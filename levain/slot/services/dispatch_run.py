@@ -10,6 +10,18 @@ uid's client (:mod:`levain.agents.session_client`, wire ``levain-run/1``) on a u
   ``{session}``; no ticket, no run id.
 * **RELEASE re-runs** :func:`verify_point_of_use` with the LAUNCH's proof and exposure: a link that expired, was revoked
   or barred while the slot was prepared releases nothing, and the child is ABORTed and ENDed.
+* **SYNC re-judges the live holders** (levain 34, row 16; design ``1105-3/DESIGN_dispatch_lease_revoke.md`` D2). A
+  session has no point of use after its RELEASE, so a revoke SYNCed into the replica while it ran was enforced only by
+  the operator-uid agent tick reading the operator's own ledger. After a SYNC that landed, a worker thread (the SYNC's
+  answer is not delayed) runs the SAME ``verify`` over every holder that has a child, with its LAUNCH proof, exposure
+  and claims: a STANDING refusal ENDs the session through the key's one END job (``ending`` is marked, so a pending
+  RELEASE refuses); a TRANSIENT one ends nothing and logs, and the next SYNC (an empty one included) judges again. No new
+  wire op and no new authority: the replica never moves backward, so a revoke judged once stays judged whatever a
+  restored operator ledger later offers. The bar half is not seen here (bars travel only in frames; the held claims
+  carry the LAUNCH's), so a bar stays the tick's. A ``raise`` that tightens a link's budgets below a running session's
+  exposure refuses ``exposure-over-link`` and so ENDs that session: the verifier was reused unchanged on purpose, that
+  was the recommended reading (design section 5), and it stands as the default until Phill answers the question put to
+  him (skipping the exposure check in the re-judge is the cheap alternative).
 * **The holder is the lifeline** (design 3.4): EOF before RELEASE is ABORT (nothing ran) then END, EOF after RELEASE is
   END, once; a session whose holder is gone stays registered only while its END is unproven. The holder's END is the
   key's END job (below), so a reaper's END on the same key joins it; every END attempt the child makes itself takes the
@@ -389,6 +401,8 @@ class RunServer:
         self._stripes = tuple(threading.RLock() for _ in range(_END_STRIPES))
         self._live: dict[str, _Holder] = {}
         self._closing = False
+        self._rejudge_running = False       # one SYNC re-judge worker at a time; a SYNC during a pass asks for one more
+        self._rejudge_again = False
 
     # -- connection ------------------------------------------------------------------------------------------------------
 
@@ -571,7 +585,61 @@ class RunServer:
             _log.warning("SYNC failed (%s)", type(exc).__name__)
             raise LauncherRefused("replica-unreadable", "the authority replica could not be updated",
                                   reason_class="transient") from None
+        self._rejudge_soon()
         return C.ok_answer(rid, head={"seq": seq, "hash": digest})
+
+    def _rejudge_soon(self) -> None:
+        """After a SYNC that landed: have a worker re-judge every live holder (module docstring, "SYNC re-judges"). One
+        worker at a time; a SYNC that lands during a pass sets ``_rejudge_again`` so that pass runs once more and sees
+        its rows. Never raises, never waits: the SYNC's answer is not delayed."""
+        try:
+            with self._mu:
+                if self._closing:
+                    return
+                self._rejudge_again = True
+                if self._rejudge_running:
+                    return
+                self._rejudge_running = True
+            threading.Thread(target=self._rejudge_loop, daemon=True).start()
+        except Exception:  # noqa: BLE001
+            with self._mu:
+                self._rejudge_running = False
+            _log.warning("a SYNC re-judge could not start")
+
+    def _rejudge_loop(self) -> None:
+        try:
+            while True:
+                with self._mu:
+                    if not self._rejudge_again or self._closing:
+                        self._rejudge_again = False
+                        self._rejudge_running = False
+                        return
+                    self._rejudge_again = False
+                    holders = list(self._live.values())
+                for h in holders:
+                    self._rejudge(h)
+        except BaseException:  # noqa: BLE001 - the flag must come back, whatever raised
+            with self._mu:
+                self._rejudge_running = False
+            _log.warning("a SYNC re-judge pass raised")
+
+    def _rejudge(self, h: _Holder) -> None:
+        """One holder, judged by the very ``verify`` LAUNCH and RELEASE call, with its LAUNCH proof, exposure and claims.
+        A holder with no child yet (its RELEASE judges it), one whose END began, and one with an END job are skipped.
+        STANDING refusal: ``_end(key, 0.0)`` (the END job, ``ending`` marked, no wait); TRANSIENT or unexpected: nothing
+        ends, one log line."""
+        if h.child is None or h.ending or h.job is not None:
+            return
+        try:
+            self._verify(h.proof, h.exposure, h.claims)
+        except LauncherRefused as exc:
+            if exc.reason_class != "standing":
+                _log.warning("SYNC re-judge of %s could not decide (%s); nothing ended", h.key, exc.name)
+                return
+            _log.warning("SYNC re-judge of %s: its authority no longer holds (%s); ENDing it", h.key, exc.name)
+            self._end(h.key, 0.0)
+        except Exception as exc:  # noqa: BLE001 - a verifier that broke is not a revoke
+            _log.warning("SYNC re-judge of %s raised (%s); nothing ended", h.key, type(exc).__name__)
 
     def _pool(self) -> None:
         try:

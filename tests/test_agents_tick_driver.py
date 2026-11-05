@@ -25,6 +25,8 @@ from tests.test_agents_launch import Rig
 from tests.test_agents_session_launch import BINDING, Stub, rig  # noqa: F401
 from tests.test_agents_session_reaper_stop import _revoke, _session_row
 from tests.test_agents_supervise import Clock
+from tests.test_routemaps import st  # noqa: F401 - the C1 rig's fixture
+from tests.test_upgrade_dispatch_end import world  # noqa: F401 - the C1 rig (real CONTROL lease, scripted helper)
 
 pytestmark = pytest.mark.skipif(shutil.which("ssh-keygen") is None, reason="needs ssh-keygen")
 
@@ -248,13 +250,61 @@ def test_a_revoked_row_with_a_live_fire_is_ended_once_by_the_tick(rig):  # noqa:
         fire.wait()
 
 
-def test_the_real_client_variant(rig):  # noqa: F811
-    """INTEGRATION (the head's): the same dead-fire settle with the real `levain.agents.session_client` talking to an
-    in-process dispatch server. The real client is importable here (asserted below); the end-to-end drive is still
-    missing in this tree (the client-sync test lives on seat/1104-29-s10b-b2, not merged)."""
-    client = pytest.importorskip("levain.agents.session_client")
-    assert callable(getattr(client.DispatchSessionLauncher, "end_session", None))
-    pytest.skip("end-to-end drive missing: run_tick through the real client + an in-process dispatch server (the head's integration; client-sync test not in this tree)")
+@pytest.mark.parametrize("how", ["agent", "grant"])
+def test_the_real_client_variant(world, how):  # noqa: F811
+    """INTEGRATION (levain 34, D1; design ``1105-3/DESIGN_dispatch_lease_revoke.md`` case 6): the operator-ledger revoke
+    reaches a RUNNING dispatch session through the real tick. ``run_tick`` + the real ``session_client`` over a socketpair
+    to the in-process run server + the real ``HelperSlotRuntime`` on the C1 rig (``tests/test_upgrade_dispatch_end.py``:
+    a real CONTROL lease, a scripted helper). The revoke is signed in the operator's ledger (revoke_agent, or revoke_grant
+    of the link); one tick a minute on stops the session: the runtime's lease is closed once, the index says ``ended``,
+    one teardown. NOT held: two uids, a real root END, whether launchd really ticks every 60 s."""
+    import json
+    from levain.consent.delivery import process_identity
+    from tests.test_agents_session_launch import EXP, _occurrence
+    from tests.test_upgrade_dispatch_end import KEY, SESSION  # noqa: F401
+    from levain.agents.role import add_role
+    from tests.test_agents_launch import ROLES
+    crig, _trig, h, leases, env = world
+    add_role(crig.store, ROLES["model-role"])            # the store holds the role the spec pins (as _session_row does)
+    oid = _occurrence(crig, billing="subscription", exposure=EXP)
+    with crig.store.write() as c:                        # the fire claimed the row and opened its session (a key)
+        assert ctl.claim_fire(c, oid, 4100, crig.now()) is not None
+        assert ctl.record_session_key(c, oid, crig.row(oid)["launch_epoch"], KEY, crig.now())
+    child = env.client().spawn(S.SessionLaunch(oid, KEY, "claude", "sonnet", "b", "passthrough", EXP))
+    child.release()
+    (lease,) = leases
+    assert lease.closed == 0 and h.verbs().count("teardown") == 0
+    fire = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)", oid])   # a live "fire" naming the row
+    try:
+        started, args = process_identity(fire.pid)
+        for _ in range(50):             # a venv python re-execs at start: wait for the argv to settle
+            time.sleep(0.1)
+            again = process_identity(fire.pid)
+            if again == (started, args):
+                break
+            started, args = again
+        record = ctl.fire_record_path(crig.store.directory, oid)
+        record.parent.mkdir(mode=0o700, exist_ok=True)
+        record.write_text(json.dumps({"occurrence_id": oid, "pid": fire.pid, "started": started, "args": args}))
+        if how == "agent":
+            _revoke(crig, oid)
+        else:
+            crig.world.link({"op": "revoke_grant", "grant_id": f"al-{crig.n:012x}"}, "laptop")
+        clock = Clock(crig)
+        clock.advance(60)
+        assert T.run_tick(crig.store, clock=clock, authority=crig.authority, launcher_of=lambda: env.client()) == T.EXIT_OK
+        for _ in range(250):
+            if env.launcher.index.get(KEY)["state"] == "ended" and lease.closed == 1:
+                break
+            time.sleep(0.02)
+        assert env.launcher.index.get(KEY)["state"] == "ended" and lease.closed == 1
+        assert h.verbs().count("teardown") == 1
+        child._conn.close()
+        env.drain()
+        assert lease.closed == 1 and h.verbs().count("teardown") == 1     # the holder's EOF joins the proven END
+    finally:
+        fire.kill()
+        fire.wait()
 
 
 def test_a_reaper_that_raised_is_not_a_clean_exit(rig, monkeypatch, capsys):  # noqa: F811

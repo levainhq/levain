@@ -188,3 +188,64 @@ def test_an_operator_revoke_own_of_a_dispatch_session_ends_it_through_the_run_se
     child._conn.close()                                                            # the fire ends: EOF on the holder
     env.drain()
     assert KEY not in env.server._live and h.verbs().count("teardown") == 1        # the EOF END joins the proof
+
+
+# --- levain 34, D2: a SYNCed revoke closes the lease on the run server's own judgement ---------------------------------------
+#
+# The case above is the CONTROL path. This one is the authority-log path (STATUS_1_0 row 16): the operator signs a revoke,
+# a fire SYNCs it into the dispatch replica, and the run server's SYNC re-judge ENDs the running session, with no tick and
+# no root END. Same rig as above (real CONTROL lease, scripted helper, ``HelperSlotRuntime``), the production replica-backed
+# server and raw frames. NOT held: two uids over real AF_UNIX, a real root END of a real vendor process.
+
+@pytest.fixture
+def replica_world(st, tmp_path):  # noqa: F811
+    from tests.test_agents_authority_replica import Wire
+    (tmp_path / "auth").mkdir()
+    rig = Rig(tmp_path / "auth")
+    trig = TicketRig(st, Clock())
+    h = Helper(tmp_path, tmp_path / "store")
+    h.script.write_text(BLOCKING_HELPER)
+    leases: list[RootSideLease] = []
+
+    def factory(_path):
+        leases.append(RootSideLease(trig))
+        return leases[-1]
+
+    runtime = DR.HelperSlotRuntime(host="darwin", helper=h.prefix, store=tmp_path / "store", routes=("pass-1",),
+                                   client_factory=factory, kill_grace_s=0.5)
+    (tmp_path / "wire").mkdir()
+    wire = Wire(rig, tmp_path / "wire", runtime=runtime)
+    yield rig, trig, h, leases, wire
+    Path(str(h.script) + ".killed").write_text("x")
+    trig.control.stop()
+    wire.close()
+
+
+def test_a_revoke_synced_into_the_replica_closes_the_dispatch_lease_once(replica_world):
+    from tests.test_agents_authority_replica import NO_BAR, _source
+    from tests.test_authority_agent_link import revoke_agent
+    rig, trig, h, leases, wire = replica_world
+    oid = _occurrence(rig, billing="subscription", exposure=EXP)
+    assert wire.sync()["ok"] is True
+    sock = wire.conn()
+    assert wire.launch(sock, oid, key=KEY)["ok"] is True
+    assert wire.call(sock, "RELEASE", ledger_head=wire.head(), bar=NO_BAR)["ok"] is True
+    (lease,) = leases
+    assert _record(trig)["lease_live"] is True and lease.closed == 0 and h.verbs().count("teardown") == 0
+
+    rig.world.link(revoke_agent(rig.row(oid)["agent_id"], rig.sid), "laptop")      # the operator revokes the agent
+    assert wire.sync()["ok"] is True                                                # another fire carries it in
+    for _ in range(500):                                                            # the worker ENDs it; no tick, no root
+        if lease.closed == 1 and wire.launcher_index(KEY).get("state") == "ended":
+            break
+        time.sleep(0.02)
+    trig.control.join_eof(5)
+    assert lease.closed == 1 and not lease.conn.lease.live and _record(trig)["lease_live"] is False
+    assert wire.launcher_index(KEY)["state"] == "ended" and h.verbs().count("teardown") == 1
+
+    before = _source(rig)
+    assert wire.sync(before[-2:])["refused"] == "ledger-stale"                      # a restore to before the revoke
+    assert wire.sync([])["ok"] is True                                              # and a head read: nothing runs twice
+    sock.close()
+    wire.close()
+    assert lease.closed == 1 and h.verbs().count("teardown") == 1

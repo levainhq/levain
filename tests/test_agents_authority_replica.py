@@ -346,11 +346,12 @@ def test_a_symlinked_or_foreign_root_is_refused(rig, tmp_path):
 class Wire:
     """The run server over socketpairs, raw frames, a replica-backed verifier (the production shape)."""
 
-    def __init__(self, rig, tmp_path, *, replica=True):
+    def __init__(self, rig, tmp_path, *, replica=True, runtime=None):
         self.rig = rig
         self.replica = _replica(tmp_path, "srv") if replica else None
-        self.control, self.runtime = FakeControl(), FakeRuntime()
-        launcher = L.RealLauncher(self.control, self.runtime, FakeSources(), L.SessionIndex(tmp_path / "idx"))
+        self.control, self.runtime = FakeControl(), runtime or FakeRuntime()
+        launcher = self.launcher = L.RealLauncher(self.control, self.runtime, FakeSources(),
+                                                  L.SessionIndex(tmp_path / "idx"))
         verify = D.replica_verifier(self.replica, now=rig.now) if replica else (lambda p, e, c: None)
         self.server = D.RunServer(launcher, verify=verify, pool_free=lambda: True, peer_ok=lambda s: True,
                                   holder_idle_s=20, replica=self.replica)
@@ -379,6 +380,10 @@ class Wire:
         finally:
             if own:
                 sock.close()
+
+    def launcher_index(self, key):
+        """The launcher's index record for ``key`` ({} when none)."""
+        return self.launcher.index.get(key) or {}
 
     def head(self):
         src = self.rig.authority.replay()
@@ -591,7 +596,8 @@ def test_the_production_wiring_reads_nothing_from_the_operators_home():
     text = Path(D.__file__).read_text()
     body = text[text.index("def build_server("):text.index("def service_row(")]
     assert "AuthorityReplica(" in body and "AgentAuthority(" not in body and "agent_store_bar(" not in body
-    assert text.count("def verify_point_of_use(") == 1 and text.count("self._verify(") == 2
+    # LAUNCH, RELEASE and the SYNC re-judge (levain 34, D2) are the three points of use; none is a second authority
+    assert text.count("def verify_point_of_use(") == 1 and text.count("self._verify(") == 3
 
 
 # --- fix round 1 (L3 s10b_b1 r1) ---------------------------------------------------------------------------------------
