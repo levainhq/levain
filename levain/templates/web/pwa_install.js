@@ -1,12 +1,14 @@
 // levain pwa_install.js: the install coach (PWA package, item 4). In a browser TAB on a phone where an install is possible (iOS
 // and iPadOS Safari, Android Chrome) it shows how to install; in the installed app (standalone) it shows nothing. Pairing and
 // pings are offered only in the installed app: pair_card.js, dashboard_boot.js and devices_panel.js ask gated() and draw
-// note() in place of those controls. A desktop browser is never gated (it cannot install, and keeps the cockpit as it was).
+// note() in place of those controls. A desktop browser is never gated (keeps the cockpit as it was). Safari on a Mac CAN install
+// (File > Add to Dock, Safari 17+): it gets the coach banner (coachKind) but is not gated, so pairing there stays as it was.
 // Drawn with textContent and createElementNS only. No origin is named here.
 (function () {
   "use strict";
   const DISMISS_KEY = "levain_install_coach_dismissed";   // sessionStorage: a dismissed banner stays away for this tab only
   const IOS_SAY = "Install Levain: tap Share, then Add to Home Screen.";
+  const MAC_SAY = "Install Levain: in Safari, open the File menu and choose Add to Dock (needs macOS Sonoma or later).";
   const GATE_SAY = "Pairing and pings are offered in the installed Levain app. ";
   let deferred = null, installedNow = false, banner = null;
   const notes = new Set();   // the gate notes drawn into pairing and pings; re-rendered whenever the install state moves
@@ -26,6 +28,18 @@
     return window.isSecureContext !== false && /Android/.test(u) && /Chrome\//.test(u) && !/EdgA|OPR\/|SamsungBrowser|Firefox|UCBrowser/.test(u);
   }
   function kind() { return ios() ? "ios" : androidChrome() ? "android" : ""; }
+  // Safari on a Mac.
+  // Add to Dock arrived in Safari 17 on macOS Sonoma, but Safari 17 also runs on Monterey and Ventura and the user agent freezes the
+  // OS version: the words are conditional on Sonoma (MAC_SAY) rather than the code guessing. Secure origins only, as on Android.
+  function macSafari() {
+    if (window.isSecureContext === false) return false;
+    const u = ua(), v = /Version\/(\d+)/.exec(u);
+    if (!/Macintosh/.test(u) || !/Safari\//.test(u) || !v || Number(v[1]) < 17) return false;
+    if (/Chrome|Chromium|CriOS|FxiOS|Firefox|Edg|OPR\/|Brave|Vivaldi/.test(u)) return false;
+    return true;   // an iPad in desktop mode (a Mac user agent with touch) never reaches here: ios() claims it first
+  }
+  // who gets the banner: gated() phones plus Safari on a Mac
+  function coachKind() { return kind() || (macSafari() ? "mac" : ""); }
   // the one question the other pages ask: is this a phone tab where the install must come first
   function gated() { return !!kind() && !standalone(); }   // appinstalled does not make THIS tab the app: only standalone lifts the gate
   function words() {
@@ -91,6 +105,8 @@
     const msg = document.createElement("div"); msg.style.flex = "1";
     if (kind() === "ios") {
       msg.append("Install Levain: tap Share ", shareGlyph(), ", then Add to Home Screen.");
+    } else if (coachKind() === "mac") {
+      msg.textContent = MAC_SAY;
     } else {
       msg.textContent = "Install Levain on this phone.";
     }
@@ -103,16 +119,18 @@
     document.body.appendChild(b);
     return b;
   }
-  // the banner shows exactly when gated, a dismissal allows, and (Android) the browser has armed the prompt
+  // the banner shows exactly when a coach is due (a phone tab, or Safari on a Mac) and not standalone, a dismissal allows, and
+  // (Android) the browser has armed the prompt
   function refresh() {
     for (const n of [...notes]) { if (n.isConnected) renderNote(n); else notes.delete(n); }
-    const want = gated() && !installedNow && !dismissed() && (kind() === "ios" || !!deferred);
+    const ck = coachKind();
+    const want = !!ck && !standalone() && !installedNow && !dismissed() && (ck === "ios" || ck === "mac" || !!deferred);
     if (!want) { if (banner) { banner.remove(); banner = null; } return; }
     if (!banner || !banner.isConnected) { if (banner) banner.remove(); banner = drawBanner(); }
   }
 
   window.addEventListener("beforeinstallprompt", (e) => { e.preventDefault(); deferred = e; refresh(); });
   window.addEventListener("appinstalled", () => { installedNow = true; deferred = null; refresh(); });
-  window.levainPwa = { standalone: standalone, gated: gated, kind: kind, note: note, words: words, refresh: refresh };
+  window.levainPwa = { standalone: standalone, gated: gated, kind: kind, coachKind: coachKind, note: note, words: words, refresh: refresh };
   if (document.readyState === "loading") document.addEventListener("DOMContentLoaded", refresh); else refresh();
 })();
