@@ -138,8 +138,11 @@
   const pkArm = (ev) => { if (tapArmable(ev)) pkArmedAt = Date.now(); };
   document.addEventListener("click", pkArm, true);
   document.addEventListener("keydown", pkArm, true);
+  // rpId|fp whose remembered id the authenticator refused on this page: whom passes over that key while another remembered
+  // key remains, until a passkey signs (signed clears it, and forgets the record when another key signed). A plain sign
+  // request (k.fp null) asking one remembered id records the refusal under the key that id was remembered for (k.of)
   const pkRefused = new Set();
-  const pkKey = (pk, k) => String(pk.rpId) + "|" + String(k && k.fp);
+  const pkKey = (pk, k) => String(pk.rpId) + "|" + String(k && (k.fp === null && k.of ? k.of : k.fp));
   // the door's own refusal (no tap asked) is NoTapError, never NotAllowedError: no authenticator was asked, so it is never
   // read as a cancel and never drops the remembered credential (only the get() below's own refusal does)
   function pkGet(pk, id, k) {
@@ -159,6 +162,16 @@
   // a passkey signed for rpId|fp (where the record is updated to the credential that signed): a refusal recorded for it is
   // over, so the next tap asks for the recorded passkey by its id again
   function pkSigned(pk, k) { pkRefused.delete(pkKey(pk, k)); }
+  // after key `by` signed on rpId `rp`: a refusal for it is over, and a remembered record the authenticator refused on this
+  // page while ANOTHER key then signed is forgotten (it names a passkey this device no longer holds, or one only cancelled,
+  // which a later sign learns again); kept, it would be asked first, and fail first, on every tap after this one
+  function pkSettle(rp, by) {
+    if (!by) return;
+    pkRefused.delete(rp + "|" + by);
+    for (const k of Object.keys(mine(rp))) {
+      if (k !== by && pkRefused.has(rp + "|" + k)) { forget(rp, k); pkRefused.delete(rp + "|" + k); }
+    }
+  }
 
   // what a refused passkey ceremony says: a cancel and a timeout both raise NotAllowedError, so that name is said in words
   function passkeyWhy(e) {
@@ -745,23 +758,31 @@
     const num = typeof f.seq === "number" ? " (#" + f.seq + ")" : "";
     return prov + when + num + (when || num ? "" : " · " + fp.slice(0, 18) + "…");
   }
-  // which eligible key signs: the one this browser used before (the newest enrolled of them, when it used several), else the
+  // which eligible key signs: the one this browser used before (the newest enrolled of them, when it used several, passing
+  // over one the authenticator refused on this page), else the
   // only one, else his pick from a list. Resolves {fp, rawId, local} or null (dismissed); rawId is this browser's record
   // (local: true), else the cockpit's, else null (the OS's list). `late` (a plain sign request, whose signer the cockpit's
   // reply names) never draws a pick: it resolves {fp: null, ids, local}, `ids` the one remembered id, else every enrolled
   // id when all are known, else none (the OS's list, which holds every levain passkey this device has)
   function whom(rp, signers, held, acts, late) {
     const local = mine(rp);
+    // an entry that cannot be an id names no passkey: it is forgotten before it decides who signs (late mode too)
+    for (const k of Object.keys(local)) if (!decodable(local[k])) { forget(rp, k); delete local[k]; }
     const has = (fp) => Object.prototype.hasOwnProperty.call(local, fp);
     const idOf = (fp) => (has(fp) ? { fp: fp, rawId: local[fp], local: true }
       : { fp: fp, rawId: held[fp] && typeof held[fp].credential_id === "string" ? held[fp].credential_id : null, local: false });
-    const known = signers.filter(has);
+    const remembered = signers.filter(has);
+    // a remembered key whose id the authenticator refused on this page is passed over (L3 picker r1): asking it again would
+    // fail again, and a bound challenge must never pair it with the OS's whole list, which signs with a key it is not bound to
+    const known = remembered.filter((fp) => !pkRefused.has(rp + "|" + fp));
     const seqOf = (fp) => (held[fp] && typeof held[fp].seq === "number" ? held[fp].seq : -1);
     const newest = (fps) => fps.reduce((best, fp) => (seqOf(fp) >= seqOf(best) ? fp : best), fps[0]);
     if (late) {
-      if (known.length) return Promise.resolve({ fp: null, ids: [local[newest(known)]], local: true });
+      if (known.length) { const of = newest(known); return Promise.resolve({ fp: null, ids: [local[of]], local: true, of: of }); }
       const all = signers.map((fp) => idOf(fp).rawId);
-      return Promise.resolve({ fp: null, ids: signers.length && all.every((i) => typeof i === "string") ? all : [], local: false });
+      // every remembered key refused: the OS's own list (whichever levain passkey this device holds signs)
+      const ok = !remembered.length && signers.length && all.every((i) => typeof i === "string");
+      return Promise.resolve({ fp: null, ids: ok ? all : [], local: false });
     }
     if (known.length) return Promise.resolve(idOf(newest(known)));
     if (signers.length === 1) return Promise.resolve(idOf(signers[0]));
@@ -774,7 +795,9 @@
         const p = el("button", "dev-btn sheet-key", keyLabel(fp, held[fp]));
         p.type = "button";
         p.title = fp;
-        p.addEventListener("click", () => end(idOf(fp)));
+        // a pick is his word for that key: a refusal recorded for it is over, so it is asked for by its id (the challenge is
+        // bound to it, so the OS's whole list would offer keys that cannot answer it)
+        p.addEventListener("click", () => { pkRefused.delete(rp + "|" + fp); end(idOf(fp)); });
         picks.push(p);
       }
       const no = el("button", "dev-btn sheet-key", "Dismiss");
@@ -861,6 +884,7 @@
           pkSigned(pk, k);
           // the key the cockpit's reply NAMES as the one that verified, not the one this page asked for
           const by = typeof a.body.signer_fp === "string" && a.body.signer_fp ? a.body.signer_fp : fp;
+          pkSettle(rp, by);
           if (by && cred.rawId && mine(rp)[by] !== b64u(cred.rawId)) remember(rp, by, b64u(cred.rawId));
           const ns = typeof a.body.namespace === "string" && a.body.namespace ? " in " + a.body.namespace : "";
           // a consent answer's reply names its decision; a ruling's also says where its delivery stands

@@ -349,3 +349,222 @@ def test_i5_the_consent_sheets_signer_picker_is_not_a_ceremony_in_flight(tmp_pat
         ])
     assert out["values"][-1] is False, out["values"]                     # the close leaves at once
     assert not [p for p in out["posts"] if p.split(" ", 1)[0].endswith("/challenge")], out["posts"]
+
+
+# --- L3 r1 fix (project_memory/1105-7/L3_picker_r1.txt): a remembered key this device no longer holds -------------------
+
+import hashlib  # noqa: E402
+
+from cryptography.exceptions import InvalidSignature  # noqa: E402
+from cryptography.hazmat.primitives import hashes  # noqa: E402
+from cryptography.hazmat.primitives.asymmetric import ec  # noqa: E402
+
+from levain.consent.grant_phone import GrantRefused  # noqa: E402
+
+
+def _unb64u(text: str) -> bytes:
+    return base64.urlsafe_b64decode(text + "=" * (-len(text) % 4))
+
+
+class _Verifying(_TwoSigners):
+    """The two-signer listing, and a revoke that checks the assertion under the key its challenge was bound to, as the
+    real ceremony does: a signature by any other key is refused (a 4xx with the server's error word)."""
+
+    def __init__(self, real: Any, keys: "list[_Passkey]") -> None:
+        super().__init__(real, [k.key.fingerprint for k in keys])
+        self.pubs = {k.key.fingerprint: k.priv.public_key() for k in keys}
+        self.bound: "str | None" = None
+
+    def step(self, grant_id: str, action: str, req: Any) -> dict[str, Any]:
+        if action != "revoke":
+            if action == "revoke-challenge":
+                self.bound = req.get("signer_fp")
+            return super().step(grant_id, action, req)
+        self.steps.append((grant_id, action, req))
+        signed = _unb64u(req["authenticator_data"]) + hashlib.sha256(_unb64u(req["client_data_json"])).digest()
+        try:
+            self.pubs[self.bound].verify(_unb64u(req["signature"]), signed, ec.ECDSA(hashes.SHA256()))
+        except (InvalidSignature, KeyError):
+            raise GrantRefused(400, "bad_signature", "the passkey's signature does not verify over this message") from None
+        return {"revoked": grant_id, "seq": 7, "warning": ""}
+
+
+_GRANT_NOTE = f"((({_CARD}) || document).querySelector('.sign-note') || {{}}).textContent"
+
+
+@needs_browser
+@needs_ssh
+def test_b6_a_bound_revoke_whose_newest_remembered_key_is_gone_asks_the_next_remembered_key(
+        world, tmp_path, monkeypatch) -> None:
+    """The deadlock (gemini HIGH, codex MED): two remembered keys, the device holds only the older. The first tap asks for
+    the newest by its id and the authenticator refuses it; the next tap must bind the challenge to the OTHER remembered key
+    (never the refused one with the OS's whole list, which signs with a key the challenge is not bound to), sign, and
+    forget the refused record so the tap after it does not fail first."""
+    port, src, signer, older, newer = _grant_rig(world, tmp_path, monkeypatch)
+    record = {older.key.fingerprint: _b64u(b"cred-old"), newer.key.fingerprint: _b64u(b"cred-new")}
+    with _serve_on(port, src, surface_tokens={"browser": "T"}, install_class="reported", signer=signer) as httpd:
+        rec = _Verifying(httpd.grant_phone, [older, newer])
+        httpd.grant_phone = rec
+        out = _drive(tmp_path, f"http://localhost:{port}/#write_token=T", [
+            _auth(older, b"cred-old"), {"until": TILE},
+            {"eval": f"window.localStorage.setItem('levain-passkeys:localhost', {json.dumps(json.dumps(record))}); 1"},
+            {"eval": OPEN_DECISIONS},
+            {"until": f"!!{_CARD} && !!{_REVOKE} && 1"},
+            {"tap": _REVOKE},
+            {"until": f"/nothing was revoked/.test({_GRANT_NOTE}) && !{_REVOKE}.disabled && {_GRANT_NOTE}", "ms": 30000},
+            {"tap": _REVOKE},
+            {"until": f"/^revoked|^not revoked|^result unknown/.test({_GRANT_NOTE}) && {_GRANT_NOTE}", "ms": 30000},
+            {"eval": _GRANT_PICKS},
+            {"eval": LS},
+        ])
+    v = out["values"]
+    asked = [r["signer_fp"] for _g, a, r in rec.steps if a == "revoke-challenge"]
+    assert asked == [newer.key.fingerprint, older.key.fingerprint], asked      # the second tap moved to the next key
+    assert v[-3].startswith("revoked"), v[-3]
+    assert v[-2] == 0, v                                                       # and needed no pick
+    assert json.loads(v[-1]) == {older.key.fingerprint: _b64u(b"cred-old")}, v[-1]    # the refused record is forgotten
+
+
+@needs_browser
+@needs_ssh
+def test_b7_a_bound_consent_answer_whose_newest_remembered_key_is_gone_asks_the_next_remembered_key(
+        tmp_path: Path, monkeypatch) -> None:
+    """The same deadlock on the sheet (sign.js whom/pkGet): the consent answer is verified for real."""
+    rig, second = _consent_rig_with_two_passkeys(tmp_path, monkeypatch)
+    older, newer = rig.pk, second
+    held = _b64u(b"levain-consent-cred")                       # the one credential rig.authenticator() holds: the older key
+    record = {older.key.fingerprint: held, newer.key.fingerprint: _b64u(b"cred-new")}
+    allow = "document.querySelector('#sheet-actions [data-choice=\"allow\"]')"
+    with rig.serving():
+        out = _drive(tmp_path, f"{rig.origin}/nope", [
+            DESKTOP, rig.authenticator(),
+            {"eval": f"window.localStorage.setItem('levain-passkeys:localhost', {json.dumps(json.dumps(record))}); 1"},
+            *rig.open_top(),
+            {"tap": allow},
+            {"until": f"/cancelled/.test({NOTE_C}) && {allow} && !{allow}.disabled && {NOTE_C}", "ms": 30000},
+            {"tap": allow},
+            {"until": f"/^signed|^Not signed|^Not sure/.test({NOTE_C}) && {NOTE_C}", "ms": 30000},
+            {"eval": "document.querySelectorAll('#sheet-actions .sheet-key').length"},
+            {"eval": LS},
+        ])
+    v = out["values"]
+    bodies = [json.loads(p.split(" ", 1)[1]) for p in out["posts"] if p.split(" ", 1)[0].endswith("/challenge")]
+    assert [b["signer_fp"] for b in bodies] == [newer.key.fingerprint, older.key.fingerprint], bodies
+    assert v[-3].startswith("signed"), v[-3]
+    assert v[-2] == 0, v
+    assert json.loads(v[-1]) == {older.key.fingerprint: held}, v[-1]
+    assert rig.state() != "pending"
+
+
+@needs_browser
+@needs_ssh
+def test_b8_a_plain_sign_after_a_refused_remembered_key_forgets_it(tmp_path: Path, monkeypatch) -> None:
+    """Late mode (gemini MED): the only remembered key is not on this device; the first tap asks for it and is refused, the
+    next asks the OS's list and the key this device holds signs. The stale record goes, so the next plain sign does not
+    fail on its first tap again."""
+    rig = _Rig(tmp_path, monkeypatch, two_keys=True)
+    record = {rig.other.key.fingerprint: _b64u(b"cred-gone")}
+    with rig.serving():
+        out = _drive(tmp_path, f"{rig.origin}/#write_token={TOK}", [
+            DESKTOP, _auth(rig.pk, b"cred-a"),
+            {"eval": f"window.localStorage.setItem('levain-passkeys:localhost', {json.dumps(json.dumps(record))}); 1"},
+            {"until": STRIP_FACET + " && 1", "ms": 30000},
+            {"tap": f"{OPTION_B}"},
+            {"until": f"/nothing was signed/.test({FACET_NOTE}) && !{OPTION_B}.disabled && {FACET_NOTE}", "ms": 30000},
+            {"tap": f"{OPTION_B}"},
+            {"until": f"/^signed/.test({FACET_NOTE}) && {FACET_NOTE}", "ms": 30000},
+            {"eval": LS},
+        ])
+    assert _signed_by(rig) == rig.pk.key.fingerprint
+    assert json.loads(out["values"][-1]) == {rig.pk.key.fingerprint: _b64u(b"cred-a")}, out["values"][-1]
+
+
+@needs_browser
+@needs_ssh
+def test_b9_an_undecodable_remembered_id_is_forgotten_by_a_plain_sign_too(tmp_path: Path, monkeypatch) -> None:
+    """complement LOW 4, gemini LOW 3: a record that cannot be an id is forgotten before it decides who signs, in late mode
+    as in bound, on the card and on the sheet; kept, it would shadow the key this device holds."""
+    rig = _Rig(tmp_path, monkeypatch, two_keys=True)
+    record = json.dumps(json.dumps({rig.other.key.fingerprint: "a"}))      # one character: no base64url decodes to it
+    with rig.serving():
+        out = _drive(tmp_path, f"{rig.origin}/nope", [
+            DESKTOP, _auth(rig.pk, b"cred-a"),
+            {"eval": f"window.localStorage.setItem('levain-passkeys:localhost', {record}); 1"},
+            *_open(rig),
+            {"tap": f"{_button('b')}"},
+            {"until": f"/^signed/.test({NOTE}) && {NOTE}", "ms": 30000},
+            {"eval": LS},
+        ])
+    assert json.loads(out["values"][-1]) == {rig.pk.key.fingerprint: _b64u(b"cred-a")}, out["values"][-1]
+
+
+@needs_browser
+@needs_ssh
+def test_b9b_the_card_forgets_an_undecodable_remembered_id_on_a_plain_sign(tmp_path: Path, monkeypatch) -> None:
+    rig = _Rig(tmp_path, monkeypatch, two_keys=True)
+    record = json.dumps(json.dumps({rig.other.key.fingerprint: "a"}))
+    with rig.serving():
+        out = _drive(tmp_path, f"{rig.origin}/#write_token={TOK}", [
+            DESKTOP, _auth(rig.pk, b"cred-a"),
+            {"eval": f"window.localStorage.setItem('levain-passkeys:localhost', {record}); 1"},
+            {"until": STRIP_FACET + " && 1", "ms": 30000},
+            {"tap": f"{OPTION_B}"},
+            {"until": f"/^signed/.test({FACET_NOTE}) && {FACET_NOTE}", "ms": 30000},
+            {"eval": LS},
+        ])
+    assert json.loads(out["values"][-1]) == {rig.pk.key.fingerprint: _b64u(b"cred-a")}, out["values"][-1]
+
+
+@needs_browser
+@needs_ssh
+def test_b10_a_picked_key_is_asked_for_by_its_id_even_after_a_refusal(world, tmp_path, monkeypatch) -> None:
+    """The one remembered key is refused, so the next tap draws the pick (two keys enrolled). Picking that same key asks the
+    authenticator for it by its id again: the challenge is bound to it, and the OS's whole list would sign with the other
+    key, which the revoke refuses. So it is refused again by the authenticator, and nothing is posted to the revoke."""
+    port, src, signer, older, newer = _grant_rig(world, tmp_path, monkeypatch)
+    record = {newer.key.fingerprint: _b64u(b"cred-new")}
+    pick_newer = (f"[...{_CARD}.querySelectorAll('.sign-pick')].find(b => b.title === {json.dumps(newer.key.fingerprint)})"
+                  ".click() || 1")
+    with _serve_on(port, src, surface_tokens={"browser": "T"}, install_class="reported", signer=signer) as httpd:
+        rec = _Verifying(httpd.grant_phone, [older, newer])
+        httpd.grant_phone = rec
+        out = _drive(tmp_path, f"http://localhost:{port}/#write_token=T", [
+            _auth(older, b"cred-old"), {"until": TILE},
+            {"eval": f"window.localStorage.setItem('levain-passkeys:localhost', {json.dumps(json.dumps(record))}); 1"},
+            {"eval": OPEN_DECISIONS},
+            {"until": f"!!{_CARD} && !!{_REVOKE} && 1"},
+            {"tap": _REVOKE},
+            {"until": f"/nothing was revoked/.test({_GRANT_NOTE}) && !{_REVOKE}.disabled && {_GRANT_NOTE}", "ms": 30000},
+            {"eval": f"{_CARD}.querySelector('.sign-note').textContent = ''; 1"},
+            {"tap": _REVOKE},
+            {"until": f"{_GRANT_PICKS} === 3 && 1", "ms": 30000},
+            {"tap": pick_newer.replace(".click() || 1", "")},
+            {"until": f"/nothing was revoked|^revoked|^not revoked/.test({_GRANT_NOTE}) && {_GRANT_NOTE}", "ms": 30000},
+        ])
+    assert "the passkey did not sign (NotAllowedError); nothing was revoked" in out["values"][-1], out["values"][-1]
+    asked = [r["signer_fp"] for _g, a, r in rec.steps if a == "revoke-challenge"]
+    assert asked == [newer.key.fingerprint, newer.key.fingerprint], asked
+    assert not [s for s in rec.steps if s[1] == "revoke"], rec.steps        # the OS's list never signed with the other key
+
+
+@needs_browser
+@needs_ssh
+def test_b8s_the_sheets_plain_sign_after_a_refused_remembered_key_forgets_it(tmp_path: Path, monkeypatch) -> None:
+    """b8 on the sheet (sign.js whom/pkGet/pkSettle): the refusal of the one remembered id is kept under the key it was
+    remembered for, so the next tap passes over that key, and the key that signs replaces the stale record."""
+    rig = _Rig(tmp_path, monkeypatch, two_keys=True)
+    record = json.dumps(json.dumps({rig.other.key.fingerprint: _b64u(b"cred-gone")}))
+    with rig.serving():
+        out = _drive(tmp_path, f"{rig.origin}/nope", [
+            DESKTOP, _auth(rig.pk, b"cred-a"),
+            {"eval": f"window.localStorage.setItem('levain-passkeys:localhost', {record}); 1"},
+            *_open(rig),
+            {"tap": f"{_button('b')}"},
+            {"until": f"/cancelled/.test({NOTE}) && {_button('b')} && !{_button('b')}.disabled && {NOTE}", "ms": 30000},
+            {"tap": f"{_button('b')}"},
+            {"until": f"/^signed|^Not signed|^Not sure/.test({NOTE}) && {NOTE}", "ms": 30000},
+            {"eval": LS},
+        ])
+    assert out["values"][-2].startswith("signed"), out["values"][-2]
+    assert _signed_by(rig) == rig.pk.key.fingerprint
+    assert json.loads(out["values"][-1]) == {rig.pk.key.fingerprint: _b64u(b"cred-a")}, out["values"][-1]

@@ -5050,8 +5050,9 @@
   const signArm = (ev) => { if (tapArmable(ev)) signArmedAt = Date.now(); };
   document.addEventListener("click", signArm, true);
   document.addEventListener("keydown", signArm, true);
-  // rp|fp whose remembered id the authenticator refused: the next tap asks for no id (the OS's own list), until a passkey
-  // signs for that rp|fp (signKeep clears it)
+  // rp|fp whose remembered id the authenticator refused: signWho passes over that key while another remembered key remains
+  // (else a pick, or, with one key enrolled, the OS's own list), until a passkey signs (signKeep clears it, and forgets the
+  // record when another key signed)
   const signRefusedId = new Set();
   // `onRefused` runs only when the authenticator itself refused (NotAllowedError from the get() below); the door's own
   // refusal (NoTapError) never reaches it, since no authenticator was asked
@@ -5132,8 +5133,19 @@
   // recorded for this rp|fp is over (the next tap asks for the recorded passkey by its id again)
   // `fp` is the key the cockpit's reply NAMES as the one that verified (a plain sign request names its signer only in the
   // reply), never the one the page asked for; null names none, and only the late refusal is cleared
+  // A record the authenticator refused on this page while ANOTHER passkey then signed is forgotten: it names a passkey this
+  // device no longer holds (or one only cancelled, which a later sign learns again), and kept it would be asked first,
+  // and fail first, on every tap after this one (L3 picker r1)
   function signKeep(rp, fp, cred) {
-    if (typeof rp === "string" && rp) { signRefusedId.delete(rp + "|*"); if (fp) signRefusedId.delete(rp + "|" + fp); }
+    if (typeof rp === "string" && rp) {
+      signRefusedId.delete(rp + "|*");
+      if (fp) {
+        signRefusedId.delete(rp + "|" + fp);
+        for (const k of Object.keys(signMine(rp))) {
+          if (k !== fp && signRefusedId.has(rp + "|" + k)) { signForget(rp, k); signRefusedId.delete(rp + "|" + k); }
+        }
+      }
+    }
     if (!fp || !cred || !cred.rawId || typeof rp !== "string" || !rp) return;
     const id = signB64u(cred.rawId);
     if (signMine(rp)[fp] !== id) signRemember(rp, fp, id);
@@ -5142,19 +5154,19 @@
   // when that id decodes and the authenticator has not refused it on this page since a passkey last signed for rp|fp, else
   // for none (the OS's own list), never a throw. An id this browser remembered that does not decode is forgotten; one the
   // authenticator refuses (NotAllowedError, which a passkey since removed reads as, and a cancel too) is not asked again by
-  // the page, and stays remembered until a passkey signs (signKeep replaces it and clears the refusal)
+  // the page, and stays remembered until a passkey signs (signKeep clears the refusal, and forgets the record when another
+  // key signed)
   // `fp` null is a plain sign request whose signer the answer names (signCeremony): `rawId` is then a list of the ids the
   // page knows (one remembered id, or all the enrolled ones, or none for the OS's own list), asked for together; a refusal
-  // of a single remembered id is remembered under rp|* and the next tap asks for none
+  // of a single remembered id is remembered under rp|<the key it was remembered for>, so signWho passes over that key on
+  // the next tap (the next remembered key, else the OS's own list)
   function signAsk(pk, rp, fp, rawId) {
     if (fp === null) {
-      const noAny = rp + "|*";
       const ids = (Array.isArray(rawId) ? rawId : []).filter(signDecodable);
-      const mineIds = Object.values(signMine(rp));
-      const remembered = ids.length === 1 && mineIds.includes(ids[0]);
-      const use = ids.length && !(remembered && signRefusedId.has(noAny))
-        ? { allowCredentials: ids.map((i) => ({ type: "public-key", id: signUnb64u(i) })) } : {};
-      return signGet(Object.assign({}, pk, use), remembered ? () => signRefusedId.add(noAny) : null);
+      const mine = signMine(rp);
+      const of = ids.length === 1 ? Object.keys(mine).find((k) => mine[k] === ids[0]) : undefined;
+      const use = ids.length ? { allowCredentials: ids.map((i) => ({ type: "public-key", id: signUnb64u(i) })) } : {};
+      return signGet(Object.assign({}, pk, use), of !== undefined ? () => signRefusedId.add(rp + "|" + of) : null);
     }
     const noId = rp + "|" + fp;
     const local = !!rawId && typeof rp === "string" && signMine(rp)[fp] === rawId;
@@ -5321,7 +5333,7 @@
     return prov + when + (typeof f.seq === "number" ? " (#" + f.seq + ")" : "") + (when || typeof f.seq === "number" ? "" : " · " + fp.slice(0, 18) + "…");
   }
   // Which passkey signs: the one this browser used before, else the only one enrolled; with several remembered, the newest
-  // enrolled of them. With several and no record the person picks (buttons put into `host`, the phone's pick list), unless
+  // enrolled of them that the authenticator has not refused on this page. With several and no record the person picks (buttons put into `host`, the phone's pick list), unless
   // `mode` is "late": a plain sign request, whose signer the cockpit's reply names, never draws a pick. Late resolves
   // {fp: null, rawIds}: the one remembered id (no OS chooser), else every enrolled id when all are known, else none (the OS's
   // own list, which holds every levain passkey this device has). The credential id is this browser's own record, else
@@ -5339,13 +5351,18 @@
     const idOf = (fp) => (Object.prototype.hasOwnProperty.call(local, fp) ? local[fp]
       : (Object.prototype.hasOwnProperty.call(held, fp) && held[fp] && typeof held[fp].credential_id === "string"
         ? held[fp].credential_id : null));
-    const known = signers.filter((fp) => Object.prototype.hasOwnProperty.call(local, fp));
+    const remembered = signers.filter((fp) => Object.prototype.hasOwnProperty.call(local, fp));
+    // a remembered key whose id the authenticator refused on this page is passed over (L3 picker r1): asking it again would
+    // fail again, and a bound challenge must never pair it with the OS's whole list, which signs with a key it is not bound to
+    const known = remembered.filter((fp) => !signRefusedId.has(rp + "|" + fp));
     const seqOf = (fp) => (held[fp] && typeof held[fp].seq === "number" ? held[fp].seq : -1);
     const newest = (fps) => fps.reduce((best, fp) => (seqOf(fp) >= seqOf(best) ? fp : best), fps[0]);
     if (mode === "late") {
       if (known.length) { const ids = [local[newest(known)]]; return Promise.resolve({ fp: null, rawIds: ids }); }
       const all = signers.map(idOf);
-      return Promise.resolve({ fp: null, rawIds: signers.length && all.every((i) => typeof i === "string") ? all : [] });
+      // every remembered key refused: the OS's own list (whichever levain passkey this device holds signs)
+      const ok = !remembered.length && signers.length && all.every((i) => typeof i === "string");
+      return Promise.resolve({ fp: null, rawIds: ok ? all : [] });
     }
     if (known.length) { const fp = newest(known); return Promise.resolve({ fp: fp, rawId: local[fp] }); }
     if (signers.length === 1) return Promise.resolve({ fp: signers[0], rawId: idOf(signers[0]) });
@@ -5367,7 +5384,9 @@
         const p = el("button", "undo-btn sign-pick", signKeyLabel(fp, held[fp]));
         p.type = "button";
         p.title = fp;
-        p.addEventListener("click", () => { end(); resolve({ fp: fp, rawId: idOf(fp) }); });
+        // a pick is his word for that key: a refusal recorded for it is over, so it is asked for by its id (the challenge is
+        // bound to it, so the OS's whole list would offer keys that cannot answer it)
+        p.addEventListener("click", () => { end(); signRefusedId.delete(rp + "|" + fp); resolve({ fp: fp, rawId: idOf(fp) }); });
         picks.push(p);
         host.appendChild(p);
       }

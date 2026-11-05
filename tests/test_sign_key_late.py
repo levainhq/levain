@@ -152,3 +152,104 @@ def test_the_listing_facts_carry_the_enrol_date_and_number(rig) -> None:
     assert facts[rig.b.key.fingerprint]["seq"] == 2
     assert facts[rig.b.key.fingerprint]["enrolled_at"] == "2026-11-02T10:00:00Z"
     assert "credential_id" not in facts[rig.b.key.fingerprint]
+
+
+# --- L3 picker r1 fixes (project_memory/1105-7/L3_picker_r1.txt) ---------------------------------------------------------
+
+
+@pytest.mark.parametrize("fp", [None, 7, ["x"], {"a": 1}])
+def test_s7_a_signer_fp_that_is_present_must_be_a_fingerprint(rig, fp) -> None:
+    """An explicit null is not "left out": a page bug that sends null never turns a bound challenge into a late one."""
+    with pytest.raises(SignRefused) as refused:
+        rig.signer.challenge(RID, {"request_sha256": rig.sha(), "signer_fp": fp})
+    assert refused.value.status == 400 and "signer_fp must be a passkey's fingerprint" in str(refused.value)
+    assert rig.signer._challenged == {}
+
+
+def test_s8_a_body_without_its_listed_version_is_never_challenged(rig) -> None:
+    """request_sha256 is required: an empty body is malformed (400); a body naming only a key is a page from before the
+    version was sent and keeps its 409 "reload" (test_phone_sign pins that; the L3 r1 ask to make it 400 is routed)."""
+    for body, status in (({}, 400), ({"signer_fp": rig.a.key.fingerprint}, 409), ({"signer_fp": None}, 400)):
+        with pytest.raises(SignRefused) as refused:
+            rig.signer.challenge(RID, body)
+        assert refused.value.status == status, (body, refused.value)
+    assert rig.signer._challenged == {}
+
+
+def test_s9_more_active_keys_than_the_cap_is_refused_at_the_challenge_before_any_tap(rig, monkeypatch) -> None:
+    monkeypatch.setattr(signmod, "_LATE_KEYS_MAX", 1)
+    with pytest.raises(SignRefused) as refused:
+        rig.signer.challenge(RID, {"request_sha256": rig.sha()})
+    assert "2 passkeys are enrolled" in str(refused.value) and "names the key" in str(refused.value), refused.value
+    assert rig.signer._challenged == {}
+    # a bound challenge is not capped
+    ch = rig.signer.challenge(RID, {"signer_fp": rig.b.key.fingerprint, "request_sha256": rig.sha()})
+    assert rig.signer.answer(RID, rig.b.assertion(ch["challenge"]))["signer_fp"] == rig.b.key.fingerprint
+
+
+def _bad_key(seq: int, public_key: str) -> AuthorityKey:
+    return AuthorityKey(fingerprint=f"SHA256:bad{seq}", public_key=public_key, key_class="display-phone",
+                        enrolled_seq=seq, enrolled_at=f"2026-11-0{seq}T10:00:00Z")
+
+
+def _other_site_key(seq: int) -> AuthorityKey:
+    priv = ec.generate_private_key(ec.SECP256R1())
+    spki = priv.public_key().public_bytes(serialization.Encoding.DER, serialization.PublicFormat.SubjectPublicKeyInfo)
+    line = public_key_line(spki, "example.com")
+    return AuthorityKey(fingerprint=fingerprint_of(line), public_key=line, key_class="display-phone", enrolled_seq=seq,
+                        enrolled_at=f"2026-11-0{seq}T10:00:00Z")
+
+
+def test_s10_a_late_answer_moves_past_a_key_whose_own_line_refuses_it(rig) -> None:
+    """complement MED 1: the newest active keys are a malformed line and a key made on another site; tried first, each
+    refuses for a reason of its own, and the older well-formed key that signed still verifies."""
+    bad = _bad_key(9, "sk-ecdsa-sha2-nistp256@openssh.com AAAA")
+    other = _other_site_key(8)
+    rig.active[bad.fingerprint] = bad
+    rig.active[other.fingerprint] = other
+    ch = rig.signer.challenge(RID, {"request_sha256": rig.sha()})
+    assert rig.signer.answer(RID, rig.a.assertion(ch["challenge"]))["signer_fp"] == rig.a.key.fingerprint
+    assert _verify(rig.dir, rig.a.key) == 0
+
+
+def test_s11_a_late_answer_no_key_verifies_says_the_last_keys_own_problem(rig) -> None:
+    bad = _bad_key(9, "ssh-ed25519 AAAA")
+    rig.active.clear()
+    rig.active[bad.fingerprint] = bad
+    ch = rig.signer.challenge(RID, {"request_sha256": rig.sha()})
+    with pytest.raises(SignRefused, match="the enrolled key is not a sk-ecdsa"):
+        rig.signer.answer(RID, rig.a.assertion(ch["challenge"]))
+    assert not (rig.dir / "sign" / f"{RID}.signed.json").exists()
+
+
+def test_s12_a_problem_of_the_answer_itself_refuses_on_the_first_well_formed_key(rig, monkeypatch) -> None:
+    """No user verification is the answer's, not a key's: it refuses at once in its own words, and no candidate is spawned
+    for. The malformed key is the OLDEST, tried last, so an answer problem passed over as a key's would end in its words."""
+    import levain.authority as authority
+
+    spawned: list[str] = []
+    real = authority.verify_link_sig
+    monkeypatch.setattr(authority, "verify_link_sig", lambda *a, **k: spawned.append(k["fingerprint"]) or real(*a, **k))
+    bad = _bad_key(0, "sk-ecdsa-sha2-nistp256@openssh.com AAAA")
+    rig.active[bad.fingerprint] = bad
+    ch = rig.signer.challenge(RID, {"request_sha256": rig.sha()})
+    answer = rig.a.assertion(ch["challenge"])
+    auth = bytearray(base64.urlsafe_b64decode(answer["authenticator_data"] + "=="))
+    auth[32] = 0x01                                           # user present, not verified
+    answer["authenticator_data"] = _b64u(bytes(auth))
+    with pytest.raises(SignRefused, match="did not verify the user"):
+        rig.signer.answer(RID, answer)
+    assert spawned == []
+    with pytest.raises(SignRefused, match="not base64url"):
+        rig.signer.answer(RID, {**rig.a.assertion(ch["challenge"]), "signature": "!!"})
+
+
+def test_s13_a_bound_answer_under_a_malformed_key_refuses_in_the_same_words(rig) -> None:
+    """The late loop's skip is late only: a challenge bound to a key whose line is malformed refuses on that key, as
+    before."""
+    bad = _bad_key(9, "sk-ecdsa-sha2-nistp256@openssh.com AAAA")
+    rig.active[bad.fingerprint] = bad
+    ch = rig.signer.challenge(RID, {"signer_fp": bad.fingerprint, "request_sha256": rig.sha()})
+    with pytest.raises(SignRefused) as refused:
+        rig.signer.answer(RID, rig.a.assertion(ch["challenge"]))
+    assert str(refused.value) == "the enrolled key is truncated"

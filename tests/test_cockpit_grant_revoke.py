@@ -135,6 +135,25 @@ def test_without_a_signer_no_grant_route_exists(world, tmp_path, monkeypatch) ->
     assert [g.id for g in grant_listing(world.root, now=_now())[0]] == [GID]
 
 
+def test_the_listings_key_facts_are_display_only_and_their_failure_never_costs_it(world, tmp_path, monkeypatch) -> None:
+    """L3 picker r1 (deepseek MED): the ``credentials`` read is a label for the revoke's pick list. A key_facts that raises
+    leaves ``credentials`` empty and the listing whole, never a 500."""
+    monkeypatch.setenv("LEVAIN_HOME", str(world.qdir.parent))
+    _grant(world, GID, "Write")
+    signer = _signer(world)
+    with _serving(tmp_path / "inst", signer=signer, extra_hosts=[RP]) as (url, _httpd):
+        status, listed = _call(url, "/cockpit/grant/list.json")
+        assert status == 200 and world.phone.fp in listed["credentials"], listed    # the facts, when they read
+
+        def broken(_signers: Any) -> Any:
+            raise RuntimeError("the facts store is gone")
+
+        monkeypatch.setattr(signer, "key_facts", broken)
+        status, listed = _call(url, "/cockpit/grant/list.json")
+        assert status == 200 and listed["credentials"] == {}, listed
+        assert [g["id"] for g in listed["grants"]] == [GID] and listed["origin"] == PAGE, listed
+
+
 # --- the page ----------------------------------------------------------------------------------------------------
 
 
