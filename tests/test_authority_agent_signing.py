@@ -83,7 +83,10 @@ _LEVAIN = Path(auth.__file__).resolve().parent
 # until someone reads it and adds it here, which is the point
 _CALLERS = {"agents/signing.py": "agent links", "chat_egress/key_setup.py": "egress setup records",
             "cli.py": "graduation policies, shell and consent grants", "cockpit/keys.py": "key enrolments and revokes",
-            "consent/grants.py": "grant revokes"}
+            "consent/grants.py": "grant revokes",
+            # added with voice custody (V1-1, L3 custody r1/r2): voice key records, by create_grant or a loosen that
+            # swaps the provider's one voice key; it prepares no agent link
+            "voice/custody.py": "voice key records"}
 
 
 def _preparing_scopes(source: str) -> list[tuple[str, bool]]:
