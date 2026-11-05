@@ -9,7 +9,7 @@ from pathlib import Path
 from tests.test_cockpit_flip_parity import _drive, needs_browser
 from tests.test_cockpit_webpush import _signed
 from tests.test_cockpit_pairing_http import T
-from tests.test_notify_center_page import MODAL, PILL, ROWS, Rig, _center, _json
+from tests.test_notify_center_page import MODAL, ROWS, Rig, _center, _json
 
 WIDE = {"emulate": {"w": 1280, "h": 900, "dpr": 1}}
 
