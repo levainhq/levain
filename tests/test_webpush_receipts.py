@@ -404,7 +404,7 @@ def test_a_push_posts_received_then_shown_with_the_endpoint_hash_and_ids_only() 
     assert "secret body" not in json.dumps(got["posts"])
     assert got["shownCalls"] == [{"title": "T", "tag": "x"}] and got["queued"] == []
     assert _receipt_steps(got) == [("received", "ok", None), ("shown", "ok", None)]
-    assert any(e["step"] == "sw-version" and e["version"] == "1105-pushshown-1" and e["on"] == "push" for e in got["trace"])
+    assert any(e["step"] == "sw-version" and e["version"] == "1105-pushshown-2" and e["on"] == "push" for e in got["trace"])
 
 
 @needs_node
@@ -580,6 +580,30 @@ def test_only_a_notification_with_this_exact_tag_counts_as_held() -> None:
     got = _run("ok+swallowed+othertag+getnall")
     assert [p["body"]["kind"] for p in got["posts"]] == ["received"], got["posts"]
     assert [(e["why"], e["count"]) for e in got["trace"] if e["step"] == "show-missing"] == [("absent", 1)]
+
+
+@needs_node
+def test_a_stale_held_notification_with_the_same_tag_does_not_certify_a_new_ping() -> None:
+    """A re-ping reuses the ref as its tag (renotify). The UA still holds the EARLIER ping's notification (data.ping 41)
+    under that tag and the platform swallowed the new show (ping 42): the tag alone matches, the ping does not, so only
+    `received` goes. A held notification carrying no ping (or no data at all) is not a match either."""
+    for flag in ("staleheld", "foreigndata", "nodata"):
+        got = _run("ok+swallowed+" + flag)
+        assert [(p["body"]["ping"], p["body"]["kind"]) for p in got["posts"]] == [(42, "received")], (flag, got["posts"])
+        assert [(e["why"], e["count"]) for e in got["trace"] if e["step"] == "show-missing"] == [("absent", 1)], flag
+    # the same stale notification, but the new show was held (it replaced the old one under the tag): shown goes
+    got = _run("ok+staleheld")
+    assert [(p["body"]["ping"], p["body"]["kind"]) for p in got["posts"]] == [(42, "received"), (42, "shown")], got["posts"]
+
+
+@needs_node
+def test_a_throw_out_of_the_held_check_leaves_the_received_receipt_and_the_queue_drain_intact() -> None:
+    """The shown arm's chain ends in a catch: even a failure inside heldByAgent's own failure path (a tag whose length
+    throws; nothing real sends one) rejects nothing into Promise.all, so `received` goes and the queue is still drained."""
+    got = _run("ok+swallowed+taghostile+seed1")
+    kinds = [(p["body"]["ping"], p["body"]["kind"]) for p in got["posts"]]
+    assert (42, "received") in kinds and (42, "shown") not in kinds, kinds
+    assert (100, "received") in kinds, kinds                      # the seeded entry was re-sent: the drain ran
 
 
 @needs_node

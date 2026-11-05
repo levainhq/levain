@@ -94,14 +94,14 @@ const self_ = {
     showNotification: async (title, o) => {
       log.order.push('show'); log.shownCalls.push({ title, tag: o.tag });
       if (log.showThrows) throw new Error('showNotification refused');
-      if (!log.swallowed) { log.held = log.held.filter((n) => n.tag !== o.tag).concat([{ title, tag: o.tag }]); }
+      if (!log.swallowed) { log.held = log.held.filter((n) => n.tag !== o.tag).concat([{ title, tag: o.tag, data: o.data }]); }
     },
     getNotifications: async (filter) => {
       log.getNotificationsCalls.push(filter === undefined ? null : filter);
       if (log.getnThrows) throw new TypeError('getNotifications refused');
       const tag = filter && filter.tag;
       // 'getnall': a filter the UA ignores (an old WebKit returned every notification of the app whatever the tag)
-      return log.held.filter((n) => log.getnAll || !tag || n.tag === tag).map((n) => ({ title: n.title, tag: n.tag }));
+      return log.held.filter((n) => log.getnAll || !tag || n.tag === tag).map((n) => ({ title: n.title, tag: n.tag, data: n.data }));
     },
     pushManager: { getSubscription: async () => log.subscription },
   },
@@ -218,6 +218,11 @@ function fire(type, ev) {
     log.getnAll = parts.includes('getnall');
     if (parts.includes('nogetn')) delete self_.registration.getNotifications;
     if (parts.includes('othertag')) log.held = [{ title: 'other', tag: 'np-other' }];   // the UA holds another ping's notification
+    // 'staleheld': the UA still holds an EARLIER ping's notification under this push's tag (a re-ping reuses the tag with
+    // renotify); with 'swallowed' the new show leaves it as it was. 'foreigndata': held under the tag with no ping in its data
+    if (parts.includes('staleheld')) log.held = [{ title: 'old', tag: 'x', data: { url: '/', ping: 41 } }];
+    if (parts.includes('foreigndata')) log.held = [{ title: 'old', tag: 'x', data: { url: '/' } }];
+    if (parts.includes('nodata')) log.held = [{ title: 'old', tag: 'x' }];
     if (parts.includes('subhang')) self_.registration.pushManager.getSubscription = () => new Promise(() => {});
     if (parts.includes('cachehang')) {
       const realOpen = caches.open;
@@ -245,6 +250,9 @@ function fire(type, ev) {
                    url: '/?view=notifications&n=p409', ping: 409, badge: 1 };
     const data = parts.includes('noping') ? { title: 'T', body: 'secret body' }
       : parts.includes('p409') ? p409 : { title: 'T', body: 'secret body', ping: 42, url: '/', tag: 'x' };
+    // 'taghostile': a tag whose length throws, so heldByAgent's own failure path throws too (nothing real sends one: the
+    // flag exists to reach the chain's trailing catch)
+    if (parts.includes('taghostile')) data.tag = { get length() { if (!log.hostileTagDone) throw new TypeError('hostile tag'); return 7; }, toString: () => 'hostile' };
     const started = Date.now();
     const evPush = () => ({ data: { json: () => data } });
     if (!parts.includes('clickonly')) {
@@ -542,6 +550,7 @@ function fire(type, ev) {
       await Promise.all(waits);
     }
   }
+  log.hostileTagDone = true;   // the hostile tag stops throwing once the worker is done, so the log can be written
   console.log(JSON.stringify(log));
   if (scenario === 'hold') process.exit(0);
 })().catch((e) => { console.log(JSON.stringify({ error: String(e && e.stack || e) })); process.exit(1); });

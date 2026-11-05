@@ -2,8 +2,11 @@
 
 ``levain ping receipts [--since 7d] [--json] [--ref REF]``. The server knows what it sent and what each push service
 answered (``deliveries``); a device that woke for a push reports ``received`` (the worker's push event fired) and
-``shown`` (showNotification resolved) to ``/webpush/receipt``, and a tap is already an ``opens`` row. This module joins the
-four per ping and device.
+``shown`` to ``/webpush/receipt``, and a tap is already an ``opens`` row. ``shown`` means the browser still lists the
+notification for THIS ping (showNotification resolved and getNotifications holds one carrying the ping's number), never that
+the OS drew it: a Focus, a scheduled summary or a banner the OS chose to hold back look the same from inside. The proof
+that someone SAW a ping is a tap (an ``opens`` row) or an answer, not ``shown``. This module joins the four per ping and
+device.
 
 Reading it: a ping with no receipt is ``no receipt yet``, never lost. A device that has not woken since cannot have
 reported, so ``silent`` is said only when that device reported a receipt (on any ping, of any kind) whose time is LATER
