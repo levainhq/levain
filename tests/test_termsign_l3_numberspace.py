@@ -416,3 +416,15 @@ def test_host_numbers_reads_past_the_bound_variable_limit(store):
     got = band_view.allocate(store, "host", [f"r{i}" for i in range(3)])
     ns = set(range(1, 1200)) | {2_000_000}
     assert band_view._host_numbers(store, ns) == set(got.values())
+
+
+def test_the_suite_cannot_reach_the_real_terminal_key():
+    # 11-04: band-answer tests under a session reached `ssh-keygen -Y sign` on the real key (a Touch ID sheet per run);
+    # conftest's autouse guard refuses the real key directory at both signer factories, before any signer exists.
+    from levain.consent import terminal_sign as ts
+
+    real = ts._real_key_dir() / ts.KEY_LABEL
+    with pytest.raises(AssertionError, match="real terminal key"):
+        ts.default_signer_factory(real, 1.0)
+    with pytest.raises(AssertionError, match="real terminal key"):
+        ts.default_desk_signer_factory(real, 1.0)

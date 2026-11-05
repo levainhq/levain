@@ -92,6 +92,30 @@ def _no_operator_git_config_reads(monkeypatch):
 
 
 @pytest.fixture(autouse=True)
+def _no_touch_id_from_any_test(monkeypatch):
+    """TEST ONLY: no test raises Touch ID on the operator's laptop. The two signer factories are the only doors to
+    the real terminal key (``~/.levain/keys``), and a band-answer test that parsed a line under a session reached it
+    through ``default_signer_factory`` with no key directory given (11-04: each run raised the sheet). A key under the
+    real key directory is refused here with an ``AssertionError`` (the sign step records it as an unsigned
+    ``signer-error``); any other key path (a test's own temp key) signs as before, and a test that patches either
+    factory itself replaces this guard."""
+    try:
+        from levain.consent import terminal_sign as ts
+    except ImportError:
+        return
+    real_dir = ts._real_key_dir()
+
+    def guard(factory):
+        def guarded(key_path, timeout=None):
+            if Path(key_path).resolve().is_relative_to(real_dir.resolve()):
+                raise AssertionError("a test reached the real terminal key (Touch ID)")
+            return factory(key_path, timeout)
+        return guarded
+    monkeypatch.setattr(ts, "default_signer_factory", guard(ts.default_signer_factory))
+    monkeypatch.setattr(ts, "default_desk_signer_factory", guard(ts.default_desk_signer_factory))
+
+
+@pytest.fixture(autouse=True)
 def _no_input_idle_source(monkeypatch):
     """The consent hook reads this Mac's real input idle (`levain.consent.auto_away.input_idle_seconds`), so a
     suite run while nobody touches the machine would hold requests no test meant to hold. Every in-process test
