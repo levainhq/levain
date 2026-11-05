@@ -388,6 +388,9 @@ LAZY_SITES = {
     'levain/consent/queue.py::ConsentQueue.answer_terminal_ruling::from levain.consent import terminal_sign as ts': 'operator',
     # operator: ``_carrier`` is called only by ``_terminal_ruling_refusal`` and ``answer_terminal_ruling`` (the two rows above), so it runs in the same operator processes
     'levain/consent/queue.py::ConsentQueue._carrier::from levain.consent import terminal_sign as ts': 'operator',
+    # operator: ``_announce_settled`` runs from ``ConsentQueue._write`` and ``sweep`` is a ``ConsentQueue`` method, both on an INSTANCE; the root queue broker (``levain/qbroker/``) uses only the module-level ``answer_refusal`` and ``ConsentQueue._face`` and builds no instance (``git grep -n "ConsentQueue(" -- levain/qbroker levain/slot/services`` finds none), so only the operator's processes (the hooks, the cockpit, the CLI) announce a settle or prune a mark
+    'levain/consent/queue.py::ConsentQueue._announce_settled::from levain.consent.band_notice import announce_settled': 'operator',
+    'levain/consent/queue.py::ConsentQueue.sweep::from levain.consent.band_notice import prune_marks': 'operator',
     # operator: ``receipt_log.verify``'s one caller is ``levain/cli.py``'s ``_cmd_consent_receipts_verify`` (``levain consent receipts verify``); the broker reads ``head`` / ``head_refusal`` only
     'levain/consent/receipt_log.py::verify::from levain.authority import AuthorityError, VerifierUnavailable, anchor_path': 'operator',
     'levain/consent/receipt_log.py::verify::from levain.consent.answering import answer_root': 'operator',
