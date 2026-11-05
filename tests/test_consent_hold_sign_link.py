@@ -54,8 +54,24 @@ def test_a_held_requests_ping_says_what_it_is_in_the_sheets_own_words(home, monk
     rid, call = _hold(home, monkeypatch)
     assert (call["kind"], call["ref"]) == ("consent", f"request:{rid}")
     assert call["title"] == HELD_TITLE != "levain"
-    assert call["body"] == "claude_code is waiting for your approval: Write: a.txt. Open it to Allow or Deny (held up to 300 s)."
+    assert call["body"] == "claude_code is waiting for your approval: Write: a.txt. Open it to review and answer (held up to 300 s)."
     assert rid not in call["body"] and call["push"] is True
+
+
+def test_the_words_promise_no_answer_the_sheet_may_not_offer(home, monkeypatch, tmp_path) -> None:
+    """An agent-configuration write is filed at T3 (_gate_call in claude_code.py and codex.py) and a phone passkey can only DENY a T3: its
+    sheet offers Deny alone. The hook that words the ping knows neither the tier of the request nor the key that opens it,
+    so the words name no answer ("Allow") at all; the link says "Review", the sheet itself says what it offers."""
+    rid, call = _hold(home, monkeypatch)
+    t3 = _file(home, "T3", name="cfg.json")
+    with _serving(tmp_path / "inst", signer=_signer(home), extra_hosts=[RP]) as (url, _httpd):
+        t2 = [o["key"] for o in _call(url, f"/cockpit/consent/{_q(rid)}/sheet.json")[1]["request"]["options"]]
+        status, got = _call(url, f"/cockpit/consent/{_q(t3)}/sheet.json")
+    got = got["request"]
+    assert status == 200 and [o["key"] for o in got["options"]] == ["deny"] and "cannot allow a T3" in got["note"], got
+    assert t2 == ["allow", "deny"]
+    for words in (call["body"], claude_code.hold_message("claude_code", "Write: cfg.json", 300.0)):
+        assert "Allow" not in words and "Approve" not in words, words
 
 
 @pytest.mark.parametrize("kind", ["consent", "push", "reping"])
@@ -137,6 +153,80 @@ def test_a_lapsed_hold_and_a_vanished_request_and_a_ping_with_no_request(tmp_pat
     assert items["p2"]["sheet"] == {"id": "pend-nope", "state": "gone"}
     assert items["p3"]["sheet"] is None and items["p4"]["sheet"] is None
     assert items["p5"]["sheet"] == {"id": soon.id, "state": "expired"}
+    # the grace window: the queue still says "pending" past expires_at; the card and the sheet read it the same way (expired)
+    assert [items[i]["needs_open"] for i in ("p1", "p2", "p5")] == [False, False, False]
+
+
+def test_a_request_is_read_from_the_queue_once_per_page_whatever_reads_it(tmp_path, monkeypatch) -> None:
+    """The card's ``needs_open`` and the sheet's state are one reading per request per page (a list of N approval pings
+    is N queue reads, as before the sheet existed), not one each."""
+    from datetime import timedelta
+
+    from levain.consent.queue import ConsentQueue, authority_source
+    from tests._h4 import h4_home
+
+    q = tmp_path / "q"
+    q.mkdir(mode=0o700)
+    cq = ConsentQueue(q, authority=authority_source(q, anchor=None), home=h4_home())
+    r = cq.file(agent="claude_code", agent_session_id="s", tool_name="Write", tool_input={"file_path": "/w/a", "content": "x"},
+                cwd="/w", hold=timedelta(minutes=5), event_id="e1")
+    s = PushStore(q)
+    s.add_ping("consent", f"request:{r.id}", "t", "b")
+    s.add_ping("reping", f"request:{r.id}", "t", "b")
+    reads: list[str] = []
+    real = ConsentQueue.get
+    monkeypatch.setattr(ConsentQueue, "get", lambda self, rid: reads.append(rid) or real(self, rid))
+    items = center.list_items(s)["items"]
+    assert [i["sheet"]["state"] for i in items] == ["open", "open"] and [i["needs_open"] for i in items] == [True, True]
+    assert reads == [r.id]
+
+
+@pytest.mark.parametrize("row", [
+    ("none_expires", lambda: type("R", (), {"expires_at": None})(), "pending"),
+    ("int_expires", lambda: type("R", (), {"expires_at": 5})(), "pending"),
+    ("no_expires", lambda: object(), "pending"),
+    ("odd_tuple", lambda: (1, 2, 3), None),
+], ids=lambda r: r[0] if isinstance(r, tuple) else None)
+def test_an_unreadable_row_answers_unread_and_never_fails_the_list(tmp_path, monkeypatch, row) -> None:
+    """A row whose ``expires_at`` is not a stamp, or one the store hands back in a shape the reader does not expect, is
+    ``unread`` for that item; the list is still served (its other items intact)."""
+    from levain.consent.queue import ConsentQueue
+
+    _name, make, state = row
+    q = tmp_path / "q"
+    q.mkdir(mode=0o700)
+    s = PushStore(q)
+    s.add_ping("consent", "request:pend-x", "t", "b")
+    s.add_ping("dated", None, "t", "Due today")
+    monkeypatch.setattr(ConsentQueue, "get", lambda self, rid: make() if state is None else (make(), state))
+    doc = center.list_items(s)
+    by = {i["id"]: i for i in doc["items"]}
+    assert by["p1"]["sheet"] == {"id": "pend-x", "state": "unread"} and by["p1"]["needs_open"] is False
+    assert by["p2"]["sheet"] is None and center.get(s, "p1")["item"]["sheet"]["state"] == "unread"
+
+
+def test_a_prompt_notice_is_not_a_request_ping_and_the_center_draws_no_sheet_for_it(home, monkeypatch) -> None:
+    """The agent's own dialog still waits (no hold): ``prompt_notice`` used to record under ``request:<id>`` whenever the hook
+    had filed a request, which the center reads as a held request (a sheet box saying "Already decided" for a request the
+    hook withdrew as it left). It records under ``prompt:`` now; the hold's own ping for the same request still dedupes it."""
+    calls: list[dict] = []
+    phone(home.qdir)
+    monkeypatch.setattr("levain.consent.auto_away.input_idle_seconds", lambda: 10.0)
+    monkeypatch.setattr(sender, "spawn", lambda qdir, **kw: calls.append(kw) or True)
+    rid = _file(home)
+    assert _queue(home).withdraw(rid)                      # as the hook leaves the call to the dialog
+    ref = claude_code.prompt_ref(rid)
+    assert ref == f"prompt:{rid}" and claude_code.prompt_ref(None).startswith("prompt:")
+    assert claude_code.prompt_notice(home.qdir, "claude_code", "Bash: touch x", ref) is True
+    assert [(c["kind"], c["ref"], c["title"]) for c in calls] == [("consent", f"prompt:{rid}", "levain")]
+    store, pid = _record(home, calls[0])
+    item = center.get(store, f"p{pid}")["item"]
+    assert item["sheet"] is None and item["needs_ref"] is None and item["needs_open"] is False
+    assert item["source"] == "approval" and item["body"].startswith("claude_code asks in its own dialog")
+    # the hold's ping for the very request keeps the notice from repeating it
+    other = _file(home, name="b.txt")
+    PushStore(home.qdir).add_ping("consent", f"request:{other}", "t", "b")
+    assert claude_code.prompt_notice(home.qdir, "claude_code", "Bash: touch x", claude_code.prompt_ref(other)) is False
 
 
 def test_the_sheet_the_link_opens_renders_and_a_passkey_approves_the_held_request(home, monkeypatch, tmp_path) -> None:
@@ -195,7 +285,7 @@ def _drive_consent_row(tmp_path: Path, setup=None) -> dict:
 def test_the_focus_view_of_a_held_requests_ping_links_the_sheet_on_the_pages_own_origin(tmp_path: Path) -> None:
     d = _drive_consent_row(tmp_path)
     href = f"{d['origin']}/sign/consent/{urllib.parse.quote(d['rid'], safe='')}"
-    assert [(t, h, rel) for t, h, rel, _ in d["link"]] == [("Approve with Face ID", href, "noopener noreferrer")], d
+    assert [(t, h, rel) for t, h, rel, _ in d["link"]] == [("Review with Face ID", href, "noopener noreferrer")], d
     assert d["link"][0][3] >= 44 and "Nothing is sent from here" in d["notes"][0], d       # the HIG hit height; no approve from the tap
     assert d["order"][:3] == ["nc-dmeta", "nc-dtitle", "nc-tools"] and d["order"][3] == "nc-sheetbox", d
 
@@ -204,6 +294,26 @@ def test_the_focus_view_of_a_held_requests_ping_links_the_sheet_on_the_pages_own
 def test_the_focus_view_of_a_decided_request_says_so_and_links_nothing(tmp_path: Path) -> None:
     d = _drive_consent_row(tmp_path, setup=lambda r: _queue_withdraw(r))
     assert d["link"] == [] and d["box"] is True and d["notes"] == ["Already decided: this request was answered, ruled or withdrawn."], d
+
+
+@needs_browser
+@pytest.mark.parametrize("sheet", [{"id": "..", "state": "open"}, {"id": ".", "state": "open"}, {"id": "...", "state": "open"}],
+                         ids=["dotdot", "dot", "dots"])
+def test_an_id_made_only_of_dots_draws_no_sheet_box(tmp_path: Path, monkeypatch, sheet) -> None:
+    """``/sign/consent/..`` would resolve as a path segment, never an id: the focus view draws nothing for it."""
+    d = _drive_consent_row(tmp_path, setup=lambda r: monkeypatch.setattr(center._Reader, "consent_sheet", lambda self, ref: dict(sheet)))
+    assert d["box"] is False and d["link"] == [], d
+
+
+@needs_browser
+@pytest.mark.parametrize("state", ["constructor", "toString", "__proto__", "hasOwnProperty"])
+def test_a_state_named_like_an_inherited_property_is_not_a_known_state(tmp_path: Path, monkeypatch, state) -> None:
+    """The state notes are looked up by own property: a state that is the name of something every object inherits reads as
+    an unreadable one (a note, no link to the sheet from the button), never as a function's source."""
+    d = _drive_consent_row(tmp_path, setup=lambda r: monkeypatch.setattr(
+        center._Reader, "consent_sheet", lambda self, ref: {"id": r.req.id, "state": state}))
+    assert d["link"] == [] and d["box"] is True, d
+    assert len(d["notes"]) == 1 and d["notes"][0].startswith("Could not check this request") and "function" not in d["notes"][0], d
 
 
 def _queue_withdraw(r) -> None:

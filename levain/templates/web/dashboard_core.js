@@ -9139,8 +9139,10 @@
   // the id alone (the sheet's route is /sign/consent/<id>), so it can only open this cockpit's sheet, where the passkey
   // ceremony is the only approval. Nothing is sent from a tap on this page (Phill: no answering from notifications).
   const NC_SHEET_ID = /^[A-Za-z0-9._:-]{1,160}$/;
+  // The wording names no answer: the sheet offers Allow and Deny, or Deny only (a passkey on a phone cannot Allow an
+  // agent-configuration request, which is T3), and this page does not know which.
   const NC_SHEET_NOTE = {
-    open: "Opens the sign sheet for this request; you Allow or Deny there with Face ID. Nothing is sent from here.",
+    open: "Opens the sign sheet for this request; you answer there with Face ID. Nothing is sent from here.",
     closed: "Already decided: this request was answered, ruled or withdrawn.",
     expired: "This request's hold has ended: it can no longer be answered here.",
     gone: "This request is no longer in the queue.",
@@ -9148,16 +9150,19 @@
   };
   function ncSheetBox(it) {
     const sh = it.sheet;
-    if (!sh || typeof sh.id !== "string" || !NC_SHEET_ID.test(sh.id)) return null;
+    // an id made only of dots would resolve as a path segment ("." / ".."), so it is no id
+    if (!sh || typeof sh.id !== "string" || !NC_SHEET_ID.test(sh.id) || /^\.+$/.test(sh.id)) return null;
     const nd = el("div", "nc-sheetbox");
     const href = location.origin + "/sign/consent/" + encodeURIComponent(sh.id);
     if (sh.state === "open") {
-      const go = el("a", "nc-signgo", "Approve with Face ID");
+      const go = el("a", "nc-signgo", "Review with Face ID");
       go.setAttribute("href", href); go.setAttribute("rel", "noopener noreferrer");
       nd.appendChild(go);
     }
-    const note = el("p", "nc-note" + (sh.state === "open" ? "" : " nc-signstate"), NC_SHEET_NOTE[sh.state] || NC_SHEET_NOTE.unread);
-    if (sh.state === "unread") {
+    const known = typeof sh.state === "string" && Object.prototype.hasOwnProperty.call(NC_SHEET_NOTE, sh.state);   // never an inherited name
+    const state = known ? sh.state : "unread";
+    const note = el("p", "nc-note" + (state === "open" ? "" : " nc-signstate"), NC_SHEET_NOTE[state]);
+    if (state === "unread") {
       const a = el("a", "nc-link", "Open the sign sheet");
       a.setAttribute("href", href); a.setAttribute("rel", "noopener noreferrer"); note.append(" ", a);
     }
