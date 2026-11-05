@@ -7,6 +7,7 @@ not POST, a synthetic click does not POST, a trusted click POSTs exactly once ev
 """
 from __future__ import annotations
 
+import hashlib
 import re
 import shutil
 import subprocess
@@ -33,9 +34,13 @@ def test_the_chat_script_is_served_and_the_page_loads_it(tmp_path):
         with urllib.request.urlopen(base + "/dashboard_chat.js", timeout=5) as r:  # noqa: S310 — loopback
             assert r.status == 200
             assert r.headers["Content-Type"].startswith("text/javascript")
-            assert b"/chat/approve" in r.read()
+            served = r.read()
+            assert b"/chat/approve" in served
+        # The URL is the version (1105-17): the page names the script as ``?v=<digest of the bytes served>``, so the
+        # tag pins that exact digest, not just the path (a page naming another digest would be refused 404 by the server).
+        digest = hashlib.sha256(served).hexdigest()[:12].encode()
         with urllib.request.urlopen(base + "/", timeout=5) as r:  # noqa: S310
-            assert b'src="/dashboard_chat.js"' in r.read()
+            assert b'<script src="/dashboard_chat.js?v=%s"></script>' % digest in r.read()
     finally:
         httpd.shutdown()
         httpd.server_close()
