@@ -232,7 +232,7 @@ def test_setup_starts_keys_after_every_account_it_makes(monkeypatch):
     monkeypatch.setattr(hands.shutil, "which", lambda n, path=None: real(n, path=path) or f"/usr/sbin/{n}")
     facts = IH.HostFacts("linux", caller_uid=501, caller_name="alice", operator_uid=501,
                          tool_present=lambda p: True, xcode_ready=lambda: True)
-    plan = IH.plan_setup(parse_install_argv(["setup", "--slots", "2", "--verifier-slots", "1", "--operator", "alice"]),
+    plan = IH.plan_setup(parse_install_argv(["setup", "--slots", "3", "--verifier-slots", "1", "--operator", "alice"]),
                          facts)
     whys = [s.why for s in plan.steps]
     start = whys.index("enable and start levain-keys.service")

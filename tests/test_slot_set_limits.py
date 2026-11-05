@@ -349,7 +349,7 @@ def test_setup_writes_no_policy_limits(host, monkeypatch):
     real = hands.shutil.which          # the other host's tools resolve, as test_slot_install_plan's fixture does
     monkeypatch.setattr(hands.shutil, "which", lambda n, path=None: real(n, path=path) or f"/usr/sbin/{n}")
 
-    plan = IH.plan_setup(_setup(1, 1), setup_facts(host))
+    plan = IH.plan_setup(_setup(3, 1), setup_facts(host))
     target = str(layout.policy_limits_path(host))
     assert plan.steps
     for s in plan.steps:

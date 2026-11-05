@@ -26,7 +26,7 @@ from levain.slot.layout import RUN
 HOSTS = ("linux", "darwin")
 OP, OP_UID = "alice", 501
 ENV = {"SUDO_UID": str(OP_UID)}
-SETUP = ["setup", "--slots", "2", "--verifier-slots", "1", "--operator", OP]
+SETUP = ["setup", "--slots", "3", "--verifier-slots", "1", "--operator", OP]
 TS = "2026-10-20T12:00:00Z"
 S1 = "s-0123456789abcdef"
 
@@ -105,7 +105,7 @@ def test_lock_taken_before_facts_and_held_through_every_step(host):
     assert rc == 0, err
     assert o.calls == ["lock", "gather", "plan", "apply", "unlock"]
     assert out.startswith('{"ok":true,') and out.endswith("\n") and out.count("\n") == 1
-    assert '"verb":"setup"' in out and '"slots":["e0","e1","v0"]' in out
+    assert '"verb":"setup"' in out and '"slots":["e0","e1","e2","v0"]' in out
 
 
 def test_refusals_before_the_lock_read_nothing():
@@ -319,7 +319,7 @@ def test_setup_marks_every_slot_after_its_confinement_and_before_the_runtime_rul
     plan = plan_setup(parse_install_argv(SETUP), _facts(host), read_sysctl=lambda p: "1", program_exists=lambda p: True)
     whys = [s.why for s in plan.steps]
     marks = _index(whys, "mark ")
-    assert [whys[i].split()[1] for i in marks] == ["e0", "e1", "v0"]
+    assert [whys[i].split()[1] for i in marks] == ["e0", "e1", "e2", "v0"]
     sudoers = [i for i, s in enumerate(plan.steps) if s.write and "sudoers.d" in str(s.write[0])]
     record = _index(whys, f"record {OP}")[0]
     confinement = [i for i, w in enumerate(whys) if "pf" in w or "netns" in w or "bwrap" in w or "lo0" in w]

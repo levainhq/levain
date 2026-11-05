@@ -38,7 +38,7 @@ def _facts(host, **kw):
 
 
 def _setup_cmd():
-    return parse_install_argv(["setup", "--slots", "2", "--verifier-slots", "1", "--operator", OP])
+    return parse_install_argv(["setup", "--slots", "3", "--verifier-slots", "1", "--operator", OP])
 
 
 def _plan(host, **kw):

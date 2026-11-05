@@ -89,7 +89,7 @@ def _fresh_linux_plan():
     real = hands.shutil.which
     hands.shutil.which = lambda n, path=None: real(n, path=path) or f"/usr/sbin/{n}"
     try:
-        cmd = parse_install_argv(["setup", "--slots", "2", "--verifier-slots", "1", "--operator", "alice"])
+        cmd = parse_install_argv(["setup", "--slots", "3", "--verifier-slots", "1", "--operator", "alice"])
         facts = HostFacts("linux", caller_uid=501, caller_name="alice", operator_uid=501,
                           tool_present=lambda p: True, xcode_ready=lambda: True)     # no operator record: a fresh host
         return plan_setup(cmd, facts, read_sysctl=lambda p: "1", program_exists=lambda p: True)

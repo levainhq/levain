@@ -266,7 +266,7 @@ def _facts(host, **kw):
 
 
 def _abandoned(host):
-    first = plan_setup(parse_install_argv(["setup", "--slots", "2", "--verifier-slots", "1", "--operator", OP]),
+    first = plan_setup(parse_install_argv(["setup", "--slots", "3", "--verifier-slots", "1", "--operator", OP]),
                        _facts(host), read_sysctl=lambda p: "1", program_exists=lambda p: True)
     j = first.intent
     made = {**{g: j.groups[g] for g in SHARED_GROUPS}, **{n: j.accounts[n] for n in SINGLETONS},

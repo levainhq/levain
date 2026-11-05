@@ -76,7 +76,7 @@ from typing import Callable, Dict, List, Mapping, Optional, Tuple
 from levain.contracts import ContractError, canon
 from levain.contracts.grammar import JSON_INT_MAX
 from levain.slot import Refused
-from levain.slot.grammar import INDEX_SPACE, SESSION_RE
+from levain.slot.grammar import EGRESS_RESERVE, INDEX_SPACE, SESSION_RE
 from levain.slot import limits_doc
 from levain.slot.runtime_grammar import VENDORS, _verifier_steps
 
@@ -869,7 +869,7 @@ class TicketStore:
         unbound = sum(1 for t in self._by_ticket.values()
                       if t.facts and RENDERS_AS[str(t.facts["kind"])][1] == cls and self._state(t) == UNBOUND
                       and t.facts.get("auth") != "passthrough")       # a passthrough ticket never takes one of these
-        return slots_free(cls) - unbound - (1 if cls == "egress" else 0)
+        return slots_free(cls) - unbound - (EGRESS_RESERVE if cls == "egress" else 0)
 
     def pool_free(self, slots_free: Callable[[str], int]) -> Dict[str, int]:
         """``POOL``'s answer: :meth:`_free` for each class, the count the mint refuses at (DECISION: unclamped, so a

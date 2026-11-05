@@ -555,23 +555,23 @@ def test_pf_alias_steps_in_plans():
     def add(n):
         return ("/sbin/ifconfig", "lo0", "alias", f"127.0.1.{n + 1}", "netmask", "255.255.255.255")
 
-    plan = _plan("darwin", 2, 1)
+    plan = _plan("darwin", 3, 1)
     argvs = [s.argv for s in plan.steps]
-    assert [a for a in argvs if a[:1] == ("/sbin/ifconfig",)] == [add(0), add(1)]
+    assert [a for a in argvs if a[:1] == ("/sbin/ifconfig",)] == [add(0), add(1), add(2)]
     anchor_write = next(i for i, s in enumerate(plan.steps) if s.write and s.write[0] == pf.ANCHOR_FILE)
-    assert max(argvs.index(add(0)), argvs.index(add(1))) < anchor_write
+    assert max(argvs.index(add(0)), argvs.index(add(1)), argvs.index(add(2))) < anchor_write
     assert pf.alias_steps(plan.allocation.slots) == [s for s in plan.steps if s.argv[:1] == ("/sbin/ifconfig",)]
     ids = dict(plan.allocation.ids)
     rep = plan_replenish(parse_install_argv(["replenish"]),
                          _set_up("darwin", used_ids=frozenset(ids.values()), existing_names=frozenset(ids)),
-                         slots=3, verifier_slots=1, live={"egress": range(2), "none": range(1)}, accounts=ids)
+                         slots=4, verifier_slots=1, live={"egress": range(3), "none": range(1)}, accounts=ids)
     rargv = [s.argv for s in rep.steps]
-    assert [a for a in rargv if a[:1] == ("/sbin/ifconfig",)] == [add(0), add(1), add(2)]
-    assert rargv.index(add(2)) < next(i for i, s in enumerate(rep.steps) if s.write and s.write[0] == pf.ANCHOR_FILE)
+    assert [a for a in rargv if a[:1] == ("/sbin/ifconfig",)] == [add(0), add(1), add(2), add(3)]
+    assert rargv.index(add(3)) < next(i for i, s in enumerate(rep.steps) if s.write and s.write[0] == pf.ANCHOR_FILE)
     undo = _undo("darwin", ids)
     uwhys = [s.why for s in undo.steps]
     rems = [i for i, w in enumerate(uwhys) if w.startswith("remove the lo0 alias ")]
-    assert [uwhys[i].split()[-1] for i in rems] == ["127.0.1.1", "127.0.1.2"]
+    assert [uwhys[i].split()[-1] for i in rems] == ["127.0.1.1", "127.0.1.2", "127.0.1.3"]
     last_tomb = max(i for i, s in enumerate(undo.steps) if "tombstone" in s.why)
     flush = uwhys.index("flush the pf anchor com.apple/levain")
     assert last_tomb < min(rems) and max(rems) < flush
@@ -580,7 +580,7 @@ def test_pf_alias_steps_in_plans():
 
 
 def test_pf_anchor_plan_and_undo():
-    plan = _plan("darwin", 2, 1)
+    plan = _plan("darwin", 3, 1)
     w = [s for s in plan.steps if s.write and s.write[0] == pf.ANCHOR_FILE]
     assert len(w) == 1 and w[0].write[1] == pf.anchor_text(plan.allocation.slots, plan.allocation.ids)
     assert w[0].validate == ("/sbin/pfctl", "-n", "-o", "none", "-a", "com.apple/levain", "-f")
@@ -603,9 +603,9 @@ def test_pf_anchor_plan_and_undo():
     ids = dict(plan.allocation.ids)
     rep = plan_replenish(parse_install_argv(["replenish"]),
                          _set_up("darwin", used_ids=frozenset(ids.values()), existing_names=frozenset(ids)),
-                         slots=3, verifier_slots=1, live={"egress": range(2), "none": range(1)}, accounts=ids)
+                         slots=4, verifier_slots=1, live={"egress": range(3), "none": range(1)}, accounts=ids)
     rw = next(s for s in rep.steps if s.write and s.write[0] == pf.ANCHOR_FILE)
-    assert rw.write[1] == pf.anchor_text([SlotId("egress", 0), SlotId("egress", 1), SlotId("egress", 2),
+    assert rw.write[1] == pf.anchor_text([SlotId("egress", 0), SlotId("egress", 1), SlotId("egress", 2), SlotId("egress", 3),
                                           SlotId("none", 0)], {**ids, **rep.allocation.ids})
     # without the in-service slots' uids it refuses rather than render a slot with no rules
     assert _refusal(plan_replenish, parse_install_argv(["replenish"]),
@@ -614,11 +614,11 @@ def test_pf_anchor_plan_and_undo():
 
 
 def _every_plan(host):
-    plan = _plan(host, 2, 1)
+    plan = _plan(host, 3, 1)
     ids = dict(plan.allocation.ids)
     rep = plan_replenish(parse_install_argv(["replenish"]),
                          _set_up(host, used_ids=frozenset(ids.values()), existing_names=frozenset(ids)),
-                         slots=3, verifier_slots=1, live={"egress": range(2), "none": range(1)}, accounts=ids)
+                         slots=4, verifier_slots=1, live={"egress": range(3), "none": range(1)}, accounts=ids)
     return [plan, _undo(host, ids), rep]
 
 
@@ -687,10 +687,10 @@ def test_pf_token_released_on_undo(tmp_path):
 
 
 def test_netns_setup_boot_pass_and_undo():
-    plan = _plan("linux", 2, 1)
+    plan = _plan("linux", 3, 1)
     want = netns.netns_steps(plan.allocation.slots)
     names = [s.argv[-1] for s in want if s.argv[1:3] == ("netns", "add")]
-    assert names == ["levain-e0", "levain-e1", "levain-v0"]
+    assert names == ["levain-e0", "levain-e1", "levain-e2", "levain-v0"]
     for s in want:
         if s.argv[1:3] == ("netns", "add"):
             # present = `ip netns list` names it (not a path test)

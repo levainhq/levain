@@ -236,7 +236,7 @@ def test_repair_completion_is_the_txn(tmp_path: Path) -> None:
     # rendered text is identical whichever verb meets the unfinished repair
     assert (e.value.name, e.value.detail) == ("install-interrupted", "repair")
     with pytest.raises(Refused) as s_e:
-        IH.plan_setup(parse_install_argv(["setup", "--slots", "1", "--verifier-slots", "1", "--operator", OP]),
+        IH.plan_setup(parse_install_argv(["setup", "--slots", "3", "--verifier-slots", "1", "--operator", OP]),
                       facts_with(TXN_B))
     assert str(s_e.value) == str(e.value) == "install-interrupted: repair"
     # equal txns: the repair finished; replenish overwrites its journal with its own
@@ -260,7 +260,7 @@ def test_repair_completion_is_the_txn(tmp_path: Path) -> None:
     with pytest.raises(Refused) as r_e:
         _plan(rjf, rf)
     with pytest.raises(Refused) as s_e:
-        IH.plan_setup(parse_install_argv(["setup", "--slots", "1", "--verifier-slots", "1", "--operator", OP]), rjf)
+        IH.plan_setup(parse_install_argv(["setup", "--slots", "3", "--verifier-slots", "1", "--operator", OP]), rjf)
     assert str(r_e.value) == str(s_e.value) == "install-interrupted: replenish"
     # ...while an unfinished one (txn differs) is resumed at its own txn. U13: its journal names no generation yet
     # (killed before R3), so --source may still establish one; a journaled generation would bind it (see below)
