@@ -240,9 +240,10 @@ class VendorCapture:
                 os.close(fd)
 
 
-#: c7.15: the names under ``<S>/run/`` and the directory itself (root : root 0700, the slot cannot enter it).
-RUN_DIR = "run"
-VENDOR_OUT, VENDOR_ERR = "vendor.out", "vendor.err"
+#: c7.15: the names under ``<S>/run/`` and the directory itself (root : root 0700, the slot cannot enter it). END's,
+#: so the one rule that lets root hash these two (end.start_capture_ok) names the same files.
+RUN_DIR = E.CAPTURE_DIR
+VENDOR_OUT, VENDOR_ERR = E.CAPTURE_LOGS
 _O_LOG_NEW = os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC
 
 
