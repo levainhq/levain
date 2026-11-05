@@ -453,7 +453,7 @@ def test_h7_a_credential_id_that_does_not_decode_is_dropped_and_the_sheet_still_
 
 @needs_browser
 @needs_ssh
-def test_h7_a_stale_remembered_credential_retries_once_without_it_and_is_replaced(tmp_path: Path, monkeypatch) -> None:
+def test_h7_a_stale_remembered_credential_is_asked_without_it_by_the_next_tap_and_is_replaced(tmp_path: Path, monkeypatch) -> None:
     rig = _Rig(tmp_path, monkeypatch)
     fp = rig.pk.key.fingerprint
     with rig.serving():
@@ -461,7 +461,9 @@ def test_h7_a_stale_remembered_credential_retries_once_without_it_and_is_replace
             DESKTOP, rig.authenticator(), _seed("localhost", {fp: "c3RhbGUtY3JlZA"}),     # b64u(b"stale-cred")
             *_open(rig), {"eval": ASKED},
             {"eval": f"{_button('b')}.click() || 1"},
-            {"until": f"/^signed|nothing was signed/.test({NOTE}) && {NOTE}", "ms": 90000},
+            {"until": f"/nothing was signed/.test({NOTE}) && {NOTE}", "ms": 90000},
+            {"eval": f"{_button('b')}.click() || 1"},          # the page never asks again by itself: the retry is a tap
+            {"until": f"/^signed/.test({NOTE}) && {NOTE}", "ms": 90000},
             {"eval": "window.__asked"},
             {"eval": "window.localStorage.getItem('levain-passkeys:localhost')"},
         ])

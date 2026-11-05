@@ -81,8 +81,8 @@ def test_s2_a_cancelled_prompt_keeps_the_remembered_passkey(tmp_path, monkeypatc
             {"eval": RECORD},
         ])
     v = out["values"]
-    assert v[7] == [1, 0], v[7]                           # the retry still happens, once
-    assert json.loads(v[8]) == {rig.pk.key.fingerprint: OTHER}, v[8]   # and the mapping survives both cancels
+    assert v[7] == [1], v[7]                              # the page does not ask again after a cancel
+    assert json.loads(v[8]) == {rig.pk.key.fingerprint: OTHER}, v[8]   # and the mapping survives the cancel
     assert rig.nothing_signed(QRID)
 
 
