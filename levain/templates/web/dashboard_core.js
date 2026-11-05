@@ -27,6 +27,8 @@
 (function () {
   "use strict";
   if (window.LevainCardFormat && typeof window.LevainCardFormat.installFieldGrow === "function") window.LevainCardFormat.installFieldGrow();
+  // the card's commands are drawn by this page's own copy-line builder (copyLine, below), not a second one in card_format.js
+  if (window.LevainCardFormat && typeof window.LevainCardFormat.setCommandBlock === "function") window.LevainCardFormat.setCommandBlock(copyLine);
 
   // ---- tiny DOM helpers (textContent only — never innerHTML on store data) ----
   const el = (tag, cls, text) => {
@@ -4563,6 +4565,13 @@
     }
     return t;
   }
+  // a question body's long text: the one with its line breaks when the body carries it with exactly the words of `blocks`
+  // (card_format.js preferFull), else `blocks` as it came
+  function blocksOf(b) {
+    const F = window.LevainCardFormat;
+    const flat = typeof b.blocks === "string" ? b.blocks : "";
+    return F && typeof F.preferFull === "function" ? F.preferFull(flat, b.blocks_full) : flat;
+  }
   // a question's long text drawn by card_format.js: headed sections, lists, and the options once as rows (text only); null when
   // the module is not loaded or throws, and the caller draws the one line it drew before
   function questionText(text, dropping, options, rec) {
@@ -4613,7 +4622,7 @@
       const known = !b.error;
       const parts = [el("div", "needs-q-title", (known && sv(b.what)) || "Question " + q.n),
                      el("div", "consent-note ext-meta needs-answer-line", known ? "answer not shown" : "answer not shown (" + String(b.error).slice(0, 200) + ")")];
-      const more = known ? blocksBeyondTitle(sv(b.what), sv(b.blocks)) : "";
+      const more = known ? blocksBeyondTitle(sv(b.what), blocksOf(b)) : "";
       if (more) parts.push(questionText(more, null, [], "") || el("div", "ext-meta needs-q-blocks", "blocks: " + more));
       slot.replaceChildren(...parts);
       return;
@@ -4630,7 +4639,7 @@
     if (settledAnswer) {
       parts.push(el("div", "needs-q-title", sv(b.what)));
       parts.push(el("div", "consent-note ext-meta needs-answer-line", answerLine(settledAnswer, options)));
-      const more = blocksBeyondTitle(sv(b.what), sv(b.blocks));
+      const more = blocksBeyondTitle(sv(b.what), blocksOf(b));
       if (more) parts.push(questionText(more, null, [], "") || el("div", "ext-meta needs-q-blocks", "blocks: " + more));
       slot.replaceChildren(...parts);
       return;
@@ -4638,7 +4647,7 @@
     let head = null;     // the focus view's title, blocks and REC lines: a needs-phill sign card is drawn in their place
     if (card) {
       parts.push(el("div", "needs-q-title", sv(b.what)));
-      const more = blocksBeyondTitle(sv(b.what), sv(b.blocks));
+      const more = blocksBeyondTitle(sv(b.what), blocksOf(b));
       if (more) parts.push(questionText(more, null, options, sv(b.rec)) || el("div", "ext-meta needs-q-blocks", "blocks: " + more));
       const recOpt = options.find((o) => o && sv(o.key) === sv(b.rec));
       if (sv(b.rec)) {
@@ -4651,7 +4660,7 @@
       parts.push(el("pre", "consent-display", sv(b.what)));
       const facts = el("div", "consent-facts");
       facts.appendChild(el("span", "ext-meta", b.open_ended || !sv(b.rec) ? "open question: answer in your own words" : "recommends " + sv(b.rec)));
-      const formatted = questionText(sv(b.blocks), null, options, sv(b.rec));
+      const formatted = questionText(blocksOf(b), null, options, sv(b.rec));
       if (formatted) facts.appendChild(formatted);
       else facts.appendChild(el("span", "ext-meta", "blocks: " + sv(b.blocks)));
       parts.push(facts);
@@ -4665,7 +4674,7 @@
     if (open && q.sign) {
       // answered by a signature (DESIGN_SIGN D5): the sign request's own options are the buttons, and no unsigned answer is
       // drawn beside them (an unsigned tap on a row its caller asked to be signed is refused there, never his word)
-      const facet = signFacet(q.sign, head);
+      const facet = signFacet(q.sign, head, blocksOf(b));
       slot.replaceChildren(...parts);
       if (card) { const bottom = el("div", "needs-actions needs-qa needs-sign"); bottom.appendChild(facet); card.appendChild(bottom); }
       else slot.appendChild(facet);
@@ -5449,7 +5458,7 @@
   }
   // the card's part for request `id`: a note line, then the request's own buttons, filled once the listing answers.
   // `head`: the focus view's question lines a needs-phill card replaces (signCardOf), else none
-  function signFacet(id, head) {
+  function signFacet(id, head, full) {
     const wrap = el("div", "sign-facet");
     wrap.dataset.signRequest = id;
     const note = el("div", "sign-note ext-meta", "reading the sign request…");
@@ -5498,6 +5507,7 @@
       // the focus view's needs-phill card (card_format.js, the sheet's rule and builders): drawn in place of the question's
       // title, blocks and REC lines (`head`), the signed text whole one tap away above the buttons, Detail after them
       const nc = head && head.length && head[0].parentNode ? signCardOf(r) : null;
+      if (nc && full) nc.stopped_full = full;     // the stop text's lines; drawDetail uses them only when they are the signed words
       if (nc) {
         const box = window.LevainCardFormat.drawHead(nc, el("pre", "consent-display", r.message));
         box.classList.add("needs-card-head");

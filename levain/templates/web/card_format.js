@@ -5,31 +5,41 @@
 // (the reference); tests/card_format_check.js pins the invariant against real rows.
 //
 // The shape the desk writes: a headline sentence, then `WHAT: ... OPTIONS: (a) x · (b) y REC: a BLOCKS: ...`, with a
-// "lead: - item - item" list inside a section.
+// "lead: - item - item" list inside a section. A text that carries line breaks (flow's `stopped_full`) is read line by line:
+// a line is its own paragraph, and a fenced block, an indented block, a `STEP n` line's command and any line that starts with
+// a path or a known command is drawn as one copyable command block (11-05: commands ran into prose and a "URL:" in a step
+// was read as a section label, which cut the step off).
 (function (root) {
   "use strict";
 
   const collapse = (s) => String(s).split(/\s+/).filter(Boolean).join(" ");
   const tokens = (s) => String(s).split(/\s+/).filter(Boolean);
 
-  // An all-caps run of 1-3 words (3+ letters in all) ending in a colon, followed by a space or the end, not preceded by a
-  // letter or digit. No lookbehind (Safari before 16.4 cannot parse one): the preceding character is group 1 and is not
-  // part of the label.
-  const LABEL = /(^|[^A-Za-z0-9])([A-Z][A-Z0-9'+/&-]+(?: [A-Z0-9][A-Z0-9'+/&-]+){0,2}):(?=\s|$)/g;
+  // The labels the desk writes (flow's fanin_log reads these same words, `_OPT_BLOCK`): only these start a section. An all-caps
+  // word and a colon that is not one of them ("It prints a URL: open it") stays prose. A label is followed by a space or the
+  // end and is not preceded by a letter or digit. No lookbehind (Safari before 16.4 cannot parse one): the preceding
+  // character is group 1 and is not part of the label. Longest first, so WHAT IT BLOCKS is not read as BLOCKS.
+  const KNOWN_LABELS = ["WHAT IT BLOCKS", "OPTIONS", "BLOCKS", "WHAT", "REC", "DIFF", "THEN", "WHY"];
+  const LABEL = new RegExp("(^|[^A-Za-z0-9])(" + KNOWN_LABELS.join("|") + "):(?=\\s|$)", "g");
   // A paragraph break where a sentence ends and the next opens with a short "Label words: " lead. Group 1 is the
   // sentence's closing mark, which stays with its sentence.
   const BREAK = /([.!?])\s+(?=[A-Z][^.:]{0,30}: )/g;
 
+  // A known word that closes a longer all-caps phrase ("DESK REC:", "NOT CLEAN: ...") is that phrase's last word, not a label.
+  const CAPS_BEFORE = /(?:^|\s)[A-Z][A-Z0-9'+/&-]+\s$/;
   function labelMatches(s) {
     const out = [];
     for (const m of s.matchAll(LABEL)) {
-      if ((m[2].match(/[A-Za-z]/g) || []).length < 3) continue;
-      out.push({ label: m[2], start: m.index + m[1].length, end: m.index + m[0].length });
+      const start = m.index + m[1].length;
+      if (CAPS_BEFORE.test(s.slice(Math.max(0, start - 40), start))) continue;
+      out.push({ label: m[2], start: start, end: m.index + m[0].length });
     }
     return out;
   }
 
-  function paragraphs(text) {
+  // `split` false: the text is one paragraph (a line the desk broke itself is not cut again at a sentence + "Lead: ").
+  function paragraphs(text, split) {
+    if (split === false) return [{ kind: "paragraph", text: text.trim() }];
     const parts = [];
     let last = 0;
     for (const m of text.matchAll(BREAK)) {
@@ -42,17 +52,17 @@
 
   // A list when the lead ends in ":" and two or more items follow; the paragraphs after the last item's sentence (a new
   // "Word(s): ..." sentence) become paragraphs of their own.
-  function blocks(text) {
+  function blocks(text, split) {
     if (!text) return [];
     const parts = text.split(" - ");
-    if (parts.length < 3 || !parts[0].endsWith(":")) return paragraphs(text);
+    if (parts.length < 3 || !parts[0].endsWith(":")) return paragraphs(text, split);
     const items = parts.slice(1).map((p) => p.trim());
-    const tail = paragraphs(items.pop());
+    const tail = paragraphs(items.pop(), split);
     let out = [];
     let lead = parts[0];
     const r = parts[0].lastIndexOf(". ");
     if (r >= 0) {
-      out = out.concat(paragraphs(parts[0].slice(0, r) + "."));
+      out = out.concat(paragraphs(parts[0].slice(0, r) + ".", split));
       lead = parts[0].slice(r + 2);
     }
     const first = tail.length && tail[0].kind === "paragraph" ? tail[0].text : "";
@@ -67,9 +77,11 @@
   }
 
   // The text that comes before the first label (with `headline` taken off its front when the text repeats it exactly, at a
-  // word boundary), then every labelled section in order.
+  // word boundary), then every labelled section in order. A text with line breaks is read by lines (sectionsByLine).
   function sections(text, dropping) {
-    let body = collapse(text);
+    const raw = String(text).replace(/\r\n?/g, "\n");
+    if (raw.trim().indexOf("\n") >= 0) return sectionsByLine(dropLead(raw, dropping));
+    let body = collapse(raw);
     if (dropping != null) {
       const h = collapse(dropping);
       if (h && body.startsWith(h) && (body.length === h.length || /\s/.test(body[h.length]))) body = body.slice(h.length).trim();
@@ -83,6 +95,79 @@
       cursor = m.end;
     }
     append(label, body.slice(cursor), out);
+    return out;
+  }
+
+  // `raw` less its leading words when they are `dropping`'s words in order (the same word-boundary rule as the flat text's
+  // headline drop); the line breaks after the dropped words stay with the rest.
+  function dropLead(raw, dropping) {
+    if (dropping == null) return raw;
+    const want = tokens(dropping);
+    if (!want.length) return raw;
+    let at = 0, end = 0;
+    for (const m of raw.matchAll(/\S+/g)) {
+      if (at === want.length) break;
+      if (m[0] !== want[at]) return raw;
+      at++;
+      end = m.index + m[0].length;
+    }
+    return at === want.length ? raw.slice(end) : raw;
+  }
+
+  // ---- the line-aware reading. A command is a line that starts with a path (`/usr/...`, `~/...`) or a known command word and
+  // does not end like a sentence; a `STEP n` line is a step caption, and a command after its colon is split off as its own block.
+  const COMMAND = /^(?:\/|~\/|(?:python3|python|git|ssh|claude|levain|launchctl|curl)(?:\s|$))/;
+  const SENTENCE_END = /[.!?:]$/;
+  const STEP = /^STEP\s+\d+\b/;
+  const INDENT = /^(?: {4}|\t)/;
+  const isCommand = (t) => COMMAND.test(t) && !SENTENCE_END.test(t);
+  const lead = (l) => (/^[ \t]*/.exec(l) || [""])[0].replace(/\t/g, "    ").length;
+
+  function sectionsByLine(raw) {
+    const lines = raw.split("\n");
+    const out = [];
+    let label = null;
+    let cur = [];
+    const flush = () => { if (label !== null || cur.length) out.push({ label: label, blocks: cur }); cur = []; };
+    const text = (t) => { for (const b of blocks(t.trim(), false)) cur.push(b); };
+    const code = (t) => { if (t) cur.push({ kind: "code", text: t }); };
+    for (let i = 0; i < lines.length; i++) {
+      const line = lines[i];
+      const t = line.trim();
+      if (!t) continue;
+      if (t.startsWith("```")) {                    // a fenced block runs to its closing fence or the end of the text
+        const body = [];
+        for (i++; i < lines.length && !lines[i].trim().startsWith("```"); i++) body.push(lines[i]);
+        code(body.join("\n").replace(/^\n+|\s+$/g, ""));
+        continue;
+      }
+      if (INDENT.test(line)) {                      // an indented block: its consecutive indented lines, the common indent off
+        const body = [line];
+        while (i + 1 < lines.length && INDENT.test(lines[i + 1])) body.push(lines[++i]);
+        const cut = Math.min(...body.map(lead));
+        code(body.map((l) => l.replace(/\t/g, "    ").slice(cut)).join("\n").replace(/\s+$/, ""));
+        continue;
+      }
+      if (isCommand(t)) { code(t); continue; }
+      if (STEP.test(t)) {
+        const m = /^(STEP\s+\d+[^:]*:)\s+(\S.*)$/.exec(t);
+        const split = m && isCommand(m[2]);
+        cur.push({ kind: "paragraph", text: split ? m[1] : t, step: true });
+        if (split) code(m[2]);
+        continue;
+      }
+      let cursor = 0;
+      for (const m of labelMatches(t)) {
+        const before = t.slice(cursor, m.start).trim();
+        if (before) text(before);
+        flush();
+        label = m.label;
+        cursor = m.end;
+      }
+      const rest = t.slice(cursor).trim();
+      if (rest) text(rest);
+    }
+    flush();
     return out;
   }
 
@@ -121,7 +206,7 @@
     for (const s of secs) {
       if (s.label) all = all.concat(tokens(s.label));
       for (const b of s.blocks) {
-        if (b.kind === "paragraph") all = all.concat(tokens(b.text));
+        if (b.kind === "paragraph" || b.kind === "code") all = all.concat(tokens(b.text));
         else { all = all.concat(tokens(b.lead)); for (const i of b.items) all = all.concat(tokens(i)); }
       }
     }
@@ -328,6 +413,27 @@
     const parts = String(text).split(" · ").map((x) => x.trim());
     return parts.length >= 2 && parts.every((x) => x) ? parts : null;
   }
+  // A command, one copyable block. The cockpit page registers its own copy-line builder (dashboard_core.js copyLine: the code,
+  // its copy button and the clipboard fallback), the one every copyable command in the cockpit is drawn by; a page without one
+  // (the sign sheet) gets the text as a selectable monospace block. Text only.
+  let commandBuilder = null;
+  function setCommandBlock(fn) { commandBuilder = typeof fn === "function" ? fn : null; }
+  function commandBlock(text) {
+    if (commandBuilder) {
+      try {
+        const n = commandBuilder(text, text.indexOf("\n") >= 0 ? "block" : "command");
+        if (n) { n.classList.add("card-cmd"); return n; }
+      } catch (_) { /* the plain block below */ }
+    }
+    return node("pre", "card-cmd card-cmd-plain", text);
+  }
+  // The text the card draws for a long field: the multi-line `full` when it carries the very words of the flat `flat` (only
+  // the line breaks differ), else `flat`. The flat text is what a signature covers, so the lines are a display of it and never
+  // a second text.
+  function preferFull(flat, full) {
+    const f = typeof flat === "string" ? flat : "";
+    return typeof full === "string" && full && collapse(full) === collapse(f) ? full : f;
+  }
   function list(items) {
     const ul = node("ul", "card-list");
     for (const i of items) ul.appendChild(rich("li", "", i));
@@ -338,10 +444,11 @@
       const sec = node("div", "card-sec");
       if (s.label) sec.appendChild(node("h3", "card-label", titleCase(s.label)));
       for (const b of s.blocks) {
+        if (b.kind === "code") { sec.appendChild(commandBlock(b.text)); continue; }
         if (b.kind === "paragraph") {
           if (!b.text) continue;
-          const dots = dotItems(b.text);
-          sec.appendChild(dots ? list(dots) : rich("p", "card-p", b.text));
+          const dots = b.step ? null : dotItems(b.text);
+          sec.appendChild(dots ? list(dots) : rich("p", b.step ? "card-p card-step" : "card-p", b.text));
           continue;
         }
         if (b.lead) sec.appendChild(rich("p", "card-p", b.lead));
@@ -408,7 +515,7 @@
     const inner = node("div", "card-detail-body");
     const rest = headline(card.asked).rest;
     if (rest) drawSections(inner, sections(rest));
-    drawBody(inner, card.stopped || "", card.asked, full, rec);
+    drawBody(inner, preferFull(card.stopped || "", card.stopped_full), card.asked, full, rec);
     det.appendChild(inner);
     return det;
   }
@@ -463,7 +570,7 @@
     doc.addEventListener("input", (ev) => grow(ev.target));
   }
 
-  const api = { linkRuns, installFieldGrow, grow, FREE_TEXT, collapse, sections, headline, optionRows, words, repeatsRows, fullOptions, parseMessage, looseCard, openUntil, drawHead, drawDetail, drawBody };
+  const api = { preferFull, setCommandBlock, linkRuns, installFieldGrow, grow, FREE_TEXT, collapse, sections, headline, optionRows, words, repeatsRows, fullOptions, parseMessage, looseCard, openUntil, drawHead, drawDetail, drawBody };
   if (typeof module === "object" && module.exports) module.exports = api;
   else root.LevainCardFormat = api;
 })(typeof window !== "undefined" ? window : this);

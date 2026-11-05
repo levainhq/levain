@@ -2678,6 +2678,12 @@ body.ke [data-ck-panel="tray"] .row .verb-actions > .verb-btn[data-verb="spore_d
 .card-list li { margin: 0 0 var(--sp-2); overflow-wrap: anywhere; }
 .needs-card .card-p, .needs-q-body .card-p { margin: 0 0 var(--sp-3); color: var(--text); overflow-wrap: anywhere; line-height: 1.5; }
 .needs-q-body { min-width: 0; }
+/* a command in a needs-phill card (card_format.js commandBlock): the cockpit's own copy line (code + copy button) or, on a page
+   without one, a plain selectable block; the text wraps and keeps its own line breaks, a `STEP n` caption sits on its command */
+.card-p.card-step { font-weight: var(--fw-bold); margin-bottom: var(--sp-1); }
+.card-sec .card-cmd { margin: 0 0 var(--sp-3); }
+.card-sec .card-cmd .consent-code { white-space: pre-wrap; color: var(--text); }
+.card-cmd-plain { margin: 0 0 var(--sp-3); padding: var(--sp-2) var(--sp-3); background: var(--card-2); border-radius: var(--r-sm); white-space: pre-wrap; overflow-wrap: anywhere; user-select: all; font: var(--fw-regular) var(--fs-micro)/var(--lh-list) var(--mono); color: var(--text); }
 .card-opts { list-style: none; margin: 0 0 var(--sp-3); padding: 0; }
 .card-opt { margin: 0 0 var(--sp-3); padding: var(--sp-2) var(--sp-3); border: 1px solid var(--hair); border-radius: var(--r-sm); }
 .card-opt-rec { border-color: var(--ok); }

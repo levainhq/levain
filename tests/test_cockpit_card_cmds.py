@@ -1,0 +1,142 @@
+"""The needs-phill card with commands in it (Phill 11-05, np-c92ec798: two sign-in commands run into prose, STEP 1 cut mid-sentence
+under a "Url" heading). The browser half: the row as flow filed it (tests/card_cmds_row.json, the flat ``stopped`` and the
+multi-line ``stopped_full`` beside it) drawn in the cockpit's Needs-you modal, as the open-ended talk question it was.
+``CARDFMT_SHOTS=<dir>`` keeps the shot as ``<CARDFMT_STEM>.png``. The parsing half runs in node: tests/card_cmds_check.js."""
+from __future__ import annotations
+
+import dataclasses
+import json
+import os
+import shutil
+import subprocess
+from pathlib import Path
+from typing import Any
+
+import pytest
+
+from levain.consent.questions import Question
+from tests.test_cockpit_card_format import PHONE
+from tests.test_cockpit_flip_parity import _drive, needs_browser
+from tests.test_cockpit_k2a import TOKEN, _install, _serve
+from tests.test_cockpit_questions import _file, _get_status
+from tests.test_cockpit_sign_card import DESKTOP, OPEN_Q, _Rig, needs_ssh
+from tests.test_cockpit_sign_facet import _Signed
+
+HERE = Path(__file__).resolve().parent
+ROW = json.loads((HERE / "card_cmds_row.json").read_text())["np-c92ec798"]
+M = "#levain-modal .needs-question"
+HAS_FULL = "blocks_full" in {f.name for f in dataclasses.fields(Question)}
+
+
+class _Row(_Signed):
+    """The rig's question answering as flow's desk reader files this row: the row's own title and flat stopped text, open-ended
+    (no options, as the row was filed), with the multi-line text beside it where this levain's Question has the field."""
+
+    def _mark(self, rows: Any) -> Any:
+        return [self._row(r) for r in rows]
+
+    def _row(self, q: Question) -> Question:
+        extra = {"blocks_full": ROW["stopped_full"]} if HAS_FULL else {}
+        return dataclasses.replace(q, what="TALK: levain: " + ROW["what"], blocks=ROW["stopped"], options=(), rec="", **extra)
+
+    def get(self, ref: Any) -> Any:
+        q = self.inner.get(ref)
+        return None if q is None else self._row(q)
+
+
+def _shot(tmp_path: Path) -> list[dict]:
+    folder = Path(os.environ.get("CARDFMT_SHOTS") or tmp_path)
+    folder.mkdir(parents=True, exist_ok=True)
+    return [{"until": "new Promise((r) => setTimeout(() => r('settled'), 900))"},
+            {"shot": str(folder / f"{os.environ.get('CARDFMT_STEM', 'cardfmt_after')}.png"), "full": False}]
+
+
+def _drawn(rig: _Rig, tmp_path: Path, viewport: dict, tail: list[dict]) -> dict:
+    with rig.serving() as (url, httpd):
+        wrapped = _Row(httpd.question_store.inner, {})
+        httpd.question_store = wrapped
+        rig.ck.attach_question_rows(wrapped)
+        keep = "window.localStorage.setItem('levain_write_token', 'T'); "
+        return _drive(tmp_path, f"{rig.origin}/nope", [
+            viewport,
+            {"eval": f"(() => {{ {keep}location.href = '{rig.origin}/'; return 1; }})()"},
+            {"until": f"{OPEN_Q} && document.querySelector('{M} .needs-q-body')", "ms": 30000},
+            *tail])
+
+
+@needs_browser
+@needs_ssh
+def test_the_talk_card_shows_three_steps_each_command_one_copyable_block(tmp_path: Path, monkeypatch) -> None:
+    rig = _Rig(tmp_path, monkeypatch)
+    out = _drawn(rig, tmp_path, DESKTOP, [
+        {"eval": f"[...document.querySelectorAll('{M} .needs-q-body .card-cmd .consent-code')].map(c => c.textContent)"},
+        {"eval": f"[...document.querySelectorAll('{M} .card-label')].map(h => h.textContent)"},
+        {"eval": f"[...document.querySelectorAll('{M} .card-step')].map(p => p.textContent)"},
+        {"eval": f"document.querySelectorAll('{M} .needs-q-body .card-cmd .consent-copy').length"},
+        {"eval": "document.documentElement.scrollWidth <= window.innerWidth"},
+        *_shot(tmp_path),
+    ])
+    cmds, labels, steps, copies, fits = [v for v in out["values"] if not (isinstance(v, dict) and "shot" in v) and v != "settled"][-5:]
+    assert len(cmds) == 3 and all(c.startswith("/usr/bin/python3 -I /Users/phillipclapham/") for c in cmds), cmds
+    assert cmds[0].endswith("--vendor claude --slot 8") and cmds[1].endswith("--vendor codex --slot 9"), cmds
+    assert cmds[2].endswith("after-login --vm vend-real --vendor claude"), cmds
+    assert labels == ["What", "Blocks"], labels
+    assert [s.split(" ")[:2] for s in steps] == [["STEP", "1"], ["STEP", "2"], ["STEP", "3"]], steps
+    assert copies == 3 and fits is True
+
+
+@needs_browser
+@needs_ssh
+def test_the_talk_card_on_a_phone_keeps_the_commands_inside_the_screen(tmp_path: Path, monkeypatch) -> None:
+    rig = _Rig(tmp_path, monkeypatch)
+    out = _drawn(rig, tmp_path, PHONE, [
+        {"eval": f"document.querySelectorAll('{M} .needs-q-body .card-cmd').length"},
+        {"eval": "document.documentElement.scrollWidth <= window.innerWidth"},
+    ])
+    assert out["values"][-2:] == [3, True], out["values"]
+
+
+def test_the_card_reads_commands_and_lines_on_the_real_row() -> None:
+    """The parsing half, in node (tests/card_cmds_check.js): three steps and three copyable commands, no URL section, known labels
+    only, fenced / indented / path / command lines, the flat legacy text as before, and the lines used only when they are the
+    flat text's own words."""
+    node = shutil.which("node")
+    if node is None:
+        pytest.skip("needs node")
+    out = subprocess.run([node, str(HERE / "card_cmds_check.js")], capture_output=True, text=True, timeout=60)
+    assert out.returncode == 0, out.stdout + out.stderr
+    assert "FAIL" not in out.stdout
+
+
+@pytest.fixture
+def lh(tmp_path, monkeypatch):
+    monkeypatch.setenv("LEVAIN_HOME", str(tmp_path / "lh"))
+    return tmp_path / "lh" / "consent"
+
+
+def test_a_question_body_carries_blocks_full_only_when_its_store_has_one(tmp_path, lh) -> None:
+    """The body route (what the card reads) adds ``blocks_full`` beside ``blocks`` for a host store whose question carries the
+    lines, and leaves the key out for one that does not (the kernel's store, an older host): ``blocks`` is never changed."""
+    from levain.consent.questions import QuestionStore
+
+    _root, src, _ids = _install(tmp_path)
+    q = _file(QuestionStore(lh))
+    assert q.blocks_full == ""
+    lines = dataclasses.replace(q, blocks_full="line one\nline two")
+
+    class Host:
+        def __init__(self, row: Question) -> None:
+            self.row = row
+
+        def get(self, n: int) -> Any:
+            return self.row if n == self.row.n else None
+
+    with _serve(src, write_token=TOKEN) as (base, httpd):
+        httpd.question_store = Host(lines)
+        body = _get_status(f"{base}/cockpit/question/{q.n}.json", TOKEN)[1]
+        assert body["blocks_full"] == "line one\nline two" and body["blocks"] == q.blocks
+        httpd.question_store = Host(q)
+        plain = _get_status(f"{base}/cockpit/question/{q.n}.json", TOKEN)[1]
+        assert "blocks_full" not in plain and plain["blocks"] == q.blocks
+        httpd.question_store = Host(dataclasses.replace(q, blocks_full=7))     # not a string: not carried
+        assert "blocks_full" not in _get_status(f"{base}/cockpit/question/{q.n}.json", TOKEN)[1]
