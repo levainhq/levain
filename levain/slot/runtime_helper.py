@@ -1166,7 +1166,10 @@ class Seams:
     var_folders: Callable[[int, int], str] = darwin_user_dir
     grant_search: Callable[[str, int, Path, str, int], None] = grant_broker_search
     wake_reaper: Optional[Callable[[], None]] = None
-    hook_templates: Mapping[str, RD.HookTemplate] = field(default_factory=dict)
+    #: the hook templates by name. ``None`` (the default, the production path) is the set
+    #: :func:`levain.slot.hook_templates.hook_templates` makes for ``host``; a mapping (a test) is exactly that mapping,
+    #: so ``{}`` still means "no template" and render refuses ``hook-template-missing`` by name.
+    hook_templates: Optional[Mapping[str, RD.HookTemplate]] = None
     #: a driver template's bytes by name (3c-8, render's ``driver-template-digest-mismatch``)
     driver_template: Callable[[str], Optional[bytes]] = RD.read_driver_template
     front_module: str = FRONT_MODULE
@@ -2110,6 +2113,15 @@ class RenderRun:
         return self.alloc.slot.slot_class == "egress"
 
 
+def hook_templates_for(seams: "Seams", blob: RenderBlob) -> Dict[str, RD.HookTemplate]:
+    """The templates for the hooks ``blob`` names: the seam's own mapping, else the production producer's."""
+    have = seams.hook_templates
+    if have is None:
+        from levain.slot.hook_templates import hook_templates
+        have = hook_templates(seams.host)
+    return {k: v for k, v in have.items() if k in blob.hooks}
+
+
 def render_facts(ctx: Ctx, alloc: R.Alloc, blob: RenderBlob) -> RD.RenderFacts:
     """The alloc facts ``render.render`` needs (§7.1: root acts on alloc only), plus the base map's route types and
     hosts (one read, :func:`base_routes`), the slot's /var/folders (macOS), ``TERM`` from the supervisor's env when it
@@ -2134,7 +2146,7 @@ def render_facts(ctx: Ctx, alloc: R.Alloc, blob: RenderBlob) -> RD.RenderFacts:
         slot_uid=owner, slot_gid=owner, gwport=RD.gwport_for(seams.host, slot) if egress else None,
         route_types=route_types, route_hosts=route_hosts, term=term, var_folders=folders,
         driver_uid=None if egress else alloc.slot_uid, driver_gid=None if egress else alloc.slot_gid,
-        hook_templates={k: v for k, v in seams.hook_templates.items() if k in blob.hooks})
+        hook_templates=hook_templates_for(seams, blob))
 
 
 #: the CAS refusals CONTROL answers only after reading the record under its lock and writing nothing

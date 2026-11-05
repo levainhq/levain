@@ -709,12 +709,13 @@ def test_read_base_map(tmp_path: Path) -> None:
     assert e.value.name == "base-map-malformed"
 
 
-def test_no_hook_is_named_while_the_helper_holds_no_template() -> None:
-    """HOOKS_BY_AUTH is empty BECAUSE the helper has no template to render one from; when it gains one, this fails
-    and the supervisor's choice is made again."""
+def test_no_hook_is_named_by_the_interactive_supervisor() -> None:
+    """The helper now holds the dispatch hook templates (1105-32: ``Seams.hook_templates`` None = the production
+    producer), but the INTERACTIVE supervisor still names none: an interactive session has no broker socket, and
+    the fail-closed slot hook would deny every call there. Naming one is the supervisor's choice, made again."""
     from levain.slot.runtime_helper import Seams as HelperSeams
 
-    assert HelperSeams.__dataclass_fields__["hook_templates"].default_factory() == {}   # type: ignore[misc]
+    assert HelperSeams.__dataclass_fields__["hook_templates"].default is None   # type: ignore[misc]
     assert SV.HOOKS_BY_AUTH == {"brokered": (), "passthrough": ()}
 
 
