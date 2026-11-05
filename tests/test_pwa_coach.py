@@ -74,37 +74,65 @@ def test_the_coach_shows_in_a_phone_tab_and_pairing_and_pings_are_the_installed_
 MAC_SAFARI = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.5 Safari/605.1.15"
 MAC_SAFARI_16 = MAC_SAFARI.replace("Version/17.5", "Version/16.6")
 IPAD_DESKTOP = MAC_SAFARI                        # iPadOS 13+ in desktop mode: a Mac user agent on a touch screen
-MAC_FIREFOX = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10.15; rv:128.0) Gecko/20100101 Firefox/128.0"
-MAC_CHROMIUM_WITH_VERSION = MAC_SAFARI + " Edg/126.0.0.0"     # a Chromium that also writes Version/ is not Safari
+MAC_FIREFOX = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10.15; rv:127.0) Gecko/20100101 Firefox/127.0"
+MAC_CHROME = DESKTOP                             # real Chrome on a Mac: no Version/ token, so it never looks like Safari
+MAC_SAY_TEXT = "open the File menu and choose Add to Dock (needs macOS Sonoma or later)"
 
 
-def _safari_init(user_agent: str, platform: str, touch: int, standalone_prop: str) -> str:
-    return ("Object.defineProperty(navigator,'userAgent',{get:()=>%s});"
-            "Object.defineProperty(navigator,'platform',{get:()=>%s});"
-            "Object.defineProperty(navigator,'maxTouchPoints',{get:()=>%d});"
-            "%s" % (json.dumps(user_agent), json.dumps(platform), touch,
-                    "" if standalone_prop == "absent" else "Object.defineProperty(navigator,'standalone',{get:()=>%s});" % standalone_prop))
+def _safari_init(user_agent: str, platform: str, touch: int, standalone_prop: str, extra: str = "") -> str:
+    # extra: "dock" = the page runs as an installed app (display-mode: standalone matches); "insecure" = isSecureContext is false
+    js = ("Object.defineProperty(navigator,'userAgent',{get:()=>%s});"
+          "Object.defineProperty(navigator,'platform',{get:()=>%s});"
+          "Object.defineProperty(navigator,'maxTouchPoints',{get:()=>%d});"
+          "%s" % (json.dumps(user_agent), json.dumps(platform), touch,
+                  "" if standalone_prop == "absent" else "Object.defineProperty(navigator,'standalone',{get:()=>%s});" % standalone_prop))
+    if extra == "dock":
+        js += ("const mm=window.matchMedia.bind(window);"
+               "window.matchMedia=(q)=>/display-mode:\\s*standalone/.test(q)?{matches:true,media:q,addEventListener(){},removeEventListener(){},addListener(){},removeListener(){}}:mm(q);")
+    elif extra == "insecure":
+        js += "Object.defineProperty(window,'isSecureContext',{get:()=>false,configurable:true});"
+    return js
 
 
 @needs_browser
-@pytest.mark.parametrize("ua,platform,touch,standalone_prop,coach,gated,say", [
-    (IOS, "iPhone", 5, "false", True, True, "Add to Home Screen"),
-    (IPAD_DESKTOP, "MacIntel", 5, "false", True, True, "Add to Home Screen"),
-    (IOS, "iPhone", 5, "true", False, False, ""),
-    (MAC_SAFARI, "MacIntel", 0, "absent", True, False, "Add to Dock"),    # Safari on a Mac installs, and pairing there is not gated
-    (MAC_SAFARI_16, "MacIntel", 0, "absent", False, False, ""),           # no Add to Dock before Safari 17
-    (MAC_FIREFOX, "MacIntel", 0, "absent", False, False, ""),
-    (MAC_CHROMIUM_WITH_VERSION, "MacIntel", 0, "absent", False, False, ""),
+@pytest.mark.parametrize("ua,platform,touch,standalone_prop,extra,coach,gated,say", [
+    (IOS, "iPhone", 5, "false", "", True, True, "Add to Home Screen"),
+    (IPAD_DESKTOP, "MacIntel", 5, "false", "", True, True, "Add to Home Screen"),
+    (IOS, "iPhone", 5, "true", "", False, False, ""),
+    (MAC_SAFARI, "MacIntel", 0, "absent", "", True, False, MAC_SAY_TEXT),    # Safari on a Mac installs, and pairing there is not gated
+    (MAC_SAFARI_16, "MacIntel", 0, "absent", "", False, False, ""),           # no Add to Dock before Safari 17
+    (MAC_FIREFOX, "MacIntel", 0, "absent", "", False, False, ""),
+    (MAC_CHROME, "MacIntel", 0, "absent", "", False, False, ""),
+    (MAC_SAFARI, "MacIntel", 0, "absent", "dock", False, False, ""),          # the installed Dock app: no banner inside the app
+    (MAC_SAFARI, "MacIntel", 1, "absent", "", True, False, MAC_SAY_TEXT),    # ios() needs maxTouchPoints > 1: one touch point is still a Mac
+    (MAC_SAFARI, "MacIntel", 0, "absent", "insecure", False, False, ""),      # no install is offered on a plain-http origin
 ])
-def test_the_coach_in_a_real_safari_tab_and_on_a_mac(tmp_path, monkeypatch, ua, platform, touch, standalone_prop, coach, gated, say):
+def test_the_coach_in_a_real_safari_tab_and_on_a_mac(tmp_path, monkeypatch, ua, platform, touch, standalone_prop, extra, coach, gated, say):
     src = _install(tmp_path)[1]
     q = tmp_path / "signq"
     q.mkdir(mode=0o700)
     with _signed(src, q) as (port, _):
         out = _drive(tmp_path, monkeypatch, f"http://127.0.0.1:{port}/#write_token={T}", [
-            {"init": _safari_init(ua, platform, touch, standalone_prop)},
+            {"init": _safari_init(ua, platform, touch, standalone_prop, extra)},
             {"until": "document.querySelector('.dev-pings') && !document.querySelector('.dev-pings').hidden", "ms": 20000},
             {"eval": "[!!document.getElementById('pwa-coach'), (document.getElementById('pwa-coach') || {}).textContent || '', window.levainPwa.gated()]"},
         ])
     shown, text, is_gated = out["values"][-1]
     assert shown is coach and is_gated is gated and say in text, (shown, text, is_gated)
+
+
+@needs_browser
+@pytest.mark.parametrize("token", ["Edg/126.0.0.0", "OPR/110.0.0.0", "Chrome/126.0.0.0"])
+def test_a_user_agent_with_version_and_a_chromium_token_is_not_safari_guard(tmp_path, monkeypatch, token):
+    # A GUARD on the exclusion alternation in macSafari(), not a real-browser claim: no shipping Chromium writes Version/ on a Mac
+    # (real Chrome and Edge are covered above by the missing Version/ token), so this UA is synthetic.
+    src = _install(tmp_path)[1]
+    q = tmp_path / "signq"
+    q.mkdir(mode=0o700)
+    with _signed(src, q) as (port, _):
+        out = _drive(tmp_path, monkeypatch, f"http://127.0.0.1:{port}/#write_token={T}", [
+            {"init": _safari_init(MAC_SAFARI + " " + token, "MacIntel", 0, "absent")},
+            {"until": "window.levainPwa", "ms": 20000},
+            {"eval": "[window.levainPwa.coachKind(), !!document.getElementById('pwa-coach')]"},
+        ])
+    assert out["values"][-1] == ["", False], out["values"][-1]

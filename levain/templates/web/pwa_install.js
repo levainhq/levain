@@ -8,7 +8,7 @@
   "use strict";
   const DISMISS_KEY = "levain_install_coach_dismissed";   // sessionStorage: a dismissed banner stays away for this tab only
   const IOS_SAY = "Install Levain: tap Share, then Add to Home Screen.";
-  const MAC_SAY = "Install Levain: in Safari choose File, then Add to Dock (macOS Sonoma or later).";
+  const MAC_SAY = "Install Levain: in Safari, open the File menu and choose Add to Dock (needs macOS Sonoma or later).";
   const GATE_SAY = "Pairing and pings are offered in the installed Levain app. ";
   let deferred = null, installedNow = false, banner = null;
   const notes = new Set();   // the gate notes drawn into pairing and pings; re-rendered whenever the install state moves
@@ -29,8 +29,10 @@
   }
   function kind() { return ios() ? "ios" : androidChrome() ? "android" : ""; }
   // Safari on a Mac.
-  // Add to Dock arrived in Safari 17; the user agent freezes the OS version, so macOS Sonoma is named in the words, not tested.
+  // Add to Dock arrived in Safari 17 on macOS Sonoma, but Safari 17 also runs on Monterey and Ventura and the user agent freezes the
+  // OS version: the words are conditional on Sonoma (MAC_SAY) rather than the code guessing. Secure origins only, as on Android.
   function macSafari() {
+    if (window.isSecureContext === false) return false;
     const u = ua(), v = /Version\/(\d+)/.exec(u);
     if (!/Macintosh/.test(u) || !/Safari\//.test(u) || !v || Number(v[1]) < 17) return false;
     if (/Chrome|Chromium|CriOS|FxiOS|Firefox|Edg|OPR\/|Brave|Vivaldi/.test(u)) return false;
