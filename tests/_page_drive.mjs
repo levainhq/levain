@@ -350,10 +350,16 @@ for (const s of steps) {
     // committed (no Page.frameNavigated, and every Runtime.evaluate queued behind it for 60 s). So the reload waits, bounded, until the
     // worker the page registered has settled (activated and in control); a page with no registration passes at once. Not fatal: a worker
     // that never takes control only costs this bounded wait, and the reload is then sent as before.
+    // No registration is NOT settled at once: register() is asynchronous, so under load the first poll can run before the page's own
+    // registration exists. "No registration" counts only after it has been seen on 8 polls in a row (a page with no worker
+    // pays that short wait); a registration that has appeared is waited for until it is activated and in control.
+    let absent = 0;
     for (const end = Date.now() + scaled(5000);;) {
-      const settled = await evaluate("(async () => { const sw = navigator.serviceWorker; if (!sw) return true; const r = await sw.getRegistration();"
-        + " if (!r) return true; return !r.installing && !!r.active && r.active.state === 'activated' && !!sw.controller; })()");
-      if (settled === true || Date.now() >= end) break;
+      const state = await evaluate("(async () => { const sw = navigator.serviceWorker; if (!sw) return 'none'; const r = await sw.getRegistration();"
+        + " if (!r) return 'absent'; return (!r.installing && !!r.active && r.active.state === 'activated' && !!sw.controller) ? 'settled' : 'pending'; })()");
+      if (state === "none" || state === "settled" || Date.now() >= end) break;
+      absent = state === "absent" ? absent + 1 : 0;
+      if (absent >= 8) break;
       await sleep(50);
     }
     await evaluate("window.__driveOldDocument = true");   // a mark the reloaded document will not carry
