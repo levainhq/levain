@@ -408,6 +408,50 @@ def test_10_np1_premise_adopt_and_review_are_the_only_writers_to_the_operators_r
     assert "adopt_take" not in root_side and "dispatch.adopt" not in root_side
 
 
+_PROC_CALLS = {"subprocess.run", "subprocess.Popen", "subprocess.call", "subprocess.check_call",
+               "subprocess.check_output", "subprocess.getoutput", "subprocess.getstatusoutput", "os.system", "os.popen",
+               "os.posix_spawn", "os.posix_spawnp"}
+
+
+def _git_calls_outside_the_guarded_helper(source: str, helper: str = "_git") -> list[tuple[int, str]]:
+    """Every way ``source`` could run git that does not go through the one sanctioned ``helper`` function, by AST: any
+    process-spawning call (``subprocess.*``, ``os.system``/``popen``/``exec*``/``spawn*``) or any argv/command literal
+    that is, or starts with, ``"git"`` (a list/tuple whose first element is that constant, or a string beginning
+    ``git ``), anywhere outside the helper's own body. Intent: the helper is the only place git is spawned, so its
+    fixed flags (no replace-objects, hooks off, scrubbed env) cannot be skipped. Nothing is allowlisted: the module
+    has no other git spawner by design."""
+    tree = ast.parse(source)
+    inside = set()
+    for n in ast.walk(tree):
+        if isinstance(n, ast.FunctionDef) and n.name == helper:
+            inside |= {id(m) for m in ast.walk(n)}
+    out = []
+    for n in ast.walk(tree):
+        if id(n) in inside:
+            continue
+        if isinstance(n, ast.Call):
+            f = ast.unparse(n.func)
+            if f in _PROC_CALLS or f.startswith(("os.exec", "os.spawn")):
+                out.append((n.lineno, f))
+        if isinstance(n, (ast.List, ast.Tuple)) and n.elts and isinstance(n.elts[0], ast.Constant) \
+                and n.elts[0].value == "git":
+            out.append((n.lineno, "argv literal starting with 'git'"))
+        if isinstance(n, ast.Constant) and isinstance(n.value, str) and n.value.split(" ")[0] == "git" \
+                and " " in n.value:
+            out.append((n.lineno, "command string starting with 'git '"))
+    return out
+
+
+def test_10b2_the_scanner_sees_a_git_call_that_bypasses_the_helper():
+    """Red-first proof for test_10b's blind spot: the ``_git``-call scan cannot see these; this scanner must."""
+    ok = "def _git(repo, *a):\n    return subprocess.run(['git', *a])\n\ndef f():\n    return _git('d', 'init')\n"
+    assert _git_calls_outside_the_guarded_helper(ok) == []
+    for bad in ("subprocess.run(['git', 'update-ref', 'x', 'y'])", "subprocess.check_output(['/usr/bin/git', 'init'])",
+                "subprocess.Popen(argv)", "os.system('git init')", "argv = ('git', 'fetch')",
+                "subprocess.run('git fetch', shell=True)", "os.execv('/usr/bin/git', ['x'])"):
+        assert _git_calls_outside_the_guarded_helper(ok + "\ndef g():\n    " + bad + "\n"), bad
+
+
 def test_10b_the_snapshot_builder_installs_only_into_the_dest_dir_it_made():
     """test_10's ``dispatch/snapshot.py`` entry, held to its reason: every ``_git`` call there that carries an installing
     verb (or ``init``) runs in ``dest_dir`` (its first argument is that name), only inside ``build_snapshot``, and
@@ -416,7 +460,10 @@ def test_10b_the_snapshot_builder_installs_only_into_the_dest_dir_it_made():
     installing = {"update-ref", "unbundle", "fetch", "am", "cherry-pick", "pull", "commit-tree", "write-tree", "push",
                   "rebase", "read-tree", "fast-import", "index-pack", "unpack-objects", "mktree", "init"}
     reads = {"rev-parse", "ls-tree", "cat-file"}
-    tree = ast.parse((REPO_ROOT / "levain" / "dispatch" / "snapshot.py").read_text())
+    source = (REPO_ROOT / "levain" / "dispatch" / "snapshot.py").read_text()
+    # the scan below sees only ``_git(...)`` calls: also fail on any git spawn that does not go through ``_git``
+    assert _git_calls_outside_the_guarded_helper(source) == []
+    tree = ast.parse(source)
     build = next(n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name == "build_snapshot")
     in_build = {id(n) for n in ast.walk(build)}
     calls = [n for n in ast.walk(tree) if isinstance(n, ast.Call) and isinstance(n.func, ast.Name) and n.func.id == "_git"]
