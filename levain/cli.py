@@ -2421,9 +2421,10 @@ def _cmd_cockpit_enroll(args: argparse.Namespace) -> int:
 # A passkey is trusted in two lists: the cockpit authority log (what `cockpit enroll` writes) and the signer list a
 # desk verifies signed answers against. The second is a separate manual step an operator forgot once, which kept a
 # signing outage going; so the enrol says it. The principal and namespaces are the form flow's signer list has
-# held for passkeys (an allowed_signers line); levain only prints text and imports nothing from flow.
+# held for passkeys (an allowed_signers line); levain only prints text and imports nothing from flow. The scope string is
+# the desk's own namespace list for that line, not a namespace levain signs in, so it stays out of the registry.
 _DESK_SIGNER_PRINCIPAL = "phill"
-_DESK_SIGNER_PASSKEY_NAMESPACES = "flow-needs-phill,flow-cockpit-message,flow-i3b-resolve"
+_DESK_SIGNER_PASSKEY_SCOPE = "flow-needs-phill,flow-cockpit-message,flow-i3b-resolve"
 
 
 def _desk_signer_hint(row: object) -> str:
@@ -2437,7 +2438,7 @@ def _desk_signer_hint(row: object) -> str:
     return ("Enrolling here does not make a desk accept this passkey's signed answers: add the line below to the "
             "signer list your desk verifies against (flow's scripts/needs_phill_signers); an operator whose desk "
             "verifies signatures elsewhere must add it there.\n"
-            f'{_DESK_SIGNER_PRINCIPAL} namespaces="{_DESK_SIGNER_PASSKEY_NAMESPACES}" {public_key}')
+            f'{_DESK_SIGNER_PRINCIPAL} namespaces="{_DESK_SIGNER_PASSKEY_SCOPE}" {public_key}')
 
 
 def _cmd_cockpit_revoke(args: argparse.Namespace) -> int:
