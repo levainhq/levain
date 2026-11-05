@@ -122,7 +122,7 @@ def test_the_strip_draws_at_every_width_with_its_unread_count_and_opens_the_cent
             OPEN, OPENED, {"eval": opened}, {"eval": filtered}])
     wide, narrow, op, fl = _json(out)
     for lay in (wide, narrow):
-        assert lay["d"] == "flex" and lay["pos"] == "sticky" and lay["tabs"] == ["needs", "board", "notifications", "grants", "drop"], lay
+        assert lay["d"] == "flex" and lay["pos"] == "sticky" and lay["tabs"] == ["needs", "board", "notifications", "grants", "drop", "room"], lay
         assert lay["vw"] is True and lay["pill"] == str(unread), lay
     assert op["rows"] == total and op["sw"] is True and op["title"] == "Notifications", op
     assert fl["narrowed"] == ["B2 backup finished"], fl
