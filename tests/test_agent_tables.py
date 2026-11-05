@@ -591,7 +591,7 @@ def test_a_crash_before_the_marker_bump_leaves_the_store_a_whole_v2_store(v2):
     c.set_authorizer(deny_marker_bump)
     with pytest.raises(sqlite3.DatabaseError):
         at.migrate_agent_schema(c)
-    c.set_authorizer(None)
+    c.set_authorizer(lambda *_: sqlite3.SQLITE_OK)   # not None: before 3.11 set_authorizer(None) leaves every statement denied
     assert not c.in_transaction
     assert at.agent_marker(c) == at.AGENT_SCHEMA_V2
     assert c.execute("SELECT sql FROM sqlite_master WHERE name = 'agent_reservations'").fetchone()[0] \
