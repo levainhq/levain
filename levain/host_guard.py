@@ -34,6 +34,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Literal, Mapping, Sequence
 
+from levain.sandbox_keys import LOOSENING_NONEMPTY, LOOSENING_TRUE
+
 __all__ = [
     "HostRefusal", "CCHostProfile", "cc_host_profile", "cc_writable_roots", "is_within",
     "host_dir", "cc_sandbox_block", "check_sandbox_types", "cc_hook_settings", "cc_mcp_config",
@@ -1472,16 +1474,10 @@ def _db_arg(args: Sequence[Any], expected: str | os.PathLike[str], what: str) ->
     return [], i + 1
 
 
-# The keys of Claude Code's sandbox settings that relax the profile. network.allowMachLookup naming
-# com.apple.trustd.agent opens what enableWeakerNetworkIsolation opens; a run (levain-memory 1026-8/p1)
-# made trustd fetch a URL a sandboxed command chose, outside the proxy.
-_LOOSENING_TRUE = (("allowUnsandboxedCommands",), ("enableWeakerNestedSandbox",),
-                   ("enableWeakerNetworkIsolation",), ("allowAppleEvents",), ("allowNestedUserNamespaces",),
-                   ("network", "allowAllUnixSockets"), ("network", "allowLocalBinding"),
-                   ("filesystem", "disabled"))
-_LOOSENING_NONEMPTY = (("excludedCommands",), ("filesystem", "allowWrite"), ("filesystem", "allowRead"),
-                       ("network", "allowUnixSockets"), ("network", "allowedDomains"),
-                       ("network", "allowMachLookup"))
+# The keys of Claude Code's sandbox settings that relax the profile: defined in levain.sandbox_keys (render's repo-layer
+# check reads the same lists in a process that cannot import this module), named here as this module always has.
+_LOOSENING_TRUE = LOOSENING_TRUE
+_LOOSENING_NONEMPTY = LOOSENING_NONEMPTY
 
 
 def _get(d: Any, keys: Sequence[str]) -> Any:

@@ -65,7 +65,7 @@ from typing import Any, Callable, Iterator, Mapping, Protocol, runtime_checkable
 
 from levain.agents import controller as _ctl
 from levain.agents.accounting import StopResult, Usage
-from levain.agents.session import S1_DISPATCH, SessionLaunch
+from levain.agents.session import S1_DISPATCH, SessionLaunch, Workspace
 from levain.slot import Refused, write_all
 from levain.slot import stage
 from levain.slot import tickets as T
@@ -158,7 +158,9 @@ class ControlPort(Protocol):
 class SlotStart:
     """What the slot runtime is asked to start: the minted ``ticket`` (a bearer capability, handed over here and kept
     nowhere else), the run it belongs to, the recorded session key, the harness, model and brief, the digest of the
-    brief's exact bytes (the value the ticket was minted with: computed once, before the mint), and the fence hooks."""
+    brief's exact bytes (the value the ticket was minted with: computed once, before the mint), and the fence hooks.
+    ``workspace`` (W1) is the launch's own member, with the manifest digest the run server verified; a runtime that
+    stages a repo reads it, and one that does not (``None``) is the launch that never had one."""
     ticket: str
     run_id: str
     session_key: str
@@ -167,6 +169,7 @@ class SlotStart:
     brief: str
     brief_digest: str
     hooks: tuple[str, ...]
+    workspace: Workspace | None = None
 
 
 @dataclass(frozen=True)
@@ -556,19 +559,20 @@ class RealLauncher:
         # never as nothing), and creating it is the existence check: a key already held is refused before any mint.
         # The one record a spawn may take over is a TRANSIENT mint refusal's: a refused mint journals nothing, so the
         # same attempt id may mint again (test_r3_4_a_refused_mint_journals_nothing_..., against the real handler)
+        ws_rec = self._workspace_record(launch)
         if not self.index.claim(key, "pending", lambda rec: self._retakable(rec, launch.occurrence_id),
-                                occurrence_id=launch.occurrence_id, created_s=self.clock()):
+                                occurrence_id=launch.occurrence_id, created_s=self.clock(), **ws_rec):
             raise LauncherRefused("session-key-already-used", f"the index already holds state {self._existing(key)!r}")
         # AUTHORITY: whoever builds a launcher can mint for any occurrence_id and caps; run_session is the guard,
         # with CONTROL's ceiling behind it
         ticket, run_id = self._mint(key, facts)
         try:
             found = self.index.transition(key, ("pending",), "minted", occurrence_id=launch.occurrence_id,
-                                          run_id=run_id, created_s=self.clock())
+                                          run_id=run_id, created_s=self.clock(), **ws_rec)
             if found is not None:
                 raise RuntimeError(f"the index record left pending ({found}) before the start")
             handle = self.runtime.start(SlotStart(ticket, run_id, key, launch.harness, launch.model, launch.brief,
-                                                   str(facts["brief_digest"]), HOOKS))
+                                                   str(facts["brief_digest"]), HOOKS, launch.workspace))
         except Exception as exc:
             held = self._undo(key, ticket, run_id, launch.occurrence_id)
             if held is None:
@@ -586,7 +590,7 @@ class RealLauncher:
             # minted -> started only: a concurrent END (a reaper's stop that found the bound session by STATUS) may
             # already have recorded `ended` with its total, which this write never replaces
             found = self.index.transition(key, ("minted",), "started", occurrence_id=launch.occurrence_id,
-                                          run_id=run_id, session=session, started_s=self.clock())
+                                          run_id=run_id, session=session, started_s=self.clock(), **ws_rec)
             if found is not None and found != "ended":
                 raise RuntimeError(f"the index record left minted ({found}) during the start")
         except BaseException:
@@ -612,6 +616,27 @@ class RealLauncher:
                                   "a concurrent END proved the session gone before it was recorded started")
         return _Launched(handle.child, self.runtime, session, lambda: self._mark_ended(key),
                          lambda: self._ended_on_record(key))
+
+    @staticmethod
+    def _workspace_record(launch: SessionLaunch) -> dict[str, Any]:
+        """The run record's workspace facts (levain 34, W1): the head sha, the manifest digest and the withhold digest,
+        written with the key's first record and carried by each write after it (a ``put`` replaces the whole record).
+        Nothing for a launch with no workspace, so those records are byte-for-byte what they were. The manifest digest
+        is the run server's own derivation (``Workspace.manifest_digest``); None here means no server filled it."""
+        ws = launch.workspace
+        if ws is None:
+            return {}
+        from levain.dispatch.snapshot import withhold_digest
+        return {"workspace": {"head": ws.head, "manifest_digest": ws.manifest_digest,
+                              "withhold_digest": withhold_digest(ws.withhold)}}
+
+    def refuse_key(self, key: str, reason: str, *, occurrence_id: str | None = None) -> None:
+        """Record a refusal made BEFORE this launcher was asked to spawn (the run server's workspace check) as the
+        zero-usage ``refused`` tombstone every refusal before allocation leaves, so the fire's later usage read settles
+        at nothing instead of at the caps. Only where the key holds no record: another spawn's record is left as it is.
+        Never raises."""
+        extra = {} if occurrence_id is None else {"occurrence_id": occurrence_id}
+        self._tombstone(key, "refused", reason, new=True, **extra)
 
     @staticmethod
     def _retakable(rec: Mapping[str, Any], occurrence_id: str) -> bool:

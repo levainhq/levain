@@ -45,6 +45,7 @@ from levain.contracts import canon
 from levain.broker import norm as broker_norm
 from levain.broker import policy as broker_policy
 from levain.firing.hands import HostOS
+from levain.sandbox_keys import LOOSENING_NONEMPTY as _LOOSENING_NONEMPTY, LOOSENING_TRUE as _LOOSENING_TRUE
 from levain.slot import Refused
 from levain.slot.bwrap import LEVAIN_BWRAP
 from levain.slot.ids import SlotId, loopback_alias
@@ -126,7 +127,8 @@ _SBPL_SAFE_RE = re.compile(r"[A-Za-z0-9/._+-]+", re.ASCII)
 DRIVER_INPUT_DEPTH = 64   # §5.4: driver_input nests no deeper than 64
 
 #: The read-back's "no such key". This module runs as root under the host's own ``/usr/bin/python3`` (macOS: CLT
-#: 3.9), so it never imports ``levain.host_guard`` at module level (tomllib, 3.11+); :func:`_get` mirrors host_guard's.
+#: 3.9), so it never imports ``levain.host_guard`` (a large operator-side module; the sandbox key lists the repo-layer
+#: check reads are ``levain.sandbox_keys``); :func:`_get` mirrors host_guard's.
 _MISSING = object()
 
 
@@ -1009,11 +1011,10 @@ def repo_loosening_refusals(docs: Mapping[str, Any]) -> list[Refused]:
     document that is not an object is refused ``repo-settings-malformed``.
     Hooks, permissions and every other key launch (plan §2c 3: the repo's settings are its own).
 
-    Operator-side: the supervisor runs this on the clone it bundles, before the bundle is made (the slot clones
-    exactly that bundle), never the root helper. host_guard is imported here, not at module level, so the root path
-    that imports this module stays on the host's 3.9."""
-    from levain.host_guard import _LOOSENING_NONEMPTY, _LOOSENING_TRUE
-
+    Run by the interactive supervisor on the clone it bundles, before the bundle is made (the slot clones exactly that
+    bundle), and by the dispatch run server on the snapshot it is sent (``levain.slot.workspace``, levain 34), never
+    the root helper. It reads the key lists from ``levain.sandbox_keys``, not ``levain.host_guard``, so a 3.9 process
+    can run it."""
     out: list[Refused] = []
     for path in sorted(docs):
         doc = docs[path]

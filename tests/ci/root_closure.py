@@ -175,8 +175,6 @@ LAZY_SITES = {
     'levain/slot/reaper.py::ensure_netns::from levain.slot.netns import netns_steps': 'root',
     'levain/slot/removal.py::_fsync::from levain.slot.generation import _full_fsync': 'root',
     'levain/slot/render.py::_export_profile::from levain.slot.wall import check_profile_text, export_wall_facts': 'root',
-    # operator: ``repo_loosening_refusals`` and ``refuse_repo_loosening`` <- ``supervisor.check_repo_layer`` <- ``supervisor`` / ``dispatch.readset``; neither has a caller in ``levain/`` outside the operator, none in the closure (host_guard needs 3.11 ``tomllib``)
-    'levain/slot/render.py::repo_loosening_refusals::from levain.host_guard import _LOOSENING_NONEMPTY, _LOOSENING_TRUE': 'operator',
     'levain/slot/render.py::parse_driver_input::from levain.contracts.canon import _int, _no_constant, _no_float, _no_lone_surrogate, _pairs, text_depth': 'root',
     'levain/slot/root_tree.py::h11_floor::from levain.slot.generation import read_version_text': 'root',
     'levain/slot/root_tree.py::_staged_is::from levain.slot.generation import generation_id': 'root',
@@ -312,6 +310,15 @@ LAZY_SITES = {
     'levain/cockpit/authority.py::sign_card::from levain.agents.signing import sign_agent_link': 'operator',
     'levain/consent/queue.py::AuthoritySource.head::from levain.authority import log_head': 'root',
     'levain/dispatch/contract.py::git_env::from levain.launch import child_env': 'root',
+    # root: the read set's ingest (``_verify_in``) runs in the dispatch run server for a workspace upload (``levain.slot.workspace``, levain 34, W1); each of these is a step of it
+    'levain/dispatch/readset.py::_layer_check::from levain.slot import Refused': 'root',
+    'levain/dispatch/readset.py::_layer_check::from levain.slot.supervisor import check_repo_layer, repo_layer_docs': 'root',
+    'levain/dispatch/readset.py::_limits::from levain.slot.stage import BUNDLE_CAP, STAGE_DEADLINE_S': 'root',
+    'levain/dispatch/readset.py::_write_attributes::from levain.slot import write_all': 'root',
+    'levain/dispatch/readset.py::_write_attributes::from levain.slot.render import READSET_ATTRIBUTES': 'root',
+    # operator: ``checkout_prefix`` <- ``build_readset`` (the operator's build); the ingest never calls it
+    'levain/dispatch/readset.py::checkout_prefix::from levain.slot.grammar import SESSION_RE': 'operator',
+    'levain/dispatch/readset.py::checkout_prefix::from levain.slot.layout import session_repo': 'operator',
     'levain/dispatch/published.py::sync::from levain.qbroker.grants import PUBLISHED_MAX   # here: grants imports this module': 'root',
     'levain/dispatch/published.py::sync::from levain.qbroker.store import replace_file': 'root',
     # root: ``record_verification`` <- ``follow.EventFollower`` (the dispatch service's ``follow_run.main``)
@@ -416,6 +423,8 @@ LAZY_SITES = {
     'levain/agents/session.py::_signed_by_spec::from levain.agents import spec as _spec': 'operator',
     # operator: ``run_session`` runs only in the operator's process (the controller, an agent session or the session client); the dispatch run server only imports the module
     'levain/agents/session.py::run_session::from levain.autonomic.journal import EffectStatus': 'operator',
+    # root: ``RealLauncher._workspace_record`` runs in the dispatch run server (``spawn`` writes the run record's workspace facts); its target is already a closure member
+    'levain/agents/session_launcher.py::RealLauncher._workspace_record::from levain.dispatch.snapshot import withhold_digest': 'root',
     # operator: ``AuthorityFeed.read`` runs only in the operator's process (the controller, an agent session or the session client); the dispatch run server only imports the module
     'levain/agents/session_client.py::AuthorityFeed.read::from levain.agent_authority import AgentAuthority': 'operator',
     # operator: ``AuthorityFeed.rows`` runs only in the operator's process (the controller, an agent session or the session client); the dispatch run server only imports the module
@@ -454,10 +463,10 @@ LAZY_SITES = {
     'levain/slot/supervisor.py::Supervisor._confirm_identity::from levain.slot.identity import BASELINE_WRITTEN, NOT_A_CHECK': 'operator',
     # operator: ``Supervisor._leased`` is the interactive supervisor's own code, the operator uid's process; the dispatch run server imports the module for its names
     'levain/slot/supervisor.py::Supervisor._leased::from levain.slot.stage import make_bundle': 'operator',
-    # operator: ``_git`` is the interactive supervisor's own code, the operator uid's process; the dispatch run server imports the module for its names
-    'levain/slot/supervisor.py::_git::from levain.slot.stage import STAGE_DEADLINE_S, _git_env as env': 'operator',
-    # operator: ``check_repo_layer`` is the interactive supervisor's own code, the operator uid's process; the dispatch run server imports the module for its names
-    'levain/slot/supervisor.py::check_repo_layer::from levain.slot.render import repo_loosening_refusals': 'operator',
+    # root: ``_git`` runs the repo-layer check's git, and the dispatch run server runs that check on a workspace snapshot (``readset._layer_check`` <- ``workspace``, levain 34, W1); its target is already a closure member
+    'levain/slot/supervisor.py::_git::from levain.slot.stage import STAGE_DEADLINE_S, _git_env as env': 'root',
+    # root: ``check_repo_layer`` is the interactive supervisor's check AND the dispatch run server's on a workspace snapshot (``readset._layer_check`` <- ``workspace``, levain 34, W1); its target is already a closure member
+    'levain/slot/supervisor.py::check_repo_layer::from levain.slot.render import repo_loosening_refusals': 'root',
     # operator: ``identity_answer`` is the interactive supervisor's own code, the operator uid's process; the dispatch run server imports the module for its names
     'levain/slot/supervisor.py::identity_answer::from levain.slot.records import _REASON_RE, OBSERVED_ID_RE': 'operator',
     # operator: ``prepare_answer`` is the interactive supervisor's own code, the operator uid's process; the dispatch run server imports the module for its names

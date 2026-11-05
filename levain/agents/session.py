@@ -64,7 +64,8 @@ from levain.agents.accounting import ActionExposure, StopResult, Usage
 from levain.agents.store import AgentStore
 from levain.agents.supervise import STOP_DEADLINE_S as _STOP_DEADLINE_S   # the reaper's stop deadline, reused
 
-__all__ = ["S1_DISPATCH", "AUTH_FOR_BILLING", "EFFECT_ID", "BRIEF_MAX_BYTES", "RECALL_MAX_BYTES", "SessionLaunch",
+__all__ = ["S1_DISPATCH", "AUTH_FOR_BILLING", "EFFECT_ID", "BRIEF_MAX_BYTES", "RECALL_MAX_BYTES", "Workspace",
+           "WORKSPACE_REPO_MAX", "WORKSPACE_WITHHOLD_MAX", "SessionLaunch",
            "SessionLauncher", "UnwiredLauncher", "Reserved", "SessionExecutor", "SessionReport", "BriefRefused",
            "render_brief", "new_session_key", "reserved_terms", "launch_refusal", "run_session", "make_run",
            "SessionEnder", "RowSessionExecutor", "session_executor_of"]
@@ -84,10 +85,50 @@ class BriefRefused(ValueError):
     """The role's template and the values handed to it do not agree."""
 
 
+WORKSPACE_REPO_MAX = 4096          # [judged] a path's length; PATH_MAX on the hosts this runs on
+WORKSPACE_WITHHOLD_MAX = 256       # the snapshot's own bound on withhold patterns (levain.dispatch.snapshot._WITHHOLD_MAX)
+_WORKSPACE_PATTERN_MAX = 512       # [judged] one withhold pattern's length
+_WORKSPACE_HEAD_RE = re.compile(r"[0-9a-f]{40}")
+_WORKSPACE_DIGEST_RE = re.compile(r"sha256:[0-9a-f]{64}")
+
+
+@dataclass(frozen=True)
+class Workspace:
+    """The workspace member of a launch (levain 34, W1): which repo, at which commit, minus which patterns. ``repo`` is
+    the operator's absolute repo path (a RECORD for the run: the run server cannot read it), ``head`` the 40-hex commit
+    the snapshot was cut from, ``withhold`` the role's withhold patterns (a tuple; empty in W1, see
+    ``levain.slot.workspace.W1_WITHHOLD_ALLOWED``). The shape is checked here, at construction, so a malformed member
+    never exists to be passed on; pattern GRAMMAR is the snapshot's (``levain.dispatch.snapshot``), checked where the
+    manifest is.
+
+    ``manifest_digest`` is NOT on the wire: it is None on the operator's side, and the run server fills it once it has
+    verified the uploaded bundle against the manifest (``levain.slot.workspace``), so the digest a record carries and
+    the stager checks is the server's own derivation, never a field the client sent."""
+    repo: str
+    head: str
+    withhold: tuple[str, ...] = ()
+    manifest_digest: str | None = None
+
+    def __post_init__(self) -> None:
+        if type(self.repo) is not str or not self.repo.startswith("/") or "\0" in self.repo \
+                or len(self.repo) > WORKSPACE_REPO_MAX:
+            raise ValueError("workspace.repo is not an absolute path")
+        if type(self.head) is not str or _WORKSPACE_HEAD_RE.fullmatch(self.head) is None:
+            raise ValueError("workspace.head is not a 40-hex commit")
+        w = self.withhold
+        if type(w) is not tuple or len(w) > WORKSPACE_WITHHOLD_MAX or any(
+                type(p) is not str or not p or len(p) > _WORKSPACE_PATTERN_MAX or "\0" in p for p in w):
+            raise ValueError("workspace.withhold is not a short tuple of patterns")
+        if self.manifest_digest is not None and (type(self.manifest_digest) is not str
+                                                 or _WORKSPACE_DIGEST_RE.fullmatch(self.manifest_digest) is None):
+            raise ValueError("workspace.manifest_digest is not a sha256 digest")
+
+
 @dataclass(frozen=True)
 class SessionLaunch:
     """What the launcher is asked to start: the occurrence, the key the supervisor recorded, the role's harness and
-    model, the rendered brief, and the route facts the launch was checked against."""
+    model, the rendered brief, and the route facts the launch was checked against. ``workspace`` (W1) is None for a
+    launch that stages no repo, which is every launch before the stager exists."""
     occurrence_id: str
     session_key: str
     harness: str
@@ -95,6 +136,7 @@ class SessionLaunch:
     brief: str
     auth: str
     exposure: ActionExposure | None
+    workspace: Workspace | None = None
 
 
 @runtime_checkable
