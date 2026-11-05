@@ -185,7 +185,8 @@ def test_h8_a_signed_reply_missing_its_fields_prints_what_was_sent_and_never_und
         ])
     said = out["values"][5]
     assert "undefined" not in said, said
-    assert said.startswith("signed (b) · by " + rig.pk.key.fingerprint + ": levain-sign-choice/1 chosen (b)"), said
+    # a reply that names no key (the cockpit's always does): the request named none either, so the line says none
+    assert said.startswith("signed (b): levain-sign-choice/1 chosen (b)") and " · by " not in said, said
     assert rig.verifies(QRID)
 
 

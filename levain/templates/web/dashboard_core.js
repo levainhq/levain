@@ -5050,8 +5050,9 @@
   const signArm = (ev) => { if (tapArmable(ev)) signArmedAt = Date.now(); };
   document.addEventListener("click", signArm, true);
   document.addEventListener("keydown", signArm, true);
-  // rp|fp whose remembered id the authenticator refused: the next tap asks for no id (the OS's own list), until a passkey
-  // signs for that rp|fp (signKeep clears it)
+  // rp|fp whose remembered id the authenticator refused: signWho passes over that key while another remembered key remains
+  // (else a pick, or, with one key enrolled, the OS's own list), until a passkey signs (signKeep clears it, and forgets the
+  // record when another key signed)
   const signRefusedId = new Set();
   // `onRefused` runs only when the authenticator itself refused (NotAllowedError from the get() below); the door's own
   // refusal (NoTapError) never reaches it, since no authenticator was asked
@@ -5130,9 +5131,22 @@
   }
   // after a verified signature: the record names the credential that signed, when it does not already, and a refusal
   // recorded for this rp|fp is over (the next tap asks for the recorded passkey by its id again)
+  // `fp` is the key the cockpit's reply NAMES as the one that verified (a plain sign request names its signer only in the
+  // reply), never the one the page asked for; null names none, and only the late refusal is cleared
+  // A record the authenticator refused on this page while ANOTHER passkey then signed is forgotten: it names a passkey this
+  // device no longer holds (or one only cancelled, which a later sign learns again), and kept it would be asked first,
+  // and fail first, on every tap after this one (L3 picker r1)
   function signKeep(rp, fp, cred) {
-    if (typeof rp === "string" && rp) signRefusedId.delete(rp + "|" + fp);
-    if (!cred || !cred.rawId || typeof rp !== "string" || !rp) return;
+    if (typeof rp === "string" && rp) {
+      signRefusedId.delete(rp + "|*");
+      if (fp) {
+        signRefusedId.delete(rp + "|" + fp);
+        for (const k of Object.keys(signMine(rp))) {
+          if (k !== fp && signRefusedId.has(rp + "|" + k)) { signForget(rp, k); signRefusedId.delete(rp + "|" + k); }
+        }
+      }
+    }
+    if (!fp || !cred || !cred.rawId || typeof rp !== "string" || !rp) return;
     const id = signB64u(cred.rawId);
     if (signMine(rp)[fp] !== id) signRemember(rp, fp, id);
   }
@@ -5140,8 +5154,20 @@
   // when that id decodes and the authenticator has not refused it on this page since a passkey last signed for rp|fp, else
   // for none (the OS's own list), never a throw. An id this browser remembered that does not decode is forgotten; one the
   // authenticator refuses (NotAllowedError, which a passkey since removed reads as, and a cancel too) is not asked again by
-  // the page, and stays remembered until a passkey signs (signKeep replaces it and clears the refusal)
+  // the page, and stays remembered until a passkey signs (signKeep clears the refusal, and forgets the record when another
+  // key signed)
+  // `fp` null is a plain sign request whose signer the answer names (signCeremony): `rawId` is then a list of the ids the
+  // page knows (one remembered id, or all the enrolled ones, or none for the OS's own list), asked for together; a refusal
+  // of a single remembered id is remembered under rp|<the key it was remembered for>, so signWho passes over that key on
+  // the next tap (the next remembered key, else the OS's own list)
   function signAsk(pk, rp, fp, rawId) {
+    if (fp === null) {
+      const ids = (Array.isArray(rawId) ? rawId : []).filter(signDecodable);
+      const mine = signMine(rp);
+      const of = ids.length === 1 ? Object.keys(mine).find((k) => mine[k] === ids[0]) : undefined;
+      const use = ids.length ? { allowCredentials: ids.map((i) => ({ type: "public-key", id: signUnb64u(i) })) } : {};
+      return signGet(Object.assign({}, pk, use), of !== undefined ? () => signRefusedId.add(rp + "|" + of) : null);
+    }
     const noId = rp + "|" + fp;
     const local = !!rawId && typeof rp === "string" && signMine(rp)[fp] === rawId;
     const id = rawId && signDecodable(rawId) && !signRefusedId.has(noId) ? signUnb64u(rawId) : null;
@@ -5219,7 +5245,9 @@
   // answer, or said nothing, and the request is then held in signPending until a board read settles it.
   function signCeremony(r, fp, rawId, choice, words, say) {
     const base = "/cockpit/sign/" + encodeURIComponent(r.id) + "/";
-    const body = { signer_fp: fp, request_sha256: r.sha256 };
+    // fp null: the signer is named by the answer, so the challenge names none (the bytes signed do not name a key)
+    const body = { request_sha256: r.sha256 };
+    if (fp !== null) body.signer_fp = fp;
     if (choice !== undefined) body.choice = choice;
     if (words !== undefined) body.write_in = words;
     let sent = false, line;
@@ -5244,12 +5272,12 @@
         return signCall(base + "answer", answer).then((a) => {
           if (!a.ok && a.status >= 400 && a.status < 500) { say("not signed: " + signWhy(a), "bad"); return { done: "unsigned" }; }
           if (!a.ok) return lost("not sure this was signed (" + signWhy(a) + ")");
-          signKeep(c.body.rp_id, fp, cred);
           // the reply's fields where it names them, else what was sent; a part neither names is left out
           const chose = typeof a.body.choice === "string" && a.body.choice ? a.body.choice : choice;
           const by = typeof a.body.signer_fp === "string" && a.body.signer_fp ? a.body.signer_fp : fp;
+          signKeep(c.body.rp_id, by, cred);
           const ns = typeof a.body.namespace === "string" && a.body.namespace ? " in " + a.body.namespace : "";
-          say("signed" + (chose ? " (" + chose + ")" : "") + " · by " + by + ns + (line ? ": " + line : ""), "ok");
+          say("signed" + (chose ? " (" + chose + ")" : "") + (by ? " · by " + by : "") + ns + (line ? ": " + line : ""), "ok");
           return { done: "signed", line: line };
         });
       }, (e) => { say(signDeclined(e, "nothing was signed"), "bad"); return { done: "unsigned" }; });
@@ -5273,7 +5301,7 @@
           const chose = typeof st.choice === "string" && st.choice ? st.choice : choice;
           const by = typeof st.signer_fp === "string" && st.signer_fp ? st.signer_fp : fp;
           const ns = typeof st.namespace === "string" && st.namespace ? " in " + st.namespace : "";
-          say("signed" + (chose ? " (" + chose + ")" : "") + " · by " + by + ns + (line ? ": " + line : "")
+          say("signed" + (chose ? " (" + chose + ")" : "") + (by ? " · by " + by : "") + ns + (line ? ": " + line : "")
               + " (its reply was lost; the cockpit confirmed it)", "ok");
           return { done: "signed", line: line };
         }
@@ -5291,13 +5319,29 @@
         return { done: "unsure" };
       });
   }
-  // Which passkey signs: the one this browser used before, else the only one enrolled; with several and no record, the
-  // person picks (buttons put into `host`, the phone's pick list). The credential id is this browser's own record, else
+  // The words one pick-list button carries for key `fp`: the provider its enrolment recorded (else "provider not recorded"),
+  // when it was enrolled and its number in the authority log, from the listing's `credentials` (display facts the cockpit
+  // holds). Never an fp prefix alone: that names nothing a person can match against the OS's own list.
+  function signKeyLabel(fp, facts) {
+    const f = facts && typeof facts === "object" ? facts : {};
+    let prov = typeof f.provider === "string" ? f.provider : "";
+    if (!prov || /^provider not/.test(prov)) prov = prov.replace(/ \(.*$/, "") || "provider not recorded";
+    const at = typeof f.enrolled_at === "string" ? new Date(f.enrolled_at) : null;
+    const pad = (n) => (n < 10 ? "0" : "") + n;
+    const when = at && !isNaN(at.getTime())
+      ? " · enrolled " + pad(at.getMonth() + 1) + "-" + pad(at.getDate()) + " " + pad(at.getHours()) + ":" + pad(at.getMinutes()) : "";
+    return prov + when + (typeof f.seq === "number" ? " (#" + f.seq + ")" : "") + (when || typeof f.seq === "number" ? "" : " · " + fp.slice(0, 18) + "…");
+  }
+  // Which passkey signs: the one this browser used before, else the only one enrolled; with several remembered, the newest
+  // enrolled of them that the authenticator has not refused on this page. With several and no record the person picks (buttons put into `host`, the phone's pick list), unless
+  // `mode` is "late": a plain sign request, whose signer the cockpit's reply names, never draws a pick. Late resolves
+  // {fp: null, rawIds}: the one remembered id (no OS chooser), else every enrolled id when all are known, else none (the OS's
+  // own list, which holds every levain passkey this device has). The credential id is this browser's own record, else
   // the one the listing's `credentials` names (display facts the cockpit holds, so a fresh browser asks for that passkey
   // at once), else none (the OS's own list). Resolves {fp, rawId}, or null when the pick was dismissed
   // by its dismiss button; rejects (an AbortError) when a redraw took `host` off the page with the pick still open, so the
   // caller's `signBusy` is released on every path. The pick holds `signBusy` like a ceremony.
-  function signWho(listing, host, say) {
+  function signWho(listing, host, say, mode) {
     const signers = Array.isArray(listing.signers) ? listing.signers : [];
     const rp = (listing.origin || "").replace(/^https?:\/\//, "").replace(/:\d+$/, "");
     const local = signMine(rp);
@@ -5307,11 +5351,24 @@
     const idOf = (fp) => (Object.prototype.hasOwnProperty.call(local, fp) ? local[fp]
       : (Object.prototype.hasOwnProperty.call(held, fp) && held[fp] && typeof held[fp].credential_id === "string"
         ? held[fp].credential_id : null));
-    const known = signers.filter((fp) => Object.prototype.hasOwnProperty.call(local, fp));
-    if (known.length === 1) return Promise.resolve({ fp: known[0], rawId: local[known[0]] });
-    if (!known.length && signers.length === 1) return Promise.resolve({ fp: signers[0], rawId: idOf(signers[0]) });
-    const choices = known.length ? known : signers;
-    say("more than one passkey is enrolled for this name; pick the one this device holds:");
+    const remembered = signers.filter((fp) => Object.prototype.hasOwnProperty.call(local, fp));
+    // a remembered key whose id the authenticator refused on this page is passed over (L3 picker r1): asking it again would
+    // fail again, and a bound challenge must never pair it with the OS's whole list, which signs with a key it is not bound to
+    const known = remembered.filter((fp) => !signRefusedId.has(rp + "|" + fp));
+    const seqOf = (fp) => (held[fp] && typeof held[fp].seq === "number" ? held[fp].seq : -1);
+    const newest = (fps) => fps.reduce((best, fp) => (seqOf(fp) >= seqOf(best) ? fp : best), fps[0]);
+    if (mode === "late") {
+      if (known.length) { const ids = [local[newest(known)]]; return Promise.resolve({ fp: null, rawIds: ids }); }
+      const all = signers.map(idOf);
+      // every remembered key refused: the OS's own list (whichever levain passkey this device holds signs)
+      const ok = !remembered.length && signers.length && all.every((i) => typeof i === "string");
+      return Promise.resolve({ fp: null, rawIds: ok ? all : [] });
+    }
+    if (known.length) { const fp = newest(known); return Promise.resolve({ fp: fp, rawId: local[fp] }); }
+    if (signers.length === 1) return Promise.resolve({ fp: signers[0], rawId: idOf(signers[0]) });
+    const choices = signers;
+    say("more than one passkey may sign this; pick one this device holds (a synced passkey such as iCloud Keychain is on all"
+      + " your devices; any one on this device works):");
     return new Promise((resolve, reject) => {
       const picks = [];
       // a panel refetch that replaces the card detaches these buttons, and nothing could ever press them again
@@ -5324,10 +5381,12 @@
       }, 250);
       const end = () => { clearInterval(watch); picks.forEach((x) => x.remove()); };
       for (const fp of choices) {
-        const p = el("button", "undo-btn sign-pick", fp.slice(0, 18) + "…");
+        const p = el("button", "undo-btn sign-pick", signKeyLabel(fp, held[fp]));
         p.type = "button";
         p.title = fp;
-        p.addEventListener("click", () => { end(); resolve({ fp: fp, rawId: idOf(fp) }); });
+        // a pick is his word for that key: a refusal recorded for it is over, so it is asked for by its id (the challenge is
+        // bound to it, so the OS's whole list would offer keys that cannot answer it)
+        p.addEventListener("click", () => { end(); signRefusedId.delete(rp + "|" + fp); resolve({ fp: fp, rawId: idOf(fp) }); });
         picks.push(p);
         host.appendChild(p);
       }
@@ -5460,12 +5519,12 @@
         if (!signInFlight.has(id)) signInFlight.set(id, new Set());
         let done = "unsigned";
         let rearm = true;     // false: the card stays frozen (signed, or "not sure" until a read finds the version open)
-        signWho(Object.assign({}, listing, { signers: signers }), acts, say)
+        signWho(Object.assign({}, listing, { signers: signers }), acts, say, "late")
           .then((who) => {
             if (!who) return { done: "unsigned" };
             // a ceremony that throws before it returns has posted nothing: the answer is only ever sent from inside the
             // promise it returns
-            try { return signCeremony(r, who.fp, who.rawId, choice, words, say); }
+            try { return signCeremony(r, who.fp, who.rawIds || who.rawId, choice, words, say); }
             catch (e) { say("the page failed (" + ((e && e.name) || "error") + "); nothing was signed", "bad"); return { done: "unsigned" }; }
           }, () => { say(SIGN_PICK_CLOSED, "bad"); return { done: "unsigned" }; })
           // a ceremony whose own catch threw may have sent the answer, with no attempt to ask about: "not sure", and the
@@ -5925,10 +5984,10 @@
         return { ok: false, message: m };
       }
       let who;
-      try { who = await signWho(Object.assign({}, listing, { signers: signers }), host, tell); }
+      try { who = await signWho(Object.assign({}, listing, { signers: signers }), host, tell, "late"); }
       catch (e) { tell(SIGN_PICK_CLOSED, "bad"); return { ok: false, message: SIGN_PICK_CLOSED + kept }; }
       if (!who) return { ok: false, message: last + kept };
-      const out = await signCeremony(r, who.fp, who.rawId, undefined, undefined, tell);
+      const out = await signCeremony(r, who.fp, who.rawIds || who.rawId, undefined, undefined, tell);
       if (out.done === "signed") {
         signDraftSet(verb, panel, params, { signed: true });
         return { ok: true, request: rid, txn: d.txn };
@@ -6911,7 +6970,7 @@
     const base = "/cockpit/grant/" + encodeURIComponent(g.id) + "/";
     const slot = host.closest(".grant-slot");     // at the click: a redraw during the ceremony detaches this card
     let sent = false, revoked = false;
-    signWho({ signers: signed.signers, origin: listing.origin }, host, say).then((who) => {
+    signWho({ signers: signed.signers, origin: listing.origin, credentials: listing.credentials }, host, say).then((who) => {
       if (!who) { say("nothing was revoked"); return; }
       say("asking for the revoke to sign…");
       return signCall(base + "revoke-challenge", { signer_fp: who.fp, instance: g.instance }).then((c) => {

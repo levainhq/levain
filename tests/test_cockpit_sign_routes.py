@@ -121,7 +121,8 @@ def test_the_listing_is_the_signers_own_rows_and_its_enrolled_keys(cockpit) -> N
     status, body = _call(cockpit["url"], "/cockpit/sign.json")
     assert status == 200
     assert set(body) == {"requests", "signers", "credentials", "origin"} and body["origin"] == PINNED
-    assert body["credentials"] == {}      # no key facts held (levain.cockpit.keyfacts): the browser asks its own list
+    # no key facts held (levain.cockpit.keyfacts): the browser asks its own list; the enrol date and number ride beside
+    assert all(set(row) <= {"enrolled_at", "seq"} for row in body["credentials"].values())
     assert body["signers"] == [cockpit["pk"].key.fingerprint]
     assert body["requests"] == cockpit["signer"].listing([cockpit["pk"].key.fingerprint])
     [row] = body["requests"]

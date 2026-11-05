@@ -32,7 +32,8 @@
 //   {"authenticator": {"rpId", "privateKey", "credentialId", "userHandle"}}   a virtual platform authenticator (user
 //                                            verification on) holding that one resident P-256 credential (base64
 //                                            PKCS#8 key, base64 ids), so the page's navigator.credentials.get signs
-//                                            with a key the test knows; nothing is collected
+//                                            with a key the test knows; nothing is collected. A later `authenticator` step adds
+//                                            its credential to that same authenticator (a device holding several passkeys)
 //   {"user_verified": <bool>}               the last authenticator's answer to user verification from now on (false: the
 //                                            page's navigator.credentials.get with userVerification "required" is refused,
 //                                            a cancelled Face ID as the page sees it); nothing is collected
@@ -319,11 +320,15 @@ for (const s of steps) {
   const waitMs = scaled(s.ms || 20000);
   const deadline = Date.now() + waitMs;
   if (s.authenticator !== undefined) {
-    await send("WebAuthn.enable", { enableUI: false });
-    const made = await send("WebAuthn.addVirtualAuthenticator", { options: { protocol: "ctap2", transport: "internal",
-      hasResidentKey: true, hasUserVerification: true, isUserVerified: true, automaticPresenceSimulation: true } });
-    authenticatorId = made.result?.authenticatorId;
-    if (!authenticatorId) throw new Error("no virtual authenticator: " + JSON.stringify(made.error || made.result));
+    // a second `authenticator` step adds its credential to the one authenticator (Chrome allows one internal authenticator
+    // per environment), so a device that holds several passkeys is two steps
+    if (!authenticatorId) {
+      await send("WebAuthn.enable", { enableUI: false });
+      const made = await send("WebAuthn.addVirtualAuthenticator", { options: { protocol: "ctap2", transport: "internal",
+        hasResidentKey: true, hasUserVerification: true, isUserVerified: true, automaticPresenceSimulation: true } });
+      authenticatorId = made.result?.authenticatorId;
+      if (!authenticatorId) throw new Error("no virtual authenticator: " + JSON.stringify(made.error || made.result));
+    }
     const a = s.authenticator;
     const added = await send("WebAuthn.addCredential", { authenticatorId, credential: { credentialId: a.credentialId,
       isResidentCredential: true, rpId: a.rpId, privateKey: a.privateKey, userHandle: a.userHandle, signCount: 0 } });

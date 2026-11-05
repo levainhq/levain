@@ -222,6 +222,9 @@ ATTEMPT_KEEP_S = 24 * 3600.0
 # the most records kept: past it a new attempt (an answer, or a status read fencing an unknown one) is refused 429 before
 # anything is signed. A person signs a request in one attempt, a few after a lost reply: 1024 a day is a loop, not a person
 ATTEMPTS_MAX = 1024
+# the active passkeys an answer that names no signer is tried against (one ssh-keygen spawn each): a bound, past which the
+# page must name the key
+_LATE_KEYS_MAX = 16
 
 
 class SignRefused(Exception):
@@ -236,6 +239,24 @@ class SignRefused(Exception):
 # the error word a port answers a SignRefused with, by its status; any other status is "sign_refused". ONE table: the
 # phone port (levain.phone_server) and the cockpit (levain.web_server) both import it, so the two cannot drift
 ERROR_WORDS = {400: "bad_request", 404: "not_found", 409: "conflict", 429: "too_many_open", 503: "unavailable"}
+
+
+def _candidate_problem(public_key: str, authenticator_data: object) -> bool:
+    """Whether :func:`levain.consent.passkey.to_sshsig`'s refusal of an answer under ``public_key`` comes from that key
+    rather than from the answer: the key's line is malformed, or the assertion's rpId hash is not the key's site. A late
+    answer then tries the next key (one bad enrolment never stops a good one from verifying). An answer whose
+    authenticator data does not decode, or is too short to carry an rpId hash, is the answer's problem."""
+    from levain.consent.passkey import _AUTH_DATA_MIN, PasskeyError, b64url_decode, key_application
+
+    try:
+        data = b64url_decode(authenticator_data, "authenticator_data")
+    except PasskeyError:
+        return False
+    try:
+        application = key_application(public_key)
+    except PasskeyError:
+        return True
+    return len(data) >= _AUTH_DATA_MIN and data[:32] != hashlib.sha256(application.encode("ascii", "replace")).digest()
 
 
 def error_word(status: int) -> str:
@@ -1128,7 +1149,12 @@ class Signer:
 
     ``facts_root`` returns the cockpit data root whose key facts (:mod:`levain.cockpit.keyfacts`) an answer's
     ``raw_id`` is recorded into and a listing's credential ids are read from (default: :func:`sign_root`'s). Those
-    facts are display only: nothing here reads them to decide what a key may sign."""
+    facts are display only: nothing here reads them to decide what a key may sign.
+
+    A challenge may leave ``signer_fp`` out (a plain sign request: the bytes signed never name a key). The answer then
+    names the signer: it is tried against the active keys read at answer time and accepted under the one it verifies
+    under. That is the same set of keys the page may name at the challenge, so it grants no authority a named key
+    does not; a challenge that names a key stays bound to that key."""
 
     def __init__(self, queue_dir: Path, namespaces: "tuple[str, ...]", rp_id: str, keys: Any, *,
                  facts_root: "Callable[[], Path] | None" = None) -> None:
@@ -1141,8 +1167,8 @@ class Signer:
         self._page_origin: str | None = None
         self._pins = 0          # the servers holding it pinned (pin_page_origin, release_pin): pinned while any does
         self._lock = threading.Lock()
-        # request id -> (file sha256, signer fp, chosen option key or None, the write-in's words or None) at challenge
-        self._challenged: dict[str, tuple[str, str, str | None, str | None]] = {}
+        # request id -> (file sha256, signer fp or None when the answer names it, chosen option key or None, the write-in's words or None) at challenge
+        self._challenged: dict[str, tuple[str, str | None, str | None, str | None]] = {}
         # an answer a stop cut off is settled now (signed if the signature store proves it, else refused): never pending
         try:
             settle_orphan_attempts(self.queue_dir)
@@ -1230,20 +1256,37 @@ class Signer:
         return list(self._keys())
 
     def key_facts(self, signers: "list[str]") -> dict[str, dict[str, Any]]:
-        """``{fingerprint: {credential_id, provider}}`` for those of ``signers`` the cockpit's key facts name, so a page
-        can ask the browser for exactly that passkey (``allowCredentials``). Display only; empty when the facts cannot
-        be read."""
+        """``{fingerprint: {credential_id, provider, enrolled_at, seq}}`` for those of ``signers`` the cockpit's key
+        facts name (``credential_id`` and ``provider``, so a page can ask the browser for exactly that passkey) or the
+        authority log enrolled (``enrolled_at``, the enrol link's time, and ``seq``, for a picker's label). Display
+        only; the facts are empty when they cannot be read."""
         from levain.cockpit import keyfacts
 
         try:
             held = keyfacts.read(self._facts_root())
         except (keyfacts.KeyFactsError, SignRefused, OSError):
-            return {}
+            held = {}
         except Exception as exc:   # noqa: BLE001 -- display only: it never costs the listing
             _log.warning("the key facts were not read: %s: %s", type(exc).__name__, exc)
-            return {}
-        return {fp: {"credential_id": held[fp].credential_id, "provider": keyfacts.provider_text(held[fp])}
-                for fp in signers if fp in held and held[fp].credential_id}
+            held = {}
+        try:
+            active = self._keys()
+        except Exception:   # noqa: BLE001 -- display only
+            active = {}
+        out: dict[str, dict[str, Any]] = {}
+        for fp in signers:
+            facts: dict[str, Any] = {}
+            if fp in held:
+                facts["provider"] = keyfacts.provider_text(held[fp])
+                if held[fp].credential_id:
+                    facts["credential_id"] = held[fp].credential_id
+            key = active.get(fp)
+            if key is not None:
+                facts["enrolled_at"] = key.enrolled_at
+                facts["seq"] = key.enrolled_seq
+            if facts:
+                out[fp] = facts
+        return out
 
     def _learn(self, fingerprint: str, raw_id: Any) -> None:
         """Record ``raw_id``, reported with an assertion that verified under ``fingerprint``'s key, as that key's
@@ -1381,19 +1424,36 @@ class Signer:
         return out
 
     def challenge(self, request_id: str, req: Any) -> dict[str, Any]:
-        """``{signer_fp, request_sha256}`` (and for a choice request ``choice``, the option's key, or
+        """``{request_sha256}`` with an optional ``signer_fp`` (and for a choice request ``choice``, the option's key, or
         :data:`WRITE_IN_KEY` with ``write_in``, the operator's words, when the request offers a write-in) -> the
         WebAuthn challenge for the bytes signed (:func:`signed_bytes`), bound to the file as it is now and to that
         option (and those words). A choice request's reply also carries ``line``, the exact line the signature
         appends, cut from those bytes, so the page shows what is signed rather than its own copy of it.
         ``request_sha256`` is the listing's ``sha256`` for the request the page showed: a file that changed since it
-        was listed is refused (409), so the operator never signs bytes the page did not show."""
+        was listed is refused (409), so the operator never signs bytes the page did not show.
+
+        ``signer_fp`` may be left out: the signer is then named by the answer, not before it (:meth:`_answer`). That
+        grants nothing a named key does not: the bytes signed never name a key (the challenge is identical with or
+        without one), the keys an answer may verify under are the active passkeys read at answer time, which are the
+        very set the page may name here, and a signature verifies under exactly one of them. Only the plain sign
+        request is built this way; every payload that carries ``signer_fp`` inside the signed bytes names its key first.
+        Left out means absent: a ``signer_fp`` that is present must be a fingerprint (an explicit null is refused 400, so
+        a page bug never turns a bound challenge into a late one). A late challenge is refused before the passkey is
+        asked when more keys are active than an answer may be tried against (:data:`_LATE_KEYS_MAX`).
+
+        Known edge: past that cap no page falls back to naming a key for a plain sign request; that many active passkeys
+        is not a plausible install, and the refusal says what to do."""
         from levain.consent.passkey import challenge
 
-        if not isinstance(req, dict) or "signer_fp" not in req or not set(req) <= {"signer_fp", "request_sha256",
-                                                                                   "choice", "write_in"}:
-            raise SignRefused("request keys must be ['request_sha256', 'signer_fp'] and, for a choice request, "
-                              "'choice' (with 'write_in' for the write-in choice)", 400)
+        # a body naming a key but no listed version passes the shape: it is a page from before the version was sent, and
+        # its refusal is the 409 below that says to reload (test_phone_sign pins it)
+        if not isinstance(req, dict) or not ({"request_sha256", "signer_fp"} & set(req)) or not set(req) <= {
+                "signer_fp", "request_sha256", "choice", "write_in"}:
+            raise SignRefused("request keys must be ['request_sha256'], optionally 'signer_fp' and, for a choice "
+                              "request, 'choice' (with 'write_in' for the write-in choice)", 400)
+        if "signer_fp" in req and not isinstance(req["signer_fp"], str):
+            raise SignRefused(f"signer_fp must be a passkey's fingerprint, or left out; {str(req['signer_fp'])[:80]} is "
+                              "not one", 400)
         request = self._open(request_id)
         message = signed_bytes(request, req.get("choice"), req.get("write_in"))
         if not req.get("request_sha256"):
@@ -1402,8 +1462,18 @@ class Signer:
         if req["request_sha256"] != request.sha256:
             raise SignRefused(f"sign request {request_id} changed since it was shown: reload and read it again; "
                               "nothing was signed", 409)
-        fp = req["signer_fp"]
-        if not isinstance(fp, str) or fp not in self._keys():
+        fp = req.get("signer_fp")
+        if "signer_fp" not in req:
+            active = len(self._keys())  # unreadable raises here; none to ask refuses, as a named key's lookup would
+            if not active:
+                raise SignRefused(f"no passkey is enrolled for {self.rp_id}")
+            if active > _LATE_KEYS_MAX:
+                # refused before the tap: the answer could never be tried against them all (the cap in _answer)
+                raise SignRefused(f"{active} passkeys are enrolled for {self.rp_id}, more than the {_LATE_KEYS_MAX} a "
+                                  "sign request that names no key can be answered by: sign it from a page that names "
+                                  "the key (the key picker), or revoke the passkeys no longer in use; nothing was asked "
+                                  "of a passkey")
+        elif fp not in self._keys():
             raise SignRefused(f"{str(fp)[:80]} is not an active passkey enrolled for {self.rp_id}")
         with self._lock:
             self._challenged[request_id] = (request.sha256, fp, req.get("choice"), req.get("write_in"))
@@ -1559,7 +1629,9 @@ class Signer:
     def _answer(self, request_id: str, req: Any, mark: "Callable[[str | None], None] | None") -> dict[str, Any]:
         """:meth:`answer` without the attempt record. ``mark`` (the attempt's) is told the signature after it verifies
         and before anything is written, and told None under the lock once every refusal is behind it, just before the
-        ``.sig`` is written."""
+        ``.sig`` is written. A challenge bound to a key is verified under that key alone; one that named none is verified
+        under each active key, newest enrolment first and at most :data:`_LATE_KEYS_MAX` of them, and recorded under the
+        first that verifies (a signature verifies under exactly one)."""
         from levain.authority import VerifierUnavailable, verify_link_sig
         from levain.cockpit.consent import utc_stamp
         from levain.consent.passkey import PasskeyError, answer_signature_problem, b64url_decode, to_sshsig
@@ -1578,27 +1650,55 @@ class Signer:
                 if self._challenged.get(request_id) == bound:
                     del self._challenged[request_id]
             raise SignRefused(changed, 409)
-        key = self._keys().get(bound[1])
-        if key is None:
-            raise SignRefused(f"{bound[1]} is no longer an active passkey enrolled for {self.rp_id}")
+        keys = self._keys()
+        if bound[1] is None:
+            # the signer is named by the answer: the active keys as they are NOW, newest enrolment first, and the
+            # first under which the signature verifies. A cap bounds the verifier spawns one POST can cost.
+            candidates = sorted(keys.values(), key=lambda k: k.enrolled_seq, reverse=True)
+            if len(candidates) > _LATE_KEYS_MAX:
+                raise SignRefused(f"{len(candidates)} passkeys are enrolled for {self.rp_id}, more than the "
+                                  f"{_LATE_KEYS_MAX} an answer can be tried against: the page must name the key")
+        else:
+            bound_key = keys.get(bound[1])
+            if bound_key is None:
+                raise SignRefused(f"{bound[1]} is no longer an active passkey enrolled for {self.rp_id}")
+            candidates = [bound_key]
         message = signed_bytes(request, bound[2], bound[3])
         page_origin = self.page_origin
-        try:
-            signature = to_sshsig(key.public_key, b64url_decode(req["authenticator_data"], "authenticator_data"),
-                                  b64url_decode(req["client_data_json"], "client_data_json"),
-                                  b64url_decode(req["signature"], "signature"), namespace=request.namespace,
-                                  page_origin=page_origin)
-        except PasskeyError as exc:
-            raise SignRefused(str(exc)) from None
-        problem = answer_signature_problem(signature, key.public_key, page_origin)
-        if problem is not None:
-            raise SignRefused(problem)
-        try:
-            ok = verify_link_sig(message, signature, public_key=key.public_key, fingerprint=key.fingerprint,
-                                 namespace=request.namespace)
-        except VerifierUnavailable as exc:
-            raise SignRefused(f"the signature could not be verified now: {exc}", 503) from None
-        if not ok:
+        key, signature = None, ""
+        last_problem: str | None = None    # late: the last refusal that belonged to one candidate key, not the answer
+        for tried in candidates:
+            try:
+                signature = to_sshsig(tried.public_key, b64url_decode(req["authenticator_data"], "authenticator_data"),
+                                      b64url_decode(req["client_data_json"], "client_data_json"),
+                                      b64url_decode(req["signature"], "signature"), namespace=request.namespace,
+                                      page_origin=page_origin)
+            except PasskeyError as exc:
+                # late: a refusal that comes from THIS key (its line malformed, or made on another site than the
+                # assertion was) moves on to the next key; one about the answer itself refuses on the first key
+                if bound[1] is None and _candidate_problem(tried.public_key, req["authenticator_data"]):
+                    last_problem = str(exc)
+                    continue
+                raise SignRefused(str(exc)) from None
+            # past to_sshsig the key is well formed and made on the assertion's own site, so what this reads is the
+            # answer's (flags, origin), the same under any candidate: it refuses at once
+            problem = answer_signature_problem(signature, tried.public_key, page_origin)
+            if problem is not None:
+                raise SignRefused(problem)
+            try:
+                ok = verify_link_sig(message, signature, public_key=tried.public_key, fingerprint=tried.fingerprint,
+                                     namespace=request.namespace)
+            except VerifierUnavailable as exc:
+                raise SignRefused(f"the signature could not be verified now: {exc}", 503) from None
+            if ok:
+                key = tried
+                break
+        if key is None:
+            if last_problem is not None:
+                raise SignRefused(last_problem)
+            if bound[1] is None:
+                raise SignRefused(f"the passkey's signature does not verify under any passkey enrolled for "
+                                  f"{self.rp_id}; nothing was signed")
             raise SignRefused("the passkey's signature does not verify over this message")
         if mark is not None:
             mark(signature)

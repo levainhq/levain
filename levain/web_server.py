@@ -2919,6 +2919,17 @@ class _Handler(GuardedHandler):
             return
         try:
             payload, status = {**grants.listing(), "origin": self.server.signer_page_origin}, 200
+            # display facts for the revoke's pick list (provider, enrol date and number), as the sign listing carries them
+            signer = self.server.signer
+            if signer is not None:
+                try:
+                    payload["credentials"] = signer.key_facts(sorted({
+                        fp for g in payload["grants"] for fp in (g.get("signers") or []) if isinstance(fp, str)}))
+                except _CredentialUnavailable:   # RU-5: only the outer catch answers it
+                    raise
+                except Exception as exc:  # noqa: BLE001 - display only: it never costs the listing
+                    _log.warning("the grants' key facts were not read: %s: %s", type(exc).__name__, exc)
+                    payload["credentials"] = {}
         except _CredentialUnavailable:   # RU-5: only the outer catch answers it
             raise
         except Exception as exc:  # noqa: BLE001 - listing() says its own faults; anything else is an answer too
