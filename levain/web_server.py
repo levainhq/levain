@@ -1338,6 +1338,39 @@ def load_web_asset(filename: str) -> str:
     )
 
 
+# The URL is the version (1105-17): the cockpit page names each of its scripts and stylesheets as ``<path>?v=<digest>``,
+# the digest taken from the very bytes the server serves for that path, so the installed app's worker can answer a shell
+# asset from its cache by exact URL with nothing to revalidate. Only the cockpit page (``_COCKPIT_PAGE``) is rewritten:
+# the other pages are not cached shells. The ``?v=`` is ignored when a path is matched (``self.path.split("?", 1)[0]``).
+_SHELL_TAG = re.compile(r"<(?:script|link)\b[^>]*>", re.IGNORECASE)
+_SHELL_ATTR = re.compile(r"""\b(src|href)(\s*=\s*)(?:"([^"]+)"|'([^']+)')""", re.IGNORECASE)
+
+
+def _asset_digest(data: bytes) -> str:
+    return hashlib.sha256(data).hexdigest()[:12]
+
+
+def _version_shell_page(page: str, digests: Mapping[str, str]) -> str:
+    """``page`` with each ``<script src>`` and ``<link href>`` naming a path in ``digests`` (path -> digest) rewritten
+    to ``<path>?v=<digest>``. A reference that already carries a query or fragment, or names another path, is left alone."""
+
+    def attr(m: "re.Match[str]") -> str:
+        value = m.group(3) if m.group(3) is not None else m.group(4)
+        digest = digests.get(value)
+        if digest is None:
+            return m.group(0)
+        quote = '"' if m.group(3) is not None else "'"
+        return f"{m.group(1)}{m.group(2)}{quote}{value}?v={digest}{quote}"
+
+    def tag(m: "re.Match[str]") -> str:
+        t = m.group(0)
+        if t[1:5].lower() == "link" and not re.search(r"""\brel\s*=\s*["']?\s*stylesheet\b""", t, re.IGNORECASE):
+            return t
+        return _SHELL_ATTR.sub(attr, t, count=1)
+
+    return _SHELL_TAG.sub(tag, page)
+
+
 _ACTION_FIELD_KINDS = ("text", "textarea", "csv", "multiselect")
 _UNSAFE_FIELD_NAMES = ("__proto__", "prototype", "constructor")
 
@@ -4981,6 +5014,11 @@ def make_server(
         chat_service, room_host = room_serve.service, host_from(room_serve)
     assets = {fn: load_web_asset(fn).encode("utf-8") for fn, _ in _ASSETS.values()}
     assets[_SHEET_PAGE] = load_web_asset(_SHEET_PAGE).encode("utf-8")
+    # The one derivation point of the shell asset versions: digests of the bytes just loaded (the bytes served), written
+    # into the cockpit page BEFORE its bytes are stored, so the page cannot name a digest the server does not serve.
+    _shell_digests = {p: _asset_digest(assets[fn]) for p, (fn, _ct) in _ASSETS.items() if p != _COCKPIT_PAGE}
+    _shell_file = _ASSETS[_COCKPIT_PAGE][0]
+    assets[_shell_file] = _version_shell_page(assets[_shell_file].decode("utf-8"), _shell_digests).encode("utf-8")
     httpd = _LevainHTTPServer((host, port), _Handler)
     httpd.levain_source = source
     httpd.levain_assets = assets

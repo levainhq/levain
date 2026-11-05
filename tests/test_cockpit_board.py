@@ -275,7 +275,8 @@ def test_the_view_script_is_served_as_app_shell(tmp_path):
         status, hdrs, data = _raw(base, "/board_view.js", token=None)
         _s, _h2, page = _raw(base, "/", token=None)
     assert status == 200 and hdrs["content-type"].startswith("text/javascript")
-    assert b'<script src="/board_view.js"></script>' in page
+    import hashlib   # the page names the script by the digest of the bytes served (1105-17)
+    assert b'<script src="/board_view.js?v=%s"></script>' % hashlib.sha256(data).hexdigest()[:12].encode() in page
     assert b"innerHTML" not in data and b"draggable" not in data
 
 

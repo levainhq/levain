@@ -452,8 +452,40 @@ function fire(type, ev) {
     net = 'ok';
     await send('/', 'navigate', 'document');
     await send(m.cached, 'no-cors', kindOf(m.cached));
+  } else if (scenario === 'hungasset') {
+    // the URL is the version (1105-17): the network never answers and the timers are FAKE (none fires unless the scenario fires
+    // it), so an asset answered from the cache can be told from one that waited on the deadline by whether a deadline timer
+    // was ever scheduled. mode: JSON {shellHtml, cached, uncached, cachedCtype?}. Records, per step, the status/body, the
+    // network calls it made and the deadline timers (ms >= 4000) it scheduled; the uncached step then fires its timer.
+    const m = JSON.parse(mode);
+    const shellName = 'levain-shell-v' + /SW_VERSION = '([^']+)'/.exec(fs.readFileSync(swPath, 'utf8'))[1];
+    cacheStores.set(shellName, new Map([['/', m.shellHtml], [m.cached, 'CACHED ' + m.cached]])); cacheNames.add(shellName);
+    if (m.cachedCtype) cacheCtypes.set(shellName + '|' + m.cached, m.cachedCtype);
+    const timers = []; let calls = 0; log.aborted = []; log.steps = [];
+    sandbox.setTimeout = (fn, ms) => { const t = { fn, ms, live: true }; timers.push(t); return t; };
+    sandbox.clearTimeout = (t) => { if (t) t.live = false; };
+    sandbox.fetch = (req, init) => {
+      calls += 1;
+      return new Promise((res, rej) => { if (init && init.signal) init.signal.addEventListener('abort', () => { log.aborted.push(req.url); rej(new Error('aborted')); }); });
+    };
+    const kindOf = (u) => (/\.css/.test(u) ? 'style' : 'script');
+    const ask = async (url, fire) => {
+      const before = { calls, timers: timers.length };
+      const ev = { request: { url: 'https://box.example' + url, method: 'GET', mode: 'no-cors', destination: kindOf(url) } };
+      let handed = null;
+      ev.respondWith = (p) => { handed = Promise.resolve(p); };
+      ev.waitUntil = () => {};
+      for (const fn of listeners.fetch || []) fn(ev);
+      if (fire) { await new Promise((r) => setImmediate(r)); for (const t of timers.slice(before.timers)) if (t.live && t.ms >= 4000) { t.live = false; t.fn(); } }
+      const r = await Promise.race([handed, new Promise((res) => setImmediate(() => setImmediate(() => setImmediate(() => res(null)))))]);
+      const resolved = r !== null;
+      log.steps.push({ url, resolved, status: resolved ? r.status : null, body: resolved && r.status ? await r.text() : null, net: calls - before.calls, deadlines: timers.slice(before.timers).filter((t) => t.ms >= 4000).length });
+    };
+    await ask(m.cached, false);
+    await ask(m.uncached, false);   // pends on the network: nothing resolves it until the deadline fires
+    await ask(m.uncached, true);    // the same request again, this time firing its deadline timer
   } else if (scenario === 'navoff') {
-    // the navigation-offline flag against a fake clock. mode: JSON {shellHtml, cached, cachedCtype?, ops}; each op is
+    // a scenario of ordered requests against a fake clock (the flag it was written for is deleted; it now drives the cached-asset type check). mode: JSON {shellHtml, cached, cachedCtype?, ops}; each op is
     // {t, url, nav?, net: 'down'|'ok'}: at fake time t (ms), request url (a navigation when nav) with the network down or up.
     // Steps record {url, status, body, net} where net is the number of network calls that step made.
     const m = JSON.parse(mode);

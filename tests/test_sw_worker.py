@@ -308,26 +308,58 @@ def test_the_fetch_handler_never_touches_posts_subresources_webpush_cockpit_or_a
     assert [e for _, es in ok["shells"] for e, _b in es] == ["/"], ok
 
 
+VER_CSS = "/dashboard.css?v=0123456789ab"
+VERSIONED_SHELL_HTML = '<link rel="stylesheet" href="%s"><script src="/b.js?v=89abcdef0123"></script>' % VER_CSS
+
+
 @needs_node
 def test_a_silent_network_costs_one_deadline_then_cached_assets_skip_the_network_and_an_uncached_one_is_aborted() -> None:
     """1105-7 L3 r1 (complement, codex, deepseek): a cold open with the network silent paid the navigation's deadline, then the
     same deadline again for every render-blocking asset of the cached shell, and every timed-out fetch stayed in flight. Now
-    the navigation answered offline puts the shell's assets cache-first (no network call, no wait); an asset the cache does
-    not hold waits one deadline with an abort signal and is aborted at it; the navigation's late answer is drained unread; a
-    navigation that reaches the network again puts assets back to network-first."""
+    (1105-17) a versioned asset url the cached shell names is answered from the cache with no network call and no wait, online
+    or off; an asset the cache does not hold waits one deadline with an abort signal and is aborted at it; the navigation's
+    late answer is drained unread. Back online the cached asset STILL makes no network call (the url is the version)."""
     sw = SW.read_text()
     deadline = int(sw.split("const NET_TIMEOUT_MS = ", 1)[1].split(";", 1)[0])
-    got = _run("deadline", json.dumps({"shellHtml": SHELL_HTML, "cached": "/dashboard.css", "uncached": "/b.js?v=2"}))
+    got = _run("deadline", json.dumps({"shellHtml": VERSIONED_SHELL_HTML, "cached": VER_CSS, "uncached": "/b.js?v=89abcdef0123"}))
     nav, cached, uncached, nav2, cached2 = got["steps"]
-    assert nav["body"] == SHELL_HTML and deadline - 100 <= nav["ms"] < deadline + 1500, nav          # one deadline, then the shell
-    assert cached == {"url": "/dashboard.css", "ms": cached["ms"], "status": 200, "body": "CACHED /dashboard.css"}, cached
+    assert nav["body"] == VERSIONED_SHELL_HTML and deadline - 100 <= nav["ms"] < deadline + 1500, nav     # one deadline, then the shell
+    assert cached == {"url": VER_CSS, "ms": cached["ms"], "status": 200, "body": "CACHED " + VER_CSS}, cached
     assert cached["ms"] < 500, cached                                                                 # no second deadline
-    assert [c["key"] for c in got["netCalls"][:2]] == ["/", "/b.js?v=2"], got["netCalls"]             # the cached asset made no call
+    assert [c["key"] for c in got["netCalls"][:2]] == ["/", "/b.js?v=89abcdef0123"], got["netCalls"]  # the cached asset made no call
     assert got["netCalls"][0]["signal"] is False and got["netCalls"][1]["signal"] is True, got["netCalls"]   # navigate: no signal
     assert uncached["status"] == 0 and deadline - 100 <= uncached["ms"] < deadline + 1500, uncached
-    assert got["aborted"] == ["/b.js?v=2"], got                                                       # the timed-out asset fetch is cancelled
+    assert got["aborted"] == ["/b.js?v=89abcdef0123"], got                                            # the timed-out asset fetch is cancelled
     assert got["lateDrained"] == 1, got                                                               # the late navigation answer is released
-    assert nav2["body"] == "<html>live</html>" and cached2["body"] == "LIVE /dashboard.css", (nav2, cached2)   # back online: network first
+    assert nav2["body"] == "<html>live</html>" and cached2["body"] == "CACHED " + VER_CSS, (nav2, cached2)   # online: still the cache
+    assert [c["key"] for c in got["netCalls"]] == ["/", "/b.js?v=89abcdef0123", "/"], got["netCalls"]  # ...with no call for the cached asset
+
+
+@needs_node
+def test_a_cached_versioned_asset_resolves_with_no_deadline_scheduled_and_an_uncached_one_hits_the_deadline() -> None:
+    """1105-17 (frame E), on FAKE timers with a fetch that never settles: the cached versioned asset resolves with NO network
+    call and NO deadline timer scheduled; an asset the cache does not hold schedules the 4 s deadline, pends until it fires,
+    and then answers a network error with its fetch aborted. Red against the network-first path (a deadline timer and a
+    fetch for the cached asset)."""
+    deadline = int(SW.read_text().split("const NET_TIMEOUT_MS = ", 1)[1].split(";", 1)[0])
+    got = _run("hungasset", json.dumps({"shellHtml": VERSIONED_SHELL_HTML, "cached": VER_CSS, "uncached": "/b.js?v=89abcdef0123"}))
+    cached, pending, fired = got["steps"]
+    assert cached["resolved"] is True and cached["body"] == "CACHED " + VER_CSS, cached
+    assert cached["net"] == 0 and cached["deadlines"] == 0, cached                  # zero elapsed deadline: nothing was scheduled
+    assert pending["resolved"] is False and pending["net"] == 1 and pending["deadlines"] == 1, pending   # an uncached asset waits
+    assert fired["resolved"] is True and fired["status"] == 0 and fired["deadlines"] == 1, fired          # ...until the deadline fires
+    assert got["aborted"] and all(u.endswith("/b.js?v=89abcdef0123") for u in got["aborted"]), got       # the timed-out fetch is cancelled
+    assert deadline == 4000
+
+
+@needs_node
+def test_an_unversioned_cached_asset_is_never_served_without_the_network() -> None:
+    """The URL is the version only when it carries a digest: an unversioned url names no fixed bytes (a deploy changes them
+    under the same name), so even a cached copy the cached shell names waits for the network (and falls back to the cache only
+    when the network fails)."""
+    got = _run("hungasset", json.dumps({"shellHtml": SHELL_HTML, "cached": "/dashboard.css", "uncached": "/b.js?v=2"}))
+    cached = got["steps"][0]
+    assert cached["resolved"] is False and cached["net"] == 1 and cached["deadlines"] == 1, cached
 
 
 def _navoff(ops: list, **extra) -> list:
@@ -335,47 +367,16 @@ def _navoff(ops: list, **extra) -> list:
     return got["steps"]
 
 
-def _window_ms() -> int:
-    sw = SW.read_text()
-    deadline = int(sw.split("const NET_TIMEOUT_MS = ", 1)[1].split(";", 1)[0])
-    mult = int(sw.split("const NAV_OFFLINE_WINDOW_MS = ", 1)[1].split("* NET_TIMEOUT_MS", 1)[0].strip().rstrip("*").strip())
-    return mult * deadline
-
-
 NAV_DOWN = {"t": 0, "url": "/", "nav": True, "net": "down"}
-
-
-@needs_node
-def test_the_offline_navigation_flag_holds_assets_cache_first_only_for_a_bounded_window() -> None:
-    """1105-7 L3 r2 (minimax): the flag was cleared only by a later NAVIGATION, so one failed navigation (Tailscale briefly off)
-    followed by in-page use with no reload kept the shell's scripts and styles cache-first from a stale cache indefinitely,
-    for every client of the worker. Now: inside the window the cached asset answers with no network call; past it the asset
-    goes to the network again."""
-    w = _window_ms()
-    inside = _navoff([NAV_DOWN, {"t": 1000, "url": "/dashboard.css", "net": "ok"}])
-    assert inside[1]["body"] == "CACHED /dashboard.css" and inside[1]["net"] == 0, inside        # cache-first, no network call
-    past = _navoff([NAV_DOWN, {"t": w + 1, "url": "/dashboard.css", "net": "ok"}])
-    assert past[1]["body"] == "LIVE /dashboard.css" and past[1]["net"] == 1, past                  # the window lapsed: network first
-    edge = _navoff([NAV_DOWN, {"t": w - 1, "url": "/dashboard.css", "net": "ok"}])
-    assert edge[1]["body"] == "CACHED /dashboard.css", edge                                          # the bound is the window, not less
-
-
-@needs_node
-def test_a_successful_asset_answer_from_the_network_clears_the_offline_flag() -> None:
-    """The flag records an outage; an asset the network answers proves it over. An uncached asset reaches the network inside
-    the window, succeeds, and the cached one is then fetched live too (the window had not lapsed)."""
-    steps = _navoff([NAV_DOWN, {"t": 1000, "url": "/b.js?v=2", "net": "ok"}, {"t": 2000, "url": "/dashboard.css", "net": "ok"}])
-    assert steps[1]["body"] == "LIVE /b.js?v=2" and steps[1]["net"] == 1, steps                    # not cached: network, answered
-    assert steps[2]["body"] == "LIVE /dashboard.css" and steps[2]["net"] == 1, steps               # flag cleared: network first again
 
 
 @needs_node
 def test_a_cached_asset_of_the_wrong_content_type_is_not_served_cache_first() -> None:
     """The network path refuses a soft-200 HTML page as a style; the cache-first branch returned its hit unchecked. Now a
     wrong-type cached copy falls through to the network (and, with the network down too, to a network error, never the page)."""
-    steps = _navoff([NAV_DOWN, {"t": 1000, "url": "/dashboard.css", "net": "ok"}], cachedCtype="text/html")
-    assert steps[1]["body"] == "LIVE /dashboard.css" and steps[1]["net"] == 1, steps
-    down = _navoff([NAV_DOWN, {"t": 1000, "url": "/dashboard.css", "net": "down"}], cachedCtype="text/html")
+    steps = _navoff([NAV_DOWN, {"t": 1000, "url": VER_CSS, "net": "ok"}], cachedCtype="text/html", shellHtml=VERSIONED_SHELL_HTML, cached=VER_CSS)
+    assert steps[1]["body"] == "LIVE " + VER_CSS and steps[1]["net"] == 1, steps
+    down = _navoff([NAV_DOWN, {"t": 1000, "url": VER_CSS, "net": "down"}], cachedCtype="text/html", shellHtml=VERSIONED_SHELL_HTML, cached=VER_CSS)
     assert down[1]["status"] == 0, down
 
 
@@ -479,7 +480,7 @@ def test_no_notification_in_the_worker_carries_an_actions_key() -> None:
 @needs_node
 def test_activation_carries_the_last_good_shell_forward_when_the_new_install_cached_none() -> None:
     got = _run("carry")
-    assert [c for c in got["caches"] if c.startswith("levain-shell")] == ["levain-shell-v1105-pwaab-3"], got   # the old shell cache is gone
+    assert [c for c in got["caches"] if c.startswith("levain-shell")] == ["levain-shell-v1105-assethash-1"], got   # the old shell cache is gone
     assert got["shells"][0][1] == [["/", "<html>old shell</html>"]], got          # its page was carried first
 
 

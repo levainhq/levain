@@ -70,9 +70,11 @@ def test_the_view_script_is_app_shell_and_the_routes_are_reserved(tmp_path):
     with _serve(src, write_token=TOKEN) as (base, _h):
         with urllib.request.urlopen(base + "/thread_view.js", timeout=10) as r:  # noqa: S310 - loopback, token-free
             assert r.status == 200 and r.headers["Content-Type"].startswith("text/javascript")
-            assert b"LevainThreadView" in r.read()
+            view = r.read()
+            assert b"LevainThreadView" in view
+        import hashlib   # the page names the script by the digest of the bytes served (1105-17)
         with urllib.request.urlopen(base + "/", timeout=10) as r:  # noqa: S310 - loopback
-            assert b'<script src="/thread_view.js"></script>' in r.read()
+            assert b'<script src="/thread_view.js?v=%s"></script>' % hashlib.sha256(view).hexdigest()[:12].encode() in r.read()
     for path in (threads.THREADS_LIST_PATH, "/cockpit/thread/x.json", "/thread_view.js", "/cockpit/note/9.json"):
         with pytest.raises(ValueError):
             make_server(src, port=0, extra_json={path: lambda: {}})
