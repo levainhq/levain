@@ -895,7 +895,8 @@ class ConsentQueue:
         self._ready = False
         # a stored leave's verdict by its whole row (:meth:`away_mark`): one verify per queue, so per hook process
         self._leave_verdicts: dict[tuple[Any, ...], str | None] = {}
-        # the requests a write transaction moved out of ``pending``, per thread, until it commits (:meth:`_write`)
+        # the requests a write transaction moved out of ``pending`` (and any later move of them in it), per thread, until
+        # it commits (:meth:`_write`)
         self._moved = threading.local()
 
     # --- store ---------------------------------------------------------------------------------------
@@ -969,7 +970,9 @@ class ConsentQueue:
                 yield conn
         finally:
             self._moved.list = outer
-        for request, state in mine:
+        # the state the row committed, never an earlier move's label: a later move in the same write wins (L3 r1 deepseek)
+        last = {request.id: (request, state) for request, state in mine}
+        for request, state in last.values():
             self._announce_settled(request, state)
 
     def _announce_settled(self, request: ExternalGateRequest, state: str) -> None:
@@ -1321,7 +1324,7 @@ class ConsentQueue:
                         ).rowcount != 1:
             return False
         moved = getattr(self._moved, "list", None)
-        if from_state == "pending" and moved is not None:
+        if moved is not None and (from_state == "pending" or any(r.id == request.id for r, _ in moved)):
             moved.append((request, state))
         conn.execute("INSERT INTO receipts (request_id, state, created_at, face) VALUES (?, ?, ?, ?)",
                      (request.id, state, stamp, json.dumps(self._face(request, state, signer_fp, grant, gap),
@@ -1370,6 +1373,12 @@ class ConsentQueue:
                 request = self._request_of(dict(zip(names, raw)))
                 if request is not None and self._transition(conn, request, "expired", stamp=stamp):
                     done += 1
+        try:   # after the write announced what it expired: a mark this old belongs to no pending request
+            from levain.consent.band_notice import prune_marks
+
+            prune_marks(self.directory)
+        except Exception:  # noqa: BLE001 - housekeeping never fails a sweep
+            pass
         return done
 
     # --- what the agent's own dialog did (unsigned) -----------------------------------------------------------

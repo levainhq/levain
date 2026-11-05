@@ -1472,6 +1472,11 @@ def _held_event(settings: AdapterSettings, cwd: Path | str | None, request: Any)
     if not band_notice.mark_held(cwd, request.id):
         return None
     try:
+        if not band_notice.is_pending(cwd, request.id):
+            # it settled before the mark stood (a cockpit tab signed it, a gate withdrew it): that settle found no mark and
+            # announced nothing, so a held event now would file a row no settle clears (L3 r1 codex 1 = complement 2)
+            band_notice.unmark_held(cwd, request.id)
+            return None
         return band_notice.held_env(cwd, request)
     except Exception:  # noqa: BLE001 - a ping is optional
         band_notice.unmark_held(cwd, request.id)
@@ -1585,7 +1590,7 @@ def run_notify_command(settings: AdapterSettings, message: str, *, cwd: Path | s
         # child_env: the allowlisted environment, never the agent session's whole one (its tokens among it)
         env = child_env()
         if env_extra:
-            env.update(env_extra)
+            env.update({k: str(v) for k, v in env_extra.items()})   # Popen takes only str values
         command = settings.notify_argv[0]
         if "/" not in command:
             command = shutil.which(command, path=env.get("PATH", os.defpath)) or ""

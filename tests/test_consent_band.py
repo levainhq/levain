@@ -398,6 +398,163 @@ def test_the_queues_own_state_gates_a_second_source_of_truth_is_not_added(world,
     assert len(cmd.wait(1)) == 1                          # no mark: no settled line, and no harm
 
 
+# --- 2b. the L3 r1 fixes (1105-21, levain 38): a row nobody can clear is the failure ------------------------------------
+def _filed(world, cmd: Cmd, name: str = "f.txt"):
+    """A request filed in the rig's queue with the recorder as claude_code's notify command, no ping yet."""
+    _settings_file(world.qdir, "claude_code.json", cmd.argv)
+    q = _queue(world)
+    rid = q.file(agent="claude_code", agent_session_id="s1", tool_name="Write",
+                 tool_input={"file_path": str(world.ws / name), "content": "x"}, cwd=str(world.ws),
+                 hold=timedelta(minutes=5)).id
+    return q, q.get(rid)[0], claude_code.read_settings_file(world.qdir / "claude_code.json")
+
+
+def test_a_request_settled_before_its_ping_gets_no_held_event_and_leaves_no_mark(world, tmp_path) -> None:
+    """codex 1 / complement 2: a cockpit tab signs (or a gate withdraws) the request between its filing and its ping. The
+    settle found no mark and announced nothing; a held event now would file a row no settle ever clears."""
+    cmd = Cmd(tmp_path)
+    q, request, s = _filed(world, cmd)
+    assert q.withdraw(request.id) is True                       # settled first: nothing was told, nothing announced
+    claude_code.hold_ping(s, world.qdir, "claude_code", "w", request.id, 300.0, request=request)
+    (got,) = cmd.wait(1)                                        # the bare ping still goes, as before the band
+    assert not {k for k in got if k.startswith("LEVAIN_CONSENT_")}, got
+    assert band_notice.unmark_held(world.qdir, request.id) is False
+
+
+def test_a_settle_whose_command_cannot_start_keeps_the_mark_for_the_next_one(world, tmp_path) -> None:
+    """deepseek MED / codex 4: the mark was consumed before the settings were read and the command started; a failure
+    after that lost the settle for good. Now the claim goes back, and a later settle sends it."""
+    cmd = Cmd(tmp_path)
+    request, _ = _held(world, cmd)
+    cmd.wait(1)
+    (world.qdir / "claude_code.json").write_text(json.dumps({"away_mode": False}))   # no command for the moment
+    assert band_notice.announce_settled(world.qdir, request, "withdrawn") is False
+    assert sorted(p.name for p in (world.qdir / band_notice.MARK_DIR).iterdir()) == \
+        [band_notice._mark_path(world.qdir, request.id).name]   # back under its own name, no claim left behind
+    _settings_file(world.qdir, "claude_code.json", cmd.argv)
+    assert band_notice.announce_settled(world.qdir, request, "withdrawn") is True
+    _settled(cmd, request.id, "withdrawn")
+
+
+def test_a_settle_whose_command_raises_keeps_the_mark(world, tmp_path, monkeypatch) -> None:
+    cmd = Cmd(tmp_path)
+    request, _ = _held(world, cmd)
+    cmd.wait(1)
+
+    def boom(*a, **kw):
+        raise RuntimeError("the notify command could not be run")
+
+    monkeypatch.setattr(claude_code, "run_notify_command", boom)
+    assert band_notice.announce_settled(world.qdir, request, "withdrawn") is False
+    assert band_notice.unmark_held(world.qdir, request.id) is True
+
+
+def test_an_unmapped_agent_does_not_consume_the_mark(world, tmp_path) -> None:
+    """complement 3: the agent-name lookup ran after the claim, so a settle from a process that cannot map it ate the mark."""
+    cmd = Cmd(tmp_path)
+    request, _ = _held(world, cmd)
+    cmd.wait(1)
+    assert band_notice.announce_settled(world.qdir, _Agent(request, "nobody"), "withdrawn") is False
+    assert band_notice.unmark_held(world.qdir, request.id) is True
+
+
+class _Agent:
+    """``request`` with another agent name (the sealed request is frozen)."""
+
+    def __init__(self, request: Any, agent: str) -> None:
+        self.id, self.agent = request.id, agent
+
+
+def test_concurrent_settlers_send_the_settled_event_once(world, tmp_path) -> None:
+    """The claim is an atomic rename of the mark: of many settlers racing, exactly one starts the command."""
+    import threading
+
+    cmd = Cmd(tmp_path)
+    request, _ = _held(world, cmd)
+    cmd.wait(1)
+    results: list[bool] = []
+    gate = threading.Barrier(8)
+
+    def settle() -> None:
+        gate.wait()
+        results.append(band_notice.announce_settled(world.qdir, request, "withdrawn"))
+
+    threads = [threading.Thread(target=settle) for _ in range(8)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(30)
+    assert results.count(True) == 1, results
+    _settled(cmd, request.id, "withdrawn")
+    assert not list((world.qdir / band_notice.MARK_DIR).iterdir())
+
+
+def test_two_moves_in_one_write_announce_the_state_that_committed(world, tmp_path) -> None:
+    """deepseek MED (latent: every caller makes one move per write today): the row committed ``denied``, so the
+    announcement says ``denied``, never the label of the first move (``undecided``, told as ``expired``). The store's own
+    trigger allows a second move only from ``undecided`` (a ruling)."""
+    cmd = Cmd(tmp_path)
+    request, _ = _held(world, cmd)
+    cmd.wait(1)
+    q = _queue(world)
+    stamp = "2026-11-05T00:00:00.000000Z"
+    with q._write() as conn:
+        assert q._transition(conn, request, "undecided", stamp=stamp)
+        assert q._transition(conn, request, "denied", stamp=stamp, from_state="undecided", via="ruling")
+    assert q.get(request.id)[1] == "denied"
+    lines = cmd.wait(2)
+    assert [x.get("LEVAIN_CONSENT_OUTCOME") for x in lines] == [None, "denied"], lines
+
+
+@pytest.mark.parametrize("brk", ["\n", "\r", "\x0b", "\x0c", "\x1c", "\x1d", "\x1e", "\x85", "\u2028", "\u2029"])
+def test_every_line_boundary_is_taken_out(brk: str) -> None:
+    """complement 5 / codex 5: every character ``str.splitlines`` breaks on, not only the C0 ones."""
+    out = band_notice._line(f"a{brk}b", 300)
+    assert len(out.splitlines()) == 1 and brk not in out
+
+
+def test_a_tiny_limit_is_never_exceeded() -> None:
+    """deepseek LOW: ``_line(x, 1)`` returned the whole string after the ellipsis."""
+    for limit in range(0, 8):
+        assert len(band_notice._line("x" * 50, limit)) <= limit, limit
+
+
+def test_a_second_ping_for_the_same_request_sends_no_second_held_event(world, tmp_path) -> None:
+    """deepseek LOW: the mark is made with O_EXCL, so a second ping of one request carries no held event."""
+    cmd = Cmd(tmp_path)
+    q, request, s = _filed(world, cmd)
+    assert band_notice.mark_held(world.qdir, request.id) is True
+    assert band_notice.mark_held(world.qdir, request.id) is False
+    band_notice.unmark_held(world.qdir, request.id)
+    claude_code.hold_ping(s, world.qdir, "claude_code", "w", request.id, 300.0, request=request)
+    claude_code.notify(s, "again", cwd=world.qdir, ref=f"request:{request.id}", request=request)
+    lines = cmd.wait(2)
+    assert [x.get("LEVAIN_CONSENT_EVENT") for x in lines].count("held") == 1, lines
+
+
+def test_every_extra_value_reaches_the_child_as_a_string(tmp_path) -> None:
+    """deepseek LOW: a non-str value made Popen raise, and the held event was lost."""
+    cmd = Cmd(tmp_path)
+    assert claude_code.run_notify_command(claude_code.AdapterSettings(notify_argv=tuple(cmd.argv)), "m", cwd=tmp_path,
+                                          env_extra={"LEVAIN_CONSENT_N": 5, "LEVAIN_CONSENT_P": Path("/x")}) is True
+    (got,) = cmd.wait(1)
+    assert (got["LEVAIN_CONSENT_N"], got["LEVAIN_CONSENT_P"]) == ("5", "/x")
+
+
+def test_the_sweep_prunes_marks_older_than_the_longest_hold_and_its_grace(world, tmp_path) -> None:
+    """complement 3: a mark whose request never settles (its row purged, an unmapped agent) no longer stays for ever."""
+    marks = world.qdir / band_notice.MARK_DIR
+    assert band_notice.mark_held(world.qdir, "old") and band_notice.mark_held(world.qdir, "new")
+    old = band_notice._mark_path(world.qdir, "old")
+    stale = time.time() - band_notice.mark_lifetime() - 5
+    os.utime(old, (stale, stale))
+    claim = marks / (old.name + ".settling-1-ab")
+    claim.touch()
+    os.utime(claim, (stale, stale))
+    _queue(world).sweep()
+    assert sorted(p.name for p in marks.iterdir()) == [band_notice._mark_path(world.qdir, "new").name]
+
+
 # --- 3. the PRESELECT -------------------------------------------------------------------------------------------------
 def _open_with(rig: _ConsentRig, query: str, rid: str | None = None) -> list[dict]:
     path = f"/sign/consent/{rig.enc(rid)}"

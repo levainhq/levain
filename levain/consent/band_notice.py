@@ -27,11 +27,19 @@ A request that leaves ``pending`` as ``undecided`` (its hold ended with no verif
 the call was not run, and nothing he signs from then on allows it.
 
 Only a request whose HELD event started is ever announced as settled. That is recorded as a mark file in the queue
-directory (``band-held/<digest of the id>``), made before the held command starts and removed by the first settle to claim
-it, which is what makes the announcement happen once. It is not a second copy of the request's state (the queue still holds
-that, and says whether the request is pending); it records only that a notify command was told of this request. Every
-request levain decides at once (a grant, a policy) or hands to the agent's own dialog with no hold has no mark, so the
-queue's commonest transitions cost one failed ``unlink`` and start nothing.
+directory (``band-held/<digest of the id>``), made before the held command starts and claimed by the first settle, which is
+what makes the announcement happen once. It is not a second copy of the request's state (the queue still holds that, and
+says whether the request is pending); it records only that a notify command was told of this request. Every request levain
+decides at once (a grant, a policy) or hands to the agent's own dialog with no hold has no mark, so the queue's commonest
+transitions cost one ``lstat`` and start nothing.
+
+The order that keeps a row clearable (L3 r1, 1105-21): the HELD side makes the mark, then re-reads the request, and sends
+no held event when it has already left ``pending`` (a settle that came first found no mark and announced nothing). The
+SETTLED side reads the settings and the agent's name first, claims the mark by renaming it to an in-flight name, starts the
+command, and only then deletes the claim; a command that does not start renames it back. The one window left, a settle
+landing after the re-read and before the held child runs, is meant to be closed by the consumer: a command that keeps a
+tombstone for a settled id files nothing for a later ``held`` of it. :meth:`levain.consent.queue.ConsentQueue.sweep` prunes
+marks older than any hold the hooks make plus the expiry grace (:func:`mark_lifetime`).
 
 Nothing here decides anything. A command that cannot start, or a mark that cannot be written or removed, changes no
 decision and raises into no gate.
@@ -41,13 +49,15 @@ from __future__ import annotations
 import hashlib
 import os
 import re
+import sqlite3
+import time
 import urllib.parse
 from collections.abc import Mapping
 from pathlib import Path
 from typing import Any
 
-__all__ = ["MARK_DIR", "OUTCOMES", "WHAT_MAX", "announce_settled", "held_env", "mark_held", "settled_env", "sheet_url",
-           "unmark_held"]
+__all__ = ["MARK_DIR", "OUTCOMES", "WHAT_MAX", "announce_settled", "held_env", "is_pending", "mark_held",
+           "mark_lifetime", "prune_marks", "settled_env", "sheet_url", "unmark_held"]
 
 PREFIX = "LEVAIN_CONSENT_"
 MARK_DIR = "band-held"
@@ -55,16 +65,21 @@ WHAT_MAX = 300                       # the sheet's own text can be long; a varia
 # the queue's state a request moved to -> the outcome the command is told (undecided: the hold ended unanswered)
 OUTCOMES: Mapping[str, str] = {"allowed": "allowed", "denied": "denied", "withdrawn": "withdrawn", "expired": "expired",
                                "undecided": "expired"}
-_CONTROL = re.compile("[\x00-\x1f\x7f]")
+# C0, DEL, C1 and the two Unicode separators: every character ``str.splitlines`` breaks a line on is among them
+_CONTROL = re.compile("[\x00-\x1f\x7f-\x9f\u2028\u2029]")
+_CLAIM = ".settling-"                # a mark a settle has claimed and not yet finished with: ``<mark>.settling-<pid>-<hex>``
 
 
 def _line(text: object, limit: int) -> str:
-    """``text`` on one line, no control character (a NUL cannot ride an environment), cut in the middle past ``limit``."""
+    """``text`` on one line, no control character (a NUL cannot ride an environment), cut in the middle past ``limit``;
+    never longer than ``limit``."""
     clean = _CONTROL.sub(" ", str(text)).strip()
     if len(clean) <= limit:
         return clean
+    if limit < 3:
+        return clean[:max(0, limit)]
     head = limit // 3
-    return clean[:head] + "…" + clean[-(limit - head - 1):]
+    return clean[:head] + "…" + clean[len(clean) - (limit - head - 1):]
 
 
 def sheet_url(queue_dir: Path | str, request_id: str) -> str | None:
@@ -98,11 +113,12 @@ def _mark_path(queue_dir: Path | str, request_id: str) -> Path:
 
 def mark_held(queue_dir: Path | str, request_id: str) -> bool:
     """Record that a notify command is about to be told of ``request_id`` (see the module words). False when the mark
-    could not be made: the caller then sends no held event, so no settle is owed."""
+    could not be made or already stands (a second ping of one request carries no second held event): the caller then
+    sends no held event."""
     path = _mark_path(queue_dir, request_id)
     try:
         path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
-        fd = os.open(path, os.O_WRONLY | os.O_CREAT | getattr(os, "O_NOFOLLOW", 0), 0o600)
+        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0), 0o600)
         os.close(fd)
     except OSError:
         return False
@@ -110,7 +126,7 @@ def mark_held(queue_dir: Path | str, request_id: str) -> bool:
 
 
 def unmark_held(queue_dir: Path | str, request_id: str) -> bool:
-    """Remove the mark; True only for the caller that removed it (the claim that makes a settle once)."""
+    """Remove the mark; True only for the caller that removed it."""
     try:
         _mark_path(queue_dir, request_id).unlink()
     except OSError:
@@ -118,12 +134,55 @@ def unmark_held(queue_dir: Path | str, request_id: str) -> bool:
     return True
 
 
+def is_pending(queue_dir: Path | str, request_id: str) -> bool:
+    """Whether the queue's row for ``request_id`` is ``pending`` now, read without the write lock. False when it cannot
+    be read: the held event is then not sent (the bare ping still is), which can lose a row but never orphan one."""
+    from levain.consent.queue import DB_NAME
+
+    try:
+        conn = sqlite3.connect((Path(queue_dir) / DB_NAME).resolve().as_uri() + "?mode=ro", uri=True, timeout=5.0)
+        try:
+            row = conn.execute("SELECT state FROM requests WHERE id = ?", (request_id,)).fetchone()
+        finally:
+            conn.close()
+    except (sqlite3.Error, OSError, ValueError):
+        return False
+    return row is not None and row[0] == "pending"
+
+
+def mark_lifetime() -> float:
+    """Seconds after which a mark can no longer belong to a pending request: the longest hold the hooks file (the
+    PermissionRequest hold and the PreToolUse gate's ceiling) plus the grace after which a read or sweep expires it."""
+    from levain.consent.adapters.claude_code import GATE_HOLD_CEILING
+    from levain.consent.adapters.rules import MAX_HOLD
+    from levain.consent.queue import UNDECIDED_GRACE
+
+    return max(MAX_HOLD, GATE_HOLD_CEILING) + UNDECIDED_GRACE.total_seconds()
+
+
+def prune_marks(queue_dir: Path | str) -> None:
+    """Remove marks (and claims a dead settler left) older than :func:`mark_lifetime`. Never raises."""
+    try:
+        cutoff = time.time() - mark_lifetime()
+        with os.scandir(Path(queue_dir) / MARK_DIR) as entries:
+            for entry in entries:
+                try:
+                    if entry.stat(follow_symlinks=False).st_mtime < cutoff:
+                        os.unlink(entry.path)
+                except OSError:
+                    pass
+    except Exception:  # noqa: BLE001 - housekeeping never fails a sweep
+        pass
+
+
 def announce_settled(queue_dir: Path | str, request: Any, state: str) -> bool:
     """Run the request's agent's notify command once with the SETTLED event, when a HELD event went out for it. True
-    when the command started. Never raises."""
+    when the command started. Never raises. Everything that can fail before the start is done before the claim, and a
+    command that does not start gives the claim back (module words)."""
     try:
         outcome = OUTCOMES.get(state)
-        if outcome is None or not unmark_held(queue_dir, request.id):
+        mark = _mark_path(queue_dir, request.id)
+        if outcome is None or not os.path.lexists(mark):   # the common case, no command told: no settings read
             return False
         from levain.consent.adapters import claude_code, codex
 
@@ -132,8 +191,26 @@ def announce_settled(queue_dir: Path | str, request: Any, state: str) -> bool:
         if name is None:
             return False
         settings = claude_code.read_settings_file(Path(queue_dir) / name)
-        return claude_code.run_notify_command(settings, f"levain: {request.agent}'s approval request was {outcome}.",
-                                              cwd=queue_dir, env_extra=settled_env(request.id, outcome),
-                                              phone_url=False)
+        claim = mark.with_name(f"{mark.name}{_CLAIM}{os.getpid()}-{os.urandom(4).hex()}")
+        try:
+            os.rename(mark, claim)       # atomic: of settlers racing, one wins the claim
+        except OSError:
+            return False
     except Exception:  # noqa: BLE001 - a notice never changes a decision
         return False
+    started = False
+    try:
+        started = claude_code.run_notify_command(settings, f"levain: {request.agent}'s approval request was {outcome}.",
+                                                 cwd=queue_dir, env_extra=settled_env(request.id, outcome),
+                                                 phone_url=False)
+    except Exception:  # noqa: BLE001 - a notice never changes a decision
+        started = False
+    finally:
+        try:
+            if started:
+                os.unlink(claim)
+            else:
+                os.rename(claim, mark)
+        except OSError:
+            pass
+    return started
