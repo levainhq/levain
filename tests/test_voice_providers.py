@@ -513,3 +513,38 @@ def test_deepgram_positional_construction_keeps_its_older_field_order():
     prov = P.DeepgramProvider(P.urllib_transport, "nova-custom")
     assert prov.stt_model == "nova-custom"
     assert prov.tts_model == P.DEEPGRAM_TTS_MODEL
+
+
+# --- V1-4 (B4): OpenAI's 429 billing codes (design DESIGN_voice_v14.md F1) -------------------------------------------
+
+@pytest.mark.parametrize("error,code", [
+    # an empty balance: the new code, the broad type alone, and the old code
+    ({"type": "insufficient_quota", "code": "credit_balance_exhausted"}, "out_of_credit"),
+    ({"code": "credit_balance_exhausted"}, "out_of_credit"),
+    ({"type": "insufficient_quota"}, "out_of_credit"),
+    ({"code": "insufficient_quota"}, "out_of_credit"),
+    # a limit the account holder set: the code wins over the broad type the vendor says may still ride with it
+    ({"type": "insufficient_quota", "code": "organization_spend_limit_exceeded"}, "spend_limited"),
+    ({"code": "project_spend_limit_exceeded"}, "spend_limited"),
+    ({"type": "insufficient_quota", "code": "organization_usage_limit_exceeded"}, "spend_limited"),
+    # an ordinary rate limit stays one (a retry can help it)
+    ({"code": "rate_limit_exceeded"}, "rate_limited"),
+    ({"type": "requests", "code": "slow_down"}, "rate_limited"),
+    ({"message": "credit_balance_exhausted"}, "rate_limited"),        # a message is not a code
+])
+def test_a_429_is_out_of_credit_a_spend_limit_or_a_rate_limit_by_its_code(error, code):
+    body = json.dumps({"error": {**error, "message": f"{MARKER} quoting {FAKE_KEY}"}}).encode()
+    assert P._code_for(429, body) == code
+    t = Replay()
+    t.response = P.HttpResponse(429, body)
+    with pytest.raises(P.VoiceError) as info:
+        P.OpenAIProvider(transport=t).speak(FAKE_KEY, "Hi.", "nova", 1.0)
+    assert info.value.code == code
+    assert str(info.value) == P.WORDS[code].format(p="OpenAI")
+    assert_clean(info.value)
+
+
+def test_the_spend_limit_has_its_own_words_naming_the_dashboard_not_money():
+    assert P.WORDS["spend_limited"].format(p="OpenAI") == \
+        "Your OpenAI spend limit is reached. Raise it on OpenAI's site, or wait for it to reset."
+    assert P.WORDS["spend_limited"] != P.WORDS["out_of_credit"]

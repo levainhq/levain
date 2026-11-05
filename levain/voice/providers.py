@@ -14,8 +14,8 @@ What an adapter holds and never holds:
   split a header, a pasted curly quote cannot be encoded) is refused as a rejected key, naming nothing.
 * **A provider's response body** is never surfaced. An OpenAI 401 body quotes part of the key it refused (design threat
   T2, still to be confirmed against a real dead key), so :func:`urllib_transport` reads an error body only for a 429,
-  and only to learn whether its ``error.code`` is ``insufficient_quota``; the adapter drops every non-2xx body before it
-  raises. What the operator sees is :class:`VoiceError`: a fixed code
+  and only for its ``error.code`` and ``error.type`` (an empty balance, a spend limit, or a rate limit); the adapter
+  drops every non-2xx body before it raises. What the operator sees is :class:`VoiceError`: a fixed code
   and a fixed sentence (:data:`WORDS`), raised outside the ``except`` that caught the failure so no transport exception
   (which may quote a header) is chained to it.
 * **The host** is a constant per provider (:data:`HOSTS`), https only, and a redirect is never followed (the
@@ -80,6 +80,7 @@ SPEED_MIN, SPEED_MAX = 0.25, 4.0
 WORDS = {
     "refused": "{p} refused the key. It may have been revoked or mistyped; set it again on the laptop.",
     "out_of_credit": "Your {p} account is out of credit.",
+    "spend_limited": "Your {p} spend limit is reached. Raise it on {p}'s site, or wait for it to reset.",
     "rate_limited": "{p} is limiting requests right now; try again in a moment.",
     "unavailable": "{p} did not answer. Nothing was charged that Levain knows of.",
     "rejected": "{p} could not use that request.",
@@ -133,7 +134,7 @@ def urllib_transport(req: HttpRequest) -> HttpResponse:
     """The real transport: https to one of :data:`ALLOWED_HOSTS` only, a redirect answered as its 3xx status and never
     followed, a response read to at most :data:`MAX_RESPONSE` bytes. An error status is a response, not an exception;
     an unreachable host raises, and the adapter maps that to ``unavailable``. An error body is read only for a 429 (its
-    ``error.code``); any other error status comes back with an empty body, and the error response is always closed."""
+    ``error.code`` and ``error.type``); any other error status comes back with an empty body, and the error response is always closed."""
     parts = urllib.parse.urlsplit(req.url)
     if parts.scheme != "https" or parts.hostname not in ALLOWED_HOSTS or parts.username or parts.password:
         raise ValueError("destination is not an allowed voice provider")
@@ -157,13 +158,32 @@ def urllib_transport(req: HttpRequest) -> HttpResponse:
     return HttpResponse(status, body)
 
 
-def _is_insufficient_quota(body: bytes) -> bool:
-    """True when a 429's JSON body says ``error.code == "insufficient_quota"``. The only thing a body is read for."""
+# OpenAI's 429 billing rows, by ``error.code`` (https://developers.openai.com/api/docs/guides/error-codes, read
+# 2026-11-05): "For billing-related errors, inspect error.code to identify the specific cause. The broader error.type
+# can still be insufficient_quota." So a code naming a limit the account holder set wins over that broad type, and a
+# spend or usage limit is not told as an empty balance (the fix there is a dashboard limit, not money).
+_SPEND_LIMIT_CODES = frozenset({"organization_spend_limit_exceeded", "project_spend_limit_exceeded",
+                                "organization_usage_limit_exceeded"})
+_OUT_OF_CREDIT_CODES = frozenset({"credit_balance_exhausted", "insufficient_quota"})
+
+
+def _is_insufficient_quota(body: bytes) -> str:
+    """The :data:`WORDS` code a 429's JSON body names: ``spend_limited`` for a spend or usage limit code,
+    ``out_of_credit`` for an empty balance (``error.code`` in :data:`_OUT_OF_CREDIT_CODES`, or ``error.type`` of
+    ``insufficient_quota`` with no limit code), else ``rate_limited``. ``error.code`` and ``error.type`` are the only
+    things a body is read for."""
     try:
         err = json.loads(body[:64 * 1024].decode("utf-8")).get("error")
-        return isinstance(err, dict) and err.get("code") == "insufficient_quota"
     except Exception:   # noqa: BLE001 - not JSON, not an object: an ordinary rate limit
-        return False
+        return "rate_limited"
+    if not isinstance(err, dict):
+        return "rate_limited"
+    code, kind = err.get("code"), err.get("type")
+    if code in _SPEND_LIMIT_CODES:
+        return "spend_limited"
+    if code in _OUT_OF_CREDIT_CODES or kind == "insufficient_quota":
+        return "out_of_credit"
+    return "rate_limited"
 
 
 def _code_for(status: int, body: bytes) -> str | None:
@@ -175,7 +195,7 @@ def _code_for(status: int, body: bytes) -> str | None:
     if status == 402:
         return "out_of_credit"
     if status == 429:
-        return "out_of_credit" if _is_insufficient_quota(body) else "rate_limited"
+        return _is_insufficient_quota(body)
     if status in (408, 425) or status < 200 or 300 <= status < 400 or status >= 500:
         return "unavailable"     # a timeout, a redirect (never followed), a server fault: the provider did not answer
     return "rejected"

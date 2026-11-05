@@ -500,3 +500,70 @@ def test_the_meter_outcomes_feed_the_route(tmp_path):
     }
     route = choose_route(["elevenlabs", "openai"], outcomes, on_device_available=True)
     assert (route.kind, route.provider, route.reason) == ("premium", "openai", DAY_CAP)
+
+
+# --- V1-4 (B3): a raw SQLite error is a MeterError, and a read that creates nothing ----------------------------------
+
+def _foreign(path) -> None:
+    """Replace the ledger file with a SQLite database that is not a ledger (no ``calls`` table)."""
+    for suffix in ("", "-wal", "-shm"):
+        p = path.parent / (path.name + suffix)
+        if p.exists():
+            p.unlink()
+    c = sqlite3.connect(str(path))
+    c.execute("CREATE TABLE other (x INTEGER)")
+    c.commit()
+    c.close()
+
+
+def test_a_ledger_replaced_under_a_ready_meter_is_a_meter_error_on_every_call(tmp_path):
+    meter, _clock = make(tmp_path)
+    rid = meter.reserve("openai", "tts", "tts-1", 10).reservation_id     # the meter is ready: no schema check runs again
+    _foreign(meter.path)
+    for call in (lambda: meter.reserve("openai", "tts", "tts-1", 10), lambda: meter.settle(rid),
+                 lambda: meter.release(rid), meter.spent, meter.ledger, meter.spent_if_present):
+        with pytest.raises(MeterError) as info:
+            call()
+        assert "OperationalError" in str(info.value)
+        assert info.value.__context__ is None          # raised outside the handler: no SQLite chain
+
+
+def test_a_write_lock_held_past_the_busy_wait_is_a_meter_error(tmp_path, monkeypatch):
+    meter, _clock = make(tmp_path)
+    rid = meter.reserve("openai", "tts", "tts-1", 10).reservation_id
+    monkeypatch.setattr(m, "_BUSY_WAIT_S", 0.1)
+    holder = sqlite3.connect(str(meter.path), isolation_level=None)
+    holder.execute("BEGIN IMMEDIATE")
+    try:
+        for call in (lambda: meter.reserve("openai", "tts", "tts-1", 10), lambda: meter.settle(rid)):
+            with pytest.raises(MeterError) as info:
+                call()
+            assert "OperationalError" in str(info.value) and info.value.__context__ is None
+    finally:
+        holder.execute("ROLLBACK")
+        holder.close()
+    assert meter.settle(rid) is True                    # nothing was left half-done
+
+
+def test_spent_if_present_creates_no_ledger_and_reads_an_existing_one_read_only(tmp_path):
+    meter, _clock = make(tmp_path)
+    got = meter.spent_if_present()
+    assert (got.month_micros, got.day_micros) == (0, 0) and got.prices_as_of == DEFAULT_PRICES.as_of
+    assert not meter.path.exists() and list(tmp_path.iterdir()) == []
+    meter.reserve("openai", "tts", "tts-1", 1000)                      # $0.015
+    assert meter.spent_if_present() == meter.spent()
+    before = meter.path.stat().st_mtime_ns
+    meter.spent_if_present()
+    assert meter.path.stat().st_mtime_ns == before
+
+
+def test_spent_if_present_refuses_a_symlink_and_a_foreign_file(tmp_path):
+    meter, _clock = make(tmp_path)
+    (tmp_path / "elsewhere.db").write_bytes(b"")
+    meter.path.symlink_to(tmp_path / "elsewhere.db")
+    with pytest.raises(MeterError):
+        meter.spent_if_present()
+    meter.path.unlink()
+    _foreign(meter.path)
+    with pytest.raises(MeterError):
+        meter.spent_if_present()
