@@ -6,7 +6,7 @@
 // whichever opens first creates the store; correctness depends on no timing (an unread key waits for the next trigger).
 const DB = 'levain-sw-2', STORE = 'opened';
 // A short id of this worker's code, recorded in the trace so a device's trace says which worker ran.
-const SW_VERSION = '1105-pwaab-3';
+const SW_VERSION = '1105-assethash-1';
 // The TRACE: an append-only ring in its own cache, one entry per step, key TRACE_PREFIX + <time ms, zero padded> + '-' +
 // <seq>, value JSON {t, src, step, ...detail}. The /tap_trace page and sw_open.js read and write the same ring. Writes are
 // best effort, serialized on one chain, never awaited by the tap, and carry only urls without fragments, counts and step
@@ -417,26 +417,12 @@ function fetchWithin(req) {
   pending.then((r) => { if (timedOut) drain(r); }, () => {});
   return Promise.race([pending, late]).finally(() => clearTimeout(timer));
 }
-// The time the latest navigation could not use the network (deadline or error) and was answered from the cache or the offline
-// page; 0 when none. For a bounded window after it, the shell's scripts and styles are served cache-first, so a cold open with
-// the network dead costs ONE deadline (the navigation's), not that deadline again per render-blocking asset (L3 pwa-ab r1:
-// 4 s + 4 s). The window is bounded (L3 pwa-ab r2): a flag that only a later navigation cleared kept every client of the worker
-// on cached assets after a brief outage that no reload followed. A navigation's network answer or an asset's clears it early.
-// An asset the cache does not hold still goes to the network under its own deadline. A worker that is stopped and restarted
-// between the navigation and its assets starts with this unset: the assets then pay one deadline each.
-const NAV_OFFLINE_WINDOW_MS = 4 * NET_TIMEOUT_MS;
-let navOfflineAt = 0;
-function navOffline() {
-  const age = Date.now() - navOfflineAt;
-  return navOfflineAt !== 0 && age >= 0 && age < NAV_OFFLINE_WINDOW_MS;
-}
 function offlineResponse() {
   return new Response(OFFLINE_HTML, { status: 503, headers: { 'Content-Type': 'text/html; charset=utf-8', 'Cache-Control': 'no-store' } });
 }
 async function navigateNetworkFirst(e, req, bare) {
   try {
     const r = await fetchWithin(req);
-    navOfflineAt = 0;
     if (bare && shellCacheable(r)) {
       // off the critical path: the page never waits on Cache Storage (a slow or full cache costs the copy, not the page)
       const copy = r.clone();
@@ -444,7 +430,6 @@ async function navigateNetworkFirst(e, req, bare) {
     }
     return r;
   } catch (err) {
-    navOfflineAt = Date.now();
     if (new URL(req.url).pathname === SHELL_KEY) {
       try {
         const hit = await (await caches.open(SHELL_CACHE)).match(SHELL_KEY);
@@ -454,10 +439,12 @@ async function navigateNetworkFirst(e, req, bare) {
     return offlineResponse();
   }
 }
-// The shell's own scripts and styles: network first (a reload never sees a skewed page), written through to the shell cache
-// OFF the response path (the worker's cache.put ignores the server's no-store) and only for an exact URL the cached shell
-// names, with a content type that fits; answered from the cache when the network fails, and cache-first while the latest
-// navigation was answered offline (navOffline()). A cached copy is held to the same assetOk check as a network answer.
+// The shell's own scripts and styles. The cockpit page names each as <path>?v=<digest of the bytes served>, so the exact URL
+// IS the version (1105-17): a cached copy of a VERSIONED url the cached '/' names, that passes assetOk, is answered from the
+// cache with no network wait, online or off; there is nothing to revalidate and no state beyond the cache itself. A miss, an
+// unversioned url or a copy that fails assetOk goes to the network under its own deadline, is written through to the shell
+// cache OFF the response path (the worker's cache.put ignores the server's no-store) and only for an exact URL the cached
+// shell names, with a content type that fits. A cold open with a dead network costs ONE deadline: the navigation's.
 async function cachedAsset(key, kind) {
   try {
     // NOT serialized: a held or never-settling mutation must not hang an offline script/style request. KNOWN EDGE: this
@@ -470,22 +457,42 @@ async function cachedAsset(key, kind) {
     return hit;
   } catch (_) { return null; }
 }
-async function assetNetworkFirst(e, req, key, kind) {
-  if (navOffline()) {
+// An unversioned url names no fixed bytes (a deploy changes them under the same name), so it is never served without the
+// network's say; only the digest in the url makes cache-first correct.
+// The server's digest is always the first 12 hex of the SHA-256 of the bytes it serves (levain/web_server.py _asset_digest).
+function versionOf(key) { try { const v = new URL(key, 'https://shell.invalid').searchParams.get('v') || ''; return /^[0-9a-f]{12}$/i.test(v) ? v.toLowerCase() : ''; } catch (_) { return ''; } }
+function versionedKey(key) { return !!versionOf(key); }
+// A network answer for a versioned url is cached only when its bytes ARE that version (an old page's ?v=OLD answered by a
+// newer deploy, or by another backend, would otherwise sit cache-first under the old name). Returns the response to store
+// (the body is read once here), or null on a mismatch / any failure; the caller's page response is unaffected.
+async function bytesOfVersion(copy, key, kind) {
+  try {
+    const want = versionOf(key);
+    const buf = await copy.arrayBuffer();
+    const hex = Array.from(new Uint8Array(await crypto.subtle.digest('SHA-256', buf)), (b) => b.toString(16).padStart(2, '0')).join('');
+    if (!want || hex.slice(0, 12) !== want) return null;
+    return new Response(buf, { status: 200, headers: { 'content-type': copy.headers.get('content-type') || (kind === 'style' ? 'text/css' : 'application/javascript') } });
+  } catch (_) { return null; }
+}
+async function assetCacheFirst(e, req, key, kind) {
+  if (versionedKey(key)) {
     const hit = await cachedAsset(key, kind);
     if (hit) return hit;
   }
   try {
     const r = await fetchWithin(req);
     if (assetOk(r, kind)) {
-      navOfflineAt = 0;   // the network answered an asset: the outage the flag records is over
       const copy = r.clone();
       e.waitUntil(serial(async () => {
         try {
           const c = await caches.open(SHELL_CACHE);
           const hit = await c.match(SHELL_KEY);
-          if (hit && shellAssets(await hit.text()).some((a) => a.key === key)) await c.put(key, copy);
-          else drain(copy);
+          if (hit && shellAssets(await hit.text()).some((a) => a.key === key)) {
+            // a versioned url is stored only when its bytes hash to the version; an unversioned one is stored as before
+            const toStore = versionedKey(key) ? await bytesOfVersion(copy, key, kind) : copy;
+            if (toStore) await c.put(key, toStore);
+            else drain(copy);
+          } else drain(copy);
         } catch (_) { drain(copy); /* best effort; the unread tee branch is released */ }
       }));
     }
@@ -502,7 +509,7 @@ self.addEventListener('fetch', (e) => {
   if (u.origin !== self.location.origin) return;
   if (NO_INTERCEPT.some((p) => u.pathname === p || u.pathname.startsWith(p + '/'))) return;
   if (req.mode !== 'navigate') {
-    if (req.destination === 'script' || req.destination === 'style') e.respondWith(assetNetworkFirst(e, req, u.pathname + u.search, req.destination));
+    if (req.destination === 'script' || req.destination === 'style') e.respondWith(assetCacheFirst(e, req, u.pathname + u.search, req.destination));
     return;
   }
   e.respondWith(navigateNetworkFirst(e, req, u.pathname === SHELL_KEY && !u.search));

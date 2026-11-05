@@ -1338,6 +1338,67 @@ def load_web_asset(filename: str) -> str:
     )
 
 
+# The URL is the version (1105-17): the cockpit page names each of its scripts and stylesheets as ``<path>?v=<digest>``,
+# the digest taken from the very bytes the server serves for that path, so the installed app's worker can answer a shell
+# asset from its cache by exact URL with nothing to revalidate. Only the cockpit page (``_COCKPIT_PAGE``) is rewritten:
+# the other pages are not cached shells. A path is matched without its query (``self.path.split("?", 1)[0]``), but a ``v``
+# that is not exactly the current digest of that path is refused 404 (``_version_query_ok``), so an old page's
+# ``?v=OLD`` never receives the new bytes the worker would then cache under the old name.
+_SHELL_TAG = re.compile(r"<(?:script|link)\b[^>]*>", re.IGNORECASE)
+# ``(?<![\w-])`` so ``data-src`` / ``data-href`` are not the attribute (``\b`` matched them: the hyphen is a word boundary)
+_SHELL_ATTR = re.compile(r"""(?<![\w-])(src|href)(\s*=\s*)(?:"([^"]+)"|'([^']+)')""", re.IGNORECASE)
+# The bound under the rewrite: ANY src/href value (quoted, unquoted or backslash-escaped in a script string) in the page
+_ANY_REF = re.compile(r"""(?<![\w-])(?:src|href)\s*=\s*\\?["']?(/[^\s"'>\\]+)""", re.IGNORECASE)
+_SHELL_ASSET_EXT = (".js", ".css")
+
+
+def _asset_digest(data: bytes) -> str:
+    return hashlib.sha256(data).hexdigest()[:12]
+
+
+def _version_shell_page(page: str, digests: Mapping[str, str]) -> str:
+    """``page`` with each ``<script src>`` and ``<link href>`` naming a path in ``digests`` (path -> digest) rewritten
+    to ``<path>?v=<digest>``. A reference that already carries a query or fragment, or names another path, is left alone."""
+
+    def attr(m: "re.Match[str]") -> str:
+        value = m.group(3) if m.group(3) is not None else m.group(4)
+        digest = digests.get(value)
+        if digest is None:
+            return m.group(0)
+        quote = '"' if m.group(3) is not None else "'"
+        return f"{m.group(1)}{m.group(2)}{quote}{value}?v={digest}{quote}"
+
+    def tag(m: "re.Match[str]") -> str:
+        t = m.group(0)
+        if t[1:5].lower() == "link" and not re.search(r"""\brel\s*=\s*["']?\s*stylesheet\b""", t, re.IGNORECASE):
+            return t
+        return _SHELL_ATTR.sub(attr, t, count=1)
+
+    return _SHELL_TAG.sub(tag, page)
+
+
+def _assert_shell_versioned(page: str, digests: Mapping[str, str]) -> None:
+    """The bound that closes the parse class: after the rewrite, no script or stylesheet path the server serves may still
+    appear as a bare ``src``/``href`` value anywhere in the page (a reference the tag regexes did not reach would be
+    cached under an unversioned name and served stale). Raises ValueError, naming the path. Links that are not
+    stylesheets (icons, the manifest) are not shell assets and are skipped."""
+    scan = _SHELL_TAG.sub(
+        lambda m: "" if m.group(0)[1:5].lower() == "link"
+        and not re.search(r"""\brel\s*=\s*["']?\s*stylesheet\b""", m.group(0), re.IGNORECASE) else m.group(0),
+        page)
+    for m in _ANY_REF.finditer(scan):
+        ref = m.group(1)
+        if ref in digests and ref.endswith(_SHELL_ASSET_EXT):
+            raise ValueError(f"refusing to start: the cockpit page names the shell asset {ref} without its ?v= digest "
+                             f"(a reference the shell rewrite does not reach)")
+
+
+def _version_query_ok(query: str, digest: str) -> bool:
+    """True when ``query`` carries no ``v``, or exactly one ``v`` equal to ``digest``."""
+    values = urllib.parse.parse_qs(query, keep_blank_values=True).get("v")
+    return values is None or values == [digest]
+
+
 _ACTION_FIELD_KINDS = ("text", "textarea", "csv", "multiselect")
 _UNSAFE_FIELD_NAMES = ("__proto__", "prototype", "constructor")
 
@@ -1620,6 +1681,7 @@ class _LevainHTTPServer(ThreadingHTTPServer):
 
     levain_source: SubstrateSource
     levain_assets: dict[str, bytes]
+    levain_shell_digests: dict[str, str]   # path -> digest of the bytes served; a ?v= must equal it
     allowed_hosts: frozenset[str]
     request_gate: threading.BoundedSemaphore
     read_gate: threading.BoundedSemaphore
@@ -4010,6 +4072,11 @@ class _Handler(GuardedHandler):
         asset = _ASSETS.get(path)
         if asset is not None:
             filename, content_type = asset
+            want = self.server.levain_shell_digests.get(path)
+            if want is not None and "?" in self.path and not _version_query_ok(self.path.split("?", 1)[1], want):
+                # a stale or wrong version names bytes this server does not serve: fail closed, never echo the query
+                self._send(b"not found\n", "text/plain; charset=utf-8", status=404, head=head)
+                return
             if path == _COCKPIT_PAGE:
                 self._send_framing((_COCKPIT_PAGE_CSP, "DENY"), self.server.levain_assets[filename], content_type,
                                    head=head)
@@ -4992,9 +5059,17 @@ def make_server(
         chat_service, room_host = room_serve.service, host_from(room_serve)
     assets = {fn: load_web_asset(fn).encode("utf-8") for fn, _ in _ASSETS.values()}
     assets[_SHEET_PAGE] = load_web_asset(_SHEET_PAGE).encode("utf-8")
+    # The one derivation point of the shell asset versions: digests of the bytes just loaded (the bytes served), written
+    # into the cockpit page BEFORE its bytes are stored, so the page cannot name a digest the server does not serve.
+    _shell_digests = {p: _asset_digest(assets[fn]) for p, (fn, _ct) in _ASSETS.items() if p != _COCKPIT_PAGE}
+    _shell_file = _ASSETS[_COCKPIT_PAGE][0]
+    _shell_page = _version_shell_page(assets[_shell_file].decode("utf-8"), _shell_digests)
+    _assert_shell_versioned(_shell_page, _shell_digests)
+    assets[_shell_file] = _shell_page.encode("utf-8")
     httpd = _LevainHTTPServer((host, port), _Handler)
     httpd.levain_source = source
     httpd.levain_assets = assets
+    httpd.levain_shell_digests = _shell_digests
     httpd.extra_assets = extra_assets
     httpd.extra_json = extra_json
     httpd.extra_panels = extra_panels
