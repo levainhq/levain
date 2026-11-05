@@ -684,14 +684,14 @@ SignerFactory = Callable[[Path, float], tuple[str, Signer]]    # (key path, the 
 def default_signer_factory(key_path: Path, timeout: float | None = None) -> tuple[str, Signer]:
     """The one door to the real key: ``ssh_signer`` in :data:`NAMESPACE`, bounded by ``timeout`` seconds.
     Calling the ``Signer`` it returns raises the Touch ID prompt."""
-    _keys.refuse_real_key_in_tests(key_path, "the signing key")
+    key_path = _keys.refuse_real_key_in_tests(key_path, "the signing key")
     return _keys.ssh_signer(key_path, namespace=NAMESPACE, timeout=timeout)
 
 
 def default_desk_signer_factory(key_path: Path, timeout: float | None = None) -> tuple[str, Signer]:
     """:func:`default_signer_factory` for the desk format: the same key, signing in :data:`DESK_NAMESPACE`. The only
     other door to the real key."""
-    _keys.refuse_real_key_in_tests(key_path, "the signing key")
+    key_path = _keys.refuse_real_key_in_tests(key_path, "the signing key")
     return _keys.ssh_signer(key_path, namespace=DESK_NAMESPACE, timeout=timeout)
 
 

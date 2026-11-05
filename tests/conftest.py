@@ -28,15 +28,16 @@ def _vendor_installed(monkeypatch):
 
 
 @pytest.fixture(autouse=True)
-def _no_real_terminal_key(monkeypatch, tmp_path):
-    """First wall of the keyguard: a test that forgot ``key_dir`` sees "no key" (a nonexistent per-test directory),
-    never the operator's Secure Enclave key whose Touch ID sheet opened on the live laptop during lane runs. The
-    second wall is ``refuse_real_key_in_tests`` in levain/cockpit/keys.py."""
-    try:
-        import levain.consent.terminal_sign as _ts
-    except ImportError:
-        return
-    monkeypatch.setattr(_ts, "_real_key_dir", lambda: tmp_path / "nokeys")
+def _no_real_terminal_key(tmp_path):
+    """First wall of the keyguard: a test that forgot ``key_dir`` sees "no key" (a nonexistent per-test directory,
+    ``<tmp_path>/nohome/.levain/keys``), never the operator's Secure Enclave key whose Touch ID sheet opened on the
+    live laptop during lane runs. Its own MonkeyPatch, so a test's ``monkeypatch.undo()`` keeps it. The second wall is
+    ``refuse_real_key_in_tests`` in levain/cockpit/keys.py; custody's default key dir is already per-test
+    (``_isolate_levain_home`` and the scratch HOME below)."""
+    import levain.consent.terminal_sign as _ts
+    with pytest.MonkeyPatch.context() as own:
+        own.setattr(_ts, "_real_key_dir", lambda: tmp_path / "nohome" / ".levain" / "keys")
+        yield
 
 
 LIVE_SEATBELT_ENV = "LEVAIN_LIVE_SEATBELT"
