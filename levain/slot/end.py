@@ -109,6 +109,10 @@ SLOT_LOCK_MAX_S = 0.5
 # DECISION: END's wait for the session END lock (a ``start`` holds it from before its clone through its ACTIVE
 # CAS), on the same order and backoff; past it, ``end-busy``.
 END_LOCK_WAIT_S = SLOT_LOCK_WAIT_S
+# DECISION (1105-10 endfix2, H1): END's wait for START's capture writer to close a log (its drain after END's kill
+# is a bounded number of reads, an fsync and a close), on the same order and backoff; past it ``capture-busy``, HELD
+# at ``manifest`` (the retry resumes there).
+CAPTURE_WAIT_S = SLOT_LOCK_WAIT_S
 
 #: The slot-lock and END-lock descriptors this process holds (comp r2 L4). Every forked child (the session-uid
 #: reader, macOS's signalling child) closes them before it runs anything, so a child that outlives END can never
@@ -168,8 +172,15 @@ CLASSES = "classes.jsonl"
 #: A regular file some of whose links lie outside the tree: read by a session uid, copied, the copy placed.
 OUTSIDE = "outside"
 #: Any other inode a session uid does not own: its bytes read by a session uid only (hashed, never copied),
-#: its metadata never read by root, whatever its link count.
+#: its metadata never read by root, whatever its link count. The one exception is START's own capture
+#: (:data:`CAPTURE_LOGS`), which root hashes (:func:`start_capture_ok`).
 UNOWNED = "unowned"
+#: c7.15 D7: START's vendor capture, ``<S>/run/vendor.out`` and ``vendor.err`` (start.py's ``open_capture`` takes
+#: these names from here, as END cannot import start). START makes them root : root 0700 / 0600 so no session uid can
+#: read or forge them, which is also why the session-uid reader cannot hash them (1105-10 endfix, finding a).
+CAPTURE_DIR = "run"
+CAPTURE_LOGS = ("vendor.out", "vendor.err")
+_CAPTURE_PATHS = frozenset(os.fsencode(f"{CAPTURE_DIR}/{n}") for n in CAPTURE_LOGS)
 #: The session-uid reader's answer for a file its uid may not open (EACCES / EPERM), END's own name beside
 #: stage's ``staging-missing`` (ENOENT) and ``staging-not-regular`` (ELOOP, not a regular file).
 LINK_UNREADABLE = "link-unreadable"
@@ -568,22 +579,85 @@ class _Budget:
         self.tick()
 
 
+def _hash_fd(fd: int, budget: _Budget) -> tuple[int, str]:
+    h, n = hashlib.sha256(), 0
+    while True:
+        chunk = os.read(fd, _CHUNK)
+        if not chunk:
+            break
+        h.update(chunk)
+        n += len(chunk)
+        budget.tick()
+    return n, "sha256:" + h.hexdigest()
+
+
 def _hash_file(e: Entry, budget: _Budget) -> tuple[int, str]:
     fd = os.open(e.name, _O_ENTRY, dir_fd=e.dirfd)
     try:
         if not _same(os.fstat(fd), e.st):
             raise Refused("tree-changed", f"{e.path!r} changed under the walk")
-        h, n = hashlib.sha256(), 0
-        while True:
-            chunk = os.read(fd, _CHUNK)
-            if not chunk:
-                break
-            h.update(chunk)
-            n += len(chunk)
-            budget.tick()
+        return _hash_fd(fd, budget)
     finally:
         os.close(fd)
-    return n, "sha256:" + h.hexdigest()
+
+
+def start_capture_ok(dir_st: os.stat_result, file_st: os.stat_result, root_uid: int) -> bool:
+    """Whether a directory and a file in it have the shape START's ``open_capture`` gives ``<S>/run/`` and its logs:
+    a directory root owns with no permission bit beyond the owner's (so no other uid can enter it, plant in it or
+    rename within it), holding a regular file root owns, with ONE link and no bit beyond the owner's (no setid, no
+    other reader). Anything else is not START's capture."""
+    return (stat.S_ISDIR(dir_st.st_mode) and dir_st.st_uid == root_uid
+            and stat.S_IMODE(dir_st.st_mode) & ~0o700 == 0
+            and stat.S_ISREG(file_st.st_mode) and file_st.st_uid == root_uid and file_st.st_nlink == 1
+            and stat.S_IMODE(file_st.st_mode) & ~0o700 == 0)
+
+
+def _await_capture_closed(fd: int, path: bytes, clock: Callable[[], float], sleep: Callable[[float], None]) -> None:
+    """A shared flock on ``fd``, a START capture log, within :data:`CAPTURE_WAIT_S`, else ``capture-busy``.
+    START's ``open_capture`` takes an exclusive flock on each log as it creates it and only closing the fd drops it,
+    so getting this one proves START's writer closed: its drain (which runs outside the session lock and may still
+    be reading what the killed vendor left in its pipes) has written, fsynced and closed, and no root path opens
+    the log for writing again (it was made ``O_EXCL``). A START that died closed its fds with it. No session uid can
+    open the log (root : root 0600 in a root 0700 directory), so none can hold or forge this lock."""
+    deadline = None
+    delay = SLOT_LOCK_FIRST_S
+    while True:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_SH | fcntl.LOCK_NB)
+            return
+        except BlockingIOError:
+            now = clock()
+            deadline = now + CAPTURE_WAIT_S if deadline is None else deadline
+            if now >= deadline:
+                raise Refused("capture-busy", f"{path!r}: START's writer held it past {CAPTURE_WAIT_S:g} s") from None
+            sleep(delay)
+            delay = min(delay * 2, SLOT_LOCK_MAX_S)
+
+
+def _hash_start_capture(e: Entry, budget: _Budget, root_uid: int, clock: Callable[[], float],
+                        sleep: Callable[[float], None]) -> "tuple[int, str] | None":
+    """START's capture log hashed by root, or ``None`` when ``e`` is not one (the caller's session-uid read then
+    stands). Only ``<S>/run/vendor.out`` / ``vendor.err`` reached by the walk's own dirfd; the directory is checked on
+    that fd BEFORE root opens a name in it (once it is root's and owner-only, nothing but root can change its
+    entries), and the file on the fd root then hashes (the walk's inode, :func:`start_capture_ok`), never by a path,
+    and only once START's writer has closed it (:func:`_await_capture_closed`). Its size is bounded by START's own
+    per-log cap (``runtime_helper.VENDOR_LOG_CAP``), and its hash is charged to the manifest's time budget like
+    every other file's, so a budget refusal here is the ordinary ``manifest_budget`` HELD."""
+    if e.dirfd < 0 or e.path not in _CAPTURE_PATHS:
+        return None
+    if not start_capture_ok(os.fstat(e.dirfd), e.st, root_uid):
+        return None
+    fd = os.open(e.name, _O_ENTRY, dir_fd=e.dirfd)
+    try:
+        st = os.fstat(fd)
+        if not _same(st, e.st):
+            raise Refused("tree-changed", f"{e.path!r} changed under the walk")
+        if not start_capture_ok(os.fstat(e.dirfd), st, root_uid):
+            return None
+        _await_capture_closed(fd, e.path, clock, sleep)
+        return _hash_fd(fd, budget)
+    finally:
+        os.close(fd)
 
 
 #: ``read_foreign(entry, budget) -> (size, digest)``: an outside-linked file's bytes, read as the session.
@@ -1464,7 +1538,9 @@ def _manifest_step(facts: EndFacts, seams: EndSeams, caps: Caps) -> None:
     setuid/setgid; an UNREAD one is an empty 0600 placeholder); an :data:`UNOWNED` file is read once by it and
     hashed, never copied (codex r1 4); that read is what the manifest records, and an UNOWNED file it cannot
     read refuses ``unowned-unreadable`` (codex r2 N2: its real bytes stay in the tree, so UNREAD's size 0
-    would be a false record). The copy cap is checked
+    would be a false record). The exception: START's capture logs (:func:`_hash_start_capture`), root's own
+    files no session uid may read by design, are hashed by root; their class stays UNOWNED, so the meta and tree
+    steps treat them as before. The copy cap is checked
     before anything is read, and is ONE budget across every reader: each gets only what the reads before it
     left (codex r1 8), so files an outside holder grows after the sum cannot stage past it."""
     classes, outside = classify(facts.live, facts.extra, facts.uids, depth_cap=caps.depth)
@@ -1495,7 +1571,11 @@ def _manifest_step(facts: EndFacts, seams: EndSeams, caps: Caps) -> None:
                     os.close(out)
                 copied += got[0]
             else:
-                got = read_as_session(facts, seams, e, None, HASH_ONLY_CAP, budget)
+                # 1105-10 endfix (a): START's own root-only capture is hashed by root; every other UNOWNED file
+                # still goes to the session uid, and refuses below when that uid cannot read it.
+                capture = _hash_start_capture(e, budget, seams.root_uid, seams.clock, seams.sleep)
+                got = capture if capture is not None else read_as_session(facts, seams, e, None, HASH_ONLY_CAP,
+                                                                          budget)
                 if got == UNREAD:
                     # codex r2 N2: an UNOWNED inode has no placeholder; it stays in the tree, so a size-0,
                     # digest-"" line would misdescribe the bytes retained. Fail closed: HELD, named.

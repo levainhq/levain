@@ -62,6 +62,7 @@ then SCRUBBED (proc.scrub over every uid of the slot, under the slot lock) and t
 from __future__ import annotations
 
 import errno
+import fcntl
 import hashlib
 import os
 import re
@@ -243,16 +244,18 @@ class VendorCapture:
                 os.close(fd)
 
 
-#: c7.15: the names under ``<S>/run/`` and the directory itself (root : root 0700, the slot cannot enter it).
-RUN_DIR = "run"
-VENDOR_OUT, VENDOR_ERR = "vendor.out", "vendor.err"
+#: c7.15: the names under ``<S>/run/`` and the directory itself (root : root 0700, the slot cannot enter it). END's,
+#: so the one rule that lets root hash these two (end.start_capture_ok) names the same files.
+RUN_DIR = E.CAPTURE_DIR
+VENDOR_OUT, VENDOR_ERR = E.CAPTURE_LOGS
 _O_LOG_NEW = os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC
 
 
 def open_capture(ctx: H.Ctx, a: R.Alloc, cap: VendorCapture) -> None:
     """``<S>/run/`` made fresh (:meth:`~levain.slot.runtime_helper.Store.mkdir`: an existing name of any kind,
     a link included, is ``session-exists``, so nothing is ever written through one), root : root 0700; its two log
-    files created ``O_CREAT|O_EXCL|O_NOFOLLOW`` there, root : root 0600; the two pipes. On a failure every fd made
+    files created ``O_CREAT|O_EXCL|O_NOFOLLOW`` there, root : root 0600, each under an exclusive flock its fd holds
+    until :meth:`VendorCapture.close` (END waits on it before hashing); the two pipes. On a failure every fd made
     here is closed."""
     seams = ctx.seams
     rel = f"live/{a.session}/{RUN_DIR}"
@@ -267,6 +270,10 @@ def open_capture(ctx: H.Ctx, a: R.Alloc, cap: VendorCapture) -> None:
                 except FileExistsError:
                     raise Refused("render-dest-exists", f"{rel}/{name}") from None
                 setattr(cap, attr, fd)
+                # 1105-10 endfix2 (H1): held from here to close() (closing drops it), so END, which takes a shared
+                # flock before it hashes a log (end._await_capture_closed), never reads one this drain still writes.
+                # A fresh O_EXCL file under the session lock: nothing else can hold a lock on it yet.
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
                 seams.chown(fd, 0, 0, f"{rel}/{name}")
                 os.fchmod(fd, 0o600)
             seams.fsync(rfd)
