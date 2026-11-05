@@ -514,6 +514,64 @@ def test_a_short_end_answers_within_its_deadline_while_a_holder_abort_blocks(rig
     assert inner.aborted == 1 and inner.released is False and env.runtime.ended == ["sess-1"]
 
 
+class SlowJobRuntime(FakeRuntime):
+    """The first END (the cleanup's ABORT settle) answers unproven at once; every later one (the key's END job) blocks
+    on ``gate``: a refused RELEASE whose cleanup is fast but whose END job is slow."""
+
+    def __init__(self):
+        super().__init__()
+        self.gate = threading.Event()
+
+    def end(self, session):
+        if self.ended:
+            self.gate.wait(30)
+            return super().end(session)
+        self.ended.append(session)
+        return False
+
+
+def test_a_release_refused_at_the_point_of_use_answers_by_name_inside_the_clients_release_timeout(rig, tmp_path):
+    """C1/C2 (fixrel2 open item): the verify-refusal path waited ``HOLDER_END_WAIT_S`` (10 s) for the END job, the same
+    as the client's RELEASE socket timeout, so a slow END turned the named refusal into 'unreachable'. The wait is
+    now :data:`D.RELEASE_REFUSED_WAIT_S`, below the client's timeout; the END runs on and the EOF cleanup joins it."""
+    runtime = SlowJobRuntime()
+    env = Env(rig, tmp_path, runtime=runtime)
+    oid, key = _occurrence(rig, billing="subscription", exposure=EXP), "s-00000000000000dc"
+    child = env.client().spawn(S.SessionLaunch(oid, key, "claude", "sonnet", "b", "passthrough", EXP))
+    env.bar_of = lambda agent: (True, 0)            # a revoke lands while the slot is prepared
+    t0 = time.monotonic()
+    try:
+        with pytest.raises(RuntimeError) as exc:
+            child.release()
+        elapsed = time.monotonic() - t0
+        assert "refused RELEASE: agent-barred" in str(exc.value), exc.value
+        assert elapsed < C._CONNECT_S - 1, elapsed
+        assert env.server._jobs[key].done.is_set() is False        # the END job runs on past the answer
+    finally:
+        runtime.gate.set()
+    child._conn.close()
+    env.drain()
+    assert env.runtime.children[0].released is False and env.launcher.index.get(key)["state"] == "ended"
+    assert D.RELEASE_REFUSED_WAIT_S < C._CONNECT_S
+
+
+def test_an_end_before_the_holder_registers_answers_a_named_unproven_inside_its_deadline(rig, env):
+    """C1/C2 (fixrel2 open item, decided as the documented edge): an END that arrives strictly before the key's LAUNCH
+    answers unproven by name within its deadline, never 'ended', and leaves nothing behind that refuses the LAUNCH."""
+    key = "s-00000000000000dd"
+    t0 = time.monotonic()
+    got = env.client().end_session(key, 2)
+    assert time.monotonic() - t0 < 2
+    assert got.terminated is False and "nothing observed" in got.detail, got
+    assert key not in env.server._live
+    oid = _occurrence(rig, billing="subscription", exposure=EXP)
+    child = env.client().spawn(S.SessionLaunch(oid, key, "claude", "sonnet", "b", "passthrough", EXP))
+    child.release()                                   # the earlier END marked nothing: the reaper's next END is the retry
+    assert env.client().end_session(key, 5).terminated is True and env.runtime.ended == ["sess-1"]
+    child._conn.close()
+    env.drain()
+
+
 def test_usage_by_an_unknown_key_is_the_caps(env):
     got = env.client().usage("s-00000000000000ff")
     assert got.actions is None and got.tunnel_bytes is None and got.seconds is None
