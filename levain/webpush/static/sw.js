@@ -6,7 +6,7 @@
 // whichever opens first creates the store; correctness depends on no timing (an unread key waits for the next trigger).
 const DB = 'levain-sw-2', STORE = 'opened';
 // A short id of this worker's code, recorded in the trace so a device's trace says which worker ran.
-const SW_VERSION = '1105-assethash-1';
+const SW_VERSION = '1105-pushshown-1';
 // The TRACE: an append-only ring in its own cache, one entry per step, key TRACE_PREFIX + <time ms, zero padded> + '-' +
 // <seq>, value JSON {t, src, step, ...detail}. The /tap_trace page and sw_open.js read and write the same ring. Writes are
 // best effort, serialized on one chain, never awaited by the tap, and carry only urls without fragments, counts and step
@@ -69,7 +69,7 @@ const traceSettled = () => {
 
 // --- device receipts -----------------------------------------------------------------------------------------------
 // A push the device got is reported to the server: `received` when the push event fired, `shown` when showNotification
-// resolved. The worker holds no credential, so a report names the SHA-256 of its own push-subscription endpoint (the
+// resolved and the user agent lists the notification (heldByAgent: held, which is not the same as drawn). The worker holds no credential, so a report names the SHA-256 of its own push-subscription endpoint (the
 // secret only the device and the server share) and carries ids and times only. Every step is total: nothing in here
 // throws into the notification. ONE budget per event bounds all of it (receiptBudget): every fetch shares its abort
 // signal, and every subscription, digest and Cache Storage wait races its deadline.
@@ -539,6 +539,31 @@ function applyBadge(n) {
   } catch (_) { return Promise.resolve(); }
 }
 
+// Whether the user agent holds the notification just asked for: getNotifications({tag}) lists one with this exact tag
+// (compared here too: an older WebKit ignored the filter and listed every notification of the app). 2026-11-05, ping 409:
+// all four devices reported `shown` for a notification none of them displayed, because `shown` then meant only that
+// showNotification resolved, and a resolved promise is the UA accepting the request (WHATWG Notifications: the promise
+// resolves after the show steps hand it to the platform, with no check that it appeared). The LIMIT that remains: a page
+// can learn only that the UA holds the notification, never that the OS drew it (a Focus that silences the app, a
+// scheduled summary, a banner the OS chose not to show), so `shown` means "the device holds it", and nothing that must
+// prove Phill SAW a ping may rest on `shown` alone: the evidence for that is a tap (notificationclick -> an `opens` row)
+// or his answer on the sheet. Absent, unlistable (no getNotifications, a throw, past the budget): no `shown`, and the
+// trace says `show-missing` with the tag's length and its leading word only (no content).
+async function heldByAgent(tag, b) {
+  const miss = (why, count) => {
+    trace('show-missing', { why, tagLen: tag.length, tagKind: (/^[A-Za-z]{1,16}/.exec(tag) || [''])[0], count: count == null ? null : count });
+    return false;
+  };
+  try {
+    const reg = self.registration;
+    if (!reg || typeof reg.getNotifications !== 'function') return miss('no-api');
+    const list = await b.within(() => reg.getNotifications({ tag }));
+    if (list === LATE) return miss('late');
+    const all = Array.from(list || []);
+    return all.some((n) => n && n.tag === tag) || miss('absent', all.length);
+  } catch (_) { return miss('error'); }
+}
+
 self.addEventListener('push', (e) => {
   const t0 = Date.now();
   let d = {};
@@ -562,13 +587,15 @@ self.addEventListener('push', (e) => {
   trace('sw-version', { version: SW_VERSION, on: 'push' });
   trace('push', { tag: traceScalar(d.tag || 'levain'), ping: traceScalar(d.ping) });
   const ping = typeof d.ping === 'number' ? d.ping : Number(d.ping);
-  // then the receipts, all under one budget from the event's start: received now, shown when the notification resolved,
-  // and the queue re-sent after both, only when the server answered one of them
+  // then the receipts, all under one budget from the event's start: received now, shown when the notification resolved
+  // AND the user agent still holds it (heldByAgent), and the queue re-sent after both, only when the server answered one
   const b = receiptBudget(t0);
   const receipts = boundedReceipts(b, async () => {
     const hashP = endpointHash(b);   // one hash for this event's reports, asked now
+    const tag = d.tag || 'levain';
     const r = await Promise.all([sendReceipt(ping, 'received', t0, b, hashP),
-                                 shown.then(() => sendReceipt(ping, 'shown', Date.now(), b, hashP), () => false)]);
+                                 shown.then(() => heldByAgent(tag, b), () => false)
+                                   .then((held) => (held ? sendReceipt(ping, 'shown', Date.now(), b, hashP) : false))]);
     if (r.some((x) => x === true)) await drainReceipts(b);
   });
   e.waitUntil(Promise.allSettled([shown, badged, receipts]).finally(traceSettled));

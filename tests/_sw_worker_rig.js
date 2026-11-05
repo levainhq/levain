@@ -6,7 +6,7 @@ const vm = require('vm');
 
 const [swPath, scenario, mode] = process.argv.slice(2);
 const listeners = {};
-const log = { console: [], asked: [], posts: [], order: [], shownCalls: [], fetches: 0, opened: [], posted: [], longWaits: [], claimed: false, skipWaiting: false, windows: [], navigated: [], focused: 0 };
+const log = { console: [], asked: [], posts: [], order: [], shownCalls: [], held: [], getNotificationsCalls: [], fetches: 0, opened: [], posted: [], longWaits: [], claimed: false, skipWaiting: false, windows: [], navigated: [], focused: 0 };
 let traceFail = false;   // 'tracefail' in the mode: every open of the trace cache throws
 let uncontrolled = [];   // windows only matchAll({includeUncontrolled: true}) returns
 
@@ -89,9 +89,19 @@ const self_ = {
   skipWaiting: () => { log.skipWaiting = true; },
   location: { origin: 'https://box.example' },
   registration: {
+    // what the user agent holds: a resolved show adds one (a same-tag show replaces it), unless the platform swallowed it
+    // (log.swallowed: the promise resolves and nothing is held, the way a notification no device drew looks from inside)
     showNotification: async (title, o) => {
       log.order.push('show'); log.shownCalls.push({ title, tag: o.tag });
       if (log.showThrows) throw new Error('showNotification refused');
+      if (!log.swallowed) { log.held = log.held.filter((n) => n.tag !== o.tag).concat([{ title, tag: o.tag }]); }
+    },
+    getNotifications: async (filter) => {
+      log.getNotificationsCalls.push(filter === undefined ? null : filter);
+      if (log.getnThrows) throw new TypeError('getNotifications refused');
+      const tag = filter && filter.tag;
+      // 'getnall': a filter the UA ignores (an old WebKit returned every notification of the app whatever the tag)
+      return log.held.filter((n) => log.getnAll || !tag || n.tag === tag).map((n) => ({ title: n.title, tag: n.tag }));
     },
     pushManager: { getSubscription: async () => log.subscription },
   },
@@ -203,6 +213,11 @@ function fire(type, ev) {
     behaviour = parts[0];
     log.subscription = parts.includes('nosub') ? null : { endpoint: 'https://fcm.googleapis.com/fcm/send/dev1' };
     log.showThrows = parts.includes('showthrows');
+    log.swallowed = parts.includes('swallowed');
+    log.getnThrows = parts.includes('getnthrows');
+    log.getnAll = parts.includes('getnall');
+    if (parts.includes('nogetn')) delete self_.registration.getNotifications;
+    if (parts.includes('othertag')) log.held = [{ title: 'other', tag: 'np-other' }];   // the UA holds another ping's notification
     if (parts.includes('subhang')) self_.registration.pushManager.getSubscription = () => new Promise(() => {});
     if (parts.includes('cachehang')) {
       const realOpen = caches.open;
@@ -223,7 +238,13 @@ function fire(type, ev) {
       if (parts.includes('seedstale')) { const at = Date.now() - 3 * 86400000; m.set('/__levain_receipt/98-received-' + String(at).padStart(13, '0') + '-0000', JSON.stringify({ ping: 98, kind: 'received', at, endpoint_sha256: 'c'.repeat(64) })); }
       cacheNames.add('levain-receipts'); cacheStores.set('levain-receipts', m);
     }
-    const data = parts.includes('noping') ? { title: 'T', body: 'secret body' } : { title: 'T', body: 'secret body', ping: 42, url: '/', tag: 'x' };
+    // 'p409': the shape of ping 409 (2026-11-05, kind consent), rebuilt from the push record's field lengths: the title
+    // 'levain', a 57-character `request:pend-<stamp>-<hex>` tag, the center link, an int ping and a badge; the body is a
+    // stand-in of the recorded length class, not the recorded text
+    const p409 = { title: 'levain', body: 'secret body ' + 'x'.repeat(180), tag: 'request:pend-2026-11-05T19:54:58.556594Z-2690252d9c8e0d77',
+                   url: '/?view=notifications&n=p409', ping: 409, badge: 1 };
+    const data = parts.includes('noping') ? { title: 'T', body: 'secret body' }
+      : parts.includes('p409') ? p409 : { title: 'T', body: 'secret body', ping: 42, url: '/', tag: 'x' };
     const started = Date.now();
     const evPush = () => ({ data: { json: () => data } });
     if (!parts.includes('clickonly')) {
