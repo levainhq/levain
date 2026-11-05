@@ -71,6 +71,8 @@ def usd_to_micros(usd: str | int) -> int:
         value = Decimal(usd) * MICROS_PER_USD
     except InvalidOperation:
         raise MeterError(f"{usd!r} is not a dollar amount") from None
+    if not value.is_finite() or value < 0:
+        raise MeterError(f"{usd!r} is not a dollar amount")
     if value != value.to_integral_value():
         raise MeterError(f"{usd!r} has finer than micro-dollar precision")
     return int(value)
@@ -271,7 +273,10 @@ class Meter:
             raise MeterError(f"voice ledger {self.path} is a symlink")
         if not self.path.parent.is_dir():
             raise MeterError(f"voice ledger directory {self.path.parent} does not exist")
-        existed = self.path.exists()
+        try:   # created 0600 from its first byte (umask can only remove bits), and never through a symlink
+            os.close(os.open(self.path, os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, 0o600))
+        except OSError as exc:
+            raise MeterError(f"voice ledger {self.path} cannot be opened: {type(exc).__name__}") from None
         try:
             with closing(self._open()) as conn:
                 conn.execute("BEGIN IMMEDIATE")
@@ -292,8 +297,7 @@ class Meter:
                     raise
         except sqlite3.DatabaseError as exc:
             raise MeterError(f"{self.path} is not a usable voice ledger: {type(exc).__name__}") from None
-        if not existed:
-            os.chmod(self.path, 0o600)     # the operator's alone
+        os.chmod(self.path, 0o600)     # the operator's alone, whoever created it and however
 
     # --- periods ------------------------------------------------------------------------------------------------------
     def _periods(self, now: datetime) -> tuple[str, str, str, str]:
@@ -312,37 +316,42 @@ class Meter:
                       else datetime(day.year, day.month, day.day, tzinfo=self._tz))
 
     def _sums(self, conn: sqlite3.Connection, now: datetime) -> tuple[int, int, str, str]:
+        # ONE statement, so the month and the day are read from one snapshot even outside a transaction (the day
+        # always lies inside its month)
         m0, m1, d0, d1 = self._periods(now)
-        month = conn.execute(f"SELECT COALESCE(SUM(cost_micros), 0) FROM calls WHERE {_COUNTED} AND at >= ? AND at < ?",
-                             (m0, m1)).fetchone()[0]
-        day = conn.execute(f"SELECT COALESCE(SUM(cost_micros), 0) FROM calls WHERE {_COUNTED} AND at >= ? AND at < ?",
-                           (d0, d1)).fetchone()[0]
+        month, day = conn.execute(
+            "SELECT COALESCE(SUM(cost_micros), 0), "
+            "COALESCE(SUM(CASE WHEN at >= ? AND at < ? THEN cost_micros ELSE 0 END), 0) "
+            f"FROM calls WHERE {_COUNTED} AND at >= ? AND at < ?", (d0, d1, m0, m1)).fetchone()
         return month, day, m0, d0
 
     # --- the check, and the rows --------------------------------------------------------------------------------------
     def reserve(self, provider: str, use: str, model: str, units: int) -> Check:
         """Price a call, check it against both caps and, if it fits, record it, all in one write transaction.
 
-        ``units`` is characters for ``tts`` and estimated seconds for ``stt``. A call fits when what is already counted
-        plus its estimate is AT MOST each cap. On a refusal nothing is written. The caller then makes the call and ends
-        with :meth:`settle` or :meth:`release`; the returned ``reservation_id`` names the row."""
+        ``units`` is characters for ``tts`` and estimated seconds for ``stt``; a call is priced at no less than one
+        unit, since a call that goes out is never free. A call fits when what is already counted plus its estimate is
+        AT MOST each cap, and a cap of 0 refuses every call. On a refusal nothing is written. The clock is read AFTER the
+        write lock is held, so a call that waited for the lock across midnight counts in the day it was let through.
+        The caller then makes the call and ends with :meth:`settle` or :meth:`release`; the returned
+        ``reservation_id`` names the row."""
         if use not in USES:
             raise MeterError(f"use {use!r} is not one of {USES}")
         if isinstance(units, bool) or not isinstance(units, int) or units < 0:
             raise MeterError(f"units must be a non-negative int, got {units!r}")
         entry = self.prices.find(provider, use, model)
-        now = self._clock()
         with closing(self._connect()) as conn:
             conn.execute("BEGIN IMMEDIATE")
             try:
+                now = self._clock()
                 month, day, _, _ = self._sums(conn, now)
                 if entry is None:
                     conn.execute("ROLLBACK")
                     return Check(False, UNPRICED, None, 0, month, day, self.caps)
-                estimate = entry.cost(units)
-                if month + estimate > self.caps.month_micros:
+                estimate = entry.cost(max(units, 1))
+                if self.caps.month_micros == 0 or month + estimate > self.caps.month_micros:
                     reason = MONTH_CAP
-                elif day + estimate > self.caps.day_micros:
+                elif self.caps.day_micros == 0 or day + estimate > self.caps.day_micros:
                     reason = DAY_CAP
                 else:
                     cur = conn.execute(

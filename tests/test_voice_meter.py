@@ -47,7 +47,7 @@ def test_usd_to_micros_is_exact_and_refuses_floats():
     assert usd_to_micros(10) == 10 * MICROS_PER_USD
     assert usd_to_micros("0.015") == 15_000
     assert usd_to_micros("0.000001") == 1
-    for bad in (0.015, True, None, "abc", "0.0000001"):
+    for bad in (0.015, True, None, "abc", "0.0000001", "Infinity", "-Infinity", "NaN", "-5", -5):
         with pytest.raises(MeterError):
             usd_to_micros(bad)
 
@@ -173,7 +173,54 @@ def test_a_call_that_lands_exactly_on_a_cap_is_allowed_and_one_micro_more_is_not
 def test_a_zero_cap_turns_premium_off(tmp_path):
     meter, _ = make(tmp_path, caps=Caps(month_micros=0, day_micros=0))
     assert meter.reserve("openai", "tts", "tts-1", 1).reason == MONTH_CAP
-    assert meter.reserve("openai", "tts", "tts-1", 0).allowed                      # a free (empty) call costs nothing
+    assert meter.reserve("openai", "tts", "tts-1", 0).reason == MONTH_CAP          # zero units is still a call
+    free = PriceTable("2026-11-04", (PriceEntry("openai", "tts", "tts-1", micros=0, per=1),))
+    meter, _ = make(tmp_path, caps=Caps(month_micros=10**6, day_micros=0), prices=free, name="free.db")
+    assert meter.reserve("openai", "tts", "tts-1", 1_000).reason == DAY_CAP       # even a call priced at nothing
+    assert meter.ledger() == []
+
+
+def test_a_call_is_priced_at_no_less_than_one_unit(tmp_path):
+    meter, _ = make(tmp_path)
+    chk = meter.reserve("openai", "stt", "gpt-4o-mini-transcribe", 0)            # a sub-second clip estimated as 0 s
+    assert chk.allowed and chk.estimate_micros == 50 and meter.ledger()[0].cost_micros == 50
+
+
+def test_the_clock_is_read_while_the_write_lock_is_held(tmp_path):
+    path, held = tmp_path / "voice.db", []
+
+    def clock() -> datetime:
+        probe = sqlite3.connect(path, timeout=0, isolation_level=None)
+        try:
+            probe.execute("BEGIN IMMEDIATE")
+            probe.execute("ROLLBACK")
+            held.append(False)
+        except sqlite3.OperationalError:
+            held.append(True)
+        finally:
+            probe.close()
+        return local(2026, 11, 5, 23, 59, 59)
+
+    meter = Meter(path, clock=clock, tz=NY)
+    meter.ledger()                                                                  # creates the file, reads no clock
+    assert meter.reserve("openai", "tts", "tts-1", 10).allowed
+    assert held == [True]
+
+
+def test_spent_reads_the_month_and_the_day_in_one_statement(tmp_path, monkeypatch):
+    meter, _ = make(tmp_path)
+    meter.reserve("openai", "tts", "tts-1", 1_000)
+    sums: list[str] = []
+    real_open = Meter._open
+
+    def traced(self):
+        conn = real_open(self)
+        conn.set_trace_callback(lambda sql: sums.append(sql) if "SUM(" in sql else None)
+        return conn
+
+    monkeypatch.setattr(Meter, "_open", traced)
+    spend = meter.spent()
+    assert len(sums) == 1 and (spend.month_micros, spend.day_micros) == (15_000, 15_000)
 
 
 def test_month_cap_is_named_before_day_cap_when_both_are_over(tmp_path):
@@ -314,6 +361,14 @@ def test_the_ledger_file_is_the_operators_alone(tmp_path):
     meter, _ = make(tmp_path)
     meter.spent()
     assert (tmp_path / "voice.db").stat().st_mode & 0o777 == 0o600
+
+
+def test_a_ledger_file_someone_else_created_is_made_the_operators_alone(tmp_path):
+    path = tmp_path / "voice.db"
+    path.touch()
+    path.chmod(0o644)                                     # an empty file left by an interrupted or racing first open
+    Meter(path).spent()
+    assert path.stat().st_mode & 0o777 == 0o600
 
 
 def test_constructing_a_meter_creates_nothing_until_it_is_used(tmp_path):
