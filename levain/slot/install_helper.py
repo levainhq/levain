@@ -11,9 +11,9 @@ not), and what the interrupted run made is kept at the ids it holds (:attr:`Host
 Undo removes the runtime rule first and the install rule last, before the record, so a failed undo
 re-runs through the install helper.
 
-``purge``, ``set-credential``, ``remove-credential`` and ``set-limits`` are not plans: they act under the install lock
+``purge``, ``set-credential``, ``remove-credential``, ``set-limits`` and ``set-ceiling`` are not plans: they act under the install lock
 (the credential verbs through a forked child that drops to keys before it opens anything below ``L/keys/``,
-:func:`run_credential`; ``set-limits`` writes ``L/policy/limits`` in root, :func:`run_set_limits`). Nor are
+:func:`run_credential`; ``set-limits`` writes ``L/policy/limits`` in root, :func:`run_set_limits`; ``set-ceiling`` writes ``L/policy/dispatch_ceiling``, :func:`run_set_ceiling`). Nor are
 ``enrol-authority-signer`` / ``remove-authority-signer``: root's allowed-signers file, :func:`run_authority_signer`.
 """
 from __future__ import annotations
@@ -69,7 +69,7 @@ from levain.broker import policy as broker_policy
 from levain.slot.runtime_grammar import VERBS as RUNTIME_VERBS
 from levain.slot.runtime_grammar import ok_line, refusal_line
 from levain.slot.layout import (STORE, Row, base_routes_steps, base_run_rows, base_store_rows, operator_record_path,
-                                parse_pool_config, policy_limits_path, policy_rows, pool_config_row, pool_config_steps,
+                                parse_pool_config, policy_dispatch_ceiling_path, policy_limits_path, policy_rows, pool_config_row, pool_config_steps,
                                 pool_config_undo_steps, reserve_row, reserve_steps, roots_steps, row_steps,
                                 run_dir_undo_steps, single_filesystem_steps, slot_rows, tmpfiles_steps,
                                 tmpfiles_undo_steps, ungroup_steps, entry_state, remove_entry_steps,
@@ -236,7 +236,7 @@ def check_tools(facts: HostFacts, steps: Sequence[Step], *, verb: str, python: b
 
 #: The verbs :func:`main` applies; every other verb of the §5.2 grammar answers ``verb-unbuilt:<verb>``.
 BUILT_VERBS = ("setup", "undo", "replenish", "purge", "set-credential", "remove-credential", "repair", "set-limits",
-               "routes-base", "routes-trust", "routes-egress", "enrol-authority-signer", "remove-authority-signer")
+               "set-ceiling", "routes-base", "routes-trust", "routes-egress", "enrol-authority-signer", "remove-authority-signer")
 
 
 def helper_pending() -> tuple[str, ...]:
@@ -2598,6 +2598,90 @@ def run_set_limits(caller_uid: int, host: HostOS, *, read: Callable[[int], bytes
     return {"verb": "set-limits", "digest": "sha256:" + hashlib.sha256(data).hexdigest()}
 
 
+# --- set-ceiling (the dispatch ceiling, tickets.read_ceiling's file; 1105-32) ------------------------------------
+
+def read_ceiling_doc(read: Callable[[int], bytes]) -> tuple[bytes, T.Ceiling]:
+    """``set-ceiling``' stdin: one ``levain-dispatch-ceiling/1`` or ``/2`` document, at most the reader's cap, checked
+    WHOLE in root by the ticket store's own check (:func:`levain.slot.tickets.parse_ceiling`, the one :func:`read_ceiling`
+    reads through, so no rule is written twice) and returned as ``(canonical bytes, the parsed ceiling)``, the canonical
+    bytes re-read through the same check: root never writes the caller's bytes, and never bytes CONTROL would refuse.
+    A refusal is ``ceiling-oversize`` or ``ceiling-malformed``, the reader's own message in the detail (stderr)."""
+    raw = read(T.CEILING_MAX + 1)
+    if len(raw) > T.CEILING_MAX:
+        raise Refused("ceiling-oversize", f"over {T.CEILING_MAX} bytes")
+    try:
+        T.parse_ceiling(raw)
+        data = canon.canonical_bytes(canon.parse(raw))
+        ceiling = T.parse_ceiling(data)
+    except Refused as e:
+        raise Refused("ceiling-malformed", e.detail) from None
+    except (canon.ContractError, ValueError, RecursionError) as e:
+        raise Refused("ceiling-malformed", str(e)[:200] or type(e).__name__) from None
+    return data, ceiling
+
+
+def _ceiling_in_force(path: Path) -> dict[str, object] | None:
+    """The ceiling at ``path`` as its fields, for the answer's ``old``; ``None`` when absent or one CONTROL would
+    refuse. Read only (a bounded read, ``O_NOFOLLOW``); never decides anything."""
+    try:
+        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC)
+    except OSError:
+        return None
+    try:
+        data = os.read(fd, T.CEILING_MAX + 1)
+    except OSError:
+        return None
+    finally:
+        os.close(fd)
+    try:
+        T.parse_ceiling(data)
+        return canon.parse(data)                                          # type: ignore[return-value]
+    except (Refused, canon.ContractError, ValueError, RecursionError):
+        return None
+
+
+def run_set_ceiling(caller_uid: int, host: HostOS, *, read: Callable[[int], bytes],
+                    lock: Callable[[], ContextManager[object]], store_seams: RH.Seams | None = None,
+                    err: TextIO | None = None, fsync: Callable[[int], None] | None = None) -> dict[str, object]:
+    """``set-ceiling``: ``L/policy/dispatch_ceiling`` replaced by stdin's document. Order as :func:`run_set_limits`:
+    the operator check, stdin read and checked in root (:func:`read_ceiling_doc`), both before the install lock; UNDER
+    the lock the operator check again, ``L/policy`` opened ``O_NOFOLLOW`` and required to pass ``seams.trusted`` (root's,
+    not group/other-writable: a ceiling in a directory the dispatch uid could write is no bound), the ceiling in force
+    read for the answer, then the write: ``dispatch_ceiling.tmp`` (``O_EXCL | O_NOFOLLOW``, 0644, fsynced), renamed over
+    the file, ``L/policy`` fsynced (:func:`levain.slot.records.write_durably`). The new entry is root's whatever the old
+    one was. A failure before the rename refuses ``ceiling-write-failed`` with the old file in force; a failure of the
+    directory fsync after it answers ok and warns on ``err``. No pool hold and no live-lease count: CONTROL reads the
+    file on every mint. NO default and no seeding: this writes only a document a human piped in. The answer carries the
+    ceiling it replaced (``old``, ``None`` when absent or unusable) and the new one (``new``)."""
+    import hashlib
+
+    rs = store_seams or RH.Seams(host=host)
+    _check_operator("set-ceiling", caller_uid, rs)
+    data, new = read_ceiling_doc(read)
+    path = rs.L / policy_dispatch_ceiling_path(host).relative_to(STORE[host])
+    with lock():
+        _check_operator("set-ceiling", caller_uid, rs)
+        try:
+            dfd = os.open(path.parent, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC)
+        except OSError as e:
+            raise Refused("bad-root", f"{path.parent}: {e.strerror or e}") from None
+        try:
+            if not rs.trusted(os.fstat(dfd)):
+                raise Refused("bad-root", f"{path.parent} is not root's alone")
+        finally:
+            os.close(dfd)
+        old = _ceiling_in_force(path)
+        try:
+            R.write_durably(path, data, mode=0o644, fsync=fsync or gen_mod._full_fsync)
+        except R.NotDurable as e:
+            (err or sys.stderr).write(f"levain install-helper: warning: {path} written but not durable ({e.strerror}): "
+                                      "it is in force now and may not survive a crash; run it again\n")
+        except OSError as e:
+            raise Refused("ceiling-write-failed", f"{path}: {e.strerror or e}; the earlier file stands") from None
+    return {"verb": "set-ceiling", "digest": "sha256:" + hashlib.sha256(data).hexdigest(), "old": old,
+            "new": canon.parse(data)}
+
+
 def policy_limits_state(host: HostOS, live: RM.Live) -> str:
     """``L/policy/limits`` for undo: OURS by path and owner alone (a regular file of root's), WHATEVER its bytes, so an
     unusable file goes too (R1 F7); a link or another owner's entry there is NOT_OURS and left."""
@@ -4296,6 +4380,8 @@ class Seams:
     credential: Callable[..., dict] = run_credential
     #: set-limits (R1 F5): its own branch in :func:`run`, never the install plan's generic path.
     limits: Callable[..., dict] = run_set_limits
+    #: set-ceiling: its own branch in :func:`run`, as set-limits'.
+    ceiling: Callable[..., dict] = run_set_ceiling
     #: routes-base / routes-trust (3c-9): their own branches in :func:`run`, as set-limits'.
     routes_base: Callable[..., dict] = run_routes_base
     routes_trust: Callable[..., dict] = run_routes_trust
@@ -4350,6 +4436,10 @@ def run(argv: Sequence[str], *, env: Mapping[str, str], seams: Seams, err: TextI
         # As the credential verbs: no host plan, no pool hold, no live-lease count (a held slot session waits on this
         # very raise); the operator check and the document's check come before the lock, which run_set_limits takes.
         return seams.limits(caller_uid, host, read=seams.stdin, lock=lambda: seams.lock(host), err=err)
+    if cmd.verb == "set-ceiling":
+        # As set-limits: one root file, no host plan, no pool hold, no live-lease count; the operator check and the
+        # document's check come before the lock, which run_set_ceiling takes.
+        return seams.ceiling(caller_uid, host, read=seams.stdin, lock=lambda: seams.lock(host), err=err)
     if cmd.verb == "routes-base":
         # As set-limits: one root file, no host plan, no pool hold (keys re-reads base.json at every Q).
         return seams.routes_base(caller_uid, host, lock=lambda: seams.lock(host), err=err)
@@ -4419,7 +4509,7 @@ INSTALL_ENTRY_ENV = ("SUDO_UID",)
 __all__ = ["ContinueSeams", "PROBE_OUT_CAP", "PROBE_TIMEOUT_S", "adopt_lock", "exec_phase_b", "phase_b_text",
            "plan_repair_stage", "plan_repair_resume", "check_fault", "fault_hook", "FAULT_POINTS", "FAULT_STEPS", "probe_text", "repair_continue", "repair_handover", "HANDOVER_ABI", "repair_probe", "run_probe",
            "RepairFacts", "desired_managed", "install_shape_path", "plan_only_report", "plan_repair", "BUILT_VERBS", "CHILD_MARGIN_S", "CREDENTIAL_VERBS", "INSTALL_ENTRY_ENV", "KEYS_ACCOUNT", "Directory", "Gathered", "HostFacts", "InstallPlan", "OPERATOR_FORMAT", "Seams",
-           "apply_steps", "check_account_ids", "drop_to_keys", "load_creds", "read_credential", "run_credential", "read_limits", "run_set_limits", "run_authority_signer", "authority_key_problem", "blob_fingerprint", "SIGNER_VERBS", "policy_limits_state", "policy_limits_undo_steps", "authority_signers_undo_steps", "run_purge", "check_tools", "count_live_leases", "live_lease_sessions", "extra_tools", "gather_facts",
+           "apply_steps", "check_account_ids", "drop_to_keys", "load_creds", "read_credential", "run_credential", "read_limits", "run_set_limits", "run_set_ceiling", "read_ceiling_doc", "run_authority_signer", "authority_key_problem", "blob_fingerprint", "SIGNER_VERBS", "policy_limits_state", "policy_limits_undo_steps", "authority_signers_undo_steps", "run_purge", "check_tools", "count_live_leases", "live_lease_sessions", "extra_tools", "gather_facts",
            "helper_pending", "main", "operator_record", "operator_record_text", "parse_operator_record",
            "plan_for", "plan_replenish", "plan_setup", "plan_tools", "plan_undo", "pool_lock", "preflight", "Quiesce",
            "quiesce_step",

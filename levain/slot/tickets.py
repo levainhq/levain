@@ -364,6 +364,15 @@ def read_ceiling(path: Path, owner: int = 0) -> Ceiling:
         data = os.read(fd, CEILING_MAX + 1)
     finally:
         os.close(fd)
+    return parse_ceiling(data)
+
+
+def parse_ceiling(data: bytes) -> Ceiling:
+    """The ceiling document's bytes, checked whole: at most :data:`CEILING_MAX`, canonical JSON, exactly one format's
+    key set, every value a non-negative integer, a `/2` maximum within the run caps. Else `ticket-ceiling:file`. The
+    ONE check: :func:`read_ceiling` reads through it and the install helper's `set-ceiling` writes only what passes it."""
+    if len(data) > CEILING_MAX:
+        raise Refused("ticket-ceiling:file", "the ceiling is past the size cap")
     try:
         obj = canon.parse(data)
     except (ContractError, ValueError, RecursionError):
