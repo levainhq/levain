@@ -45,6 +45,8 @@ server may hold a session (the launcher contract: a launcher that cannot undo wh
 """
 from __future__ import annotations
 
+import base64
+import binascii
 import logging
 import re
 import socket
@@ -62,13 +64,15 @@ from typing import Any
 
 from levain.agents import controller as _ctl
 from levain.agents.accounting import ActionExposure, StopResult, Usage
-from levain.agents.session import S1_DISPATCH, SessionLaunch
+from levain.agents.session import S1_DISPATCH, SessionLaunch, Workspace
 from levain.agents.session_launcher import LauncherRefused
 from levain.contracts import ContractError, canon
 
 __all__ = ["PROTOCOL", "RUN_FRAME_MAX", "LAUNCHER_NAME", "WAIT_SLICE_S", "WireError", "ProofUnavailable", "LinkRow",
            "LinkProof", "encode_run_frame", "read_run_frame", "check_run_request", "ok_answer", "refused_answer",
            "launch_to_wire", "launch_from_wire", "usage_to_wire", "usage_from_wire", "link_proof",
+           "WS_CHUNK_BYTES", "WS_PARTS", "WsBegin", "ws_begin_to_wire", "ws_begin_from_wire", "ws_chunk_frames",
+           "ws_chunk_from_wire",
            "default_run_socket", "unix_connector", "DispatchSessionLauncher", "build_launcher", "AuthorityFeed"]
 
 _log = logging.getLogger("levain.agents.session_client")
@@ -234,6 +238,9 @@ class LinkProof:
 _ROW_KEYS = ("seq", "prev_hash", "record", "signer_fp", "signature")
 _EXPOSURE_KEYS = ("actions", "unit", "seconds", "tunnel_bytes")
 _LAUNCH_KEYS = ("occurrence_id", "session_key", "harness", "model", "brief", "auth", "exposure")
+#: OPTIONAL on the wire (an absent member is None), so a client that stages no workspace sends the frame it always sent
+_LAUNCH_OPTIONAL = ("workspace",)
+_WORKSPACE_KEYS = ("repo", "head", "withhold")
 _PROOF_KEYS = ("occurrence_id", "spec_hash", "link_id", "store_id", "born", "current")
 
 
@@ -253,10 +260,14 @@ def _row_from_wire(o: object, where: str) -> LinkRow:
 def launch_to_wire(launch: SessionLaunch, proof: LinkProof) -> dict[str, object]:
     """The LAUNCH body: the typed :class:`SessionLaunch` fields and the proof. No ticket, no run id, no mint field."""
     ex = launch.exposure
-    return {"launch": {"occurrence_id": launch.occurrence_id, "session_key": launch.session_key,
-                       "harness": launch.harness, "model": launch.model, "brief": launch.brief, "auth": launch.auth,
-                       "exposure": None if ex is None else {"actions": ex.actions, "unit": ex.unit,
-                                                            "seconds": ex.seconds, "tunnel_bytes": ex.tunnel_bytes}},
+    body = {"occurrence_id": launch.occurrence_id, "session_key": launch.session_key,
+            "harness": launch.harness, "model": launch.model, "brief": launch.brief, "auth": launch.auth,
+            "exposure": None if ex is None else {"actions": ex.actions, "unit": ex.unit,
+                                                 "seconds": ex.seconds, "tunnel_bytes": ex.tunnel_bytes}}
+    ws = launch.workspace
+    if ws is not None:         # the manifest digest is the server's own derivation and never travels (Workspace)
+        body["workspace"] = {"repo": ws.repo, "head": ws.head, "withhold": list(ws.withhold)}
+    return {"launch": body,
             "proof": {"occurrence_id": proof.occurrence_id, "spec_hash": proof.spec_hash, "link_id": proof.link_id,
                       "store_id": proof.store_id, "born": _row_to_wire(proof.born),
                       "current": _row_to_wire(proof.current)}}
@@ -267,7 +278,7 @@ def launch_from_wire(request: Mapping[str, object]) -> tuple[SessionLaunch, Link
     occurrence must be the launch's own."""
     body = {k: v for k, v in request.items() if k not in ("p", "op", "id")}
     body = _exact(body, ("launch", "proof"), "LAUNCH")
-    lo = _exact(body["launch"], _LAUNCH_KEYS, "launch")
+    lo = _exact(body["launch"], _LAUNCH_KEYS, "launch", optional=_LAUNCH_OPTIONAL)
     ex = lo["exposure"]
     exposure = None
     if ex is not None:
@@ -275,11 +286,21 @@ def launch_from_wire(request: Mapping[str, object]) -> tuple[SessionLaunch, Link
         exposure = ActionExposure(_int(ex["actions"], "exposure.actions"), _str(ex["unit"], "exposure.unit", max_len=32),
                                   _int(ex["seconds"], "exposure.seconds"),
                                   _int(ex["tunnel_bytes"], "exposure.tunnel_bytes", none=True))
+    workspace = None
+    if "workspace" in lo:
+        wo = _exact(lo["workspace"], _WORKSPACE_KEYS, "launch.workspace")
+        if type(wo["withhold"]) is not list:
+            raise WireError("launch.workspace.withhold is not a list")
+        try:
+            workspace = Workspace(_str(wo["repo"], "workspace.repo", max_len=4096),
+                                  _str(wo["head"], "workspace.head", max_len=40), tuple(wo["withhold"]))
+        except ValueError as exc:         # the dataclass's own shape check, as a frame the connection is dropped for
+            raise WireError(str(exc)) from None
     launch = SessionLaunch(_str(lo["occurrence_id"], "occurrence_id", max_len=128),
                            _str(lo["session_key"], "session_key", max_len=128),
                            _str(lo["harness"], "harness", max_len=64), _str(lo["model"], "model", max_len=256),
                            _str(lo["brief"], "brief", max_len=RUN_FRAME_MAX), _str(lo["auth"], "auth", max_len=32),
-                           exposure)
+                           exposure, workspace)
     po = _exact(body["proof"], _PROOF_KEYS, "proof")
     proof = LinkProof(_str(po["occurrence_id"], "proof.occurrence_id", max_len=128),
                       _str(po["spec_hash"], "proof.spec_hash", max_len=128),
@@ -289,6 +310,77 @@ def launch_from_wire(request: Mapping[str, object]) -> tuple[SessionLaunch, Link
     if proof.occurrence_id != launch.occurrence_id:
         raise WireError("the proof names another occurrence than the launch")
     return launch, proof
+
+
+# --- the workspace upload (levain 34, W1) ---------------------------------------------------------------------------------
+#
+# The bundle cannot ride the LAUNCH frame (RUN_FRAME_MAX), and the workspace member names no bytes, so two ops before it,
+# on the connection the LAUNCH will use: WSBEGIN declares the two parts (the canonical manifest and the bundle: sizes and
+# sha256 digests), WSDATA carries one bounded chunk of one part. The chunking follows SYNC's: a bound well under one frame
+# (base64 grows a chunk by a third), in order, each answered. The server holds the parts until the LAUNCH of the SAME
+# session key consumes them or the connection ends. Only the shape is here; the bytes are the operator-uid side's to build.
+
+#: [judged] raw bytes per WSDATA chunk: 192 KiB is 256 KiB of base64, half of RUN_FRAME_MAX, whatever the framing adds
+WS_CHUNK_BYTES = 192 * 1024
+WS_PARTS = ("manifest", "bundle")
+_WS_BEGIN_KEYS = ("session_key", "manifest_size", "manifest_sha256", "bundle_size", "bundle_sha256")
+_WS_DATA_KEYS = ("session_key", "part", "offset", "data")
+_WS_DIGEST = re.compile(r"sha256:[0-9a-f]{64}")
+
+
+@dataclass(frozen=True)
+class WsBegin:
+    """A decoded WSBEGIN: the session key the upload belongs to and, per part, its declared size and sha256 digest."""
+    session_key: str
+    sizes: Mapping[str, int]
+    digests: Mapping[str, str]
+
+
+def ws_begin_to_wire(session_key: str, manifest: bytes, bundle: bytes) -> dict[str, object]:
+    """The WSBEGIN fields for these two parts' bytes (the op and id are the sender's)."""
+    import hashlib
+    return {"session_key": session_key, "manifest_size": len(manifest),
+            "manifest_sha256": "sha256:" + hashlib.sha256(manifest).hexdigest(),
+            "bundle_size": len(bundle), "bundle_sha256": "sha256:" + hashlib.sha256(bundle).hexdigest()}
+
+
+def ws_begin_from_wire(request: Mapping[str, object]) -> WsBegin:
+    body = _exact({k: v for k, v in request.items() if k not in ("p", "op", "id")}, _WS_BEGIN_KEYS, "WSBEGIN")
+    sizes, digests = {}, {}
+    for part in WS_PARTS:
+        sizes[part] = _int(body[f"{part}_size"], f"{part}_size", lo=1)
+        d = _str(body[f"{part}_sha256"], f"{part}_sha256", max_len=71)
+        if _WS_DIGEST.fullmatch(d) is None:
+            raise WireError(f"{part}_sha256 is not sha256: + 64 lowercase hex")
+        digests[part] = d
+    return WsBegin(_str(body["session_key"], "session_key", max_len=128), sizes, digests)
+
+
+def ws_chunk_frames(session_key: str, part: str, data: bytes):
+    """Yield the WSDATA fields that carry ``data`` (one part's bytes) in order: ``WS_CHUNK_BYTES`` at a time."""
+    if part not in WS_PARTS:
+        raise WireError(f"part {part!r} is not one of {WS_PARTS}")
+    for off in range(0, len(data), WS_CHUNK_BYTES):
+        yield {"session_key": session_key, "part": part, "offset": off,
+               "data": base64.b64encode(data[off:off + WS_CHUNK_BYTES]).decode("ascii")}
+
+
+def ws_chunk_from_wire(request: Mapping[str, object]) -> tuple[str, str, int, bytes]:
+    """``(session_key, part, offset, raw bytes)`` of a WSDATA, or :class:`WireError`: the part is one of
+    :data:`WS_PARTS`, the data is canonical base64 of 1..``WS_CHUNK_BYTES`` bytes."""
+    body = _exact({k: v for k, v in request.items() if k not in ("p", "op", "id")}, _WS_DATA_KEYS, "WSDATA")
+    part = body["part"]
+    if part not in WS_PARTS:
+        raise WireError(f"part is not one of {WS_PARTS}")
+    text = _str(body["data"], "data", max_len=4 * ((WS_CHUNK_BYTES + 2) // 3) + 4)
+    try:
+        raw = base64.b64decode(text.encode("ascii"), validate=True)
+    except (binascii.Error, UnicodeEncodeError, ValueError):
+        raise WireError("data is not base64") from None
+    if not 0 < len(raw) <= WS_CHUNK_BYTES or base64.b64encode(raw).decode("ascii") != text:
+        raise WireError("data is not canonical base64 of 1..WS_CHUNK_BYTES bytes")
+    return (_str(body["session_key"], "session_key", max_len=128), part,
+            _int(body["offset"], "offset"), raw)  # type: ignore[return-value]
 
 
 _USAGE_KEYS = ("usd_micros", "input_tokens", "output_tokens", "source", "actions", "tunnel_bytes", "seconds")

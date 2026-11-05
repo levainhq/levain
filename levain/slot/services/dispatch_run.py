@@ -8,6 +8,14 @@ uid's client (:mod:`levain.agents.session_client`, wire ``levain-run/1``) on a u
   in-server retry), then ``RealLauncher.spawn`` unchanged, under a holder permit (:data:`MAX_HOLDERS`, below the
   connection cap so USAGE and END always find one; none free is a transient ``no-holder-capacity``). The answer is
   ``{session}``; no ticket, no run id.
+* **A workspace upload** (levain 34, W1; :mod:`levain.slot.workspace`). A LAUNCH whose ``launch.workspace`` member is set
+  is preceded, on the same connection, by ``WSBEGIN`` (the two parts' sizes and sha256 digests) and ``WSDATA`` chunks
+  (bounded, in order, base64) of the canonical snapshot manifest and the git bundle. After the authority check and
+  before the pool check or any mint, the LAUNCH verifies the upload (hash identity: the server re-derives the commit and
+  the object count from the manifest, ingests the bundle in a scratch clone, binds the repo-layer loosening check) and
+  refuses ``session_refused:workspace`` on any mismatch, with nothing staged and a zero-usage ``refused`` record; the
+  slot runtime later writes the verified bytes to ``staging/repo.bundle``. The connection ending drops an upload no
+  LAUNCH took.
 * **RELEASE re-runs** :func:`verify_point_of_use` with the LAUNCH's proof and exposure: a link that expired, was revoked
   or barred while the slot was prepared releases nothing, and the child is ABORTed and ENDed.
 * **The holder is the lifeline** (design 3.4): EOF before RELEASE is ABORT (nothing ran) then END, EOF after RELEASE is
@@ -48,6 +56,7 @@ already had over the live files; it can forge no signature and cannot roll the r
 from __future__ import annotations
 
 import argparse
+import dataclasses
 import hashlib
 import logging
 import os
@@ -74,6 +83,7 @@ from levain.agents.authority_replica import AuthorityReplica, ReplicaRefused, Re
 from levain.agents.accounting import ActionExposure, StopResult
 from levain.agents.session_launcher import LauncherRefused, RealLauncher, SessionIndex
 from levain.slot import Refused
+from levain.slot import workspace as WS
 from levain.slot.layout import RUN, STORE
 
 NAME = "dispatch_run"
@@ -376,11 +386,13 @@ class RunServer:
                  verify: Callable[[C.LinkProof, Optional[ActionExposure], Optional[FrameClaims]], None],
                  pool_free: Callable[[], bool], peer_ok: Callable[[socket.socket], bool],
                  holder_idle_s: float = HOLDER_IDLE_S, max_connections: int = MAX_CONNECTIONS,
-                 max_holders: int = MAX_HOLDERS, replica: Optional[AuthorityReplica] = None) -> None:
+                 max_holders: int = MAX_HOLDERS, replica: Optional[AuthorityReplica] = None,
+                 uploads: Optional[WS.WorkspaceUploads] = None) -> None:
         if not 0 < max_holders < max_connections:
             raise ValueError("holders must be capped below the connection cap (USAGE and END need a permit)")
         self.launcher, self._verify, self._pool_free, self._peer_ok = launcher, verify, pool_free, peer_ok
         self._replica = replica
+        self._uploads = uploads           # None: this server stages no workspace (a LAUNCH naming one is refused)
         self._idle = holder_idle_s
         self._mu = threading.Condition(threading.Lock())
         self._jobs: dict[str, _EndJob] = {}
@@ -398,6 +410,7 @@ class RunServer:
             sock.close()
             return
         mine: Optional[_Holder] = None
+        owner = WS.UploadOwner()          # the workspace uploads this connection began (dropped if no LAUNCH took them)
         try:
             try:
                 if not self._peer_ok(sock):
@@ -419,7 +432,7 @@ class RunServer:
                                                        else "bad-request", str(exc)))
                     return
                 try:
-                    ans, mine = self._op(op, req, rid, mine)
+                    ans, mine = self._op(op, req, rid, mine, owner)
                 except LauncherRefused as exc:
                     ans = C.refused_answer(rid, exc.name, exc.detail, exc.reason_class)
                 except C.WireError as exc:
@@ -431,6 +444,8 @@ class RunServer:
                 if not self._send(sock, ans):
                     return
         finally:
+            if self._uploads is not None:
+                self._uploads.drop_owner(owner)
             if mine is not None:
                 self._finish(mine, HOLDER_END_WAIT_S)
             try:
@@ -457,20 +472,30 @@ class RunServer:
             raise C.WireError(f"unexpected {sorted(extra)} missing {sorted(missing)}")
         return {n: req[n] for n in names}
 
-    def _op(self, op: str, req: dict, rid: int, mine: Any) -> tuple[dict, Any]:
+    def _op(self, op: str, req: dict, rid: int, mine: Any, owner: Optional[WS.UploadOwner] = None
+            ) -> tuple[dict, Any]:
         if op == "LAUNCH":
             if mine is not None:
                 raise C.WireError("one launch per connection")
             claims = self._claims(req, bar=True)
             launch, proof = C.launch_from_wire({k: v for k, v in req.items() if k not in ("ledger_head", "bar")})
             self._verify(proof, launch.exposure, claims)
+            launch = self._workspace_of(launch, owner)
             self._pool()
-            holder = self._spawn(launch, proof, claims)
+            try:
+                holder = self._spawn(launch, proof, claims)
+            finally:
+                if self._uploads is not None:     # the stager consumed it at start; a refused or failed spawn did not
+                    self._uploads.drop(launch.session_key)
             try:
                 return C.ok_answer(rid, session=holder.child.session), holder
             except BaseException:
                 self._finish(holder, 0.0)
                 raise
+        if op in ("WSBEGIN", "WSDATA"):
+            if mine is not None or owner is None:
+                raise C.WireError("a workspace upload precedes the LAUNCH on its connection")
+            return self._upload_op(op, req, rid, owner), mine
         if op == "SYNC":
             return self._sync(rid, self._fields(req, "rows")["rows"]), mine
         if op == "USAGE":
@@ -519,6 +544,41 @@ class RunServer:
                 return C.ok_answer(rid, exited=False, returncode=None), mine
             return C.ok_answer(rid, exited=True, returncode=rc), mine
         raise C.WireError(f"unknown op {op!r}")
+
+    # -- the workspace upload (levain 34, W1) ------------------------------------------------------------------------------
+
+    def _upload_op(self, op: str, req: dict, rid: int, owner: WS.UploadOwner) -> dict:
+        """WSBEGIN / WSDATA: the frames that carry the snapshot manifest and bundle ahead of a LAUNCH. A frame off the
+        shape drops the connection (``WireError``); a refusal by the upload (over cap, out of order, no capacity)
+        answers by name and, for a refused chunk, has already dropped the upload."""
+        if self._uploads is None:
+            raise WS.WorkspaceRefused("unavailable", "this server stages no workspace")
+        if op == "WSBEGIN":
+            b = C.ws_begin_from_wire(req)
+            self._uploads.begin(self._key(b.session_key), owner, b.sizes, b.digests)
+            return C.ok_answer(rid)
+        key, part, offset, raw = C.ws_chunk_from_wire(req)
+        return C.ok_answer(rid, received=self._uploads.chunk(self._key(key), owner, part, offset, raw))
+
+    def _workspace_of(self, launch: Any, owner: Optional[WS.UploadOwner]) -> Any:
+        """The LAUNCH's workspace judgment, after the authority check and before the pool check or any mint: the launch
+        itself when it names none and no upload exists; the launch with its member's ``manifest_digest`` filled by the
+        server's own derivation when the upload verifies; else ``session_refused:workspace``, recorded as the zero-usage
+        ``refused`` tombstone (:meth:`RealLauncher.refuse_key`) so the fire's usage read settles at nothing."""
+        try:
+            if self._uploads is None:
+                if launch.workspace is None:
+                    return launch
+                raise WS.WorkspaceRefused("unavailable", "this server stages no workspace")
+            ws = self._uploads.verify(launch.session_key, owner if owner is not None else WS.UploadOwner(),
+                                      launch.workspace)
+        except WS.WorkspaceRefused as exc:
+            _log.warning("workspace refused for %s: %s", launch.session_key, exc.cause)
+            refuse = getattr(self.launcher, "refuse_key", None)
+            if refuse is not None:
+                refuse(launch.session_key, WS.WORKSPACE_REFUSAL, occurrence_id=launch.occurrence_id)
+            raise
+        return launch if ws is None else dataclasses.replace(launch, workspace=ws)
 
     @staticmethod
     def _key(v: object) -> str:
@@ -859,8 +919,11 @@ def build_server(host: str, store: Path, control_sock: Path, operator_uid: int) 
     from levain.slot.dispatch_runtime import DispatchControlPort, HelperSlotRuntime
     index_dir = store / "dispatch" / "sessions"
     replica = AuthorityReplica(store / "dispatch" / "authority")
+    uploads = WS.WorkspaceUploads(store / "dispatch" / "workspace")     # the verify's scratch; the runtime stages from it
+    uploads.sweep()
     launcher = RealLauncher(DispatchControlPort(control_sock),
-                            HelperSlotRuntime(host=host, control_socket=control_sock, store=store),
+                            HelperSlotRuntime(host=host, control_socket=control_sock, store=store,
+                                              workspace=uploads.stage),
                             bound_usage_sources(queue_root=store / "queue", store=store, index_dir=index_dir),
                             SessionIndex(index_dir))
     pool = DispatchControlPort(control_sock, ops=frozenset({"POOL"}))
@@ -870,7 +933,7 @@ def build_server(host: str, store: Path, control_sock: Path, operator_uid: int) 
         return type(ans.get("egress_free")) is int and ans["egress_free"] > 0
 
     return RunServer(launcher, verify=replica_verifier(replica), pool_free=pool_free,
-                     peer_ok=lambda s: peer_uid(s) == operator_uid, replica=replica)
+                     peer_ok=lambda s: peer_uid(s) == operator_uid, replica=replica, uploads=uploads)
 
 
 def service_row():
