@@ -1060,7 +1060,8 @@ def decide_ex(event: Any, queue: ConsentQueue, settings: AdapterSettings, *, env
         if got is None and wait > 0:
             # a hold will run: his devices hear of the request now, as the gate pings its filed request (Phill 11-02,
             # np-e642162b (a)); `held` is true only when the hold ran and its ping started
-            held = hold_ping(settings, queue.directory, AGENT, _notice_what(tool_name, tool_input), request.id, wait)
+            held = hold_ping(settings, queue.directory, AGENT, _notice_what(tool_name, tool_input), request.id, wait,
+                             request=request)
             wait = min(wait, max(0.0, deadline - clock()))   # the ping's spawn time comes out of the hold, not the reserve
             held = held and wait > 0   # the spawn can have used the whole wait: then no hold runs and the dialog's notice goes (L3 round c)
             got, back = hold_for_answer(queue, request, wait, tool_input=tool_input, posture=posture,
@@ -1420,7 +1421,7 @@ def ping_configured(settings: AdapterSettings, queue_dir: Path | str | None) -> 
 
 
 def notify(settings: AdapterSettings, message: str, *, cwd: Path | str | None = None, kind: str = "consent",
-           ref: str | None = None) -> bool:
+           ref: str | None = None, request: Any = None) -> bool:
     """Ping the operator (R-f): start ``notify_argv`` + ``[message]``, detached, never waited on, in ``cwd`` (the
     queue directory from the gate; the home directory when none is given), never the project the agent works in.
     The command is an absolute path or a bare name found on the child's ``PATH`` as an absolute path; a relative
@@ -1436,8 +1437,9 @@ def notify(settings: AdapterSettings, message: str, *, cwd: Path | str | None = 
     is no queue directory, so nothing is recorded and no push is sent.
     True when the notify command or a push started; False when neither is configured or neither could start (a
     command that did not start is still written to the record, as not started). A failed ping never fails the
-    gate."""
-    started, pushed, _recorded = _notify_ex(settings, message, cwd=cwd, kind=kind, ref=ref)
+    gate. ``request`` (the sealed request, given by a ping about one held for a signed answer) adds the HELD event's
+    variables to the notify command's environment (:mod:`levain.consent.band_notice`)."""
+    started, pushed, _recorded = _notify_ex(settings, message, cwd=cwd, kind=kind, ref=ref, request=request)
     return started or pushed
 
 
@@ -1459,11 +1461,33 @@ def _ping_title(kind: str, ref: str | None) -> str:
     return CONSENT_PING_TITLE if approval and isinstance(ref, str) and ref.startswith("request:") else "levain"
 
 
+def _held_event(settings: AdapterSettings, cwd: Path | str | None, request: Any) -> dict[str, str] | None:
+    """The HELD event's variables for ``request`` when a notify command will carry them, its mark made first (the
+    settle announcement is owed to a command that was told); None when there is nothing to carry them or the mark
+    or the variables could not be made."""
+    if request is None or cwd is None or not settings.notify_argv:
+        return None
+    from levain.consent import band_notice
+
+    if not band_notice.mark_held(cwd, request.id):
+        return None
+    try:
+        return band_notice.held_env(cwd, request)
+    except Exception:  # noqa: BLE001 - a ping is optional
+        band_notice.unmark_held(cwd, request.id)
+        return None
+
+
 def _notify_ex(settings: AdapterSettings, message: str, *, cwd: Path | str | None, kind: str,
-               ref: str | None) -> tuple[bool, bool, bool]:
+               ref: str | None, request: Any = None) -> tuple[bool, bool, bool]:
     """:func:`notify`'s work: (the notify command started, a push started, the ping's record child started). A ping a
     mute holds is recorded (queued for the phone) and not pushed: ``(…, False, True)``."""
-    started = _notify_argv(settings, message, cwd=cwd)
+    held = _held_event(settings, cwd, request)
+    started = run_notify_command(settings, message, cwd=cwd, env_extra=held)
+    if held is not None and not started:
+        from levain.consent import band_notice
+
+        band_notice.unmark_held(cwd, request.id)    # type: ignore[arg-type]  # held is None unless both were given
     pushed = recorded = False
     if cwd is not None:
         try:
@@ -1488,7 +1512,7 @@ def _notify_ex(settings: AdapterSettings, message: str, *, cwd: Path | str | Non
 
 
 def hold_ping(settings: AdapterSettings, queue_dir: Path | str, agent: str, what: str, request_id: str,
-              wait: float) -> bool:
+              wait: float, *, request: Any = None) -> bool:
     """Phill 11-02 (np-e642162b (a)): *"yes we DO want these to be able to find us ASAP"*. The ping for a
     PermissionRequest filed and about to be held for a signed answer (an away hold that will run: ``wait`` above zero),
     sent exactly as the PreToolUse gate pings its filed request (:func:`notify`, kind ``consent``, ref
@@ -1496,11 +1520,12 @@ def hold_ping(settings: AdapterSettings, queue_dir: Path | str, agent: str, what
     request id was minted for this very call, so nothing can have pinged it yet and there is no dedupe read here (a
     read that faults would read as "already pinged" and silence both this ping and the dialog's notice: L3 round c).
     True when the ping was started (the notify command, a push, or the record child that queues a held one); False
-    when nothing could start, so the caller lets the dialog's prompt notice go. Never raises."""
+    when nothing could start, so the caller lets the dialog's prompt notice go. Never raises. ``request`` (the sealed
+    request the hold filed) adds the HELD event's variables to the notify command (:mod:`levain.consent.band_notice`)."""
     ref = f"request:{request_id}"
     try:
         started, pushed, recorded = _notify_ex(
-            settings, hold_message(agent, what, wait), cwd=queue_dir, kind="consent", ref=ref)
+            settings, hold_message(agent, what, wait), cwd=queue_dir, kind="consent", ref=ref, request=request)
         return started or pushed or recorded
     except Exception:  # noqa: BLE001 - a failed ping never fails the hook
         return False
@@ -1542,7 +1567,12 @@ def prompt_notice(queue_dir: Path | str | None, agent: str, what: str, ref: str,
         return False
 
 
-def _notify_argv(settings: AdapterSettings, message: str, *, cwd: Path | str | None) -> bool:
+def run_notify_command(settings: AdapterSettings, message: str, *, cwd: Path | str | None,
+                       env_extra: Mapping[str, str] | None = None, phone_url: bool = True) -> bool:
+    """Start the ``notify_argv`` command with ``message`` as its last argument (the phone page's link after it when
+    ``phone_url``), detached. ``env_extra`` is added to the child's environment, which is the allowlist
+    (:func:`levain.launch.child_env`) and nothing else besides: the consent event variables
+    (:mod:`levain.consent.band_notice`). True when the command started."""
     if not settings.notify_argv:
         return False
     import shutil
@@ -1550,10 +1580,12 @@ def _notify_argv(settings: AdapterSettings, message: str, *, cwd: Path | str | N
 
     from levain.launch import child_env
 
-    text = message if settings.phone_url is None else f"{message} {settings.phone_url}"
+    text = message if settings.phone_url is None or not phone_url else f"{message} {settings.phone_url}"
     try:
         # child_env: the allowlisted environment, never the agent session's whole one (its tokens among it)
         env = child_env()
+        if env_extra:
+            env.update(env_extra)
         command = settings.notify_argv[0]
         if "/" not in command:
             command = shutil.which(command, path=env.get("PATH", os.defpath)) or ""
@@ -1911,7 +1943,8 @@ def _gate_call(event: Mapping[str, Any], queue: ConsentQueue, settings: AdapterS
         return _pre("deny", f"levain: the gate failed ({type(exc).__name__}), so the action was NOT taken: {what}. "
                     "Do not retry it and do not achieve it another way.", **_stop(tier, what, "the gate failed."))
     try:
-        notify(settings, hold_message(AGENT, what, hold), cwd=queue.directory, ref=f"request:{request.id}")
+        notify(settings, hold_message(AGENT, what, hold), cwd=queue.directory, ref=f"request:{request.id}",
+               request=request)
         if posture in ATTENDED_POSTURES and still_away is not None:
             # held only because he was away (above): re-read away as the PermissionRequest hold does, and when it
             # ends hand the call back to Claude Code's dialog (L3 r1 complement 1 = codex 2)

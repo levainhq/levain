@@ -124,6 +124,7 @@ import os
 import pwd
 import re
 import sqlite3
+import threading
 import time
 import warnings
 from collections.abc import Callable, Iterator, Mapping
@@ -894,6 +895,8 @@ class ConsentQueue:
         self._ready = False
         # a stored leave's verdict by its whole row (:meth:`away_mark`): one verify per queue, so per hook process
         self._leave_verdicts: dict[tuple[Any, ...], str | None] = {}
+        # the requests a write transaction moved out of ``pending``, per thread, until it commits (:meth:`_write`)
+        self._moved = threading.local()
 
     # --- store ---------------------------------------------------------------------------------------
     def _check_directory(self) -> None:
@@ -954,8 +957,28 @@ class ConsentQueue:
 
     @contextmanager
     def _write(self) -> Iterator[sqlite3.Connection]:
-        with write_transaction(self._connect) as conn:
-            yield conn
+        """One write transaction. Every request it moves out of ``pending`` is announced to the notify command that was
+        told of it, AFTER the commit (:func:`levain.consent.band_notice.announce_settled`), so a rolled-back move
+        announces nothing and a failed announcement changes nothing. The queue's own ``pending`` -> X move is the one
+        place the answer, the withdrawal and the expiry share, whichever process makes them."""
+        outer = getattr(self._moved, "list", None)
+        mine: list[tuple[ExternalGateRequest, str]] = []
+        self._moved.list = mine
+        try:
+            with write_transaction(self._connect) as conn:
+                yield conn
+        finally:
+            self._moved.list = outer
+        for request, state in mine:
+            self._announce_settled(request, state)
+
+    def _announce_settled(self, request: ExternalGateRequest, state: str) -> None:
+        try:
+            from levain.consent.band_notice import announce_settled
+
+            announce_settled(self.directory, request, state)
+        except Exception:  # noqa: BLE001 - a notice never changes a decision
+            pass
 
     @contextmanager
     def _read(self) -> Iterator[sqlite3.Connection]:
@@ -1297,6 +1320,9 @@ class ConsentQueue:
                         (state, stamp, answer, signature, signer_fp, note, via, request.id, from_state)
                         ).rowcount != 1:
             return False
+        moved = getattr(self._moved, "list", None)
+        if from_state == "pending" and moved is not None:
+            moved.append((request, state))
         conn.execute("INSERT INTO receipts (request_id, state, created_at, face) VALUES (?, ?, ?, ?)",
                      (request.id, state, stamp, json.dumps(self._face(request, state, signer_fp, grant, gap),
                                                            ensure_ascii=False, sort_keys=True)))
