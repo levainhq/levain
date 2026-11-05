@@ -55,9 +55,10 @@
     return { text: m[1].trim() + (rest ? "\n" + rest : ""), tag: "tool_use_error" };
   }
   // the vendor's own refusal sentences, matched at the start of the unwrapped text (not a word anywhere in it)
-  var REFUSED = [/^File is in a directory that is denied by your permission settings/, /^Permission to use [^\n]*? has been denied/,
-                 /^[^\n]*? is outside [^\n]*?blocks reads outside/];
-  function refused(text) { return REFUSED.some(function (re) { return re.test(text); }); }
+  var REFUSED = [/^File is in a directory that is denied by your permission settings/, /^Permission to use [^\n]{1,100} has been denied/,
+                 /^[^\n;]{1,300} is outside [^\n;]{1,300}; the permissions\.blockReadsOutsideWorkingDirectories setting blocks reads outside the working directories/];
+  // only the head of the text is tested: the vendor's sentences are short, and a very long error body costs nothing
+  function refused(text) { var head = String(text).slice(0, 700); return REFUSED.some(function (re) { return re.test(head); }); }
   // the head's words for a row: its speaker, else a short sentence for what the row is
   function headWords(l) {
     if (l.who) return l.who;

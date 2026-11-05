@@ -164,9 +164,10 @@ def test_only_the_vendors_error_tag_is_removed_and_any_other_body_is_drawn_as_re
 def test_a_tool_is_called_refused_only_by_the_vendors_own_refusal_sentences(tmp_path, w):
     wrap = lambda t: "<tool_use_error>%s</tool_use_error>" % t
     bodies = [wrap("File is in a directory that is denied by your permission settings."), wrap("Permission to use Bash has been denied."),
-              wrap(OUTSIDE), wrap("File not found: /home/permissions/x"), wrap("This was refused by the shell"), OUTSIDE]
-    g = _lines(tmp_path, w, _results(*bodies), 6)
-    assert [x["head"].split(" — ")[0] for x in g] == ["A tool was refused"] * 3 + ["A tool failed"] * 2 + ["A tool result"], g
+              wrap(OUTSIDE), wrap("File not found: /home/permissions/x"), wrap("This was refused by the shell"), OUTSIDE,
+              wrap("README.md is outside this section; its guide blocks reads outside examples")]    # a look-alike of the third phrase (L3 r2 codex)
+    g = _lines(tmp_path, w, _results(*bodies), 7)
+    assert [x["head"].split(" — ")[0] for x in g] == ["A tool was refused"] * 3 + ["A tool failed"] * 2 + ["A tool result"] + ["A tool failed"], g
     # the untagged denial (the vendor sends it without the wrapper) reads "A tool result": is_error is not carried through the
     # timeline, a known edge pinned here so a change to it is deliberate
 
