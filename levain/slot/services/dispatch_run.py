@@ -27,7 +27,8 @@ uid's client (:mod:`levain.agents.session_client`, wire ``levain-run/1``) on a u
   RELEASE refuses); a TRANSIENT one ends nothing and logs, and the next SYNC (an empty one included) judges again. A
   session whose END job finished UNPROVEN is judged again on every SYNC, and a standing refusal retries its END; one
   whose job is in flight or proven is skipped. Expiry is not judged here (``FrameClaims.rejudge``): the design's stop reasons are revoke_agent,
-  revoke_grant, revoke_key, bar and raise, and an expiry never stopped a released session. No new
+  revoke_grant, revoke_key, bar and raise, and an expiry never stopped a released session; nor does a renewal of the
+  session's own link, whose new row the LAUNCH proof cannot name (levain 35, L3 lease r2). No new
   wire op and no new authority: the replica never moves backward, so a revoke judged once stays judged whatever a
   restored operator ledger later offers. The bar half is not seen here (bars travel only in frames; the held claims
   carry the LAUNCH's), so a bar stays the tick's. A ``raise`` that tightens a link's budgets below a running session's
@@ -36,7 +37,11 @@ uid's client (:mod:`levain.agents.session_client`, wire ``levain-run/1``) on a u
   him (skipping the exposure check in the re-judge is the cheap alternative). Known edges (L3 r1 LOWs, accepted): a
   transient refusal in the last pass before the SYNCs stop waits for the operator tick, since nothing re-runs a pass on a
   timer. A re-judge END of a never-released child does not ABORT it first; RELEASE's refusal or the holder's EOF cleanup
-  ABORTs it later, and that ABORT on a child the END already stopped is caught and harmless.
+  ABORTs it later, and that ABORT on a child the END already stopped is caught and harmless. Known edge (L3 lease r3,
+  accepted by the head): the re-judge's range check was written to take ANY authentic, active-signed ledger row in
+  [born, current) as the proof's current row, not only this link's own, because the stored LAUNCH proof was verified
+  exact at LAUNCH and so was meant to name this link's row; only a reconstructed proof could name an unrelated row
+  there, and a test pins that, so a later tightening changes it on purpose.
 * **The holder is the lifeline** (design 3.4): EOF before RELEASE is ABORT (nothing ran) then END, EOF after RELEASE is
   END, once; a session whose holder is gone stays registered only while its END is unproven. The holder's END is the
   key's END job (below), so a reaper's END on the same key joins it; every END attempt the child makes itself takes the
@@ -145,7 +150,7 @@ _END_STRIPES = 64
 def verify_point_of_use(proof: C.LinkProof, exposure: Optional[ActionExposure], *,
                         replay: Callable[[], Any], now: Callable[[], datetime],
                         bar_of: Callable[[str], tuple[bool, int]],
-                        verify_sig: Optional[Callable[..., bool]] = None, judge_time: bool = True) -> None:
+                        verify_sig: Optional[Callable[..., bool]] = None, rejudge: bool = False) -> None:
     """The run server's whole authority check for one fire. Raises :class:`LauncherRefused` (standing, or transient for
     a ledger or store that cannot be read); returns None when the fire may go on.
 
@@ -161,9 +166,20 @@ def verify_point_of_use(proof: C.LinkProof, exposure: Optional[ActionExposure], 
        (:func:`levain.authority.agent_link_arms`), and the agent has no open bar (``bar_of``);
     4. the requested exposure (calls and tunnel bytes) is inside the link's per-run budgets, on a subscription link.
 
-    ``judge_time=False`` (the SYNC re-judge of a session that is already running, never a LAUNCH or a RELEASE) drops
-    the time half of 3, expiry and the clock-behind-the-log check (:func:`levain.authority.agent_link_unrevoked`):
-    an expiry was never a reason to stop a running session.
+    ``rejudge=True`` (the SYNC re-judge of a session that is already running, never a LAUNCH or a RELEASE; the server
+    sets it, a frame never does) changes two things, and only these:
+    * it drops the time half of 3, expiry and the clock-behind-the-log check
+      (:func:`levain.authority.agent_link_unrevoked`): an expiry was never a reason to stop a running session;
+    * in 1, the proof's CURRENT row may be an earlier row than the link's current one, when the link was renewed while
+      the session ran (L3 lease r2 MED, codex: a renew moves ``grant_seqs``, and the exact check ENDed the healthy
+      session of the operator's own renewal). The proof's two rows must still be authentic rows of the ledger with
+      active signers, the born row exactly the link's born row (the same incarnation) and the current row at or after
+      it and before the link's current row; and the link's current row's signer must be active too. What can lie
+      between them is a renew and nothing else: an agent link's terms are fixed under its born row, and a replay
+      refuses any change to one but a ``renew``, which moves only its expiry
+      (:func:`levain.authority._agent_link_step_checks`). So the budgets judged in 4 are the very ones the session
+      launched under. The proof re-judged is the one this server's LAUNCH and RELEASE judged exactly; a LAUNCH or a
+      RELEASE with a proof the ledger has since moved past still refuses ``link-proof-mismatch``.
 
     Replacing this with a stronger per-occurrence check touches this function only."""
     verify_sig = verify_sig or _default_verify_sig()
@@ -179,8 +195,18 @@ def verify_point_of_use(proof: C.LinkProof, exposure: Optional[ActionExposure], 
     if not _auth.agent_link(grant) or born is None or current is None or grant["spec_hash"] != proof.spec_hash \
             or grant["store_id"] != proof.store_id:
         raise LauncherRefused("link-not-standing", "the link is not a standing agent link of this spec and store")
-    for row, want in ((proof.born, born), (proof.current, current)):
-        _row_is_the_ledgers(state, row, want, verify_sig)
+    if rejudge and proof.current.seq != current:
+        # a renewal while the session ran (docstring): the proof's current row is an earlier row of this incarnation
+        if not born <= proof.current.seq < current:
+            raise LauncherRefused("link-proof-mismatch", "the proof's row is not the link's row in the ledger")
+        _row_is_the_ledgers(state, proof.born, born, verify_sig)
+        _row_is_the_ledgers(state, proof.current, proof.current.seq, verify_sig)
+        renewed_by = state.keys.get(state.link_signers[current - 1])     # its signature: the replay verified it
+        if renewed_by is None or not renewed_by.active:
+            raise LauncherRefused("signer-not-active", "the link's signer is not an active enrolled key")
+    else:
+        for row, want in ((proof.born, born), (proof.current, current)):
+            _row_is_the_ledgers(state, row, want, verify_sig)
     try:
         barred, closed = bar_of(grant["agent_id"])
     except Exception as exc:  # noqa: BLE001
@@ -188,8 +214,8 @@ def verify_point_of_use(proof: C.LinkProof, exposure: Optional[ActionExposure], 
                               reason_class="transient") from None
     if barred:
         raise LauncherRefused("agent-barred", "a revoke is open for this agent")
-    live = (_auth.agent_link_arms(state, proof.link_id, now=now(), closed_bar_revoke_seq=closed) if judge_time
-            else _auth.agent_link_unrevoked(state, proof.link_id, closed_bar_revoke_seq=closed))
+    live = (_auth.agent_link_unrevoked(state, proof.link_id, closed_bar_revoke_seq=closed) if rejudge
+            else _auth.agent_link_arms(state, proof.link_id, now=now(), closed_bar_revoke_seq=closed))
     if not live:
         raise LauncherRefused("link-not-live", "the link is expired or was revoked")
     billing, calls, tunnel = _auth.agent_link_terms(grant)
@@ -230,7 +256,8 @@ class FrameClaims:
     """What a LAUNCH or RELEASE frame says about the operator's side: ``ledger_head`` is the client's verified
     ``(seq, hash)``; ``bar`` is ``(open bar?, highest closed bar's revoke_seq)`` of the agent. Neither is trusted beyond
     this: the replica must hold the head (it may be ahead of it), the bar is only bounded by the head's seq.
-    ``rejudge`` is never read from a frame: the server sets it for its own SYNC re-judge, which judges no expiry."""
+    ``rejudge`` is never read from a frame: the server sets it for its own SYNC re-judge, which judges no expiry and
+    keeps a session whose link was renewed while it ran (:func:`verify_point_of_use`)."""
     ledger_head: tuple[int, str]
     bar: tuple[bool, int]
     rejudge: bool = False
@@ -275,7 +302,7 @@ def replica_verifier(replica: AuthorityReplica, *,
         if held != digest:                  # the replica holds that seq (append-only, verified): another chain
             raise LauncherRefused("ledger-fork", "the claimed head is not on the replica's chain")
         verify_point_of_use(proof, exposure, replay=lambda: state, now=now, bar_of=lambda agent: (barred, closed),
-                            verify_sig=verify_sig, judge_time=not claims.rejudge)
+                            verify_sig=verify_sig, rejudge=claims.rejudge)
     return verify
 
 
@@ -782,7 +809,15 @@ class RunServer:
                 job = self._jobs.get(h.key)
             if job is not None and (not job.done.is_set() or job.result.terminated is True):
                 return
-        claims = None if h.claims is None else FrameClaims(h.claims.ledger_head, h.claims.bar, rejudge=True)
+        if h.claims is None:
+            # Unreachable by construction (L3 lease r2, deepseek MED): a re-judge runs only after a SYNC, a SYNC only
+            # on a server with a replica, and there every LAUNCH decodes its claims or is refused before a holder
+            # exists (``_claims``). Were it reached, the replica verifier would refuse ``ledger-head-missing``, a
+            # STANDING refusal, and this pass would END a session for a hole in its own record. A session with no
+            # claims has nothing the replica can judge it by, so it is skipped, by name; the operator tick still judges it.
+            _log.warning("SYNC re-judge of %s: the holder carries no frame claims; not judged, nothing ended", h.key)
+            return
+        claims = FrameClaims(h.claims.ledger_head, h.claims.bar, rejudge=True)
         try:
             self._verify(h.proof, h.exposure, claims)
             return
