@@ -132,7 +132,7 @@
     // the creation and the read of its key are separate steps: a passkey the device made but this page cannot read is said
     // aloud, by name, because it now sits in the device's passwords with nothing to enrol
     const read = (cred) => {
-      if (cred === made) return made;
+      if (cred && cred === made) return made;
       const r = cred.response;
       if (!r || typeof r.getPublicKey !== "function" || !r.getPublicKey()) {
         const e = new Error("no public key");
@@ -144,11 +144,14 @@
       return made;
     };
     return asked.then((cred) => {
-      try { return send(read(cred)); } catch (e) {
+      let kept;
+      try { kept = read(cred); } catch (e) {
         say("A passkey was made, and this browser cannot enrol it", "It did not give the page the passkey's public key (" + ((e && e.name) || "error")
             + "). A passkey named \"" + name + "\" now sits in this device's passwords with nothing to enrol: delete it there, then make one on a browser that can.");
         buttons([["Make a passkey", true, start]]);
+        return undefined;
       }
+      return send(kept);
     }, (e) => {
       say("No passkey was made", "This device did not make one (" + ((e && e.name) || "cancelled") + "). Nothing changed; tap to try again.");
       buttons([["Make a passkey", true, start]]);
