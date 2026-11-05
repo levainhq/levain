@@ -98,7 +98,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any, Iterable
 
 from levain.cockpit.broker import Broker, BrokerError, Lifecycle
-from levain.cockpit.firejournal import OFFER_TTL, PAIRED_PREFIX, DeviceRevoked, PairingError
+from levain.cockpit.firejournal import OFFER_TTL, PAIRED_PREFIX, REVOKE_MODES, DeviceRevoked, FamilyChanged, PairingError
 from levain.cockpit.shortcode import SHORT_MAX_FAILURES, SHORT_PAIRING_TTL
 from levain.cockpit.anneal_effects import (
     EPISODES,
@@ -184,9 +184,10 @@ _PENDING_ACTIONS = ("signature", "cancel")
 # claim is the one credential-less POST, matched exactly after the query strip, after the Host + CSRF layer 1 check.
 _PAIR_OFFER = "/cockpit/pair/offer"
 _PAIR_REVOKE = "/cockpit/pair/revoke"
+_PAIR_REVOKE_PREVIEW = "/cockpit/pair/revoke-preview"
 _PAIR_LIST = "/cockpit/pair/devices.json"
 _PAIR_CLAIM = "/cockpit/pair/claim"
-_PAIR_AUTHED_POST = frozenset({_PAIR_OFFER, _PAIR_REVOKE})
+_PAIR_AUTHED_POST = frozenset({_PAIR_OFFER, _PAIR_REVOKE, _PAIR_REVOKE_PREVIEW})
 _PAIR_BODY_MAX = 1024             # every pair POST's body cap (the claim's per RP-4; offer and revoke carry less)
 _PAIR_CLAIM_SLOTS = 2             # the claim's own semaphore, not the shared request gate (RP-4)
 _PAIR_VERIFY_SLOTS = 4            # paired lookups in flight, taken before the broker start / lookup (RT-3)
@@ -1299,7 +1300,7 @@ _RESERVED_PATHS: frozenset[str] = frozenset(_ASSETS) | {
     "/cockpit/manifest.json", "/cockpit/freshness.json", EVENTS_PATH, _COCKPIT_VERB_PATH, _SIGN_LIST_PATH,
     _BAND_PATH, _GRANT_LIST_PATH, cockpit_threads.THREADS_LIST_PATH, cockpit_room.ROOM_PATH, _COORD_LIST, _COORD_SHEET,
     cockpit_board.BOARD_PATH, _DISPATCH_LIST, _KEY_LINE_ROUTE, _DESK_ANSWER_ROUTE, _DESK_TEXT_ROUTE,
-    _PAIR_OFFER, _PAIR_REVOKE, _PAIR_LIST, _PAIR_CLAIM,
+    _PAIR_OFFER, _PAIR_REVOKE, _PAIR_REVOKE_PREVIEW, _PAIR_LIST, _PAIR_CLAIM,
     _NOTIFY_PATH,
 } | frozenset(_CHAT_GET_ROUTES) | frozenset(_CHAT_POST_ROUTES) | _push_static()
 # Prefixes no downstream extra route may live under (the consent body route is one path per request id).
@@ -2835,7 +2836,8 @@ class _Handler(GuardedHandler):
             out.update(device_id=device, token=token)
             return out, 200
         undone, ustatus = self._pair_call(
-            lambda db: {"revoked": db.revoke_devices([device], by=minted_by, now=now)})
+            lambda db: {"revoked": db.revoke_confirmed(device, expect=[device], mode="family",
+                                                       by=minted_by, now=now)["revoked"]})
         if ustatus == 200:
             with self.server.pair_epoch_lock:   # after the commit, as every revoke (RU-3)
                 self.server.pair_epoch += 1
@@ -4436,7 +4438,7 @@ class _Handler(GuardedHandler):
 
     def _pair_authed_post(self, route: str) -> None:
         """``POST /cockpit/pair/offer {label?}`` mints a one-time code minted by THIS credential (RQ-2); ``POST
-        /cockpit/pair/revoke {id}`` revokes a paired device and its family (RP-7; any credential, surface or paired,
+        /cockpit/pair/revoke {id, expect, mode}`` revokes a paired device (its whole family, or it alone with its children re-parented) bound to the set ``/cockpit/pair/revoke-preview {id}`` named (RP-7; any credential, surface or paired,
         may revoke any paired device; the surface tokens are never revocable here). The revocation epoch moves only
         after the revoke's transaction commits (RU-3)."""
         srv = self.server
@@ -4467,13 +4469,44 @@ class _Handler(GuardedHandler):
                             "expires_in_s": int(OFFER_TTL.total_seconds())}
 
                 payload, status = self._pair_call(mint)
-            else:
+            elif route == _PAIR_REVOKE_PREVIEW:
                 unknown = sorted(set(req) - {"id"})
                 if unknown:
                     self._send_json({"error": "bad_request", "message": f"unknown request keys {unknown}"}, 400)
                     return
-                payload, status = self._pair_call(
-                    lambda db: {"revoked": db.revoke_devices([req.get("id")], by=minted_by, now=now)})
+
+                def preview(db: Any) -> dict[str, Any]:
+                    out = db.revoke_preview(req.get("id"))
+                    out["caller"] = minted_by[len(PAIRED_PREFIX):] if minted_by.startswith(PAIRED_PREFIX) else None
+                    out["includes_caller"] = any(f["id"] == out["caller"] for f in out["family"])
+                    return out
+
+                payload, status = self._pair_call(preview)
+                if status == 400 and "no such device" in payload.get("message", ""):
+                    status = 404
+            else:
+                unknown = sorted(set(req) - {"id", "expect", "mode"})
+                if unknown:
+                    self._send_json({"error": "bad_request", "message": f"unknown request keys {unknown}"}, 400)
+                    return
+                if "expect" not in req or "mode" not in req:
+                    # no revoke runs unconfirmed, whichever client sent it: the refusal is at the point of use
+                    self._send_json({"error": "confirm_required",
+                                     "message": "a revoke carries the family it was shown (expect) and a mode "
+                                                f"({'/'.join(sorted(REVOKE_MODES))}); ask revoke-preview first"}, 400)
+                    return
+
+                def revoke(db: Any) -> dict[str, Any]:
+                    try:
+                        return db.revoke_confirmed(req.get("id"), expect=req["expect"], mode=req["mode"],
+                                                   by=minted_by, now=now)
+                    except FamilyChanged as changed:
+                        return {"error": "family_changed", "family": changed.family,
+                                "message": "the set of devices changed since it was shown"}
+
+                payload, status = self._pair_call(revoke)
+                if payload.get("error") == "family_changed":
+                    status = 409
                 if status == 200:
                     with srv.pair_epoch_lock:       # after the commit, never inside it (RU-3)
                         srv.pair_epoch += 1

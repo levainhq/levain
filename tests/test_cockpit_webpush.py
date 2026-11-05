@@ -114,7 +114,7 @@ def test_only_a_paired_device_subscribes_and_its_revoke_stops_its_pings(rig) -> 
         assert _call(port, "POST", "/webpush/subscribe", _sub(3), token=other_tok)[0] == 200
         live = {s["endpoint"]: s["device_id"] for s in PushStore(qdir).live_subscriptions()}
         assert live == {_sub(2)["endpoint"]: PAIRED_PREFIX + dev, _sub(3)["endpoint"]: PAIRED_PREFIX + other_dev}
-        st, out, _ = _call(port, "POST", "/cockpit/pair/revoke", {"id": dev}, token=T)
+        st, out, _ = _call(port, "POST", "/cockpit/pair/revoke", {"id": dev, "expect": [dev], "mode": "family"}, token=T)
         assert st == 200 and dev in out["revoked"], out
         live = {s["endpoint"]: s["device_id"] for s in PushStore(qdir).live_subscriptions()}
         assert live == {_sub(3)["endpoint"]: PAIRED_PREFIX + other_dev}
@@ -145,7 +145,7 @@ def test_turn_on_under_the_cockpits_own_key_pairs_this_browser_and_its_revoke_st
         # the key it was handed is an ordinary paired device's: its own subscribe is the paired one, no second device
         st, again, _ = _call(port, "POST", "/webpush/subscribe", _sub(1), token=tok)
         assert st == 200 and "token" not in again and set(_devices(port)) == {dev}, again
-        st, out, _ = _call(port, "POST", "/cockpit/pair/revoke", {"id": dev}, token=T)
+        st, out, _ = _call(port, "POST", "/cockpit/pair/revoke", {"id": dev, "expect": [dev], "mode": "family"}, token=T)
         assert st == 200 and out["revoked"] == [dev], out
         assert PushStore(qdir).live_subscriptions() == []
         assert _call(port, "GET", "/webpush/key", token=tok)[0] == 403
@@ -261,7 +261,7 @@ def test_a_revoke_whose_tidy_up_fails_still_stops_every_ping(rig, pushes, monkey
             raise sqlite3.OperationalError("database is locked")
 
         monkeypatch.setattr(push_store, "retire_device_subscriptions", locked)
-        st, out, _ = _call(port, "POST", "/cockpit/pair/revoke", {"id": dev}, token=T)
+        st, out, _ = _call(port, "POST", "/cockpit/pair/revoke", {"id": dev, "expect": [dev], "mode": "family"}, token=T)
         assert st == 200 and dev in out["revoked"] and "push_note" in out, out
         assert "again" not in out["push_note"], out          # a retry finds nothing to revoke: never advised
         # the row was never retired, yet no reader counts it and no ping reaches it
@@ -309,7 +309,7 @@ def test_a_subscribe_authenticated_before_a_revoke_and_committed_after_it_is_ref
             s.sendall(("POST /webpush/subscribe HTTP/1.1\r\nHost: 127.0.0.1:%d\r\nContent-Type: application/json\r\n"
                        "X-Levain-Write-Token: %s\r\nContent-Length: %d\r\n\r\n" % (port, tok, len(body))).encode()
                       + body[:5])
-            st, out, _ = _call(port, "POST", "/cockpit/pair/revoke", {"id": dev}, token=T)
+            st, out, _ = _call(port, "POST", "/cockpit/pair/revoke", {"id": dev, "expect": [dev], "mode": "family"}, token=T)
             assert st == 200 and dev in out["revoked"], out
             s.sendall(body[5:])
             reply = b""
@@ -334,7 +334,7 @@ def test_a_subscription_stored_for_a_revoked_device_is_never_sent_to(rig, pushes
     with _signed(src, qdir) as (port, httpd):
         dev, tok = _pair(port)
         assert _call(port, "POST", "/webpush/subscribe", _sub(1), token=tok)[0] == 200
-        assert _call(port, "POST", "/cockpit/pair/revoke", {"id": dev}, token=T)[0] == 200
+        assert _call(port, "POST", "/cockpit/pair/revoke", {"id": dev, "expect": [dev], "mode": "family"}, token=T)[0] == 200
         store = PushStore(qdir)
         with store.write() as c:     # a row a tidy-up never reached, revived as a stalled subscribe would
             c.execute("UPDATE subscriptions SET retired_at = NULL")

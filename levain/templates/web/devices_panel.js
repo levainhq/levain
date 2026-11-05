@@ -1,7 +1,7 @@
 // levain devices_panel.js — the cockpit's Devices panel (per-device pairing, PAIR_DESIGN.md REV 1-6).
 //
 // Lists the paired devices (GET /cockpit/pair/devices.json), mints a one-time pairing link (POST /cockpit/pair/offer {label}),
-// revokes a device and its family (POST /cockpit/pair/revoke {id}), and turns pings on for this browser (OS-4, /webpush/*).
+// revokes a device behind a confirm card that names the family (POST /cockpit/pair/revoke-preview {id}, then /cockpit/pair/revoke {id, expect, mode}), and turns pings on for this browser (OS-4, /webpush/*).
 // It rides the page's own credential: the token the cockpit keeps in localStorage "levain_write_token" (dashboard_boot.js WRITE_TOKEN_KEY). Everything is drawn with textContent: this
 // file shares a page with that token, so it adds no HTML sink. A server with no writable cockpit answers 404 and the panel never
 // appears; a page with no usable credential shows nothing either.
@@ -37,7 +37,7 @@
     const f = shared().noPushWords;
     return typeof f === "function" ? f() : "This browser does not offer pings.";
   }
-  let pingRow = null, pingState = null, pingBtn = null, pushKey = "", pushAsked = false;
+  let confirmBox = null, pingRow = null, pingState = null, pingBtn = null, pushKey = "", pushAsked = false;
   const b64uToBytes = (t) => Uint8Array.from(atob(t.replace(/-/g, "+").replace(/_/g, "/") + "===".slice((t.length + 3) % 4)),
                                              (c) => c.charCodeAt(0));
 
@@ -126,6 +126,8 @@
       tabBtns[k] = b; tabsNav.appendChild(b);
     }
     body.appendChild(tabsNav);
+    confirmBox = el("div", "dev-confirm-host");
+    body.appendChild(confirmBox);
     list = el("div", "dev-list");
     list.setAttribute("role", "tabpanel");
     list.id = "dev-tabpanel";
@@ -624,20 +626,100 @@
     }
   }
 
+  // Revoke is a two-step: the server names the family a revoke would take, the operator sees it on a card, and the revoke
+  // carries that exact set back (`expect`) with the mode they chose. A set that moved in between comes back as family_changed
+  // with the fresh set, and the card is drawn again.
+  function closeConfirm() { confirmBox.replaceChildren(); }
   async function revoke(d, btn) {
-    btn.disabled = true; say("");
-    let msg = "", revoked = false;
-    try {
-      const res = await api("POST", "/cockpit/pair/revoke", { id: d.id });
-      const n = (res.data.revoked || []).length;
-      if (res.status !== 200) msg = "Could not revoke " + named(d) + " (" + (res.data.message || res.status) + ").";
-      else { revoked = true; msg = n > 1 ? "Revoked " + named(d) + " and " + (n - 1) + " device(s) it had paired." : "Revoked " + named(d) + "."; }
-    } catch (_) { msg = "Could not reach the cockpit."; }
-    // G2: a failed revoke keeps a live button; a successful one leaves the row to the re-render (no second click on a revoked key)
-    if (!revoked && btn.isConnected) btn.disabled = false;
-    const listed = await refresh();
-    // after the refresh, so its own note does not wipe the revoke's answer; a refresh error after a good revoke is added, not lost
-    say(revoked && !listed ? msg + " Couldn't refresh the device list." : msg);
+    btn.disabled = true; say(""); closeConfirm();
+    let res;
+    try { res = await api("POST", "/cockpit/pair/revoke-preview", { id: d.id }); }
+    catch (_) { say("Could not reach the cockpit."); if (btn.isConnected) btn.disabled = false; return; }
+    if (btn.isConnected) btn.disabled = false;
+    if (res.status !== 200 || !Array.isArray(res.data.family)) {
+      say("Could not check what revoking " + named(d) + " would take (" + (res.data.message || res.status) + ").");
+      return;
+    }
+    showConfirm(d, res.data, "");
+  }
+  // a paired-<id> credential name reads as that device's label when the list holds it; a surface name or the box reads as itself
+  function pairedByWords(name) {
+    const m = /^paired-(.+)$/.exec(String(name));
+    const hit = m ? lastDevs.find((x) => x.id === m[1]) : null;
+    return hit ? (hit.label || hit.id) : String(name);
+  }
+  function plural(n) { return n + (n === 1 ? " device" : " devices"); }
+  function showConfirm(d, pv, warn) {
+    const fam = pv.family, caller = pv.caller || null, now = Date.now();
+    const card = el("div", "dev-confirm");
+    card.setAttribute("role", "group");
+    card.setAttribute("aria-label", "Confirm revoking " + named(d));
+    card.appendChild(el("div", "dev-confirm-h", "Revoke " + (fam.length > 1 ? "these " + fam.length + " devices?" : named(d) + "?")));
+    if (warn) card.appendChild(el("div", "dev-link-w", warn));
+    card.appendChild(el("div", "dev-link-n", fam.length > 1
+      ? "Revoking " + named(d) + " also revokes every device it paired, and they all sign out at once. This cannot be undone."
+      : "It signs out at once. This cannot be undone."));
+    const ul = el("ul", "dev-confirm-list");
+    let hasSelf = false;
+    for (const f of fam) {
+      const li = el("li", "dev-confirm-item");
+      const nm = el("span", "dev-name", f.label || f.id);
+      nm.dir = "auto";
+      li.appendChild(nm);
+      if (f.id === caller) { hasSelf = true; li.appendChild(el("span", "pill dev-pill dev-self", "THIS DEVICE: you will be signed out")); }
+      li.appendChild(el("div", "dev-meta", (f.paired_by ? "paired by " + pairedByWords(f.paired_by) + " · " : "") + "last seen " + when(f.last_seen, now)));
+      ul.appendChild(li);
+    }
+    card.appendChild(ul);
+    const acts = el("div", "dev-confirm-acts");
+    const bs = [];
+    const go = async (mode, b) => {
+      for (const x of bs) x.disabled = true;
+      let msg = "", ok = false, changed = null;
+      try {
+        const r = await api("POST", "/cockpit/pair/revoke", { id: d.id, expect: fam.map((f) => f.id).sort(), mode: mode });
+        if (r.status === 409 && r.data.error === "family_changed" && Array.isArray(r.data.family)) changed = r.data;
+        else if (r.status !== 200) msg = "Could not revoke " + named(d) + " (" + (r.data.message || r.status) + ").";
+        else {
+          ok = true;
+          const n = (r.data.revoked || []).length, kept = (r.data.detached || []).length;
+          msg = mode === "only"
+            ? "Revoked " + named(d) + (kept ? "; the " + plural(kept) + " it paired stay paired." : ".")
+            : n > 1 ? "Revoked " + named(d) + " and " + (n - 1) + " device(s) it had paired." : "Revoked " + named(d) + ".";
+        }
+      } catch (_) { msg = "Could not reach the cockpit."; }
+      if (changed) {      // the set moved since it was shown: nothing was revoked; show the fresh set
+        closeConfirm();
+        showConfirm(d, { family: changed.family, caller: caller }, "The devices changed while this was open. Nothing was revoked; check the list again.");
+        return;
+      }
+      closeConfirm();
+      const listed = await refresh();
+      say(ok && !listed ? msg + " Couldn't refresh the device list." : msg);
+    };
+    const kids = fam.length > 1;
+    if (kids) {
+      const only = el("button", "dev-btn dev-safe", "Revoke only " + named(d));
+      only.type = "button";
+      only.title = "The devices it paired stay paired and are handed to whatever paired it";
+      only.addEventListener("click", () => go("only", only));
+      bs.push(only); acts.appendChild(only);
+    }
+    const all = el("button", "dev-btn dev-danger",
+      kids ? "Revoke " + fam.length + " devices" + (hasSelf ? " and sign this one out" : "")
+           : "Revoke " + named(d) + (hasSelf ? " and sign this one out" : ""));
+    all.type = "button";
+    all.addEventListener("click", () => go("family", all));
+    bs.push(all); acts.appendChild(all);
+    card.appendChild(acts);
+    if (kids) card.appendChild(el("div", "dev-link-n", "\u201CRevoke only\u201D takes just " + named(d) + "; the others keep working."));
+    const cancel = el("button", "dev-linkbtn", "Cancel");
+    cancel.type = "button";
+    cancel.addEventListener("click", closeConfirm);
+    card.appendChild(cancel);
+    confirmBox.replaceChildren(card);
+    try { card.scrollIntoView({ block: "nearest" }); } catch (_) { /* no scrolling here */ }
+    (kids ? bs[0] : all).focus();
   }
 
   // ---- Presence (1b: you decide, sensing informs). One record, three settings, one sentence. The masthead chip and the sheet it

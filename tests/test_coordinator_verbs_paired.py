@@ -165,7 +165,7 @@ def test_a_revoked_devices_token_is_refused_by_every_verb_and_the_store_is_uncha
         lid = out["result"]["launch_id"]
         lease = store.coord_lease()
         assert store.launch(lid).state == "active" and lease is not None
-        st, out, _ = _call(port, "POST", "/cockpit/pair/revoke", {"id": device}, token=T)
+        st, out, _ = _call(port, "POST", "/cockpit/pair/revoke", {"id": device, "expect": [device], "mode": "family"}, token=T)
         assert st == 200 and device in out["revoked"], out
         before = _snapshot(qdir)
         for verb in (STOP_VERB, HOLD_VERB, START_VERB):
