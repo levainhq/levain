@@ -12,7 +12,7 @@ exit 2), never exit 0 with no output:
 
 * ``hook-not-in-slot``: the slot's broker socket variable is not in the environment. The adapter would then take its
   operator path (a local queue under the home directory), which a slot must never reach.
-* ``hook-adapter-unavailable``: the adapter or the broker client did not import.
+* ``hook-broker-client-unavailable`` / ``hook-adapter-unavailable``: the broker client / the adapter did not import.
 * ``hook-adapter-failed``: the adapter raised.
 * ``hook-adapter-exit``: the adapter returned non-zero.
 
@@ -36,14 +36,15 @@ def refuse(name: str, why: str, detail: str, stderr: TextIO) -> int:
     try:
         stderr.write("levain hook %s: refused: %s (%s)\n" % (name, why, detail[:200]))
         stderr.flush()
-    except Exception:
+    except BaseException:  # noqa: BLE001 - a refusal that cannot be written is still a refusal
         pass
     return REFUSED_EXIT
 
 
 def _load_adapter() -> Any:
     # a function-local import on purpose: a failure here is a named refusal, not a traceback (tests/ci/root_closure.py
-    # LAZY_SITES row "root": a slot hook process runs it, so the adapter is root-closure code)
+    # LAZY_SITES row "operator": the slot hook runs as the slot uid, never root; the adapter's 3.9 floor is held by
+    # tests/test_slot_hook_templates.py, not by the root closure)
     from levain.consent.adapters import claude_code
     return claude_code
 
@@ -51,17 +52,24 @@ def _load_adapter() -> Any:
 def run(name: str, *, stdin: Optional[TextIO] = None, stdout: Optional[TextIO] = None,
         stderr: Optional[TextIO] = None, environ: Optional[Mapping[str, str]] = None,
         load_adapter: Optional[Callable[[], Any]] = None) -> int:
-    """Run the hook ``name``: 0 with the adapter's output, or :data:`REFUSED_EXIT` with a named refusal."""
-    stdin = stdin if stdin is not None else sys.stdin
-    stdout = stdout if stdout is not None else sys.stdout
-    stderr = stderr if stderr is not None else sys.stderr
-    env = os.environ if environ is None else environ
+    """Run the hook ``name``: 0 with the adapter's output, or :data:`REFUSED_EXIT` with a named refusal. ``environ``
+    (default ``os.environ``) is the ONE environment: :func:`in_slot` is checked against it and the adapter's ``main``
+    is handed it, so the slot check and the adapter can never read two different environments."""
+    err: Any = stderr
     try:
+        err = stderr if stderr is not None else sys.stderr
+        stdin = stdin if stdin is not None else sys.stdin
+        stdout = stdout if stdout is not None else sys.stdout
+        env = os.environ if environ is None else environ
         from levain.consent.broker_client import in_slot
+    except BaseException as exc:  # noqa: BLE001 - fail closed
+        return refuse(name, "hook-broker-client-unavailable", "%s: %s" % (type(exc).__name__, exc), err)
+    try:
         adapter = (load_adapter or _load_adapter)()
         main = adapter.main
     except BaseException as exc:  # noqa: BLE001 - fail closed: nothing that cannot import is a gate
-        return refuse(name, "hook-adapter-unavailable", "%s: %s" % (type(exc).__name__, exc), stderr)
+        return refuse(name, "hook-adapter-unavailable", "%s: %s" % (type(exc).__name__, exc), err)
+    stderr = err
     try:
         slot = in_slot(env)
     except BaseException as exc:  # noqa: BLE001
@@ -70,7 +78,7 @@ def run(name: str, *, stdin: Optional[TextIO] = None, stdout: Optional[TextIO] =
         return refuse(name, "hook-not-in-slot", "no broker socket in the environment", stderr)
     out = io.StringIO()
     try:
-        code = main([], stdin=stdin, stdout=out)
+        code = main([], stdin=stdin, stdout=out, environ=env)
     except BaseException as exc:  # noqa: BLE001 - SystemExit included: an adapter that exits is not an answer
         return refuse(name, "hook-adapter-failed", "%s: %s" % (type(exc).__name__, exc), stderr)
     if code != 0:
