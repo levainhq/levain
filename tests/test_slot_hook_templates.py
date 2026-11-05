@@ -173,6 +173,28 @@ def test_an_adapter_that_raises_or_exits_nonzero_is_refused():
         assert code == 2 and out == "" and why in err
 
 
+def test_only_the_exact_int_zero_is_success_a_zero_equal_return_is_refused():
+    """L3 r2 codex MED: ``False != 0`` is False, so an adapter that regressed to return False (or 0.0, or an object
+    equal to 0) with no output exited 0 and the gate allowed. Only the int 0 is an answer."""
+    class ZeroEq:
+        def __eq__(self, other):
+            return other == 0
+
+        def __ne__(self, other):
+            return not self.__eq__(other)
+
+        __hash__ = None  # type: ignore[assignment]
+
+    for value in (False, 0.0, None, ZeroEq(), "0", 1):
+        class Quiet:
+            @staticmethod
+            def main(argv, stdin=None, stdout=None, environ=None, _v=value):
+                return _v
+
+        code, out, err = _run(lambda a=Quiet: a)
+        assert code == 2 and out == "" and "hook-adapter-exit" in err, (value, code, err)
+
+
 def test_outside_a_slot_the_operator_path_is_never_reached():
     class Never:
         @staticmethod
