@@ -151,3 +151,13 @@ def test_the_startup_check_refuses_a_page_with_a_bare_shell_asset_reference_the_
         assert "/sky.js" in str(e) and "refusing to start" in str(e), e
     else:
         raise AssertionError("make_server started with a bare shell asset reference in the cockpit page")
+
+
+def test_the_workers_attribute_boundary_is_the_servers() -> None:
+    """1105-17 fix2: the same fact in two languages must not drift. ``levain/webpush/static/sw.js`` holds the boundary as
+    ``ATTR_BOUNDARY = String.raw`...``` (no build step to share one source), and the server's ``_SHELL_ATTR`` opens with it."""
+    sw = (Path(__file__).resolve().parent.parent / "levain" / "webpush" / "static" / "sw.js").read_text(encoding="utf-8")
+    m = re.search(r"const ATTR_BOUNDARY = String\.raw`([^`]+)`;", sw)
+    assert m, "sw.js no longer declares ATTR_BOUNDARY as a String.raw literal"
+    assert web_server._SHELL_ATTR.pattern.startswith(m.group(1)), (m.group(1), web_server._SHELL_ATTR.pattern)
+    assert m.group(1) in web_server._ANY_REF.pattern, (m.group(1), web_server._ANY_REF.pattern)

@@ -280,9 +280,16 @@ function fire(type, ev) {
       cacheStores.set('levain-shell-vOLD', new Map([['/', '<html>old shell</html>'], ['/dashboard.css', 'OLD CSS'], ['/a.js', 'OLD A']]));
       cacheNames.add('levain-shell-vOLD');
     }
+    // verok | verbad: the shell names ONE versioned script; the digest in its url is the real one (verok) or another (verbad)
+    const VER_BODY = 'VERSIONED BYTES';
+    const verKey = '/v.js?v=' + (md === 'verok' ? require('crypto').createHash('sha256').update(VER_BODY).digest('hex').slice(0, 12) : '0123456789ab');
     sandbox.fetch = async (url) => {
       log.fetched = (log.fetched || []).concat([String(url)]);
       if (md === 'down') throw new TypeError('network down');
+      if (md === 'verok' || md === 'verbad') {
+        return String(url) === '/' ? new Response('<script src="' + verKey + '"></script>', { status: 200, headers: { 'content-type': 'text/html' } })
+          : new Response(VER_BODY, { status: 200, headers: { 'content-type': 'application/javascript' } });
+      }
       const withAssets = ['assets', 'badasset', 'softhtml'].includes(md);
       if (withAssets && String(url) !== '/') {
         const spy = (r) => { Object.defineProperty(r, 'body', { value: { cancel: () => { log.cancelled = (log.cancelled || 0) + 1; return Promise.resolve(); } } }); return r; };

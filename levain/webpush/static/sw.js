@@ -318,6 +318,10 @@ async function commitShell(resp) {
     try {
       const r = await fetch(a.key, { credentials: 'same-origin', cache: 'reload' });
       if (!assetOk(r, a.kind)) { drain(r); return null; }   // an unread body holds its connection
+      // a versioned url is staged only when its bytes hash to its version, exactly as the write-through path holds it (an old
+      // shell naming ?v=OLD answered by a newer or other backend would otherwise sit cache-first under the old name); a
+      // mismatch fails this asset like a failed fetch, so nothing is committed. The body is read inside bytesOfVersion.
+      if (versionedKey(a.key)) { const ok = await bytesOfVersion(r, a.key, a.kind); return ok ? [a.key, ok] : null; }
       // read the body now: an unread response holds its connection, and a shell of more assets than the browser's per-host
       // limit would wait on itself
       return [a.key, new Response(await r.arrayBuffer(), { status: 200, headers: { 'content-type': r.headers.get('content-type') } })];
@@ -348,6 +352,9 @@ async function writeShell(resp, staged) {
   } catch (_) { /* best effort */ }
   return true;
 }
+// The attribute-name boundary: `data-src` is not `src` (a plain \b matched it, the hyphen being a word boundary). The server's
+// _SHELL_ATTR (levain/web_server.py) opens with this exact source text; tests/test_shell_asset_versions.py asserts they are equal.
+const ATTR_BOUNDARY = String.raw`(?<![\w-])`;
 // Same-origin absolute URLs named by <script src> and <link rel=stylesheet href> in the shell html, as {key: path+query, kind}.
 // The exact URL (query included) is what the worker caches and what it later intercepts.
 function shellAssets(html) {
@@ -359,7 +366,7 @@ function shellAssets(html) {
     const key = u.pathname + u.search;
     if (!out.has(key)) out.set(key, { key, kind });
   };
-  const attr = (tag, name) => { const m = new RegExp('\\b' + name + '\\s*=\\s*(?:"([^"]+)"|\'([^\']+)\')', 'i').exec(tag); return m ? (m[1] || m[2]) : null; };
+  const attr = (tag, name) => { const m = new RegExp(ATTR_BOUNDARY + name + '\\s*=\\s*(?:"([^"]+)"|\'([^\']+)\')', 'i').exec(tag); return m ? (m[1] || m[2]) : null; };
   for (const m of html.matchAll(/<script\b[^>]*>/gi)) { const v = attr(m[0], 'src'); if (v) add(v, 'script'); }
   for (const m of html.matchAll(/<link\b[^>]*>/gi)) {
     const rel = attr(m[0], 'rel');

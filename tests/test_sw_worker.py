@@ -481,6 +481,43 @@ def test_a_network_answer_is_cached_under_a_versioned_url_only_when_its_bytes_ha
 
 
 @needs_node
+def test_a_shell_commit_stages_a_versioned_asset_only_when_its_bytes_hash_to_that_version() -> None:
+    """1105-17 fix2 (codex finding 1): commitShell (install and refresh) staged the shell's assets without the digest check the
+    write-through path has, so an OLD shell naming ?v=OLD answered by a newer or other backend stored mismatched bytes under the
+    old key, cache-first. A mismatch now fails the commit as a failed asset fetch does: nothing is written, the prior shell stays."""
+    body = "NEW BYTES"
+    good_key = _versioned_key(body)
+    bad_key = "/x.js?v=0123456789ab"
+    # refresh: a navigation to '/' whose shell names the versioned asset
+    good = _fetch(url="https://box.example/", net="ok", shell=True, html=f'<script src="{good_key}"></script>', assetBody=body)
+    assert {e: b for _, es in good["shells"] for e, b in es} == {"/": f'<script src="{good_key}"></script>', good_key: body}, good
+    bad = _fetch(url="https://box.example/", net="ok", shell=True, html=f'<script src="{bad_key}"></script>', assetBody=body)
+    assert {e: b for _, es in bad["shells"] for e, b in es} == {"/": "<html>cached shell</html>"}, bad    # old cache intact
+    # install: the first generation caches nothing on a mismatch, and carries the prior one when there is one
+    ok = _run("install", "verok")
+    assert sorted(e for _, es in ok["shells"] for e, _b in es) == ["/", "/v.js?v=" + hashlib.sha256(b"VERSIONED BYTES").hexdigest()[:12]], ok
+    assert all(not es for _, es in _run("install", "verbad")["shells"]), _run("install", "verbad")
+    prior = {n: dict(es) for n, es in _run("install", "verbad:prior")["shells"]}
+    assert [v for n, v in prior.items() if n != "levain-shell-vOLD"] == [{"/": "<html>old shell</html>"}], prior
+
+
+@needs_node
+def test_a_data_src_before_src_is_cached_under_the_versioned_url_the_server_wrote() -> None:
+    """1105-17 fix2 (codex MED): the server's attribute pattern skips ``data-src`` but the worker's own parser (``\\b``) matched
+    it, so for ``<script data-src="/a.js" src="/a.js">`` the server versioned the real ``src`` and the worker cached the bare
+    ``/a.js``. End to end: the page goes through the server's rewrite, that HTML goes to the worker."""
+    from levain import web_server
+
+    body = "A BYTES"
+    digest = hashlib.sha256(body.encode()).hexdigest()[:12]
+    page = web_server._version_shell_page('<script data-src="/a.js" src="/a.js"></script>', {"/a.js": digest})
+    assert page == f'<script data-src="/a.js" src="/a.js?v={digest}"></script>', page
+    got = _fetch(url="https://box.example/", net="ok", shell=True, html=page, assetBody=body)
+    cached = {e: b for _, es in got["shells"] for e, b in es}
+    assert cached == {"/": page, f"/a.js?v={digest}": body}, cached          # the versioned key, and no bare /a.js
+
+
+@needs_node
 def test_only_the_page_message_skips_waiting() -> None:
     assert _run("message", json.dumps({"type": "levain-skip-waiting"}))["skipWaiting"] is True
     for junk in ({"type": "other"}, "levain-skip-waiting", None):
