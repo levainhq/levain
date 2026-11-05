@@ -206,6 +206,48 @@ def test_exec_bit_mismatch_refuses(tree):
         hash_of(tree, [entry(repo, "b", "100755")])
 
 
+def test_owner_unreadable_refuses(tree, monkeypatch):
+    """L3_win2_r1 codex #2: root reads past permissions, the slot's vendor does not. The test runs unprivileged, where
+    a mode-000 open already fails, so ``fstat`` answers the mode root would see on such a file it could open."""
+    _, repo = tree
+    put(repo, "a", b"a\n")
+    ents = [entry(repo, "a")]
+    real = os.fstat
+
+    def fstat(fd):
+        st = list(real(fd))
+        st[0] &= ~0o400
+        return os.stat_result(st)
+    monkeypatch.setattr(os, "fstat", fstat)
+    with pytest.raises(SS.CheckFailed, match="not readable by its owner"):
+        hash_of(tree, ents)
+
+
+def test_a_mode_outside_the_blob_modes_is_check_failed(tree):
+    _, repo = tree
+    put(repo, "a", b"a\n")
+    with pytest.raises(SS.CheckFailed, match="not a blob mode"):
+        hash_of(tree, [entry(repo, "a", "100664")])
+
+
+@pytest.mark.parametrize("seam", ["dup", "fstat", "read"])
+def test_an_oserror_is_check_failed(tree, monkeypatch, seam):
+    """L3_win2_r1 gemini LOW: every failure of the pass is ``CheckFailed`` (clone_check's contract)."""
+    _, repo = tree
+    put(repo, "d/a", b"a\n")
+    ents = [entry(repo, "d/a")]
+
+    def eio(*_a, **_k):
+        raise OSError(5, "EIO")
+    kw = {}
+    if seam == "read":
+        kw["read"] = eio
+    else:
+        monkeypatch.setattr(os, seam, eio)
+    with pytest.raises(SS.CheckFailed, match="root hash failed \\(errno 5\\)"):
+        hash_of(tree, ents, **kw)
+
+
 def test_absent_file_refuses(tree):
     with pytest.raises(SS.CheckFailed, match="no plain worktree file"):
         hash_of(tree, [SS.IndexEntry("100644", "0" * 40, 0, "nope")])

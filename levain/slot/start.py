@@ -613,52 +613,75 @@ def hash_worktree_at(repo_fd: int, entries: Sequence[IndexEntry], owner_uid: int
     one link (root never reads a file the slot did not write as itself), and read to EOF in :data:`HASH_CHUNK`
     pieces whose count equals ``st_size`` (a file that grew or shrank refuses). Its id is a git blob id,
     ``sha1("blob <size>\\0" + bytes)``, which is what ``git hash-object --no-filters`` computes; it must equal the
-    index entry's. One ``deadline_s`` bounds the whole pass. Returns the bytes hashed."""
+    index entry's. The file must also carry its owner read bit: root reads past permissions, the slot's vendor does
+    not, so a file the slot cannot read refuses here as the old slot-uid ``hash-object`` did. One ``deadline_s``
+    bounds the whole pass. Any failure, an ``OSError`` from a dup, ``fstat`` or read included, is
+    :class:`CheckFailed` (``clone_check``'s contract). Returns the bytes hashed.
+
+    The deadline is per PASS by intent (DESIGN_window2 §3 item 4): the session END lock is held no longer than one
+    check child could hold it, :data:`runtime_helper.CHECK_S`. Calibration (1105-7): chosen, not measured; the macOS
+    VM row is to time a full pass on a real-size read set (up to :data:`READSET_PATHS_MAX` entries) against it."""
     end = clock() + deadline_s
     total = 0
     for e in entries:
-        parts = e.path.split("/")
-        if any(p in ("", ".", "..") for p in parts):
-            raise CheckFailed(f"(b) {_name(e.path)}: not a plain relative path")
-        pfd = _beneath_fd(repo_fd, parts, e.path)
         try:
-            try:
-                fd = os.open(parts[-1], _O_FILE, dir_fd=pfd)
-            except OSError as e2:
-                raise CheckFailed(f"(b) {_name(e.path)}: no plain worktree file (errno {e2.errno})") from None
-        finally:
-            os.close(pfd)
-        try:
-            st = os.fstat(fd)
-            if not stat.S_ISREG(st.st_mode):
-                raise CheckFailed(f"(b) {_name(e.path)}: the worktree entry is not a regular file "
-                                  f"(mode {stat.S_IFMT(st.st_mode):o})")
-            if bool(st.st_mode & stat.S_IXUSR) != _MODES[e.mode]:
-                raise CheckFailed(f"(b) {_name(e.path)}: exec bit {stat.S_IMODE(st.st_mode):o} vs index {e.mode}")
-            if st.st_uid != owner_uid:
-                raise CheckFailed(f"(b) {_name(e.path)}: owned by uid {st.st_uid}, not the slot's")
-            if st.st_nlink != 1:
-                raise CheckFailed(f"(b) {_name(e.path)}: {st.st_nlink} links")
-            h = hashlib.sha1(b"blob %d\0" % st.st_size)
-            got = 0
-            while True:
-                if clock() > end:
-                    raise CheckFailed(f"(b) {_name(e.path)}: the root hash passed its {deadline_s:g}s bound")
-                chunk = read(fd, HASH_CHUNK)
-                if not chunk:
-                    break
-                got += len(chunk)
-                if got > st.st_size:
-                    break
-                h.update(chunk)
-            if got != st.st_size:
-                raise CheckFailed(f"(b) {_name(e.path)}: read {got} bytes for a size of {st.st_size}")
-        finally:
-            os.close(fd)
-        if h.hexdigest() != e.sha:
-            raise CheckFailed(f"(b) {_name(e.path)}: blob {e.sha[:12]} != worktree --no-filters {h.hexdigest()[:12]}")
-        total += got
+            total += _hash_one(repo_fd, e, owner_uid, end, deadline_s, clock, read)
+        except OSError as err:
+            raise CheckFailed(f"(b) {_name(e.path)}: the root hash failed (errno {err.errno})") from None
     return total
+
+
+def _hash_one(repo_fd: int, e: IndexEntry, owner_uid: int, end: float, deadline_s: float,
+              clock: Callable[[], float], read: Callable[[int, int], bytes]) -> int:
+    """One entry of :func:`hash_worktree_at`; returns its bytes hashed. ``OSError`` is the caller's to turn into
+    :class:`CheckFailed`."""
+    want_exec = _MODES.get(e.mode)
+    if want_exec is None:
+        raise CheckFailed(f"(b) {_name(e.path)}: index mode {e.mode!r} is not a blob mode")
+    parts = e.path.split("/")
+    if any(p in ("", ".", "..") for p in parts):
+        raise CheckFailed(f"(b) {_name(e.path)}: not a plain relative path")
+    pfd = _beneath_fd(repo_fd, parts, e.path)
+    try:
+        try:
+            fd = os.open(parts[-1], _O_FILE, dir_fd=pfd)
+        except OSError as e2:
+            raise CheckFailed(f"(b) {_name(e.path)}: no plain worktree file (errno {e2.errno})") from None
+    finally:
+        os.close(pfd)
+    try:
+        st = os.fstat(fd)
+        if not stat.S_ISREG(st.st_mode):
+            raise CheckFailed(f"(b) {_name(e.path)}: the worktree entry is not a regular file "
+                              f"(mode {stat.S_IFMT(st.st_mode):o})")
+        if bool(st.st_mode & stat.S_IXUSR) != want_exec:
+            raise CheckFailed(f"(b) {_name(e.path)}: exec bit {stat.S_IMODE(st.st_mode):o} vs index {e.mode}")
+        if st.st_uid != owner_uid:
+            raise CheckFailed(f"(b) {_name(e.path)}: owned by uid {st.st_uid}, not the slot's")
+        if not st.st_mode & stat.S_IRUSR:
+            raise CheckFailed(f"(b) {_name(e.path)}: mode {stat.S_IMODE(st.st_mode):o}, not readable by its owner")
+        if st.st_nlink != 1:
+            raise CheckFailed(f"(b) {_name(e.path)}: {st.st_nlink} links")
+        # The header's size is fstat's; the read below refuses unless it returns exactly that many bytes.
+        h = hashlib.sha1(b"blob %d\0" % st.st_size)
+        got = 0
+        while True:
+            if clock() > end:
+                raise CheckFailed(f"(b) {_name(e.path)}: the root hash passed its {deadline_s:g}s bound")
+            chunk = read(fd, HASH_CHUNK)
+            if not chunk:
+                break
+            got += len(chunk)
+            if got > st.st_size:
+                break
+            h.update(chunk)
+        if got != st.st_size:
+            raise CheckFailed(f"(b) {_name(e.path)}: read {got} bytes for a size of {st.st_size}")
+    finally:
+        os.close(fd)
+    if h.hexdigest() != e.sha:
+        raise CheckFailed(f"(b) {_name(e.path)}: blob {e.sha[:12]} != worktree --no-filters {h.hexdigest()[:12]}")
+    return got
 
 
 def check_attributes(sfd: int) -> None:
@@ -726,7 +749,17 @@ def clone_check(sfd: int, kind: str, run: Callable[[Tuple[str, ...], int], bytes
     and ``root_hash(repo_fd, entries)`` (:func:`hash_worktree_at`, returns the bytes hashed) replaces the lstat pass
     and the ``hash-object`` children, so nothing is launched into the slot after the proof. The closing
     ``no_process()`` is then unchanged and any process it sees refuses. With ``root_hash`` None (Linux) the window
-    after the last child is a pure detection, as it always was."""
+    after the last child is a pure detection, as it always was.
+
+    After window 2's proof, (a) :func:`check_attributes` runs again (root-side, no child): a process alive during
+    ``ls-files`` and killed by the quiesce could have rewritten ``info/attributes`` after the first proof of it.
+    Accepted residual (DESIGN_window2 §3, "What it weakens"; L3_win2_r1 codex #1): such a process could also have
+    written elsewhere under ``repo/.git`` (the index, objects, config) or left a file outside ``entries``; the hash
+    proves only the entries' bytes, and neither window ever proved the rest of ``repo``. Reaching it needs a
+    compromised git or Apple agent in the ``ls-files`` launch chain (ls-files runs no hook or filter), the same
+    class window 1 accepted."""
+    if root_hash is not None and quiesce is None:   # an argument check, before any child runs
+        raise ValueError("clone_check: root_hash needs the quiesce that proves its window")
     if kind not in RD.READSET_KINDS:
         return None
     window = kind == "dispatch"
@@ -742,11 +775,11 @@ def clone_check(sfd: int, kind: str, run: Callable[[Tuple[str, ...], int], bytes
         raise CheckFailed(f"(b) ls-files: {len(entries)} entries, past the read set's {READSET_PATHS_MAX}")
     check_index(entries)
     if root_hash is not None:
-        if quiesce is None:
-            raise ValueError("clone_check: root_hash needs the quiesce that proves its window")
         if not no_process():
             _note("window 2: slot-uid process(es) present before the quiesce")
+        assert quiesce is not None   # the argument check at the top
         quiesce()
+        check_attributes(sfd)
     try:
         repo = os.open("repo", os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC, dir_fd=sfd)
     except OSError as e:

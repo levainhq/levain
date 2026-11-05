@@ -14,8 +14,12 @@ from types import SimpleNamespace
 import pytest
 
 from levain.slot import proc as PR
+from levain.slot import render as RD
 from levain.slot import start as SS
 from levain.slot import wall
+
+#: The real (a) check, kept before the ``sfd`` fixture replaces it with a no-op.
+_CHECK_ATTRIBUTES = SS.check_attributes
 
 
 class Table:
@@ -243,11 +247,48 @@ def test_macos_a_process_after_the_root_hash_refuses(root, sfd, monkeypatch):
 
 
 def test_root_hash_without_a_quiesce_is_a_programming_error(root, sfd):
+    """An argument check: it fails before any check child runs (L3_win2_r1 complement LOW 1)."""
     files = _write(root, {"a.txt": b"one\n"})
     t = Table([])
+    calls = []
     with pytest.raises(ValueError):
-        SS.clone_check(sfd, "dispatch", _fake_run(root, files, t), t.no_process, spec_base=lambda: 0,
+        SS.clone_check(sfd, "dispatch", _fake_run(root, files, t, calls=calls), t.no_process, spec_base=lambda: 0,
                        root_hash=lambda fd, ents: 0)
+    assert calls == []
+
+
+def _real_attributes(root, monkeypatch):
+    """The real (a) check over a real ``repo/.git/info/attributes`` holding render's line."""
+    info = os.path.join(root, "repo", ".git", "info")
+    os.makedirs(info)
+    path = os.path.join(info, "attributes")
+    with open(path, "wb") as f:
+        f.write(RD.READSET_ATTRIBUTES)
+    monkeypatch.setattr(SS, "check_attributes", _CHECK_ATTRIBUTES)
+    return path
+
+
+def test_macos_attributes_proven_twice_pass(root, sfd, monkeypatch):
+    _real_attributes(root, monkeypatch)
+    files = _write(root, {"a.txt": b"one\n"})
+    t = Table([])
+    assert _mac(sfd, t, _fake_run(root, files, t, on_ls=lambda: t.alive.append("distnoted")), monkeypatch)
+
+
+def test_macos_attributes_rewritten_during_ls_files_refuses(root, sfd, monkeypatch):
+    """L3_win2_r1 codex #1 / gemini MED: a process alive during ``ls-files`` and killed by window 2's quiesce rewrote
+    ``info/attributes`` after its first proof; (a) runs again after the proof and refuses."""
+    path = _real_attributes(root, monkeypatch)
+    files = _write(root, {"a.txt": b"one\n"})
+    t = Table([])
+
+    def rewrite():
+        t.alive.append("distnoted")
+        with open(path, "wb") as f:
+            f.write(b"* filter=evil\n")
+    with pytest.raises(SS.CheckFailed, match=r"\(a\) info/attributes"):
+        _mac(sfd, t, _fake_run(root, files, t, on_ls=rewrite), monkeypatch)
+    assert t.kills == 2
 
 
 def test_linux_has_no_quiesce(monkeypatch):
