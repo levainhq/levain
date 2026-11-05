@@ -70,7 +70,7 @@ TICK_PRE_RENEW_BOUND_S = 60
 WORST_RENEW_GAP_S = TICK_INTERVAL_S + TICK_HARD_BOUND_S + TICK_PRE_RENEW_BOUND_S
 #: exit codes: 0 a pass ran; 1 refused (store, install: with an install refusal the renewals of rows it could stop
 #: still ran, the claims did not); 2 the reaper raised; 3 the graceful bound fired; 4 a launched session row was renewed
-#: with no session launcher to END it (none is registered in this process: the run server's wiring, S10b); 70 the
+#: with no session launcher to END it (an install that names none, or whose launcher cannot be built); 70 the
 #: watchdog took the process.
 EXIT_OK, EXIT_REFUSED, EXIT_REAPER_ERROR, EXIT_SOFT_TIMEOUT, EXIT_NO_LAUNCHER, EXIT_HARD_TIMEOUT = 0, 1, 2, 3, 4, 70
 
@@ -159,10 +159,10 @@ def executor_of_factory(store: AgentStore, *, launcher_of: Callable[[], Any],
 
 
 def session_launcher_of(store: AgentStore) -> Callable[[], Any]:
-    """``launcher_of`` for the store's ``session_install.json`` (``session_wire.resolve_launcher``). Nothing under
-    ``levain/`` calls ``register_launcher`` yet (the run server's launcher is S10b's to wire), so an install that names
-    a launcher refuses here and one that names none gives the unwired default: either way the router records the
-    session rows it met and :func:`run_tick` exits :data:`EXIT_NO_LAUNCHER`."""
+    """``launcher_of`` for the store's ``session_install.json`` (``session_wire.resolve_launcher``). The production launcher
+    is registered by importing ``session_wire`` (S10a); an install that names none gives the unwired default, and one
+    whose launcher cannot be built refuses: either way the router records the session rows it met and :func:`run_tick`
+    exits :data:`EXIT_NO_LAUNCHER`."""
     def build() -> Any:
         from levain.agents import session_wire as _wire
         return _wire.resolve_launcher(store, _wire.read_install(store.directory))
@@ -469,8 +469,7 @@ def run_tick(store: AgentStore | Path | str | None, *, coord_dir: Path | str | N
         rows = [] if seen.get("refused") else list(getattr(seen.get("executor_of"), "no_launcher", []))
         if rows:
             say(f"{len(rows)} launched session row(s) have no session launcher, so they can be renewed but never "
-                f"ENDed ({rows[0][1]}; first: {rows[0][0]}). No launcher is registered in this process until the run "
-                "server's launcher is wired (S10b).")
+                f"ENDed ({rows[0][1]}; first: {rows[0][0]}). Name a launcher in the install file.")
         return rows
 
     try:

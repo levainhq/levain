@@ -196,7 +196,7 @@ def test_binding_of_arms_nothing_when_the_log_cannot_be_replayed(rig):  # noqa: 
 class FakeSessionClient:
     """The interface S10a's `DispatchSessionLauncher` presents to the reaper (S10 DESIGN 3.2), as a fake: `usage(key)`
     (never raises) and `end_session(key, deadline_s) -> StopResult`, `StopResult(True, ...)` only for a proven END.
-    The real client is exercised by `test_the_real_client_variant` once S10a has landed."""
+    The real client is exercised by `test_the_real_client_variant` (skipped for now; see its docstring)."""
 
     def __init__(self):
         self.ended: list = []
@@ -221,8 +221,8 @@ def test_a_dead_fire_session_row_is_settled_by_one_tick(rig):  # noqa: F811
     assert rig.row(oid)["state"] != "launched"                 # and settled the row on the proof
 
 
-def test_a_live_fire_is_not_ended_by_the_tick(rig):  # noqa: F811
-    """The router and the driver add no stop rule: a row whose fire is alive is left to session.py's rules (S11b)."""
+def test_a_revoked_row_with_a_live_fire_is_ended_once_by_the_tick(rig):  # noqa: F811
+    """S11b Q2=a: the reaper ENDs a barred (revoked) session row even while its fire is alive, once, about a minute on."""
     import json
     from levain.consent.delivery import process_identity
     oid, key = _session_row(rig)
@@ -242,19 +242,19 @@ def test_a_live_fire_is_not_ended_by_the_tick(rig):  # noqa: F811
         clock = Clock(rig)
         clock.advance(60)
         T.run_tick(rig.store, clock=clock, authority=rig.authority, launcher_of=lambda: client)
-        assert client.ended == []
+        assert len(client.ended) == 1 and client.ended[0][0] == key
     finally:
         fire.kill()
         fire.wait()
 
 
 def test_the_real_client_variant(rig):  # noqa: F811
-    """INTEGRATION (S10a/S11, the head's after both land): the same dead-fire settle with the real
-    `levain.agents.session_client` talking to an in-process dispatch server. Until S10a lands this skips; once it has,
-    the head replaces the body with the end-to-end drive (the fake above names the interface it must satisfy)."""
+    """INTEGRATION (the head's): the same dead-fire settle with the real `levain.agents.session_client` talking to an
+    in-process dispatch server. The real client is importable here (asserted below); the end-to-end drive is still
+    missing in this tree (the client-sync test lives on seat/1104-29-s10b-b2, not merged)."""
     client = pytest.importorskip("levain.agents.session_client")
     assert callable(getattr(client.DispatchSessionLauncher, "end_session", None))
-    pytest.skip("S10a/S11 integration: drive run_tick through the real client + in-process server (head, after both land)")
+    pytest.skip("end-to-end drive missing: run_tick through the real client + an in-process dispatch server (the head's integration; client-sync test not in this tree)")
 
 
 def test_a_reaper_that_raised_is_not_a_clean_exit(rig, monkeypatch, capsys):  # noqa: F811
@@ -377,7 +377,7 @@ def test_a_session_row_with_no_registered_launcher_is_loud(rig, capsys, launcher
     code = T.run_tick(rig.store, clock=clock, authority=rig.authority)
     assert code == T.EXIT_NO_LAUNCHER
     err = capsys.readouterr().err
-    assert "no session launcher" in err and oid in err and "S10b" in err
+    assert "no session launcher" in err and oid in err and "Name a launcher in the install file" in err
 
 
 def test_binding_of_does_not_arm_a_link_whose_signer_was_revoked(rig):  # noqa: F811
