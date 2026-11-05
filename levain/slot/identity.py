@@ -121,7 +121,8 @@ def parse_auth_answer(exit_code: int, out: bytes) -> str:
     is within :data:`PROFILE_ANSWER_MAX`, and holds exactly ``claim`` :data:`CLAIM`, ``logged_in`` true and that
     digest. Fail closed on any other shape.
 
-    * ``identity-expired``: the binary said it is not logged in (sign in to this slot again).
+    * ``identity-expired``: the binary said it is not logged in (a credential with no access token; sign in to this
+      slot again). A login that expired or was revoked on the server still answers logged in: this name never sees it.
     * ``identity-unreachable``: the binary did not answer in time (``timeout``), a retry, never a new login; or it is
       older than the child's minimum version (``binary-too-old`` leads the detail), an upgrade of the vendor binary.
     * ``identity-unparsable``: every other error name, a non-zero exit, a different claim or any other shape."""

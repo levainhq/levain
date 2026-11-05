@@ -8,9 +8,9 @@ local data?) was measured on the operator's signed-in VM slot 2026-11-05 (levain
 local data. The answer is therefore a LOCAL-DATA claim (:data:`CLAIM`), "local data says this sign-in"; root
 (:func:`levain.slot.identity.parse_auth_answer`) holds the same word. The binary takes the account (email, orgId)
 from the ``oauthAccount`` block of the session's ``.claude.json``, which render seeds from the block the slot's login
-parked (np-8645041e (a), :func:`levain.slot.end.park_move`). Known edge: a different credential under the same
-recorded account is not detected by this check (loggedIn comes from the credential, the id comes from the recorded
-block).
+parked (np-8645041e (a), :func:`levain.slot.end.park_move`). So the account is a recorded LABEL: the parked record
+names an account, it does not tell which account the credential belongs to, and it does not see an expired login
+(``loggedIn`` comes from the credential's access token, with no expiry check and no server call).
 
 This replaced the earlier child that refreshed the OAuth token itself: that refresh was a first-party-only act.
 

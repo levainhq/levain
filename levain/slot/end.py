@@ -2282,9 +2282,8 @@ def _set_aside(facts: EndFacts, sfd: int, src: Path, name: bytes, dest: Path, oc
 
 
 # --- the identity seed (identseed, np-8645041e (a)) -------------------------------------------------------------------
-# The claim stays "local data says this sign-in" (identity_child.CLAIM). Known edge: a different credential under the
-# same recorded account is not detected by this check (loggedIn comes from the credential, the id from the recorded
-# block).
+# The claim string stays "local-data" (identity_child.CLAIM). The parked record is a LABEL: it names the account the
+# login recorded; it does not tell which account the credential belongs to, and it does not see an expired login.
 
 def check_seed_block(block: object) -> dict[str, object] | None:
     """The whitelisted account block (:data:`IDENTITY_SEED_KEYS` only) when ``block`` is a dict whose

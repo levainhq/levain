@@ -32,7 +32,8 @@ def test_login_still_needs_passthrough() -> None:
     assert e.value.name == "login-needs-passthrough"
 
 
-def test_auth_help_names_the_identity_check_and_codex_not_a_check() -> None:
+def test_auth_help_names_the_recorded_account_label_and_codex_not_a_check() -> None:
     text = " ".join(L.build_parser().format_help().split())
     assert "for now" not in text
-    assert "after the identity check" in text and "not a check" in text
+    assert "the account recorded when it was signed in" in text and "not a check" in text
+    assert "after the identity check" not in text and "verified" not in text

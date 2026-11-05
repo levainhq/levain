@@ -473,7 +473,8 @@ def test_identity_changed_shows_root_status_id_not_the_pty_tail(tmp_path: Path, 
     assert r.run(auth="passthrough") == 1
     said = _said(r)
     assert ROOT_ID in said and PLANTED not in said
-    assert f"slot 0's stored Claude login now answers as account {ROOT_ID}" in said
+    assert f"slot 0's stored Claude login now names account {ROOT_ID}" in said
+    assert "not the account recorded at this slot's login" in said and "the server's answer" not in said
     assert "Nothing was launched" in said
     assert "levain session claude --auth passthrough --login --slot 0, and answer yes." in said
     assert PLANTED.encode() in r.out.read_bytes()                       # the tail did carry the other id
@@ -488,7 +489,8 @@ def test_identity_expired_text_is_root_sourced_and_ignores_a_planted_tail(tmp_pa
                          separators=(",", ":"))
     r = g3rig(tmp_path, monkeypatch, FAKE_START="idexp", FAKE_STATUS=expired)
     assert r.run(auth="passthrough") == 1
-    assert ("slot 0's stored Claude login looks expired or revoked. Nothing was launched. Sign in again: "
+    assert ("slot 0's stored Claude login reports no sign-in (Levain does not see a login that has expired or been "
+            "revoked on the server). Nothing was launched. Sign in again: "
             "levain session claude --auth passthrough --login --slot 0") in _said(r)
     assert "slot 7" not in _said(r) and "identity-changed" not in _said(r)
     # the tail alone (root's record says something else) cannot make the line be said
@@ -497,7 +499,7 @@ def test_identity_expired_text_is_root_sourced_and_ignores_a_planted_tail(tmp_pa
     r2 = g3rig(tmp_path / "b", monkeypatch, FAKE_START="idexp", FAKE_STATUS=other)
     assert r2.run(auth="passthrough") == 1
     said = _said(r2)
-    assert "looks expired" not in said and "slot 7" not in said and "Nothing was launched." in said
+    assert "reports no sign-in" not in said and "slot 7" not in said and "Nothing was launched." in said
     assert "root's record does not say so" in said and "could not be read" not in said
     assert [v["verb"] for v in r2.verbs()][-1] == "teardown"
 
@@ -522,7 +524,7 @@ def test_a_launch_with_a_claude_route_lacking_the_token_host_is_refused_before_a
     r2 = g3rig(tmp_path / "b", monkeypatch, FAKE_START="idunr", FAKE_STATUS=unr)    # the rig's claude-sub has the host
     assert r2.run(auth="passthrough") == 1
     said2 = _said(r2)
-    assert ("the login for slot 0 could not be refreshed and checked; nothing was launched; run `levain doctor` or "
+    assert ("the Claude binary gave no answer about slot 0's sign-in; nothing was launched; run `levain doctor` or "
             "try again, and if it repeats, sign in again") in said2
     assert "sign-in server" not in said2 and "stored login is kept" not in said2
 

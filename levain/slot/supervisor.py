@@ -1554,8 +1554,9 @@ class Supervisor:
                 return
             vendor = self.req.vendor
             n = self._slot_index
-            self.say(f"slot {n}'s stored {({'claude': 'Claude', 'codex': 'Codex'}).get(vendor, vendor)} login looks "
-                     f"expired or revoked. Nothing was launched. Sign in again: levain session {vendor} "
+            self.say(f"slot {n}'s stored {({'claude': 'Claude', 'codex': 'Codex'}).get(vendor, vendor)} login "
+                     f"reports no sign-in (Levain does not see a login that has expired or been revoked on the "
+                     f"server). Nothing was launched. Sign in again: levain session {vendor} "
                      f"--auth passthrough --login --slot {n}")
         except Exception as e:   # noqa: BLE001 - said, never raised over the teardown that follows
             try:
@@ -1564,12 +1565,10 @@ class Supervisor:
                 pass
 
     def _identity_unreachable(self, session: str) -> None:
-        """``start`` refused ``identity-unreachable`` (the login could not be refreshed and checked): routed like
-        :meth:`_identity_expired`, so the retry text is said only when root's ``status`` record also says
-        ``identity-unreachable``. The name is root's catch-all for every refresh outcome without an answer of its own
-        (a network failure, but also a 200 that could not be used, an abandoned exchange, a local pre-request failure),
-        and the record carries no detail, so the text claims neither a network failure nor a kept login; it tells him
-        to retry and, only if that repeats, to sign in again."""
+        """``start`` refused ``identity-unreachable`` (the Claude binary did not answer in time, or is too old): routed
+        like :meth:`_identity_expired`, so the retry text is said only when root's ``status`` record also says
+        ``identity-unreachable``. The record carries no detail, so the text claims neither a cause nor a kept login;
+        it tells him to retry and, only if that repeats, to sign in again."""
         neutral = ("start refused identity-unreachable, but root's record could not be read ({why}). "
                    "Nothing was launched.")
         try:
@@ -1582,7 +1581,7 @@ class Supervisor:
                 self.say("start refused identity-unreachable, but root's record does not say so. "
                          "Nothing was launched.")
                 return
-            self.say(f"the login for slot {self._slot_index} could not be refreshed and checked; nothing was launched; "
+            self.say(f"the Claude binary gave no answer about slot {self._slot_index}'s sign-in; nothing was launched; "
                      "run `levain doctor` or try again, and if it repeats, sign in again")
         except Exception as e:   # noqa: BLE001 - said, never raised over the teardown that follows
             try:
@@ -1600,12 +1599,13 @@ class Supervisor:
         vendor = self.req.vendor
         name = {"claude": "Claude", "codex": "Codex"}.get(vendor, vendor)
         if result != "identity-changed" or oid is None:
-            self.say("identity-changed: the slot's stored login did not match its baseline; root's record does not "
-                     "name an account, so none is shown. Nothing was launched.")
+            self.say("identity-changed: the slot's stored login names a different account than the one recorded at "
+                     "its login; root's record does not name an account, so none is shown. Nothing was launched.")
             return
         n = self._slot_index
-        self.say(f"slot {n}'s stored {name} login now answers as account {oid} (the server's answer), not the "
-                 f"account confirmed as this slot's baseline. Nothing was launched. To use another account on "
+        self.say(f"slot {n}'s stored {name} login now names account {oid} (read from the Claude binary's local "
+                 f"data; Levain does not check it with the server), not the account recorded at this slot's login. "
+                 f"Nothing was launched. To use another account on "
                  f"this slot, sign in again: levain session {vendor} "
                  f"--auth passthrough --login --slot {n}, and answer yes.")
 
@@ -1639,11 +1639,12 @@ class Supervisor:
         name = {"claude": "Claude", "codex": "Codex"}.get(self.req.vendor, self.req.vendor)
         if oid == NOT_A_CHECK:
             prompt = (f"levain: {name} has no server-validated identity call, so this login is recorded as not a "
-                      f"check: Levain cannot tell which account it is. Keep it as this slot's {name} baseline? "
-                      "[y/N] ")
+                      f"check: Levain cannot tell which account it is. Record it as this slot's {name} account "
+                      "label? [y/N] ")
         else:
-            prompt = (f"levain: this login is {name} account {oid} (the server's answer). Keep it as this slot's "
-                      f"{name} baseline? [y/N] ")
+            prompt = (f"levain: this sign-in names {name} account {oid}. Levain will record that as this slot's "
+                      f"{name} account label; a later session whose sign-in names another account is refused. It "
+                      "does not check which account the login belongs to. Record it? [y/N] ")
         if self.req.dispatch:
             prompt = prompt.replace(" [y/N] ", f" A yes also lets unattended runs (dispatch) use this {name} login. [y/N] ")
         answer = (self.s.confirm or self._ask)(prompt)
@@ -1659,8 +1660,9 @@ class Supervisor:
         if not answer:
             self.say("not confirmed: no baseline written")
         elif res == {"baseline": BASELINE_WRITTEN}:
-            self.say(f"baseline written: this slot's {name} login is its baseline"
-                     + (" (not a check)" if oid == NOT_A_CHECK else f" (account {oid})"))
+            self.say(f"baseline written: this slot's {name} account label is recorded"
+                     + (" as not a check" if oid == NOT_A_CHECK
+                        else f" as {oid}; Levain does not check it"))
         else:
             self.say("no baseline written: root's answer did not say it wrote one")
 
