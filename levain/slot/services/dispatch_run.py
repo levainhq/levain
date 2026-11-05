@@ -324,9 +324,10 @@ class _Holder:
     launched child (None until the spawn answers; ``ready`` is set when it has, or when it failed), the proof and
     exposure it was launched under (re-judged before RELEASE), whether its ABORT already ran, and its END job once its
     cleanup started (``job``, set once under ``lock``: the cleanup runs once whichever of EOF, a refused RELEASE or
-    shutdown reaches it first). ``ending`` is THE one "an END began for this session" fact: set under ``lock`` before
-    any END job for the key starts (the holder's own cleanup, or a short-connection END while the holder is
-    registered), and RELEASE reads it under the same ``lock``, so a RELEASE either ran before every END or refuses.
+    shutdown reaches it first). ``ending`` is THE one "an END began for this session" fact: set before any END job for
+    the key starts (the holder's own cleanup, under ``lock``; a short-connection END while the holder is registered,
+    under ``lock`` unless its deadline ran out waiting for it, see :meth:`RunServer._end`), and RELEASE reads it under
+    ``lock``, so a RELEASE either ran before every END or refuses and runs the cleanup itself.
     It leaves ``_live`` only when an END for its key is PROVEN."""
 
     def __init__(self, key: str, proof: C.LinkProof, exposure: Optional[ActionExposure],
@@ -473,9 +474,15 @@ class RunServer:
                 self._finish(mine, HOLDER_END_WAIT_S)
                 raise
             with mine.lock:
-                if mine.ending:
-                    raise LauncherRefused("session-ended", "this session's END already started; nothing is released")
-                mine.child.release()
+                ended = mine.ending
+                if not ended:
+                    mine.child.release()
+            if ended:
+                # the holder's cleanup runs here, not at EOF: an END that began before the child existed (during the
+                # spawn) finished unproven and aborted nothing (L3 fixrel r1). No wait on the job: an END is already
+                # under way, and the refusal must answer inside the client's RELEASE timeout.
+                self._finish(mine, 0.0)
+                raise LauncherRefused("session-ended", "this session's END already started; nothing is released")
             return C.ok_answer(rid), mine
         if op == "TERM":
             self._fields(req)
@@ -701,14 +708,23 @@ class RunServer:
     def _end(self, key: str, deadline_s: float) -> StopResult:
         """Answer within ``deadline_s`` with the key's END job's result, else that it is in progress. A holder registered
         under the key (its spawn in flight included) is marked ``ending`` under its lock BEFORE the job starts, so its
-        RELEASE refuses from here on (codex HIGH, bundle L3 :471)."""
+        RELEASE refuses from here on (codex HIGH, bundle L3 :471). The lock is waited on only inside ``deadline_s``: the
+        holder's cleanup holds it across an ABORT that may be slow (L3 fixrel r1). On timeout the flag is set without
+        it (a plain bool write); the holder is then either in its cleanup (which sets ``ending`` itself) or in a RELEASE
+        that already took the lock, i.e. one that ran before this END, the case the END then stops."""
+        end_at = time.monotonic() + max(0.0, deadline_s)
         with self._mu:
             h = self._live.get(key)
         if h is not None:
-            with h.lock:
+            if h.lock.acquire(timeout=min(max(0.0, deadline_s), threading.TIMEOUT_MAX)):
+                try:
+                    h.ending = True
+                finally:
+                    h.lock.release()
+            else:
                 h.ending = True
         job = self._start_end(key)
-        job.done.wait(max(0.0, deadline_s))
+        job.done.wait(max(0.0, end_at - time.monotonic()))
         return job.result
 
     def _run_end(self, key: str, job: _EndJob) -> None:
