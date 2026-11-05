@@ -91,12 +91,15 @@ def _rec(session, total, tid=1, event="tunnel"):
 def test_shared_slot_log_returns_only_the_asked_sessions_final_total(tmp_path):
     log = tmp_path / "tunnel.log"
     # slot reuse: A, then B, then A's later record, then B again, all in one append-only file
-    log.write_text(_rec("A", 100) + _rec("B", 7) + _rec("A", 900000, 2) + "torn{\n" + _rec("B", 1000, 2)
+    log.write_text("torn{\n" + _rec("A", 100) + _rec("B", 7) + _rec("A", 900000, 2) + _rec("B", 1000, 2)
                    + json.dumps({"event": "other", "session": "A", "passthrough_total": 5}) + "\n")
     s = DispatchUsageSources(run_state=lambda r: {}, tunnel_log=lambda sess: log, seconds_of=lambda sess: 1)
     assert s.tunnel_bytes("A") == 900000
     assert s.tunnel_bytes("B") == 1000
     assert s.tunnel_bytes("C") is None
+    # S10b C FIX ROUND 3: a torn line after a session's first record may be one of its records: None
+    log.write_text(_rec("A", 100) + "torn{\n" + _rec("A", 900000, 2))
+    assert s.tunnel_bytes("A") is None
     log.write_text(_rec("B", 1000))  # A's records rotated away: None, never B's total
     assert s.tunnel_bytes("A") is None
 

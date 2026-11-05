@@ -1236,13 +1236,12 @@ class Front:
                 sys.stderr.write(line)
                 return True
             data = line.encode("utf-8")
-            if len(data) > self.log_cap:      # one record past the whole cap would break the two-cap bound
+            whole = len(data) <= self.log_cap
+            if not whole:                     # one record past the whole cap would break the two-cap bound
                 data = (json.dumps({**head, "event": "log-record-dropped", "bytes": len(data)}, sort_keys=True)
                         + "\n").encode("utf-8")
-                self._append(self.log_path, data)
-                return False
             self._append(self.log_path, data)
-            return True
+            return whole
         except OSError as e:
             print(f"levain gw-front: log write failed ({e}): {line}", file=sys.stderr, end="")
             return False
