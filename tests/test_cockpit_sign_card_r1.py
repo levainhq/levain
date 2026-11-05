@@ -259,7 +259,7 @@ def test_a_pick_list_a_redraw_detached_releases_the_card_and_a_write_in_survives
             {"until": STRIP_FACET + " && 1", "ms": 30000},
             # R4: the pick list is open when the card is drawn again; the new card's tap opens a new pick list (the old
             # one released the lease), and the old one's words are what the card now says
-            {"eval": f"{OPTION_B}.click() || 1"},
+            {"tap": f"{OPTION_B}"},
             {"until": PICKS},
             {"eval": REDRAW},
             {"until": f"{CARD_KEPT} && {PICKS} === 3 && 1", "ms": 20000},   # the board read left the open card, and its pick list, alone
@@ -267,7 +267,7 @@ def test_a_pick_list_a_redraw_detached_releases_the_card_and_a_write_in_survives
                      ".find(b => b.textContent === 'dismiss').click() || 1"},
             # R9
             {"eval": COUNT_RELOADS},
-            {"eval": f"{OPTION_B}.click() || 1"},
+            {"tap": f"{OPTION_B}"},
             {"until": PICKS, "may_timeout": True},
             {"eval": "[...document.querySelectorAll('#levain-modal .needs-question .sign-pick')]"
                      ".find(b => b.textContent === 'dismiss').click() || 1"},
@@ -276,7 +276,7 @@ def test_a_pick_list_a_redraw_detached_releases_the_card_and_a_write_in_survives
             {"eval": NEVER_SENT.format(tail=json.dumps("/answer"))},
             {"eval": f"(() => {{ const i = {WRITE_IN}; i.value = 'only after the backup'; "
                      "i.dispatchEvent(new Event('input')); return 1; })()"},
-            {"eval": f"{WORDS_BTN}.click() || 1"},
+            {"tap": f"{WORDS_BTN}"},
             {"until": PICKS},
             _pick(fp),
             {"until": f"/never reached the cockpit/.test({FACET_NOTE}) && {FACET_NOTE}"},
@@ -313,6 +313,8 @@ def test_past_the_listings_cap_the_card_signs_and_a_message_sends(tmp_path, monk
             {"until": STRIP_FACET + " && 1", "ms": 30000, "may_timeout": True},
             {"eval": "[...document.querySelectorAll('#levain-modal .needs-question .sign-option')].map(b => b.textContent)"},
             {"until": BOX + " && 1"},
+            # the focus view closed when it is open: the compose box is under it
+            {"eval": "((x) => (x && x.click(), 1))(document.querySelector('#levain-modal .modal-close'))"},
             _send("past the cap"),
             {"until": CLEARED, "ms": 30000, "may_timeout": True},
             {"eval": BOX_MSG},

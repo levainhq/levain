@@ -46,7 +46,7 @@ def test_a_fresh_facet_finds_the_answer_signed_after_the_request_left_the_listin
         out = _drive(tmp_path, f"{rig.origin}/#write_token={TOK}", [
             DESKTOP, rig.authenticator(), {"until": STRIP_FACET + " && 1", "ms": 30000},
             {"eval": CARD_SENT_THEN_LOST.format(tail=json.dumps("/answer"))},
-            {"eval": f"{OPTION_B}.click() || 1"},
+            {"tap": f"{OPTION_B}"},
             {"until": f"/still verifying/.test({FACET_NOTE}) && {FACET_NOTE}", "ms": 30000},
             {"eval": AFTER.format(ms=9000)},                  # the verify is let through: it signs, the row leaves
             {"eval": HISTORY},
@@ -90,7 +90,7 @@ def test_a_fresh_facet_asks_on_every_board_read_until_the_answer_reads_refused(t
         out = _drive(tmp_path, f"{rig.origin}/#write_token={TOK}", [
             DESKTOP, rig.authenticator(), {"until": STRIP_FACET + " && 1", "ms": 30000},
             {"eval": CARD_SENT_THEN_LOST.format(tail=json.dumps("/answer"))},
-            {"eval": f"{OPTION_B}.click() || 1"},
+            {"tap": f"{OPTION_B}"},
             {"until": f"/still verifying/.test({FACET_NOTE}) && {FACET_NOTE}", "ms": 30000},
             {"eval": AFTER.format(ms=2500)},                  # past the page's 2 s listing reuse
             {"eval": HISTORY},
@@ -138,7 +138,7 @@ def test_a_facet_drawn_after_the_answer_settled_refused_says_so_and_keeps_saying
         out = _drive(tmp_path, f"{rig.origin}/#write_token={TOK}", [
             DESKTOP, rig.authenticator(), {"until": STRIP_FACET + " && 1", "ms": 30000},
             {"eval": CARD_SENT_THEN_LOST.format(tail=json.dumps("/answer"))},
-            {"eval": f"{OPTION_B}.click() || 1"},
+            {"tap": f"{OPTION_B}"},
             {"until": f"/still verifying/.test({FACET_NOTE}) && {FACET_NOTE}", "ms": 30000},
             {"eval": READS_EVERY_1500},
             {"until": f"/not signed/.test({FACET_NOTE}) && {FACET_NOTE}", "ms": 45000},   # settled, nobody drawn yet
@@ -193,7 +193,7 @@ def test_a_facet_drawn_after_the_first_pass_settle_refused_still_says_why(tmp_pa
         out = _drive(tmp_path, f"{rig.origin}/#write_token={TOK}", [
             DESKTOP, rig.authenticator(), {"until": STRIP_FACET + " && 1", "ms": 30000},
             {"eval": CARD_ANSWER_503.format(tail=json.dumps("/answer"))},
-            {"eval": f"{OPTION_B}.click() || 1"},
+            {"tap": f"{OPTION_B}"},
             {"eval": AFTER.format(ms=3000)},
             {"eval": HISTORY},
             {"until": f"{ROW} && 1", "ms": 30000},
@@ -236,7 +236,7 @@ def test_a_signed_request_leaves_nothing_frozen_behind_for_a_reused_id(tmp_path:
         t.start()
         out = _drive(tmp_path, f"{rig.origin}/#write_token={TOK}", [
             DESKTOP, rig.authenticator(), {"until": STRIP_FACET + " && 1", "ms": 30000},
-            {"eval": f"{OPTION_B}.click() || 1"},
+            {"tap": f"{OPTION_B}"},
             {"until": f"/^signed/.test({FACET_NOTE}) && {FACET_NOTE}", "ms": 30000},
             {"eval": AFTER.format(ms=3500)},                  # the request is filed again meanwhile
             {"eval": "window.LevainCockpitTransport.reload() && 1"},

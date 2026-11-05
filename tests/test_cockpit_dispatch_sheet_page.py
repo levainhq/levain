@@ -115,7 +115,7 @@ def test_a_dispatch_job_is_signed_in_the_sheet_and_the_store_verifies_it(tmp_pat
             DESKTOP, rig.authenticator(), *rig.open_top(),
             {"eval": "document.getElementById('sheet-title').textContent"},
             {"eval": "[...document.querySelectorAll('#sheet-actions [data-choice]')].map(b => b.dataset.choice).join(',')"},
-            {"eval": "document.querySelector('#sheet-actions [data-choice=\"sign\"]').click() || 1"},
+            {"tap": "document.querySelector('#sheet-actions [data-choice=\"sign\"]')"},
             {"until": f"/^signed/.test({NOTE}) && {NOTE}", "ms": 30000},
             {"eval": "(document.getElementById('sheet-signing') || {}).textContent"},
         ])
@@ -140,7 +140,7 @@ def test_a_dispatch_job_is_cancelled_in_the_sheet_with_its_reason(tmp_path: Path
         out = _drive(tmp_path, f"{rig.origin}/nope", [
             DESKTOP, rig.authenticator(), *rig.open_top(),
             {"eval": "(() => { const b = document.getElementById('sheet-reason'); b.value = '  wrong repo  '; return 1; })()"},
-            {"eval": "document.querySelector('#sheet-actions [data-choice=\"cancel\"]').click() || 1"},
+            {"tap": "document.querySelector('#sheet-actions [data-choice=\"cancel\"]')"},
             {"until": f"/^signed/.test({NOTE}) && {NOTE}", "ms": 30000},
         ])
     v = out["values"]
@@ -167,7 +167,7 @@ def test_the_decisions_view_lists_the_job_and_its_sign_button_opens_the_sheet_wi
             {"until": f"{IN} && {IN}.getElementById('sheet') && {IN}.getElementById('sheet').dataset.state", "ms": 30000},
             {"eval": f"{FRAME}.getAttribute('src')"},
             {"eval": f"!!{IN}.getElementById('sheet-picked') && {IN}.getElementById('sheet-picked').textContent"},
-            {"eval": f"{IN}.getElementById('sheet-picked').click() || 1"},
+            {"tap": f"{IN}.getElementById('sheet-picked')"},
             {"until": f"/^signed/.test({IN}.getElementById('sheet-note').textContent) && "
                       f"{IN}.getElementById('sheet-note').textContent", "ms": 30000},
         ])
@@ -317,7 +317,7 @@ def test_an_authorise_whose_recommendation_moved_between_card_and_tap_signs_noth
                      "c.get = (o) => { window.__gets++; return g(o); }; return 1; })()"},
             {"eval": f"/Authorise run 1 onto main/.test({box}.textContent)"},
             {"eval": "[...document.querySelectorAll('#sheet-actions [data-choice]')].map(b => b.dataset.choice).join(',')"},
-            {"eval": "document.querySelector('#sheet-actions [data-choice=\"authorise\"]').click() || 1"},
+            {"tap": "document.querySelector('#sheet-actions [data-choice=\"authorise\"]')"},
             {"until": f"/nothing was signed/.test({NOTE}) && {STATE} === 'open' && "
                       f"/Authorise run 0 onto main/.test({box}.textContent) && {NOTE}", "ms": 30000},
             {"eval": "window.__gets"},
@@ -343,7 +343,7 @@ def test_an_authorise_on_the_card_shown_lands_it(tmp_path: Path, monkeypatch) ->
     with rig.serving():
         out = _drive(tmp_path, f"{rig.origin}/nope", [
             DESKTOP, rig.authenticator(), *rig.open_top(),
-            {"eval": "document.querySelector('#sheet-actions [data-choice=\"authorise\"]').click() || 1"},
+            {"tap": "document.querySelector('#sheet-actions [data-choice=\"authorise\"]')"},
             {"until": f"/^(signed|Not)/.test({NOTE}) && {NOTE}", "ms": 60000},
         ])
     v = out["values"]
@@ -396,7 +396,7 @@ def test_a_dispatch_job_amended_between_the_read_and_the_tap_signs_nothing_and_i
             {"until": f"/changed since it was shown/.test({NOTE}) && {STATE} === 'open' && {sign} && !{sign}.disabled "
                       f"&& {NOTE}", "ms": 30000},
             {"eval": "window.__gets"},
-            {"eval": f"{sign}.click() || 1"},
+            {"tap": f"{sign}"},
             {"until": f"/^signed/.test({NOTE}) && {NOTE}", "ms": 30000},
         ])
     v = out["values"]
@@ -455,7 +455,7 @@ def test_an_authorise_whose_card_moved_is_refused_by_the_cockpit_before_any_pass
         sheet.step = step
         out = _drive(tmp_path, f"{rig.origin}/nope", [
             DESKTOP, rig.authenticator(), *rig.open_top(), {"eval": GETS},
-            {"eval": "document.querySelector('#sheet-actions [data-choice=\"authorise\"]').click() || 1"},
+            {"tap": "document.querySelector('#sheet-actions [data-choice=\"authorise\"]')"},
             {"until": f"/changed since it was shown/.test({NOTE}) && {STATE} === 'open' && "
                       f"/Authorise run 0 onto main/.test({box}.textContent) && {NOTE}", "ms": 30000},
             {"eval": "window.__gets"},
@@ -518,12 +518,13 @@ def test_two_dispatch_slots_both_fill(tmp_path: Path, monkeypatch, repo) -> None
             # the dispatch read answers 3 s late, so the first slot's fill is still out when the second slot is drawn
             {"eval": "(() => { const f = window.fetch; window.fetch = (u, o) => (String(u).indexOf('/cockpit/dispatch.json') >= 0"
                      " ? new Promise((r) => setTimeout(r, 3000)).then(() => f(u, o)) : f(u, o)); return 1; })()"},
-            {"eval": "window.LevainNeeds.history() || 1"},
-            {"until": f"!!document.querySelector('#levain-modal') && {slots}.length === 1 && 1", "ms": 30000},
+            # history() answers false and draws nothing until the cockpit's first view has arrived (CI 11-04: a single call
+            # made as soon as the function existed was a no-op, and the modal never opened); the act-until step repeats it
+            # together with its assertion
+            {"do": "window.LevainNeeds.history() || 1", "until": f"!!document.querySelector('#levain-modal') && {slots}.length === 1 && 1", "ms": 30000},
             # the first slot stays on the page, its fill still out; the history opened again draws a second one
             {"eval": f"(() => {{ document.body.appendChild({slots}[0]); return 1; }})()"},
-            {"eval": "window.LevainNeeds.history() || 1"},
-            {"until": f"{slots}.length === 2 && 1", "ms": 30000},
+            {"do": "window.LevainNeeds.history() || 1", "until": f"{slots}.length === 2 && 1", "ms": 30000},
             {"eval": f"{slots}.map(s => !!s.querySelector('[data-dispatch-job]')).join(',')"},
             {"until": f"{slots}.every(s => s.querySelector('[data-dispatch-job]')) && 1", "ms": 12000},
         ])

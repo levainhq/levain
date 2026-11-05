@@ -68,7 +68,7 @@ def test_h2_an_answer_that_landed_with_its_reply_lost_is_confirmed_signed_by_its
         out = _drive(tmp_path, f"{rig.origin}/#write_token={TOK}", [
             *_card(rig),
             {"eval": LOSE_REPLY.format(tail=json.dumps("/answer"))},
-            {"eval": f"{OPTION_B}.click() || 1"},
+            {"tap": f"{OPTION_B}"},
             {"until": f"/the cockpit confirmed it/.test({FACET_NOTE}) && {FACET_NOTE}", "ms": 30000},
             {"eval": AFTER.format(ms=2000)},
             {"eval": BUTTONS},
@@ -89,10 +89,10 @@ def test_h2_an_answer_that_never_left_is_refused_by_its_attempt_and_only_then_th
         out = _drive(tmp_path, f"{rig.origin}/#write_token={TOK}", [
             *_card(rig),
             {"eval": NEVER_SENT.format(tail=json.dumps("/answer"))},
-            {"eval": f"{OPTION_B}.click() || 1"},
+            {"tap": f"{OPTION_B}"},
             {"until": f"!{OPTION_B}.disabled && {FACET_NOTE}", "ms": 30000},
             {"eval": OPEN % QRID},
-            {"eval": f"{OPTION_B}.click() || 1"},
+            {"tap": f"{OPTION_B}"},
             {"until": f"/^signed/.test({FACET_NOTE}) && {FACET_NOTE}", "ms": 30000},
         ])
     v = out["values"]
@@ -111,12 +111,11 @@ def test_h4_a_malformed_challenge_is_named_and_no_passkey_is_asked(tmp_path, mon
         out = _drive(tmp_path, f"{rig.origin}/#write_token={TOK}", [
             *_card(rig),
             _patch("/challenge", {"challenge": ""}),
-            {"eval": f"{OPTION_B}.click() || 1"},
+            {"tap": f"{OPTION_B}"},
             {"until": f"/nothing was signed/.test({FACET_NOTE}) && {FACET_NOTE}", "ms": 30000},
             {"until": f"!{OPTION_B}.disabled && 1", "ms": 5000},
             _patch("/challenge", {"challenge": "no+such/text="}),
-            {"eval": f"(() => {{ document.querySelector('#levain-modal .needs-question .sign-note').textContent = ''; "
-                     f"{OPTION_B}.click(); return 1; }})()"},
+            {"tap": OPTION_B, "before": "(document.querySelector('#levain-modal .needs-question .sign-note').textContent = '', 1)"},
             {"until": f"/nothing was signed/.test({FACET_NOTE}) && {FACET_NOTE}", "ms": 30000},
             {"eval": "window.__gets.length"},
         ])
@@ -137,7 +136,7 @@ def test_h7_a_remembered_id_that_does_not_decode_is_dropped_and_the_card_signs(t
     with rig.serving():
         out = _drive(tmp_path, f"{rig.origin}/#write_token={TOK}", [
             *_card(rig, _remember(rig, "%%% not an id")),
-            {"eval": f"{OPTION_B}.click() || 1"},
+            {"tap": f"{OPTION_B}"},
             {"until": f"/^signed|nothing was signed|not sure/.test({FACET_NOTE}) && {FACET_NOTE}", "ms": 30000},
             {"eval": "window.__gets"},
             {"eval": RECORD},
@@ -151,20 +150,22 @@ def test_h7_a_remembered_id_that_does_not_decode_is_dropped_and_the_card_signs(t
 
 @needs_browser
 @needs_ssh
-def test_h7_a_remembered_id_the_authenticator_refuses_is_asked_once_more_without_it(tmp_path, monkeypatch) -> None:
+def test_h7_a_remembered_id_the_authenticator_refuses_is_asked_without_it_by_the_next_tap(tmp_path, monkeypatch) -> None:
     rig = _Rig(tmp_path, monkeypatch)
     with rig.serving():
         out = _drive(tmp_path, f"{rig.origin}/#write_token={TOK}", [
             *_card(rig, _remember(rig, OTHER)),
-            {"eval": f"{OPTION_B}.click() || 1"},
-            {"until": f"/^signed|nothing was signed|not sure/.test({FACET_NOTE}) && {FACET_NOTE}", "ms": 90000},
+            {"tap": f"{OPTION_B}"},
+            {"until": f"/nothing was signed/.test({FACET_NOTE}) && {FACET_NOTE}", "ms": 90000},
+            {"tap": f"{OPTION_B}"},          # the page never asks again by itself: the retry is a tap
+            {"until": f"/^signed|not sure/.test({FACET_NOTE}) && {FACET_NOTE}", "ms": 90000},
             {"eval": "window.__gets"},
             {"eval": RECORD},
         ])
     v = out["values"]
-    assert str(v[5]).startswith("signed (b)"), v[5]
-    assert v[6] == [1, 0], v[6]                           # the remembered id, refused; then once with none
-    assert json.loads(v[7]) == {rig.pk.key.fingerprint: CRED}, v[7]
+    assert str(v[7]).startswith("signed (b)"), v[7]
+    assert v[8] == [1, 0], v[8]                           # the remembered id, refused; the next tap asks with none
+    assert json.loads(v[9]) == {rig.pk.key.fingerprint: CRED}, v[9]
     assert rig.verifies(QRID)
 
 
@@ -179,7 +180,7 @@ def test_h8_a_signed_reply_missing_its_fields_prints_what_was_sent_and_never_und
         out = _drive(tmp_path, f"{rig.origin}/#write_token={TOK}", [
             *_card(rig),
             _patch("/answer", {}, replace=True),
-            {"eval": f"{OPTION_B}.click() || 1"},
+            {"tap": f"{OPTION_B}"},
             {"until": f"/^signed/.test({FACET_NOTE}) && {FACET_NOTE}", "ms": 30000},
         ])
     said = out["values"][5]
@@ -208,7 +209,7 @@ def test_a_focus_view_opened_again_while_the_cockpit_verifies_shows_the_frozen_c
         out = _drive(tmp_path, f"{rig.origin}/#write_token={TOK}", [
             DESKTOP, rig.authenticator(), {"until": STRIP_FACET + " && 1", "ms": 30000},   # the board reads go on
             {"eval": CARD_SENT_THEN_LOST.format(tail=json.dumps("/answer"))},
-            {"eval": f"{OPTION_B}.click() || 1"},
+            {"tap": f"{OPTION_B}"},
             {"until": f"/still verifying/.test({FACET_NOTE}) && {FACET_NOTE}", "ms": 30000},
             {"eval": close},
             {"eval": reopen},

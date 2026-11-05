@@ -10,7 +10,7 @@ import json
 from pathlib import Path
 
 from tests.test_cockpit_narrow_layout_rig import NEEDS, TOK, FullRig, drive_touch, needs_browser, needs_ssh
-from tests.test_envelope_sheet import FD, SIGN_ON, _click, _in, _tag, make_init
+from tests.test_envelope_sheet import FD, SIGN_ON, _in, _tag, make_init
 from tests.test_msgslot_hero import READY, _tagged, _type
 
 LONG_LINE = ("signing ev-fa26a07a" + "0123456789abcdef" * 3 + "01234567 for SHA256:k7W5K5UxuJkJIHKlROxooI4LS5ZnR8BYUbl/MU9HyAA"
@@ -50,7 +50,7 @@ def _run(tmp_path: Path, monkeypatch) -> dict:
     steps = [emu, {"touch": True}, {"init": init}, {"until": NEEDS, "ms": 30000}, {"until": READY, "ms": 30000}, _type("tidy the changelog"),
              {"eval": "document.querySelector('#ck-drop [data-coord-drop=envelope]').click(); 1"},
              {"until": _in(FD, "return !!d.getElementById('drop-review') && /ev-test/.test(d.getElementById('drop-review').textContent);"), "ms": 30000},
-             SIGN_ON, _click(FD, "#drop-sign"),
+             SIGN_ON, {"tap": f"{FD}.querySelector('#drop-sign')"},
              {"until": _in(FD, "return /delivered/.test(d.getElementById('sheet-note').textContent);"), "ms": 20000},
              {"eval": "new Promise((r) => setTimeout(() => r(1), 600))"},
              _tag("frame", FD, OVER),

@@ -37,6 +37,15 @@
 //                                            page's navigator.credentials.get with userVerification "required" is refused,
 //                                            a cancelled Face ID as the page sees it); nothing is collected
 //   {"key": "<key>"}                        one trusted key press (down, then up) to the focused element; nothing is collected
+//   {"tap": "<expression>", "ms": <n>}      one trusted mouse press and release at the centre of the element the expression
+//                                            names, scrolled into view first, so the page's listeners read event.isTrusted
+//                                            true (an evaluated .click() is never trusted). Polled until the element exists,
+//                                            is not disabled and is the node hit at that point (or holds it); otherwise the
+//                                            drive FAILS as a wait does. Collected as 1, as an `eval` of `x.click() || 1` was.
+//                                            An element in a same-origin frame is pressed at its point in the top page.
+//                                            "before": "<expression>" runs once ahead of it (not collected); "times": <n>
+//                                            presses n times at the one point; "after": "<expression>" runs once right
+//                                            after the presses (not collected)
 // App content that loads asynchronously is not waited for: put an `until` step before the `shot`.
 // LEVAIN_DRIVE_CDP_PORT: the port of an already running headless Chrome (the test session's shared one). The drive then runs in a
 // fresh browser context of that Chrome (its own cookies, storage and cache) and disposes the context on every exit, instead of
@@ -361,6 +370,57 @@ for (const s of steps) {
     await send("Input.dispatchKeyEvent", { type: "keyDown", key: s.key, ...(s.key.length === 1 ? { text: s.key } : {}) });
     await send("Input.dispatchKeyEvent", { type: "keyUp", key: s.key });
     await sleep(200);
+  } else if (s.tap !== undefined) {
+    // `before` runs once ahead of the press (a stub to put in place), and its value is not collected
+    if (s.before !== undefined) {
+      const b = await evaluateOutcome(s.before);
+      if ("error" in b) {
+        console.error(`step ${steps.indexOf(s)}: tap's before failed: ${b.error}: ${s.before}`);
+        await shotOnTimeout(steps.indexOf(s));
+        done(1); await sleep(10000);
+      }
+    }
+    // where a person's finger lands: the element's centre, once it is drawn, enabled and not covered by another node in its
+    // own document; an element inside a same-origin frame is pressed at its point in the top page (the frames' offsets added)
+    const at = `(() => { const e = (${s.tap}\n); if (!e || e.disabled || !e.getBoundingClientRect) return null; `
+      + `e.scrollIntoView({ block: "center", inline: "center" }); `
+      + `for (let w = e.ownerDocument.defaultView; w && w !== window && w.frameElement; w = w.parent) w.frameElement.scrollIntoView({ block: "center", inline: "center" }); `
+      + `const r = e.getBoundingClientRect(); `
+      + `if (!r.width || !r.height) return null; let x = r.left + r.width / 2, y = r.top + r.height / 2; `
+      + `const h = e.ownerDocument.elementFromPoint(x, y); if (!(h && (h === e || e.contains(h)))) return null; `
+      + `for (let w = e.ownerDocument.defaultView; w && w !== window; w = w.parent) { const f = w.frameElement; `
+      + `if (!f) return null; const fr = f.getBoundingClientRect(); x += fr.left + f.clientLeft; y += fr.top + f.clientTop; } `
+      + `return [x, y]; })()`;
+    let xy = null, lastError = null;
+    for (;;) {
+      const o = await evaluateOutcome(at, Math.min(Math.max(deadline - Date.now(), 250), 3000));
+      if ("error" in o) { lastError = o.error; xy = null; } else xy = o.value;
+      if (xy || Date.now() >= deadline) break;
+      await sleep(100);
+    }
+    if (!xy) {
+      console.error(`step ${steps.indexOf(s)}: tap found no element to press within ${waitMs}ms: ${s.tap}` +
+        (lastError ? ` (last error: ${lastError})` : ""));
+      await shotOnTimeout(steps.indexOf(s));
+      done(1); await sleep(10000);
+    }
+    const [x, y] = xy;
+    await send("Input.dispatchMouseEvent", { type: "mouseMoved", x, y });
+    // `times`: that many presses at the one point, back to back (a double tap on a control the first press may disable)
+    for (let i = 0; i < (s.times || 1); i++) {
+      await send("Input.dispatchMouseEvent", { type: "mousePressed", x, y, button: "left", buttons: 1, clickCount: 1 });
+      await send("Input.dispatchMouseEvent", { type: "mouseReleased", x, y, button: "left", buttons: 0, clickCount: 1 });
+    }
+    // `after` runs once right after the presses (a confirm the press drew), and its value is not collected
+    if (s.after !== undefined) {
+      const a = await evaluateOutcome(s.after);
+      if ("error" in a) {
+        console.error(`step ${steps.indexOf(s)}: tap's after failed: ${a.error}: ${s.after}`);
+        await shotOnTimeout(steps.indexOf(s));
+        done(1); await sleep(10000);
+      }
+    }
+    values.push(1);
   } else if (s.focus !== undefined) {
     await send("Emulation.setFocusEmulationEnabled", { enabled: !!s.focus });         // a headless page is never the focused window: without this no focusin / focusout fires
   } else if (s.motion !== undefined) {

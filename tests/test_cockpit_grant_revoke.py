@@ -209,7 +209,7 @@ def test_the_cockpit_revoke_button_runs_the_phones_ceremony_with_the_passkey(wor
             auth_step, {"until": TILE}, {"eval": OPEN_DECISIONS},
             {"until": f"!!{_CARD} && {_CARD}.querySelector('.grant-revoke').title === 'revoke with your passkey'"},
             {"eval": f"!!{_CARD}.querySelector('.consent-code')"},
-            {"eval": f"{_CARD}.querySelector('.grant-revoke').click(), 1"},
+            {"tap": f"{_CARD}.querySelector('.grant-revoke')"},
             {"posts": 2},
             {"until": f"/revoked/.test(({_CARD} || {{textContent: 'revoked'}}).textContent) "
                       "|| /revoked/.test(document.querySelector('#levain-modal').textContent)"},
