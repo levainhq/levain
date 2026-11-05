@@ -343,7 +343,9 @@ def _malformed(frame: Mapping[str, Any]) -> str | None:
         if frame.get(key) is not None and not isinstance(frame.get(key), list):
             return f"{key} is not a list"
     message = frame.get("message")
-    if message is not None:
+    # only an assistant or user frame carries ``message`` as an object a handler reads; a system frame (a permission_denied
+    # one) carries a sentence there, which is not a malformed frame
+    if message is not None and frame.get("type") in ("assistant", "user"):
         if not isinstance(message, Mapping):
             return "message is not an object"
         content = message.get("content")

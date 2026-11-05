@@ -44,6 +44,32 @@
     return first.length > 120 ? first.slice(0, 120) + "..." : first;
   }
 
+  var WRAPPED = /^\s*<tool_use_error>([\s\S]*?)<\/tool_use_error>([\s\S]*)$/;
+  // Only the vendor's own error wrapper is removed: a body that opens with <tool_use_error>inner</tool_use_error> is its inner
+  // text (then any text after the tag, on a new line) and the tag's name. Every other body, including one that is a single
+  // other tag pair (a file or a command's output), is drawn exactly as recorded.
+  function unwrap(text) {
+    var m = WRAPPED.exec(text);
+    if (!m) return { text: text, tag: "" };
+    var rest = m[2].trim();
+    return { text: m[1].trim() + (rest ? "\n" + rest : ""), tag: "tool_use_error" };
+  }
+  // the vendor's own refusal sentences, matched at the start of the unwrapped text (not a word anywhere in it)
+  var REFUSED = [/^File is in a directory that is denied by your permission settings/, /^Permission to use [^\n]{1,100} has been denied/,
+                 /^[^\n;]{1,300} is outside [^\n;]{1,300}; the permissions\.blockReadsOutsideWorkingDirectories setting blocks reads outside the working directories/];
+  // only the head of the text is tested: the vendor's sentences are short, and a very long error body costs nothing
+  function refused(text) { var head = String(text).slice(0, 700); return REFUSED.some(function (re) { return re.test(head); }); }
+  // the head's words for a row: its speaker, else a short sentence for what the row is
+  function headWords(l) {
+    if (l.who) return l.who;
+    if (l.kind === "vendor_tool_result") {
+      if (l.tag === "tool_use_error") return refused(l.text) ? "A tool was refused" : "A tool failed";
+      return "A tool result";
+    }
+    if (l.tool) return l.tool.open ? "A tool is running" : "A tool ran";
+    return l.kind === "vendor_error" ? "Error" : l.kind.replace(/_/g, " ");
+  }
+
   function lineModel(it) {
     var you = it.kind === "message" && it.source === "operator";
     var room = it.kind === "vendor_agent_text";
@@ -51,6 +77,10 @@
     // row that reads "Error" on every turn trains the eye past the one that is (any other mode is still drawn)
     var modeNoise = it.kind === "vendor_error" && it.body === "dontAsk";
     var text = it.body == null ? "" : String(it.body);
+    // a tool's result arrives wrapped in its vendor's tag (e.g. <tool_use_error>...</tool_use_error>); the tag is read for
+    // the head's words and the text is drawn without it, as text like every other word here
+    var tag = "";
+    if (it.kind === "vendor_tool_result") { var un = unwrap(text); text = un.text; tag = un.tag; }
     // a hook of the operator's own settings starting in the child (body e.g. "SessionStart:startup") and one that ended
     // in success are recorded as error-kind rows too (claude_session._on_hook, ref "error:hook_started:<id>"); they are
     // not errors (roomfix2, seen on a real open). A hook that ended any other way, and every other error, is drawn.
@@ -59,10 +89,15 @@
       (ref.indexOf("error:hook_response:") === 0 && / success$/.test(text)));
     if (it.kind === "vendor_approval_request") text = "The room asked for something it cannot have; nothing was granted.";
     if (it.kind === "vendor_approval_resolved") text = "";
+    // a call that has finished and has no words of its own is an empty chip: the result row beside it shows the outcome.
+    // A call still open keeps its row, because that it is running is live information; so does one with no tool facts at all
+    // (it is hidden only on an explicit completion, never on missing state).
+    var emptyDoneCall = it.kind === "vendor_tool_call" && !text && !!it.tool && it.tool.open === false;
     return {
       gseq: it.gseq, ref: ref, at: it.at || "",
       who: you ? "You" : (room ? "The room" : ""), cls: you ? "rv-you" : (room ? "rv-room" : (it.kind === "vendor_error" ? "rv-error" : "")),
-      kind: String(it.kind), text: text, collapsible: own(COLLAPSED, it.kind), hidden: own(HIDDEN, it.kind) || modeNoise || hookNoise,
+      kind: String(it.kind), text: text, collapsible: own(COLLAPSED, it.kind), hidden: own(HIDDEN, it.kind) || modeNoise || hookNoise || emptyDoneCall,
+      tag: tag, rich: room,
       ambiguous: it.kind === "message" && it.status === "ambiguous",
       truncated: it.truncated === true, tool: it.tool ? { open: it.tool.open === true } : null
     };
@@ -110,8 +145,46 @@
 
   // A message's words become DOM here and nowhere as markup: plain text, plus one shape, a fenced block (a line opening with
   // three backticks to the line closing with three), drawn as <pre><code> from the lines between. An unclosed fence (a reply
-  // still streaming) stays plain text, backticks and all; nothing else is parsed.
-  function fillText(doc, node, text) {
+  // still streaming) stays plain text, backticks and all.
+  // The room's own replies (and only those) also get an inline pass over their non-code text, built as elements and never as
+  // markup: **bold** (which may hold `code`) and `code`, each within one line. A marker with no partner on its line stays
+  // literal, a line longer than LONG_LINE is drawn plain (the pass is quadratic in a line's length), and nothing else is
+  // parsed (no links, no images, no HTML, no lists); the words of tools and of the operator get no inline pass at all.
+  var LONG_LINE = 20000;
+  function closeBold(s, from) {
+    var eol = s.indexOf("\n", from);
+    if (eol < 0) eol = s.length;
+    for (var k = from; k < eol; k++) {
+      var c = s.charAt(k);
+      if (c === "`") { var e = s.indexOf("`", k + 1); if (e > k + 1 && e < eol) { k = e; continue; } }
+      if (c === "*" && s.charAt(k + 1) === "*" && !/\s/.test(s.charAt(k - 1))) return k;
+    }
+    return -1;
+  }
+  function inline(doc, target, s, bold) {
+    var buf = "", i = 0;
+    function flush() { if (buf) { target.appendChild(doc.createTextNode(buf)); buf = ""; } }
+    while (i < s.length) {
+      var c = s.charAt(i);
+      if (c === "`") {
+        var e = s.indexOf("`", i + 1);
+        if (e > i + 1 && s.slice(i + 1, e).indexOf("\n") < 0) { flush(); target.appendChild(el(doc, "code", "rv-ic", s.slice(i + 1, e))); i = e + 1; continue; }
+      } else if (!bold && c === "*" && s.charAt(i + 1) === "*" && s.charAt(i + 2) && !/\s/.test(s.charAt(i + 2))) {
+        var j = closeBold(s, i + 2);
+        if (j > i + 2) { flush(); var st = el(doc, "strong"); inline(doc, st, s.slice(i + 2, j), true); target.appendChild(st); i = j + 2; continue; }
+      }
+      buf += c; i++;
+    }
+    flush();
+  }
+  // the inline pass one line at a time (no marker pairs across a newline); a line over LONG_LINE is drawn plain
+  function richText(doc, node, text) {
+    text.split("\n").forEach(function (ln, n) {
+      if (n) node.appendChild(doc.createTextNode("\n"));
+      if (ln.length > LONG_LINE) node.appendChild(doc.createTextNode(ln)); else inline(doc, node, ln, false);
+    });
+  }
+  function fillText(doc, node, text, rich) {
     var lines = text.split(/\r?\n/), parts = [], cur = [], i = 0;
     while (i < lines.length) {
       if (/^ {0,3}```/.test(lines[i])) {
@@ -125,10 +198,15 @@
       }
       cur.push(lines[i]); i++;
     }
-    if (!parts.length) { node.textContent = text; return; }
+    if (!parts.length) { if (rich) richText(doc, node, text); else node.textContent = text; return; }
     if (cur.length) parts.push({ code: false, text: cur.join("\n") });
     parts.forEach(function (p) {
-      if (!p.code) { if (p.text.replace(/\s+/g, "")) node.appendChild(doc.createTextNode(p.text.replace(/^\n+|\n+$/g, ""))); return; }
+      if (!p.code) {
+        if (!p.text.replace(/\s+/g, "")) return;
+        var plain = p.text.replace(/^\n+|\n+$/g, "");
+        if (rich) richText(doc, node, plain); else node.appendChild(doc.createTextNode(plain));
+        return;
+      }
       var pre = el(doc, "pre", "rv-code"), code = el(doc, "code", null, p.text);
       pre.appendChild(code); node.appendChild(pre);
     });
@@ -140,11 +218,11 @@
     var fold = l.collapsible && !!ui, shown = fold && ui.open[l.gseq] === true;
     var head = el(doc, fold ? "button" : "div", "rv-who");
     if (fold) { head.setAttribute("type", "button"); head.setAttribute("aria-expanded", shown ? "true" : "false"); }
-    head.textContent = l.who || (l.tool ? (l.tool.open ? "A tool is running" : "A tool ran") : (l.kind === "vendor_error" ? "Error" : l.kind.replace(/_/g, " ")));
+    head.textContent = headWords(l);
     if (fold && !shown && l.text) head.textContent += " — " + peek(l.text);
     row.appendChild(head);
     var pre = l.text ? el(doc, "div", "rv-text") : null;
-    if (pre) fillText(doc, pre, l.text);
+    if (pre) fillText(doc, pre, l.text, l.rich);
     if (pre) {
       if (fold) pre.hidden = !shown;
       row.appendChild(pre);
@@ -154,7 +232,7 @@
         var now = pre.hidden;
         pre.hidden = !now; head.setAttribute("aria-expanded", now ? "true" : "false");
         if (now) ui.open[l.gseq] = true; else delete ui.open[l.gseq];
-        head.textContent = l.who || (l.tool ? (l.tool.open ? "A tool is running" : "A tool ran") : l.kind.replace(/_/g, " "));
+        head.textContent = headWords(l);
         if (!now && l.text) head.textContent += " — " + peek(l.text);
       });
     }
