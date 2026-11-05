@@ -86,12 +86,25 @@ _O_DIR = os.O_RDONLY | os.O_NOFOLLOW | os.O_DIRECTORY | os.O_CLOEXEC
 
 
 class WorkspaceRefused(LauncherRefused):
-    """``session_refused:workspace`` with the cause as the detail's first word (``cause``) and a human tail. Standing:
-    the same upload meets the same answer."""
+    """``session_refused:workspace`` with the cause as the detail's first word (``cause``) and a human tail. Standing
+    by default (the same upload meets the same answer); ``transient`` for a failure of the host, not of the upload (a
+    full disk, the scratch directory, git that could not run).
 
-    def __init__(self, cause: str, detail: str = "") -> None:
+    ``tombstone`` is set by :meth:`WorkspaceUploads.verify` only for a STANDING refusal of an upload the LAUNCH's own
+    connection holds for the LAUNCH's own key: only then is the key this connection's to spend (L3 w1srv r1, gemini
+    HIGH 1 / codex MED 2: a foreign connection's LAUNCH must not poison another's in-flight upload)."""
+
+    def __init__(self, cause: str, detail: str = "", *, reason_class: str = "standing") -> None:
         self.cause = cause
-        super().__init__(WORKSPACE_REFUSAL, f"{cause}: {detail[:300]}" if detail else cause)
+        self.tombstone = False
+        super().__init__(WORKSPACE_REFUSAL, f"{cause}: {detail[:300]}" if detail else cause, reason_class=reason_class)
+
+
+#: Read-set refusals that name the HOST, not the bytes (git could not run or passed its timeout, the scratch parent or
+#: workdir, the copy's deadline): transient, so no tombstone (L3 w1srv r1, codex MED 4 / deepseek MED 2).
+#: ``readset-git-failed`` stays standing: a clone that fails on a damaged pack and one that fails on a full disk are
+#: the same answer from git (known edge).
+_TRANSIENT_READSET = frozenset({"readset-git-unavailable", "readset-workdir", "readset-handoff-raced"})
 
 
 def _fold(name: str) -> str:
@@ -166,7 +179,9 @@ def manifest_from_bytes(data: bytes) -> SN.Manifest:
 
 
 class UploadOwner:
-    """One connection's claim on the uploads it began, so the connection ending drops what the LAUNCH did not take."""
+    """One connection's claim on its upload (at most one: a WSBEGIN replaces the connection's earlier upload), so the
+    LAUNCH and the connection ending drop what the stager did not take. ``keys`` is read and written under the
+    uploads' lock."""
     __slots__ = ("keys",)
 
     def __init__(self) -> None:
@@ -203,15 +218,18 @@ class WorkspaceUploads:
     # -- the upload ------------------------------------------------------------------------------------------------
 
     def begin(self, key: str, owner: UploadOwner, sizes: Mapping[str, int], digests: Mapping[str, str]) -> None:
-        """WSBEGIN: declare the two parts. Refused ``session_refused:workspace`` for a part over its bound or a key
-        that already has an upload; ``no-workspace-capacity`` (transient) when :data:`MAX_UPLOADS` are held."""
-        if sizes["manifest"] > self._manifest_max:
-            raise WorkspaceRefused("manifest-over-cap", f"{sizes['manifest']} bytes is over {self._manifest_max}")
-        if sizes["bundle"] > self._bundle_max:
-            raise WorkspaceRefused("bundle-over-cap", f"{sizes['bundle']} bytes is over {self._bundle_max}")
+        """WSBEGIN: declare the two parts. ONE upload per connection: a WSBEGIN first ends this connection's earlier
+        upload (any key, refused or not), so a retry on the same connection re-begins cleanly (L3 w1srv r1, gemini
+        HIGH 2 / MED 3, codex MED 1). Refused ``session_refused:workspace`` for a part over its bound or a key another
+        connection holds an upload for; ``no-workspace-capacity`` (transient) when :data:`MAX_UPLOADS` are held."""
         with self._mu:
+            self._release_locked(owner)
+            if sizes["manifest"] > self._manifest_max:
+                raise WorkspaceRefused("manifest-over-cap", f"{sizes['manifest']} bytes is over {self._manifest_max}")
+            if sizes["bundle"] > self._bundle_max:
+                raise WorkspaceRefused("bundle-over-cap", f"{sizes['bundle']} bytes is over {self._bundle_max}")
             if key in self._ups:
-                raise WorkspaceRefused("upload-exists", "this session key already has an upload")
+                raise WorkspaceRefused("upload-exists", "another connection holds an upload for this session key")
             if len(self._ups) >= self._max:
                 raise LauncherRefused("no-workspace-capacity", "every workspace upload slot is taken",
                                       reason_class="transient")
@@ -227,49 +245,70 @@ class WorkspaceUploads:
             raise WorkspaceRefused("no-upload", "no upload is open for this key on this connection")
         buf = up.parts[part]
         if offset != len(buf) or len(buf) + len(raw) > up.sizes[part]:
-            self.drop(key)
+            self._discard(up)
             raise WorkspaceRefused("chunk-out-of-order" if offset != len(buf) else "chunk-over-size",
                                    f"{part} at {offset}, held {len(buf)} of {up.sizes[part]}")
         buf += raw
         return len(buf)
 
-    def drop(self, key: str) -> None:
+    def _discard(self, up: _Upload) -> None:
+        """Remove exactly ``up`` (by identity): an upload a later WSBEGIN put under the same key is not this one."""
         with self._mu:
-            up = self._ups.pop(key, None)
-        if up is not None:
-            up.owner.keys.discard(key)
+            if self._ups.get(up.key) is up:
+                del self._ups[up.key]
+            up.owner.keys.discard(up.key)
+
+    def _release_locked(self, owner: UploadOwner) -> None:
+        for key in list(owner.keys):
+            up = self._ups.get(key)
+            if up is not None and up.owner is owner:
+                del self._ups[key]
+            owner.keys.discard(key)
 
     def drop_owner(self, owner: UploadOwner) -> None:
-        for key in list(owner.keys):
-            self.drop(key)
+        """Drop every upload ``owner`` holds, and nothing another connection holds."""
+        with self._mu:
+            self._release_locked(owner)
 
     # -- phase 1: verify (before the mint) -------------------------------------------------------------------------
 
     def verify(self, key: str, owner: UploadOwner, ws: Optional[Workspace]) -> Optional[Workspace]:
         """The LAUNCH's workspace judgment. No member and no upload: ``None`` (a launch that stages nothing). A member
         and a whole, matching upload: the member with ``manifest_digest`` set to the server's own derivation. Anything
-        else: :class:`WorkspaceRefused`, the upload dropped."""
+        else: :class:`WorkspaceRefused`, this connection's upload dropped and NOTHING another connection holds touched.
+        ``tombstone`` is set only on a standing refusal of the upload this connection holds for ``key``."""
         with self._mu:
             up = self._ups.get(key)
+            mine = up is not None and up.owner is owner
+            held = bool(owner.keys)
         if ws is None:
-            if up is None:
-                return None
-            self.drop(key)
-            raise WorkspaceRefused("upload-without-workspace", "bytes were sent but the launch names no workspace")
-        if up is None or up.owner is not owner:
-            raise WorkspaceRefused("no-upload", "the launch names a workspace and no upload is open for its key")
+            if not held:
+                return None         # another connection's upload under this key is not this launch's to drop
+            self.drop_owner(owner)
+            exc = WorkspaceRefused("upload-without-workspace", "bytes were sent but the launch names no workspace")
+            exc.tombstone = mine
+            raise exc
+        if not mine:
+            self.drop_owner(owner)  # an upload for another key is not this launch's either (one per connection)
+            raise WorkspaceRefused("no-upload", "the launch names a workspace and this connection holds no upload "
+                                   "for its key")
         try:
             return dataclasses.replace(ws, manifest_digest=self._judge(up, ws))
-        except WorkspaceRefused:
-            self.drop(key)
-            raise
+        except WorkspaceRefused as exc:
+            refused = exc
         except (RS.ReadSetRefused, SN.SnapshotRefused, DispatchError) as exc:
-            self.drop(key)
-            raise WorkspaceRefused(getattr(exc, "name", "verify-failed"), getattr(exc, "detail", "")) from None
+            name = getattr(exc, "name", "verify-failed")
+            refused = WorkspaceRefused(name, getattr(exc, "detail", ""),
+                                       reason_class="transient" if name in _TRANSIENT_READSET else "standing")
+        except OSError as exc:      # the scratch (full disk, a stale name, the parent): the host, not the upload
+            _log.warning("the workspace verify for %s met %s in the scratch", key, type(exc).__name__)
+            refused = WorkspaceRefused("scratch-unavailable", type(exc).__name__, reason_class="transient")
         except Exception as exc:  # noqa: BLE001 - a judgment that broke authorises nothing
-            self.drop(key)
             _log.warning("the workspace verify for %s raised %s", key, type(exc).__name__)
-            raise WorkspaceRefused("verify-failed", type(exc).__name__) from None
+            refused = WorkspaceRefused("verify-failed", type(exc).__name__)
+        self._discard(up)
+        refused.tombstone = refused.reason_class == "standing"
+        raise refused from None
 
     def _judge(self, up: _Upload, ws: Workspace) -> str:
         parts = up.parts                  # the held bytearrays, not copies: an upload is up to ~80 MiB, four may be held
@@ -334,12 +373,14 @@ class WorkspaceUploads:
         finally:
             if made is not None:
                 _remove_workdir(pfd, parent, name, made)
-            if fd >= 0:
-                os.close(fd)
-            try:
-                os.unlink(inp, dir_fd=pfd)
-            except OSError:
-                pass
+            if fd >= 0:             # only the input file THIS call created is unlinked (L3 w1srv r1, gemini MED 4)
+                try:
+                    os.close(fd)
+                finally:
+                    try:
+                        os.unlink(inp, dir_fd=pfd)
+                    except OSError:
+                        pass
             os.close(pfd)
 
     def sweep(self) -> None:
@@ -367,18 +408,23 @@ class WorkspaceUploads:
     def stage(self, req: SlotStart, staging: Path) -> None:
         """The ``HelperSlotRuntime(workspace=...)`` callable: write the verified bundle to ``staging/repo.bundle``. A
         request with no workspace stages nothing. The request's member must carry the digest the verify derived for
-        THIS key (so a SlotStart this server did not verify stages nothing). The upload is consumed either way."""
+        THIS key (so a SlotStart this server did not verify stages nothing). A verified upload stays in the table, its
+        key reserved and its buffer counted against :data:`MAX_UPLOADS`, until the write is done, then is consumed
+        either way, by identity (L3 w1srv r1, codex MED 3)."""
         ws = req.workspace
         if ws is None:
             return
         with self._mu:
-            up = self._ups.pop(req.session_key, None)
-        if up is not None:
-            up.owner.keys.discard(req.session_key)
+            up = self._ups.get(req.session_key)
         if up is None or up.verified is None or ws.manifest_digest != up.verified.manifest_digest:
             raise WorkspaceRefused("not-verified", "the launch's workspace was not verified by this server")
-        v = up.verified
-        data = up.parts["bundle"]
+        try:
+            self._write_staged(up.verified, up.parts["bundle"], staging)
+        finally:
+            self._discard(up)
+
+    @staticmethod
+    def _write_staged(v: _Verified, data: bytearray, staging: Path) -> None:
         try:
             sfd = os.open(os.fspath(staging), _O_DIR)
         except OSError as exc:
@@ -398,13 +444,16 @@ class WorkspaceUploads:
             RS.full_fsync(fd)
             if os.fstat(fd).st_size != len(data) or RS._prefix_problem(fd, v.commit, v.objects) is not None:
                 raise WorkspaceRefused("staging-readback", "the file staged is not the bundle verified")
-            os.close(fd)
-            fd = -1
+            done, fd = fd, -1       # a close is never retried: the descriptor may be gone even when close raises
+            os.close(done)
             RS.full_fsync(sfd)
         except BaseException:
             if fd >= 0:
-                os.close(fd)
-                fd = -1
+                done, fd = fd, -1
+                try:
+                    os.close(done)
+                except OSError:
+                    pass
             if created:
                 try:
                     os.unlink(stage.BUNDLE_NAME, dir_fd=sfd)
