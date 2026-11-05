@@ -225,7 +225,7 @@ def test_posted_sources_land_in_the_list_with_their_origin_and_the_raw_markdown(
     assert bare["body"] == "" and bare["origin"] == "token" and bare["source"] == "mailer"
     for item in doc["items"]:
         assert set(item) == {"id", "origin", "source", "title", "body", "preview", "at", "priority", "read", "read_at",
-                             "needs_ref", "needs_open", "token_name", "image_url", "delivery"}
+                             "needs_ref", "needs_open", "token_name", "image_url", "sheet", "delivery"}
         assert item["at"].endswith("+00:00")
 
 

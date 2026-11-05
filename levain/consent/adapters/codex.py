@@ -83,7 +83,7 @@ from levain.consent.adapters.claude_code import (  # noqa: F401
     CLEANUP_RESERVE, DEFAULT_MAX_HOLD, DEFAULT_TIER, ISOLATE_PRELUDE, MIN_FILE_HOLD, AdapterSettings,
     _absolute_root, _atomic_write, _is_ours, _merge_handler, _refuse_symlink, _stat_key, _verified, away_hold,
     effective_away, hold_for_answer, hold_ping, hook_command, read_settings_file, still_away_from, with_away_mark,
-    hook_timeout, levain_home_protected, nothing_can_decide, prompt_notice, prompt_ref,
+    hold_message, hook_timeout, levain_home_protected, nothing_can_decide, prompt_notice, prompt_ref,
     protected_paths,
 )
 from levain.consent.adapters.claude_code import (  # noqa: F401 - GATE_TIMEOUT is the installer's
@@ -676,8 +676,7 @@ def _gate_call(event: Mapping[str, Any], queue: ConsentQueue, settings: AdapterS
         return _deny(f"levain: the gate failed ({type(exc).__name__}), so the action was NOT taken: {what}. "
                      "Do not retry it and do not achieve it another way.")
     try:
-        notify(settings, f"levain: {AGENT} waits on you up to {hold:g} s: {what} (request {request.id}).",
-               cwd=queue.directory, ref=f"request:{request.id}")
+        notify(settings, hold_message(AGENT, what, hold), cwd=queue.directory, ref=f"request:{request.id}")
         if posture in ATTENDED_POSTURES and still_away is not None:
             # held only because he was away (above): when away ends, the call goes back to Codex's approval
             got, back = hold_for_answer(queue, request, hold + 5.0, tool_input=tool_input, posture=posture,

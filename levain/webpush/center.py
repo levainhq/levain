@@ -467,22 +467,21 @@ class _Reader:
         self.queue_dir = queue_dir
         self._queue: Any = None
         self._questions: Any = None
+        self._standing: dict[str, str] = {}
         self._labels: dict[tuple[Any, str], str] = {}
 
     def needs_open(self, ref: Any) -> bool:
         """Whether the Needs-you item a ping was about still waits on him, read now; an unreadable store is False (the
-        Needs-you card is the authority, and a wrong True would point at nothing)."""
+        Needs-you card is the authority, and a wrong True would point at nothing). A request is the same reading the
+        focus view's sheet takes (:meth:`standing`), so the two cannot disagree about one request."""
         if not isinstance(ref, str) or ":" not in ref:
             return False
         from levain.webpush import record
 
-        kind = ref.partition(":")[0]
+        kind, _, key = ref.partition(":")
+        if kind == "request":
+            return self.standing(key) == "pending"
         try:
-            if kind == "request" and self._queue is None:
-                from levain.consent.queue import ConsentQueue, authority_source
-
-                self._queue = ConsentQueue(self.queue_dir, home=Path.home(),
-                                           authority=authority_source(self.queue_dir, anchor=None))
             if kind == "question" and self._questions is None:
                 from levain.consent.questions import QuestionStore
 
@@ -494,6 +493,48 @@ class _Reader:
             return got.get("state") in ("pending", "open")
         except Exception:  # noqa: BLE001 - one ref that cannot be read is False for that item, never a failed page
             return False
+
+    def standing(self, rid: str) -> str:
+        """One consent request's standing, read once per page: ``pending`` (answerable now: the queue says pending and
+        its hold has not ended), ``undecided`` (waiting on a late ruling), ``expired`` (the hold ended: the queue keeps
+        a request ``pending`` through its undecided grace window, but applies no answer to it), ``closed`` (decided,
+        withdrawn or otherwise final), ``gone`` (no longer in the queue) or ``unread`` (the store, or the row, could
+        not be read). Never raises."""
+        if rid not in self._standing:
+            try:
+                if self._queue is None:
+                    from levain.consent.queue import ConsentQueue, authority_source
+
+                    self._queue = ConsentQueue(self.queue_dir, home=Path.home(),
+                                               authority=authority_source(self.queue_dir, anchor=None))
+                got = self._queue.get(rid)
+                if got is None:
+                    out = "gone"
+                else:
+                    from levain.cockpit.consent import utc_stamp
+
+                    request, state = got
+                    if state == "pending":
+                        out = "expired" if request.expires_at <= utc_stamp(datetime.now(timezone.utc)) else "pending"
+                    else:
+                        out = "undecided" if state == "undecided" else "expired" if state == "expired" else "closed"
+            except Exception:  # noqa: BLE001 - an unreadable store or row is said as such, never drawn as an open sheet
+                out = "unread"
+            self._standing[rid] = out
+        return self._standing[rid]
+
+    def consent_sheet(self, ref: Any) -> dict[str, str] | None:
+        """For a ping about a filed consent request (``request:<id>``): ``{"id", "state"}``, the request's
+        :meth:`standing` now, so the focus view can link its sign sheet (``/sign/consent/<id>``, drawn on the page's own
+        origin from the id alone: no link is taken from the ping). ``state``: ``open`` (pending with its hold running, or
+        undecided: a passkey may answer or rule it, ConsentSheet.row's own condition), ``expired``, ``closed``, ``gone``
+        or ``unread``. None for any other ref: no request, no sheet. Only a ping the signed hold filed carries a
+        ``request:`` ref (a notice that only says the agent's own dialog waits is ``prompt:``)."""
+        if not isinstance(ref, str) or not ref.startswith("request:") or len(ref) == len("request:"):
+            return None
+        rid = ref[len("request:"):]
+        got = self.standing(rid)
+        return {"id": rid, "state": "open" if got in ("pending", "undecided") else got}
 
     def label(self, journal: Any, device_id: str) -> str:
         key = (journal, device_id)
@@ -554,7 +595,7 @@ def _notice_item(rd: _Reader, num: int, read: bool, read_at: str | None) -> dict
     return {"id": f"n{num}", "origin": "token", "source": r["source"], "title": r["title"], "body": r["body"],
             "preview": plain_preview(r["body"]), "at": _iso(r["at"]), "priority": r["priority"], "read": read,
             "read_at": _iso(read_at) if read else None, "needs_ref": None, "needs_open": False,
-            "token_name": r["token"], "image_url": None,
+            "token_name": r["token"], "image_url": None, "sheet": None,
             "delivery": _delivery(rd, r["ping_id"])}
 
 
@@ -583,6 +624,7 @@ def _ping_item(rd: _Reader, num: int, read: bool, read_at: str | None) -> dict[s
             "preview": plain_preview(body), "at": _iso(r["at"]), "priority": "normal", "read": read,
             "read_at": _iso(read_at) if read else None, "needs_ref": needs_ref,
             "needs_open": bool(needs_ref) and rd.needs_open(ref), "token_name": None, "image_url": None,
+            "sheet": rd.consent_sheet(ref) if source == "approval" else None,
             "delivery": _delivery(rd, num)}
 
 

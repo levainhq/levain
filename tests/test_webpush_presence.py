@@ -352,11 +352,9 @@ def test_an_approval_prompt_at_an_active_laptop_pings_the_devices_once_and_start
     assert [(c["kind"], c["push"], c["url"]) for c in calls] == [("consent", True, "/?view=needs")]
     assert calls[0]["body"].startswith("claude_code asks in its own dialog: ")
     assert q.pending() == []                                                           # nothing held
+    assert calls[0]["ref"].startswith("prompt:") and calls[0]["title"] == "levain"    # never a ``request:`` ref: no sheet to open
     if decider == "a zero hold ran out":
-        assert calls[0]["ref"].startswith("request:")
         assert q.get(calls[0]["ref"].split(":", 1)[1])[1] == "withdrawn"               # left to the dialog at once
-    else:
-        assert calls[0]["ref"].startswith("prompt:")
 
 
 def test_the_same_command_asked_again_is_a_new_prompt_and_pings_again(tmp_path, monkeypatch):
@@ -380,27 +378,30 @@ def test_a_prompt_notice_is_said_once_per_ref_and_never_under_a_mute(tmp_path, m
     qdir.mkdir()
     _phone(qdir)
     calls = _spy(monkeypatch, ACTIVE)
-    assert claude_code.prompt_notice(qdir, "claude_code", "Bash: touch x", "request:r9") is True
-    PushStore(qdir).add_ping("consent", "request:r9", "levain", "x")   # what the spawned child records
-    assert claude_code.prompt_notice(qdir, "claude_code", "Bash: touch x", "request:r9") is False
+    assert claude_code.prompt_notice(qdir, "claude_code", "Bash: touch x", "prompt:r9") is True
+    PushStore(qdir).add_ping("consent", "prompt:r9", "levain", "x")   # what the spawned child records
+    assert claude_code.prompt_notice(qdir, "claude_code", "Bash: touch x", "prompt:r9") is False
     intent.apply_settings(qdir, lets_through="nothing", idle=lambda: ACTIVE)
-    assert claude_code.prompt_notice(qdir, "claude_code", "Bash: touch x", "request:r10") is False
+    assert claude_code.prompt_notice(qdir, "claude_code", "Bash: touch x", "prompt:r10") is False
     intent.apply_settings(qdir, lets_through="approvals", idle=lambda: ACTIVE)
-    assert claude_code.prompt_notice(qdir, "claude_code", "Bash: touch x", "request:r10") is True
-    assert [c["ref"] for c in calls] == ["request:r9", "request:r10"]
+    assert claude_code.prompt_notice(qdir, "claude_code", "Bash: touch x", "prompt:r10") is True
+    assert [c["ref"] for c in calls] == ["prompt:r9", "prompt:r10"]
+    # a ping the hold already recorded for the request (``request:<id>``) is this prompt's own: not said again
+    PushStore(qdir).add_ping("consent", "request:r11", "levain", "x")
+    assert claude_code.prompt_notice(qdir, "claude_code", "Bash: touch x", claude_code.prompt_ref("r11")) is False
 
 
 def test_a_prompt_notice_needs_a_phone_and_a_fault_says_nothing(tmp_path, monkeypatch):
     qdir = tmp_path / "q"
     qdir.mkdir()
     calls = _spy(monkeypatch, ACTIVE)
-    assert claude_code.prompt_notice(qdir, "claude_code", "x", "request:r1") is False     # no phone paired
+    assert claude_code.prompt_notice(qdir, "claude_code", "x", "prompt:r1") is False     # no phone paired
     _phone(qdir)
 
     def boom(*a, **kw):
         raise RuntimeError("sender")
     monkeypatch.setattr(sender, "spawn", boom)
-    assert claude_code.prompt_notice(qdir, "claude_code", "x", "request:r1") is False
+    assert claude_code.prompt_notice(qdir, "claude_code", "x", "prompt:r1") is False
     assert calls == []
 
 
@@ -424,7 +425,8 @@ def _held_ping(calls, q, agent):
     assert [(c["kind"], c["push"], c["hold"], c["url"]) for c in calls] == [("consent", True, None, "/?view=needs")]
     assert calls[0]["ref"].startswith("request:")
     rid = calls[0]["ref"].split(":", 1)[1]
-    assert calls[0]["body"].startswith(f"{agent} waits on you up to ") and f"(request {rid})." in calls[0]["body"]
+    assert calls[0]["body"].startswith(f"{agent} is waiting for your approval: ") and calls[0]["body"].endswith("s).")
+    assert calls[0]["title"] == claude_code.CONSENT_PING_TITLE and rid not in calls[0]["body"]
     assert q.get(rid)[1] == "withdrawn"                    # the hold ran out and left the call to the dialog
 
 
@@ -498,7 +500,7 @@ def test_a_hold_the_deadline_left_no_wait_for_sends_the_dialog_notice(tmp_path, 
     assert held == []                                                    # no hold ran
     assert [(c["kind"], c["push"]) for c in calls] == [("consent", True)]
     assert calls[0]["body"].startswith(f"{agent} asks in its own dialog: ")
-    assert calls[0]["ref"].startswith("request:")
+    assert calls[0]["ref"].startswith("prompt:")
 
 
 @pytest.mark.parametrize("agent", ["claude_code", "codex"])
@@ -534,7 +536,8 @@ def test_an_away_hold_ping_is_never_silenced_by_a_faulting_dedupe_read(tmp_path,
     monkeypatch.setattr(wp, "pinged", lambda *a, **kw: True)   # what a locked pings DB reads as
     assert claude_code.hold_ping(_away(), qdir, "claude_code", "Bash: touch x", "r7", 300.0) is True
     assert [c["ref"] for c in calls] == ["request:r7"]
-    assert calls[0]["body"] == "claude_code waits on you up to 300 s: Bash: touch x (request r7)."
+    assert calls[0]["body"] == ("claude_code is waiting for your approval: Bash: touch x. Open it to review and answer "
+                                   "(held up to 300 s).")
 
 
 def test_an_away_hold_ping_never_raises(tmp_path, monkeypatch):
