@@ -246,40 +246,22 @@ def test_a_lost_answer_then_a_reload_posts_the_effect_once(tmp_path, monkeypatch
 
 @needs_browser
 @needs_ssh
-def test_a_pick_list_a_redraw_detached_releases_the_card_and_a_write_in_survives_not_sure(tmp_path, monkeypatch) -> None:
-    """R4: two passkeys enrolled and no record of which this browser holds: the pick list is open when the card is drawn
-    again, and the new card's buttons work. R9: a dismissed pick (nothing signed) reads nothing again. R6: the write-in's
-    answer never reached the server ("not sure"): its words are kept, and the box opens again once the cockpit says that
-    answer's attempt was refused."""
+def test_a_write_in_survives_not_sure_with_two_passkeys_enrolled_and_no_pick_list(tmp_path, monkeypatch) -> None:
+    """R6: the write-in's answer never reached the server ("not sure"): its words are kept, and the box opens again once
+    the cockpit says that answer's attempt was refused. Two passkeys are enrolled and this browser has no record of which
+    it holds: a plain sign request names its signer in the answer, so no pick list is drawn (R4 and R9, the pick list a
+    redraw detached and a dismissed pick, are the grant revoke's now: tests/test_sign_picker_page.py)."""
     rig = _Rig(tmp_path, monkeypatch, two_keys=True)
-    fp = rig.pk.key.fingerprint
     with rig.serving() as (_url, _httpd):
         out = _drive(tmp_path, f"{rig.origin}/#write_token={TOK}", [
             DESKTOP, rig.authenticator(),
             {"until": STRIP_FACET + " && 1", "ms": 30000},
-            # R4: the pick list is open when the card is drawn again; the new card's tap opens a new pick list (the old
-            # one released the lease), and the old one's words are what the card now says
-            {"tap": f"{OPTION_B}"},
-            {"until": PICKS},
-            {"eval": REDRAW},
-            {"until": f"{CARD_KEPT} && {PICKS} === 3 && 1", "ms": 20000},   # the board read left the open card, and its pick list, alone
-            {"eval": "[...document.querySelectorAll('#levain-modal .needs-question .sign-pick')]"
-                     ".find(b => b.textContent === 'dismiss').click() || 1"},
-            # R9
-            {"eval": COUNT_RELOADS},
-            {"tap": f"{OPTION_B}"},
-            {"until": PICKS, "may_timeout": True},
-            {"eval": "[...document.querySelectorAll('#levain-modal .needs-question .sign-pick')]"
-                     ".find(b => b.textContent === 'dismiss').click() || 1"},
-            {"eval": RELOADS_AFTER},
-            # R6
             {"eval": NEVER_SENT.format(tail=json.dumps("/answer"))},
             {"eval": f"(() => {{ const i = {WRITE_IN}; i.value = 'only after the backup'; "
                      "i.dispatchEvent(new Event('input')); return 1; })()"},
             {"tap": f"{WORDS_BTN}"},
-            {"until": PICKS},
-            _pick(fp),
             {"until": f"/never reached the cockpit/.test({FACET_NOTE}) && {FACET_NOTE}"},
+            {"eval": PICKS},
             {"until": f"!{WRITE_IN}.disabled && {WRITE_IN}.value", "may_timeout": True},
             {"eval": OPEN % QRID},
             {"eval": REDRAW},
@@ -291,14 +273,12 @@ def test_a_pick_list_a_redraw_detached_releases_the_card_and_a_write_in_survives
             {"eval": f"{WRITE_IN}.value"},
         ])
     v = out["values"]
-    assert v[2] == 3, v[2]                               # two passkeys and a dismiss
-    assert v[8] == 3, v[8]                               # the new card's tap: the redraw released the lease
-    assert v[10] == 0, v[10]                             # a dismissed pick read nothing again
-    assert "never reached the cockpit" in v[16], v[16]   # the cockpit refused the attempt: nothing was signed
-    assert v[17] == "only after the backup", v[17]       # kept, and editable again
-    assert v[18] is True and rig.nothing_signed(QRID)
-    assert v[21] == "only after the backup", v[21]       # a board read left the words where they were typed
-    assert v[24] == "only after the backup", v[24]       # and a focus view opened again offers the same words
+    assert "never reached the cockpit" in v[4], v        # the cockpit refused the attempt: nothing was signed
+    assert v[5] == 0, v                                  # and no pick list was drawn to get there
+    assert v[6] == "only after the backup", v            # kept, and editable again
+    assert v[7] is True and rig.nothing_signed(QRID), v
+    assert v[10] == "only after the backup", v           # a board read left the words where they were typed
+    assert v[13] == "only after the backup", v           # and a focus view opened again offers the same words
 
 
 @needs_browser

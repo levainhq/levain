@@ -149,8 +149,11 @@
     }
     pkArmedAt = 0;
     const key = pkKey(pk, k);
-    const use = id && !pkRefused.has(key) ? id : null;
-    return navigator.credentials.get({ publicKey: use ? Object.assign({}, pk, { allowCredentials: [{ type: "public-key", id: use }] }) : pk })
+    // `id`: one credential id, or a list of them (a plain sign request names its signer in the answer, so every id the page
+    // knows is asked for together); an empty list asks for none (the OS's own list)
+    const ids = Array.isArray(id) ? id : id ? [id] : [];
+    const use = ids.length && !pkRefused.has(key) ? ids : null;
+    return navigator.credentials.get({ publicKey: use ? Object.assign({}, pk, { allowCredentials: use.map((i) => ({ type: "public-key", id: i })) }) : pk })
       .catch((e) => { if (e && e.name === "NotAllowedError" && use && k && k.local) pkRefused.add(key); throw e; });
   }
   // a passkey signed for rpId|fp (where the record is updated to the credential that signed): a refusal recorded for it is
@@ -533,7 +536,7 @@
       active = r;
       lock(true);
       if (expect) signing(expect, "page", "Signing");
-      whom(rp, keysFor(choice), held, acts).then((k) => (k ? ceremony(r, rp, k, choice, words) : "unsigned"))
+      whom(rp, keysFor(choice), held, acts, !consent && !dispatch).then((k) => (k ? ceremony(r, rp, k, choice, words) : "unsigned"))
         .catch(() => "unsigned")
         .then((done) => {
           if (done === "signed") { busy = false; ended(); acts.replaceChildren(); acts.hidden = true; tell("signed"); return; }
@@ -728,23 +731,47 @@
     });
   }
 
-  // which eligible key signs: the one this browser used before, else the only one, else his pick from a list.
-  // Resolves {fp, rawId, local} or null (dismissed); rawId is this browser's record (local: true), else the cockpit's,
-  // else null (the OS's list)
-  function whom(rp, signers, held, acts) {
+  // The words one pick-list button carries for key `fp` (the same as dashboard_core.js's signKeyLabel): the provider its
+  // enrolment recorded (else "provider not recorded"), when it was enrolled and its number in the authority log, from the
+  // read's `credentials`; an fp prefix only when the cockpit sent neither.
+  function keyLabel(fp, facts) {
+    const f = facts && typeof facts === "object" ? facts : {};
+    let prov = typeof f.provider === "string" ? f.provider : "";
+    if (!prov || /^provider not/.test(prov)) prov = prov.replace(/ \(.*$/, "") || "provider not recorded";
+    const at = typeof f.enrolled_at === "string" ? new Date(f.enrolled_at) : null;
+    const pad = (n) => (n < 10 ? "0" : "") + n;
+    const when = at && !isNaN(at.getTime())
+      ? " · enrolled " + pad(at.getMonth() + 1) + "-" + pad(at.getDate()) + " " + pad(at.getHours()) + ":" + pad(at.getMinutes()) : "";
+    const num = typeof f.seq === "number" ? " (#" + f.seq + ")" : "";
+    return prov + when + num + (when || num ? "" : " · " + fp.slice(0, 18) + "…");
+  }
+  // which eligible key signs: the one this browser used before (the newest enrolled of them, when it used several), else the
+  // only one, else his pick from a list. Resolves {fp, rawId, local} or null (dismissed); rawId is this browser's record
+  // (local: true), else the cockpit's, else null (the OS's list). `late` (a plain sign request, whose signer the cockpit's
+  // reply names) never draws a pick: it resolves {fp: null, ids, local}, `ids` the one remembered id, else every enrolled
+  // id when all are known, else none (the OS's list, which holds every levain passkey this device has)
+  function whom(rp, signers, held, acts, late) {
     const local = mine(rp);
     const has = (fp) => Object.prototype.hasOwnProperty.call(local, fp);
     const idOf = (fp) => (has(fp) ? { fp: fp, rawId: local[fp], local: true }
       : { fp: fp, rawId: held[fp] && typeof held[fp].credential_id === "string" ? held[fp].credential_id : null, local: false });
     const known = signers.filter(has);
-    if (known.length === 1) return Promise.resolve(idOf(known[0]));
-    if (!known.length && signers.length === 1) return Promise.resolve(idOf(signers[0]));
-    say("More than one passkey may sign this; pick the one this device holds:");
+    const seqOf = (fp) => (held[fp] && typeof held[fp].seq === "number" ? held[fp].seq : -1);
+    const newest = (fps) => fps.reduce((best, fp) => (seqOf(fp) >= seqOf(best) ? fp : best), fps[0]);
+    if (late) {
+      if (known.length) return Promise.resolve({ fp: null, ids: [local[newest(known)]], local: true });
+      const all = signers.map((fp) => idOf(fp).rawId);
+      return Promise.resolve({ fp: null, ids: signers.length && all.every((i) => typeof i === "string") ? all : [], local: false });
+    }
+    if (known.length) return Promise.resolve(idOf(newest(known)));
+    if (signers.length === 1) return Promise.resolve(idOf(signers[0]));
+    say("More than one passkey may sign this; pick one this device holds (a synced passkey such as iCloud Keychain is on all"
+      + " your devices; any one on this device works):");
     return new Promise((resolve) => {
       const picks = [];
       const end = (v) => { picks.forEach((x) => x.remove()); resolve(v); };
-      for (const fp of known.length ? known : signers) {
-        const p = el("button", "dev-btn sheet-key", fp.slice(0, 18) + "…");
+      for (const fp of signers) {
+        const p = el("button", "dev-btn sheet-key", keyLabel(fp, held[fp]));
         p.type = "button";
         p.title = fp;
         p.addEventListener("click", () => end(idOf(fp)));
@@ -774,7 +801,9 @@
       : !consent ? ["challenge", "answer"] : r.mode === "rule" ? ["rule-challenge", "rule"] : ["challenge", "answer"];
     // a dispatch challenge, like a plain sign request's, names the version this sheet showed: the cockpit refuses a job
     // that changed since (409), so no passkey is asked for a change set the operator did not read
-    const body = dispatch || !consent ? { signer_fp: fp, request_sha256: r.sha256 } : { decision: choice, signer_fp: fp };
+    // fp null (a plain sign request): the answer names the signer, so the challenge names none
+    const body = dispatch || !consent ? { request_sha256: r.sha256 } : { decision: choice };
+    if (fp !== null) body.signer_fp = fp;
     if (dispatch && choice === "cancel") body.reason = typeof words === "string" ? words : "";
     if (!consent && !dispatch && choice !== undefined) body.choice = choice;
     if (!consent && !dispatch && words !== undefined) body.write_in = words;
@@ -810,8 +839,8 @@
       if (typeof c.body.line === "string") { line = c.body.line; signing(line, "server", "Signing"); }
       say("Confirm with your passkey to sign…" + (line ? " " + line : ""));
       // the passkey asked for by its id when one decodes; an id that does not is dropped (the OS's own list), never a throw
-      const allow = k.rawId && decodable(k.rawId) ? unb64u(k.rawId) : null;
-      if (k.rawId && !allow && k.local) forget(rp, fp);
+      const allow = fp === null ? (k.ids || []).filter(decodable).map(unb64u) : k.rawId && decodable(k.rawId) ? unb64u(k.rawId) : null;
+      if (fp !== null && k.rawId && !allow && k.local) forget(rp, fp);
       const pk = { challenge: unb64u(c.body.challenge), rpId: c.body.rp_id, userVerification: "required", timeout: 60000 };
       const asked = pkGet(pk, allow, k);
       return asked.then((cred) => {
@@ -830,15 +859,16 @@
           if (!a.ok && a.status >= 400 && a.status < 500) return unsigned("Not signed: " + why(a));
           if (!a.ok) { say("Not sure this was signed (" + why(a) + ").", "bad"); return unsure(); }
           pkSigned(pk, k);
-          if (cred.rawId && mine(rp)[fp] !== b64u(cred.rawId)) remember(rp, fp, b64u(cred.rawId));
+          // the key the cockpit's reply NAMES as the one that verified, not the one this page asked for
           const by = typeof a.body.signer_fp === "string" && a.body.signer_fp ? a.body.signer_fp : fp;
+          if (by && cred.rawId && mine(rp)[by] !== b64u(cred.rawId)) remember(rp, by, b64u(cred.rawId));
           const ns = typeof a.body.namespace === "string" && a.body.namespace ? " in " + a.body.namespace : "";
           // a consent answer's reply names its decision; a ruling's also says where its delivery stands
           // a dispatch reply names the job's state now (signed, cancelled, or where the land went)
           const what = a.body.choice || (consent && typeof a.body.decision === "string" ? a.body.decision
             : dispatch && typeof a.body.state === "string" ? a.body.state + (typeof a.body.outcome === "string" ? ", " + a.body.outcome : "") : "");
           const went = consent && a.body.delivery && typeof a.body.delivery.reason === "string" ? " · " + a.body.delivery.reason : "";
-          say("signed" + (what ? " (" + what + ")" : "") + " · by " + by + ns + (line ? ": " + line : "") + went, "ok");
+          say("signed" + (what ? " (" + what + ")" : "") + (by ? " · by " + by : "") + ns + (line ? ": " + line : "") + went, "ok");
           if (line) signing(line, "server", "Signed"); else relabel("Signed");
           $("sheet").dataset.state = "signed";
           showOutcome(what, line);

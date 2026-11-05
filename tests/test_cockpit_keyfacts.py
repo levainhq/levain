@@ -30,6 +30,12 @@ NS = "example-attest"
 ORIGIN = f"https://{RP}"
 
 
+def _held(credentials: dict) -> dict:
+    """The key FACTS in a listing's ``credentials`` (credential id, provider): the enrol date and number that ride beside
+    them are the authority log's, not facts the cockpit holds, so a facts test reads them away."""
+    out = {fp: {k: v for k, v in row.items() if k in ("credential_id", "provider")} for fp, row in credentials.items()}
+    return {fp: row for fp, row in out.items() if "credential_id" in row}
+
 def _b64u(b: bytes) -> str:
     return base64.urlsafe_b64encode(b).decode().rstrip("=")
 
@@ -408,7 +414,7 @@ def test_a_verified_signature_records_its_credential_id_once(tmp_path: Path) -> 
     # a later different id from the same key is kept out
     answer("new-0002", {"raw_id": _b64u(os.urandom(32))})
     assert keyfacts.read(facts)[key.fingerprint].credential_id == _b64u(pk.cred)
-    assert signer.key_facts([key.fingerprint]) == {
+    assert _held(signer.key_facts([key.fingerprint])) == {
         key.fingerprint: {"credential_id": _b64u(pk.cred),
                           "provider": "provider not recorded (only an enrolment that sends its creation names it)"}}
     # an unknown request key is still refused
@@ -549,7 +555,7 @@ def test_a_fresh_browser_gets_the_credential_id_from_the_cockpit_after_one_signa
     _file(q, "http-0001")
     with _serving(tmp_path / "inst", signer=signer, extra_hosts=[rp]) as (url, _httpd):
         status, body = _call(url, "/cockpit/sign.json")
-        assert status == 200 and body["credentials"] == {}
+        assert status == 200 and _held(body["credentials"]) == {}
         sha = next(r["sha256"] for r in body["requests"] if r["id"] == "http-0001")
         status, c = _call(url, "/cockpit/sign/http-0001/challenge", {"signer_fp": key.fingerprint, "request_sha256": sha})
         assert status == 200, c
@@ -557,7 +563,7 @@ def test_a_fresh_browser_gets_the_credential_id_from_the_cockpit_after_one_signa
                           {**pk.assertion(c["challenge"], origin), "raw_id": _b64u(pk.cred)})
         assert status == 200, a
         status, body = _call(url, "/cockpit/sign.json")
-        assert body["credentials"] == {key.fingerprint: {
+        assert _held(body["credentials"]) == {key.fingerprint: {
             "credential_id": _b64u(pk.cred),
             "provider": "provider not recorded (only an enrolment that sends its creation names it)"}}
         _file(q, "http-0002")
@@ -592,7 +598,7 @@ def test_facts_that_cannot_be_read_for_any_reason_never_fail_the_sign_listing(tm
         with _serving(tmp_path / "inst", signer=signer, extra_hosts=[rp]) as (url, _httpd):
             status, body = _call(url, "/cockpit/sign.json")
             assert status == 200, body
-            assert [r["id"] for r in body["requests"]] == ["list-0001"] and body["credentials"] == {}
+            assert [r["id"] for r in body["requests"]] == ["list-0001"] and _held(body["credentials"]) == {}
             status, one = _call(url, "/cockpit/sign/list-0001.json")
-            assert status == 200 and one["credentials"] == {}
+            assert status == 200 and _held(one["credentials"]) == {}
     assert "no data root here" in caplog.text

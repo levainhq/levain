@@ -488,7 +488,9 @@ def test_h8_the_signed_line_never_prints_undefined(tmp_path: Path, monkeypatch) 
             {"until": f"/^signed/.test({NOTE}) && {NOTE}", "ms": 30000},
         ])
     said = out["values"][-1]
-    assert "undefined" not in said and rig.pk.key.fingerprint in said, said
+    # a reply that names no key (the cockpit's always does): a plain sign request has no asked-for key to fall back to, so the
+    # line names none rather than another
+    assert "undefined" not in said and " · by " not in said and said.startswith("signed"), said
 
 
 # --- L3 verify r2 (H9-H14) ---------------------------------------------------------------------------------------------
@@ -880,20 +882,8 @@ def test_i4_a_node_the_board_adds_to_the_body_while_the_sheet_is_open_is_inert(t
     assert v[-1] is False, v                                           # given back on close
 
 
-@needs_browser
-def test_i5_the_signer_picker_is_not_a_ceremony_in_flight(tmp_path: Path, monkeypatch) -> None:
-    rig = _Rig(tmp_path, monkeypatch, two_keys=True)
-    with rig.serving():
-        out = _drive(tmp_path, f"{rig.origin}/#write_token={TOK}", [
-            DESKTOP, *OPEN_FRAMED,
-            {"tap": f"{CHOICE_IN('b')}"},
-            {"until": f"{IN}.querySelector('#sheet-actions .sheet-key') && 1", "ms": 30000},
-            {"eval": CLOSE_IN_FRAME},
-            {"until": f"!{FRAME} && 1", "ms": 3000, "may_timeout": True},
-            {"eval": f"!!{FRAME}"},
-        ])
-    assert out["values"][-1] is False, out["values"]                   # nothing was posted: the close leaves at once
-    assert not [p for p in out["posts"] if p.split(" ", 1)[0].endswith("/challenge")], out["posts"]
+# (i5, the signer picker is not a ceremony in flight, moved to a consent row: a plain sign request draws no picker now;
+# tests/test_sign_picker_page.py)
 
 
 # --- the lease and the inert set are given back on every close path (L3 r2 of the landing) ---------------------------
