@@ -18,6 +18,7 @@ Lock order: pool -> slot -> session END lock; the reaper never takes the install
 """
 from __future__ import annotations
 
+import math
 import os
 import stat
 import subprocess
@@ -457,11 +458,16 @@ class Reaper:
         allocs = self._allocs(ctx)
         records = self._records(ctx)
         for s in pending_sessions(ctx.store.path / "alloc"):
+            rec = records.get(s)
+            if rec is not None and rec.state == R.HELD:
+                # 1105-17 heldbuild: step 3 owns a HELD session's journal. Its END redoes the journal after the same
+                # proofs, under the backoff and the quarantine; redoing it here every pass bypassed both (a VM session
+                # retried ~every 30 s while its backoff stood at 60 s). A skip is the normal path, so it is unlogged.
+                continue
             a = allocs.get(s)
             if a is None:
                 rep["skipped"].append(f"reconcile:{s}:no-alloc")       # type: ignore[union-attr]
                 continue
-            rec = records.get(s)
             try:
                 with self.item(rep, f"reconcile:{s}"):   # the journal stays at its phase for the next pass
                     E.reconcile_session(SS.end_facts(ctx, a), SS.end_seams(ctx, a),
@@ -476,14 +482,25 @@ class Reaper:
         of the same pass does not run END on it again."""
         after = SS.read_record(ctx, s)
         if after is not None and after.state == R.HELD and (before is None or after.generation != before.generation):
-            self._back_off(s, after.fields.get("held_attempts"))
+            self._back_off(s, after.fields)
 
     # -- step 3: END, the HELD retry, SCRUB again (§7.3, §7.7 3, RH5) --------------------------------------------------
 
     def _held_due(self, s: str) -> bool:
         return self.next_try.get(s, 0.0) <= self.seams.monotonic()
 
-    def _back_off(self, s: str, attempts: object) -> None:
+    def _back_off(self, s: str, fields: Mapping[str, object]) -> None:
+        """The next time a HELD session is tried: ``HELD_BACKOFF_S`` doubling per ``held_attempts`` to ``V22_S``. A
+        QUARANTINED one (:func:`levain.slot.end.quarantined`: a cause no redo clears, tried enough times) is never
+        due again in this process: ``inf`` keeps it in ``live`` and in the pass record's ``held`` list, so doctor
+        still names it. A restarted reaper has no ``next_try`` for it and so tries it once (DESIGN Q6): the way back."""
+        if E.quarantined(fields):
+            if self.next_try.get(s) != math.inf:     # said once per process, when it starts: the log names the cause
+                self.log(f"END {s}: quarantined after {fields.get('held_attempts')} tries "
+                         f"({fields.get('held_reason')}); no further retry until the reaper is restarted")
+            self.next_try[s] = math.inf
+            return
+        attempts = fields.get("held_attempts")
         n = attempts if isinstance(attempts, int) and attempts >= 1 else 1
         delay = min(HELD_BACKOFF_S * (2 ** min(n - 1, 32)), V22_S)
         self.next_try[s] = self.seams.monotonic() + delay
@@ -527,7 +544,7 @@ class Reaper:
         except Refused as e:
             rep["skipped"].append(f"end:{s}:{e.name}")                  # type: ignore[union-attr]
             if e.name not in ("end-busy", "slot-locked") and rec.state == R.HELD:
-                self._back_off(s, rec.fields.get("held_attempts"))
+                self._back_off(s, rec.fields)
             return
         except Exception as e:   # noqa: BLE001 - CasNotSent and the like: the next pass tries again
             self.log(f"END {s}: {type(e).__name__}: {e}")
@@ -542,7 +559,7 @@ class Reaper:
             live.add(s)
             held[s] = None
             after = SS.read_record(ctx, s)
-            self._back_off(s, after.fields.get("held_attempts") if after is not None else None)
+            self._back_off(s, after.fields if after is not None else {})
 
     def _scrub(self, ctx: H.Ctx, a: R.Alloc, rep: Dict[str, object]) -> None:
         try:

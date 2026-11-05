@@ -419,7 +419,7 @@ def held_before_d1(tmp_path: Path) -> tuple[World, Control]:
     w = login_world(tmp_path, kind=None)
     ctl = Control()
     assert end_session(w.facts, w.seams(ctl), record_state=REVOKED) == HELD
-    assert ctl.fields == {"failed_step": "park", "held_attempts": 1}
+    assert ctl.fields == {"failed_step": "park", "held_attempts": 1, "held_reason": "keep-occupied"}   # 1105-17: named
     assert any("park not proven: move: keep-occupied" in n for n in w.notes)
     assert read_root_intent(w.facts.intent, owner_ok=mine).phase == "move"
     assert where(w) == {"keep": "old", "tree": "new"}

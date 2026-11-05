@@ -103,6 +103,26 @@ def test_an_entry_that_cannot_be_unlinked_ends_held_naming_it_with_its_copy_kept
     assert (world.facts.tree / ".levain-var-folders" / "C" / "cachefile").read_bytes() == PLANTED   # ... and kept
 
 
+def test_the_residue_held_names_its_reason_and_the_retained_redo_clears_it(world, monkeypatch):
+    """1105-17 heldbuild: the HELD CAS carries the refusal name beside ``failed_step`` and ``held_attempts`` (the
+    reaper quarantines on it), and the CAS out of HELD clears all three."""
+    real, blocked = os.unlink, [True]
+
+    def unlink(p, *a, **k):
+        if blocked[0] and os.fsencode(p) == b"cachefile" and "dir_fd" in k:
+            raise PermissionError(errno.EPERM, "Operation not permitted", os.fsdecode(p))
+        return real(p, *a, **k)
+    monkeypatch.setattr(os, "unlink", unlink)
+    ctl = Control()
+    assert end_session(world.facts, world.seams(ctl), record_state=REVOKED) == HELD
+    assert ctl.fields == {"failed_step": "tree", "held_attempts": 1, "held_reason": "var-folders-residue"}
+    assert not end_mod.quarantined(ctl.fields)                       # one try: a permanent cause needs three
+    blocked[0] = False                                               # the cause fixed
+    assert end_session(world.facts, world.seams(ctl), record_state=HELD, failed_step="tree",
+                       held_attempts=1) == RETAINED, world.notes
+    assert not {"failed_step", "held_attempts", "held_reason"} & set(ctl.fields)
+
+
 def test_a_file_written_after_the_manifest_is_residue_never_unlinked(world):
     def fault(p):
         if p == "retain:before:tree":

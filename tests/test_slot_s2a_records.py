@@ -252,6 +252,21 @@ def test_state_exclusive_pairs():
                                           "artifact_failed": "cap"})
 
 
+def test_held_reason_is_one_optional_key_a_name_never_a_path():
+    """1105-17 heldbuild: the refusal name behind a HELD. The record keeps its format number; the key is optional
+    (absent = unclassified). A reader that predates it refuses the record by name, ``unknown-key``, as it does any key
+    outside ``STATE_KEYS`` (``test_state_keys_refused_by_name``)."""
+    s = _state(state=R.HELD, fields={"failed_step": "tree", "held_attempts": 3, "held_reason": "var-folders-residue"})
+    assert R.parse_state(R.state_bytes(s)) == s
+    assert canon.parse(R.state_bytes(s))["format"] == "levain-session-state/1"
+    assert "held_reason" in R.STATE_OPTIONAL and "held_reason" not in R.STATE_REQUIRED
+    no_reason = _state(state=R.HELD, fields={"failed_step": "tree", "held_attempts": 3})
+    assert R.parse_state(R.state_bytes(no_reason)) == no_reason
+    _refused("bad-value", _state, fields={"held_reason": "../etc/passwd"})
+    _refused("bad-value", _state, fields={"held_reason": ""})
+    _refused("wrong-type", _state, fields={"held_reason": 3})
+
+
 def test_state_field_values_checked():
     _refused("bad-value", _state, fields={"identity": {"observed_id": "has space"}})
     _refused("bad-value", _state, state="NOPE")
@@ -283,7 +298,7 @@ def test_edge_table_is_the_contracts():
 
 
 def test_cas_fields_exact():
-    assert R.CAS_FIELDS == {"failed_step", "held_attempts", "brake_reason", "touched", "manifest",
+    assert R.CAS_FIELDS == {"failed_step", "held_attempts", "held_reason", "brake_reason", "touched", "manifest",
                             "artifact_digest", "artifact_failed", "verifier_report_digest",
                             "verifier_report_refused", "identity"}
     for never in ("claims", "artifact_acked", "lease_live", "state", "generation", "intent", "trashed_at"):

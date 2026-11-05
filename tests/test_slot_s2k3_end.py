@@ -216,6 +216,7 @@ def _held_at_tree(w: World, ctl: Control) -> None:
         raise OSError(errno.EIO, "strip fails")
     assert end_session(w.facts, w.seams(ctl, strip=strip), record_state=REVOKED) == HELD
     assert ctl.failed_step == "tree" and read_root_intent(w.facts.intent, owner_ok=mine).phase == "tree"
+    assert "held_reason" not in ctl.fields                       # an OSError names no refusal: unclassified = transient
 
 
 def test_reconcile_at_tree_proves_again_and_holds_on_a_live_process(tmp_path):
@@ -232,6 +233,7 @@ def test_reconcile_at_tree_proves_again_and_holds_on_a_live_process(tmp_path):
     assert e.value.name == "kill-unproven"
     assert held_lock == [True]                                   # the proofs run under the slot lock
     assert ctl.state == HELD and ctl.failed_step == "kill" and ctl.fields["held_attempts"] == attempts + 1
+    assert ctl.fields["held_reason"] == "kill-unproven"          # 1105-17: the proof's refusal is named (the EIO was not)
     assert read_root_intent(w.facts.intent, owner_ok=mine).phase == "tree"   # nothing reconciled
     reconcile_session(w.facts, w.seams(ctl))                     # proven: it finishes
     assert ctl.state == RETAINED

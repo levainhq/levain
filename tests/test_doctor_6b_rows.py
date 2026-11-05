@@ -249,6 +249,55 @@ def test_a_held_session_from_control_is_a_failure_with_its_step_and_tries(tmp_pa
     assert OTHER not in row.detail
 
 
+def _stop_start():
+    """The two lines of reap_held_lines the quarantine hint reuses, for the host the test runs on."""
+    import sys
+    lines = doctor.reap_held_lines("darwin" if sys.platform == "darwin" else "linux", str(Path(doctor.__file__).parent))
+    return lines[0], lines[3]
+
+
+def test_a_quarantined_held_session_names_its_reason_and_the_restart_lines(tmp_path: Path):
+    """1105-17 heldbuild: the row derives quarantine from the record (reason + tries), says so, and prints the stop
+    and start lines the reap-held sequence already builds: no new verb, no new command source."""
+    recs = [{"session": SESSION, "state": "HELD", "failed_step": "tree", "held_attempts": 3,
+             "held_reason": "var-folders-residue"}]
+    row = _rows(tmp_path, status=lambda: (True, recs))["agent held sessions"]
+    stop, start = _stop_start()
+    assert not row.ok
+    assert f"{SESSION} at tree, quarantined after 3 tries: var-folders-residue" in row.detail
+    assert "while the reaper retries" not in row.detail                # every held session here is quarantined
+    assert "has stopped retrying" in row.hint and f"`{stop}` then `{start}`" in row.hint
+    assert "repair" not in row.hint                                    # the restart is the way back, not a verb
+
+
+@pytest.mark.parametrize("rec,tail", [
+    ({"failed_step": "tree", "held_attempts": 2, "held_reason": "var-folders-residue"}, "tree (2 tries)"),
+    ({"failed_step": "tree", "held_attempts": 99, "held_reason": "link-reader-failed"}, "tree (99 tries)"),
+    ({"failed_step": "tree", "held_attempts": 5}, "tree (5 tries)"),
+    ({"failed_step": "freeze", "held_attempts": 3}, "freeze (3 tries)"),
+])
+def test_a_held_session_that_is_not_quarantined_reads_as_before(tmp_path: Path, rec, tail):
+    row = _rows(tmp_path, status=lambda: (True, [{"session": SESSION, "state": "HELD", **rec}]))["agent held sessions"]
+    assert f"{SESSION} at {tail}" in row.detail and "quarantined" not in row.detail
+    assert "has stopped retrying" not in row.hint and "while the reaper retries" in row.detail
+
+
+def test_a_budget_refusal_is_quarantined_on_its_first_recorded_try_in_the_row(tmp_path: Path):
+    recs = [{"session": SESSION, "state": "HELD", "failed_step": "manifest_budget", "held_attempts": 1,
+             "held_reason": "manifest-inode-cap"}]
+    row = _rows(tmp_path, status=lambda: (True, recs))["agent held sessions"]
+    assert f"{SESSION} at manifest_budget, quarantined after 1 tries: manifest-inode-cap" in row.detail
+
+
+def test_a_mix_keeps_the_release_sequence_for_the_session_still_retrying(tmp_path: Path):
+    recs = [{"session": SESSION, "state": "HELD", "failed_step": "tree", "held_attempts": 3,
+             "held_reason": "var-folders-residue"},
+            {"session": OTHER, "state": "HELD", "failed_step": "kill", "held_attempts": 1}]
+    row = _rows(tmp_path, status=lambda: (True, recs))["agent held sessions"]
+    assert "quarantined after 3 tries" in row.detail and f"{OTHER} at kill (1 tries)" in row.detail
+    assert "has stopped retrying" in row.hint and "live-lease" in row.hint
+
+
 def test_the_reapers_held_list_adds_sessions_control_does_not_show_this_account(tmp_path: Path):
     _beat(tmp_path / "run", held=[OTHER])
     row = _rows(tmp_path)["agent held sessions"]
@@ -376,6 +425,18 @@ def test_a_real_held_session_reaches_the_row_with_its_step_and_tries(live: _Live
         host="linux", store=_store(live.run.parent, {"e0": "reusable"}, pool=(1, 0)), run=live.run, now=NOW,
         running=_up(), uid=OP_UID)}
     assert rows["agent control"].ok and not rows["agent held sessions"].ok
+
+
+def test_a_real_control_carries_held_reason_to_the_row(live: _Live):
+    """The reason END records travels CONTROL's CAS and STATUS to doctor, and the row derives quarantine from it."""
+    _op, root = attach(live)
+    root.ask("REVOKE", session=S1)
+    assert cas(root, S1, 1, "REVOKED", "HELD", failed_step="tree", held_attempts=3,
+               held_reason="var-folders-residue")["ok"]
+    answered = doctor._ask_control_status(live.run, time.monotonic() + 3)
+    assert answered[1][0]["held_reason"] == "var-folders-residue"
+    row = doctor._check_held(answered, ("absent", None), NOW)
+    assert f"{S1} at tree, quarantined after 3 tries: var-folders-residue" in row.detail
 
 
 def test_no_socket_and_a_dead_socket_are_different_words():

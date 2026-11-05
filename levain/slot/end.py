@@ -68,8 +68,8 @@ from levain.slot import Refused, stage, wall, write_all
 from levain.slot.ids import SlotId
 from levain.slot.layout import RESERVE_BYTES
 # The §7.3 states END sends; records owns the names (the full set and its legal edges).
-from levain.slot.records import (CREDENTIAL_PARKED, DEAD, FROZEN, HELD, RETAINED, REVOKED, parse_slot_state,
-                                 read_record)
+from levain.slot.records import (_REASON_RE, CREDENTIAL_PARKED, DEAD, FROZEN, HELD, RETAINED, REVOKED,
+                                 parse_slot_state, read_record)
 from levain.slot.root_intent import (INTENT_PHASES, TIMESTAMP_RE, Cas, Fault, Phase, PhaseFailed, Plan,
                                      RootIntent, atomic_write, begin, fsync_dir, intent_path, read_root_intent,
                                      reconcile, sweep_temps, temp_path, unlink_durable)
@@ -175,6 +175,65 @@ _VF_LEFT = frozenset({errno.EPERM, errno.EACCES, errno.ENOTEMPTY, errno.EEXIST, 
 #: exit is END again with larger caps (§7.3 force-retire a).
 BUDGET_REFUSALS = frozenset({"manifest-inode-cap", "manifest-time-cap", "manifest-byte-cap", "meta-byte-cap",
                              "link-copy-cap", "manifest-depth-cap"})
+
+# --- 1105-17 heldbuild: which HELD reasons a redo can clear --------------------------------------------------------
+# A HELD session is retried by the reaper under a backoff. A cause no redo can clear (a fact about the files or the
+# install, read unchanged each time) is QUARANTINED once it has failed enough tries: the reaper stops retrying it,
+# the slot stays leased and nothing is moved or deleted. Quarantine is DERIVED from the record (``held_reason`` +
+# ``held_attempts``, :func:`quarantined`), never a stored state. Every refusal name END can raise is classed in one of
+# the four sets below; tests/test_slot_end_held_classes.py fails when one is missing.
+#: A person must act: the redo re-reads the same files or install state. ``no-credential:<tag>`` is matched by
+#: :data:`PERMANENT_HELD_PREFIXES`.
+PERMANENT_HELD = frozenset({
+    "unowned-unreadable", "var-folders-residue", "var-folders-special", "var-folders-foreign", "var-folders-not-dir",
+    "var-folders-mount", "tree-unknown-type", "tree-shared-special", "tree-mount",
+    "retain-conflict", "retained-exists", "live-missing", "tree-missing", "credential-not-parked", "keep-occupied",
+    "keep-return-conflict", "keep-shape", "replaced-occupied", "unconfirmed-occupied", "classes-missing",
+    "slot-not-ours", "seam-unbuilt", "intent-malformed", "intent-unbuilt", "intent-pending"})
+PERMANENT_HELD_PREFIXES = ("no-credential:",)
+#: A redo can pass: a race, a slow writer, a process that may still exit, an I/O fault. ``bad-root`` covers both a
+#: wrong owner and an fsync / open errno, and ``kill-unproven`` a process that may yet exit: both stay transient
+#: (the hourly cap bounds a misclassified one at 24 tries a day). ``var-folders-changed`` is held at ``manifest``
+#: when the dir changed under the walk, and the redo re-derives the manifest and passes (test_slot_end_var_folders).
+TRANSIENT_HELD = frozenset({"tree-changed", "capture-busy", "link-reader-failed", "link-reader-unset",
+                            "kill-unproven", "freeze-unproven", "bad-root", "reserve-locked", "var-folders-changed"})
+#: Raised with no record change and no backoff (the reaper's ``_end_one``), or before END's first act: never a
+#: ``held_reason``.
+NOT_AN_ATTEMPT = frozenset({"end-busy", "slot-locked", "not-ending", "alloc-malformed"})
+#: The tries a PERMANENT cause gets before it is quarantined (the 0 / 60 / 180 s tries cover a racing writer or a
+#: crashed redo); a BUDGET refusal gets one, since the same caps on the same tree refuse identically and each try can
+#: hold the single reaper pass for up to :data:`V2_SECONDS`.
+QUARANTINE_AFTER = 3
+QUARANTINE_AFTER_BUDGET = 1
+
+
+def quarantine_after(reason: object) -> int | None:
+    """The ``held_attempts`` at which a HELD for ``reason`` is quarantined; ``None`` for a transient, unclassified or
+    absent reason (retried at the backoff cap forever)."""
+    if not isinstance(reason, str):
+        return None
+    if reason in BUDGET_REFUSALS:
+        return QUARANTINE_AFTER_BUDGET
+    if reason in PERMANENT_HELD or reason.startswith(PERMANENT_HELD_PREFIXES):
+        return QUARANTINE_AFTER
+    return None
+
+
+def quarantined(fields: Mapping[str, object]) -> bool:
+    """Whether a HELD record's ``fields`` (``held_reason``, ``held_attempts``) put it in quarantine. The one test the
+    reaper and ``levain doctor`` both ask."""
+    after = quarantine_after(fields.get("held_reason"))
+    tries = fields.get("held_attempts")
+    return after is not None and isinstance(tries, int) and not isinstance(tries, bool) and tries >= after
+
+
+def held_reason_of(e: BaseException) -> str | None:
+    """The refusal name behind a failed step, for the HELD CAS: the ``Refused`` itself or the one a failed phase
+    wraps; ``None`` for anything else (an OSError, a fault) or a name the record would refuse."""
+    cause = e.cause if isinstance(e, PhaseFailed) else e
+    if isinstance(cause, Refused) and _REASON_RE.fullmatch(cause.name):
+        return cause.name
+    return None
 
 #: ``L/retained/<s>/linkcopy/<dev>-<ino>``: a foreign inode's bytes as the session uid read them, staged by
 #: the manifest step and linked into the tree by the tree step (L2 H2).
@@ -1703,12 +1762,15 @@ def send_cas(seams: EndSeams, target: str, fields: Mapping[str, object]) -> None
     CONTROL that is down (``OSError``) are retried with backoff for up to :data:`CAS_RETRY_SECONDS`;
     ``stale-generation`` is retried once (the seam reads the record's generation on every call). Anything
     else, or the retries spent, raises :class:`CasNotSent`. A CAS out of HELD (any target but HELD) also
-    clears ``failed_step`` and ``held_attempts`` (L1-F4: CONTROL merges, so an unnamed field survives)."""
+    clears ``failed_step``, ``held_attempts`` and ``held_reason`` (L1-F4: CONTROL merges, so an unnamed field
+    survives). A CONTROL that predates ``held_reason`` refuses it ``field-not-casable``: the optional classification
+    is dropped and the CAS sent again once, so a mixed-version window never keeps a session from ending."""
     if target != HELD:
-        fields = {"failed_step": None, "held_attempts": None, **fields}
+        fields = {"failed_step": None, "held_attempts": None, "held_reason": None, **fields}
     t0 = seams.clock()
     delay = CAS_BACKOFF_FIRST
     stale_retried = False
+    reason_dropped = False
     while True:
         try:
             seams.cas(target, fields)
@@ -1716,6 +1778,10 @@ def send_cas(seams: EndSeams, target: str, fields: Mapping[str, object]) -> None
         except Refused as e:
             if e.name == "stale-generation" and not stale_retried:
                 stale_retried = True
+                continue
+            if e.name == "field-not-casable" and "held_reason" in fields and not reason_dropped:
+                reason_dropped = True
+                fields = {k: v for k, v in fields.items() if k != "held_reason"}
                 continue
             if e.name != "locked":
                 raise CasNotSent(target, e) from None
@@ -2696,7 +2762,8 @@ def reconcile_session(facts: EndFacts, seams: EndSeams, *, caps: Caps = Caps(),
             except Exception as e:   # noqa: BLE001 - an unproven step is HELD
                 seams.note(f"reconcile {facts.session}: {step} not proven: {e}")
                 attempts = held_attempts if isinstance(held_attempts, int) and held_attempts >= 0 else 0
-                send_cas(seams, HELD, {"failed_step": step, "held_attempts": attempts + 1})
+                send_cas(seams, HELD, {"failed_step": step, "held_attempts": attempts + 1,
+                                       "held_reason": held_reason_of(e)})
                 raise
         try:
             return _reconcile(facts, seams, caps)
@@ -2825,15 +2892,19 @@ def _end_locked(facts: EndFacts, seams: EndSeams, start: int, attempts: int, cap
         if isinstance(e.cause, CasNotSent):
             raise e.cause from None
         seams.note(f"END {facts.session}: {step} not proven: {e}")
-        held = step
+        held, reason = step, held_reason_of(e)
     except Exception as e:   # noqa: BLE001 - an unproven step is HELD, never a crash past the tree
         seams.note(f"END {facts.session}: {step} not proven: {e}")
-        held = step
-    cas(HELD, {"failed_step": held, "held_attempts": attempts})
+        held, reason = step, held_reason_of(e)
+    # ``held_reason`` None (an OSError, an unnamed fault) clears a reason an earlier try left, so a stale permanent
+    # reason never outlives a transient failure.
+    cas(HELD, {"failed_step": held, "held_attempts": attempts, "held_reason": reason})
     return HELD
 
 
-__all__ = ["BUDGET_REFUSALS", "CAS_RETRY_SECONDS", "CLASSES", "CREDENTIALS", "CREDENTIAL_FILES", "CREDENTIAL_PARKED",
+__all__ = ["BUDGET_REFUSALS", "NOT_AN_ATTEMPT", "PERMANENT_HELD", "PERMANENT_HELD_PREFIXES", "QUARANTINE_AFTER",
+           "QUARANTINE_AFTER_BUDGET", "TRANSIENT_HELD", "held_reason_of", "quarantine_after", "quarantined",
+           "CAS_RETRY_SECONDS", "CLASSES", "CREDENTIALS", "CREDENTIAL_FILES", "CREDENTIAL_PARKED",
            "Caps", "HASH_ONLY_CAP", "LINK_UNREADABLE", "OUTSIDE", "PROVEN_PHASES", "SLOT_LOCK_WAIT_S", "UNOWNED",
            "UNREAD_ANSWERS", "WALK_OPEN_DIRS", "WALK_PEAK_FDS", "classify", "read_classes", "retained_whole",
            "stored_classification", "session_reader", "slot_lock", "sync_tree",
