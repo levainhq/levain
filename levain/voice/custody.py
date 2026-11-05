@@ -184,8 +184,6 @@ def read_key(provider: str, use: str, *, authority: AuthoritySource, store: Any 
     calls, so a revoke stops the next read and a record that is gone reads nothing."""
     if not isinstance(authority, AuthoritySource):
         raise TypeError(f"read_key takes an AuthoritySource, not {type(authority).__name__}")
-    if provider not in VOICE_KEY_PROVIDERS or use not in VOICE_KEY_USES:
-        raise VoiceKeyUnavailable("not_set", "that provider or use is not one voice knows")
     try:
         state = authority()
     except Exception:                       # noqa: BLE001 - any failure is "the log could not be verified now"

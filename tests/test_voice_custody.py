@@ -319,6 +319,15 @@ def test_the_writer_refuses_an_item_name_it_cannot_place_unquoted(sec, name):
     assert sec.calls() == []
 
 
+def test_the_writer_itself_refuses_a_value_it_cannot_place_unquoted(sec):
+    """The writer is the replaceable seam: it holds its own line whatever its caller checked."""
+    for bad in ("short", "has space in it", "quo'te-key-1234", "x;y-key-1234567", "new\nline-key-1234"):
+        with pytest.raises(KeychainWriteFailed) as exc:
+            SecurityStdinWriter(sec.path).write(SOURCE, ACCOUNT, Secret(bad))
+        assert bad not in str(exc.value)
+    assert sec.calls() == []
+
+
 # --- add: the ceremony -------------------------------------------------------------------------------------------
 
 def test_add_signs_a_record_naming_the_item_and_stores_the_value_through_stdin(ck, sec):
