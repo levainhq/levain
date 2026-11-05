@@ -15,6 +15,8 @@ import base64
 import errno
 import hashlib
 import os
+import shutil
+import time
 from pathlib import Path
 
 import pytest
@@ -196,3 +198,217 @@ def test_the_retained_object_carries_no_staging(world):
     assert obj["entries"] == len(world.manifest_file())
     assert not (world.facts.retained / end_mod.VFCOPY).exists()
     assert not (world.facts.retained / end_mod.VFKEYS).exists()
+
+
+# --- L3 r1 fixes (1105-17 endvf_fix1) --------------------------------------------------------------------------------
+
+
+def _move_away(vf: Path) -> Path:
+    """``vf`` renamed aside by the dir-fd rename form (which gets past the :func:`sunlnk` stand-in: test setup)."""
+    gone = vf.with_name("gone")
+    pfd = os.open(vf.parent, os.O_RDONLY)
+    try:
+        os.rename(vf.name, gone.name, src_dir_fd=pfd, dst_dir_fd=pfd)
+    finally:
+        os.close(pfd)
+    return gone
+
+
+def _vf_walks(monkeypatch, vf: Path) -> list[int]:
+    """Counts the entries every walk rooted AT ``vf`` yields (the var-folders scan and the tree step's emptying)."""
+    real, seen = end_mod.walk, [0]
+
+    def counting(root, *a, **k):
+        for e in real(root, *a, **k):
+            if Path(root) == vf:
+                seen[0] += 1
+            yield e
+    monkeypatch.setattr(end_mod, "walk", counting)
+    return seen
+
+
+@pytest.mark.parametrize("cap", ["inodes", "seconds"])
+def test_a_scratch_tree_past_the_budget_refuses_without_scanning_it_all(world, monkeypatch, cap):
+    """E1 (codex 3): the scan counts against the manifest's inode / time budget as it goes, so a huge scratch tree
+    refuses by the budget's name with a bounded number of entries scanned, never the whole tree held first."""
+    for i in range(300):
+        (world.vf / "T" / f"f{i:03}").write_bytes(b"x")
+    seen = _vf_walks(monkeypatch, world.vf)
+    ctl = Control()
+    if cap == "inodes":
+        caps, kw, name, bound = end_mod.Caps(inodes=50), {}, "manifest-inode-cap", 51
+    else:
+        ticks = iter(range(1_000_000))
+        caps, kw, name, bound = end_mod.Caps(seconds=5), {"clock": lambda: float(next(ticks))}, "manifest-time-cap", 10
+    assert end_session(world.facts, world.seams(ctl, **kw), record_state=REVOKED, caps=caps) == HELD
+    assert ctl.failed_step == "manifest_budget"
+    assert any(name in n for n in world.notes), world.notes
+    assert 0 < seen[0] <= bound, seen[0]
+    assert world.facts.live.is_dir() and not world.facts.tree.exists()
+
+
+def test_a_failing_copy_mkdir_leaks_no_fd_across_retries(world, tmp_path, monkeypatch):
+    """E2 (codex 5): with an outside-linked file (``linkcopy`` opened) and the copy's mkdir failing, every retry
+    closes what it opened."""
+    outside = tmp_path / "outside.txt"
+    outside.write_text("x" * 10)
+    os.link(outside, world.S / "repo" / "hl-out")
+    real = os.mkdir
+
+    def mkdir(p, *a, **k):
+        if os.fsencode(p).endswith(b"/" + os.fsencode(end_mod.VFCOPY)):
+            raise OSError(errno.ENAMETOOLONG, "File name too long", os.fsdecode(p))
+        return real(p, *a, **k)
+    monkeypatch.setattr(os, "mkdir", mkdir)
+
+    def nfds() -> int:
+        return len(os.listdir("/dev/fd"))
+    ctl = Control()
+    assert end_session(world.facts, world.seams(ctl), record_state=REVOKED) == HELD
+    assert ctl.failed_step == "manifest"
+    before = nfds()
+    for i in range(6):
+        assert end_session(world.facts, world.seams(ctl), record_state=HELD, failed_step="manifest",
+                           held_attempts=i + 1) == HELD
+        assert ctl.failed_step == "manifest"
+    assert nfds() == before
+
+
+def _once_before_classify(monkeypatch, act) -> None:
+    real, done = end_mod.classify, [False]
+
+    def classify(*a, **k):
+        if not done[0]:
+            done[0] = True
+            act()
+        return real(*a, **k)
+    monkeypatch.setattr(end_mod, "classify", classify)
+
+
+def _assert_changed_held(w: World, ctl: Control, step: str) -> None:
+    assert ctl.failed_step == step
+    assert any("var-folders-changed" in n for n in w.notes), w.notes
+    assert w.facts.live.is_dir() and not w.facts.tree.exists()
+
+
+def test_a_dir_made_after_an_absent_preflight_holds_at_manifest_and_the_redo_rederives(world, monkeypatch):
+    """E3 (codex 2): absent at the preflight, its skeleton made before the manifest walk: the manifest names the
+    dir and no copy exists. HELD ``manifest``, nothing moved; the redo scans, copies and retains it."""
+    _move_away(world.vf)
+
+    def remake():
+        world.vf.mkdir()
+        for n in SKELETON:
+            (world.vf / n).mkdir()
+    _once_before_classify(monkeypatch, remake)
+    ctl = Control()
+    assert end_session(world.facts, world.seams(ctl), record_state=REVOKED) == HELD
+    _assert_changed_held(world, ctl, "manifest")
+    assert end_session(world.facts, world.seams(ctl), record_state=HELD, failed_step="manifest",
+                       held_attempts=1) == RETAINED, world.notes
+    assert sorted(os.listdir(world.facts.tree / ".levain-var-folders")) == sorted(SKELETON)
+    assert world.manifest_file() == tree_manifest(world.facts.tree)
+
+
+def test_a_skeleton_dir_made_between_the_scan_and_the_manifest_holds_at_manifest(world, monkeypatch):
+    """E3: a skeleton dir the scan did not see but the manifest walk did is in the manifest and not the copy."""
+    os.rmdir(world.vf / "0")
+    _once_before_classify(monkeypatch, lambda: (world.vf / "0").mkdir())
+    ctl = Control()
+    assert end_session(world.facts, world.seams(ctl), record_state=REVOKED) == HELD
+    _assert_changed_held(world, ctl, "manifest")
+
+
+def test_a_scanned_entry_gone_before_the_manifest_holds_at_manifest(world, monkeypatch):
+    """E3, the other direction: a scanned dir gone before the manifest walk is in the copy and not the manifest."""
+    def drop():
+        os.unlink(world.vf / "T" / "sub" / "deep.txt")
+        os.rmdir(world.vf / "T" / "sub")
+    _once_before_classify(monkeypatch, drop)
+    ctl = Control()
+    assert end_session(world.facts, world.seams(ctl), record_state=REVOKED) == HELD
+    _assert_changed_held(world, ctl, "manifest")
+
+
+def test_the_tree_step_holds_when_the_manifest_names_a_copy_that_is_gone(world):
+    """E3 at the tree step: the manifest names the dir, the copy is missing. HELD ``tree`` before the first rename,
+    and no original is unlinked (without the check, they were emptied with no copy kept)."""
+    def fault(p):
+        if p == "retain:before:tree":
+            shutil.rmtree(world.facts.retained / end_mod.VFCOPY)
+    ctl = Control()
+    assert end_session(world.facts, world.seams(ctl, fault=fault), record_state=REVOKED) == HELD
+    _assert_changed_held(world, ctl, "tree")
+    assert (world.vf / "C" / "cachefile").read_bytes() == PLANTED
+
+
+def test_the_tree_step_holds_when_a_copy_exists_the_manifest_does_not_name(world):
+    """E3 at the tree step, the other direction: no var-folders dir at the manifest, a copy present at the tree."""
+    _move_away(world.vf)
+
+    def fault(p):
+        if p == "retain:before:tree":
+            (world.facts.retained / end_mod.VFCOPY).mkdir()
+    ctl = Control()
+    assert end_session(world.facts, world.seams(ctl, fault=fault), record_state=REVOKED) == HELD
+    _assert_changed_held(world, ctl, "tree")
+
+
+@pytest.mark.parametrize("call", ["_scan_var_folders", "_empty_var_folders", "prove_var_folders_skeleton"])
+def test_a_dir_gone_after_the_preflight_is_none_not_held(world, monkeypatch, call):
+    """E4 (complement 2): the dir removed between a preflight and the walk / open is "none", never a spurious HELD:
+    at the tree step (empty, prove: the copy is retained) and at the manifest step's scan (no dir, so no copy)."""
+    real = getattr(end_mod, call)
+
+    def gone(*a, **k):
+        shutil.rmtree(world.vf)
+        return real(*a, **k)
+    monkeypatch.setattr(end_mod, call, gone)
+    ctl = Control()
+    assert end_session(world.facts, world.seams(ctl), record_state=REVOKED) == RETAINED, world.notes
+    dest = world.facts.tree / ".levain-var-folders"
+    if call == "_scan_var_folders":
+        assert not dest.exists() and world.manifest_file() == tree_manifest(world.facts.tree)
+    else:
+        assert (dest / "C" / "cachefile").read_bytes() == PLANTED
+
+
+def _seal_inputs(w: World):
+    """The manifest step's inputs to :func:`_seal_vfcopy`, built for a direct call: the scan and a mirrored copy."""
+    w.facts.retained.mkdir(exist_ok=True)
+    scan = end_mod._scan_var_folders(w.vf, 10, end_mod._Budget(end_mod.Caps(), time.monotonic))
+    vcopy = os.fsencode(w.facts.retained / end_mod.VFCOPY)
+    os.mkdir(vcopy, 0o700)
+    for rel, st in scan:
+        if os.path.isdir(w.vf / os.fsdecode(rel)):
+            os.mkdir(vcopy + b"/" + rel, 0o700)
+    files = {(st.st_dev, st.st_ino) for rel, st in scan if not os.path.isdir(w.vf / os.fsdecode(rel))}
+    return vcopy, os.lstat(w.vf), scan, files
+
+
+def test_the_key_list_is_capped_by_the_manifest_byte_cap(world):
+    """E5 (complement 3): ``vfkeys.jsonl`` refuses ``manifest-byte-cap``, and the meta cap does not bound it."""
+    vcopy, vroot, scan, files = _seal_inputs(world)
+    end_mod._seal_vfcopy(world.facts, vcopy, vroot, scan, files, end_mod.Caps(meta_bytes=10))
+    with pytest.raises(end_mod.Refused) as e:
+        end_mod._seal_vfcopy(world.facts, vcopy, vroot, scan, files, end_mod.Caps(manifest_bytes=10))
+    assert e.value.name == "manifest-byte-cap"
+
+
+def test_the_copy_dirs_get_their_modes_deepest_first_and_the_root_last(world, monkeypatch):
+    """E6b (deepseek 3): the order the docstring states; the root used to go first."""
+    vcopy, vroot, scan, files = _seal_inputs(world)
+    order: list[int] = []
+    real = os.fchmod
+
+    def fchmod(fd, mode):
+        order.append(os.fstat(fd).st_ino)
+        return real(fd, mode)
+    monkeypatch.setattr(os, "fchmod", fchmod)
+    end_mod._seal_vfcopy(world.facts, vcopy, vroot, scan, files, end_mod.Caps())
+    root = Path(os.fsdecode(vcopy))
+    dirs = {Path(d): os.lstat(d).st_ino for d, _, _ in os.walk(root)}
+    assert sorted(order) == sorted(dirs.values()) and order[-1] == dirs[root]
+    for d, ino in dirs.items():
+        if d != root:
+            assert order.index(ino) < order.index(dirs[d.parent]), d
