@@ -406,6 +406,52 @@ function fire(type, ev) {
     const off = await Promise.race([second.handed.then(async (r) => ({ status: r.status, body: await r.text() })), new Promise((r) => setTimeout(() => r({ timeout: true }), 500))]);
     log.offline = off;
     if (!m.hang) await Promise.all(first.waits);
+  } else if (scenario === 'deadline') {
+    // the network ANSWERS NOTHING (Tailscale off): a navigation to '/' waits out the worker's deadline and gets the cached shell;
+    // then the shell's cached asset must answer from the cache with no network wait, an uncached asset waits its own deadline
+    // and its fetch is ABORTED; the navigation's late answer is drained; then the network returns and both go network-first again.
+    // mode: JSON {shellHtml, cached}. Steps record {ms, status, body}; net calls record {key, signal}; aborts record the key.
+    const m = JSON.parse(mode);
+    const shellName = 'levain-shell-v' + /SW_VERSION = '([^']+)'/.exec(fs.readFileSync(swPath, 'utf8'))[1];
+    cacheStores.set(shellName, new Map([['/', m.shellHtml], [m.cached, 'CACHED ' + m.cached]])); cacheNames.add(shellName);
+    let net = 'hang';
+    const late = [];
+    log.netCalls = []; log.aborted = []; log.steps = []; log.lateDrained = 0;
+    sandbox.fetch = (req, init) => {
+      const p = new URL(req.url, 'https://box.example'), key = p.pathname + p.search;
+      log.netCalls.push({ key, signal: !!(init && init.signal) });
+      if (net === 'ok') {
+        return Promise.resolve(key === '/' ? new Response('<html>live</html>', { status: 200, headers: { 'content-type': 'text/html' } })
+          : new Response('LIVE ' + key, { status: 200, headers: { 'content-type': /\.css/.test(key) ? 'text/css' : 'application/javascript' } }));
+      }
+      return new Promise((res, rej) => {
+        late.push({ key, res });
+        if (init && init.signal) init.signal.addEventListener('abort', () => { log.aborted.push(key); rej(new Error('aborted')); });
+      });
+    };
+    const send = async (url, mode_, destination) => {
+      const ev = { request: { url: 'https://box.example' + url, method: 'GET', mode: mode_, destination } };
+      let handed = null;
+      ev.respondWith = (p) => { handed = Promise.resolve(p); };
+      ev.waitUntil = () => {};
+      const t0 = Date.now();
+      for (const fn of listeners.fetch || []) fn(ev);
+      const r = await handed;
+      log.steps.push({ url, ms: Date.now() - t0, status: r.status, body: r.status ? await r.text() : null });
+    };
+    const kindOf = (u) => (/\.css/.test(u) ? 'style' : 'script');
+    await send('/', 'navigate', 'document');
+    await send(m.cached, 'no-cors', kindOf(m.cached));
+    await send(m.uncached, 'no-cors', kindOf(m.uncached));
+    for (const l of late.filter((x) => x.key === '/')) {
+      const r = new Response('<html>late</html>', { status: 200, headers: { 'content-type': 'text/html' } });
+      Object.defineProperty(r, 'body', { value: { cancel: () => { log.lateDrained += 1; return Promise.resolve(); } } });
+      l.res(r);
+    }
+    await new Promise((r) => setTimeout(r, 20));
+    net = 'ok';
+    await send('/', 'navigate', 'document');
+    await send(m.cached, 'no-cors', kindOf(m.cached));
   }
   console.log(JSON.stringify(log));
   if (scenario === 'hold') process.exit(0);

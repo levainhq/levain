@@ -202,17 +202,29 @@ def test_delete_and_clear_never_close_a_needs_you_item_and_the_page_says_so(tmp_
 
 
 @needs_browser
-def test_a_push_tap_opens_that_item_marked_read_and_a_deleted_one_says_so(tmp_path: Path) -> None:
-    """The tap's url (/?view=notifications&n=<id>) opens the focus view on that item and marks it read (the strip count drops, the address
-    is cleaned); the same link to an item since deleted opens the list and says it was deleted."""
+def test_a_push_tap_opens_that_item_and_a_gesture_marks_it_read_and_a_deleted_one_says_so(tmp_path: Path) -> None:
+    """The tap's url (/?view=notifications&n=<id>) opens the focus view on that item (the address is cleaned) but leaves it unread: any
+    site can make that navigation now the cross-site guard admits it, so the load alone writes nothing (L3 pwa-ab r1, codex). An
+    evaluated .click() is not a gesture; one trusted tap inside the view marks it read (the strip count drops). The same link to an
+    item since deleted opens the list and says it was deleted."""
     r = Rig(tmp_path)
+    title = f"{MODAL}.querySelector('.nc-dtitle')"
     with _signed(r.src, r.q) as (port, _):
         ids = r.seed(port)
         n = _center(port)["unread"]
         out = _drive(tmp_path, _url(port, f"?view=notifications&n={ids['flow']}"), [
             {"emulate": {"w": 1280, "h": 900, "dpr": 1}},
-            {"until": f"{MODAL} && {MODAL}.querySelector('.nc-dtitle') && 1", "ms": 40000}, _ready(n - 1),
-            {"eval": f"JSON.stringify({{ title: {MODAL}.querySelector('.nc-dtitle').textContent, url: location.search }})"}])
+            {"until": f"{MODAL} && {title} && 1", "ms": 40000}, _ready(n),
+            {"eval": "new Promise(r => setTimeout(r, 1500)).then(() => 1)"},        # long past the old immediate mark-read POST
+            {"eval": f"JSON.stringify({{ title: {title}.textContent, url: location.search, pill: {PILL}.textContent }})"}])
+        unread_after_load = {i["id"]: i["read"] for i in _center(port)["items"]}
+        out2 = _drive(tmp_path, _url(port, f"?view=notifications&n={ids['flow']}"), [
+            {"emulate": {"w": 1280, "h": 900, "dpr": 1}},
+            {"until": f"{MODAL} && {title} && 1", "ms": 40000}, _ready(n),
+            {"eval": f"{title}.click(); {MODAL}.querySelector('.nc-root').dispatchEvent(new PointerEvent('pointerdown', {{bubbles: true}})); 1"},
+            {"eval": "new Promise(r => setTimeout(r, 1000)).then(() => 1)"},
+            {"eval": f"JSON.stringify({{ pill: {PILL}.textContent }})"},
+            {"tap": title}, _ready(n - 1)])
         read = {i["id"]: i["read"] for i in _center(port)["items"]}
         _call(port, "POST", "/webpush/center/delete", {"id": ids["low"]}, token=T)
         gone = _drive(tmp_path, _url(port, f"?view=notifications&n={ids['low']}"), [
@@ -220,8 +232,10 @@ def test_a_push_tap_opens_that_item_marked_read_and_a_deleted_one_says_so(tmp_pa
             {"until": f"{MODAL} && {MODAL}.querySelector('.nc-gone') && 1", "ms": 40000},
             {"eval": f"JSON.stringify({{ line: {MODAL}.querySelector('.nc-gone').textContent, rows: {ROWS}.length }})"}])
     got = _json(out)[0]
-    assert got == {"title": "Inbox digest", "url": ""}, got
-    assert read[ids["flow"]] is True
+    assert got == {"title": "Inbox digest", "url": "", "pill": str(n)}, got
+    assert unread_after_load[ids["flow"]] is False                      # the load alone wrote nothing
+    assert _json(out2)[0] == {"pill": str(n)}, out2                       # an untrusted click and a script-made pointerdown are not gestures
+    assert read[ids["flow"]] is True                                    # the trusted tap marked it
     line = _json(gone)[0]
     assert line["line"] == "That notification was deleted." and line["rows"] >= 1, line
 

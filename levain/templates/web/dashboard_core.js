@@ -8413,7 +8413,9 @@
   const nc = { sig: "", items: [], unread: 0, total: 0, needs: 0, next: null, status: "idle", goodAt: 0, readId: 0, wgen: 0, busy: 0 };
   // status: idle (never read) | ok | error (never read, last try failed) | noauth (no/refused token) | absent (this server has no center)
   const ncUi = { sel: null, pinned: null, filter: "", banner: null, menu: false, detail: false, gone: "", more: false };
-  let ncRoot = null, ncDeepPending = null;
+  // ncDeepLink: the pending id came from the page's own address (a push tap's deep link), not a click on this page.
+  // ncReadArmed: the id a deep link selected and left unread; the first trusted gesture inside the view marks it (see ncSelect).
+  let ncRoot = null, ncDeepPending = null, ncDeepLink = false, ncReadArmed = null;
   const ncPanels = new Set();
 
   function ncApi(method, path, body) {
@@ -8545,40 +8547,69 @@
     ncPaint();
     return ok;
   }
-  function ncSelect(id) {
+  // `byLink`: the selection came from the address (/?view=notifications&n=<id>), which the cross-site guard admits so a push tap
+  // that reaches the browser as a launcher intent can open (1105-7 defect A). Any other site can make that same navigation, so a
+  // deep link only SELECTS; the item is marked read by the first trusted tap or key press inside the view (ncGesture), which a
+  // hostile navigation never yields (codex, L3 pwa-ab r1). A click on a row keeps marking read at once.
+  function ncSelect(id, byLink) {
     ncUi.sel = id; ncUi.detail = true; ncUi.gone = "";
     const it = ncFind(id);
     // the open row is always pinned (a new arrival can push it past any refresh limit); ncFind prefers the list's own copy
     if (it) ncUi.pinned = it;
+    ncReadArmed = byLink && it && !it.read ? id : null;
     ncPaint();
-    if (it && !it.read) ncSetRead(id, true);
+    if (!byLink && it && !it.read) ncSetRead(id, true);
+  }
+  function ncGesture(ev) {
+    if (!ev.isTrusted || !ncReadArmed) return;
+    if (ev.type === "keydown" && ev.key === "Escape") return;   // leaving the view is not reading the item
+    const id = ncReadArmed;
+    ncReadArmed = null;
+    // the item's own controls (its read toggle, delete, a row's dot or delete) carry their own intent: disarm, write nothing here
+    const t = ev.target && ev.target.closest ? ev.target.closest("[data-tool], .nc-dot-btn, .nc-del") : null;
+    if (t) return;
+    const it = ncFind(id);
+    if (ncUi.sel === id && it && !it.read) ncSetRead(id, true);
   }
 
   // ---- the deep link: /?view=notifications&n=<id> (a push tap) --------------------------------------------------------
   async function ncDeepTry() {
-    const id = ncDeepPending;
+    const id = ncDeepPending, byLink = ncDeepLink;
     if (!id) return;
-    if (nc.items.some((x) => x.id === id)) { ncDeepPending = null; ncSelect(id); return; }
+    if (nc.items.some((x) => x.id === id)) { ncDeepPending = null; ncSelect(id, byLink); return; }
     if (nc.status !== "ok") return;           // no list yet (the token may still be on its way): the next read tries again
     ncDeepPending = null;
     const res = await ncApi("GET", NC_PATH + "/item?id=" + encodeURIComponent(id));
-    if (res.status === 200 && res.data.item) { ncUi.pinned = res.data.item; ncSelect(id); return; }
+    if (res.status === 200 && res.data.item) { ncUi.pinned = res.data.item; ncSelect(id, byLink); return; }
     if (res.status === 404) {
       ncUi.gone = res.data.error === "gone" && typeof res.data.message === "string" ? res.data.message : res.data.error === "gone" ? "That notification was deleted." : "That notification isn’t here.";
       ncUi.sel = null; ncUi.detail = false;
     } else ncUi.banner = { kind: "write", retry: false, text: "Couldn’t open that notification. The list is as it was." };
     ncPaint();
   }
+  // The page's address names a view to open: `notifications` (+ `n`) is the center's focus view; `needs` (a held summary's tap,
+  // held.SUMMARY_URL) is the Needs-you strip, reached the way the strip's own Needs tab reaches it. Any other `view` value is left
+  // alone (the page opens at home, the address untouched). A link only OPENS a view: it never answers, marks read or writes.
   function ncUrlAsk() {
     try {
       const q = new URLSearchParams(window.location.search);
-      if (q.get("view") !== "notifications") return null;
+      const view = q.get("view");
+      if (view !== "notifications" && view !== "needs") return null;
       const n = q.get("n");
       q.delete("view"); q.delete("n");
       const rest = q.toString();
       window.history.replaceState(null, "", window.location.pathname + (rest ? "?" + rest : "") + window.location.hash);
+      if (view === "needs") return { needs: true };
       return { id: n && NC_ID.test(n) ? n : null };
     } catch (_) { return null; }
+  }
+  // The strip draws once the board's first read answers, after this boot: wait (bounded, and given up the moment the reader touches
+  // the page: phoneJumpRun moves) for the Needs strip to hold something waiting, then jump exactly as the Needs tab does. With
+  // nothing waiting the page stays where it opened.
+  function needsDeepJump(run, deadline) {
+    if (run !== phoneJumpRun) return;
+    if (document.querySelector(PHONE_JUMP_TARGET.needs)) { phoneJump("needs", null); return; }
+    if (Date.now() < deadline) window.setTimeout(() => needsDeepJump(run, deadline), PHONE_JUMP_STEP_MS);
   }
 
   // ---- the markdown and the links ---------------------------------------------------------------------------------------
@@ -8953,6 +8984,9 @@
     split.append(lp, dp);
     root.appendChild(split);
     root.addEventListener("click", (ev) => { if (ncUi.menu && !ev.target.closest(".nc-more")) { ncUi.menu = false; ncFillBar(); } });
+    // capture phase: the gesture is seen before the control it lands on acts (a row's click may select another item)
+    root.addEventListener("pointerdown", ncGesture, true);
+    root.addEventListener("keydown", ncGesture, true);
     root.addEventListener("keydown", (ev) => { if (ev.key === "Escape" && ncUi.menu) { ev.preventDefault(); ev.stopPropagation(); ncUi.menu = false; ncFillBar(); mb.focus(); } });
     root._nc = { bar, filter, markall, mb, menu, mm, mc, banner, needs, list, detail, split, lp, dp };
     return root;
@@ -9244,11 +9278,13 @@
     for (const p of Array.from(ncPanels)) { if (!p.isConnected) ncPanels.delete(p); else p._ncFill(); }
     ncFillAll();
   }
-  // opens the focus view; `id` (a panel row, or a push tap's `n`) selects that item and marks it read
-  function openNotifyCenter(opener, id) {
+  // opens the focus view; `id` (a panel row, or a push tap's `n`) selects that item: a panel row marks it read, a deep link
+  // (`byLink`, the page's address) waits for a gesture inside the view (ncSelect)
+  function openNotifyCenter(opener, id, byLink) {
     ncUi.filter = ""; ncUi.menu = false; ncUi.sel = null; ncUi.pinned = null; ncUi.gone = ""; ncUi.detail = false;
     if (ncUi.banner && ncUi.banner.kind === "write") ncUi.banner = null;
     ncDeepPending = id && NC_ID.test(id) ? id : null;
+    ncDeepLink = !!byLink; ncReadArmed = null;
     modalCustom = { id: "notifications", page: true, title: "Notifications", build: () => { ncRoot = ncMakeRoot(); return ncRoot; } };
     modalGlance = false;
     modalKey = "custom:notifications";
@@ -9266,7 +9302,8 @@
     window.setTimeout(() => { if (nc.status !== "ok") ncRead(false); }, 3000);
     window.setInterval(() => { if (!document.hidden) ncRead(false); }, NC_POLL_MS);
     document.addEventListener("visibilitychange", () => { if (!document.hidden) ncRead(false); });
-    if (ask) openNotifyCenter(null, ask.id);
+    if (ask && ask.needs) needsDeepJump(++phoneJumpRun, Date.now() + PHONE_JUMP_WAIT_MS);
+    else if (ask) openNotifyCenter(null, ask.id, true);
   }
   if (document.readyState === "loading") document.addEventListener("DOMContentLoaded", ncBoot); else ncBoot();
   window.LevainNotifyCenter = { open: openNotifyCenter, state: () => ({ status: nc.status, unread: nc.unread, total: nc.total, needs: nc.needs }), read: ncRead };

@@ -309,6 +309,28 @@ def test_the_fetch_handler_never_touches_posts_subresources_webpush_cockpit_or_a
 
 
 @needs_node
+def test_a_silent_network_costs_one_deadline_then_cached_assets_skip_the_network_and_an_uncached_one_is_aborted() -> None:
+    """1105-7 L3 r1 (complement, codex, deepseek): a cold open with the network silent paid the navigation's deadline, then the
+    same deadline again for every render-blocking asset of the cached shell, and every timed-out fetch stayed in flight. Now
+    the navigation answered offline puts the shell's assets cache-first (no network call, no wait); an asset the cache does
+    not hold waits one deadline with an abort signal and is aborted at it; the navigation's late answer is drained unread; a
+    navigation that reaches the network again puts assets back to network-first."""
+    sw = SW.read_text()
+    deadline = int(sw.split("const NET_TIMEOUT_MS = ", 1)[1].split(";", 1)[0])
+    got = _run("deadline", json.dumps({"shellHtml": SHELL_HTML, "cached": "/dashboard.css", "uncached": "/b.js?v=2"}))
+    nav, cached, uncached, nav2, cached2 = got["steps"]
+    assert nav["body"] == SHELL_HTML and deadline - 100 <= nav["ms"] < deadline + 1500, nav          # one deadline, then the shell
+    assert cached == {"url": "/dashboard.css", "ms": cached["ms"], "status": 200, "body": "CACHED /dashboard.css"}, cached
+    assert cached["ms"] < 500, cached                                                                 # no second deadline
+    assert [c["key"] for c in got["netCalls"][:2]] == ["/", "/b.js?v=2"], got["netCalls"]             # the cached asset made no call
+    assert got["netCalls"][0]["signal"] is False and got["netCalls"][1]["signal"] is True, got["netCalls"]   # navigate: no signal
+    assert uncached["status"] == 0 and deadline - 100 <= uncached["ms"] < deadline + 1500, uncached
+    assert got["aborted"] == ["/b.js?v=2"], got                                                       # the timed-out asset fetch is cancelled
+    assert got["lateDrained"] == 1, got                                                               # the late navigation answer is released
+    assert nav2["body"] == "<html>live</html>" and cached2["body"] == "LIVE /dashboard.css", (nav2, cached2)   # back online: network first
+
+
+@needs_node
 def test_install_precaches_the_shell_without_skipping_waiting_and_a_failed_fetch_never_blocks_install() -> None:
     got = _run("install", "ok")
     assert got["skipWaiting"] is False, got                                          # the page asks for it, never the worker
@@ -408,7 +430,7 @@ def test_no_notification_in_the_worker_carries_an_actions_key() -> None:
 @needs_node
 def test_activation_carries_the_last_good_shell_forward_when_the_new_install_cached_none() -> None:
     got = _run("carry")
-    assert [c for c in got["caches"] if c.startswith("levain-shell")] == ["levain-shell-v1104-pwasw-1"], got   # the old shell cache is gone
+    assert [c for c in got["caches"] if c.startswith("levain-shell")] == ["levain-shell-v1105-pwaab-2"], got   # the old shell cache is gone
     assert got["shells"][0][1] == [["/", "<html>old shell</html>"]], got          # its page was carried first
 
 

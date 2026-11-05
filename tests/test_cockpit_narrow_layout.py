@@ -175,6 +175,29 @@ def test_a_desktop_draws_the_strip_and_keeps_the_graph_above_the_needs(tmp_path:
         assert layout["band"] < layout["sky"] < layout["needs"], layout   # the wide page's own order
 
 
+@needs_browser
+@needs_ssh
+def test_a_held_summarys_tap_opens_the_needs_strip_and_changes_nothing_and_an_unknown_view_stays_home(tmp_path: Path, monkeypatch) -> None:
+    """A held summary's push carries /?view=needs. The page takes the reader to the Needs-you strip the way the strip's Needs tab does (the
+    wide page draws it below the graph, so the move is a real scroll), cleans the address, and writes nothing: both requests still wait
+    and no view opens over the page. An unknown `view` value opens at home as before, address untouched."""
+    rig = FullRig(tmp_path, monkeypatch)
+    waiting = "document.querySelector('#ck-needs[data-waiting]')"
+    read = (f"JSON.stringify({{ y: Math.round(window.scrollY), top: Math.round({waiting}.getBoundingClientRect().top), search: location.search,"
+            " modal: !!document.getElementById('levain-modal') })")
+    with rig.serving():
+        out = _drive(tmp_path, f"{rig.origin}/?view=needs#write_token={TOK}", [
+            DESKTOP, {"until": f"{waiting} && window.scrollY > 100 && 1", "ms": 40000}, SETTLE, {"eval": read}])["values"]
+        after = (rig.state(rig.rid), rig.state(rig.second))
+        home = _drive(tmp_path, f"{rig.origin}/?view=bogus#write_token={TOK}", [
+            DESKTOP, {"until": f"{waiting} && 1", "ms": 40000}, {"eval": "new Promise(r => setTimeout(r, 2500)).then(() => 1)"}, {"eval": read}])["values"]
+    got = [json.loads(v) for v in out if isinstance(v, str) and v.startswith("{")][0]
+    stay = [json.loads(v) for v in home if isinstance(v, str) and v.startswith("{")][0]
+    assert 0 <= got["top"] < 140 and got["y"] > 100 and got["search"] == "" and got["modal"] is False, got
+    assert after == ("pending", "pending"), after                       # a deep link only opens the view
+    assert stay["y"] == 0 and stay["search"] == "?view=bogus" and stay["modal"] is False and stay["top"] > 140, stay
+
+
 def test_the_strip_is_hidden_by_default_and_drawn_in_the_narrow_block_and_the_wide_one() -> None:
     css = CSS.read_text()
     assert re.search(r"(^|\n)\.ck-phonetabs\s*\{\s*display:\s*none\s*;?\s*\}", css)

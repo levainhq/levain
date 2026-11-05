@@ -6,7 +6,7 @@
 // whichever opens first creates the store; correctness depends on no timing (an unread key waits for the next trigger).
 const DB = 'levain-sw-2', STORE = 'opened';
 // A short id of this worker's code, recorded in the trace so a device's trace says which worker ran.
-const SW_VERSION = '1104-pwasw-1';
+const SW_VERSION = '1105-pwaab-2';
 // The TRACE: an append-only ring in its own cache, one entry per step, key TRACE_PREFIX + <time ms, zero padded> + '-' +
 // <seq>, value JSON {t, src, step, ...detail}. The /tap_trace page and sw_open.js read and write the same ring. Writes are
 // best effort, serialized on one chain, never awaited by the tap, and carry only urls without fragments, counts and step
@@ -247,7 +247,7 @@ function serial(fn) {
   shellChain = run.then(() => {}, () => {});
   return run;
 }
-// Cache names carry a version label ('0.11.10', '1104-pwasw-1'): compared run by run, digit runs as NUMBERS (so 0.11.10 is
+// Cache names carry a version label ('0.11.10', '1105-pwaab-1'): compared run by run, digit runs as NUMBERS (so 0.11.10 is
 // newer than 0.11.9), other runs as text. A digit run outranks a text run at the same place, so a label with no digits at all
 // (malformed) sorts below every numbered one and is then ordered as plain text. Never throws.
 function versionRuns(v) { return String(v).match(/\d+|\D+/g) || []; }
@@ -394,12 +394,42 @@ const OFFLINE_HTML = '<!doctype html><html lang="en"><head><meta charset="utf-8"
   'padding:calc(24px + env(safe-area-inset-top)) calc(24px + env(safe-area-inset-right)) calc(24px + env(safe-area-inset-bottom)) calc(24px + env(safe-area-inset-left))}' +
   'a{color:#14110f;background:#f1ebe3;padding:12px 28px;border-radius:12px;text-decoration:none;font-weight:600}</style></head>' +
   '<body><p>Can\'t reach your cockpit. Is Tailscale on?</p><a href="">Retry</a></body></html>';
+// How long the worker waits on the network for a navigation or a shell script/style before it answers from the cache (or the
+// offline page). A host that is unreachable by SILENCE (the cockpit with Tailscale off: its packets go nowhere and nothing
+// refuses them) never makes fetch() reject for the browser's own minute-long timeout; without a deadline the navigation, and
+// then every render-blocking script of the cached shell, hung there as a blank white page (1105-7).
+// A script/style fetch carries an AbortController signal and is aborted at its deadline, so a timed-out fetch does not stay
+// queued on the dead connection pool ahead of a later Retry. A navigation cannot: a navigate-mode request cannot be re-made
+// with a signal (Fetch spec: a new Request with a non-empty init turns mode 'navigate' into 'same-origin', a different request
+// with its own redirect handling), so its late response is left to
+// settle and, if it ever arrives, its body is cancelled unread (drain).
+// KNOWN EDGE (kept on purpose, L3 pwa-ab r1): a working network slower than the deadline is treated as down (the cached shell,
+// or the offline page whose Retry starts a fresh navigation under a fresh deadline); a longer wait is the hang defect B was.
+const NET_TIMEOUT_MS = 4000;
+function fetchWithin(req) {
+  let timer, timedOut = false;
+  const ac = req.mode === 'navigate' ? null : new AbortController();
+  const late = new Promise((_, reject) => {
+    timer = setTimeout(() => { timedOut = true; if (ac) ac.abort(); reject(new Error('network deadline')); }, NET_TIMEOUT_MS);
+  });
+  const pending = ac ? fetch(req, { signal: ac.signal }) : fetch(req);
+  // the loser of the race may settle later: a rejection is observed (never unhandled), a late response is released unread
+  pending.then((r) => { if (timedOut) drain(r); }, () => {});
+  return Promise.race([pending, late]).finally(() => clearTimeout(timer));
+}
+// Set when the latest navigation could not use the network (deadline or error) and was answered from the cache or the offline
+// page; cleared when a navigation's network answer arrives. While set, the shell's scripts and styles are served cache-first,
+// so a cold open with the network dead costs ONE deadline (the navigation's), not that deadline again per render-blocking asset
+// (L3 pwa-ab r1: 4 s + 4 s). An asset the cache does not hold still goes to the network under its own deadline. A worker that
+// is stopped and restarted between the navigation and its assets starts with this unset: the assets then pay one deadline each.
+let navOffline = false;
 function offlineResponse() {
   return new Response(OFFLINE_HTML, { status: 503, headers: { 'Content-Type': 'text/html; charset=utf-8', 'Cache-Control': 'no-store' } });
 }
 async function navigateNetworkFirst(e, req, bare) {
   try {
-    const r = await fetch(req);
+    const r = await fetchWithin(req);
+    navOffline = false;
     if (bare && shellCacheable(r)) {
       // off the critical path: the page never waits on Cache Storage (a slow or full cache costs the copy, not the page)
       const copy = r.clone();
@@ -407,6 +437,7 @@ async function navigateNetworkFirst(e, req, bare) {
     }
     return r;
   } catch (err) {
+    navOffline = true;
     if (new URL(req.url).pathname === SHELL_KEY) {
       try {
         const hit = await (await caches.open(SHELL_CACHE)).match(SHELL_KEY);
@@ -418,10 +449,24 @@ async function navigateNetworkFirst(e, req, bare) {
 }
 // The shell's own scripts and styles: network first (a reload never sees a skewed page), written through to the shell cache
 // OFF the response path (the worker's cache.put ignores the server's no-store) and only for an exact URL the cached shell
-// names, with a content type that fits; answered from the cache when the network fails.
-async function assetNetworkFirst(e, req, key, kind) {
+// names, with a content type that fits; answered from the cache when the network fails, and cache-first while the latest
+// navigation was answered offline (navOffline).
+async function cachedAsset(key) {
   try {
-    const r = await fetch(req);
+    // NOT serialized: a held or never-settling mutation must not hang an offline script/style request. KNOWN EDGE: this
+    // check-then-read can race a commit, so an offline request racing one may serve one old asset once, or answer a network error once when the commit's prune lands between the check and the read.
+    const c = await caches.open(SHELL_CACHE);
+    const page = await c.match(SHELL_KEY);
+    return page && shellAssets(await page.text()).some((a) => a.key === key) ? (await c.match(key)) || null : null;
+  } catch (_) { return null; }
+}
+async function assetNetworkFirst(e, req, key, kind) {
+  if (navOffline) {
+    const hit = await cachedAsset(key);
+    if (hit) return hit;
+  }
+  try {
+    const r = await fetchWithin(req);
     if (assetOk(r, kind)) {
       const copy = r.clone();
       e.waitUntil(serial(async () => {
@@ -435,15 +480,7 @@ async function assetNetworkFirst(e, req, key, kind) {
     }
     return r;
   } catch (err) {
-    try {
-      // NOT serialized: a held or never-settling mutation must not hang an offline script/style request. KNOWN EDGE: this
-      // check-then-read can race a commit, so an offline request racing one may serve one old asset once, or answer a network error once when the commit's prune lands between the check and the read.
-      const c = await caches.open(SHELL_CACHE);
-      const page = await c.match(SHELL_KEY);
-      const hit = page && shellAssets(await page.text()).some((a) => a.key === key) ? await c.match(key) : null;
-      if (hit) return hit;
-    } catch (_) { /* fall through */ }
-    return Response.error();
+    return (await cachedAsset(key)) || Response.error();
   }
 }
 self.addEventListener('fetch', (e) => {
