@@ -126,15 +126,12 @@ def test_rec_on_an_item_with_no_rec_is_refused():
 
 @pytest.mark.parametrize("text", [
     "(a) all recs",                  # a pick with no number is never guessed onto an item
-    "1a foo",                        # trailing words that are not a note
     "1ab",
     "1a2b",
     "1 because",
     "0a",
-    "1a, nonsense, 2b",              # one bad entry spoils the whole line
-    "1 b because",                   # a note with no words
+    "1a, 2z, 2b",                    # a malformed token in the answer run spoils the whole line
     "2:",
-    "all recs please",
     "hello there",
     "",
     "   ",
@@ -147,7 +144,7 @@ def test_a_line_that_does_not_fully_parse_records_nothing(text):
 
 
 def test_hint_only_for_a_line_that_starts_like_an_answer():
-    assert run("1a foo").hint and "nothing was recorded" in run("1a foo").hint
+    assert run("1a2b").hint and "nothing was recorded" in run("1a2b").hint
     assert run("hello there").hint is None
     assert "number in front" in run("(a) all recs").hint
     assert run("(a) all recs").hint.startswith("Levain did not read this as a band answer")

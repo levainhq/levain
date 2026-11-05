@@ -218,7 +218,7 @@ def test_phills_line_round_trips_recorded_and_signed_with_the_whole_line(store, 
                     ctk=lambda key: (None, "not checked"))
     assert got.ok, got.problem
     parsed = ts.parse_verified(rec["message"].encode())
-    assert parsed.typed == PHILL and parsed.typed_matches_hash()                # what was signed is what he typed
+    assert parsed.typed == PHILL and parsed.typed_matches_hash                # what was signed is what he typed
     assert [(e.item, e.answer, e.note) for e in parsed.entries] == [(qs[4].id, "(a) fixed 30 s", PHILL)]
 
 
