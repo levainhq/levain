@@ -85,8 +85,15 @@ class _Lock:
 
 
 def _stdin(obj):
+    """A stream, as stdin is: each call hands back the next bytes, then EOF (``b""``)."""
     raw = obj if isinstance(obj, bytes) else json.dumps(obj).encode()
-    return lambda n: raw[:n]
+    pos = [0]
+
+    def read(n):
+        out = raw[pos[0]:pos[0] + n]
+        pos[0] += len(out)
+        return out
+    return read
 
 
 def _trusted(st):
@@ -219,16 +226,20 @@ def test_a_bad_document_is_refused_by_name_before_the_lock(raw, name, L):
     assert path.read_bytes() == before
 
 
-def test_stdin_is_read_once_bounded_to_the_cap_plus_one(L):
+def test_stdin_is_read_to_eof_bounded_to_the_cap_plus_one(L):
+    """A whole-document reader (``sys.stdin.buffer.read``) answers the doc, then EOF: two calls, the second asking only
+    for what is left of the cap plus one (L3 r1: the read loops to EOF, so a chunked reader cannot truncate)."""
     asked = []
+    doc = canon.canonical_bytes(DOC2)
+    chunks = [doc]
 
     def read(n):
         asked.append(n)
-        return canon.canonical_bytes(DOC2)
+        return chunks.pop(0) if chunks else b""
     seams, _ = _seams(L)
     seams.stdin = read
     assert _main(seams)[0] == 0
-    assert asked == [T.CEILING_MAX + 1]
+    assert asked == [T.CEILING_MAX + 1, T.CEILING_MAX + 1 - len(doc)]
 
 
 def test_a_caller_who_is_not_the_operator_is_refused_before_stdin(L):
@@ -336,3 +347,176 @@ def test_run_set_ceiling_writes_under_the_store_seams_root(L):
     got = run_set_ceiling(ME, "darwin", read=_stdin(DOC2), lock=lambda: _Lock()("darwin"), store_seams=_rs(L),
                           err=io.StringIO())
     assert got["verb"] == "set-ceiling" and (L / "policy" / NAME).exists()
+
+
+# --- L3 r1 (1105-32): `old` is the ceiling CONTROL would read, by the reader's own file rules ------------------------
+
+def test_old_is_none_for_a_valid_document_group_or_other_writable(L):
+    path = L / "policy" / NAME
+    path.write_bytes(canon.canonical_bytes(DOC1))
+    os.chmod(path, 0o666)
+    with pytest.raises(Refused):
+        _read(L)                                              # CONTROL refuses it: no ceiling was in force
+    rc, out, _ = _main(_seams(L)[0])
+    assert rc == 0 and out["old"] is None and out["new"] == DOC2
+
+
+def test_old_is_none_for_a_valid_document_of_another_owner(L):
+    path = L / "policy" / NAME
+    path.write_bytes(canon.canonical_bytes(DOC1))
+    os.chmod(path, 0o644)
+    other = RH.Seams(host="darwin", store=L, trusted=_trusted, euid=lambda: ME + 1)   # root is someone else here
+    got = run_set_ceiling(ME, "darwin", read=_stdin(DOC2), lock=lambda: _Lock()("darwin"), store_seams=other,
+                          err=io.StringIO())
+    assert got["old"] is None
+
+
+def test_old_is_none_for_a_fifo_and_the_fifo_is_replaced(L):
+    path = L / "policy" / NAME
+    os.mkfifo(path)
+    rc, out, err = _main(_seams(L)[0])
+    assert rc == 0 and out["old"] is None, err
+    assert _read(L).max_open_tickets == 4
+
+
+def test_a_link_at_the_ceiling_is_replaced_not_followed(L, tmp_path):
+    elsewhere = tmp_path / "elsewhere"
+    elsewhere.write_bytes(canon.canonical_bytes(DOC1))
+    os.symlink(elsewhere, L / "policy" / NAME)
+    rc, out, _ = _main(_seams(L)[0])
+    assert rc == 0 and out["old"] is None
+    assert not os.path.islink(L / "policy" / NAME) and elsewhere.read_bytes() == canon.canonical_bytes(DOC1)
+
+
+def test_a_directory_at_the_ceiling_refuses_write_failed(L):
+    (L / "policy" / NAME).mkdir()
+    rc, out, _ = _main(_seams(L)[0])
+    assert (rc, out) == (1, {"ok": False, "refused": "ceiling-write-failed"})
+    assert (L / "policy" / NAME).is_dir()
+
+
+def test_a_dead_writers_tmp_does_not_block_the_next_set(L):
+    (L / "policy" / (NAME + ".tmp")).write_bytes(b"left by a killed writer")
+    rc, out, err = _main(_seams(L)[0])
+    assert rc == 0, err
+    assert not os.path.lexists(L / "policy" / (NAME + ".tmp"))
+    assert _read(L).max_open_tickets == 4
+
+
+# --- L3 r1 (1105-32): stdin is read to EOF or the cap plus one, whatever the reader's chunking ---------------------
+
+def _chunked(raw, size=7):
+    """A reader that hands back at most ``size`` bytes per call, as a raw pipe may."""
+    pos = [0]
+    asked = []
+
+    def read(n):
+        asked.append(n)
+        out = raw[pos[0]:pos[0] + min(n, size)]
+        pos[0] += len(out)
+        return out
+    return read, asked
+
+
+def test_a_chunked_reader_still_delivers_the_whole_document(L):
+    seams, _ = _seams(L)
+    seams.stdin, asked = _chunked(canon.canonical_bytes(DOC2))
+    rc, out, err = _main(seams)
+    assert rc == 0, err
+    assert out["new"] == DOC2 and asked[0] == T.CEILING_MAX + 1 and len(asked) > 1
+
+
+def test_a_chunked_oversize_document_is_refused_not_truncated_to_a_valid_one(L):
+    """The read must not stop at a chunk boundary that happens to close a valid document (L3 r1, deepseek)."""
+    path = L / "policy" / NAME
+    path.write_bytes(canon.canonical_bytes(DOC2))
+    before = path.read_bytes()
+    raw = canon.canonical_bytes(DOC1) + b" " * T.CEILING_MAX
+    chunks = [canon.canonical_bytes(DOC1), b" " * T.CEILING_MAX]
+    asked = []
+
+    def read(n):
+        asked.append(n)
+        return chunks.pop(0)[:n] if chunks else b""
+    seams, lock = _seams(L)
+    seams.stdin = read
+    rc, out, _ = _main(seams)
+    assert (rc, out) == (1, {"ok": False, "refused": "ceiling-oversize"})
+    assert lock.calls == [] and path.read_bytes() == before and len(raw) > T.CEILING_MAX
+
+
+def test_the_read_never_asks_past_the_cap_plus_one_in_total(L):
+    seams, _ = _seams(L)
+    seams.stdin, asked = _chunked(b" " * (3 * T.CEILING_MAX), size=1000)
+    rc, out, _ = _main(seams)
+    assert (rc, out) == (1, {"ok": False, "refused": "ceiling-oversize"})
+    assert asked[0] == T.CEILING_MAX + 1 and asked[-1] == T.CEILING_MAX + 1 - 1000 * (len(asked) - 1)
+
+
+# --- L3 r1 (1105-32): undo removes the ceiling, as it removes the slot limits ----------------------------------------
+
+def _run_undo(tmp_path, put=None):
+    from levain.slot.grammar import parse_install_argv as parse
+    from tests.test_undo_remove import RECORD, S0, _darwin_host, _facts, _shape
+
+    h, live, shared = _darwin_host(tmp_path)
+    target = live.at(layout.policy_dispatch_ceiling_path("darwin"))
+    if put is not None:
+        target.parent.mkdir(parents=True, exist_ok=True)
+        put(target)
+    plan = IH.plan_undo(parse(["undo"]), _facts("darwin", _shape(*RECORD)), accounts={"_levain_s0": S0},
+                        shared_groups=shared, live=live, end=lambda uid, name: (True, ""))
+    whys = [s.why for s in plan.steps]
+    out = {}
+    for s in plan.steps:
+        if s.call is not None and s.write is None:
+            ok, why = s.call()
+            assert ok, (s.why, why)
+            out[s.why] = why
+    return target, whys, out, live
+
+
+_UNDO_WHY = f"remove the dispatch ceiling {layout.policy_dispatch_ceiling_path('darwin')}"
+
+
+@pytest.mark.parametrize("data", [canon.canonical_bytes(DOC2), b"garbage, not a document", b""])
+def test_undo_removes_the_ceiling_usable_or_not(tmp_path, data):
+    """A later setup for another operator starts with NO ceiling (every mint refused) rather than this one's."""
+    target, whys, _, _ = _run_undo(tmp_path, lambda p: p.write_bytes(data))
+    assert not os.path.lexists(target)
+    limits = f"remove the slot limits {layout.policy_limits_path('darwin')}"
+    assert whys.index(limits) < whys.index(_UNDO_WHY) < whys.index("remove the install record")
+
+
+def test_undo_removes_a_group_writable_ceiling_of_roots_too(tmp_path):
+    target, _, _, _ = _run_undo(tmp_path, lambda p: (p.write_bytes(canon.canonical_bytes(DOC1)), os.chmod(p, 0o666)))
+    assert not os.path.lexists(target)
+
+
+def test_undo_with_no_ceiling_runs_nothing_for_it(tmp_path):
+    target, _, out, _ = _run_undo(tmp_path)
+    assert not os.path.lexists(target) and out[_UNDO_WHY] == ""
+
+
+def test_undo_leaves_a_link_at_the_ceiling_in_place(tmp_path):
+    elsewhere = tmp_path / "elsewhere"
+    elsewhere.write_bytes(canon.canonical_bytes(DOC1))
+    target, _, out, live = _run_undo(tmp_path, lambda p: os.symlink(elsewhere, p))
+    assert os.path.islink(target) and elsewhere.exists() and "left in place" in out[_UNDO_WHY]
+    assert ("dispatch-ceiling", str(layout.policy_dispatch_ceiling_path("darwin"))) in live.skips
+
+
+@pytest.mark.parametrize("host", ("darwin", "linux"))
+def test_setup_writes_no_ceiling(host, monkeypatch):
+    """No default stands in for the operator's bound: setup never writes one, so a re-run never resets it."""
+    from levain.firing import hands
+    from tests.test_slot_install_plan import _facts as setup_facts, _setup
+
+    real = hands.shutil.which
+    monkeypatch.setattr(hands.shutil, "which", lambda n, path=None: real(n, path=path) or f"/usr/sbin/{n}")
+    plan = IH.plan_setup(_setup(1, 1), setup_facts(host))
+    target = str(layout.policy_dispatch_ceiling_path(host))
+    assert plan.steps
+    for s in plan.steps:
+        assert not (s.write and str(s.write[0]) == target), s.why
+        assert target not in s.argv, s.why

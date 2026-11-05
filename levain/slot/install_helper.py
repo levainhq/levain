@@ -943,6 +943,7 @@ def plan_undo(cmd: InstallCommand, facts: HostFacts, *, accounts: Mapping[str, i
         *slot_state_undo_steps(host, slots_of(uids), store=live.at(STORE[host])),
         *pool_config_undo_steps(host),
         *policy_limits_undo_steps(host, live),
+        *policy_dispatch_ceiling_undo_steps(host, live),
         *authority_signers_undo_steps(host, live),
         Step(f"create {path.parent}", (mkdir, "-p", "-m", "755", str(path.parent))),
         Step("retire every account id so none is reissued", write=(path, retired_ids_text(retired_after), 0o644)),
@@ -2605,8 +2606,16 @@ def read_ceiling_doc(read: Callable[[int], bytes]) -> tuple[bytes, T.Ceiling]:
     WHOLE in root by the ticket store's own check (:func:`levain.slot.tickets.parse_ceiling`, the one :func:`read_ceiling`
     reads through, so no rule is written twice) and returned as ``(canonical bytes, the parsed ceiling)``, the canonical
     bytes re-read through the same check: root never writes the caller's bytes, and never bytes CONTROL would refuse.
-    A refusal is ``ceiling-oversize`` or ``ceiling-malformed``, the reader's own message in the detail (stderr)."""
-    raw = read(T.CEILING_MAX + 1)
+    A refusal is ``ceiling-oversize`` or ``ceiling-malformed``, the reader's own message in the detail (stderr). The
+    reader is called until EOF (an empty read) or the cap plus one byte in all, never asked for more than that total:
+    a reader that returns short chunks cannot cut an oversize document down to a valid smaller one (L3 r1)."""
+    n = T.CEILING_MAX + 1
+    raw = b""
+    while len(raw) < n:
+        chunk = read(n - len(raw))
+        if not chunk:
+            break
+        raw += chunk[:n - len(raw)]
     if len(raw) > T.CEILING_MAX:
         raise Refused("ceiling-oversize", f"over {T.CEILING_MAX} bytes")
     try:
@@ -2620,19 +2629,16 @@ def read_ceiling_doc(read: Callable[[int], bytes]) -> tuple[bytes, T.Ceiling]:
     return data, ceiling
 
 
-def _ceiling_in_force(path: Path) -> dict[str, object] | None:
+def _ceiling_in_force(path: Path, owner: int) -> dict[str, object] | None:
     """The ceiling at ``path`` as its fields, for the answer's ``old``; ``None`` when absent or one CONTROL would
-    refuse. Read only (a bounded read, ``O_NOFOLLOW``); never decides anything."""
+    refuse. Read through CONTROL's own file rules and check (:func:`levain.slot.tickets.read_ceiling_bytes`, then
+    :func:`~levain.slot.tickets.parse_ceiling`): a valid document in a link, a non-regular file, a file not
+    ``owner``'s (root: the helper's euid, which owns what it writes) or one group/other-writable was no bound, so it is
+    ``None`` (L3 r1). Read only; never decides anything."""
     try:
-        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC)
-    except OSError:
+        data = T.read_ceiling_bytes(path, owner)
+    except (Refused, OSError):
         return None
-    try:
-        data = os.read(fd, T.CEILING_MAX + 1)
-    except OSError:
-        return None
-    finally:
-        os.close(fd)
     try:
         T.parse_ceiling(data)
         return canon.parse(data)                                          # type: ignore[return-value]
@@ -2670,7 +2676,7 @@ def run_set_ceiling(caller_uid: int, host: HostOS, *, read: Callable[[int], byte
                 raise Refused("bad-root", f"{path.parent} is not root's alone")
         finally:
             os.close(dfd)
-        old = _ceiling_in_force(path)
+        old = _ceiling_in_force(path, rs.euid())
         try:
             R.write_durably(path, data, mode=0o644, fsync=fsync or gen_mod._full_fsync)
         except R.NotDurable as e:
@@ -2695,6 +2701,25 @@ def policy_limits_undo_steps(host: HostOS, live: RM.Live) -> list[Step]:
     rm = "/bin/rm" if host == "darwin" else _abs("rm")
     return [RM.remove_step(f"remove the slot limits {path}", ("policy-limits", str(path)), live,
                            lambda: policy_limits_state(host, live),
+                           lambda: live.act((rm, "-f", RM.at(live, path))), tools=(rm,))]
+
+
+def policy_dispatch_ceiling_state(host: HostOS, live: RM.Live) -> str:
+    """``L/policy/dispatch_ceiling`` for undo, as :func:`policy_limits_state`: OURS by path and owner alone (a regular
+    file of root's), WHATEVER its bytes or mode, so an unusable ceiling goes too; a link or another owner's entry
+    there is NOT_OURS and left."""
+    return RM.root_file(live, policy_dispatch_ceiling_path(host))
+
+
+def policy_dispatch_ceiling_undo_steps(host: HostOS, live: RM.Live) -> list[Step]:
+    """Undo's removal of ``L/policy/dispatch_ceiling`` (``set-ceiling``'s file, under the operator record undo
+    removes; L3 r1 1105-32): the store survives undo, so without this a later setup for another operator would mint
+    under this one's ceiling instead of refusing every mint until that operator sets one. The live read first (ABSENT
+    runs nothing)."""
+    path = policy_dispatch_ceiling_path(host)
+    rm = "/bin/rm" if host == "darwin" else _abs("rm")
+    return [RM.remove_step(f"remove the dispatch ceiling {path}", ("dispatch-ceiling", str(path)), live,
+                           lambda: policy_dispatch_ceiling_state(host, live),
                            lambda: live.act((rm, "-f", RM.at(live, path))), tools=(rm,))]
 
 
@@ -4509,7 +4534,7 @@ INSTALL_ENTRY_ENV = ("SUDO_UID",)
 __all__ = ["ContinueSeams", "PROBE_OUT_CAP", "PROBE_TIMEOUT_S", "adopt_lock", "exec_phase_b", "phase_b_text",
            "plan_repair_stage", "plan_repair_resume", "check_fault", "fault_hook", "FAULT_POINTS", "FAULT_STEPS", "probe_text", "repair_continue", "repair_handover", "HANDOVER_ABI", "repair_probe", "run_probe",
            "RepairFacts", "desired_managed", "install_shape_path", "plan_only_report", "plan_repair", "BUILT_VERBS", "CHILD_MARGIN_S", "CREDENTIAL_VERBS", "INSTALL_ENTRY_ENV", "KEYS_ACCOUNT", "Directory", "Gathered", "HostFacts", "InstallPlan", "OPERATOR_FORMAT", "Seams",
-           "apply_steps", "check_account_ids", "drop_to_keys", "load_creds", "read_credential", "run_credential", "read_limits", "run_set_limits", "run_set_ceiling", "read_ceiling_doc", "run_authority_signer", "authority_key_problem", "blob_fingerprint", "SIGNER_VERBS", "policy_limits_state", "policy_limits_undo_steps", "authority_signers_undo_steps", "run_purge", "check_tools", "count_live_leases", "live_lease_sessions", "extra_tools", "gather_facts",
+           "apply_steps", "check_account_ids", "drop_to_keys", "load_creds", "read_credential", "run_credential", "read_limits", "run_set_limits", "run_set_ceiling", "read_ceiling_doc", "run_authority_signer", "authority_key_problem", "blob_fingerprint", "SIGNER_VERBS", "policy_limits_state", "policy_limits_undo_steps", "policy_dispatch_ceiling_state", "policy_dispatch_ceiling_undo_steps", "authority_signers_undo_steps", "run_purge", "check_tools", "count_live_leases", "live_lease_sessions", "extra_tools", "gather_facts",
            "helper_pending", "main", "operator_record", "operator_record_text", "parse_operator_record",
            "plan_for", "plan_replenish", "plan_setup", "plan_tools", "plan_undo", "pool_lock", "preflight", "Quiesce",
            "quiesce_step",

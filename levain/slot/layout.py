@@ -391,8 +391,8 @@ POLICY_DISPATCH_CEILING = "dispatch_ceiling"
 
 def policy_dispatch_ceiling_path(host: HostOS) -> Path:
     """``L/policy/dispatch_ceiling`` (``levain-dispatch-ceiling/1`` or ``/2``): the operator's bound on dispatch, root
-    0644, written only by the install helper's ``set-ceiling``, read by CONTROL's ticket store. Setup writes nothing
-    here: no default stands in for it (an absent file refuses every mint)."""
+    0644, written only by the install helper's ``set-ceiling``, read by CONTROL's ticket store, removed by ``undo``.
+    Setup writes nothing here: no default stands in for it (an absent file refuses every mint)."""
     return STORE[host] / "policy" / POLICY_DISPATCH_CEILING
 
 
