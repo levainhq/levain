@@ -258,6 +258,11 @@ def test_holders_cannot_take_the_permits_usage_and_end_need(rig, tmp_path):
     with pytest.raises(L.LauncherRefused) as exc:
         env.client().spawn(S.SessionLaunch(oid, "s-00000000000000e9", "claude", "sonnet", "b", "passthrough", EXP))
     assert (exc.value.name, exc.value.reason_class) == ("no-holder-capacity", "transient")
+    # the refused connection keeps its connection permit until its handler sees the client's close (a refused LAUNCH
+    # leaves the connection usable, so the server cannot free it at the answer): wait for that handler to end, or the
+    # USAGE below can meet a full cap (flaked 1 in 4 before this join)
+    env.threads[-1].join(10)
+    assert not env.threads[-1].is_alive()
     sock = env.connect()
     sock.sendall(C.encode_run_frame({"p": C.PROTOCOL, "op": "USAGE", "id": 1, "session_key": "s-00000000000000ff"}))
     ans = C.read_run_frame(sock)
@@ -397,6 +402,116 @@ def test_a_holder_eof_and_a_reaper_end_on_one_session_make_one_teardown(rig, tmp
     runtime.gate.set()
     env.drain()
     assert runtime.ended == ["sess-1"] and runtime.entered == 1
+
+
+@pytest.mark.parametrize("proven", [False, True])
+def test_an_end_between_launch_and_release_makes_release_refuse_and_start_nothing(rig, tmp_path, proven):
+    """codex HIGH bundle L3 (dispatch_run.py:471): a short-connection END after LAUNCH and before RELEASE (teardown
+    running, or already proven) must make RELEASE refuse by name; the gated child is never released."""
+    runtime = BlockingRuntime()
+    env = Env(rig, tmp_path, runtime=runtime)
+    oid, key = _occurrence(rig, billing="subscription", exposure=EXP), "s-00000000000000d7"
+    child = env.client().spawn(S.SessionLaunch(oid, key, "claude", "sonnet", "b", "passthrough", EXP))
+    if proven:
+        runtime.gate.set()
+        assert env.client().end_session(key, 5).terminated is True
+    else:
+        assert env.client().end_session(key, 0.05).terminated is False      # the END is in flight
+        # the refused RELEASE runs the holder's cleanup, whose ABORT takes the key's stripe the in-flight END holds:
+        # let that END finish shortly after the RELEASE arrives (it was marked ending before this point)
+        threading.Timer(0.3, runtime.gate.set).start()
+    with pytest.raises(RuntimeError, match="session-ended"):
+        child.release()
+    assert env.runtime.children[0].released is False
+    runtime.gate.set()
+    child._conn.close()
+    env.drain()
+    assert env.runtime.children[0].released is False and runtime.ended == ["sess-1"]
+
+
+def test_an_end_while_the_launch_is_still_spawning_makes_release_refuse(rig, tmp_path):
+    """The same ordering one step earlier: an END that lands while the LAUNCH's spawn is in flight (the holder is
+    registered first) marks it ending, so the RELEASE that follows refuses and the child is never released."""
+    runtime = GatedStartRuntime()
+    env = Env(rig, tmp_path, runtime=runtime)
+    oid, key, got = _occurrence(rig, billing="subscription", exposure=EXP), "s-00000000000000d8", {}
+
+    def fire():
+        got["child"] = env.client().spawn(S.SessionLaunch(oid, key, "claude", "sonnet", "b", "passthrough", EXP))
+    t = threading.Thread(target=fire, daemon=True)
+    t.start()
+    assert runtime.entered.wait(5) and key in env.server._live
+    assert env.client().end_session(key, 0.05).terminated is False      # nothing to prove yet: answered unproven
+    runtime.gate.set()
+    t.join(10)
+    with pytest.raises(RuntimeError, match="session-ended"):
+        got["child"].release()
+    assert env.runtime.children[0].released is False
+    got["child"]._conn.close()
+    env.drain()
+    assert env.runtime.children[0].released is False and runtime.ended == ["sess-1"]
+
+
+def test_an_end_during_the_spawn_then_a_refused_release_aborts_and_ends_with_the_holder_still_open(rig, tmp_path):
+    """L3 fixrel r1 (gemini MED): the END that lands during the spawn finishes unproven before the child exists; the
+    RELEASE it makes refuse must run the holder's cleanup itself (ABORT, then END), not leave the gated child alive
+    until the holder's EOF. The holder connection stays OPEN here."""
+    runtime = GatedStartRuntime()
+    env = Env(rig, tmp_path, runtime=runtime)
+    oid, key, got = _occurrence(rig, billing="subscription", exposure=EXP), "s-00000000000000da", {}
+
+    def fire():
+        got["child"] = env.client().spawn(S.SessionLaunch(oid, key, "claude", "sonnet", "b", "passthrough", EXP))
+    t = threading.Thread(target=fire, daemon=True)
+    t.start()
+    assert runtime.entered.wait(5) and key in env.server._live
+    assert env.client().end_session(key, 0.5).terminated is False      # finished unproven: no session recorded yet
+    runtime.gate.set()
+    t.join(10)
+    with pytest.raises(RuntimeError, match="session-ended"):
+        got["child"].release()
+    for _ in range(250):                              # no EOF: the holder's socket is still open
+        if env.launcher.index.get(key)["state"] == "ended":
+            break
+        time.sleep(0.02)
+    inner = env.runtime.children[0]
+    assert inner.released is False and inner.aborted == 1 and runtime.ended == ["sess-1"]
+    assert env.launcher.index.get(key)["state"] == "ended" and key not in env.server._live
+    got["child"]._conn.close()
+    env.drain()
+    assert inner.aborted == 1 and runtime.ended == ["sess-1"]
+
+
+def test_a_short_end_answers_within_its_deadline_while_a_holder_abort_blocks(rig, tmp_path):
+    """L3 fixrel r1 (complement LOW-MED :708): the holder's cleanup holds its lock across a slow ABORT; a short END
+    with a deadline must not wait on that lock past its deadline. It marks the holder ending and answers unproven."""
+    env = Env(rig, tmp_path)
+    oid, key = _occurrence(rig, billing="subscription", exposure=EXP), "s-00000000000000db"
+    child = env.client().spawn(S.SessionLaunch(oid, key, "claude", "sonnet", "b", "passthrough", EXP))
+    inner = env.runtime.children[0]
+    entered, gate = threading.Event(), threading.Event()
+
+    def slow_abort(timeout=5.0):
+        entered.set()
+        gate.wait(10)
+        inner.aborted += 1
+        return 0
+    inner.abort = slow_abort
+    child._conn.close()                               # EOF: the cleanup takes the holder lock and ABORTs (blocks)
+    assert entered.wait(5)
+    t0 = time.monotonic()
+    got = env.client().end_session(key, 0.2)
+    elapsed = time.monotonic() - t0
+    holder = env.server._live[key]
+    gate.set()
+    env.drain()
+    assert got.terminated is False and elapsed < 1.5, (got, elapsed)
+    assert holder.ending is True
+    for _ in range(250):
+        if env.launcher.index.get(key)["state"] == "ended":
+            break
+        time.sleep(0.02)
+    assert inner.aborted == 1 and inner.released is False and env.runtime.ended == ["sess-1"]
 
 
 def test_usage_by_an_unknown_key_is_the_caps(env):
