@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 from datetime import datetime, timedelta, timezone
 
 from levain.cockpit.engine import Cockpit, ProviderSpec, Read
@@ -14,6 +15,11 @@ RES = {**ROW, "digest": {"available": True, "episodes_24h": 4, "store_bytes": 10
                          "last_wrap_at": datetime.now(timezone.utc).isoformat()}}
 OC = {**ROW, "name": "codex", "cadence": "on_call", "memory": "stateless", "silence_is_signal": False,
       "wrap_every": None, "digest": None, "last_call": {"at": NOW, "outcome": "ok"}}
+
+
+def _bare(text):
+    """A run time without the day the card adds when it is not today, so the fixture's clock time pins on any date."""
+    return re.sub(r"(last run|newest episode) (?:[A-Z][a-z]{2} \d{1,2} |[A-Z][a-z]{2} )?(?=\d\d:\d\d)", r"\1 ", text)
 
 
 def _rows(*rows):
@@ -165,16 +171,16 @@ def _role(**dg):
 def test_stateless_resident_never_reads_running_and_shows_its_last_run_time() -> None:
     h = _role()
     assert "running" not in h["text"]
-    assert h["text"].startswith("last run 02:56") and "33 episodes in 24 h" in h["text"]
+    assert _bare(h["text"]).startswith("last run 02:56") and "33 episodes in 24 h" in h["text"]
     assert "skipped" in h["text"] and h["tone"] == "ok"      # shown as text; the tone comes from the facts, not the word
 
 
 def test_stateless_resident_names_the_source_when_no_run_is_recorded() -> None:
     h = _role(last_run_source="episode", last_run_status=None, run_failed=None, run_late=None)
-    assert "newest episode 02:56" in h["text"] and "no run recorded" in h["text"]
+    assert "newest episode 02:56" in _bare(h["text"]) and "no run recorded" in h["text"]
     assert h["tone"] == "neutral"      # a time with its source, not a liveness verdict
     unk = _role(last_run_source="episode", last_run_status=None, run_failed=None, run_late=None, available=None)
-    assert "newest episode 02:56" in unk["text"] and unk["tone"] == "neutral"     # an unknown `available` does not hide it
+    assert "newest episode 02:56" in _bare(unk["text"]) and unk["tone"] == "neutral"     # an unknown `available` does not hide it
 
 
 def test_a_scheduler_stop_reads_as_a_stop_never_as_a_run_time_or_as_health() -> None:
@@ -271,7 +277,7 @@ def test_the_fleet_card_heads_agents_and_roles_apart_and_reads_a_roles_last_run(
     assert groups["resident"][1:] == ["Agents · judged by their writing", ["flow"]]
     assert groups["role"][1] == "Roles · run on a schedule" and groups["role"][2] == ["diogenes", "ontime", "late", "old"]
     d = {x.split("|")[0]: x.split("|")[1:] for x in f["d"]}
-    assert d["diogenes"][0].startswith("last run 02:56") and "running" not in d["diogenes"][0] and "bad" not in d["diogenes"][1]
+    assert _bare(d["diogenes"][0]).startswith("last run 02:56") and "running" not in d["diogenes"][0] and "bad" not in d["diogenes"][1]
     assert d["late"][0].startswith("run late") and "bad" in d["late"][1]
     assert d["old"][0].startswith("no run time reported")
 
@@ -294,3 +300,52 @@ def test_kind_decides_the_reading_and_memory_only_when_kind_is_absent() -> None:
 def test_a_huge_count_and_a_long_status_do_not_break_the_row() -> None:
     h = _role(episodes_24h=10 ** 1000, last_run_status="x\n" * 100)
     assert h["tone"] == "ok" and "health unreadable" not in h["text"] and "episodes in 24 h" not in h["text"] and len(h["text"]) < 100
+
+
+# ---- 1104-29: a run time carries its day when it is not today ----
+def test_a_run_time_says_its_day_when_it_is_not_today() -> None:
+    from levain.cockpit.engine import roster_health
+    now = datetime(2026, 11, 4, 12, 0, tzinfo=timezone(timedelta(hours=-5)))
+
+    def txt(at):
+        row = {**ROLE, "digest": {**ROLE["digest"], "last_run_at": at, "run_late": True}}
+        return roster_health(row, now)["text"]
+
+    assert "last run 02:56" in txt("2026-11-04T02:56:47-05:00")                       # today: the bare time
+    assert "last run Mon 22:29" in txt("2026-11-02T22:29:00-05:00")                  # inside a week: the weekday
+    assert "last run Oct 20 22:29" in txt("2026-10-20T22:29:00-05:00")               # older: the date
+    assert "last run Tue 23:30" in txt("2026-11-03T23:30:00-05:00")                  # the day is judged in the contributor's offset
+    assert "run late" in txt("2026-11-02T22:29:00-05:00")
+
+
+@needs_browser
+def test_the_fleet_card_names_its_alarms_first_rings_a_failed_call_and_folds_with_a_count(tmp_path: Path) -> None:
+    from levain.cockpit.providers import build_default_cockpit
+
+    rows = [{**RES, "name": f"ok{i}", "digest": {**RES["digest"], "episodes_24h": 5}} for i in range(8)]
+    rows += [{**RES, "name": "argus", "digest": {"available": True, "episodes_24h": 0}},
+             {**ROLE, "name": "mailbot", "digest": {**ROLE["digest"], "run_failed": True}},
+             {**OC, "name": "glm", "last_call": {"at": NOW, "outcome": "failed"}},
+             {**OC, "name": "codex"}]
+    _root, src, _ids = _install(tmp_path)
+    ck = build_default_cockpit(src)
+    ck.register(ProviderSpec(id="fleetcard", kind="roster", title="Fleet", priority="feed", region="operate",
+                             read=lambda c: Read(value={"rows": rows})))
+    panel = "document.querySelector('[data-ck-panel=fleetcard]')"
+    facts = (f"JSON.stringify({{strip: ({panel}.querySelector('.fl-alarms')||{{}}).textContent, "
+             f"first: {panel}.querySelector('.xbody').firstElementChild.className, "
+             f"fail: [...{panel}.querySelectorAll('.fl .n i.fail')].map(i => i.parentElement.textContent), "
+             f"bad: [...{panel}.querySelectorAll('.fl .n i.bad')].map(i => i.parentElement.textContent), "
+             f"foot: ({panel}.querySelector('.more-foot')||{{}}).textContent}})")
+    with _Served(src, cockpit=ck, surface_tokens={"browser": "T"}, install_class="reported") as url:
+        out = _drive(tmp_path, f"{url}/", [
+            {"emulate": {"w": 430, "h": 932, "dpr": 2, "mobile": True}},
+            {"until": f"{panel} && {panel}.querySelectorAll('.fl').length >= 1"},
+            {"until": f"!!{panel}.querySelector('.more-foot')"},
+            {"eval": facts},
+        ])
+    f = json.loads([v for v in out["values"] if isinstance(v, str) and v.startswith("{")][0])
+    assert f["strip"] == "2 need attention · argus, mailbot" and f["first"] == "fl-alarms"
+    assert f["bad"] == ["argus", "mailbot"]
+    assert f["fail"] == ["glm"] and "glm" not in f["bad"]          # a ring, not a filled alarm
+    assert re.fullmatch(r"\d+ more", f["foot"] or "") or (f["foot"] or "").startswith("Read all")

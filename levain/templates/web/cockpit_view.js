@@ -1044,10 +1044,12 @@
     const alarm = h.tone === "alarm";
     const row = el("div", "fl rrow");
     row.setAttribute("data-ck-row", "");
-    row.setAttribute("tabindex", "0");
+    row.setAttribute("tabindex", "0");   // a keyboard stop for reading the row; a click opens nothing (the card's expand is the detail), so the row draws no pointer
     const n = el("div", "n");
     // unknown is its own mark (a dashed ring) so it never reads as an on-call "not called yet" hollow dot, and never as accent
-    const dot = el("i", alarm ? "bad" : (h.tone === "unknown" ? "unk" : (h.tone === "neutral" && !h.at ? "off" : "")));
+    // a failed last call is a ring in the alarm colour: seen beside the filled alarms, never one of them (an on-call member's silence is no signal)
+    const failedCall = !alarm && isObj(r.last_call) && r.last_call.outcome === "failed";
+    const dot = el("i", alarm ? "bad" : (failedCall ? "fail" : (h.tone === "unknown" ? "unk" : (h.tone === "neutral" && !h.at ? "off" : ""))));
     dot.setAttribute("aria-hidden", "true");
     n.append(dot, document.createTextNode(r.name));
     const when = h.at ? " " + (ago(h.at) || h.at) : "";
@@ -1060,6 +1062,17 @@
     return row;
   }
   function paintRoster(host, rows, d) {
+    // the alarms first: a card that clamps shows its top, so the members that need him are named there, whatever group they sit in
+    const alarms = rows.filter((r) => isObj(r.health) && r.health.tone === "alarm");
+    if (alarms.length) {
+      const strip = el("div", "fl-alarms");
+      strip.setAttribute("data-ck-fleet-alarms", String(alarms.length));
+      const dot = el("i", "bad"); dot.setAttribute("aria-hidden", "true");
+      const words = el("span", "");
+      words.append(el("b", "", alarms.length + (alarms.length === 1 ? " needs attention" : " need attention")), document.createTextNode(" \u00b7 " + alarms.map((r) => r.name).join(", ")));
+      strip.append(dot, words);
+      host.appendChild(strip);
+    }
     for (const [gid, title] of FLEET_GROUPS) {
       const rs = rows.filter((r) => fleetGroupOf(r) === gid);
       if (!rs.length) continue;
