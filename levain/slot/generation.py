@@ -187,7 +187,8 @@ def _re(pattern: str) -> Callable[[object], bool]:
     return lambda x: isinstance(x, str) and rx.fullmatch(x) is not None
 
 
-_UNIT = _re(r"[a-z][a-z0-9-]{0,31}")
+# a unit and a service follow their program file, so an underscore is in the name (``dispatch_run``, S10b slice R)
+_UNIT = _re(r"[a-z][a-z0-9_-]{0,31}")
 _SUDOERS = _re(r"levain-[a-z0-9-]{1,32}")
 _GROUP = _re(r"levain-[a-z0-9-]{1,24}")
 _ALIAS = _re(r"127\.0\.1\.(?:[1-9]|[1-9][0-9]|1[0-9][0-9]|2[0-4][0-9]|25[0-4])")
@@ -259,7 +260,7 @@ def shape_text(s: InstallShape) -> str:
 
 
 _VERSION = re.compile(r"[0-9A-Za-z.+!-]{1,40}")
-_SERVICE = re.compile(r"[a-z][a-z0-9-]{0,31}")
+_SERVICE = re.compile(r"[a-z][a-z0-9_-]{0,31}")
 
 
 def parse_shape(data: bytes) -> InstallShape:

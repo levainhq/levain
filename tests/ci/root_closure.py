@@ -384,6 +384,84 @@ LAZY_SITES = {
     'levain/dispatch/sign.py::_passkey_problem::from levain.consent.passkey import answer_signature_problem': 'root',
     # the queue broker (``levain.slot.services.qbroker``, ROOT_PYTHON as ``_levain_qbroker``): its own package
     'levain/qbroker/grants.py::grant_row::from levain.qbroker.store import GRANT_ROW_FORMAT': 'root',
+    # operator: ``_admit_run_in`` runs only in the operator's process (the controller, an agent session or the session client); the dispatch run server only imports the module
+    "levain/agents/controller.py::_admit_run_in::from levain.autonomic.journal import RunJournal   # here: the journal is not the controller's import closure": 'operator',
+    # operator: ``_default_input_check`` runs only in the operator's process (the controller, an agent session or the session client); the dispatch run server only imports the module
+    'levain/agents/controller.py::_default_input_check::from levain.dream import agent as dream_agent': 'operator',
+    # operator: ``_dream_body`` runs only in the operator's process (the controller, an agent session or the session client); the dispatch run server only imports the module
+    "levain/agents/controller.py::_dream_body::from levain.dream import agent as dream_agent   # here: the dream is not the controller's import closure": 'operator',
+    # operator: ``_pinned_executor`` runs only in the operator's process (the controller, an agent session or the session client); the dispatch run server only imports the module
+    'levain/agents/controller.py::_pinned_executor::from levain.agents import role as _role, spec as _spec': 'operator',
+    # operator: ``_record_is_dead`` runs only in the operator's process (the controller, an agent session or the session client); the dispatch run server only imports the module
+    'levain/agents/controller.py::_record_is_dead::from levain.consent.delivery import process_running': 'operator',
+    # operator: ``_session_body`` runs only in the operator's process (the controller, an agent session or the session client); the dispatch run server only imports the module
+    'levain/agents/controller.py::_session_body::from levain.agents import session, session_wire   # here: both import this module': 'operator',
+    # operator: ``fire`` runs only in the operator's process (the controller, an agent session or the session client); the dispatch run server only imports the module
+    "levain/agents/controller.py::fire::from levain.consent.delivery import process_identity   # here: the consent package is not the controller's closure": 'operator',
+    # operator: ``fire_refusal`` runs only in the operator's process (the controller, an agent session or the session client); the dispatch run server only imports the module
+    "levain/agents/controller.py::fire_refusal::from levain.autonomic.journal import RunJournal   # here: the journal is not the controller's import closure": 'operator',
+    # operator: ``_stored_spec`` runs only in the operator's process (the controller, an agent session or the session client); the dispatch run server only imports the module
+    'levain/agents/gauges.py::_stored_spec::from levain.agents import spec as _spec': 'operator',
+    # operator: ``_fire_state`` runs only in the operator's process (the controller, an agent session or the session client); the dispatch run server only imports the module
+    'levain/agents/session.py::_fire_state::from levain.consent.delivery import process_identity': 'operator',
+    # operator: ``_signed_by_spec`` runs only in the operator's process (the controller, an agent session or the session client); the dispatch run server only imports the module
+    'levain/agents/session.py::_signed_by_spec::from levain.agents import spec as _spec': 'operator',
+    # operator: ``run_session`` runs only in the operator's process (the controller, an agent session or the session client); the dispatch run server only imports the module
+    'levain/agents/session.py::run_session::from levain.autonomic.journal import EffectStatus': 'operator',
+    # operator: ``AuthorityFeed.read`` runs only in the operator's process (the controller, an agent session or the session client); the dispatch run server only imports the module
+    'levain/agents/session_client.py::AuthorityFeed.read::from levain.agent_authority import AgentAuthority': 'operator',
+    # operator: ``AuthorityFeed.rows`` runs only in the operator's process (the controller, an agent session or the session client); the dispatch run server only imports the module
+    'levain/agents/session_client.py::AuthorityFeed.rows::from levain.cockpit.firejournal import DB_NAME': 'operator',
+    # operator: ``build_launcher`` runs only in the operator's process (the controller, an agent session or the session client); the dispatch run server only imports the module
+    'levain/agents/session_client.py::build_launcher::from levain.agents.session_wire import read_install': 'operator',
+    # operator: ``default_run_socket`` runs only in the operator's process (the controller, an agent session or the session client); the dispatch run server only imports the module
+    'levain/agents/session_client.py::default_run_socket::from levain.slot import layout': 'operator',
+    # operator: ``link_proof`` runs only in the operator's process (the controller, an agent session or the session client); the dispatch run server only imports the module
+    'levain/agents/session_client.py::link_proof::from levain import authority as _auth': 'operator',
+    # operator: ``link_proof`` runs only in the operator's process (the controller, an agent session or the session client); the dispatch run server only imports the module
+    'levain/agents/session_client.py::link_proof::from levain.agent_authority import AgentAuthority': 'operator',
+    # operator: ``link_proof`` runs only in the operator's process (the controller, an agent session or the session client); the dispatch run server only imports the module
+    'levain/agents/session_client.py::link_proof::from levain.cockpit.firejournal import DB_NAME': 'operator',
+    # root: ``_default_verify_sig`` runs in the dispatch run server's own process (``_levain_dispatch``, never the operator's), which is a service entry
+    'levain/slot/services/dispatch_run.py::_default_verify_sig::from levain.authority_sig import verify_link_sig': 'root',
+    # root: ``bound_usage_sources`` runs in the dispatch run server's own process (``_levain_dispatch``, never the operator's), which is a service entry
+    'levain/slot/services/dispatch_run.py::bound_usage_sources::from levain.qbroker import operator as _op': 'root',
+    # root: ``bound_usage_sources`` runs in the dispatch run server's own process (``_levain_dispatch``, never the operator's), which is a service entry
+    'levain/slot/services/dispatch_run.py::bound_usage_sources::from levain.slot import dispatch_usage as _du': 'root',
+    # root: ``bound_usage_sources`` runs in the dispatch run server's own process (``_levain_dispatch``, never the operator's), which is a service entry
+    'levain/slot/services/dispatch_run.py::bound_usage_sources::from levain.slot.runtime_helper import FRONT_LOG_NAME': 'root',
+    # root: ``build_server`` runs in the dispatch run server's own process (``_levain_dispatch``, never the operator's), which is a service entry
+    'levain/slot/services/dispatch_run.py::build_server::from levain.qbroker.peercred import peer_uid': 'root',
+    # root: ``build_server`` runs in the dispatch run server's own process (``_levain_dispatch``, never the operator's), which is a service entry
+    'levain/slot/services/dispatch_run.py::build_server::from levain.slot.dispatch_runtime import DispatchControlPort, HelperSlotRuntime': 'root',
+    # root: ``main`` runs in the dispatch run server's own process (``_levain_dispatch``, never the operator's), which is a service entry
+    'levain/slot/services/dispatch_run.py::main::from levain.slot.layout import operator_record_path': 'root',
+    # root: ``main`` runs in the dispatch run server's own process (``_levain_dispatch``, never the operator's), which is a service entry
+    'levain/slot/services/dispatch_run.py::main::from levain.slot.services.control import _operator_uid': 'root',
+    # root: ``service_row`` runs in the dispatch run server's own process (``_levain_dispatch``, never the operator's), which is a service entry
+    'levain/slot/services/dispatch_run.py::service_row::from levain.slot.units import Service': 'root',
+    # root: ``_default_read_total`` runs in the dispatch run server's process (its usage settle)
+    'levain/slot/dispatch_usage.py::_default_read_total::from levain.slot.runtime_helper import _INT64_MAX, _PASSTHROUGH_TAIL_BYTES': 'root',
+    # operator: ``Seams.__post_init__`` is the interactive supervisor's own code, the operator uid's process; the dispatch run server imports the module for its names
+    'levain/slot/supervisor.py::Seams.__post_init__::from levain.slot.control_client import ControlClient': 'operator',
+    # operator: ``Supervisor._confirm_identity`` is the interactive supervisor's own code, the operator uid's process; the dispatch run server imports the module for its names
+    'levain/slot/supervisor.py::Supervisor._confirm_identity::from levain.slot.identity import BASELINE_WRITTEN, NOT_A_CHECK': 'operator',
+    # operator: ``Supervisor._leased`` is the interactive supervisor's own code, the operator uid's process; the dispatch run server imports the module for its names
+    'levain/slot/supervisor.py::Supervisor._leased::from levain.slot.stage import make_bundle': 'operator',
+    # operator: ``_git`` is the interactive supervisor's own code, the operator uid's process; the dispatch run server imports the module for its names
+    'levain/slot/supervisor.py::_git::from levain.slot.stage import STAGE_DEADLINE_S, _git_env as env': 'operator',
+    # operator: ``check_repo_layer`` is the interactive supervisor's own code, the operator uid's process; the dispatch run server imports the module for its names
+    'levain/slot/supervisor.py::check_repo_layer::from levain.slot.render import repo_loosening_refusals': 'operator',
+    # operator: ``identity_answer`` is the interactive supervisor's own code, the operator uid's process; the dispatch run server imports the module for its names
+    'levain/slot/supervisor.py::identity_answer::from levain.slot.records import _REASON_RE, OBSERVED_ID_RE': 'operator',
+    # operator: ``prepare_answer`` is the interactive supervisor's own code, the operator uid's process; the dispatch run server imports the module for its names
+    'levain/slot/supervisor.py::prepare_answer::from levain.slot.ids import SlotId': 'operator',
+    # operator: ``prepare_answer`` is the interactive supervisor's own code, the operator uid's process; the dispatch run server imports the module for its names
+    'levain/slot/supervisor.py::prepare_answer::from levain.slot.render import gwport_for': 'operator',
+    # operator: ``prepare_answer`` is the interactive supervisor's own code, the operator uid's process; the dispatch run server imports the module for its names
+    'levain/slot/supervisor.py::prepare_answer::from levain.slot.runtime_helper import PREPARE_RESULT_FORMAT': 'operator',
+    # operator: ``probe_answer`` is the interactive supervisor's own code, the operator uid's process; the dispatch run server imports the module for its names
+    'levain/slot/supervisor.py::probe_answer::from levain.slot.probe import MAX_PROBE_ADDRS, PROBE_HOSTS': 'operator',
 }
 _NEEDLES = ("run_module(", "module_argv(", "import_module(", "__import__(")
 

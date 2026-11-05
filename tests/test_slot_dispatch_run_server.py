@@ -435,7 +435,7 @@ def test_the_unit_row_renders_a_dispatch_uid_keepalive_plist_golden():
     assert plist["UserName"] == "_levain_dispatch" and plist["KeepAlive"] is True and plist["RunAtLoad"] is True
     assert plist["Label"] == "com.levain.dispatch_run" and plist["ProgramArguments"][-1] == "dispatch_run"
     assert units.program_relpath(svc) == "levain/slot/services/dispatch_run.py"
-    assert svc.name not in {s.name for s in units.SERVICES}         # registration is the head's (CONTRACT 1.3 / 2.2)
+    assert svc == units.by_name("dispatch_run")                      # registered (CONTRACT 1.3 / 2.2)
 
 
 def test_the_program_refuses_to_run_as_anyone_but_the_dispatch_account(capsys):

@@ -22,7 +22,8 @@ from levain.firing.hands import HostOS
 from levain.slot.layout import RUN, Row, base_run_rows
 
 #: The §2.2 dir each non-root service binds in (its run dir); root services have none to wait for.
-RUN_DIR_OF: Mapping[str, str] = {"control": "control", "keys": "keys", "qbroker": "qb", "dispatch": "planner"}
+RUN_DIR_OF: Mapping[str, str] = {"control": "control", "keys": "keys", "qbroker": "qb", "dispatch": "planner",
+                                  "dispatch_run": "dispatch"}
 
 EXIT_NO_RUN_DIR = 75   # EX_TEMPFAIL: try again later
 EXIT_USAGE = 64        # EX_USAGE
