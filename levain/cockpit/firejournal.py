@@ -25,6 +25,8 @@ Stdlib only.
 """
 from __future__ import annotations
 
+import hashlib
+import hmac
 import json
 import os
 import re
@@ -1294,17 +1296,22 @@ class CockpitDB:
     def revoke_preview(self, device_id: str) -> dict[str, Any]:
         """The set a family revoke of ``device_id`` would take right now: ``{target, family: [{id, label, paired_by,
         last_seen}]}``, the not-yet-revoked members of the one closure :meth:`revoke_confirmed` checks against, oldest
-        first. A read; an unknown id raises :class:`PairingError`."""
+        first, plus ``digests`` (one per mode, :func:`revoke_digest`): what a confirm sends back instead of the id list,
+        so the request is the same size for any family. A read; an unknown id raises :class:`PairingError`."""
         _check_device_id(device_id)
         with self.read() as conn:
             if conn.execute("SELECT 1 FROM paired_devices WHERE id = ?", (device_id,)).fetchone() is None:
                 raise PairingError(f"no such device: {device_id}")
-            return {"target": device_id, "family": _live_family_rows(conn, device_id)}
+            family = _live_family_rows(conn, device_id)
+            ids = [f["id"] for f in family]
+            return {"target": device_id, "family": family,
+                    "digests": {m: revoke_digest(ids, m) for m in sorted(REVOKE_MODES)}}
 
-    def revoke_confirmed(self, device_id: str, *, expect: "Sequence[str]", mode: str, by: str,
+    def revoke_confirmed(self, device_id: str, *, expect_digest: str, mode: str, by: str,
                          now: datetime) -> dict[str, Any]:
-        """Revoke ``device_id`` bound to what the operator saw, in ONE transaction. ``expect`` is the preview's family
-        (ids); when the live closure differs, nothing moves and :class:`FamilyChanged` carries the fresh rows. Mode
+        """Revoke ``device_id`` bound to what the operator saw, in ONE transaction. ``expect_digest`` is the preview's
+        digest for ``mode``, recomputed here inside the transaction; when it differs, nothing moves and
+        :class:`FamilyChanged` carries the fresh rows and digests. Mode
         ``family`` is :meth:`revoke_devices` for that one root; mode ``only`` revokes the target alone and re-parents
         each of its not-yet-revoked direct children to the target's own ``paired_by`` (their credentials are not
         rotated). Returns ``{revoked, detached}``, what this call committed: a target already revoked re-parents
@@ -1312,8 +1319,8 @@ class CockpitDB:
         if not isinstance(mode, str) or mode not in REVOKE_MODES:
             raise PairingError(f"mode is one of {sorted(REVOKE_MODES)}")
         _check_device_id(device_id)
-        if (not isinstance(expect, (list, tuple)) or any(not isinstance(e, str) for e in expect)):
-            raise PairingError("expect is a list of device ids")
+        if not isinstance(expect_digest, str) or _DIGEST.fullmatch(expect_digest) is None:
+            raise PairingError("expect_digest is the 64-hex digest revoke-preview named")
         stamp = utc_stamp(now)
         with self.write() as conn:
             row = conn.execute("SELECT paired_by FROM paired_devices WHERE id = ?", (device_id,)).fetchone()
@@ -1321,7 +1328,7 @@ class CockpitDB:
                 raise PairingError(f"no such device: {device_id}")
             _expire(conn, now)
             fresh = _live_family_rows(conn, device_id)
-            if sorted(f["id"] for f in fresh) != sorted(set(expect)):
+            if not hmac.compare_digest(revoke_digest([f["id"] for f in fresh], mode), expect_digest):
                 raise FamilyChanged(fresh)
             detached: list[str] = []
             if mode == "family":
@@ -1626,6 +1633,13 @@ def _finish_due(row: sqlite3.Row) -> datetime:
 
 
 REVOKE_MODES = frozenset({"family", "only"})
+_DIGEST = re.compile(r"[0-9a-f]{64}")
+
+
+def revoke_digest(ids: "Sequence[str]", mode: str) -> str:
+    """The digest a revoke confirm is bound to: SHA-256 over the mode and the sorted, de-duplicated device ids of the
+    set the operator was shown. Fixed size for any family, so the confirm never outgrows the pair-body cap."""
+    return hashlib.sha256("\n".join([mode, *sorted(set(ids))]).encode("utf-8")).hexdigest()
 
 
 class FamilyChanged(Exception):
@@ -1634,6 +1648,8 @@ class FamilyChanged(Exception):
     def __init__(self, family: "list[dict[str, Any]]") -> None:
         super().__init__("the family changed since it was shown")
         self.family = family
+        ids = [f["id"] for f in family]
+        self.digests = {m: revoke_digest(ids, m) for m in sorted(REVOKE_MODES)}
 
 
 def _check_device_id(d: Any) -> None:

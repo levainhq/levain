@@ -1,5 +1,5 @@
 """A device revoke is bound to what the operator saw (levain 30, 11-04): the family a revoke takes is named by the
-server before it runs (``revoke-preview``), a request carries that set back as ``expect`` plus a ``mode``, and a
+server before it runs (``revoke-preview``), a request carries that set's digest back (``expect_digest``) plus a ``mode``, and a
 request without them moves nothing. ``mode: "only"`` revokes the target alone and re-parents its children."""
 from __future__ import annotations
 
@@ -41,7 +41,7 @@ def test_the_old_request_shape_no_longer_takes_the_whole_family(src) -> None:
         assert len(_live(httpd)) == 4          # nothing moved
 
 
-def test_a_stale_expect_moves_nothing_and_names_the_fresh_set(src) -> None:
+def test_a_stale_digest_moves_nothing_and_names_the_fresh_set(src) -> None:
     with _serve(src) as (port, httpd):
         laptop, tl, kids = _family(port)
         _phone, tphone = kids["iphone"]
@@ -49,8 +49,9 @@ def test_a_stale_expect_moves_nothing_and_names_the_fresh_set(src) -> None:
         assert st == 200 and prev["includes_caller"] is True, prev
         seen = sorted(f["id"] for f in prev["family"])
         assert seen == sorted([laptop] + [v[0] for v in kids.values()])
+        dg = prev["digests"]["family"]
         _pair(port, token=tl, label="late")     # a fifth device joins after the operator looked
-        st, out, _ = _call(port, "POST", REVOKE, {"id": laptop, "expect": seen, "mode": "family"},
+        st, out, _ = _call(port, "POST", REVOKE, {"id": laptop, "expect_digest": dg, "mode": "family"},
                            token=tphone, headers=PROXY)
         assert (st, out.get("error")) == (409, "family_changed"), (st, out)
         assert len(out["family"]) == 5
@@ -63,7 +64,7 @@ def test_family_mode_with_the_seen_set_takes_exactly_that_set(src) -> None:
         _phone, tphone = kids["iphone"]
         st, prev, _ = _call(port, "POST", PREVIEW, {"id": laptop}, token=tphone, headers=PROXY)
         seen = sorted(f["id"] for f in prev["family"])
-        st, out, _ = _call(port, "POST", REVOKE, {"id": laptop, "expect": seen, "mode": "family"}, token=T)
+        st, out, _ = _call(port, "POST", REVOKE, {"id": laptop, "expect_digest": prev["digests"]["family"], "mode": "family"}, token=T)
         assert st == 200 and sorted(out["revoked"]) == seen, out
         assert _live(httpd) == {}
 
@@ -74,7 +75,7 @@ def test_only_mode_detaches_the_children_to_the_targets_parent(src) -> None:
         _phone, tphone = kids["iphone"]
         st, prev, _ = _call(port, "POST", PREVIEW, {"id": laptop}, token=tphone, headers=PROXY)
         seen = sorted(f["id"] for f in prev["family"])
-        st, out, _ = _call(port, "POST", REVOKE, {"id": laptop, "expect": seen, "mode": "only"},
+        st, out, _ = _call(port, "POST", REVOKE, {"id": laptop, "expect_digest": prev["digests"]["only"], "mode": "only"},
                            token=tphone, headers=PROXY)
         assert st == 200 and out["revoked"] == [laptop], out
         assert sorted(out["detached"]) == sorted(v[0] for v in kids.values())
@@ -104,8 +105,8 @@ def test_a_surface_token_and_an_unknown_id_are_refused_by_the_preview(src) -> No
     with _serve(src) as (port, _h):
         assert _call(port, "POST", PREVIEW, {"id": "browser"}, token=T)[0] == 400
         assert _call(port, "POST", PREVIEW, {"id": "d-0123456789ab"}, token=T)[0] == 404
-        assert _call(port, "POST", REVOKE, {"id": "d-0123456789ab", "expect": [], "mode": "family"}, token=T)[0] == 404
-        assert _call(port, "POST", REVOKE, {"id": "x", "expect": [], "mode": "weird"}, token=T)[0] == 400
+        assert _call(port, "POST", REVOKE, {"id": "d-0123456789ab", "expect_digest": "0" * 64, "mode": "family"}, token=T)[0] == 404
+        assert _call(port, "POST", REVOKE, {"id": "x", "expect_digest": "0" * 64, "mode": "weird"}, token=T)[0] == 400
 
 
 def test_an_unhashable_mode_is_a_400_never_a_500(src) -> None:
@@ -113,7 +114,7 @@ def test_an_unhashable_mode_is_a_400_never_a_500(src) -> None:
     with _serve(src) as (port, httpd):
         laptop, _tl, _kids = _family(port)
         for mode in (["family"], {"m": 1}, 7, None):
-            st, out, _ = _call(port, "POST", REVOKE, {"id": laptop, "expect": [laptop], "mode": mode}, token=T)
+            st, out, _ = _call(port, "POST", REVOKE, {"id": laptop, "expect_digest": "0" * 64, "mode": mode}, token=T)
             assert (st, out.get("error")) == (400, "bad_request"), (mode, st, out)
         assert len(_live(httpd)) == 4
 
@@ -128,8 +129,7 @@ def test_only_mode_on_an_already_revoked_target_moves_nothing_and_reports_nothin
         with db.write() as conn:        # a revoked target whose children are still live (a state no route makes today)
             conn.execute("UPDATE paired_devices SET revoked_at = '2026-11-04T00:00:00Z' WHERE id = ?", (laptop,))
         before = {d["id"]: d["paired_by"] for d in db.list_devices()}
-        seen = sorted(v[0] for v in kids.values())
-        out = db.revoke_confirmed(laptop, expect=seen, mode="only", by="browser", now=datetime.now(timezone.utc))
+        out = db.revoke_confirmed(laptop, expect_digest=db.revoke_preview(laptop)["digests"]["only"], mode="only", by="browser", now=datetime.now(timezone.utc))
         assert out == {"revoked": [], "detached": []}, out
         assert {d["id"]: d["paired_by"] for d in db.list_devices()} == before      # nobody was re-parented
 
@@ -158,6 +158,58 @@ def test_a_failed_subscribe_undoes_the_new_device_even_when_it_has_gained_a_chil
         assert (st, out.get("error")) == (500, "internal") and "token" not in out, out
         live = _live(httpd)
         assert live == {}, live          # the new device and the child it minted are both revoked
+
+
+def test_a_family_of_one_hundred_revokes_through_the_confirm_inside_the_pair_body_cap(src) -> None:
+    """L3 (codex HIGH x3): the confirm listed every id, so a family of ~58 outgrew the 1 KiB pair-body cap and was
+    refused before routing. The digest is the same size for any family."""
+    import json
+
+    from levain.web_server import _PAIR_BODY_MAX
+
+    with _serve(src) as (port, httpd):
+        laptop, tl = _pair(port, label="laptop")
+        for i in range(99):
+            _pair(port, token=tl, label=f"kid{i}")
+        st, prev, _ = _call(port, "POST", PREVIEW, {"id": laptop}, token=T)
+        assert st == 200 and len(prev["family"]) == 100, (st, len(prev.get("family", [])))
+        body = {"id": laptop, "expect_digest": prev["digests"]["family"], "mode": "family"}
+        assert len(json.dumps(body)) < _PAIR_BODY_MAX // 4
+        st, out, _ = _call(port, "POST", REVOKE, body, token=T)
+        assert st == 200 and len(out["revoked"]) == 100, (st, out.get("error"), out.get("message"))
+        assert _live(httpd) == {}
+
+
+def test_the_digest_differs_by_mode_and_by_set(src) -> None:
+    with _serve(src) as (port, _h):
+        laptop, tl, kids = _family(port)
+        st, a, _ = _call(port, "POST", PREVIEW, {"id": laptop}, token=T)
+        assert a["digests"]["only"] != a["digests"]["family"]
+        assert all(len(v) == 64 for v in a["digests"].values())
+        _pair(port, token=tl, label="late")
+        st, b, _ = _call(port, "POST", PREVIEW, {"id": laptop}, token=T)
+        assert b["digests"]["family"] != a["digests"]["family"]
+
+
+def test_a_digest_for_the_other_mode_is_a_family_changed_never_a_revoke(src) -> None:
+    with _serve(src) as (port, httpd):
+        laptop, _tl, _kids = _family(port)
+        st, prev, _ = _call(port, "POST", PREVIEW, {"id": laptop}, token=T)
+        st, out, _ = _call(port, "POST", REVOKE,
+                           {"id": laptop, "expect_digest": prev["digests"]["only"], "mode": "family"}, token=T)
+        assert (st, out.get("error")) == (409, "family_changed"), (st, out)
+        assert len(_live(httpd)) == 4
+
+
+def test_the_old_expect_list_and_a_malformed_digest_are_refused(src) -> None:
+    with _serve(src) as (port, httpd):
+        laptop, _tl, _kids = _family(port)
+        st, out, _ = _call(port, "POST", REVOKE, {"id": laptop, "expect": [laptop], "mode": "family"}, token=T)
+        assert st == 400, (st, out)          # an unknown key, and no digest: nothing moves
+        for bad in ("short", 7, None, ["a" * 64], "G" * 64):
+            st, out, _ = _call(port, "POST", REVOKE, {"id": laptop, "expect_digest": bad, "mode": "family"}, token=T)
+            assert st == 400, (bad, st, out)
+        assert len(_live(httpd)) == 4
 
 
 # --- the confirm card, in a browser at phone width ---------------------------------------------------------------

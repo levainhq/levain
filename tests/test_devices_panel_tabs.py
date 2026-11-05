@@ -9,6 +9,7 @@ import sqlite3
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
+from levain.cockpit.firejournal import revoke_digest
 from tests.test_cockpit_k2a import _install
 from tests.test_cockpit_pairing_http import T, _call, _pair, _serve
 from tests.test_pair_card_w1b import _drive, needs_browser
@@ -25,7 +26,7 @@ def _seed(port: int, httpd, active: list[str], revoked: list[str]) -> None:
     for label in [*revoked, *active]:
         ids[label] = _pair(port, label=label)[0]
     for label in revoked:
-        st, out, _ = _call(port, "POST", "/cockpit/pair/revoke", {"id": ids[label], "expect": [ids[label]], "mode": "family"}, token=T)
+        st, out, _ = _call(port, "POST", "/cockpit/pair/revoke", {"id": ids[label], "expect_digest": revoke_digest([ids[label]], "family"), "mode": "family"}, token=T)
         assert st == 200, out
     # the server stamps with one-second resolution: set distinct stamps directly (later in the list = newer)
     db = sqlite3.connect(str(Path(httpd.broker.data_root) / "cockpit.db"))
