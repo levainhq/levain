@@ -1,7 +1,7 @@
 // levain devices_panel.js — the cockpit's Devices panel (per-device pairing, PAIR_DESIGN.md REV 1-6).
 //
 // Lists the paired devices (GET /cockpit/pair/devices.json), mints a one-time pairing link (POST /cockpit/pair/offer {label}),
-// revokes a device behind a confirm card that names the family (POST /cockpit/pair/revoke-preview {id}, then /cockpit/pair/revoke {id, expect, mode}), and turns pings on for this browser (OS-4, /webpush/*).
+// revokes a device behind a confirm card that names the family (POST /cockpit/pair/revoke-preview {id}, then /cockpit/pair/revoke {id, expect_digest, mode}), and turns pings on for this browser (OS-4, /webpush/*).
 // It rides the page's own credential: the token the cockpit keeps in localStorage "levain_write_token" (dashboard_boot.js WRITE_TOKEN_KEY). Everything is drawn with textContent: this
 // file shares a page with that token, so it adds no HTML sink. A server with no writable cockpit answers 404 and the panel never
 // appears; a page with no usable credential shows nothing either.
@@ -680,7 +680,7 @@
   }
 
   // Revoke is a two-step: the server names the family a revoke would take, the operator sees it on a card, and the revoke
-  // carries that exact set back (`expect`) with the mode they chose. A set that moved in between comes back as family_changed
+  // carries that set's digest back (`expect_digest`) with the mode they chose. A set that moved in between comes back as family_changed
   // with the fresh set, and the card is drawn again. Each Revoke click and each Cancel starts a new flow (flowGen): an answer
   // for an older flow, landing after the operator moved on, never opens, replaces or closes the card.
   let flowGen = 0;
@@ -742,7 +742,7 @@
       for (const x of bs) x.disabled = true;
       let msg = "", ok = false, changed = null;
       try {
-        const r = await api("POST", "/cockpit/pair/revoke", { id: d.id, expect: fam.map((f) => f.id).sort(), mode: mode });
+        const r = await api("POST", "/cockpit/pair/revoke", { id: d.id, expect_digest: (pv.digests || {})[mode], mode: mode });
         if (r.status === 409 && r.data.error === "family_changed" && Array.isArray(r.data.family)) changed = r.data;
         else if (r.status !== 200) msg = "Could not revoke " + named(d) + " (" + (r.data.message || r.status) + ").";
         else {
@@ -766,7 +766,7 @@
       }
       if (changed) {      // the set moved since it was shown: nothing was revoked; show the fresh set
         closeConfirm();
-        showConfirm(d, { family: changed.family, caller: caller }, "The devices changed while this was open. Nothing was revoked; check the list again.");
+        showConfirm(d, { family: changed.family, digests: changed.digests, caller: caller }, "The devices changed while this was open. Nothing was revoked; check the list again.");
         return;
       }
       closeConfirm();

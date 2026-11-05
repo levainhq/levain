@@ -11,7 +11,7 @@ from typing import Any, Iterator
 
 import pytest
 
-from levain.cockpit.firejournal import PAIRED_PREFIX, CockpitDB
+from levain.cockpit.firejournal import PAIRED_PREFIX, CockpitDB, revoke_digest
 from levain.web_server import make_server
 from levain.webpush.store import PushStore
 from tests.test_cockpit_k2a import _install
@@ -165,7 +165,7 @@ def test_revoking_a_device_expires_the_short_code_its_family_minted(src) -> None
     with _serve(src) as (port, _h):
         dev, tok = _pair(port)
         code = _short(port, token=tok, headers=PROXY)
-        assert _call(port, "POST", "/cockpit/pair/revoke", {"id": dev, "expect": [dev], "mode": "family"}, token=T)[0] == 200
+        assert _call(port, "POST", "/cockpit/pair/revoke", {"id": dev, "expect_digest": revoke_digest([dev], "family"), "mode": "family"}, token=T)[0] == 200
         assert _call(port, "POST", "/cockpit/pair/claim", {"short": code})[0] == 403
 
 
@@ -209,7 +209,7 @@ def test_the_powers_table_holds_row_by_row_for_each_credential_class(rig, monkey
             assert call("GET", "/cockpit/manifest.json")[0] == 200, name                    # read
             assert call("POST", "/cockpit/pair/offer", {})[0] == 200, name                  # mint a link
             assert call("POST", "/cockpit/pair/offer", {"short": True})[0] == 200, name     # mint a short code
-            st, out, _ = call("POST", "/cockpit/pair/revoke", {"id": victims[i], "expect": [victims[i]], "mode": "family"})           # revoke any device
+            st, out, _ = call("POST", "/cockpit/pair/revoke", {"id": victims[i], "expect_digest": revoke_digest([victims[i]], "family"), "mode": "family"})           # revoke any device
             assert st == 200 and out["revoked"] == [victims[i]], (name, out)
             st, out, _ = call("POST", "/webpush/subscribe", _sub(10 + i))
             assert st == 200, (name, out)
@@ -218,9 +218,9 @@ def test_the_powers_table_holds_row_by_row_for_each_credential_class(rig, monkey
             assert (st, out.get("error")) == ((200, None) if name == "paired" else (403, "device_required")), (name, out)
             assert call("POST", "/webpush/unsubscribe", {"endpoint": _sub(10 + i)["endpoint"]})[0] == 200, name
             assert call("POST", "/webpush/opened", {"ping": ping})[0] == 200, name         # any existing ping id
-        assert _call(port, "POST", "/cockpit/pair/revoke", {"id": "d-0123456789ab", "expect": [], "mode": "family"}, token=FC)[0] == 404
+        assert _call(port, "POST", "/cockpit/pair/revoke", {"id": "d-0123456789ab", "expect_digest": "0" * 64, "mode": "family"}, token=FC)[0] == 404
         # a surface token is never revoked from the Devices panel: it is no paired device
-        assert _call(port, "POST", "/cockpit/pair/revoke", {"id": "browser", "expect": [], "mode": "family"}, token=T)[0] == 400
+        assert _call(port, "POST", "/cockpit/pair/revoke", {"id": "browser", "expect_digest": "0" * 64, "mode": "family"}, token=T)[0] == 400
 
 
 def test_a_test_ping_creates_deliveries_only_for_the_caller(rig, monkeypatch) -> None:

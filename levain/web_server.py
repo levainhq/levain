@@ -4466,7 +4466,7 @@ class _Handler(GuardedHandler):
 
     def _pair_authed_post(self, route: str) -> None:
         """``POST /cockpit/pair/offer {label?}`` mints a one-time code minted by THIS credential (RQ-2); ``POST
-        /cockpit/pair/revoke {id, expect, mode}`` revokes a paired device (its whole family, or it alone with its children re-parented) bound to the set ``/cockpit/pair/revoke-preview {id}`` named (RP-7; any credential, surface or paired,
+        /cockpit/pair/revoke {id, expect_digest, mode}`` revokes a paired device (its whole family, or it alone with its children re-parented) bound to the set ``/cockpit/pair/revoke-preview {id}`` named (RP-7; any credential, surface or paired,
         may revoke any paired device; the surface tokens are never revocable here). The revocation epoch moves only
         after the revoke's transaction commits (RU-3)."""
         srv = self.server
@@ -4513,23 +4513,23 @@ class _Handler(GuardedHandler):
                 if status == 400 and "no such device" in payload.get("message", ""):
                     status = 404
             else:
-                unknown = sorted(set(req) - {"id", "expect", "mode"})
+                unknown = sorted(set(req) - {"id", "expect_digest", "mode"})
                 if unknown:
                     self._send_json({"error": "bad_request", "message": f"unknown request keys {unknown}"}, 400)
                     return
-                if "expect" not in req or "mode" not in req:
+                if "expect_digest" not in req or "mode" not in req:
                     # no revoke runs unconfirmed, whichever client sent it: the refusal is at the point of use
                     self._send_json({"error": "confirm_required",
-                                     "message": "a revoke carries the family it was shown (expect) and a mode "
+                                     "message": "a revoke carries the digest of the family it was shown (expect_digest) and a mode "
                                                 f"({'/'.join(sorted(REVOKE_MODES))}); ask revoke-preview first"}, 400)
                     return
 
                 def revoke(db: Any) -> dict[str, Any]:
                     try:
-                        return db.revoke_confirmed(req.get("id"), expect=req["expect"], mode=req["mode"],
+                        return db.revoke_confirmed(req.get("id"), expect_digest=req["expect_digest"], mode=req["mode"],
                                                    by=minted_by, now=now)
                     except FamilyChanged as changed:
-                        return {"error": "family_changed", "family": changed.family,
+                        return {"error": "family_changed", "family": changed.family, "digests": changed.digests,
                                 "message": "the set of devices changed since it was shown"}
 
                 payload, status = self._pair_call(revoke)
