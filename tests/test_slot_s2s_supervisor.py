@@ -114,6 +114,9 @@ elif verb == "start":
                 buf += os.read(0, 64)
         os.write(1, b"quit seen\n")
         line({"exit": 0, "ok": True})
+    elif mode == "extkill":
+        open(os.path.join(store, "started"), "w").close()
+        os._exit(137)                               # END from outside (REVOKE-OWN, then the reaper) killed the slot
     elif mode == "wait":
         open(os.path.join(store, "started"), "w").close()
         while not os.path.exists(os.path.join(store, "torn")):
@@ -375,6 +378,19 @@ def test_sigterm_mid_session_tears_down_then_closes_the_lease(tmp_path: Path, mo
     assert f"session {SESSION} ended RETAINED" in rig.stderr()
     assert rig.calls[-1] == ("close",)
     assert signal.getsignal(signal.SIGTERM) is before      # the handlers are put back
+
+
+@pytest.mark.parametrize("end,tail", [("RETAINED", "ended RETAINED: the work is kept"), ("HELD", "ended HELD: a step did not prove")])
+def test_a_slot_killed_from_outside_still_gets_the_one_teardown_then_the_lease_closes(
+        tmp_path: Path, monkeypatch: pytest.MonkeyPatch, end: str, tail: str) -> None:
+    """1104-30 X1 check 2, interactive half: after an external REVOKE and the reaper's END the slot's processes are
+    gone; the supervisor sees `start` end without its own stop, runs the one teardown (RETAINED for an already-ended
+    session, END being idempotent) and only then closes the lease. A teardown that does not prove says so and exits 1."""
+    rig = Rig(tmp_path, monkeypatch, FAKE_START="extkill", FAKE_END=end)
+    code = rig.run()
+    assert [x["verb"] for x in rig.verbs()] == ["prepare", "render", "probe", "start", "teardown"]
+    assert code == 1 and tail in rig.stderr()
+    assert rig.calls[-1] == ("close",)
 
 
 def test_refusal_after_prepare_is_named_and_still_tears_down(tmp_path: Path, monkeypatch: pytest.MonkeyPatch

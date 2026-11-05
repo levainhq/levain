@@ -76,6 +76,8 @@ class Env:
         self.asks, self.prompts, self.slept = 0, [], []
         self.answers = []                       # the operator's typed answers, consumed in order
         self.now = 0.0
+        self.revoked = []                       # REVOKE-OWN asks, in order
+        self.revoke_answer = lambda sess: (True, 5)
 
     def lstat(self, p):
         if p not in self.fs:
@@ -101,13 +103,17 @@ class Env:
             read_directory=lambda host: self.read_dir(host), check_writers=lambda *a: self.writers(*a),
             gen_id=lambda a, b: GEN, current_gen=lambda h: self.current, version="9.9.9",
             live_sessions=lambda: self.ask_live(), prompt=self.ask_prompt, sleep=lambda x: self.do_sleep(x),
-            clock=lambda: self.now)
+            revoke_own=lambda sess: self.ask_revoke(sess), clock=lambda: self.now)
 
     def ask_live(self):
         self.asks += 1
         if type(self.live) is list:
             return self.live[min(self.asks, len(self.live)) - 1]
         return self.live
+
+    def ask_revoke(self, sess):
+        self.revoked.append(sess)
+        return self.revoke_answer(sess)
 
     def ask_prompt(self, text):
         self.prompts.append(text)
@@ -784,29 +790,115 @@ def test_the_bound_returns_the_prompt_and_nothing_is_ended(env, capsys):
     nothing_ran(env)
 
 
-def test_end_now_with_leases_live_refuses_and_names_them(env, capsys):
-    """L3 r1 HIGH-1: `end` printed "Ending them now" and went to sudo, where the helper refuses `live-lease`. Levain has
-    no operator verb that ends a session, so it names the ones holding a lease and runs nothing."""
-    env.live = two_live()
+def settled(sess, state="RETAINED", lease=False, kind="dispatch", **extra):
+    r = rec(sess, kind=kind, state=state, lease_live=lease)
+    r.update(extra)
+    return r
+
+
+def test_end_now_revokes_each_live_session_waits_for_the_leases_then_runs_root(env, capsys):
+    """1104-30 X1: [e] asks CONTROL to REVOKE-OWN every live session, polls STATUS until no lease is live and every
+    revoked session is RETAINED, and only then goes on. 'Ended' is said only for what STATUS showed ended."""
+    env.live = [two_live(),
+                (True, [settled(S1, "REVOKED", True), settled(S2, "RETAINED"), settled(S3, "REVOKED", True, "interactive")]),
+                (True, [settled(S1), settled(S2), settled(S3, kind="interactive")])]
     env.answers = ["e"]
     rc, out = env.run(capsys)
-    assert rc == 4 and S1 in out and S2 in out and S3 in out and "End these first" in out
-    assert "Ending them now" not in out and "Nothing was changed" in out
+    assert rc == 0 and sorted(env.revoked) == sorted([S1, S2, S3]) and env.slept
+    assert "Ended (work kept)" in out and S1 in out and "Levain has no command" not in out
+    assert env.execs                                  # the installer step ran only after the sessions ended
+    assert out.index("Waiting for") < out.index("Ended (work kept)")
+
+
+def test_end_sessions_flag_does_the_same_without_a_prompt(env, capsys):
+    env.live = [two_live(), (True, [settled(S1), settled(S2), settled(S3, kind="interactive")])]
+    rc, out = env.run(capsys, end_sessions=True)
+    assert rc == 0 and env.prompts == [] and len(env.revoked) == 3 and "Ended (work kept)" in out
+
+
+def test_a_session_that_ends_held_is_named_with_its_step_and_root_is_never_asked(env, capsys):
+    env.live = [two_live(), (True, [settled(S1), settled(S2, "HELD", False, failed_step="freeze"),
+                                    settled(S3, kind="interactive")])]
+    env.answers = ["e"]
+    rc, out = env.run(capsys)
+    assert rc == 4 and S2 in out and "HELD" in out and "freeze" in out
+    assert "Ended (work kept)" not in out
     nothing_ran(env)
+
+
+def test_a_lease_that_never_closes_is_named_and_the_choice_returns(env, capsys):
+    """The dispatch half's open item: a holder that does not let go is named at the bound, never called ended, and
+    nothing is revoked twice."""
+    env.live = [(True, [rec(S1)]), (True, [settled(S1, "REVOKED", True)])]
+    env.answers = ["e", "c"]
+    rc, out = env.run(capsys)
+    assert rc == 4 and env.revoked == [S1] and len(env.prompts) == 2
+    assert f"{S1} was told to end but still holds its lease" in out and "Ended" not in out
+    assert env.now >= U._END_WAIT_MIN * 60
+    nothing_ran(env)
+
+
+def test_a_session_that_is_already_revoked_is_waited_for_not_revoked_again(env, capsys):
+    env.live = [(True, [settled(S1, "REVOKED", True)]), (True, [settled(S1)])]
+    env.answers = ["e"]
+    rc, out = env.run(capsys)
+    assert rc == 0 and env.revoked == []
+
+
+def test_a_revoke_refusal_is_named_and_stops_everything(env, capsys):
+    env.live = two_live()
+    env.answers = ["e"]
+    env.revoke_answer = lambda sess: (False, "refused session-unknown")
+    rc, out = env.run(capsys)
+    assert rc == 4 and "session-unknown" in out and "Nothing more was ended" in out and len(env.revoked) == 1
+    nothing_ran(env)
+
+
+def test_control_going_silent_during_the_end_wait_is_cannot_tell_never_ended(env, capsys):
+    env.live = [(True, [rec(S1)]), (False, "no answer in time")]
+    env.answers = ["e", "c"]
+    rc, out = env.run(capsys)
+    assert rc == 4 and "Cannot tell" in out and "Ended" not in out
+    nothing_ran(env)
+
+
+def test_a_revoked_session_whose_lease_closed_but_is_not_yet_retained_is_not_ended(env, capsys):
+    """END still on its way (FROZEN) is not 'ended': the bound passes and the words say so. (What the offer does next
+    is `_live_split`'s, unchanged: a lease-free FROZEN record is not 'running' to it; residue in the RETURN.)"""
+    env.live = [(True, [rec(S1)]), (True, [settled(S1, "FROZEN", False)])]
+    env.answers = ["e"]
+    rc, out = env.run(capsys)
+    assert env.revoked == [S1] and "Ended" not in out and f"{U._END_WAIT_MIN} min passed" in out
 
 
 def test_end_now_proceeds_when_no_lease_is_live(env, capsys):
     env.live = (True, [rec(S1, lease_live=False), rec(S2, lease_live=False)])
     env.answers = ["e"]
     rc, out = env.run(capsys)
-    assert rc == 0 and len(env.runner.calls) == 1 and env.execs
+    assert rc == 0 and len(env.runner.calls) == 1 and env.execs and env.revoked == []
 
 
-def test_end_sessions_flag_refuses_the_same_way(env, capsys):
-    env.live = two_live()
-    rc, out = env.run(capsys, end_sessions=True)
-    assert rc == 4 and "End these first" in out and env.prompts == []
-    nothing_ran(env)
+def test_leased_agrees_with_roots_live_lease_sessions_on_real_records(tmp_path):
+    """Two things that should be one: W1's `_leased` and root's `live_lease_sessions` read the same record files."""
+    from levain.contracts import canon
+    from levain.slot import install_helper as IH
+    from levain.slot import records as R
+
+    names = {"s-" + c * 16: (st, lease) for c, (st, lease) in zip("abcdef", [
+        ("REVOKED", True), ("HELD", True), ("RETAINED", False), ("ACTIVE", True), ("ACTIVE", False), ("HELD", False)])}
+    d = tmp_path / "sessions"
+    d.mkdir()
+    recs = []
+    for sess, (st, lease) in names.items():
+        sr = R.SessionState(session=sess, generation=1, state=st, claims={}, lease_live=lease, event_kind="state",
+                            updated_at=R.timestamp(0))
+        (d / f"{sess}.json").write_bytes(R.state_bytes(sr))
+        recs.append(R.state_record(sr, check=False))
+    (d / ("s-" + "9" * 16 + ".json")).write_bytes(b"not json")        # unparsable: root counts it live
+    root_set = set(IH.live_lease_sessions(d))
+    mine = set(U._leased(recs))
+    assert mine == root_set - {"s-" + "9" * 16}
+    assert root_set == {"s-" + c * 16 for c in "abd"} | {"s-" + "9" * 16}
 
 
 def test_a_cancel_at_the_root_gate_says_what_stands(env, capsys, monkeypatch):
@@ -979,3 +1071,36 @@ def test_a_held_session_still_stops_ahead_of_the_offer(env, capsys):
     rc, out = env.run(capsys, no_pip=True)
     assert rc == 3 and env.prompts == [] and "Held sessions" in out
     nothing_ran(env)
+
+
+@pytest.mark.parametrize("reply,want", [({"ok": True, "generation": 7}, (True, 7)),
+                                        ({"ok": False, "refused": "session-unknown"}, (False, "refused session-unknown"))])
+def test_the_default_revoke_ask_frames_revoke_own_and_maps_the_answer(tmp_path, monkeypatch, reply, want):
+    import socket
+    import tempfile
+    import threading
+
+    from levain.slot import control, layout
+
+    run = Path(tempfile.mkdtemp(prefix="lvr", dir="/tmp"))
+    (run / "control").mkdir()
+    srv = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    srv.bind(str(run / "control" / "control.sock"))
+    srv.listen(1)
+    seen = []
+
+    def serve():
+        c, _ = srv.accept()
+        req = control.read_frame(c)
+        seen.append(req)
+        c.sendall(control.encode_frame({"id": req["id"], **reply}))
+        c.close()
+
+    t = threading.Thread(target=serve, daemon=True)
+    t.start()
+    monkeypatch.setitem(layout.RUN, "linux", run)
+    assert U._revoke_own("linux", S1) == want
+    t.join(5)
+    srv.close()
+    assert seen == [{"v": 1, "op": "REVOKE-OWN", "id": 1, "session": S1}]
+    assert U._revoke_own("linux", S1)[0] is False        # the socket is gone: not an answer

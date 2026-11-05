@@ -44,6 +44,7 @@ EXIT_OK, EXIT_REFUSED, EXIT_HELD, EXIT_WAITED_OUT, EXIT_INTERNAL = 0, 1, 3, 4, 7
 #: answers ``claims`` without the ticket's facts). When it passes the choice returns to the operator; nothing is ended.
 _WAIT_DEFAULT_MIN = 30
 _POLL_S = 5.0
+_END_WAIT_MIN = 3         # DECISION: after REVOKE-OWN, the reaper's wake plus END's own budget margin (1104-30 X1)
 _ASK_TRIES = 10
 _ANSWERS = {"w": "wait", "e": "end", "c": "cancel"}
 #: Where the offer runs: before the installer step (a cancel changes nothing) or before the root repair (it does not).
@@ -324,6 +325,44 @@ def _live_sessions(host: str) -> tuple[bool, Any]:
     return doctor._ask_control_status(run, doctor._clock() + doctor._CONTROL_ASK_S)
 
 
+def _revoke_own(host: str, session: str) -> tuple[bool, Any]:
+    """(True, generation) when CONTROL took the operator's ``REVOKE-OWN {session}``; (False, why) otherwise: a
+    refusal is named, anything else is "did not answer". Doctor's frame codec and deadline, one exchange. Nothing
+    here raises. It asks CONTROL to stop the session; root's reaper ENDs it and the lease holder closes its lease."""
+    import socket
+
+    from levain import doctor
+    from levain.slot import layout
+
+    run = layout.RUN.get(host)
+    if run is None:
+        return False, "no run directory for this host"
+    try:
+        from levain.slot import control
+
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as raw:
+            c = doctor._ByDeadline(raw, doctor._clock() + doctor._CONTROL_ASK_S)
+            c.connect(str(run / "control" / "control.sock"))
+            c.sendall(control.encode_frame({"v": 1, "op": "REVOKE-OWN", "id": 1, "session": session}))
+            ans = control.read_frame(c)  # type: ignore[arg-type]
+    except FileNotFoundError:
+        return False, "no control socket"
+    except PermissionError:
+        return False, "this account may not open the control socket"
+    except TimeoutError:
+        return False, "no answer in time"
+    except Exception as exc:  # noqa: BLE001 - any other failure is "did not answer"
+        return False, type(exc).__name__
+    if type(ans) is not dict or ans.get("id") != 1 or type(ans.get("ok")) is not bool:
+        return False, "no answer" if ans is None else "an answer off its shape"
+    if ans["ok"] is not True:
+        from levain import unshowable
+
+        why = ans.get("refused")
+        return False, "refused " + (unshowable.mark(why[:40], allow="") if type(why) is str and why else "(unnamed)")
+    return True, ans.get("generation")
+
+
 @dataclass
 class Seams:
     host: str = "darwin" if sys.platform == "darwin" else "linux"
@@ -358,6 +397,7 @@ class Seams:
     current_gen: Callable[[str], Optional[str]] = _current_generation
     version: Optional[str] = None
     live_sessions: Optional[Callable[[], tuple[bool, Any]]] = None     # default: CONTROL's STATUS for this host
+    revoke_own: Optional[Callable[[str], tuple[bool, Any]]] = None   # default: CONTROL's REVOKE-OWN for this host
     prompt: Callable[[str], str] = input
     sleep: Callable[[float], None] = time.sleep
     clock: Callable[[], float] = time.monotonic
@@ -523,7 +563,7 @@ def _choose(s: Seams, minutes: int, why: str) -> str:
     print(f"{why}")
     print("The upgrade restarts Levain's services, which ends them. Their work is kept.")
     print(f"  [w] wait until they finish (up to {minutes} min), then upgrade      "
-          "[e] upgrade now (names any you must end first)      [c] cancel")
+          "[e] end them now and upgrade (work kept)      [c] cancel")
     for _ in range(_ASK_TRIES):
         try:
             ans = s.prompt("Choose [w/e/c]: ").strip().lower()
@@ -582,6 +622,94 @@ def _leased(recs: Any) -> list[str]:
     return sorted(out)
 
 
+_SETTLING = frozenset({"REVOKED", "FROZEN", "DEAD", "CREDENTIAL_PARKED"})     # END is on its way
+
+
+def _names(xs: list[str]) -> str:
+    return ", ".join(xs[:5]) + (f" and {len(xs) - 5} more" if len(xs) > 5 else "")
+
+
+def _revocable(recs: Any) -> list[str]:
+    """The labelled sessions in a live state: the ones CONTROL's ``REVOKE-OWN`` can move. A record already past live
+    is waited for, an off-shape one cannot be named to CONTROL (it is waited for and, at the bound, named)."""
+    from levain.slot import records as R
+    from levain.slot.grammar import SESSION_RE
+
+    return sorted(r["session"] for r in recs if type(r) is dict and type(r.get("session")) is str
+                  and SESSION_RE.fullmatch(r["session"]) and type(r.get("state")) is str and r["state"] in R.LIVE_STATES)
+
+
+def _step_of(r: dict) -> str:
+    from levain import unshowable
+
+    fs = r.get("failed_step")
+    return f" at step {unshowable.mark(fs[:40], allow='')}" if type(fs) is str and fs else ""
+
+
+def _end_now(s: Seams, recs: Any, phase: str) -> str:
+    """[e]: "go" (nothing the root repair would refuse, or every session proven ended), "stop" (a refusal, a HELD
+    end: named, exit 4) or "back" (the bound passed with a lease still live: the choice returns). Revoke each live
+    session, then poll STATUS until no record holds a lease AND every session asked is past END; a session is called
+    ended only where STATUS shows its lease closed and its record RETAINED. Nothing here kills, signals or closes a
+    lease: CONTROL stops it, root's reaper ENDs it, the holder lets go on its own proof."""
+    if not _leased(recs):
+        return "go"                 # nothing to end that the repair would refuse; root decides under its lock
+    ask = s.revoke_own or (lambda sess: _revoke_own(s.host, sess))
+    asked: list[str] = []
+    for sess in _revocable(recs):
+        try:
+            ok, why = ask(sess)
+        except Exception as e:  # noqa: BLE001 - an ask that raises is "did not answer"
+            ok, why = False, type(e).__name__
+        if not ok:
+            more = f" ({len(asked)} already asked)" if asked else ""
+            print(f"Levain could not end {sess}: {why if type(why) is str else 'no answer'}{more}. "
+                  f"Nothing more was ended. {_cancel_words(phase)}")
+            return "stop"
+        asked.append(sess)
+    if asked:
+        print(f"Asked CONTROL to end {_names(asked)}. Root's reaper keeps each one's work.")
+    end = s.clock() + _END_WAIT_MIN * 60
+    last: Any = None
+    while True:
+        ok, now = _ask_live(s)
+        if ok and type(now) is list:
+            left = _leased(now)
+            by = {r["session"]: r for r in now if type(r) is dict and type(r.get("session")) is str}
+            pend = [x for x in asked if by.get(x, {}).get("state") in _SETTLING or x not in by]
+            if not left and not pend:
+                break
+            line = ("Waiting for " + _names(sorted(set(left) | set(pend))) + " to finish ending "
+                    "(a lease is closed by the session that holds it).")
+        else:
+            left = None
+            line = f"Cannot tell whether they ended (CONTROL: {now if type(now) is str else 'refused'})."
+        if line != last:
+            print(line)
+            last = line
+        if s.clock() >= end:
+            if left:
+                for x in left:
+                    if x in asked:
+                        print(f"{x} was told to end but still holds its lease; Levain cannot close it for you.")
+                    else:
+                        print(f"{x} still holds a lease.")
+            else:
+                print(f"{_END_WAIT_MIN} min passed and Levain cannot tell they ended.")
+            return "back"
+        s.sleep(_POLL_S)
+    held = [(x, by[x]) for x in asked if by[x].get("state") == "HELD"]
+    if held:
+        for x, r in held:
+            print(f"{x} ended HELD{_step_of(r)}: a step did not prove, so its slot stays leased and its work stays "
+                  "where it is. Run `levain doctor`; the upgrade did not go on.")
+        print(_cancel_words(phase))
+        return "stop"
+    if asked:
+        print(f"Ended (work kept): {_names(asked)}.")
+    return "go"
+
+
 def _cancel_words(phase: str) -> str:
     """What a cancel changed, by the phase it came in: before the installer nothing; before root the installer step
     stands and the root side is as it was."""
@@ -595,9 +723,8 @@ def _live_offer(s: Seams, wait: bool, wait_max: Optional[int], end_sessions: boo
                 phase: str = _PHASE_INSTALLER) -> Optional[int]:
     """The wait offer (1104-29 W1): None to go on, or the exit code of a cancel. Nothing running: silent. A STATUS
     that does not answer is NOT zero: the same choices are offered. The flags answer the first ask only; when a wait
-    passes its bound the choice returns to the operator. ``phase`` words what a cancel left behind. Levain has no
-    operator verb that ends a session (CONTROL's operator verbs are LEASE-OPEN, STATUS, KEYS-STATUS; END is root's), so
-    "end" goes on only when no session holds a live lease, and otherwise names the ones that must be ended first."""
+    passes its bound the choice returns to the operator. ``phase`` words what a cancel left behind. "End" asks CONTROL to ``REVOKE-OWN`` each live session (END stays root's), waits for the leases to close and goes
+    on only when STATUS shows every one ended; see :func:`_end_now`."""
     try:
         return _offer_loop(s, wait, wait_max, end_sessions, phase)
     except KeyboardInterrupt:
@@ -627,15 +754,12 @@ def _offer_loop(s: Seams, wait: bool, wait_max: Optional[int], end_sessions: boo
             if not answered:        # a host whose CONTROL is down is what this command repairs; root decides under its lock
                 print(f"{why} Going on: the root step refuses by itself if a session still holds a live lease.")
                 return None
-            blockers = _leased(recs)
-            if not blockers:
-                return None             # nothing to end that the repair would refuse; root decides under its lock
-            print(f"{why} The root repair refuses while a session's lease is live, and Levain has no command that "
-                  f"ends a session for you. End these first: {', '.join(blockers[:5])}"
-                  f"{f' and {len(blockers) - 5} more' if len(blockers) > 5 else ''} (leave each `levain session` "
-                  "terminal; an agent session ends when its job does), or use --wait.")
-            print(f"Stopped. {_cancel_words(phase)}")
-            return EXIT_WAITED_OUT
+            verdict = _end_now(s, recs, phase)
+            if verdict == "go":
+                return None
+            if verdict == "stop":
+                return EXIT_WAITED_OUT
+            continue                # "back": the bound passed, the choice returns; nothing more is ended
         if choice == "cancel":
             print(f"Cancelled. {_cancel_words(phase)}")
             return EXIT_WAITED_OUT
@@ -878,7 +1002,8 @@ def register(subparsers: Any) -> None:
     g.add_argument("--wait-max", type=int, metavar="MINUTES", choices=range(1, 24 * 60 + 1),
                    help="Like --wait, with your own bound in minutes (1 to 1440).")
     g.add_argument("--end-sessions", action="store_true",
-                   help="If sessions are running, do not wait: go on when none holds a live lease, else name the "
-                        "ones you must end first (Levain has no command that ends a session for you).")
+                   help="If sessions are running, do not wait: ask CONTROL to end them (their work is kept), wait for "
+                        "each to finish ending, then upgrade. A session that does not end, or ends HELD, is named "
+                        "and nothing more runs.")
     p.set_defaults(func=lambda a: run_upgrade(no_pip=a.no_pip, dry_run=a.dry_run, verbose=a.verbose, wait=a.wait,
                                               wait_max=a.wait_max, end_sessions=a.end_sessions))
