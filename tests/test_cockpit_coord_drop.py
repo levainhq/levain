@@ -61,7 +61,11 @@ def test_the_listing_makes_no_store_then_shows_the_drop_with_its_receipt_and_the
         status, body = _call(url, "/cockpit/coord/drops.json")
         assert status == 200 and body["coord_drops"] == [] and body["coord_note"] is None, body
         assert body["coord_signers"] == [key.fp] and body["origin"] == PAGE and body["rp_id"] == RP
-        assert body["coord_store_read"] is True and body["coord_store_id"] is None and body["credentials"] == {}
+        assert body["coord_store_read"] is True and body["coord_store_id"] is None
+        # no key facts are held for a key the cockpit never saw sign; the enrol date and number ride beside since the
+        # signer names itself in the answer (0ed20bcf, key_facts gains enrolled_at and seq), so those two keys only
+        assert set(body["credentials"]) == {key.fp}
+        assert set(body["credentials"][key.fp]) <= {"enrolled_at", "seq"}, body["credentials"]
         assert not (world["qdir"] / DB_NAME).exists()                            # a read makes no store
         status, got = _call(url, "/cockpit/coord/drop", _plain("ph-" + "1" * 32))
         assert status == 200 and got["created"] is True and got["drop"]["surface"] == "phone", got
