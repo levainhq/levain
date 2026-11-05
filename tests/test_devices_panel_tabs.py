@@ -25,7 +25,7 @@ def _seed(port: int, httpd, active: list[str], revoked: list[str]) -> None:
     for label in [*revoked, *active]:
         ids[label] = _pair(port, label=label)[0]
     for label in revoked:
-        st, out, _ = _call(port, "POST", "/cockpit/pair/revoke", {"id": ids[label]}, token=T)
+        st, out, _ = _call(port, "POST", "/cockpit/pair/revoke", {"id": ids[label], "expect": [ids[label]], "mode": "family"}, token=T)
         assert st == 200, out
     # the server stamps with one-second resolution: set distinct stamps directly (later in the list = newer)
     db = sqlite3.connect(str(Path(httpd.broker.data_root) / "cockpit.db"))

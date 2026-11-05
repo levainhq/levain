@@ -1,7 +1,7 @@
 // levain devices_panel.js — the cockpit's Devices panel (per-device pairing, PAIR_DESIGN.md REV 1-6).
 //
 // Lists the paired devices (GET /cockpit/pair/devices.json), mints a one-time pairing link (POST /cockpit/pair/offer {label}),
-// revokes a device and its family (POST /cockpit/pair/revoke {id}), and turns pings on for this browser (OS-4, /webpush/*).
+// revokes a device behind a confirm card that names the family (POST /cockpit/pair/revoke-preview {id}, then /cockpit/pair/revoke {id, expect, mode}), and turns pings on for this browser (OS-4, /webpush/*).
 // It rides the page's own credential: the token the cockpit keeps in localStorage "levain_write_token" (dashboard_boot.js WRITE_TOKEN_KEY). Everything is drawn with textContent: this
 // file shares a page with that token, so it adds no HTML sink. A server with no writable cockpit answers 404 and the panel never
 // appears; a page with no usable credential shows nothing either.
@@ -37,7 +37,7 @@
     const f = shared().noPushWords;
     return typeof f === "function" ? f() : "This browser does not offer pings.";
   }
-  let pingRow = null, pingState = null, pingBtn = null, pushKey = "", pushAsked = false;
+  let confirmBox = null, pingTestBtn = null, pingRow = null, pingState = null, pingBtn = null, pushKey = "", pushAsked = false;
   const b64uToBytes = (t) => Uint8Array.from(atob(t.replace(/-/g, "+").replace(/_/g, "/") + "===".slice((t.length + 3) % 4)),
                                              (c) => c.charCodeAt(0));
 
@@ -126,6 +126,8 @@
       tabBtns[k] = b; tabsNav.appendChild(b);
     }
     body.appendChild(tabsNav);
+    confirmBox = el("div", "dev-confirm-host");
+    body.appendChild(confirmBox);
     list = el("div", "dev-list");
     list.setAttribute("role", "tabpanel");
     list.id = "dev-tabpanel";
@@ -140,6 +142,10 @@
     pingBtn.type = "button";
     pingBtn.addEventListener("click", () => { if (pingBtn.dataset.on === "1") turnOff(); else turnOn(); });
     pingRow.appendChild(pingBtn);
+    pingTestBtn = el("button", "dev-btn dev-test", "Send a test ping");
+    pingTestBtn.type = "button";
+    pingTestBtn.addEventListener("click", () => sendTestPing());
+    pingRow.appendChild(pingTestBtn);
     body.appendChild(pingRow);
 
     const form = el("form", "dev-offer");
@@ -469,11 +475,12 @@
     }
     if (!PUSH_OK) {
       // no live Turn on without the push API: the words say what to do instead
+      pingTestBtn.hidden = true;
       pingBtn.hidden = true; pingBtn.dataset.on = "";   // hidden, not disabled: a click that still arrives reaches turnOn(), which answers in words
       pingState.textContent = noPushSay();
       return;
     }
-    pingBtn.hidden = false;
+    pingBtn.hidden = false; pingTestBtn.hidden = false;
     const reg = await registration();
     const sub = reg ? await reg.pushManager.getSubscription().catch(() => null) : null;
     pingBtn.dataset.on = sub ? "1" : "";
@@ -527,6 +534,49 @@
       if (sub) await sub.unsubscribe().catch(() => {});
       say(shared().turnOnFailed ? shared().turnOnFailed(e) : "Could not turn pings on. (" + ((e && e.message) || e) + ")");
     } finally { pingBtn.disabled = false; pings(); }
+  }
+  // A test ping to THIS browser, any time (the first-run card is the only other place it was ever sent). The words are the
+  // pairing card's own (one copy); a subscription the push service has dropped, or none at all, says what to do instead.
+  // The wait is bounded here, not in api(): a POST the server committed late must not be taken for a failed one.
+  const TEST_WAIT_MS = 20000;
+  async function sendTestPing() {
+    if (pingTestBtn.disabled) return;
+    pingTestBtn.disabled = true; say("");
+    try {
+      const reg = PUSH_OK ? await registration() : null;
+      const sub = reg ? await reg.pushManager.getSubscription().catch(() => null) : null;
+      if (!sub) {
+        say(PUSH_OK && Notification.permission === "denied"
+          ? "This browser blocks notifications from this page. Allow them for this site in the browser or system settings, then turn pings on."
+          : "Pings are off in this browser, so there is nothing to test. Turn pings on first.");
+        return;
+      }
+      let timer = null;
+      const wait = new Promise((_, no) => { timer = setTimeout(() => no(new Error("no answer")), TEST_WAIT_MS); });
+      let res;
+      const call = api("POST", "/webpush/test", {});
+      call.catch(() => { /* a late rejection after the wait gave up is already said below */ });
+      try { res = await Promise.race([call, wait]); } finally { clearTimeout(timer); }
+      if (res.status === 200) {
+        // the ping goes to every live subscription of this DEVICE (its credential), which can be more than this browser's
+        // own (an older subscribe, another browser holding the same key), so the words count them and blame none of them
+        const d = (res.data && res.data.deliveries) || [];
+        const ok = d.filter((x) => x && x.status >= 200 && x.status < 300).length;
+        const gone = d.filter((x) => x && (x.status === 410 || x.status === 404)).length;
+        let words = typeof shared().testWords === "function" ? shared().testWords(res.data) : "The test ping was sent.";
+        if (gone && ok) {
+          words = "A test ping was sent to " + ok + " of this device's " + d.length + " subscriptions; the push service had dropped " + gone + ", now removed.";
+        } else if (gone && gone === d.length) {
+          words = (d.length === 1 ? "This device's subscription is gone" : "All " + d.length + " of this device's subscriptions are gone") + ": turn pings on again.";
+        } else if (gone) {
+          words = "No subscription of this device took the test ping (" + gone + " gone, " + (d.length - gone) + " refused): turn pings on again.";
+        }
+        say(words);
+      } else if (res.status === 403) {
+        say("This browser is not paired as a device, so it cannot be pinged. Turn pings on to pair it.");
+      } else say("The test ping was refused (" + ((res.data && res.data.message) || res.status) + ").");
+    } catch (_) { say("No answer came back, so the test ping may or may not arrive."); }
+    finally { pingTestBtn.disabled = false; }
   }
   async function turnOff() {
     pingBtn.disabled = true; say("");
@@ -629,20 +679,123 @@
     }
   }
 
+  // Revoke is a two-step: the server names the family a revoke would take, the operator sees it on a card, and the revoke
+  // carries that exact set back (`expect`) with the mode they chose. A set that moved in between comes back as family_changed
+  // with the fresh set, and the card is drawn again. Each Revoke click and each Cancel starts a new flow (flowGen): an answer
+  // for an older flow, landing after the operator moved on, never opens, replaces or closes the card.
+  let flowGen = 0;
+  function closeConfirm() { confirmBox.replaceChildren(); }
   async function revoke(d, btn) {
-    btn.disabled = true; say("");
-    let msg = "", revoked = false;
-    try {
-      const res = await api("POST", "/cockpit/pair/revoke", { id: d.id });
-      const n = (res.data.revoked || []).length;
-      if (res.status !== 200) msg = "Could not revoke " + named(d) + " (" + (res.data.message || res.status) + ").";
-      else { revoked = true; msg = n > 1 ? "Revoked " + named(d) + " and " + (n - 1) + " device(s) it had paired." : "Revoked " + named(d) + "."; }
-    } catch (_) { msg = "Could not reach the cockpit."; }
-    // G2: a failed revoke keeps a live button; a successful one leaves the row to the re-render (no second click on a revoked key)
-    if (!revoked && btn.isConnected) btn.disabled = false;
-    const listed = await refresh();
-    // after the refresh, so its own note does not wipe the revoke's answer; a refresh error after a good revoke is added, not lost
-    say(revoked && !listed ? msg + " Couldn't refresh the device list." : msg);
+    const g = ++flowGen;
+    btn.disabled = true; say(""); closeConfirm();
+    let res;
+    try { res = await api("POST", "/cockpit/pair/revoke-preview", { id: d.id }); }
+    catch (_) { if (btn.isConnected) btn.disabled = false; if (g === flowGen) say("Could not reach the cockpit."); return; }
+    if (btn.isConnected) btn.disabled = false;
+    if (g !== flowGen) return;
+    if (res.status !== 200 || !Array.isArray(res.data.family)) {
+      say("Could not check what revoking " + named(d) + " would take (" + (res.data.message || res.status) + ").");
+      return;
+    }
+    if (!res.data.family.some((f) => f.id === d.id)) { refresh(); say(named(d) + " was already revoked."); return; }
+    showConfirm(d, res.data, "");
+  }
+  // a paired-<id> credential name reads as that device's label when the list holds it; a surface name or the box reads as itself
+  function pairedByWords(name) {
+    const m = /^paired-(.+)$/.exec(String(name));
+    const hit = m ? lastDevs.find((x) => x.id === m[1]) : null;
+    return hit ? (hit.label || hit.id) : String(name);
+  }
+  function plural(n) { return n + (n === 1 ? " device" : " devices"); }
+  function showConfirm(d, pv, warn) {
+    const fam = pv.family, caller = pv.caller || null, now = Date.now(), g = flowGen;
+    const card = el("div", "dev-confirm");
+    card.setAttribute("role", "group");
+    card.setAttribute("aria-label", "Confirm revoking " + named(d));
+    card.appendChild(el("div", "dev-confirm-h", "Revoke " + (fam.length > 1 ? "these " + fam.length + " devices?" : named(d) + "?")));
+    if (warn) card.appendChild(el("div", "dev-link-w", warn));
+    card.appendChild(el("div", "dev-link-n", fam.length > 1
+      ? "Revoking " + named(d) + " also revokes every device it paired, and they all sign out at once. This cannot be undone."
+      : "It signs out at once. This cannot be undone."));
+    const ul = el("ul", "dev-confirm-list");
+    let hasSelf = false;
+    for (const f of fam) {
+      const li = el("li", "dev-confirm-item");
+      const nm = el("span", "dev-name", f.label || f.id);
+      nm.dir = "auto";
+      li.appendChild(nm);
+      // the sign-out words follow the action: the target itself is signed out by either button; a device it paired is
+      // signed out only by the family revoke ("Revoke only" hands it on, still signed in)
+      if (f.id === caller) {
+        hasSelf = true;
+        li.appendChild(el("span", "pill dev-pill dev-self", f.id === d.id
+          ? "THIS DEVICE: you will be signed out"
+          : "THIS DEVICE: signed out if you revoke all; “Revoke only” keeps it"));
+      }
+      li.appendChild(el("div", "dev-meta", (f.paired_by ? "paired by " + pairedByWords(f.paired_by) + " · " : "") + "last seen " + when(f.last_seen, now)));
+      ul.appendChild(li);
+    }
+    card.appendChild(ul);
+    const acts = el("div", "dev-confirm-acts");
+    const bs = [];
+    const go = async (mode, b) => {
+      for (const x of bs) x.disabled = true;
+      let msg = "", ok = false, changed = null;
+      try {
+        const r = await api("POST", "/cockpit/pair/revoke", { id: d.id, expect: fam.map((f) => f.id).sort(), mode: mode });
+        if (r.status === 409 && r.data.error === "family_changed" && Array.isArray(r.data.family)) changed = r.data;
+        else if (r.status !== 200) msg = "Could not revoke " + named(d) + " (" + (r.data.message || r.status) + ").";
+        else {
+          ok = true;
+          const n = (r.data.revoked || []).length, kept = (r.data.detached || []).length;
+          msg = mode === "only"
+            ? "Revoked " + named(d) + (kept ? "; the " + plural(kept) + " it paired stay paired." : ".")
+            : n > 1 ? "Revoked " + named(d) + " and " + (n - 1) + " device(s) it had paired." : "Revoked " + named(d) + ".";
+        }
+      } catch (_) { msg = "Could not reach the cockpit."; }
+      if (g !== flowGen) {    // the operator has moved on to another card: the outcome is said, the card left alone
+        await refresh();
+        if (msg) say(msg);
+        return;
+      }
+      if (changed &&!changed.family.some((f) => f.id === d.id)) {    // revoked elsewhere since the card was drawn
+        closeConfirm();
+        await refresh();
+        say(named(d) + " was already revoked.");
+        return;
+      }
+      if (changed) {      // the set moved since it was shown: nothing was revoked; show the fresh set
+        closeConfirm();
+        showConfirm(d, { family: changed.family, caller: caller }, "The devices changed while this was open. Nothing was revoked; check the list again.");
+        return;
+      }
+      closeConfirm();
+      const listed = await refresh();
+      say(ok && !listed ? msg + " Couldn't refresh the device list." : msg);
+    };
+    const kids = fam.length > 1;
+    if (kids) {
+      const only = el("button", "dev-btn dev-safe", "Revoke only " + named(d) + (d.id === caller ? " and sign this one out" : ""));
+      only.type = "button";
+      only.title = "The devices it paired stay paired and are handed to whatever paired it";
+      only.addEventListener("click", () => go("only", only));
+      bs.push(only); acts.appendChild(only);
+    }
+    const all = el("button", "dev-btn dev-danger",
+      kids ? "Revoke " + fam.length + " devices" + (hasSelf ? " and sign this one out" : "")
+           : "Revoke " + named(d) + (hasSelf ? " and sign this one out" : ""));
+    all.type = "button";
+    all.addEventListener("click", () => go("family", all));
+    bs.push(all); acts.appendChild(all);
+    card.appendChild(acts);
+    if (kids) card.appendChild(el("div", "dev-link-n", "\u201CRevoke only\u201D takes just " + named(d) + "; the others keep working."));
+    const cancel = el("button", "dev-linkbtn", "Cancel");
+    cancel.type = "button";
+    cancel.addEventListener("click", () => { flowGen++; closeConfirm(); });
+    card.appendChild(cancel);
+    confirmBox.replaceChildren(card);
+    try { card.scrollIntoView({ block: "nearest" }); } catch (_) { /* no scrolling here */ }
+    (kids ? bs[0] : all).focus();
   }
 
   // ---- Presence (1b: you decide, sensing informs). One record, three settings, one sentence. The masthead chip and the sheet it

@@ -1287,31 +1287,54 @@ class CockpitDB:
                     if conn.execute("SELECT 1 FROM paired_devices WHERE id = ?", (d,)).fetchone() is None:
                         raise PairingError(f"no such device: {d}")
             _expire(conn, now)
-            # RS-5: the closure's join is the credential-name rule itself, stated once here
-            assert PAIRED_PREFIX == "paired-", "the closure below joins on the literal 'paired-' prefix"
-            family: list[str] = []
-            for root in roots:
-                for (member,) in conn.execute(
-                        "WITH RECURSIVE fam(id) AS (SELECT id FROM paired_devices WHERE id = ? "
-                        "UNION SELECT d.id FROM paired_devices d JOIN fam ON d.paired_by = 'paired-' || fam.id) "
-                        "SELECT id FROM fam", (root,)).fetchall():
-                    if member not in family:
-                        family.append(member)
-            revoked: list[str] = []
-            for member in family:
-                if not conn.execute("UPDATE paired_devices SET revoked_at = ? WHERE id = ? AND revoked_at IS NULL",
-                                    (stamp, member)).rowcount:
-                    continue
-                name = PAIRED_PREFIX + member
-                conn.execute("UPDATE pair_offers SET expires = ? WHERE minted_by = ? AND used_at IS NULL "
-                             "AND expires > ?", (stamp, name, stamp))
-                conn.execute("UPDATE pair_short_offer SET expires = ? WHERE minted_by = ? AND used_at IS NULL "
-                             "AND expires > ?", (stamp, name, stamp))
-                conn.execute("INSERT OR IGNORE INTO tokens (name, generation) VALUES (?, 1)", (name,))
-                (gen,) = conn.execute("SELECT generation FROM tokens WHERE name = ?", (name,)).fetchone()
-                _rotate_in(conn, name, expect_generation=int(gen), new_generation=int(gen) + 1, by=by, stamp=stamp)
-                revoked.append(member)
+            family = _family_closure(conn, roots)
+            revoked = _revoke_members(conn, family, by=by, stamp=stamp)
         return revoked
+
+    def revoke_preview(self, device_id: str) -> dict[str, Any]:
+        """The set a family revoke of ``device_id`` would take right now: ``{target, family: [{id, label, paired_by,
+        last_seen}]}``, the not-yet-revoked members of the one closure :meth:`revoke_confirmed` checks against, oldest
+        first. A read; an unknown id raises :class:`PairingError`."""
+        _check_device_id(device_id)
+        with self.read() as conn:
+            if conn.execute("SELECT 1 FROM paired_devices WHERE id = ?", (device_id,)).fetchone() is None:
+                raise PairingError(f"no such device: {device_id}")
+            return {"target": device_id, "family": _live_family_rows(conn, device_id)}
+
+    def revoke_confirmed(self, device_id: str, *, expect: "Sequence[str]", mode: str, by: str,
+                         now: datetime) -> dict[str, Any]:
+        """Revoke ``device_id`` bound to what the operator saw, in ONE transaction. ``expect`` is the preview's family
+        (ids); when the live closure differs, nothing moves and :class:`FamilyChanged` carries the fresh rows. Mode
+        ``family`` is :meth:`revoke_devices` for that one root; mode ``only`` revokes the target alone and re-parents
+        each of its not-yet-revoked direct children to the target's own ``paired_by`` (their credentials are not
+        rotated). Returns ``{revoked, detached}``, what this call committed: a target already revoked re-parents
+        nobody."""
+        if not isinstance(mode, str) or mode not in REVOKE_MODES:
+            raise PairingError(f"mode is one of {sorted(REVOKE_MODES)}")
+        _check_device_id(device_id)
+        if (not isinstance(expect, (list, tuple)) or any(not isinstance(e, str) for e in expect)):
+            raise PairingError("expect is a list of device ids")
+        stamp = utc_stamp(now)
+        with self.write() as conn:
+            row = conn.execute("SELECT paired_by FROM paired_devices WHERE id = ?", (device_id,)).fetchone()
+            if row is None:
+                raise PairingError(f"no such device: {device_id}")
+            _expire(conn, now)
+            fresh = _live_family_rows(conn, device_id)
+            if sorted(f["id"] for f in fresh) != sorted(set(expect)):
+                raise FamilyChanged(fresh)
+            detached: list[str] = []
+            if mode == "family":
+                revoked = _revoke_members(conn, _family_closure(conn, [device_id]), by=by, stamp=stamp)
+            else:
+                revoked = _revoke_members(conn, [device_id], by=by, stamp=stamp)
+                if revoked:     # the children are handed on only when this call took the target
+                    detached = [r[0] for r in conn.execute(
+                        "SELECT id FROM paired_devices WHERE paired_by = ? AND revoked_at IS NULL AND id != ? "
+                        "ORDER BY rowid", (PAIRED_PREFIX + device_id, device_id)).fetchall()]
+                    for child in detached:
+                        conn.execute("UPDATE paired_devices SET paired_by = ? WHERE id = ?", (row["paired_by"], child))
+        return {"revoked": revoked, "detached": detached}
 
     def list_devices(self) -> list[dict[str, Any]]:
         """Every paired device, oldest first: id, label, created, last_seen, revoked_at, paired_by. Never a hash."""
@@ -1600,6 +1623,68 @@ def _finish_due(row: sqlite3.Row) -> datetime:
         return parse_stamp(row["decided_at"])
     except ConsentError as exc:
         raise _corrupt(row["operation_id"], "a due time does not parse") from exc
+
+
+REVOKE_MODES = frozenset({"family", "only"})
+
+
+class FamilyChanged(Exception):
+    """A confirmed revoke's expected family no longer matches the live closure; ``family`` is the fresh set."""
+
+    def __init__(self, family: "list[dict[str, Any]]") -> None:
+        super().__init__("the family changed since it was shown")
+        self.family = family
+
+
+def _check_device_id(d: Any) -> None:
+    if not isinstance(d, str) or _DEVICE_ID.fullmatch(d) is None:
+        raise PairingError(f"not a device id: {d!r}")
+
+
+def _family_closure(conn: sqlite3.Connection, roots: "Sequence[str]") -> "list[str]":
+    """The descendant closure of ``roots`` over ``paired_by = 'paired-' || id``, roots included, in discovery order:
+    the ONE definition a preview, a confirmed revoke and the cascade all use."""
+    # RS-5: the closure's join is the credential-name rule itself, stated once here
+    assert PAIRED_PREFIX == "paired-", "the closure below joins on the literal 'paired-' prefix"
+    family: list[str] = []
+    for root in roots:
+        for (member,) in conn.execute(
+                "WITH RECURSIVE fam(id) AS (SELECT id FROM paired_devices WHERE id = ? "
+                "UNION SELECT d.id FROM paired_devices d JOIN fam ON d.paired_by = 'paired-' || fam.id) "
+                "SELECT id FROM fam", (root,)).fetchall():
+            if member not in family:
+                family.append(member)
+    return family
+
+
+def _live_family_rows(conn: sqlite3.Connection, root: str) -> "list[dict[str, Any]]":
+    out: list[dict[str, Any]] = []
+    for member in _family_closure(conn, [root]):
+        r = conn.execute("SELECT id, label, paired_by, last_seen FROM paired_devices "
+                         "WHERE id = ? AND revoked_at IS NULL", (member,)).fetchone()
+        if r is not None:
+            out.append({"id": r["id"], "label": r["label"], "paired_by": r["paired_by"], "last_seen": r["last_seen"]})
+    return out
+
+
+def _revoke_members(conn: sqlite3.Connection, family: "Sequence[str]", *, by: str, stamp: str) -> "list[str]":
+    """Revoke each not-yet-revoked member inside the caller's open write transaction: ``revoked_at``, its unused
+    offers expired, its broker generation rotated (which cancels its WAITING pendings)."""
+    revoked: list[str] = []
+    for member in family:
+        if not conn.execute("UPDATE paired_devices SET revoked_at = ? WHERE id = ? AND revoked_at IS NULL",
+                            (stamp, member)).rowcount:
+            continue
+        name = PAIRED_PREFIX + member
+        conn.execute("UPDATE pair_offers SET expires = ? WHERE minted_by = ? AND used_at IS NULL "
+                     "AND expires > ?", (stamp, name, stamp))
+        conn.execute("UPDATE pair_short_offer SET expires = ? WHERE minted_by = ? AND used_at IS NULL "
+                     "AND expires > ?", (stamp, name, stamp))
+        conn.execute("INSERT OR IGNORE INTO tokens (name, generation) VALUES (?, 1)", (name,))
+        (gen,) = conn.execute("SELECT generation FROM tokens WHERE name = ?", (name,)).fetchone()
+        _rotate_in(conn, name, expect_generation=int(gen), new_generation=int(gen) + 1, by=by, stamp=stamp)
+        revoked.append(member)
+    return revoked
 
 
 def _rotate_in(conn: sqlite3.Connection, name: str, *, expect_generation: int, new_generation: int, by: str,

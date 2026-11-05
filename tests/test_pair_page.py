@@ -95,8 +95,10 @@ def test_the_panel_reads_through_one_shared_promise_and_no_flag_can_stick() -> N
     assert re.search(r"let running = null, rerun = false, gone = false, refused = \"\";", js)
     assert "if (running) { rerun = true; return running; }" in js
     assert re.search(r"finally \{ running = null;", js)
-    # G2: the revoke's button is re-enabled only when the revoke FAILED
-    assert "if (!revoked && btn.isConnected) btn.disabled = false;" in js
+    # G2: the row's Revoke only opens the confirm card, so it is re-enabled once the preview answered; the card's own buttons are
+    # disabled while the revoke runs and the card closes on every answer, so no second click reaches a revoked key
+    assert "if (btn.isConnected) btn.disabled = false;" in js
+    assert "for (const x of bs) x.disabled = true;" in js and "closeConfirm();" in js
 
 
 def test_a_403_refuses_that_token_only_and_a_different_token_revives_the_panel() -> None:
@@ -121,7 +123,7 @@ def test_only_the_devices_list_read_has_a_timeout_never_the_offer_or_revoke_post
             assert "READ_TIMEOUT_MS" in line, line
         else:
             assert "READ_TIMEOUT_MS" not in line and "timeout" not in line.lower(), line
-    assert len(re.findall(r'api\("POST"', js)) == 7      # Notify tokens' mint and revoke ride one call (S4.2), offer, revoke, the pings subscribe and unsubscribe (OS-4), the presence write (one call to /webpush/presence/set; 1b retired the policy write), the tap-token change (one call, the route an argument)
+    assert len(re.findall(r'api\("POST"', js)) == 9      # the test ping, Notify tokens' mint and revoke ride one call (S4.2), offer, the revoke preview, revoke, the pings subscribe and unsubscribe (OS-4), the presence write (one call to /webpush/presence/set; 1b retired the policy write), the tap-token change (one call, the route an argument)
 
 
 def _fetch_calls(js: str) -> "list[str]":

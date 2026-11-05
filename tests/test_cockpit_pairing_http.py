@@ -158,7 +158,7 @@ def test_rp10_4_revoke_refuses_the_next_request_cascades_and_rotates(src) -> Non
         assert (st, held["state"]) == (200, "WAITING"), held
         db = httpd.broker.active_db()
         assert db.token_generation(PAIRED_PREFIX + a) == 1
-        st, out, _ = _call(port, "POST", "/cockpit/pair/revoke", {"id": a}, token=ts)   # any credential may revoke
+        st, out, _ = _call(port, "POST", "/cockpit/pair/revoke", {"id": a, "expect": sorted([a, b]), "mode": "family"}, token=ts)   # any credential may revoke
         assert st == 200 and sorted(out["revoked"]) == sorted([a, b])
         for tok in (ta, tb):
             assert _call(port, "GET", "/cockpit/manifest.json", token=tok, headers=PROXY)[0] == 403
@@ -166,9 +166,9 @@ def test_rp10_4_revoke_refuses_the_next_request_cascades_and_rotates(src) -> Non
         assert _call(port, "GET", "/cockpit/manifest.json", token=ts, headers=PROXY)[0] == 200
         assert db.token_generation(PAIRED_PREFIX + a) == 2
         assert db.outcome(held["pending_id"]).state == "CANCELLED"
-        st, out, _ = _call(port, "POST", "/cockpit/pair/revoke", {"id": "d-0123456789ab"}, token=T)
+        st, out, _ = _call(port, "POST", "/cockpit/pair/revoke", {"id": "d-0123456789ab", "expect": [], "mode": "family"}, token=T)
         assert st == 404
-        st, out, _ = _call(port, "POST", "/cockpit/pair/revoke", {"id": "browser"}, token=T)
+        st, out, _ = _call(port, "POST", "/cockpit/pair/revoke", {"id": "browser", "expect": [], "mode": "family"}, token=T)
         assert st == 400           # RP-7: a surface token is never revocable here
 
 
@@ -181,7 +181,7 @@ def test_rs1_a_revoke_is_seen_by_the_next_request_on_the_same_keep_alive_connect
         st, _o, _ = _call(port, "GET", "/cockpit/manifest.json", token=tok, headers=PROXY, conn=keep)
         sock = keep.sock
         assert st == 200 and sock is not None
-        assert _call(port, "POST", "/cockpit/pair/revoke", {"id": device}, token=T)[0] == 200
+        assert _call(port, "POST", "/cockpit/pair/revoke", {"id": device, "expect": [device], "mode": "family"}, token=T)[0] == 200
         st, out, _ = _call(port, "GET", "/cockpit/manifest.json", token=tok, headers=PROXY, conn=keep)
         assert keep.sock is sock, "the second request must ride the same connection"
         assert st == 403, out
@@ -361,7 +361,7 @@ def test_ru3_a_revoke_during_a_steady_event_flow_ends_the_stream_before_its_next
         try:
             time.sleep(0.4)
             assert len(_ids(chunks)) > 3, "the flow is steady before the revoke"
-            assert _call(port, "POST", "/cockpit/pair/revoke", {"id": device}, token=T)[0] == 200
+            assert _call(port, "POST", "/cockpit/pair/revoke", {"id": device, "expect": [device], "mode": "family"}, token=T)[0] == 200
             with w._lock:
                 last_published = w._seq
             pump.join(5)
@@ -502,7 +502,7 @@ def test_f5_every_pair_503_carries_retry_after_and_the_claims_closes(src, quick_
     with _standby(src) as (_live, port, _tok, _h):
         for method, path, body in (("GET", "/cockpit/pair/devices.json", None),
                                    ("POST", "/cockpit/pair/offer", {}),
-                                   ("POST", "/cockpit/pair/revoke", {"id": "d-0123456789ab"})):
+                                   ("POST", "/cockpit/pair/revoke", {"id": "d-0123456789ab", "expect": [], "mode": "family"})):
             st, out, hdrs = _call(port, method, path, body, token=T)
             assert (st, out.get("error"), hdrs.get("retry-after")) == (503, "broker_unavailable", "2"), (path, hdrs)
         st, out, hdrs = _call(port, "POST", "/cockpit/pair/claim", {"code": "x" * 22})
