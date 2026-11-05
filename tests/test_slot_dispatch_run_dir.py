@@ -104,6 +104,25 @@ def test_a_fresh_linux_setup_starts_the_run_server_before_it_writes_the_operator
     assert start < record          # the record is setup's LAST act (§23), so the server's first start finds none
 
 
+def test_run_sock_is_group_writable_under_a_default_umask():
+    """connect() needs write on the socket inode: a levain-control member reaches it through the dir's group (L3 r1 M1)."""
+    import shutil
+    import tempfile
+    from pathlib import Path
+    from levain.slot.services import dispatch_run as D
+    short = Path(tempfile.mkdtemp(dir="/tmp"))      # AF_UNIX paths are short; pytest's macOS tmp_path is too long
+    old = os.umask(0o022)
+    try:
+        sock = D._bind(short / "run.sock")
+    finally:
+        os.umask(old)
+    try:
+        assert stat.S_IMODE(os.lstat(short / "run.sock").st_mode) & 0o060 == 0o060
+    finally:
+        sock.close()
+        shutil.rmtree(short)
+
+
 def _unit_lines(svc):
     return dict(line.split("=", 1) for line in units.systemd_unit_text(svc).splitlines() if "=" in line)
 
