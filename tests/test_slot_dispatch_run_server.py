@@ -160,7 +160,7 @@ def test_the_check_is_one_named_function_called_before_the_spawn_and_again_befor
     # the third call is the SYNC re-judge of a running session (levain 34, D2): the same verify, never a second authority
     assert text.count("def verify_point_of_use(") == 1 and text.count("self._verify(") == 3
     rejudge = text[text.index("def _rejudge("):]
-    assert rejudge.index("self._verify(h.proof, h.exposure, h.claims)") < rejudge.index("self._end(h.key, 0.0)")
+    assert rejudge.index("self._verify(h.proof, h.exposure, claims)") < rejudge.index("self._end(h.key, 0.0)")
     launch = text[text.index('if op == "LAUNCH":'):]
     assert launch.index("self._verify(") < launch.index("self._pool()") < launch.index("self.launcher.spawn(")
     release = text[text.index('if op == "RELEASE":'):]
@@ -620,9 +620,10 @@ def wire(rig, tmp_path):
     w.close()
 
 
-def _released(rig, wire, key="s-00000000000000b1"):
-    """A synced, launched and RELEASED session of a fresh subscription link; returns (oid, holder socket)."""
-    oid = _occurrence(rig, billing="subscription", exposure=EXP)
+def _released(rig, wire, key="s-00000000000000b1", **occ):
+    """A synced, launched and RELEASED session of a fresh subscription link; returns (oid, holder socket). ``occ``
+    goes to ``_occurrence`` (a second session needs another spec ``name``, or its claim is a duplicate)."""
+    oid = _occurrence(rig, billing="subscription", exposure=EXP, **occ)
     assert wire.sync()["ok"] is True
     sock = wire.conn()
     assert wire.launch(sock, oid, key=key)["ok"] is True
@@ -685,7 +686,31 @@ def test_a_revoke_synced_before_the_release_makes_the_pending_release_refuse(rig
     assert wire.sync()["ok"] is True
     assert _ended(wire)
     gone = wire.call(sock, "RELEASE", ledger_head=mine, bar=NO_BAR)
-    assert gone["ok"] is False and gone["refused"] in ("session-ended", "link-not-standing")
+    # the RELEASE's own verify refuses first (the revoked link): this case proves the RELEASE starts nothing; the case
+    # below proves the ``ending`` mark alone blocks it (complement L3 r1, tests)
+    assert gone["ok"] is False and gone["refused"] == "link-not-standing", gone
+    assert wire.runtime.children[0].released is False and wire.runtime.ended == ["sess-1"]
+    sock.close()
+
+
+def test_an_end_begun_by_the_rejudge_blocks_a_release_whose_own_verify_passes(rig, wire):
+    """The ``ending`` mark, alone: the re-judge refuses (standing) while the RELEASE's own verify passes, so only the
+    END the re-judge began can make the RELEASE refuse, and it does, by ``session-ended``."""
+    oid = _occurrence(rig, billing="subscription", exposure=EXP)
+    assert wire.sync()["ok"] is True
+    sock = wire.conn()
+    assert wire.launch(sock, oid)["ok"] is True
+    real = wire.server._verify
+
+    def verify(proof, exposure, claims=None):
+        if claims is not None and claims.rejudge:
+            raise L.LauncherRefused("link-not-standing", "the re-judge's verdict only")
+        return real(proof, exposure, claims)
+    wire.server._verify = verify
+    assert wire.sync()["ok"] is True
+    assert _ended(wire)
+    gone = wire.call(sock, "RELEASE", ledger_head=wire.head(), bar=NO_BAR)
+    assert (gone["ok"], gone.get("refused")) == (False, "session-ended"), gone
     assert wire.runtime.children[0].released is False and wire.runtime.ended == ["sess-1"]
     sock.close()
 
@@ -761,6 +786,97 @@ def test_the_sync_answer_does_not_wait_for_the_rejudge(rig, wire):
     assert time.monotonic() - t0 < 2.0 and entered.wait(5)
     gate.set()
     assert _rejudge_idle(wire.server)
+    sock.close()
+
+
+# --- levain 34, D2 fix round 1 (L3 r1) ------------------------------------------------------------------------------------
+
+B2 = "s-00000000000000b2"
+
+
+def test_an_end_that_raises_for_one_holder_skips_no_other_and_the_next_sync_retries_it(rig, wire):
+    """L3 r1 MED (four seats): the END of the first revoked holder raises; the second is still ENDed in the same pass,
+    and the first, whose END never started, is ENDed by the next (empty) SYNC."""
+    _, s1 = _released(rig, wire)
+    oid, s2 = _released(rig, wire, key=B2, name="research-bot")
+    real_end = wire.server._end
+
+    def end(key, deadline_s):
+        if key == "s-00000000000000b1":
+            raise RuntimeError("can't start new thread")
+        return real_end(key, deadline_s)
+    wire.server._end = end
+    _sign(rig, oid, "key")                                            # the born signer of both links
+    assert wire.sync()["ok"] is True
+    assert _ended(wire, B2), "the raise for holder 1 skipped holder 2"
+    assert _rejudge_idle(wire.server)
+    assert wire.launcher_index("s-00000000000000b1").get("state") != "ended"
+    wire.server._end = real_end
+    assert wire.sync([])["ok"] is True
+    assert _ended(wire) and len(wire.server._jobs) == 2
+    s1.close()
+    s2.close()
+
+
+def test_a_rejudge_worker_that_cannot_start_still_runs_the_pass(rig, wire, monkeypatch):
+    """L3 r1 MED (codex, deepseek): ``Thread.start`` fails for the re-judge worker (thread exhaustion). The SYNC that
+    carried the revoke is the last one, so no later SYNC can pick the pass up; it runs on the SYNC's own thread."""
+    oid, sock = _released(rig, wire)
+    refused = []
+
+    class NoWorker(threading.Thread):
+        def start(self):
+            if getattr(self, "_target", None) is not None and getattr(self._target, "__name__", "") == "_rejudge_loop":
+                refused.append(1)
+                raise RuntimeError("can't start new thread")
+            return super().start()
+    monkeypatch.setattr(D.threading, "Thread", NoWorker)
+    _sign(rig, oid, "agent")
+    assert wire.sync()["ok"] is True                                  # the only SYNC after the revoke
+    assert refused == [1] and not wire.server._rejudge_running
+    assert _ended(wire), "a worker that could not start lost the committed revoke"
+    assert wire.runtime.ended == ["sess-1"]
+    sock.close()
+
+
+def test_an_end_job_whose_thread_cannot_start_is_unproven_not_in_flight_for_good(rig, wire, monkeypatch):
+    """A failed ``Thread.start`` for an END job used to leave a job that is never done; the re-judge would then skip
+    the holder as 'in flight' forever. It is finished UNPROVEN instead, and the next SYNC starts a fresh one."""
+    oid, sock = _released(rig, wire)
+    refused = []
+
+    class NoEndJob(threading.Thread):
+        def start(self):
+            if getattr(self, "_target", None) is not None and getattr(self._target, "__name__", "") == "_run_end" \
+                    and not refused:
+                refused.append(1)
+                raise RuntimeError("can't start new thread")
+            return super().start()
+    monkeypatch.setattr(D.threading, "Thread", NoEndJob)
+    _sign(rig, oid, "agent")
+    assert wire.sync()["ok"] is True
+    assert _rejudge_idle(wire.server) and refused == [1]
+    job = wire.server._jobs["s-00000000000000b1"]
+    assert job.done.is_set() and job.result.terminated is False and wire.runtime.ended == []
+    assert wire.sync([])["ok"] is True
+    assert _ended(wire) and wire.runtime.ended == ["sess-1"]
+    sock.close()
+
+
+def test_an_expiry_alone_ends_no_running_session(rig, wire):
+    """L3 r1 complement LOW 3: the design's stop reasons are revoke_agent / revoke_grant / revoke_key (and bar, raise).
+    The session's link expires while it runs and an unrelated SYNC lands: the re-judge ran and nothing ended."""
+    oid, sock = _released(rig, wire)
+    calls = _count_verifies(wire)
+    rig.world.clock.now += timedelta(days=30)                         # past the link's 29-day expiry
+    rig.link()                                                        # an unrelated row, signed after the expiry
+    assert wire.sync()["ok"] is True
+    assert _rejudge_idle(wire.server)
+    assert calls, "the re-judge never ran, so this case proves nothing"
+    assert wire.runtime.ended == [] and wire.launcher_index("s-00000000000000b1").get("state") != "ended"
+    h = wire.server._live["s-00000000000000b1"]
+    with pytest.raises(L.LauncherRefused, match="link-not-live"):     # the same link at a point of use still refuses
+        wire.server._verify(h.proof, h.exposure, D.FrameClaims((wire.head()["seq"], wire.head()["hash"]), (False, 0)))
     sock.close()
 
 

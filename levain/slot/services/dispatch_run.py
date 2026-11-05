@@ -15,13 +15,19 @@ uid's client (:mod:`levain.agents.session_client`, wire ``levain-run/1``) on a u
   the operator-uid agent tick reading the operator's own ledger. After a SYNC that landed, a worker thread (the SYNC's
   answer is not delayed) runs the SAME ``verify`` over every holder that has a child, with its LAUNCH proof, exposure
   and claims: a STANDING refusal ENDs the session through the key's one END job (``ending`` is marked, so a pending
-  RELEASE refuses); a TRANSIENT one ends nothing and logs, and the next SYNC (an empty one included) judges again. No new
+  RELEASE refuses); a TRANSIENT one ends nothing and logs, and the next SYNC (an empty one included) judges again. A
+  session whose END job finished UNPROVEN is judged again on every SYNC, and a standing refusal retries its END; one
+  whose job is in flight or proven is skipped. Expiry is not judged here (``FrameClaims.rejudge``): the design's stop reasons are revoke_agent,
+  revoke_grant, revoke_key, bar and raise, and an expiry never stopped a released session. No new
   wire op and no new authority: the replica never moves backward, so a revoke judged once stays judged whatever a
   restored operator ledger later offers. The bar half is not seen here (bars travel only in frames; the held claims
   carry the LAUNCH's), so a bar stays the tick's. A ``raise`` that tightens a link's budgets below a running session's
   exposure refuses ``exposure-over-link`` and so ENDs that session: the verifier was reused unchanged on purpose, that
   was the recommended reading (design section 5), and it stands as the default until Phill answers the question put to
-  him (skipping the exposure check in the re-judge is the cheap alternative).
+  him (skipping the exposure check in the re-judge is the cheap alternative). Known edges (L3 r1 LOWs, accepted): a
+  transient refusal in the last pass before the SYNCs stop waits for the operator tick, since nothing re-runs a pass on a
+  timer. A re-judge END of a never-released child does not ABORT it first; RELEASE's refusal or the holder's EOF cleanup
+  ABORTs it later, and that ABORT on a child the END already stopped is caught and harmless.
 * **The holder is the lifeline** (design 3.4): EOF before RELEASE is ABORT (nothing ran) then END, EOF after RELEASE is
   END, once; a session whose holder is gone stays registered only while its END is unproven. The holder's END is the
   key's END job (below), so a reaper's END on the same key joins it; every END attempt the child makes itself takes the
@@ -121,7 +127,7 @@ _END_STRIPES = 64
 def verify_point_of_use(proof: C.LinkProof, exposure: Optional[ActionExposure], *,
                         replay: Callable[[], Any], now: Callable[[], datetime],
                         bar_of: Callable[[str], tuple[bool, int]],
-                        verify_sig: Optional[Callable[..., bool]] = None) -> None:
+                        verify_sig: Optional[Callable[..., bool]] = None, judge_time: bool = True) -> None:
     """The run server's whole authority check for one fire. Raises :class:`LauncherRefused` (standing, or transient for
     a ledger or store that cannot be read); returns None when the fire may go on.
 
@@ -136,6 +142,10 @@ def verify_point_of_use(proof: C.LinkProof, exposure: Optional[ActionExposure], 
     3. the link is unexpired, was born after its agent's last revoke and after the last closed bar's revoke
        (:func:`levain.authority.agent_link_arms`), and the agent has no open bar (``bar_of``);
     4. the requested exposure (calls and tunnel bytes) is inside the link's per-run budgets, on a subscription link.
+
+    ``judge_time=False`` (the SYNC re-judge of a session that is already running, never a LAUNCH or a RELEASE) drops
+    the time half of 3, expiry and the clock-behind-the-log check (:func:`levain.authority.agent_link_unrevoked`):
+    an expiry was never a reason to stop a running session.
 
     Replacing this with a stronger per-occurrence check touches this function only."""
     verify_sig = verify_sig or _default_verify_sig()
@@ -160,7 +170,9 @@ def verify_point_of_use(proof: C.LinkProof, exposure: Optional[ActionExposure], 
                               reason_class="transient") from None
     if barred:
         raise LauncherRefused("agent-barred", "a revoke is open for this agent")
-    if not _auth.agent_link_arms(state, proof.link_id, now=now(), closed_bar_revoke_seq=closed):
+    live = (_auth.agent_link_arms(state, proof.link_id, now=now(), closed_bar_revoke_seq=closed) if judge_time
+            else _auth.agent_link_unrevoked(state, proof.link_id, closed_bar_revoke_seq=closed))
+    if not live:
         raise LauncherRefused("link-not-live", "the link is expired or was revoked")
     billing, calls, tunnel = _auth.agent_link_terms(grant)
     if billing != "subscription":
@@ -199,9 +211,11 @@ def _default_verify_sig() -> Callable[..., bool]:
 class FrameClaims:
     """What a LAUNCH or RELEASE frame says about the operator's side: ``ledger_head`` is the client's verified
     ``(seq, hash)``; ``bar`` is ``(open bar?, highest closed bar's revoke_seq)`` of the agent. Neither is trusted beyond
-    this: the replica must hold the head (it may be ahead of it), the bar is only bounded by the head's seq."""
+    this: the replica must hold the head (it may be ahead of it), the bar is only bounded by the head's seq.
+    ``rejudge`` is never read from a frame: the server sets it for its own SYNC re-judge, which judges no expiry."""
     ledger_head: tuple[int, str]
     bar: tuple[bool, int]
+    rejudge: bool = False
 
 
 def replica_verifier(replica: AuthorityReplica, *,
@@ -243,7 +257,7 @@ def replica_verifier(replica: AuthorityReplica, *,
         if held != digest:                  # the replica holds that seq (append-only, verified): another chain
             raise LauncherRefused("ledger-fork", "the claimed head is not on the replica's chain")
         verify_point_of_use(proof, exposure, replay=lambda: state, now=now, bar_of=lambda agent: (barred, closed),
-                            verify_sig=verify_sig)
+                            verify_sig=verify_sig, judge_time=not claims.rejudge)
     return verify
 
 
@@ -591,22 +605,27 @@ class RunServer:
     def _rejudge_soon(self) -> None:
         """After a SYNC that landed: have a worker re-judge every live holder (module docstring, "SYNC re-judges"). One
         worker at a time; a SYNC that lands during a pass sets ``_rejudge_again`` so that pass runs once more and sees
-        its rows. Never raises, never waits: the SYNC's answer is not delayed."""
+        its rows. Never raises, never waits: the SYNC's answer is not delayed, except in one case. When the worker
+        thread cannot be started (thread exhaustion), the pass runs HERE, on the SYNC's own thread, before it answers
+        (L3 r1: a swallowed start lost a committed revoke on a quiet box). A delayed answer is the price of never losing a
+        pass; a pending flag waiting for a next SYNC that may never come was the alternative, and it can lose one."""
+        with self._mu:
+            if self._closing:
+                return
+            self._rejudge_again = True
+            if self._rejudge_running:
+                return
+            self._rejudge_running = True
         try:
-            with self._mu:
-                if self._closing:
-                    return
-                self._rejudge_again = True
-                if self._rejudge_running:
-                    return
-                self._rejudge_running = True
             threading.Thread(target=self._rejudge_loop, daemon=True).start()
         except Exception:  # noqa: BLE001
-            with self._mu:
-                self._rejudge_running = False
-            _log.warning("a SYNC re-judge could not start")
+            _log.warning("a SYNC re-judge worker could not start; the pass runs on the SYNC's thread")
+            self._rejudge_loop()
 
     def _rejudge_loop(self) -> None:
+        """Passes until no SYNC asked for another. Every exit clears ``_rejudge_running``, and the exception exit
+        re-checks ``_rejudge_again`` (a SYNC that landed during the pass) and asks for a fresh worker, so a raise loses no
+        queued pass (L3 r1). Each holder is judged in its own ``try``: one holder that raises skips no other."""
         try:
             while True:
                 with self._mu:
@@ -617,29 +636,49 @@ class RunServer:
                     self._rejudge_again = False
                     holders = list(self._live.values())
                 for h in holders:
-                    self._rejudge(h)
+                    try:
+                        self._rejudge(h)
+                    except Exception as exc:  # noqa: BLE001
+                        _log.warning("SYNC re-judge of %s raised (%s)", h.key, type(exc).__name__)
         except BaseException:  # noqa: BLE001 - the flag must come back, whatever raised
             with self._mu:
                 self._rejudge_running = False
+                again = self._rejudge_again and not self._closing
             _log.warning("a SYNC re-judge pass raised")
+            if again:
+                self._rejudge_soon()
 
     def _rejudge(self, h: _Holder) -> None:
-        """One holder, judged by the very ``verify`` LAUNCH and RELEASE call, with its LAUNCH proof, exposure and claims.
-        A holder with no child yet (its RELEASE judges it), one whose END began, and one with an END job are skipped.
+        """One holder, judged by the very ``verify`` LAUNCH and RELEASE call, with its LAUNCH proof, exposure and claims
+        (marked ``rejudge``, so expiry is not judged: :func:`verify_point_of_use`). A holder with no child yet is skipped
+        (its RELEASE judges it), and so is one whose key's END job is in flight or PROVEN. One whose END began but whose
+        last job finished UNPROVEN is judged again, and a standing refusal starts a fresh job (:meth:`_start_end`): a
+        revoked session whose first END failed is retried on every SYNC, never skipped for good (codex HIGH, L3 r1).
         STANDING refusal: ``_end(key, 0.0)`` (the END job, ``ending`` marked, no wait); TRANSIENT or unexpected: nothing
-        ends, one log line."""
-        if h.child is None or h.ending or h.job is not None:
+        ends, one log line. The verify and the END are each caught here."""
+        if h.child is None:
             return
+        if h.ending or h.job is not None:
+            with self._mu:
+                job = self._jobs.get(h.key)
+            if job is not None and (not job.done.is_set() or job.result.terminated is True):
+                return
+        claims = None if h.claims is None else FrameClaims(h.claims.ledger_head, h.claims.bar, rejudge=True)
         try:
-            self._verify(h.proof, h.exposure, h.claims)
+            self._verify(h.proof, h.exposure, claims)
+            return
         except LauncherRefused as exc:
             if exc.reason_class != "standing":
                 _log.warning("SYNC re-judge of %s could not decide (%s); nothing ended", h.key, exc.name)
                 return
             _log.warning("SYNC re-judge of %s: its authority no longer holds (%s); ENDing it", h.key, exc.name)
-            self._end(h.key, 0.0)
         except Exception as exc:  # noqa: BLE001 - a verifier that broke is not a revoke
             _log.warning("SYNC re-judge of %s raised (%s); nothing ended", h.key, type(exc).__name__)
+            return
+        try:
+            self._end(h.key, 0.0)
+        except Exception as exc:  # noqa: BLE001 - the next SYNC judges it again (its job is not in flight or proven)
+            _log.warning("SYNC re-judge END of %s raised (%s); the next SYNC retries", h.key, type(exc).__name__)
 
     def _pool(self) -> None:
         try:
@@ -697,7 +736,8 @@ class RunServer:
         The holder leaves ``_live`` only once an END for its key is PROVEN (here, or in :meth:`_run_end`). An END that
         does not prove (abort's and the job's both failed) keeps it registered as UNPROVEN: a shutdown re-attempts it,
         a later END for the key starts a fresh job, and the index record stays not-``ended``, so the root reaper's
-        periodic END (S11/S11b) is the retry. There is no retry loop here on purpose."""
+        periodic END (S11/S11b) is the retry, and so is a SYNC re-judge that finds the session's authority gone. There
+        is no retry loop here on purpose."""
         try:
             with h.lock:
                 if h.job is None:
@@ -779,12 +819,17 @@ class RunServer:
     def _start_end(self, key: str) -> _EndJob:
         """T7: the key's one END job, started if there is none or the last one finished UNPROVEN (a retry, never
         concurrent with another). A PROVEN job is kept for good and answers every repeat; past :data:`_JOBS_KEEP` jobs
-        only finished unproven ones are dropped."""
+        only finished unproven ones are dropped. A job whose thread cannot start is finished UNPROVEN on the spot, so it
+        never reads as in flight for good and the next END (or SYNC re-judge) starts a fresh one (L3 r1)."""
         with self._mu:
             job = self._jobs.get(key)
             if job is None or (job.done.is_set() and job.result.terminated is not True):
                 job = self._jobs[key] = _EndJob()
-                threading.Thread(target=self._run_end, args=(key, job), daemon=True).start()
+                try:
+                    threading.Thread(target=self._run_end, args=(key, job), daemon=True).start()
+                except Exception:  # noqa: BLE001
+                    job.result = StopResult(False, "END could not start; nothing assumed ended")
+                    job.done.set()
             if len(self._jobs) > _JOBS_KEEP:
                 for k in [k for k, j in self._jobs.items()
                           if k != key and j.done.is_set() and j.result.terminated is not True]:

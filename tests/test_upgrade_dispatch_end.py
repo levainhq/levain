@@ -246,6 +246,58 @@ def test_a_revoke_synced_into_the_replica_closes_the_dispatch_lease_once(replica
     before = _source(rig)
     assert wire.sync(before[-2:])["refused"] == "ledger-stale"                      # a restore to before the revoke
     assert wire.sync([])["ok"] is True                                              # and a head read: nothing runs twice
+    assert _rejudge_settled(wire.server)                                            # (gemini L3 r1: wait for its pass)
+    sock.close()
+    wire.close()
+    assert lease.closed == 1 and h.verbs().count("teardown") == 1
+
+
+def _rejudge_settled(server, seconds: float = 10.0) -> bool:
+    end = time.monotonic() + seconds
+    while server._rejudge_running and time.monotonic() < end:
+        time.sleep(0.01)
+    return not server._rejudge_running
+
+
+def test_a_synced_revoke_whose_first_end_fails_is_retried_by_the_next_sync_and_closes_the_lease_once(replica_world):
+    """codex HIGH L3 r1: the re-judge's END job finishes UNPROVEN (``launcher.stop`` fails once). The holder used to be
+    skipped for good (``ending`` was set), so the revoked session ran on. An empty SYNC now judges it again and retries
+    the END: the lease closes exactly once, one teardown, and a further SYNC (the job proven) runs nothing twice."""
+    from tests.test_agents_authority_replica import NO_BAR
+    from tests.test_authority_agent_link import revoke_agent
+    from levain.agents.accounting import StopResult
+    rig, trig, h, leases, wire = replica_world
+    oid = _occurrence(rig, billing="subscription", exposure=EXP)
+    assert wire.sync()["ok"] is True
+    sock = wire.conn()
+    assert wire.launch(sock, oid, key=KEY)["ok"] is True
+    assert wire.call(sock, "RELEASE", ledger_head=wire.head(), bar=NO_BAR)["ok"] is True
+    (lease,) = leases
+    real_stop, stops = wire.server.launcher.stop, []
+
+    def stop(key, deadline_s=0.0):
+        stops.append(key)
+        if len(stops) == 1:
+            return StopResult(False, "a transient teardown failure")
+        return real_stop(key, deadline_s)
+    wire.server.launcher.stop = stop
+
+    rig.world.link(revoke_agent(rig.row(oid)["agent_id"], rig.sid), "laptop")
+    assert wire.sync()["ok"] is True
+    assert _rejudge_settled(wire.server)
+    job = wire.server._jobs[KEY]
+    assert job.done.wait(5) and job.result.terminated is False
+    assert lease.closed == 0 and h.verbs().count("teardown") == 0 and stops == [KEY]
+
+    assert wire.sync([])["ok"] is True                                              # an empty SYNC: judged again
+    for _ in range(500):
+        if lease.closed == 1 and wire.launcher_index(KEY).get("state") == "ended":
+            break
+        time.sleep(0.02)
+    trig.control.join_eof(5)
+    assert lease.closed == 1 and wire.launcher_index(KEY)["state"] == "ended" and h.verbs().count("teardown") == 1
+    assert wire.sync([])["ok"] is True and _rejudge_settled(wire.server)            # proven: skipped, never re-run
+    assert len(stops) == 2
     sock.close()
     wire.close()
     assert lease.closed == 1 and h.verbs().count("teardown") == 1

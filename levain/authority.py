@@ -68,6 +68,7 @@ __all__ = [
     "consent_grant", "consent_grant_tool_problem", "consent_revocable", "consent_tool_shape_problem",
     "consent_resolved_workspace", "consent_mcp_declaration", "consent_mcp_input_fits", "consent_mcp_tool_problem",
     "agent_last_revoke", "agent_link", "agent_link_terms", "agent_link_arms", "agent_link_incarnation", "agent_links",
+    "agent_link_unrevoked",
     "consent_root_problem", "consent_tool_problem", "consent_workspace_problem", "create_schema", "custody_mismatch",
     "custody_problem", "egress_key_conflicts", "egress_key_host_problem", "egress_key_incarnation", "egress_key_live",
     "egress_key_record", "egress_key_repo_problem", "graduation_grant", "graduation_incarnation", "graduation_links",
@@ -1686,17 +1687,27 @@ def agent_link_arms(state: AuthoritySnapshot, link_id: str, *, now: datetime, cl
     ``revoke_agent`` and after ``closed_bar_revoke_seq`` (the highest ``revoke_seq`` of a closed bar of that agent,
     the caller's to read: the bar is local state, not the log's). Fails closed: False for an id that is no standing
     agent link, one with no born seq, a ``now`` that is no aware datetime, or a bar seq that is no integer at or above
-    zero. Says nothing of signer standing; that is the reader's."""
-    grant, born = state.policy.grants.get(link_id), state.grant_born.get(link_id)
-    if not agent_link(grant) or born is None or type(closed_bar_revoke_seq) is not int or closed_bar_revoke_seq < 0:
+    zero. Says nothing of signer standing; that is the reader's. Its revoke half is :func:`agent_link_unrevoked`."""
+    if not agent_link_unrevoked(state, link_id, closed_bar_revoke_seq=closed_bar_revoke_seq):
         return False
     if not isinstance(now, datetime) or now.tzinfo is None or now.utcoffset() is None:
         return False
     try:
         if (state.head_at is not None and now < state.head_at) \
-                or now >= _parse_stamp(grant["expires_at"], "expires_at"):
+                or now >= _parse_stamp(state.policy.grants[link_id]["expires_at"], "expires_at"):
             return False
     except (AuthorityError, OverflowError):
+        return False
+    return True
+
+
+def agent_link_unrevoked(state: AuthoritySnapshot, link_id: str, *, closed_bar_revoke_seq: int = 0) -> bool:
+    """The time-free half of :func:`agent_link_arms`: ``link_id`` is a standing agent link with a born seq, born after
+    its agent's last ``revoke_agent`` and after ``closed_bar_revoke_seq``. Fails closed as that function does. The run
+    server's SYNC re-judge of a session already running reads this half only: an expiry was never a reason to stop a
+    released session (levain 34, L3 r1 complement LOW 3)."""
+    grant, born = state.policy.grants.get(link_id), state.grant_born.get(link_id)
+    if not agent_link(grant) or born is None or type(closed_bar_revoke_seq) is not int or closed_bar_revoke_seq < 0:
         return False
     return born > agent_last_revoke(state, grant["agent_id"], grant["store_id"]) and born > closed_bar_revoke_seq
 
