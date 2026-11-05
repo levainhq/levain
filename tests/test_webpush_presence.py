@@ -424,7 +424,8 @@ def _held_ping(calls, q, agent):
     assert [(c["kind"], c["push"], c["hold"], c["url"]) for c in calls] == [("consent", True, None, "/?view=needs")]
     assert calls[0]["ref"].startswith("request:")
     rid = calls[0]["ref"].split(":", 1)[1]
-    assert calls[0]["body"].startswith(f"{agent} waits on you up to ") and f"(request {rid})." in calls[0]["body"]
+    assert calls[0]["body"].startswith(f"{agent} is waiting for your approval: ") and calls[0]["body"].endswith("s).")
+    assert calls[0]["title"] == claude_code.CONSENT_PING_TITLE and rid not in calls[0]["body"]
     assert q.get(rid)[1] == "withdrawn"                    # the hold ran out and left the call to the dialog
 
 
@@ -534,7 +535,8 @@ def test_an_away_hold_ping_is_never_silenced_by_a_faulting_dedupe_read(tmp_path,
     monkeypatch.setattr(wp, "pinged", lambda *a, **kw: True)   # what a locked pings DB reads as
     assert claude_code.hold_ping(_away(), qdir, "claude_code", "Bash: touch x", "r7", 300.0) is True
     assert [c["ref"] for c in calls] == ["request:r7"]
-    assert calls[0]["body"] == "claude_code waits on you up to 300 s: Bash: touch x (request r7)."
+    assert calls[0]["body"] == ("claude_code is waiting for your approval: Bash: touch x. Open it to Allow or Deny "
+                                   "(held up to 300 s).")
 
 
 def test_an_away_hold_ping_never_raises(tmp_path, monkeypatch):

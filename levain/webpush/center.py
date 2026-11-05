@@ -495,6 +495,35 @@ class _Reader:
         except Exception:  # noqa: BLE001 - one ref that cannot be read is False for that item, never a failed page
             return False
 
+    def consent_sheet(self, ref: Any) -> dict[str, str] | None:
+        """For a ping about a filed consent request (``request:<id>``): ``{"id", "state"}``, the request's standing read
+        now, so the focus view can link its sign sheet (``/sign/consent/<id>``, drawn on the page's own origin from the id
+        alone: no link is taken from the ping). ``state``: ``open`` (pending with its hold running, or undecided: a
+        passkey may answer or rule it, ConsentSheet.row's own condition), ``expired`` (its hold ended), ``closed``
+        (decided, withdrawn or otherwise final), ``gone`` (no longer in the queue), ``unread`` (the store could not be
+        read). None for any other ref: no request, no sheet."""
+        if not isinstance(ref, str) or not ref.startswith("request:") or len(ref) == len("request:"):
+            return None
+        rid = ref[len("request:"):]
+        try:
+            if self._queue is None:
+                from levain.consent.queue import ConsentQueue, authority_source
+
+                self._queue = ConsentQueue(self.queue_dir, home=Path.home(),
+                                           authority=authority_source(self.queue_dir, anchor=None))
+            got = self._queue.get(rid)
+        except Exception:  # noqa: BLE001 - an unreadable store is said as such, never drawn as an open sheet
+            return {"id": rid, "state": "unread"}
+        if got is None:
+            return {"id": rid, "state": "gone"}
+        request, state = got
+        if state == "pending":
+            from levain.cockpit.consent import utc_stamp
+
+            return {"id": rid, "state": "expired" if request.expires_at <= utc_stamp(datetime.now(timezone.utc))
+                    else "open"}
+        return {"id": rid, "state": "open" if state == "undecided" else "expired" if state == "expired" else "closed"}
+
     def label(self, journal: Any, device_id: str) -> str:
         key = (journal, device_id)
         if key not in self._labels:
@@ -554,7 +583,7 @@ def _notice_item(rd: _Reader, num: int, read: bool, read_at: str | None) -> dict
     return {"id": f"n{num}", "origin": "token", "source": r["source"], "title": r["title"], "body": r["body"],
             "preview": plain_preview(r["body"]), "at": _iso(r["at"]), "priority": r["priority"], "read": read,
             "read_at": _iso(read_at) if read else None, "needs_ref": None, "needs_open": False,
-            "token_name": r["token"], "image_url": None,
+            "token_name": r["token"], "image_url": None, "sheet": None,
             "delivery": _delivery(rd, r["ping_id"])}
 
 
@@ -583,6 +612,7 @@ def _ping_item(rd: _Reader, num: int, read: bool, read_at: str | None) -> dict[s
             "preview": plain_preview(body), "at": _iso(r["at"]), "priority": "normal", "read": read,
             "read_at": _iso(read_at) if read else None, "needs_ref": needs_ref,
             "needs_open": bool(needs_ref) and rd.needs_open(ref), "token_name": None, "image_url": None,
+            "sheet": rd.consent_sheet(ref) if source == "approval" else None,
             "delivery": _delivery(rd, num)}
 
 

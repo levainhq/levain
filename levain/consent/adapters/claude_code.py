@@ -1441,6 +1441,24 @@ def notify(settings: AdapterSettings, message: str, *, cwd: Path | str | None = 
     return started or pushed
 
 
+# The title of a ping about a FILED consent request (ref ``request:<id>``). Phill 11-05 (15:07, "I never saw that
+# notification"): it went out as "levain", beside the SIGN row's ping 1.5 s later, and read as a duplicate of it. The words
+# are the center's own ("Approval needed", levain.webpush.center) and the sheet's ("Allow", "Deny"), nothing new.
+CONSENT_PING_TITLE = "A seat waits for your approval"
+
+
+def hold_message(agent: str, what: str, wait: float) -> str:
+    """The words of a ping about a request held for his answer: who waits, on what (the sheet's own display of the
+    call), and the sheet's two answers. The request id rides the ping's ref, not its words."""
+    return (f"levain: {agent} is waiting for your approval: {what}. Open it to Allow or Deny "
+            f"(held up to {math.ceil(wait):g} s).")
+
+
+def _ping_title(kind: str, ref: str | None) -> str:
+    approval = kind in ("consent", "push", "reping")      # the kinds the center files as approvals
+    return CONSENT_PING_TITLE if approval and isinstance(ref, str) and ref.startswith("request:") else "levain"
+
+
 def _notify_ex(settings: AdapterSettings, message: str, *, cwd: Path | str | None, kind: str,
                ref: str | None) -> tuple[bool, bool, bool]:
     """:func:`notify`'s work: (the notify command started, a push started, the ping's record child started). A ping a
@@ -1461,7 +1479,7 @@ def _notify_ex(settings: AdapterSettings, message: str, *, cwd: Path | str | Non
             hold = None if said is None or said.push else (said.by or "active")
             if paired or settings.notify_argv:
                 body = message[len("levain: "):] if message.startswith("levain: ") else message
-                recorded = sender.spawn(cwd, kind=kind, ref=ref, title="levain", body=body, url="/?view=needs",
+                recorded = sender.spawn(cwd, kind=kind, ref=ref, title=_ping_title(kind, ref), body=body, url="/?view=needs",
                                         command=started if settings.notify_argv else None, push=phone, hold=hold)
                 pushed = recorded and phone
         except Exception:  # noqa: BLE001 - a failed ping never fails the gate
@@ -1482,8 +1500,7 @@ def hold_ping(settings: AdapterSettings, queue_dir: Path | str, agent: str, what
     ref = f"request:{request_id}"
     try:
         started, pushed, recorded = _notify_ex(
-            settings, f"levain: {agent} waits on you up to {math.ceil(wait):g} s: {what} (request {request_id}).",
-            cwd=queue_dir, kind="consent", ref=ref)
+            settings, hold_message(agent, what, wait), cwd=queue_dir, kind="consent", ref=ref)
         return started or pushed or recorded
     except Exception:  # noqa: BLE001 - a failed ping never fails the hook
         return False
@@ -1894,8 +1911,7 @@ def _gate_call(event: Mapping[str, Any], queue: ConsentQueue, settings: AdapterS
         return _pre("deny", f"levain: the gate failed ({type(exc).__name__}), so the action was NOT taken: {what}. "
                     "Do not retry it and do not achieve it another way.", **_stop(tier, what, "the gate failed."))
     try:
-        notify(settings, f"levain: {AGENT} waits on you up to {hold:g} s: {what} (request {request.id}).",
-               cwd=queue.directory, ref=f"request:{request.id}")
+        notify(settings, hold_message(AGENT, what, hold), cwd=queue.directory, ref=f"request:{request.id}")
         if posture in ATTENDED_POSTURES and still_away is not None:
             # held only because he was away (above): re-read away as the PermissionRequest hold does, and when it
             # ends hand the call back to Claude Code's dialog (L3 r1 complement 1 = codex 2)

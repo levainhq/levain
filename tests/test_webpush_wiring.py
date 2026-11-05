@@ -44,7 +44,7 @@ def test_a_phone_with_pings_on_gets_the_gate_ping_with_its_ref(tmp_path, monkeyp
     assert claude_code.ping_configured(claude_code.AdapterSettings(), tmp_path) is True
     assert claude_code.notify(claude_code.AdapterSettings(), "levain: claude waits on you: Bash (request r1).",
                               cwd=tmp_path, ref="request:r1") is True
-    assert calls == [{"kind": "consent", "ref": "request:r1", "title": "levain",
+    assert calls == [{"kind": "consent", "ref": "request:r1", "title": claude_code.CONSENT_PING_TITLE,
                       "body": "claude waits on you: Bash (request r1).", "url": "/?view=needs", "command": None,
                       "push": True, "hold": None}]
 
@@ -75,7 +75,7 @@ def test_a_notify_command_only_install_still_gets_the_ping_recorded(tmp_path, mo
     assert webpush.live(tmp_path) is False
     assert claude_code.notify(_argv_settings(true), "levain: claude waits on you: Bash (request r2).",
                               cwd=tmp_path, ref="request:r2") is True
-    assert calls == [{"kind": "consent", "ref": "request:r2", "title": "levain",
+    assert calls == [{"kind": "consent", "ref": "request:r2", "title": claude_code.CONSENT_PING_TITLE,
                       "body": "claude waits on you: Bash (request r2).", "url": "/?view=needs", "command": True,
                       "push": False, "hold": None}]
 
