@@ -37,6 +37,13 @@
       return x.pathname + q + (x.hash ? "#..." : "");
     } catch (_) { return null; }
   };
+  // PRESENCE of a notification-center item id (`n=`, the shape dashboard_core.js NC_ID accepts) in a url, as `{n: true}` to spread
+  // into a step's detail, else `{}`: a tap that carried a deep-linked item is told apart from one that did not, and the id
+  // itself (a numeric ping id) is never written.
+  const NC_ID = /^[pn][1-9][0-9]{0,17}$/;
+  const nFlag = (u) => {
+    try { const n = new URL(String(u), location.href).searchParams.get("n"); return n !== null && NC_ID.test(n) ? { n: true } : {}; } catch (_) { return {}; }
+  };
   // total: nothing in here (the clock, the key, the JSON, the promise chain) can throw into the tap
   const trace = (step, detail) => {
     try {
@@ -51,10 +58,10 @@
     } catch (_) { /* best effort */ }
   };
   // the assign comes first: the trace of it may often be lost to the navigation, which is fine
-  const assignTo = (href) => { location.assign(href); trace("assign", { target: traceUrl(href) }); };
+  const assignTo = (href) => { location.assign(href); trace("assign", { target: traceUrl(href), ...nFlag(href) }); };
   try {
     trace("page-load", {
-      href: traceUrl(location.href),
+      href: traceUrl(location.href), ...nFlag(location.href),
       standalone: !!(typeof matchMedia === "function" && matchMedia("(display-mode: standalone)").matches),
       navStandalone: navigator.standalone === undefined ? null : !!navigator.standalone,
       referrer: document.referrer ? traceUrl(document.referrer) : "",
@@ -77,7 +84,7 @@
       assignTo(u.href);
     };
     // no cache, or the worker could not write a target: message-only, as before
-    const msg = { type: d.type, url: traceUrl(u.href), nonce: typeof d.nonce === "string" };
+    const msg = { type: d.type, url: traceUrl(u.href), nonce: typeof d.nonce === "string", ...nFlag(u.href) };
     if (!haveCache || typeof d.nonce !== "string") { trace("message", { ...msg, claim: "message-only" }); go(); return; }
     // only the key this message names, and only a nonce shaped like the worker's: a lost claim means another path (or the
     // worker) already owns this open, so no ack and no navigation

@@ -9302,6 +9302,11 @@
     window.setTimeout(() => { if (nc.status !== "ok") ncRead(false); }, 3000);
     window.setInterval(() => { if (!document.hidden) ncRead(false); }, NC_POLL_MS);
     document.addEventListener("visibilitychange", () => { if (!document.hidden) ncRead(false); });
+    // a token that arrives after the page opened (a tap on an unpaired page that then pairs, or the owner prompt) reads the center
+    // at once, so a kept deep link opens its item now and not at the next 30 s pulse; same read as the pulse, no new timer.
+    // `storage` fires only for another tab's change, the same-page announce is the levain:write-token-change event.
+    window.addEventListener("levain:write-token-change", () => { ncRead(false); });
+    window.addEventListener("storage", (e) => { if (e.key === "levain_write_token") ncRead(false); });
     if (ask && ask.needs) needsDeepJump(++phoneJumpRun, Date.now() + PHONE_JUMP_WAIT_MS);
     else if (ask) openNotifyCenter(null, ask.id, true);
   }
