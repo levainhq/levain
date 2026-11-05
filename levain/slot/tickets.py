@@ -349,6 +349,14 @@ def read_ceiling(path: Path, owner: int = 0) -> Ceiling:
     ceiling is the operator's bound on dispatch; no default stands in for it). So does one not owned by `owner` (root;
     a test passes its own uid) or writable by group or other (L1 note 8): a ceiling the dispatch uid could write is no
     bound on it."""
+    return parse_ceiling(read_ceiling_bytes(path, owner))
+
+
+def read_ceiling_bytes(path: Path, owner: int = 0) -> bytes:
+    """The ceiling file's bytes (at most :data:`CEILING_MAX` + 1), under :func:`read_ceiling`'s FILE rules: opened
+    ``O_NOFOLLOW``, a regular file owned by ``owner``, not writable by group or other; else ``ticket-ceiling:file``.
+    The ONE place those rules live: :func:`read_ceiling` and the install helper's ``set-ceiling`` (its ``old``) both
+    read through it. An ``OSError`` past the open (fstat, read) propagates."""
     try:
         fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC)
     except OSError:
@@ -361,9 +369,17 @@ def read_ceiling(path: Path, owner: int = 0) -> Ceiling:
             raise Refused("ticket-ceiling:file", f"the ceiling's owner is {st.st_uid}, not {owner}")
         if st.st_mode & 0o022:
             raise Refused("ticket-ceiling:file", "the ceiling is writable by group or other")
-        data = os.read(fd, CEILING_MAX + 1)
+        return os.read(fd, CEILING_MAX + 1)
     finally:
         os.close(fd)
+
+
+def parse_ceiling(data: bytes) -> Ceiling:
+    """The ceiling document's bytes, checked whole: at most :data:`CEILING_MAX`, canonical JSON, exactly one format's
+    key set, every value a non-negative integer, a `/2` maximum within the run caps. Else `ticket-ceiling:file`. The
+    ONE check: :func:`read_ceiling` reads through it and the install helper's `set-ceiling` writes only what passes it."""
+    if len(data) > CEILING_MAX:
+        raise Refused("ticket-ceiling:file", "the ceiling is past the size cap")
     try:
         obj = canon.parse(data)
     except (ContractError, ValueError, RecursionError):
@@ -1031,4 +1047,4 @@ def _write_all(fd: int, data: bytes) -> None:
 
 __all__ = ["AUTHS", "BOUND", "CALLS_MAX", "DEADLINE_MAX", "TUNNEL_BYTES_MAX", "CANCELLED", "CEILING_FORMAT", "CEILING_FORMAT_2", "CEILING_KEYS_2", "Ceiling", "VENDORS", "EXPIRED", "JOURNAL", "KINDS", "LEASE_OVER", "MINT_FIELDS",
            "RELEASED", "RENDERS_AS", "RESOLVED_KEYS", "RUN_ID_RE", "TICKET_UNUSED_S", "check_resolved", "check_slot",
-           "Ticket", "TicketStore", "UNBOUND", "check_attempt_id", "check_facts", "read_ceiling", "request_digest"]
+           "Ticket", "TicketStore", "UNBOUND", "check_attempt_id", "check_facts", "read_ceiling", "read_ceiling_bytes", "request_digest"]

@@ -11,9 +11,9 @@ not), and what the interrupted run made is kept at the ids it holds (:attr:`Host
 Undo removes the runtime rule first and the install rule last, before the record, so a failed undo
 re-runs through the install helper.
 
-``purge``, ``set-credential``, ``remove-credential`` and ``set-limits`` are not plans: they act under the install lock
+``purge``, ``set-credential``, ``remove-credential``, ``set-limits`` and ``set-ceiling`` are not plans: they act under the install lock
 (the credential verbs through a forked child that drops to keys before it opens anything below ``L/keys/``,
-:func:`run_credential`; ``set-limits`` writes ``L/policy/limits`` in root, :func:`run_set_limits`). Nor are
+:func:`run_credential`; ``set-limits`` writes ``L/policy/limits`` in root, :func:`run_set_limits`; ``set-ceiling`` writes ``L/policy/dispatch_ceiling``, :func:`run_set_ceiling`). Nor are
 ``enrol-authority-signer`` / ``remove-authority-signer``: root's allowed-signers file, :func:`run_authority_signer`.
 """
 from __future__ import annotations
@@ -69,7 +69,7 @@ from levain.broker import policy as broker_policy
 from levain.slot.runtime_grammar import VERBS as RUNTIME_VERBS
 from levain.slot.runtime_grammar import ok_line, refusal_line
 from levain.slot.layout import (STORE, Row, base_routes_steps, base_run_rows, base_store_rows, operator_record_path,
-                                parse_pool_config, policy_limits_path, policy_rows, pool_config_row, pool_config_steps,
+                                parse_pool_config, policy_dispatch_ceiling_path, policy_limits_path, policy_rows, pool_config_row, pool_config_steps,
                                 pool_config_undo_steps, reserve_row, reserve_steps, roots_steps, row_steps,
                                 run_dir_undo_steps, single_filesystem_steps, slot_rows, tmpfiles_steps,
                                 tmpfiles_undo_steps, ungroup_steps, entry_state, remove_entry_steps,
@@ -236,7 +236,7 @@ def check_tools(facts: HostFacts, steps: Sequence[Step], *, verb: str, python: b
 
 #: The verbs :func:`main` applies; every other verb of the §5.2 grammar answers ``verb-unbuilt:<verb>``.
 BUILT_VERBS = ("setup", "undo", "replenish", "purge", "set-credential", "remove-credential", "repair", "set-limits",
-               "routes-base", "routes-trust", "routes-egress", "enrol-authority-signer", "remove-authority-signer")
+               "set-ceiling", "routes-base", "routes-trust", "routes-egress", "enrol-authority-signer", "remove-authority-signer")
 
 
 def helper_pending() -> tuple[str, ...]:
@@ -950,6 +950,7 @@ def plan_undo(cmd: InstallCommand, facts: HostFacts, *, accounts: Mapping[str, i
         *slot_state_undo_steps(host, slots_of(uids), store=live.at(STORE[host])),
         *pool_config_undo_steps(host),
         *policy_limits_undo_steps(host, live),
+        *policy_dispatch_ceiling_undo_steps(host, live),
         *authority_signers_undo_steps(host, live),
         Step(f"create {path.parent}", (mkdir, "-p", "-m", "755", str(path.parent))),
         Step("retire every account id so none is reissued", write=(path, retired_ids_text(retired_after), 0o644)),
@@ -2605,6 +2606,95 @@ def run_set_limits(caller_uid: int, host: HostOS, *, read: Callable[[int], bytes
     return {"verb": "set-limits", "digest": "sha256:" + hashlib.sha256(data).hexdigest()}
 
 
+# --- set-ceiling (the dispatch ceiling, tickets.read_ceiling's file; 1105-32) ------------------------------------
+
+def read_ceiling_doc(read: Callable[[int], bytes]) -> tuple[bytes, T.Ceiling]:
+    """``set-ceiling``' stdin: one ``levain-dispatch-ceiling/1`` or ``/2`` document, at most the reader's cap, checked
+    WHOLE in root by the ticket store's own check (:func:`levain.slot.tickets.parse_ceiling`, the one :func:`read_ceiling`
+    reads through, so no rule is written twice) and returned as ``(canonical bytes, the parsed ceiling)``, the canonical
+    bytes re-read through the same check: root never writes the caller's bytes, and never bytes CONTROL would refuse.
+    A refusal is ``ceiling-oversize`` or ``ceiling-malformed``, the reader's own message in the detail (stderr). The
+    reader is called until EOF (an empty read) or the cap plus one byte in all, never asked for more than that total:
+    a reader that returns short chunks cannot cut an oversize document down to a valid smaller one (L3 r1)."""
+    n = T.CEILING_MAX + 1
+    raw = b""
+    while len(raw) < n:
+        chunk = read(n - len(raw))
+        if not chunk:
+            break
+        raw += chunk[:n - len(raw)]
+    if len(raw) > T.CEILING_MAX:
+        raise Refused("ceiling-oversize", f"over {T.CEILING_MAX} bytes")
+    try:
+        T.parse_ceiling(raw)
+        data = canon.canonical_bytes(canon.parse(raw))
+        ceiling = T.parse_ceiling(data)
+    except Refused as e:
+        raise Refused("ceiling-malformed", e.detail) from None
+    except (canon.ContractError, ValueError, RecursionError) as e:
+        raise Refused("ceiling-malformed", str(e)[:200] or type(e).__name__) from None
+    return data, ceiling
+
+
+def _ceiling_in_force(path: Path, owner: int) -> dict[str, object] | None:
+    """The ceiling at ``path`` as its fields, for the answer's ``old``; ``None`` when absent or one CONTROL would
+    refuse. Read through CONTROL's own file rules and check (:func:`levain.slot.tickets.read_ceiling_bytes`, then
+    :func:`~levain.slot.tickets.parse_ceiling`): a valid document in a link, a non-regular file, a file not
+    ``owner``'s (root: the helper's euid, which owns what it writes) or one group/other-writable was no bound, so it is
+    ``None`` (L3 r1). Read only; never decides anything."""
+    try:
+        data = T.read_ceiling_bytes(path, owner)
+    except (Refused, OSError):
+        return None
+    try:
+        T.parse_ceiling(data)
+        return canon.parse(data)                                          # type: ignore[return-value]
+    except (Refused, canon.ContractError, ValueError, RecursionError):
+        return None
+
+
+def run_set_ceiling(caller_uid: int, host: HostOS, *, read: Callable[[int], bytes],
+                    lock: Callable[[], ContextManager[object]], store_seams: RH.Seams | None = None,
+                    err: TextIO | None = None, fsync: Callable[[int], None] | None = None) -> dict[str, object]:
+    """``set-ceiling``: ``L/policy/dispatch_ceiling`` replaced by stdin's document. Order as :func:`run_set_limits`:
+    the operator check, stdin read and checked in root (:func:`read_ceiling_doc`), both before the install lock; UNDER
+    the lock the operator check again, ``L/policy`` opened ``O_NOFOLLOW`` and required to pass ``seams.trusted`` (root's,
+    not group/other-writable: a ceiling in a directory the dispatch uid could write is no bound), the ceiling in force
+    read for the answer, then the write: ``dispatch_ceiling.tmp`` (``O_EXCL | O_NOFOLLOW``, 0644, fsynced), renamed over
+    the file, ``L/policy`` fsynced (:func:`levain.slot.records.write_durably`). The new entry is root's whatever the old
+    one was. A failure before the rename refuses ``ceiling-write-failed`` with the old file in force; a failure of the
+    directory fsync after it answers ok and warns on ``err``. No pool hold and no live-lease count: CONTROL reads the
+    file on every mint. NO default and no seeding: this writes only a document a human piped in. The answer carries the
+    ceiling it replaced (``old``, ``None`` when absent or unusable) and the new one (``new``)."""
+    import hashlib
+
+    rs = store_seams or RH.Seams(host=host)
+    _check_operator("set-ceiling", caller_uid, rs)
+    data, new = read_ceiling_doc(read)
+    path = rs.L / policy_dispatch_ceiling_path(host).relative_to(STORE[host])
+    with lock():
+        _check_operator("set-ceiling", caller_uid, rs)
+        try:
+            dfd = os.open(path.parent, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC)
+        except OSError as e:
+            raise Refused("bad-root", f"{path.parent}: {e.strerror or e}") from None
+        try:
+            if not rs.trusted(os.fstat(dfd)):
+                raise Refused("bad-root", f"{path.parent} is not root's alone")
+        finally:
+            os.close(dfd)
+        old = _ceiling_in_force(path, rs.euid())
+        try:
+            R.write_durably(path, data, mode=0o644, fsync=fsync or gen_mod._full_fsync)
+        except R.NotDurable as e:
+            (err or sys.stderr).write(f"levain install-helper: warning: {path} written but not durable ({e.strerror}): "
+                                      "it is in force now and may not survive a crash; run it again\n")
+        except OSError as e:
+            raise Refused("ceiling-write-failed", f"{path}: {e.strerror or e}; the earlier file stands") from None
+    return {"verb": "set-ceiling", "digest": "sha256:" + hashlib.sha256(data).hexdigest(), "old": old,
+            "new": canon.parse(data)}
+
+
 def policy_limits_state(host: HostOS, live: RM.Live) -> str:
     """``L/policy/limits`` for undo: OURS by path and owner alone (a regular file of root's), WHATEVER its bytes, so an
     unusable file goes too (R1 F7); a link or another owner's entry there is NOT_OURS and left."""
@@ -2618,6 +2708,25 @@ def policy_limits_undo_steps(host: HostOS, live: RM.Live) -> list[Step]:
     rm = "/bin/rm" if host == "darwin" else _abs("rm")
     return [RM.remove_step(f"remove the slot limits {path}", ("policy-limits", str(path)), live,
                            lambda: policy_limits_state(host, live),
+                           lambda: live.act((rm, "-f", RM.at(live, path))), tools=(rm,))]
+
+
+def policy_dispatch_ceiling_state(host: HostOS, live: RM.Live) -> str:
+    """``L/policy/dispatch_ceiling`` for undo, as :func:`policy_limits_state`: OURS by path and owner alone (a regular
+    file of root's), WHATEVER its bytes or mode, so an unusable ceiling goes too; a link or another owner's entry
+    there is NOT_OURS and left."""
+    return RM.root_file(live, policy_dispatch_ceiling_path(host))
+
+
+def policy_dispatch_ceiling_undo_steps(host: HostOS, live: RM.Live) -> list[Step]:
+    """Undo's removal of ``L/policy/dispatch_ceiling`` (``set-ceiling``'s file, under the operator record undo
+    removes; L3 r1 1105-32): the store survives undo, so without this a later setup for another operator would mint
+    under this one's ceiling instead of refusing every mint until that operator sets one. The live read first (ABSENT
+    runs nothing)."""
+    path = policy_dispatch_ceiling_path(host)
+    rm = "/bin/rm" if host == "darwin" else _abs("rm")
+    return [RM.remove_step(f"remove the dispatch ceiling {path}", ("dispatch-ceiling", str(path)), live,
+                           lambda: policy_dispatch_ceiling_state(host, live),
                            lambda: live.act((rm, "-f", RM.at(live, path))), tools=(rm,))]
 
 
@@ -4303,6 +4412,8 @@ class Seams:
     credential: Callable[..., dict] = run_credential
     #: set-limits (R1 F5): its own branch in :func:`run`, never the install plan's generic path.
     limits: Callable[..., dict] = run_set_limits
+    #: set-ceiling: its own branch in :func:`run`, as set-limits'.
+    ceiling: Callable[..., dict] = run_set_ceiling
     #: routes-base / routes-trust (3c-9): their own branches in :func:`run`, as set-limits'.
     routes_base: Callable[..., dict] = run_routes_base
     routes_trust: Callable[..., dict] = run_routes_trust
@@ -4357,6 +4468,10 @@ def run(argv: Sequence[str], *, env: Mapping[str, str], seams: Seams, err: TextI
         # As the credential verbs: no host plan, no pool hold, no live-lease count (a held slot session waits on this
         # very raise); the operator check and the document's check come before the lock, which run_set_limits takes.
         return seams.limits(caller_uid, host, read=seams.stdin, lock=lambda: seams.lock(host), err=err)
+    if cmd.verb == "set-ceiling":
+        # As set-limits: one root file, no host plan, no pool hold, no live-lease count; the operator check and the
+        # document's check come before the lock, which run_set_ceiling takes.
+        return seams.ceiling(caller_uid, host, read=seams.stdin, lock=lambda: seams.lock(host), err=err)
     if cmd.verb == "routes-base":
         # As set-limits: one root file, no host plan, no pool hold (keys re-reads base.json at every Q).
         return seams.routes_base(caller_uid, host, lock=lambda: seams.lock(host), err=err)
@@ -4426,7 +4541,7 @@ INSTALL_ENTRY_ENV = ("SUDO_UID",)
 __all__ = ["ContinueSeams", "PROBE_OUT_CAP", "PROBE_TIMEOUT_S", "adopt_lock", "exec_phase_b", "phase_b_text",
            "plan_repair_stage", "plan_repair_resume", "check_fault", "fault_hook", "FAULT_POINTS", "FAULT_STEPS", "probe_text", "repair_continue", "repair_handover", "HANDOVER_ABI", "repair_probe", "run_probe",
            "RepairFacts", "desired_managed", "install_shape_path", "plan_only_report", "plan_repair", "BUILT_VERBS", "CHILD_MARGIN_S", "CREDENTIAL_VERBS", "INSTALL_ENTRY_ENV", "KEYS_ACCOUNT", "Directory", "Gathered", "HostFacts", "InstallPlan", "OPERATOR_FORMAT", "Seams",
-           "apply_steps", "check_account_ids", "drop_to_keys", "load_creds", "read_credential", "run_credential", "read_limits", "run_set_limits", "run_authority_signer", "authority_key_problem", "blob_fingerprint", "SIGNER_VERBS", "policy_limits_state", "policy_limits_undo_steps", "authority_signers_undo_steps", "run_purge", "check_tools", "count_live_leases", "live_lease_sessions", "extra_tools", "gather_facts",
+           "apply_steps", "check_account_ids", "drop_to_keys", "load_creds", "read_credential", "run_credential", "read_limits", "run_set_limits", "run_set_ceiling", "read_ceiling_doc", "run_authority_signer", "authority_key_problem", "blob_fingerprint", "SIGNER_VERBS", "policy_limits_state", "policy_limits_undo_steps", "policy_dispatch_ceiling_state", "policy_dispatch_ceiling_undo_steps", "authority_signers_undo_steps", "run_purge", "check_tools", "count_live_leases", "live_lease_sessions", "extra_tools", "gather_facts",
            "helper_pending", "main", "operator_record", "operator_record_text", "parse_operator_record",
            "plan_for", "plan_replenish", "plan_setup", "plan_tools", "plan_undo", "pool_lock", "preflight", "Quiesce",
            "quiesce_step",
