@@ -19,11 +19,14 @@ from __future__ import annotations
 import json
 import os
 import re
+import time
 from http.server import BaseHTTPRequestHandler
 from typing import Any
 from urllib.parse import unquote_plus
 
 __all__ = [
+    "BODY_DEADLINE_S",
+    "BODY_TIMEOUT_WORDS",
     "LISTEN_BACKLOG",
     "GuardedHandler",
     "host_header_allowed",
@@ -34,6 +37,13 @@ __all__ = [
 # own connection through a proxy such as ``tailscale serve``, and lost a random script (2026-10-25, the iOS cockpit's
 # "window.LevainCockpitView.fromManifest" error). The kernel caps it at kern.ipc.somaxconn / net.core.somaxconn.
 LISTEN_BACKLOG = 128
+
+# The most time a request body (or the drain of a refused one) may take to arrive, counted ONCE from the first byte
+# asked for. The socket timeout below is per recv and restarts with every byte, so a client sending one byte just inside
+# it held the handler thread, and on a route that reads under a gate the gate, for as long as it liked. The largest body
+# any route takes (and the largest drain) is a few hundred KiB to about a MiB, so this still fits a slow honest link.
+BODY_DEADLINE_S = 20.0
+BODY_TIMEOUT_WORDS = "The request did not arrive in time; try again."
 
 # A write only ever legitimately originates from our own dashboard page (which sends
 # ``Sec-Fetch-Site: same-origin``) or a non-browser client that sends NO Sec-Fetch-
@@ -187,15 +197,63 @@ class GuardedHandler(BaseHTTPRequestHandler):
         self.close_connection = True
         self._send_json({"error": error, "message": message}, status)
 
+    def _read_within(self, n: int, total_deadline_s: float, *, keep: bool) -> bytes:
+        """Read up to ``n`` request-body bytes under ONE monotonic deadline across every recv: each recv waits at most
+        what is left of the budget (and never more than the per-recv ``timeout``), and the socket's own timeout is
+        restored after. Returns the bytes (empty when ``keep`` is false), SHORT when the client closes first. Raises
+        ``TimeoutError`` once the budget is spent and ``OSError`` on a reset."""
+        deadline = time.monotonic() + total_deadline_s
+        pieces: list[bytes] = []
+        got = 0
+        try:
+            while got < n:
+                left = deadline - time.monotonic()
+                if left <= 0:
+                    raise TimeoutError("request body deadline")
+                self.connection.settimeout(min(left, self.timeout))
+                piece = self.rfile.read1(min(65536, n - got))
+                if not piece:        # the client closed before its declared length arrived
+                    break
+                got += len(piece)
+                if keep:
+                    pieces.append(piece)
+        finally:
+            try:
+                self.connection.settimeout(self.timeout)
+            except OSError:
+                pass
+        return b"".join(pieces)
+
+    def _read_body(self, clen: int, total_deadline_s: "float | None" = None) -> "bytes | None":
+        """The ``clen`` body bytes of a write, read under ONE total deadline (default :data:`BODY_DEADLINE_S`; read at
+        call time so a test can move it). A spent deadline is answered 408 in fixed words and the connection closes
+        (so the unread rest cannot desync it); a client that reset gets no answer. ``None`` in both cases: nothing more
+        to send, the caller just returns. A client that closed early gives the SHORT bytes, as ``rfile.read`` did, and
+        the route's own JSON check answers.
+
+        ⛔ EVERY ROUTE READS ITS BODY HERE, never with a bare ``rfile.read``: that read waits per recv, and the
+        gate a route holds while it reads (the request gate, a pairing or receipt slot, the install lock) is then
+        held for as long as a client trickles one byte at a time. The header block is not covered (the stdlib reads it
+        per recv before any route runs), but no gate is held yet while it arrives."""
+        budget = BODY_DEADLINE_S if total_deadline_s is None else total_deadline_s
+        try:
+            return self._read_within(clen, budget, keep=True)
+        except TimeoutError:
+            try:
+                self._reject(408, "request_timeout", BODY_TIMEOUT_WORDS)
+            except OSError:      # the client went away while it was being told
+                self.close_connection = True
+            return None
+        except OSError:          # a reset
+            self.close_connection = True
+            return None
+
     def _drain(self, n: int) -> None:
-        """Read and discard up to ``n`` bytes of the request body in bounded chunks, so a refused
-        request's body does not dangle on a kept-alive connection."""
-        remaining = n
-        while remaining > 0:
-            chunk = self.rfile.read(min(remaining, 65536))
-            if not chunk:
-                break
-            remaining -= len(chunk)
+        """Read and discard up to ``n`` bytes of the request body, under the same total deadline as a body read, so a
+        refused request's body does not dangle on a kept-alive connection and a trickle cannot hold the thread (or the
+        gate the caller holds). Raises ``TimeoutError`` when the budget is spent; the only caller,
+        :meth:`_refuse_oversize`, still sends its 413."""
+        self._read_within(n, BODY_DEADLINE_S, keep=False)
 
     def _refuse_write_origin(self) -> bool:
         """The first two write checks: the Host allowlist, then CSRF layer 1 (``Sec-Fetch-Site`` must

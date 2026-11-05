@@ -249,10 +249,8 @@ class _InitHandler(GuardedHandler):
         if not self.server.install_lock.acquire(blocking=False):
             return self._reject(503, "busy", "an install is already in progress")
         try:
-            try:
-                raw = self.rfile.read(clen)
-            except OSError:  # slow/stalled client hit the socket timeout → drop it
-                self.close_connection = True
+            raw = self._read_body(clen)    # one total deadline; a spent one is answered 408 and closes
+            if raw is None:
                 return
             try:
                 req = json.loads(raw.decode("utf-8"))

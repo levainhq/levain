@@ -16,6 +16,7 @@ import http.client
 import threading
 from contextlib import contextmanager
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -67,6 +68,7 @@ def _server(kind: str, tmp_path: Path):
     t = threading.Thread(target=httpd.serve_forever, daemon=True)
     t.start()
     _TOKEN[kind] = getattr(httpd, "write_token", None)
+    _LIVE["httpd"] = httpd
     try:
         yield httpd.server_address[1]
     finally:
@@ -121,6 +123,7 @@ def test_each_security_header_appears_once_on_a_normal_response(tmp_path, kind):
 
 WRITE_ROUTES = {"serve": "/edit", "init": "/init"}
 _TOKEN: dict[str, str | None] = {}
+_LIVE: dict[str, Any] = {}      # the server of the target in use, for a test that looks at its gates
 
 
 def _raw_post(port: int, path: str, headers: dict, body: bytes = b""):
@@ -229,6 +232,7 @@ def _te_target(family: str, tmp_path: Path):
         from tests.test_cockpit_pairing_http import H, T, _serve as pair_serve
 
         with pair_serve(_install(tmp_path)[1]) as (port, _h):
+            _LIVE["httpd"] = _h
             yield port, "/cockpit/pair/offer", {H: T}, b'{"label":"x"}'
     else:
         from levain.webpush import notify_tokens as nt
@@ -240,6 +244,7 @@ def _te_target(family: str, tmp_path: Path):
         src = _install(tmp_path)[1]
         tok = nt.create(q, "Backup")[1]
         with _signed(src, q) as (port, _h):
+            _LIVE["httpd"] = _h
             if family == "notify":
                 yield port, "/notify", {nt.HEADER: tok}, _JSON_BODY
             else:
@@ -312,3 +317,224 @@ def test_a_plain_content_length_post_is_unchanged_and_the_connection_stays_usabl
         got = _post_then_pipelined_get(port, route, extra, [("Content-Length", str(len(body)))], body)
     assert len(_responses(got)) == 2, f"{family}: {_responses(got)} {got[:400]!r}"
     assert b"transfer_encoding_refused" not in got and b"length_required" not in got
+
+
+# A body is read under ONE total deadline (`GuardedHandler._read_body`), not under the socket's per-recv timeout. The
+# per-recv timeout restarts with every byte, so a client sending one byte just inside it kept a handler thread, and on a
+# route that reads under a gate the gate too, for as long as it liked (found on the voice routes 1105-17, which had their
+# own fix; this is every other body-reading site). Each family below is a different call site of the shared reader.
+
+import json  # noqa: E402
+import time  # noqa: E402
+
+from levain import http_guards  # noqa: E402
+
+_LOCK_TYPE = type(threading.Lock())
+
+
+def _gates(httpd: Any) -> dict[str, int]:
+    """Every gate the server owns (a semaphore's free slots, a lock as 1 free / 0 taken): a held gate reads lower than
+    it did when the server was idle."""
+    out: dict[str, int] = {}
+    for name, value in vars(httpd).items():
+        if isinstance(value, threading.BoundedSemaphore):
+            out[name] = value._value
+        elif isinstance(value, _LOCK_TYPE):
+            out[name] = 0 if value.locked() else 1
+    return out
+
+
+def _held(httpd: Any, idle: dict[str, int]) -> list[str]:
+    now = _gates(httpd)
+    return sorted(name for name, free in idle.items() if now.get(name, free) < free)
+
+
+def _trickle_post(port: int, route: str, extra: dict, declared: int, payload: bytes, gap: float, wait: float,
+                  probe=None):
+    """POST with ``Content-Length: declared``, then ``payload`` one byte per ``gap`` seconds, stopping the moment the
+    server answers. ``probe()`` is called once, after the third byte, while the trickle is still going. Returns
+    ``(status or None, answer bytes, seconds until the answer or hang-up, probe result)``."""
+    s = socket.create_connection(("127.0.0.1", port), timeout=wait)
+    started = time.monotonic()
+    answered = b""
+    probed = None
+    try:
+        lines = [f"POST {route} HTTP/1.1", f"Host: 127.0.0.1:{port}", "Content-Type: application/json",
+                 f"Content-Length: {declared}"] + [f"{k}: {v}" for k, v in extra.items()]
+        s.sendall(("\r\n".join(lines) + "\r\n\r\n").encode("ascii"))
+        s.setblocking(False)
+        for i in range(len(payload)):
+            try:
+                s.sendall(payload[i:i + 1])
+            except OSError:
+                break
+            if i == 2 and probe is not None:
+                probed = probe()
+            end = time.monotonic() + gap
+            while time.monotonic() < end and not answered:
+                try:
+                    got = s.recv(65536)
+                except BlockingIOError:
+                    time.sleep(0.02)
+                    continue
+                except OSError:
+                    break
+                if not got:
+                    break
+                answered += got
+            if answered:
+                break
+        if not answered:
+            s.setblocking(True)
+            s.settimeout(wait)
+            try:
+                while b"\r\n\r\n" not in answered:
+                    got = s.recv(65536)
+                    if not got:
+                        break
+                    answered += got
+            except OSError:
+                pass
+        code = int(answered.split(b" ", 2)[1]) if answered.startswith(b"HTTP/") else None
+        return code, answered, time.monotonic() - started, probed
+    finally:
+        s.close()
+
+
+def _body_of(answer: bytes) -> dict:
+    return json.loads(answer.partition(b"\r\n\r\n")[2] or b"{}")
+
+
+@pytest.mark.parametrize("family", FAMILIES)
+def test_a_body_that_trickles_is_cut_at_one_total_deadline_and_frees_its_gate(tmp_path, family, monkeypatch):
+    """Twelve bytes at 0.4 s apiece, each well inside the socket timeout, against a 1 s total deadline: a 408 in fixed
+    words with the connection closed, in a bounded time, and every gate the read held is free again. Red with the
+    family's read site back on ``self.rfile.read(clen)`` (the trickle then runs to its end, ~5 s, and the answer is the
+    route's own)."""
+    monkeypatch.setattr(http_guards, "BODY_DEADLINE_S", 1.0)
+    with _te_target(family, tmp_path) as (port, route, extra, _body):
+        httpd = _LIVE["httpd"]
+        idle = _gates(httpd)
+        code, answered, seconds, held = _trickle_post(port, route, extra, 12, b"x" * 12, 0.4, 10,
+                                                      probe=lambda: _held(httpd, idle))
+        assert code == 408, (family, seconds, answered[:300])
+        assert seconds < 3.5, seconds
+        assert held, f"{family}: the read was not under a gate, so this test shows nothing about gates"
+        payload = _body_of(answered)
+        assert payload == {"error": "request_timeout", "message": http_guards.BODY_TIMEOUT_WORDS}
+        assert b"connection: close" in answered.lower().split(b"\r\n\r\n")[0]
+        deadline = time.monotonic() + 5
+        while _held(httpd, idle) and time.monotonic() < deadline:
+            time.sleep(0.02)
+        assert _held(httpd, idle) == []
+
+
+# (family, bytes declared over the route's cap, whether a gate is already held when the refused body is drained)
+_DRAINS = [("edit", "web", True), ("init", "init", False), ("receipt", "receipt", True)]
+
+
+@pytest.mark.parametrize("family,cap_of,gated", _DRAINS, ids=[d[0] for d in _DRAINS])
+def test_the_drain_of_a_refused_body_is_cut_at_the_same_deadline_and_still_answers_413(
+        tmp_path, family, cap_of, gated, monkeypatch):
+    """A body declared over the cap is drained (bounded) before the 413, and that drain read per recv too: a trickle
+    held the thread, and on ``/edit`` and the receipt carve-out the gate, for as long as the client liked. The drain
+    stops at the deadline and the 413 is still sent (the refusal is the true answer; the drain is best effort). Red
+    with ``_drain`` back on ``self.rfile.read(...)`` (no answer inside the window)."""
+    from levain import init_server, web_server
+    cap = {"web": web_server._MAX_POST_BYTES, "init": init_server._MAX_INIT_BODY,
+           "receipt": web_server._RECEIPT_BODY_MAX}[cap_of]
+    monkeypatch.setattr(http_guards, "BODY_DEADLINE_S", 1.0)
+    with _te_target(family, tmp_path) as (port, route, extra, _body):
+        httpd = _LIVE["httpd"]
+        idle = _gates(httpd)
+        code, answered, seconds, held = _trickle_post(port, route, extra, cap + 1, b"x" * 12, 0.4, 5,
+                                                      probe=lambda: _held(httpd, idle))
+        assert code == 413, (family, seconds, answered[:300])
+        assert seconds < 3.0, seconds
+        assert bool(held) == gated, (family, held)
+        assert _body_of(answered)["error"] == "too_large"
+        deadline = time.monotonic() + 5
+        while _held(httpd, idle) and time.monotonic() < deadline:
+            time.sleep(0.02)
+        assert _held(httpd, idle) == []
+
+
+@pytest.mark.parametrize("family", FAMILIES)
+def test_a_slow_but_honest_body_in_pieces_is_read_whole_and_answered_by_its_route(tmp_path, family):
+    """The unchanged half: a body that arrives in three pieces 0.2 s apart, well inside the default deadline, reaches the
+    route whole (a dropped or reordered piece is a ``bad_json``), is answered by the route and not the guard, and the
+    pipelined GET after it is served on the same connection. Red with the reader keeping only its first piece."""
+    with _te_target(family, tmp_path) as (port, route, extra, body):
+        third = max(1, len(body) // 3)
+        pieces = [body[:third], body[third:2 * third], body[2 * third:]]
+        s = socket.create_connection(("127.0.0.1", port), timeout=3)
+        got = b""
+        try:
+            lines = [f"POST {route} HTTP/1.1", f"Host: 127.0.0.1:{port}", "Content-Type: application/json",
+                     f"Content-Length: {len(body)}"] + [f"{k}: {v}" for k, v in extra.items()]
+            s.sendall(("\r\n".join(lines) + "\r\n\r\n").encode("ascii"))
+            for piece in pieces:
+                time.sleep(0.2)
+                s.sendall(piece)
+            s.sendall(f"GET / HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\n\r\n".encode("ascii"))
+            try:
+                while len(_responses(got)) < 2:
+                    chunk = s.recv(65536)
+                    if not chunk:
+                        break
+                    got += chunk
+            except TimeoutError:
+                pass
+        finally:
+            s.close()
+    assert len(_responses(got)) == 2, f"{family}: {_responses(got)} {got[:400]!r}"
+    assert 408 not in _responses(got) and b"bad_json" not in got and b"request_timeout" not in got
+
+
+def test_read_body_returns_the_short_bytes_when_the_client_closes_early_and_none_after_a_reset(tmp_path):
+    """The reader's three outcomes without a socket: a closed client gives the bytes it did send (the route's own
+    JSON check then answers, as before), a spent deadline answers 408 and a reset closes without an answer."""
+    class _R:
+        def __init__(self, steps):
+            self.steps = list(steps)
+
+        def read1(self, n):
+            step = self.steps.pop(0)
+            if isinstance(step, BaseException):
+                raise step
+            return step[:n]
+
+    class _C:
+        def __init__(self):
+            self.timeouts = []
+
+        def settimeout(self, t):
+            self.timeouts.append(t)
+
+    class _H(http_guards.GuardedHandler):
+        def __init__(self, steps):                       # no socket: only what the reader touches
+            self.rfile, self.connection, self.close_connection = _R(steps), _C(), False
+            self.sent = []
+
+        def _reject(self, status, error, message):
+            self.close_connection = True
+            self.sent.append((status, error, message))
+
+    h = _H([b"ab", b""])
+    assert h._read_body(5) == b"ab" and h.sent == [] and h.connection.timeouts[-1] == http_guards.GuardedHandler.timeout
+    h = _H([b"ab", ConnectionResetError()])
+    assert h._read_body(5) is None and h.sent == [] and h.close_connection
+    h = _H([b"ab", TimeoutError()])
+    assert h._read_body(5) is None and h.sent == [(408, "request_timeout", http_guards.BODY_TIMEOUT_WORDS)]
+    h = _H([b"abcde"])
+    assert h._read_body(5, 0.0) is None and h.sent[0][0] == 408      # a spent budget never starts a recv
+
+
+def test_no_handler_reads_a_request_body_with_a_bare_rfile_read():
+    """The structural pin: a body-reading site written later with ``self.rfile.read(n)`` waits per recv and brings back
+    the trickle this section closes. Every read goes through ``GuardedHandler._read_body`` / ``_drain``."""
+    root = Path(http_guards.__file__).resolve().parent
+    offenders = sorted(f"{p.relative_to(root)}:{i}" for p in root.rglob("*.py")
+                       for i, line in enumerate(p.read_text(encoding="utf-8").splitlines(), 1)
+                       if "rfile.read(" in line)
+    assert offenders == [], offenders
