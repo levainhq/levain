@@ -4468,6 +4468,10 @@
   // write token and an offered verb the body shows one button per option and a words box; without them it shows the CLI
   // command to copy. Every string is drawn with textContent, never as HTML; an answer authorises nothing (ruling 26a).
   const questionBodies = new Map();
+  // question n -> the short handle of its words (needsName), learned when the words are read. It outlives a closed view on purpose
+  // (the glance tile names the item after the dialog closes) and is a few words, bounded to the newest QUESTION_HANDLES_MAX.
+  const questionHandles = new Map();
+  const QUESTION_HANDLE_WORDS = 6, QUESTION_HANDLE_CHARS = 60, QUESTION_HANDLES_MAX = 200;
   // a refused send's words, by question id: a stale refusal empties the box so the owed re-read is not held off by it,
   // and a redraw that still shows the question open gives the words back
   const questionDrafts = new Map();
@@ -4485,6 +4489,11 @@
       },
       () => ({ error: "the question could not be read (network)" }));
   }
+  function rememberQuestionHandle(n, handle) {
+    questionHandles.delete(n);
+    questionHandles.set(n, handle);
+    if (questionHandles.size > QUESTION_HANDLES_MAX) questionHandles.delete(questionHandles.keys().next().value);
+  }
   function questionBody(q, row) {
     const key = q.n + "|" + q.state;
     if (questionBodies.has(key)) return questionBodies.get(key);
@@ -4492,7 +4501,11 @@
     const headers = t && typeof t.headers === "function" ? t.headers() : {};
     if (!headers["X-Levain-Write-Token"]) return Promise.resolve({ error: CONSENT_NO_TOKEN, noToken: true });
     const got = consentQueued(() => questionFetch(q, headers, 1), "the question could not be read", row)
-      .then((b) => { if (b.error && questionBodies.get(key) === got) questionBodies.delete(key); return b; });
+      .then((b) => {
+        if (b.error && questionBodies.get(key) === got) questionBodies.delete(key);
+        else if (!b.error && typeof b.what === "string") { const h = questionHandle(b.what); if (h) rememberQuestionHandle(q.n, h); }
+        return b;
+      });
     questionBodies.set(key, got);
     return got;
   }
@@ -5997,9 +6010,28 @@
     return !!(h && h["X-Levain-Write-Token"]);
   }
   const needsKey = (it) => (it.kind === "consent" ? "c:" + it.c.id + "|" + it.c.state + "|" + it.c.expiresAt : "q:" + it.q.n + "|" + it.q.state + (it.q.state === "answered" ? "|" + (hasWriteToken() ? "t" : "-") : ""));
-  // the name a glance tile gives the top item: the tool and who asked, or the question's number (its words are fetched, not in the row)
+  // the name a glance tile gives the top item, and the focus view's dialog title the same (one helper so they cannot drift).
+  // A consent is its tool and who asked. A question is a short handle from its own words and who asked; the wire row carries no words
+  // (they are fetched with the page's token, questionBody), so until they have been read the name is "<agent> · question" and the
+  // band number when the last band read gave one. The question's long number (flow's card number) is the answer key, never a name:
+  // it stays in q.n, which the answer path sends, and is not drawn here.
   function needsName(it) {
-    return it.kind === "consent" ? (it.c.tool || "request") + " · " + (it.c.agent || "agent") : "question #" + it.q.n + " · " + (it.q.agent || "agent");
+    if (it.kind === "consent") return (it.c.tool || "request") + " · " + (it.c.agent || "agent");
+    const handle = questionHandles.get(it.q.n);
+    if (handle) return handle + " · " + (it.q.agent || "agent");
+    const band = bandNumOf.get(Number(it.q.n));
+    return (it.q.agent || "agent") + " · question" + (band === undefined ? "" : " · band " + band);
+  }
+  // A question's handle: the first line of its words, cut to its first few words on a word boundary with an ellipsis (a long
+  // unbroken token is cut by characters). "" when there are no words to take.
+  function questionHandle(what) {
+    const line = String(what || "").split(/\r?\n/).map((l) => l.trim()).find(Boolean) || "";
+    const words = line.split(/\s+/).filter(Boolean);
+    if (!words.length) return "";
+    let out = words.slice(0, QUESTION_HANDLE_WORDS).join(" ");
+    let cut = words.length > QUESTION_HANDLE_WORDS;
+    if (out.length > QUESTION_HANDLE_CHARS) { out = out.slice(0, QUESTION_HANDLE_CHARS); cut = true; }
+    return cut ? out.replace(/[\s,;:.\-–—(]+$/, "") + "…" : out;
   }
   function needsSummary(items) {
     const nc = items.filter((it) => it.kind === "consent").length, nq = items.length - nc;
@@ -6029,7 +6061,7 @@
     const id = needsIdOf(it);
     modalCustom = {
       id,
-      title: it.kind === "consent" ? (it.c.tool || "request") + " · " + (it.c.agent || "agent") : "Question #" + it.q.n + " · " + (it.q.agent || "agent"),
+      title: needsName(it),
       build: () => (it.kind === "consent" ? consentCard(it.c) : questionCard(it.q)),
     };
     modalGlance = false;
@@ -6037,6 +6069,18 @@
     modalReturnFocus = opener || null;
     modalEpisodeQuery = "";
     buildModal(null);
+    // a question's handle comes from its words, which are fetched: the title is retaken when they land (the card reads the same fetch)
+    if (it.kind === "question") Promise.resolve(questionBody(it.q, null)).then(() => retitleNeedsFocus(it, id), () => {});
+  }
+  function retitleNeedsFocus(it, id) {
+    if (!modalCustom || modalCustom.page || modalCustom.id !== id) return;
+    const title = needsName(it);
+    if (title === modalCustom.title) return;
+    modalCustom.title = title;
+    const h = document.getElementById("levain-modal-title");
+    if (h) h.textContent = title;
+    const region = document.querySelector("#levain-modal .modal-body");
+    if (region) region.setAttribute("aria-label", title + " — scrollable content");
   }
   // The way in for another script's focus view (the Board tab's ⤢): a custom modal with that script's own content. `live` keeps it open
   // across a dashboard refresh and rebuilds its content then (refreshModal); a modal that is not live is closed as a Needs-you card is.
