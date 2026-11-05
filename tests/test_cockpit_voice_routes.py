@@ -935,8 +935,8 @@ def test_t_caps_reaching_a_cap_exactly_is_allowed_and_passing_it_is_refused_nami
 # contained-shell and inert grants, so a voice key never reached the grant page; and nothing tied the cockpit the grant
 # routes act on (the consent hook's) to the one read_key replays (broker.data_root).
 
-def _hook(qdir: Path, root: Path) -> None:
-    (qdir / "claude_code.json").write_text(json.dumps({"cockpit_data_root": str(root), "away_mode": False,
+def _hook(queue: Path, root: Path) -> None:
+    (queue / "claude_code.json").write_text(json.dumps({"cockpit_data_root": str(root), "away_mode": False,
                                                        "away_hold_seconds": 0}))
 
 
@@ -984,15 +984,15 @@ def _phone(ck: "KeyedCockpit"):
     return phone
 
 
-def _grant_phone(qdir: Path):
+def _grant_phone(queue: Path):
     """The cockpit's grant routes exactly as make_server builds them: over the consent queue, acting on sign_root."""
     from levain.consent.answering import passkey_keys
     from levain.consent.grant_phone import GrantPhone
     from levain.consent.sign import sign_root
 
-    return GrantPhone(qdir, RP, None,
-                      lambda: {k.fingerprint: k for k in passkey_keys(custody.authority_for(sign_root(qdir))(), RP)},
-                      lambda: sign_root(qdir))
+    return GrantPhone(queue, RP, None,
+                      lambda: {k.fingerprint: k for k in passkey_keys(custody.authority_for(sign_root(queue))(), RP)},
+                      lambda: sign_root(queue))
 
 
 def test_t_rev_a_phone_passkey_revoke_of_the_voice_key_stops_the_next_speak(rig):
