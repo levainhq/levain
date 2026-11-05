@@ -106,7 +106,14 @@ async function run(query, shotName, midShot) {
   const shot = async (name) => { if (outdir === '-') return; const r = await s.send('Page.captureScreenshot', { format: 'png' }); writeFileSync(join(outdir, name), Buffer.from(r.result.data, 'base64')); };
   if (midShot) { await sleep(520); await shot(midShot); }
   let res = '';
-  for (let i = 0; i < 40 && !res.startsWith('RESULT'); i++) { await sleep(300); const r = await s.send('Runtime.evaluate', { expression: 'document.getElementById("result").textContent', returnByValue: true }); res = r.result.result.value; }
+  // A poll answers a string only once the driver page is loaded: before that (the navigation still in flight, so the old
+  // document has no #result) the evaluate throws and carries no value. Wait for a string; the deadline below is unchanged.
+  for (let i = 0; i < 40 && !res.startsWith('RESULT'); i++) {
+    await sleep(300);
+    const r = await s.send('Runtime.evaluate', { expression: 'document.getElementById("result").textContent', returnByValue: true });
+    const v = r.result?.result?.value;
+    res = typeof v === 'string' ? v : '';
+  }
   if (shotName) await shot(shotName);
   s.close(); return res;
 }
