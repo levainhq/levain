@@ -5019,7 +5019,7 @@
   // the door below refused because no tap asked (NoTapError): no prompt was shown, so it is never called a cancel
   const signDeclined = (e, what) => (e && e.name === "NoTapError"
     ? "no passkey prompt was shown (no tap asked for one in time); " + what + ": tap to try again"
-    : "the passkey did not sign (" + ((e && e.name) || "cancelled") + "); " + what + ": tap to try again");
+    : "the passkey did not sign (" + ((e && e.name) || "cancelled") + "); " + what + ": tap to try again; if this device holds no passkey for this cockpit, make one with Make a passkey on this device");
   const signWhy = (r) => (r.body && typeof r.body.message === "string" && r.body.message) || ("refused (HTTP " + r.status + ")");
   // The one door to the authenticator. navigator.credentials.get is called from here and nowhere else in this file, and only
   // while a tap is armed. Only a person's own press arms it (event.isTrusted): a click on a control, Space or Enter on a
@@ -5554,6 +5554,10 @@
         signInFlight.get(id).add(() => { lock(false); if (freeze) freeze.release(); });
       }
       wrap.appendChild(acts);
+      // a standing way to make a passkey for this name on THIS device: the error link above shows only while nobody has one
+      const mkStanding = el("a", "sign-enrol-link sign-enrol-standing", "Make a passkey on this device");
+      mkStanding.href = "/enrol";
+      wrap.appendChild(mkStanding);
       if (nc) wrap.appendChild(window.LevainCardFormat.drawDetail(nc, options));
       if (unsettled) {          // the last answer may still sign: nothing here is offered until the cockpit settles it
         lock(true);

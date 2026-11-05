@@ -214,3 +214,27 @@ def test_a_passkey_the_page_cannot_read_is_named_and_nothing_is_sent(tmp_path: P
         ])
     assert 'A passkey named "levain ' in out["values"][-1], out["values"]
     assert out["posts"] == []
+
+
+@needs_browser
+@needs_ssh
+def test_a_device_that_can_sign_still_gets_the_standing_link_on_the_card_and_the_sheet(tmp_path: Path, monkeypatch) -> None:
+    # Phill 11-05: the link under the error is gone once any passkey is enrolled, and a device whose store lacks that
+    # passkey then has no way forward. The standing entry is on every card's sign area and on every sheet.
+    rig = _Rig(tmp_path, monkeypatch)            # the cockpit holds an enrolled passkey for this name
+    with rig.serving():
+        card = _drive(tmp_path, f"{rig.origin}/#write_token={TOK}", [
+            DESKTOP, rig.authenticator(),
+            {"until": STRIP_FACET + " && 1", "ms": 30000},
+            {"eval": "(() => { const a = document.querySelector('#levain-modal .needs-question .sign-facet a.sign-enrol-standing');"
+                     " return a ? a.getAttribute('href') + '|' + a.textContent : null; })()"},
+        ])
+        sheet = _drive(tmp_path, f"{rig.origin}/nope", [
+            DESKTOP, rig.authenticator(),
+            {"eval": f"(() => {{ window.localStorage.setItem('levain_write_token', {json.dumps(TOK)}); "
+                     f"location.href = '/sign/{QRID}'; return 1; }})()"},
+            {"until": "document.getElementById('sheet-enrol-link') && 1", "ms": 30000},
+            {"eval": "document.getElementById('sheet-enrol-link').getAttribute('href')"},
+        ])
+    assert card["values"][1] == "/enrol|Make a passkey on this device", card["values"]
+    assert sheet["values"][2] == "/enrol", sheet["values"]

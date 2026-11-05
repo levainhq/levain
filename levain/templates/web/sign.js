@@ -68,6 +68,7 @@
   // the drop sheet inside the cockpit's modal IS the modal's body: no card, no brand line, no title of its own (the modal's
   // heading names it), the full width. Opened on its own (the phone) it keeps the card.
   const embedded = framed && location.pathname === "/sign/drop";
+  { const ml = document.getElementById("sheet-enrol-link"); if (ml && framed) ml.target = "_top"; }   // /enrol refuses a frame
   if (embedded) {
     document.body.classList.add("sheet-embedded");
     const h1 = document.getElementById("sheet-title");
@@ -160,7 +161,7 @@
   function passkeyWhy(e) {
     const n = e && e.name;
     if (n === "NoTapError") return "No passkey prompt was shown (no tap asked for one in time), so the passkey did not sign";
-    if (!n || n === "NotAllowedError") return "You cancelled, or the passkey prompt timed out, so the passkey did not sign";
+    if (!n || n === "NotAllowedError") return "You cancelled, or the passkey prompt timed out, so the passkey did not sign (if this device holds no passkey for this cockpit, make one with Make a passkey on this device?)";
     return "The passkey did not sign (" + n + ")";
   }
 
