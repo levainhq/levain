@@ -11,7 +11,8 @@ difference is classified on its own (:func:`classify`). A declared op that disag
 delta is refused, and so is a link that changes nothing.
 
 A link is written :data:`FORMAT` or, when it needs a rule an older replay does not have, :data:`FORMAT_V2`,
-:data:`FORMAT_V3` or :data:`FORMAT_V4`; each link has one form (:func:`_link_format`), and the replay refuses the others.
+:data:`FORMAT_V3`, :data:`FORMAT_V4` or :data:`FORMAT_V5`; each link has one form (:func:`_link_format`), and the
+replay refuses the others.
 
 The anchor (``anchor/authority.anchor`` in the store's data root, its directory excluded from Time Machine
 so a restore of the data root cannot roll it back with the log) is written only after a commit, so it lags
@@ -57,6 +58,7 @@ __all__ = [
     "CONSENT_MCP_GRANT_KIND", "CONSENT_MCP_READ_ONLY_TOOLS",
     "CONSENT_GRANTABLE_TOOLS", "CONSENT_POSTURES", "CONSENT_SHELL_TOOLS",
     "CUSTODIES", "DISPLAY_PHONE", "EGRESS_KEY_KIND", "FIDO_ATTESTED", "FORMAT", "FORMAT_V2", "FORMAT_V3", "FORMAT_V4",
+    "FORMAT_V5", "VOICE_KEY_KIND", "VOICE_KEY_PROVIDERS", "VOICE_KEY_USES", "voice_key_for", "voice_key_record",
     "GRADUATION_CREATE_RANK",
     "GRADUATION_GRANT_MAX", "GRADUATION_KIND", "HANDS_MCP_KIND", "GRADUATION_OPT_IN_RANK", "GRADUATION_PHONE_KIND", "PASSKEY",
     "NAMESPACE", "RESET_FORMAT", "RESET_NAMESPACE", "SCHEMA",
@@ -95,8 +97,13 @@ FORMAT_V3 = "levain-authority/3"
 # any link after it either: every levain that reads this log must be the build that knows the agent kinds before one
 # is signed.
 FORMAT_V4 = "levain-authority/4"
+# The format of a link that brings in a ``voice-key`` (:data:`VOICE_KEY_KIND`). That record carries no ``expires_at``
+# (a voice key stands until revoked), and the envelope an older replay holds an unknown kind to requires one, so an
+# older replay would refuse the whole log at that link rather than hold the record inert. Written /5, an older
+# replay stops at it (its format check) instead.
+FORMAT_V5 = "levain-authority/5"
 # the formats this replay takes; one named place, so a test can stand an older replay up by narrowing it
-_KNOWN_FORMATS = (FORMAT, FORMAT_V2, FORMAT_V3, FORMAT_V4)
+_KNOWN_FORMATS = (FORMAT, FORMAT_V2, FORMAT_V3, FORMAT_V4, FORMAT_V5)
 RESET_FORMAT = "levain-authority-reset/1"
 RESET_NAMESPACE = "levain-authority-reset"
 ANCHOR_NAME = "authority.anchor"
@@ -296,6 +303,24 @@ _EGRESS_KEY_TEXT = re.compile(r"[\x21-\x7e](?:[\x20-\x7e]{0,253}[\x21-\x7e])?")
 # a basic-auth user id: printable, no space and no ':' (RFC 7617 section 2: the user-id cannot hold a colon)
 _EGRESS_KEY_USER = re.compile(r"[\x21-\x39\x3b-\x7e]{1,255}")
 _EGRESS_KEY_REPOS_MAX = 256
+# A voice key record (voice V1-1, design §3.1): the operator names ONCE, under the log's rule for a loosen (a
+# laptop-presence key), the keychain item (``source`` = service, ``account``) from which the server reads ONE
+# speech provider's API key, and which ``uses`` of it are allowed. Names only: the value never enters a link. It is
+# not an egress key: it attaches nothing inside a sandbox and declares no repo or host (each provider's host is a
+# constant of the server's adapter), so overloading :data:`EGRESS_KEY_KIND` would make one record mean two things.
+# A voice key STANDS UNTIL REVOKED (design Q1(a): its reach is the operator's own provider account under a cap, and
+# a monthly re-sign is friction with no criterion behind it), so the record has no ``expires_at``, and its link is
+# written :data:`FORMAT_V5` (see there). Its terms are fixed under its id: a replacement is a new id in one
+# ``loosen`` that drops the old record. At most one voice key per provider is in the policy (a replay rule,
+# :func:`_voice_key_step_checks`). Creating one is a laptop-presence act (the rank of a loosen; a passkey creates
+# nothing but a graduation policy), so a surface token or the phone can never point the room's words at another
+# account; any enrolled key, a passkey included, may revoke one, and a revoke stops the next read.
+VOICE_KEY_KIND = "voice-key"
+VOICE_KEY_PROVIDERS = ("deepgram", "elevenlabs", "openai")
+VOICE_KEY_USES = ("stt", "tts")
+_VOICE_KEY_FIELDS = frozenset({"id", "kind", "provider", "uses", "source", "account"})
+_VOICE_KEY_ID = re.compile(r"vk-[0-9a-f]{12}")
+_VOICE_KEY_FIXED = "a voice key's terms are fixed: revoke it and set another"
 # Ruling 1: a shell command is never parsed, so a grant naming a shell tool would allow every command. Both agents
 # name their shell tool Bash in a PermissionRequest (Claude Code; Codex 0.162.1's exec_command, measured in Q0 item
 # 6, Q3 and 1017-shellnames). Codex 0.162.1 names the input it sends to a running terminal ``write_stdin`` (its
@@ -1162,6 +1187,61 @@ def egress_key_incarnation(state: AuthoritySnapshot, record_id: str) -> str | No
     return f"{born}:{hashlib.sha256(meaning.encode()).hexdigest()}" if meaning is not None else None
 
 
+def _validate_voice_key(grant: Mapping[str, Any], what: str, at: datetime | None) -> dict[str, Any]:
+    """A voice key record's shape (:data:`VOICE_KEY_KIND`): names only, no expiry and no value."""
+    if set(grant) != _VOICE_KEY_FIELDS:
+        raise AuthorityError(f"{what} (a voice key) must carry exactly {', '.join(sorted(_VOICE_KEY_FIELDS))}")
+    if not isinstance(grant["id"], str) or not _VOICE_KEY_ID.fullmatch(grant["id"]):
+        raise AuthorityError(f"{what}.id must match {_VOICE_KEY_ID.pattern}")
+    if not isinstance(grant["provider"], str) or grant["provider"] not in VOICE_KEY_PROVIDERS:
+        raise AuthorityError(f"{what}.provider must be one of {', '.join(VOICE_KEY_PROVIDERS)}")
+    uses = grant["uses"]
+    if not isinstance(uses, (list, tuple)) or not uses or not all(isinstance(u, str) and u in VOICE_KEY_USES
+                                                                  for u in uses):
+        raise AuthorityError(f"{what}.uses must be a non-empty list drawn from {', '.join(VOICE_KEY_USES)}")
+    if list(uses) != sorted(set(uses)):
+        raise AuthorityError(f"{what}.uses must be sorted and unique")
+    for name in ("source", "account"):
+        if not isinstance(grant[name], str) or not _EGRESS_KEY_TEXT.fullmatch(grant[name]):
+            raise AuthorityError(f"{what}.{name} must be 1 .. 255 printable ASCII characters (the keychain item's "
+                                 f"{'service' if name == 'source' else name})")
+    return _thaw(grant)
+
+
+def _voice_key_change(o: Mapping[str, Any], n: Mapping[str, Any], o_exp: datetime | None,
+                      n_exp: datetime | None) -> str:
+    """A voice key has no change: every one is refused (a replacement is a new id)."""
+    raise AuthorityError(_VOICE_KEY_FIXED)
+
+
+def voice_key_record(grant: Any) -> bool:
+    """Whether ``grant`` is a voice key record this levain knows (:data:`VOICE_KEY_KIND`). A voice key is live
+    exactly while the policy holds it: it has no expiry, and a revoke removes it."""
+    return isinstance(grant, Mapping) and grant.get("kind") == VOICE_KEY_KIND \
+        and _grant_kind(grant) is _GRANT_KINDS[VOICE_KEY_KIND]
+
+
+def voice_key_for(grants: Mapping[str, Any], provider: str) -> Mapping[str, Any] | None:
+    """The one voice key ``provider`` has in ``grants``, or None. The replay admits at most one per provider
+    (:func:`_voice_key_step_checks`); a mapping holding two (a caller's own construction) is None, never a pick."""
+    found = [g for g in grants.values() if voice_key_record(g) and g["provider"] == provider]
+    return found[0] if len(found) == 1 else None
+
+
+def _voice_key_step_checks(new: StandingPolicy) -> None:
+    """The one-per-provider rule, a replay rule (a voice key has no expiry to make "live" a clock question): a policy
+    holding two voice keys for one provider is refused, so a replacement is the one ``loosen`` that drops the old
+    record as it adds the new."""
+    seen: dict[str, str] = {}
+    for gid, g in sorted(new.grants.items()):
+        if not voice_key_record(g):
+            continue
+        if g["provider"] in seen:
+            raise AuthorityError(f"one voice key per provider: {g['provider']} already has {seen[g['provider']]!r}; "
+                                 "replace it in one link or revoke it first")
+        seen[g["provider"]] = gid
+
+
 def graduation_grant(grant: Any) -> bool:
     """Whether ``grant`` is a graduation policy this levain knows (:data:`GRADUATION_KIND`)."""
     return isinstance(grant, Mapping) and grant.get("kind") == GRADUATION_KIND
@@ -1895,6 +1975,8 @@ _GRANT_KINDS: Mapping[str | None, _GrantKind] = MappingProxyType({
                                        renew_checks=(lambda g, after: _consent_mcp_tool_check(g, after),),
                                        consent=True, passkey_revocable=True),
     EGRESS_KEY_KIND: _GrantKind(validate=_validate_egress_key, change=_egress_key_change),
+    VOICE_KEY_KIND: _GrantKind(validate=_validate_voice_key, change=_voice_key_change, passkey_revocable=True,
+                               expires=False, fixed=_VOICE_KEY_FIXED),
     CONSENT_CONTAINED_SHELL_KIND: _GrantKind(validate=_validate_contained_shell_grant,
                                              change=_contained_shell_grant_change,
                                              append_checks=(lambda g: _consent_home_check(g),),
@@ -2138,8 +2220,9 @@ def _agent_link_step_checks(old: StandingPolicy, new: StandingPolicy, op: str, a
 
 def _link_format(policy: StandingPolicy, rec: Mapping[str, Any], signer_custody: str) -> str:
     """The one format a link carrying ``rec`` (its op fields), signed by a key of ``signer_custody``, is written in
-    after ``policy``: :data:`FORMAT_V4` for a link that brings in an agent link or carries ``revoke_agent``, tested
-    before every other; else :data:`FORMAT_V3` for a link that brings in a graduation policy carrying a ``guard`` (by
+    after ``policy``: :data:`FORMAT_V5` for a link that brings in a voice key, tested before every other;
+    else :data:`FORMAT_V4` for a link that brings in an agent link or carries ``revoke_agent``, tested
+    before the rest; else :data:`FORMAT_V3` for a link that brings in a graduation policy carrying a ``guard`` (by
     create_grant or loosen, whoever signs it); else :data:`FORMAT_V2` for a passkey's renew or create_grant, and for a
     link that brings in a graduation opt-in; :data:`FORMAT` for every other. :func:`prepare` writes it and the replay
     holds every link to it. A guard enters the log only by a ``/3`` link and never changes after it (a graduation
@@ -2155,7 +2238,10 @@ def _link_format(policy: StandingPolicy, rec: Mapping[str, Any], signer_custody:
         brought = [g for gid, g in grants.items() if gid not in policy.grants] if isinstance(grants, Mapping) else []
     else:
         brought = []
-    # first, before /3: a replay that stops at /3 must stop at any link that authorises or revokes an agent
+    # first of all: a replay that stops at /4 must stop at a voice key, which an older replay cannot hold inert
+    if any(isinstance(g, Mapping) and g.get("kind") == VOICE_KEY_KIND for g in brought):
+        return FORMAT_V5
+    # then, before /3: a replay that stops at /3 must stop at any link that authorises or revokes an agent
     if op == "revoke_agent" or any(isinstance(g, Mapping) and g.get("kind") == AGENT_LINK_KIND for g in brought):
         return FORMAT_V4
     if any(isinstance(g, Mapping) and g.get("kind") == GRADUATION_KIND and "guard" in g for g in brought):
@@ -2276,6 +2362,7 @@ def _step(state: AuthoritySnapshot | None, row: _Row, *, ssh_keygen: Path | str,
             if isinstance(need, StandingPolicy):
                 _graduation_step_checks(state.policy, need, keys, op)
                 _agent_link_step_checks(state.policy, need, op, at)
+                _voice_key_step_checks(need)
             want = _link_format(state.policy, rec, signer.custody)
             if rec["format"] != want:
                 raise AuthorityError(f"this {op} link carries {rec['format']}; a link like it is written {want}")

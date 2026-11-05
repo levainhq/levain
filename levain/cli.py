@@ -647,6 +647,8 @@ def build_parser() -> argparse.ArgumentParser:
     _add_consent_receipts_parser(cs_sub)
     _add_binding_parser(subparsers, _ck_common)
     _add_chat_parser(subparsers, _ck_common)
+    from levain.voice.cli import add_parsers as _add_voice_parsers
+    _add_voice_parsers(subparsers, _ck_common)
     _add_push_parser(subparsers)
     _add_publish_parser(subparsers)
     _add_limits_parser(subparsers)

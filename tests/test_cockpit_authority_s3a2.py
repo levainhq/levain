@@ -769,6 +769,9 @@ PER_ACT_APPENDERS = {
     # agents.signing._sign_op (P5a-2a): prepare and append in two separate autocommit blocks of one journal it opens
     # per act, the signature taken between them OUTSIDE any transaction (_check_the_signing_module holds that)
     ("agents/signing.py", "_sign_op"): ("append", "prepare"),
+    # voice.custody.add_key (V1-1): a voice key's create or replacing loosen, prepared and appended inside one
+    # autocommit block of a journal it opens per act, like key_setup.setup_key
+    ("voice/custody.py", "add_key"): ("append", "prepare"),
 }
 
 
@@ -965,7 +968,9 @@ def _check_the_appenders(root: Path) -> None:
                                  ("cli.py", "_signed_append", "prepare"),
                                  ("cockpit/keys.py", "_append", "sign_and_append"),
                                  ("consent/grants.py", "append_revoke", "append"),
-                                 ("consent/grants.py", "prepare_revoke", "prepare")]
+                                 ("consent/grants.py", "prepare_revoke", "prepare"),
+                                 ("voice/custody.py", "add_key", "append"),
+                                 ("voice/custody.py", "add_key", "prepare")]
     for (rel, name), calls in PER_ACT_APPENDERS.items():
         _check_per_act_append(_function(ast.parse((root / rel).read_text(encoding="utf-8")), name), calls)
     _check_the_signing_module(ast.parse((root / "agents" / "signing.py").read_text(encoding="utf-8")))
