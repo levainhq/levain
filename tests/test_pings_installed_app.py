@@ -137,9 +137,11 @@ def _words_for(tmp_path, rig, init: str) -> str:
 
 
 @needs_browser
-def test_ipados_desktop_mode_with_no_push_api_gets_the_home_screen_words(rig, tmp_path) -> None:
-    # no iPad in the user agent: a Mac platform with a touch screen is how iPadOS desktop mode reports itself
-    assert _words_for(tmp_path, rig, _ua(DESKTOP) + IPADOS_DESKTOP_MODE + NO_PUSH) == HOME_WORDS
+def test_ipados_desktop_mode_with_no_push_api_in_a_tab_gets_the_install_coach(rig, tmp_path) -> None:
+    # no iPad in the user agent: a Mac platform with a touch screen is how iPadOS desktop mode reports itself. PWA2 reads that as
+    # iOS Safari, so the uninstalled tab gets the install coach in place of the old home-screen words (those stay where the coach
+    # is not shown: the CriOS iPad test above)
+    assert _words_for(tmp_path, rig, _ua(DESKTOP) + IPADOS_DESKTOP_MODE + NO_PUSH) == "Install Levain: tap Share, then Add to Home Screen."
 
 
 @needs_browser
