@@ -361,16 +361,22 @@ def test_sigterm_mid_session_tears_down_then_closes_the_lease(tmp_path: Path, mo
     rig = Rig(tmp_path, monkeypatch, FAKE_START="wait")
     started = rig.store / "started"
 
+    over = threading.Event()   # set when run() has returned: a late SIGTERM would hit pytest itself, handlers restored
+
     def kill_when_started() -> None:
         deadline = time.monotonic() + 20
-        while not started.exists() and time.monotonic() < deadline:
+        while not started.exists() and not over.is_set() and time.monotonic() < deadline:
             time.sleep(0.02)
-        os.kill(os.getpid(), signal.SIGTERM)
+        if started.exists() and not over.is_set():
+            os.kill(os.getpid(), signal.SIGTERM)
 
     t = threading.Thread(target=kill_when_started, daemon=True)
     before = signal.getsignal(signal.SIGTERM)
     t.start()
-    code = rig.run()
+    try:
+        code = rig.run()
+    finally:
+        over.set()
     t.join(5)
     assert [x["verb"] for x in rig.verbs()] == ["prepare", "render", "probe", "start", "teardown"]
     assert code == 1
