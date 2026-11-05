@@ -90,6 +90,11 @@
     const head = el("div", "zone-head");
     head.appendChild(el("div", "zone-title", "Devices"));
     head.appendChild(el("span", "zone-gloss", "who holds a key to this cockpit, and who may post to you"));
+    // a passkey is made per device and per name; once any one is enrolled the sign cards stop offering the page, so the
+    // paired surface itself always does (a Home Screen window cannot type an address)
+    const mk = el("a", "sign-enrol-link", "Make a passkey on this device");
+    mk.href = "/enrol";
+    head.appendChild(mk);
     section.appendChild(head);
     const grid = el("div", "ck-zgrid dev-grid");
     const panel = el("div", "panel k-list dev-panel");

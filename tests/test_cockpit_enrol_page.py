@@ -65,6 +65,8 @@ def test_the_page_and_its_script_are_served_and_name_the_gated_route(src) -> Non
     assert re.search(r'MAP_KEY = \(rp\) => "%s"' % re.escape(prefix), js)
     assert re.search(r'mapKey = \(rp\) => "%s"' % re.escape(prefix), load_web_asset("sign.js"))
     assert f'KEY_LINE = "{_KEY_LINE_ROUTE}"' in js
+    # the paired surface carries a standing link to it (the sign cards drop theirs once any passkey is enrolled)
+    assert re.search(r'mk\.href = "/enrol"', load_web_asset("devices_panel.js"))
 
 
 @needs_browser
