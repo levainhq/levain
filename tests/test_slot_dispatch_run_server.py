@@ -380,6 +380,11 @@ def test_an_unproven_end_after_a_refused_release_stays_registered_and_shutdown_r
     assert key in env.server._live
     env.runtime.end_ok = True
     env.server.shutdown(5)
+    for _ in range(250):                              # shutdown returns when the retry job is done; _run_end drops the holder
+        # from _live only AFTER it sets done (and shutdown's own wait is on done), so the settled state is the drop itself
+        if key not in env.server._live:
+            break
+        time.sleep(0.02)
     assert env.launcher.index.get(key)["state"] == "ended" and key not in env.server._live
     child._conn.close()
     env.drain()
