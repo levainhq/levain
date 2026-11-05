@@ -27,6 +27,19 @@ def _vendor_installed(monkeypatch):
     monkeypatch.setattr(_start, "vendor_ready", lambda host, vendor: None)
 
 
+@pytest.fixture(autouse=True)
+def _no_real_terminal_key(tmp_path):
+    """First wall of the keyguard: a test that forgot ``key_dir`` sees "no key" (a nonexistent per-test directory,
+    ``<tmp_path>/nohome/.levain/keys``), never the operator's Secure Enclave key whose Touch ID sheet opened on the
+    live laptop during lane runs. Its own MonkeyPatch, so a test's ``monkeypatch.undo()`` keeps it. The second wall is
+    ``refuse_real_key_in_tests`` in levain/cockpit/keys.py; custody's default key dir is already per-test
+    (``_isolate_levain_home`` and the scratch HOME below)."""
+    import levain.consent.terminal_sign as _ts
+    with pytest.MonkeyPatch.context() as own:
+        own.setattr(_ts, "_real_key_dir", lambda: tmp_path / "nohome" / ".levain" / "keys")
+        yield
+
+
 LIVE_SEATBELT_ENV = "LEVAIN_LIVE_SEATBELT"
 LIVE_SEATBELT_REASON = (
     f"applies a LIVE macOS Seatbelt profile on this host, off unless {LIVE_SEATBELT_ENV}=1: a hand-written Seatbelt "
@@ -89,30 +102,6 @@ def _no_operator_git_config_reads(monkeypatch):
     sets its own runner."""
     from levain.firing import confinement
     monkeypatch.setattr(confinement, "_run_git_config", lambda args, environ: None)
-
-
-@pytest.fixture(autouse=True)
-def _no_touch_id_from_any_test(monkeypatch):
-    """TEST ONLY: no test raises Touch ID on the operator's laptop. The two signer factories are the only doors to
-    the real terminal key (``~/.levain/keys``), and a band-answer test that parsed a line under a session reached it
-    through ``default_signer_factory`` with no key directory given (11-04: each run raised the sheet). A key under the
-    real key directory is refused here with an ``AssertionError`` (the sign step records it as an unsigned
-    ``signer-error``); any other key path (a test's own temp key) signs as before, and a test that patches either
-    factory itself replaces this guard."""
-    try:
-        from levain.consent import terminal_sign as ts
-    except ImportError:
-        return
-    real_dir = ts._real_key_dir()
-
-    def guard(factory):
-        def guarded(key_path, timeout=None):
-            if Path(key_path).resolve().is_relative_to(real_dir.resolve()):
-                raise AssertionError("a test reached the real terminal key (Touch ID)")
-            return factory(key_path, timeout)
-        return guarded
-    monkeypatch.setattr(ts, "default_signer_factory", guard(ts.default_signer_factory))
-    monkeypatch.setattr(ts, "default_desk_signer_factory", guard(ts.default_desk_signer_factory))
 
 
 @pytest.fixture(autouse=True)

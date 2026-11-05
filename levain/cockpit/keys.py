@@ -29,11 +29,13 @@ import re
 import sqlite3
 import struct
 import subprocess
+import sys
+import unicodedata
 from collections.abc import Callable, Collection, Mapping
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, overload
 
 from levain import authority as _authority
 from levain.authority import (LAPTOP, NAMESPACE, UNSTATED, AnchorError, AuthorityError, AuthorityKey,
@@ -61,6 +63,84 @@ _FP = re.compile(r"\d+ (SHA256:[A-Za-z0-9+/]{43}) ")
 
 class KeyError_(Exception):      # noqa: N801 - not the builtin
     """A refused key act; the message is the operator-facing reason."""
+
+
+class RealKeyReached(KeyError_, AssertionError):
+    """A test run reached the real operator key: a ``KeyError_`` (the sign step records it as an unsigned
+    ``signer-error``) that is also an ``AssertionError``, so a test that expects either kind of refusal sees one."""
+
+
+def pwd_key_dir() -> Path:
+    """``<real home>/.levain/keys`` from the password database, never ``$HOME`` or ``$LEVAIN_HOME``."""
+    import pwd
+    return Path(pwd.getpwuid(os.getuid()).pw_dir) / ".levain" / "keys"
+
+
+def under_test_run() -> bool:
+    """True inside a pytest run: the per-test variable pytest sets while a test runs, or pytest loaded at all."""
+    return "PYTEST_CURRENT_TEST" in os.environ or "pytest" in sys.modules
+
+
+def _resolved(path: Path) -> Path:
+    """``path`` with ``~`` expanded and links followed (the one resolve the guard does, so a test can break it)."""
+    return Path(path).expanduser().resolve()
+
+
+def _fold(path: Path) -> str:
+    """A spelling-insensitive key for ``path``: NFC and case folded, as APFS (the macOS default) compares names."""
+    return unicodedata.normalize("NFC", str(path)).casefold()
+
+
+def _same_dir_as(target: Path, real_stat: os.stat_result) -> bool:
+    """True when ``target`` or one of its existing ancestors IS the directory ``real_stat`` describes (device and
+    inode), whatever it is spelled: a firmlink, a mount, or a spelling folding does not map."""
+    for p in (target, *target.parents):
+        try:
+            st = os.stat(p)
+        except (FileNotFoundError, NotADirectoryError):
+            continue
+        if (st.st_dev, st.st_ino) == (real_stat.st_dev, real_stat.st_ino):
+            return True
+    return False
+
+
+@overload
+def refuse_real_key_in_tests(path: None, what: str = ...) -> None: ...
+@overload
+def refuse_real_key_in_tests(path: Path | str, what: str = ...) -> Path: ...
+def refuse_real_key_in_tests(path: Path | str | None, what: str = "the key") -> Path | None:
+    """Added after test runs raised the operator's Touch ID sheet on the live laptop: under a pytest run, any path
+    that names the real operator key directory or something inside it raises :class:`RealKeyReached`. It is judged
+    resolved (links followed), spelling-insensitively (case and Unicode normalisation folded) and by directory
+    identity (device and inode of the path or an existing ancestor). When the guard cannot tell (the password
+    database has no entry for this uid, or a path will not resolve or stat) it refuses: under pytest it fails closed.
+
+    Returns the resolved path it judged, which a caller uses for every later act so a link retargeted after the
+    check is not followed again; outside a pytest run it returns ``path`` with ``~`` expanded, unchanged otherwise.
+    ``path`` None returns None and judges nothing: callers pass their already-resolved default."""
+    if path is None:
+        return None
+    if not under_test_run():
+        return Path(path).expanduser()
+    try:
+        real = _resolved(pwd_key_dir())
+        target = _resolved(Path(path))
+        real_stat: os.stat_result | None
+        try:
+            real_stat = os.stat(real)
+        except FileNotFoundError:
+            real_stat = None
+        hit = (_fold(target) == _fold(real) or _fold(target).startswith(_fold(real).rstrip("/") + "/")
+               or (real_stat is not None and _same_dir_as(target, real_stat)))
+    except (OSError, RuntimeError, KeyError) as exc:
+        raise RealKeyReached(f"a test reached the real terminal key (Touch ID) guard, which cannot tell whether {what} "
+                             f"({path}) is inside the real operator key directory ({type(exc).__name__}: {exc}); "
+                             "under a test run that is refused. Pass a temp key_dir and a fake signer") from None
+    if hit:
+        raise RealKeyReached(f"a test reached the real terminal key (Touch ID): {what} ({target}) is inside the real operator key directory {real}, and a test "
+                        "run must never reach it (a Touch ID sheet would open on the live laptop); pass a temp key_dir "
+                        "and a fake signer")
+    return target
 
 
 @dataclass(frozen=True)
@@ -777,7 +857,7 @@ def ssh_signer(key_path: Path, *, ssh_keygen: Path | str = DEFAULT_SSH_KEYGEN,
     ``timeout`` bounds one signature's wait in seconds; ``None`` keeps the module default. It was added so a
     caller that wants a shorter bound for its own signer does not have to change the module's global."""
     from levain.cockpit.custody import APPLE_PROVIDER, PASSPHRASE, TOUCH_ID, is_encrypted_file, read_sidecar
-    key_path = Path(key_path).expanduser()
+    key_path = refuse_real_key_in_tests(Path(key_path).expanduser(), "the signing key")   # the judged path, from here on
     public_key = signing_public_key(key_path)
     fp = fingerprint_of(public_key, ssh_keygen=ssh_keygen)
     sidecar = read_sidecar(key_path)

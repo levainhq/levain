@@ -49,7 +49,7 @@ from typing import Any
 
 from levain.authority import CUSTODIES, LAPTOP, UNSTATED, custody_problem
 from levain.autonomic.confirm import _VERIFY_ENV, DEFAULT_SSH_KEYGEN
-from levain.cockpit.keys import KeyError_, normalise_public_key
+from levain.cockpit.keys import KeyError_, normalise_public_key, refuse_real_key_in_tests
 from levain.launch import child_env
 
 __all__ = ["APPLE_PROVIDER", "BIOUTIL", "SC_AUTH", "SIDECAR_SUFFIX", "CreatedKey", "Identity", "Sidecar",
@@ -437,6 +437,7 @@ def default_key_dir() -> Path:
 
 def _key_dir(key_dir: Path | None) -> Path:
     d = (Path(key_dir).expanduser() if key_dir is not None else default_key_dir()).absolute()
+    refuse_real_key_in_tests(d, "the key directory")
     try:
         d.mkdir(mode=0o700, parents=True, exist_ok=True)
         st = os.lstat(d)
