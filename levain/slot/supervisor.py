@@ -659,13 +659,15 @@ def read_base_map(path: Path, *, read: Callable[[Path], bytes] = Path.read_bytes
     return [r for r in obj["routes"] if type(r) is dict]
 
 
-def pick_routes(base: Sequence[Mapping[str, Any]], vendor: str, auth: str) -> Tuple[str, ...]:
-    """Every ``egress`` route of the base map (the git hosts and registries) plus EXACTLY ONE route of the auth's
+def pick_routes(base: Sequence[Mapping[str, Any]], vendor: str, auth: str, *, egress: bool = True) -> Tuple[str, ...]:
+    """With ``egress`` (the default, every interactive session), every ``egress`` route of the base map (the git
+    hosts and registries); with ``egress=False`` (a dispatch passthrough session: its ticket lists none by default,
+    Phill 11-02 np-b0cbc7de (a), and render's ticket compare refuses any it did not list) none. Plus EXACTLY ONE route of the auth's
     type for this vendor (§5.3: ≤ 1 brokered + ≤ 1 passthrough per vendor; render refuses a brokered session without
     its route). Refused ``no-route:<auth>`` / ``route-ambiguous:<auth>`` by name, and a Claude passthrough route lacking
     a host the identity child talks to ``passthrough-route-lacks-token-host``."""
     need = _AUTH_ROUTE[auth]
-    egress = [r["route"] for r in base if r.get("type") == "egress" and type(r.get("route")) is str]
+    egress_ids = [r["route"] for r in base if r.get("type") == "egress" and type(r.get("route")) is str]
     # the selected route MAPPINGS, not their ids: a later check reads the very entry chosen here, never a re-lookup by
     # id (which could land on an egress entry or a duplicate sharing the id).
     mine = [r for r in base if r.get("type") == need and type(r.get("route")) is str
@@ -688,7 +690,7 @@ def pick_routes(base: Sequence[Mapping[str, Any]], vendor: str, auth: str) -> Tu
                      else f"{' and '.join(why for _, why in missing)} need them")
             raise Refused("passthrough-route-lacks-token-host",
                           f"add {names} to the hosts of route {rid} in the base map: {needs}")
-    return tuple(sorted(set(egress))) + (route["route"],)
+    return (tuple(sorted(set(egress_ids))) if egress else ()) + (route["route"],)
 
 
 def git_identity(repo: Path, *, git: str = "git",

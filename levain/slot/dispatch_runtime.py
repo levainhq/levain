@@ -240,7 +240,8 @@ class HelperSlotRuntime:
         if set(req.hooks) != set(HOOKS):
             raise LauncherRefused("hooks-incomplete", ",".join(sorted(set(req.hooks) ^ set(HOOKS))))
         if self._routes is None:
-            routes = pick_routes(read_base_map(layout.base_routes_path(self.host)), req.harness, "passthrough")
+            routes = pick_routes(read_base_map(layout.base_routes_path(self.host)), req.harness, "passthrough",
+                                 egress=False)   # the ticket lists none by default (11-02); render refuses extras
         else:
             routes = self._routes(req) if callable(self._routes) else self._routes
         data = canon.canonical_bytes({"format": RENDER_FORMAT, "vendor": req.harness, "routes": list(routes),
