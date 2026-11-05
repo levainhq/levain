@@ -657,14 +657,28 @@ def read_passthrough_total(log_path: object) -> Optional[int]:
         return None
 
 
+def _tunnel_id_ok(t: object) -> bool:
+    return type(t) is int and 1 <= t <= _INT64_MAX   # type: ignore[operator]
+
+
 def _read_session_total_fd(fd: int, session: str) -> Optional[int]:
-    """The session's OWN final ``passthrough_total`` in an open tunnel log (``fd`` a regular file the caller judged).
-    The log (``L/gw/slot<n>/``) is per SLOT and append-only, so a reused slot holds several sessions' records and
-    :func:`read_passthrough_total` (the last tunnel line of ANY session) would hand back another session's total.
-    Same record format as that helper (last 1 MiB, first partial line dropped, ``event`` ``tunnel``, int
-    ``passthrough_total`` in 0..2**63-1), searched BACKWARD for the last record whose ``session`` equals ``session``.
-    The log is written by the front's lower uid: a tail of it is parsed with stdlib ``json`` (``RecursionError``
-    caught), nothing else. None when absent; never raises."""
+    """The session's OWN final ``passthrough_total`` in an open tunnel log (``fd`` a regular file the caller judged),
+    published only when the log PROVES it final. The log (``L/gw/slot<n>/``) is per SLOT and append-only, so a reused
+    slot holds several sessions' records; only records whose ``session`` equals ``session`` are read.
+
+    A log that can no longer grow is not thereby complete: the front writes a tunnel's ``tunnel`` (close) record
+    only when the tunnel ends, so a tunnel open when the front was killed has none. The front therefore logs a
+    ``tunnel-open`` with a ``tunnel_id`` (1, 2, 3, ... per front) before a passthrough tunnel's first byte is written,
+    and the close carries the same id. The total (the last close's ``passthrough_total``) is returned only when, in
+    file order: every open of the session has a close and every close an earlier open; the ids are exactly 1..n,
+    each opened once and closed once (a gap or a missing 1 means records out of the 1 MiB window, in the rotated
+    ``.1`` or torn; a repeat means a second front or a forged line); and the totals never decrease. A passthrough
+    close with no id (a log written by a front older than the open record) or any malformed session record of these
+    two events: None. None is over-debit (usage settles at the reservation), the safe side; a published total is
+    never smaller than the bytes the log's tunnels moved. A session with no passthrough tunnel reads None too.
+    Same tail as :func:`read_passthrough_total` (last 1 MiB, first partial line dropped; a torn line is skipped and,
+    if it was one of the session's, leaves an unmatched or missing id). The log is written by the front's lower uid:
+    the tail is parsed with stdlib ``json`` (``RecursionError`` caught), nothing else. Never raises."""
     try:
         st = os.fstat(fd)
         if not stat.S_ISREG(st.st_mode):
@@ -683,19 +697,38 @@ def _read_session_total_fd(fd: int, session: str) -> Optional[int]:
         lines = b"".join(chunks).split(b"\n")
         if off:
             lines = lines[1:]
-        for line in reversed(lines):
+        opened: set = set()
+        closed: set = set()
+        total = 0
+        for line in lines:
             try:
                 rec = json.loads(line)
             except (ValueError, RecursionError):
                 continue
-            if not isinstance(rec, dict) or rec.get("event") != "tunnel" or rec.get("session") != session:
+            if not isinstance(rec, dict) or rec.get("session") != session:
                 continue
-            v = rec.get("passthrough_total")
-            if type(v) is int and 0 <= v <= _INT64_MAX:
-                return v
+            event = rec.get("event")
+            if event == "tunnel-open":
+                t = rec.get("tunnel_id")
+                if not _tunnel_id_ok(t) or t in opened:
+                    return None
+                opened.add(t)
+            elif event == "tunnel":
+                pt = rec.get("passthrough")
+                if pt is False and "passthrough_total" not in rec and "tunnel_id" not in rec:
+                    continue   # a non-passthrough tunnel: counts nothing
+                t = rec.get("tunnel_id")
+                v = rec.get("passthrough_total")
+                if pt is not True or not _tunnel_id_ok(t) or t not in opened or t in closed \
+                        or type(v) is not int or not total <= v <= _INT64_MAX:
+                    return None
+                closed.add(t)
+                total = v
+        if not opened or closed != opened or opened != set(range(1, len(opened) + 1)):
+            return None
+        return total
     except Exception:
         return None
-    return None
 
 
 def read_session_total(path: object, session: str) -> Optional[int]:
@@ -718,9 +751,10 @@ def read_session_tunnel_total(store: "Store", slot: SlotId, front_uid: int, sess
     ``L/gw/slot<n>/`` held to the front account's alone and opened ``O_NOFOLLOW|O_DIRECTORY`` only if it is the dir
     judged), then ``front.log`` opened ``O_NOFOLLOW`` BELOW that fd and held to a regular file with one link owned by
     the front account or root (what prepare left it). Any refusal of the walk (``Refused``), a link, a replaced or
-    foreign file, an unreadable log (``OSError``) or no record of ``session``: None. Anything else (a programming
-    error) propagates; it is not read as an absent total. Root calls this only after SCRUB proved the front's uid gone
-    (``start.teardown``)."""
+    foreign file, an unreadable log (``OSError``), or a log that does not prove ``session``'s total final (an open
+    tunnel with no close, :func:`_read_session_total_fd`): None. Anything else (a programming error) propagates; it is
+    not read as an absent total. Root calls this only after SCRUB proved the front's uid gone (``start.teardown``):
+    that proves the log can no longer grow; the open/close match proves it complete."""
     try:
         dfd = _open_front_log_dir(store, slot, front_uid)
         if dfd is None:

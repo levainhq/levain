@@ -1152,6 +1152,9 @@ class Front:
         #: every passthrough connection from its upstream open to its end: id(counts) -> (counts, client writer,
         #: upstream writer). Exhaustion closes them all and marks each ``counts["cut"]``.
         self._pt_open: dict[int, tuple[dict, asyncio.StreamWriter, asyncio.StreamWriter]] = {}
+        #: the last passthrough tunnel id this front logged a ``tunnel-open`` for: ids run 1, 2, 3, ... per front, so
+        #: root's reader (``runtime_helper._read_session_total_fd``) can prove it saw EVERY tunnel of the session.
+        self.pt_seq = 0
 
     def _pt_left(self) -> Optional[float]:
         """Seconds until the passthrough deadline (<= 0 once past it); None when the session has none."""
@@ -1365,6 +1368,13 @@ class Front:
                 self._log({"event": "refused", "refused": pt_refusal, "detail": "hello", "host": route.host,
                            "address": addr})
                 return
+            if route.passthrough:
+                # The open record lands before the tunnel's first byte is written (no await between here and the
+                # hello's write), and once its bytes are taken a close record always follows (``relaying``) unless the
+                # front is killed: so an open with no close in the log is a tunnel whose bytes the log does not hold.
+                self.pt_seq += 1
+                tid = counts["tunnel_id"] = self.pt_seq
+                self._log({"event": "tunnel-open", "tunnel_id": tid})
             relaying = True
             uwriter.write(hello)
             counts["up"] = len(hello)
@@ -1390,7 +1400,8 @@ class Front:
                            "host": route.host, "port": port, "address": addr,
                            "bytes_up": counts["up"], "bytes_down": counts["down"],
                            "end": counts.get("end", "aborted"),
-                           **({"passthrough_total": self.pt_total} if route.passthrough else {})})
+                           **({"passthrough_total": self.pt_total, "tunnel_id": counts["tunnel_id"]}
+                              if route.passthrough else {})})
 
     async def _open_upstream(self, route: ConnectRoute, port: int):
         try:

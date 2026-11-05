@@ -1344,8 +1344,9 @@ def teardown(ctx: H.Ctx, req: RuntimeRequest, blob: None) -> Dict[str, object]:
     # later, larger total). The total is read only inside SCRUB, once proc.scrub has proven the gateway uid gone too
     # and before the slot is released to another session (``front_dead``). A slot that already left this lease, or a
     # SCRUB that refuses, reads nothing: the key is absent and usage settles at the reservation (over-debit, the safe
-    # side). OPEN (not closed here): the front logs a tunnel only when it ends, so a tunnel still open when SCRUB
-    # SIGKILLs the front (Linux) has no line, and the total read here can omit its bytes.
+    # side). A dead front proves the log can no longer grow, not that it is complete: a tunnel still open when SCRUB
+    # SIGKILLs the front (Linux) has no close line. The reader publishes only when every ``tunnel-open`` of the session
+    # has its close (``runtime_helper._read_session_total_fd``), else the key is absent (over-debit).
     seams.at("scrub")
     got: Dict[str, int] = {}
 

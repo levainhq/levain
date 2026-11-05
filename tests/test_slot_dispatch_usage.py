@@ -67,7 +67,11 @@ def test_empty_or_non_string_keys_are_none_and_no_reader_is_called():
 
 def test_default_reader_is_the_helpers_final_tunnel_line(tmp_path):
     log = tmp_path / "tunnel.log"
-    log.write_text(json.dumps({"event": "tunnel", "session": "S1", "passthrough_total": 99}) + "\n")
+    old = json.dumps({"event": "tunnel", "session": "S1", "passthrough_total": 99}) + "\n"
+    log.write_text(old)          # a front older than the open record (S10b C FIX ROUND 2): not provably final
+    s0 = DispatchUsageSources(run_state=lambda r: {}, tunnel_log=lambda sess: log, seconds_of=lambda sess: 1)
+    assert s0.tunnel_bytes("S1") is None
+    log.write_text(_rec("S1", 99))
     s = DispatchUsageSources(run_state=lambda r: {"calls": 1, "known": True}, tunnel_log=lambda sess: log,
                              seconds_of=lambda sess: 1)
     assert s.tunnel_bytes("S1") == 99
@@ -77,15 +81,18 @@ def test_default_reader_is_the_helpers_final_tunnel_line(tmp_path):
                                 seconds_of=lambda sess: 1).tunnel_bytes("S1") is None
 
 
-def _rec(session, total, event="tunnel"):
-    return json.dumps({"event": event, "session": session, "passthrough_total": total}) + "\n"
+def _rec(session, total, tid=1, event="tunnel"):
+    """One passthrough tunnel opened then closed, as the front logs it (S10b C FIX ROUND 2)."""
+    return (json.dumps({"event": "tunnel-open", "session": session, "tunnel_id": tid}) + "\n"
+            + json.dumps({"event": event, "session": session, "passthrough": True, "tunnel_id": tid,
+                          "passthrough_total": total}) + "\n")
 
 
 def test_shared_slot_log_returns_only_the_asked_sessions_final_total(tmp_path):
     log = tmp_path / "tunnel.log"
     # slot reuse: A, then B, then A's later record, then B again, all in one append-only file
-    log.write_text(_rec("A", 100) + _rec("B", 7) + _rec("A", 900000) + "torn{\n" + _rec("B", 1000)
-                   + _rec("A", 5, event="other"))
+    log.write_text(_rec("A", 100) + _rec("B", 7) + _rec("A", 900000, 2) + "torn{\n" + _rec("B", 1000, 2)
+                   + json.dumps({"event": "other", "session": "A", "passthrough_total": 5}) + "\n")
     s = DispatchUsageSources(run_state=lambda r: {}, tunnel_log=lambda sess: log, seconds_of=lambda sess: 1)
     assert s.tunnel_bytes("A") == 900000
     assert s.tunnel_bytes("B") == 1000
