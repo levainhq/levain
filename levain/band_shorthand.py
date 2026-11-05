@@ -12,14 +12,19 @@ Grammar (``,`` ``;`` or white space between entries)::
     SWEEP := (all | rest | others | all others) WS REC
     note  := (because | but | - | —) WS text-to-end-of-line      # attaches to the entry before it
     line  := entry+ [note | words]
-    words := the first thing after the entries that is no entry and does not start like one: a word, `->`,
-             `--`, `!`, `(works)` ... to the end of the line. Every entry of the line then carries the WHOLE line
-             (trimmed at its ends) as its note: what he typed is kept, and signed, as he typed it (11-04).
+    words := after the run, his own words to the end of the line, opened ONLY by a word mark (`->` `=>` `--`, or
+             `.` / `!` before a space or the end), or by a plain word right after a compact entry (`1a this works`).
+             Every entry of the line then carries the WHOLE line (trimmed at its ends) as its note: what he typed is
+             kept, and signed, as he typed it (11-04).
 
-Only the LEADING run of entries is ever an answer: a number or letter inside the words is text (an answer shape
-there is said in ``hint``, never read). Inside the run, a token that starts like an answer and is none (``2z``,
-``2ab``, a bare ``3``, a bare ``(b)``) refuses the whole line by name. A ``NUM ":"`` entry before a WORD is still
-free text to the end of the line (``3: a thing``); before punctuation (``3: a -> ok``) it is the pick.
+Fail closed (11-04 round 2). Only the LEADING run of well-formed entries is ever an answer; the first token that is
+none ends it. If that token looks like an answer attempt in any way (it starts with a digit or ``(``, or is a pick
+with no number: ``2z``, ``2->``, ``0a``, ``(b)``, ``b``, ``rec``), or is any other mark (``1a/b``, ``1a?``), or is a
+plain word after a SPACED entry (``1 a lot``, ``2 rec looks good``: type ``2 rec -> looks good``), or follows a run
+that holds a sweep (``all recs please``), the WHOLE line is refused by name and nothing is recorded. An answer shape
+inside his words (or inside a note, or swallowed by a ``NUM ":"`` free text) is named in ``hint``, never read: one
+hint names all of them, found by the lexer's own entry and sweep patterns. ``NUM ":"`` keeps its meaning: when the
+line does not lex as picks after it, it is free text to the end of the line (``3: a thing``, ``1: a -> fine``).
 
 A message is the LEADING lines that each parse in full; the first line that does not, or a blank line, ends the
 block and, with all after it, is ``rest``. A line that does not FULLY parse records nothing; a line over
@@ -40,28 +45,26 @@ _NUM = r"[1-9][0-9]{0,6}(?![0-9])"
 _REC = r"(?:your\s+rec|you\s+rec|recs|rec|r)(?![A-Za-z0-9])"
 _SEP = re.compile(r"[,;\s]+")
 _OPTION_LETTERS = ("a", "b", "c", "d", "e", "f")    # a tuple: "" is no option (``"" in "abcdef"`` would be True)
-_SWEEP = re.compile(rf"(?P<sweep>(?:all\s+others|all|rest|others)\s+{_REC})", re.I)
+_SWEEP_WORDS = rf"(?:all\s+others|all|rest|others)\s+{_REC}"
+_SWEEP = re.compile(rf"(?P<sweep>{_SWEEP_WORDS})", re.I)
+# ONE pick definition: the entry lexer, the in-run refusal (a pick with no number) and the hint scan all use it
+_PICK = rf"(?:(?P<rec>{_REC})|\((?P<l1>[a-f])\)|(?P<l2>[a-f])(?![A-Za-z0-9]))"
 # `\s*(?:[:.)]\s*)?` is `\s*[:.)]?\s*` without two quantifiers splitting one run of spaces (no backtracking blow-up)
-_ENTRY = re.compile(rf"(?P<num>{_NUM})\s*(?:[:.)]\s*)?(?:(?P<rec>{_REC})|\((?P<l1>[a-f])\)|(?P<l2>[a-f])(?![A-Za-z0-9]))",
-                    re.I)
+_ENTRY = re.compile(rf"(?P<num>{_NUM})\s*(?:[:.)]\s*)?{_PICK}", re.I)
+_BARE_PICK = re.compile(_PICK, re.I)
 # the head of a free-text entry only (NUM ":" then a word): the text is the rest of the line, sliced once when taken,
 # so trying it at every entry never scans to the end of the line
 _TEXT = re.compile(rf"(?P<num>{_NUM})\s*:\s*(?=\S)", re.I)
 # a line longer than this is never read as answers (the block ends there): the hook's work stays bounded
 LINE_MAX = 2000
 _NOTE = re.compile(r"\s+(?:(?:because|but)\s+|[-—]\s+)(?P<note>\S.*)$", re.I)
-# a first line that was MEANT as an answer: NUM LETTER, NUM ":", a bare (a), a leading sweep, NUM and one letter past
-# the options (`1z`), or a bare NUM before words marked as words (`5 -> this works`)
-_ATTEMPT = re.compile(rf"\s*(?:{_NUM}\s*(?:[a-f](?![A-Za-z])|:|\([a-f]\))|\([a-f]\)|(?:all|rest|others)\s+{_REC}"
-                      rf"|{_NUM}[a-z](?![A-Za-z0-9])|{_NUM}\s*(?:->|=>|--|—))", re.I)
+# a line that was MEANT as an answer (for the hint only; nothing is recorded either way): it opens with a digit, a
+# bare (a), or a sweep
+_ATTEMPT = re.compile(rf"\s*(?:[0-9]|\([a-f]\)|{_SWEEP_WORDS})", re.I)
+# what opens his words after the run: an arrow or a double dash, or dots / bangs before a space or the end
+_WORDS_MARK = re.compile(r"->|=>|--|[.!]+(?=\s|$)")
 # one token, for naming it: up to the next separator
 _TOKEN = re.compile(r"[^\s,;]+")
-# a token in the answer run that starts like an answer: a bare number, or a number then a letter or a mark
-_STARTS_LIKE = re.compile(rf"{_NUM}(?:[A-Za-z(:.)]|(?=[\s,;])|$)")
-_BARE_PICK = re.compile(r"\([a-f]\)(?![A-Za-z0-9])", re.I)
-# an answer shape inside the words after the run: said, never read
-_SHAPE_IN_WORDS = re.compile(rf"(?<![A-Za-z0-9])(?:{_NUM}(?:[a-f]|\([a-f]\))(?![A-Za-z0-9])"
-                             rf"|(?:all\s+others|all|rest|others)\s+{_REC})", re.I)
 
 
 @dataclass(frozen=True)
@@ -123,8 +126,9 @@ class Refusal:
 @dataclass(frozen=True)
 class Parse:
     """``matched``: at least one leading line parsed in full. ``actions`` / ``refused``: what to record and what not.
-    ``rest``: the message after the block, for the agent. ``hint``: set when the first line looked like an answer but
-    did not fully parse (nothing was recorded)."""
+    ``rest``: the message after the block, for the agent. ``hint``: names every answer shape in text that was not read
+    (his words, a note, a swallowed free text), and says when a line looked like an answer but did not fully parse
+    (nothing was recorded for it)."""
     matched: bool
     actions: tuple[Action, ...] = ()
     refused: tuple[Refusal, ...] = ()
@@ -147,21 +151,60 @@ class _Line:
     entries: list[_Raw] = field(default_factory=list)
     error: str | None = None
     words_at: int | None = None                # where the operator's own words begin, after the entries
+    said_at: int | None = None                 # where text that is NOT read begins (his words, a note, swallowed text)
 
 
 def _text(line: str, t: re.Match[str]) -> _Raw:
     return _Raw("text", int(t.group("num")), text=line[t.end():].rstrip())
 
 
+def _token(line: str, pos: int) -> str:
+    m = _TOKEN.match(line, pos)
+    return (m.group(0) if m else line[pos:pos + 24])[:24]
+
+
 def _unread(line: str, pos: int) -> str:
     """Why the token at ``pos`` is no entry, naming it (``3 has no pick``, ``could not read '2z'``)."""
-    m = _TOKEN.match(line, pos)
-    tok = m.group(0) if m else line[pos:pos + 24]
+    tok = _token(line, pos)
     if tok.isdigit():
         return f"{tok} has no pick"
-    if _BARE_PICK.match(tok):
+    if _BARE_PICK.fullmatch(tok):
         return f"a pick needs its number in front ({tok!r})"
-    return f"could not read {tok[:24]!r}"
+    return f"could not read {tok!r}"
+
+
+def _words(out: _Line, line: str, pos: int, compact: bool) -> _Line:
+    """The run is over at ``pos`` (``out`` holds at least one entry). His words begin here only when nothing about
+    them could be an answer; otherwise the whole line is refused by name."""
+    c = line[pos]
+    if any(r.kind == "sweep" for r in out.entries):
+        out.error = "a sweep takes no words after it: type `all recs` alone, or `all recs because ...`"
+    elif c.isdigit() or c == "(" or _BARE_PICK.match(line, pos):
+        out.error = _unread(line, pos)                # an answer attempt after the run: never words
+    elif _WORDS_MARK.match(line, pos) or (c.isalpha() and compact):
+        out.words_at = out.said_at = pos
+    elif c.isalpha():
+        out.error = (f"could not read {_token(line, pos)!r}: words after a spaced answer need a mark first "
+                     "(`2 rec -> words`)")
+    else:
+        out.error = _unread(line, pos)
+    return out
+
+
+def _shapes(line: str, start: int) -> list[str]:
+    """Every answer shape in ``line[start:]``, by the lexer's own sweep and entry patterns, at the start of a token
+    (not after a letter, digit, ``.`` or ``_``: ``v1.2b``, ``0x4b``) and ending at a token's end (``3e-5`` is none)."""
+    found: list[str] = []
+    i, n = start, len(line)
+    while i < n:
+        if i == 0 or not (line[i - 1].isalnum() or line[i - 1] in "._"):
+            m = _SWEEP.match(line, i) or _ENTRY.match(line, i)
+            if m and (m.end() == n or line[m.end()].isspace() or line[m.end()] in ",;.!?)"):
+                found.append(re.sub(r"\s+", " ", m.group(0)))
+                i = m.end()
+                continue
+        i += 1
+    return found
 
 
 def _lex(line: str) -> _Line:
@@ -169,11 +212,13 @@ def _lex(line: str) -> _Line:
     starts, and the line is sliced only for the one free text taken. An entry that reads both as a pick and as the
     start of free text (``3: a thing, more``) is the pick when the rest of the line lexes cleanly, else free text to
     the end of the line. Free text always lexes, so on an error only the LAST such entry decides: it becomes the
-    text, and every entry before it stays (its own rest now lexes cleanly)."""
+    text, and every entry before it stays (its own rest now lexes cleanly). With no such entry, the first token that
+    is no entry goes to :func:`_words`: his words, or the whole line refused."""
     out = _Line()
     pos = 0
     n = len(line)
     fork: tuple[int, re.Match[str]] | None = None    # the last pick-or-text entry: (its index, its free-text head)
+    compact = False                                  # the last entry has no space inside it (`1a`, not `1 a`)
     while True:
         m = _SEP.match(line, pos)
         if m:
@@ -194,33 +239,35 @@ def _lex(line: str) -> _Line:
         end = m.end() if m else pos
         note = _NOTE.match(line, end) if raw is not None else None
         if raw is not None and note is None and end < n and _SEP.match(line, end) is None:
-            # a NUM ":" entry with a mark right on it stays free text ("3: e.g. this", "3: a.m.")
-            if not (line[end].isalnum() or line[end] in "(_") and (raw.kind == "sweep" or not _TEXT.match(line, pos)):
-                out.entries.append(raw)                  # "5a!", "1a->ok": the entry, then his words
-                out.words_at = end
-                return out
-            raw = None                                   # "1ab", "1a2b": not a clean entry
+            # a word mark right on the entry ("5a!", "1a->ok"): the entry, then his words. Never on a NUM ":" entry
+            # ("3: a.m." stays free text) and never inside a fork (the fork decides, below)
+            if fork is None and not _TEXT.match(line, pos) and _WORDS_MARK.match(line, end):
+                out.entries.append(raw)
+                return _words(out, line, end, compact=False)
+            raw = None                                   # "1ab", "1a2b", "1a/b", "1a.b": not a clean entry
         if raw is None:
             t = _TEXT.match(line, pos)
             if t:
                 out.entries.append(_text(line, t))
                 return out
-            if fork is not None and line[pos].isalpha():  # "3: a thing, more": the last pick-or-text entry is text
+            if fork is not None:                         # "3: a thing, more": the last pick-or-text entry is text
                 del out.entries[fork[0]:]
                 out.entries.append(_text(line, fork[1]))
+                out.said_at = fork[1].end()              # an answer shape it swallowed is named, never read
                 return out
-            if out.entries and not _STARTS_LIKE.match(line, pos) and not _BARE_PICK.match(line, pos):
-                out.words_at = pos                       # the run is over: the rest of the line is his words
-                return out
+            if out.entries:
+                return _words(out, line, pos, compact)
             out.error = _unread(line, pos)
             return out
         if note:
             raw.note = note.group("note").rstrip()
             out.entries.append(raw)
+            out.said_at = note.start("note")
             return out
         if raw.kind != "sweep" and (t := _TEXT.match(line, pos)):
             fork = (len(out.entries), t)
         out.entries.append(raw)
+        compact = not any(ch.isspace() for ch in m.group(0))
         pos = end
 
 
@@ -231,18 +278,18 @@ def parse(text: str, view: View | None, items: dict[int, ItemInfo], current_stor
     raws: list[_Raw] = []
     used = 0
     hint: str | None = None
+    shapes: list[str] = []                              # answer shapes in text that was not read, every line
     for i, line in enumerate(lines):
         if not line.strip():
             break                                       # a blank line ends the block; it and all after are `rest`
         lexed = _lex(line) if len(line) <= LINE_MAX else _Line(error=f"the line is too long (over {LINE_MAX} "
                                                                      "characters)")
-        if lexed.error is None and lexed.entries and lexed.words_at is not None:
-            for r in lexed.entries:
-                r.note = line.strip()                   # the whole line as he typed it, on every entry of it
-            shape = _SHAPE_IN_WORDS.search(line, lexed.words_at)
-            if shape and hint is None:
-                hint = (f"the words after the answer were kept with it as typed; {shape.group(0)!r} in them was not "
-                        "read as an answer (answers go first: `1a, 2b -> words`)")
+        if lexed.error is None and lexed.entries:
+            if lexed.words_at is not None:
+                for r in lexed.entries:
+                    r.note = line.strip()               # the whole line as he typed it, on every entry of it
+            if lexed.said_at is not None:
+                shapes.extend(_shapes(line, lexed.said_at))
         if lexed.error is not None or not lexed.entries:
             if not raws and _ATTEMPT.match(line):
                 reason = lexed.error or "empty"
@@ -255,16 +302,21 @@ def parse(text: str, view: View | None, items: dict[int, ItemInfo], current_stor
             break
         raws.extend(lexed.entries)
         used = i + 1
+    if shapes:
+        named = list(dict.fromkeys(shapes))
+        said = (f"{', '.join(repr(s) for s in named)} in your words {'was' if len(named) == 1 else 'were'} not read "
+                "as an answer (answers go first: `1a, 2b -> words`)")
+        hint = f"{said}; {hint}" if hint else said
     rest = "\n".join(lines[used:])
     if not raws:
         return Parse(False, rest=text, hint=hint)
     refused: list[Refusal] = []
     if view is None:
         return Parse(True, (), (Refusal(None, "no band was shown to this viewer yet; nothing recorded: run `levain band`"),),
-                     rest)
+                     rest, hint=hint)
     if current_store_id is not None and view.store_id != current_store_id:
         return Parse(True, (), (Refusal(None, "the band you saw came from another question store; nothing recorded "
-                                              "(ask for a fresh band)"),), rest)
+                                              "(ask for a fresh band)"),), rest, hint=hint)
     by_n: dict[int, list[_Raw]] = {}
     sweeps: list[_Raw] = []
     for r in raws:
