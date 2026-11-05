@@ -432,7 +432,7 @@
   const FOLD_ROW = ".row, .rrow, .lrow", FOLD_HEAD = ".grp-head, .grp-h";
   function foldRows(body) {
     const panel = body.closest && body.closest(".panel[data-ck-panel]");
-    if (!panel || FOLD_PANELS.indexOf(panel.dataset.ckPanel) < 0 || panel.closest(".modal")) return false;
+    if (!panel || (FOLD_PANELS.indexOf(panel.dataset.ckPanel) < 0 && !body.querySelector(".fl-group")) || panel.closest(".modal")) return false;   // a Fleet card folds whatever its panel id is
     // the reading place survives every fold trigger (a row opening, a search, fonts settling): unfolding and folding again
     // changes the body's height, and the browser clamps or anchors the scroll under the reader
     const place = body.scrollTop;
@@ -8186,6 +8186,7 @@
     needs: "#ck-needs[data-waiting]:not([hidden])",
     board: ".panel[data-ck-panel=\"tray\"]",
     notes: ".panel[data-ck-panel=\"notifications\"]",
+    room: "[data-zone=\"room\"]:not([hidden])",
   };
   const PHONE_JUMP_WAIT_MS = CONSENT_FETCH_TIMEOUT_MS + 5000, PHONE_JUMP_STEP_MS = 150, PHONE_JUMP_STEADY = 2;
   // `slot`: where the tab's section sits once it is drawn; `filled`: the same node once its read has filled it (the grants heading
