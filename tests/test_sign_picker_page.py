@@ -262,6 +262,26 @@ def test_b2_a_bound_revoke_asks_for_the_key_this_browser_remembers_and_draws_no_
 
 @needs_browser
 @needs_ssh
+def test_b2b_a_bound_revoke_with_several_remembered_keys_takes_the_newest_enrolled(world, tmp_path, monkeypatch) -> None:
+    port, src, signer, older, newer = _grant_rig(world, tmp_path, monkeypatch)
+    record = {older.key.fingerprint: _b64u(b"cred-old"), newer.key.fingerprint: _b64u(b"cred-new")}
+    with _serve_on(port, src, surface_tokens={"browser": "T"}, install_class="reported", signer=signer) as httpd:
+        # the older key listed first: taking the first remembered key would ask for it
+        rec = _TwoSigners(httpd.grant_phone, [older.key.fingerprint, newer.key.fingerprint])
+        httpd.grant_phone = rec
+        _drive(tmp_path, f"http://localhost:{port}/#write_token=T", [
+            _auth(newer, b"cred-new"), {"until": TILE},
+            {"eval": f"window.localStorage.setItem('levain-passkeys:localhost', {json.dumps(json.dumps(record))}); 1"},
+            {"eval": OPEN_DECISIONS},
+            {"until": f"!!{_CARD} && !!{_REVOKE} && 1"},
+            {"tap": _REVOKE},
+            {"posts": 2},
+        ])
+    assert rec.steps[0][2]["signer_fp"] == newer.key.fingerprint, rec.steps
+
+
+@needs_browser
+@needs_ssh
 def test_b3_r4_r9_the_revokes_pick_labels_the_keys_survives_a_redraw_and_a_dismiss_posts_nothing(
         world, tmp_path, monkeypatch) -> None:
     """B3: a fresh browser, two passkeys: the pick's buttons carry the provider the enrolment recorded (here none: said so),
