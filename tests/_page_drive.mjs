@@ -336,24 +336,21 @@ for (const s of steps) {
     // a script that runs before the page's own scripts on every load from now on, then one reload so it applies to this page
     const added = await send("Page.addScriptToEvaluateOnNewDocument", { source: s.init });
     if (added.error) throw new Error("the init script was not added: " + JSON.stringify(added.error));
-    // the first load must be over before the count is read, or its late event would read as the reload's; then the reload's own load
-    // event, not a fixed pause (the old document's readyState can still read "complete" just after the call). Any stall is a setup failure.
+    // the first load must be over before the reload is sent. The reloaded document is recognised by its own state (the mark the old document
+    // carried is gone and it is complete), never by counting Page.loadEventFired: that event can be missed or land early/late against the
+    // snapshot, which left this step waiting out its whole deadline on a reload that had in fact finished. Any stall is a setup failure.
     for (const end = Date.now() + scaled(15000);;) {
       if (await evaluate("document.readyState") === "complete") break;
       if (Date.now() >= end) throw new Error("init: the first load did not complete");
       await sleep(100);
     }
     await evaluate("window.__driveOldDocument = true");   // a mark the reloaded document will not carry
-    const loadsBefore = loads;
     const reloaded = await send("Page.reload", {});
     if (reloaded.error) throw new Error("init: the reload was refused: " + JSON.stringify(reloaded.error));
-    for (const end = Date.now() + scaled(15000); loads === loadsBefore;) {
-      if (Date.now() >= end) throw new Error("init: the reload did not complete");
-      await sleep(50);
-    }
+    // the old document's readyState can still read "complete" just after the call, so the mark, not the state alone, tells the new document
     for (const end = Date.now() + scaled(15000);;) {
       if (await evaluate("document.readyState === 'complete' && window.__driveOldDocument === undefined") === true) break;
-      if (Date.now() >= end) throw new Error("init: the reloaded page did not become ready");
+      if (Date.now() >= end) throw new Error("init: the reload did not complete");
       await sleep(100);
     }
   } else if (s.emulate !== undefined) {
