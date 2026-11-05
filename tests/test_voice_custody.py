@@ -37,7 +37,7 @@ from levain.voice.custody import (KeychainWriteFailed, Secret, SecurityStdinWrit
 from tests.chat_egress.keys_rig import Cockpit
 
 pytest.importorskip("cryptography")
-from tests.test_authority_graduation_kind import T0, World  # noqa: E402
+from tests.test_authority_graduation_kind import World  # noqa: E402
 
 pytestmark = pytest.mark.skipif(shutil.which("ssh-keygen") is None, reason="needs ssh-keygen")
 
@@ -344,8 +344,9 @@ def test_add_signs_a_record_naming_the_item_and_stores_the_value_through_stdin(c
     assert len(writes) == 1 and writes[0]["stdin_lines"] == 2          # the add line and `exit`, on stdin only
 
 
-def test_the_value_is_in_no_argv_env_record_log_repr_or_output(ck, sec, tmp_path, capsys, caplog):
+def test_the_value_is_in_no_argv_env_record_log_repr_or_output(ck, sec, tmp_path, capsys, caplog, monkeypatch):
     caplog.set_level(logging.DEBUG)
+    monkeypatch.setenv("VOICE_ENV_CANARY", "inherited")             # a child that inherits this process's env shows it
     rec, _ = add(ck, sec)
     got = read(ck, sec)
     assert got == VALUE
@@ -354,14 +355,14 @@ def test_the_value_is_in_no_argv_env_record_log_repr_or_output(ck, sec, tmp_path
     for call in sec.calls():
         assert VALUE not in " ".join(call["argv"])                    # argv of every `security` run
         assert VALUE not in "".join(call["env"].values())             # and its whole environment
-        assert call["env"]["PATH"] == "/usr/bin:/bin"
-    assert VALUE not in "".join(os.environ.values())                  # not parked in this process's environment
+        assert call["env"]["PATH"] == "/usr/bin:/bin" and "VOICE_ENV_CANARY" not in call["env"]
+    assert VALUE not in "".join(os.environ.values())                 # not parked in this process's environment
     assert hits(tmp_path, skip=(sec.root / "items.json",)) == []     # the journal, the anchor, the call log, the keys
     assert VALUE not in json.dumps(rows) and VALUE not in repr(rows)
     out = capsys.readouterr()
     assert VALUE not in out.out + out.err and VALUE not in caplog.text
-    for shown in (repr(rec), repr(Secret(VALUE)), repr(custody.VoiceKeyPreview(rec, ())), repr(SecurityStdinWriter(sec.path)),
-                  repr(KeychainStore(sec.path))):
+    for shown in (repr(rec), repr(Secret(VALUE)), repr(custody.VoiceKeyPreview(rec, ())),
+                  repr(SecurityStdinWriter(sec.path)), repr(KeychainStore(sec.path))):
         assert VALUE not in shown
 
 
@@ -513,7 +514,7 @@ def test_a_revoke_by_a_passkey_class_signer_is_the_logs_to_allow_and_a_missing_r
           "source": SOURCE, "account": ACCOUNT, "placement": {"scheme": "bearer"}, "repos": [],
           "expires_at": utc_stamp(datetime.now(timezone.utc) + timedelta(days=7))}
     ck.link({"op": "create_grant", "grant": ek})
-    with pytest.raises(VoiceKeyRefused, match="no voice key"):                 # another kind's record is not a voice key
+    with pytest.raises(VoiceKeyRefused, match="no voice key"):        # another kind's record is not a voice key
         custody.revoke_key(ck.root, "ek-000000000001", **ck.kw())
     assert "ek-000000000001" in ck.state().policy.grants
 

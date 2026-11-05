@@ -229,7 +229,7 @@ def add_key(data_root: Path | str, *, provider: str, uses: Iterable[str], source
     """Store ``value`` as keychain item ``source``/``account`` and sign the voice key record naming it.
 
     Order, so nothing is left half-done in the dangerous direction: the record is judged by the log's rules
-    (prepared, unsigned), ``confirm(preview)`` is asked (False: nothing written, nothing signed, :class:`SetupDeclined`),
+    (prepared, unsigned), ``confirm(preview)`` is asked (False: nothing written or signed, :class:`SetupDeclined`),
     the item is written and READ BACK equal, and only then is the link signed and appended. A failed sign after the
     write leaves an item no record names, which nothing reads. ``replace`` supersedes the provider's live key in the
     same ``loosen`` (a new id; the old record goes). Returns ``(record, warning)``."""
