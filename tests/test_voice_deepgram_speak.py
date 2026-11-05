@@ -156,7 +156,8 @@ def test_the_chosen_voice_is_the_model_parameter(server, voice):
     assert parse_qs(urlsplit(server.received[0]["target"]).query)["model"] == [voice]
 
 
-@pytest.mark.parametrize("speed,wire", [(0.7, "0.7"), (1.5, "1.5"), (0.85, "0.85"), (1, None), (1.0, None)])
+@pytest.mark.parametrize("speed,wire", [(0.7, "0.7"), (1.5, "1.5"), (0.85, "0.85"), (1, None), (1.0, None),
+                                        (1.0000001, "1.0000001"), (1.23456789, "1.23456789")])    # L3 r2 codex: a six-digit format sent the first as "1"
 def test_speed_is_sent_on_the_wire_unless_it_is_the_default(server, speed, wire):
     # Aura-2 speed runs 0.7 - 1.5 (https://developers.deepgram.com/docs/tts-voice-controls); 1.0 is Deepgram's default
     prov, _ = speaker(server)
@@ -227,12 +228,15 @@ def test_the_chunk_check_is_a_raise_not_an_assert_so_it_survives_python_dash_O()
         sys.modules.pop("levain.voice.providers", None)
         try:
             importlib.import_module("levain.voice.providers")
-        except ImportError:
+        except ImportError as exc:
+            print(exc, file=sys.stderr)
             sys.exit(7)
         sys.exit(0)
     """)
     done = subprocess.run([sys.executable, "-O", "-I", "-c", code], capture_output=True, text=True)
     assert done.returncode == 7, done.stderr
+    # the exit code alone would also pass on an unrelated ImportError (a missing dependency): the cap's own words must be in it
+    assert "over the smallest voice adapter input cap" in done.stderr, done.stderr
 
 
 def test_an_over_cap_text_is_a_pre_send_valueerror_like_every_other_refusal_before_sending(server):

@@ -427,7 +427,7 @@ class DeepgramProvider:
                 raise ValueError("voice is not one of the priced model's voices")
             query = {"model": voice, "encoding": "mp3"}
             if speed != 1.0:
-                query["speed"] = f"{float(speed):g}"
+                query["speed"] = repr(float(speed))     # round-trips: a six-digit format would send 1.0000001 as the default
             audio = _send(self.transport, self.name, secret, "Token",
                           self._url("/v1/speak", **query),
                           {"Content-Type": "application/json", "Accept": "audio/mpeg"},
