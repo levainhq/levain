@@ -135,7 +135,8 @@ def test_no_decision_path_imports_the_hints() -> None:
                 users.add(str(f.relative_to(ROOT)))
     # web_server.py renders the signing sheet's title / requester / message with ``visible`` and nothing else; the sheet's
     # allow / deny / refused branches read the key set, ``cut`` and ``problem``, never the displayed strings
-    assert users == {"cockpit/hintview.py", "consent/listing.py", "web_server.py"}, sorted(users)
+    # band_notice.py renders the HELD ping's one-line WHAT with ``visible`` and nothing else; no allow / deny / hold path reads it
+    assert users == {"cockpit/hintview.py", "consent/band_notice.py", "consent/listing.py", "web_server.py"}, sorted(users)
     # hintview reaches hints; listing reaches hintview only
     assert "levain.consent.hints" not in (ROOT / "consent" / "listing.py").read_text(encoding="utf-8")
     # the display guard sits outside the hints: the engine and display_safe reach neither (they are not in `users`)
