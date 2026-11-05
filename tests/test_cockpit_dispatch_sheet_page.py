@@ -167,7 +167,7 @@ def test_the_decisions_view_lists_the_job_and_its_sign_button_opens_the_sheet_wi
             {"until": f"{IN} && {IN}.getElementById('sheet') && {IN}.getElementById('sheet').dataset.state", "ms": 30000},
             {"eval": f"{FRAME}.getAttribute('src')"},
             {"eval": f"!!{IN}.getElementById('sheet-picked') && {IN}.getElementById('sheet-picked').textContent"},
-            {"eval": f"{IN}.getElementById('sheet-picked').click() || 1"},
+            {"tap": f"{IN}.getElementById('sheet-picked')"},
             {"until": f"/^signed/.test({IN}.getElementById('sheet-note').textContent) && "
                       f"{IN}.getElementById('sheet-note').textContent", "ms": 30000},
         ])
@@ -396,7 +396,7 @@ def test_a_dispatch_job_amended_between_the_read_and_the_tap_signs_nothing_and_i
             {"until": f"/changed since it was shown/.test({NOTE}) && {STATE} === 'open' && {sign} && !{sign}.disabled "
                       f"&& {NOTE}", "ms": 30000},
             {"eval": "window.__gets"},
-            {"eval": f"{sign}.click() || 1"},
+            {"tap": f"{sign}"},
             {"until": f"/^signed/.test({NOTE}) && {NOTE}", "ms": 30000},
         ])
     v = out["values"]
