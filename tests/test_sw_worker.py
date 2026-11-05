@@ -330,6 +330,55 @@ def test_a_silent_network_costs_one_deadline_then_cached_assets_skip_the_network
     assert nav2["body"] == "<html>live</html>" and cached2["body"] == "LIVE /dashboard.css", (nav2, cached2)   # back online: network first
 
 
+def _navoff(ops: list, **extra) -> list:
+    got = _run("navoff", json.dumps({"shellHtml": SHELL_HTML, "cached": "/dashboard.css", "ops": ops, **extra}))
+    return got["steps"]
+
+
+def _window_ms() -> int:
+    sw = SW.read_text()
+    deadline = int(sw.split("const NET_TIMEOUT_MS = ", 1)[1].split(";", 1)[0])
+    mult = int(sw.split("const NAV_OFFLINE_WINDOW_MS = ", 1)[1].split("* NET_TIMEOUT_MS", 1)[0].strip().rstrip("*").strip())
+    return mult * deadline
+
+
+NAV_DOWN = {"t": 0, "url": "/", "nav": True, "net": "down"}
+
+
+@needs_node
+def test_the_offline_navigation_flag_holds_assets_cache_first_only_for_a_bounded_window() -> None:
+    """1105-7 L3 r2 (minimax): the flag was cleared only by a later NAVIGATION, so one failed navigation (Tailscale briefly off)
+    followed by in-page use with no reload kept the shell's scripts and styles cache-first from a stale cache indefinitely,
+    for every client of the worker. Now: inside the window the cached asset answers with no network call; past it the asset
+    goes to the network again."""
+    w = _window_ms()
+    inside = _navoff([NAV_DOWN, {"t": 1000, "url": "/dashboard.css", "net": "ok"}])
+    assert inside[1]["body"] == "CACHED /dashboard.css" and inside[1]["net"] == 0, inside        # cache-first, no network call
+    past = _navoff([NAV_DOWN, {"t": w + 1, "url": "/dashboard.css", "net": "ok"}])
+    assert past[1]["body"] == "LIVE /dashboard.css" and past[1]["net"] == 1, past                  # the window lapsed: network first
+    edge = _navoff([NAV_DOWN, {"t": w - 1, "url": "/dashboard.css", "net": "ok"}])
+    assert edge[1]["body"] == "CACHED /dashboard.css", edge                                          # the bound is the window, not less
+
+
+@needs_node
+def test_a_successful_asset_answer_from_the_network_clears_the_offline_flag() -> None:
+    """The flag records an outage; an asset the network answers proves it over. An uncached asset reaches the network inside
+    the window, succeeds, and the cached one is then fetched live too (the window had not lapsed)."""
+    steps = _navoff([NAV_DOWN, {"t": 1000, "url": "/b.js?v=2", "net": "ok"}, {"t": 2000, "url": "/dashboard.css", "net": "ok"}])
+    assert steps[1]["body"] == "LIVE /b.js?v=2" and steps[1]["net"] == 1, steps                    # not cached: network, answered
+    assert steps[2]["body"] == "LIVE /dashboard.css" and steps[2]["net"] == 1, steps               # flag cleared: network first again
+
+
+@needs_node
+def test_a_cached_asset_of_the_wrong_content_type_is_not_served_cache_first() -> None:
+    """The network path refuses a soft-200 HTML page as a style; the cache-first branch returned its hit unchecked. Now a
+    wrong-type cached copy falls through to the network (and, with the network down too, to a network error, never the page)."""
+    steps = _navoff([NAV_DOWN, {"t": 1000, "url": "/dashboard.css", "net": "ok"}], cachedCtype="text/html")
+    assert steps[1]["body"] == "LIVE /dashboard.css" and steps[1]["net"] == 1, steps
+    down = _navoff([NAV_DOWN, {"t": 1000, "url": "/dashboard.css", "net": "down"}], cachedCtype="text/html")
+    assert down[1]["status"] == 0, down
+
+
 @needs_node
 def test_install_precaches_the_shell_without_skipping_waiting_and_a_failed_fetch_never_blocks_install() -> None:
     got = _run("install", "ok")
@@ -430,7 +479,7 @@ def test_no_notification_in_the_worker_carries_an_actions_key() -> None:
 @needs_node
 def test_activation_carries_the_last_good_shell_forward_when_the_new_install_cached_none() -> None:
     got = _run("carry")
-    assert [c for c in got["caches"] if c.startswith("levain-shell")] == ["levain-shell-v1105-pwaab-2"], got   # the old shell cache is gone
+    assert [c for c in got["caches"] if c.startswith("levain-shell")] == ["levain-shell-v1105-pwaab-3"], got   # the old shell cache is gone
     assert got["shells"][0][1] == [["/", "<html>old shell</html>"]], got          # its page was carried first
 
 
