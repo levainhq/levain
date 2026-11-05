@@ -4,6 +4,7 @@ IndexedDB, Cache Storage and clients (``tests/_sw_worker_rig.js``); the page/wor
 ``{type: "levain-opened"}``."""
 from __future__ import annotations
 
+import hashlib
 import json
 import shutil
 import subprocess
@@ -350,6 +351,8 @@ def test_a_cached_versioned_asset_resolves_with_no_deadline_scheduled_and_an_unc
     assert fired["resolved"] is True and fired["status"] == 0 and fired["deadlines"] == 1, fired          # ...until the deadline fires
     assert got["aborted"] and all(u.endswith("/b.js?v=89abcdef0123") for u in got["aborted"]), got       # the timed-out fetch is cancelled
     assert deadline == 4000
+    # the scenario leaves nothing behind: the pending step's fetch is aborted and its timer is spent (1105-17 fix1, deepseek LOW)
+    assert got["leaked"] == {"liveTimers": 0, "unabortedFetches": 0}, got["leaked"]
 
 
 @needs_node
@@ -453,6 +456,28 @@ def test_content_type_gates_the_write_through_and_a_refresh_replaces_the_shell_o
     assert cached == {"/": new_html, "/dashboard.css": "LIVE /dashboard.css"}, good               # the refresh stages its assets, then commits '/'
     bad = _fetch(url="https://box.example/", net="ok", shell=True, html=new_html, assetFail=["/dashboard.css"])
     assert {e: b for _, es in bad["shells"] for e, b in es} == {"/": "<html>cached shell</html>"}, bad   # '/' is NOT replaced
+
+
+def _versioned_key(body: str, path: str = "/x.js") -> str:
+    return f"{path}?v={hashlib.sha256(body.encode()).hexdigest()[:12]}"
+
+
+@needs_node
+def test_a_network_answer_is_cached_under_a_versioned_url_only_when_its_bytes_hash_to_that_version() -> None:
+    """1105-17 fix1 (codex MED, complement MED-LOW): an old page asking for /x.js?v=OLD can be answered by a newer deploy (or
+    another backend). The worker hashes the body and stores it only when its first 12 hex are the url's v; a mismatch is still
+    RETURNED to the page, never cached (it would otherwise sit cache-first under the old name)."""
+    body = "NEW BYTES"
+    good_key = _versioned_key(body)
+    bad_key = "/x.js?v=0123456789ab"
+    for key, cached in ((good_key, True), (bad_key, False)):
+        got = _fetch(url="https://box.example" + key, mode="no-cors", destination="script", net="ok", shell=True,
+                     shellHtml=f'<script src="{key}"></script>', assetBody=body)
+        assert got["body"] == body, got                                           # the page is answered either way
+        stored = {e: b for _, es in got["shells"] for e, b in es}
+        assert (key in stored) is cached, (key, stored)
+        if cached:
+            assert stored[key] == body, stored
 
 
 @needs_node

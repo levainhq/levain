@@ -328,7 +328,7 @@ function fire(type, ev) {
       const key = path.pathname + path.search;
       if (key !== '/' && /\.(css|js)$/.test(path.pathname)) {
         if ((m.assetFail || []).includes(key)) return new Response('nope', { status: 404, headers: { 'content-type': 'text/css' } });
-        return new Response('LIVE ' + key, { status: 200, headers: { 'content-type': m.ctype || (/\.css$/.test(path.pathname) ? 'text/css' : 'application/javascript') } });
+        return new Response(m.assetBody !== undefined ? m.assetBody : 'LIVE ' + key, { status: 200, headers: { 'content-type': m.ctype || (/\.css$/.test(path.pathname) ? 'text/css' : 'application/javascript') } });
       }
       return new Response(m.html || '<html>live</html>', { status: m.net === '500' ? 500 : 200, headers: { 'content-type': 'text/html' } });
     };
@@ -456,7 +456,8 @@ function fire(type, ev) {
     // the URL is the version (1105-17): the network never answers and the timers are FAKE (none fires unless the scenario fires
     // it), so an asset answered from the cache can be told from one that waited on the deadline by whether a deadline timer
     // was ever scheduled. mode: JSON {shellHtml, cached, uncached, cachedCtype?}. Records, per step, the status/body, the
-    // network calls it made and the deadline timers (ms >= 4000) it scheduled; the uncached step then fires its timer.
+    // network calls it made and the deadline timers (ms >= 4000) it scheduled; the uncached step then fires its timer, and a
+    // closing sweep fires what is left and records `leaked` ({liveTimers, unabortedFetches}).
     const m = JSON.parse(mode);
     const shellName = 'levain-shell-v' + /SW_VERSION = '([^']+)'/.exec(fs.readFileSync(swPath, 'utf8'))[1];
     cacheStores.set(shellName, new Map([['/', m.shellHtml], [m.cached, 'CACHED ' + m.cached]])); cacheNames.add(shellName);
@@ -484,6 +485,11 @@ function fire(type, ev) {
     await ask(m.cached, false);
     await ask(m.uncached, false);   // pends on the network: nothing resolves it until the deadline fires
     await ask(m.uncached, true);    // the same request again, this time firing its deadline timer
+    // clean up after itself: the second step's request is still pending with its deadline timer live; fire what is left so its
+    // fetch is aborted, then record what could still be held (the test asserts nothing is)
+    for (const t of timers) if (t.live) { t.live = false; t.fn(); }
+    await new Promise((r) => setImmediate(r));
+    log.leaked = { liveTimers: timers.filter((t) => t.live).length, unabortedFetches: calls - log.aborted.length };
   } else if (scenario === 'navoff') {
     // a scenario of ordered requests against a fake clock (the flag it was written for is deleted; it now drives the cached-asset type check). mode: JSON {shellHtml, cached, cachedCtype?, ops}; each op is
     // {t, url, nav?, net: 'down'|'ok'}: at fake time t (ms), request url (a navigation when nav) with the network down or up.

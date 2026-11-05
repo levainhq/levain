@@ -459,7 +459,21 @@ async function cachedAsset(key, kind) {
 }
 // An unversioned url names no fixed bytes (a deploy changes them under the same name), so it is never served without the
 // network's say; only the digest in the url makes cache-first correct.
-function versionedKey(key) { try { return /^[0-9a-f]{8,64}$/i.test(new URL(key, 'https://shell.invalid').searchParams.get('v') || ''); } catch (_) { return false; } }
+// The server's digest is always the first 12 hex of the SHA-256 of the bytes it serves (levain/web_server.py _asset_digest).
+function versionOf(key) { try { const v = new URL(key, 'https://shell.invalid').searchParams.get('v') || ''; return /^[0-9a-f]{12}$/i.test(v) ? v.toLowerCase() : ''; } catch (_) { return ''; } }
+function versionedKey(key) { return !!versionOf(key); }
+// A network answer for a versioned url is cached only when its bytes ARE that version (an old page's ?v=OLD answered by a
+// newer deploy, or by another backend, would otherwise sit cache-first under the old name). Returns the response to store
+// (the body is read once here), or null on a mismatch / any failure; the caller's page response is unaffected.
+async function bytesOfVersion(copy, key, kind) {
+  try {
+    const want = versionOf(key);
+    const buf = await copy.arrayBuffer();
+    const hex = Array.from(new Uint8Array(await crypto.subtle.digest('SHA-256', buf)), (b) => b.toString(16).padStart(2, '0')).join('');
+    if (!want || hex.slice(0, 12) !== want) return null;
+    return new Response(buf, { status: 200, headers: { 'content-type': copy.headers.get('content-type') || (kind === 'style' ? 'text/css' : 'application/javascript') } });
+  } catch (_) { return null; }
+}
 async function assetCacheFirst(e, req, key, kind) {
   if (versionedKey(key)) {
     const hit = await cachedAsset(key, kind);
@@ -473,8 +487,12 @@ async function assetCacheFirst(e, req, key, kind) {
         try {
           const c = await caches.open(SHELL_CACHE);
           const hit = await c.match(SHELL_KEY);
-          if (hit && shellAssets(await hit.text()).some((a) => a.key === key)) await c.put(key, copy);
-          else drain(copy);
+          if (hit && shellAssets(await hit.text()).some((a) => a.key === key)) {
+            // a versioned url is stored only when its bytes hash to the version; an unversioned one is stored as before
+            const toStore = versionedKey(key) ? await bytesOfVersion(copy, key, kind) : copy;
+            if (toStore) await c.put(key, toStore);
+            else drain(copy);
+          } else drain(copy);
         } catch (_) { drain(copy); /* best effort; the unread tee branch is released */ }
       }));
     }
