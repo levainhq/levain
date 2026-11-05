@@ -19,6 +19,11 @@ NOTE = "(document.querySelector('#levain-modal .agent-msg .agent-msg-none') || {
 TYPE = ("(() => { const b = %s; const ta = b.querySelector('.tray-dump-ta'); ta.value = 'hello seat'; ta.dispatchEvent(new Event('input')); "
         "b.querySelector('.tray-dump-btn').click(); const y = b.querySelector('.verb-confirm'); if (y) y.click(); return 1; })()") % MBOX
 MSG = "(%s.querySelector('.edit-msg') || {}).textContent" % MBOX
+# the same words, the send pressed by a person (a trusted tap: the passkey door opens only for one), then the confirm it draws
+TAP_TYPE = {"tap": "%s.querySelector('.tray-dump-btn')" % MBOX,
+            "before": ("(() => { const ta = %s.querySelector('.tray-dump-ta'); ta.value = 'hello seat'; "
+                       "ta.dispatchEvent(new Event('input')); return 1; })()") % MBOX,
+            "after": "(() => { const y = %s.querySelector('.verb-confirm'); if (y) y.click(); return 1; })()" % MBOX}
 
 
 def _out(tmp_path, src, steps, first=DESKTOP, enum=ENUM):
@@ -137,12 +142,12 @@ def test_the_box_on_a_signed_verb_signs_through_the_passkey_and_the_door_applies
             {"until": "document.querySelector('[data-ck-compose=recipient]') && document.getElementById('ck-hlens')", "ms": 30000},
             {"eval": _paint(_value(), "agents")}, {"eval": _tap("n3")}, {"until": MBOX + " && 1"},
             # a cancelled passkey: nothing signed, nothing posted, the draft kept in the box
-            {"user_verified": False}, {"eval": TYPE},
+            {"user_verified": False}, TAP_TYPE,
             {"until": "/did not sign|nothing was signed/.test(%s) && %s" % (MSG, MSG), "ms": 30000},
             {"eval": "%s.querySelector('.tray-dump-ta').value" % MBOX},
             # verified: the request filed for these words is signed and the verb posts with its id
             {"user_verified": True},
-            {"eval": TYPE},
+            TAP_TYPE,
             {"until": "%s === 'sent' && 1" % MSG, "ms": 30000},
             {"eval": "JSON.stringify([%s.querySelector('.tray-dump-ta').value, %s])" % (MBOX, ADDR)},
         ])

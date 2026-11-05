@@ -153,7 +153,7 @@ def test_the_needs_card_allow_opens_the_sheet_with_allow_picked_and_one_tap_sign
             {"until": f"{IN} && {IN}.getElementById('sheet') && {IN}.getElementById('sheet').dataset.state", "ms": 30000},
             {"eval": f"{FRAME}.getAttribute('src')"},
             {"eval": f"!!{IN}.getElementById('sheet-picked') && {IN}.getElementById('sheet-picked').textContent"},
-            {"eval": f"{IN}.getElementById('sheet-picked').click() || 1"},
+            {"tap": f"{IN}.getElementById('sheet-picked')"},
             {"until": f"/^signed/.test({IN}.getElementById('sheet-note').textContent) && "
                       f"{IN}.getElementById('sheet-note').textContent", "ms": 30000},
         ])
