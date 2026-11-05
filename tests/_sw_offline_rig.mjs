@@ -13,9 +13,26 @@ const [chromePath, url] = process.argv.slice(2);
 const flags = JSON.parse(readFileSync(join(dirname(fileURLToPath(import.meta.url)), "chrome_flags.json"), "utf8")).flags;
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 const port = await new Promise((r) => { const s = createServer(); s.listen(0, "127.0.0.1", () => { const p = s.address().port; s.close(() => r(p)); }); });
-const prof = mkdtempSync(join(tmpdir(), "levain-sw-offline-"));
+// SW_OFFLINE_TMP: the parent's own scratch dir, so a profile a killed rig could not remove stays inside the test's tmp_path
+const prof = mkdtempSync(join(process.env.SW_OFFLINE_TMP || tmpdir(), "levain-sw-offline-"));
 const chrome = spawn(chromePath, [...flags, `--remote-debugging-port=${port}`, `--user-data-dir=${prof}`, "--no-first-run", "about:blank"], { stdio: "ignore" });
-const done = (code) => { try { chrome.kill("SIGKILL"); } catch {} setTimeout(() => { try { rmSync(prof, { recursive: true, force: true }); } catch {} process.exit(code); }, 300); };
+const exited = new Promise((r) => chrome.once("exit", r));
+let ending = false;
+// stop Chrome (SIGTERM, then SIGKILL after 3 s), wait for it to exit, remove the profile, THEN exit: the parent waits for this
+// exit before it signals, so the profile is gone whenever the rig ends on its own
+const done = async (code) => {
+  if (ending) return;
+  ending = true;
+  if (chrome.exitCode === null && chrome.signalCode === null) {
+    try { chrome.kill("SIGTERM"); } catch {}
+    if (await Promise.race([exited.then(() => true), sleep(3000).then(() => false)]) === false) {
+      try { chrome.kill("SIGKILL"); } catch {}
+      await Promise.race([exited, sleep(2000)]);
+    }
+  }
+  for (let i = 0; i < 3; i++) { try { rmSync(prof, { recursive: true, force: true }); break; } catch { await sleep(200); } }
+  process.exit(code);
+};
 process.on("uncaughtException", (e) => { console.error(e && e.stack || String(e)); done(1); });
 process.on("unhandledRejection", (e) => { console.error(e && e.stack || String(e)); done(1); });
 for (const sig of ["SIGTERM", "SIGINT", "SIGHUP"]) process.on(sig, () => done(130));
@@ -70,10 +87,13 @@ if (process.env.SW_OFFLINE_DROP_SHELL === "1") {
 console.log(JSON.stringify({ online: state }));
 // the parent stops the server, then writes one line
 await new Promise((r) => { process.stdin.once("data", r); process.stdin.once("end", r); });
-const t0 = Date.now();
-const made = await (await fetch(`http://127.0.0.1:${port}/json/new?${encodeURIComponent(url)}`, { method: "PUT" })).json();
+// the cold tab opens blank and is attached with Page enabled BEFORE it navigates: the write-token prompt must meet the dialog
+// handler, never open ahead of it (a page served from cache can reach the prompt in milliseconds)
+const made = await (await fetch(`http://127.0.0.1:${port}/json/new?about:blank`, { method: "PUT" })).json();
 const p2 = await attach(made.webSocketDebuggerUrl);
 await p2("Page.enable");
+const t0 = Date.now();
+p2("Page.navigate", { url });
 // the cold-open tab: polled until it shows text at the url (a tab still waiting on the network reads as about:blank), up to
 // WAIT_MS; `ms` is how long the user stared at the blank before it painted, null when it never did
 const WAIT_MS = Number(process.env.SW_OFFLINE_WAIT_MS || 15000);
@@ -84,4 +104,19 @@ while (Date.now() - t0 < WAIT_MS) {
   if (snap && snap.href && snap.href.startsWith(url.replace(/\/$/, "")) && snap.text) { ms = Date.now() - t0; break; }
 }
 console.log(JSON.stringify({ offline: snap, ms }));
+// SW_OFFLINE_RETRY=1: the parent brings the origin back and writes one more line; the offline page's Retry is pressed and the
+// tab is polled until it shows `SW_OFFLINE_RETRY_TEXT` (a fresh navigation through the worker, under a fresh deadline)
+if (process.env.SW_OFFLINE_RETRY === "1") {
+  await new Promise((r) => { process.stdin.once("data", r); process.stdin.once("end", r); });
+  const want = process.env.SW_OFFLINE_RETRY_TEXT || "";
+  const t1 = Date.now();
+  await evalIn(p2, `(() => { document.querySelector('a').click(); return 1; })()`);
+  let again = { error: "never polled" }, rms = null;
+  while (Date.now() - t1 < WAIT_MS) {
+    await sleep(250);
+    again = await evalIn(p2, SNAP);
+    if (again && again.text && again.text.includes(want)) { rms = Date.now() - t1; break; }
+  }
+  console.log(JSON.stringify({ retry: again, ms: rms }));
+}
 done(0);
