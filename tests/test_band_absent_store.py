@@ -365,8 +365,11 @@ _SEND = ("(() => { document.querySelector('[data-band-slot] .band-option[title=\
 _NO_MARKER = ("window.__release && (() => { const s = document.querySelector('#levain-modal [data-band-slot]');"
               " return !!s && !s.hasAttribute('data-band-read'); })()")
 # the next draw throws once (bandDraw's own replaceChildren), as a draw that fails on a payload it did not expect would
+# only a replaceChildren on the band slot (or inside it) throws: any other panel's redraw that lands first under load would
+# otherwise spend the one throw, bandDraw would draw "ok", and the wait for "error" would never come true
 _THROW_ONCE = ("(() => { const orig = Element.prototype.replaceChildren; let n = 0;"
-               " Element.prototype.replaceChildren = function (...a) { if (!n++) throw new Error('boom'); return orig.apply(this, a); };"
+               " Element.prototype.replaceChildren = function (...a) { if (!n && this.closest && this.closest('[data-band-slot]')) { n++;"
+               " throw new Error('boom'); } return orig.apply(this, a); };"
                " window.__release(); return 1; })()")
 
 
