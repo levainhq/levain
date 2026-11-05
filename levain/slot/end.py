@@ -35,7 +35,10 @@ tree, and any inode a session uid does not own whatever its link count, is hashe
 copied) by a reader dropped to a session uid, and one that uid cannot read is recorded and never copied;
 root never reads such an inode's metadata. ONE classification (:func:`classify`), computed by the manifest
 step and stored beside it, is what the meta and tree steps read. Metadata, strip and chown address every
-entry from its walk dirfd, never by a full path (L2 M2).
+entry from its walk dirfd, never by a full path (L2 M2). The one session-tree file root opens itself is a login
+session's vendor config, read at park for the account record (:func:`seed_from_tree`): only when it is regular, has one link and is
+owned by the slot uid (so its bytes are the slot's own), opened with ``O_NOFOLLOW``, size-capped and parsed as
+untrusted data.
 
 Every root-only act is an injected seam with a real default: the freeze, kill and process proof
 (the defaults here refuse, which lands HELD; the real ones are :func:`levain.slot.proc.end_seams`'s),
@@ -51,7 +54,9 @@ import ctypes.util
 import errno
 import fcntl
 import hashlib
+import json
 import os
+import re
 import secrets
 import shutil
 import stat
@@ -65,6 +70,7 @@ from typing import Callable, Collection, Iterator, Mapping, Sequence
 
 from levain.contracts import ContractError, canon
 from levain.slot import Refused, stage, wall, write_all
+from levain.slot.grammar import SESSION_RE
 from levain.slot.ids import SlotId
 from levain.slot.layout import RESERVE_BYTES
 # The §7.3 states END sends; records owns the names (the full set and its legal edges).
@@ -146,6 +152,27 @@ CREDENTIALS: Mapping[str, tuple[tuple[bytes, ...], bytes]] = {
     "codex": ((b"config", b"codex"), b"auth.json"),
 }
 CREDENTIAL_FILES = tuple(CREDENTIALS.values())
+#: identseed (np-8645041e (a), signed by Phill 11-05): the per-vendor file in the session tree whose account
+#: block a ``login`` session's END parks beside the credential, and that block's key. Claude Code 2.1.318's
+#: ``auth status`` reads ``email`` / ``orgId`` / ``orgName`` from ``oauthAccount`` in
+#: ``$CLAUDE_CONFIG_DIR/.claude.json`` (RETURN_c1p addendum, measured; the field mapping read from the binary's own
+#: code by lane identseed), never from ``.credentials.json``, and every later session's ``.claude.json`` is a fresh
+#: render without it.
+IDENTITY_SEED_SOURCE: Mapping[str, tuple[tuple[bytes, ...], bytes, str]] = {
+    "claude": ((b"config", b"claude"), b".claude.json", "oauthAccount"),
+}
+#: ``L/slots/e<n>/keep/<this>``: root's record of the parked block, root 0600, beside the credential.
+IDENTITY_SEED_NAME = "identity-seed.json"
+IDENTITY_SEED_FORMAT = "levain-identity-seed/1"
+#: the WHITELIST: only these keys of the block are ever parked or seeded: exactly the three ``auth status`` turns into
+#: ``email``, ``orgId`` and ``orgName``. Everything else in the block (or the file) is never copied.
+IDENTITY_SEED_KEYS = ("emailAddress", "organizationName", "organizationUuid")
+#: DECISION: the most of the slot's ``.claude.json`` END reads to find the block (a measured login file held 72 KB).
+IDENTITY_SEED_SOURCE_MAX = 1 << 20
+#: DECISION: a parked record is three short strings plus its frame; one past this is not root's record.
+IDENTITY_SEED_MAX_BYTES = 4096
+_SEED_UUID_RE = re.compile(r"[0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{12}", re.ASCII)
+_SEED_TMP = IDENTITY_SEED_NAME + ".tmp"
 #: IG-1 (1027-18 RULINGS): ``L/retained/<s>/replaced/``, where END puts the credential a confirmed re-login replaces in
 #: ``keep/``. It is inside the session's own retained directory, so discard, restore and purge carry it with the session.
 REPLACED = "replaced"
@@ -189,7 +216,9 @@ PERMANENT_HELD = frozenset({
     "var-folders-mount", "tree-unknown-type", "tree-shared-special", "tree-mount",
     "retain-conflict", "retained-exists", "live-missing", "tree-missing", "credential-not-parked", "keep-occupied",
     "keep-return-conflict", "keep-shape", "replaced-occupied", "unconfirmed-occupied", "classes-missing",
-    "slot-not-ours", "seam-unbuilt", "intent-malformed", "intent-unbuilt", "intent-pending"})
+    "slot-not-ours", "seam-unbuilt", "intent-malformed", "intent-unbuilt", "intent-pending",
+    # identseed: only END's own record check of the block it just whitelisted (identity_seed_bytes); same bytes on redo
+    "bad-identity-seed"})
 PERMANENT_HELD_PREFIXES = ("no-credential:",)
 #: A redo can pass: a race, a slow writer, a process that may still exit, an I/O fault. ``bad-root`` covers both a
 #: wrong owner and an fsync / open errno, and ``kill-unproven`` a process that may yet exit: both stay transient
@@ -1739,6 +1768,9 @@ class EndSeams:
     note: Callable[[str], None] = lambda msg: None
     reserve: "Reserve | None" = None
     owner_ok: Callable[[os.stat_result], bool] = _root_owned
+    #: identseed: the owner rule for the session's config file the seed is read from; None = ``st_uid`` is alloc's slot
+    #: uid (tests whose files the slot never owns inject theirs).
+    seed_owner_ok: "Callable[[os.stat_result], bool] | None" = None
 
     @property
     def retry(self) -> Callable[[Callable[[], None]], None]:
@@ -2252,10 +2284,147 @@ def _set_aside(facts: EndFacts, sfd: int, src: Path, name: bytes, dest: Path, oc
     fault(f"{point}:aside")
 
 
+# --- the identity seed (identseed, np-8645041e (a)) -------------------------------------------------------------------
+# The claim string stays "local-data" (identity_child.CLAIM). The parked record is a LABEL: it names the account the
+# login recorded; it does not tell which account the credential belongs to, and it does not see an expired login.
+
+def _utf8(s: str) -> bool:
+    """``s`` encodes as UTF-8 (no lone surrogate: ``json.loads`` admits ``"\\ud800"``, the record's canonical bytes
+    cannot hold it)."""
+    try:
+        s.encode("utf-8")
+    except UnicodeEncodeError:
+        return False
+    return True
+
+
+def check_seed_block(block: object) -> dict[str, object] | None:
+    """The whitelisted account block (:data:`IDENTITY_SEED_KEYS` only) when ``block`` is a dict whose
+    ``organizationUuid`` is a UUID string, whose ``emailAddress`` is a string of 1-320 characters holding ``@`` with no
+    NUL and no edge whitespace (the identity child's own email rule), and whose ``organizationName``, when present, is
+    a string of at most 256 characters with no NUL, or null; the email and the name encode as UTF-8 (identfix F-A: a
+    lone surrogate the slot wrote would otherwise pass here and fail the record's encoding at park); else None. Every
+    other key is dropped, never checked."""
+    if type(block) is not dict:
+        return None
+    org, email = block.get("organizationUuid"), block.get("emailAddress")
+    if not (type(org) is str and _SEED_UUID_RE.fullmatch(org)):    # ASCII by the pattern: no surrogate passes
+        return None
+    if not (type(email) is str and 0 < len(email) <= 320 and "@" in email and "\0" not in email
+            and email.strip() == email and _utf8(email)):
+        return None
+    out: dict[str, object] = {"emailAddress": email, "organizationUuid": org}
+    if "organizationName" in block:
+        name = block["organizationName"]
+        if not (name is None or (type(name) is str and len(name) <= 256 and "\0" not in name and _utf8(name))):
+            return None
+        out["organizationName"] = name
+    return out
+
+
+def check_identity_seed(obj: object) -> dict[str, object]:
+    """A :data:`IDENTITY_SEED_FORMAT` record checked whole (exact keys; vendor; the login session; the block exactly
+    what :func:`check_seed_block` keeps), else ``bad-identity-seed``."""
+    if type(obj) is not dict or set(obj) != {"format", "vendor", "session", "account"} \
+            or obj["format"] != IDENTITY_SEED_FORMAT:
+        raise Refused("bad-identity-seed", "keys or format")
+    if type(obj["vendor"]) is not str or obj["vendor"] not in IDENTITY_SEED_SOURCE:
+        raise Refused("bad-identity-seed", "vendor")
+    if type(obj["session"]) is not str or not SESSION_RE.fullmatch(obj["session"]):
+        raise Refused("bad-identity-seed", "session")
+    block = check_seed_block(obj["account"])
+    if block is None or block != obj["account"]:
+        raise Refused("bad-identity-seed", "account")
+    return dict(obj)
+
+
+def identity_seed_bytes(*, vendor: str, session: str, account: Mapping[str, object]) -> bytes:
+    obj = {"format": IDENTITY_SEED_FORMAT, "vendor": vendor, "session": session, "account": dict(account)}
+    check_identity_seed(obj)
+    return canon.canonical_bytes(obj)
+
+
+def seed_from_tree(dfd: int, name: bytes, key: str, slot_uid: int,
+                   owner_ok: "Callable[[os.stat_result], bool] | None" = None) -> dict[str, object] | None:
+    """The whitelisted block of the session's own config file ``name`` below ``dfd`` (the session's vendor config dir),
+    or None. Read by root at park time, after DEAD (no process of the slot is alive to race it), and only a file that
+    is regular, has one link and is owned by the SLOT uid (a link to a file of anyone else's is never read), at most
+    :data:`IDENTITY_SEED_SOURCE_MAX` bytes, valid JSON with ``key`` passing :func:`check_seed_block`. The content is
+    the slot's: it is parsed as untrusted data and only the three whitelisted strings leave this function."""
+    try:
+        fd = os.open(name, _O_ENTRY, dir_fd=dfd)
+    except OSError:
+        return None
+    try:
+        st = os.fstat(fd)
+        owned = owner_ok(st) if owner_ok is not None else st.st_uid == slot_uid
+        if not stat.S_ISREG(st.st_mode) or st.st_nlink != 1 or not owned or st.st_size > IDENTITY_SEED_SOURCE_MAX:
+            return None
+        buf = bytearray()
+        while len(buf) <= IDENTITY_SEED_SOURCE_MAX:
+            chunk = os.read(fd, min(1 << 16, IDENTITY_SEED_SOURCE_MAX + 1 - len(buf)))
+            if not chunk:
+                break
+            buf += chunk
+    except OSError:
+        return None
+    finally:
+        os.close(fd)
+    if len(buf) > IDENTITY_SEED_SOURCE_MAX:
+        return None
+    try:
+        obj = json.loads(bytes(buf).decode("utf-8"))
+    except (ValueError, RecursionError):
+        return None
+    return check_seed_block(obj.get(key)) if type(obj) is dict else None
+
+
+def _park_seed(facts: EndFacts, dfd: int, kfd: int, fault: Fault,
+               seed_owner_ok: "Callable[[os.stat_result], bool] | None" = None) -> None:
+    """A ``login`` session's park, just before its credential is renamed into ``keep/``: ``keep/``'s seed record made
+    to describe THIS login. The whitelisted block from the session's config (:func:`seed_from_tree`) written root
+    0600 by temp + fsync + rename + directory fsync; with no usable block, any earlier record is unlinked, so a
+    record never outlives the credential it was parked with (a later session then refuses ``identity-seed-missing``
+    and asks for a new login). Idempotent: a redo writes the same bytes again."""
+    src = IDENTITY_SEED_SOURCE.get(facts.vendor) if facts.kind == "login" else None
+    if src is None:
+        return
+    _, cfg_name, key = src
+    block = seed_from_tree(dfd, cfg_name, key, facts.slot_uid, seed_owner_ok)
+    try:
+        os.unlink(_SEED_TMP, dir_fd=kfd)
+    except FileNotFoundError:
+        pass
+    if block is None:
+        try:
+            os.unlink(IDENTITY_SEED_NAME, dir_fd=kfd)
+        except FileNotFoundError:
+            pass
+        os.fsync(kfd)
+        fault("park:seed:dropped")
+        return
+    data = identity_seed_bytes(vendor=facts.vendor, session=facts.session, account=block)
+    fd = os.open(_SEED_TMP, _O_NEW, 0o600, dir_fd=kfd)
+    try:
+        os.fchmod(fd, 0o600)
+        write_all(fd, data)
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+    os.rename(_SEED_TMP, IDENTITY_SEED_NAME, src_dir_fd=kfd, dst_dir_fd=kfd)
+    os.fsync(kfd)
+    fault("park:seed:written")
+
+
 def park_move(facts: EndFacts, *, owner_ok: Callable[[os.stat_result], bool] = _root_owned,
-              fault: Fault = _no_fault) -> None:
-    """Move the session vendor's credential file to ``keep/`` by rename, never opening it, on a
+              fault: Fault = _no_fault, seed_owner_ok: "Callable[[os.stat_result], bool] | None" = None) -> None:
+    """Move the session vendor's credential file to ``keep/`` by rename, never opening the credential, on a
     passthrough session only (L1-F1): on any other, a file at a credential path is ordinary work, retained.
+    A ``login`` session's park first opens and reads one other file as root, the session's vendor config
+    (:func:`_park_seed` -> :func:`seed_from_tree`: no-follow, regular, one link, slot-owned, size-capped, parsed as
+    untrusted data), and writes or unlinks ``keep/``'s account record from it, after any set-aside and BEFORE the credential
+    rename: a death between the two leaves the new record in ``keep/`` and the new credential still in the session
+    tree, and the redo writes the same record again and parks.
     Only a non-directory is moved; absent = already parked or never made. A ``keep/`` entry already there
     is never replaced (``keep-occupied``, HELD park), so a planted file cannot overwrite a parked login;
     ``keep/`` is root-only, so the check and the rename cannot race. The one exception is a
@@ -2308,6 +2477,9 @@ def park_move(facts: EndFacts, *, owner_ok: Callable[[os.stat_result], bool] = _
                 else:
                     raise Refused("keep-occupied",
                                   f"{facts.keep}/{name.decode('ascii')} already holds a credential")
+            # identseed: the seed record first, then the credential; a death between them leaves the credential in
+            # the tree, and the redo writes the same record again before it parks.
+            _park_seed(facts, dfd, kfd, fault, seed_owner_ok)
             os.rename(name, name, src_dir_fd=dfd, dst_dir_fd=kfd)
             fault("park:keep:renamed")
             os.fsync(dfd)
@@ -2323,7 +2495,9 @@ def park_plan(facts: EndFacts, seams: "EndSeams | None" = None) -> Plan:
     # DECISION: park's `commit` is its CAS; the step itself re-syncs keep/ so a redo is durable.
     owner_ok = seams.owner_ok if seams is not None else _root_owned
     fault = seams.fault if seams is not None else _no_fault
-    return Plan("park", (Phase("move", lambda: park_move(facts, owner_ok=owner_ok, fault=fault)),
+    seed_ok = seams.seed_owner_ok if seams is not None else None
+    return Plan("park", (Phase("move", lambda: park_move(facts, owner_ok=owner_ok, fault=fault,
+                                                         seed_owner_ok=seed_ok)),
                          Phase("commit", lambda: fsync_dir(facts.keep) if os.path.isdir(facts.keep) else None)))
 
 
@@ -2905,6 +3079,8 @@ def _end_locked(facts: EndFacts, seams: EndSeams, start: int, attempts: int, cap
 __all__ = ["BUDGET_REFUSALS", "NOT_AN_ATTEMPT", "PERMANENT_HELD", "PERMANENT_HELD_PREFIXES", "QUARANTINE_AFTER",
            "QUARANTINE_AFTER_BUDGET", "TRANSIENT_HELD", "held_reason_of", "quarantine_after", "quarantined",
            "CAS_RETRY_SECONDS", "CLASSES", "CREDENTIALS", "CREDENTIAL_FILES", "CREDENTIAL_PARKED",
+           "IDENTITY_SEED_FORMAT", "IDENTITY_SEED_KEYS", "IDENTITY_SEED_MAX_BYTES", "IDENTITY_SEED_NAME",
+           "IDENTITY_SEED_SOURCE", "check_identity_seed", "check_seed_block", "identity_seed_bytes", "seed_from_tree",
            "Caps", "HASH_ONLY_CAP", "LINK_UNREADABLE", "OUTSIDE", "PROVEN_PHASES", "SLOT_LOCK_WAIT_S", "UNOWNED",
            "UNREAD_ANSWERS", "WALK_OPEN_DIRS", "WALK_PEAK_FDS", "classify", "read_classes", "retained_whole",
            "stored_classification", "session_reader", "slot_lock", "sync_tree",

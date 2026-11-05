@@ -56,7 +56,7 @@ def _baseline(w) -> Path:
 # --- the identity call, run by start for a login session --------------------------------------------------------------
 
 def test_codex_login_records_not_a_check(env):
-    """IG-2: Codex has no server-validated call; root records the literal ``not-a-check`` as the observed id."""
+    """IG-2: Levain reads no account for Codex; root records the literal ``not-a-check`` as the observed id."""
     w, la, _ = env
     s = _login(w, la, "codex")
     assert w.state(s).fields["identity"] == {"observed_id": "not-a-check"}

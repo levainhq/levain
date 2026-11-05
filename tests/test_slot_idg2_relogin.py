@@ -225,6 +225,8 @@ CRASH_POINTS = {
     "park:replace:renamed": {"replaced": "old", "tree": "new"},
     "park:replace:source-synced": {"replaced": "old", "tree": "new"},
     "park:replace:aside": {"replaced": "old", "tree": "new"},
+    # identseed: this login's config holds no account block, so the park drops keep/'s seed record before the rename
+    "park:seed:dropped": {"replaced": "old", "tree": "new"},
     "park:keep:renamed": {"replaced": "old", "keep": "new"},
     "park:keep:source-synced": {"replaced": "old", "keep": "new"},
     "park:before:commit": {"replaced": "old", "keep": "new"},

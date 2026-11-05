@@ -27,7 +27,8 @@ def test_default_seams_pass_render_check_facts(monkeypatch):
     blob, facts = egress(kind="dispatch", auth="passthrough", hooks=BOTH)
     monkeypatch.setattr(H, "base_routes", lambda store: (dict(facts.route_types), dict(facts.route_hosts)))
     alloc = types.SimpleNamespace(slot=facts.slot, slot_uid=facts.slot_uid, child_uid=None, var_folders=facts.var_folders,
-                                  session=facts.session, kind=facts.kind, vendor=facts.vendor, auth=facts.auth)
+                                  session=facts.session, kind=facts.kind, vendor=facts.vendor, auth=facts.auth,
+                                  ticket=None)   # identseed: render_facts reads alloc's ticket for the seed's gate rule
     ctx = types.SimpleNamespace(seams=H.Seams(host="darwin"), env={}, store=None)
     got = H.render_facts(ctx, alloc, blob)
     rd.check_facts(blob, got)

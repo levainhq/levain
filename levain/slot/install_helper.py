@@ -427,7 +427,8 @@ def pool_lock(store: Path, *, missing_ok: bool = False, waits: RH.Seams | None =
 
 def _operator_held(slot_dir: Path) -> bool:
     """§3.5 ``dispatch_eligible`` is false for a slot whose ``keep/`` holds a vendor credential or that has a
-    ``baseline``; both are looked at by name only (§2.1: keep files are moved, never opened)."""
+    ``baseline``; both are looked at by name only (§2.1: keep's credential files are moved, never opened; the one
+    file in ``keep/`` root opens is its own account record, ``identity-seed.json``, never read here)."""
     return (any(os.path.lexists(slot_dir / "keep" / n) for n in RH.CREDENTIAL_NAME.values())
             or os.path.lexists(slot_dir / "baseline"))
 

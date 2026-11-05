@@ -47,7 +47,9 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--auth", choices=AUTHS, default="brokered",
                    help="brokered: Levain's gateway holds the API key (default); passthrough: the slot's own "
                         "vendor login. With --login it signs the slot in; without it the session uses the slot's stored "
-                        "login after the identity check (Codex has no server-checked identity: not a check).")
+                        "login, refused if it names an account other than the account recorded when it was signed in "
+                        "(a label; Levain does not verify "
+                        "which account the login belongs to, and for Codex it does not know: not a check).")
     p.add_argument("--login", action="store_true",
                    help="A login session: sign the slot in to the vendor (needs --auth passthrough).")
     p.add_argument("--dispatch", action="store_true",
