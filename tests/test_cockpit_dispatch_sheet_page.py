@@ -518,12 +518,13 @@ def test_two_dispatch_slots_both_fill(tmp_path: Path, monkeypatch, repo) -> None
             # the dispatch read answers 3 s late, so the first slot's fill is still out when the second slot is drawn
             {"eval": "(() => { const f = window.fetch; window.fetch = (u, o) => (String(u).indexOf('/cockpit/dispatch.json') >= 0"
                      " ? new Promise((r) => setTimeout(r, 3000)).then(() => f(u, o)) : f(u, o)); return 1; })()"},
-            {"eval": "window.LevainNeeds.history() || 1"},
-            {"until": f"!!document.querySelector('#levain-modal') && {slots}.length === 1 && 1", "ms": 30000},
+            # history() answers false and draws nothing until the cockpit's first view has arrived (CI 11-04: a single call
+            # made as soon as the function existed was a no-op, and the modal never opened); the act-until step repeats it
+            # together with its assertion
+            {"do": "window.LevainNeeds.history() || 1", "until": f"!!document.querySelector('#levain-modal') && {slots}.length === 1 && 1", "ms": 30000},
             # the first slot stays on the page, its fill still out; the history opened again draws a second one
             {"eval": f"(() => {{ document.body.appendChild({slots}[0]); return 1; }})()"},
-            {"eval": "window.LevainNeeds.history() || 1"},
-            {"until": f"{slots}.length === 2 && 1", "ms": 30000},
+            {"do": "window.LevainNeeds.history() || 1", "until": f"{slots}.length === 2 && 1", "ms": 30000},
             {"eval": f"{slots}.map(s => !!s.querySelector('[data-dispatch-job]')).join(',')"},
             {"until": f"{slots}.every(s => s.querySelector('[data-dispatch-job]')) && 1", "ms": 12000},
         ])
