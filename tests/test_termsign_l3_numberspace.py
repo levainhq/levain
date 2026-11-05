@@ -116,11 +116,27 @@ def test_a_host_number_on_a_fresh_store_with_no_band_shown_is_silent(store, env)
     assert seat(store, env, "1: some words") == ""
 
 
-def test_no_band_shown_still_refuses_a_line_that_names_a_levain_number(store, env):
+def test_no_band_shown_is_silent_even_for_a_line_that_names_a_levain_number(store, env):
+    # 11-04: a typed "6a" meant for flow's band printed Levain's "no band was shown" beside flow's own resolution
     band_view.allocate(store, "host", ["x"])
-    assert "no band was shown" in seat(store, env, "1a, 7b")
-    assert "no band was shown" in seat(store, env, "all recs")
-    assert "no band was shown" in seat(store, env, "7a")
+    assert seat(store, env, "1a, 7b") == ""
+    assert seat(store, env, "all recs") == ""
+    assert seat(store, env, "7a") == ""
+    assert [r[:2] for r in items(store)] == [(1, "host")]
+
+
+def test_a_flow_band_and_a_levain_band_one_line_records_once_in_the_levain_band(store, env):
+    band_view.allocate(store, "host", ["flow-row"])           # flow's footer number 1
+    ask(store, "one"); ask(store, "two")
+    out, commit = band_view.hook_prompt({"session_id": SESSION, "prompt": "hello"}, env)
+    commit()
+    assert "band@" in out
+    n = [r[0] for r in items(store) if r[1] == "question"][0]
+    first = seat(store, env, f"{n}b")
+    assert "recorded" in first.lower() or "answered" in first.lower()
+    again = seat(store, env, f"{n}b")                         # a second hook run on the same typed line
+    assert "already answered" in again
+    assert len([q for q in store.recent() if q.answer is not None]) == 1
 
 
 class _Unreadable:
@@ -161,7 +177,7 @@ def test_an_unreadable_host_read_on_a_fresh_store_does_not_say_no_band(store, en
 
     monkeypatch.setattr(store, "_peek", peek)
     echo = seat(store, env, "1a")
-    assert "no band was shown" not in echo and "could not read" in echo
+    assert echo == ""                    # no Levain band was ever shown: silent whether or not the host read worked
 
 
 def test_dropping_a_host_refusal_keeps_parse_own_rest_and_hint(store, env):

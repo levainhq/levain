@@ -1987,6 +1987,11 @@ def _seat_answer(store: QuestionStore, viewer: str, prompt: Any, environ: Mappin
     plan, view, questions, extras = _plan_on(store, got[0] if got is not None else None, prompt)
     if not plan.matched:
         return format_echo([], [], "seat", plan.hint) if plan.hint else ""
+    if view is None:
+        # 11-04: no Levain band was ever shown to this viewer, so the line is not for Levain (a seat that shows flow's
+        # band typed "6a"); the whole-line refusal said "no band was shown" beside flow's own resolution. Parse still
+        # refuses (the CLI and tests pin it); only the hook is silent, and nothing was recorded.
+        return ""
     sign_with = (_terminal_signer(store, viewer, prompt, plan, session, environ, signer_factory, key_dir,
                                   on_sign, view_id=got[1] if got is not None else None,
                                   queue_for=queue_for) if session else None)
