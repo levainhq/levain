@@ -1,0 +1,407 @@
+"""Contract tests for the voice provider adapters, against fixtures in the providers' documented response shape.
+
+No test reaches the network (a socket connect is refused for the whole module) and none holds a real key: ``FAKE_KEY``
+is an obvious placeholder, and the fixture files hold only a ``{KEY}`` marker the test fills in, so a leak of the key
+into an error body, an exception, a repr or a log is something the tests can see."""
+
+from __future__ import annotations
+
+import io
+import json
+import logging
+import re
+import socket
+import traceback
+import urllib.error
+from pathlib import Path
+from urllib.parse import parse_qs, urlsplit
+
+import pytest
+
+from levain.voice import providers as P
+
+FAKE_KEY = "FAKE-KEY-NOT-A-CREDENTIAL-0001"
+MARKER = "SECRET-BODY-MARKER"          # in every error fixture body: it must never reach the operator
+FIXTURES = Path(__file__).parent / "fixtures" / "voice"
+
+
+@pytest.fixture(autouse=True)
+def _no_network(monkeypatch):
+    def refuse(*a, **k):
+        raise AssertionError("a voice test tried to open a socket")
+    monkeypatch.setattr(socket.socket, "connect", refuse)
+
+
+def fixture(name: str) -> P.HttpResponse:
+    data = json.loads((FIXTURES / f"{name}.json").read_text(encoding="utf-8"))
+    body = bytes.fromhex(data["body_hex"]) if "body_hex" in data else data["body"].replace("{KEY}", FAKE_KEY).encode()
+    return P.HttpResponse(data["status"], body)
+
+
+class Replay:
+    """A transport that answers from a fixture (or raises) and keeps the requests it saw."""
+
+    def __init__(self, name: str | None = None, *, raises: Exception | None = None) -> None:
+        self.response = fixture(name) if name else None
+        self.raises = raises
+        self.seen: list[P.HttpRequest] = []
+
+    def __call__(self, req: P.HttpRequest) -> P.HttpResponse:
+        self.seen.append(req)
+        if self.raises is not None:
+            raise self.raises
+        return self.response
+
+
+def surfaces(exc: BaseException) -> str:
+    """Everything an exception could show a person or a log."""
+    return " | ".join([str(exc), repr(exc), repr(exc.args), "".join(traceback.format_exception(exc))])
+
+
+def assert_clean(exc: BaseException) -> None:
+    text = surfaces(exc)
+    assert FAKE_KEY not in text and MARKER not in text
+    assert exc.__cause__ is None and exc.__context__ is None
+
+
+def test_fixture_files_hold_no_key_and_no_key_shaped_string():
+    files = sorted(FIXTURES.glob("*.json"))
+    assert files
+    for f in files:
+        text = f.read_text(encoding="utf-8")
+        assert FAKE_KEY not in text
+        assert not re.search(r"sk-[A-Za-z0-9]{8,}", text)
+        assert json.loads(text)["_provenance"].startswith("Written in the provider")
+
+
+# ---- OpenAI speech ----------------------------------------------------------------------------------------------
+
+def test_openai_speak_sends_the_documented_request_and_returns_the_audio():
+    t = Replay("speech_200")
+    audio = P.OpenAIProvider(transport=t).speak(FAKE_KEY, "Hello there.", "nova", 1.25)
+    assert audio == fixture("speech_200").body and audio.startswith(b"ID3")
+    (req,) = t.seen
+    assert (req.method, req.url) == ("POST", "https://api.openai.com/v1/audio/speech")
+    assert req.headers["Authorization"] == f"Bearer {FAKE_KEY}"
+    assert json.loads(req.body) == {"model": P.OPENAI_TTS_MODEL, "input": "Hello there.", "voice": "nova", "speed": 1.25,
+                                    "response_format": "mp3"}
+
+
+def test_the_openai_model_id_is_data_not_a_branch():
+    t = Replay("speech_200")
+    P.OpenAIProvider(transport=t, tts_model="some-future-model").speak(FAKE_KEY, "Hi.")
+    assert json.loads(t.seen[0].body)["model"] == "some-future-model"
+    assert P.OpenAIProvider().tts_model == P.OPENAI_TTS_MODEL
+
+
+def test_the_key_is_in_no_repr_and_no_attribute():
+    t = Replay("speech_200")
+    prov = P.OpenAIProvider(transport=t)
+    prov.speak(FAKE_KEY, "Hi.")
+    for obj in (prov, t.seen[0], t.response):
+        assert FAKE_KEY not in repr(obj)
+    assert FAKE_KEY not in repr(vars(prov)) and FAKE_KEY not in str(prov)
+    assert repr(t.seen[0]) == "HttpRequest(POST https://api.openai.com/v1/audio/speech)"
+
+
+def test_nothing_is_logged_by_a_call(caplog):
+    caplog.set_level(logging.DEBUG)
+    P.OpenAIProvider(transport=Replay("speech_200")).speak(FAKE_KEY, "Hi.")
+    with pytest.raises(P.VoiceError):
+        P.OpenAIProvider(transport=Replay("openai_401")).speak(FAKE_KEY, "Hi.")
+    assert FAKE_KEY not in caplog.text and MARKER not in caplog.text
+
+
+# ---- status -> fixed words, on both providers ---------------------------------------------------------------------
+
+CASES = [
+    ("openai_401", "refused"), ("openai_403", "refused"), ("deepgram_401", "refused"),
+    ("openai_429_quota", "out_of_credit"), ("deepgram_402", "out_of_credit"),
+    ("openai_429_rate", "rate_limited"),
+    ("openai_500", "unavailable"), ("openai_503", "unavailable"), ("redirect_302", "unavailable"),
+    ("openai_400", "rejected"),
+]
+
+
+@pytest.mark.parametrize("name,code", CASES)
+@pytest.mark.parametrize("make", [lambda t: P.OpenAIProvider(transport=t), lambda t: P.DeepgramProvider(transport=t)],
+                         ids=["openai", "deepgram"])
+@pytest.mark.parametrize("call", ["speak", "transcribe"])
+def test_every_failure_status_is_a_fixed_code_and_no_body_is_surfaced(name, code, make, call):
+    prov = make(Replay(name))
+    with pytest.raises(P.VoiceError) as info:
+        if call == "speak":
+            prov.speak(FAKE_KEY, "Hello.")
+        else:
+            prov.transcribe(FAKE_KEY, b"\x00\x01audio", "audio/webm;codecs=opus", "en-US")
+    exc = info.value
+    assert exc.code == code
+    assert str(exc) == P.WORDS[code].format(p=P.NAMES[prov.name])
+    assert_clean(exc)
+
+
+def test_the_fixed_words_are_the_designs_for_the_codes_it_names():
+    assert P.WORDS["refused"].format(p="OpenAI") == \
+        "OpenAI refused the key. It may have been revoked or mistyped; set it again on the laptop."
+    assert P.WORDS["out_of_credit"].format(p="OpenAI") == "Your OpenAI account is out of credit."
+    assert P.WORDS["rate_limited"].format(p="OpenAI") == "OpenAI is limiting requests right now; try again in a moment."
+    assert P.WORDS["unavailable"].format(p="OpenAI") == "OpenAI did not answer. Nothing was charged that Levain knows of."
+
+
+def test_the_two_429s_are_told_apart_by_the_error_code_field_only():
+    for body, code in [(b'{"error": {"code": "insufficient_quota"}}', "out_of_credit"),
+                       (b'{"error": {"code": "rate_limit_exceeded"}}', "rate_limited"),
+                       (b'{"error": {"message": "insufficient_quota"}}', "rate_limited"),   # the message is not the code
+                       (b"insufficient_quota", "rate_limited"),                              # not JSON
+                       (b'["insufficient_quota"]', "rate_limited"), (b"", "rate_limited"), (b"\xff\xfe", "rate_limited")]:
+        assert P._code_for(429, body) == code
+
+
+def test_every_status_class_maps_to_a_code():
+    assert P._code_for(200, b"") is None and P._code_for(204, b"") is None
+    for status, code in [(401, "refused"), (403, "refused"), (402, "out_of_credit"), (408, "unavailable"),
+                         (500, "unavailable"), (502, "unavailable"), (504, "unavailable"), (599, "unavailable"),
+                         (301, "unavailable"), (307, "unavailable"), (404, "rejected"), (413, "rejected"),
+                         (422, "rejected")]:
+        assert P._code_for(status, b"") == code, status
+    assert {P._code_for(s, b"") for s in range(100, 600)} - {None} <= set(P.WORDS)
+
+
+@pytest.mark.parametrize("exc", [TimeoutError(f"timed out sending {FAKE_KEY}"), ConnectionError(FAKE_KEY),
+                                 OSError(MARKER), ValueError(FAKE_KEY)])
+def test_a_transport_failure_is_unavailable_and_chains_nothing(exc):
+    with pytest.raises(P.VoiceError) as info:
+        P.OpenAIProvider(transport=Replay(raises=exc)).speak(FAKE_KEY, "Hi.")
+    assert info.value.code == "unavailable"
+    assert_clean(info.value)
+
+
+def test_a_transport_that_answers_with_a_non_response_is_unavailable():
+    with pytest.raises(P.VoiceError) as info:
+        P.OpenAIProvider(transport=lambda req: "not a response").speak(FAKE_KEY, "Hi.")
+    assert info.value.code == "unavailable"
+
+
+def test_a_200_with_no_audio_is_not_an_answer():
+    with pytest.raises(P.VoiceError) as info:
+        P.OpenAIProvider(transport=lambda req: P.HttpResponse(200, b"")).speak(FAKE_KEY, "Hi.")
+    assert info.value.code == "unavailable"
+
+
+# ---- refusals before any request ---------------------------------------------------------------------------------
+
+@pytest.mark.parametrize("key", ["", "has space", "line\nbreak", "tab\there", "nul\x00", "del\x7f", None, 123])
+def test_an_unusable_key_is_refused_and_nothing_is_sent(key):
+    t = Replay("speech_200")
+    with pytest.raises(P.VoiceError) as info:
+        P.OpenAIProvider(transport=t).speak(key, "Hi.")
+    assert info.value.code == "refused" and t.seen == []
+    assert_clean(info.value)
+
+
+@pytest.mark.parametrize("args", [("", "nova", 1.0), ("   ", "nova", 1.0), ("x" * (P.API_CAP + 1), "nova", 1.0),
+                                  ("Hi.", "nova", 0.1), ("Hi.", "nova", 4.5), ("Hi.", "nova/../x", 1.0),
+                                  ("Hi.", "", 1.0), ("Hi.", "no va", 1.0)])
+@pytest.mark.parametrize("make", [lambda t: P.OpenAIProvider(transport=t), lambda t: P.DeepgramProvider(transport=t)],
+                         ids=["openai", "deepgram"])
+def test_speak_refuses_bad_input_before_sending(args, make):
+    t = Replay("speech_200")
+    with pytest.raises(ValueError) as info:
+        make(t).speak(FAKE_KEY, *args)
+    assert t.seen == [] and FAKE_KEY not in str(info.value)
+
+
+def test_the_input_cap_is_inclusive():
+    t = Replay("speech_200")
+    P.OpenAIProvider(transport=t).speak(FAKE_KEY, "x" * P.API_CAP)
+    assert len(t.seen) == 1
+
+
+@pytest.mark.parametrize("audio,mime,lang", [(b"", "audio/webm", "en"), (b"a", "video/mp4", "en"), (b"a", "", "en"),
+                                             (b"a", "audio/webm", "en US"), (b"a", "audio/webm", "english-language-tag")])
+def test_transcribe_refuses_bad_input_before_sending(audio, mime, lang):
+    t = Replay("openai_transcribe_200")
+    with pytest.raises(ValueError):
+        P.OpenAIProvider(transport=t).transcribe(FAKE_KEY, audio, mime, lang)
+    assert t.seen == []
+
+
+# ---- OpenAI transcription ----------------------------------------------------------------------------------------
+
+def test_openai_transcribe_is_a_multipart_request_and_returns_stripped_text():
+    audio = b"\x1aE\xdf\xa3 pretend webm bytes \x00\xff"
+    t = Replay("openai_transcribe_200")
+    text = P.OpenAIProvider(transport=t).transcribe(FAKE_KEY, audio, "audio/webm;codecs=opus", "en-US")
+    assert text == "Hello from the room."
+    (req,) = t.seen
+    assert req.url == "https://api.openai.com/v1/audio/transcriptions"
+    assert req.headers["Authorization"] == f"Bearer {FAKE_KEY}"
+    ctype = req.headers["Content-Type"]
+    boundary = ctype.split("boundary=")[1]
+    assert ctype.startswith("multipart/form-data; ")
+    assert req.body.startswith(f"--{boundary}\r\n".encode()) and req.body.endswith(f"\r\n--{boundary}--\r\n".encode())
+    assert audio in req.body
+    assert f'name="model"\r\n\r\n{P.OPENAI_STT_MODEL}'.encode() in req.body
+    assert b'name="language"\r\n\r\nen\r\n' in req.body                # BCP-47 narrowed to the ISO code
+    assert b'filename="audio.webm"' in req.body and b"Content-Type: audio/webm\r\n" in req.body
+    assert FAKE_KEY.encode() not in req.body
+
+
+def test_the_multipart_body_is_deterministic_and_the_boundary_is_not_in_the_audio():
+    audio = b"same audio"
+    first, second = Replay("openai_transcribe_200"), Replay("openai_transcribe_200")
+    P.OpenAIProvider(transport=first).transcribe(FAKE_KEY, audio, "audio/wav")
+    P.OpenAIProvider(transport=second).transcribe(FAKE_KEY, audio, "audio/wav")
+    assert first.seen[0].body == second.seen[0].body
+    b1 = P._multipart({}, "a.wav", "audio/wav", audio)[1]
+    hostile = f"xx{b1}yy".encode()
+    b2 = P._multipart({}, "a.wav", "audio/wav", hostile)[1]
+    assert b2.encode() not in hostile
+
+
+def test_no_language_means_no_language_field():
+    t = Replay("openai_transcribe_200")
+    P.OpenAIProvider(transport=t).transcribe(FAKE_KEY, b"a", "audio/mpeg")
+    assert b'name="language"' not in t.seen[0].body
+
+
+def test_an_answer_with_no_text_is_the_empty_string():
+    assert P.OpenAIProvider(transport=Replay("openai_transcribe_empty")).transcribe(FAKE_KEY, b"a", "audio/mp4") == ""
+
+
+@pytest.mark.parametrize("make", [lambda t: P.OpenAIProvider(transport=t), lambda t: P.DeepgramProvider(transport=t)],
+                         ids=["openai", "deepgram"])
+def test_a_200_in_the_wrong_shape_is_unavailable_and_not_echoed(make):
+    with pytest.raises(P.VoiceError) as info:
+        make(Replay("wrong_shape_200")).transcribe(FAKE_KEY, b"a", "audio/wav")
+    assert info.value.code == "unavailable"
+    assert_clean(info.value)
+
+
+# ---- Deepgram ----------------------------------------------------------------------------------------------------
+
+def _query(url: str) -> dict[str, list[str]]:
+    return parse_qs(urlsplit(url).query)
+
+
+def test_deepgram_speak_asserts_mip_opt_out_and_uses_the_token_scheme():
+    t = Replay("speech_200")
+    audio = P.DeepgramProvider(transport=t).speak(FAKE_KEY, "Hello there.", speed=1.5)
+    (req,) = t.seen
+    parts = urlsplit(req.url)
+    assert (parts.scheme, parts.hostname, parts.path) == ("https", "api.deepgram.com", "/v1/speak")
+    assert _query(req.url)["mip_opt_out"] == ["true"]
+    assert _query(req.url)["model"] == [P.DEEPGRAM_TTS_VOICE] and _query(req.url)["encoding"] == ["mp3"]
+    assert req.headers["Authorization"] == f"Token {FAKE_KEY}" and FAKE_KEY not in req.url
+    assert json.loads(req.body) == {"text": "Hello there."}
+    assert audio.startswith(b"ID3")
+
+
+def test_deepgram_transcribe_asserts_mip_opt_out_and_returns_the_transcript():
+    audio = b"pretend mp4 bytes"
+    t = Replay("deepgram_listen_200")
+    text = P.DeepgramProvider(transport=t).transcribe(FAKE_KEY, audio, "audio/mp4", "en-US")
+    (req,) = t.seen
+    parts = urlsplit(req.url)
+    assert (parts.scheme, parts.hostname, parts.path) == ("https", "api.deepgram.com", "/v1/listen")
+    q = _query(req.url)
+    assert q["mip_opt_out"] == ["true"] and q["model"] == [P.DEEPGRAM_STT_MODEL] and q["language"] == ["en-US"]
+    assert req.headers["Content-Type"] == "audio/mp4" and req.body == audio
+    assert text == "Hello from the room."
+
+
+def test_mip_opt_out_cannot_be_overridden_by_any_query_argument():
+    assert _query(P.DeepgramProvider._url("/v1/listen", mip_opt_out="false"))["mip_opt_out"] == ["true"]
+    t = Replay("deepgram_listen_200")
+    P.DeepgramProvider(transport=t).transcribe(FAKE_KEY, b"a", "audio/wav")
+    assert "mip_opt_out=true" in t.seen[0].url                                   # even with no language given
+
+
+# ---- hosts, redirects, the real transport -----------------------------------------------------------------------
+
+def test_every_request_goes_to_an_allowed_https_host_and_carries_no_userinfo():
+    seen: list[P.HttpRequest] = []
+    for prov in (P.OpenAIProvider(transport=Replay("speech_200")), P.DeepgramProvider(transport=Replay("speech_200"))):
+        t = prov.transport
+        prov.speak(FAKE_KEY, "Hi.")
+        seen += t.seen
+    for prov in (P.OpenAIProvider(transport=Replay("openai_transcribe_200")),
+                 P.DeepgramProvider(transport=Replay("deepgram_listen_200"))):
+        prov.transcribe(FAKE_KEY, b"a", "audio/wav")
+        seen += prov.transport.seen
+    assert len(seen) == 4
+    for req in seen:
+        parts = urlsplit(req.url)
+        assert parts.scheme == "https" and parts.hostname in P.ALLOWED_HOSTS and not parts.username
+
+
+def test_the_hosts_are_the_designs_constants():
+    assert P.HOSTS == {"openai": "api.openai.com", "deepgram": "api.deepgram.com"}
+
+
+@pytest.mark.parametrize("url", ["http://api.openai.com/v1/audio/speech", "https://evil.example/v1/audio/speech",
+                                 "https://api.openai.com.evil.example/x", "https://user:pw@api.openai.com/x",
+                                 "ftp://api.openai.com/x", "https://api.openai.com@evil.example/x"])
+def test_the_real_transport_refuses_any_other_destination_before_opening(url, monkeypatch):
+    class Boom:
+        def open(self, *a, **k):
+            raise AssertionError("the opener was reached")
+    monkeypatch.setattr(P, "_OPENER", Boom())
+    with pytest.raises(ValueError):
+        P.urllib_transport(P.HttpRequest("POST", url, {"Authorization": f"Bearer {FAKE_KEY}"}, b""))
+
+
+def test_a_redirect_is_never_followed():
+    assert P._NoRedirect().redirect_request(object(), object(), 302, "Found", {}, "https://elsewhere.invalid/") is None
+    assert any(isinstance(h, P._NoRedirect) for h in P._OPENER.handlers)
+
+
+def _http_error(status: int, body: bytes) -> urllib.error.HTTPError:
+    return urllib.error.HTTPError("https://api.openai.com/v1/audio/speech", status, "x", {}, io.BytesIO(body))
+
+
+def test_the_real_transport_returns_an_error_status_as_a_response(monkeypatch):
+    class Opener:
+        def open(self, req, timeout=None):
+            assert timeout == P.TIMEOUT
+            raise _http_error(302, b"")
+    monkeypatch.setattr(P, "_OPENER", Opener())
+    resp = P.urllib_transport(P.HttpRequest("POST", "https://api.openai.com/v1/audio/speech", {}, b""))
+    assert resp.status == 302
+    with pytest.raises(P.VoiceError) as info:
+        P.OpenAIProvider(transport=P.urllib_transport).speak(FAKE_KEY, "Hi.")
+    assert info.value.code == "unavailable"
+    assert_clean(info.value)
+
+
+def test_the_real_transport_maps_a_429_body_it_read_to_the_right_code(monkeypatch):
+    class Opener:
+        def open(self, req, timeout=None):
+            raise _http_error(429, b'{"error": {"code": "insufficient_quota", "message": "key ' + FAKE_KEY.encode() + b'"}}')
+    monkeypatch.setattr(P, "_OPENER", Opener())
+    with pytest.raises(P.VoiceError) as info:
+        P.OpenAIProvider(transport=P.urllib_transport).speak(FAKE_KEY, "Hi.")
+    assert info.value.code == "out_of_credit"
+    assert_clean(info.value)
+
+
+def test_the_real_transport_refuses_an_oversize_response(monkeypatch):
+    class Resp:
+        status = 200
+        def __enter__(self): return self
+        def __exit__(self, *a): return False
+        def read(self, n): return b"x" * n
+    class Opener:
+        def open(self, req, timeout=None): return Resp()
+    monkeypatch.setattr(P, "_OPENER", Opener())
+    with pytest.raises(ValueError):
+        P.urllib_transport(P.HttpRequest("POST", "https://api.openai.com/v1/audio/speech", {}, b""))
+
+
+def test_an_unknown_provider_is_refused_and_the_known_ones_resolve():
+    assert isinstance(P.provider_for("openai"), P.OpenAIProvider)
+    assert isinstance(P.provider_for("deepgram"), P.DeepgramProvider)
+    with pytest.raises(ValueError):
+        P.provider_for("elevenlabs")
+    assert set(P.NAMES) == set(P.HOSTS)
+    assert {c for c in P.WORDS} >= {P._code_for(s, b"") for s in (401, 402, 404, 429, 500)} - {None}

@@ -1,0 +1,1 @@
+{"_provenance": "Written in the provider documented response shape for the contract tests; NOT recorded from a live call. Holds no key: {KEY} is replaced by the test with its fake key.", "status": 401, "headers": {"content-type": "application/json"}, "body": "{\"err_code\": \"INVALID_AUTH\", \"err_msg\": \"SECRET-BODY-MARKER {KEY}\"}"}
