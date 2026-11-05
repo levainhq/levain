@@ -13,9 +13,12 @@ directory: the real slot uid gets EACCES there (``run/`` is 0700 and not its own
 from __future__ import annotations
 
 import base64
+import fcntl
 import hashlib
 import os
 import stat
+import threading
+import time
 from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
@@ -281,3 +284,125 @@ def test_start_capture_predicate(dir_st, file_st, ok):
 def test_start_and_end_share_the_capture_names():
     assert SS.RUN_DIR == end_mod.CAPTURE_DIR
     assert (SS.VENDOR_OUT, SS.VENDOR_ERR) == end_mod.CAPTURE_LOGS
+
+
+# --- endfix2 H1: END never hashes a capture START is still draining into ------------------------------------------
+#
+# In production START's helper drains the vendor's pipes (runtime_helper.wait_child_capturing) OUTSIDE the session
+# lock, so END can run while it does: END kills the vendor, and START then reads what was left in the pipes, fsyncs
+# and closes. The tests above close the capture before END; these keep START's file fds open, as the drain does.
+
+REST_OUT = b"stream-json line 8 (drained after the kill)\n" * 3
+REST_ERR = b"vendor stderr: the last line\n"
+
+
+def live_capture(w: World, out: bytes = OUT_BYTES, err: bytes = ERR_BYTES):
+    """The REAL ``open_capture`` with a prefix written and the capture left OPEN (START mid-drain). Returns the
+    capture and the store; the caller closes both."""
+    seams = SimpleNamespace(L=w.L, host="darwin" if DARWIN else "linux", trusted=lambda st: True,
+                            chown=lambda fd, uid, gid, rel: None, fsync=os.fsync)
+    store = H.Store(seams)
+    ctx = H.Ctx(seams=seams, store=store, sudo_uid=0, caller="test", operator_uid=0, env={})
+    cap = SS.VendorCapture()
+    SS.open_capture(ctx, SimpleNamespace(session=SESSION), cap)
+    os.write(cap.out_f, out)
+    os.write(cap.err_f, err)
+    return cap, store
+
+
+def test_end_waits_for_starts_final_drain_and_hashes_the_whole_capture(tmp_path):
+    """START's last drain lands while END waits: the manifest describes the bytes the retained tree holds. The drain
+    thread writes the rest when END first sleeps (it is waiting) or after END returned (it did not wait)."""
+    w = world(tmp_path)
+    cap, store = live_capture(w)
+    go = threading.Event()
+
+    def drain():
+        go.wait(20)
+        os.write(cap.out_f, REST_OUT)
+        os.write(cap.err_f, REST_ERR)
+        os.fsync(cap.out_f)
+        os.fsync(cap.err_f)
+        cap.close()
+
+    def sleep(s):
+        go.set()
+        time.sleep(min(s, 0.01))
+    t = threading.Thread(target=drain)
+    t.start()
+    try:
+        got, ctl = end(w, w.S / SS.RUN_DIR, sleep=sleep)
+    finally:
+        go.set()
+        t.join(20)
+        cap.close()
+        store.close()
+    assert got == RETAINED, w.notes
+    m = by_path(w)
+    kept_out = (w.facts.tree / "run" / "vendor.out").read_bytes()
+    kept_err = (w.facts.tree / "run" / "vendor.err").read_bytes()
+    assert kept_out == OUT_BYTES + REST_OUT and kept_err == ERR_BYTES + REST_ERR
+    assert m[b"run/vendor.out"]["size"] == len(kept_out) and m[b"run/vendor.out"]["digest"] == _sha(kept_out)
+    assert m[b"run/vendor.err"]["size"] == len(kept_err) and m[b"run/vendor.err"]["digest"] == _sha(kept_err)
+
+
+def test_a_capture_start_never_closes_ends_held_capture_busy_never_hashed(tmp_path):
+    """START's helper hung mid-drain (or stopped): END waits its bound, then HELD at ``manifest`` naming
+    ``capture-busy``; no tree is retained and nothing describes the half-written file."""
+    w = world(tmp_path)
+    cap, store = live_capture(w)
+    now = [1000.0]
+
+    def sleep(s):
+        now[0] += s
+    try:
+        got, ctl = end(w, w.S / SS.RUN_DIR, clock=lambda: now[0], sleep=sleep)
+    finally:
+        cap.close()
+        store.close()
+    assert got == HELD and ctl.failed_step == "manifest", w.notes
+    assert any("capture-busy" in n and "vendor." in n for n in w.notes), w.notes
+    assert not w.facts.tree.exists() and w.S.is_dir()
+    assert now[0] - 1000.0 >= end_mod.CAPTURE_WAIT_S                      # it did wait its bound first
+
+
+def test_open_capture_holds_the_capture_lock_until_close(tmp_path):
+    """The writer side: from creation to close START's fds hold an exclusive flock on each log, so another open file
+    description (END's) cannot take a shared one until START closes."""
+    w = world(tmp_path)
+    cap, store = live_capture(w)
+    paths = [w.S / SS.RUN_DIR / n for n in end_mod.CAPTURE_LOGS]
+
+    def shared_free(p: Path) -> bool:
+        fd = os.open(p, os.O_RDONLY)
+        try:
+            fcntl.flock(fd, fcntl.LOCK_SH | fcntl.LOCK_NB)
+            return True
+        except BlockingIOError:
+            return False
+        finally:
+            os.close(fd)
+    try:
+        assert [shared_free(p) for p in paths] == [False, False]
+    finally:
+        cap.close()
+        store.close()
+    assert [shared_free(p) for p in paths] == [True, True]
+
+
+# --- endfix2 M1: the capture's size is bounded by START's own cap, and END proves one that size ----------------------
+
+
+def test_a_capture_at_starts_log_cap_is_hashed_whole(tmp_path):
+    """START writes at most ``VENDOR_LOG_CAP`` bytes per log (the rest is counted and dropped), so that is the largest
+    capture END meets. END proves one of that size per log under the default caps: no size rule of END's turns a
+    full log back into a refusal."""
+    w = world(tmp_path)
+    big = (b"x" * 4095 + b"\n") * (H.VENDOR_LOG_CAP // 4096)
+    assert len(big) == H.VENDOR_LOG_CAP
+    capture(w, out=big, err=big)
+    got, _ = end(w, w.S / SS.RUN_DIR)
+    assert got == RETAINED, w.notes
+    m = by_path(w)
+    for name in (b"run/vendor.out", b"run/vendor.err"):
+        assert m[name]["size"] == H.VENDOR_LOG_CAP and m[name]["digest"] == _sha(big)
