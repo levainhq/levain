@@ -26,8 +26,8 @@ KEYS_ACCOUNT = "_levain_keys"
 QBROKER_ACCOUNT = "_levain_qbroker"
 DISPATCH_ACCOUNT = "_levain_dispatch"
 EX_USAGE = 64
-EX_CONFIG = 78       # EX_CONFIG: the install this program reads is missing a piece it needs
-EX_REFUSED = 75      # EX_TEMPFAIL: a refused start; the unit manager starts it again
+EX_CONFIG = 78       # EX_CONFIG: the install this program reads lacks an account or holds a bad operator record
+EX_REFUSED = 75      # EX_TEMPFAIL: a refused start (an absent operator record among them); the unit manager starts it again
 
 
 def _host() -> str:
@@ -107,7 +107,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         config = config_from_argv(sys.argv[1:] if argv is None else argv)
     except Refused as e:
         print(f"levain CONTROL: refused: {e}", file=sys.stderr, flush=True)
-        return EX_CONFIG
+        # Setup starts this unit before it writes the operator record, its LAST act (§23): on a fresh host the first
+        # start finds none. EX_TEMPFAIL is restarted (Restart=always / KeepAlive); EX_CONFIG would leave it down.
+        return EX_REFUSED if e.name == "no-operator" else EX_CONFIG
     try:
         return C.serve(config)
     except Refused:

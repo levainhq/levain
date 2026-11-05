@@ -165,14 +165,52 @@ def test_control_refuses_a_missing_account(monkeypatch, tmp_path, capsys, missin
     assert f"no-account: {missing}" in capsys.readouterr().err
 
 
-def test_control_refuses_without_an_operator_record(monkeypatch, tmp_path, capsys):
+def test_control_without_an_operator_record_exits_temporary_and_its_unit_restarts(monkeypatch, tmp_path, capsys):
+    # Setup starts CONTROL before it writes the operator record, its LAST act (§23): an absent record is the normal
+    # state of a fresh host's first start, so it exits EX_TEMPFAIL, which the unit restarts (until 1104-29 it exited
+    # EX_CONFIG, which RestartPreventExitStatus left down).
     monkeypatch.setattr(C, "serve", lambda config: pytest.fail("served"))
     _accounts(monkeypatch)
-    assert SC.main(["--operator-record", str(tmp_path / "absent")]) == SC.EX_CONFIG
+    rc = SC.main(["--operator-record", str(tmp_path / "absent")])
+    assert rc == SC.EX_REFUSED == 75
     assert "no-operator" in capsys.readouterr().err
+    lines = dict(ln.split("=", 1) for ln in units.systemd_unit_text(units.by_name("control")).splitlines() if "=" in ln)
+    assert lines["Restart"] == "always" and str(rc) not in lines["RestartPreventExitStatus"].split()
+    import plistlib
+    assert plistlib.loads(units.launchd_plist_text(units.by_name("control")).encode())["KeepAlive"] is True
+
+
+@pytest.mark.parametrize("name", ["control", "dispatch_run"])
+def test_an_absent_record_exit_is_restarted_with_backoff_and_never_given_up_on(name):
+    """The 75 contract end to end (L3 r2 deepseek D2), read from the rendered unit: systemd restarts a Restart=always
+    unit on any exit not listed in RestartPreventExitStatus; RestartSec=1 rising over RestartSteps=5 to
+    RestartMaxDelaySec=30 keeps a never-enrolled host from looping at 1 Hz; StartLimitIntervalSec=0 means no start-rate
+    limit marks the unit failed while a slow setup has not yet written the record."""
+    from levain.slot.services import dispatch_run as D
+    assert SC.EX_REFUSED == D.EX_TEMPFAIL == 75
+    text = units.systemd_unit_text(units.by_name(name))
+    lines = dict(ln.split("=", 1) for ln in text.splitlines() if "=" in ln)
+    assert lines["Restart"] == "always"
+    assert "75" not in lines["RestartPreventExitStatus"].split()
+    assert (lines["RestartSec"], lines["RestartSteps"], lines["RestartMaxDelaySec"]) == ("1", "5", "30")
+    assert lines["StartLimitIntervalSec"] == "0" and "StartLimitBurst" not in lines
+    assert text.index("StartLimitIntervalSec=0") < text.index("[Service]")    # a [Unit] key: under [Service] it is ignored
+
+
+def test_control_refuses_a_malformed_operator_record(monkeypatch, tmp_path, capsys):
+    monkeypatch.setattr(C, "serve", lambda config: pytest.fail("served"))
+    _accounts(monkeypatch)
     (tmp_path / "bad").write_text("{}")
     assert SC.main(["--operator-record", str(tmp_path / "bad")]) == SC.EX_CONFIG
     assert "operator-record-malformed" in capsys.readouterr().err
+
+
+def test_a_fresh_linux_setup_starts_control_before_it_writes_the_operator_record():
+    from tests.test_slot_dispatch_run_dir import _fresh_linux_plan
+    steps = _fresh_linux_plan().steps
+    start = next(i for i, s in enumerate(steps) if s.argv and s.argv[-2:] == ("--now", "levain-control.service"))
+    record = next(i for i, s in enumerate(steps) if s.write and s.write[0] == layout.operator_record_path("linux"))
+    assert start < record          # so CONTROL's first start on a fresh host finds no record
 
 
 def test_control_refuses_an_unreadable_operator_record(monkeypatch, tmp_path, capsys):
