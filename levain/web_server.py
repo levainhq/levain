@@ -3578,53 +3578,14 @@ class _Handler(GuardedHandler):
         self._send(got.body, got.content_type, status=got.status,
                    headers=[*got.headers, ("Vary", _WRITE_TOKEN_HEADER)], cache_control="private, no-store")
 
-    def _read_voice_body(self, clen: int) -> "bytes | None":
-        """The ``clen`` body bytes of a voice POST, read under ONE total deadline (:data:`cockpit_voice.BODY_DEADLINE_S`)
-        while the voice slot is held. The handler's socket timeout is per recv, so a client sending a byte before each
-        one fires would otherwise keep the slot for as long as it liked; here each recv waits at most what is left of the
-        budget. A spent budget is answered 408 in fixed words (the connection closes); a client that went away or reset
-        is not answered. None in both cases: nothing more to send."""
-        deadline = time.monotonic() + cockpit_voice.BODY_DEADLINE_S
-        pieces: list[bytes] = []
-        got = 0
-        spent = False
-        try:
-            while got < clen:
-                left = deadline - time.monotonic()
-                if left <= 0:
-                    spent = True
-                    break
-                self.connection.settimeout(left)
-                piece = self.rfile.read1(min(65536, clen - got))
-                if not piece:      # the client closed before its declared length arrived
-                    break
-                pieces.append(piece)
-                got += len(piece)
-        except TimeoutError:       # a recv outlasted what was left of the budget
-            spent = True
-        except OSError:            # a reset
-            pass
-        finally:
-            try:
-                self.connection.settimeout(self.timeout)
-            except OSError:
-                pass
-        if spent:
-            self._reject(408, "request_timeout", cockpit_voice.WORDS["body_timeout"])
-            return None
-        if got != clen:
-            self.close_connection = True
-            return None
-        return b"".join(pieces)
-
     def _voice_answer(self, route: str) -> "cockpit_voice.Answer | None":
         """The voice POST gates in order (design section 2, after the shared Host and cross-site check): a room host,
         a broker and a store directory, else 404; a surface token on every bind, loopback included; a named owner; the
         content type; the declared length against the route's own cap (413 with the connection closed and nothing
         drained); a voice slot without waiting (503). Every refusal up to here is sent before a byte of the body is
-        read and closes the connection. Then the body is read (under one total deadline, :meth:`_read_voice_body`) and
-        the call made while the voice slot is held; the slot is released before the answer is written.
-        ``request_gate`` is never taken. None: a refusal was sent, or the client went away before its body arrived;
+        read and closes the connection. Then the body is read (the shared :meth:`_read_body`, under one total deadline,
+        :data:`cockpit_voice.BODY_DEADLINE_S`) and the call made while the voice slot is held; the slot is released
+        before the answer is written. ``request_gate`` is never taken. None: a refusal was sent, or the client went away before its body arrived;
         either way there is no answer left to write."""
         srv = self.server
         directory = self._store_directory()
@@ -3657,8 +3618,11 @@ class _Handler(GuardedHandler):
             self._reject(503, "voice_busy", cockpit_voice.WORDS["voice_busy"])
             return None
         try:
-            raw = self._read_voice_body(clen)
-            if raw is None:        # answered 408, or the client went away: nothing more to answer
+            raw = self._read_body(clen, cockpit_voice.BODY_DEADLINE_S)
+            if raw is None:        # answered 408, or the client reset: nothing more to answer
+                return None
+            if len(raw) != clen:   # the client closed early: ``_read_body`` hands back the SHORT bytes, and a cut-off
+                self.close_connection = True      # recording must not be transcribed (nor a cut-off JSON read as a call)
                 return None
             data_root = srv.broker.data_root
             common: dict[str, Any] = {

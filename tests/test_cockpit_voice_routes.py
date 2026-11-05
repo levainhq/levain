@@ -1325,6 +1325,74 @@ def test_f10_a_body_that_trickles_is_cut_at_one_total_deadline_and_frees_the_slo
     assert len(rig.transport.seen) == 1
 
 
+def _early_close(port, path: str, ctype: str, declared: int, sent: bytes, wait: float = 6.0) -> bytes:
+    """Declare ``declared`` body bytes, send ``sent`` (fewer), half-close the write side and read whatever the server
+    answers until it hangs up. b"" is the server hanging up with no answer."""
+    s = socket.create_connection(("127.0.0.1", port), timeout=wait)
+    try:
+        s.sendall(head(port, path, ctype=ctype, clen=str(declared)).encode("ascii") + sent)
+        s.shutdown(socket.SHUT_WR)
+        got = b""
+        try:
+            while True:
+                piece = s.recv(65536)
+                if not piece:
+                    break
+                got += piece
+        except OSError:
+            pass
+        return got
+    finally:
+        s.close()
+
+
+def test_u1_a_body_that_ends_short_is_refused_unread_and_reaches_no_provider(rig):
+    """The voice routes read their body through the shared ``_read_body``, which hands back the SHORT bytes when the
+    client closes before its declared length. A cut-off recording must not be transcribed, nor a cut-off speak request
+    run: the route answers nothing (the client is gone), closes, reserves nothing, calls no provider, and the slot is
+    free for the next call. The speak body here is a COMPLETE valid request with a longer length declared, so it would
+    run if read. Red with: the ``len(raw) != clen`` refusal in ``_voice_answer`` removed (the provider is called)."""
+    rig.add_key()
+    g = rig.reply("Hello there.")
+    whole = json.dumps({"room_thread_id": rig.w.thread, "reply_gseq": g, "chunk": 0, "provider": "openai",
+                        "voice": "nova", "speed": 1.0}).encode()
+    with served(rig) as (port, httpd):
+        for path, ctype, sent in ((SPEAK, "application/json", whole),
+                                  (TRANSCRIBE + "?provider=openai", "audio/webm;codecs=opus", AUDIO[:64])):
+            assert _early_close(port, path, ctype, len(sent) + 40, sent) == b"", path
+            assert rig.transport.seen == [] and rig.rows() == [], path
+            for _ in range(cockpit_voice.VOICE_INFLIGHT):                  # both slots are free again
+                assert httpd.voice_gate.acquire(blocking=False)
+            for _ in range(cockpit_voice.VOICE_INFLIGHT):
+                httpd.voice_gate.release()
+        assert speak(port, rig, g)[0] == 200 and transcribe(port)[0] == 200
+    assert len(rig.transport.seen) == 2
+
+
+def test_u2_the_timeout_words_the_voice_client_is_told_are_the_shared_readers_words():
+    """The voice route no longer sends its own 408: the shared reader does, in ``http_guards.BODY_TIMEOUT_WORDS``. The
+    voice module's ``WORDS["body_timeout"]`` stays the voice client's documented sentence, so the two must be one text
+    (f10 above reads the answer against the voice words). Red with: either sentence edited alone."""
+    from levain import http_guards
+    assert cockpit_voice.WORDS["body_timeout"] == http_guards.BODY_TIMEOUT_WORDS
+
+
+def test_u3_the_voice_route_reads_its_body_only_through_the_shared_reader():
+    """``_read_voice_body`` was a second copy of ``_read_body``'s loop (two pieces of code computing one deadline). It
+    is gone, and ``_voice_answer`` reads the body in exactly one call, ``self._read_body(clen,
+    cockpit_voice.BODY_DEADLINE_S)``, with no direct ``rfile`` or ``connection`` use of its own (the voice deadline stays
+    voice's own number, which f10 moves). Red with: the old method restored, or the call made without the voice deadline."""
+    import levain.web_server as ws
+    tree = ast.parse(Path(ws.__file__).read_text())
+    assert not [n for n in ast.walk(tree) if isinstance(n, ast.FunctionDef) and n.name == "_read_voice_body"]
+    answer = next(n for n in ast.walk(tree) if isinstance(n, ast.FunctionDef) and n.name == "_voice_answer")
+    reads = [n for n in ast.walk(answer) if isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute)
+             and n.func.attr == "_read_body"]
+    assert len(reads) == 1
+    assert [ast.unparse(a) for a in reads[0].args] == ["clen", "cockpit_voice.BODY_DEADLINE_S"] and not reads[0].keywords
+    assert not [n for n in ast.walk(answer) if isinstance(n, ast.Attribute) and n.attr in ("rfile", "connection")]
+
+
 class _ValueErrorAdapter:
     """An adapter whose call raises ValueError, as every adapter does for input it refuses BEFORE it sends."""
 
