@@ -635,9 +635,10 @@ def check_repo_layer(docs: Mapping[str, Any]) -> None:
 
 _AUTH_ROUTE = {"brokered": "brokered", "passthrough": "subscription_passthrough"}
 #: the OAuth token host (:data:`levain.slot.identity_child.TOKEN_ORIGIN`): the vendor binary's own refresh and revoke
-#: go there through the passthrough route's tunnel, including when the identity child runs its status command
+#: go there through the passthrough route's tunnel
 _TOKEN_HOST = IC.TOKEN_ORIGIN[1]
-#: the host the Claude identity child's profile call goes to (:data:`levain.slot.identity_child.ORIGIN`)
+#: the host the Claude binary's API traffic goes to (:data:`levain.slot.identity_child.ORIGIN`, the origin the identity
+#: child's tunnel allowlist names; the child itself makes no request)
 _PROFILE_HOST = IC.ORIGIN[1]
 #: the hosts a Claude passthrough route must carry, each with what reaches it (quoted in the refusal text and pinned).
 #: Levain's identity child makes no request to either: the Claude binary's own traffic goes there through the route's
