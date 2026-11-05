@@ -337,9 +337,24 @@ class SessionIndex:
         finally:
             os.close(lock)
 
+    def transition(self, key: str, from_states: tuple[str, ...], state: str, **fields: Any) -> str | None:
+        """:meth:`put`, only while the record is in one of ``from_states``: the read and the write are one step under
+        the key's lock, so a concurrent END's ``ended`` (written under the same lock, :meth:`RealLauncher._mark_ended`)
+        is never replaced by a spawn's non-terminal write. None when written; else the state found (``"absent"`` for
+        no record). A record that does not read raises, as :meth:`get` does."""
+        with self.locked(key):
+            rec = self.get(key)
+            if rec is None:
+                return "absent"
+            if rec["state"] not in from_states:
+                return str(rec["state"])
+            self.put(key, state, **fields)
+            return None
+
     def put(self, key: str, state: str, **fields: Any) -> None:
         """Write the record under ``key`` whole (replacing), durably. Only the spawn that CREATED a key's record (or
-        retook it, :meth:`claim`), and the END that proves its session gone, replace it."""
+        retook it, :meth:`claim`), and the END that proves its session gone, replace it; the spawn's writes after the
+        mint go through :meth:`transition`."""
         path, tmp = self._temp(key, state, fields)
         try:
             os.replace(tmp, path)
@@ -548,7 +563,10 @@ class RealLauncher:
         # with CONTROL's ceiling behind it
         ticket, run_id = self._mint(key, facts)
         try:
-            self.index.put(key, "minted", occurrence_id=launch.occurrence_id, run_id=run_id, created_s=self.clock())
+            found = self.index.transition(key, ("pending",), "minted", occurrence_id=launch.occurrence_id,
+                                          run_id=run_id, created_s=self.clock())
+            if found is not None:
+                raise RuntimeError(f"the index record left pending ({found}) before the start")
             handle = self.runtime.start(SlotStart(ticket, run_id, key, launch.harness, launch.model, launch.brief,
                                                    str(facts["brief_digest"]), HOOKS))
         except Exception as exc:
@@ -565,8 +583,12 @@ class RealLauncher:
             raise
         session = handle.session
         try:
-            self.index.put(key, "started", occurrence_id=launch.occurrence_id, run_id=run_id, session=session,
-                           started_s=self.clock())
+            # minted -> started only: a concurrent END (a reaper's stop that found the bound session by STATUS) may
+            # already have recorded `ended` with its total, which this write never replaces
+            found = self.index.transition(key, ("minted",), "started", occurrence_id=launch.occurrence_id,
+                                          run_id=run_id, session=session, started_s=self.clock())
+            if found is not None and found != "ended":
+                raise RuntimeError(f"the index record left minted ({found}) during the start")
         except BaseException:
             # the session is live and the index cannot say so: end it, or hold it
             try:
@@ -579,6 +601,15 @@ class RealLauncher:
                 raise
             return HeldChild(self.runtime, session, on_end=lambda: self._mark_ended(key, run_id=run_id, session=session),
                              recorded_ended=lambda: self._ended_on_record(key))
+        if found == "ended":
+            # its END is already proven and recorded: the gated child is closed and the launch is not handed back
+            # as live (the record answers usage and stop)
+            try:
+                handle.child.abort()
+            except Exception:  # noqa: BLE001 - the END is already proven; the local gate is closed best effort
+                pass
+            raise LauncherRefused("session-ended-at-start",
+                                  "a concurrent END proved the session gone before it was recorded started")
         return _Launched(handle.child, self.runtime, session, lambda: self._mark_ended(key),
                          lambda: self._ended_on_record(key))
 
@@ -631,12 +662,16 @@ class RealLauncher:
 
     def _tombstone(self, key: str, state: str, reason: str, *, new: bool = False, **extra: Any) -> None:
         """A zero-usage record. ``new``: only where the key holds no record (a refusal of a key some other spawn
-        holds leaves that spawn's record as it is); else it replaces the record this spawn created."""
+        holds leaves that spawn's record as it is); else it replaces the record this spawn created, and only while
+        that record is still ``pending`` or ``minted`` (a concurrent END's ``ended`` is never replaced by a zero)."""
         try:
             if new:
                 self.index.create(key, state, reason=reason, created_s=self.clock(), **extra)
             else:
-                self.index.put(key, state, reason=reason, created_s=self.clock(), **extra)
+                found = self.index.transition(key, ("pending", "minted"), state, reason=reason,
+                                              created_s=self.clock(), **extra)
+                if found is not None:
+                    _log.warning("no %s record was written for session %s: the record is %s", state, key, found)
         except Exception:  # noqa: BLE001 - an unwritable tombstone reads as unreadable usage, the safe side
             _log.warning("no %s record could be written for session %s", state, key)
 
@@ -732,10 +767,15 @@ class RealLauncher:
                 self._mark_ended(key, occurrence_id=occurrence_id, run_id=run_id, session=session)
                 return None
             try:
-                self.index.put(key, "started", occurrence_id=occurrence_id, run_id=run_id, session=session,
-                               started_s=self.clock())
+                found = self.index.transition(key, ("pending", "minted"), "started", occurrence_id=occurrence_id,
+                                              run_id=run_id, session=session, started_s=self.clock())
             except Exception:  # noqa: BLE001 - the record stays minted: stop() still finds the session by STATUS
+                found = None
                 _log.warning("the held session of %s could not be recorded", key)
+            if found == "ended":
+                return None      # a concurrent END proved it and recorded `ended`: nothing is held
+            if found is not None:
+                _log.warning("the held session of %s was not recorded started: the record is %s", key, found)
             return HeldChild(self.runtime, session,
                              on_end=lambda: self._mark_ended(key, occurrence_id=occurrence_id, run_id=run_id,
                                                              session=session),

@@ -1351,7 +1351,15 @@ def teardown(ctx: H.Ctx, req: RuntimeRequest, blob: None) -> Dict[str, object]:
     got: Dict[str, int] = {}
 
     def front_dead(front_uid: int) -> None:
-        v = H.read_session_tunnel_total(ctx.store, a.slot, front_uid, a.session)   # never raises; None = unreadable
+        # Best effort: this runs inside SCRUB, between the kill and the FRONT_REVOKED/release block, so anything it
+        # raises (the reader lets a programming error propagate) would leave the slot leased. It is logged and the
+        # key left absent (over-debit) instead; the reader's own tests pin the propagation.
+        try:
+            v = H.read_session_tunnel_total(ctx.store, a.slot, front_uid, a.session)
+        except Exception as e:  # noqa: BLE001 - see above
+            sys.stderr.write(f"levain runtime-helper: tunnel total read failed for {a.session}: "
+                             f"{type(e).__name__}: {e}\n")
+            return
         if v is not None:
             got["tunnel_bytes"] = v
 

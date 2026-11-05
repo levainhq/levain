@@ -676,13 +676,32 @@ def _read_session_total_fd(fd: int, session: str) -> Optional[int]:
     close with no id (a log written by a front older than the open record) or any malformed session record of these
     two events: None. None is over-debit (usage settles at the reservation), the safe side; a published total is
     never smaller than the bytes the log's tunnels moved. A session with no passthrough tunnel reads None too.
-    Same tail as :func:`read_passthrough_total` (last 1 MiB, first partial line dropped; a torn line is skipped and,
-    if it was one of the session's, leaves an unmatched or missing id). The log is written by the front's lower uid:
-    the tail is parsed with stdlib ``json`` (``RecursionError`` caught), nothing else. Never raises."""
+
+    A torn or malformed line cannot be attributed by its ``session`` field, and a torn open with its close appended
+    to the fragment hides a whole tunnel (one line, neither record parses). So a line that does not parse as a JSON
+    object is None when it names ``session`` (its JSON-encoded form appears in the line) or comes after any record of
+    the session, and so is a session ``log-record-dropped`` record. Only a line before the session's first record
+    that does not name it (an earlier session's tear) is passed over: a record of this session lost there would be
+    its first, and the front closes a tunnel whose open record did not land (``Front._log`` answers False) before
+    any of its bytes move. The one empty line allowed is the last (the newline after the final record).
+
+    Same tail as :func:`read_passthrough_total`: the last 1 MiB (the first, partial line dropped). That window is a
+    cap: a session whose records began before it (a long session, or a reused slot's other sessions filling the log
+    since) reads None, reason ``tail-window`` (:func:`_session_total_and_reason`), the over-debit side. The log is
+    written by the front's lower uid: the tail is parsed with stdlib ``json`` (``RecursionError`` caught), nothing
+    else. Never raises."""
+    return _session_total_and_reason(fd, session)[0]
+
+
+def _session_total_and_reason(fd: int, session: str) -> Tuple[Optional[int], str]:
+    """:func:`_read_session_total_fd` with why: ``(total, "ok")``, else ``(None, reason)``, reason one of
+    ``not-regular``, ``malformed``, ``unmatched`` (an open with no close, an id seen twice, a bad id or total),
+    ``tail-window`` (an id or the open of a close missing while the 1 MiB window cut the log), ``gap`` (the same
+    with the whole log read), ``no-tunnel``, ``error``. Never raises."""
     try:
         st = os.fstat(fd)
         if not stat.S_ISREG(st.st_mode):
-            return None
+            return None, "not-regular"
         off = max(0, st.st_size - _PASSTHROUGH_TAIL_BYTES)
         if off:
             os.lseek(fd, off, os.SEEK_SET)
@@ -697,6 +716,11 @@ def _read_session_total_fd(fd: int, session: str) -> Optional[int]:
         lines = b"".join(chunks).split(b"\n")
         if off:
             lines = lines[1:]
+        if lines and lines[-1] == b"":
+            lines = lines[:-1]
+        missing = "tail-window" if off else "gap"
+        token = json.dumps(session).encode("utf-8")
+        seen = False
         opened: set = set()
         closed: set = set()
         total = 0
@@ -704,14 +728,21 @@ def _read_session_total_fd(fd: int, session: str) -> Optional[int]:
             try:
                 rec = json.loads(line)
             except (ValueError, RecursionError):
+                rec = None
+            if not isinstance(rec, dict):
+                if seen or token in line:
+                    return None, "malformed"
                 continue
-            if not isinstance(rec, dict) or rec.get("session") != session:
+            if rec.get("session") != session:
                 continue
+            seen = True
             event = rec.get("event")
+            if event == "log-record-dropped":
+                return None, "malformed"
             if event == "tunnel-open":
                 t = rec.get("tunnel_id")
                 if not _tunnel_id_ok(t) or t in opened:
-                    return None
+                    return None, "unmatched"
                 opened.add(t)
             elif event == "tunnel":
                 pt = rec.get("passthrough")
@@ -719,16 +750,22 @@ def _read_session_total_fd(fd: int, session: str) -> Optional[int]:
                     continue   # a non-passthrough tunnel: counts nothing
                 t = rec.get("tunnel_id")
                 v = rec.get("passthrough_total")
+                if _tunnel_id_ok(t) and t not in opened and pt is True:
+                    return None, missing
                 if pt is not True or not _tunnel_id_ok(t) or t not in opened or t in closed \
                         or type(v) is not int or not total <= v <= _INT64_MAX:
-                    return None
+                    return None, "unmatched"
                 closed.add(t)
                 total = v
-        if not opened or closed != opened or opened != set(range(1, len(opened) + 1)):
-            return None
-        return total
+        if not opened:
+            return None, "no-tunnel"
+        if opened != set(range(1, len(opened) + 1)):
+            return None, missing
+        if closed != opened:
+            return None, "unmatched"
+        return total, "ok"
     except Exception:
-        return None
+        return None, "error"
 
 
 def read_session_total(path: object, session: str) -> Optional[int]:
@@ -766,7 +803,12 @@ def read_session_tunnel_total(store: "Store", slot: SlotId, front_uid: int, sess
                 if not stat.S_ISREG(st.st_mode) or st.st_nlink != 1 \
                         or st.st_uid not in (store.seams.chowned_uid(front_uid), 0):
                     return None
-                return _read_session_total_fd(f, session)
+                total, why = _session_total_and_reason(f, session)
+                if total is None and why != "no-tunnel":
+                    # the key is left absent (usage settles at the reservation); the reason says which cap or
+                    # defect cost the total, ``tail-window`` the 1 MiB window's
+                    sys.stderr.write(f"levain runtime-helper: tunnel total unproven for {session}: {why}\n")
+                return total
             finally:
                 os.close(f)
         finally:

@@ -51,8 +51,8 @@ def test_the_reader_is_one_and_dispatch_usage_reimports_it(tmp_path):
 
 def test_teardown_answers_this_sessions_total_not_anothers(env, tmp_path):
     w, s, log = _teardown_world(env)
-    log.write_text(_rec("other", 999) + _rec(s, 100) + _rec("other", 5000, 2) + _rec(s, 1234, 2)
-                   + _rec("other", 7000, 3) + "torn{")
+    log.write_text("torn{\n" + _rec("other", 999) + _rec(s, 100) + _rec("other", 5000, 2) + _rec(s, 1234, 2)
+                   + _rec("other", 7000, 3))
     code, line = w.main(["teardown", s])
     assert line == {"ok": True, "state": R.RETAINED, "tunnel_bytes": 1234}, w.last_err
     assert teardown_proves(line)                       # the extra key leaves the proof unchanged
@@ -323,7 +323,7 @@ def test_fr2_a_close_without_a_matching_open_is_absent(tmp_path, text):
 
 def test_fr2_another_sessions_records_are_ignored(tmp_path):
     p = tmp_path / "front.log"
-    p.write_text(_open("other", 1) + _rec("S", 40) + _close("other", 7, 9999) + _open("other", 1) + "garbage\n")
+    p.write_text("garbage\n" + _open("other", 1) + _rec("S", 40) + _close("other", 7, 9999) + _open("other", 1))
     assert H.read_session_total(p, "S") == 40
     assert H.read_session_total(p, "other") is None
 
@@ -407,3 +407,167 @@ def test_fr2_the_front_logs_an_open_before_the_bytes_and_the_close_carries_its_i
         assert H.read_session_total(log, "s-test") == front.pt_total == 4 * hello_len
 
     asyncio.run(_run(policy("interactive"), body))
+
+
+# --- FIX ROUND 3: a torn record never yields a lower total; the read never wedges the slot ---------------------------
+
+class _TornOpenOs:
+    """``os`` for the front module whose ``write`` of a ``tunnel-open`` record writes a prefix and then fails ENOSPC,
+    the shape of a disk filling mid-record. ``truncate_fails``: the front's repair (``ftruncate``) fails too."""
+
+    def __init__(self, truncate_fails=False):
+        import errno as _errno
+        self._errno, self.truncate_fails, self.torn = _errno, truncate_fails, 0
+
+    def __getattr__(self, name):
+        return getattr(os, name)
+
+    def write(self, fd, data):
+        data = bytes(data)
+        if b'"tunnel-open"' in data and not self.torn:
+            self.torn = 1
+            return os.write(fd, data[:20])
+        if self.torn == 1:
+            self.torn = 2
+            raise OSError(self._errno.ENOSPC, "No space left on device")
+        return os.write(fd, data)
+
+    def ftruncate(self, fd, length):
+        if self.truncate_fails:
+            raise OSError(self._errno.ENOSPC, "No space left on device")
+        return os.ftruncate(fd, length)
+
+
+def _torn_open_world(monkeypatch, truncate_fails):
+    import asyncio
+    import levain.broker.front as front_mod
+    from tests.test_broker_front_passthrough_limits import _run, _settled, client_hello, policy
+    fake = _TornOpenOs(truncate_fails)
+    out: dict = {}
+    seen: dict = {}
+
+    async def body(open_tunnel, front, log) -> None:
+        hello_len = len(client_hello("api.anthropic.com"))
+        st1, _, r1, w1 = await open_tunnel()
+        got = b""
+        while len(got) < hello_len:
+            got += await r1.read(65536)
+        w1.close()
+        await _settled(front)
+        up_before = seen["up"]
+        monkeypatch.setattr(front_mod, "os", fake)
+        st2, _, r2, w2 = await open_tunnel()            # its open record is torn: no byte of it may flow
+        assert await asyncio.wait_for(r2.read(65536), 5) == b""
+        w2.close()
+        await _settled(front)
+        monkeypatch.setattr(front_mod, "os", os)
+        st3, head3, _, w3 = await open_tunnel()         # passthrough is latched closed for this front
+        w3.close()
+        await _settled(front)
+        await asyncio.sleep(0.05)
+        out.update(st=(st1, st2, st3), head3=head3, up=(up_before, seen["up"]), hello_len=hello_len,
+                   text=log.read_bytes(), total=H.read_session_total(log, "s-test"), pt_total=front.pt_total)
+
+    asyncio.run(_run(policy("interactive"), body, seen=seen))
+    return fake, out
+
+
+def test_fr3_a_torn_open_record_closes_the_tunnel_before_its_bytes_and_latches_passthrough(monkeypatch):
+    """codex HIGH: an ENOSPC-shaped partial write of ``tunnel-open``. The tunnel forwards nothing, the front repairs the
+    fragment, later passthrough CONNECTs are refused, and the published total is the bytes that actually moved."""
+    fake, out = _torn_open_world(monkeypatch, truncate_fails=False)
+    assert fake.torn == 2
+    assert out["st"][:2] == (200, 200)
+    assert out["up"][1] == out["up"][0] == out["hello_len"]         # tunnel 2's hello never reached the upstream
+    assert out["st"][2] != 200 and b"passthrough" in out["head3"], out["head3"]
+    lines = [json.loads(x) for x in out["text"].decode().splitlines()]   # the fragment was cut back: every line parses
+    assert [(x["event"], x.get("tunnel_id")) for x in lines if x["event"] in ("tunnel-open", "tunnel")] == [
+        ("tunnel-open", 1), ("tunnel", 1)]
+    assert out["total"] == 2 * out["hello_len"]                     # tunnel 1 up + echoed down: all that moved
+
+
+def test_fr3_a_torn_fragment_the_front_cannot_repair_reads_none(monkeypatch):
+    fake, out = _torn_open_world(monkeypatch, truncate_fails=True)
+    assert fake.torn == 2 and out["up"][1] == out["up"][0]
+    assert out["total"] is None                                      # a torn line after the session's records
+
+
+_FRAG = '{"address": "1.2.3.4", "at": 1.0, "bytes_down": 9'          # a record cut before its session field
+
+
+@pytest.mark.parametrize("text", [
+    _rec("S", 10) + '{"at": 1.0, "event": "tunnel-open", "ses' + _close("S", 2, 50),   # codex: open 2 torn, its
+    #                                                                 close glued on: tunnel 2 vanishes whole
+    _rec("S", 10) + _FRAG + _rec("S", 50, 2),                        # a torn record glued to tunnel 2's open
+    _rec("S", 10) + _open("S", 2) + _FRAG + _close("S", 2, 50),      # ... glued to tunnel 2's close
+    _rec("S", 10) + _FRAG + "\n",                                    # a torn line after the session's records
+    _rec("S", 10) + _FRAG,                                           # a torn final line (the front died mid-write)
+    _rec("S", 10) + "[1, 2]\n",                                      # JSON, not a record
+    _rec("S", 10) + "\n",                                            # an empty line inside the log
+    '{"event": "tunnel", "session": "S", "passthr\n' + _rec("S", 10),   # a torn line naming the session, before
+    _rec("S", 10) + json.dumps({"event": "log-record-dropped", "session": "S", "bytes": 9}) + "\n",
+])
+def test_fr3_a_torn_or_malformed_line_of_the_session_is_absent(tmp_path, text):
+    p = tmp_path / "front.log"
+    p.write_text(text)
+    assert H.read_session_total(p, "S") is None
+
+
+def test_fr3_another_sessions_torn_line_before_the_session_is_tolerated(tmp_path):
+    """A line no record of this session can be in (before its first record, not naming it) does not cost its total."""
+    p = tmp_path / "front.log"
+    p.write_text(_rec("other", 5) + _FRAG + "\n" + "garbage\n" + _rec("S", 10) + _rec("S", 30, 2))
+    assert H.read_session_total(p, "S") == 30
+
+
+def test_fr3_the_real_fronts_ordinary_tunnel_close_counts_nothing():
+    """deepseek HIGH (checked on disk): the real front writes ``passthrough: false`` on an ordinary route's close, and
+    the reader skips it, so a session with an ordinary route still publishes its passthrough total."""
+    import asyncio
+    from tests.test_broker_front_passthrough_limits import _records, _run, _settled, client_hello, policy
+
+    async def body(open_tunnel, front, log) -> None:
+        for host in ("api.anthropic.com", "ok.example", "api.anthropic.com"):
+            st, _, r, w = await open_tunnel(host)
+            assert st == 200
+            hello_len = len(client_hello(host))
+            got = b""
+            while len(got) < hello_len:
+                got += await r.read(65536)
+            w.close()
+            await _settled(front)
+        plain = [x for x in _records(log) if x.get("event") == "tunnel" and x.get("host") == "ok.example"]
+        assert len(plain) == 1 and plain[0]["passthrough"] is False and "tunnel_id" not in plain[0], plain
+        assert H.read_session_total(log, "s-test") == front.pt_total > 0
+
+    asyncio.run(_run(policy("interactive"), body))
+
+
+def test_fr3_a_reader_bug_never_wedges_the_slot(env, monkeypatch, capsys):
+    """MED: anything the tunnel read raises is logged and the key left absent; SCRUB's revoke and release still run."""
+    from tests.test_slot_s2f3_start import E0
+    w, s, log = _teardown_world(env)
+    log.write_text(_rec(s, 100))
+    monkeypatch.setattr(H, "read_session_tunnel_total", lambda *a, **k: (_ for _ in ()).throw(AttributeError("bug")))
+    assert w.main(["teardown", s])[1] == {"ok": True, "state": R.RETAINED}, w.last_err
+    assert w.slot_state(E0).state == "reusable"
+    err = capsys.readouterr().err
+    assert "tunnel total" in err and "AttributeError" in err, err
+
+
+def test_fr3_a_session_cut_by_the_tail_window_names_its_reason(tmp_path):
+    """MED (over-debit only): a session whose records began before the 1 MiB tail reads None with its own reason."""
+    p = tmp_path / "front.log"
+    pad = json.dumps({"event": "refused", "session": "other", "detail": "x" * 1000}) + "\n"
+    p.write_text(_open("S", 1) + pad * 1100 + _close("S", 1, 10) + _rec("S", 20, 2))
+    fd = os.open(p, os.O_RDONLY)
+    try:
+        assert H._session_total_and_reason(fd, "S") == (None, "tail-window")
+    finally:
+        os.close(fd)
+    p.write_text(_rec("S", 10) + _open("S", 2))
+    fd = os.open(p, os.O_RDONLY)
+    try:
+        assert H._session_total_and_reason(fd, "S") == (None, "unmatched")
+    finally:
+        os.close(fd)

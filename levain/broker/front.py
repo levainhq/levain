@@ -1155,6 +1155,10 @@ class Front:
         #: the last passthrough tunnel id this front logged a ``tunnel-open`` for: ids run 1, 2, 3, ... per front, so
         #: root's reader (``runtime_helper._read_session_total_fd``) can prove it saw EVERY tunnel of the session.
         self.pt_seq = 0
+        #: latched when a ``tunnel-open`` record failed to land: never cleared for the life of the front. A tunnel
+        #: whose open is not in the log could carry bytes the reader never sees (a lower total), so from then on no
+        #: passthrough tunnel is opened and no passthrough byte is taken.
+        self.pt_log_failed = False
 
     def _pt_left(self) -> Optional[float]:
         """Seconds until the passthrough deadline (<= 0 once past it); None when the session has none."""
@@ -1172,6 +1176,9 @@ class Front:
             raise Refused("passthrough-deadline", "past-deadline")
         if self.pt_exhausted:
             raise Refused("passthrough-bytes-exhausted", "cap-reached")
+        if self.pt_log_failed:
+            # the byte budget can no longer be accounted, so it is spent: the table's name, a distinct detail
+            raise Refused("passthrough-bytes-exhausted", "tunnel-log-failed")
 
     def _pt_take(self, n: int, own: dict) -> tuple[bool, Optional[dict]]:
         """Reserve ``n`` passthrough bytes the caller writes next, with no await between this and its write. False
@@ -1181,6 +1188,8 @@ class Front:
         reservation that lands exactly on the cap latches exhaustion and closes every OTHER connection; the caller's (``own``, its
         counts) is marked cut but left open, so its accepted chunk is written before the caller ends it."""
         cap = self.policy.tunnel_bytes_cap
+        if self.pt_log_failed:
+            return False, None
         if cap is None:
             self.pt_total += n
             return True, None
@@ -1216,25 +1225,34 @@ class Front:
             return False
         return True
 
-    def _log(self, rec: dict) -> None:
+    def _log(self, rec: dict) -> bool:
+        """Write one record. True when it was written whole (to the log, or to stderr when there is no log); False
+        when the write failed, reported on stderr. A caller whose accounting depends on the record (``tunnel-open``)
+        acts on False; every other caller may ignore it."""
         head = {"at": round(time.time(), 3), "session": self.policy.session}
         line = json.dumps({**head, **rec}, sort_keys=True) + "\n"
         try:
             if self.log_path is None:
                 sys.stderr.write(line)
-                return
+                return True
             data = line.encode("utf-8")
             if len(data) > self.log_cap:      # one record past the whole cap would break the two-cap bound
                 data = (json.dumps({**head, "event": "log-record-dropped", "bytes": len(data)}, sort_keys=True)
                         + "\n").encode("utf-8")
+                self._append(self.log_path, data)
+                return False
             self._append(self.log_path, data)
+            return True
         except OSError as e:
             print(f"levain gw-front: log write failed ({e}): {line}", file=sys.stderr, end="")
+            return False
 
     def _append(self, path: Path, data: bytes) -> None:
         """Append ``data`` to the log: opened ``O_NOFOLLOW`` (a link there is an error, never followed), a regular
         file only, set to LOG_MODE. When ``data`` would take a non-empty log past the cap, the log is first renamed
-        to ``<log>.1`` (replacing the previous one) and a new log made. The front is the log's only writer."""
+        to ``<log>.1`` (replacing the previous one) and a new log made. The front is the log's only writer. A write
+        that fails part way (ENOSPC, a quota) is cut back to the size before it, best effort, so the next record does
+        not land on a fragment; the error is raised either way."""
         fd = self._open_log(path)
         try:
             size = os.fstat(fd).st_size
@@ -1243,8 +1261,16 @@ class Front:
                 fd = -1
                 os.replace(path, path.with_name(path.name + ".1"))
                 fd = self._open_log(path)
-            while data:
-                data = data[os.write(fd, data):]
+                size = os.fstat(fd).st_size
+            try:
+                while data:
+                    data = data[os.write(fd, data):]
+            except OSError:
+                try:
+                    os.ftruncate(fd, size)
+                except OSError:
+                    pass   # the fragment stays: root's reader reads a torn line after a session record as None
+                raise
         finally:
             if fd >= 0:
                 os.close(fd)
@@ -1372,9 +1398,16 @@ class Front:
                 # The open record lands before the tunnel's first byte is written (no await between here and the
                 # hello's write), and once its bytes are taken a close record always follows (``relaying``) unless the
                 # front is killed: so an open with no close in the log is a tunnel whose bytes the log does not hold.
+                # The open record is mandatory: one that did not land (a failed or partial write) ends this tunnel
+                # here, before any of its bytes is written, and latches passthrough closed for the front. Its hello
+                # stays in ``pt_total`` (taken, never sent): a later close may then carry more than moved, never less.
                 self.pt_seq += 1
                 tid = counts["tunnel_id"] = self.pt_seq
-                self._log({"event": "tunnel-open", "tunnel_id": tid})
+                if not self._log({"event": "tunnel-open", "tunnel_id": tid}):
+                    self.pt_log_failed = True
+                    self._log({"event": "refused", "refused": "passthrough-bytes-exhausted",
+                               "detail": "tunnel-log-failed", "host": route.host, "address": addr})
+                    return
             relaying = True
             uwriter.write(hello)
             counts["up"] = len(hello)

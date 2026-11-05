@@ -1188,3 +1188,58 @@ def test_r3_8_the_held_child_of_an_index_failure_records_ended_with_its_session(
     assert child.abort() == ctl.GATE_REFUSED
     rec = ln.index.get(KEY)
     assert rec["state"] == "ended" and rec["session"] == "sess-1" and ln.usage(KEY).actions == 6
+
+
+# S10b slice C FIX ROUND 3 (codex HIGH): no non-terminal write erases a concurrent END's `ended` and its total
+
+class _TotalRuntime(FakeRuntime):
+    def final_tunnel_bytes(self, session):
+        return 777
+
+
+def _concurrent_end(index, session):
+    """Another launcher (a reaper's stop) proving the session gone and recording `ended` with its total."""
+    return L.RealLauncher(FakeControl(), _TotalRuntime(), FakeSources(), index)._mark_ended(KEY, session=session)
+
+
+def test_fr3_an_end_recorded_while_the_slot_starts_is_never_erased_by_started(tmp_path):
+    class Rt(FakeRuntime):
+        def start(self, req):
+            handle = super().start(req)
+            assert _concurrent_end(ln.index, handle.session)      # STATUS names the bound session: END runs now
+            return handle
+
+    ln, _, rt = build(tmp_path, runtime=Rt())
+    with pytest.raises(L.LauncherRefused) as e:
+        ln.spawn(launch())
+    assert e.value.name == "session-ended-at-start"
+    rec = ln.index.get(KEY)
+    assert rec["state"] == "ended" and rec["tunnel_bytes"] == 777 and rec["session"] == "sess-1", rec
+    assert rt.children[0].aborted == 1                            # never handed back as a live launch
+
+
+def test_fr3_an_end_recorded_during_an_undo_is_never_erased_by_started(tmp_path):
+    class Rt(FakeRuntime):
+        def end(self, session):
+            super().end(session)
+            assert _concurrent_end(ln.index, session)              # another launcher's END proves it meanwhile
+            return False
+
+    ln, _, rt = build(tmp_path, control=FakeControl(**BOUND9), runtime=Rt(fail=OSError("half started")))
+    with pytest.raises(OSError):
+        ln.spawn(launch())
+    rec = ln.index.get(KEY)
+    assert rec["state"] == "ended" and rec["tunnel_bytes"] == 777, rec
+
+
+def test_fr3_an_undone_tombstone_never_replaces_an_ended_record(tmp_path):
+    class Rt(FakeRuntime):
+        def start(self, req):
+            assert _concurrent_end(ln.index, "sess-1")
+            raise OSError("no slot")
+
+    ln, control, _ = build(tmp_path, runtime=Rt())
+    with pytest.raises(OSError):
+        ln.spawn(launch())
+    rec = ln.index.get(KEY)
+    assert rec["state"] == "ended" and rec["tunnel_bytes"] == 777, rec
