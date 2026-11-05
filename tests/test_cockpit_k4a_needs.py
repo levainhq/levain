@@ -139,7 +139,7 @@ def test_the_decisions_tile_names_the_top_item_and_a_click_goes_to_the_strip_wit
             {"eval": f"(async () => {{ {TILE}.click(); await new Promise(r => setTimeout(r, 300)); return [!document.getElementById('levain-modal'), !!document.activeElement.closest('#ck-needs')]; }})()"}])["values"]
     # the top item is named, not just counted: the open question leads, as the mock's tile does; by its first words once they are read,
     # else by who asked, and never by its number (tests/test_cockpit_band_title.py holds the title helper's own cases)
-    assert "question #" not in out[-2] and ("claude_code · question" in out[-2] or "Ship the sweep fix tonight or… · claude_code" in out[-2]), out
+    assert "question #" not in out[-2] and "Ship the sweep fix tonight or… · claude_code" in out[-2], out
     assert out[-1] == [True, True], out                                  # no modal; focus is in the strip
 
 

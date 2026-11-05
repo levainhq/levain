@@ -4489,10 +4489,31 @@
       },
       () => ({ error: "the question could not be read (network)" }));
   }
-  function rememberQuestionHandle(n, handle) {
-    questionHandles.delete(n);
-    questionHandles.set(n, handle);
+  // a handle is kept by the question's card id (flow's "question:<n>"), else its number: one string key either way, so a number
+  // that arrives as a string and as a number is one question
+  const questionKeyOf = (q) => (q && q.id ? String(q.id) : "n:" + String(q && q.n));
+  function rememberQuestionHandle(q, handle) {
+    const k = questionKeyOf(q);
+    const changed = questionHandles.get(k) !== handle;
+    questionHandles.delete(k);
+    questionHandles.set(k, handle);
     if (questionHandles.size > QUESTION_HANDLES_MAX) questionHandles.delete(questionHandles.keys().next().value);
+    if (changed) repaintNeedsNames(k);
+  }
+  // The glance tile is drawn before a question's words are read, so a name learned later is painted into the tile that already
+  // stands (cockpit_view.js glanceFace marks it with the item it names). Only a tile naming `key` is touched (all of them when
+  // key is absent: the write token came or went).
+  function repaintNeedsNames(key) {
+    if (typeof document === "undefined") return;
+    for (const t of document.querySelectorAll(".glance-top")) {
+      const it = t._needsItem;
+      if (!it || it.kind !== "question" || (key !== undefined && questionKeyOf(it.q) !== key)) continue;
+      const name = needsName(it);
+      if (t.textContent !== name) t.textContent = name;
+    }
+  }
+  if (typeof window !== "undefined" && typeof window.addEventListener === "function") {
+    window.addEventListener("levain:write-token-change", () => repaintNeedsNames());
   }
   function questionBody(q, row) {
     const key = q.n + "|" + q.state;
@@ -4503,8 +4524,17 @@
     const got = consentQueued(() => questionFetch(q, headers, 1), "the question could not be read", row)
       .then((b) => {
         if (b.error && questionBodies.get(key) === got) questionBodies.delete(key);
-        else if (!b.error && typeof b.what === "string") { const h = questionHandle(b.what); if (h) rememberQuestionHandle(q.n, h); }
+        else if (!b.error && typeof b.what === "string") {
+          // the words were fetched with a token: a handle made from them is kept only while this page still holds one. A read that
+          // lands after the token went is not cached either, so the read that follows the token's return learns the handle.
+          if (hasWriteToken()) { const h = questionHandle(b.what); if (h) rememberQuestionHandle(q, h); }
+          else if (questionBodies.get(key) === got) questionBodies.delete(key);
+        }
         return b;
+      }, (e) => {
+        // a rejected read is not kept: a retry must be able to read again, and the title be taken then
+        if (questionBodies.get(key) === got) questionBodies.delete(key);
+        throw e;
       });
     questionBodies.set(key, got);
     return got;
@@ -6017,7 +6047,8 @@
   // it stays in q.n, which the answer path sends, and is not drawn here.
   function needsName(it) {
     if (it.kind === "consent") return (it.c.tool || "request") + " · " + (it.c.agent || "agent");
-    const handle = questionHandles.get(it.q.n);
+    // the handle is the question's own words: it is shown only to a page that holds the token the words were read with
+    const handle = hasWriteToken() ? questionHandles.get(questionKeyOf(it.q)) : "";
     if (handle) return handle + " · " + (it.q.agent || "agent");
     const band = bandNumOf.get(Number(it.q.n));
     return (it.q.agent || "agent") + " · question" + (band === undefined ? "" : " · band " + band);
@@ -6031,7 +6062,9 @@
     let out = words.slice(0, QUESTION_HANDLE_WORDS).join(" ");
     let cut = words.length > QUESTION_HANDLE_WORDS;
     if (out.length > QUESTION_HANDLE_CHARS) { out = out.slice(0, QUESTION_HANDLE_CHARS); cut = true; }
-    return cut ? out.replace(/[\s,;:.\-–—(]+$/, "") + "…" : out;
+    if (!cut) return out;
+    const body = out.replace(/[\s,;:.\-–—(]+$/, "");
+    return body ? body + "…" : "";     // nothing but trailing marks is no handle: the agent-only name stands
   }
   function needsSummary(items) {
     const nc = items.filter((it) => it.kind === "consent").length, nq = items.length - nc;
@@ -6310,8 +6343,8 @@
     const id = needsIdOf(it);
     if (id) row.dataset.needsId = id;
     row.dataset.needsCard = it.kind;
-    const title = el("span", "needs-row-title", it.kind === "consent" ? (it.c.tool || "request") : "question #" + it.q.n);
-    const sub = el("span", "needs-row-sub ext-meta", "");
+    const title = el("span", "needs-row-title", it.kind === "consent" ? (it.c.tool || "request") : needsName(it));
+    const sub =el("span", "needs-row-sub ext-meta", "");
     const text = el("span", "needs-row-text");
     text.append(title, sub);
     const side = el("span", "needs-row-side");
@@ -6493,7 +6526,7 @@
     // expiring one is never folded behind "+N more" by questions (the cards keep the questions first)
     const barOrder = items.filter((it) => it.kind === "consent").concat(items.filter((it) => it.kind !== "consent"));
     for (const it of barOrder.slice(0, NEEDS_CHIPS)) {
-      const chip = el("button", "needs-chip-btn", it.kind === "consent" ? (it.c.tool || "request") : "question #" + it.q.n);
+      const chip = el("button", "needs-chip-btn", it.kind === "consent" ? (it.c.tool || "request") : needsName(it));
       chip.type = "button";
       const id = it.kind === "consent" ? (it.c.id ? "consent:" + it.c.id : "") : (it.q.id ? String(it.q.id) : "");
       if (id) chip.dataset.needsId = id;
