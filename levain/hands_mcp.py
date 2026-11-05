@@ -20,7 +20,12 @@ account can use it, and a card says so plainly). It is recorded here and never a
 ``server_sha256`` is the digest of the Codex table this entry renders. It is checked when a link is appended and
 again inside every renderer, never at replay, so a later change to the renderer cannot make an old link refuse the
 log: :func:`live_entries` reports an entry whose digest no longer matches its table and leaves it out, and a renderer
-handed one refuses."""
+handed one refuses.
+
+Known edge: a stock Apple Silicon Homebrew tree (``/opt/homebrew/bin`` and the Cellar) is group-writable by ``admin``,
+so :func:`command_problems` refuses a command under it ("writable by group or world") although it is in
+:data:`TRUSTED_COMMAND_DIRS`. Only a root-owned binary directory can host a stdio server; no shipped verb builds a
+stdio entry yet."""
 from __future__ import annotations
 
 import hashlib
