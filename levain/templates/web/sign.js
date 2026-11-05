@@ -457,7 +457,10 @@
     card.id = "sheet-escalate";
     card.appendChild(el("p", "", "No passkey can sign this here: it needs an active passkey enrolled for " + rp + "."));
     if (typeof note === "string" && note) card.appendChild(el("p", "ext-meta", note));
-    card.appendChild(el("p", "", "Enrol one at the laptop (levain cockpit enroll, signed by the laptop key), then open this link again."));
+    card.appendChild(el("p", "", "Make a passkey on this device, enrol it at the laptop (levain cockpit enroll, signed by the laptop key), then open this link again."));
+    const mk = el("a", "sign-enrol-link", "Make a passkey on this device");
+    mk.href = "/enrol";
+    card.appendChild(mk);
     $("sheet-body").appendChild(card);
   }
 

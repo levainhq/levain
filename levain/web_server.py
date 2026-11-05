@@ -1138,6 +1138,10 @@ _ASSETS: dict[str, tuple[str, str]] = {
     "/pair.js": ("pair.js", "text/javascript; charset=utf-8"),
     "/devices_panel.js": ("devices_panel.js", "text/javascript; charset=utf-8"),
     "/pair_card.js": ("pair_card.js", "text/javascript; charset=utf-8"),
+    # The passkey-making page: a static shell (its reads and its one POST are same-origin and gated) that makes a passkey on
+    # this device and prints the laptop commands that enrol it, through POST /cockpit/passkey/key-line (served beside a Signer).
+    "/enrol": ("enrol.html", "text/html; charset=utf-8"),
+    "/enrol.js": ("enrol.js", "text/javascript; charset=utf-8"),
     # The install coach, and the one gated() question pairing and pings ask (a phone tab where an install is possible).
     "/pwa_install.js": ("pwa_install.js", "text/javascript; charset=utf-8"),
     # The page half of a push tap: every page a Home Screen window can show loads it (the cockpit, the sign sheet, /pair).

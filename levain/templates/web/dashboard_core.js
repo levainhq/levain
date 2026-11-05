@@ -5406,8 +5406,13 @@
       const signers = Array.isArray(r.signers) ? r.signers : [];
       const k = signNotes.get(id);
       if (k) show(k[0], k[1]);
-      else if (!signers.length) show(listing.note || "no passkey is enrolled for this name", "bad");
-      else show("");
+      else if (!signers.length) {
+        show(listing.note || "no passkey is enrolled for this name", "bad");
+        // the page that makes a passkey for this name on this device and prints the laptop commands that enrol it
+        const mk = el("a", "sign-enrol-link", "Make a passkey on this device");
+        mk.href = "/enrol";
+        note.appendChild(mk);
+      } else show("");
       const acts = el("div", "sign-actions");
       const buttons = [];
       let sheetBtn = null;    // "open the sheet": locked with the card's own controls, whether or not a key may sign

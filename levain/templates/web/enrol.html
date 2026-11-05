@@ -1,0 +1,23 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<meta name="referrer" content="no-referrer" />
+<title>Levain · make a passkey</title>
+<link rel="stylesheet" href="/dashboard.css" />
+</head>
+<body class="pair-body">
+  <main class="pair-card" id="enrol" aria-live="polite">
+    <div class="pair-brand"><span class="pair-dot"></span>Levain</div>
+    <h1 id="enrol-title">Make a passkey on this device</h1>
+    <p id="enrol-msg">Reading this device…</p>
+    <div id="enrol-actions" class="pair-actions" hidden></div>
+    <div id="enrol-cmds"></div>
+    <p id="enrol-next"><a id="enrol-home" href="/">Back to the cockpit</a></p>
+  </main>
+  <!-- The page's code is its own served file: this page's CSP is script-src 'self', no inline script. -->
+  <script src="/sw_open.js"></script>
+  <script src="/enrol.js"></script>
+</body>
+</html>
