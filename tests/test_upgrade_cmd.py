@@ -738,8 +738,8 @@ def test_upgrade_holds_no_second_copy_of_the_recovery_note(monkeypatch):
 S1, S2, S3 = "s-" + "1" * 16, "s-" + "2" * 16, "s-" + "3" * 16
 
 
-def rec(session, kind="dispatch", state="ACTIVE"):
-    return {"session": session, "state": state, "claims": {"kind": kind}}
+def rec(session, kind="dispatch", state="ACTIVE", lease_live=True):
+    return {"session": session, "state": state, "claims": {"kind": kind}, "lease_live": lease_live}
 
 
 def two_live():
@@ -784,11 +784,66 @@ def test_the_bound_returns_the_prompt_and_nothing_is_ended(env, capsys):
     nothing_ran(env)
 
 
-def test_end_now_proceeds(env, capsys):
+def test_end_now_with_leases_live_refuses_and_names_them(env, capsys):
+    """L3 r1 HIGH-1: `end` printed "Ending them now" and went to sudo, where the helper refuses `live-lease`. Levain has
+    no operator verb that ends a session, so it names the ones holding a lease and runs nothing."""
     env.live = two_live()
     env.answers = ["e"]
     rc, out = env.run(capsys)
+    assert rc == 4 and S1 in out and S2 in out and S3 in out and "End these first" in out
+    assert "Ending them now" not in out and "Nothing was changed" in out
+    nothing_ran(env)
+
+
+def test_end_now_proceeds_when_no_lease_is_live(env, capsys):
+    env.live = (True, [rec(S1, lease_live=False), rec(S2, lease_live=False)])
+    env.answers = ["e"]
+    rc, out = env.run(capsys)
     assert rc == 0 and len(env.runner.calls) == 1 and env.execs
+
+
+def test_end_sessions_flag_refuses_the_same_way(env, capsys):
+    env.live = two_live()
+    rc, out = env.run(capsys, end_sessions=True)
+    assert rc == 4 and "End these first" in out and env.prompts == []
+    nothing_ran(env)
+
+
+def test_a_cancel_at_the_root_gate_says_what_stands(env, capsys):
+    """L3 r1 HIGH-2: after the installer step, "Nothing was changed" was false. The words come from the phase."""
+    env.live = [(True, []), two_live()]
+    env.answers = ["c"]
+    rc, out = env.run(capsys)
+    assert rc == 0 and env.execs
+    env.live = two_live()
+    rc, out = env.run(capsys, no_pip=True)
+    assert rc == 4 and "Nothing was changed" not in out
+    assert "installer step is not undone" in out and "levain upgrade --no-pip" in out
+    assert sudo_calls(env) == []
+
+
+def test_off_shape_and_unknown_state_records_count_as_running():
+    agents, own = U._live_split([rec(S1), "junk", {"session": S2, "state": ["x"]}, {"session": S3, "state": "NEW"},
+                                 rec(S1, state="RETAINED")])
+    assert len(agents) == 4 and not own
+    assert U._live_split([rec(S1, state="HELD"), rec(S2, state="PURGED")]) == ([], [])
+
+
+def test_wait_on_a_status_that_does_not_answer_prompts_at_once(env, capsys):
+    env.live = (False, "no control socket")
+    env.answers = ["c"]
+    rc, out = env.run(capsys, wait=True)
+    assert rc == 4 and len(env.prompts) == 1 and env.slept == []
+    nothing_ran(env)
+
+
+def test_ctrl_c_outside_the_offer_is_not_exit_4(env, capsys):
+    def boom(argv, **kw):
+        raise KeyboardInterrupt
+
+    env.runner = boom
+    rc, out = env.run(capsys)
+    assert rc == U.EXIT_INTERRUPTED == 130 and "partly applied" in out
 
 
 def test_an_empty_answer_asks_again_and_eof_is_cancel(env, capsys):
@@ -853,9 +908,9 @@ def test_flags_answer_in_advance_and_pass_through_the_reexec(env, capsys, tmp_pa
     rc, out = e2.run(capsys, wait_max=7)
     assert rc == 0 and e2.execs[0][1][-2:] == ["--wait-max", "7"] and "up to 7 min" in out
     e3 = Env(tmp_path / "e")
-    e3.live = two_live()
+    e3.live = (True, [rec(S1, lease_live=False)])
     rc, out = e3.run(capsys, end_sessions=True)
-    assert rc == 0 and e3.prompts == [] and e3.execs[0][1][-1] == "--end-sessions" and "Ending them now" in out
+    assert rc == 0 and e3.prompts == [] and e3.execs[0][1][-1] == "--end-sessions"
 
 
 def test_flags_are_mutually_exclusive():
