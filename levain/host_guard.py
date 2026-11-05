@@ -643,7 +643,10 @@ def _read_toml_doc(path: Path) -> Any:
         return None
     except OSError as exc:
         raise AgentPinError([f"{path}: unreadable ({exc.strerror or exc})"]) from None
-    import tomllib   # 3.11+, imported here so root's 3.9 can import this module (the supervisor's repo-layer check reads its constants)
+    try:
+        import tomllib   # 3.11+, imported here so root's 3.9 can import this module (the supervisor's repo-layer check reads its constants)
+    except ImportError:   # < 3.11: a TOML file that is there but cannot be read is a refusal, never a pass
+        raise AgentPinError([f"{path}: cannot be read (TOML needs Python 3.11+)"]) from None
     try:
         return tomllib.loads(data.decode("utf-8"))
     except (ValueError, UnicodeDecodeError):

@@ -1035,3 +1035,16 @@ def test_the_pinned_block_closes_mach_lookup_apple_events_and_nested_namespaces(
     assert hg.check_sandbox_types(block) == []
     del block["network"]["allowMachLookup"]
     assert "sandbox.network.allowMachLookup is missing" in hg.check_sandbox_types(block)
+
+
+def test_a_toml_file_that_is_there_is_refused_not_passed_when_tomllib_is_missing(tmp_path, monkeypatch):
+    """1104-31 CI: `tomllib` is imported inside `_read_toml_doc` so root's Python 3.9 can import this module; on
+    that Python a TOML file that exists must be a named refusal (AgentPinError), never a raw ImportError that a
+    broad caller could swallow into a pass."""
+    cfg = tmp_path / "config.toml"
+    cfg.write_text("[a]\nb = 1\n", encoding="utf-8")
+    monkeypatch.setitem(sys.modules, "tomllib", None)          # `import tomllib` now raises ImportError
+    with pytest.raises(hg.AgentPinError) as err:
+        hg._read_toml_doc(cfg)
+    assert "TOML needs Python 3.11+" in str(err.value)
+    assert hg._read_toml_doc(tmp_path / "absent.toml") is None   # an absent file is still just absent
