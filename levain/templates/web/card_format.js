@@ -1,8 +1,8 @@
 // The CARD FORMAT for a needs-phill item's long text (Phill 10-30, "8a"): layout parsing, then the card's DOM builders
 // (drawHead, drawDetail), shared by every surface that draws the card; node runs only the parsing. It only SPLITS the
 // text the desk wrote and never changes a word. The only things it takes off are the structural tokens that become layout:
-// a label's colon, a " - " list marker, and a " · " separator under OPTIONS. Ported from the iOS app's NPCard.swift
-// (the reference); tests/card_format_check.js pins the invariant against real rows.
+// a label's colon, a " - " list marker, and a " · " separator under OPTIONS. It began as a port of the iOS app's card, which is gone;
+// tests/card_format_check.js pins the invariant against real rows.
 //
 // The shape the desk writes: a headline sentence, then `WHAT: ... OPTIONS: (a) x · (b) y REC: a BLOCKS: ...`, with a
 // "lead: - item - item" list inside a section. flow's `stopped_full`/`blocks_full` (a caller asks for it: sections' `lines`) is
@@ -330,7 +330,7 @@
     return n;
   }
   // ---- links (Phill 11-01: the report and consent links on the attest card were plain text to copy). Same rules as the
-  // iOS app (NPCard.swift linkRuns): http and https only, the URL starts at an "http(s)://" not inside
+  // the iOS card this began as (gone) had the same rules: http and https only, the URL starts at an "http(s)://" not inside
   // a longer word and ends at whitespace, <, > or ", trailing sentence punctuation is not part of it, a closing bracket
   // only when the URL has more closers than openers, and a URL needs a host. The runs concatenate to the input, so no word
   // changes. Drawn as DOM anchors, never HTML.

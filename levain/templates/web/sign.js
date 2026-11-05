@@ -384,8 +384,8 @@
     const body = $("sheet-body");
     if (r.refused) { $("sheet").dataset.state = "refused"; return body.appendChild(el("p", "", "Not signable: " + r.refused)); }
     const msg = el("pre", "sheet-message", typeof r.message === "string" ? r.message : "");
-    // a needs-phill card is drawn as headline, option rows, then a collapsed Detail (card_format.js, ported from the iOS app's
-    // NPCard); its signed text stays whole, one tap away, above the controls. Any other message, and any needs-phill
+    // a needs-phill card is drawn as headline, option rows, then a collapsed Detail (card_format.js, which began as a port of the iOS card, now gone);
+    // its signed text stays whole, one tap away, above the controls. Any other message, and any needs-phill
     // message parseMessage does not read exactly (it returns null), is one visible block.
     const F = window.LevainCardFormat;
     const card = !dispatch && !consent && F && typeof F.drawHead === "function" ? (F.parseMessage(r.message, r) || (typeof F.looseCard === "function" ? F.looseCard(r.message, r) : null)) : null;

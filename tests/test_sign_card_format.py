@@ -1,5 +1,5 @@
 """The sign sheet's card format (Phill 10-30: the consent/sign card was one solid block of text; "they need formatting and
-space"). The parser is one pure file, ``levain/templates/web/card_format.js``, ported from flowConnect's ``NPCard.swift``
+space"). The parser is one pure file, ``levain/templates/web/card_format.js``, which began as a port of the iOS app's card (since deleted)
 (the same spec he approved on glass, "8a"). Three things are pinned here:
 
 * the parser never changes a word: ``tests/card_format_check.js`` runs it under node against two REAL needs-phill rows
