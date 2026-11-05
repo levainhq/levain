@@ -1,6 +1,7 @@
 """D1 + D2 (levain-memory 1019-s1design/runs/s2-macos/RESULT_D1D2.md, ruled in s1_reviews/S2_L3_r2_TRIAGE.md
 "VM-D1D2"), each test a reproduced VM failure: X9/X7 (getconf AS the slot uid after prepare re-created the
-var-folders dir END had moved: HELD retain-conflict), X1/X6 (launchd's per-user agents of the uid survived a long
+var-folders dir END had moved: HELD retain-conflict; since 1105-10 endvf END copies and empties it in place, never
+moves it), X1/X6 (launchd's per-user agents of the uid survived a long
 END: SCRUB refused until `launchctl bootout user/<uid>`), raw_d/998_undo.txt (undo rc 0 with a slot process
 alive). The VM re-run on the fix: runs/s3-macos-d1d2/."""
 from __future__ import annotations

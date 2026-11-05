@@ -312,7 +312,10 @@ def world(tmp_path):
 def _assert_retained(w: World, pre, pre_manifest, ctl: Control) -> None:
     f = w.facts
     assert ctl.state == RETAINED
-    assert not f.live.exists() and (w.vf is None or not w.vf.exists())
+    assert not f.live.exists()
+    if w.vf is not None:   # 1105-10 endvf: the dir stays in place, emptied to its skeleton; its copy is in the tree
+        assert set(os.listdir(w.vf)) <= {"0", "C", "T", "X"}
+        assert all(not os.listdir(w.vf / n) for n in os.listdir(w.vf))
     assert snapshot(f.tree) == pre                       # byte-equal, modes kept, links kept as links
     assert w.manifest_file() == pre_manifest
     assert (f.keep / ".credentials.json").read_bytes() == CRED

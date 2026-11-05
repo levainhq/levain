@@ -413,7 +413,8 @@ def test_tree_redo_after_the_var_folders_rename_fsyncs_both_parents(tmp_path, mo
     real = end_mod.fsync_dir
     monkeypatch.setattr(end_mod, "fsync_dir", lambda p: synced.append(Path(p)) or real(p))
     assert end_session(w.facts, w.seams(ctl), record_state=HELD, failed_step="tree") == RETAINED
-    assert w.vf.parent in synced and w.facts.tree in synced
+    # 1105-10 endvf: the var-folders rename is now the copy's, retained/vfcopy -> tree/.levain-var-folders
+    assert w.facts.retained in synced and w.facts.tree in synced
 
 
 def test_park_redo_after_the_rename_fsyncs_both_dirs(tmp_path, monkeypatch):
