@@ -118,6 +118,10 @@ from levain.cockpit import stream as cockpit_stream
 from levain.cockpit import board as cockpit_board
 from levain.cockpit import threads as cockpit_threads
 from levain.cockpit import room as cockpit_room
+from levain.cockpit import voice as cockpit_voice
+from levain.voice import custody as voice_custody
+from levain.voice import meter as voice_meter
+from levain.voice import providers as voice_providers
 from levain.coordinator import chat_lease
 from levain.coordinator.store import CoordError
 from levain.cockpit.verbs import (SERVED_VERBS_NAME, VerbRegistry, VerbSpec, VerbView, dispatch as dispatch_verb,
@@ -1308,6 +1312,7 @@ _RESERVED_PATHS: frozenset[str] = frozenset(_ASSETS) | {
     "/cockpit/manifest.json", "/cockpit/freshness.json", EVENTS_PATH, _COCKPIT_VERB_PATH, _SIGN_LIST_PATH,
     _BAND_PATH, _GRANT_LIST_PATH, cockpit_threads.THREADS_LIST_PATH, cockpit_room.ROOM_PATH, _COORD_LIST, _COORD_SHEET,
     cockpit_board.BOARD_PATH, _DISPATCH_LIST, _KEY_LINE_ROUTE, _DESK_ANSWER_ROUTE, _DESK_TEXT_ROUTE,
+    cockpit_voice.VOICE_JSON, *cockpit_voice.VOICE_PATHS,
     _PAIR_OFFER, _PAIR_REVOKE, _PAIR_REVOKE_PREVIEW, _PAIR_LIST, _PAIR_CLAIM,
     _NOTIFY_PATH,
 } | frozenset(_CHAT_GET_ROUTES) | frozenset(_CHAT_POST_ROUTES) | _push_static()
@@ -1687,6 +1692,14 @@ class _LevainHTTPServer(ThreadingHTTPServer):
     room_host: "cockpit_room.RoomHost | None" = None
     # the RoomServe make_server started (RM-G2); server_close stops it. None: this server holds no room
     room_serve: "Any" = None
+    # premium voice (V1-4), served only beside a room host and a broker. voice_gate bounds the voice POSTs on their own
+    # (they never take request_gate: a stalled upload holds a voice slot, never a cockpit slot); voice_transport is the
+    # providers' HTTP (a test replays responses through it); voice_last_read is each provider's last key-read or call
+    # outcome, in memory only; voice_meter is the ledger over the store directory's voice.db, built on first use.
+    voice_gate: "threading.BoundedSemaphore | None" = None
+    voice_transport: "Any" = None
+    voice_last_read: "dict[str, str | None] | None" = None
+    voice_meter: "Any" = None
     # the dispatch family's sign, cancel and authorise (OS-2), built by make_server beside the Signer; None serves no
     # dispatch signing route
     dispatch_sheet: "DispatchSheet | None" = None
@@ -3400,6 +3413,134 @@ class _Handler(GuardedHandler):
             status, payload = cockpit_room.post_room_rotate(host, directory, owner, req)
         return payload, status
 
+    # --- premium voice (V1-4; levain.cockpit.voice holds the logic, these methods the gates) ---------------------------
+
+    def _voice_meter(self, directory: Any) -> Any:
+        """The ledger at ``<store directory>/voice.db``, one Meter per path. Building one creates no file."""
+        path = Path(directory) / cockpit_voice.LEDGER_NAME
+        held = self.server.voice_meter
+        if held is None or held.path != path:
+            held = voice_meter.Meter(path)
+            self.server.voice_meter = held
+        return held
+
+    def _serve_voice(self, *, head: bool) -> None:
+        """``GET /cockpit/voice.json`` (V1-4): which providers have a key, the caps and the estimated spend. Gated as
+        ``room.json`` is (a surface token on every bind, then a non-blocking ``request_gate`` slot); 404 without a room
+        host and a broker. Reads the authority log and, if it exists, the ledger read-only: no keychain, no file
+        created."""
+        srv = self.server
+        vary = [("Vary", _WRITE_TOKEN_HEADER)]
+        if not self._off_box_token_valid():
+            self._gated_read_403("premium voice settings need", head=head)
+            return
+        directory = self._store_directory()
+        if srv.room_host is None or srv.broker is None or directory is None:
+            self._send(json.dumps({"error": "not_found", "message": "no such route"}).encode("utf-8"),
+                       "application/json; charset=utf-8", status=404, head=head, headers=vary,
+                       cache_control="private, no-store")
+            return
+        if not srv.request_gate.acquire(blocking=False):
+            self._send(b"busy\n", "text/plain; charset=utf-8", status=503, head=head)
+            return
+        failed = None
+        body: "dict[str, Any] | None" = None
+        try:
+            body = cockpit_voice.serve_voice(srv.broker.data_root, self._voice_meter(directory),
+                                             last_read=srv.voice_last_read if srv.voice_last_read is not None else {})
+        except _CredentialUnavailable:   # RU-5: only the outer catch answers it
+            raise
+        except Exception as exc:  # noqa: BLE001 - fixed words; the log names the type only
+            failed = type(exc).__name__
+        finally:
+            srv.request_gate.release()
+        status = 200
+        if failed is not None or body is None:
+            _log.warning("voice: voice.json could not be built (%s)", failed)
+            status, body = 500, {"error": "internal", "message": cockpit_voice.WORDS["unreadable"]}
+        self._send(json.dumps(body).encode("utf-8"), "application/json; charset=utf-8", status=status, head=head,
+                   headers=vary, cache_control="private, no-store")
+
+    def _voice_post(self, route: str) -> None:
+        """``POST /cockpit/voice/speak`` and ``/transcribe``. Reached from ``do_POST`` right after
+        ``_refuse_write_origin``; :meth:`_voice_answer` runs the remaining gates. Nothing escapes: one catch answers 500
+        in fixed words and logs the exception's TYPE only (never its text, never a traceback: an exception here may
+        carry what a provider or a keychain said)."""
+        failed = None
+        got: "cockpit_voice.Answer | None" = None
+        try:
+            got = self._voice_answer(route)
+        except _CredentialUnavailable:   # RU-5: only the outer catch answers it
+            raise
+        except Exception as exc:  # noqa: BLE001 - see the docstring
+            failed = type(exc).__name__
+        if failed is not None:
+            _log.warning("voice: a request failed (%s)", failed)
+            self.close_connection = True
+            got = cockpit_voice.internal_answer()
+        if got is None:          # a gate answered already
+            return
+        self._send(got.body, got.content_type, status=got.status,
+                   headers=[*got.headers, ("Vary", _WRITE_TOKEN_HEADER)], cache_control="private, no-store")
+
+    def _voice_answer(self, route: str) -> "cockpit_voice.Answer | None":
+        """The voice POST gates in order (design section 2, after the shared Host and cross-site check): a room host,
+        a broker and a store directory, else 404; a surface token on every bind, loopback included; a named owner; the
+        content type; the declared length against the route's own cap (413 with the connection closed and nothing
+        drained); a voice slot without waiting (503). Every refusal up to here is sent before a byte of the body is
+        read and closes the connection. Then the body is read and the call made while the voice slot is held; the slot
+        is released before the answer is written. ``request_gate`` is never taken. None: a refusal was sent."""
+        srv = self.server
+        directory = self._store_directory()
+        if srv.room_host is None or srv.broker is None or directory is None or srv.voice_gate is None:
+            self._reject(404, "not_found", "no such route")
+            return None
+        if not self._off_box_token_valid():
+            self._token_403("credential_required")
+            return None
+        if self._thread_owner() is None:
+            self._reject(403, "forbidden", cockpit_voice.WORDS["no_owner"])
+            return None
+        speak = route == cockpit_voice.SPEAK_PATH
+        if speak:
+            if self._refuse_non_json():
+                return None
+        elif cockpit_voice.base_type(self.headers.get("Content-Type")) not in voice_providers.MIME_ALLOW:
+            self._reject(415, "unsupported_media_type", cockpit_voice.WORDS["unsupported_media_type"])
+            return None
+        clen = self._declared_length()
+        if clen is None:
+            return None
+        if speak:
+            if self._refuse_oversize(clen, cockpit_voice.SPEAK_MAX, 0):     # never drained: it is not read
+                return None
+        elif clen > cockpit_voice.UPLOAD_MAX:
+            self._reject(413, "too_large", cockpit_voice.WORDS["too_long"])
+            return None
+        if not srv.voice_gate.acquire(blocking=False):
+            self._reject(503, "voice_busy", cockpit_voice.WORDS["voice_busy"])
+            return None
+        try:
+            try:
+                raw = self.rfile.read(clen)
+            except OSError:        # a stalled client hit the socket timeout
+                self.close_connection = True
+                return None
+            if len(raw) != clen:   # the client closed before its declared length arrived: nothing to answer
+                self.close_connection = True
+                return None
+            data_root = srv.broker.data_root
+            common: dict[str, Any] = {
+                "meter": self._voice_meter(directory), "transport": srv.voice_transport,
+                "read_key": voice_custody.read_key,     # looked up per request, the module's one reader
+                "last_read": srv.voice_last_read if srv.voice_last_read is not None else {}}
+            if speak:
+                return cockpit_voice.speak(directory, data_root, srv.chat_service, raw, **common)
+            query = self.path.split("?", 1)[1] if "?" in self.path else ""
+            return cockpit_voice.transcribe(data_root, query, self.headers.get("Content-Type", ""), raw, **common)
+        finally:
+            srv.voice_gate.release()
+
     def _serve_threads(self, path: str, *, head: bool) -> None:
         """``GET /cockpit/threads.json`` and ``GET /cockpit/thread/<th-id>.json`` (CH-U1a): the coordinator's threads and
         one thread's stream, read-only (:func:`levain.cockpit.threads.serve_threads`). A thread carries the operator's
@@ -3802,6 +3943,9 @@ class _Handler(GuardedHandler):
         if cockpit_room.is_room_path(path):
             self._serve_room(path, head=head)
             return
+        if path == cockpit_voice.VOICE_JSON:
+            self._serve_voice(head=head)
+            return
         if cockpit_threads.is_threads_path(path):
             self._serve_threads(path, head=head)
             return
@@ -4102,6 +4246,12 @@ class _Handler(GuardedHandler):
         # or its token-free mesh bind) falls through to the 422 'read_only' refusal below, NOT a token-403
         # [codex L3]; a proxied one needs the token first.
         route = self.path.split("?", 1)[0]
+        # PREMIUM VOICE (V1-4): carved out by exact path before every generic gate, the _notify_post precedent. The
+        # generic path refuses any body that is not JSON (a transcribe upload is audio) and reads the body inside
+        # request_gate, which a voice call must never hold; _voice_post runs the gates it skips, in the order of the
+        # design's section 2 (DESIGN_voice_v14.md), with the same status codes.
+        if route in cockpit_voice.VOICE_PATHS:
+            return self._voice_post(route)
         # PAIR (RP-4): the claim is the one credential-less POST, carved out by exact path BEFORE the token gates (on
         # his proxied path every POST would otherwise need a token it cannot have yet); the live code is its
         # credential. The authed pair POSTs need a token on every bind, loopback included.
@@ -5065,6 +5215,10 @@ def make_server(
     # Bound the expensive routes (store read + writes). Cockpit GET reads wait briefly for a read-pool slot (see
     # _acquire_read_slot) and leave _RESERVED_SLOTS free; every other gated route answers 503 past the cap.
     httpd.request_gate = threading.BoundedSemaphore(_MAX_INFLIGHT)
+    # premium voice (V1-4): its own small gate, never request_gate; the real providers' HTTP; per-provider last reads
+    httpd.voice_gate = threading.BoundedSemaphore(cockpit_voice.VOICE_INFLIGHT)
+    httpd.voice_transport = voice_providers.urllib_transport
+    httpd.voice_last_read = {}
     from levain.webpush.presence_tokens import RateLimit as _PresenceRate
 
     httpd.presence_rate = _PresenceRate()     # tap-token writes per minute, counted in this process
