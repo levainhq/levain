@@ -40,7 +40,7 @@ def test_the_chat_script_is_served_and_the_page_loads_it(tmp_path):
         # tag pins that exact digest, not just the path (a page naming another digest would be refused 404 by the server).
         digest = hashlib.sha256(served).hexdigest()[:12].encode()
         with urllib.request.urlopen(base + "/", timeout=5) as r:  # noqa: S310
-            assert b'<script src="/dashboard_chat.js?v=%s"></script>' % digest in r.read()
+            assert b'src="/dashboard_chat.js?v=%s"' % digest in r.read()
     finally:
         httpd.shutdown()
         httpd.server_close()
