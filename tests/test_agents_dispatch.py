@@ -13,6 +13,7 @@ from datetime import datetime, timedelta, timezone
 import pytest
 
 from levain.agents import controller as ctl
+from levain.agents import spec as spec_mod
 from levain.agents import supervise
 from levain.autonomic.journal import RunJournal
 from levain.coordinator.store import CoordStore
@@ -48,6 +49,51 @@ def _fire_ready(rig: Rig):
     oid = rig.claim("k")
     assert rig.launch(oid, on_input=None).outcome == "launched"   # the dream's input hook is tested on its own below
     return oid    # no hand start: the launch admitted the run
+
+
+def test_a_mutated_agents_name_row_never_gives_an_agent_the_dreams_hook_or_body(rig):
+    # behaviour: which agent an occurrence IS comes from the frozen spec its spec_hash names, never from the mutable
+    # agents.name row; a row renamed to "dream" after registration matches no signed name: no dream hook (the default
+    # hook is dead input, the row stays admitted) and no run body (unwired)
+    rig.link()
+    oid = rig.claim("k")
+    _rename(rig, "dream")
+    hook = ctl._default_input_check(rig.store, oid)
+    assert callable(hook)
+    with pytest.raises(RuntimeError, match="cannot be read or verified"):
+        hook({})
+    assert ctl.run_agent(rig.store, oid, 0, bodies={"dream": lambda: (lambda s, o, e: 0)}) == ctl.FIRE_UNWIRED
+    res = rig.launch(oid)
+    assert res.outcome == ctl.UNCLASSIFIED and rig.row(oid)["state"] == "admitted"
+
+
+def test_a_dream_spec_whose_name_row_is_renamed_is_held_not_launched_unchecked(tmp_path):
+    rig = _dream_rig(tmp_path)
+    rig.link()
+    oid = rig.claim("k")
+    _rename(rig, "something-else")
+    assert callable(ctl._default_input_check(rig.store, oid))    # dead input, never None (= input present)
+    seen = []
+    assert ctl.run_agent(rig.store, oid, 0, bodies={"dream": lambda: (lambda s, o, e: seen.append(o) or 0)}) == \
+        ctl.FIRE_UNWIRED and seen == []
+
+
+def test_a_spec_that_does_not_hash_to_its_spec_hash_names_no_agent_and_the_launch_is_held(rig, monkeypatch):
+    # behaviour: the spec is re-hashed on the way out; one that fails names no agent: no body (unwired) and the default
+    # hook is dead input, so the row stays admitted and is never launched unchecked
+    rig.link()
+    oid = rig.claim("k")
+    assert ctl._pinned_executor(rig.store, oid)[0] == "job_push_check"
+    monkeypatch.setattr(spec_mod, "spec_hash", lambda agent_id, spec: "0" * 64)
+    assert ctl._pinned_executor(rig.store, oid)[0] is None
+    hook = ctl._default_input_check(rig.store, oid)
+    assert callable(hook)
+    with pytest.raises(RuntimeError, match="cannot be read or verified"):
+        hook({})
+    assert ctl.run_agent(rig.store, oid, 0) == ctl.FIRE_UNWIRED
+    res = rig.launch(oid)
+    assert res.outcome == ctl.UNCLASSIFIED and rig.row(oid)["state"] == "admitted"
+    assert "input check failed" in res.reason
 
 
 def test_a_scheduled_fire_of_the_dream_no_longer_ends_unwired(tmp_path):
@@ -114,24 +160,25 @@ def test_run_agent_reads_the_executor_from_the_row_and_an_unknown_one_refuses_un
     assert "no run body is wired" in capsys.readouterr().err
 
 
-def test_only_the_dream_has_an_input_hook(rig):
+def test_only_the_dream_has_an_input_hook(rig, tmp_path):
     # behaviour: launch's default hook is the dream's for the dream (with no install facts it raises when run, so the
     # row stays admitted: dead input), and absent for any other agent, which launches as it always did
     rig.link()
     other = rig.claim("a")
     assert rig.launch(other).outcome == "launched"
     assert ctl._default_input_check(rig.store, other) is None
-    rig.finish(other)
-    _rename(rig, "dream")
-    oid = rig.claim("b")
-    assert callable(ctl._default_input_check(rig.store, oid))
-    res = rig.launch(oid)
-    assert res.outcome == ctl.UNCLASSIFIED and rig.row(oid)["state"] == "admitted"
+    (tmp_path / "d").mkdir()
+    drig = Rig(tmp_path / "d", name="dream")
+    drig.link()
+    oid = drig.claim("b")
+    assert callable(ctl._default_input_check(drig.store, oid))
+    res = drig.launch(oid)
+    assert res.outcome == ctl.UNCLASSIFIED and drig.row(oid)["state"] == "admitted"
 
 
-def test_the_dream_hook_admits_through_the_verdict_and_a_quiet_day_ends_skipped(rig, monkeypatch):
+def test_the_dream_hook_admits_through_the_verdict_and_a_quiet_day_ends_skipped(tmp_path, monkeypatch):
+    rig = Rig(tmp_path, name="dream")
     rig.link()
-    _rename(rig, "dream")
     monkeypatch.setattr(da, "install_on_input", lambda agent_dir, **kw: (lambda row: False))
     oid = rig.claim("c")
     res = rig.launch(oid)
@@ -243,9 +290,9 @@ def test_bool_on_input_raises_on_an_unreadable_verdict_so_the_day_stays_retryabl
         da.bool_on_input(lambda row: unwired)({})
 
 
-def test_an_unreadable_memory_db_is_not_recorded_as_a_quiet_day(rig, tmp_path):
+def test_an_unreadable_memory_db_is_not_recorded_as_a_quiet_day(tmp_path):
+    rig = Rig(tmp_path, name="dream")
     rig.link()
-    _rename(rig, "dream")
     f = _facts(tmp_path)
     f["store_path"].write_bytes(b"this is not a sqlite database" * 50)
     da.write_install(rig.store.directory, **f)
@@ -264,9 +311,9 @@ def test_a_manual_dream_checked_while_admitted_is_judged_on_its_own_day_not_unre
     assert "launched_at" not in v.reason
 
 
-def test_an_explicit_none_on_input_still_means_no_input_check(rig):
+def test_an_explicit_none_on_input_still_means_no_input_check(tmp_path):
+    rig = Rig(tmp_path, name="dream")
     rig.link()
-    _rename(rig, "dream")
     oid = rig.claim("g3")
     assert callable(ctl._default_input_check(rig.store, oid))
     res = rig.launch(oid, on_input=None)
@@ -393,3 +440,19 @@ def test_fire_factory_binds_a_consolidate_that_handles_a_stop(tmp_path, monkeypa
     monkeypatch.setattr(ex, "consolidate_store", lambda *a, **kw: seen.update(kw))
     da.fire_factory(rig.store, oid, 0)["consolidate"]()
     assert seen["handle_stop"] is True
+
+
+def test_an_ordinary_agent_gets_no_hook_whatever_its_role_row_holds_and_a_mismatch_still_does(rig, monkeypatch):
+    # behaviour: the default hook reads only the signed name; an unreadable role row never gives a non-dream agent the
+    # raising hook (it launches as before); a signed-name mismatch still gets the raising one
+    rig.link()
+    oid = rig.claim("k")
+    from levain.agents import role as role_mod
+
+    def boom(*a, **k):
+        raise sqlite3.OperationalError("role row unreadable")
+    monkeypatch.setattr(role_mod, "role_by_hash", boom)
+    assert ctl._default_input_check(rig.store, oid) is None
+    assert rig.launch(oid).outcome == "launched"
+    _rename(rig, "other")
+    assert callable(ctl._default_input_check(rig.store, oid))

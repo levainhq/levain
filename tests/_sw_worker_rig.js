@@ -50,6 +50,10 @@ const indexedDB = {
 
 // --- Cache Storage ---------------------------------------------------------------------------------------------------
 const cacheNames = new Set();
+const cacheCtypes = new Map();
+const cacheHeaders = new Map(); // 'cache|key' -> every header of the stored response
+// (cacheCtypes above: 'cache|key' -> content-type, when a test pins one)
+let putFailKey = null;           // the next put to this key in a shell cache throws once
 const cacheStores = new Map();   // cache name -> Map(request key -> body text)
 const caches = {
   keys: async () => [...cacheNames],
@@ -59,9 +63,13 @@ const caches = {
     cacheNames.add(n);
     if (!cacheStores.has(n)) cacheStores.set(n, new Map());
     const m = cacheStores.get(n);
+    const guess = (k) => (k === '/' ? 'text/html' : /\.css(\?|$)/.test(k) ? 'text/css' : /\.js(\?|$)/.test(k) ? 'application/javascript' : '');
     return {
-      put: async (k, r) => { m.set(k, await r.text()); },
-      match: async (k) => (m.has(k) ? new Response(m.get(k)) : undefined),
+      put: async (k, r) => {
+        if (n.startsWith('levain-shell-v') && putFailKey === k) { putFailKey = null; throw new TypeError('quota'); }
+        cacheCtypes.set(n + '|' + k, r.headers.get('content-type') || guess(k)); cacheHeaders.set(n + '|' + k, [...r.headers.entries()]); m.set(k, await r.text());
+      },
+      match: async (k) => (m.has(k) ? new Response(m.get(k), { headers: [...(cacheHeaders.get(n + '|' + k) || []), ['content-type', cacheCtypes.get(n + '|' + k) || guess(k)]].reduce((h, [a, b]) => { h.set(a, b); return h; }, new Headers()) }) : undefined),
       delete: async (k) => m.delete(k),
       keys: async () => [...m.keys()].map((k) => ({ url: 'https://box.example' + k })),
     };
@@ -94,7 +102,7 @@ const self_ = {
   },
 };
 const sandbox = {
-  self: self_, indexedDB, caches, Response, Math,
+  self: self_, indexedDB, caches, Response, Headers, Math,
   console: { info: (m) => log.console.push(['info', String(m)]), warn: (m) => log.console.push(['warn', String(m)]) },
   URL, clearTimeout, MessageChannel, TextEncoder, AbortController, crypto: require('crypto').webcrypto,
   // a wait of 5 s or more is recorded and shortened, so the worker's NEW_TTL_MS hold after a successful openWindow does not slow the rig
@@ -255,6 +263,148 @@ function fire(type, ev) {
     // a tap with no ping writes nothing
     await fire('notificationclick', { notification: { close: () => {}, data: { url: '/' } } });
     log.openedAfterNoPing = [...dbs.get('levain-sw-2').stores.get('opened').entries()].length;
+  } else if (scenario === 'install') {
+    // mode: ok | down | redirected | assets | badasset | softhtml, optionally ':prior' (an older generation exists; activation runs after)
+    const [md, prior] = mode.split(':');
+    const ctypeOf = (path) => (/\.css(\?|$)/.test(path) ? 'text/css' : 'application/javascript');
+    if (prior === 'stale') {
+      // an older generation produced by the vulnerable worker: '/' names assets, one missing, one query-mismatched, one HTML under a script key, plus a stray
+      cacheStores.set('levain-shell-vOLD', new Map([['/', '<link rel="stylesheet" href="/dashboard.css"><script src="/b.js?v=2"></script><script src="/c.js"></script>'],
+        ['/dashboard.css', 'OLD CSS'], ['/b.js', 'OLD B NOQUERY'], ['/c.js', '<html>portal</html>'], ['/stray.js', 'STRAY']]));
+      cacheCtypes.set('levain-shell-vOLD|/c.js', 'text/html'); cacheNames.add('levain-shell-vOLD');
+    } else if (prior === 'good') {
+      cacheStores.set('levain-shell-vOLD', new Map([['/', '<link rel="stylesheet" href="/dashboard.css"><script src="/b.js?v=2"></script>'],
+        ['/dashboard.css', 'OLD CSS'], ['/b.js?v=2', 'OLD B'], ['/stray.js', 'STRAY']]));
+      cacheNames.add('levain-shell-vOLD');
+    } else if (prior) {
+      cacheStores.set('levain-shell-vOLD', new Map([['/', '<html>old shell</html>'], ['/dashboard.css', 'OLD CSS'], ['/a.js', 'OLD A']]));
+      cacheNames.add('levain-shell-vOLD');
+    }
+    sandbox.fetch = async (url) => {
+      log.fetched = (log.fetched || []).concat([String(url)]);
+      if (md === 'down') throw new TypeError('network down');
+      const withAssets = ['assets', 'badasset', 'softhtml'].includes(md);
+      if (withAssets && String(url) !== '/') {
+        const spy = (r) => { Object.defineProperty(r, 'body', { value: { cancel: () => { log.cancelled = (log.cancelled || 0) + 1; return Promise.resolve(); } } }); return r; };
+        if (md === 'badasset' && String(url) === '/dashboard.css') return spy(new Response('nope', { status: 404, headers: { 'content-type': 'text/css' } }));
+        if (md === 'softhtml' && String(url) === '/a.js') return spy(new Response('<html>portal</html>', { status: 200, headers: { 'content-type': 'text/html' } }));
+        return new Response('ASSET ' + url, { status: 200, headers: { 'content-type': ctypeOf(String(url)) } });
+      }
+      const html = withAssets
+        ? '<link rel="stylesheet" href="/dashboard.css"><script src="/a.js"></script><script src="https://cdn.example/x.js"></script>' +
+          '<script src="/webpush/z.js"></script><link rel="icon" href="/icon.png"><script src="/b.js?v=2"></script>' +
+          "<script src='/q.js'></script><link rel='stylesheet' href='/q.css'>"
+        : '<html>shell</html>';
+      const r = new Response(html, { status: 200, headers: { 'content-type': 'text/html' } });
+      if (md === 'redirected') Object.defineProperty(r, 'redirected', { value: true });
+      return r;
+    };
+    await fire('install', {});
+    if (prior) await fire('activate', {});
+    log.shells = [...cacheStores.entries()].filter(([n]) => n.startsWith('levain-shell-v') && cacheNames.has(n)).map(([n, m]) => [n, [...m.entries()]]);
+  } else if (scenario === 'carry') {
+    // an older shell exists, the current one is empty (its install fetch failed): activation carries it forward
+    cacheStores.set('levain-shell-vOLD', new Map([['/', '<html>old shell</html>']])); cacheNames.add('levain-shell-vOLD');
+    await fire('activate', {});
+    log.caches = [...cacheNames].sort();
+    log.shells = [...cacheStores.entries()].filter(([n]) => n.startsWith('levain-shell-v') && cacheNames.has(n)).map(([n, m]) => [n, [...m.entries()]]);
+  } else if (scenario === 'message') {
+    await fire('message', { data: JSON.parse(mode) });
+  } else if (scenario === 'fetch') {
+    // mode: JSON {url, method, mode, net: 'down'|'ok'|'500', shell: bool}; records respondWith, the response and the cache writes
+    const m = JSON.parse(mode);
+    const shellName = 'levain-shell-v' + /SW_VERSION = '([^']+)'/.exec(fs.readFileSync(swPath, 'utf8'))[1];
+    if (m.shell) { cacheStores.set(shellName, new Map([['/', m.shellHtml || '<html>cached shell</html>']])); cacheNames.add(shellName); }
+    if (m.shellHeaders) cacheHeaders.set(shellName + '|/', Object.entries(m.shellHeaders));
+    for (const k of m.stray || []) cacheStores.get(shellName).set(k, 'STRAY');
+    if (m.putFail) putFailKey = m.putFail;
+    if (m.cached) { cacheStores.get(shellName).set(m.cached, 'CACHED ' + m.cached); }
+    sandbox.fetch = async (req) => {
+      log.fetchedNet = (log.fetchedNet || 0) + 1;
+      if (m.net === 'down') throw new TypeError('network down');
+      const path = new URL(typeof req === 'string' ? req : req.url, 'https://box.example');
+      const key = path.pathname + path.search;
+      if (key !== '/' && /\.(css|js)$/.test(path.pathname)) {
+        if ((m.assetFail || []).includes(key)) return new Response('nope', { status: 404, headers: { 'content-type': 'text/css' } });
+        return new Response('LIVE ' + key, { status: 200, headers: { 'content-type': m.ctype || (/\.css$/.test(path.pathname) ? 'text/css' : 'application/javascript') } });
+      }
+      return new Response(m.html || '<html>live</html>', { status: m.net === '500' ? 500 : 200, headers: { 'content-type': 'text/html' } });
+    };
+    const ev = { request: { url: m.url, method: m.method || 'GET', mode: m.mode || 'navigate', destination: m.destination || 'document' } };
+    let handed = null;
+    ev.respondWith = (p) => { handed = Promise.resolve(p); };
+    ev.waitUntil = (p) => { (log.waits = log.waits || []).push(Promise.resolve(p)); };
+    for (const fn of listeners.fetch || []) fn(ev);
+    log.responded = handed !== null;
+    if (handed) {
+      const r = await handed;
+      log.status = r.status; log.ctype = r.headers.get('content-type'); log.body = await r.text();
+    }
+    await Promise.all(log.waits || []);
+    log.shells = [...cacheStores.entries()].filter(([n]) => n.startsWith('levain-shell-v')).map(([n, mm]) => [n, [...mm.entries()]]);
+    log.rootCsp = (cacheHeaders.get(shellName + '|/') || []).filter(([h]) => h === 'content-security-policy').map(([, v]) => v);
+  } else if (scenario === 'overlap') {
+    // two navigations to '/' in flight together; runs[i] = {html, putFail}: the i-th '/' fetch answers that html
+    const m = JSON.parse(mode);
+    const shellName = 'levain-shell-v' + /SW_VERSION = '([^']+)'/.exec(fs.readFileSync(swPath, 'utf8'))[1];
+    cacheStores.set(shellName, new Map([['/', m.shellHtml]])); cacheNames.add(shellName);
+    let nav = 0;
+    sandbox.fetch = async (req) => {
+      const p = new URL(typeof req === 'string' ? req : req.url, 'https://box.example'), key = p.pathname + p.search;
+      if (key !== '/') return new Response('LIVE ' + key, { status: 200, headers: { 'content-type': /\.css$/.test(key) ? 'text/css' : 'application/javascript' } });
+      return new Response(m.runs[nav++].html, { status: 200, headers: { 'content-type': 'text/html' } });
+    };
+    if (m.putFail) putFailKey = m.putFail;
+    const waits = [];
+    for (let i = 0; i < m.runs.length; i++) {
+      const ev = { request: { url: 'https://box.example/', method: 'GET', mode: 'navigate', destination: 'document' } };
+      let handed = null;
+      ev.respondWith = (p) => { handed = Promise.resolve(p); };
+      ev.waitUntil = (p) => { waits.push(Promise.resolve(p)); };
+      for (const fn of listeners.fetch || []) fn(ev);
+      await handed;
+    }
+    await Promise.all(waits);
+    log.shells = [...cacheStores.entries()].filter(([n]) => n.startsWith('levain-shell-v')).map(([n, mm]) => [n, [...mm.entries()]]);
+  } else if (scenario === 'hold') {
+    // mode: JSON {shellHtml, key, hang: bool, putFail: bool}. An ONLINE asset request writes through (its put hangs forever when
+    // `hang`, throws when `putFail`; the clone's body cancel is recorded), then the network drops and an OFFLINE request for
+    // the same asset must still answer while that write-through is pending.
+    const m = JSON.parse(mode);
+    const shellName = 'levain-shell-v' + /SW_VERSION = '([^']+)'/.exec(fs.readFileSync(swPath, 'utf8'))[1];
+    cacheStores.set(shellName, new Map([['/', m.shellHtml], [m.key, 'CACHED ' + m.key]])); cacheNames.add(shellName);
+    const realOpen = caches.open;
+    caches.open = async (n) => {
+      const c = await realOpen(n);
+      if (!n.startsWith('levain-shell-v')) return c;
+      const put = c.put;
+      return { ...c, put: async (k, r) => { if (k !== m.key) return put(k, r); if (m.hang) return new Promise(() => {}); if (m.putFail) throw new TypeError('quota'); return put(k, r); } };
+    };
+    let up = true;
+    sandbox.fetch = async () => {
+      if (!up) throw new TypeError('network down');
+      const r = new Response('LIVE ' + m.key, { status: 200, headers: { 'content-type': /\.css/.test(m.key) ? 'text/css' : 'application/javascript' } });
+      const realClone = r.clone.bind(r);
+      r.clone = () => { const c = realClone(); const cancel = c.body.cancel.bind(c.body); c.body.cancel = (...a) => { log.copyDrained = true; return cancel(...a); }; return c; };
+      return r;
+    };
+    const send = async () => {
+      const ev = { request: { url: 'https://box.example' + m.key, method: 'GET', mode: 'no-cors', destination: /\.css/.test(m.key) ? 'style' : 'script' } };
+      let handed = null; const waits = [];
+      ev.respondWith = (p) => { handed = Promise.resolve(p); };
+      ev.waitUntil = (p) => { waits.push(Promise.resolve(p)); };
+      for (const fn of listeners.fetch || []) fn(ev);
+      return { handed, waits };
+    };
+    const first = await send();
+    const live = await first.handed; log.liveBody = await live.text();
+    await new Promise((r) => setTimeout(r, 20));        // let the write-through reach its put
+    up = false;
+    const second = await send();
+    const off = await Promise.race([second.handed.then(async (r) => ({ status: r.status, body: await r.text() })), new Promise((r) => setTimeout(() => r({ timeout: true }), 500))]);
+    log.offline = off;
+    if (!m.hang) await Promise.all(first.waits);
   }
   console.log(JSON.stringify(log));
+  if (scenario === 'hold') process.exit(0);
 })().catch((e) => { console.log(JSON.stringify({ error: String(e && e.stack || e) })); process.exit(1); });
