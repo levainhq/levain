@@ -480,8 +480,13 @@ def test_t_record_the_words_are_the_records_reply_and_a_body_cannot_carry_any(ri
         status, _h, out = speak(port, rig, g, provider="elevenlabs")
         assert (status, js(out)["error"]) == (409, "provider_unsupported")
         assert js(out)["message"] == "ElevenLabs is not supported in this version."
-        status, _h, out = speak(port, rig, g, provider="deepgram", voice=vprov.DEEPGRAM_TTS_VOICE, speed=1.25)
-        assert (status, js(out)["error"]) == (400, "bad_request")       # Deepgram's speed is fixed at 1.0
+        # Deepgram's speed range is Aura-2's own, the adapter's constants (the adapter sends a speed other than 1.0):
+        # past it is a 400. An in-range request would reserve a meter row, so the range itself is pinned as data below.
+        status, _h, out = speak(port, rig, g, provider="deepgram", voice=vprov.DEEPGRAM_TTS_VOICE, speed=1.75)
+        assert (status, js(out)["error"], js(out)["message"]) == (400, "bad_request",
+                                                                  "That speed is outside what Deepgram accepts.")
+        assert (cockpit_voice.PROVIDERS["deepgram"].speed_min, cockpit_voice.PROVIDERS["deepgram"].speed_max) == (
+            vprov.DEEPGRAM_SPEED_MIN, vprov.DEEPGRAM_SPEED_MAX) == (0.7, 1.5)
     assert len(rig.transport.seen) == sent
     assert [r.status for r in rig.rows()] == ["ok"] * len(chunks)
 
