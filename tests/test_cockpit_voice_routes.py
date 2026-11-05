@@ -154,16 +154,16 @@ def frame_hits(frame) -> list[str]:
 
 
 class Rig:
-    def __init__(self, tmp_path: Path, qdir: Path, monkeypatch) -> None:
+    def __init__(self, tmp_path: Path, queue: Path, monkeypatch) -> None:
         self.tmp = tmp_path
-        self.qdir = qdir
-        self.w = World(qdir)
+        self.qdir = queue
+        self.w = World(queue)
         _root, self.src, _ids = _install(tmp_path / "entity")
         self.data_root = Path(self.src.write_scope.ledger_root) / "cockpit"
         self.ck = KeyedCockpit(self.data_root, tmp_path / "keys")
         # the consent hook names the broker's own cockpit, so the grant routes revoke in the log read_key reads (a voice
         # route refuses otherwise: test_t_rev_a_voice_route_refuses_when_the_grant_routes_act_on_another_cockpit)
-        (qdir / "claude_code.json").write_text(json.dumps({"cockpit_data_root": str(self.data_root),
+        (queue / "claude_code.json").write_text(json.dumps({"cockpit_data_root": str(self.data_root),
                                                            "away_mode": False, "away_hold_seconds": 0}))
         self.sec = FakeSecurity(tmp_path)
         monkeypatch.setattr(custody, "DEFAULT_SECURITY", self.sec.path)   # read_key's default store: the fake
@@ -171,9 +171,9 @@ class Rig:
         self._pos = 1000
         self._n = 0
 
-    def add_key(self, uses=("stt", "tts"), provider="openai") -> dict:
+    def add_key(self, uses=("stt", "tts"), provider="openai", source=SOURCE) -> dict:
         record, _warning = custody.add_key(
-            self.data_root, provider=provider, uses=uses, account=ACCOUNT, value=Secret(VALUE), source=SOURCE,
+            self.data_root, provider=provider, uses=uses, account=ACCOUNT, value=Secret(VALUE), source=source,
             confirm=lambda preview: True, writer=SecurityStdinWriter(self.sec.path),
             items=KeychainItems(self.sec.path), store=KeychainStore(self.sec.path), **self.ck.kw())
         return record
@@ -206,14 +206,20 @@ class Rig:
 
 
 @pytest.fixture
-def rig(tmp_path, qdir, monkeypatch):
+def rig(tmp_path, qdir, monkeypatch):  # noqa: F811 - the imported fixture, taken by name
     return Rig(tmp_path, qdir, monkeypatch)
 
 
 @contextmanager
-def served(rig: Rig, *, room: bool = True, signer_q: Path | None = None, mesh: bool = False):
+def served(rig: Rig, *, room: bool = True, signer_q: Path | None = None, signer_on: bool = True,
+           mesh: bool = False):
+    """``levain serve`` over the rig. By default with a Signer over the consent reader's own queue, as a real install
+    runs it, so the phone's grant routes are served (a voice route reads no key without them). ``signer_q`` names
+    another queue; ``signer_on=False`` serves no Signer at all."""
     port = _free_port()
     signer = None
+    if signer_q is None and signer_on:
+        signer_q = rig.qdir
     if signer_q is not None:
         signer = Signer(signer_q, (NS,), "localhost", lambda: {})
         signer.page_origin = f"http://localhost:{port}"
@@ -306,8 +312,7 @@ def no_leak(*texts: str) -> None:
 def test_t_gate_every_voice_route_needs_the_surface_token_on_every_bind(rig, tmp_path, bind):
     """A presence tap token and a notify token are not the credential; nothing is reserved for a refusal.
     Red with: the carve-out moved after _refuse_non_json (transcribe 415), or the token check dropped."""
-    signq = tmp_path / "signq"
-    signq.mkdir(mode=0o700)
+    signq = rig.qdir        # the Signer's queue is the consent reader's, so the grant routes (and voice) are served
     tap = presence_tokens.create(signq, "tap")[1]
     notice = notify_tokens.create(signq, "svc")[1]
     rig.add_key()
@@ -1058,6 +1063,143 @@ def test_t_rev_a_voice_route_refuses_when_the_grant_routes_act_on_another_cockpi
             gp.step(record["id"], "revoke-challenge",
                     {"signer_fp": signer, "instance": grant_instance(state.grant_link(record["id"]))})
         assert exc.value.error == "not_found"
+
+
+# --- trevfix (L3 trev r1) ------------------------------------------------------------------------------------
+
+def _refused_with(port, rig, g, error: str) -> None:
+    for status, _h, body in (speak(port, rig, g), transcribe(port)):
+        out = js(body)
+        assert (status, out["error"], out["message"], out["fallback"]) == (
+            503, error, cockpit_voice.WORDS[error], "on_device"), body
+
+
+@pytest.mark.parametrize("how", ["no_signer", "other_queue"])
+def test_r1_no_grant_route_served_means_no_key_read_even_when_the_readers_hook_names_the_root(rig, tmp_path, how):
+    """R1: the consent reader's hook names the broker's root, but the server serves no phone grant route (no Signer, or
+    a Signer over another queue, whose own hook names the same root too): no phone revoke exists, so speak and
+    transcribe refuse ``revoke_unreachable`` and nothing is reserved or read. Red with: ``revoke_queue`` fed the
+    reader's store directory instead of the grant routes' queue (both answer 200)."""
+    rig.add_key()
+    g = rig.reply("Read this aloud.")
+    reads = rig.sec.calls()
+    kw: dict = {"signer_on": False}
+    if how == "other_queue":
+        signq = tmp_path / "signq"
+        signq.mkdir(mode=0o700)
+        _hook(signq, rig.data_root)
+        kw = {"signer_q": signq}
+    with served(rig, **kw) as (port, httpd):
+        assert httpd.grant_phone is None
+        _refused_with(port, rig, g, "revoke_unreachable")
+    assert rig.transport.seen == [] and rig.rows() == [] and rig.sec.calls() == reads
+
+
+@pytest.mark.parametrize("fault", ["raises", "not_a_path"])
+def test_r3_a_fault_checking_the_reach_is_its_own_sentence_and_logs_the_type_only(rig, monkeypatch, caplog, fault):
+    """R3: a fault while checking (the hook read raising; a root that is not a path) is not "another cockpit": it
+    refuses ``revoke_unchecked`` in its own words, reads nothing, and the log names the type only. Red with: the fault
+    branch of ``revoke_refusal`` answering ``revoke_unreachable``."""
+    import levain.consent.answering as answering
+
+    rig.add_key()
+    g = rig.reply("Read this aloud.")
+    reads = rig.sec.calls()
+    secret_text = "SECRET-FAULT-TEXT /private/hooks"
+
+    def broken(_q):
+        if fault == "raises":
+            raise PermissionError(secret_text)
+        return [object()]
+
+    assert cockpit_voice.WORDS["revoke_unchecked"] != cockpit_voice.WORDS["revoke_unreachable"]
+    with served(rig) as (port, _httpd):
+        monkeypatch.setattr(answering, "hook_roots", broken)
+        with caplog.at_level(logging.WARNING, logger="levain.cockpit.voice"):
+            _refused_with(port, rig, g, "revoke_unchecked")
+    assert rig.transport.seen == [] and rig.rows() == [] and rig.sec.calls() == reads
+    lines = [r.getMessage() for r in caplog.records if r.name == "levain.cockpit.voice"]
+    assert lines and all(("PermissionError" if fault == "raises" else "TypeError") in m for m in lines), lines
+    assert not any(secret_text in m for m in lines) and all(r.exc_info is None for r in caplog.records)
+
+
+def test_r4_speak_and_transcribe_take_data_root_first_and_their_paths_by_keyword_only(rig):
+    """R4: both routes take ``data_root`` first and the queue paths keyword-only, so a caller writing the old
+    ``speak(directory, data_root, ...)`` order is a TypeError, never a silent swap. Red with: speak's old positional
+    ``(directory, data_root, service, raw)``."""
+    import inspect
+
+    for fn in (cockpit_voice.speak, cockpit_voice.transcribe):
+        params = inspect.signature(fn).parameters
+        assert next(iter(params)) == "data_root", fn
+        assert params["revoke_queue"].kind is inspect.Parameter.KEYWORD_ONLY, fn
+    assert inspect.signature(cockpit_voice.speak).parameters["directory"].kind is inspect.Parameter.KEYWORD_ONLY
+    kw = {"revoke_queue": rig.qdir, "meter": None, "transport": rig.transport, "read_key": None, "last_read": {}}
+    with pytest.raises(TypeError):
+        cockpit_voice.speak(rig.qdir, rig.data_root, rig.w.svc, b"{}", **kw)
+    with pytest.raises(TypeError):
+        cockpit_voice.transcribe(rig.qdir, rig.data_root, "provider=openai", "audio/webm", AUDIO, **kw)
+
+
+class _Proxy:
+    """An object whose attributes are ``inner``'s except those given."""
+
+    def __init__(self, inner, **over) -> None:
+        self._inner = inner
+        self.__dict__.update(over)
+
+    def __getattr__(self, name):
+        return getattr(self._inner, name)
+
+
+def test_r2_a_voice_record_without_provider_is_listed_and_never_takes_the_page_down(rig, tmp_path, monkeypatch):
+    """R2: a record the listing classifies as a voice key but that lacks ``provider`` (a shape no replay writes today,
+    put here by wrapping the snapshot) is still listed, with an empty provider, beside the other key. Red with: the
+    provider read by ``[...]`` again (KeyError: grant_view raises)."""
+    from types import MappingProxyType
+
+    import levain.consent.grants as grants
+
+    a = rig.add_key(provider="openai")
+    b = rig.add_key(provider="deepgram", source=SOURCE + "-deepgram")
+    real = grants._signing_authority
+
+    def stripped(*args, **kwargs):
+        state = real(*args, **kwargs)
+        held = dict(state.policy.grants)
+        held[a["id"]] = MappingProxyType({k: v for k, v in held[a["id"]].items() if k != "provider"})
+        return _Proxy(state, policy=_Proxy(state.policy, grants=MappingProxyType(held)))
+
+    monkeypatch.setattr(grants, "_signing_authority", stripped)
+    view = grants.grant_view(rig.qdir, now=datetime.now(timezone.utc))
+    rows = {r["id"]: r for r in view["grants"]}
+    assert (rows[a["id"]]["provider"], rows[b["id"]]["provider"]) == ("", "deepgram"), view
+
+
+def test_r2_one_voice_row_that_cannot_be_built_is_skipped_and_the_rest_still_list(rig, monkeypatch, caplog):
+    """R2: a fault building one voice-key row leaves that row out (logged by type name) and every other row is still
+    listed, so the page can still revoke them. Red with: the per-row catch removed (grant_view raises)."""
+    import levain.consent.grants as grants
+
+    a = rig.add_key(provider="openai")
+    b = rig.add_key(provider="deepgram", source=SOURCE + "-deepgram")
+    state = custody.authority_for(rig.data_root)()
+    bad = grants.grant_instance(state.grant_link(a["id"]))
+    real = grants.grant_instance
+
+    def instance(link):
+        got = real(link)
+        if got == bad:
+            raise RuntimeError("SECRET-ROW-TEXT")
+        return got
+
+    monkeypatch.setattr(grants, "grant_instance", instance)
+    with caplog.at_level(logging.WARNING, logger="levain.consent.grants"):
+        view = grants.grant_view(rig.qdir, now=datetime.now(timezone.utc))
+    ids = {r["id"] for r in view["grants"]}
+    assert b["id"] in ids and a["id"] not in ids, view
+    lines = [r.getMessage() for r in caplog.records if r.name == "levain.consent.grants"]
+    assert lines and all("RuntimeError" in m and "SECRET-ROW-TEXT" not in m for m in lines), lines
 
 
 def test_t_getro_voice_json_creates_no_ledger(rig):

@@ -11,8 +11,9 @@ The call sequence is the design's section 3 and its order is the point:
 
 1. validate the request (nothing read or written on a refusal);
 2. (speak) the room thread must be the open room, and the words are the RECORD's reply, never the page's;
-   then, both routes: the consent hooks must name ``data_root`` as their one cockpit (:func:`revoke_reaches`), so the
-   grant page's revoke reaches the key about to be read; else ``revoke_unreachable``, nothing reserved or read;
+   then, both routes: the phone's grant routes must be served and the consent hooks of THEIR queue must name
+   ``data_root`` as their one cockpit (:func:`revoke_refusal`), so the grant page's revoke reaches the key about to be
+   read; else ``revoke_unreachable`` (or ``revoke_unchecked`` when that could not be checked), nothing reserved or read;
 3. ``meter.reserve`` (a cap, an unpriced model or a meter that cannot be used refuses here, and no key is read);
 4. ``custody.read_key`` (a fresh verified replay, then the keychain): a :class:`~levain.voice.custody.Secret`;
 5. the adapter call, with ``secret.reveal()`` written INLINE in its argument list, so no name in any frame of this
@@ -131,6 +132,8 @@ WORDS = {
     "authority_unreadable": "Levain could not verify its authority log just now; premium voice is off until it can.",
     "revoke_unreachable": ("Premium voice is off: the phone's grant page revokes keys in a different cockpit from the "
                            "one this Levain reads voice keys from."),
+    "revoke_unchecked": ("Premium voice is off: Levain could not check that the phone's grant page can revoke this "
+                         "Levain's voice keys, so no key is read."),
     "keychain_unreadable": "Levain could not read the key from this Mac's keychain (it may be locked).",
     "key_unusable": "The keychain item for {p} does not hold a usable key; set it again on the laptop.",
     "bad_call": "Premium voice could not use that request.",
@@ -286,29 +289,43 @@ def _end(meter: vmeter.Meter, reservation_id: int, release: bool) -> None:
                      "released" if release else "settled", failed)
 
 
-def revoke_reaches(directory: Path | str, data_root: Path | str) -> bool:
-    """Whether a revoke from the grant page reaches the voice keys at ``data_root``: the consent hooks of the store
-    directory ``directory`` name exactly one cockpit (what :func:`levain.consent.sign.sign_root` takes, so what the
-    grant routes and ``grants.json`` act on) and it is ``data_root``. Re-read on every call: the hook file can change
-    while the server runs. Any fault reading it is False."""
+def revoke_refusal(revoke_queue: Path | str | None, data_root: Path | str) -> str | None:
+    """None when a revoke from the phone's grant page reaches the voice keys at ``data_root``, else the refusal (a key
+    of :data:`WORDS`, also the error code). ``revoke_queue`` is the queue the grant routes are served over
+    (``GrantPhone.queue_dir``), None when the server serves no grant routes (no Signer, or its queue is not the
+    consent reader's): then no phone revoke exists, ``revoke_unreachable``. Otherwise that queue's consent hooks must
+    name exactly one cockpit (:func:`levain.consent.sign.sign_root`'s rule, so the root the grant routes act on) and
+    it must be ``data_root``; any other answer is ``revoke_unreachable``. A fault while checking (the hook file
+    unreadable, an unexpected shape) is ``revoke_unchecked``, a different sentence: it is not known to be another
+    cockpit. That fault is logged by its type name only. Re-read on every call: the hook file can change while the
+    server runs."""
     from levain.consent.answering import hook_roots
 
+    if revoke_queue is None:
+        return "revoke_unreachable"
     try:
-        roots = hook_roots(Path(directory))
-        return len(roots) == 1 and roots[0].resolve() == Path(data_root).resolve()
-    except Exception:            # noqa: BLE001 - a hook that cannot be read names no cockpit: fail closed
-        return False
+        roots = list(hook_roots(Path(revoke_queue)))
+        if len(roots) != 1:
+            return "revoke_unreachable"
+        same = Path(roots[0]).resolve() == Path(data_root).resolve()
+    except Exception as exc:     # noqa: BLE001 - a check that could not be made fails closed, in its own words
+        _log.warning("voice: the revoke reach could not be checked (%s); no key is read", type(exc).__name__)
+        return "revoke_unchecked"
+    return None if same else "revoke_unreachable"
 
 
-def _call(provider: str, use: str, units: int, data_root: Path | str, *, directory: Path | str, meter: vmeter.Meter,
-          read_key: Callable[..., Any], last_read: MutableMapping[str, str | None],
+def _call(provider: str, use: str, units: int, data_root: Path | str, *, revoke_queue: Path | str | None,
+          meter: vmeter.Meter, read_key: Callable[..., Any], last_read: MutableMapping[str, str | None],
           send: Callable[[Any], Any]) -> tuple[Any, Answer | None]:
-    """Steps 3 to 6 of the module docstring for one call, after the revoke-reach check (:func:`revoke_reaches`): a
+    """Steps 3 to 6 of the module docstring for one call, after the revoke-reach check (:func:`revoke_refusal`): a
     key whose revoke from the phone could not reach it is never read, and nothing is reserved. ``send(secret)`` makes
     the adapter call and must write ``secret.reveal()`` inline in the adapter's argument list. Returns
     ``(result, None)`` or ``(None, refusal)``."""
-    if not revoke_reaches(directory, data_root):
-        return None, refusal(503, "revoke_unreachable", "revoke_unreachable", fallback=True)
+    # known edge, by intent: a hook file edited between this check and read_key lets one more key read through, the
+    # same class as any revoke racing a call already in flight
+    refused_reach = revoke_refusal(revoke_queue, data_root)
+    if refused_reach is not None:
+        return None, refusal(503, refused_reach, refused_reach, fallback=True)
     model = PROVIDERS[provider].tts_model if use == "tts" else PROVIDERS[provider].stt_model
     try:
         check = meter.reserve(provider, use, model, units)
@@ -403,12 +420,13 @@ def _parse_speak(raw: bytes) -> tuple[dict[str, Any] | None, Answer | None]:
     return req, None
 
 
-def speak(directory: Path | str, data_root: Path | str, service: Any, raw: bytes, *, meter: vmeter.Meter,
-          transport: vprov.Transport, read_key: Callable[..., Any],
-          last_read: MutableMapping[str, str | None]) -> Answer:
+def speak(data_root: Path | str, service: Any, raw: bytes, *, directory: Path | str,
+          revoke_queue: Path | str | None, meter: vmeter.Meter, transport: vprov.Transport,
+          read_key: Callable[..., Any], last_read: MutableMapping[str, str | None]) -> Answer:
     """``POST /cockpit/voice/speak``: chunk ``chunk`` of the room reply that ended at ``reply_gseq``, as mp3. The words
     are only the record's (``reply_text`` over the open room's stream, then ``speakable``); a body naming any other key
-    is refused."""
+    is refused. ``directory`` is the store directory the room is read from; ``revoke_queue`` the grant routes' queue
+    (:func:`revoke_refusal`). Both keyword-only, like :func:`transcribe`'s: two paths never swap by position."""
     req, refused = _parse_speak(raw)
     if refused is not None or req is None:
         return refused or internal_answer()
@@ -438,7 +456,7 @@ def speak(directory: Path | str, data_root: Path | str, service: Any, raw: bytes
     words = chunks[req["chunk"]]
     adapter = vprov.provider_for(provider, transport)
     voice, speed = req["voice"], req["speed"]
-    audio, refused = _call(provider, "tts", len(words), data_root, directory=directory, meter=meter,
+    audio, refused = _call(provider, "tts", len(words), data_root, revoke_queue=revoke_queue, meter=meter,
                            read_key=read_key, last_read=last_read,
                            send=lambda secret: adapter.speak(secret.reveal(), words, voice, speed))
     if refused is not None:
@@ -464,12 +482,12 @@ def _query_provider(query: str) -> tuple[str | None, Answer | None]:
     return provider, None
 
 
-def transcribe(data_root: Path | str, query: str, content_type: str, audio: bytes, *, directory: Path | str,
-               meter: vmeter.Meter, transport: vprov.Transport, read_key: Callable[..., Any],
-               last_read: MutableMapping[str, str | None]) -> Answer:
+def transcribe(data_root: Path | str, query: str, content_type: str, audio: bytes, *,
+               revoke_queue: Path | str | None, meter: vmeter.Meter, transport: vprov.Transport,
+               read_key: Callable[..., Any], last_read: MutableMapping[str, str | None]) -> Answer:
     """``POST /cockpit/voice/transcribe?provider=``: ``{"text": ...}`` for the audio body. The audio is never written
-    or logged; the ledger holds the estimated seconds only (:func:`upload_units`). ``directory`` is the store
-    directory, whose consent hooks :func:`revoke_reaches` reads."""
+    or logged; the ledger holds the estimated seconds only (:func:`upload_units`). ``revoke_queue`` is the grant
+    routes' queue, whose consent hooks :func:`revoke_refusal` reads (keyword-only, as in :func:`speak`)."""
     provider, refused = _query_provider(query)
     if refused is not None or provider is None:
         return refused or internal_answer()
@@ -479,9 +497,10 @@ def transcribe(data_root: Path | str, query: str, content_type: str, audio: byte
     if not audio:
         return refusal(400, "no_audio", "no_audio")
     adapter = vprov.provider_for(provider, transport)
-    text, refused = _call(provider, "stt", upload_units(len(audio)), data_root, directory=directory, meter=meter,
-                          read_key=read_key, last_read=last_read,
-                          send=lambda secret: adapter.transcribe(secret.reveal(), audio, mime, ""))
+    text, refused = _call(provider, "stt", upload_units(len(audio)), data_root, revoke_queue=revoke_queue,
+                          meter=meter, read_key=read_key, last_read=last_read,
+                          # the lambda runs inside _call, before the del below drops this frame's reference
+                          send=lambda secret: adapter.transcribe(secret.reveal(), audio, mime, ""))  # noqa: F821
     del audio
     if refused is not None:
         return refused

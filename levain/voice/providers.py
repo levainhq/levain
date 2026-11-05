@@ -143,18 +143,17 @@ _OPENER = urllib.request.build_opener(_NoRedirect)
 def _read_until(resp: Any, deadline: float, limit: int) -> bytes:
     """Up to ``limit`` bytes of ``resp``, in single reads (``read1`` returns what one recv gave, where ``read(n)`` would
     wait for all ``n``), with the monotonic ``deadline`` checked before each. A spent deadline raises TimeoutError; the
-    caller's ``with`` (or ``finally``) closes the connection."""
-    pieces: list[bytes] = []
-    got = 0
-    while got < limit:
+    caller's ``with`` (or ``finally``) closes the connection. One growing buffer, never an object per read: a body
+    sent in millions of tiny reads costs about its own size, which ``limit`` bounds."""
+    buf = bytearray()
+    while len(buf) < limit:
         if _monotonic() >= deadline:
             raise TimeoutError("the voice exchange outlasted its deadline")
-        piece = resp.read1(min(_READ_CHUNK, limit - got))
+        piece = resp.read1(min(_READ_CHUNK, limit - len(buf)))
         if not piece:
             break
-        pieces.append(piece)
-        got += len(piece)
-    return b"".join(pieces)
+        buf += piece
+    return bytes(buf)
 
 
 def urllib_transport(req: HttpRequest) -> HttpResponse:

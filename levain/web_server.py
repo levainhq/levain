@@ -3569,12 +3569,13 @@ class _Handler(GuardedHandler):
             common: dict[str, Any] = {
                 "meter": self._voice_meter(directory), "transport": srv.voice_transport,
                 "read_key": voice_custody.read_key,     # looked up per request, the module's one reader
-                "last_read": srv.voice_last_read if srv.voice_last_read is not None else {}}
+                "last_read": srv.voice_last_read if srv.voice_last_read is not None else {},
+                # the queue the phone's grant routes revoke through; None when none are served (no key is then read)
+                "revoke_queue": srv.grant_phone.queue_dir if srv.grant_phone is not None else None}
             if speak:
-                return cockpit_voice.speak(directory, data_root, srv.chat_service, raw, **common)
+                return cockpit_voice.speak(data_root, srv.chat_service, raw, directory=directory, **common)
             query = self.path.split("?", 1)[1] if "?" in self.path else ""
-            return cockpit_voice.transcribe(data_root, query, self.headers.get("Content-Type", ""), raw,
-                                            directory=directory, **common)
+            return cockpit_voice.transcribe(data_root, query, self.headers.get("Content-Type", ""), raw, **common)
         finally:
             srv.voice_gate.release()
 

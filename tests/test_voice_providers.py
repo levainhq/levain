@@ -722,3 +722,33 @@ def test_f4_a_normal_exchange_is_unaffected_by_the_clock(monkeypatch):
     _clock, resp, _o = _trickling(monkeypatch, gap=0.0, n=3)
     got = P.urllib_transport(P.HttpRequest("POST", "https://api.openai.com/v1/audio/speech", {}, b""))
     assert (got.status, got.body) == (200, b"xxx")
+
+
+def test_r7_a_body_in_tiny_reads_costs_about_its_size_not_an_object_per_read(monkeypatch):
+    """voice14 r2 (deepseek MED): ``_read_until`` kept every ``read1`` result as its own bytes object, so a body sent in
+    millions of tiny reads inside the budget cost one object (~35 bytes of header) per read on top of its size. One
+    buffer now: N two-byte reads of fresh objects peak at a few times the body (the buffer, its over-allocation and the
+    final copy), well under the ~20 bytes per read a per-read list costs at the least. Red with: the list of pieces
+    back (``pieces.append`` then ``b"".join``)."""
+    import tracemalloc
+
+    n = 200_000
+
+    class Tiny:
+        left = n
+
+        def read1(self, size):
+            if self.left <= 0:
+                return b""
+            self.left -= 1
+            return bytes((65, 66))      # a new object each read (a 1-byte bytes is a cached singleton)
+
+    monkeypatch.setattr(P, "_monotonic", lambda: 0.0)
+    tracemalloc.start()
+    try:
+        got = P._read_until(Tiny(), 1.0, 10 * n)
+        _cur, peak = tracemalloc.get_traced_memory()
+    finally:
+        tracemalloc.stop()
+    assert got == b"AB" * n
+    assert peak < 3 * 2 * n + 256 * 1024, peak          # bound: 3x the body plus slack; a per-read list is ~8 MB here

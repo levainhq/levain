@@ -15,6 +15,7 @@ voice key (:mod:`levain.voice.custody`) is listed beside them by provider and re
 """
 from __future__ import annotations
 
+import logging
 import secrets
 import shlex
 from collections.abc import Callable, Iterable, Mapping
@@ -34,6 +35,8 @@ from levain.cockpit.keys import KeyError_, Signer, _append, _capture, _journal, 
 __all__ = ["INERT_NOTE", "ConsentGrant", "GrantChanged", "append_revoke", "create_grant", "grant_instance",
            "grant_listing", "grant_view", "list_grants", "list_inert_grants", "prepare_revoke", "revoke_command",
            "revoke_grant"]
+
+_log = logging.getLogger(__name__)
 
 
 class GrantChanged(KeyError_):
@@ -230,14 +233,16 @@ def grant_view(queue_dir: Path | str, *, now: datetime, recent: int = 5,
     """Every grant the cockpit the consent hooks of ``queue_dir`` name holds (expired and inert ones included, and each
     voice key: ``kind`` ``voice-key``, ``state`` ``live``, ``expires_at`` empty, ``provider`` and nothing of its
     keychain item), each with what it answered and the line that revokes it: ``{"root", "note", "grants",
-    "inert_note"}``. ``root`` is the ONE cockpit those hooks verify against (the log the queue finds a grant in at decision time); none or more than
-    one is a ``note`` and no rows. What a grant answered is read from the queue (the requests it allowed) and the
-    ledger (whether each such call then ran): ``answered`` is ``{"count", "last_at", "recent", "refused_count"}``,
-    ``recent`` the newest ``recent`` calls, each ``{"request_id", "at", "tool", "cwd", "outcome"}``,
-    ``refused_count`` how many of ALL its calls were then refused; both counted for this instance of the grant only (``instance``, :func:`grant_instance`: an answer by an earlier grant under the same id, or by
-    this one before a renew changed it, is not its own). Read-only: nothing is created. Every string a grant's
-    creator or an agent wrote is shown through ``visible``; ``id`` is also given as is, the name a revoke route
-    takes, and ``instance`` is what that route's challenge names."""
+    "inert_note"}``. ``root`` is the ONE cockpit those hooks verify against (the log the queue finds a grant in at
+    decision time); none or more than one is a ``note`` and no rows. A voice-key row that cannot be built is left
+    out and logged by its fault's type name, so one bad record never takes the page (and every other revoke) down.
+    What a grant answered is read from the queue (the requests it allowed) and the ledger (whether each such call
+    then ran): ``answered`` is ``{"count", "last_at", "recent", "refused_count"}``, ``recent`` the newest ``recent``
+    calls, each ``{"request_id", "at", "tool", "cwd", "outcome"}``, ``refused_count`` how many of ALL its calls were
+    then refused; both counted for this instance of the grant only (``instance``, :func:`grant_instance`: an answer by
+    an earlier grant under the same id, or by this one before a renew changed it, is not its own). Read-only: nothing
+    is created. Every string a grant's creator or an agent wrote is shown through ``visible``; ``id`` is also given
+    as is, the name a revoke route takes, and ``instance`` is what that route's challenge names."""
     from levain.cockpit.display_safe import visible
     from levain.consent.answering import hook_roots
     from levain.consent.listing import read_grant_evidence
@@ -286,8 +291,11 @@ def grant_view(queue_dir: Path | str, *, now: datetime, recent: int = 5,
         rows.append({**common(gid, kind, expires_at, seq), "state": "inert"})
     for gid in voice:               # no expiry: a voice key is live until it is revoked or replaced
         link = links[gid]
-        rows.append({**common(gid, VOICE_KEY_KIND, "", None if link is None else link[0]), "state": "live",
-                     "provider": visible(str(state.policy.grants[gid]["provider"]))})
+        try:
+            rows.append({**common(gid, VOICE_KEY_KIND, "", None if link is None else link[0]), "state": "live",
+                         "provider": visible(str(state.policy.grants[gid].get("provider") or ""))})
+        except Exception as exc:    # noqa: BLE001 - one row's fault is that row's, never the whole page's
+            _log.warning("grants: a voice-key row could not be shown (%s); the others are", type(exc).__name__)
     return {"root": visible(str(root)), "note": "", "grants": rows, "inert_note": INERT_NOTE}
 
 
