@@ -74,7 +74,10 @@ def run(args):
         if flag("drop_writes"):
             return 0
         it = items()
-        it[opt(args, "-s") + "\\t" + opt(args, "-a")] = opt(args, "-w")
+        k = opt(args, "-s") + "\\t" + opt(args, "-a")
+        if k in it and "-U" not in args:            # the real binary: errSecDuplicateItem unless -U updates
+            return 45
+        it[k] = opt(args, "-w")
         json.dump(it, open(ROOT + "/items.json", "w"))
         return 0
     if cmd == "find-generic-password":
@@ -92,12 +95,19 @@ def run(args):
         return 0
     return 1
 if argv[:1] == ["-i"]:
+    if flag("hang"):
+        import time
+        time.sleep(20)
     code = 0
     for line in stdin.splitlines():
         parts = shlex.split(line)
-        if parts and parts[0] != "exit":
-            code = code or run(parts)
-    sys.exit(code)
+        if not parts:
+            continue
+        if parts[0] == "exit":                       # "strict": a binary that does not know `exit` (unmeasured)
+            code = code or (1 if flag("strict") else 0)
+            continue
+        code = code or run(parts)
+    sys.exit(1 if flag("rc1") else code)            # "rc1": a nonzero status whatever happened (unmeasured)
 sys.exit(run(argv))
 '''
 
@@ -148,7 +158,30 @@ def add(ck, sec, *, value=VALUE, provider="openai", uses=("stt", "tts"), source=
 
 
 def read(ck, sec, provider="openai", use="tts"):
-    return custody.read_key(provider, use, authority=ck.source(), store=KeychainStore(sec.path))
+    got = custody.read_key(provider, use, authority=ck.source(), store=KeychainStore(sec.path))
+    assert isinstance(got, Secret)
+    return got.reveal()
+
+
+def leaks(exc: BaseException, value: str = VALUE) -> list[str]:
+    """Where ``value`` shows in an exception: its words, its repr, its attributes, and the same for every exception
+    on its chain (``__context__`` and ``__cause__``, shown or suppressed), with every frame's locals rendered."""
+    out, todo, seen = [], [exc], set()
+    while todo:
+        e = todo.pop()
+        if e is None or id(e) in seen:
+            continue
+        seen.add(id(e))
+        shown = [str(e), repr(e), repr(getattr(e, "__dict__", {}))]
+        out += [f"{type(e).__name__} {('str', 'repr', 'attrs')[i]}" for i, s in enumerate(shown) if value in s]
+        tb = e.__traceback__
+        while tb is not None:       # each frame's locals, as `capture_locals=True` renders them (repr), but this file's
+            code = tb.tb_frame.f_code
+            if code.co_filename != __file__:
+                out += [f"{code.co_name}:{k}" for k, v in tb.tb_frame.f_locals.items() if value in repr(v)]
+            tb = tb.tb_next
+        todo += [e.__context__, e.__cause__]
+    return out
 
 
 def hits(root: Path, value: str = VALUE, *, skip: tuple[Path, ...] = ()) -> list[str]:
@@ -341,16 +374,16 @@ def test_add_signs_a_record_naming_the_item_and_stores_the_value_through_stdin(c
     state = ck.state()
     assert state.link_signers[state.seq - 1] == ck.fp                  # the laptop-presence key signed it
     writes = [c for c in sec.calls() if c["argv"] == ["-i"]]
-    assert len(writes) == 1 and writes[0]["stdin_lines"] == 2          # the add line and `exit`, on stdin only
+    assert len(writes) == 1 and writes[0]["stdin_lines"] == 1          # the add line alone, on stdin only
 
 
 def test_the_value_is_in_no_argv_env_record_log_repr_or_output(ck, sec, tmp_path, capsys, caplog, monkeypatch):
     caplog.set_level(logging.DEBUG)
     monkeypatch.setenv("VOICE_ENV_CANARY", "inherited")             # a child that inherits this process's env shows it
     rec, _ = add(ck, sec)
-    got = read(ck, sec)
-    assert got == VALUE
-    rows = custody.list_keys(ck.root, now=datetime.now(timezone.utc))
+    got = custody.read_key("openai", "tts", authority=ck.source(), store=KeychainStore(sec.path))
+    assert isinstance(got, Secret) and got.reveal() == VALUE and VALUE not in repr(got) + str(got) + f"{got}"
+    rows =custody.list_keys(ck.root, now=datetime.now(timezone.utc))
     custody.revoke_key(ck.root, rec["id"], **ck.kw())
     for call in sec.calls():
         assert VALUE not in " ".join(call["argv"])                    # argv of every `security` run
@@ -391,6 +424,9 @@ def test_every_failure_speaks_fixed_words_never_the_store_the_value_or_the_recor
         text = words(exc)
         assert VALUE not in text and "STORE-REPLY-MARKER" not in text and "cannot add" not in text
         assert "has spaces" not in text
+        # the chain and every frame's locals too: a debugger, a crash reporter or `--showlocals` sees those
+        for needle in (VALUE, "has spaces", "cannot add", "STORE-REPLY-MARKER"):
+            assert leaks(exc.value, needle) == [], needle
     assert (e3.value.code, e4.value.code) == ("keychain_unreadable", "unusable")
 
 
@@ -431,12 +467,85 @@ def test_a_failed_signature_leaves_an_item_no_record_names_and_nothing_reads_it(
     def refusing_sign(message):
         raise RuntimeError("the touch was declined")
 
-    with pytest.raises(RuntimeError):
+    with pytest.raises(RuntimeError) as raised:
         add(ck, sec, **{**ck.kw(), "sign": refusing_sign})
+    assert leaks(raised.value) == []                 # the read-back value is held in no frame the traceback keeps
     assert ck.state().policy.grants == {}
     with pytest.raises(VoiceKeyUnavailable) as e:
         read(ck, sec)
     assert e.value.code == "not_set"
+
+
+def test_a_failed_replace_leaves_the_live_record_reading_the_key_it_was_signed_for(ck, sec):
+    """L3 r1 (complement 1, codex 2, gemini 1): a replace once wrote the live record's own item (-U) before signing,
+    so a declined touch or a moved log left the old record reading an unsigned key. Default names are per record."""
+    old, _ = add(ck, sec, source=None)
+    assert old["source"] == f"levain-voice-openai-{old['id']}"
+
+    def refusing_sign(message):
+        raise RuntimeError("the touch was declined")
+
+    with pytest.raises(RuntimeError):
+        add(ck, sec, source=None, replace=True, value=OTHER, **{**ck.kw(), "sign": refusing_sign})
+    assert ck.state().policy.grants.keys() == {old["id"]} and read(ck, sec) == VALUE
+    assert sec.items()[f"{old['source']}\t{ACCOUNT}"] == VALUE      # the live item is untouched
+    new, _ = add(ck, sec, source=None, replace=True, value=OTHER)   # the same replace, signed, goes through
+    assert new["source"] != old["source"] and read(ck, sec) == OTHER
+    assert sec.items()[f"{old['source']}\t{ACCOUNT}"] == VALUE      # the superseded item stays, named by nothing
+
+
+def test_an_item_that_exists_is_never_written_over(ck, sec):
+    """Naming an existing item (another credential, an earlier key) is refused before anything is written."""
+    sec.seed("someones-item", ACCOUNT, OTHER)
+    with pytest.raises(VoiceKeyRefused, match="already exists"):
+        add(ck, sec, source="someones-item")
+    assert [c for c in sec.calls() if c["argv"] == ["-i"]] == []
+    assert sec.items() == {f"someones-item\t{ACCOUNT}": OTHER} and ck.state().policy.grants == {}
+
+
+def test_an_item_a_record_names_is_refused_even_after_the_keychain_lost_it(ck, sec):
+    """A live record whose item was deleted would read whatever is written there next: the log's names are refused
+    whatever the keychain says, for every kind that names an item."""
+    rec, _ = add(ck, sec)
+    (sec.root / "items.json").write_text("{}")
+    n = len(sec.calls())
+    with pytest.raises(VoiceKeyRefused, match=rec["id"]):
+        add(ck, sec, provider="deepgram", value=OTHER)               # SOURCE/ACCOUNT, as the openai record names
+    assert len(sec.calls()) == n and sec.items() == {}
+
+
+def test_the_writer_never_updates_an_item_a_racing_add_created(ck, sec):
+    """Between the count and the write another hand creates the item: the writer adds without -U, the add fails,
+    the read-back sees the other value, and nothing is signed or overwritten."""
+    class Zero:
+        def count(self, service, account):
+            sec.seed(service, account, OTHER)                         # the race, landing just after the count
+            return 0
+
+    with pytest.raises(KeychainWriteFailed, match="nothing was signed"):
+        add(ck, sec, items=Zero())
+    assert sec.items() == {f"{SOURCE}\t{ACCOUNT}": OTHER} and ck.state().policy.grants == {}
+
+
+@pytest.mark.parametrize("flags", [("strict",), ("rc1",), ("strict", "rc1")])
+def test_the_writer_trusts_no_exit_status_only_the_read_back(ck, sec, flags):
+    """UNMEASURED: whether real `security -i` knows `exit` or what status it gives on end of input. The writer sends
+    one line and no `exit`, ignores the status, and the read-back decides (a dropped write: the test above)."""
+    for f in flags:
+        sec.flag(f)
+    rec, _ = add(ck, sec)
+    assert rec["id"] in ck.state().policy.grants and read(ck, sec) == VALUE
+    assert [c["stdin_lines"] for c in sec.calls() if c["argv"] == ["-i"]] == [1]
+
+
+def test_a_writer_that_cannot_run_or_times_out_raises_fixed_words_with_no_chain(sec):
+    sec.flag("hang")
+    with pytest.raises(KeychainWriteFailed, match="did not take") as e:
+        SecurityStdinWriter(sec.path, timeout_s=0.5).write(SOURCE, ACCOUNT, Secret(VALUE))
+    assert e.value.__context__ is None and e.value.__cause__ is None and leaks(e.value) == []
+    with pytest.raises(KeychainWriteFailed, match="did not take") as e2:
+        SecurityStdinWriter(str(sec.root / "no-such-security")).write(SOURCE, ACCOUNT, Secret(VALUE))
+    assert e2.value.__context__ is None and leaks(e2.value) == []
 
 
 def test_a_second_key_for_a_provider_needs_replace_and_is_refused_before_anything_is_written(ck, sec):
@@ -460,13 +569,14 @@ def test_replace_is_one_link_and_the_next_read_gets_the_new_item(ck, sec):
     assert [c["argv"][2] for c in sec.calls() if c["argv"][0] == "find-generic-password"][-1] == "levain-voice-openai-2"
 
 
-def test_an_item_that_matches_twice_across_the_search_list_is_refused(ck, sec):
-    class Twice:
+@pytest.mark.parametrize("found", [1, 2])
+def test_an_item_found_anywhere_on_the_search_list_is_refused(ck, sec, found):
+    class Found:
         def count(self, service, account):
-            return 2
+            return found
 
-    with pytest.raises(VoiceKeyRefused, match="search list"):
-        add(ck, sec, items=Twice())
+    with pytest.raises(VoiceKeyRefused, match="already exists"):
+        add(ck, sec, items=Found())
     assert [c for c in sec.calls() if c["argv"] == ["-i"]] == []
 
 
@@ -548,6 +658,16 @@ def test_the_authority_must_be_a_fresh_source_not_a_kept_snapshot(ck, sec):
     with pytest.raises(TypeError):
         custody.read_key("openai", "tts", authority=lambda: kept, store=KeychainStore(sec.path))
 
+    class Kept(custody.AuthoritySource):                              # L3 r1 (codex 4): a subclass passed isinstance
+        __slots__ = ()
+
+        def __call__(self):
+            return kept
+
+    stale = Kept(ck.root / "cockpit.sqlite3", anchor=None)
+    with pytest.raises(TypeError):
+        custody.read_key("openai", "tts", authority=stale, store=KeychainStore(sec.path))
+
 
 def test_a_log_that_cannot_be_read_is_unreadable_never_a_key(ck, sec, tmp_path):
     add(ck, sec)
@@ -584,8 +704,8 @@ def test_no_test_reaches_the_real_security_binary(ck, sec, tmp_path):
     add(ck, sec)
     with pytest.raises(VoiceKeyRefused):                              # read_key's default store is the real one
         custody.read_key("openai", "tts", authority=ck.source())
-    with pytest.raises(VoiceKeyRefused):                              # and so is add's, when none is handed in
-        add(ck, sec, replace=True, value=OTHER, writer=SecurityStdinWriter(sec.path), items=None)
+    with pytest.raises(VoiceKeyRefused, match="real `security`"):    # and so is add's, when none is handed in
+        add(ck, sec, replace=True, value=OTHER, source=None, writer=SecurityStdinWriter(sec.path), items=None)
 
 
 # --- the CLI ---------------------------------------------------------------------------------------------------
@@ -619,6 +739,30 @@ def test_cli_add_list_revoke_end_to_end_and_the_value_is_never_printed(ck, sec, 
     with pytest.raises(VoiceKeyUnavailable):
         read(ck, sec)
     assert cli("list")[1].strip() == "no voice keys"
+
+
+@pytest.mark.parametrize("interactive", [False, True])
+def test_cli_add_prints_the_v5_upgrade_order_before_anything_is_stored_or_signed(ck, sec, cli, monkeypatch, capsys,
+                                                                                interactive):
+    """L3 r1 (codex 5, complement 6): the first /5 link locks out every older levain on this log; the CLI says so,
+    --yes included, before the store and the sign."""
+    shown = []
+    real = custody.SecurityStdinWriter.write
+
+    def write(self, s, a, v):
+        shown.append(capsys.readouterr().out)                         # everything printed before the store
+        return real(self, s, a, v)
+
+    monkeypatch.setattr(custody.SecurityStdinWriter, "write", write)
+    if interactive:
+        monkeypatch.setattr(sys.stdin, "isatty", lambda: True, raising=False)
+        monkeypatch.setattr("builtins.input", lambda prompt="": "y")
+        code, out, err = cli("add", "openai", "--signing-key", str(ck.key))
+    else:
+        code, out, err = cli("add", "openai", "--yes", "--signing-key", str(ck.key))
+    assert code == 0, err
+    assert len(shown) == 1 and "levain-authority/5" in shown[0] and "must be this build or newer" in shown[0]
+    assert VALUE not in shown[0] + out + err
 
 
 def test_cli_add_without_a_terminal_and_without_yes_stores_nothing(ck, sec, cli, monkeypatch):

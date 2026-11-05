@@ -33,7 +33,8 @@ def add_parsers(subparsers: argparse._SubParsersAction, common: object) -> None:
     add.add_argument("--use", dest="uses", action="append", choices=VOICE_KEY_USES, default=None,
                      help="A use the key is allowed (tts: read aloud, stt: dictation); repeatable. Default: both.")
     add.add_argument("--source", default=None,
-                     help="The keychain item's service (default: levain-voice-<provider>).")
+                     help="The keychain item's service (default: levain-voice-<provider>-<record id>, one new item "
+                          "per record). It must name no item that exists: a key is never written over one.")
     add.add_argument("--account", default=None, help="The keychain item's account (default: levain-voice).")
     add.add_argument("--replace", action="store_true",
                      help="Supersede this provider's existing key, in the same signed link.")
@@ -54,17 +55,28 @@ def add_parsers(subparsers: argparse._SubParsersAction, common: object) -> None:
     lst.set_defaults(func=_cmd_list)
 
 
+#: printed with every add, ``--yes`` included, before anything is stored or signed: a voice key link is
+#: levain-authority/5, and an older replay refuses the log at it (tests/test_voice_custody.py, the older-replay test)
+UPGRADE_ORDER_LINE = (
+    "  upgrade order: this is a levain-authority/5 link. Once one is signed, a levain older than this build refuses "
+    "this whole authority log (its replay stops at that link, so it allows nothing and can append no link, a revoke "
+    "included). Every levain that reads this log, each coordinator and daemon, must be this build or newer before "
+    "you sign.")
+
+
 def _confirm(preview: object, yes: bool) -> bool:
-    """Show the record exactly as it will be signed, then ask: y/N on a terminal; with no terminal only ``--yes``
-    goes on. Nothing is stored in the keychain, nor signed, before this answers yes."""
+    """Show the record exactly as it will be signed and the upgrade order, then ask: y/N on a terminal; with no
+    terminal only ``--yes`` goes on. Nothing is stored in the keychain, nor signed, before this answers yes."""
     from levain.cockpit.display_safe import visible
 
     rec = preview.record  # type: ignore[attr-defined]
     print(f"voice key {rec['id']} for {rec['provider']}: {', '.join(rec['uses'])}")
-    print(f"  keychain item: service {visible(rec['source'])!r}, account {visible(rec['account'])!r}")
+    print(f"  keychain item: service {visible(rec['source'])!r}, account {visible(rec['account'])!r} (a new item)")
     print("  stands until revoked; the key itself is stored in the keychain, never in the record")
     if preview.replaces:  # type: ignore[attr-defined]
-        print(f"  replaces: {', '.join(visible(x) for x in preview.replaces)}")  # type: ignore[attr-defined]
+        gone = ", ".join(visible(x) for x in preview.replaces)  # type: ignore[attr-defined]
+        print(f"  replaces: {gone} (its keychain item is left in place)")
+    print(UPGRADE_ORDER_LINE)
     if yes:
         return True
     if not sys.stdin.isatty():
@@ -93,7 +105,7 @@ def _cmd_add(args: argparse.Namespace) -> int:
         signer_fp, sign = ssh_signer(args.signing_key)
         rec, warning = custody.add_key(
             _cockpit_root(args), provider=args.provider, uses=args.uses or custody.VOICE_KEY_USES,
-            source=args.source or custody.default_source(args.provider),
+            source=args.source,
             account=args.account or custody.DEFAULT_ITEM_ACCOUNT, value=value, signer_fp=signer_fp, sign=sign,
             clock=_utc_now, replace=args.replace, confirm=lambda p: _confirm(p, args.yes))
     except (*custody._REFUSALS, *_cockpit_refusals()) as exc:

@@ -8,16 +8,19 @@ account) and the uses allowed, never the value. This module is the one place a v
   a caller kept) whether the provider has a voice key RIGHT NOW, then reads the item the record names, once per call.
   Nothing is cached, so a revoke stops the very next read, and a record no longer in the policy reads nothing.
 * :func:`add_key` signs the record (a create or one replacing ``loosen``, which the log ranks as laptop-presence) and
-  writes the item through ONE function, :class:`SecurityStdinWriter`, that hands the value to ``security -i`` on
-  stdin so it is in no argv. The writer is a seam (:class:`KeychainWriter`): the measurement that ``security -i``
-  really keeps the value out of ``ps`` was not made in this slice, and a different writer replaces this one without
-  touching the rest.
+  writes a NEW item (never one that exists or that a record names) through ONE function, :class:`SecurityStdinWriter`,
+  that hands the value to ``security -i`` on stdin so it is in no argv. The writer is a seam (:class:`KeychainWriter`):
+  the measurement that ``security -i`` really keeps the value out of ``ps`` was not made in this slice, and a
+  different writer replaces this one without touching the rest. A voice key record is a ``levain-authority/5`` link:
+  once the first one is signed, a levain older than this build refuses the whole authority log, so every levain
+  that reads it must be this build or newer before that link is signed.
 * :func:`revoke_key` and :func:`list_keys` are the signer-side counterparts. A revoke withdraws the AUTHORITY to read;
   the keychain item stays until its owner deletes it (a revoke can be signed from a phone, which holds no keychain).
 
-The value never appears in an argv, an environment, a record, a log line, a repr or an exception message: it travels
-as a :class:`Secret` whose repr is fixed text, every exception here carries fixed words, and the subprocess
-environment is ``PATH`` alone. No real ``security`` binary is reachable under a test run (:func:`checked_security`).
+The value never appears in an argv, an environment, a record, a log line, a repr or an exception (its message, its
+chain or its frames' locals): it travels as a :class:`Secret` whose repr is fixed text, from the moment a store
+returns it to the reader's return value, every exception here carries fixed words, and the subprocess environment is
+``PATH`` alone. No real ``security`` binary is reachable under a test run (:func:`checked_security`).
 """
 from __future__ import annotations
 
@@ -98,6 +101,11 @@ class Secret:
     def well_formed(self) -> bool:
         return isinstance(self._value, str) and _VALUE.fullmatch(self._value) is not None
 
+    def matches(self, other: object) -> bool:
+        """Equal values, compared in constant time; False for anything but a Secret holding a str (None included)."""
+        return (isinstance(other, Secret) and isinstance(self._value, str) and isinstance(other._value, str)
+                and hmac.compare_digest(self._value.encode(), other._value.encode()))
+
     def __repr__(self) -> str:
         return "Secret(<redacted>)"
 
@@ -134,11 +142,13 @@ class KeychainWriter:
 
 
 class SecurityStdinWriter(KeychainWriter):
-    """``security -i`` with the ``add-generic-password`` line fed on stdin: the value is in the pipe, not in ``ps``.
-    UNMEASURED against the real binary in this slice (a scratch keychain was out of bounds): that ``-i`` reads the
-    line this way and that its argv stays value-free are the design's inference, so the write is read back and
-    compared before anything is signed (:func:`add_key`), and the tests run it over a stand-in. The reply of
-    ``security`` is discarded: it is never shown, returned or logged."""
+    """``security -i`` with ONE ``add-generic-password`` line fed on stdin, then end of input: the value is in the
+    pipe, not in ``ps``. No ``-U``: it adds a new item and never updates one, so it cannot change a key a record
+    already names. UNMEASURED against the real binary in this slice (a scratch keychain was out of bounds): that
+    ``-i`` reads the line this way, that its argv stays value-free, and what exit status it gives (with or without a
+    trailing ``exit`` line) are inference. So the exit status is not trusted either way: ``write`` raises only when the
+    binary could not be run at all, and :func:`add_key` reads the item back and compares before anything is signed.
+    The reply of ``security`` goes to ``/dev/null``: it is never captured, so no exception can carry it."""
 
     def __init__(self, security: str | Path | None = None, timeout_s: float = 10.0) -> None:
         self._security = checked_security(security)
@@ -151,14 +161,17 @@ class SecurityStdinWriter(KeychainWriter):
         if not value.well_formed():
             raise KeychainWriteFailed("the key holds characters this writer cannot place (letters, digits and "
                                       "._~+/=- only, 8 to 512 of them)")
-        line = f"add-generic-password -U -s {source} -a {account} -w {value.reveal()}\nexit\n"
+        line = f"add-generic-password -s {source} -a {account} -w {value.reveal()}\n"
+        ran = True
         try:
-            subprocess.run([self._security, "-i"], input=line.encode("ascii"), capture_output=True,
-                           timeout=self._timeout, check=True, env=_ENV)
+            subprocess.run([self._security, "-i"], input=line.encode("ascii"), stdout=subprocess.DEVNULL,
+                           stderr=subprocess.DEVNULL, timeout=self._timeout, check=False, env=_ENV)
         except (OSError, subprocess.SubprocessError):
-            raise KeychainWriteFailed("the keychain did not take the key") from None
+            ran = False
         finally:
             del line
+        if not ran:     # raised outside the handler: the exception carries no __context__ (and no subprocess frame)
+            raise KeychainWriteFailed("the keychain did not take the key")
 
 
 # --- the reader --------------------------------------------------------------------------------------------------
@@ -169,20 +182,31 @@ def authority_for(data_root: Path | str) -> AuthoritySource:
     return authority_source(root / DB_NAME, anchor=anchor_path(root))
 
 
-def default_source(provider: str) -> str:
-    """The keychain service ``levain voice key add`` names for ``provider`` unless told otherwise."""
-    return f"levain-voice-{provider}"
+def default_source(provider: str, record_id: str) -> str:
+    """The keychain service ``add_key`` names unless told otherwise: one item per RECORD, so a replace writes a new
+    item beside the live one and never over it."""
+    return f"levain-voice-{provider}-{record_id}"
 
 
-def read_key(provider: str, use: str, *, authority: AuthoritySource, store: Any = None) -> str:
-    """The value of ``provider``'s voice key, for ``use``, or :class:`VoiceKeyUnavailable`. THE only reader.
+def _read_item(store: Any, source: str, account: str) -> Secret | None:
+    """The item's value, wrapped before any name holds it, or None. Nothing escapes from here: a store's exception is
+    dropped inside the handler, so no raise of the caller's carries it (or its frames) as ``__context__``."""
+    try:
+        return Secret(store.read(source, account))
+    except Exception:                       # noqa: BLE001 - a store's own words may carry anything
+        return None
 
-    Each call replays the authority log afresh (``authority`` is an :class:`AuthoritySource`, which reads and
-    verifies on every call; a callable that returns a kept snapshot is a TypeError, not a freshness a caller could
-    break), finds the provider's one voice key, checks ``use`` against its ``uses`` and only then reads the item it
+
+def read_key(provider: str, use: str, *, authority: AuthoritySource, store: Any = None) -> Secret:
+    """``provider``'s voice key, for ``use``, as a :class:`Secret` (the adapter calls ``reveal()`` at the request
+    header and nowhere else), or :class:`VoiceKeyUnavailable`. THE only reader.
+
+    Each call replays the authority log afresh (``authority`` is exactly an :class:`AuthoritySource`, which reads and
+    verifies on every call; any other callable, a subclass included, is a TypeError, so no caller can hand in a kept
+    snapshot), finds the provider's one voice key, checks ``use`` against its ``uses`` and only then reads the item it
     names from ``store`` (default: the login keychain through :class:`KeychainStore`). Nothing is held between
     calls, so a revoke stops the next read and a record that is gone reads nothing."""
-    if not isinstance(authority, AuthoritySource):
+    if type(authority) is not AuthoritySource:
         raise TypeError(f"read_key takes an AuthoritySource, not {type(authority).__name__}")
     try:
         state = authority()
@@ -194,13 +218,12 @@ def read_key(provider: str, use: str, *, authority: AuthoritySource, store: Any 
     if use not in record["uses"]:
         raise VoiceKeyUnavailable("use_not_granted", f"the {provider} key is not set for {use}")
     keychain = KeychainStore(checked_security()) if store is None else store
-    try:
-        value = keychain.read(record["source"], record["account"])
-    except Exception:                       # noqa: BLE001 - a store's own words may carry anything: fixed words here
-        raise VoiceKeyUnavailable("keychain_unreadable", "the key could not be read from the keychain") from None
-    if not isinstance(value, str) or not _VALUE.fullmatch(value):
+    held = _read_item(keychain, record["source"], record["account"])
+    if held is None:
+        raise VoiceKeyUnavailable("keychain_unreadable", "the key could not be read from the keychain")
+    if not held.well_formed():
         raise VoiceKeyUnavailable("unusable", "the keychain item does not hold a usable key")
-    return value
+    return held
 
 
 # --- the signer side ---------------------------------------------------------------------------------------------
@@ -221,23 +244,30 @@ def _check_names(provider: str, uses: Iterable[str]) -> list[str]:
     return chosen
 
 
-def add_key(data_root: Path | str, *, provider: str, uses: Iterable[str], source: str, account: str, value: Secret,
+def add_key(data_root: Path | str, *, provider: str, uses: Iterable[str], account: str, value: Secret,
             signer_fp: str, sign: Signer, clock: Callable[[], datetime], confirm: Callable[[VoiceKeyPreview], bool],
-            writer: KeychainWriter | None = None, items: KeychainItems | None = None, store: Any = None,
-            replace: bool = False, record_id: str | None = None, ssh_keygen: Path | str = DEFAULT_SSH_KEYGEN,
+            source: str | None = None, writer: KeychainWriter | None = None, items: KeychainItems | None = None,
+            store: Any = None, replace: bool = False, record_id: str | None = None,
+            ssh_keygen: Path | str = DEFAULT_SSH_KEYGEN,
             marker_directory: Path | None = None) -> tuple[dict[str, Any], str | None]:
-    """Store ``value`` as keychain item ``source``/``account`` and sign the voice key record naming it.
+    """Store ``value`` as a NEW keychain item ``source``/``account`` and sign the voice key record naming it.
 
     Order, so nothing is left half-done in the dangerous direction: the record is judged by the log's rules
     (prepared, unsigned), ``confirm(preview)`` is asked (False: nothing written or signed, :class:`SetupDeclined`),
-    the item is written and READ BACK equal, and only then is the link signed and appended. A failed sign after the
-    write leaves an item no record names, which nothing reads. ``replace`` supersedes the provider's live key in the
-    same ``loosen`` (a new id; the old record goes). Returns ``(record, warning)``."""
+    the item is written and READ BACK equal, and only then is the link signed and appended. The item must be new: one
+    that exists, or that any record in the log names, is refused before the write, and the writer never updates an
+    item. So a failed or declined sign, a moved log or a lost race after the write leaves only an item no record names,
+    which nothing reads, and every live record still reads the key it was signed for. ``source`` defaults to one item
+    per record (:func:`default_source`). ``replace`` supersedes the provider's live key in the same ``loosen`` (a new
+    id and a new item; the old record goes, its item stays until its owner deletes it). Returns
+    ``(record, warning)``."""
     chosen = _check_names(provider, uses)
     if not isinstance(value, Secret) or not value.well_formed():
         raise VoiceKeyRefused("the key is not shaped like a provider key (letters, digits and ._~+/=- only, 8 to 512)")
     now = _now(clock)
     rid = record_id if record_id is not None else "vk-" + secrets.token_hex(6)
+    if source is None:
+        source = default_source(provider, rid)
     record = {"id": rid, "kind": VOICE_KEY_KIND, "provider": provider, "uses": chosen, "source": source,
               "account": account}
     db = _journal(data_root, marker_directory=marker_directory)
@@ -250,11 +280,15 @@ def add_key(data_root: Path | str, *, provider: str, uses: Iterable[str], source
                               "or revoke it first")
     if live is None and replace:
         raise VoiceKeyRefused(f"nothing to replace: {provider} has no voice key")
-    # attributes only (no value is read): how many keychains hold an item of this service and account
-    seen = (items if items is not None else KeychainItems(checked_security())).count(source, account)
-    if seen > 1:
-        raise VoiceKeyRefused(f"{seen} keychain items have service {source[:80]!r} and account {account[:80]!r}: "
-                              "which one a read gets is the search list's order; leave one")
+    # the item must be new: named by no record in the log (a live one would read what is written next) and present in
+    # no keychain on the search list (attributes only, no value is read); the writer adds, never updates
+    named = [gid for gid, g in sorted(state.policy.grants.items())
+             if g.get("source") == source and g.get("account") == account]
+    seen = 0 if named else (items if items is not None else KeychainItems(checked_security())).count(source, account)
+    if named or seen:
+        raise VoiceKeyRefused(f"keychain item service {source[:80]!r} account {account[:80]!r} already exists"
+                              + (f" (named by {', '.join(named)})" if named else "")
+                              + ": a key is written to a new item, never over one; name another --source")
     if live is not None:
         policy = _thaw(state.policy.as_dict())
         del policy["grants"][live["id"]]
@@ -274,11 +308,7 @@ def add_key(data_root: Path | str, *, provider: str, uses: Iterable[str], source
                 raise SetupDeclined("not confirmed: nothing was written or signed")
             out_writer.write(source, account, value)
             keychain = KeychainStore(checked_security()) if store is None else store
-            try:
-                held = keychain.read(source, account)
-            except Exception:           # noqa: BLE001 - fixed words, whatever the store said
-                held = None
-            if not isinstance(held, str) or not hmac.compare_digest(held.encode(), value.reveal().encode()):
+            if not value.matches(_read_item(keychain, source, account)):
                 raise KeychainWriteFailed("the keychain does not hold the key just written: nothing was signed")
             signature = sign(link.message)
             new = append(conn, link, signature, now=_now(clock), ssh_keygen=ssh_keygen,
