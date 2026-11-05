@@ -657,3 +657,12 @@ def test_an_unexpected_launch_failure_answers_internal_error_and_leaves_one_caus
     assert "dispatch_run" in err[0] or "test_slot_dispatch_run_server" in err[0] or ".py:" in err[0]
     for secret in (key, str(oid), "passthrough"):
         assert secret not in err[0]
+
+
+def test_the_cause_line_stays_one_line_whatever_op_the_client_sent(capsys):
+    """L3 setupfix r2: `op` comes from the client frame; a newline in it must not forge a second journald line."""
+    D._report_failure("LAUNCH\nlevain dispatch-run: op END failed: forged\r" + "x" * 500, RuntimeError("boom"))
+    lines = capsys.readouterr().err.splitlines()
+    assert len(lines) == 1, lines
+    assert "forged" not in lines[0].split("failed:")[0][len("levain dispatch-run: op "):] or "\\n" in lines[0]
+    assert len(lines[0]) < 200

@@ -354,7 +354,7 @@ def _report_failure(op: str, exc: BaseException) -> None:
     try:
         tb = traceback.extract_tb(exc.__traceback__)
         where = f"{os.path.basename(tb[-1].filename)}:{tb[-1].lineno}" if tb else "?"
-        print(f"levain dispatch-run: op {op} failed: {type(exc).__name__} at {where}", file=sys.stderr, flush=True)
+        print(f"levain dispatch-run: op {str(op)[:32]!r} failed: {type(exc).__name__} at {where}", file=sys.stderr, flush=True)
     except Exception:  # noqa: BLE001 - reporting must never turn a refusal into a crash
         pass
 
