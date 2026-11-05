@@ -136,9 +136,13 @@ def test_levain_band_answer_outside_an_agent_session_records_via_cli(store, qdir
 def test_band_answer_needs_the_whole_line_to_parse(store, qdir, capsys):
     ask(store)
     band_view.run_band(argparse.Namespace(queue_dir=qdir))
-    assert band_view.run_band_answer(argparse.Namespace(queue_dir=qdir, line="1a and also fix the bug")) == 2
     assert band_view.run_band_answer(argparse.Namespace(queue_dir=qdir, line="1a\nfix the bug")) == 2
+    assert band_view.run_band_answer(argparse.Namespace(queue_dir=qdir, line="1z and also fix the bug")) == 2
     assert answers(store) == []
+    # 11-04: words after the leading answer are his note on it (the whole line), not a second request
+    assert band_view.run_band_answer(argparse.Namespace(queue_dir=qdir, line="1a and also fix the bug")) == 0
+    assert answers(store) == [(1, "option", "fix", "cli")]
+    assert context(store) == [(1, "cli", "cli", 1, "1a and also fix the bug")]
 
 
 def test_all_recs_does_not_touch_an_item_filed_after_the_view(store, env):
@@ -218,7 +222,7 @@ def test_partial_and_ambiguous_lines_record_nothing_and_say_what_was_refused(sto
     out = prompt(env, "1a, 1b, 2c")
     assert answers(store) == [(2, "option", "none", "cli")]
     assert "refused: conflict: 1a and 1b" in out
-    out = prompt(env, "1a, what")                                # a line that does not fully parse: nothing at all
+    out = prompt(env, "1a, 2z")                                  # a malformed token in the run: nothing at all
     assert answers(store) == [(2, "option", "none", "cli")] and "recorded:" not in out
 
 

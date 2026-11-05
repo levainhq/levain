@@ -418,16 +418,20 @@ def test_host_numbers_reads_past_the_bound_variable_limit(store):
     assert band_view._host_numbers(store, ns) == set(got.values())
 
 
-def test_the_suite_cannot_reach_the_real_terminal_key():
-    # 11-04: band-answer tests under a session reached `ssh-keygen -Y sign` on the real key (a Touch ID sheet per run);
-    # conftest's autouse guard refuses the real key directory at both signer factories, before any signer exists.
-    from levain.consent import terminal_sign as ts
+def test_the_suite_cannot_reach_the_real_terminal_key(monkeypatch, tmp_path):
+    # 11-04: band-answer tests under a session reached `ssh-keygen -Y sign` on the real key (a Touch ID sheet per run).
+    # The keyguard (merged into this lane) refuses the real key directory at both signer factories, before any signer
+    # exists; its refusal is also an AssertionError. The "real" directory here is a stand-in under tmp_path, so this
+    # test never names the operator's own key directory.
     from levain.cockpit import keys as K
+    from levain.consent import terminal_sign as ts
 
-    # keyguard r2: conftest redirects ``ts._real_key_dir`` to a no-key temp dir (first wall), so the REAL key is the one
-    # the guard itself judges, ``K.pwd_key_dir()`` (the passwd-database home, not the environment)
-    real = K.pwd_key_dir() / ts.KEY_LABEL
-    with pytest.raises(AssertionError, match="real terminal key"):
+    real_dir = tmp_path / "Home" / ".levain" / "keys"
+    real_dir.mkdir(parents=True)
+    monkeypatch.setattr(K, "pwd_key_dir", lambda: real_dir)
+    monkeypatch.setattr(ts, "_real_key_dir", K.pwd_key_dir)
+    real = real_dir / ts.KEY_LABEL
+    with pytest.raises(AssertionError, match="real operator key directory"):
         ts.default_signer_factory(real, 1.0)
-    with pytest.raises(AssertionError, match="real terminal key"):
+    with pytest.raises(AssertionError, match="real operator key directory"):
         ts.default_desk_signer_factory(real, 1.0)
