@@ -90,6 +90,10 @@ MAX_CONNECTIONS = 64
 MAX_HOLDERS = 48
 #: [judged] how long a holder's own cleanup waits for its END job before its thread lets go (the job runs on)
 HOLDER_END_WAIT_S = 10.0
+#: [judged] how long a RELEASE refused at the point of use waits for its END job before it answers: under the client's
+#: RELEASE socket timeout (``session_client._CONNECT_S``, 10 s), so the refusal arrives by name and not as "unreachable".
+#: The job runs on; the holder's EOF cleanup joins it. The cleanup's own ABORT settle is not bounded by this.
+RELEASE_REFUSED_WAIT_S = 2.0
 #: [judged] on SIGTERM/SIGINT, the whole budget for ENDing every live session before exit (under launchd's 20 s)
 SHUTDOWN_BUDGET_S = 15.0
 #: past this many END jobs, the finished UNPROVEN ones are dropped (a retry re-runs them anyway); a PROVEN one is never
@@ -471,7 +475,7 @@ class RunServer:
             try:
                 self._verify(mine.proof, mine.exposure, claims)
             except LauncherRefused:
-                self._finish(mine, HOLDER_END_WAIT_S)
+                self._finish(mine, RELEASE_REFUSED_WAIT_S)      # inside the client's RELEASE timeout (fixrel2)
                 raise
             with mine.lock:
                 ended = mine.ending
@@ -711,7 +715,13 @@ class RunServer:
         RELEASE refuses from here on (codex HIGH, bundle L3 :471). The lock is waited on only inside ``deadline_s``: the
         holder's cleanup holds it across an ABORT that may be slow (L3 fixrel r1). On timeout the flag is set without
         it (a plain bool write); the holder is then either in its cleanup (which sets ``ending`` itself) or in a RELEASE
-        that already took the lock, i.e. one that ran before this END, the case the END then stops."""
+        that already took the lock, i.e. one that ran before this END, the case the END then stops.
+
+        An END strictly before the key's LAUNCH registers (no holder, no index record) answers unproven by name ("no
+        session is recorded under this key; nothing observed") within the deadline and marks nothing: it is never a
+        false "ended", and a LAUNCH of that key afterwards is not refused. Documented edge (C1, 1104-31): the caller's
+        retry (the reaper's periodic END) reaches the session once it is registered, and a revoke that moved the row
+        is fenced by ``start_run``'s release transaction, which aborts the child unreleased."""
         end_at = time.monotonic() + max(0.0, deadline_s)
         with self._mu:
             h = self._live.get(key)
