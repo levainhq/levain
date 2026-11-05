@@ -19,6 +19,7 @@ import urllib.error
 import urllib.request
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlsplit
 
 from levain.webpush import ece, vapid
 from levain.webpush.store import PushStore, PushStoreError, data_text
@@ -80,6 +81,41 @@ def build_payload(title: str, body: str, tag: str, url: str, ping_id: int, badge
     return data
 
 
+def supports_declarative(endpoint: str) -> bool:
+    """True when the subscription's push service is Apple's (``web.push.apple.com``): the only service whose clients
+    (iOS and iPadOS 18.4+, Safari 18.4+) read a Declarative Web Push body (RFC 8030 ``web_push`` payloads). Derived from
+    the stored endpoint, never from a user-agent string. An Apple client older than 18.4 ignores the extra fields and
+    reads the legacy ones, so the one payload below serves both."""
+    host = (urlsplit(endpoint).hostname or "").lower()
+    return host == "push.apple.com" or host.endswith(".push.apple.com")
+
+
+def declarative_payload(data: bytes) -> bytes:
+    """``data`` (the legacy payload :func:`build_payload` made) with the Declarative Web Push members added, or ``data``
+    unchanged when they cannot be added correctly. WebKit parses ``navigate`` as an ABSOLUTE url and DROPS a declarative
+    message whose ``navigate`` is relative (the push service still answers 201, so a wrong one is a silent loss); this
+    server holds no origin (the cockpit's origin is configuration it must not hard-code), so the members are added only
+    when the payload's own ``url`` is already an absolute https url. Until a sender supplies one this is the identity, and
+    every push stays the legacy payload. Added: ``web_push: 8030`` and ``notification {title, body, navigate, tag}``,
+    ``app_badge`` when the legacy payload has ``badge``. Not added: ``mutable`` (a mutable push reaches the worker with
+    ``event.data`` null, which the worker's reader would show as an empty notification) and NO ``actions``, ever. The
+    legacy members stay at the top level for a client that does not read declarative payloads. The body is never clipped
+    to make room: if the doubled payload does not fit :data:`ece.MAX_PLAINTEXT`, the legacy bytes go out whole."""
+    try:
+        legacy = json.loads(data.decode("utf-8"))
+        url = legacy["url"]
+        if not (isinstance(url, str) and url.startswith("https://") and urlsplit(url).hostname):
+            return data
+        notif = {"title": legacy["title"], "body": legacy["body"], "navigate": url, "tag": legacy.get("tag") or "levain"}
+        out = {**legacy, "web_push": 8030, "notification": notif}
+        if isinstance(legacy.get("badge"), int):
+            out["app_badge"] = legacy["badge"]
+        enc = _dumps(out)
+    except Exception:   # noqa: BLE001 - never fails a send: the legacy payload goes out
+        return data
+    return enc if len(enc) <= ece.MAX_PLAINTEXT else data
+
+
 def topic_for(ref: str | None) -> str | None:
     """The RFC 8030 section 5.4 ``Topic`` for a ping about ``ref``: a re-ping of the same request replaces the one
     still queued for an offline phone. 32 url-safe characters; None when the ping has no ref (a test ping)."""
@@ -107,6 +143,8 @@ def _prepare(queue_dir: Path, sub: dict, data: bytes, topic: str | None) -> "url
     endpoint = valid_endpoint(sub["endpoint"])
     if endpoint is None:
         return None
+    if supports_declarative(endpoint):
+        data = declarative_payload(data)
     try:
         body = ece.encrypt(data, ece.b64d(sub["p256dh"]), ece.b64d(sub["auth"]))
     except Exception:   # noqa: BLE001 - bad keys: recorded as status 0, never raised at the gate

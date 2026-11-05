@@ -150,7 +150,10 @@
   :focus-visible { outline: 2px solid var(--text); outline-offset: 2px; border-radius: var(--r-sm); }
   .num { font-variant-numeric: tabular-nums; }
   .k { font: var(--fw-semibold) var(--fs-micro)/1 var(--round); letter-spacing: var(--track-caps); text-transform: uppercase; color: var(--label); }
-  .frame { padding-inline: var(--gutter); }          /* the one rule every edge-aligned block uses */
+  /* iOS standalone (black-translucent + viewport-fit=cover): the page draws under the status bar, the notch and the home indicator.
+     env() is 0px everywhere that is not applied (a browser tab, a desktop), so these are inert outside a Home Screen install. */
+  .deck { padding-top: env(safe-area-inset-top, 0px); padding-bottom: env(safe-area-inset-bottom, 0px); }
+  .frame { padding-left: max(var(--gutter), env(safe-area-inset-left, 0px)); padding-right: max(var(--gutter), env(safe-area-inset-right, 0px)); }          /* the one rule every edge-aligned block uses */
   .deck { max-width: none; margin: 0; }
   main.frame { padding-block: var(--sp-6) var(--sp-8); }
 
@@ -885,7 +888,7 @@
 
   .modal-overlay {
     position: fixed; inset: 0; z-index: 50; display: flex; align-items: center;
-    justify-content: center; padding: var(--sp-6);
+    justify-content: center; padding: max(var(--sp-6), env(safe-area-inset-top, 0px)) max(var(--sp-6), env(safe-area-inset-right, 0px)) max(var(--sp-6), env(safe-area-inset-bottom, 0px)) max(var(--sp-6), env(safe-area-inset-left, 0px));
     background: color-mix(in oklch, var(--base) 88%, transparent);
     animation: modalFade var(--dur-expand) var(--ease-out) both;
   }
@@ -945,8 +948,8 @@
      valuable exactly where the grid cell is most cramped. 100dvh tracks iOS Safari's
      dynamic toolbar so the card isn't clipped under it. */
   @media (max-width: 760px) {
-    .modal-overlay { padding: 0; }
-    .modal { width: 100%; height: 100dvh; max-height: 100dvh; border-radius: 0; border-top-width: 3px; }
+    .modal-overlay { padding: env(safe-area-inset-top, 0px) env(safe-area-inset-right, 0px) env(safe-area-inset-bottom, 0px) env(safe-area-inset-left, 0px); }
+    .modal { width: 100%; height: calc(100dvh - env(safe-area-inset-top, 0px) - env(safe-area-inset-bottom, 0px)); max-height: 100%; border-radius: 0; border-top-width: 3px; }
   }
   @media (pointer: coarse) {
     .modal-close { width: 40px; height: 40px; }
@@ -2619,7 +2622,7 @@ body.ke [data-ck-panel="tray"] .row .verb-actions > .verb-btn[data-verb="spore_d
 .pair-card a { color: var(--text); }
 .pair-actions { display: flex; flex-wrap: wrap; gap: var(--sp-3); margin: 0 0 var(--sp-4); }
 .pair-actions[hidden] { display: none; }
-.pair-veil { position: fixed; inset: 0; z-index: 1000; display: grid; place-items: center; padding: var(--sp-6); box-sizing: border-box; background: var(--bg); }
+.pair-veil { position: fixed; inset: 0; z-index: 1000; display: grid; place-items: center; padding: max(var(--sp-6), env(safe-area-inset-top, 0px)) max(var(--sp-6), env(safe-area-inset-right, 0px)) max(var(--sp-6), env(safe-area-inset-bottom, 0px)) max(var(--sp-6), env(safe-area-inset-left, 0px)); box-sizing: border-box; background: var(--bg); }
 .pair-actions .dev-btn { min-height: var(--hit-min, 44px); }
 .pair-code { width: 100%; box-sizing: border-box; margin: 0 0 var(--sp-3); text-align: center; letter-spacing: .25em; text-transform: uppercase; font: var(--fw-bold) var(--fs-title)/1.2 var(--mono); }
 .pair-msg { margin: 0 0 var(--sp-3); color: var(--text); font: var(--fw-regular) var(--fs-body)/1.5 var(--sans); overflow-wrap: anywhere; }
@@ -3066,12 +3069,17 @@ body.ke .masthead .indicators .pr-chip { gap: var(--sp-3); }
 .pr-sheet-seg[hidden], .pr-custom[hidden] { display: none; }
 .pr-sheet-hint { color: var(--label); font: var(--fw-regular) var(--fs-micro) var(--sans); }
 .pr-until-note { margin: var(--sp-2) 0 0; }
-.pr-custom { display: flex; gap: var(--sp-2); align-items: center; margin-top: var(--sp-2); }
+form.pr-custom { display: flex; gap: var(--sp-2); align-items: center; margin-top: var(--sp-2); }
 .pr-num { width: 5.5em; min-height: 36px; padding: 0 var(--sp-3); box-sizing: border-box; color: var(--text); background: var(--card-2); border: 1px solid var(--hair-2); border-radius: var(--r-md); font: var(--fw-regular) var(--fs-body) var(--sans); }
 .pr-num[aria-invalid="true"] { border-color: var(--bad); }
 .pr-custom-go { min-height: 36px; }
 .pr-big { min-height: 36px; padding: var(--sp-2) var(--sp-3); font: var(--fw-semibold) var(--fs-meta)/1.1 var(--sans); color: var(--text); background: none; border: 1px solid var(--hair-2); border-radius: var(--r-md); cursor: pointer; }
 .pr-big:hover { border-color: var(--text); }
+.pr-big { position: relative; }
+.pr-big.pr-custom::after { content: ""; position: absolute; top: 4px; right: 4px; width: 6px; height: 6px; border-radius: 50%; background: var(--accent, currentColor); }
+.pr-custom-line { display: flex; align-items: center; gap: var(--sp-3); margin-top: var(--sp-2); }
+.pr-custom-line .pr-sheet-hint { flex: 1 1 auto; }
+.pr-custom-line .pr-reset { flex: 0 0 auto; }
 .pr-big:disabled { opacity: .5; cursor: default; }
 .pr-big[aria-pressed="true"] { background: var(--card-2); border-color: var(--text); }
 .pr-endloud { width: 100%; margin-top: var(--sp-2); }
@@ -3105,12 +3113,10 @@ body.ke .dev-zone.pr-settings .zone-head { display: flex; }
 .pr-settings .dev-row { padding: var(--sp-3) 0; }
 .pr-settings .pr-new-form { margin-top: var(--sp-3); }
 .pr-settings-grid { gap: var(--sp-4); }
-.pr-standing .pr-sheet-seg { max-width: 460px; }
 .pr-checks { display: flex; flex-wrap: wrap; gap: var(--sp-3); flex: 1 1 100%; font: var(--fw-regular) var(--fs-meta) var(--sans); color: var(--text); }
 .pr-new .dev-url { width: 100%; margin: var(--sp-3) 0; }
 @media (max-width: 520px) {
   .pr-revoke { min-height: var(--hit-min, 44px); }
-  .pr-standing .pr-big { min-height: var(--hit-min, 44px); }
 }
 
 /* ---- The sign sheet and /pair at every size (Phill 11-01: "why is it this narrow little strip on a huge empty page"). One page, drawn for the
@@ -3439,3 +3445,9 @@ a.nc-pick.is-rec:hover { border-color: var(--text); }
   .nc-dtitle { font-size: 22px; overflow-wrap: anywhere; }
   .nc-foot .nc-btn { min-height: var(--hit-min); }
 }
+
+/* the update bar (pwa_update.js): a new app version is waiting; never silent, never over the home indicator */
+.pwa-update-bar { position: fixed; left: calc(var(--sp-5) + env(safe-area-inset-left, 0px)); right: calc(var(--sp-5) + env(safe-area-inset-right, 0px)); bottom: calc(var(--sp-5) + env(safe-area-inset-bottom, 0px)); z-index: 60;
+  min-height: var(--hit-min); padding: var(--sp-3) var(--sp-5); border: 1px solid var(--accent-line); border-radius: var(--r-lg);
+  background: var(--accent-soft); color: var(--text); font: var(--fw-semibold) var(--fs-lead)/var(--lh-tight) var(--sans);
+  text-align: center; box-shadow: var(--shadow-overlay); cursor: pointer; }

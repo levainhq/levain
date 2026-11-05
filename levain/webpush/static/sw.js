@@ -6,7 +6,7 @@
 // whichever opens first creates the store; correctness depends on no timing (an unread key waits for the next trigger).
 const DB = 'levain-sw-2', STORE = 'opened';
 // A short id of this worker's code, recorded in the trace so a device's trace says which worker ran.
-const SW_VERSION = '1102-center-1';
+const SW_VERSION = '1104-pwasw-1';
 // The TRACE: an append-only ring in its own cache, one entry per step, key TRACE_PREFIX + <time ms, zero padded> + '-' +
 // <seq>, value JSON {t, src, step, ...detail}. The /tap_trace page and sw_open.js read and write the same ring. Writes are
 // best effort, serialized on one chain, never awaited by the tap, and carry only urls without fragments, counts and step
@@ -21,7 +21,10 @@ const OPEN_CACHE = 'levain-open', OPEN_PREFIX = '/__levain_open/';
 // work of one event ends RECEIPT_BUDGET_MS after the event started.
 const RECEIPT_CACHE = 'levain-receipts', RECEIPT_PREFIX = '/__levain_receipt/';
 const RECEIPT_BUDGET_MS = 4000, RECEIPT_DRAIN = 5, RECEIPT_QUEUE_CAP = 200, RECEIPT_MAX_AGE_MS = 86400000;
-const CACHES_KEEP = [OPEN_CACHE, TRACE_CACHE, RECEIPT_CACHE];
+// The offline shell: the cockpit page '/' cached under a name that carries this worker's own version, so a new worker
+// precaches its own copy and activation deletes every older `levain-shell-v*` (dropOldCaches: not in CACHES_KEEP).
+const SHELL_CACHE = 'levain-shell-v' + SW_VERSION, SHELL_KEY = '/';
+const CACHES_KEEP = [OPEN_CACHE, TRACE_CACHE, RECEIPT_CACHE, SHELL_CACHE];
 // How long a 'for: new' entry lives (and how long the worker keeps one after a successful openWindow): the window between
 // openWindow and the opened page's first script run. The page's own limit for 'new' entries is the same figure (sw_open.js).
 const NEW_TTL_MS = 30000;  // a cold-started Home Screen app can take seconds to run its first script; the claim is
@@ -232,13 +235,215 @@ function dropOldDatabase() {
   });
 }
 
+// A new worker whose install could not fetch '/' would otherwise delete the last good shell and leave nothing for an
+// outage: before the old caches go, the newest older shell's copy is carried into the current cache when that is empty.
+// Every mutation of the shell cache (commit with its snapshot/write/rollback/prune, the activation carry, the runtime
+// write-through) runs through this ONE chain, so no two ever interleave. Network fetches and validation stay outside it;
+// only cache reads of existing state and the writes run inside. A rejected task is observed by its caller and never poisons
+// the chain.
+let shellChain = Promise.resolve();
+function serial(fn) {
+  const run = shellChain.then(fn);
+  shellChain = run.then(() => {}, () => {});
+  return run;
+}
+function carryShellForward() { return serial(carryShellForwardNow); }
+async function carryShellForwardNow() {
+  if (typeof caches === 'undefined') return;
+  const names = await caches.keys();
+  if (names.includes(SHELL_CACHE) && await (await caches.open(SHELL_CACHE)).match(SHELL_KEY)) return;
+  for (const n of names.filter((x) => x.startsWith('levain-shell-v') && x !== SHELL_CACHE).sort().reverse()) {
+    const from = await caches.open(n);
+    const page = await from.match(SHELL_KEY);
+    if (!page) continue;
+    // Only the old '/' and exactly the assets it names, each held to the same gate as a fresh write. An old generation
+    // that fails it (a missing or query-mismatched asset, an HTML body under a script key) carries NOTHING: the app falls
+    // to the network, honest, rather than a half shell. Everything else in the old cache is dropped with it.
+    if (!shellCacheable(page)) { drain(page); return; }   // headers only; the body stays unread for the clone below
+    const html = await page.clone().text();
+    const staged = [];
+    for (const a of shellAssets(html)) {
+      const hit = await from.match(a.key);
+      if (!assetOk(hit, a.kind)) { drain(hit); drain(page); return; }
+      staged.push([a.key, new Response(await hit.arrayBuffer(), { status: 200, headers: { 'content-type': hit.headers.get('content-type') } })]);
+    }
+    const to = await caches.open(SHELL_CACHE);
+    for (const [k, r] of staged) await to.put(k, r);
+    await to.put(SHELL_KEY, page);
+    return;
+  }
+}
+
 async function dropOldCaches() {
   if (typeof caches === 'undefined') return;
+  try { await carryShellForward(); } catch (_) { /* the shell is a convenience; activation never fails on it */ }
   const names = await caches.keys();
   await Promise.all(names.filter((n) => n.startsWith('levain-') && !CACHES_KEEP.includes(n)).map((n) => caches.delete(n)));
 }
 
-self.addEventListener('install', () => self.skipWaiting());
+// No skipWaiting here: a new worker waits until the page, which shows "New version available. Tap to reload.", posts
+// {type: 'levain-skip-waiting'} (the first install has no controller and activates at once anyway). The shell precache
+// is best effort: a failed or redirected fetch leaves the cache empty and never fails the install.
+async function precacheShell() {
+  try {
+    const r = await fetch(SHELL_KEY, { credentials: 'same-origin', cache: 'reload' });
+    if (!shellCacheable(r)) { drain(r); return; }
+    await commitShell(r);
+  } catch (_) { /* offline at install: the next successful navigation fills it */ }
+}
+// One coherent generation: '/' is committed only AFTER every CSS/JS its markup names has been fetched and validated, so a
+// cached '/' never points at an asset the cache lacks. Any failure commits nothing (the previous generation keeps serving;
+// a first install with a failing asset caches nothing and the app behaves as it did before the shell cache).
+function drain(r) { try { if (r && r.body) r.body.cancel().catch(() => {}); } catch (_) { /* nothing held */ } }
+async function commitShell(resp) {
+  let html = '';
+  try { html = await resp.clone().text(); } catch (_) { /* no markup: the shell alone */ }
+  const assets = shellAssets(html);
+  const staged = await Promise.all(assets.map(async (a) => {
+    try {
+      const r = await fetch(a.key, { credentials: 'same-origin', cache: 'reload' });
+      if (!assetOk(r, a.kind)) { drain(r); return null; }   // an unread body holds its connection
+      // read the body now: an unread response holds its connection, and a shell of more assets than the browser's per-host
+      // limit would wait on itself
+      return [a.key, new Response(await r.arrayBuffer(), { status: 200, headers: { 'content-type': r.headers.get('content-type') } })];
+    } catch (_) { return null; }
+  }));
+  if (staged.some((x) => !x)) { drain(resp); return false; }
+  return serial(() => writeShell(resp, staged));
+}
+async function writeShell(resp, staged) {
+  const cache = await caches.open(SHELL_CACHE);
+  // the live cache is written assets first, '/' last; a put that throws midway puts back what it overwrote (and removes
+  // what it added) so an old '/' is never left naming assets of another generation
+  const keys = [...staged.map(([k]) => k), SHELL_KEY];
+  const before = new Map();
+  // status, statusText and EVERY header are kept (a CSP on '/' must survive a restore)
+  for (const k of keys) { const h = await cache.match(k); before.set(k, h ? new Response(await h.arrayBuffer(), { status: h.status, statusText: h.statusText, headers: new Headers(h.headers) }) : null); }
+  try {
+    for (const [k, r] of staged) await cache.put(k, r);
+    await cache.put(SHELL_KEY, resp);
+  } catch (err) {
+    for (const [k, old] of before) { try { if (old) await cache.put(k, old); else await cache.delete(k); } catch (_) { /* best effort */ } }
+    throw err;
+  }
+  // bound the cache: only '/' and the assets it names stay
+  try {
+    const keep = new Set(keys);
+    for (const k of await cache.keys()) { const u = new URL(k.url), key = u.pathname + u.search; if (!keep.has(key)) await cache.delete(key); }
+  } catch (_) { /* best effort */ }
+  return true;
+}
+// Same-origin absolute URLs named by <script src> and <link rel=stylesheet href> in the shell html, as {key: path+query, kind}.
+// The exact URL (query included) is what the worker caches and what it later intercepts.
+function shellAssets(html) {
+  const out = new Map();
+  const add = (v, kind) => {
+    if (!/^\/(?!\/)/.test(v)) return;
+    let u; try { u = new URL(v.split('#')[0], 'https://shell.invalid'); } catch (_) { return; }
+    if (NO_INTERCEPT.some((p) => u.pathname === p || u.pathname.startsWith(p + '/'))) return;
+    const key = u.pathname + u.search;
+    if (!out.has(key)) out.set(key, { key, kind });
+  };
+  const attr = (tag, name) => { const m = new RegExp('\\b' + name + '\\s*=\\s*(?:"([^"]+)"|\'([^\']+)\')', 'i').exec(tag); return m ? (m[1] || m[2]) : null; };
+  for (const m of html.matchAll(/<script\b[^>]*>/gi)) { const v = attr(m[0], 'src'); if (v) add(v, 'script'); }
+  for (const m of html.matchAll(/<link\b[^>]*>/gi)) {
+    const rel = attr(m[0], 'rel');
+    if (rel && /^stylesheet$/i.test(rel.trim())) { const h = attr(m[0], 'href'); if (h) add(h, 'style'); }
+  }
+  return [...out.values()];
+}
+// A 200, not redirected, with a content type that fits the kind: a soft-200 HTML error page or captive portal is not an asset.
+function assetOk(r, kind) {
+  if (!r || r.status !== 200 || r.redirected) return false;
+  const ct = r.headers.get('content-type') || '';
+  return kind === 'script' ? /javascript|ecmascript/i.test(ct) : kind === 'style' ? /text\/css/i.test(ct) : false;
+}
+function shellCacheable(r) {
+  return !!r && r.status === 200 && !r.redirected && /text\/html/i.test(r.headers.get('content-type') || '');
+}
+self.addEventListener('install', (e) => e.waitUntil(precacheShell()));
+self.addEventListener('message', (e) => {
+  const d = e.data;
+  if (d && typeof d === 'object' && d.type === 'levain-skip-waiting') e.waitUntil(self.skipWaiting());
+});
+
+// Navigations only: network first, the cached shell (or the offline page) when the network fails. Never intercepted:
+// anything but a same-origin GET navigation, and /webpush/ and /cockpit/ (data). Never cached: any response but the bare
+// '/' with no query (a credential would ride in a query; the offline page never echoes the URL); a fragment never reaches
+// a worker. A navigation to '/' with a query is still answered offline from the cached shell (reading it, not writing it).
+const NO_INTERCEPT = ['/webpush', '/cockpit'];
+const OFFLINE_HTML = '<!doctype html><html lang="en"><head><meta charset="utf-8">' +
+  '<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover"><title>Levain</title>' +
+  '<style>html,body{margin:0;height:100%;background:#14110f;color:#f1ebe3;font:17px/1.4 -apple-system,system-ui,sans-serif}' +
+  'body{display:flex;flex-direction:column;align-items:center;justify-content:center;text-align:center;gap:20px;' +
+  'padding:calc(24px + env(safe-area-inset-top)) calc(24px + env(safe-area-inset-right)) calc(24px + env(safe-area-inset-bottom)) calc(24px + env(safe-area-inset-left))}' +
+  'a{color:#14110f;background:#f1ebe3;padding:12px 28px;border-radius:12px;text-decoration:none;font-weight:600}</style></head>' +
+  '<body><p>Can\'t reach your cockpit. Is Tailscale on?</p><a href="">Retry</a></body></html>';
+function offlineResponse() {
+  return new Response(OFFLINE_HTML, { status: 503, headers: { 'Content-Type': 'text/html; charset=utf-8', 'Cache-Control': 'no-store' } });
+}
+async function navigateNetworkFirst(e, req, bare) {
+  try {
+    const r = await fetch(req);
+    if (bare && shellCacheable(r)) {
+      // off the critical path: the page never waits on Cache Storage (a slow or full cache costs the copy, not the page)
+      const copy = r.clone();
+      e.waitUntil((async () => { try { await commitShell(copy); } catch (_) { /* best effort; '/' is replaced only with its assets */ } })());
+    }
+    return r;
+  } catch (err) {
+    if (new URL(req.url).pathname === SHELL_KEY) {
+      try {
+        const hit = await (await caches.open(SHELL_CACHE)).match(SHELL_KEY);
+        if (hit) return hit;
+      } catch (_) { /* fall through to the offline page */ }
+    }
+    return offlineResponse();
+  }
+}
+// The shell's own scripts and styles: network first (a reload never sees a skewed page), written through to the shell cache
+// OFF the response path (the worker's cache.put ignores the server's no-store) and only for an exact URL the cached shell
+// names, with a content type that fits; answered from the cache when the network fails.
+async function assetNetworkFirst(e, req, key, kind) {
+  try {
+    const r = await fetch(req);
+    if (assetOk(r, kind)) {
+      const copy = r.clone();
+      e.waitUntil(serial(async () => {
+        try {
+          const c = await caches.open(SHELL_CACHE);
+          const hit = await c.match(SHELL_KEY);
+          if (hit && shellAssets(await hit.text()).some((a) => a.key === key)) await c.put(key, copy);
+          else drain(copy);
+        } catch (_) { drain(copy); /* best effort; the unread tee branch is released */ }
+      }));
+    }
+    return r;
+  } catch (err) {
+    try {
+      // NOT serialized: a held or never-settling mutation must not hang an offline script/style request. KNOWN EDGE: this
+      // check-then-read can race a commit, so an offline request racing one may serve one old asset once, or answer a network error once when the commit's prune lands between the check and the read.
+      const c = await caches.open(SHELL_CACHE);
+      const page = await c.match(SHELL_KEY);
+      const hit = page && shellAssets(await page.text()).some((a) => a.key === key) ? await c.match(key) : null;
+      if (hit) return hit;
+    } catch (_) { /* fall through */ }
+    return Response.error();
+  }
+}
+self.addEventListener('fetch', (e) => {
+  const req = e.request;
+  if (!req || req.method !== 'GET') return;
+  let u;
+  try { u = new URL(req.url); } catch (_) { return; }
+  if (u.origin !== self.location.origin) return;
+  if (NO_INTERCEPT.some((p) => u.pathname === p || u.pathname.startsWith(p + '/'))) return;
+  if (req.mode !== 'navigate') {
+    if (req.destination === 'script' || req.destination === 'style') e.respondWith(assetNetworkFirst(e, req, u.pathname + u.search, req.destination));
+    return;
+  }
+  e.respondWith(navigateNetworkFirst(e, req, u.pathname === SHELL_KEY && !u.search));
+});
 // the pre-fix4 pending target: ONE singleton key in the same cache; no claim path reads it any more, so it is deleted
 async function dropLegacyPending() {
   if (typeof caches === 'undefined') return;

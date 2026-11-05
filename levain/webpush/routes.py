@@ -23,6 +23,10 @@ _STATIC_FILES = {
     "/app.webmanifest": ("app.webmanifest", "application/manifest+json"),
     "/icon-192.png": ("icon-192.png", "image/png"),
     "/icon-512.png": ("icon-512.png", "image/png"),
+    "/icon-maskable-192.png": ("icon-maskable-192.png", "image/png"),
+    "/icon-maskable-512.png": ("icon-maskable-512.png", "image/png"),
+    "/shot-narrow.png": ("shot-narrow.png", "image/png"),
+    "/shot-wide.png": ("shot-wide.png", "image/png"),
     "/badge-96.png": ("badge-96.png", "image/png"),
     "/apple-touch-icon.png": ("apple-touch-icon.png", "image/png"),
 }
