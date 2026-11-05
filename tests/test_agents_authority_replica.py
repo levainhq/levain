@@ -37,6 +37,7 @@ from tests.test_authority_agent_link import revoke_agent
 pytestmark = pytest.mark.skipif(shutil.which("ssh-keygen") is None, reason="needs ssh-keygen")
 
 REPO = Path(__file__).resolve().parent.parent
+NO_BAR = {"open": False, "closed_revoke_seq": 0}
 
 
 @pytest.fixture
@@ -444,8 +445,8 @@ def test_launch_is_judged_against_the_replica_with_the_frames_head_and_bar(rig, 
     assert (ans["refused"], ans["reason_class"]) == ("ledger-behind", "transient")
     assert wire.control.minted == {}
     wire.sync(sock=sock)
-    ans = wire.launch(sock, oid, ledger_head={"seq": 1, "hash": "0" * 64})   # a head that is not the replica's
-    assert ans["refused"] == "ledger-behind"
+    ans = wire.launch(sock, oid, ledger_head={"seq": 1, "hash": "0" * 64})   # a held seq on another chain
+    assert ans["refused"] == "ledger-fork" and "reason_class" not in ans
     assert wire.launch(sock, oid, bar={"open": True, "closed_revoke_seq": 0})["refused"] == "agent-barred"
     big = wire.head()["seq"] + 1
     assert wire.launch(sock, oid, bar={"open": False, "closed_revoke_seq": big})["refused"] == "bar-invalid"
@@ -473,7 +474,7 @@ def test_release_with_an_unchanged_ledger_releases(rig, wire):
     wire.sync()
     sock = wire.conn()
     assert wire.launch(sock, oid)["ok"] is True
-    assert wire.call(sock, "RELEASE", ledger_head=wire.head())["ok"] is True
+    assert wire.call(sock, "RELEASE", ledger_head=wire.head(), bar=NO_BAR)["ok"] is True
     sock.close()
 
 
@@ -486,7 +487,7 @@ def test_a_revoke_signed_between_launch_and_release_refuses_at_release(rig, wire
     s2 = wire.conn()
     assert wire.sync(sock=s2)["ok"] is True                                   # the fire SYNCs before it RELEASEs
     s2.close()
-    gone = wire.call(sock, "RELEASE", ledger_head=wire.head())
+    gone = wire.call(sock, "RELEASE", ledger_head=wire.head(), bar=NO_BAR)
     assert gone["refused"] == "link-not-standing"          # a revoked link is gone from the replay
     sock.close()
 
@@ -497,17 +498,92 @@ def test_a_release_naming_a_head_the_replica_lacks_is_refused_and_the_session_is
     sock = wire.conn()
     assert wire.launch(sock, oid)["ok"] is True
     rig.world.link(revoke_agent(rig.row(oid)["agent_id"], rig.sid))
-    stale = wire.call(sock, "RELEASE", ledger_head=wire.head())               # a client that skipped its SYNC
+    stale = wire.call(sock, "RELEASE", ledger_head=wire.head(), bar=NO_BAR)   # a client that skipped its SYNC
     assert (stale["refused"], stale["reason_class"]) == ("ledger-behind", "transient")
     sock.close()
 
 
-def test_release_without_a_ledger_head_is_a_bad_request(rig, wire):
+def _other_fire(rig, wire, record=None):
+    """Another fire: the operator signs ``record`` (None: a new, unrelated link that bars nothing), that fire SYNCs it
+    into the replica."""
+    rig.link() if record is None else rig.world.link(record)
+    assert wire.sync()["ok"] is True
+
+
+def test_another_fires_sync_between_launch_and_release_does_not_end_this_session(rig, wire):
     oid = _occurrence(rig, billing="subscription", exposure=EXP)
     wire.sync()
     sock = wire.conn()
     assert wire.launch(sock, oid)["ok"] is True
-    assert wire.call(sock, "RELEASE")["refused"] == "bad-request"
+    mine = wire.head()                                                        # this fire's verified head
+    _other_fire(rig, wire)                                                    # a row that does not bar this agent
+    assert wire.replica.head()[0] == mine["seq"] + 1
+    ans = wire.call(sock, "RELEASE", ledger_head=mine, bar=NO_BAR)            # a held ancestor of the replica's head
+    assert ans["ok"] is True and wire.runtime.children[0].released is True and wire.runtime.ended == []
+    sock.close()
+
+
+def test_a_revoke_of_this_agent_another_fire_synced_refuses_release_under_a_held_head(rig, wire):
+    oid = _occurrence(rig, billing="subscription", exposure=EXP)
+    wire.sync()
+    sock = wire.conn()
+    assert wire.launch(sock, oid)["ok"] is True
+    mine = wire.head()
+    _other_fire(rig, wire, revoke_agent(rig.row(oid)["agent_id"], rig.sid))   # past this fire's claimed head
+    gone = wire.call(sock, "RELEASE", ledger_head=mine, bar=NO_BAR)
+    assert gone["refused"] == "link-not-standing"          # judged on the replica's whole replay, not the claimed prefix
+    assert wire.runtime.children[0].released is False and wire.runtime.ended == ["sess-1"]
+    sock.close()
+
+
+@pytest.mark.parametrize("claim,name", [("past", "ledger-behind"), ("fork", "ledger-fork"), ("zero", "ledger-behind")])
+def test_a_release_naming_a_head_the_replica_does_not_hold_or_that_forks_is_refused(rig, wire, claim, name):
+    oid = _occurrence(rig, billing="subscription", exposure=EXP)
+    wire.sync()
+    sock = wire.conn()
+    assert wire.launch(sock, oid)["ok"] is True
+    h = wire.head()
+    head = {"past": {"seq": h["seq"] + 1, "hash": h["hash"]}, "fork": {"seq": h["seq"] - 1, "hash": "0" * 64},
+            "zero": {"seq": 0, "hash": ""}}[claim]
+    ans = wire.call(sock, "RELEASE", ledger_head=head, bar=NO_BAR)
+    assert ans["refused"] == name
+    assert ans.get("reason_class") == ("transient" if name == "ledger-behind" else None)
+    assert wire.runtime.children[0].released is False and wire.runtime.ended == ["sess-1"]
+    sock.close()
+
+
+@pytest.mark.parametrize("fields", [{}, {"bar": NO_BAR}, {"head": True}], ids=["neither", "no-head", "no-bar"])
+def test_release_without_a_ledger_head_or_a_bar_is_a_bad_request(rig, wire, fields):
+    oid = _occurrence(rig, billing="subscription", exposure=EXP)
+    wire.sync()
+    sock = wire.conn()
+    assert wire.launch(sock, oid)["ok"] is True
+    if fields.pop("head", False):
+        fields["ledger_head"] = wire.head()
+    assert wire.call(sock, "RELEASE", **fields)["refused"] == "bad-request"
+    sock.close()
+
+
+def test_release_judges_the_bar_its_own_frame_carries_not_the_launches(rig, wire):
+    # codex r1 MED: a bar opened after LAUNCH, with no ledger row yet, refuses RELEASE
+    oid = _occurrence(rig, billing="subscription", exposure=EXP)
+    wire.sync()
+    sock = wire.conn()
+    assert wire.launch(sock, oid)["ok"] is True                               # LAUNCH: no bar
+    gone = wire.call(sock, "RELEASE", ledger_head=wire.head(), bar={"open": True, "closed_revoke_seq": 0})
+    assert (gone["refused"], gone.get("reason_class")) == ("agent-barred", None)
+    assert wire.runtime.children[0].released is False and wire.runtime.ended == ["sess-1"]
+    sock.close()
+
+
+def test_a_release_bar_outside_its_claimed_head_is_bar_invalid(rig, wire):
+    oid = _occurrence(rig, billing="subscription", exposure=EXP)
+    wire.sync()
+    sock = wire.conn()
+    assert wire.launch(sock, oid)["ok"] is True
+    h = wire.head()
+    ans = wire.call(sock, "RELEASE", ledger_head=h, bar={"open": False, "closed_revoke_seq": h["seq"] + 1})
+    assert ans["refused"] == "bar-invalid" and wire.runtime.children[0].released is False
     sock.close()
 
 

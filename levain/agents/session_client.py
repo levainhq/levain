@@ -69,7 +69,7 @@ from levain.contracts import ContractError, canon
 __all__ = ["PROTOCOL", "RUN_FRAME_MAX", "LAUNCHER_NAME", "WAIT_SLICE_S", "WireError", "ProofUnavailable", "LinkRow",
            "LinkProof", "encode_run_frame", "read_run_frame", "check_run_request", "ok_answer", "refused_answer",
            "launch_to_wire", "launch_from_wire", "usage_to_wire", "usage_from_wire", "link_proof",
-           "default_run_socket", "unix_connector", "DispatchSessionLauncher", "build_launcher"]
+           "default_run_socket", "unix_connector", "DispatchSessionLauncher", "build_launcher", "AuthorityFeed"]
 
 _log = logging.getLogger("levain.agents.session_client")
 
@@ -363,6 +363,77 @@ def link_proof(store: Any, cockpit_root: Path | str, occurrence_id: str, *, now:
     return LinkProof(occurrence_id, spec_hash, link_id, sid[0], rows[born], rows[current])
 
 
+# --- the authority feed: what the fire SYNCs to the server's replica -----------------------------------------------------
+
+_SYNC_CHUNK_ROWS = 256
+_SYNC_CHUNK_BYTES = RUN_FRAME_MAX // 4          # well under one frame, whatever the row sizes (a row is capped at 64 KiB)
+
+
+@dataclass(frozen=True)
+class AuthorityRead:
+    """The operator side as the fire verified it: the ledger ``head`` ``(seq, hash)`` after a verified replay, and the
+    agent's ``bar`` ``(open bar?, highest closed bar's revoke_seq or 0)`` from the agent store."""
+    head: tuple[int, str]
+    bar: tuple[bool, int]
+
+
+class AuthorityFeed:
+    """Reads what the operator-side fire sends the dispatch server (S10b B-pub, design 2.3): its verified ledger head,
+    the agent's bar, and the ``authority_log`` rows the server's replica lacks. The server re-verifies every row
+    (signatures, chain, anchor) and trusts none of this beyond that."""
+
+    def __init__(self, store: Any, cockpit_root: Path | str) -> None:
+        self._store, self._root = store, Path(cockpit_root)
+
+    def read(self, occurrence_id: str) -> AuthorityRead:
+        from levain.agent_authority import AgentAuthority
+        try:
+            with self._store.read() as conn:
+                row = conn.execute("SELECT agent_id FROM agent_occurrences WHERE occurrence_id = ?",
+                                   (occurrence_id,)).fetchone()
+                if row is None or type(row[0]) is not str:
+                    raise ProofUnavailable("the occurrence row names no agent", standing=True)
+                opened = conn.execute("SELECT 1 FROM agent_bars WHERE agent_id = ? AND closed_at IS NULL",
+                                      (row[0],)).fetchone() is not None
+                closed = conn.execute("SELECT MAX(revoke_seq) FROM agent_bars WHERE agent_id = ? AND closed_at IS NOT NULL",
+                                      (row[0],)).fetchone()[0]
+                if closed is not None and type(closed) is not int:   # text or a blob in an INTEGER column: corrupt
+                    raise ProofUnavailable("the agent's closed bar names no integer revoke seq", standing=True)
+        except ProofUnavailable:
+            raise
+        except Exception as exc:  # noqa: BLE001
+            raise ProofUnavailable(f"the agent store does not read ({type(exc).__name__})", standing=False) from None
+        try:
+            state = AgentAuthority(self._root).replay()
+        except Exception as exc:  # noqa: BLE001 - a replay that fails proves nothing
+            raise ProofUnavailable(f"the authority log does not replay ({type(exc).__name__})", standing=False) from None
+        return AuthorityRead((state.seq, state.head_hash), (opened, 0 if closed is None else closed))
+
+    def rows(self, after: int, upto: int) -> list[dict[str, object]]:
+        """The next chunk of rows with ``after < seq <= upto``, in order, bounded by count and bytes (at least one)."""
+        from levain.cockpit.firejournal import DB_NAME
+        out: list[dict[str, object]] = []
+        size = 0
+        try:
+            db = sqlite3.connect("file:" + quote(str(self._root / DB_NAME), safe="/") + "?mode=ro", uri=True, timeout=5.0)
+            try:
+                cur = db.execute("SELECT seq, prev_hash, record, signer_fp, signature, hash FROM authority_log"
+                                 " WHERE seq > ? AND seq <= ? ORDER BY seq", (after, upto))
+                for got in cur:
+                    if type(got[0]) is not int or not all(type(c) is str for c in got[1:]):
+                        raise ProofUnavailable(f"log row {got[0]} is not text", standing=False)
+                    row = dict(zip(("seq", "prev_hash", "record", "signer_fp", "signature", "hash"), got))
+                    size += sum(len(str(v)) for v in got) + 80
+                    if out and (len(out) >= _SYNC_CHUNK_ROWS or size > _SYNC_CHUNK_BYTES):
+                        break
+                    out.append(row)
+            finally:
+                db.close()
+        except sqlite3.Error as exc:
+            raise ProofUnavailable(f"the authority log rows do not read ({type(exc).__name__})", standing=False) from None
+        return out
+
+
 # --- the connection ---------------------------------------------------------------------------------------------------
 
 class _Down(Exception):
@@ -533,8 +604,10 @@ class _RemoteChild:
     """The gated child the client answers: ``release``, ``abort`` and a ``process`` (design 3.2). ``session`` is the S1
     session id the server answered, None for a child whose LAUNCH answer was lost."""
 
-    def __init__(self, conn: _Conn | None, session: str | None) -> None:
+    def __init__(self, conn: _Conn | None, session: str | None,
+                 release_fields: Callable[[_Conn], dict[str, object]] | None = None) -> None:
         self._conn = conn
+        self._release_fields = release_fields
         self.session = session
         self.process = _RemoteProcess(conn)
         self.released = False
@@ -545,10 +618,18 @@ class _RemoteChild:
         if self._conn is None:
             raise RuntimeError("the dispatch run server did not answer LAUNCH: nothing to release")
         try:
-            self._conn.request("RELEASE", ())
-        except _Down as exc:
+            # the fire's fresh verified head and the agent's fresh bar, SYNCed first: the server re-judges the link and
+            # the bar against its replica at RELEASE (L3 r1: a bar opened after LAUNCH was not seen)
+            fields = self._release_fields(self._conn) if self._release_fields is not None else {}
+            self._conn.request("RELEASE", (), **fields)
+        except LauncherRefused as exc:
+            raise RuntimeError(f"the authority could not be synced for RELEASE: {exc.name}") from None
+        except (_Down, WireError, KeyError) as exc:
+            # an off-shape SYNC answer (WireError, KeyError) leaves the connection open: closed here, as spawn does
+            self._conn.close()
             self.process._lose()
-            raise RuntimeError(f"the dispatch run server is unreachable at RELEASE ({exc})") from None
+            raise RuntimeError(f"the dispatch run server is unreachable at RELEASE ({type(exc).__name__}: {exc})") \
+                from None
         except _Refused as exc:
             raise RuntimeError(f"the dispatch run server refused RELEASE: {exc.name}") from None
         self.released = True
@@ -590,6 +671,43 @@ def unix_connector(path: Path | str, *, timeout: float = _CONNECT_S) -> Callable
     return connect
 
 
+def _head_of(ans: dict) -> tuple[int, str]:
+    h = _exact(ans["head"], ("seq", "hash"), "head")
+    return _int(h["seq"], "head.seq"), _str(h["hash"], "head.hash", max_len=128)
+
+
+def _sync_to(conn: _Conn, feed: AuthorityFeed, head: tuple[int, str]) -> None:
+    """Bring the server's replica to ``head``: read its head (an empty SYNC), send the rows it lacks in chunks, and
+    require it to land on ``head`` or past it (another fire's SYNC; the server then judges that its replica HOLDS ``head``).
+    ``ledger-stale`` (another fire SYNCed first) is already-synced after ONE more head read; the same seq with another
+    hash is ``ledger-fork``; ``ledger-unverifiable`` / ``ledger-behind`` and the rest surface as :class:`_Refused`."""
+    for attempt in (0, 1):
+        try:
+            try:
+                have = _head_of(conn.request("SYNC", ("head",), rows=[]))
+            except _Refused as exc:
+                if exc.name != "ledger-empty":      # an empty replica refuses the head read: it holds nothing yet
+                    raise
+                have = (0, "")
+            while have[0] < head[0]:
+                chunk = feed.rows(have[0], head[0])
+                if not chunk:
+                    raise _Refused("ledger-behind", "the operator's ledger lacks rows its own head names", "transient")
+                have = _head_of(conn.request("SYNC", ("head",), rows=chunk))
+            break
+        except _Refused as exc:
+            if exc.name == "ledger-stale" and attempt == 0:
+                continue
+            raise
+    if have == head:
+        return
+    if have[0] > head[0]:
+        # another fire SYNCed past this fire's read: the frame names this head and the SERVER judges whether its
+        # replica holds it (held: go on, against the whole replica; another chain: a standing ledger-fork). b2rel.
+        return
+    raise _Refused("ledger-fork", "the server's ledger and the operator's differ at the same position", "standing")
+
+
 class DispatchSessionLauncher:
     """A :class:`levain.agents.session.SessionLauncher` and :class:`levain.agents.session.SessionEnder` over the run
     server (module docstring). ``connect()`` returns a connected socket (raising ``OSError``); ``proof_of(occurrence_id)``
@@ -598,9 +716,29 @@ class DispatchSessionLauncher:
     route = S1_DISPATCH
     auth = "passthrough"
 
-    def __init__(self, connect: Callable[[], socket.socket], proof_of: Callable[[str], LinkProof]) -> None:
+    def __init__(self, connect: Callable[[], socket.socket], proof_of: Callable[[str], LinkProof],
+                 feed: AuthorityFeed | None = None) -> None:
         self._connect = connect
         self._proof_of = proof_of
+        self._feed = feed           # None: a server without a replica (its frames carry no ledger_head or bar)
+
+    def _claims(self, conn: _Conn, occurrence_id: str, *, bar: bool) -> dict[str, object]:
+        """SYNC the server's replica up to the fire's verified ledger head, then the frame fields naming it (and, with
+        ``bar``, the agent's bar as read now: LAUNCH and RELEASE both send it). Raises :class:`LauncherRefused`
+        (named; ``ledger-fork`` and the like are standing) or :class:`_Down`."""
+        assert self._feed is not None
+        try:
+            read = self._feed.read(occurrence_id)
+            _sync_to(conn, self._feed, read.head)
+        except ProofUnavailable as exc:
+            raise LauncherRefused("link-proof-unavailable", str(exc),
+                                  reason_class="standing" if exc.standing else "transient") from None
+        except _Refused as exc:
+            raise LauncherRefused(exc.name, exc.detail, reason_class=exc.reason_class) from None
+        fields: dict[str, object] = {"ledger_head": {"seq": read.head[0], "hash": read.head[1]}}
+        if bar:
+            fields["bar"] = {"open": read.bar[0], "closed_revoke_seq": read.bar[1]}
+        return fields
 
     # -- spawn ---------------------------------------------------------------------------------------------------------
 
@@ -612,7 +750,11 @@ class DispatchSessionLauncher:
                                   reason_class="standing" if exc.standing else "transient") from None
         body = launch_to_wire(launch, proof)
         try:
-            encode_run_frame({**body, "p": PROTOCOL, "op": "LAUNCH", "id": 1})      # too big: refused before any connect
+            # worst-case claims (the largest seq and hash the wire admits), so a body that passes here cannot overflow
+            # once the real ones are added (L3 r1)
+            extra = ({"ledger_head": {"seq": _INT_MAX, "hash": "0" * 128},
+                      "bar": {"open": False, "closed_revoke_seq": _INT_MAX}} if self._feed is not None else {})
+            encode_run_frame({**body, **extra, "p": PROTOCOL, "op": "LAUNCH", "id": 1})      # too big: refused before any connect
         except WireError as exc:
             raise LauncherRefused("launch-frame-refused", str(exc)) from None
         try:
@@ -620,19 +762,31 @@ class DispatchSessionLauncher:
         except OSError as exc:
             raise LauncherRefused("dispatch-unreachable", f"{type(exc).__name__}", reason_class="transient") from None
         conn = _Conn(sock)
+        if self._feed is not None:
+            try:
+                body = {**body, **self._claims(conn, launch.occurrence_id, bar=True)}
+            except LauncherRefused:
+                conn.close()
+                raise
+            except (_Down, WireError, KeyError) as exc:     # nothing was launched yet: a plain transient refusal
+                conn.close()
+                raise LauncherRefused("dispatch-unreachable", f"SYNC: {type(exc).__name__}", reason_class="transient") from None
         try:
             ans = conn.request("LAUNCH", ("session",), timeout=LAUNCH_ANSWER_S, **body)
             session = _str(ans["session"], "session", max_len=128)
         except _Refused as exc:
             conn.close()
             raise LauncherRefused(exc.name, exc.detail, reason_class=exc.reason_class) from None
-        except (_Down, WireError) as exc:
-            # the request may have been delivered: the server may hold a session, so this must not raise (a raising
-            # spawn promises nothing is live). The closed holder is the server's cue to END; this child proves nothing.
+        except (_Down, WireError, KeyError) as exc:
+            # a classified refusal (_Refused) was surfaced above; only these are a lost answer. The request may have
+            # been delivered: the server may hold a session, so this must not raise (a raising spawn promises nothing
+            # is live). The closed holder is the server's cue to END; this child proves nothing.
             _log.warning("LAUNCH for %s lost its answer (%s): returning a down child", launch.session_key, exc)
             conn.close()
             return _RemoteChild(None, None)
-        return _RemoteChild(conn, session)
+        occ = launch.occurrence_id
+        return _RemoteChild(conn, session,
+                            (lambda c: self._claims(c, occ, bar=True)) if self._feed is not None else None)
 
     # -- usage and end, keyed by the recorded session key -----------------------------------------------------------------
 
@@ -688,4 +842,5 @@ def build_launcher(store: Any) -> DispatchSessionLauncher:
     from levain.agents.session_wire import read_install
     install = read_install(store.directory)
     return DispatchSessionLauncher(unix_connector(default_run_socket()),
-                                   lambda occ: link_proof(store, install.cockpit_root, occ))
+                                   lambda occ: link_proof(store, install.cockpit_root, occ),
+                                   AuthorityFeed(store, install.cockpit_root))
