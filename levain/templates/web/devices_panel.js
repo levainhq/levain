@@ -37,7 +37,7 @@
     const f = shared().noPushWords;
     return typeof f === "function" ? f() : "This browser does not offer pings.";
   }
-  let confirmBox = null, pingRow = null, pingState = null, pingBtn = null, pushKey = "", pushAsked = false;
+  let confirmBox = null, pingTestBtn = null, pingRow = null, pingState = null, pingBtn = null, pushKey = "", pushAsked = false;
   const b64uToBytes = (t) => Uint8Array.from(atob(t.replace(/-/g, "+").replace(/_/g, "/") + "===".slice((t.length + 3) % 4)),
                                              (c) => c.charCodeAt(0));
 
@@ -142,6 +142,10 @@
     pingBtn.type = "button";
     pingBtn.addEventListener("click", () => { if (pingBtn.dataset.on === "1") turnOff(); else turnOn(); });
     pingRow.appendChild(pingBtn);
+    pingTestBtn = el("button", "dev-btn dev-test", "Send a test ping");
+    pingTestBtn.type = "button";
+    pingTestBtn.addEventListener("click", () => sendTestPing());
+    pingRow.appendChild(pingTestBtn);
     body.appendChild(pingRow);
 
     const form = el("form", "dev-offer");
@@ -466,11 +470,12 @@
     pingRow.hidden = false;
     if (!PUSH_OK) {
       // no live Turn on without the push API: the words say what to do instead
+      pingTestBtn.hidden = true;
       pingBtn.hidden = true; pingBtn.dataset.on = "";   // hidden, not disabled: a click that still arrives reaches turnOn(), which answers in words
       pingState.textContent = noPushSay();
       return;
     }
-    pingBtn.hidden = false;
+    pingBtn.hidden = false; pingTestBtn.hidden = false;
     const reg = await registration();
     const sub = reg ? await reg.pushManager.getSubscription().catch(() => null) : null;
     pingBtn.dataset.on = sub ? "1" : "";
@@ -524,6 +529,37 @@
       if (sub) await sub.unsubscribe().catch(() => {});
       say(shared().turnOnFailed ? shared().turnOnFailed(e) : "Could not turn pings on. (" + ((e && e.message) || e) + ")");
     } finally { pingBtn.disabled = false; pings(); }
+  }
+  // A test ping to THIS browser, any time (the first-run card is the only other place it was ever sent). The words are the
+  // pairing card's own (one copy); a subscription the push service has dropped, or none at all, says what to do instead.
+  // The wait is bounded here, not in api(): a POST the server committed late must not be taken for a failed one.
+  const TEST_WAIT_MS = 20000;
+  async function sendTestPing() {
+    if (pingTestBtn.disabled) return;
+    pingTestBtn.disabled = true; say("");
+    try {
+      const reg = PUSH_OK ? await registration() : null;
+      const sub = reg ? await reg.pushManager.getSubscription().catch(() => null) : null;
+      if (!sub) {
+        say(PUSH_OK && Notification.permission === "denied"
+          ? "This browser blocks notifications from this page. Allow them for this site in the browser or system settings, then turn pings on."
+          : "Pings are off in this browser, so there is nothing to test. Turn pings on first.");
+        return;
+      }
+      let timer = null;
+      const wait = new Promise((_, no) => { timer = setTimeout(() => no(new Error("no answer")), TEST_WAIT_MS); });
+      let res;
+      try { res = await Promise.race([api("POST", "/webpush/test", {}), wait]); } finally { clearTimeout(timer); }
+      if (res.status === 200) {
+        const d = (res.data && res.data.deliveries) || [];
+        const gone = d.some((x) => x && (x.status === 410 || x.status === 404));
+        const words = typeof shared().testWords === "function" ? shared().testWords(res.data) : "The test ping was sent.";
+        say(gone ? "This browser's subscription is gone: turn pings on again." : words);
+      } else if (res.status === 403) {
+        say("This browser is not paired as a device, so it cannot be pinged. Turn pings on to pair it.");
+      } else say("The test ping was refused (" + ((res.data && res.data.message) || res.status) + ").");
+    } catch (_) { say("No answer came back, so the test ping may or may not arrive."); }
+    finally { pingTestBtn.disabled = false; }
   }
   async function turnOff() {
     pingBtn.disabled = true; say("");

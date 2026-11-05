@@ -271,7 +271,7 @@
   }
 
   window.levainPairCard = { claim: claim, drainOpened: drainOpened, fold: fold, installedNote: installedNote,
-    env: () => ({ installed: installedApp(), apple: onApple() }), noPushWords: noPushWords, turnOnFailed: turnOnFailed, subscribeLost: SUBSCRIBE_LOST };
+    env: () => ({ installed: installedApp(), apple: onApple() }), noPushWords: noPushWords, testWords: testWords, turnOnFailed: turnOnFailed, subscribeLost: SUBSCRIBE_LOST };
 
   document.addEventListener("visibilitychange", () => { if (document.visibilityState === "visible") drainOpened(); });
   if ("serviceWorker" in navigator) {

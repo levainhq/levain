@@ -2607,6 +2607,7 @@ body.ke [data-ck-panel="tray"] .row .verb-actions > .verb-btn[data-verb="spore_d
 .dev-confirm-acts .dev-btn { min-height: var(--hit-min, 44px); text-align: center; }
 .dev-safe { background: var(--card); border-color: var(--text); }
 .dev-danger { color: var(--bad); border-color: var(--bad); }
+.dev-pings { flex-wrap: wrap; }
 .dev-linkbtn { display: block; margin: var(--sp-3) 0 0; padding: var(--sp-2) 0; min-height: var(--hit-min, 44px); background: none; border: 0; color: var(--label); font: var(--fw-regular) var(--fs-meta) var(--sans); text-decoration: underline; cursor: pointer; }
 .dev-link { margin-top: var(--sp-5); padding: var(--sp-4) var(--sp-5); border: 1px dashed var(--hair-2); border-radius: var(--r-md); }
 .dev-link[hidden], .dev-note[hidden] { display: none; }
