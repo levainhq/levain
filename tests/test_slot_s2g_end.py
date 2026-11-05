@@ -81,7 +81,7 @@ def silent_run_as(uid, gid, fn, wfd, keep=()):
 
 def test_emptied_repo_with_root_marker_is_retained(tmp_path):
     """The agent empties <S>/repo before END; root's marker says the clone ran, so the tree is retained
-    (and <S> + the var-folders dir leave the slot's reach), never "never cloned"."""
+    (and <S> leaves the slot's reach, the var-folders dir is emptied to its skeleton), never "never cloned"."""
     w = World(tmp_path, uchg=False)
     for p in sorted((w.S / "repo").rglob("*"), reverse=True):
         p.rmdir() if p.is_dir() and not p.is_symlink() else p.unlink()
@@ -89,7 +89,8 @@ def test_emptied_repo_with_root_marker_is_retained(tmp_path):
     ctl = Control()
     assert end_session(w.facts, w.seams(ctl), record_state=REVOKED) == RETAINED
     assert w.facts.tree.is_dir() and (w.facts.tree / "config" / "claude" / "settings.local.json").exists()
-    assert not w.facts.live.exists() and not w.vf.exists()
+    assert not w.facts.live.exists() and sorted(os.listdir(w.vf)) == ["C", "T"]   # 1105-10 endvf: left in place
+    assert not os.listdir(w.vf / "C") and not os.listdir(w.vf / "T")
     assert ctl.history[-1][1]["manifest"]["entries"] > 0
 
 

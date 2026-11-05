@@ -3,7 +3,9 @@
 ``REVOKED -> FROZEN -> DEAD -> CREDENTIAL_PARKED -> RETAINED``. Ending a session never deletes its
 work (plan §2f): the session tree is renamed, whole, into ``L/retained/<session>/tree/`` after its
 manifest and metadata are durable, then neutralized in place (flags, ACLs, xattrs and setuid/setgid
-stripped, owner root). Any step that is not PROVEN moves the record to HELD with ``failed_step``; the
+stripped, owner root). One child is the exception (1105-10 endvf): macOS's per-user ``/var/folders`` dir, which SIP
+pins in place, is COPIED to ``tree/.levain-var-folders`` (the bytes the manifest hashed), then emptied in place and
+proven to hold only its empty skeleton (:data:`VAR_FOLDERS_SKELETON`). Any step that is not PROVEN moves the record to HELD with ``failed_step``; the
 tree is never touched by a failure path, and a retry resumes idempotently.
 
 Root acts only on alloc facts, its own intent journal, its own slot state file and a live check
@@ -51,6 +53,7 @@ import fcntl
 import hashlib
 import os
 import secrets
+import shutil
 import stat
 import struct
 import sys
@@ -152,6 +155,21 @@ UNCONFIRMED = "unconfirmed"
 #: DECISION: a ``levain-baseline/1`` file is five short fields; one past this is not root's baseline.
 BASELINE_MAX_BYTES = 4096
 VAR_FOLDERS_NAME = b".levain-var-folders"     # CONTRACT §7.4: macOS /private/var/folders/<slot>
+#: 1105-10 endvf (DESIGN_end_var_folders (f)): the skeleton dirhelper makes in a per-user var-folders dir. Measured
+#: 2026-11-05 on macOS 15.7.7, SIP on (RETURN_vmsunlnk 060/061): the dir and each of these carry ``sunlnk`` +
+#: ``com.apple.rootless`` from creation, and root could not clear the flag, rename, rmdir or ``rm -rf`` them; a plain
+#: file a session wrote inside WAS unlinked. So END copies what it finds, empties the dir in place, and accepts only
+#: these names, each an empty directory, as what is left. A dated observation of one OS version, not a law.
+VAR_FOLDERS_SKELETON = frozenset({b"0", b"C", b"T", b"X"})
+#: ``L/retained/<s>/vfcopy/``: the manifest step's copy of the var-folders dir (its dirs, and every regular file's
+#: bytes as hashed for the manifest), renamed into ``tree/.levain-var-folders`` by the tree step.
+VFCOPY = "vfcopy"
+#: ``L/retained/<s>/vfkeys.jsonl``: the originals the copy holds, by (path, dev, ino), so the tree step unlinks only an
+#: entry whose bytes were copied; a root working file removed by the ``commit`` step, as :data:`CLASSES` is.
+VFKEYS = "vfkeys.jsonl"
+#: The errnos of an unlink / rmdir under the var-folders dir that leave the entry for the skeleton proof to name
+#: (``var-folders-residue``, HELD for a person): flagged (EPERM / EACCES), or a dir holding something not copied.
+_VF_LEFT = frozenset({errno.EPERM, errno.EACCES, errno.ENOTEMPTY, errno.EEXIST, errno.ENOENT})
 
 #: The refusals that mean "past the manifest budget": HELD ``failed_step:"manifest_budget"``, whose
 #: exit is END again with larger caps (§7.3 force-retire a).
@@ -419,8 +437,8 @@ def walk(root: Path, extra: Mapping[bytes, Path] | None = None, *,
     """Every entry under ``root`` (not ``root`` itself), depth first, a directory before its children,
     names in byte order; never follows a link (each directory opened ``O_NOFOLLOW`` from its parent's
     fd and checked against the ``lstat`` that named it). ``extra`` adds root children that live
-    elsewhere (macOS ``/var/folders/<slot>``, walked as ``.levain-var-folders`` before it is moved
-    there); an absent one is skipped, a present one must be a real directory, and a name the tree
+    elsewhere (macOS ``/var/folders/<slot>``, walked as ``.levain-var-folders``, the name its copy takes in
+    the retained tree); an absent one is skipped, a present one must be a real directory, and a name the tree
     already has is ``retain-conflict``. An entry on another filesystem than its directory (a mount inside
     the tree, L2 L12) refuses ``tree-mount``: root never walks, strips or chowns into one.
 
@@ -579,24 +597,27 @@ class _Budget:
         self.tick()
 
 
-def _hash_fd(fd: int, budget: _Budget) -> tuple[int, str]:
+def _hash_fd(fd: int, budget: _Budget, out: int | None = None) -> tuple[int, str]:
+    """``fd``'s bytes hashed, and written to ``out`` as read when given: a copy is exactly the bytes hashed."""
     h, n = hashlib.sha256(), 0
     while True:
         chunk = os.read(fd, _CHUNK)
         if not chunk:
             break
+        if out is not None:
+            write_all(out, chunk)
         h.update(chunk)
         n += len(chunk)
         budget.tick()
     return n, "sha256:" + h.hexdigest()
 
 
-def _hash_file(e: Entry, budget: _Budget) -> tuple[int, str]:
+def _hash_file(e: Entry, budget: _Budget, out: int | None = None) -> tuple[int, str]:
     fd = os.open(e.name, _O_ENTRY, dir_fd=e.dirfd)
     try:
         if not _same(os.fstat(fd), e.st):
             raise Refused("tree-changed", f"{e.path!r} changed under the walk")
-        return _hash_fd(fd, budget)
+        return _hash_fd(fd, budget, out)
     finally:
         os.close(fd)
 
@@ -667,7 +688,7 @@ ForeignRead = Callable[[Entry, _Budget], "tuple[int, str]"]
 def iter_manifest(root: Path, *, extra: Mapping[bytes, Path] | None = None, caps: Caps = Caps(),
                   clock: Callable[[], float] = time.monotonic, credentials: Collection[bytes] = (),
                   skip_credentials: bool = False, foreign: Collection[tuple[int, int]] = (),
-                  read_foreign: ForeignRead | None = None) -> Iterator[dict]:
+                  read_foreign: ForeignRead | None = None, budget: _Budget | None = None) -> Iterator[dict]:
     """The manifest records of the tree, in walk order: ``{path_b64, type, mode, size, nlink, digest}``
     (``mode`` = the permission bits, ``stat.S_IMODE``; a file's digest is over its bytes, a link's over
     its ``readlink`` target bytes; a dir / fifo / socket / device: size 0, digest ""). The inode, time
@@ -677,8 +698,11 @@ def iter_manifest(root: Path, *, extra: Mapping[bytes, Path] | None = None, caps
     plan §2g 3); one still there refuses ``credential-not-parked`` (END parks first, so the manifest never
     holds it), and ``skip_credentials`` leaves it out instead, for a snapshot of a live tree. ``foreign``:
     the inodes some of whose links lie outside the tree; root never opens one, ``read_foreign`` (the
-    session-uid reader) hashes it (L2 H2), and :data:`UNREAD` is what it records for one it cannot read."""
-    budget = _Budget(caps, clock)
+    session-uid reader) hashes it (L2 H2), and :data:`UNREAD` is what it records for one it cannot read.
+    ``budget``: the caller's (END's manifest step, whose var-folders scan already ran on its deadline); else a new
+    one from ``caps`` and ``clock``."""
+    if budget is None:
+        budget = _Budget(caps, clock)
     creds = frozenset(credentials)
     foreign = frozenset(foreign)
     for e in walk(root, extra, depth_cap=caps.depth):
@@ -1008,6 +1032,202 @@ def _clear_linkcopy(facts: EndFacts, seams: "EndSeams") -> None:
         os.close(fd)
     os.rmdir(d)
     fsync_dir(facts.retained)
+
+
+# --- the var-folders dir (1105-10 endvf, DESIGN_end_var_folders (e)+(f)+(g)) ---------------------------------------
+
+
+def var_folders_preflight(facts: EndFacts) -> os.stat_result | None:
+    """(g) The var-folders dir as END may act on it, checked before anything moves (the manifest step, and the tree
+    step BEFORE its first rename, so a refusal leaves no half-moved tree): ``None`` when there is none (Linux, or
+    absent); else a real directory (``var-folders-not-dir``: a symlink included, never followed) that one of the
+    session's uids owns (``var-folders-foreign``), on its parent's filesystem (``var-folders-mount``)."""
+    vf = facts.var_folders
+    if vf is None:
+        return None
+    try:
+        st = os.lstat(vf)
+    except FileNotFoundError:
+        return None
+    if not stat.S_ISDIR(st.st_mode):
+        raise Refused("var-folders-not-dir", str(vf))
+    if st.st_uid not in facts.uids:
+        raise Refused("var-folders-foreign", f"{vf} is owned by uid {st.st_uid}")
+    if st.st_dev != os.lstat(vf.parent).st_dev:
+        raise Refused("var-folders-mount", f"{vf} is on another filesystem than its parent")
+    return st
+
+
+def _scan_var_folders(vf: Path, depth_cap: int, budget: "_Budget") -> list[tuple[bytes, os.stat_result]]:
+    """Every entry under ``vf`` (relative path, lstat), in walk order. Only directories and single-link regular files
+    may be there: a symlink, a hard link, a device, fifo or socket refuses ``var-folders-special``, named, before a
+    byte is copied or anything moves. END never follows, opens or copies one; a person looks.
+
+    L3 r1 (codex 3): each entry counts against the manifest step's ``budget`` AS it is scanned, so a scratch tree past
+    the inode or time cap refuses ``manifest-inode-cap`` / ``manifest-time-cap`` with at most ``caps.inodes`` entries
+    held, never the whole tree in memory first."""
+    out: list[tuple[bytes, os.stat_result]] = []
+    for e in walk(vf, depth_cap=depth_cap):
+        budget.entry()
+        m = e.st.st_mode
+        if stat.S_ISDIR(m) or (stat.S_ISREG(m) and e.st.st_nlink == 1):
+            out.append((e.path, e.st))
+            continue
+        what = "hard link" if stat.S_ISREG(m) else entry_type(m)
+        raise Refused("var-folders-special", f"{what} {e.path.decode('utf-8', 'replace')}")
+    return out
+
+
+def _clear_vfcopy(facts: EndFacts, seams: "EndSeams") -> None:
+    """Remove the copy and key list an earlier attempt's manifest step left (root's own working files, never work:
+    the originals are untouched until the tree step)."""
+    d = facts.retained / VFCOPY
+    try:
+        st = os.lstat(d)
+    except FileNotFoundError:
+        pass
+    else:
+        if not stat.S_ISDIR(st.st_mode) or not seams.owner_ok(st):
+            raise Refused("bad-root", f"{d} is not a directory with the expected owner")
+        shutil.rmtree(d)
+        fsync_dir(facts.retained)
+    unlink_durable(facts.retained / VFKEYS)
+
+
+def _read_vfkeys(facts: EndFacts) -> frozenset[tuple[bytes, int, int]]:
+    try:
+        raw = _read_durable(facts.retained / VFKEYS)
+    except FileNotFoundError:
+        return frozenset()
+    out = set()
+    for line in raw.splitlines():
+        rec = canon.parse(line)
+        out.add((base64.b64decode(rec["path_b64"]), rec["dev"], rec["ino"]))   # type: ignore[index]
+    return frozenset(out)
+
+
+def _empty_var_folders(facts: EndFacts, depth_cap: int) -> None:
+    """(f) Unlink every original the copy holds (by its walk dirfd, never through a link), then rmdir the dirs the
+    session made, deepest first; the skeleton's own dirs are never touched. An entry that is not in the key list (it
+    appeared after the manifest, so no copy holds it) is left. An unlink / rmdir refused for good (:data:`_VF_LEFT`)
+    leaves the entry for :func:`prove_var_folders_skeleton` to name; any other error raises (HELD, redone)."""
+    vf = facts.var_folders
+    keys = _read_vfkeys(facts)
+    dirs: list[bytes] = []
+    for e in walk(vf, depth_cap=depth_cap):   # type: ignore[arg-type]
+        if (e.path, e.st.st_dev, e.st.st_ino) not in keys:
+            continue
+        if stat.S_ISDIR(e.st.st_mode):
+            if b"/" in e.path or e.path not in VAR_FOLDERS_SKELETON:
+                dirs.append(e.path)
+        elif stat.S_ISREG(e.st.st_mode):
+            # KNOWN EDGE (L3 r1 codex 1, closed by the head): unlink by name after the inode match; a daemon swap between loses scratch cache only.
+            try:
+                os.unlink(e.name, dir_fd=e.dirfd)
+            except OSError as err:
+                if err.errno not in _VF_LEFT:
+                    raise
+    vfd = os.open(vf, _DIR_FLAGS)   # type: ignore[arg-type]
+    try:
+        # DECISION: rmdir by a path relative to the dir's fd: every session uid is dead, the walk above saw no link
+        # (the manifest step refused any), and rmdir removes only an empty directory.
+        for p in reversed(dirs):
+            try:
+                os.rmdir(p, dir_fd=vfd)
+            except OSError as err:
+                if err.errno not in _VF_LEFT:
+                    raise
+    finally:
+        os.close(vfd)
+
+
+def prove_var_folders_skeleton(vf: Path) -> None:
+    """(f) The proof: ``vf`` holds only :data:`VAR_FOLDERS_SKELETON` names, each a real, EMPTY directory, else
+    ``var-folders-residue`` naming the first entry left (HELD: a writer outside the sandbox left something root
+    could not remove, which a person should look at; the next session on the uid never sees it)."""
+    fd = os.open(vf, _DIR_FLAGS)
+    try:
+        for n in sorted(os.fsencode(x) for x in os.listdir(fd)):
+            st = os.stat(n, dir_fd=fd, follow_symlinks=False)
+            if n not in VAR_FOLDERS_SKELETON or not stat.S_ISDIR(st.st_mode):
+                raise Refused("var-folders-residue", n.decode("utf-8", "replace"))
+            cfd = _open_dir_at(n, fd, st)
+            try:
+                left = sorted(os.fsencode(x) for x in os.listdir(cfd))
+            finally:
+                os.close(cfd)
+            if left:
+                raise Refused("var-folders-residue", (n + b"/" + left[0]).decode("utf-8", "replace"))
+    finally:
+        os.close(fd)
+
+
+#: The manifest's ``path_b64`` of every var-folders entry begins with these characters (the first 18 bytes of
+#: :data:`VAR_FOLDERS_NAME`, a whole number of base64 groups): a cheap filter before a line is parsed.
+_VF_B64_PREFIX = _b64(VAR_FOLDERS_NAME[:18]).encode("ascii")
+
+
+def _manifest_var_folders_paths(facts: EndFacts) -> set[bytes]:
+    """The var-folders paths the stored manifest names (the dir itself and every entry under it), streamed line by
+    line; only lines the base64 prefix may match are parsed."""
+    out: set[bytes] = set()
+    sub = VAR_FOLDERS_NAME + b"/"
+    fd = os.open(facts.retained / "manifest.jsonl", os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC)
+    with os.fdopen(fd, "rb") as fh:
+        for line in fh:
+            if _VF_B64_PREFIX not in line:
+                continue
+            p = base64.b64decode(canon.parse(line.rstrip(b"\n"))["path_b64"])   # type: ignore[index]
+            if p == VAR_FOLDERS_NAME or p.startswith(sub):
+                out.add(p)
+    return out
+
+
+def check_var_folders_copy(facts: EndFacts, dest: Path | None = None) -> None:
+    """L3 r1 (codex 2): the invariant between the stored manifest and the var-folders copy. The manifest names
+    ``.levain-var-folders`` exactly when the copy exists (``vfcopy`` in ``retained/``, or ``dest`` once the tree step
+    renamed it there), and then names exactly the paths the copy holds (the key list: every scanned dir, every copied
+    file). The scan, the classification and the manifest are separate walks of a dir an outside daemon can still write,
+    so a dir it made between them (an absent dir's skeleton, a skeleton dir) is in the manifest and not the copy, and a
+    scanned entry gone before the manifest walk is in the copy and not the manifest. Any mismatch refuses
+    ``var-folders-changed``, with nothing moved: the manifest step checks it last (its redo re-scans, re-copies and
+    re-hashes), the tree step before its first rename."""
+    copy = os.path.lexists(facts.retained / VFCOPY) or (dest is not None and os.path.lexists(dest))
+    want: set[bytes] = set()
+    if copy:
+        want = {VAR_FOLDERS_NAME} | {VAR_FOLDERS_NAME + b"/" + p for p, _dev, _ino in _read_vfkeys(facts)}
+    if _manifest_var_folders_paths(facts) != want:
+        raise Refused("var-folders-changed", "the var-folders copy does not match the manifest")
+
+
+def _var_folders_tree_step(facts: EndFacts, tree: Path, depth: int, vroot: os.stat_result | None) -> None:
+    """The tree step's var-folders sub-step: the manifest step's copy renamed into ``tree/.levain-var-folders`` (one
+    rename inside root's own store; a redo whose rename happened fsyncs both parents), then the dir emptied in place
+    and the skeleton proven. The dir itself is never moved: SIP pins it (:data:`VAR_FOLDERS_SKELETON`).
+
+    ``vroot`` is :func:`var_folders_preflight`'s answer from the top of :func:`_tree_step` (every redo runs it, before
+    the first rename); L3 r1 (deepseek 2) dropped a second preflight here, which ran with ``live`` already moved. A dir
+    gone between that preflight and the walk is "none" (complement 2), never a spurious HELD; one still there whose
+    walk hit a vanished entry raises as before (HELD, redone)."""
+    vcopy = facts.retained / VFCOPY
+    dest = tree / os.fsdecode(VAR_FOLDERS_NAME)
+    if os.path.lexists(vcopy):
+        if os.path.lexists(dest):
+            raise Refused("retain-conflict", f"{vcopy} and {dest} both exist")
+        _rename_durable(vcopy, dest)
+    elif os.path.isdir(dest) and not os.path.islink(dest):
+        fsync_dir(facts.retained)
+        fsync_dir(tree)
+    if vroot is None:
+        return
+    vf: Path = facts.var_folders   # type: ignore[assignment]
+    try:
+        _empty_var_folders(facts, depth - 1)
+        prove_var_folders_skeleton(vf)
+    except FileNotFoundError:
+        if os.path.lexists(vf):
+            raise
+        return
 
 
 # --- metadata (levain-retention-meta/1): per-OS readers and strips, every call on an fd --------------
@@ -1542,25 +1762,69 @@ def _manifest_step(facts: EndFacts, seams: EndSeams, caps: Caps) -> None:
     files no session uid may read by design, are hashed by root; their class stays UNOWNED, so the meta and tree
     steps treat them as before. The copy cap is checked
     before anything is read, and is ONE budget across every reader: each gets only what the reads before it
-    left (codex r1 8), so files an outside holder grows after the sum cannot stage past it."""
+    left (codex r1 8), so files an outside holder grows after the sum cannot stage past it.
+
+    1105-10 endvf (DESIGN_end_var_folders (f)): the var-folders dir is checked (:func:`var_folders_preflight`,
+    :func:`_scan_var_folders`: a special entry refuses here, before anything moves) and copied into
+    ``L/retained/<s>/vfcopy/`` as it is hashed: a session-owned file by root, an UNOWNED one by the session-uid reader
+    (never root's bytes for a file no session uid can read). Its bytes count against the same copy cap. The copied
+    originals are listed in ``vfkeys.jsonl`` for the tree step, which alone unlinks them. The scan counts against the
+    manifest's own inode / time budget as it goes (L3 r1 codex 3), and the step ends by checking the copy against the
+    manifest it wrote (:func:`check_var_folders_copy`, codex 2): a mismatch is HELD here, and the redo re-derives both."""
+    budget = _Budget(caps, seams.clock)
+    vroot = var_folders_preflight(facts)
+    scan: list[tuple[bytes, os.stat_result]] = []
+    if vroot is not None:
+        try:
+            scan = _scan_var_folders(facts.var_folders, caps.depth - 1, budget)  # type: ignore[arg-type]
+        except FileNotFoundError:
+            if os.path.lexists(facts.var_folders):   # type: ignore[arg-type]
+                raise
+            vroot = None   # gone since the preflight (complement 2): none; the copy check below sees the manifest's
+    # The manifest walk counts these entries again, with the rest of the tree; the deadline keeps running.
+    budget.entries = 0
     classes, outside = classify(facts.live, facts.extra, facts.uids, depth_cap=caps.depth)
-    copy = outside_link_bytes(outside)
+    copy = outside_link_bytes(outside) + sum(st.st_size for _, st in scan if stat.S_ISREG(st.st_mode))
     if copy > caps.link_copy_bytes:
-        raise Refused("link-copy-cap", f"{copy} bytes hard-linked outside the tree > {caps.link_copy_bytes}")
+        raise Refused("link-copy-cap", f"{copy} bytes to copy (outside links, var-folders) > {caps.link_copy_bytes}")
     _clear_linkcopy(facts, seams)
+    _clear_vfcopy(facts, seams)
     _write_classes(facts.retained / CLASSES, classes, caps.meta_bytes, caps.depth)
-    sfd = -1
-    if outside:
-        os.mkdir(facts.retained / LINKCOPY, 0o700)
-        fsync_dir(facts.retained)
-        sfd = os.open(facts.retained / LINKCOPY, _DIR_FLAGS)
+    vcopy = os.fsencode(facts.retained / VFCOPY)
+    vf_files: dict[tuple[int, int], bytes] = {}
     staged: dict[tuple[int, int], tuple[int, str]] = {}
     copied = 0
+
+    def stage_var_folders(e: Entry, key: tuple[int, int], budget: _Budget) -> tuple[int, str]:
+        nonlocal copied
+        rel = vf_files[key]
+        if e.path != VAR_FOLDERS_NAME + b"/" + rel:
+            raise Refused("tree-changed", f"{e.abspath!r} is not the var-folders entry scanned")
+        out = os.open(vcopy + b"/" + rel, _O_NEW, 0o600)
+        try:
+            if classes.get(key) == UNOWNED:
+                got = read_as_session(facts, seams, e, out, caps.link_copy_bytes - copied, budget)
+                if got == UNREAD:
+                    raise Refused("unowned-unreadable", f"{e.abspath!r}: no session uid can read it, so it is "
+                                                        f"not copied")
+            else:
+                got = _hash_file(e, budget, out)
+            os.fchmod(out, stat.S_IMODE(e.st.st_mode) & ~_SETID)
+            os.fsync(out)
+        finally:
+            os.close(out)
+        copied += got[0]
+        if copied > caps.link_copy_bytes:
+            raise Refused("link-copy-cap", f"{e.abspath!r}: the copies passed {caps.link_copy_bytes} bytes")
+        return got
 
     def read_foreign(e: Entry, budget: _Budget) -> tuple[int, str]:
         nonlocal copied
         key = (e.st.st_dev, e.st.st_ino)
         if key not in staged:
+            if key in vf_files:
+                staged[key] = stage_var_folders(e, key, budget)
+                return staged[key]
             if classes[key] == OUTSIDE:
                 out = os.open(_staged_name(key), _O_NEW, 0o600, dir_fd=sfd)
                 try:
@@ -1586,17 +1850,57 @@ def _manifest_step(facts: EndFacts, seams: EndSeams, caps: Caps) -> None:
             staged[key] = got
         return staged[key]
 
+    # L3 r1 (codex 5): everything after ``sfd`` opens is inside the ``finally`` that closes it, so a failing mkdir of
+    # the copy (ENAMETOOLONG, ENOSPC, EACCES) on a ~31 s retry cannot leak one fd per attempt.
+    sfd = -1
     try:
+        if outside:
+            os.mkdir(facts.retained / LINKCOPY, 0o700)
+            fsync_dir(facts.retained)
+            sfd = os.open(facts.retained / LINKCOPY, _DIR_FLAGS)
+        if vroot is not None:
+            os.mkdir(vcopy, 0o700)
+            for rel, st in scan:
+                if stat.S_ISDIR(st.st_mode):
+                    os.mkdir(vcopy + b"/" + rel, 0o700)   # 0700 while it fills; its own mode once full
+                else:
+                    vf_files[(st.st_dev, st.st_ino)] = rel
         _stream_jsonl(facts.retained / "manifest.jsonl",
                       iter_manifest(facts.live, extra=facts.extra, caps=caps, clock=seams.clock,
-                                    credentials=facts.parked_paths, foreign=classes, read_foreign=read_foreign),
+                                    credentials=facts.parked_paths, foreign=set(classes) | set(vf_files),
+                                    read_foreign=read_foreign, budget=budget),
                       caps.manifest_bytes, "manifest-byte-cap")
         if sfd >= 0:
             os.fsync(sfd)
     finally:
         if sfd >= 0:
             os.close(sfd)
+    if vroot is not None:
+        _seal_vfcopy(facts, vcopy, vroot, scan, {k for k in vf_files if k in staged}, caps)
+    check_var_folders_copy(facts)
     seams.fault("retain:manifest:written")
+
+
+def _seal_vfcopy(facts: EndFacts, vcopy: bytes, vroot: os.stat_result, scan: list[tuple[bytes, os.stat_result]],
+                 copied: Collection[tuple[int, int]], caps: Caps) -> None:
+    """The copy's dirs durable and given their originals' modes (less setuid / setgid, deepest first, the root
+    last), then the key list: every scanned dir and every file whose bytes were copied, by (path, dev, ino). The key
+    list is capped by the manifest's byte cap (``manifest-byte-cap``, L3 r1 complement 3): it lists a subset of the
+    manifest's entries, never metadata. The scan is in walk order (a dir before its children), so its reverse is
+    deepest first, and the root goes after all of it (L3 r1 deepseek 3: it used to go first)."""
+    for rel, st in reversed([(b"", vroot)] + [(r, s) for r, s in scan if stat.S_ISDIR(s.st_mode)]):
+        p = vcopy + b"/" + rel if rel else vcopy
+        fd = os.open(p, _DIR_FLAGS)
+        try:
+            os.fchmod(fd, stat.S_IMODE(st.st_mode) & ~_SETID)
+            os.fsync(fd)
+        finally:
+            os.close(fd)
+    fsync_dir(facts.retained)
+    keep = [(rel, st) for rel, st in scan if stat.S_ISDIR(st.st_mode) or (st.st_dev, st.st_ino) in copied]
+    _stream_jsonl(facts.retained / VFKEYS,
+                  iter({"path_b64": _b64(rel), "dev": st.st_dev, "ino": st.st_ino} for rel, st in keep),
+                  caps.manifest_bytes, "manifest-byte-cap")
 
 
 def _meta_step(facts: EndFacts, seams: EndSeams, caps: Caps) -> None:
@@ -1642,7 +1946,7 @@ def _rename_durable(src: Path, dst: Path) -> None:
 
 
 def _tree_step(facts: EndFacts, seams: EndSeams) -> None:
-    """Rename the session's work into ``tree/`` (and macOS ``/var/folders/<slot>`` into
+    """Rename the session's work into ``tree/`` (and place the copy of macOS ``/var/folders/<slot>`` at
     ``tree/.levain-var-folders/``), link the staged copies over the outside-linked files, strip (setuid /
     setgid included), then chown root, then flush it all (:attr:`EndSeams.sync`) before the journal may
     leave ``tree`` (codex r1 5). Each sub-step is idempotent; a redo whose rename already happened still
@@ -1652,9 +1956,16 @@ def _tree_step(facts: EndFacts, seams: EndSeams) -> None:
     non-regular one refuses ``tree-shared-special`` (comp r1 4). An :data:`UNOWNED` inode has only its
     setuid / setgid cleared, by fd: root reads none of its metadata (codex r1 4). Every walk takes the depth the
     manifest step accepted, so no depth refusal can land on a renamed tree; the classification is read before
-    the rename, so a missing one refuses with nothing moved."""
+    the rename, so a missing one refuses with nothing moved.
+
+    1105-10 endvf: the var-folders dir is NOT renamed (SIP pins it, :data:`VAR_FOLDERS_SKELETON`). Its checks
+    (:func:`var_folders_preflight`, :func:`check_var_folders_copy`) run before the first rename, so a refusal leaves
+    ``live/<s>`` unmoved; after it, :func:`_var_folders_tree_step` places the manifest step's copy, empties the dir in
+    place and proves the skeleton."""
     classes, depth = stored_classification(facts)
+    vroot = var_folders_preflight(facts)
     tree = facts.tree
+    check_var_folders_copy(facts, tree / os.fsdecode(VAR_FOLDERS_NAME))
     if os.path.lexists(facts.live):
         if os.path.lexists(tree):
             raise Refused("retain-conflict", f"{facts.live} and {tree} both exist")
@@ -1666,22 +1977,7 @@ def _tree_step(facts: EndFacts, seams: EndSeams) -> None:
         fsync_dir(tree.parent)
     seams.fault("retain:tree:renamed")
 
-    vf = facts.var_folders
-    dest = tree / os.fsdecode(VAR_FOLDERS_NAME)
-    if vf is not None and os.path.lexists(vf):
-        if os.path.lexists(dest):
-            raise Refused("retain-conflict", f"{vf} and {dest} both exist")
-        st = os.lstat(vf)
-        if getattr(st, "st_flags", 0):   # an immutable dir cannot be renamed; its flags are in meta
-            try:
-                os.chflags(vf, 0, follow_symlinks=False)
-            except OSError as e:
-                seams.note(f"strip {vf}: flags not cleared ({e.strerror or e})")
-        _rename_durable(vf, dest)
-    elif vf is not None and os.path.isdir(dest) and not os.path.islink(dest):
-        if os.path.isdir(vf.parent):
-            fsync_dir(vf.parent)
-        fsync_dir(dest.parent)
+    _var_folders_tree_step(facts, tree, depth, vroot)
     seams.fault("retain:tree:var-folders")
 
     # DECISION: the outside-link copies are placed before the strip (§7.4 names rename, strip, fchown),
@@ -1736,6 +2032,7 @@ def _commit_step(facts: EndFacts, seams: EndSeams) -> None:
     past ``tree`` (forward only), so no step that reads it can run again, and the retained object is §7.4's
     list exactly."""
     unlink_durable(facts.retained / CLASSES)
+    unlink_durable(facts.retained / VFKEYS)
     p = facts.retained / "retained_at"
     if not os.path.lexists(p):
         atomic_write(p, (seams.now() + "\n").encode("ascii"), 0o644)
@@ -2543,7 +2840,8 @@ __all__ = ["BUDGET_REFUSALS", "CAS_RETRY_SECONDS", "CLASSES", "CREDENTIALS", "CR
            "CasNotSent", "DEAD", "END_STEPS", "EndFacts", "EndSeams", "Entry", "FROZEN", "HELD", "LINKCOPY",
            "LINK_COPY_BYTES", "MANIFEST_FORMAT", "META_FORMAT", "OBJECT_FORMAT", "REVOKED", "RETAINED", "Reserve",
            "UNREAD", "V12_SECONDS", "V14_BYTES", "V17_MANIFEST_BYTES", "V17_META_BYTES", "V1_INODES", "V2_SECONDS",
-           "V5_FLOOR_BYTES", "VAR_FOLDERS_NAME", "check_slot_ours", "cloned_path", "darwin_meta", "darwin_strip",
+           "V5_FLOOR_BYTES", "VAR_FOLDERS_NAME", "VAR_FOLDERS_SKELETON", "VFCOPY", "VFKEYS",
+           "prove_var_folders_skeleton", "var_folders_preflight", "check_slot_ours", "cloned_path", "darwin_meta", "darwin_strip",
            "default_meta_reader", "default_strip", "digest_bytes", "end_lock", "end_session", "entry_type",
            "facts_from_alloc", "foreign_links", "fork_run_as", "iter_manifest", "iter_meta", "keep_shape_ok",
            "linux_meta", "linux_strip", "mark_cloned", "object_record", "os_chown", "outside_link_bytes",
