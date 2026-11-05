@@ -452,6 +452,36 @@ function fire(type, ev) {
     net = 'ok';
     await send('/', 'navigate', 'document');
     await send(m.cached, 'no-cors', kindOf(m.cached));
+  } else if (scenario === 'navoff') {
+    // the navigation-offline flag against a fake clock. mode: JSON {shellHtml, cached, cachedCtype?, ops}; each op is
+    // {t, url, nav?, net: 'down'|'ok'}: at fake time t (ms), request url (a navigation when nav) with the network down or up.
+    // Steps record {url, status, body, net} where net is the number of network calls that step made.
+    const m = JSON.parse(mode);
+    const shellName = 'levain-shell-v' + /SW_VERSION = '([^']+)'/.exec(fs.readFileSync(swPath, 'utf8'))[1];
+    cacheStores.set(shellName, new Map([['/', m.shellHtml], [m.cached, 'CACHED ' + m.cached]])); cacheNames.add(shellName);
+    if (m.cachedCtype) cacheCtypes.set(shellName + '|' + m.cached, m.cachedCtype);
+    let clock = 1_000_000, net = 'ok', calls = 0;
+    sandbox.Date = { now: () => clock };
+    sandbox.fetch = async (req) => {
+      calls += 1;
+      if (net === 'down') throw new TypeError('network down');
+      const p = new URL(req.url, 'https://box.example'), key = p.pathname + p.search;
+      if (key === '/') return new Response('<html>live</html>', { status: 200, headers: { 'content-type': 'text/html' } });
+      return new Response('LIVE ' + key, { status: 200, headers: { 'content-type': /\.css/.test(key) ? 'text/css' : 'application/javascript' } });
+    };
+    log.steps = [];
+    for (const op of m.ops) {
+      clock = 1_000_000 + op.t; net = op.net;
+      const before = calls;
+      const ev = { request: { url: 'https://box.example' + op.url, method: 'GET', mode: op.nav ? 'navigate' : 'no-cors', destination: op.nav ? 'document' : (/\.css/.test(op.url) ? 'style' : 'script') } };
+      let handed = null; const waits = [];
+      ev.respondWith = (p) => { handed = Promise.resolve(p); };
+      ev.waitUntil = (p) => { waits.push(Promise.resolve(p)); };
+      for (const fn of listeners.fetch || []) fn(ev);
+      const r = await handed;
+      log.steps.push({ url: op.url, status: r.status, body: r.status ? await r.text() : null, net: calls - before });
+      await Promise.all(waits);
+    }
   }
   console.log(JSON.stringify(log));
   if (scenario === 'hold') process.exit(0);
