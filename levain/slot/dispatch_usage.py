@@ -15,11 +15,8 @@ settles a None at the caps, the safe side. Nothing here raises. The readers are 
 without a broker, a front or a root-owned store (the real ones are the S10d residue, U-A1)."""
 from __future__ import annotations
 
-import json
-import os
-import stat
 from collections.abc import Mapping
-from typing import Any, Callable, List, Optional
+from typing import Any, Callable, Optional
 
 __all__ = ["DispatchUsageSources"]
 
@@ -29,48 +26,13 @@ def _count(v: object) -> Optional[int]:
 
 
 def _default_read_total(path: object, session: str) -> Optional[int]:
-    """The session's OWN final ``passthrough_total`` in a slot tunnel log. The log (``L/gw/slot<n>/``) is per SLOT and
-    append-only, so a reused slot holds several sessions' records; every front record carries its ``session``, and
-    :func:`read_passthrough_total` (which takes the last tunnel line of any session) would hand back another session's
-    total. Same file discipline and record format as that helper (last 1 MiB of a regular non-symlink file, first
-    partial line dropped, ``event`` ``tunnel``, int ``passthrough_total`` in 0..2**63-1), searched BACKWARD for the
-    last record whose ``session`` equals ``session``. None when absent."""
-    from levain.slot.runtime_helper import _INT64_MAX, _PASSTHROUGH_TAIL_BYTES
-    try:
-        fd = os.open(path, os.O_RDONLY | os.O_NONBLOCK | os.O_NOFOLLOW | os.O_CLOEXEC)  # type: ignore[call-overload]
-        try:
-            st = os.fstat(fd)
-            if not stat.S_ISREG(st.st_mode):
-                return None
-            off = max(0, st.st_size - _PASSTHROUGH_TAIL_BYTES)
-            if off:
-                os.lseek(fd, off, os.SEEK_SET)
-            chunks: List[bytes] = []
-            left = _PASSTHROUGH_TAIL_BYTES + 1
-            while left > 0:
-                c = os.read(fd, min(left, 1 << 16))
-                if not c:
-                    break
-                chunks.append(c)
-                left -= len(c)
-        finally:
-            os.close(fd)
-    except (OSError, TypeError, ValueError):
-        return None
-    lines = b"".join(chunks).split(b"\n")
-    if off:
-        lines = lines[1:]
-    for line in reversed(lines):
-        try:
-            rec = json.loads(line)
-        except (ValueError, RecursionError):
-            continue
-        if not isinstance(rec, dict) or rec.get("event") != "tunnel" or rec.get("session") != session:
-            continue
-        v = rec.get("passthrough_total")
-        if type(v) is int and 0 <= v <= _INT64_MAX:
-            return v
-    return None
+    """The session's OWN final ``passthrough_total`` in a slot tunnel log: the one reader now lives in
+    ``levain.slot.runtime_helper`` (:func:`~levain.slot.runtime_helper.read_session_total`); this is its re-import
+    under the S10d name, opening ``path`` with ``O_NOFOLLOW`` at the leaf only. Root's END does NOT use this path
+    reader: it uses :func:`~levain.slot.runtime_helper.read_session_tunnel_total` (the trusted walk), and a new caller
+    resolving a slot log should too. None when absent."""
+    from levain.slot.runtime_helper import read_session_total
+    return read_session_total(path, session)
 
 
 class DispatchUsageSources:

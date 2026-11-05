@@ -50,6 +50,7 @@ Nothing imports this module from an entry point, and :class:`~levain.agents.sess
 """
 from __future__ import annotations
 
+import contextlib
 import fcntl
 import hashlib
 import json
@@ -60,7 +61,7 @@ import secrets
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Callable, Mapping, Protocol, runtime_checkable
+from typing import Any, Callable, Iterator, Mapping, Protocol, runtime_checkable
 
 from levain.agents import controller as _ctl
 from levain.agents.accounting import StopResult, Usage
@@ -311,9 +312,7 @@ class SessionIndex:
         wins (the other then reads the winner's record, which is not retakable)."""
         if self.create(key, state, **fields):
             return True
-        lock = os.open(self.dir / f".{key}.lock", os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW | os.O_CLOEXEC, 0o600)
-        try:
-            fcntl.flock(lock, fcntl.LOCK_EX)
+        with self.locked(key):
             try:
                 rec = self.get(key)
             except ValueError:
@@ -324,12 +323,38 @@ class SessionIndex:
                 return False
             self.put(key, state, **fields)
             return True
+
+    @contextlib.contextmanager
+    def locked(self, key: str) -> Iterator[None]:
+        """The key's exclusive ``flock`` (``.<key>.lock``): :meth:`claim`'s retakes and the END's ``ended`` write
+        (:meth:`RealLauncher._mark_ended`) read-then-write under it. Not re-entrant: a holder never takes it again."""
+        self._path(key)                                  # the key grammar, before a lock file is named after it
+        self.dir.mkdir(parents=True, exist_ok=True)
+        lock = os.open(self.dir / f".{key}.lock", os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW | os.O_CLOEXEC, 0o600)
+        try:
+            fcntl.flock(lock, fcntl.LOCK_EX)
+            yield
         finally:
             os.close(lock)
 
+    def transition(self, key: str, from_states: tuple[str, ...], state: str, **fields: Any) -> str | None:
+        """:meth:`put`, only while the record is in one of ``from_states``: the read and the write are one step under
+        the key's lock, so a concurrent END's ``ended`` (written under the same lock, :meth:`RealLauncher._mark_ended`)
+        is never replaced by a spawn's non-terminal write. None when written; else the state found (``"absent"`` for
+        no record). A record that does not read raises, as :meth:`get` does."""
+        with self.locked(key):
+            rec = self.get(key)
+            if rec is None:
+                return "absent"
+            if rec["state"] not in from_states:
+                return str(rec["state"])
+            self.put(key, state, **fields)
+            return None
+
     def put(self, key: str, state: str, **fields: Any) -> None:
         """Write the record under ``key`` whole (replacing), durably. Only the spawn that CREATED a key's record (or
-        retook it, :meth:`claim`), and the END that proves its session gone, replace it."""
+        retook it, :meth:`claim`), and the END that proves its session gone, replace it; the spawn's writes after the
+        mint go through :meth:`transition`."""
         path, tmp = self._temp(key, state, fields)
         try:
             os.replace(tmp, path)
@@ -341,6 +366,11 @@ class SessionIndex:
 
 def _count(v: object) -> int | None:
     return v if type(v) is int and v >= 0 else None
+
+
+def _count_i64(v: object) -> int | None:
+    """A published tunnel total: an int in 0..2**63-1, else None."""
+    return v if type(v) is int and 0 <= v <= 2**63 - 1 else None
 
 
 _monotonic = time.monotonic
@@ -533,7 +563,10 @@ class RealLauncher:
         # with CONTROL's ceiling behind it
         ticket, run_id = self._mint(key, facts)
         try:
-            self.index.put(key, "minted", occurrence_id=launch.occurrence_id, run_id=run_id, created_s=self.clock())
+            found = self.index.transition(key, ("pending",), "minted", occurrence_id=launch.occurrence_id,
+                                          run_id=run_id, created_s=self.clock())
+            if found is not None:
+                raise RuntimeError(f"the index record left pending ({found}) before the start")
             handle = self.runtime.start(SlotStart(ticket, run_id, key, launch.harness, launch.model, launch.brief,
                                                    str(facts["brief_digest"]), HOOKS))
         except Exception as exc:
@@ -550,8 +583,12 @@ class RealLauncher:
             raise
         session = handle.session
         try:
-            self.index.put(key, "started", occurrence_id=launch.occurrence_id, run_id=run_id, session=session,
-                           started_s=self.clock())
+            # minted -> started only: a concurrent END (a reaper's stop that found the bound session by STATUS) may
+            # already have recorded `ended` with its total, which this write never replaces
+            found = self.index.transition(key, ("minted",), "started", occurrence_id=launch.occurrence_id,
+                                          run_id=run_id, session=session, started_s=self.clock())
+            if found is not None and found != "ended":
+                raise RuntimeError(f"the index record left minted ({found}) during the start")
         except BaseException:
             # the session is live and the index cannot say so: end it, or hold it
             try:
@@ -564,6 +601,15 @@ class RealLauncher:
                 raise
             return HeldChild(self.runtime, session, on_end=lambda: self._mark_ended(key, run_id=run_id, session=session),
                              recorded_ended=lambda: self._ended_on_record(key))
+        if found == "ended":
+            # its END is already proven and recorded: the gated child is closed and the launch is not handed back
+            # as live (the record answers usage and stop)
+            try:
+                handle.child.abort()
+            except Exception:  # noqa: BLE001 - the END is already proven; the local gate is closed best effort
+                pass
+            raise LauncherRefused("session-ended-at-start",
+                                  "a concurrent END proved the session gone before it was recorded started")
         return _Launched(handle.child, self.runtime, session, lambda: self._mark_ended(key),
                          lambda: self._ended_on_record(key))
 
@@ -616,12 +662,16 @@ class RealLauncher:
 
     def _tombstone(self, key: str, state: str, reason: str, *, new: bool = False, **extra: Any) -> None:
         """A zero-usage record. ``new``: only where the key holds no record (a refusal of a key some other spawn
-        holds leaves that spawn's record as it is); else it replaces the record this spawn created."""
+        holds leaves that spawn's record as it is); else it replaces the record this spawn created, and only while
+        that record is still ``pending`` or ``minted`` (a concurrent END's ``ended`` is never replaced by a zero)."""
         try:
             if new:
                 self.index.create(key, state, reason=reason, created_s=self.clock(), **extra)
             else:
-                self.index.put(key, state, reason=reason, created_s=self.clock(), **extra)
+                found = self.index.transition(key, ("pending", "minted"), state, reason=reason,
+                                              created_s=self.clock(), **extra)
+                if found is not None:
+                    _log.warning("no %s record was written for session %s: the record is %s", state, key, found)
         except Exception:  # noqa: BLE001 - an unwritable tombstone reads as unreadable usage, the safe side
             _log.warning("no %s record could be written for session %s", state, key)
 
@@ -717,10 +767,15 @@ class RealLauncher:
                 self._mark_ended(key, occurrence_id=occurrence_id, run_id=run_id, session=session)
                 return None
             try:
-                self.index.put(key, "started", occurrence_id=occurrence_id, run_id=run_id, session=session,
-                               started_s=self.clock())
+                found = self.index.transition(key, ("pending", "minted"), "started", occurrence_id=occurrence_id,
+                                              run_id=run_id, session=session, started_s=self.clock())
             except Exception:  # noqa: BLE001 - the record stays minted: stop() still finds the session by STATUS
+                found = None
                 _log.warning("the held session of %s could not be recorded", key)
+            if found == "ended":
+                return None      # a concurrent END proved it and recorded `ended`: nothing is held
+            if found is not None:
+                _log.warning("the held session of %s was not recorded started: the record is %s", key, found)
             return HeldChild(self.runtime, session,
                              on_end=lambda: self._mark_ended(key, occurrence_id=occurrence_id, run_id=run_id,
                                                              session=session),
@@ -743,17 +798,49 @@ class RealLauncher:
         """S1 END proved the session's group gone: record it ``ended`` (the record's fields, with ``known`` ones such
         as the run id and session over them), so usage reads the sources and a later stop needs no second END. True
         when it is recorded, or there is nothing to record (an ``ended`` record, a zero record, no record); False when
-        the write failed (the record stays as it was, usage reads the caps; the caller retries)."""
+        the write failed (the record stays as it was, usage reads the caps; the caller retries).
+
+        The read and the write are ONE step under the key's lock (:meth:`SessionIndex.locked`), and ``tunnel_bytes``
+        only ever grows onto a record: two launchers stopping one session cannot have the second erase the first's
+        published total. An ``ended`` record that lacks a valid total is enriched by a later writer that has one; an
+        ``ended`` record that has one is never rewritten."""
         try:
-            rec = self.index.get(key)
-            if rec is None or rec["state"] not in ("pending", "minted", "started"):
+            with self.index.locked(key):
+                rec = self.index.get(key)
+                if rec is None:
+                    return True
+                if rec["state"] == "ended":
+                    if _count_i64(rec.get("tunnel_bytes")) is None:
+                        tunnel = self._final_tunnel_bytes(rec.get("session"))
+                        if tunnel is not None:
+                            fields = {k: v for k, v in rec.items() if k not in ("format", "key", "state")}
+                            self.index.put(key, "ended", **{**fields, "tunnel_bytes": tunnel})
+                    return True
+                if rec["state"] not in ("pending", "minted", "started"):
+                    return True
+                fields = {k: v for k, v in rec.items() if k not in ("format", "key", "state")}
+                merged = {**fields, **known, "ended_s": self.clock()}
+                tunnel = self._final_tunnel_bytes(merged.get("session"))
+                if tunnel is not None:
+                    merged["tunnel_bytes"] = tunnel
+                self.index.put(key, "ended", **merged)
                 return True
-            fields = {k: v for k, v in rec.items() if k not in ("format", "key", "state")}
-            self.index.put(key, "ended", **{**fields, **known, "ended_s": self.clock()})
-            return True
         except Exception:  # noqa: BLE001
             _log.warning("the END of session %s could not be recorded", key)
             return False
+
+    def _final_tunnel_bytes(self, session: object) -> int | None:
+        """The final tunnel total root's END published for ``session``, when this launcher's runtime offers it
+        (``final_tunnel_bytes``; a runtime without it, or one that raises, gives None and the key is left off the
+        record, so usage settles at the reservation, the safe side)."""
+        reader = getattr(self.runtime, "final_tunnel_bytes", None)
+        if reader is None or type(session) is not str:
+            return None
+        try:
+            v = reader(session)
+        except Exception:  # noqa: BLE001
+            return None
+        return _count_i64(v)
 
     def _ended_on_record(self, key: str) -> bool:
         """Whether the durable record says a proven END (this launcher's or another's). Read through every time."""

@@ -657,6 +657,166 @@ def read_passthrough_total(log_path: object) -> Optional[int]:
         return None
 
 
+def _tunnel_id_ok(t: object) -> bool:
+    return type(t) is int and 1 <= t <= _INT64_MAX   # type: ignore[operator]
+
+
+def _read_session_total_fd(fd: int, session: str) -> Optional[int]:
+    """The session's OWN final ``passthrough_total`` in an open tunnel log (``fd`` a regular file the caller judged),
+    published only when the log PROVES it final. The log (``L/gw/slot<n>/``) is per SLOT and append-only, so a reused
+    slot holds several sessions' records; only records whose ``session`` equals ``session`` are read.
+
+    A log that can no longer grow is not thereby complete: the front writes a tunnel's ``tunnel`` (close) record
+    only when the tunnel ends, so a tunnel open when the front was killed has none. The front therefore logs a
+    ``tunnel-open`` with a ``tunnel_id`` (1, 2, 3, ... per front) before a passthrough tunnel's first byte is written,
+    and the close carries the same id. The total (the last close's ``passthrough_total``) is returned only when, in
+    file order: every open of the session has a close and every close an earlier open; the ids are exactly 1..n,
+    each opened once and closed once (a gap or a missing 1 means records out of the 1 MiB window, in the rotated
+    ``.1`` or torn; a repeat means a second front or a forged line); and the totals never decrease. A passthrough
+    close with no id (a log written by a front older than the open record) or any malformed session record of these
+    two events: None. None is over-debit (usage settles at the reservation), the safe side; a published total is
+    never smaller than the bytes the log's tunnels moved. A session with no passthrough tunnel reads None too.
+
+    A torn or malformed line cannot be attributed by its ``session`` field, and a torn open with its close appended
+    to the fragment hides a whole tunnel (one line, neither record parses). So a line that does not parse as a JSON
+    object is None when it names ``session`` (its JSON-encoded form appears in the line) or comes after any record of
+    the session, and so is a session ``log-record-dropped`` record. Only a line before the session's first record
+    that does not name it (an earlier session's tear) is passed over: a record of this session lost there would be
+    its first, and the front closes a tunnel whose open record did not land (``Front._log`` answers False) before
+    any of its bytes move. The one empty line allowed is the last (the newline after the final record).
+
+    Same tail as :func:`read_passthrough_total`: the last 1 MiB (the first, partial line dropped). That window is a
+    cap: a session whose records began before it (a long session, or a reused slot's other sessions filling the log
+    since) reads None, reason ``tail-window`` (:func:`_session_total_and_reason`), the over-debit side. The log is
+    written by the front's lower uid: the tail is parsed with stdlib ``json`` (``RecursionError`` caught), nothing
+    else. Never raises."""
+    return _session_total_and_reason(fd, session)[0]
+
+
+def _session_total_and_reason(fd: int, session: str) -> Tuple[Optional[int], str]:
+    """:func:`_read_session_total_fd` with why: ``(total, "ok")``, else ``(None, reason)``, reason one of
+    ``not-regular``, ``malformed``, ``unmatched`` (an open with no close, an id seen twice, a bad id or total),
+    ``tail-window`` (an id or the open of a close missing while the 1 MiB window cut the log), ``gap`` (the same
+    with the whole log read), ``no-tunnel``, ``error``. Never raises."""
+    try:
+        st = os.fstat(fd)
+        if not stat.S_ISREG(st.st_mode):
+            return None, "not-regular"
+        off = max(0, st.st_size - _PASSTHROUGH_TAIL_BYTES)
+        if off:
+            os.lseek(fd, off, os.SEEK_SET)
+        chunks: List[bytes] = []
+        left = _PASSTHROUGH_TAIL_BYTES + 1
+        while left > 0:
+            c = os.read(fd, min(left, 1 << 16))
+            if not c:
+                break
+            chunks.append(c)
+            left -= len(c)
+        lines = b"".join(chunks).split(b"\n")
+        if off:
+            lines = lines[1:]
+        if lines and lines[-1] == b"":
+            lines = lines[:-1]
+        missing = "tail-window" if off else "gap"
+        token = json.dumps(session).encode("utf-8")
+        seen = False
+        opened: set = set()
+        closed: set = set()
+        total = 0
+        for line in lines:
+            try:
+                rec = json.loads(line)
+            except (ValueError, RecursionError):
+                rec = None
+            if not isinstance(rec, dict):
+                if seen or token in line:
+                    return None, "malformed"
+                continue
+            if rec.get("session") != session:
+                continue
+            seen = True
+            event = rec.get("event")
+            if event == "log-record-dropped":
+                return None, "malformed"
+            if event == "tunnel-open":
+                t = rec.get("tunnel_id")
+                if not _tunnel_id_ok(t) or t in opened:
+                    return None, "unmatched"
+                opened.add(t)
+            elif event == "tunnel":
+                pt = rec.get("passthrough")
+                if pt is False and "passthrough_total" not in rec and "tunnel_id" not in rec:
+                    continue   # a non-passthrough tunnel: counts nothing
+                t = rec.get("tunnel_id")
+                v = rec.get("passthrough_total")
+                if _tunnel_id_ok(t) and t not in opened and pt is True:
+                    return None, missing
+                if pt is not True or not _tunnel_id_ok(t) or t not in opened or t in closed \
+                        or type(v) is not int or not total <= v <= _INT64_MAX:
+                    return None, "unmatched"
+                closed.add(t)
+                total = v
+        if not opened:
+            return None, "no-tunnel"
+        if opened != set(range(1, len(opened) + 1)):
+            return None, missing
+        if closed != opened:
+            return None, "unmatched"
+        return total, "ok"
+    except Exception:
+        return None, "error"
+
+
+def read_session_total(path: object, session: str) -> Optional[int]:
+    """:func:`_read_session_total_fd` over a path (``O_NOFOLLOW|O_NONBLOCK``: a symlink or a FIFO is None). The
+    dispatch usage reader (``levain.slot.dispatch_usage``) re-imports this one; root's END uses
+    :func:`read_session_tunnel_total`, the trusted walk."""
+    try:
+        fd = os.open(path, os.O_RDONLY | os.O_NONBLOCK | os.O_NOFOLLOW | os.O_CLOEXEC)  # type: ignore[call-overload]
+    except (OSError, TypeError, ValueError):
+        return None
+    try:
+        return _read_session_total_fd(fd, session)
+    finally:
+        os.close(fd)
+
+
+def read_session_tunnel_total(store: "Store", slot: SlotId, front_uid: int, session: str) -> Optional[int]:
+    """The session's final tunnel total for root's END (CONTRACT §5.1, ``teardown``'s ``tunnel_bytes``): the same
+    trusted walk :func:`prepare_front_log` makes (:func:`_open_front_log_dir`: ``L/gw/`` through ``trusted=True``,
+    ``L/gw/slot<n>/`` held to the front account's alone and opened ``O_NOFOLLOW|O_DIRECTORY`` only if it is the dir
+    judged), then ``front.log`` opened ``O_NOFOLLOW`` BELOW that fd and held to a regular file with one link owned by
+    the front account or root (what prepare left it). Any refusal of the walk (``Refused``), a link, a replaced or
+    foreign file, an unreadable log (``OSError``), or a log that does not prove ``session``'s total final (an open
+    tunnel with no close, :func:`_read_session_total_fd`): None. Anything else (a programming error) propagates; it is
+    not read as an absent total. Root calls this only after SCRUB proved the front's uid gone (``start.teardown``):
+    that proves the log can no longer grow; the open/close match proves it complete."""
+    try:
+        dfd = _open_front_log_dir(store, slot, front_uid)
+        if dfd is None:
+            return None
+        try:
+            f = os.open(FRONT_LOG_NAME, _O_READ, dir_fd=dfd)
+            try:
+                st = os.fstat(f)
+                if not stat.S_ISREG(st.st_mode) or st.st_nlink != 1 \
+                        or st.st_uid not in (store.seams.chowned_uid(front_uid), 0):
+                    return None
+                total, why = _session_total_and_reason(f, session)
+                if total is None and why != "no-tunnel":
+                    # the key is left absent (usage settles at the reservation); the reason says which cap or
+                    # defect cost the total, ``tail-window`` the 1 MiB window's
+                    sys.stderr.write(f"levain runtime-helper: tunnel total unproven for {session}: {why}\n")
+                return total
+            finally:
+                os.close(f)
+        finally:
+            os.close(dfd)
+    except (Refused, OSError):
+        return None
+
+
 def front_session_routes(base: Mapping[str, object], routes: Sequence[str], *,
                          dispatch: bool = False) -> List[dict]:
     """The session's routes as the front reads them (§4.3 "the front's view"): each id's base-map entry, in the
@@ -3728,7 +3888,7 @@ __all__ = ["Answer", "BASE_ROUTES_FORMAT", "CAS_UNMOVED", "CREDENTIAL_NAME", "Ct
            "parse_slot_state_of", "pick_slot", "prepare", "proc_identity", "read_view", "render",
            "render_layer_rows", "resume", "revert_lease", "run", "session_dir_rows", "session_lock",
            "session_lock_name", "session_owner_uid", "slot_owned_dir_ok", "spawn_front", "spawn_target", "status",
-           "front_policy_bytes", "front_session_routes", "read_passthrough_total", "gateway_front_args", "prepare_front_log",
+           "front_policy_bytes", "front_session_routes", "read_passthrough_total", "read_session_total", "read_session_tunnel_total", "gateway_front_args", "prepare_front_log",
            "account_in_range", "check_front_log_dirs",
            "refuse_ticketed_front", "stub_front_args", "wait_child", "write_front_policy"]
 
