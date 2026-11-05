@@ -19,6 +19,7 @@ import json
 import logging
 import socket
 import threading
+from pathlib import Path
 import traceback
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from urllib.parse import parse_qs, urlsplit
@@ -155,11 +156,29 @@ def test_the_chosen_voice_is_the_model_parameter(server, voice):
     assert parse_qs(urlsplit(server.received[0]["target"]).query)["model"] == [voice]
 
 
-def test_speed_is_validated_and_never_sent(server):
+@pytest.mark.parametrize("speed,wire", [(0.7, "0.7"), (1.5, "1.5"), (0.85, "0.85"), (1, None), (1.0, None)])
+def test_speed_is_sent_on_the_wire_unless_it_is_the_default(server, speed, wire):
+    # Aura-2 speed runs 0.7 - 1.5 (https://developers.deepgram.com/docs/tts-voice-controls); 1.0 is Deepgram's default
     prov, _ = speaker(server)
-    prov.speak(FAKE_KEY, "Hi.", speed=1.5)
-    assert "speed" not in parse_qs(urlsplit(server.received[0]["target"]).query)
+    prov.speak(FAKE_KEY, "Hi.", speed=speed)
+    query = parse_qs(urlsplit(server.received[0]["target"]).query)
+    assert query.get("speed") == ([wire] if wire else None)
+    assert query["model"] == [P.DEEPGRAM_TTS_VOICE] and query["encoding"] == ["mp3"] and query["mip_opt_out"] == ["true"]
     assert b"speed" not in server.received[0]["body"]
+
+
+@pytest.mark.parametrize("speed", [0.69, 0.5, 0.25, 1.51, 2.0, 4.0, 0, -1, float("nan"), float("inf"), True, "1.2", None])
+def test_a_speed_outside_aura_2s_range_is_refused_before_sending_not_dropped(server, speed):
+    prov, _ = speaker(server)
+    with pytest.raises(ValueError) as info:       # a pre-send ValueError: the route releases the reservation
+        prov.speak(FAKE_KEY, "Hi.", speed=speed)
+    assert not isinstance(info.value, P.VoiceError) and FAKE_KEY not in surfaces(info.value)
+    assert server.received == []
+
+
+def test_speed_is_checked_against_deepgrams_range_not_openais():
+    assert (P.DEEPGRAM_SPEED_MIN, P.DEEPGRAM_SPEED_MAX) == (0.7, 1.5)
+    assert (P.SPEED_MIN, P.SPEED_MAX) == (0.25, 4.0)
 
 
 def test_the_authorization_header_is_removed_from_the_request_once_the_transport_returns(server):
@@ -192,6 +211,50 @@ def test_the_cap_is_deepgrams_not_the_other_adapters(server):
 def test_the_chunker_stays_under_the_cap():
     from levain.voice.text import CHUNK
     assert CHUNK <= P.DEEPGRAM_INPUT_CAP
+
+
+def test_the_chunk_check_is_a_raise_not_an_assert_so_it_survives_python_dash_O():
+    # the module is re-imported under ``-O`` (asserts stripped) with CHUNK pushed over the cap: the import must still fail
+    import subprocess
+    import sys
+    import textwrap
+    root = Path(P.__file__).resolve().parents[2]
+    code = textwrap.dedent(f"""
+        import importlib, sys
+        sys.path.insert(0, {str(root)!r})
+        import levain.voice.text as t
+        t.CHUNK = 3000
+        sys.modules.pop("levain.voice.providers", None)
+        try:
+            importlib.import_module("levain.voice.providers")
+        except ImportError:
+            sys.exit(7)
+        sys.exit(0)
+    """)
+    done = subprocess.run([sys.executable, "-O", "-I", "-c", code], capture_output=True, text=True)
+    assert done.returncode == 7, done.stderr
+
+
+def test_an_over_cap_text_is_a_pre_send_valueerror_like_every_other_refusal_before_sending(server):
+    # a caller that chunks to 3000 (chunk_text accepts any size under 4096) reaches the same exception type the OpenAI
+    # adapter raises for its own cap, which the route releases rather than bills
+    prov, _ = speaker(server)
+    with pytest.raises(ValueError) as info:
+        prov.speak(FAKE_KEY, "x" * 3000)
+    assert type(info.value) is ValueError and server.received == []
+    with pytest.raises(ValueError) as other:
+        P.OpenAIProvider(transport=Loopback(server)).speak(FAKE_KEY, "x" * (P.OPENAI_INPUT_CAP + 1))
+    assert type(other.value) is type(info.value)
+
+
+def test_a_413_is_rejected_so_an_unverified_character_unit_fails_closed(server):
+    # Deepgram's pages say "characters" and not code points, bytes or UTF-16 units: a text it counts as over the limit
+    # is a 413 (https://developers.deepgram.com/docs/errors) and the adapter turns it into a refusal, not a retry
+    server.answer = (413, {"Content-Type": "application/json"}, _legacy("Payload Too Large", "Input text exceeds maximum"))
+    prov, _ = speaker(server)
+    with pytest.raises(P.VoiceError) as info:
+        prov.speak(FAKE_KEY, "\U0001F600" * P.DEEPGRAM_INPUT_CAP)         # 2000 code points, 8000 bytes
+    assert info.value.code == "rejected"
 
 
 # ---- every documented error status, in the body shape the page shows ------------------------------------------------

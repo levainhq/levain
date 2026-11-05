@@ -41,8 +41,11 @@ Facts about the providers, and where each comes from (the design is ``project_me
   parameter (``aura-2-thalia-en`` is a listed Aura-2 voice), ``encoding=mp3`` valid on REST (the response is ``audio/mpeg``;
   the pages disagree on the default encoding, so mp3 is always asked for by name), at most 2000 characters per request for
   Aura-2 (:data:`DEEPGRAM_INPUT_CAP`; above it Deepgram answers 413, which the adapter refuses before sending), and
-  ``mip_opt_out=true`` keeping the request out of the model-improvement programme. Deepgram documents a ``speed`` query
-  parameter without its range, so speed is validated here and not sent. The documented error statuses are mapped by status
+  ``mip_opt_out=true`` keeping the request out of the model-improvement programme. Speed is the ``speed`` query parameter,
+  0.7 to 1.5 for Aura-2 ("Aura-2: speed runs 0.7 - 1.5", https://developers.deepgram.com/docs/tts-voice-controls; the Speak
+  reference above gives the parameter and no range, and says "Not yet supported in all languages", the voice-controls page
+  lists Aura-2 speed for English and Spanish); a speed outside that range is refused here before sending, and a speed
+  other than 1.0 is sent. The documented error statuses are mapped by status
   alone (:func:`_code_for`); Deepgram's TTS pages show no 402 body, only the general "402 Payment Required: The project
   has insufficient funds". The Nova-3 pre-recorded path (``/v1/listen``), its parameters and the transcript's place in the
   response are from the design, not fetched: UNVERIFIED (and out of scope for the OpenAI TTS shutdown, which does not
@@ -80,8 +83,13 @@ DEEPGRAM_TTS_MODEL = "aura-2"                   # the priced family (levain.voic
 DEEPGRAM_TTS_VOICE = "aura-2-thalia-en"         # a model id; from the design's "Aura-2", the voice name is not fetched
 DEEPGRAM_STT_MODEL = "nova-3"
 OPENAI_INPUT_CAP = API_CAP                      # OpenAI's speech input limit, the number the cap was first written for
-DEEPGRAM_INPUT_CAP = 2000                       # Aura-2 and Aura-1: https://developers.deepgram.com/docs/text-to-speech
-assert CHUNK <= DEEPGRAM_INPUT_CAP, "the chunker must stay under the smallest adapter cap"
+# Aura-2 and Aura-1: the table "Max Characters" on https://developers.deepgram.com/docs/text-to-speech (read 2026-11-05).
+# The unit those pages name is "characters"; whether Deepgram counts code points, bytes or UTF-16 units was not read from
+# any page, so len() of the Python string is the unit used here, UNVERIFIED. A text Deepgram counts as longer is answered
+# 413, which maps to ``rejected`` (:func:`_code_for`), so the unverified unit fails closed.
+DEEPGRAM_INPUT_CAP = 2000
+if CHUNK > DEEPGRAM_INPUT_CAP:      # a real check, not an assert: it must hold under ``python -O`` too
+    raise ImportError("levain.voice.text.CHUNK is over the smallest voice adapter input cap")
 
 # Seconds. TIMEOUT is urllib's per-socket-operation inactivity timeout (the connect, a send, each blocking recv): a
 # provider sending a byte before each one fires never trips it, and a call holds one of the server's two voice slots, so
@@ -95,7 +103,8 @@ _READ_CHUNK = 64 * 1024
 _monotonic = time.monotonic     # one name for the exchange clock, so a test can drive it
 MAX_RESPONSE = 16 * 1024 * 1024                 # a response past this is not read: it is not an answer
 MIME_ALLOW = {"audio/webm": "webm", "audio/mp4": "mp4", "audio/mpeg": "mp3", "audio/wav": "wav"}
-SPEED_MIN, SPEED_MAX = 0.25, 4.0
+SPEED_MIN, SPEED_MAX = 0.25, 4.0                # OpenAI's range
+DEEPGRAM_SPEED_MIN, DEEPGRAM_SPEED_MAX = 0.7, 1.5   # Aura-2's own: https://developers.deepgram.com/docs/tts-voice-controls
 
 # The fixed sentences. ``{p}`` is the provider in use. A provider body is never one of them. "rejected" (a 4xx that is
 # neither the key nor a limit) has no sentence in the design; this is a placeholder for that gap.
@@ -302,12 +311,13 @@ def _send(transport: Transport, provider: str, key: _Key, scheme: str, url: str,
     return answer
 
 
-def _need_speech(text: str, speed: float, cap: int = API_CAP) -> None:
+def _need_speech(text: str, speed: float, cap: int = API_CAP,
+                 speed_range: tuple[float, float] = (SPEED_MIN, SPEED_MAX)) -> None:
     if not isinstance(text, str) or not text.strip():
         raise ValueError("nothing to speak")
     if len(text) > cap:
         raise ValueError("text is over the provider's input cap; chunk it first")
-    if isinstance(speed, bool) or not isinstance(speed, (int, float)) or not SPEED_MIN <= speed <= SPEED_MAX:
+    if isinstance(speed, bool) or not isinstance(speed, (int, float)) or not speed_range[0] <= speed <= speed_range[1]:
         raise ValueError("speed is outside the provider's range")
 
 
@@ -408,15 +418,18 @@ class DeepgramProvider:
     def speak(self, key: str, text: str, voice: str = DEEPGRAM_TTS_VOICE, speed: float = 1.0) -> bytes:
         """mp3 bytes for ``text`` (at most :data:`DEEPGRAM_INPUT_CAP` characters). ``voice`` is a voice of the
         :attr:`tts_model` family (an Aura-2 model id), so the family the meter priced is the one billed. ``speed`` is
-        validated and not sent."""
+        refused outside Aura-2's 0.7-1.5 and sent as the ``speed`` query parameter unless it is 1.0 (Deepgram's default)."""
         secret = _Key(key)
         del key
         with secret:
-            _need_speech(text, speed, DEEPGRAM_INPUT_CAP)
+            _need_speech(text, speed, DEEPGRAM_INPUT_CAP, (DEEPGRAM_SPEED_MIN, DEEPGRAM_SPEED_MAX))
             if not _need_voice(voice).startswith(f"{self.tts_model}-"):
                 raise ValueError("voice is not one of the priced model's voices")
+            query = {"model": voice, "encoding": "mp3"}
+            if speed != 1.0:
+                query["speed"] = f"{float(speed):g}"
             audio = _send(self.transport, self.name, secret, "Token",
-                          self._url("/v1/speak", model=voice, encoding="mp3"),
+                          self._url("/v1/speak", **query),
                           {"Content-Type": "application/json", "Accept": "audio/mpeg"},
                           json.dumps({"text": text}).encode("utf-8"))
         if not audio:
