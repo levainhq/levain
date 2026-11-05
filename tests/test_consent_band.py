@@ -49,7 +49,7 @@ HELD_KEYS = {"LEVAIN_CONSENT_EVENT", "LEVAIN_CONSENT_REQUEST", "LEVAIN_CONSENT_A
 # what a notify command that records itself does: one JSON line per start, its own consent variables, its argv after the
 # file, and the names of every variable it was started with
 _RECORDER = '''import json, os, sys
-rec = {k: v for k, v in os.environ.items() if k.startswith("LEVAIN_CONSENT_")}
+rec ={k: v for k, v in os.environ.items() if k.startswith("LEVAIN_CONSENT_")}
 rec["_argv"] = sys.argv[2:]
 rec["_names"] = sorted(os.environ)
 with open(sys.argv[1], "a") as fh:
@@ -222,11 +222,20 @@ def test_a_command_that_cannot_start_leaves_no_mark_and_owes_no_settle(world, tm
 
 
 # --- 2. the SETTLED event ---------------------------------------------------------------------------------------------
+def _held_landed(cmd: Cmd, request_id: str) -> None:
+    """The held child has written its line. The two children are separate interpreter starts launched moments apart, so which
+    writes first is a race the consumer closes with a tombstone; levain promises no order, and a test about the settled event
+    waits for the held one before it settles (as the signed-answer tests' served round trip does)."""
+    (first,) = cmd.wait(1)
+    assert (first["LEVAIN_CONSENT_EVENT"], first["LEVAIN_CONSENT_REQUEST"]) == ("held", request_id), first
+
+
 def _settled(cmd: Cmd, request_id: str, outcome: str) -> None:
     lines = cmd.wait(2)
-    assert [(x["LEVAIN_CONSENT_EVENT"], x["LEVAIN_CONSENT_REQUEST"]) for x in lines] == [("held", request_id),
-                                                                                         ("settled", request_id)], lines
-    last = lines[1]
+    # the held line and exactly one settled line, compared without an order levain does not promise
+    assert sorted((x["LEVAIN_CONSENT_EVENT"], x["LEVAIN_CONSENT_REQUEST"]) for x in lines) == [("held", request_id),
+                                                                                               ("settled", request_id)], lines
+    last = next(x for x in lines if x["LEVAIN_CONSENT_EVENT"] == "settled")
     assert last["LEVAIN_CONSENT_OUTCOME"] == outcome
     assert {k for k in last if k.startswith("LEVAIN_CONSENT_")} == {"LEVAIN_CONSENT_EVENT", "LEVAIN_CONSENT_REQUEST",
                                                                     "LEVAIN_CONSENT_OUTCOME"}
@@ -265,8 +274,9 @@ def test_a_denied_answer_settles_as_denied(home, tmp_path) -> None:
 def test_a_withdrawal_settles_the_request_once(world, tmp_path) -> None:
     cmd = Cmd(tmp_path)
     request, _ = _held(world, cmd)
+    _held_landed(cmd, request.id)
     assert _queue(world).withdraw(request.id) is True
-    assert _queue(world).withdraw(request.id) is False       # already gone: nothing to announce a second time
+    assert _queue(world).withdraw(request.id) is False      # already gone: nothing to announce a second time
     _settled(cmd, request.id, "withdrawn")
 
 
@@ -291,6 +301,7 @@ def _filed_long_ago(world, cmd: Cmd, hold: timedelta) -> str:
 def test_the_expiry_sweep_settles_a_request_nobody_answered(world, tmp_path) -> None:
     cmd = Cmd(tmp_path)
     rid = _filed_long_ago(world, cmd, timedelta(minutes=1))
+    _held_landed(cmd, rid)
     assert _queue(world).sweep() == 1
     assert _queue(world).sweep() == 0
     _settled(cmd, rid, "expired")
@@ -299,6 +310,7 @@ def test_the_expiry_sweep_settles_a_request_nobody_answered(world, tmp_path) -> 
 def test_a_read_that_expires_a_request_settles_it_too(world, tmp_path) -> None:
     cmd = Cmd(tmp_path)
     rid = _filed_long_ago(world, cmd, timedelta(minutes=1))
+    _held_landed(cmd, rid)
     assert _queue(world).get(rid)[1] == "expired"
     assert _queue(world).get(rid)[1] == "expired"
     _settled(cmd, rid, "expired")
@@ -308,8 +320,9 @@ def test_a_hold_that_ends_undecided_is_announced_as_expired(world, tmp_path) -> 
     """The hook's own end of a hold (``mark_undecided``): the call was not run, so the row has nothing left to sign."""
     cmd = Cmd(tmp_path)
     request, _ = _held(world, cmd)
+    _held_landed(cmd, request.id)
     q = _queue(world)
-    q_future = ConsentQueue(world.qdir, authority=q._authority, home=h4_home(),
+    q_future =ConsentQueue(world.qdir, authority=q._authority, home=h4_home(),
                             clock=lambda: datetime.now(timezone.utc) + timedelta(minutes=6))
     assert q_future.mark_undecided(request.id).state == "undecided"
     _settled(cmd, request.id, "expired")
@@ -340,9 +353,11 @@ def test_codexs_request_settles_through_codexs_own_command(world, tmp_path) -> N
     cc, cx = Cmd(tmp_path, "cc"), Cmd(tmp_path, "cx")
     _settings_file(world.qdir, "claude_code.json", cc.argv)
     request, _ = _held(world, cx, agent="codex", name="x.txt")
+    _held_landed(cx, request.id)
     assert _queue(world).withdraw(request.id)
     lines = cx.wait(2)
-    assert [x["LEVAIN_CONSENT_EVENT"] for x in lines] == ["held", "settled"]
+    assert sorted(x["LEVAIN_CONSENT_EVENT"] for x in lines) == ["held", "settled"]
+    assert next(x for x in lines if x["LEVAIN_CONSENT_EVENT"] == "settled")["LEVAIN_CONSENT_OUTCOME"] == "withdrawn"
     assert cc.quiet() == []
 
 
