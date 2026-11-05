@@ -50,7 +50,9 @@ def test_prepare_stores_the_path_and_render_never_asks_again(tmp_path):
     w.seams.var_folders = boom
     code, line = w.main(["render", s], _blob())
     assert line == {"ok": True}, w.last_err
-    assert "/private/var/folders/zz/u3999" in (w.L / "live" / s / "root" / "profile.sb").read_text()
+    # 1105-10 endvf (DESIGN_end_var_folders (e)): the profile no longer names the dir (no write grant there); the
+    # stored path still reaches render (the alloc rewrite below keeps it, and getconf is never asked again)
+    assert "/private/var/folders" not in (w.L / "live" / s / "root" / "profile.sb").read_text()
     assert w.alloc(s).var_folders == ("/private/var/folders/zz/u3999",)          # render's rewrite keeps it
 
 

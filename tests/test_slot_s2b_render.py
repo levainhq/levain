@@ -625,7 +625,6 @@ GOLD_PROFILE_EGRESS = """(version 1)
 (deny file-write*)
 (allow file-write*
   (subpath "/private/var/levain/live/s-0123456789abcdef/repo") (subpath "/private/var/levain/live/s-0123456789abcdef/config") (subpath "/private/var/levain/live/s-0123456789abcdef/xdg") (subpath "/private/var/levain/live/s-0123456789abcdef/tmp") (subpath "/private/var/levain/live/s-0123456789abcdef/sock")
-  (subpath "/private/var/folders/zy/hhq908f97y7g9v4yl18g49l00000lq")
   (literal "/dev/null") (literal "/dev/zero") (literal "/dev/tty") (literal "/dev/dtracehelper") (literal "/dev/ptmx"))
 (deny network-outbound)
 (deny network-bind)
@@ -697,11 +696,13 @@ def _digest(r) -> str:
 #: read once when these were taken; a change here is a change to what a confined session loads. WF-1b re-took the four
 #: egress digests: the only change against cf2e19bb is root/settings.json's permissions.allow gaining
 #: WebFetch(domain:api.github.com) and WebFetch(domain:github.com), the helper's route_hosts for its github route.
+#: 1105-10 endvf re-took the four darwin digests: the only change is root/profile.sb losing its var-folders writable
+#: group (DESIGN_end_var_folders (e)); the four Linux digests are unchanged.
 GOLD_DIGESTS = {
-    ("darwin", "claude", "egress"): "18f9a25ffabf303f",
-    ("darwin", "claude", "none"): "dd0f5dad5c38e0b8",
-    ("darwin", "codex", "egress"): "d261401cde64acea",   # R7: + SSL_CERT_FILE in root/env
-    ("darwin", "codex", "none"): "7441ce40b3226c61",
+    ("darwin", "claude", "egress"): "882b6a9e58394c4b",
+    ("darwin", "claude", "none"): "c15ca48b7909cf0b",
+    ("darwin", "codex", "egress"): "c83c5f69a0ceedd3",   # R7: + SSL_CERT_FILE in root/env
+    ("darwin", "codex", "none"): "96ccb0d934bbd77a",
     ("linux", "claude", "egress"): "9a6f5684256bdd1c",
     ("linux", "claude", "none"): "c9796d76e53b1d57",
     ("linux", "codex", "egress"): "02b07820fb916f2b",
@@ -723,7 +724,10 @@ def test_golden_text_per_os_vendor_class():
         rd.render_profile(blob, facts).decode().splitlines()
     blob, facts = verifier()
     v = rd.render_profile(blob, facts).decode()
-    assert "remote ip" not in v and "local ip" not in v and '(subpath "/private/var/folders/ab/d2")' in v
+    assert "remote ip" not in v and "local ip" not in v
+    # 1105-10 endvf (DESIGN_end_var_folders (e)): neither uid's var-folders dir is writable, the driver's included
+    assert "/private/var/folders" not in v
+    assert "/private/var/folders" not in rd.render_profile(*egress()).decode()
     blob, facts = egress("linux")
     assert json.loads(rd.render(blob, facts).file("root/settings.json").data) == GOLD_SETTINGS_LINUX
     blob, facts = egress("darwin", "codex")

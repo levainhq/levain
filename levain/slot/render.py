@@ -848,7 +848,11 @@ def render_profile(blob: RenderBlob, facts: RenderFacts, *, probe: bool = False)
         network.append(f"(allow network-outbound (remote unix-socket (subpath {_q(f'{R}/planner/slot{n}')})))")
     return _profile_bytes(WallFacts(
         label=f"Levain session profile (CONTRACT §8.1) for {facts.session} on {facts.slot.tag}, kind {facts.kind}.",
-        writable=(tuple(f"{S}/{d}" for d in writable), tuple(facts.var_folders)),
+        # 1105-10 endvf (DESIGN_end_var_folders (e), np-a6c66697): the var-folders dirs are no longer a writable group,
+        # so ``(deny file-write*)`` covers them; the env already sends every temp/cache writer into <S>. Why R-M2 made
+        # them writable is in levain-memory (not read by this lane): if a real vendor needs the dir, restore
+        # ``tuple(facts.var_folders)`` as the second group. ``facts.var_folders`` is still validated and carried for END.
+        writable=(tuple(f"{S}/{d}" for d in writable),),
         devices=DEVICE_LITERALS, network=tuple(network), mach_allow=MACH_ALLOW))
 
 
