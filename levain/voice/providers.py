@@ -32,13 +32,23 @@ Facts about the providers, and where each comes from (the design is ``project_me
   down on 2027-01-06, so the model id is DATA (:data:`OPENAI_TTS_MODEL`, a constructor argument), never a code branch;
   which model replaces it is a ruling that is not made here. The transcription model id and the transcription endpoint
   path are from the design and OpenAI's usual API shape, not fetched.
-* Deepgram: ``mip_opt_out=true`` as a query parameter on the request URL is from Deepgram's model-improvement-programme page
-  (read by the planning lane). The Aura-2 speech path (``/v1/speak``) and the Nova-3 pre-recorded path (``/v1/listen``),
-  the ``Token`` authorization scheme, the ``encoding=mp3`` parameter and the transcript's place in the response are from
-  the design, not fetched: UNVERIFIED until a real call (the slice's named residue). Deepgram speech takes no speed here
-  (a review cites a documented ``speed`` query parameter, 0.7-1.5; unverified, so not sent until the first real call).
-  Deepgram bills Aura-2 as one family, so :attr:`DeepgramProvider.tts_model` is the priced family (``aura-2``) and the
-  voice sent as Deepgram's ``model`` must be one of that family's voices.
+* Deepgram speech, read from Deepgram's pages on 2026-11-05 (the Speak reference
+  https://developers.deepgram.com/reference/text-to-speech/speak-request, the guide
+  https://developers.deepgram.com/docs/text-to-speech, the output settings
+  https://developers.deepgram.com/docs/tts-media-output-settings, the voices https://developers.deepgram.com/docs/tts-models
+  and the errors https://developers.deepgram.com/docs/errors): ``POST https://api.deepgram.com/v1/speak``, ``Authorization:
+  Token <key>``, a JSON body ``{"text": ...}`` (exactly one of ``text`` or ``url``), the voice as the ``model`` query
+  parameter (``aura-2-thalia-en`` is a listed Aura-2 voice), ``encoding=mp3`` valid on REST (the response is ``audio/mpeg``;
+  the pages disagree on the default encoding, so mp3 is always asked for by name), at most 2000 characters per request for
+  Aura-2 (:data:`DEEPGRAM_INPUT_CAP`; above it Deepgram answers 413, which the adapter refuses before sending), and
+  ``mip_opt_out=true`` keeping the request out of the model-improvement programme. Deepgram documents a ``speed`` query
+  parameter without its range, so speed is validated here and not sent. The documented error statuses are mapped by status
+  alone (:func:`_code_for`); Deepgram's TTS pages show no 402 body, only the general "402 Payment Required: The project
+  has insufficient funds". The Nova-3 pre-recorded path (``/v1/listen``), its parameters and the transcript's place in the
+  response are from the design, not fetched: UNVERIFIED (and out of scope for the OpenAI TTS shutdown, which does not
+  touch transcription). No Deepgram call has been made with a real key (the slice's named residue). Deepgram bills Aura-2
+  as one family, so :attr:`DeepgramProvider.tts_model` is the priced family (``aura-2``) and the voice sent as Deepgram's
+  ``model`` must be one of that family's voices.
 * ElevenLabs is not built in this slice.
 
 No claim above about a provider's behaviour is tested against the provider: the fixtures under ``tests/fixtures/voice``
@@ -58,7 +68,7 @@ from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import Any
 
-from levain.voice.text import API_CAP
+from levain.voice.text import API_CAP, CHUNK
 
 HOSTS = {"openai": "api.openai.com", "deepgram": "api.deepgram.com"}
 ALLOWED_HOSTS = frozenset(HOSTS.values())
@@ -69,6 +79,9 @@ OPENAI_DEFAULT_VOICE = "nova"
 DEEPGRAM_TTS_MODEL = "aura-2"                   # the priced family (levain.voice.meter.DEFAULT_PRICES)
 DEEPGRAM_TTS_VOICE = "aura-2-thalia-en"         # a model id; from the design's "Aura-2", the voice name is not fetched
 DEEPGRAM_STT_MODEL = "nova-3"
+OPENAI_INPUT_CAP = API_CAP                      # OpenAI's speech input limit, the number the cap was first written for
+DEEPGRAM_INPUT_CAP = 2000                       # Aura-2 and Aura-1: https://developers.deepgram.com/docs/text-to-speech
+assert CHUNK <= DEEPGRAM_INPUT_CAP, "the chunker must stay under the smallest adapter cap"
 
 # Seconds. TIMEOUT is urllib's per-socket-operation inactivity timeout (the connect, a send, each blocking recv): a
 # provider sending a byte before each one fires never trips it, and a call holds one of the server's two voice slots, so
@@ -289,10 +302,10 @@ def _send(transport: Transport, provider: str, key: _Key, scheme: str, url: str,
     return answer
 
 
-def _need_speech(text: str, speed: float) -> None:
+def _need_speech(text: str, speed: float, cap: int = API_CAP) -> None:
     if not isinstance(text, str) or not text.strip():
         raise ValueError("nothing to speak")
-    if len(text) > API_CAP:
+    if len(text) > cap:
         raise ValueError("text is over the provider's input cap; chunk it first")
     if isinstance(speed, bool) or not isinstance(speed, (int, float)) or not SPEED_MIN <= speed <= SPEED_MAX:
         raise ValueError("speed is outside the provider's range")
@@ -351,7 +364,7 @@ class OpenAIProvider:
         secret = _Key(key)
         del key                                             # from here only the emptied-on-exit _Key names it
         with secret:
-            _need_speech(text, speed)
+            _need_speech(text, speed, OPENAI_INPUT_CAP)
             body = json.dumps({"model": self.tts_model, "input": text, "voice": _need_voice(voice), "speed": speed,
                                "response_format": "mp3"}).encode("utf-8")
             audio = _send(self.transport, self.name, secret, "Bearer", f"https://{HOSTS['openai']}/v1/audio/speech",
@@ -393,12 +406,13 @@ class DeepgramProvider:
         return f"https://{HOSTS['deepgram']}{path}?" + urllib.parse.urlencode({**query, "mip_opt_out": "true"})
 
     def speak(self, key: str, text: str, voice: str = DEEPGRAM_TTS_VOICE, speed: float = 1.0) -> bytes:
-        """mp3 bytes for ``text``. ``voice`` is a voice of the :attr:`tts_model` family (an Aura-2 model id), so the
-        family the meter priced is the one billed. ``speed`` is validated and not sent."""
+        """mp3 bytes for ``text`` (at most :data:`DEEPGRAM_INPUT_CAP` characters). ``voice`` is a voice of the
+        :attr:`tts_model` family (an Aura-2 model id), so the family the meter priced is the one billed. ``speed`` is
+        validated and not sent."""
         secret = _Key(key)
         del key
         with secret:
-            _need_speech(text, speed)
+            _need_speech(text, speed, DEEPGRAM_INPUT_CAP)
             if not _need_voice(voice).startswith(f"{self.tts_model}-"):
                 raise ValueError("voice is not one of the priced model's voices")
             audio = _send(self.transport, self.name, secret, "Token",
