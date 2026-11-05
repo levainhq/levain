@@ -25,7 +25,7 @@ def test_a_double_tap_on_sign_is_one_ceremony_and_one_answer(tmp_path: Path, mon
         out = _drive(tmp_path, f"{rig.origin}/nope", [
             DESKTOP, rig.authenticator(), *_open(rig), {"eval": SPY},
             # two taps in one task: the second lands while the first ceremony is still in flight
-            {"eval": f"(() => {{ const b = {_button('b')}; b.click(); b.click(); return 1; }})()"},
+            {"tap": _button('b'), "times": 2},
             {"until": f"/^signed/.test({NOTE}) && {NOTE}", "ms": 30000},
             {"eval": "window.__gets"},
             {"eval": STATE},
@@ -46,8 +46,7 @@ def test_a_fault_after_the_answer_was_sent_says_unconfirmed_never_not_signed(tmp
     with rig.serving():
         out = _drive(tmp_path, f"{rig.origin}/nope", [
             DESKTOP, rig.authenticator(), *_open(rig), _stub(),
-            {"eval": f"window.__stub['/answer'] = {LOST_AFTER_SEND}; window.__stub['/attempt'] = {LOST_BEFORE_SEND}; "
-                     f"{_button('b')}.click() || 1"},
+            {"tap": _button('b'), "before": f"window.__stub['/answer'] = {LOST_AFTER_SEND}; window.__stub['/attempt'] = {LOST_BEFORE_SEND}; 1"},
             {"until": "!!document.getElementById('sheet-recheck') && 1", "ms": 30000},
             {"eval": NOTE},
             {"eval": "(document.getElementById('sheet-signing') || {}).textContent"},
@@ -75,8 +74,8 @@ def test_dismissing_the_sheet_mid_ceremony_keeps_the_lock_and_starts_no_second_c
         out = _drive(tmp_path, f"{rig.origin}/#write_token={TOK}", [
             DESKTOP, rig.authenticator(), *OPEN_FRAMED,
             _stub(f"{FRAME}.contentWindow"),
-            {"eval": f"{FRAME}.contentWindow.__stub['/challenge'] = {COUNT_HANG}; "
-                     f"{IN}.querySelector('#sheet-actions [data-choice=\"b\"]').click() || 1"},
+            {"tap": f"{IN}.querySelector('#sheet-actions [data-choice=\"b\"]')",
+             "before": f"{FRAME}.contentWindow.__stub['/challenge'] = {COUNT_HANG}; 1"},
             {"until": "window.__chn >= 1 && 1", "ms": 30000},
             {"eval": CLOSE_IN_FRAME},
             WAIT_RELOAD,
@@ -84,8 +83,8 @@ def test_dismissing_the_sheet_mid_ceremony_keeps_the_lock_and_starts_no_second_c
             {"eval": f"[...{IN}.querySelectorAll('#sheet-actions button')].filter((b) => !b.disabled).length"},
             {"eval": f"{IN}.getElementById('sheet-signing').textContent"},
             # force a tap past the disabled attribute: the in-flight lock must still refuse it
-            {"eval": f"(() => {{ const b = {IN}.querySelector('#sheet-actions [data-choice=\"b\"]'); "
-                     "b.disabled = false; b.click(); return 1; })()"},
+            {"tap": f"{IN}.querySelector('#sheet-actions [data-choice=\"b\"]')",
+             "before": f"({IN}.querySelector('#sheet-actions [data-choice=\"b\"]').disabled = false, 1)"},
             {"eval": "new Promise((r) => setTimeout(() => r(window.__chn), 800))"},
             {"eval": CLOSE_IN_FRAME},                                  # a second close leaves
             {"until": f"!{FRAME} && 1", "ms": 5000},

@@ -332,7 +332,12 @@ OPEN = ("fetch('/cockpit/sign.json', {headers: {'X-Levain-Write-Token': 'T'}}).t
 
 
 def _send(text: str) -> dict:
-    return {"eval": TYPE_AND_SEND.format(box=BOX, text=json.dumps(text))}
+    """The words typed, the box's send pressed by a person (a trusted tap: the passkey door opens only for one), and the
+    confirm it draws pressed in the same turn (that click is evaluated; the send's tap is what armed the door)."""
+    return {"tap": f"{BOX}.querySelector('.tray-dump-btn')",
+            "before": f"(() => {{ const t = {BOX}.querySelector('.tray-dump-ta'); t.value = {json.dumps(text)}; "
+                      "t.dispatchEvent(new Event('input')); return 1; })()",
+            "after": f"(() => {{ const y = {BOX}.querySelector('.verb-confirm'); if (y) y.click(); return 1; }})()"}
 
 
 @needs_browser
@@ -355,13 +360,13 @@ def test_d6_5_a_signed_question_and_a_signed_message_end_to_end(tmp_path, monkey
             {"user_verified": False},
             {"eval": f"(() => {{ const i = {WRITE_IN}; i.value = 'only after the backup'; "
                      "i.dispatchEvent(new Event('input')); return 1; })()"},
-            {"eval": f"{WORDS_BTN}.click() || 1"},
+            {"tap": f"{WORDS_BTN}"},
             {"until": f"/did not sign/.test({FACET_NOTE}) && {FACET_NOTE}"},
             {"until": f"!{WRITE_IN}.disabled && {WRITE_IN}.value"},
             {"eval": OPEN % QRID},
             # 2. the same card, verified: option (b) is signed, and the line shown is the server's
             {"user_verified": True},
-            {"eval": f"{OPTION_B}.click() || 1"},
+            {"tap": f"{OPTION_B}"},
             {"until": f"/^signed/.test({FACET_NOTE}) && {FACET_NOTE}"},
             # 3. a compose signer's refusal shows its words and keeps the draft
             {"until": BOX + " && 1"},

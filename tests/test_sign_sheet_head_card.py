@@ -276,7 +276,8 @@ def _open(stub: Stub) -> list[dict[str, Any]]:
 
 
 def _click(i: str) -> dict[str, Any]:
-    return {"do": f"document.getElementById('{i}').click()", "until": "1", "ms": 5000}
+    # a person's press (trusted): the passkey door opens only for one
+    return {"tap": f"document.getElementById('{i}')", "ms": 5000}
 
 
 def _until(js: str) -> dict[str, Any]:
@@ -370,7 +371,7 @@ def test_a_second_tap_while_the_first_is_in_flight_posts_one_challenge(tmp_path:
     stub.delay["draft-challenge"] = 0.6
     v = _run(tmp_path, stub, [
         _click("head-review"), _until("!!document.getElementById('head-sign')"),
-        {"do": "(() => { const b = document.getElementById('head-sign'); b.click(); b.click(); })()", "until": "1", "ms": 5000},
+        {"tap": "document.getElementById('head-sign')", "times": 2, "ms": 5000},
         _until("/^Signed/.test(" + NOTE + ")"), _tag("note", NOTE),
     ])
     assert stub.actions().count("draft-challenge") == 1 and stub.actions().count("draft-accept") == 1, stub.actions()

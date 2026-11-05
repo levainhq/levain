@@ -44,7 +44,7 @@ def test_the_sheet_signs_through_the_cockpits_own_ceremony(tmp_path: Path, monke
             {"eval": "document.getElementById('sheet-title').textContent"},
             {"eval": "document.getElementById('sheet-signers').textContent"},
             {"eval": "document.getElementById('sheet-home').getAttribute('href')"},
-            {"eval": f"{_button('b')}.click() || 1"},
+            {"tap": f"{_button('b')}"},
             {"until": f"/^signed/.test({NOTE}) && {NOTE}", "ms": 30000},
             {"eval": STATE},
         ])
@@ -70,7 +70,7 @@ def test_the_links_pick_is_one_tap_on_its_own_version_and_nothing_on_load(tmp_pa
             {"eval": "document.getElementById('sheet-picked').textContent"},
             {"eval": "document.getElementById('sheet-pick').textContent"},
             {"eval": "window.__gets"},
-            {"eval": "document.getElementById('sheet-picked').click() || 1"},
+            {"tap": "document.getElementById('sheet-picked')"},
             {"until": f"/^signed/.test({NOTE}) && {NOTE}", "ms": 30000},
             {"eval": "window.__gets"},
         ])
@@ -148,7 +148,7 @@ def test_a_refused_user_verification_signs_nothing_and_the_option_signs_again(tm
     with rig.serving():
         out = _drive(tmp_path, f"{rig.origin}/nope", [
             DESKTOP, rig.authenticator(), {"user_verified": False}, *_open(rig),
-            {"eval": f"{_button('a')}.click() || 1"},
+            {"tap": f"{_button('a')}"},
             {"until": f"/did not sign/.test({NOTE}) && {NOTE}", "ms": 30000},
             {"until": f"!{_button('a')}.disabled", "ms": 5000},
         ])
@@ -176,7 +176,7 @@ def test_the_cockpit_opens_the_sheet_over_itself_and_it_signs_there(tmp_path: Pa
             {"until": f"{IN} && {IN}.getElementById('sheet') && {IN}.getElementById('sheet').dataset.state", "ms": 30000},
             {"eval": f"{FRAME}.getAttribute('src')"},
             {"eval": f"{IN}.location.pathname + '|' + {IN}.location.hash"},
-            {"eval": f"{IN}.querySelector('#sheet-actions [data-choice=\"b\"]').click() || 1"},
+            {"tap": f"{IN}.querySelector('#sheet-actions [data-choice=\"b\"]')"},
             {"until": f"/^signed/.test({IN}.getElementById('sheet-note').textContent) && "
                       f"{IN}.getElementById('sheet-note').textContent", "ms": 30000},
             {"eval": f"!!{IN}.getElementById('sheet-close') && !{IN}.getElementById('sheet-home')"},
@@ -262,18 +262,21 @@ def test_h1_a_write_in_is_frozen_and_normalised_at_the_click_and_the_text_signed
         out = _drive(tmp_path, f"{rig.origin}/nope", [
             DESKTOP, rig.authenticator(), *_open(rig),
             {"eval": f"{WRITE_IN_BOX}.value = '  approve $10  '; 1"},
-            # the click and what the page shows in the same turn, before any reply could come back
-            {"eval": f"(() => {{ {WRITE_IN_BTN}.click(); return [{WRITE_IN_BOX}.disabled, {WRITE_IN_BOX}.value, "
-                     f"{SIGNING} || '']; }})()"},
+            # the tap, and what the page shows in the same turn (read by a listener that runs right after the button's own
+            # handler), before any reply could come back
+            {"tap": WRITE_IN_BTN,
+             "before": f"document.addEventListener('click', () => {{ window.__h1 = [{WRITE_IN_BOX}.disabled, "
+                       f"{WRITE_IN_BOX}.value, {SIGNING} || '']; }}, {{ once: true }}); 1"},
+            {"eval": "window.__h1"},
             {"until": f"/^signed/.test({NOTE}) && {NOTE}", "ms": 30000},
             {"eval": SIGNING},
             {"eval": "document.getElementById('sheet-signing').dataset.source"},
         ])
     v = out["values"]
-    disabled, value, shown = v[3]
+    disabled, value, shown = v[4]
     assert disabled is True and value == "approve $10", v           # frozen at the click, the text normalised in place
     assert shown.endswith("approve $10"), v                          # what is being signed, shown as it is signed
-    assert v[5].endswith("(*): approve $10") and v[6] == "server", v   # after the signature: the server's own line
+    assert v[6].endswith("(*): approve $10") and v[7] == "server", v   # after the signature: the server's own line
     assert _signed_message(rig).endswith("(*): approve $10")
     assert rig.verifies(QRID)
 
@@ -292,8 +295,8 @@ def test_h2_unsure_after_the_answer_landed_asks_its_attempt_and_shows_it_signed_
             {"until": f"{IN} && {IN}.getElementById('sheet') && {IN}.getElementById('sheet').dataset.state === 'open'", "ms": 30000},
             _stub(f"{FRAME}.contentWindow"),
             {"eval": f"{FRAME}.contentWindow.__stub['/answer'] = {LOST_AFTER_SEND}; 1"},
-            {"eval": f"{IN}.getElementById('sheet-write-in').value = 'approve $10'; "
-                     f"[...{IN}.querySelectorAll('#sheet-actions button')].find((b) => /Sign my words/.test(b.textContent)).click() || 1"},
+            {"tap": f"[...{IN}.querySelectorAll('#sheet-actions button')].find((b) => /Sign my words/.test(b.textContent))",
+             "before": f"{IN}.getElementById('sheet-write-in').value = 'approve $10'; 1"},
             {"until": f"{IN}.getElementById('sheet').dataset.state === 'signed' && 1", "ms": 30000},
             {"eval": f"[...{IN}.querySelectorAll('#sheet-actions button, #sheet-actions input')].filter((b) => !b.disabled).length"},
             {"eval": f"{IN}.getElementById('sheet-note').textContent"},
@@ -312,7 +315,7 @@ def test_h2_an_answer_that_never_left_is_refused_by_its_attempt_and_the_sheet_re
     with rig.serving():
         out = _drive(tmp_path, f"{rig.origin}/nope", [
             DESKTOP, rig.authenticator(), *_open(rig), _stub(),
-            {"eval": f"window.__stub['/answer'] = {LOST_BEFORE_SEND}; {_button('a')}.click() || 1"},
+            {"tap": f"{_button('a')}", "before": f"window.__stub['/answer'] = {LOST_BEFORE_SEND}; 1"},
             {"until": f"{ENABLED} && {WRITE_IN_BOX} && !{WRITE_IN_BOX}.disabled && 1", "ms": 30000},
             {"eval": STATE},
             {"eval": NOTE},
@@ -329,7 +332,7 @@ def test_h3_a_challenge_that_never_answers_ends_unsigned_at_the_deadline(tmp_pat
     with rig.serving():
         out = _drive(tmp_path, f"{rig.origin}/nope", [
             DESKTOP, rig.authenticator(), *_open(rig), _stub(), {"eval": SPY},
-            {"eval": f"window.__stub['/challenge'] = {HANG}; {_button('a')}.click() || 1"},
+            {"tap": f"{_button('a')}", "before": f"window.__stub['/challenge'] = {HANG}; 1"},
             {"until": f"/did not answer in time/.test({NOTE}) && {ENABLED} && {NOTE}", "ms": 25000, "may_timeout": True},
             {"eval": "window.__gets"},
             {"eval": "window.__reads"},
@@ -346,7 +349,7 @@ def test_h3_an_answer_whose_body_never_arrives_is_unsure_and_its_attempt_settles
     with rig.serving():
         out = _drive(tmp_path, f"{rig.origin}/nope", [
             DESKTOP, rig.authenticator(), *_open(rig), _stub(),
-            {"eval": f"window.__stub['/answer'] = {BODY_HANG}; {_button('a')}.click() || 1"},
+            {"tap": f"{_button('a')}", "before": f"window.__stub['/answer'] = {BODY_HANG}; 1"},
             {"until": f"{ENABLED} && {NOTE}", "ms": 25000, "may_timeout": True},
             {"eval": NOTE},
         ])
@@ -364,9 +367,9 @@ def test_h4_a_malformed_challenge_is_named_and_no_passkey_is_asked(tmp_path: Pat
     with rig.serving():
         out = _drive(tmp_path, f"{rig.origin}/nope", [
             DESKTOP, rig.authenticator(), *_open(rig), _stub(), {"eval": SPY},
-            {"eval": f"window.__bad = 'not base64url!'; window.__stub['/challenge'] = {bad}; {_button('a')}.click() || 1"},
+            {"tap": f"{_button('a')}", "before": f"window.__bad = 'not base64url!'; window.__stub['/challenge'] = {bad}; 1"},
             {"until": f"{ENABLED} && /challenge/.test({NOTE}) && {NOTE}", "ms": 10000, "may_timeout": True},
-            {"eval": f"window.__bad = ''; {_button('a')}.click() || 1"},
+            {"tap": f"{_button('a')}", "before": f"window.__bad = ''; 1"},
             {"until": f"{ENABLED} && /challenge/.test({NOTE}) && {NOTE}", "ms": 10000, "may_timeout": True},
             {"eval": "window.__gets"},
         ])
@@ -426,7 +429,7 @@ def test_h6_the_sheet_reads_its_passkey_record_under_the_reads_rp_id(tmp_path: P
         out = _drive(tmp_path, f"{rig.origin}/nope", [
             DESKTOP, rig.authenticator(), _seed("rp.example", {fp: "cnAtZXhhbXBsZQ"}), _seed("localhost", {fp: "aG9zdG5hbWU"}),
             *_open(rig), {"eval": ASKED},
-            {"eval": f"{_button('a')}.click() || 1"},
+            {"tap": f"{_button('a')}"},
             {"until": "window.__asked.length >= 1 && window.__asked", "ms": 10000},
         ])
     assert out["values"][-1][0] == "cnAtZXhhbXBsZQ", out["values"]
@@ -441,7 +444,7 @@ def test_h7_a_credential_id_that_does_not_decode_is_dropped_and_the_sheet_still_
         out = _drive(tmp_path, f"{rig.origin}/nope", [
             DESKTOP, rig.authenticator(), _seed("localhost", {rig.pk.key.fingerprint: "%%% not base64url"}),
             *_open(rig), {"eval": ASKED},
-            {"eval": f"{_button('b')}.click() || 1"},
+            {"tap": f"{_button('b')}"},
             {"until": f"/^signed|failed|did not/.test({NOTE}) && {NOTE}", "ms": 30000},
             {"eval": "window.__asked"},
         ])
@@ -460,9 +463,9 @@ def test_h7_a_stale_remembered_credential_is_asked_without_it_by_the_next_tap_an
         out = _drive(tmp_path, f"{rig.origin}/nope", [
             DESKTOP, rig.authenticator(), _seed("localhost", {fp: "c3RhbGUtY3JlZA"}),     # b64u(b"stale-cred")
             *_open(rig), {"eval": ASKED},
-            {"eval": f"{_button('b')}.click() || 1"},
+            {"tap": f"{_button('b')}"},
             {"until": f"/nothing was signed/.test({NOTE}) && {NOTE}", "ms": 90000},
-            {"eval": f"{_button('b')}.click() || 1"},          # the page never asks again by itself: the retry is a tap
+            {"tap": f"{_button('b')}"},          # the page never asks again by itself: the retry is a tap
             {"until": f"/^signed/.test({NOTE}) && {NOTE}", "ms": 90000},
             {"eval": "window.__asked"},
             {"eval": "window.localStorage.getItem('levain-passkeys:localhost')"},
@@ -481,7 +484,7 @@ def test_h8_the_signed_line_never_prints_undefined(tmp_path: Path, monkeypatch) 
     with rig.serving():
         out = _drive(tmp_path, f"{rig.origin}/nope", [
             DESKTOP, rig.authenticator(), *_open(rig), _stub(),
-            {"eval": f"window.__stub['/answer'] = {bare}; {_button('b')}.click() || 1"},
+            {"tap": f"{_button('b')}", "before": f"window.__stub['/answer'] = {bare}; 1"},
             {"until": f"/^signed/.test({NOTE}) && {NOTE}", "ms": 30000},
         ])
     said = out["values"][-1]
@@ -522,8 +525,8 @@ def test_h9_a_close_while_a_ceremony_is_in_flight_shows_it_unsure_until_the_re_r
         out = _drive(tmp_path, f"{rig.origin}/#write_token={TOK}", [
             DESKTOP, rig.authenticator(), *OPEN_FRAMED,
             _stub(f"{FRAME}.contentWindow"),
-            {"eval": f"{FRAME}.contentWindow.__stub['/challenge'] = {HANG}; "
-                     f"{IN}.querySelector('#sheet-actions [data-choice=\"b\"]').click() || 1"},
+            {"tap": f"{IN}.querySelector('#sheet-actions [data-choice=\"b\"]')",
+             "before": f"{FRAME}.contentWindow.__stub['/challenge'] = {HANG}; 1"},
             {"eval": CLOSE_IN_FRAME},
             {"until": f"{FRAME}.contentWindow.__reads >= 1 && /still open/.test({IN}.getElementById('sheet-note').textContent) && 1",
              "ms": 30000, "may_timeout": True},
@@ -550,7 +553,7 @@ def test_h10_and_h13_an_unsigned_line_is_relabelled_and_the_notice_has_no_double
     with rig.serving():
         out = _drive(tmp_path, f"{rig.origin}/nope", [
             DESKTOP, rig.authenticator(), *_open(rig), _stub(),
-            {"eval": f"window.__stub['/challenge'] = {refused}; {_button('b')}.click() || 1"},
+            {"tap": f"{_button('b')}", "before": f"window.__stub['/challenge'] = {refused}; 1"},
             {"until": f"/nothing was signed/.test({NOTE}) && {NOTE}", "ms": 30000},
             {"eval": SIGNING},
         ])
@@ -566,7 +569,7 @@ def test_h10_after_unsure_the_signing_line_reads_not_confirmed(tmp_path: Path, m
     with rig.serving():
         out = _drive(tmp_path, f"{rig.origin}/nope", [
             DESKTOP, rig.authenticator(), *_open(rig), _stub(),
-            {"eval": f"window.__stub['/answer'] = {LOST_BEFORE_SEND}; {_button('b')}.click() || 1"},
+            {"tap": f"{_button('b')}", "before": f"window.__stub['/answer'] = {LOST_BEFORE_SEND}; 1"},
             {"until": f"{ENABLED} && 1", "ms": 30000},
             {"eval": SIGNING},
         ])
@@ -580,8 +583,7 @@ def test_h10_while_the_attempt_read_is_out_the_line_is_not_confirmed(tmp_path: P
     with rig.serving():
         out = _drive(tmp_path, f"{rig.origin}/nope", [
             DESKTOP, rig.authenticator(), *_open(rig), _stub(),
-            {"eval": f"window.__stub['/answer'] = {LOST_BEFORE_SEND}; window.__stub['/attempt'] = {HANG}; "
-                     f"{_button('b')}.click() || 1"},
+            {"tap": _button('b'), "before": f"window.__stub['/answer'] = {LOST_BEFORE_SEND}; window.__stub['/attempt'] = {HANG}; 1"},
             {"until": f"/Asking the cockpit/.test({NOTE}) && 1", "ms": 30000},
             {"eval": SIGNING},
             {"eval": f"[{_button('a')}.disabled, {_button('b')}.disabled]"},
@@ -596,8 +598,7 @@ def test_h11_an_attempt_read_the_cockpit_refuses_stays_not_confirmed_and_offers_
     with rig.serving():
         out = _drive(tmp_path, f"{rig.origin}/nope", [
             DESKTOP, rig.authenticator(), *_open(rig), _stub(),
-            {"eval": f"window.__stub['/answer'] = {LOST_BEFORE_SEND}; window.__stub['/attempt'] = {UNPAIRED_READ}; "
-                     f"{_button('b')}.click() || 1"},
+            {"tap": _button('b'), "before": f"window.__stub['/answer'] = {LOST_BEFORE_SEND}; window.__stub['/attempt'] = {UNPAIRED_READ}; 1"},
             {"until": "document.getElementById('sheet-recheck') && 1", "ms": 30000},
             {"eval": NOTE},
             {"eval": f"[{_button('a')}.disabled, {_button('b')}.disabled]"},
@@ -637,7 +638,7 @@ def test_h14_no_deadline_timer_is_left_pending_after_a_fetch_settles(tmp_path: P
         out = _drive(tmp_path, f"{rig.origin}/nope", [
             DESKTOP, rig.authenticator(), *_open(rig), _stub(), {"eval": track},
             # a real challenge post, answered by the real server's refusal path is not needed: a stubbed refusal is a whole fetch
-            {"eval": f"window.__stub['/challenge'] = {refused}; {_button('b')}.click() || 1"},
+            {"tap": f"{_button('b')}", "before": f"window.__stub['/challenge'] = {refused}; 1"},
             {"until": f"/nothing was signed/.test({NOTE}) && 1", "ms": 30000},
             {"eval": "[...window.__live.values()].filter((ms) => ms >= 15000).length"},
         ])
@@ -666,7 +667,7 @@ def test_h15_a_close_after_the_attempt_settled_leaves_at_once(tmp_path: Path, mo
         out = _drive(tmp_path, f"{rig.origin}/#write_token={TOK}", [
             DESKTOP, rig.authenticator(), *OPEN_FRAMED,
             _stub(f"{FRAME}.contentWindow"),
-            {"eval": f"{FRAME}.contentWindow.__stub['/answer'] = {LOST_AFTER_SEND}; {CHOICE_IN('b')}.click() || 1"},
+            {"tap": f"{CHOICE_IN('b')}", "before": f"{FRAME}.contentWindow.__stub['/answer'] = {LOST_AFTER_SEND}; 1"},
             {"until": f"(!{FRAME} || {IN}.getElementById('sheet').dataset.state === 'signed') && 1", "ms": 30000},
             {"eval": f"{FRAME} ? ({CLOSE_IN_FRAME}) : 1"},
             {"eval": FRAME_STILL_UP},
@@ -687,7 +688,7 @@ def test_h16_a_signed_ceremony_with_no_server_line_still_reads_signed(tmp_path: 
     with rig.serving():
         out = _drive(tmp_path, f"{rig.origin}/nope", [
             DESKTOP, rig.authenticator(), *_open(rig), _stub(),
-            {"eval": f"window.__stub['/challenge'] = {no_line}; {_button('b')}.click() || 1"},
+            {"tap": f"{_button('b')}", "before": f"window.__stub['/challenge'] = {no_line}; 1"},
             {"until": f"/^signed/.test({NOTE}) && 1", "ms": 30000},
             {"eval": SIGNING},
         ])
@@ -702,8 +703,8 @@ def test_h17_the_close_read_back_never_overwrites_a_signed_outcome(tmp_path: Pat
         out = _drive(tmp_path, f"{rig.origin}/#write_token={TOK}", [
             DESKTOP, rig.authenticator(), *OPEN_FRAMED,
             _stub(f"{FRAME}.contentWindow"),
-            {"eval": f"{FRAME}.contentWindow.__stub['/answer'] = {_hold('__answer')}; "
-                     f"{FRAME}.contentWindow.__stub['.json'] = {_hold('__read')}; {CHOICE_IN('b')}.click() || 1"},
+            {"tap": CHOICE_IN('b'), "before": f"{FRAME}.contentWindow.__stub['/answer'] = {_hold('__answer')}; "
+                                              f"{FRAME}.contentWindow.__stub['.json'] = {_hold('__read')}; 1"},
             {"until": f"typeof window.__answer === 'function' && 1", "ms": 30000},
             {"eval": CLOSE_IN_FRAME},                                  # the read-back is now held
             {"until": f"typeof window.__read === 'function' && 1", "ms": 30000},
@@ -725,7 +726,7 @@ def test_h18_the_close_read_back_names_a_changed_request(tmp_path: Path, monkeyp
         out = _drive(tmp_path, f"{rig.origin}/#write_token={TOK}", [
             DESKTOP, rig.authenticator(), *OPEN_FRAMED,
             _stub(f"{FRAME}.contentWindow"),
-            {"eval": f"{FRAME}.contentWindow.__stub['/challenge'] = {HANG}; {CHOICE_IN('b')}.click() || 1"},
+            {"tap": f"{CHOICE_IN('b')}", "before": f"{FRAME}.contentWindow.__stub['/challenge'] = {HANG}; 1"},
             {"eval": f"{FRAME}.contentWindow.__stub['.json'] = {changed}; 1"},
             {"eval": CLOSE_IN_FRAME},
             {"until": f"{FRAME}.contentWindow.__reads >= 1 && /changed|still open/.test({NOTE_IN}) && {NOTE_IN}", "ms": 30000},
@@ -741,12 +742,12 @@ def test_h19_a_close_asked_in_one_ceremony_does_not_leave_the_next_one(tmp_path:
         out = _drive(tmp_path, f"{rig.origin}/#write_token={TOK}", [
             DESKTOP, rig.authenticator(), *OPEN_FRAMED,
             _stub(f"{FRAME}.contentWindow"),
-            {"eval": f"{FRAME}.contentWindow.__stub['/challenge'] = {HOLD_THEN_FAIL}; {CHOICE_IN('b')}.click() || 1"},
+            {"tap": f"{CHOICE_IN('b')}", "before": f"{FRAME}.contentWindow.__stub['/challenge'] = {HOLD_THEN_FAIL}; 1"},
             {"eval": CLOSE_IN_FRAME},
             {"until": f"/still open/.test({NOTE_IN}) && 1", "ms": 30000},
             {"eval": f"window.__fail() || 1"},          # the first ceremony ends, unsigned
             {"until": f"!{CHOICE_IN('b')}.disabled && 1", "ms": 30000},
-            {"eval": f"{FRAME}.contentWindow.__stub['/challenge'] = {HANG}; {CHOICE_IN('b')}.click() || 1"},
+            {"tap": f"{CHOICE_IN('b')}", "before": f"{FRAME}.contentWindow.__stub['/challenge'] = {HANG}; 1"},
             {"until": f"/^Signing:/.test({SIGNING_IN}) && 1", "ms": 30000},
             {"eval": CLOSE_IN_FRAME},                                  # a first close of the second ceremony
             {"eval": FRAME_STILL_UP},
@@ -776,7 +777,7 @@ def test_i1_a_card_ceremony_in_flight_locks_the_sheet_button_and_the_sheet_canno
             DESKTOP, rig.authenticator(),
             {"until": STRIP_FACET + " && 1", "ms": 30000},
             _stub(),
-            {"eval": f"window.__stub['/challenge'] = {HANG}; {CARD_OPTION_A}.click() || 1"},
+            {"tap": f"{CARD_OPTION_A}", "before": f"window.__stub['/challenge'] = {HANG}; 1"},
             {"until": f"{OPEN_SHEET}.disabled && 1", "ms": 10000, "may_timeout": True},
             {"eval": f"{OPEN_SHEET}.disabled"},
             {"eval": f"window.LevainSignSheet.open('{QRID}') === null && !document.getElementById('levain-sign-sheet')"},
@@ -791,11 +792,12 @@ def test_i1_an_open_sheet_holds_the_lease_so_a_card_tap_asks_for_no_challenge(tm
     with rig.serving():
         out = _drive(tmp_path, f"{rig.origin}/#write_token={TOK}", [
             DESKTOP, rig.authenticator(), *OPEN_FRAMED,
+            # the sheet's overlay covers the card, so no finger reaches it: the lease is read before any passkey door
             {"eval": f"{CARD_OPTION_A}.click() || 1"},
             {"eval": CARD_NOTE},
             {"eval": PARENT_X + ".click() || 1"},
             {"until": f"!{FRAME} && 1", "ms": 5000},
-            {"eval": f"{CARD_OPTION_A}.click() || 1"},
+            {"tap": f"{CARD_OPTION_A}"},
             # a settle only: the virtual authenticator answers at once, so the note passes through "asking" and on to its
             # final text between polls on a slow runner (run 40685220828); the proof the tap ran is the challenge POST below
             {"until": f"/asking|confirm|challenge/.test({CARD_NOTE}) && {CARD_NOTE}", "ms": 5000, "may_timeout": True},
@@ -814,7 +816,7 @@ def test_i2_the_parents_close_while_the_answer_is_held_stays_open_then_the_secon
         out = _drive(tmp_path, f"{rig.origin}/#write_token={TOK}", [
             DESKTOP, rig.authenticator(), *OPEN_FRAMED,
             _stub(f"{FRAME}.contentWindow"),
-            {"eval": f"{FRAME}.contentWindow.__stub['/answer'] = {_hold('__answer')}; {CHOICE_IN('b')}.click() || 1"},
+            {"tap": f"{CHOICE_IN('b')}", "before": f"{FRAME}.contentWindow.__stub['/answer'] = {_hold('__answer')}; 1"},
             {"until": "typeof window.__answer === 'function' && 1", "ms": 30000},
             {"eval": PARENT_X + ".click() || 1"},
             {"eval": AFTER_MS(2500)},                                    # past the parent's acknowledgement window
@@ -853,7 +855,7 @@ def test_i3_a_cancelled_retry_keeps_the_remembered_credential(tmp_path: Path, mo
         out = _drive(tmp_path, f"{rig.origin}/nope", [
             DESKTOP, rig.authenticator(), _seed("localhost", {fp: CARD_CRED}),
             *_open(rig), {"eval": cancel},
-            {"eval": f"{_button('b')}.click() || 1"},
+            {"tap": f"{_button('b')}"},
             {"until": f"/nothing was signed/.test({NOTE}) && 1", "ms": 30000},
             {"eval": "window.localStorage.getItem('levain-passkeys:localhost')"},
         ])
@@ -884,7 +886,7 @@ def test_i5_the_signer_picker_is_not_a_ceremony_in_flight(tmp_path: Path, monkey
     with rig.serving():
         out = _drive(tmp_path, f"{rig.origin}/#write_token={TOK}", [
             DESKTOP, *OPEN_FRAMED,
-            {"eval": f"{CHOICE_IN('b')}.click() || 1"},
+            {"tap": f"{CHOICE_IN('b')}"},
             {"until": f"{IN}.querySelector('#sheet-actions .sheet-key') && 1", "ms": 30000},
             {"eval": CLOSE_IN_FRAME},
             {"until": f"!{FRAME} && 1", "ms": 3000, "may_timeout": True},
@@ -1002,3 +1004,27 @@ def test_the_real_sheet_reads_the_shape_deep_link_and_the_old_ports_redirect_emi
         assert got[2] == "Sign (b)" and got[3].startswith("Your pick: (b)"), v
         assert got[4] == 0, v                               # nothing asked of the passkey on load
     assert not any("phone_token" in p or "OLDTOKEN" in p for p in out["posts"]), out["posts"]
+
+
+@needs_browser
+@needs_ssh
+def test_an_evaluated_click_on_the_sheet_asks_for_no_passkey_and_keeps_the_remembered_one(tmp_path: Path, monkeypatch) -> None:
+    """sign.js's door: a script's .click() is not a person's tap. No prompt; the sheet says none was shown; the door's own
+    refusal (NoTapError) is not a cancel, so the next real tap still asks for the remembered passkey by its id."""
+    rig = _Rig(tmp_path, monkeypatch)
+    fp = rig.pk.key.fingerprint
+    with rig.serving():
+        out = _drive(tmp_path, f"{rig.origin}/nope", [
+            DESKTOP, rig.authenticator(), _seed("localhost", {fp: CARD_CRED}), *_open(rig), {"eval": ASKED},
+            {"eval": f"{_button('b')}.click() || 1"},
+            {"until": f"/No passkey prompt was shown/.test({NOTE}) && {NOTE}", "ms": 30000},
+            {"eval": "new Promise((r) => setTimeout(() => r(window.__asked), 1000))"},
+            {"tap": _button("b"), "ms": 30000},
+            {"until": f"/^signed/.test({NOTE}) && {NOTE}", "ms": 90000},
+            {"eval": "window.__asked"},
+        ])
+    v = out["values"]
+    assert "nothing was signed" in v[-5], v[-5]
+    assert v[-4] == [], v                                   # the evaluated click asked for nothing
+    assert v[-1] == [CARD_CRED], v                          # the tap asked once, for the remembered passkey by its id
+    assert rig.verifies(QRID)

@@ -35,7 +35,7 @@ def test_s1_an_answer_still_on_its_way_is_fenced_by_its_attempt_read_and_never_l
         out = _drive(tmp_path, f"{rig.origin}/#write_token={TOK}", [
             *_card(rig),
             {"eval": LATE_COMMIT.format(tail=json.dumps("/answer"), ms=900)},
-            {"eval": f"{OPTION_B}.click() || 1"},
+            {"tap": f"{OPTION_B}"},
             {"until": f"!{OPTION_B}.disabled && {FACET_NOTE}", "ms": 30000},
             {"eval": AFTER.format(ms=1500)},                  # past the late answer's arrival
             {"eval": BUTTONS},
@@ -56,7 +56,7 @@ def test_s1_s6_an_answer_that_never_left_comes_back_on_its_attempts_refusal_and_
         out = _drive(tmp_path, f"{rig.origin}/#write_token={TOK}", [
             *_card(rig),
             {"eval": NEVER_SENT.format(tail=json.dumps("/answer"))},
-            {"eval": f"{OPTION_B}.click() || 1"},
+            {"tap": f"{OPTION_B}"},
             {"until": f"!{OPTION_B}.disabled && {FACET_NOTE}", "ms": 30000},
             {"eval": AFTER.format(ms=2500)},
             {"eval": "window.__reloads"},
@@ -75,7 +75,7 @@ def test_s2_a_cancelled_prompt_keeps_the_remembered_passkey(tmp_path, monkeypatc
         out = _drive(tmp_path, f"{rig.origin}/#write_token={TOK}", [
             *_card(rig, _remember(rig, OTHER)),
             {"eval": CANCEL_ALL},
-            {"eval": f"{OPTION_B}.click() || 1"},
+            {"tap": f"{OPTION_B}"},
             {"until": f"/nothing was signed/.test({FACET_NOTE}) && {FACET_NOTE}", "ms": 30000},
             {"eval": "window.__gets"},
             {"eval": RECORD},
@@ -96,7 +96,7 @@ def test_s3_a_remembered_entry_that_cannot_be_an_id_is_purged(tmp_path, monkeypa
             *_card(rig),
             {"eval": f"window.localStorage.setItem('levain-passkeys:localhost', {json.dumps(json.dumps({fp: '', 'x': None, 'y': 5}))}) || 1"},
             {"eval": CANCEL_ALL},
-            {"eval": f"{OPTION_B}.click() || 1"},
+            {"tap": f"{OPTION_B}"},
             {"until": f"/nothing was signed/.test({FACET_NOTE}) && {FACET_NOTE}", "ms": 30000},
             {"eval": RECORD},
         ])
@@ -111,7 +111,7 @@ def test_s4_a_corrupt_record_is_no_record_and_the_card_signs(tmp_path, monkeypat
         out = _drive(tmp_path, f"{rig.origin}/#write_token={TOK}", [
             *_card(rig),
             {"eval": "window.localStorage.setItem('levain-passkeys:localhost', '{not json') || 1"},
-            {"eval": f"{OPTION_B}.click() || 1"},
+            {"tap": f"{OPTION_B}"},
             {"until": f"/^signed|nothing was signed|not sure/.test({FACET_NOTE}) && {FACET_NOTE}", "ms": 30000},
             {"eval": RECORD},
         ])
@@ -130,7 +130,7 @@ def test_s5_an_attempt_read_that_rejects_is_said_and_the_card_stays_frozen(tmp_p
             *_card(rig),
             {"eval": NEVER_SENT.format(tail=json.dumps("/answer"))},
             {"eval": ONE_THROWS.format(tail=json.dumps("/attempt"))},
-            {"eval": f"{OPTION_B}.click() || 1"},
+            {"tap": f"{OPTION_B}"},
             {"until": f"/could not be read/.test({FACET_NOTE}) && {FACET_NOTE}", "ms": 15000},
             {"eval": BUTTONS},
         ])

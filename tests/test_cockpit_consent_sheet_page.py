@@ -123,7 +123,7 @@ def test_a_consent_answer_signs_in_the_sheet_and_the_queue_verifies_it(tmp_path:
             DESKTOP, rig.authenticator(), *rig.open_top(),
             {"eval": "document.getElementById('sheet-title').textContent"},
             {"eval": "[...document.querySelectorAll('#sheet-actions [data-choice]')].map(b => b.dataset.choice).join(',')"},
-            {"eval": "document.querySelector('#sheet-actions [data-choice=\"allow\"]').click() || 1"},
+            {"tap": "document.querySelector('#sheet-actions [data-choice=\"allow\"]')"},
             {"until": f"/^signed/.test({NOTE}) && {NOTE}", "ms": 30000},
             {"eval": "(document.getElementById('sheet-signing') || {}).textContent"},
         ])
@@ -179,7 +179,7 @@ def test_an_undecided_request_is_ruled_in_the_sheet(tmp_path: Path, monkeypatch)
     with rig.serving():
         out = _drive(tmp_path, f"{rig.origin}/nope", [
             DESKTOP, rig.authenticator(), *rig.open_top(rid),
-            {"eval": "document.querySelector('#sheet-actions [data-choice=\"deny\"]').click() || 1"},
+            {"tap": "document.querySelector('#sheet-actions [data-choice=\"deny\"]')"},
             {"until": f"/^signed/.test({NOTE}) && {NOTE}", "ms": 30000},
         ])
     v = out["values"]

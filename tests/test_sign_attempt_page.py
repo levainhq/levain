@@ -45,7 +45,7 @@ def test_red_the_sheet_never_re_arms_over_an_answer_that_then_signs(tmp_path: Pa
     with rig.serving():
         out = _drive(tmp_path, f"{rig.origin}/nope", [
             DESKTOP, rig.authenticator(), *_open(rig), _stub(),
-            {"eval": f"window.__stub['/answer'] = {SHEET_LATE.format(ms=LATE_MS)}; {_button('b')}.click() || 1"},
+            {"tap": f"{_button('b')}", "before": f"window.__stub['/answer'] = {SHEET_LATE.format(ms=LATE_MS)}; 1"},
             {"eval": AFTER.format(ms=LATE_MS + 2500)},
             {"eval": SHEET_ARMED},
             {"eval": NOTE},
@@ -68,7 +68,7 @@ def test_red_the_card_never_re_arms_over_an_answer_that_then_signs(tmp_path: Pat
         out = _drive(tmp_path, f"{rig.origin}/#write_token={TOK}", [
             *_card(rig),
             {"eval": CARD_LATE.format(tail=json.dumps("/answer"), ms=LATE_MS)},
-            {"eval": f"{OPTION_B}.click() || 1"},
+            {"tap": f"{OPTION_B}"},
             {"eval": AFTER.format(ms=LATE_MS + 2500)},
             {"eval": BUTTONS},
             {"eval": FACET_NOTE},
@@ -109,7 +109,7 @@ def test_the_sheet_holds_an_answer_still_verifying_not_confirmed_until_check_aga
         go = _hold_verify(monkeypatch, 8.0)
         out = _drive(tmp_path, f"{rig.origin}/nope", [
             DESKTOP, rig.authenticator(), *_open(rig), _stub(),
-            {"eval": f"window.__stub['/answer'] = {SHEET_SENT_THEN_LOST}; {_button('b')}.click() || 1"},
+            {"tap": f"{_button('b')}", "before": f"window.__stub['/answer'] = {SHEET_SENT_THEN_LOST}; 1"},
             {"until": f"/still verifying/.test({NOTE}) && {NOTE}", "ms": 30000},
             {"eval": SHEET_ARMED},
             {"eval": f"(document.getElementById('sheet-signing') || {{}}).textContent"},
@@ -138,7 +138,7 @@ def test_the_card_holds_an_answer_still_verifying_frozen_until_a_board_read_find
         out = _drive(tmp_path, f"{rig.origin}/#write_token={TOK}", [
             DESKTOP, rig.authenticator(), {"until": STRIP_FACET + " && 1", "ms": 30000},
             {"eval": CARD_SENT_THEN_LOST.format(tail=json.dumps("/answer"))},
-            {"eval": f"{OPTION_B}.click() || 1"},
+            {"tap": f"{OPTION_B}"},
             {"until": f"/still verifying/.test({FACET_NOTE}) && {FACET_NOTE}", "ms": 30000},
             {"eval": BUTTONS},
             {"eval": AFTER.format(ms=3000)},                  # the board read after "not sure" has come and gone

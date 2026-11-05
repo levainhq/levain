@@ -37,7 +37,7 @@ def test_a_card_signed_in_the_cockpit_records_the_credential_that_signed(tmp_pat
             DESKTOP, rig.authenticator(),
             {"until": STRIP_FACET + " && 1", "ms": 30000},
             {"eval": SPY},
-            {"eval": f"{OPTION_B}.click() || 1"},
+            {"tap": f"{OPTION_B}"},
             {"until": f"/^signed/.test({FACET_NOTE}) && {FACET_NOTE}"},
             {"eval": "JSON.stringify(window.__allow)"},
         ])
@@ -62,7 +62,7 @@ def test_a_fresh_browser_asks_for_the_credential_the_cockpit_holds(tmp_path, mon
             {"until": STRIP_FACET + " && 1", "ms": 30000},
             {"eval": "Object.keys(window.localStorage).filter((k) => k.startsWith('levain-passkeys:')).length"},
             {"eval": SPY},
-            {"eval": f"{OPTION_B}.click() || 1"},
+            {"tap": f"{OPTION_B}"},
             {"until": f"/^signed/.test({FACET_NOTE}) && {FACET_NOTE}"},
             {"eval": "JSON.stringify(window.__allow)"},
         ])

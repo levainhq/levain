@@ -115,7 +115,7 @@ def test_a_dispatch_job_is_signed_in_the_sheet_and_the_store_verifies_it(tmp_pat
             DESKTOP, rig.authenticator(), *rig.open_top(),
             {"eval": "document.getElementById('sheet-title').textContent"},
             {"eval": "[...document.querySelectorAll('#sheet-actions [data-choice]')].map(b => b.dataset.choice).join(',')"},
-            {"eval": "document.querySelector('#sheet-actions [data-choice=\"sign\"]').click() || 1"},
+            {"tap": "document.querySelector('#sheet-actions [data-choice=\"sign\"]')"},
             {"until": f"/^signed/.test({NOTE}) && {NOTE}", "ms": 30000},
             {"eval": "(document.getElementById('sheet-signing') || {}).textContent"},
         ])
@@ -140,7 +140,7 @@ def test_a_dispatch_job_is_cancelled_in_the_sheet_with_its_reason(tmp_path: Path
         out = _drive(tmp_path, f"{rig.origin}/nope", [
             DESKTOP, rig.authenticator(), *rig.open_top(),
             {"eval": "(() => { const b = document.getElementById('sheet-reason'); b.value = '  wrong repo  '; return 1; })()"},
-            {"eval": "document.querySelector('#sheet-actions [data-choice=\"cancel\"]').click() || 1"},
+            {"tap": "document.querySelector('#sheet-actions [data-choice=\"cancel\"]')"},
             {"until": f"/^signed/.test({NOTE}) && {NOTE}", "ms": 30000},
         ])
     v = out["values"]
@@ -317,7 +317,7 @@ def test_an_authorise_whose_recommendation_moved_between_card_and_tap_signs_noth
                      "c.get = (o) => { window.__gets++; return g(o); }; return 1; })()"},
             {"eval": f"/Authorise run 1 onto main/.test({box}.textContent)"},
             {"eval": "[...document.querySelectorAll('#sheet-actions [data-choice]')].map(b => b.dataset.choice).join(',')"},
-            {"eval": "document.querySelector('#sheet-actions [data-choice=\"authorise\"]').click() || 1"},
+            {"tap": "document.querySelector('#sheet-actions [data-choice=\"authorise\"]')"},
             {"until": f"/nothing was signed/.test({NOTE}) && {STATE} === 'open' && "
                       f"/Authorise run 0 onto main/.test({box}.textContent) && {NOTE}", "ms": 30000},
             {"eval": "window.__gets"},
@@ -343,7 +343,7 @@ def test_an_authorise_on_the_card_shown_lands_it(tmp_path: Path, monkeypatch) ->
     with rig.serving():
         out = _drive(tmp_path, f"{rig.origin}/nope", [
             DESKTOP, rig.authenticator(), *rig.open_top(),
-            {"eval": "document.querySelector('#sheet-actions [data-choice=\"authorise\"]').click() || 1"},
+            {"tap": "document.querySelector('#sheet-actions [data-choice=\"authorise\"]')"},
             {"until": f"/^(signed|Not)/.test({NOTE}) && {NOTE}", "ms": 60000},
         ])
     v = out["values"]
@@ -455,7 +455,7 @@ def test_an_authorise_whose_card_moved_is_refused_by_the_cockpit_before_any_pass
         sheet.step = step
         out = _drive(tmp_path, f"{rig.origin}/nope", [
             DESKTOP, rig.authenticator(), *rig.open_top(), {"eval": GETS},
-            {"eval": "document.querySelector('#sheet-actions [data-choice=\"authorise\"]').click() || 1"},
+            {"tap": "document.querySelector('#sheet-actions [data-choice=\"authorise\"]')"},
             {"until": f"/changed since it was shown/.test({NOTE}) && {STATE} === 'open' && "
                       f"/Authorise run 0 onto main/.test({box}.textContent) && {NOTE}", "ms": 30000},
             {"eval": "window.__gets"},
