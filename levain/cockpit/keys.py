@@ -64,6 +64,11 @@ class KeyError_(Exception):      # noqa: N801 - not the builtin
     """A refused key act; the message is the operator-facing reason."""
 
 
+class RealKeyReached(KeyError_, AssertionError):
+    """A test run reached the real operator key: a ``KeyError_`` (the sign step records it as an unsigned
+    ``signer-error``) that is also an ``AssertionError``, so a test that expects either kind of refusal sees one."""
+
+
 def pwd_key_dir() -> Path:
     """``<real home>/.levain/keys`` from the password database, never ``$HOME`` or ``$LEVAIN_HOME``."""
     import pwd
@@ -87,7 +92,7 @@ def refuse_real_key_in_tests(path: Path | str | None, what: str = "the key") -> 
     except (OSError, RuntimeError, KeyError):
         return
     if target == real or real in target.parents:
-        raise KeyError_(f"refused: {what} ({target}) is inside the real operator key directory {real}, and a test "
+        raise RealKeyReached(f"a test reached the real terminal key (Touch ID): {what} ({target}) is inside the real operator key directory {real}, and a test "
                         "run must never reach it (a Touch ID sheet would open on the live laptop); pass a temp key_dir "
                         "and a fake signer")
 

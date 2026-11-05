@@ -72,3 +72,8 @@ def test_temp_key_dir_is_untouched(tmp_path):
     K.refuse_real_key_in_tests(tmp_path / "keys")
     K.refuse_real_key_in_tests(None)
     assert ts.find_key(tmp_path / "nowhere") is None
+
+
+def test_refusal_is_a_key_error_and_an_assertion_error(fixture_bypassed):
+    with pytest.raises(AssertionError, match="real terminal key"):
+        ts.default_signer_factory(REAL / ts.KEY_LABEL, 1.0)
