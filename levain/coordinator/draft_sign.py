@@ -31,6 +31,12 @@ A kept review is held by the phone object (``CoordPhone._draft_reviews``), bound
 expires with :data:`levain.coordinator.phone.REVIEW_TTL`. The cockpit passes one constant device for every page, so the
 binding separates devices only on a door that resolves a paired device per request. No kept state is trusted past the
 store: the acceptance never reads it.
+
+Known edge: ``draft-challenge`` writes ``minted`` without the phone's lock, and a second challenge for the same review
+id (sequential or concurrent; the page's ``hbusy`` sends one) replaces the first, so an accept of the first payload is
+refused 422 "not the one this review's challenge was minted for" when the two payloads differ (they differ in
+``signed_at``; two challenges on one clock value are identical and the first assertion stays acceptable): nothing is
+signed, and the page refreshes its cards, so the review is read again before the next Sign.
 """
 from __future__ import annotations
 

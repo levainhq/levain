@@ -3,7 +3,8 @@ external spec URL and tag (S1_DESIGN §5 S1-b; the second-seat read before the f
 import re
 from pathlib import Path
 
-from tests._contracts_vectors import BY_KIND_BEGIN, BY_KIND_END, FROZEN, render_by_kind
+from tests._contracts_vectors import (BY_KIND_BEGIN, BY_KIND_END, FROZEN, NAMESPACES_BEGIN, NAMESPACES_END,
+                                      render_by_kind, render_namespaces)
 
 DOC = (Path(__file__).resolve().parent.parent / "docs" / "contracts.md").read_text(encoding="utf-8")
 
@@ -11,6 +12,11 @@ DOC = (Path(__file__).resolve().parent.parent / "docs" / "contracts.md").read_te
 def test_the_vectors_by_kind_block_is_generated_from_the_vector_files():
     start, end = DOC.index(BY_KIND_BEGIN), DOC.index(BY_KIND_END) + len(BY_KIND_END)
     assert DOC[start:end] + "\n" == render_by_kind(), "regenerate: python -m tests._contracts_vectors"
+
+
+def test_the_f11_namespace_list_is_generated_from_the_registry():
+    start, end = DOC.index(NAMESPACES_BEGIN), DOC.index(NAMESPACES_END) + len(NAMESPACES_END)
+    assert DOC[start:end] + "\n" == render_namespaces(), "regenerate: python -m tests._contracts_vectors namespaces"
 
 
 def test_every_frozen_item_has_a_section():
