@@ -4,6 +4,7 @@ worktree on macOS. It is host-independent and pure, and every accepted case is c
 """
 from __future__ import annotations
 
+import contextlib
 import os
 import subprocess
 
@@ -230,6 +231,29 @@ def test_a_mode_outside_the_blob_modes_is_check_failed(tree):
         hash_of(tree, [entry(repo, "a", "100664")])
 
 
+@contextlib.contextmanager
+def _failing_os(monkeypatch, seam, eio):
+    """``os.<seam>`` fails with ``eio`` only inside this block (``read`` is a parameter of the hash, not an ``os``
+    attribute, so it is not patched here). History: a process-wide ``os.fstat`` that always raised also failed
+    callers outside the hash (CI 2026-11-05, py3.12 and 3.13 on Linux: an ``EIO`` surfaced with no frame of the test
+    or the product above it, so it came from a caller of ``os.fstat`` that is not ours); the wrapper delegates to the
+    real call outside the block, so only the product's own call site is faulted."""
+    if seam == "read":
+        yield
+        return
+    real = getattr(os, seam)
+    armed = []
+
+    def wrapper(*a, **k):
+        return eio(*a, **k) if armed else real(*a, **k)
+    monkeypatch.setattr(os, seam, wrapper)
+    armed.append(True)
+    try:
+        yield
+    finally:
+        armed.clear()
+
+
 @pytest.mark.parametrize("seam", ["dup", "fstat", "read"])
 def test_an_oserror_is_check_failed(tree, monkeypatch, seam):
     """L3_win2_r1 gemini LOW: every failure of the pass is ``CheckFailed`` (clone_check's contract)."""
@@ -237,15 +261,18 @@ def test_an_oserror_is_check_failed(tree, monkeypatch, seam):
     put(repo, "d/a", b"a\n")
     ents = [entry(repo, "d/a")]
 
-    def eio(*_a, **_k):
+    hits = []
+
+    def eio(*a, **_k):
+        hits.append(a)
         raise OSError(5, "EIO")
     kw = {}
     if seam == "read":
         kw["read"] = eio
-    else:
-        monkeypatch.setattr(os, seam, eio)
     with pytest.raises(SS.CheckFailed, match="root hash failed \\(errno 5\\)"):
-        hash_of(tree, ents, **kw)
+        with _failing_os(monkeypatch, seam, eio):
+            hash_of(tree, ents, **kw)
+    assert hits, f"the {seam} fault never reached the hash: the test proved nothing"
 
 
 def test_absent_file_refuses(tree):
