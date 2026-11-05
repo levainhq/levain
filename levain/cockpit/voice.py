@@ -10,6 +10,8 @@ The call sequence is the design's section 3 and its order is the point:
 
 1. validate the request (nothing read or written on a refusal);
 2. (speak) the room thread must be the open room, and the words are the RECORD's reply, never the page's;
+   then, both routes: the consent hooks must name ``data_root`` as their one cockpit (:func:`revoke_reaches`), so the
+   grant page's revoke reaches the key about to be read; else ``revoke_unreachable``, nothing reserved or read;
 3. ``meter.reserve`` (a cap, an unpriced model or a meter that cannot be used refuses here, and no key is read);
 4. ``custody.read_key`` (a fresh verified replay, then the keychain): a :class:`~levain.voice.custody.Secret`;
 5. the adapter call, with ``secret.reveal()`` written INLINE in its argument list, so no name in any frame of this
@@ -122,6 +124,8 @@ WORDS = {
     "no_tts_key": "The {p} key is not set for reading aloud.",
     "no_stt_key": "The {p} key is not set for dictation.",
     "authority_unreadable": "Levain could not verify its authority log just now; premium voice is off until it can.",
+    "revoke_unreachable": ("Premium voice is off: the phone's grant page revokes keys in a different cockpit from the "
+                           "one this Levain reads voice keys from."),
     "keychain_unreadable": "Levain could not read the key from this Mac's keychain (it may be locked).",
     "key_unusable": "The keychain item for {p} does not hold a usable key; set it again on the laptop.",
     "bad_call": "Premium voice could not use that request.",
@@ -277,11 +281,29 @@ def _end(meter: vmeter.Meter, reservation_id: int, release: bool) -> None:
                      "released" if release else "settled", failed)
 
 
-def _call(provider: str, use: str, units: int, data_root: Path | str, *, meter: vmeter.Meter,
+def revoke_reaches(directory: Path | str, data_root: Path | str) -> bool:
+    """Whether a revoke from the grant page reaches the voice keys at ``data_root``: the consent hooks of the store
+    directory ``directory`` name exactly one cockpit (what :func:`levain.consent.sign.sign_root` takes, so what the
+    grant routes and ``grants.json`` act on) and it is ``data_root``. Re-read on every call: the hook file can change
+    while the server runs. Any fault reading it is False."""
+    from levain.consent.answering import hook_roots
+
+    try:
+        roots = hook_roots(Path(directory))
+        return len(roots) == 1 and roots[0].resolve() == Path(data_root).resolve()
+    except Exception:            # noqa: BLE001 - a hook that cannot be read names no cockpit: fail closed
+        return False
+
+
+def _call(provider: str, use: str, units: int, data_root: Path | str, *, directory: Path | str, meter: vmeter.Meter,
           read_key: Callable[..., Any], last_read: MutableMapping[str, str | None],
           send: Callable[[Any], Any]) -> tuple[Any, Answer | None]:
-    """Steps 3 to 6 of the module docstring for one call. ``send(secret)`` makes the adapter call and must write
-    ``secret.reveal()`` inline in the adapter's argument list. Returns ``(result, None)`` or ``(None, refusal)``."""
+    """Steps 3 to 6 of the module docstring for one call, after the revoke-reach check (:func:`revoke_reaches`): a
+    key whose revoke from the phone could not reach it is never read, and nothing is reserved. ``send(secret)`` makes
+    the adapter call and must write ``secret.reveal()`` inline in the adapter's argument list. Returns
+    ``(result, None)`` or ``(None, refusal)``."""
+    if not revoke_reaches(directory, data_root):
+        return None, refusal(503, "revoke_unreachable", "revoke_unreachable", fallback=True)
     model = PROVIDERS[provider].tts_model if use == "tts" else PROVIDERS[provider].stt_model
     try:
         check = meter.reserve(provider, use, model, units)
@@ -405,8 +427,8 @@ def speak(directory: Path | str, data_root: Path | str, service: Any, raw: bytes
     words = chunks[req["chunk"]]
     adapter = vprov.provider_for(provider, transport)
     voice, speed = req["voice"], req["speed"]
-    audio, refused = _call(provider, "tts", len(words), data_root, meter=meter, read_key=read_key,
-                           last_read=last_read,
+    audio, refused = _call(provider, "tts", len(words), data_root, directory=directory, meter=meter,
+                           read_key=read_key, last_read=last_read,
                            send=lambda secret: adapter.speak(secret.reveal(), words, voice, speed))
     if refused is not None:
         return refused
@@ -431,11 +453,12 @@ def _query_provider(query: str) -> tuple[str | None, Answer | None]:
     return provider, None
 
 
-def transcribe(data_root: Path | str, query: str, content_type: str, audio: bytes, *, meter: vmeter.Meter,
-               transport: vprov.Transport, read_key: Callable[..., Any],
+def transcribe(data_root: Path | str, query: str, content_type: str, audio: bytes, *, directory: Path | str,
+               meter: vmeter.Meter, transport: vprov.Transport, read_key: Callable[..., Any],
                last_read: MutableMapping[str, str | None]) -> Answer:
     """``POST /cockpit/voice/transcribe?provider=``: ``{"text": ...}`` for the audio body. The audio is never written
-    or logged; the ledger holds the estimated seconds only (:func:`upload_units`)."""
+    or logged; the ledger holds the estimated seconds only (:func:`upload_units`). ``directory`` is the store
+    directory, whose consent hooks :func:`revoke_reaches` reads."""
     provider, refused = _query_provider(query)
     if refused is not None or provider is None:
         return refused or internal_answer()
@@ -445,8 +468,8 @@ def transcribe(data_root: Path | str, query: str, content_type: str, audio: byte
     if not audio:
         return refusal(400, "no_audio", "no_audio")
     adapter = vprov.provider_for(provider, transport)
-    text, refused = _call(provider, "stt", upload_units(len(audio)), data_root, meter=meter, read_key=read_key,
-                          last_read=last_read,
+    text, refused = _call(provider, "stt", upload_units(len(audio)), data_root, directory=directory, meter=meter,
+                          read_key=read_key, last_read=last_read,
                           send=lambda secret: adapter.transcribe(secret.reveal(), audio, mime, ""))
     del audio
     if refused is not None:
