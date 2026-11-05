@@ -27,7 +27,7 @@ from typing import TYPE_CHECKING, Callable, Iterable, Literal
 from levain.firing.hands import HostOS, Step, _abs
 from levain.launch import child_env
 from levain.slot import Refused
-from levain.slot.layout import ROOT_GROUP, service_entry_path
+from levain.slot.layout import ROOT_GROUP, dispatch_store_dir, service_entry_path
 from levain.slot.root_tree import PY_FLAGS, ROOT_PYTHON
 
 if TYPE_CHECKING:
@@ -122,12 +122,25 @@ def launchd_path(svc: Service) -> Path:
     return LAUNCHD_DIR / f"{launchd_label(svc)}.plist"
 
 
+#: The directory a logging service's file sits in when the service does not run as root, by account. launchd opens the
+#: path in the job's child AFTER it has dropped to ``UserName`` (Apple's launchd ``core.c``: ``job_setup_attributes`` runs
+#: ``job_postfork_become_user`` first, then ``job_setup_fd`` for the stdout and stderr paths), so root's ``/var/log`` is
+#: closed to such an account (EACCES, the line lost). A directory the account owns is open under either order of the drop.
+_OWN_LOG_DIR: dict[str, Callable[[HostOS], Path]] = {"_levain_dispatch": dispatch_store_dir}
+
+
 def launchd_log_path(svc: Service) -> Path:
-    """Where launchd appends a logging service's stdout and stderr (under root's ``/var/log``), so the pf one-shot's
-    "restored pf" / "not retried" line from a boot run, and the dispatch run server's unnamed-failure line, can be read
-    afterwards. launchd creates the file; no code here sets its owner or mode. The pf program keeps its file's size
-    bounded (:func:`levain.slot.services.pf.bound_log`); the dispatch run server does not trim its own."""
-    return Path("/var/log") / f"{launchd_label(svc)}.log"
+    """Where launchd appends a logging service's stdout and stderr, so the pf one-shot's "restored pf" / "not retried"
+    line from a boot run, and the dispatch run server's unnamed-failure line, can be read afterwards. A root service's
+    file is under ``/var/log``; another account's is inside the directory that account owns (:data:`_OWN_LOG_DIR`: for
+    ``_levain_dispatch`` its store ``L/dispatch``, made by the store rows before any unit is bootstrapped), never a
+    directory it cannot create in. Each program keeps its file's size bounded (:func:`levain.slot.services.pf.bound_log`;
+    the dispatch run server's own)."""
+    if svc.user == "root":
+        return Path("/var/log") / f"{launchd_label(svc)}.log"
+    if svc.user not in _OWN_LOG_DIR:
+        raise Refused("bad-token", f"{svc.name}: no log directory for the account {svc.user!r}")
+    return _OWN_LOG_DIR[svc.user]("darwin") / f"{launchd_label(svc)}.log"
 
 
 def launchd_plist_text(svc: Service) -> str:

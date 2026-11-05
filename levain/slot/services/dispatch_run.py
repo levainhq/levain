@@ -56,6 +56,7 @@ import signal
 import socket
 import sqlite3
 import subprocess
+import stat
 import sys
 import traceback
 import threading
@@ -346,12 +347,34 @@ class _Holder:
         self.job: Optional[_EndJob] = None
 
 
+#: [judged] the size past which the launchd log (the inherited stderr) is emptied before a line is written to it: a few
+#: MiB holds thousands of one-line causes, and the file under KeepAlive=always has no other bound.
+LOG_MAX_BYTES = 4 << 20
+#: serializes the size check and the truncate with the writes of the handler threads, which report concurrently
+_LOG_LOCK = threading.Lock()
+
+
+def _bound_log(fd: int = 2) -> None:
+    """Empty ``fd``'s file when it is a regular file past :data:`LOG_MAX_BYTES`. launchd opens the unit's log for
+    appending and never trims it, and the account cannot replace it, so the program trims the descriptor it inherited.
+    A terminal, a pipe or a closed descriptor is left alone. (``pf.bound_log`` has this shape but no lock and a 1 MiB cap,
+    and importing the pf program here would pull in the install helper.)"""
+    try:
+        with _LOG_LOCK:
+            st = os.fstat(fd)
+            if stat.S_ISREG(st.st_mode) and st.st_size > LOG_MAX_BYTES:
+                os.ftruncate(fd, 0)
+    except OSError:
+        pass
+
+
 def _report_failure(op: str, exc: BaseException) -> None:
     """ONE stderr line for an unexpected failure that is about to answer `internal-error`: the op, the exception's type
     and the file:line of its last frame. Never ``str(exc)``: it can carry a path, a key or a ticket from the request.
     Stderr is the unit's log (journald on Linux); it was `_log.warning` before, which reaches no stream unless a
     handler is configured, so the cause appeared nowhere on the box (VM finding 5)."""
     try:
+        _bound_log()
         tb = traceback.extract_tb(exc.__traceback__)
         where = f"{os.path.basename(tb[-1].filename)}:{tb[-1].lineno}" if tb else "?"
         print(f"levain dispatch-run: op {str(op)[:32]!r} failed: {type(exc).__name__} at {where}", file=sys.stderr, flush=True)
@@ -818,6 +841,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     if me is None or os.geteuid() != me:
         print(f"levain dispatch-run: must run as {ACCOUNT} (the service unit runs it)", file=sys.stderr)
         return EX_WRONG_USER
+    _bound_log()      # a restart under KeepAlive starts from a bounded file
     args = list(sys.argv[1:] if argv is None else argv)
     if args[:1] == [NAME]:
         args = args[1:]
@@ -876,8 +900,8 @@ def build_server(host: str, store: Path, control_sock: Path, operator_uid: int) 
 def service_row():
     """The unit row this program runs under: ``Service("dispatch_run", ...)`` as ``_levain_dispatch``, always restarted,
     after CONTROL and gw-keys, its stdout and stderr kept in the launchd log: the same row as
-    ``levain.slot.units.by_name("dispatch_run")`` (registered in S10b slice R, with its run dir ``R/dispatch``). A golden for the plist this row renders is in
-    ``tests/test_slot_dispatch_run_server.py``."""
+    ``levain.slot.units.by_name("dispatch_run")`` (registered in S10b slice R, with its run dir ``R/dispatch``; a test
+    pins the two equal). A golden for the plist this row renders is in ``tests/test_slot_service_dispatch.py``."""
     from levain.slot.units import Service
     return Service(NAME, "dispatch run server", ACCOUNT, ("control", "keys"), "always", logs=True)
 

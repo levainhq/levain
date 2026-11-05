@@ -63,8 +63,9 @@ _BASE_RENDERS = {
                "bba7ea59e0cfd3ec98488124db756571e22c2cd14f05e05613866750e453292b"),
     # added with its registration (S10b slice R), not on bcb41e68: the sha256 of the row's own render, the Linux one
     # through ``_at_bcb41e68`` like the rest. The plist hash was re-pinned when the row gained its stderr path (logs=True,
-    # finding 5); the Linux unit is unchanged (systemd's journal already keeps stderr).
-    "dispatch_run": ("61b1d4dc68d5d21b53d9916d669981f949a13f49251fc4cf83bea78ef6f4c229",
+    # finding 5) and again when that path moved into the account's own store dir; the Linux unit is unchanged
+    # (systemd's journal already keeps stderr).
+    "dispatch_run": ("de2c2e2087b41ca39e3a837eb25a5cca99b98d18e21f62d74762d351c50218eb",
                      "2651a0f918d026efac2e19d3ad5189063ae7a6e87d840e827e7452c71ac86eae"),
     "pf": ("bf226f0434c4c2598d98d34c84a254c1ed9d137812e9d78fb5002a30d4ee82d7", None),  # pfboot: the boot log paths (logs=True)
 }
@@ -95,18 +96,42 @@ def test_dispatch_unit_is_on_failure_and_every_other_render_is_unchanged():
             assert _sha(_at_bcb41e68(units.systemd_unit_text(others[name]))) == unit, name
 
 
-def test_dispatch_run_plist_names_a_stderr_path_in_roots_log_dir_beside_the_pf_unit():
-    """Finding 5: with no StandardErrorPath launchd threw away the one stderr line that names an unnamed failure, so
-    every such failure reached the caller as a bare `internal-error` with no cause anywhere on the box."""
+def test_dispatch_run_plist_names_a_stderr_path_inside_the_directory_its_account_owns():
+    """Finding 5, and its L3 r1 HIGH: launchd opens StandardErrorPath in the child AFTER the drop to UserName, so a path in
+    root's /var/log would fail EACCES and the one line that names an unnamed failure would still be lost. The path is
+    inside ``L/dispatch``, which the store rows make owned by the job's own account before any unit is bootstrapped."""
     run = units.by_name("dispatch_run")
     job = plistlib.loads(units.launchd_plist_text(run).encode())
-    assert job["StandardErrorPath"] == job["StandardOutPath"] == str(units.launchd_log_path(run))
-    assert units.launchd_log_path(run) == Path("/var/log/com.levain.dispatch_run.log")
-    # the same directory the pf unit's log sits in; the unit still runs as its own account (the file is launchd's, not its)
-    assert Path(job["StandardErrorPath"]).parent == units.launchd_log_path(units.by_name("pf")).parent
+    log = units.launchd_log_path(run)
+    assert job["StandardErrorPath"] == job["StandardOutPath"] == str(log)
     assert job["UserName"] == "_levain_dispatch" and job["KeepAlive"] is True
-    # the Linux unit takes no such key: systemd's journal keeps a service's stderr
-    assert "StandardError" not in units.systemd_unit_text(run)
+    # built from the layout, never a literal: a file directly inside the account's own store dir
+    assert log == layout.dispatch_store_dir("darwin") / "com.levain.dispatch_run.log"
+    rows = {r.path: r for r in layout.base_store_rows("darwin", "op")}
+    own = rows[log.parent]
+    assert own.owner == job["UserName"] and own.mode & 0o700 == 0o700 and own.kind == "dir"
+    # a root service keeps its file in root's log dir; no non-root service's file is there
+    assert units.launchd_log_path(units.by_name("pf")) == Path("/var/log/com.levain.pf.log")
+    assert not str(log).startswith("/var/log/")
+
+
+def test_a_logging_service_of_an_account_with_no_log_directory_is_refused():
+    from levain.slot import Refused
+    stray = units.Service("stray", "stray", "_levain_keys", (), "always", logs=True)
+    with pytest.raises(Refused):
+        units.launchd_log_path(stray)
+    with pytest.raises(Refused):
+        units.launchd_plist_text(stray)
+
+
+def test_the_dispatch_run_linux_unit_keeps_its_exact_lines_and_names_no_log_file():
+    """systemd's journal keeps a service's stderr; the unit's [Service] lines are exactly these."""
+    text = units.systemd_unit_text(units.by_name("dispatch_run"))
+    service = text.split("[Service]\n", 1)[1].split("\n\n", 1)[0].splitlines()
+    assert service == ["Type=simple", "User=_levain_dispatch", "Group=_levain_dispatch",
+                       "ExecStart=" + " ".join(units.argv("linux", units.by_name("dispatch_run"))),
+                       "Restart=always", "RestartSec=1", "RestartSteps=5", "RestartMaxDelaySec=30",
+                       "RestartPreventExitStatus=78 77"]
 
 
 @pytest.mark.parametrize("host", ("darwin", "linux"))
