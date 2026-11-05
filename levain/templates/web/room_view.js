@@ -112,7 +112,7 @@
   // three backticks to the line closing with three), drawn as <pre><code> from the lines between. An unclosed fence (a reply
   // still streaming) stays plain text, backticks and all; nothing else is parsed.
   function fillText(doc, node, text) {
-    var lines = text.split("\n"), parts = [], cur = [], i = 0;
+    var lines = text.split(/\r?\n/), parts = [], cur = [], i = 0;
     while (i < lines.length) {
       if (/^ {0,3}```/.test(lines[i])) {
         var j = i + 1;
@@ -247,17 +247,19 @@
     var store = opts.storage === undefined ? (function () { try { return root.sessionStorage; } catch (e) { return null; } })() : opts.storage;
     var stopped = false, timer = 0, gen = 0, last = "", thread = null, current = null, ui = { open: {} }, drafts = {};
     var wrap = el(doc, "div", "rv"), stage = el(doc, "div", "rv-stage"), body = el(doc, "div", "rv-body"), dock = el(doc, "div", "rv-dock"),
-      jumpB = el(doc, "button", "rv-jump", "Jump to latest"), hushed = "";
+      jumpB = el(doc, "button", "rv-jump", "Jump to latest"), hushed = null;
     jumpB.setAttribute("type", "button"); jumpB.hidden = true;
     stage.appendChild(body); stage.appendChild(jumpB); wrap.appendChild(stage); wrap.appendChild(dock); host.appendChild(wrap);
     // On a phone the conversation is its own scroll box that ends above the dock: it follows the newest line while it is at its
     // end, and holds its place (with a way back down) once scrolled up. Where the box does not scroll (a desk) none of this shows.
     function atEnd() { return body.scrollHeight - body.scrollTop - body.clientHeight <= 48; }
-    function paintJump() { jumpB.hidden = atEnd(); }
+    function paintJump() { if (!stopped) jumpB.hidden = atEnd(); }
     function toEnd() { body.scrollTop = body.scrollHeight; }
     var wasEnd = true;       // at its end as of the last scroll or draw: a resize (a phone turned) keeps a box that was at its end there
     body.addEventListener("scroll", function () { wasEnd = atEnd(); paintJump(); });
-    if (root.addEventListener) root.addEventListener("resize", function () { if (!stopped && wasEnd) toEnd(); paintJump(); });
+    // kept by name so stop() can remove it: a stopped mount left its listener, and the detached tree it held, on the window
+    var onResize = function () { if (!stopped && wasEnd) toEnd(); paintJump(); };
+    if (root.addEventListener) root.addEventListener("resize", onResize);
     jumpB.addEventListener("click", function () { toEnd(); paintJump(); });
     var ta = el(doc, "textarea", "rv-input"), actions = el(doc, "div", "rv-actions"),
       sendB = el(doc, "button", "rv-send", "Send"), dropB = el(doc, "button", "rv-drop", "Drop"),
@@ -390,7 +392,9 @@
       rotB.disabled = true; note.textContent = "Starting a new conversation...";
       post("rotate", { room_thread_id: current && current.thread }).then(function (r) {
         note.textContent = r.status === 200 ? "A new conversation is open." : ((r.json && r.json.message) || "No new conversation was started.");
-        if (r.status === 200 && current) hushed = current.error;        // the old conversation's problem is not the new one's
+        // a one-poll bridge: the old conversation's problem is not the new one's, but a read that still names the OLD
+        // thread is only the server catching up. The same error on a new thread is a new problem and shows.
+        if (r.status === 200 && current && current.error) hushed = { thread: current.thread, error: current.error };
         last = ""; return pull();
       }).catch(function () { note.textContent = "The server could not be reached."; }).then(paintDock);
     });
@@ -501,7 +505,10 @@
           if (t !== last) {
             last = t;
             current = roomModel(JSON.parse(t));
-            if (hushed && current.error === hushed) current.error = ""; else hushed = "";
+            if (hushed) {
+              if (current.thread === hushed.thread && current.error === hushed.error) current.error = "";
+              hushed = null;                // spent on its first poll, or sooner when the thread or the error moved
+            }
             var stick = thread === null || atEnd();
             if (current.thread !== thread) {
               stick = true;
@@ -520,7 +527,7 @@
     function loop() { if (!stopped && pollMs > 0) timer = setTimeout(function () { pull().then(loop); }, pollMs); }
     paintDock();
     pull().then(loop);
-    return { stop: function () { stopped = true; clearTimeout(timer); endDictation(); }, refresh: function () { last = ""; return pull(); }, model: function () { return current; } };
+    return { stop: function () { stopped = true; clearTimeout(timer); endDictation(); if (root.removeEventListener) root.removeEventListener("resize", onResize); }, refresh: function () { last = ""; return pull(); }, model: function () { return current; } };
   }
 
   var api = { roomModel: roomModel, lineModel: lineModel, sendWords: sendWords, renderRoom: renderRoom, mount: mount };

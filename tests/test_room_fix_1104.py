@@ -73,10 +73,12 @@ def test_the_ended_notice_leads_with_a_sentence_wraps_its_ids_and_clears_on_a_ne
             {"eval": "const n = document.querySelector('.rv-banner'); JSON.stringify({lead: n.querySelector('.rv-banner-lead').textContent, detail: n.querySelector('.rv-detail').textContent.slice(0, 40),"
                      " wrap: getComputedStyle(n.querySelector('.rv-detail')).overflowWrap, fits: n.scrollWidth <= n.clientWidth + 1})"},
             {"eval": "document.querySelector('.rv-rotate').click(); new Promise(r => setTimeout(() => r(document.querySelectorAll('.rv-banner').length), 600))"},
+            {"eval": "window.__body = Object.assign({}, window.__body, {room_thread: 't2'}); window.__rv.refresh().then(() => document.querySelectorAll('.rv-banner').length)"},
         ])
     n = json.loads(out["values"][1])
     assert n["lead"].startswith("The room ran into a problem") and n["detail"].startswith("The room reported: pump: CoordError") and n["wrap"] == "anywhere" and n["fits"], n
-    assert out["values"][2] == 0
+    assert out["values"][2] == 0      # the old thread still on the wire: the old error stays hushed for that poll
+    assert out["values"][3] == 1      # the same error persisting on the new conversation shows the banner
 
 
 def test_the_room_has_a_jump_entry_in_the_views_strip_that_targets_its_zone():
@@ -93,3 +95,64 @@ def test_the_phone_rules_free_the_card_clamp_and_keep_the_dock_in_flow():
     assert "body.ke .rv-zone .ck-zgrid .panel { height: auto; max-height: none; }" in block and ".rv .rv-body { max-height: 62vh" in block
     assert "overflow-wrap: anywhere" in block and "position: sticky" in block      # the notice, not the dock
     assert "rv-dock" not in block
+
+
+def _assets_from(boot):
+    return {"/rvc.html": ("text/html; charset=utf-8", _PAGE.encode()), "/rvc.js": ("text/javascript; charset=utf-8", boot.encode())}
+
+
+_ERR = 'room_error: "pump: CoordError: no driver session is attached to launch ln-1da8"'
+
+
+@needs_browser
+def test_stop_removes_the_resize_listener_and_a_resize_after_stop_paints_nothing(tmp_path, w):
+    # round 1 (roomfix L3): the resize listener outlived stop() and kept painting a detached jump button
+    spy = ('window.__rs = new Set(); const ae = window.addEventListener.bind(window), re = window.removeEventListener.bind(window);'
+           'window.addEventListener = (t, h, o) => { if (t === "resize") window.__rs.add(h); return ae(t, h, o); };'
+           'window.removeEventListener = (t, h, o) => { if (t === "resize") window.__rs.delete(h); return re(t, h, o); };')
+    with _serve_room(tmp_path, w, extra_assets=_assets_from(spy + _BOOT)) as (base, _h):
+        out = _drive(tmp_path, base + "/rvc.html", [
+            {"until": "document.querySelectorAll('.rv-line').length >= 30"},
+            {"eval": "window.__rs.size"},
+            {"eval": "window.__rv.stop(); const j = document.querySelector('.rv-jump'); j.hidden = true; window.dispatchEvent(new Event('resize'));"
+                     " new Promise(r => setTimeout(() => r(JSON.stringify({left: window.__rs.size, jumpHidden: j.hidden})), 100))"},
+        ])
+    assert out["values"][1] == 1, out["values"]
+    assert json.loads(out["values"][2]) == {"left": 0, "jumpHidden": True}
+
+
+@needs_browser
+def test_the_same_error_on_the_new_conversation_shows_the_banner_again(tmp_path, w):
+    # round 1 (roomfix L3): a repeated identical error stayed hushed forever; a rotate now moves the room to a new thread
+    boot = _BOOT.replace('room_error: window.__err || null', _ERR).replace(
+        'window.__posts.push(u);', 'window.__posts.push(u); if (/rotate/.test(u)) window.__body = Object.assign({}, window.__body, {room_thread: "t2"});')
+    with _serve_room(tmp_path, w, extra_assets=_assets_from(boot)) as (base, _h):
+        out = _drive(tmp_path, base + "/rvc.html", [
+            {"until": "document.querySelector('.rv-banner')"},
+            {"eval": "document.querySelector('.rv-rotate').click(); new Promise(r => setTimeout(() => r(document.querySelectorAll('.rv-banner').length), 600))"},
+        ])
+    assert out["values"][1] == 1
+
+
+@needs_browser
+def test_a_rotate_the_server_has_not_yet_shown_hides_the_old_error_for_one_poll_only(tmp_path, w):
+    boot = _BOOT.replace('room_error: window.__err || null', _ERR)       # the stub keeps answering with the OLD thread
+    with _serve_room(tmp_path, w, extra_assets=_assets_from(boot)) as (base, _h):
+        out = _drive(tmp_path, base + "/rvc.html", [
+            {"until": "document.querySelector('.rv-banner')"},
+            {"eval": "document.querySelector('.rv-rotate').click(); new Promise(r => setTimeout(() => r(document.querySelectorAll('.rv-banner').length), 600))"},
+            {"eval": "window.__body = Object.assign({}, window.__body, {room_thread: 't2'}); window.__rv.refresh()"
+                     ".then(() => document.querySelectorAll('.rv-banner').length)"},
+        ])
+    assert out["values"][1] == 0 and out["values"][2] == 1, out["values"]
+
+
+@needs_browser
+def test_a_fenced_block_in_a_crlf_body_is_pre_code(tmp_path, w):
+    boot = _BOOT.replace('"newest\\n\\n```py\\nx = 1 < 2\\n```\\n```unclosed\\nstill text"', '"newest\\r\\n\\r\\n```py\\r\\nx = 1 < 2\\r\\n```\\r\\n```unclosed\\r\\nstill text"')
+    assert "\\r\\n```py" in boot, "the CRLF substitution did not apply"
+    with _serve_room(tmp_path, w, extra_assets=_assets_from(boot)) as (base, _h):
+        out = _drive(tmp_path, base + "/rvc.html", [
+            {"until": "document.querySelectorAll('.rv-line').length >= 30"}, {"eval": _GEO}])
+    g = json.loads(out["values"][1])
+    assert g["pre"] == 1 and g["code"] == "x = 1 < 2" and not g["raw"], g
