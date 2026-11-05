@@ -6,6 +6,7 @@ into an error body, an exception, a repr or a log is something the tests can see
 
 from __future__ import annotations
 
+import dataclasses
 import io
 import json
 import logging
@@ -47,7 +48,8 @@ class Replay:
         self.seen: list[P.HttpRequest] = []
 
     def __call__(self, req: P.HttpRequest) -> P.HttpResponse:
-        self.seen.append(req)
+        # a copy: the adapter removes the key from the request's own headers once the transport returns
+        self.seen.append(dataclasses.replace(req, headers=dict(req.headers)))
         if self.raises is not None:
             raise self.raises
         return self.response
@@ -190,7 +192,8 @@ def test_a_200_with_no_audio_is_not_an_answer():
 
 # ---- refusals before any request ---------------------------------------------------------------------------------
 
-@pytest.mark.parametrize("key", ["", "has space", "line\nbreak", "tab\there", "nul\x00", "del\x7f", None, 123])
+@pytest.mark.parametrize("key", ["", "has space", "line\nbreak", "tab\there", "nul\x00", "del\x7f", None, 123,
+                                 "sk-curly’quote", "sk-nbsp x", "sk-é"])
 def test_an_unusable_key_is_refused_and_nothing_is_sent(key):
     t = Replay("speech_200")
     with pytest.raises(P.VoiceError) as info:
@@ -201,7 +204,8 @@ def test_an_unusable_key_is_refused_and_nothing_is_sent(key):
 
 @pytest.mark.parametrize("args", [("", "nova", 1.0), ("   ", "nova", 1.0), ("x" * (P.API_CAP + 1), "nova", 1.0),
                                   ("Hi.", "nova", 0.1), ("Hi.", "nova", 4.5), ("Hi.", "nova/../x", 1.0),
-                                  ("Hi.", "", 1.0), ("Hi.", "no va", 1.0)])
+                                  ("Hi.", "", 1.0), ("Hi.", "no va", 1.0), ("Hi.", "nova", True),
+                                  ("Hi.", "nova", "1.0"), ("Hi.", "nova", None), ("Hi.", "nova", float("nan"))])
 @pytest.mark.parametrize("make", [lambda t: P.OpenAIProvider(transport=t), lambda t: P.DeepgramProvider(transport=t)],
                          ids=["openai", "deepgram"])
 def test_speak_refuses_bad_input_before_sending(args, make):
@@ -396,6 +400,103 @@ def test_the_real_transport_refuses_an_oversize_response(monkeypatch):
     monkeypatch.setattr(P, "_OPENER", Opener())
     with pytest.raises(ValueError):
         P.urllib_transport(P.HttpRequest("POST", "https://api.openai.com/v1/audio/speech", {}, b""))
+
+
+def test_the_real_transport_reads_no_401_body_and_closes_every_error_response(monkeypatch):
+    class Body(io.BytesIO):
+        reads = 0
+
+        def read(self, *a):
+            self.reads += 1
+            return super().read(*a)
+
+    fps: list[Body] = []
+
+    class Opener:
+        def __init__(self, status: int) -> None:
+            self.status = status
+
+        def open(self, req, timeout=None):
+            fps.append(Body(b'{"error": {"code": "insufficient_quota", "message": "' + FAKE_KEY.encode() + b'"}}'))
+            raise urllib.error.HTTPError("https://api.openai.com/v1/audio/speech", self.status, "x", {}, fps[-1])
+
+    req = P.HttpRequest("POST", "https://api.openai.com/v1/audio/speech", {}, b"")
+    for status in (401, 403, 400, 500):
+        monkeypatch.setattr(P, "_OPENER", Opener(status))
+        resp = P.urllib_transport(req)
+        assert (resp.status, resp.body) == (status, b"") and fps[-1].reads == 0     # not even read
+    monkeypatch.setattr(P, "_OPENER", Opener(429))
+    assert P._code_for(429, P.urllib_transport(req).body) == "out_of_credit"
+    assert all(fp.closed for fp in fps) and len(fps) == 5
+
+
+def _strings(value, seen: set[int], depth: int = 0):
+    """Every string reachable from ``value`` through containers, instance dicts and slots (functions skipped)."""
+    if depth > 8 or id(value) in seen or callable(value):
+        return
+    seen.add(id(value))
+    if isinstance(value, (str, bytes)):
+        yield value if isinstance(value, str) else value.decode("latin-1")
+        return
+    if isinstance(value, dict):
+        children = [*value.keys(), *value.values()]
+    elif isinstance(value, (list, tuple, set, frozenset)):
+        children = list(value)
+    else:
+        children = list(getattr(value, "__dict__", {}).values())
+        children += [getattr(value, s, None) for s in getattr(type(value), "__slots__", ())]
+    for child in children:
+        yield from _strings(child, seen, depth + 1)
+
+
+def _provider_frames_hold_no_key(exc: BaseException) -> int:
+    tb, frames, seen = exc.__traceback__, 0, set()
+    while tb is not None:
+        if tb.tb_frame.f_globals.get("__name__") == P.__name__:
+            frames += 1
+            for s in _strings(dict(tb.tb_frame.f_locals), seen):
+                assert FAKE_KEY not in s and MARKER not in s, tb.tb_frame.f_code.co_name
+        tb = tb.tb_next
+    return frames
+
+
+@pytest.mark.parametrize("case", ["status_401", "transport_raises", "bad_shape_200", "bad_speed", "key_with_newline"])
+@pytest.mark.parametrize("make", [lambda t: P.OpenAIProvider(transport=t), lambda t: P.DeepgramProvider(transport=t)],
+                         ids=["openai", "deepgram"])
+def test_no_frame_on_a_failures_traceback_holds_the_key(case, make):
+    def raises(req):
+        raise TimeoutError("timed out")
+    transport = {"status_401": lambda req: fixture("openai_401"), "transport_raises": raises,
+                 "bad_shape_200": lambda req: P.HttpResponse(200, b'{"nope": 1}'),
+                 "bad_speed": lambda req: fixture("speech_200"),
+                 "key_with_newline": lambda req: fixture("speech_200")}[case]
+    prov = make(transport)
+    with pytest.raises((P.VoiceError, ValueError)) as info:
+        if case == "bad_shape_200":
+            prov.transcribe(FAKE_KEY, b"a", "audio/wav")
+        else:
+            prov.speak(FAKE_KEY + ("\n" if case == "key_with_newline" else ""), "Hi.",
+                       speed=9.0 if case == "bad_speed" else 1.0)
+    assert _provider_frames_hold_no_key(info.value) >= 1
+    rendered = "".join(traceback.TracebackException.from_exception(info.value, capture_locals=True).format())
+    assert FAKE_KEY not in rendered and MARKER not in rendered
+
+
+def test_every_adapter_model_is_priced_by_the_meter():
+    from levain.voice.meter import DEFAULT_PRICES
+    for name in P.HOSTS:
+        prov = P.provider_for(name)
+        assert DEFAULT_PRICES.find(name, "tts", prov.tts_model) is not None, name
+        assert DEFAULT_PRICES.find(name, "stt", prov.stt_model) is not None, name
+
+
+def test_a_deepgram_voice_outside_the_priced_family_is_refused_before_sending():
+    t = Replay("speech_200")
+    with pytest.raises(ValueError):
+        P.DeepgramProvider(transport=t).speak(FAKE_KEY, "Hi.", "aura-1-asteria-en")
+    assert t.seen == []
+    P.DeepgramProvider(transport=t).speak(FAKE_KEY, "Hi.", "aura-2-andromeda-en")
+    assert _query(t.seen[0].url)["model"] == ["aura-2-andromeda-en"]
 
 
 def test_an_unknown_provider_is_refused_and_the_known_ones_resolve():

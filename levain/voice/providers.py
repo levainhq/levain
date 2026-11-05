@@ -6,11 +6,16 @@ What an adapter holds and never holds:
 
 * **The key** arrives as a parameter of :meth:`speak` / :meth:`transcribe`, goes into one request's headers and is not
   kept. It is not an attribute of an adapter, a request's ``repr`` (headers and body are excluded from it), an exception
-  or a log line. A key the provider cannot be sent (empty, or holding a control character that would split a header) is
-  refused as a rejected key, naming nothing.
+  or a log line. The method's first act moves it into a :class:`_Key` (fixed ``repr``) and deletes its own name for it;
+  the ``_Key`` is emptied when the call ends and the request's ``Authorization`` header is removed as soon as the
+  transport returns or raises, so no frame of this module on a :class:`VoiceError`'s (or a ValueError's) traceback
+  holds the key, even for a tool that captures frame locals. The CALLER's own frame is the caller's to keep clean. A
+  key the provider cannot be sent (empty, or anything but printable ASCII with no space: a control character would
+  split a header, a pasted curly quote cannot be encoded) is refused as a rejected key, naming nothing.
 * **A provider's response body** is never surfaced. An OpenAI 401 body quotes part of the key it refused (design threat
-  T2, still to be confirmed against a real dead key), so the body is read for exactly one thing, whether a 429's
-  ``error.code`` is ``insufficient_quota``, and then dropped. What the operator sees is :class:`VoiceError`: a fixed code
+  T2, still to be confirmed against a real dead key), so :func:`urllib_transport` reads an error body only for a 429,
+  and only to learn whether its ``error.code`` is ``insufficient_quota``; the adapter drops every non-2xx body before it
+  raises. What the operator sees is :class:`VoiceError`: a fixed code
   and a fixed sentence (:data:`WORDS`), raised outside the ``except`` that caught the failure so no transport exception
   (which may quote a header) is chained to it.
 * **The host** is a constant per provider (:data:`HOSTS`), https only, and a redirect is never followed (the
@@ -30,7 +35,10 @@ Facts about the providers, and where each comes from (the design is ``project_me
 * Deepgram: ``mip_opt_out=true`` as a query parameter on the request URL is from Deepgram's model-improvement-programme page
   (read by the planning lane). The Aura-2 speech path (``/v1/speak``) and the Nova-3 pre-recorded path (``/v1/listen``),
   the ``Token`` authorization scheme, the ``encoding=mp3`` parameter and the transcript's place in the response are from
-  the design, not fetched: UNVERIFIED until a real call (the slice's named residue). Deepgram speech takes no speed here.
+  the design, not fetched: UNVERIFIED until a real call (the slice's named residue). Deepgram speech takes no speed here
+  (a review cites a documented ``speed`` query parameter, 0.7-1.5; unverified, so not sent until the first real call).
+  Deepgram bills Aura-2 as one family, so :attr:`DeepgramProvider.tts_model` is the priced family (``aura-2``) and the
+  voice sent as Deepgram's ``model`` must be one of that family's voices.
 * ElevenLabs is not built in this slice.
 
 No claim above about a provider's behaviour is tested against the provider: the fixtures under ``tests/fixtures/voice``
@@ -56,10 +64,13 @@ ALLOWED_HOSTS = frozenset(HOSTS.values())
 OPENAI_TTS_MODEL = "tts-1"                      # DATA: announced to shut down 2027-01-06 (module docstring)
 OPENAI_STT_MODEL = "gpt-4o-mini-transcribe"
 OPENAI_DEFAULT_VOICE = "nova"
+DEEPGRAM_TTS_MODEL = "aura-2"                   # the priced family (levain.voice.meter.DEFAULT_PRICES)
 DEEPGRAM_TTS_VOICE = "aura-2-thalia-en"         # a model id; from the design's "Aura-2", the voice name is not fetched
 DEEPGRAM_STT_MODEL = "nova-3"
 
-TIMEOUT = 30.0                                  # seconds, total; urllib has no separate connect timeout
+# Seconds, applied by urllib to EACH blocking socket operation (connect, each read), not to the whole call: a provider
+# trickling bytes could hold a call longer. Known edge, not bounded here (the two hosts are constants we chose).
+TIMEOUT = 30.0
 MAX_RESPONSE = 16 * 1024 * 1024                 # a response past this is not read: it is not an answer
 MIME_ALLOW = {"audio/webm": "webm", "audio/mp4": "mp4", "audio/mpeg": "mp3", "audio/wav": "wav"}
 SPEED_MIN, SPEED_MAX = 0.25, 4.0
@@ -121,7 +132,8 @@ _OPENER = urllib.request.build_opener(_NoRedirect)
 def urllib_transport(req: HttpRequest) -> HttpResponse:
     """The real transport: https to one of :data:`ALLOWED_HOSTS` only, a redirect answered as its 3xx status and never
     followed, a response read to at most :data:`MAX_RESPONSE` bytes. An error status is a response, not an exception;
-    an unreachable host raises, and the adapter maps that to ``unavailable``."""
+    an unreachable host raises, and the adapter maps that to ``unavailable``. An error body is read only for a 429 (its
+    ``error.code``); any other error status comes back with an empty body, and the error response is always closed."""
     parts = urllib.parse.urlsplit(req.url)
     if parts.scheme != "https" or parts.hostname not in ALLOWED_HOSTS or parts.username or parts.password:
         raise ValueError("destination is not an allowed voice provider")
@@ -131,10 +143,14 @@ def urllib_transport(req: HttpRequest) -> HttpResponse:
             body = resp.read(MAX_RESPONSE + 1)
             status = int(resp.status)
     except urllib.error.HTTPError as err:
+        body = b""
         try:
-            body = err.read(64 * 1024)
+            if err.code == 429:
+                body = err.read(64 * 1024)
         except Exception:   # noqa: BLE001 - an unreadable error body is an empty one
             body = b""
+        finally:
+            err.close()
         return HttpResponse(int(err.code), body)
     if len(body) > MAX_RESPONSE:
         raise ValueError("response too large")
@@ -165,27 +181,59 @@ def _code_for(status: int, body: bytes) -> str | None:
     return "rejected"
 
 
-def _send(transport: Transport, provider: str, req: HttpRequest) -> bytes:
-    """The body of a 2xx answer, or a :class:`VoiceError`. Whatever the transport raises is dropped here (it may quote a
-    header) and the error is raised OUTSIDE the ``except``, so it carries no chained context."""
-    failed = False
-    resp: HttpResponse | None = None
+class _Key:
+    """One call's key. Its ``repr`` is fixed, it holds nothing unless the key can be sent (printable ASCII, no space),
+    and leaving its ``with`` block empties it, so a frame that still names it after the call holds no key."""
+
+    __slots__ = ("_value",)
+
+    def __init__(self, key: object) -> None:
+        sendable = isinstance(key, str) and bool(key) and all(32 < ord(c) < 127 for c in key)
+        self._value: str | None = key if sendable else None    # type: ignore[assignment]
+
+    def __bool__(self) -> bool:
+        return self._value is not None
+
+    def __repr__(self) -> str:
+        return "<voice key>"
+
+    def __enter__(self) -> _Key:
+        return self
+
+    def __exit__(self, *exc: object) -> None:
+        self._value = None
+
+    def header(self, scheme: str) -> str:
+        return f"{scheme} {self._value}"
+
+
+def _exchange(transport: Transport, req: HttpRequest) -> tuple[str | None, bytes]:
+    """(the :data:`WORDS` code or None, the 2xx body or b""). Never raises: whatever the transport raises is dropped
+    here (it may quote a header), a non-2xx body is dropped here (it may quote the key), and the request's
+    ``Authorization`` header is removed the moment the transport is done with it."""
     try:
         resp = transport(req)
     except Exception:   # noqa: BLE001 - timeout, DNS, TLS, a redirect loop: all one fixed answer
-        failed = True
-    if failed or not isinstance(resp, HttpResponse):
-        raise VoiceError("unavailable", provider)
+        return "unavailable", b""
+    finally:
+        req.headers.pop("Authorization", None)
+    if not isinstance(resp, HttpResponse):
+        return "unavailable", b""
     code = _code_for(resp.status, resp.body)
+    return code, (resp.body if code is None else b"")
+
+
+def _send(transport: Transport, provider: str, key: _Key, scheme: str, url: str, headers: dict[str, str],
+          body: bytes) -> bytes:
+    """The body of a 2xx answer, or a :class:`VoiceError` raised outside any ``except`` (no chained context) from a
+    frame that holds no key and no provider body."""
+    if not key:
+        raise VoiceError("refused", provider)
+    req = HttpRequest("POST", url, {"Authorization": key.header(scheme), **headers}, body)
+    code, answer = _exchange(transport, req)
     if code is not None:
         raise VoiceError(code, provider)
-    return resp.body
-
-
-def _need_key(key: str, provider: str) -> str:
-    if not isinstance(key, str) or not key or any(ord(c) < 33 or ord(c) == 127 for c in key):
-        raise VoiceError("refused", provider)
-    return key
+    return answer
 
 
 def _need_speech(text: str, speed: float) -> None:
@@ -193,7 +241,7 @@ def _need_speech(text: str, speed: float) -> None:
         raise ValueError("nothing to speak")
     if len(text) > API_CAP:
         raise ValueError("text is over the provider's input cap; chunk it first")
-    if not SPEED_MIN <= speed <= SPEED_MAX:
+    if isinstance(speed, bool) or not isinstance(speed, (int, float)) or not SPEED_MIN <= speed <= SPEED_MAX:
         raise ValueError("speed is outside the provider's range")
 
 
@@ -247,28 +295,32 @@ class OpenAIProvider:
 
     def speak(self, key: str, text: str, voice: str = OPENAI_DEFAULT_VOICE, speed: float = 1.0) -> bytes:
         """mp3 bytes for ``text`` (at most :data:`API_CAP` characters) in ``voice`` at ``speed``."""
-        _need_speech(text, speed)
-        body = json.dumps({"model": self.tts_model, "input": text, "voice": _need_voice(voice), "speed": speed,
-                           "response_format": "mp3"}).encode("utf-8")
-        req = HttpRequest("POST", f"https://{HOSTS['openai']}/v1/audio/speech",
-                          {"Authorization": f"Bearer {_need_key(key, self.name)}", "Content-Type": "application/json",
-                           "Accept": "audio/mpeg"}, body)
-        audio = _send(self.transport, self.name, req)
+        secret = _Key(key)
+        del key                                             # from here only the emptied-on-exit _Key names it
+        with secret:
+            _need_speech(text, speed)
+            body = json.dumps({"model": self.tts_model, "input": text, "voice": _need_voice(voice), "speed": speed,
+                               "response_format": "mp3"}).encode("utf-8")
+            audio = _send(self.transport, self.name, secret, "Bearer", f"https://{HOSTS['openai']}/v1/audio/speech",
+                          {"Content-Type": "application/json", "Accept": "audio/mpeg"}, body)
         if not audio:
             raise VoiceError("unavailable", self.name)      # a 200 with no audio is not an answer
         return audio
 
     def transcribe(self, key: str, audio: bytes, mime: str, lang: str = "") -> str:
         """The text of ``audio``. An answer with no text is the empty string (the caller says "Heard nothing")."""
-        base = _need_audio(audio, mime)
-        fields = {"model": self.stt_model, "response_format": "json"}
-        if _need_lang(lang):
-            fields["language"] = lang.split("-")[0].lower()     # OpenAI takes an ISO-639-1 code
-        body, boundary = _multipart(fields, f"audio.{MIME_ALLOW[base]}", base, audio)
-        req = HttpRequest("POST", f"https://{HOSTS['openai']}/v1/audio/transcriptions",
-                          {"Authorization": f"Bearer {_need_key(key, self.name)}",
-                           "Content-Type": f"multipart/form-data; boundary={boundary}"}, body)
-        return _text_of(_send(self.transport, self.name, req), self.name, lambda j: j["text"])
+        secret = _Key(key)
+        del key
+        with secret:
+            base = _need_audio(audio, mime)
+            fields = {"model": self.stt_model, "response_format": "json"}
+            if _need_lang(lang):
+                fields["language"] = lang.split("-")[0].lower()     # OpenAI takes an ISO-639-1 code
+            body, boundary = _multipart(fields, f"audio.{MIME_ALLOW[base]}", base, audio)
+            answer = _send(self.transport, self.name, secret, "Bearer",
+                           f"https://{HOSTS['openai']}/v1/audio/transcriptions",
+                           {"Content-Type": f"multipart/form-data; boundary={boundary}"}, body)
+        return _text_of(answer, self.name, lambda j: j["text"])
 
 
 @dataclass(frozen=True)
@@ -277,6 +329,7 @@ class DeepgramProvider:
     the audio and text out of Deepgram's model-improvement programme; no setting turns it off."""
 
     transport: Transport = field(default=urllib_transport, repr=False)
+    tts_model: str = DEEPGRAM_TTS_MODEL      # the priced family; the voice sent is one of its voices
     stt_model: str = DEEPGRAM_STT_MODEL
     name: str = "deepgram"
     uses: frozenset[str] = frozenset({"tts", "stt"})
@@ -286,25 +339,33 @@ class DeepgramProvider:
         return f"https://{HOSTS['deepgram']}{path}?" + urllib.parse.urlencode({**query, "mip_opt_out": "true"})
 
     def speak(self, key: str, text: str, voice: str = DEEPGRAM_TTS_VOICE, speed: float = 1.0) -> bytes:
-        """mp3 bytes for ``text``. ``voice`` is an Aura-2 model id. ``speed`` is validated and not sent."""
-        _need_speech(text, speed)
-        req = HttpRequest("POST", self._url("/v1/speak", model=_need_voice(voice), encoding="mp3"),
-                          {"Authorization": f"Token {_need_key(key, self.name)}", "Content-Type": "application/json",
-                           "Accept": "audio/mpeg"}, json.dumps({"text": text}).encode("utf-8"))
-        audio = _send(self.transport, self.name, req)
+        """mp3 bytes for ``text``. ``voice`` is a voice of the :attr:`tts_model` family (an Aura-2 model id), so the
+        family the meter priced is the one billed. ``speed`` is validated and not sent."""
+        secret = _Key(key)
+        del key
+        with secret:
+            _need_speech(text, speed)
+            if not _need_voice(voice).startswith(f"{self.tts_model}-"):
+                raise ValueError("voice is not one of the priced model's voices")
+            audio = _send(self.transport, self.name, secret, "Token",
+                          self._url("/v1/speak", model=voice, encoding="mp3"),
+                          {"Content-Type": "application/json", "Accept": "audio/mpeg"},
+                          json.dumps({"text": text}).encode("utf-8"))
         if not audio:
             raise VoiceError("unavailable", self.name)
         return audio
 
     def transcribe(self, key: str, audio: bytes, mime: str, lang: str = "") -> str:
-        base = _need_audio(audio, mime)
-        query = {"model": self.stt_model, "smart_format": "true"}
-        if _need_lang(lang):
-            query["language"] = lang
-        req = HttpRequest("POST", self._url("/v1/listen", **query),
-                          {"Authorization": f"Token {_need_key(key, self.name)}", "Content-Type": base}, audio)
-        return _text_of(_send(self.transport, self.name, req), self.name,
-                        lambda j: j["results"]["channels"][0]["alternatives"][0]["transcript"])
+        secret = _Key(key)
+        del key
+        with secret:
+            base = _need_audio(audio, mime)
+            query = {"model": self.stt_model, "smart_format": "true"}
+            if _need_lang(lang):
+                query["language"] = lang
+            answer = _send(self.transport, self.name, secret, "Token", self._url("/v1/listen", **query),
+                           {"Content-Type": base}, audio)
+        return _text_of(answer, self.name, lambda j: j["results"]["channels"][0]["alternatives"][0]["transcript"])
 
 
 def _text_of(body: bytes, provider: str, pick: Callable[[dict], object]) -> str:
