@@ -361,23 +361,34 @@ def test_sigterm_mid_session_tears_down_then_closes_the_lease(tmp_path: Path, mo
     rig = Rig(tmp_path, monkeypatch, FAKE_START="wait")
     started = rig.store / "started"
 
+    over = threading.Event()   # set when run() has returned: a late SIGTERM would hit pytest itself, handlers restored
+
     def kill_when_started() -> None:
         deadline = time.monotonic() + 20
-        while not started.exists() and time.monotonic() < deadline:
+        while not started.exists() and not over.is_set() and time.monotonic() < deadline:
             time.sleep(0.02)
-        os.kill(os.getpid(), signal.SIGTERM)
+        if started.exists() and not over.is_set():
+            os.kill(os.getpid(), signal.SIGTERM)
 
     t = threading.Thread(target=kill_when_started, daemon=True)
+    # A no-op handler stands in for pytest's own for the whole run: the over-check and os.kill are not atomic, so a
+    # SIGTERM that lands after run() restored its handlers must be harmless, never the end of the pytest process.
+    outer = signal.signal(signal.SIGTERM, lambda *_: None)
     before = signal.getsignal(signal.SIGTERM)
     t.start()
-    code = rig.run()
-    t.join(5)
+    try:
+        code = rig.run()
+    finally:
+        over.set()
+        t.join(5)
+        restored = signal.getsignal(signal.SIGTERM)
+        signal.signal(signal.SIGTERM, outer)
     assert [x["verb"] for x in rig.verbs()] == ["prepare", "render", "probe", "start", "teardown"]
     assert code == 1
     assert "SIGTERM: ending session" in rig.stderr()
     assert f"session {SESSION} ended RETAINED" in rig.stderr()
     assert rig.calls[-1] == ("close",)
-    assert signal.getsignal(signal.SIGTERM) is before      # the handlers are put back
+    assert restored is before      # the handlers are put back
 
 
 @pytest.mark.parametrize("end,tail", [("RETAINED", "ended RETAINED: the work is kept"), ("HELD", "ended HELD: a step did not prove")])

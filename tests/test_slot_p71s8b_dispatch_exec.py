@@ -392,16 +392,47 @@ def test_10_np1_premise_adopt_and_review_are_the_only_writers_to_the_operators_r
     """NP-1 (Phill np-b8a7375b "15b") renders ``acceptEdits`` for the executor on this premise: the ONLY path from
     ``<S>/repo`` to the operator's repo is adopt (``slot/adopt_take``, the operator's ``levain session adopt``) and
     review/landing (``dispatch/adopt``, the dispatch artifact's landing). Derived, not listed: the modules that install
-    refs or objects in a git repo, by an AST walk. Three more write only a repo they themselves created, in a private
+    refs or objects in a git repo, by an AST walk. Four more write only a repo they themselves created, in a private
     scratch directory (the importer's ``.work`` repo, adopt-verify's preview repo, the read-set builder's temp
-    repo); each is named here with that reason, and a NEW writer anywhere under ``levain/slot`` or ``levain/dispatch``
-    fails this test until it is classified by a person."""
+    repo, the workspace snapshot builder's bare ``dest_dir``); each is named here with that reason, and a NEW writer
+    anywhere under ``levain/slot`` or ``levain/dispatch`` fails this test until it is classified by a person."""
     operator_writers = {"levain/slot/adopt_take.py", "levain/dispatch/adopt.py"}
-    private_scratch = {"levain/slot/importer.py", "levain/slot/adopt_verify.py", "levain/dispatch/readset.py"}
+    # dispatch/snapshot.py (S10w): build_snapshot only READS the operator's repo (rev-parse, ls-tree, cat-file); its one
+    # installing verb is fast-import into dest_dir, a bare repo it mkdirs itself (must not exist, refused inside the
+    # operator's repo). Held to that reason by test_10b below.
+    private_scratch = {"levain/slot/importer.py", "levain/slot/adopt_verify.py", "levain/dispatch/readset.py",
+                       "levain/dispatch/snapshot.py"}
     assert _slot_clone_to_operator_repo_writers() == operator_writers | private_scratch
     # and the adopt/review writers are reached by no root-helper verb: the helper's verbs never import them
     root_side = (REPO_ROOT / "levain" / "slot" / "runtime_helper.py").read_text()
     assert "adopt_take" not in root_side and "dispatch.adopt" not in root_side
+
+
+def test_10b_the_snapshot_builder_installs_only_into_the_dest_dir_it_made():
+    """test_10's ``dispatch/snapshot.py`` entry, held to its reason: every ``_git`` call there that carries an installing
+    verb (or ``init``) runs in ``dest_dir`` (its first argument is that name), only inside ``build_snapshot``, and
+    ``build_snapshot`` creates ``dest_dir`` with ``os.mkdir`` (so it cannot be a pre-existing repo); every other
+    ``_git`` call there is a read-only sub-command against the operator's ``repo``."""
+    installing = {"update-ref", "unbundle", "fetch", "am", "cherry-pick", "pull", "commit-tree", "write-tree", "push",
+                  "rebase", "read-tree", "fast-import", "index-pack", "unpack-objects", "mktree", "init"}
+    reads = {"rev-parse", "ls-tree", "cat-file"}
+    tree = ast.parse((REPO_ROOT / "levain" / "dispatch" / "snapshot.py").read_text())
+    build = next(n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name == "build_snapshot")
+    in_build = {id(n) for n in ast.walk(build)}
+    calls = [n for n in ast.walk(tree) if isinstance(n, ast.Call) and isinstance(n.func, ast.Name) and n.func.id == "_git"]
+    assert calls
+    seen_install = False
+    for c in calls:
+        verb = c.args[1].value if len(c.args) > 1 and isinstance(c.args[1], ast.Constant) else None
+        target = c.args[0].id if c.args and isinstance(c.args[0], ast.Name) else None
+        if verb in installing:
+            seen_install = True
+            assert target == "dest_dir" and id(c) in in_build, (c.lineno, verb, target)
+        else:
+            assert verb in reads, (c.lineno, verb)
+    assert seen_install
+    mkdirs = [n for n in ast.walk(build) if isinstance(n, ast.Call) and ast.unparse(n.func) == "os.mkdir"]
+    assert [ast.unparse(m.args[0]) for m in mkdirs] == ["dest_dir"]
 
 
 def test_11_the_kind_matrix_of_vendor_argv_is_unchanged_but_for_the_executor():

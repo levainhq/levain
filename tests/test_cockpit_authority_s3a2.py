@@ -640,6 +640,13 @@ SNAPSHOT_BUILDERS = {
     # AgentAuthority.replay is the autonomic engine's read-only anchored replay: the anchor is read before its
     # transaction, it appends nothing, and it was written to be the same kind of reader as graduation_policy._replay.
     (LEVAIN / "agent_authority.py", "replay"),
+    # AuthorityReplica._verify (S10b-B1, 1104-28_S10B_INSTALL_DESIGN §2: "runs authority.snapshot(conn)") is the WRITE
+    # path's verify, the same role as levain.authority.append's in-transaction replay: it runs inside the replica's
+    # BEGIN IMMEDIATE over the dispatch-owned replica (never the cockpit's store), decides COMMIT or ROLLBACK and feeds
+    # advance_anchor; append hands back only the (seq, hash) head, never a policy. The replica's READ path is
+    # replay() -> AgentAuthority.replay above. So no request reads policy from it. Held by
+    # test_the_replica_verify_is_only_the_append_transactions_check.
+    (LEVAIN / "agents" / "authority_replica.py", "_verify"),
 }
 
 
@@ -662,6 +669,21 @@ def test_the_fence_sees_a_planted_snapshot_call(tmp_path):
     probe.write_text("from levain import authority as a\nfrom levain.authority import snapshot as s\n"
                      "def reader(conn):\n    return a.snapshot(conn), s(conn)\n")
     assert sorted(_uses(probe, ("snapshot",))) == [("snapshot", "reader", 4), ("snapshot", "reader", 4)]
+
+
+def test_the_replica_verify_is_only_the_append_transactions_check():
+    """SNAPSHOT_BUILDERS' ``authority_replica._verify`` entry, held to its reason: ``_verify`` is called only from
+    ``_txn``, after that function's ``BEGIN IMMEDIATE`` and before its ``COMMIT``, and ``append`` returns a ``Head``
+    (``(seq, hash)``), so the snapshot it builds decides the write and reaches no reader."""
+    tree = ast.parse((LEVAIN / "agents" / "authority_replica.py").read_text(encoding="utf-8"))
+    callers = [n for n in ast.walk(tree) if isinstance(n, ast.Call) and _dotted(n.func) == "self._verify"]
+    txn = _function(tree, "_txn")
+    assert len(callers) == 1 and _within(callers[0], txn)
+    sql = {n.args[0].value: n.lineno for n in ast.walk(txn) if isinstance(n, ast.Call) and _dotted(n.func)
+           == "conn.execute" and n.args and isinstance(n.args[0], ast.Constant) and n.args[0].value in
+           ("BEGIN IMMEDIATE", "COMMIT")}
+    assert sql["BEGIN IMMEDIATE"] < callers[0].lineno < sql["COMMIT"], sql
+    assert ast.unparse(_function(tree, "append").returns) == "Head"
 
 
 def _function(tree: ast.AST, name: str) -> ast.FunctionDef | ast.AsyncFunctionDef:

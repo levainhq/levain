@@ -340,13 +340,16 @@ def test_the_replaced_credential_follows_discard_restore_and_purge(tmp_path):
 # --- through the runtime helper: G1's confirm-identity yes, then teardown ---------------------------------------------
 
 
-def test_a_codex_relogin_confirmed_yes_then_torn_down_replaces_the_parked_login(tmp_path):
+def test_a_codex_relogin_confirmed_yes_then_torn_down_replaces_the_parked_login(tmp_path, monkeypatch):
     """The whole path on lane 2f3's harness (the REAL CONTROL, fake launches and process table): a login session on a
     slot whose keep/ already holds a Codex login, its ``confirm-identity yes`` (G1's verb, which writes the baseline
     END reads), then ``teardown``: RETAINED, the new login parked, the old one in ``replaced/``. Without the yes the
     same teardown is RETAINED with the new login in ``unconfirmed/`` and the parked one untouched (D1)."""
     from tests.test_slot_idg1_identity import E0, GW0, _login
+    from levain.slot import start as _start
     from tests.test_slot_s2f3_start import _S, _world
+    # the repo conftest's autouse patch (this store has no vendor prefix) is absent under the root-py39 job's --noconftest
+    monkeypatch.setattr(_start, "vendor_ready", lambda host, vendor: None)
     results = {}
     for answer in ("yes", "no"):
         w, la, table = _world(tmp_path / answer)
