@@ -2873,10 +2873,8 @@ class _Handler(GuardedHandler):
         if not self.server.request_gate.acquire(blocking=False):
             return self._reject(503, "notify_busy", "server busy")
         try:
-            try:
-                raw = self.rfile.read(clen)
-            except OSError:        # a stalled client hit the socket timeout
-                self.close_connection = True
+            raw = self._read_body(clen)    # one total deadline; a spent one is answered 408 and closes
+            if raw is None:
                 return
             try:
                 req = json.loads(raw.decode("utf-8"))
@@ -4482,10 +4480,8 @@ class _Handler(GuardedHandler):
         try:
             if self._refuse_oversize(clen, _MAX_POST_BYTES, _DRAIN_CAP):
                 return
-            try:
-                raw = self.rfile.read(clen)
-            except OSError:  # slow/stalled client hit the socket timeout → drop it
-                self.close_connection = True
+            raw = self._read_body(clen)    # one total deadline; a spent one is answered 408 and closes
+            if raw is None:
                 return
             try:
                 req = json.loads(raw.decode("utf-8"))
@@ -4668,10 +4664,8 @@ class _Handler(GuardedHandler):
             return None
         if self._refuse_oversize(clen, _PAIR_BODY_MAX, _PAIR_BODY_MAX):
             return None
-        try:
-            raw = self.rfile.read(clen)
-        except OSError:
-            self.close_connection = True
+        raw = self._read_body(clen)    # one total deadline; a spent one is answered 408 and closes
+        if raw is None:
             return None
         try:
             req = json.loads(raw.decode("utf-8"))
@@ -4739,10 +4733,8 @@ class _Handler(GuardedHandler):
                 return
             if self._refuse_oversize(clen, _RECEIPT_BODY_MAX, 2 * _RECEIPT_BODY_MAX):
                 return
-            try:
-                raw = self.rfile.read(clen)
-            except OSError:
-                self.close_connection = True
+            raw = self._read_body(clen)    # one total deadline; a spent one is answered 408 and closes
+            if raw is None:
                 return
             from levain.webpush import routes as push_routes
 
