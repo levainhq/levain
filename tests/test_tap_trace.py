@@ -162,3 +162,17 @@ def test_tap_trace_is_served_without_a_credential_and_carries_no_token_field(src
     assert "sw_open.js" not in html.replace("No sw_open.js here", "")             # the page never claims a pending tap
     for text in (html, js):
         assert not re.search(r"token|authorization|localStorage|sessionStorage|fetch\(", text, re.I), text[:80]
+
+
+@needs_node
+def test_the_page_records_that_a_tap_carried_an_item_id_as_a_flag_never_the_id() -> None:
+    got = _open_rig("ntap")
+    text = json.dumps(got["trace"])
+    assert "p123456" not in text and "123456" not in text and "not-an-id" not in text, text
+    loads = [e for e in got["trace"] if e["step"] == "page-load"]
+    flags = [e.get("n") for e in loads]
+    assert flags[1:] == [True, None, None], (flags, loads)          # [0] is the rig's first plain boot; then a well-formed id, a malformed one, none
+    assert all(e["href"] == "/?view=notifications" for e in loads[1:]), loads   # the path and view only, as before
+    msgs = [e for e in got["trace"] if e["step"] == "message"]
+    assert msgs and msgs[-1].get("n") is True, msgs
+    assert [e.get("n") for e in got["trace"] if e["step"] == "assign"] == [True], got["trace"]

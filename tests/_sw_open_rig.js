@@ -138,6 +138,13 @@ const fire = async (t, o, ev = {}) => { for (const fn of (o[t] || [])) fn(ev); a
     const before = log.assigned.length;
     await boot('https://box.example/?view=needs');
     log.fragment = { moved: log.assigned.length - before, pending: has('q2') };
+  } else if (scenario === 'ntap') {
+    // a tap's page address carries the notification-center item id: the trace says THAT it did, never which
+    await boot('https://box.example/?view=notifications&n=p123456');
+    await boot('https://box.example/?view=notifications&n=not-an-id');
+    await boot('https://box.example/?view=notifications');
+    send({ type: 'levain-open', url: '/?view=notifications&n=p123456' });
+    await tick();
   } else if (scenario === 'first') {
     log.first = { assigned: log.assigned.slice(), left: left() };                // the newest went; two stay
     await boot('https://box.example/sign/1');                                    // a page already at /sign/1 takes its own entry and stays

@@ -91,3 +91,43 @@ def test_an_unknown_or_malformed_n_selects_nothing_with_or_without_a_token(tmp_p
     assert u["title"] == "" and ug["gone"] != "", (u, ug)
     pre, post = _json(late)
     assert pre["gone"] == "" and post["title"] == "" and post["status"] == "ok", (pre, post)
+
+
+# the token's own announce, and another tab's change: the two ways a token reaches a page that is already open
+STORE_ONLY = {"eval": f"localStorage.setItem('levain_write_token', {json.dumps(T)}); 1"}
+FIRE_STORAGE = {"eval": "window.dispatchEvent(new StorageEvent('storage', { key: 'levain_write_token' })); 1"}
+OTHER_KEY = {"eval": "window.dispatchEvent(new StorageEvent('storage', { key: 'something_else' })); 1"}
+# long enough for the 600 ms and 3 s boot reads to be over before the token comes, and well short of the 30 s pulse
+SETTLE = _wait(3800)
+
+
+def _late_token(tmp_path: Path, name: str, give: list[dict]) -> tuple[dict, dict]:
+    tmp_path = tmp_path / name
+    tmp_path.mkdir()
+    r = Rig(tmp_path)
+    with _signed(r.src, r.q) as (port, _):
+        ids = r.seed(port)
+        out = _drive(tmp_path, _bare(port, f"?view=notifications&n={ids['flow']}"), [
+            WIDE, {"until": f"{MODAL} && window.LevainNotifyCenter.state().status === 'noauth' && 1", "ms": 40000}, SETTLE, PROBE,
+            *give, _wait(2000), PROBE])
+    before, after = _json(out)
+    return before, after
+
+
+@needs_browser
+def test_a_token_that_arrives_after_the_tap_opens_its_item_at_once_not_at_the_next_pulse(tmp_path: Path) -> None:
+    """The same page announces the token it just stored (pairing, the owner prompt): the center reads then, with no other read
+    and no tap, so the kept deep link opens within about two seconds and not at the 30 s pulse."""
+    before, after = _late_token(tmp_path, "announce", [GIVE_TOKEN])
+    assert before["modal"] is True and before["title"] == "" and before["status"] == "noauth", before
+    assert after["title"] == "Inbox digest" and after["status"] == "ok" and after["rows"] >= 6, after
+
+
+@needs_browser
+def test_a_token_stored_by_another_tab_opens_the_item_at_once_and_an_unrelated_storage_event_reads_nothing(tmp_path: Path) -> None:
+    """Another tab's change arrives as a `storage` event for the token key: the same prompt read. A storage event for a different
+    key does not read (the token is stored but nothing announced it, so the page is still empty)."""
+    before, still = _late_token(tmp_path, "other", [STORE_ONLY, OTHER_KEY])
+    assert before["title"] == "" and still["title"] == "" and still["status"] == "noauth", (before, still)
+    before, after = _late_token(tmp_path, "storage", [STORE_ONLY, FIRE_STORAGE])
+    assert before["title"] == "" and after["title"] == "Inbox digest" and after["status"] == "ok", (before, after)
