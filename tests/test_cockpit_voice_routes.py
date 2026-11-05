@@ -161,6 +161,10 @@ class Rig:
         _root, self.src, _ids = _install(tmp_path / "entity")
         self.data_root = Path(self.src.write_scope.ledger_root) / "cockpit"
         self.ck = KeyedCockpit(self.data_root, tmp_path / "keys")
+        # the consent hook names the broker's own cockpit, so the grant routes revoke in the log read_key reads (a voice
+        # route refuses otherwise: test_t_rev_a_voice_route_refuses_when_the_grant_routes_act_on_another_cockpit)
+        (qdir / "claude_code.json").write_text(json.dumps({"cockpit_data_root": str(self.data_root),
+                                                           "away_mode": False, "away_hold_seconds": 0}))
         self.sec = FakeSecurity(tmp_path)
         monkeypatch.setattr(custody, "DEFAULT_SECURITY", self.sec.path)   # read_key's default store: the fake
         self.transport = Transport()
@@ -927,27 +931,133 @@ def test_t_caps_reaching_a_cap_exactly_is_allowed_and_passing_it_is_refused_nami
 
 # --- 14. T-REV, 15. T-GETRO --------------------------------------------------------------------------------------------
 
-REV_FINDING = (
-    "T-REV FINDING (routed to the desk, not fixed in V1-4): the phone's grant page cannot revoke a voice key. "
-    "levain.consent.grants.grant_view lists only consent, contained-shell and inert grants (_split), so a voice-key "
-    "record (passkey_revocable=True, authority.py VOICE_KEY_KIND) never appears on /cockpit/consent/grants.json and "
-    "no phone revoke can be started for it. Separately, the grant routes act on sign_root(queue_dir) (the cockpit "
-    "the consent hook names) while read_key replays broker.data_root/cockpit.db; nothing in make_server ties the two.")
+# The V1-4 lane's T-REV finding (RETURN_voice_v14.md), fixed by the 1105-17 trev lane: grant_view listed only consent,
+# contained-shell and inert grants, so a voice key never reached the grant page; and nothing tied the cockpit the grant
+# routes act on (the consent hook's) to the one read_key replays (broker.data_root).
+
+def _hook(queue: Path, root: Path) -> None:
+    (queue / "claude_code.json").write_text(json.dumps({"cockpit_data_root": str(root), "away_mode": False,
+                                                       "away_hold_seconds": 0}))
 
 
-@pytest.mark.xfail(strict=True, reason=REV_FINDING)
 def test_t_rev_the_phone_grant_page_lists_the_voice_key_that_read_key_reads(rig, tmp_path):
+    """The row names the provider and the record id, nothing of the keychain item and nothing of the value. Red with:
+    grant_view's voice rows removed (the V1-4 xfail)."""
     from levain.consent.grants import grant_view
     from levain.consent.sign import sign_root
 
     record = rig.add_key()
     signq = tmp_path / "signq"
     signq.mkdir(mode=0o700)
-    (signq / "claude_code.json").write_text(json.dumps({"cockpit_data_root": str(rig.data_root), "away_mode": False,
-                                                        "away_hold_seconds": 0}))
+    _hook(signq, rig.data_root)
     assert Path(sign_root(signq)).resolve() == rig.data_root.resolve()    # the hook names read_key's own log
     view = grant_view(signq, now=datetime.now(timezone.utc))
-    assert record["id"] in {r["id"] for r in view["grants"]}, view
+    rows = {r["id"]: r for r in view["grants"]}
+    assert record["id"] in rows, view
+    row = rows[record["id"]]
+    assert (row["kind"], row["provider"], row["state"], row["id_shown"]) == ("voice-key", "openai", "live",
+                                                                            record["id"])
+    assert row["instance"] and row["answered"]["count"] == 0
+    shown = json.dumps(view)
+    no_leak(shown)
+    assert SOURCE not in shown and "source" not in row and "account" not in row and "uses" not in row
+    assert "levain consent grant revoke" in row["revoke"] and record["id"] in row["revoke"]
+
+
+RP = "phone.example"                    # a passkey's revoke is taken only from a key made on an https name
+ORIGIN = "https://phone.example"
+
+
+def _phone(ck: "KeyedCockpit"):
+    """A software passkey enrolled (display-phone, passkey custody) in ``ck``'s log by its laptop key."""
+    from tests.test_dispatch_phone import SoftPasskey
+
+    phone = SoftPasskey(RP)
+    conn = sqlite3.connect(ck.root / "cockpit.db", isolation_level=None)
+    try:
+        auth.sign_and_append(conn, {"op": "enrol", "fingerprint": phone.fp, "public_key": phone.line,
+                                    "class": "display-phone", "custody": "passkey"},
+                             signer_fp=ck.fp, sign=ck.sign, clock=lambda: datetime.now(timezone.utc),
+                             cache=ReplayCache(), anchor=anchor_path(ck.root))
+    finally:
+        conn.close()
+    return phone
+
+
+def _grant_phone(queue: Path):
+    """The cockpit's grant routes exactly as make_server builds them: over the consent queue, acting on sign_root."""
+    from levain.consent.answering import passkey_keys
+    from levain.consent.grant_phone import GrantPhone
+    from levain.consent.sign import sign_root
+
+    return GrantPhone(queue, RP, None,
+                      lambda: {k.fingerprint: k for k in passkey_keys(custody.authority_for(sign_root(queue))(), RP)},
+                      lambda: sign_root(queue))
+
+
+def test_t_rev_a_phone_passkey_revoke_of_the_voice_key_stops_the_next_speak(rig):
+    """The whole phone path: the grant listing names the voice key and its passkey, the challenge, the passkey's
+    assertion, the append; the next speak reads no key (409 no_key, no provider call) and so does transcribe. Red with:
+    grant_view's voice rows removed (the listing has no row to revoke from)."""
+    record = rig.add_key()
+    phone = _phone(rig.ck)
+    g = rig.reply("Read this aloud.")
+    gp = _grant_phone(rig.qdir)
+    with served(rig) as (port, _httpd):
+        assert speak(port, rig, g)[0] == 200
+        rows = {r["id"]: r for r in gp.listing()["grants"]}
+        assert record["id"] in rows, gp.listing()
+        row = rows[record["id"]]
+        assert row["signers"] == [phone.fp]
+        c = gp.step(record["id"], "revoke-challenge", {"signer_fp": phone.fp, "instance": row["instance"]})
+        line = json.loads(c["line"])
+        assert (line["op"], line["grant_id"]) == ("revoke_grant", record["id"])
+        got = gp.step(record["id"], "revoke", phone.assertion(c["challenge"], origin=ORIGIN))
+        assert got["revoked"] == record["id"]
+        status, _h, body = speak(port, rig, g)
+        assert (status, js(body)["error"]) == (409, "no_key"), body
+        status, _h, body = transcribe(port)
+        assert (status, js(body)["error"]) == (409, "no_key"), body
+    assert len(rig.transport.seen) == 1                      # only the call before the revoke went out
+    assert record["id"] not in {r["id"] for r in gp.listing()["grants"]}
+
+
+@pytest.mark.parametrize("hooks", ["other", "none", "two"])
+def test_t_rev_a_voice_route_refuses_when_the_grant_routes_act_on_another_cockpit(rig, tmp_path, hooks):
+    """The consent hook names a cockpit that is not the broker's data root (or none, or two): the grant page's revoke
+    cannot reach the key read_key would read, so speak and transcribe refuse in fixed words before anything is
+    reserved or read. Red with: the revoke-reach check in ``voice._call`` removed (both answer 200)."""
+    record = rig.add_key()
+    other = KeyedCockpit(tmp_path / "other-cockpit", tmp_path / "keys-other")
+    _phone(other)
+    if hooks == "other":
+        _hook(rig.qdir, other.root)
+    elif hooks == "none":
+        (rig.qdir / "claude_code.json").unlink()
+    else:
+        (rig.qdir / "codex.json").write_text(json.dumps({"cockpit_data_root": str(other.root)}))
+    g = rig.reply("Read this aloud.")
+    reads = rig.sec.calls()
+    with served(rig) as (port, _httpd):
+        for status, _h, body in (speak(port, rig, g), transcribe(port)):
+            out = js(body)
+            assert (status, out["error"], out["message"], out["fallback"]) == (
+                503, "revoke_unreachable", cockpit_voice.WORDS["revoke_unreachable"], "on_device"), body
+    assert rig.transport.seen == [] and rig.rows() == []
+    assert rig.sec.calls() == reads                          # the keychain was never asked
+    if hooks == "other":
+        # and the observed half: the phone's revoke, acting on the hook's cockpit, cannot find the key at all
+        from levain.consent.grant_phone import GrantRefused
+        from levain.consent.grants import grant_instance
+
+        state = custody.authority_for(rig.data_root)()
+        gp = _grant_phone(rig.qdir)
+        assert record["id"] not in {r["id"] for r in gp.listing()["grants"]}
+        signer = next(iter(gp._signers()[0]))
+        with pytest.raises(GrantRefused) as exc:
+            gp.step(record["id"], "revoke-challenge",
+                    {"signer_fp": signer, "instance": grant_instance(state.grant_link(record["id"]))})
+        assert exc.value.error == "not_found"
 
 
 def test_t_getro_voice_json_creates_no_ledger(rig):

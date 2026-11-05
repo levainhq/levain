@@ -3573,7 +3573,8 @@ class _Handler(GuardedHandler):
             if speak:
                 return cockpit_voice.speak(directory, data_root, srv.chat_service, raw, **common)
             query = self.path.split("?", 1)[1] if "?" in self.path else ""
-            return cockpit_voice.transcribe(data_root, query, self.headers.get("Content-Type", ""), raw, **common)
+            return cockpit_voice.transcribe(data_root, query, self.headers.get("Content-Type", ""), raw,
+                                            directory=directory, **common)
         finally:
             srv.voice_gate.release()
 
