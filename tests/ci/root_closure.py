@@ -387,6 +387,8 @@ LAZY_SITES = {
     # operator: ``_admit_run_in`` runs only in the operator's process (the controller, an agent session or the session client); the dispatch run server only imports the module
     "levain/agents/controller.py::_admit_run_in::from levain.autonomic.journal import RunJournal   # here: the journal is not the controller's import closure": 'operator',
     # operator: ``_default_input_check`` runs only in the operator's process (the controller, an agent session or the session client); the dispatch run server only imports the module
+    # operator: ``_default_input_check`` runs only in the operator's process (the controller, an agent session or the session client); the dispatch run server only imports the module
+    'levain/agents/controller.py::_default_input_check::from levain.agents import spec as _spec': 'operator',
     'levain/agents/controller.py::_default_input_check::from levain.dream import agent as dream_agent': 'operator',
     # operator: ``_dream_body`` runs only in the operator's process (the controller, an agent session or the session client); the dispatch run server only imports the module
     "levain/agents/controller.py::_dream_body::from levain.dream import agent as dream_agent   # here: the dream is not the controller's import closure": 'operator',
@@ -428,8 +430,6 @@ LAZY_SITES = {
     'levain/slot/services/dispatch_run.py::bound_usage_sources::from levain.qbroker import operator as _op': 'root',
     # root: ``bound_usage_sources`` runs in the dispatch run server's own process (``_levain_dispatch``, never the operator's), which is a service entry
     'levain/slot/services/dispatch_run.py::bound_usage_sources::from levain.slot import dispatch_usage as _du': 'root',
-    # root: ``bound_usage_sources`` runs in the dispatch run server's own process (``_levain_dispatch``, never the operator's), which is a service entry
-    'levain/slot/services/dispatch_run.py::bound_usage_sources::from levain.slot.runtime_helper import FRONT_LOG_NAME': 'root',
     # root: ``build_server`` runs in the dispatch run server's own process (``_levain_dispatch``, never the operator's), which is a service entry
     'levain/slot/services/dispatch_run.py::build_server::from levain.qbroker.peercred import peer_uid': 'root',
     # root: ``build_server`` runs in the dispatch run server's own process (``_levain_dispatch``, never the operator's), which is a service entry
@@ -441,7 +441,7 @@ LAZY_SITES = {
     # root: ``service_row`` runs in the dispatch run server's own process (``_levain_dispatch``, never the operator's), which is a service entry
     'levain/slot/services/dispatch_run.py::service_row::from levain.slot.units import Service': 'root',
     # root: ``_default_read_total`` runs in the dispatch run server's process (its usage settle)
-    'levain/slot/dispatch_usage.py::_default_read_total::from levain.slot.runtime_helper import _INT64_MAX, _PASSTHROUGH_TAIL_BYTES': 'root',
+    'levain/slot/dispatch_usage.py::_default_read_total::from levain.slot.runtime_helper import read_session_total': 'root',
     # operator: ``Seams.__post_init__`` is the interactive supervisor's own code, the operator uid's process; the dispatch run server imports the module for its names
     'levain/slot/supervisor.py::Seams.__post_init__::from levain.slot.control_client import ControlClient': 'operator',
     # operator: ``Supervisor._confirm_identity`` is the interactive supervisor's own code, the operator uid's process; the dispatch run server imports the module for its names
