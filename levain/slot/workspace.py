@@ -58,7 +58,8 @@ from levain.dispatch.policy import path_text_problem
 from levain.slot import stage, write_all
 
 __all__ = ["BUNDLE_MAX_BYTES", "DISPATCH_REFUSED_NAMES", "MANIFEST_MAX_BYTES", "MAX_UPLOADS", "UploadOwner",
-           "W1_WITHHOLD_ALLOWED", "WORKSPACE_REFUSAL", "WorkspaceRefused", "WorkspaceUploads", "manifest_from_bytes"]
+           "W1_WITHHOLD_ALLOWED", "WORKSPACE_REFUSAL", "WorkspaceRefused", "WorkspaceUploads", "manifest_from_bytes",
+           "refused_name_carried"]
 
 _log = logging.getLogger("levain.slot.workspace")
 
@@ -97,6 +98,19 @@ class WorkspaceRefused(LauncherRefused):
 def _fold(name: str) -> str:
     # the same fold the settings check uses (supervisor._fold): a case- and normalization-insensitive store
     return unicodedata.normalize("NFD", name).casefold()
+
+
+def refused_name_carried(entries) -> "Optional[tuple[str, str]]":
+    """``(cause, detail)`` for the first manifest entry whose path is one of :data:`DISPATCH_REFUSED_NAMES` (folded),
+    else None. The one derivation of this refusal: the server's verify raises it, and the operator-uid sender
+    (``levain.dispatch.stager``) asks it before a byte is sent, so the two cannot disagree on what is refused."""
+    refused = {_fold(n) for n in DISPATCH_REFUSED_NAMES}
+    for entry in entries:
+        path = entry[0]
+        if _fold(path) in refused:
+            return ("repo-carries-" + path.lstrip(".").replace(".", "-").lower(),
+                    f"{path}: a dispatch snapshot does not carry it (refused, never stripped)")
+    return None
 
 
 def _remove_workdir(pfd: int, parent: str, name: str, made: tuple) -> None:
@@ -285,11 +299,9 @@ class WorkspaceUploads:
             raise WorkspaceRefused("head-mismatch", "the manifest was cut from another commit than the launch names")
         if manifest.withhold != tuple(sorted(ws.withhold)):
             raise WorkspaceRefused("withhold-mismatch", "the manifest's withhold is not the launch's")
-        refused = {_fold(n) for n in DISPATCH_REFUSED_NAMES}
-        for path, _mode, _blob in manifest.entries:
-            if _fold(path) in refused:
-                raise WorkspaceRefused("repo-carries-" + path.lstrip(".").replace(".", "-").lower(),
-                                       f"{path}: a dispatch snapshot does not carry it (refused, never stripped)")
+        carried = refused_name_carried(manifest.entries)
+        if carried is not None:
+            raise WorkspaceRefused(*carried)
         try:
             commit, _tree, objects = SN.snapshot_commit(manifest)
         except Exception as exc:  # noqa: BLE001 - e.g. a path that is both a file and a directory

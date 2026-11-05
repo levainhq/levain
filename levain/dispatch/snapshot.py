@@ -20,8 +20,9 @@ listed files) for the case where no contract lists the files: the files are ever
   Signing the manifest is NOT done here (open).
 
 Known edges (judged, no code): the scan reads blob bytes as the committed text, so a secret split across lines or
-encoded (base64, compressed) is not seen; a binary blob is scanned as bytes and is otherwise opaque. ``HEAD`` is the
-repo's checked-out commit: the working tree, the index and untracked files are never read. Stdlib only.
+encoded (base64, compressed) is not seen; a binary blob is scanned as bytes and is otherwise opaque. The commit is
+the ``head`` the caller names (a 40-hex sha it resolved) or, with none, the repo's checked-out ``HEAD``: the working
+tree, the index and untracked files are never read. Stdlib only.
 """
 from __future__ import annotations
 
@@ -274,9 +275,27 @@ def _read_blobs(repo: str, shas: list[str]) -> dict[str, bytes]:
     return got
 
 
+def _resolve_head(repo: str, head: str | None) -> str:
+    """The commit the snapshot is cut from: ``HEAD`` when ``head`` is None, else ``head`` itself, which must be a 40-hex
+    commit sha the repo holds (an abbreviation, a ref or a tag is refused: the caller resolved it already, and the
+    manifest names exactly what was resolved)."""
+    if head is None:
+        got = _git(repo, "rev-parse", "--verify", "-q", "HEAD^{commit}").decode("ascii", "replace").strip()
+    else:
+        if type(head) is not str or _SHA1.fullmatch(head) is None:
+            raise SnapshotRefused("snapshot-repo", "head is not a 40-hex commit sha")
+        got = _git(repo, "rev-parse", "--verify", "-q", head + "^{commit}").decode("ascii", "replace").strip()
+        if got != head:
+            raise SnapshotRefused("snapshot-repo", "head does not name a commit of the repo")
+    if _SHA1.fullmatch(got) is None:
+        raise SnapshotRefused("snapshot-repo", "HEAD is not a commit")
+    return got
+
+
 def plan_snapshot(repo: str, withhold: Any = (), *, policy: ProviderPolicy | None = None,
-                  provider: str | None = None) -> tuple[Manifest, dict[str, bytes]]:
-    """Judge ``repo`` at HEAD and return ``(manifest, blobs)``, or raise :class:`SnapshotRefused`. Order: withhold
+                  provider: str | None = None, head: str | None = None) -> tuple[Manifest, dict[str, bytes]]:
+    """Judge ``repo`` at ``head`` (default: its checked-out HEAD; a given ``head`` is a 40-hex commit sha, see
+    :func:`_resolve_head`) and return ``(manifest, blobs)``, or raise :class:`SnapshotRefused`. Order: withhold
     first (a withheld path is judged by nothing else), then entry kind, path hygiene, the NEVER list (``policy`` and
     ``provider`` together, or neither), the count and size bounds from git's own sizes, then the content scan."""
     if not isinstance(repo, str) or not os.path.isabs(repo):
@@ -284,9 +303,7 @@ def plan_snapshot(repo: str, withhold: Any = (), *, policy: ProviderPolicy | Non
     pats = _withhold_patterns(withhold)
     if (policy is None) != (provider is None):
         raise SnapshotRefused("snapshot-policy", "a policy and a provider are given together or not at all")
-    head = _git(repo, "rev-parse", "--verify", "-q", "HEAD^{commit}").decode("ascii", "replace").strip()
-    if _SHA1.fullmatch(head) is None:
-        raise SnapshotRefused("snapshot-repo", "HEAD is not a commit")
+    head = _resolve_head(repo, head)
     raw = _git(repo, "ls-tree", "-r", "-z", "-l", head)      # the sha resolved once, never HEAD again
     kept: list[tuple[str, str, str, int]] = []
     withheld: list[str] = []
@@ -372,12 +389,12 @@ def _message(manifest: Manifest) -> str:
 
 
 def build_snapshot(repo: str, dest_dir: str, withhold: Any = (), *, policy: ProviderPolicy | None = None,
-                   provider: str | None = None) -> tuple[ReadSet, Manifest]:
-    """Build the snapshot of ``repo`` at HEAD as a bare scratch repo in ``dest_dir`` (a real absolute path that must NOT
-    exist yet, and not inside ``repo``), or raise :class:`SnapshotRefused`. The built commit must equal
+                   provider: str | None = None, head: str | None = None) -> tuple[ReadSet, Manifest]:
+    """Build the snapshot of ``repo`` at ``head`` (default HEAD, see :func:`plan_snapshot`) as a bare scratch repo in
+    ``dest_dir`` (a real absolute path that must NOT exist yet, and not inside ``repo``), or raise :class:`SnapshotRefused`. The built commit must equal
     :func:`snapshot_commit` of the manifest or the build is refused; a refusal after ``dest_dir`` was created removes
     it again (only while it is still the directory this call made)."""
-    manifest, blobs = plan_snapshot(repo, withhold, policy=policy, provider=provider)
+    manifest, blobs = plan_snapshot(repo, withhold, policy=policy, provider=provider, head=head)
     try:
         ok = (isinstance(dest_dir, str) and os.path.isabs(dest_dir) and os.path.realpath(dest_dir) == dest_dir)
         rst = os.stat(repo)

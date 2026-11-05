@@ -14,6 +14,12 @@ arguments for one session occurrence, from the store and ONE install-fact source
 * ``recall``: P4's recall of the agent's episodes from the install's ``episodic_path``, only when the SIGNED spec's
   ``memory`` is ``stateful``; None for a stateless agent (the default) or when the install names no path.
 * ``values``: the install's ``values`` (default none).
+* ``workspace`` (levain 34, W1): the install's per-agent ``workspaces`` setting, ``{<agent id>: {"repo": <absolute
+  path>, "branch": <local branch, optional>}}``. For an agent that has one, the factory resolves the branch (default:
+  the repo's checked-out HEAD) to a 40-hex commit NOW, on the operator uid, and hands ``run_session`` the
+  :class:`levain.agents.session.Workspace` member that names it; the run records it. A setting that does not resolve
+  (a missing repo, an unknown branch) is handed over as ``workspace_problem``, and the run ends
+  ``session_refused:workspace`` before anything starts, settled at zero. An agent with no entry stages nothing.
 * ``launcher``: the install's ``launcher`` NAME resolved through :data:`LAUNCHERS`, a registry only
   :func:`register_launcher` writes; no name is :class:`levain.agents.session.UnwiredLauncher`, so a store that has
   not been given a launcher launches nothing and the run settles at zero as ``session_refused:launcher-not-wired``.
@@ -31,15 +37,17 @@ import logging
 import os
 import tempfile
 from collections.abc import Callable, Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
 from levain.agents import session as _session
+from levain.agents.spec import AGENT_ID
 from levain.agents.store import AgentStore
 
-__all__ = ["INSTALL_FILE", "INSTALL_SCHEMA", "InstallRefused", "SessionInstall", "LAUNCHERS", "register_launcher",
+__all__ = ["INSTALL_FILE", "INSTALL_SCHEMA", "InstallRefused", "SessionInstall", "WorkspaceSetting", "LAUNCHERS",
+           "register_launcher",
            "read_install", "write_install", "resolve_launcher", "fire_factory", "SESSION_WIN_CHECK",
            "session_win_check", "register_session_win_check"]
 
@@ -66,11 +74,21 @@ def register_launcher(name: str, builder: Callable[[AgentStore], Any]) -> None:
 
 
 @dataclass(frozen=True)
+class WorkspaceSetting:
+    """One agent's workspace: the operator's repo (an absolute path; its existence is the FIRE's to find out, so an
+    install naming a repo that has moved still reads) and the local branch whose tip is staged (None: the repo's
+    checked-out HEAD)."""
+    repo: str
+    branch: str | None = None
+
+
+@dataclass(frozen=True)
 class SessionInstall:
     cockpit_root: Path
     launcher: str | None
     episodic_path: Path | None
     values: Mapping[str, Any]
+    workspaces: Mapping[str, WorkspaceSetting] = field(default_factory=dict)
 
 
 def _abs(doc: Mapping[str, Any], key: str, path: Path, *, kind: str) -> Path:
@@ -103,7 +121,7 @@ def _parse_install(doc: Any, path: Path) -> SessionInstall:
         raise InstallRefused(f"{path} is not a JSON object")
     if doc.get("schema") != INSTALL_SCHEMA:
         raise InstallRefused(f"{path} has schema {doc.get('schema')!r}, not {INSTALL_SCHEMA}")
-    unknown = set(doc) - {"schema", "cockpit_root", "launcher", "episodic_path", "values"}
+    unknown = set(doc) - {"schema", "cockpit_root", "launcher", "episodic_path", "values", "workspaces"}
     if unknown:
         raise InstallRefused(f"{path}: unknown key {sorted(unknown)[0]!r}")
     root = _abs(doc, "cockpit_root", path, kind="dir")
@@ -114,11 +132,33 @@ def _parse_install(doc: Any, path: Path) -> SessionInstall:
     values = doc.get("values", {})
     if not isinstance(values, dict):
         raise InstallRefused(f"{path}: values is not an object")
-    return SessionInstall(root, launcher, episodic, values)
+    return SessionInstall(root, launcher, episodic, values, _parse_workspaces(doc.get("workspaces", {}), path))
+
+
+def _parse_workspaces(raw: Any, path: Path) -> Mapping[str, WorkspaceSetting]:
+    """The optional ``workspaces`` table of an install: agent id -> exactly ``{"repo"}`` or ``{"repo", "branch"}``. The
+    schema stays 1: a file without the key reads as it always did (an older reader refuses a file with it, by its
+    unknown-key rule, rather than ignoring a repo setting)."""
+    if not isinstance(raw, dict):
+        raise InstallRefused(f"{path}: workspaces is not an object")
+    out: dict[str, WorkspaceSetting] = {}
+    for agent, entry in raw.items():
+        if not isinstance(agent, str) or AGENT_ID.fullmatch(agent) is None:
+            raise InstallRefused(f"{path}: workspaces key {str(agent)[:40]!r} is not an agent id")
+        if not isinstance(entry, dict) or "repo" not in entry or set(entry) - {"repo", "branch"}:
+            raise InstallRefused(f"{path}: workspaces[{agent}] is exactly {{repo[, branch]}}")
+        repo, branch = entry["repo"], entry.get("branch")
+        if not isinstance(repo, str) or not repo.startswith("/") or "\0" in repo or len(repo) > _session.WORKSPACE_REPO_MAX:
+            raise InstallRefused(f"{path}: workspaces[{agent}].repo is not an absolute path")
+        if branch is not None and _session.branch_problem(branch) is not None:
+            raise InstallRefused(f"{path}: workspaces[{agent}].branch: {_session.branch_problem(branch)}")
+        out[agent] = WorkspaceSetting(repo, branch)
+    return out
 
 
 def write_install(agent_dir: Path | str, *, cockpit_root: Path | str, launcher: str | None = None,
-                  episodic_path: Path | str | None = None, values: Mapping[str, Any] | None = None) -> Path:
+                  episodic_path: Path | str | None = None, values: Mapping[str, Any] | None = None,
+                  workspaces: Mapping[str, Mapping[str, str]] | None = None) -> Path:
     """Write the install file atomically: the new document is checked FIRST (as :func:`read_install` would read it
     back), then written to a temp in the directory (fsync, mode 0600) and renamed over the old one. A document that
     fails the check raises :class:`InstallRefused` and leaves the working install as it was."""
@@ -130,6 +170,8 @@ def write_install(agent_dir: Path | str, *, cockpit_root: Path | str, launcher: 
         doc["episodic_path"] = str(Path(episodic_path).expanduser())
     if values:
         doc["values"] = dict(values)
+    if workspaces:
+        doc["workspaces"] = {a: dict(e) for a, e in workspaces.items()}
     text = json.dumps(doc, sort_keys=True)
     _parse_install(json.loads(text), d / INSTALL_FILE)     # the round trip: what a read will see, before any write
     fd, tmp = tempfile.mkstemp(dir=d, prefix=".session_install.", suffix=".tmp")
@@ -259,7 +301,26 @@ def fire_factory(store: AgentStore, occurrence_id: str, launch_epoch: int, *,
     extra = {} if clock is None else {"clock": clock}   # a test seam: production passes none and both read real time
     return {**extra, "sup": sup, "role": role, "values": dict(install.values), "recall": recall, "launcher": launcher,
             "exposure": None if reserved is None else reserved.exposure,
-            "max_exposure_usd_micros": 0 if reserved is None or reserved.usd_micros is None else reserved.usd_micros}
+            "max_exposure_usd_micros": 0 if reserved is None or reserved.usd_micros is None else reserved.usd_micros,
+            **_workspace_kwargs(install, row[0])}
+
+
+def _workspace_kwargs(install: SessionInstall, agent_id: str) -> dict[str, Any]:
+    """``run_session``'s ``workspace`` (or ``workspace_problem``) for this agent: its install setting resolved to a
+    40-hex commit now, on this (the operator's) uid, by ``levain.dispatch.stager``. Nothing for an agent with no
+    setting. An unresolvable setting never raises here: a run that cannot be built is left ``launched``, and this one
+    is a REFUSAL the run records (``session_refused:workspace``)."""
+    setting = install.workspaces.get(agent_id)
+    if setting is None:
+        return {}
+    from levain.dispatch import stager
+    try:
+        head = stager.resolve_head(setting.repo, setting.branch)
+        return {"workspace": _session.Workspace(setting.repo, head, (), None, setting.branch)}
+    except stager.StageRefused as exc:
+        return {"workspace_problem": f"{exc.name}: {exc.detail}"[:300]}
+    except ValueError as exc:      # a member the Workspace shape refuses
+        return {"workspace_problem": f"workspace-member: {exc}"[:300]}
 
 
 # The production launcher: the operator-side client of the dispatch run server (P7-1 S9/S10a). The install file names it

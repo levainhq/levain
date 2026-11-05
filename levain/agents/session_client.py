@@ -20,8 +20,8 @@ error, never silently carried.
   END the session (design 3.4); the client therefore CLOSES it on any fault.
   A launch that stages a repo (levain 34, W1) carries a ``workspace`` member ``{repo, head, withhold}`` and is preceded,
   on the SAME connection, by ``WSBEGIN`` and ``WSDATA`` frames that carry the snapshot manifest and git bundle (see
-  "the workspace upload" below). The sender of those frames is the operator-uid side's, a later lane; only the shapes
-  are here.
+  "the workspace upload" below). The sender is :meth:`DispatchSessionLauncher.stage_workspace` over
+  ``levain.dispatch.stager`` (operator uid only); the shapes are here.
 * A **short** connection carries ``USAGE`` or ``END`` for a session key and nothing else.
 
 **What never crosses.** The ticket and the run id are minted and kept on the dispatch uid (design port items (2), (3)):
@@ -68,7 +68,7 @@ from typing import Any
 
 from levain.agents import controller as _ctl
 from levain.agents.accounting import ActionExposure, StopResult, Usage
-from levain.agents.session import S1_DISPATCH, SessionLaunch, Workspace
+from levain.agents.session import S1_DISPATCH, WORKSPACE_REFUSED, SessionLaunch, Workspace
 from levain.agents.session_launcher import LauncherRefused
 from levain.contracts import ContractError, canon
 
@@ -77,7 +77,8 @@ __all__ = ["PROTOCOL", "RUN_FRAME_MAX", "LAUNCHER_NAME", "WAIT_SLICE_S", "WireEr
            "launch_to_wire", "launch_from_wire", "usage_to_wire", "usage_from_wire", "link_proof",
            "WS_CHUNK_BYTES", "WS_PARTS", "WsBegin", "ws_begin_to_wire", "ws_begin_from_wire", "ws_chunk_frames",
            "ws_chunk_from_wire",
-           "default_run_socket", "unix_connector", "DispatchSessionLauncher", "build_launcher", "AuthorityFeed"]
+           "WorkspaceNotSent", "default_run_socket", "unix_connector", "DispatchSessionLauncher", "build_launcher",
+           "AuthorityFeed"]
 
 _log = logging.getLogger("levain.agents.session_client")
 
@@ -747,6 +748,13 @@ class _RemoteChild:
 
 # --- the launcher --------------------------------------------------------------------------------------------------------
 
+class WorkspaceNotSent(LauncherRefused):
+    """The workspace could not be staged, and no LAUNCH was sent: nothing is live on the server, nothing was spent.
+    ``nothing_sent`` is what :func:`levain.agents.session.run_session` reads to settle the run at zero (a spawn that
+    raised some other error is read as one that may have started a session)."""
+    nothing_sent = True
+
+
 def default_run_socket() -> Path:
     """[judged by this slice, S10b confirms] where the run server listens: ``dispatch/run.sock`` under the host's run
     directory (:data:`levain.slot.layout.RUN`). S10b owns the path; a launcher built with another ``connect`` ignores it."""
@@ -837,6 +845,43 @@ class DispatchSessionLauncher:
             fields["bar"] = {"open": read.bar[0], "closed_revoke_seq": read.bar[1]}
         return fields
 
+    # -- the workspace -------------------------------------------------------------------------------------------------
+
+    def stage_workspace(self, conn: _Conn, launch: SessionLaunch) -> None:
+        """Build the launch's workspace snapshot on the operator uid and upload it on ``conn``, ahead of LAUNCH on the
+        same connection (levain 34, W1). Returns when every byte is acknowledged, else raises :class:`WorkspaceNotSent`
+        (nothing sent, the run server holds nothing it will launch): a refusal of the sender itself or of the server's
+        upload ops, or a lost wire. The seam a different sender overrides; the default is ``levain.dispatch.stager``
+        (operator-uid code, imported here and nowhere else: this module is in the dispatch run server's closure)."""
+        ws = launch.workspace
+        if ws is None:
+            return
+        from levain.dispatch import stager
+        try:
+            up = stager.build_upload(ws)
+        except stager.StageRefused as exc:
+            raise WorkspaceNotSent(WORKSPACE_REFUSED, f"{exc.name}: {exc.detail}"[:_DETAIL_MAX]) from None
+        except Exception as exc:  # noqa: BLE001 - a sender that broke authorises nothing; the cause is the type only
+            _log.warning("the workspace for %s could not be built: %s", launch.session_key, type(exc).__name__)
+            raise WorkspaceNotSent(WORKSPACE_REFUSED, f"stage-failed: {type(exc).__name__}") from None
+        key = launch.session_key
+        try:
+            conn.request("WSBEGIN", (), **ws_begin_to_wire(key, up.manifest, up.bundle))
+            for part, data in (("manifest", up.manifest), ("bundle", up.bundle)):
+                for frame in ws_chunk_frames(key, part, data):
+                    ans = conn.request("WSDATA", ("received",), **frame)
+                    sent = frame["offset"] + len(base64.b64decode(frame["data"]))
+                    if ans["received"] != sent:
+                        conn.close()
+                        raise WorkspaceNotSent(WORKSPACE_REFUSED, f"upload-ack: the server holds {ans['received']} "
+                                               f"bytes of the {part}, {sent} were sent")
+        except _Refused as exc:
+            raise WorkspaceNotSent(exc.name, exc.detail, reason_class=exc.reason_class) from None
+        except (_Down, WireError) as exc:
+            conn.close()
+            raise WorkspaceNotSent("dispatch-unreachable", f"WSDATA: {type(exc).__name__}",
+                                   reason_class="transient") from None
+
     # -- spawn ---------------------------------------------------------------------------------------------------------
 
     def spawn(self, launch: SessionLaunch) -> Any:
@@ -868,6 +913,12 @@ class DispatchSessionLauncher:
             except (_Down, WireError, KeyError) as exc:     # nothing was launched yet: a plain transient refusal
                 conn.close()
                 raise LauncherRefused("dispatch-unreachable", f"SYNC: {type(exc).__name__}", reason_class="transient") from None
+        if launch.workspace is not None:
+            try:
+                self.stage_workspace(conn, launch)          # before LAUNCH, on this connection; raises or has staged
+            except BaseException:
+                conn.close()
+                raise
         try:
             ans = conn.request("LAUNCH", ("session",), timeout=LAUNCH_ANSWER_S, **body)
             session = _str(ans["session"], "session", max_len=128)
