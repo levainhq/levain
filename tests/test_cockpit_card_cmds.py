@@ -19,7 +19,7 @@ from tests.test_cockpit_card_format import PHONE
 from tests.test_cockpit_flip_parity import _drive, needs_browser
 from tests.test_cockpit_k2a import TOKEN, _install, _serve
 from tests.test_cockpit_questions import _file, _get_status
-from tests.test_cockpit_sign_card import DESKTOP, OPEN_Q, _Rig, needs_ssh
+from tests.test_cockpit_sign_card import DESKTOP, NS, OPEN_Q, QRID, _Rig, _write_request, needs_ssh
 from tests.test_cockpit_sign_facet import _Signed
 
 HERE = Path(__file__).resolve().parent
@@ -33,7 +33,7 @@ class _Row(_Signed):
     (no options, as the row was filed), with the multi-line text beside it where this levain's Question has the field."""
 
     def _mark(self, rows: Any) -> Any:
-        return [self._row(r) for r in rows]
+        return [self._row(r) for r in super()._mark(rows)]
 
     def _row(self, q: Question) -> Question:
         extra = {"blocks_full": ROW["stopped_full"]} if HAS_FULL else {}
@@ -51,16 +51,18 @@ def _shot(tmp_path: Path) -> list[dict]:
             {"shot": str(folder / f"{os.environ.get('CARDFMT_STEM', 'cardfmt_after')}.png"), "full": False}]
 
 
-def _drawn(rig: _Rig, tmp_path: Path, viewport: dict, tail: list[dict]) -> dict:
+def _drawn(rig: _Rig, tmp_path: Path, viewport: dict, tail: list[dict], *, signed: bool = False, card: bool = False) -> dict:
     with rig.serving() as (url, httpd):
-        wrapped = _Row(httpd.question_store.inner, {})
+        # signed: the question names the rig's sign request, filed here in the needs-phill grammar with the row's flat words
+        wrapped = _Row(httpd.question_store.inner, {rig.question.n: QRID} if signed else {})
         httpd.question_store = wrapped
         rig.ck.attach_question_rows(wrapped)
         keep = "window.localStorage.setItem('levain_write_token', 'T'); "
         return _drive(tmp_path, f"{rig.origin}/nope", [
             viewport,
             {"eval": f"(() => {{ {keep}location.href = '{rig.origin}/'; return 1; }})()"},
-            {"until": f"{OPEN_Q} && document.querySelector('{M} .needs-q-body')", "ms": 30000},
+            # a signed card's head replaces the question's body once its sign request is read: wait for its Detail instead
+            {"until": f"{OPEN_Q} && document.querySelector('{M} {'.card-detail' if card else '.needs-q-body'}')", "ms": 30000},
             *tail])
 
 
@@ -83,6 +85,50 @@ def test_the_talk_card_shows_three_steps_each_command_one_copyable_block(tmp_pat
     assert labels == ["What", "Blocks"], labels
     assert [s.split(" ")[:2] for s in steps] == [["STEP", "1"], ["STEP", "2"], ["STEP", "3"]], steps
     assert copies == 3 and fits is True
+
+
+def _file_signed_row(rig: _Rig) -> None:
+    """The rig's sign request carries the row as flow signs it: the needs-phill grammar, the flat `stopped` (line breaks are
+    never part of what is signed)."""
+    msg = "\n".join(["flow needs-phill answer", "item: np-c92ec798", "row_version: " + "a" * 64, "repo: ROW_REPO",
+                     "asked: " + ROW["what"], "stopped: " + ROW["stopped"], "nonce: 9a1f", "filed: 2026-11-05T15:29:00Z"]
+                    ).replace("ROW_REPO", ROW["repo"])
+    _write_request(rig.qdir, QRID, msg, options=[{"key": "a", "text": "Ship it tonight"}, {"key": "b", "text": "Hold for the morning"}],
+                   write_in=True)
+
+
+@needs_browser
+@needs_ssh
+def test_a_signed_card_reads_the_lines_but_never_makes_a_copy_button(tmp_path: Path, monkeypatch) -> None:
+    """Line breaks are not signed, so on a card whose words are signed the lines are only a reading: the three commands stay
+    monospace and selectable, and none is a copy button (the unsigned test above is the contrast: same row, three buttons)."""
+    rig = _Rig(tmp_path, monkeypatch)
+    _file_signed_row(rig)
+    out = _drawn(rig, tmp_path, DESKTOP, [
+        {"until": f"document.querySelector('{M} .card-detail')", "ms": 30000},
+        {"eval": f"document.querySelector('{M} .card-detail').open = true"},
+        {"eval": f"[...document.querySelectorAll('{M} .card-cmd')].map(c => c.className + '|' + c.textContent)"},
+        {"eval": f"document.querySelectorAll('{M} .card-detail .consent-copy, {M} .card-detail .consent-cmd').length"},
+        {"eval": f"document.querySelectorAll('{M} .card-detail .card-step').length"},
+        {"eval": f"(document.querySelector('{M}') || document.body).querySelectorAll('.card-detail button').length"},
+        *_shot(tmp_path),
+    ], signed=True, card=True)
+    cmds, copies, steps, buttons = [v for v in out["values"] if not (isinstance(v, dict) and "shot" in v) and v != "settled"][-4:]
+    assert len(cmds) == 3 and all(c.startswith("card-cmd card-cmd-plain|/usr/bin/python3 -I /Users/phillipclapham/") for c in cmds), cmds
+    assert copies == 0 and buttons == 0 and steps == 3, (copies, buttons, steps)
+
+
+@needs_browser
+@needs_ssh
+def test_a_signed_question_body_never_makes_a_copy_button_either(tmp_path: Path, monkeypatch) -> None:
+    """The question body of a signed row that is not a needs-phill message (so no card replaces it) is the other place the lines
+    are drawn on a signed row: read as lines, commands monospace, no copy button."""
+    rig = _Rig(tmp_path, monkeypatch)
+    out = _drawn(rig, tmp_path, DESKTOP, [
+        {"eval": f"[...document.querySelectorAll('{M} .needs-q-body .card-cmd')].map(c => c.className)"},
+        {"eval": f"document.querySelectorAll('{M} .needs-q-body .consent-copy, {M} .needs-q-body .consent-cmd').length"},
+    ], signed=True)
+    assert out["values"][-2:] == [["card-cmd card-cmd-plain"] * 3, 0], out["values"]
 
 
 @needs_browser

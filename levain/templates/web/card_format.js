@@ -5,10 +5,11 @@
 // (the reference); tests/card_format_check.js pins the invariant against real rows.
 //
 // The shape the desk writes: a headline sentence, then `WHAT: ... OPTIONS: (a) x · (b) y REC: a BLOCKS: ...`, with a
-// "lead: - item - item" list inside a section. A text that carries line breaks (flow's `stopped_full`) is read line by line:
-// a line is its own paragraph, and a fenced block, an indented block, a `STEP n` line's command and any line that starts with
-// a path or a known command is drawn as one copyable command block (11-05: commands ran into prose and a "URL:" in a step
-// was read as a section label, which cut the step off).
+// "lead: - item - item" list inside a section. flow's `stopped_full`/`blocks_full` (a caller asks for it: sections' `lines`) is
+// read line by line: a line is its own paragraph, and a fenced block, an indented block, a `STEP n` line's command and any
+// line that starts with a path or a known command is drawn as one command block (11-05: commands ran into prose and a "URL:"
+// in a step was read as a section label, which cut the step off). The block is a copy button only on a card whose words are
+// not signed (drawBody's `copy`); the line breaks are not part of a signature, so a signed card draws plain monospace.
 (function (root) {
   "use strict";
 
@@ -25,13 +26,17 @@
   // sentence's closing mark, which stays with its sentence.
   const BREAK = /([.!?])\s+(?=[A-Z][^.:]{0,30}: )/g;
 
-  // A known word that closes a longer all-caps phrase ("DESK REC:", "NOT CLEAN: ...") is that phrase's last word, not a label.
-  const CAPS_BEFORE = /(?:^|\s)[A-Z][A-Z0-9'+/&-]+\s$/;
+  // The all-caps phrases whose last word is a known label ("DESK REC: a" is the desk's recommendation, not a REC section). An
+  // explicit short list on purpose: any preceding all-caps word ("... wait for CI REC: b", "the VM BLOCKS: x") is a real
+  // label after an acronym. A phrase is written whole, its last word being the label it ends in.
+  const LABEL_PHRASES = ["DESK REC"];
   function labelMatches(s) {
     const out = [];
     for (const m of s.matchAll(LABEL)) {
       const start = m.index + m[1].length;
-      if (CAPS_BEFORE.test(s.slice(Math.max(0, start - 40), start))) continue;
+      const upTo = s.slice(0, start + m[2].length);
+      const phrase = LABEL_PHRASES.some((p) => upTo.endsWith(p) && !/[A-Za-z0-9]/.test(upTo.charAt(upTo.length - p.length - 1)));
+      if (phrase) continue;
       out.push({ label: m[2], start: start, end: m.index + m[0].length });
     }
     return out;
@@ -77,10 +82,12 @@
   }
 
   // The text that comes before the first label (with `headline` taken off its front when the text repeats it exactly, at a
-  // word boundary), then every labelled section in order. A text with line breaks is read by lines (sectionsByLine).
-  function sections(text, dropping) {
+  // word boundary), then every labelled section in order. Line mode (`lines` true, and only for a text that is flow's
+  // `stopped_full`/`blocks_full`, which the caller knows from preferFull/usesFull) reads the text by lines (sectionsByLine);
+  // every other text, line breaks or not, takes the flat path: collapsed, cut at a sentence + "Lead:".
+  function sections(text, dropping, lines) {
     const raw = String(text).replace(/\r\n?/g, "\n");
-    if (raw.trim().indexOf("\n") >= 0) return sectionsByLine(dropLead(raw, dropping));
+    if (lines === true && raw.trim().indexOf("\n") >= 0) return sectionsByLine(dropLead(raw, dropping));
     let body = collapse(raw);
     if (dropping != null) {
       const h = collapse(dropping);
@@ -116,11 +123,21 @@
 
   // ---- the line-aware reading. A command is a line that starts with a path (`/usr/...`, `~/...`) or a known command word and
   // does not end like a sentence; a `STEP n` line is a step caption, and a command after its colon is split off as its own block.
+  // A line that starts with a path is a command whatever its last character. A command-word line that ends in "." is still a
+  // command when its last token is "." or a path (`git add .`, `cp -r a/ b/.`) or it carries a flag (`git commit -m x.`);
+  // `claude login failed again.` is prose. A command-word line with no final mark that reads as prose is a known edge.
   const COMMAND = /^(?:\/|~\/|(?:python3|python|git|ssh|claude|levain|launchctl|curl)(?:\s|$))/;
+  const PATH_START = /^(?:\/|~\/)/;
   const SENTENCE_END = /[.!?:]$/;
   const STEP = /^STEP\s+\d+\b/;
   const INDENT = /^(?: {4}|\t)/;
-  const isCommand = (t) => COMMAND.test(t) && !SENTENCE_END.test(t);
+  function isCommand(t) {
+    if (!COMMAND.test(t)) return false;
+    if (PATH_START.test(t) || !SENTENCE_END.test(t)) return true;
+    if (!t.endsWith(".")) return false;
+    const last = t.split(/\s+/).pop();
+    return last === "." || last.indexOf("/") >= 0 || /\s-{1,2}\w/.test(t);
+  }
   const lead = (l) => (/^[ \t]*/.exec(l) || [""])[0].replace(/\t/g, "    ").length;
 
   function sectionsByLine(raw) {
@@ -418,8 +435,9 @@
   // (the sign sheet) gets the text as a selectable monospace block. Text only.
   let commandBuilder = null;
   function setCommandBlock(fn) { commandBuilder = typeof fn === "function" ? fn : null; }
-  function commandBlock(text) {
-    if (commandBuilder) {
+  // `copy` false (a signed card: its line breaks are not signed, so no line may become a copy action) never reaches the builder.
+  function commandBlock(text, copy) {
+    if (copy === true && commandBuilder) {
       try {
         const n = commandBuilder(text, text.indexOf("\n") >= 0 ? "block" : "command");
         if (n) { n.classList.add("card-cmd"); return n; }
@@ -430,21 +448,24 @@
   // The text the card draws for a long field: the multi-line `full` when it carries the very words of the flat `flat` (only
   // the line breaks differ), else `flat`. The flat text is what a signature covers, so the lines are a display of it and never
   // a second text.
-  function preferFull(flat, full) {
+  function usesFull(flat, full) {
     const f = typeof flat === "string" ? flat : "";
-    return typeof full === "string" && full && collapse(full) === collapse(f) ? full : f;
+    return typeof full === "string" && full !== "" && collapse(full) === collapse(f);
+  }
+  function preferFull(flat, full) {
+    return usesFull(flat, full) ? full : (typeof flat === "string" ? flat : "");
   }
   function list(items) {
     const ul = node("ul", "card-list");
     for (const i of items) ul.appendChild(rich("li", "", i));
     return ul;
   }
-  function drawSections(into, secs) {
+  function drawSections(into, secs, copy) {
     for (const s of secs) {
       const sec = node("div", "card-sec");
       if (s.label) sec.appendChild(node("h3", "card-label", titleCase(s.label)));
       for (const b of s.blocks) {
-        if (b.kind === "code") { sec.appendChild(commandBlock(b.text)); continue; }
+        if (b.kind === "code") { sec.appendChild(commandBlock(b.text, copy)); continue; }
         if (b.kind === "paragraph") {
           if (!b.text) continue;
           const dots = b.step ? null : dotItems(b.text);
@@ -485,9 +506,14 @@
   // section per label, lists for " - " and " · " runs, and the options once as rows from `options` ({key, text|label}) with
   // the recommended one marked and the REC reason under it. An OPTIONS section that does not match the rows stays drawn.
   // Display only: every word of `text` is drawn but the structural tokens.
-  function drawBody(into, text, dropping, options, rec) {
+  // `mode` = { lines, copy }, both default false: `lines` reads `text` by lines (it is a `stopped_full`/`blocks_full` text the
+  // caller got from preferFull/usesFull), `copy` lets a command line become a copy button. A card whose words are signed
+  // never passes `copy`: the line breaks are not signed, so its commands are drawn as plain selectable monospace.
+  function drawBody(into, text, dropping, options, rec, mode) {
+    const lines = !!(mode && mode.lines === true);
+    const copy = !!(mode && mode.copy === true);
     const rows = (options || []).map((o) => ({ key: String(o.key), text: String(o.text !== undefined ? o.text : o.label) }));
-    const all = sections(text || "", dropping);
+    const all = sections(text || "", dropping, lines);
     let why = null;
     let secs = all;
     let at = -1;     // where the rows go: where the prose OPTIONS/REC sat
@@ -499,9 +525,9 @@
       secs = all.filter((x) => !gone(x));
       at = first < 0 ? -1 : all.slice(0, first).filter((x) => !gone(x)).length;
     }
-    drawSections(into, at < 0 ? secs : secs.slice(0, at));
+    drawSections(into, at < 0 ? secs : secs.slice(0, at), copy);
     if (rows.length) into.appendChild(drawOptionRows(rows, rec, why));
-    if (at >= 0) drawSections(into, secs.slice(at));
+    if (at >= 0) drawSections(into, secs.slice(at), copy);
     return into;
   }
   // Detail, collapsed: the rest of the question, the stop (less an OPTIONS/REC section that only repeats the rows), and the
@@ -515,7 +541,8 @@
     const inner = node("div", "card-detail-body");
     const rest = headline(card.asked).rest;
     if (rest) drawSections(inner, sections(rest));
-    drawBody(inner, preferFull(card.stopped || "", card.stopped_full), card.asked, full, rec);
+    // a Detail is always a signed message's card: the lines read, no copy button (copy is never passed from here)
+    drawBody(inner, preferFull(card.stopped || "", card.stopped_full), card.asked, full, rec, { lines: usesFull(card.stopped, card.stopped_full) });
     det.appendChild(inner);
     return det;
   }
@@ -570,7 +597,7 @@
     doc.addEventListener("input", (ev) => grow(ev.target));
   }
 
-  const api = { preferFull, setCommandBlock, linkRuns, installFieldGrow, grow, FREE_TEXT, collapse, sections, headline, optionRows, words, repeatsRows, fullOptions, parseMessage, looseCard, openUntil, drawHead, drawDetail, drawBody };
+  const api = { preferFull, usesFull, setCommandBlock, linkRuns, installFieldGrow, grow, FREE_TEXT, collapse, sections, headline, optionRows, words, repeatsRows, fullOptions, parseMessage, looseCard, openUntil, drawHead, drawDetail, drawBody };
   if (typeof module === "object" && module.exports) module.exports = api;
   else root.LevainCardFormat = api;
 })(typeof window !== "undefined" ? window : this);

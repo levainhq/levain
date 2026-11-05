@@ -2706,6 +2706,7 @@ body.ke [data-ck-panel="tray"] .row .verb-actions > .verb-btn[data-verb="spore_d
 .needs-card-head .consent-display { margin-top: var(--sp-3); white-space: pre-wrap; overflow-wrap: anywhere; }
 .sign-facet .card-detail { margin-top: var(--sp-4); }
 .sign-facet .card-p { margin: 0 0 var(--sp-3); color: var(--text); overflow-wrap: anywhere; font: var(--fw-regular) var(--fs-body)/1.5 var(--sans); }
+.sign-facet .card-p.card-step { font-weight: var(--fw-bold); margin-bottom: var(--sp-1); }
 
 /* a review queue row's "yours to clear" line: its own line, wrapped whole, so the command it names is never cut */
 .review-mine { display: block; white-space: normal; overflow-wrap: anywhere; }

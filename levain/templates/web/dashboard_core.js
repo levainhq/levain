@@ -4574,10 +4574,17 @@
   }
   // a question's long text drawn by card_format.js: headed sections, lists, and the options once as rows (text only); null when
   // the module is not loaded or throws, and the caller draws the one line it drew before
-  function questionText(text, dropping, options, rec) {
+  function questionText(text, dropping, options, rec, mode) {
     const F = window.LevainCardFormat;
     if (!F || typeof F.drawBody !== "function" || !text) return null;
-    try { return F.drawBody(el("div", "card-body needs-q-body"), text, dropping, options, rec); } catch (e) { return null; }
+    try { return F.drawBody(el("div", "card-body needs-q-body"), text, dropping, options, rec, mode); } catch (e) { return null; }
+  }
+  // how card_format.js reads blocksOf(b): by lines only when that is the body's `blocks_full`, and a command line is a copy
+  // button only on a question that is not answered by a signature (q.sign): the line breaks are not signed, so a signed
+  // question's commands are plain selectable monospace and never reach copyLine
+  function blocksMode(q, b) {
+    const F = window.LevainCardFormat;
+    return { lines: !!(F && typeof F.usesFull === "function" && F.usesFull(b.blocks, b.blocks_full)), copy: !q.sign };
   }
   // the answered questions among a panel's lines, newest decision first, at most `max` of them (a Set of the line.question objects)
   const ANSWERED_ROWS_EAGER = 5;
@@ -4623,7 +4630,7 @@
       const parts = [el("div", "needs-q-title", (known && sv(b.what)) || "Question " + q.n),
                      el("div", "consent-note ext-meta needs-answer-line", known ? "answer not shown" : "answer not shown (" + String(b.error).slice(0, 200) + ")")];
       const more = known ? blocksBeyondTitle(sv(b.what), blocksOf(b)) : "";
-      if (more) parts.push(questionText(more, null, [], "") || el("div", "ext-meta needs-q-blocks", "blocks: " + more));
+      if (more) parts.push(questionText(more, null, [], "", blocksMode(q, b)) || el("div", "ext-meta needs-q-blocks", "blocks: " + more));
       slot.replaceChildren(...parts);
       return;
     }
@@ -4640,7 +4647,7 @@
       parts.push(el("div", "needs-q-title", sv(b.what)));
       parts.push(el("div", "consent-note ext-meta needs-answer-line", answerLine(settledAnswer, options)));
       const more = blocksBeyondTitle(sv(b.what), blocksOf(b));
-      if (more) parts.push(questionText(more, null, [], "") || el("div", "ext-meta needs-q-blocks", "blocks: " + more));
+      if (more) parts.push(questionText(more, null, [], "", blocksMode(q, b)) || el("div", "ext-meta needs-q-blocks", "blocks: " + more));
       slot.replaceChildren(...parts);
       return;
     }
@@ -4648,7 +4655,7 @@
     if (card) {
       parts.push(el("div", "needs-q-title", sv(b.what)));
       const more = blocksBeyondTitle(sv(b.what), blocksOf(b));
-      if (more) parts.push(questionText(more, null, options, sv(b.rec)) || el("div", "ext-meta needs-q-blocks", "blocks: " + more));
+      if (more) parts.push(questionText(more, null, options, sv(b.rec), blocksMode(q, b)) || el("div", "ext-meta needs-q-blocks", "blocks: " + more));
       const recOpt = options.find((o) => o && sv(o.key) === sv(b.rec));
       if (sv(b.rec)) {
         const rl = el("div", "needs-rec");
@@ -4660,7 +4667,7 @@
       parts.push(el("pre", "consent-display", sv(b.what)));
       const facts = el("div", "consent-facts");
       facts.appendChild(el("span", "ext-meta", b.open_ended || !sv(b.rec) ? "open question: answer in your own words" : "recommends " + sv(b.rec)));
-      const formatted = questionText(blocksOf(b), null, options, sv(b.rec));
+      const formatted = questionText(blocksOf(b), null, options, sv(b.rec), blocksMode(q, b));
       if (formatted) facts.appendChild(formatted);
       else facts.appendChild(el("span", "ext-meta", "blocks: " + sv(b.blocks)));
       parts.push(facts);
