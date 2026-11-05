@@ -430,7 +430,8 @@ def run_session(sup: Any, store: AgentStore, occurrence_id: str, launch_epoch: i
                 values: Mapping[str, Any], recall: Any, launcher: Any, exposure: ActionExposure | None,
                 max_exposure_usd_micros: int = 0, wait: Callable[[Any], int | None] | None = None,
                 clock: Callable[[], Any] | None = None, key: str | None = None,
-                workspace: Workspace | None = None, workspace_problem: str | None = None) -> SessionReport:
+                workspace: Workspace | None = None, workspace_problem: str | None = None,
+                workspace_setting: tuple[str, str | None] | None = None) -> SessionReport:
     """A session occurrence's body, called by the fire after its claim. ``sup`` is a ``Supervisor``. In order: the
     row must be ``launched`` at ``launch_epoch`` (else nothing runs or settles: ``not_held``); the refusals (a
     refusal ends the occurrence ``failed`` with ``session_refused:<why>``, nothing spawned, settled at zero unless the
@@ -456,7 +457,12 @@ def run_session(sup: Any, store: AgentStore, occurrence_id: str, launch_epoch: i
     branch setting named now, the branch): it rides the launch, is part of the launch digest by repo and branch (never
     the resolved head, which a replay must not be cancelled by), and is recorded in the effect's result. A
     ``workspace_problem`` (the install's setting could not be resolved to a commit) ends the run
-    ``session_refused:workspace`` before anything starts, settled at zero. A launcher whose ``spawn`` raises an error
+    ``session_refused:workspace`` before anything starts, settled at zero, EXCEPT on a rerun: a row that already names
+    a session key had an earlier attempt that may have launched, and refusing here would end that attempt's live
+    session as a refusal and zero its usage (the branch since deleted, the repo moved). ``workspace_setting`` is the
+    install's ``(repo, branch)`` the problem came from; with it the rerun goes on to the journaled effect, whose digest
+    is the same as the first attempt's, so the recorded effect replays. The effect body itself still spawns nothing
+    for a ``workspace_problem``. With no setting there is nothing to hash and the refusal stands. A launcher whose ``spawn`` raises an error
     marked ``nothing_sent`` (the sender refused or lost the wire before LAUNCH) has started nothing: usage is zero
     whatever the reason, and a refusal named :data:`WORKSPACE_REFUSED` is recorded under that name."""
     from datetime import datetime, timezone
@@ -488,7 +494,9 @@ def run_session(sup: Any, store: AgentStore, occurrence_id: str, launch_epoch: i
     if why is not None:
         end = sup.finish(occurrence_id, unstarted, ok=False, reason=f"session_refused:{why}")
         return SessionReport(1, outcome="refused", state=end.state, note=why)
-    if workspace_problem is not None:
+    setting = (workspace.repo, workspace.branch) if workspace is not None else (
+        workspace_setting if workspace_problem is not None else None)
+    if workspace_problem is not None and not (row[3] is not None and setting is not None):
         end = sup.finish(occurrence_id, unstarted, ok=False, reason=WORKSPACE_REFUSED)
         return SessionReport(1, outcome="refused", state=end.state, note=workspace_problem)
     session_key = key or new_session_key()
@@ -509,6 +517,10 @@ def run_session(sup: Any, store: AgentStore, occurrence_id: str, launch_epoch: i
 
     def effect() -> dict[str, Any]:
         spawn_failed.clear()          # only this call's own spawn error is the known failure below
+        if workspace_problem is not None:
+            # a rerun let past the refusal above only to replay a recorded effect: a body that runs anyway has
+            # nothing resolved to launch, so it starts nothing and says so
+            return {"outcome": WORKSPACE_REFUSED, "session_key": session_key, "spawned": False}
 
         def spawn(k: str) -> Any:
             executor.spawn_attempted = True
@@ -559,7 +571,7 @@ def run_session(sup: Any, store: AgentStore, occurrence_id: str, launch_epoch: i
          "exposure": None if exposure is None else [exposure.actions, exposure.unit, exposure.seconds,
                                                     exposure.tunnel_bytes],
          # the setting, never the resolved head; absent when there is none, so a launch with no workspace hashes as before
-         **({} if workspace is None else {"workspace": [workspace.repo, workspace.branch]})},
+         **({} if setting is None else {"workspace": [setting[0], setting[1]]})},
         sort_keys=True).encode("utf-8")).hexdigest()
     eff = sup.effect(occurrence_id, EFFECT_ID, digest=digest, fn=effect, executor=executor)
     status = eff.outcome.status

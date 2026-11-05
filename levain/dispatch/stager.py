@@ -2,7 +2,7 @@
 ``1105-32/DESIGN_render_wiring.md`` finding 3, cut W1; research ``1105-3/RESEARCH_stager.md``). Its sibling on the run
 server is :mod:`levain.slot.workspace`, which verifies what this module builds.
 
-This module runs ONLY as the operator's uid, in the fire (``DispatchSessionLauncher.stage_workspace`` imports it lazily).
+This module runs ONLY as the operator's uid, in the fire (``DispatchSessionLauncher.build_workspace`` imports it lazily).
 It is not in the dispatch run server's import closure (``tests/ci/root_closure.py``): it reads the operator's repo,
 which the server cannot, and it shells out to git and the policy store as the operator.
 
@@ -35,7 +35,7 @@ from levain.dispatch import snapshot as SN
 from levain.dispatch.policy import ProviderPolicy
 from levain.slot import workspace as WS
 
-__all__ = ["PROVIDER", "StageRefused", "Upload", "build_upload", "never_policy", "resolve_head"]
+__all__ = ["PROVIDER", "StageRefused", "TRANSIENT_NAMES", "Upload", "build_upload", "never_policy", "resolve_head"]
 
 _log = logging.getLogger("levain.dispatch.stager")
 
@@ -44,12 +44,19 @@ _log = logging.getLogger("levain.dispatch.stager")
 PROVIDER = "workspace"
 
 
+#: Refusal names that say the HOST could not run git (a timeout, a missing binary), not that the repo or the setting is
+#: wrong: a retry can succeed, so they are never recorded as a standing workspace refusal.
+TRANSIENT_NAMES = frozenset({"snapshot-git-unavailable", "readset-git-unavailable"})
+
+
 class StageRefused(DispatchError):
-    """The workspace cannot be staged, by name (``name``) with a human ``detail``. Nothing was sent."""
+    """The workspace cannot be staged, by name (``name``) with a human ``detail``. Nothing was sent. ``transient`` is
+    True for a host fault (:data:`TRANSIENT_NAMES`): the same setting may stage on the next try."""
 
     def __init__(self, name: str, detail: str = "") -> None:
         self.name = name
         self.detail = detail
+        self.transient = name in TRANSIENT_NAMES
         super().__init__(f"{name}: {detail}" if detail else name)
 
 
@@ -98,7 +105,9 @@ def resolve_head(repo: str, branch: str | None = None) -> str:
         rev = f"refs/heads/{branch}^{{commit}}"
     try:
         out = SN._git(repo, "rev-parse", "--verify", "-q", rev)
-    except SN.SnapshotRefused:
+    except SN.SnapshotRefused as exc:
+        if exc.name in TRANSIENT_NAMES:          # git could not run: not an answer about the branch
+            raise StageRefused(exc.name, exc.detail) from None
         raise StageRefused("workspace-branch", f"{branch or 'HEAD'} does not resolve to a commit of {repo}") from None
     head = out.decode("ascii", "replace").strip()
     if SN._SHA1.fullmatch(head) is None:
@@ -162,6 +171,9 @@ def _build_in(ws: Workspace, policy: ProviderPolicy, root: str) -> Upload:
                 raise StageRefused("bundle-shape", "the bundle git cut is not the header and pack the manifest derives")
         finally:
             os.close(fd)
+        size = os.stat(path).st_size                          # the cap is judged on the file, before it is read
+        if size > WS.BUNDLE_MAX_BYTES:
+            raise StageRefused("bundle-over-cap", f"{size} bytes is over {WS.BUNDLE_MAX_BYTES}")
         with open(path, "rb") as fh:
             bundle = fh.read()
     except RS.ReadSetRefused as exc:

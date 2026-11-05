@@ -108,7 +108,10 @@ class HandUploaded(C.DispatchSessionLauncher):
     nothing, so the server meets exactly the bytes the test put there. The real sender is held in
     ``tests/test_dispatch_stager_send.py``."""
 
-    def stage_workspace(self, conn, launch):
+    def build_workspace(self, launch):
+        return None
+
+    def stage_workspace(self, conn, launch, upload=None):
         return None
 
 

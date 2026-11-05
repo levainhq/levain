@@ -308,8 +308,11 @@ def fire_factory(store: AgentStore, occurrence_id: str, launch_epoch: int, *,
 def _workspace_kwargs(install: SessionInstall, agent_id: str) -> dict[str, Any]:
     """``run_session``'s ``workspace`` (or ``workspace_problem``) for this agent: its install setting resolved to a
     40-hex commit now, on this (the operator's) uid, by ``levain.dispatch.stager``. Nothing for an agent with no
-    setting. An unresolvable setting never raises here: a run that cannot be built is left ``launched``, and this one
-    is a REFUSAL the run records (``session_refused:workspace``)."""
+    setting. A setting that cannot be resolved is a REFUSAL the run records (``session_refused:workspace``), handed
+    over with the setting itself (``workspace_setting``) so a rerun of a run that already launched can still hash
+    to its first attempt and replay. A HOST fault (git could not run: ``StageRefused.transient``) raises instead:
+    that is no answer about the setting, a run that cannot be built is left ``launched`` (``make_run``), and the next
+    try resolves it again."""
     setting = install.workspaces.get(agent_id)
     if setting is None:
         return {}
@@ -318,9 +321,13 @@ def _workspace_kwargs(install: SessionInstall, agent_id: str) -> dict[str, Any]:
         head = stager.resolve_head(setting.repo, setting.branch)
         return {"workspace": _session.Workspace(setting.repo, head, (), None, setting.branch)}
     except stager.StageRefused as exc:
-        return {"workspace_problem": f"{exc.name}: {exc.detail}"[:300]}
+        if exc.transient:
+            raise
+        return {"workspace_problem": f"{exc.name}: {exc.detail}"[:300],
+                "workspace_setting": (setting.repo, setting.branch)}
     except ValueError as exc:      # a member the Workspace shape refuses
-        return {"workspace_problem": f"workspace-member: {exc}"[:300]}
+        return {"workspace_problem": f"workspace-member: {exc}"[:300],
+                "workspace_setting": (setting.repo, setting.branch)}
 
 
 # The production launcher: the operator-side client of the dispatch run server (P7-1 S9/S10a). The install file names it

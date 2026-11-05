@@ -65,10 +65,17 @@ class RealSender(World):
     """The server half's rig with the REAL client: ``launch`` builds, uploads and then LAUNCHes (the base class's
     ``launch`` skips the sender so its tests can upload tampered bytes by hand)."""
 
+    connects: list
+
     def launch(self, sock, key, ws):
         r = self.rig
-        client = C.DispatchSessionLauncher(lambda: sock, lambda occ: C.link_proof(r.store, r.world.root, occ,
-                                                                                  now=r.now()))
+        self.connects = getattr(self, "connects", [])
+
+        def connect():
+            self.connects.append(key)                                  # a connection the client took
+            return sock
+
+        client = C.DispatchSessionLauncher(connect, lambda occ: C.link_proof(r.store, r.world.root, occ, now=r.now()))
         return client.spawn(S.SessionLaunch(self.oid, key, "claude", "sonnet", "b", "passthrough", EXP, ws))
 
 
@@ -422,7 +429,7 @@ def test_a_loosening_snapshot_never_reaches_the_real_server(w, tmp_path, tmpdir_
     with pytest.raises(C.WorkspaceNotSent) as exc:
         w.launch(sock, key, member(repo))
     assert exc.value.name == REFUSED and exc.value.detail.startswith("loosening")
-    assert sock.fileno() == -1                               # the connection the sender opened is closed, not left holding
+    assert w.connects == [] and sock.fileno() != -1          # the refusal came before the client took a connection at all
     assert w.uploads._ups == {} and w.runtime.attempts == [] and not w.staged.exists()
     assert w.env.launcher.index.get(key) is None             # the server never heard of the key: no LAUNCH, no tombstone
     assert os.listdir(tmpdir_) == []
@@ -607,7 +614,8 @@ def test_a_setting_that_does_not_resolve_is_handed_over_as_a_problem_not_raised(
     repo = op_repo(tmp_path)
     for setting in (W.WorkspaceSetting(str(repo), "nope"), W.WorkspaceSetting(str(tmp_path / "gone"), None)):
         kw = W._workspace_kwargs(W.SessionInstall(tmp_path, None, None, {}, {AG: setting}), AG)
-        assert set(kw) == {"workspace_problem"} and kw["workspace_problem"].startswith("workspace-")
+        assert set(kw) == {"workspace_problem", "workspace_setting"} and kw["workspace_problem"].startswith("workspace-")
+        assert kw["workspace_setting"] == (setting.repo, setting.branch)      # what a rerun hashes to replay its first attempt
 
 
 def test_the_factory_hands_run_session_the_workspace_for_a_configured_agent(rig, tmp_path, monkeypatch):
@@ -659,3 +667,175 @@ def test_a_rerun_after_the_branch_moved_is_a_replay(rig):
 def test_a_rerun_asking_for_another_branch_or_repo_is_not_a_replay(rig, over):
     launcher, again = _crashed_then_rerun(rig, dataclasses.replace(MEMBER, **over))
     assert len(launcher.launches) == 1 and again.state == "launched"          # asking for other work is not a replay
+
+
+
+# --- a rerun whose setting no longer resolves (L3 w1cli r1: gemini HIGH, complement MED) ---------------------------------------
+
+def _crashed_then_rerun_unresolved(rig, setting=(MEMBER.repo, MEMBER.branch)):
+    """The first attempt resolved its workspace, launched, and crashed before it recorded the end; at the rerun the
+    setting no longer resolves (the branch since deleted, the repo moved), so the fire hands over a problem."""
+    from tests.test_agents_session_launch import _sup
+    oid = _occurrence(rig, billing="subscription", exposure=EXP)
+    launcher = Stub(auth="passthrough")
+    sup = _crash_first_finish(_sup(rig, oid))
+    with pytest.raises(KeyboardInterrupt):
+        _run(rig, oid, launcher, exposure=EXP, sup=sup, workspace=MEMBER)
+    extra = {} if setting is None else {"workspace_setting": setting}
+    _, again = _run(rig, oid, launcher, exposure=EXP, sup=sup, workspace_problem="workspace-branch: gone", **extra)
+    return oid, launcher, again
+
+
+def test_a_rerun_whose_setting_no_longer_resolves_still_replays_the_first_attempts_effect(rig):
+    oid, launcher, again = _crashed_then_rerun_unresolved(rig)
+    assert len(launcher.launches) == 1                                         # nothing spawned twice
+    assert (again.state, rig.row(oid)["state"], rig.row(oid)["reason"]) == ("done", "done", "completed")   # not session_refused:workspace
+
+
+def test_a_rerun_with_a_problem_and_other_work_spawns_nothing(rig):
+    oid, launcher, again = _crashed_then_rerun_unresolved(rig, setting=(MEMBER.repo, "release"))
+    assert len(launcher.launches) == 1 and again.state == "launched"          # not a replay of the first: left to lapse recovery
+
+
+def test_a_rerun_with_a_problem_and_no_setting_is_still_a_refusal(rig):
+    oid, launcher, again = _crashed_then_rerun_unresolved(rig, setting=None)
+    assert len(launcher.launches) == 1 and rig.row(oid)["reason"] == "session_refused:workspace"   # nothing to hash: the old rule
+
+
+def test_a_first_attempt_with_a_problem_and_a_setting_is_refused_and_launches_nothing(rig):
+    oid = _occurrence(rig, billing="subscription", exposure=EXP)
+    launcher = Stub(auth="passthrough")
+    _run(rig, oid, launcher, exposure=EXP, workspace_problem="workspace-branch: gone",
+         workspace_setting=(MEMBER.repo, MEMBER.branch))
+    assert launcher.launches == [] and rig.row(oid)["reason"] == "session_refused:workspace"
+    assert rig.row(oid)["session_key"] is None                                 # no earlier attempt: the refusal stands
+
+
+# --- the snapshot is built before the connection is opened (L3 w1cli r1: codex HIGH) -----------------------------------------------
+
+def _ordered_client(w, events, sock):
+    r = w.rig
+
+    def connect():
+        events.append("connect")
+        return sock
+
+    def proof(occ):
+        events.append("proof")
+        return C.link_proof(r.store, r.world.root, occ, now=r.now())
+
+    client = C.DispatchSessionLauncher(connect, proof)
+    real = client.build_workspace
+
+    def build(launch):
+        events.append("build")
+        return real(launch)
+
+    client.build_workspace = build
+    return client
+
+
+def test_the_snapshot_is_built_before_the_proof_is_read_and_before_the_connection_is_opened(w, tmp_path):
+    repo = op_repo(tmp_path)
+    events: list = []
+    sock = w.env.connect()
+    client = _ordered_client(w, events, sock)
+    child = client.spawn(S.SessionLaunch(w.oid, w.key(), "claude", "sonnet", "b", "passthrough", EXP, member(repo)))
+    assert events == ["build", "proof", "connect"] and child.session == "sess-1"
+    child._conn.close()
+    w.env.drain()
+
+
+def test_a_build_refusal_happens_with_no_proof_read_and_no_connection_opened(w, tmp_path):
+    repo = op_repo(tmp_path, {".claude/settings.json": '{"disableAllHooks": true}', "src/a.py": "a\n"})
+    events: list = []
+    sock = w.env.connect()
+    client = _ordered_client(w, events, sock)
+    with pytest.raises(C.WorkspaceNotSent) as exc:
+        client.spawn(S.SessionLaunch(w.oid, w.key(), "claude", "sonnet", "b", "passthrough", EXP, member(repo)))
+    assert exc.value.name == S.WORKSPACE_REFUSED and events == ["build"]
+    sock.close()
+    w.env.drain()
+
+
+def test_a_launch_with_no_workspace_builds_nothing_before_it_connects(w):
+    events: list = []
+    sock = w.env.connect()
+    client = _ordered_client(w, events, sock)
+    child = client.spawn(S.SessionLaunch(w.oid, w.key(), "claude", "sonnet", "b", "passthrough", EXP, None))
+    assert events == ["build", "proof", "connect"]                            # the build step runs and has nothing to do
+    child._conn.close()
+    w.env.drain()
+
+
+# --- a host fault is not a standing refusal (L3 w1cli r1: codex MED) -----------------------------------------------------------------
+
+def _git_unavailable(monkeypatch):
+    def down(*a, **k):
+        raise SN.SnapshotRefused("snapshot-git-unavailable", "git could not run (TimeoutExpired)")
+
+    monkeypatch.setattr(SN, "_git", down)
+
+
+def test_resolve_head_keeps_a_git_that_could_not_run_transient(tmp_path, monkeypatch):
+    repo = op_repo(tmp_path)
+    _git_unavailable(monkeypatch)
+    with pytest.raises(stager.StageRefused) as exc:
+        stager.resolve_head(str(repo), "main")
+    assert exc.value.name == "snapshot-git-unavailable" and exc.value.transient is True
+
+
+def test_resolve_head_still_names_a_branch_git_cannot_resolve(tmp_path):
+    repo = op_repo(tmp_path)
+    with pytest.raises(stager.StageRefused) as exc:
+        stager.resolve_head(str(repo), "nope")
+    assert exc.value.name == "workspace-branch" and exc.value.transient is False
+
+
+def test_the_factory_raises_for_a_host_fault_and_hands_over_a_problem_for_a_bad_setting(tmp_path, monkeypatch):
+    repo = op_repo(tmp_path)
+    install = W.SessionInstall(tmp_path, None, None, {}, {AG: W.WorkspaceSetting(str(repo), "main")})
+    _git_unavailable(monkeypatch)
+    with pytest.raises(stager.StageRefused) as exc:                          # fire_factory raises: make_run leaves the row launched
+        W._workspace_kwargs(install, AG)
+    assert exc.value.transient is True
+
+
+def test_a_build_that_met_a_host_fault_is_a_transient_not_a_workspace_refusal(tmp_path, monkeypatch):
+    def down(ws, **k):
+        raise stager.StageRefused("snapshot-git-unavailable", "git could not run (TimeoutExpired)")
+
+    monkeypatch.setattr(stager, "build_upload", down)
+    with pytest.raises(C.WorkspaceNotSent) as exc:
+        C.DispatchSessionLauncher(lambda: None, lambda occ: None).build_workspace(launch_of(member(op_repo(tmp_path))))
+    assert (exc.value.name, exc.value.reason_class, exc.value.nothing_sent) == ("snapshot-git-unavailable", "transient", True)
+
+
+# --- the bundle's size is judged before it is read (L3 w1cli r1: complement LOW) ---------------------------------------------------
+
+def test_a_bundle_over_the_cap_is_refused_on_its_size_without_being_read(tmp_path, tmpdir_, monkeypatch):
+    repo = op_repo(tmp_path)
+    monkeypatch.setattr(WS, "BUNDLE_MAX_BYTES", 100)
+    opened: list = []
+    real_open = open
+
+    def spy(path, *a, **k):
+        opened.append(str(path))
+        return real_open(path, *a, **k)
+
+    monkeypatch.setattr(stager, "open", spy, raising=False)
+    with pytest.raises(stager.StageRefused) as exc:
+        stager.build_upload(member(repo))
+    assert exc.value.name == "bundle-over-cap" and opened == [] and os.listdir(tmpdir_) == []
+
+
+def test_an_effect_body_run_with_a_problem_starts_nothing(rig):
+    """A key on the row with no journaled effect behind it (not a state the fire writes, but one the body must not
+    trust): the refusal is let past for a rerun, and the body that then runs has no resolved workspace to launch."""
+    oid = _occurrence(rig, billing="subscription", exposure=EXP)
+    with rig.store.write() as conn:
+        conn.execute("UPDATE agent_occurrences SET session_key = ? WHERE occurrence_id = ?", ("s-00000000000000c1", oid))
+    launcher = Stub(auth="passthrough")
+    _run(rig, oid, launcher, exposure=EXP, workspace_problem="workspace-branch: gone",
+         workspace_setting=(MEMBER.repo, MEMBER.branch))
+    assert launcher.launches == [] and rig.row(oid)["reason"] == "session_refused:workspace"
