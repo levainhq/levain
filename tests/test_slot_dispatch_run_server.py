@@ -969,3 +969,185 @@ def test_the_cause_line_stays_one_line_whatever_op_the_client_sent(capsys):
     assert len(lines) == 1, lines
     assert "forged" not in lines[0].split("failed:")[0][len("levain dispatch-run: op "):] or "\\n" in lines[0]
     assert len(lines[0]) < 200
+
+
+# --- the launchd log is bounded by the program (L3 r1 of the stderr unit) -------------------------------------------------
+
+def _log_fd(tmp_path, size):
+    """A log as launchd opens it (appending), already ``size`` bytes long (sparse: the bytes are never read)."""
+    import os
+    path = tmp_path / "dispatch_run.log"
+    with open(path, "wb") as f:
+        f.truncate(size)
+    return path, os.open(path, os.O_WRONLY | os.O_APPEND)
+
+
+def test_an_over_cap_log_is_emptied_and_an_under_cap_one_is_left_alone(tmp_path):
+    import os
+    path, fd = _log_fd(tmp_path, D.LOG_MAX_BYTES + 1)
+    try:
+        D._bound_log(fd, path)
+        assert path.stat().st_size == 0
+    finally:
+        os.close(fd)
+    path, fd = _log_fd(tmp_path, D.LOG_MAX_BYTES)
+    try:
+        D._bound_log(fd, path)
+        assert path.stat().st_size == D.LOG_MAX_BYTES        # at the cap, not past it
+    finally:
+        os.close(fd)
+
+
+def test_a_pipe_and_a_closed_descriptor_are_left_alone():
+    import os
+    r, w = os.pipe()
+    try:
+        D._bound_log(w)                                      # not a regular file: no truncate, no raise
+    finally:
+        os.close(r)
+        os.close(w)
+    D._bound_log(w)                                          # closed: the OSError is swallowed
+
+
+def test_the_size_check_and_the_truncate_run_under_the_lock(tmp_path, monkeypatch):
+    import os
+    held = []
+    real = os.ftruncate
+
+    def spy(fd, n):
+        held.append(D._LOG_LOCK.locked())
+        return real(fd, n)
+
+    monkeypatch.setattr(D.os, "ftruncate", spy)
+    path, fd = _log_fd(tmp_path, D.LOG_MAX_BYTES + 1)
+    try:
+        D._bound_log(fd, path)
+    finally:
+        os.close(fd)
+    assert held == [True]
+
+
+def test_concurrent_reporters_share_a_bounded_log_and_none_raises(tmp_path, monkeypatch):
+    import os
+    import sys
+    path, fd = _log_fd(tmp_path, D.LOG_MAX_BYTES + 1)
+    monkeypatch.setattr(D, "_expected_log", lambda: path)
+    saved = os.dup(2)
+    out = open(path, "a")                                    # sys.stderr for the program, appending as launchd's fd does
+    errors = []
+    try:
+        os.dup2(fd, 2)
+        monkeypatch.setattr(sys, "stderr", out)
+
+        def work():
+            try:
+                for _ in range(100):
+                    D._report_failure("LAUNCH", RuntimeError("boom"))
+            except BaseException as exc:  # noqa: BLE001
+                errors.append(exc)
+
+        threads = [threading.Thread(target=work) for _ in range(8)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+    finally:
+        os.dup2(saved, 2)
+        os.close(saved)
+        os.close(fd)
+        out.close()
+    assert errors == []
+    assert 0 < path.stat().st_size < D.LOG_MAX_BYTES        # the over-cap file was emptied once, then only lines
+    assert all(ln.startswith("levain dispatch-run: op 'LAUNCH' failed: RuntimeError") for ln in
+               path.read_bytes().replace(b"\0", b"").decode().splitlines() if ln)
+
+
+def test_the_program_bounds_its_log_at_startup_and_before_each_cause_line(monkeypatch):
+    import os
+    import pwd
+    calls = []
+    monkeypatch.setattr(D, "_trim_if_over", lambda fd, expected=None: calls.append(fd))
+    monkeypatch.setattr(D, "_bound_log", lambda fd=2, expected=None: calls.append(fd))
+    D._report_failure("LAUNCH", RuntimeError("boom"))
+    assert calls == [2]
+    if os.geteuid() == 0:
+        pytest.skip("the program refuses root before the startup trim")
+    me = pwd.getpwuid(os.geteuid())
+    monkeypatch.setattr(D.pwd, "getpwnam", lambda name: me)
+    assert D.main(["--operator-uid", "x"]) == D.EX_CONFIG    # fails at argument parsing, after the startup trim
+    assert calls == [2, 2]
+
+
+# --- L3 r2 of the stderr unit: one lock span, an offset reset, and only the unit's own log is trimmed ---------------------
+
+def test_the_failure_line_is_written_under_the_same_lock_that_guards_the_truncate(monkeypatch):
+    """gemini MED: a truncate between a line's write and its flush erased it. The write itself must be inside the span."""
+    import sys
+    held = []
+
+    class Spy:
+        def write(self, text):
+            held.append(D._LOG_LOCK.locked())
+            return len(text)
+
+        def flush(self):
+            held.append(D._LOG_LOCK.locked())
+
+    monkeypatch.setattr(sys, "stderr", Spy())
+    D._report_failure("LAUNCH", RuntimeError("boom"))
+    assert held and all(held), held
+
+
+def test_a_truncate_cannot_interleave_with_a_failure_line_write(monkeypatch):
+    """With the lock held by another truncater, the reporter writes nothing until it is released."""
+    import sys
+    import io
+    sink = io.StringIO()
+    monkeypatch.setattr(sys, "stderr", sink)
+    D._LOG_LOCK.acquire()
+    try:
+        t = threading.Thread(target=D._report_failure, args=("LAUNCH", RuntimeError("boom")))
+        t.start()
+        t.join(0.3)
+        assert t.is_alive() and sink.getvalue() == ""        # blocked on the lock, nothing written
+    finally:
+        D._LOG_LOCK.release()
+    t.join(5)
+    assert sink.getvalue().startswith("levain dispatch-run: op 'LAUNCH' failed")
+
+
+def test_the_offset_is_reset_after_a_truncate(tmp_path):
+    import os
+    path, fd = _log_fd(tmp_path, D.LOG_MAX_BYTES + 1)
+    try:
+        os.lseek(fd, 0, os.SEEK_END)
+        D._bound_log(fd, path)
+        assert os.lseek(fd, 0, os.SEEK_CUR) == 0
+    finally:
+        os.close(fd)
+
+
+def test_only_the_units_own_log_is_trimmed(tmp_path, monkeypatch):
+    """deepseek MED: whatever regular file fd 2 happened to be (a shell redirect) was emptied once over the cap."""
+    import os
+    path, fd = _log_fd(tmp_path, D.LOG_MAX_BYTES + 1)
+    other = tmp_path / "somewhere_else.log"
+    other.write_bytes(b"x")
+    try:
+        D._bound_log(fd, other)                              # fd is not that file
+        assert path.stat().st_size == D.LOG_MAX_BYTES + 1
+        D._bound_log(fd, tmp_path / "absent.log")            # the expected file is missing (Linux): nothing to trim
+        assert path.stat().st_size == D.LOG_MAX_BYTES + 1
+        monkeypatch.setattr(D, "_expected_log", lambda: other)
+        D._bound_log(fd)                                     # the default path is the module's, not the fd's
+        assert path.stat().st_size == D.LOG_MAX_BYTES + 1
+        D._bound_log(fd, path)
+        assert path.stat().st_size == 0
+    finally:
+        os.close(fd)
+
+
+def test_the_expected_log_is_the_path_the_unit_gives_launchd(monkeypatch):
+    from levain.slot import units
+    monkeypatch.setattr(D, "_host", lambda: "darwin")
+    assert D._expected_log() == units.launchd_log_path(units.by_name("dispatch_run"))

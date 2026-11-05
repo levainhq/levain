@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import os
 import plistlib
+import stat
 from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Callable, Iterable, Literal
@@ -27,7 +28,7 @@ from typing import TYPE_CHECKING, Callable, Iterable, Literal
 from levain.firing.hands import HostOS, Step, _abs
 from levain.launch import child_env
 from levain.slot import Refused
-from levain.slot.layout import ROOT_GROUP, service_entry_path
+from levain.slot.layout import ROOT_GROUP, dispatch_store_dir, service_entry_path
 from levain.slot.root_tree import PY_FLAGS, ROOT_PYTHON
 
 if TYPE_CHECKING:
@@ -59,7 +60,9 @@ SERVICES: tuple[Service, ...] = (
     Service("keys", "gw-keys", "_levain_keys", ("control",), "always"),
     Service("qbroker", "QUEUE BROKER", "_levain_qbroker", ("control",), "always"),
     Service("dispatch", "dispatch", "_levain_dispatch", ("control", "keys"), "on-failure"),
-    Service("dispatch_run", "dispatch run server", "_levain_dispatch", ("control", "keys"), "always"),
+    # logs=True: the program's one stderr line for an unnamed failure ("op ... failed: <type> at <where>") is the only
+    # cause an `internal-error` answer leaves; without a path launchd threw it away (VM fire, finding 5).
+    Service("dispatch_run", "dispatch run server", "_levain_dispatch", ("control", "keys"), "always", logs=True),
     Service("reaper", "reaper", "root", ("control",), "always"),
     Service("pf", "pf anchor", "root", (), "one-shot", hosts=("darwin",), logs=True),
 )
@@ -120,11 +123,61 @@ def launchd_path(svc: Service) -> Path:
     return LAUNCHD_DIR / f"{launchd_label(svc)}.plist"
 
 
+#: The directory a logging service's file sits in when the service does not run as root, by account. launchd opens the
+#: path in the job's child AFTER it has dropped to ``UserName`` (Apple's launchd ``core.c``: ``job_setup_attributes`` runs
+#: ``job_postfork_become_user`` first, then ``job_setup_fd`` for the stdout and stderr paths), so root's ``/var/log`` is
+#: closed to such an account (EACCES, the line lost). A directory the account owns is open under either order of the drop.
+_OWN_LOG_DIR: dict[str, Callable[[HostOS], Path]] = {"_levain_dispatch": dispatch_store_dir}
+
+
 def launchd_log_path(svc: Service) -> Path:
-    """Where launchd appends a logging service's stdout and stderr (under root's ``/var/log``), so the pf one-shot's
-    "restored pf" / "not retried" line from a boot run can be read afterwards. The program keeps the file's size
-    bounded (:func:`levain.slot.services.pf.bound_log`)."""
-    return Path("/var/log") / f"{launchd_label(svc)}.log"
+    """Where launchd appends a logging service's stdout and stderr, so the pf one-shot's "restored pf" / "not retried"
+    line from a boot run, and the dispatch run server's unnamed-failure line, can be read afterwards. A root service's
+    file is under ``/var/log``; another account's is inside the directory that account owns (:data:`_OWN_LOG_DIR`: for
+    ``_levain_dispatch`` its store ``L/dispatch``, made by the store rows before any unit is bootstrapped), never a
+    directory it cannot create in. Each program keeps its file's size bounded (:func:`levain.slot.services.pf.bound_log`;
+    the dispatch run server's own)."""
+    if svc.user in _OWN_LOG_DIR:
+        return _OWN_LOG_DIR[svc.user]("darwin") / f"{launchd_label(svc)}.log"
+    if svc.user == "root" or not svc.logs:
+        return Path("/var/log") / f"{launchd_label(svc)}.log"      # a service that keeps no log never has the path opened
+    raise Refused("bad-config", f"{svc.name}: no log directory for the account {svc.user!r}")
+
+
+def _clear_stale_log(svc: Service, *, account_uid: Callable[[str], int] | None = None) -> tuple[bool, str]:
+    """Delete a regular file at ``svc``'s launchd log path that the service's CURRENT account does not own. ``undo`` keeps
+    the store, and so the log, while it retires the account; a later setup allocates a NEW uid and chowns only the
+    directory, so a kept 0644 log of the dead uid could not be opened for append by launchd as the new account (the
+    original EACCES). Deleting is the bound: launchd re-creates the file as the right owner. ``lstat`` first and only a
+    regular file is removed (``unlink`` never follows a link); a symlink, a directory or anything else is refused and
+    named, never followed or removed. A file the current account owns is kept (a running job holds it open)."""
+    if not svc.logs or svc.user == "root":
+        return True, ""
+    path = launchd_log_path(svc)
+    try:
+        st = os.lstat(path)
+    except FileNotFoundError:
+        return True, ""
+    except OSError as e:
+        return False, f"{path}: {e.strerror}"
+    if not stat.S_ISREG(st.st_mode):
+        return False, f"{path} is not a regular file; remove it by hand (it is not followed or removed here)"
+    try:
+        if account_uid is None:
+            import pwd
+            account_uid = lambda n: pwd.getpwnam(n).pw_uid          # noqa: E731
+        want = account_uid(svc.user)
+    except (KeyError, OSError):
+        return False, f"{svc.user} does not exist, so {path}'s owner cannot be judged"
+    if st.st_uid == want:
+        return True, ""
+    try:
+        os.unlink(path)
+    except FileNotFoundError:
+        pass
+    except OSError as e:
+        return False, f"{path}: {e.strerror}"
+    return True, ""
 
 
 def launchd_plist_text(svc: Service) -> str:
@@ -316,6 +369,9 @@ def install_steps(host: HostOS, services: Iterable[Service], *, run: Callable[..
                               call=lambda lb=label, p=path, t=text: _unload_launchd_if_changed(lb, p, t, run, read)))
             steps.append(Step(f"write the LaunchDaemon {label} ({s.title}, as {s.user})",
                               write=(path, text, 0o644), validate=("/usr/bin/plutil", "-lint")))
+            if s.logs and s.user != "root":
+                steps.append(Step(f"remove a stale {launchd_log_path(s)} (a regular file the {s.user} account does not "
+                                  "own) before the job is bootstrapped", call=lambda sv=s: _clear_stale_log(sv)))
         for s in chosen:
             label = launchd_label(s)
             steps.append(Step(f"start {label}", ("/bin/launchctl", "bootstrap", "system", str(launchd_path(s))),
