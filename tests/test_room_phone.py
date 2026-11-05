@@ -68,8 +68,8 @@ def test_the_room_boxes_are_prose_with_dash_free_names():
 def test_the_phone_rules_exist_and_use_tokens_only():
     css = (WEB / "dashboard.css").read_text()
     i = css.index("RM-H, the phone")
-    block = css[i:css.index("/* C12:", i)]
-    assert "font-size: 16px" in block and "env(safe-area-inset-bottom" in block and "position: sticky" in block
+    block = css[i:css.index(".rv .rv-stage", i)]
+    assert "font-size: 16px" in block and "env(safe-area-inset-bottom" in block and "position: sticky" not in block   # the dock sits under the conversation, never over it (1104-29)
     assert "grid-template-columns: repeat(2" in block and ".rv-send { grid-column: 1 / -1" in block
     assert not re.search(r"#[0-9a-fA-F]{3,6}\b", block)
 
@@ -114,7 +114,7 @@ return JSON.stringify({noSideScroll: document.documentElement.scrollWidth <= win
 
 @needs_browser
 def test_the_dock_fits_a_390_phone_with_every_control_whole(tmp_path, w):
-    """Structural only: the computed position is `sticky`, which cannot show that the dock sticks to the viewport edge."""
+    """Structural only. The dock is in the flow below the conversation (1104-29), no longer sticky."""
     with _serve_room(tmp_path, w, extra_assets=_assets(_boot("Local"))) as (base, _h):
         out = _drive(tmp_path, base + "/rvc.html", [
             {"emulate": {"w": 390, "h": 800, "dpr": 2, "mobile": True}},
@@ -123,7 +123,7 @@ def test_the_dock_fits_a_390_phone_with_every_control_whole(tmp_path, w):
         ])
     g = json.loads(out["values"][1])
     assert g["noSideScroll"] and g["inside"] and g["tall"] and g["unclipped"] and g["sendWide"], g
-    assert g["n"] == 5 and g["rows"] <= 3 and g["input16"] >= 16 and g["sticky"] == "sticky", g
+    assert g["n"] == 5 and g["rows"] <= 3 and g["input16"] >= 16 and g["sticky"] != "sticky", g
 
 
 # --- the voice, F1-F4 of the r1 findings -----------------------------------------------------------------------------

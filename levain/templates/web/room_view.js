@@ -108,6 +108,32 @@
   }
   function clear(node) { while (node.firstChild) node.removeChild(node.firstChild); }
 
+  // A message's words become DOM here and nowhere as markup: plain text, plus one shape, a fenced block (a line opening with
+  // three backticks to the line closing with three), drawn as <pre><code> from the lines between. An unclosed fence (a reply
+  // still streaming) stays plain text, backticks and all; nothing else is parsed.
+  function fillText(doc, node, text) {
+    var lines = text.split("\n"), parts = [], cur = [], i = 0;
+    while (i < lines.length) {
+      if (/^ {0,3}```/.test(lines[i])) {
+        var j = i + 1;
+        while (j < lines.length && !/^ {0,3}```[ \t]*$/.test(lines[j])) j++;
+        if (j < lines.length) {
+          if (cur.length) parts.push({ code: false, text: cur.join("\n") });
+          parts.push({ code: true, text: lines.slice(i + 1, j).join("\n") });
+          cur = []; i = j + 1; continue;
+        }
+      }
+      cur.push(lines[i]); i++;
+    }
+    if (!parts.length) { node.textContent = text; return; }
+    if (cur.length) parts.push({ code: false, text: cur.join("\n") });
+    parts.forEach(function (p) {
+      if (!p.code) { if (p.text.replace(/\s+/g, "")) node.appendChild(doc.createTextNode(p.text.replace(/^\n+|\n+$/g, ""))); return; }
+      var pre = el(doc, "pre", "rv-code"), code = el(doc, "code", null, p.text);
+      pre.appendChild(code); node.appendChild(pre);
+    });
+  }
+
   // hooks: onMark(ref, delivered, note, done), onCommit(card, words, note, buttons), onDismiss(card, note, buttons); ui.open keyed by gseq
   function renderLine(doc, l, hooks, ui) {
     var row = el(doc, "div", "rv-line " + l.cls);
@@ -117,7 +143,8 @@
     head.textContent = l.who || (l.tool ? (l.tool.open ? "A tool is running" : "A tool ran") : (l.kind === "vendor_error" ? "Error" : l.kind.replace(/_/g, " ")));
     if (fold && !shown && l.text) head.textContent += " — " + peek(l.text);
     row.appendChild(head);
-    var pre = l.text ? el(doc, "div", "rv-text", l.text) : null;
+    var pre = l.text ? el(doc, "div", "rv-text") : null;
+    if (pre) fillText(doc, pre, l.text);
     if (pre) {
       if (fold) pre.hidden = !shown;
       row.appendChild(pre);
@@ -182,7 +209,13 @@
     }
     clear(st.streamBox);
     if (m.model) st.streamBox.appendChild(el(doc, "div", "rv-head", m.model));
-    if (m.error) st.streamBox.appendChild(el(doc, "div", "rv-note rv-error", "The room reported: " + m.error));
+    if (m.error) {
+      var ban = el(doc, "div", "rv-gap rv-banner");
+      ban.setAttribute("role", "status");
+      ban.appendChild(el(doc, "div", "rv-banner-lead", "The room ran into a problem and may not be answering."));
+      ban.appendChild(el(doc, "div", "rv-detail", "The room reported: " + m.error));
+      st.streamBox.appendChild(ban);
+    }
     if (m.gap) st.streamBox.appendChild(el(doc, "div", "rv-gap", "Some lines may be missing from this conversation."));
     if (!m.stream.length) st.streamBox.appendChild(el(doc, "div", "rv-note", m.open ? "Nothing has been said yet." : m.words));
     m.stream.forEach(function (l) { st.streamBox.appendChild(renderLine(doc, l, hooks, ui)); });
@@ -213,8 +246,19 @@
     if (Speech && !(Speech.prototype && "processLocally" in Speech.prototype)) Speech = null;
     var store = opts.storage === undefined ? (function () { try { return root.sessionStorage; } catch (e) { return null; } })() : opts.storage;
     var stopped = false, timer = 0, gen = 0, last = "", thread = null, current = null, ui = { open: {} }, drafts = {};
-    var wrap = el(doc, "div", "rv"), body = el(doc, "div", "rv-body"), dock = el(doc, "div", "rv-dock");
-    wrap.appendChild(body); wrap.appendChild(dock); host.appendChild(wrap);
+    var wrap = el(doc, "div", "rv"), stage = el(doc, "div", "rv-stage"), body = el(doc, "div", "rv-body"), dock = el(doc, "div", "rv-dock"),
+      jumpB = el(doc, "button", "rv-jump", "Jump to latest"), hushed = "";
+    jumpB.setAttribute("type", "button"); jumpB.hidden = true;
+    stage.appendChild(body); stage.appendChild(jumpB); wrap.appendChild(stage); wrap.appendChild(dock); host.appendChild(wrap);
+    // On a phone the conversation is its own scroll box that ends above the dock: it follows the newest line while it is at its
+    // end, and holds its place (with a way back down) once scrolled up. Where the box does not scroll (a desk) none of this shows.
+    function atEnd() { return body.scrollHeight - body.scrollTop - body.clientHeight <= 48; }
+    function paintJump() { jumpB.hidden = atEnd(); }
+    function toEnd() { body.scrollTop = body.scrollHeight; }
+    var wasEnd = true;       // at its end as of the last scroll or draw: a resize (a phone turned) keeps a box that was at its end there
+    body.addEventListener("scroll", function () { wasEnd = atEnd(); paintJump(); });
+    if (root.addEventListener) root.addEventListener("resize", function () { if (!stopped && wasEnd) toEnd(); paintJump(); });
+    jumpB.addEventListener("click", function () { toEnd(); paintJump(); });
     var ta = el(doc, "textarea", "rv-input"), actions = el(doc, "div", "rv-actions"),
       sendB = el(doc, "button", "rv-send", "Send"), dropB = el(doc, "button", "rv-drop", "Drop"),
       stopB = el(doc, "button", "rv-stop", "Stop"), note = el(doc, "div", "rv-sendnote"),
@@ -346,6 +390,7 @@
       rotB.disabled = true; note.textContent = "Starting a new conversation...";
       post("rotate", { room_thread_id: current && current.thread }).then(function (r) {
         note.textContent = r.status === 200 ? "A new conversation is open." : ((r.json && r.json.message) || "No new conversation was started.");
+        if (r.status === 200 && current) hushed = current.error;        // the old conversation's problem is not the new one's
         last = ""; return pull();
       }).catch(function () { note.textContent = "The server could not be reached."; }).then(paintDock);
     });
@@ -456,12 +501,17 @@
           if (t !== last) {
             last = t;
             current = roomModel(JSON.parse(t));
+            if (hushed && current.error === hushed) current.error = ""; else hushed = "";
+            var stick = thread === null || atEnd();
             if (current.thread !== thread) {
+              stick = true;
               ui.open = {}; thread = current.thread;
               // the kept edits belong to the room they were made in: another room starts with none
               if (thread !== cardsThread) { drafts = {}; hooks.ids = {}; cardsThread = thread; saveCards(); }
             }
             renderRoom(doc, body, current, hooks, ui, drafts);
+            if (stick) toEnd();
+            wasEnd = atEnd(); paintJump();
           }
           paintDock();
         });

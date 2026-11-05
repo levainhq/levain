@@ -2783,11 +2783,30 @@ body.ke[data-mode="build"] .th-zone .zone-head { display: flex; }   /* titled li
    row at the touch size, so no label is squeezed and nothing scrolls sideways. */
 @media (pointer: coarse), (max-width: 640px) { .rv .rv-input, .rv .rv-card textarea { font-size: 16px; } }
 @media (max-width: 640px) {
-  .rv .rv-dock { position: sticky; bottom: 0; z-index: 1; background: var(--bg, var(--card)); padding-top: var(--sp-3); padding-bottom: env(safe-area-inset-bottom, 0px); }
+  .rv .rv-dock { padding-top: var(--sp-3); padding-bottom: env(safe-area-inset-bottom, 0px); }
   .rv .rv-actions { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); }
   .rv .rv-actions > button { min-width: 0; padding-inline: var(--sp-3); overflow-wrap: anywhere; }
   .rv .rv-actions > .rv-send { grid-column: 1 / -1; }
   .rv .rv-card button { width: 100%; }
+}
+
+/* The room's conversation, its notice and its code block. On a phone the card does not clamp the room (the Board's 560px card height is
+   for a list; here it hid the newest reply behind the dock): the card takes its height, the conversation is its own scroll box that ends
+   ABOVE the dock, and "Jump to latest" shows while it is scrolled up. The dock is in the flow under it, never over it. */
+.rv .rv-stage { position: relative; min-width: 0; }
+.rv .rv-jump { position: absolute; right: var(--sp-3); bottom: var(--sp-3); min-height: var(--hit-min, 44px); padding: var(--sp-2) var(--sp-5); border-radius: var(--r-md); cursor: pointer;
+  background: var(--accent); color: var(--on-accent); border: 1px solid var(--accent); font: var(--fw-semibold) var(--fs-meta)/1 var(--sans); }
+.rv .rv-jump[hidden] { display: none; }
+.rv .rv-gap { overflow-wrap: anywhere; }
+.rv .rv-banner { display: flex; flex-direction: column; gap: var(--sp-2); background: var(--card-2); }
+@media (max-width: 720px) { .rv .rv-banner { position: sticky; top: 0; z-index: 1; } }   /* the notice stays in view above a scrolled conversation */
+.rv .rv-banner .rv-detail { color: var(--label); font: var(--fw-regular) var(--fs-micro)/1.5 var(--mono); overflow-wrap: anywhere; }
+.rv .rv-code { margin: var(--sp-2) 0 0; padding: var(--sp-3) var(--sp-4); background: var(--card); border: 1px solid var(--hair-2); border-radius: var(--r-sm); overflow-x: auto; white-space: pre; }
+.rv .rv-code code { font: var(--fw-regular) var(--fs-micro)/1.5 var(--mono); color: var(--text); }
+@media (max-width: 720px) {
+  body.ke .rv-zone .ck-zgrid .panel { height: auto; max-height: none; }
+  body.ke .rv-zone .ck-zgrid .panel .pbody { overflow: visible; max-height: none; }
+  .rv .rv-body { max-height: 62vh; max-height: 62dvh; overflow-y: auto; overflow-x: hidden; }
 }
 
 /* C12: the board kind's painters (board_view.js, bd-*). The panel lists cards grouped under column headings; the six columns (one on a narrow page) are the ⤢ modal's. */
