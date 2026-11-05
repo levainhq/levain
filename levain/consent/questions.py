@@ -142,6 +142,10 @@ class Question:
     # the levain sign request (levain.consent.sign) a caller filed for this question, by id: the cockpit row then
     # carries `sign: {"request": <id>}` and the page signs the request's own options. The kernel's store sets none
     sign_request: str | None = None
+    # the same text as ``blocks`` with its line breaks (a host store whose items carry a multi-line text: flow's needs-phill rows'
+    # ``stopped_full``). Display only: ``blocks`` is the text a signature covers, and the card draws this one only when it has
+    # exactly those words. The kernel's store sets none
+    blocks_full: str = ""
 
     @property
     def open_ended(self) -> bool:

@@ -2339,6 +2339,9 @@ class _Handler(GuardedHandler):
                             "signed": None if signed is None else bool(signed),
                             "label": next((label for k, label in opts if k == a.value), None)
                             if a.kind == "option" else None}}
+                    full = getattr(q, "blocks_full", "")
+                    if isinstance(full, str) and full:
+                        payload["blocks_full"] = full      # the lines of `blocks`, for the card; absent when the store has none
             except _CredentialUnavailable:   # RU-5: only the outer catch answers it
                 raise
             except Exception as exc:  # noqa: BLE001 - a store that cannot be read is an answer, never a dead connection
