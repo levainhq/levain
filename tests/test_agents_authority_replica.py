@@ -589,20 +589,33 @@ def test_a_commit_that_fails_leaves_the_replica_and_its_replay_as_they_were(rig,
     assert replica.replay() == rig.authority.replay()
 
 
-def test_a_loose_replica_root_or_anchor_dir_is_made_private(rig, tmp_path):
+def test_a_fresh_replica_is_private_from_inception(rig, tmp_path):
+    replica = _replica(tmp_path)
+    replica.append(_source(rig))
+    anchor_dir = auth.anchor_path(replica.root).parent
+    assert [p.stat().st_mode & 0o777 for p in (replica.root, anchor_dir, replica.db_path)] == [0o700, 0o700, 0o600]
+
+
+@pytest.mark.parametrize("what", ["root", "anchor_dir", "db"])
+def test_a_loose_pre_existing_replica_object_is_refused_never_repaired(rig, tmp_path, what):
     rows = _with_link(rig)
     replica = _replica(tmp_path)
     replica.append(rows[:-1])
-    anchor_dir = auth.anchor_path(replica.root).parent
-    replica.root.chmod(0o777)
-    anchor_dir.chmod(0o777)
-    replica.db_path.chmod(0o666)
-    replica.append(rows[-1:])
-    modes = [p.stat().st_mode & 0o777 for p in (replica.root, anchor_dir, replica.db_path)]
-    assert modes == [0o700, 0o700, 0o600]
-    replica.root.chmod(0o777)
-    assert replica.head() == (rows[-1].seq, rows[-1].hash)                    # the reader repairs it too
-    assert replica.root.stat().st_mode & 0o777 == 0o700
+    target = {"root": replica.root, "anchor_dir": auth.anchor_path(replica.root).parent, "db": replica.db_path}[what]
+    loose = 0o755 if what != "db" else 0o644
+    target.chmod(loose)
+    with pytest.raises(AR.ReplicaRefused) as exc:          # another uid may already hold it open: a chmod revokes nothing
+        replica.append(rows[-1:])
+    assert (exc.value.name, exc.value.reason_class) == ("replica-not-private", "standing")
+    assert target.stat().st_mode & 0o777 == loose                             # left as found, never repaired
+    for read in (replica.head, replica.replay):
+        with pytest.raises(AR.ReplicaRefused) as exc:
+            read()
+        assert exc.value.name == "replica-not-private"
+    claims = D.FrameClaims((rows[-2].seq, rows[-2].hash), (False, 0))
+    with pytest.raises(LauncherRefusedT) as lexc:          # the run server keeps the name and the class (L3 r2 #5)
+        D.replica_verifier(replica, now=rig.now)(None, None, claims)
+    assert (lexc.value.name, lexc.value.reason_class) == ("replica-not-private", "standing")
 
 
 @pytest.mark.parametrize("what", ["db", "journal", "lock", "anchor", "anchor_dir", "hardlink"])
@@ -686,6 +699,80 @@ def test_a_replica_that_moves_during_the_check_is_named_ledger_behind(rig, tmp_p
     with pytest.raises(LauncherRefusedT) as exc:
         D.replica_verifier(replica, now=rig.now)(None, None, D.FrameClaims(moved, (False, 0)))
     assert (exc.value.name, exc.value.reason_class) == ("ledger-behind", "transient")
+
+
+# --- L3 r2 ------------------------------------------------------------------------------------------------------------
+
+def test_an_anchor_conflict_after_the_commit_is_refused_as_committed_never_a_success(rig, tmp_path, monkeypatch):
+    rows = _with_link(rig)
+    replica = _replica(tmp_path)
+    replica.append(rows[:-1])
+
+    def conflict(path, snap):                              # another writer's anchor landed after the pre-COMMIT check
+        raise auth.ForeignAnchor("another store's anchor")
+
+    monkeypatch.setattr(auth, "advance_anchor", conflict)
+    with pytest.raises(AR.ReplicaRefused) as exc:
+        replica.append(rows[-1:])
+    assert (exc.value.name, exc.value.reason_class) == ("ledger-anchor-conflict", "standing")
+    assert "ARE committed" in exc.value.detail
+    assert replica.head() == (rows[-1].seq, rows[-1].hash)                    # committed: the refusal says so
+
+
+def test_a_resend_whose_held_first_row_matches_but_a_later_row_differs_is_a_fork(rig, tmp_path):
+    rows = _with_link(rig)
+    replica = _replica(tmp_path)
+    replica.append(rows)
+    later = [rows[-2], dataclasses.replace(rows[-1], record=rows[-1].record + " ")]
+    assert _refused(replica, later, "ledger-fork").reason_class == "standing"
+    _refused(replica, rows[-2:], "ledger-stale")                              # the identical resend is still stale
+
+
+def test_a_partly_held_batch_whose_new_row_does_not_link_is_a_fork(rig, tmp_path):
+    rows = _with_link(rig)
+    replica = _replica(tmp_path)
+    replica.append(rows[:-1])
+    broken = [rows[-2], dataclasses.replace(rows[-1], prev_hash="f" * 64)]
+    _refused(replica, broken, "ledger-fork")
+    _refused(replica, rows[-2:], "ledger-stale")                              # consistent overlap: the client re-reads
+
+
+def test_a_replay_advances_a_lagging_anchor_and_refuses_transient_while_it_cannot(rig, tmp_path, monkeypatch):
+    rows = _with_link(rig)
+    replica = _replica(tmp_path)
+    replica.append(rows[:-1])
+    real = auth.advance_anchor
+
+    def fail(path, snap):
+        raise OSError("disk")
+
+    monkeypatch.setattr(auth, "advance_anchor", fail)
+    replica.append(rows[-1:])                                                 # committed; the anchor lags
+    with pytest.raises(AR.ReplicaRefused) as exc:          # a lag never stands under an authorising replay
+        replica.replay()
+    assert (exc.value.name, exc.value.reason_class) == ("ledger-anchor-lagging", "transient")
+    head = (rows[-1].seq, rows[-1].hash)
+    with pytest.raises(LauncherRefusedT) as lexc:
+        D.replica_verifier(replica, now=rig.now)(None, None, D.FrameClaims(head, (False, 0)))
+    assert (lexc.value.name, lexc.value.reason_class) == ("ledger-anchor-lagging", "transient")
+    monkeypatch.setattr(auth, "advance_anchor", real)
+    assert auth.read_anchor(auth.anchor_path(replica.root)).seq == rows[-2].seq
+    assert replica.replay() == rig.authority.replay()                         # the read path heals it
+    assert auth.read_anchor(auth.anchor_path(replica.root)).seq == rows[-1].seq
+
+
+def test_a_standing_replica_refusal_from_the_replay_keeps_its_name_and_class(rig, tmp_path, monkeypatch):
+    rows = _with_link(rig)
+    replica = _replica(tmp_path)
+    replica.append(rows)
+
+    def not_ours():
+        raise AR.ReplicaRefused("replica-not-ours", "cockpit.db is a symlink")
+
+    monkeypatch.setattr(replica, "replay", not_ours)
+    with pytest.raises(LauncherRefusedT) as exc:
+        D.replica_verifier(replica, now=rig.now)(None, None, D.FrameClaims(replica.head(), (False, 0)))
+    assert (exc.value.name, exc.value.reason_class) == ("replica-not-ours", "standing")
 
 
 LauncherRefusedT = L.LauncherRefused

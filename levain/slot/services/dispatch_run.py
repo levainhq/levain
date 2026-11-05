@@ -194,6 +194,8 @@ def replica_verifier(replica: AuthorityReplica, *,
             raise LauncherRefused("ledger-head-missing", "the frame names no ledger head")
         try:
             head = replica.head()
+        except ReplicaRefused as exc:     # the same mapping as the replay's below: head() runs first (L3 r2 #5)
+            raise LauncherRefused(exc.name, exc.detail, reason_class=exc.reason_class) from None
         except Exception:  # noqa: BLE001 - a replica that cannot be read authorises nothing
             raise LauncherRefused("authority-unreadable", "the authority replica cannot be read",
                                   reason_class="transient") from None
@@ -205,7 +207,10 @@ def replica_verifier(replica: AuthorityReplica, *,
             raise LauncherRefused("bar-invalid", "the claimed closed bar lies outside the replica's ledger")
 
         def replay() -> Any:
-            state = replica.replay()
+            try:
+                state = replica.replay()
+            except ReplicaRefused as exc:     # keeps its own name and class (a standing replica-not-ours stays standing)
+                raise LauncherRefused(exc.name, exc.detail, reason_class=exc.reason_class) from None
             if (state.seq, state.head_hash) != head:
                 raise LauncherRefused("ledger-behind", "the replica moved during the check", reason_class="transient")
             return state
