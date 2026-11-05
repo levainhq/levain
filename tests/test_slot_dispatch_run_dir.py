@@ -73,4 +73,59 @@ def test_the_reaper_boot_pass_makes_it(tmp_path, host):
     assert (row.owner, row.group) == ("_levain_dispatch", "levain-control")
     assert reaper.boot_dirs(w.seams, log=lambda m: None) == []
     assert (w.R / "dispatch").is_dir() and not (w.R / "dispatch").is_symlink()
-    assert stat.S_IMODE(os.lstat(w.R / "dispatch").st_mode) & 0o777 == row.mode & 0o777
+    mode = stat.S_IMODE(os.lstat(w.R / "dispatch").st_mode)
+    assert mode & 0o777 == row.mode & 0o777
+    if host == "linux":
+        assert mode & 0o2000 == 0o2000      # setgid kept: run.sock takes the dir's levain-control group
+
+
+# --- a fresh setup: the run server starts before the operator record exists (L3 r1 codex H1) ---------------------------
+
+
+def _fresh_linux_plan():
+    from levain.firing import hands
+    from levain.slot.grammar import parse_install_argv
+    from levain.slot.install_helper import HostFacts, plan_setup
+    real = hands.shutil.which
+    hands.shutil.which = lambda n, path=None: real(n, path=path) or f"/usr/sbin/{n}"
+    try:
+        cmd = parse_install_argv(["setup", "--slots", "2", "--verifier-slots", "1", "--operator", "alice"])
+        facts = HostFacts("linux", caller_uid=501, caller_name="alice", operator_uid=501,
+                          tool_present=lambda p: True, xcode_ready=lambda: True)     # no operator record: a fresh host
+        return plan_setup(cmd, facts, read_sysctl=lambda p: "1", program_exists=lambda p: True)
+    finally:
+        hands.shutil.which = real
+
+
+def test_a_fresh_linux_setup_starts_the_run_server_before_it_writes_the_operator_record():
+    steps = _fresh_linux_plan().steps
+    start = next(i for i, s in enumerate(steps) if s.argv and s.argv[-2:] == ("--now", "levain-dispatch_run.service"))
+    record = next(i for i, s in enumerate(steps) if s.write and s.write[0] == layout.operator_record_path("linux"))
+    assert start < record          # the record is setup's LAST act (§23), so the server's first start finds none
+
+
+def _unit_lines(svc):
+    return dict(line.split("=", 1) for line in units.systemd_unit_text(svc).splitlines() if "=" in line)
+
+
+def test_an_absent_operator_record_is_a_temporary_exit_the_unit_restarts(monkeypatch, tmp_path, capsys):
+    import pwd
+    from levain.slot.services import dispatch_run as D
+    monkeypatch.setattr(D.pwd, "getpwnam", lambda n: pwd.struct_passwd((n, "x", os.geteuid(), 0, "", "/", "/bin/sh")))
+    monkeypatch.setattr(D, "build_server", lambda *a, **k: pytest.fail("served without an operator uid"))
+    rc = D.main(["--operator-record", str(tmp_path / "absent"), "--socket", str(tmp_path / "run.sock")])
+    assert rc == 75                                                         # EX_TEMPFAIL
+    assert "no-operator" in capsys.readouterr().err
+    lines = _unit_lines(units.by_name("dispatch_run"))
+    assert lines["Restart"] == "always" and str(rc) not in lines["RestartPreventExitStatus"].split()
+    assert not (tmp_path / "run.sock").exists()
+
+
+def test_a_malformed_operator_record_still_stops_the_unit(monkeypatch, tmp_path, capsys):
+    import pwd
+    from levain.slot.services import dispatch_run as D
+    monkeypatch.setattr(D.pwd, "getpwnam", lambda n: pwd.struct_passwd((n, "x", os.geteuid(), 0, "", "/", "/bin/sh")))
+    monkeypatch.setattr(D, "build_server", lambda *a, **k: pytest.fail("served without an operator uid"))
+    (tmp_path / "bad").write_text("{}")
+    assert D.main(["--operator-record", str(tmp_path / "bad"), "--socket", str(tmp_path / "run.sock")]) == D.EX_CONFIG
+    assert "operator-record-malformed" in capsys.readouterr().err
