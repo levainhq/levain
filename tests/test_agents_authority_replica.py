@@ -278,9 +278,7 @@ def test_a_commit_whose_anchor_advance_fails_keeps_the_rows_and_the_next_sync_he
         raise OSError("disk")
 
     monkeypatch.setattr(auth, "advance_anchor", fail)
-    with pytest.raises(AR.ReplicaRefused) as exc:
-        replica.append(rows[-1:])
-    assert (exc.value.name, exc.value.reason_class) == ("ledger-anchor-unwritten", "transient")
+    assert replica.append(rows[-1:]) == (rows[-1].seq, rows[-1].hash)         # committed, answered (r1: never "unchanged")
     monkeypatch.undo()
     assert replica.head() == (rows[-1].seq, rows[-1].hash)                    # committed, the anchor lags (never leads)
     assert auth.read_anchor(auth.anchor_path(replica.root)).seq == rows[-1].seq - 1
@@ -518,3 +516,176 @@ def test_the_production_wiring_reads_nothing_from_the_operators_home():
     body = text[text.index("def build_server("):text.index("def service_row(")]
     assert "AuthorityReplica(" in body and "AgentAuthority(" not in body and "agent_store_bar(" not in body
     assert text.count("def verify_point_of_use(") == 1 and text.count("self._verify(") == 2
+
+
+# --- fix round 1 (L3 s10b_b1 r1) ---------------------------------------------------------------------------------------
+
+def test_a_replay_during_an_uncommitted_sync_reads_the_committed_head(rig, tmp_path, monkeypatch):
+    """r1 #1 (refuted, pinned): the uncommitted SYNC's verify fills the shared cache first; a concurrent replay of the
+    committed log is a digest prefix of it and is served, never HeadBelowCache."""
+    rows = _with_link(rig)
+    replica = _replica(tmp_path)
+    replica.append(rows[:-1])
+    committed = replica.replay()
+    inside, go_on = threading.Event(), threading.Event()
+    real = auth.snapshot
+
+    def paused(conn, **kw):
+        state = real(conn, **kw)
+        if threading.current_thread().name == "sync":
+            assert state.seq == rows[-1].seq                                  # the shared cache now holds it, uncommitted
+            inside.set()
+            go_on.wait(30)
+        return state
+
+    monkeypatch.setattr(auth, "snapshot", paused)
+    out: list = []
+    t = threading.Thread(target=lambda: out.append(replica.append(rows[-1:])), name="sync")
+    t.start()
+    try:
+        assert inside.wait(30)
+        assert replica.head() == (rows[-2].seq, rows[-2].hash)
+        assert replica.replay() == committed                                  # no HeadBelowCache, the committed head
+        verify = D.replica_verifier(replica, now=rig.now)
+        with pytest.raises(LauncherRefusedT) as exc:                          # judged against the committed head only
+            verify(None, None, D.FrameClaims((rows[-1].seq, rows[-1].hash), (False, 0)))
+        assert exc.value.name == "ledger-behind"
+    finally:
+        go_on.set()
+        t.join(60)
+    monkeypatch.undo()
+    assert out == [(rows[-1].seq, rows[-1].hash)] and replica.replay() == rig.authority.replay()
+
+
+class _NoCommit:
+    """A connection whose COMMIT fails (disk full at the commit)."""
+
+    def __init__(self, conn):
+        self._c = conn
+
+    def execute(self, sql, *a):
+        if sql == "COMMIT":
+            raise sqlite3.OperationalError("disk I/O error")
+        return self._c.execute(sql, *a)
+
+    def __getattr__(self, name):
+        return getattr(self._c, name)
+
+
+def test_a_commit_that_fails_leaves_the_replica_and_its_replay_as_they_were(rig, tmp_path, monkeypatch):
+    rows = _with_link(rig)
+    replica = _replica(tmp_path)
+    replica.append(rows[:-1])
+    committed, before = replica.replay(), (_stored(replica), _anchor_bytes(replica))
+    real = sqlite3.connect
+    monkeypatch.setattr(AR.sqlite3, "connect", lambda *a, **kw: _NoCommit(real(*a, **kw)))
+    with pytest.raises(AR.ReplicaRefused) as exc:
+        replica.append(rows[-1:])
+    monkeypatch.undo()
+    assert exc.value.reason_class == "transient"
+    assert (_stored(replica), _anchor_bytes(replica)) == before
+    assert replica.replay() == committed                                      # the cache is not ahead of the database
+    assert replica.append(rows[-1:]) == (rows[-1].seq, rows[-1].hash)
+    assert replica.replay() == rig.authority.replay()
+
+
+def test_a_loose_replica_root_or_anchor_dir_is_made_private(rig, tmp_path):
+    rows = _with_link(rig)
+    replica = _replica(tmp_path)
+    replica.append(rows[:-1])
+    anchor_dir = auth.anchor_path(replica.root).parent
+    replica.root.chmod(0o777)
+    anchor_dir.chmod(0o777)
+    replica.db_path.chmod(0o666)
+    replica.append(rows[-1:])
+    modes = [p.stat().st_mode & 0o777 for p in (replica.root, anchor_dir, replica.db_path)]
+    assert modes == [0o700, 0o700, 0o600]
+    replica.root.chmod(0o777)
+    assert replica.head() == (rows[-1].seq, rows[-1].hash)                    # the reader repairs it too
+    assert replica.root.stat().st_mode & 0o777 == 0o700
+
+
+@pytest.mark.parametrize("what", ["db", "journal", "lock", "anchor", "anchor_dir", "hardlink"])
+def test_a_symlinked_or_shared_file_in_the_replica_is_refused(rig, tmp_path, what):
+    rows = _with_link(rig)
+    replica = _replica(tmp_path)
+    replica.append(rows[:-1])
+    elsewhere = tmp_path / "elsewhere"
+    elsewhere.mkdir()
+    anchor = auth.anchor_path(replica.root)
+    target = {"db": replica.db_path, "journal": replica.root / "cockpit.db-journal",
+              "lock": replica.root / AR.LOCK_NAME, "anchor": anchor, "anchor_dir": anchor.parent}.get(what)
+    if what == "hardlink":
+        (elsewhere / "copy").hardlink_to(replica.db_path)
+    elif what == "anchor_dir":
+        shutil.move(str(target), str(elsewhere / "anchor"))
+        target.symlink_to(elsewhere / "anchor")
+    else:
+        if target.exists():
+            shutil.copy(target, elsewhere / "f")
+            target.unlink()
+        else:
+            (elsewhere / "f").write_bytes(b"")
+        target.symlink_to(elsewhere / "f")
+    with pytest.raises(AR.ReplicaRefused) as exc:
+        replica.append(rows[-1:])
+    assert exc.value.name == "replica-not-ours"
+    with pytest.raises(Exception):
+        replica.head()
+
+
+def test_a_commit_whose_anchor_advance_fails_answers_the_committed_head_and_a_retry_heals_it(rig, tmp_path, monkeypatch):
+    rows = _with_link(rig)
+    replica = _replica(tmp_path)
+    replica.append(rows[:-1])
+    real = auth.advance_anchor
+
+    def fail(path, snap):
+        raise OSError("disk")
+
+    monkeypatch.setattr(auth, "advance_anchor", fail)
+    assert replica.append(rows[-1:]) == (rows[-1].seq, rows[-1].hash)         # committed: never "unchanged"
+    assert auth.read_anchor(auth.anchor_path(replica.root)).seq == rows[-1].seq - 1
+    monkeypatch.setattr(auth, "advance_anchor", real)
+    with pytest.raises(AR.ReplicaRefused) as exc:                             # the identical retry
+        replica.append(rows[-1:])
+    assert (exc.value.name, exc.value.reason_class) == ("ledger-stale", "transient")
+    assert auth.read_anchor(auth.anchor_path(replica.root)).seq == rows[-1].seq   # ... healed the anchor first
+    assert replica.replay() == rig.authority.replay()
+
+
+def test_a_missing_verifier_is_a_transient_refusal(rig, tmp_path):
+    rows = _source(rig)
+    replica = AR.AuthorityReplica(tmp_path / "nokeygen" / "authority", ssh_keygen=tmp_path / "no-ssh-keygen")
+    with pytest.raises(AR.ReplicaRefused) as exc:
+        replica.append(rows)
+    assert (exc.value.name, exc.value.reason_class) == ("ledger-verifier-unavailable", "transient")
+    assert replica.head() == (0, "")
+
+
+def test_head_reads_a_replica_whose_path_holds_uri_characters(rig, tmp_path):
+    rows = _source(rig)
+    replica = AR.AuthorityReplica(tmp_path / "a?b#c%41" / "authority")
+    assert replica.append(rows) == (rows[-1].seq, rows[-1].hash)
+    assert replica.head() == (rows[-1].seq, rows[-1].hash)
+
+
+def test_release_with_a_holder_that_carries_no_claims_fails_closed(rig, wire):
+    from types import SimpleNamespace
+    with pytest.raises(LauncherRefusedT) as exc:
+        wire.server._release_claims({"ledger_head": wire.head()}, SimpleNamespace(claims=None))
+    assert exc.value.name == "ledger-head-missing"
+
+
+def test_a_replica_that_moves_during_the_check_is_named_ledger_behind(rig, tmp_path, monkeypatch):
+    rows = _with_link(rig)
+    replica = _replica(tmp_path)
+    replica.append(rows[:-1])
+    moved = (rows[-1].seq, rows[-1].hash)
+    monkeypatch.setattr(replica, "head", lambda: moved)                       # head read at N+1, the replay sees N
+    with pytest.raises(LauncherRefusedT) as exc:
+        D.replica_verifier(replica, now=rig.now)(None, None, D.FrameClaims(moved, (False, 0)))
+    assert (exc.value.name, exc.value.reason_class) == ("ledger-behind", "transient")
+
+
+LauncherRefusedT = L.LauncherRefused

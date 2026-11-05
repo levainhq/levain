@@ -120,6 +120,8 @@ def verify_point_of_use(proof: C.LinkProof, exposure: Optional[ActionExposure], 
     verify_sig = verify_sig or _default_verify_sig()
     try:
         state = replay()
+    except LauncherRefused:
+        raise                 # the replay's own named refusal (``ledger-behind``) keeps its name
     except Exception as exc:  # noqa: BLE001 - a ledger that does not replay authorises nothing
         raise LauncherRefused("authority-unreadable", f"the authority ledger does not replay ({type(exc).__name__})",
                               reason_class="transient") from None
@@ -490,8 +492,9 @@ class RunServer:
             return None
         self._fields(req, "ledger_head")
         head = self._claims(req, bar=False)
-        assert head is not None
-        return FrameClaims(head.ledger_head, holder.claims.bar if holder.claims is not None else (False, 0))
+        if head is None or holder.claims is None:      # never a default bar: no LAUNCH claims, no RELEASE (r1)
+            raise LauncherRefused("ledger-head-missing", "the session holds no LAUNCH ledger claims")
+        return FrameClaims(head.ledger_head, holder.claims.bar)
 
     def _sync(self, rid: int, rows: object) -> dict:
         """``SYNC``: append the rows that continue the replica's head (none: just read it); answer the new head."""

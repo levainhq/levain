@@ -18,10 +18,21 @@ The replica is a CACHE of what the operator signed, never a second source of aut
 
 One writer (the run server's SYNC) and one reader (the same process's replay), one uid. Appends are serialised by a
 process lock and an ``flock`` on ``<root>/.append.lock``.
+
+The root and its anchor directory are made private (0700) and every file the replica keeps there (the database, SQLite's
+side files, the locks, the anchor) must be this uid's own regular, single-link file, never a symlink, before anything
+is read or written (L3 r1, codex): once the directories are private, nothing but this uid can replace what was checked.
+
+The verify inside :meth:`append` shares the replica's ``ReplayCache`` with :meth:`replay`. A chain that verified inside a
+transaction that then rolled back stays cached, and that is safe: the cache serves a reader only the states of the rows
+that reader's own snapshot holds (a digest-matching prefix), so a reader never sees an uncommitted row (L3 r1 #1, refuted
+and pinned by ``test_a_replay_during_an_uncommitted_sync_reads_the_committed_head`` and the commit-failure test).
 """
 from __future__ import annotations
 
+import errno
 import fcntl
+import logging
 import os
 import sqlite3
 import stat
@@ -30,6 +41,7 @@ from collections.abc import Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Optional, Tuple
+from urllib.parse import quote
 
 from levain import authority as _auth
 from levain.agent_authority import AgentAuthority
@@ -40,12 +52,18 @@ SYNC_MAX_ROWS = 1024
 #: how long an append waits for the replica's own readers before it answers transient ``ledger-busy``
 APPEND_BUSY_TIMEOUT_S = 5.0
 LOCK_NAME = ".append.lock"
+#: what the replica keeps in its root, and in ``<root>/anchor``
+_ROOT_FILES = (DB_NAME, DB_NAME + "-journal", DB_NAME + "-wal", DB_NAME + "-shm", LOCK_NAME)
+_ANCHOR_FILES = (_auth.ANCHOR_NAME, _auth.ANCHOR_NAME + ".lock")
+
+_log = logging.getLogger("levain.agents.authority_replica")
 
 __all__ = ["APPEND_BUSY_TIMEOUT_S", "AuthorityReplica", "ReplicaRefused", "ReplicaRow", "SYNC_MAX_ROWS"]
 
 
 class ReplicaRefused(Exception):
-    """A SYNC the replica refuses; the replica is unchanged. ``reason_class`` is ``standing`` or ``transient``."""
+    """A SYNC the replica refuses; its log is unchanged (a ``ledger-stale`` resend may first advance an anchor that lags
+    the held head, never past it). ``reason_class`` is ``standing`` or ``transient``."""
 
     def __init__(self, name: str, detail: str = "", reason_class: str = "standing") -> None:
         super().__init__(f"{name}: {detail}" if detail else name)
@@ -91,14 +109,16 @@ class AuthorityReplica:
 
     def replay(self) -> _auth.AuthoritySnapshot:
         """The replica's verified, anchored replay. Raises on any failure (an empty or absent replica included)."""
+        self._private(create=False)
         return self._authority.replay()
 
     def head(self) -> Head:
         """``(seq, hash)`` of the replica's last stored row, ``(0, "")`` when it holds none. A replica that exists but
         cannot be read raises (it is never read as empty)."""
-        if not self.db_path.exists():
+        if not self._private(create=False) or not self.db_path.exists():
             return (0, "")
-        conn = sqlite3.connect(f"file:{self.db_path}?mode=ro", uri=True, isolation_level=None, timeout=2.0)
+        conn = sqlite3.connect(f"file:{quote(str(self.db_path))}?mode=ro", uri=True, isolation_level=None,
+                               timeout=2.0)
         try:
             got = _auth.log_head(conn)
         finally:
@@ -119,22 +139,76 @@ class AuthorityReplica:
                     type(v) is str for v in (r.prev_hash, r.record, r.signer_fp, r.signature, r.hash)):
                 raise ReplicaRefused("bad-row", "a row is not the six authority_log columns")
         with self._mu:
-            self._make_root()
-            lock_fd = os.open(self._root / LOCK_NAME, os.O_RDWR | os.O_CREAT | os.O_CLOEXEC, 0o600)
+            self._private(create=True)
+            try:
+                lock_fd = os.open(self._root / LOCK_NAME, os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW | os.O_CLOEXEC, 0o600)
+            except OSError as exc:
+                raise ReplicaRefused("replica-unwritable", type(exc).__name__, "transient") from None
             try:
                 fcntl.flock(lock_fd, fcntl.LOCK_EX)
                 return self._append_locked(rows)
             finally:
                 os.close(lock_fd)
 
-    def _make_root(self) -> None:
+    def _private(self, *, create: bool) -> bool:
+        """Make the root (and its anchor directory) this uid's private directories and check every file the replica
+        keeps there; False when the root does not exist and ``create`` is off. Refuses ``replica-not-ours``."""
+        if create:
+            try:
+                self._root.mkdir(mode=0o700, parents=True, exist_ok=True)
+            except OSError as exc:
+                raise ReplicaRefused("replica-unwritable", type(exc).__name__, "transient") from None
+        root = self._open(None, str(self._root), directory=True)
+        if root is None:
+            if create:
+                raise ReplicaRefused("replica-unwritable", "the root vanished", "transient")
+            return False
         try:
-            self._root.mkdir(mode=0o700, parents=True, exist_ok=True)
-            st = os.lstat(self._root)
+            for name in _ROOT_FILES:
+                self._close(self._open(root, name, directory=False))
+            anchor = self._open(root, _auth.ANCHOR_DIR, directory=True)
+            if anchor is not None:
+                try:
+                    for name in _ANCHOR_FILES:
+                        self._close(self._open(anchor, name, directory=False))
+                finally:
+                    os.close(anchor)
+        finally:
+            os.close(root)
+        return True
+
+    @staticmethod
+    def _close(fd: Optional[int]) -> None:
+        if fd is not None:
+            os.close(fd)
+
+    def _open(self, parent: Optional[int], name: str, *, directory: bool) -> Optional[int]:
+        """An fd on ``name`` (relative to ``parent``), never through a symlink, checked to be this uid's own directory
+        (made 0700) or regular single-link file (made 0600 at most); None when it does not exist."""
+        flags = os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC | (os.O_DIRECTORY if directory else os.O_NONBLOCK)
+        try:
+            fd = os.open(name, flags, dir_fd=parent)
+        except FileNotFoundError:
+            return None
         except OSError as exc:
-            raise ReplicaRefused("replica-unwritable", f"{type(exc).__name__}", "transient") from None
-        if stat.S_ISLNK(st.st_mode) or not stat.S_ISDIR(st.st_mode) or st.st_uid != os.geteuid():
-            raise ReplicaRefused("replica-not-ours", str(self._root))
+            if exc.errno in (errno.ELOOP, errno.ENOTDIR, errno.EMLINK):
+                raise ReplicaRefused("replica-not-ours", f"{name} is a symlink or not a {'directory' if directory else 'file'}") from None
+            raise ReplicaRefused("replica-unreadable", type(exc).__name__, "transient") from None
+        try:
+            st = os.fstat(fd)
+            kind_ok = stat.S_ISDIR(st.st_mode) if directory else (stat.S_ISREG(st.st_mode) and st.st_nlink == 1)
+            if not kind_ok or st.st_uid != os.geteuid():
+                raise ReplicaRefused("replica-not-ours", f"{name} is not this uid's own private "
+                                                         f"{'directory' if directory else 'file'}")
+            if st.st_mode & 0o077:
+                os.fchmod(fd, 0o700 if directory else 0o600)
+        except ReplicaRefused:
+            os.close(fd)
+            raise
+        except OSError as exc:
+            os.close(fd)
+            raise ReplicaRefused("replica-unwritable", type(exc).__name__, "transient") from None
+        return fd
 
     def _append_locked(self, rows: "list[ReplicaRow]") -> Head:
         path = _auth.anchor_path(self._root)
@@ -159,11 +233,19 @@ class AuthorityReplica:
         except sqlite3.Error as exc:
             raise ReplicaRefused("replica-unreadable", type(exc).__name__, "transient") from None
         done = False
+        stale: Optional[ReplicaRefused] = None
         try:
             try:
                 got = _auth.log_head(conn)
                 head: Head = (0, "") if got is None else (int(got[0]), str(got[1]))
-                self._continues(conn, head, rows)
+                try:
+                    self._continues(conn, head, rows)
+                except ReplicaRefused as exc:
+                    if exc.name != "ledger-stale":
+                        raise
+                    # a resend of rows the replica holds (a retry after a commit whose anchor advance failed): verify
+                    # the held log and advance the anchor as an empty SYNC does, then answer stale (codex r1 #4)
+                    stale, rows = exc, []
                 for r in rows:
                     conn.execute("INSERT INTO authority_log (seq, prev_hash, record, signer_fp, signature, hash) "
                                  "VALUES (?, ?, ?, ?, ?, ?)", (r.seq, r.prev_hash, r.record, r.signer_fp, r.signature,
@@ -188,10 +270,12 @@ class AuthorityReplica:
             raise ReplicaRefused("replica-unreadable", type(exc).__name__, "transient") from None
         try:
             _auth.advance_anchor(path, state)
-        except _auth.AuthorityError as exc:
-            raise ReplicaRefused("ledger-fork", f"the anchor refuses the replica ({type(exc).__name__})") from None
-        except OSError as exc:
-            raise ReplicaRefused("ledger-anchor-unwritten", type(exc).__name__, "transient") from None
+        except (_auth.AuthorityError, OSError) as exc:
+            # the rows are committed, so this is never "unchanged": the head is answered, the anchor lags (it never
+            # leads), and the next SYNC, a resend of these rows included, advances it (codex r1 #4)
+            _log.warning("replica committed at seq %d; the anchor is behind (%s)", state.seq, type(exc).__name__)
+        if stale is not None:
+            raise stale
         return (state.seq, state.head_hash)
 
     @staticmethod
@@ -225,6 +309,8 @@ class AuthorityReplica:
         kw: dict[str, Any] = {} if self._ssh_keygen is None else {"ssh_keygen": self._ssh_keygen}
         try:
             state = _auth.snapshot(conn, cache=self._cache, **kw)
+        except _auth.VerifierUnavailable as exc:      # an AuthorityError, but never a verdict on the log (codex r1 #5)
+            raise ReplicaRefused("ledger-verifier-unavailable", f"{exc}"[:300], "transient") from None
         except _auth.HeadBelowCache as exc:
             raise ReplicaRefused("ledger-fork", f"{exc}"[:300]) from None
         except _auth.AuthorityError as exc:
