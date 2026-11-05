@@ -471,7 +471,9 @@ def test_an_end_during_the_spawn_then_a_refused_release_aborts_and_ends_with_the
     with pytest.raises(RuntimeError, match="session-ended"):
         got["child"].release()
     for _ in range(250):                              # no EOF: the holder's socket is still open
-        if env.launcher.index.get(key)["state"] == "ended":
+        # the END job writes the index record BEFORE it sets done and drops the holder from _live (_run_end), so the
+        # settled state is both: waiting on the record alone reads _live in the gap between the two
+        if env.launcher.index.get(key)["state"] == "ended" and key not in env.server._live:
             break
         time.sleep(0.02)
     inner = env.runtime.children[0]
