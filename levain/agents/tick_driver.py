@@ -69,9 +69,9 @@ TICK_PRE_RENEW_BOUND_S = 60
 #: the worst gap between two renewals of one non-withheld row (the invariant the lease needs to exceed).
 WORST_RENEW_GAP_S = TICK_INTERVAL_S + TICK_HARD_BOUND_S + TICK_PRE_RENEW_BOUND_S
 #: exit codes: 0 a pass ran; 1 refused (store, install: with an install refusal the renewals of rows it could stop
-#: still ran, the claims did not); 2 the reaper raised; 3 the graceful bound fired; 4 a launched session row was renewed
-#: with no session launcher to END it (an install that names none, or whose launcher cannot be built); 70 the
-#: watchdog took the process.
+#: still ran, the claims did not); 2 the reaper raised; 3 the graceful bound fired; 4 a launched session row had no
+#: session launcher to END it, so it was not renewed and its lease lapses to takeover (an install that names none, or
+#: whose launcher cannot be built); 70 the watchdog took the process.
 EXIT_OK, EXIT_REFUSED, EXIT_REAPER_ERROR, EXIT_SOFT_TIMEOUT, EXIT_NO_LAUNCHER, EXIT_HARD_TIMEOUT = 0, 1, 2, 3, 4, 70
 
 __all__ = ["TICK_INTERVAL_S", "TICK_HARD_BOUND_S", "TICK_SOFT_BOUND_S", "TICK_PRE_RENEW_BOUND_S", "WORST_RENEW_GAP_S",
@@ -115,7 +115,7 @@ def executor_of_factory(store: AgentStore, *, launcher_of: Callable[[], Any],
 
     A session row met with no usable launcher (the builder raised, gave None, or gave the unwired default) is recorded
     on the returned callable's ``no_launcher`` list (``(occurrence_id, why)``): :func:`run_tick` names those rows and
-    exits :data:`EXIT_NO_LAUNCHER`, so a tick that can renew a session but never END it is never a clean exit.
+    exits :data:`EXIT_NO_LAUNCHER`, so a tick that met a session row it could not END is never a clean exit.
     """
     from levain.agents.session import RowSessionExecutor, UnwiredLauncher
 
