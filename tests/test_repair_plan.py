@@ -119,7 +119,7 @@ def test_repair_plans_from_pre_change_host(tmp_path: Path) -> None:
 
     stops = _all(whys, lambda w: w.startswith("stop com.levain."))
     assert {whys[i] for i in stops} == {f"stop com.levain.{n}" for n in
-                                        ("control", "keys", "qbroker", "dispatch", "reaper", "pf")}
+                                        ("control", "keys", "qbroker", "dispatch", "dispatch_run", "reaper", "pf")}
     assert [whys[i] for i in stops][0] == "stop com.levain.pf"       # reverse start order
     creates_group = _all(whys, lambda w: w.startswith("create the group"))
     assert [whys[i] for i in creates_group] == ["create the group levain-keysadmin (shared)"]
@@ -145,7 +145,7 @@ def test_repair_plans_from_pre_change_host(tmp_path: Path) -> None:
     assert max(creates_group) < min(pairs)
     assert renames[0] < flips[0] < min(entries)                     # staged, then ONE flip before any entry write
     assert max(sudoers) < min(starts)                                # sudoers before any start
-    assert len(starts) == 6
+    assert len(starts) == 7
     assert max(starts) < shape < gone == len(whys) - 1               # install-shape, then the journal goes, last
     assert plan.generation_change is True                            # no record: a generation change
 

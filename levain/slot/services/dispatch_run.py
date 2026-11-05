@@ -78,6 +78,7 @@ from levain.slot.layout import RUN, STORE
 NAME = "dispatch_run"
 ACCOUNT = "_levain_dispatch"
 EX_USAGE = 64
+EX_TEMPFAIL = 75
 EX_CONFIG = 78
 EX_WRONG_USER = 77
 #: [judged] a holder connection that sends nothing for this long is read as gone (EOF): the session is ENDed.
@@ -766,7 +767,12 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         op_uid = a.operator_uid if a.operator_uid is not None else _operator_uid(Path(a.operator_record or operator_record_path(host)))
         server = build_server(host, Path(a.store_dir), Path(a.control), op_uid)
         listener = _bind(Path(a.socket))
-    except (Refused, SystemExit, KeyError, OSError, ValueError) as exc:
+    except Refused as exc:
+        # Setup starts this unit before it writes the operator record, its LAST act (§23): on a fresh host the first
+        # start finds none. EX_TEMPFAIL is restarted (Restart=always / KeepAlive); EX_CONFIG would leave it down.
+        print(f"levain dispatch-run: refused: Refused: {exc}", file=sys.stderr, flush=True)
+        return EX_TEMPFAIL if exc.name == "no-operator" else EX_CONFIG
+    except (SystemExit, KeyError, OSError, ValueError) as exc:
         print(f"levain dispatch-run: refused: {type(exc).__name__}: {exc}", file=sys.stderr, flush=True)
         return EX_CONFIG
     stop = threading.Event()
@@ -807,10 +813,9 @@ def build_server(host: str, store: Path, control_sock: Path, operator_uid: int) 
 
 def service_row():
     """The unit row this program runs under: ``Service("dispatch_run", ...)`` as ``_levain_dispatch``, always restarted,
-    after CONTROL and gw-keys. NOT yet in ``levain.slot.units.SERVICES``: adding it changes CONTRACT section 1.3 (the
-    service table), section 2.2 (a run dir for ``run.sock``, root-made, ``_levain_dispatch``-owned, others traverse)
-    and the pinned tables in four test files, which is the head's call (RETURN, open questions). A golden for the plist
-    this row renders is in ``tests/test_slot_dispatch_run_server.py``."""
+    after CONTROL and gw-keys: the same row as ``levain.slot.units.by_name("dispatch_run")`` (registered in S10b slice
+    R, with its run dir ``R/dispatch``). A golden for the plist this row renders is in
+    ``tests/test_slot_dispatch_run_server.py``."""
     from levain.slot.units import Service
     return Service(NAME, "dispatch run server", ACCOUNT, ("control", "keys"), "always")
 

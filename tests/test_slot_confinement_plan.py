@@ -189,6 +189,8 @@ TABLE_1_3 = {
     "qbroker": ("_levain_qbroker", ("control",), "always", "com.levain.qbroker", "levain-qbroker.service"),
     "dispatch": ("_levain_dispatch", ("control", "keys"), "on-failure", "com.levain.dispatch",
                  "levain-dispatch.service"),
+    "dispatch_run": ("_levain_dispatch", ("control", "keys"), "always", "com.levain.dispatch_run",
+                     "levain-dispatch_run.service"),
     "reaper": ("root", ("control",), "always", "com.levain.reaper", "levain-reaper.service"),
     "pf": ("root", (), "one-shot", "com.levain.pf", None),
 }
@@ -345,7 +347,7 @@ def test_service_exits_without_run_dir(host):
     assert not check({**good, f"{R}/control": _st(0o750, 3799, 20)})[0]            # wrong group
     # the run dir each non-root service checks is its §2.2 row
     assert {n: service_boot.run_dir_row(host, n).path.name for n in service_boot.RUN_DIR_OF} == {
-        "control": "control", "keys": "keys", "qbroker": "qb", "dispatch": "planner"}
+        "control": "control", "keys": "keys", "qbroker": "qb", "dispatch": "planner", "dispatch_run": "dispatch"}
     assert set(service_boot.RUN_DIR_OF) == {s.name for s in units.SERVICES if s.user != "root"}
     # main exits non-zero (and never runs the program) when the check fails; root services skip it
     ran = []

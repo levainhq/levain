@@ -220,6 +220,10 @@ def base_run_rows(host: HostOS, operator: str | None) -> list[Row]:
         # its creator's primary group (_levain_control) otherwise, which no peer reaching it through levain-control
         # (the operator, keys, qbroker, dispatch) is in. macOS gives a new entry its directory's group either way.
         Row(R / "control", "_levain_control", "levain-control", 0o2750),
+        # The dispatch run server's socket dir (S10b slice R): not world-traversable like R/keys. The operator is in
+        # levain-control (as for R/control/), no slot uid is, so a slot uid cannot even connect. Setgid on Linux so
+        # run.sock takes the group (a BSD dir hands its group down without it).
+        Row(R / "dispatch", "_levain_dispatch", "levain-control", 0o2750 if host == "linux" else 0o750),
         Row(R / "reaper", "root", "levain-wake", 0o750),
         *fence,
     ]

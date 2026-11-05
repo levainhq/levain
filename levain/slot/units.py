@@ -59,6 +59,7 @@ SERVICES: tuple[Service, ...] = (
     Service("keys", "gw-keys", "_levain_keys", ("control",), "always"),
     Service("qbroker", "QUEUE BROKER", "_levain_qbroker", ("control",), "always"),
     Service("dispatch", "dispatch", "_levain_dispatch", ("control", "keys"), "on-failure"),
+    Service("dispatch_run", "dispatch run server", "_levain_dispatch", ("control", "keys"), "always"),
     Service("reaper", "reaper", "root", ("control",), "always"),
     Service("pf", "pf anchor", "root", (), "one-shot", hosts=("darwin",), logs=True),
 )
