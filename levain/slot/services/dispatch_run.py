@@ -13,9 +13,10 @@ uid's client (:mod:`levain.agents.session_client`, wire ``levain-run/1``) on a u
   (bounded, in order, base64) of the canonical snapshot manifest and the git bundle. After the authority check and
   before the pool check or any mint, the LAUNCH verifies the upload (hash identity: the server re-derives the commit and
   the object count from the manifest, ingests the bundle in a scratch clone, binds the repo-layer loosening check) and
-  refuses ``session_refused:workspace`` on any mismatch, with nothing staged and a zero-usage ``refused`` record; the
-  slot runtime later writes the verified bytes to ``staging/repo.bundle``. The connection ending drops an upload no
-  LAUNCH took.
+  refuses ``session_refused:workspace`` on any mismatch, with nothing staged (and a zero-usage ``refused`` record only
+  for a standing refusal of this connection's own upload for the key); the slot runtime later writes the verified bytes
+  to ``staging/repo.bundle``. One upload per connection (a WSBEGIN replaces the earlier one); the LAUNCH, whatever its
+  outcome, and the connection ending drop whatever the stager did not take.
 * **RELEASE re-runs** :func:`verify_point_of_use` with the LAUNCH's proof and exposure: a link that expired, was revoked
   or barred while the slot was prepared releases nothing, and the child is ABORTed and ENDed.
 * **The holder is the lifeline** (design 3.4): EOF before RELEASE is ABORT (nothing ran) then END, EOF after RELEASE is
@@ -477,16 +478,19 @@ class RunServer:
         if op == "LAUNCH":
             if mine is not None:
                 raise C.WireError("one launch per connection")
-            claims = self._claims(req, bar=True)
-            launch, proof = C.launch_from_wire({k: v for k, v in req.items() if k not in ("ledger_head", "bar")})
-            self._verify(proof, launch.exposure, claims)
-            launch = self._workspace_of(launch, owner)
-            self._pool()
             try:
+                claims = self._claims(req, bar=True)
+                launch, proof = C.launch_from_wire({k: v for k, v in req.items() if k not in ("ledger_head", "bar")})
+                self._verify(proof, launch.exposure, claims)
+                launch = self._workspace_of(launch, owner)
+                self._pool()
                 holder = self._spawn(launch, proof, claims)
             finally:
-                if self._uploads is not None:     # the stager consumed it at start; a refused or failed spawn did not
-                    self._uploads.drop(launch.session_key)
+                # every LAUNCH ends this connection's upload BEFORE its answer is sent: a held-for-spawn upload was
+                # consumed by the stager inside the spawn; any other outcome (a transient refusal included) must not
+                # pin it or turn a retry's WSBEGIN into upload-exists (L3 w1srv r1, gemini HIGH 2, codex MED 1)
+                if self._uploads is not None and owner is not None:
+                    self._uploads.drop_owner(owner)
             try:
                 return C.ok_answer(rid, session=holder.child.session), holder
             except BaseException:
@@ -563,8 +567,11 @@ class RunServer:
     def _workspace_of(self, launch: Any, owner: Optional[WS.UploadOwner]) -> Any:
         """The LAUNCH's workspace judgment, after the authority check and before the pool check or any mint: the launch
         itself when it names none and no upload exists; the launch with its member's ``manifest_digest`` filled by the
-        server's own derivation when the upload verifies; else ``session_refused:workspace``, recorded as the zero-usage
-        ``refused`` tombstone (:meth:`RealLauncher.refuse_key`) so the fire's usage read settles at nothing."""
+        server's own derivation when the upload verifies; else ``session_refused:workspace``. Only a standing refusal of
+        the upload THIS connection holds for the key (``exc.tombstone``) is recorded as the zero-usage ``refused``
+        tombstone (:meth:`RealLauncher.refuse_key`), so the fire's usage read settles at nothing; a refusal for no
+        upload here, a foreign one, or a transient host failure writes nothing, as a pool refusal writes nothing, so
+        it never poisons another connection's upload or a retry (L3 w1srv r1, gemini HIGH 1, codex MED 2 and 4)."""
         try:
             if self._uploads is None:
                 if launch.workspace is None:
@@ -575,7 +582,7 @@ class RunServer:
         except WS.WorkspaceRefused as exc:
             _log.warning("workspace refused for %s: %s", launch.session_key, exc.cause)
             refuse = getattr(self.launcher, "refuse_key", None)
-            if refuse is not None:
+            if exc.tombstone and refuse is not None:
                 refuse(launch.session_key, WS.WORKSPACE_REFUSAL, occurrence_id=launch.occurrence_id)
             raise
         return launch if ws is None else dataclasses.replace(launch, workspace=ws)

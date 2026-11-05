@@ -13,7 +13,13 @@ the zero-usage ``refused`` tombstone: a tampered bundle (in transit; a damaged p
 header; a changed object count), an over-cap bundle and an overrunning chunk, a symlink at ``repo.bundle``, a manifest
 that does not match the bundle (another snapshot's, not canonical, not what WSBEGIN declared), a head or withhold the
 member does not share with the manifest, a snapshot whose ``.claude/settings.json`` loosens the sandbox, one carrying
-``.mcp.json``, an upload with no member, a member with no upload.
+``.mcp.json``, an upload with no member. A member with no upload on its connection is refused and writes NO tombstone
+(the key may be another connection's in-flight upload), nor does a transient host failure (L3 w1srv r1).
+
+The L3 r1 fix round (two real connections where a race needs two): one upload per connection, replaced on re-begin and
+dropped by every LAUNCH outcome, so a transient refusal is retryable on the same connection; a foreign LAUNCH neither
+drops nor poisons another connection's upload; the key stays reserved while the stager writes; a host failure in the
+scratch is transient and leaves the key launchable; the verify unlinks only the input file it created.
 
 What no test here holds (UNVERIFIED until the VM rows): the unit as ``_levain_dispatch`` with real peer credentials, a
 real ``staging/<session>`` made by root's ``prepare``, the root-side ``stage_bundle`` reading the file, a repo of
@@ -145,6 +151,19 @@ class World:
         client = HandUploaded(lambda: sock, lambda occ: C.link_proof(r.store, r.world.root, occ, now=r.now()))
         return client.spawn(S.SessionLaunch(self.oid, key, "claude", "sonnet", "b", "passthrough", EXP, ws))
 
+    def raw_launch(self, sock, key, ws):
+        """A LAUNCH frame sent by hand, so a refusal leaves the connection open for a same-connection retry (the client
+        closes it)."""
+        r = self.rig
+        proof = C.link_proof(r.store, r.world.root, self.oid, now=r.now())
+        return self.send(sock, "LAUNCH", **C.launch_to_wire(
+            S.SessionLaunch(self.oid, key, "claude", "sonnet", "b", "passthrough", EXP, ws), proof))
+
+    def chunks(self, sock, key, parts: Parts):
+        return [self.send(sock, "WSDATA", **f) for part, data in (("manifest", parts.manifest_bytes),
+                                                                  ("bundle", parts.bundle))
+                for f in C.ws_chunk_frames(key, part, data)]
+
     def refused(self, key, parts: Parts, ws=None, **upload_kw) -> L.LauncherRefused:
         sock, answers = self.upload(key, parts, **upload_kw)
         assert all(a["ok"] for a in answers), answers
@@ -153,10 +172,13 @@ class World:
         self.assert_nothing_staged(key)
         return exc.value
 
-    def assert_nothing_staged(self, key):
+    def assert_nothing_staged(self, key, *, tombstone=True):
         assert not self.staged.exists() and not self.staged.is_symlink()
         assert self.uploads._ups == {} and self.runtime.starts == [] and self.env.control.minted == {}
         rec = self.env.launcher.index.get(key)
+        if not tombstone:
+            assert rec is None, rec
+            return
         assert rec is not None and rec["state"] == "refused" and rec["reason"] == REFUSED
         assert self.env.launcher.usage(key).actions == 0      # a refusal before the mint spends nothing
 
@@ -284,12 +306,27 @@ def test_a_chunk_out_of_order_ends_the_upload(w, tmp_path):
 def test_uploads_are_capped_and_a_full_table_is_transient(tmp_path):
     w = World(tmp_path, max_uploads=1)
     parts = make_parts(tmp_path)
-    sock = w.env.connect()
-    assert w.send(sock, "WSBEGIN", **C.ws_begin_to_wire("s-00000000000000a1", parts.manifest_bytes, parts.bundle))["ok"]
-    ans = w.send(sock, "WSBEGIN", **C.ws_begin_to_wire("s-00000000000000a2", parts.manifest_bytes, parts.bundle))
+    a, b = w.env.connect(), w.env.connect()
+    assert w.send(a, "WSBEGIN", **C.ws_begin_to_wire("s-00000000000000a1", parts.manifest_bytes, parts.bundle))["ok"]
+    ans = w.send(b, "WSBEGIN", **C.ws_begin_to_wire("s-00000000000000a2", parts.manifest_bytes, parts.bundle))
     assert (ans["refused"], ans.get("reason_class")) == ("no-workspace-capacity", "transient")
-    same = w.send(sock, "WSBEGIN", **C.ws_begin_to_wire("s-00000000000000a1", parts.manifest_bytes, parts.bundle))
-    assert same["refused"] == REFUSED and same["detail"].startswith("upload-exists")
+    same = w.send(b, "WSBEGIN", **C.ws_begin_to_wire("s-00000000000000a1", parts.manifest_bytes, parts.bundle))
+    assert same["refused"] == REFUSED and same["detail"].startswith("upload-exists")    # another connection's key
+    assert list(w.uploads._ups) == ["s-00000000000000a1"] and w.uploads._ups["s-00000000000000a1"].owner.keys \
+        == {"s-00000000000000a1"}
+
+
+def test_one_upload_per_connection_a_rebegin_replaces_it(tmp_path):
+    w = World(tmp_path, max_uploads=1)                 # the replace frees its own slot: a cap of one still re-begins
+    parts = make_parts(tmp_path)
+    sock = w.env.connect()
+    k1, k2 = "s-00000000000000a3", "s-00000000000000a4"
+    assert w.send(sock, "WSBEGIN", **C.ws_begin_to_wire(k1, parts.manifest_bytes, parts.bundle))["ok"]
+    assert w.send(sock, "WSBEGIN", **C.ws_begin_to_wire(k1, parts.manifest_bytes, parts.bundle))["ok"]   # same key
+    assert w.send(sock, "WSBEGIN", **C.ws_begin_to_wire(k2, parts.manifest_bytes, parts.bundle))["ok"]   # another
+    assert list(w.uploads._ups) == [k2] and w.uploads._ups[k2].owner.keys == {k2}
+    assert all(a["ok"] for a in w.chunks(sock, k2, parts))
+    assert w.launch(sock, k2, parts.workspace()).session == "sess-1" and w.staged.read_bytes() == parts.bundle
 
 
 def test_a_connection_that_ends_drops_the_upload_nobody_launched(w, tmp_path):
@@ -421,7 +458,7 @@ def test_a_member_with_no_upload_and_an_upload_with_no_member_are_each_refused(w
     with pytest.raises(L.LauncherRefused) as exc:
         w.launch(sock, key, parts.workspace())
     assert cause(exc.value) == "no-upload"
-    w.assert_nothing_staged(key)
+    w.assert_nothing_staged(key, tombstone=False)       # no upload here: the key may be another connection's
     key2 = w.key()
     sock, _ = w.upload(key2, parts)
     with pytest.raises(L.LauncherRefused) as exc:
@@ -437,7 +474,130 @@ def test_an_upload_begun_on_another_connection_is_not_this_launchs(w, tmp_path):
     with pytest.raises(L.LauncherRefused) as exc:
         w.launch(w.env.connect(), key, parts.workspace())
     assert cause(exc.value) == "no-upload" and key in w.uploads._ups      # A's upload is not B's to take, nor to drop
-    holder.close()
+    assert w.env.launcher.index.get(key) is None                          # nor to poison (gemini HIGH 1, codex MED 2)
+    child = w.launch(holder, key, parts.workspace())                       # A's own LAUNCH still stages
+    assert child.session == "sess-1" and w.staged.read_bytes() == parts.bundle
+    assert w.env.launcher.index.get(key)["state"] == "started"
+    child._conn.close()
+    w.env.drain()
+
+
+def test_a_launch_naming_no_workspace_never_drops_another_connections_upload(w, tmp_path):
+    parts, key = make_parts(tmp_path), w.key()
+    _a, _ = w.upload(key, parts)
+    assert w.uploads.verify(key, WS.UploadOwner(), None) is None      # B holds nothing: nothing to refuse, nothing to drop
+    assert key in w.uploads._ups
+
+
+# --- the L3 r1 fix round: one upload per connection, every LAUNCH ends it ----------------------------------------------------
+
+def test_a_transient_refusal_leaves_no_upload_and_the_same_connection_retries(w, tmp_path):
+    parts, key = make_parts(tmp_path), w.key()
+    sock, answers = w.upload(key, parts)
+    assert all(a["ok"] for a in answers)
+    w.env.pool = False                                                    # the pool check refuses, transient
+    ans = w.raw_launch(sock, key, parts.workspace())
+    assert (ans["refused"], ans["reason_class"]) == ("no-free-slot", "transient")
+    assert w.uploads._ups == {} and w.env.launcher.index.get(key) is None   # nothing pinned, nothing tombstoned
+    w.env.pool = True
+    assert w.send(sock, "WSBEGIN", **C.ws_begin_to_wire(key, parts.manifest_bytes, parts.bundle))["ok"]
+    assert all(a["ok"] for a in w.chunks(sock, key, parts))
+    ok = w.raw_launch(sock, key, parts.workspace())
+    assert ok["ok"] and ok["session"] == "sess-1" and w.staged.read_bytes() == parts.bundle
+    sock.close()
+    w.env.drain()
+
+
+def test_a_launch_of_another_key_ends_this_connections_upload(w, tmp_path):
+    parts, k1, k2, k3 = make_parts(tmp_path), w.key(), w.key(), w.key()
+    sock, _ = w.upload(k1, parts)
+    ans = w.raw_launch(sock, k2, None)                                     # bytes for k1, a launch of k2 with none
+    assert ans["refused"] == REFUSED and ans["detail"].startswith("upload-without-workspace")
+    assert w.uploads._ups == {} and w.env.launcher.index.get(k2) is None and w.env.launcher.index.get(k1) is None
+    sock2, _ = w.upload(k1, parts)
+    ans = w.raw_launch(sock2, k3, parts.workspace())                       # bytes for k1, a launch of k3 naming one
+    assert ans["refused"] == REFUSED and ans["detail"].startswith("no-upload") and w.uploads._ups == {}
+    assert w.runtime.starts == []
+
+
+def test_the_key_stays_reserved_and_counted_while_the_stager_writes(tmp_path, monkeypatch):
+    w = World(tmp_path, max_uploads=1)
+    parts, key, other = make_parts(tmp_path), w.key(), w.key()
+    foreign, seen = w.env.connect(), []
+    real = RS.full_fsync
+
+    def during_stage(fd):
+        real(fd)
+        if not seen:                                                       # mid-write, from a second real connection
+            seen.append(w.send(foreign, "WSBEGIN", **C.ws_begin_to_wire(key, parts.manifest_bytes, parts.bundle)))
+            seen.append(w.send(foreign, "WSBEGIN", **C.ws_begin_to_wire(other, parts.manifest_bytes, parts.bundle)))
+    w.runtime.before = lambda d: monkeypatch.setattr(RS, "full_fsync", during_stage)
+    sock, _ = w.upload(key, parts)
+    child = w.launch(sock, key, parts.workspace())
+    assert child.session == "sess-1" and w.staged.read_bytes() == parts.bundle
+    assert seen[0]["refused"] == REFUSED and seen[0]["detail"].startswith("upload-exists")
+    assert (seen[1]["refused"], seen[1]["reason_class"]) == ("no-workspace-capacity", "transient")
+    assert w.uploads._ups == {}
+    child._conn.close()
+    w.env.drain()
+
+
+def test_a_full_scratch_is_transient_and_the_key_stays_launchable(w, tmp_path, monkeypatch):
+    parts, key = make_parts(tmp_path), w.key()
+
+    def enospc(fd, data):
+        raise OSError(28, "No space left on device")
+    monkeypatch.setattr(WS, "write_all", enospc)
+    sock, _ = w.upload(key, parts)
+    with pytest.raises(L.LauncherRefused) as exc:
+        w.launch(sock, key, parts.workspace())
+    assert (exc.value.name, exc.value.reason_class) == (REFUSED, "transient")
+    assert exc.value.detail.startswith("scratch-unavailable")
+    w.assert_nothing_staged(key, tombstone=False)
+    monkeypatch.undo()
+    sock, _ = w.upload(key, parts)                                         # the host recovered: the SAME key launches
+    assert w.launch(sock, key, parts.workspace()).session == "sess-1" and w.staged.read_bytes() == parts.bundle
+
+
+def test_an_unsafe_scratch_parent_is_transient_not_a_tombstone(w, tmp_path):
+    parts, key = make_parts(tmp_path), w.key()
+    scratch = tmp_path / "scratch"
+    scratch.mkdir()
+    os.chmod(scratch, 0o777)                                               # _open_parent refuses: readset-workdir
+    sock, _ = w.upload(key, parts)
+    with pytest.raises(L.LauncherRefused) as exc:
+        w.launch(sock, key, parts.workspace())
+    assert exc.value.reason_class == "transient" and exc.value.detail.startswith("readset-workdir")
+    w.assert_nothing_staged(key, tombstone=False)
+    os.chmod(scratch, 0o700)
+    sock, _ = w.upload(key, parts)
+    assert w.launch(sock, key, parts.workspace()).session == "sess-1"
+
+
+def test_the_verify_unlinks_only_the_input_file_it_created(w, tmp_path):
+    parts, key = make_parts(tmp_path), w.key()
+    scratch = tmp_path / "scratch"
+    scratch.mkdir(mode=0o700)
+    theirs = scratch / f"in-{key}.bundle"
+    theirs.write_bytes(b"another verify's input")
+    sock, _ = w.upload(key, parts)
+    with pytest.raises(L.LauncherRefused) as exc:
+        w.launch(sock, key, parts.workspace())
+    assert exc.value.reason_class == "transient" and exc.value.detail.startswith("scratch-unavailable")
+    assert theirs.read_bytes() == b"another verify's input"
+
+
+def test_the_start_up_sweep_removes_a_crashed_verifys_workdir_and_input(w, tmp_path):
+    key = w.key()
+    scratch = tmp_path / "scratch"
+    scratch.mkdir(mode=0o700)
+    wd = scratch / RS.workdir_name(key)
+    (wd / "P" / "objects").mkdir(parents=True)
+    (wd / "handoff.bundle").write_bytes(b"x")
+    (scratch / f"in-{key}.bundle").write_bytes(b"x")
+    (scratch / "unrelated").write_bytes(b"kept")
+    w.uploads.sweep()
+    assert sorted(os.listdir(scratch)) == ["unrelated"]
 
 
 def test_a_server_that_stages_no_workspace_refuses_the_member_and_the_upload(tmp_path):
