@@ -875,11 +875,11 @@ def build_server(host: str, store: Path, control_sock: Path, operator_uid: int) 
 
 def service_row():
     """The unit row this program runs under: ``Service("dispatch_run", ...)`` as ``_levain_dispatch``, always restarted,
-    after CONTROL and gw-keys: the same row as ``levain.slot.units.by_name("dispatch_run")`` (registered in S10b slice
-    R, with its run dir ``R/dispatch``). A golden for the plist this row renders is in
+    after CONTROL and gw-keys, its stdout and stderr kept in the launchd log: the same row as
+    ``levain.slot.units.by_name("dispatch_run")`` (registered in S10b slice R, with its run dir ``R/dispatch``). A golden for the plist this row renders is in
     ``tests/test_slot_dispatch_run_server.py``."""
     from levain.slot.units import Service
-    return Service(NAME, "dispatch run server", ACCOUNT, ("control", "keys"), "always")
+    return Service(NAME, "dispatch run server", ACCOUNT, ("control", "keys"), "always", logs=True)
 
 
 __all__ = ["ACCOUNT", "NAME", "FrameClaims", "RunServer", "replica_verifier", "service_row", "agent_store_bar", "bound_usage_sources", "build_server", "main", "serve",

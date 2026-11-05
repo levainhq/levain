@@ -59,7 +59,9 @@ SERVICES: tuple[Service, ...] = (
     Service("keys", "gw-keys", "_levain_keys", ("control",), "always"),
     Service("qbroker", "QUEUE BROKER", "_levain_qbroker", ("control",), "always"),
     Service("dispatch", "dispatch", "_levain_dispatch", ("control", "keys"), "on-failure"),
-    Service("dispatch_run", "dispatch run server", "_levain_dispatch", ("control", "keys"), "always"),
+    # logs=True: the program's one stderr line for an unnamed failure ("op ... failed: <type> at <where>") is the only
+    # cause an `internal-error` answer leaves; without a path launchd threw it away (VM fire, finding 5).
+    Service("dispatch_run", "dispatch run server", "_levain_dispatch", ("control", "keys"), "always", logs=True),
     Service("reaper", "reaper", "root", ("control",), "always"),
     Service("pf", "pf anchor", "root", (), "one-shot", hosts=("darwin",), logs=True),
 )
@@ -122,8 +124,9 @@ def launchd_path(svc: Service) -> Path:
 
 def launchd_log_path(svc: Service) -> Path:
     """Where launchd appends a logging service's stdout and stderr (under root's ``/var/log``), so the pf one-shot's
-    "restored pf" / "not retried" line from a boot run can be read afterwards. The program keeps the file's size
-    bounded (:func:`levain.slot.services.pf.bound_log`)."""
+    "restored pf" / "not retried" line from a boot run, and the dispatch run server's unnamed-failure line, can be read
+    afterwards. launchd creates the file; no code here sets its owner or mode. The pf program keeps its file's size
+    bounded (:func:`levain.slot.services.pf.bound_log`); the dispatch run server does not trim its own."""
     return Path("/var/log") / f"{launchd_label(svc)}.log"
 
 

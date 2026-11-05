@@ -62,8 +62,9 @@ _BASE_RENDERS = {
     "reaper": ("0e43ef1cd8e4169f92da574c9ed5a7636fabe2875e47c0e8b15ae9d32474f074",
                "bba7ea59e0cfd3ec98488124db756571e22c2cd14f05e05613866750e453292b"),
     # added with its registration (S10b slice R), not on bcb41e68: the sha256 of the row's own render, the Linux one
-    # through ``_at_bcb41e68`` like the rest
-    "dispatch_run": ("1c57797494190c3b757cf400e27c5a7aa1144145285caf2afc5d831406fff2d8",
+    # through ``_at_bcb41e68`` like the rest. The plist hash was re-pinned when the row gained its stderr path (logs=True,
+    # finding 5); the Linux unit is unchanged (systemd's journal already keeps stderr).
+    "dispatch_run": ("61b1d4dc68d5d21b53d9916d669981f949a13f49251fc4cf83bea78ef6f4c229",
                      "2651a0f918d026efac2e19d3ad5189063ae7a6e87d840e827e7452c71ac86eae"),
     "pf": ("bf226f0434c4c2598d98d34c84a254c1ed9d137812e9d78fb5002a30d4ee82d7", None),  # pfboot: the boot log paths (logs=True)
 }
@@ -92,6 +93,20 @@ def test_dispatch_unit_is_on_failure_and_every_other_render_is_unchanged():
         assert _sha(units.launchd_plist_text(others[name])) == plist, name
         if unit is not None:
             assert _sha(_at_bcb41e68(units.systemd_unit_text(others[name]))) == unit, name
+
+
+def test_dispatch_run_plist_names_a_stderr_path_in_roots_log_dir_beside_the_pf_unit():
+    """Finding 5: with no StandardErrorPath launchd threw away the one stderr line that names an unnamed failure, so
+    every such failure reached the caller as a bare `internal-error` with no cause anywhere on the box."""
+    run = units.by_name("dispatch_run")
+    job = plistlib.loads(units.launchd_plist_text(run).encode())
+    assert job["StandardErrorPath"] == job["StandardOutPath"] == str(units.launchd_log_path(run))
+    assert units.launchd_log_path(run) == Path("/var/log/com.levain.dispatch_run.log")
+    # the same directory the pf unit's log sits in; the unit still runs as its own account (the file is launchd's, not its)
+    assert Path(job["StandardErrorPath"]).parent == units.launchd_log_path(units.by_name("pf")).parent
+    assert job["UserName"] == "_levain_dispatch" and job["KeepAlive"] is True
+    # the Linux unit takes no such key: systemd's journal keeps a service's stderr
+    assert "StandardError" not in units.systemd_unit_text(run)
 
 
 @pytest.mark.parametrize("host", ("darwin", "linux"))
