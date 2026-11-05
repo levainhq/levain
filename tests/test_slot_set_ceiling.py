@@ -514,7 +514,7 @@ def test_setup_writes_no_ceiling(host, monkeypatch):
 
     real = hands.shutil.which
     monkeypatch.setattr(hands.shutil, "which", lambda n, path=None: real(n, path=path) or f"/usr/sbin/{n}")
-    plan = IH.plan_setup(_setup(1, 1), setup_facts(host))
+    plan = IH.plan_setup(_setup(3, 1), setup_facts(host))
     target = str(layout.policy_dispatch_ceiling_path(host))
     assert plan.steps
     for s in plan.steps:
