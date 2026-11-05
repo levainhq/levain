@@ -103,6 +103,18 @@ class StagingRuntime(FakeRuntime):
         return super().start(req)
 
 
+class HandUploaded(C.DispatchSessionLauncher):
+    """The client for tests that upload the parts BY HAND (to tamper with them): its ``stage_workspace`` seam sends
+    nothing, so the server meets exactly the bytes the test put there. The real sender is held in
+    ``tests/test_dispatch_stager_send.py``."""
+
+    def build_workspace(self, launch):
+        return None
+
+    def stage_workspace(self, conn, launch, upload=None):
+        return None
+
+
 class World:
     def __init__(self, tmp_path: Path, **uploads_kw) -> None:
         self.rig = Rig(tmp_path)
@@ -139,8 +151,7 @@ class World:
 
     def launch(self, sock, key, ws):
         r = self.rig
-        client = C.DispatchSessionLauncher(lambda: sock, lambda occ: C.link_proof(r.store, r.world.root, occ,
-                                                                                  now=r.now()))
+        client = HandUploaded(lambda: sock, lambda occ: C.link_proof(r.store, r.world.root, occ, now=r.now()))
         return client.spawn(S.SessionLaunch(self.oid, key, "claude", "sonnet", "b", "passthrough", EXP, ws))
 
     def raw_launch(self, sock, key, ws):
@@ -602,8 +613,8 @@ def test_a_server_that_stages_no_workspace_refuses_the_member_and_the_upload(tmp
                                      **C.ws_begin_to_wire("s-00000000000000b1", parts.manifest_bytes, parts.bundle)}))
     ans = C.read_run_frame(sock)
     assert ans["refused"] == REFUSED and ans["detail"].startswith("unavailable")
-    client = C.DispatchSessionLauncher(lambda: env.connect(), lambda occ: C.link_proof(rig.store, rig.world.root, occ,
-                                                                                         now=rig.now()))
+    client = HandUploaded(lambda: env.connect(), lambda occ: C.link_proof(rig.store, rig.world.root, occ,
+                                                                          now=rig.now()))
     with pytest.raises(L.LauncherRefused) as exc:
         client.spawn(S.SessionLaunch(oid, "s-00000000000000b2", "claude", "sonnet", "b", "passthrough", EXP,
                                      parts.workspace()))

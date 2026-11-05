@@ -429,6 +429,8 @@ LAZY_SITES = {
     'levain/agents/session_client.py::AuthorityFeed.read::from levain.agent_authority import AgentAuthority': 'operator',
     # operator: ``AuthorityFeed.rows`` runs only in the operator's process (the controller, an agent session or the session client); the dispatch run server only imports the module
     'levain/agents/session_client.py::AuthorityFeed.rows::from levain.cockpit.firejournal import DB_NAME': 'operator',
+    # operator: ``build_workspace`` builds the workspace snapshot from the operator's repo before the LAUNCH connection is opened (levain 34, W1); it runs only in the fire, the operator's uid, and the dispatch run server never calls it
+    'levain/agents/session_client.py::DispatchSessionLauncher.build_workspace::from levain.dispatch import stager': 'operator',
     # operator: ``build_launcher`` runs only in the operator's process (the controller, an agent session or the session client); the dispatch run server only imports the module
     'levain/agents/session_client.py::build_launcher::from levain.agents.session_wire import read_install': 'operator',
     # operator: ``default_run_socket`` runs only in the operator's process (the controller, an agent session or the session client); the dispatch run server only imports the module

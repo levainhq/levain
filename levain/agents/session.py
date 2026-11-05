@@ -65,7 +65,7 @@ from levain.agents.store import AgentStore
 from levain.agents.supervise import STOP_DEADLINE_S as _STOP_DEADLINE_S   # the reaper's stop deadline, reused
 
 __all__ = ["S1_DISPATCH", "AUTH_FOR_BILLING", "EFFECT_ID", "BRIEF_MAX_BYTES", "RECALL_MAX_BYTES", "Workspace",
-           "WORKSPACE_REPO_MAX", "WORKSPACE_WITHHOLD_MAX", "SessionLaunch",
+           "WORKSPACE_REPO_MAX", "WORKSPACE_WITHHOLD_MAX", "WORKSPACE_BRANCH_MAX", "WORKSPACE_REFUSED", "branch_problem", "SessionLaunch",
            "SessionLauncher", "UnwiredLauncher", "Reserved", "SessionExecutor", "SessionReport", "BriefRefused",
            "render_brief", "new_session_key", "reserved_terms", "launch_refusal", "run_session", "make_run",
            "SessionEnder", "RowSessionExecutor", "session_executor_of"]
@@ -88,8 +88,28 @@ class BriefRefused(ValueError):
 WORKSPACE_REPO_MAX = 4096          # [judged] a path's length; PATH_MAX on the hosts this runs on
 WORKSPACE_WITHHOLD_MAX = 256       # the snapshot's own bound on withhold patterns (levain.dispatch.snapshot._WITHHOLD_MAX)
 _WORKSPACE_PATTERN_MAX = 512       # [judged] one withhold pattern's length
+WORKSPACE_BRANCH_MAX = 200         # [judged] a branch name's length
+#: What a fire records when its workspace is refused (by the operator-uid sender before any LAUNCH, or by the run server
+#: at LAUNCH): the run ends ``failed`` with this reason.
+WORKSPACE_REFUSED = "session_refused:workspace"
+_BRANCH_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._/-]*")
 _WORKSPACE_HEAD_RE = re.compile(r"[0-9a-f]{40}")
 _WORKSPACE_DIGEST_RE = re.compile(r"sha256:[0-9a-f]{64}")
+
+
+def branch_problem(branch: object) -> str | None:
+    """Why ``branch`` cannot name a local branch the operator's repo holds, else None. Narrower than git's own ref
+    grammar on purpose (ASCII, no leading ``-`` or ``.``, no ``..``, ``//``, ``@{``, trailing ``/`` or ``.``, no
+    component starting with ``.`` or ending ``.lock``): the name becomes ``refs/heads/<branch>`` on a git command line."""
+    if type(branch) is not str or not branch or len(branch) > WORKSPACE_BRANCH_MAX:
+        return f"a branch is 1 to {WORKSPACE_BRANCH_MAX} characters"
+    if _BRANCH_RE.fullmatch(branch) is None:
+        return "a branch is ASCII letters, digits and . _ / - only, starting with a letter or digit"
+    if ".." in branch or "//" in branch or "@{" in branch or branch.endswith(("/", ".")):
+        return "a branch holds no '..', '//', '@{' and does not end in '/' or '.'"
+    if any(c.startswith(".") or c.endswith(".lock") for c in branch.split("/")):
+        return "a branch component does not start with '.' or end in '.lock'"
+    return None
 
 
 @dataclass(frozen=True)
@@ -103,11 +123,14 @@ class Workspace:
 
     ``manifest_digest`` is NOT on the wire: it is None on the operator's side, and the run server fills it once it has
     verified the uploaded bundle against the manifest (``levain.slot.workspace``), so the digest a record carries and
-    the stager checks is the server's own derivation, never a field the client sent."""
+    the stager checks is the server's own derivation, never a field the client sent. ``branch`` is not on the wire
+    either: it is the install's branch setting the operator-uid side resolved ``head`` from at the fire (None: the
+    repo's checked-out HEAD), kept so the fire's record can say which one."""
     repo: str
     head: str
     withhold: tuple[str, ...] = ()
     manifest_digest: str | None = None
+    branch: str | None = None
 
     def __post_init__(self) -> None:
         if type(self.repo) is not str or not self.repo.startswith("/") or "\0" in self.repo \
@@ -122,6 +145,8 @@ class Workspace:
         if self.manifest_digest is not None and (type(self.manifest_digest) is not str
                                                  or _WORKSPACE_DIGEST_RE.fullmatch(self.manifest_digest) is None):
             raise ValueError("workspace.manifest_digest is not a sha256 digest")
+        if self.branch is not None and branch_problem(self.branch) is not None:
+            raise ValueError("workspace.branch is not a branch name")
 
 
 @dataclass(frozen=True)
@@ -404,7 +429,9 @@ class SessionReport:
 def run_session(sup: Any, store: AgentStore, occurrence_id: str, launch_epoch: int, *, role: Mapping[str, Any],
                 values: Mapping[str, Any], recall: Any, launcher: Any, exposure: ActionExposure | None,
                 max_exposure_usd_micros: int = 0, wait: Callable[[Any], int | None] | None = None,
-                clock: Callable[[], Any] | None = None, key: str | None = None) -> SessionReport:
+                clock: Callable[[], Any] | None = None, key: str | None = None,
+                workspace: Workspace | None = None, workspace_problem: str | None = None,
+                workspace_setting: tuple[str, str | None] | None = None) -> SessionReport:
     """A session occurrence's body, called by the fire after its claim. ``sup`` is a ``Supervisor``. In order: the
     row must be ``launched`` at ``launch_epoch`` (else nothing runs or settles: ``not_held``); the refusals (a
     refusal ends the occurrence ``failed`` with ``session_refused:<why>``, nothing spawned, settled at zero unless the
@@ -424,7 +451,20 @@ def run_session(sup: Any, store: AgentStore, occurrence_id: str, launch_epoch: i
     differ from the recorded effect's); a run ``start_run`` did not start (``not_started``); a run whose gate's exit
     proves nothing about its group; a run whose ``start_run`` raised after the spawn (``start_run`` aborts the child
     before the error propagates); and a run whose ``wait`` raised, after the child was stopped and aborted here, with
-    the error propagating."""
+    the error propagating.
+
+    ``workspace`` (levain 34, W1) is the member the operator-uid side resolved at the fire (repo, the 40-hex head its
+    branch setting named now, the branch): it rides the launch, is part of the launch digest by repo and branch (never
+    the resolved head, which a replay must not be cancelled by), and is recorded in the effect's result. A
+    ``workspace_problem`` (the install's setting could not be resolved to a commit) ends the run
+    ``session_refused:workspace`` before anything starts, settled at zero, EXCEPT on a rerun: a row that already names
+    a session key had an earlier attempt that may have launched, and refusing here would end that attempt's live
+    session as a refusal and zero its usage (the branch since deleted, the repo moved). ``workspace_setting`` is the
+    install's ``(repo, branch)`` the problem came from; with it the rerun goes on to the journaled effect, whose digest
+    is the same as the first attempt's, so the recorded effect replays. The effect body itself still spawns nothing
+    for a ``workspace_problem``. With no setting there is nothing to hash and the refusal stands. A launcher whose ``spawn`` raises an error
+    marked ``nothing_sent`` (the sender refused or lost the wire before LAUNCH) has started nothing: usage is zero
+    whatever the reason, and a refusal named :data:`WORKSPACE_REFUSED` is recorded under that name."""
     from datetime import datetime, timezone
     from levain.autonomic.journal import EffectStatus
 
@@ -454,6 +494,11 @@ def run_session(sup: Any, store: AgentStore, occurrence_id: str, launch_epoch: i
     if why is not None:
         end = sup.finish(occurrence_id, unstarted, ok=False, reason=f"session_refused:{why}")
         return SessionReport(1, outcome="refused", state=end.state, note=why)
+    setting = (workspace.repo, workspace.branch) if workspace is not None else (
+        workspace_setting if workspace_problem is not None else None)
+    if workspace_problem is not None and not (row[3] is not None and setting is not None):
+        end = sup.finish(occurrence_id, unstarted, ok=False, reason=WORKSPACE_REFUSED)
+        return SessionReport(1, outcome="refused", state=end.state, note=workspace_problem)
     session_key = key or new_session_key()
     executor.session_key = session_key
     try:
@@ -462,19 +507,28 @@ def run_session(sup: Any, store: AgentStore, occurrence_id: str, launch_epoch: i
         end = sup.finish(occurrence_id, unstarted, ok=False, reason="session_refused:brief")
         return SessionReport(1, outcome="refused", state=end.state, note=str(exc))
     launch = SessionLaunch(occurrence_id, session_key, role["harness"], role["model"], brief,
-                           AUTH_FOR_BILLING[reserved.billing], exposure)
+                           AUTH_FOR_BILLING[reserved.billing], exposure, workspace)
+    # what the fire records of its workspace: the setting it resolved and the commit that gave
+    ws_record: dict[str, Any] = {} if workspace is None else {
+        "workspace": {"repo": workspace.repo, "branch": workspace.branch, "head": workspace.head}}
     waiter = wait or (lambda child: child.process.wait())
 
     spawn_failed: list[BaseException] = []
 
     def effect() -> dict[str, Any]:
         spawn_failed.clear()          # only this call's own spawn error is the known failure below
+        if workspace_problem is not None:
+            # a rerun let past the refusal above only to replay a recorded effect: a body that runs anyway has
+            # nothing resolved to launch, so it starts nothing and says so
+            return {"outcome": WORKSPACE_REFUSED, "session_key": session_key, "spawned": False}
 
         def spawn(k: str) -> Any:
             executor.spawn_attempted = True
             try:
                 child = launcher.spawn(launch)
             except Exception as exc:
+                if getattr(exc, "nothing_sent", False) is True:
+                    executor.spawn_attempted = False      # no LAUNCH went out: nothing is live and nothing was spent
                 spawn_failed.append(exc)
                 raise
             executor.child = child
@@ -487,10 +541,12 @@ def run_session(sup: Any, store: AgentStore, occurrence_id: str, launch_epoch: i
                 raise
             # start_run leaves a raising spawn's run to its caller to end; the key is recorded, so it ends here
             _log.warning("session spawn for %s raised %s: %s", occurrence_id, type(exc).__name__, exc)
-            return {"outcome": "session_spawn_failed", "session_key": session_key, "spawned": True}
+            refused = getattr(exc, "name", None) == WORKSPACE_REFUSED
+            return {"outcome": WORKSPACE_REFUSED if refused else "session_spawn_failed", "session_key": session_key,
+                    "spawned": getattr(exc, "nothing_sent", False) is not True, **ws_record}
         if not started.spawned:
             return {"outcome": "not_started", "reason": started.reason, "session_key": session_key,
-                    "spawned": executor.spawn_attempted}
+                    "spawned": executor.spawn_attempted, **ws_record}
         try:
             rc = waiter(started.value)
         except BaseException as exc:
@@ -504,7 +560,7 @@ def run_session(sup: Any, store: AgentStore, occurrence_id: str, launch_epoch: i
             exc.add_note(f"run_session: the child was stopped ({stop.terminated}: {stop.detail}) and aborted")
             raise
         return {"outcome": "exited", "returncode": rc, "session_key": session_key, "spawned": True,
-                "proven": _ctl.gate_proves_termination(rc)}
+                "proven": _ctl.gate_proves_termination(rc), **ws_record}
 
     # the digest is the launch as asked: a rerun asking for other work is not a replay of the first (the journal
     # cancels a changed digest, and the row is left to lapse recovery). Two inputs are left out on purpose: the
@@ -513,7 +569,9 @@ def run_session(sup: Any, store: AgentStore, occurrence_id: str, launch_epoch: i
     digest = hashlib.sha256(b"levain-session-launch/1\n" + json.dumps(
         {"occurrence_id": occurrence_id, "role_hash": reserved.role_hash, "values": dict(values), "auth": launch.auth,
          "exposure": None if exposure is None else [exposure.actions, exposure.unit, exposure.seconds,
-                                                    exposure.tunnel_bytes]},
+                                                    exposure.tunnel_bytes],
+         # the setting, never the resolved head; absent when there is none, so a launch with no workspace hashes as before
+         **({} if setting is None else {"workspace": [setting[0], setting[1]]})},
         sort_keys=True).encode("utf-8")).hexdigest()
     eff = sup.effect(occurrence_id, EFFECT_ID, digest=digest, fn=effect, executor=executor)
     status = eff.outcome.status
