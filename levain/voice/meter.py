@@ -56,6 +56,7 @@ DAY_CAP = "day_cap"
 UNPRICED = "unpriced"
 
 _BUSY_WAIT_S = 10.0
+_MAX_MICROS = 2 ** 62          # a cap or price above this could not be stored in SQLite's signed 64-bit integer with room to sum
 
 
 class MeterError(Exception):
@@ -68,11 +69,13 @@ def usd_to_micros(usd: str | int) -> int:
     if isinstance(usd, bool) or not isinstance(usd, (str, int)):
         raise MeterError(f"a dollar amount is a string or an int, not {type(usd).__name__}")
     try:
-        value = Decimal(usd) * MICROS_PER_USD
-    except InvalidOperation:
+        value = Decimal(usd) * MICROS_PER_USD     # decimal.Overflow (an exponent like 1e999999) is an ArithmeticError
+    except ArithmeticError:                       # InvalidOperation is one too
         raise MeterError(f"{usd!r} is not a dollar amount") from None
     if not value.is_finite() or value < 0:
         raise MeterError(f"{usd!r} is not a dollar amount")
+    if value > _MAX_MICROS:
+        raise MeterError(f"{usd!r} is more than a ledger can hold")
     if value != value.to_integral_value():
         raise MeterError(f"{usd!r} has finer than micro-dollar precision")
     return int(value)
@@ -273,8 +276,13 @@ class Meter:
             raise MeterError(f"voice ledger {self.path} is a symlink")
         if not self.path.parent.is_dir():
             raise MeterError(f"voice ledger directory {self.path.parent} does not exist")
-        try:   # created 0600 from its first byte (umask can only remove bits), and never through a symlink
-            os.close(os.open(self.path, os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, 0o600))
+        try:   # created 0600 from its first byte (umask can only remove bits), never through a symlink, and made 0600
+            # on the descriptor BEFORE SQLite opens it, so the -wal and -shm files it derives from this one start 0600
+            fd = os.open(self.path, os.O_RDWR | os.O_CREAT | getattr(os, "O_NOFOLLOW", 0), 0o600)
+            try:
+                os.fchmod(fd, 0o600)
+            finally:
+                os.close(fd)
         except OSError as exc:
             raise MeterError(f"voice ledger {self.path} cannot be opened: {type(exc).__name__}") from None
         try:
@@ -297,7 +305,6 @@ class Meter:
                     raise
         except sqlite3.DatabaseError as exc:
             raise MeterError(f"{self.path} is not a usable voice ledger: {type(exc).__name__}") from None
-        os.chmod(self.path, 0o600)     # the operator's alone, whoever created it and however
 
     # --- periods ------------------------------------------------------------------------------------------------------
     def _periods(self, now: datetime) -> tuple[str, str, str, str]:

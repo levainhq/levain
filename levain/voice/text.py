@@ -62,8 +62,10 @@ def replace_code_fences(text: str) -> str:
 
 def _continues(ch: str) -> bool:
     """True for a character that belongs to the one before it: a mark (Mn, Mc, Me, which covers the variation
-    selectors), an emoji skin-tone modifier, or the zero-width joiner. Regional-indicator pairs (flags) and tag
-    sequences are not handled: a known edge, cut only inside a 200+ character run with no space."""
+    selectors), an emoji skin-tone modifier, or the zero-width joiner. Regional-indicator pairs (flags), tag
+    sequences, Indic virama conjuncts (a cut after a virama can split the conjunct it forms with the next consonant) and
+    Hangul conjoining jamo (a leading, vowel and trailing jamo that compose one syllable) are not handled: known
+    edges, each cut only inside a 200+ character run with no space."""
     return unicodedata.category(ch) in ("Mn", "Mc", "Me") or 0x1F3FB <= ord(ch) <= 0x1F3FF or ch == _ZWJ
 
 

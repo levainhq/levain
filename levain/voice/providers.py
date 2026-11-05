@@ -329,10 +329,11 @@ class DeepgramProvider:
     the audio and text out of Deepgram's model-improvement programme; no setting turns it off."""
 
     transport: Transport = field(default=urllib_transport, repr=False)
-    tts_model: str = DEEPGRAM_TTS_MODEL      # the priced family; the voice sent is one of its voices
     stt_model: str = DEEPGRAM_STT_MODEL
     name: str = "deepgram"
     uses: frozenset[str] = frozenset({"tts", "stt"})
+    tts_model: str = DEEPGRAM_TTS_MODEL      # the priced family; the voice sent is one of its voices. Last, so positional
+                                             # construction of the older fields is unchanged
 
     @staticmethod
     def _url(path: str, **query: str) -> str:

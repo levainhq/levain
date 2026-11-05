@@ -52,6 +52,13 @@ def test_usd_to_micros_is_exact_and_refuses_floats():
             usd_to_micros(bad)
 
 
+def test_usd_to_micros_refuses_an_overflowing_or_unstorable_amount():
+    for bad in ("1e999999", "1e30", str(2 ** 63), 2 ** 63, "4611686018427388"):    # last: 2**62 / 1e6 rounded up
+        with pytest.raises(MeterError):
+            usd_to_micros(bad)
+    assert usd_to_micros("4611686018427") == 4611686018427 * MICROS_PER_USD       # under the bound still prices
+
+
 def test_the_standing_cap_defaults_are_ten_a_month_and_two_a_day():
     assert DEFAULT_CAPS.month_micros == usd_to_micros(10)
     assert DEFAULT_CAPS.day_micros == usd_to_micros(2)
@@ -369,6 +376,45 @@ def test_a_ledger_file_someone_else_created_is_made_the_operators_alone(tmp_path
     path.chmod(0o644)                                     # an empty file left by an interrupted or racing first open
     Meter(path).spent()
     assert path.stat().st_mode & 0o777 == 0o600
+
+
+def test_the_ledger_is_0600_before_sqlite_opens_it_so_its_wal_and_shm_start_0600(tmp_path, monkeypatch):
+    path = tmp_path / "voice.db"
+    with sqlite3.connect(path) as conn:                   # a WAL-mode ledger left 0644 with no -wal/-shm beside it
+        conn.execute("PRAGMA journal_mode = WAL")
+        conn.execute("CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)")
+        conn.execute("INSERT INTO meta VALUES ('format', ?)", (m.FORMAT,))
+    conn.close()
+    for sibling in ("-wal", "-shm"):
+        (tmp_path / f"voice.db{sibling}").unlink(missing_ok=True)
+    path.chmod(0o644)
+    seen: list[tuple[str, int]] = []
+    real = sqlite3.connect
+
+    def spy(*a, **k):
+        seen.append(("db", path.stat().st_mode & 0o777))     # the mode at the moment SQLite first opens it
+        c = real(*a, **k)
+        c.execute("SELECT count(*) FROM sqlite_master").fetchone()
+        for sibling in ("-wal", "-shm"):
+            side = tmp_path / f"voice.db{sibling}"
+            if side.exists():
+                seen.append((sibling, side.stat().st_mode & 0o777))
+        return c
+
+    monkeypatch.setattr(m.sqlite3, "connect", spy)
+    Meter(path).spent()
+    assert seen[0] == ("db", 0o600)
+    assert {name for name, _ in seen} >= {"db", "-wal", "-shm"}
+    assert all(mode == 0o600 for _, mode in seen)
+
+
+def test_a_ledger_that_cannot_be_made_private_is_a_meter_error_not_a_permission_error(tmp_path, monkeypatch):
+    def refuse(fd, mode):
+        raise PermissionError(1, "Operation not permitted")      # a file someone else owns
+
+    monkeypatch.setattr(m.os, "fchmod", refuse)
+    with pytest.raises(MeterError, match="cannot be opened"):
+        Meter(tmp_path / "voice.db").spent()
 
 
 def test_constructing_a_meter_creates_nothing_until_it_is_used(tmp_path):

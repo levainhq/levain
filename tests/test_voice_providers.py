@@ -506,3 +506,10 @@ def test_an_unknown_provider_is_refused_and_the_known_ones_resolve():
         P.provider_for("elevenlabs")
     assert set(P.NAMES) == set(P.HOSTS)
     assert {c for c in P.WORDS} >= {P._code_for(s, b"") for s in (401, 402, 404, 429, 500)} - {None}
+
+
+def test_deepgram_positional_construction_keeps_its_older_field_order():
+    # tts_model was added AFTER the fields that existed, so a positional caller's stt_model still lands in stt_model
+    prov = P.DeepgramProvider(P.urllib_transport, "nova-custom")
+    assert prov.stt_model == "nova-custom"
+    assert prov.tts_model == P.DEEPGRAM_TTS_MODEL
