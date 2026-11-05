@@ -18,6 +18,10 @@ error, never silently carried.
 * A **holder** connection is one session's lifeline: ``LAUNCH`` (typed launch + the signature proof), then ``RELEASE``,
   ``WAIT`` (a bounded long-poll; ``timeout_ms`` 0 is a poll), ``TERM`` and ``ABORT``. Its EOF is the server's cue to
   END the session (design 3.4); the client therefore CLOSES it on any fault.
+  A launch that stages a repo (levain 34, W1) carries a ``workspace`` member ``{repo, head, withhold}`` and is preceded,
+  on the SAME connection, by ``WSBEGIN`` and ``WSDATA`` frames that carry the snapshot manifest and git bundle (see
+  "the workspace upload" below). The sender of those frames is the operator-uid side's, a later lane; only the shapes
+  are here.
 * A **short** connection carries ``USAGE`` or ``END`` for a session key and nothing else.
 
 **What never crosses.** The ticket and the run id are minted and kept on the dispatch uid (design port items (2), (3)):

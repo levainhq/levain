@@ -424,10 +424,12 @@ def test_a_member_with_no_upload_and_an_upload_with_no_member_are_each_refused(w
 
 def test_an_upload_begun_on_another_connection_is_not_this_launchs(w, tmp_path):
     parts, key = make_parts(tmp_path), w.key()
-    w.upload(key, parts)
+    holder, _ = w.upload(key, parts)                  # connection A stays open, holding its upload
+    assert key in w.uploads._ups
     with pytest.raises(L.LauncherRefused) as exc:
         w.launch(w.env.connect(), key, parts.workspace())
-    assert cause(exc.value) == "no-upload"
+    assert cause(exc.value) == "no-upload" and key in w.uploads._ups      # A's upload is not B's to take, nor to drop
+    holder.close()
 
 
 def test_a_server_that_stages_no_workspace_refuses_the_member_and_the_upload(tmp_path):

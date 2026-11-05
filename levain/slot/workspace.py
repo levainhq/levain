@@ -272,13 +272,13 @@ class WorkspaceUploads:
             raise WorkspaceRefused("verify-failed", type(exc).__name__) from None
 
     def _judge(self, up: _Upload, ws: Workspace) -> str:
-        parts = {p: bytes(b) for p, b in up.parts.items()}
+        parts = up.parts                  # the held bytearrays, not copies: an upload is up to ~80 MiB, four may be held
         for part, data in parts.items():
             if len(data) != up.sizes[part]:
                 raise WorkspaceRefused("upload-incomplete", f"{part}: {len(data)} of {up.sizes[part]} bytes")
             if "sha256:" + hashlib.sha256(data).hexdigest() != up.digests[part]:
                 raise WorkspaceRefused(f"{part}-digest", "the bytes held are not the bytes WSBEGIN declared")
-        manifest = manifest_from_bytes(parts["manifest"])
+        manifest = manifest_from_bytes(bytes(parts["manifest"]))
         if not W1_WITHHOLD_ALLOWED and (ws.withhold or manifest.withhold or manifest.withheld_paths):
             raise WorkspaceRefused("withhold-not-in-w1", "W1 stages a snapshot with an empty withhold")
         if manifest.head != ws.head:
@@ -378,7 +378,7 @@ class WorkspaceUploads:
         if up is None or up.verified is None or ws.manifest_digest != up.verified.manifest_digest:
             raise WorkspaceRefused("not-verified", "the launch's workspace was not verified by this server")
         v = up.verified
-        data = bytes(up.parts["bundle"])
+        data = up.parts["bundle"]
         try:
             sfd = os.open(os.fspath(staging), _O_DIR)
         except OSError as exc:
