@@ -66,6 +66,42 @@ def add_parsers(subparsers: argparse._SubParsersAction) -> None:
     _add_signing_parsers(verbs)
     _add_revoke_parsers(verbs)
     _add_fence_parsers(verbs)
+    _add_tick_parsers(verbs)
+
+
+def _add_tick_parsers(verbs: argparse._SubParsersAction) -> None:
+    tick = verbs.add_parser(
+        "tick", help="One reaper + scheduler pass over the agent store (run by a launchd user agent every minute).",
+        allow_abbrev=False,
+        description="Renew the leases of launched agent rows, stop the ones past their stop time, then claim scheduled "
+                    "windows. One pass, bounded (graceful at 540 s, hard exit at 600 s). Runs as you. --print-unit prints "
+                    "the launchd plist for the schedule and installs nothing. Give --store-dir before `tick`.")
+    tick.add_argument("--coord-dir", dest="coord_dir", type=Path, default=None,
+                      help="The coordinator queue directory (its dispatch.db feeds the slot-lease probes).")
+    tick.add_argument("--print-unit", dest="print_unit", action="store_true",
+                      help="Print the launchd user-agent plist for this store and exit; installs and loads nothing.")
+    tick.set_defaults(func=run_tick)
+
+
+def run_tick(args: argparse.Namespace) -> int:
+    from levain.agents import tick_driver
+
+    if args.print_unit:
+        from levain import daemon
+        from levain.autonomic.db import default_store_dir
+
+        store = args.store_dir if args.store_dir is not None else default_store_dir()
+        spec = daemon.build_tick_spec(agent_store=store, interval=tick_driver.TICK_INTERVAL_S, coord_dir=args.coord_dir)
+        print(daemon.LaunchdProvider().render_unit(spec), end="")
+        return 0
+    try:
+        return tick_driver.run_tick(args.store_dir, coord_dir=args.coord_dir)
+    except (AgentStoreRefused, ValueError) as exc:      # an install refusal is the driver's own (it still renews, exit 1)
+        print(f"levain agents: {exc}", file=sys.stderr)
+        return 1
+    except (StoreFormatError, sqlite3.Error, OSError) as exc:
+        print(f"levain agents: cannot open the autonomic store: {exc}", file=sys.stderr)
+        return 1
 
 
 def run_agents(args: argparse.Namespace) -> int:
