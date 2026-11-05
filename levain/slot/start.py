@@ -32,7 +32,9 @@ CONTROL checks, never as a fact root acts on.
    start can be retried. For those three kinds a zero exit is not success until ``clone-check`` passes
    (:func:`clone_check`, §5.4 step 3: (a) the clone's attributes file is render's line; kind ``dispatch`` also
    (b), every index entry's worktree bytes hashed with no filter equal to its blob, inside a window no other
-   slot-uid process may be alive in); a failed check goes down the same ``clone-failed`` path. Success = end's
+   slot-uid process may be alive in; on macOS the launchd domain is ended again after ``ls-files`` and root hashes
+   the worktree itself, :func:`hash_worktree_at`, so no child runs after the last proof); a failed check goes down
+   the same ``clone-failed`` path. Success = end's
    ``mark_cloned``, written only after the check.
 6. ``forwarder`` (Linux egress): the slot's TCP -> ``gw.sock`` relay in the netns, detached (§9.1); the helper
    waits (bounded) for its ready byte, written after bind + listen, and refuses ``forwarder-not-ready`` without it.
@@ -60,6 +62,7 @@ then SCRUBBED (proc.scrub over every uid of the slot, under the slot lock) and t
 from __future__ import annotations
 
 import errno
+import hashlib
 import os
 import re
 import select
@@ -577,6 +580,87 @@ def hash_batches(paths: Sequence[str], base: int, cap: int = wall.SPEC_CAP) -> L
     return out
 
 
+#: DECISION: the root-side hash reads a file in chunks of this size (one read seam call each).
+HASH_CHUNK = 1 << 20
+
+
+def _beneath_fd(repo_fd: int, parts: Sequence[str], path: str) -> int:
+    """The fd of ``path``'s parent directory, every component opened ``O_DIRECTORY|O_NOFOLLOW`` from ``repo_fd``
+    (a fresh fd; ``repo_fd`` is never closed)."""
+    fd = os.dup(repo_fd)
+    try:
+        for comp in parts[:-1]:
+            try:
+                nfd = os.open(comp, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC, dir_fd=fd)
+            except OSError as e:
+                raise CheckFailed(f"(b) {_name(path)}: parent {comp!r} is not a plain directory "
+                                  f"(errno {e.errno})") from None
+            os.close(fd)
+            fd = nfd
+        return fd
+    except BaseException:
+        os.close(fd)
+        raise
+
+
+def hash_worktree_at(repo_fd: int, entries: Sequence[IndexEntry], owner_uid: int, *,
+                     deadline_s: float = H.CHECK_S, clock: Callable[[], float] = time.monotonic,
+                     read: Callable[[int, int], bytes] = os.read) -> int:
+    """macOS window 2 (DESIGN_window2): root hashes every worktree entry ITSELF, with no child, so no ``asuser`` launch
+    (which recreates the slot uid's launchd domain) runs after the last proof. Each entry is opened fd-relative from
+    ``repo_fd`` (parents ``O_DIRECTORY|O_NOFOLLOW``, the leaf ``O_NOFOLLOW|O_NONBLOCK``, so a FIFO never blocks), then
+    judged on the OPENED fd: a regular file, owner execute bit equal to its index mode's, owned by ``owner_uid`` with
+    one link (root never reads a file the slot did not write as itself), and read to EOF in :data:`HASH_CHUNK`
+    pieces whose count equals ``st_size`` (a file that grew or shrank refuses). Its id is a git blob id,
+    ``sha1("blob <size>\\0" + bytes)``, which is what ``git hash-object --no-filters`` computes; it must equal the
+    index entry's. One ``deadline_s`` bounds the whole pass. Returns the bytes hashed."""
+    end = clock() + deadline_s
+    total = 0
+    for e in entries:
+        parts = e.path.split("/")
+        if any(p in ("", ".", "..") for p in parts):
+            raise CheckFailed(f"(b) {_name(e.path)}: not a plain relative path")
+        pfd = _beneath_fd(repo_fd, parts, e.path)
+        try:
+            try:
+                fd = os.open(parts[-1], _O_FILE, dir_fd=pfd)
+            except OSError as e2:
+                raise CheckFailed(f"(b) {_name(e.path)}: no plain worktree file (errno {e2.errno})") from None
+        finally:
+            os.close(pfd)
+        try:
+            st = os.fstat(fd)
+            if not stat.S_ISREG(st.st_mode):
+                raise CheckFailed(f"(b) {_name(e.path)}: the worktree entry is not a regular file "
+                                  f"(mode {stat.S_IFMT(st.st_mode):o})")
+            if bool(st.st_mode & stat.S_IXUSR) != _MODES[e.mode]:
+                raise CheckFailed(f"(b) {_name(e.path)}: exec bit {stat.S_IMODE(st.st_mode):o} vs index {e.mode}")
+            if st.st_uid != owner_uid:
+                raise CheckFailed(f"(b) {_name(e.path)}: owned by uid {st.st_uid}, not the slot's")
+            if st.st_nlink != 1:
+                raise CheckFailed(f"(b) {_name(e.path)}: {st.st_nlink} links")
+            h = hashlib.sha1(b"blob %d\0" % st.st_size)
+            got = 0
+            while True:
+                if clock() > end:
+                    raise CheckFailed(f"(b) {_name(e.path)}: the root hash passed its {deadline_s:g}s bound")
+                chunk = read(fd, HASH_CHUNK)
+                if not chunk:
+                    break
+                got += len(chunk)
+                if got > st.st_size:
+                    break
+                h.update(chunk)
+            if got != st.st_size:
+                raise CheckFailed(f"(b) {_name(e.path)}: read {got} bytes for a size of {st.st_size}")
+        finally:
+            os.close(fd)
+        if h.hexdigest() != e.sha:
+            raise CheckFailed(f"(b) {_name(e.path)}: blob {e.sha[:12]} != worktree --no-filters {h.hexdigest()[:12]}")
+        total += got
+    return total
+
+
 def check_attributes(sfd: int) -> None:
     """(a): ``repo/.git/info/attributes`` opened fd-relative from the session dir fd, each directory
     ``O_NOFOLLOW``, the file ``O_RDONLY|O_NOFOLLOW|O_NONBLOCK|O_NOCTTY`` (a FIFO never blocks), then ``fstat``: a
@@ -622,7 +706,8 @@ def _hash_ids(out: bytes, n: int) -> List[str]:
 
 def clone_check(sfd: int, kind: str, run: Callable[[Tuple[str, ...], int], bytes], no_process: Callable[[], bool],
                 *, spec_base: Callable[[], int], cap: int = wall.SPEC_CAP,
-                quiesce: Optional[Callable[[], None]] = None) -> Optional[CheckStats]:
+                quiesce: Optional[Callable[[], None]] = None,
+                root_hash: Optional[Callable[[int, Sequence[IndexEntry]], int]] = None) -> Optional[CheckStats]:
     """§5.4 step 3 after a zero clone exit, in order: for kind ``dispatch`` the slot uid has no process (V4); for
     ``dispatch|planner|verifier`` (a) :func:`check_attributes`; for ``dispatch`` only (V3) (b): ``ls-files -s -z``
     run as the slot (``run(argv, bound)`` returns its stdout or raises :class:`CheckFailed`), parsed and checked
@@ -631,12 +716,17 @@ def clone_check(sfd: int, kind: str, run: Callable[[Tuple[str, ...], int], bytes
     then no slot-uid process again (V4). Any failure raises :class:`CheckFailed`. ``interactive|login``: no check
     (None).
 
-    ``quiesce`` (macOS only; None on Linux): run ONCE, before the first window's proof, nothing verified yet so
-    ending the slot uid's launchd domain costs no evidence (launchd's per-uid agent, ``distnoted``, runs as the slot
-    uid after git's first notification). It raises :class:`CheckFailed` when the domain is not proven ended. The
-    predicate after it is unchanged: no slot-uid process. The window AFTER the last child gets no quiesce: it stays a
-    detection (a process alive while the check ran refuses); a second hash pass after a quiesce there waits on the
-    VM sampling (DESIGN_render_wiring Finding 4 (ii))."""
+    ``quiesce`` (macOS only; None on Linux): ends the slot uid's launchd domain (``distnoted``, the per-uid agent,
+    runs as the slot uid after git's first notification and again after EVERY ``launchctl asuser`` child). It runs
+    before the first window's proof, nothing verified yet so the kill costs no evidence. It raises
+    :class:`CheckFailed` when the domain is not proven ended.
+
+    ``root_hash`` (macOS only, with ``quiesce``; None on Linux): window 2 (DESIGN_window2). ``ls-files`` is the last
+    child; then ONE ``no_process()`` whose answer is only noted (the kill erases that evidence), ``quiesce`` again,
+    and ``root_hash(repo_fd, entries)`` (:func:`hash_worktree_at`, returns the bytes hashed) replaces the lstat pass
+    and the ``hash-object`` children, so nothing is launched into the slot after the proof. The closing
+    ``no_process()`` is then unchanged and any process it sees refuses. With ``root_hash`` None (Linux) the window
+    after the last child is a pure detection, as it always was."""
     if kind not in RD.READSET_KINDS:
         return None
     window = kind == "dispatch"
@@ -651,24 +741,35 @@ def clone_check(sfd: int, kind: str, run: Callable[[Tuple[str, ...], int], bytes
     if len(entries) > READSET_PATHS_MAX:
         raise CheckFailed(f"(b) ls-files: {len(entries)} entries, past the read set's {READSET_PATHS_MAX}")
     check_index(entries)
+    if root_hash is not None:
+        if quiesce is None:
+            raise ValueError("clone_check: root_hash needs the quiesce that proves its window")
+        if not no_process():
+            _note("window 2: slot-uid process(es) present before the quiesce")
+        quiesce()
     try:
         repo = os.open("repo", os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC, dir_fd=sfd)
     except OSError as e:
         raise CheckFailed(f"(b) repo: not a plain directory (errno {e.errno})") from None
     try:
-        size = check_worktree(repo, entries)
+        if root_hash is not None:
+            size, nbatches = root_hash(repo, entries), 0
+        else:
+            size = check_worktree(repo, entries)
     finally:
         os.close(repo)
-    batches = hash_batches([ent.path for ent in entries], spec_base(), cap)
-    got: List[str] = []
-    for batch in batches:
-        got += _hash_ids(run(wall.hash_object_argv(batch), ID_LINE_BYTES * len(batch)), len(batch))
-    for ent, h in zip(entries, got):
-        if ent.sha != h:
-            raise CheckFailed(f"(b) {_name(ent.path)}: blob {ent.sha[:12]} != worktree --no-filters {h[:12]}")
+    if root_hash is None:
+        batches = hash_batches([ent.path for ent in entries], spec_base(), cap)
+        nbatches = len(batches)
+        got: List[str] = []
+        for batch in batches:
+            got += _hash_ids(run(wall.hash_object_argv(batch), ID_LINE_BYTES * len(batch)), len(batch))
+        for ent, h in zip(entries, got):
+            if ent.sha != h:
+                raise CheckFailed(f"(b) {_name(ent.path)}: blob {ent.sha[:12]} != worktree --no-filters {h[:12]}")
     if not no_process():
         raise CheckFailed("window: a slot-uid process is alive after the last check child")
-    return CheckStats(len(entries), len(batches), size)
+    return CheckStats(len(entries), nbatches, size)
 
 
 def _run_check(ctx: H.Ctx, a: R.Alloc, argv: Tuple[str, ...], bound: int) -> bytes:
@@ -703,10 +804,11 @@ def _no_slot_process(ctx: H.Ctx, a: R.Alloc) -> bool:
 
 
 def _window_quiesce(ctx: H.Ctx, a: R.Alloc) -> Optional[Callable[[], None]]:
-    """The clone check's first-window quiesce: macOS only (Linux has no per-uid launchd agent, its window is the
-    session cgroup and stays byte-for-byte as it was). :func:`kill_domain` (``proc.end_domain``: the launchd domain
-    booted out), the same ending identity capture uses; unproven, or a bootout that raises (a Refused or OSError the
-    caller turns into ``clone-failed``), is a refusal, never a pass."""
+    """The clone check's quiesce, run twice on macOS (before window 1's proof and after ``ls-files``, the last
+    ``asuser`` child): macOS only (Linux has no per-uid launchd agent, its window is the session cgroup and stays
+    byte-for-byte as it was). :func:`kill_domain` (``proc.end_domain``: the launchd domain booted out), the same ending
+    identity capture uses; unproven, or a bootout that raises (a Refused or OSError the caller turns into
+    ``clone-failed``), is a refusal, never a pass."""
     if ctx.seams.host == "linux":
         return None
 
@@ -715,6 +817,13 @@ def _window_quiesce(ctx: H.Ctx, a: R.Alloc) -> Optional[Callable[[], None]]:
         if not res.proven:
             raise CheckFailed(f"window: the slot uid's launchd domain was not proven ended: {res.name}")
     return quiesce
+
+
+def _root_hasher(ctx: H.Ctx, a: R.Alloc) -> Optional[Callable[[int, Sequence[IndexEntry]], int]]:
+    """macOS only: root's own hash of the worktree (:func:`hash_worktree_at`) as the slot uid's files; Linux None."""
+    if ctx.seams.host == "linux":
+        return None
+    return lambda repo_fd, entries: hash_worktree_at(repo_fd, entries, a.slot_uid)
 
 
 def _discard_clone(ctx: H.Ctx, a: R.Alloc, what: str) -> Optional[str]:
@@ -896,7 +1005,7 @@ def _start_fenced(ctx: H.Ctx, a: R.Alloc, cap: Optional[VendorCapture] = None) -
             with ctx.store.dir("live", a.session) as sfd:
                 clone_check(sfd, a.kind, lambda av, bound: _run_check(ctx, a, av, bound),
                             lambda: _no_slot_process(ctx, a), spec_base=lambda: _hash_spec_base(ctx, a),
-                            quiesce=_window_quiesce(ctx, a))
+                            quiesce=_window_quiesce(ctx, a), root_hash=_root_hasher(ctx, a))
             passed = True
         except (CheckFailed, Refused, OSError) as err:
             # A listing or launch refusal inside the check is a failed check too: the clone is never kept unproven.
