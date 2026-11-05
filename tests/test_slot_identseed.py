@@ -482,6 +482,31 @@ def test_a_read_fault_on_the_record_is_bad_identity_seed(env, monkeypatch):
     assert line["refused"] == "bad-identity-seed", line
 
 
+def test_a_fault_on_the_keep_directorys_fstat_is_bad_identity_seed(env, monkeypatch):
+    """L3 on landing 9f (complement LOW, codex LOW, deepseek LOW): the reader's directory fstat sat outside the
+    OSError translation, so an EIO there escaped as a raw OSError (the helper's ``internal`` exit)."""
+    w, la = env
+    w.give_credential(E0, "claude")
+    s = _prepared(w, "egress", "interactive", "claude", "passthrough")
+    w.session = s
+    real_open, real_fstat, seen = os.open, os.fstat, {}
+
+    def op(path, *a, **k):
+        fd = real_open(path, *a, **k)
+        if path == "keep":
+            seen["kfd"] = fd                                 # the reader opens keep/ by this name, once
+        return fd
+
+    def fs(fd):
+        if fd == seen.get("kfd"):
+            raise OSError(5, "injected")
+        return real_fstat(fd)
+    monkeypatch.setattr(os, "open", op)
+    monkeypatch.setattr(os, "fstat", fs)
+    line = w.main(["render", s], _blob(vendor="claude", routes=PASS))[1]
+    assert seen and line["refused"] == "bad-identity-seed", line
+
+
 def test_every_identity_gated_session_is_egress_class():
     """F-C (complement LOW, gemini MED): render seeds only ``if egress and ... identity_gated``; start's gate has no
     egress term. That holds only while no passthrough session can be prepared on a none-class slot: prepare's

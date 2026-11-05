@@ -2150,7 +2150,12 @@ def read_identity_seed(ctx: Ctx, a: R.Alloc) -> Optional[Dict[str, object]]:
                 return None
             raise
     try:
-        if not ctx.seams.trusted(os.fstat(kfd)):
+        try:
+            kst = os.fstat(kfd)
+        except OSError as e:
+            # L3 (land9f; complement, codex, deepseek): the directory's own fstat is this function's refusal too
+            raise Refused("bad-identity-seed", f"keep: {e.strerror or e}") from None
+        if not ctx.seams.trusted(kst):
             raise Refused("bad-identity-seed", f"slots/{tag}/keep: owner")
         try:
             fd = os.open(E.IDENTITY_SEED_NAME, _SEED_FLAGS, dir_fd=kfd)
