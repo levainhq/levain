@@ -1226,7 +1226,8 @@ def _marker(a: R.Alloc) -> bytes:
     return canon.canonical_bytes({"lease_seq": a.lease_seq, "session": a.session})
 
 
-def scrub_and_release(ctx: H.Ctx, a: R.Alloc) -> Optional[bool]:
+def scrub_and_release(ctx: H.Ctx, a: R.Alloc, *,
+                      front_dead: Optional[Callable[[int], None]] = None) -> Optional[bool]:
     """§7.3 ``slot: LEASED -> SCRUBBED -> REUSABLE``. Under the SLOT lock only, and only while root's slot state file
     shows this slot leased to THIS session at alloc's ``lease_seq``: proc.scrub (macOS: :func:`proc.end_domain` on
     every uid of the slot, the gateway's under ``front.lock`` waited for up to :data:`FRONT_LOCK_WAIT_S`; Linux: the
@@ -1239,7 +1240,11 @@ def scrub_and_release(ctx: H.Ctx, a: R.Alloc) -> Optional[bool]:
     slot stays leased to a RETAINED session with no process, which the reaper's pass rule ("leased + RETAINED + alloc
     -> SCRUB again") owns. DECISION: a slot that has already left this lease (a second teardown, the reaper first) is
     not touched and not refused, and answers ``None`` (nothing of this lease was left to release). A verifier pair has no gateway uid: its child takes that place, with no
-    ``front.lock`` (it has no front)."""
+    ``front.lock`` (it has no front).
+
+    ``front_dead(gw_uid)`` (an egress slot only, ``teardown``'s tunnel read): called once proc.scrub has PROVEN the
+    gateway uid process-free, still under the slot lock with the state naming this lease, so the slot's front log
+    can no longer grow and is not yet another session's. Not called when the slot left this lease or scrub refused."""
     seams = ctx.seams
     slot = a.slot
     ids = H.slot_ids(ctx, slot)
@@ -1255,6 +1260,8 @@ def scrub_and_release(ctx: H.Ctx, a: R.Alloc) -> Optional[bool]:
         seams.at("scrubbed")
         gw_lock = (lambda: front_lock(ctx, slot, FRONT_LOCK_WAIT_S)) if egress else None
         PR.scrub(ids[first], ids[second], seams=seams.proc_seams, gw_lock=gw_lock)   # type: ignore[arg-type]
+        if egress and front_dead is not None:
+            front_dead(ids[second])
         if egress:
             with front_lock(ctx, slot, FRONT_LOCK_WAIT_S):
                 if ctx.store.read(("slots", slot.tag), FRONT_REVOKED) == _marker(a):
@@ -1312,7 +1319,8 @@ def teardown(ctx: H.Ctx, req: RuntimeRequest, blob: None) -> Dict[str, object]:
     """END (§7.4) then SCRUBBED. ``{ok, state}`` (§5.1's Out column) with the state END left the record in:
     ``RETAINED``, or ``HELD`` (the slot stays leased; ``failed_step`` is in the record, CONTROL's STATUS shows it).
     A RETAINED end whose SCRUB lost the pool TRY (the slot stays leased to this session) adds ``released: false``
-    (H7); a slot that had already left this lease answers as before.
+    (H7); a slot that had already left this lease answers as before. A RETAINED egress end may add ``tunnel_bytes``,
+    read once SCRUB proved the front's uid gone (absent when the slot had left this lease or the log has no total).
     DECISION: a HELD end answers ``ok`` with ``state:"HELD"`` (the Out column's shape carries the state for this),
     while a refusal (END busy, a CAS CONTROL never took, processes surviving SCRUBBED) answers ``ok:false``."""
     assert req.session is not None
@@ -1332,33 +1340,27 @@ def teardown(ctx: H.Ctx, req: RuntimeRequest, blob: None) -> Dict[str, object]:
         raise Refused("end-cas-not-sent", str(e)[:256]) from None
     if out != R.RETAINED:
         return {"state": out}
-    # END's per-uid "no process left" proof returned: the front cannot append any more, so this is the one moment the
-    # session's final tunnel total is final. Read it before SCRUB can release the slot to another session.
-    tunnel = _final_tunnel_bytes(ctx, a)
+    # END proved the SLOT uid gone, not the front: the gateway is a separate uid and may still be relaying (and log a
+    # later, larger total). The total is read only inside SCRUB, once proc.scrub has proven the gateway uid gone too
+    # and before the slot is released to another session (``front_dead``). A slot that already left this lease, or a
+    # SCRUB that refuses, reads nothing: the key is absent and usage settles at the reservation (over-debit, the safe
+    # side). OPEN (not closed here): the front logs a tunnel only when it ends, so a tunnel still open when SCRUB
+    # SIGKILLs the front (Linux) has no line, and the total read here can omit its bytes.
     seams.at("scrub")
+    got: Dict[str, int] = {}
+
+    def front_dead(front_uid: int) -> None:
+        v = H.read_session_tunnel_total(ctx.store, a.slot, front_uid, a.session)   # never raises; None = unreadable
+        if v is not None:
+            got["tunnel_bytes"] = v
+
     ans: Dict[str, object] = {"state": R.RETAINED}
-    if scrub_and_release(ctx, a) is False:
+    if scrub_and_release(ctx, a, front_dead=front_dead) is False:
         # The record is RETAINED either way; the slot stays leased to it (the pool TRY lost), and the reaper's pass
         # owns the next SCRUB.
         ans["released"] = False
-    if tunnel is not None:
-        ans["tunnel_bytes"] = tunnel
+    ans.update(got)
     return ans
-
-
-def _final_tunnel_bytes(ctx: H.Ctx, a: R.Alloc) -> Optional[int]:
-    """``tunnel_bytes`` of ``teardown``'s answer (CONTRACT §5.1): the session's OWN last ``passthrough_total`` in its
-    slot's front log, read through the trusted walk (:func:`levain.slot.runtime_helper.read_session_tunnel_total`),
-    for an egress session only. None (the key is absent) when the slot has no front, the walk refuses, the log is
-    unreadable or holds no record of this session. Never raises: a reading that fails must not fail the END."""
-    try:
-        slot = a.slot
-        if slot.slot_class != "egress":
-            return None
-        front_uid = H.slot_ids(ctx, slot)[slot.accounts[1]]
-        return H.read_session_tunnel_total(ctx.store, slot, front_uid, a.session)
-    except Exception:  # noqa: BLE001
-        return None
 
 
 __all__ = ["CheckFailed", "CheckStats", "EXEC_MARKER_S", "FORWARDER_READY_S", "FRONT_LOCK", "FRONT_LOCK_WAIT_S",

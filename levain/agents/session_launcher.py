@@ -50,6 +50,7 @@ Nothing imports this module from an entry point, and :class:`~levain.agents.sess
 """
 from __future__ import annotations
 
+import contextlib
 import fcntl
 import hashlib
 import json
@@ -60,7 +61,7 @@ import secrets
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Callable, Mapping, Protocol, runtime_checkable
+from typing import Any, Callable, Iterator, Mapping, Protocol, runtime_checkable
 
 from levain.agents import controller as _ctl
 from levain.agents.accounting import StopResult, Usage
@@ -311,9 +312,7 @@ class SessionIndex:
         wins (the other then reads the winner's record, which is not retakable)."""
         if self.create(key, state, **fields):
             return True
-        lock = os.open(self.dir / f".{key}.lock", os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW | os.O_CLOEXEC, 0o600)
-        try:
-            fcntl.flock(lock, fcntl.LOCK_EX)
+        with self.locked(key):
             try:
                 rec = self.get(key)
             except ValueError:
@@ -324,6 +323,17 @@ class SessionIndex:
                 return False
             self.put(key, state, **fields)
             return True
+
+    @contextlib.contextmanager
+    def locked(self, key: str) -> Iterator[None]:
+        """The key's exclusive ``flock`` (``.<key>.lock``): :meth:`claim`'s retakes and the END's ``ended`` write
+        (:meth:`RealLauncher._mark_ended`) read-then-write under it. Not re-entrant: a holder never takes it again."""
+        self._path(key)                                  # the key grammar, before a lock file is named after it
+        self.dir.mkdir(parents=True, exist_ok=True)
+        lock = os.open(self.dir / f".{key}.lock", os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW | os.O_CLOEXEC, 0o600)
+        try:
+            fcntl.flock(lock, fcntl.LOCK_EX)
+            yield
         finally:
             os.close(lock)
 
@@ -341,6 +351,11 @@ class SessionIndex:
 
 def _count(v: object) -> int | None:
     return v if type(v) is int and v >= 0 else None
+
+
+def _count_i64(v: object) -> int | None:
+    """A published tunnel total: an int in 0..2**63-1, else None."""
+    return v if type(v) is int and 0 <= v <= 2**63 - 1 else None
 
 
 _monotonic = time.monotonic
@@ -743,18 +758,33 @@ class RealLauncher:
         """S1 END proved the session's group gone: record it ``ended`` (the record's fields, with ``known`` ones such
         as the run id and session over them), so usage reads the sources and a later stop needs no second END. True
         when it is recorded, or there is nothing to record (an ``ended`` record, a zero record, no record); False when
-        the write failed (the record stays as it was, usage reads the caps; the caller retries)."""
+        the write failed (the record stays as it was, usage reads the caps; the caller retries).
+
+        The read and the write are ONE step under the key's lock (:meth:`SessionIndex.locked`), and ``tunnel_bytes``
+        only ever grows onto a record: two launchers stopping one session cannot have the second erase the first's
+        published total. An ``ended`` record that lacks a valid total is enriched by a later writer that has one; an
+        ``ended`` record that has one is never rewritten."""
         try:
-            rec = self.index.get(key)
-            if rec is None or rec["state"] not in ("pending", "minted", "started"):
+            with self.index.locked(key):
+                rec = self.index.get(key)
+                if rec is None:
+                    return True
+                if rec["state"] == "ended":
+                    if _count_i64(rec.get("tunnel_bytes")) is None:
+                        tunnel = self._final_tunnel_bytes(rec.get("session"))
+                        if tunnel is not None:
+                            fields = {k: v for k, v in rec.items() if k not in ("format", "key", "state")}
+                            self.index.put(key, "ended", **{**fields, "tunnel_bytes": tunnel})
+                    return True
+                if rec["state"] not in ("pending", "minted", "started"):
+                    return True
+                fields = {k: v for k, v in rec.items() if k not in ("format", "key", "state")}
+                merged = {**fields, **known, "ended_s": self.clock()}
+                tunnel = self._final_tunnel_bytes(merged.get("session"))
+                if tunnel is not None:
+                    merged["tunnel_bytes"] = tunnel
+                self.index.put(key, "ended", **merged)
                 return True
-            fields = {k: v for k, v in rec.items() if k not in ("format", "key", "state")}
-            merged = {**fields, **known, "ended_s": self.clock()}
-            tunnel = self._final_tunnel_bytes(merged.get("session"))
-            if tunnel is not None:
-                merged["tunnel_bytes"] = tunnel
-            self.index.put(key, "ended", **merged)
-            return True
         except Exception:  # noqa: BLE001
             _log.warning("the END of session %s could not be recorded", key)
             return False
@@ -770,7 +800,7 @@ class RealLauncher:
             v = reader(session)
         except Exception:  # noqa: BLE001
             return None
-        return v if type(v) is int and 0 <= v <= 2**63 - 1 else None
+        return _count_i64(v)
 
     def _ended_on_record(self, key: str) -> bool:
         """Whether the durable record says a proven END (this launcher's or another's). Read through every time."""

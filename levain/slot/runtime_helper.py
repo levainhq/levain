@@ -717,8 +717,10 @@ def read_session_tunnel_total(store: "Store", slot: SlotId, front_uid: int, sess
     trusted walk :func:`prepare_front_log` makes (:func:`_open_front_log_dir`: ``L/gw/`` through ``trusted=True``,
     ``L/gw/slot<n>/`` held to the front account's alone and opened ``O_NOFOLLOW|O_DIRECTORY`` only if it is the dir
     judged), then ``front.log`` opened ``O_NOFOLLOW`` BELOW that fd and held to a regular file with one link owned by
-    the front account or root (what prepare left it). Any refusal of the walk, a link, a replaced or foreign file, an
-    unreadable log or no record of ``session``: None. Never raises."""
+    the front account or root (what prepare left it). Any refusal of the walk (``Refused``), a link, a replaced or
+    foreign file, an unreadable log (``OSError``) or no record of ``session``: None. Anything else (a programming
+    error) propagates; it is not read as an absent total. Root calls this only after SCRUB proved the front's uid gone
+    (``start.teardown``)."""
     try:
         dfd = _open_front_log_dir(store, slot, front_uid)
         if dfd is None:
@@ -735,7 +737,7 @@ def read_session_tunnel_total(store: "Store", slot: SlotId, front_uid: int, sess
                 os.close(f)
         finally:
             os.close(dfd)
-    except Exception:
+    except (Refused, OSError):
         return None
 
 

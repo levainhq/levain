@@ -787,9 +787,11 @@ def test_f9_the_mapping_reads_the_answers_the_helpers_teardown_returns():
     import inspect
     from levain.slot import start as SS
     src = inspect.getsource(SS.teardown)
-    # S10b C: the RETAINED answer is built in one place and may carry ``tunnel_bytes`` beside ``released: false``
+    # S10b C: the RETAINED answer is built in one place and may carry ``tunnel_bytes`` beside ``released: false``;
+    # FIX ROUND 1: the total is read inside SCRUB, once the front's uid is proven gone (``front_dead``)
     assert 'return {"state": out}' in src and 'ans["released"] = False' in src
-    assert 'ans: Dict[str, object] = {"state": R.RETAINED}' in src and 'ans["tunnel_bytes"] = tunnel' in src
+    assert 'ans: Dict[str, object] = {"state": R.RETAINED}' in src and 'got["tunnel_bytes"] = v' in src
+    assert 'scrub_and_release(ctx, a, front_dead=front_dead)' in src
 
 
 def test_f9_a_stop_after_a_proven_abort_answers_from_the_record_not_a_second_end(tmp_path):

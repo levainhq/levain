@@ -27,8 +27,10 @@ def _count(v: object) -> Optional[int]:
 
 def _default_read_total(path: object, session: str) -> Optional[int]:
     """The session's OWN final ``passthrough_total`` in a slot tunnel log: the one reader now lives in
-    ``levain.slot.runtime_helper`` (:func:`~levain.slot.runtime_helper.read_session_total`), which root's END also
-    uses; this is its re-import under the S10d name. None when absent."""
+    ``levain.slot.runtime_helper`` (:func:`~levain.slot.runtime_helper.read_session_total`); this is its re-import
+    under the S10d name, opening ``path`` with ``O_NOFOLLOW`` at the leaf only. Root's END does NOT use this path
+    reader: it uses :func:`~levain.slot.runtime_helper.read_session_tunnel_total` (the trusted walk), and a new caller
+    resolving a slot log should too. None when absent."""
     from levain.slot.runtime_helper import read_session_total
     return read_session_total(path, session)
 
