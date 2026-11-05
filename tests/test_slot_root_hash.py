@@ -7,6 +7,8 @@ from __future__ import annotations
 import contextlib
 import os
 import subprocess
+import sys
+import threading
 
 import pytest
 
@@ -231,48 +233,88 @@ def test_a_mode_outside_the_blob_modes_is_check_failed(tree):
         hash_of(tree, [entry(repo, "a", "100664")])
 
 
+def _site(frame) -> tuple[str, str]:
+    """``(file, function)`` of a frame: who made a faulted call."""
+    return frame.f_code.co_filename, frame.f_code.co_name
+
+
+def _eio_read(faults):
+    """A ``read`` seam that fails with EIO and records its immediate caller (the product's call site)."""
+    def read(*_a, **_k):
+        faults.append(_site(sys._getframe(1)))
+        raise OSError(5, "EIO")
+    return read
+
+
 @contextlib.contextmanager
-def _failing_os(monkeypatch, seam, eio):
-    """``os.<seam>`` fails with ``eio`` only inside this block (``read`` is a parameter of the hash, not an ``os``
-    attribute, so it is not patched here). History: a process-wide ``os.fstat`` that always raised also failed
-    callers outside the hash (CI 2026-11-05, py3.12 and 3.13 on Linux: an ``EIO`` surfaced with no frame of the test
-    or the product above it, so it came from a caller of ``os.fstat`` that is not ours); the wrapper delegates to the
-    real call outside the block, so only the product's own call site is faulted."""
+def _failing_os(monkeypatch, seam):
+    """``os.<seam>`` fails with EIO only for the thread that armed this block, and only inside it; yields ``faults``,
+    the ``(file, function)`` of the immediate caller of each faulted call (``read`` is a parameter of the hash, not
+    an ``os`` attribute, so it is not patched here; its test passes :func:`_eio_read` with the same list).
+    History: a process-wide ``os.fstat`` that always raised also failed callers outside the hash (CI 2026-11-05,
+    py3.12 and 3.13 on Linux: an ``EIO`` surfaced with no frame of the test or the product above it, so it came from
+    a caller of ``os.fstat`` that is not ours). Armed-only fixed the time axis (L3_land6b_r1); the thread check fixes
+    the other axis, since the patch is process-global and another thread inside the window would receive the
+    fault, and the recorded caller lets a test prove the fault landed at the product's seam rather than anywhere."""
+    faults: list[tuple[str, str]] = []
     if seam == "read":
-        yield
+        yield faults
         return
     real = getattr(os, seam)
+    owner = threading.get_ident()
     armed = []
 
     def wrapper(*a, **k):
-        return eio(*a, **k) if armed else real(*a, **k)
+        if armed and threading.get_ident() == owner:
+            faults.append(_site(sys._getframe(1)))
+            raise OSError(5, "EIO")
+        return real(*a, **k)
     monkeypatch.setattr(os, seam, wrapper)
     armed.append(True)
     try:
-        yield
+        yield faults
     finally:
         armed.clear()
 
 
 @pytest.mark.parametrize("seam", ["dup", "fstat", "read"])
 def test_an_oserror_is_check_failed(tree, monkeypatch, seam):
-    """L3_win2_r1 gemini LOW: every failure of the pass is ``CheckFailed`` (clone_check's contract)."""
+    """L3_win2_r1 gemini LOW: every failure of the pass is ``CheckFailed`` (clone_check's contract). L3_land6b_r1:
+    the first fault must come from the product's own call site, not any other caller of the patched function."""
     _, repo = tree
     put(repo, "d/a", b"a\n")
     ents = [entry(repo, "d/a")]
 
-    hits = []
-
-    def eio(*a, **_k):
-        hits.append(a)
-        raise OSError(5, "EIO")
-    kw = {}
-    if seam == "read":
-        kw["read"] = eio
     with pytest.raises(SS.CheckFailed, match="root hash failed \\(errno 5\\)"):
-        with _failing_os(monkeypatch, seam, eio):
+        with _failing_os(monkeypatch, seam) as faults:
+            kw = {"read": _eio_read(faults)} if seam == "read" else {}
             hash_of(tree, ents, **kw)
-    assert hits, f"the {seam} fault never reached the hash: the test proved nothing"
+    assert faults, f"the {seam} fault never reached the hash: the test proved nothing"
+    first_file, first_func = faults[0]
+    assert first_file.endswith("levain/slot/start.py"), (
+        f"the first {seam} fault came from {first_file}:{first_func}, not the root-hash seam in levain/slot/start.py")
+
+
+def test_the_fault_reaches_only_the_arming_thread(monkeypatch):
+    """The wrapper is a process-global patch: a second thread calling ``os.fstat`` while the block is armed gets the
+    real answer, while this thread's own call is faulted in the same window (so the pass cannot be vacuous)."""
+    other: dict = {}
+
+    def worker():
+        try:
+            other["result"] = os.fstat(0)
+        except BaseException as e:
+            other["error"] = e
+    with _failing_os(monkeypatch, "fstat") as faults:
+        t = threading.Thread(target=worker)
+        t.start()
+        t.join(10)
+        assert not t.is_alive()
+        with pytest.raises(OSError):
+            os.fstat(0)
+    assert "error" not in other, f"the other thread received the fault: {other['error']!r}"
+    assert isinstance(other["result"], os.stat_result)
+    assert len(faults) == 1, "only the arming thread's call is a fault"
 
 
 def test_absent_file_refuses(tree):
