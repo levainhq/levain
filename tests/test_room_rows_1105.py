@@ -47,15 +47,15 @@ def _stream():
     return [threads._item(r, facts, done) for r in rows]
 
 
-def _boot():
+def _boot(stream=None):
     return ('window.__body = {room_thread: "t1", composer: {state: "writable"}, model: "m", stream: %s, proposals: [], room_error: null};\n'
             'const stub = (u, o) => Promise.resolve({status: 200, ok: true, text: () => Promise.resolve(JSON.stringify(window.__body))});\n'
             'window.__rv = LevainRoomView.mount(document.getElementById("host"), {pollMs: 0, storage: null, speech: null, fetch: stub, headers: () => ({})});'
-            % json.dumps(_stream()))
+            % json.dumps(_stream() if stream is None else stream))
 
 
-def _assets():
-    return {"/rvc.html": ("text/html; charset=utf-8", _PAGE.encode()), "/rvc.js": ("text/javascript; charset=utf-8", _boot().encode())}
+def _assets(stream=None):
+    return {"/rvc.html": ("text/html; charset=utf-8", _PAGE.encode()), "/rvc.js": ("text/javascript; charset=utf-8", _boot(stream).encode())}
 
 
 _LOOK = """(() => {
@@ -129,6 +129,96 @@ def test_the_rooms_replies_show_bold_and_code_as_elements_and_nothing_else_is_pa
     assert g["fencedStrong"] == ["intro"] and g["fencedCodesOutside"] == ["t"], g
     assert g["rawB"] == 0                                              # <b> is text, never an element
     assert g["yourMarkup"] == 0 and g["yourText"] == YOURS             # his own line is plain
+
+
+_DUMP = """(() => JSON.stringify([...document.querySelectorAll('.rv-line')].map(n => ({
+  head: n.querySelector('.rv-who').textContent, text: (n.querySelector('.rv-text') || {}).textContent || null}))))()"""
+
+
+def _results(*bodies):
+    return [threads._item(_row(i + 1, "vendor_tool_result", "vendor", "tool_result:toolu_x%d" % i, "L1", b), {}, set())
+            for i, b in enumerate(bodies)]
+
+
+def _lines(tmp_path, w, stream, want):
+    with _serve_room(tmp_path, w, extra_assets=_assets(stream)) as (base, _h):
+        out = _drive(tmp_path, base + "/rvc.html", [{"until": "document.querySelectorAll('.rv-line').length >= %d" % want}, {"eval": _DUMP}])
+    return json.loads(out["values"][1])
+
+
+HTML = "<html><body>Hello</body></html>"
+RESP = "<response>v</response>"
+OUTSIDE = ("/etc/hosts is outside /tmp/real1/cwd; the permissions.blockReadsOutsideWorkingDirectories setting blocks reads outside "
+           "the working directories. Ask the user to add the directory with /add-dir, or to remove that setting.")
+
+
+@needs_browser
+def test_only_the_vendors_error_tag_is_removed_and_any_other_body_is_drawn_as_recorded(tmp_path, w):
+    g = _lines(tmp_path, w, _results(HTML, RESP, "<tool_use_error>X</tool_use_error>\nextra"), 3)
+    assert g[0]["text"] == HTML and g[1]["text"] == RESP, g           # a file that is one tag pair is not stripped
+    assert g[0]["head"].startswith("A tool result") and g[1]["head"].startswith("A tool result"), g
+    assert g[2]["text"] == "X\nextra" and g[2]["head"].startswith("A tool failed"), g    # the tag goes, the words after it stay
+
+
+@needs_browser
+def test_a_tool_is_called_refused_only_by_the_vendors_own_refusal_sentences(tmp_path, w):
+    wrap = lambda t: "<tool_use_error>%s</tool_use_error>" % t
+    bodies = [wrap("File is in a directory that is denied by your permission settings."), wrap("Permission to use Bash has been denied."),
+              wrap(OUTSIDE), wrap("File not found: /home/permissions/x"), wrap("This was refused by the shell"), OUTSIDE]
+    g = _lines(tmp_path, w, _results(*bodies), 6)
+    assert [x["head"].split(" — ")[0] for x in g] == ["A tool was refused"] * 3 + ["A tool failed"] * 2 + ["A tool result"], g
+    # the untagged denial (the vendor sends it without the wrapper) reads "A tool result": is_error is not carried through the
+    # timeline, a known edge pinned here so a change to it is deliberate
+
+
+@needs_browser
+def test_an_empty_call_is_hidden_only_when_the_tool_is_known_to_have_finished(tmp_path, w):
+    facts = {("L1", "tool_call:11"): ("toolu_11", 0, 0), ("L1", "tool_call:12"): ("toolu_12", 0, 0)}
+    rows = [_row(10, "vendor_tool_call", "vendor", "tool_call:10", "L1", None),     # no facts: no tool object
+            _row(11, "vendor_tool_call", "vendor", "tool_call:11", "L1", None),     # finished
+            _row(12, "vendor_tool_call", "vendor", "tool_call:12", "L1", None)]     # running
+    stream = [threads._item(r, facts, {("L1", "toolu_11")}) for r in rows]
+    assert "tool" not in stream[0] and stream[1]["tool"]["open"] is False and stream[2]["tool"]["open"] is True
+    g = _lines(tmp_path, w, stream, 2)
+    assert [x["head"] for x in g] == ["vendor tool call", "A tool is running"], g
+
+
+_BIG = """(async () => {
+  const body = %s;
+  const mk = (b) => ({gseq: 100, kind: "vendor_agent_text", source: "vendor", ref: "agent_text:100", launch_id: "L1", status: null, body: b, at: "2026-11-05T21:48:38+00:00"});
+  window.__body.stream = [mk(body)];
+  const t = performance.now(); await window.__rv.refresh(); const ms = performance.now() - t;
+  const n = document.querySelector('.rv-room .rv-text');
+  return JSON.stringify({ms, strong: n.querySelectorAll('strong').length, first: (n.querySelector('strong') || {}).textContent || null, same: n.textContent === body});
+})()"""
+
+
+def _timed(tmp_path, w, *bodies):
+    """Each JS expression in bodies is drawn as the room's one reply on the same mounted page; the in-page draw time and what came out."""
+    steps = [{"until": "document.querySelectorAll('.rv-line').length >= 7"}] + [{"eval": _BIG % b} for b in bodies]
+    with _serve_room(tmp_path, w, extra_assets=_assets()) as (base, _h):
+        out = _drive(tmp_path, base + "/rvc.html", steps)
+    return [json.loads(v) for v in out["values"][1:]]
+
+
+@needs_browser
+def test_a_huge_line_of_unpaired_bold_openers_renders_fast_and_a_line_past_20000_is_drawn_plain(tmp_path, w):
+    huge, over, under, worst = _timed(tmp_path, w, '"**a ".repeat(25000)',      # 100k characters on one line: ~10 s before the bound
+                                      '"**a**".repeat(5000)',                   # 25k characters, every pair would be bold: drawn plain
+                                      '"**a**".repeat(3000)',                   # 15k characters: the pass still runs
+                                      '"**a ".repeat(4999)')                    # 19996, just under the cap, every opener unpaired
+    assert huge["ms"] < 2000 and huge["strong"] == 0 and huge["same"] is True, huge
+    assert over["strong"] == 0 and over["same"] is True and over["ms"] < 2000, over
+    assert under["strong"] == 3000 and under["same"] is False and under["ms"] < 2000, under
+    assert worst["strong"] == 0 and worst["same"] is True and worst["ms"] < 2000, worst
+
+
+@needs_browser
+def test_an_empty_backtick_pair_is_not_a_code_span_to_the_bold_scan_either(tmp_path, w):
+    # the bold scan and the inner pass read the empty pair alike: the pair is two literal ticks, the second opens a span to the
+    # next tick (hiding the "b**" as a closer), so the one bold runs to the final "**"
+    (g,) = _timed(tmp_path, w, '"**a `` b** c ` d**"')
+    assert g["strong"] == 1 and g["first"] == "a ` b** c  d", g        # one literal tick, then " b** c " as code, then " d"
 
 
 def test_the_page_script_has_no_markup_sink():

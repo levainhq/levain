@@ -44,18 +44,25 @@
     return first.length > 120 ? first.slice(0, 120) + "..." : first;
   }
 
-  var WRAPPED = /^\s*<([A-Za-z_][\w-]*)>([\s\S]*?)<\/\1>\s*$/;
-  // text whose whole body is one plain tag pair (no attributes) is its inner text and that tag's name; any other text is itself
+  var WRAPPED = /^\s*<tool_use_error>([\s\S]*?)<\/tool_use_error>([\s\S]*)$/;
+  // Only the vendor's own error wrapper is removed: a body that opens with <tool_use_error>inner</tool_use_error> is its inner
+  // text (then any text after the tag, on a new line) and the tag's name. Every other body, including one that is a single
+  // other tag pair (a file or a command's output), is drawn exactly as recorded.
   function unwrap(text) {
     var m = WRAPPED.exec(text);
-    if (!m || m[2].indexOf("</" + m[1] + ">") >= 0) return { text: text, tag: "" };
-    return { text: m[2].trim(), tag: m[1] };
+    if (!m) return { text: text, tag: "" };
+    var rest = m[2].trim();
+    return { text: m[1].trim() + (rest ? "\n" + rest : ""), tag: "tool_use_error" };
   }
+  // the vendor's own refusal sentences, matched at the start of the unwrapped text (not a word anywhere in it)
+  var REFUSED = [/^File is in a directory that is denied by your permission settings/, /^Permission to use [^\n]*? has been denied/,
+                 /^[^\n]*? is outside [^\n]*?blocks reads outside/];
+  function refused(text) { return REFUSED.some(function (re) { return re.test(text); }); }
   // the head's words for a row: its speaker, else a short sentence for what the row is
   function headWords(l) {
     if (l.who) return l.who;
     if (l.kind === "vendor_tool_result") {
-      if (l.tag === "tool_use_error") return /denied|refused|not allowed|permission/i.test(l.text) ? "A tool was refused" : "A tool failed";
+      if (l.tag === "tool_use_error") return refused(l.text) ? "A tool was refused" : "A tool failed";
       return "A tool result";
     }
     if (l.tool) return l.tool.open ? "A tool is running" : "A tool ran";
@@ -81,10 +88,10 @@
       (ref.indexOf("error:hook_response:") === 0 && / success$/.test(text)));
     if (it.kind === "vendor_approval_request") text = "The room asked for something it cannot have; nothing was granted.";
     if (it.kind === "vendor_approval_resolved") text = "";
-    var open = it.tool ? it.tool.open === true : false;
     // a call that has finished and has no words of its own is an empty chip: the result row beside it shows the outcome.
-    // A call still open keeps its row, because that it is running is live information.
-    var emptyDoneCall = it.kind === "vendor_tool_call" && !text && !open;
+    // A call still open keeps its row, because that it is running is live information; so does one with no tool facts at all
+    // (it is hidden only on an explicit completion, never on missing state).
+    var emptyDoneCall = it.kind === "vendor_tool_call" && !text && !!it.tool && it.tool.open === false;
     return {
       gseq: it.gseq, ref: ref, at: it.at || "",
       who: you ? "You" : (room ? "The room" : ""), cls: you ? "rv-you" : (room ? "rv-room" : (it.kind === "vendor_error" ? "rv-error" : "")),
@@ -137,15 +144,18 @@
 
   // A message's words become DOM here and nowhere as markup: plain text, plus one shape, a fenced block (a line opening with
   // three backticks to the line closing with three), drawn as <pre><code> from the lines between. An unclosed fence (a reply
-  // still streaming) stays plain text, backticks and all; nothing else is parsed.
-  // The room's own replies also get an inline pass over their non-code text, built as elements and never as markup: **bold**
-  // (which may hold `code`) and `code`. A marker with no partner on its line stays literal, and nothing else is parsed
-  // (no links, no images, no HTML, no lists).
+  // still streaming) stays plain text, backticks and all.
+  // The room's own replies (and only those) also get an inline pass over their non-code text, built as elements and never as
+  // markup: **bold** (which may hold `code`) and `code`, each within one line. A marker with no partner on its line stays
+  // literal, a line longer than LONG_LINE is drawn plain (the pass is quadratic in a line's length), and nothing else is
+  // parsed (no links, no images, no HTML, no lists); the words of tools and of the operator get no inline pass at all.
+  var LONG_LINE = 20000;
   function closeBold(s, from) {
-    for (var k = from; k < s.length; k++) {
+    var eol = s.indexOf("\n", from);
+    if (eol < 0) eol = s.length;
+    for (var k = from; k < eol; k++) {
       var c = s.charAt(k);
-      if (c === "\n") return -1;
-      if (c === "`") { var e = s.indexOf("`", k + 1); if (e > k && s.slice(k, e).indexOf("\n") < 0) { k = e; continue; } }
+      if (c === "`") { var e = s.indexOf("`", k + 1); if (e > k + 1 && e < eol) { k = e; continue; } }
       if (c === "*" && s.charAt(k + 1) === "*" && !/\s/.test(s.charAt(k - 1))) return k;
     }
     return -1;
@@ -166,6 +176,13 @@
     }
     flush();
   }
+  // the inline pass one line at a time (no marker pairs across a newline); a line over LONG_LINE is drawn plain
+  function richText(doc, node, text) {
+    text.split("\n").forEach(function (ln, n) {
+      if (n) node.appendChild(doc.createTextNode("\n"));
+      if (ln.length > LONG_LINE) node.appendChild(doc.createTextNode(ln)); else inline(doc, node, ln, false);
+    });
+  }
   function fillText(doc, node, text, rich) {
     var lines = text.split(/\r?\n/), parts = [], cur = [], i = 0;
     while (i < lines.length) {
@@ -180,13 +197,13 @@
       }
       cur.push(lines[i]); i++;
     }
-    if (!parts.length) { if (rich) inline(doc, node, text, false); else node.textContent = text; return; }
+    if (!parts.length) { if (rich) richText(doc, node, text); else node.textContent = text; return; }
     if (cur.length) parts.push({ code: false, text: cur.join("\n") });
     parts.forEach(function (p) {
       if (!p.code) {
         if (!p.text.replace(/\s+/g, "")) return;
         var plain = p.text.replace(/^\n+|\n+$/g, "");
-        if (rich) inline(doc, node, plain, false); else node.appendChild(doc.createTextNode(plain));
+        if (rich) richText(doc, node, plain); else node.appendChild(doc.createTextNode(plain));
         return;
       }
       var pre = el(doc, "pre", "rv-code"), code = el(doc, "code", null, p.text);
