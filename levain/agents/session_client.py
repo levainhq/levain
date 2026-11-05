@@ -42,6 +42,12 @@ never ``done`` on a broken wire and keeps its slot for the reaper); ``usage`` th
 ``end_session`` that cannot be answered is ``StopResult(False, ...)``. A ``spawn`` that fails BEFORE the request is
 sent raises (nothing was allocated); one that fails after it returns a down child instead of raising, because the
 server may hold a session (the launcher contract: a launcher that cannot undo what it allocated must not raise).
+
+**Known edges** (LOW, kept by intent, none built against). The first exit a holder records stands: ``terminate`` and
+``abort`` never overwrite it, so an ``abort`` after a recorded exit returns that exit and sends no ABORT (the closed
+holder already cued the server's END), and an exit recorded unproven on a transport fault is not upgraded by a later
+proven one; the cost is a run that keeps its slot until the reaper's END proves it (``_RemoteProcess._publish``, pinned
+by ``test_a_recorded_exit_is_never_downgraded_by_a_later_abort_or_terminate``).
 """
 from __future__ import annotations
 

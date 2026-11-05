@@ -62,6 +62,12 @@ because another fire's SYNC can land between this fire's SYNC and its frame; a h
 client for that frame, so ``RELEASE`` judges the bar as it stands at RELEASE. The point-of-use check always judges
 the replica's WHOLE current replay, never the claimed prefix, so a revoke another fire SYNCed past the claimed head still refuses. A false bar or a withheld row is the power a process running as the operator
 already had over the live files; it can forge no signature and cannot roll the replica back (design 1104-28 section 2.4).
+
+**Known edges** (LOW, kept by intent, none built against). An END for a key whose LAUNCH has not yet registered marks
+nothing and answers unproven by name ("no session is recorded under this key"), never "ended", so the LAUNCH that follows
+is not refused and the caller's retry (the reaper's periodic END) is what reaches the session once it exists; a revoke
+that lands in that window is caught by ``start_run``'s release transaction, which aborts the child unreleased
+(``_end``, pinned by ``test_an_end_before_the_holder_registers_answers_a_named_unproven_inside_its_deadline``).
 """
 from __future__ import annotations
 
