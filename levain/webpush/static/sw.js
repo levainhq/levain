@@ -549,7 +549,8 @@ function applyBadge(n) {
 }
 
 // Whether the user agent holds the notification just asked for: getNotifications({tag}) lists one with this exact tag
-// (compared here too: an older WebKit ignored the filter and listed every notification of the app). 2026-11-05, ping 409:
+// AND this push's ping in its data (the tag is compared here too: an older WebKit ignored the filter and listed every
+// notification of the app). 2026-11-05, ping 409:
 // all four devices reported `shown` for a notification none of them displayed, because `shown` then meant only that
 // showNotification resolved, and a resolved promise is the UA accepting the request (WHATWG Notifications: the promise
 // resolves after the show steps hand it to the platform, with no check that it appeared). The LIMIT that remains: a page
@@ -558,7 +559,7 @@ function applyBadge(n) {
 // prove Phill SAW a ping may rest on `shown` alone: the evidence for that is a tap (notificationclick -> an `opens` row)
 // or his answer on the sheet. Absent, unlistable (no getNotifications, a throw, past the budget): no `shown`, and the
 // trace says `show-missing` with the tag's length and its leading word only (no content).
-async function heldByAgent(tag, b) {
+async function heldByAgent(tag, ping, b) {
   const miss = (why, count) => {
     trace('show-missing', { why, tagLen: tag.length, tagKind: (/^[A-Za-z]{1,16}/.exec(tag) || [''])[0], count: count == null ? null : count });
     return false;
@@ -569,7 +570,9 @@ async function heldByAgent(tag, b) {
     const list = await b.within(() => reg.getNotifications({ tag }));
     if (list === LATE) return miss('late');
     const all = Array.from(list || []);
-    return all.some((n) => n && n.tag === tag) || miss('absent', all.length);
+    // the tag alone is not enough: a re-ping reuses the ref as its tag (renotify), so an EARLIER ping's notification can sit
+    // under the same tag while the platform swallowed this one. The options carry data.ping; it must be this push's
+    return all.some((n) => n && n.tag === tag && n.data && Number(n.data.ping) === ping) || miss('absent', all.length);
   } catch (_) { return miss('error'); }
 }
 
@@ -603,8 +606,9 @@ self.addEventListener('push', (e) => {
     const hashP = endpointHash(b);   // one hash for this event's reports, asked now
     const tag = d.tag || 'levain';
     const r = await Promise.all([sendReceipt(ping, 'received', t0, b, hashP),
-                                 shown.then(() => heldByAgent(tag, b), () => false)
-                                   .then((held) => (held ? sendReceipt(ping, 'shown', Date.now(), b, hashP) : false))]);
+                                 shown.then(() => heldByAgent(tag, ping, b), () => false)
+                                   .then((held) => (held ? sendReceipt(ping, 'shown', Date.now(), b, hashP) : false))
+                                   .catch(() => false)]);   // total: a throw in this arm would reject Promise.all, and the budget's end would abort `received` too
     if (r.some((x) => x === true)) await drainReceipts(b);
   });
   e.waitUntil(Promise.allSettled([shown, badged, receipts]).finally(traceSettled));
