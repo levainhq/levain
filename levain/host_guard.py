@@ -30,7 +30,6 @@ import stat
 import sys
 import subprocess
 import tempfile
-import tomllib
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Literal, Mapping, Sequence
@@ -644,6 +643,7 @@ def _read_toml_doc(path: Path) -> Any:
         return None
     except OSError as exc:
         raise AgentPinError([f"{path}: unreadable ({exc.strerror or exc})"]) from None
+    import tomllib   # 3.11+, imported here so root's 3.9 can import this module (the supervisor's repo-layer check reads its constants)
     try:
         return tomllib.loads(data.decode("utf-8"))
     except (ValueError, UnicodeDecodeError):
