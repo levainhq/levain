@@ -260,3 +260,10 @@ def fire_factory(store: AgentStore, occurrence_id: str, launch_epoch: int, *,
     return {**extra, "sup": sup, "role": role, "values": dict(install.values), "recall": recall, "launcher": launcher,
             "exposure": None if reserved is None else reserved.exposure,
             "max_exposure_usd_micros": 0 if reserved is None or reserved.usd_micros is None else reserved.usd_micros}
+
+
+# The production launcher: the operator-side client of the dispatch run server (P7-1 S9/S10a). The install file names it
+# (``"launcher": "s1-dispatch"``); a store whose install names none still launches nothing (UnwiredLauncher).
+from levain.agents import session_client as _session_client   # noqa: E402  (session_client imports this module lazily)
+
+register_launcher(_session_client.LAUNCHER_NAME, _session_client.build_launcher)
