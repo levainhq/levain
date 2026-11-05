@@ -79,6 +79,23 @@ def test_a_zwj_emoji_sequence_is_never_split():
     assert not any(c.startswith("‍") or c.endswith("‍") for c in chunks)
 
 
+def test_a_cut_may_fall_after_the_first_character():
+    word = "a" + "e" + "́" * 300                    # the only clean boundary is at index 1
+    assert T._cut_point(word, 200) == 1
+
+
+@pytest.mark.parametrize("unit", ["\U0001F469‍❤️‍\U0001F468",     # variation selector inside
+                                  "\U0001F44D\U0001F3FD",                               # skin-tone modifier
+                                  "कि"])                                     # Devanagari vowel sign (Mc)
+def test_a_cut_never_strands_a_selector_modifier_or_spacing_mark(unit):
+    word = unit * 400
+    for limit in range(150, 150 + 2 * len(unit)):
+        cut = T._cut_point(word, limit)
+        assert cut % len(unit) == 0, (limit, cut)
+    chunks = T.chunk_text(word)
+    assert "".join(chunks) == word and all(len(c) % len(unit) == 0 for c in chunks)
+
+
 def test_crlf_is_the_same_text_as_lf():
     lf = "A sentence here.\n\nAnother one follows."
     assert T.chunk_text(lf.replace("\n", "\r\n")) == T.chunk_text(lf)
@@ -139,6 +156,18 @@ def test_reply_text_is_the_agent_text_since_the_operators_last_line():
     assert T.reply_text(_stream(), 8) == "part one\n\npart two"
     assert T.reply_text(_stream(), 3) == "old answer"
     assert T.reply_text(reversed(_stream()), 8) == "part one\n\npart two"      # gseq order, not arrival order
+
+
+def test_two_turns_with_no_operator_line_between_are_two_replies():
+    stream = [
+        {"gseq": 1, "kind": "message", "source": "operator", "body": "go"},
+        {"gseq": 2, "kind": "vendor_agent_text", "source": "vendor", "body": "first turn"},
+        {"gseq": 3, "kind": "vendor_turn_ended", "source": "vendor", "body": None},
+        {"gseq": 4, "kind": "vendor_agent_text", "source": "vendor", "body": "second turn"},
+        {"gseq": 5, "kind": "vendor_turn_ended", "source": "vendor", "body": None},
+    ]
+    assert T.reply_text(stream, 3) == "first turn"
+    assert T.reply_text(stream, 5) == "second turn"                  # the first is never read (or paid for) again
 
 
 def test_reply_text_names_only_a_finished_reply():

@@ -60,13 +60,20 @@ def replace_code_fences(text: str) -> str:
     return "\n".join(out)
 
 
+def _continues(ch: str) -> bool:
+    """True for a character that belongs to the one before it: a mark (Mn, Mc, Me, which covers the variation
+    selectors), an emoji skin-tone modifier, or the zero-width joiner. Regional-indicator pairs (flags) and tag
+    sequences are not handled: a known edge, cut only inside a 200+ character run with no space."""
+    return unicodedata.category(ch) in ("Mn", "Mc", "Me") or 0x1F3FB <= ord(ch) <= 0x1F3FF or ch == _ZWJ
+
+
 def _cut_point(word: str, limit: int) -> int:
-    """Where to cut ``word`` (no whitespace, longer than ``limit``): at most ``limit`` in, never between a base
-    character and the combining marks or joiner that follow it."""
+    """Where to cut ``word`` (no whitespace, longer than ``limit``): at most ``limit`` in, never before a character
+    that continues the one before it, nor just after a joiner."""
     cut = limit
-    while cut > 1 and (unicodedata.combining(word[cut]) or word[cut] == _ZWJ or word[cut - 1] == _ZWJ):
+    while cut > 0 and (_continues(word[cut]) or word[cut - 1] == _ZWJ):
         cut -= 1
-    return cut if cut > 1 else limit    # a run of marks longer than the limit is cut rather than looped on
+    return cut if cut > 0 else limit    # a run of marks longer than the limit is cut rather than looped on
 
 
 def _take_words(sentence: str, limit: int) -> tuple[str, str]:
@@ -140,8 +147,9 @@ def speakable(text: str) -> list[str]:
 
 def reply_text(items: Iterable[Mapping[str, Any]], reply_gseq: int) -> str | None:
     """The text of the reply that ended at ``reply_gseq``, from a thread's stream items (dicts with ``gseq``, ``kind``,
-    ``source`` and ``body``): the ``vendor_agent_text`` bodies after the operator's last ``message`` before it, in
-    ``gseq`` order, joined by a blank line. None when ``reply_gseq`` is not a ``vendor_turn_ended`` item (a reply still
+    ``source`` and ``body``): the ``vendor_agent_text`` bodies after the operator's last ``message`` before it (or
+    after the previous ``vendor_turn_ended``, when that is later: an earlier turn is never read again), in ``gseq``
+    order, joined by a blank line. None when ``reply_gseq`` is not a ``vendor_turn_ended`` item (a reply still
     running is never read, and a caller cannot name a ``gseq`` that was not a reply's end). The text is only ever the
     record's: nothing a caller supplies is spoken."""
     ordered = sorted((i for i in items if isinstance(i.get("gseq"), int)), key=lambda i: i["gseq"])
@@ -149,7 +157,8 @@ def reply_text(items: Iterable[Mapping[str, Any]], reply_gseq: int) -> str | Non
     if end is None or end.get("kind") != "vendor_turn_ended":
         return None
     before = [i for i in ordered if i["gseq"] < reply_gseq]
-    start = max((i["gseq"] for i in before if i.get("kind") == "message" and i.get("source") == "operator"), default=-1)
+    start = max((i["gseq"] for i in before if (i.get("kind") == "message" and i.get("source") == "operator")
+                 or i.get("kind") == "vendor_turn_ended"), default=-1)
     parts = [i["body"] for i in before
              if i["gseq"] > start and i.get("kind") == "vendor_agent_text" and isinstance(i.get("body"), str) and i["body"].strip()]
     return "\n\n".join(parts)
