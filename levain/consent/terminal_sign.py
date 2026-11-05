@@ -23,7 +23,6 @@ from __future__ import annotations
 
 import hashlib
 import os
-import pwd
 import re
 import secrets
 import shlex
@@ -443,7 +442,7 @@ class TerminalKey:
 
 def _real_key_dir() -> Path:
     """``<real home>/.levain/keys``: the home from the password database, never ``$HOME`` or ``$LEVAIN_HOME``."""
-    return Path(pwd.getpwuid(os.getuid()).pw_dir) / ".levain" / "keys"
+    return _keys.pwd_key_dir()
 
 
 def _own_regular_file(path: Path) -> bool:
@@ -467,6 +466,7 @@ def find_key(key_dir: Path | None = None) -> TerminalKey | None:
     that is there but malformed, raises ``KeyError_``. ``key_dir`` is for tests; the default is the real home's,
     whatever the environment says."""
     d = Path(key_dir) if key_dir is not None else _real_key_dir()
+    _keys.refuse_real_key_in_tests(d, "the key directory")
     try:
         st = os.lstat(d)
     except FileNotFoundError:
@@ -645,6 +645,7 @@ def _create(key_dir: Path | None, creator: Callable[..., Any] | None,
         return CreateReport(False, f"{session_refusal()} (nothing was created)")
     try:
         d = Path(key_dir) if key_dir is not None else _real_key_dir()
+        _keys.refuse_real_key_in_tests(d, "the key directory")
         if find_key(d) is not None:
             return CreateReport(False, "refused: a terminal key is already enrolled; `levain band terminal-key "
                                        "status` shows it (nothing was created)")
@@ -683,12 +684,14 @@ SignerFactory = Callable[[Path, float], tuple[str, Signer]]    # (key path, the 
 def default_signer_factory(key_path: Path, timeout: float | None = None) -> tuple[str, Signer]:
     """The one door to the real key: ``ssh_signer`` in :data:`NAMESPACE`, bounded by ``timeout`` seconds.
     Calling the ``Signer`` it returns raises the Touch ID prompt."""
+    key_path = _keys.refuse_real_key_in_tests(key_path, "the signing key")
     return _keys.ssh_signer(key_path, namespace=NAMESPACE, timeout=timeout)
 
 
 def default_desk_signer_factory(key_path: Path, timeout: float | None = None) -> tuple[str, Signer]:
     """:func:`default_signer_factory` for the desk format: the same key, signing in :data:`DESK_NAMESPACE`. The only
     other door to the real key."""
+    key_path = _keys.refuse_real_key_in_tests(key_path, "the signing key")
     return _keys.ssh_signer(key_path, namespace=DESK_NAMESPACE, timeout=timeout)
 
 
@@ -731,6 +734,7 @@ def sign(message: bytes, *, key: TerminalKey | None = None, key_dir: Path | None
             key = find_key(key_dir)
         if key is None:
             return SignOutcome("unsigned", "no-key", "no terminal key with a touch-id sidecar")
+        _keys.refuse_real_key_in_tests(key.path, "the signing key")
         factory = signer_factory or default_signer_factory
         fp, signer = factory(key.path, bound_s)
         signature = signer(bytes(message))
