@@ -7,11 +7,14 @@ replica-backed verifier (the production shape), both in-process over socketpairs
 from __future__ import annotations
 
 import shutil
+import sqlite3
 import sys
 from pathlib import Path
 
 import pytest
 
+from levain.agents import bars
+from levain.agents import controller as CTL
 from levain.agents import session as S
 from levain.agents import session_client as C
 from levain.agents import session_wire as W
@@ -97,17 +100,14 @@ def test_a_server_ledger_that_forked_is_a_named_standing_refusal(rig, wire):
     oid = _occurrence(rig, billing="subscription", exposure=EXP)
     wire.sync()
     # a different operator ledger at the same seq: the replica's own head is not on this chain
-    import dataclasses
     rows = _source(rig)
-    other = wire.replica
-    import sqlite3
-    db = sqlite3.connect(other.db_path)
+    db = sqlite3.connect(wire.replica.db_path)
     db.execute("UPDATE authority_log SET hash = ? WHERE seq = ?", ("0" * 64, rows[-1].seq))
     db.commit()
     db.close()
     with pytest.raises(C.LauncherRefused) as exc:
         _client(rig, wire).spawn(_launch(oid))
-    assert exc.value.name in ("ledger-fork", "ledger-unverifiable", "authority-unreadable", "replica-unreadable")
+    assert (exc.value.name, exc.value.reason_class) == ("ledger-fork", "standing")
     assert wire.runtime.children == []
 
 
@@ -174,6 +174,105 @@ def test_a_revoke_of_this_agent_synced_by_another_fire_before_release_still_refu
         child.release()
     assert wire.runtime.children[0].released is False and wire.runtime.ended == ["sess-1"]
     child.abort()
+    child._conn.close()
+
+
+# --- L3 r1 fixes (RETURN_s10b_b2_fix) ----------------------------------------------------------------------------------
+
+def _open_bar(rig, agent_id):
+    """A revoke's first step only: the agent store's open bar, no ledger row (revoke_agent_begin before its append)."""
+    db = sqlite3.connect(rig.store.directory / "autonomic.db", isolation_level=None)
+    try:
+        bars.open_bar(db, agent_id, head_seq=0, now=rig.now())
+    finally:
+        db.close()
+
+
+def test_a_bar_opened_after_launch_without_a_ledger_row_refuses_release(rig, wire):
+    # codex r1 MED / complement 4: RELEASE judged the LAUNCH-time bar, so a bar opened in between was not seen
+    oid = _occurrence(rig, billing="subscription", exposure=EXP)
+    child = _client(rig, wire).spawn(_launch(oid))
+    _open_bar(rig, rig.row(oid)["agent_id"])
+    with pytest.raises(RuntimeError, match="agent-barred"):
+        child.release()
+    assert wire.runtime.children[0].released is False and wire.runtime.ended == ["sess-1"]
+    child.abort()
+    child._conn.close()
+
+
+def test_an_open_bar_at_launch_surfaces_as_its_named_standing_refusal_not_a_down_child(rig, wire):
+    # deepseek r1 3: a classified refusal of LAUNCH is the operator's to see, never a lost answer
+    oid = _occurrence(rig, billing="subscription", exposure=EXP)
+    _open_bar(rig, rig.row(oid)["agent_id"])
+    with pytest.raises(C.LauncherRefused) as exc:
+        _client(rig, wire).spawn(_launch(oid))
+    assert (exc.value.name, exc.value.reason_class) == ("agent-barred", "standing")
+    assert wire.runtime.children == []
+
+
+def _bad_sync_answers(monkeypatch, bad):
+    """From now on every SYNC is answered ``bad`` after a well-shaped frame (the wire passed; the fields did not)."""
+    real = C._Conn.request
+
+    def spy(self, op, expect, **kw):
+        if op == "SYNC":
+            return bad
+        return real(self, op, expect, **kw)
+    monkeypatch.setattr(C._Conn, "request", spy)
+
+
+@pytest.mark.parametrize("bad", [{"head": {"seq": "1", "hash": ""}}, {}], ids=["wire-error", "key-error"])
+def test_a_malformed_sync_answer_at_release_raises_runtime_error_and_loses_the_child(rig, wire, monkeypatch, bad):
+    # complement r1 1 / deepseek r1 1: a WireError or KeyError out of _sync_to escaped release() raw
+    oid = _occurrence(rig, billing="subscription", exposure=EXP)
+    child = _client(rig, wire).spawn(_launch(oid))
+    _bad_sync_answers(monkeypatch, bad)
+    with pytest.raises(RuntimeError, match="unreachable at RELEASE"):
+        child.release()
+    assert child.released is False and child._conn.alive is False
+    assert child.process.returncode == CTL.GATE_UNPROVEN
+
+
+@pytest.mark.parametrize("bad", [{"head": {"seq": "1", "hash": ""}}, {}], ids=["wire-error", "key-error"])
+def test_a_malformed_sync_answer_at_launch_is_a_transient_refusal(rig, wire, monkeypatch, bad):
+    oid = _occurrence(rig, billing="subscription", exposure=EXP)
+    _bad_sync_answers(monkeypatch, bad)
+    with pytest.raises(C.LauncherRefused) as exc:
+        _client(rig, wire).spawn(_launch(oid))
+    assert (exc.value.name, exc.value.reason_class) == ("dispatch-unreachable", "transient")
+    assert wire.runtime.children == []
+
+
+@pytest.mark.parametrize("value", ["abc", b"\x01"], ids=["text", "blob"])
+def test_a_closed_bar_whose_revoke_seq_is_not_an_integer_is_proof_unavailable(rig, value):
+    # complement r1 2 / codex r1 2: int(closed) sat outside the guarded read
+    oid = _occurrence(rig, billing="subscription", exposure=EXP)
+    db = sqlite3.connect(rig.store.directory / "autonomic.db", isolation_level=None)
+    try:
+        db.execute("INSERT INTO agent_bars (bar_id, agent_id, barred_at, head_seq_at_bar, revoke_seq, closed_at)"
+                   " VALUES ('bar-x', ?, '2026-01-01T00:00:00Z', 0, ?, '2026-01-01T00:00:01Z')",
+                   (rig.row(oid)["agent_id"], value))
+    finally:
+        db.close()
+    with pytest.raises(C.ProofUnavailable) as exc:
+        C.AuthorityFeed(rig.store, rig.world.root).read(oid)
+    assert exc.value.standing is True
+
+
+def test_the_launch_frame_size_check_uses_worst_case_claims(rig, wire, monkeypatch):
+    # complement r1 6: seq 1 placeholders let a body near the frame limit pass, then overflow with the real values
+    oid = _occurrence(rig, billing="subscription", exposure=EXP)
+    seen = []
+    real = C.encode_run_frame
+
+    def spy(obj):
+        if obj.get("op") == "LAUNCH" and obj.get("id") == 1 and "ledger_head" in obj:
+            seen.append((obj["ledger_head"], obj["bar"]))
+        return real(obj)
+    monkeypatch.setattr(C, "encode_run_frame", spy)
+    child = _client(rig, wire).spawn(_launch(oid))
+    head, bar = seen[0]
+    assert head["seq"] == bar["closed_revoke_seq"] == C._INT_MAX and len(head["hash"]) == 128
     child._conn.close()
 
 
