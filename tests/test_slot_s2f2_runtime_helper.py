@@ -234,10 +234,18 @@ class World:
         return H.parse_slot_state_of((slot.slot_dir(self.L) / "state").read_bytes(), slot)
 
     def give_credential(self, slot: SlotId, vendor: str = "claude", *, baseline: bool = True,
-                        observed_id: str | None = None) -> None:
-        """``observed_id`` defaults to ``not-a-check`` for codex and a fixed id digest for claude."""
+                        observed_id: str | None = None, seed: bool = True) -> None:
+        """``observed_id`` defaults to ``not-a-check`` for codex and a fixed id digest for claude. ``seed``
+        (identseed): a claude credential is parked with its account record, as END's park of a login now leaves it."""
         d = slot.slot_dir(self.L)
         (d / "keep" / H.CREDENTIAL_NAME[vendor]).write_bytes(b"{}")
+        if seed and vendor == "claude":
+            from levain.slot import end as E
+            p = d / "keep" / E.IDENTITY_SEED_NAME
+            p.write_bytes(E.identity_seed_bytes(vendor="claude", session="s-00000000000000ba", account={
+                "emailAddress": "op@example.test", "organizationName": "Example",
+                "organizationUuid": "11111111-2222-4333-8444-555555555555"}))
+            p.chmod(0o600)
         if baseline:
             if observed_id is None:
                 observed_id = "not-a-check" if vendor == "codex" else "4b8e0c1a1d2e4f009a7b0123456789ab4b8e0c1a1d2e4f009a7b0123456789ab"

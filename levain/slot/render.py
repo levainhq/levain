@@ -206,6 +206,9 @@ class RenderFacts:
     driver_uid: int | None = None
     driver_gid: int | None = None
     hook_templates: Mapping[str, HookTemplate] = field(default_factory=dict)
+    #: identseed (PROTOTYPE of np-3ccc8493 option (a)): the whitelisted ``oauthAccount`` block root read from the
+    #: slot's parked record (``runtime_helper.read_identity_seed``), for a gated Claude session; else None.
+    oauth_account: Mapping[str, object] | None = None
 
     @property
     def S(self) -> PurePosixPath:
@@ -668,11 +671,23 @@ def render_cc_settings(blob: RenderBlob, facts: RenderFacts) -> dict:
     return out
 
 
+#: identseed: the vendors whose gated sessions get the parked account block, and the only keys of it ever rendered (a
+#: test holds these equal to ``end.IDENTITY_SEED_SOURCE`` / ``end.IDENTITY_SEED_KEYS``; render does not import end).
+SEEDED_VENDORS = ("claude",)
+SEED_KEYS = ("emailAddress", "organizationName", "organizationUuid")
+
+
 def render_cc_onboarding(facts: RenderFacts) -> dict:
     """``<S>/config/claude/.claude.json``: onboarding done and ``<S>/repo`` trusted, no credential in it (the shape
-    runs/macos-RM2 raw/100 and runs/macos-RB raw/044 measured; R-M2 found the TUI keeps it in ``CLAUDE_CONFIG_DIR``)."""
-    return {"hasCompletedOnboarding": True, "theme": "dark", "bypassPermissionsModeAccepted": False,
-            "projects": {f"{facts.S}/repo": {"hasTrustDialogAccepted": True, "hasCompletedProjectOnboarding": True}}}
+    runs/macos-RM2 raw/100 and runs/macos-RB raw/044 measured; R-M2 found the TUI keeps it in ``CLAUDE_CONFIG_DIR``).
+    identseed: with ``facts.oauth_account`` (root's parked record, never the slot's), its whitelisted keys go in as
+    ``oauthAccount``, the block ``auth status`` reads the account from; no token is ever in it."""
+    out: dict[str, Any] = {
+        "hasCompletedOnboarding": True, "theme": "dark", "bypassPermissionsModeAccepted": False,
+        "projects": {f"{facts.S}/repo": {"hasTrustDialogAccepted": True, "hasCompletedProjectOnboarding": True}}}
+    if facts.oauth_account is not None:
+        out["oauthAccount"] = {k: facts.oauth_account[k] for k in SEED_KEYS if k in facts.oauth_account}
+    return out
 
 
 def _json_bytes(obj: object) -> bytes:

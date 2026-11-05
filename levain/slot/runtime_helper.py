@@ -50,6 +50,7 @@ from levain.slot import records as R
 from levain.slot import render as RD
 from levain.slot import stage as ST
 from levain.slot import verify_caps as VC
+from levain.slot import end as _E
 from levain.slot.end import V5_FLOOR_BYTES
 from levain.slot.grammar import SESSION_RE
 from levain.slot.runtime_grammar import _NAME_RE as _WIRE_NAME_RE
@@ -2122,6 +2123,70 @@ def hook_templates_for(seams: "Seams", blob: RenderBlob) -> Dict[str, RD.HookTem
     return {k: v for k, v in have.items() if k in blob.hooks}
 
 
+def identity_gated(a: R.Alloc) -> bool:
+    """start's identity gate runs for this session (an interactive passthrough session, or a ticketed one, c7.14, of
+    a credential vendor): the one statement of the rule, read by start and by render's seed."""
+    return (a.kind == "interactive" or a.ticket is not None) and a.auth == "passthrough" and a.vendor in _E.CREDENTIALS
+
+
+_SEED_FLAGS = os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_NOCTTY | os.O_CLOEXEC
+
+
+def read_identity_seed(ctx: Ctx, a: R.Alloc) -> Optional[Dict[str, object]]:
+    """identseed (PROTOTYPE of np-3ccc8493 option (a)): the slot's parked account record,
+    ``L/slots/<tag>/keep/identity-seed.json`` (:data:`levain.slot.end.IDENTITY_SEED_NAME`), read by root by dirfd
+    with ``O_NOFOLLOW``: a regular file with a trusted (root) owner, at most
+    :data:`~levain.slot.end.IDENTITY_SEED_MAX_BYTES`, passing :func:`levain.slot.end.check_identity_seed` whole and
+    naming alloc's vendor. Returns the record; None when the file (or ``keep/``) is absent; ``bad-identity-seed`` for
+    any other failure. Only END's park of a ``login`` writes it (``keep/`` is root 0700: the slot cannot)."""
+    E = _E
+    tag = a.slot.tag
+    with ctx.store.dir("slots", tag) as sfd:
+        try:
+            kfd = _openat_dir(sfd, "keep", f"slots/{tag}/keep")
+        except Refused as e:
+            if e.name == "store-missing":
+                return None
+            raise
+    try:
+        if not ctx.seams.trusted(os.fstat(kfd)):
+            raise Refused("bad-identity-seed", f"slots/{tag}/keep: owner")
+        try:
+            fd = os.open(E.IDENTITY_SEED_NAME, _SEED_FLAGS, dir_fd=kfd)
+        except FileNotFoundError:
+            return None
+        except OSError as e:
+            raise Refused("bad-identity-seed", f"open: {e.strerror or e}") from None
+    finally:
+        os.close(kfd)
+    try:
+        st = os.fstat(fd)
+        if not stat.S_ISREG(st.st_mode):
+            raise Refused("bad-identity-seed", "not a regular file")
+        if not ctx.seams.trusted(st):
+            raise Refused("bad-identity-seed", "owner")
+        if st.st_size > E.IDENTITY_SEED_MAX_BYTES:
+            raise Refused("bad-identity-seed", f"{st.st_size} bytes")
+        buf = bytearray()
+        while len(buf) <= E.IDENTITY_SEED_MAX_BYTES:
+            chunk = os.read(fd, E.IDENTITY_SEED_MAX_BYTES + 1 - len(buf))
+            if not chunk:
+                break
+            buf += chunk
+    finally:
+        os.close(fd)
+    if len(buf) > E.IDENTITY_SEED_MAX_BYTES:
+        raise Refused("bad-identity-seed", "oversize")
+    try:
+        obj = canon.parse(bytes(buf))
+    except ContractError:
+        raise Refused("bad-identity-seed", "not canonical JSON") from None
+    rec = E.check_identity_seed(obj)
+    if rec["vendor"] != a.vendor:
+        raise Refused("bad-identity-seed", f"names {rec['vendor']}, not {a.vendor}")
+    return rec
+
+
 def render_facts(ctx: Ctx, alloc: R.Alloc, blob: RenderBlob) -> RD.RenderFacts:
     """The alloc facts ``render.render`` needs (§7.1: root acts on alloc only), plus the base map's route types and
     hosts (one read, :func:`base_routes`), the slot's /var/folders (macOS), ``TERM`` from the supervisor's env when it
@@ -2141,7 +2206,13 @@ def render_facts(ctx: Ctx, alloc: R.Alloc, blob: RenderBlob) -> RD.RenderFacts:
     if term is not None and not RD._TERM_RE.fullmatch(term):
         term = None
     route_types, route_hosts = base_routes(ctx.store)
-    return RD.RenderFacts(
+    # identseed: a gated Claude session's .claude.json carries the slot's parked account block (absent: render seeds
+    # nothing and start's gate refuses identity-seed-missing before any move)
+    account = None
+    if egress and alloc.vendor in RD.SEEDED_VENDORS and identity_gated(alloc):
+        rec = read_identity_seed(ctx, alloc)
+        account = rec["account"] if rec is not None else None
+    return RD.RenderFacts(oauth_account=account,
         host=seams.host, session=alloc.session, slot=slot, kind=alloc.kind, vendor=alloc.vendor, auth=alloc.auth,
         slot_uid=owner, slot_gid=owner, gwport=RD.gwport_for(seams.host, slot) if egress else None,
         route_types=route_types, route_hosts=route_hosts, term=term, var_folders=folders,

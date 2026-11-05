@@ -951,18 +951,26 @@ slot_owner_ok: Optional[Callable[[os.stat_result], bool]] = None
 def _identity_gate(ctx: H.Ctx, a: R.Alloc) -> None:
     """The interactive passthrough session's keep/ return and §7.6 compare, before the clone (DESIGN g3 §1-§2), under
     the session END lock the caller holds: the slot's baseline read (:func:`levain.slot.identity.read_slot_baseline`),
-    the vendor's parked credential moved from ``keep/`` into the session tree (:func:`levain.slot.end.return_move`),
-    then :func:`levain.slot.identity.gate_check`. A refusal of the baseline, and the return's three refusals before
-    any move (:data:`_RETURN_UNMOVED`), move nothing. Every other failure once the return was entered (its
-    ``bad-root`` may come after its rename: L3 r1 F1), and every refusal after it, is followed by a best-effort
-    :func:`levain.slot.end.park_move` of the credential back into ``keep/`` (a no-op when it never left): a failure
-    there is noted and END's park is the backstop. No baseline is written on this path.
+    for Claude the parked account record present (identseed prototype: else ``identity-seed-missing:<tag>``, before
+    any move), the vendor's parked credential moved from ``keep/`` into the session tree
+    (:func:`levain.slot.end.return_move`), then :func:`levain.slot.identity.gate_check`. A refusal of the baseline,
+    the missing record, and the return's three refusals before any move (:data:`_RETURN_UNMOVED`), move nothing.
+    Every other failure once the return was entered (its ``bad-root`` may come after its rename: L3 r1 F1), and
+    every refusal after it, is followed by a best-effort :func:`levain.slot.end.park_move` of the credential back
+    into ``keep/`` (a no-op when it never left): a failure there is noted and END's park is the backstop. No baseline
+    is written on this path.
 
     For Claude the identity child asks the unmodified binary for its own sign-in report (a local-data claim, a
     digest of ``orgId`` and email) and changes nothing in the credential."""
     seams = ctx.seams
     seams.at("identity-gate")
     baseline = ID.read_slot_baseline(ctx, a)
+    if a.vendor in RD.SEEDED_VENDORS and H.read_identity_seed(ctx, a) is None:
+        # identseed (PROTOTYPE of np-3ccc8493 option (a)): render seeded nothing, so the binary would answer with no
+        # account (bad-shape); refused by name before any move, never a silent unseeded start
+        raise Refused(f"identity-seed-missing:{a.slot.tag}",
+                      "the slot's login was parked without its account block (a login parked before this change, or "
+                      "one whose config held none): log this slot in again")
     facts = end_facts(ctx, a)
     es = end_seams(ctx, a)
     try:
@@ -1018,7 +1026,7 @@ def _start_fenced(ctx: H.Ctx, a: R.Alloc, cap: Optional[VendorCapture] = None) -
         raise Refused("already-started", a.session)
     if rec is None or rec.state != R.RENDERED:
         raise Refused("not-rendered", f"{a.session}: {rec.state if rec else 'no record'}")   # SECRETS' own rule
-    if (a.kind == "interactive" or a.ticket is not None) and a.auth == "passthrough" and a.vendor in E.CREDENTIALS:
+    if H.identity_gated(a):
         # c7.14: a ticketed passthrough session (alloc auth passthrough only exists on one CONTROL bound to a
         # passthrough ticket: ATTACH compares the two) takes the same keep/ return and identity compare
         _identity_gate(ctx, a)
