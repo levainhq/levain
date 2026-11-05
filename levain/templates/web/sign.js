@@ -8,6 +8,8 @@
 // follow one rule. The pick is one "Sign (<key>)" tap only while the listed version is the one in the link;
 // anything else is a line saying why, and every option still signs on its own tap. Nothing is signed on load: the tap is the
 // gesture. The request id is the path's; a `sign=` in the fragment is ignored. The fragment is taken out of the bar first.
+// A consent sheet's link may also carry `?choice=allow|deny`: that option is preselected (highlighted, with a line saying
+// so), nothing is signed or sent by the link, and any other value is ignored.
 //
 // Who may sign (§4A.3, as this ceremony has it): the server's row `signers`, the keys its verifier accepts for this request.
 // The passkey asked for is one of those, by its credential id when this browser or the cockpit knows it (allowCredentials),
@@ -104,7 +106,15 @@
   let pick = "";
   const pickV = vm ? vm[1] : "";
   if (pm) { try { pick = decodeURIComponent(pm[1]); } catch (e) { pick = pm[1]; } }
-  if (location.hash) { try { history.replaceState(null, "", location.pathname); } catch (e) { /* the bar keeps it */ } }
+  // A consent link may also carry `?choice=allow` or `?choice=deny` (the NEEDS YOU row's link): the sheet PRESELECTS that
+  // option, highlighting it and saying so, and nothing more. No version is bound (the row's author does not hold one); no
+  // ceremony starts on load; the tap is the existing challenge, answer and passkey. Any other value is ignored. Like the
+  // fragment, it is taken out of the bar once read.
+  let preselect = "";
+  if (consent && location.search) {
+    try { const c = new URLSearchParams(location.search).get("choice"); if (c === "allow" || c === "deny") preselect = c; } catch (e) { /* ignored */ }
+  }
+  if (location.hash || (consent && location.search)) { try { history.replaceState(null, "", location.pathname); } catch (e) { /* the bar keeps it */ } }
   // a second link opened on this page (a fragment-only navigation does not reload it): read it afresh
   window.addEventListener("hashchange", () => { if (location.hash) location.reload(); });
 
@@ -616,11 +626,25 @@
       miss.id = "sheet-pick-miss";
       $("sheet-body").insertBefore(miss, $("sheet-body").firstChild);
     }
+    // a preselect from the link (?choice=): the option is highlighted below and a line says so; one the row does not offer says that
+    const pre = preselect && !po ? options.find((o) => o && o.key === preselect) : null;
+    if (pre) {
+      const note = el("p", "sheet-pick", "Your pick from the link: " + String(pre.text) + ". Read the request, then tap " + String(pre.text)
+        + " below and confirm with your passkey. Nothing is signed until you do.");
+      note.id = "sheet-preselect";
+      $("sheet-body").insertBefore(note, $("sheet-body").firstChild);
+    } else if (preselect && !po) {
+      const miss = el("p", "sheet-pick-miss", "The option in the link (" + preselect + ") is not offered for this request: pick one below.");
+      miss.id = "sheet-pick-miss";
+      $("sheet-body").insertBefore(miss, $("sheet-body").firstChild);
+    }
     // a dispatch job is only ever signed through an act its row offers: no options, no button (never a bare "Sign")
     if (!options.length && !dispatch) acts.appendChild(button("Sign with your passkey", po ? "" : "dev-primary", () => run(undefined, undefined)));
     for (const o of options) {
       if (!o || typeof o.key !== "string") continue;
-      const b = button("(" + o.key + ") " + String(o.text), o.key === (cardView ? cardView.recommended : r.recommended) ? "sheet-rec" : "", tap(o));
+      const isPre = !!pre && o.key === pre.key;
+      const b = button("(" + o.key + ") " + String(o.text), (o.key === (cardView ? cardView.recommended : r.recommended) ? "sheet-rec" : "") + (isPre ? " dev-primary sheet-preselected" : ""), tap(o));
+      if (isPre) b.setAttribute("aria-current", "true");
       if (cardView) b.replaceChildren(el("span", "card-key", "(" + o.key + ")"), " " + String(o.text));      // same text, the key set off
       b.title = "signs: " + String(o.line);
       b.dataset.choice = o.key;

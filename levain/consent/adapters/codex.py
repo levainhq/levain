@@ -280,7 +280,7 @@ def decide(event: Any, queue: ConsentQueue, settings: AdapterSettings, *, max_ho
         if got is None and wait > 0:
             # a hold will run: his devices hear of the request now, as the gate pings its filed request (Phill 11-02,
             # np-e642162b (a)); `held` is true only when the hold ran and its ping started
-            held = hold_ping(settings, queue.directory, AGENT, what_of(), request.id, wait)
+            held = hold_ping(settings, queue.directory, AGENT, what_of(), request.id, wait, request=request)
             wait = min(wait, max(0.0, deadline - clock()))   # the ping's spawn time comes out of the hold, not the reserve
             held = held and wait > 0   # the spawn can have used the whole wait: then no hold runs and the dialog's notice goes (L3 round c)
             got, back = hold_for_answer(queue, request, wait, tool_input=tool_input, posture=posture,
@@ -676,7 +676,8 @@ def _gate_call(event: Mapping[str, Any], queue: ConsentQueue, settings: AdapterS
         return _deny(f"levain: the gate failed ({type(exc).__name__}), so the action was NOT taken: {what}. "
                      "Do not retry it and do not achieve it another way.")
     try:
-        notify(settings, hold_message(AGENT, what, hold), cwd=queue.directory, ref=f"request:{request.id}")
+        notify(settings, hold_message(AGENT, what, hold), cwd=queue.directory, ref=f"request:{request.id}",
+               request=request)
         if posture in ATTENDED_POSTURES and still_away is not None:
             # held only because he was away (above): when away ends, the call goes back to Codex's approval
             got, back = hold_for_answer(queue, request, hold + 5.0, tool_input=tool_input, posture=posture,
