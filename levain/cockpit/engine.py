@@ -2900,13 +2900,32 @@ def _kb(n: float) -> str:
     return f"{n / 1e6:.1f} MB" if n > 1e6 else f"{round(n / 1e3)} kB"
 
 
-def _run_time(dg: dict[str, Any]) -> str | None:
+_WEEKDAYS = ("Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun")
+_MONTHS = ("Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec")
+
+
+def _clock(t: datetime, now: datetime | None) -> str:
+    """'02:56' for today, 'Mon 02:56' inside the last six days, 'Oct 28 02:56' beyond, all in the offset the contributor
+    wrote (the day is judged in that offset too). With no clock the bare time stands, as before."""
+    hm = t.strftime("%H:%M")
+    if now is None:
+        return hm
+    days = (now.astimezone(t.tzinfo).date() - t.date()).days
+    if days == 0:
+        return hm
+    if 0 < days < 7:
+        return f"{_WEEKDAYS[t.weekday()]} {hm}"
+    return f"{_MONTHS[t.month - 1]} {t.day} {hm}"
+
+
+def _run_time(dg: dict[str, Any], now: datetime | None = None) -> str | None:
     """'last run 02:56 (scheduler)' or 'newest episode 02:56 (no run recorded)', the clock time in the offset the
-    contributor wrote; None when the digest carries no readable last_run_at (an older roster)."""
+    contributor wrote (with its day when that is not today); None when the digest carries no readable last_run_at
+    (an older roster)."""
     at = dg.get("last_run_at")
     if not _is_iso(at):
         return None
-    hm = _parse_iso(at).strftime("%H:%M")
+    hm = _clock(_parse_iso(at), now)
     return f"newest episode {hm} (no run recorded)" if dg.get("last_run_source") == "episode" else f"last run {hm}"
 
 
@@ -2934,13 +2953,13 @@ def _flag_unreadable(dg: dict[str, Any]) -> bool:
     return any(k in dg and dg[k] is not None and not isinstance(dg[k], bool) for k in ("run_failed", "run_late"))
 
 
-def _run_reading(dg: dict[str, Any]) -> dict[str, Any] | None:
+def _run_reading(dg: dict[str, Any], now: datetime | None = None) -> dict[str, Any] | None:
     """An alarm reading for a stateless resident whose digest says its run failed or is late; None otherwise."""
     failed, late = dg.get("run_failed") is True, dg.get("run_late") is True
     if not (failed or late):
         return None
     parts = (["last run failed"] if failed else []) + (["run late"] if late else [])
-    t = _run_time(dg)
+    t = _run_time(dg, now)
     if t is not None:
         parts.append(t)
     _status_part(dg, parts)
@@ -2976,7 +2995,7 @@ def roster_health(row: dict[str, Any], now: datetime) -> dict[str, Any]:
     if dg is None:
         return {**out, "tone": "unknown", "text": "no data"}
     if is_role:
-        run = _run_reading(dg)
+        run = _run_reading(dg, now)
         if run is not None:                                    # a failed or late run: its own words, never "write path"
             return {**out, **run}
     src = dg.get("last_run_source") if is_role else None
@@ -3003,7 +3022,7 @@ def roster_health(row: dict[str, Any], now: datetime) -> dict[str, Any]:
 
     if is_role:
         # a role run on a schedule is read from its last run, never from a bare "running"
-        t = _run_time(dg)
+        t = _run_time(dg, now)
         if t is None:
             note("unknown", "no run time reported")   # an older roster: absence of a run time is never health
         else:

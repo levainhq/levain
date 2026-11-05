@@ -1054,6 +1054,11 @@
   .fl .n i.off { background: none; border: 1.5px solid var(--meta); }
   .fl .n i.bad { background: var(--bad); }
   .fl .n i.unk { background: none; border: 1.5px dashed var(--label); }
+  .fl .n i.fail { background: none; border: 1.5px solid var(--bad); }
+  .fl-alarms { display: flex; align-items: center; gap: var(--sp-3); padding: var(--sp-2) var(--sp-3); font-size: var(--fs-meta); color: var(--label); overflow-wrap: anywhere; }
+  .fl-alarms i { width: 7px; height: 7px; border-radius: var(--r-pill); flex: none; background: var(--bad); }
+  .fl-alarms b { color: var(--text); font-weight: var(--fw-medium); }
+  .fl.rrow:hover { background: none; }
   .fl .d { color: var(--label); }
   .fl .d.bad { color: var(--text); }
   .fl .d.unk { font-style: italic; }
