@@ -1307,8 +1307,9 @@ class CockpitDB:
         (ids); when the live closure differs, nothing moves and :class:`FamilyChanged` carries the fresh rows. Mode
         ``family`` is :meth:`revoke_devices` for that one root; mode ``only`` revokes the target alone and re-parents
         each of its not-yet-revoked direct children to the target's own ``paired_by`` (their credentials are not
-        rotated). Returns ``{revoked, detached}``."""
-        if mode not in REVOKE_MODES:
+        rotated). Returns ``{revoked, detached}``, what this call committed: a target already revoked re-parents
+        nobody."""
+        if not isinstance(mode, str) or mode not in REVOKE_MODES:
             raise PairingError(f"mode is one of {sorted(REVOKE_MODES)}")
         _check_device_id(device_id)
         if (not isinstance(expect, (list, tuple)) or any(not isinstance(e, str) for e in expect)):
@@ -1324,16 +1325,16 @@ class CockpitDB:
                 raise FamilyChanged(fresh)
             detached: list[str] = []
             if mode == "family":
-                members = _family_closure(conn, [device_id])
+                revoked = _revoke_members(conn, _family_closure(conn, [device_id]), by=by, stamp=stamp)
             else:
-                members = [device_id]
-                detached = [r[0] for r in conn.execute(
-                    "SELECT id FROM paired_devices WHERE paired_by = ? AND revoked_at IS NULL AND id != ? "
-                    "ORDER BY rowid", (PAIRED_PREFIX + device_id, device_id)).fetchall()]
-                for child in detached:
-                    conn.execute("UPDATE paired_devices SET paired_by = ? WHERE id = ?", (row["paired_by"], child))
-            revoked = _revoke_members(conn, members, by=by, stamp=stamp)
-        return {"revoked": revoked, "detached": detached if revoked else []}
+                revoked = _revoke_members(conn, [device_id], by=by, stamp=stamp)
+                if revoked:     # the children are handed on only when this call took the target
+                    detached = [r[0] for r in conn.execute(
+                        "SELECT id FROM paired_devices WHERE paired_by = ? AND revoked_at IS NULL AND id != ? "
+                        "ORDER BY rowid", (PAIRED_PREFIX + device_id, device_id)).fetchall()]
+                    for child in detached:
+                        conn.execute("UPDATE paired_devices SET paired_by = ? WHERE id = ?", (row["paired_by"], child))
+        return {"revoked": revoked, "detached": detached}
 
     def list_devices(self) -> list[dict[str, Any]]:
         """Every paired device, oldest first: id, label, created, last_seen, revoked_at, paired_by. Never a hash."""

@@ -664,18 +664,23 @@
 
   // Revoke is a two-step: the server names the family a revoke would take, the operator sees it on a card, and the revoke
   // carries that exact set back (`expect`) with the mode they chose. A set that moved in between comes back as family_changed
-  // with the fresh set, and the card is drawn again.
+  // with the fresh set, and the card is drawn again. Each Revoke click and each Cancel starts a new flow (flowGen): an answer
+  // for an older flow, landing after the operator moved on, never opens, replaces or closes the card.
+  let flowGen = 0;
   function closeConfirm() { confirmBox.replaceChildren(); }
   async function revoke(d, btn) {
+    const g = ++flowGen;
     btn.disabled = true; say(""); closeConfirm();
     let res;
     try { res = await api("POST", "/cockpit/pair/revoke-preview", { id: d.id }); }
-    catch (_) { say("Could not reach the cockpit."); if (btn.isConnected) btn.disabled = false; return; }
+    catch (_) { if (btn.isConnected) btn.disabled = false; if (g === flowGen) say("Could not reach the cockpit."); return; }
     if (btn.isConnected) btn.disabled = false;
+    if (g !== flowGen) return;
     if (res.status !== 200 || !Array.isArray(res.data.family)) {
       say("Could not check what revoking " + named(d) + " would take (" + (res.data.message || res.status) + ").");
       return;
     }
+    if (!res.data.family.some((f) => f.id === d.id)) { refresh(); say(named(d) + " was already revoked."); return; }
     showConfirm(d, res.data, "");
   }
   // a paired-<id> credential name reads as that device's label when the list holds it; a surface name or the box reads as itself
@@ -686,7 +691,7 @@
   }
   function plural(n) { return n + (n === 1 ? " device" : " devices"); }
   function showConfirm(d, pv, warn) {
-    const fam = pv.family, caller = pv.caller || null, now = Date.now();
+    const fam = pv.family, caller = pv.caller || null, now = Date.now(), g = flowGen;
     const card = el("div", "dev-confirm");
     card.setAttribute("role", "group");
     card.setAttribute("aria-label", "Confirm revoking " + named(d));
@@ -724,6 +729,17 @@
             : n > 1 ? "Revoked " + named(d) + " and " + (n - 1) + " device(s) it had paired." : "Revoked " + named(d) + ".";
         }
       } catch (_) { msg = "Could not reach the cockpit."; }
+      if (g !== flowGen) {    // the operator has moved on to another card: the outcome is said, the card left alone
+        await refresh();
+        if (msg) say(msg);
+        return;
+      }
+      if (changed &&!changed.family.some((f) => f.id === d.id)) {    // revoked elsewhere since the card was drawn
+        closeConfirm();
+        await refresh();
+        say(named(d) + " was already revoked.");
+        return;
+      }
       if (changed) {      // the set moved since it was shown: nothing was revoked; show the fresh set
         closeConfirm();
         showConfirm(d, { family: changed.family, caller: caller }, "The devices changed while this was open. Nothing was revoked; check the list again.");
@@ -735,7 +751,7 @@
     };
     const kids = fam.length > 1;
     if (kids) {
-      const only = el("button", "dev-btn dev-safe", "Revoke only " + named(d));
+      const only = el("button", "dev-btn dev-safe", "Revoke only " + named(d) + (d.id === caller ? " and sign this one out" : ""));
       only.type = "button";
       only.title = "The devices it paired stay paired and are handed to whatever paired it";
       only.addEventListener("click", () => go("only", only));
@@ -751,7 +767,7 @@
     if (kids) card.appendChild(el("div", "dev-link-n", "\u201CRevoke only\u201D takes just " + named(d) + "; the others keep working."));
     const cancel = el("button", "dev-linkbtn", "Cancel");
     cancel.type = "button";
-    cancel.addEventListener("click", closeConfirm);
+    cancel.addEventListener("click", () => { flowGen++; closeConfirm(); });
     card.appendChild(cancel);
     confirmBox.replaceChildren(card);
     try { card.scrollIntoView({ block: "nearest" }); } catch (_) { /* no scrolling here */ }

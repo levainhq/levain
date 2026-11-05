@@ -2835,9 +2835,9 @@ class _Handler(GuardedHandler):
             out = json.loads(got[1])
             out.update(device_id=device, token=token)
             return out, 200
+        # the undo has no operator to confirm a set: it takes the device and whatever family it has now (the cascade)
         undone, ustatus = self._pair_call(
-            lambda db: {"revoked": db.revoke_confirmed(device, expect=[device], mode="family",
-                                                       by=minted_by, now=now)["revoked"]})
+            lambda db: {"revoked": db.revoke_devices([device], by=minted_by, now=now)})
         if ustatus == 200:
             with self.server.pair_epoch_lock:   # after the commit, as every revoke (RU-3)
                 self.server.pair_epoch += 1

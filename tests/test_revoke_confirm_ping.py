@@ -60,6 +60,44 @@ def test_a_gone_subscription_reads_turn_pings_on_again_and_the_button_comes_back
 
 
 @needs_browser
+def test_a_gone_older_subscription_of_the_same_device_is_not_called_this_browsers(full_chrome, rig, pushes, monkeypatch,
+                                                                                  tmp_path) -> None:
+    """L3 r1 (codex MED): one credential holds up to MAX_SUBSCRIPTIONS_PER_DEVICE live subscriptions (an earlier
+    subscribe, another browser holding the same key), and /webpush/test pings them all; a 410 from another one was read
+    as "this browser's subscription is gone" while this browser's own ping was accepted."""
+    from tests.test_cockpit_pairing_http import _call
+
+    src, qdir = rig
+    with _signed(src, qdir) as (port, _h):
+        _dev, tok = _pair(port, label="iPhone")
+        assert _call(port, "POST", "/webpush/subscribe", _sub(8), token=tok)[0] == 200       # the older subscription
+        monkeypatch.setattr(sender, "_post", lambda req: 410 if req.full_url.endswith("/dev8") else 201)
+        out = _drive(tmp_path, f"http://localhost:{port}/#write_token={tok}", _panel(tok, _sub(7), [
+            {"until": ON, "ms": 20000},
+            {"eval": f"{TEST_BTN}.click() || 1"},
+            {"until": f"{NOTE} && {NOTE}.includes('test ping') && !{TEST_BTN}.disabled && {NOTE}", "ms": 20000},
+        ]))
+    note = out["values"][-1]
+    assert "This browser's subscription is gone" not in note, note
+    assert "1 of this device's 2 subscriptions" in note and "dropped 1" in note, note
+
+
+def test_the_test_ping_request_is_never_left_to_reject_unhandled() -> None:
+    """L3 r1 (complement 5): when the 20 s wait wins the race, the api() promise can still reject later; it carries its
+    own catch before the race."""
+    import re
+
+    src = (Path(__file__).resolve().parents[1] / "levain/templates/web/devices_panel.js").read_text()
+    body = src[src.index("async function sendTestPing"):src.index("async function turnOff")]
+    call = re.search(r"const (\w+) = api\(\"POST\", \"/webpush/test\", \{\}\);", body)
+    assert call, body
+    name = call.group(1)
+    assert re.search(rf"{name}\.catch\(\(\) => \{{\s*[^}}]*\}}\);", body), body
+    assert body.index(f"{name}.catch(") < body.index("Promise.race("), body
+    assert f"Promise.race([{name}, wait])" in body, body
+
+
+@needs_browser
 def test_without_a_subscription_the_button_says_why_and_posts_nothing(full_chrome, rig, pushes, tmp_path) -> None:
     src, qdir = rig
     with _signed(src, qdir) as (port, _h):

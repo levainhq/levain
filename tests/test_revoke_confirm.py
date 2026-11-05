@@ -108,6 +108,58 @@ def test_a_surface_token_and_an_unknown_id_are_refused_by_the_preview(src) -> No
         assert _call(port, "POST", REVOKE, {"id": "x", "expect": [], "mode": "weird"}, token=T)[0] == 400
 
 
+def test_an_unhashable_mode_is_a_400_never_a_500(src) -> None:
+    """L3 r1 (all three lineages): a list or object mode raised TypeError inside the REVOKE_MODES check."""
+    with _serve(src) as (port, httpd):
+        laptop, _tl, _kids = _family(port)
+        for mode in (["family"], {"m": 1}, 7, None):
+            st, out, _ = _call(port, "POST", REVOKE, {"id": laptop, "expect": [laptop], "mode": mode}, token=T)
+            assert (st, out.get("error")) == (400, "bad_request"), (mode, st, out)
+        assert len(_live(httpd)) == 4
+
+
+def test_only_mode_on_an_already_revoked_target_moves_nothing_and_reports_nothing(src) -> None:
+    """L3 r1 (complement 2, deepseek 4): the re-parent ran and committed before the revoke found nothing to revoke."""
+    from datetime import datetime, timezone
+
+    with _serve(src) as (port, httpd):
+        laptop, _tl, kids = _family(port)
+        db = httpd.broker.active_db()
+        with db.write() as conn:        # a revoked target whose children are still live (a state no route makes today)
+            conn.execute("UPDATE paired_devices SET revoked_at = '2026-11-04T00:00:00Z' WHERE id = ?", (laptop,))
+        before = {d["id"]: d["paired_by"] for d in db.list_devices()}
+        seen = sorted(v[0] for v in kids.values())
+        out = db.revoke_confirmed(laptop, expect=seen, mode="only", by="browser", now=datetime.now(timezone.utc))
+        assert out == {"revoked": [], "detached": []}, out
+        assert {d["id"]: d["paired_by"] for d in db.list_devices()} == before      # nobody was re-parented
+
+
+def test_a_failed_subscribe_undoes_the_new_device_even_when_it_has_gained_a_child(tmp_path, monkeypatch) -> None:
+    """L3 r1 (complement 4, deepseek HIGH 2): the undo of a pairing whose subscribe failed has no operator to confirm a
+    set, so it must take the device whatever its family is now; a confirm-bound undo refused and left it LIVE."""
+    from datetime import datetime, timezone
+
+    from levain.webpush.store import PushStore
+    from tests.test_cockpit_webpush import _signed, _sub
+
+    qdir = tmp_path / "signq"
+    qdir.mkdir(mode=0o700)
+    src2 = _install(tmp_path)[1]
+    with _signed(src2, qdir) as (port, httpd):
+        def broken(self, endpoint, p256dh, auth, device_id, **kw):
+            # the new device pairs a child of its own before the subscribe fails (a second tab, a fast claim)
+            now = datetime.now(timezone.utc)
+            jdb = httpd.broker.active_db()
+            assert jdb.redeem_offer(jdb.mint_offer(label="child", minted_by=device_id, now=now), now=now)
+            raise OSError("push store unwritable")
+
+        monkeypatch.setattr(PushStore, "add_subscription", broken)
+        st, out, _ = _call(port, "POST", "/webpush/subscribe", _sub(1), token=T)
+        assert (st, out.get("error")) == (500, "internal") and "token" not in out, out
+        live = _live(httpd)
+        assert live == {}, live          # the new device and the child it minted are both revoked
+
+
 # --- the confirm card, in a browser at phone width ---------------------------------------------------------------
 
 import json  # noqa: E402
@@ -169,3 +221,66 @@ def test_the_confirm_card_names_the_family_marks_this_device_and_focuses_the_saf
     assert len(solo["btns"]) == 1 and "only" not in solo["btns"][0], solo
     assert sorted(live) == sorted(x[0] for x in kids.values())             # "only" left the three live
     assert "stay paired" in v[-1], v[-1]
+
+
+WAIT = "new Promise((r) => setTimeout(() => r(1), %d))"
+HEAD = "(document.querySelector('.dev-confirm-h') || {}).textContent || null"
+
+
+@needs_browser
+def test_the_card_follows_the_last_click_warns_on_this_device_and_closes_on_an_already_revoked_target(
+        tmp_path, monkeypatch, src) -> None:
+    """L3 r1: (complement 6) "Revoke only X" on THIS device says it signs this one out; (codex) a slow preview answered
+    after a later Revoke or Cancel never reopens the card; (complement 3, deepseek, codex) a target revoked elsewhere
+    after its card was drawn closes the card with "already revoked", never "Revoked X"."""
+    import time
+
+    from levain.cockpit.firejournal import CockpitDB
+
+    shots = _shots(tmp_path)
+    real = CockpitDB.revoke_preview
+    ids: dict = {}
+
+    def preview(self, device_id):
+        out = real(self, device_id)
+        if device_id == ids.get("iphone"):
+            time.sleep(2.0)                     # an answer that lands after the operator's next click
+        elif device_id == ids.get("ipad"):      # revoked from another device right after its card was drawn
+            from datetime import datetime, timezone
+            self.revoke_devices([device_id], by="browser", now=datetime.now(timezone.utc))
+        return out
+
+    monkeypatch.setattr(CockpitDB, "revoke_preview", preview)
+    with _serve(src) as (port, httpd):
+        laptop, tl, kids = _family(port)
+        ids.update({k: v[0] for k, v in kids.items()})
+        out = _drive(tmp_path, monkeypatch, f"http://127.0.0.1:{port}/#write_token={tl}", [
+            {"emulate": {"w": 390, "h": 844, "dpr": 2, "mobile": True}},
+            {"until": READY, "ms": 20000},
+            {"eval": CLICK_REVOKE % "laptop"},                                   # the caller IS the target
+            {"until": "document.querySelector('.dev-confirm')", "ms": 10000},
+            {"eval": CARD},
+            {"eval": "document.querySelector('.dev-linkbtn').click() || 1"},
+            {"eval": CLICK_REVOKE % "iphone"},                                   # slow preview ...
+            {"eval": CLICK_REVOKE % "pixel"},                                    # ... overtaken by this one
+            {"until": "document.querySelector('.dev-confirm')", "ms": 10000},
+            {"eval": HEAD},
+            {"eval": "document.querySelector('.dev-linkbtn').click() || 1"},     # and then Cancel
+            {"eval": WAIT % 3000},
+            {"eval": "!!document.querySelector('.dev-confirm')"},
+            {"eval": CLICK_REVOKE % "ipad"},
+            {"until": "document.querySelector('.dev-confirm .dev-danger')", "ms": 10000},
+            {"eval": "document.querySelector('.dev-confirm .dev-danger').click() || 1"},
+            {"until": "!document.querySelector('.dev-confirm') && document.querySelector('.dev-note').textContent", "ms": 20000},
+            {"shot": str(shots / "revoke_already_revoked_close_390.png"), "full": False},
+        ])
+        live = _live(httpd)
+    v = [x for x in out["values"] if not (isinstance(x, dict) and "shot" in x)]
+    card = json.loads(next(x for x in v if isinstance(x, str) and x.startswith("{")))
+    assert card["self"] == ["laptop"], card
+    assert card["btns"][0].startswith("Revoke only") and card["btns"][0].endswith("and sign this one out"), card
+    heads = [x for x in v if isinstance(x, str) and x.startswith("Revoke ")]
+    assert len(heads) == 1 and "pixel" in heads[0], v
+    assert False in v, v                     # no card reopened after Cancel
+    assert "already revoked" in v[-1] and "Revoked" not in v[-1], v[-1]
+    assert ids["ipad"] not in live and len(live) == 3
