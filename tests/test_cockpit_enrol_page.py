@@ -196,3 +196,19 @@ def test_the_link_on_a_sheet_the_cockpit_overlay_frames_leaves_the_frame(tmp_pat
             {"until": f"{link} && {link}.getAttribute('target')", "ms": 30000},
         ])
     assert out["values"][-1] == "_top", out["values"]
+
+
+@needs_browser
+def test_a_passkey_the_page_cannot_read_is_named_and_nothing_is_sent(tmp_path: Path, monkeypatch) -> None:
+    rig = _rig_with_no_passkey(tmp_path, monkeypatch)
+    unreadable = "(() => { AuthenticatorAttestationResponse.prototype.getPublicKey = () => null; return 1; })()"
+    with rig.serving():
+        out = _drive(tmp_path, f"{rig.origin}/nope", [
+            DESKTOP, rig.authenticator(), *_open(), {"eval": unreadable},
+            {"tap": "document.querySelector('#enrol-actions button')"},
+            {"until": "/^A passkey was made, and this browser cannot enrol it/.test(document.getElementById('enrol-title').textContent) && 1",
+             "ms": 30000},
+            {"eval": "document.getElementById('enrol-msg').textContent"},
+        ])
+    assert 'A passkey named "levain ' in out["values"][-1], out["values"]
+    assert out["posts"] == []

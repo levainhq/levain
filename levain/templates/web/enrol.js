@@ -119,22 +119,37 @@
   function start() {
     buttons([]);
     say("Make a passkey on this device", "Asking this device for a passkey for " + rpId + "…");
-    cmdEl.replaceChildren();
     const pad = (n) => String(n).padStart(2, "0"), now = new Date(), uid = rand(16);
     const name = "levain " + now.getFullYear() + "-" + pad(now.getMonth() + 1) + "-" + pad(now.getDate())
       + " " + pad(now.getHours()) + ":" + pad(now.getMinutes()) + ":" + pad(now.getSeconds())
       + " " + Array.from(uid.slice(0, 2), (b) => b.toString(16).padStart(2, "0")).join("");
-    const create = made ? Promise.resolve(made) : navigator.credentials.create({ publicKey: {
+    const options = { publicKey: {
       rp: { id: rpId, name: "levain" }, user: { id: uid, name: name, displayName: name },
       challenge: rand(32), pubKeyCredParams: [{ type: "public-key", alg: -7 }], attestation: "none", timeout: 60000,
-      authenticatorSelection: { residentKey: "required", userVerification: "required" } } })
-      .then((cred) => {
-        const r = cred.response;
-        setMade({ rawId: b64u(cred.rawId), spki: b64u(r.getPublicKey()), name: name,
-                  authData: typeof r.getAuthenticatorData === "function" ? b64u(r.getAuthenticatorData()) : "" });
-        return made;
-      });
-    return create.then(send, (e) => {
+      authenticatorSelection: { residentKey: "required", userVerification: "required" } } };
+    let asked;
+    try { asked = made ? Promise.resolve(made) : navigator.credentials.create(options); } catch (e) { asked = Promise.reject(e); }
+    // the creation and the read of its key are separate steps: a passkey the device made but this page cannot read is said
+    // aloud, by name, because it now sits in the device's passwords with nothing to enrol
+    const read = (cred) => {
+      if (cred === made) return made;
+      const r = cred.response;
+      if (!r || typeof r.getPublicKey !== "function" || !r.getPublicKey()) {
+        const e = new Error("no public key");
+        e.name = "NoPublicKey";
+        throw e;
+      }
+      setMade({ rawId: b64u(cred.rawId), spki: b64u(r.getPublicKey()), name: name,
+                authData: typeof r.getAuthenticatorData === "function" ? b64u(r.getAuthenticatorData()) : "" });
+      return made;
+    };
+    return asked.then((cred) => {
+      try { return send(read(cred)); } catch (e) {
+        say("A passkey was made, and this browser cannot enrol it", "It did not give the page the passkey's public key (" + ((e && e.name) || "error")
+            + "). A passkey named \"" + name + "\" now sits in this device's passwords with nothing to enrol: delete it there, then make one on a browser that can.");
+        buttons([["Make a passkey", true, start]]);
+      }
+    }, (e) => {
       say("No passkey was made", "This device did not make one (" + ((e && e.name) || "cancelled") + "). Nothing changed; tap to try again.");
       buttons([["Make a passkey", true, start]]);
     }).catch((e) => {
