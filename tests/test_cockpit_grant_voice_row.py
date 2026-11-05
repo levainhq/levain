@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
 import subprocess
 from datetime import datetime, timezone
 from pathlib import Path
@@ -30,8 +31,7 @@ from tests.test_grant_phone import world  # noqa: F401  (a fixture)
 from tests.test_voice_custody import FakeSecurity
 from tests._grant_helpers import _grant
 
-pytestmark = pytest.mark.skipif(subprocess.run(["which", "ssh-keygen"], capture_output=True).returncode != 0,
-                                reason="needs ssh-keygen")
+pytestmark = pytest.mark.skipif(shutil.which("ssh-keygen") is None, reason="needs ssh-keygen")
 
 _CARDS = "[...document.querySelectorAll('#levain-modal [data-consent-grant]')]"
 _REVOKE = "levain consent grant revoke --data-root /cockpit --signing-key <key> -- "
@@ -45,10 +45,10 @@ def _consent_row(gid: str = "cg-0000000000aa") -> dict:
             "agent": "claude_code", "tools": ["Write"], "workspace": "/work/proj", "postures": ["default"]}
 
 
-def _voice_row(provider: str, gid: str) -> dict:
+def _voice_row(provider: str, gid: str, state: str = "live", **answered) -> dict:
     # the shape grant_view gives a voice key: no expiry, no agent, no tools, no workspace, no postures
     return {"id": gid, "id_shown": gid, "kind": "voice-key", "expires_at": "", "link_seq": 7,
-            "instance": "inst-" + provider, "answered": dict(_EMPTY), "revoke": _REVOKE + gid, "state": "live",
+            "instance": "inst-" + provider, "answered": {**_EMPTY, **answered}, "revoke": _REVOKE + gid, "state": state,
             "provider": provider}
 
 
@@ -70,6 +70,9 @@ def _drive_cards(tmp_path, world, monkeypatch, rows: list[dict]):
             {"until": TILE}, {"eval": _stub(rows)}, {"eval": OPEN_DECISIONS},
             {"until": f"{_CARDS}.length === {len(rows)}"}, *({"eval": e} for e in cards)])
     ids, html, text = out["values"][-3:]
+    # the three evaluations are zipped by position: they must describe the same cards, and one id must be one card
+    assert len(ids) == len(html) == len(text) == len(rows), (len(ids), len(html), len(text), len(rows))
+    assert len(set(ids)) == len(ids), ids
     return dict(zip(ids, zip(html, text)))
 
 
@@ -104,6 +107,41 @@ def test_a_voice_key_row_names_its_provider_and_says_it_is_live_until_revoked(wo
         # the revoke control is the consent row's own: the same command line and the same button
         assert '<code class="consent-code">' + _REVOKE_HTML + gid + "</code>" in html, html
         assert 'class="undo-btn consent-copy"' in html and ">revoke</button>" in html, html
+
+
+@needs_browser
+@pytest.mark.parametrize("state", ["revoked", "inert", "expired"])
+def test_a_voice_key_that_is_not_live_does_not_say_it_is_live_until_revoked(world, tmp_path, monkeypatch, state):
+    """The header says "standing grant · <state>"; the facts line must not contradict it with "Live until you revoke it".
+    A key that is not live draws its state word there. Red with the facts line unconditional on state."""
+    gid = "vk-0000000000aa"
+    got = _drive_cards(tmp_path, world, monkeypatch, [_voice_row("openai", gid, state)])
+    html, text = got[gid]
+    assert "Live until you revoke it" not in text, text
+    assert "standing grant · " + state in text, text
+    assert '<span class="ext-meta">' + state + "</span>" in html, html
+    assert "OpenAI voice key" in text, text
+
+
+@needs_browser
+def test_a_provider_that_is_not_listed_is_drawn_as_it_is_written(world, tmp_path, monkeypatch):
+    """The code says a provider not listed shows as written; it was capitalised ("Elevenlabs"). Red with the fallback
+    capitalising."""
+    gid = "vk-0000000000cc"
+    got = _drive_cards(tmp_path, world, monkeypatch, [_voice_row("elevenlabs", gid), _voice_row("eleven-Labs", "vk-0000000000dd")])
+    assert "elevenlabs voice key" in got[gid][1] and "Elevenlabs" not in got[gid][1], got[gid][1]
+    assert "eleven-Labs voice key" in got["vk-0000000000dd"][1], got["vk-0000000000dd"][1]
+
+
+@needs_browser
+def test_a_voice_key_is_never_drawn_demoted_for_refused_calls(world, tmp_path, monkeypatch):
+    """A voice key answers no request, so a refused count on its record (a malformed or hostile body) neither demotes its
+    row nor sorts it ahead of a consent row. Red with grantRefused counting a voice key's refusals."""
+    rows = [_consent_row(), _voice_row("openai", "vk-0000000000aa", refused_count=3, count=3)]
+    got = _drive_cards(tmp_path, world, monkeypatch, rows)
+    assert list(got) == ["cg-0000000000aa", "vk-0000000000aa"], list(got)         # the order the server sent
+    html = got["vk-0000000000aa"][0]
+    assert "grant-demote" not in html and "ext-accent" not in html and "refused" not in got["vk-0000000000aa"][1], html
 
 
 @needs_browser
@@ -151,20 +189,21 @@ def test_the_page_draws_a_real_voice_key_the_way_the_stub_does(world, tmp_path, 
 
 @needs_browser
 def test_the_grant_slot_shots(world, tmp_path, monkeypatch):
-    """The grants slot with both kinds of row, as a phone shows it and as a desktop does. ``LEVAIN_GRANTPAGE_SHOTS=<dir>``
+    """The grants slot with both kinds of row (a revoked voice key among them), as a phone shows it and as a desktop does. ``LEVAIN_GRANTPAGE_SHOTS=<dir>``
     says where the PNGs go and ``LEVAIN_GRANTPAGE_PREFIX`` names them (before or after); else they land in the tmp dir and
     the test only proves the page draws."""
     out_dir = Path(os.environ.get("LEVAIN_GRANTPAGE_SHOTS") or tmp_path)
     prefix = os.environ.get("LEVAIN_GRANTPAGE_PREFIX") or "after"
     out_dir.mkdir(parents=True, exist_ok=True)
-    rows = [_consent_row(), _voice_row("openai", "vk-0000000000aa"), _voice_row("deepgram", "vk-0000000000bb")]
+    rows = [_consent_row(), _voice_row("openai", "vk-0000000000aa"), _voice_row("deepgram", "vk-0000000000bb"),
+            _voice_row("openai", "vk-0000000000ee", "revoked")]
     monkeypatch.setenv("LEVAIN_HOME", str(world.qdir.parent))
     _root, src, _ids = _install(tmp_path)
     look = ("(() => { const h = [...document.querySelectorAll('#levain-modal .ext-grouphead')].find(e => /standing grants/"
             ".test(e.textContent)); if (!h) return 'missing'; h.scrollIntoView({block: 'start'}); return 'ok'; })()")
     with _serve(src, surface_tokens={"browser": "T"}, install_class="reported") as (url, _httpd):
         open_steps = [{"until": TILE}, {"eval": _stub(rows)}, {"eval": OPEN_DECISIONS},
-                      {"until": f"{_CARDS}.length === 3", "ms": 30000}, SETTLE, {"eval": look}, SETTLE]
+                      {"until": f"{_CARDS}.length === {len(rows)}", "ms": 30000}, SETTLE, {"eval": look}, SETTLE]
         phone = drive_touch(tmp_path, f"{url}/#write_token=T",
                             [*PHONE_TOUCH, *open_steps, {"shot": str(out_dir / f"{prefix}_390.png"), "full": False}])
         desk = _drive(tmp_path, f"{url}/#write_token=T",

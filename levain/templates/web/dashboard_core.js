@@ -6802,8 +6802,10 @@
   // off the newest calls it sends (a refusal older than those still counts)
   const grantRefusedShown = (g) => (g && g.answered && Array.isArray(g.answered.recent) ? g.answered.recent : [])
     .filter((c) => c && c.outcome === "refused").length;
-  const grantRefused = (g) => Math.max(g && g.answered && Number.isInteger(g.answered.refused_count) ? g.answered.refused_count : 0,
-                                       grantRefusedShown(g));
+  // a voice key answers no request, so it has no refusals to count: whatever its record carries, it is never demoted
+  const grantRefused = (g) => (g && g.kind === "voice-key" ? 0
+    : Math.max(g && g.answered && Number.isInteger(g.answered.refused_count) ? g.answered.refused_count : 0,
+               grantRefusedShown(g)));
   // the speech providers' names as levain.voice.providers.NAMES spells them; a provider not listed shows as it is written
   const VOICE_PROVIDER_NAMES = { openai: "OpenAI", deepgram: "Deepgram" };
   function grantCard(g, inertNote, signList) {
@@ -6821,7 +6823,7 @@
     const count = Number.isInteger(a.count) ? a.count : 0;
     if (voiceKey) {
       const p = sv(g.provider);
-      head.appendChild(el("span", "consent-agent", (Object.prototype.hasOwnProperty.call(VOICE_PROVIDER_NAMES, p) ? VOICE_PROVIDER_NAMES[p] : (p ? p.charAt(0).toUpperCase() + p.slice(1) : "")) + (p ? " " : "") + "voice key"));
+      head.appendChild(el("span", "consent-agent", (Object.prototype.hasOwnProperty.call(VOICE_PROVIDER_NAMES, p) ? VOICE_PROVIDER_NAMES[p] : p) + (p ? " " : "") + "voice key"));
       head.appendChild(el("span", "ext-meta", "standing grant · " + state));
     } else {
       head.appendChild(el("span", "consent-agent", sv(g.agent) || sv(g.kind) || "grant"));
@@ -6835,7 +6837,10 @@
     const facts = el("div", "consent-facts");
     if (sv(g.workspace)) facts.appendChild(el("span", "ext-meta", "in " + g.workspace));
     if (Array.isArray(g.postures) && g.postures.length) facts.appendChild(el("span", "ext-meta", g.postures.join(", ") + " mode"));
-    facts.appendChild(el("span", "ext-meta", voiceKey ? "Live until you revoke it" : (state === "expired" ? "expired " : "until ") + sv(g.expires_at)));
+    // a voice key has no date: it is live until revoked, and any other state is drawn as its bare word (the head says it too)
+    const untilText = voiceKey ? (state === "live" ? "Live until you revoke it" : state)
+                               : (state === "expired" ? "expired " : "until ") + sv(g.expires_at);
+    if (untilText) facts.appendChild(el("span", "ext-meta", untilText));
     facts.appendChild(el("span", "ext-meta", sv(g.kind) + " " + sv(g.id_shown)));
     row.appendChild(facts);
     if (state === "inert" && inertNote) row.appendChild(el("div", "consent-note ext-meta", inertNote));
