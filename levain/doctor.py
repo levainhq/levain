@@ -1904,11 +1904,13 @@ def _check_control(host: str, running: Any, status: tuple[bool, Any]) -> CheckRe
 
 def _check_held(status: tuple[bool, Any], beat: tuple[str, Any], now: float) -> CheckResult:
     from levain import unshowable
+    from levain.slot import end as E
     from levain.slot import records as R
     from levain.slot.grammar import SESSION_RE
 
     name = "agent held sessions"
     held: dict[str, str] = {}
+    quarantined: set[str] = set()
     listed = status[0] and type(status[1]) is list
     shown_by_control: set[str] = set()
     if listed:
@@ -1920,8 +1922,14 @@ def _check_held(status: tuple[bool, Any], beat: tuple[str, Any], now: float) -> 
             if rec.get("state") == R.HELD:
                 step = rec.get("failed_step")
                 tries = rec.get("held_attempts")
-                held[sess] = (f"{unshowable.mark(step[:32], allow='')}" if type(step) is str else "?") + (
-                    f" ({tries} tries)" if type(tries) is int else "")
+                reason = rec.get("held_reason")
+                at = f"{unshowable.mark(step[:32], allow='')}" if type(step) is str else "?"
+                if type(tries) is int and type(reason) is str and E.quarantined(
+                        {"held_attempts": tries, "held_reason": reason}):
+                    quarantined.add(sess)       # derived from the record, as the reaper derives it
+                    held[sess] = f"{at}, quarantined after {tries} tries: {unshowable.mark(reason[:64], allow='')}"
+                else:
+                    held[sess] = at + (f" ({tries} tries)" if type(tries) is int else "")
     fresh = _fresh_beat(beat, now)
     if fresh is not None:
         for s in fresh["held"]:
@@ -1948,11 +1956,25 @@ def _check_held(status: tuple[bool, Any], beat: tuple[str, Any], now: float) -> 
         return CheckResult(name, True, "none")
     shown = [f"{s} at {w}" if w else s for s, w in sorted(held.items())[:_HELD_NAMED]]
     more = f" and {len(held) - _HELD_NAMED} more" if len(held) > _HELD_NAMED else ""
+    retrying = " while the reaper retries" if len(quarantined) < len(held) else ""
+    hint = ("The reaper retries with a backoff; if the named step keeps failing, its service log says why. "
+            "If `repair` refuses `live-lease` for this session (it was stranded by an older release's END), "
+            "release it from this install's package, in order:\n" + _held_commands())
+    if quarantined:
+        hint = _quarantine_hint() + ("\n" + hint if len(quarantined) < len(held) else "")
     return CheckResult(name, False, f"{len(held)} stuck mid-end: {'; '.join(shown)}{more}; each keeps its slot leased "
-                       "and its tree untouched while the reaper retries",
-                       "The reaper retries with a backoff; if the named step keeps failing, its service log says why. "
-                       "If `repair` refuses `live-lease` for this session (it was stranded by an older release's END), "
-                       "release it from this install's package, in order:\n" + _held_commands())
+                       f"and its tree untouched{retrying}", hint)
+
+
+def _quarantine_hint() -> str:
+    """What to do about a QUARANTINED held session: the reaper has stopped retrying it, so fix the cause and restart
+    the reaper (a restarted reaper tries every HELD once). The stop and start lines are the two :func:`reap_held_lines`
+    already builds for this host: no new command source and no new verb."""
+    host = "darwin" if sys.platform == "darwin" else "linux"
+    lines = reap_held_lines(host, os.path.dirname(os.path.abspath(__file__)))
+    return ("The reaper has stopped retrying the quarantined ones; each keeps its slot leased and its tree untouched. "
+            "The reaper's service log names the entry. Fix that, then restart the reaper to try once more: "
+            f"`{lines[0]}` then `{lines[3]}`.")
 
 
 def reap_held_lines(host: HostOS, source: str) -> tuple[str, ...]:

@@ -72,7 +72,7 @@ EDGES: frozenset[tuple[str, str]] = frozenset(
 
 #: §7.2's CAS-writable ``fields``, exactly. ``claims`` change only through ATTACH / MINT,
 #: ``artifact_acked`` only through ARTIFACT-ACK, ``lease_live`` only through the lease.
-CAS_FIELDS = frozenset({"failed_step", "held_attempts", "brake_reason", "touched", "manifest",
+CAS_FIELDS = frozenset({"failed_step", "held_attempts", "held_reason", "brake_reason", "touched", "manifest",
                         "artifact_digest", "artifact_failed", "verifier_report_digest",
                         "verifier_report_refused", "identity"})
 
@@ -637,6 +637,9 @@ def _identity(value: object) -> dict[str, object]:
 FIELD_CHECKS: Mapping[str, Callable[[object], object]] = {
     "failed_step": lambda v: _match(v, "failed_step", _STEP_RE),
     "held_attempts": lambda v: _uint(v, "held_attempts"),
+    # 1105-17 heldbuild: the refusal NAME behind a HELD (``failed_step`` is too coarse to classify), optional and
+    # additive; absent reads as unclassified, which the reaper treats as transient.
+    "held_reason": lambda v: _match(v, "held_reason", _REASON_RE),
     "brake_reason": lambda v: _match(v, "brake_reason", _REASON_RE),
     "touched": lambda v: list(_str_list(v, "touched", TOUCHED_NAMES, MAX_TOUCHED)),
     "manifest": _manifest,

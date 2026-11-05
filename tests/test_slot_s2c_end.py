@@ -872,7 +872,8 @@ def test_kill_failure_held(world, seam, failed):
     pre_live = snapshot(world.S)
     ctl = Control()
     assert end_session(world.facts, world.seams(ctl, **seam), record_state=REVOKED) == HELD
-    assert ctl.history[-1] == (HELD, {"failed_step": failed, "held_attempts": 1})
+    # 1105-17 heldbuild: the refusal's name rides the HELD CAS (a transient class: the reaper keeps retrying it)
+    assert ctl.history[-1] == (HELD, {"failed_step": failed, "held_attempts": 1, "held_reason": "kill-unproven"})
     assert snapshot(world.S) == pre_live                  # tree untouched, credential not moved
     assert os.listdir(world.facts.keep) == [] and not world.facts.intent.exists()
     assert not world.facts.retained.exists()
