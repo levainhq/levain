@@ -309,6 +309,14 @@ if "frame-src" in _CSP:     # pragma: no cover - the cockpit page's frame-src is
 _COCKPIT_PAGE_CSP = _CSP + "; frame-src 'self'"
 
 
+# the one query a cross-site navigation to the cockpit page may carry: a push tap's own deep link (``/?view=notifications``
+# with an optional ``&n=<item id>``, or ``/?view=needs``), exactly the shapes the sender builds (center.push_url, held's
+# summary urls). 1105-7: a tap that reaches Chrome as a launcher intent (an intent-launched navigation was measured on an
+# Android emulator) arrives ``Sec-Fetch-Site: cross-site``, and the bare-``/`` rule alone answered it a plain-text 403.
+# Every parameter is named and bounded, so a pair code, a token or any other query on ``/`` stays refused.
+_PUSH_TAP_QUERY = re.compile(r"view=(?:needs|notifications(?:&n=[pn][1-9][0-9]{0,17})?)")
+
+
 def _sheet_id(path: str) -> "str | None":
     """The request id of ``GET /sign/<id>``, else None."""
     rid = path[len(_SHEET_PREFIX):] if path.startswith(_SHEET_PREFIX) else ""
@@ -1843,6 +1851,11 @@ class _Handler(GuardedHandler):
         finally:
             self._frame_headers = None
 
+    def _push_tap_path(self) -> bool:
+        """True for ``/?<a push tap's deep link>`` (see :data:`_PUSH_TAP_QUERY`): the exact raw path, no other parameter."""
+        path, sep, query = self.path.partition("?")
+        return path == "/" and bool(sep) and _PUSH_TAP_QUERY.fullmatch(query) is not None
+
     def _cross_site_pair_navigation(self) -> bool:
         """P2 L3 r1 F1: a pair link opened from webmail or another site is a top-level ``GET /pair`` navigation and
         arrives ``Sec-Fetch-Site: cross-site``, which the shared read preamble refuses. That page is a static shell
@@ -1854,10 +1867,12 @@ class _Handler(GuardedHandler):
         a cross-site frame of it is refused here, its own-origin frame is what its headers admit. The consent sheet
         ``GET /sign/consent/<id>`` (OS-2) is the same shell over a consent request, admitted alike. The bare ``GET /`` is the
         dashboard shell, which carries ``legacy_phone_link.js``: an old phone link opened from a message or a mail page
-        arrives cross-site and must reach that script to land on its sign sheet (W1a); exact raw path, no query."""
+        arrives cross-site and must reach that script to land on its sign sheet (W1a); exact raw path, no query, except a
+        push tap's own deep link (:meth:`_push_tap_path`)."""
         page = self.path.split("?", 1)[0]
         return (self.command == "GET"
-                and (self.path == "/pair" or self.path == "/" or _sheet_id(page) is not None or _consent_sheet_id(page) is not None
+                and (self.path == "/pair" or self.path == "/" or self._push_tap_path()
+                     or _sheet_id(page) is not None or _consent_sheet_id(page) is not None
                      or _dispatch_sheet_id(page) is not None or page == _COORD_SHEET)
                 and self.headers.get("Sec-Fetch-Site") == "cross-site"
                 and self.headers.get("Sec-Fetch-Mode") == "navigate"
