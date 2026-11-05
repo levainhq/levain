@@ -759,11 +759,13 @@ def test_head_reads_a_replica_whose_path_holds_uri_characters(rig, tmp_path):
     assert replica.head() == (rows[-1].seq, rows[-1].hash)
 
 
-def test_release_with_a_holder_that_carries_no_claims_fails_closed(rig, wire):
-    from types import SimpleNamespace
-    with pytest.raises(LauncherRefusedT) as exc:
-        wire.server._release_claims({"ledger_head": wire.head()}, SimpleNamespace(claims=None))
-    assert exc.value.name == "ledger-head-missing"
+def test_release_that_carries_no_bar_of_its_own_fails_closed(rig, wire):
+    # B2-rel/S10: RELEASE reads its own bar at RELEASE (the holder no longer carries LAUNCH claims); a frame with a
+    # ledger_head but no bar is refused, never judged against a default bar (the B1 r1 property, on the later design)
+    with pytest.raises(C.WireError):
+        wire.server._release_claims({"ledger_head": wire.head()})
+    with pytest.raises(C.WireError):
+        wire.server._release_claims({})
 
 
 def test_a_replica_that_moves_during_the_check_is_named_ledger_behind(rig, tmp_path, monkeypatch):
