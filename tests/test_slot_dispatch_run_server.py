@@ -29,6 +29,7 @@ from levain.agents import session as S
 from levain.agents import session_client as C
 from levain.agents import session_launcher as L
 from levain.agents.accounting import ActionExposure
+from levain.cockpit.consent import utc_stamp
 from levain.slot.services import dispatch_run as D
 from tests.test_agents_launch import Rig
 from tests.test_agents_session_launch import EXP, _occurrence, _reservation, _run
@@ -877,6 +878,132 @@ def test_an_expiry_alone_ends_no_running_session(rig, wire):
     h = wire.server._live["s-00000000000000b1"]
     with pytest.raises(L.LauncherRefused, match="link-not-live"):     # the same link at a point of use still refuses
         wire.server._verify(h.proof, h.exposure, D.FrameClaims((wire.head()["seq"], wire.head()["hash"]), (False, 0)))
+    sock.close()
+
+
+# --- levain 35, lease fix (L3 lease r2) ---------------------------------------------------------------------------------
+
+def _renew(rig, link_id, signer="laptop", days=29):
+    at = rig.world.clock.now + timedelta(minutes=1)        # World.link moves the clock a minute before it signs
+    rig.world.link({"op": "renew", "grant_id": link_id, "expires_at": utc_stamp(at + timedelta(days=days)),
+                    "signed_at": utc_stamp(at)}, signer)
+
+
+@pytest.mark.parametrize("twice", [False, True])
+def test_a_legal_renewal_of_the_running_sessions_own_link_keeps_the_session(rig, wire, twice):
+    """L3 lease r2 MED (codex): a renew moves the link's ``grant_seqs`` to the renewal row, so the LAUNCH proof's
+    ``current`` row is no longer the ledger's. The re-judge used to read that as ``link-proof-mismatch`` (standing) and
+    END a healthy session: the operator's own renewal killed his own run. A renewal (twice over too) keeps it."""
+    oid, sock = _released(rig, wire)
+    link_id = rig.row(oid)["link_id"]
+    calls = _count_verifies(wire)
+    _renew(rig, link_id)
+    if twice:
+        _renew(rig, link_id)
+    state = rig.authority.replay()
+    h = wire.server._live["s-00000000000000b1"]
+    assert state.grant_seqs[link_id] > h.proof.current.seq, "the renew did not move the link's current row"
+    assert wire.sync()["ok"] is True
+    assert _rejudge_idle(wire.server)
+    assert calls, "the re-judge never ran, so this case proves nothing"
+    assert wire.runtime.ended == [] and "s-00000000000000b1" in wire.server._live
+    assert wire.launcher_index("s-00000000000000b1").get("state") != "ended"
+    # the point of use stays exact: a LAUNCH or RELEASE with the old proof still refuses (a fire re-reads its proof)
+    with pytest.raises(L.LauncherRefused, match="link-proof-mismatch"):
+        wire.server._verify(h.proof, h.exposure, D.FrameClaims((wire.head()["seq"], wire.head()["hash"]), (False, 0)))
+    sock.close()
+
+
+@pytest.mark.parametrize("how", ["agent", "grant", "key"])
+def test_a_revoke_after_a_renewal_of_the_running_link_still_ends_it(rig, wire, how):
+    """The renewal tolerance does not reach the revoke path: renew, then revoke (agent, the link, or its born signer's
+    key), each SYNCed on its own: the first SYNC keeps the session, the second ENDs it."""
+    oid, sock = _released(rig, wire)
+    _renew(rig, rig.row(oid)["link_id"])
+    assert wire.sync()["ok"] is True
+    assert _rejudge_idle(wire.server) and wire.runtime.ended == []
+    _sign(rig, oid, how)
+    assert wire.sync()["ok"] is True
+    assert _ended(wire), "a revoke after a renewal ended nothing"
+    assert wire.runtime.ended == ["sess-1"]
+    sock.close()
+
+
+def test_a_renewal_signed_by_a_key_since_revoked_ends_the_session(rig, wire):
+    """The renewal row the ledger now holds is part of what the link means: a second key renews the link and is then
+    revoked. The LAUNCH proof's own rows still stand (the first key), but the link's current row's signer does not."""
+    oid, sock = _released(rig, wire)
+    second = Key(rig.world.tmp / "keys", "laptop2")
+    rig.world.keys["laptop2"] = (second.fp, lambda m: second.sign(m, auth.NAMESPACE))
+    rig.world.link({"op": "enrol", "fingerprint": second.fp, "public_key": second.public_key,
+                    "class": "laptop-presence", "custody": "passphrase"}, "laptop")
+    _renew(rig, rig.row(oid)["link_id"], signer="laptop2")
+    assert wire.sync()["ok"] is True
+    assert _rejudge_idle(wire.server) and wire.runtime.ended == []
+    rig.world.link({"op": "revoke_key", "fingerprint": second.fp}, "laptop")
+    assert wire.sync()["ok"] is True
+    assert _ended(wire), "the renewal's revoked signer ended nothing"
+    sock.close()
+
+
+@pytest.mark.parametrize("fault", ["seq-past", "genuine-before-born", "genuine-after-current", "record", "signature"])
+def test_a_rejudge_proof_whose_current_row_is_not_a_genuine_earlier_row_of_the_link_is_refused(rig, fault):
+    """The re-judge accepts an EARLIER current row only as an authentic row of the ledger, at or after the link's born
+    row and before its current one; a forged, moved or out-of-range row (an authentic row of another link included)
+    still refuses ``link-proof-mismatch`` or ``link-signature-invalid`` (verify_point_of_use, ``rejudge=True``)."""
+    oid = _occurrence(rig, billing="subscription", exposure=EXP)
+    proof = _proof(rig, oid)
+    _renew(rig, rig.row(oid)["link_id"])
+    rig.link()                                                        # an unrelated row past the link's current one
+    assert _check(rig, proof, rejudge=True) is None                   # the genuine earlier row passes
+    cur, rows = proof.current, {r.seq: r for r in _source(rig)}
+
+    def genuine(seq):
+        r = rows[seq]
+        return C.LinkRow(r.seq, r.prev_hash, r.record, r.signer_fp, r.signature)
+    if fault == "seq-past":
+        bad, name = dataclasses.replace(cur, seq=rig.authority.replay().seq + 1), "link-proof-mismatch"
+    elif fault == "genuine-before-born":
+        bad, name = genuine(proof.born.seq - 1), "link-proof-mismatch"
+    elif fault == "genuine-after-current":
+        bad, name = genuine(rig.authority.replay().seq), "link-proof-mismatch"
+    elif fault == "record":
+        bad, name = dataclasses.replace(cur, record=cur.record + " "), "link-proof-mismatch"
+    else:
+        bad, name = dataclasses.replace(cur, signature=cur.signature.replace("A", "B", 3)), "link-signature-invalid"
+    with pytest.raises(L.LauncherRefused) as exc:
+        _check(rig, dataclasses.replace(proof, current=bad), rejudge=True)
+    assert exc.value.name == name
+
+
+def test_a_holder_with_no_claims_is_skipped_by_the_rejudge_not_ended(rig, wire):
+    """L3 lease r2 MED (deepseek): a live holder whose ``claims`` is None. Unreachable by construction (every LAUNCH on
+    a replica server decodes its claims or is refused), so the record is forced here. The replica verifier would refuse
+    it ``ledger-head-missing`` (standing) and END a session over a hole in the server's own record; it is skipped, and
+    a revoke SYNCed afterwards for that session is left to the operator tick."""
+    oid, sock = _released(rig, wire)
+    seen = []
+    real = wire.server._verify
+
+    def verify(proof, exposure, claims=None):
+        seen.append(claims)
+        return real(proof, exposure, claims)
+    wire.server._verify = verify
+    wire.server._live["s-00000000000000b1"].claims = None
+    rig.link()
+    assert wire.sync()["ok"] is True
+    assert _rejudge_idle(wire.server)
+    assert seen == [] and wire.runtime.ended == [] and "s-00000000000000b1" in wire.server._live
+    sock.close()
+
+
+def test_every_launch_on_a_replica_server_carries_claims_into_its_holder(rig, wire):
+    """The construction the guard above rests on: on a server with a replica, a LAUNCH's holder holds the frame's
+    claims (a LAUNCH with no ledger head or no bar is refused before any holder exists: pinned in
+    ``tests/test_agents_authority_replica.py``, the ``for missing in`` case)."""
+    _, sock = _released(rig, wire)
+    claims = wire.server._live["s-00000000000000b1"].claims
+    assert claims is not None and claims.rejudge is False and claims.ledger_head[0] >= 1
     sock.close()
 
 
