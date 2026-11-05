@@ -108,30 +108,58 @@
   window.addEventListener("hashchange", () => { if (location.hash) location.reload(); });
 
   // The one door to the authenticator in this page. navigator.credentials.get is called from pkGet and nowhere else, and only
-  // while a tap is armed: a click or Enter/Space arms it (the capture listeners), one get() consumes it. A focus, visibility,
-  // pageshow, online, reconnect, render or timer never arms it, so a passkey sheet taking the window's focus (and giving it
-  // back) cannot ask for another. A refusal or cancel is never retried here: the page says so and the next tap asks again.
-  // A remembered credential the authenticator refused is dropped for the NEXT tap's ask (the OS's own list), kept on disk.
-  const PK_ARM_MS = 90000;
+  // while a tap is armed. Only a person's own press arms it (event.isTrusted): a click on a control, Space or Enter on a
+  // control, Enter in a one-line field, Cmd/Ctrl+Enter anywhere. Space or Enter typed into a text box does not, nor does an
+  // evaluated .click() or a dispatched event, a focus, visibility, pageshow, online, reconnect, render or timer, so a passkey
+  // sheet taking the window's focus (and giving it back) cannot ask for another. One get() consumes the arm (one tap, one
+  // ask), and it lapses after PK_ARM_MS: long enough for the challenge read a tap starts before its prompt, so a flow stalled
+  // well past its tap shows no prompt and says a tap tries again. A refusal or cancel is never retried here: the page says so
+  // and the next tap asks again. A remembered credential the authenticator refused is dropped for the next tap's ask (the
+  // OS's own list), kept on disk, until a passkey signs for that rpId|fp (pkSigned).
+  // tapArmable is the same text in dashboard_core.js (test_passkey_tap_only holds the two equal)
+  const PK_ARM_MS = 10000;
+  // tapArmable:begin
+  const TAP_CONTROL = "button, a[href], summary, select, label, input, [role=button], [role=menuitem], [role=option], [role=radio], [role=checkbox], [role=tab], [role=link]";
+  const TAP_TEXT = "textarea, [contenteditable]:not([contenteditable=false]), input:not([type]), input[type=text], input[type=search], input[type=email], input[type=url], input[type=tel], input[type=password], input[type=number]";
+  function tapArmable(ev) {
+    if (!ev || !ev.isTrusted) return false;
+    const t = ev.target && typeof ev.target.closest === "function" ? ev.target : null;
+    if (!t) return false;
+    const text = t.closest(TAP_TEXT);
+    if (ev.type === "click") return !text && !!t.closest(TAP_CONTROL);
+    if (ev.type !== "keydown" || ev.isComposing || ev.repeat) return false;
+    if (ev.key === "Enter" && (ev.metaKey || ev.ctrlKey)) return true;
+    if (text) return ev.key === "Enter" && text.tagName === "INPUT";
+    return (ev.key === "Enter" || ev.key === " ") && !!t.closest(TAP_CONTROL);
+  }
+  // tapArmable:end
   let pkArmedAt = 0;
-  const pkArm = () => { pkArmedAt = Date.now(); };
+  const pkArm = (ev) => { if (tapArmable(ev)) pkArmedAt = Date.now(); };
   document.addEventListener("click", pkArm, true);
-  document.addEventListener("keydown", (ev) => { if (ev.key === "Enter" || ev.key === " ") pkArm(); }, true);
+  document.addEventListener("keydown", pkArm, true);
   const pkRefused = new Set();
+  const pkKey = (pk, k) => String(pk.rpId) + "|" + String(k && k.fp);
+  // the door's own refusal (no tap asked) is NoTapError, never NotAllowedError: no authenticator was asked, so it is never
+  // read as a cancel and never drops the remembered credential (only the get() below's own refusal does)
   function pkGet(pk, id, k) {
     if (!pkArmedAt || Date.now() - pkArmedAt > PK_ARM_MS) {
-      return Promise.reject(Object.assign(new Error("no tap asked for this passkey prompt"), { name: "NotAllowedError" }));
+      pkArmedAt = 0;
+      return Promise.reject(Object.assign(new Error("no tap asked for this passkey prompt"), { name: "NoTapError" }));
     }
     pkArmedAt = 0;
-    const key = String(pk.rpId) + "|" + String(k && k.fp);
+    const key = pkKey(pk, k);
     const use = id && !pkRefused.has(key) ? id : null;
     return navigator.credentials.get({ publicKey: use ? Object.assign({}, pk, { allowCredentials: [{ type: "public-key", id: use }] }) : pk })
       .catch((e) => { if (e && e.name === "NotAllowedError" && use && k && k.local) pkRefused.add(key); throw e; });
   }
+  // a passkey signed for rpId|fp (where the record is updated to the credential that signed): a refusal recorded for it is
+  // over, so the next tap asks for the recorded passkey by its id again
+  function pkSigned(pk, k) { pkRefused.delete(pkKey(pk, k)); }
 
   // what a refused passkey ceremony says: a cancel and a timeout both raise NotAllowedError, so that name is said in words
   function passkeyWhy(e) {
     const n = e && e.name;
+    if (n === "NoTapError") return "No passkey prompt was shown (no tap asked for one in time), so the passkey did not sign";
     if (!n || n === "NotAllowedError") return "You cancelled, or the passkey prompt timed out, so the passkey did not sign";
     return "The passkey did not sign (" + n + ")";
   }
@@ -795,6 +823,7 @@
         return call(base + steps[1], answer).then((a) => {
           if (!a.ok && a.status >= 400 && a.status < 500) return unsigned("Not signed: " + why(a));
           if (!a.ok) { say("Not sure this was signed (" + why(a) + ").", "bad"); return unsure(); }
+          pkSigned(pk, k);
           if (cred.rawId && mine(rp)[fp] !== b64u(cred.rawId)) remember(rp, fp, b64u(cred.rawId));
           const by = typeof a.body.signer_fp === "string" && a.body.signer_fp ? a.body.signer_fp : fp;
           const ns = typeof a.body.namespace === "string" && a.body.namespace ? " in " + a.body.namespace : "";
@@ -1126,6 +1155,7 @@
           const envelope = { body_text: c.body_text, payload: ch.body.payload, authenticator_data: b64u(cred.response.authenticatorData),
                              client_data_json: b64u(cred.response.clientDataJSON), signature: b64u(cred.response.signature) };
           sent = true;
+          pkSigned(pk, k);
           if (cred.rawId && mine(rp)[k.fp] !== b64u(cred.rawId)) remember(rp, k.fp, b64u(cred.rawId));
           signedLine = line;
           return sendDrop({ words: c.words, outbox_id: oid, sent_at: stamp(), store_id: storeId, envelope: envelope });
@@ -1384,6 +1414,7 @@
             const req = { review_id: r.id, body_text: r.body_text, payload: ch.body.payload, authenticator_data: b64u(cred.response.authenticatorData),
                           client_data_json: b64u(cred.response.clientDataJSON), signature: b64u(cred.response.signature) };
             sent = true;
+            pkSigned(pk, k);
             if (cred.rawId && mine(rp)[k.fp] !== b64u(cred.rawId)) remember(rp, k.fp, b64u(cred.rawId));
             return post("draft-accept", req).then((a) => {
               if (a.ok) {
