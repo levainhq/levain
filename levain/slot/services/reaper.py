@@ -50,26 +50,8 @@ EX_INSTANCE_HELD = 75                                     # EX_TEMPFAIL
 WAKE_DRAIN_MAX = 64
 
 
-#: The size past which :func:`_bound_log` empties the unit's log. [judged: the worker's pass line is about 190 bytes a
-#: minute, so 4 MiB is some two weeks of passes, and a quarantine line is rare]. launchd opens the log for appending and
-#: never trims it (``units.launchd_log_path``), and the reaper's three processes share that one descriptor.
-LOG_MAX_BYTES = 4 << 20
-
-
-def _bound_log(fd: int = 2) -> None:
-    """Empty ``fd``'s file when it is a regular file past :data:`LOG_MAX_BYTES`. A terminal or a pipe is left alone. The
-    descriptor is O_APPEND (launchd), so a truncate by one process leaves the next process's write at the new end."""
-    try:
-        st = os.fstat(fd)
-        if stat.S_ISREG(st.st_mode) and st.st_size > LOG_MAX_BYTES:
-            os.ftruncate(fd, 0)
-    except OSError:
-        pass
-
-
 def _log(msg: str) -> None:
     try:
-        _bound_log()
         sys.stderr.write(f"levain reaper[{os.getpid()}]: {msg}\n")
         sys.stderr.flush()
     except Exception:   # noqa: BLE001

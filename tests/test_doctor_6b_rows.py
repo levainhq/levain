@@ -584,6 +584,18 @@ def test_the_reaper_log_the_rows_name_is_the_file_its_plist_writes_to():
     assert units.systemd_name(reaper) in doctor.reaper_log_where("linux")
 
 
+def test_the_darwin_reaper_log_words_say_when_the_file_is_not_there_yet(tmp_path: Path):
+    """L3 v2fix r1: a Mac installed before the plist kept a log has no file at the path; the words say it is not created
+    until `sudo levain setup-isolation` is re-run, and say nothing of the kind once the file exists."""
+    from levain.slot import units
+    real = str(units.launchd_log_path(units.by_name("reaper")))
+    absent = doctor.reaper_log_where("darwin", exists=lambda p: False)
+    assert real in absent and "not created until `sudo levain setup-isolation` is re-run" in absent
+    present = doctor.reaper_log_where("darwin", exists=lambda p: p == real)
+    assert real in present and "not created" not in present
+    assert "not created" not in doctor.reaper_log_where("linux", exists=lambda p: False)
+
+
 def test_the_quarantine_hint_and_the_held_hint_name_where_the_reaper_logs(tmp_path: Path):
     import sys
     recs = [{"session": SESSION, "state": "HELD", "failed_step": "tree", "held_attempts": 3,

@@ -39,7 +39,7 @@ import time
 import tomllib
 from dataclasses import dataclass
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Sequence
+from typing import TYPE_CHECKING, Any, Callable, Sequence
 
 from levain.slot import SUDO
 
@@ -1969,15 +1969,18 @@ def _check_held(status: tuple[bool, Any], beat: tuple[str, Any], now: float) -> 
                        f"and its tree untouched{retrying}", hint)
 
 
-def reaper_log_where(host: HostOS) -> str:
+def reaper_log_where(host: HostOS, exists: Callable[[str], bool] = os.path.exists) -> str:
     """Where the reaper's stderr (its quarantine and failed-pass lines) is kept, as words for a hint: on macOS the file the
     LaunchDaemon's own ``StandardErrorPath`` names (read from the unit, never a literal here), on Linux the journal
-    command for its systemd unit."""
+    command for its systemd unit. A Mac installed before the plist kept a log has no such file until setup is re-run, and
+    the words say so while the path does not exist."""
     from levain.slot import units
 
     svc = units.by_name("reaper")
     if host == "darwin":
-        return f"service log {units.launchd_log_path(svc)}"
+        path = str(units.launchd_log_path(svc))
+        gap = "" if exists(path) else " (not created until `sudo levain setup-isolation` is re-run)"
+        return f"service log {path}{gap}"
     return f"journal (`journalctl -u {units.systemd_name(svc)}`)"
 
 

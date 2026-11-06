@@ -5,7 +5,6 @@ from __future__ import annotations
 import os
 import shutil
 import signal
-import sys
 import tempfile
 import time
 from pathlib import Path
@@ -131,29 +130,3 @@ def test_a_second_instance_refuses_and_leaves_the_live_socket(world, monkeypatch
         os.kill(first, signal.SIGTERM)
         os.waitpid(first, 0)
     assert not sock.exists()
-
-
-def test_the_reaper_log_is_emptied_once_past_its_cap_and_a_line_lands_after_it(tmp_path, monkeypatch):
-    """VM v2 finding 5 turns the reaper's stderr into a file under KeepAlive; one pass line a minute would grow it for
-    ever. Past the cap the file is emptied before the next line; a pipe or a terminal is never touched."""
-    log = tmp_path / "com.levain.reaper.log"
-    fd = os.open(str(log), os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o644)
-    os.ftruncate(fd, SR.LOG_MAX_BYTES + 1)
-    saved = os.dup(2)
-    try:
-        os.dup2(fd, 2)
-        monkeypatch.setattr(sys, "stderr", os.fdopen(2, "w", closefd=False))     # pytest swaps sys.stderr
-        SR._log("a line after the cap")
-    finally:
-        monkeypatch.undo()
-        os.dup2(saved, 2)
-        os.close(saved)
-        os.close(fd)
-    text = log.read_bytes().replace(b"\0", b"").decode()
-    assert log.stat().st_size < 4096 and text.endswith("a line after the cap\n"), (log.stat().st_size, text)
-    r, w = os.pipe()
-    try:
-        SR._bound_log(w)                                                 # a pipe: nothing to truncate, no raise
-    finally:
-        os.close(r)
-        os.close(w)
