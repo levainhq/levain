@@ -2445,7 +2445,13 @@ def _has_desk_signer_file() -> bool:
         here = Path.cwd().resolve()
     except OSError:                                    # a removed working directory: there is no desk to find
         return False
-    return any((d / _DESK_SIGNER_FILE).is_file() for d in (here, *here.parents))
+    for d in (here, *here.parents):
+        try:
+            if (d / _DESK_SIGNER_FILE).is_file():
+                return True
+        except OSError:                                # an unreadable `scripts` dir: that directory has no desk file
+            continue
+    return False
 
 
 def _desk_signer_hint(row: object) -> str:

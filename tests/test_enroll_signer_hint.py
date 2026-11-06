@@ -65,3 +65,17 @@ def test_a_directory_named_like_the_file_is_not_a_signer_file(tmp_path: Path, ca
     monkeypatch.chdir(desk)
     out, _ = _passkey_enroll(tmp_path, monkeypatch, capsys)
     assert SENTENCE not in out
+
+
+def test_an_unreadable_scripts_dir_is_no_desk_and_the_enrol_still_succeeds(tmp_path: Path, capsys, monkeypatch) -> None:
+    """L3 r1 (codex MED): ``is_file()`` raises PermissionError on an unreadable ``scripts``; the enrol had already
+    committed, so the command exited with a traceback. The gate treats the unreadable directory as having no desk."""
+    here = tmp_path / "locked"
+    (here / "scripts").mkdir(parents=True)
+    (here / "scripts").chmod(0o000)
+    monkeypatch.chdir(here)
+    try:
+        out, _ = _passkey_enroll(tmp_path, monkeypatch, capsys)
+    finally:
+        (here / "scripts").chmod(0o755)
+    assert "enrolled:" in out and SENTENCE not in out
