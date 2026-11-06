@@ -16,9 +16,9 @@ The call sequence is the design's section 3 and its order is the point:
 
 1. validate the request (nothing read or written on a refusal);
 2. (speak) the room thread must be the open room, and the words are the RECORD's reply, never the page's;
-   then, both routes: the phone's grant routes must be served and the consent hooks of THEIR queue must name
+   then, both routes: when the phone's grant routes are served, the consent hooks of THEIR queue must name
    ``data_root`` as their one cockpit (:func:`revoke_refusal`), so the grant page's revoke reaches the key about to be
-   read; else ``revoke_unreachable`` (or ``revoke_unchecked`` when that could not be checked), nothing reserved or read;
+   read (with no grant route served the revoke is ``levain voice key revoke``, which needs no cockpit queue: allowed); else ``revoke_unreachable`` (or ``revoke_unchecked`` when that could not be checked), nothing reserved or read;
 3. ``meter.reserve`` (a cap, an unpriced model or a meter that cannot be used refuses here, and no key is read);
 4. ``custody.read_key`` (a fresh verified replay, then the keychain): a :class:`~levain.voice.custody.Secret`;
 5. the adapter call, with ``secret.reveal()`` written INLINE in its argument list, so no name in any frame of this
@@ -172,8 +172,8 @@ WORDS = {
     "no_tts_key": "The {p} key is not set for reading aloud.",
     "no_stt_key": "The {p} key is not set for dictation.",
     "authority_unreadable": "Levain could not verify its authority log just now; premium voice is off until it can.",
-    "revoke_unreachable": ("Premium voice is off: the phone's grant page revokes keys in a different cockpit from the "
-                           "one this Levain reads voice keys from."),
+    "revoke_unreachable": ("Premium voice is off: the phone's grant page cannot revoke this Levain's voice keys. "
+                           "Revoke from the command line."),
     "revoke_unchecked": ("Premium voice is off: Levain could not check that the phone's grant page can revoke this "
                          "Levain's voice keys, so no key is read."),
     "keychain_unreadable": "Levain could not read the key from this Mac's keychain (it may be locked).",
@@ -341,7 +341,8 @@ def revoke_refusal(revoke_queue: Path | str | None, data_root: Path | str) -> st
     """None when a revoke from the phone's grant page reaches the voice keys at ``data_root``, else the refusal (a key
     of :data:`WORDS`, also the error code). ``revoke_queue`` is the queue the grant routes are served over
     (``GrantPhone.queue_dir``), None when the server serves no grant routes (no Signer, or its queue is not the
-    consent reader's): then no phone revoke exists, ``revoke_unreachable``. Otherwise that queue's consent hooks must
+    consent reader's): then the only revoke is the command line's ``levain voice key revoke`` (any enrolled key,
+    always present), which acts on ``data_root`` directly, so None is allowed. Otherwise that queue's consent hooks must
     name exactly one cockpit (:func:`levain.consent.sign.sign_root`'s rule, so the root the grant routes act on) and
     it must be ``data_root``; any other answer is ``revoke_unreachable``. A fault while checking (the hook file
     unreadable, an unexpected shape) is ``revoke_unchecked``, a different sentence: it is not known to be another
@@ -350,7 +351,7 @@ def revoke_refusal(revoke_queue: Path | str | None, data_root: Path | str) -> st
     from levain.consent.answering import hook_roots
 
     if revoke_queue is None:
-        return "revoke_unreachable"
+        return None
     try:
         roots = list(hook_roots(Path(revoke_queue)))
         if len(roots) != 1:
