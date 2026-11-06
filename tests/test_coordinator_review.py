@@ -117,6 +117,107 @@ def test_the_coordinator_never_clears_an_authority_relevant_item_in_its_own_mode
     assert review.get_item(store, plain.item_id).last[:3] == ("cleared", "coordinator", "coordinator")
 
 
+FOREIGN = "the coordinator's mode clears only"
+
+
+@pytest.mark.parametrize("feed", review.FEEDS)
+def test_the_coordinators_mode_clears_only_an_item_the_coordinator_filed(store, feed):
+    """B1(b), the D3 ruling: a "Seat died", an "Agent card" or a "Drop not split" is filed by the service, so the
+    coordinator's mode leaves it open; the operator's own modes clear it. A label guard, not a capability: a process
+    that picks ``mode="fresh"`` is recorded as the operator (a known edge, S1's)."""
+    tok = _token(store)
+    item, _ = review.file_item(store, feed, {"text": "x"}, dedupe_key=f"{feed}:1")
+    assert item.by == "service" and not item.authority_relevant
+    with pytest.raises(CoordError, match=FOREIGN):
+        review.clear_item(store, item.item_id, mode="coordinator", token=tok)
+    assert review.get_item(store, item.item_id).state == "open" and review.get_item(store, item.item_id).last is None
+    assert review.clear_item(store, item.item_id, mode="manual").state == "cleared"
+
+
+@pytest.mark.parametrize("feed", review.FEEDS)
+def test_the_coordinators_mode_still_clears_its_own_items_and_reopens_any(store, feed):
+    """The CHANGELOG's claim: the coordinator still clears any item it filed itself, whatever its feed. The guard reads
+    who filed the item, never its feed (no levain path files a ``doubt`` or ``contradiction``; the dream's
+    contradictions come on an ``agent`` card the service files, which the parametrization above leaves open)."""
+    tok = _token(store)
+    own, _ = review.file_item(store, feed, {"text": "x"}, dedupe_key="own", by="coordinator", token=tok)
+    review.clear_item(store, own.item_id, mode="coordinator", token=tok)
+    assert review.get_item(store, own.item_id).last[:3] == ("cleared", "coordinator", "coordinator")
+    # the coordinator's KNOW (morning.py, first_reader.py) is written through file_know, not file_item
+    know, _ = review.file_know(store, None, "a thing I know", token=tok)
+    assert know.by == "coordinator" and know.feed == "know"
+    assert review.clear_item(store, know.item_id, mode="coordinator", token=tok).state == "cleared"
+    # a reopen puts an item back in your view and hides nothing, so the guard is for clears only
+    theirs, _ = review.file_item(store, "seat", {"text": "x"}, dedupe_key="theirs")
+    review.clear_item(store, theirs.item_id, mode="manual")
+    assert review.reopen_item(store, theirs.item_id, mode="coordinator", token=tok).state == "open"
+
+
+def test_an_item_reads_its_fields_from_the_columns_the_select_names():
+    """``_item`` maps a ``_COLS`` row by place, and the refusals read the Item's fields by name: this pins the places."""
+    cols = [c.strip() for c in review._COLS.split(",")]
+    assert cols == ["item_id", "thread_id", "feed", "dedupe_key", "body", "authority_relevant", "by", "at"]
+    # the queue page's one-statement read maps its item columns by the same places
+    assert [c.strip().removeprefix("i.") for c in review._LATEST_COLS.split(",")][:8] == cols
+
+
+_CLEAR = ("INSERT INTO review_events (item_id, seq, op, mode, by, at) VALUES (?, 1, 'cleared', ?, ?, 'x')")
+
+
+def test_the_database_refuses_a_coordinator_clear_of_an_item_it_did_not_file(store):
+    item, _ = review.file_item(store, "seat", {"text": "x"}, dedupe_key="s")                   # filed by the service
+    with pytest.raises(sqlite3.IntegrityError, match=FOREIGN):
+        _raw(store, _CLEAR, item.item_id, "coordinator", "coordinator")
+    # a clear in your modes, and the coordinator's own item cleared in its own mode, are not what it refuses
+    _raw(store, _CLEAR, item.item_id, "fresh", "operator")
+    own, _ = review.file_item(store, "doubt", {"text": "x"}, dedupe_key="d", by="coordinator", token=_token(store))
+    _raw(store, _CLEAR, own.item_id, "coordinator", "coordinator")
+
+
+def test_the_database_refuses_a_coordinator_clear_of_an_item_that_does_not_exist(store):
+    """The subquery finds no row, and ``NULL != 'coordinator'`` is NULL, not true: only the COALESCE makes this abort."""
+    review.file_item(store, "seat", {"text": "x"}, dedupe_key="s")          # the store is made on first use
+    with pytest.raises(sqlite3.IntegrityError, match=FOREIGN):
+        _raw(store, _CLEAR, "rv-nothing", "coordinator", "coordinator")
+
+
+def test_a_store_made_before_the_trigger_gains_it_on_open(store, qdir, clock):
+    item, _ = review.file_item(store, "seat", {"text": "x"}, dedupe_key="s")
+    _raw(store, "DROP TRIGGER review_events_foreign")
+    _raw(store, _CLEAR, item.item_id, "coordinator", "coordinator")          # the old store takes the foreign clear
+    fresh = CoordStore(qdir, clock=clock)                                   # the ordinary opener
+    other, _ = review.file_item(fresh, "seat", {"text": "y"}, dedupe_key="s2")
+    with pytest.raises(CoordError, match=FOREIGN):
+        review.clear_item(fresh, other.item_id, mode="coordinator", token=_token(fresh))
+    with pytest.raises(sqlite3.IntegrityError, match=FOREIGN):
+        _raw(fresh, _CLEAR, other.item_id, "coordinator", "coordinator")
+
+
+def _has_trigger(store, name):
+    c = sqlite3.connect(store.path)
+    try:
+        return c.execute("SELECT 1 FROM sqlite_master WHERE type = 'trigger' AND name = ?", (name,)).fetchone() is not None
+    finally:
+        c.close()
+
+
+def test_a_store_without_the_trigger_is_read_before_any_writer_opens_it(store, qdir, clock):
+    """L3 r1 (codex MED): an upgraded store lacks ``review_events_foreign`` until a writer opens it. The read-only
+    surfaces (the cockpit and phone panels, :func:`review.list_items`) still read it, and make nothing; the first
+    writer's ensure path installs the trigger."""
+    item, _ = review.file_item(store, "seat", {"text": "x"}, dedupe_key="s")
+    _raw(store, "DROP TRIGGER review_events_foreign")                        # the store as an older levain left it
+    reader = CoordStore(qdir, clock=clock)
+    assert [i.item_id for i in review.list_items(reader)] == [item.item_id]
+    reader.open_readonly().close()
+    assert not _has_trigger(store, "review_events_foreign")                 # a reader made nothing
+    writer = CoordStore(qdir, clock=clock)
+    review.file_item(writer, "seat", {"text": "y"}, dedupe_key="s2")         # any writer's first open
+    assert _has_trigger(store, "review_events_foreign")
+    with pytest.raises(CoordError, match=FOREIGN):
+        review.clear_item(writer, item.item_id, mode="coordinator", token=_token(writer))
+
+
 def test_coordinator_mode_needs_the_lease_token(store):
     item, _ = review.file_item(store, "doubt", {"text": "x"}, dedupe_key="d", by="coordinator", token=_token(store))
     with pytest.raises(CoordError):

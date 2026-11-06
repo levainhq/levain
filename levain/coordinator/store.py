@@ -544,7 +544,8 @@ class CoordStore:
     def _ensure(self, conn: sqlite3.Connection, *, create: bool) -> None:
         """The ONE ensure-schema path: in one ``BEGIN IMMEDIATE``, R4's ``review_events`` rebuild
         (:func:`levain.coordinator.review.migrate_events`), every statement of this opener's schema, the review events'
-        one-signature index (:func:`levain.coordinator.review.ensure_one_signature`), the store-wide sequence of
+        one-signature index (:func:`levain.coordinator.review.ensure_one_signature`) and foreign-clear trigger
+        (:func:`levain.coordinator.review.ensure_foreign_clear`), the store-wide sequence of
         every table in :data:`GSEQ_TABLES` (``replies`` first: :func:`_all_gseq`); after a
         rebuild, ``PRAGMA integrity_check`` must answer ``ok`` before the transaction commits (any failure rolls all of
         it back). ``create=False``: a file holding no coordinator store is :class:`StoreAbsent`,
@@ -553,7 +554,8 @@ class CoordStore:
             if "threads" not in _names(conn):
                 raise StoreAbsent(f"{self.path} holds no coordinator store")
             JobStore._ensure_schema(conn)      # the dispatch store's own format steps, as its own opener runs them
-        from levain.coordinator.review import ensure_one_signature, items_need_rebuild, migrate_events, migrate_items
+        from levain.coordinator.review import (ensure_foreign_clear, ensure_one_signature, items_need_rebuild,
+                                               migrate_events, migrate_items)
 
         # a constraint rebuild of a table other tables point at runs with foreign keys off (a no-op inside a
         # transaction, so it is set here), and the keys are checked again before the commit. The setting is put back
@@ -579,6 +581,7 @@ class CoordStore:
                     conn.execute(stmt)
                 refresh_timeline_view(conn)
                 ensure_one_signature(conn)
+                ensure_foreign_clear(conn)
                 _all_gseq(conn)
                 from levain.coordinator.lease import migrate_settings
                 migrate_settings(conn)

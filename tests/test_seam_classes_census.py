@@ -22,7 +22,7 @@ from levain.coordinator.first_reader import FIRST_READER_SCHEMA
 from levain.coordinator.intake import INTAKE_SCHEMA
 from levain.coordinator.lease import LAUNCH_KINDS, LEASE_KINDS, LEASE_SCHEMA
 from levain.coordinator.ready import LIFECYCLE_SCHEMA
-from levain.coordinator.review import REVIEW_SCHEMA
+from levain.coordinator.review import FOREIGN_CLEAR_TRIGGER, REVIEW_SCHEMA
 from levain.coordinator.seam_handoffs import SEAM_HANDOFF_SCHEMA
 from levain.coordinator.seam_open import OPEN_SCHEMA
 from levain.coordinator.store import GSEQ_TABLES, SCHEMA, SEAM_SCHEMA
@@ -140,6 +140,8 @@ _DDL = re.compile(r"CREATE\s+(?:UNIQUE\s+)?(TABLE|TRIGGER|INDEX|VIEW)\s+(?:IF NO
 _DISPATCH_DB_LISTS = {
     "dispatch.jobs._SCHEMA": JOB_SCHEMA, "store.SCHEMA": SCHEMA, "lease.LEASE_SCHEMA": LEASE_SCHEMA,
     "teamdrafts.DRAFT_SCHEMA": DRAFT_SCHEMA, "review.REVIEW_SCHEMA": REVIEW_SCHEMA,
+    # made by the writer's ensure path (review.ensure_foreign_clear), outside the reader's schema list
+    "review.FOREIGN_CLEAR_TRIGGER": (FOREIGN_CLEAR_TRIGGER,),
     "first_reader.FIRST_READER_SCHEMA": FIRST_READER_SCHEMA, "ready.LIFECYCLE_SCHEMA": LIFECYCLE_SCHEMA,
     "work_delta.OPERATOR_VIEWS_SCHEMA": OPERATOR_VIEWS_SCHEMA, "store.SEAM_SCHEMA": SEAM_SCHEMA,
     "seam_handoffs.SEAM_HANDOFF_SCHEMA": SEAM_HANDOFF_SCHEMA, "seam_open.OPEN_SCHEMA": OPEN_SCHEMA, "intake.INTAKE_SCHEMA": INTAKE_SCHEMA,
@@ -158,10 +160,11 @@ def _declared(statements: tuple[str, ...]) -> list[tuple[str, str]]:
 
 
 def test_the_name_scan_reads_every_statement_and_catches_a_seeded_duplicate() -> None:
-    # the lists as measured: every statement names an object (272 in all), so the scan below skips nothing
+    # the lists as measured: every statement names an object (the total is the sum of the second numbers below), so the scan below skips nothing
     assert {k: (len(v), len(_declared(v))) for k, v in _DISPATCH_DB_LISTS.items()} == {
         "dispatch.jobs._SCHEMA": (57, 57), "store.SCHEMA": (28, 28), "lease.LEASE_SCHEMA": (33, 33),
         "teamdrafts.DRAFT_SCHEMA": (9, 9), "review.REVIEW_SCHEMA": (15, 15),
+        "review.FOREIGN_CLEAR_TRIGGER": (1, 1),
         "first_reader.FIRST_READER_SCHEMA": (16, 16), "ready.LIFECYCLE_SCHEMA": (10, 10),
         "work_delta.OPERATOR_VIEWS_SCHEMA": (4, 4), "store.SEAM_SCHEMA": (4, 4),
         "seam_handoffs.SEAM_HANDOFF_SCHEMA": (8, 8), "seam_open.OPEN_SCHEMA": (21, 21),
