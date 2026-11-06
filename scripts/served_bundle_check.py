@@ -192,12 +192,20 @@ def package_dir(tree: Path) -> Path:
 
 
 def _tree_literal(pkg: Path, name: str):
-    """The literal value of the module-level ``name`` in the tree's ``web_server.py``, parsed (never imported)."""
+    """The literal value of the module-level ``name`` in the tree's ``web_server.py``, parsed (never imported). A name
+    assigned more than once is refused: Python uses the LAST binding, so returning the first could read a table the
+    module does not run with."""
+    found = []
     for node in ast.parse((pkg / "web_server.py").read_text(encoding="utf-8")).body:
         target = node.target if isinstance(node, ast.AnnAssign) else node.targets[0] if isinstance(node, ast.Assign) else None
         if getattr(target, "id", None) == name and node.value is not None:
-            return ast.literal_eval(node.value)
-    raise OSError(f"{pkg / 'web_server.py'}: no {name} found")
+            found.append(node)
+    if not found:
+        raise OSError(f"{pkg / 'web_server.py'}: no {name} found")
+    if len(found) > 1:
+        raise OSError(f"{pkg / 'web_server.py'}: {name} is assigned more than once at module level (lines "
+                      + ", ".join(str(n.lineno) for n in found) + "); the later binding is the one that runs")
+    return ast.literal_eval(found[0].value)
 
 
 def tree_assets(pkg: Path) -> dict[str, str]:
@@ -342,13 +350,15 @@ def check_tree(base: str, pkg: Path, page: str, versioned: dict[str, str], sw: b
     else:
         out.append(Result(False, "tree sign sheet", f"HTTP {status} at {served_at}"))
     t_sw = pkg / "webpush" / "static" / "sw.js"
-    if t_sw.is_file() and sw:
-        tb = t_sw.read_bytes()
+    if not t_sw.is_file():
+        out.append(Result(False, "tree /sw.js", "the tree has no webpush/static/sw.js"))
+    elif not sw:
+        out.append(Result(False, "tree /sw.js", "the origin served an empty or no worker (see worker /sw.js), so nothing to compare"))
+    else:
+        tb = tree_bytes(t_sw)
         same = tb == sw
         out.append(Result(same, "tree /sw.js", f"SW_VERSION {_sw_version(sw)}" if same else
                           f"served SW_VERSION {_sw_version(sw)} ({digest(sw)}), tree SW_VERSION {_sw_version(tb)} ({digest(tb)})"))
-    elif not t_sw.is_file():
-        out.append(Result(False, "tree /sw.js", "the tree has no webpush/static/sw.js"))
     return out
 
 

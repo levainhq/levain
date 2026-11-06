@@ -380,3 +380,46 @@ def test_a_path_named_bare_and_with_two_digests_is_one_result_carrying_every_rea
     page = [r for r in results if r.name == "page /sky.js"]
     assert len(page) == 1 and not page[0].ok, [r.line() for r in results]
     assert "without its ?v=" in page[0].detail and "different ?v=" in page[0].detail
+
+
+# ---- L3 land11 r1 fix round (1105-49 fix11): each test below was first run RED against bb583d1e ---------------------------
+
+
+def test_the_worker_compare_always_yields_one_tree_sw_result_and_names_why_it_failed(tmp_path: Path) -> None:
+    """The docstring promises ONE ``tree <path>`` result per path: an empty served worker used to emit none."""
+    tree = _tree(tmp_path / "t")
+    with _up(tmp_path / "a") as base:
+        empty = sbc.run(base, tree, _with_sw(lambda b: b""))                    # 200 and no body
+        gone = sbc.run(base, tree, lambda u: (404, b"") if u.endswith("/sw.js") else sbc.fetch(u))   # no worker served at all
+        (tree / "levain" / "webpush" / "static" / "sw.js").unlink()
+        no_tree_sw = sbc.run(base, tree)
+    for results in (empty, gone, no_tree_sw):
+        mine = [r for r in results if r.name == "tree /sw.js"]
+        assert len(mine) == 1 and not mine[0].ok, [r.line() for r in results]
+    assert "empty" in next(r.detail for r in empty if r.name == "tree /sw.js")
+    assert "origin" in next(r.detail for r in gone if r.name == "tree /sw.js")
+    assert "no webpush/static/sw.js" in next(r.detail for r in no_tree_sw if r.name == "tree /sw.js")
+    # check_origin's own lines are unchanged: the shape / worker failure is still reported, once
+    assert "worker /sw.js" in _failed(gone) and "worker shape" in _failed(empty)
+
+
+def test_a_crlf_copy_of_the_worker_in_the_tree_passes_against_the_lf_bytes_the_server_serves(tmp_path: Path) -> None:
+    tree = _tree(tmp_path / "t")
+    sw = tree / "levain" / "webpush" / "static" / "sw.js"
+    sw.write_bytes(sw.read_bytes().replace(b"\r\n", b"\n").replace(b"\n", b"\r\n"))    # a Windows / autocrlf checkout
+    assert b"\r\n" in sw.read_bytes()
+    with _up(tmp_path / "a") as base:
+        results = sbc.run(base, tree)
+    assert _failed(results) == [], [r.line() for r in results if not r.ok]
+
+
+def test_a_name_assigned_twice_at_module_level_is_refused_naming_the_file_and_the_name(tmp_path: Path, capsys) -> None:
+    tree = _tree(tmp_path / "t")
+    ws = tree / "levain" / "web_server.py"
+    ws.write_text(ws.read_text(encoding="utf-8") + "\n_ASSETS = {}\n", encoding="utf-8")   # the later rebind is what Python uses
+    with pytest.raises(OSError, match=r"web_server\.py.*_ASSETS.*more than once"):
+        sbc._tree_literal(tree / "levain", "_ASSETS")
+    with _up(tmp_path / "a") as base:
+        assert sbc.main(["--url", base, "--tree", str(tree)]) == 2
+    err = capsys.readouterr().err
+    assert err.startswith("ERROR") and "_ASSETS" in err and "web_server.py" in err
