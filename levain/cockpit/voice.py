@@ -9,7 +9,7 @@ answer.
 
 Premium dictation (the transcribe route, and the ``stt`` use in ``voice.json``) is OFF in Levain 1.0 (Phill 11-05): the
 server refuses the transcribe POST with :data:`WORDS` ``premium_stt_off`` before it reads a key, reserves a meter row or
-reads a body byte, unless it was started with the switch (``levain serve --premium-stt``). The code below is kept whole
+reads a body byte, unless it was started with the hidden ``--premium-stt`` switch of ``levain serve``. The code below is kept whole
 for a later release; the switch is the only thing that gates it.
 
 The call sequence is the design's section 3 and its order is the point:
