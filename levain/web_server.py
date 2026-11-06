@@ -1010,6 +1010,66 @@ _MAX_READ_WAITERS = 64
 
 _log = logging.getLogger(__name__)
 
+_SLOW_READ_MS = 2000.0     # a cockpit read slower than this logs ONE line (route, ms, gate wait ms), nothing else
+_ROUTE_PANEL_IDS_MAX = 32  # distinct panel ids counted by name; later ones fold into "panel/other"
+
+
+class _RouteStats:
+    """In-process latency and refusal counters for the cockpit GET reads. A bounded dict keyed by route TEMPLATE
+    (``panel/<id>``, ``manifest``, ``question/<n>``, ``events``, ...), never a raw path: at most
+    ``_ROUTE_PANEL_IDS_MAX`` panel ids plus a fixed handful of other keys. Holds counts and times only, no request
+    content. ``snapshot()`` is the read-only shape; there is no network route for it (no new surface)."""
+
+    _FIXED = ("manifest", "freshness", "events", "question/<n>", "panel/other", "other")
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._rows: dict[str, list[float]] = {}   # key -> [count, total_ms, max_ms, refused_503]
+
+    @classmethod
+    def key_for(cls, path: str) -> str:
+        path = path.split("?", 1)[0]
+        if path == "/cockpit/manifest.json":
+            return "manifest"
+        if path == "/cockpit/events":
+            return "events"
+        if path.startswith(_QUESTION_BODY_PREFIX):
+            return "question/<n>"
+        if path.startswith("/cockpit/panel/") and path.endswith(".json"):
+            pid = path[len("/cockpit/panel/"):-len(".json")]
+            return f"panel/{pid}" if re.fullmatch(r"[A-Za-z0-9_.:-]{1,48}", pid) else "panel/other"
+        return "freshness" if path.startswith("/cockpit/fresh") else "other"
+
+    def _row(self, key: str) -> list[float]:
+        row = self._rows.get(key)
+        if row is None:
+            if key.startswith("panel/") and key != "panel/other" and \
+                    sum(1 for k in self._rows if k.startswith("panel/")) >= _ROUTE_PANEL_IDS_MAX:
+                key = "panel/other"
+            row = self._rows.setdefault(key, [0.0, 0.0, 0.0, 0.0])
+        return row
+
+    def record(self, path: str, ms: float, *, gate_wait_ms: float = 0.0, refused: bool = False) -> None:
+        key = self.key_for(path)
+        with self._lock:
+            row = self._row(key)
+            row[0] += 1
+            row[1] += ms
+            row[2] = max(row[2], ms)
+            if refused:
+                row[3] += 1
+        if ms > _SLOW_READ_MS:
+            _log.warning("slow cockpit read: route=%s ms=%d gate_wait_ms=%d%s", key, ms, gate_wait_ms,
+                         " refused=503" if refused else "")
+
+    def snapshot(self) -> dict[str, dict[str, float]]:
+        with self._lock:
+            return {k: {"count": int(r[0]), "total_ms": round(r[1], 1), "max_ms": round(r[2], 1),
+                        "refused_503": int(r[3])} for k, r in self._rows.items()}
+
+
+_ROUTE_STATS = _RouteStats()
+
 
 def _store_fault(what: str, exc: BaseException) -> dict[str, str]:
     """The 500 body of an agent-text route whose store could not be read: the exception's type only. Its message is
@@ -2325,6 +2385,7 @@ class _Handler(GuardedHandler):
         store = getattr(self.server, "question_store", None)
         if store is not None and _QUESTION_ID.fullmatch(n):
             if not self.server.request_gate.acquire(blocking=False):
+                self._q503 = True
                 self._send(b"busy\n", "text/plain; charset=utf-8", status=503, head=head)
                 return
             try:
@@ -4037,7 +4098,10 @@ class _Handler(GuardedHandler):
             self._serve_consent_body(path, head=head)
             return
         if path.startswith(_QUESTION_BODY_PREFIX) and path.endswith(_CONSENT_BODY_SUFFIX):
+            _tq = time.monotonic()
+            self._q503 = False
             self._serve_question_body(path, head=head)
+            _ROUTE_STATS.record(path, (time.monotonic() - _tq) * 1000.0, refused=self._q503)
             return
         if path == _BAND_PATH:
             self._serve_band(head=head)
@@ -4069,9 +4133,13 @@ class _Handler(GuardedHandler):
             if path == EVENTS_PATH:
                 self._serve_stream(head=head)
                 return
+            _t0 = time.monotonic()
             if not self._acquire_read_slot():
+                _wait = (time.monotonic() - _t0) * 1000.0
+                _ROUTE_STATS.record(self.path, _wait, gate_wait_ms=_wait, refused=True)
                 self._send(b"busy\n", "text/plain; charset=utf-8", status=503, head=head)
                 return
+            _wait = (time.monotonic() - _t0) * 1000.0
             if not self._peer_open():
                 # the client gave up during its wait: skip the store read nobody will receive
                 self._release_read_slot()
@@ -4091,6 +4159,7 @@ class _Handler(GuardedHandler):
                 self._release_read_slot()
             self._send(body, "application/json; charset=utf-8", status=status, head=head,
                        headers=hdrs, cache_control=COCKPIT_CACHE_CONTROL)
+            _ROUTE_STATS.record(self.path, (time.monotonic() - _t0) * 1000.0, gate_wait_ms=_wait)
             return
 
         if path == "/substrate.json":
