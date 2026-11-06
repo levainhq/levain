@@ -7249,10 +7249,30 @@
   // Everything that read or wrote its `.value` goes through these helpers, in this one place.
   // The words in the box as one string: line breaks (a <br>, a div per Enter) are "\n", a lone <br> left by deleting everything is
   // nothing, a no-break space is a space, and trailing newlines are dropped.
+  // ONE normaliser for both sides of every "is this the retained request's words" comparison (a kept request from an earlier
+  // build may end in newlines or hold no-break spaces; the box can only ever show the normalised form)
+  function dropNorm(s) { return String(s == null ? "" : s).replace(/\r\n?/g, "\n").replace(/\u00a0/g, " ").replace(/\n+$/, ""); }
+  const dropSame = (a, b) => dropNorm(a) === dropNorm(b);
+  // read by walking the DOM, never innerText: innerText is layout-dependent (a hidden host gives "" in WebKit and the bare
+  // textContent, with no line breaks, in Chrome). A <br> is a newline; a block child (a div per Enter) starts and ends a line.
   function dropBoxText(box) {
     if (!box || !box.textContent) return "";
-    const raw = typeof box.innerText === "string" ? box.innerText : box.textContent;
-    return raw.replace(/\r\n?/g, "\n").replace(/\u00a0/g, " ").replace(/\n+$/, "");
+    let out = "";
+    const nl = () => { if (out && out[out.length - 1] !== "\n") out += "\n"; };
+    const walk = (n) => {
+      for (let c = n.firstChild; c; c = c.nextSibling) {
+        if (c.nodeType === 3) out += c.nodeValue;
+        else if (c.nodeType === 1) {
+          if (c.tagName === "BR") { out += "\n"; continue; }
+          const block = /^(DIV|P|LI|UL|OL|BLOCKQUOTE|PRE|H[1-6])$/.test(c.tagName);
+          if (block) nl();
+          walk(c);
+          if (block) nl();
+        }
+      }
+    };
+    walk(box);
+    return dropNorm(out);
   }
   function setDropBoxText(box, text) { if (box) box.textContent = typeof text === "string" ? text : ""; }
   // the box takes no typing: contenteditable off and aria-disabled (a div has no `disabled`)
@@ -7273,13 +7293,22 @@
   // plain text in at the caret (or at `at`, a Range): never markup
   function dropInsertPlain(box, text, at) {
     const t = String(text || "").replace(/\r\n?/g, "\n");
-    if (!t) return;
+    if (!t || dropBoxIsOff(box)) return;      // a box that is off (a send in flight, no coordinator) takes nothing
     const sel = window.getSelection && window.getSelection();
     if (at && sel) { sel.removeAllRanges(); sel.addRange(at); }
+    // the selection must sit wholly inside the box (both ends and their common ancestor), else the text goes at the box's end:
+    // never into another field, never deleting DOM outside the composer
+    if (sel) {
+      const inside = (n) => !!n && box.contains(n);
+      let r0 = null;
+      try { r0 = sel.rangeCount ? sel.getRangeAt(0) : null; } catch (e) { r0 = null; }
+      if (!(r0 && inside(r0.startContainer) && inside(r0.endContainer) && inside(r0.commonAncestorContainer))) dropCaretEnd(box);
+    }
     let ok = false;
     try { ok = document.execCommand("insertText", false, t); } catch (e) { ok = false; }
     if (!ok && sel) {
-      const r = sel.rangeCount && box.contains(sel.getRangeAt(0).startContainer) ? sel.getRangeAt(0) : (dropCaretEnd(box), sel.getRangeAt(0));
+      if (!sel.rangeCount) dropCaretEnd(box);
+      const r = sel.getRangeAt(0);
       r.deleteContents();
       const node = document.createTextNode(t);
       r.insertNode(node);
@@ -7301,14 +7330,17 @@
     box.dataset.placeholder = "words for the coordinator";
     for (const [k, v] of [["autocapitalize", "sentences"], ["autocorrect", "on"], ["spellcheck", "true"], ["inputmode", "text"], ["enterkeyhint", "enter"]]) box.setAttribute(k, v);
     // a cleared box keeps a lone <br> in some browsers, which would hold the placeholder away: empty means empty
-    box.addEventListener("input", () => { if (!box.textContent && box.firstChild) box.replaceChildren(); });
+    // (only after a deletion: Enter in an empty box leaves <br>s too, and those are the newline the user just typed)
+    box.addEventListener("input", (ev) => { if (!box.textContent && box.firstChild && ev && typeof ev.inputType === "string" && ev.inputType.indexOf("delete") === 0) box.replaceChildren(); });
     box.addEventListener("paste", (ev) => {
       ev.preventDefault();
+      if (dropBoxIsOff(box)) return;
       const cd = ev.clipboardData;
       dropInsertPlain(box, cd && typeof cd.getData === "function" ? cd.getData("text/plain") : "");
     });
     box.addEventListener("drop", (ev) => {
       ev.preventDefault();
+      if (dropBoxIsOff(box)) return;
       const dt = ev.dataTransfer;
       const text = dt && typeof dt.getData === "function" ? dt.getData("text/plain") : "";
       let at = null;
@@ -7316,7 +7348,7 @@
       dropInsertPlain(box, text, at);
     });
     // no rich text by any route (the iOS edit menu's bold and italic, a style paste)
-    box.addEventListener("beforeinput", (ev) => { if (typeof ev.inputType === "string" && ev.inputType.indexOf("format") === 0) ev.preventDefault(); });
+    box.addEventListener("beforeinput", (ev) => { if (typeof ev.inputType === "string" && /^(format|insertOrderedList|insertUnorderedList|insertHorizontalRule|insertLink)/.test(ev.inputType)) ev.preventDefault(); });
     return box;
   }
   // every kept request, newest first (a record an earlier build kept under the bare key counts too)
@@ -7553,7 +7585,7 @@
     const earlierLine = () => {
       const mine = ui.req ? ui.req.outbox_id : null;
       const n = dropKeptAll().filter((r) => r.outbox_id !== mine).length;
-      const inBox = ui.fromKeep && ui.req && ui.req.words === dropBoxText(words) ? "The drop in the box was not confirmed earlier: send it again, unchanged, to find out. " : "";
+      const inBox = ui.fromKeep && ui.req && dropSame(ui.req.words, dropBoxText(words)) ? "The drop in the box was not confirmed earlier: send it again, unchanged, to find out. " : "";
       ui.earlier.textContent = inBox + (n ? n + " earlier drop" + (n > 1 ? "s" : "") + " not confirmed." : "");
     };
     const resume = (msg) => {
@@ -7583,8 +7615,8 @@
       // the retained request (words, id, time, store, and an envelope a sheet attached) goes again as it was, so a send whose
       // answer was lost files once; words edited since are a new drop with a new id
       // (a new drop is kept under its own id: the one it replaces in the box stays kept, never overwritten)
-      if (!(ui.req && ui.req.words === w)) ui.fromKeep = false;
-      const req = ui.req && ui.req.words === w ? ui.req : { words: w, outbox_id: dropOutboxId(), sent_at: dropStamp(), store_id: ui.storeId };
+      if (!(ui.req && dropSame(ui.req.words, w))) ui.fromKeep = false;
+      const req = ui.req && dropSame(ui.req.words, w) ? ui.req : { words: w, outbox_id: dropOutboxId(), sent_at: dropStamp(), store_id: ui.storeId };
       ui.req = req;
       const kept = dropKeep(req);
       lock(true);

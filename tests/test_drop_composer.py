@@ -103,3 +103,88 @@ def test_a_box_that_is_off_takes_no_typing_and_says_so(tmp_path: Path, monkeypat
     steps = _open([{"eval": off}, *_keys("zzz"), _tag("off", f"({{txt: {TXT}, ce: {BOX}.getAttribute('contenteditable'), aria: {BOX}.getAttribute('aria-disabled'), off: {OFF}}})")])
     got = _run(tmp_path, monkeypatch, steps)["off"]
     assert got == {"t": "off", "txt": "", "ce": "false", "aria": "true", "off": True}, got
+
+
+# ---- L3 r1 (1106-16 composer): the fixes, each from the reproduced failure ----
+from tests.test_msgslot_hero import EARLIER, _posted, _seed
+
+OFF_ON = "(() => { const h = document.getElementById('ck-drop'); h._drop.working = true; h._drop.lock(true); return 1; })()"
+PASTE_OF = lambda txt: ("(() => { const dt = new DataTransfer(); dt.setData('text/plain', %s); const ev = new ClipboardEvent('paste', {clipboardData: dt, bubbles: true, cancelable: true});"
+                        " %s.dispatchEvent(ev); return 1; })()") % (json.dumps(txt), BOX)
+DROP_OF = lambda txt, x, y: ("(() => { const dt = new DataTransfer(); dt.setData('text/plain', %s); const ev = new DragEvent('drop', {dataTransfer: dt, clientX: %d, clientY: %d, bubbles: true, cancelable: true});"
+                             " %s.dispatchEvent(ev); return 1; })()") % (json.dumps(txt), x, y, BOX)
+
+
+@needs_browser
+@needs_ssh
+def test_a_paste_and_a_drop_onto_an_off_box_insert_nothing(tmp_path: Path, monkeypatch) -> None:
+    steps = _open([{"eval": OFF_ON}, {"eval": PASTE_OF("pasted while sending")}, {"eval": DROP_OF("dropped while sending", -5, -5)}, _tag("off", f"({{txt: {TXT}, html: {BOX}.innerHTML}})")])
+    got = _run(tmp_path, monkeypatch, steps)["off"]
+    assert got["txt"] == "" and got["html"] == "", got
+
+
+FALLBACK = ("(() => { document.execCommand = () => false; const out = document.createElement('p'); out.id = 'outside-card'; out.textContent = 'adjacent card text'; document.body.appendChild(out);"
+            " const t = %s.firstChild; const s = getSelection(); s.setBaseAndExtent(t, 1, out.firstChild, 5); return 1; })()") % BOX
+
+
+@needs_browser
+@needs_ssh
+def test_the_paste_fallback_never_deletes_dom_outside_the_composer_when_the_selection_runs_out_of_it(tmp_path: Path, monkeypatch) -> None:
+    steps = _open([*_keys("hello"), {"eval": FALLBACK}, {"eval": PASTE_OF("NEW")},
+                   _tag("after", f"({{txt: {TXT}, outside: document.getElementById('outside-card').textContent}})")])
+    got = _run(tmp_path, monkeypatch, steps)["after"]
+    assert got["outside"] == "adjacent card text", got      # the page beside the box is untouched
+    assert "NEW" in got["txt"] and got["txt"].startswith("hello"), got
+
+
+@needs_browser
+@needs_ssh
+def test_the_words_read_back_with_their_line_breaks_while_the_host_is_hidden(tmp_path: Path, monkeypatch) -> None:
+    hide = f"(() => {{ {BOX}.innerHTML = 'hi<div>there</div><div><br></div><div>you</div>'; document.getElementById('ck-drop').hidden = true; return 1; }})()"
+    steps = _open([{"eval": hide}, _tag("hid", f"({{txt: {TXT}, shown: !!{BOX}.getClientRects().length}})")])
+    got = _run(tmp_path, monkeypatch, steps)["hid"]
+    assert got["shown"] is False and got["txt"] == "hi\nthere\n\nyou", got
+
+
+@needs_browser
+@needs_ssh
+def test_a_kept_request_whose_words_end_in_newlines_or_nbsp_is_retried_under_its_own_id(tmp_path: Path, monkeypatch) -> None:
+    rec = {"words": "tell it now\n\n", "outbox_id": "ph-" + "ef" * 16, "sent_at": "2026-10-30T12:00:00.123000Z", "store_id": None}
+    rig = FullRig(tmp_path, monkeypatch)
+    from tests.test_msgslot_hero import _send as send_step
+    steps = [{"emulate": {"w": 1280, "h": 900, "dpr": 1}}, {"init": _seed(rec)}, {"until": NEEDS, "ms": 30000}, {"until": READY, "ms": 30000}, SETTLE,
+             _tag("before", f"({{box: {TXT}, earlier: {EARLIER}}})"), send_step(posts=1)]
+    with rig.serving():
+        out = drive_touch(tmp_path, f"{rig.origin}/#write_token={TOK}", steps)
+    assert _posted(out) == [rec], _posted(out)      # the SAME request: id and the words as kept, not a new id
+    before = _tagged(out)["before"]
+    assert before["box"] == "tell it now" and "not confirmed earlier" in before["earlier"], before
+
+
+@needs_browser
+@needs_ssh
+def test_enter_in_an_empty_box_keeps_the_newline_it_made(tmp_path: Path, monkeypatch) -> None:
+    got = _run(tmp_path, monkeypatch, _open([ENTER, *_keys("a"), _tag("e", STATE)]))["e"]
+    assert got["txt"] == "\na", got
+
+
+FORMATS = ("(() => { const o = {}; for (const t of ['formatBold', 'insertOrderedList', 'insertUnorderedList', 'insertText']) { const ev = new InputEvent('beforeinput', {inputType: t, cancelable: true, bubbles: true});"
+           " %s.dispatchEvent(ev); o[t] = ev.defaultPrevented; } return JSON.stringify(Object.assign({t: 'fmt'}, o)); })()") % BOX
+
+
+@needs_browser
+@needs_ssh
+def test_list_and_format_edits_are_refused_but_typing_is_not(tmp_path: Path, monkeypatch) -> None:
+    got = _run(tmp_path, monkeypatch, _open([{"eval": FORMATS}]))["fmt"]
+    assert (got["formatBold"], got["insertOrderedList"], got["insertUnorderedList"], got["insertText"]) == (True, True, True, False), got
+
+
+OTHER = ("(() => { const i = document.createElement('input'); i.id = 'other-field'; i.value = 'abcdef'; document.body.appendChild(i); i.focus(); i.setSelectionRange(1, 3); return 1; })()")
+
+
+@needs_browser
+@needs_ssh
+def test_a_drop_with_no_drop_point_does_not_write_into_another_focused_field(tmp_path: Path, monkeypatch) -> None:
+    steps = _open([{"eval": OTHER}, {"eval": DROP_OF("DROPPED", -5, -5)}, _tag("d", f"({{txt: {TXT}, other: document.getElementById('other-field').value}})")])
+    got = _run(tmp_path, monkeypatch, steps)["d"]
+    assert got["other"] == "abcdef" and got["txt"] == "DROPPED", got
