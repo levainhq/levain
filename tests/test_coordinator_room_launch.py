@@ -4,8 +4,11 @@ context, resume, lapse recycling, restart, and a close that does not wait behind
 Claude child; the frames are the shapes RM0 / RM0B recorded (see ``tests/test_coordinator_claude_session.py``)."""
 from __future__ import annotations
 
+import hashlib
+import io
 import json
 import os
+import shlex
 import stat
 import shutil
 import subprocess
@@ -947,9 +950,9 @@ def test_c8_an_already_active_resumed_launch_still_says_resumed(world):
 def test_c8_the_containment_digest_does_not_depend_on_the_deny_list_order(monkeypatch):
     """FAILS on the RM-E tip (deepseek LOW 5)."""
     settings = json.dumps({"permissions": {"deny": []}})
-    a = room_launch.containment_digest(settings)
+    a = room_launch.containment_digest(settings, "0" * 64)
     monkeypatch.setattr(room_launch, "ROOM_DENIED_TOOLS", tuple(reversed(room_launch.ROOM_DENIED_TOOLS)))
-    assert room_launch.containment_digest(settings) == a
+    assert room_launch.containment_digest(settings, "0" * 64) == a
 
 
 def test_c8_a_child_that_exits_after_its_open_check_is_not_activated(world):
@@ -1343,3 +1346,159 @@ def test_c3_the_child_gets_an_allowlisted_environment(world):
     env = room_launch.room_env({"PATH": "/bin", "HOME": "/h", "ANTHROPIC_API_KEY": "k", "OPENAI_API_KEY": "o",
                                 "LEVAIN_HOME": "/lv", "LEVAIN_WRITE_TOKEN": "t"})
     assert env == {"PATH": "/bin", "HOME": "/h", "ANTHROPIC_API_KEY": "k", "LEVAIN_HOME": "/lv", "LEVAIN_ROOM": "1"}
+
+
+# --- 1105-49: the room's own read-guard hook ---------------------------------------------------------------------
+def _env_spy():
+    """A spawn seam that keeps the environment each child was given."""
+    envs = []
+
+    def spawn(argv, *, cwd, env, stderr):
+        envs.append(dict(env))
+        return room_launch._spawn(argv, cwd=cwd, env=env, stderr=stderr)
+    return envs, spawn
+
+
+def test_1105_49_the_launch_writes_the_hook_script_and_a_settings_document_that_names_it(world):
+    from levain.coordinator import room_readguard
+    h = launcher(world).ensure()
+    src = Path(room_readguard.__file__).read_bytes()
+    guard = Path(world["run"]) / f"room_readguard-{hashlib.sha256(src).hexdigest()[:16]}.py"
+    assert guard.read_bytes() == src
+    assert stat.S_IMODE(guard.stat().st_mode) == 0o600 and not list(Path(world["run"]).glob(".room_readguard.*"))
+    doc = json.loads((Path(world["run"]) / h.launch_id / "settings.json").read_text())
+    assert doc["permissions"]["blockReadsOutsideWorkingDirectories"] is True       # the vendor's block stays beside it
+    [entry] = doc["hooks"]["PreToolUse"]
+    assert entry["matcher"] == "Read|Grep|Glob"
+    [hook] = entry["hooks"]
+    assert hook["command"] == f"{shlex.quote(sys.executable)} -I {shlex.quote(str(guard))}"
+
+
+def test_1105_49_the_child_is_given_both_decoys_so_only_the_vendor_answers_the_canary(world):
+    """Canary-masking (the design's first point): a hook deny is an ``is_error`` result AND a ``permission_denials``
+    entry, so a hook that answered a decoy would pass the open check without the deny rules or the block holding. The
+    child's environment names both decoys; the real hook, run with exactly that environment, prints nothing for them
+    and still refuses an outside path."""
+    from levain.coordinator import room_readguard
+    envs, spawn = _env_spy()
+    launcher(world, spawn=spawn).ensure()
+    rule, scope = _paths(world)
+    [env] = envs
+    assert json.loads(env[room_readguard.EXEMPT_ENV]) == [rule, scope]
+    for decoy in (rule, scope):
+        ev = json.dumps({"tool_name": "Read", "tool_input": {"file_path": decoy}, "cwd": str(world["cwd"])})
+        out = io.StringIO()
+        assert room_readguard.main(io.StringIO(ev), out, env) == 0 and out.getvalue() == "", decoy
+    ev = json.dumps({"tool_name": "Read", "tool_input": {"file_path": "/etc/hosts"}, "cwd": str(world["cwd"])})
+    out = io.StringIO()
+    room_readguard.main(io.StringIO(ev), out, env)
+    assert room_readguard.ROOM_READ_REFUSAL in out.getvalue()
+
+
+def test_1105_49_the_containment_digest_covers_the_hook_entry_and_its_script_and_is_stable_across_launches(world, monkeypatch):
+    seen, spawn = _argv_spy()
+    lr = launcher(world, spawn=spawn)
+    lr.end(lr.ensure().launch_id, "test")
+    lr.ensure()
+    argv = seen[1][0]
+    settings = Path(argv[argv.index("--settings") + 1]).read_text()             # the document the child was given
+    sha = hashlib.sha256(_guard_path(argv).read_bytes()).hexdigest()             # the script it names, as written
+    a = room_launch.containment_digest(settings, sha)
+    assert _recorded_digests(world) == [a, a]                                   # both launches ran under one policy
+    doc = json.loads(settings)
+    del doc["hooks"]
+    assert room_launch.containment_digest(json.dumps(doc), sha) != a            # no hook entry: another policy
+    assert room_launch.containment_digest(settings, "0" * 64) != a              # another script behind the same entry
+
+
+# --- 1105-49 L3 r1 fixes -----------------------------------------------------------------------------------------
+def _argv_spy():
+    """A spawn seam that keeps the argv and environment of each child it started."""
+    seen = []
+
+    def spawn(argv, *, cwd, env, stderr):
+        seen.append((list(argv), dict(env)))
+        return room_launch._spawn(argv, cwd=cwd, env=env, stderr=stderr)
+    return seen, spawn
+
+
+def _guard_path(argv) -> Path:
+    """The script the launch's own ``--settings`` document names as its hook (what the child runs)."""
+    doc = json.loads(Path(argv[argv.index("--settings") + 1]).read_text())
+    return Path(shlex.split(doc["hooks"]["PreToolUse"][0]["hooks"][0]["command"])[-1])
+
+
+def _recorded_digests(w) -> list:
+    return w["cs"]._read(lambda conn: [r[0] for r in conn.execute(
+        "SELECT containment_digest FROM chat_launch_checks WHERE containment_digest IS NOT NULL ORDER BY seq").fetchall()])
+
+
+def test_1105_49r_a_package_upgrade_during_the_launch_leaves_the_digest_on_the_bytes_that_run(world, monkeypatch):
+    """L3 r1 codex MED (complement LOW 2, deepseek LOW): the digest hashed the PACKAGE module at activation while the
+    child ran the copy written earlier, so an upgrade in between recorded a digest of bytes that never ran. The digest
+    is taken over the bytes written for this launch: a second launch whose package changes mid-launch records the same
+    policy as the first, and the file its settings name holds exactly those bytes."""
+    seen, spawn = _argv_spy()
+    lr = launcher(world, spawn=spawn)
+    lr.end(lr.ensure().launch_id, "test")
+    real = room_launch._guard_source()
+    calls = []
+
+    def upgraded_mid_launch() -> bytes:
+        calls.append(1)
+        return real if len(calls) == 1 else b"# another version of the package\n" + real
+    monkeypatch.setattr(room_launch, "_guard_source", upgraded_mid_launch)
+    lr.ensure()
+    first, second = _recorded_digests(world)
+    assert second == first
+    assert _guard_path(seen[1][0]).read_bytes() == real
+
+
+def test_1105_49r_a_script_changed_after_it_was_written_is_never_spawned_and_the_next_launch_restores_it(world,
+                                                                                                     monkeypatch):
+    """L3 r1 codex MED: spawn fails closed when the installed script no longer has the bytes the digest was taken over."""
+    seen, spawn = _argv_spy()
+    lr = launcher(world, spawn=spawn)
+    orig = RoomLauncher._write_files
+
+    def tampered(self, *a, **k):
+        out = orig(self, *a, **k)
+        _guard_path(out[0]).write_bytes(b"print('swapped')\n")
+        return out
+    monkeypatch.setattr(RoomLauncher, "_write_files", tampered)
+    with pytest.raises(RoomLaunchError, match="read-guard"):
+        lr.ensure()
+    assert seen == []
+    monkeypatch.setattr(RoomLauncher, "_write_files", orig)
+    lr.ensure()
+    assert _guard_path(seen[0][0]).read_bytes() == room_launch._guard_source()
+
+
+def test_1105_49r_another_launcher_with_another_script_never_replaces_the_file_a_running_room_runs(world, monkeypatch):
+    """L3 r1 codex MED: one shared mutable path let a concurrent launcher (another package version) replace the script
+    beneath a running room without its recorded digest changing. Each version of the script has its own file."""
+    seen, spawn = _argv_spy()
+    launcher(world, spawn=spawn).ensure()
+    real = room_launch._guard_source()
+    mine = _guard_path(seen[0][0])
+    monkeypatch.setattr(room_launch, "_guard_source", lambda: b"# another version of the package\n" + real)
+    launcher(world, spawn=spawn).ensure()                                       # a second launcher, the same run_dir
+    assert mine.read_bytes() == real
+    assert _guard_path(seen[1][0]) != mine
+    assert _guard_path(seen[1][0]).read_bytes() == b"# another version of the package\n" + real
+
+
+def test_1105_49r_a_path_valued_scope_decoy_still_launches_and_the_child_gets_absolute_strings(world, monkeypatch):
+    """L3 r1 complement LOW 5: ``json.dumps([decoy, scope])`` raised on a ``Path`` after the launch's files were
+    written. Both are given as absolute strings."""
+    from levain.coordinator import room_readguard
+    orig = RoomLauncher._scope_decoy
+
+    def as_path(self):
+        d, p = orig(self)
+        return d, Path(p)
+    monkeypatch.setattr(RoomLauncher, "_scope_decoy", as_path)
+    seen, spawn = _argv_spy()
+    launcher(world, spawn=spawn).ensure()
+    got = json.loads(seen[0][1][room_readguard.EXEMPT_ENV])
+    assert got == list(_paths(world)) and all(isinstance(p, str) and os.path.isabs(p) for p in got)

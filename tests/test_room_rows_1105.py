@@ -353,3 +353,33 @@ def test_stop_follows_the_turn_as_the_room_is_read_again_and_a_raced_stop_keeps_
             {"eval": "JSON.stringify(%s)" % _STOP}])
     assert json.loads(out["values"][1]) is False
     assert json.loads(out["values"][4]) is True, out["values"]       # the re-read after the stop shows the turn over
+
+
+@needs_browser
+def test_a_read_the_rooms_own_hook_refused_is_drawn_as_the_same_refusal_and_never_with_the_models_sentence(tmp_path, w):
+    """1105-49: the vendor wraps a hook's deny as ``PreToolUse:<Tool> hook error: <reason>`` (the recorded run,
+    ``tests/fixtures/claude_stream/room_hook_denied_read.jsonl``); the page reads it from its words and draws the plain
+    sentence, as for the vendor's own refusals. A hook that said something else, or on another tool, is a failure."""
+    from levain.coordinator.claude_session import ROOM_READ_REFUSAL
+    bodies = [f"PreToolUse:{t} hook error: {ROOM_READ_REFUSAL}" for t in ("Read", "Grep", "Glob")]
+    bodies += [f"PreToolUse:Bash hook error: {ROOM_READ_REFUSAL}", "PreToolUse:Read hook error: some other hook said no"]
+    g = _lines(tmp_path, w, _results(*bodies), 5)
+    assert [x["head"].split(" — ")[0] for x in g] == ["A read was refused"] * 3 + ["A tool result", "A tool result"], g
+    for x in g[:3]:
+        assert x["text"] == "That is outside what the room can read, so nothing was read." and "PreToolUse" not in x["head"], x
+        assert "Tell the user" not in x["text"] and "/add-dir" not in x["text"]
+
+
+@needs_browser
+def test_another_hooks_reason_that_opens_like_the_rooms_sentence_is_drawn_as_it_is(tmp_path, w):
+    """L3 r1 codex LOW: the page read only the sentence's first clause, unanchored, so another hook's deny that opened
+    the same way was replaced by the room's refusal text and its own words were lost. Only the whole sentence, in the
+    recorded wrapper and with nothing after it, is the room's refusal."""
+    from levain.coordinator.claude_session import ROOM_READ_REFUSAL
+    first = ROOM_READ_REFUSAL.split(". ")[0] + "."
+    bodies = [f"PreToolUse:Read hook error: {first} Another hook's own, important detail.",
+              f"PreToolUse:Read hook error: {ROOM_READ_REFUSAL}\nand a second line",
+              f"PreToolUse:Read hook error: {ROOM_READ_REFUSAL}"]
+    g = _lines(tmp_path, w, _results(*bodies), 3)
+    assert [x["head"].split(" — ")[0] for x in g] == ["A tool result", "A tool result", "A read was refused"], g
+    assert "important detail" in g[0]["text"], g

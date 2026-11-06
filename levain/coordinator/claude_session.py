@@ -38,6 +38,7 @@ import os
 import queue
 import re
 import secrets
+import shlex
 import signal
 import subprocess
 import threading
@@ -49,6 +50,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, ClassVar, NamedTuple, Protocol, runtime_checkable
 
+from levain.coordinator.room_readguard import HOOK_MATCHER, ROOM_READ_REFUSAL
 from levain.coordinator.driver import (APPROVAL_SUBTYPE, ApprovalAnswer, Capabilities, CommandResult, Event,
                                        InterruptCommand, LivenessEvidence, NotSent, ReadBatch, SendCommand,
                                        SendResult, SessionMeta, event)
@@ -56,7 +58,8 @@ from levain.coordinator.driver import (APPROVAL_SUBTYPE, ApprovalAnswer, Capabil
 __all__ = [
     "CLOSE_BOUND", "CONN_MAX", "ROOM_DENIED_TOOLS", "ROOM_MCP_SERVER", "ROOM_MCP_TOOL", "ROOM_TOOLS", "SEQ_MAX", "CanaryVerdict",
     "ClaudeSession", "NotLive", "PipeTransport", "Probe", "Transport", "TransportClosed", "canary_denied",
-    "default_deny_paths", "open_probe", "room_argv", "room_settings_json",
+    "default_deny_paths", "open_probe", "room_argv", "room_hook_command", "room_settings_json",
+    "ROOM_READ_REFUSAL",
 ]
 
 CONN_MAX = 10 ** 8 - 1
@@ -1023,10 +1026,23 @@ def _inside(child: str, root: str) -> bool:
     return child == root or child.startswith(root.rstrip("/") + "/")
 
 
-def room_settings_json(workdir: str | os.PathLike[str], deny_paths: Iterable[str | os.PathLike[str]]) -> str:
+def room_hook_command(python: str, script: str | os.PathLike[str]) -> str:
+    """The shell command of the room's read-guard hook: ``python -I <script>`` (isolated mode; the script is
+    :mod:`levain.coordinator.room_readguard` copied as it is, standard library only). Both paths must be absolute."""
+    if not os.path.isabs(python) or not os.path.isabs(str(script)):
+        raise ValueError("the hook's python and script must be absolute paths")
+    return f"{shlex.quote(python)} -I {shlex.quote(str(script))}"
+
+
+def room_settings_json(workdir: str | os.PathLike[str], deny_paths: Iterable[str | os.PathLike[str]],
+                       hook_command: str | None = None) -> str:
     """The ``--settings`` JSON for the room child: ``permissions.deny`` with a Read, Grep and Glob rule for every
     deny path, and ``permissions.blockReadsOutsideWorkingDirectories``. ``workdir`` must be absolute and not inside any
-    deny path (that would blind the room, not confine it), compared lexically AND after ``realpath`` on both sides."""
+    deny path (that would blind the room, not confine it), compared lexically AND after ``realpath`` on both sides.
+    ``hook_command`` (:func:`room_hook_command`) adds the room's own ``hooks.PreToolUse`` entry
+    (:mod:`levain.coordinator.room_readguard`): it can only add a refusal, with :data:`ROOM_READ_REFUSAL` as the model's
+    text; the vendor's block stays on beside it. None leaves the hook out (the vendor's own sentence is then the
+    refusal's text, a cosmetic difference and no hole)."""
     wd = str(workdir)
     if not os.path.isabs(wd):
         raise ValueError("workdir must be absolute")
@@ -1043,7 +1059,13 @@ def room_settings_json(workdir: str | os.PathLike[str], deny_paths: Iterable[str
             deny.extend(f"{tool}({body})" for tool in ("Read", "Grep", "Glob"))
     seen: set[str] = set()
     deny = [r for r in deny if not (r in seen or seen.add(r))]
-    return json.dumps({"permissions": {"deny": deny, "blockReadsOutsideWorkingDirectories": True}}, sort_keys=True)
+    doc: dict[str, Any] = {"permissions": {"deny": deny, "blockReadsOutsideWorkingDirectories": True}}
+    if hook_command is not None:
+        if not isinstance(hook_command, str) or not hook_command.strip():
+            raise ValueError("hook_command must be a non-empty string")
+        doc["hooks"] = {"PreToolUse": [{"matcher": HOOK_MATCHER, "hooks": [
+            {"type": "command", "command": hook_command, "timeout": 10}]}]}
+    return json.dumps(doc, sort_keys=True)
 
 
 def room_argv(*, mcp_config: str | os.PathLike[str], settings: str | os.PathLike[str], model: str | None = None,
