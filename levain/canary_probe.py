@@ -168,7 +168,164 @@ def run(nonce: str, home: str, offhost: str, port: int, cockpit: str, hookdir: s
         _say(nonce, "RESULTS", "UNWRITTEN", _classify(exc)[1])
 
 
+# ---------------------------------------------------------------------------- the terminal seat arms (Z1c)
+#
+# `seat <config.json>` runs ONE sandboxed Bash call's worth of the terminal seat canary's arms (DESIGN_z1 section 5:
+# P3, P4, P5, P6, P7, P8). The config is written by the host beside this file; the arms are attempted in a fixed
+# order and each prints `<nonce> <NAME> <STATUS> [detail]`. STATUS is OPEN (the act succeeded: the wall failed),
+# BLOCKED (only an errno a refusal produces) or INCONCLUSIVE (any other failure: a dead directory is not a wall).
+# CONTROL lines (OK / FAILED) are writes that must succeed; the host reads a probe whose control failed as
+# inconclusive. RENAMEGIT runs LAST because success breaks the scratch clone.
+
+SEAT_CONTROLS = ("CTRLWRITE", "CTRLCOMMIT")
+SEAT_ARMS = ("XLANE", "GITHOOK", "GITCONFIG", "GITINFO", "GITMODULES", "BIND", "LOOPCONNECT", "KEYCAT",
+             "HOMEWRITE", "OFFHOST", "COCKPITPORT", "RENAMEGIT", "RENAMEHOOKS")
+SEAT_BLOCKING_ERRNOS = frozenset({errno.EPERM, errno.EACCES, errno.EROFS})
+
+
+def seat_status(exc: BaseException) -> tuple[str, str]:
+    """BLOCKED only for an errno a sandbox refusal produces. A refused connection is NOT one (ECONNREFUSED is also what
+    a dead listener answers); the host's server-side hit count judges the loopback arm as well."""
+    code = getattr(exc, "errno", None)
+    label = errno.errorcode.get(code, type(exc).__name__) if isinstance(code, int) else type(exc).__name__
+    return ("BLOCKED" if code in SEAT_BLOCKING_ERRNOS else "INCONCLUSIVE"), label
+
+
+def _seat_commit(lane: str) -> None:
+    import subprocess
+    env = {"PATH": os.environ.get("PATH", "/usr/bin:/bin"), "HOME": lane, "GIT_CONFIG_GLOBAL": "/dev/null",
+           "GIT_CONFIG_NOSYSTEM": "1"}
+    subprocess.run(["git", "-C", lane, "-c", "user.name=canary", "-c", "user.email=canary@invalid", "-c",
+                    "commit.gpgsign=false", "commit", "--allow-empty", "-m", "seat canary control"],
+                   env=env, check=True, capture_output=True, timeout=30)
+
+
+def _seat_bind() -> None:
+    s = socket.socket()
+    try:
+        s.bind(("127.0.0.1", 0))
+    finally:
+        s.close()
+
+
+def _seat_rename(lane: str, say) -> None:
+    git, moved = os.path.join(lane, ".git"), os.path.join(lane, ".g2")
+    os.rename(git, moved)   # success is the finding; whatever follows is attempted and then undone
+    try:
+        os.mkdir(git)
+        say("RENAMEHOOKS", "OPEN" if _try_ok(lambda: os.mkdir(os.path.join(git, "hooks"))) else "BLOCKED", "after rename")
+    except OSError as exc:
+        say("RENAMEHOOKS", *seat_status(exc))
+    finally:
+        for undo in (lambda: os.rmdir(os.path.join(git, "hooks")), lambda: os.rmdir(git), lambda: os.rename(moved, git)):
+            try:
+                undo()
+            except OSError:
+                pass
+
+
+def _try_ok(fn) -> bool:
+    try:
+        fn()
+        return True
+    except OSError:
+        return False
+
+
+def run_seat(cfg: dict, out=print) -> list[tuple[str, str]]:
+    """Run the arms for ``cfg`` (keys: nonce lane_a lane_b key_file port home offhost cockpit). Returns the (name,
+    status) pairs it printed."""
+    n = cfg["nonce"]
+    seen: list[tuple[str, str]] = []
+
+    def say(name: str, status: str, detail: str = "") -> None:
+        seen.append((name, status))
+        out(f"{n} {name} {status}" + (f" {' '.join(str(detail).split())[:80]}" if detail else ""))
+
+    lane = cfg["lane_a"]
+    ctrl_ok = True
+    for name, fn in (("CTRLWRITE", lambda: _create(os.path.join(lane, f"ctrl-{n}.txt"))),
+                     ("CTRLCOMMIT", lambda: _seat_commit(lane))):
+        try:
+            fn()
+            say(name, "OK")
+        except Exception as exc:   # noqa: BLE001 - any failure of a control is the same answer
+            ctrl_ok = False
+            say(name, "FAILED", type(exc).__name__)
+    if not ctrl_ok:
+        return seen   # no arm is attempted without its controls: the host reads the missing lines as inconclusive
+
+    git = os.path.join(lane, ".git")
+    tries = (("XLANE", _create, (os.path.join(cfg["lane_b"], f"xlane-{n}.txt"),)),
+             ("GITHOOK", _create, (os.path.join(git, "hooks", f"pre-commit-{n}"),)),
+             ("GITCONFIG", lambda p: open(p, "a").close(), (os.path.join(git, "config"),)),
+             ("GITINFO", lambda p: open(p, "a").close(), (os.path.join(git, "info", "exclude"),)),
+             ("GITMODULES", os.mkdir, (os.path.join(git, "modules"),)),
+             ("BIND", _seat_bind, ()),
+             ("LOOPCONNECT", _connect, (f"127.0.0.1:{cfg['port']}",)),
+             ("KEYCAT", lambda p: open(p, "rb").read(1), (cfg["key_file"],)),
+             ("HOMEWRITE", _create, (os.path.join(cfg["home"], f".levain-canary-probe-{n}"),)),
+             ("OFFHOST", _connect, (cfg["offhost"],)),
+             ("COCKPITPORT", _connect, (cfg["cockpit"],)))
+    for name, fn, args in tries:
+        try:
+            fn(*args)
+            say(name, "OPEN")
+        except LookupError as exc:
+            say(name, "INCONCLUSIVE", str(exc))
+        except (OSError, ValueError) as exc:
+            say(name, *seat_status(exc))
+    try:
+        _seat_rename(lane, say)
+        say("RENAMEGIT", "OPEN")
+    except OSError as exc:
+        say("RENAMEGIT", *seat_status(exc))
+        say("RENAMEHOOKS", "INCONCLUSIVE", "rename refused, nothing to follow")
+    return seen
+
+
+def seat_flip(link: str, real_dir: str, decoy: str, seconds: float, counter: str) -> int:
+    """The P2 flipper: swap ``link`` between a real directory (``real_dir``) and a symlink to ``decoy`` for
+    ``seconds``, writing the flip count to ``counter`` when it ends. It never touches anything but those names."""
+    import time
+    end, flips = time.monotonic() + seconds, 0
+    while time.monotonic() < end:
+        try:
+            if os.path.islink(link):
+                os.unlink(link)
+                os.mkdir(real_dir)
+            else:
+                for entry in os.listdir(real_dir):   # a write that landed in the real directory must not stop the flips
+                    os.unlink(os.path.join(real_dir, entry))
+                os.rmdir(real_dir)
+                os.symlink(decoy, link)
+            flips += 1
+        except OSError:
+            pass
+    try:
+        with open(counter, "w", encoding="ascii") as fh:
+            fh.write(str(flips))
+    except OSError:
+        return 1
+    return 0
+
+
+def seat_main(argv: list[str]) -> int:
+    import json
+    if argv and argv[0] == "seat" and len(argv) == 2:
+        with open(argv[1], encoding="utf-8") as fh:
+            run_seat(json.load(fh))
+        return 0
+    if argv and argv[0] == "seat-flip" and len(argv) == 6:
+        return seat_flip(argv[1], argv[2], argv[3], float(argv[4]), argv[5])
+    print("usage: canary_probe.py seat <config.json> | seat-flip <link> <real_dir> <decoy> <seconds> <counter>")
+    return 2
+
+
 def main(argv: list[str] | None = None) -> int:
+    args = sys.argv[1:] if argv is None else argv
+    if args and args[0] in ("seat", "seat-flip"):
+        return seat_main(args)
     p = argparse.ArgumentParser(prog="canary_probe")
     p.add_argument("--nonce", required=True)
     p.add_argument("--home", required=True)
