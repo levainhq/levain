@@ -321,3 +321,62 @@ def test_a_response_is_bounded_in_size_and_in_total_time(monkeypatch) -> None:
         with pytest.raises(OSError, match="deadline"):
             sbc.fetch(base + "/", timeout=3.0, total_timeout=0.6)
         assert time.monotonic() - started < 3.0
+
+
+# ---- L3 r2 fix round (1105-36 b4fix2): each test below was first run RED against 04a8ab6f -------------------------------
+
+
+@pytest.mark.parametrize("status", [200, 404])
+def test_a_body_that_stalls_past_the_deadline_is_exit_two_at_the_deadline_not_a_pass_after_it(status: int) -> None:
+    def stall(h):                               # a chunked body: five bytes, a stall LONGER than the deadline but shorter than the
+        h.send_response(status)                 # socket timeout, then the terminating chunk. The read that ends it is one blocking call
+        h.send_header("Transfer-Encoding", "chunked")
+        h.end_headers()
+        h.wfile.write(b"5\r\nhello\r\n")
+        h.wfile.flush()
+        time.sleep(1.5)
+        h.wfile.write(b"0\r\n\r\n")
+        h.wfile.flush()
+
+    with _origin(stall) as base:
+        started = time.monotonic()
+        with pytest.raises(OSError, match="deadline"):
+            sbc.fetch(base + "/", timeout=3.0, total_timeout=0.5)
+        assert time.monotonic() - started < 1.2      # given up AT the deadline: the blocking read was capped, not waited out
+
+
+def test_a_read_that_finishes_after_the_deadline_is_over_deadline_even_when_it_returns_nothing() -> None:
+    class Slow:                                 # no socket to cap: the one read takes 0.3 s and then says "end of body"
+        headers = {}
+
+        def read1(self, n):
+            time.sleep(0.3)
+            return b""
+
+    with pytest.raises(OSError, match="deadline"):
+        sbc._read_bounded("http://x/", Slow(), time.monotonic() + 0.1)
+
+
+def test_a_tree_file_that_is_not_utf8_is_exit_two_naming_the_file(tmp_path: Path, capsys) -> None:
+    tree = _tree(tmp_path / "t")
+    (tree / "levain" / "templates" / "web" / "sky.js").write_bytes(b"\xff\xfe not utf-8")
+    with pytest.raises(OSError, match="not valid UTF-8"):
+        sbc.tree_bytes(tree / "levain" / "templates" / "web" / "sky.js")
+    with _up(tmp_path / "a") as base:
+        assert sbc.main(["--url", base, "--tree", str(tree)]) == 2
+    err = capsys.readouterr().err
+    assert err.startswith("ERROR") and "sky.js" in err and "UTF-8" in err
+
+
+def test_a_path_named_bare_and_with_two_digests_is_one_result_carrying_every_reason(tmp_path: Path) -> None:
+    with _up(tmp_path) as base:
+        def messy(url: str):
+            status, body = sbc.fetch(url)
+            if url == base + "/":               # the real versioned sky.js stays; add a bare one and a second, wrong digest
+                body = body.replace(b"<head>", b'<head><script src="/sky.js"></script><script src="/sky.js?v=' + b"0" * 12 + b'"></script>', 1)
+            return status, body
+
+        results = sbc.run(base, None, messy)
+    page = [r for r in results if r.name == "page /sky.js"]
+    assert len(page) == 1 and not page[0].ok, [r.line() for r in results]
+    assert "without its ?v=" in page[0].detail and "different ?v=" in page[0].detail

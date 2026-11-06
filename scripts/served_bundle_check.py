@@ -17,7 +17,7 @@ template), the sign sheet (``/sign/<id>``, served only beside a signer: an origi
 and the last line says so), and the worker. The tree is read as the server reads it (``read_text``, so a CRLF checkout
 matches), never run or imported: the asset table is parsed out of its ``web_server.py`` with ``ast``. Exit 0 no FAIL (an
 UNVERIFIED line is not a FAIL, and is never counted as a PASS), 1 any FAIL, 2 the origin or the tree could not be read (a
-declared asset the tree lacks, a cut or oversized response, a malformed asset table).
+declared asset the tree lacks, a cut, oversized or unfinished-in-time response, a malformed asset table, a tree file that is not UTF-8).
 
 Standard library only, so it runs under any interpreter and against any release (an older server with no ``?v=`` digests
 FAILs on exactly that). It makes GET requests to the one origin it is given and touches nothing else.
@@ -80,16 +80,47 @@ MAX_BODY = 16 * 1024 * 1024   # the largest response read: the cockpit's biggest
 _CHUNK = 64 * 1024
 
 
+def _socket_of(r):
+    """The socket under open response ``r`` (an ``HTTPResponse``, or the ``HTTPError`` that wraps one), or None."""
+    x = r
+    for _ in range(4):
+        raw = getattr(x, "raw", None)
+        if raw is not None:
+            return getattr(raw, "_sock", None)
+        x = getattr(x, "fp", None)
+        if x is None:
+            return None
+    return None
+
+
 def _read_bounded(url: str, r, deadline: float) -> bytes:
     """The body of open response ``r``: at most ``MAX_BODY`` bytes, finished before the absolute monotonic ``deadline``
     (the socket timeout alone resets on every received byte), and as long as its Content-Length says (a connection that
-    closes early is a cut body, which ``read(amt)`` returns as a short read rather than raising)."""
+    closes early is a cut body, which ``read(amt)`` returns as a short read rather than raising). Each blocking read is
+    given only the time left, so a stalled stream is given up AT the deadline; the deadline is looked at again after every
+    read, the one that returns nothing included, so a read that ends after it is over-deadline, never a PASS."""
     parts: list[bytes] = []
     total = 0
+    sock = _socket_of(r)
+
+    def over() -> OSError:
+        return OSError(f"{url}: not finished before the total deadline ({total} bytes read)")
+
     while True:
+        left = deadline - time.monotonic()
+        if left <= 0:
+            raise over()
+        if sock is not None:
+            try:
+                sock.settimeout(left)
+            except OSError:                   # the body is complete and the response closed its socket: nothing can block now
+                sock = None
+        try:
+            chunk = r.read1(_CHUNK)       # ONE socket read, so the deadline is looked at after every packet, not every 64 KiB
+        except TimeoutError as e:
+            raise over() from e
         if time.monotonic() > deadline:
-            raise OSError(f"{url}: not finished before the total deadline ({total} bytes read)")
-        chunk = r.read1(_CHUNK)           # ONE socket read, so the deadline is looked at after every packet, not every 64 KiB
+            raise over()
         if not chunk:
             break
         total += len(chunk)
@@ -200,7 +231,10 @@ def tree_sheet(pkg: Path) -> tuple[str, str]:
 def tree_bytes(path: Path) -> bytes:
     """A tree file's bytes as the server serves them: ``load_web_asset`` is ``read_text(encoding="utf-8")`` (universal
     newlines, so a CRLF checkout reads as LF) and the server ``.encode("utf-8")``s that, so read it the same way."""
-    return path.read_text(encoding="utf-8").encode("utf-8")
+    try:
+        return path.read_text(encoding="utf-8").encode("utf-8")
+    except UnicodeDecodeError as e:          # the server could not serve it either: an unreadable tree, not a traceback
+        raise OSError(f"{path}: not valid UTF-8 ({e.reason} at byte {e.start})") from e
 
 
 def _sw_version(sw: bytes) -> str:
@@ -218,10 +252,13 @@ def check_origin(base: str, get: Callable[[str], tuple[int, bytes]] = fetch) -> 
     versioned, bare, conflicts = shell_refs(page)
     if not versioned:
         out.append(Result(False, "page", "names no ?v=<digest> shell asset: this server predates the content-hash shell (row 35)"))
+    why_page: dict[str, list[str]] = {}       # ONE result per path, carrying every reason the page is wrong about it
     for path in bare:
-        out.append(Result(False, f"page {path}", "named without its ?v= digest"))
-    for path, digests in sorted(conflicts.items()):
-        out.append(Result(False, f"page {path}", "named with different ?v= digests: " + ", ".join(digests)))
+        why_page.setdefault(path, []).append("named without its ?v= digest")
+    for path, digests in conflicts.items():
+        why_page.setdefault(path, []).append("named with different ?v= digests: " + ", ".join(digests))
+    for path in sorted(why_page):
+        out.append(Result(False, f"page {path}", "; ".join(why_page[path])))
     for path, want in sorted(versioned.items()):
         status, data = get(f"{base}{path}?v={want}")
         got = digest(data) if status == 200 else None
