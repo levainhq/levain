@@ -349,6 +349,9 @@ class TestHttpRoutes:
         _root, src = _install(tmp_path)
         ck = build_default_cockpit(src)
         ck.register(_simple("slow", refresh_every_s=0.1, stale_after_s=0.2, rows=[RowIn("r", "t", {"at": "1"}, stored={"id": "r"})]))
+        # this reads a 0.1 s refresher inside the shared read cache's 1.5 s TTL (which a served cockpit now gets,
+        # solid2 r1): the cache is turned off so the refresher's own clock is what is measured
+        ck.read_cache_ttl_s = 0
         ck.start()
         try:
             with _serve(src, cockpit=ck) as (base, _h):

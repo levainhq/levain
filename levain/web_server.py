@@ -1055,6 +1055,75 @@ _MAX_READ_WAITERS = 64
 
 _log = logging.getLogger(__name__)
 
+_SLOW_READ_MS = 2000.0     # a cockpit read slower than this logs ONE line (route, ms, gate wait ms), nothing else
+_ROUTE_PANEL_IDS_MAX = 32  # distinct panel ids counted by name; later ones fold into "panel/other"
+
+
+# The cockpit's identical concurrent reads (a page load bursts ~28) share one compute for this long (engine
+# ``_shared_read``); a write handled by this server invalidates at once, a write by another process shows within it.
+COCKPIT_READ_CACHE_TTL_S = 1.5
+
+
+class _RouteStats:
+    """In-process latency and refusal counters for the cockpit GET reads. A bounded dict keyed by route TEMPLATE
+    (``panel/<id>``, ``manifest``, ``question/<n>``, ``events``, ...), never a raw path: at most
+    ``_ROUTE_PANEL_IDS_MAX`` panel ids plus a fixed handful of other keys. Holds counts and times only, no request
+    content. ``snapshot()`` is the read-only shape; there is no network route for it (no new surface)."""
+
+    _FIXED = ("manifest", "freshness", "events", "question/<n>", "panel/other", "other")
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._rows: dict[str, list[float]] = {}   # key -> [count, total_ms, max_ms, refused_503]
+
+    @classmethod
+    def key_for(cls, path: str) -> str:
+        path = path.split("?", 1)[0]
+        if path == "/cockpit/manifest.json":
+            return "manifest"
+        if path == "/cockpit/events":
+            return "events"
+        if path.startswith(_QUESTION_BODY_PREFIX):
+            return "question/<n>"
+        if path.startswith("/cockpit/panel/") and path.endswith(".json"):
+            pid = path[len("/cockpit/panel/"):-len(".json")]
+            return f"panel/{pid}" if re.fullmatch(r"[A-Za-z0-9_.:-]{1,48}", pid) else "panel/other"
+        return "freshness" if path.startswith("/cockpit/fresh") else "other"
+
+    def _row(self, key: str) -> tuple[str, list[float]]:
+        # returns the EFFECTIVE key (a folded panel id comes back as "panel/other") with its row
+        row = self._rows.get(key)
+        if row is None:
+            if key.startswith("panel/") and key != "panel/other" and \
+                    sum(1 for k in self._rows if k.startswith("panel/") and k != "panel/other") >= _ROUTE_PANEL_IDS_MAX:
+                key = "panel/other"
+            row = self._rows.setdefault(key, [0.0, 0.0, 0.0, 0.0, 0.0])
+        return key, row
+
+    def record(self, path: str, ms: float, *, gate_wait_ms: float = 0.0, refused: bool = False,
+               aborted: bool = False) -> None:
+        key = self.key_for(path)
+        with self._lock:
+            key, row = self._row(key)
+            row[0] += 1
+            row[1] += ms
+            row[2] = max(row[2], ms)
+            if refused:
+                row[3] += 1
+            if aborted:
+                row[4] += 1
+        if ms > _SLOW_READ_MS:
+            _log.warning("slow cockpit read: route=%s ms=%d gate_wait_ms=%d%s%s", key, ms, gate_wait_ms,
+                         " refused=503" if refused else "", " aborted" if aborted else "")
+
+    def snapshot(self) -> dict[str, dict[str, float]]:
+        with self._lock:
+            return {k: {"count": int(r[0]), "total_ms": round(r[1], 1), "max_ms": round(r[2], 1),
+                        "refused_503": int(r[3]), "aborted": int(r[4])} for k, r in self._rows.items()}
+
+
+_ROUTE_STATS = _RouteStats()
+
 
 def _store_fault(what: str, exc: BaseException) -> dict[str, str]:
     """The 500 body of an agent-text route whose store could not be read: the exception's type only. Its message is
@@ -1914,6 +1983,11 @@ class _LevainHTTPServer(ThreadingHTTPServer):
                     raise
                 self.cockpit = built   # published only once started: a failed start retries next request
             cockpit = self.cockpit
+            # identical concurrent reads share one compute: on the kernel's own cockpit AND on one a downstream passed
+            # (flow's bridge passes its own; L3 r1 codex: the cache was off on exactly the deploy it was built for).
+            # None is "the server's default"; a caller that set a number, 0 included, keeps it
+            if getattr(cockpit, "read_cache_ttl_s", 0) is None:     # (a test double may carry no cache at all)
+                cockpit.read_cache_ttl_s = COCKPIT_READ_CACHE_TTL_S
         if self.broker is not None:
             # started with the cockpit, outside the cockpit's lock: its start recovery is a settler
             # and may wait on a store lock (K2b §4.2, §9); a second call returns at once
@@ -1971,6 +2045,7 @@ class _Handler(GuardedHandler):
     server: _LevainHTTPServer  # narrow the type for typed attribute access
     _credential_cache: Any = _UNSET
     _presence_cache: Any = _UNSET   # reset per request in handle_one_request
+    _reads_invalidated = False      # likewise: whether this request has dropped the shared read cache yet
     _post_headers: "list[tuple[str, str]]" = []   # extra headers for a push POST's JSON reply (never mutated in place)
     _pair_epoch_seen = 0       # the revocation epoch read just before this request's paired lookup (RU-3)
     # (Content-Security-Policy, X-Frame-Options) in place of http_guards' for this one response (send_header), else None
@@ -2039,8 +2114,17 @@ class _Handler(GuardedHandler):
         self._credential_cache = _UNSET
         self._presence_cache = _UNSET
         self._post_headers = []
+        self._reads_invalidated = False
+        self.command = None     # a kept-alive connection's previous verb is not this request's
         try:
-            super().handle_one_request()
+            try:
+                super().handle_one_request()
+            finally:
+                # the fallback (send_response is the first invalidation, before the status line): an admitted write
+                # that sent no response (its handler raised), and one more for a read that began while it ran. A
+                # request refused at a gate was never admitted and never invalidates (_admitted_write)
+                if self._reads_invalidated or self._admitted_write(None):
+                    self._invalidate_reads()
         except _CredentialUnavailable:
             self.close_connection = True
             try:
@@ -2051,6 +2135,36 @@ class _Handler(GuardedHandler):
                 self.wfile.flush()
             except (OSError, ValueError):
                 pass        # the client went away first
+
+    def _admitted_write(self, code: "int | None") -> bool:
+        """Whether THIS request may have written, so the shared read cache must drop what it holds (1106 solid2 r1).
+        A write method (not GET / HEAD) AND either a verified surface or paired credential resolved on this request
+        (a write route admitted it, whatever the write then answered), or a 2xx answer (the routes whose credential
+        is not a surface token: the pairing claim's code, a notify token, a push receipt's endpoint hash, the chat
+        token, a presence tap). A request refused at a gate (OPTIONS 501, a missing or wrong token's 403, a
+        malformed request's 400, a wrong Host or Origin) resolves no token credential and gets no 2xx: it never
+        invalidates, so no unauthenticated client can keep flushing the cache the read gate's load relies on."""
+        if getattr(self, "command", None) in (None, "GET", "HEAD"):
+            return False
+        cred = getattr(self, "_credential_cache", _UNSET)
+        if isinstance(cred, dict) and cred.get("class") == "token":
+            return True
+        return code is not None and 200 <= code < 300
+
+    def _invalidate_reads(self) -> None:
+        self._reads_invalidated = True
+        cockpit = getattr(self.server, "cockpit", None)
+        if cockpit is not None:
+            cockpit.invalidate_reads()
+
+    def send_response(self, code: int, message: "str | None" = None) -> None:
+        """READ-YOUR-WRITES (1106 solid2 r1): an admitted write drops the shared read cache BEFORE its status line is
+        written. Every handler answers through here after its write committed (send_error included), so a client
+        that holds the response and reads at once, on any connection, never gets a read cached or begun before the
+        write. The ``finally`` in :meth:`handle_one_request` is only the fallback."""
+        if not self._reads_invalidated and self._admitted_write(code):
+            self._invalidate_reads()
+        super().send_response(code, message)
 
     def _write_token_required(self) -> bool:
         """True iff this request needs a surface token on EVERY route, the substrate-bearing READS included
@@ -2394,6 +2508,7 @@ class _Handler(GuardedHandler):
         store = getattr(self.server, "question_store", None)
         if store is not None and _QUESTION_ID.fullmatch(n):
             if not self.server.request_gate.acquire(blocking=False):
+                self._q503 = True
                 self._send(b"busy\n", "text/plain; charset=utf-8", status=503, head=head)
                 return
             try:
@@ -4106,7 +4221,12 @@ class _Handler(GuardedHandler):
             self._serve_consent_body(path, head=head)
             return
         if path.startswith(_QUESTION_BODY_PREFIX) and path.endswith(_CONSENT_BODY_SUFFIX):
-            self._serve_question_body(path, head=head)
+            _tq = time.monotonic()
+            self._q503 = False
+            try:
+                self._serve_question_body(path, head=head)
+            finally:   # a client that left mid-send (BrokenPipe) is still one counted read
+                _ROUTE_STATS.record(path, (time.monotonic() - _tq) * 1000.0, refused=self._q503)
             return
         if path == _BAND_PATH:
             self._serve_band(head=head)
@@ -4138,28 +4258,41 @@ class _Handler(GuardedHandler):
             if path == EVENTS_PATH:
                 self._serve_stream(head=head)
                 return
+            _t0 = time.monotonic()
             if not self._acquire_read_slot():
+                _wait = (time.monotonic() - _t0) * 1000.0
+                _ROUTE_STATS.record(path, _wait, gate_wait_ms=_wait, refused=True)
                 self._send(b"busy\n", "text/plain; charset=utf-8", status=503, head=head)
                 return
-            if not self._peer_open():
-                # the client gave up during its wait: skip the store read nobody will receive
-                self._release_read_slot()
-                self.close_connection = True
-                return
-            try:
-                status, body, hdrs = handle_cockpit_get(
-                    self._cockpit(), self.path, credential=self._credential(),
-                    if_none_match=self.headers.get("If-None-Match"), transport=self._transport(),
-                )
-            except _CredentialUnavailable:   # RU-5: only the outer catch answers it
-                raise
-            except Exception as exc:  # noqa: BLE001 - never 500 with a dead connection
-                status, hdrs = 500, [("Vary", COCKPIT_VARY)]
-                body = json.dumps({"error": "internal", "message": f"{type(exc).__name__}: {exc}"}).encode("utf-8")
+            _wait = (time.monotonic() - _t0) * 1000.0
+            _aborted = False
+            try:   # every read is counted from request start, whether or not the client is still there to get it
+                if not self._peer_open():
+                    # the client gave up during its wait: skip the store read nobody will receive
+                    _aborted = True
+                    self._release_read_slot()
+                    self.close_connection = True
+                    return
+                try:
+                    status, body, hdrs = handle_cockpit_get(
+                        self._cockpit(), self.path, credential=self._credential(),
+                        if_none_match=self.headers.get("If-None-Match"), transport=self._transport(),
+                    )
+                except _CredentialUnavailable:   # RU-5: only the outer catch answers it
+                    raise
+                except Exception as exc:  # noqa: BLE001 - never 500 with a dead connection
+                    status, hdrs = 500, [("Vary", COCKPIT_VARY)]
+                    body = json.dumps({"error": "internal", "message": f"{type(exc).__name__}: {exc}"}).encode("utf-8")
+                finally:
+                    self._release_read_slot()
+                try:
+                    self._send(body, "application/json; charset=utf-8", status=status, head=head,
+                               headers=hdrs, cache_control=COCKPIT_CACHE_CONTROL)
+                except OSError:
+                    _aborted = True
+                    raise
             finally:
-                self._release_read_slot()
-            self._send(body, "application/json; charset=utf-8", status=status, head=head,
-                       headers=hdrs, cache_control=COCKPIT_CACHE_CONTROL)
+                _ROUTE_STATS.record(path, (time.monotonic() - _t0) * 1000.0, gate_wait_ms=_wait, aborted=_aborted)
             return
 
         if path == "/substrate.json":

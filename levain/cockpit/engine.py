@@ -600,6 +600,21 @@ def _note_rows_in(store: Any, now: datetime) -> tuple[list[RowIn], int]:
 _UNSET: Any = object()      # attach_server's "board not given", distinct from an explicit None
 
 
+_READ_CACHE_MAX = 64          # live entries; past it a read simply runs uncached
+_READ_CACHE_JOIN_S = 60.0     # how long a joiner waits for the owner before reading for itself
+
+
+def _read_key(x: Any) -> str:
+    return json.dumps(x, sort_keys=True, separators=(",", ":"), default=str)
+
+
+class _SharedRead:
+    __slots__ = ("at", "done", "value", "ok")
+
+    def __init__(self, at: float) -> None:
+        self.at, self.done, self.value, self.ok = at, threading.Event(), None, None
+
+
 class Cockpit:
     def __init__(
         self,
@@ -639,6 +654,13 @@ class Cockpit:
         # panel id -> its live store-search workers, capped at SEARCH_INFLIGHT, so hung hooks cost bounded threads
         self._searching: dict[str, list[threading.Thread]] = {}
         self._search_mu = threading.Lock()
+        # the short-TTL shared read cache (manifest and unsearched panel reads). None (the default) = off here, so a
+        # caller that reads a Cockpit directly reads fresh every time, and "the server's default" to the server that
+        # serves it (web_server get_cockpit), its own or one a downstream passed; 0 = off even when served.
+        self.read_cache_ttl_s: float | None = None
+        self._rc: dict[Any, "_SharedRead"] = {}
+        self._rc_gen = 0
+        self._rc_lock = threading.Lock()
 
     def attach_verbs(self, view: Any) -> None:
         """Attach the verb registry's view: row and panel actions, the manifest ``verbs`` map, and
@@ -2065,8 +2087,89 @@ class Cockpit:
     def _ordered_specs(specs_map: dict[str, ProviderSpec]) -> list[ProviderSpec]:
         return sorted(specs_map.values(), key=lambda s: (_REGION_ORDER.index(s.region), s.rank, s.id))
 
+    # --- the shared read cache ---------------------------------------------------------------------
+    def invalidate_reads(self) -> None:
+        """A write happened (the server calls it for an ADMITTED write, before that write's response is sent, and
+        once more after: web_server ``_Handler.send_response``; a request refused at a gate never calls it): every cached read
+        and every in-flight one is stale from here. A read started before this call is never stored for, nor
+        joined by, a request arriving after it (the generation is part of the key)."""
+        with self._rc_lock:
+            self._rc_gen += 1
+            self._rc.clear()
+
+    def _shared_read(self, key: Any, compute: Callable[[], Any], keep: Callable[[Any], bool] = lambda v: True) -> Any:
+        """Single-flight plus a short TTL for one identical read. ``key`` must hold EVERYTHING the result
+        depends on (the caller derives it); the write generation is added here. The compute runs in the caller
+        that finds no live entry; concurrent identical callers wait for it; a caller inside ``read_cache_ttl_s``
+        of the compute's START reuses it. A failed compute (or a value ``keep`` refuses) is never cached: its joiners
+        compute for themselves or take the value in flight, and the next caller starts afresh."""
+        ttl = self.read_cache_ttl_s or 0.0
+        if ttl <= 0:
+            return compute()
+        with self._rc_lock:
+            full = (self._rc_gen, key)
+            ent = self._rc.get(full)
+            now = time.monotonic()
+            if ent is not None and ent.ok is not False and (not ent.done.is_set() or now - ent.at < ttl):
+                owner = False
+            else:
+                if len(self._rc) >= _READ_CACHE_MAX:
+                    self._rc = {k: e for k, e in self._rc.items() if e.done.is_set() is False or now - e.at < ttl}
+                    if len(self._rc) >= _READ_CACHE_MAX:
+                        # full of live entries (a caller can mint keys: one per real row id): the oldest FINISHED
+                        # entry gives way, so honest reads keep sharing; only a table of 64 reads all in flight runs
+                        # this one uncached
+                        done = [(e.at, k) for k, e in self._rc.items() if e.done.is_set()]
+                        if done:
+                            del self._rc[min(done, key=lambda d: d[0])[1]]
+                        else:
+                            ent = None
+                if ent is not None or len(self._rc) < _READ_CACHE_MAX:
+                    ent = self._rc[full] = _SharedRead(now)
+                    owner = True
+                else:
+                    owner = False
+        if ent is None:
+            return compute()        # the table is full of live entries: this read runs uncached, outside the lock
+        if owner:
+            try:
+                ent.value = compute()
+                ent.ok = True
+            except BaseException:
+                ent.ok = False
+                with self._rc_lock:
+                    if self._rc.get(full) is ent:
+                        del self._rc[full]
+                ent.done.set()
+                raise
+            if not keep(ent.value):
+                with self._rc_lock:
+                    if self._rc.get(full) is ent:
+                        del self._rc[full]
+            ent.done.set()
+            return ent.value
+        if ent.done.wait(_READ_CACHE_JOIN_S) and ent.ok:
+            return ent.value
+        return compute()        # the owner failed or hung: this caller reads for itself
+
     def manifest(self, credential: dict[str, Any], *, install_class: str | None = None,
                  transport: dict[str, Any] | None = None) -> dict[str, Any]:
+        """The manifest, shared. KEY = every input this composition reads from the request: the whole credential
+        dict (class, name, device_class: it is also hashed into the etag and echoed in the body), ``install_class``
+        and ``transport`` (both published in the body and hashed into the etag). Everything else it reads
+        (authority, labels, verb view, the specs, the panel sources) is server-global state, not request state,
+        and is bounded by the TTL and by ``invalidate_reads``. The credential was verified by the caller on THIS
+        request before it got here (a refused request never reaches the engine), so the cache never decides who
+        may read; it only avoids repeating a compute for an identical, already-authorised asker. The returned dict
+        is shared: read-only for every caller."""
+        if (self.read_cache_ttl_s or 0.0) <= 0:
+            return self._manifest_compute(credential, install_class=install_class, transport=transport)
+        key = ("manifest", _read_key(credential), install_class, _read_key(transport))
+        return self._shared_read(key, lambda: self._manifest_compute(credential, install_class=install_class,
+                                                                     transport=transport))
+
+    def _manifest_compute(self, credential: dict[str, Any], *, install_class: str | None = None,
+                          transport: dict[str, Any] | None = None) -> dict[str, Any]:
         """``transport`` is the serving transport's write capability (``writable``,
         ``write_token_required``), which only the server knows; it is published when given."""
         auth = self.authority()
@@ -2179,6 +2282,26 @@ class Cockpit:
     def panel(self, panel_id: str, *, profile: str = "full", q: str | None = None,
               row: str | None = None, credential_class: str = "none",
               limit: int | None = None, at: str | None = None) -> dict[str, Any] | None:
+        """The shared form of :meth:`_panel_compute`. KEY = every argument the compose's result depends on (panel id,
+        profile, row, credential class; ``limit`` only bounds a search, so it is validated, not keyed); the result is a function of those and of server-global state. A search
+        (``q``) and a past read (``at``) are never cached: ``q`` is free text the operator types (unbounded keys,
+        and a store search is the costly live read), ``at`` has its own replay cache. A QueryError or RowNotFound
+        propagates to every waiter alike (a failed compute is not stored). The result is shared: read-only."""
+        if (self.read_cache_ttl_s or 0.0) <= 0 or q is not None or at is not None:
+            return self._panel_compute(panel_id, profile=profile, q=q, row=row, credential_class=credential_class,
+                                       limit=limit, at=at)
+        # ``limit`` caps only a search, and a search is never cached: without ``q`` the compose reads it only to
+        # refuse a bad one, so it is checked here (the same QueryError, before the table is touched) and left out
+        # of the key, instead of letting every distinct value mint its own entry
+        check_query(None, limit)
+        key = ("panel", panel_id, profile, row, credential_class)
+        return self._shared_read(key, lambda: self._panel_compute(
+            panel_id, profile=profile, q=q, row=row, credential_class=credential_class, limit=limit, at=at),
+            keep=lambda v: v is not None)      # an unknown id is not stored: ids are caller-chosen
+
+    def _panel_compute(self, panel_id: str, *, profile: str = "full", q: str | None = None,
+                       row: str | None = None, credential_class: str = "none",
+                       limit: int | None = None, at: str | None = None) -> dict[str, Any] | None:
         """The ``Panel`` payload, or None for an unknown panel id. ``profile`` is ``full`` or
         ``compact``; ``q`` is the search (plain text, bounded: ``check_query``) over the panel's declared
         search fields, answered by the provider's ``search`` hook when the panel is a store-scope window;
