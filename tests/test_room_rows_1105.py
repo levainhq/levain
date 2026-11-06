@@ -98,20 +98,21 @@ def test_a_tool_result_reads_as_a_sentence_without_its_tag_and_opens_on_a_tap(tm
     with _serve_room(tmp_path, w, extra_assets=_assets()) as (base, _h):
         out = _drive(tmp_path, base + "/rvc.html", [
             {"until": "document.querySelectorAll('.rv-line').length >= 7"}, {"eval": _LOOK},
-            {"eval": "const b = [...document.querySelectorAll('.rv-who')].find(n => n.textContent.indexOf('A tool was refused') === 0);"
+            {"eval": "const b = [...document.querySelectorAll('.rv-who')].find(n => n.textContent.indexOf('A read was refused') === 0);"
                      " const t = b.nextSibling; const before = t.hidden; b.click();"
                      " JSON.stringify({before, after: t.hidden, text: t.textContent, expanded: b.getAttribute('aria-expanded'), head: b.textContent})"}])
     g = json.loads(out["values"][1])
     heads = g["heads"]
-    assert "A tool was refused — File is in a directory that is denied by your permission settings." in heads, heads
+    assert "A read was refused — That is outside what the room can read, so nothing was read." in heads, heads
+    assert not [h for h in heads if "permission settings" in h or "blockReads" in h], heads    # never the vendor's wording
     assert "A tool failed — File does not exist." in heads, heads
     assert "A tool result — 1\thello from the room scratch dir" in heads, heads
     assert not [h for h in heads if "vendor" in h or "<" in h], heads
     assert g["angle"] == 0 and g["anyMarkupInTools"] == 0
     o = json.loads(out["values"][2])
     assert o["before"] is True and o["after"] is False and o["expanded"] == "true"
-    assert o["text"] == "File is in a directory that is denied by your permission settings."
-    assert o["head"] == "A tool was refused"
+    assert o["text"] == "That is outside what the room can read, so nothing was read."
+    assert o["head"] == "A read was refused"
 
 
 @needs_browser
@@ -167,9 +168,14 @@ def test_a_tool_is_called_refused_only_by_the_vendors_own_refusal_sentences(tmp_
               wrap(OUTSIDE), wrap("File not found: /home/permissions/x"), wrap("This was refused by the shell"), OUTSIDE,
               wrap("README.md is outside this section; its guide blocks reads outside examples")]    # a look-alike of the third phrase (L3 r2 codex)
     g = _lines(tmp_path, w, _results(*bodies), 7)
-    assert [x["head"].split(" — ")[0] for x in g] == ["A tool was refused"] * 3 + ["A tool failed"] * 2 + ["A tool result"] + ["A tool failed"], g
-    # the untagged denial (the vendor sends it without the wrapper) reads "A tool result": is_error is not carried through the
-    # timeline, a known edge pinned here so a change to it is deliberate
+    assert [x["head"].split(" — ")[0] for x in g] == ["A read was refused", "A tool was refused", "A read was refused",
+                                                      "A tool failed", "A tool failed", "A read was refused", "A tool failed"], g
+    # the untagged outside-the-cwd denial (the vendor sends it without the wrapper) is read from its words and drawn as the
+    # same refusal (roomcanary: it drew "A tool result — /etc/hosts is outside /priv..." with the vendor's path and setting)
+    assert not [x for x in g if "permissions." in (x["text"] or "") or "/tmp/real1" in (x["text"] or "") or "/etc/hosts" in (x["text"] or "")
+                or "denied by your" in (x["text"] or "") or "Bash" in (x["text"] or "")], g
+    assert [x["text"] for x in g if x["head"].startswith("A tool was refused")] == [
+        "That is outside what the room can use, so the tool was not used."], g
 
 
 @needs_browser

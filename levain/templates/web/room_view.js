@@ -54,16 +54,30 @@
     var rest = m[2].trim();
     return { text: m[1].trim() + (rest ? "\n" + rest : ""), tag: "tool_use_error" };
   }
-  // the vendor's own refusal sentences, matched at the start of the unwrapped text (not a word anywhere in it)
-  var REFUSED = [/^File is in a directory that is denied by your permission settings/, /^Permission to use [^\n]{1,100} has been denied/,
-                 /^[^\n;]{1,300} is outside [^\n;]{1,300}; the permissions\.blockReadsOutsideWorkingDirectories setting blocks reads outside the working directories/];
+  // the vendor's own refusal sentences, matched at the start of the unwrapped text (not a word anywhere in it); the vendor
+  // sends the outside-the-cwd one with no wrapper, so a refusal is read from the words, tagged or not. A Read's own result
+  // opens with a line number, so a file's text never starts with one of these.
+  var REFUSED = [
+    { what: "read", re: /^File is in a directory that is denied by your permission settings/ },
+    { what: "tool", re: /^Permission to use [^\n]{1,100} has been denied/ },
+    { what: "read", re: /^[^\n;]{1,300} is outside [^\n;]{1,300}; the permissions\.blockReadsOutsideWorkingDirectories setting blocks reads outside the working directories/ }
+  ];
+  // what a refusal says on the page: plain words, never the vendor's sentence (it names a path and a settings key)
+  var REFUSAL_HEAD = { read: "A read was refused", tool: "A tool was refused" };
+  var REFUSAL_TEXT = { read: "That is outside what the room can read, so nothing was read.",
+                       tool: "That is outside what the room can use, so the tool was not used." };
   // only the head of the text is tested: the vendor's sentences are short, and a very long error body costs nothing
-  function refused(text) { var head = String(text).slice(0, 700); return REFUSED.some(function (re) { return re.test(head); }); }
+  function refusalOf(text) {
+    var head = String(text).slice(0, 700);
+    for (var i = 0; i < REFUSED.length; i++) if (REFUSED[i].re.test(head)) return REFUSED[i].what;
+    return "";
+  }
   // the head's words for a row: its speaker, else a short sentence for what the row is
   function headWords(l) {
     if (l.who) return l.who;
     if (l.kind === "vendor_tool_result") {
-      if (l.tag === "tool_use_error") return refused(l.text) ? "A tool was refused" : "A tool failed";
+      if (l.refusal) return REFUSAL_HEAD[l.refusal];
+      if (l.tag === "tool_use_error") return "A tool failed";
       return "A tool result";
     }
     if (l.tool) return l.tool.open ? "A tool is running" : "A tool ran";
@@ -80,7 +94,12 @@
     // a tool's result arrives wrapped in its vendor's tag (e.g. <tool_use_error>...</tool_use_error>); the tag is read for
     // the head's words and the text is drawn without it, as text like every other word here
     var tag = "";
-    if (it.kind === "vendor_tool_result") { var un = unwrap(text); text = un.text; tag = un.tag; }
+    var refusal = "";
+    if (it.kind === "vendor_tool_result") {
+      var un = unwrap(text); text = un.text; tag = un.tag;
+      refusal = refusalOf(text);
+      if (refusal) text = REFUSAL_TEXT[refusal];
+    }
     // a hook of the operator's own settings starting in the child (body e.g. "SessionStart:startup") and one that ended
     // in success are recorded as error-kind rows too (claude_session._on_hook, ref "error:hook_started:<id>"); they are
     // not errors (roomfix2, seen on a real open). A hook that ended any other way, and every other error, is drawn.
@@ -97,7 +116,7 @@
       gseq: it.gseq, ref: ref, at: it.at || "",
       who: you ? "You" : (room ? "The room" : ""), cls: you ? "rv-you" : (room ? "rv-room" : (it.kind === "vendor_error" ? "rv-error" : "")),
       kind: String(it.kind), text: text, collapsible: own(COLLAPSED, it.kind), hidden: own(HIDDEN, it.kind) || modeNoise || hookNoise || emptyDoneCall,
-      tag: tag, rich: room,
+      tag: tag, refusal: refusal, rich: room,
       ambiguous: it.kind === "message" && it.status === "ambiguous",
       truncated: it.truncated === true, tool: it.tool ? { open: it.tool.open === true } : null
     };

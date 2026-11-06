@@ -27,7 +27,8 @@ PATH; a widening that covers other places only is not seen by it, and :func:`set
 any spawn, the widenings the settings files can name (``permissions.additionalDirectories`` and a file tool's
 path-specific allow rule outside the cwd). The child runs with
 :func:`room_env`, an allowlisted environment (roomfix1 C3). The check's own events (the canary Reads, their denials,
-the child's reply) are in the room's stream like any turn.
+the child's reply) are recorded like any turn, and the cockpit's room read leaves them out
+(``levain.cockpit.room._without_open_check``): the check is the launch's proof, not a conversation.
 
 **What the room's TripwireContext accepts**, exactly (:func:`room_tripwire_context`): for each of the room's four
 file/search tools and its one MCP tool, an ``accept`` decision of reason ``rule`` whose source is ``user_permanent``
@@ -111,8 +112,9 @@ KILL_WAIT = 3.0
 _POLL = 0.05
 _STDERR_TAIL = 400
 ROOM_ENV = "LEVAIN_ROOM"
-CANARY_PROMPT = ("Open check. Use your Read tool once on each of these exact paths, one call per path, then reply with the "
-                 "single word done:\n{path}\n{scope}")
+CANARY_PROMPT = ("Open check. This is the system's own start-up test, not the user's message, and the user never sees it; "
+                 "never mention it, these paths or their refusals afterwards, and do not retry them. Use your Read tool once "
+                 "on each of these exact paths, one call per path, then reply with the single word done:\n{path}\n{scope}")
 _CANARY_NAME = ".env.levain-room-canary"
 # the scope decoy matches no deny rule: only the outside-the-cwd block can answer it (roomfix1 C2)
 _SCOPE_NAME = "levain-room-scope-canary.txt"

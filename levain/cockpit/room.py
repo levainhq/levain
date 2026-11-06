@@ -170,6 +170,25 @@ def _proposals(conn: sqlite3.Connection, room_thread: str) -> list[dict[str, Any
     return out
 
 
+def _without_open_check(rows: list) -> list:
+    """``rows`` without each room launch's open-check turn. Every launch's first turn is the one the launcher sends itself
+    (``RoomLauncher._open_check``: two canary Reads of decoy files, then a reply); it is the launch's own proof, not a
+    conversation, and a message cannot reach the launch before it ends. So a launch's vendor rows, from its first up to and
+    including its first ``vendor_turn_ended``, are dropped from what the page draws (the stream the page polls is also what a
+    reopened room replays). Kept: an error row (a hook that failed is information) and everything after that first turn
+    end. The record keeps every row (it marks them ``backfill``, being read before the launch's first vendor position);
+    only this read leaves them out."""
+    closed: set[str] = set()
+    out = []
+    for r in rows:
+        lid = r.launch_id or ""
+        if r.source != "vendor" or not lid or lid in closed or r.kind == "vendor_error":
+            out.append(r)
+        elif r.kind == "vendor_turn_ended":
+            closed.add(lid)
+    return out
+
+
 def room_read(directory: Path | str, service: Any = None) -> dict[str, Any]:
     """The open room as one body: ``room_thread`` (None when no room is open), ``launch_id`` (its newest room launch),
     ``composer`` (None when it has no launch or the record cannot say), ``model``, ``gap``, ``stream`` and
@@ -197,7 +216,7 @@ def room_read(directory: Path | str, service: Any = None) -> dict[str, Any]:
             done = {(lid, c) for (lid, k), (c, _t, _b) in facts.items() if k.startswith("tool_result:") and c}
             return {"room_thread": room_thread, "launch_id": launch, "composer": _composer(conn, launch, service),
                     "model": threads.model_in_use(service, launch), "gap": gap,
-                    "stream": [threads._item(r, facts, done) for r in merged],
+                    "stream": [threads._item(r, facts, done) for r in _without_open_check(merged)],
                     "proposals": _proposals(conn, room_thread)}
         finally:
             conn.execute("COMMIT")
