@@ -435,3 +435,16 @@ def test_the_suite_cannot_reach_the_real_terminal_key(monkeypatch, tmp_path):
         ts.default_signer_factory(real, 1.0)
     with pytest.raises(AssertionError, match="real operator key directory"):
         ts.default_desk_signer_factory(real, 1.0)
+
+
+# --- TERMSIGN fix 2 (11-06): an empty band gives a number-led prompt no hint at all ------------------------------------
+def test_a_prompt_that_starts_with_a_number_against_an_empty_band_gets_no_hint(store, env, qdir):
+    out, commit = band_view.hook_prompt({"session_id": SESSION, "prompt": "50.2 is the one I want"}, env)
+    commit()
+    assert out == "" and "band answer" not in out
+    assert seat(store, env, "50.2") == ""
+
+
+def test_the_hint_still_speaks_when_levain_holds_an_open_question_for_the_viewer(store, env):
+    show(store, env)
+    assert "did not read this as a band answer" in seat(store, env, "1 is the one I want")

@@ -529,16 +529,23 @@ def test_p4_full_fsync_falls_back_to_fsync_as_dir_fsync_does(cred_dir, monkeypat
 def test_p5_a_commit_holds_at_most_commit_fds_beyond_the_counted_ones(cred_dir):
     from levain.broker import keys as K
 
+    import gc
     seen = []
 
+    def counted():
+        # earlier tests leave fds that only the cyclic GC frees; a collection landing inside the window would
+        # lower the count mid-measurement (CI shard 3, 11-06), so the garbage is gone before every reading
+        gc.collect()
+        return K.count_open_fds()
+
     def fsync_file(fd):
-        seen.append(K.count_open_fds())
+        seen.append(counted())
         os.fsync(fd)
 
     # a writer whose directory did not exist when keys counted: its first commit opens the directory too
     lazy = C.CredWriter(str(cred_dir), seams=C.WriteSeams(fsync_file=fsync_file))
     try:
-        base = K.count_open_fds()
+        base = counted()
         lazy._commit_sync(NAME, _fields(), None)
         assert seen[-1] - base == C.COMMIT_FDS
     finally:
@@ -546,13 +553,13 @@ def test_p5_a_commit_holds_at_most_commit_fds_beyond_the_counted_ones(cred_dir):
     # a writer opened before the count: the directory is a fixed fd, the commit's own are the rest
     w = C.CredWriter(str(cred_dir), seams=C.WriteSeams(fsync_file=fsync_file))
     try:
-        before = K.count_open_fds()
+        before = counted()
         assert w.open_dir() is True
-        base = K.count_open_fds()
+        base = counted()
         assert base - before == 1
         w._commit_sync(NAME, _fields("sk-two"), None)
         assert seen[-1] - base == C.COMMIT_FDS - 1
-        assert K.count_open_fds() == base               # nothing of the commit's is kept
+        assert counted() == base               # nothing of the commit's is kept
     finally:
         w.close()
     assert C.COMMIT_FDS <= K.TRANSIENT_NAMED
