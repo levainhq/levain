@@ -6,6 +6,9 @@ All notable changes to Levain. Format is loosely [Keep a Changelog](https://keep
 
 ## [Unreleased]
 
+### Fixed
+- **`levain dream enable` on a store whose agent-schema marker had moved now ends in the one plain refusal, not a raw store exception.** `register_dream` wrapped only its last store call; the earlier ones (default zone, held names, the same-content look, the role write) ran the same marker check outside the guard, so a marker moved before the call escaped as `AgentStoreRefused` instead of `EnableRefused`. Every store call now sits inside the guard.
+
 ## [0.11.28] — 2026-11-06
 
 ### Added

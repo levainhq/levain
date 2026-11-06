@@ -127,20 +127,20 @@ def register_dream(store: Any, *, revise: bool = False, binding: str | None = No
     from levain.agents import refuse, role as _role, spec as _spec
     from levain.agents.store import AgentStoreRefused, get_default_zone
 
-    zone = get_default_zone(store)
-    role = _role.parse_role(dream_role())
-    held = {a["name"] for a in _spec.list_agents(store)}
-    parsed = _spec.parse_spec(dream_spec(_role.role_hash(role), binding))
-    if revise or _same(store, parsed, zone):
-        held.discard(parsed["name"])
-    problems = [str(r) for r in refuse.check_spec(parsed, role=role, default_zone=zone, names_held=held,
-                                                              as_dream=True)]
-    if problems:
-        raise EnableRefused("; ".join(problems))
-    _, role_hash, _, _ = _role.add_role(store, role)
-    try:
+    try:    # EVERY store call checks the marker in its own transaction, so a store moved since open refuses at the first
+        zone = get_default_zone(store)
+        role = _role.parse_role(dream_role())
+        held = {a["name"] for a in _spec.list_agents(store)}
+        parsed = _spec.parse_spec(dream_spec(_role.role_hash(role), binding))
+        if revise or _same(store, parsed, zone):
+            held.discard(parsed["name"])
+        problems = [str(r) for r in refuse.check_spec(parsed, role=role, default_zone=zone, names_held=held,
+                                                                  as_dream=True)]
+        if problems:
+            raise EnableRefused("; ".join(problems))
+        _, role_hash, _, _ = _role.add_role(store, role)
         agent_id, spec_hash, version, created = _spec.register_spec(store, parsed, zone, revise=revise, attach=True)
-    except (_spec.SpecError, AgentStoreRefused) as exc:     # the store's marker is checked in the write: a store moved since
+    except (_spec.SpecError, AgentStoreRefused) as exc:
         raise EnableRefused(str(exc)) from exc
     return Registered(agent_id, spec_hash, role_hash, version, created, str(zone))
 

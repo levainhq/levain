@@ -813,3 +813,15 @@ def test_a_marker_moved_after_the_role_is_an_enable_refusal_not_a_bare_store_ref
     monkeypatch.setattr(role_mod, "add_role", add_then_move)
     with pytest.raises(da.EnableRefused, match="unknown agent schema marker 'levain-agent-schema/5'"):
         da.register_dream(astore)
+
+
+@pytest.mark.parametrize("revise", [False, True])
+def test_a_marker_moved_before_the_call_is_an_enable_refusal_from_the_first_store_read(astore, revise):
+    """Diogenes 11-06 LOW: only register_spec sat inside the try, so a store whose marker moved BEFORE register_dream ran
+    raised a bare AgentStoreRefused from the earlier store calls (the default zone, the held names, the same-content
+    look, add_role). Reproduced on origin/main; EnableRefused is the contract for every refusal."""
+    c = sqlite3.connect(astore.directory / DB_NAME, isolation_level=None)
+    c.execute("UPDATE meta SET value = 'levain-agent-schema/5' WHERE key = 'agent_schema'")
+    c.close()
+    with pytest.raises(da.EnableRefused, match="unknown agent schema marker 'levain-agent-schema/5'"):
+        da.register_dream(astore, revise=revise)
