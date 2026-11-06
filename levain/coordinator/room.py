@@ -24,6 +24,7 @@ from levain.coordinator.store import (SURFACES, WORDS_MAX, CoordError, CoordStor
 
 ROOM_EVENT_KINDS = ("opened", "rotated")
 PROPOSAL_KINDS = ("committed", "dismissed")
+RELAY_OUTCOMES = ("sent", "failed")
 _BY = ("operator", "service")
 # [seat] the summary's cap is flowConnect's NOTE_CHARS (a note points, it does not report)
 SUMMARY_MAX = 600
@@ -106,6 +107,22 @@ ROOM_SCHEMA: tuple[str, ...] = (
     "AND e.kind = 'committed' AND e.drop_id = NEW.drop_id AND p.summary = NEW.body AND p.room_thread = NEW.room_thread "
     "AND p.launch_id = NEW.launch_id) "
     "BEGIN SELECT RAISE(ABORT, 'a drop note is the summary of the proposal that made the drop'); END",
+
+    # D2 (1106-16): what the room relayed to the host's desk. A row is one ATTEMPT's result; a quote set is 'sent' once per
+    # room thread, so a model that calls again for the same words is refused rather than filing them twice
+    "CREATE TABLE IF NOT EXISTS room_relays (relay_id TEXT PRIMARY KEY, "
+    "room_thread TEXT NOT NULL REFERENCES threads(thread_id), launch_id TEXT NOT NULL REFERENCES launches(launch_id), "
+    f"quoted TEXT NOT NULL, words_sha256 TEXT NOT NULL, outcome TEXT NOT NULL CHECK ({_in('outcome', RELAY_OUTCOMES)}), "
+    "desk_thread TEXT, detail TEXT NOT NULL, at TEXT NOT NULL)",
+    *_append_only("room_relays", "a host relay"),
+    "CREATE TRIGGER IF NOT EXISTS room_relays_no_replace BEFORE INSERT ON room_relays WHEN EXISTS (SELECT 1 FROM room_relays "
+    "WHERE relay_id = NEW.relay_id OR rowid = NEW.rowid) BEGIN SELECT RAISE(ABORT, 'a host relay is never replaced'); END",
+    "CREATE TRIGGER IF NOT EXISTS room_relays_once BEFORE INSERT ON room_relays WHEN NEW.outcome = 'sent' AND EXISTS "
+    "(SELECT 1 FROM room_relays r WHERE r.room_thread = NEW.room_thread AND r.quoted = NEW.quoted AND r.outcome = 'sent') "
+    "BEGIN SELECT RAISE(ABORT, 'those words were already relayed from this room'); END",
+    "CREATE TRIGGER IF NOT EXISTS room_relays_launch BEFORE INSERT ON room_relays WHEN NOT EXISTS (SELECT 1 FROM "
+    "launches l WHERE l.launch_id = NEW.launch_id AND l.role = 'room') "
+    "BEGIN SELECT RAISE(ABORT, 'a relay comes from a room launch'); END",
 )
 
 
@@ -213,12 +230,10 @@ def get_proposal(conn: sqlite3.Connection, proposal_id: str) -> Proposal:
     return _proposal(conn, proposal_id)
 
 
-def propose(conn: sqlite3.Connection, launch_id: str, quote: Sequence[str], summary: str, about: str | None = None, *,
-            now: str | None = None) -> Proposal:
-    """A proposal from a ROOM launch (its role compared as text) in the open room. ``quote`` is 1..:data:`QUOTE_MAX`
-    ids of the OPERATOR's own messages in that room thread; the proposal's words are those messages' stored bodies,
-    in the order given, joined by one blank line (a lone quote is its body byte for byte). ``summary`` is the room's own
-    words, kept apart as the labelled note. Nothing is a drop yet."""
+def quoted_words(conn: sqlite3.Connection, launch_id: str, quote: Sequence[str]) -> tuple[str, str]:
+    """``(open room thread, words)`` for a ROOM launch's ``quote``: 1..:data:`QUOTE_MAX` distinct ids of the OPERATOR's own
+    messages in the open room, their stored bodies in the order given, joined by one blank line (a lone quote is its body
+    byte for byte). The one place the room's words are read: a proposal and a host relay both take only these."""
     ensure(conn)
     row = conn.execute("SELECT role, threads FROM launches WHERE launch_id = ?", (launch_id,)).fetchone() \
         if isinstance(launch_id, str) else None
@@ -243,6 +258,39 @@ def propose(conn: sqlite3.Connection, launch_id: str, quote: Sequence[str], summ
                              "only his words")
         bodies.append(found[0])
     words = _check_words(bodies[0] if len(bodies) == 1 else "\n\n".join(bodies))
+    return room, words
+
+
+def relay_already_sent(conn: sqlite3.Connection, room_thread: str, quote: Sequence[str]) -> bool:
+    """Whether this exact quote set (as a list, in order) was already relayed from ``room_thread``."""
+    ensure(conn)
+    return conn.execute("SELECT 1 FROM room_relays WHERE room_thread = ? AND quoted = ? AND outcome = 'sent'",
+                        (room_thread, json.dumps(list(quote)))).fetchone() is not None
+
+
+def record_relay(conn: sqlite3.Connection, launch_id: str, room_thread: str, quote: Sequence[str], words: str,
+                 outcome: str, desk_thread: str | None, detail: str, *, now: str | None = None) -> str:
+    """Append what a relay attempt did. ``detail`` is the host command's one reported line (capped by the caller).
+    A second 'sent' for the same quote set in the same room refuses (:class:`CoordError`)."""
+    ensure(conn)
+    relay_id = "rl-" + secrets.token_hex(16)
+    try:
+        conn.execute("INSERT INTO room_relays (relay_id, room_thread, launch_id, quoted, words_sha256, outcome, desk_thread, "
+                     "detail, at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                     (relay_id, room_thread, launch_id, json.dumps(list(quote)), words_sha256(words), outcome, desk_thread,
+                      detail, _stamp(now)))
+    except sqlite3.IntegrityError as exc:
+        raise CoordError(str(exc)) from None
+    return relay_id
+
+
+def propose(conn: sqlite3.Connection, launch_id: str, quote: Sequence[str], summary: str, about: str | None = None, *,
+            now: str | None = None) -> Proposal:
+    """A proposal from a ROOM launch (its role compared as text) in the open room. ``quote`` is 1..:data:`QUOTE_MAX`
+    ids of the OPERATOR's own messages in that room thread; the proposal's words are those messages' stored bodies,
+    in the order given, joined by one blank line (a lone quote is its body byte for byte). ``summary`` is the room's own
+    words, kept apart as the labelled note. Nothing is a drop yet."""
+    room, words = quoted_words(conn, launch_id, quote)
     if not isinstance(summary, str) or not summary.strip() or len(summary) > SUMMARY_MAX or "\x00" in summary:
         raise CoordError(f"a summary is 1 to {SUMMARY_MAX} characters of text")
     try:

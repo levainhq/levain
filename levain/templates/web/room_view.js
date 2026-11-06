@@ -176,7 +176,7 @@
       canSend: thread !== null && own(SEND_STATES, st), canStop: thread !== null && own(STOP_STATES, st) && running,
       state: st, words: thread === null ? "No room is open." : (c && c.why && st !== "writable" ? COMPOSER_WORDS[st] + " (" + c.why + ")" : COMPOSER_WORDS[st]),
       model: typeof body.model === "string" && body.model ? "Model in use: " + body.model : "",
-      gap: body.gap === true,
+      gap: body.gap === true, dropsVia: body.drops_via === "desk" ? "desk" : "card",
       error: typeof body.room_error === "string" ? body.room_error : "",
       stream: (body.stream || []).map(lineModel).filter(function (l) { return !l.hidden; }),
       proposals: (body.proposals || []).map(function (p) {
@@ -360,7 +360,7 @@
       st.streamBox.appendChild(ban);
     }
     if (m.gap) st.streamBox.appendChild(el(doc, "div", "rv-gap", "Some lines may be missing from this conversation."));
-    if (!m.stream.length) st.streamBox.appendChild(el(doc, "div", "rv-note", m.open ? "Say what you need. Ask for a drop and the room will propose one for you to tap." : m.words));
+    if (!m.stream.length) st.streamBox.appendChild(el(doc, "div", "rv-note", m.open ? (m.dropsVia === "desk" ? "Say what you need. Ask me to send something to the desk and I will." : "Say what you need. Ask for a drop and the room will propose one for you to tap.") : m.words));
     m.stream.forEach(function (l) { st.streamBox.appendChild(renderLine(doc, l, hooks, ui)); });
     if (m.running) {          // the room is mid-turn: three quiet dots (still, under reduced motion) until its words arrive
       var dots = el(doc, "div", "rv-pending", "");

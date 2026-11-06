@@ -242,10 +242,15 @@ def serve_room(path: str, *, directory: Path | str, service: Any = None,
         return 500, {"error": "internal", "message": "the room record could not be read"}
     if view is not None:
         try:
-            err = view().get("last_error")
+            seen = view()
+            err = seen.get("last_error")
+            via = seen.get("drops_via")
         except Exception:   # a serve that is stopped or not started has no error to report
-            err = None
+            err, via = None, None
         body["room_error"] = err if isinstance(err, str) and err else None
+        # D2: how a drop leaves the room. "desk": the model files his words with the host's desk on his ask (no card);
+        # "card": the model proposes and his tap commits. Anything else, or no host view, is the card.
+        body["drops_via"] = "desk" if via == "desk" else "card"
     return 200, body
 
 

@@ -17,18 +17,30 @@ live, so the door checks that here.
 
 A refusal comes back as the tool's own error; a protocol mistake (a bad shape, an unknown tool or method) as a JSON-RPC
 error; a machine fault as the tool's own error leading with that it was one. A frame over :data:`FRAME_MAX` bytes is
-refused and drained, and the server goes on. The store is the default consent directory's, opened without creating one."""
+refused and drained, and the server goes on. The store is the default consent directory's, opened without creating one.
+
+**Host tools (1106-16 D2).** A host may give the room commands (:mod:`levain.coordinator.room_host`), which reach this
+door in ``LEVAIN_ROOM_HOST_COMMANDS``, set by the launcher in the mcp-config file it wrote for this launch. With none,
+the door is exactly what it was: ``propose_drop``. With a ``relay`` the host marked ``relay_without_tap``, the door's
+tools are ``relay_to_desk`` (which RETIRES ``propose_drop``: a call to it is "unknown tool") and, with a ``replies``,
+``desk_replies``; ``replies`` alone adds ``desk_replies`` beside ``propose_drop``. ``relay_to_desk`` takes ids of the
+operator's own messages and nothing else, runs the host's argv with those words on STDIN, and records the attempt
+(``room_relays``). The door runs only the host's argv; the model names a quote set and a thread id, never a program or an
+argument."""
 from __future__ import annotations
 
 import json
+import re
 import sqlite3
 import sys
 from typing import Any
 
+from levain.coordinator import room_host
+from levain.coordinator.room_host import HOSTCMD_ENV, THREAD_RE, HostCommandError, HostCommands
 from levain.consent.band_mcp import (INTERNAL_ERROR, INVALID_PARAMS, INVALID_REQUEST, METHOD_NOT_FOUND, PARSE_ERROR,
                                      _RpcError, _error, _ok)
 
-__all__ = ["TOOL", "FRAME_MAX", "LAUNCH_ENV", "handle", "launch_from", "main", "serve"]
+__all__ = ["TOOL", "RELAY_TOOL", "REPLIES_TOOL", "FRAME_MAX", "LAUNCH_ENV", "handle", "launch_from", "main", "serve"]
 
 LAUNCH_ENV = "LEVAIN_ROOM_LAUNCH"
 
@@ -63,6 +75,34 @@ TOOL: dict[str, Any] = {
             "about": {"type": "string", "description": "Optional: a work thread id (th-...) it concerns."},
         },
         "required": ["quote_ids", "summary"],
+        "additionalProperties": False,
+    },
+}
+
+
+RELAY_TOOL: dict[str, Any] = {
+    "name": room_host.RELAY_TOOL,
+    "description": (
+        "File the operator's own words with the desk, now, because he asked you to. Name his messages in this room, by "
+        "id (quote_ids, in order), that are the words to send; they are copied from the store and sent exactly. You "
+        "cannot supply words, a note or a destination. The same words go once per room. The reply says whether the desk "
+        "took them and the thread id to read the desk's answer by (desk_replies). Use it only when he has asked for it."),
+    "inputSchema": {
+        "type": "object",
+        "properties": {"quote_ids": {"type": "array", "minItems": 1, "items": {"type": "string"},
+                                     "description": "Ids (cm-...) of the operator's own messages in this room, in order."}},
+        "required": ["quote_ids"],
+        "additionalProperties": False,
+    },
+}
+REPLIES_TOOL: dict[str, Any] = {
+    "name": room_host.REPLIES_TOOL,
+    "description": ("Read the desk's replies to a thread you opened with relay_to_desk. Read-only; it never waits, so ask "
+                    "again later if there is none yet."),
+    "inputSchema": {
+        "type": "object",
+        "properties": {"thread": {"type": "string", "description": "The thread id relay_to_desk gave (th-...)."}},
+        "required": ["thread"],
         "additionalProperties": False,
     },
 }
@@ -116,6 +156,102 @@ def _refused(why: str) -> dict[str, Any]:
     return _text(f"levain room: refused, nothing was proposed: {why}", True)
 
 
+def _reject_spoofs_and_extras(raw: Any, allowed: frozenset) -> dict:
+    if not isinstance(raw, dict):
+        raise _RpcError(INVALID_PARAMS, "arguments must be an object")
+    spoof = sorted(k for k in raw if isinstance(k, str) and k.lower() in _IDENTITY_KEYS)
+    if spoof:
+        raise _RpcError(INVALID_PARAMS, f"refused: a call never names its own launch or session ({', '.join(spoof)})")
+    words = sorted(set(raw) & _WORDS_KEYS)
+    if words:
+        raise _RpcError(INVALID_PARAMS, f"this door takes no words of its own ({', '.join(words)}): the words are the "
+                                        "operator's quoted messages, named by quote_ids")
+    extra = sorted(set(raw) - allowed)
+    if extra:
+        raise _RpcError(INVALID_PARAMS, f"this tool takes {', '.join(sorted(allowed))} only: not {', '.join(extra)}")
+    return raw
+
+
+def _relay_arguments(raw: Any) -> list[str]:
+    from levain.coordinator import room
+
+    raw = _reject_spoofs_and_extras(raw, frozenset({"quote_ids"}))
+    ids = raw.get("quote_ids")
+    if not isinstance(ids, list) or not 1 <= len(ids) <= room.QUOTE_MAX:
+        raise _RpcError(INVALID_PARAMS, f"quote_ids must be a list of 1 to {room.QUOTE_MAX} message ids")
+    if not all(isinstance(i, str) and 0 < len(i) <= _ID_MAX and not _has_control(i) for i in ids):
+        raise _RpcError(INVALID_PARAMS, "every quote id must be a short string")
+    return list(ids)
+
+
+def _room_launch_refusal(conn: sqlite3.Connection, launch_id: str) -> str | None:
+    from levain.coordinator import lease
+
+    ln = lease.launch(conn, launch_id)
+    if ln is None:
+        return "the launch this door was started for does not exist"
+    if ln.role != "room":
+        return "this door's launch is not a room launch; only the room uses it"
+    if ln.state != "active":
+        return f"the room launch is {ln.state}, not active"
+    return None
+
+
+def _command_fault(code: int, out: str) -> str:
+    line = " ".join(out.split())[:300] or "no output"
+    if code == 124:
+        return f"{line}. It may or may not have arrived: tell the operator, and do not retry on your own."
+    return f"the host command failed (exit {code}): {line}"
+
+
+def _relay(launch_id: str, params: dict[str, Any], host: HostCommands) -> dict[str, Any]:
+    from levain.consent.queue import default_queue_dir
+    from levain.coordinator import room
+    from levain.coordinator.envelopes import EnvelopeStore
+    from levain.coordinator.store import CoordError, StoreAbsent
+    from levain.dispatch.jobs import JobStoreError
+
+    ids = _relay_arguments(params.get("arguments"))
+    fail = lambda why: _text(f"levain room: refused, nothing was relayed: {why}", True)      # noqa: E731
+    try:
+        store = EnvelopeStore(default_queue_dir())
+        with store._write(create=False) as (conn, _now):
+            why = _room_launch_refusal(conn, launch_id)
+            if why is not None:
+                return fail(why)
+            room_thread, words = room.quoted_words(conn, launch_id, ids)
+            if room.relay_already_sent(conn, room_thread, ids):
+                return fail("those words were already relayed from this room")
+        # the command runs OUTSIDE the store's write lock: it may take seconds and writes elsewhere
+        code, out = room_host.run(host.relay, words)
+        match = None if code else re.search(r"\(thread (" + THREAD_RE.pattern + r")\)", out)
+        desk_thread = match.group(1) if match else None
+        detail = " ".join(out.split())[:300] or "no output"
+        with store._write(create=False) as (conn, now):
+            room.record_relay(conn, launch_id, room_thread, ids, words, "failed" if code else "sent", desk_thread,
+                              detail if not code else _command_fault(code, out), now=now)
+    except (CoordError, StoreAbsent) as exc:
+        return fail(str(exc))
+    except (sqlite3.Error, JobStoreError, OSError) as exc:
+        return _text(f"levain room: a machine fault ({type(exc).__name__}: {exc}); whether the desk got the words is "
+                     "unknown: tell the operator, and do not retry on your own", True)
+    if code:
+        return _text(f"levain room: not relayed. {_command_fault(code, out)}", True)
+    tail = f" Thread {desk_thread}: read the desk's answer with desk_replies." if desk_thread else ""
+    return _text(f"levain room: relayed to the desk. {detail}{tail}", False)
+
+
+def _replies(params: dict[str, Any], host: HostCommands) -> dict[str, Any]:
+    raw = _reject_spoofs_and_extras(params.get("arguments"), frozenset({"thread"}))
+    thread = raw.get("thread")
+    if not isinstance(thread, str) or THREAD_RE.fullmatch(thread) is None:
+        raise _RpcError(INVALID_PARAMS, "thread must be a desk thread id (th-...) from relay_to_desk")
+    code, out = room_host.run(host.replies, "", (thread,))
+    if code:
+        return _text(f"levain room: replies could not be read. {_command_fault(code, out)}", True)
+    return _text(out or f"No reply yet on {thread}.", False)
+
+
 def _propose(launch_id: str, params: dict[str, Any]) -> dict[str, Any]:
     from levain.consent.queue import default_queue_dir
     from levain.coordinator import lease, room
@@ -150,8 +286,9 @@ def launch_from(value: Any) -> str | None:
     return value if isinstance(value, str) and _LAUNCH_ID.fullmatch(value) is not None else None
 
 
-def handle(launch_id: str, msg: Any) -> dict[str, Any] | None:
-    """The reply to one decoded message, or ``None`` for a notification (a message with no ``id``)."""
+def handle(launch_id: str, msg: Any, host: HostCommands | None = None) -> dict[str, Any] | None:
+    """The reply to one decoded message, or ``None`` for a notification (a message with no ``id``). ``host`` is the
+    host's commands (None: the door's tool is ``propose_drop`` alone)."""
     if not isinstance(msg, dict) or msg.get("jsonrpc") != "2.0" or not isinstance(msg.get("method"), str):
         return _error(None, INVALID_REQUEST, "not a JSON-RPC 2.0 request")
     if "id" not in msg:
@@ -173,16 +310,24 @@ def handle(launch_id: str, msg: Any) -> dict[str, Any] | None:
             return _ok(rid, {"protocolVersion": _PROTOCOL,
                              "capabilities": {"tools": {}}, "serverInfo": {"name": "levain_room", "version": "1"}})
         if method == "tools/list":
-            return _ok(rid, {"tools": [TOOL]})
+            return _ok(rid, {"tools": [_DEFS[n] for n in room_host.door_tools(host)]})
         if method == "tools/call":
-            if params.get("name") != _NAME:
-                raise _RpcError(INVALID_PARAMS, f"unknown tool {str(params.get('name'))[:60]!r}")
-            return _ok(rid, _propose(launch_id, params))
+            name = params.get("name")
+            if not isinstance(name, str) or name not in room_host.door_tools(host):
+                raise _RpcError(INVALID_PARAMS, f"unknown tool {str(name)[:60]!r}")
+            if name == _NAME:
+                return _ok(rid, _propose(launch_id, params))
+            if name == room_host.RELAY_TOOL:
+                return _ok(rid, _relay(launch_id, params, host))
+            return _ok(rid, _replies(params, host))
         raise _RpcError(METHOD_NOT_FOUND, f"method not found: {method[:60]}")
     except _RpcError as exc:
         return _error(rid, exc.code, exc.message)
     except Exception as exc:  # noqa: BLE001 - a server that dies mid-conversation loses the room's tool for the session
         return _error(rid, INTERNAL_ERROR, f"{type(exc).__name__}: {exc}")
+
+
+_DEFS = {_NAME: TOOL, room_host.RELAY_TOOL: RELAY_TOOL, room_host.REPLIES_TOOL: REPLIES_TOOL}
 
 
 def _frames(stream: Any):
@@ -210,7 +355,7 @@ def _frames(stream: Any):
         yield line.decode("utf-8", errors="replace") if isinstance(line, bytes) else line
 
 
-def serve(launch_id: str, stdin: Any = None, stdout: Any = None) -> None:
+def serve(launch_id: str, stdin: Any = None, stdout: Any = None, host: HostCommands | None = None) -> None:
     """Answer one message per line until stdin ends."""
     stdin = stdin if stdin is not None else sys.stdin
     stdout = stdout if stdout is not None else sys.stdout
@@ -225,7 +370,7 @@ def serve(launch_id: str, stdin: Any = None, stdout: Any = None) -> None:
             except (ValueError, RecursionError):     # nesting deep enough to overflow the decoder is a parse error too
                 reply = _error(None, PARSE_ERROR, "parse error")
             else:
-                reply = handle(launch_id, msg)
+                reply = handle(launch_id, msg, host)
         if reply is not None:
             # ASCII-escaped: a raw U+2028 / U+2029 / U+0085 inside a string splits the line for a client that splits on
             # every line break, and one reply would become two broken ones
@@ -245,13 +390,18 @@ def main(argv: list[str] | None = None) -> int:
         print(f"levain room door: not started: name the room launch with --launch or ${LAUNCH_ENV} (a launch id, ln-...)",
               file=sys.stderr)
         return 2
+    try:
+        host = room_host.from_env(os.environ.get(HOSTCMD_ENV))
+    except HostCommandError as exc:
+        print(f"levain room door: not started: {exc}", file=sys.stderr)
+        return 2
     for stream in (sys.stdin, sys.stdout):
         try:
             stream.reconfigure(encoding="utf-8", errors="replace")
         except (AttributeError, ValueError):
             pass
     try:
-        serve(launch_id)
+        serve(launch_id, host=host)
     except (BrokenPipeError, KeyboardInterrupt):
         pass
     return 0

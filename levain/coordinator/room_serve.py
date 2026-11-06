@@ -72,8 +72,10 @@ class RoomServe:
                  launcher_kw: Optional[Mapping[str, Any]] = None,
                  service_kw: Optional[Mapping[str, Any]] = None) -> None:
         self._store = store
+        self._setting = setting
         self.chat_store = ChatStore(store)
-        skw: dict[str, Any] = {"probe": make_probe(self.chat_store), "tripwires": make_tripwires(self.chat_store)}
+        skw: dict[str, Any] = {"probe": make_probe(self.chat_store, door_names=setting.door_names),
+               "tripwires": make_tripwires(self.chat_store, door_names=setting.door_names)}
         skw.update(service_kw or {})                 # a test's own probe replaces the room's
         self.service = ChatService(self.chat_store, **skw)
         if launcher is None:
@@ -257,7 +259,9 @@ class RoomServe:
         and reads no store (roomfix1 R1: the poll called :meth:`view`, which waits for a send holding the lock across
         the launcher's open, so every poll stalled and held a request slot until it ended). One attribute read each,
         so it never blocks; it never raises."""
-        return {"last_error": self.last_error, "running": self._started and not self._stopped}
+        host = getattr(self._setting, "host", None)
+        return {"last_error": self.last_error, "running": self._started and not self._stopped,
+                "drops_via": "desk" if host is not None and host.relays else "card"}
 
     def interrupt(self, launch_id: str) -> Any:
         """His Stop: the service's unfenced interrupt of ``launch_id`` (the room's newest launch, which the route reads
