@@ -5,8 +5,7 @@ approved what. A flaw in how it does that is worth a private report.
 
 ## Supported versions
 
-The latest release on PyPI (`pip index versions levain` shows it). Fixes land on `main` and ship in the next release;
-older releases are not patched. `levain --version` prints what you run, and [the changelog](CHANGELOG.md) names what each release changed.
+The latest release on PyPI ([pypi.org/project/levain](https://pypi.org/project/levain/), or ). Fixes land on  and ship in the next release; older releases are not patched. `levain --version` prints what you run, and [the changelog](CHANGELOG.md) names what each release changed.
 
 ## Reporting a vulnerability
 
@@ -39,4 +38,5 @@ A flaw in any of these, reachable by someone who is not already entitled to do t
 - A problem that needs you to have already turned the efferent gate off yourself (`efferent_gate: "ungated"`, which the
   README describes under *Boundaries, kept honest*).
 - Vulnerabilities in Claude Code, Codex, `anneal-memory` or another dependency: report those to their owners.
-- Findings that need physical access to an unlocked machine you are already signed in to.
+- Findings that need a process already running as your own OS user, or physical access to an unlocked machine you are
+  already signed in to.
