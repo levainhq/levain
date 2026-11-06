@@ -194,6 +194,18 @@ def test_dictation_errors_read_by_code(tmp_path, w):
 
 
 @needs_browser
+def test_dictation_into_an_empty_draft_enables_send(tmp_path, w):
+    """L3 r1 (codex 5): a recognizer result sets the box's value, which fires no input event; Send stayed aria-disabled."""
+    out, _w = _run(tmp_path, w, "Live", [
+        {"eval": "const ta = document.querySelector('.rv-input'); ta.value = ''; ta.dispatchEvent(new Event('input'));"
+                 " const before = document.querySelector('.rv-send').getAttribute('aria-disabled');"
+                 " document.querySelector('.rv-mic').click(); __recs[0].emit('send this to the desk');"
+                 " JSON.stringify({before, after: document.querySelector('.rv-send').getAttribute('aria-disabled'), v: ta.value})"},
+    ])
+    assert json.loads(out["values"][1]) == {"before": "true", "after": None, "v": "send this to the desk"}
+
+
+@needs_browser
 def test_typing_during_dictation_is_kept_and_the_next_result_extends_it(tmp_path, w):
     """F4: the next result must not overwrite what was typed in between."""
     out, _w = _run(tmp_path, w, "Live", [

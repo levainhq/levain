@@ -438,7 +438,9 @@
     ta.addEventListener("input", function () { try { if (store) store.setItem("levain.room.draft", ta.value); } catch (e) { /* no storage */ } grow(); paintSend(); });
     // The box grows with its words up to a cap set in CSS, then scrolls. field-sizing does it where the browser has it; this is the
     // fallback for the rest, and it is harmless beside it.
-    function grow() { ta.style.height = "auto"; if (ta.scrollHeight) ta.style.height = ta.scrollHeight + "px"; }
+    // border-box: scrollHeight leaves out the border, so it is added back (else one line shows a scrollbar where
+    // field-sizing is not supported)
+    function grow() { ta.style.height = "auto"; if (ta.scrollHeight) ta.style.height = (ta.scrollHeight + ta.offsetHeight - ta.clientHeight) + "px"; }
     // An empty draft cannot be sent. aria-disabled, not disabled: the button still takes focus and the handler refuses an empty line.
     function paintSend() { if (ta.value.trim()) sendB.removeAttribute("aria-disabled"); else sendB.setAttribute("aria-disabled", "true"); }
     // Desk: Enter sends, Shift+Enter is a new line. A touch screen keeps Return as a new line and Send as the button. Enter while an
@@ -592,6 +594,7 @@
           lastHeard = t;
           ta.value = dbase + (heard && t.indexOf(heard) === 0 ? t.slice(heard.length) : t);
           try { if (store) store.setItem("levain.room.draft", ta.value); } catch (e) { /* no storage */ }
+          grow(); paintSend();                         // a set value fires no input event: Send and the box follow it here
         };
         r.onend = function () { if (rec === r) endDictation(); };
         r.onerror = function (ev) {

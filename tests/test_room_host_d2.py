@@ -19,12 +19,16 @@ from tests.test_coordinator_room_mcp import (NOLAUNCH, Clock, call, make_launch,
 
 THREAD = "th-0abcdef-a1b2c3"
 FAKE = """\
-import json, sys
+import json, sys, time
 mode = sys.argv[1]
 rec = sys.argv[2]
 if mode == "relay":
     text = sys.stdin.read()
     open(rec, "a").write(json.dumps({"argv": sys.argv[1:], "stdin": text}) + "\\n")
+    if "SLOW" in text:
+        time.sleep(1.0)
+    if "HANG" in text:
+        time.sleep(30)
     if "FAIL" in text:
         print("Not sent: the inbox did not take it (OSError).", file=sys.stderr)
         sys.exit(1)
@@ -64,7 +68,8 @@ def recs(host):
 def relays(qdir):
     c = raw(qdir)
     try:
-        return c.execute("SELECT outcome, desk_thread, quoted, detail FROM room_relays ORDER BY rowid").fetchall()
+        return c.execute("SELECT COALESCE(o.outcome, 'claimed'), o.desk_thread, c.quoted, o.detail FROM room_relay_claims c "
+                         "LEFT JOIN room_relay_outcomes o ON o.relay_id = c.relay_id ORDER BY c.rowid").fetchall()
     finally:
         c.close()
 
@@ -119,27 +124,110 @@ def test_the_same_words_are_relayed_once_per_room(host, qdir, world):
     again = hcall(world["launch"], host, {"quote_ids": [world["m1"]]}, "relay_to_desk")
     refused(again, text="already relayed")
     assert len(recs(host)) == 1 and ok["result"]["isError"] is False
-    # a different set is a different relay
+    # a different message is a different relay
     assert hcall(world["launch"], host, {"quote_ids": [world["m2"]]}, "relay_to_desk")["result"]["isError"] is False
     assert len(recs(host)) == 2
 
 
-def test_a_failed_command_is_reported_recorded_failed_and_retryable(host, store, qdir, world):
+def test_each_message_is_relayed_once_whatever_set_it_rides_in(host, store, qdir, world):
+    """L3 r1 (complement 4): the key was the id LIST, so [m1] then [m1, m3] (or a reordered list) filed m1 twice."""
+    m3 = say(store, world["thread"], "a third thing", n=11)
+    assert hcall(world["launch"], host, {"quote_ids": [world["m1"]]}, "relay_to_desk")["result"]["isError"] is False
+    refused(hcall(world["launch"], host, {"quote_ids": [world["m1"], m3]}, "relay_to_desk"), text="already relayed")
+    refused(hcall(world["launch"], host, {"quote_ids": [m3, world["m1"]]}, "relay_to_desk"), text="already relayed")
+    assert len(recs(host)) == 1
+    assert hcall(world["launch"], host, {"quote_ids": [m3]}, "relay_to_desk")["result"]["isError"] is False
+
+
+def test_a_command_that_ran_and_failed_is_unknown_and_never_rerun(host, store, qdir, world):
+    """It started, so it may have delivered before failing: the words stay held, and the model is told so."""
     bad = say(store, world["thread"], "FAIL please", n=9)
     r = hcall(world["launch"], host, {"quote_ids": [bad]}, "relay_to_desk")
-    assert r["result"]["isError"] is True and "not relayed" in r["result"]["content"][0]["text"]
-    assert "inbox did not take it" in r["result"]["content"][0]["text"]
-    assert [x[0] for x in relays(qdir)] == ["failed"]
-    # a failed relay does not use up the words
-    r2 = hcall(world["launch"], host, {"quote_ids": [bad]}, "relay_to_desk")
-    assert r2["result"]["isError"] is True and len(recs(host)) == 2
+    text = r["result"]["content"][0]["text"]
+    assert r["result"]["isError"] is True and "delivery unknown" in text and "inbox did not take it" in text, text
+    assert "do not retry" in text
+    assert [x[0] for x in relays(qdir)] == ["unknown"]
+    refused(hcall(world["launch"], host, {"quote_ids": [bad]}, "relay_to_desk"), text="delivery is unknown")
+    assert len(recs(host)) == 1
 
 
-def test_a_missing_program_is_a_refusal_not_a_crash(qdir, world, tmp_path):
+def test_a_missing_program_failed_certainly_and_releases_the_words(qdir, world, tmp_path):
     h = HostCommands(relay=("/nonexistent/prog",), relay_without_tap=True)
     r = hcall(world["launch"], h, {"quote_ids": [world["m1"]]}, "relay_to_desk")
     assert r["result"]["isError"] is True and "could not start" in r["result"]["content"][0]["text"]
+    assert "nothing was delivered" in r["result"]["content"][0]["text"]
     assert [x[0] for x in relays(qdir)] == ["failed"]
+    # nothing was delivered, so the words are free: a second attempt runs (and fails the same way)
+    hcall(world["launch"], h, {"quote_ids": [world["m1"]]}, "relay_to_desk")
+    assert [x[0] for x in relays(qdir)] == ["failed", "failed"]
+
+
+def test_two_concurrent_relays_of_one_message_run_the_command_once(host, store, qdir, world):
+    """L3 r1 (all four seats): the check and the record were two transactions with the command between them, so two
+    doors (or a retry racing the first) both ran it. REPRODUCED on ec0e6f4a: two executions, and the loser told
+    'nothing was relayed'."""
+    import threading
+
+    slow = say(store, world["thread"], "SLOW: file this", n=12)
+    gate, out = threading.Barrier(2), [None, None]
+
+    def go(i):
+        gate.wait()
+        out[i] = hcall(world["launch"], host, {"quote_ids": [slow]}, "relay_to_desk", rid=i)
+
+    ts = [threading.Thread(target=go, args=(i,)) for i in (0, 1)]
+    for t in ts:
+        t.start()
+    for t in ts:
+        t.join(30)
+    assert len(recs(host)) == 1, recs(host)
+    errs = sorted(o["result"]["isError"] for o in out)
+    assert errs == [False, True], out
+    loser = next(o for o in out if o["result"]["isError"])["result"]["content"][0]["text"]
+    assert "in flight" in loser or "already relayed" in loser, loser
+    assert [x[0] for x in relays(qdir)] == ["sent"]
+
+
+def test_a_crash_between_delivery_and_the_record_never_duplicates(host, store, qdir, world, monkeypatch):
+    """L3 r1 (codex 1, gemini 1): delivery succeeded, the record failed; a retry found no record and re-ran. Now the claim
+    committed before the command holds the words."""
+    def boom(*_a, **_k):
+        raise sqlite3.OperationalError("disk I/O error")
+
+    with monkeypatch.context() as m:
+        m.setattr(room, "record_relay_outcome", boom)
+        r = hcall(world["launch"], host, {"quote_ids": [world["m1"]]}, "relay_to_desk")
+    text = r["result"]["content"][0]["text"]
+    assert "relayed to the desk" in text and "could not record" in text and "do not relay them again" in text, text
+    assert [x[0] for x in relays(qdir)] == ["claimed"]
+    refused(hcall(world["launch"], host, {"quote_ids": [world["m1"]]}, "relay_to_desk"), text="in flight")
+    assert len(recs(host)) == 1
+
+
+def test_a_timed_out_relay_is_unknown_and_never_retried(host, store, qdir, world, monkeypatch):
+    real = room_host.run
+    monkeypatch.setattr(room_host, "run", lambda *a, **k: real(*a, **{**k, "timeout": 0.5}))
+    hang = say(store, world["thread"], "HANG then file", n=13)
+    r = hcall(world["launch"], host, {"quote_ids": [hang]}, "relay_to_desk")
+    text = r["result"]["content"][0]["text"]
+    assert r["result"]["isError"] is True and "delivery unknown" in text and "did not finish" in text, text
+    assert [x[0] for x in relays(qdir)] == ["unknown"]
+    refused(hcall(world["launch"], host, {"quote_ids": [hang]}, "relay_to_desk"), text="delivery is unknown")
+    assert len(recs(host)) == 1
+
+
+def test_the_claim_trigger_holds_for_any_writer(store, qdir, world):
+    """The store itself refuses a second live claim on a message, whatever Python did before it."""
+    c = raw(qdir)
+    try:
+        c.execute("BEGIN IMMEDIATE")
+        room.claim_relay(c, world["launch"], world["thread"], [world["m1"]], "w")
+        with pytest.raises(sqlite3.IntegrityError, match="in flight"):
+            c.execute("INSERT INTO room_relay_claims (relay_id, room_thread, launch_id, quoted, words_sha256, at) VALUES "
+                      "('rl-x', ?, ?, ?, 'h', 'now')", (world["thread"], world["launch"], json.dumps([world["m1"]])))
+        c.execute("ROLLBACK")
+    finally:
+        c.close()
 
 
 def test_relay_takes_ids_only(host, world):
@@ -165,10 +253,33 @@ def test_relay_refuses_a_non_room_or_missing_launch(host, store, qdir, world):
 
 # --- replies ----------------------------------------------------------------------------------------------------------
 def test_replies_appends_only_a_validated_thread_id(host, world):
+    assert hcall(world["launch"], host, {"quote_ids": [world["m1"]]}, "relay_to_desk")["result"]["isError"] is False
     r = hcall(world["launch"], host, {"thread": THREAD}, "desk_replies")
     assert r["result"]["isError"] is False and r["result"]["content"][0]["text"] == "10:42 on it"
-    (rec,) = recs(host)
+    (_relay, rec) = recs(host)
     assert rec["argv"][-2:] == ["--thread", THREAD] and rec["stdin"] == ""
+
+
+def test_replies_reads_only_a_thread_this_room_relayed_to(host, world):
+    """L3 r1 (codex 2, complement 3): any well-shaped desk thread id was read, so a room could read another conversation."""
+    foreign = "th-0abcdef-ffff00"
+    refused(hcall(world["launch"], host, {"thread": foreign}, "desk_replies"), text="not a desk thread this room relayed to")
+    refused(hcall(world["launch"], host, {"thread": THREAD}, "desk_replies"), text="not a desk thread this room relayed to")
+    assert not host.rec.exists()
+    hcall(world["launch"], host, {"quote_ids": [world["m1"]]}, "relay_to_desk")
+    refused(hcall(world["launch"], host, {"thread": foreign}, "desk_replies"), text="not a desk thread this room relayed to")
+    assert len(recs(host)) == 1
+
+
+def test_replies_refuses_a_launch_that_is_not_live(host, store, world):
+    from levain.coordinator import lease
+
+    refused(hcall(NOLAUNCH, host, {"thread": THREAD}, "desk_replies"), text="does not exist")
+    hcall(world["launch"], host, {"quote_ids": [world["m1"]]}, "relay_to_desk")
+    with store._write() as (conn, now):
+        lease.end_launch(conn, now, world["launch"], "ended", "done")
+    refused(hcall(world["launch"], host, {"thread": THREAD}, "desk_replies"), text="ended, not active")
+    assert len(recs(host)) == 1
 
 
 @pytest.mark.parametrize("bad", ["", "x", "th-", "th-abc; rm -rf /", "th-0abcdef-a1b2c3 --text", "../th-1", "th-" + "a" * 40,
@@ -209,12 +320,57 @@ def test_the_door_refuses_to_start_on_a_malformed_host_value(monkeypatch, capsys
 def test_run_times_out_and_caps_output(tmp_path):
     s = tmp_path / "slow.py"
     s.write_text("import time\ntime.sleep(5)\n")
-    code, out = room_host.run((sys.executable, str(s)), timeout=0.3)
-    assert code == 124 and "did not finish" in out
+    code, out, started = room_host.run((sys.executable, str(s)), timeout=0.3)
+    assert code == 124 and "did not finish" in out and started is True
     b = tmp_path / "big.py"
     b.write_text("print('x' * 100000)\n")
-    code, out = room_host.run((sys.executable, str(b)))
+    code, out, _started = room_host.run((sys.executable, str(b)))
     assert code == 0 and len(out) == room_host.OUTPUT_MAX
+
+
+def test_a_timeout_kills_the_commands_whole_process_group(tmp_path):
+    """L3 r1 (codex 3): only the immediate child was killed, so a helper it spawned delivered after the door gave up.
+    REPRODUCED on ec0e6f4a: the grandchild outlived the timeout and wrote its mark."""
+    import os
+    import time
+
+    pidf, mark = tmp_path / "gc.pid", tmp_path / "late.mark"
+    gc = tmp_path / "gc.py"
+    gc.write_text(f"import os, time\nopen({str(pidf)!r}, 'w').write(str(os.getpid()))\ntime.sleep(1.5)\n"
+                  f"open({str(mark)!r}, 'w').write('delivered late')\n")
+    parent = tmp_path / "parent.py"
+    parent.write_text(f"import subprocess, sys, time\nsubprocess.Popen([sys.executable, {str(gc)!r}])\ntime.sleep(30)\n")
+    t0 = time.monotonic()
+    code, _out, started = room_host.run((sys.executable, str(parent)), timeout=0.8)
+    assert code == 124 and started and time.monotonic() - t0 < 6
+    pid = int(pidf.read_text())
+    time.sleep(2.0)
+    assert not mark.exists(), "the grandchild survived the timeout and acted"
+    with pytest.raises(ProcessLookupError):
+        os.kill(pid, 0)
+
+
+def test_a_noisy_command_is_read_with_bounded_memory(tmp_path):
+    """L3 r1 (codex 4): capture_output held the whole output before the cap. 64 MB of output now peaks far below that."""
+    import tracemalloc
+
+    noisy = tmp_path / "noisy.py"
+    noisy.write_text("import sys\nb = b'y' * (1 << 20)\nfor _ in range(64):\n    sys.stdout.buffer.write(b)\n"
+                     "sys.stderr.write('the real error')\nsys.exit(3)\n")
+    tracemalloc.start()
+    try:
+        code, out, _started = room_host.run((sys.executable, str(noisy)))
+        _now, peak = tracemalloc.get_traced_memory()
+    finally:
+        tracemalloc.stop()
+    assert code == 3 and len(out) <= room_host.OUTPUT_MAX
+    assert peak < 4 * (1 << 20), peak
+    assert out.endswith("the real error")          # a failure's stderr survives a long stdout (gemini 5)
+
+
+def test_a_program_popen_will_not_pass_never_started():
+    code, out, started = room_host.run(("/bin/echo", "a\x00b"))
+    assert (code, started) == (room_host.NOT_STARTED, False) and "could not start" in out
 
 
 # --- containment: the argv, the probe, the digest ---------------------------------------------------------------------
@@ -295,21 +451,35 @@ def test_room_json_says_how_a_drop_leaves_the_room(tmp_path):
 def test_the_schema_is_additive(qdir, store):
     c = sqlite3.connect(qdir / "dispatch.db")
     room.ensure(c)
-    assert c.execute("SELECT 1 FROM sqlite_master WHERE name = 'room_relays'").fetchone()
+    for name in ("room_relay_claims", "room_relay_outcomes"):
+        assert c.execute("SELECT 1 FROM sqlite_master WHERE name = ?", (name,)).fetchone()
     c.close()
 
 
-def test_the_real_stdio_door_reads_the_hosts_commands_from_its_environment(host, tmp_path):
+def test_the_real_stdio_door_reads_the_hosts_commands_from_its_environment(host, qdir, world, tmp_path):
+    """The door as Claude starts it (a fresh process, -P, its launch and host commands from the environment), against
+    the test store (LEVAIN_HOME is the fixture's): it starts (L3 r1 deepseek 1, the 'missing import os', is refuted
+    here), relays, reads the relayed thread, and refuses a foreign one."""
     import os
     import subprocess
 
-    env = {**os.environ, room_host.HOSTCMD_ENV: host.to_json(), "PYTHONPATH": os.getcwd()}
+    env = {**os.environ, room_host.HOSTCMD_ENV: host.to_json(), room_mcp.LAUNCH_ENV: world["launch"],
+           "PYTHONPATH": os.getcwd()}
+    assert env["LEVAIN_HOME"] == str(qdir.parent)
+    tool = lambda i, name, args: {"jsonrpc": "2.0", "id": i, "method": "tools/call",      # noqa: E731
+                                  "params": {"name": name, "arguments": args}}
     msgs = "\n".join(json.dumps(m) for m in (
         {"jsonrpc": "2.0", "id": 1, "method": "tools/list", "params": {}},
-        {"jsonrpc": "2.0", "id": 2, "method": "tools/call", "params": {"name": "desk_replies", "arguments": {"thread": THREAD}}},
+        tool(2, "relay_to_desk", {"quote_ids": [world["m1"]]}),
+        tool(3, "desk_replies", {"thread": THREAD}),
+        tool(4, "desk_replies", {"thread": "th-0abcdef-ffff00"}),
     )) + "\n"
-    out = subprocess.run([sys.executable, "-P", "-m", "levain.coordinator.room_mcp", "--launch", "ln-" + "a" * 32],
+    out = subprocess.run([sys.executable, "-P", "-m", "levain.coordinator.room_mcp"],
                          input=msgs, capture_output=True, text=True, env=env, timeout=60)
+    assert out.returncode == 0, out.stderr
     replies = [json.loads(x) for x in out.stdout.splitlines()]
     assert [t["name"] for t in replies[0]["result"]["tools"]] == ["relay_to_desk", "desk_replies"]
-    assert replies[1]["result"]["content"][0]["text"] == "10:42 on it"
+    assert "relayed to the desk" in replies[1]["result"]["content"][0]["text"], replies[1]
+    assert replies[2]["result"]["content"][0]["text"] == "10:42 on it"
+    assert replies[3]["result"]["isError"] is True and "not a desk thread this room relayed to" in \
+        replies[3]["result"]["content"][0]["text"]

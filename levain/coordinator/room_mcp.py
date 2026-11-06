@@ -24,9 +24,11 @@ door in ``LEVAIN_ROOM_HOST_COMMANDS``, set by the launcher in the mcp-config fil
 the door is exactly what it was: ``propose_drop``. With a ``relay`` the host marked ``relay_without_tap``, the door's
 tools are ``relay_to_desk`` (which RETIRES ``propose_drop``: a call to it is "unknown tool") and, with a ``replies``,
 ``desk_replies``; ``replies`` alone adds ``desk_replies`` beside ``propose_drop``. ``relay_to_desk`` takes ids of the
-operator's own messages and nothing else, runs the host's argv with those words on STDIN, and records the attempt
-(``room_relays``). The door runs only the host's argv; the model names a quote set and a thread id, never a program or an
-argument."""
+operator's own messages and nothing else, CLAIMS the relay (``room_relay_claims``, committed
+before anything runs: each of his messages goes once per room, and a claim that may have delivered is never re-run), runs
+the host's argv with those words on STDIN, and records its one outcome (``room_relay_outcomes``). ``desk_replies`` reads
+only a thread a relay from this room was sent on, for a live room launch. The door runs only the host's argv; the model
+names a quote set and a thread id, never a program or an argument."""
 from __future__ import annotations
 
 import json
@@ -85,8 +87,9 @@ RELAY_TOOL: dict[str, Any] = {
     "description": (
         "File the operator's own words with the desk, now, because he asked you to. Name his messages in this room, by "
         "id (quote_ids, in order), that are the words to send; they are copied from the store and sent exactly. You "
-        "cannot supply words, a note or a destination. The same words go once per room. The reply says whether the desk "
-        "took them and the thread id to read the desk's answer by (desk_replies). Use it only when he has asked for it."),
+        "cannot supply words, a note or a destination. Each of his messages goes once per room: one already relayed, or "
+        "whose delivery is unknown, is refused. The reply says whether the desk took them and the thread id to read the "
+        "desk's answer by (desk_replies). Use it only when he has asked for it."),
     "inputSchema": {
         "type": "object",
         "properties": {"quote_ids": {"type": "array", "minItems": 1, "items": {"type": "string"},
@@ -199,9 +202,17 @@ def _room_launch_refusal(conn: sqlite3.Connection, launch_id: str) -> str | None
 
 def _command_fault(code: int, out: str) -> str:
     line = " ".join(out.split())[:300] or "no output"
-    if code == 124:
-        return f"{line}. It may or may not have arrived: tell the operator, and do not retry on your own."
+    if code == room_host.TIMED_OUT:
+        return line
     return f"the host command failed (exit {code}): {line}"
+
+
+def _relay_outcome(ran: room_host.Ran) -> str:
+    """'failed' ONLY when the command never started (certainly nothing delivered, so the words are released); 'sent' on
+    exit 0; else 'unknown': it ran and did not say it succeeded, so it may have delivered, and it is never re-run."""
+    if not ran.started:
+        return "failed"
+    return "sent" if ran.code == 0 else "unknown"
 
 
 def _relay(launch_id: str, params: dict[str, Any], host: HostCommands) -> dict[str, Any]:
@@ -213,43 +224,71 @@ def _relay(launch_id: str, params: dict[str, Any], host: HostCommands) -> dict[s
 
     ids = _relay_arguments(params.get("arguments"))
     fail = lambda why: _text(f"levain room: refused, nothing was relayed: {why}", True)      # noqa: E731
+    store = EnvelopeStore(default_queue_dir())
+    # 1. CLAIM, committed before anything runs: a second door, a retry or a crash after delivery finds the claim and is
+    # refused, so the command runs once for his words, by this claimer only
     try:
-        store = EnvelopeStore(default_queue_dir())
-        with store._write(create=False) as (conn, _now):
+        with store._write(create=False) as (conn, now):
             why = _room_launch_refusal(conn, launch_id)
             if why is not None:
                 return fail(why)
             room_thread, words = room.quoted_words(conn, launch_id, ids)
-            if room.relay_already_sent(conn, room_thread, ids):
-                return fail("those words were already relayed from this room")
-        # the command runs OUTSIDE the store's write lock: it may take seconds and writes elsewhere
-        code, out = room_host.run(host.relay, words)
-        match = None if code else re.search(r"\(thread (" + THREAD_RE.pattern + r")\)", out)
-        desk_thread = match.group(1) if match else None
-        detail = " ".join(out.split())[:300] or "no output"
-        with store._write(create=False) as (conn, now):
-            room.record_relay(conn, launch_id, room_thread, ids, words, "failed" if code else "sent", desk_thread,
-                              detail if not code else _command_fault(code, out), now=now)
+            relay_id = room.claim_relay(conn, launch_id, room_thread, ids, words, now=now)
     except (CoordError, StoreAbsent) as exc:
         return fail(str(exc))
     except (sqlite3.Error, JobStoreError, OSError) as exc:
-        return _text(f"levain room: a machine fault ({type(exc).__name__}: {exc}); whether the desk got the words is "
-                     "unknown: tell the operator, and do not retry on your own", True)
-    if code:
-        return _text(f"levain room: not relayed. {_command_fault(code, out)}", True)
+        return fail(f"a machine fault before the command ran ({type(exc).__name__}: {exc})")
+    # 2. the command runs OUTSIDE the store's write lock: it may take seconds and writes elsewhere
+    ran = room_host.run(host.relay, words)
+    outcome = _relay_outcome(ran)
+    match = re.search(r"\(thread (" + THREAD_RE.pattern + r")\)", ran.out) if outcome == "sent" else None
+    desk_thread = match.group(1) if match else None
+    detail = (" ".join(ran.out.split())[:300] or "no output") if outcome == "sent" else _command_fault(ran.code, ran.out)
+    # 3. its one outcome. A record that fails leaves the claim 'claimed', which holds the words: fail closed
+    unrecorded = ""
+    try:
+        with store._write(create=False) as (conn, now):
+            room.record_relay_outcome(conn, relay_id, outcome, desk_thread, detail, now=now)
+    except (CoordError, sqlite3.Error, JobStoreError, OSError) as exc:
+        unrecorded = (f" Levain could not record the outcome ({type(exc).__name__}: {exc}), so these words stay held in "
+                      "this room: do not relay them again; tell the operator.")
+    if outcome == "failed":
+        return _text(f"levain room: not relayed, nothing was delivered. {detail}.{unrecorded}", True)
+    if outcome == "unknown":
+        return _text(f"levain room: delivery unknown. {detail}. The desk may have these words; they will not be relayed "
+                     f"again from this room. Tell the operator, and do not retry.{unrecorded}", True)
     tail = f" Thread {desk_thread}: read the desk's answer with desk_replies." if desk_thread else ""
-    return _text(f"levain room: relayed to the desk. {detail}{tail}", False)
+    return _text(f"levain room: relayed to the desk. {detail}{tail}{unrecorded}", False)
 
 
-def _replies(params: dict[str, Any], host: HostCommands) -> dict[str, Any]:
+def _replies(launch_id: str, params: dict[str, Any], host: HostCommands) -> dict[str, Any]:
+    from levain.consent.queue import default_queue_dir
+    from levain.coordinator import room
+    from levain.coordinator.envelopes import EnvelopeStore
+    from levain.coordinator.store import CoordError, StoreAbsent
+    from levain.dispatch.jobs import JobStoreError
+
     raw = _reject_spoofs_and_extras(params.get("arguments"), frozenset({"thread"}))
     thread = raw.get("thread")
     if not isinstance(thread, str) or THREAD_RE.fullmatch(thread) is None:
         raise _RpcError(INVALID_PARAMS, "thread must be a desk thread id (th-...) from relay_to_desk")
-    code, out = room_host.run(host.replies, "", (thread,))
-    if code:
-        return _text(f"levain room: replies could not be read. {_command_fault(code, out)}", True)
-    return _text(out or f"No reply yet on {thread}.", False)
+    fail = lambda why: _text(f"levain room: refused, no replies were read: {why}", True)     # noqa: E731
+    # only a live room launch, and only a thread this room's own relay was sent on: never any desk thread by id
+    try:
+        with EnvelopeStore(default_queue_dir())._write(create=False) as (conn, _now):
+            why = _room_launch_refusal(conn, launch_id)
+            if why is not None:
+                return fail(why)
+            if not room.relayed_desk_thread(conn, launch_id, thread):
+                return fail(f"{thread} is not a desk thread this room relayed to; read only a thread relay_to_desk gave")
+    except (CoordError, StoreAbsent) as exc:
+        return fail(str(exc))
+    except (sqlite3.Error, JobStoreError, OSError) as exc:
+        return fail(f"a machine fault ({type(exc).__name__}: {exc})")
+    ran = room_host.run(host.replies, "", (thread,))
+    if ran.code:
+        return _text(f"levain room: replies could not be read. {_command_fault(ran.code, ran.out)}", True)
+    return _text(ran.out or f"No reply yet on {thread}.", False)
 
 
 def _propose(launch_id: str, params: dict[str, Any]) -> dict[str, Any]:
@@ -317,9 +356,11 @@ def handle(launch_id: str, msg: Any, host: HostCommands | None = None) -> dict[s
                 raise _RpcError(INVALID_PARAMS, f"unknown tool {str(name)[:60]!r}")
             if name == _NAME:
                 return _ok(rid, _propose(launch_id, params))
-            if name == room_host.RELAY_TOOL:
+            if name == room_host.RELAY_TOOL and host is not None and host.relays:
                 return _ok(rid, _relay(launch_id, params, host))
-            return _ok(rid, _replies(params, host))
+            if name == room_host.REPLIES_TOOL and host is not None and host.replies is not None:
+                return _ok(rid, _replies(launch_id, params, host))
+            raise _RpcError(INVALID_PARAMS, f"unknown tool {name[:60]!r}")
         raise _RpcError(METHOD_NOT_FOUND, f"method not found: {method[:60]}")
     except _RpcError as exc:
         return _error(rid, exc.code, exc.message)

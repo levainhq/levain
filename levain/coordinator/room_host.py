@@ -13,8 +13,9 @@ the card commits a drop. The proposed-drop path is retired only when ``relay`` i
 never infers it). ``replies`` alone adds a read-only tool and retires nothing.
 
 **What the model cannot do.** The relay tool takes ids of the operator's own messages in the open room, never words (the
-room's words-by-id rule, :func:`levain.coordinator.room.quoted_words`); the same quote set is relayed once per room
-thread; and the door runs only the argv the host gave, with ``shell=False``, a timeout and a capped output. The argv
+room's words-by-id rule, :func:`levain.coordinator.room.quoted_words`); each of his messages is relayed once per room
+thread (claimed before the command runs: :func:`levain.coordinator.room.claim_relay`); and the door runs only the argv
+the host gave, with ``shell=False``, in its own process group (killed whole on the timeout) and a capped output. The argv
 reaches the door through the room's own mcp-config file (0700 run directory, written per launch), not through anything
 the model can name.
 
@@ -24,12 +25,15 @@ from __future__ import annotations
 import json
 import os
 import re
+import signal
 import subprocess
+import threading
+import time
 from dataclasses import dataclass
-from typing import Any, Optional
+from typing import Any, NamedTuple, Optional
 
-__all__ = ["HOSTCMD_ENV", "OUTPUT_MAX", "TIMEOUT", "HostCommands", "HostCommandError", "RELAY_TOOL", "REPLIES_TOOL",
-           "THREAD_RE", "door_tools", "from_env", "run"]
+__all__ = ["HOSTCMD_ENV", "NOT_STARTED", "OUTPUT_MAX", "TIMED_OUT", "TIMEOUT", "HostCommands", "HostCommandError",
+           "RELAY_TOOL", "REPLIES_TOOL", "Ran", "THREAD_RE", "door_tools", "from_env", "run"]
 
 HOSTCMD_ENV = "LEVAIN_ROOM_HOST_COMMANDS"
 # [seat] seconds a host command may run before the door gives up on it
@@ -113,21 +117,106 @@ def from_env(value: Optional[str]) -> Optional[HostCommands]:
     return HostCommands(doc.get("relay"), doc.get("replies"), doc.get("relay_without_tap", False))
 
 
-def run(argv: tuple[str, ...], stdin_text: str = "", extra: tuple[str, ...] = (), *, timeout: float = TIMEOUT
-        ) -> tuple[int, str]:
-    """Run the host's command. ``stdin_text`` goes to its STDIN; ``extra`` are fixed-shape arguments appended (an
-    already-validated thread id), never free text. Returns ``(exit code, output)``: code 124 for a timeout, 127 when
-    the program cannot be started; output is stdout then stderr, capped at :data:`OUTPUT_MAX`."""
+class Ran(NamedTuple):
+    """What :func:`run` saw. ``started`` is False only when the program never began (nothing it could deliver); a
+    command that started and then failed or timed out may have delivered."""
+    code: int
+    out: str
+    started: bool
+
+
+# the exit codes run() reports for its own outcomes
+TIMED_OUT = 124
+NOT_STARTED = 127
+# [seat] bytes of each stream kept while the rest is read and dropped (OUTPUT_MAX characters, at UTF-8's widest)
+_RETAIN = OUTPUT_MAX * 4
+_CHUNK = 64 * 1024
+# [seat] seconds to reap a killed command's group and readers
+_REAP = 2.0
+
+
+def _drain(stream: Any, keep: bytearray) -> None:
+    """Read ``stream`` to its end, keeping its first :data:`_RETAIN` bytes and dropping the rest (a noisy command never
+    makes the door hold its whole output)."""
     try:
-        done = subprocess.run([*argv, *extra], input=stdin_text, capture_output=True, text=True, encoding="utf-8",
-                              errors="replace", timeout=timeout, shell=False)
+        read = getattr(stream, "read1", stream.read)
+        while True:
+            chunk = read(_CHUNK)
+            if not chunk:
+                return
+            room = _RETAIN - len(keep)
+            if room > 0:
+                keep += chunk[:room]
+    except (OSError, ValueError):
+        return
+    finally:
+        try:
+            stream.close()
+        except (OSError, ValueError):
+            pass
+
+
+def _feed(stream: Any, data: bytes) -> None:
+    try:
+        stream.write(data)
+    except (OSError, ValueError):       # a command that exits without reading its stdin: a broken pipe, not a fault
+        pass
+    finally:
+        try:
+            stream.close()
+        except (OSError, ValueError):
+            pass
+
+
+def _kill_group(pid: int) -> None:
+    try:
+        os.killpg(pid, signal.SIGKILL)
+    except (ProcessLookupError, PermissionError, OSError):     # the group is already gone
+        pass
+
+
+def run(argv: tuple[str, ...], stdin_text: str = "", extra: tuple[str, ...] = (), *, timeout: float = TIMEOUT) -> Ran:
+    """Run the host's command. ``stdin_text`` goes to its STDIN; ``extra`` are fixed-shape arguments appended (an
+    already-validated thread id), never free text. The command starts in its OWN session (process group): on a timeout
+    the whole group is killed, so a helper it spawned cannot deliver after the door gave up. Each stream is read as it
+    comes, keeping a bounded head and dropping the rest. Returns :class:`Ran`: code :data:`TIMED_OUT` for a timeout,
+    :data:`NOT_STARTED` (``started`` False) when the program could not be started; output is stdout then stderr, capped
+    at :data:`OUTPUT_MAX`."""
+    try:
+        proc = subprocess.Popen([*argv, *extra], stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                shell=False, start_new_session=True)
+    except (OSError, ValueError) as exc:     # ValueError: an argument Popen will not pass (it never ran either way)
+        return Ran(NOT_STARTED, f"the host command could not start ({type(exc).__name__})", False)
+    out_b, err_b = bytearray(), bytearray()
+    workers = [threading.Thread(target=_feed, args=(proc.stdin, stdin_text.encode("utf-8", "replace")), daemon=True),
+               threading.Thread(target=_drain, args=(proc.stdout, out_b), daemon=True),
+               threading.Thread(target=_drain, args=(proc.stderr, err_b), daemon=True)]
+    for w in workers:
+        w.start()
+    deadline = time.monotonic() + timeout
+    timed_out = False
+    try:
+        proc.wait(timeout=max(0.0, deadline - time.monotonic()))
     except subprocess.TimeoutExpired:
-        return 124, f"the host command did not finish within {timeout:g} s"
-    except OSError as exc:
-        return 127, f"the host command could not start ({type(exc).__name__})"
-    text = (done.stdout or "").strip()
-    if done.returncode and done.stderr:
-        text = (text + "\n" + done.stderr.strip()).strip()
-    elif not text:
-        text = (done.stderr or "").strip()
-    return done.returncode, text[:OUTPUT_MAX]
+        timed_out = True
+    # a command that exited may have left a descendant holding its pipes: its readers wait only until the deadline
+    for w in workers[1:]:
+        w.join(max(0.0, deadline - time.monotonic()))
+    if timed_out or any(w.is_alive() for w in workers):
+        _kill_group(proc.pid)
+        try:
+            proc.wait(timeout=_REAP)
+        except subprocess.TimeoutExpired:
+            pass
+        for w in workers:
+            w.join(_REAP)
+    if timed_out:
+        return Ran(TIMED_OUT, f"the host command did not finish within {timeout:g} s and was stopped", True)
+    code = proc.returncode
+    out = out_b.decode("utf-8", "replace").strip()
+    err = err_b.decode("utf-8", "replace").strip()
+    if code and err:        # a failure's diagnostic is usually on stderr: it keeps room even behind a long stdout
+        text = (out[:OUTPUT_MAX // 2] + "\n" + err).strip() if out else err
+    else:
+        text = out or err
+    return Ran(code, text[:OUTPUT_MAX], True)

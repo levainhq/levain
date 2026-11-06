@@ -24,7 +24,7 @@ from levain.coordinator.store import (SURFACES, WORDS_MAX, CoordError, CoordStor
 
 ROOM_EVENT_KINDS = ("opened", "rotated")
 PROPOSAL_KINDS = ("committed", "dismissed")
-RELAY_OUTCOMES = ("sent", "failed")
+RELAY_OUTCOMES = ("sent", "failed", "unknown")
 _BY = ("operator", "service")
 # [seat] the summary's cap is flowConnect's NOTE_CHARS (a note points, it does not report)
 SUMMARY_MAX = 600
@@ -108,21 +108,34 @@ ROOM_SCHEMA: tuple[str, ...] = (
     "AND p.launch_id = NEW.launch_id) "
     "BEGIN SELECT RAISE(ABORT, 'a drop note is the summary of the proposal that made the drop'); END",
 
-    # D2 (1106-16): what the room relayed to the host's desk. A row is one ATTEMPT's result; a quote set is 'sent' once per
-    # room thread, so a model that calls again for the same words is refused rather than filing them twice
-    "CREATE TABLE IF NOT EXISTS room_relays (relay_id TEXT PRIMARY KEY, "
+    # D2 (1106-16): what the room relayed to the host's desk. A relay is CLAIMED (its intent, committed BEFORE the host
+    # command runs) and then gets at most one outcome. Its state: no outcome = 'claimed' (in flight, or the door died
+    # mid-command), 'sent', 'failed' (the command never started: nothing was delivered) or 'unknown' (it started and did
+    # not report success: it may have delivered). Each of his messages is claimed once per room thread unless every claim
+    # holding it is 'failed', so two doors, a retry, or a crash after delivery can never run the command for it twice.
+    "CREATE TABLE IF NOT EXISTS room_relay_claims (relay_id TEXT PRIMARY KEY, "
     "room_thread TEXT NOT NULL REFERENCES threads(thread_id), launch_id TEXT NOT NULL REFERENCES launches(launch_id), "
-    f"quoted TEXT NOT NULL, words_sha256 TEXT NOT NULL, outcome TEXT NOT NULL CHECK ({_in('outcome', RELAY_OUTCOMES)}), "
-    "desk_thread TEXT, detail TEXT NOT NULL, at TEXT NOT NULL)",
-    *_append_only("room_relays", "a host relay"),
-    "CREATE TRIGGER IF NOT EXISTS room_relays_no_replace BEFORE INSERT ON room_relays WHEN EXISTS (SELECT 1 FROM room_relays "
-    "WHERE relay_id = NEW.relay_id OR rowid = NEW.rowid) BEGIN SELECT RAISE(ABORT, 'a host relay is never replaced'); END",
-    "CREATE TRIGGER IF NOT EXISTS room_relays_once BEFORE INSERT ON room_relays WHEN NEW.outcome = 'sent' AND EXISTS "
-    "(SELECT 1 FROM room_relays r WHERE r.room_thread = NEW.room_thread AND r.quoted = NEW.quoted AND r.outcome = 'sent') "
-    "BEGIN SELECT RAISE(ABORT, 'those words were already relayed from this room'); END",
-    "CREATE TRIGGER IF NOT EXISTS room_relays_launch BEFORE INSERT ON room_relays WHEN NOT EXISTS (SELECT 1 FROM "
-    "launches l WHERE l.launch_id = NEW.launch_id AND l.role = 'room') "
+    "quoted TEXT NOT NULL CHECK (json_valid(quoted) AND json_type(quoted) = 'array'), words_sha256 TEXT NOT NULL, "
+    "at TEXT NOT NULL)",
+    "CREATE TABLE IF NOT EXISTS room_relay_outcomes (relay_id TEXT PRIMARY KEY REFERENCES room_relay_claims(relay_id), "
+    f"outcome TEXT NOT NULL CHECK ({_in('outcome', RELAY_OUTCOMES)}), desk_thread TEXT, detail TEXT NOT NULL, "
+    "at TEXT NOT NULL, CHECK (outcome = 'sent' OR desk_thread IS NULL))",
+    *_append_only("room_relay_claims", "a relay claim"),
+    *_append_only("room_relay_outcomes", "a relay outcome"),
+    "CREATE TRIGGER IF NOT EXISTS room_relay_claims_no_replace BEFORE INSERT ON room_relay_claims WHEN EXISTS (SELECT 1 FROM "
+    "room_relay_claims WHERE relay_id = NEW.relay_id OR rowid = NEW.rowid) "
+    "BEGIN SELECT RAISE(ABORT, 'a relay claim is never replaced'); END",
+    "CREATE TRIGGER IF NOT EXISTS room_relay_claims_once BEFORE INSERT ON room_relay_claims WHEN EXISTS (SELECT 1 FROM "
+    "room_relay_claims c, json_each(c.quoted) a, json_each(NEW.quoted) b WHERE c.room_thread = NEW.room_thread AND "
+    "a.value = b.value AND NOT EXISTS (SELECT 1 FROM room_relay_outcomes o WHERE o.relay_id = c.relay_id AND "
+    "o.outcome = 'failed')) BEGIN SELECT RAISE(ABORT, 'those words were already relayed from this room, or a relay of "
+    "them is in flight or of unknown delivery'); END",
+    "CREATE TRIGGER IF NOT EXISTS room_relay_claims_launch BEFORE INSERT ON room_relay_claims WHEN NOT EXISTS (SELECT 1 "
+    "FROM launches l WHERE l.launch_id = NEW.launch_id AND l.role = 'room') "
     "BEGIN SELECT RAISE(ABORT, 'a relay comes from a room launch'); END",
+    "CREATE TRIGGER IF NOT EXISTS room_relay_outcomes_no_replace BEFORE INSERT ON room_relay_outcomes WHEN EXISTS (SELECT 1 "
+    "FROM room_relay_outcomes WHERE relay_id = NEW.relay_id OR rowid = NEW.rowid) "
+    "BEGIN SELECT RAISE(ABORT, 'a relay has one outcome'); END",
 )
 
 
@@ -261,27 +274,70 @@ def quoted_words(conn: sqlite3.Connection, launch_id: str, quote: Sequence[str])
     return room, words
 
 
-def relay_already_sent(conn: sqlite3.Connection, room_thread: str, quote: Sequence[str]) -> bool:
-    """Whether this exact quote set (as a list, in order) was already relayed from ``room_thread``."""
-    ensure(conn)
-    return conn.execute("SELECT 1 FROM room_relays WHERE room_thread = ? AND quoted = ? AND outcome = 'sent'",
-                        (room_thread, json.dumps(list(quote)))).fetchone() is not None
+#: a relay's state: no outcome row is 'claimed'; else its one outcome
+RELAY_STATES = ("claimed", *RELAY_OUTCOMES)
+_RELAY_STATE = ("COALESCE((SELECT o.outcome FROM room_relay_outcomes o WHERE o.relay_id = c.relay_id), 'claimed')")
 
 
-def record_relay(conn: sqlite3.Connection, launch_id: str, room_thread: str, quote: Sequence[str], words: str,
-                 outcome: str, desk_thread: str | None, detail: str, *, now: str | None = None) -> str:
-    """Append what a relay attempt did. ``detail`` is the host command's one reported line (capped by the caller).
-    A second 'sent' for the same quote set in the same room refuses (:class:`CoordError`)."""
+def relay_state(conn: sqlite3.Connection, relay_id: str) -> str | None:
+    """The relay's state (:data:`RELAY_STATES`), or None for no such claim."""
     ensure(conn)
+    row = conn.execute(f"SELECT {_RELAY_STATE} FROM room_relay_claims c WHERE c.relay_id = ?", (relay_id,)).fetchone()
+    return row[0] if row is not None else None
+
+
+def claim_relay(conn: sqlite3.Connection, launch_id: str, room_thread: str, quote: Sequence[str], words: str, *,
+                now: str | None = None) -> str:
+    """Claim a relay of ``quote`` (his message ids) BEFORE its command runs, in the caller's write transaction; its
+    ``relay_id``. Refused (:class:`CoordError`) when any of those messages is held by a claim in this room thread that
+    did not fail: already 'sent', or 'claimed' / 'unknown' (it may have been delivered, so it is never run again on
+    its own). Only the claimer runs the command."""
+    ensure(conn)
+    quoted = json.dumps(list(quote))
+    held = conn.execute(f"SELECT DISTINCT {_RELAY_STATE} FROM room_relay_claims c, json_each(c.quoted) a, json_each(?) b "
+                        "WHERE c.room_thread = ? AND a.value = b.value", (quoted, room_thread)).fetchall()
+    states = {r[0] for r in held} - {"failed"}
+    if "sent" in states:
+        raise CoordError("those words were already relayed from this room")
+    if states:
+        raise CoordError("a relay of those words is in flight, or its delivery is unknown; it is not sent again from "
+                         "this room: tell the operator")
     relay_id = "rl-" + secrets.token_hex(16)
     try:
-        conn.execute("INSERT INTO room_relays (relay_id, room_thread, launch_id, quoted, words_sha256, outcome, desk_thread, "
-                     "detail, at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                     (relay_id, room_thread, launch_id, json.dumps(list(quote)), words_sha256(words), outcome, desk_thread,
-                      detail, _stamp(now)))
+        conn.execute("INSERT INTO room_relay_claims (relay_id, room_thread, launch_id, quoted, words_sha256, at) "
+                     "VALUES (?, ?, ?, ?, ?, ?)",
+                     (relay_id, room_thread, launch_id, quoted, words_sha256(words), _stamp(now)))
     except sqlite3.IntegrityError as exc:
         raise CoordError(str(exc)) from None
     return relay_id
+
+
+def record_relay_outcome(conn: sqlite3.Connection, relay_id: str, outcome: str, desk_thread: str | None, detail: str, *,
+                         now: str | None = None) -> None:
+    """The claim's one outcome. 'failed' only when the command never started (it releases the words); 'unknown' when it
+    started and did not report success; 'sent' carries the desk thread it printed, if any."""
+    ensure(conn)
+    if outcome not in RELAY_OUTCOMES:
+        raise CoordError(f"a relay outcome is one of {', '.join(RELAY_OUTCOMES)}")
+    try:
+        conn.execute("INSERT INTO room_relay_outcomes (relay_id, outcome, desk_thread, detail, at) VALUES (?, ?, ?, ?, ?)",
+                     (relay_id, outcome, desk_thread if outcome == "sent" else None, detail, _stamp(now)))
+    except sqlite3.IntegrityError as exc:
+        raise CoordError(str(exc)) from None
+
+
+def relayed_desk_thread(conn: sqlite3.Connection, launch_id: str, desk_thread: str) -> bool:
+    """Whether ``desk_thread`` is a thread a relay from ``launch_id``'s open room was SENT on: the only threads that room
+    may read replies from."""
+    ensure(conn)
+    row = conn.execute("SELECT role, threads FROM launches WHERE launch_id = ?", (launch_id,)).fetchone() \
+        if isinstance(launch_id, str) else None
+    room = current_room(conn)
+    if row is None or row[0] != "room" or room is None or room not in json.loads(row[1]):
+        return False
+    return conn.execute("SELECT 1 FROM room_relay_claims c JOIN room_relay_outcomes o ON o.relay_id = c.relay_id "
+                        "WHERE c.room_thread = ? AND o.outcome = 'sent' AND o.desk_thread = ?",
+                        (room, desk_thread)).fetchone() is not None
 
 
 def propose(conn: sqlite3.Connection, launch_id: str, quote: Sequence[str], summary: str, about: str | None = None, *,
