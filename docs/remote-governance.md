@@ -46,7 +46,7 @@ reason (`remote`), not the detail.
 | `claude attach <id>` from ssh (the desk) | the attach-client leg: the hook runs in the daemon-spawned desk, whose environment and ancestry never mention the client, so the client is found by its `ps` row (`::test_attach_client_under_sshd_makes_the_session_remote`, end to end `::test_attached_from_ssh_desk_never_reaches_the_sheet_and_promises_no_card`) | as above | an attach by id from mosh reads the same way (`::test_attach_client_under_mosh_server_makes_the_session_remote`) but was not run for real; two clients on one desk read remote if ANY is remote (`::test_two_clients_one_local_one_remote_reads_remote`), so a laptop answer typed while an ssh client is also attached is routed to the phone |
 | `claude attach <name>` | NOT detected: a client attached by name carries no session id in its argv (`::test_a_client_without_a_matching_id_in_argv_is_not_seen`) | read as local: the sheet opens on the laptop and times out; recorded `unsigned/timeout` | the whole surface: a name-attached remote client is as before this change |
 | Claude mobile (Anthropic's remote control) | NOT detected by levain: no leg looks for it. Flow classifies a `queued` turn with `queueSkipSlashCommands` as remote control (flow decides; `[judged by levain 41, 2026-11-05, against the quoted peer_roster lines in RETURN_remotegov_m1.md F3]`) | not measured: whether such a turn reaches `levain.band_hook` as a prompt, and with what environment, is UNMEASURED | all of it; levain does not govern this input. The repo only lists `--remote-control` among the claude flags it passes through (`levain/consent/delivery.py`) |
-| the cockpit on his phone | not a terminal: a click on a row goes through the cockpit, not the hook. A row carries a passkey sign card only where a producer filed a sign request (`Question.sign_request`; flow files them for its own band, levain files only `LEVAIN_SIGN_REQUESTS`' one review-clear grammar) `[judged by levain 41, 2026-11-05, against F4 in RETURN_remotegov_m1.md]` | Face ID passkey on the phone, where a card exists | a levain-store band row has no phone sign card today (no terminal-answer grammar in `LEVAIN_SIGN_REQUESTS`), so "sign it on your phone" is true only for rows a producer has filed |
+| the cockpit on his phone | not a terminal: a click on a row goes through the cockpit, not the hook. A row carries a passkey sign card only where a producer filed a sign request (`Question.sign_request`; flow files them for its own band, levain files only `LEVAIN_SIGN_REQUESTS`' one review-clear grammar) `[judged by levain 41, 2026-11-05, against F4 in RETURN_remotegov_m1.md]` | Face ID passkey on the phone, where a card exists | a levain-store band row has no phone sign card today (no terminal-answer grammar in `LEVAIN_SIGN_REQUESTS`), so the echo for a remote answer does not mention a phone card; it would be true only for rows a producer has filed |
 
 ## Away and sleep: not this repo's half
 
@@ -64,6 +64,11 @@ That half is flow's and its tests are flow's; this repo's part is only that the 
 
 - A client attached by name is not seen (above); so is anything that runs the desk with no ssh, mosh or attach
   ancestry, such as a VPN-reached laptop session: that is a local terminal as far as the process tree can tell.
+- Flow's hook calls `is_remote()` with no arguments, so it matches an attach client only by the session id in its own
+  environment (`CLAUDE_CODE_SESSION_ID`); levain's band hook also passes the hook payload's id. A daemon-backed attach
+  whose hook environment carries no session id is seen by levain's hook and not by flow's, so flow's away/sleep stamp
+  can still read that turn as the laptop's keyboard `[judged by levain 43, 2026-11-05, against the L3 r2 codex finding
+  in project_memory/1105-31/L3_remotegov_r2.txt]`; forwarding the payload id from flow's hook is flow's change.
 - The detector reads the process tree as `ps` prints it. A build of sshd that stops rewriting its title, or a
   `claude` binary that renames the `attach` subcommand, stops matching; the failure is the status quo, a sheet that
   times out.
