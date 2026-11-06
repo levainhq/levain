@@ -188,7 +188,7 @@ def test_the_sudoers_step_is_validated_and_scoped_to_the_hands_user(tmp_path: Pa
 
 
 def test_classic_sudo_text_is_byte_identical_and_sudo_rs_drops_only_the_unknown_tokens() -> None:
-    classic = sudoers_text("alice", "_levain_x", requiretty=True)
+    classic = sudoers_text("alice", "_levain_x", classic_sudo=True)
     assert classic == (
         "# Written by `levain setup-isolation`; removed by `levain setup-isolation --undo`.\n"
         "# alice may run commands as the Levain hands user _levain_x, and nothing else.\n"
@@ -196,7 +196,7 @@ def test_classic_sudo_text_is_byte_identical_and_sudo_rs_drops_only_the_unknown_
         "Defaults>_levain_x env_reset\n"
         "Defaults>_levain_x !log_input, !log_output, !use_pty\n"
         "alice ALL=(_levain_x) NOPASSWD: ALL\n")
-    rs = sudoers_text("alice", "_levain_x", requiretty=False)
+    rs = sudoers_text("alice", "_levain_x", classic_sudo=False)
     assert rs == classic.replace("Defaults>_levain_x !requiretty\n", "").replace("!log_input, !log_output, ", "")
     assert "log_input" not in rs and "log_output" not in rs and "!use_pty" in rs
 
@@ -212,7 +212,7 @@ def test_classic_sudo_text_is_byte_identical_and_sudo_rs_drops_only_the_unknown_
 def test_requiretty_line_only_where_sudo_knows_it(first, knows) -> None:
     from levain.firing.hands import sudo_knows_requiretty
     assert sudo_knows_requiretty(lambda: first) is knows
-    text = sudoers_text("alice", "_levain_x", requiretty=knows)
+    text = sudoers_text("alice", "_levain_x", classic_sudo=knows)
     assert ("!requiretty" in text) is knows
     # the grant is identical either way
     assert "alice ALL=(_levain_x) NOPASSWD: ALL" in text and "env_reset" in text
