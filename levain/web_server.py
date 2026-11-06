@@ -362,8 +362,9 @@ def _sign_one(route: str) -> "str | None":
 # (an undecided one), through the phone port's OWN step code (ConsentSheet below), over the Signer's queue, rpId and pinned
 # page. GET /cockpit/consent/<id>/sheet.json is the sign sheet's read of one request, POST
 # /cockpit/consent/<id>/{challenge,answer,rule-challenge,rule} its ceremony, both behind the sign routes' gate exactly, and
-# GET /sign/consent/<id> the sheet's page. Served only beside the grant routes (make_server's same-queue condition): the
-# card a button sits on and the request it answers come from one queue. Else every path here is 404.
+# GET /sign/consent/<id> the sheet's page. Served only while the consent reader's queue is the Signer's (the server's
+# consent_sheet, read at each request): the card a button sits on and the request it answers come from one queue. Else
+# every path here is 404.
 _CONSENT_SIGN_ACTIONS = ("challenge", "answer", "rule-challenge", "rule")
 _CONSENT_SHEET_READ = "/sheet.json"
 _CONSENT_SHEET_PREFIX = "/sign/consent/"
@@ -378,6 +379,20 @@ def _consent_sign_route(route: str) -> "tuple[str, str] | None":
     if not sep or _CONSENT_ID.fullmatch(rid) is None or action not in _CONSENT_SIGN_ACTIONS:
         return None
     return rid, action
+
+
+def _cards_on_queue(reader: Any, queue: "Path | str") -> bool:
+    """Whether the consent cards ``reader`` lists are read from ``queue``: its ``directory`` (None: the default queue,
+    resolved now) resolves to the same path. A reader naming no directory reads no queue: False."""
+    if reader is None or not hasattr(reader, "directory"):
+        return False
+    from levain.consent.queue import default_queue_dir
+
+    try:
+        card_queue = reader.directory if reader.directory is not None else default_queue_dir()
+        return Path(card_queue).resolve() == Path(queue).resolve()
+    except (OSError, RuntimeError, TypeError, ValueError):
+        return False
 
 
 def _consent_sheet_read(path: str) -> "str | None":
@@ -1757,9 +1772,24 @@ class _LevainHTTPServer(ThreadingHTTPServer):
     # the grants' passkey revoke (PLAN M17 "9a"), built by make_server from that Signer once it is pinned; None serves no
     # grant route
     grant_phone: "GrantPhone | None" = None
-    # the consent family's answer and ruling (OS-2), built by make_server beside grant_phone, under its condition; None
-    # serves no consent signing route
-    consent_sheet: "ConsentSheet | None" = None
+    # the consent family's answer and ruling (OS-2), built by make_server over the Signer's queue whenever a Signer
+    # serves; read through `consent_sheet`, which serves it only while the consent reader's queue is that same queue
+    _consent_sheet: "ConsentSheet | None" = None
+
+    @property
+    def consent_sheet(self) -> "ConsentSheet | None":
+        """The consent sheet when the consent cards this page shows are read from the queue its answers are verified
+        in, else None (and then every consent sheet route is 404). Read at each request against the reader held then,
+        not once at start: a host that points the reader at the Signer's queue after make_server returned (flow's
+        bridge) gets the sheet, and a reader moved to any other queue takes it away."""
+        sheet = self._consent_sheet
+        if sheet is None or not _cards_on_queue(getattr(self, "consent_reader", None), sheet.queue_dir):
+            return None
+        return sheet
+
+    @consent_sheet.setter
+    def consent_sheet(self, sheet: "ConsentSheet | None") -> None:
+        self._consent_sheet = sheet
     # whether the cockpit draws levain's own Work board when no provider brings one (make_server's work_board)
     work_board: bool = True
     # the ChatService the work thread's Stop acts through; None serves none of it
@@ -5394,20 +5424,17 @@ def make_server(
             # only when the grant cards this page shows come from that same queue (/cockpit/consent/grants.json reads
             # the consent reader's): two queues could name two cockpits whose grants share ids and instances, and a
             # button on one card must never revoke the other's. Different queues: no grant route, the button copies.
-            from levain.consent.queue import default_queue_dir
-
             reader = httpd.consent_reader
-            card_queue = (reader.directory if reader.directory is not None else default_queue_dir()) \
-                if hasattr(reader, "directory") else None
-            if card_queue is not None and Path(card_queue).resolve() == Path(sign_queue).resolve():
+            if _cards_on_queue(reader, sign_queue):
                 # the cards' queue is PINNED to the one just compared: a default queue re-resolved per request (a
                 # LEVAIN_HOME changed after start) could otherwise move the cards off the queue the revoke is bound to
-                reader.directory = Path(card_queue).resolve()
+                reader.directory = Path(sign_queue).resolve()
                 httpd.grant_phone = GrantPhone(sign_queue, signer.rp_id, signer.page_origin, signer.keys,
                                                lambda: sign_root(sign_queue))
-                # the consent family's answer and ruling (OS-2), on the same condition and for the same reason: the
-                # consent card a button sits on is read from this queue, the one the answer is verified in
-                httpd.consent_sheet = ConsentSheet(sign_queue, signer.rp_id, signer.page_origin, signer)
+            # the consent family's answer and ruling (OS-2), for the same reason, but its condition is read at each
+            # request (the server's `consent_sheet`): the consent card a button sits on is read from this queue, the
+            # one the answer is verified in, also when a host points the reader here after this returns (flow's bridge)
+            httpd.consent_sheet = ConsentSheet(sign_queue, signer.rp_id, signer.page_origin, signer)
         if cockpit is not None:
             # one transaction: an attach that raises (a panel registered since check_verbs; a decisions panel the
             # registry refuses) undoes this server's attaches and keeps any other registration
@@ -5673,7 +5700,7 @@ def run_web_server(
     if unlocked != url:
         print(f"  open the cockpit, unlocked: {unlocked}", flush=True)
     if signer is not None:
-        # make_server wires the consent family only when this queue is the one the cockpit's consent cards come from
+        # the consent family serves only while this queue is the one the cockpit's consent cards come from (read now)
         sheets = ("consent and grant sheets on" if httpd.consent_sheet is not None else
                   "consent and grant sheets off: this queue is not the one the cockpit's consent cards are read from")
         print(f"  signing: {signer.page_origin} (queue {signer.queue_dir}; {sheets})", flush=True)
