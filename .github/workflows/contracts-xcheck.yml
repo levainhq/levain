@@ -13,7 +13,10 @@ on:
   workflow_dispatch:
 
 concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}
+  # A workflow_dispatch run gets a group of its own (its run id), so it neither cancels the push run whose
+  # verdict the release gate reads (3e2aef8d, 11-05) nor is cancelled by the next dispatch; a push or PR run still
+  # cancels the superseded run of the same ref.
+  group: ${{ github.workflow }}-${{ github.ref }}-${{ github.event_name == 'workflow_dispatch' && github.run_id || 'ci' }}
   cancel-in-progress: true
 
 jobs:
