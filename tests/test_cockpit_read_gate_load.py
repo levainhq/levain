@@ -119,3 +119,73 @@ def test_question_rows_ignore_signed_and_signer_on_a_light_question() -> None:
     rows_light, _ = _question_rows_in(Store(q(light)), now)
     assert [r.facets for r in rows_light] == [r.facets for r in rows_full] and len(rows_light) == 1
     assert rows_light[0].facets["question_state"] == "answered"
+
+
+def _raw_get_and_close(url: str, path: str) -> None:
+    """A client that connects, sends the request and closes before reading the response."""
+    import socket
+    host, port = url.split("//", 1)[1].split(":")
+    s = socket.create_connection((host, int(port)), timeout=5)
+    s.sendall(f"GET {path} HTTP/1.1\r\nHost: {host}:{port}\r\n\r\n".encode())
+    time.sleep(0.05)
+    s.close()
+
+
+def _count(key: str, field: str = "count") -> int:
+    return web_server._ROUTE_STATS.snapshot().get(key, {}).get(field, 0)
+
+
+def _wait_for(pred, secs: float = 5.0) -> bool:
+    end = time.monotonic() + secs
+    while time.monotonic() < end:
+        if pred():
+            return True
+        time.sleep(0.02)
+    return pred()
+
+
+def test_a_slow_read_the_client_abandons_is_still_counted(tmp_path: Path, monkeypatch) -> None:
+    """The slowest reads are the ones clients abandon: a send that raises must not skip the record."""
+    _root, src, _ids = _install(tmp_path)
+    real_send = web_server._Handler._send
+
+    def dying_send(self, body, ctype, *a, **kw):
+        if kw.get("status", 200) == 200 and "json" in ctype:
+            raise BrokenPipeError("client left")
+        return real_send(self, body, ctype, *a, **kw)
+
+    monkeypatch.setattr(web_server._Handler, "_send", dying_send)
+    before, before_ab = _count("panel/now"), _count("panel/now", "aborted")
+    with _serve(src, install_class="reported") as (url, _httpd):
+        _raw_get_and_close(url, "/cockpit/panel/now.json")
+        assert _wait_for(lambda: _count("panel/now") == before + 1)
+    assert _count("panel/now", "aborted") == before_ab + 1
+
+
+def test_a_503_is_counted_when_the_client_has_gone(tmp_path: Path, monkeypatch) -> None:
+    _root, src, _ids = _install(tmp_path)
+    real_send = web_server._Handler._send
+
+    def dying_send(self, body, ctype, *a, **kw):
+        if kw.get("status") == 503:
+            raise BrokenPipeError("client left")
+        return real_send(self, body, ctype, *a, **kw)
+
+    monkeypatch.setattr(web_server._Handler, "_send", dying_send)
+    monkeypatch.setattr(web_server._Handler, "_acquire_read_slot", lambda self: False)
+    before = _count("panel/now", "refused_503")
+    with _serve(src, install_class="reported") as (url, _httpd):
+        _raw_get_and_close(url, "/cockpit/panel/now.json")
+        assert _wait_for(lambda: _count("panel/now", "refused_503") == before + 1)
+
+
+def test_panel_other_does_not_steal_a_named_slot_and_the_log_names_the_folded_key(caplog) -> None:
+    st = _RouteStats()
+    st.record("/cockpit/panel/bad!id.json", 1.0)   # lands in panel/other first
+    for i in range(web_server._ROUTE_PANEL_IDS_MAX):
+        st.record(f"/cockpit/panel/p{i}.json", 1.0)
+    snap = st.snapshot()
+    assert all(f"panel/p{i}" in snap for i in range(web_server._ROUTE_PANEL_IDS_MAX))
+    with caplog.at_level(logging.WARNING, logger=web_server.__name__):
+        st.record("/cockpit/panel/extra.json", 2500.0)
+    assert any("route=panel/other" in r.getMessage() for r in caplog.records)

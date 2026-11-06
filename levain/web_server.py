@@ -1040,32 +1040,36 @@ class _RouteStats:
             return f"panel/{pid}" if re.fullmatch(r"[A-Za-z0-9_.:-]{1,48}", pid) else "panel/other"
         return "freshness" if path.startswith("/cockpit/fresh") else "other"
 
-    def _row(self, key: str) -> list[float]:
+    def _row(self, key: str) -> tuple[str, list[float]]:
+        # returns the EFFECTIVE key (a folded panel id comes back as "panel/other") with its row
         row = self._rows.get(key)
         if row is None:
             if key.startswith("panel/") and key != "panel/other" and \
-                    sum(1 for k in self._rows if k.startswith("panel/")) >= _ROUTE_PANEL_IDS_MAX:
+                    sum(1 for k in self._rows if k.startswith("panel/") and k != "panel/other") >= _ROUTE_PANEL_IDS_MAX:
                 key = "panel/other"
-            row = self._rows.setdefault(key, [0.0, 0.0, 0.0, 0.0])
-        return row
+            row = self._rows.setdefault(key, [0.0, 0.0, 0.0, 0.0, 0.0])
+        return key, row
 
-    def record(self, path: str, ms: float, *, gate_wait_ms: float = 0.0, refused: bool = False) -> None:
+    def record(self, path: str, ms: float, *, gate_wait_ms: float = 0.0, refused: bool = False,
+               aborted: bool = False) -> None:
         key = self.key_for(path)
         with self._lock:
-            row = self._row(key)
+            key, row = self._row(key)
             row[0] += 1
             row[1] += ms
             row[2] = max(row[2], ms)
             if refused:
                 row[3] += 1
+            if aborted:
+                row[4] += 1
         if ms > _SLOW_READ_MS:
-            _log.warning("slow cockpit read: route=%s ms=%d gate_wait_ms=%d%s", key, ms, gate_wait_ms,
-                         " refused=503" if refused else "")
+            _log.warning("slow cockpit read: route=%s ms=%d gate_wait_ms=%d%s%s", key, ms, gate_wait_ms,
+                         " refused=503" if refused else "", " aborted" if aborted else "")
 
     def snapshot(self) -> dict[str, dict[str, float]]:
         with self._lock:
             return {k: {"count": int(r[0]), "total_ms": round(r[1], 1), "max_ms": round(r[2], 1),
-                        "refused_503": int(r[3])} for k, r in self._rows.items()}
+                        "refused_503": int(r[3]), "aborted": int(r[4])} for k, r in self._rows.items()}
 
 
 _ROUTE_STATS = _RouteStats()
@@ -4100,8 +4104,10 @@ class _Handler(GuardedHandler):
         if path.startswith(_QUESTION_BODY_PREFIX) and path.endswith(_CONSENT_BODY_SUFFIX):
             _tq = time.monotonic()
             self._q503 = False
-            self._serve_question_body(path, head=head)
-            _ROUTE_STATS.record(path, (time.monotonic() - _tq) * 1000.0, refused=self._q503)
+            try:
+                self._serve_question_body(path, head=head)
+            finally:   # a client that left mid-send (BrokenPipe) is still one counted read
+                _ROUTE_STATS.record(path, (time.monotonic() - _tq) * 1000.0, refused=self._q503)
             return
         if path == _BAND_PATH:
             self._serve_band(head=head)
@@ -4136,30 +4142,38 @@ class _Handler(GuardedHandler):
             _t0 = time.monotonic()
             if not self._acquire_read_slot():
                 _wait = (time.monotonic() - _t0) * 1000.0
-                _ROUTE_STATS.record(self.path, _wait, gate_wait_ms=_wait, refused=True)
+                _ROUTE_STATS.record(path, _wait, gate_wait_ms=_wait, refused=True)
                 self._send(b"busy\n", "text/plain; charset=utf-8", status=503, head=head)
                 return
             _wait = (time.monotonic() - _t0) * 1000.0
-            if not self._peer_open():
-                # the client gave up during its wait: skip the store read nobody will receive
-                self._release_read_slot()
-                self.close_connection = True
-                return
-            try:
-                status, body, hdrs = handle_cockpit_get(
-                    self._cockpit(), self.path, credential=self._credential(),
-                    if_none_match=self.headers.get("If-None-Match"), transport=self._transport(),
-                )
-            except _CredentialUnavailable:   # RU-5: only the outer catch answers it
-                raise
-            except Exception as exc:  # noqa: BLE001 - never 500 with a dead connection
-                status, hdrs = 500, [("Vary", COCKPIT_VARY)]
-                body = json.dumps({"error": "internal", "message": f"{type(exc).__name__}: {exc}"}).encode("utf-8")
+            _aborted = False
+            try:   # every read is counted from request start, whether or not the client is still there to get it
+                if not self._peer_open():
+                    # the client gave up during its wait: skip the store read nobody will receive
+                    _aborted = True
+                    self._release_read_slot()
+                    self.close_connection = True
+                    return
+                try:
+                    status, body, hdrs = handle_cockpit_get(
+                        self._cockpit(), self.path, credential=self._credential(),
+                        if_none_match=self.headers.get("If-None-Match"), transport=self._transport(),
+                    )
+                except _CredentialUnavailable:   # RU-5: only the outer catch answers it
+                    raise
+                except Exception as exc:  # noqa: BLE001 - never 500 with a dead connection
+                    status, hdrs = 500, [("Vary", COCKPIT_VARY)]
+                    body = json.dumps({"error": "internal", "message": f"{type(exc).__name__}: {exc}"}).encode("utf-8")
+                finally:
+                    self._release_read_slot()
+                try:
+                    self._send(body, "application/json; charset=utf-8", status=status, head=head,
+                               headers=hdrs, cache_control=COCKPIT_CACHE_CONTROL)
+                except OSError:
+                    _aborted = True
+                    raise
             finally:
-                self._release_read_slot()
-            self._send(body, "application/json; charset=utf-8", status=status, head=head,
-                       headers=hdrs, cache_control=COCKPIT_CACHE_CONTROL)
-            _ROUTE_STATS.record(self.path, (time.monotonic() - _t0) * 1000.0, gate_wait_ms=_wait)
+                _ROUTE_STATS.record(path, (time.monotonic() - _t0) * 1000.0, gate_wait_ms=_wait, aborted=_aborted)
             return
 
         if path == "/substrate.json":
