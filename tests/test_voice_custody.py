@@ -845,3 +845,62 @@ def test_a_provider_with_no_adapter_signs_no_use(ck, sec, cli):
     assert custody.default_uses("elevenlabs") == ()
     for provider in ("openai", "deepgram", "inworld"):                 # every provider with an adapter still signs
         assert custody.default_uses(provider)
+
+
+# --- 1106-1 miscdeny: the real `security` binary, spelled in another letter case (casesweep row 14) --------------------
+
+def test_a_case_alias_of_the_real_security_binary_is_refused_under_a_test(tmp_path):
+    """casesweep row 14: `Path.resolve()` keeps the spelling it is given, so `/USR/BIN/SECURITY` compared unequal to
+    `/usr/bin/security` and passed the guard, which would have let a test run the real keychain binary. Refusing is the
+    DENY direction (an unreadable spelling still refuses, as before). Needs a case-insensitive volume (macOS APFS) with
+    the binary there: elsewhere this skips with the reason, so a Linux CI run never reds it; the injected-fold test
+    below runs there."""
+    real = Path(custody._REAL_SECURITY)
+    alias = Path(str(real).swapcase())
+    if not real.exists() or str(alias) == str(real) or not alias.exists() or not os.path.samefile(alias, real):
+        pytest.skip("this filesystem is case-sensitive: no case alias of /usr/bin/security exists")
+    for spelled in (str(alias), str(alias.parent / "../BIN/SECURITY"), str(Path(str(real.parent).swapcase()) / "security")):
+        with pytest.raises(VoiceKeyRefused, match="real `security`"):
+            custody.checked_security(spelled)
+    standin = tmp_path / "security"
+    standin.write_text("#!/bin/sh\n")
+    assert custody.checked_security(str(standin)) == str(standin)            # a stand-in still passes
+
+
+def test_the_real_security_guard_with_an_injected_case_fold(tmp_path, monkeypatch):
+    """The same logic where no alias exists (a Linux CI run): the "real binary" is a file under tmp_path and
+    `pathid._fs_spelling` is replaced by a case-insensitive walk, standing in for a case-insensitive volume."""
+    from levain import pathid
+    from tests.test_pathid import _case_insensitive_spelling
+    real = tmp_path.resolve() / "bin" / "security"
+    real.parent.mkdir()
+    real.write_text("#!/bin/sh\n")
+    other = tmp_path.resolve() / "bin" / "other"
+    other.write_text("#!/bin/sh\n")
+    monkeypatch.setattr(custody, "_REAL_SECURITY", str(real))
+    monkeypatch.setattr(pathid, "_fs_spelling", _case_insensitive_spelling)
+    for spelled in (str(real), str(real.parent.with_name("BIN") / "SECURITY"), str(real.parent / ".." / "BIN" / "security")):
+        with pytest.raises(VoiceKeyRefused, match="real `security`"):
+            custody.checked_security(spelled)
+    assert custody.checked_security(str(other)) == str(other)
+    assert custody.checked_security(str(real.parent.with_name("BIN") / "OTHER")) == str(real.parent.with_name("BIN") / "OTHER")
+
+
+def test_an_unreadable_spelling_of_the_real_security_binary_refuses(tmp_path, monkeypatch):
+    """L3 casefix r1 F1: `pathid.canonical` swallows its failures, so the old `except` was dead and a spelling of the
+    real binary that could not be read (EACCES, a descriptor limit) compared unequal and passed. The guard now refuses
+    on `pathid.maybe_same` (equal, the same file, or unsure)."""
+    from tests.test_pathid import _case_insensitive_spelling, _unknowable
+    real = tmp_path.resolve() / "bin" / "security"
+    real.parent.mkdir()
+    real.write_text("#!/bin/sh\n")
+    other = tmp_path.resolve() / "bin" / "other"
+    other.write_text("#!/bin/sh\n")
+    alias = real.parent.with_name("BIN") / "SECURITY"
+    monkeypatch.setattr(custody, "_REAL_SECURITY", str(real))
+    _unknowable(monkeypatch, alias, spelling=_case_insensitive_spelling)
+    with pytest.raises(VoiceKeyRefused, match="real `security`"):
+        custody.checked_security(str(alias))
+    with pytest.raises(VoiceKeyRefused, match="real `security`"):
+        custody.checked_security(str(real))
+    assert custody.checked_security(str(other)) == str(other)                 # a readable stand-in still passes

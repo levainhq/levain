@@ -334,6 +334,42 @@ def test_ws_put_names_a_destination_relative_to_the_workspace_or_absolute_inside
         ws_git.put_parts(ws, str(tmp_path / "wsx" / "b.txt"))
 
 
+def test_ws_put_takes_an_absolute_destination_spelled_as_another_name_of_the_workspace(tmp_path: Path) -> None:
+    """1106-1 aliasb (casesweep row 10): the inside check was a string prefix, so the workspace spelled in another letter
+    case (a case-insensitive volume: macOS APFS) was refused as "not inside". Runs everywhere through a symlink at the
+    workspace's depth (another name of the same directory); the case-alias form below needs APFS and skips elsewhere.
+    A sibling that is NOT the workspace, and a dest whose prefix names the workspace through `..`, stay refused."""
+    ws = tmp_path.resolve() / "ws"
+    ws.mkdir()
+    (tmp_path.resolve() / "wsx").mkdir()
+    link = tmp_path.resolve() / "wslink"
+    link.symlink_to(ws)
+    assert ws_git.put_parts(ws, str(link / "a" / "b.txt")) == ["a", "b.txt"]
+    for bad in (tmp_path.resolve() / "wsx" / "b.txt", tmp_path.resolve() / "nothere" / "b.txt",
+                tmp_path.resolve() / "wslink" / ".." / "x"):
+        with pytest.raises(WsGitError):
+            ws_git.put_parts(ws, str(bad))
+    with pytest.raises(WsGitError, match="no '.', '..' or empty parts"):
+        ws_git.put_parts(ws, str(link / "a" / ".." / "b.txt"))                  # the clean-parts rule still applies
+    other = tmp_path.resolve() / "elsewhere"
+    other.mkdir()
+    (tmp_path.resolve() / "wsfar").symlink_to(other)                           # same depth, a link to a different dir
+    with pytest.raises(WsGitError, match="not inside"):
+        ws_git.put_parts(ws, str(tmp_path.resolve() / "wsfar" / "b.txt"))
+
+
+def test_ws_put_takes_a_workspace_spelled_in_another_letter_case(tmp_path: Path) -> None:
+    ws = tmp_path.resolve() / "ws"
+    ws.mkdir()
+    alias = str(ws).swapcase()
+    if alias == str(ws) or not os.path.exists(alias) or not os.path.samefile(alias, ws):
+        pytest.skip("this filesystem is case-sensitive: no case alias of a directory exists")
+    assert ws_git.put_parts(ws, alias + "/a/b.txt") == ["a", "b.txt"]
+    assert ws_git.put_parts(Path(alias), str(ws / "a" / "b.txt")) == ["a", "b.txt"]
+    with pytest.raises(WsGitError, match="not inside"):
+        ws_git.put_parts(ws, str(tmp_path.resolve() / "wsx").swapcase() + "/b.txt")
+
+
 def _put(h: ws_git.Hands, src: Path, dest: str) -> int:
     return ws_git.cmd_ws_put(h.home, src, dest)
 

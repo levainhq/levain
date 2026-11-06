@@ -34,6 +34,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
+from levain import pathid
 from levain.authority import (VOICE_KEY_KIND, VOICE_KEY_PROVIDERS, VOICE_KEY_USES, AuthorityError, _thaw, anchor_path,
                               append, prepare, voice_key_for, voice_key_record)
 from levain.authority_sig import VerifierUnavailable
@@ -123,10 +124,12 @@ def checked_security(path: str | Path | None = None) -> str:
     chosen = DEFAULT_SECURITY if path is None else str(path)
     if under_test_run():
         try:
-            real = Path(_REAL_SECURITY).resolve()
-            same = Path(chosen).expanduser().resolve() == real
+            # by the filesystem's own spelling, not the one given: `resolve()` keeps `/USR/BIN/SECURITY` as typed (casesweep
+            # row 14, key 1106-1). DENY direction: a spelling that could not be read refuses (`maybe_same` is True when
+            # either side's resolution was unsure; `canonical` swallows its own failures, so no except can see them).
+            same = pathid.maybe_same(Path(chosen).expanduser(), _REAL_SECURITY)
         except (OSError, RuntimeError):
-            same = True                     # cannot tell: under a test run that is a refusal
+            same = True                     # `~user` that cannot be expanded: cannot tell, so under a test run refuse
         if same:
             raise VoiceKeyRefused("a test reached the real `security` binary: hand in a stand-in")
     return chosen

@@ -867,7 +867,15 @@ def _operand_path(tok: str, ent: Path, first: bool) -> Path | None:
 
 def _lexically_in_root(p: Path, ent: Path) -> bool:
     s = str(p)
-    return any(s == r or s.startswith(r + os.sep) for r in {str(ent), os.path.realpath(ent)})
+    if any(s == r or s.startswith(r + os.sep) for r in {str(ent), os.path.realpath(ent)}):
+        return True
+    # The name stays "lexically" on purpose (a symbol rename is serial-only): the first test is the lexical one, and the
+    # second is the same walk with identity: some ancestor of ``p`` is the install's directory spelled in another case
+    # (casesweep row 8, key 1106-1). Ancestors are taken lexically, so an in-root symlink keeps the pin it has, and each
+    # is compared with ``pathid.maybe_inside`` both ways (the same directory): a pin is protective, so a question the
+    # filesystem would not answer reads "in the install" (DENY direction), never "skip the pin".
+    from levain import pathid
+    return any(pathid.maybe_inside(ent, a) and pathid.maybe_inside(a, ent) for a in (p, *p.parents))
 
 
 _INTERPRETER = re.compile(r"^(python[0-9.]*|pypy[0-9.]*|node|nodejs|deno|bun|ruby|perl|php|sh|bash|zsh|dash|uv|uvx|npx|env)$")

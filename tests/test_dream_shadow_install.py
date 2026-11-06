@@ -601,6 +601,31 @@ def test_a_same_kind_re_enable_with_other_facts_needs_revise_and_a_new_link(env,
     assert da.install_on_input(env["ag"])(_row(spec_hash=second)) is True
 
 
+def test_a_store_marker_refusal_on_a_shadow_enable_is_printed_without_the_revise_advice(env, flow, tmp_path, capsys,
+                                                                                         monkeypatch):
+    # reproduced on 4b00694a (landing 12): the --revise advice was appended to a refusal about the agent store's schema
+    # marker, advice that cannot help there (--revise rewrites a spec; the marker is the store's, not the spec's)
+    import sqlite3
+
+    from levain.agents import role as role_mod
+    from levain.autonomic.db import DB_NAME
+
+    real = role_mod.add_role
+
+    def add_then_move(store, role):
+        out = real(store, role)
+        c = sqlite3.connect(env["ag"] / DB_NAME, isolation_level=None)
+        c.execute("UPDATE meta SET value = 'levain-agent-schema/5' WHERE key = 'agent_schema'")
+        c.close()
+        return out
+
+    monkeypatch.setattr(role_mod, "add_role", add_then_move)
+    assert _enable(env, tmp_path, *_shadow_args(env, flow)) == 1
+    err = capsys.readouterr().err
+    assert "unknown agent schema marker 'levain-agent-schema/5'" in err
+    assert "--revise" not in err and "new signed link" not in err
+
+
 def test_every_bound_fact_moves_the_spec(env, flow, tmp_path):
     base = dict(shadow_flow_root=flow.root, store_path=env["kw"]["store_path"], coord_dir=env["kw"]["coord_dir"],
                 cockpit_root=env["kw"]["cockpit_root"], flow_instructions=env["instr"], zone=ZONE, facts_path=None, model=None,

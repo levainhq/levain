@@ -40,6 +40,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+from levain import pathid
 from levain.firing import hands_login as hl
 from levain.firing.confinement import HandsIdentity
 from levain.hands_mcp import registration_problems
@@ -237,7 +238,9 @@ def store_problem(hands: HandsIdentity) -> str | None:
         return "the operator's home or the hands home could not be resolved"
     if hands.uid == 0 or hands.user in ("", "root"):
         return "the hands account is root"
-    if home == op or home.startswith(op.rstrip("/") + "/") or op.startswith(home.rstrip("/") + "/"):
+    # one home, two roles, in any spelling (casesweep row 12, key 1106-1): ``realpath`` keeps the letter case it is given.
+    # DENY direction: ``pathid.maybe_inside`` both ways is "the same, below or above", and an unanswered stat refuses.
+    if pathid.maybe_inside(op, home) or pathid.maybe_inside(home, op):
         return "the hands home is the operator's own home (or holds, or sits in, it): the operator's store is not touched"
     if not cfg.startswith(home.rstrip("/") + "/"):
         return "the vendor config home is not inside the hands home"

@@ -87,7 +87,6 @@ Known edges:
 from __future__ import annotations
 
 import json
-import os
 import sqlite3
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
@@ -95,6 +94,7 @@ from datetime import timedelta
 from pathlib import Path
 from typing import Any
 
+from levain import pathid
 from levain.autonomic.durable_sqlite import read_transaction, write_transaction
 from levain.coordinator.review import _REF_STORE
 from levain.coordinator.store import CoordError, CoordStore, _append_only, next_gseq
@@ -160,14 +160,11 @@ def _questions(directory: Path) -> Any:
 
 
 def _inside(cwd: str, where: Sequence[dict[str, Any]]) -> bool:
-    """Whether ``cwd`` is, or is under, a repo ``where`` names; both sides by real path (a repo spelled through a link,
-    or macOS's ``/var`` for ``/private/var``, still contains its own real path)."""
-    try:
-        real = os.path.realpath(cwd)
-        repos = [os.path.realpath(w["repo"]) for w in where]
-    except (OSError, ValueError):
-        return False
-    return any(real == r or real.startswith(r.rstrip("/") + "/") for r in repos)
+    """Whether ``cwd`` is, or is under, a repo ``where`` names; both sides by real path and by identity
+    (:func:`levain.pathid.inside`: a repo spelled through a link, or macOS's ``/var`` for ``/private/var``, still
+    contains its own real path, and so does a spelling in another letter case on a case-insensitive volume). True only
+    when sure, so a question that cannot be placed is escalated to the operator, never answered."""
+    return any(pathid.inside(w["repo"], cwd) for w in where)
 
 
 def _verdict(store: Any, conn: sqlite3.Connection, now: str, q: Any, authority: Any) -> Reading:

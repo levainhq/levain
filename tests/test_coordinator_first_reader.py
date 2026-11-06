@@ -370,6 +370,65 @@ def test_a_symlinked_repo_in_the_envelope_still_contains_its_own_real_path(tmp_p
     assert not fr._inside(str(tmp_path), [{"repo": str(link)}])
 
 
+def _case_alias(p):
+    """``p`` spelled with its letters' case swapped, when this filesystem takes that spelling as the same directory (a
+    case-insensitive one: macOS APFS by default); else the test is skipped. A Linux CI job can never red this test."""
+    import os
+    from pathlib import Path
+
+    alias = Path(str(p.resolve()).swapcase())
+    if str(alias) == str(p.resolve()) or not alias.exists() or not os.path.samefile(alias, p):
+        pytest.skip("this filesystem is case-sensitive: no case alias of a directory exists")
+    return alias
+
+
+def test_a_question_asked_from_a_case_alias_of_a_repo_is_inside_it_and_an_outside_alias_is_not(tmp_path):
+    """casesweep 1105-49 rows 6, 6b, 6c (key 1106-1): `realpath` keeps the spelling it is given, so the lexical test
+    said "outside" for a cwd (or a repo) spelled in another case and the question was escalated for nothing. The
+    envelope still contains only what it names: an alias of a directory OUTSIDE every repo stays outside."""
+    repo_dir = tmp_path.resolve() / "repo"
+    (repo_dir / "sub").mkdir(parents=True)
+    other = tmp_path.resolve() / "other"
+    (other / "sub").mkdir(parents=True)
+    a_repo, a_other = _case_alias(repo_dir), _case_alias(other)
+    where = [{"repo": str(repo_dir)}]
+    assert fr._inside(str(repo_dir / "sub"), where)                                        # canonical: unchanged
+    assert not fr._inside(str(other / "sub"), where)
+    assert fr._inside(str(a_repo / "sub"), where)                                          # row 6: cwd in the alias
+    assert fr._inside(str(repo_dir / "sub"), [{"repo": str(a_repo)}])                      # row 6b: repo in the alias
+    assert fr._inside(str(a_repo / "sub"), [{"repo": str(a_repo)}])
+    assert not fr._inside(str(a_other / "sub"), where)                                     # row 6c: still outside
+    assert not fr._inside(str(a_other), [{"repo": str(a_repo)}])
+    assert not fr._inside(str(tmp_path.resolve() / "repox"), [{"repo": str(a_repo)}])      # a prefix sibling
+
+
+def test_the_first_reader_containment_with_an_injected_case_fold_runs_on_any_filesystem(tmp_path, monkeypatch):
+    """The same logic where no alias exists: `pathid._fs_spelling` (the seam) stands in for a case-insensitive volume."""
+    import os
+    from pathlib import Path
+
+    from levain import pathid
+
+    def fold(path):
+        cur = Path(path).anchor or "/"
+        for part in Path(path).parts[1:]:
+            names = os.listdir(cur)
+            hit = part if part in names else next((n for n in names if n.lower() == part.lower()), None)
+            if hit is None:
+                return None
+            cur = os.path.join(cur, hit)
+        return cur
+
+    monkeypatch.setattr(pathid, "_fs_spelling", fold)
+    base = tmp_path.resolve()
+    (base / "repo" / "sub").mkdir(parents=True)
+    (base / "other").mkdir()
+    assert fr._inside(str(base / "REPO" / "Sub"), [{"repo": str(base / "repo")}])
+    assert fr._inside(str(base / "repo" / "sub"), [{"repo": str(base / "REPO")}])
+    assert not fr._inside(str(base / "OTHER"), [{"repo": str(base / "repo")}])
+    assert not fr._inside(str(base / "REPOX"), [{"repo": str(base / "repo")}])
+
+
 # --- C5 fix round 2 (L3 r2): no replay under the dispatch lock; escalate re-reads the question -----------------------
 def _held(monkeypatch, store, act=None):
     """Mark while ``store._write`` holds the dispatch lock; run ``act`` (once) just before it opens."""
