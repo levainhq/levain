@@ -1106,6 +1106,7 @@
       view = null;
     }
     if (roomSection) {
+      if (roomOn() && !token()) { setRoom(false); return; }   // the token went: the protected conversation leaves the page with it
       const wantRoom = !!token() && roomOn() && document.visibilityState !== "hidden";
       roomSection.hidden = !roomOn();
       if (wantRoom && !roomView) {
@@ -1133,6 +1134,13 @@
         ev.stopPropagation();
         setRoom(true);
       } else if (jump || (t && t.closest("[data-mode-tab]"))) setRoom(false);
+    }, true);
+    // a mode shortcut (1-4) that re-selects the mode already showing changes no attribute, so it is caught here: it leaves the Room too
+    document.addEventListener("keydown", (ev) => {
+      if (!roomOn() || ev.metaKey || ev.ctrlKey || ev.altKey || !/^[1-4]$/.test(ev.key)) return;
+      const a = document.activeElement, tag = a && a.tagName;
+      if (tag === "INPUT" || tag === "TEXTAREA" || tag === "SELECT" || (a && a.isContentEditable)) return;
+      setRoom(false);
     }, true);
     document.addEventListener("visibilitychange", sync);
     window.addEventListener("storage", (e) => { if (e.key === WRITE_TOKEN_KEY) sync(); });

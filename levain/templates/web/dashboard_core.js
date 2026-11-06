@@ -6758,7 +6758,7 @@
     grid.dataset.layout = prefs.layout;
     grid.setAttribute("role", "tabpanel");
     drawNeedsList(grid, prefs.tab === "desk" ? desk : items, prefs, rowOf);
-    const kids = [head, needsBar(items), grid];
+    const kids = prefs.tab === "you" ? [head, needsBar(items), grid] : [head, grid];   // the filter chips are the Needs you list's
     if (settled.length) kids.push(answeredSection());
     host.replaceChildren(...kids);
     host.hidden = false;

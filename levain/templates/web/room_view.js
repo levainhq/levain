@@ -355,7 +355,7 @@
       host.appendChild(st.streamBox); host.appendChild(st.cardsBox);
     }
     clear(st.streamBox);
-    if (hooks && hooks.modelSlot) hooks.modelSlot.textContent = m.model;       // the full tab shows the model beside the title
+    if (hooks && hooks.modelSlot) hooks.modelSlot.textContent = m.model || "";       // the full tab shows the model beside the title
     else if (m.model) st.streamBox.appendChild(el(doc, "div", "rv-head", m.model));
     if (m.error) {
       var ban = el(doc, "div", "rv-gap rv-banner");
@@ -415,6 +415,7 @@
     body.addEventListener("scroll", function () { wasEnd = atEnd(); paintJump(); });
     // kept by name so stop() can remove it: a stopped mount left its listener, and the detached tree it held, on the window
     var onResize = function () { if (!stopped && wasEnd) toEnd(); paintJump(); };
+    var onHidden = null, onBlur = null;   // the dictation guards, kept by name so stop() can remove them
     if (root.addEventListener) root.addEventListener("resize", onResize);
     // The phone: the page's height is the VISUAL viewport's (the keyboard shrinks it), so the composer stays above the keyboard.
     // --rv-vvh / --rv-vvt are read by dashboard.css (body.rv-on); rv-kb marks an open keyboard (the app's header yields room to the
@@ -471,7 +472,7 @@
     function paintSend() {
       if (ta.value.trim()) sendB.removeAttribute("aria-disabled"); else sendB.setAttribute("aria-disabled", "true");
       // the slot shows Stop only while a reply can be stopped and nothing is typed: a typed line always gets its Send
-      actions.setAttribute("data-mode", current && current.canStop && !ta.value.trim() ? "stop" : "send");
+      actions.setAttribute("data-mode", current && current.canStop && (!ta.value.trim() || !current.canSend) ? "stop" : "send");
     }
     // Desk: Enter sends, Shift+Enter is a new line. A touch screen keeps Return as a new line and Send as the button. Enter while an
     // input method is composing (isComposing, or keyCode 229 for Safari's out-of-order confirming Enter) belongs to the method.
@@ -642,8 +643,10 @@
       });
       // foreground only: leaving the page ends dictation
       var leave = function () { if (rec) endDictation(); };
-      doc.addEventListener("visibilitychange", function () { if (doc.visibilityState === "hidden") leave(); });
-      root.addEventListener && root.addEventListener("blur", leave);
+      onHidden = function () { if (doc.visibilityState === "hidden") leave(); };
+      onBlur = leave;
+      doc.addEventListener("visibilitychange", onHidden);
+      root.addEventListener && root.addEventListener("blur", onBlur);
     }
 
     var hooks = {
@@ -719,6 +722,8 @@
     pull().then(loop);
     return { stop: function () {
       stopped = true; clearTimeout(timer); endDictation(); if (root.removeEventListener) root.removeEventListener("resize", onResize);
+      if (onHidden) doc.removeEventListener("visibilitychange", onHidden);
+      if (onBlur && root.removeEventListener) root.removeEventListener("blur", onBlur);
       if (vv) {
         vv.removeEventListener("resize", fitViewport); vv.removeEventListener("scroll", fitViewport);
         rootEl.style.removeProperty("--rv-vvh"); rootEl.style.removeProperty("--rv-vvt"); if (doc.body) doc.body.classList.remove("rv-kb");
