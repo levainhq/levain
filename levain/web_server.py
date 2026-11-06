@@ -5606,8 +5606,8 @@ def run_web_server(
     sign_kw: dict[str, Any] = {} if signer is None else {"signer": signer, "extra_hosts": frozenset({sign_host})}
     if room_serve is not None:
         sign_kw["room_serve"] = room_serve
-    if premium_stt:
-        sign_kw["premium_stt"] = True      # hidden for 1.0 (levain.cockpit.voice): only this flag turns the route on
+    if premium_stt is True:
+        sign_kw["premium_stt"] = True    # hidden for 1.0 (levain.cockpit.voice): only a literal True turns the route on
     try:
         # the Coordinator panel's verbs exactly when the watcher below runs beside this server
         httpd = make_server(source, host=host, port=port, chat_host=chat_host, install_class=install_class,
