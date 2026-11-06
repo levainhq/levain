@@ -180,8 +180,34 @@ def test_the_sudoers_step_is_validated_and_scoped_to_the_hands_user(tmp_path: Pa
     # socket levain reads the shell's state back over.
     # Linux (D, Phill 2026-10-09): the runas group is the net group, the one gid the egress boundary lets out.
     runas = f"{h} : {h}_net" if host == "linux" else h
-    assert rules == [f"Defaults>{h} !requiretty", f"Defaults>{h} env_reset",
+    from levain.firing.hands import sudo_knows_requiretty
+    want_rt = [f"Defaults>{h} !requiretty"] if sudo_knows_requiretty() else []
+    assert rules == [*want_rt, f"Defaults>{h} env_reset",
                      f"Defaults>{h} !log_input, !log_output, !use_pty", f"alice ALL=({runas}) NOPASSWD: ALL"]
+
+
+@pytest.mark.parametrize("first,knows", [
+    ("sudo-rs 0.2.8", False),
+    ("Sudo-RS 0.2.8", False),
+    ("Sudo version 1.9.15p5", True),
+    ("Sudo version 1.9.13p3", True),
+    (None, True),
+    ("", True),
+])
+def test_requiretty_line_only_where_sudo_knows_it(first, knows) -> None:
+    from levain.firing.hands import sudo_knows_requiretty
+    assert sudo_knows_requiretty(lambda: first) is knows
+    text = sudoers_text("alice", "_levain_x", requiretty=knows)
+    assert ("!requiretty" in text) is knows
+    # the grant is identical either way
+    assert "alice ALL=(_levain_x) NOPASSWD: ALL" in text and "env_reset" in text
+
+
+def test_unprobeable_sudo_keeps_the_old_line() -> None:
+    from levain.firing.hands import sudo_knows_requiretty
+    def boom():
+        raise OSError("no sudo")
+    assert sudo_knows_requiretty(boom) is True
 
 
 @pytest.mark.skipif(shutil.which("visudo") is None, reason="needs visudo")

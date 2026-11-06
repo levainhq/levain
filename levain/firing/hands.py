@@ -593,14 +593,36 @@ def _operator_name_refused(operator: str) -> bool:
     return not OPERATOR_RE.fullmatch(operator) or is_sudoers_alias(operator)
 
 
-def sudoers_text(operator: str, hands_user: str, net_group: str | None = None) -> str:
+def sudo_knows_requiretty(probe: Callable[[], str | None] | None = None) -> bool:
+    """False only when the installed sudo says it is sudo-rs; an unknown or unprobeable sudo keeps the
+    old behaviour (True). ``probe`` returns the first line of ``sudo --version`` (or None); injected by tests."""
+    if probe is None:
+        def probe() -> str | None:
+            try:
+                r = subprocess.run(["sudo", "--version"], capture_output=True, text=True, timeout=10)
+            except (OSError, subprocess.SubprocessError):
+                return None
+            return r.stdout.splitlines()[0] if r.returncode == 0 and r.stdout else None
+    try:
+        first = probe()
+    except Exception:   # a broken probe is an unprobeable sudo
+        return True
+    return not (first and "sudo-rs" in first.lower())
+
+
+def sudoers_text(operator: str, hands_user: str, net_group: str | None = None, *,
+                 requiretty: bool | None = None) -> str:
     if _operator_name_refused(operator):
         raise HandsSetupError(f"refusing the account name {operator!r}: it could change meaning in a sudoers rule")
+    if requiretty is None:
+        requiretty = sudo_knows_requiretty()
     return (
         f"# Written by `levain setup-isolation`; removed by `levain setup-isolation --undo`.\n"
         f"# {operator} may run commands as the Levain hands user {hands_user}, and nothing else.\n"
-        f"Defaults>{hands_user} !requiretty\n"
-        f"Defaults>{hands_user} env_reset\n"
+        # sudo-rs (Ubuntu 26.04) has no requiretty option and visudo rejects it as unknown; it never
+        # enforces requiretty, so leaving the line out there loses nothing.
+        + (f"Defaults>{hands_user} !requiretty\n" if requiretty else "")
+        + f"Defaults>{hands_user} env_reset\n"
         # levain hands bash a socket on stdin and reads its state back over it; I/O logging and a
         # pseudo-terminal would put sudo's own pipe or pty there instead (S2 L2b L3).
         f"Defaults>{hands_user} !log_input, !log_output, !use_pty\n"
