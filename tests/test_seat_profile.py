@@ -43,7 +43,7 @@ def test_builds_and_shapes(rig):
     p = build(rig)
     base, keys, _ = rig
     s = p.settings
-    assert p.tools == hg.CC_SEAT_TOOLS == ("Bash", "Read", "Edit", "Write")
+    assert p.tools == hg.CC_SEAT_TOOLS == ("Bash", "Read", "Edit", "Write", "NotebookEdit", "Glob", "Grep")
     sb = s["sandbox"]
     assert sb["network"]["allowLocalBinding"] is False and sb["network"]["strictAllowlist"] is True
     assert sb["network"]["allowedDomains"] == []
@@ -90,7 +90,7 @@ def test_argv_and_digest(rig):
     a = p.argv()
     assert "-p" not in a
     assert a[1:3] == list(hg.SEAT_SOURCE_ARGS) and a[3] == "--restricted"   # L3 z1 r1 codex 2: file tools confined
-    assert a[a.index("--tools") + 1] == "Bash,Read,Edit,Write"
+    assert a[a.index("--tools") + 1] == "Bash,Read,Edit,Write,NotebookEdit,Glob,Grep"
     assert "--strict-mcp-config" in a and a[a.index("--permission-mode") + 1] == "acceptEdits"
     h = p.argv(headless=True, model="haiku")
     assert "-p" in h and h[-2:] == ["--model", "haiku"]
