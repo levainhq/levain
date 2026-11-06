@@ -29,7 +29,7 @@ A flaw in any of these, reachable by someone who is not already entitled to do t
 - **Signing:** a signed answer or grant that verifies when it should not, or one that fails to verify when it should.
   The signature namespaces are listed in [`docs/contracts.md`](docs/contracts.md) §F11.
 - **The cockpit and pairing:** a way to use a cockpit surface, or a paired device, without the pairing, token or passkey step
-  that surface asks for.
+  that surface should require.
 - **The sandbox and confinement:** a way out of the OS sandbox or the confinement floor that the documentation says holds.
 - **Memory governance:** a path into long-term memory that the governed write path was meant to refuse.
 
@@ -42,5 +42,5 @@ A flaw in any of these, reachable by someone who is not already entitled to do t
   README describes under *Boundaries, kept honest*).
 - Vulnerabilities in Claude Code, Codex, `anneal-memory` or another dependency: report those to their owners. How Levain
   uses a dependency, or fails to guard against its failure where this policy says it does, is in scope.
-- Findings that need some other process already running as your own OS user (not the confined agent or entity that
-  the in-scope items above are about), or physical access to an unlocked machine you are already signed in to.
+- Findings that need some other process already running as your own OS user (an agent that Levain is set up to govern is
+  not "some other process"), or physical access to an unlocked machine you are already signed in to.
