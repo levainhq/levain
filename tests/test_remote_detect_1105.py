@@ -13,6 +13,8 @@ import subprocess
 
 import pytest
 
+from levain import band_view
+
 from levain.cockpit.keys import KeyError_
 from levain.consent import band as consent_band
 from levain.consent import terminal_sign as ts
@@ -209,7 +211,11 @@ def test_real_ps_rows_reads_a_table_in_this_environment():
     import os
 
     text = REAL_PS_ROWS()
-    assert text is not None and str(os.getpid()) in {line.split()[0] for line in text.splitlines()[1:] if line.split()}
+    if text is None:
+        import pytest
+
+        pytest.skip("ps is not runnable in this sandbox (L3 remotegov r1 complement LOW); the detector treats that as local")
+    assert str(os.getpid()) in {line.split()[0] for line in text.splitlines()[1:] if line.split()}
 
 
 # --- (iii) is_remote() with no arguments sees the environment and the ancestry -------------------------------------
@@ -261,7 +267,7 @@ def test_sign_names_the_leg_that_fired_in_its_detail():
 
 # --- (iv) the end to end: the real _seat_answer for a desk attached from ssh, SSH_* absent from its env --------------
 
-WHERE_TO_SIGN = "sign it on your phone: open the card in the cockpit"
+NO_CARD_PROMISE = "sign it on your phone"      # the echo promises a card only where one exists (none is filed here yet)
 
 
 def run_seat(monkeypatch, store, env, keydir, rows):
@@ -286,17 +292,18 @@ def run_seat(monkeypatch, store, env, keydir, rows):
         outcomes.append(out)
         return out
     monkeypatch.setattr(ts, "sign", spy)
-    echo = seat(store, env, "1a", keydir, sheet, environ=environ)
+    # the hook payload's session id is the desk's own (the harness's fake "seat-1" would rightly lose the attach leg)
+    echo = band_view._seat_answer(store, VIEWER, "1a", environ, None, session=SID, signer_factory=sheet, key_dir=keydir)
     return echo, sheet_calls, outcomes
 
 
-def test_attached_from_ssh_desk_never_reaches_the_sheet_and_says_where_to_sign(monkeypatch, store, env, keydir):
+def test_attached_from_ssh_desk_never_reaches_the_sheet_and_promises_no_card(monkeypatch, store, env, keydir):
     echo, sheet_calls, outcomes = run_seat(monkeypatch, store, env, keydir, SSH_ATTACH_ROWS)
     assert sheet_calls == []                                                   # no Touch ID sheet on the laptop
     assert ts.post_notice.posted == []                                         # and no notice that announces one
     assert recorded(store) == [(1, "fix")]                                     # recording is unchanged
     assert [(r[5], r[6]) for r in sidecar(store)] == [("unsigned", "remote")]
-    assert "recorded UNSIGNED (the desk is remote" in echo and WHERE_TO_SIGN in echo
+    assert "recorded UNSIGNED (the desk is remote" in echo and NO_CARD_PROMISE not in echo
     assert [(o.state, o.reason) for o in outcomes] == [("unsigned", "remote")]
     assert "attach client 1e37cf45 reached from sshd-session" in outcomes[0].detail
 
@@ -307,7 +314,7 @@ def test_the_same_desk_with_a_local_attach_client_calls_the_signer_once(monkeypa
     assert len(ts.post_notice.posted) == 1
     assert recorded(store) == [(1, "fix")]
     assert [(r[5], r[6]) for r in sidecar(store)] == [("unsigned", "timeout")]
-    assert "no touch in time" in echo and WHERE_TO_SIGN not in echo
+    assert "no touch in time" in echo and NO_CARD_PROMISE not in echo
     assert [o.reason for o in outcomes] == ["timeout"]
 
 
@@ -320,5 +327,29 @@ def test_ssh_run_with_the_env_scrubbed_never_reaches_the_sheet(monkeypatch, stor
         calls.append("x")
         raise AssertionError("the sheet was reached")
     echo = seat(store, env, "1a", keydir, sheet, environ={**env})
-    assert calls == [] and recorded(store) == [(1, "fix")] and WHERE_TO_SIGN in echo
+    assert calls == [] and recorded(store) == [(1, "fix")] and NO_CARD_PROMISE not in echo
     assert [(r[5], r[6]) for r in sidecar(store)] == [("unsigned", "remote")]
+
+
+def test_an_explicit_session_id_beats_a_missing_or_stale_env_one(monkeypatch):
+    """L3 remotegov r1 codex MED: the hook payload's session id is the authoritative one; the env variable may be absent or stale
+    in a daemon-backed desk. Red with: remote_reason ignoring its session_id argument."""
+    use_ancestry(monkeypatch, DESK)
+    use_ps(monkeypatch, SSH_ATTACH_ROWS)
+    assert ts.remote_reason({}, None, SID) is not None                         # no env id at all: the argument finds the client
+    assert ts.remote_reason({"CLAUDE_CODE_SESSION_ID": "ffffffff-0000"}, None, SID) is not None   # a stale env id loses to it
+    assert ts.remote_reason({}, None, None) is None
+
+
+def test_the_ancestry_walk_stops_at_the_first_remote_ancestor(monkeypatch):
+    """L3 remotegov r1 complement LOW: every local prompt paid for the whole walk. Red with: the list built before the scan."""
+    pulled: list[int] = []
+
+    def chain():
+        for i, args in enumerate([["sshd-session:", "u@ttys1"], ["zsh"], ["launchd"]]):
+            pulled.append(i)
+            yield args
+
+    monkeypatch.setattr(ts, "_ancestor_commands", chain)
+    assert ts.remote_reason({}, None, None) is not None
+    assert pulled == [0]

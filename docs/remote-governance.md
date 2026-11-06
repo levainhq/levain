@@ -32,10 +32,8 @@ leg, and nothing raises (`::test_ps_that_fails_or_times_out_is_not_remote`, `::t
 "local" raises a sheet nobody touches, which times out, and a false "remote" costs one signature on the phone.
 
 What a remote desk changes is the sheet and the words, nothing else. The answer is still recorded and the row still
-closes, with sign state `unsigned/remote` (`::test_attached_from_ssh_desk_never_reaches_the_sheet_and_says_where_to_sign`;
-the kernel principle, quoted in `band_view`, is that signing never blocks recording). The echo now says where to sign:
-`recorded UNSIGNED (the desk is remote, so no Touch ID prompt was raised; sign it on your phone: open the card in the
-cockpit)`. The outcome's `detail` names the leg that fired, in process only: the answer's stored sidecar keeps the
+closes, with sign state `unsigned/remote` (`::test_attached_from_ssh_desk_never_reaches_the_sheet_and_promises_no_card`;
+the kernel principle, quoted in `band_view`, is that signing never blocks recording). The echo is unchanged, `recorded UNSIGNED (the desk is remote, so no Touch ID prompt was raised)`, and promises no phone card: a card for a Levain-store answer needs a producer and a consumer that do not exist yet (`::test_attached_from_ssh_desk_never_reaches_the_sheet_and_promises_no_card` pins the absence of the promise). The outcome's `detail` names the leg that fired, in process only: the answer's stored sidecar keeps the
 reason (`remote`), not the detail.
 
 ## The surfaces
@@ -43,9 +41,9 @@ reason (`remote`), not the detail.
 | surface | how it is detected | a band answer typed there | ungoverned |
 |---|---|---|---|
 | local terminal | no leg fires (`::test_local_terminal_ancestry_is_not_remote`) | Touch ID sheet on the laptop; signed if touched, else `unsigned/timeout`; recorded either way (`::test_the_same_desk_with_a_local_attach_client_calls_the_signer_once`) | nothing new: the signature is the only evidence, the typed line is the operator's |
-| `claude` run over ssh | env leg (`SSH_CONNECTION`, `SSH_CLIENT`, `SSH_TTY` all reached the hook, `[judged by levain 41, 2026-11-05, against F2 in RETURN_remotegov_m1.md]`), and the ancestry leg when the env is scrubbed (`::test_ssh_run_with_the_env_scrubbed_never_reaches_the_sheet`) | no sheet; recorded `unsigned/remote`; echo names the phone | the answer is recorded unsigned, so the row closes without a signature |
+| `claude` run over ssh | env leg (`SSH_CONNECTION`, `SSH_CLIENT`, `SSH_TTY` all reached the hook, `[judged by levain 41, 2026-11-05, against F2 in RETURN_remotegov_m1.md]`), and the ancestry leg when the env is scrubbed (`::test_ssh_run_with_the_env_scrubbed_never_reaches_the_sheet`) | no sheet; recorded `unsigned/remote`; the echo says only that it is unsigned and why | the answer is recorded unsigned, so the row closes without a signature |
 | `claude` run over mosh | the same env names (inherited from the ssh bootstrap, stale after a roam: `[judged by levain 41, 2026-11-05, against F2]`) and the ancestry leg through `mosh-server`, which is reparented to launchd with no sshd in the chain (`::test_ancestry_with_mosh_server_is_remote_with_env_scrubbed`) | as above | as above; tmux or screen on top of either was not measured |
-| `claude attach <id>` from ssh (the desk) | the attach-client leg: the hook runs in the daemon-spawned desk, whose environment and ancestry never mention the client, so the client is found by its `ps` row (`::test_attach_client_under_sshd_makes_the_session_remote`, end to end `::test_attached_from_ssh_desk_never_reaches_the_sheet_and_says_where_to_sign`) | as above | an attach by id from mosh reads the same way (`::test_attach_client_under_mosh_server_makes_the_session_remote`) but was not run for real; two clients on one desk read remote if ANY is remote (`::test_two_clients_one_local_one_remote_reads_remote`), so a laptop answer typed while an ssh client is also attached is routed to the phone |
+| `claude attach <id>` from ssh (the desk) | the attach-client leg: the hook runs in the daemon-spawned desk, whose environment and ancestry never mention the client, so the client is found by its `ps` row (`::test_attach_client_under_sshd_makes_the_session_remote`, end to end `::test_attached_from_ssh_desk_never_reaches_the_sheet_and_promises_no_card`) | as above | an attach by id from mosh reads the same way (`::test_attach_client_under_mosh_server_makes_the_session_remote`) but was not run for real; two clients on one desk read remote if ANY is remote (`::test_two_clients_one_local_one_remote_reads_remote`), so a laptop answer typed while an ssh client is also attached is routed to the phone |
 | `claude attach <name>` | NOT detected: a client attached by name carries no session id in its argv (`::test_a_client_without_a_matching_id_in_argv_is_not_seen`) | read as local: the sheet opens on the laptop and times out; recorded `unsigned/timeout` | the whole surface: a name-attached remote client is as before this change |
 | Claude mobile (Anthropic's remote control) | NOT detected by levain: no leg looks for it. Flow classifies a `queued` turn with `queueSkipSlashCommands` as remote control (flow decides; `[judged by levain 41, 2026-11-05, against the quoted peer_roster lines in RETURN_remotegov_m1.md F3]`) | not measured: whether such a turn reaches `levain.band_hook` as a prompt, and with what environment, is UNMEASURED | all of it; levain does not govern this input. The repo only lists `--remote-control` among the claude flags it passes through (`levain/consent/delivery.py`) |
 | the cockpit on his phone | not a terminal: a click on a row goes through the cockpit, not the hook. A row carries a passkey sign card only where a producer filed a sign request (`Question.sign_request`; flow files them for its own band, levain files only `LEVAIN_SIGN_REQUESTS`' one review-clear grammar) `[judged by levain 41, 2026-11-05, against F4 in RETURN_remotegov_m1.md]` | Face ID passkey on the phone, where a card exists | a levain-store band row has no phone sign card today (no terminal-answer grammar in `LEVAIN_SIGN_REQUESTS`), so "sign it on your phone" is true only for rows a producer has filed |
@@ -53,13 +51,14 @@ reason (`remote`), not the detail.
 ## Away and sleep: not this repo's half
 
 Whether a typed turn ends the away or sleep presence is counted by flow, not here: flow's `peer_roster` stamps the
-turn (`last_laptop_human`) and `phone_bridge` publishes it to levain, which stores it and reads it back as `desk_msg_at`
-(`levain/webpush/desk.py` `note_desk_message`, `levain/webpush/intent.py`). An ssh-, mosh- or attach-typed turn into
-the desk session DOES end away and sleep today: nothing in the transcript tells those turns apart from a laptop-typed
-one, so flow reads them all as him at the laptop
-`[judged by levain 41, 2026-11-05, against F3 and F5 in RETURN_remotegov_m1.md]`. The fix is a flow seat's (mark the
-turn by the hook's `prompt_id`, which equals the transcript's `promptId`); it is not done here, and this change does not
-alter `desk_msg_at`.
+turn and `phone_bridge` publishes it to levain, which stores it and reads it back as `desk_msg_at`
+(`levain/webpush/desk.py` `note_desk_message`, `levain/webpush/intent.py`). Before flow's `remote_stamp`, an ssh-, mosh- or
+attach-typed turn into the desk session ended away and sleep, because nothing in the transcript tells those turns apart
+from a laptop-typed one `[measured by levain 41, 2026-11-05, F3 and F5 in RETURN_remotegov_m1.md]`. Flow's own hook now
+stamps each prompt this repo's detector (`terminal_sign.is_remote`) calls remote, keyed by the hook's `prompt_id`, which
+equals the transcript's `promptId`, and `peer_roster` reads a stamped turn as `last_remote_terminal`, not the laptop's
+keyboard `[judged by levain 41, 2026-11-05, against flow main 4eaa53fb: scripts/remote_stamp.py and scripts/termsign_hook.py]`.
+That half is flow's and its tests are flow's; this repo's part is only that the detector it asks now sees an attached desk.
 
 ## Known edges
 

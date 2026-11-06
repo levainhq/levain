@@ -30,7 +30,7 @@ import stat
 import subprocess
 import sys
 import unicodedata
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -723,15 +723,15 @@ def _remote_process_name(args: Sequence[str]) -> str | None:
     return name if name in REMOTE_PROCESSES else None
 
 
-def _ancestor_commands() -> list[list[str]]:
+def _ancestor_commands() -> Iterable[list[str]]:
     """This process's ancestors' command lines, nearest first: the one walker in :mod:`levain.consent.band`
     (``_ancestors``, ``ps -o args=``, its own hop cap). A tests' seam; an unreadable ancestry is an empty list."""
     try:
         from levain.consent import band
 
-        return [list(args) for _pid, args in band._ancestors()]
+        return (list(args) for _pid, args in band._ancestors())      # lazy: the caller stops at the first match
     except Exception:  # noqa: BLE001 - routing never raises; no ancestry reads as local
-        return []
+        return iter(())
 
 
 def _ps_rows() -> str | None:
@@ -798,7 +798,8 @@ def _attach_remote_reason(session_id: str) -> str | None:
     return None
 
 
-def remote_reason(env: Mapping[str, str] | None = None, presence: str | None = None) -> str | None:
+def remote_reason(env: Mapping[str, str] | None = None, presence: str | None = None,
+                  session_id: str | None = None) -> str | None:
     """Routing only (never evidence): why this desk is remote, in a few words that name the leg, or ``None``.
     Remote when ANY of: the presence says so; ``env`` holds ``SSH_CONNECTION``, ``SSH_TTY`` or ``SSH_CLIENT``
     (:data:`_SSH_ENV_NAMES`, exact names); an ancestor of this process is ``sshd``, ``sshd-session`` or
@@ -823,9 +824,9 @@ def remote_reason(env: Mapping[str, str] | None = None, presence: str | None = N
     except Exception:  # noqa: BLE001
         pass
     try:
-        session_id = env.get(SESSION_ID_ENV) or ""
-        if isinstance(session_id, str) and session_id:
-            return _attach_remote_reason(session_id)
+        sid = session_id if isinstance(session_id, str) and session_id else env.get(SESSION_ID_ENV) or ""
+        if isinstance(sid, str) and sid:
+            return _attach_remote_reason(sid)
     except Exception:  # noqa: BLE001
         pass
     return None

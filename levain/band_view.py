@@ -779,7 +779,7 @@ class Signing:
 
 _SIGN_WORDS = {
     "no-key": "terminal signing is not set up (levain band terminal-key create)",
-    "remote": "the desk is remote, so no Touch ID prompt was raised; sign it on your phone: open the card in the cockpit",
+    "remote": "the desk is remote, so no Touch ID prompt was raised",
     "unavailable": "Touch ID was unavailable",
     "cancelled": "you cancelled Touch ID",
     "timeout": "no touch in time",
@@ -1951,7 +1951,7 @@ def _terminal_signer(store: QuestionStore, viewer: str, prompt: str, plan: Parse
                            versions=info_ids)
         if on_sign is not None:
             on_sign()
-        why_remote = ts.remote_reason(environ)
+        why_remote = ts.remote_reason(environ, session_id=session)
         remote = why_remote is not None
         if not remote:
             try:
