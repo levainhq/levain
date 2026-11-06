@@ -39,6 +39,12 @@ def test_engine_rows_carry_section_and_carried_and_a_legacy_question_draws_none(
     assert "question_section" not in _question_row_in(foreign).facets
 
 
+def test_a_non_boolean_carried_drops_the_facet_instead_of_coercing() -> None:
+    f = _question_row_in(_q(5, section="desk", carried="false")).facets
+    assert "question_carried" not in f and "question_section" not in f
+    validate_facets(f)
+
+
 def test_the_page_split_tags_and_counts_open_rows() -> None:
     node = shutil.which("node")
     if node is None:

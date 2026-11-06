@@ -539,7 +539,11 @@ def _question_row_in(q: Any) -> RowIn:
     section = getattr(q, "section", "")
     if section in ("you", "desk"):
         facets["question_section"] = section
-        facets["question_carried"] = bool(getattr(q, "carried", False))
+        carried = getattr(q, "carried", False)
+        if isinstance(carried, bool):     # a real boolean only: a string "false" is truthy, so anything else drops the facet
+            facets["question_carried"] = carried
+        else:
+            del facets["question_section"]
     _sign_facet(facets, q)
     return RowIn(id=f"{QUESTION_ROW_PREFIX}{q.n}", title=f"{agent} · question #{q.n}", facets=facets,
                  stored={"n": q.n, "answered_at": q.answer.answered_at if answered else "open"})

@@ -3,6 +3,7 @@ band number, the first sentence (clamped to 2 lines) and its blocks line; it hol
 focus view (today's detail). The voice button is not built: the cockpit's speak route reads a room reply by its gseq, not a band row."""
 from __future__ import annotations
 
+import dataclasses
 import json
 import os
 from pathlib import Path
@@ -59,3 +60,19 @@ def test_a_click_on_a_card_opens_the_focus_view(tmp_path: Path, monkeypatch) -> 
             {"do": click, "until": "document.querySelectorAll('#levain-modal .needs-question .question-option').length === 3"},
             {"eval": "document.querySelectorAll('#levain-modal .question-option').length"}])["values"]
     assert vals[-1] == len(LONG_OPTS)
+
+
+@needs_browser
+def test_a_read_only_surface_with_no_band_transport_still_draws_the_cards(tmp_path: Path, monkeypatch) -> None:
+    """codex HIGH: a read-only manifest surface passes no bandRead; the cards then draw without band numbers, never an error."""
+    _file(tmp_path, monkeypatch)
+    _root, src, _ids = _install(tmp_path)
+    src = dataclasses.replace(src, write_scope=None)      # a read-only surface: dashboard_boot passes no bandRead
+    probe = (f"JSON.stringify({{n: {ROWS}.length, err: /could not|error/i.test(document.getElementById('ck-needs').innerText),"
+             f" bands: {ROWS}.map(r => (r.querySelector('.needs-row-band') || {{}}).textContent || '')}})")
+    with _serve(src, surface_tokens={"browser": "T"}, install_class="reported") as (url, _httpd):
+        vals = _drive(tmp_path, f"{url}/", [{"emulate": SIZES[0][1]}, {"until": f"{ROWS}.length === 3", "ms": 20000},
+                                            {"eval": "new Promise(r => setTimeout(() => r(1), 600))"}, {"eval": probe}])["values"]
+    got = json.loads(next(v for v in vals if isinstance(v, str) and v.startswith("{")))
+    assert got["n"] == 3 and not got["err"], got
+    assert all(b == "" for b in got["bands"]), got           # no transport, no numbers

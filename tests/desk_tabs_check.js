@@ -14,5 +14,16 @@ check(r.desk === 2, "desk-owes counts open desk rows incl. carried: " + r.desk);
 check(r.show === true, "strip shows when a desk row exists");
 check(C.deskTabs([q("you", "open"), q("", "open")]).show === false, "no desk row: no strip");
 check(C.deskTabs([{ question: { state: "open" } }]).show === false, "no section facet: no strip");
+// the tabs and counts come from the FULL row set; the chosen tab's rows are what is cut to a page (codex MED 3)
+const many = []; for (let i = 0; i < 10; i++) many.push(q("you", "open")); many.push(q("desk", "open"));
+let pg = C.deskTabPage(many, "you", 10);
+check(pg.dt.show === true && pg.dt.desk === 1 && pg.dt.you === 10, "11 rows, row 11 desk: tabs show, counts " + pg.dt.you + "/" + pg.dt.desk);
+check(pg.shown.length === 10 && pg.total === 10, "you tab holds its 10 rows");
+pg = C.deskTabPage(many, "desk", 10);
+check(pg.shown.length === 1 && pg.tags[0] === "desk", "desk tab holds the 11th row");
+const desks = []; for (let i = 0; i < 15; i++) desks.push(q("desk", "open"));
+pg = C.deskTabPage(desks, "desk", 10);
+check(pg.dt.desk === 15 && pg.shown.length === 10 && pg.total === 15, "15 desk rows: label counts 15, page cuts to 10");
+check(C.deskTabPage([q("you", "open")], "you", 10).dt.show === false, "no desk row: plain cut, no tabs");
 console.log(failures === 0 ? "ALL PASS" : failures + " FAILED");
 process.exit(failures === 0 ? 0 : 1);

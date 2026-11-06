@@ -4743,6 +4743,10 @@
   // (unsigned, a human channel): an authority item is listed and says it opens its signing sheet. Every string is drawn with
   // textContent, never as HTML.
   const bandNumOf = new Map();    // question n -> band number, from the last band read: a question row leads with it
+  // the cards' own copy of the band numbers (bandNumOf also feeds needsName's title, which must not change when a card reads the band)
+  const cardBandOf = new Map();
+  let cardBandSeq = 0;      // the render whose band read may still set cardBandOf (a superseded response is ignored)
+  const cardBandNum = (n) => { const k = Number(n); return bandNumOf.has(k) ? bandNumOf.get(k) : cardBandOf.get(k); };
   let bandKeep = "";              // what the last send said about refusals and sheets: a redraw gives it back until the next send
   let bandGot = null;             // the last read, shared for a moment by the slots one render draws (the server takes one at a time)
   function bandFetch(fresh) {
@@ -6419,12 +6423,19 @@
   // The card face's words: the first sentence of the question (CSS clamps it to two lines); a text with no sentence end is whole.
   function needsFirstSentence(what) {
     const t = String(what || "").replace(/\s+/g, " ").trim();
-    const m = /^(.+?[.!?])(?:\s|$)/.exec(t);
-    return m ? m[1] : t;
+    // a sentence ends at . ! ? followed by a space (or at once by a capital: "Which way?Really."), but not after a title or
+    // an abbreviation (Dr. Mr. Mrs. Ms. e.g. i.e. etc. vs.)
+    const abbr = /(?:^|[\s(])(?:Dr|Mr|Mrs|Ms|St|vs|etc|approx|e\.g|i\.e)\.$/i;
+    const re = /[.!?](?=\s|$|[A-Z])/g;
+    let m;
+    while ((m = re.exec(t))) {
+      if (m.index === 0) continue;
+      const head = t.slice(0, m.index + 1);
+      if (m[0] === "." && abbr.test(head)) continue;
+      return head;
+    }
+    return t;
   }
-  // the cards' own copy of the band numbers (bandNumOf also feeds needsName's title, which must not change when a card reads the band)
-  const cardBandOf = new Map();
-  const cardBandNum = (n) => { const k = Number(n); return bandNumOf.has(k) ? bandNumOf.get(k) : cardBandOf.get(k); };
   function needsRow(it) {
     const row = el("button", "needs-row" + (it.kind === "consent" ? " needs-consent" : " needs-question"));
     row.type = "button";
@@ -6593,12 +6604,22 @@
     host.replaceChildren(...kids);
     host.hidden = false;
     // the cards lead with their band number: the band read gives it (the Decisions panel's own slot may not be drawn on this tab)
-    if (items.some((it) => it.kind === "question")) {
-      bandFetch(false).then((b) => {
+    // (no band transport on a read-only manifest surface: the cards then draw without numbers)
+    if (typeof bandRead === "function" && items.some((it) => it.kind === "question")) {
+      const seq = ++cardBandSeq;
+      let p = null;
+      try { p = bandFetch(false); } catch (e) { p = null; }
+      if (p && typeof p.then === "function") p.then((b) => {
+        if (seq !== cardBandSeq) return;     // a newer render's read owns the numbers now
         const list = b && Array.isArray(b.items) ? b.items : [];
+        cardBandOf.clear();
         for (const x of list) if (x && Number.isInteger(x.question) && x.n !== undefined) cardBandOf.set(x.question, x.n);
         applyBandNumbers();
-      }, () => {});
+      }, (e) => {
+        if (/no question store/.test(e && e.message ? String(e.message) : "")) return;     // nothing to retry on a cockpit without one
+        // a refused or busy read is not "done": the next render draws the strip again and asks again
+        if (seq === cardBandSeq && host.dataset.sig === sig) delete host.dataset.sig;
+      });
     }
     host.dataset.sig = sig;   // only a strip that was drawn is recorded as drawn: a build that threw is tried again at the next render
   }
@@ -7804,7 +7825,7 @@
     return f;
   }
 
-  function appendExternalLines(host, lines) {
+  function appendExternalLines(host, lines, tabInfo) {
     let lastGroup = null;
     // the Decisions panel's proposal cards (see renderExternalBody) follow the live requests, which are on a clock, and come
     // before the decided ones: ahead of the first "Resolved" / "Outcomes" heading, else after the last row
@@ -7816,7 +7837,10 @@
     let slotDue = !!(owner && !host.querySelector(".proposal-slot"));
     const eagerQ = newestAnswered(lines, ANSWERED_ROWS_EAGER);
     // the Decisions card's two tabs (Needs you / Desk owes) when the rows carry a desk section: each row is tagged here, the strip is drawn after
-    const dt = window.LevainCardFormat && typeof window.LevainCardFormat.deskTabs === "function" ? window.LevainCardFormat.deskTabs(lines) : null;
+    // (cockpit_view hands over the classification of ALL the filtered rows and the page of the chosen tab: tags align with `lines`)
+    const CF = window.LevainCardFormat;
+    const dt = tabInfo && tabInfo.dt ? Object.assign({}, tabInfo.dt, { tags: tabInfo.tags })
+      : (CF && typeof CF.deskTabs === "function" ? CF.deskTabs(lines) : null);
     const tabbed = !!(dt && dt.show);
     const firstAt = host.children.length;
     let li = -1;
@@ -7858,13 +7882,14 @@
       mark(row);
     }
     if (slotDue) host.appendChild(standingSlots());
-    if (tabbed) drawDeskTabs(host, firstAt, dt);
+    if (tabbed) drawDeskTabs(host, firstAt, dt, tabInfo && tabInfo.onTab);
   }
 
   // The Decisions card's in-card tabs: "Needs you (n)" first and the default, "Desk owes (n)" second. A row tagged "both" (a desk row
   // carried past a day) shows under each; an untagged node (a heading, a proposal card) is "you", a heading following its rows' tags.
-  const deskTabChoice = { at: "you" };
-  function drawDeskTabs(host, firstAt, dt) {
+  function drawDeskTabs(host, firstAt, dt, onTab) {
+    const CF = window.LevainCardFormat;
+    const choice = () => (CF && typeof CF.getDeskTab === "function" ? CF.getDeskTab() : "you");
     const kids = Array.from(host.children).slice(firstAt);
     let head = null, seen = null;
     const seal = () => { if (head) head.dataset.deskTab = seen.size > 1 || seen.has("both") ? "both" : (Array.from(seen)[0] || "you"); };
@@ -7880,13 +7905,13 @@
       const b = el("button", "ck-tab", text);
       b.type = "button";
       b.setAttribute("role", "tab");
-      b.addEventListener("click", () => { deskTabChoice.at = key; apply(); });
+      b.addEventListener("click", () => { if (CF && CF.setDeskTab) CF.setDeskTab(key); if (onTab) onTab(); else apply(); });
       nav.appendChild(b);
       return [key, b];
     });
     const apply = () => {
-      for (const [key, b] of buttons) b.setAttribute("aria-selected", key === deskTabChoice.at ? "true" : "false");
-      for (const k of kids) k.classList.toggle("ck-dtab-off", k.dataset.deskTab !== "both" && k.dataset.deskTab !== deskTabChoice.at);
+      for (const [key, b] of buttons) b.setAttribute("aria-selected", key === choice() ? "true" : "false");
+      for (const k of kids) k.classList.toggle("ck-dtab-off", k.dataset.deskTab !== "both" && k.dataset.deskTab !== choice());
     };
     host.insertBefore(nav, kids[0] || null);
     apply();

@@ -615,7 +615,23 @@
     return out;
   }
 
-  const api = { deskTabs, preferFull, usesFull, setCommandBlock, linkRuns, installFieldGrow, grow, FREE_TEXT, collapse, sections, headline, optionRows, words, repeatsRows, fullOptions, parseMessage, looseCard, openUntil, drawHead, drawDetail, drawBody };
+  // The tab choice, one cell: only the Decisions lines carry a desk section, so the card and its focus view share it.
+  let deskAt = "you";
+  const getDeskTab = () => deskAt;
+  const setDeskTab = (k) => { deskAt = k === "desk" ? "desk" : "you"; };
+  // One screenful of the SELECTED tab, from the FULL row set: the tabs, their counts and the Decisions label come from every
+  // filtered row, then the chosen tab's rows are cut to `cap`. {dt, shown, total, tags}: dt is deskTabs(all); shown is the page of
+  // rows; tags are those rows' tab tags (for the drawer); total is the chosen tab's row count. dt.show false: no tabs, the plain cut.
+  function deskTabPage(all, at, cap) {
+    const dt = deskTabs(all);
+    if (!dt.show) return { dt, shown: all.slice(0, cap), total: all.length, tags: null };
+    const pick = [];
+    all.forEach((ln, i) => { if (dt.tags[i] === "both" || dt.tags[i] === at) pick.push(i); });
+    const cut = pick.slice(0, cap);
+    return { dt, shown: cut.map((i) => all[i]), total: pick.length, tags: cut.map((i) => dt.tags[i]) };
+  }
+
+  const api = { deskTabPage, getDeskTab, setDeskTab, deskTabs, preferFull, usesFull, setCommandBlock, linkRuns, installFieldGrow, grow, FREE_TEXT, collapse, sections, headline, optionRows, words, repeatsRows, fullOptions, parseMessage, looseCard, openUntil, drawHead, drawDetail, drawBody };
   if (typeof module === "object" && module.exports) module.exports = api;
   else root.LevainCardFormat = api;
 })(typeof window !== "undefined" ? window : this);
