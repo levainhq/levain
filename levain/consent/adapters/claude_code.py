@@ -906,7 +906,23 @@ def decide(event: Any, queue: ConsentQueue, settings: AdapterSettings, *, enviro
     out = decide_ex(event, queue, settings, environ=environ, home=home, claude_pid=claude_pid, launch_nonce="",
                     contained_launch=None, **kw)
     if isinstance(out, Decided):
-        return hook_output(out.decision)
+        answer = hook_output(out.decision)
+        # A PermissionRequest decision files its decision-time ledger row here (1106-51), EXCEPT a gate-take: the
+        # request the PreToolUse gate filed (event id ``hook:<tool_use_id>``; this event's own request is ``rand:``)
+        # already has the row `_gate_call`'s ``deliver`` wrote, so a second one would count the call twice.
+        # Known edge (pinned in tests/test_consent_cc_permreq_ledger.py): a PermissionRequest event carries no
+        # tool_use_id, so with PostToolUse also wired the later post row cannot join this one: one call counts twice.
+        # Timing: the write is on the answer's path, bounded as `_gate_call`'s ``deliver`` is (same note-then-return
+        # order): the ledger sets PRAGMA busy_timeout = HOOK_BUSY_SECONDS (2.0 s) per lock wait; a failure is swallowed.
+        try:
+            if not str(getattr(out.request, "event_id", "")).startswith("hook:"):
+                c = out.call
+                raw = event.get("tool_input", {})  # decide_ex's normalisation: missing or None -> {}, else as is
+                _ledger_note(Path(queue.directory), event, c.session, c.tool_name, {} if raw is None else raw, c.cwd,
+                             decision=out.decision, request_id=out.request.id)
+        except Exception:  # noqa: BLE001 - the ledger is a record, never the answer
+            pass
+        return answer
     if isinstance(out, Abstained) and not out.held:
         # the agent's own dialog asks and no away hold pinged his devices about the request: one notice that it waits
         # (Phill 11-02, np-e642162b (a); :func:`prompt_notice`, which never raises)
