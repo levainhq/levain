@@ -1981,6 +1981,7 @@ class _Handler(GuardedHandler):
     server: _LevainHTTPServer  # narrow the type for typed attribute access
     _credential_cache: Any = _UNSET
     _presence_cache: Any = _UNSET   # reset per request in handle_one_request
+    _reads_invalidated = False      # likewise: whether this request has dropped the shared read cache yet
     _post_headers: "list[tuple[str, str]]" = []   # extra headers for a push POST's JSON reply (never mutated in place)
     _pair_epoch_seen = 0       # the revocation epoch read just before this request's paired lookup (RU-3)
     # (Content-Security-Policy, X-Frame-Options) in place of http_guards' for this one response (send_header), else None
@@ -2041,18 +2042,17 @@ class _Handler(GuardedHandler):
         self._credential_cache = _UNSET
         self._presence_cache = _UNSET
         self._post_headers = []
+        self._reads_invalidated = False
         self.command = None     # a kept-alive connection's previous verb is not this request's
         try:
             try:
                 super().handle_one_request()
             finally:
-                # a write (any method but GET/HEAD) has finished: no read cached or in flight before it may be
-                # served to a request that arrives after it (engine.invalidate_reads; the TTL bounds a write made
-                # by ANOTHER process)
-                if getattr(self, "command", None) not in (None, "GET", "HEAD"):
-                    cockpit = getattr(self.server, "cockpit", None)
-                    if cockpit is not None:
-                        cockpit.invalidate_reads()
+                # the fallback (send_response is the first invalidation, before the status line): an admitted write
+                # that sent no response (its handler raised), and one more for a read that began while it ran. A
+                # request refused at a gate was never admitted and never invalidates (_admitted_write)
+                if self._reads_invalidated or self._admitted_write(None):
+                    self._invalidate_reads()
         except _CredentialUnavailable:
             self.close_connection = True
             try:
@@ -2063,6 +2063,36 @@ class _Handler(GuardedHandler):
                 self.wfile.flush()
             except (OSError, ValueError):
                 pass        # the client went away first
+
+    def _admitted_write(self, code: "int | None") -> bool:
+        """Whether THIS request may have written, so the shared read cache must drop what it holds (1106 solid2 r1).
+        A write method (not GET / HEAD) AND either a verified surface or paired credential resolved on this request
+        (a write route admitted it, whatever the write then answered), or a 2xx answer (the routes whose credential
+        is not a surface token: the pairing claim's code, a notify token, a push receipt's endpoint hash, the chat
+        token, a presence tap). A request refused at a gate (OPTIONS 501, a missing or wrong token's 403, a
+        malformed request's 400, a wrong Host or Origin) resolves no token credential and gets no 2xx: it never
+        invalidates, so no unauthenticated client can keep flushing the cache the read gate's load relies on."""
+        if getattr(self, "command", None) in (None, "GET", "HEAD"):
+            return False
+        cred = getattr(self, "_credential_cache", _UNSET)
+        if isinstance(cred, dict) and cred.get("class") == "token":
+            return True
+        return code is not None and 200 <= code < 300
+
+    def _invalidate_reads(self) -> None:
+        self._reads_invalidated = True
+        cockpit = getattr(self.server, "cockpit", None)
+        if cockpit is not None:
+            cockpit.invalidate_reads()
+
+    def send_response(self, code: int, message: "str | None" = None) -> None:
+        """READ-YOUR-WRITES (1106 solid2 r1): an admitted write drops the shared read cache BEFORE its status line is
+        written. Every handler answers through here after its write committed (send_error included), so a client
+        that holds the response and reads at once, on any connection, never gets a read cached or begun before the
+        write. The ``finally`` in :meth:`handle_one_request` is only the fallback."""
+        if not self._reads_invalidated and self._admitted_write(code):
+            self._invalidate_reads()
+        super().send_response(code, message)
 
     def _write_token_required(self) -> bool:
         """True iff this request needs a surface token on EVERY route, the substrate-bearing READS included

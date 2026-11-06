@@ -2088,7 +2088,8 @@ class Cockpit:
 
     # --- the shared read cache ---------------------------------------------------------------------
     def invalidate_reads(self) -> None:
-        """A write happened (any non-GET request the server handled, once it has finished): every cached read
+        """A write happened (the server calls it for an ADMITTED write, before that write's response is sent, and
+        once more after: web_server ``_Handler.send_response``; a request refused at a gate never calls it): every cached read
         and every in-flight one is stale from here. A read started before this call is never stored for, nor
         joined by, a request arriving after it (the generation is part of the key)."""
         with self._rc_lock:
@@ -2114,7 +2115,14 @@ class Cockpit:
                 if len(self._rc) >= _READ_CACHE_MAX:
                     self._rc = {k: e for k, e in self._rc.items() if e.done.is_set() is False or now - e.at < ttl}
                     if len(self._rc) >= _READ_CACHE_MAX:
-                        ent = None
+                        # full of live entries (a caller can mint keys: one per real row id): the oldest FINISHED
+                        # entry gives way, so honest reads keep sharing; only a table of 64 reads all in flight runs
+                        # this one uncached
+                        done = [(e.at, k) for k, e in self._rc.items() if e.done.is_set()]
+                        if done:
+                            del self._rc[min(done, key=lambda d: d[0])[1]]
+                        else:
+                            ent = None
                 if ent is not None or len(self._rc) < _READ_CACHE_MAX:
                     ent = self._rc[full] = _SharedRead(now)
                     owner = True
@@ -2273,15 +2281,19 @@ class Cockpit:
     def panel(self, panel_id: str, *, profile: str = "full", q: str | None = None,
               row: str | None = None, credential_class: str = "none",
               limit: int | None = None, at: str | None = None) -> dict[str, Any] | None:
-        """The shared form of :meth:`_panel_compute`. KEY = every argument the compose reads (panel id, profile,
-        row, limit, credential class); the result is a function of those and of server-global state. A search
+        """The shared form of :meth:`_panel_compute`. KEY = every argument the compose's result depends on (panel id,
+        profile, row, credential class; ``limit`` only bounds a search, so it is validated, not keyed); the result is a function of those and of server-global state. A search
         (``q``) and a past read (``at``) are never cached: ``q`` is free text the operator types (unbounded keys,
         and a store search is the costly live read), ``at`` has its own replay cache. A QueryError or RowNotFound
         propagates to every waiter alike (a failed compute is not stored). The result is shared: read-only."""
         if self.read_cache_ttl_s <= 0 or q is not None or at is not None:
             return self._panel_compute(panel_id, profile=profile, q=q, row=row, credential_class=credential_class,
                                        limit=limit, at=at)
-        key = ("panel", panel_id, profile, row, limit, credential_class)
+        # ``limit`` caps only a search, and a search is never cached: without ``q`` the compose reads it only to
+        # refuse a bad one, so it is checked here (the same QueryError, before the table is touched) and left out
+        # of the key, instead of letting every distinct value mint its own entry
+        check_query(None, limit)
+        key = ("panel", panel_id, profile, row, credential_class)
         return self._shared_read(key, lambda: self._panel_compute(
             panel_id, profile=profile, q=q, row=row, credential_class=credential_class, limit=limit, at=at),
             keep=lambda v: v is not None)      # an unknown id is not stored: ids are caller-chosen

@@ -11,7 +11,8 @@ from pathlib import Path
 
 import pytest
 
-from levain.cockpit.engine import Cockpit
+from levain.cockpit import engine as cockpit_engine
+from levain.cockpit.engine import Cockpit, QueryError
 from levain.cockpit.providers import build_default_cockpit
 from tests.test_cockpit_k2a import _install, _serve
 
@@ -126,13 +127,34 @@ def test_panel_cache_keys_on_class_profile_row_limit_and_skips_search_unknown_an
     assert ck.panel(pid, credential_class="token") is p1 and n[0] == 1
     assert ck.panel(pid, credential_class="none") is not p1 and n[0] == 2
     assert ck.panel(pid, credential_class="token", profile="compact") is not p1 and n[0] == 3
-    assert ck.panel(pid, credential_class="token", limit=5) is not p1 and n[0] == 4
+    # limit bounds only a search: without q it is validated, never keyed (r1: distinct limits minted entries)
+    assert ck.panel(pid, credential_class="token", limit=5) is p1 and ck.panel(pid, credential_class="token",
+                                                                                 limit=7) is p1 and n[0] == 3
+    with pytest.raises(QueryError):
+        ck.panel(pid, credential_class="token", limit=0)
     ck.panel(pid, credential_class="token", q="seed")
     ck.panel(pid, credential_class="token", q="seed")
-    assert n[0] == 6                                           # a search is never shared
-    assert ck.panel("no-such-panel") is None and ck.panel("no-such-panel") is None and n[0] == 8
+    assert n[0] == 5                                           # a search is never shared
+    assert ck.panel("no-such-panel") is None and ck.panel("no-such-panel") is None and n[0] == 7
     ck.invalidate_reads()
     assert ck.panel(pid, credential_class="token") is not p1
+
+
+def test_a_full_table_evicts_its_oldest_finished_entry_instead_of_reading_uncached(ck) -> None:
+    # r1: caller-minted keys (one per real row id) filled the 64 slots and every honest read then ran unshared
+    for i in range(cockpit_engine._READ_CACHE_MAX):
+        ck._shared_read(("filler", i), lambda: object())
+    assert len(ck._rc) == cockpit_engine._READ_CACHE_MAX
+    n = [0]
+
+    def honest() -> object:
+        n[0] += 1
+        return object()
+
+    first = ck._shared_read(("honest",), honest)
+    assert ck._shared_read(("honest",), honest) is first and n[0] == 1      # stored, and shared
+    assert len(ck._rc) == cockpit_engine._READ_CACHE_MAX
+    assert (ck._rc_gen, ("filler", 0)) not in ck._rc                        # the oldest finished one gave way
 
 
 def test_off_by_default_so_a_directly_built_cockpit_reads_fresh(tmp_path: Path) -> None:
@@ -163,11 +185,45 @@ def test_over_http_two_surface_tokens_never_cross_and_a_post_invalidates(tmp_pat
         except urllib.error.HTTPError as e:
             assert e.code in (401, 403)
         ck = httpd.cockpit
+        # r1: an ADMITTED write (a verified token reached the write route) drops the cache BEFORE its status line,
+        # so a client holding the answer never reads the pre-write entry. The invalidation is slowed here: were it
+        # still run after the response, urlopen would return before it had happened
+        calls, real = [], ck.invalidate_reads
+
+        def slow_invalidate() -> None:
+            time.sleep(0.5)
+            calls.append(time.monotonic())
+            real()
+
+        ck.invalidate_reads = slow_invalidate
         gen = ck._rc_gen
-        req = urllib.request.Request(url + "/edit", data=b"{}", headers={"Content-Type": "application/json"},
-                                     method="POST")
-        try:
-            urllib.request.urlopen(req, timeout=10)  # noqa: S310
-        except urllib.error.HTTPError:
-            pass
-        assert ck._rc_gen > gen and not ck._rc
+        assert _post_status(url + "/edit", T_B) < 500
+        assert calls and ck._rc_gen > gen and not ck._rc
+
+
+def _post_status(url: str, tok: str | None = None, method: str = "POST") -> int:
+    headers = {"Content-Type": "application/json"}
+    if tok:
+        headers["X-Levain-Write-Token"] = tok
+    req = urllib.request.Request(url, data=b"{}" if method == "POST" else None, headers=headers, method=method)
+    try:
+        with urllib.request.urlopen(req, timeout=10) as r:  # noqa: S310 - loopback
+            return r.status
+    except urllib.error.HTTPError as e:
+        return e.code
+
+
+def test_a_request_refused_at_the_gate_never_invalidates(tmp_path: Path) -> None:
+    # r1: any parsed non-GET request used to flush the cache, so an unauthenticated client could keep it cold
+    _root, src, _ids = _install(tmp_path)
+    with _serve(src, install_class="reported", surface_tokens={"browser": T_A, "other": T_B}) as (url, httpd):
+        _get(url + "/cockpit/manifest.json", T_B)
+        ck = httpd.cockpit
+        gen, warm = ck._rc_gen, dict(ck._rc)
+        assert warm
+        assert _post_status(url + "/cockpit/manifest.json", method="OPTIONS") == 501
+        assert _post_status(url + "/edit", "x" * 40) == 403          # a wrong token
+        assert _post_status(url + "/edit") == 403                    # none at all
+        assert _post_status(url + "/no-such-route", "x" * 40) in (403, 404)
+        time.sleep(0.2)                                              # past every request's finally
+        assert ck._rc_gen == gen and ck._rc == warm
