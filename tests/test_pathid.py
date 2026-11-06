@@ -184,3 +184,101 @@ def test_the_canonical_then_contain_logic_with_an_injected_case_fold(tree, monke
     assert not pathid.inside(root, Path(str(tree / "other")).with_name("OTHER"))
     assert not pathid.inside(root, Path(str(tree / "rootcamp")).with_name("ROOTCAMP") / "x")
     assert not pathid.inside(root, Path(str(tree / "rootcamp")).with_name("ROOTCAMP"))
+
+
+# ---------------------------------------------------------------- L3 casefix round 1 (key 1106-1): F1, F3, F4
+
+def _unknowable(monkeypatch, *paths, spelling=None):
+    """Stand in for "each of ``paths`` exists and cannot be read" (EACCES) at both of pathid's doors: the spelling seam
+    raises ``_Unsure`` and ``os.stat`` raises ``PermissionError``, as a real permission failure does to both. Every
+    other path is answered by ``spelling`` (default: the module's own lookup) and the real ``os.stat``."""
+    import errno
+    bad = {os.fspath(p) for p in paths}
+    inner, real_stat = spelling or pathid._fs_spelling, os.stat
+
+    def spelled(p):
+        if p in bad:
+            raise pathid._Unsure("injected: exists, unreadable")
+        return inner(p)
+
+    def stat(p, *a, **k):
+        if isinstance(p, (str, os.PathLike)) and os.fspath(p) in bad:
+            raise PermissionError(errno.EACCES, "injected", os.fspath(p))
+        return real_stat(p, *a, **k)
+
+    monkeypatch.setattr(pathid, "_fs_spelling", spelled)
+    monkeypatch.setattr(pathid.os, "stat", stat)
+
+
+def test_an_unknowable_path_lexically_under_the_root_is_not_surely_inside(tree, monkeypatch):
+    """F3: `_canon` keeps the given spelling when it cannot place a path, and that spelling sat under the root, so
+    `inside` (GRANTS: True only when sure) answered True for a path it could not place. Now an unsure side never
+    takes the lexical True; the identity walk decides, and a match ABOVE a component it could not stat is unsure."""
+    root = tree / "root"
+    _unknowable(monkeypatch, root / "sub")
+    for p in (root / "sub", root / "sub" / "new"):
+        assert not pathid.inside(root, p)
+        assert pathid.maybe_inside(root, p)                 # DENY direction unchanged: unsure is still True
+
+
+def test_a_symlink_loop_under_the_root_is_not_surely_inside(tree):
+    loop = tree / "root" / "loop"
+    loop.symlink_to(loop)
+    for p in (loop, loop / "x"):
+        assert not pathid.inside(tree / "root", p)
+        assert pathid.maybe_inside(tree / "root", p)
+
+
+@pytest.mark.skipif(os.geteuid() == 0, reason="root reads every directory: no permission failure to provoke")
+def test_a_path_below_an_unsearchable_directory_under_the_root_is_not_surely_inside(tree):
+    locked = tree / "root" / "locked"
+    (locked / "inner").mkdir(parents=True)
+    locked.chmod(0)
+    try:
+        assert not pathid.inside(tree / "root", locked / "inner")
+        assert pathid.maybe_inside(tree / "root", locked / "inner")
+        assert pathid.inside(tree / "root", locked)          # the unsearchable directory itself is placed: sure
+    finally:
+        locked.chmod(0o700)
+
+
+def test_canonical_sure_input_answers_as_before_the_unsure_fix(tree, monkeypatch):
+    """The control the F3 fix must not move: canonical, sure input inside is still True from `inside`, outside still
+    False, and `maybe_inside` agrees; with an unknowable path elsewhere in the tree."""
+    root = tree / "root"
+    _unknowable(monkeypatch, tree / "other")
+    for p in (root, root / "sub", root / "sub" / "f.txt", root / "sub" / "deep" / "not" / "made"):
+        assert pathid.inside(root, p) and pathid.maybe_inside(root, p)
+    for p in (tree, tree / "rootcamp", tree / "rootcamp" / "x"):
+        assert not pathid.inside(root, p) and not pathid.maybe_inside(root, p)
+
+
+def test_bad_arguments_never_raise_and_are_unsure(tree, monkeypatch):
+    """F4: `Path(None)` raised TypeError and a NUL in a root raised ValueError at the root's stat, despite "never
+    raises". A bad argument is never surely inside and is possibly inside (a DENY caller refuses). The cwd is the
+    root on purpose: a bad argument must not fall back to "." and so be the cwd, which would put the cwd's tree in it."""
+    root = tree / "root"
+    monkeypatch.chdir(root)
+    for bad in (None, 5, "/\0bad", str(root) + "\0x"):
+        assert not pathid.inside(bad, root / "sub") and pathid.maybe_inside(bad, root / "sub")
+        assert not pathid.inside(root, bad) and pathid.maybe_inside(root, bad)
+        assert pathid.maybe_same(bad, root) and pathid.maybe_same(root, bad)
+        pathid.canonical(bad)
+
+
+def test_the_consent_home_refusal_refuses_a_nul_workspace_instead_of_raising(tree):
+    """F4, the codex scenario: `consent_root_problem("/\\0bad", home=...)` aborted on the root stat."""
+    from levain.authority import consent_root_problem
+    assert consent_root_problem("/\0bad", home=str(tree / "root")) is not None
+
+
+def test_maybe_same_is_equal_spelling_same_file_or_unsure(tree, monkeypatch):
+    """F1's DENY answer: one path surely or possibly. Sure input answers as `canonical` equality or `same` does."""
+    root = tree / "root"
+    (tree / "other" / "to_sub").symlink_to(root / "sub")
+    assert pathid.maybe_same(root / "sub", tree / "other" / "to_sub")
+    assert pathid.maybe_same(root / "never" / "made", root / "sub" / ".." / "never" / "made")
+    assert not pathid.maybe_same(root / "sub", tree / "other")
+    assert not pathid.maybe_same(root / "never", root / "made")
+    _unknowable(monkeypatch, tree / "other" / "x")
+    assert pathid.maybe_same(tree / "other" / "x", root / "sub")        # could not place it: possibly the same

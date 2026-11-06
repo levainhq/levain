@@ -125,10 +125,11 @@ def checked_security(path: str | Path | None = None) -> str:
     if under_test_run():
         try:
             # by the filesystem's own spelling, not the one given: `resolve()` keeps `/USR/BIN/SECURITY` as typed (casesweep
-            # row 14, key 1106-1). DENY direction: an unreadable spelling still refuses (the except below).
-            same = pathid.canonical(Path(chosen).expanduser()) == pathid.canonical(_REAL_SECURITY)
+            # row 14, key 1106-1). DENY direction: a spelling that could not be read refuses (`maybe_same` is True when
+            # either side's resolution was unsure; `canonical` swallows its own failures, so no except can see them).
+            same = pathid.maybe_same(Path(chosen).expanduser(), _REAL_SECURITY)
         except (OSError, RuntimeError):
-            same = True                     # cannot tell: under a test run that is a refusal
+            same = True                     # `~user` that cannot be expanded: cannot tell, so under a test run refuse
         if same:
             raise VoiceKeyRefused("a test reached the real `security` binary: hand in a stand-in")
     return chosen
