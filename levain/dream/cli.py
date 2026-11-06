@@ -182,7 +182,8 @@ def run_dream_enable(args: argparse.Namespace) -> int:
         reg = da.register_dream(store, revise=args.revise, binding=binding)
     except da.EnableRefused as exc:
         why = str(exc)
-        if binding is not None:
+        # the advice is about a changed spec; a refusal that is the agent store's own (its schema marker) is printed alone
+        if binding is not None and not isinstance(exc.__cause__, AgentStoreRefused):
             why += ("; a shadow install's facts are bound into the dream's spec, so changed facts are a new version "
                     "(--revise), which needs a new signed link; nothing was written")
         print(f"levain dream enable: {why}", file=sys.stderr)
