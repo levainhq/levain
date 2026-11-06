@@ -8,8 +8,8 @@ import json
 import pytest
 
 from levain.agents import cli as agents_cli
-from levain.agents.role import (RoleError, add_role, get_role, instance_ceiling, parse_role, parse_role_text,
-                                role_hash, spawn_namespace)
+from levain.agents.role import (RoleError, add_role, canonical_role, get_role, instance_ceiling, parse_role,
+                                parse_role_text, role_by_hash, role_hash, spawn_namespace)
 from levain.agents.store import open_agent_store
 from levain.authority import _canonical
 from levain.cli import main
@@ -65,6 +65,120 @@ def test_hash_matches_a0_formula_and_is_order_stable():
     assert list(shuffled) != list(ROLE)
     assert role_hash(shuffled) == role_hash(ROLE)
     assert role_hash(parse_role_text(json.dumps(shuffled))) == role_hash(ROLE)
+
+
+# K1 (key 1105-36): the hashes below are pinned LITERALS, read off origin/main before `kind` existed. A signed agent
+# link pins them, so a slice that moves one re-signs every live agent on the operator's Touch ID.
+DREAM_ROLE_HASH = "d8b10c8747ebe39945c0879dfd07221eaaa267c09aa6130dec37c1684f54be5b"
+PARTNER_ROLE = {"name": "partner",
+                "brief": {"template": "Work with the operator on {topic}; keep your partnership memory.",
+                          "slots": {"topic": "str"}},
+                "ceiling": {"lands": ["the install's anneal memory text"]},
+                "model": "claude-opus-5-5", "harness": "claude", "executor": "session"}
+PARTNER_ROLE_HASH = "5510fb834f0ee95a36e96d3c47d2e670f920dc920d46e41fbc61d67cf5306b57"
+SCRIBE_ROLE_HASH = "a0e4c6e91646508d12d070fc16baeb9d33601fa0c9bcb1c46a46d906407504b1"
+
+
+def test_the_shipped_hashes_do_not_move_and_kind_role_is_the_same_role():
+    from levain.dream.agent import dream_role
+    scribe = json.loads(
+        '{"brief":{"slots":{"topic":"str"},"template":"Write about {topic}"},"ceiling":{"pushes":["origin"],'
+        '"where":[{"paths":["a/"],"repo":"r"}]},"executor":"session","harness":"claude","model":"m","name":"scribe"}')
+    for role, pinned in ((dream_role(), DREAM_ROLE_HASH), (PARTNER_ROLE, PARTNER_ROLE_HASH),
+                         (scribe, SCRIBE_ROLE_HASH)):
+        assert role_hash(role) == pinned
+        # `kind: role` is the default's second spelling in the INPUT only: same hash, same canonical text, no key
+        spelled = dict(role, kind="role")
+        assert role_hash(spelled) == pinned
+        assert canonical_role(spelled) == canonical_role(role)
+        assert "kind" not in parse_role(spelled) and "kind" not in parse_role(role)
+        assert '"kind"' not in canonical_role(spelled)
+        # `kind: job` is a different role: a different hash, and the canonical text carries the field
+        job = dict(role, kind="job")
+        assert role_hash(job) != pinned
+        assert parse_role(job)["kind"] == "job" and '"kind":"job"' in canonical_role(job)
+        # and it round-trips: the canonical text parses back to the same hash
+        assert role_hash(parse_role_text(canonical_role(job))) == role_hash(job)
+
+
+def test_kind_is_optional_not_required_and_the_missing_field_message_does_not_name_it():
+    # the trap: appending `kind` to the required tuple makes it mandatory and refuses every role there is
+    assert "kind" not in ROLE
+    assert "kind" not in parse_role(ROLE)
+    with pytest.raises(RoleError, match="missing field 'model'") as exc:
+        parse_role({k: v for k, v in ROLE.items() if k != "model"})
+    assert "kind" not in str(exc.value).split("missing field")[1]
+
+
+@pytest.mark.parametrize("value,needle", [
+    (None, "kind"), ("agent", "agent"), ("Role", "kind"), ("", "kind"), ("jobs", "kind"), (1, "kind"),
+    (True, "kind"), (["job"], "kind"), ({"x": 1}, "kind"),
+])
+def test_kind_other_than_job_or_role_is_refused_naming_the_field(value, needle):
+    with pytest.raises(RoleError, match=r"field 'kind' .* is not one of job, role|field 'kind' = 'agent'") as exc:
+        parse_role(dict(ROLE, kind=value))
+    assert needle in str(exc.value) and "unknown field" not in str(exc.value)
+
+
+def test_kind_agent_is_refused_naming_the_pending_ruling_not_accepted_as_an_inert_value():
+    with pytest.raises(RoleError) as exc:
+        parse_role(dict(ROLE, kind="agent"))
+    msg = str(exc.value)
+    assert "'kind'" in msg and "agent" in msg and "ruling" in msg
+    with pytest.raises(RoleError, match="ruling"):
+        parse_role_text(json.dumps(dict(ROLE, kind="agent")))
+    with pytest.raises(RoleError, match="ruling"):
+        role_hash(dict(ROLE, kind="agent"))
+
+
+def test_a_pre_slice_stored_row_still_reads_and_a_second_spelling_of_the_default_is_refused(tmp_path):
+    store = open_agent_store(tmp_path / "store")
+    text = _canonical(ROLE)  # exactly the text a binary before `kind` wrote
+    digest = hashlib.sha256(b"levain-rolespec/1\n" + text.encode()).hexdigest()
+    with store.write() as conn:
+        conn.execute("INSERT INTO agent_roles (role_hash, name, version, spec, created_at) VALUES (?,?,?,?,?)",
+                     (digest, "scribe", 1, text, "2026-01-01T00:00:00Z"))
+    got_digest, version, role = get_role(store, "scribe")
+    assert (got_digest, version) == (digest, 1) and role == parse_role(ROLE) and "kind" not in role
+    assert role_by_hash(store, digest) == role
+    # a row whose text carries `"kind":"role"` is not the canonical text, so it is refused even under its own hash
+    spelled = _canonical(dict(ROLE, kind="role", name="other"))
+    spelled_digest = hashlib.sha256(b"levain-rolespec/1\n" + spelled.encode()).hexdigest()
+    with store.write() as conn:
+        conn.execute("INSERT INTO agent_roles (role_hash, name, version, spec, created_at) VALUES (?,?,?,?,?)",
+                     (spelled_digest, "other", 1, spelled, "2026-01-01T00:00:00Z"))
+    with pytest.raises(RoleError, match="does not hash"):
+        get_role(store, "other")
+
+
+def test_a_job_role_roundtrips_through_add_and_get(tmp_path):
+    store = open_agent_store(tmp_path / "store")
+    job = dict(ROLE, kind="job")
+    name, digest, version, created = add_role(store, job)
+    assert (name, version, created) == ("scribe", 1, True) and digest == role_hash(job) != role_hash(ROLE)
+    assert get_role(store, "scribe") == (digest, 1, parse_role(job))
+    assert role_by_hash(store, digest)["kind"] == "job"
+    # the same words without the kind are the OTHER role: the next version, not a hit on the job's hash
+    assert add_role(store, ROLE) == ("scribe", role_hash(ROLE), 2, True)
+
+
+def test_role_show_prints_the_kind_and_role_when_absent(tmp_path, capsys):
+    assert _run(tmp_path, "role", "add", str(_file(tmp_path, ROLE))) == 0
+    assert _run(tmp_path, "role", "add", str(_file(tmp_path, dict(ROLE, name="chore", kind="job"), "job.json"))) == 0
+    capsys.readouterr()
+    assert _run(tmp_path, "role", "show", "scribe") == 0
+    first = capsys.readouterr().out.splitlines()[0]
+    assert first == f"role scribe v1 {role_hash(ROLE)} kind=role"
+    assert _run(tmp_path, "role", "show", "chore") == 0
+    first = capsys.readouterr().out.splitlines()[0]
+    assert first == f"role chore v1 {role_hash(dict(ROLE, name='chore', kind='job'))} kind=job"
+
+
+def test_role_add_of_kind_agent_exits_1_naming_the_ruling(tmp_path, capsys):
+    assert _run(tmp_path, "role", "add", str(_file(tmp_path, dict(ROLE, kind="agent")))) == 1
+    err = capsys.readouterr().err
+    assert "'kind'" in err and "ruling" in err
+    assert _run(tmp_path, "role", "add", str(_file(tmp_path, dict(ROLE, kind="role")))) == 0
 
 
 @pytest.mark.parametrize("path,value", [

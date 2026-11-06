@@ -16,7 +16,7 @@ import sys
 from collections import Counter
 from pathlib import Path
 
-from levain.agents.role import MAX_VERSION, RoleError, add_role, get_role, latest_version, parse_role_text, role_by_hash
+from levain.agents.role import DEFAULT_KIND, MAX_VERSION, RoleError, add_role, get_role, latest_version, parse_role_text, role_by_hash
 from levain.agents.refuse import AuditError, audit_verdicts, check_spec, derived_flags, refinement_of
 from levain.agents.spec import (SpecError, finalize_spec, find_revert, get_agent, list_agents, load_json,
                                 parse_spec, register_specs, retire_agent, set_operation, stored_specs)
@@ -185,7 +185,7 @@ def run_role_show(args: argparse.Namespace) -> int:
         print(f"levain agents role show: the store refused it: {exc}", file=sys.stderr)
         return 1
     try:  # one write of the whole text, so a stdout that cannot encode it prints nothing
-        print(f"role {args.name} v{version} {digest}\n" + json.dumps(role, indent=2, sort_keys=True, ensure_ascii=False))
+        print(f"role {args.name} v{version} {digest} kind={role.get('kind', DEFAULT_KIND)}\n" + json.dumps(role, indent=2, sort_keys=True, ensure_ascii=False))
     except UnicodeEncodeError as exc:
         print(f"levain agents role show: stdout cannot encode the role ({exc.encoding}); "
               f"set PYTHONIOENCODING=utf-8", file=sys.stderr)

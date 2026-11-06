@@ -1,6 +1,7 @@
 """levain.agents.role — the RoleSpec registry (A0 r6/r7 §3.1, §4.2; BUILD_PLAN P1).
 
-A role is a plain mapping with exactly these fields (anything else is refused, naming the field):
+A role is a plain mapping with exactly these fields (anything else is refused, naming the field), the first six
+required and ``kind`` optional:
 
 - ``name``      ``[a-z][a-z0-9-]{0,47}``; the spawned namespace is ``@spawn/<name>``.
 - ``brief``     ``{"template": str, "slots": {slot name: "str" | "int" | "path"}}``. The template's ``{slot}``
@@ -12,6 +13,10 @@ A role is a plain mapping with exactly these fields (anything else is refused, n
 - ``model``     str; non-empty for a session executor.
 - ``harness``   ``claude`` | ``codex`` for a session executor, ``""`` for any other executor (D1 R-D1).
 - ``executor``  ``session`` | ``dream``.
+- ``kind``      ``job`` | ``role``, optional; ABSENT MEANS ``role``. ``kind: "role"`` is accepted in the input and
+                dropped, so a role has one spelling of its default: ``null``, ``"agent"`` and any other value are
+                refused. ``agent`` is refused naming the pending ruling (whether an agent is declared on a role or
+                derived from structure is Phill's to answer); accepting it as an inert value would pre-decide it.
 
 There is no float anywhere, and no signature: authorisation comes through the agent-link, which signs the AgentSpec
 hash, which pins :func:`role_hash` (A0 §3.2).
@@ -20,6 +25,16 @@ hash, which pins :func:`role_hash` (A0 §3.2).
 form. The version is the registry's counter per name (UNIQUE(name, version)) and is NOT a role field, so it is not
 hashed: the same content is the same hash whichever version holds it. The ``agent_roles.spec`` column holds the
 canonical text, which is what P5b's ``compile`` re-hashes.
+
+The canonical form OMITS ``kind`` when it is ``role`` (the one place a default is not written out: spec.py writes
+its defaults out, a role must not). That keeps every role registered before ``kind`` existed byte-identical, so its
+role_hash, the agent links that pin it, the bindings, the stored spawn drafts and the stored rows all still verify;
+writing the default would move every one of those hashes and re-sign every live agent. The prefix stays
+``levain-rolespec/1`` and the ``agent_roles`` table is unchanged for the same reason.
+
+Known edge, one line, no build: a binary from before ``kind`` reads a role carrying ``kind: "job"`` as an unknown field
+(``role show``, ``role_by_hash`` and ``get_role`` raise :class:`RoleError`, so a fire is refused, never run). The only
+path to that is a downgrade after a job role was registered.
 """
 from __future__ import annotations
 
@@ -34,13 +49,17 @@ from typing import Any
 from levain.agents.store import AgentStore
 from levain.authority import _canonical
 
-__all__ = ["RoleError", "ROLE_FIELDS", "ROLE_NAME", "parse_role", "parse_role_text", "canonical_role", "role_hash",
+__all__ = ["RoleError", "ROLE_FIELDS", "ROLE_OPTIONAL_FIELDS", "ROLE_KINDS",
+           "DEFAULT_KIND", "ROLE_NAME", "parse_role", "parse_role_text", "canonical_role", "role_hash",
            "instance_ceiling", "spawn_namespace", "add_role", "get_role", "latest_version",
            "role_by_hash"]
 
 ROLE_HASH_PREFIX = b"levain-rolespec/1\n"
 ROLE_NAME = re.compile(r"[a-z][a-z0-9-]{0,47}")
-ROLE_FIELDS = ("name", "brief", "ceiling", "model", "harness", "executor")
+ROLE_FIELDS = ("name", "brief", "ceiling", "model", "harness", "executor")  # the REQUIRED fields, not all allowed ones
+ROLE_OPTIONAL_FIELDS = ("kind",)
+ROLE_KINDS = ("job", "role")
+DEFAULT_KIND = "role"
 EXECUTORS = ("session", "dream")
 HARNESSES = ("claude", "codex")
 SLOT_TYPES = ("str", "int", "path")
@@ -52,12 +71,14 @@ class RoleError(ValueError):
     """A role file or a role lookup is refused; the message names the field or the name."""
 
 
-def _exact(obj: Any, allowed: tuple[str, ...], where: str, *, required: bool = True) -> dict[str, Any]:
+def _exact(obj: Any, allowed: tuple[str, ...], where: str, *, required: bool = True,
+           optional: tuple[str, ...] = ()) -> dict[str, Any]:
+    """``allowed`` are the required fields (all of them unless ``required`` is False); ``optional`` may be absent."""
     if not isinstance(obj, dict):
         raise RoleError(f"{where} must be an object, not {type(obj).__name__}")
     for key in obj:
-        if key not in allowed:
-            raise RoleError(f"unknown field {key!r} in {where} (allowed: {', '.join(allowed)})")
+        if key not in allowed and key not in optional:
+            raise RoleError(f"unknown field {key!r} in {where} (allowed: {', '.join(allowed + optional)})")
     if required:
         for key in allowed:
             if key not in obj:
@@ -126,9 +147,20 @@ def _ceiling(value: Any) -> dict[str, Any]:
     return out
 
 
+def _kind(value: Any) -> str:
+    if value == "agent" and isinstance(value, str):
+        raise RoleError("field 'kind' = 'agent' is refused: whether an agent is declared on a role or derived from "
+                        "structure is a pending ruling, so only job and role are accepted until it is answered")
+    if not isinstance(value, str) or value not in ROLE_KINDS:
+        raise RoleError(f"field 'kind' {value!r} is not one of {', '.join(ROLE_KINDS)} "
+                        f"(absent means {DEFAULT_KIND}; null is not a spelling of absent)")
+    return value
+
+
 def parse_role(obj: Any) -> dict[str, Any]:
     """Validate a role mapping and return a fresh, normalised copy; raise :class:`RoleError` naming the field."""
-    role = _exact(obj, ROLE_FIELDS, "role")
+    role = _exact(obj, ROLE_FIELDS, "role", optional=ROLE_OPTIONAL_FIELDS)
+    kind = _kind(role["kind"]) if "kind" in role else DEFAULT_KIND
     name = _str(role["name"], "name")
     if not ROLE_NAME.fullmatch(name):
         raise RoleError(f"name {name!r} does not match [a-z][a-z0-9-]{{0,47}}")
@@ -143,8 +175,11 @@ def parse_role(obj: Any) -> dict[str, Any]:
     model = _str(role["model"], "model")
     if executor == "session" and not model:
         raise RoleError("model must not be empty for a session executor")
-    return {"name": name, "brief": _brief(role["brief"]), "ceiling": _ceiling(role["ceiling"]), "model": model,
-            "harness": harness, "executor": executor}
+    out = {"name": name, "brief": _brief(role["brief"]), "ceiling": _ceiling(role["ceiling"]), "model": model,
+           "harness": harness, "executor": executor}
+    if kind != DEFAULT_KIND:  # the default is never written: see the module docstring
+        out["kind"] = kind
+    return out
 
 
 def _no_floats(text: str) -> Any:
