@@ -28,16 +28,19 @@ A flaw in any of these, reachable by someone who is not already entitled to do t
   requires, a grant that covers more than it was signed for, or a record that does not show who approved what.
 - **Signing:** a signed answer or grant that verifies when it should not, or one that fails to verify when it should.
   The signature namespaces are listed in [`docs/contracts.md`](docs/contracts.md) §F11.
-- **The cockpit and pairing:** a way to use the cockpit, or a paired device, without the pairing or passkey step.
+- **The cockpit and pairing:** a way to use a cockpit surface, or a paired device, without the pairing, token or passkey step
+  that surface asks for.
 - **The sandbox and confinement:** a way out of the OS sandbox or the confinement floor that the documentation says holds.
 - **Memory governance:** a path into long-term memory that the governed write path was meant to refuse.
 
 ## What is out of scope
 
-- Anything the README already states as a boundary: see *Boundaries, kept honest* in the [README](README.md).
-  Levain confines no Claude Code or Codex session; it installs hooks and consent paths for them.
+- Anything the README says Levain does *not* cover: see *Boundaries, kept honest* in the [README](README.md).
+  Levain confines no Claude Code or Codex session; it installs hooks and consent paths for them. A way past a path or
+  route the confinement floor says it denies is in scope.
 - A problem that needs you to have already turned the efferent gate off yourself (`efferent_gate: "ungated"`, which the
   README describes under *Boundaries, kept honest*).
-- Vulnerabilities in Claude Code, Codex, `anneal-memory` or another dependency: report those to their owners.
-- Findings that need a process already running as your own OS user, or physical access to an unlocked machine you are
-  already signed in to.
+- Vulnerabilities in Claude Code, Codex, `anneal-memory` or another dependency: report those to their owners. How Levain
+  uses a dependency, or fails to guard against its failure where this policy says it does, is in scope.
+- Findings that need some other process already running as your own OS user (not the confined agent or entity that
+  the in-scope items above are about), or physical access to an unlocked machine you are already signed in to.
