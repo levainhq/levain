@@ -28,8 +28,7 @@ library code can make a critical section fully interrupt-safe.
 
 Levain's own hosts already behave this way: `levain serve` reads on request and refresher threads,
 which never receive the signal, and its main thread closes the server on Ctrl-C; `levain tui
---manifest` stops the Cockpit and exits. [judged by the K1 cockpit seat, 2026-10-10, against
-`levain/web_server.py` and the R1 branch's `levain/tui.py`.]
+--manifest` stops the Cockpit and exits.
 
 A host that needs a Cockpit to stay usable across Ctrl-C has to keep the interrupt out of the
 engine's reads: install its own SIGINT handler that records the signal and acts on it between

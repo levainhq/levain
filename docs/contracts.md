@@ -3,11 +3,10 @@
 The wire and cryptographic substrate every levain log speaks: Merkle math, signed notes, checkpoints,
 cosignatures, witness submissions, origins, key fingerprints, canonical JSON leaf framing, the two frozen leaf types
 and SSHSIG for device lines. Code: `levain/contracts/` (stdlib and `cryptography>=48` only; nothing there imports
-`levain.team` or any other levain module). Vectors: `tests/golden/contracts/frozen/`. Design: levain
-`project_memory/1012-s1/S1_DESIGN.md` (rev 11).
+`levain.team` or any other levain module). Vectors: `tests/golden/contracts/frozen/`.
 
-**Status: built, NOT yet frozen.** The freeze tag `levain-contracts/1` is cut only after a seat other than the
-builder reads this document against the design's §1 (T36). Until that tag exists, nothing below is a promise.
+**Status: frozen at the tag `levain-contracts/1`** (commit `7fb56396`; `git rev-parse 'levain-contracts/1^{commit}'`).
+The items under "The frozen items" are promises; the items under "Not frozen (provisional)" are not.
 
 "Frozen" means: the bytes are pinned by `tests/golden/contracts/frozen/`, a change to them fails CI, and a change needs
 a new version tag, never an edit. Every expected byte string in a vector is hand-built from the spec text or by a few
@@ -108,7 +107,7 @@ F12) are checked by the Python tests, under the OpenSSH version the vectors reco
   equal to `ssh-keygen -lf`. Certificates are outside F7; the blob's embedded type must equal the declared one.
 - Code: `levain/contracts/keys.py`; `levain/team/signing.py` `fingerprint()` keeps its allowlist and calls it.
   Known second computation: `levain/cockpit/keys.py` still fingerprints through `ssh-keygen` until it adopts
-  `fp_of_blob` (another lane's file).
+  `fp_of_blob`.
 - Vectors: `frozen/fingerprint/` (one throwaway key per type, expected values from `ssh-keygen -lf` under
   `OpenSSH_10.3p1`; the `.pub` files sit beside them).
 

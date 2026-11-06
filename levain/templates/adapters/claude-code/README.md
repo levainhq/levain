@@ -35,11 +35,11 @@ independent of the first.
 in v1 — the hook commands use POSIX shell form. (A Windows template is a
 post-v1 item.)
 
-> **This README documents the adapter and a manual install path for dogfooding
-> it.** The supported end-to-end install — running an interview to fill the
-> seed templates, initializing the store,
-> resolving the placeholder tokens below — is `levain init` (build step 4).
-> Until that ships, the manual sequence here stands up a working install.
+> **This README documents the adapter and a manual install path.** The
+> supported end-to-end install — running an interview to fill the seed
+> templates, initializing the store, resolving the placeholder tokens below —
+> is `levain init`. The manual sequence here is for understanding what `init`
+> does and for debugging an install.
 
 ## Install layout
 
@@ -73,7 +73,7 @@ post-v1 item.)
 ## Template placeholders
 
 Three templates carry placeholder tokens that resolve to environment-specific
-values. `levain init` (build step 4) resolves them; for a manual install,
+values. `levain init` resolves them; for a manual install,
 substitute them by hand per the steps below.
 
 | Token | In | Resolves to |
@@ -223,7 +223,7 @@ governed; it never edits the file.
   mechanism is off — verify with `python3 --version` first. On a fresh macOS
   without the Xcode command-line tools, `python3` may be absent.
 
-## Install (manual — `levain init` automates this at build step 4)
+## Install (manual — `levain init` automates this)
 
 1. **Install anneal-memory** into the interpreter you will use and confirm it
    runs: `<python> -m anneal_memory --help`. Note that interpreter's absolute
@@ -254,7 +254,7 @@ governed; it never edits the file.
    the wired command invokes the interpreter explicitly — but good hygiene).
 7. **Start a Claude Code session** in the partnership directory.
 
-`levain init` (build step 4) automates steps 2–6, resolves the placeholder
+`levain init` automates steps 2–6, resolves the placeholder
 tokens, fills `world.md`/`origin.md` from an interview, and initialises the
 store. Either way the entity starts with no continuity: its first wrap
 (`prepare_wrap`, then `save_continuity`, through the MCP server) writes `.levain/memory.continuity.md`, and until then the `CLAUDE.md` import of
@@ -352,7 +352,7 @@ MCP server and the hooks will read different stores.
 ## Harness portability
 
 The hook scripts are nearly harness-neutral. For a non-Claude-Code adapter
-(e.g. Codex, build step 3), expect **three** swap points, not one:
+(e.g. the Codex adapter, which ships with Levain), expect **three** swap points, not one:
 
 1. **`_levain_hook.emit()`** — formats output as Claude Code hook JSON
    (`hookSpecificOutput` + `hookEventName`). The primary seam; swap it for the

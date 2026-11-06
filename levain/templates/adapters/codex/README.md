@@ -23,11 +23,11 @@ post-v1 item (see Known characteristics).
 **Supported platforms:** macOS, Linux, and WSL. Native Windows is not
 supported in v1.
 
-> **This README documents the adapter and a manual install path for
-> dogfooding it.** The supported end-to-end install — running an interview to
-> fill the seed templates, initializing the store, loading the continuity
-> scaffold, resolving the placeholder tokens below — is `levain init` (build
-> step 4). Until that ships, the manual sequence here stands up a working
+> **This README documents the adapter and a manual install path.** The
+> supported end-to-end install — running an interview to fill the seed
+> templates, initializing the store, loading the continuity scaffold,
+> resolving the placeholder tokens below — is `levain init`. The manual
+> sequence here is for understanding what `init` does and for debugging an
 > install.
 
 ## Install layout
@@ -61,7 +61,7 @@ supported in v1.
 ## Template placeholders
 
 Three templates carry placeholder tokens that resolve to environment-specific
-values. `levain init` (build step 4) resolves them; for a manual install,
+values. `levain init` resolves them; for a manual install,
 substitute them by hand per the steps below.
 
 | Token | In | Resolves to |
@@ -146,10 +146,13 @@ map, expected a sequence in `hooks`"). The JSON sidecar at
 - **Python 3** available. The hook commands invoke it (`{{PYTHON}}`). If no
   working interpreter is wired, the hooks silently do not run and the
   posture mechanism is off — verify with `python3 --version` first.
-- **Codex CLI** installed (`codex --version`). v1 is tested against
-  codex-cli 0.132.0+.
+- **Codex CLI** installed (`codex --version`). The consent hook is tested
+  against the codex-cli versions listed in the main README (currently
+  0.162.1); `levain init` warns on any other version, and `levain
+  verify-hooks` checks that the installed hook scripts emit well-formed
+  output.
 
-## Install (manual — `levain init` automates this at build step 4)
+## Install (manual — `levain init` automates this)
 
 1. **Install levain and anneal-memory** into the interpreter you will use
    and confirm both run: `<python> -m anneal_memory --help` and
@@ -184,7 +187,7 @@ map, expected a sequence in `hooks`"). The JSON sidecar at
 7. **Start a Codex session** in the partnership directory (`cd
    <partnership-directory> && codex`).
 
-`levain init` (build step 4) automates steps 2–6, resolves the placeholder
+`levain init` automates steps 2–6, resolves the placeholder
 tokens, fills `world.md` / `origin.md` from an interview, and loads
 `seed/continuity.md` into the store. In this manual path the entity starts
 from an empty continuity — the expected near-empty start anyway
@@ -215,7 +218,7 @@ Codex shows trust / approval prompts on first run:
        invalidates trust until re-approved interactively.
     3. **`--dangerously-bypass-hook-trust`** is documented to bypass the
        trust check for one invocation, but empirical observation
-       (Argus deployment, codex-cli 0.132.0) shows it does **not
+       (a server deployment, codex-cli 0.132.0) shows it does **not
        reliably restore firing under `codex exec`** in all cases. Best
        defense is interactive trust establishment.
 - **MCP server** — first session may prompt to approve the `anneal_memory`
@@ -231,7 +234,7 @@ mode here is silent. Verify the *actual* runtime, not a proxy:
   instructions and what date were injected into your context this
   session?"* — it should quote the posture string and today's date back.
   Interactive mode is the reliable path because (a) it surfaces hook trust
-  prompts that `codex exec` does not, and (b) Argus empirical observation
+  prompts that `codex exec` does not, and (b) empirical observation
   (codex-cli 0.132.0) is that interactive-session hooks fire reliably
   while `codex exec` is intermittent. If activation works interactively,
   the templates are wired correctly; subsequent `codex exec` reliability
@@ -267,10 +270,11 @@ mode here is silent. Verify the *actual* runtime, not a proxy:
   means the `should_fire()` install-scoping gate is failing (cwd not inside
   install root) or the activation file (`posture.md` /
   `recency_directives.md`) couldn't be read. This validates the *script
-  half* of the contract independently of whether Codex invokes them. A
-  future `levain doctor` / `levain verify hooks` command will automate this
-  with expected-side-effect checks; until then, the standalone invocation
-  is the canonical verification path.
+  half* of the contract independently of whether Codex invokes them.
+  `levain verify-hooks` automates this check (it invokes each installed hook
+  script with the payload a harness would send), and `levain doctor --invoke`
+  runs the same check after doctor's static checks. The standalone invocation
+  above is what those commands do by hand.
 - **Stranger-install end-to-end verification (recommended for new
   deployments):** the canonical install-verification recipe — proven
   against a vanilla Codex install on a separate host — uses `CODEX_HOME`
@@ -315,7 +319,7 @@ mode here is silent. Verify the *actual* runtime, not a proxy:
   ```
   `CODEX_HOME` isolation matters — without it, the operator's main Codex
   install state intercepts and the verification reads/writes the wrong
-  store. Verified working on codex-cli 0.132.0 against `argushub`.
+  store. Verified working on codex-cli 0.132.0 on a separate server host.
 
 ## Store scoping
 
@@ -340,9 +344,9 @@ hooks will read different stores, and the hooks may not fire at all.
 - **Codex hook reliability under `codex exec` is a Codex platform issue,
   not adapter-shaped.** Three independent test contexts confirm this on
   codex-cli 0.132.0: (a) laptop zero-trust install (hooks never fired),
-  (b) argushub stranger zero-trust install (hooks never fired despite
+  (b) a server stranger zero-trust install (hooks never fired despite
   identical adapter file shape and `--dangerously-bypass-hook-trust`),
-  (c) argushub Argus-production trust-established install (hooks fired
+  (c) a server production trust-established install (hooks fired
   intermittently — SessionStart confirmed firing via `state.json` mtime
   updates 3x in one day, then failed on subsequent invocations with no
   config change). The `--dangerously-bypass-hook-trust` flag is documented
