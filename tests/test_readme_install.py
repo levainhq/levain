@@ -81,10 +81,28 @@ def test_a_missing_command_names_path_before_the_old_python():
     assert prose.index("pipx ensurepath") < prose.index("older than 3.12"), prose
 
 
-def test_pipx_is_told_which_python_and_uv_is_said_to_fetch_its_own():
+def test_the_missing_command_remedy_for_uv_is_uvs_own():
     prose = _set_it_up_prose()
-    assert "pipx install --python python3.12 levain" in prose, prose
-    assert "uv tool install" in prose and "fetches" in prose, prose
+    assert "uv tool update-shell" in prose, prose
+    assert prose.index("uv tool update-shell") < prose.index("older than 3.12"), prose
+
+
+def test_the_python_gate_is_scoped_to_plain_pip_and_not_claimed_for_the_installers():
+    block = _fenced_blocks(_section("Set it up"))[0]
+    gate = next(l for l in block.splitlines() if l.startswith("python3 --version"))
+    assert "plain pip" in gate and "3.12" in gate, gate
+    prose = _set_it_up_prose()
+    assert "plain pip only" in prose, prose
+
+
+def test_pipx_is_told_to_name_a_new_enough_python_and_uv_is_hedged():
+    prose = _set_it_up_prose()
+    assert "pipx install --python python3.13 levain" in prose, prose
+    assert "python3.12 levain" not in prose, prose
+    assert "3.12-or-newer interpreter" in prose, prose
+    assert "PIPX_DEFAULT_PYTHON" in prose, prose
+    assert "by default uses the Python it was installed under" in prose, prose
+    assert "fetches one when none is installed" in prose and "automatic downloads" in prose, prose
     assert "install pipx or uv first" in prose.lower(), prose
 
 
@@ -92,13 +110,27 @@ def test_the_readme_makes_no_claim_about_the_package_index_releases():
     assert "placeholder" not in README.lower()
 
 
-def test_contributing_gives_the_literal_ci_install_line_and_no_security_file_link():
+def test_contributing_gives_the_literal_ci_install_line():
     ci_lines = [l.strip().removeprefix("run: ") for l in WORKFLOW.splitlines() if "pip install -e" in l]
     literal = next(l for l in ci_lines if "openhands" in l)
     assert literal in CONTRIBUTING, (literal, CONTRIBUTING)
     assert "test extras" not in CONTRIBUTING
+
+
+def test_contributing_carries_no_security_route_on_this_branch():
+    """The route depends on a repo setting not yet enabled; it lives on seat/1105-36-security until then."""
+    low = CONTRIBUTING.lower()
     assert "SECURITY.md" not in CONTRIBUTING
-    assert "private vulnerability reporting" in CONTRIBUTING and "Security tab" in CONTRIBUTING
+    assert "vulnerability" not in low and "security" not in low, CONTRIBUTING
+
+
+def test_the_changelog_makes_no_claim_about_the_package_index_or_repo_settings():
+    unreleased = CHANGELOG.split("## [Unreleased]", 1)[1].split("\n## [", 1)[0]
+    assert "has_issues" not in unreleased
+    entry = next(e for e in unreleased.split("\n- **") if e.startswith("The README's install block"))
+    if "placeholder" in entry:
+        assert "observed 2026-11-05" in entry, entry
+    assert "python3.12 levain" not in entry, entry
 
 
 def test_the_changelog_structure_contributing_describes_exists():

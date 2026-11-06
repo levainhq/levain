@@ -123,13 +123,13 @@ The store is universal; the *firing* is the harness's job. (Under Codex there's 
 ## Set it up
 
 ```
-python3 --version                # must print 3.12 or newer
+python3 --version                # 3.12 or newer, needed by plain pip only (see below)
 pipx install levain              # or: uv tool install levain
 levain --version                 # must print a version
 levain init --path ./my-partner
 ```
 
-Install it with `pipx` or `uv tool`, not a bare `pip`: either gives levain its own environment and puts the `levain` command on your PATH, and a Homebrew Python refuses a bare `pip install` outright (PEP 668). Install pipx or uv first if you have neither. If `levain --version` finds no command, open a new shell, or run `pipx ensurepath` and then open one: the install directory is often not on your PATH yet. If it still finds none, the Python the installer used is older than 3.12 (the one that ships with macOS is older). `python3 --version` shows only one interpreter, and pipx uses the Python it was itself installed under, so name the one you want: `pipx install --python python3.12 levain`. `uv tool install` fetches a suitable Python itself, so for uv this check does not apply.
+Install it with `pipx` or `uv tool`, not a bare `pip`: either gives levain its own environment and puts the `levain` command on your PATH, and a Homebrew Python refuses a bare `pip install` outright (PEP 668). Install pipx or uv first if you have neither. If `levain --version` finds no command, open a new shell: the install directory is often not on your PATH yet. With pipx, run `pipx ensurepath` and then open one; with uv, run `uv tool update-shell` and then open one. If it still finds none, or the install refused, the Python the installer used is older than 3.12 (the one that ships with macOS is older). `python3 --version` tells you about plain pip only: pipx by default uses the Python it was installed under (`PIPX_DEFAULT_PYTHON` overrides that), so name a 3.12-or-newer interpreter, e.g. `pipx install --python python3.13 levain`. `uv tool install` uses a suitable Python it finds, or fetches one when none is installed and automatic downloads are on, so for uv this check does not apply.
 
 This creates `./my-partner`, runs the interview, lays down the seed, registers the adapter you choose, initializes the store at `.levain/memory.db`, and records the exact version set it composed. Then open that directory with Claude Code or Codex and start working.
 

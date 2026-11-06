@@ -6,8 +6,6 @@ Thanks for looking. This file points at where each thing is written down rather 
 
 - **What Levain is and how it is put together:** the [README](README.md). *Build on it* covers `levain.kernel`, the
   published seam for writing your own surface.
-- **A security problem:** report it through GitHub private vulnerability reporting, on the repository's Security tab,
-  not as a public issue.
 
 ## Setting up a clone
 
