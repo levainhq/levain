@@ -127,7 +127,7 @@ def register_dream(store: Any, *, revise: bool = False, binding: str | None = No
     from levain.agents import refuse, role as _role, spec as _spec
     from levain.agents.store import AgentStoreRefused, get_default_zone
 
-    try:    # EVERY store call checks the marker in its own transaction, so a store moved since open refuses at the first
+    try:    # any store call can meet a moved marker, so none sits outside the guard
         zone = get_default_zone(store)
         role = _role.parse_role(dream_role())
         held = {a["name"] for a in _spec.list_agents(store)}
