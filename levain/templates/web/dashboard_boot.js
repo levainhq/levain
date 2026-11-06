@@ -49,10 +49,10 @@
       retryT = 0;
       if (everDrawn || refusedStop) return;
       if (inflight) { retryUntilDrawn(why); return; }
-      load({ passive: true });
+      load({ passive: true, auto: true });
     }, RETRY_MS[Math.min(retryN++, RETRY_MS.length - 1)]);
   }
-  window.addEventListener("online", function () { if (!everDrawn && !refusedStop && !inflight) { clearTimeout(retryT); retryT = 0; load({ passive: true }); } });
+  window.addEventListener("online", function () { if (!everDrawn && !refusedStop && !inflight) { clearTimeout(retryT); retryT = 0; load({ passive: true, auto: true }); } });
   // A non-passive (save / boot) reload is AUTHORITATIVE — it must eventually render. If one
   // lands while a load is in flight, the shared `inflight` guard would drop it; latch it
   // here and re-fire when the current load settles, so a save's reload can't be swallowed by
@@ -899,6 +899,9 @@
 
   async function load(opts) {
     const passive = !!(opts && opts.passive);
+    // a read the operator or the page's own foreground asks for re-opens the retry chain; only the chain's own timer / online
+    // re-reads (auto) stay shut after a refusal
+    if (!(opts && opts.auto)) refusedStop = false;
     if (inflight) {
       // A passive read is droppable (next trigger re-reads); a non-passive save/boot
       // reload must NOT be — latch it to re-run when the in-flight load settles.
@@ -957,6 +960,7 @@
           // the token-reject branch: a non-token 403 (Host/CSRF — plain-text body) never reaches here,
           // so it falls through to the generic read-failed path below with the stored token intact.
           dropToken();
+          refusedStop = true;
           status("read refused — off-box token missing or invalid");
           return false;
         }
