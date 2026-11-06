@@ -7,6 +7,11 @@ the caps and the estimated spend), ``POST /cockpit/voice/speak`` (one chunk of a
 returns the ``voice.json`` body as a dict; ``levain.web_server`` runs the gates (design section 2) and writes the
 answer.
 
+Premium dictation (the transcribe route, and the ``stt`` use in ``voice.json``) is OFF in Levain 1.0 (Phill 11-05): the
+server refuses the transcribe POST with :data:`WORDS` ``premium_stt_off`` before it reads a key, reserves a meter row or
+reads a body byte, unless it was started with the hidden ``--premium-stt`` switch of ``levain serve``. The code below is kept whole
+for a later release; the switch is the only thing that gates it.
+
 The call sequence is the design's section 3 and its order is the point:
 
 1. validate the request (nothing read or written on a refusal);
@@ -78,6 +83,8 @@ class ProviderData:
     speed_min: float
     speed_max: float
     retention: str
+    # the retention words with premium dictation off (an empty string: ``retention`` already says nothing of it)
+    retention_speech: str = ""
 
 
 PROVIDERS: dict[str, ProviderData] = {
@@ -87,7 +94,8 @@ PROVIDERS: dict[str, ProviderData] = {
                            ("alloy", "ash", "coral", "echo", "fable", "onyx", "nova", "sage", "shimmer"),
                            vprov.OPENAI_DEFAULT_VOICE, vprov.SPEED_MIN, vprov.SPEED_MAX,
                            "Speech: abuse logs kept up to 30 days. Transcription: no abuse-monitoring retention. "
-                           "Not used to train unless opted in."),
+                           "Not used to train unless opted in.",
+                           "Speech: abuse logs kept up to 30 days. Not used to train unless opted in."),
     # the English Aura-2 voices Deepgram documents (vprov.DEEPGRAM_TTS_VOICES); the speed range is the adapter's own
     # (Aura-2's), and the adapter sends a speed other than 1.0
     "deepgram": ProviderData("deepgram", vprov.DEEPGRAM_TTS_MODEL, vprov.DEEPGRAM_STT_MODEL,
@@ -107,6 +115,9 @@ WORDS = {
     "body_timeout": "The request did not arrive in time; try again.",
     "unsupported_media_type": "Send the recording as audio/webm, audio/mp4, audio/mpeg or audio/wav.",
     "not_found": "Premium voice is not served here.",
+    # premium dictation is hidden for Levain 1.0 (Phill 11-05): the transcribe route answers this, in these words only,
+    # whether or not a key exists, until the server is started with the switch (``levain serve --premium-stt``)
+    "premium_stt_off": "Premium dictation is not offered in this version.",
     "bad_json": "The request is not valid JSON.",
     "bad_keys": "A speak request names room_thread_id, reply_gseq, chunk, provider, voice and speed, and nothing else.",
     "bad_provider": "That is not a voice provider.",
@@ -219,13 +230,15 @@ def base_type(content_type: str | None) -> str:
 
 # --- the read ---------------------------------------------------------------------------------------------------------
 
-def serve_voice(data_root: Path | str, meter: vmeter.Meter, *, last_read: MutableMapping[str, str | None]
-                ) -> dict[str, Any]:
+def serve_voice(data_root: Path | str, meter: vmeter.Meter, *, last_read: MutableMapping[str, str | None],
+                premium_stt: bool = False) -> dict[str, Any]:
     """The body of ``GET /cockpit/voice.json``. Whether a provider has a key comes from ONE verified replay of the
     authority log at ``data_root``; the keychain is never read here (Q-D3), so a page's poll never reaches it. Only a
     record's id and uses are shown (no keychain names, no part of a value). ``last_read`` is the outcome of this
     process's last key read or provider call per provider, kept in memory only. The spend is read without creating
-    the ledger."""
+    the ledger. ``premium_stt`` is the server's switch (default off): off, no provider lists ``stt`` among its uses and
+    its retention words leave transcription out, so a page has nothing to offer a dictation control from; the body
+    says ``"premium_stt": false``."""
     try:
         grants = custody.authority_for(data_root)().policy.grants
         authority = "ok"
@@ -234,16 +247,19 @@ def serve_voice(data_root: Path | str, meter: vmeter.Meter, *, last_read: Mutabl
     rows = []
     for name, data in PROVIDERS.items():
         record = voice_key_for(grants, name) if grants else None
+        uses = sorted(u for u in record["uses"] if premium_stt or u != "stt") if record is not None else []
         rows.append({"name": name,
-                     "uses": sorted(record["uses"]) if record is not None else [],
+                     "uses": uses,
                      "key": "set" if record is not None else "not_set",
                      "record_id": record["id"] if record is not None else None,
                      "last_read": last_read.get(name),
                      "voices": list(data.voices), "default_voice": data.default_voice, "tts_model": data.tts_model,
-                     "speed": [data.speed_min, data.speed_max], "retention": data.retention})
+                     "speed": [data.speed_min, data.speed_max],
+                     "retention": data.retention if premium_stt or not data.retention_speech
+                     else data.retention_speech})
     caps = meter.caps
     body: dict[str, Any] = {"providers": rows, "prices_as_of": meter.prices.as_of, "estimate": True,
-                            "authority": authority}
+                            "authority": authority, "premium_stt": bool(premium_stt)}
     try:
         spend = meter.spent_if_present()
         body["meter"] = "ok"

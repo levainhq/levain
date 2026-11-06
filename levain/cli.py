@@ -1097,6 +1097,12 @@ def build_parser() -> argparse.ArgumentParser:
             "search result can reach a search provider's query log."
         ),
     )
+    web_p.add_argument(
+        "--premium-stt",
+        action="store_true",
+        dest="premium_stt",
+        help=argparse.SUPPRESS,      # premium dictation is hidden for Levain 1.0: not listed, and off unless named
+    )
     web_p.set_defaults(func=_cmd_serve)
 
     serve_p = subparsers.add_parser(
@@ -4501,6 +4507,7 @@ def _cmd_serve(args: argparse.Namespace) -> int:
         sign_queue_dir=args.sign_queue_dir,
         sign_host=args.sign_host,
         room=args.room,
+        premium_stt=args.premium_stt,
     )
 
 
