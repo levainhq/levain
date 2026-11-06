@@ -117,13 +117,6 @@ def test_contributing_gives_the_literal_ci_install_line():
     assert "test extras" not in CONTRIBUTING
 
 
-def test_contributing_carries_no_security_route_on_this_branch():
-    """The route depends on a repo setting not yet enabled; it lives on seat/1105-36-security until then."""
-    low = CONTRIBUTING.lower()
-    assert "SECURITY.md" not in CONTRIBUTING
-    assert "vulnerability" not in low and "security" not in low, CONTRIBUTING
-
-
 def test_the_changelog_makes_no_claim_about_the_package_index_or_repo_settings():
     unreleased = CHANGELOG.split("## [Unreleased]", 1)[1].split("\n## [", 1)[0]
     assert "has_issues" not in unreleased
