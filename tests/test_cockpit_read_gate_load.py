@@ -189,3 +189,36 @@ def test_panel_other_does_not_steal_a_named_slot_and_the_log_names_the_folded_ke
     with caplog.at_level(logging.WARNING, logger=web_server.__name__):
         st.record("/cockpit/panel/extra.json", 2500.0)
     assert any("route=panel/other" in r.getMessage() for r in caplog.records)
+
+
+def test_28_concurrent_manifests_share_one_compose(tmp_path: Path, monkeypatch) -> None:
+    """The shared read cache: a page load's burst of identical manifest GETs composes the 36 panels ONCE."""
+    from levain.cockpit.engine import Cockpit
+
+    _fill(tmp_path, monkeypatch)
+    _root, src, _ids = _install(tmp_path)
+    composes = [0]
+    real = Cockpit._manifest_compute
+
+    def counting(self, *a, **kw):
+        composes[0] += 1
+        return real(self, *a, **kw)
+
+    monkeypatch.setattr(Cockpit, "_manifest_compute", counting)
+    with _serve(src, install_class="reported") as (url, httpd):
+        assert _get(url + "/cockpit/manifest.json")[0] == 200            # builds the cockpit, warms it
+        httpd.cockpit.invalidate_reads()
+        composes[0] = 0
+        results: list[int] = []
+        lock = threading.Lock()
+
+        def one() -> None:
+            s, _t = _get(url + "/cockpit/manifest.json")
+            with lock:
+                results.append(s)
+
+        threads = [threading.Thread(target=one) for _ in range(WIDTH)]
+        [t.start() for t in threads]
+        [t.join(60) for t in threads]
+    assert results == [200] * WIDTH
+    assert composes[0] == 1, composes[0]

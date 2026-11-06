@@ -1014,6 +1014,11 @@ _SLOW_READ_MS = 2000.0     # a cockpit read slower than this logs ONE line (rout
 _ROUTE_PANEL_IDS_MAX = 32  # distinct panel ids counted by name; later ones fold into "panel/other"
 
 
+# The cockpit's identical concurrent reads (a page load bursts ~28) share one compute for this long (engine
+# ``_shared_read``); a write handled by this server invalidates at once, a write by another process shows within it.
+COCKPIT_READ_CACHE_TTL_S = 1.5
+
+
 class _RouteStats:
     """In-process latency and refusal counters for the cockpit GET reads. A bounded dict keyed by route TEMPLATE
     (``panel/<id>``, ``manifest``, ``question/<n>``, ``events``, ...), never a raw path: at most
@@ -1916,6 +1921,7 @@ class _LevainHTTPServer(ThreadingHTTPServer):
                 except BaseException:
                     built.stop()    # a half-started cockpit must not leave refreshers running
                     raise
+                built.read_cache_ttl_s = COCKPIT_READ_CACHE_TTL_S   # identical concurrent reads share one compute
                 self.cockpit = built   # published only once started: a failed start retries next request
             cockpit = self.cockpit
         if self.broker is not None:
@@ -2035,8 +2041,18 @@ class _Handler(GuardedHandler):
         self._credential_cache = _UNSET
         self._presence_cache = _UNSET
         self._post_headers = []
+        self.command = None     # a kept-alive connection's previous verb is not this request's
         try:
-            super().handle_one_request()
+            try:
+                super().handle_one_request()
+            finally:
+                # a write (any method but GET/HEAD) has finished: no read cached or in flight before it may be
+                # served to a request that arrives after it (engine.invalidate_reads; the TTL bounds a write made
+                # by ANOTHER process)
+                if getattr(self, "command", None) not in (None, "GET", "HEAD"):
+                    cockpit = getattr(self.server, "cockpit", None)
+                    if cockpit is not None:
+                        cockpit.invalidate_reads()
         except _CredentialUnavailable:
             self.close_connection = True
             try:
