@@ -25,6 +25,19 @@
   // dead, its late result is discarded, and the next read starts.
   let loadGen = 0, inflightAt = 0, inflightPassive = true;
   const STUCK_MS = 8000;
+  // A FAILED first read (a radio still waking on foreground, a proxy hiccup) used to leave the cold "connecting…" line and an empty
+  // board with nothing to try again until the next foreground: Phill 11-06 saw both phones sit there. Until a board has been drawn
+  // once, a failure says so in the line and re-reads on a short backoff (and when the network returns); a refusal (token) is not retried.
+  let everDrawn = false, retryN = 0, retryT = 0;
+  const RETRY_MS = [2000, 4000, 8000, 15000, 30000];
+  function drawnOnce() { everDrawn = true; retryN = 0; clearTimeout(retryT); retryT = 0; }
+  function retryUntilDrawn(why) {
+    if (everDrawn) return;
+    if (storeEl) { storeEl.hidden = false; storeEl.textContent = "can't reach the cockpit yet (" + why + "), trying again…"; }
+    if (retryT) return;
+    retryT = setTimeout(function () { retryT = 0; if (!everDrawn) load({ passive: true }); }, RETRY_MS[Math.min(retryN++, RETRY_MS.length - 1)]);
+  }
+  window.addEventListener("online", function () { if (!everDrawn && !inflight) { clearTimeout(retryT); retryT = 0; load({ passive: true }); } });
   // A non-passive (save / boot) reload is AUTHORITATIVE — it must eventually render. If one
   // lands while a load is in flight, the shared `inflight` guard would drop it; latch it
   // here and re-fire when the current load settles, so a save's reload can't be swallowed by
@@ -906,7 +919,7 @@
         }
         status("read " + new Date().toLocaleTimeString());
         showNotice();
-        landed = true;
+        landed = true; drawnOnce();
         return true;
       }
       let res = await fetch("/substrate.json", { cache: "no-store", headers: readHeaders() });
@@ -951,11 +964,12 @@
       // read-only surface too; the write transports stay gated on `writable` (NO THEATER).
       window.LevainDashboard.render(view, view.writable === false ? { recall } : { commit, commitAction, commitJob, pollJob, onJobsIdle, recall });
       status("read " + new Date().toLocaleTimeString());
-      landed = true;
+      landed = true; drawnOnce();
       return true;
     } catch (e) {
       if (myGen !== loadGen) return false;     // a superseded read's failure says nothing about the page now
       status("read failed: " + (e && e.message ? e.message : e));
+      retryUntilDrawn(e && e.message ? e.message : "read failed");
       return false;
     } finally {
      if (myGen === loadGen) {

@@ -42,6 +42,26 @@ def test_a_foreground_after_a_dead_first_read_repaints_the_board(tmp_path: Path)
     assert cold and board == 0, f"the dead read must leave the page cold, or this proves nothing: {out['values']}"
 
 
+# the first manifest read FAILS (a radio still waking: the fetch rejects at once), later ones go through
+FAIL_FIRST = ("(() => { const f = window.fetch.bind(window); let n = 0;"
+              " window.fetch = function (u, o) { if (String(u).indexOf('/cockpit/manifest.json') === 0 && n++ === 0)"
+              " return Promise.reject(new TypeError('Failed to fetch')); return f(u, o); }; })()")
+
+
+@needs_browser
+def test_a_failed_first_read_says_so_and_retries_by_itself_without_a_foreground(tmp_path: Path) -> None:
+    """Phill 11-06: both phones sat on the cold "connecting…" line with no panels. A hung read was fixed (above); a FAILED one left
+    the line and nothing to try again. It now names the failure in the line and re-reads on a backoff until a board is drawn."""
+    _root, src, _ids = _install(tmp_path)
+    with _serve_plain(src) as url:
+        out = _drive(tmp_path, f"{url}/", [
+            {"init": FAIL_FIRST},
+            {"until": "document.querySelector('#store') && /trying again/.test(document.querySelector('#store').textContent) && 1", "ms": 8000},
+            {"until": DRAWN, "ms": 12000},
+        ])
+    assert out["values"][-1], out["values"]
+
+
 # a registration whose worker is waiting, with a controller already in charge (an update, not a first install)
 STUB = ("(() => { const posts = []; const l = {}; const w = { postMessage: (m) => posts.push(m) };"
         " const reg = { waiting: w, addEventListener() {}, update: () => Promise.resolve() };"
