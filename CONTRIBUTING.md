@@ -6,6 +6,8 @@ Thanks for looking. This file points at where each thing is written down rather 
 
 - **What Levain is and how it is put together:** the [README](README.md). *Build on it* covers `levain.kernel`, the
   published seam for writing your own surface.
+- **A security problem:** report it through GitHub private vulnerability reporting, on the repository's Security tab,
+  not as a public issue.
 
 ## Setting up a clone
 
@@ -17,9 +19,17 @@ bash scripts/install_hooks.sh
 
 ## Running the tests
 
-CI is the recipe: [`.github/workflows/test.yml`](.github/workflows/test.yml) installs the package with its test extras
-and runs `pytest`. Some tests need macOS's `sandbox-exec`, a live Ollama or the Linux image and skip themselves where
-those are absent; a skip is not a pass, so read the skip count in the output.
+CI is the recipe: [`.github/workflows/test.yml`](.github/workflows/test.yml) installs with the line below and runs `pytest`
+(in shards; the workflow splits the suite).
+
+```
+pip install -e ".[dev,openhands]" hatchling
+```
+
+Some tests need something your machine may not have and skip themselves where it is absent: macOS's `sandbox-exec`, a
+live Ollama, the Linux image, a real Chrome (the `needs_browser` tests), Node with `srt` and `uv` (the chat egress
+tests). CI runs several of these in their own jobs, and one more job runs root-run code on Python 3.9; plain `pytest`
+runs none of those jobs for you. A skip is not a pass, so read the skip count in the output.
 
 ## Changes
 
