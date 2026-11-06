@@ -4,52 +4,21 @@ name: ubuntu-latest-probe
 # 26.04 and these tests fail there. This workflow runs exactly that failing subset on `ubuntu-latest` every week,
 # so the day a product fix or a runner change makes them pass shows up as a green probe. It never gates main:
 # the job is continue-on-error and nothing reads this workflow's verdict (the release gate reads `test`).
-# Known 26.04 failures (run 42223831873): (1) sudo-rs rejects `Defaults !requiretty` (levain/firing/hands.py
-# sudoers_text -> visudo "unknown setting"); (2) the confined shell's start probe dies with "Invalid environment
-# variable name evaluates to an empty string" (the runner's ${...} reaches an expander before bash does).
+# Failures first seen on 26.04 (run 42223831873), both since FIXED in the product and kept here as regression
+# watch: (1) sudo-rs rejects `Defaults !requiretty`, `!log_input`, `!log_output` (visudo "unknown setting");
+# hands.py sudoers_text omits them on sudo-rs only. (2) the confined shell's start probe died with "Invalid
+# environment variable name" because systemd-run expanded `${...}` in the scope argv; confinement.py now escapes
+# `$` only on hosts that expand it. A red pytest line here is a regression; the job's own green means nothing.
 
 on:
   schedule:
     - cron: "17 6 * * 1"
   workflow_dispatch:
-  push:
-    branches: [seat/1106-50-unpin]   # TEMPORARY: measure 26.04 on the branch before landing; remove this trigger at landing
 
 permissions:
   contents: read
 
 jobs:
-  diag:   # TEMPORARY measurement job, removed before landing
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v6
-      - run: |
-          cat > /tmp/diag.sh <<'DIAG'
-          #!/bin/bash
-          # TEMPORARY measurement: does systemd-run expand ${...} / $$ in the argv of a --scope command on this runner?
-          systemd --version | head -1
-          loginctl enable-linger "$USER" 2>&1 | head -1
-          export XDG_RUNTIME_DIR=/run/user/$(id -u)
-          echo "--- plain scope, \${BASH_VERSINFO[0]} in -c"
-          /usr/bin/systemd-run --user --scope --quiet bash -c 'echo V=${BASH_VERSINFO[0]} P=${!1} U=${HOME%%/*}' bash 2>&1 | head -5
-          echo "--- doubled dollars"
-          /usr/bin/systemd-run --user --scope --quiet bash -c 'echo V=$${BASH_VERSINFO[0]} P=$${!1} U=$${HOME%%%%/*}' bash 2>&1 | head -5
-          echo "--- plain bash (control)"
-          bash -c 'echo V=${BASH_VERSINFO[0]} U=${HOME%%/*}' bash
-          DIAG
-          bash /tmp/diag.sh
-      - run: |
-          cat > /tmp/diag2.sh <<'DIAG2'
-          #!/bin/bash
-          # TEMPORARY measurement: which sudoers Defaults does this host's visudo accept?
-          sudo --version | head -2
-          visudo --version 2>&1 | head -1
-          for tok in '!requiretty' '!log_input' '!log_output' '!use_pty' 'env_reset' '!env_reset' 'secure_path="/usr/bin"' '!lecture' '!fqdn' '!syslog' 'timestamp_timeout=0' '!visiblepw' 'always_set_home' 'umask=0027' 'passwd_tries=1' 'closefrom=3' 'noexec' '!authenticate' '!set_home' 'logfile="/tmp/x"'; do
-            printf 'Defaults %s\n' "$tok" > /tmp/dd.sudoers
-            if out=$(visudo -cf /tmp/dd.sudoers 2>&1); then echo "OK    $tok"; else echo "REJECT $tok :: $(echo "$out" | head -1)"; fi
-          done
-          DIAG2
-          bash /tmp/diag2.sh
   probe:
     name: ubuntu-latest probe (non-gating)
     runs-on: ubuntu-latest

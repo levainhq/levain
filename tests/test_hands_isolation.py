@@ -181,9 +181,24 @@ def test_the_sudoers_step_is_validated_and_scoped_to_the_hands_user(tmp_path: Pa
     # Linux (D, Phill 2026-10-09): the runas group is the net group, the one gid the egress boundary lets out.
     runas = f"{h} : {h}_net" if host == "linux" else h
     from levain.firing.hands import sudo_knows_requiretty
-    want_rt = [f"Defaults>{h} !requiretty"] if sudo_knows_requiretty() else []
-    assert rules == [*want_rt, f"Defaults>{h} env_reset",
-                     f"Defaults>{h} !log_input, !log_output, !use_pty", f"alice ALL=({runas}) NOPASSWD: ALL"]
+    classic = sudo_knows_requiretty()
+    want_rt = [f"Defaults>{h} !requiretty"] if classic else []
+    want_io = f"Defaults>{h} !log_input, !log_output, !use_pty" if classic else f"Defaults>{h} !use_pty"
+    assert rules == [*want_rt, f"Defaults>{h} env_reset", want_io, f"alice ALL=({runas}) NOPASSWD: ALL"]
+
+
+def test_classic_sudo_text_is_byte_identical_and_sudo_rs_drops_only_the_unknown_tokens() -> None:
+    classic = sudoers_text("alice", "_levain_x", requiretty=True)
+    assert classic == (
+        "# Written by `levain setup-isolation`; removed by `levain setup-isolation --undo`.\n"
+        "# alice may run commands as the Levain hands user _levain_x, and nothing else.\n"
+        "Defaults>_levain_x !requiretty\n"
+        "Defaults>_levain_x env_reset\n"
+        "Defaults>_levain_x !log_input, !log_output, !use_pty\n"
+        "alice ALL=(_levain_x) NOPASSWD: ALL\n")
+    rs = sudoers_text("alice", "_levain_x", requiretty=False)
+    assert rs == classic.replace("Defaults>_levain_x !requiretty\n", "").replace("!log_input, !log_output, ", "")
+    assert "log_input" not in rs and "log_output" not in rs and "!use_pty" in rs
 
 
 @pytest.mark.parametrize("first,knows", [

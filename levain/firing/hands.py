@@ -626,7 +626,11 @@ def sudoers_text(operator: str, hands_user: str, net_group: str | None = None, *
         + f"Defaults>{hands_user} env_reset\n"
         # levain hands bash a socket on stdin and reads its state back over it; I/O logging and a
         # pseudo-terminal would put sudo's own pipe or pty there instead (S2 L2b L3).
-        f"Defaults>{hands_user} !log_input, !log_output, !use_pty\n"
+        # sudo-rs (same detector as requiretty above) has no log_input / log_output setting (visudo: "unknown
+        # setting", measured on ubuntu-26.04) and does no I/O logging at all, so the two negations are no-ops
+        # there; !use_pty is accepted and stays. Classic sudo keeps the full line, byte for byte.
+        + (f"Defaults>{hands_user} !log_input, !log_output, !use_pty\n" if requiretty
+           else f"Defaults>{hands_user} !use_pty\n")
         # Linux: the runas group lets the operator's `levain ws-git` start network git with the net
         # group's gid, the one gid the egress boundary lets out.
         + (f"{operator} ALL=({hands_user} : {net_group}) NOPASSWD: ALL\n" if net_group
