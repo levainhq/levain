@@ -2,7 +2,7 @@
 
 Codex runs this hook when it is about to ask for approval, and shows NO dialog while the hook runs (measured, Q0
 item 6 and Q3): the TUI says "Running hook" and the approval dialog appears only after the hook returns. So a hold
-delays the dialog, and the hook holds only while the operator is away (their word, or input idle) and stops
+delays the dialog, and the hook holds only while the operator is away (their word, or the presence record) and stops
 holding when they come back. The hook:
 
 1. reads the event (``tool_name``, ``tool_input``, ``session_id``, ``cwd``, ``permission_mode``) and files one

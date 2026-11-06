@@ -2594,15 +2594,17 @@ def _add_consent_away_parser(cs_sub: argparse._SubParsersAction) -> None:
         "away", help="Show or set away mode: whether the consent hook holds a request for a signed answer.",
         description="Whether an approval waits for a signed answer from your devices. It follows your presence "
                     "record, the same one `levain ping status` prints: an approval is held for a signed answer "
-                    "exactly when it would reach your devices (the default follows your input at this Mac: on after "
-                    "--idle-after seconds without it, 600 unless you set another), and otherwise the agent's own "
-                    "dialog asks you at once. `on`, `off` and `auto` are your verbs on that record and each prints "
+                    "exactly when it would reach your devices (the default, devices on `follow`, is on once you have not "
+                    "typed a message to a desk session for --idle-after seconds, 600 unless you set another; input at "
+                    "this Mac never counts), and otherwise the agent's own dialog asks you at once. `on`, `off` and `auto` are your verbs on that record and each prints "
                     "its line: `on` = devices on (and an away mark in the consent queue store, which stands over the "
                     "record: leaving it takes a leave signed by a key enrolled in the install's cockpit, "
                     "--signing-key); `off` = a signed leave and devices off; `auto` = a signed leave and devices "
-                    "follow (--idle-after sets the follow time, 60 to 86400 seconds). A held request ends early "
-                    "when the record says the other way (your input, or `off`), leaving the agent's own dialog to "
-                    "ask. `on` refuses when no enrolled key in the install's cockpit could sign an answer, and a "
+                    "follow (--idle-after sets the follow time, 60 to 86400 seconds). `on`, `off` and `auto` set the "
+                    "presence record's devices, so they route every ping, not only approvals (`auto` also resets a "
+                    "devices setting made with `levain ping`), and --idle-after is that record's follow time for all "
+                    "pings. A held request ends early when the record says the other way (a message you typed to a "
+                    "desk session, or `off`), leaving the agent's own dialog to ask. `on` refuses when no enrolled key in the install's cockpit could sign an answer, and a "
                     "record that sends approvals to your devices holds only while one could. Claude Code shows its "
                     "own dialog during the hold too (an allow from the hook dismisses it); Codex shows no dialog "
                     "until the hold ends, so for Codex away means away. A consent store that cannot be read is "
@@ -2618,7 +2620,7 @@ def _add_consent_away_parser(cs_sub: argparse._SubParsersAction) -> None:
                       help="Seconds to hold a request in away mode, more than 0 and at most 840, the longest the "
                            "hook waits (default: the file's hold, else 300 for Claude Code and 120 for Codex).")
     away.add_argument("--idle-after", dest="idle_after", type=float, default=None,
-                      help="With `auto`: seconds of no input after which devices come on (the record's follow time, "
+                      help="With `auto`: seconds without a message you typed to a desk session after which devices come on (the record's follow time, "
                            "60 to 86400; default: the record's, else 600).")
     away.add_argument("--signing-key", dest="signing_key", type=Path, default=None,
                       help="With `off` or `auto`: an enrolled key that signs leaving an away mode `on` set (its "

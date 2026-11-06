@@ -4,8 +4,8 @@ Three records beside the presence word (all under ``<queue_dir>/webpush/``), plu
 
 - **A desk message** (:func:`note_desk_message`, ``desk_message.json``): the operator typed a message to a desk at the laptop.
   It is laptop input: it ends an ``until: input`` overlay (``away``, ``sleep``) at once, by READING (the intent record is never
-  written here, :mod:`levain.webpush.intent`), and counts as activity for the ``follow`` threshold, so a long message that is
-  being composed holds pings the way keyboard input does. A turn in the Claude app's remote control is NOT a desk message: the caller decides, and it reports
+  written here, :mod:`levain.webpush.intent`), and ``follow`` reads it: devices stay off until the newest one is ``follow_after``
+  old (sensed keyboard or mouse input does not count). A turn in the Claude app's remote control is NOT a desk message: the caller decides, and it reports
   that as :func:`~levain.webpush.presence.note_remote_activity`. Every desk message writes a row to the presence log
   (``levain ping log``), which is the stream a coordinator wakes on.
 - **Desk liveness** (:func:`publish_desk` / :func:`end_desk` / :func:`read_desk`, ``desk.json``): the desk's name and when it
@@ -13,7 +13,8 @@ Three records beside the presence word (all under ``<queue_dir>/webpush/``), plu
   ``live``: a publisher that died must not leave "live" standing.
 - **The Here / Away reading of the operator** (:func:`you_view`), derived from the laptop's input idle time (and a desk
   message): ``here`` while the last input is under ``follow_after`` old (the one threshold, ten minutes by default), ``away``
-  after it, cleared by input. :func:`observe` writes one presence-log row at each change (``auto-away`` / ``auto-here``) and
+  after it, cleared by input. It is a display and an event stream: ``follow`` itself reads the typed desk message alone
+  (:func:`levain.webpush.intent.devices_on_now`). :func:`observe` writes one presence-log row at each change (``auto-away`` / ``auto-here``) and
   one when it first sees an overlay ended (``ended away`` / ``ended sleep`` / ``ended quiet``): event rows, never a record write.
   The word "desk" is never used for this reading: it names the desk, and the operator is "you".
 

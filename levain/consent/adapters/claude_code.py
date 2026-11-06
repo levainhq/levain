@@ -26,7 +26,7 @@ Settings live in ``<levain home>/consent/claude_code.json`` (:data:`SETTINGS_NAM
 
     {"cockpit_data_root": "/absolute/cockpit/data/root", "away_mode": false, "away_hold_seconds": 0}
 
-plus, once ``levain consent away`` has written them, ``away_word`` (``"on"`` / ``"off"``, absent for input idle)
+plus, once ``levain consent away`` has written them, ``away_word`` (``"on"`` / ``"off"``, absent for input idle, which only a caller with no queue directory reads)
 and ``away_idle_seconds``. Missing or unreadable settings mean no explicit word and no authority (so no answer can
 verify, and nothing is held). An away mode set by ``levain consent away on`` is also an away mark in the queue store,
 and the hook reads it there (:func:`with_away_mark`): until a signed leave of it verifies, the agent is away whatever
@@ -106,8 +106,8 @@ GATE_HOLD_CEILING = 840.0
 
 @dataclass(frozen=True)
 class AdapterSettings:
-    # away_mode is the explicit word on, explicit_off the explicit word off; with neither, input idle decides
-    # (levain.consent.auto_away.away_state). legacy: the file holds no away_word (written before auto-away
+    # away_mode is the explicit word on, explicit_off the explicit word off; with neither, input idle decides for a caller
+    # with no queue directory and the presence record decides otherwise (levain.consent.auto_away.away_state). legacy: the file holds no away_word (written before auto-away
     # existed), so its away_mode is read as the word
     away_mode: bool = False
     away_hold_seconds: float = 0.0
@@ -153,7 +153,7 @@ def try_read_settings_file(path: Path) -> AdapterSettings | None:
 def settings_from(data: Any) -> AdapterSettings:
     """The settings a parsed settings file means, as both adapters' hooks and ``levain consent away`` read it:
     the explicit word ``away_word``: ``"on"`` (away mode), ``"off"`` (``explicit_off``) or ``"auto"`` (input idle
-    decides). A file without a valid one was written before auto-away existed (``legacy``): its ``away_mode`` is
+    decides for a caller with no queue directory, the presence record otherwise). A file without a valid one was written before auto-away existed (``legacy``): its ``away_mode`` is
     the word, ``true`` on and anything else off, whether ``levain init`` or the operator wrote it (the two cannot
     be told apart, and an operator's off is never undone by an upgrade); a hold only when it is a finite number >= 0
     (an integer too large for a float is malformed), an idle threshold

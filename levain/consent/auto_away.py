@@ -3,10 +3,12 @@
 Given a queue directory (every hook call site), away is decided in this order, strongest first: an unreadable
 store (away), a signed away mark (``levain consent away on``, which only a signed ``off`` or ``auto`` leaves; away),
 then the presence record: an approval is held for a signed answer exactly when it would reach the operator's devices
-(:func:`levain.webpush.intent.approvals_route`, the same sample as ``should_push(queue_dir, "consent")``), with ONE
-named exception: when ``follow`` reads "devices on" only because there is no laptop input reading (Linux, an
-``ioreg`` failure), the ping still goes (fail-open) but the hold does not (the agent's own dialog asks), and the
-describe line's ``Approvals:`` clause says so. The mark rule (:func:`mark_stands`) is shared with the approval push
+(:func:`levain.webpush.intent.approvals_route`, the same sample as ``should_push(queue_dir, "consent")``). That
+function also returns ``blind``, for a ``follow`` that reads "devices on" only for want of a measurement: the ping would
+still go (fail-open) but the hold would not (the agent's own dialog asks), and the describe line's ``Approvals:``
+clause would say so. No input is unmeasured today, because ``follow`` reads the typed desk message alone, so
+``intent._blind`` is always false and that branch never fires; it stays as the one place a future unmeasurable input
+would say so. The mark rule (:func:`mark_stands`) is shared with the approval push
 (:func:`approval_push`), so a standing mark that holds a request also pushes it. The PING about a request already
 filed and held is wider than the hold (Phill 11-02, np-e642162b (a)): :func:`approval_push` sends it whatever the desk
 or devices setting is doing, unless a mute holds it; the hold's own question above is unchanged. The settings file's ``away_word``, ``away_mode`` and ``away_idle_seconds`` are not
@@ -168,8 +170,8 @@ def approvals_note(queue_dir: Path | str | None, *, to_devices: bool | None = No
     clause appear only where consent differs from the record; without it a standing mark or an unsignable install is
     always named (true, and never wrong). A signed away mark stands over the record (approvals reach the devices for a
     signed answer whatever it says); a record that would send them there still holds only while an enrolled key could
-    sign, and not at all when ``blind`` (it sends them there only for want of a laptop input reading:
-    :func:`away_state` then leaves the agent's own dialog to ask). Read for every agent that has settings or a store in
+    sign, and not at all when ``blind`` (it sends them there only for want of a measurement, which no input
+    leaves today: :func:`away_state` would then leave the agent's own dialog to ask). Read for every agent that has settings or a store in
     ``queue_dir``; any fault says nothing."""
     if queue_dir is None:
         return None
@@ -198,7 +200,7 @@ def approvals_note(queue_dir: Path | str | None, *, to_devices: bool | None = No
             return ("your devices, for a signed answer (a signed away stands; leave: levain consent away off "
                     "--signing-key <key>)")
         if unmarked and blind and to_devices is True:
-            return ("the agent's own dialog (no laptop input reading, so nothing measured shows you away; the ping "
+            return ("the agent's own dialog (nothing measured shows you away; the ping "
                     "still reaches your devices)")
         if unsignable and to_devices is not False:
             return "the agent's own dialog (no enrolled key can sign from a device)"

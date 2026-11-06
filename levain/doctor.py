@@ -3405,8 +3405,9 @@ def _check_autonomic_store(store_dir: Path | None = None) -> list[CheckResult]:
 
 def _check_cockpit_authority(install: Path) -> list[CheckResult]:
     """The cockpit's signing keys (trust-tiering DESIGN §3.9), read from ``<install>/.levain/cockpit``.
-    A WARNING, never a failure, while exactly one laptop-presence key that can sign is enrolled: losing it
-    leaves nothing that can enrol a successor. A FAIL per QUARANTINED key, and a FAIL when unrevoked
+    A FAIL while exactly one laptop-presence key that can sign is enrolled (a quarantined key does not count):
+    losing it leaves nothing that can enrol a successor. A WARNING, not a failure, when none can sign and no
+    laptop-presence key is quarantined. A FAIL per QUARANTINED key, and a FAIL when unrevoked
     laptop-presence keys remain but every one is quarantined (nothing in this levain can recover that).
     No row at all without a cockpit journal. The journal is
     opened read-only (SQLite may add its WAL side files beside it): a ``levain-cockpit/2`` journal is

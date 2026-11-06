@@ -21,7 +21,7 @@ Every timestamp (`as_of`, `at`) is ISO-8601.
 | `ambient` | `{events: [{kind, at, repo, agent, outcome}], legend}` | an event missing any of the five keys; `kind` empty; `at` not ISO; `repo`/`agent` neither string nor null; `outcome` not `ok`/`failed`; `legend` missing or blank. Extra keys on an event are accepted and ignored |
 | `status-dots` | `{metrics: [{label, status?, value?, unit?, read?}], alerts?: [{message, severity?}]}`; `status` is `ok`/`warn`/`bad`/`unknown` (default `unknown`) | a metric without a label; a `status` outside the four; a `value` that is not a finite number or a string; a `unit` or `read` that is not a string; an alert without `message` |
 | `metric-grid` | `{numbers: [{label, value, unit?}]}` | `value` not a finite number (a numeric string, a boolean, NaN and the infinities are refused) |
-| `roster` | `{rows: [{name, memory, cadence, lifecycle, role?, group?, wrap_every?, silence_is_signal?, digest?, last_call?}]}` | `memory` not `stateful`/`stateless`; `cadence` not `resident`/`on_call`; `lifecycle` not `active`/`retired`; a repeated or empty `name`; `digest` neither an object nor null; `last_call` neither null nor `{at (ISO-8601), outcome (ok or failed)}` |
+| `roster` | `{rows: [{name, memory, cadence, lifecycle, kind?, role?, group?, wrap_every?, silence_is_signal?, digest?, last_call?}]}` | `memory` not `stateful`/`stateless`; `cadence` not `resident`/`on_call`; `lifecycle` not `active`/`retired`; a repeated or empty `name`; `digest` neither an object nor null; `last_call` neither null nor `{at (ISO-8601), outcome (ok or failed)}` |
 | `list` | `Read(rows=(RowIn, ...))` with `order` (a registered ordering) and `version_fields` declared on the spec; groups, facets, views and verbs as the row engine defines them | the spec lacks `order` or `version_fields`; a facet the spec did not declare |
 | `form` | `{fields: [{name, type, label?, enum?}], verb?}`; `type` is `text`, `recipient` or `date` | no fields; a repeated or empty `name`; an unknown `type`; a `recipient` field whose `enum` is not a non-empty list of non-empty strings; an `enum` on a non-recipient field |
 | `log` | `{rows: [{verb, target, actor, at}]}` | any of the four missing or empty; `at` not ISO |
@@ -33,6 +33,10 @@ Notes a provider relies on:
 - **`roster`**: a `digest` of `null` means "no data" and renders as such; it is never read as zero. A
   row whose `lifecycle` is `retired` is dropped by the kernel (the value carries `retired_hidden: n`).
   `silence_is_signal` defaults to `cadence == "resident"` when omitted or null.
+  `kind` is not validated by the kernel, and only `"role"` means a role: a row with `kind: "role"` is read for
+  health from its digest's last run (`last_run_at`, `last_run_status`, `run_failed`, `run_late`); a row whose
+  `kind` is missing or `null` is read as a role when its `memory` is `stateless`; every other value, `"job"`
+  included, reads as not a role (episodes and wraps).
 - **`form`**: the provider supplies a `recipient` field's `enum` from its own registry; the kernel
   checks only that it is a non-empty list of strings.
 - **`log`**: the kernel adds a `sentence` to each row, `"<verb label> · <target>"`, from the

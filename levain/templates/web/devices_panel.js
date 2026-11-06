@@ -941,7 +941,7 @@
     prDevBtns = segment(prSheet, PR_DEVICES, "Whether pings reach your devices", (v) => customize({ devices: v }));
     prAfterRow = el("div", "pr-sheet-seg pr-sub");
     prAfterRow.setAttribute("role", "group");
-    prAfterRow.setAttribute("aria-label", "Follow: minutes without input before devices come on");
+    prAfterRow.setAttribute("aria-label", "Follow: minutes without a message you typed before devices come on");
     prAfterRow.appendChild(el("span", "pr-sheet-hint", "after"));
     for (const m of PR_AFTER) {
       const b = el("button", "pr-big pr-after", String(m));
@@ -955,7 +955,7 @@
     prAfterBtns.custom = cu; prAfterRow.appendChild(cu);
     prAfterRow.appendChild(el("span", "pr-sheet-hint", "min"));
     prSheet.appendChild(prAfterRow);
-    prAfterCustom = minutesField(prSheet, "Minutes without input before devices come on", (n) => { prAfterOpen = false; customize({ follow_after: n * 60 }); });
+    prAfterCustom = minutesField(prSheet, "Minutes without a message you typed before devices come on", (n) => { prAfterOpen = false; customize({ follow_after: n * 60 }); });
 
     labelled(prSheet, "Lets through");
     prLetsBtns = segment(prSheet, [], "What reaches your devices", (v) => customize({ lets_through: v }));
