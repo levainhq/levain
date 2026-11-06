@@ -25,6 +25,35 @@
   // dead, its late result is discarded, and the next read starts.
   let loadGen = 0, inflightAt = 0, inflightPassive = true;
   const STUCK_MS = 8000;
+  // A FAILED first read (a radio still waking on foreground, a proxy hiccup) used to leave the cold "connecting…" line and an empty
+  // board with nothing to try again until the next foreground: Phill 11-06 saw both phones sit there. Until a board has been drawn
+  // once, a failure says so in the line and re-reads on a short backoff (and when the network returns); a refusal (token) is not retried.
+  let everDrawn = false, retryN = 0, retryT = 0, refusedStop = false;
+  // a refusal travels as a typed property, never as message text (a connection-refused network error must still retry)
+  function refusal(msg) { const e = new Error(msg); e.refused = true; return e; }
+  const RETRY_MS = [2000, 4000, 8000, 15000, 30000];
+  function drawnOnce() { if (everDrawn === false && storeEl && /^(can't reach the cockpit|the cockpit refused)/.test(storeEl.textContent || "")) storeEl.textContent = ""; everDrawn = true; refusedStop = false; retryN = 0; clearTimeout(retryT); retryT = 0; }
+  function retryUntilDrawn(why, refused) {
+    if (everDrawn) return;
+    // a refusal (the token the page holds is missing or wrong) is not a network blip: a retry would only ask again, and each ask can
+    // put up the token prompt. Say it and stop; the next foreground or the Refresh button reads again.
+    if (refused) {
+      refusedStop = true;
+      if (storeEl) { storeEl.hidden = false; storeEl.textContent = "the cockpit refused this device (" + why + "); pair it again or reload"; }
+      return;
+    }
+    if (storeEl) { storeEl.hidden = false; storeEl.textContent = "can't reach the cockpit yet (" + why + "), trying again…"; }
+    if (retryT) return;
+    // a read already in flight (a foreground started one) would drop this retry and end the chain: wait and ask again instead
+    retryT = setTimeout(function () {
+      retryT = 0;
+      if (everDrawn || refusedStop) return;
+      if (inflight) { retryUntilDrawn(why); return; }
+      load({ passive: true, auto: true });
+    }, RETRY_MS[Math.min(retryN++, RETRY_MS.length - 1)]);
+  }
+  // (the node harnesses that load this file hand it a window with no event API)
+  if (typeof window.addEventListener === "function") window.addEventListener("online", function () { if (!everDrawn && !refusedStop && !inflight) { clearTimeout(retryT); retryT = 0; load({ passive: true, auto: true }); } });
   // A non-passive (save / boot) reload is AUTHORITATIVE — it must eventually render. If one
   // lands while a load is in flight, the shared `inflight` guard would drop it; latch it
   // here and re-fire when the current load settles, so a save's reload can't be swallowed by
@@ -347,12 +376,12 @@
     let res = await fetch(url, { cache: "no-store", headers: readHeaders(), signal: signal });
     if (res.status === 403 && await isTokenReject(res)) {
       if (promptForToken()) res = await fetch(url, { cache: "no-store", headers: readHeaders(), signal: signal });
-      if (res.status === 403) { dropToken(); throw new Error("off-box token missing or invalid"); }
+      if (res.status === 403) { dropToken(); throw refusal("off-box token missing or invalid"); }
     }
     if (!res.ok) {
       let m = "HTTP " + res.status;
       try { const d = await res.json(); m = d.message || d.error || m; } catch (_) { /* ignore */ }
-      throw new Error(m);
+      const re = new Error(m); re.refused = res.status === 401 || res.status === 403; throw re;
     }
     return res.json();
   }
@@ -871,6 +900,9 @@
 
   async function load(opts) {
     const passive = !!(opts && opts.passive);
+    // a read the operator or the page's own foreground asks for re-opens the retry chain; only the chain's own timer / online
+    // re-reads (auto) stay shut after a refusal
+    if (!(opts && opts.auto)) refusedStop = false;
     if (inflight) {
       // A passive read is droppable (next trigger re-reads); a non-passive save/boot
       // reload must NOT be — latch it to re-run when the in-flight load settles.
@@ -906,7 +938,7 @@
         }
         status("read " + new Date().toLocaleTimeString());
         showNotice();
-        landed = true;
+        landed = true; drawnOnce();
         return true;
       }
       let res = await fetch("/substrate.json", { cache: "no-store", headers: readHeaders() });
@@ -929,11 +961,12 @@
           // the token-reject branch: a non-token 403 (Host/CSRF — plain-text body) never reaches here,
           // so it falls through to the generic read-failed path below with the stored token intact.
           dropToken();
+          refusedStop = true;
           status("read refused — off-box token missing or invalid");
           return false;
         }
       }
-      if (!res.ok) throw new Error("HTTP " + res.status);
+      if (!res.ok) { const he = new Error("HTTP " + res.status); he.refused = res.status === 401 || res.status === 403; throw he; }
       const view = await res.json();
       if (myGen !== loadGen) return false;     // superseded while it was stuck: the newer read owns the board
       // Post-fetch race re-check (codex L3 HIGH): a passive load that STARTED clean, then
@@ -951,11 +984,12 @@
       // read-only surface too; the write transports stay gated on `writable` (NO THEATER).
       window.LevainDashboard.render(view, view.writable === false ? { recall } : { commit, commitAction, commitJob, pollJob, onJobsIdle, recall });
       status("read " + new Date().toLocaleTimeString());
-      landed = true;
+      landed = true; drawnOnce();
       return true;
     } catch (e) {
       if (myGen !== loadGen) return false;     // a superseded read's failure says nothing about the page now
       status("read failed: " + (e && e.message ? e.message : e));
+      retryUntilDrawn(e && e.message ? e.message : String(e || "read failed"), !!(e && e.refused));
       return false;
     } finally {
      if (myGen === loadGen) {
