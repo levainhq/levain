@@ -108,7 +108,8 @@ jobs:
           python tests/ci/shard.py pick --shards "$TEST_SHARDS" --shard "${{ matrix.shard }}" < "$RUNNER_TEMP/nodes.txt" > "$RUNNER_TEMP/files.txt"
           mapfile -t files < "$RUNNER_TEMP/files.txt"
           test "${#files[@]}" -gt 0 || { echo "shard ${{ matrix.shard }} has no files"; exit 1; }
-          pytest -q --basetemp=/tmp/levain-pt "${files[@]}"
+          # --durations=25 prints the 25 slowest tests into the log, a measurement the shard weights lack (the -q progress parse ignores it)
+          pytest -q --durations=25 --basetemp=/tmp/levain-pt "${files[@]}"
 
       - name: Keep what the page showed at a failed wait
         # the page driver writes timeout-step-<n>.png / .txt beside its steps file, under pytest's basetemp; reading them is how a
