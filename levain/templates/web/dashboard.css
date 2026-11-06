@@ -1802,9 +1802,10 @@ body.ke .needs-tab { flex: 0 1 auto; min-width: 0; min-height: var(--hit-min); p
 body.ke .needs-tab:hover { color: var(--text); }
 body.ke .needs-tab.is-on { color: var(--text); border-bottom-color: var(--accent); }
 body.ke .needs-tab:focus-visible, body.ke .needs-more-row:focus-visible, body.ke .needs-layout-btn:focus-visible { outline: none; box-shadow: 0 0 0 3px var(--accent-line); }
-body.ke .needs-layout-sw { display: inline-flex; align-items: center; gap: var(--sp-2); font: var(--fw-medium) var(--fs-meta)/1 var(--mono); color: var(--meta); }
-body.ke .needs-layout-btn { min-height: var(--hit-min); padding: 0 var(--sp-4); font: inherit; color: var(--label); background: none; border: 1px solid var(--hair-2); border-radius: var(--r-sm); cursor: pointer; }
-body.ke .needs-layout-btn.is-on { color: var(--base); background: var(--text); border-color: var(--text); }
+/* the rows | tiles control is a phone choice: at desktop width both draw the same cards, so it is not drawn there (Phill 11-06) */
+body.ke .needs-layout-sw { display: none; }
+body.ke .needs-layout-btn { appearance: none; flex: 1 1 0; min-height: 36px; padding: 0 var(--sp-4); font: var(--fw-semibold) var(--fs-meta)/1 var(--sans); color: var(--label); background: none; border: 0; border-radius: calc(var(--r-sm) - 2px); cursor: pointer; }
+body.ke .needs-layout-btn.is-on { color: var(--text); background: var(--base); box-shadow: 0 1px 2px rgba(0, 0, 0, .18), 0 0 0 .5px var(--hair-2); }
 body.ke .needs-group { grid-column: 1 / -1; font: var(--fw-bold) var(--fs-micro)/1 var(--mono); letter-spacing: .08em; text-transform: uppercase; color: var(--meta); padding: var(--sp-3) var(--sp-2) 0; }
 body.ke .needs-empty { grid-column: 1 / -1; padding: var(--sp-5) var(--sp-2); }
 body.ke .needs-more-row { grid-column: 1 / -1; display: flex; align-items: center; justify-content: center; width: 100%; min-height: 48px; padding: var(--sp-3) var(--sp-5); box-sizing: border-box;
@@ -1817,7 +1818,8 @@ body.ke .needs-row-opts { white-space: nowrap; }
   body.ke .needs-tab { font-size: var(--fs-body); padding: 0 var(--sp-3); }
   body.ke .needs-headline .needs-gloss, body.ke .needs-headline .needs-order { display: none; }
   body.ke .needs-headline .needs-history { flex: none; min-height: var(--hit-min); font-size: var(--fs-micro); padding: var(--sp-1) var(--sp-3); }
-  body.ke .needs-layout-sw { flex: 1 0 100%; order: 9; }   /* the mock-up switch takes a line of its own, after "all decisions" */
+  /* a native-looking segmented control on a line of its own: a recessed track, the chosen segment raised */
+  body.ke .needs-layout-sw { display: flex; flex: 1 0 100%; order: 9; gap: 2px; padding: 2px; min-height: 40px; box-sizing: border-box; background: var(--card-2); border: 1px solid var(--hair); border-radius: var(--r-sm); }
   body.ke .needs-asked { display: none; }
   body.ke .needs-grid .needs-row-sub { display: none; }
   body.ke .needs-grid .needs-row-title { min-height: 0; }

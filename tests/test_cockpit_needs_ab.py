@@ -91,7 +91,7 @@ def test_rows_show_six_then_a_fold_that_states_its_hidden_count_and_oldest_age(t
 
 
 @needs_browser
-def test_tiles_are_two_columns_with_every_item_shown_and_clamped_titles(tmp_path: Path, monkeypatch) -> None:
+def test_tiles_are_two_columns_and_fold_after_four_rows_of_two_with_clamped_titles(tmp_path: Path, monkeypatch) -> None:
     probe = (f"JSON.stringify({{rows: {ROWS}.length, more: !!document.querySelector('#ck-needs .needs-more-row'),"
              " cols: getComputedStyle(document.querySelector('#ck-needs .needs-grid')).gridTemplateColumns.split(' ').length,"
              f" heights: {ROWS}.map(r => Math.round(r.getBoundingClientRect().height)),"
@@ -101,7 +101,7 @@ def test_tiles_are_two_columns_with_every_item_shown_and_clamped_titles(tmp_path
              f" overflow: {ROWS}.filter(r => r.scrollHeight > r.clientHeight + 1).length}})")
     got = [v for v in _run(tmp_path, monkeypatch, "?needs=tiles", [{"eval": probe}]) if isinstance(v, dict)][0]
     assert got["cols"] == 2 and len(got["lefts"]) == 2, got
-    assert got["rows"] == YOU and not got["more"], got                     # nothing folded
+    assert got["rows"] == 8 and got["more"], got                           # four rows of two, then the fold (Phill 11-06: collapse in both)
     assert max(got["heights"]) - min(got["heights"]) <= 1 and min(got["heights"]) >= 44, got   # a regular grid, tap targets
     assert got["lines"] == ["2"] and got["scrollW"] <= got["vw"], got
     assert got["overflow"] == 0, got                                       # no tile clips its own text
@@ -124,16 +124,17 @@ def test_the_tabs_swap_the_list_from_the_view_already_held_and_are_remembered(tm
 
 
 @needs_browser
-def test_the_layout_switch_is_drawn_only_on_a_page_served_with_the_mockup_flag(tmp_path: Path, monkeypatch) -> None:
+def test_the_layout_switch_is_a_phone_control_drawn_by_default_and_remembered(tmp_path: Path, monkeypatch) -> None:
     has = "!!document.querySelector('#ck-needs .needs-layout-sw')"
-    assert [v for v in _run(tmp_path, monkeypatch, "", [{"eval": has}], flag=False, sub="off") if isinstance(v, bool)][-1] is False
+    vis = "getComputedStyle(document.querySelector('#ck-needs .needs-layout-sw')).display"
+    assert [v for v in _run(tmp_path, monkeypatch, "", [{"eval": vis}], flag=False, sub="off") if isinstance(v, str)][-1] == "flex"   # no flag needed
     steps = [{"eval": "JSON.stringify({sw: " + has + ", on: [...document.querySelectorAll('.needs-layout-btn.is-on')].map(b => b.textContent)})"},
              {"do": "document.querySelector('.needs-layout-btn[data-needs-layout=tiles]').click()",
               "until": "document.querySelector('#ck-needs .needs-grid').dataset.layout === 'tiles'"},
              {"eval": "JSON.stringify({kept: localStorage.getItem('levain.needs.layout'), url: location.search, rows: " + ROWS + ".length})"}]
     first, second = [v for v in _run(tmp_path, monkeypatch, "", steps, flag=True, sub="on") if isinstance(v, dict)]
     assert first == {"sw": True, "on": ["rows"]}, first                    # default rows, the switch drawn
-    assert second == {"kept": "tiles", "url": "?needs=tiles", "rows": YOU}, second
+    assert second == {"kept": "tiles", "url": "?needs=tiles", "rows": 8}, second
 
 
 DETAIL = f"""(() => {{
@@ -144,7 +145,7 @@ DETAIL = f"""(() => {{
 
 
 def _detail_steps(layout: str) -> list:
-    fold = [{"do": "(document.querySelector('#ck-needs .needs-more-row') || {click(){}}).click()", "until": f"{ROWS}.length === {YOU}"}] if layout == "rows" else []
+    fold = [{"do": "(document.querySelector('#ck-needs .needs-more-row') || {click(){}}).click()", "until": f"{ROWS}.length === {YOU}"}]
     last = f"{ROWS}[{ROWS}.length - 1]"
     return [*fold,
             # the last row lands at the foot of the viewport, far below the page's top; the scroll the tap itself arrives at is read in

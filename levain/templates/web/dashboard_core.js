@@ -6512,6 +6512,7 @@
     return out;
   }
   const NEEDS_LAYOUT_KEY = "levain.needs.layout", NEEDS_TAB_KEY = "levain.needs.tab";
+  const NEEDS_FOLD_TILES = 8;               // phone tiles shown before the fold (four rows of two)
   const NEEDS_FOLD = 6;                     // rows shown before the fold in the rows layout
   let needsViewRef = null;                  // the last view the strip drew from: a tab or layout change re-renders from it, no network
   let needsLayoutNow = null, needsTabNow = null;
@@ -6521,8 +6522,8 @@
     try { if (get) return window.localStorage.getItem(key); window.localStorage.setItem(key, val); } catch (e) { /* the choice then lasts this page only */ }
     return null;
   }
-  // The page's layout (?needs=rows|tiles beats the remembered choice; default rows), the active tab, and whether the mock-up switch is
-  // drawn: only a page served with the scratch launcher's `mockup_layout_switch` flag, never a real install.
+  // The page's layout (?needs=rows|tiles beats the remembered choice; default rows), the active tab, and that the layout switch is drawn
+  // (the stylesheet shows it on a phone only).
   function needsPrefs(view) {
     if (needsLayoutNow === null) {
       let q = "";
@@ -6532,7 +6533,7 @@
       if (q) needsStore(false, NEEDS_LAYOUT_KEY, q);
     }
     if (needsTabNow === null) needsTabNow = needsStore(true, NEEDS_TAB_KEY) === "desk" ? "desk" : "you";
-    return { layout: needsLayoutNow, tab: needsTabNow, sw: !!(view && view.mockup_layout_switch === true) };
+    return { layout: needsLayoutNow, tab: needsTabNow, sw: true };
   }
   function rerenderNeeds(focusSel) {
     const host = document.getElementById("ck-needs");
@@ -6572,16 +6573,19 @@
     const kids = [];
     if (!list.length) {
       kids.push(el("div", "needs-empty ext-meta", prefs.tab === "desk" ? "The desk owes you nothing right now." : "Nothing waits on you right now."));
-    } else if (prefs.layout === "tiles") {
-      for (const it of list) kids.push(rowOf(it));
     } else {
+      const tiles = prefs.layout === "tiles";
       const old = (it) => { const s = needsAgeSecs(it); return s !== null && s >= 86400; };
       const today = list.filter((it) => !old(it)), older = list.filter(old);
-      const grouped = today.length > 0 && older.length > 0;
+      const grouped = !tiles && today.length > 0 && older.length > 0;   // the tiles carry no group labels
       const ordered = grouped ? today.concat(older) : list;
-      const hiddenN = ordered.length - NEEDS_FOLD;
-      const fold = hiddenN >= 2;                     // one hidden row is not worth a row of its own
-      const shown = !fold || needsMoreOpen ? ordered : ordered.slice(0, NEEDS_FOLD);
+      // both layouts fold; a phone's tiles show four rows of two before the fold, everything else six items
+      let phone = false;
+      try { phone = !!(window.matchMedia && window.matchMedia("(max-width: 599px)").matches); } catch (e) { phone = false; }
+      const foldAt = tiles && phone ? NEEDS_FOLD_TILES : NEEDS_FOLD;
+      const hiddenN = ordered.length - foldAt;
+      const fold = hiddenN >= 2;                     // one hidden item is not worth a row of its own
+      const shown = !fold || needsMoreOpen ? ordered : ordered.slice(0, foldAt);
       let last = "";
       for (const it of shown) {
         const g = grouped ? (old(it) ? "older" : "today") : "";
@@ -6592,7 +6596,7 @@
         kids.push(rowOf(it));
       }
       if (fold) {
-        const hidden = ordered.slice(NEEDS_FOLD);
+        const hidden = ordered.slice(foldAt);
         let label;
         if (needsMoreOpen) label = "Show fewer";
         else {
@@ -6705,11 +6709,10 @@
       head.appendChild(el("span", "needs-order", "questions first, then soonest to expire"));
     }
     if (prefs.sw) {
-      // the mock-up's A/B switch: drawn only on a page served with the scratch launcher's flag, never on a real install
+      // the phone's rows | tiles segmented control: CSS hides it at desktop width, where both choices draw the same cards
       const sw = el("span", "needs-layout-sw");
       sw.setAttribute("role", "group");
       sw.setAttribute("aria-label", "layout");
-      sw.append(el("span", "needs-layout-lab", "layout:"));
       for (const key of ["rows", "tiles"]) {
         const b = el("button", "needs-layout-btn" + (prefs.layout === key ? " is-on" : ""), key);
         b.type = "button";
