@@ -444,6 +444,9 @@ LAZY_SITES = {
     'levain/agents/session_client.py::link_proof::from levain.agent_authority import AgentAuthority': 'operator',
     # operator: ``link_proof`` runs only in the operator's process (the controller, an agent session or the session client); the dispatch run server only imports the module
     'levain/agents/session_client.py::link_proof::from levain.cockpit.firejournal import DB_NAME': 'operator',
+    # operator: ``register_specs`` (and ``_register_in`` under it) is called only by ``levain agents register`` (``levain/agents/cli.py``), the operator's process; the dispatch run server only imports the module
+    "levain/agents/spec.py::_register_in::from levain.agents import operator as _operator     # lazy: the registry's side, never reached by a fire": 'operator',
+    "levain/agents/spec.py::register_specs::from levain.agents import operator as _operator     # lazy: the registry's side, never reached by a fire": 'operator',
     # root: ``_default_verify_sig`` runs in the dispatch run server's own process (``_levain_dispatch``, never the operator's), which is a service entry
     'levain/slot/services/dispatch_run.py::_default_verify_sig::from levain.authority_sig import verify_link_sig': 'root',
     # root: ``bound_usage_sources`` runs in the dispatch run server's own process (``_levain_dispatch``, never the operator's), which is a service entry
