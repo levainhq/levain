@@ -15,6 +15,9 @@ from __future__ import annotations
 TEAM_ENTRY_NAMESPACE = "levain-team-entry"
 # The operator's passkey clear of a "yours to clear" coordinator review item (c4-mut head ruling R2).
 REVIEW_CLEAR_NAMESPACE = "levain-review-clear"
+# The operator's phone passkey countersigning a band answer typed at a REMOTE terminal (board row 64, B2): evidence
+# beside an answer already recorded unsigned, never a gate on it.
+ANSWER_COUNTERSIGN_NAMESPACE = "levain-answer-countersign"
 
 # namespace -> (status, owner, meaning). status is "shipped" (a released levain uses it) or "reserved" (a design
 # names it; nothing signs in it yet).
@@ -55,6 +58,9 @@ REGISTRY: dict[str, tuple[str, str, str]] = {
     REVIEW_CLEAR_NAMESPACE: ("shipped", "levain/coordinator/review.py",
                              "the operator's passkey clear of a 'yours to clear' coordinator review item, over the "
                              "item's id, state and last event"),
+    ANSWER_COUNTERSIGN_NAMESPACE: ("shipped", "levain/consent/answer_countersign.py",
+                                   "the operator's phone passkey countersigning a band answer typed at a remote "
+                                   "terminal (message format levain-terminal-answer/1 with a countersign-of line)"),
     "levain-terminal-answer": ("shipped", "levain/consent/terminal_sign.py",
                                "the laptop Touch ID key's signature over a band answer typed at the terminal "
                                "(TERMSIGN; message format levain-terminal-answer/1)"),
@@ -70,6 +76,11 @@ REGISTRY: dict[str, tuple[str, str, str]] = {
 # what levain itself asks.
 LEVAIN_SIGN_REQUESTS: dict[str, str] = {
     REVIEW_CLEAR_NAMESPACE: r"levain review clear rv-[0-9a-f]{32} open \S+",
+    # multi-line (re.fullmatch's "." stops at a newline): terminal_sign.build_message's format line and store line,
+    # its seven header lines (install .. at), then countersign-of, then the entry lines. A shape fence only; the
+    # verifier re-parses.
+    ANSWER_COUNTERSIGN_NAMESPACE: r"levain-terminal-answer/1\nstore: levain-questions:[^\n]+\n(?:.+\n){7}"
+                                  r"countersign-of: .+\n(?:.+\n)+",
 }
 
 # Reserved families: prefix -> the rule. A family reserves the prefix against any other meaning; it registers

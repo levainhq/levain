@@ -111,6 +111,13 @@ BAND_SCHEMA = (
     "BEGIN SELECT RAISE(ABORT, 'answer context is append-only'); END",
     "CREATE TRIGGER IF NOT EXISTS answer_context_kept BEFORE DELETE ON answer_context "
     "BEGIN SELECT RAISE(ABORT, 'answer context is append-only'); END",
+    # B2: the sign card a remote answer points at (levain.consent.answer_countersign); one row per carded answer
+    "CREATE TABLE IF NOT EXISTS answer_countersign (question_id TEXT PRIMARY KEY REFERENCES answers(question_id), "
+    "request_id TEXT NOT NULL, message_sha256 TEXT NOT NULL, row_version TEXT NOT NULL, filed_at TEXT NOT NULL)",
+    "CREATE TRIGGER IF NOT EXISTS answer_countersign_frozen BEFORE UPDATE ON answer_countersign "
+    "BEGIN SELECT RAISE(ABORT, 'answer countersign is append-only'); END",
+    "CREATE TRIGGER IF NOT EXISTS answer_countersign_kept BEFORE DELETE ON answer_countersign "
+    "BEGIN SELECT RAISE(ABORT, 'answer countersign is append-only'); END",
 )
 
 # TERMSIGN L3: sources a caller outside Levain may allocate under (:func:`allocate`); the others are Levain's own
@@ -770,6 +777,9 @@ class Signing:
     versions: Mapping[str, str] = dataclasses.field(default_factory=dict)
     ruled: Mapping[str, str] = dataclasses.field(default_factory=dict)
     ruling_refusals: Mapping[str, str] = dataclasses.field(default_factory=dict)
+    # B2: for a REMOTE unsigned line only, what the sign card is built from (levain.consent.answer_countersign);
+    # None on every other Signing, so the local answer path never sees it
+    card: Mapping[str, Any] | None = None
 
     def __post_init__(self) -> None:
         # read-only once built: the same object sits in every entry of the line, and the write checks against it
@@ -802,7 +812,7 @@ def _no_key_noted(store: QuestionStore, viewer: str) -> bool:
 
 
 def _sign_note(by_state: Mapping[str, Sequence[str]], signing: "Signing | None", quiet_no_key: bool,
-               ruled: Sequence[str] = (), ruled_unrecorded: Sequence[str] = ()) -> str | None:
+               ruled: Sequence[str] = (), ruled_unrecorded: Sequence[str] = (), card: Any = None) -> str | None:
     """The echo's sentence on the sign state, in plain words (``signed (Touch ID, laptop): 1a``), or ``None``.
     ``ruled``: the labels whose signed ruling ALLOW the queue applied and whose answer was recorded (TERMSIGN L4);
     ``ruled_unrecorded``: those whose ruling was applied but whose answer the store did not record."""
@@ -816,6 +826,9 @@ def _sign_note(by_state: Mapping[str, Sequence[str]], signing: "Signing | None",
         parts.append("signed (Touch ID, laptop): " + ", ".join(by_state["signed"]))
     if by_state.get("unsigned") and signing is not None and not quiet_no_key:
         why = _SIGN_WORDS.get(signing.reason or "") or f"the signer failed: {signing.detail or 'unknown'}"
+        if signing.reason == "remote" and card is not None:      # B2: the card clause, from what filing did
+            why += ("; a sign card is on its way: sign it on your phone" if card.sent
+                    else f"; no sign card was sent: {card.why}")
         parts.append(f"recorded UNSIGNED ({why}): " + ", ".join(by_state["unsigned"]))
     return "; ".join(parts) or None
 
@@ -1005,6 +1018,8 @@ def apply_plan(store: QuestionStore, plan: Parse, questions: dict[int, Question]
     by_state: dict[str, list[str]] = {}
     quiet_no_key = False
     ruled_labels: list[str] = []
+    signing: Signing | None = None
+    card_result: Any = None
     if sign_with is not None and (todo or ruling_cands):
         todo_pairs = [(act, questions[act.n]) for act, _ in todo]
         try:
@@ -1051,11 +1066,22 @@ def apply_plan(store: QuestionStore, plan: Parse, questions: dict[int, Question]
                 ids.append(entry["ref"])
                 if isinstance(entry.get("sign"), Signing):
                     by_state.setdefault(entry["sign"].state, []).append(act.label)
+        # B2: a remote line is recorded unsigned (103a); its sign card is filed after the write, from what was recorded
+        if (sign_with is not None and signing is not None and signing.card is not None
+                and signing.state == "unsigned" and signing.reason == "remote"):
+            from levain.consent import answer_countersign
+
+            done = [r for r in results if isinstance(r, Answer) and r.question_id in signing.versions]
+            if done:
+                # its own bound, as the write's after the signer: the pointers' store write waits at most HOOK_BUSY_MS
+                # (the signing queue's own lock is bounded by sign.LOCK_WAIT_S)
+                card_result = answer_countersign.file_card(store, signing.card, done,
+                                                           deadline=time.monotonic() + HOOK_BUSY_MS / 1000)
     # the ruling's sentence comes from what the queue applied (Signing.ruled), never from what was recorded: a ruling
     # applied whose answer the store then refused (its row moved, the lock busy) is still a ruling applied
     sign_note = _sign_note(by_state, next((e["sign"] for _, e in todo if isinstance(e.get("sign"), Signing)), None),
                            quiet_no_key, [lb for lb in ruled_labels if lb in recorded],
-                           [lb for lb in ruled_labels if lb not in recorded])
+                           [lb for lb in ruled_labels if lb not in recorded], card_result)
     try:
         echo = format_echo(recorded, refused, via, plan.hint, sheets, sign_note)
     except Exception:                                         # what was recorded is said, whatever the formatting
@@ -1966,8 +1992,15 @@ def _terminal_signer(store: QuestionStore, viewer: str, prompt: str, plan: Parse
             ruled, refusals = _apply_carried(carried, message, out.signature, scope, versions)
             return Signing("signed", None, "", message.decode("utf-8"), out.signature, out.fingerprint, versions,
                            ruled, refusals)
+        card = None
+        if out.reason == "remote":
+            card = {"store": f"levain-questions:{sid}", "install": sid, "session": session, "view": str(view_id),
+                    "typed": typed, "typed_block": None if typed == block else block,
+                    "entries": tuple(e for e in entries if e.kind == "information"),
+                    "environ": {k: environ[k] for k in ("HOME", "LEVAIN_HOME", "LEVAIN_SIGN_QUEUE_DIR")
+                                if k in environ}}
         return Signing("unsigned", out.reason, out.detail, versions=versions,
-                       ruling_refusals={qid: "the answer was not signed" for qid in carried})
+                       ruling_refusals={qid: "the answer was not signed" for qid in carried}, card=card)
 
     return sign_with
 
@@ -2156,7 +2189,7 @@ def answer_badge(store: Any, question_id: str, *, key_dir: Path | None = None,
 
         key = ts.find_key(key_dir)
         if key is None:
-            return ""
+            return _remote_badge(store, question_id)       # B2: a remote answer's card needs no terminal key
         return _badge_of(store, question_id, key, _shared_ctk(ctk), _origins(origins))
     except Exception:  # noqa: BLE001 - a display aid never breaks the band
         return ""
@@ -2197,6 +2230,10 @@ def answer_badges(store: Any, question_ids: Sequence[str], *, deadline: float | 
         try:
             from levain.consent import terminal_sign as ts
 
+            for qid in ids:                 # B2: an unsigned-remote answer reads its sign card (no key, no claim needed)
+                remote = _remote_badge(store, qid)
+                if remote:
+                    found.put(qid, remote)
             key = ts.find_key(key_dir)
             if key is None:
                 return
@@ -2265,6 +2302,21 @@ def _shared_ctk(ctk: Callable[[str], tuple[bool | None, str]] | None) -> Callabl
     return check
 
 
+def _remote_badge(store: Any, question_id: str, sign: Mapping[str, Any] | None = None) -> str:
+    """B2: the badge of an answer recorded unsigned-remote: what its sign card says now (``answer_countersign.verdict``,
+    read at badge time, no poller). ``""`` for any other answer. Fail closed: only a verified countersignature reads as
+    signed. Never raises."""
+    try:
+        sign = answer_sign_of(store, question_id) if sign is None else sign
+        if not sign or sign.get("sign_state") != "unsigned" or sign.get("sign_reason") != "remote":
+            return ""
+        from levain.consent import answer_countersign as ac
+
+        return ac.badge_words(ac.verdict(store, question_id, sign_queue=ac.sign_queue_dir(os.environ)))
+    except Exception:  # noqa: BLE001 - a display aid never breaks the band
+        return ""
+
+
 def _badge_of(store: Any, question_id: str, key: Any, ctk: Callable[[str], tuple[bool | None, str]],
               origins: frozenset[str], *, claim: tuple[tuple[str, str], object] | None = None) -> str:
     """One row's verdict (see :func:`answer_badge`), cached by its digest. ``claim`` (the worker of
@@ -2274,7 +2326,7 @@ def _badge_of(store: Any, question_id: str, key: Any, ctk: Callable[[str], tuple
 
     sign = answer_sign_of(store, question_id)
     if not sign or sign.get("sign_state") != "signed" or not sign.get("message") or not sign.get("sig"):
-        return ""
+        return _remote_badge(store, question_id, sign)      # B2: an unsigned-remote answer reads its sign card
     q = store.get(question_id)
     if q is None or q.answer is None:
         return ""
