@@ -6,7 +6,15 @@ One READ-ONLY list panel over the agent store. It reads the store through :func:
 kernel verb (:data:`AGENT_VERBS`, defined in :mod:`levain.cockpit.verbs`) whose handler calls the owner of that act
 in :mod:`levain.agents` (``set_operation``, ``retire_agent``, ``renew_agent_link``); the panel never calls one.
 
-A row is one agent, ``agent:<agent_id>``, in one of four groups (the ordering ``agents.state``):
+A row is one agent, ``agent:<agent_id>``, in one of four groups (the ordering ``agents.state``), after the pinned row:
+
+- **Agent** (``operator``, K2b / P9a-o): the store's ONE operator agent, a row of its own over
+  :func:`levain.agents.operator.materialise`, drawn first and not counted: ``operator-agent:<oa-id>``, or the fixed
+  ``operator-agent:none`` while the store has no record (it then says whether the dream is registered and not attached,
+  from :func:`levain.agents.operator.unattached_dream`, so a pre-K2b install shows it). Its roles, their operation, the
+  install's live/shadow facts and ``dream_unattached`` are words on the row. A record or an attachment that cannot be
+  read is THIS row, ``operator-agent:unreadable`` with the reason, never a fault of the whole panel. The row reads and
+  offers nothing: no agent verb applies to it. The panel reaches the attachments only through that module.
 
 - **Firing**: registered, active, and a live agent link covers its current spec (the tick would let it fire);
 - **Paused**: registered and its operation is paused (a pause wins over an unarmed link: it is what he did);
@@ -38,6 +46,7 @@ from typing import Any
 
 from levain import authority as _auth
 from levain.agent_authority import AgentAuthority, AgentAuthorityError
+from levain.agents import operator as _operator
 from levain.agents.role import DEFAULT_KIND, RoleError
 from levain.agents.role import _check_row as _check_stored_role
 from levain.agents.store import AgentStoreRefused, open_agent_store_view
@@ -45,12 +54,14 @@ from levain.autonomic.db import StoreFormatError
 from levain.cockpit.engine import ProviderSpec, ReadContext
 from levain.cockpit.results import Absent, Fault, Read, Result, RowIn
 
-__all__ = ["AGENTS_ID", "AGENT_ORDER", "AGENT_ROW_PREFIX", "AGENT_VERBS", "AgentsWiring", "RETIRED_SHOWN",
-           "agents_discoverer", "cockpit_wiring"]
+__all__ = ["AGENTS_ID", "AGENT_ORDER", "AGENT_ROW_PREFIX", "AGENT_VERBS", "AgentsWiring", "OPERATOR_ROW_PREFIX",
+           "RETIRED_SHOWN", "agents_discoverer", "cockpit_wiring"]
 
 AGENTS_ID = "agents"
 AGENT_ROW_PREFIX = "agent:"
 AGENT_ORDER = "agents.state"
+OPERATOR_ROW_PREFIX = "operator-agent:"     # the pinned row of the store's one operator agent (not an ``agent:`` row)
+OPERATOR_GROUP = "operator"
 AGENT_FACETS = frozenset({"agent_group", "agent_link", "agent_version", "agent_store", "agent_kind"})
 UNREADABLE_KIND = "unreadable"
 # the verbs an agent row offers (levain.cockpit.verbs registers them); `run now` has no owner yet and is not here
@@ -208,6 +219,46 @@ def _row(agent: dict[str, Any], group: str, words: str, link: str, expiry: str, 
                          "agent_store": store_id, "agent_kind": kind[0]}, stored=stored)
 
 
+def _operator_row(conn: sqlite3.Connection, install_dir: Path) -> RowIn:
+    """The pinned row of the store's operator agent, read on the panel's own connection through
+    :mod:`levain.agents.operator` and nothing lower. A record or an attachment that fails its checks is this row, in the
+    ``unreadable`` state with the reason; any other error is the panel's, as everywhere else in it."""
+    try:
+        agent = _operator.materialise(conn, install_dir=install_dir)
+        unattached = _operator.unattached_dream(conn) if agent is None else agent.dream_unattached
+    except _operator.OperatorAgentUnreadable as exc:     # before SpecError: it IS one, and is this row's, not the panel's
+        why = _one_line(exc, 240)
+        return RowIn(id=OPERATOR_ROW_PREFIX + "unreadable", title="Operator agent",
+                     body=f"unreadable: {why}", facets={"agent_group": OPERATOR_GROUP},
+                     stored={"state": "unreadable", "why": why, "group": OPERATOR_GROUP})
+    tail = f" · the dream ({unattached}) is registered but not attached" if unattached else ""
+    if agent is None:
+        return RowIn(id=OPERATOR_ROW_PREFIX + "none", title="Operator agent",
+                     body="no operator agent in this store yet" + tail, facets={"agent_group": OPERATOR_GROUP},
+                     stored={"state": "none", "dream_unattached": unattached, "group": OPERATOR_GROUP})
+    roles = [f"{r.name} v{r.version} as role {r.role_name} v{r.role_version} ({r.operation})" for r in agent.roles]
+    gone = f" · {len(agent.retired_roles)} retired" if agent.retired_roles else ""
+    install = agent.install.label if agent.install is not None else "install not consulted"
+    head = _one_line(f"Operator agent {agent.record_id} · roles: {'; '.join(roles) or 'none attached'}{gone}"
+                     f" · install: {install}", 300 - len(tail)) + tail
+    stored = {"state": "attached", "record_id": agent.record_id, "created_at": agent.created_at, "install": install,
+              "dream_unattached": unattached, "group": OPERATOR_GROUP,
+              "roles": [{"agent_id": r.agent_id, "name": r.name, "version": r.version, "role_name": r.role_name,
+                         "role_version": r.role_version, "operation": r.operation} for r in agent.roles],
+              "retired_roles": [r.agent_id for r in agent.retired_roles]}
+    return RowIn(id=OPERATOR_ROW_PREFIX + agent.record_id, title="Operator agent", body=head,
+                 facets={"agent_group": OPERATOR_GROUP}, stored=stored)
+
+
+def read_operator_row(wiring: AgentsWiring) -> RowIn | None:
+    """The operator agent's row, or None when this install has no agent store. Writes nothing."""
+    view = open_agent_store_view(wiring.store_dir)
+    if view.path is None:
+        return None
+    with view.read() as conn:
+        return _operator_row(conn, view.path.parent)
+
+
 def read_rows(wiring: AgentsWiring, *, only: str | None = None) -> tuple[tuple[RowIn, ...], str | None] | None:
     """The agent rows (all, or the one agent id ``only``) and a note, or None when this install has no agent store.
     Writes nothing: the store is opened through the read-only view and the log through the read-only authority."""
@@ -219,6 +270,8 @@ def read_rows(wiring: AgentsWiring, *, only: str | None = None) -> tuple[tuple[R
     rows: list[RowIn] = []
     older = 0
     with view.read() as conn:
+        if only is None:
+            rows.append(_operator_row(conn, view.path.parent))      # pinned first: its own group sorts before the rest
         store_id_row = conn.execute("SELECT value FROM meta WHERE key = 'store_id'").fetchone()
         if store_id_row is None:
             raise StoreFormatError("the agent store holds no store id")
@@ -286,6 +339,12 @@ def agents_discoverer(cockpit: Any) -> Callable[[ReadContext], list[ProviderSpec
             return Read(rows=got[0], note=got[1])
 
         def agents_read_one(ctx: ReadContext, row_id: str) -> Result:
+            if isinstance(row_id, str) and row_id.startswith(OPERATOR_ROW_PREFIX):
+                try:
+                    one = read_operator_row(wiring())
+                except Exception as exc:  # noqa: BLE001
+                    return _unreadable(exc)
+                return Read(rows=(one,)) if one is not None and one.id == row_id else Absent("no such agent")
             if not isinstance(row_id, str) or not row_id.startswith(AGENT_ROW_PREFIX):
                 return Absent("no such agent")
             try:
