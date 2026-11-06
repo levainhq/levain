@@ -2626,7 +2626,7 @@ def _write_consent_settings(install: Path, adapter: str, emit: Callable[[str], N
                     os.link(tmp, path)  # fails when another writer created it meanwhile: theirs is kept
                     emit(f"  consent settings: {path} (approvals follow your presence record, `levain ping status`: held "
                          f"for a signed answer when it sends pings to your devices, by default after 10 minutes "
-                         f"without input at this Mac; grants verify against {ours})")
+                         f"without a message you typed to a desk session; grants verify against {ours})")
                     return
                 except FileExistsError:
                     pass

@@ -13,7 +13,7 @@ one another, and the operator feeling in control of how residue and approvals re
 ``base`` is the operator's standing default (``back`` returns to it; only the operator writes it). ``overlay`` is a preset
 (``away``, ``quiet``, ``sleep``, ``loud``) or a setting made "for a while", and ends by its own ``until``: ``{"kind":
 "timer","at"}`` or ``{"kind": "input"}``. An overlay's end is READ, never written: the record is never rewritten by sensing
-(laptop idle, remote input, a desk message, desk liveness), which only feeds ``follow`` and ``until: input``. An ended overlay
+(laptop idle, remote input, a desk message, desk liveness), which feeds only ``follow`` (a desk message, remote input) and ``until: input`` (a desk message); laptop idle is shown and decides nothing. An ended overlay
 stays on file, inert, until the next write replaces it.
 
 One lock (the presence lock, ``<queue>/webpush/.presence.lock``), one event stream (every write leaves one row in
@@ -335,7 +335,7 @@ def _eff(rec: dict, now: float, reading: float | None, desk_msg_at: float | None
 def decide(now: float, rec: dict, reading: float | None, *, class_name: str, remote: dict | None = None,
            desk_msg_at: float | None, filed: bool = False) -> Decision:
     """Whether a ping of ``class_name`` is pushed at ``now``. Pure. ``rec`` is a :func:`read` result; ``reading`` the laptop
-    idle seconds (it feeds the ``until: input`` overlays only; ``follow`` reads ``desk_msg_at``, Phill 11-03 "1a"). ``filed``: the ping is about a request already FILED and waiting
+    idle seconds (shown only: neither ``follow`` nor an ``until: input`` overlay reads it, both read ``desk_msg_at``, Phill 11-03 "1a"). ``filed``: the ping is about a request already FILED and waiting
     for a signed answer (an approval-class ping from a consent hook or gate), which goes whatever the desk or devices
     setting is doing (only a mute holds it). A fault reads as push (a ping he did not need costs one notification, one
     he needed and never got costs the day)."""
@@ -512,7 +512,7 @@ def _who_text(ov: dict | None) -> str:
 
 def _approvals_note(queue_dir: Path | str | None, to_devices: bool | None = None, *, blind: bool = False) -> str | None:
     """The ``Approvals:`` clause, from consent's side (the signed away mark, a key that can sign, and ``blind``: the record
-    sends approvals to the devices only for want of a laptop reading, where consent's hold does not follow it). Consent
+    sends approvals to the devices only for want of a measurement, where consent's hold does not follow it). Consent
     provides ``levain.consent.auto_away.approvals_note(queue_dir)``; until it does, or on any fault, there is none."""
     try:
         from levain.consent import auto_away

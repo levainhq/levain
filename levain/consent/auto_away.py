@@ -200,7 +200,7 @@ def approvals_note(queue_dir: Path | str | None, *, to_devices: bool | None = No
             return ("your devices, for a signed answer (a signed away stands; leave: levain consent away off "
                     "--signing-key <key>)")
         if unmarked and blind and to_devices is True:
-            return ("the agent's own dialog (no laptop input reading, so nothing measured shows you away; the ping "
+            return ("the agent's own dialog (nothing measured shows you away; the ping "
                     "still reaches your devices)")
         if unsignable and to_devices is not False:
             return "the agent's own dialog (no enrolled key can sign from a device)"

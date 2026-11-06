@@ -3,7 +3,7 @@
 Since presence 1b (Phill 11-02) the rule lives in :mod:`levain.webpush.intent`: ONE record (``intent.json``) with a standing
 ``base`` and an ``overlay`` (a preset or a setting for a while), each carrying ``devices`` (on / off / follow), ``follow_after``
 (seconds; default 600) and ``lets_through`` (everything / needs / approvals / nothing). Sensing (laptop idle, remote input, a
-desk message, desk liveness) is shown and feeds ``follow``; it never rewrites the record. An explicit word or setting made
+desk message, desk liveness) is shown, and remote input and a desk message feed ``follow`` (laptop idle does not); it never rewrites the record. An explicit word or setting made
 until input (away, sleep) stands until another word of his or a message he types into a session (the desk message): sensed
 laptop input never ends it (Phill 11-02). This module
 keeps what the record shares with its callers:

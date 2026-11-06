@@ -5,7 +5,7 @@ with none matching, withdraws the request at once so the agent's own dialog asks
 request up to ``away_hold_seconds`` while ``levain consent answer`` or the phone signs one. Whether it is on is
 :func:`levain.consent.auto_away.away_state`: given the queue directory (every hook), a signed away mark, else the
 presence record (:func:`levain.webpush.intent.approvals_route`: held exactly when an approval would reach the
-operator's devices, except a ``follow`` that reaches them only for want of a laptop input reading); the words this module writes (``away_word``, ``away_mode``, ``away_idle_seconds``) are read only
+operator's devices, except a ``follow`` that reaches them only for want of a measurement); the words this module writes (``away_word``, ``away_mode``, ``away_idle_seconds``) are read only
 by a caller with no queue directory (one release): the explicit word (``auto``, the one ``levain init`` writes, is
 none), else input idle past ``away_idle_seconds`` on macOS, else off. A file with no ``away_word`` was written before
 auto-away existed: its ``away_mode`` is the word. ``levain consent away on|off|auto`` also set the record's base
@@ -23,7 +23,7 @@ one any process of the operator's can write, so leaving a marked away mode (``of
 signed by an enrolled key in :data:`~levain.consent.record.AWAY_NAMESPACE`, stored before the file is written (the
 store is the truth; the word follows). Revoking the key that signed a leave puts away mode back on (the leave is
 re-verified by each hook call). Any enrolled key may sign a leave, whatever its class (a design ruling: leaving only
-lowers what the hook holds). Input-idle away has no mark: the operator's input still ends it. A store that cannot be
+lowers what the hook holds). Input-idle away (a caller with no queue directory only) has no mark: the operator's input still ends it. A store that cannot be
 read is never read as no mark: ``off`` and ``auto`` refuse until it is repaired or moved aside.
 """
 from __future__ import annotations
