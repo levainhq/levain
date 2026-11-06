@@ -197,4 +197,5 @@ def test_read_only_opener_migrates_nothing_and_still_reads_an_older_store(tmp_pa
 def test_snapshots_are_the_released_shapes():
     assert "chat_echoes" not in "".join(snap.SCHEMA_V0_11_25) and "chat_echoes" in "".join(snap.SCHEMA_MAIN_F75ACBC7)
     assert not any("chat_approval" in s for s in snap.SCHEMA_MAIN_F75ACBC7 + snap.SCHEMA_V0_11_25)
-    assert snap.ADDED_V0_11_25 == () and snap.ADDED_MAIN_F75ACBC7 == chat.CHAT_ADDED_COLUMNS
+    # the columns main gained after f75acbc7 (1106-1 striptool: chat_events.tool_name) are the current list's tail
+    assert snap.ADDED_V0_11_25 == () and snap.ADDED_MAIN_F75ACBC7 + (("chat_events", "tool_name", "TEXT"),) == chat.CHAT_ADDED_COLUMNS

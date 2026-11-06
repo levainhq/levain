@@ -218,7 +218,7 @@ def room_read(directory: Path | str, service: Any = None) -> dict[str, Any]:
                 "SELECT l.launch_id FROM launches l, json_each(l.threads) j WHERE j.value = ? AND l.role = 'room'",
                 (room_thread,))} if threads._has(conn, "launches") else set()
             facts, gap = threads._event_facts(conn, launches)
-            done = {(lid, c) for (lid, k), (c, _t, _b) in facts.items() if k.startswith("tool_result:") and c}
+            done = {(lid, f[0]) for (lid, k), f in facts.items() if k.startswith("tool_result:") and f[0]}
             return {"room_thread": room_thread, "launch_id": launch, "composer": _composer(conn, launch, service),
                     "model": threads.model_in_use(service, launch), "gap": gap,
                     "stream": [threads._item(r, facts, done) for r in _without_open_check(merged, room_launches)],

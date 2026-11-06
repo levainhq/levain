@@ -402,8 +402,11 @@ def _released_store(qdir, store, world):
                                author_surface="cockpit", client_id="tab-a", outbox_id="ob-released1", body="go",
                                normalized="go", launch_id=world["launch"])
     chat.outbox_step(c, now, m.message_id, "refused", cause="released")
-    chat.record_event(c, now, launch_id=world["launch"], key="agent_text:a1", pos="00000001", kind="agent_text",
-                      body="hello", normalized="hello")
+    # v0.11.25's record_event SQL: the table it wrote had no tool_name column (the current writer names that column)
+    c.execute("INSERT INTO chat_events (launch_id, vendor_event_key, gseq, vendor_pos, kind, vendor_turn_id, call_id, body, "
+              "body_sha256, body_norm_sha256, truncated, backfill, source, at) "
+              "VALUES (?, 'agent_text:a1', ?, '00000001', 'agent_text', NULL, NULL, 'hello', ?, ?, 0, 0, 'vendor', ?)",
+              (world["launch"], chat.next_gseq(c, now), chat.body_sha256("hello"), chat.body_sha256("hello"), now))
     chat.record_cursor(c, now, launch_id=world["launch"], vendor_cursor="00000001", complete_through="00000001",
                        gap=False)
     # v0.11.25's record_check SQL (CH-D1b-3's writer names two columns this table does not have yet)
@@ -417,7 +420,9 @@ def _released_store(qdir, store, world):
 # the columns a released table had: a column CHAT_ADDED_COLUMNS adds later is compared by its own test
 # (test_released_store_gains_the_activation_columns_and_their_rule), not as a change to the rows
 _RELEASED_COLUMNS = {"chat_launch_checks": "launch_id, seq, gseq, kind, source, evidence_sha256, spawn_nonce, detail, "
-                                           "by, at"}
+                                           "by, at",
+                     "chat_events": "launch_id, vendor_event_key, gseq, vendor_pos, kind, vendor_turn_id, call_id, body, "
+                                    "body_sha256, body_norm_sha256, truncated, backfill, source, at"}
 
 
 def _rows(c):
@@ -506,6 +511,98 @@ def test_added_column_reaches_a_released_table(qdir, store, world, monkeypatch):
     assert cols[-1] == "probe_note"
     assert c.execute("SELECT probe_note FROM chat_launch_checks").fetchall() == [(None,)]
     assert _rows(c)["chat_messages"] == rows["chat_messages"]
+
+
+def _replay(c, key, **kw):
+    """record_event in its own transaction on the raw connection ``c`` (autocommit); the stored row and whether it wrote."""
+    c.execute("BEGIN IMMEDIATE")
+    try:
+        got = chat.record_event(c, "2026-11-06T12:00:00Z", launch_id=kw.pop("launch"), key=key, normalized=kw.get("body", "hello"),
+                                **{"pos": "00000001", "kind": "agent_text", "body": "hello", **kw})
+        c.execute("COMMIT")
+    except BaseException:
+        c.execute("ROLLBACK")
+        raise
+    return got
+
+
+def test_released_store_gains_tool_name_old_rows_read_null_and_a_replay_with_a_name_is_no_conflict(qdir, store, world):
+    # 1106-1 striptool: chat_events gains ONE nullable column through the one ensure path; the released store is built the OLD
+    # way (v0.11.25's DDL and its writer's SQL), then opened by the current code
+    c, _m = _released_store(qdir, store, world)
+    assert "tool_name" not in [r[1] for r in c.execute("PRAGMA table_info(chat_events)")]
+    rows = _rows(c)
+    c.close()
+    ChatStore(store)._connect().close()
+    c = raw(qdir)
+    assert [r[1] for r in c.execute("PRAGMA table_info(chat_events)")][-1] == "tool_name"
+    assert c.execute("SELECT vendor_event_key, tool_name FROM chat_events").fetchall() == [("agent_text:a1", None)]
+    assert _rows(c) == rows                                            # every released column of every row, rowids included
+    assert c.execute("PRAGMA integrity_check").fetchall() == [("ok",)]
+    # the trigger family still holds after the ALTER: a row is never replaced or rewritten
+    with pytest.raises(sqlite3.IntegrityError, match="append-only|frozen|kept|never"):
+        c.execute("UPDATE chat_events SET tool_name = 'Read'")
+    # a replay of a key stored BEFORE the upgrade, now carrying a name: the stored row (name NULL) is returned, nothing is
+    # written and no EventConflict is raised; a different body is still a conflict
+    stored, created = _replay(c, "agent_text:a1", launch=world["launch"], tool_name="Read")
+    assert created is False and stored.body == "hello"
+    assert c.execute("SELECT tool_name FROM chat_events").fetchall() == [(None,)]
+    with pytest.raises(chat.EventConflict):
+        _replay(c, "agent_text:a1", launch=world["launch"], body="other", tool_name="Read")
+
+
+def test_a_tool_name_is_stored_on_the_first_write_and_is_not_part_of_what_a_replay_is_compared_on(cs, world, qdir):
+    c = raw(qdir)
+    ev, created = _replay(c, "tool_result:toolu_1", launch=world["launch"], kind="tool_result", call_id="toolu_1",
+                          tool_name="Bash")
+    assert created is True
+    assert c.execute("SELECT tool_name FROM chat_events WHERE vendor_event_key = 'tool_result:toolu_1'").fetchall() == [("Bash",)]
+    # the same key again with another name, and with none: the row stands, nothing is written, no conflict
+    for other in ("Read", None):
+        again, created = _replay(c, "tool_result:toolu_1", launch=world["launch"], kind="tool_result", call_id="toolu_1",
+                                 tool_name=other)
+        assert created is False and again.gseq == ev.gseq
+    assert c.execute("SELECT tool_name FROM chat_events WHERE vendor_event_key = 'tool_result:toolu_1'").fetchall() == [("Bash",)]
+    # a name is one clean line of text
+    for bad in ("", "Re\nad", 7):
+        with pytest.raises(CoordError, match="tool name"):
+            _replay(c, "tool_result:toolu_2", launch=world["launch"], kind="tool_result", call_id="toolu_2", tool_name=bad)
+
+
+def test_the_ingest_keeps_the_drivers_tool_name_and_drops_one_it_cannot_keep(cs, world, qdir):
+    s = ScriptedSession()
+    svc = ready(cs, world, s)
+    s.show("tool_result", body="1\talpha\n2\tbeta", turn_id="t-1", call_id="toolu_b", tool_name="Bash")
+    s.show("tool_result", body="1\tx", turn_id="t-1", call_id="toolu_r", tool_name="Read")
+    s.show("tool_result", body="plain", turn_id="t-1", call_id="toolu_n")
+    s.show("tool_result", body="odd", turn_id="t-1", call_id="toolu_o", tool_name="Re\nad")      # never fails the batch
+    assert svc.read_next(world["launch"]) == 4
+    c = raw(qdir)
+    got = dict(c.execute("SELECT call_id, tool_name FROM chat_events WHERE kind = 'tool_result'"))
+    assert got == {"toolu_b": "Bash", "toolu_r": "Read", "toolu_n": None, "toolu_o": None}, got
+
+
+def test_the_thread_read_carries_the_tool_name_of_a_result_and_reads_a_store_that_has_no_such_column(cs, world, qdir):
+    from levain.cockpit import threads
+    s = ScriptedSession()
+    svc = ready(cs, world, s)
+    s.show("tool_call", body="", turn_id="t-1", call_id="toolu_b", tool_name="Bash")
+    s.show("tool_result", body="1\talpha\n2\tbeta", turn_id="t-1", call_id="toolu_b", tool_name="Bash")
+    assert svc.read_next(world["launch"]) == 2
+    got = threads.thread_stream(qdir, world["thread"])
+    assert [(i["kind"], i.get("tool_name")) for i in got["stream"] if i["kind"].startswith("vendor_tool")] == [
+        ("vendor_tool_call", "Bash"), ("vendor_tool_result", "Bash")]
+
+
+def test_a_reader_of_a_store_without_the_column_draws_every_name_as_none(qdir, store, world):
+    from levain.cockpit import threads
+    c, _m = _released_store(qdir, store, world)
+    c.close()
+    assert "tool_name" not in [r[1] for r in raw(qdir).execute("PRAGMA table_info(chat_events)")]
+    got = threads.thread_stream(qdir, world["thread"])               # read-only: it migrates nothing
+    assert [i for i in got["stream"] if i["kind"] == "vendor_agent_text"], got
+    assert "tool_name" not in [r[1] for r in raw(qdir).execute("PRAGMA table_info(chat_events)")]
+    assert all(i.get("tool_name") is None for i in got["stream"])
 
 
 def test_non_additive_column_is_refused_and_nothing_changes(qdir, store, world, monkeypatch):

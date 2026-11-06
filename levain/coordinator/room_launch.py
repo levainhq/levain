@@ -96,6 +96,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Callable, Mapping, NamedTuple, Optional
 
+from levain import pathid
 from levain.cockpit.consent import parse_stamp
 from levain.consent.adapters import claude_code
 from levain.coordinator import lease
@@ -274,7 +275,10 @@ def _allow_rule_outside(rule: str, cwd: Optional[str], home: str, settings_dir: 
     root, base = os.path.realpath(literal), os.path.realpath(cwd)
     if os.path.exists(root) and os.path.exists(base) and os.path.samefile(root, base):
         return False
-    inside = root == base or root.startswith(base.rstrip("/") + "/")
+    # lexical first (a canonical input answers as it always did); then identity (`pathid.inside`, True only when sure), so
+    # an allow rule spelled in another letter case that IS under the cwd is not read as outside. A stat that cannot answer
+    # leaves it "outside": this refuses a launch, so the sure-inside direction is the one that may let a rule through.
+    inside = root == base or root.startswith(base.rstrip("/") + "/") or pathid.inside(base, root)
     return not inside
 
 
@@ -726,7 +730,8 @@ class RoomLauncher:
             real = os.path.realpath(d)
             roots = [os.path.realpath(self._setting.cwd)] + [os.path.realpath(p) for p in self._deny
                                                               if os.path.isabs(p)]
-            if any(real == r or real.startswith(r.rstrip("/") + "/") for r in roots):
+            # a DENY test (a True refuses): the lexical form, then `pathid.maybe_inside` for a root spelled in another case
+            if any(real == r or real.startswith(r.rstrip("/") + "/") or pathid.maybe_inside(r, real) for r in roots):
                 raise RoomLaunchError(f"the open check's scope decoy {real[:120]!r} would be inside the room's cwd or a "
                                       "deny path; nothing would test the read scope")
             path = os.path.join(d, _SCOPE_NAME)

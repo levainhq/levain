@@ -37,7 +37,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Protocol
 
-from levain import hands_live
+from levain import hands_live, pathid
 from levain.firing.hands import SECURE_PATH, WORKSPACE_ROOT, _abs
 from levain.hands_live import (  # noqa: F401 - HANDS_LOCK and proc_hides_processes are imported from here
     HANDS_LOCK, LIVENESS_TIMEOUT, HandsLiveError, _open_lock, proc_hides_processes, take_exclusive,
@@ -442,9 +442,20 @@ def put_parts(workspace: Path, dest: Path | str) -> list[str]:
     d = str(dest)
     ws = str(workspace)
     if os.path.isabs(d):
-        if not d.startswith(ws.rstrip("/") + "/"):
-            raise WsGitError(f"{dest} is not inside the workspace {workspace}")
-        d = d[len(ws.rstrip("/")) + 1:]
+        base = ws.rstrip("/")
+        if d.startswith(base + "/"):
+            d = d[len(base) + 1:]
+        else:
+            # not the workspace's own spelling: inside only if the same number of leading components name the workspace
+            # itself (another letter case on a case-insensitive volume, or a link to it). A prefix that is `.`, `..` or
+            # empty names nothing, and the rest is still checked part by part below.
+            want = base.split("/")
+            dparts = d.split("/")
+            lead = dparts[:len(want)]
+            if (len(dparts) <= len(want) or any(p in (".", "..") or ("" in lead[1:]) for p in lead)
+                    or not pathid.same("/".join(lead), ws)):
+                raise WsGitError(f"{dest} is not inside the workspace {workspace}")
+            d = "/".join(dparts[len(want):])
     parts = d.split("/")
     if not d or any(p in ("", ".", "..") or "\0" in p for p in parts):
         raise WsGitError(f"refusing the destination {dest!r}: give a file path inside the workspace, "

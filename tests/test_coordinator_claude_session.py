@@ -1386,3 +1386,50 @@ def test_a_hook_command_quotes_a_path_with_a_space_and_refuses_a_relative_one():
     for py, script in (("python3", "/g.py"), ("/usr/bin/python3", "g.py")):
         with pytest.raises(ValueError):
             room_hook_command(py, script)
+
+
+# ---- 1106-1 aliasc: a workdir inside a deny path, either one spelled in another letter case (casesweep rows 5, 5b) ----------------
+def _case_alias_of(p):
+    """``p`` spelled with its letters' case swapped, when this filesystem takes that spelling as the same file (a
+    case-insensitive one: macOS APFS by default); else the test is skipped. On a case-sensitive volume (Linux CI) no
+    alias exists, so the macOS test below can never red there; the injected-fold test after it runs everywhere."""
+    full = str(p).swapcase()
+    if full == str(p) or not os.path.exists(full) or not os.path.samefile(full, p):
+        pytest.skip("this filesystem is case-sensitive: no case alias of a directory exists")
+    return full
+
+
+def test_a_workdir_inside_a_deny_path_is_refused_when_either_is_spelled_in_another_case(tmp_path):
+    """casesweep rows 5/5b: ``_inside`` was a string prefix, so an alias-spelled workdir (or deny path) skipped the
+    "workdir INSIDE a deny path" refusal and the room opened blind (its own cwd denied). A sibling that merely shares a
+    prefix, and a canonical input, answer as before."""
+    deny = tmp_path / "ssh"
+    (deny / "room").mkdir(parents=True)
+    (tmp_path / "sshx" / "room").mkdir(parents=True)
+    alias_deny, alias_room = _case_alias_of(deny), _case_alias_of(deny / "room")
+    with pytest.raises(ValueError, match="inside deny path"):
+        room_settings_json(str(deny / "room"), [str(deny)])                       # canonical: as before
+    with pytest.raises(ValueError, match="inside deny path"):
+        room_settings_json(alias_room, [str(deny)])                               # row 5: the workdir in alias spelling
+    with pytest.raises(ValueError, match="inside deny path"):
+        room_settings_json(str(deny / "room"), [alias_deny])                      # row 5b: the deny path in alias spelling
+    for ok_room in (str(tmp_path / "sshx" / "room"), _case_alias_of(tmp_path / "sshx" / "room")):
+        room_settings_json(ok_room, [str(deny)])                                  # a sibling is not inside, in either spelling
+        room_settings_json(ok_room, [alias_deny])
+
+
+def test_a_workdir_inside_a_deny_path_is_refused_through_an_injected_case_fold(tmp_path, monkeypatch):
+    """The same logic where no alias exists (a Linux CI run): ``pathid._fs_spelling`` is replaced by a case-insensitive
+    walk over the real tree, and the deny path is spelled in a case that only the fold maps onto the real directory."""
+    from levain import pathid
+    from tests.test_pathid import _case_insensitive_spelling
+    monkeypatch.setattr(pathid, "_fs_spelling", _case_insensitive_spelling)
+    base = tmp_path.resolve()
+    (base / "ssh" / "room").mkdir(parents=True)
+    (base / "sshx" / "room").mkdir(parents=True)
+    with pytest.raises(ValueError, match="inside deny path"):
+        room_settings_json(str(base / "ssh" / "room"), [str(base / "SSH")])
+    with pytest.raises(ValueError, match="inside deny path"):
+        room_settings_json(str(base / "SSH" / "ROOM"), [str(base / "ssh")])
+    room_settings_json(str(base / "sshx" / "room"), [str(base / "SSH")])
+    room_settings_json(str(base / "SSHX" / "room"), [str(base / "ssh")])

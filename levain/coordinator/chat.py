@@ -203,7 +203,8 @@ CHAT_SCHEMA: tuple[str, ...] = (
     f"kind TEXT NOT NULL CHECK ({_in('kind', EVENT_KINDS)}), vendor_turn_id TEXT, call_id TEXT, "
     "body TEXT NOT NULL, body_sha256 TEXT NOT NULL, body_norm_sha256 TEXT NOT NULL, "
     "truncated INTEGER NOT NULL CHECK (truncated IN (0, 1)), backfill INTEGER NOT NULL CHECK (backfill IN (0, 1)), "
-    "source TEXT NOT NULL CHECK (source = 'vendor'), at TEXT NOT NULL, PRIMARY KEY (launch_id, vendor_event_key), "
+    "source TEXT NOT NULL CHECK (source = 'vendor'), at TEXT NOT NULL, tool_name TEXT, "
+    "PRIMARY KEY (launch_id, vendor_event_key), "
     f"CHECK (length(CAST(body AS BLOB)) <= {EVENT_BODY_MAX}), "
     # rev 3 §16 item 2 (head ruling on Q1): the key is "<kind>:<vendor id>", its prefix the row's own kind
     "CHECK (substr(vendor_event_key, 1, length(kind) + 1) = kind || ':' "
@@ -313,6 +314,9 @@ CHAT_SCHEMA: tuple[str, ...] = (
 CHAT_ADDED_COLUMNS: tuple[tuple[str, str, str], ...] = (
     ("chat_launch_checks", "canary_verdict_id", "TEXT"),        # rev 7 §2.7 (CH-D1b-3); its rule is a trigger
     ("chat_launch_checks", "containment_digest", "TEXT"),
+    # the vendor's own name for the tool a tool_result answers (a page strips a Read's line numbers by it); NULL on a row
+    # stored before this column, and never part of the replay-conflict tuple in record_event
+    ("chat_events", "tool_name", "TEXT"),
 )
 
 
@@ -615,11 +619,13 @@ def _chat_launch(conn: sqlite3.Connection, launch_id: object) -> str:
 
 def record_event(conn: sqlite3.Connection, now: str, *, launch_id: str, key: str, pos: str, kind: str, body: str,
                  normalized: str, turn_id: str | None = None, call_id: str | None = None,
-                 backfill: bool = False) -> tuple[ChatEvent, bool]:
+                 backfill: bool = False, tool_name: str | None = None) -> tuple[ChatEvent, bool]:
     """Record one vendor event of a worker or room launch in the caller's transaction: ``(event, True)``; a replay of a
     recorded key with the same content (both digests included) writes nothing: ``(stored, False)``; the same key with
     other content raises :class:`EventConflict`. The digests are of the WHOLE body (the reconciliation matches them
-    against a message's); the stored body is clipped to :data:`EVENT_BODY_MAX` bytes."""
+    against a message's); the stored body is clipped to :data:`EVENT_BODY_MAX` bytes. ``tool_name`` is the vendor's name
+    for the tool a ``tool_result`` answers: a display fact, stored on the first write and NOT part of what a replay is
+    compared on (a key stored before the column existed holds NULL, and its replay carries a name)."""
     _chat_launch(conn, launch_id)
     _line("a vendor event key", key)
     _line("a vendor position", pos)
@@ -629,7 +635,7 @@ def record_event(conn: sqlite3.Connection, now: str, *, launch_id: str, key: str
     # tool_result are three rows, never a primary-key collision
     if not key.startswith(kind + ":") or len(key) == len(kind) + 1:
         raise CoordError(f"a vendor event key is {kind}:<vendor id> (kind-qualified), not {key[:60]!r}")
-    for name, value in (("a vendor turn id", turn_id), ("a vendor call id", call_id)):
+    for name, value in (("a vendor turn id", turn_id), ("a vendor call id", call_id), ("a vendor tool name", tool_name)):
         if value is not None:
             _line(name, value)
     if not isinstance(body, str) or not isinstance(normalized, str):
@@ -647,10 +653,10 @@ def record_event(conn: sqlite3.Connection, now: str, *, launch_id: str, key: str
                                 "content; nothing was written")
         return stored, False
     conn.execute("INSERT INTO chat_events (launch_id, vendor_event_key, gseq, vendor_pos, kind, vendor_turn_id, "
-                 "call_id, body, body_sha256, body_norm_sha256, truncated, backfill, source, at) "
-                 "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'vendor', ?)",
+                 "call_id, body, body_sha256, body_norm_sha256, truncated, backfill, source, at, tool_name) "
+                 "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'vendor', ?, ?)",
                  (launch_id, key, next_gseq(conn, now), pos, kind, turn_id, call_id, kept, sha, norm, int(truncated),
-                  int(bool(backfill)), now))
+                  int(bool(backfill)), now, tool_name))
     return _event_row(conn, launch_id, key), True
 
 
@@ -1508,6 +1514,16 @@ class _Seen:
     norm: str
     correlation: object
     vendor_id: str
+    tool_name: str | None = None       # a display hint: kept only when it is one clean line of text, else None
+
+
+def _tool_hint(name: object) -> str | None:
+    """A driver's tool name as the store keeps it: the name when it is one clean line of plain text, else None. The name
+    only decides how a page draws a result, so a driver's odd value is dropped here and never fails the batch."""
+    try:
+        return _line("a vendor tool name", name)
+    except CoordError:
+        return None
 
 
 def _outcome(got: object) -> tuple[str, str, str | None, str | None]:
@@ -2106,7 +2122,7 @@ class ChatService:
             body = e.body
             seen.append(_Seen(e.key, e.kind, e.pos, e.turn_id, e.call_id, body,
                               _plain_norm(session.normalize(body)) if isinstance(body, str) else body,
-                              e.correlation, e.vendor_id))
+                              e.correlation, e.vendor_id, _tool_hint(getattr(e, "tool_name", None))))
         through, cursor, gap = batch.complete_through, batch.next_cursor, bool(batch.gap)
 
         def frontier(conn: sqlite3.Connection) -> tuple[str | None, _LaunchRead, bool, set[str]]:
@@ -2154,7 +2170,7 @@ class ChatService:
             for i, (e, old, window_keys) in enumerate(zip(seen, backfill, windows)):
                 ev, created = record_event(conn, now, launch_id=launch_id, key=e.key, pos=e.pos, kind=e.kind,
                                            body=e.body, normalized=e.norm, turn_id=e.turn_id, call_id=e.call_id,
-                                           backfill=old)
+                                           backfill=old, tool_name=e.tool_name)
                 if created != fresh[i]:
                     raise CoordError(f"launch {launch_id}'s chat record changed while its batch was read; nothing "
                                      "was written")

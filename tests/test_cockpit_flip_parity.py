@@ -26,12 +26,69 @@ DRIVE = Path(__file__).with_name("_page_drive.mjs")
 needs_browser = pytest.mark.skipif(NODE is None or not Path(CHROME).exists(), reason="node and Chrome are needed")
 
 
+DIAG_OK = "__levain_diag_ok__"
+
+
+def _with_diag(steps: list[dict[str, Any]]) -> tuple[list[dict[str, Any]], list[int]]:
+    """A synchronous `until` step may carry `"diag": "<expression>"`: if its wait never comes true, the drive fails with
+    that expression's value (read from the page at the timeout) in the message, so a CI log names WHY the condition did
+    not hold (slow, or never true). The wait, its bound and its condition are the step's own and unchanged: the driver
+    is told `may_timeout` so the page is still there to read, and the next step fails the drive when the last poll was
+    falsy (a flag the polled expression sets), which also skips every later step. On success that step answers DIAG_OK
+    and `_drive` drops it from `values` BY POSITION (the step right after its `until`), so the callers' indexes do not
+    move and a real value equal to DIAG_OK is never touched. Returns the steps to send and the index, in those steps, of
+    each injected diag step. Synchronous `until` only: the polled expression is read once per poll, never awaited, so a
+    thenable is refused (the wrapper below flags it and the diag step fails the drive saying so)."""
+    out: list[dict[str, Any]] = []
+    injected: list[int] = []
+    for i, s in enumerate(steps):
+        if "diag" not in s:
+            out.append(s)
+            continue
+        assert "until" in s and not {"do", "posts", "may_timeout"} & set(s), f"step {i}: diag needs a plain sync until step"
+        until = s["until"]
+        out.append({**{k: v for k, v in s.items() if k != "diag"}, "may_timeout": True,
+                    "until": f"(() => {{ window.__untilOk = false; window.__untilBad = false; const v = ({until}); "
+                             f"if (v && typeof v.then === 'function') {{ window.__untilBad = true; return null; }} "
+                             f"window.__untilOk = !!v; return v; }})()"})
+        head = json.dumps(f"step {i}: until never came true within {s.get('ms', 'the driver default')}ms: {until}")
+        bad = json.dumps(f"step {i}: diag supports a synchronous until only; this one returned a thenable: {until}")
+        injected.append(len(out))
+        out.append({"eval": f"(() => {{ if (window.__untilBad) throw new Error({bad}); if (window.__untilOk) return {json.dumps(DIAG_OK)}; let d; "
+                            f"try {{ const x = ({s['diag']}); d = typeof x === 'string' ? x : JSON.stringify(x); }} catch (e) {{ d = 'the diag expression threw: ' + e; }} "
+                            f"throw new Error({head} + ' | PAGE AT THE TIMEOUT: ' + d); }})()"})
+    return out, injected
+
+
+def _pushes_value(s: dict[str, Any]) -> bool:
+    """Whether the driver (tests/_page_drive.mjs, its if-chain over the step's key, in this order) appends one entry to
+    `values` for this step. `_drive` needs it to find where an injected diag step's answer sits; it checks the answer
+    there, so a drift of this mirror from the driver fails loudly rather than dropping a real value."""
+    for k in ("authenticator", "user_verified", "init", "emulate", "scheme", "key"):
+        if k in s:
+            return False
+    if "tap" in s:
+        return True
+    if "focus" in s or "motion" in s:
+        return False
+    if "shot" in s:
+        return True
+    return "posts" not in s   # `do` and `until` steps push unless a `posts` count is what they wait on; a bare `posts` waits and pushes nothing; an eval pushes
+
+
 def _drive(tmp_path: Path, url: str, steps: list[dict[str, Any]]) -> dict[str, Any]:
     f = tmp_path / "steps.json"
-    f.write_text(json.dumps(steps))
+    sent, injected = _with_diag(steps)
+    f.write_text(json.dumps(sent))
     res = run_driver([NODE, str(DRIVE), CHROME, url, str(f)], timeout=300)
-    assert res.returncode == 0, res.stderr
-    return json.loads(res.stdout)
+    # the driver reports a failed step (the diag message included) on stderr and prints nothing on stdout; stdout is the fallback
+    assert res.returncode == 0, res.stderr or res.stdout
+    out = json.loads(res.stdout)
+    pos = {i: sum(_pushes_value(x) for x in sent[:i]) for i in injected}
+    for i in sorted(injected, reverse=True):
+        assert out["values"][pos[i]] == DIAG_OK, (i, pos[i], out["values"])
+        del out["values"][pos[i]]
+    return out
 
 
 def _eventually(read: Any, want: Any, seconds: float = 20.0) -> Any:

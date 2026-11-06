@@ -51,6 +51,7 @@ WAKE_DRAIN_MAX = 64
 
 
 def _log(msg: str) -> None:
+    RP.bound_log()    # the unit's launchd log has no other bound (``levain.slot.reaper.bound_log``)
     try:
         sys.stderr.write(f"levain reaper[{os.getpid()}]: {msg}\n")
         sys.stderr.flush()
@@ -364,6 +365,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     if os.geteuid() != 0:
         print("levain reaper: must run as root (the service unit runs it)", file=sys.stderr)
         return 77
+    RP.bound_log()    # a restart under KeepAlive starts from a bounded file
     return serve(H.Seams())
 
 

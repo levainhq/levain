@@ -26,6 +26,8 @@ from collections.abc import Callable, Mapping
 from pathlib import Path
 from typing import Any, NamedTuple
 
+from levain import pathid
+
 __all__ = [
     "CONTROL_REPLIES", "MODE", "MODE_ALLOWED_SHAPE", "TRIPWIRES", "UNPARSEABLE", "ControlReply", "Trip",
     "TripwireContext", "TripwireWindow", "control_line", "launch_roots", "mode_trip", "read_exempt",
@@ -109,7 +111,9 @@ def read_target_within(tool_input: Any, roots: tuple[str, ...]) -> bool:
         real = str(Path(fp).resolve(strict=True))                  # a missing target raises: latch
     except (OSError, RuntimeError, ValueError):
         return False                                               # a symlink loop or an embedded NUL too
-    return any(real == r or real.startswith(r.rstrip(os.sep) + os.sep) for r in roots)   # symlink escape: latch
+    # symlink escape: latch. Quiet only when surely inside: the lexical test as before, or the same directory under
+    # another spelling (a case alias on this Mac's case-insensitive volume, `pathid.inside`, True only when sure)
+    return any(real == r or real.startswith(r.rstrip(os.sep) + os.sep) or pathid.inside(r, real) for r in roots)
 # ---- end verbatim --------------------------------------------------------------------------------------------------
 
 

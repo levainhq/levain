@@ -279,6 +279,9 @@ class TestJobRuntime:
                        lambda st, r, e: done.append((st, r)), _T0)
         assert ok is True
         _wait(lambda: s.read_status("j1", _T0)["status"] == "done")
+        # 'done' is written BEFORE the worker fires the completion callback (jobs.py _run: finish, then on_finish),
+        # so wait for the callback itself, not for 'done': the read below raced it on a loaded runner.
+        _wait(lambda: len(done) >= 1)
         assert s.read_status("j1", _T0)["result"] == {"text": "result", "summary": "s"}
         assert done == [("done", {"text": "result", "summary": "s"})]
 

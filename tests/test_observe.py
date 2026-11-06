@@ -6,6 +6,8 @@ import io
 import json
 from pathlib import Path
 
+import pytest
+
 from levain import cli, observe
 
 SECRET_EVENT = {
@@ -152,3 +154,98 @@ def test_event_log_survives_a_fifo_swap_and_tightens_a_loose_file(tmp_path):
     os.chmod(log, 0o644)
     observe.append_event(tmp_path, SECRET_EVENT)
     assert log.stat().st_mode & 0o777 == 0o600 and len(_events(tmp_path)) == 1
+
+
+# --- 1106-1 miscdeny: the live ~/.claude spelled in another letter case (casesweep row 13) -------------------------
+
+def _case_alias(p):
+    """``p`` spelled with its letters' case swapped, when this filesystem takes that spelling as the same directory (a
+    case-insensitive one: macOS APFS by default); else the test is skipped."""
+    import os
+    alias = Path(str(p.resolve()).swapcase())
+    if str(alias) == str(p.resolve()) or not alias.exists() or not os.path.samefile(alias, p):
+        pytest.skip("this filesystem is case-sensitive: no case alias of a directory exists")
+    return alias
+
+
+def test_a_case_alias_of_the_live_claude_dir_still_needs_live(tmp_path, monkeypatch, capsys):
+    """casesweep row 13: `Path.resolve()` keeps the spelling it is given, so `--settings-root /USERS/<me>/.CLAUDE` compared
+    unequal to the live `~/.claude` and installed the hook there without `--live`. DENY direction (`maybe_inside` both
+    ways: equal by identity, or unsure). Needs a case-insensitive volume (macOS APFS): on a case-sensitive one no alias
+    of a directory exists and this skips, so a Linux CI run never reds it; `..._with_an_injected_fold` below runs there."""
+    home = tmp_path / "home"
+    live = home / ".claude"
+    live.mkdir(parents=True)
+    alias = _case_alias(live)
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setattr(observe, "_can_import", lambda py: True)
+    assert observe.is_live_root(alias) and observe.is_live_root(live)
+    assert not observe.is_live_root(alias / "sub") and not observe.is_live_root(home)     # equal, not "below" or "above"
+    assert cli.main(["observe", "install", "--settings-root", str(alias)]) == 2
+    assert cli.main(["observe", "uninstall", "--settings-root", str(alias)]) == 2
+    assert not (live / "settings.json").exists()
+    assert "live ~/.claude" in capsys.readouterr().err
+
+
+def test_a_settings_file_in_a_case_alias_of_the_live_dir_is_live(tmp_path, monkeypatch):
+    """casesweep row 13, `_is_live_settings`: the settings file inside an alias of the live dir (it need not exist yet)
+    resolves into the live `~/.claude`. Same volume condition as above (skips on a case-sensitive one)."""
+    home = tmp_path / "home"
+    (home / ".claude").mkdir(parents=True)
+    other = tmp_path / "other"
+    other.mkdir()
+    alias = _case_alias(home / ".claude")
+    monkeypatch.setenv("HOME", str(home))
+    assert observe._is_live_settings(alias / "settings.json")
+    assert observe._is_live_settings(alias / "other-name.json")                  # the live dir, any name (as before)
+    assert not observe._is_live_settings(_case_alias(other) / "settings.json")
+
+
+def test_the_live_claude_dir_is_found_through_an_injected_case_fold(tmp_path, monkeypatch):
+    """The same logic where no alias exists (a Linux CI run): `pathid._fs_spelling` is replaced by a case-insensitive
+    walk over the real tree, standing in for a case-insensitive volume. The canonical spellings still answer as before."""
+    from levain import pathid
+    from tests.test_pathid import _case_insensitive_spelling
+    home = tmp_path.resolve() / "home"
+    (home / ".claude").mkdir(parents=True)
+    (home / "other").mkdir()
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setattr(pathid, "_fs_spelling", _case_insensitive_spelling)
+    assert observe.is_live_root(home / ".CLAUDE") and observe.is_live_root(home / ".claude")
+    assert observe._is_live_settings(home / ".CLAUDE" / "settings.json")
+    assert not observe.is_live_root(home / "OTHER") and not observe.is_live_root(home / ".CLAUDE" / "sub")
+    assert not observe.is_live_root(home) and not observe._is_live_settings(home / "OTHER" / "settings.json")
+
+
+def test_a_case_alias_of_an_absent_live_dir_still_needs_live(tmp_path, monkeypatch, capsys):
+    """L3 casefix r1 F2 (codex): with NO `~/.claude` yet, `~/.CLAUDE` is a distinct absent path to `maybe_inside`, so
+    `observe install --settings-root ~/.CLAUDE` passed both guards and created the live config directory (on a
+    case-insensitive volume `.CLAUDE` is `.claude`). A root whose canonical spelling folds to the live dir's counts
+    as live; on a case-sensitive volume that over-refuses `~/.CLAUDE`, which only demands `--live`."""
+    home = tmp_path.resolve() / "home"
+    home.mkdir()
+    (home / "other").mkdir()
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setattr(observe, "_can_import", lambda py: True)
+    assert observe.is_live_root(home / ".CLAUDE") and observe.is_live_root(home / ".claude")
+    assert observe._is_live_settings(home / ".CLAUDE" / "settings.json")
+    assert not observe.is_live_root(home / ".CLAUDE" / "sub") and not observe.is_live_root(home / "other")
+    assert not observe._is_live_settings(home / "other" / "settings.json")
+    assert cli.main(["observe", "install", "--settings-root", str(home / ".CLAUDE")]) == 2
+    assert "live ~/.claude" in capsys.readouterr().err
+    assert sorted(p.name for p in home.iterdir()) == ["other"]                  # nothing created
+
+
+def test_an_unreadable_settings_file_counts_as_live(tmp_path, monkeypatch):
+    """L3 casefix r1 F2 (gemini): `canonical` swallows its failures, so `_is_live_settings`'s "cannot tell: treat as
+    live" except was dead and a settings file whose spelling could not be read compared unequal and passed."""
+    from tests.test_pathid import _unknowable
+    home = tmp_path.resolve() / "home"
+    (home / ".claude").mkdir(parents=True)
+    elsewhere = tmp_path.resolve() / "elsewhere"
+    elsewhere.mkdir()
+    (elsewhere / "settings.json").write_text("{}")
+    monkeypatch.setenv("HOME", str(home))
+    _unknowable(monkeypatch, elsewhere / "settings.json")
+    assert observe._is_live_settings(elsewhere / "settings.json")
+    assert not observe._is_live_settings(elsewhere / "other.json")             # a readable file elsewhere: not live

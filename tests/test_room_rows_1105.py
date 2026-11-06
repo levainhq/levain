@@ -32,7 +32,8 @@ def _row(gseq, kind, source, ref, launch, body, status=None):
 
 def _stream():
     """A tool that ran and is done, one still running, three results, the room's replies, and one line of his own."""
-    facts = {("L1", "tool_call:1"): ("toolu_1", 0, 0), ("L1", "tool_call:2"): ("toolu_2", 0, 0)}
+    facts = {("L1", "tool_call:1"): ("toolu_1", 0, 0, "Read"), ("L1", "tool_call:2"): ("toolu_2", 0, 0, "Read"),
+             ("L1", "tool_result:toolu_3"): (None, 0, 0, "Read")}          # the Read whose result is FILE
     done = {("L1", "toolu_1")}
     rows = [
         _row(1, "vendor_tool_call", "vendor", "tool_call:1", "L1", None),
@@ -136,8 +137,10 @@ _DUMP = """(() => JSON.stringify([...document.querySelectorAll('.rv-line')].map(
   head: n.querySelector('.rv-who').textContent, text: (n.querySelector('.rv-text') || {}).textContent || null}))))()"""
 
 
-def _results(*bodies):
-    return [threads._item(_row(i + 1, "vendor_tool_result", "vendor", "tool_result:toolu_x%d" % i, "L1", b), {}, set())
+def _results(*bodies, tool_name=None):
+    """The items the page is given for results of ``tool_name`` (None: a row stored before the name was kept, no fact)."""
+    facts = {} if tool_name is None else {("L1", "tool_result:toolu_x%d" % i): (None, 0, 0, tool_name) for i in range(len(bodies))}
+    return [threads._item(_row(i + 1, "vendor_tool_result", "vendor", "tool_result:toolu_x%d" % i, "L1", b), facts, set())
             for i, b in enumerate(bodies)]
 
 
@@ -187,8 +190,23 @@ def test_a_tool_is_called_refused_only_by_the_vendors_own_refusal_sentences(tmp_
 
 
 @needs_browser
+def test_a_result_of_another_tool_keeps_its_numbers_and_a_read_loses_them(tmp_path, w):
+    """Reproduced (1106-1 striptool): a Bash result ``1\\talpha\\n2\\tbeta`` drew without its numbers, the strip going by shape alone.
+    The row carries the vendor's tool name (``tool_name``); only "Read" is stripped, and a row stored before the name was kept
+    (no fact: null) keeps the shape rule."""
+    body = "1\talpha\n2\tbeta\n3\tgamma"
+    cases = (("Bash", body), ("Grep", body), ("Read", "alpha\nbeta\ngamma"), (None, "alpha\nbeta\ngamma"))
+    facts = {("L1", "tool_result:toolu_n%d" % i): (None, 0, 0, name) for i, (name, _w) in enumerate(cases) if name}
+    stream = [threads._item(_row(i + 1, "vendor_tool_result", "vendor", "tool_result:toolu_n%d" % i, "L1", body), facts, set())
+              for i in range(len(cases))]
+    g = _lines(tmp_path, w, stream, len(cases))
+    assert [x["text"] for x in g] == [want for _n, want in cases], g
+    assert g[0]["head"].startswith("A tool result — 1\talpha"), g           # the closed row's one-line summary keeps it too
+
+
+@needs_browser
 def test_an_empty_call_is_hidden_only_when_the_tool_is_known_to_have_finished(tmp_path, w):
-    facts = {("L1", "tool_call:11"): ("toolu_11", 0, 0), ("L1", "tool_call:12"): ("toolu_12", 0, 0)}
+    facts = {("L1", "tool_call:11"): ("toolu_11", 0, 0, None), ("L1", "tool_call:12"): ("toolu_12", 0, 0, None)}
     rows = [_row(10, "vendor_tool_call", "vendor", "tool_call:10", "L1", None),     # no facts: no tool object
             _row(11, "vendor_tool_call", "vendor", "tool_call:11", "L1", None),     # finished
             _row(12, "vendor_tool_call", "vendor", "tool_call:12", "L1", None)]     # running

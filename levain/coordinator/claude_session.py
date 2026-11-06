@@ -50,6 +50,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, ClassVar, NamedTuple, Protocol, runtime_checkable
 
+from levain import pathid
 from levain.coordinator.room_readguard import HOOK_MATCHER, ROOM_READ_REFUSAL
 from levain.coordinator.driver import (APPROVAL_SUBTYPE, ApprovalAnswer, Capabilities, CommandResult, Event,
                                        InterruptCommand, LivenessEvidence, NotSent, ReadBatch, SendCommand,
@@ -1023,7 +1024,10 @@ def _rules(path: str) -> list[str]:
 
 
 def _inside(child: str, root: str) -> bool:
-    return child == root or child.startswith(root.rstrip("/") + "/")
+    """``child`` is ``root`` or below it. A DENY site (a True refuses the room), so the lexical test is joined by
+    :func:`levain.pathid.maybe_inside`: a workdir or deny path spelled in another letter case (this Mac's volume is
+    case-insensitive) is the same place, and a stat that cannot answer counts as inside, not as outside."""
+    return (child == root or child.startswith(root.rstrip("/") + "/") or pathid.maybe_inside(root, child))
 
 
 def room_hook_command(python: str, script: str | os.PathLike[str]) -> str:
@@ -1038,7 +1042,8 @@ def room_settings_json(workdir: str | os.PathLike[str], deny_paths: Iterable[str
                        hook_command: str | None = None) -> str:
     """The ``--settings`` JSON for the room child: ``permissions.deny`` with a Read, Grep and Glob rule for every
     deny path, and ``permissions.blockReadsOutsideWorkingDirectories``. ``workdir`` must be absolute and not inside any
-    deny path (that would blind the room, not confine it), compared lexically AND after ``realpath`` on both sides.
+    deny path (that would blind the room, not confine it), compared lexically, after ``realpath`` on both sides, AND by
+    identity (:func:`_inside`: a case alias of either path counts).
     ``hook_command`` (:func:`room_hook_command`) adds the room's own ``hooks.PreToolUse`` entry
     (:mod:`levain.coordinator.room_readguard`): it can only add a refusal, with :data:`ROOM_READ_REFUSAL` as the model's
     text; the vendor's block stays on beside it. None leaves the hook out (the vendor's own sentence is then the
