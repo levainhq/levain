@@ -59,7 +59,7 @@ def _refusal(reason: str, marker: str | None, *, migrates: bool = False) -> str:
     point it away from the real way out."""
     if migrates and marker in AGENT_SCHEMA_PREDECESSORS:
         return (f"{reason}: {marker} is an older agent schema that the next `levain agents` verb of this version "
-                f"migrates (this read-only look does not)")
+                f"migrates (an already-open store object does not)")
     head = (f"{reason}: the agent tables in this store are not the ones this levain writes; restore `{DB_NAME}` "
             f"from a backup made by this version")
     if marker is None:    # no marker names a writer, so a backup is the only way out
