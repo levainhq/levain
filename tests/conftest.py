@@ -399,3 +399,15 @@ def _no_real_touch_id_notice(monkeypatch):
     fake.real = ts.post_notice  # type: ignore[attr-defined]
     fake.posted = posted        # type: ignore[attr-defined]
     monkeypatch.setattr(ts, "post_notice", fake)
+
+
+@pytest.fixture(autouse=True)
+def _no_real_process_table(monkeypatch):
+    """The remote detector (``terminal_sign.remote_reason``) reads this process's ancestry and a ``ps`` table; a suite
+    run from an ssh or mosh login (or beside a real ``claude attach``) would otherwise turn every "local" expectation
+    remote. Both doors read as an empty process tree here; a test of the detector itself puts the real functions
+    back."""
+    from levain.consent import terminal_sign as ts
+
+    monkeypatch.setattr(ts, "_ancestor_commands", lambda: [])
+    monkeypatch.setattr(ts, "_ps_rows", lambda: None)
