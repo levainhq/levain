@@ -8815,7 +8815,9 @@
     const b = ev.target && ev.target.closest ? ev.target.closest("[data-phone-jump]") : null;
     if (b) phoneJump(b.dataset.phoneJump, b);
   });
-  for (const type of ["touchstart", "wheel"]) document.addEventListener(type, () => { phoneJumpRun++; }, { passive: true, capture: true });
+  // Any trusted reader input ends a pending automatic jump (a late Decisions read must never replace the view the reader chose): a touch, a
+// wheel, a press or click anywhere (a panel's expand, a nav link, Notifications) or a key. Script-made events (isTrusted false) do not.
+for (const type of ["touchstart", "wheel", "pointerdown", "click", "keydown"]) document.addEventListener(type, (ev) => { if (ev.isTrusted) phoneJumpRun++; }, { passive: true, capture: true });
 
   // ====================================================================== THE NOTIFICATION CENTER (S4.2) ====
   // One list of Levain's pings and the notices posted at the operator (GET /webpush/center, levain/webpush/center.py), drawn
@@ -9011,12 +9013,62 @@
       const view = q.get("view");
       if (view !== "notifications" && view !== "needs") return null;
       const n = q.get("n");
-      q.delete("view"); q.delete("n");
+      const q0 = new URLSearchParams(q.toString());
+      q.delete("view"); q.delete("n"); q.delete("item");
       const rest = q.toString();
       window.history.replaceState(null, "", window.location.pathname + (rest ? "?" + rest : "") + window.location.hash);
-      if (view === "needs") return { needs: true };
+      if (view === "needs") {
+        // `&item=<id>`: the one waiting card the link is about. Only a bounded id is kept (the guard admits the same shape); the
+        // address drops it like the other two, and a link only OPENS the card: it never answers, marks read or writes.
+        const item = q0.get("item");
+        return { needs: true, item: item && NEEDS_ITEM_ID.test(item) ? item : null };
+      }
       return { id: n && NC_ID.test(n) ? n : null };
     } catch (_) { return null; }
+  }
+  // The id a deep link names a Needs-you card by (`/?view=needs&item=<id>`): the card's own id (`question:<n>`, `consent:<request id>`),
+  // the bare request id a sign card was filed under, or flow's `np-<8 hex>` item id (its card is `question:<1 + hex>`). The server admits exactly this shape.
+  const NEEDS_ITEM_ID = /^[A-Za-z0-9_.:-]{1,64}$/;
+  function needsItemMatch(it, item) {
+    const id = needsIdOf(it);
+    // flow's own card for an `np-` item is `question:<1 + the id's hex>` (flow's desk_cards.card_number): the same card from either name
+    const hex = /^np-([0-9a-f]{8})$/i.exec(item);
+    if (hex && id === "question:" + (1 + parseInt(hex[1], 16))) return true;
+    return !!id && (id === item || id === "consent:" + item || id === "question:" + item || id === "np:" + item);
+  }
+  function needsGoneNote() {
+    const host = document.getElementById("ck-needs");
+    if (!host || !host.parentNode) return;
+    for (const old of document.querySelectorAll(".needs-gone-note")) old.remove();
+    const note = el("div", "needs-gone-note ext-meta", "That item is no longer waiting.");
+    note.setAttribute("role", "status");
+    host.parentNode.insertBefore(note, host);
+    window.setTimeout(() => note.remove(), 12000);
+  }
+  // A `needs` link with an `item`: wait (bounded, given up when the reader touches the page) for the Decisions lines to be read, then
+  // scroll to the card and open its focus view; an id that is not among the waiting items falls back to the plain Needs view with a
+  // one-line notice. Without a read by the deadline it falls back the same way.
+  function needsItemJump(item, run, deadline) {
+    if (run !== phoneJumpRun) return;
+    const dec = ((currentView && currentView.extra_panels || {}).decisions || {});
+    const lines = dec.lines;
+    // an EMPTY listing is an answer only when the panel says so itself: `clean` (a whole read, status ok or empty, nothing skipped or
+    // filtered) with no error or note. Any other empty one (unread, short, partial) is not (the next read may hold the item): keep waiting
+    const whole = Array.isArray(lines) && (lines.length > 0 || (dec.clean === true && !dec.error && !dec.note));
+    if (whole) {
+      const it = needsWaiting(needsItems(lines)).find((x) => needsItemMatch(x, item));
+      if (it) {
+        if (document.querySelector(PHONE_JUMP_TARGET.needs)) needsGo(needsIdOf(it));
+        openNeedsFocus(it, null);
+        return;
+      }
+      // "no longer waiting" is said only of a whole listing: a panel that carries an error or a note (a partial read says so there) is not one
+      if (!dec.error && !dec.note) needsGoneNote();
+      needsDeepJump(run, Date.now() + PHONE_JUMP_WAIT_MS);   // the fallback to plain Needs gets its own wait, not the spent one
+      return;
+    }
+    if (Date.now() < deadline) { window.setTimeout(() => needsItemJump(item, run, deadline), PHONE_JUMP_STEP_MS); return; }
+    needsDeepJump(run, Date.now() + PHONE_JUMP_WAIT_MS);   // never read (unpaired, empty or slow): not "gone"
   }
   // The strip draws once the board's first read answers, after this boot: wait (bounded, and given up the moment the reader touches
   // the page: phoneJumpRun moves) for the Needs strip to hold something waiting, then jump exactly as the Needs tab does. With
@@ -9759,7 +9811,8 @@
     // `storage` fires only for another tab's change, the same-page announce is the levain:write-token-change event.
     window.addEventListener("levain:write-token-change", () => { ncRead(false); });
     window.addEventListener("storage", (e) => { if (e.key === "levain_write_token") ncRead(false); });
-    if (ask && ask.needs) needsDeepJump(++phoneJumpRun, Date.now() + PHONE_JUMP_WAIT_MS);
+    if (ask && ask.needs && ask.item) needsItemJump(ask.item, ++phoneJumpRun, Date.now() + PHONE_JUMP_WAIT_MS);
+    else if (ask && ask.needs) needsDeepJump(++phoneJumpRun, Date.now() + PHONE_JUMP_WAIT_MS);
     else if (ask) openNotifyCenter(null, ask.id, true);
   }
   if (document.readyState === "loading") document.addEventListener("DOMContentLoaded", ncBoot); else ncBoot();

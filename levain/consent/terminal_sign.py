@@ -29,6 +29,7 @@ import shlex
 import stat
 import subprocess
 import sys
+import time
 import unicodedata
 from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
@@ -697,11 +698,19 @@ def default_desk_signer_factory(key_path: Path, timeout: float | None = None) ->
 
 # --- where the desk is remote ------------------------------------------------------------------------------
 #
-# ONE detector, three legs, all routing and never evidence (a false "local" costs a prompt nobody touches, which
+# ONE detector, four legs, all routing and never evidence (a false "local" costs a prompt nobody touches, which
 # times out; a false "remote" costs one phone signature). Every leg fails to "not remote": a ``ps`` that is missing,
-# slow or unparseable is the status quo, never an exception. Edge notes:
+# slow or unparseable is the status quo, never an exception. The one deliberate exception: once leg 4 has found a
+# remote agent view client open, an unreadable laptop idle time reads remote (the safe side). Edge notes:
 #   - a client attached by NAME (``claude attach <part of the name>``) carries no session id in its argv: not seen;
 #   - two clients on one desk: the session reads remote if ANY attach client is remote;
+#   - leg 4 (agent view) ties a prompt to the client by the keystroke: the client's tty and the viewed session's tty
+#     are read together. The kernel updates a tty's access time lazily (macOS devfs: a read in the same second as the
+#     last update is deferred, and the next stat stamps it with the stat's own fraction of a second, at most one
+#     second later), so the two times can land up to 2 s apart (measured 1.006 s): :data:`TIE_S` covers that. A client
+#     read within that window for another reason also ties, and any tied remote client reads remote. No client tied (a
+#     reply that is not delivered as pty bytes) falls back to: a remote agent view client is open AND the laptop is
+#     idle;
 #   - a process title is read as ``ps`` prints it, so a build that stops rewriting the sshd title is not seen.
 
 _SSH_ENV_NAMES = ("SSH_CONNECTION", "SSH_TTY", "SSH_CLIENT")    # exact names; SSH_AUTH_SOCK, P9K_SSH are not signals
@@ -709,6 +718,10 @@ REMOTE_PROCESSES = ("sshd", "sshd-session", "mosh-server")     # an ancestor wit
 SESSION_ID_ENV = "CLAUDE_CODE_SESSION_ID"
 ATTACH_ID_MIN = 8                  # an attach client is matched by at least this many leading characters of the id
 _PS_TIMEOUT_S = 2.0
+TIE_S = 2.0                        # a client's tty and the session's tty read this close together are one keystroke
+TIE_RECENT_S = 60.0                # ...and only when that read is this recent (an old shared stamp is not this prompt)
+IDLE_S = 60.0                      # the fallback needs the laptop keyboard and mouse idle at least this long
+_NO_TTY = ("", "?", "??", "-")     # no controlling tty: "??" on macOS ps, "?" on Linux procps
 _FALLBACK_HOPS = 8                 # used only when the ancestry walker's own cap cannot be read
 
 
@@ -746,9 +759,9 @@ def _ps_rows() -> str | None:
     return done.stdout if done.returncode == 0 else None
 
 
-def _ps_table(text: str) -> dict[int, tuple[int, list[str]]]:
-    """``pid -> (ppid, argv)`` for every row of ``ps`` text that parses; a row that does not is skipped."""
-    table: dict[int, tuple[int, list[str]]] = {}
+def _ps_table(text: str) -> dict[int, tuple[int, str, list[str]]]:
+    """``pid -> (ppid, tty, argv)`` for every row of ``ps`` text that parses; a row that does not is skipped."""
+    table: dict[int, tuple[int, str, list[str]]] = {}
     for line in text.splitlines():
         parts = line.split(None, 3)
         if len(parts) < 4:
@@ -761,18 +774,18 @@ def _ps_table(text: str) -> dict[int, tuple[int, list[str]]]:
             args = shlex.split(parts[3])
         except ValueError:
             args = parts[3].split()
-        table[pid] = (ppid, args)
+        table[pid] = (ppid, parts[2], args)
     return table
 
 
-def _attach_remote_reason(session_id: str) -> str | None:
+def _attach_remote_reason(session_id: str, text: str | None = None) -> str | None:
     """The reason the desk named ``session_id`` is remote because some ``claude attach <id>`` client of it sits in
     an sshd or mosh-server ancestry, or ``None``. ``<id>`` is a prefix of the session id of at least
     :data:`ATTACH_ID_MIN` characters; the client's ancestry is walked in the SAME ``ps`` table (no second
     ``ps``), at the ancestry walker's hop cap."""
     if len(session_id) < ATTACH_ID_MIN:
         return None
-    text = _ps_rows()
+    text = _ps_rows() if text is None else text
     if not text:
         return None
     table = _ps_table(text)
@@ -782,7 +795,7 @@ def _attach_remote_reason(session_id: str) -> str | None:
         hops = int(band._HOPS)
     except Exception:  # noqa: BLE001
         hops = _FALLBACK_HOPS
-    for pid, (ppid, args) in table.items():
+    for pid, (ppid, _tty, args) in table.items():
         if len(args) < 3 or os.path.basename(args[0]) != "claude" or args[1] != "attach":
             continue
         ident = next((a for a in args[2:] if not a.startswith("-")), "")
@@ -790,11 +803,120 @@ def _attach_remote_reason(session_id: str) -> str | None:
             continue
         cur, seen = ppid, 0
         while cur > 1 and seen < hops and cur in table:
-            parent, cargs = table[cur]
+            parent, _t, cargs = table[cur]
             name = _remote_process_name(cargs)
             if name is not None:
                 return f"attach client {ident[:ATTACH_ID_MIN]} reached from {name}"
             cur, seen = parent, seen + 1
+    return None
+
+
+def _tty_atime(tty: str) -> float | None:
+    """The access time of ``/dev/<tty>`` in seconds, or ``None``. The kernel moves it when a program READS input from
+    the terminal (not when bytes are written to it). A tests' seam."""
+    try:
+        return os.stat(f"/dev/{tty}").st_atime
+    except (OSError, ValueError):
+        return None
+
+
+def _hid_idle_s() -> float | None:
+    """Seconds since the laptop's keyboard or mouse last moved (``ioreg -c IOHIDSystem``, ``HIDIdleTime`` in ns), or
+    ``None`` when it cannot be read. A tests' seam."""
+    try:
+        done = subprocess.run(["ioreg", "-c", "IOHIDSystem"], capture_output=True, text=True, timeout=_PS_TIMEOUT_S,
+                              stdin=subprocess.DEVNULL, env={"PATH": "/bin:/usr/bin:/usr/sbin", "LC_ALL": "C"})
+        found = re.search(r'"HIDIdleTime"\s*=\s*(\d+)', done.stdout)
+        return int(found.group(1)) / 1e9 if found else None
+    except (OSError, subprocess.SubprocessError, ValueError):
+        return None
+
+
+def _own_pid() -> int:
+    """This process's pid. A tests' seam."""
+    return os.getpid()
+
+
+def _agentview_remote_reason(text: str, session_id: str) -> str | None:
+    """Leg 4: the reason the prompt came from a remote agent view client, or ``None``. A ``--bg`` desk's hook runs
+    under the daemon, so neither its environment nor its ancestry names the client, and an agent view client carries
+    no session id in its argv. The client is found by the keystroke instead: the session's own pty (the nearest
+    ancestor of this process with a real tty) and the client's tty are both READ for one keystroke, so their access
+    times sit within :data:`TIE_S` (the kernel's lazy update included). One tied client decides; several tied read
+    remote if ANY is remote. With none tied, the fallback is: some agent view client is remote AND the laptop has
+    not been seen in use for :data:`IDLE_S` (an unreadable idle time cannot show the laptop in use, so it reads
+    remote and the reason says "laptop activity unreadable"). A false remote costs one phone card; a false local
+    stalls on an unseen sheet, so doubt about a proven remote client resolves remote, and every failure before one
+    is found reads as not remote."""
+    table = _ps_table(text)
+    try:
+        from levain.consent import band
+
+        hops = int(band._HOPS)
+    except Exception:  # noqa: BLE001
+        hops = _FALLBACK_HOPS
+
+    def remote_name(pid: int) -> str | None:
+        cur, seen = table[pid][0], 0
+        while cur > 1 and seen < hops and cur in table:
+            parent, _t, cargs = table[cur]
+            name = _remote_process_name(cargs)
+            if name is not None:
+                return name
+            cur, seen = parent, seen + 1
+        return None
+
+    clients: list[tuple[int, str, bool]] = []      # (pid, tty, is an agents client)
+    for pid, (_pp, tty, args) in table.items():
+        if tty in _NO_TTY or len(args) < 2 or os.path.basename(args[0]) != "claude":
+            continue
+        if args[1] == "agents":
+            clients.append((pid, tty, True))
+        elif args[1] == "attach":
+            ident = next((a for a in args[2:] if not a.startswith("-")), "")
+            if len(ident) >= ATTACH_ID_MIN and session_id.startswith(ident):
+                clients.append((pid, tty, False))
+    if not clients:
+        return None
+    session_tty = None
+    cur, seen = _own_pid(), 0
+    while cur in table and seen <= hops:
+        if table[cur][1] not in _NO_TTY:
+            session_tty = table[cur][1]
+            break
+        cur, seen = table[cur][0], seen + 1
+    if session_tty is not None:
+        s_at = _tty_atime(session_tty)
+        if s_at is not None and abs(time.time() - s_at) <= TIE_RECENT_S:
+            tied: list[tuple[int, str, float]] = []
+            for pid, tty, _a in clients:
+                if tty == session_tty:
+                    continue
+                c_at = _tty_atime(tty)
+                if c_at is not None and abs(s_at - c_at) <= TIE_S:
+                    tied.append((pid, tty, abs(s_at - c_at)))
+            if tied:
+                for pid, tty, delta in sorted(tied, key=lambda t: t[2]):
+                    name = remote_name(pid)
+                    if name is not None:
+                        return (f"agent view client {tty} reached from {name}, its input matched this session's "
+                                f"to {round(delta * 1000)} ms")
+                return None
+    for pid, tty, is_agents in clients:
+        if not is_agents:
+            continue
+        name = remote_name(pid)
+        if name is None:
+            continue
+        try:
+            idle = _hid_idle_s()
+        except Exception:  # noqa: BLE001
+            idle = None
+        if idle is None:
+            return f"fallback: remote agent view client {tty} reached from {name}, laptop activity unreadable"
+        if idle >= IDLE_S:
+            return f"fallback: remote agent view client {tty} reached from {name}, laptop idle {round(idle)} s"
+        return None
     return None
 
 
@@ -804,7 +926,8 @@ def remote_reason(env: Mapping[str, str] | None = None, presence: str | None = N
     Remote when ANY of: the presence says so; ``env`` holds ``SSH_CONNECTION``, ``SSH_TTY`` or ``SSH_CLIENT``
     (:data:`_SSH_ENV_NAMES`, exact names); an ancestor of this process is ``sshd``, ``sshd-session`` or
     ``mosh-server`` (a scrubbed environment, a mosh session); or ``env`` names the desk's session
-    (:data:`SESSION_ID_ENV`) and a ``claude attach`` client of it was reached from one of those. Never raises: a
+    (:data:`SESSION_ID_ENV`) and a ``claude attach`` client of it was reached from one of those; or an agent view client
+    is remote by the keystroke tie or its fallback (:func:`_agentview_remote_reason`). Never raises: a
     leg that fails reads as local. ``env`` is the hook's environment, or ``os.environ`` when ``None``; the ancestry
     is always this process's own."""
     try:
@@ -826,7 +949,9 @@ def remote_reason(env: Mapping[str, str] | None = None, presence: str | None = N
     try:
         sid = session_id if isinstance(session_id, str) and session_id else env.get(SESSION_ID_ENV) or ""
         if isinstance(sid, str) and sid:
-            return _attach_remote_reason(sid)
+            text = _ps_rows()                       # ONE ps for the attach leg and the agent view leg
+            if text:
+                return _attach_remote_reason(sid, text) or _agentview_remote_reason(text, sid)
     except Exception:  # noqa: BLE001
         pass
     return None

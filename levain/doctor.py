@@ -133,6 +133,7 @@ def _run_doctor(path: Path, invoke: bool = False, repin_hooks: bool = False) -> 
         core.extend(_check_agent_hook_pins(install, repin=repin_hooks))
         core.extend(_check_cc_sandbox(install))
         core.extend(_check_cc_messaging(install))
+        core.extend(_check_seat_profile())
     if not hookless:
         # Additive scope report — a hookless (openhands) entity has no hooks and
         # therefore no activation gate to report on.
@@ -4857,6 +4858,38 @@ def _check_cc_sandbox(install: Path) -> list[CheckResult]:
                         "Set `sandbox.enabled: true` in the workspace's .claude/settings.json "
                         "(doctor never edits your settings), or accept this as your own trust decision.",
                         warn=True)]
+
+
+def _check_seat_profile(*, claude_bin: str | None = None, python: str | None = None,
+                        managed: Any = None) -> list[CheckResult]:
+    """The ``seat profile`` row: the terminal seat profile builds for a throwaway canary root with the claude binary and
+    interpreter found here, and names its tool set. Builds only; nothing is launched. No claude binary is a fact said
+    in words, a refusal is a failure."""
+    import tempfile
+
+    from levain import seat_profile as sp
+
+    claude = claude_bin or shutil.which("claude")
+    if claude is None:
+        return [CheckResult("seat profile", True, "no claude binary found; the terminal seat profile was not built",
+                            neutral=True)]
+    base: Path | None = None
+    try:
+        base = Path(tempfile.mkdtemp(dir=sp.ensure_canary_prefix(os.environ)))
+        (base / "lane" / ".git").mkdir(parents=True)
+        (base / "ret").mkdir()
+        (base / "keys").mkdir()
+        prof = sp.build_seat_profile(base / "lane", base / "ret", claude_bin=claude, python=python or sys.executable,
+                                     lease=None, key_dir=base / "keys", canary_root=base, managed=managed)
+        return [CheckResult("seat profile", True, f"builds (tools {','.join(prof.tools)}; digest {prof.digest()[:12]})")]
+    except sp.SeatRefusal as exc:
+        return [CheckResult("seat profile", False, f"refused: {exc}"[:400],
+                            "The terminal seat profile cannot be built on this machine.")]
+    except Exception as exc:  # noqa: BLE001 - doctor reports, never crashes
+        return [CheckResult("seat profile", True, f"could not be checked: {exc}"[:300], warn=True)]
+    finally:
+        if base is not None:
+            shutil.rmtree(base, ignore_errors=True)
 
 
 def _check_cc_messaging(install: Path) -> list[CheckResult]:

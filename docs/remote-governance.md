@@ -24,6 +24,7 @@ arguments (`tests/test_remote_detect_1105.py::test_is_remote_without_arguments_r
 | env | exactly `SSH_CONNECTION`, `SSH_TTY` or `SSH_CLIENT` in the hook's environment (`SSH_AUTH_SOCK`, `P9K_SSH`, `_P9K_SSH_TTY` are not signals) | `env SSH_CLIENT` ... | `::test_the_three_exact_env_names_are_signals`, `::test_names_that_only_look_like_ssh_are_not_signals` |
 | ancestry | an ancestor of the hook process whose argv[0] basename is exactly `sshd`, `sshd-session` or `mosh-server` (one trailing colon of a rewritten process title is dropped), within the hop cap of the one ancestry walker, `levain.consent.band._ancestors` | `ancestor process sshd-session` | `::test_ancestry_with_sshd_session_is_remote_with_env_scrubbed`, `::test_ancestry_with_mosh_server_is_remote_with_env_scrubbed`, `::test_only_the_exact_names_count_as_a_remote_ancestor`, `::test_local_terminal_ancestry_is_not_remote` |
 | attach client | the hook env names its desk (`CLAUDE_CODE_SESSION_ID`) and a `ps` row is `claude attach <id>` with `<id>` a prefix of at least eight characters of that id, and that client's own ancestry holds one of the three names | `attach client 1e37cf45 reached from sshd-session` | `::test_attach_client_under_sshd_makes_the_session_remote`, `::test_attach_client_under_mosh_server_makes_the_session_remote`, `::test_attach_client_for_another_session_is_not_remote`, `::test_local_attach_client_is_not_remote` |
+| agent view client | the hook env names its desk and `ps` shows a `claude agents` client (or an id-matching `claude attach`) on a real tty whose own ancestry holds one of the three names. The prompt is tied to its client by the keystroke: the client's tty and the session's tty are both read for one keystroke, so their access times sit within `TIE_S` (2 s: usually milliseconds, but the kernel defers an update made in the same second as the last one and stamps it at the next stat, measured up to 1.006 s off) of each other and the session's is under `TIE_RECENT_S` (60 s) old; one tied client decides, several tied read remote if ANY is remote, so a remote client read within that window for any reason makes the prompt remote. With no client tied the fallback is: a remote `claude agents` client is open AND the laptop keyboard and mouse have been idle for at least `IDLE_S` (60 s); an unreadable idle time cannot show the laptop in use, so it reads remote | `agent view client ttys002 reached from mosh-server, its input matched this session's to 1 ms`, or `fallback: remote agent view client ttys002 reached from mosh-server, laptop idle 120 s` (or `laptop activity unreadable`) | `tests/test_remote_detect_agentview_1106.py` |
 | presence | the caller's presence text says remote (neither live hook passes one: [judged by levain 41, 2026-11-05, against `git grep -n "is_remote("` in levain and flow's `scripts/termsign_hook.py`]) | `presence says remote` | `::test_presence_remote_is_a_signal_and_other_presence_is_not` |
 
 Routing only, never evidence: a `ps` that fails, times out or prints something unparseable reads as local for that
@@ -74,3 +75,33 @@ That half is flow's and its tests are flow's; this repo's part is only that the 
   times out.
 - Residue, no instrument here holds it: answering one band item from a real phone terminal over ssh, mosh and
   `claude attach` and seeing no sheet on the laptop and the new words in the echo.
+
+### Known edge: the agent view peek panel (intent only, not measured)
+
+A reply typed in the agent view peek panel (sent "without leaving agent view") may not travel as bytes read from the viewed session's tty, so no client's tty would tie. Whether it does has not been measured. The intent is that such a reply lands on the fallback (a remote agent view client is open and the laptop is idle); with the laptop busy it reads local and the sheet opens unseen. Real mosh and Blink were not run either: the tie rests on the measured laptop agent view and a pty experiment.
+
+## The sign card (B2)
+
+A band answer typed at a remote desk is recorded at once and unsigned (`sign_reason='remote'`); nothing delays or gates it.
+After the write the seat hook files one card per typed line in the cockpit Signer's queue
+(`levain/consent/answer_countersign.py`): levain's own plain request in the `levain-answer-countersign` namespace, whose
+message is the ordinary `levain-terminal-answer/1` bytes plus a `countersign-of:` line naming the recorded answers. The
+queue dir is `$LEVAIN_SIGN_QUEUE_DIR`, else the `sign_queue_dir` key of the hook queue's `claude_code.json`; with neither,
+no card is filed and the echo says why. The echo promises "sign it on your phone" only when the card was filed, pointed at
+and the push child started (which says nothing of arrival). The card is evidence only.
+
+A band render reads the card back, with no poller: `countersigned on your phone <time>` only when the passkey signature
+verifies over exactly the recorded answer; `remote, unsigned` while the card is open, expired or was never filed;
+`DISOWNED on your phone` after a deny; `countersign FAILED: <reason>` for anything else. A bad signature, a missing
+card or any error is never countersigned. The local Touch ID path files nothing and reads as before.
+
+Known edges. The card's pointer write waits for the question store at most `HOOK_BUSY_MS`; a store held past that
+leaves a filed card nothing points at (it lapses unsigned) and the echo says the store stayed busy. A push that could not
+be started is not retried: the echo says so and the answer reads `remote, unsigned`. The badge finds the signing queue
+from the reading process's settings, so moving `sign_queue_dir` after a card was filed makes that card read as gone
+(`countersign FAILED`) or, with no queue named, `remote, unsigned`, never as signed; the queue path is not stored beside the answer on purpose, since the passkeys the
+verifier trusts are read from that queue. Filing is idempotent only while the card is open; nothing refiles, because a
+recorded answer is never answered again.
+
+Residue, no instrument here holds it: a line typed from a real phone terminal, the push arriving on the phone, Face ID on
+the sheet and the badge turning on the laptop; and the live `sign_queue_dir` key in the hook queue's `claude_code.json`.

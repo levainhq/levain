@@ -173,6 +173,9 @@ def test_core_reads_no_process_environment(tmp_path, monkeypatch):
     cc.import_site_dirs()       # the stdlib caches read the environment once, at first use (design §15)
     tempfile.gettempdir()
     site.getusersitepackages()
+    # levain.webpush.sender builds its urllib opener at import, which reads the proxy environment once; the core path imports it
+    # lazily, so a run of this test first in its process (a shard, or alone) met that one-time read inside the measured window
+    import levain.webpush.sender  # noqa: F401
     repo = tmp_path / "repo"
     repo.mkdir()
     subprocess.run(["git", "init", "-q", str(repo)], check=True, capture_output=True)

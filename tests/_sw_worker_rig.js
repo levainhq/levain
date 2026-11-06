@@ -66,11 +66,19 @@ const caches = {
     const guess = (k) => (k === '/' ? 'text/html' : /\.css(\?|$)/.test(k) ? 'text/css' : /\.js(\?|$)/.test(k) ? 'application/javascript' : '');
     return {
       put: async (k, r) => {
+        if (n === 'levain-open' && k.startsWith('/__levain_open/shown-') && log.putMode) {
+          // 'putslow': the entry's write completes 300 ms late; 'putstuck': it never completes (a hung Cache Storage)
+          log.order.push('put-start');
+          if (log.putMode === 'putstuck') return new Promise(() => {});
+          // 'putlate': the write lands AFTER the bounded waits (and after a rejected show's cleanup would have deleted)
+          await new Promise((res) => setTimeout(res, log.putMode === 'putlate' ? 3600 : 300));
+          log.order.push('put-done');
+        }
         if (n.startsWith('levain-shell-v') && putFailKey === k) { putFailKey = null; throw new TypeError('quota'); }
         cacheCtypes.set(n + '|' + k, r.headers.get('content-type') || guess(k)); cacheHeaders.set(n + '|' + k, [...r.headers.entries()]); m.set(k, await r.text());
       },
-      match: async (k) => (m.has(k) ? new Response(m.get(k), { headers: [...(cacheHeaders.get(n + '|' + k) || []), ['content-type', cacheCtypes.get(n + '|' + k) || guess(k)]].reduce((h, [a, b]) => { h.set(a, b); return h; }, new Headers()) }) : undefined),
-      delete: async (k) => m.delete(k),
+      match: async (k0) => { const k = typeof k0 === "string" ? k0 : new URL(k0.url).pathname; return (m.has(k) ? new Response(m.get(k), { headers: [...(cacheHeaders.get(n + '|' + k) || []), ['content-type', cacheCtypes.get(n + '|' + k) || guess(k)]].reduce((h, [a, b]) => { h.set(a, b); return h; }, new Headers()) }) : undefined); },
+      delete: async (k0) => m.delete(typeof k0 === "string" ? k0 : new URL(k0.url).pathname),
       keys: async () => [...m.keys()].map((k) => ({ url: 'https://box.example' + k })),
     };
   },
@@ -92,7 +100,7 @@ const self_ = {
     // what the user agent holds: a resolved show adds one (a same-tag show replaces it), unless the platform swallowed it
     // (log.swallowed: the promise resolves and nothing is held, the way a notification no device drew looks from inside)
     showNotification: async (title, o) => {
-      log.order.push('show'); log.shownCalls.push({ title, tag: o.tag });
+      log.order.push('show'); log.shownCalls.push({ title, tag: o.tag }); log.showTs = Date.now();
       if (log.showThrows) throw new Error('showNotification refused');
       if (!log.swallowed) { log.held = log.held.filter((n) => n.tag !== o.tag).concat([{ title, tag: o.tag, data: o.data }]); }
     },
@@ -214,6 +222,7 @@ function fire(type, ev) {
     log.subscription = parts.includes('nosub') ? null : { endpoint: 'https://fcm.googleapis.com/fcm/send/dev1' };
     log.showThrows = parts.includes('showthrows');
     log.swallowed = parts.includes('swallowed');
+    log.putMode = parts.includes('putstuck') ? 'putstuck' : parts.includes('putlate') ? 'putlate' : parts.includes('putslow') ? 'putslow' : null;
     log.getnThrows = parts.includes('getnthrows');
     log.getnAll = parts.includes('getnall');
     if (parts.includes('nogetn')) delete self_.registration.getNotifications;
@@ -253,13 +262,26 @@ function fire(type, ev) {
     // 'taghostile': a tag whose length throws, so heldByAgent's own failure path throws too (nothing real sends one: the
     // flag exists to reach the chain's trailing catch)
     if (parts.includes('taghostile')) data.tag = { get length() { if (!log.hostileTagDone) throw new TypeError('hostile tag'); return 7; }, toString: () => 'hostile' };
+    // 'nourl': no url in the payload; 'summary': the held-summary tag; 'crossurl': an off-origin url; 'second': a second push (ping 43) after the first;
+    // 'clickping': the `then:...+click` carries ping 42 (as a real notification's data does), 'clickother': ping 99
+    if (parts.includes('nourl')) delete data.url;
+    if (parts.includes('summary')) data.tag = 'summary';
+    if (parts.includes('crossurl')) data.url = 'https://evil.example/x';
+    if (parts.includes('legacy')) { const m = new Map(); m.set('/__levain_open/shown', JSON.stringify({ url: '/', nonce: 'old', at: Date.now(), for: 'shown', ping: 41, tag: 'x' })); cacheNames.add('levain-open'); cacheStores.set('levain-open', m); }
     const started = Date.now();
     const evPush = () => ({ data: { json: () => data } });
     if (!parts.includes('clickonly')) {
       await fire('push', evPush());
       if (parts.includes('twice')) await fire('push', evPush());
+      if (parts.includes('many')) for (let i = 0; i < 12; i++) { await new Promise((r) => setTimeout(r, 5)); data.ping = 100 + i; data.tag = 't' + i; data.url = '/?view=notifications&n=p' + (100 + i); await fire('push', evPush()); }
+      if (parts.includes('sametag')) { data.ping = 43; data.url = '/?view=notifications&n=p43'; await fire('push', evPush()); }   // same tag 'x', a newer ping
+      if (parts.includes('second')) { data.ping = 43; data.tag = 'y'; data.url = '/?view=notifications&n=p43'; await fire('push', evPush()); }
     }
+    if (parts.includes('putlate')) await new Promise((r) => setTimeout(r, 1500));   // let the late write land before reading the store
+    log.shownAfterPush = pendings().filter((p) => p.for === 'shown');
+    log.legacyLeft = (cacheStores.get('levain-open') || new Map()).has('/__levain_open/shown');
     log.elapsedMs = Date.now() - started;
+    log.showAfterMs = log.showTs ? log.showTs - started : null;
     log.afterFirst = { posts: log.posts.length, queued: [...(cacheStores.get('levain-receipts') || new Map()).keys()].sort() };
     log.firstPosts = log.posts;
     const then = parts.find((p) => p.startsWith('then:'));
@@ -269,7 +291,7 @@ function fire(type, ev) {
       log.windows = [windowClient];
       if (parts.includes('rotate')) log.subscription = { endpoint: 'https://fcm.googleapis.com/fcm/send/dev2' };
       const t1 = Date.now();
-      if (parts.includes('click')) await fire('notificationclick', { notification: { close: () => {}, data: { url: '/' } } });
+      if (parts.includes('click')) await fire('notificationclick', { notification: { close: () => {}, data: { url: '/', ...(parts.includes('clickping') ? { ping: 42 } : parts.includes('clickother') ? { ping: 99 } : {}) } } });
       if (parts.includes('push')) await fire('push', evPush());
       log.thenMs = Date.now() - t1;
     }
@@ -279,6 +301,7 @@ function fire(type, ev) {
       await fire('notificationclick', { notification: { close: () => {}, data: { url: '/' } } });
       log.clickMs = Date.now() - t1;
     }
+    log.shownAfterClick = pendings().filter((p) => p.for === 'shown');
     log.queued = [...(cacheStores.get('levain-receipts') || new Map()).keys()].sort();
     log.trace = traceSteps();
   } else if (scenario === 'click') {

@@ -593,17 +593,46 @@ def _operator_name_refused(operator: str) -> bool:
     return not OPERATOR_RE.fullmatch(operator) or is_sudoers_alias(operator)
 
 
-def sudoers_text(operator: str, hands_user: str, net_group: str | None = None) -> str:
+def sudo_knows_requiretty(probe: Callable[[], str | None] | None = None) -> bool:
+    """False only when the installed sudo says it is sudo-rs; an unknown or unprobeable sudo keeps the
+    old behaviour (True). ``probe`` returns the first line of ``sudo --version`` (or None); injected by tests."""
+    if probe is None:
+        def probe() -> str | None:
+            try:
+                r = subprocess.run([SUDO, "--version"], capture_output=True, text=True, timeout=10,
+                                   cwd="/", env={**child_env(), "LC_ALL": "C"})
+            except (OSError, subprocess.SubprocessError):
+                return None
+            return r.stdout.splitlines()[0] if r.returncode == 0 and r.stdout else None
+    try:
+        first = probe()
+    except Exception:   # a broken probe is an unprobeable sudo
+        return True
+    return not (first and "sudo-rs" in first.lower())
+
+
+def sudoers_text(operator: str, hands_user: str, net_group: str | None = None, *,
+                 classic_sudo: bool | None = None) -> str:
+    """``classic_sudo`` True = classic sudo (emits ``!requiretty`` and the I/O-logging negations), False =
+    sudo-rs (omits the tokens its visudo rejects), None = detect with :func:`sudo_knows_requiretty`."""
     if _operator_name_refused(operator):
         raise HandsSetupError(f"refusing the account name {operator!r}: it could change meaning in a sudoers rule")
+    if classic_sudo is None:
+        classic_sudo = sudo_knows_requiretty()
     return (
         f"# Written by `levain setup-isolation`; removed by `levain setup-isolation --undo`.\n"
         f"# {operator} may run commands as the Levain hands user {hands_user}, and nothing else.\n"
-        f"Defaults>{hands_user} !requiretty\n"
-        f"Defaults>{hands_user} env_reset\n"
+        # sudo-rs (Ubuntu 26.04) has no requiretty option and visudo rejects it as unknown; it never
+        # enforces requiretty, so leaving the line out there loses nothing.
+        + (f"Defaults>{hands_user} !requiretty\n" if classic_sudo else "")
+        + f"Defaults>{hands_user} env_reset\n"
         # levain hands bash a socket on stdin and reads its state back over it; I/O logging and a
         # pseudo-terminal would put sudo's own pipe or pty there instead (S2 L2b L3).
-        f"Defaults>{hands_user} !log_input, !log_output, !use_pty\n"
+        # sudo-rs (same detector as the !requiretty line above) has no log_input / log_output setting (visudo: "unknown
+        # setting", measured on ubuntu-26.04) and does no I/O logging at all, so the two negations are no-ops
+        # there; !use_pty is accepted and stays. Classic sudo keeps the full line, byte for byte.
+        + (f"Defaults>{hands_user} !log_input, !log_output, !use_pty\n" if classic_sudo
+           else f"Defaults>{hands_user} !use_pty\n")
         # Linux: the runas group lets the operator's `levain ws-git` start network git with the net
         # group's gid, the one gid the egress boundary lets out.
         + (f"{operator} ALL=({hands_user} : {net_group}) NOPASSWD: ALL\n" if net_group

@@ -7896,6 +7896,68 @@ def _probe_env() -> dict[str, str]:
 # ANCESTOR's ``cgroup.procs``, which for the operator's session and any delegated unit is root's (RUN on
 # argushub 2026-10-09, project_memory/1009-13_S2/DESIGN.md P1); the user manager does the move for us.
 SYSTEMD_RUN = "/usr/bin/systemd-run"
+
+# systemd 259+ (Ubuntu 26.04) expands ``${NAME}`` / ``$NAME`` in the COMMAND arguments of ``systemd-run``
+# itself (ExecStart-style specifier expansion), so a ``bash -c`` script handed through it arrives with its
+# variables replaced by nothing. Older systemd passes the text through untouched, where a doubled ``$$``
+# would reach bash as its PID. So the escape is conditional on what THIS host does, measured.
+# The probe prints a single-quoted ``$$``, which needs nothing from the environment: intact text prints
+# ``$$``; a systemd that expands turns ``$$`` into ``$`` (the very rule the escape relies on), so it prints
+# ``$``. Any other result (no systemd-run, a refusing or hung user manager, a nonzero exit, other output)
+# is INCONCLUSIVE: never cached, answered False for this spawn, probed again on the next one.
+_SD_PROBE_ARGV = [SYSTEMD_RUN, "--user", "--scope", "--quiet", "/bin/sh", "-c", "printf %s '$$'", "sh"]
+_sd_expands_dollar: bool | None = None   # set only from a conclusive probe
+_sd_probe_lock = threading.Lock()
+_sd_probe_runner: Callable[[], str | None] | None = None   # tests inject; returns stdout, None = cannot run
+
+
+def _sd_probe_run() -> str | None:
+    """Run the probe; its stdout, or None when systemd-run / the user manager did not run it cleanly."""
+    if not (os.path.isfile(SYSTEMD_RUN) and os.access(SYSTEMD_RUN, os.X_OK)):
+        return None
+    argv = ["/usr/bin/env", f"XDG_RUNTIME_DIR=/run/user/{os.getuid()}", *_SD_PROBE_ARGV]
+    try:
+        proc = subprocess.run(argv, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                              stderr=subprocess.PIPE, env=_probe_env(), timeout=20)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if proc.returncode != 0:
+        return None   # no stderr text is read, so the answer does not depend on the locale
+    return proc.stdout.decode("utf-8", "replace")
+
+
+def systemd_run_expands_dollar() -> bool:
+    """True when this host's ``systemd-run`` expands ``$`` in command arguments. A conclusive probe
+    (``$$`` intact = False, ``$`` = True) is cached for the process; an inconclusive one answers False for
+    this call only and is retried on the next. False is the closed side for an unknown host: on an old
+    systemd it is right, and on an expanding one the unescaped runner makes systemd-run refuse the shell
+    loudly, where a wrong True would silently hand bash ``$$`` (its PID) for every ``$``. One probe at a
+    time, so a late result can never race a conclusive one."""
+    global _sd_expands_dollar
+    if _sd_expands_dollar is not None:
+        return _sd_expands_dollar
+    with _sd_probe_lock:
+        if _sd_expands_dollar is not None:
+            return _sd_expands_dollar
+        out = (_sd_probe_runner or _sd_probe_run)()
+        if out == "$$":
+            _sd_expands_dollar = False
+        elif out == "$":
+            _sd_expands_dollar = True
+        else:
+            return False
+        return _sd_expands_dollar
+
+
+def _escape_for_systemd_run(command: list[str]) -> list[str]:
+    """The COMMAND words handed to ``systemd-run`` (everything after its ``--``), with every ``$`` doubled
+    when this host expands them. The only place the escape lives; never applied to systemd-run's own
+    options or to a layer that does not expand."""
+    if not systemd_run_expands_dollar():
+        return list(command)
+    return [w.replace("$", "$$") for w in command]
+
+
 _CGROUP_ROOT = Path("/sys/fs/cgroup")
 _LEVAIN_SLICE = "levain.slice"
 _CGROUP_KILL_KERNEL = (5, 14)   # cgroup.kill first shipped in 5.14
@@ -9962,7 +10024,7 @@ class _BwrapShell(SandboxedShell):
         if "XDG_RUNTIME_DIR" not in self._env:
             scope = ["/usr/bin/env", f"XDG_RUNTIME_DIR=/run/user/{os.getuid()}", *scope,
                      "/usr/bin/env", "-u", "XDG_RUNTIME_DIR"]
-        return scope + argv, pass_fds
+        return scope + _escape_for_systemd_run(argv), pass_fds
 
     def _after_spawn(self, pgid: int) -> None:
         # bash is blocked reading its input, so nothing of the command has run yet. Before it may run,

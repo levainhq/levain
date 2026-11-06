@@ -63,3 +63,52 @@ def test_the_query_admission_is_the_taps_own_two_parameters_and_nothing_else(tmp
         assert _get(port, tap, {**NAV, "Sec-Fetch-Dest": "iframe"})[0] == 403
         assert _get(port, tap, NAV, method="HEAD")[0] == 403
         assert _get(port, tap, {**NAV, "Host": "evil.example"})[0] == 403
+
+
+def test_a_pixel_launch_navigate_with_dest_empty_reaches_the_shell_and_only_the_shell(tmp_path: Path) -> None:
+    """11-06 Pixel photo of the 403 body: Sec-Fetch-Site cross-site, Mode navigate, Dest EMPTY (a notification tap or the installed
+    app's launch). The app shell admits it; pair and sign pages, a fetch, frames/embeds, HEAD and a foreign Host stay refused."""
+    pixel = {"Sec-Fetch-Site": "cross-site", "Sec-Fetch-Mode": "navigate", "Sec-Fetch-Dest": "empty"}
+    src = _install(tmp_path)[1]
+    with _serve(src) as (port, _):
+        status, shell = _get(port, "/")
+        assert status == 200
+        assert _get(port, "/", pixel) == (200, shell)
+        for u in _payload_urls(tmp_path):
+            assert _get(port, u, pixel) == (200, shell), u
+        for bad in ("/pair", "/pair?x=1", "/?pair=abcdefgh12", "/?view=other", "/x", "/?"):
+            assert _get(port, bad, pixel)[0] == 403, bad
+        for mode, dest in (("cors", "empty"), ("no-cors", "empty"), ("same-origin", "empty"), ("navigate", "iframe"),
+                           ("navigate", "embed"), ("navigate", "object"), ("navigate", "frame")):
+            assert _get(port, "/", {**pixel, "Sec-Fetch-Mode": mode, "Sec-Fetch-Dest": dest})[0] == 403, (mode, dest)
+        assert _get(port, "/", pixel, method="HEAD")[0] == 403
+        assert _get(port, "/", {**pixel, "Host": "evil.example"})[0] == 403
+
+
+def test_the_needs_item_deep_link_is_admitted_in_exactly_its_own_shape(tmp_path: Path) -> None:
+    """`/?view=needs&item=<id>` opens one Needs-you card (a row with no sign request has no /sign/<id>): admitted cross-site for
+    a bounded id and nothing else."""
+    src = _install(tmp_path)[1]
+    with _serve(src) as (port, _):
+        for ok in ("/?view=needs&item=q-abc123", "/?view=needs&item=np-4e087a4f", "/?view=needs&item=consent:cr-1.x_2",
+                   "/?view=needs&item=" + "a" * 64):
+            assert _get(port, ok, NAV)[0] == 200, ok
+        for bad in ("/?view=needs&item=x&y=1", "/?item=x", "/?view=board&item=x", "/?view=needs&item=a<b",
+                    "/?view=needs&item=a%20b", "/?view=needs&item=%3Cx", "/?view=needs&item=", "/?view=needs&item=" + "a" * 65,
+                    "/?item=x&view=needs", "/?view=needs&item=x&item=y", "/?view=needs&item=x&view=needs",
+                    "/?view=notifications&item=x", "/?view=needs&item=x;y", "/?view=needs&item=a+b", "/?view=needs&item=a/b",
+                    "/?view=needs&n=n12", "/x?view=needs&item=x", "/?view=needs&item=x#y&z=1&write_token=T"):
+            assert _get(port, bad, NAV)[0] == 403, bad
+        tap = "/?view=needs&item=q-abc123"
+        assert _get(port, tap, {**NAV, "Sec-Fetch-Mode": "cors", "Sec-Fetch-Dest": "empty"})[0] == 403
+        assert _get(port, tap, {**NAV, "Sec-Fetch-Dest": "iframe"})[0] == 403
+        assert _get(port, tap, NAV, method="HEAD")[0] == 403
+        assert _get(port, tap, {**NAV, "Host": "evil.example"})[0] == 403
+
+
+def test_the_needs_item_query_check_refuses_a_raw_space_and_every_other_shape() -> None:
+    from levain.web_server import _needs_item_query as ok   # the client cannot send a raw space, so the parser is asked directly
+    assert ok("view=needs&item=q-abc") and ok("view=needs&item=consent:a.b_c-1")
+    for bad in ("view=needs&item=a b", "view=needs&item=a<b", "view=needs&item=x&y=1", "item=x", "view=board&item=x", "view=needs", "",
+                "view=needs&item=a\nb", "view=needs&item=é"):
+        assert not ok(bad), bad

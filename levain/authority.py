@@ -61,7 +61,7 @@ __all__ = [
     "CUSTODIES", "DISPLAY_PHONE", "EGRESS_KEY_KIND", "FIDO_ATTESTED", "FORMAT", "FORMAT_V2", "FORMAT_V3", "FORMAT_V4",
     "FORMAT_V5", "VOICE_KEY_KIND", "VOICE_KEY_PROVIDERS", "VOICE_KEY_USES", "voice_key_for", "voice_key_record",
     "GRADUATION_CREATE_RANK",
-    "GRADUATION_GRANT_MAX", "GRADUATION_KIND", "HANDS_MCP_KIND", "GRADUATION_OPT_IN_RANK", "GRADUATION_PHONE_KIND", "PASSKEY",
+    "GRADUATION_GRANT_MAX", "GRADUATION_KIND", "HANDS_MCP_KIND", "SEAT_LEASE_KIND", "SEAT_LEASE_MAX", "GRADUATION_OPT_IN_RANK", "GRADUATION_PHONE_KIND", "PASSKEY",
     "NAMESPACE", "RESET_FORMAT", "RESET_NAMESPACE", "SCHEMA",
     "Anchor", "AnchorError", "ForeignAnchor", "KEY_WORD", "AuthorityError", "AuthorityKey", "AuthorityPolicy", "AuthoritySnapshot",
     "HeadBelowCache", "NotInitialised", "PROCESS_CACHE", "ReplayCache", "ReplayError", "StaleHead", "StandingPolicy",
@@ -1934,6 +1934,110 @@ def _refuse_unknown_kind(grants: list[Any]) -> None:
                              "levain that wrote it")
 
 
+# A seat-root lease (PATHZERO Z1, ruling D2 a; ``levain.seat_lease``): the signed authority under which Levain mints a
+# terminal seat's roots (one lane clone and its RETURN directory, each below the two parents named here). Fixed terms
+# under its id; a renew moves only the expiry, at most SEAT_LEASE_MAX past the renew. A launch needs a LIVE one; a
+# revoke (the cockpit's passkey revoke reaches it through ``passkey_revocable``) refuses every LATER launch and leaves a
+# running seat's roots alone. At most one live lease at a time, judged at append (:func:`_seat_lease_unique_check`).
+SEAT_LEASE_KIND = "seat-root-lease"
+SEAT_LEASE_MAX = timedelta(days=14)
+_SEAT_LEASE_FIELDS = frozenset({"id", "kind", "agent", "lanes_parent", "returns_parent", "launcher_key_sha256",
+                                "expires_at"})
+_SEAT_LEASE_ID = re.compile(r"sl-[0-9a-f]{12}")
+_SEAT_LEASE_FIXED = "a seat-root lease's terms are fixed: revoke it and sign another"
+
+
+def _validate_seat_lease(grant: Mapping[str, Any], what: str, at: datetime | None) -> dict[str, Any]:
+    """A seat-root lease's shape (:data:`SEAT_LEASE_KIND`): exactly its fields, ``agent`` ``claude_code``, two absolute
+    normalized parents, the launcher key's sha256, an expiry at most :data:`SEAT_LEASE_MAX` past the link's ``at``. What
+    a parent may be (no agent-config name in it, not under ``~/.claude`` or flow's state, the two disjoint) is an append
+    rule (:func:`_seat_lease_check`), not a replay rule, so no later rule change refuses the log."""
+    if set(grant) != _SEAT_LEASE_FIELDS:
+        raise AuthorityError(f"{what} (a seat-root lease) must carry exactly {', '.join(sorted(_SEAT_LEASE_FIELDS))}")
+    if grant["kind"] != SEAT_LEASE_KIND:
+        raise AuthorityError(f"{what}.kind must be {SEAT_LEASE_KIND!r}")
+    for name, pattern, shape in (("id", _SEAT_LEASE_ID, "sl- and 12 lowercase hex digits"),
+                                 ("launcher_key_sha256", _SHA256_HEX, "64 lowercase hex digits")):
+        if not isinstance(grant[name], str) or not pattern.fullmatch(grant[name]):
+            raise AuthorityError(f"{what}.{name} must be {shape}")
+    if grant["agent"] != "claude_code" or type(grant["agent"]) is not str:
+        raise AuthorityError(f"{what}.agent must be 'claude_code'")
+    for name in ("lanes_parent", "returns_parent"):
+        path = _agent_text(grant[name], f"{what}.{name}", _AGENT_PATH_MAX)
+        if not path.startswith("/") or os.path.normpath(path) != path or "\0" in path:
+            raise AuthorityError(f"{what}.{name} must be an absolute, normalized path")
+    expires = _parse_stamp(grant["expires_at"], f"{what}.expires_at")
+    if at is not None and expires - at > SEAT_LEASE_MAX:
+        raise AuthorityError(f"{what} may last at most {SEAT_LEASE_MAX.days} days past its link's time")
+    if not _finite_json(grant):
+        raise AuthorityError(f"{what} must be finite JSON (no NaN or Infinity)")
+    return _thaw(grant)
+
+
+def _seat_lease_change(o: Mapping[str, Any], n: Mapping[str, Any], o_exp: datetime, n_exp: datetime) -> str:
+    """A seat-root lease's change: ``renew`` when only its expiry moved later; anything else is refused."""
+    rest = lambda g: _canonical({k: v for k, v in g.items() if k != "expires_at"})   # noqa: E731
+    if rest(o) == rest(n) and n_exp > o_exp:
+        return "renew"
+    raise AuthorityError(_SEAT_LEASE_FIXED)
+
+
+def _seat_lease_check(grants: list[Any], after: str = "") -> None:
+    """At append and at a renew, a lease's parents meet the root rules (judged against the appender's own home, so an
+    append rule): no agent-config name (``levain.host_guard.PROTECTED_NAMES``) among their components, neither under
+    ``~/.claude`` or flow's ``state``, and neither inside, equal to or above the other."""
+    from levain import host_guard as hg
+    home = os.path.expanduser("~")
+    barred = (os.path.join(home, ".claude"), os.path.join(home, "Briefcase", "flow", "state"))
+    for grant in grants:
+        if not (isinstance(grant, Mapping) and grant.get("kind") == SEAT_LEASE_KIND):
+            continue
+        problems: list[str] = []
+        parents = {k: str(grant.get(k)) for k in ("lanes_parent", "returns_parent")}
+        for name, path in parents.items():
+            if hg.PROTECTED_NAMES & set(path.split("/")):
+                problems.append(f"{name} names an agent-config directory")
+            if any(hg.is_within(path, b) for b in barred):
+                problems.append(f"{name} is inside ~/.claude or flow's state")
+        a, b = parents["lanes_parent"], parents["returns_parent"]
+        if hg.is_within(a, b) or hg.is_within(b, a):
+            problems.append("the lanes parent and the returns parent must not contain each other")
+        if problems:
+            raise AuthorityError(f"seat-root lease {str(grant.get('id'))[:40]!r}: " + "; ".join(problems) + after)
+
+
+def _seat_lease_live(grant: Any, now: datetime) -> bool:
+    if not (isinstance(grant, Mapping) and grant.get("kind") == SEAT_LEASE_KIND):
+        return False
+    try:
+        return _parse_stamp(grant["expires_at"], "expires_at") > now
+    except (AuthorityError, KeyError, OverflowError):
+        return False
+
+
+def _seat_lease_unique_check(state: AuthoritySnapshot, rec: Mapping[str, Any], now: datetime) -> None:
+    """At append: a create, a loosen or a renew may not leave two LIVE seat-root leases (one set of parents at a time;
+    revoke the first). Judged with the appender's clock, so an append rule."""
+    op = rec["op"]
+    if op == "create_grant":
+        grant = rec["grant"]
+        if not isinstance(grant, Mapping) or not isinstance(grant.get("id"), str):
+            return
+        after, touched = {**state.policy.grants, grant["id"]: grant}, [grant["id"]]
+    elif op == "loosen":
+        after, old = rec["policy"]["grants"], state.policy.grants
+        touched = [gid for gid, g in after.items()
+                   if gid not in old or _canonical(_thaw(old[gid])) != _canonical(_thaw(g))]
+    elif op == "renew":
+        after, touched = state.policy.grants, [rec["grant_id"]]
+    else:
+        return
+    live = [gid for gid, g in after.items() if _seat_lease_live(g, now)]
+    if len(live) > 1 and any(gid in live for gid in touched):
+        others = ", ".join(repr(g[:40]) for g in live if g not in touched) or "another"
+        raise AuthorityError(f"one live seat-root lease at a time: {others} is already live; revoke it first")
+
+
 @dataclass(frozen=True)
 class _GrantKind:
     """How one grant kind is read, compared and appended. ``consent``: the consent queue answers from a grant of it
@@ -1990,6 +2094,10 @@ _GRANT_KINDS: Mapping[str | None, _GrantKind] = MappingProxyType({
     HANDS_MCP_KIND: _GrantKind(validate=_validate_hands_mcp, change=_hands_mcp_change,
                                append_checks=(_hands_mcp_check,), renew_checks=(_hands_mcp_check,),
                                passkey_revocable=True, fixed=_HANDS_MCP_FIXED),
+    SEAT_LEASE_KIND: _GrantKind(validate=_validate_seat_lease, change=_seat_lease_change,
+                                append_checks=(_seat_lease_check,), renew_checks=(_seat_lease_check,),
+                                passkey_revocable=True, max_life=SEAT_LEASE_MAX, fixed=_SEAT_LEASE_FIXED,
+                                renew_signer_class=LAPTOP),
     AGENT_LINK_KIND: _GrantKind(validate=_validate_agent_link, change=_agent_link_change, passkey_revocable=True,
                                 max_life=AGENT_LINK_MAX, fixed=_AGENT_LINK_FIXED, renew_signer_class=LAPTOP),
 })
@@ -2726,6 +2834,7 @@ def _append_only_checks(state: AuthoritySnapshot, rec: Mapping[str, Any], now: d
     record's one-live rule (:func:`_egress_key_append_check`)."""
     _egress_key_append_check(state, rec, now)
     _hands_mcp_unique_check(state, rec, now)
+    _seat_lease_unique_check(state, rec, now)
     if rec["op"] == "create_grant":
         _grant_append_checks([rec["grant"]])
     elif rec["op"] == "loosen":

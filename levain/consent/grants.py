@@ -24,8 +24,8 @@ from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any
 
-from levain.authority import (CONSENT_CONTAINED_SHELL_KIND, CONSENT_GRANT_KIND, CONSENT_MCP_GRANT_KIND, VOICE_KEY_KIND,
-                              AuthorityError, StaleHead, UnsignedLink, VerifierUnavailable, anchor_path, append,
+from levain.authority import (CONSENT_CONTAINED_SHELL_KIND, CONSENT_GRANT_KIND, CONSENT_MCP_GRANT_KIND, SEAT_LEASE_KIND,
+                              VOICE_KEY_KIND, AuthorityError, StaleHead, UnsignedLink, VerifierUnavailable, anchor_path, append,
                               consent_grant, consent_grant_tool_problem, consent_resolved_workspace,
                               contained_shell_grant, inert_grant, passkey_revocable, prepare, voice_key_record)
 from levain.autonomic.confirm import DEFAULT_SSH_KEYGEN
@@ -262,9 +262,12 @@ def grant_view(queue_dir: Path | str, *, now: datetime, recent: int = 5,
     # request, so no evidence is read for it. Its row names the provider and the record id only: the keychain item the
     # record names (source, account) is not shown, and the record holds no value to show.
     voice = [gid for gid, g in sorted(state.policy.grants.items()) if voice_key_record(g)]
-    links = {gid: state.grant_link(gid) for gid in [g.id for g in consent] + [i[0] for i in inert] + voice}
+    # a seat-root lease (levain.seat_lease) is passkey-revocable too, so it is listed for its revoke (ruling D2 a); it
+    # answers no consent request either
+    lease = [gid for gid, g in sorted(state.policy.grants.items()) if g.get("kind") == SEAT_LEASE_KIND]
+    links = {gid: state.grant_link(gid) for gid in [g.id for g in consent] + [i[0] for i in inert] + voice + lease}
     evidence = read_grant_evidence(queue_dir, [(gid, *link) for gid, link in links.items()
-                                               if link is not None and gid not in voice], recent=recent)
+                                               if link is not None and gid not in voice and gid not in lease], recent=recent)
     stamp = utc_stamp(now)
     rows: list[dict[str, Any]] = []
 
@@ -296,6 +299,11 @@ def grant_view(queue_dir: Path | str, *, now: datetime, recent: int = 5,
                          "provider": visible(str(state.policy.grants[gid].get("provider") or ""))})
         except Exception as exc:    # noqa: BLE001 - one row's fault is that row's, never the whole page's
             _log.warning("grants: a voice-key row could not be shown (%s); the others are", type(exc).__name__)
+    for gid in lease:               # expires like a consent grant; the roots it names are shown as its workspace
+        g, link = state.policy.grants[gid], links[gid]
+        rows.append({**common(gid, SEAT_LEASE_KIND, str(g["expires_at"]), None if link is None else link[0]),
+                     "state": "live" if str(g["expires_at"]) > stamp else "expired", "agent": visible(str(g["agent"])),
+                     "tools": [], "workspace": visible(str(g["lanes_parent"])), "postures": []})
     return {"root": visible(str(root)), "note": "", "grants": rows, "inert_note": INERT_NOTE}
 
 
