@@ -6083,7 +6083,8 @@
     for (const ln of Array.isArray(lines) ? lines : []) {
       if (!ln || typeof ln !== "object") continue;
       if (ln.consent && ln.consent.state === "pending") consents.push({ kind: "consent", c: ln.consent });
-      else if (ln.question && ln.question.state === "open") questions.push({ kind: "question", q: ln.question });
+      // a question the desk alone owes (section desk, not carried over to him) is the Decisions card's "Desk owes" tab, not his strip
+      else if (ln.question && ln.question.state === "open") { if (!(ln.question.section === "desk" && !ln.question.carried)) questions.push({ kind: "question", q: ln.question }); }
       else if (ln.question && ln.question.state === "answered" && decidedRecently(ln.question.decidedAge, ln.question.decidedAt)) {
         answered.push({ kind: "question", q: ln.question, answered: true });
       }

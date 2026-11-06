@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import dataclasses
+import json
 import shutil
 import subprocess
 from pathlib import Path
@@ -13,6 +14,9 @@ import pytest
 from levain.cockpit.engine import _question_row_in
 from levain.cockpit.registry import validate_facets
 from levain.consent.questions import Question
+from tests.test_cockpit_flip_parity import _drive, needs_browser
+from tests.test_cockpit_k2a import _install, _serve
+from tests.test_cockpit_needs_rows import READY, _file
 
 HERE = Path(__file__).parent
 
@@ -51,3 +55,24 @@ def test_the_page_split_tags_and_counts_open_rows() -> None:
         pytest.skip("needs node")
     out = subprocess.run([node, str(HERE / "desk_tabs_check.js")], capture_output=True, text=True, timeout=60)
     assert out.returncode == 0 and "ALL PASS" in out.stdout, out.stdout + out.stderr
+
+
+def _ql(n: int, **facets) -> dict:
+    return {"question": {"id": f"question:{n}", "n": n, "state": "open", "agent": "desk", **facets}}
+
+
+@needs_browser
+def test_the_needs_strip_leaves_out_an_uncarried_desk_question(tmp_path: Path, monkeypatch) -> None:
+    """An open question the desk alone owes (section desk, not carried) is the Decisions card's Desk owes tab, not his strip;
+    a carried desk question shows in both, and a legacy question with no section facet still shows. The count is the items."""
+    _file(tmp_path, monkeypatch)
+    _root, src, _ids = _install(tmp_path)
+    lines = [_ql(1, section="you"), _ql(2, section="desk", carried=False), _ql(3, section="desk", carried=True), _ql(4)]
+    probe = (f"(() => {{ const it = window.LevainNeeds.items({json.dumps(lines)});"
+             " return JSON.stringify({ids: it.map(x => x.q.id), n: it.length}); })()")
+    with _serve(src, surface_tokens={"browser": "T"}, install_class="reported") as (url, _httpd):
+        vals = _drive(tmp_path, f"{url}/#write_token=T", [{"until": READY, "ms": 20000}, {"eval": probe}])["values"]
+    got = [json.loads(v) for v in vals if isinstance(v, str) and v.startswith("{")]
+    assert got, vals
+    assert sorted(got[-1]["ids"]) == ["question:1", "question:3", "question:4"] and got[-1]["n"] == 3, got[-1]
+    assert "question:2" not in got[-1]["ids"]
