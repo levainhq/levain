@@ -137,7 +137,7 @@ FACETS: dict[str, tuple[str, Callable[[Any], bool]]] = {
     # an agent row on the agents panel (levain.cockpit.agents_panel): the group it is drawn in, and the id of the agent
     # link its verbs act on ("" when none is signed for its current spec), and the agent's version and store id its
     # verbs' writes are checked against
-    "agent_group": ("enum", _enum("firing", "paused", "unarmed", "retired")),
+    "agent_group": ("enum", _enum("operator", "firing", "paused", "unarmed", "retired")),
     "agent_link": ("str", _is_str),
     "agent_version": ("int", _is_int),
     "agent_store": ("str", _is_str),
@@ -422,12 +422,14 @@ register_ordering(
     builtin=True,
 )
 # the agents panel (levain.cockpit.agents_panel): grouped by what the agent does now, by name inside a group; a retired
-# agent is history beside the rest and is not a figure on the panel's count
+# agent is history beside the rest and is not a figure on the panel's count. The store's one operator agent is a pinned row
+# of its own, first (P9a-o): it is the record the registry materialises, not a registered agent, so it is not counted either
 register_ordering(
     Ordering("agents.state", lambda row, today: (row.title.lower(), row.id),
              lambda row, today: str(row.facets.get("agent_group") or "unarmed"),
-             (("firing", "Firing"), ("paused", "Paused"), ("unarmed", "Unarmed"), ("retired", "Retired")),
-             uncounted=frozenset({"retired"})),
+             (("operator", "Agent"), ("firing", "Firing"), ("paused", "Paused"), ("unarmed", "Unarmed"),
+              ("retired", "Retired")),
+             uncounted=frozenset({"operator", "retired"})),
     builtin=True,
 )
 # rows a migrated source already ordered (an external panel, design §6.2): one constant key, and the stable

@@ -6,6 +6,7 @@ the ``Rig`` of the launch tests). Each case was first run as a script against th
 from __future__ import annotations
 
 import copy
+import re
 import shutil
 import sqlite3
 from datetime import timedelta
@@ -106,8 +107,9 @@ def _groups(panel: dict) -> dict[str, list[str]]:
 def test_rows_group_firing_paused_unarmed_retired_and_an_unreadable_log_is_never_health(world, tmp_path):
     # behaviour: one agent per group lands in its group, in the group order, and only the retired one is uncounted
     panel = world.panel()
-    assert [g["id"] for g in panel["groups"]] == ["firing", "paused", "unarmed", "retired"]
+    assert [g["id"] for g in panel["groups"]] == ["operator", "firing", "paused", "unarmed", "retired"]   # P9a-o's pinned group first
     got = _groups(panel)
+    assert got["operator"] == ["operator-agent:none"]                                     # a store with no record, uncounted
     assert got["firing"] == [world.rid("firing")] and got["paused"] == [world.rid("paused")]
     assert got["retired"] == [world.rid("retired")]
     assert set(got["unarmed"]) == {world.rid("unarmed"), "agent:" + world.rig.agent}     # the launch rig's agent too
@@ -386,7 +388,8 @@ def test_each_row_carries_the_kind_of_the_role_its_spec_pins(world):
     for a, want in ((job, "job"), (plain, "role"), (named, "role")):
         assert world.ck.read_one(AGENTS_ID, "agent:" + a).value["facets"]["agent_kind"] == want
     # every row has the facet: the retired and the paused ones too
-    assert all("agent_kind" in r["facets"] for r in rows.values())
+    # (the operator agent's row is the record, not a registered agent, and carries no kind: it is the pinned row, P9a-o)
+    assert all("agent_kind" in r["facets"] for r in rows.values() if not r["id"].startswith("operator-agent:"))
 
 
 def test_the_kind_facet_accepts_every_kind_a_role_can_have_and_unreadable():
@@ -440,3 +443,147 @@ def test_a_role_row_that_fails_its_check_reads_unreadable_never_absent_and_is_on
     assert rows["agent:" + good]["facets"]["agent_kind"] == "job"
     assert world.ck.read_one(AGENTS_ID, "agent:" + bad).value["facets"]["agent_kind"] == "unreadable"
     assert _snapshot(world) == before                         # reading a bad role row repairs and writes nothing
+
+
+# --- P9a-o: the operator agent's pinned row. Each case was first run against this rig and is red on the tree before
+# the row existed (the RETURN carries the red output) ---
+
+OPERATOR_PREFIX = "operator-agent:"
+
+
+def _dream(world: World) -> str:
+    """Register the dream the way ``levain dream enable`` does (attached); returns its ``ag-`` id."""
+    from levain.agents.store import set_default_zone
+    from levain.dream import agent as dream_agent
+
+    set_default_zone(world.rig.store, "America/New_York")
+    return dream_agent.register_dream(world.rig.store).agent_id
+
+
+def _dream_unattached(world: World) -> str:
+    """The dream as an install that registered it before K2b has it: the role and the spec, no attachment."""
+    from levain.agents import role as role_mod
+    from levain.agents.store import set_default_zone
+    from levain.dream import agent as dream_agent
+
+    set_default_zone(world.rig.store, "America/New_York")
+    role = role_mod.parse_role(dream_agent.dream_role())
+    role_mod.add_role(world.rig.store, role)
+    parsed = parse_spec(dream_agent.dream_spec(role_mod.role_hash(role)))
+    return register_spec(world.rig.store, parsed, "America/New_York")[0]
+
+
+def _operator_rows(panel: dict) -> list[dict]:
+    return [r for r in panel["rows"] if r["id"].startswith(OPERATOR_PREFIX)]
+
+
+def test_the_dream_attached_draws_the_operator_agents_row_with_its_role_and_the_others_keep_their_groups(world):
+    # behaviour: an attached dream gives ONE row `operator-agent:<oa-id>` pinned first in its own uncounted group, naming
+    # the role, its operation and the install facts (none in this store); the existing agents keep their groups and the
+    # count is the registered agents' (the record is not one)
+    dream = _dream(world)
+    panel = world.panel()
+    ops = _operator_rows(panel)
+    assert len(ops) == 1 and re.fullmatch(r"operator-agent:oa-[0-9a-f]{32}", ops[0]["id"])
+    row = ops[0]
+    assert row["group"] == "operator" and row["facets"]["agent_group"] == "operator"
+    assert "dream" in row["body"] and "active" in row["body"] and "no install facts" in row["body"]
+    assert "not attached" not in row["body"]
+    assert row["body"].startswith("Operator agent oa-") and "roles: dream v1 as role dream v1 (active)" in row["body"]
+    assert [g["id"] for g in panel["groups"]] == ["operator", "firing", "paused", "unarmed", "retired"]
+    assert next(g for g in panel["groups"] if g["id"] == "operator").get("uncounted")
+    assert panel["count"] == 5 and panel["rows"][0]["id"] == row["id"]       # the four, plus the dream: the record is no agent
+    got = _groups(panel)
+    assert got["firing"] == [world.rid("firing")] and got["retired"] == [world.rid("retired")]
+    # the dream is also an ordinary agent row, and read_one answers the operator row by its id
+    assert "agent:" + dream in {r["id"] for r in panel["rows"]}
+    assert world.ck.read_one(AGENTS_ID, row["id"]).value["id"] == row["id"]
+    assert isinstance(world.ck.read_one(AGENTS_ID, OPERATOR_PREFIX + "oa-" + "0" * 32), Absent)
+
+
+def test_a_store_with_no_operator_record_draws_the_fixed_none_row(world):
+    # behaviour: no record -> `operator-agent:none`, whatever the other agents are; it is not a count
+    panel = world.panel()
+    assert [r["id"] for r in _operator_rows(panel)] == ["operator-agent:none"]
+    row = _operator_rows(panel)[0]
+    assert row["body"] == "no operator agent in this store yet"
+    assert panel["count"] == 4
+    assert world.ck.read_one(AGENTS_ID, "operator-agent:none").value["id"] == "operator-agent:none"
+
+
+def test_a_pre_k2b_dream_with_no_record_shows_dream_unattached_on_the_none_row(world):
+    # behaviour: a dream registered before K2b has no attachment and the store has no record: the none row says so, as a
+    # fact (the id of the dream's spec), never as health
+    dream = _dream_unattached(world)
+    row = _operator_rows(world.panel())[0]
+    assert row["id"] == "operator-agent:none" and row["body"].startswith("no operator agent in this store yet")
+    assert f"the dream ({dream}) is registered but not attached" in row["body"]
+
+
+def test_an_unattached_dream_beside_a_record_made_by_another_role_is_shown_on_the_record_row(world):
+    # behaviour: a record exists (another role attached) and the dream is not attached: the record's row carries it
+    from levain.agents.operator import attach
+
+    other = _kind_agent(world, "partner", {**_kind_role("partner-role", "role"), "executor": "dream"})
+    attach(world.rig.store, other)
+    dream = _dream_unattached(world)
+    row = _operator_rows(world.panel())[0]
+    assert row["id"].startswith(OPERATOR_PREFIX + "oa-") and row["body"].startswith("Operator agent oa-")
+    assert f"the dream ({dream}) is registered but not attached" in row["body"]
+
+
+def test_a_corrupt_attached_role_row_is_an_unreadable_operator_row_and_the_rest_of_the_panel_still_reads(world):
+    # behaviour: the attached dream's role row fails its check: ONE `unreadable` row with the reason, NOT a whole-panel
+    # fault; every other agent keeps its group (the dream's own agent row says its role is unreadable), nothing written
+    from levain.agents import role as role_mod
+    from levain.dream import agent as dream_agent
+
+    dream = _dream(world)
+    digest = role_mod.role_hash(role_mod.parse_role(dream_agent.dream_role()))
+    conn = sqlite3.connect(world.wiring.store_dir / "autonomic.db")
+    try:
+        conn.execute("UPDATE agent_roles SET spec = ? WHERE role_hash = ?", ("{not json", digest))
+        conn.commit()
+    finally:
+        conn.close()
+    before = _snapshot(world)
+    panel = world.panel()
+    assert "fault" not in panel or not panel.get("fault")
+    ops = _operator_rows(panel)
+    assert len(ops) == 1 and ops[0]["id"] == "operator-agent:unreadable" and ops[0]["group"] == "operator"
+    assert ops[0]["body"].startswith("unreadable: ") and "dream" in ops[0]["body"]
+    assert _groups(panel)["firing"] == [world.rid("firing")] and "agent:" + dream in {r["id"] for r in panel["rows"]}
+    assert world.ck.read_one(AGENTS_ID, ops[0]["id"]).value["body"] == ops[0]["body"]
+    assert _snapshot(world) == before
+
+
+def test_the_operator_row_offers_no_verb_and_a_verb_aimed_at_it_is_refused(world):
+    # behaviour: reading only. No agent verb applies to the operator row, and aiming one at it changes nothing
+    _dream(world)
+    before = _snapshot(world)
+    row = _operator_rows(world.panel())[0]
+    req = {"verb": "agent_pause", "panel_id": AGENTS_ID, "row_id": row["id"], "row_version": row["version"], "params": {}}
+    with pytest.raises(EditError):
+        dispatch(registry=world.reg, cockpit=world.ck, scope=object(), req=req, credential=CRED,
+                 install_class=REPORTED, route="cockpit")
+    assert _snapshot(world) == before
+
+
+def test_the_panel_module_reaches_the_attachments_only_through_the_operator_module():
+    # behaviour: the gate K2b made conscious. The panel names neither table, and it imports the operator module
+    text = (Path(__file__).resolve().parents[1] / "levain" / "cockpit" / "agents_panel.py").read_text()
+    assert "agent_attachments" not in text and "agent_operator" not in text and "levain.agents.operator" in text
+
+
+def test_a_store_with_no_agent_still_says_none_registered_beside_the_uncounted_operator_row(tmp_path):
+    # behaviour: the pinned row is not a figure: an empty store keeps "No agent is registered." and a count of zero
+    from levain.agents.store import open_agent_store
+
+    open_agent_store(tmp_path / "e")
+    ck = Cockpit(entity=lambda ctx: {"name": "t"})
+    ck.agents_wiring = AgentsWiring(store_dir=tmp_path / "e")
+    ck.discover(agents_discoverer(ck), retire=True)
+    ck.manifest(CLOSED)
+    panel = ck.panel(AGENTS_ID)
+    assert [r["id"] for r in panel["rows"]] == ["operator-agent:none"] and panel["count"] == 0
+    assert panel["empty"] == "No agent is registered."
