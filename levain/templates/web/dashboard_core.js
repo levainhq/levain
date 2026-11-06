@@ -7787,7 +7787,14 @@
     if (owner && owner !== host) host.dataset.proposalSlot = "";
     let slotDue = !!(owner && !host.querySelector(".proposal-slot"));
     const eagerQ = newestAnswered(lines, ANSWERED_ROWS_EAGER);
+    // the Decisions card's two tabs (Needs you / Desk owes) when the rows carry a desk section: each row is tagged here, the strip is drawn after
+    const dt = window.LevainCardFormat && typeof window.LevainCardFormat.deskTabs === "function" ? window.LevainCardFormat.deskTabs(lines) : null;
+    const tabbed = !!(dt && dt.show);
+    const firstAt = host.children.length;
+    let li = -1;
+    const mark = (node) => { if (tabbed && node) node.dataset.deskTab = dt.tags[li]; };
     for (const ln of lines) {
+      li++;
       const o = ln && typeof ln === "object" ? ln : {};
       // rows that carry a group (a list drawn as a count) come in the kernel's order: a heading where the group changes
       if (typeof o.grp === "string" && o.grp !== lastGroup) {
@@ -7795,9 +7802,9 @@
         if (slotDue && (o.grp === "Resolved" || o.grp === "Outcomes")) { slotDue = false; host.appendChild(standingSlots()); }
         host.appendChild(el("div", "ext-grouphead", o.grp));
       }
-      if (o.consent) { host.appendChild(consentRow(o)); continue; }
-      if (o.question) { host.appendChild(questionRow(o, !!o.question && eagerQ.has(o.question))); continue; }
-      if (o.note) { host.appendChild(noteRow(o)); continue; }
+      if (o.consent) { host.appendChild(consentRow(o)); mark(host.lastElementChild); continue; }
+      if (o.question) { host.appendChild(questionRow(o, !!o.question && eagerQ.has(o.question))); mark(host.lastElementChild); continue; }
+      if (o.note) { host.appendChild(noteRow(o)); mark(host.lastElementChild); continue; }
       const row = el("div", "row" + (o.accent ? " ext-accent" : "") + (o.dim ? " ext-dim" : ""));
       if (o.wrapMeta) row.classList.add("meta-wrap");   // a row whose meta line IS its content (the sessions' chips): it wraps, never ellipsises
       if (typeof o.key === "string" && o.key) row.dataset.keepKey = o.key;   // the id an expanded row is found by after a repaint
@@ -7820,8 +7827,41 @@
       if (o.cancel && cancelPending) appendRowVerbs(row, buildPendingCancel(o.cancel));
       if (o.review) appendReviewVerb(row, o.review);
       host.appendChild(row);
+      mark(row);
     }
     if (slotDue) host.appendChild(standingSlots());
+    if (tabbed) drawDeskTabs(host, firstAt, dt);
+  }
+
+  // The Decisions card's in-card tabs: "Needs you (n)" first and the default, "Desk owes (n)" second. A row tagged "both" (a desk row
+  // carried past a day) shows under each; an untagged node (a heading, a proposal card) is "you", a heading following its rows' tags.
+  const deskTabChoice = { at: "you" };
+  function drawDeskTabs(host, firstAt, dt) {
+    const kids = Array.from(host.children).slice(firstAt);
+    let head = null, seen = null;
+    const seal = () => { if (head) head.dataset.deskTab = seen.size > 1 || seen.has("both") ? "both" : (Array.from(seen)[0] || "you"); };
+    for (const k of kids) {
+      if (k.classList.contains("ext-grouphead")) { seal(); head = k; seen = new Set(); continue; }
+      if (!k.dataset.deskTab) k.dataset.deskTab = "you";
+      if (seen) seen.add(k.dataset.deskTab);
+    }
+    seal();
+    const nav = el("div", "ck-tabs ck-desk-tabs");
+    nav.setAttribute("role", "tablist");
+    const buttons = [["you", "Needs you (" + dt.you + ")"], ["desk", "Desk owes (" + dt.desk + ")"]].map(([key, text]) => {
+      const b = el("button", "ck-tab", text);
+      b.type = "button";
+      b.setAttribute("role", "tab");
+      b.addEventListener("click", () => { deskTabChoice.at = key; apply(); });
+      nav.appendChild(b);
+      return [key, b];
+    });
+    const apply = () => {
+      for (const [key, b] of buttons) b.setAttribute("aria-selected", key === deskTabChoice.at ? "true" : "false");
+      for (const k of kids) k.classList.toggle("ck-dtab-off", k.dataset.deskTab !== "both" && k.dataset.deskTab !== deskTabChoice.at);
+    };
+    host.insertBefore(nav, kids[0] || null);
+    apply();
   }
 
   function renderEdits(entry, view) {

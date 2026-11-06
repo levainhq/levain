@@ -597,7 +597,25 @@
     doc.addEventListener("input", (ev) => grow(ev.target));
   }
 
-  const api = { preferFull, usesFull, setCommandBlock, linkRuns, installFieldGrow, grow, FREE_TEXT, collapse, sections, headline, optionRows, words, repeatsRows, fullOptions, parseMessage, looseCard, openUntil, drawHead, drawDetail, drawBody };
+  // The Decisions card's two in-card tabs. Each line's tab: a question with section "desk" is "desk" (and "both" while carried);
+  // every other line (the other question rows, consent, notes) is "you". `open` counts the lines still waiting. Tabs show only
+  // when a desk question exists. Pure: the page draws the strip and hides by these tags.
+  function deskTabs(lines) {
+    const out = { tags: [], you: 0, desk: 0, show: false };
+    for (const ln of lines) {
+      const q = ln && ln.question, c = ln && ln.consent, n = ln && ln.note;
+      const desk = !!(q && q.section === "desk");
+      const tag = desk ? (q.carried ? "both" : "desk") : "you";
+      const open = q ? q.state === "open" : c ? c.state === "pending" : n ? n.state === "open" : false;
+      out.tags.push(tag);
+      if (desk) out.show = true;
+      if (open && tag !== "desk") out.you++;
+      if (open && tag !== "you") out.desk++;
+    }
+    return out;
+  }
+
+  const api = { deskTabs, preferFull, usesFull, setCommandBlock, linkRuns, installFieldGrow, grow, FREE_TEXT, collapse, sections, headline, optionRows, words, repeatsRows, fullOptions, parseMessage, looseCard, openUntil, drawHead, drawDetail, drawBody };
   if (typeof module === "object" && module.exports) module.exports = api;
   else root.LevainCardFormat = api;
 })(typeof window !== "undefined" ? window : this);

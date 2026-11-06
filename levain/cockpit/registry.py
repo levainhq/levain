@@ -125,6 +125,9 @@ FACETS: dict[str, tuple[str, Callable[[Any], bool]]] = {
     "question_n": ("int", _is_int),
     "question_state": ("enum", _enum("open", "answered")),
     "question_options": ("int", _is_int),
+    # the host's band section for a question ("you" / "desk") and whether a desk row also lists under "you"; passed through as data
+    "question_section": ("enum", _enum("you", "desk")),
+    "question_carried": ("bool", _is_bool),
     # an agent's note (levain.consent.notes): its number and whether it was dismissed; its words are never a facet
     "note_n": ("int", _is_int),
     "note_state": ("enum", _enum("open", "dismissed")),

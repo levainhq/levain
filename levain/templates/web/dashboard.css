@@ -1375,6 +1375,8 @@ body.ke .ck-zgrid .panel > .xbody { flex: 1; min-height: 0; overflow: auto; padd
 .ck-tabs { display: flex; gap: var(--sp-2); flex-wrap: wrap; flex-basis: 100%; margin-top: var(--sp-3); }
 .ck-tab { background: none; border: 0; border-radius: var(--r-md); padding: var(--sp-2) var(--sp-3); color: var(--label); cursor: pointer; font: var(--fw-semibold) var(--fs-meta) var(--round); }
 .ck-tab[aria-selected="true"] { background: var(--card-2); color: var(--text); }
+.ck-desk-tabs { margin: 0 0 var(--sp-3); }
+.ck-dtab-off { display: none !important; }
 @media (max-width: 1180px) {
   body.ke { --gutter-ke: 32px; }
   body.ke .band { grid-template-columns: auto minmax(0, 1fr); }

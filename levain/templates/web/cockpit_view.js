@@ -382,6 +382,8 @@
                             decidedAge: typeof f.decided_at === "string" ? ageLabel(f.decided_at, nowMs || Date.now(), "") : "",
                             decidedAt: typeof f.decided_at === "string" ? f.decided_at : "",
                             offered: (Array.isArray(r.actions) ? r.actions : []).some((a) => a && a.verb === "question_answer" && a.gesture === "direct"),
+                            section: f.question_section === "you" || f.question_section === "desk" ? f.question_section : "",
+                            carried: f.question_carried === true,
                             sign: signOf(f) };
         }
         // a coordinator review item: its state, whether it is "yours to clear", and the one verb the kernel offers on it
