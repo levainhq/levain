@@ -387,8 +387,11 @@ for (const s of steps) {
   } else if (s.key !== undefined) {
     // a key a person presses, to whatever holds focus: a trusted event, so a focused <select> answers it as it answers a keyboard
     // (a typed letter selects an option starting with it; `change` fires only when that moves the selection)
-    await send("Input.dispatchKeyEvent", { type: "keyDown", key: s.key, ...(s.key.length === 1 ? { text: s.key } : {}) });
-    await send("Input.dispatchKeyEvent", { type: "keyUp", key: s.key });
+    // optional: `modifiers` (1 alt, 2 ctrl, 4 meta, 8 shift), `vk` (windowsVirtualKeyCode) and `text`, so Enter and Shift+Enter can be pressed
+    const extra = { ...(s.modifiers ? { modifiers: s.modifiers } : {}), ...(s.vk ? { windowsVirtualKeyCode: s.vk, nativeVirtualKeyCode: s.vk } : {}) };
+    const text = s.text !== undefined ? s.text : (s.key.length === 1 ? s.key : undefined);
+    await send("Input.dispatchKeyEvent", { type: "keyDown", key: s.key, ...extra, ...(text !== undefined ? { text } : {}) });
+    await send("Input.dispatchKeyEvent", { type: "keyUp", key: s.key, ...extra });
     await sleep(200);
   } else if (s.tap !== undefined) {
     // `before` runs once ahead of the press (a stub to put in place), and its value is not collected

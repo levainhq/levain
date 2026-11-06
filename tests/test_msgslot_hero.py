@@ -18,7 +18,9 @@ from tests.test_cockpit_narrow_layout_rig import (NEEDS, PHONE_TOUCH, SETTLE, TO
 
 VIEWS = {"390": list(PHONE_TOUCH), "1280": [{"emulate": {"w": 1280, "h": 900, "dpr": 1}}]}
 BOX = "document.getElementById('ck-drop-words')"
-READY = f"{BOX} && !{BOX}.disabled"
+TXT = f"window.LevainDashboard.dropBoxText({BOX})"      # the hero box is a contenteditable div: its words are read through the one helper
+OFF = f"{BOX}.matches('[aria-disabled=true]')"
+READY = f"{BOX} && !{OFF}"
 
 
 def _drive_view(view: str, tmp_path: Path, url: str, steps: list) -> dict:
@@ -42,13 +44,13 @@ def _tagged(out: dict) -> dict:
 
 
 def _type(words: str) -> dict:
-    return {"eval": f"(() => {{ {BOX}.value = {json.dumps(words)}; {BOX}.dispatchEvent(new Event('input', {{bubbles: true}})); return 1; }})()"}
+    return {"eval": f"(() => {{ window.LevainDashboard.setDropBoxText({BOX}, {json.dumps(words)}); {BOX}.dispatchEvent(new Event('input', {{bubbles: true}})); return 1; }})()"}
 
 
 SEND = "document.querySelector('#ck-drop [data-coord-drop=send]')"
 # press Send only while the words are still in the box and Send is live: the page clears the box (and forgets the request) once a
 # drop is answered, so a press after that would be a different, empty send and not a repeat of this one
-CLICK_SEND_JS = f"({BOX}.value && !{SEND}.disabled) ? ({SEND}.click(), 1) : 1"
+CLICK_SEND_JS = f"({TXT} && !{SEND}.disabled) ? ({SEND}.click(), 1) : 1"
 
 
 def _send(*, posts: int | None = None, until: str | None = None, ms: int = 15000, every: int = 1500) -> dict:
@@ -132,7 +134,7 @@ def test_the_drop_leaves_with_the_ke_page_and_returns_with_the_next_ke_render(ba
 @needs_ssh
 def test_send_writes_the_drop_through_the_one_route_clears_the_box_and_says_what_went(tmp_path: Path, monkeypatch) -> None:
     rig = FullRig(tmp_path, monkeypatch)
-    after = ("JSON.stringify({t: 'after', box: " + BOX + ".value, focused: document.activeElement === " + BOX + ", receipt: document.querySelector('#ck-drop .drop-receipt').textContent,"
+    after = ("JSON.stringify({t: 'after', box: " + TXT + ", focused: document.activeElement === " + BOX + ", receipt: document.querySelector('#ck-drop .drop-receipt').textContent,"
              " rows: [...document.querySelectorAll('#ck-drop .drop-recent-row')].map(r => r.textContent), consent: document.querySelectorAll('#ck-needs .coord-drop-slot').length})")
     with rig.serving():
         out = _drive(tmp_path, f"{rig.origin}/#write_token={TOK}",
@@ -228,7 +230,7 @@ def test_an_expanded_recent_list_taller_than_the_composer_does_not_move_the_comp
 @needs_ssh
 def test_without_a_token_the_hero_still_draws_and_says_to_sign_in(tmp_path: Path, monkeypatch) -> None:
     rig = FullRig(tmp_path, monkeypatch)
-    line = ("JSON.stringify({t: 'line', note: document.querySelector('#ck-drop .drop-note').textContent, box: !!" + BOX + ", disabled: [...document.querySelectorAll('#ck-drop button, #ck-drop textarea')].filter(e => !e.hidden).every(e => e.disabled),"
+    line = ("JSON.stringify({t: 'line', note: document.querySelector('#ck-drop .drop-note').textContent, box: !!" + BOX + ", disabled: [...document.querySelectorAll('#ck-drop button, #ck-drop [role=textbox]')].filter(e => !e.hidden).every(e => e.disabled || e.getAttribute('aria-disabled') === 'true'),"
             " shown: document.getElementById('ck-drop').getClientRects().length > 0})")
     with rig.serving():
         out = _drive(tmp_path, f"{rig.origin}/", [{"emulate": {"w": 1280, "h": 900, "dpr": 1}},
@@ -295,9 +297,9 @@ def _slow_reply_steps(send_steps: list) -> list:
 @needs_ssh
 def test_a_repeated_send_press_over_a_slow_reply_files_one_drop_and_leaves_the_box_empty(tmp_path: Path, monkeypatch) -> None:
     rig = FullRig(tmp_path, monkeypatch)
-    done = f"window.__settled && /^Sent/.test(document.querySelector('#ck-drop .drop-receipt').textContent) && {BOX}.value === ''"
+    done = f"window.__settled && /^Sent/.test(document.querySelector('#ck-drop .drop-receipt').textContent) && {TXT} === ''"
     steps = _slow_reply_steps([*_sent("one drop only", until=done, ms=20000, every=700),
-                               {"eval": f"JSON.stringify({{t: 'end', box: {BOX}.value, receipt: document.querySelector('#ck-drop .drop-receipt').textContent}})"}])
+                               {"eval": f"JSON.stringify({{t: 'end', box: {TXT}, receipt: document.querySelector('#ck-drop .drop-receipt').textContent}})"}])
     with rig.serving():
         out = drive_touch(tmp_path, f"{rig.origin}/#write_token={TOK}", steps)
     posted = _posted(out)
@@ -418,7 +420,7 @@ def test_the_hero_box_and_its_typed_words_survive_the_cockpit_re_render(tmp_path
     redrawn = "(() => { const w = document.getElementById('ck-when'); return w && w.firstChild && !w.firstChild.__gen; })()"
     steps = [{"emulate": {"w": 1280, "h": 900, "dpr": 1}}, {"until": NEEDS, "ms": 30000}, {"until": READY, "ms": 30000}, _type("typed, not sent"), {"eval": mark},
              {"eval": "document.dispatchEvent(new Event('visibilitychange')); 1"}, {"until": redrawn, "ms": 20000}, SETTLE,
-             {"eval": f"JSON.stringify({{t: 'kept', same: {BOX}.__mark === 1, value: {BOX}.value, afterNeeds: !!document.querySelector('#ck-needs + #ck-drop')}})"}]
+             {"eval": f"JSON.stringify({{t: 'kept', same: {BOX}.__mark === 1, value: {TXT}, afterNeeds: !!document.querySelector('#ck-needs + #ck-drop')}})"}]
     with rig.serving():
         out = _drive(tmp_path, f"{rig.origin}/#write_token={TOK}", steps)
     assert _tagged(out)["kept"] == {"t": "kept", "same": True, "value": "typed, not sent", "afterNeeds": True}, _tagged(out)["kept"]
@@ -443,7 +445,7 @@ def _seed(rec: dict) -> str:
     return f"localStorage.setItem({PEND} + ':' + {json.dumps(rec['outbox_id'])}, {json.dumps(json.dumps(rec))});"
 
 
-KEYS = "JSON.stringify({t: 'keys', keys: Object.keys(localStorage).filter(k => k.indexOf('levain-drop-pending:') === 0).sort(), box: document.getElementById('ck-drop-words').value, earlier: " + EARLIER + "})"
+KEYS = "JSON.stringify({t: 'keys', keys: Object.keys(localStorage).filter(k => k.indexOf('levain-drop-pending:') === 0).sort(), box: window.LevainDashboard.dropBoxText(document.getElementById('ck-drop-words')), earlier: " + EARLIER + "})"
 
 
 @needs_browser
@@ -523,15 +525,15 @@ LONG = "\n".join(f"line {i} of the words kept from an earlier visit" for i in ra
 
 @needs_browser
 @needs_ssh
-def test_restored_words_grow_the_box_where_the_browser_has_no_field_sizing(tmp_path: Path, monkeypatch) -> None:
+def test_restored_words_fill_the_hero_box_with_no_height_script(tmp_path: Path, monkeypatch) -> None:
     rig = FullRig(tmp_path, monkeypatch)
     rec = dict(SIGNED, words=LONG)
     steps = [{"emulate": {"w": 1280, "h": 900, "dpr": 1}}, {"init": _seed(rec) + NO_FIELD_SIZING}, {"until": NEEDS, "ms": 30000}, {"until": READY, "ms": 30000},
-             {"eval": f"JSON.stringify({{t: 'h', style: {BOX}.style.height, fits: {BOX}.offsetHeight >= {BOX}.scrollHeight}})"}]
+             {"eval": f"JSON.stringify({{t: 'h', style: {BOX}.style.height, fits: {BOX}.offsetHeight >= {BOX}.scrollHeight, tall: {BOX}.offsetHeight > 400}})"}]
     with rig.serving():
         out = drive_touch(tmp_path, f"{rig.origin}/#write_token={TOK}", steps)
     h = _tagged(out)["h"]
-    assert h["style"].endswith("px") and h["fits"], h
+    assert h["style"] == "" and h["fits"] and h["tall"], h      # a div grows with its words by itself: no height script, nothing clipped
 
 
 @needs_browser
@@ -633,9 +635,9 @@ def test_a_read_that_fails_after_a_lost_reply_does_not_leave_send_dead(tmp_path:
 BREAK_READS = ("(() => { const f = window.fetch; window.fetch = function (u, o) { const url = typeof u === 'string' ? u : (u && u.url) || '';"
                " if (url.indexOf('/cockpit/coord/drops.json') >= 0) return Promise.resolve(new Response('{}', {status: 503}));"
                " return f.apply(this, arguments); }; return 1; })()")
-BOX_STATE = (f"JSON.stringify({{t: '__T__', boxOff: {BOX}.disabled, sendOff: document.querySelector('#ck-drop [data-coord-drop=send]').disabled,"
+BOX_STATE = (f"JSON.stringify({{t: '__T__', boxOff: {OFF}, sendOff: document.querySelector('#ck-drop [data-coord-drop=send]').disabled,"
              " envOff: document.querySelector('#ck-drop [data-coord-drop=envelope]').disabled, bad: !!document.querySelector('#ck-drop .drop-note.bad'),"
-             f" focused: document.activeElement === {BOX}, value: {BOX}.value}})")
+             f" focused: document.activeElement === {BOX}, value: {TXT}}})")
 STALE_REPLAY = {"eval": "new Promise(r => setTimeout(r, 3600)).then(() => { document.dispatchEvent(new Event('visibilitychange')); return 1; })"}
 SETTLE_BAD = {"until": "!!document.querySelector('#ck-drop .drop-note.bad')", "ms": 20000}
 

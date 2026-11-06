@@ -166,20 +166,23 @@ def test_drop_about_this_card_opens_the_drop_box_with_that_cards_words(tmp_path:
     _root, src, _ids = _install(tmp_path)
     box = "document.getElementById('ck-drop-words')"
     want = "About card levain:a (Land the board follow-up): "
-    state = (f"JSON.stringify([{box}.value, document.activeElement === {box}, {box}.selectionStart, {box}.selectionEnd, "
+    txt = f"window.LevainDashboard.dropBoxText({box})"      # the hero box is a contenteditable div: words through the helper, the caret from the selection
+    caret = ("(() => { const b = " + box + "; const s = getSelection(); if (!s.rangeCount) return [-1, -1]; const r = s.getRangeAt(0); const at = (n, o) => { const p = document.createRange();"
+             " p.selectNodeContents(b); p.setEnd(n, o); return p.toString().length; }; return [at(r.startContainer, r.startOffset), at(r.endContainer, r.endOffset)]; })()")
+    state = (f"JSON.stringify([{txt}, document.activeElement === {box}, ...{caret}, "
              f"document.querySelector('[data-drop-about=\"levain:a\"]').textContent])")
     with _serve(src, write_token=TOKEN) as (url, httpd):
         httpd.coord_sheet = sheet = _Sheet(lh)
         out = _drive(tmp_path, f"{url}/", [
             {"emulate": {"w": 1280, "h": 1000, "dpr": 1}},
             *_reload(),
-            {"until": f"{BUILTIN} && {BUILTIN}.querySelector('[data-drop-about=\"levain:a\"]') && {box} && !{box}.disabled"},
-            {"eval": f"{box}.value"},                                            # empty before
+            {"until": f"{BUILTIN} && {BUILTIN}.querySelector('[data-drop-about=\"levain:a\"]') && {box} && !{box}.matches('[aria-disabled=true]')"},
+            {"eval": txt},                                                       # empty before
             {"eval": f"{BUILTIN}.querySelector('[data-drop-about=\"levain:a\"]').click(); 1"},
-            {"until": f"{box}.value === {json.dumps(want)} && document.activeElement === {box} && 1"},
+            {"until": f"{txt} === {json.dumps(want)} && document.activeElement === {box} && 1"},
             {"eval": state},
             # a second card with words already in the box: they stay, the new words follow on a new paragraph
-            {"eval": f"{BUILTIN}.querySelector('[data-drop-about=\"levain:d\"]').click(); {box}.value"},
+            {"eval": f"{BUILTIN}.querySelector('[data-drop-about=\"levain:d\"]').click(); {txt}"},
         ])
     v = out["values"]
     assert v[-5] == ""                                                           # the box was empty
@@ -209,6 +212,7 @@ def test_a_card_clicked_before_the_drop_box_has_read_is_not_lost(tmp_path: Path,
     _seed(lh)
     _root, src, _ids = _install(tmp_path)
     box, host = "document.getElementById('ck-drop-words')", "document.getElementById('ck-drop')"
+    txt = f"window.LevainDashboard.dropBoxText({box})"
     want = "About card levain:a (Land the board follow-up): "
     click = lambda k: f"{BUILTIN}.querySelector('[data-drop-about=\"{k}\"]').click(); 1"
     with _serve(src, write_token=TOKEN) as (url, httpd):
@@ -219,8 +223,8 @@ def test_a_card_clicked_before_the_drop_box_has_read_is_not_lost(tmp_path: Path,
             {"until": f"{BUILTIN} && {BUILTIN}.querySelector('[data-drop-about=\"levain:a\"]') && {box} && 1"},
             {"eval": f"[{host}._drop.read, {host}._drop.can]"},          # the click below is before the read: the window under test
             {"eval": click("levain:a")},
-            {"until": f"{box}.value === {json.dumps(want)} && document.activeElement === {box} && 1"},
-            {"eval": f"JSON.stringify([{box}.value, {box}.selectionStart, {host}._drop.pending, {host}._drop.say.textContent])"},
+            {"until": f"{txt} === {json.dumps(want)} && document.activeElement === {box} && 1"},
+            {"eval": f"JSON.stringify([{txt}, (() => {{ const s = getSelection(), r = s.getRangeAt(0), p = document.createRange(); p.selectNodeContents({box}); p.setEnd(r.startContainer, r.startOffset); return p.toString().length; }})(), {host}._drop.pending, {host}._drop.say.textContent])"},
         ])
     v = out["values"]
     assert v[-4] == [None, False], v                                           # no read had landed when the card was clicked
@@ -251,14 +255,15 @@ def test_compose_drop_refuses_a_box_that_is_busy_or_off_and_clears_a_stale_hando
     _seed(lh)
     _root, src, _ids = _install(tmp_path)
     host, box = "document.getElementById('ck-drop')", "document.getElementById('ck-drop-words')"
-    state = (f"JSON.stringify([{box}.value, {host}._drop.say.textContent, sessionStorage.getItem('levain-drop-prefill')])")
+    txt = f"window.LevainDashboard.dropBoxText({box})"
+    state = (f"JSON.stringify([{txt}, {host}._drop.say.textContent, sessionStorage.getItem('levain-drop-prefill')])")
     with _serve(src, write_token=TOKEN) as (url, httpd):
         httpd.coord_sheet = _Sheet(lh)
         out = _drive(tmp_path, f"{url}/", [
             {"emulate": {"w": 1280, "h": 1000, "dpr": 1}},
             *_reload(),
             # the box starts enabled and off: it is ready to be driven by hand only once its first read has landed
-            {"until": f"{BUILTIN} && {host} && {host}._drop && {host}._drop.read && {host}._drop.can && !{box}.disabled && 1"},
+            {"until": f"{BUILTIN} && {host} && {host}._drop && {host}._drop.read && {host}._drop.can && !{box}.matches('[aria-disabled=true]') && 1"},
             {"eval": "sessionStorage.setItem('levain-drop-prefill', 'stale'); 1"},
             {"eval": f"{host}._drop.working = true; [LevainDashboard.composeDrop('x'), {state}]"},        # a send in flight
             {"eval": f"{host}._drop.working = false; {host}._drop.can = false; {host}._drop.note = 'no store'; "
