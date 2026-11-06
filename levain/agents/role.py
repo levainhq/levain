@@ -15,8 +15,9 @@ required and ``kind`` optional:
 - ``executor``  ``session`` | ``dream``.
 - ``kind``      ``job`` | ``role``, optional; ABSENT MEANS ``role``. ``kind: "role"`` is accepted in the input and
                 dropped, so a role has one spelling of its default: ``null``, ``"agent"`` and any other value are
-                refused. ``agent`` is refused naming the pending ruling (whether an agent is declared on a role or
-                derived from structure is Phill's to answer); accepting it as an inert value would pre-decide it.
+                refused. ``agent`` is refused saying the one agent is derived (np-4e087a4f (b): only job and role
+                are writable; the registry materialises the agent from the store's operator record and roles
+                attach to it); accepting it as a value would make an agent something a role file declares.
 
 There is no float anywhere, and no signature: authorisation comes through the agent-link, which signs the AgentSpec
 hash, which pins :func:`role_hash` (A0 §3.2).
@@ -149,8 +150,9 @@ def _ceiling(value: Any) -> dict[str, Any]:
 
 def _kind(value: Any) -> str:
     if value == "agent" and isinstance(value, str):
-        raise RoleError("field 'kind' = 'agent' is refused: whether an agent is declared on a role or derived from "
-                        "structure is a pending ruling, so only job and role are accepted until it is answered")
+        raise RoleError("field 'kind' = 'agent' is refused: `agent` is not a role kind: the one agent is materialised "
+                        "by the registry from the store's operator record, and roles attach to it "
+                        "(`levain agents attach`); only job and role are accepted")
     if not isinstance(value, str) or value not in ROLE_KINDS:
         raise RoleError(f"field 'kind' {value!r} is not one of {', '.join(ROLE_KINDS)} "
                         f"(absent means {DEFAULT_KIND}; null is not a spelling of absent)")
