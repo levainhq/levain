@@ -138,9 +138,10 @@ def launchd_log_path(svc: Service) -> Path:
     line from a boot run, the dispatch run server's unnamed-failure line and the reaper's quarantine line can be read
     afterwards. A root service's file is under ``/var/log``; another account's is inside the directory that account owns (:data:`_OWN_LOG_DIR`: for
     ``_levain_dispatch`` its store ``L/dispatch``, made by the store rows before any unit is bootstrapped), never a
-    directory it cannot create in. The pf one-shot and the dispatch run server keep their files' size bounded
-    (:func:`levain.slot.services.pf.bound_log`; the dispatch run server's own). The reaper does NOT: its file under
-    ``/var/log`` only grows, and the bound it lacks is a rotation row (newsyslog), owed and not built."""
+    directory it cannot create in. The pf one-shot, the dispatch run server and the reaper each bound their own file in
+    process (:func:`levain.slot.services.pf.bound_log`, the dispatch run server's ``_bound_log`` and
+    :func:`levain.slot.reaper.bound_log`: three implementations of one shape). A newsyslog row cannot: it renames the file
+    launchd holds open, and the daemon keeps writing into the renamed inode."""
     if svc.user in _OWN_LOG_DIR:
         return _OWN_LOG_DIR[svc.user]("darwin") / f"{launchd_label(svc)}.log"
     if svc.user == "root" or not svc.logs:

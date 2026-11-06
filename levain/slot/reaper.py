@@ -73,7 +73,47 @@ SPENT = "spent"
 HEARTBEAT = "pass.json"
 
 
+#: [judged] the size past which the launchd log (the inherited stderr) is emptied before a line is written to it. The
+#: reaper writes about 190 B a minute, so 4 MiB holds roughly two weeks; the file under KeepAlive=always has no other
+#: bound (newsyslog cannot: it renames the file launchd holds open and the daemon keeps writing into the renamed inode).
+LOG_MAX_BYTES = 4 << 20
+
+
+def _expected_log() -> Path:
+    """The file launchd opens as this unit's stderr (``units.launchd_log_path`` for ``reaper``; a test pins the two equal;
+    ``levain.slot.units`` is not imported here so the root closure table gains no site). Only a descriptor that IS this
+    file is ever trimmed."""
+    return Path("/var/log/com.levain.reaper.log")
+
+
+def bound_log(fd: int = 2, expected: Optional[Path] = None) -> None:
+    """Empty ``fd``'s file when it is the unit's log and past :data:`LOG_MAX_BYTES`. A terminal, a pipe, a closed
+    descriptor, or a file redirected over fd 2 from a shell is left alone (only the same device and inode as
+    :func:`_expected_log` is trimmed), and a file of exactly :data:`LOG_MAX_BYTES` is left alone too (the test is "past"),
+    so the cap is a bound plus the lines written between checks, not a quota. The reaper is three single-threaded
+    processes (main, worker, revoker) sharing ONE open file description, so there is no lock to take and none would span
+    them: a truncate by one is safe for the others only because launchd opens the log for appending [measured on a
+    shared O_APPEND descriptor after ``fork``: no NUL hole; whether launchd's own open is O_APPEND is residue]. The size
+    is re-read immediately before the truncate, so a process that lost the race does not wipe the lines the winner wrote
+    after its trim; two processes inside the gap between that re-read and the truncate (once per ~4 MiB of log) can still
+    drop a few log lines. The offset is rewound after the truncate (harmless on O_APPEND). Nothing here raises."""
+    try:
+        st = os.fstat(fd)
+        if not (stat.S_ISREG(st.st_mode) and st.st_size > LOG_MAX_BYTES):
+            return
+        mine = os.stat(_expected_log() if expected is None else expected)
+        if (st.st_dev, st.st_ino) != (mine.st_dev, mine.st_ino):
+            return
+        if os.fstat(fd).st_size <= LOG_MAX_BYTES:   # re-read just before the truncate: another process may have trimmed
+            return                                  # (and written a line) since the check above; do not wipe its line
+        os.ftruncate(fd, 0)
+        os.lseek(fd, 0, os.SEEK_SET)   # ftruncate keeps the offset: on a descriptor without O_APPEND the next write would
+    except OSError:                    # leave a NUL hole at the old offset; a no-op on an O_APPEND one
+        pass
+
+
 def _log_to_stderr(msg: str) -> None:
+    bound_log()
     try:
         sys.stderr.write(f"levain reaper[{os.getpid()}]: {msg}\n")
         sys.stderr.flush()
@@ -1033,5 +1073,6 @@ def ensure_netns(slots: Sequence[SlotId]) -> None:
                 raise RuntimeError(f"{step.why}: exit {rc}")
 
 
-__all__ = ["CONTROL_BOOT_WAIT_S", "HEARTBEAT", "HELD_BACKOFF_S", "REVOKER_RETRY_S", "Reaper", "Revoker", "SPENT",
-           "Tuning", "V11_S", "V18_S", "V22_S", "V23_S", "boot_dirs", "ensure_netns", "run_rows", "temp_session"]
+__all__ = ["CONTROL_BOOT_WAIT_S", "HEARTBEAT", "HELD_BACKOFF_S", "LOG_MAX_BYTES", "REVOKER_RETRY_S", "Reaper", "Revoker",
+           "SPENT", "Tuning", "V11_S", "V18_S", "V22_S", "V23_S", "bound_log", "boot_dirs", "ensure_netns", "run_rows",
+           "temp_session"]
