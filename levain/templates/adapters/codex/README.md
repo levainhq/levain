@@ -51,7 +51,7 @@ supported in v1.
     └── hooks/
         ├── _levain_hook.py        <- shared helpers
         ├── session_start.py       <- SessionStart hook (Layer A + Layer D start-catch + due-spore surface)
-        └── user_prompt_submit.py  <- UserPromptSubmit hook (Layer B + spore-collision surface + Layer D nudge)
+        └── user_prompt_submit.py  <- UserPromptSubmit hook (Layer B + open spores that match the prompt + Layer D nudge)
 
 ~/.codex/
 ├── hooks.json                    <- from hooks.json.template; wires the hooks globally
@@ -133,8 +133,8 @@ The store is pinned to **`.levain/memory.db` inside the install** — see
 
 `~/.codex/hooks.json` (the **sidecar** JSON file) registers the hooks.
 Codex's inline `[[hooks.X]]` TOML form in `~/.codex/config.toml` was
-empirically observed to fail to parse in codex-cli 0.132.0 ("invalid type:
-map, expected a sequence in `hooks`"). The JSON sidecar at
+observed to fail to parse in codex-cli 0.132.0, an older version than the tested
+ones ("invalid type: map, expected a sequence in `hooks`"; not re-measured since). The JSON sidecar at
 `~/.codex/hooks.json` works without any explicit feature flag.
 
 ## Prerequisites
@@ -147,9 +147,9 @@ map, expected a sequence in `hooks`"). The JSON sidecar at
   working interpreter is wired, the hooks silently do not run and the
   posture mechanism is off — verify with `python3 --version` first.
 - **Codex CLI** installed (`codex --version`). The consent hook is tested
-  against the codex-cli versions listed in the main README (currently
-  0.162.1); `levain init` warns on any other version, and `levain
-  verify-hooks` checks that the installed hook scripts emit well-formed
+  against the codex-cli versions listed in the main README (the list is
+  `TESTED_VERSIONS` in `levain/consent/canary.py`); `levain init` warns on any
+  other version, and `levain verify-hooks` checks that the installed hook scripts emit well-formed
   output.
 
 ## Install (manual — `levain init` automates this)
@@ -217,8 +217,8 @@ Codex shows trust / approval prompts on first run:
        `_levain_hook.py` / `session_start.py` / `user_prompt_submit.py`
        invalidates trust until re-approved interactively.
     3. **`--dangerously-bypass-hook-trust`** is documented to bypass the
-       trust check for one invocation, but empirical observation
-       (a server deployment, codex-cli 0.132.0) shows it does **not
+       trust check for one invocation, but an observation on
+       codex-cli 0.132.0 (a server deployment; older than the tested versions, not re-measured) shows it does **not
        reliably restore firing under `codex exec`** in all cases. Best
        defense is interactive trust establishment.
 - **MCP server** — first session may prompt to approve the `anneal_memory`
@@ -234,8 +234,8 @@ mode here is silent. Verify the *actual* runtime, not a proxy:
   instructions and what date were injected into your context this
   session?"* — it should quote the posture string and today's date back.
   Interactive mode is the reliable path because (a) it surfaces hook trust
-  prompts that `codex exec` does not, and (b) empirical observation
-  (codex-cli 0.132.0) is that interactive-session hooks fire reliably
+  prompts that `codex exec` does not, and (b) an observation on
+  codex-cli 0.132.0 (older than the tested versions, not re-measured) is that interactive-session hooks fire reliably
   while `codex exec` is intermittent. If activation works interactively,
   the templates are wired correctly; subsequent `codex exec` reliability
   is a Codex platform reliability question, not an adapter issue.
@@ -319,7 +319,7 @@ mode here is silent. Verify the *actual* runtime, not a proxy:
   ```
   `CODEX_HOME` isolation matters — without it, the operator's main Codex
   install state intercepts and the verification reads/writes the wrong
-  store. Verified working on codex-cli 0.132.0 on a separate server host.
+  store. Verified working on codex-cli 0.132.0 on a separate server host (an older version than the tested ones; not re-run since).
 
 ## Store scoping
 
@@ -343,7 +343,7 @@ hooks will read different stores, and the hooks may not fire at all.
 
 - **Codex hook reliability under `codex exec` is a Codex platform issue,
   not adapter-shaped.** Three independent test contexts confirm this on
-  codex-cli 0.132.0: (a) laptop zero-trust install (hooks never fired),
+  codex-cli 0.132.0 (older than the tested versions; the measurements below were not re-run on a tested one): (a) laptop zero-trust install (hooks never fired),
   (b) a server stranger zero-trust install (hooks never fired despite
   identical adapter file shape and `--dangerously-bypass-hook-trust`),
   (c) a server production trust-established install (hooks fired
@@ -397,7 +397,7 @@ hooks will read different stores, and the hooks may not fire at all.
   the MCP server registration are global. Multi-install Codex support
   requires either per-project Codex hook scoping (if Codex adds that) or a
   Levain-side install-selector — both are post-v1 items.
-- **Codex hook inline-TOML form fails in v0.132.0.** The JSON sidecar at
+- **Codex hook inline-TOML form failed in v0.132.0 (not re-measured on a tested version).** The JSON sidecar at
   `~/.codex/hooks.json` is the working shape. If a future Codex version
   fixes inline TOML parsing, the adapter can move the wiring into
   `config.toml` directly.

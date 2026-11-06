@@ -282,6 +282,7 @@ failure mode here is silent. Verify the *actual* runtime, not a proxy:
 - **Activation:** start a session and ask the entity *"what posture
   instructions and what date were injected into your context this session?"* —
   it should quote the posture string and today's date back.
+- **Hook scripts:** `levain verify-hooks` (`--path` names the install; the default is the current directory) invokes each installed hook script with the JSON payload Claude Code would send and checks the output is well-formed. It checks the scripts, not that Claude Code runs them.
 - **Memory:** from inside that session, ask the entity to record an episode and
   then recall it. If the `anneal_memory` MCP server failed to register, the
   entity will report its memory tools are unavailable — test this in-session,
@@ -352,14 +353,19 @@ MCP server and the hooks will read different stores.
 ## Harness portability
 
 The hook scripts are nearly harness-neutral. For a non-Claude-Code adapter
-(e.g. the Codex adapter, which ships with Levain), expect **three** swap points, not one:
+expect **three** swap points, not one. The Codex adapter, which ships with Levain, shows all three in practice:
+`levain/templates/adapters/codex/activation/hooks/_levain_hook.py` (`emit()`),
+`.../codex/activation/hooks/session_start.py` (the `source` vocabulary) and
+`.../codex/hooks.json.template` (the events wired):
 
 1. **`_levain_hook.emit()`** — formats output as Claude Code hook JSON
    (`hookSpecificOutput` + `hookEventName`). The primary seam; swap it for the
    target harness's hook-output format.
-2. **The `CLAUDE_PROJECT_DIR` env var** read in `install_root()` — Claude
-   Code-specific; honor the target harness's project-dir variable, or rely on
-   the `__file__` fallback.
-3. **The `source` vocabulary** (`startup`/`resume`/`clear`/`compact`) parsed in
+2. **The `source` vocabulary** (`startup`/`resume`/`clear`/`compact`) parsed in
    `session_start.py` — Claude Code's `SessionStart` payload values; re-verify
    the target harness's equivalents.
+3. **Hook events wired** — the wiring is in `settings.template.json` (Claude
+   Code) or `hooks.json.template` (Codex); another harness may wire other events.
+
+`install_root()` needs no swap: it derives the install from the hook file's own
+location and reads no project-directory env var.
