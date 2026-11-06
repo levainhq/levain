@@ -823,6 +823,24 @@ class TestSecurityBoundary:
                 code = e.code
         assert code == 403
 
+    def test_the_plain_403_names_the_rule_that_fired(self, tmp_path: Path) -> None:
+        """11-06: a Pixel's browser got the bare word "forbidden" and nothing measurable. The body now says why, from the
+        requester's own Sec-Fetch headers; the first line is still the word."""
+        with _serving(_store_with_data(tmp_path)) as (base, _):
+            try:
+                _request(base + "/tap_trace", headers={"Sec-Fetch-Site": "cross-site", "Sec-Fetch-Mode": "navigate",
+                                                       "Sec-Fetch-Dest": "document"})
+                body = ""
+            except urllib.error.HTTPError as e:
+                body = e.read().decode()
+            try:
+                _request(base + "/", headers={"Host": "evil.example\x7f<b>"})
+                bad_host = ""
+            except (urllib.error.HTTPError, ValueError) as e:
+                bad_host = e.read().decode() if hasattr(e, "read") else ""
+        assert body.startswith("forbidden\n") and "Sec-Fetch-Site cross-site" in body and "Mode navigate" in body, body
+        assert "<" not in bad_host
+
     def test_same_origin_fetch_allowed(self, tmp_path: Path) -> None:
         with _serving(_store_with_data(tmp_path)) as (base, _):
             status, _h, _b = _request(

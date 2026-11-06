@@ -202,9 +202,23 @@ class GuardedHandler(BaseHTTPRequestHandler):
         refusal, each answered with a plain 403. Sends it and returns True when refused. A server
         adds its own read gates after this (the dashboard's off-box token)."""
         if not self._host_ok() or self._cross_site_read():
-            self._send(b"forbidden\n", "text/plain; charset=utf-8", status=403, head=head)
+            self._send(self._refusal_text(), "text/plain; charset=utf-8", status=403, head=head)
             return True
         return False
+
+    def _refusal_text(self) -> bytes:
+        """The plain 403 body: the word the page always said, then WHY, from the requester's own headers (11-06: a Pixel's browser
+        was refused with the bare word and nothing measurable; a photo of this page names the rule that fired). Header values are
+        cut and reduced to letters, digits and a few separators so the body cannot carry a request's bytes back as markup."""
+        def seen(name: str) -> str:
+            v = self.headers.get(name)
+            return "(absent)" if v is None else "".join(ch for ch in v[:80] if ch.isalnum() and ch.isascii() or ch in " .-_:;,=/?*") or "(empty)"
+        if not self._host_ok():
+            why = f"the Host header {seen('Host')} is not a name this server answers for"
+        else:
+            why = (f"a cross-site page load of {self.path.split('?', 1)[0][:60]!r} (Sec-Fetch-Site {seen('Sec-Fetch-Site')}, "
+                   f"Mode {seen('Sec-Fetch-Mode')}, Dest {seen('Sec-Fetch-Dest')}) that is not a pairing or sign page")
+        return f"forbidden\n\nrefused: {why}\n".encode("utf-8")
 
     def _reject(self, status: int, error: str, message: str) -> None:
         """Refuse a write BEFORE its body is read: close the connection (so the unread body cannot
