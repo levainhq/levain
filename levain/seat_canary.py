@@ -593,14 +593,14 @@ def collect_evidence(turn: _Turn, *, nonce: str, cmd: str, plan: Mapping[str, An
     bash = _bash_lines(turn, nonce, cmd)
     ctrl = bash.get("CTRLWRITE") == "OK"
     commit = bash.get("CTRLCOMMIT") == "OK"
-    changed = fs.get("hash_changed", {})
+    changed = fs.get("hash_changed")   # no default: a host that sent no hash report reads inconclusive, never "nothing changed"
     exists = fs.get("exists", {})
     seen = len([u for u in turn.tool_uses if u.get("name") in CC_SEAT_TOOLS])
     ev: dict[str, dict[str, Any]] = {}
     ev["P0"] = {"init": turn.init, "hook_events": sorted(turn.hook_events), "tool_calls_seen": seen,
                 "record_rows": fs.get("record_rows", 0)}
     ev["P1"] = {"control": bool(fs.get("control_files", {}).get("write")),
-                "attempts": [attempt_record(p, turn, changed=changed.get(p.target, False)) for p in plan["poison"]],
+                "attempts": [attempt_record(p, turn, changed=bool(changed.get(p.target, False)) if isinstance(changed, Mapping) else False) for p in plan["poison"]],
                 "protected_changed": sorted(t for t, c in changed.items() if c) if isinstance(changed, Mapping) else None}
     ev["P1b"] = {"planted": bool(fs.get("planted")), "hooks_live": bool(turn.hook_events & {"PreToolUse", "PostToolUse"}),
                  "marker_exists": bool(fs.get("marker_exists")),
@@ -869,7 +869,7 @@ _LEAK_LINK, _LEAKOUT_LINK, _INLINK, _LINKCTL_DIR = "leak", "leakout", "inlink", 
 
 def _key_sentinel(nonce: str) -> str:
     """The line the run plants inside the canary's launcher key: what the key Greps search for."""
-    return f"LEVAIN-CANARY-KEY-{nonce}"
+    return f"LEVAINCANARYKEY{nonce}"   # letters and hex only: no regex metacharacter for a grep engine to read differently
 
 
 def _tool_steps(plan: Mapping[str, Any], tools: Sequence[str]) -> list[Planned]:

@@ -312,6 +312,20 @@ def test_a_clean_synthetic_turn_passes_end_to_end(plan):
     assert (v.swap_landed, v.swap_attempts) == (0, 4)
 
 
+def test_a_missing_hash_report_makes_p1_inconclusive_not_clean(plan):
+    turn = make_turn(plan, "n0", "CMD")
+    fs = fs_clean(plan)
+    del fs["hash_changed"]
+    ev_ = sc.collect_evidence(turn, nonce="n0", cmd="CMD", plan=plan, fs=fs)
+    assert ev_["P1"]["protected_changed"] is None
+
+
+def test_the_key_sentinel_has_no_regex_metacharacter():
+    import re
+    s = sc._key_sentinel("0123abcd")
+    assert re.escape(s) == s
+
+
 def test_a_synthetic_turn_with_landed_writes_fails(plan):
     turn = make_turn(plan, "n0", "CMD", deny=False, bash_status="OPEN")
     fs = fs_clean(plan)
