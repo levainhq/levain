@@ -547,6 +547,57 @@ This keeps Ubuntu's host-wide restriction on and is reversible with `apparmor_pa
 
 ⚠ **Don't diagnose this by reading `kernel.unprivileged_userns_clone`.** That sysctl still reports `1` on affected Ubuntu hosts while `kernel.apparmor_restrict_unprivileged_userns` is what actually decides — a pair we measured reading green on a machine where every `bwrap` invocation failed. Levain checks by running `bwrap`, not by reading either.
 
+## All commands
+
+Every top-level `levain` verb, each with the one line `levain --help` gives it. `levain <verb> --help` has the rest.
+
+| Command | What it does |
+| --- | --- |
+| `levain init` | Scaffold a new install: interview, render templates, init store. |
+| `levain doctor` | Loud, in-environment health check of an install. |
+| `levain verify-hooks` | Smoke-test the installed activation hooks for each adapter present. |
+| `levain dashboard` | Read-only glance at the substrate from outside a session. |
+| `levain tui` | Interactive terminal control plane over the substrate. |
+| `levain state` | Set / show your freeform state line — what's going on right now. |
+| `levain cockpit` | Enroll, revoke and list the cockpit's signing keys, and initialise its authority log (a reported install). |
+| `levain consent` | The cross-agent consent queue: its standing grants and its hook canary. |
+| `levain binding` | Graduation policies (what may run below CONFIRM without asking, signed in the authority log); pause, resume or abandon a binding. |
+| `levain chat` | The chat launch's network: the keys Levain holds for it. |
+| `levain voice` | Premium voice: the provider key Levain holds for read-aloud. |
+| `levain push` | Push a branch only on the operator's signed yes (the gated push path). |
+| `levain publish` | Publish a package to PyPI or npm only on the operator's signed yes (the gated path). |
+| `levain limits` | Show or set a session's budgets (tool calls, active hours, tokens, repeats), or extend a halted session. |
+| `levain ask` | Ask the operator a question and keep working (the question band). |
+| `levain question` | List, show or answer the agents' questions (the question band). |
+| `levain band` | Print the NEEDS YOU band: what waits on you, numbered. |
+| `levain dispatch` | File, read, sign or cancel a dispatch job (a planner's task run by cheaper executors). |
+| `levain drop` | Drop words for the coordinator and go (kept verbatim; never authority). |
+| `levain drops` | Your drops: list, show, and split (the coordinator's door). |
+| `levain thread` | The threads your drops became. |
+| `levain coord` | The coordinator lease: who holds the coordinator role, and the sessions launched for it. |
+| `levain envelope` | Thread envelopes: what the coordinator may do for a thread, signed by you. |
+| `levain observe` | Observe-mode PermissionRequest logger: aggregate counts only, answers nothing. |
+| `levain agents` | Named agents on the autonomic store (the store check; `role add\|show`). |
+| `levain dream` | Dreaming: run on a store copy; rollback, recover and drill. |
+| `levain run` | Run a sovereign entity as an interactive partner on an open model. |
+| `levain wrap` | Consolidate a sovereign entity's memory — metabolize its episodes into felt memory. |
+| `levain serve` | Serve the substrate dashboard as a local web-app (localhost). |
+| `levain serve-app` | Serve the substrate dashboard as an in-host MCP App (stdio). |
+| `levain docs` | Read the operator manual in the browser (base + installed pack chapters). |
+| `levain daemon` | Install/manage the always-on `serve` autostart (login-start, crash-survive). |
+| `levain update` | Update the known-good version set together (anneal + schema + migrations) and refresh the activation tree and adapter files after an upgrade. |
+| `levain messaging` | Show or change the Claude Code cross-session messaging choice of an install. |
+| `levain adopt-answers` | Make your hand-edited seed files the interview record (.levain/answers.json). |
+| `levain setup-isolation` | Create a dedicated unprivileged user for an entity's bash (one-time, needs sudo). |
+| `levain hands` | Sign the entity's own user in to Claude Code or Codex (its own login, never a copy of yours). |
+| `levain ws-git` | Run git in the entity's workspace as the entity's user, with hooks and the like off. |
+| `levain ws-adopt` | Import one of your repositories into the entity's workspace, owned by the entity's user. |
+| `levain ws-put` | Copy one file of yours into the entity's workspace, written by the entity's user. |
+| `levain ssh-add` | Add an ssh key to a running session's scoped agent, limited to the hosts you name. |
+| `levain team` | Share one project's decisions across a team of engineers (git ledger + edit-time hook). |
+| `levain ping` | Web push to paired phones: keys, a test ping, the notification record, presence. |
+| `levain notify` | Notify tokens: the credential a service posts a notice at your phone with. |
+
 ## Audience
 
 Operator-class developers: the people who already feel session-amnesia as a real problem and would build their own fix. If you've built your own substrate-management scripts, you'll recognize the pieces. If "continuity file" and "session-closing reflection" don't land yet, this probably isn't your tool yet.
