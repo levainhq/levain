@@ -459,9 +459,27 @@ def _bound_log(fd: int = 2, expected: Optional[Path] = None) -> None:
         _trim_if_over(fd, expected)
 
 
+#: the longest refusal detail a cause line or an `internal-error` reply carries
+_REFUSAL_DETAIL_MAX = 120
+
+
+def _refusal_cause(exc: BaseException) -> str:
+    """``name: detail`` of a :class:`levain.slot.Refused` (the supervisor's refusal BY NAME, CONTRACT §5), else ``""``.
+    The name is the stable reason and the detail is its one human line; both are repr'd, so a control character in either
+    cannot start a second log line, and the detail is capped. Any other exception contributes nothing: ``str(exc)`` of an
+    arbitrary error can carry a path, a key or a ticket from the request (VM v2 finding 2: the name was dropped, and the
+    operator read ``Refused at supervisor.py:407``)."""
+    if not isinstance(exc, Refused):
+        return ""
+    name = repr(str(exc.name)[:64])
+    detail = str(exc.detail)[:_REFUSAL_DETAIL_MAX]
+    return f"{name}: {detail!r}" if detail else name
+
+
 def _report_failure(op: str, exc: BaseException) -> None:
     """ONE stderr line for an unexpected failure that is about to answer `internal-error`: the op, the exception's type
-    and the file:line of its last frame. Never ``str(exc)``: it can carry a path, a key or a ticket from the request.
+    and the file:line of its last frame, and for a supervisor :class:`Refused` its name and one-line detail
+    (:func:`_refusal_cause`). Never ``str(exc)``: it can carry a path, a key or a ticket from the request.
     Stderr is the unit's log (journald on Linux); it was `_log.warning` before, which reaches no stream unless a
     handler is configured, so the cause appeared nowhere on the box (VM finding 5). The bound and the write share ONE
     :data:`_LOG_LOCK` span, so no other thread's truncate lands between this line's write and its flush."""
@@ -470,7 +488,10 @@ def _report_failure(op: str, exc: BaseException) -> None:
         where = f"{os.path.basename(tb[-1].filename)}:{tb[-1].lineno}" if tb else "?"
         with _LOG_LOCK:
             _trim_if_over(2)
-            print(f"levain dispatch-run: op {str(op)[:32]!r} failed: {type(exc).__name__} at {where}", file=sys.stderr, flush=True)
+            cause = _refusal_cause(exc)
+            tail = f" ({cause})" if cause else ""
+            print(f"levain dispatch-run: op {str(op)[:32]!r} failed: {type(exc).__name__} at {where}{tail}",
+                  file=sys.stderr, flush=True)
     except Exception:  # noqa: BLE001 - reporting must never turn a refusal into a crash
         pass
 
@@ -548,7 +569,7 @@ class RunServer:
                     return
                 except Exception as exc:  # noqa: BLE001
                     _report_failure(op, exc)
-                    ans = C.refused_answer(rid, "internal-error", reason_class="transient")
+                    ans = C.refused_answer(rid, "internal-error", _refusal_cause(exc), reason_class="transient")
                 if not self._send(sock, ans):
                     return
         finally:

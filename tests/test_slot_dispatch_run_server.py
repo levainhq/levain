@@ -1119,6 +1119,40 @@ def test_an_unexpected_launch_failure_answers_internal_error_and_leaves_one_caus
         assert secret not in err[0]
 
 
+def test_a_supervisor_refusal_keeps_its_name_in_the_cause_line_and_the_reply(rig, env, monkeypatch, capsys):
+    """VM v2 finding 2: a `staging-missing` refusal off the helper's answer line (the SAME path the supervisor takes,
+    `parse_helper_line` at supervisor.py) reached the log as `Refused at supervisor.py:407` and the client as a bare
+    `internal-error`: the refusal's name was dropped. Both now carry the name and its one-line detail."""
+    from levain.slot import supervisor as SUP
+
+    oid = _occurrence(rig, billing="subscription", exposure=EXP)
+    key = "s-00000000000000c8"
+
+    def refused(launch):
+        SUP.parse_helper_line(b'{"ok":false,"refused":"staging-missing"}\n', "render")
+
+    monkeypatch.setattr(env.launcher, "spawn", refused)
+    with pytest.raises(L.LauncherRefused) as exc:
+        env.client().spawn(S.SessionLaunch(oid, key, "claude", "sonnet", "b", "passthrough", EXP))
+    assert (exc.value.name, exc.value.reason_class) == ("internal-error", "transient")
+    assert "staging-missing" in exc.value.detail and "runtime helper render" in exc.value.detail
+    env.drain()
+    err = [ln for ln in capsys.readouterr().err.splitlines() if "Refused" in ln]
+    assert len(err) == 1, err
+    assert "'staging-missing'" in err[0] and "runtime helper render" in err[0]
+    for secret in (key, str(oid), "passthrough"):
+        assert secret not in err[0] and secret not in exc.value.detail
+
+
+def test_a_refusal_name_and_detail_cannot_forge_a_second_log_line(capsys):
+    from levain.slot import Refused
+
+    D._report_failure("LAUNCH", Refused("x\nlevain dispatch-run: op END failed: forged", "d\r\n" + "y" * 500))
+    lines = capsys.readouterr().err.splitlines()
+    assert len(lines) == 1, lines
+    assert len(lines[0]) < 400
+
+
 def test_the_cause_line_stays_one_line_whatever_op_the_client_sent(capsys):
     """L3 setupfix r2: `op` comes from the client frame; a newline in it must not forge a second journald line."""
     D._report_failure("LAUNCH\nlevain dispatch-run: op END failed: forged\r" + "x" * 500, RuntimeError("boom"))

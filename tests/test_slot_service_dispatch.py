@@ -59,7 +59,9 @@ _BASE_RENDERS = {
              "ea1c8d3db8cf129979306b769467116cf432abbfd41bc01790103f5ed4aa8752"),
     "qbroker": ("ba7065b38fcc837b669c64022aaf074f61121f7e1a2a73da038cde787cc95f52",
                 "f57330c86d79cf0968eadc1c8722f7fbcf749d8ca0b040875137b948c1d1f103"),
-    "reaper": ("0e43ef1cd8e4169f92da574c9ed5a7636fabe2875e47c0e8b15ae9d32474f074",
+    # the plist hash was re-pinned deliberately when the row gained its stderr path (logs=True, VM v2 finding 5);
+    # the Linux unit is unchanged
+    "reaper": ("0f46c37e5bc24a8902ced318b77754b602f175ff80479fa64eee2adbf520a55d",
                "bba7ea59e0cfd3ec98488124db756571e22c2cd14f05e05613866750e453292b"),
     # added with its registration (S10b slice R), not on bcb41e68: the sha256 of the row's own render, the Linux one
     # through ``_at_bcb41e68`` like the rest. The plist hash was re-pinned when the row gained its stderr path (logs=True,
@@ -488,3 +490,16 @@ def test_setup_and_repair_both_carry_the_clear_before_the_start(tmp_path):
         clear = [i for i, w in enumerate(whys) if w.startswith("remove a stale ")]
         start = [i for i, w in enumerate(whys) if w.startswith("start com.levain.dispatch_run")]
         assert len(clear) == 1 and len(start) == 1 and clear[0] < start[0], (plan.verb, clear, start)
+
+
+def test_the_reaper_plist_keeps_its_stderr_in_root_log_dir_and_the_linux_unit_is_unchanged():
+    """VM v2 finding 5: the reaper logs to stderr and its plist named no StandardErrorPath, so
+    `END <s>: quarantined after 3 tries (...)` went nowhere on a real install. A root service's file is under /var/log
+    (launchd opens it as root; no directory of another account is involved). systemd's journal already keeps stderr, so
+    the Linux unit is the one `_BASE_RENDERS` pins."""
+    reaper = units.by_name("reaper")
+    assert reaper.logs and reaper.user == "root"
+    job = plistlib.loads(units.launchd_plist_text(reaper).encode())
+    assert job["StandardErrorPath"] == job["StandardOutPath"] == str(units.launchd_log_path(reaper))
+    assert units.launchd_log_path(reaper) == Path("/var/log/com.levain.reaper.log")
+    assert "StandardErrorPath" not in units.systemd_unit_text(reaper)

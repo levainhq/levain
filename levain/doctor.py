@@ -39,9 +39,12 @@ import time
 import tomllib
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Sequence
+from typing import TYPE_CHECKING, Any, Sequence
 
 from levain.slot import SUDO
+
+if TYPE_CHECKING:
+    from levain.firing.hands import HostOS
 
 
 def _supports_color() -> bool:
@@ -1821,7 +1824,7 @@ def _check_reaper(host: str, beat: tuple[str, Any], running: Any, now: float,
                            "so this account cannot see its last pass", neutral=not soft, warn=soft)
     if kind == "absent":
         return CheckResult(name, True, f"{lead}, and has written no pass record yet", warn=True,
-                           hint=f"It passes about every {int(V11_S)} s; if this stays, look at its service log.")
+                           hint=f"It passes about every {int(V11_S)} s; if this stays, look at {_reaper_log_here()}.")
     if kind == "bad":
         return CheckResult(name, True, f"{lead}; its pass record cannot be read ({rec})", warn=True)
     age = _beat_age(rec, now)
@@ -1830,7 +1833,7 @@ def _check_reaper(host: str, beat: tuple[str, Any], running: Any, now: float,
     if age > _REAPER_STALE_S:
         return CheckResult(name, True, f"{lead}, but no pass in {_age_text(age)} (pass {rec['pass_seq']}); one long END "
                            f"can take that long, and it otherwise passes about every {int(V11_S)} s", warn=True,
-                           hint="If this stays, look at the reaper's service log; a repair run restarts it: "
+                           hint=f"If this stays, look at {_reaper_log_here()}; a repair run restarts it: "
                            "`sudo levain setup-isolation`.")
     failed = _failed_steps(rec)
     detail = f"{lead}; pass {rec['pass_seq']} ended {_age_text(age)} ago"
@@ -1842,7 +1845,7 @@ def _check_reaper(host: str, beat: tuple[str, Any], running: Any, now: float,
         shown = ", ".join(unshowable.mark(s[:64], allow="") for s in failed[:_SKIP_SHOWN])
         more = f" and {len(failed) - _SKIP_SHOWN} more" if len(failed) > _SKIP_SHOWN else ""
         return CheckResult(name, True, f"{detail}; a step failed in that pass: {shown}{more}", warn=True,
-                           hint="The pass goes on past a failed step; the reaper's service log names the fault.")
+                           hint=f"The pass goes on past a failed step; {_reaper_log_here()} names the fault.")
     return CheckResult(name, True, detail, warn=soft)
 
 
@@ -1957,13 +1960,29 @@ def _check_held(status: tuple[bool, Any], beat: tuple[str, Any], now: float) -> 
     shown = [f"{s} at {w}" if w else s for s, w in sorted(held.items())[:_HELD_NAMED]]
     more = f" and {len(held) - _HELD_NAMED} more" if len(held) > _HELD_NAMED else ""
     retrying = " while the reaper retries" if len(quarantined) < len(held) else ""
-    hint = ("The reaper retries with a backoff; if the named step keeps failing, its service log says why. "
+    hint = (f"The reaper retries with a backoff; if the named step keeps failing, its {_reaper_log_here()} says why. "
             "If `repair` refuses `live-lease` for this session (it was stranded by an older release's END), "
             "release it from this install's package, in order:\n" + _held_commands())
     if quarantined:
         hint = _quarantine_hint() + ("\n" + hint if len(quarantined) < len(held) else "")
     return CheckResult(name, False, f"{len(held)} stuck mid-end: {'; '.join(shown)}{more}; each keeps its slot leased "
                        f"and its tree untouched{retrying}", hint)
+
+
+def reaper_log_where(host: HostOS) -> str:
+    """Where the reaper's stderr (its quarantine and failed-pass lines) is kept, as words for a hint: on macOS the file the
+    LaunchDaemon's own ``StandardErrorPath`` names (read from the unit, never a literal here), on Linux the journal
+    command for its systemd unit."""
+    from levain.slot import units
+
+    svc = units.by_name("reaper")
+    if host == "darwin":
+        return f"service log {units.launchd_log_path(svc)}"
+    return f"journal (`journalctl -u {units.systemd_name(svc)}`)"
+
+
+def _reaper_log_here() -> str:
+    return reaper_log_where("darwin" if sys.platform == "darwin" else "linux")
 
 
 def _quarantine_hint() -> str:
@@ -1973,7 +1992,7 @@ def _quarantine_hint() -> str:
     host = "darwin" if sys.platform == "darwin" else "linux"
     lines = reap_held_lines(host, os.path.dirname(os.path.abspath(__file__)))
     return ("The reaper has stopped retrying the quarantined ones; each keeps its slot leased and its tree untouched. "
-            "The reaper's service log names the entry. Fix that, then restart the reaper to try once more: "
+            f"The reaper's {_reaper_log_here()} names the entry. Fix that, then restart the reaper to try once more: "
             f"`{lines[0]}` then `{lines[3]}`.")
 
 

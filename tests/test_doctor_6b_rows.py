@@ -6,6 +6,7 @@ comes from a real ``Control`` over a real socket for the live tests, and a unit 
 from __future__ import annotations
 
 import os
+import plistlib
 import tempfile
 import shutil
 import time
@@ -571,3 +572,24 @@ def test_a_fresh_pass_record_naming_no_held_session_is_not_called_out_of_date():
     stale = doctor._check_held((False, "no answer in time"), ("ok", dict(rec, ended_at=R.timestamp(NOW - 5000))), NOW)
     assert fresh.ok and fresh.warn and "out of date" not in fresh.detail and "is current" in fresh.detail
     assert "out of date" in stale.detail
+
+
+def test_the_reaper_log_the_rows_name_is_the_file_its_plist_writes_to():
+    """VM v2 finding 5: the quarantine row said "the reaper's service log" while the unit kept none. The words name the
+    path (macOS: the plist's own StandardErrorPath, read from the unit, never a literal) or the journal command."""
+    from levain.slot import units
+    reaper = units.by_name("reaper")
+    job = plistlib.loads(units.launchd_plist_text(reaper).encode())
+    assert job["StandardErrorPath"] in doctor.reaper_log_where("darwin")
+    assert units.systemd_name(reaper) in doctor.reaper_log_where("linux")
+
+
+def test_the_quarantine_hint_and_the_held_hint_name_where_the_reaper_logs(tmp_path: Path):
+    import sys
+    recs = [{"session": SESSION, "state": "HELD", "failed_step": "tree", "held_attempts": 3,
+             "held_reason": "var-folders-residue"},
+            {"session": OTHER, "state": "HELD", "failed_step": "kill", "held_attempts": 1}]
+    row = _rows(tmp_path, status=lambda: (True, recs))["agent held sessions"]
+    where = doctor.reaper_log_where("darwin" if sys.platform == "darwin" else "linux")
+    assert f"The reaper's {where} names the entry" in row.hint            # the quarantine half
+    assert f"its {where} says why" in row.hint                              # the retrying half
