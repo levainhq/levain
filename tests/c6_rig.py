@@ -60,10 +60,11 @@ class Run:
     """One ticketed dispatch session bound through CONTROL's own verbs (test_tickets' `bound_session`, then c3_rig's
     `Session` steps): `token` is its token, `run_id` the run's id."""
 
-    def __init__(self, control: C.Control, session: str, attempt: str) -> None:
+    def __init__(self, control: C.Control, session: str, attempt: str, reserved: Optional[int] = None) -> None:
         dispatch = C.Conn(DISPATCH_UID)
+        extra = {} if reserved is None else {"reserved_microdollars": reserved}   # the run's share; default: mint_args'
         ans = control.handle(dispatch, {"v": 1, "op": "RUN-TICKET-MINT", "id": 1,
-                                        **mint_args(attempt, route_policy_digest=POLICY_DIGEST)})
+                                        **mint_args(attempt, route_policy_digest=POLICY_DIGEST, **extra)})
         self.ticket, self.run_id, self.session = ticket_of(ans), ans["run_id"], session
         self.lease = C.Conn(DISPATCH_UID)
         nonce = _ok(control.handle(self.lease, {"v": 1, "op": "LEASE-OPEN", "id": 2,
@@ -190,9 +191,10 @@ class World:
         await R3.aio_until(lambda: self.control.keys_attached() is not None, what="CONTROL sees keys attached")
         return self.keys
 
-    async def run(self, session: str = "s-00000000000000a1", attempt: str = "a-1") -> Tuple[Run, Front]:
+    async def run(self, session: str = "s-00000000000000a1", attempt: str = "a-1",
+                  reserved: Optional[int] = None) -> Tuple[Run, Front]:
         loop = asyncio.get_running_loop()
-        r = await loop.run_in_executor(None, lambda: Run(self.control, session, attempt))
+        r = await loop.run_in_executor(None, lambda: Run(self.control, session, attempt, reserved))
         assert self.keys is not None
         f = await Front(self.keys, r).claim()
         self.fronts.append(f)
