@@ -8,12 +8,21 @@ WEB = Path(__file__).resolve().parents[1] / "levain" / "templates" / "web"
 PROSE = {"autocapitalize": "sentences", "autocorrect": "on", "spellcheck": "true", "inputmode": "text", "autocomplete": "off"}
 
 
-def test_cockpit_drop_textarea_is_prose():
+def test_cockpit_drop_box_is_a_prose_contenteditable_not_a_form_control():
+    """Phill 11-06: on the iPhone Safari's AutoFill offered cards and contacts on the hero textarea whatever its attributes said (his
+    four-variant test: the identical textarea was clean on a static page, so the classifier reads the live page around it). The hero box
+    is a contenteditable div with role=textbox, so no form control exists to classify; it still says "ordinary prose" outright."""
     js = (WEB / "dashboard_core.js").read_text()
-    i = js.index('words.id = "ck-drop-words"')
-    block = js[i:i + 1500]
+    block = js[js.index("function dropBoxBuild()"):][:2600]
+    assert 'el("div", "drop-words")' in block and 'box.id = "ck-drop-words"' in block
+    for needle in ('"contenteditable", "true"', '"role", "textbox"', '"aria-multiline", "true"', '"aria-label"'):
+        assert needle in block, needle
     for k, v in PROSE.items():
-        assert f'["{k}", "{v}"]' in block, k
+        if k != "autocomplete":      # autocomplete is a form-control attribute: the div carries none
+            assert f'["{k}", "{v}"]' in block, k
+    assert "textarea" not in block.replace("textarea's", "")      # nothing in the builder makes a textarea
+    hero = js[js.index("function dropHeroBuild("):][:2500]
+    assert "dropBoxBuild()" in hero and 'el("textarea", "drop-words")' not in hero
 
 
 def test_code_and_repo_boxes_keep_their_attributes():
@@ -32,11 +41,10 @@ def test_every_drop_textarea_has_a_dash_free_name():
     """Phill 11-04, on his iPhone: Safari's AutoFill showed "AutoFill Contact" and his phone numbers on the Drop box (not on a
     page whose box carried a dash-free id and name: variant K of ~/Desktop/ios_autofill_variants). The WebKit classifier is closed
     code and its one reported trigger is a dash in a field's name (Apple Developer Forums 764041), so each Drop box names itself
-    `dropwords`. The boxes are the cockpit hero and the envelope sheet's."""
-    for fname, anchor in (("dashboard_core.js", 'words.id = "ck-drop-words"'), ("sign.js", 'words.id = "drop-words"')):
-        js = (WEB / fname).read_text()
-        i = js.index(anchor)
-        assert '["name", "dropwords"]' in js[i:i + 1500], fname
+    `dropwords`. The envelope sheet's textarea keeps it; the cockpit hero box is no longer a form control (11-06)."""
+    js = (WEB / "sign.js").read_text()
+    assert '["name", "dropwords"]' in js[js.index('words.id = "drop-words"'):][:1500]
+    assert "dropwords" not in (WEB / "dashboard_core.js").read_text()      # the cockpit hero box is a div with no name at all
 
 
 def test_the_other_dashed_text_fields_of_the_drop_flow_have_dash_free_names():

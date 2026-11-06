@@ -126,9 +126,9 @@ def test_an_expanded_row_stays_open_across_a_redraw_that_rebuilds_the_rows(tmp_p
 @needs_browser
 @needs_ssh
 def test_words_typed_and_focus_in_the_composer_and_the_filter_survive_a_redraw(tmp_path: Path, monkeypatch) -> None:
-    probe = ("JSON.stringify({t: 'thread', words: document.querySelector('#ck-drop-words').value, rows: [], active: document.activeElement.className || document.activeElement.id,"
+    probe = ("JSON.stringify({t: 'thread', words: window.LevainDashboard.dropBoxText(document.querySelector('#ck-drop-words')), rows: [], active: document.activeElement.className || document.activeElement.id,"
              " filter: document.querySelector('#ck-drop .drop-filter').value, keys: [...document.querySelectorAll('#ck-drop .drop-recent-row')].map(r => r.dataset.dropKey)})")
-    typed = {"eval": "(() => { const w = document.querySelector('#ck-drop-words'); w.value = 'half a thought'; w.dispatchEvent(new Event('input', {bubbles: true})); w.focus(); return 1; })()"}
+    typed = {"eval": "(() => { const w = document.querySelector('#ck-drop-words'); window.LevainDashboard.setDropBoxText(w, 'half a thought'); w.dispatchEvent(new Event('input', {bubbles: true})); w.focus(); return 1; })()"}
     filt = {"eval": "(() => { const q = document.querySelector('#ck-drop .drop-filter'); q.focus(); q.value = 'drop'; q.dispatchEvent(new Event('input', {bubbles: true})); return 1; })()"}
     steps = _boot(_init(DESK_ROWS), [typed, {"eval": _more_drop("d3", "a newer drop", "2026-10-30T13:00:00.000000Z")}, REDRAW, SETTLE2, {"eval": probe},
                                       filt, {"eval": _more_drop("d4", "yet another drop", "2026-10-30T13:30:00.000000Z")}, {"eval": "Date.now = ((n) => () => n() + 120000)(Date.now); 1"},

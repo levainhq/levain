@@ -7273,14 +7273,13 @@
     const outstanding = typeof ui.handed === "string";
     ui.handed = undefined;
     const box = ui.words;
-    if (!outstanding || !box || typeof delivered !== "string" || !delivered.trim() || box.value.trim() !== delivered.trim()) return;
+    if (!outstanding || !box || typeof delivered !== "string" || !delivered.trim() || dropBoxText(box).trim() !== delivered.trim()) return;
     if (ui.req && ui.req.words.trim() === delivered.trim()) {
       dropForget(ui.req);
       ui.req = null;
       ui.fromKeep = false;
     }
-    box.value = "";
-    box.style.height = "";
+    setDropBoxText(box, "");
     dropPrefillClear();
     if (typeof ui.resume === "function") ui.resume();
     if (typeof ui.earlierLine === "function") ui.earlierLine();
@@ -7295,7 +7294,113 @@
   // one whose answer is unknown
   const dropPendKey = () => "levain-drop-pending:" + window.location.hostname;
   const dropPendKeyOf = (id) => dropPendKey() + ":" + id;
-  const dropGrow = (t) => { const f = window.LevainCardFormat; if (f && typeof f.grow === "function") f.grow(t); };   // a programmatic value fires no input event
+  // ---- the hero Drop box is a contenteditable div (role=textbox), not a form control (Phill 11-06): Safari's AutoFill kept
+  // offering cards and contacts on the live textarea whatever its attributes said, and a div has no field kind to classify.
+  // Everything that read or wrote its `.value` goes through these helpers, in this one place.
+  // The words in the box as one string: line breaks (a <br>, a div per Enter) are "\n", a lone <br> left by deleting everything is
+  // nothing, a no-break space is a space, and trailing newlines are dropped.
+  // ONE normaliser for both sides of every "is this the retained request's words" comparison (a kept request from an earlier
+  // build may end in newlines or hold no-break spaces; the box can only ever show the normalised form)
+  function dropNorm(s) { return String(s == null ? "" : s).replace(/\r\n?/g, "\n").replace(/\u00a0/g, " ").replace(/\n+$/, ""); }
+  const dropSame = (a, b) => dropNorm(a) === dropNorm(b);
+  // read by walking the DOM, never innerText: innerText is layout-dependent (a hidden host gives "" in WebKit and the bare
+  // textContent, with no line breaks, in Chrome). A <br> is a newline; a block child (a div per Enter) starts and ends a line.
+  function dropBoxText(box) {
+    if (!box || !box.textContent) return "";
+    let out = "";
+    const nl = () => { if (out && out[out.length - 1] !== "\n") out += "\n"; };
+    const walk = (n) => {
+      for (let c = n.firstChild; c; c = c.nextSibling) {
+        if (c.nodeType === 3) out += c.nodeValue;
+        else if (c.nodeType === 1) {
+          if (c.tagName === "BR") { out += "\n"; continue; }
+          const block = /^(DIV|P|LI|UL|OL|BLOCKQUOTE|PRE|H[1-6])$/.test(c.tagName);
+          if (block) nl();
+          walk(c);
+          if (block) nl();
+        }
+      }
+    };
+    walk(box);
+    return dropNorm(out);
+  }
+  function setDropBoxText(box, text) { if (box) box.textContent = typeof text === "string" ? text : ""; }
+  // the box takes no typing: contenteditable off and aria-disabled (a div has no `disabled`)
+  function dropBoxOff(box, off) {
+    box.setAttribute("contenteditable", off ? "false" : "true");
+    if (off) box.setAttribute("aria-disabled", "true"); else box.removeAttribute("aria-disabled");
+  }
+  function dropBoxIsOff(box) { return box.getAttribute("aria-disabled") === "true"; }
+  function dropCaretEnd(box) {
+    const sel = window.getSelection && window.getSelection();
+    if (!sel) return;
+    const r = document.createRange();
+    r.selectNodeContents(box);
+    r.collapse(false);
+    sel.removeAllRanges();
+    sel.addRange(r);
+  }
+  // plain text in at the caret (or at `at`, a Range): never markup
+  function dropInsertPlain(box, text, at) {
+    const t = String(text || "").replace(/\r\n?/g, "\n");
+    if (!t || dropBoxIsOff(box)) return;      // a box that is off (a send in flight, no coordinator) takes nothing
+    const sel = window.getSelection && window.getSelection();
+    if (at && sel) { sel.removeAllRanges(); sel.addRange(at); }
+    // the selection must sit wholly inside the box (both ends and their common ancestor), else the text goes at the box's end:
+    // never into another field, never deleting DOM outside the composer
+    if (sel) {
+      const inside = (n) => !!n && box.contains(n);
+      let r0 = null;
+      try { r0 = sel.rangeCount ? sel.getRangeAt(0) : null; } catch (e) { r0 = null; }
+      if (!(r0 && inside(r0.startContainer) && inside(r0.endContainer) && inside(r0.commonAncestorContainer))) dropCaretEnd(box);
+    }
+    let ok = false;
+    try { ok = document.execCommand("insertText", false, t); } catch (e) { ok = false; }
+    if (!ok && sel) {
+      if (!sel.rangeCount) dropCaretEnd(box);
+      const r = sel.getRangeAt(0);
+      r.deleteContents();
+      const node = document.createTextNode(t);
+      r.insertNode(node);
+      r.setStartAfter(node);
+      r.collapse(true);
+      sel.removeAllRanges();
+      sel.addRange(r);
+    }
+    box.dispatchEvent(new Event("input", { bubbles: true }));
+  }
+  function dropBoxBuild() {
+    const box = el("div", "drop-words");
+    box.id = "ck-drop-words";
+    box.setAttribute("contenteditable", "true");      // "true", the markup the 11-06 test found clean; plaintext-only was never tried on the phone
+    box.setAttribute("role", "textbox");
+    box.setAttribute("aria-multiline", "true");
+    box.setAttribute("aria-label", "your words for the coordinator");
+    box.setAttribute("aria-placeholder", "words for the coordinator");
+    box.dataset.placeholder = "words for the coordinator";
+    for (const [k, v] of [["autocapitalize", "sentences"], ["autocorrect", "on"], ["spellcheck", "true"], ["inputmode", "text"], ["enterkeyhint", "enter"]]) box.setAttribute(k, v);
+    // a cleared box keeps a lone <br> in some browsers, which would hold the placeholder away: empty means empty
+    // (only after a deletion: Enter in an empty box leaves <br>s too, and those are the newline the user just typed)
+    box.addEventListener("input", (ev) => { if (!box.textContent && box.firstChild && ev && typeof ev.inputType === "string" && ev.inputType.indexOf("delete") === 0) box.replaceChildren(); });
+    box.addEventListener("paste", (ev) => {
+      ev.preventDefault();
+      if (dropBoxIsOff(box)) return;
+      const cd = ev.clipboardData;
+      dropInsertPlain(box, cd && typeof cd.getData === "function" ? cd.getData("text/plain") : "");
+    });
+    box.addEventListener("drop", (ev) => {
+      ev.preventDefault();
+      if (dropBoxIsOff(box)) return;
+      const dt = ev.dataTransfer;
+      const text = dt && typeof dt.getData === "function" ? dt.getData("text/plain") : "";
+      let at = null;
+      try { if (document.caretRangeFromPoint) { at = document.caretRangeFromPoint(ev.clientX, ev.clientY); if (at && !box.contains(at.startContainer)) at = null; } } catch (e) { at = null; }
+      dropInsertPlain(box, text, at);
+    });
+    // no rich text by any route (the iOS edit menu's bold and italic, a style paste)
+    box.addEventListener("beforeinput", (ev) => { if (typeof ev.inputType === "string" && /^(format|insertOrderedList|insertUnorderedList|insertHorizontalRule|insertLink)/.test(ev.inputType)) ev.preventDefault(); });
+    return box;
+  }
   // every kept request, newest first (a record an earlier build kept under the bare key counts too)
   const dropKeptAll = () => {
     const seen = new Map();
@@ -7481,13 +7586,9 @@
     head.appendChild(el("h3", null, "Drop to the coordinator"));
     ui.say = el("span", "needs-gloss drop-note", "");
     head.appendChild(ui.say);
-    const words = el("textarea", "drop-words");
-    words.id = "ck-drop-words";
-    words.placeholder = "words for the coordinator";
-    words.setAttribute("aria-label", "your words for the coordinator");
-    // a plain prose box: iOS keys its field kind off the attributes, and a bare textarea beside the one-time-code pairing box
-    // got payment/code treatment (no predictive text, autocorrect off); say "ordinary text" outright
-    for (const [k, v] of [["autocomplete", "off"], ["autocapitalize", "sentences"], ["autocorrect", "on"], ["spellcheck", "true"], ["inputmode", "text"], ["enterkeyhint", "enter"], ["name", "dropwords"]]) words.setAttribute(k, v);
+    // a contenteditable div, not a textarea: iOS Safari classified the textarea as a card/contact field from its page context
+    // (the pairing code box beside it) whatever its attributes said; a div with role=textbox is no form control (dropBoxBuild)
+    const words = dropBoxBuild();
     words.addEventListener("input", () => { dropPrefillClear(); ui.handed = undefined; });      // words changed since a handoff: that handoff is stale
     const acts = el("div", "needs-actions drop-actions");
     const send = el("button", "needs-btn needs-primary", "Send");
@@ -7534,14 +7635,13 @@
     const earlierLine = () => {
       const mine = ui.req ? ui.req.outbox_id : null;
       const n = dropKeptAll().filter((r) => r.outbox_id !== mine).length;
-      const inBox = ui.fromKeep && ui.req && ui.req.words === words.value ? "The drop in the box was not confirmed earlier: send it again, unchanged, to find out. " : "";
+      const inBox = ui.fromKeep && ui.req && dropSame(ui.req.words, dropBoxText(words)) ? "The drop in the box was not confirmed earlier: send it again, unchanged, to find out. " : "";
       ui.earlier.textContent = inBox + (n ? n + " earlier drop" + (n > 1 ? "s" : "") + " not confirmed." : "");
     };
     const resume = (msg) => {
       const next = dropKeptAll()[0];
       if (!next) return false;
-      words.value = next.words;
-      dropGrow(words);
+      setDropBoxText(words, next.words);
       ui.req = next;
       ui.fromKeep = true;
       if (msg) paint(msg, true);
@@ -7550,23 +7650,23 @@
     ui.earlierLine = earlierLine;
     ui.resume = resume;
     const paint = (msg, bad) => { ui.receipt.textContent = msg; ui.receipt.classList.toggle("bad", !!bad); };
-    const lock = (on) => { ui.working = on; send.disabled = env.disabled = on || !ui.can; words.disabled = dropWordsOff(words, on, ui.can); };
+    const lock = (on) => { ui.working = on; send.disabled = env.disabled = on || !ui.can; dropBoxOff(words, dropWordsOff(words, on, ui.can)); };
     ui.paint = paint;
     ui.lock = lock;
     // (the handoff is marked after the sheet opens: opening closes any sheet first, and a close ends a handoff)
-    env.addEventListener("click", () => { if (ui.can) { const got = openDropSheet(words.value); if (got) ui.handed = words.value; } });
+    env.addEventListener("click", () => { if (ui.can) { const got = openDropSheet(dropBoxText(words)); if (got) ui.handed = dropBoxText(words); } });
     send.addEventListener("click", () => {
       if (ui.working || !ui.can) return;
       if (ui.reading) { ui.reading.then(() => send.click()); return; }      // the read that names the store is still out
-      const w = words.value;
+      const w = dropBoxText(words);
       if (!w.trim()) { paint("Type your words first.", true); words.focus(); return; }
       const t = window.LevainCockpitTransport;
       const headers = Object.assign({}, t && typeof t.headers === "function" ? t.headers() : {}, { "Content-Type": "application/json" });
       // the retained request (words, id, time, store, and an envelope a sheet attached) goes again as it was, so a send whose
       // answer was lost files once; words edited since are a new drop with a new id
       // (a new drop is kept under its own id: the one it replaces in the box stays kept, never overwritten)
-      if (!(ui.req && ui.req.words === w)) ui.fromKeep = false;
-      const req = ui.req && ui.req.words === w ? ui.req : { words: w, outbox_id: dropOutboxId(), sent_at: dropStamp(), store_id: ui.storeId };
+      if (!(ui.req && dropSame(ui.req.words, w))) ui.fromKeep = false;
+      const req = ui.req && dropSame(ui.req.words, w) ? ui.req : { words: w, outbox_id: dropOutboxId(), sent_at: dropStamp(), store_id: ui.storeId };
       ui.req = req;
       const kept = dropKeep(req);
       lock(true);
@@ -7591,8 +7691,7 @@
           const d = a.body.drop || {};
           const first = w.split("\n")[0].trim().slice(0, 80) + (w.length > 80 || w.includes("\n") ? "…" : "");
           const how = dropHow(req, a.body);
-          words.value = "";
-          words.style.height = "";
+          setDropBoxText(words, "");
           paint((a.body.created === false ? "Already delivered: " : "Sent to the coordinator: ") + "“" + first + "” · " + how.text + " · " + String(d.drop_id || ""), !how.ok);
           resume();      // an earlier unconfirmed drop comes into the box, to send unchanged
           earlierLine();
@@ -7615,7 +7714,7 @@
     resume("A drop from earlier was not confirmed. Send it again, unchanged, to find out.");
     earlierLine();
     host._drop = ui;
-    host.addEventListener("keydown", (ev) => { if (ev.key === "Enter" && (ev.metaKey || ev.ctrlKey) && ev.target === words) { ev.preventDefault(); send.click(); } });      // after the commit above, so a failed build leaves none
+    host.addEventListener("keydown", (ev) => { if (ev.key === "Enter" && (ev.metaKey || ev.ctrlKey) && !ev.isComposing && ev.target === words) { ev.preventDefault(); send.click(); } });      // after the commit above, so a failed build leaves none
     return ui;
   }
   // one draw of the drop card from one read; the box and its words are never rebuilt under the reader
@@ -7625,7 +7724,7 @@
   function dropWordsOff(words, working, can) {
     if (working) return true;
     if (can) return false;
-    return !(document.activeElement === words || words.value.trim() !== "");
+    return !(document.activeElement === words || dropBoxText(words).trim() !== "");
   }
   function dropHeroDraw(host, r) {
     const ui = host._drop;
@@ -7640,7 +7739,7 @@
     ui.say.textContent = note;
     ui.say.classList.toggle("bad", !ui.can);
     ui.send.disabled = ui.env.disabled = ui.working || !ui.can;
-    ui.words.disabled = dropWordsOff(ui.words, ui.working, ui.can);
+    dropBoxOff(ui.words, dropWordsOff(ui.words, ui.working, ui.can));
     host.classList.toggle("drop-off", !ui.can);
     // A transient failure (network, 5xx, no store read) leaves the rows already drawn; the note above says why. A refused or
     // missing token leaves nothing of the thread: neither his drops nor the desk's cached rows outlive the authority to read them.
@@ -7734,7 +7833,6 @@
     host.hidden = false;
     host._drop.view = view || null;
     if (host._drop.read) dropThreadDraw(host);      // the desk's side may have changed with this view, whatever the drop read does next
-    if (fresh) dropGrow(host._drop.words);      // restored words are sized once the box is laid out, not while the host was hidden
     if (dropRead && Date.now() - dropAt >= DROP_FAIL_TTL_MS) dropRead = null;      // a render reads again once the last read is a few seconds old
     dropRefresh(host, false);
   }
@@ -7758,11 +7856,11 @@
     if (document.getElementById("levain-modal")) closeModal();      // a focus view stands over the box
     const box = ui.words;
     ui.say.textContent = ui.note || ""; ui.say.classList.remove("bad");      // an earlier refusal's line is stale now; the coordinator's own note stays
-    box.value = box.value.trim() ? box.value.replace(/\s+$/, "") + "\n\n" + words : words;
+    const have = dropBoxText(box);
+    setDropBoxText(box, have.trim() ? have.replace(/\s+$/, "") + "\n\n" + words : words);
     dropPrefillClear();      // a handoff to the sheet left earlier is stale now that these words are in the box
-    dropGrow(box);
     try { box.scrollIntoView({ block: "center" }); } catch (e) { /* scrolling is a convenience */ }
-    try { box.focus({ preventScroll: true }); box.setSelectionRange(box.value.length, box.value.length); } catch (e) { /* focus is a convenience */ }
+    try { box.focus({ preventScroll: true }); dropCaretEnd(box); } catch (e) { /* focus is a convenience */ }
     return true;
   }
   const DISPATCH_VERB = { sign: "Sign", cancel: "Cancel job", authorise: "Authorise" };
@@ -8502,7 +8600,7 @@
         if (run !== phoneJumpRun) return;
         host.scrollIntoView({ block: "start" });
         const ta = host._drop && host._drop.words;
-        if (ta && !ta.disabled) ta.focus({ preventScroll: true });
+        if (ta && !dropBoxIsOff(ta)) ta.focus({ preventScroll: true });
       });
       return;
     }
@@ -9481,5 +9579,5 @@
   window.LevainAgentPage = { open: openAgentPage };
   window.LevainNeeds = { items: (lines) => needsWaiting(needsItems(lines)), name: needsName, summary: needsSummary, go: needsGo, history: openDecisionsHistory };
   window.LevainLoops = { find: loopFind, go: loopGo, why: () => loopWhy };
-  window.LevainDashboard = { render: renderKeepingPlace, redraw: ckRedraw, openCustom, composeDrop, adoptPanel, captureKept, settleKept, buildKept: () => buildKept, renderPanel: renderPanelSafe, measureClauses, measureOverflow, hasUnsavedEdit, jobsActive: () => _activeJobs.size > 0, fitLineTile, lineTileCount: () => lineFits.size, noteBodyCount: () => noteBodies.size };
+  window.LevainDashboard = { render: renderKeepingPlace, redraw: ckRedraw, openCustom, composeDrop, adoptPanel, captureKept, settleKept, buildKept: () => buildKept, renderPanel: renderPanelSafe, measureClauses, measureOverflow, hasUnsavedEdit, dropBoxText, setDropBoxText, dropBoxIsOff, jobsActive: () => _activeJobs.size > 0, fitLineTile, lineTileCount: () => lineFits.size, noteBodyCount: () => noteBodies.size };
 })();

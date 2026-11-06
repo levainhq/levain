@@ -2967,6 +2967,11 @@ body.ke[data-mode="build"] .th-zone .zone-head { display: flex; }   /* titled li
    so they get the same width and font, not the rows. */
 body :is(#drop-words, .drop-words, .question-words) { display: block; width: 100%; max-width: none; min-width: 0; box-sizing: border-box;
   min-height: 12em; padding: var(--sp-3) var(--sp-4); font-size: 16px; line-height: 1.45; resize: vertical; field-sizing: content; }
+/* The cockpit Drop box is a contenteditable div (role=textbox), so it takes the textarea's look by hand: pre-wrapped text that breaks
+   anywhere, the rows as a min-height, a placeholder from data-placeholder while it is :empty, and a dimmed look while off. */
+body div#ck-drop-words { white-space: pre-wrap; overflow-wrap: anywhere; word-break: break-word; overflow: auto; -webkit-user-select: text; user-select: text; -webkit-appearance: none; appearance: none; cursor: text; }
+body div#ck-drop-words:empty::before { content: attr(data-placeholder); color: var(--meta); pointer-events: none; }
+body div#ck-drop-words[aria-disabled="true"] { opacity: .55; cursor: default; }
 body :is(.sheet-write-in, .sign-write-in) { grid-column: 1 / -1; display: block; width: 100%; max-width: none; min-width: 0; box-sizing: border-box; min-height: 44px; font-size: 16px; }
 /* The same fields wore the browser's own grey slab (rgb 59 59 59, square, a monospace face) beside the page's token inputs (filters, the
    pairing box: --bg, a --hair-2 line, --r-md). One look for all of them: the token field, the page's sans, a quiet placeholder. */
