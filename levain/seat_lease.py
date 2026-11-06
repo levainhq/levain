@@ -1,0 +1,364 @@
+"""The seat-root lease and the clone launch (PATHZERO Z1d, ruling D2 a).
+
+A terminal seat works in ONE lane clone plus its RETURN directory. Levain mints exactly those two roots, per lane,
+under a signed lease: a ``seat-root-lease`` link in the cockpit's authority log (the kind lives in
+``levain.authority``). The lease names the two parents the roots may sit under, pins the launcher key by sha256 and
+lasts at most 14 days; its holder re-signs it, and the cockpit Grants tab's passkey revoke removes it. A revoke
+refuses every LATER launch; a running seat keeps its roots (its settings were fixed at start, nothing here kills or
+touches a minted root). A launch with no live lease refuses; it never falls back to a prompting or bypass launch.
+
+Each mint is one row in ``<key dir>/mints.jsonl``: hash-chained, signed by the launcher key (an ed25519 key made at
+the first lease create, private half 0600 in the key directory, which every seat profile denies reading). The clone and
+the RETURN directory are created by the mint (an exclusive mkdir under the parent), never adopted from an existing
+path, and the row pins the clone's ``.git`` identity (device, inode) so a later Levain git call can refuse a swapped
+one. This module BUILDS AND VALIDATES a launch; it never executes ``claude`` (the launch itself is Z1e's, in the VM).
+"""
+from __future__ import annotations
+
+import fcntl
+import hashlib
+import json
+import os
+import re
+import secrets
+import shutil
+import stat
+import subprocess
+import sys
+from collections.abc import Callable, Mapping
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any
+
+from levain import host_guard as hg
+from levain.authority import SEAT_LEASE_KIND, SEAT_LEASE_MAX, AuthoritySnapshot, NotInitialised, _parse_stamp, _thaw
+from levain.seat_profile import SeatProfile, SeatRefusal, build_seat_profile
+
+__all__ = ["SEAT_LEASE_KIND", "SeatLaunchRefused", "LaunchPlan", "live_lease", "key_dir_for", "ensure_launcher_key",
+           "create_lease", "renew_lease", "mint_lane", "append_mint", "read_mints", "prepare_launch", "launch_seat",
+           "SIGN_COMMAND"]
+
+SIGN_COMMAND = "levain seat lease create --lanes-parent <dir> --returns-parent <dir> --signing-key <key>"
+_LANE_KEY = re.compile(r"[a-z0-9][a-z0-9._-]{0,63}")
+_BASE_SHA = re.compile(r"[0-9a-f]{40}|[0-9a-f]{64}")
+_GIT_TIMEOUT = 600.0
+_MINTS = "mints.jsonl"
+_KEY = "launcher.ed25519"
+
+
+class SeatLaunchRefused(Exception):
+    """A seat launch is refused before anything ran. ``str()`` is the reason shown to the operator."""
+
+
+def _canonical(value: Any) -> str:
+    return json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=True)
+
+
+# --- the lease ---------------------------------------------------------------------------------------------------
+
+def live_lease(state: AuthoritySnapshot, now: datetime) -> Mapping[str, Any] | None:
+    """The one live seat-root lease the verified replay ``state`` holds at ``now`` (its fields, plus ``incarnation``:
+    the seq of the link that brought its id into the policy), or None. More than one live is refused (the log refuses
+    to append a second; a foreign writer could leave two): which one a launch means is not an answer."""
+    live = []
+    for gid, grant in state.policy.grants.items():
+        if not (isinstance(grant, Mapping) and grant.get("kind") == SEAT_LEASE_KIND):
+            continue
+        try:
+            if _parse_stamp(grant["expires_at"], "expires_at") > now:
+                live.append((gid, grant))
+        except Exception:  # noqa: BLE001 - a lease whose expiry cannot be read is not live
+            continue
+    if len(live) > 1:
+        raise SeatLaunchRefused("the authority log holds more than one live seat-root lease: revoke all but one")
+    if not live:
+        return None
+    gid, grant = live[0]
+    return {**_thaw(grant), "incarnation": state.grant_born.get(gid, 0)}
+
+
+def _replay(cockpit_root: Path | str) -> AuthoritySnapshot | None:
+    """The verified, anchored replay, or None when no cockpit journal (or an empty log) exists. Any other failure
+    refuses: a log that cannot be read is never read as "no lease" quietly."""
+    from levain.agent_authority import AgentAuthority
+    from levain.cockpit.firejournal import DB_NAME
+    if not (Path(cockpit_root) / DB_NAME).is_file():
+        return None
+    try:
+        return AgentAuthority(cockpit_root).replay()
+    except NotInitialised:
+        return None
+    except Exception as exc:  # noqa: BLE001
+        raise SeatLaunchRefused(f"the authority log cannot be read ({type(exc).__name__}: {str(exc)[:160]})") from None
+
+
+# --- the launcher key ----------------------------------------------------------------------------------------------
+
+def key_dir_for(install: Path | str, roots: tuple[Path, ...]) -> Path:
+    """``<host state dir of the install>/seat_launcher``, outside every root a seat can write (created 0700)."""
+    d = hg.host_dir(install, "state", roots=roots) / "seat_launcher"
+    d.mkdir(mode=0o700, exist_ok=True)
+    st = os.lstat(d)
+    if stat.S_ISLNK(st.st_mode) or st.st_uid != os.getuid() or st.st_mode & 0o077:
+        raise SeatLaunchRefused(f"the launcher key directory {str(d)!r} is a link, foreign-owned or not private")
+    return d
+
+
+def _load_key(key_dir: Path):
+    from cryptography.hazmat.primitives import serialization
+    path = key_dir / _KEY
+    fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
+    try:
+        st = os.fstat(fd)
+        if st.st_uid != os.getuid() or st.st_mode & 0o077 or not stat.S_ISREG(st.st_mode):
+            raise SeatLaunchRefused(f"the launcher key {str(path)!r} is not a private file of this user")
+        raw = os.read(fd, 4096)
+    finally:
+        os.close(fd)
+    return serialization.load_pem_private_key(raw, password=None)
+
+
+def _pub_sha256(key: Any) -> str:
+    from cryptography.hazmat.primitives import serialization
+    pub = key.public_key().public_bytes(serialization.Encoding.Raw, serialization.PublicFormat.Raw)
+    return hashlib.sha256(pub).hexdigest()
+
+
+def ensure_launcher_key(key_dir: Path) -> str:
+    """Make the launcher ed25519 key if absent (0600, exclusive); return its public half's sha256 (what a lease pins)."""
+    from cryptography.hazmat.primitives import serialization
+    from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+    path = key_dir / _KEY
+    try:
+        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+    except FileExistsError:
+        return _pub_sha256(_load_key(key_dir))
+    key = Ed25519PrivateKey.generate()
+    with os.fdopen(fd, "wb") as fh:
+        fh.write(key.private_bytes(serialization.Encoding.PEM, serialization.PrivateFormat.PKCS8,
+                                   serialization.NoEncryption()))
+    return _pub_sha256(key)
+
+
+# --- sign / renew a lease (the cockpit key commands' own append) ---------------------------------------------------
+
+def create_lease(cockpit_root: Path | str, *, lanes_parent: Path | str, returns_parent: Path | str, key_dir: Path,
+                 signer_fp: str, sign: Callable[[bytes], str], clock: Callable[[], datetime],
+                 lease_id: str | None = None) -> Mapping[str, Any]:
+    """Sign a 14-day ``seat-root-lease`` (a laptop-presence key). Both parents are made 0700 if absent and stored as
+    their realpaths. The log's own rules judge the rest before anything is signed (:func:`levain.authority._seat_lease_check`)."""
+    from levain.autonomic.confirm import DEFAULT_SSH_KEYGEN
+    from levain.cockpit.consent import utc_stamp
+    from levain.cockpit.keys import _append, _capture, _journal, _now, _signing_authority
+    now = _now(clock)
+    parents = []
+    for p in (lanes_parent, returns_parent):
+        p = Path(os.path.expanduser(str(p)))
+        p.mkdir(mode=0o700, parents=True, exist_ok=True)
+        parents.append(str(Path(os.path.realpath(p))))
+    grant = {"id": lease_id or "sl-" + secrets.token_hex(6), "kind": SEAT_LEASE_KIND, "agent": "claude_code",
+             "lanes_parent": parents[0], "returns_parent": parents[1],
+             "launcher_key_sha256": ensure_launcher_key(key_dir), "expires_at": utc_stamp(now + SEAT_LEASE_MAX)}
+    db = _journal(cockpit_root)
+    _signing_authority(_capture(db, now, DEFAULT_SSH_KEYGEN))
+    new = _append(db, {"op": "create_grant", "grant": grant}, signer_fp=signer_fp, sign=sign, clock=clock,
+                  ssh_keygen=DEFAULT_SSH_KEYGEN)
+    return _thaw(new.policy.grants[grant["id"]])
+
+
+def renew_lease(cockpit_root: Path | str, lease_id: str, *, signer_fp: str, sign: Callable[[bytes], str],
+                clock: Callable[[], datetime]) -> str:
+    """Re-sign a live lease for 14 more days (its terms stay). Returns the new ``expires_at``."""
+    from levain.autonomic.confirm import DEFAULT_SSH_KEYGEN
+    from levain.cockpit.consent import utc_stamp
+    from levain.cockpit.keys import _append, _journal, _now
+    now = _now(clock)
+    op = {"op": "renew", "grant_id": lease_id, "expires_at": utc_stamp(now + SEAT_LEASE_MAX), "signed_at": utc_stamp(now)}
+    _append(_journal(cockpit_root), op, signer_fp=signer_fp, sign=sign, clock=clock, ssh_keygen=DEFAULT_SSH_KEYGEN)
+    return op["expires_at"]
+
+
+# --- the mint ------------------------------------------------------------------------------------------------------
+
+def _git(*args: str, cwd: Path | None = None) -> subprocess.CompletedProcess[str]:
+    env = {"PATH": os.environ.get("PATH", "/usr/bin:/bin"), "HOME": os.environ.get("HOME", ""),
+           "GIT_CONFIG_GLOBAL": "/dev/null", "GIT_CONFIG_NOSYSTEM": "1", "GIT_TERMINAL_PROMPT": "0",
+           "LC_ALL": "C"}
+    return subprocess.run(["git", "-c", "core.hooksPath=/dev/null", *args], cwd=cwd, env=env, text=True,
+                          capture_output=True, timeout=_GIT_TIMEOUT, check=False)
+
+
+def _real_dir(path: str, what: str) -> Path:
+    p = Path(path)
+    st = os.lstat(p) if os.path.lexists(p) else None
+    if st is None or not stat.S_ISDIR(st.st_mode) or Path(os.path.realpath(p)) != p:
+        raise SeatLaunchRefused(f"the lease's {what} {path!r} is not a real directory")
+    return p
+
+
+def _mkdir_exclusive(parent: Path, name: str) -> Path:
+    path = parent / name
+    try:
+        os.mkdir(path, 0o700)
+    except FileExistsError:
+        raise SeatLaunchRefused(f"{str(path)!r} already exists: a mint creates its roots, never adopts one") from None
+    if stat.S_ISLNK(os.lstat(path).st_mode):
+        raise SeatLaunchRefused(f"{str(path)!r} is a link")
+    return path
+
+
+def mint_lane(lease: Mapping[str, Any], lane_key: str, remote_url: str, base_sha: str, *, now: datetime,
+              ) -> tuple[Path, Path, dict[str, Any]]:
+    """Create the lane's two roots under the lease's parents and return ``(clone, return_dir, mint row)``: the clone
+    (``git clone --no-hardlinks`` with no hooks or templates, then a detached checkout of ``base_sha``) at
+    ``<lanes_parent>/<lane_key>`` and an empty RETURN directory at ``<returns_parent>/<lane_key>``, both made here with
+    an exclusive mkdir. The row (before the profile digest, which the caller adds) pins the lease id and incarnation,
+    the clone's ``.git`` (device, inode) and the source. On any failure the roots this call made are removed."""
+    if not _LANE_KEY.fullmatch(lane_key or ""):
+        raise SeatLaunchRefused("the lane key must be 1 to 64 characters of a-z, 0-9, '.', '_', '-', not starting with a symbol")
+    if not _BASE_SHA.fullmatch(base_sha or ""):
+        raise SeatLaunchRefused("the base sha must be a full lowercase hex commit id")
+    if not remote_url or remote_url.startswith("-") or "\0" in remote_url:
+        raise SeatLaunchRefused("the source remote is not a usable url or path")
+    lanes = _real_dir(lease["lanes_parent"], "lanes_parent")
+    returns = _real_dir(lease["returns_parent"], "returns_parent")
+    made: list[Path] = []
+    try:
+        clone = _mkdir_exclusive(lanes, lane_key)
+        made.append(clone)
+        return_dir = _mkdir_exclusive(returns, lane_key)
+        made.append(return_dir)
+        for step in (("clone", "--quiet", "--no-hardlinks", "--no-checkout", "--template=", "--", remote_url, str(clone)),):
+            r = _git(*step)
+            if r.returncode:
+                raise SeatLaunchRefused(f"git clone failed: {r.stderr.strip()[:300]}")
+        r = _git("checkout", "--quiet", "--detach", base_sha, cwd=clone)
+        if r.returncode:
+            raise SeatLaunchRefused(f"base {base_sha[:12]} is not in the source: {r.stderr.strip()[:300]}")
+        gst = os.lstat(clone / ".git")
+        if not stat.S_ISDIR(gst.st_mode):
+            raise SeatLaunchRefused("the clone's .git is not a real directory")
+        row = {"v": 1, "lease_id": lease["id"], "incarnation": lease.get("incarnation", 0), "lane_key": lane_key,
+               "clone": str(clone), "git": [gst.st_dev, gst.st_ino], "return_dir": str(return_dir),
+               "remote": remote_url, "base_sha": base_sha,
+               "at": now.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%fZ")}
+        return clone, return_dir, row
+    except BaseException:
+        for p in reversed(made):
+            shutil.rmtree(p, ignore_errors=True)
+        raise
+
+
+def append_mint(key_dir: Path, row: Mapping[str, Any]) -> dict[str, Any]:
+    """Append ``row`` to the launcher's mint chain: ``prev`` the last row's hash, ``hash`` over the row, ``sig`` the
+    launcher key's ed25519 signature of that hash. Serialised by a lock on the file."""
+    key = _load_key(key_dir)
+    path = key_dir / _MINTS
+    fd = os.open(path, os.O_RDWR | os.O_CREAT | os.O_APPEND | os.O_NOFOLLOW, 0o600)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        with os.fdopen(os.dup(fd), "rb") as fh:
+            lines = [ln for ln in fh.read().splitlines() if ln.strip()]
+        prev = json.loads(lines[-1])["hash"] if lines else ""
+        body = {**row, "prev": prev}
+        digest = hashlib.sha256(_canonical(body).encode()).hexdigest()
+        out = {**body, "hash": digest, "sig": key.sign(bytes.fromhex(digest)).hex()}
+        os.write(fd, (_canonical(out) + "\n").encode())
+        os.fsync(fd)
+        return out
+    finally:
+        os.close(fd)
+
+
+def read_mints(key_dir: Path) -> list[dict[str, Any]]:
+    """Every mint row, with the chain and each signature verified; a broken chain raises ``ValueError``."""
+    key = _load_key(key_dir)
+    pub = key.public_key()
+    path = key_dir / _MINTS
+    if not path.is_file():
+        return []
+    rows, prev = [], ""
+    for ln in path.read_text().splitlines():
+        if not ln.strip():
+            continue
+        row = json.loads(ln)
+        body = {k: v for k, v in row.items() if k not in ("hash", "sig")}
+        digest = hashlib.sha256(_canonical(body).encode()).hexdigest()
+        if body.get("prev") != prev or digest != row.get("hash"):
+            raise ValueError("the mint chain is broken")
+        pub.verify(bytes.fromhex(row["sig"]), bytes.fromhex(digest))
+        rows.append(row)
+        prev = digest
+    return rows
+
+
+# --- the launch (build and validate only) --------------------------------------------------------------------------
+
+class LaunchPlan:
+    """What a validated launch would run: the profile, its digest and the mint row already recorded."""
+
+    def __init__(self, profile: SeatProfile, mint: Mapping[str, Any]) -> None:
+        self.profile, self.mint = profile, mint
+
+    @property
+    def digest(self) -> str:
+        return str(self.mint["profile_digest"])
+
+
+def prepare_launch(lane_key: str, remote_url: str, base_sha: str, *, claude_bin: str, python: str,
+                   cockpit_root: Path | str, install: Path | str, now: datetime | None = None,
+                   **profile_kw: Any) -> LaunchPlan:
+    """Check the lease, mint the roots, build the profile through the one builder and record the mint. Raises
+    :class:`SeatLaunchRefused` (no live lease, a lease whose key is not the launcher's, a mint problem) or
+    :class:`levain.seat_profile.SeatRefusal` (the profile); on either, the roots this call made are removed and no
+    mint row is written. Nothing is executed."""
+    now = now or datetime.now(timezone.utc)
+    state = _replay(cockpit_root)
+    lease = None if state is None else live_lease(state, now)
+    if lease is None:
+        raise SeatLaunchRefused(f"no live seat-root lease: a launch needs one, and never falls back to a prompt. "
+                                f"Sign one: {SIGN_COMMAND}")
+    lanes, returns = Path(lease["lanes_parent"]), Path(lease["returns_parent"])
+    key_dir = key_dir_for(install, (lanes, returns))
+    try:
+        pinned = _pub_sha256(_load_key(key_dir))
+    except FileNotFoundError:
+        raise SeatLaunchRefused("the launcher key is missing: the lease cannot be used; sign a new one") from None
+    if pinned != lease["launcher_key_sha256"]:
+        raise SeatLaunchRefused("the launcher key is not the one the lease pins: sign a new lease")
+    clone, return_dir, row = mint_lane(lease, lane_key, remote_url, base_sha, now=now)
+    try:
+        profile = build_seat_profile(clone, return_dir, claude_bin=claude_bin, python=python, lease=lease,
+                                     key_dir=key_dir, **profile_kw)
+        row = {**row, "profile_digest": profile.digest(), "claude": _binary_ident(claude_bin)}
+        mint = append_mint(key_dir, row)
+    except BaseException:
+        for p in (return_dir, clone):
+            shutil.rmtree(p, ignore_errors=True)
+        raise
+    return LaunchPlan(profile, mint)
+
+
+def _binary_ident(claude_bin: str) -> list[int]:
+    try:
+        st = os.stat(os.path.realpath(claude_bin))
+        return [st.st_dev, st.st_ino, st.st_size, st.st_mtime_ns]
+    except OSError:
+        return []
+
+
+def launch_seat(lane_key: str, remote_url: str, base_sha: str, *, claude_bin: str, python: str,
+                cockpit_root: Path | str, install: Path | str, out=None, err=None, **kw: Any) -> int:
+    """:func:`prepare_launch`, then print the argv and the digest. Never executes ``claude`` (Z1e launches). Returns 0,
+    or 1 with the refusal on ``err``."""
+    out, err = out or sys.stdout, err or sys.stderr
+    try:
+        plan = prepare_launch(lane_key, remote_url, base_sha, claude_bin=claude_bin, python=python,
+                              cockpit_root=cockpit_root, install=install, **kw)
+    except (SeatLaunchRefused, SeatRefusal) as exc:
+        print(f"seat launch refused: {exc}", file=err)
+        return 1
+    print(f"seat launch validated (not started): lane {lane_key}", file=out)
+    print(f"  clone   {plan.profile.clone}\n  return  {plan.profile.return_dir}\n  digest  {plan.digest}", file=out)
+    print("  argv    " + json.dumps(plan.profile.argv()), file=out)
+    return 0
