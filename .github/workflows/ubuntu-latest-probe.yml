@@ -12,6 +12,8 @@ on:
   schedule:
     - cron: "17 6 * * 1"
   workflow_dispatch:
+  push:
+    branches: [seat/1106-50-unpin]   # TEMPORARY: measure 26.04 on the branch before landing; remove this trigger at landing
 
 permissions:
   contents: read
