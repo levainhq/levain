@@ -7,13 +7,16 @@ inside, and a DENY check built on it is skipped. The same holds for a second mou
 
 The helpers here ask the filesystem for its own spelling of a path (``canonical``), compare by that spelling and, failing
 that, by ``(st_dev, st_ino)`` of the path's existing ancestors (``inside``). Stdlib only, Python 3.9 syntax: the Linux
-root-side modules import it, and root runs the system interpreter.
+root-side modules import it, and root runs the system interpreter. The filesystem's own SPELLING is recovered only where
+``fcntl.F_GETPATH`` exists (macOS); everywhere else ``canonical`` keeps the spelling given and only the identity step
+can catch an alias.
 
 Two directions, because a GRANTS site and a DENY site want opposite answers when a stat fails:
 
 * :func:`inside` is True only when sure (a GRANTS caller: "may this path be treated as under the root?").
 * :func:`maybe_inside` is True when :func:`inside` is, or when any stat or resolve error left the question open (a DENY
   caller: "is this path surely or possibly under the protected directory?").
+* :func:`maybe_same` is the DENY answer to "is this the same path": equal canonical spellings, the same file, or unsure.
 """
 from __future__ import annotations
 
@@ -84,7 +87,7 @@ def _canon(path) -> Tuple[Path, bool]:
     unsure = False
     try:
         p = Path(path).resolve()
-    except (OSError, RuntimeError, ValueError):        # a symlink loop, an embedded NUL, a permission error
+    except (OSError, RuntimeError, ValueError, TypeError):   # a symlink loop, an embedded NUL, a permission error, not a path
         unsure = True
         try:
             p = Path(os.path.abspath(os.fspath(path)))
@@ -118,29 +121,40 @@ def canonical(path) -> Path:
 
 def _decide(root, path) -> Tuple[bool, bool]:
     """``(inside, unsure)``. Lexical on the canonical spellings first, then identity: each existing ancestor of ``path``
-    is compared to ``root`` by ``(st_dev, st_ino)`` (``os.path.samestat``, the stat form of ``samefile``)."""
+    is compared to ``root`` by ``(st_dev, st_ino)`` (``os.path.samestat``, the stat form of ``samefile``).
+
+    An unsure side never takes the lexical answer: its spelling is the unresolved one, and a component of it may be a
+    link that leads elsewhere. The identity walk then decides, and a match found ABOVE a component that exists and
+    could not be stat'ed is unsure, not inside (that component is where the path could not be placed)."""
+    try:
+        Path(root), Path(path)
+    except TypeError:                                   # not a path at all (None, an int): nothing can be said of it
+        return False, True
     cr, ur = _canon(root)
     cp, up = _canon(path)
-    if cp == cr or cr in cp.parents:
-        return True, False
     unsure = ur or up
+    if not unsure and (cp == cr or cr in cp.parents):
+        return True, False
     try:
         want = os.stat(cr)
     except OSError as exc:
         # a root that does not exist is identical to nothing; one that exists and cannot be stat'ed is an open question
         return False, unsure or exc.errno not in _ABSENT
+    except (ValueError, TypeError):                     # an embedded NUL: a root that cannot be stat'ed is an open question
+        return False, True
+    unplaced = False                                    # a component below this candidate exists and could not be stat'ed
     for cand in (cp, *cp.parents):
         try:
             st = os.stat(cand)
         except OSError as exc:
             if exc.errno not in _ABSENT:
-                unsure = True
+                unsure = unplaced = True
             continue
-        except ValueError:
-            unsure = True
+        except (ValueError, TypeError):
+            unsure = unplaced = True
             continue
         if os.path.samestat(want, st):
-            return True, False
+            return (False, True) if unplaced else (True, False)
     return False, unsure
 
 
@@ -157,6 +171,15 @@ def maybe_inside(root, path) -> bool:
     under ``root``", the direction for a DENY site that must skip nothing it could not check. Never raises."""
     hit, unsure = _decide(root, path)
     return hit or unsure
+
+
+def maybe_same(a, b) -> bool:
+    """True when ``a`` and ``b`` are surely or possibly one path: their canonical spellings are equal, or :func:`same`
+    says one file, or resolving either one was unsure (a stat or resolve error, a bad argument). The direction for a
+    DENY site ("is this the protected path?") that must refuse what it could not check. Never raises."""
+    ca, ua = _canon(a)
+    cb, ub = _canon(b)
+    return ua or ub or ca == cb or same(a, b)
 
 
 def same(a, b) -> bool:

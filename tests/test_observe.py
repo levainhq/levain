@@ -215,3 +215,37 @@ def test_the_live_claude_dir_is_found_through_an_injected_case_fold(tmp_path, mo
     assert observe._is_live_settings(home / ".CLAUDE" / "settings.json")
     assert not observe.is_live_root(home / "OTHER") and not observe.is_live_root(home / ".CLAUDE" / "sub")
     assert not observe.is_live_root(home) and not observe._is_live_settings(home / "OTHER" / "settings.json")
+
+
+def test_a_case_alias_of_an_absent_live_dir_still_needs_live(tmp_path, monkeypatch, capsys):
+    """L3 casefix r1 F2 (codex): with NO `~/.claude` yet, `~/.CLAUDE` is a distinct absent path to `maybe_inside`, so
+    `observe install --settings-root ~/.CLAUDE` passed both guards and created the live config directory (on a
+    case-insensitive volume `.CLAUDE` is `.claude`). A root whose canonical spelling folds to the live dir's counts
+    as live; on a case-sensitive volume that over-refuses `~/.CLAUDE`, which only demands `--live`."""
+    home = tmp_path.resolve() / "home"
+    home.mkdir()
+    (home / "other").mkdir()
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setattr(observe, "_can_import", lambda py: True)
+    assert observe.is_live_root(home / ".CLAUDE") and observe.is_live_root(home / ".claude")
+    assert observe._is_live_settings(home / ".CLAUDE" / "settings.json")
+    assert not observe.is_live_root(home / ".CLAUDE" / "sub") and not observe.is_live_root(home / "other")
+    assert not observe._is_live_settings(home / "other" / "settings.json")
+    assert cli.main(["observe", "install", "--settings-root", str(home / ".CLAUDE")]) == 2
+    assert "live ~/.claude" in capsys.readouterr().err
+    assert sorted(p.name for p in home.iterdir()) == ["other"]                  # nothing created
+
+
+def test_an_unreadable_settings_file_counts_as_live(tmp_path, monkeypatch):
+    """L3 casefix r1 F2 (gemini): `canonical` swallows its failures, so `_is_live_settings`'s "cannot tell: treat as
+    live" except was dead and a settings file whose spelling could not be read compared unequal and passed."""
+    from tests.test_pathid import _unknowable
+    home = tmp_path.resolve() / "home"
+    (home / ".claude").mkdir(parents=True)
+    elsewhere = tmp_path.resolve() / "elsewhere"
+    elsewhere.mkdir()
+    (elsewhere / "settings.json").write_text("{}")
+    monkeypatch.setenv("HOME", str(home))
+    _unknowable(monkeypatch, elsewhere / "settings.json")
+    assert observe._is_live_settings(elsewhere / "settings.json")
+    assert not observe._is_live_settings(elsewhere / "other.json")             # a readable file elsewhere: not live

@@ -249,22 +249,28 @@ def is_live_root(root: Path) -> bool:
     """``root`` IS the live ~/.claude (not below it, not above it), by identity and not by spelling: on a case-insensitive
     volume ``/USERS/me/.CLAUDE`` is the same directory and ``Path.resolve()`` keeps the case it is given (casesweep row 13,
     key 1106-1). DENY direction (this refuses a write): ``pathid.maybe_inside`` both ways is "the same directory", and a
-    question the filesystem would not answer counts as live."""
+    question the filesystem would not answer counts as live. Identity cannot answer while ``~/.claude`` does not exist
+    yet (two absent paths are two paths), so a canonical spelling that equals the live one with case folded is live too
+    (L3 casefix r1 F2): on a case-sensitive volume that over-refuses a ``~/.CLAUDE``, which only demands ``--live``."""
     from levain import pathid       # a function-local import: the hook entry point (``-m levain.observe hook``) never needs it
     try:
         live, given = Path.home() / ".claude", Path(root).expanduser()
     except (OSError, RuntimeError):
         return False
-    return pathid.maybe_inside(live, given) and pathid.maybe_inside(given, live)
+    if pathid.maybe_inside(live, given) and pathid.maybe_inside(given, live):
+        return True
+    return str(pathid.canonical(given)).casefold() == str(pathid.canonical(live)).casefold()
 
 
 def _is_live_settings(path: Path) -> bool:
-    """The settings file the root names resolves into the live ~/.claude (through any symlink chain, in any letter case)."""
+    """The settings file the root names resolves into the live ~/.claude (through any symlink chain, in any letter case).
+    DENY direction: ``pathid.maybe_same`` (equal, the same file, or a resolution that was unsure), or the file's
+    directory is the live root (:func:`is_live_root`). ``canonical`` swallows its own failures, so the except below
+    sees only a home that cannot be found."""
     from levain import pathid
     try:
         live = Path.home() / ".claude"
-        got = pathid.canonical(path)
-        return got == pathid.canonical(live / "settings.json") or is_live_root(got.parent)
+        return pathid.maybe_same(path, live / "settings.json") or is_live_root(pathid.canonical(path).parent)
     except (OSError, RuntimeError):
         return True  # cannot tell: treat as live
 

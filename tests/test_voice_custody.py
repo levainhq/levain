@@ -884,3 +884,23 @@ def test_the_real_security_guard_with_an_injected_case_fold(tmp_path, monkeypatc
             custody.checked_security(spelled)
     assert custody.checked_security(str(other)) == str(other)
     assert custody.checked_security(str(real.parent.with_name("BIN") / "OTHER")) == str(real.parent.with_name("BIN") / "OTHER")
+
+
+def test_an_unreadable_spelling_of_the_real_security_binary_refuses(tmp_path, monkeypatch):
+    """L3 casefix r1 F1: `pathid.canonical` swallows its failures, so the old `except` was dead and a spelling of the
+    real binary that could not be read (EACCES, a descriptor limit) compared unequal and passed. The guard now refuses
+    on `pathid.maybe_same` (equal, the same file, or unsure)."""
+    from tests.test_pathid import _case_insensitive_spelling, _unknowable
+    real = tmp_path.resolve() / "bin" / "security"
+    real.parent.mkdir()
+    real.write_text("#!/bin/sh\n")
+    other = tmp_path.resolve() / "bin" / "other"
+    other.write_text("#!/bin/sh\n")
+    alias = real.parent.with_name("BIN") / "SECURITY"
+    monkeypatch.setattr(custody, "_REAL_SECURITY", str(real))
+    _unknowable(monkeypatch, alias, spelling=_case_insensitive_spelling)
+    with pytest.raises(VoiceKeyRefused, match="real `security`"):
+        custody.checked_security(str(alias))
+    with pytest.raises(VoiceKeyRefused, match="real `security`"):
+        custody.checked_security(str(real))
+    assert custody.checked_security(str(other)) == str(other)                 # a readable stand-in still passes
