@@ -4873,11 +4873,9 @@ def _check_seat_profile(*, claude_bin: str | None = None, python: str | None = N
     if claude is None:
         return [CheckResult("seat profile", True, "no claude binary found; the terminal seat profile was not built",
                             neutral=True)]
-    prefix = sp._canary_prefix(os.environ)
     base: Path | None = None
     try:
-        prefix.mkdir(mode=0o700, parents=True, exist_ok=True)
-        base = Path(tempfile.mkdtemp(dir=prefix))
+        base = Path(tempfile.mkdtemp(dir=sp.ensure_canary_prefix(os.environ)))
         (base / "lane" / ".git").mkdir(parents=True)
         (base / "ret").mkdir()
         (base / "keys").mkdir()

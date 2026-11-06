@@ -3630,7 +3630,10 @@ def _add_seat_parser(subparsers: argparse._SubParsersAction, common: object) -> 
     launch.add_argument("--claude", default=None, help="The claude binary (default: the one on PATH).")
     launch.add_argument("--python", default=None, help="The python that runs the seat's hooks (default: this one).")
     common(launch)
-    canary = sub.add_parser("canary", help="The seat canary (needs the Z1c arm in this tree); arguments pass through.")
+    # no prefix chars: every token after `canary` (its own --claude-bin, -h ...) passes through to seat_canary.main;
+    # with the default ones argparse lifts a leading --flag out of REMAINDER and refuses it (L3 z1 r1, gemini 4)
+    canary = sub.add_parser("canary", help="The seat canary; arguments pass through (`levain seat canary -h`).",
+                            add_help=False, prefix_chars="\0")
     canary.add_argument("canary_args", nargs=argparse.REMAINDER)
     seat_p.set_defaults(func=_cmd_seat)
 
@@ -3639,11 +3642,7 @@ def _cmd_seat(args: argparse.Namespace) -> int:
     import shutil
 
     if args.seat_cmd == "canary":
-        try:
-            from levain.seat_canary import main as canary_main
-        except ImportError:
-            print("seat canary: not built in this tree", file=sys.stderr)
-            return 1
+        from levain.seat_canary import main as canary_main
         return canary_main(args.canary_args)
     from levain import seat_lease
     from levain.cockpit.keys import ssh_signer

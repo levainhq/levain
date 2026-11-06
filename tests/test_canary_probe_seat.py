@@ -109,6 +109,37 @@ def test_flipper_counts_flips_and_survives_a_landed_file(tmp_path):
     link.mkdir()
     (link / "s0.json").write_text("x")   # a write that landed in the real directory
     assert cp.seat_flip(str(link), str(link), str(decoy), 0.3, str(counter)) == 0
-    assert int(counter.read_text()) > 2
+    count, end = counter.read_text().split()
+    assert int(count) > 2 and end == "timeout"
     assert (link.is_symlink() and os.readlink(link) == str(decoy)) or link.is_dir()
     assert not decoy.joinpath("s0.json").exists()   # the flipper never writes into the decoy
+
+
+def test_the_flipper_stops_on_the_seats_stop_file_and_says_so(tmp_path):
+    import threading
+    link, decoy, counter = tmp_path / "swap", tmp_path / "decoy", tmp_path / "flips.txt"
+    decoy.mkdir()
+    link.mkdir()
+    t = threading.Thread(target=cp.seat_flip, args=(str(link), str(link), str(decoy), 30.0, str(counter)))
+    t.start()
+    assert cp.seat_flip_stop(str(counter)) == 0                       # bounded wait for the final line
+    t.join(5)
+    assert not t.is_alive()
+    count, end = counter.read_text().split()
+    assert end == "stop" and int(count) >= 0
+
+
+def test_the_flipper_ends_when_its_directory_is_gone(tmp_path):
+    parent = tmp_path / "lane"
+    parent.mkdir()
+    link, decoy, counter = parent / "swap", tmp_path / "decoy", tmp_path / "flips.txt"
+    decoy.mkdir()
+    link.mkdir()
+    import threading
+    import time
+    t = threading.Thread(target=cp.seat_flip, args=(str(link), str(link), str(decoy), 30.0, str(counter)))
+    t.start()
+    time.sleep(0.2)
+    os.rename(parent, tmp_path / "moved")                            # atomic: the race cannot refill it
+    t.join(5)
+    assert not t.is_alive() and counter.read_text().split()[1] == "gone"

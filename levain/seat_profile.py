@@ -1,7 +1,7 @@
 """The terminal seat profile builder (PATHZERO Z1b): everything one terminal Claude Code seat is launched with.
 
-A terminal seat works in ONE lane clone plus its RETURN directory. The sandbox bounds Bash at the syscall; the four
-file tools are confined by ``permissions.deny`` on every protected name; the seat loads no settings, hooks or MCP
+A terminal seat works in ONE lane clone plus its RETURN directory. The sandbox bounds Bash at the syscall; the file
+tools are confined to those two roots by ``--restricted`` and kept off every protected name by ``permissions.deny``; the seat loads no settings, hooks or MCP
 from its roots (the source list, :data:`levain.host_guard.SEAT_SOURCE_ARGS`), so a write that slips the deny lands
 in a file nothing reads. The D9 ruling about the file tools lives with ``CC_SEAT_TOOLS`` in ``levain.host_guard``
 and is not restated here. ``levain.coordinator.launch`` keeps its own ``project,local`` layers for the coordinator;
@@ -30,7 +30,8 @@ __all__ = ["SeatRefusal", "SeatProfile", "seat_deny_write", "seat_permission_den
            "CANARY_DIRNAME", "FILE_TOOLS", "SEAT_LEASE_KIND"]
 
 CANARY_DIRNAME = "levain-seat-canary"
-#: All four file tools are named in every deny, so a later re-admission inherits it.
+#: All four file tools are named in every deny, so a later re-admission inherits it. Measured 11-06 on 2.1.319: an
+#: ``Edit(...)`` rule refuses the Write tool and a ``Write(...)`` rule alone did NOT, so the Edit rules carry the deny.
 FILE_TOOLS = ("Edit", "Write", "MultiEdit", "NotebookEdit")
 _GIT_DENY = ("hooks", "config", "info", "modules", "worktrees")
 _WALK_CAP = 200_000
@@ -94,7 +95,12 @@ class SeatProfile:
         argv = [self.claude_bin]
         if headless:
             argv += ["-p", "--output-format", "stream-json", "--verbose", "--include-hook-events"]
-        argv += [*SEAT_SOURCE_ARGS,
+        # --restricted (L3 z1 r1, codex 2), measured headless on 2.1.319 (1106-16/z1/L3_z1_r1_triage.md): without it a
+        # Write outside the working directories came back "requested permissions ... you haven't granted it yet" (a
+        # prompt a person could approve); with it, "is outside <cwd>, <RETURN>; --restricted confines the file tools
+        # to the working directory" (a refusal). additionalDirectories from --settings counted as a working directory,
+        # Bash named in --tools stayed, and the --settings hooks fired. The interactive start is not yet measured.
+        argv += [*SEAT_SOURCE_ARGS, "--restricted",
                  "--permission-mode", "acceptEdits",
                  "--tools", ",".join(self.tools),
                  "--strict-mcp-config", "--mcp-config", json.dumps(self.mcp_config, sort_keys=True),
@@ -118,6 +124,20 @@ class SeatProfile:
 
 def _canary_prefix(environ: Mapping[str, str]) -> Path:
     return _real(environ.get("TMPDIR") or tempfile.gettempdir()) / CANARY_DIRNAME
+
+
+def ensure_canary_prefix(environ: Mapping[str, str]) -> Path:
+    """The canary prefix, made 0700 if absent, and refused unless it is a real directory of this user that nobody
+    else can write: on a shared ``/tmp`` another user could make it first and swap a canary root inside it."""
+    prefix = _canary_prefix(environ)
+    try:
+        prefix.mkdir(mode=0o700, exist_ok=True)
+    except OSError as exc:
+        raise SeatRefusal(f"the canary prefix {str(prefix)!r} cannot be made ({exc.strerror})") from None
+    st = os.lstat(prefix)
+    if not os.path.isdir(prefix) or os.path.islink(prefix) or st.st_uid != os.getuid() or st.st_mode & 0o077:
+        raise SeatRefusal(f"the canary prefix {str(prefix)!r} is not a private directory of this user")
+    return prefix
 
 
 def _contains_agent_config(root: Path, *, git_dir_ok: bool) -> list[str]:

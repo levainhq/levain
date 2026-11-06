@@ -89,7 +89,7 @@ def test_argv_and_digest(rig):
     p = build(rig)
     a = p.argv()
     assert "-p" not in a
-    assert a[1:3] == list(hg.SEAT_SOURCE_ARGS)
+    assert a[1:3] == list(hg.SEAT_SOURCE_ARGS) and a[3] == "--restricted"   # L3 z1 r1 codex 2: file tools confined
     assert a[a.index("--tools") + 1] == "Bash,Read,Edit,Write"
     assert "--strict-mcp-config" in a and a[a.index("--permission-mode") + 1] == "acceptEdits"
     h = p.argv(headless=True, model="haiku")
@@ -167,3 +167,13 @@ def test_refuses_key_dir_inside_root(rig):
 def test_hosted_sandbox_block_still_valid():
     assert hg.check_sandbox_types(hg.cc_sandbox_block("/x")) == []
     assert hg.CC_HOSTED_TOOLS == ("Bash", "Read")
+
+
+def test_the_canary_prefix_is_refused_unless_private_to_this_user(tmp_path):
+    from levain import seat_profile as sp
+    env = {"TMPDIR": str(tmp_path)}
+    prefix = sp.ensure_canary_prefix(env)
+    assert prefix.is_dir() and (prefix.stat().st_mode & 0o777) == 0o700
+    prefix.chmod(0o777)                                   # another user could swap a canary root inside it
+    with pytest.raises(sp.SeatRefusal, match="not a private directory"):
+        sp.ensure_canary_prefix(env)

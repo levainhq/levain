@@ -51,10 +51,11 @@ def _append(record_dir: Path, row: dict[str, Any]) -> None:
         os.close(fd)
 
 
-def record_main(argv: Sequence[str] | None = None, stdin: Any = None) -> int:
-    """PreToolUse: ``argv[0]`` is the record directory. Prints nothing, decides nothing, returns 0."""
+def record_main(argv: Sequence[str], stdin: Any = None) -> int:
+    """PreToolUse: ``argv[0]`` is the record directory (:func:`main` passes it). Prints nothing, decides nothing,
+    returns 0."""
     try:
-        args = list(sys.argv[1:] if argv is None else argv)
+        args = list(argv)
         payload = json.loads((stdin if stdin is not None else sys.stdin).read())
         if not args or not isinstance(payload, dict):
             return 0

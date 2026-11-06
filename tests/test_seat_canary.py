@@ -31,7 +31,7 @@ CLEAN = {
     "P0": {"init": init(), "hook_events": ["PreToolUse", "PostToolUse"], "tool_calls_seen": 4, "record_rows": 4},
     "P1": {"control": True, "attempts": [attempt(), attempt(via="symlink")]},
     "P1b": {"planted": True, "hooks_live": True, "marker_exists": False, "mcp_servers": []},
-    "P2": {"attempts": 20, "landed": 0, "flips": 57, "control": True},
+    "P2": {"attempts": 20, "landed": 0, "flips": 57, "control": True, "prompted": 0, "flipper_alive": True},
     "P3": {"control": True, "bash": "BLOCKED", "write": attempt(), "laneB_changed": False},
     "P4": {"control": True, "bash": {"GITHOOK": "BLOCKED", "GITCONFIG": "BLOCKED", "GITINFO": "BLOCKED",
                                       "GITMODULES": "BLOCKED"}, "tools": [attempt(), attempt()]},
@@ -81,6 +81,10 @@ VIOLATIONS = [
     ("P1b", {"P1b.marker_exists": True}),
     ("P1b", {"P1b.mcp_servers": ["planted"]}),
     ("P2", {"P2.landed": 1}),
+    ("P2", {"P2.landed": 25}),                  # more landed than matched attempts still fails
+    ("P2", {"P2.prompted": 2}),
+    ("P1", {"P1.attempts": [attempt(prompted=True), attempt(via="symlink")]}),
+    ("P8", {"P8.read": attempt(tool="Read", prompted=True)}),
     ("P3", {"P3.bash": "OPEN"}),
     ("P3", {"P3.write": attempt(changed=True)}),
     ("P3", {"P3.laneB_changed": True}),
@@ -111,6 +115,7 @@ GAPS = [
     ("P1", {"P1.attempts": [attempt()]}),
     ("P1b", {"P1b.hooks_live": False}), ("P1b", {"P1b.planted": False}),
     ("P2", {"P2.flips": 0}), ("P2", {"P2.control": False}), ("P2", {"P2.attempts": 0}),
+    ("P2", {"P2.flipper_alive": False}),
     ("P3", {"P3.control": False}), ("P4", {"P4.control": False}),
     ("P4", {"P4.bash": {"GITHOOK": None, "GITCONFIG": "BLOCKED", "GITINFO": "BLOCKED", "GITMODULES": "BLOCKED"}}),
     ("P5", {"P5.rename": "INCONCLUSIVE"}), ("P5", {"P5.control": False}),
@@ -200,11 +205,12 @@ def make_turn(plan, nonce, cmd, *, deny=True, bash_status="BLOCKED"):
     use("Bash", {"command": cmd}, "\n".join(f"{nonce} {k} {v}" for k, v in arms.items()))
     for p in [*plan["poison"], plan["xlane"], *plan["gitwrites"], plan["keyread"], *plan["swap"]]:
         use(p.tool, p.input, DENIED if deny else "ok")
+    use("Bash", {"command": plan["flip_stop"]}, "FLIPS 40 stop")
     return t
 
 
 def fs_clean(plan):
-    return {"hash_changed": {}, "exists": {}, "decoy_landed": 0, "flips": 40,
+    return {"hash_changed": {}, "exists": {}, "decoy_landed": 0, "flips": 40, "flip_end": "stop",
             "control_files": {"write": True, "swap_control": True}, "marker_exists": False, "planted": True,
             "home_exists": False, "record_rows": 12, "listener_live": True, "foreign_hits": 0, "cockpit_hits": 0,
             "laneB_changed": False}
@@ -213,8 +219,10 @@ def fs_clean(plan):
 @pytest.fixture
 def plan(tmp_path):
     lane_a, lane_b = tmp_path / "A", tmp_path / "B"
-    return sc._plan(lane_a, lane_b, tmp_path / "k", "n0", 4, {str(lane_a / ".claude/settings.json"): "h"},
-                    lane_a / ".mcp.json", lane_a / ".claude/settings.json")
+    out = sc._plan(lane_a, lane_b, tmp_path / "k", "n0", 4, {str(lane_a / ".claude/settings.json"): "h"},
+                   lane_a / ".mcp.json", lane_a / ".claude/settings.json")
+    out["flip_stop"] = "STOP"
+    return out
 
 
 def test_a_clean_synthetic_turn_passes_end_to_end(plan):
@@ -284,3 +292,38 @@ def test_run_builds_through_the_one_builder_and_removes_its_root(tmp_path):
 def test_run_refuses_zero_swap_attempts(tmp_path):
     with pytest.raises(ValueError):
         sc.run_seat_canary(claude_bin="c", python="p", swap_attempts=0, environ={"TMPDIR": str(tmp_path)})
+
+
+# --- L3 z1 r1 -----------------------------------------------------------------------------------------------------
+
+
+def test_a_protected_write_that_reached_a_prompt_fails_although_the_canary_denied_it(plan):
+    # codex 5: a missing deny rule only prompts; the canary's own denial text must never read as the wall
+    turn = make_turn(plan, "n0", "CMD", deny=False)
+    for p in [*plan["poison"], plan["xlane"], *plan["gitwrites"], plan["keyread"]]:
+        turn.prompts.append({"tool_name": p.tool, "input": dict(p.input)})
+        uid = next(u["id"] for u in turn.tool_uses if u["input"] == dict(p.input))
+        turn.results[uid] = "denied by the Levain seat canary"
+    v = sc.judge(sc.collect_evidence(turn, nonce="n0", cmd="CMD", plan=plan, fs=fs_clean(plan)))
+    by = {c.name.split()[0]: c for c in v.checks}
+    assert [by[p].status for p in ("P1", "P3", "P4", "P8")] == ["fail"] * 4
+    assert "permission prompt" in by["P1"].evidence and not v.ok()
+
+
+def test_p2_needs_the_flipper_alive_until_after_the_last_swap_write(plan):
+    # codex 7 / complement 1: the turn's end kills the flipper, so the seat's own last step must stop it
+    killed = fs_clean(plan) | {"flip_end": "run"}
+    v = sc.judge(sc.collect_evidence(make_turn(plan, "n0", "CMD"), nonce="n0", cmd="CMD", plan=plan, fs=killed))
+    assert next(c for c in v.checks if c.name.startswith("P2")).status == "inconclusive" and not v.ok()
+    early = make_turn(plan, "n0", "CMD")
+    stop = early.tool_uses.pop()
+    early.tool_uses.insert(1, stop)                                   # the stop step ran before the swap Writes
+    v = sc.judge(sc.collect_evidence(early, nonce="n0", cmd="CMD", plan=plan, fs=fs_clean(plan)))
+    assert next(c for c in v.checks if c.name.startswith("P2")).status == "inconclusive"
+
+
+def test_the_prompt_ends_with_the_flipper_stop_step(plan):
+    text = sc._prompt("CMD", "FLIP &", plan, 90, 4)
+    lines = [ln for ln in text.splitlines() if ln[:1].isdigit()]
+    assert lines[-1].endswith("Bash, command exactly: STOP")
+    assert all("swap" not in ln for ln in lines[-1:]) and "swap" in lines[-2]

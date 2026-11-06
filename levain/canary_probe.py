@@ -284,12 +284,39 @@ def run_seat(cfg: dict, out=print) -> list[tuple[str, str]]:
     return seen
 
 
+FLIP_ENDS = ("stop", "timeout", "gone")
+_FLIP_CHECK = 256
+
+
+def _put(path: str, text: str) -> bool:
+    tmp = f"{path}.tmp"
+    try:
+        with open(tmp, "w", encoding="ascii") as fh:
+            fh.write(text)
+        os.replace(tmp, path)
+        return True
+    except OSError:
+        return False
+
+
 def seat_flip(link: str, real_dir: str, decoy: str, seconds: float, counter: str) -> int:
-    """The P2 flipper: swap ``link`` between a real directory (``real_dir``) and a symlink to ``decoy`` for
-    ``seconds``, writing the flip count to ``counter`` when it ends. It never touches anything but those names."""
+    """The P2 flipper: swap ``link`` between a real directory (``real_dir``) and a symlink to ``decoy``. It never
+    touches anything but those names and ``counter`` (plus its ``.tmp``). Every few hundred loops it rewrites
+    ``counter`` as ``<flips> run``; it ends when ``<counter>.stop`` appears (``<flips> stop``: it was alive until the
+    seat's last step made that file), when ``link``'s directory is gone (``gone``) or after ``seconds`` (``timeout``)."""
     import time
-    end, flips = time.monotonic() + seconds, 0
+    end, flips, loops, reason = time.monotonic() + seconds, 0, 0, "timeout"
+    stop, parent = counter + ".stop", os.path.dirname(link)
     while time.monotonic() < end:
+        loops += 1
+        if loops % _FLIP_CHECK == 0:
+            if os.path.exists(stop):
+                reason = "stop"
+                break
+            if not os.path.isdir(parent):
+                reason = "gone"
+                break
+            _put(counter, f"{flips} run")
         try:
             if os.path.islink(link):
                 os.unlink(link)
@@ -302,12 +329,26 @@ def seat_flip(link: str, real_dir: str, decoy: str, seconds: float, counter: str
             flips += 1
         except OSError:
             pass
-    try:
-        with open(counter, "w", encoding="ascii") as fh:
-            fh.write(str(flips))
-    except OSError:
-        return 1
-    return 0
+    return 0 if _put(counter, f"{flips} {reason}") else 1
+
+
+def seat_flip_stop(counter: str, wait: float = 10.0) -> int:
+    """The seat's last P2 step: make ``<counter>.stop`` and wait (bounded) for the flipper's final count, printed."""
+    import time
+    open(counter + ".stop", "w").close()
+    end = time.monotonic() + wait
+    while time.monotonic() < end:
+        try:
+            with open(counter, encoding="ascii") as fh:
+                text = fh.read().strip()
+        except OSError:
+            text = ""
+        if text.split()[-1:] and text.split()[-1] in FLIP_ENDS:
+            print(f"FLIPS {text}")
+            return 0
+        time.sleep(0.05)
+    print("FLIPS none: the flipper never answered the stop")
+    return 1
 
 
 def seat_main(argv: list[str]) -> int:
@@ -318,13 +359,16 @@ def seat_main(argv: list[str]) -> int:
         return 0
     if argv and argv[0] == "seat-flip" and len(argv) == 6:
         return seat_flip(argv[1], argv[2], argv[3], float(argv[4]), argv[5])
-    print("usage: canary_probe.py seat <config.json> | seat-flip <link> <real_dir> <decoy> <seconds> <counter>")
+    if argv and argv[0] == "seat-flip-stop" and len(argv) == 2:
+        return seat_flip_stop(argv[1])
+    print("usage: canary_probe.py seat <config.json> | seat-flip <link> <real_dir> <decoy> <seconds> <counter> | "
+          "seat-flip-stop <counter>")
     return 2
 
 
 def main(argv: list[str] | None = None) -> int:
     args = sys.argv[1:] if argv is None else argv
-    if args and args[0] in ("seat", "seat-flip"):
+    if args and args[0] in ("seat", "seat-flip", "seat-flip-stop"):
         return seat_main(args)
     p = argparse.ArgumentParser(prog="canary_probe")
     p.add_argument("--nonce", required=True)

@@ -171,3 +171,108 @@ def test_the_lease_kind_has_one_definition_authority_owns():
     import levain.seat_profile as seat_profile
     assert seat_profile.SEAT_LEASE_KIND is authority.SEAT_LEASE_KIND
     assert seat_lease.SEAT_LEASE_KIND is authority.SEAT_LEASE_KIND
+
+
+# --- L3 z1 r1 fixes ------------------------------------------------------------------------------------------------
+
+class _Ticking:
+    """A real clock's shape: every read is a microsecond later than the last (codex 4: a renew read it twice)."""
+
+    def __init__(self, world):
+        self.world = world
+
+    def __call__(self):
+        self.world.clock.now += timedelta(microseconds=1)
+        return self.world.clock.now
+
+
+def test_a_renew_on_a_clock_that_moves_between_reads_signs_and_extends(rig):
+    lease = rig.sign_lease()
+    rig.world.clock.now += timedelta(days=1)
+    fp, sign = rig.world.keys["laptop"]
+    expires = sl.renew_lease(rig.world.root, lease["id"], signer_fp=fp, sign=sign, clock=_Ticking(rig.world))
+    state = sl._replay(rig.world.root)
+    assert state.policy.grants[lease["id"]]["expires_at"] == expires
+
+
+def test_a_renew_of_a_lapsed_lease_is_refused_so_two_never_go_live(rig):
+    from levain.cockpit.keys import KeyError_
+    first = rig.sign_lease()
+    rig.world.clock.now += timedelta(days=15)
+    rig.sign_lease()                                                   # the second, after the first lapsed
+    fp, sign = rig.world.keys["laptop"]
+    with pytest.raises(KeyError_, match="never renewed"):
+        sl.renew_lease(rig.world.root, first["id"], signer_fp=fp, sign=sign, clock=rig.world.clock)
+
+
+def test_an_empty_launcher_key_is_a_refusal_not_a_traceback(rig):
+    (rig.key_dir / "launcher.ed25519").write_bytes(b"")
+    os.chmod(rig.key_dir / "launcher.ed25519", 0o600)
+    with pytest.raises(sl.SeatLaunchRefused, match="launcher key"):
+        sl.ensure_launcher_key(rig.key_dir)
+
+
+def test_the_launcher_key_is_never_visible_half_written(rig, monkeypatch):
+    seen = []
+    real_link = os.link
+    monkeypatch.setattr(os, "link", lambda a, b, **k: (seen.append(os.path.exists(b)), real_link(a, b, **k))[1])
+    sl.ensure_launcher_key(rig.key_dir)
+    assert seen == [False]                                             # published whole by one link
+    assert [p.name for p in rig.key_dir.iterdir()] == ["launcher.ed25519"]
+
+
+def test_a_torn_mint_chain_refuses_the_launch_and_a_failed_append_leaves_no_partial_row(rig, monkeypatch):
+    rig.sign_lease()
+    rig.launch("lane-a")
+    path = rig.key_dir / "mints.jsonl"
+    good = path.read_bytes()
+    path.write_bytes(good + b'{"v": 1, "torn')
+    with pytest.raises(sl.SeatLaunchRefused, match="mint chain"):
+        rig.launch("lane-b")
+    assert not (rig.lanes / "lane-b").exists()
+    path.write_bytes(good)
+    real_fsync = os.fsync
+    monkeypatch.setattr(os, "fsync", lambda fd: (_ for _ in ()).throw(OSError(28, "No space left on device")))
+    with pytest.raises(OSError):
+        rig.launch("lane-c")
+    monkeypatch.setattr(os, "fsync", real_fsync)
+    assert path.read_bytes() == good and not (rig.lanes / "lane-c").exists()
+
+
+def test_a_lease_revoked_while_the_clone_runs_rolls_the_roots_back(rig, monkeypatch):
+    from levain.consent.grants import revoke_grant
+    lease = rig.sign_lease()
+    real_mint = sl.mint_lane
+
+    def slow_mint(*a, **k):
+        out = real_mint(*a, **k)
+        fp, sign = rig.world.keys["laptop"]
+        rig.world.clock.now += timedelta(minutes=1)
+        revoke_grant(rig.world.root, lease["id"], signer_fp=fp, sign=sign, clock=rig.world.clock)
+        return out
+    monkeypatch.setattr(sl, "mint_lane", slow_mint)
+    with pytest.raises(sl.SeatLaunchRefused, match="no longer live"):
+        rig.launch("lane-a", now=rig.world.clock.now + timedelta(minutes=1))
+    assert list(rig.lanes.iterdir()) == [] and list(rig.returns.iterdir()) == []
+    assert sl.read_mints(rig.key_dir) == []
+
+
+def test_a_parent_others_can_write_refuses_the_mint(rig):
+    rig.sign_lease()
+    rig.lanes.chmod(0o777)
+    try:
+        with pytest.raises(sl.SeatLaunchRefused, match="others can write"):
+            rig.launch("lane-a")
+    finally:
+        rig.lanes.chmod(0o700)
+    assert list(rig.lanes.iterdir()) == []
+
+
+def test_levain_seat_canary_passes_its_own_flags_through(monkeypatch):
+    import levain.seat_canary as sc
+    from levain import cli
+    seen = []
+    monkeypatch.setattr(sc, "main", lambda argv: seen.append(list(argv)) or 0)
+    assert cli.main(["seat", "canary", "--claude-bin", "/x/claude", "--swap-attempts", "3"]) == 0
+    assert cli.main(["seat", "canary", "-h"]) == 0
+    assert seen == [["--claude-bin", "/x/claude", "--swap-attempts", "3"], ["-h"]]
