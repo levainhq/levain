@@ -1072,30 +1072,26 @@
     buildRoom(main);
   }
 
-  // The room's zone (room_view.js over GET /cockpit/room.json and POST /cockpit/room/*), mounted under the same rule as the
-  // threads: only on the Build tab, only on a visible page, only with a write token. A server with no room answers its
-  // read an empty room and the page says so; a server that mounts no room routes answers 404 and the view says it could not read.
+  // The Room tab (1106-51; Phill, signed row 273: "full-tab Room"): the room owns the whole tab. body.rv-on (dashboard.css) hides
+  // the rest of the page but the app's own header and views strip; the Room mounts (room_view.js over GET /cockpit/room.json and POST
+  // /cockpit/room/*) only while that is on, on a visible page, with a write token. Any other views tab or mode tab leaves the Room.
+  // A server with no room answers its read an empty room and the page says so; a server that mounts no room routes answers 404 and
+  // the view says it could not read.
   function buildRoom(main) {
     if (!window.LevainRoomView) return;
-    roomSection = el("section", "ck-zone th-zone rv-zone");
+    roomSection = el("section", "rv-zone");
     roomSection.dataset.zone = "room";
-    roomSection.dataset.modes = "build";
     roomSection.hidden = true;
-    const head = el("div", "zone-head");
-    head.appendChild(el("div", "zone-title", "Room"));
-    head.appendChild(el("span", "zone-gloss", "one conversation with Claude, kept by this server"));
-    roomSection.appendChild(head);
-    const grid = el("div", "ck-zgrid th-grid");
-    const panel = el("div", "panel k-list th-panel");
-    panel.dataset.modes = "build";
-    const ph = el("div", "phead");
-    ph.appendChild(el("h2", null, "The room"));
-    panel.appendChild(ph);
-    roomHost = el("div", "pbody rv-body-host");
-    panel.appendChild(roomHost);
-    grid.appendChild(panel);
-    roomSection.appendChild(grid);
-    if (main) main.appendChild(roomSection); else document.body.appendChild(roomSection);
+    roomHost = el("div", "rv-body-host");
+    roomSection.appendChild(roomHost);
+    if (main && main.parentNode) main.parentNode.insertBefore(roomSection, main.nextSibling); else document.body.appendChild(roomSection);
+  }
+  function roomOn() { return document.body.classList.contains("rv-on"); }
+  function setRoom(on) {
+    if (on === roomOn()) return;
+    document.body.classList.toggle("rv-on", on);
+    document.querySelectorAll('[data-phone-jump="room"]').forEach((b) => { if (on) b.setAttribute("aria-current", "page"); else b.removeAttribute("aria-current"); });
+    sync();
   }
 
   function sync() {
@@ -1110,12 +1106,13 @@
       view = null;
     }
     if (roomSection) {
-      roomSection.hidden = !token();
-      if (want && !roomView) {
+      const wantRoom = !!token() && roomOn() && document.visibilityState !== "hidden";
+      roomSection.hidden = !roomOn();
+      if (wantRoom && !roomView) {
         roomHost.replaceChildren();
         const T = window.LevainCockpitTransport;
         roomView = window.LevainRoomView.mount(roomHost, { headers: () => (T ? T.headers() : {}), probe: false });
-      } else if (!want && roomView) {
+      } else if (!wantRoom && roomView) {
         roomView.stop();
         roomView = null;
       }
@@ -1125,7 +1122,18 @@
   function start() {
     if (!window.LevainThreadView || !document.querySelector("main.frame")) return;
     build();
-    new MutationObserver(sync).observe(document.body, { attributes: true, attributeFilter: ["data-mode"] });
+    let lastMode = document.body.dataset.mode;
+    new MutationObserver(() => { if (document.body.dataset.mode !== lastMode) { lastMode = document.body.dataset.mode; setRoom(false); } sync(); }).observe(document.body, { attributes: true, attributeFilter: ["data-mode"] });
+    // the Room tab enters the Room (captured, so the page's own jump never also scrolls to it); every other views tab and every mode tab leaves it
+    document.addEventListener("click", (ev) => {
+      const t = ev.target && ev.target.closest ? ev.target : null;
+      const jump = t && t.closest("[data-phone-jump]");
+      if (jump && jump.dataset.phoneJump === "room") {
+        if (!roomSection || !token()) return;
+        ev.stopPropagation();
+        setRoom(true);
+      } else if (jump || (t && t.closest("[data-mode-tab]"))) setRoom(false);
+    }, true);
     document.addEventListener("visibilitychange", sync);
     window.addEventListener("storage", (e) => { if (e.key === WRITE_TOKEN_KEY) sync(); });
     window.addEventListener("levain:write-token-change", sync);   // the same page's own set / remove (dashboard_boot's token handling)

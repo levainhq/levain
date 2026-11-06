@@ -2839,86 +2839,109 @@ body.ke[data-mode="build"] .th-zone .zone-head { display: flex; }   /* titled li
   .th-body .tv-head .tv-at { margin-left: 0; }
 }
 
-/* RM-F: the cockpit's one Claude room (room_view.js, rv-*): the conversation, the dock (draft, Send, Stop, mic), the
-   proposal card and the ambiguous-line reconcile. Colours are tokens the page's light and dark themes already define. */
-.rv { display: flex; flex-direction: column; gap: var(--sp-4); min-width: 0; }
+/* RM-F / 1106-51: the cockpit's one Claude room (room_view.js, rv-*), drawn as a whole-tab chat page the way the reference products draw
+   one (chatgpt.com, gemini.google.com; measurements in project_memory/1106-16/design/DESIGN_RESEARCH_1106.md 4.1, 4.2, 7): a thin header
+   (title, New), the conversation as the page's one scroller in a centered column, one pinned composer with Send and Stop in one slot. No
+   card, no history list. Colours are tokens the page's light and dark themes already define. */
+.rv { --rv-col: 672px; --rv-comp: 768px; --rv-pl: 24px; --rv-pr: 24px; display: flex; flex-direction: column; height: 100%; min-width: 0; min-height: 0; background: var(--base); }
+@media (min-width: 1100px) { .rv { --rv-col: 768px; } }                      /* ChatGPT's expanded thread width (48rem), measured */
+@media (max-width: 640px) {
+  .rv { --rv-pl: max(16px, env(safe-area-inset-left, 0px)); --rv-pr: max(16px, env(safe-area-inset-right, 0px)); }
+}
+.rv .rv-top { flex: none; display: flex; align-items: center; gap: var(--sp-4); box-sizing: border-box; height: 52px; padding-inline: var(--rv-pl) var(--rv-pr); border-bottom: 1px solid var(--hair); }
+@media (max-width: 640px) { .rv .rv-top { height: 56px; } }                       /* 44pt target plus 6pt each side (research 7.4 item 2) */
+.rv .rv-title { margin: 0; font: var(--fw-semibold) var(--fs-title)/1 var(--sans); color: var(--text); }
+.rv .rv-model { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font: var(--fw-regular) var(--fs-micro)/1.5 var(--mono); color: var(--label); }
+@media (max-width: 640px) { .rv .rv-model { display: none; } }
 .rv .rv-head { display: flex; flex-wrap: wrap; align-items: baseline; gap: var(--sp-2) var(--sp-4); font: var(--fw-regular) var(--fs-micro)/1.5 var(--mono); color: var(--label); }
 .rv .rv-note { margin: 0; color: var(--label); font: var(--fw-regular) var(--fs-meta)/1.5 var(--sans); overflow-wrap: anywhere; }
-.rv .rv-gap { padding: var(--sp-3) var(--sp-4); border: 1px solid var(--bad); border-radius: var(--r-sm); color: var(--text); font: var(--fw-regular) var(--fs-meta)/1.5 var(--sans); }
-.rv .rv-line { border-left: 3px solid var(--hair-2); padding: var(--sp-2) var(--sp-4); }
-.rv .rv-you { border-left: 0; align-self: flex-end; max-width: 85%; background: var(--accent-soft); border-radius: var(--r-lg); padding: var(--sp-3) var(--sp-4); }
+.rv .rv-gap { padding: var(--sp-3) var(--sp-4); border: 1px solid var(--bad); border-radius: var(--r-sm); color: var(--text); font: var(--fw-regular) var(--fs-meta)/1.5 var(--sans); overflow-wrap: anywhere; }
+/* the conversation: flat. The room's words sit on the page, yours in a subtle block, a tool's rows quiet beside a thin rule */
+.rv .rv-line { padding: 0; }
+.rv .rv-you { align-self: flex-end; max-width: 85%; background: var(--card-2); border-radius: var(--r-lg); padding: var(--sp-3) var(--sp-5); }
 .rv .rv-you .rv-who { display: none; }
-.rv .rv-room { border-left: 0; padding-inline: 0; }
-.rv .rv-stream, .rv .rv-cards { display: flex; flex-direction: column; gap: var(--sp-3); width: 100%; max-width: 68ch; margin-inline: auto; box-sizing: border-box; }
-.rv .rv-cards { margin-top: var(--sp-3); }
+.rv .rv-line:not(.rv-you):not(.rv-room) { border-left: 2px solid var(--hair-2); padding: var(--sp-1) var(--sp-4); color: var(--label); }
+.rv .rv-line:not(.rv-you):not(.rv-room) .rv-text { font-size: var(--fs-body); }
+.rv .rv-error { border-left-color: var(--bad); }
+.rv .rv-stream, .rv .rv-cards { display: flex; flex-direction: column; gap: var(--sp-5); box-sizing: border-box; width: min(100%, calc(var(--rv-col) + var(--rv-pl) + var(--rv-pr))); padding-inline: var(--rv-pl) var(--rv-pr); margin-inline: auto; }
+.rv .rv-stream { min-height: 100%; }
+.rv .rv-stream > .rv-note:only-child { margin: auto; text-align: center; font-size: var(--fs-lead); }   /* the empty state: one centered line */
+.rv .rv-cards { margin-top: var(--sp-5); }
 .rv .rv-cards:empty { display: none; }
-.rv .rv-body { max-height: min(62dvh, 640px); overflow-y: auto; overflow-x: hidden; overflow-anchor: none; overscroll-behavior: contain; padding: var(--sp-4); }
+.rv .rv-stage { flex: 1 1 0; min-height: 0; position: relative; display: flex; flex-direction: column; min-width: 0; }
+.rv .rv-body { flex: 1 1 auto; min-height: 0; overflow-y: auto; overflow-x: hidden; overflow-anchor: none; overscroll-behavior: contain; padding-block: var(--sp-6) var(--sp-5); }
 .rv .rv-pending { display: flex; gap: var(--sp-2); padding: var(--sp-2) 0; }
 .rv .rv-dot { width: 6px; height: 6px; border-radius: 50%; background: var(--label); opacity: .35; animation: rv-pulse 1.2s ease-in-out 25; }   /* finite (30 s), never infinite: tests/test_cockpit_no_infinite_animation.py */
 .rv .rv-dot:nth-child(2) { animation-delay: .2s; }
 .rv .rv-dot:nth-child(3) { animation-delay: .4s; }
 @keyframes rv-pulse { 0%, 80%, 100% { opacity: .25; } 40% { opacity: 1; } }
 @media (prefers-reduced-motion: reduce) { .rv .rv-dot { animation: none; opacity: .6; } }
-.rv .rv-error { border-left-color: var(--bad); }
 .rv .rv-who { font: var(--fw-semibold) var(--fs-micro)/1.5 var(--mono); color: var(--label); }
-.rv .rv-text { margin: var(--sp-1) 0 0; white-space: pre-wrap; overflow-wrap: anywhere; font: var(--fw-regular) var(--fs-lead)/1.6 var(--sans); color: var(--text); }
+.rv .rv-text { margin: var(--sp-1) 0 0; white-space: pre-wrap; overflow-wrap: anywhere; font: var(--fw-regular) 16px/1.65 var(--sans); color: var(--text); }
 .rv .rv-mark { display: flex; flex-wrap: wrap; align-items: center; gap: var(--sp-2) var(--sp-4); margin: var(--sp-2) 0 0; font: var(--fw-regular) var(--fs-meta)/1.5 var(--sans); color: var(--label); }
 .rv .rv-mark button { min-height: var(--hit-min, 44px); }
 .rv .rv-card { padding: var(--sp-4); border: 1px solid var(--hair-2); border-radius: var(--r-md); background: var(--card-2); display: flex; flex-direction: column; gap: var(--sp-3); }
 .rv .rv-card textarea { width: 100%; box-sizing: border-box; min-height: 72px; resize: vertical; padding: var(--sp-3) var(--sp-4); background: var(--card); color: var(--text);
   border: 1px solid var(--hair-2); border-radius: var(--r-md); font: var(--fw-regular) var(--fs-meta)/1.5 var(--sans); }
 .rv .rv-summary { padding: var(--sp-3) var(--sp-4); border-left: 3px solid var(--hair-2); color: var(--label); font: var(--fw-regular) var(--fs-meta)/1.5 var(--sans); white-space: pre-wrap; overflow-wrap: anywhere; }
-.rv .rv-dock { display: flex; flex-direction: column; gap: var(--sp-3); min-width: 0; width: 100%; max-width: 68ch; margin-inline: auto; box-sizing: border-box; }
-.rv .rv-compose { display: flex; align-items: flex-end; gap: var(--sp-3); }
-.rv .rv-input { flex: 1; min-width: 0; box-sizing: border-box; min-height: var(--hit-min, 44px); max-height: 40dvh; overflow-y: auto; field-sizing: content; resize: none; padding: var(--sp-3) var(--sp-4); background: var(--card-2); color: var(--text);
-  border: 1px solid var(--hair-2); border-radius: var(--r-md); font: var(--fw-regular) var(--fs-meta)/1.5 var(--sans); }
-.rv .rv-input:focus-visible { outline: 2px solid var(--accent-line); outline-offset: 1px; border-color: var(--accent-line); }
+/* the pinned composer: 768 wide on a desk (ChatGPT, measured), the page's width less the gutters on a phone; the box is at least 52 tall
+   (48 floor on a phone) and its buttons are 44. The status line sits above it, so the composer is the last thing on the page. */
+.rv .rv-dock { flex: none; display: flex; flex-direction: column; gap: var(--sp-3); box-sizing: border-box; min-width: 0; width: min(100%, calc(var(--rv-comp) + var(--rv-pl) + var(--rv-pr)));
+  margin-inline: auto; padding: var(--sp-3) var(--rv-pr) 16px var(--rv-pl); }
+.rv .rv-compose { display: flex; align-items: flex-end; gap: var(--sp-2); box-sizing: border-box; min-height: 52px; padding: 4px; background: var(--card-2); border: 1px solid var(--hair-2); border-radius: 28px; }
+.rv .rv-compose:focus-within { border-color: var(--accent-line); }
+.rv .rv-input { flex: 1; min-width: 0; box-sizing: border-box; align-self: center; min-height: 44px; max-height: min(40dvh, 288px); overflow-y: auto; field-sizing: content; resize: none; padding: 10px var(--sp-4);
+  background: transparent; color: var(--text); border: 0; outline: 0; font: var(--fw-regular) 16px/24px var(--sans); }
 .rv .rv-input:disabled { opacity: .55; cursor: not-allowed; }
-.rv .rv-actions { display: flex; flex-wrap: wrap; gap: var(--sp-3); }
-.rv .rv-send, .rv .rv-stop, .rv .rv-open, .rv .rv-mic, .rv .rv-rotate, .rv .rv-card button { min-height: var(--hit-min, 44px); padding: var(--sp-2) var(--sp-6); border-radius: var(--r-md); cursor: pointer; font: var(--fw-semibold) var(--fs-meta)/1 var(--sans); }
+.rv .rv-actions, .rv .rv-slot { flex: none; display: flex; }
+.rv .rv-slot[data-mode="stop"] .rv-send, .rv .rv-slot:not([data-mode="stop"]) .rv-stop { display: none; }
+.rv .rv-send, .rv .rv-stop { flex: none; width: var(--hit-min, 44px); height: var(--hit-min, 44px); padding: 0; border-radius: 50%; cursor: pointer; font: var(--fw-semibold) 18px/1 var(--sans); }
 .rv .rv-send, .rv .rv-open { background: var(--accent); color: var(--on-accent); border: 1px solid var(--accent); }
-.rv .rv-send { flex: none; width: var(--hit-min, 44px); height: var(--hit-min, 44px); padding: 0; border-radius: 50%; font-size: var(--fs-title); }
-.rv .rv-send[aria-disabled="true"] { background: var(--card-2); color: var(--meta); border-color: var(--hair-2); cursor: default; }
-.rv .rv-open[hidden] { display: none; }
+.rv .rv-send[aria-disabled="true"] { background: var(--hair-2); color: var(--meta); border-color: var(--hair-2); cursor: default; }
 .rv .rv-send:hover:not(:disabled) { filter: brightness(1.08); }
-.rv .rv-mic, .rv .rv-rotate, .rv .rv-card button { background: none; color: var(--text); border: 1px solid var(--label); }
-.rv .rv-stop { background: none; color: var(--text); border: 1px solid var(--bad); }
-.rv .rv-stop:hover:not(:disabled) { background: color-mix(in oklch, var(--bad) 14%, transparent); }
+.rv .rv-stop { background: var(--text); color: var(--base); border: 1px solid var(--text); }
+.rv .rv-open { min-height: var(--hit-min, 44px); padding: var(--sp-2) var(--sp-6); border-radius: var(--r-pill); cursor: pointer; font: var(--fw-semibold) var(--fs-body)/1 var(--sans); }
+.rv .rv-open[hidden] { display: none; }
+.rv .rv-mic, .rv .rv-rotate, .rv .rv-card button { min-height: var(--hit-min, 44px); padding: var(--sp-2) var(--sp-5); border-radius: var(--r-pill); cursor: pointer; font: var(--fw-semibold) var(--fs-meta)/1 var(--sans); background: none; color: var(--text); border: 1px solid var(--hair-2); }
+.rv .rv-mic { align-self: flex-end; border-color: transparent; color: var(--label); }
+.rv .rv-rotate { min-width: var(--hit-min, 44px); margin-left: auto; }
 .rv button:disabled { opacity: .45; cursor: not-allowed; }
 .rv button:focus-visible { outline: 2px solid var(--accent-line); outline-offset: 2px; }
-.rv .rv-sendnote { min-height: 1.5em; font: var(--fw-regular) var(--fs-meta)/1.5 var(--sans); color: var(--label); overflow-wrap: anywhere; }
-/* RM-H, the phone (390 px is the width the thread fold test uses): the draft box and a card's words are 16px so iOS does not zoom
-   the page on focus; the dock stays under the thumb with the home indicator's inset; Send takes its own row, the rest sit two to a
-   row at the touch size, so no label is squeezed and nothing scrolls sideways. */
+.rv .rv-sendnote { font: var(--fw-regular) var(--fs-meta)/1.5 var(--sans); color: var(--label); overflow-wrap: anywhere; text-align: center; }
+.rv .rv-sendnote:empty { display: none; }
+/* RM-H, the phone: the draft box and a card's words are 16px so iOS does not zoom the page on focus, the dock keeps the home indicator's inset. */
 @media (pointer: coarse), (max-width: 640px) { .rv .rv-input, .rv .rv-card textarea { font-size: 16px; } }
 @media (max-width: 640px) {
-  .rv .rv-dock { padding-top: var(--sp-3); padding-bottom: env(safe-area-inset-bottom, 0px); }
-  .rv .rv-actions { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); }
-  .rv .rv-actions > button { min-width: 0; padding-inline: var(--sp-3); overflow-wrap: anywhere; }
+  .rv .rv-dock { padding-bottom: max(12px, env(safe-area-inset-bottom, 0px)); }
   .rv .rv-card button { width: 100%; }
 }
-
-/* The room's conversation, its notice and its code block. On a phone the card does not clamp the room (the Board's 560px card height is
-   for a list; here it hid the newest reply behind the dock): the card takes its height, the conversation is its own scroll box that ends
-   ABOVE the dock, and "Jump to latest" shows while it is scrolled up. The dock is in the flow under it, never over it. */
-.rv .rv-stage { position: relative; min-width: 0; }
-.rv .rv-jump { position: absolute; left: 50%; transform: translateX(-50%); bottom: var(--sp-3); min-height: var(--hit-min, 44px); padding: var(--sp-2) var(--sp-5); border-radius: var(--r-pill); cursor: pointer;
-  background: var(--accent); color: var(--on-accent); border: 1px solid var(--accent); font: var(--fw-semibold) var(--fs-meta)/1 var(--sans); }
+/* "Jump to latest" shows while the conversation is scrolled up (more than 100 px from its end); the dock is below the stage, never over it */
+.rv .rv-jump { position: absolute; left: 50%; transform: translateX(-50%); bottom: var(--sp-4); min-height: var(--hit-min, 44px); padding: var(--sp-2) var(--sp-5); border-radius: var(--r-pill); cursor: pointer;
+  background: var(--card); color: var(--text); border: 1px solid var(--hair-2); box-shadow: 0 2px 8px color-mix(in oklch, var(--base) 60%, transparent); font: var(--fw-semibold) var(--fs-meta)/1 var(--sans); }
 .rv .rv-jump[hidden] { display: none; }
-.rv .rv-gap { overflow-wrap: anywhere; }
-.rv .rv-banner { display: flex; flex-direction: column; gap: var(--sp-2); background: var(--card-2); }
-@media (max-width: 720px) { .rv .rv-banner { position: sticky; top: 0; z-index: 1; } }   /* the notice stays in view above a scrolled conversation */
+.rv .rv-banner { display: flex; flex-direction: column; gap: var(--sp-2); background: var(--card-2); position: sticky; top: 0; z-index: 1; }   /* the notice stays in view above a scrolled conversation */
 .rv .rv-banner .rv-detail { color: var(--label); font: var(--fw-regular) var(--fs-micro)/1.5 var(--mono); overflow-wrap: anywhere; }
 .rv .rv-code { margin: var(--sp-2) 0 0; padding: var(--sp-3) var(--sp-4); background: var(--card); border: 1px solid var(--hair-2); border-radius: var(--r-sm); overflow-x: auto; white-space: pre; }
 .rv .rv-code code { font: var(--fw-regular) var(--fs-micro)/1.5 var(--mono); color: var(--text); }
 .rv .rv-text strong { font-weight: var(--fw-semibold); }
 .rv .rv-ic { padding: 0 var(--sp-1); background: var(--card); border: 1px solid var(--hair-2); border-radius: var(--r-sm); font: var(--fw-regular) var(--fs-micro)/1.5 var(--mono); color: var(--text); overflow-wrap: anywhere; }
 .rv .rv-text strong .rv-ic { font-weight: var(--fw-regular); }
-@media (max-width: 720px) {
-  body.ke .rv-zone .ck-zgrid .panel { height: auto; max-height: none; }
-  body.ke .rv-zone .ck-zgrid .panel .pbody { overflow: visible; max-height: none; }
-  .rv .rv-body { max-height: 62vh; max-height: 62dvh; padding: var(--sp-3); }
-}
+
+/* The Room tab (dashboard_boot.js sets body.rv-on): the room owns the whole viewport below the app's own header and views strip. The deck
+   is one fixed box of the visual viewport's height (room_view.js keeps --rv-vvh / --rv-vvt), so the page itself never scrolls and the
+   composer sits above a phone's keyboard; while the keyboard is up (rv-kb) the header and strip yield their room to the conversation. */
+.rv-zone { display: none; }
+body.rv-on { overflow: hidden; }
+body.rv-on .deck { position: fixed; left: 0; right: 0; top: var(--rv-vvt, 0px); height: var(--rv-vvh, 100dvh); min-height: 0; max-width: none; margin: 0; padding-bottom: 0; box-sizing: border-box; display: flex; flex-direction: column; overflow: hidden; }
+body.rv-on .deck > :not(.masthead):not(.ck-phonetabs):not(.rv-zone) { display: none !important; }
+body.rv-on .deck > .masthead, body.rv-on .deck > .ck-phonetabs { flex: none; }
+body.rv-on .rv-zone { display: flex; flex-direction: column; flex: 1 1 0; min-height: 0; margin: 0; padding: 0; }
+body.rv-on .rv-zone[hidden] { display: none; }
+body.rv-on .rv-zone .rv-body-host { position: relative; flex: 1 1 0; min-height: 0; }
+body.rv-on .rv-zone .rv-body-host > .rv { position: absolute; inset: 0; height: auto; }
+body.rv-on.rv-kb .rv .rv-dock { padding-bottom: 12px; }   /* the home indicator is under the keyboard */
+@media (max-width: 720px) { body.rv-on.rv-kb .deck > .masthead, body.rv-on.rv-kb .deck > .ck-phonetabs { display: none; } }
+body.rv-on .ck-phonetabs button[data-phone-jump="room"] { color: var(--text); background: var(--card-2); }
 
 /* C12: the board kind's painters (board_view.js, bd-*). The panel lists cards grouped under column headings; the six columns (one on a narrow page) are the ⤢ modal's. */
 .bd-cols { display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: var(--sp-4); align-items: start; }

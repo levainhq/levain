@@ -68,9 +68,9 @@ def test_the_room_boxes_are_prose_with_dash_free_names():
 def test_the_phone_rules_exist_and_use_tokens_only():
     css = (WEB / "dashboard.css").read_text()
     i = css.index("RM-H, the phone")
-    block = css[i:css.index(".rv .rv-stage", i)]
+    block = css[i:css.index(".rv .rv-jump", i)]
     assert "font-size: 16px" in block and "env(safe-area-inset-bottom" in block and "position: sticky" not in block   # the dock sits under the conversation, never over it (1104-29)
-    assert "grid-template-columns: repeat(2" in block and ".rv-send { grid-column" not in block   # Send sits beside the draft now (1106-16)
+    assert ".rv-send { grid-column" not in block   # Send sits beside the draft (1106-16); 1106-51: one composer row, no button grid
     assert not re.search(r"#[0-9a-fA-F]{3,6}\b", block)
 
 
@@ -102,7 +102,7 @@ def test_an_on_device_recognizer_gets_a_control_that_asks_for_local_processing(t
 
 
 _GEOM = """(() => { const r = n => n.getBoundingClientRect();
-const acts = [...document.querySelectorAll('.rv-actions > button')], dock = r(document.querySelector('.rv-dock'));
+const acts = [...document.querySelectorAll('.rv-mic, .rv-send')], dock = r(document.querySelector('.rv-dock'));
 return JSON.stringify({noSideScroll: document.documentElement.scrollWidth <= window.innerWidth,
   inside: acts.every(b => r(b).left >= dock.left - 0.5 && r(b).right <= dock.right + 0.5),
   tall: acts.every(b => r(b).height >= 43.5), unclipped: acts.every(b => b.scrollWidth <= b.clientWidth + 1),
@@ -123,7 +123,7 @@ def test_the_dock_fits_a_390_phone_with_every_control_whole(tmp_path, w):
         ])
     g = json.loads(out["values"][1])
     assert g["noSideScroll"] and g["inside"] and g["tall"] and g["unclipped"] and g["send44"], g
-    assert g["n"] == 3 and g["rows"] <= 2 and g["input16"] >= 16 and g["sticky"] != "sticky", g
+    assert g["n"] == 2 and g["rows"] <= 2 and g["input16"] >= 16 and g["sticky"] != "sticky", g
 
 
 # --- the voice, F1-F4 of the r1 findings -----------------------------------------------------------------------------
