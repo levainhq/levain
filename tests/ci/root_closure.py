@@ -352,6 +352,8 @@ LAZY_SITES = {
     'levain/authority.py::egress_key_repo_problem::from levain.chat_egress.parse import canonical_path': 'operator',
     # operator: <- ``_grant_append_checks`` / the renew branch of ``_append_only_checks`` <- ``prepare`` / ``append`` (the signer's process: ``cli``, ``cockpit.keys``, ``consent.grants``, ``agents``, ``chat_egress.key_setup``); never the replay (``_step``)
     'levain/authority.py::_hands_mcp_check::from levain import hands_mcp': 'operator',
+    # operator: the seat-lease append / renew rule (``SEAT_LEASE_KIND``'s ``append_checks`` / ``renew_checks``), reached through ``_grant_append_checks`` and the renew branch, the signer's process; its docstring: an append rule, not a replay rule, so no root process runs it (``levain.host_guard`` needs 3.11 ``tomllib``)
+    'levain/authority.py::_seat_lease_check::from levain import host_guard as hg': 'operator',
     # operator: a ``Cockpit`` method; ``Cockpit(`` is constructed only in ``levain/cockpit/providers.py`` (``git grep -n 'Cockpit(' -- levain``), not in the closure; engine is here only as ``levain/cockpit/__init__.py``'s import
     'levain/cockpit/engine.py::Cockpit._note_decision_one::from levain.consent.notes import NoteStoreError': 'operator',
     # operator: a ``Cockpit`` method; ``Cockpit(`` is constructed only in ``levain/cockpit/providers.py``, not in the closure

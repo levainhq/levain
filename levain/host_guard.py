@@ -41,7 +41,7 @@ __all__ = [
     "host_dir", "cc_sandbox_block", "check_sandbox_types", "cc_hook_settings", "cc_mcp_config",
     "hook_pin", "check_or_record_pin", "repin", "agent_hook_pins", "check_agent_hook_pins",
     "repin_agent_hooks", "cc_sandbox_state", "check_managed_settings", "host_env",
-    "parse_cc_version", "CC_HOSTED_TOOLS", "CC_VERSION_FLOOR",
+    "parse_cc_version", "CC_HOSTED_TOOLS", "CC_SEAT_TOOLS", "SEAT_SOURCE_ARGS", "CC_VERSION_FLOOR",
     "check_shared_code", "codex_initialize_params", "codex_config_overrides",
     "security_inputs_digest",
     "trust_managed", "load_managed_trust",
@@ -64,12 +64,31 @@ CC_VERSION_FLOOR = (2, 1, 285)
 # --restricted. Edit and Write are OUT (D12, proposed 10-07): the host approving a
 # file-tool PATH that Claude Code resolves and writes LATER is a race that sandboxed Bash can
 # win by swapping a workspace symlink to activation/hooks (L3 r1, codex 1), so every write the
-# entity makes goes through Bash, where denyWrite holds at the syscall. Restoring them is a
+# entity makes goes through Bash, where denyWrite holds at the syscall. Restoring them to the hosted profile is a
 # change to this tuple plus a write broker that is itself the writer (openat under a held
 # directory fd, O_NOFOLLOW at every component), never a path policy in front of CC's own tool.
 # Any other tool is re-admitted the same way: one at a time, behind a canary arm that proves it
 # inherits the gate and the confinement.
 CC_HOSTED_TOOLS = ("Bash", "Read")
+
+# D9 b' (Phill, 11-06, relayed by the desk): the rule above binds the HOSTED profile only. The
+# terminal seat profile (CC_SEAT_TOOLS) keeps Edit and Write. It was ruled knowing that this is
+# a path policy in front of CC's own tool and that a won symlink-swap race is not excluded; the
+# race's prize was bounded instead: permissions.deny on every protected name for all four file
+# tools, roots minted per lane under his signed lease, and inert targets (the seat loads no
+# settings, hooks or MCP from its own roots). MultiEdit and NotebookEdit were left out until the
+# host probe that measured Edit and Write measures them. The seat canary reports the swap race
+# as a rate over N attempts, never as a pass; a non-zero rate returns the seat set to
+# ("Bash", "Read") as levain 43 ruled for a failed probe. A hosted session is unchanged: a
+# cockpit that can be reached approves held actions, which a terminal seat's prompt does not.
+# The head narrowed the seat set to these four: the web tools run outside the network allowlist.
+CC_SEAT_TOOLS = ("Bash", "Read", "Edit", "Write")
+
+# Which settings sources a terminal seat loads: none. Measured on the host (headless): without
+# `project` in the source list a clone's CLAUDE.md and .claude/settings.json hooks are not
+# loaded, and an empty list loads nothing from the clone; `local` would admit settings.local.json.
+# This is the one place the spelling lives, so a different measured spelling is a one-line change.
+SEAT_SOURCE_ARGS = ("--setting-sources", "")
 
 
 # `.codex`: r3a measured a sandboxed model Bash creating <ws>/.codex/config.toml in hosted CC
@@ -219,7 +238,11 @@ _SANDBOX_TYPES: dict[tuple[str, ...], type] = {
     ("network", "deniedDomains"): list,
     ("filesystem", "disabled"): bool,
     ("filesystem", "denyWrite"): list,
+    ("filesystem", "denyRead"): list,
 }
+
+# Keys the hosted block does not carry: absent is fine, present must have its type.
+_OPTIONAL_SANDBOX_KEYS = frozenset({("filesystem", "denyRead")})
 
 
 def cc_sandbox_block(entity: str | os.PathLike[str]) -> dict[str, Any]:
@@ -256,7 +279,8 @@ def check_sandbox_types(block: Mapping[str, Any]) -> list[str]:
             node = node.get(k, _MISSING) if isinstance(node, Mapping) else _MISSING
         name = "sandbox." + ".".join(keys)
         if node is _MISSING:
-            problems.append(f"{name} is missing")
+            if keys not in _OPTIONAL_SANDBOX_KEYS:
+                problems.append(f"{name} is missing")
         elif type(node) is not typ:
             problems.append(f"{name} must be {typ.__name__}, got {type(node).__name__}")
     return problems

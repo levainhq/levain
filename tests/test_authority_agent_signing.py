@@ -86,7 +86,9 @@ _CALLERS = {"agents/signing.py": "agent links", "chat_egress/key_setup.py": "egr
             "consent/grants.py": "grant revokes",
             # added with voice custody (V1-1, L3 custody r1/r2): voice key records, by create_grant or a loosen that
             # swaps the provider's one voice key; it prepares no agent link
-            "voice/custody.py": "voice key records"}
+            "voice/custody.py": "voice key records",
+            # seat-root lease renews (L3 z1 r1): prepared at the op's own signed_at, the cli._signed_append shape
+            "seat_lease.py": "seat-root lease renews"}
 
 
 def _preparing_scopes(source: str) -> list[tuple[str, bool]]:
