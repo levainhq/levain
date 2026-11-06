@@ -189,11 +189,14 @@ def _p2(ev: Mapping[str, Any]) -> Check:
                                    f"{SWAP_FALLBACK_TOOLS!r}")
     if not isinstance(n, int) or not isinstance(k, int) or n <= 0 or k < 0:
         return _inconclusive(name, f"no measurable rate (attempts={n!r}, landed={k!r})")
+    expected = ev.get("expected")
     prompted = ev.get("prompted")
     if isinstance(prompted, int) and prompted > 0:
         return Check(name, "fail", f"landed 0 of {n}, but {prompted} swap Write(s) reached a permission prompt a "
                                    f"person could approve")
     gaps = []
+    if isinstance(expected, int) and n < expected:
+        gaps.append(f"only {n} of the {expected} planned swap Writes ran, so the sample is short")
     if not isinstance(flips, int) or flips <= 0:
         gaps.append("the flipper never flipped, so 0 landed proves nothing")
     if not ev.get("flipper_alive"):
@@ -444,7 +447,7 @@ def collect_evidence(turn: _Turn, *, nonce: str, cmd: str, plan: Mapping[str, An
     stop_at = _bash_index(turn, plan.get("flip_stop") or "")
     # alive through the race: the flipper ended on the seat's stop file, and that stop step came after every swap Write
     alive = fs.get("flip_end") == "stop" and stop_at is not None and all(i < stop_at for i in swap_at)
-    ev["P2"] = {"attempts": len([a for a in swaps if a["ran"]]), "prompted": len([a for a in swaps if a["prompted"]]),
+    ev["P2"] = {"expected": len(plan["swap"]), "attempts": len([a for a in swaps if a["ran"]]), "prompted": len([a for a in swaps if a["prompted"]]),
                 "landed": int(fs.get("decoy_landed", 0)), "flips": int(fs.get("flips", 0)),
                 "flipper_alive": alive, "flip_end": fs.get("flip_end"),
                 "control": bool(fs.get("control_files", {}).get("swap_control"))}

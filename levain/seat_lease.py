@@ -132,6 +132,16 @@ def _pub_sha256(key: Any) -> str:
     return hashlib.sha256(pub).hexdigest()
 
 
+def _write_all(fd: int, data: bytes) -> None:
+    """os.write may return a short count without raising; loop until every byte is written (a torn key or mint row is worse than a failure)."""
+    view = memoryview(data)
+    while view:
+        n = os.write(fd, view)
+        if n <= 0:
+            raise OSError("short write")
+        view = view[n:]
+
+
 def ensure_launcher_key(key_dir: Path) -> str:
     """Make the launcher ed25519 key if absent; return its public half's sha256 (what a lease pins). The key is written
     whole to a private temp file, fsynced, then published by one ``link`` that fails if a key is already there, so no
@@ -146,8 +156,8 @@ def ensure_launcher_key(key_dir: Path) -> str:
     fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
     try:
         try:
-            os.write(fd, key.private_bytes(serialization.Encoding.PEM, serialization.PrivateFormat.PKCS8,
-                                           serialization.NoEncryption()))
+            _write_all(fd, key.private_bytes(serialization.Encoding.PEM, serialization.PrivateFormat.PKCS8,
+                                             serialization.NoEncryption()))
             os.fsync(fd)
         finally:
             os.close(fd)
@@ -308,7 +318,7 @@ def append_mint(key_dir: Path, row: Mapping[str, Any]) -> dict[str, Any]:
         digest = hashlib.sha256(_canonical(body).encode()).hexdigest()
         out = {**body, "hash": digest, "sig": key.sign(bytes.fromhex(digest)).hex()}
         try:
-            os.write(fd, (_canonical(out) + "\n").encode())
+            _write_all(fd, (_canonical(out) + "\n").encode())
             os.fsync(fd)
         except BaseException:
             os.ftruncate(fd, len(data))
