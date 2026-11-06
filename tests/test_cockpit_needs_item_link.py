@@ -79,27 +79,28 @@ def test_a_consent_card_is_named_by_its_exact_id_only() -> None:
     assert "indexOf" not in body and 'item + "-"' not in body, body
 
 
-# the page before it is paired: its Decisions panel read does not answer until the pairing reload (a read the box refuses does the same to the jump)
-OFF_BOX = """(() => { const f = window.fetch; window.fetch = async (...a) => {
-  if (String(a[0]).indexOf('/cockpit/panel/decisions.json') === 0 && !window.sessionStorage.getItem('paired')) return new Promise(() => {});
-  return f.apply(window, a); }; })();"""
-PENDING = "window.sessionStorage.getItem('levain_needs_item_pending')"
+# the harness's init step reloads the page once, which would drop the link: open the link after it
+GO_LINK = {"eval": "location.assign('/?view=needs&item=question:2#write_token=T'); 1"}
+
+def _jump_body() -> str:
+    from tests._ke_dom import WEB
+    js = (WEB / "dashboard_core.js").read_text(encoding="utf-8")
+    return js[js.index("function needsItemJump"):js.index("function needsDeepJump")]
 
 
-@needs_browser
-def test_a_pending_item_survives_the_pairing_reload(tmp_path: Path, monkeypatch) -> None:
-    """An unpaired page strips the query at once and pair_card.js reloads the clean `/`: the validated id rides sessionStorage across it."""
-    _two_questions(tmp_path, monkeypatch)
-    _root, src, _ids = _install(tmp_path)
-    with _serve(src, surface_tokens={"browser": "T"}, install_class="reported") as (url, _httpd):
-        out = _drive(tmp_path, f"{url}/?view=needs&item=question:2", [
-            {"init": OFF_BOX}, DESKTOP, SETTLE, {"eval": "JSON.stringify({ search: location.search, pending: " + PENDING + " })"},
-            {"eval": "window.sessionStorage.setItem('paired', '1'); location.reload(); 1"},
-            {"until": ROWS, "ms": 40000}, SETTLE, {"eval": READ}, {"eval": PENDING}])["values"]
-    before, after = json.loads(out[-6]), json.loads(out[-2])
-    assert before["search"] == "" and json.loads(before["pending"])["id"] == "question:2", before
-    assert after["modal"] and "codex" in after["title"], after       # the card opened on the clean address
-    assert out[-1] is None, out[-1]                                             # and the pending id was used up
+def test_an_empty_or_partial_listing_never_says_no_longer_waiting() -> None:
+    """The transient-empty case that destroyed the link before: an EMPTY listing is not an answer (the jump keeps polling until a listing
+    holds the item or the deadline), and the notice is said only of a whole listing (no panel error, no note). The page does not re-read
+    the panel on a timer inside the harness's window, so this is pinned on the code, not driven."""
+    body = _jump_body()
+    assert "Array.isArray(lines) && lines.length" in body, body
+    assert "!dec.error && !dec.note" in body and body.index("!dec.error") < body.index("needsGoneNote()"), body
+
+
+def test_the_link_keeps_nothing_across_a_reload() -> None:
+    from tests._ke_dom import WEB
+    js = (WEB / "dashboard_core.js").read_text(encoding="utf-8")
+    assert "levain_needs_item_pending" not in js and "needsPending" not in js and "NEEDS_PENDING" not in js
 
 
 SLOW_DECISIONS = """(() => { const f = window.fetch; window.fetch = async (...a) => {
@@ -110,12 +111,12 @@ SLOW_DECISIONS = """(() => { const f = window.fetch; window.fetch = async (...a)
 def _slow_decisions(tmp_path: Path, monkeypatch, press: bool) -> dict:
     _two_questions(tmp_path, monkeypatch)
     _root, src, _ids = _install(tmp_path)
-    steps = [{"init": SLOW_DECISIONS}, DESKTOP]
+    steps = [{"init": SLOW_DECISIONS}, DESKTOP, GO_LINK]
     if press:
         steps.append({"tap": "document.querySelector('[data-theme-set=\"dark\"]')", "ms": 40000})
     steps += [{"until": ROWS, "ms": 40000}, {"eval": "new Promise(r => setTimeout(() => r(1), 9000))"}, {"eval": READ}]
     with _serve(src, surface_tokens={"browser": "T"}, install_class="reported") as (url, _httpd):
-        out = _drive(tmp_path, f"{url}/?view=needs&item=question:2#write_token=T", steps)["values"]
+        out = _drive(tmp_path, f"{url}/#write_token=T", steps)["values"]
     return json.loads(out[-1])
 
 

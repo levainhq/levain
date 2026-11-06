@@ -8637,11 +8637,9 @@ for (const type of ["touchstart", "wheel", "pointerdown", "click", "keydown"]) d
       const rest = q.toString();
       window.history.replaceState(null, "", window.location.pathname + (rest ? "?" + rest : "") + window.location.hash);
       if (view === "needs") {
-        needsPendingClear();
         // `&item=<id>`: the one waiting card the link is about. Only a bounded id is kept (the guard admits the same shape); the
         // address drops it like the other two, and a link only OPENS the card: it never answers, marks read or writes.
         const item = q0.get("item");
-        if (item && NEEDS_ITEM_ID.test(item)) needsPendingSet(item);
         return { needs: true, item: item && NEEDS_ITEM_ID.test(item) ? item : null };
       }
       return { id: n && NC_ID.test(n) ? n : null };
@@ -8650,19 +8648,6 @@ for (const type of ["touchstart", "wheel", "pointerdown", "click", "keydown"]) d
   // The id a deep link names a Needs-you card by (`/?view=needs&item=<id>`): the card's own id (`question:<n>`, `consent:<request id>`),
   // the bare request id a sign card was filed under, or flow's `np-<8 hex>` item id (its card is `question:<1 + hex>`). The server admits exactly this shape.
   const NEEDS_ITEM_ID = /^[A-Za-z0-9_.:-]{1,64}$/;
-  // An unpaired or off-box device strips the query at once and reloads the clean `/` once paired (pair_card.js): the validated id rides
-  // sessionStorage (10 minutes) across that reload and is cleared once the card is opened or found gone.
-  const NEEDS_PENDING_KEY = "levain_needs_item_pending", NEEDS_PENDING_MS = 600000;
-  function needsPendingSet(item) { try { window.sessionStorage.setItem(NEEDS_PENDING_KEY, JSON.stringify({ id: item, exp: Date.now() + NEEDS_PENDING_MS })); } catch (_) { /* the jump then rides this page only */ } }
-  function needsPendingClear() { try { window.sessionStorage.removeItem(NEEDS_PENDING_KEY); } catch (_) { /* nothing kept */ } }
-  function needsPendingGet() {
-    try {
-      const v = JSON.parse(window.sessionStorage.getItem(NEEDS_PENDING_KEY) || "null");
-      if (v && typeof v.id === "string" && NEEDS_ITEM_ID.test(v.id) && typeof v.exp === "number" && v.exp > Date.now()) return v.id;
-    } catch (_) { /* unreadable: no pending item */ }
-    needsPendingClear();
-    return null;
-  }
   function needsItemMatch(it, item) {
     const id = needsIdOf(it);
     // flow's own card for an `np-` item is `question:<1 + the id's hex>` (flow's desk_cards.card_number): the same card from either name
@@ -8684,21 +8669,23 @@ for (const type of ["touchstart", "wheel", "pointerdown", "click", "keydown"]) d
   // one-line notice. Without a read by the deadline it falls back the same way.
   function needsItemJump(item, run, deadline) {
     if (run !== phoneJumpRun) return;
-    const lines = ((currentView && currentView.extra_panels || {}).decisions || {}).lines;
-    if (Array.isArray(lines)) {
-      needsPendingClear();
+    const dec = ((currentView && currentView.extra_panels || {}).decisions || {});
+    const lines = dec.lines;
+    // an EMPTY listing is not an answer (the first read can come back empty or short and the next one holds the item): keep waiting
+    if (Array.isArray(lines) && lines.length) {
       const it = needsWaiting(needsItems(lines)).find((x) => needsItemMatch(x, item));
       if (it) {
         if (document.querySelector(PHONE_JUMP_TARGET.needs)) needsGo(needsIdOf(it));
         openNeedsFocus(it, null);
         return;
       }
-      needsGoneNote();
+      // "no longer waiting" is said only of a whole listing: a panel that carries an error or a note (a partial read says so there) is not one
+      if (!dec.error && !dec.note) needsGoneNote();
       needsDeepJump(run, deadline);
       return;
     }
     if (Date.now() < deadline) { window.setTimeout(() => needsItemJump(item, run, deadline), PHONE_JUMP_STEP_MS); return; }
-    needsDeepJump(run, deadline);   // never read (unpaired, or slow): not "gone"; the pending id waits for the reload that pairing brings
+    needsDeepJump(run, deadline);   // never read (unpaired, empty or slow): not "gone"
   }
   // The strip draws once the board's first read answers, after this boot: wait (bounded, and given up the moment the reader touches
   // the page: phoneJumpRun moves) for the Needs strip to hold something waiting, then jump exactly as the Needs tab does. With
@@ -9441,9 +9428,7 @@ for (const type of ["touchstart", "wheel", "pointerdown", "click", "keydown"]) d
     // `storage` fires only for another tab's change, the same-page announce is the levain:write-token-change event.
     window.addEventListener("levain:write-token-change", () => { ncRead(false); });
     window.addEventListener("storage", (e) => { if (e.key === "levain_write_token") ncRead(false); });
-    const pend = ask ? null : needsPendingGet();      // a clean address after a pairing reload: the link it came in on
     if (ask && ask.needs && ask.item) needsItemJump(ask.item, ++phoneJumpRun, Date.now() + PHONE_JUMP_WAIT_MS);
-    else if (pend) needsItemJump(pend, ++phoneJumpRun, Date.now() + PHONE_JUMP_WAIT_MS);
     else if (ask && ask.needs) needsDeepJump(++phoneJumpRun, Date.now() + PHONE_JUMP_WAIT_MS);
     else if (ask) openNotifyCenter(null, ask.id, true);
   }
