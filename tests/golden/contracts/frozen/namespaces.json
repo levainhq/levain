@@ -104,6 +104,11 @@
    "owner": "levain/coordinator/review.py"
   },
   {
+   "namespace": "levain-answer-countersign",
+   "status": "shipped",
+   "owner": "levain/consent/answer_countersign.py"
+  },
+  {
    "namespace": "levain-terminal-answer",
    "status": "shipped",
    "owner": "levain/consent/terminal_sign.py"

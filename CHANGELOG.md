@@ -6,6 +6,9 @@ All notable changes to Levain. Format is loosely [Keep a Changelog](https://keep
 
 ## [Unreleased]
 
+### Added
+- **A band answer typed at a remote desk now files a sign card for your phone passkey.** The answer is still recorded at once, unsigned; the card (`levain-answer-countersign`, filed in the cockpit Signer's queue named by `LEVAIN_SIGN_QUEUE_DIR` or `sign_queue_dir` in `claude_code.json`) is evidence only. The band's badge for that answer reads `countersigned on your phone`, `remote, unsigned`, `DISOWNED on your phone` or `countersign FAILED: <reason>` from the card as it stands, and only a verified signature over exactly the recorded answer reads as countersigned. The local Touch ID path is unchanged.
+
 ### Changed
 - **The per-run dollar figure on an `api_key` agent link is now enforced at launch, not only shown on the card.** The signing card says "at most $X a run"; until now nothing held it, `reserve()` bounded only the window. An `api_key` exposure above the link's signed `budget_run_usd_micros` now ends `skipped-budget` / `run_budget` and writes nothing. A link that signs less than a run needs (the dream's per-run limit is $20.00) refuses on its next fire, which is the card's own promise. The run server's point-of-use check now judges the link's billing against the launcher's (`link-billing-not-the-launchers`, replacing `link-not-subscription`) and refuses an `api_key` link that signs a zero figure (`link-run-budget-zero`); the brokered launcher itself is not in this release.
 

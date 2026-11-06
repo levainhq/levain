@@ -74,3 +74,21 @@ That half is flow's and its tests are flow's; this repo's part is only that the 
   times out.
 - Residue, no instrument here holds it: answering one band item from a real phone terminal over ssh, mosh and
   `claude attach` and seeing no sheet on the laptop and the new words in the echo.
+
+## The sign card (B2)
+
+A band answer typed at a remote desk is recorded at once and unsigned (`sign_reason='remote'`); nothing delays or gates it.
+After the write the seat hook files one card per typed line in the cockpit Signer's queue
+(`levain/consent/answer_countersign.py`): levain's own plain request in the `levain-answer-countersign` namespace, whose
+message is the ordinary `levain-terminal-answer/1` bytes plus a `countersign-of:` line naming the recorded answers. The
+queue dir is `$LEVAIN_SIGN_QUEUE_DIR`, else the `sign_queue_dir` key of the hook queue's `claude_code.json`; with neither,
+no card is filed and the echo says why. The echo promises "sign it on your phone" only when the card was filed, pointed at
+and the push child started (which says nothing of arrival). The card is evidence only.
+
+A band render reads the card back, with no poller: `countersigned on your phone <time>` only when the passkey signature
+verifies over exactly the recorded answer; `remote, unsigned` while the card is open, expired or was never filed;
+`DISOWNED on your phone` after a deny; `countersign FAILED: <reason>` for anything else. A bad signature, a missing
+card or any error is never countersigned. The local Touch ID path files nothing and reads as before.
+
+Residue, no instrument here holds it: a line typed from a real phone terminal, the push arriving on the phone, Face ID on
+the sheet and the badge turning on the laptop; and the live `sign_queue_dir` key in the hook queue's `claude_code.json`.
