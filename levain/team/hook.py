@@ -25,6 +25,7 @@ import sys
 from dataclasses import dataclass, field
 from pathlib import Path
 
+from .. import pathid
 from ..launch import child_env
 from . import canon as C
 from . import entry as E
@@ -134,11 +135,26 @@ def _target(payload: dict) -> str | None:
 
 
 def _within(path: str, root: Path) -> bool:
+    """Is ``path`` surely or possibly under ``root``? By identity, not spelling (key 1106-1): ``path`` is model-supplied
+    and keeps the case the model wrote, and ``/USERS/me/repo/x`` is ``/Users/me/repo/x`` on a case-insensitive volume.
+    This is a DENY gate (a "no" skips every ruling on the path), so it is ``pathid.maybe_inside``: True also when a
+    stat or resolve error left the question open; ``pretooluse`` then halts if it cannot place the path."""
+    return pathid.maybe_inside(root, path)
+
+
+def _rel(path: str, root: Path) -> str | None:
+    """``path`` relative to ``root`` as a posix string, both in the filesystem's own spelling (so a canonical path gets
+    the same string as before); an ancestor that is ``root`` only by ``(st_dev, st_ino)`` is used when the spellings
+    do not line up. None when ``path`` cannot be placed under ``root``."""
+    cp, cr = pathid.canonical(path), pathid.canonical(root)
     try:
-        Path(os.path.realpath(path)).relative_to(os.path.realpath(root))
-        return True
+        return cp.relative_to(cr).as_posix()
     except ValueError:
-        return False
+        pass
+    for cand in (cp, *cp.parents):
+        if pathid.same(cr, cand):
+            return cp.relative_to(cand).as_posix()
+    return None
 
 
 def _in_ledger_machinery(path: str) -> bool:
@@ -202,9 +218,12 @@ def pretooluse(payload: dict) -> None:
     except Exception as exc:  # noqa: BLE001 - any failure to JUDGE a joined ledger halts the gate (§3f), never allows
         _deny_unjudged(str(exc) if isinstance(exc, (R.RolesError, TeamError)) else f"{type(exc).__name__}: {exc}")
         return
-    rel = Path(os.path.realpath(target)).relative_to(os.path.realpath(repo.toplevel)).as_posix() \
-        if _within(target, repo.toplevel) else None
+    if not _within(target, repo.toplevel):
+        return
+    rel = _rel(target, repo.toplevel)
     if rel is None:
+        # possibly under the repo (a stat error left it open) and not placeable: the gate cannot judge, so it halts
+        _deny_unjudged(f"cannot tell where {I.oneline(target)} sits in the repository {I.oneline(str(repo.toplevel))}")
         return
     # Claude Code always sends session_id; the transcript path is a stable stand-in if a build ever does not.
     session = str(payload.get("session_id") or "")

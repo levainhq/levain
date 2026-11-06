@@ -14,6 +14,7 @@ import pytest
 
 from levain.cli import main as levain_main
 from levain.team import entry as E
+from levain.team import hook as H
 from levain.team.transport import GitLedger, Repo
 
 pytestmark = pytest.mark.skipif(shutil.which("git") is None or shutil.which("ssh-keygen") is None
@@ -299,6 +300,134 @@ def test_hook_denies_edits_inside_the_ledger_worktree(two):
     assert out["hookSpecificOutput"]["permissionDecision"] == "deny"
     assert "levain team record" in out["hookSpecificOutput"]["permissionDecisionReason"]
 
+
+
+# ---- the hook judges a path by identity, not by its spelling (key 1106-1; the class of 1105-49) -----------------
+# A model-supplied `file_path` keeps the case the model wrote (measured: RETURN_cwdprobe.md), and on a case-insensitive
+# volume `/USERS/me/repo/src/x.py` is the same file as `/Users/me/repo/src/x.py`. The gate is a DENY gate, so
+# `_within` asks `pathid.maybe_inside` (True when sure OR unsure). The first four tests build a real alias at run
+# time and SKIP on a case-sensitive filesystem ("no case alias of a directory exists"): a Linux CI run can never red
+# them, only a macOS run can. The `injected fold` test below runs the same hook path on any filesystem.
+
+def _case_alias_of(p) -> str:
+    """``p`` with its letters' case swapped, when this filesystem takes that spelling as the same file; else skip."""
+    real = os.path.realpath(p)
+    alias = real.swapcase()
+    if alias == real or not os.path.exists(os.path.dirname(alias)) or not os.path.samefile(os.path.dirname(alias), os.path.dirname(real)):
+        pytest.skip("this filesystem is case-sensitive: no case alias of a directory exists")
+    return alias
+
+
+def _pre(cwd, path, session="s1", tool="Edit") -> dict:
+    return hook("pretooluse", {"session_id": session, "transcript_path": "/x", "cwd": str(cwd),
+                               "permission_mode": "default", "hook_event_name": "PreToolUse", "tool_name": tool,
+                               "tool_input": {"file_path": path}, "tool_use_id": "t"})
+
+
+@pytest.mark.parametrize("spelling", ["alias path, canonical cwd", "alias path, alias cwd",
+                                      "canonical path, alias cwd (control)", "canonical path, canonical cwd (control)"])
+def test_hook_judges_an_alias_spelled_file_path(two, spelling):
+    """The model writes the file in other case (an injected `/USERS/...`, or the case it was typed in): the ruling still
+    governs it. macOS only (skips on a case-sensitive filesystem). Before the fix the first two returned `{}`."""
+    tmp, ana, ben = two
+    ben = Path(os.path.realpath(ben))
+    assert team("sync", repo=ben) == 0
+    canon_file = str(ben / "src" / "settlement.py")
+    alias_file, alias_cwd = _case_alias_of(canon_file), _case_alias_of(ben)
+    path, cwd = {"alias path, canonical cwd": (alias_file, str(ben)), "alias path, alias cwd": (alias_file, alias_cwd),
+                 "canonical path, alias cwd (control)": (canon_file, alias_cwd),
+                 "canonical path, canonical cwd (control)": (canon_file, str(ben))}[spelling]
+    out = _pre(cwd, path)
+    assert out["hookSpecificOutput"]["permissionDecision"] == "deny", out
+    assert "never delete or rename" in out["hookSpecificOutput"]["permissionDecisionReason"]
+    assert "] src/settlement.py is governed by" in out["hookSpecificOutput"]["permissionDecisionReason"]   # the repo-relative path, in the real spelling
+
+
+def test_hook_judges_a_relative_file_path_under_an_alias_cwd(two):
+    """A relative `file_path` is joined to the payload `cwd`; when that cwd is an alias the joined path is one too.
+    macOS only (skips on a case-sensitive filesystem). Before the fix this returned `{}`."""
+    tmp, ana, ben = two
+    ben = Path(os.path.realpath(ben))
+    assert team("sync", repo=ben) == 0
+    out = _pre(_case_alias_of(ben), "src/settlement.py")
+    assert out["hookSpecificOutput"]["permissionDecision"] == "deny", out
+    assert "] src/settlement.py is governed by" in out["hookSpecificOutput"]["permissionDecisionReason"]   # the repo-relative path, in the real spelling
+
+
+def test_hook_still_judges_an_alias_path_outside_the_repo_as_outside(two, tmp_path_factory):
+    """The other side of the same fix: widening the test must not pull a path that is NOT in the repo inside it. An alias
+    of a plain directory, of a prefix-sibling of the repo (`<repo>x`) and of the repo's parent stay unjudged.
+    macOS only (skips on a case-sensitive filesystem)."""
+    tmp, ana, ben = two
+    ben = Path(os.path.realpath(ben))
+    assert team("sync", repo=ben) == 0
+    sibling = ben.with_name(ben.name + "x")
+    (sibling / "src").mkdir(parents=True)
+    (sibling / "src" / "settlement.py").write_text("x = 1\n")
+    plain = Path(os.path.realpath(tmp_path_factory.mktemp("plain")))
+    (plain / "src").mkdir()
+    (plain / "src" / "settlement.py").write_text("x = 1\n")
+    for outside in (sibling / "src" / "settlement.py", plain / "src" / "settlement.py", ben.parent / "never_made.py"):
+        assert _pre(ben, _case_alias_of(outside), session="so") == {}, outside
+    assert H._within(_case_alias_of(sibling / "src" / "settlement.py"), ben) is False
+    assert H._within(_case_alias_of(ben.parent / "never_made.py"), ben) is False
+    assert H._within(_case_alias_of(ben / "src" / "settlement.py"), ben) is True
+
+
+def _fold_spelling(path: str):
+    """A stand-in for a case-insensitive volume: walk the real tree and match every component without case."""
+    cur = Path(path).anchor or "/"
+    for part in Path(path).parts[1:]:
+        names = os.listdir(cur)
+        hit = part if part in names else next((n for n in names if n.lower() == part.lower()), None)
+        if hit is None:
+            return None
+        cur = os.path.join(cur, hit)
+    return cur
+
+
+def test_hook_judges_an_alias_spelled_path_with_an_injected_case_fold(two, monkeypatch, capsys):
+    """The same gate on ANY filesystem (Linux CI included): `pathid._fs_spelling` is replaced by a case-insensitive walk
+    over the real tree, and repository discovery is pinned to the real clone, so an upper-cased path reaches the
+    containment test exactly as a macOS alias would. Before the fix the upper-cased path was skipped, no verdict."""
+    from levain import pathid
+    tmp, ana, ben = two
+    ben = Path(os.path.realpath(ben))
+    assert team("sync", repo=ben) == 0
+    real = Repo.discover(ben)
+    monkeypatch.setattr(pathid, "_fs_spelling", _fold_spelling)
+    monkeypatch.setattr(Repo, "discover", classmethod(lambda cls, start: real))
+    outside = ben.with_name(ben.name + "x") / "src" / "settlement.py"
+    outside.parent.mkdir(parents=True)
+    outside.write_text("x = 1\n")
+    assert H._within(str(ben / "src" / "settlement.py").upper(), ben) is True
+    assert H._within(str(outside).upper(), ben) is False                       # a prefix sibling stays outside
+    assert H._within(str(ben.parent / "NEVER_MADE.PY"), ben) is False
+    capsys.readouterr()                                                        # drop what the sync above printed
+    H.pretooluse({"session_id": "f1", "cwd": str(ben), "tool_name": "Edit",
+                  "tool_input": {"file_path": str(ben / "src" / "settlement.py").upper()}})
+    out = json.loads(capsys.readouterr().out)
+    assert out["hookSpecificOutput"]["permissionDecision"] == "deny", out
+    assert "] src/settlement.py is governed by" in out["hookSpecificOutput"]["permissionDecisionReason"]   # the repo-relative path, in the real spelling
+    H.pretooluse({"session_id": "f2", "cwd": str(ben), "tool_name": "Edit", "tool_input": {"file_path": str(outside).upper()}})
+    assert capsys.readouterr().out == ""                                       # outside, spelled as an alias: unjudged
+
+
+def test_hook_halts_when_a_possibly_inside_path_cannot_be_placed(two, monkeypatch, capsys):
+    """`_within` is the DENY direction (True when unsure). If it says yes but the path cannot be placed under the repo
+    (a stat error left the question open), the gate halts as it does for any ledger it cannot judge (§3f), never
+    allows silently. Any filesystem."""
+    tmp, ana, ben = two
+    ben = Path(os.path.realpath(ben))
+    assert team("sync", repo=ben) == 0
+    monkeypatch.setattr(H, "_within", lambda path, root: True)
+    monkeypatch.setattr(H, "_rel", lambda path, root: None)
+    capsys.readouterr()                                                        # drop what the sync above printed
+    H.pretooluse({"session_id": "u1", "cwd": str(ben), "tool_name": "Edit",
+                  "tool_input": {"file_path": str(ben / "src" / "settlement.py")}})
+    out = json.loads(capsys.readouterr().out)
+    assert out["hookSpecificOutput"]["permissionDecision"] == "deny"
+    assert "cannot judge" in out["hookSpecificOutput"]["permissionDecisionReason"]
 
 def test_an_unparseable_team_toml_is_uncounted_and_the_counted_team_stands(two):
     tmp, ana, ben = two
