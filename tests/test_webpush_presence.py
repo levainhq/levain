@@ -1,4 +1,4 @@
-"""The phone-push rule over the one intent record (presence 1b): follow (devices on after 10 min without a typed desk message) by default,
+"""The phone-push rule over the one intent record (presence 1b): follow (devices on after 10 min without a typed desk message, or while remote activity is fresh) by default,
 the presets' lets_through, loud over all, and the compat words flow's installed half still calls."""
 from __future__ import annotations
 

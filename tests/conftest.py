@@ -108,9 +108,11 @@ def _no_operator_git_config_reads(monkeypatch):
 def _no_input_idle_source(monkeypatch):
     """The consent hook reads this Mac's real input idle (`levain.consent.auto_away.input_idle_seconds`), so a
     suite run while nobody touches the machine would reach the real reader. Every in-process test gets a fixed
-    reading (0 s) instead, so no test depends on the machine it runs on. (Input at the Mac does not count toward
-    presence: follow reads the typed desk message. It was "no idle source" while a missing reading meant not away.)
-    A test of input idle passes its own reader."""
+    reading (0 s) instead, so no test depends on the machine it runs on; a file that wants another value pins its
+    own (test_consent_away.py pins 5 s). The fixture names still say "laptop" and "idle" for the reading, which is
+    only a sensor: follow turns devices on from the typed desk message or fresh remote activity, never from input
+    at the Mac. It was "no idle source" while a missing reading meant not away. A test of input idle passes its
+    own reader."""
     import levain.consent.auto_away as auto_away
     monkeypatch.setattr(auto_away, "input_idle_seconds", lambda: 0.0)
 

@@ -56,8 +56,9 @@ def _queue(tmp_path: Path, root: object) -> Path:
 
 @pytest.fixture(autouse=True)
 def _at_the_laptop(monkeypatch):
-    """The Mac's input idle is pinned to 5 s so what these tests read does not depend on the machine they run on.
-    (Input at the Mac does not count toward presence: follow reads the typed desk message.)"""
+    """The Mac's input idle reading is pinned to 5 s so what these tests read does not depend on the machine they run
+    on. The reading is only a sensor: follow turns devices on from the typed desk message or fresh remote activity,
+    never from input at the Mac."""
     monkeypatch.setattr(auto_away, "input_idle_seconds", lambda: 5.0)
 
 
