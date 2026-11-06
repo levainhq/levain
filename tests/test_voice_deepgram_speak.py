@@ -167,14 +167,27 @@ def test_the_offered_voices_are_english_aura_2_ids_sorted_without_duplicates_and
     assert len(voices) == 41
 
 
-def test_a_second_listed_voice_is_sent_as_the_model_and_a_voice_outside_the_list_is_refused_before_any_network_use(server):
+def test_a_second_listed_voice_is_sent_as_the_model_and_a_voice_of_another_language_or_family_is_refused_before_any_network_use(server):
     prov, transport = speaker(server)
     prov.speak(FAKE_KEY, "Hi.", "aura-2-zeus-en")
     assert parse_qs(urlsplit(server.received[0]["target"]).query)["model"] == ["aura-2-zeus-en"]
-    for bad in ("aura-2-sirio-es", "aura-1-asteria-en", "aura-2-nobody-en", "aura-2-", "nova"):
+    # L3 r1 (voices): the wire's check is the family and the English shape, not a frozen list, so a voice Deepgram adds
+    # later is sendable once the cockpit offers it; it refuses what is another language's, another family's or malformed
+    for bad in ("aura-2-sirio-es", "aura-1-asteria-en", "aura-2-", "nova", "aura-2-ZEUS-en", "aura-2-zeus-en ", " aura-2-zeus-en",
+                "aura-2-zeus-en\n", "aura-2-zeus-en&speed=2"):
         with pytest.raises(ValueError):
             prov.speak(FAKE_KEY, "Hi.", bad)
-    assert len(server.received) == 1 and len(transport.requests) == 1       # only the listed voice ever left the process
+    assert len(server.received) == 1 and len(transport.requests) == 1       # only the English Aura-2 voice ever left the process
+
+
+def test_a_new_english_voice_of_the_family_is_sendable_and_the_family_follows_the_provider_s_model(server):
+    prov, _ = speaker(server)
+    prov.speak(FAKE_KEY, "Hi.", "aura-2-newvoice-en")                      # not offered by the cockpit yet, still a valid wire id
+    assert parse_qs(urlsplit(server.received[0]["target"]).query)["model"] == ["aura-2-newvoice-en"]
+    other = P.DeepgramProvider(tts_model="aura-3", transport=prov.transport)
+    with pytest.raises(ValueError):                                         # an aura-2 id on an aura-3 provider is the wrong family
+        other.speak(FAKE_KEY, "Hi.", "aura-2-zeus-en")
+    assert len(server.received) == 1
 
 
 @pytest.mark.parametrize("speed,wire", [(0.7, "0.7"), (1.5, "1.5"), (0.85, "0.85"), (1, None), (1.0, None),

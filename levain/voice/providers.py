@@ -84,7 +84,9 @@ DEEPGRAM_TTS_VOICE = "aura-2-thalia-en"         # a model id, the default; one o
 # Every English Aura-2 voice the table "All Available Voices" lists on https://developers.deepgram.com/docs/tts-models (read
 # 2026-11-05), by model id; the default is one of them. The other languages' ids on that page (`-es`, `-nl`, ...) are left
 # out on purpose: the cockpit's voice picker is English-only. How many there are is asserted by a test, not stated here.
-# Sorted, so a reader and a test can compare it by eye. A voice outside this tuple is refused before sending.
+# Sorted, so a reader and a test can compare it by eye. The cockpit's route refuses a voice outside this tuple; the adapter
+# refuses only an id that is not an English voice of its model family, so a voice Deepgram adds later needs this tuple
+# updated to be OFFERED and nothing else.
 DEEPGRAM_TTS_VOICES = (
     "aura-2-amalthea-en", "aura-2-andromeda-en", "aura-2-apollo-en", "aura-2-arcas-en", "aura-2-aries-en",
     "aura-2-asteria-en", "aura-2-athena-en", "aura-2-atlas-en", "aura-2-aurora-en", "aura-2-callista-en",
@@ -431,16 +433,18 @@ class DeepgramProvider:
         return f"https://{HOSTS['deepgram']}{path}?" + urllib.parse.urlencode({**query, "mip_opt_out": "true"})
 
     def speak(self, key: str, text: str, voice: str = DEEPGRAM_TTS_VOICE, speed: float = 1.0) -> bytes:
-        """mp3 bytes for ``text`` (at most :data:`DEEPGRAM_INPUT_CAP` characters). ``voice`` is a voice of the
-        :data:`DEEPGRAM_TTS_VOICES` (an English Aura-2 model id, so the family the meter priced is the one billed; an id
-        outside it, another language's included, is refused before sending). ``speed`` is
+        """mp3 bytes for ``text`` (at most :data:`DEEPGRAM_INPUT_CAP` characters). ``voice`` is an English voice of
+        :attr:`tts_model`'s family (``<tts_model>-<name>-en``, so the family the meter priced is the one billed; another
+        language's, another family's or a malformed id is refused before sending). Which voices are OFFERED is the
+        cockpit's list (:data:`DEEPGRAM_TTS_VOICES`), checked by its route; this check is the wire's. ``speed`` is
         refused outside Aura-2's 0.7-1.5 and sent as the ``speed`` query parameter unless it is 1.0 (Deepgram's default)."""
         secret = _Key(key)
         del key
         with secret:
             _need_speech(text, speed, DEEPGRAM_INPUT_CAP, (DEEPGRAM_SPEED_MIN, DEEPGRAM_SPEED_MAX))
-            if _need_voice(voice) not in DEEPGRAM_TTS_VOICES:
-                raise ValueError("voice is not one of the offered Aura-2 voices")
+            voice = _need_voice(voice)
+            if re.fullmatch(re.escape(self.tts_model) + r"-[a-z]+-en", voice) is None:
+                raise ValueError("voice is not an English voice of the provider's model family")
             query = {"model": voice, "encoding": "mp3"}
             if speed != 1.0:
                 query["speed"] = repr(float(speed))     # round-trips: a six-digit format would send 1.0000001 as the default
