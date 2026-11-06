@@ -5726,27 +5726,11 @@ def _build_room_serve(room: Path) -> Any:
 
 
 def _canonical_path(p: Path) -> Path:
-    """``p`` resolved AND spelled as the filesystem spells it (roomfix2 K1). ``Path.resolve()`` follows links but keeps
-    the case it was given, so on a case-insensitive filesystem ``/USERS/me`` resolves to itself. The nearest existing
-    ancestor is asked for its own path (``F_GETPATH`` where the platform has it: macOS, which also answers a firmlink
-    alias with the canonical name); the part that does not exist yet is joined on as given."""
-    import fcntl
-    import os
+    """``p`` resolved AND spelled as the filesystem spells it (roomfix2 K1): :func:`levain.pathid.canonical`, kept under
+    this name because ``--room`` and its tests call it here."""
+    from levain.pathid import canonical
 
-    p = p.resolve()
-    tail: list = []
-    base = p
-    while not base.exists() and base != base.parent:
-        tail.append(base.name)
-        base = base.parent
-    getpath = getattr(fcntl, "F_GETPATH", None)
-    if getpath is not None:
-        fd = os.open(base, os.O_RDONLY)
-        try:
-            base = Path(os.fsdecode(fcntl.fcntl(fd, getpath, bytes(1024)).split(b"\0", 1)[0]))
-        finally:
-            os.close(fd)
-    return base.joinpath(*reversed(tail))
+    return canonical(p)
 
 
 def _room_dir_refusal(cwd: Path, queue: Path) -> None:
@@ -5772,10 +5756,8 @@ def _room_dir_refusal(cwd: Path, queue: Path) -> None:
         return (st.st_dev, st.st_ino)
 
     def inside(child: Path, root: Path) -> bool:
-        if child == root or root in child.parents:
-            return True
-        want = ident(root)
-        return want is not None and any(ident(c) == want for c in (child, *child.parents))
+        from levain.pathid import maybe_inside      # a DENY site: a stat that fails counts as inside, so it refuses
+        return maybe_inside(root, child)
 
     if inside(home, cwd):
         # named by identity too (roomfix3 LOW): a spelling only the (st_dev, st_ino) match catches is still home itself
