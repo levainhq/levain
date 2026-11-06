@@ -56,11 +56,14 @@
   function modelWords(m) { return typeof m === "string" && m ? "Model in use: " + m : ""; }
 
   // A Read's result: the vendor numbers every line (``cat -n``: a right-aligned number, a tab, the line). The number is the
-  // vendor's formatting and not the file's text, so it is not drawn. A tool result carries no tool name, so the test is the
-  // shape: the leading run of lines that open with a number and a tab, each one more than the last; the run ends at the first
-  // line that is not the next number. Display only: the record is not changed. This is a COPY of withoutLineNumbers in
-  // room_view.js (two served files with no shared loader); tests/test_thread_rows_1105.py holds the two to the same answers.
+  // vendor's formatting and not the file's text, so it is not drawn. Only a result of the tool named "Read" is read this way
+  // (``tool_name``, the vendor's own name, kept on the row); a result of any other tool is drawn as recorded, and a row stored
+  // before the name was kept (null) falls back to the shape: the leading run of lines that open with a number and a tab, each
+  // one more than the last; the run ends at the first line that is not the next number. Display only: the record is not
+  // changed. This is a COPY of withoutLineNumbers and stripsNumbers in room_view.js (two served files with no shared loader);
+  // tests/test_thread_rows_1105.py holds the two to the same answers.
   var NUMBERED = /^ *(\d+)\t/;
+  function stripsNumbers(it) { return it.tool_name == null || it.tool_name === "Read"; }
   function withoutLineNumbers(text) {
     var lines = text.split("\n"), n = 0, prev = -1;
     for (; n < lines.length; n++) {
@@ -79,7 +82,7 @@
     return {
       gseq: it.gseq, kind: it.kind, label: label(it.kind), who: who, ref: it.ref == null ? "" : String(it.ref),
       text: own(APPROVAL_WORDS, it.kind) ? APPROVAL_WORDS[it.kind]
-        : (it.body == null ? "" : (it.kind === "vendor_tool_result" ? withoutLineNumbers(String(it.body)) : String(it.body))),
+        : (it.body == null ? "" : (it.kind === "vendor_tool_result" && stripsNumbers(it) ? withoutLineNumbers(String(it.body)) : String(it.body))),
       status: status, unverified: it.unverified === true, truncated: it.truncated === true,
       tool: it.tool ? { open: it.tool.open === true } : null,
       collapsible: own(COLLAPSED_KINDS, it.kind),

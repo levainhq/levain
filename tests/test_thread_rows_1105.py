@@ -23,8 +23,10 @@ def _row(gseq, kind, source, ref, launch, body, status=None):
     return TimelineRow(gseq, kind, source, ref, launch, status, body, "2026-11-05T21:48:38+00:00", None)
 
 
-def _results(*bodies):
-    return [threads._item(_row(i + 1, "vendor_tool_result", "vendor", "tool_result:toolu_x%d" % i, "L1", b), {}, set())
+def _results(*bodies, tool_name=None):
+    """The items the page is given for results of ``tool_name`` (None: a row stored before the name was kept, no fact)."""
+    facts = {} if tool_name is None else {("L1", "tool_result:toolu_x%d" % i): (None, 0, 0, tool_name) for i in range(len(bodies))}
+    return [threads._item(_row(i + 1, "vendor_tool_result", "vendor", "tool_result:toolu_x%d" % i, "L1", b), facts, set())
             for i, b in enumerate(bodies)]
 
 
@@ -108,12 +110,24 @@ def test_a_reads_line_numbers_are_not_drawn_and_no_other_leading_number_is_touch
     """Reproduced: the body of a Read's result drew "     1\\t# CLAUDE.md ..." and its peek "1\\t# CLAUDE.md". The vendor prefixes every
     line with a right-aligned number and a tab (``cat -n``); a work thread's result carries no tool name either, so the test is
     the shape: the leading run of consecutive "<number><tab>" lines. Only a tool result is read this way."""
-    stream = _results(*BODIES) + [threads._item(_row(20, "vendor_agent_text", "vendor", "agent_text:20", "L1", "1\tan agent line\n2\tmore"), {}, set())]
-    g = _lines(tmp_path, stream)
-    assert [x["text"] for x in g[:len(BODIES)]] == STRIPPED, g
-    assert g[0]["peek"] == "# CLAUDE.md — flow", g[0]                       # the one-line summary of the closed row, too
-    assert g[-1]["text"] == "1\tan agent line\n2\tmore", g[-1]               # an agent's own words are never read as a file
+    agent = threads._item(_row(20, "vendor_agent_text", "vendor", "agent_text:20", "L1", "1\tan agent line\n2\tmore"), {}, set())
+    for name in ("Read", None):                                              # a Read, and a row stored before the name was kept
+        g = _lines(tmp_path, _results(*BODIES, tool_name=name) + [agent])
+        assert [x["text"] for x in g[:len(BODIES)]] == STRIPPED, (name, g)
+        assert g[0]["peek"] == "# CLAUDE.md — flow", g[0]                    # the one-line summary of the closed row, too
+        assert g[-1]["text"] == "1\tan agent line\n2\tmore", g[-1]            # an agent's own words are never read as a file
 
+
+@needs_browser
+def test_a_result_of_another_tool_keeps_its_numbers(tmp_path):
+    """Reproduced (1106-1 striptool): a Bash result ``1\\talpha\\n2\\tbeta`` (``nl``, a table, a cut) drew without its numbers, because the
+    strip went by shape alone. The row now carries the vendor's tool name (``tool_name``) and only "Read" is stripped."""
+    body = "1\talpha\n2\tbeta\n3\tgamma"
+    for name in ("Bash", "Grep", "read", "Read "):                            # an exact match only: no case folding, no trimming
+        g = _lines(tmp_path, _results(body, tool_name=name))
+        assert g[0]["text"] == body, (name, g)
+    assert _lines(tmp_path, _results(body, tool_name="Read"))[0]["text"] == "alpha\nbeta\ngamma"
+    assert _lines(tmp_path, _results(body))[0]["text"] == "alpha\nbeta\ngamma"      # no name stored: today's shape rule
 
 def _stop_state(tmp_path, stream, stoppable=True, launch="L1", gap=False):
     """None when the thread draws no Stop, else whether the Stop button is disabled."""
@@ -195,9 +209,14 @@ def test_stop_follows_the_turn_as_the_thread_is_read_again_and_a_raced_stop_keep
 _AGREE = """const fs = require("fs");
 const rv = require(process.argv[2] + "/room_view.js"), tv = require(process.argv[2] + "/thread_view.js");
 const bodies = JSON.parse(fs.readFileSync(process.argv[3], "utf8"));
-const item = (b) => ({gseq: 1, kind: "vendor_tool_result", source: "vendor", ref: "tool_result:x", launch_id: "L1", body: b, at: ""});
-process.stdout.write(JSON.stringify(bodies.map(b => ({room: rv.lineModel(item(b)).text,
-  thread: tv.threadModel({thread_id: "t1", launch_id: "L1", stream: [item(b)]}).stream[0].text}))));
+const item = (b, name) => { const it = {gseq: 1, kind: "vendor_tool_result", source: "vendor", ref: "tool_result:x", launch_id: "L1", body: b, at: ""};
+  if (name !== "absent") it.tool_name = name; return it; };
+const out = {};
+for (const name of ["Read", "Bash", null, "absent"]) {
+  out[String(name)] = bodies.map(b => ({room: rv.lineModel(item(b, name)).text,
+    thread: tv.threadModel({thread_id: "t1", launch_id: "L1", stream: [item(b, name)]}).stream[0].text}));
+}
+process.stdout.write(JSON.stringify(out));
 """
 
 
@@ -212,9 +231,12 @@ def test_the_room_and_the_thread_strip_a_reads_numbers_alike(tmp_path):
     fixtures.write_text(json.dumps(bodies))
     res = subprocess.run([NODE, str(script), str(WEB), str(fixtures)], capture_output=True, text=True, timeout=60)
     assert res.returncode == 0, res.stderr
-    got = json.loads(res.stdout)
-    assert [g["room"] for g in got] == [g["thread"] for g in got], got
-    assert got[0]["thread"] == "# CLAUDE.md — flow\n\nbody line"
+    by_name = json.loads(res.stdout)
+    for name, got in by_name.items():                    # under every name (a missing key and a null alike) the two views agree
+        assert [g["room"] for g in got] == [g["thread"] for g in got], (name, got)
+    assert by_name["Read"][0]["thread"] == "# CLAUDE.md — flow\n\nbody line"
+    assert by_name["null"] == by_name["absent"] == by_name["Read"]          # no name: today's shape rule, the Read's answer
+    assert [g["thread"] for g in by_name["Bash"]] == bodies         # any other tool: drawn exactly as recorded
 
 
 _AGREE_RUNNING = """const fs = require("fs");

@@ -253,18 +253,23 @@ def thread_list(directory: Path | str) -> dict[str, Any]:
         conn.close()
 
 
-def _event_facts(conn: sqlite3.Connection, launches: set[str]) -> tuple[dict[tuple[str, str], tuple[str | None, int, int]], bool]:
-    """``({(launch_id, key): (call_id, truncated, backfill)}, gap)``; ``gap`` is true when any launch's latest cursor
-    row says the driver could not catch up, or the stream holds a ``gap`` event. A table the store lacks adds nothing."""
-    facts: dict[tuple[str, str], tuple[str | None, int, int]] = {}
+_Fact = tuple[str | None, int, int, str | None]       # (call_id, truncated, backfill, tool_name)
+
+
+def _event_facts(conn: sqlite3.Connection, launches: set[str]) -> tuple[dict[tuple[str, str], _Fact], bool]:
+    """``({(launch_id, key): (call_id, truncated, backfill, tool_name)}, gap)``; ``gap`` is true when any launch's latest
+    cursor row says the driver could not catch up, or the stream holds a ``gap`` event. A table the store lacks adds
+    nothing, and a store this reader opens read-only before the writer has added ``tool_name`` gives every name None."""
+    facts: dict[tuple[str, str], _Fact] = {}
     gap = False
     has_events, has_cursors = _has(conn, "chat_events"), _has(conn, "chat_cursors")
+    named = has_events and any(r[1] == "tool_name" for r in conn.execute("PRAGMA table_info(chat_events)"))
     for launch in launches:
         if has_events:
-            for key, call_id, truncated, backfill, kind in conn.execute(
-                    "SELECT vendor_event_key, call_id, truncated, backfill, kind FROM chat_events WHERE launch_id = ?",
-                    (launch,)):
-                facts[(launch, key)] = (call_id, truncated, backfill)
+            for key, call_id, truncated, backfill, kind, tool_name in conn.execute(
+                    "SELECT vendor_event_key, call_id, truncated, backfill, kind, %s FROM chat_events WHERE launch_id = ?"
+                    % ("tool_name" if named else "NULL"), (launch,)):
+                facts[(launch, key)] = (call_id, truncated, backfill, tool_name)
                 gap = gap or kind == "gap"
         if has_cursors:
             last = conn.execute("SELECT gap FROM chat_cursors WHERE launch_id = ? ORDER BY seq DESC LIMIT 1",
@@ -273,9 +278,9 @@ def _event_facts(conn: sqlite3.Connection, launches: set[str]) -> tuple[dict[tup
     return facts, gap
 
 
-def _item(row: chat.TimelineRow, facts: Mapping[tuple[str, str], tuple[str | None, int, int]],
+def _item(row: chat.TimelineRow, facts: Mapping[tuple[str, str], _Fact],
           done: set[tuple[str, str]]) -> dict[str, Any]:
-    call_id, truncated, backfill = facts.get((row.launch_id or "", row.ref_id), (None, 0, 0))
+    call_id, truncated, backfill, tool_name = facts.get((row.launch_id or "", row.ref_id), (None, 0, 0, None))
     # an approval's ref is the kind alone and its body is dropped: the vendor's control-request id is not a queue request
     # id, and a driver may put the tool name, its input or that id in the body, so none of it is offered
     view_approval = row.kind in _VIEW_APPROVAL_KINDS
@@ -290,6 +295,10 @@ def _item(row: chat.TimelineRow, facts: Mapping[tuple[str, str], tuple[str | Non
         item["unverified"] = True       # no signature check exists on the record, so the view never says "verified"
     if row.kind == "vendor_tool_call" and call_id:
         item["tool"] = {"call_id": call_id, "open": (row.launch_id or "", call_id) not in done}
+    if row.kind in ("vendor_tool_call", "vendor_tool_result"):
+        # the vendor's own name for the tool (None for a row stored before the column existed): a page strips a Read's line
+        # numbers only for "Read", and keeps its shape rule for None
+        item["tool_name"] = tool_name
     return item
 
 
@@ -317,7 +326,7 @@ def thread_stream(directory: Path | str, thread_id: str, service: Any = None) ->
                 "SELECT l.launch_id FROM launches l, json_each(l.threads) j WHERE j.value = ?",
                 (thread_id,))} if _has(conn, "launches") else set()
             facts, gap = _event_facts(conn, launches)
-            done = {(lid, c) for (lid, k), (c, _t, _b) in facts.items() if k.startswith("tool_result:") and c}
+            done = {(lid, f[0]) for (lid, k), f in facts.items() if k.startswith("tool_result:") and f[0]}
             launch = _worker_launch(conn, thread_id)
             return {"thread_id": thread_id, "launch_id": launch, "gap": gap, "model": model_in_use(service, launch),
                     "stoppable": stoppable(service, launch),

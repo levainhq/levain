@@ -90,11 +90,13 @@
   }
 
   // A Read's result: the vendor numbers every line (``cat -n``: a right-aligned number, a tab, the line). The number is the
-  // vendor's formatting and not the file's text, so it is not drawn. The record carries no tool name for a result and the
-  // room has no shell (ROOM_TOOLS: Read, Grep, Glob, WebSearch; a grep's numbers take a colon), so the test is the shape: the
-  // leading run of lines that open with a number and a tab, each one more than the last. The run ends at the first line that
-  // is not the next number; an error body and a refusal are never read as a file. Display only: the record is not changed.
+  // vendor's formatting and not the file's text, so it is not drawn. Only a result of the tool named "Read" is read this way
+  // (``tool_name``, the vendor's own name, kept on the row); a result of any other tool is drawn as recorded, and a row stored
+  // before the name was kept (null) falls back to the shape: the leading run of lines that open with a number and a tab, each
+  // one more than the last. The run ends at the first line that is not the next number; an error body and a refusal are never
+  // read as a file. Display only: the record is not changed.
   var NUMBERED = /^ *(\d+)\t/;
+  function stripsNumbers(it) { return it.tool_name == null || it.tool_name === "Read"; }
   function withoutLineNumbers(text) {
     var lines = text.split("\n"), n = 0, prev = -1;
     for (; n < lines.length; n++) {
@@ -122,7 +124,7 @@
       var un = unwrap(text); text = un.text; tag = un.tag;
       refusal = refusalOf(text, tag);
       if (refusal) text = REFUSAL_TEXT[refusal];
-      else if (!tag) text = withoutLineNumbers(text);
+      else if (!tag && stripsNumbers(it)) text = withoutLineNumbers(text);
     }
     // a hook of the operator's own settings starting in the child (body e.g. "SessionStart:startup") and one that ended
     // in success are recorded as error-kind rows too (claude_session._on_hook, ref "error:hook_started:<id>"); they are
