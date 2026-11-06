@@ -46,6 +46,7 @@ from pathlib import Path
 from types import MappingProxyType
 from typing import Any
 
+from levain import pathid       # containment by identity (stdlib-only leaf); the consent root refusal's home test
 # the link-signature verifier lives in levain.authority_sig, so root's route-map check verifies without importing this
 # store; every name is re-exported here, and this module's own calls go through these module attributes
 from levain.authority_sig import (_WEBAUTHN_SIG_TYPE, NAMESPACE, AuthorityError, VerifierUnavailable,
@@ -2590,9 +2591,14 @@ def _require_aware(now: Any) -> None:
 def consent_root_problem(workspace: str, *, home: str | os.PathLike[str]) -> str | None:
     """Why the directory ``workspace`` names, on THIS machine, cannot be a consent grant's root (None when it can):
     it is ``/``, or ``home`` (this machine's home directory) or above it. Read at append and again at every
-    decision, since a log written elsewhere names another home."""
+    decision, since a log written elsewhere names another home.
+
+    A DENY site, so the direction is :func:`levain.pathid.maybe_inside` (the home is surely or possibly under the
+    workspace, by identity: ``/USERS/me`` is ``/Users/me`` on a case-insensitive volume, and ``realpath`` keeps the case
+    it was given). The lexical test stays beside it, so what the string test refused it still refuses."""
     home = os.fspath(home)
-    if workspace == "/" or any(_path_within(h, workspace) for h in {os.path.normpath(home), os.path.realpath(home)}):
+    if workspace == "/" or any(_path_within(h, workspace) for h in {os.path.normpath(home), os.path.realpath(home)}) \
+            or (os.path.isabs(workspace) and pathid.maybe_inside(workspace, home)):
         return f"the workspace {workspace[:200]} is / or the home directory or above it; name a project directory"
     return None
 
