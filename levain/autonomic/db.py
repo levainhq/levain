@@ -31,6 +31,14 @@ store, so such a process left running would keep reading and writing the ``/2`` 
 those releases opens it (nothing outside ``levain.autonomic`` builds a store object), which is why the migration
 takes no lock against them.
 
+The same order holds for the AGENT schema marker (``meta.agent_schema``), which this binary moves forward in the
+opening transaction (:func:`levain.autonomic.agent_tables.migrate_agent_schema`): stop every process of an older levain
+that has the store open before this binary opens it. An older ``levain agents`` verb is a fresh process and refuses a
+newer marker by name, but a process that opened the store BEFORE the migration (a running daemon) keeps reading and
+writing the tables it knows, and cannot see the newer ones. :class:`levain.agents.store.AgentStore` checks the agent
+marker inside every transaction, so from this marker on a held object is stopped at its next transaction by the next
+bump; the processes that predate that check are not.
+
 The directory is created ``0700``; an existing one keeps its mode. A registry kept in the earlier JSON file format
 (this package's or the vagus package's) enters only through
 :meth:`levain.autonomic.binding.BindingStore.migrate_json`, a one-way import.
@@ -216,9 +224,10 @@ class AutonomicDB:
             # a new store gets its audit table here; a /1 store is migrated (marker and table, in this
             # transaction); any other marker raises and the transaction rolls back, leaving the store as it was
             migrate_to_v2(conn)
-            # an agent schema /2 store (0.11.27) is taken to /3 here, inside this transaction (P7-A §4). One whose agent
-            # objects do not reach /3 is left /2 (the migration undid its own writes) and the rest of the store opens
-            # as before: `levain agents` refuses it. Any other agent marker is not touched here.
+            # an agent schema /2 store (0.11.27) or /3 store is taken to the current marker here, inside this
+            # transaction (P7-A §4, K2a). One whose agent objects do not reach it is left at the marker it had (the
+            # migration undid its own writes) and the rest of the store opens as before: `levain agents` refuses it.
+            # Any other agent marker is not touched here.
             try:
                 migrate_agent_schema(conn)
             except AgentSchemaNotMigrated:

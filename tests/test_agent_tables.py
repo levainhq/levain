@@ -1,4 +1,4 @@
-"""F0: the agent DDL, its seventeen triggers and the agent schema check (A0 r7 §3.5, §3.7, §4.2).
+"""F0: the agent DDL, its twenty-three triggers and the agent schema check (A0 r7 §3.5, §3.7, §4.2).
 
 Built from ``a0_scratch/r6_schema_run.py`` (A0 §1.5), whose checks are asserted here against ``levain.autonomic.agent_tables``
 itself: each trigger refuses its own bad write with its own message and is the only refusal on that write; the legitimate
@@ -15,9 +15,13 @@ import pytest
 
 from levain.autonomic import agent_tables as at
 from levain.autonomic.db import DB_NAME, AutonomicDB
+from tests import _agent_history as hist
+from tests._agent_history import V2_RESERVATIONS_SQL
 
 # `sha256("\n".join(AGENT_OBJECT_DDL))`. The compare in check_agent_schema is byte-exact against these constants.
-DDL_SHA256 = "007d65fdaeaa5c07a9b70939fdd9926e0b379b271d6bbddde0cd2a579ef1f451"
+DDL_SHA256 = "ff2fc2a71f1e847405f5e0eb3f42c4165245897062bf2ae9e674a53f9cee17f9"
+# the /3 part of it, unchanged since /3 (K2a only appended): the same hash the whole DDL had before K2a
+DDL_V3_SHA256 = "007d65fdaeaa5c07a9b70939fdd9926e0b379b271d6bbddde0cd2a579ef1f451"
 
 NOW = "2026-10-30T18:00:00Z"
 
@@ -27,9 +31,21 @@ def test_the_agent_ddl_is_pinned():
     assert got == DDL_SHA256, "an agent DDL edit is a new agent schema marker with a migration (A0 §3.5)"
 
 
+def test_the_v3_part_of_the_ddl_is_unchanged_and_the_saved_historical_modules_are_unedited():
+    """K2a appends; it never edits a /3 statement. The frozen modules the migration tests build stores from are the
+    bytes of the tags they name, so a changed past is a red test."""
+    assert hashlib.sha256("\n".join(at.AGENT_DDL_V3).encode()).hexdigest() == DDL_V3_SHA256
+    assert at.AGENT_OBJECT_DDL == at.AGENT_DDL_V3 + at.OPERATOR_DDL_V4
+    assert hashlib.sha256(hist.V2_FILE.read_bytes()).hexdigest() == hist.V2_SHA256
+    assert hashlib.sha256(hist.V3_FILE.read_bytes()).hexdigest() == hist.V3_SHA256
+    v3 = hist.load(hist.V3_FILE, "agent_tables_v3_pin")
+    assert hashlib.sha256("\n".join(v3.AGENT_OBJECT_DDL).encode()).hexdigest() == DDL_V3_SHA256
+    assert tuple(v3.AGENT_OBJECT_DDL) == at.AGENT_DDL_V3
+
+
 def test_the_object_names_are_the_spec():
-    assert len(at.AGENT_TABLES) == 8 and len(at.AGENT_TRIGGERS) == 17
-    assert at.AGENT_SCHEMA == "levain-agent-schema/3"
+    assert len(at.AGENT_TABLES) == 10 and len(at.AGENT_TRIGGERS) == 23
+    assert at.AGENT_SCHEMA == "levain-agent-schema/4"
     ref = at.reference_master()
     assert sorted(r[1] for r in ref if r[0] == "trigger") == sorted(at.AGENT_TRIGGERS)
     assert sorted(r[1] for r in ref if r[0] == "table") == sorted(at.AGENT_TABLES)
@@ -177,10 +193,10 @@ def test_agent_objects_with_no_marker_are_refused_and_nothing_is_created(good, t
 
 def test_an_unknown_marker_is_refused(good, tmp_path):
     t = tampered(good, tmp_path, "marker2", [
-        "UPDATE meta SET value = 'levain-agent-schema/4' WHERE key = 'agent_schema'"])
+        "UPDATE meta SET value = 'levain-agent-schema/5' WHERE key = 'agent_schema'"])
     reason = at.check_agent_schema(t)
     assert reason is not None and reason.startswith("unknown agent schema marker")
-    assert "'levain-agent-schema/4'" in reason
+    assert "'levain-agent-schema/5'" in reason
     t.close()
 
 
@@ -296,6 +312,10 @@ def seed(c):
     c.execute("UPDATE agent_occurrences SET state='done', reason='completed', ended_at=? WHERE occurrence_id='o-done'",
               (NOW,))
     c.execute("INSERT INTO agent_specs VALUES ('ag-1', 1, 's1', 'r1', '{}', ?)", (NOW,))
+    # K2a: the registered spec ag-1, the store's one operator agent record, and ag-1's role attached to it
+    c.execute("INSERT INTO agents VALUES ('ag-1', 'scribe', 1, 'registered', 'active', 0, ?)", (NOW,))
+    c.execute("INSERT INTO agent_operator VALUES (1, 'oa-1', ?)", (NOW,))
+    c.execute("INSERT INTO agent_attachments VALUES ('ag-1', 'scribe', ?)", (NOW,))
     c.execute("INSERT INTO agent_bars (bar_id, agent_id, barred_at, head_seq_at_bar) VALUES ('ab-open','ag-1',?,5)",
               (NOW,))
     c.execute("INSERT INTO agent_bars (bar_id, agent_id, barred_at, head_seq_at_bar, closed_at, reason)"
@@ -342,6 +362,18 @@ TRIGGER_CASES = {
                               " VALUES ('ab-2','ag-1',?,6)", (NOW,), "a bar is never replaced"),
     "agent_bars_identity": ("UPDATE agent_bars SET agent_id='ag-7' WHERE bar_id='ab-open'", (),
                             "bar identity is immutable"),
+    # K2a: the REPLACE forms are the ones no constraint refuses with the trigger gone (slot 1 replaces the row), so
+    # "the only refusal on its write" holds for them; the plain second row is the CHECK's and the PRIMARY KEY's too
+    "agent_operator_no_replace": ("INSERT OR REPLACE INTO agent_operator VALUES (1, 'oa-2', ?)", (NOW,),
+                                  "one agent per agent store"),
+    "agent_operator_frozen": ("UPDATE agent_operator SET record_id = 'oa-9'", (),
+                              "the operator agent record is immutable"),
+    "agent_operator_keep": ("DELETE FROM agent_operator", (), "the operator agent record is never deleted"),
+    "agent_attachments_no_replace": ("INSERT OR REPLACE INTO agent_attachments VALUES ('ag-1', 'other', ?)", (NOW,),
+                                     "an attachment is written once, to the store's agent, for a registered spec"),
+    "agent_attachments_frozen": ("UPDATE agent_attachments SET role_name = 'other'", (),
+                                 "an attachment is immutable"),
+    "agent_attachments_keep": ("DELETE FROM agent_attachments", (), "an attachment is never deleted"),
 }
 
 
@@ -533,33 +565,36 @@ def test_a_replace_colliding_only_on_rowid_is_what_the_pragma_still_closes(tmp_p
 
 # ------------------------------------------------------------------ the /2 -> /3 migration (P7-A §4)
 
-# agent_reservations as 0.11.27 stored it: the table a real /2 store (made by the P5c-3 opener) holds
-V2_RESERVATIONS_SQL = ("CREATE TABLE agent_reservations (occurrence_id TEXT PRIMARY KEY, agent_id TEXT NOT NULL, "
-                       "window_key TEXT NOT NULL, reserved_usd_micros INTEGER NOT NULL, debited_usd_micros INTEGER, "
-                       "state TEXT NOT NULL CHECK (state IN ('open','settled')), settled_reason TEXT)")
-
-
 @pytest.fixture
-def v2(tmp_path) -> Path:
-    """A /2 store file with two reservation rows. It is the /3 opener's store with the seven columns dropped and the
-    marker set back; the table text is asserted equal to what the /2 code stored, so it is a /2 store, not a lookalike."""
-    store = tmp_path / "v2"
-    with AutonomicDB(store).write():
-        pass
-    path = store / DB_NAME
+def v2(tmp_path, monkeypatch) -> Path:
+    """A /2 store file with two reservation rows, made by v0.11.27's own agent DDL (``tests/_agent_history.py``): it has
+    no table added since, so the migration has real work to do. The table text is asserted equal to what the /2 code
+    stored."""
+    path = hist.make_store(tmp_path / "v2", monkeypatch, "v2")
     c = connect(path)
-    for name, _ in at.RESERVATION_COLUMNS_V3:
-        c.execute(f"ALTER TABLE agent_reservations DROP COLUMN {name}")
-    c.execute("UPDATE meta SET value = ? WHERE key = 'agent_schema'", (at.AGENT_SCHEMA_V2,))
     c.execute("INSERT INTO agent_reservations VALUES ('oc-1','ag-1','w:x',5,NULL,'open',NULL)")
     c.execute("INSERT INTO agent_reservations VALUES ('oc-2','ag-1','w:x',7,3,'settled','actual')")
     assert c.execute("SELECT sql FROM sqlite_master WHERE name = 'agent_reservations'").fetchone()[0] \
         == V2_RESERVATIONS_SQL
+    assert not {r[0] for r in c.execute("SELECT name FROM sqlite_master")} & {"agent_operator", "agent_attachments"}
     c.close()
     return path
 
 
-def test_a_v2_store_migrates_to_v3_and_passes_the_check_with_its_rows_intact(v2):
+@pytest.fixture
+def v3(tmp_path, monkeypatch) -> Path:
+    """A /3 store made by the binary before K2a (a0a64485's agent DDL and its own opener migration), with a spec row."""
+    path = hist.make_store(tmp_path / "v3", monkeypatch, "v3")
+    c = connect(path)
+    c.execute("INSERT INTO agent_specs VALUES ('ag-1', 1, 's1', 'r1', '{}', ?)", (NOW,))
+    c.execute("INSERT INTO agent_reservations (occurrence_id, agent_id, window_key, reserved_usd_micros, state,"
+              " billing) VALUES ('oc-1','ag-1','w:x',5,'open','subscription')")
+    assert not {r[0] for r in c.execute("SELECT name FROM sqlite_master")} & {"agent_operator", "agent_attachments"}
+    c.close()
+    return path
+
+
+def test_a_v2_store_migrates_to_the_current_marker_and_passes_the_check_with_its_rows_intact(v2):
     c = connect(v2)
     assert at.check_agent_schema(c) == "unknown agent schema marker 'levain-agent-schema/2'"
     assert at.migrate_agent_schema(c) is True
@@ -608,8 +643,8 @@ def test_a_run_that_found_some_columns_already_there_finishes_the_job(v2):
     c.close()
 
 
-def test_only_a_v2_marker_migrates_and_the_others_are_still_refused(good, tmp_path):
-    for n, marker in enumerate(("levain-agent-schema/1", "levain-agent-schema/4", None, at.AGENT_SCHEMA)):
+def test_only_a_v2_or_v3_marker_migrates_and_the_others_are_still_refused(good, tmp_path):
+    for n, marker in enumerate(("levain-agent-schema/1", "levain-agent-schema/5", None, at.AGENT_SCHEMA)):
         sqls = [f"UPDATE meta SET value = '{marker}' WHERE key = 'agent_schema'"] if marker else \
             ["DELETE FROM meta WHERE key = 'agent_schema'"]
         t = tampered(good, tmp_path, f"other{n}", sqls)
@@ -668,9 +703,8 @@ def test_a_v2_store_with_no_reservation_table_is_not_migrated_and_says_so(v2):
     c.close()
 
 
-# The /2 file these opener tests use is the `v2` fixture: the /3 opener's store with the seven columns dropped and the
-# marker set back. When this was written its whole sqlite_master (54 rows) and both markers were compared equal to a
-# store made by the d97184c4 opener (the P5c-3 tree, `git archive d97184c4`), so it stands for a 0.11.27 store.
+# The /2 file these opener tests use is the `v2` fixture: a store v0.11.27's own agent DDL made (tests/_agent_history.py),
+# so it carries no table added since.
 
 
 def test_the_opener_migrates_a_v2_store_and_open_agent_store_accepts_it(v2):
@@ -705,7 +739,7 @@ def test_the_opener_leaves_an_altered_v2_store_v2_opens_the_rest_and_agents_refu
         open_agent_store(v2.parent)
 
 
-@pytest.mark.parametrize("marker", ["levain-agent-schema/1", "levain-agent-schema/4"])
+@pytest.mark.parametrize("marker", ["levain-agent-schema/1", "levain-agent-schema/5"])
 def test_the_opener_touches_no_other_agent_marker(v2, marker):
     raw = connect(v2)
     raw.execute("UPDATE meta SET value = ? WHERE key = 'agent_schema'", (marker,))
@@ -766,7 +800,7 @@ def test_a_failing_savepoint_teardown_does_not_replace_the_original_error(v2, pr
     real = connect(v2)
     real.execute("DROP TRIGGER agent_occurrences_one_fire")     # the check fails, so the handler runs
     real.execute("BEGIN IMMEDIATE")
-    c = _FailingConn(real, prefix, sqlite3.OperationalError("no such savepoint: levain_agent_schema_v3"))
+    c = _FailingConn(real, prefix, sqlite3.OperationalError("no such savepoint: levain_agent_schema_migrate"))
     with pytest.raises(at.AgentSchemaNotMigrated, match="did not migrate cleanly"):
         at.migrate_agent_schema(c)
     real.close()
@@ -780,3 +814,166 @@ def test_a_failing_release_on_the_success_path_raises_the_release_error_not_a_ma
         at.migrate_agent_schema(c)
     assert "disk I/O error" in str(ei.value.__cause__)
     real.close()
+
+
+# ------------------------------------------------------------------ K2a: the operator record, the /4 migration chain
+
+
+def _sqlite_master(c):
+    return c.execute("SELECT type, name, sql FROM sqlite_master ORDER BY type, name").fetchall()
+
+
+def test_a_clean_v2_store_made_by_v0_11_27_reaches_v4_through_the_chain(v2):
+    """The chain's first hop: a /2 store has NONE of the /4 objects, so the migration must run both steps and judge the
+    result once, against the /4 reference. (A migrator that checked the /3 hop against the /4 reference would strand
+    every 0.11.27 install: this is that store.)"""
+    c = connect(v2)
+    assert at.agent_marker(c) == at.AGENT_SCHEMA_V2
+    assert at.migrate_agent_schema(c) is True
+    assert at.agent_marker(c) == "levain-agent-schema/4" and at.check_agent_schema(c) is None
+    assert at.agent_master(c) == at.reference_master()    # a migrated store and a fresh one compare equal
+    assert c.execute("SELECT count(*) FROM agent_operator").fetchone()[0] == 0
+    assert c.execute("SELECT count(*) FROM agent_attachments").fetchone()[0] == 0
+    assert c.execute("SELECT count(*) FROM agent_reservations").fetchone()[0] == 2    # the /2 rows survive
+    c.close()
+
+
+def test_a_v3_store_made_by_the_binary_before_k2a_migrates_and_passes_the_check(v3):
+    c = connect(v3)
+    assert at.agent_marker(c) == at.AGENT_SCHEMA_V3
+    assert at.check_agent_schema(c) == "unknown agent schema marker 'levain-agent-schema/3'"
+    assert at.migrate_agent_schema(c) is True
+    assert at.agent_marker(c) == at.AGENT_SCHEMA and at.check_agent_schema(c) is None
+    assert at.agent_master(c) == at.reference_master()
+    assert c.execute("SELECT spec_hash FROM agent_specs").fetchall() == [("s1",)]
+    assert c.execute("SELECT billing FROM agent_reservations").fetchall() == [("subscription",)]
+    assert c.execute("SELECT count(*) FROM agent_operator").fetchone()[0] == 0
+    c.close()
+
+
+def test_the_opener_migrates_a_v3_store_and_the_agent_store_accepts_it(v3):
+    from levain.agents.store import open_agent_store
+
+    store = open_agent_store(v3.parent)
+    with store.read() as c:
+        assert at.agent_marker(c) == at.AGENT_SCHEMA and at.check_agent_schema(c) is None
+        assert c.execute("SELECT spec_hash FROM agent_specs").fetchall() == [("s1",)]
+
+
+def test_a_v3_store_with_an_altered_object_stays_v3_and_the_error_names_v3(v3):
+    c = connect(v3)
+    c.execute("DROP TRIGGER agent_occurrences_one_fire")
+    with pytest.raises(at.AgentSchemaNotMigrated, match=r"the /3 agent schema did not migrate cleanly"):
+        at.migrate_agent_schema(c)
+    assert not c.in_transaction and at.agent_marker(c) == at.AGENT_SCHEMA_V3
+    assert not {r[0] for r in c.execute("SELECT name FROM sqlite_master")} & {"agent_operator", "agent_attachments"}
+    c.close()
+
+
+def test_a_v2_failure_error_names_v2_not_the_hop_it_died_in(v2):
+    c = connect(v2)
+    c.execute("DROP TRIGGER agent_occurrences_one_fire")
+    with pytest.raises(at.AgentSchemaNotMigrated, match=r"the /2 agent schema did not migrate cleanly"):
+        at.migrate_agent_schema(c)
+    c.close()
+
+
+class _RecordingConn(_FailingConn):
+    """A :class:`_FailingConn` that also records every statement it was asked to run, in order."""
+
+    def __init__(self, conn, prefix, error):
+        super().__init__(conn, prefix, error)
+        self.statements: list[str] = []
+
+    def execute(self, sql, *a):
+        self.statements.append(sql)
+        return super().execute(sql, *a)
+
+
+def test_a_failure_in_the_last_step_keeps_nothing_and_the_marker_is_written_only_after_it(v2):
+    """The marker is written ONCE, after the last step. A failure in the /3 -> /4 step must leave the /2 store whole:
+    no reservation column, no /4 table, the /2 marker, and no marker write has even been attempted yet."""
+    real = connect(v2)
+    c = _RecordingConn(real, "CREATE TRIGGER IF NOT EXISTS agent_attachments_no_replace",
+                       sqlite3.OperationalError("injected: the last step fails"))
+    with pytest.raises(at.AgentSchemaNotMigrated, match=r"the /2 agent schema did not migrate cleanly.*injected"):
+        at.migrate_agent_schema(c)
+    assert not any(st.startswith("UPDATE meta") for st in c.statements), c.statements
+    assert not real.in_transaction and at.agent_marker(real) == at.AGENT_SCHEMA_V2
+    assert real.execute("SELECT sql FROM sqlite_master WHERE name = 'agent_reservations'").fetchone()[0] \
+        == V2_RESERVATIONS_SQL
+    assert not {r[0] for r in real.execute("SELECT name FROM sqlite_master")} & {"agent_operator", "agent_attachments"}
+    real.close()
+
+
+def test_a_hand_made_operator_table_of_other_text_is_judged_by_the_final_check_not_kept(v3):
+    c = connect(v3)
+    c.execute("CREATE TABLE agent_operator (slot INTEGER PRIMARY KEY, record_id TEXT)")
+    with pytest.raises(at.AgentSchemaNotMigrated, match=r"the /3 agent schema did not migrate cleanly.*agent_operator"):
+        at.migrate_agent_schema(c)
+    assert at.agent_marker(c) == at.AGENT_SCHEMA_V3 and not c.in_transaction
+    c.close()
+
+
+# the record is a singleton and an attachment is written once: refused on a connection with recursive_triggers OFF
+# (a plain AutonomicDB connection), which is the case the design reproduced; the store's own connections run it ON
+
+
+@pytest.fixture
+def op(tmp_path):
+    p = connect(tmp_path / "op.db")
+    at.create_agent_objects(p)
+    assert p.execute("PRAGMA recursive_triggers").fetchone()[0] == 0
+    p.execute("INSERT INTO agents VALUES ('ag-1', 'scribe', 1, 'registered', 'active', 0, ?)", (NOW,))
+    p.execute("INSERT INTO agents VALUES ('ag-2', 'dream', 1, 'registered', 'active', 0, ?)", (NOW,))
+    yield p
+    p.close()
+
+
+@pytest.mark.parametrize("sql", [
+    "INSERT INTO agent_operator VALUES (1, 'oa-2', ?)",
+    "INSERT INTO agent_operator VALUES (2, 'oa-2', ?)",
+    "INSERT OR REPLACE INTO agent_operator VALUES (1, 'oa-2', ?)",
+    "INSERT OR IGNORE INTO agent_operator VALUES (2, 'oa-2', ?)",
+])
+def test_a_second_operator_record_is_refused_by_the_schema_on_any_connection(op, sql):
+    op.execute("INSERT INTO agent_operator VALUES (1, 'oa-1', ?)", (NOW,))
+    assert refused(op, sql, (NOW,)) == "one agent per agent store"
+    assert op.execute("SELECT record_id FROM agent_operator").fetchall() == [("oa-1",)]
+
+
+def test_a_replace_of_an_attachment_is_refused_with_the_pragma_off_and_the_row_survives(op):
+    op.execute("INSERT INTO agent_operator VALUES (1, 'oa-1', ?)", (NOW,))
+    op.execute("INSERT INTO agent_attachments VALUES ('ag-1', 'scribe', ?)", (NOW,))
+    msg = "an attachment is written once, to the store's agent, for a registered spec"
+    assert refused(op, "INSERT OR REPLACE INTO agent_attachments VALUES ('ag-1', 'other', ?)", (NOW,)) == msg
+    assert refused(op, "INSERT INTO agent_attachments VALUES ('ag-1', 'scribe', ?)", (NOW,)) == msg
+    assert op.execute("SELECT agent_id, role_name FROM agent_attachments").fetchall() == [("ag-1", "scribe")]
+
+
+def test_an_attachment_needs_the_record_and_a_registered_spec(op):
+    msg = "an attachment is written once, to the store's agent, for a registered spec"
+    assert refused(op, "INSERT INTO agent_attachments VALUES ('ag-1', 'scribe', ?)", (NOW,)) == msg    # no record yet
+    op.execute("INSERT INTO agent_operator VALUES (1, 'oa-1', ?)", (NOW,))
+    assert refused(op, "INSERT INTO agent_attachments VALUES ('ag-ghost', 'scribe', ?)", (NOW,)) == msg
+    assert refused(op, "INSERT INTO agent_attachments VALUES ('ag-2', 'dream', ?)", (NOW,)) is None
+
+
+def test_the_rowid_replace_residue_is_closed_by_the_store_pragma_and_open_without_it(tmp_path):
+    """The residue the keyed triggers leave (the same as agent_specs', A0 r7 §4.2): a REPLACE naming an existing rowid
+    deletes that row with no DELETE trigger unless recursive_triggers is on, which the agent store sets on every
+    connection."""
+    out = {}
+    for pragma in (0, 1):
+        p = connect(tmp_path / f"att{pragma}.db")
+        at.create_agent_objects(p)
+        p.execute(f"PRAGMA recursive_triggers = {pragma}")
+        p.execute("INSERT INTO agents VALUES ('ag-1', 'scribe', 1, 'registered', 'active', 0, ?)", (NOW,))
+        p.execute("INSERT INTO agents VALUES ('ag-2', 'dream', 1, 'registered', 'active', 0, ?)", (NOW,))
+        p.execute("INSERT INTO agent_operator VALUES (1, 'oa-1', ?)", (NOW,))
+        p.execute("INSERT INTO agent_attachments VALUES ('ag-1', 'scribe', ?)", (NOW,))
+        rid = p.execute("SELECT rowid FROM agent_attachments").fetchone()[0]
+        out[pragma] = refused(p, "INSERT OR REPLACE INTO agent_attachments (rowid, agent_id, role_name, attached_at)"
+                                 " VALUES (?, 'ag-2', 'dream', ?)", (rid, NOW))
+        p.close()
+    assert out == {0: None, 1: "an attachment is never deleted"}

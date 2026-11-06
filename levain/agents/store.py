@@ -3,7 +3,9 @@
 ``open_agent_store`` refuses what an agent must not run on and hands back an :class:`AgentStore` whose every
 connection has ``PRAGMA recursive_triggers = ON``. A REPLACE over a spec's or a bar's declared key is refused by
 the ``_no_replace`` triggers on any connection; the pragma is what makes a REPLACE that collides only on the implicit
-``rowid`` fire the ``_keep`` triggers (A0 r7 §4.2). The schema is checked once, at open (A0 r7 §6.12). The refusals:
+``rowid`` fire the ``_keep`` triggers (A0 r7 §4.2). The schema is compared byte for byte once, at open (A0 r7 §6.12);
+the agent schema MARKER is read inside every transaction of an opened store (K2a), so a store moved to another marker
+under a held object is refused at that object's next transaction. The refusals:
 
 - a ``levain-autonomic/3`` store: agents run on ``/2`` until the agent-proof slice (R15-5) lands; the store is read
   through a read-only connection and nothing is created or changed;
@@ -21,7 +23,8 @@ from collections.abc import Iterator
 from contextlib import contextmanager
 from pathlib import Path
 
-from levain.autonomic.agent_tables import agent_marker, check_agent_schema, create_agent_objects, has_agent_object
+from levain.autonomic.agent_tables import (AGENT_SCHEMA, AGENT_SCHEMA_PREDECESSORS, agent_marker, check_agent_schema,
+                                           create_agent_objects, has_agent_object)
 from levain.autonomic.db import (DB_NAME, STORE_FORMAT_V1, STORE_FORMAT_V2, AutonomicDB, StoreFormatError,
                                  default_store_dir, store_marker)
 
@@ -49,7 +52,14 @@ class _AgentDB(AutonomicDB):
         return conn
 
 
-def _refusal(reason: str, marker: str | None) -> str:
+def _refusal(reason: str, marker: str | None, *, migrates: bool = False) -> str:
+    """The refusal's words. ``migrates`` is True only from a reader that cannot migrate (the read-only view) looking at
+    a store whose marker is a KNOWN older one: that store is not corrupt, it is old, and the next ``levain agents`` verb
+    of this version (which opens the store for writing) migrates it. Sending that reader to the older levain would
+    point it away from the real way out."""
+    if migrates and marker in AGENT_SCHEMA_PREDECESSORS:
+        return (f"{reason}: {marker} is an older agent schema that the next `levain agents` verb of this version "
+                f"migrates (this read-only look does not)")
     head = (f"{reason}: the agent tables in this store are not the ones this levain writes; restore `{DB_NAME}` "
             f"from a backup made by this version")
     if marker is None:    # no marker names a writer, so a backup is the only way out
@@ -57,9 +67,19 @@ def _refusal(reason: str, marker: str | None) -> str:
     return head + f", or run the levain that wrote marker {marker}"
 
 
+def _check_marker(conn: sqlite3.Connection) -> None:
+    """Inside the caller's transaction, after it began: the agent schema marker is this binary's, else refused. The
+    byte-for-byte compare of the objects runs once, at open; this is the cheap half, so a marker moved by another
+    connection since this object opened (a newer levain's migration) stops a held object at its next transaction."""
+    marker = agent_marker(conn)
+    if marker != AGENT_SCHEMA:
+        reason = "no agent_schema marker" if marker is None else f"unknown agent schema marker {marker!r}"
+        raise AgentStoreRefused(_refusal(reason, marker))
+
+
 class AgentStore:
     """An opened, checked agent store. :meth:`write` is one ``BEGIN IMMEDIATE`` transaction and :meth:`read` a
-    consistent snapshot, both of a store whose ``/2`` format marker is this binary's."""
+    consistent snapshot, both of a store whose ``/2`` format marker and agent schema marker are this binary's."""
 
     def __init__(self, db: _AgentDB) -> None:
         self._db = db
@@ -69,11 +89,13 @@ class AgentStore:
     @contextmanager
     def write(self) -> Iterator[sqlite3.Connection]:
         with self._db.write() as conn:
+            _check_marker(conn)
             yield conn
 
     @contextmanager
     def read(self) -> Iterator[sqlite3.Connection]:
         with self._db.read() as conn:
+            _check_marker(conn)
             yield conn
 
 
@@ -167,7 +189,8 @@ def open_agent_store_view(store_dir: Path | str | None = None) -> AgentStoreView
             return AgentStoreView(None)
         reason = check_agent_schema(conn)
     if reason is not None:
-        raise AgentStoreRefused(_refusal(reason, marker))
+        # this look never migrates: a known older marker is named as old, with the verb that migrates it
+        raise AgentStoreRefused(_refusal(reason, marker, migrates=True))
     return view
 
 
