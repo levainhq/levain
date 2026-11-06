@@ -63,7 +63,10 @@ SERVICES: tuple[Service, ...] = (
     # logs=True: the program's one stderr line for an unnamed failure ("op ... failed: <type> at <where>") is the only
     # cause an `internal-error` answer leaves; without a path launchd threw it away (VM fire, finding 5).
     Service("dispatch_run", "dispatch run server", "_levain_dispatch", ("control", "keys"), "always", logs=True),
-    Service("reaper", "reaper", "root", ("control",), "always"),
+    # logs=True: the reaper's stderr carries `END <s>: quarantined after 3 tries (...)` and its failed-pass lines, which the
+    # doctor rows tell the operator to read in "the reaper's service log"; the plist named no path, so launchd threw them
+    # away (VM v2, finding 5). Root, so the file is under /var/log (see launchd_log_path).
+    Service("reaper", "reaper", "root", ("control",), "always", logs=True),
     Service("pf", "pf anchor", "root", (), "one-shot", hosts=("darwin",), logs=True),
 )
 
@@ -132,11 +135,11 @@ _OWN_LOG_DIR: dict[str, Callable[[HostOS], Path]] = {"_levain_dispatch": dispatc
 
 def launchd_log_path(svc: Service) -> Path:
     """Where launchd appends a logging service's stdout and stderr, so the pf one-shot's "restored pf" / "not retried"
-    line from a boot run, and the dispatch run server's unnamed-failure line, can be read afterwards. A root service's
-    file is under ``/var/log``; another account's is inside the directory that account owns (:data:`_OWN_LOG_DIR`: for
+    line from a boot run, the dispatch run server's unnamed-failure line and the reaper's quarantine line can be read
+    afterwards. A root service's file is under ``/var/log``; another account's is inside the directory that account owns (:data:`_OWN_LOG_DIR`: for
     ``_levain_dispatch`` its store ``L/dispatch``, made by the store rows before any unit is bootstrapped), never a
     directory it cannot create in. Each program keeps its file's size bounded (:func:`levain.slot.services.pf.bound_log`;
-    the dispatch run server's own)."""
+    the dispatch run server's and the reaper's own)."""
     if svc.user in _OWN_LOG_DIR:
         return _OWN_LOG_DIR[svc.user]("darwin") / f"{launchd_label(svc)}.log"
     if svc.user == "root" or not svc.logs:
