@@ -20,6 +20,10 @@ def _enroll(tmp_path: Path, monkeypatch, key_file: Path, root: Path, laptop, *ex
 
 
 def test_a_passkey_enrol_prints_its_signer_line_and_the_sentence(tmp_path: Path, capsys, monkeypatch) -> None:
+    desk = tmp_path / "desk"                        # the hint is for an install that has a desk signer file (1105-36)
+    (desk / "scripts").mkdir(parents=True)
+    (desk / "scripts" / "needs_phill_signers").write_text("")
+    monkeypatch.chdir(desk)
     root, laptop = _cockpit(tmp_path)
     pk = Passkey()
     key_file = tmp_path / "pk.pub"

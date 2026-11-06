@@ -2431,17 +2431,30 @@ def _cmd_cockpit_enroll(args: argparse.Namespace) -> int:
 # signing outage going; so the enrol says it. The principal and namespaces are the form flow's signer list has
 # held for passkeys (an allowed_signers line); levain only prints text and imports nothing from flow. The scope string is
 # the desk's own namespace list for that line, not a namespace levain signs in, so it stays out of the registry.
+# The hint is for an install that HAS a desk signer list: a Levain-only install has none (its own verifiers build their
+# signer text from the key and read no operator-edited list), so a line naming flow's file would send it nowhere. No
+# setting says an install has a desk, so the gate is the file the hint names: found in the working directory or one of
+# its parents (a desk checkout's root, or a directory under it), the hint prints; otherwise nothing does.
 _DESK_SIGNER_PRINCIPAL = "phill"
 _DESK_SIGNER_PASSKEY_SCOPE = "flow-needs-phill,flow-cockpit-message,flow-i3b-resolve"
+_DESK_SIGNER_FILE = Path("scripts") / "needs_phill_signers"
+
+
+def _has_desk_signer_file() -> bool:
+    try:
+        here = Path.cwd().resolve()
+    except OSError:                                    # a removed working directory: there is no desk to find
+        return False
+    return any((d / _DESK_SIGNER_FILE).is_file() for d in (here, *here.parents))
 
 
 def _desk_signer_hint(row: object) -> str:
-    """The second trust-list reminder, for a passkey only (other custodies sign in other namespaces): the sentence and
-    the key's line, or "" for any other key."""
+    """The second trust-list reminder, for a passkey only (other custodies sign in other namespaces) and only where a
+    desk signer file exists: the sentence and the key's line, or "" for any other key or a Levain-only install."""
     from levain.authority import PASSKEY
 
     public_key = getattr(row, "public_key", None)
-    if getattr(row, "custody", None) != PASSKEY or not public_key:
+    if getattr(row, "custody", None) != PASSKEY or not public_key or not _has_desk_signer_file():
         return ""
     return ("Enrolling here does not make a desk accept this passkey's signed answers: add the line below to the "
             "signer list your desk verifies against (flow's scripts/needs_phill_signers); an operator whose desk "
