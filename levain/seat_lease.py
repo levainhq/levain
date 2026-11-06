@@ -403,8 +403,17 @@ def prepare_launch(lane_key: str, remote_url: str, base_sha: str, *, claude_bin:
         if again is None or (again["id"], again["incarnation"]) != (lease["id"], lease["incarnation"]):
             raise SeatLaunchRefused("the seat-root lease is no longer live (revoked, expired or replaced while the "
                                     "clone ran): nothing was launched")
+        egress = None                    # Z2a: the live seat-egress grant, if one is signed; none = today's profile
+        if state is not None:
+            from levain import seat_push
+            try:
+                egress = seat_push.live_egress(state, clock())
+            except seat_push.SeatPushRefused as exc:
+                raise SeatLaunchRefused(str(exc)) from None
+        if egress is not None:
+            profile_kw = {"cockpit_root": cockpit_root, "levain_home": _levain_home(), **profile_kw}
         profile = build_seat_profile(clone, return_dir, claude_bin=claude_bin, python=python, lease=lease,
-                                     key_dir=key_dir, **profile_kw)
+                                     key_dir=key_dir, egress=egress, **profile_kw)
         row = {**row, "profile_digest": profile.digest(), "claude": _binary_ident(claude_bin)}
         mint = append_mint(key_dir, row)
     except BaseException:
@@ -412,6 +421,11 @@ def prepare_launch(lane_key: str, remote_url: str, base_sha: str, *, claude_bin:
             shutil.rmtree(p, ignore_errors=True)
         raise
     return LaunchPlan(profile, mint)
+
+
+def _levain_home() -> Path:
+    from levain.consent.queue import default_queue_dir
+    return default_queue_dir().parent
 
 
 def _binary_ident(claude_bin: str) -> list[int]:

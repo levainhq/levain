@@ -3623,6 +3623,27 @@ def _add_seat_parser(subparsers: argparse._SubParsersAction, common: object) -> 
     common(revoke)
     lst = lsub.add_parser("list", help="Show the live lease, if any.")
     common(lst)
+    egress = sub.add_parser("egress", help="Sign, renew, revoke and list the seat-egress grant (the lane-branch push).")
+    esub = egress.add_subparsers(dest="seat_egress_cmd", required=True)
+    ecreate = esub.add_parser("create", help="Sign a 14-day grant: a seat's commits reach seat/<lane> on ONE remote, "
+                                             "never another branch (an enrolled laptop-presence key).")
+    ecreate.add_argument("--lanes-parent", dest="lanes_parent", type=Path, required=True,
+                         help="The lease's lanes parent: only clones below it push.")
+    ecreate.add_argument("--remote", required=True, help="The one remote lane branches are pushed to.")
+    ecreate.add_argument("--allow-domain", dest="allow_domains", action="append", default=[], metavar="HOST",
+                         help="A host the seat's sandbox may reach (repeatable; default none).")
+    ecreate.add_argument("--signing-key", dest="signing_key", type=Path, required=True)
+    common(ecreate)
+    erenew = esub.add_parser("renew", help="Re-sign a live grant for 14 more days.")
+    erenew.add_argument("grant_id")
+    erenew.add_argument("--signing-key", dest="signing_key", type=Path, required=True)
+    common(erenew)
+    erevoke = esub.add_parser("revoke", help="Revoke the grant: no later push; commits stay in the clone.")
+    erevoke.add_argument("grant_id")
+    erevoke.add_argument("--signing-key", dest="signing_key", type=Path, required=True)
+    common(erevoke)
+    elist = esub.add_parser("list", help="Show the live grant, if any.")
+    common(elist)
     launch = sub.add_parser("launch", help="Mint a lane's roots under the live lease and validate the launch (does not start claude).")
     launch.add_argument("lane_key")
     launch.add_argument("--remote", required=True, help="The source repository (url or path) to clone.")
@@ -3644,12 +3665,14 @@ def _cmd_seat(args: argparse.Namespace) -> int:
     if args.seat_cmd == "canary":
         from levain.seat_canary import main as canary_main
         return canary_main(args.canary_args)
-    from levain import seat_lease
+    from levain import seat_lease, seat_push
     from levain.cockpit.keys import ssh_signer
     from levain.seat_profile import SeatRefusal
 
     try:
         root = _cockpit_root(args)
+        if args.seat_cmd == "egress":
+            return _cmd_seat_egress(args, root)
         if args.seat_cmd == "launch":
             return seat_lease.launch_seat(args.lane_key, args.remote, args.base,
                                           claude_bin=args.claude or shutil.which("claude") or "claude",
@@ -3676,9 +3699,40 @@ def _cmd_seat(args: argparse.Namespace) -> int:
             print(f"revoked: {args.lease_id} at seq {seq}; later launches refuse, running seats keep their roots")
             if warning:
                 print(f"warning: {warning}", file=sys.stderr)
-    except (seat_lease.SeatLaunchRefused, SeatRefusal, *_cockpit_refusals()) as exc:
+    except (seat_lease.SeatLaunchRefused, seat_push.SeatPushRefused, SeatRefusal, *_cockpit_refusals()) as exc:
         print(f"seat {args.seat_cmd} refused: {exc}", file=sys.stderr)
         return 1
+    return 0
+
+
+def _cmd_seat_egress(args: argparse.Namespace, root: Path) -> int:
+    """``levain seat egress create|renew|revoke|list`` (PATHZERO Z2a; ``levain.seat_push``). Signing is the cockpit key
+    commands' own; nothing here enables a push without a signature."""
+    from levain import seat_lease, seat_push
+    from levain.cockpit.keys import ssh_signer
+
+    if args.seat_egress_cmd == "list":
+        state = seat_lease._replay(root)
+        grant = None if state is None else seat_push.live_egress(state, _utc_now())
+        print("no live seat-egress grant" if grant is None else
+              f"{grant['id']}  lanes {grant['lanes_parent']}  remote {grant['push_remote']}  "
+              f"domains {','.join(grant['allowed_domains']) or '-'}  until {grant['expires_at']}")
+        return 0
+    signer_fp, sign = ssh_signer(args.signing_key)
+    if args.seat_egress_cmd == "create":
+        g = seat_push.create_egress(root, lanes_parent=args.lanes_parent, push_remote=args.remote,
+                                    allowed_domains=args.allow_domains, signer_fp=signer_fp, sign=sign, clock=_utc_now)
+        print(f"signed: {g['id']}: seat/<lane> branches of clones below {g['lanes_parent']} push to {g['push_remote']}, "
+              f"until {g['expires_at']}")
+    elif args.seat_egress_cmd == "renew":
+        print(f"renewed: {args.grant_id} until "
+              f"{seat_lease.renew_lease(root, args.grant_id, signer_fp=signer_fp, sign=sign, clock=_utc_now)}")
+    else:
+        from levain.consent.grants import revoke_grant
+        seq, warning = revoke_grant(root, args.grant_id, signer_fp=signer_fp, sign=sign, clock=_utc_now)
+        print(f"revoked: {args.grant_id} at seq {seq}; no later push, commits stay in the clone")
+        if warning:
+            print(f"warning: {warning}", file=sys.stderr)
     return 0
 
 

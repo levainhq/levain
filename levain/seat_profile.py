@@ -23,7 +23,7 @@ from pathlib import Path
 from typing import Any, Mapping, Sequence
 
 from levain import host_guard as hg
-from levain.authority import SEAT_LEASE_KIND
+from levain.authority import SEAT_EGRESS_KIND, SEAT_LEASE_KIND
 from levain.host_guard import (CC_SEAT_TOOLS, PROTECTED_NAMES, SEAT_SOURCE_ARGS, HostRefusal)
 
 __all__ = ["SeatRefusal", "SeatProfile", "seat_deny_write", "seat_permission_deny", "build_seat_profile",
@@ -212,18 +212,46 @@ def _lease_problems(clone: Path, return_dir: Path, lease: Mapping[str, Any] | No
     return problems
 
 
+def _egress_problems(clone: Path, lease: Mapping[str, Any] | None, egress: Mapping[str, Any] | None,
+                     cockpit_root: Path | str | None, levain_home: Path | str | None) -> list[str]:
+    if egress is None:
+        return []
+    if lease is None:
+        return ["a seat-egress grant needs a lease launch, never the canary's fixed root"]
+    problems = []
+    if egress.get("kind") != SEAT_EGRESS_KIND or egress.get("agent") != "claude_code":
+        problems.append("the egress grant is not a claude_code seat-egress grant")
+    parent = egress.get("lanes_parent")
+    if not isinstance(parent, str) or not os.path.isabs(parent) or _real(parent) == clone or not hg.is_within(clone, parent):
+        problems.append("the clone is not below the egress grant's lanes_parent")
+    if lease.get("lanes_parent") != parent:
+        problems.append("the egress grant's lanes_parent is not the lease's")
+    if not isinstance(egress.get("allowed_domains"), (list, tuple)):
+        problems.append("the egress grant carries no allowed_domains list")
+    if cockpit_root is None or levain_home is None:
+        problems.append("an egress profile needs the cockpit root and the levain home its hook reads")
+    return problems
+
+
 def build_seat_profile(clone: Path, return_dir: Path, *, claude_bin: str, python: str,
                        lease: Mapping[str, Any] | None, key_dir: Path,
                        canary_root: Path | None = None, environ: Mapping[str, str] | None = None,
                        managed: Sequence[tuple[str, Any]] | None = None, platform: str = sys.platform,
-                       home: Path | None = None) -> SeatProfile:
+                       home: Path | None = None, egress: Mapping[str, Any] | None = None,
+                       cockpit_root: Path | str | None = None, levain_home: Path | str | None = None) -> SeatProfile:
     """Build the terminal seat profile, or raise :class:`SeatRefusal` naming every problem found. ``lease=None`` is
     accepted only with ``canary_root`` under the fixed test prefix. Refuses a root that already holds an agent-config
-    target, and an executable (python, claude) a seat could write."""
+    target, and an executable (python, claude) a seat could write.
+
+    ``egress`` is the live ``seat-egress`` grant (PATHZERO Z2a, :mod:`levain.seat_push`) or None. With it the sandbox's
+    ``allowedDomains`` is the grant's ``allowed_domains`` and the profile carries the lane-branch ``Stop`` /
+    ``SessionEnd`` push hook (``cockpit_root`` and ``levain_home`` are what the hook reads, both required); with None
+    both are exactly what they were before Z2a (empty domains, no such hook). A grant never reaches a canary profile."""
     environ = os.environ if environ is None else environ
     clone, return_dir, key_dir = _real(clone), _real(return_dir), _real(key_dir)
     roots = (clone, return_dir)
     problems = _lease_problems(clone, return_dir, lease, canary_root, environ)
+    problems += _egress_problems(clone, lease, egress, cockpit_root, levain_home)
     problems += _roots_problems(clone, return_dir, key_dir)
     if not problems:
         problems += [f"{t} is an agent-config target inside a seat root" for t in
@@ -236,7 +264,8 @@ def build_seat_profile(clone: Path, return_dir: Path, *, claude_bin: str, python
         raise SeatRefusal("; ".join(problems))
 
     sandbox = hg.cc_sandbox_block(clone)
-    sandbox["network"]["allowedDomains"] = []   # strictAllowlist with an empty list until Z2 (D7: no local binding)
+    # strictAllowlist; empty without a live seat-egress grant (D7: no local binding), else the grant's own list
+    sandbox["network"]["allowedDomains"] = [] if egress is None else list(egress["allowed_domains"])
     sandbox["filesystem"] = {
         "disabled": False,
         "allowWrite": [str(r) for r in roots],
@@ -254,6 +283,10 @@ def build_seat_profile(clone: Path, return_dir: Path, *, claude_bin: str, python
         "PostToolUse": [{"matcher": "", "hooks": [hook("post")]}],
         "PostToolUseFailure": [{"matcher": "", "hooks": [hook("post")]}],
     }
+    if egress is not None:                       # the lane-branch push (Z2a): Levain's executor, outside the bound
+        from levain import seat_push
+        hooks = {**hooks, **seat_push.hook_entries(python, clone=clone, key_dir=key_dir, cockpit_root=cockpit_root,
+                                                   home=Path(levain_home))}
     settings = {
         "sandbox": sandbox,
         "permissions": {"defaultMode": "acceptEdits", "additionalDirectories": [str(return_dir)],

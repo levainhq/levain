@@ -61,7 +61,7 @@ __all__ = [
     "CUSTODIES", "DISPLAY_PHONE", "EGRESS_KEY_KIND", "FIDO_ATTESTED", "FORMAT", "FORMAT_V2", "FORMAT_V3", "FORMAT_V4",
     "FORMAT_V5", "VOICE_KEY_KIND", "VOICE_KEY_PROVIDERS", "VOICE_KEY_USES", "voice_key_for", "voice_key_record",
     "GRADUATION_CREATE_RANK",
-    "GRADUATION_GRANT_MAX", "GRADUATION_KIND", "HANDS_MCP_KIND", "SEAT_LEASE_KIND", "SEAT_LEASE_MAX", "GRADUATION_OPT_IN_RANK", "GRADUATION_PHONE_KIND", "PASSKEY",
+    "GRADUATION_GRANT_MAX", "GRADUATION_KIND", "HANDS_MCP_KIND", "SEAT_LEASE_KIND", "SEAT_LEASE_MAX", "SEAT_EGRESS_KIND", "SEAT_EGRESS_MAX", "GRADUATION_OPT_IN_RANK", "GRADUATION_PHONE_KIND", "PASSKEY",
     "NAMESPACE", "RESET_FORMAT", "RESET_NAMESPACE", "SCHEMA",
     "Anchor", "AnchorError", "ForeignAnchor", "KEY_WORD", "AuthorityError", "AuthorityKey", "AuthorityPolicy", "AuthoritySnapshot",
     "HeadBelowCache", "NotInitialised", "PROCESS_CACHE", "ReplayCache", "ReplayError", "StaleHead", "StandingPolicy",
@@ -2015,9 +2015,9 @@ def _seat_lease_live(grant: Any, now: datetime) -> bool:
         return False
 
 
-def _seat_lease_unique_check(state: AuthoritySnapshot, rec: Mapping[str, Any], now: datetime) -> None:
-    """At append: a create, a loosen or a renew may not leave two LIVE seat-root leases (one set of parents at a time;
-    revoke the first). Judged with the appender's clock, so an append rule."""
+def _unique_live_check(state: AuthoritySnapshot, rec: Mapping[str, Any], now: datetime, kind: str, label: str) -> None:
+    """At append: a create, a loosen or a renew may not leave two LIVE grants of ``kind`` (``label`` names it; revoke the
+    first). Judged with the appender's clock, so an append rule."""
     op = rec["op"]
     if op == "create_grant":
         grant = rec["grant"]
@@ -2032,10 +2032,113 @@ def _seat_lease_unique_check(state: AuthoritySnapshot, rec: Mapping[str, Any], n
         after, touched = state.policy.grants, [rec["grant_id"]]
     else:
         return
-    live = [gid for gid, g in after.items() if _seat_lease_live(g, now)]
+    live = [gid for gid, g in after.items() if _kind_live(g, now, kind)]
     if len(live) > 1 and any(gid in live for gid in touched):
         others = ", ".join(repr(g[:40]) for g in live if g not in touched) or "another"
-        raise AuthorityError(f"one live seat-root lease at a time: {others} is already live; revoke it first")
+        raise AuthorityError(f"one live {label} at a time: {others} is already live; revoke it first")
+
+
+def _kind_live(grant: Any, now: datetime, kind: str) -> bool:
+    if not (isinstance(grant, Mapping) and grant.get("kind") == kind):
+        return False
+    try:
+        return _parse_stamp(grant["expires_at"], "expires_at") > now
+    except (AuthorityError, KeyError, OverflowError):
+        return False
+
+
+def _seat_lease_unique_check(state: AuthoritySnapshot, rec: Mapping[str, Any], now: datetime) -> None:
+    _unique_live_check(state, rec, now, SEAT_LEASE_KIND, "seat-root lease")
+
+
+def _seat_egress_unique_check(state: AuthoritySnapshot, rec: Mapping[str, Any], now: datetime) -> None:
+    _unique_live_check(state, rec, now, SEAT_EGRESS_KIND, "seat-egress grant")
+
+
+# A seat-egress grant (PATHZERO Z2a, ruling H2 a; ``levain.seat_push``): the signed authority under which Levain's OWN
+# push executor pushes a seat's lane branch ``seat/<lane_key>`` (and only that name) to ONE pinned remote, from a Stop /
+# SessionEnd hook the seat profile carries. The grant names no branch: the branch is fixed by the lane's mint row, so a
+# seat has no path to main by construction. It also carries the seat sandbox's ``allowed_domains`` (empty: none). Fixed
+# terms under its id; a renew moves only the expiry (at most SEAT_EGRESS_MAX past the renew); a passkey revoke reaches
+# it. At most one live at a time (:func:`_unique_live_check`).
+SEAT_EGRESS_KIND = "seat-egress"
+SEAT_EGRESS_MAX = timedelta(days=14)
+_SEAT_EGRESS_FIELDS = frozenset({"id", "kind", "agent", "lanes_parent", "push_remote", "allowed_domains", "expires_at"})
+_SEAT_EGRESS_ID = re.compile(r"se-[0-9a-f]{12}")
+_SEAT_EGRESS_FIXED = "a seat-egress grant's terms are fixed: revoke it and sign another"
+_SEAT_EGRESS_DOMAIN = re.compile(r"(?=.{1,253}\Z)([a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?)(\.[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?)+")
+_SEAT_EGRESS_DOMAINS_MAX = 16
+
+
+def _validate_seat_egress(grant: Mapping[str, Any], what: str, at: datetime | None) -> dict[str, Any]:
+    """A seat-egress grant's shape (:data:`SEAT_EGRESS_KIND`): exactly its fields, ``agent`` ``claude_code``, an
+    absolute normalized lanes parent, a remote string, at most :data:`_SEAT_EGRESS_DOMAINS_MAX` distinct lowercase
+    dotted host names (no wildcard, no IP literal, no port) and an expiry at most :data:`SEAT_EGRESS_MAX` past the
+    link's ``at``. That the remote is canonical and the parent is a fit root are append rules
+    (:func:`_seat_egress_check`), not replay rules."""
+    if set(grant) != _SEAT_EGRESS_FIELDS:
+        raise AuthorityError(f"{what} (a seat-egress grant) must carry exactly {', '.join(sorted(_SEAT_EGRESS_FIELDS))}")
+    if grant["kind"] != SEAT_EGRESS_KIND:
+        raise AuthorityError(f"{what}.kind must be {SEAT_EGRESS_KIND!r}")
+    if not isinstance(grant["id"], str) or not _SEAT_EGRESS_ID.fullmatch(grant["id"]):
+        raise AuthorityError(f"{what}.id must be se- and 12 lowercase hex digits")
+    if grant["agent"] != "claude_code" or type(grant["agent"]) is not str:
+        raise AuthorityError(f"{what}.agent must be 'claude_code'")
+    path = _agent_text(grant["lanes_parent"], f"{what}.lanes_parent", _AGENT_PATH_MAX)
+    if not path.startswith("/") or os.path.normpath(path) != path or "\0" in path:
+        raise AuthorityError(f"{what}.lanes_parent must be an absolute, normalized path")
+    remote = _agent_text(grant["push_remote"], f"{what}.push_remote", 512)
+    if any(ord(c) < 32 or ord(c) == 127 for c in remote):
+        raise AuthorityError(f"{what}.push_remote must carry no control character")
+    domains = grant["allowed_domains"]
+    if not isinstance(domains, (list, tuple)) or len(domains) > _SEAT_EGRESS_DOMAINS_MAX:
+        raise AuthorityError(f"{what}.allowed_domains must be a list of at most {_SEAT_EGRESS_DOMAINS_MAX} host names")
+    for d in domains:
+        if not isinstance(d, str) or not _SEAT_EGRESS_DOMAIN.fullmatch(d) or d.rsplit(".", 1)[-1].isdigit():
+            raise AuthorityError(f"{what}.allowed_domains holds {str(d)[:40]!r}: each must be a lowercase dotted host "
+                                 "name (no wildcard, IP literal or port)")
+    if len(set(domains)) != len(domains):
+        raise AuthorityError(f"{what}.allowed_domains repeats a name")
+    expires = _parse_stamp(grant["expires_at"], f"{what}.expires_at")
+    if at is not None and expires - at > SEAT_EGRESS_MAX:
+        raise AuthorityError(f"{what} may last at most {SEAT_EGRESS_MAX.days} days past its link's time")
+    if not _finite_json(grant):
+        raise AuthorityError(f"{what} must be finite JSON (no NaN or Infinity)")
+    return _thaw(grant)
+
+
+def _seat_egress_change(o: Mapping[str, Any], n: Mapping[str, Any], o_exp: datetime, n_exp: datetime) -> str:
+    """A seat-egress grant's change: ``renew`` when only its expiry moved later; anything else is refused."""
+    rest = lambda g: _canonical({k: v for k, v in g.items() if k != "expires_at"})   # noqa: E731
+    if rest(o) == rest(n) and n_exp > o_exp:
+        return "renew"
+    raise AuthorityError(_SEAT_EGRESS_FIXED)
+
+
+def _seat_egress_check(grants: list[Any], after: str = "") -> None:
+    """At append and at a renew: the pinned remote is in its canonical spelling (so the executor's byte-equality
+    judgment can hold) and the lanes parent meets the root rules (no agent-config name, not under ``~/.claude`` or
+    flow's ``state``). Judged against the appender's own home, so an append rule."""
+    from levain import host_guard as hg
+    from levain.consent import push
+    home = os.path.expanduser("~")
+    barred = (os.path.join(home, ".claude"), os.path.join(home, "Briefcase", "flow", "state"))
+    for grant in grants:
+        if not (isinstance(grant, Mapping) and grant.get("kind") == SEAT_EGRESS_KIND):
+            continue
+        problems: list[str] = []
+        try:
+            if push.canonical_remote(str(grant.get("push_remote"))) != grant.get("push_remote"):
+                problems.append(f"push_remote is not canonical (use {push.canonical_remote(str(grant.get('push_remote')))!r})")
+        except ValueError as exc:
+            problems.append(f"push_remote: {exc}")
+        parent = str(grant.get("lanes_parent"))
+        if hg.PROTECTED_NAMES & set(parent.split("/")):
+            problems.append("lanes_parent names an agent-config directory")
+        if any(hg.is_within(parent, b) for b in barred):
+            problems.append("lanes_parent is inside ~/.claude or flow's state")
+        if problems:
+            raise AuthorityError(f"seat-egress grant {str(grant.get('id'))[:40]!r}: " + "; ".join(problems) + after)
 
 
 @dataclass(frozen=True)
@@ -2094,6 +2197,10 @@ _GRANT_KINDS: Mapping[str | None, _GrantKind] = MappingProxyType({
     HANDS_MCP_KIND: _GrantKind(validate=_validate_hands_mcp, change=_hands_mcp_change,
                                append_checks=(_hands_mcp_check,), renew_checks=(_hands_mcp_check,),
                                passkey_revocable=True, fixed=_HANDS_MCP_FIXED),
+    SEAT_EGRESS_KIND: _GrantKind(validate=_validate_seat_egress, change=_seat_egress_change,
+                                 append_checks=(_seat_egress_check,), renew_checks=(_seat_egress_check,),
+                                 passkey_revocable=True, max_life=SEAT_EGRESS_MAX, fixed=_SEAT_EGRESS_FIXED,
+                                 renew_signer_class=LAPTOP),
     SEAT_LEASE_KIND: _GrantKind(validate=_validate_seat_lease, change=_seat_lease_change,
                                 append_checks=(_seat_lease_check,), renew_checks=(_seat_lease_check,),
                                 passkey_revocable=True, max_life=SEAT_LEASE_MAX, fixed=_SEAT_LEASE_FIXED,
@@ -2835,6 +2942,7 @@ def _append_only_checks(state: AuthoritySnapshot, rec: Mapping[str, Any], now: d
     _egress_key_append_check(state, rec, now)
     _hands_mcp_unique_check(state, rec, now)
     _seat_lease_unique_check(state, rec, now)
+    _seat_egress_unique_check(state, rec, now)
     if rec["op"] == "create_grant":
         _grant_append_checks([rec["grant"]])
     elif rec["op"] == "loosen":
