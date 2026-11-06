@@ -1502,3 +1502,77 @@ def test_1105_49r_a_path_valued_scope_decoy_still_launches_and_the_child_gets_ab
     launcher(world, spawn=spawn).ensure()
     got = json.loads(seen[0][1][room_readguard.EXEMPT_ENV])
     assert got == list(_paths(world)) and all(isinstance(p, str) and os.path.isabs(p) for p in got)
+
+
+# --- 1106-1 aliasc: the scope decoy and the allow-rule check when a path is spelled in another letter case (casesweep rows 7, 7b-7e) ---
+def _case_alias_of(p):
+    """``p`` spelled with its letters' case swapped, when this filesystem takes that spelling as the same file (macOS
+    APFS by default); else the test is skipped. A case-sensitive volume (Linux CI) has no alias, so the macOS tests below
+    never red there; the injected-fold tests run everywhere."""
+    full = str(p).swapcase()
+    if full == str(p) or not os.path.exists(full) or not os.path.samefile(full, p):
+        pytest.skip("this filesystem is case-sensitive: no case alias of a directory exists")
+    return full
+
+
+def test_an_allow_rule_inside_the_cwd_in_another_case_is_not_outside_but_a_sibling_still_is(tmp_path):
+    """rows 7d/7e: ``_allow_rule_outside`` compared strings, so a rule under the cwd spelled in another case read as
+    outside (an over-block: the launch refused). An allow rule in an alias of a SIBLING stays outside; canonical unchanged."""
+    home, cwd, other = _rule_world(tmp_path)
+    alias_cwd, alias_other = _case_alias_of(cwd), _case_alias_of(other)
+    f = room_launch._allow_rule_outside
+    assert not f(f"Read(/{cwd}/src/**)", str(cwd), str(home), str(home))                     # canonical, as before
+    assert not f(f"Read(/{alias_cwd}/src/**)", str(cwd), str(home), str(home))                # row 7d
+    assert not f(f"Read(/{cwd}/src/**)", alias_cwd, str(home), str(home))
+    assert f(f"Read(/{other}/**)", str(cwd), str(home), str(home))                            # canonical outside, as before
+    assert f(f"Read(/{alias_other}/**)", str(cwd), str(home), str(home))                      # row 7e
+    assert f(f"Read(/{alias_other}/**)", alias_cwd, str(home), str(home))
+
+
+def test_an_allow_rule_through_an_injected_case_fold_is_inside_but_a_sibling_still_is_outside(tmp_path, monkeypatch):
+    from levain import pathid
+    from tests.test_pathid import _case_insensitive_spelling
+    monkeypatch.setattr(pathid, "_fs_spelling", _case_insensitive_spelling)
+    base = tmp_path.resolve()
+    home, cwd, other = _rule_world(base)
+    f = room_launch._allow_rule_outside
+    assert not f(f"Read(/{base}/PROJ/src/**)", str(cwd), str(home), str(home))
+    assert not f(f"Read(/{cwd}/src/**)", str(base / "PROJ"), str(home), str(home))
+    assert f(f"Read(/{base}/OTHER/**)", str(cwd), str(home), str(home))
+    assert f(f"Read(/{base}/PROJ-twin/**)", str(cwd), str(home), str(home))
+    assert not f(f"Read(/{cwd}/src/**)", str(cwd), str(home), str(home))
+
+
+def test_the_scope_decoy_is_refused_inside_the_cwd_or_a_deny_path_spelled_in_another_case(world):
+    """rows 7/7b/7c: the decoy must sit outside the cwd and every absolute deny path, tested as strings, so a scope
+    directory reached through an alias of either was not refused (the proof it carries would go vacuous). A scope dir
+    elsewhere still works and is removed; a canonical inside is still refused."""
+    cwd, home = world["cwd"], world["home"]
+    (home / ".ssh").mkdir()
+    for scope_root in (cwd, _case_alias_of(cwd), _case_alias_of(home / ".ssh"), str(home / ".ssh")):
+        lr = launcher(world, scope_dir=str(scope_root))
+        with pytest.raises(RoomLaunchError, match="scope decoy"):
+            lr._scope_decoy()
+        assert not [n for n in os.listdir(scope_root) if n.startswith("levain-room-scope-")]      # nothing left behind
+    elsewhere = world["run"].parent / "scope_elsewhere"
+    elsewhere.mkdir()
+    d, path = launcher(world, scope_dir=str(elsewhere))._scope_decoy()
+    assert os.path.exists(path)
+    shutil.rmtree(d)
+
+
+def test_the_scope_decoy_through_an_injected_case_fold_is_refused_inside_a_deny_path(world, monkeypatch):
+    """The same logic where no alias exists (Linux CI): a deny path spelled in a case only the fold maps onto the
+    scope directory's real name."""
+    from levain import pathid
+    from tests.test_pathid import _case_insensitive_spelling
+    monkeypatch.setattr(pathid, "_fs_spelling", _case_insensitive_spelling)
+    guarded = world["run"].parent / "guarded"
+    guarded.mkdir()
+    lr = launcher(world, scope_dir=str(guarded))
+    lr._deny = [str(world["run"].parent / "GUARDED")]
+    with pytest.raises(RoomLaunchError, match="scope decoy"):
+        lr._scope_decoy()
+    lr._deny = [str(world["run"].parent / "GUARDEDX")]
+    d, _path = lr._scope_decoy()
+    shutil.rmtree(d)
