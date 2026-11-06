@@ -44,6 +44,7 @@ from levain.cockpit.firejournal import DB_NAME
 from levain.cockpit.keys import (KeyError_, Signer, _append, _capture, _journal, _now, _signing_authority,
                                  under_test_run)
 from levain.consent.queue import AuthoritySource, authority_source
+from levain.voice import providers as vprov
 
 __all__ = ["DEFAULT_ITEM_ACCOUNT", "DEFAULT_SECURITY", "KeychainWriteFailed", "KeychainWriter", "Secret",
            "SecurityStdinWriter", "VoiceKeyPreview", "VoiceKeyRefused", "VoiceKeyUnavailable", "add_key",
@@ -237,18 +238,23 @@ class VoiceKeyPreview:
 
 # The uses a provider's adapter can carry out, where that is fewer than all of them. A key is signed for a use only if the
 # provider has an adapter for it: a standing grant for a use nothing serves would take effect by itself the day an adapter
-# for it is added, with no fresh signature (L3 inworld r1, codex).
+# for it is added, with no fresh signature (L3 inworld r1, codex). A provider with no adapter at all (no entry in the
+# adapters' host table, ``providers.HOSTS``) serves no use, so no key is signed for it (L3 inworld r3, gemini).
 PROVIDER_USES: dict[str, tuple[str, ...]] = {"inworld": ("tts",)}
 
 
 def default_uses(provider: str) -> tuple[str, ...]:
-    """The uses a key for ``provider`` carries when none is named: every use its adapter serves."""
+    """The uses a key for ``provider`` carries when none is named: every use its adapter serves (none without one)."""
+    if provider not in vprov.HOSTS:
+        return ()
     return PROVIDER_USES.get(provider, VOICE_KEY_USES)
 
 
 def _check_names(provider: str, uses: Iterable[str]) -> list[str]:
     if provider not in VOICE_KEY_PROVIDERS:
         raise VoiceKeyRefused(f"{str(provider)[:40]!r} is not a voice provider ({', '.join(VOICE_KEY_PROVIDERS)})")
+    if not default_uses(provider):
+        raise VoiceKeyRefused(f"{provider} has no adapter in this build, so no key is signed for it")
     chosen = sorted(set(uses))
     if not chosen or any(u not in VOICE_KEY_USES for u in chosen):
         raise VoiceKeyRefused(f"uses are drawn from {', '.join(VOICE_KEY_USES)}")

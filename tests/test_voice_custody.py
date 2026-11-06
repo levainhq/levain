@@ -827,3 +827,21 @@ def test_a_key_is_signed_only_for_uses_the_providers_adapter_serves(ck, sec, use
     assert sec.calls() == []
     assert custody.default_uses("inworld") == ("tts",) and custody.default_uses("openai") == custody.VOICE_KEY_USES
     assert add(ck, sec, provider="inworld", uses=("tts",))[0]["uses"] == ["tts"]
+
+
+def test_a_provider_with_no_adapter_signs_no_use(ck, sec, cli):
+    """L3 inworld r3 gemini MED: before the fix ``levain voice key add elevenlabs`` signed a standing grant for stt and
+    tts (the CLI printed ``voice key vk-... for elevenlabs: stt, tts`` and ``set: vk-... (elevenlabs)``), though no adapter
+    serves ElevenLabs, so the grant would take effect by itself the day one is added. The adapter table is
+    ``providers.HOSTS``. Red with: the no-adapter refusal in _check_names removed, or default_uses not reading HOSTS."""
+    code, out, err = cli("add", "elevenlabs", "--yes", "--signing-key", str(ck.key))
+    assert code == 1, out
+    assert "add refused" in err and "no adapter" in err
+    assert sec.calls() == [] and ck.state().policy.grants == {}
+    for uses in (("tts",), ("stt",), ("stt", "tts")):
+        with pytest.raises(VoiceKeyRefused, match="no adapter"):
+            add(ck, sec, provider="elevenlabs", uses=uses)
+    assert sec.calls() == [] and ck.state().policy.grants == {}
+    assert custody.default_uses("elevenlabs") == ()
+    for provider in ("openai", "deepgram", "inworld"):                 # every provider with an adapter still signs
+        assert custody.default_uses(provider)
