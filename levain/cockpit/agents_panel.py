@@ -174,8 +174,9 @@ def _judge_read(arming: _Arming, conn: sqlite3.Connection, agent: dict[str, Any]
 def _kind(conn: sqlite3.Connection, role_hash: str, seen: dict[str, tuple[str, str]]) -> tuple[str, str]:
     """``(kind, why)`` of the role a spec pins: the kind of the stored role (``why`` empty), or
     :data:`UNREADABLE_KIND` and the reason. The row passes the check every other read of a stored role passes
-    (:func:`levain.agents.role._check_row`, on this read's own connection, so the spec and its role come from one
-    snapshot): a row that is gone, is not text, does not parse, does not hash to its key or is not the canonical text
+    (:func:`levain.agents.role._check_row`, on this read's own connection; the spec and role reads are separate
+    statements, not one snapshot, which holds because ``agent_roles`` is append-only, so a hash resolves to one row
+    whenever it is read): a row that is gone, is not text, does not parse, does not hash to its key or is not the canonical text
     is "unreadable", never an absent kind and never a default one. ``seen`` holds the answers of this read."""
     if role_hash not in seen:
         row = conn.execute("SELECT name, version, spec FROM agent_roles WHERE role_hash = ?", (role_hash,)).fetchone()
