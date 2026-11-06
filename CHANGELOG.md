@@ -6,6 +6,9 @@ All notable changes to Levain. Format is loosely [Keep a Changelog](https://keep
 
 ## [Unreleased]
 
+### Added
+- **A link straight to one Needs-you card: `/?view=needs&item=<id>`.** A band row with fewer than two options files no sign card, so its ping could only open the home view. The page now opens that card's focus view and scrolls the strip to it; an id that is not waiting opens the plain Needs view with "That item is no longer waiting." `<id>` is the card's id (`question:<n>`, `consent:<request id>`), the bare request id, or flow's `np-<8 hex>` item id. The cross-site guard admits exactly this shape (the two keys `view=needs` then `item`, an id of at most 64 of `A-Za-z0-9_.:-`, no escapes) and nothing else; the link only opens a card and never answers it. The page says "no longer waiting" only of a whole listing (never an empty one, or one carrying an error or a note), and keeps no part of the link across a reload. Known edge: a brand-new unpaired device that opens the link ends on the plain Needs view after pairing.
+
 ### Changed
 - **The per-run dollar figure on an `api_key` agent link is now enforced at launch, not only shown on the card.** The signing card says "at most $X a run"; until now nothing held it, `reserve()` bounded only the window. An `api_key` exposure above the link's signed `budget_run_usd_micros` now ends `skipped-budget` / `run_budget` and writes nothing. A link that signs less than a run needs (the dream's per-run limit is $20.00) refuses on its next fire, which is the card's own promise. The run server's point-of-use check now judges the link's billing against the launcher's (`link-billing-not-the-launchers`, replacing `link-not-subscription`) and refuses an `api_key` link that signs a zero figure (`link-run-budget-zero`); the brokered launcher itself is not in this release.
 
