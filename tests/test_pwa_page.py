@@ -138,3 +138,23 @@ def test_a_refused_device_is_not_retried_in_a_loop(tmp_path: Path) -> None:
             {"eval": "new Promise(r => setTimeout(() => r(window.__manifest_reads), 7000))"},
         ])
     assert out["values"][-1] <= 3, out["values"]      # the boot read (and its token re-read), never a 2/4/8 s retry loop
+
+
+# the plain-text 403 a Host / cross-site refusal sends (no JSON, no "token" word): refused all the same
+PLAIN_403 = REFUSE_ALL.replace("JSON.stringify({error: 'forbidden', message: 'missing or invalid write token'})", "'forbidden\\n'") \
+    .replace("'Content-Type': 'application/json'", "'Content-Type': 'text/plain'")
+
+
+@needs_browser
+def test_a_plain_403_and_the_online_event_do_not_re_ask(tmp_path: Path) -> None:
+    _root, src, _ids = _install(tmp_path)
+    with _serve_plain(src) as url:
+        out = _drive(tmp_path, f"{url}/", [
+            {"init": PLAIN_403},
+            {"eval": "new Promise(r => setTimeout(() => r(window.__manifest_reads), 3000))"},
+            {"eval": "(() => { window.dispatchEvent(new Event('online')); return 0; })()"},
+            {"eval": "new Promise(r => setTimeout(() => r(window.__manifest_reads), 4000))"},
+        ])
+    first, last = out["values"][-3], out["values"][-1]
+    assert 1 <= first <= 3, out["values"]             # the boot read happened (and was refused)
+    assert last == first, out["values"]               # neither the 2/4 s backoff nor an online event asked again

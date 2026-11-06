@@ -210,13 +210,16 @@ class GuardedHandler(BaseHTTPRequestHandler):
         """The plain 403 body: the word the page always said, then WHY, from the requester's own headers (11-06: a Pixel's browser
         was refused with the bare word and nothing measurable; a photo of this page names the rule that fired). Header values are
         cut and reduced to letters, digits and a few separators so the body cannot carry a request's bytes back as markup."""
+        def clean(v: str) -> str:
+            return "".join(ch for ch in v[:80] if ch.isalnum() and ch.isascii() or ch in " .-_:;,=/?*[]")
+
         def seen(name: str) -> str:
             v = self.headers.get(name)
-            return "(absent)" if v is None else "".join(ch for ch in v[:80] if ch.isalnum() and ch.isascii() or ch in " .-_:;,=/?*") or "(empty)"
+            return "(absent)" if v is None else clean(v) or "(empty)"
         if not self._host_ok():
             why = f"the Host header {seen('Host')} is not a name this server answers for"
         else:
-            why = (f"a cross-site page load of {self.path.split('?', 1)[0][:60]!r} (Sec-Fetch-Site {seen('Sec-Fetch-Site')}, "
+            why = (f"a cross-site page load of {clean(self.path.split('?', 1)[0][:60])!r} (Sec-Fetch-Site {seen('Sec-Fetch-Site')}, "
                    f"Mode {seen('Sec-Fetch-Mode')}, Dest {seen('Sec-Fetch-Dest')}) that is not a pairing or sign page")
         return f"forbidden\n\nrefused: {why}\n".encode("utf-8")
 
