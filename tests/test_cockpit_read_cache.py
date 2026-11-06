@@ -161,7 +161,21 @@ def test_off_by_default_so_a_directly_built_cockpit_reads_fresh(tmp_path: Path) 
     _root, src, _ids = _install(tmp_path)
     c = build_default_cockpit(src)
     cred = {"class": "none", "device_class": None}
-    assert c.read_cache_ttl_s == 0 and c.manifest(cred) is not c.manifest(cred)
+    assert not c.read_cache_ttl_s and c.manifest(cred) is not c.manifest(cred)
+
+
+def test_a_cockpit_a_downstream_passes_is_served_with_the_cache_on(tmp_path: Path) -> None:
+    # r1 codex: flow's bridge passes its own cockpit, and only a lazily built one got the TTL
+    _root, src, _ids = _install(tmp_path)
+    passed = build_default_cockpit(src)
+    off = build_default_cockpit(src)
+    off.read_cache_ttl_s = 0
+    with _serve(src, cockpit=passed, surface_tokens={"browser": T_A, "other": T_B}) as (url, httpd):
+        _get(url + "/cockpit/manifest.json", T_B)
+        assert httpd.cockpit is passed and passed.read_cache_ttl_s == pytest.approx(1.5) and passed._rc
+    with _serve(src, cockpit=off, surface_tokens={"browser": T_A, "other": T_B}) as (url, httpd):
+        _get(url + "/cockpit/manifest.json", T_B)
+        assert off.read_cache_ttl_s == 0 and not off._rc               # a caller's own number is kept
 
 
 def _get(url: str, tok: str | None = None) -> tuple[int, dict]:

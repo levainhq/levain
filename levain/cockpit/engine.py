@@ -654,9 +654,10 @@ class Cockpit:
         # panel id -> its live store-search workers, capped at SEARCH_INFLIGHT, so hung hooks cost bounded threads
         self._searching: dict[str, list[threading.Thread]] = {}
         self._search_mu = threading.Lock()
-        # the short-TTL shared read cache (manifest and unsearched panel reads); 0 = off, the default, so a
-        # caller that builds a Cockpit directly reads fresh every time. The server turns it on.
-        self.read_cache_ttl_s: float = 0.0
+        # the short-TTL shared read cache (manifest and unsearched panel reads). None (the default) = off here, so a
+        # caller that reads a Cockpit directly reads fresh every time, and "the server's default" to the server that
+        # serves it (web_server get_cockpit), its own or one a downstream passed; 0 = off even when served.
+        self.read_cache_ttl_s: float | None = None
         self._rc: dict[Any, "_SharedRead"] = {}
         self._rc_gen = 0
         self._rc_lock = threading.Lock()
@@ -2102,7 +2103,7 @@ class Cockpit:
         that finds no live entry; concurrent identical callers wait for it; a caller inside ``read_cache_ttl_s``
         of the compute's START reuses it. A failed compute (or a value ``keep`` refuses) is never cached: its joiners
         compute for themselves or take the value in flight, and the next caller starts afresh."""
-        ttl = self.read_cache_ttl_s
+        ttl = self.read_cache_ttl_s or 0.0
         if ttl <= 0:
             return compute()
         with self._rc_lock:
@@ -2161,7 +2162,7 @@ class Cockpit:
         request before it got here (a refused request never reaches the engine), so the cache never decides who
         may read; it only avoids repeating a compute for an identical, already-authorised asker. The returned dict
         is shared: read-only for every caller."""
-        if self.read_cache_ttl_s <= 0:
+        if (self.read_cache_ttl_s or 0.0) <= 0:
             return self._manifest_compute(credential, install_class=install_class, transport=transport)
         key = ("manifest", _read_key(credential), install_class, _read_key(transport))
         return self._shared_read(key, lambda: self._manifest_compute(credential, install_class=install_class,
@@ -2286,7 +2287,7 @@ class Cockpit:
         (``q``) and a past read (``at``) are never cached: ``q`` is free text the operator types (unbounded keys,
         and a store search is the costly live read), ``at`` has its own replay cache. A QueryError or RowNotFound
         propagates to every waiter alike (a failed compute is not stored). The result is shared: read-only."""
-        if self.read_cache_ttl_s <= 0 or q is not None or at is not None:
+        if (self.read_cache_ttl_s or 0.0) <= 0 or q is not None or at is not None:
             return self._panel_compute(panel_id, profile=profile, q=q, row=row, credential_class=credential_class,
                                        limit=limit, at=at)
         # ``limit`` caps only a search, and a search is never cached: without ``q`` the compose reads it only to

@@ -1921,9 +1921,13 @@ class _LevainHTTPServer(ThreadingHTTPServer):
                 except BaseException:
                     built.stop()    # a half-started cockpit must not leave refreshers running
                     raise
-                built.read_cache_ttl_s = COCKPIT_READ_CACHE_TTL_S   # identical concurrent reads share one compute
                 self.cockpit = built   # published only once started: a failed start retries next request
             cockpit = self.cockpit
+            # identical concurrent reads share one compute: on the kernel's own cockpit AND on one a downstream passed
+            # (flow's bridge passes its own; L3 r1 codex: the cache was off on exactly the deploy it was built for).
+            # None is "the server's default"; a caller that set a number, 0 included, keeps it
+            if getattr(cockpit, "read_cache_ttl_s", 0) is None:     # (a test double may carry no cache at all)
+                cockpit.read_cache_ttl_s = COCKPIT_READ_CACHE_TTL_S
         if self.broker is not None:
             # started with the cockpit, outside the cockpit's lock: its start recovery is a settler
             # and may wait on a store lock (K2b §4.2, §9); a second call returns at once
