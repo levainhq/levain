@@ -22,7 +22,8 @@ concurrency:
 jobs:
   xcheck:
     name: xcheck (Go upstream vs frozen vectors)
-    runs-on: ubuntu-latest
+    # Pinned because ubuntu-latest moved to ubuntu-26.04, whose sudo/bash/python differ; revisit when the tests are made to pass on it.
+    runs-on: ubuntu-24.04
     timeout-minutes: 20
     env:
       # Go must run the toolchain verified below and never download another one itself (T35).
