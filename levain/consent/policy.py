@@ -37,6 +37,7 @@ from collections.abc import Callable, Mapping
 from datetime import datetime
 from typing import TYPE_CHECKING, Any
 
+from levain import pathid
 from levain.authority import (consent_grant, consent_grant_tool_problem, consent_mcp_declaration, consent_mcp_input_fits,
                               consent_root_problem, contained_shell_grant)
 from levain.cockpit.consent import ConsentError, parse_stamp
@@ -267,7 +268,11 @@ def _request_targets(agent: str, tool_name: str, tool_input: Any) -> list[Any] |
 
 
 def _within(path: str, root: str) -> bool:
-    return path == root or path.startswith(root.rstrip(os.sep) + os.sep)
+    """Whether ``path`` is ``root`` or below it, by identity (:func:`levain.pathid.inside`), so a path spelled in another
+    letter case on a case-insensitive volume still counts as inside the grant it IS inside. A GRANTS-style test: True
+    only when sure, so anything unclear falls through to the human. Only the containment folds; the callers'
+    no-symlink tests (``realpath(x) == x`` in :func:`_resolved` and ``root != workspace``) are untouched."""
+    return pathid.inside(root, path)
 
 
 def _resolved(target: Any, cwd: str, *, home: str | os.PathLike[str]) -> str | None:
