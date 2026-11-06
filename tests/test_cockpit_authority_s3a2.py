@@ -772,6 +772,9 @@ PER_ACT_APPENDERS = {
     # voice.custody.add_key (V1-1): a voice key's create or replacing loosen, prepared and appended inside one
     # autocommit block of a journal it opens per act, like key_setup.setup_key
     ("voice/custody.py", "add_key"): ("append", "prepare"),
+    # seat_lease.renew_lease (Z1d): a seat-root lease's renew, prepared and appended in two separate autocommit blocks of a
+    # journal it opens per act, the signature taken between them outside any transaction, the shape of cli._signed_append
+    ("seat_lease.py", "renew_lease"): ("append", "prepare"),
 }
 
 
@@ -969,6 +972,8 @@ def _check_the_appenders(root: Path) -> None:
                                  ("cockpit/keys.py", "_append", "sign_and_append"),
                                  ("consent/grants.py", "append_revoke", "append"),
                                  ("consent/grants.py", "prepare_revoke", "prepare"),
+                                 ("seat_lease.py", "renew_lease", "append"),
+                                 ("seat_lease.py", "renew_lease", "prepare"),
                                  ("voice/custody.py", "add_key", "append"),
                                  ("voice/custody.py", "add_key", "prepare")]
     for (rel, name), calls in PER_ACT_APPENDERS.items():
