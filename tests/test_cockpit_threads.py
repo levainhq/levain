@@ -130,7 +130,7 @@ def _row(kind, ref, launch):
 
 
 def test_a_tool_completion_belongs_to_its_own_launch():
-    facts = {("L-A", "tool_call:1"): ("call-1", 0, 0), ("L-B", "tool_call:1"): ("call-1", 0, 0)}
+    facts = {("L-A", "tool_call:1"): ("call-1", 0, 0, None), ("L-B", "tool_call:1"): ("call-1", 0, 0, None)}
     done = {("L-A", "call-1")}          # the result arrived in launch A only
     a = threads._item(_row("vendor_tool_call", "tool_call:1", "L-A"), facts, done)
     b = threads._item(_row("vendor_tool_call", "tool_call:1", "L-B"), facts, done)
