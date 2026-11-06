@@ -1813,10 +1813,11 @@ body.ke .needs-more-row:hover { border-style: solid; }
 body.ke .needs-row-opts { white-space: nowrap; }
 @media (max-width: 599px) {
   body.ke .needs-headline { flex-wrap: wrap; gap: var(--sp-2) var(--sp-3); align-items: center; }
+  body.ke .needs-tabs { flex: 0 1 auto; gap: 0; }
   body.ke .needs-tab { font-size: var(--fs-body); padding: 0 var(--sp-3); }
   body.ke .needs-headline .needs-gloss, body.ke .needs-headline .needs-order { display: none; }
-  body.ke .needs-headline .needs-history { flex: none; min-height: var(--hit-min); }
-  body.ke .needs-layout-sw { flex: 1 0 100%; }
+  body.ke .needs-headline .needs-history { flex: none; min-height: var(--hit-min); font-size: var(--fs-micro); padding: var(--sp-1) var(--sp-3); }
+  body.ke .needs-layout-sw { flex: 1 0 100%; order: 9; }   /* the mock-up switch takes a line of its own, after "all decisions" */
   body.ke .needs-asked { display: none; }
   body.ke .needs-grid .needs-row-sub { display: none; }
   body.ke .needs-grid .needs-row-title { min-height: 0; }
@@ -1847,6 +1848,8 @@ body.needs-locked { overflow: hidden; }
   .modal-overlay.needs-detail .modal { width: 100%; height: auto; max-height: min(88dvh, calc(100dvh - 24px - env(safe-area-inset-top, 0px))); border-radius: var(--r-lg) var(--r-lg) 0 0;
     padding-bottom: env(safe-area-inset-bottom, 0px); animation: needsSheetRise var(--dur-expand) var(--ease-out) both; }
   .modal-overlay.needs-detail .modal-close { width: var(--hit-min); height: var(--hit-min); }
+  .modal-overlay.needs-detail .modal-head { flex-wrap: nowrap; }
+  .modal-overlay.needs-detail .modal-head h2 { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 }
 @media (prefers-reduced-motion: reduce) { .modal-overlay.needs-detail .modal { animation: none; } }
 /* needs-ab end */
