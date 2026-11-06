@@ -1998,13 +1998,21 @@ class _Handler(GuardedHandler):
         arrives cross-site and must reach that script to land on its sign sheet (W1a); exact raw path, no query, except a
         push tap's own deep link (:meth:`_push_tap_path`)."""
         page = self.path.split("?", 1)[0]
-        return (self.command == "GET"
+        if not (self.command == "GET" and self.headers.get("Sec-Fetch-Site") == "cross-site"
+                and self.headers.get("Sec-Fetch-Mode") == "navigate"):
+            return False
+        dest = self.headers.get("Sec-Fetch-Dest")
+        # A Pixel's notification tap and installed-app launch reach the shell as navigate with Dest ``empty`` (11-06 photo of the
+        # 403 body: Sec-Fetch-Site cross-site, Mode navigate, Dest empty). Dest ``empty`` is admitted for the app shell alone
+        # (the bare ``/`` and a push tap's deep link), never for pair or a sign sheet: Mode ``navigate`` is not a header a page's
+        # fetch/XHR/beacon can send (those are cors/no-cors/same-origin), an iframe, embed or object says its own Dest and stays
+        # refused, and the shell is a GET-only static page whose reads are same-origin and credential-gated.
+        if dest == "empty":
+            return self.path == "/" or self._push_tap_path()
+        return (dest == "document"
                 and (self.path == "/pair" or self.path == "/" or self._push_tap_path()
                      or _sheet_id(page) is not None or _consent_sheet_id(page) is not None
-                     or _dispatch_sheet_id(page) is not None or page == _COORD_SHEET)
-                and self.headers.get("Sec-Fetch-Site") == "cross-site"
-                and self.headers.get("Sec-Fetch-Mode") == "navigate"
-                and self.headers.get("Sec-Fetch-Dest") == "document")
+                     or _dispatch_sheet_id(page) is not None or page == _COORD_SHEET))
 
     def handle_one_request(self) -> None:
         """One request on this (possibly kept-alive) connection. PAIR RS-1: the credential cache is reset here, at the

@@ -18,7 +18,9 @@
   const CACHE = "levain-open", PREFIX = "/__levain_open/";
   // a target older than this is a tap nobody followed up (the card it points at is stale, and a later plain visit must not jump).
   // 'new': the window between openWindow and the opened page's first script run. 'asked': the worker's ack wait plus slack.
-  const TTL_MS = { asked: 30000, new: 30000 };
+  // 'shown': the launch fallback for a tap whose notificationclick never ran (see below); SHOWN_TTL_MS is also its expiry here.
+  const SHOWN_TTL_MS = 180000;
+  const TTL_MS = { asked: 30000, new: 30000, shown: SHOWN_TTL_MS };
   const haveCache = typeof caches !== "undefined";
 
   // The TRACE (the worker writes the same ring, see sw.js): one cache entry per step under '/__levain_trace/<time>-<seq>',
@@ -100,7 +102,7 @@
     checking = true;
     try {
       const cache = await caches.open(CACHE);
-      const found = [], seen = [];
+      const found = [], seen = [], shownEntries = [];
       for (const req of await cache.keys()) {
         if (new URL(req.url).pathname.indexOf(PREFIX) !== 0) continue;
         let e = null;
@@ -111,6 +113,9 @@
           await cache.delete(req); continue;
         }
         seen.push({ for: e.for || null, ageMs: Date.now() - e.at, url: traceUrl(e.url) });
+        // the first version's fixed singleton key (no ping suffix) is orphaned now: swept, never judged
+        if (new URL(req.url).pathname === PREFIX + "shown") { await cache.delete(req); continue; }
+        if (e.for === "shown") { shownEntries.push({ req, e }); continue; }   // never claimable by the 'new' path (below)
         if (e.for !== "new") continue;                       // 'asked' belongs to the message path
         let u;
         try { u = new URL(e.url, location.href); } catch (_) { continue; }
@@ -129,7 +134,67 @@
         return;
       }
       trace("checkPending", { seen, claimed: null, assigned: false });
+      await takeShown(cache, shownEntries, here);
     } catch (_) { /* no cache: nothing pending */ } finally { checking = false; }
+  }
+  // The LAUNCH FALLBACK. On the iPhone Home Screen app a tapped push can open the app at the bare '/' without ever running the
+  // worker's notificationclick (11-06: pings 607-609 shown, no click, no `opens` row), so the target is lost. The worker writes
+  // ONE immutable 'shown' entry per ping (sw.js startShownPending). This document, at its first run, takes one ONLY when
+  // everything says "launched by that tap": the page is exactly '/' (no query, no fragment) and was not reloaded, a standalone
+  // launch, the entry at most SHOWN_TTL_MS old and same-origin, and the notification it names is no longer in the tray (iOS
+  // dismisses a tapped one; a manual launch with the notification still showing must not redirect). Every live entry is
+  // judged; when SEVERAL are gone from the tray (several pings were tapped away or dismissed) the NEWEST wins: it is the one on
+  // top of what he would have tapped. Anything unknown (no registration, no getNotifications, a throw) fails toward the plain
+  // launch. Deletes name exactly the requests this page read, so a push arriving meanwhile (its own key) is never touched.
+  // KNOWN, ACCEPTED EDGE: tray absence is not proof of a tap. A ping he swiped away, then an icon launch within SHOWN_TTL_MS,
+  // redirects to that ping's card. It lands inside his own cockpit and costs one tap to leave, and the evidence it replaces is
+  // that today the real tap lands nowhere; so the tray check stays and is not tightened further.
+  async function takeShown(cache, entries, here) {
+    if (!entries.length) return;
+    const bare = here.pathname === "/" && !here.search && !here.hash;
+    let standalone = false;
+    try { standalone = !!((typeof matchMedia === "function" && matchMedia("(display-mode: standalone)").matches) || navigator.standalone); } catch (_) { standalone = false; }
+    if (!bare || !standalone) { trace("shown-skip", { why: !bare ? "not-bare" : "not-standalone" }); return; }
+    // a reload at '/' is never a launch (when the Navigation Timing API says so)
+    let navType = null;
+    try { const n = typeof performance !== "undefined" && performance.getEntriesByType ? performance.getEntriesByType("navigation")[0] : null; navType = n && n.type || null; } catch (_) { navType = null; }
+    if (navType === "reload") { trace("shown-skip", { why: "reload" }); return; }
+    const live = [];
+    for (const f of entries) {
+      let u = null;
+      try { u = new URL(f.e.url, location.href); } catch (_) { u = null; }
+      if (!u || u.origin !== location.origin) { trace("shown-skip", { why: "cross-origin" }); continue; }
+      if (Date.now() - f.e.at > SHOWN_TTL_MS) { trace("shown-skip", { why: "expired" }); continue; }
+      const ping = Number(f.e.ping);
+      if (!Number.isInteger(ping)) { trace("shown-skip", { why: "no-ping" }); continue; }
+      live.push({ ...f, u, ping, tag: typeof f.e.tag === "string" ? f.e.tag : "" });
+    }
+    if (!live.length) return;
+    const gone = [];
+    try {
+      const sw = navigator.serviceWorker;
+      let timer;
+      const reg = await Promise.race([sw.getRegistration ? sw.getRegistration() : sw.ready, new Promise((r) => { timer = setTimeout(() => r(null), 3000); })]);
+      clearTimeout(timer);
+      if (!reg || typeof reg.getNotifications !== "function") { trace("shown-skip", { why: "no-api" }); return; }
+      // one query per TAG. A re-ping reuses the tag (renotify): the newer notification REPLACES the older in the tray, so an
+      // entry is in the tray (or superseded by what is) when a notification under its tag carries its ping or a NEWER one
+      const byTag = new Map();
+      for (const f of live) {
+        if (!byTag.has(f.tag)) byTag.set(f.tag, Array.from(await reg.getNotifications({ tag: f.tag })));
+        const list = byTag.get(f.tag);
+        if (list.some((n) => n && n.data && Number(n.data.ping) >= f.ping)) trace("shown-skip", { why: "in-tray" });
+        else gone.push(f);
+      }
+    } catch (_) { trace("shown-skip", { why: "error" }); return; }
+    if (!gone.length) return;
+    gone.sort((x, y) => y.e.at - x.e.at);
+    const f = gone[0];
+    if (!(await cache.delete(f.req))) return;   // a lost delete: another page took it
+    // the launch handled the others that were gone too: a later bare launch must not pop one of them
+    for (const o of gone.slice(1)) { try { await cache.delete(o.req); } catch (_) { /* swept by its TTL */ } }
+    trace("shown-launch", { url: traceUrl(f.u.href), ping: f.ping, ageMs: Date.now() - f.e.at, candidates: gone.length });
+    assignTo(f.u.href);
   }
   // once, at this document's first script run: a pageshow call would let a page opened for one tap consume a later tap's entry
   checkPending();
