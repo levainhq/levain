@@ -40,11 +40,12 @@ def _version_arg(text: str) -> int:
 
 def add_parsers(subparsers: argparse._SubParsersAction) -> None:
     p = subparsers.add_parser(
-        "agents", help="Named agents on the autonomic store (the store check; `role add|show`).",
+        "agents", help="Named agents on the autonomic store (the store check, then one verb per act; see `levain agents --help`).",
         allow_abbrev=False,
         description="Open the autonomic store's agent tables and check them against this levain's schema. "
                     "Refuses a /3 store, and a store whose agent tables are not the ones this levain writes. "
-                    "Verbs: `role add|show` (the role registry). Give --store-dir before `role`.")
+                    "With a verb (listed below) it acts on those tables: the role registry, agent specs, the "
+                    "operator agent and its links, the fence and the tick. Give --store-dir before the verb.")
     p.add_argument("--store-dir", dest="store_dir", type=Path, default=None,
                    help="The autonomic store directory (default: $LEVAIN_HOME/autonomic).")
     p.set_defaults(func=run_agents)

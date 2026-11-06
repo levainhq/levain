@@ -33,9 +33,10 @@ Notes a provider relies on:
 - **`roster`**: a `digest` of `null` means "no data" and renders as such; it is never read as zero. A
   row whose `lifecycle` is `retired` is dropped by the kernel (the value carries `retired_hidden: n`).
   `silence_is_signal` defaults to `cadence == "resident"` when omitted or null.
-  `kind` (`role` or `job`) is not validated by the kernel: a row with `kind: "role"` is read for health from
-  its digest's last run (`last_run_at`, `last_run_status`, `run_failed`, `run_late`); a row that sends no `kind` is
-  read as a role when its `memory` is `stateless`; any other value reads as not a role (episodes and wraps).
+  `kind` is not validated by the kernel, and only `"role"` means a role: a row with `kind: "role"` is read for
+  health from its digest's last run (`last_run_at`, `last_run_status`, `run_failed`, `run_late`); a row whose
+  `kind` is missing or `null` is read as a role when its `memory` is `stateless`; every other value, `"job"`
+  included, reads as not a role (episodes and wraps).
 - **`form`**: the provider supplies a `recipient` field's `enum` from its own registry; the kernel
   checks only that it is a non-empty list of strings.
 - **`log`**: the kernel adds a `sentence` to each row, `"<verb label> · <target>"`, from the
