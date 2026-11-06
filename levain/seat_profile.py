@@ -62,18 +62,26 @@ def _abs_rule(tool: str, path: str) -> str:
 
 
 def seat_permission_deny(roots: Sequence[Path], key_dir: Path) -> list[str]:
-    """``permissions.deny``: all four file tools on every protected pattern of every root (plus a gitfile anywhere),
-    and the Read tool on the launcher key directory. The first root (the clone, the working directory) also gets the
-    cwd-relative spellings, which are the ones measured to fire after symlink resolution."""
+    """``permissions.deny``: all four file tools on every protected pattern of every root, and the Read tool on the
+    launcher key directory. The first root (the clone, the working directory) also gets the cwd-relative spellings,
+    which are the ones measured to fire after symlink resolution. ``.git`` is denied only at the paths that run code or
+    carry configuration (:data:`_GIT_DENY`), never whole and never as ``**/.git``: Claude Code turns a file-tool deny
+    rule into a sandbox write denial, so a whole-``.git`` rule made ``git commit`` fail with ``index.lock: Operation
+    not permitted`` (1106-16/z1e/RETURN_gitdeny.md, measured). A ``.git`` created after launch is therefore not deny-ruled
+    (the launch walk refuses a gitfile or nested ``.git`` that already exists), and a Write to a ``.git`` file outside
+    those paths reaches a permission prompt instead of a hard deny."""
     rules: list[str] = []
+    names = sorted(PROTECTED_NAMES - {".mcp.json", ".git"})
     for i, root in enumerate(roots):
-        pats = [f"{root}/{name}/**" for name in sorted(PROTECTED_NAMES - {".mcp.json"})]
-        pats += [f"{root}/.mcp.json", f"{root}/**/.git"]
+        pats = [f"{root}/{name}/**" for name in names]
+        pats += [f"{root}/.git/{sub}/**" for sub in _GIT_DENY]
+        pats += [f"{root}/.mcp.json"]
         for tool in FILE_TOOLS:
             rules += [_abs_rule(tool, p) for p in pats]
             if i == 0:
-                rules += [f"{tool}({name}/**)" for name in sorted(PROTECTED_NAMES - {".mcp.json"})]
-                rules += [f"{tool}(.mcp.json)", f"{tool}(**/.git)"]
+                rules += [f"{tool}({name}/**)" for name in names]
+                rules += [f"{tool}(.git/{sub}/**)" for sub in _GIT_DENY]
+                rules += [f"{tool}(.mcp.json)"]
     rules.append(_abs_rule("Read", f"{key_dir}/**"))
     return rules
 

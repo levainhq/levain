@@ -70,7 +70,10 @@ def test_permission_deny_names_all_four_file_tools(rig):
     for tool in ("Edit", "Write", "MultiEdit", "NotebookEdit"):
         assert any(r.startswith(f"{tool}(") and ".claude/**" in r for r in deny)
         assert any(r.startswith(f"{tool}(") and r.endswith("/.mcp.json)") for r in deny)
-        assert f"{tool}(**/.git)" in deny
+        for sub in sp._GIT_DENY:
+            assert f"{tool}(.git/{sub}/**)" in deny and f"{tool}(//{str(base / 'lane').lstrip('/')}/.git/{sub}/**)" in deny
+        # git commit needs .git writable (measured, z1e/RETURN_gitdeny.md): no rule may deny .git whole
+        assert not any(r.startswith(f"{tool}(") and (r.endswith("/.git/**)") or r.endswith(".git)")) for r in deny)
     assert any(r.startswith("Read(") and str(keys).lstrip("/") in r for r in deny)
 
 
