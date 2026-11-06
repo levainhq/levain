@@ -85,6 +85,24 @@
     return l.kind === "vendor_error" ? "Error" : l.kind.replace(/_/g, " ");
   }
 
+  // A Read's result: the vendor numbers every line (``cat -n``: a right-aligned number, a tab, the line). The number is the
+  // vendor's formatting and not the file's text, so it is not drawn. The record carries no tool name for a result and the
+  // room has no shell (ROOM_TOOLS: Read, Grep, Glob, WebSearch; a grep's numbers take a colon), so the test is the shape: the
+  // leading run of lines that open with a number and a tab, each one more than the last. The run ends at the first line that
+  // is not the next number; an error body and a refusal are never read as a file. Display only: the record is not changed.
+  var NUMBERED = /^ *(\d+)\t/;
+  function withoutLineNumbers(text) {
+    var lines = text.split("\n"), n = 0, prev = -1;
+    for (; n < lines.length; n++) {
+      var m = NUMBERED.exec(lines[n]);
+      if (!m || (prev >= 0 && Number(m[1]) !== prev + 1)) break;
+      prev = Number(m[1]);
+    }
+    if (n === 0) return text;
+    for (var i = 0; i < n; i++) lines[i] = lines[i].replace(NUMBERED, "");
+    return lines.join("\n");
+  }
+
   function lineModel(it) {
     var you = it.kind === "message" && it.source === "operator";
     var room = it.kind === "vendor_agent_text";
@@ -100,6 +118,7 @@
       var un = unwrap(text); text = un.text; tag = un.tag;
       refusal = refusalOf(text, tag);
       if (refusal) text = REFUSAL_TEXT[refusal];
+      else if (!tag) text = withoutLineNumbers(text);
     }
     // a hook of the operator's own settings starting in the child (body e.g. "SessionStart:startup") and one that ended
     // in success are recorded as error-kind rows too (claude_session._on_hook, ref "error:hook_started:<id>"); they are
@@ -123,12 +142,29 @@
     };
   }
 
+  // Whether a turn is running: the composer says nothing of it (an idle room and a running one are both "writable"), so it
+  // is read from the turn rows the server sends in the stream (hidden from the page, still sent): the newest launch's latest
+  // turn row is a start with no end after it. A turn an earlier launch left open belongs to a session that is gone.
+  function turnRunning(stream) {
+    var launch = null, last = "";
+    for (var i = 0; i < stream.length; i++) {
+      var it = stream[i];
+      if (it && typeof it.launch_id === "string" && it.launch_id) {
+        if (it.launch_id !== launch) { launch = it.launch_id; last = ""; }
+        if (it.kind === "vendor_turn_started" || it.kind === "vendor_turn_ended") last = it.kind;
+      }
+    }
+    return last === "vendor_turn_started";
+  }
+
   function roomModel(body) {
     var c = body.composer || null, st = c && own(COMPOSER_WORDS, c.state) ? c.state : "none";
     var thread = typeof body.room_thread === "string" ? body.room_thread : null;
+    var running = turnRunning(body.stream || []);
     return {
-      thread: thread, open: thread !== null,
-      canSend: thread !== null && own(SEND_STATES, st), canStop: thread !== null && own(STOP_STATES, st),
+      thread: thread, open: thread !== null, running: running,
+      // Stop is for a turn that can be stopped; a stop sent in a race still gets the server's "Nothing was running to stop."
+      canSend: thread !== null && own(SEND_STATES, st), canStop: thread !== null && own(STOP_STATES, st) && running,
       state: st, words: thread === null ? "No room is open." : (c && c.why && st !== "writable" ? COMPOSER_WORDS[st] + " (" + c.why + ")" : COMPOSER_WORDS[st]),
       model: typeof body.model === "string" && body.model ? "Model in use: " + body.model : "",
       gap: body.gap === true,

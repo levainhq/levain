@@ -106,7 +106,7 @@ def test_a_tool_result_reads_as_a_sentence_without_its_tag_and_opens_on_a_tap(tm
     assert "A read was refused — That is outside what the room can read, so nothing was read." in heads, heads
     assert not [h for h in heads if "permission settings" in h or "blockReads" in h], heads    # never the vendor's wording
     assert "A tool failed — File does not exist." in heads, heads
-    assert "A tool result — 1\thello from the room scratch dir" in heads, heads
+    assert "A tool result — hello from the room scratch dir" in heads, heads     # the Read's own line number is not drawn
     assert not [h for h in heads if "vendor" in h or "<" in h], heads
     assert g["angle"] == 0 and g["anyMarkupInTools"] == 0
     o = json.loads(out["values"][2])
@@ -239,3 +239,91 @@ def test_an_empty_backtick_pair_is_not_a_code_span_to_the_bold_scan_either(tmp_p
 def test_the_page_script_has_no_markup_sink():
     js = (WEB / "room_view.js").read_text()
     assert not re.search(r"innerHTML|outerHTML|insertAdjacentHTML|document\.write|DOMParser|createContextualFragment", js)
+
+
+# --- a Read's line numbers, and the Stop button (1105-49, desk 10's look at the live room) --------------------------------
+
+@needs_browser
+def test_a_reads_line_numbers_are_not_drawn_and_no_other_leading_number_is_touched(tmp_path, w):
+    """Reproduced on the live room: the row read "A tool result — 1 # CLAUDE.md ...". The vendor's Read prefixes every line with
+    a right-aligned number and a tab (``cat -n``). The record carries no tool name for a result, and the room has no shell, so a
+    result whose lines open with consecutive numbers and a tab is a Read's."""
+    read = "     1\t# CLAUDE.md — flow\n     2\t\n     3\tbody line"
+    bodies = [read,
+              "1\thello from the room scratch dir\n2\t",         # the shape the vendor's stream recorded (no padding)
+              "     1\t2\tx",                                     # the file's own text starts with a number and a tab: one prefix goes
+              "42 apples\n43 pears",                              # a number that is the result's own words
+              "12:a grep hit\n13:another",                        # a grep's numbers (a colon, no tab)
+              "     1\ta\n     5\tb",                             # numbers that are not a run stop the strip at the break
+              "<tool_use_error>3\tnot a file</tool_use_error>"]   # an error body is never read as a file
+    g = _lines(tmp_path, w, _results(*bodies), 7)
+    assert [x["text"] for x in g] == ["# CLAUDE.md — flow\n\nbody line", "hello from the room scratch dir\n", "2\tx",
+                                      "42 apples\n43 pears", "12:a grep hit\n13:another", "a\n     5\tb", "3\tnot a file"], g
+    assert g[0]["head"] == "A tool result — # CLAUDE.md — flow", g[0]
+
+
+def _stop_boot(stream, state="writable", stop_outcome="confirmed"):
+    return ('window.__body = {room_thread: "t1", composer: {state: "%s"}, model: "m", stream: %s, proposals: [], room_error: null};\n'
+            'window.__posts = [];\n'
+            'const stub = (u, o) => { const post = o && o.method === "POST"; if (post) window.__posts.push(u);\n'
+            '  const out = post ? {outcome: "%s"} : window.__body;\n'
+            '  return Promise.resolve({status: 200, ok: true, text: () => Promise.resolve(JSON.stringify(out))}); };\n'
+            'window.__rv = LevainRoomView.mount(document.getElementById("host"), {pollMs: 0, storage: null, speech: null, fetch: stub, headers: () => ({})});'
+            % (state, json.dumps(stream), stop_outcome))
+
+
+def _turn(gseq, kind, launch):
+    return threads._item(_row(gseq, kind, "vendor", "%s:%d" % (kind, gseq), launch, "success completed" if kind == "vendor_turn_ended" else None),
+                         {}, set())
+
+
+def _said(gseq):
+    return threads._item(_row(gseq, "message", "operator", "cm-%d" % gseq, None, "hi", status="accepted"), {}, set())
+
+
+_STOP = "document.querySelector('.rv-stop').disabled"
+_READY = {"until": "window.__rv && window.__rv.model() && document.querySelector('.rv-input')"}
+
+
+_SERVES = iter(range(1000))
+
+
+def _stop_disabled(tmp_path, w, stream, state="writable"):
+    boot = _stop_boot(stream, state)
+    with _serve_room(tmp_path, w, "serve%d" % next(_SERVES), extra_assets={"/rvc.html": ("text/html; charset=utf-8", _PAGE.encode()),
+                                                "/rvc.js": ("text/javascript; charset=utf-8", boot.encode())}) as (base, _h):
+        out = _drive(tmp_path, base + "/rvc.html", [_READY, {"eval": "JSON.stringify(%s)" % _STOP}])
+    return json.loads(out["values"][1])
+
+
+@needs_browser
+def test_stop_is_available_only_while_a_turn_is_running(tmp_path, w):
+    """Reproduced: an idle room (composer "writable", the last turn ended) and a running one (the last turn started, not ended)
+    gave the same model, and Stop was enabled on both. A turn is running when the newest launch's latest turn row is a start."""
+    ended = [_said(1), _turn(2, "vendor_turn_started", "L1"), _turn(3, "vendor_turn_ended", "L1")]
+    running = ended[:2]
+    assert _stop_disabled(tmp_path, w, [], "writable") is True                      # a room with nothing said yet
+    assert _stop_disabled(tmp_path, w, ended, "writable") is True                   # idle: the turn ended
+    assert _stop_disabled(tmp_path, w, running, "writable") is False                # a turn is running
+    assert _stop_disabled(tmp_path, w, running, "not_live") is False                # a stuck turn can still be stopped
+    assert _stop_disabled(tmp_path, w, running, "ended") is True                    # no launch to stop
+    assert _stop_disabled(tmp_path, w, ended + [_said(4), _turn(5, "vendor_turn_started", "L1")], "writable") is False
+    # a turn left open by an earlier launch that died is not the new launch's turn
+    assert _stop_disabled(tmp_path, w, running + [_turn(4, "vendor_turn_started", "L2"), _turn(5, "vendor_turn_ended", "L2")]) is True
+    assert _stop_disabled(tmp_path, w, running + [_turn(4, "vendor_agent_text", "L2")]) is True
+
+
+@needs_browser
+def test_stop_follows_the_turn_as_the_room_is_read_again_and_a_raced_stop_keeps_its_words(tmp_path, w):
+    ended = [_said(1), _turn(2, "vendor_turn_started", "L1"), _turn(3, "vendor_turn_ended", "L1")]
+    boot = _stop_boot(ended[:2], stop_outcome="no_such_request")
+    assets = {"/rvc.html": ("text/html; charset=utf-8", _PAGE.encode()), "/rvc.js": ("text/javascript; charset=utf-8", boot.encode())}
+    with _serve_room(tmp_path, w, extra_assets=assets) as (base, _h):
+        out = _drive(tmp_path, base + "/rvc.html", [
+            _READY, {"eval": "JSON.stringify(%s)" % _STOP},
+            # the turn ended on the server a moment before the tap: the stop is sent, the server says nothing was running
+            {"eval": "window.__body.stream = %s; document.querySelector('.rv-stop').click(); 1" % json.dumps(ended)},
+            {"until": "document.querySelector('.rv-sendnote').textContent === 'Nothing was running to stop.' && window.__posts.length === 1"},
+            {"eval": "JSON.stringify(%s)" % _STOP}])
+    assert json.loads(out["values"][1]) is False
+    assert json.loads(out["values"][4]) is True, out["values"]       # the re-read after the stop shows the turn over
