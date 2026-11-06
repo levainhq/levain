@@ -74,7 +74,9 @@ def _check_marker(conn: sqlite3.Connection) -> None:
     marker = agent_marker(conn)
     if marker != AGENT_SCHEMA:
         reason = "no agent_schema marker" if marker is None else f"unknown agent schema marker {marker!r}"
-        raise AgentStoreRefused(_refusal(reason, marker))
+        # migrates=True: a KNOWN older marker under a held object is an old store, and the next verb migrates it (the
+        # read-only view's words); an unknown or later marker still goes to the levain that wrote it
+        raise AgentStoreRefused(_refusal(reason, marker, migrates=True))
 
 
 class AgentStore:

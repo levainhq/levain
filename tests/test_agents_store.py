@@ -6,6 +6,7 @@ import sqlite3
 import pytest
 
 from levain import cli
+from levain.agents import cli as cli_agents
 from levain.agents.store import AgentStoreRefused, open_agent_store, open_agent_store_view
 from levain.autonomic import agent_tables as at
 from levain.autonomic import schema3
@@ -305,3 +306,72 @@ def test_a_future_marker_is_still_sent_to_the_levain_that_wrote_it_even_from_the
         open_agent_store_view(d)
     assert "run the levain that wrote marker levain-agent-schema/5" in str(e.value)
     assert "older agent schema" not in str(e.value)
+
+
+# ------------------------------------------------------------------ fixk2b: the held object's words and the verbs' catch
+
+
+@pytest.mark.parametrize("marker", ["levain-agent-schema/2", "levain-agent-schema/3"])
+def test_a_held_store_whose_marker_is_a_known_older_one_names_the_verb_that_migrates_it(tmp_path, marker):
+    """fixk2b (L3 land12 r1, deepseek LOW 3): a KNOWN predecessor marker under a held object read 'unknown ... run the
+    levain that wrote marker /3', the way out the read-only view had already stopped giving."""
+    d = tmp_path / "heldold"
+    held = open_agent_store(d)
+    view = open_agent_store_view(d)
+    edit(d, f"UPDATE meta SET value = '{marker}' WHERE key = 'agent_schema'")
+    for hold in (held.read, held.write, view.read):
+        with pytest.raises(AgentStoreRefused) as e:
+            with hold():
+                raise AssertionError("the block must not run")
+        text = str(e.value)
+        assert f"{marker} is an older agent schema that the next `levain agents` verb of this version migrates" in text
+        assert "run the levain that wrote marker" not in text
+
+
+def _bumped_open(monkeypatch, d):
+    """tick_driver's opener, but the marker moves right after the open: the verb's first transaction meets it."""
+    from levain.agents import tick_driver
+
+    def opener(store_dir):
+        st = open_agent_store(store_dir)
+        edit(d, "UPDATE meta SET value = 'levain-agent-schema/5' WHERE key = 'agent_schema'")
+        return st
+
+    monkeypatch.setattr(tick_driver, "open_agent_store", opener)
+
+
+def test_tick_says_a_marker_moved_after_its_open_and_exits_1_not_a_traceback(tmp_path, monkeypatch, capsys):
+    """fixk2b (L3 land12 r1, complement LOW 2): `tick` is registered after the one wrap, so ITS OWN handler must catch
+    the refusal a transaction raises after the open. Real pieces: no install file, so the refused-install branch."""
+    d = tmp_path / "tick"
+    open_agent_store(d)
+    _bumped_open(monkeypatch, d)
+    args = cli.build_parser().parse_args(["agents", "--store-dir", str(d), "tick"])
+    assert args.func is cli_agents.run_tick       # the position: tick keeps its own function, unwrapped
+    assert args.func(args) == 1
+    err = capsys.readouterr().err
+    assert "levain agents: unknown agent schema marker 'levain-agent-schema/5'" in err
+    assert "Traceback" not in err
+
+
+def test_tick_says_a_marker_moved_under_the_controllers_transaction_too(tmp_path, monkeypatch, capsys):
+    """The same, with an install that names a cockpit (so the pass reaches the controller, not the refused branch); the
+    controller's transaction is a held read of the moved store."""
+    from levain import agent_authority
+    from levain.agents import controller as ctl
+    from levain.agents import tick_driver
+
+    d = tmp_path / "tickctl"
+    open_agent_store(d)
+    _bumped_open(monkeypatch, d)
+    monkeypatch.setattr(tick_driver, "_cockpit_root", lambda st: tmp_path)
+    monkeypatch.setattr(agent_authority, "AgentAuthority", lambda root: object())
+
+    def tick(store, *a, **k):
+        with store.read():
+            raise AssertionError("the block must not run")
+
+    monkeypatch.setattr(ctl, "tick", tick)
+    args = cli.build_parser().parse_args(["agents", "--store-dir", str(d), "tick"])
+    assert args.func(args) == 1
+    assert "levain agents: unknown agent schema marker 'levain-agent-schema/5'" in capsys.readouterr().err

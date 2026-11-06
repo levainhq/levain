@@ -125,7 +125,7 @@ def register_dream(store: Any, *, revise: bool = False, binding: str | None = No
     before K2b gets attached). Idempotent: the same content registers nothing twice and attaches once. Raises :class:`EnableRefused` with every refusal; nothing is written when any
     rule refuses the spec. ``binding`` is a shadow install's :func:`shadow_binding` (None: a live install)."""
     from levain.agents import refuse, role as _role, spec as _spec
-    from levain.agents.store import get_default_zone
+    from levain.agents.store import AgentStoreRefused, get_default_zone
 
     zone = get_default_zone(store)
     role = _role.parse_role(dream_role())
@@ -140,7 +140,7 @@ def register_dream(store: Any, *, revise: bool = False, binding: str | None = No
     _, role_hash, _, _ = _role.add_role(store, role)
     try:
         agent_id, spec_hash, version, created = _spec.register_spec(store, parsed, zone, revise=revise, attach=True)
-    except _spec.SpecError as exc:
+    except (_spec.SpecError, AgentStoreRefused) as exc:     # the store's marker is checked in the write: a store moved since
         raise EnableRefused(str(exc)) from exc
     return Registered(agent_id, spec_hash, role_hash, version, created, str(zone))
 

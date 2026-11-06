@@ -795,3 +795,21 @@ def test_a_drill_failure_whose_row_could_not_be_raised_is_raised_again_on_the_ne
     assert da.drill_tick(db, root, now=now + timedelta(hours=2), attention=lambda k, t: 1 / 0,
                          resolve=res.append).action == "not-due"
     assert res == ["dream-drill"]
+
+
+def test_a_marker_moved_after_the_role_is_an_enable_refusal_not_a_bare_store_refusal(astore, monkeypatch):
+    """fixk2b (L3 land12 r1, complement LOW 3): register_spec(attach=True) checks the marker in its own transaction, so a
+    marker another process moved between add_role and register_spec raised AgentStoreRefused out of register_dream, whose
+    contract is EnableRefused for every refusal."""
+    real = role_mod.add_role
+
+    def add_then_move(store, role):
+        out = real(store, role)
+        c = sqlite3.connect(astore.directory / DB_NAME, isolation_level=None)
+        c.execute("UPDATE meta SET value = 'levain-agent-schema/5' WHERE key = 'agent_schema'")
+        c.close()
+        return out
+
+    monkeypatch.setattr(role_mod, "add_role", add_then_move)
+    with pytest.raises(da.EnableRefused, match="unknown agent schema marker 'levain-agent-schema/5'"):
+        da.register_dream(astore)
