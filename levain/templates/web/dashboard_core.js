@@ -4758,6 +4758,11 @@
       const n = bandNumOf.get(Number(row.dataset.questionN));
       if (tag) { tag.textContent = n === undefined ? "" : String(n); tag.hidden = n === undefined; }
     }
+    for (const row of document.querySelectorAll(".needs-row[data-question-n]")) {
+      const tag = row.querySelector(".needs-row-band");
+      const n = cardBandNum(row.dataset.questionN);
+      if (tag) { tag.textContent = n === undefined ? "" : String(n); tag.hidden = n === undefined; }
+    }
   }
   function bandSlot() {
     const slot = el("div", "band-slot");
@@ -6411,6 +6416,15 @@
   // item is drawn whole. Line one is the question's title (a consent's tool and first words), line two what it blocks (a consent's
   // working directory), the right edge the agent, the clock or age, and "rec <key>" when the item carries one. Text is drawn with
   // textContent and cut by CSS to one line each, so a long item never sets its row's height.
+  // The card face's words: the first sentence of the question (CSS clamps it to two lines); a text with no sentence end is whole.
+  function needsFirstSentence(what) {
+    const t = String(what || "").replace(/\s+/g, " ").trim();
+    const m = /^(.+?[.!?])(?:\s|$)/.exec(t);
+    return m ? m[1] : t;
+  }
+  // the cards' own copy of the band numbers (bandNumOf also feeds needsName's title, which must not change when a card reads the band)
+  const cardBandOf = new Map();
+  const cardBandNum = (n) => { const k = Number(n); return bandNumOf.has(k) ? bandNumOf.get(k) : cardBandOf.get(k); };
   function needsRow(it) {
     const row = el("button", "needs-row" + (it.kind === "consent" ? " needs-consent" : " needs-question"));
     row.type = "button";
@@ -6444,16 +6458,22 @@
       });
     } else {
       if (it.q.age) side.appendChild(el("span", "ext-meta needs-left", "asked " + it.q.age));
+      const bn = cardBandNum(it.q.n);
+      const tag = el("b", "band-num needs-row-band", bn === undefined ? "" : String(bn));   // the band number leads the face; applyBandNumbers retakes it
+      tag.hidden = bn === undefined;
+      row.dataset.questionN = String(it.q.n);
+      side.insertBefore(tag, side.firstChild);
       questionBody(it.q, row).then((b) => {
         if (!b || b.error) return;
-        const first = flat(b.what);
+        const first = needsFirstSentence(b.what);
         if (first) title.textContent = first;
+        if (flat(b.what)) row.title = flat(b.what);
         const more = flat(blocksBeyondTitle(b.what, b.blocks));
         if (more) sub.textContent = "blocks: " + more;
         if (typeof b.rec === "string" && b.rec) side.appendChild(el("span", "needs-rec-tag needs-row-rec", "rec " + b.rec));
       });
     }
-    row.title = "open the whole request and decide there";
+    if (!row.title) row.title = "open the whole request and decide there";
     row.append(text, side);
     row.addEventListener("click", () => openNeedsFocus(row._needsItem || it, row));
     return row;
@@ -6572,6 +6592,14 @@
     if (settled.length) kids.push(answeredSection());
     host.replaceChildren(...kids);
     host.hidden = false;
+    // the cards lead with their band number: the band read gives it (the Decisions panel's own slot may not be drawn on this tab)
+    if (items.some((it) => it.kind === "question")) {
+      bandFetch(false).then((b) => {
+        const list = b && Array.isArray(b.items) ? b.items : [];
+        for (const x of list) if (x && Number.isInteger(x.question) && x.n !== undefined) cardBandOf.set(x.question, x.n);
+        applyBandNumbers();
+      }, () => {});
+    }
     host.dataset.sig = sig;   // only a strip that was drawn is recorded as drawn: a build that threw is tried again at the next render
   }
   // the Decisions focus view (decided requests, outcomes, proposals); false when this page has no Decisions panel
