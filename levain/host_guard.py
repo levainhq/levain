@@ -81,14 +81,16 @@ CC_HOSTED_TOOLS = ("Bash", "Read")
 # ("Bash", "Read") as levain 43 ruled for a failed probe. A hosted session is unchanged: a
 # cockpit that can be reached approves held actions, which a terminal seat's prompt does not.
 # The head narrowed the seat set: the web tools run outside the network allowlist.
-# Z1f (H3, go): NotebookEdit, Glob and Grep are re-admitted, each BEHIND ITS OWN CANARY PROBE
-# (levain.seat_canary.TOOL_PROBES: NotebookEdit -> P9, Glob and Grep -> P10), so a tool whose probe is
-# not a pass is dropped from the verdict's fallback set and the canary fails. Measured 11-06 on 2.1.319:
-# NotebookEdit takes the same protected-path deny as Edit and Write (z0b2); Glob and Grep outside the
-# working directories are refused under --restricted. Still OUT: MultiEdit (does not exist in 2.1.319),
+# Z1f (H3, go): Glob and Grep are re-admitted BEHIND THEIR CANARY PROBE (levain.seat_canary.TOOL_PROBES:
+# both -> P10, which also tries traversal through a symlink inside a root), so when P10 is not a pass both
+# are dropped from the verdict's fallback set and the canary fails. Measured 11-06 on 2.1.319: Glob and
+# Grep outside the working directories are refused under --restricted. NotebookEdit is NOT admitted:
+# its probe (P9, levain.seat_canary.READY_TOOL_PROBES) is ready, but it has no symlink-swap arm, and
+# NotebookEdit edits an existing file so P2's flipper (an empty real directory) gives it nothing to race
+# for (z1f fix round). Still OUT: MultiEdit (does not exist in 2.1.319),
 # TodoWrite (not in the 2.1.319 tool list), Agent (named Task there), SendMessage, Skill and TaskStop
 # (U11, a VM measurement of subagent inheritance), WebFetch and WebSearch (the narrowing stands).
-CC_SEAT_TOOLS = ("Bash", "Read", "Edit", "Write", "NotebookEdit", "Glob", "Grep")
+CC_SEAT_TOOLS = ("Bash", "Read", "Edit", "Write", "Glob", "Grep")
 
 # Which settings sources a terminal seat loads: none. Measured on the host (headless): without
 # `project` in the source list a clone's CLAUDE.md and .claude/settings.json hooks are not
