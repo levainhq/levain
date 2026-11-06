@@ -184,6 +184,17 @@ const fire = async (t, o, ev = {}) => { for (const fn of (o[t] || [])) fn(ev); a
     // a push (its own key) lands while the page waits on the tray: the page deletes exactly what it read, so the new entry survives
     await run('pushDuringCheck', { hook: async () => { putShown({ ping: 610, nonce: 'z', tag: 'np-610', url: '/?view=notifications&n=p610', at: Date.now() }); } });
     log.pushDuringKeys = shownKeys().map((k) => k.slice(PFX.length));
+    // SAME-TAG RE-PING: ping 43 replaced ping 42 under tag 'x' in the tray; both cache entries remain. 42 is superseded, not gone
+    const NCA = '/?view=notifications&n=p42', NCB = '/?view=notifications&n=p43';
+    const sameTag = () => { putShown({ ping: 42, nonce: 'a', tag: 'x', url: NCA, at: Date.now() - 20000 }); putShown({ ping: 43, nonce: 'b', tag: 'x', url: NCB, at: Date.now() - 10000 }); };
+    log.getN = [];
+    await run('sameTagShowing', { none: true, extra: sameTag, tr: [{ tag: 'x', data: { ping: 43 } }] });   // B showing: nothing redirects
+    log.sameTagQueries = log.getN.length;                                          // one query for the tag, not one per entry
+    await run('sameTagGone', { none: true, extra: sameTag });                      // neither showing: the newest gone (43) wins
+    await run('sameTagOlderOnly', { none: true, extra: sameTag, tr: [{ tag: 'x', data: { ping: 42 } }] });   // only 42 showing: 43 is gone and redirects
+    // the legacy singleton key (the first version, no ping suffix) is swept and never judged
+    await run('legacy', { none: true, extra: () => store.set(PFX + 'shown', JSON.stringify({ url: SHOWN_U, nonce: 'old', at: Date.now(), for: 'shown', ping: 607, tag: 'np-607' })) });
+    log.legacyLeft = store.has(PFX + 'shown');
   } else if (scenario === 'ntap') {
     // a tap's page address carries the notification-center item id: the trace says THAT it did, never which
     await boot('https://box.example/?view=notifications&n=p123456');

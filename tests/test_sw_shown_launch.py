@@ -133,3 +133,39 @@ def test_a_click_that_does_fire_removes_the_shown_entries_of_its_ping_only() -> 
     assert len(got["shownAfterClick"]) == 1, got                                      # another ping's tap leaves it
     got = _run("push", "ok+second+then:ok+click+clickping")                           # ping 42 clicked: 43's own entry stays
     assert [e["ping"] for e in got["shownAfterClick"]] == [43], got
+
+
+@needs_node
+def test_a_same_tag_re_ping_replaces_the_older_entry_in_the_worker() -> None:
+    """Round 2 (complement MED, codex MED): a re-ping reuses the item ref as the tag (renotify), so ping 43 replaces ping 42
+    in the tray. Its older entry must not outlive it (it would read 'gone' at a manual launch)."""
+    got = _run("push", "ok+sametag")
+    assert [(e["ping"], e["tag"]) for e in got["shownAfterPush"]] == [(43, "x")], got
+    got = _run("push", "ok+second")                                                   # a DIFFERENT tag: both stay
+    assert sorted(e["ping"] for e in got["shownAfterPush"]) == [42, 43], got
+
+
+@needs_node
+def test_a_same_tag_older_entry_is_superseded_not_gone_when_the_newer_ping_is_in_the_tray() -> None:
+    got = _open_rig("shown")
+    assert got["sameTagShowing"]["assigned"] == [], got["sameTagShowing"]            # 43 showing: 42 must not redirect the page
+    assert len(got["sameTagShowing"]["keys"]) == 2, got["sameTagShowing"]
+    assert got["sameTagQueries"] >= 1 and got["sameTagQueries"] == 1, got["sameTagQueries"]   # one query for the tag
+    assert got["sameTagGone"]["assigned"] == ["https://box.example/?view=notifications&n=p43"], got["sameTagGone"]
+    assert got["sameTagOlderOnly"]["assigned"] == ["https://box.example/?view=notifications&n=p43"], got["sameTagOlderOnly"]
+
+
+@needs_node
+def test_a_late_cache_write_never_recreates_the_entry_of_a_rejected_show() -> None:
+    """Round 2 (deepseek HIGH): the write lands after the cleanup's bounded waits; the delete is chained after the put."""
+    got = _run("push", "ok+showthrows+putlate")
+    assert got["shownAfterPush"] == [], got
+    assert any(t["step"] == "show-failed" for t in got["trace"]), got
+
+
+@needs_node
+def test_the_legacy_singleton_key_is_swept_by_the_worker_and_by_the_page() -> None:
+    got = _run("push", "ok+legacy")
+    assert got["legacyLeft"] is False, got                                            # the push's best-effort prune deleted it
+    got = _open_rig("shown")
+    assert got["legacy"]["assigned"] == [] and got["legacyLeft"] is False, got["legacy"]   # the page's sweep: removed, never judged

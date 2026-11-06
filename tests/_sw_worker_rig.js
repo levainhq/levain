@@ -70,7 +70,8 @@ const caches = {
           // 'putslow': the entry's write completes 300 ms late; 'putstuck': it never completes (a hung Cache Storage)
           log.order.push('put-start');
           if (log.putMode === 'putstuck') return new Promise(() => {});
-          await new Promise((res) => setTimeout(res, 300));
+          // 'putlate': the write lands AFTER the bounded waits (and after a rejected show's cleanup would have deleted)
+          await new Promise((res) => setTimeout(res, log.putMode === 'putlate' ? 3600 : 300));
           log.order.push('put-done');
         }
         if (n.startsWith('levain-shell-v') && putFailKey === k) { putFailKey = null; throw new TypeError('quota'); }
@@ -221,7 +222,7 @@ function fire(type, ev) {
     log.subscription = parts.includes('nosub') ? null : { endpoint: 'https://fcm.googleapis.com/fcm/send/dev1' };
     log.showThrows = parts.includes('showthrows');
     log.swallowed = parts.includes('swallowed');
-    log.putMode = parts.includes('putstuck') ? 'putstuck' : parts.includes('putslow') ? 'putslow' : null;
+    log.putMode = parts.includes('putstuck') ? 'putstuck' : parts.includes('putlate') ? 'putlate' : parts.includes('putslow') ? 'putslow' : null;
     log.getnThrows = parts.includes('getnthrows');
     log.getnAll = parts.includes('getnall');
     if (parts.includes('nogetn')) delete self_.registration.getNotifications;
@@ -266,15 +267,19 @@ function fire(type, ev) {
     if (parts.includes('nourl')) delete data.url;
     if (parts.includes('summary')) data.tag = 'summary';
     if (parts.includes('crossurl')) data.url = 'https://evil.example/x';
+    if (parts.includes('legacy')) { const m = new Map(); m.set('/__levain_open/shown', JSON.stringify({ url: '/', nonce: 'old', at: Date.now(), for: 'shown', ping: 41, tag: 'x' })); cacheNames.add('levain-open'); cacheStores.set('levain-open', m); }
     const started = Date.now();
     const evPush = () => ({ data: { json: () => data } });
     if (!parts.includes('clickonly')) {
       await fire('push', evPush());
       if (parts.includes('twice')) await fire('push', evPush());
       if (parts.includes('many')) for (let i = 0; i < 12; i++) { await new Promise((r) => setTimeout(r, 5)); data.ping = 100 + i; data.tag = 't' + i; data.url = '/?view=notifications&n=p' + (100 + i); await fire('push', evPush()); }
+      if (parts.includes('sametag')) { data.ping = 43; data.url = '/?view=notifications&n=p43'; await fire('push', evPush()); }   // same tag 'x', a newer ping
       if (parts.includes('second')) { data.ping = 43; data.tag = 'y'; data.url = '/?view=notifications&n=p43'; await fire('push', evPush()); }
     }
+    if (parts.includes('putlate')) await new Promise((r) => setTimeout(r, 1500));   // let the late write land before reading the store
     log.shownAfterPush = pendings().filter((p) => p.for === 'shown');
+    log.legacyLeft = (cacheStores.get('levain-open') || new Map()).has('/__levain_open/shown');
     log.elapsedMs = Date.now() - started;
     log.showAfterMs = log.showTs ? log.showTs - started : null;
     log.afterFirst = { posts: log.posts.length, queued: [...(cacheStores.get('levain-receipts') || new Map()).keys()].sort() };

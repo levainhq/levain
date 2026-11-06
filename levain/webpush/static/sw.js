@@ -6,7 +6,7 @@
 // whichever opens first creates the store; correctness depends on no timing (an unread key waits for the next trigger).
 const DB = 'levain-sw-2', STORE = 'opened';
 // A short id of this worker's code, recorded in the trace so a device's trace says which worker ran.
-const SW_VERSION = '1106-51-shown-2';
+const SW_VERSION = '1106-51-shown-3';
 // The TRACE: an append-only ring in its own cache, one entry per step, key TRACE_PREFIX + <time ms, zero padded> + '-' +
 // <seq>, value JSON {t, src, step, ...detail}. The /tap_trace page and sw_open.js read and write the same ring. Writes are
 // best effort, serialized on one chain, never awaited by the tap, and carry only urls without fragments, counts and step
@@ -602,7 +602,12 @@ self.addEventListener('push', (e) => {
   } else {
     shown = (async () => { await waitBounded(pend.written, SHOWN_WRITE_WAIT_MS); return ask(); })();
   }
-  const shownCleanup = pend ? shown.then(null, () => waitBounded(pend.written, SHOWN_WRITE_WAIT_MS).then(() => dropKey(pend.key))) : undefined;
+  // A rejected show takes its entry away, and the delete is CHAINED AFTER the write settles (however late it lands), so a slow put
+  // can never recreate the entry the cleanup deleted; the event only waits a bound for it. A resolved show replaces any OLDER
+  // entry under the same tag (a re-ping reuses the tag: the platform swapped the notification, so the older entry is stale).
+  const shownCleanup = pend ? shown.then(
+    () => waitBounded(pend.written.then((ok) => (ok ? pruneSuperseded(pend.tag, pend.ping) : false)), 2 * SHOWN_WRITE_WAIT_MS),
+    () => waitBounded(pend.written.then(() => dropKey(pend.key)), 2 * SHOWN_WRITE_WAIT_MS)) : undefined;
   const badged = applyBadge(d.badge);   // after the notification is asked for; its failure is its own
   trace('sw-version', { version: SW_VERSION, on: 'push' });
   trace('push', { tag: traceScalar(d.tag || 'levain'), ping: traceScalar(d.ping) });
@@ -684,12 +689,14 @@ function startShownPending(d) {
       }
     })();
     const pruned = written.then((ok) => (ok ? pruneShown() : false)).catch(() => false);
-    return { key, written, pruned };
+    return { key, written, pruned, tag: String(tag), ping };
   } catch (err) {
     trace('shown-pending-failed', { error: err && err.name || 'error' });
     return null;
   }
 }
+// the fixed singleton key of the first version of the fallback: no ping suffix, never written now, always removed
+const LEGACY_SHOWN_KEY = OPEN_PREFIX + 'shown';
 async function shownKeys(c) {
   return (await c.keys()).filter((r) => new URL(r.url).pathname.indexOf(SHOWN_PREFIX) === 0);
 }
@@ -697,6 +704,7 @@ async function shownKeys(c) {
 async function pruneShown() {
   try {
     const c = await caches.open(OPEN_CACHE);
+    try { await c.delete(LEGACY_SHOWN_KEY); } catch (_) { /* swept by its TTL on the page */ }
     const rows = [];
     for (const req of await shownKeys(c)) {
       let at = null;
@@ -707,6 +715,19 @@ async function pruneShown() {
     rows.sort((x, y) => y.at - x.at);
     for (const x of rows.slice(SHOWN_MAX)) await c.delete(x.req);
     return true;
+  } catch (_) { return false; }
+}
+// this push's notification replaced the earlier one(s) under its tag: their entries (an OLDER ping, same tag) go
+async function pruneSuperseded(tag, ping) {
+  try {
+    const c = await caches.open(OPEN_CACHE);
+    let any = false;
+    for (const req of await shownKeys(c)) {
+      let e = null;
+      try { const r = await c.match(req); e = r && await r.json(); } catch (_) { e = null; }
+      if (e && e.tag === tag && Number.isInteger(e.ping) && e.ping < ping && await c.delete(req)) any = true;
+    }
+    return any;
   } catch (_) { return false; }
 }
 async function dropKey(key) {

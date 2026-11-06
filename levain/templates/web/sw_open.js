@@ -113,6 +113,8 @@
           await cache.delete(req); continue;
         }
         seen.push({ for: e.for || null, ageMs: Date.now() - e.at, url: traceUrl(e.url) });
+        // the first version's fixed singleton key (no ping suffix) is orphaned now: swept, never judged
+        if (new URL(req.url).pathname === PREFIX + "shown") { await cache.delete(req); continue; }
         if (e.for === "shown") { shownEntries.push({ req, e }); continue; }   // never claimable by the 'new' path (below)
         if (e.for !== "new") continue;                       // 'asked' belongs to the message path
         let u;
@@ -175,9 +177,13 @@
       const reg = await Promise.race([sw.getRegistration ? sw.getRegistration() : sw.ready, new Promise((r) => { timer = setTimeout(() => r(null), 3000); })]);
       clearTimeout(timer);
       if (!reg || typeof reg.getNotifications !== "function") { trace("shown-skip", { why: "no-api" }); return; }
+      // one query per TAG. A re-ping reuses the tag (renotify): the newer notification REPLACES the older in the tray, so an
+      // entry is in the tray (or superseded by what is) when a notification under its tag carries its ping or a NEWER one
+      const byTag = new Map();
       for (const f of live) {
-        const list = Array.from(await reg.getNotifications({ tag: f.tag }));
-        if (list.some((n) => n && n.data && Number(n.data.ping) === f.ping)) trace("shown-skip", { why: "in-tray" });
+        if (!byTag.has(f.tag)) byTag.set(f.tag, Array.from(await reg.getNotifications({ tag: f.tag })));
+        const list = byTag.get(f.tag);
+        if (list.some((n) => n && n.data && Number(n.data.ping) >= f.ping)) trace("shown-skip", { why: "in-tray" });
         else gone.push(f);
       }
     } catch (_) { trace("shown-skip", { why: "error" }); return; }
