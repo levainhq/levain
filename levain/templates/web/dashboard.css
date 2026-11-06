@@ -2796,7 +2796,7 @@ body.ke[data-mode="build"] .th-zone .zone-head { display: flex; }   /* titled li
 .rv .rv-cards:empty { display: none; }
 .rv .rv-body { max-height: min(62dvh, 640px); overflow-y: auto; overflow-x: hidden; overflow-anchor: none; overscroll-behavior: contain; padding: var(--sp-4); }
 .rv .rv-pending { display: flex; gap: var(--sp-2); padding: var(--sp-2) 0; }
-.rv .rv-dot { width: 6px; height: 6px; border-radius: 50%; background: var(--label); opacity: .35; animation: rv-pulse 1.2s infinite ease-in-out; }
+.rv .rv-dot { width: 6px; height: 6px; border-radius: 50%; background: var(--label); opacity: .35; animation: rv-pulse 1.2s ease-in-out 25; }   /* finite (30 s), never infinite: tests/test_cockpit_no_infinite_animation.py */
 .rv .rv-dot:nth-child(2) { animation-delay: .2s; }
 .rv .rv-dot:nth-child(3) { animation-delay: .4s; }
 @keyframes rv-pulse { 0%, 80%, 100% { opacity: .25; } 40% { opacity: 1; } }

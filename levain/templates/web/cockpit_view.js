@@ -1830,7 +1830,7 @@
     else if (!items.length) s.body.appendChild(el("p", "empty" + (store && !s.results ? " loading" : ""), store && !s.results ? "searching…" : (terms.length ? "no match" : d.empty)));
     // the first screenful, unless the operator asked for all of it or is filtering
     // the Decisions card's tabs are classified from every filtered row; the chosen tab's rows are what get paginated
-    const CF = window.LevainCardFormat;
+    const CF = root.LevainCardFormat;
     const rowShaped = d.kind !== "roster" && d.kind !== "log" && s.ctx.rows;
     const pg = rowShaped && CF && typeof CF.deskTabPage === "function" ? CF.deskTabPage(items, CF.getDeskTab(), items.length) : null;
     const tabbed = !!(pg && pg.dt.show);
