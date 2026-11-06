@@ -413,3 +413,5 @@ def _no_real_process_table(monkeypatch):
 
     monkeypatch.setattr(ts, "_ancestor_commands", lambda: [])
     monkeypatch.setattr(ts, "_ps_rows", lambda: None)
+    monkeypatch.setattr(ts, "_tty_atime", lambda tty: None)
+    monkeypatch.setattr(ts, "_hid_idle_s", lambda: 0.0)       # a busy laptop: the agent view fallback never fires
