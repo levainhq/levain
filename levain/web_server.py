@@ -3947,7 +3947,7 @@ class _Handler(GuardedHandler):
         # top-level navigation (F1): it skips only the cross-site refusal, never the Host allowlist.
         if self._cross_site_pair_navigation():
             if not self._host_ok():
-                self._send(b"forbidden\n", "text/plain; charset=utf-8", status=403, head=head)
+                self._send(self._refusal_text(), "text/plain; charset=utf-8", status=403, head=head)
                 return
         elif self._refuse_read(head=head):
             return
