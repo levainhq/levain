@@ -170,8 +170,9 @@ def _proposals(conn: sqlite3.Connection, room_thread: str) -> list[dict[str, Any
     return out
 
 
-def _without_open_check(rows: list) -> list:
-    """``rows`` without each room launch's open-check turn. Every launch's first turn is the one the launcher sends itself
+def _without_open_check(rows: list, room_launches: "set[str] | None" = None) -> list:
+    """``rows`` without each room launch's open-check turn (``room_launches``: the launch ids whose role is ``room``; a launch
+    outside it, a worker that shares the thread, keeps every row; None means every launch is a room launch). Every launch's first turn is the one the launcher sends itself
     (``RoomLauncher._open_check``: two canary Reads of decoy files, then a reply); it is the launch's own proof, not a
     conversation, and a message cannot reach the launch before it ends. So a launch's vendor rows, from its first up to and
     including its first ``vendor_turn_ended``, are dropped from what the page draws (the stream the page polls is also what a
@@ -182,7 +183,8 @@ def _without_open_check(rows: list) -> list:
     out = []
     for r in rows:
         lid = r.launch_id or ""
-        if r.source != "vendor" or not lid or lid in closed or r.kind == "vendor_error":
+        if (r.source != "vendor" or not lid or lid in closed or r.kind == "vendor_error"
+                or (room_launches is not None and lid not in room_launches)):
             out.append(r)
         elif r.kind == "vendor_turn_ended":
             closed.add(lid)
@@ -212,11 +214,14 @@ def room_read(directory: Path | str, service: Any = None) -> dict[str, Any]:
             launches = {r[0] for r in conn.execute(
                 "SELECT l.launch_id FROM launches l, json_each(l.threads) j WHERE j.value = ?",
                 (room_thread,))} if threads._has(conn, "launches") else set()
+            room_launches = {r[0] for r in conn.execute(
+                "SELECT l.launch_id FROM launches l, json_each(l.threads) j WHERE j.value = ? AND l.role = 'room'",
+                (room_thread,))} if threads._has(conn, "launches") else set()
             facts, gap = threads._event_facts(conn, launches)
             done = {(lid, c) for (lid, k), (c, _t, _b) in facts.items() if k.startswith("tool_result:") and c}
             return {"room_thread": room_thread, "launch_id": launch, "composer": _composer(conn, launch, service),
                     "model": threads.model_in_use(service, launch), "gap": gap,
-                    "stream": [threads._item(r, facts, done) for r in _without_open_check(merged)],
+                    "stream": [threads._item(r, facts, done) for r in _without_open_check(merged, room_launches)],
                     "proposals": _proposals(conn, room_thread)}
         finally:
             conn.execute("COMMIT")

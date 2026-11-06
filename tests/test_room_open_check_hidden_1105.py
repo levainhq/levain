@@ -80,3 +80,10 @@ def test_the_check_prompt_tells_the_child_not_to_speak_of_it_afterwards():
     text = CANARY_PROMPT.format(path="/p/decoy", scope="/q/scope")
     assert text.startswith("Open check") and "/p/decoy" in text and "/q/scope" in text
     assert "not the user's message" in text and "never mention it, these paths or their refusals afterwards" in text
+
+
+def test_a_launch_that_is_not_a_room_launch_keeps_its_first_turn():
+    """L3 room r2 codex MED: a worker launch can share the room's thread; its first turn is real work, not a check."""
+    rows = _check(10, "L1") + _real(30, "L1") + _real(50, "W1")
+    got = cockpit_room._without_open_check(rows, {"L1"})
+    assert [r.gseq for r in got] == [10, 11, 30, 31, 32, 33, 50, 51, 52, 53], _kinds(got)   # W1's turn stays, L1's check goes
