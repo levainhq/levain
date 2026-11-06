@@ -42,10 +42,19 @@ def _run_fake(tmp_path: Path) -> bytes:
     got = bytearray()
 
     def serve() -> None:
-        c, _ = srv.accept()
+        srv.settimeout(30)
+        try:
+            c, _ = srv.accept()
+        except OSError:
+            return
         buf = b""
+        c.settimeout(10)
         while b"\r\n\r\n" not in buf:
-            buf += c.recv(4096)
+            d = c.recv(4096)
+            if not d:   # the fake died before finishing its request: end the thread, the caller reports the exit
+                c.close()
+                return
+            buf += d
         c.sendall(b"HTTP/1.1 200 Connection Established\r\n\r\n")
         c.settimeout(2)
         try:
@@ -55,12 +64,14 @@ def _run_fake(tmp_path: Path) -> bytes:
             pass
         c.close()
 
-    t = threading.Thread(target=serve)
+    t = threading.Thread(target=serve, daemon=True)
     t.start()
     env = {"HTTPS_PROXY": f"http://127.0.0.1:{srv.getsockname()[1]}", "TMPDIR": str(tmp_path), "PATH": os.environ["PATH"]}
-    subprocess.run([str(exe), "run"], env=env, check=True, timeout=60, capture_output=True)
-    t.join(10)
-    srv.close()
+    try:
+        subprocess.run([str(exe), "run"], env=env, check=True, timeout=60, capture_output=True)
+        t.join(10)
+    finally:
+        srv.close()
     return bytes(got)
 
 

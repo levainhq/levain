@@ -11,6 +11,8 @@
 #include <string.h>
 #include <unistd.h>
 #include <signal.h>
+#include <stdarg.h>
+#include <sys/time.h>
 #include <errno.h>
 #include <sys/socket.h>
 #include <netinet/in.h>
@@ -41,6 +43,16 @@ static size_t build_hello(unsigned char *o, const char *host) {
     return n;
 }
 
+/* Append to the fixed note buffer, clamped: snprintf returns the length it WOULD have written, so a bare n += overruns on a long path. */
+#define NOTE_SZ 2048
+static int app(char *note, int n, const char *fmt, ...) {
+    va_list ap; va_start(ap, fmt);
+    int w = vsnprintf(note + n, NOTE_SZ - n, fmt, ap);
+    va_end(ap);
+    if (w < 0) return n;
+    return (n + w >= NOTE_SZ) ? NOTE_SZ - 1 : n + w;
+}
+
 static volatile sig_atomic_t term = 0;
 static void on_term(int s) { (void)s; term = 1; }
 
@@ -51,9 +63,10 @@ int main(int argc, char **argv) {
         return 0;
     }
     signal(SIGTERM, on_term);
-    char note[2048]; int n = 0;
+    char note[NOTE_SZ]; int n = 0;
+    signal(SIGPIPE, SIG_IGN);
     const char *tmp = getenv("TMPDIR"); const char *proxy = getenv("HTTPS_PROXY");
-    n += snprintf(note + n, sizeof note - n, "argc=%d HTTPS_PROXY=%s TMPDIR=%s uid=%d\n", argc, proxy ? proxy : "(none)", tmp ? tmp : "(none)", (int)getuid());
+    n = app(note, n, "argc=%d HTTPS_PROXY=%s TMPDIR=%s uid=%d\n", argc, proxy ? proxy : "(none)", tmp ? tmp : "(none)", (int)getuid());
     long sent = 0, got = 0; char head[256] = "";
     if (proxy) {
         const char *p = strrchr(proxy, ':');
@@ -64,8 +77,15 @@ int main(int argc, char **argv) {
         if (connect(fd, (struct sockaddr *)&a, sizeof a) == 0) {
             const char *req = "CONNECT api.anthropic.com:443 HTTP/1.1\r\nHost: api.anthropic.com:443\r\n\r\n";
             write(fd, req, strlen(req));
-            ssize_t r = read(fd, head, sizeof head - 1);
-            if (r > 0) { head[r] = 0; got += r; }
+            struct timeval rt = {5, 0};   /* a proxy that never answers must not hang the fake */
+            setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &rt, sizeof rt);
+            size_t hl = 0;   /* TCP keeps no write boundaries: read until the blank line that ends the reply */
+            while (hl < sizeof head - 1) {
+                ssize_t r = read(fd, head + hl, sizeof head - 1 - hl);
+                if (r <= 0) break;
+                hl += (size_t)r; got += r; head[hl] = 0;
+                if (strstr(head, "\r\n\r\n")) break;
+            }
             char *cr = strchr(head, '\r'); if (cr) *cr = 0;
             if (strstr(head, " 200")) {
                 unsigned char hello[256]; size_t hn = build_hello(hello, "api.anthropic.com");
@@ -83,7 +103,7 @@ int main(int argc, char **argv) {
         }
         close(fd);
     }
-    n += snprintf(note + n, sizeof note - n, "first=%s sent=%ld got=%ld\n", head, sent, got);
+    n = app(note, n, "first=%s sent=%ld got=%ld\n", head, sent, got);
     if (tmp) {
         char path[512]; snprintf(path, sizeof path, "%s/fake_ran.txt", tmp);
         FILE *f = fopen(path, "w"); if (f) { fputs(note, f); fclose(f); }
@@ -91,15 +111,15 @@ int main(int argc, char **argv) {
     {   /* vsun rig addition: write files into the slot uid's /private/var/folders/<xx>/<hash> subtree (its DARWIN_USER_DIR is <hash>/0/):
          * under 0/, T/, C/ and the <hash> dir itself. The outcome of each is appended to the note (stderr = vendor.err). */
         char ud[1024]; size_t m = confstr(_CS_DARWIN_USER_DIR, ud, sizeof ud);
-        if (m == 0 || m > sizeof ud) { n += snprintf(note + n, sizeof note - n, "vf-write: confstr(USER_DIR) failed\n"); }
+        if (m == 0 || m > sizeof ud) { n = app(note, n, "vf-write: confstr(USER_DIR) failed\n"); }
         else {
-            n += snprintf(note + n, sizeof note - n, "vf-write: DARWIN_USER_DIR=%s\n", ud);
+            n = app(note, n, "vf-write: DARWIN_USER_DIR=%s\n", ud);
             const char *rel[4] = { "vsun_child_in_0.txt", "../T/vsun_child_in_T.txt", "../C/vsun_child_in_C.txt", "../vsun_child_in_hash.txt" };
             for (int i = 0; i < 4; i++) {
                 char path[1300]; snprintf(path, sizeof path, "%s%s", ud, rel[i]);
                 FILE *f = fopen(path, "w");
-                if (f) { fputs("written by the fake vendor child\n", f); fclose(f); n += snprintf(note + n, sizeof note - n, "vf-write: %s OK\n", path); }
-                else { n += snprintf(note + n, sizeof note - n, "vf-write: %s FAILED errno=%d\n", path, errno); }
+                if (f) { fputs("written by the fake vendor child\n", f); fclose(f); n = app(note, n, "vf-write: %s OK\n", path); }
+                else { n = app(note, n, "vf-write: %s FAILED errno=%d\n", path, errno); }
             }
         }
     }
@@ -110,8 +130,8 @@ int main(int argc, char **argv) {
         for (int i = 0; i < 4; i++) {
             char path[1300]; snprintf(path, sizeof path, "%s%s", VSUN_VF, rel2[i]);
             FILE *f = fopen(path, "w");
-            if (f) { fputs("written by the fake vendor child\n", f); fclose(f); n += snprintf(note + n, sizeof note - n, "vf-write2: %s OK\n", path); }
-            else { n += snprintf(note + n, sizeof note - n, "vf-write2: %s FAILED errno=%d\n", path, errno); }
+            if (f) { fputs("written by the fake vendor child\n", f); fclose(f); n = app(note, n, "vf-write2: %s OK\n", path); }
+            else { n = app(note, n, "vf-write2: %s FAILED errno=%d\n", path, errno); }
         }
     }
 #endif
@@ -123,8 +143,8 @@ int main(int argc, char **argv) {
             if (!fgets(gl, sizeof gl, gp)) gl[0] = 0;
             int grc = pclose(gp);
             char *nl = strchr(gl, 10); if (nl) *nl = 0;
-            n += snprintf(note + n, sizeof note - n, "git-shim: status=%d first=%s\n", grc, gl);
-        } else { n += snprintf(note + n, sizeof note - n, "git-shim: popen failed errno=%d\n", errno); }
+            n = app(note, n, "git-shim: status=%d first=%s\n", grc, gl);
+        } else { n = app(note, n, "git-shim: popen failed errno=%d\n", errno); }
     }
     fputs(note, stderr);
     for (int i = 0; i < HOLD_S && !term; i++) sleep(1);
