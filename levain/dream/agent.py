@@ -122,22 +122,26 @@ class Registered:
 def register_dream(store: Any, *, revise: bool = False, binding: str | None = None) -> Registered:
     """Register the role and the spec in ``store`` (an :class:`~levain.agents.store.AgentStore`) and attach the spec to the
     store's operator agent, on every exit including the same-content one (that is how an install whose dream was registered
-    before K2b gets attached). Idempotent: the same content registers nothing twice and attaches once. Raises :class:`EnableRefused` with every refusal; nothing is written when any
-    rule refuses the spec. ``binding`` is a shadow install's :func:`shadow_binding` (None: a live install)."""
+    before K2b gets attached). Idempotent: the same content registers nothing twice and attaches once. Raises :class:`EnableRefused` with every refusal; nothing is written when a
+    rule refuses the spec, but a refusal in the spec write itself can leave the content-addressed, idempotent role on file. ``binding`` is a shadow install's :func:`shadow_binding` (None: a live install)."""
     from levain.agents import refuse, role as _role, spec as _spec
     from levain.agents.store import AgentStoreRefused, get_default_zone
 
+    role = _role.parse_role(dream_role())
+    parsed = _spec.parse_spec(dream_spec(_role.role_hash(role), binding))    # pure: a defect in the shipped spec is a bug, not a refusal
     try:    # any store call can meet a moved marker, so none sits outside the guard
         zone = get_default_zone(store)
-        role = _role.parse_role(dream_role())
         held = {a["name"] for a in _spec.list_agents(store)}
-        parsed = _spec.parse_spec(dream_spec(_role.role_hash(role), binding))
-        if revise or _same(store, parsed, zone):
-            held.discard(parsed["name"])
-        problems = [str(r) for r in refuse.check_spec(parsed, role=role, default_zone=zone, names_held=held,
-                                                                  as_dream=True)]
-        if problems:
-            raise EnableRefused("; ".join(problems))
+        same = revise or _same(store, parsed, zone)
+    except AgentStoreRefused as exc:
+        raise EnableRefused(str(exc)) from exc
+    if same:
+        held.discard(parsed["name"])
+    problems = [str(r) for r in refuse.check_spec(parsed, role=role, default_zone=zone, names_held=held,
+                                                              as_dream=True)]
+    if problems:
+        raise EnableRefused("; ".join(problems))
+    try:
         _, role_hash, _, _ = _role.add_role(store, role)
         agent_id, spec_hash, version, created = _spec.register_spec(store, parsed, zone, revise=revise, attach=True)
     except (_spec.SpecError, AgentStoreRefused) as exc:

@@ -825,3 +825,14 @@ def test_a_marker_moved_before_the_call_is_an_enable_refusal_from_the_first_stor
     c.close()
     with pytest.raises(da.EnableRefused, match="unknown agent schema marker 'levain-agent-schema/5'"):
         da.register_dream(astore, revise=revise)
+
+
+def test_a_defect_in_the_shipped_spec_is_not_dressed_as_an_enable_refusal(astore, monkeypatch):
+    """L1/L2/L3 r0 (four lineages): parse_spec is pure, so a SpecError from our own template is a bug the caller's
+    catch-all must show as one; only the store calls translate into EnableRefused."""
+    def bad(*a, **k):
+        raise spec_mod.SpecError("template defect")
+
+    monkeypatch.setattr(spec_mod, "parse_spec", bad)
+    with pytest.raises(spec_mod.SpecError, match="template defect"):
+        da.register_dream(astore)
