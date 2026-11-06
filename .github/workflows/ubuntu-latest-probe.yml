@@ -38,6 +38,18 @@ jobs:
           bash -c 'echo V=${BASH_VERSINFO[0]} U=${HOME%%/*}' bash
           DIAG
           bash /tmp/diag.sh
+      - run: |
+          cat > /tmp/diag2.sh <<'DIAG2'
+          #!/bin/bash
+          # TEMPORARY measurement: which sudoers Defaults does this host's visudo accept?
+          sudo --version | head -2
+          visudo --version 2>&1 | head -1
+          for tok in '!requiretty' '!log_input' '!log_output' '!use_pty' 'env_reset' '!env_reset' 'secure_path="/usr/bin"' '!lecture' '!fqdn' '!syslog' 'timestamp_timeout=0' '!visiblepw' 'always_set_home' 'umask=0027' 'passwd_tries=1' 'closefrom=3' 'noexec' '!authenticate' '!set_home' 'logfile="/tmp/x"'; do
+            printf 'Defaults %s\n' "$tok" > /tmp/dd.sudoers
+            if out=$(visudo -cf /tmp/dd.sudoers 2>&1); then echo "OK    $tok"; else echo "REJECT $tok :: $(echo "$out" | head -1)"; fi
+          done
+          DIAG2
+          bash /tmp/diag2.sh
   probe:
     name: ubuntu-latest probe (non-gating)
     runs-on: ubuntu-latest
