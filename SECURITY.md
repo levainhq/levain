@@ -5,7 +5,8 @@ approved what. A flaw in how it does that is worth a private report.
 
 ## Supported versions
 
-The latest release on PyPI ([pypi.org/project/levain](https://pypi.org/project/levain/), or ). Fixes land on  and ship in the next release; older releases are not patched. `levain --version` prints what you run, and [the changelog](CHANGELOG.md) names what each release changed.
+The latest release on PyPI ([pypi.org/project/levain](https://pypi.org/project/levain/), or `pip index versions
+levain`). Fixes land on `main` and ship in the next release; older releases are not patched. `levain --version` prints what you run, and [the changelog](CHANGELOG.md) names what each release changed.
 
 ## Reporting a vulnerability
 
