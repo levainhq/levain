@@ -166,7 +166,7 @@
       col.cards.forEach(function (k) {
         var row = el(doc, "div", "bd-row");
         row.dataset.id = k.id;
-        row.appendChild(el(doc, "div", "bd-title", (k.number != null ? k.number + ". " : "") + String(k.title == null ? "" : k.title).replace(/^\s*DESK OWES:\s*/i, "")));
+        row.appendChild(el(doc, "div", "bd-title", (k.number != null ? k.number + ". " : "") + (String(k.title == null ? "" : k.title).replace(/^\s*DESK OWES:\s*/i, "") || String(k.title == null ? "" : k.title))));
         var meta = [k.repo, k.tier, k.source, k.id].filter(Boolean).join(" · ");
         if (meta) row.appendChild(el(doc, "div", "bd-meta", meta));
         drawPlan(doc, row, k);
@@ -198,7 +198,7 @@
       col.cards.forEach(function (k) {
         var card = el(doc, "article", "bd-card");
         card.dataset.id = k.id;
-        card.appendChild(el(doc, "div", "bd-title", (k.number != null ? k.number + ". " : "") + String(k.title == null ? "" : k.title).replace(/^\s*DESK OWES:\s*/i, "")));
+        card.appendChild(el(doc, "div", "bd-title", (k.number != null ? k.number + ". " : "") + (String(k.title == null ? "" : k.title).replace(/^\s*DESK OWES:\s*/i, "") || String(k.title == null ? "" : k.title))));
         var meta = [k.repo, k.tier, k.source, k.id].filter(Boolean).join(" · ");
         if (meta) card.appendChild(el(doc, "div", "bd-meta", meta));
         drawPlan(doc, card, k);

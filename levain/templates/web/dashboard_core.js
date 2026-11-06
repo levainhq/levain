@@ -6446,7 +6446,7 @@
     if (id) row.dataset.needsId = id;
     row.dataset.needsCard = it.kind;
     // display only: the Desk owes tab says it already, and the 2-line clamp is better spent on the ask
-    const title = el("span", "needs-row-title", it.kind === "consent" ? (it.c.tool || "request") : (needsName(it).replace(/^\s*DESK OWES:\s*/i, "") || needsName(it)));
+    const title = el("span", "needs-row-title", it.kind === "consent" ? (it.c.tool || "request") : (String(needsName(it) || "").replace(/^\s*DESK OWES:\s*/i, "") || needsName(it)));
     const sub =el("span", "needs-row-sub ext-meta", "");
     const text = el("span", "needs-row-text");
     text.append(title, sub);
@@ -6575,15 +6575,15 @@
     if (!list.length) {
       kids.push(el("div", "needs-empty ext-meta", prefs.tab === "desk" ? "The desk owes you nothing right now." : "Nothing waits on you right now."));
     } else {
-      const tiles = prefs.layout === "tiles";
+      let phone = false;
+      try { phone = !!(window.matchMedia && window.matchMedia("(max-width: 599px)").matches); } catch (e) { phone = false; }
+      const tiles = prefs.layout === "tiles" && phone;   // the choice is a phone one: a desktop draws the same cards whichever was stored
       const old = (it) => { const s = needsAgeSecs(it); return s !== null && s >= 86400; };
       const today = list.filter((it) => !old(it)), older = list.filter(old);
       const grouped = !tiles && today.length > 0 && older.length > 0;   // the tiles carry no group labels
       const ordered = grouped ? today.concat(older) : list;
       // both layouts fold; a phone's tiles show four rows of two before the fold, everything else six items
-      let phone = false;
-      try { phone = !!(window.matchMedia && window.matchMedia("(max-width: 599px)").matches); } catch (e) { phone = false; }
-      const foldAt = tiles && phone ? NEEDS_FOLD_TILES : NEEDS_FOLD;
+      const foldAt = tiles ? NEEDS_FOLD_TILES : NEEDS_FOLD;
       const hiddenN = ordered.length - foldAt;
       const fold = hiddenN >= 2;                     // one hidden item is not worth a row of its own
       const shown = !fold || needsMoreOpen ? ordered : ordered.slice(0, foldAt);
