@@ -2021,6 +2021,10 @@ def _seat_answer(store: QuestionStore, viewer: str, prompt: Any, environ: Mappin
     got = _newest_view(store, viewer)           # read ONCE: the plan and the signed message name the same view
     plan, view, questions, extras = _plan_on(store, got[0] if got is not None else None, prompt)
     if not plan.matched:
+        # 11-06 (TERMSIGN fix 2): with nothing open for this viewer the line is not for Levain's band (flow's footer owns it), so
+        # the "did not read this as a band answer" hint would be a second verdict beside flow's. Silent; nothing recorded.
+        if not (questions or extras):
+            return ""
         return format_echo([], [], "seat", plan.hint) if plan.hint else ""
     if view is None:
         # 11-04: no Levain band was ever shown to this viewer, so the line is not for Levain (a seat that shows flow's
