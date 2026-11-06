@@ -114,6 +114,8 @@ def test_any_writer_opening_a_pre_r4_store_migrates_it_and_keeps_every_row(tmp_p
     assert after["events"] == before["events"]     # every row, its rowid (the cleared page's order) included
     assert after["items"] == before["items"]
     assert after["triggers"] == before["triggers"]
+    # the rebuild drops review_events' triggers; the ensure path makes the writer-only one again after it (L3 r1)
+    assert "review_events_foreign" in {t[0] for t in after["triggers"]}
     conn = sqlite3.connect(d / "dispatch.db")
     try:
         assert conn.execute("PRAGMA integrity_check").fetchall() == [("ok",)]
