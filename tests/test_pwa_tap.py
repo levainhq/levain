@@ -63,3 +63,23 @@ def test_the_query_admission_is_the_taps_own_two_parameters_and_nothing_else(tmp
         assert _get(port, tap, {**NAV, "Sec-Fetch-Dest": "iframe"})[0] == 403
         assert _get(port, tap, NAV, method="HEAD")[0] == 403
         assert _get(port, tap, {**NAV, "Host": "evil.example"})[0] == 403
+
+
+def test_a_pixel_launch_navigate_with_dest_empty_reaches_the_shell_and_only_the_shell(tmp_path: Path) -> None:
+    """11-06 Pixel photo of the 403 body: Sec-Fetch-Site cross-site, Mode navigate, Dest EMPTY (a notification tap or the installed
+    app's launch). The app shell admits it; pair and sign pages, a fetch, frames/embeds, HEAD and a foreign Host stay refused."""
+    pixel = {"Sec-Fetch-Site": "cross-site", "Sec-Fetch-Mode": "navigate", "Sec-Fetch-Dest": "empty"}
+    src = _install(tmp_path)[1]
+    with _serve(src) as (port, _):
+        status, shell = _get(port, "/")
+        assert status == 200
+        assert _get(port, "/", pixel) == (200, shell)
+        for u in _payload_urls(tmp_path):
+            assert _get(port, u, pixel) == (200, shell), u
+        for bad in ("/pair", "/pair?x=1", "/?pair=abcdefgh12", "/?view=other", "/x", "/?"):
+            assert _get(port, bad, pixel)[0] == 403, bad
+        for mode, dest in (("cors", "empty"), ("no-cors", "empty"), ("same-origin", "empty"), ("navigate", "iframe"),
+                           ("navigate", "embed"), ("navigate", "object"), ("navigate", "frame")):
+            assert _get(port, "/", {**pixel, "Sec-Fetch-Mode": mode, "Sec-Fetch-Dest": dest})[0] == 403, (mode, dest)
+        assert _get(port, "/", pixel, method="HEAD")[0] == 403
+        assert _get(port, "/", {**pixel, "Host": "evil.example"})[0] == 403
