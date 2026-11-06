@@ -15,7 +15,10 @@ on:
   workflow_dispatch:
 
 concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}
+  # A workflow_dispatch run gets a group of its own (its run id), so it neither cancels the push run whose
+  # verdict the release gate reads (3e2aef8d, 11-05) nor is cancelled by the next dispatch; a push or PR run still
+  # cancels the superseded run of the same ref.
+  group: ${{ github.workflow }}-${{ github.ref }}-${{ github.event_name == 'workflow_dispatch' && github.run_id || 'ci' }}
   cancel-in-progress: true
 
 env:
@@ -105,7 +108,8 @@ jobs:
           python tests/ci/shard.py pick --shards "$TEST_SHARDS" --shard "${{ matrix.shard }}" < "$RUNNER_TEMP/nodes.txt" > "$RUNNER_TEMP/files.txt"
           mapfile -t files < "$RUNNER_TEMP/files.txt"
           test "${#files[@]}" -gt 0 || { echo "shard ${{ matrix.shard }} has no files"; exit 1; }
-          pytest -q --basetemp=/tmp/levain-pt "${files[@]}"
+          # --durations=25 prints the 25 slowest tests into the log, a measurement the shard weights lack (the -q progress parse ignores it)
+          pytest -q --durations=25 --basetemp=/tmp/levain-pt "${files[@]}"
 
       - name: Keep what the page showed at a failed wait
         # the page driver writes timeout-step-<n>.png / .txt beside its steps file, under pytest's basetemp; reading them is how a
