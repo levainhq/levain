@@ -170,6 +170,7 @@ class Rig:
         self.transport = Transport()
         self._pos = 1000
         self._n = 0
+        self._opened = False
 
     def add_key(self, uses=("stt", "tts"), provider="openai", source=SOURCE) -> dict:
         record, _warning = custody.add_key(
@@ -186,9 +187,15 @@ class Rig:
         return e
 
     def reply(self, *texts: str, end: bool = True) -> int:
-        """The room agent's words, then (``end``) its turn's end. The gseq of the end, else of the last text."""
+        """The room agent's words, then (``end``) its turn's end. The gseq of the end, else of the last text. A launch's
+        FIRST turn is the open check the launcher sends itself (``RoomLauncher._open_check``), which the room's read leaves
+        out (``cockpit.room._without_open_check``); so the first call here writes that turn, then the reply."""
         with self.w.cs._write() as (conn, now):
             last = None
+            if not self._opened:
+                self._event(conn, now, "agent_text", "done")
+                self._event(conn, now, "turn_ended", "")
+                self._opened = True
             for t in texts:
                 last = self._event(conn, now, "agent_text", t)
             if end:
