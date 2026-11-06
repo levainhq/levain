@@ -7,7 +7,11 @@ What it holds, in the coordinator's own store (``dispatch.db``):
   event, open again after a ``reopened`` one. Tables are append-only like the rest of the store.
 - **Three review modes** (RULED, *"also on review modes"*): ``manual`` (you), ``fresh`` (a fresh session you asked,
   recorded as you) and ``coordinator`` (the actor reviewing itself). An item marked ``authority_relevant`` can never be
-  cleared in ``coordinator`` mode, and the SQL refuses it, so no caller has to remember. A fourth mode, ``signed``, is
+  cleared in ``coordinator`` mode, and the SQL refuses it, so no caller has to remember. The coordinator's mode also
+  clears only an item the coordinator filed (its own doubts and contradictions): a seat that died, a drop not split
+  or an agent card is the operator's to clear. That is a LABEL guard on the coordinator's mode, not a capability: a
+  clear recorded in another mode writes ``by = 'operator'`` and this does not stop who picks it (S1's, a known
+  edge). A fourth mode, ``signed``, is
   no caller's to pick: it is the clear the operator's passkey signed (:func:`clear_signed`), and its event names the
   sign request, so a reader tells it from the laptop's unsigned ``manual`` clear.
 - **The push records**: a SIGN reply points at a request in ``queue.db``, an ANSWER reply at a question in
@@ -136,6 +140,21 @@ REVIEW_SCHEMA: tuple[str, ...] = (
     "WHEN NEW.op = 'cleared' AND NEW.by = 'coordinator' AND (SELECT authority_relevant FROM review_items WHERE "
     "item_id = NEW.item_id) = 1 "
     "BEGIN SELECT RAISE(ABORT, 'an authority-relevant item is not cleared in coordinator mode'); END",
+    # B1(b), the D3 ruling: the coordinator's mode clears only an item the coordinator filed (its own doubts and
+    # contradictions); a seat that died, a drop not split, an agent card are the operator's to clear. The COALESCE is
+    # load-bearing: an item that is not there makes the subquery NULL, and ``NULL != 'coordinator'`` is NULL, which
+    # never fires a WHEN, so without it a clear of a missing item would pass this trigger. A LABEL guard, not a
+    # capability: a process that records its clear as ``fresh`` or ``manual`` writes ``by = 'operator'`` and is not
+    # held here (a named known edge, S1's). Final once shipped: CREATE TRIGGER IF NOT EXISTS never replaces one.
+    # The WHEN is disjoint from the two triggers above on purpose: SQLite promises no order among BEFORE triggers (seen
+    # firing newest first), so a clear both refuse would surface this message over theirs. ``mode = 'coordinator'``
+    # leaves a mode/by mismatch to review_events_mode and the authority subquery leaves an authority-relevant item to
+    # review_events_authority; both still abort, so no insert they refuse passes here.
+    "CREATE TRIGGER IF NOT EXISTS review_events_foreign BEFORE INSERT ON review_events "
+    "WHEN NEW.op = 'cleared' AND NEW.by = 'coordinator' AND NEW.mode = 'coordinator' "
+    "AND COALESCE((SELECT authority_relevant FROM review_items WHERE item_id = NEW.item_id), 0) = 0 "
+    "AND COALESCE((SELECT by FROM review_items WHERE item_id = NEW.item_id), '') != 'coordinator' "
+    "BEGIN SELECT RAISE(ABORT, 'the coordinator''s mode clears only an item the coordinator filed'); END",
 )
 
 
@@ -348,6 +367,9 @@ def _review(store: CoordStore, item_id: str, op: str, mode: str, token: object, 
         if op == "cleared" and by == "coordinator" and row[5]:
             raise CoordError("an authority-relevant item is cleared by you or a fresh session you asked, never by "
                              "the coordinator reviewing itself")
+        if op == "cleared" and by == "coordinator" and row[6] != "coordinator":
+            raise CoordError(f"the coordinator's mode clears only an item the coordinator filed; item {item_id} is "
+                             f"yours to clear (manual or fresh, or the laptop: levain coord review clear {item_id})")
         seq = conn.execute("SELECT COALESCE(MAX(seq), 0) + 1 FROM review_events WHERE item_id = ?",
                            (item_id,)).fetchone()[0]
         conn.execute("INSERT INTO review_events (item_id, seq, op, mode, by, at, gseq) VALUES (?, ?, ?, ?, ?, ?, ?)",
@@ -358,8 +380,9 @@ def _review(store: CoordStore, item_id: str, op: str, mode: str, token: object, 
 def clear_item(store: CoordStore, item_id: str, *, mode: str = "manual", token: object = None,
                plain_only: bool = False, still: Callable[[Item], None] | None = None) -> Item:
     """Clear an open item in ``mode``. ``coordinator`` mode writes as the coordinator, so it needs the lease token, and
-    it is refused for an authority-relevant item. ``plain_only`` is a clear sent on a device's token (the cockpit's and
-    the phone's Clear): it is refused for an authority-relevant item too, whose clear the head ruled signed-only
+    it is refused for an authority-relevant item and for any item the coordinator did not file (the coordinator's
+    mode clears its own items only; a label guard, see the module docstring). ``plain_only`` is a clear sent on a
+    device's token (the cockpit's and the phone's Clear): it is refused for an authority-relevant item too, whose clear the head ruled signed-only
     (1025+25): :func:`clear_signed`, or the laptop's own clear. ``still(item)`` runs inside the write transaction on the
     item as it is then, before anything is written; it refuses by raising. A missing item is :class:`CoordNotFound`, a
     missing store :class:`StoreAbsent` (none is made)."""
