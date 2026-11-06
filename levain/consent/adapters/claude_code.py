@@ -906,7 +906,16 @@ def decide(event: Any, queue: ConsentQueue, settings: AdapterSettings, *, enviro
     out = decide_ex(event, queue, settings, environ=environ, home=home, claude_pid=claude_pid, launch_nonce="",
                     contained_launch=None, **kw)
     if isinstance(out, Decided):
-        return hook_output(out.decision)
+        answer = hook_output(out.decision)
+        # the live hook is a PermissionRequest hook only (no PostToolUse recorder, no PreToolUse gate), so this is the
+        # one place a verified answer can reach the ledger (1106-51). After the output is built; never changes it.
+        try:
+            c = out.call
+            _ledger_note(Path(queue.directory), event, c.session, c.tool_name, event.get("tool_input") or {}, c.cwd,
+                         decision=out.decision, request_id=out.request.id)
+        except Exception:  # noqa: BLE001 - the ledger is a record, never the answer
+            pass
+        return answer
     if isinstance(out, Abstained) and not out.held:
         # the agent's own dialog asks and no away hold pinged his devices about the request: one notice that it waits
         # (Phill 11-02, np-e642162b (a); :func:`prompt_notice`, which never raises)
