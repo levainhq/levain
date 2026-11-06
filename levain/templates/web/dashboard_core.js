@@ -6445,7 +6445,8 @@
     const id = needsIdOf(it);
     if (id) row.dataset.needsId = id;
     row.dataset.needsCard = it.kind;
-    const title = el("span", "needs-row-title", it.kind === "consent" ? (it.c.tool || "request") : needsName(it));
+    // display only: the Desk owes tab says it already, and the 2-line clamp is better spent on the ask
+    const title = el("span", "needs-row-title", it.kind === "consent" ? (it.c.tool || "request") : (needsName(it).replace(/^\s*DESK OWES:\s*/i, "") || needsName(it)));
     const sub =el("span", "needs-row-sub ext-meta", "");
     const text = el("span", "needs-row-text");
     text.append(title, sub);
