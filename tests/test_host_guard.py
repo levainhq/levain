@@ -1048,3 +1048,79 @@ def test_a_toml_file_that_is_there_is_refused_not_passed_when_tomllib_is_missing
         hg._read_toml_doc(cfg)
     assert "TOML needs Python 3.11+" in str(err.value)
     assert hg._read_toml_doc(tmp_path / "absent.toml") is None   # an absent file is still just absent
+
+
+# ---------------------------------------------------------------------------- 1106-1 miscdeny: a hook operand under the install, spelled in another case
+
+
+def _case_alias(p: Path) -> Path:
+    """``p`` spelled with its letters' case swapped, when this filesystem takes that spelling as the same path (a
+    case-insensitive one: macOS APFS by default); else the test is skipped."""
+    alias = Path(str(p.resolve()).swapcase())
+    if str(alias) == str(p.resolve()) or not alias.exists() or not os.path.samefile(alias, p):
+        pytest.skip("this filesystem is case-sensitive: no case alias of a path exists")
+    return alias
+
+
+def _docs_running(command: str) -> list:
+    return [{"hooks": {"SessionStart": [{"hooks": [{"type": "command", "command": command}]}]}}]
+
+
+def test_a_hook_operand_spelled_in_another_case_is_pinned_as_the_install_file_it_is(ent):
+    """casesweep row 8: `_lexically_in_root` compared strings, so a hook command naming `/USERS/<me>/.../ENT/...` was
+    "outside the install": left unpinned, with a warning. Identity decides now (a pin is protective, so DENY direction:
+    `maybe_inside`). Needs a case-insensitive volume (macOS APFS); on a case-sensitive one this skips, so a Linux CI
+    run never reds it: `test_lexically_in_root_with_an_injected_case_fold` below runs there."""
+    real = ent.resolve()
+    script = real / "activation" / "hooks" / "session_start.py"
+    canon_pins, canon_unresolved = hg._command_pins(real, _docs_running(str(script)))
+    assert canon_unresolved == [] and len(canon_pins) == 1
+    alias_script = _case_alias(real) / "activation" / "hooks" / "session_start.py"
+    pins, unresolved = hg._command_pins(real, _docs_running(str(alias_script)))
+    assert unresolved == [] and list(pins.values()) == list(canon_pins.values())
+    pins, unresolved = hg._command_pins(_case_alias(real), _docs_running(str(script)))        # the install spelled as an alias
+    assert unresolved == [] and list(pins.values()) == list(canon_pins.values())
+
+
+def test_a_hook_operand_outside_the_install_is_still_unpinned_and_named(ent, tmp_path):
+    """Control: identity widens only what is the same directory. A sibling whose name starts with the install's, and a
+    file elsewhere, stay outside (named after an interpreter so the operand is a later token)."""
+    real = ent.resolve()
+    sibling = real.parent / (real.name + "camp")
+    sibling.mkdir()
+    (sibling / "h.py").write_text("x")
+    elsewhere = tmp_path.resolve() / "elsewhere.py"
+    elsewhere.write_text("x")
+    for path in (sibling / "h.py", elsewhere):
+        pins, unresolved = hg._command_pins(real, _docs_running(f"python3 {path}"))
+        assert pins == {} and any("operand outside the install" in u for u in unresolved), (path, pins, unresolved)
+
+
+def test_a_symlink_under_the_install_that_leaves_it_is_still_pinned_by_its_link_string(ent, tmp_path):
+    """Canonical-input behaviour that must not change (the CHANGELOG's known edge: an in-root symlink is pinned by link
+    string and target content wherever the target lives). The check is on the operand's own lexical path, not on where
+    it leads, so containment-by-resolution (`pathid.inside(ent, p)`) would have flipped it; this holds it."""
+    real = ent.resolve()
+    target = tmp_path.resolve() / "elsewhere.py"
+    target.write_text("# outside\n")
+    link = real / "activation" / "hooks" / "link.py"
+    link.symlink_to(target)
+    pins, unresolved = hg._command_pins(real, _docs_running(str(link)))
+    assert unresolved == [] and len(pins) == 1
+
+
+def test_lexically_in_root_with_an_injected_case_fold(ent, monkeypatch):
+    """The same logic where no alias exists (a Linux CI run): `pathid._fs_spelling` is replaced by a case-insensitive
+    walk over the real tree, standing in for a case-insensitive volume."""
+    from levain import pathid
+    from tests.test_pathid import _case_insensitive_spelling
+    monkeypatch.setattr(pathid, "_fs_spelling", _case_insensitive_spelling)
+    real = ent.resolve()
+    shout = real.with_name(real.name.upper())
+    assert hg._lexically_in_root(real / "activation" / "hooks" / "x.py", real)                       # canonical: as before
+    assert hg._lexically_in_root(shout / "activation" / "hooks" / "x.py", real)                      # an alias of the install
+    assert hg._lexically_in_root(shout, real)
+    assert hg._lexically_in_root(real / "activation", shout)                                         # the install given as an alias
+    assert not hg._lexically_in_root(real.with_name(real.name + "camp") / "x.py", real)
+    assert not hg._lexically_in_root(real.parent / "other" / "x.py", real)
+    assert not hg._lexically_in_root(real.parent, real)                                              # above the install

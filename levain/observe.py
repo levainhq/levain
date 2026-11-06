@@ -246,17 +246,25 @@ def _is_ours(handler: Any) -> bool:
 
 
 def is_live_root(root: Path) -> bool:
+    """``root`` IS the live ~/.claude (not below it, not above it), by identity and not by spelling: on a case-insensitive
+    volume ``/USERS/me/.CLAUDE`` is the same directory and ``Path.resolve()`` keeps the case it is given (casesweep row 13,
+    key 1106-1). DENY direction (this refuses a write): ``pathid.maybe_inside`` both ways is "the same directory", and a
+    question the filesystem would not answer counts as live."""
+    from levain import pathid       # a function-local import: the hook entry point (``-m levain.observe hook``) never needs it
     try:
-        return Path(root).expanduser().resolve() == (Path.home() / ".claude").resolve()
+        live, given = Path.home() / ".claude", Path(root).expanduser()
     except (OSError, RuntimeError):
         return False
+    return pathid.maybe_inside(live, given) and pathid.maybe_inside(given, live)
 
 
 def _is_live_settings(path: Path) -> bool:
-    """The settings file the root names resolves into the live ~/.claude (through any symlink chain)."""
+    """The settings file the root names resolves into the live ~/.claude (through any symlink chain, in any letter case)."""
+    from levain import pathid
     try:
-        live = (Path.home() / ".claude").resolve()
-        return path.resolve() in (live / "settings.json", (live / "settings.json").resolve()) or is_live_root(path.resolve().parent)
+        live = Path.home() / ".claude"
+        got = pathid.canonical(path)
+        return got == pathid.canonical(live / "settings.json") or is_live_root(got.parent)
     except (OSError, RuntimeError):
         return True  # cannot tell: treat as live
 

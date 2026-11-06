@@ -591,3 +591,64 @@ def test_a_signin_whose_held_callback_port_moved_asks_for_a_remove_first(rig, ca
     rig.log.write_text("")
     assert signin(rig) == 1
     assert "callback port" in capsys.readouterr().out and rig.mutating() == []
+
+
+# --- 1106-1 miscdeny: the hands home is the operator's home, spelled in another case (casesweep row 12) ---------------
+
+def _case_alias(p: Path) -> Path:
+    """``p`` spelled with its letters' case swapped, when this filesystem takes that spelling as the same directory (a
+    case-insensitive one: macOS APFS by default); else the test is skipped."""
+    import os
+    alias = Path(str(p.resolve()).swapcase())
+    if str(alias) == str(p.resolve()) or not alias.exists() or not os.path.samefile(alias, p):
+        pytest.skip("this filesystem is case-sensitive: no case alias of a directory exists")
+    return alias
+
+
+def _hands_at(home) -> HandsIdentity:
+    import os
+    return HandsIdentity("levain-hands", os.getuid() or 1, str(home), Path(str(home)) / "ws")
+
+
+@pytest.mark.parametrize("which", ["same", "inside", "above"])
+def test_a_hands_home_that_is_a_case_alias_of_the_operators_is_refused(tmp_path, monkeypatch, which):
+    """casesweep row 12: `os.path.realpath` keeps the spelling it is given, so a hands home written `/USERS/<me>` compared
+    unequal to the operator's `/Users/<me>` and `signin`/`remove` would have run against the operator's own store.
+    DENY direction (`pathid.maybe_inside` both ways: the same, below, or above). Config-only, so not reachable by a
+    plausible caller; the fix is one call. Needs a case-insensitive volume (macOS APFS): on a case-sensitive one this
+    skips, so a Linux CI run never reds it; the injected-fold test below runs there."""
+    op = tmp_path.resolve() / "operator"
+    (op / "sub").mkdir(parents=True)
+    monkeypatch.setattr(hml, "_operator_home", lambda: str(op))
+    hands_home = {"same": _case_alias(op), "inside": _case_alias(op / "sub"), "above": _case_alias(op.parent)}[which]
+    assert "operator's own home" in (hml.store_problem(_hands_at(hands_home)) or "")
+
+
+def test_a_hands_home_beside_the_operators_is_accepted_whatever_its_spelling(tmp_path, monkeypatch):
+    """Control: a real second home, and its alias, are not the operator's (and the vendor config home inside it holds)."""
+    op = tmp_path.resolve() / "operator"
+    hh = tmp_path.resolve() / "hands"
+    op.mkdir()
+    hh.mkdir()
+    monkeypatch.setattr(hml, "_operator_home", lambda: str(op))
+    assert hml.store_problem(_hands_at(hh)) is None
+    assert hml.store_problem(_hands_at(_case_alias(hh))) is None
+    (tmp_path / "hands-camp").mkdir()                                       # a sibling whose name starts with the hands'
+    assert hml.store_problem(_hands_at(tmp_path / "operatorcamp")) is None
+
+
+def test_the_hands_home_check_with_an_injected_case_fold(tmp_path, monkeypatch):
+    """The same logic where no alias exists (a Linux CI run): `pathid._fs_spelling` is replaced by a case-insensitive
+    walk over the real tree, standing in for a case-insensitive volume."""
+    from levain import pathid
+    from tests.test_pathid import _case_insensitive_spelling
+    op = tmp_path.resolve() / "operator"
+    hh = tmp_path.resolve() / "hands"
+    (op / "sub").mkdir(parents=True)
+    hh.mkdir()
+    monkeypatch.setattr(pathid, "_fs_spelling", _case_insensitive_spelling)
+    monkeypatch.setattr(hml, "_operator_home", lambda: str(op))
+    for spelled in (op.with_name("OPERATOR"), op.with_name("OPERATOR") / "sub", op.parent.with_name(op.parent.name.upper())):
+        assert "operator's own home" in (hml.store_problem(_hands_at(spelled)) or ""), spelled
+    assert "operator's own home" in (hml.store_problem(_hands_at(op)) or "")                    # canonical: as before
+    assert hml.store_problem(_hands_at(hh)) is None and hml.store_problem(_hands_at(hh.with_name("HANDS"))) is None
