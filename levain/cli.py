@@ -646,6 +646,7 @@ def build_parser() -> argparse.ArgumentParser:
     _add_consent_rule_parser(cs_sub)
     _add_consent_receipts_parser(cs_sub)
     _add_binding_parser(subparsers, _ck_common)
+    _add_seat_parser(subparsers, _ck_common)
     _add_chat_parser(subparsers, _ck_common)
     from levain.voice.cli import add_parsers as _add_voice_parsers
     _add_voice_parsers(subparsers, _ck_common)
@@ -3589,6 +3590,96 @@ def _cmd_consent_grant_list(args: argparse.Namespace) -> int:
         state = "expired" if expires_at <= stamp else f"until {expires_at}"
         print(f"{gid!r}  kind {kind}  {state}  (seq {seq}): a grant kind this levain does not know, held inert: it "
               "answers nothing here (upgrade levain to use it; `levain consent grant revoke` removes it)")
+    return 0
+
+
+# --- levain seat lease|launch|canary (PATHZERO Z1d: the seat-root lease and the clone launch; levain.seat_lease) -----
+
+def _add_seat_parser(subparsers: argparse._SubParsersAction, common: object) -> None:
+    seat_p = subparsers.add_parser(
+        "seat", help="Terminal seat roots: the signed 14-day lease, the clone launch (validate only), the canary.",
+        description=(
+            "A terminal Claude Code seat works in one lane clone plus its RETURN directory, minted per launch under a "
+            "seat-root lease: a link in the cockpit's signed authority log, 14 days, revocable from the cockpit's "
+            "Grants tab. A launch with no live lease refuses and never falls back to a prompt. `launch` builds and "
+            "validates the launch and prints the argv and digest; it does not start claude."))
+    sub = seat_p.add_subparsers(dest="seat_cmd", required=True)
+    lease = sub.add_parser("lease", help="Sign, renew, revoke and list the seat-root lease.")
+    lsub = lease.add_subparsers(dest="seat_lease_cmd", required=True)
+    create = lsub.add_parser("create", help="Sign a 14-day lease (an enrolled laptop-presence key).")
+    create.add_argument("--lanes-parent", dest="lanes_parent", type=Path, required=True,
+                        help="The directory lane clones are made under.")
+    create.add_argument("--returns-parent", dest="returns_parent", type=Path, required=True,
+                        help="The directory RETURN directories are made under (apart from the lanes parent).")
+    create.add_argument("--signing-key", dest="signing_key", type=Path, required=True)
+    common(create)
+    renew = lsub.add_parser("renew", help="Re-sign a live lease for 14 more days.")
+    renew.add_argument("lease_id")
+    renew.add_argument("--signing-key", dest="signing_key", type=Path, required=True)
+    common(renew)
+    revoke = lsub.add_parser("revoke", help="Revoke the lease: every later launch refuses; running seats keep their roots.")
+    revoke.add_argument("lease_id")
+    revoke.add_argument("--signing-key", dest="signing_key", type=Path, required=True)
+    common(revoke)
+    lst = lsub.add_parser("list", help="Show the live lease, if any.")
+    common(lst)
+    launch = sub.add_parser("launch", help="Mint a lane's roots under the live lease and validate the launch (does not start claude).")
+    launch.add_argument("lane_key")
+    launch.add_argument("--remote", required=True, help="The source repository (url or path) to clone.")
+    launch.add_argument("--base", required=True, help="The full commit id the lane starts from.")
+    launch.add_argument("--claude", default=None, help="The claude binary (default: the one on PATH).")
+    launch.add_argument("--python", default=None, help="The python that runs the seat's hooks (default: this one).")
+    common(launch)
+    canary = sub.add_parser("canary", help="The seat canary (needs the Z1c arm in this tree); arguments pass through.")
+    canary.add_argument("canary_args", nargs=argparse.REMAINDER)
+    seat_p.set_defaults(func=_cmd_seat)
+
+
+def _cmd_seat(args: argparse.Namespace) -> int:
+    import shutil
+
+    if args.seat_cmd == "canary":
+        try:
+            from levain.seat_canary import main as canary_main
+        except ImportError:
+            print("seat canary: not built in this tree", file=sys.stderr)
+            return 1
+        return canary_main(args.canary_args)
+    from levain import seat_lease
+    from levain.cockpit.keys import ssh_signer
+    from levain.seat_profile import SeatRefusal
+
+    try:
+        root = _cockpit_root(args)
+        if args.seat_cmd == "launch":
+            return seat_lease.launch_seat(args.lane_key, args.remote, args.base,
+                                          claude_bin=args.claude or shutil.which("claude") or "claude",
+                                          python=args.python or sys.executable, cockpit_root=root, install=args.path)
+        if args.seat_lease_cmd == "list":
+            state = seat_lease._replay(root)
+            lease = None if state is None else seat_lease.live_lease(state, _utc_now())
+            print("no live seat-root lease" if lease is None else
+                  f"{lease['id']}  lanes {lease['lanes_parent']}  returns {lease['returns_parent']}  "
+                  f"until {lease['expires_at']}")
+            return 0
+        signer_fp, sign = ssh_signer(args.signing_key)
+        if args.seat_lease_cmd == "create":
+            lanes, returns = args.lanes_parent, args.returns_parent
+            key_dir = seat_lease.key_dir_for(args.path, (Path(os.path.realpath(lanes)), Path(os.path.realpath(returns))))
+            g = seat_lease.create_lease(root, lanes_parent=lanes, returns_parent=returns, key_dir=key_dir,
+                                        signer_fp=signer_fp, sign=sign, clock=_utc_now)
+            print(f"signed: {g['id']}: lanes {g['lanes_parent']}, returns {g['returns_parent']}, until {g['expires_at']}")
+        elif args.seat_lease_cmd == "renew":
+            print(f"renewed: {args.lease_id} until {seat_lease.renew_lease(root, args.lease_id, signer_fp=signer_fp, sign=sign, clock=_utc_now)}")
+        else:
+            from levain.consent.grants import revoke_grant
+            seq, warning = revoke_grant(root, args.lease_id, signer_fp=signer_fp, sign=sign, clock=_utc_now)
+            print(f"revoked: {args.lease_id} at seq {seq}; later launches refuse, running seats keep their roots")
+            if warning:
+                print(f"warning: {warning}", file=sys.stderr)
+    except (seat_lease.SeatLaunchRefused, SeatRefusal, *_cockpit_refusals()) as exc:
+        print(f"seat {args.seat_cmd} refused: {exc}", file=sys.stderr)
+        return 1
     return 0
 
 
