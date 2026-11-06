@@ -326,6 +326,19 @@ def test_register_dream_over_a_corrupt_attachment_is_an_enable_refusal_not_a_sil
         da.register_dream(store)
 
 
+def test_an_attachment_whose_valid_role_is_a_job_is_unreadable_never_shown_as_an_attached_role(store):
+    """fixk2 (L3 k2 r1, codex MED): a direct writer attaches a valid spec pinning a valid JOB; attach_in refuses exactly
+    that state, and materialise reported it as an attached role with exit 0."""
+    attached(store)                                      # the record exists
+    job, _ = register(store, "worker", role_doc("job-role", kind="job"))
+    c = raw(store)
+    c.execute("INSERT INTO agent_attachments (agent_id, role_name, attached_at) VALUES (?,?,?)",
+              (job, "job-role", "2026-11-05T00:00:00Z"))   # the schema permits it: no trigger judges the role's kind
+    c.close()
+    with pytest.raises(op.OperatorAgentUnreadable, match=rf"{job}.*job"):
+        view(store)
+
+
 def test_a_retired_attached_spec_is_listed_under_retired_roles_not_dropped(store):
     a = attached(store)
     spec_mod.retire_agent(store, "partner-a")
@@ -346,6 +359,30 @@ def test_an_unreadable_install_file_is_shown_as_its_own_refusal_never_as_missing
     (store.directory / da.INSTALL_FILE).write_text("{not json")
     got = view(store, store.directory).install
     assert got.label.startswith("install facts unreadable: ") and "cannot be read" in got.label and got.kind is None
+
+
+def test_a_missing_install_directory_is_no_install_facts_and_does_not_raise(store, tmp_path):
+    """fixk2 (L3 k2 r1, deepseek LOW): materialise with an install_dir that does not exist."""
+    da.register_dream(store)
+    missing = tmp_path / "no-such-dir"
+    assert not missing.exists()
+    got = view(store, missing).install
+    assert (got.kind, got.label, got.memory_path) == (None, "no install facts", None)
+
+
+def test_the_install_kind_and_memory_path_come_from_one_read_of_the_facts_file(store, tmp_path, monkeypatch):
+    """fixk2 (L3 k2 r1, codex LOW): the kind came from one read and the memory path from another, so a facts file
+    replaced between them (`dream enable` live -> shadow) gave a kind that is not the file's. Here a first read that
+    would have answered "shadow" while the file says live: the kind must be the one the validated read saw."""
+    da.register_dream(store)
+    mem, cockpit, coord = tmp_path / "memory.db", tmp_path / "cockpit", tmp_path / "coord"
+    mem.write_text("")
+    cockpit.mkdir()
+    coord.mkdir()
+    da.write_install(store.directory, store_path=mem, cockpit_root=cockpit, coord_dir=coord, zone=ZONE)
+    monkeypatch.setattr(da, "install_kind", lambda _d: "shadow")     # the other read, had it run, saw another file
+    got = view(store, store.directory).install
+    assert (got.kind, got.label, got.memory_path) == ("live", "live", mem)
 
 
 def test_a_live_install_names_its_kind_and_memory_path(store, tmp_path):

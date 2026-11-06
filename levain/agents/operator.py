@@ -226,14 +226,16 @@ def _install(install_dir: Path | str | None) -> InstallFacts | None:
         return None
     from levain.dream import agent as dream_agent
 
-    kind = dream_agent.install_kind(install_dir)
+    # ONE read of the facts file: the kind and the memory path come from the same validated snapshot (a second read
+    # could see a file `dream enable` replaced in between). The kind is derived the way dream.agent.install_kind does.
     try:
         inst = dream_agent.read_install(install_dir)
     except dream_agent.InstallRefused as exc:
-        if not (Path(install_dir) / dream_agent.INSTALL_FILE).exists():
+        if isinstance(exc.__cause__, FileNotFoundError):     # no file (or no directory): the read's own answer
             return InstallFacts(None, "no install facts", None)
-        return InstallFacts(kind, f"install facts unreadable: {exc}", None)
-    return InstallFacts(kind, kind or "live", inst.store_path)
+        return InstallFacts(None, f"install facts unreadable: {exc}", None)   # no validated snapshot names a kind
+    kind = "shadow" if inst.shadow_flow_root is not None else "live"
+    return InstallFacts(kind, kind, inst.store_path)
 
 
 def materialise(conn: Any, *, install_dir: Path | str | None = None) -> OperatorAgent | None:
@@ -256,10 +258,14 @@ def materialise(conn: Any, *, install_dir: Path | str | None = None) -> Operator
         row = tuple(rest)
         if row[0] is None:
             raise OperatorAgentUnreadable(f"the attachment of {agent_id} (role {held_role!r}) names no agent in the store")
-        _spec, _role_doc, rname, rver = _judge(agent_id, row)
+        _spec, role_doc, rname, rver = _judge(agent_id, row)
         if rname != held_role:
             raise OperatorAgentUnreadable(f"the attachment of agent {agent_id} ({row[0]!r}) names role {held_role!r}, but "
                                           f"its spec pins {rname!r}")
+        kind = role_doc.get("kind", _role.DEFAULT_KIND)
+        if kind != "role":     # the state attach_in refuses: a job is never an attached role, so it is not shown as one
+            raise OperatorAgentUnreadable(f"the attachment of agent {agent_id} ({row[0]!r}) pins {rname!r}, a {kind}: "
+                                          f"a {kind} is not attached to the agent")
         item = AttachedRole(agent_id, row[0], row[1], held_role, rver, attached_at, row[3])
         (live if row[2] == "registered" else retired).append(item)
     return OperatorAgent(record[0], record[1], tuple(live), tuple(retired), _install(install_dir), unattached_dream(conn))

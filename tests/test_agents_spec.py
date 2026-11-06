@@ -274,6 +274,30 @@ def test_cli_verbs_round_trip(tmp_path, capsys):
     assert main([*d, "list"]) == 0 and capsys.readouterr().out == ""            # --warn stored nothing
 
 
+@pytest.mark.parametrize("verb", [["agent"], ["attach", "job_push_check"], ["list"], ["show", "job_push_check"],
+                                  ["pause", "job_push_check"], ["zone"]])
+def test_a_post_open_marker_refusal_is_said_with_exit_1_never_a_traceback(store, monkeypatch, capsys, verb):
+    """fixk2 (L3 k2 r1, codex MED): the open succeeds at /4, another process moves the marker, and the verb's own
+    transaction raises AgentStoreRefused, which no post-open handler caught: it escaped as a traceback."""
+    import levain.agents.cli as agents_cli
+
+    reg(store, "job_push_check")
+    real_open = agents_cli.open_agent_store
+
+    def open_then_move(store_dir):
+        opened = real_open(store_dir)
+        c = sqlite3.connect(opened.path, isolation_level=None)
+        c.execute("UPDATE meta SET value = 'levain-agent-schema/5' WHERE key = 'agent_schema'")
+        c.close()
+        return opened
+
+    monkeypatch.setattr(agents_cli, "open_agent_store", open_then_move)
+    capsys.readouterr()
+    assert main(["agents", "--store-dir", str(store.directory), *verb]) == 1
+    err = capsys.readouterr().err
+    assert "unknown agent schema marker 'levain-agent-schema/5'" in err and "Traceback" not in err
+
+
 # ---- L3 round 1 -----------------------------------------------------------------------------------------------
 def test_a_retired_id_acts_on_itself_never_on_the_live_successor_or_its_group(store, capsys):
     old, *_ = reg(store, "job_push_check")

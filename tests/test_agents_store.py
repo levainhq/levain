@@ -273,6 +273,30 @@ def test_the_read_only_view_of_an_older_store_names_this_versions_verb_not_the_o
     assert open_agent_store_view(path.parent) is not None
 
 
+def test_a_held_read_only_view_refuses_its_next_read_after_the_marker_moves(tmp_path):
+    """fixk2 (L3 k2 r1, codex MED): a view opened at /4 read a store another process had moved to a later marker."""
+    d = tmp_path / "heldview"
+    open_agent_store(d)
+    view = open_agent_store_view(d)
+    with view.read() as c:
+        assert at.agent_marker(c) == at.AGENT_SCHEMA
+    edit(d, "UPDATE meta SET value = 'levain-agent-schema/5' WHERE key = 'agent_schema'")
+    with pytest.raises(AgentStoreRefused, match="unknown agent schema marker 'levain-agent-schema/5'"):
+        with view.read():
+            raise AssertionError("the block must not run")
+    edit(d, "UPDATE meta SET value = 'levain-agent-schema/4' WHERE key = 'agent_schema'")
+    with view.read() as c:       # the same view reads again once the marker is this binary's
+        assert at.agent_marker(c) == at.AGENT_SCHEMA
+
+
+def test_the_in_memory_view_of_no_store_still_reads_its_empty_tables(tmp_path):
+    view = open_agent_store_view(tmp_path / "none")
+    assert view.path is None
+    with view.read() as c:
+        assert c.execute("SELECT COUNT(*) FROM agents").fetchone()[0] == 0
+    assert not (tmp_path / "none").exists()
+
+
 def test_a_future_marker_is_still_sent_to_the_levain_that_wrote_it_even_from_the_view(tmp_path):
     d = tmp_path / "future"
     open_agent_store(d)

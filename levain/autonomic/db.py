@@ -227,7 +227,8 @@ class AutonomicDB:
             # an agent schema /2 store (0.11.27) or /3 store is taken to the current marker here, inside this
             # transaction (P7-A §4, K2a). One whose agent objects do not reach it is left at the marker it had (the
             # migration undid its own writes) and the rest of the store opens as before: `levain agents` refuses it.
-            # Any other agent marker is not touched here.
+            # A migration that could not undo its writes raises AgentSchemaRollbackFailed, which is not caught here:
+            # this transaction is rolled back and the open fails. Any other agent marker is not touched here.
             try:
                 migrate_agent_schema(conn)
             except AgentSchemaNotMigrated:

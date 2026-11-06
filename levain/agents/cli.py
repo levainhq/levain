@@ -9,6 +9,7 @@ Exit 0: done (bare ``agents``: the agent schema is this levain's). Exit 1: refus
 from __future__ import annotations
 
 import argparse
+import functools
 import json
 import os
 import sqlite3
@@ -67,8 +68,36 @@ def add_parsers(subparsers: argparse._SubParsersAction) -> None:
     _add_operator_parsers(verbs)
     _add_signing_parsers(verbs)
     _add_revoke_parsers(verbs)
+    # the verbs above open the agent store; `fence` never does and `tick` says its own refusal, so they are added after
+    # the one wrap and keep their own functions
+    _say_refusals(p)
     _add_fence_parsers(verbs)
     _add_tick_parsers(verbs)
+
+
+def _refusal_said(fn):
+    """``fn`` with a store refusal raised AFTER the open (a verb's own transaction meeting a marker another process
+    moved: :func:`levain.agents.store._check_marker`) said on stderr with exit 1, like the open's own refusal, never a
+    traceback."""
+    @functools.wraps(fn)
+    def run(args: argparse.Namespace) -> int:
+        try:
+            return fn(args)
+        except AgentStoreRefused as exc:
+            print(f"levain agents: {exc}", file=sys.stderr)
+            return 1
+    return run
+
+
+def _say_refusals(parser: argparse.ArgumentParser) -> None:
+    """Wrap every verb's ``func`` under ``levain agents`` in :func:`_refusal_said`: the ONE catch, at the dispatch."""
+    fn = parser.get_default("func")
+    if fn is not None:
+        parser.set_defaults(func=_refusal_said(fn))
+    for action in parser._actions:
+        if isinstance(action, argparse._SubParsersAction):
+            for sub in dict.fromkeys(action.choices.values()):     # an alias maps to the same parser: wrap it once
+                _say_refusals(sub)
 
 
 def _add_tick_parsers(verbs: argparse._SubParsersAction) -> None:

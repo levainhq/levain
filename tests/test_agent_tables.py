@@ -794,15 +794,32 @@ class _FailingConn:
         return self._c.in_transaction
 
 
-@pytest.mark.parametrize("prefix", ["RELEASE", "ROLLBACK TO"])
-def test_a_failing_savepoint_teardown_does_not_replace_the_original_error(v2, prefix):
-    """L3 r2 (complement LOW): 'no such savepoint' from the teardown masked the real failure."""
+def test_a_failing_savepoint_release_after_the_undo_does_not_replace_the_original_error(v2):
+    """L3 r2 (complement LOW): 'no such savepoint' from the teardown masked the real failure. (After ROLLBACK TO the
+    writes are undone, so the catchable class is still right here.)"""
     real = connect(v2)
     real.execute("DROP TRIGGER agent_occurrences_one_fire")     # the check fails, so the handler runs
     real.execute("BEGIN IMMEDIATE")
-    c = _FailingConn(real, prefix, sqlite3.OperationalError("no such savepoint: levain_agent_schema_migrate"))
+    c = _FailingConn(real, "RELEASE", sqlite3.OperationalError("no such savepoint: levain_agent_schema_migrate"))
     with pytest.raises(at.AgentSchemaNotMigrated, match="did not migrate cleanly"):
         at.migrate_agent_schema(c)
+    real.close()
+
+
+@pytest.mark.parametrize("joined", [True, False])
+def test_a_failing_undo_raises_the_uncaught_class_and_chains_the_original_error(v2, joined):
+    """fixk2 (codex HIGH): a failing ROLLBACK TO (joined) or ROLLBACK (own) used to be swallowed and the catchable
+    AgentSchemaNotMigrated raised, though the writes might still be pending. Now AgentSchemaRollbackFailed, which is not
+    an AgentSchemaNotMigrated, with the check's own reason chained and named."""
+    real = connect(v2)
+    real.execute("DROP TRIGGER agent_occurrences_one_fire")
+    if joined:
+        real.execute("BEGIN IMMEDIATE")
+    c = _FailingConn(real, "ROLLBACK", sqlite3.OperationalError("disk I/O error"))
+    with pytest.raises(at.AgentSchemaRollbackFailed, match=r"the /2 agent schema .* could not be undone") as ei:
+        at.migrate_agent_schema(c)
+    assert not isinstance(ei.value, at.AgentSchemaNotMigrated)
+    assert isinstance(ei.value.__cause__, at.AgentSchemaNotMigrated) and "disk I/O error" in str(ei.value)
     real.close()
 
 
@@ -904,6 +921,51 @@ def test_a_failure_in_the_last_step_keeps_nothing_and_the_marker_is_written_only
         == V2_RESERVATIONS_SQL
     assert not {r[0] for r in real.execute("SELECT name FROM sqlite_master")} & {"agent_operator", "agent_attachments"}
     real.close()
+
+
+def _v3_missing_a_trigger(v3):
+    raw = connect(v3)
+    raw.execute("DROP TRIGGER agent_occurrences_one_fire")
+    raw.close()
+
+
+def _v3_left_as_it_was(v3):
+    c = connect(v3)
+    try:
+        names = {r[0] for r in c.execute("SELECT name FROM sqlite_master")}
+        has_v4 = any(n.startswith(("agent_operator", "agent_attachments")) for n in names)    # the tables or a trigger
+        return at.agent_marker(c), has_v4, "agent_occurrences_one_fire" in names
+    finally:
+        c.close()
+
+
+def test_a_failed_joined_migration_through_the_opener_keeps_nothing_when_the_opener_catches_it_and_commits(v3):
+    """fixk2 (L3 k2 r1, codex HIGH / deepseek HIGH), the own=False sibling of the test above: the opener runs the
+    migration inside its own BEGIN IMMEDIATE, catches AgentSchemaNotMigrated and COMMITs. The /3 store missing a trigger
+    must read /3 afterwards and hold no /4 object (a RELEASE-only teardown would commit it at /4)."""
+    _v3_missing_a_trigger(v3)
+    real = connect(v3)
+    c = _RecordingConn(real, "never-matches", sqlite3.OperationalError("unused"))
+    AutonomicDB._ensure_schema(c)            # the opener's own path: it catches the refusal and commits
+    real.close()
+    assert "COMMIT" in c.statements and any(st.startswith("SAVEPOINT") for st in c.statements)
+    assert _v3_left_as_it_was(v3) == (at.AGENT_SCHEMA_V3, False, False)
+
+
+def test_a_failing_savepoint_rollback_inside_the_opener_rolls_the_opener_back_and_never_commits_a_4_marker(v3):
+    """fixk2 (codex HIGH, reproduced): when ROLLBACK TO itself fails, the migration's writes are still in the opener's
+    transaction. Raising the catchable AgentSchemaNotMigrated let the opener COMMIT them: a /3 store missing a trigger
+    was committed at /4, the trigger still missing. The error must be one the opener does not swallow."""
+    _v3_missing_a_trigger(v3)
+    real = connect(v3)
+    c = _RecordingConn(real, "ROLLBACK TO", sqlite3.OperationalError("injected: the savepoint rollback fails"))
+    with pytest.raises(sqlite3.DatabaseError) as ei:
+        AutonomicDB._ensure_schema(c)
+    assert not isinstance(ei.value, at.AgentSchemaNotMigrated)
+    assert "COMMIT" not in c.statements
+    assert not real.in_transaction
+    real.close()
+    assert _v3_left_as_it_was(v3) == (at.AGENT_SCHEMA_V3, False, False)
 
 
 def test_a_hand_made_operator_table_of_other_text_is_judged_by_the_final_check_not_kept(v3):

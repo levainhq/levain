@@ -140,6 +140,16 @@ class AgentStoreView:
 
     @contextmanager
     def read(self) -> Iterator[sqlite3.Connection]:
+        """A snapshot. For a store file, the agent schema marker is read after ``BEGIN``, as :class:`AgentStore` does,
+        so a view held while another process moves the marker is refused at its next read. The in-memory view of no
+        store has no marker (it holds empty agent tables only) and is not checked."""
+        with self._read(check=self.path is not None) as conn:
+            yield conn
+
+    @contextmanager
+    def _read(self, *, check: bool) -> Iterator[sqlite3.Connection]:
+        # check=False only for open_agent_store_view's own look, which judges the marker itself (and names an older
+        # one as migratable, which _check_marker would not)
         if self.path is None:
             conn = sqlite3.connect(":memory:", isolation_level=None)
             create_agent_objects(conn)
@@ -147,6 +157,8 @@ class AgentStoreView:
             conn = sqlite3.connect(self.path.absolute().as_uri() + "?mode=ro", uri=True, isolation_level=None)
         try:
             conn.execute("BEGIN")
+            if check:
+                _check_marker(conn)
             yield conn
         finally:
             conn.close()
@@ -181,7 +193,7 @@ def open_agent_store_view(store_dir: Path | str | None = None) -> AgentStoreView
     if _store_format_ro(path) == STORE_V3:
         raise AgentStoreRefused(STORE_V3_REASON)
     view = AgentStoreView(path)
-    with view.read() as conn:
+    with view._read(check=False) as conn:
         if _store_format_view(conn):
             return AgentStoreView(None)
         marker = agent_marker(conn)

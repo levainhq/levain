@@ -18,7 +18,8 @@ import sqlite3
 __all__ = ["AGENT_SCHEMA", "AGENT_TABLES", "AGENT_TRIGGERS", "AGENT_OBJECT_DDL", "create_agent_objects",
            "ddl_agents", "agent_master", "reference_master", "has_agent_object", "agent_marker",
            "check_agent_schema", "AGENT_SCHEMA_V2", "AGENT_SCHEMA_V3", "AGENT_SCHEMA_PREDECESSORS", "AGENT_DDL_V3",
-           "OPERATOR_DDL_V4", "RESERVATION_COLUMNS_V3", "migrate_agent_schema", "AgentSchemaNotMigrated"]
+           "OPERATOR_DDL_V4", "RESERVATION_COLUMNS_V3", "migrate_agent_schema", "AgentSchemaNotMigrated",
+           "AgentSchemaRollbackFailed"]
 
 # /1 named A0 r6's twelve-trigger text (F0 r1, never merged); a store carrying it is refused as an unknown marker.
 # /2 shipped in 0.11.27. /3 adds the seven subscription-route columns to agent_reservations (P7-A §4) and is the first
@@ -254,6 +255,12 @@ class AgentSchemaNotMigrated(sqlite3.DatabaseError):
     ``levain agents`` then refuses. The message names that starting marker."""
 
 
+class AgentSchemaRollbackFailed(sqlite3.DatabaseError):
+    """A failed migration whose own undo (``ROLLBACK`` / ``ROLLBACK TO``) also failed: its writes may still be in the
+    caller's transaction. Deliberately NOT an :class:`AgentSchemaNotMigrated`, so the opener does not catch it and its
+    transaction is rolled back instead of committed. The original error is chained."""
+
+
 _SAVEPOINT = "levain_agent_schema_migrate"
 
 
@@ -298,7 +305,9 @@ def migrate_agent_schema(conn: sqlite3.Connection) -> bool:
     so a caller that catches the error and commits keeps no half-migrated or newly marked store. A second run, or one
     after a crash (which rolled the whole transaction back), lands in the same place. A store whose objects were
     altered by hand fails the check (or lacks a table a step alters), nothing is kept, and
-    :class:`AgentSchemaNotMigrated` is raised naming the marker the store started from and the reason."""
+    :class:`AgentSchemaNotMigrated` is raised naming the marker the store started from and the reason. When the undo
+    itself fails, :class:`AgentSchemaRollbackFailed` is raised instead (not a subclass: a caller that catches the first
+    and commits must not catch this one; its transaction has to be rolled back)."""
     own = not conn.in_transaction
     conn.execute("BEGIN IMMEDIATE" if own else f"SAVEPOINT {_SAVEPOINT}")
     open_ = True    # the transaction (own) or the savepoint (joined) this call began and has not yet ended
@@ -321,16 +330,24 @@ def migrate_agent_schema(conn: sqlite3.Connection) -> bool:
         open_ = False
         return True
     except BaseException as err:
-        # best-effort teardown: a failing ROLLBACK / RELEASE ("no such savepoint") must not replace the real error
         if open_ and conn.in_transaction:
+            # the undo. If it fails, this call's writes may still be in the transaction, and the catchable
+            # AgentSchemaNotMigrated would let a caller that catches it COMMIT them (the opener does): a store marked
+            # current whose objects were never validated. So that failure raises AgentSchemaRollbackFailed, which no
+            # caller catches, and the caller's transaction is rolled back.
             try:
-                if own:
-                    conn.execute("ROLLBACK")
-                else:
-                    conn.execute(f"ROLLBACK TO {_SAVEPOINT}")
+                conn.execute("ROLLBACK" if own else f"ROLLBACK TO {_SAVEPOINT}")
+            except sqlite3.Error as undo:
+                raise AgentSchemaRollbackFailed(
+                    f"the {_short(start)} agent schema did not migrate cleanly and its writes could not be undone "
+                    f"({undo}); the transaction must be rolled back: {err}") from err
+            if not own:
+                # the writes are undone; a RELEASE that fails ("no such savepoint") leaves nothing of them to keep, and
+                # must not replace the real error
+                try:
                     conn.execute(f"RELEASE {_SAVEPOINT}")
-            except sqlite3.Error:
-                pass
+                except sqlite3.Error:
+                    pass
         if isinstance(err, sqlite3.Error):
             # one error class for the opener to catch; the store is left at its starting marker and the cause is chained
             named = f"the {_short(start)} agent schema did not migrate cleanly: "
