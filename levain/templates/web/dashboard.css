@@ -2781,35 +2781,49 @@ body.ke[data-mode="build"] .th-zone .zone-head { display: flex; }   /* titled li
   .th-body .tv-head .tv-at { margin-left: 0; }
 }
 
-/* RM-F: the cockpit's one Claude room (room_view.js, rv-*): the conversation, the dock (draft, Send, Drop, Stop, mic), the
+/* RM-F: the cockpit's one Claude room (room_view.js, rv-*): the conversation, the dock (draft, Send, Stop, mic), the
    proposal card and the ambiguous-line reconcile. Colours are tokens the page's light and dark themes already define. */
 .rv { display: flex; flex-direction: column; gap: var(--sp-4); min-width: 0; }
 .rv .rv-head { display: flex; flex-wrap: wrap; align-items: baseline; gap: var(--sp-2) var(--sp-4); font: var(--fw-regular) var(--fs-micro)/1.5 var(--mono); color: var(--label); }
 .rv .rv-note { margin: 0; color: var(--label); font: var(--fw-regular) var(--fs-meta)/1.5 var(--sans); overflow-wrap: anywhere; }
 .rv .rv-gap { padding: var(--sp-3) var(--sp-4); border: 1px solid var(--bad); border-radius: var(--r-sm); color: var(--text); font: var(--fw-regular) var(--fs-meta)/1.5 var(--sans); }
 .rv .rv-line { border-left: 3px solid var(--hair-2); padding: var(--sp-2) var(--sp-4); }
-.rv .rv-you { border-left-color: var(--info); }
-.rv .rv-room { border-left-color: var(--accent-line); }
+.rv .rv-you { border-left: 0; align-self: flex-end; max-width: 85%; background: var(--accent-soft); border-radius: var(--r-lg); padding: var(--sp-3) var(--sp-4); }
+.rv .rv-you .rv-who { display: none; }
+.rv .rv-room { border-left: 0; padding-inline: 0; }
+.rv .rv-stream, .rv .rv-cards { display: flex; flex-direction: column; gap: var(--sp-3); width: 100%; max-width: 68ch; margin-inline: auto; box-sizing: border-box; }
+.rv .rv-cards { margin-top: var(--sp-3); }
+.rv .rv-cards:empty { display: none; }
+.rv .rv-body { max-height: min(62dvh, 640px); overflow-y: auto; overflow-x: hidden; overflow-anchor: none; overscroll-behavior: contain; padding: var(--sp-4); }
+.rv .rv-pending { display: flex; gap: var(--sp-2); padding: var(--sp-2) 0; }
+.rv .rv-dot { width: 6px; height: 6px; border-radius: 50%; background: var(--label); opacity: .35; animation: rv-pulse 1.2s infinite ease-in-out; }
+.rv .rv-dot:nth-child(2) { animation-delay: .2s; }
+.rv .rv-dot:nth-child(3) { animation-delay: .4s; }
+@keyframes rv-pulse { 0%, 80%, 100% { opacity: .25; } 40% { opacity: 1; } }
+@media (prefers-reduced-motion: reduce) { .rv .rv-dot { animation: none; opacity: .6; } }
 .rv .rv-error { border-left-color: var(--bad); }
 .rv .rv-who { font: var(--fw-semibold) var(--fs-micro)/1.5 var(--mono); color: var(--label); }
-.rv .rv-text { margin: var(--sp-1) 0 0; white-space: pre-wrap; overflow-wrap: anywhere; font: var(--fw-regular) var(--fs-meta)/1.5 var(--sans); color: var(--text); }
+.rv .rv-text { margin: var(--sp-1) 0 0; white-space: pre-wrap; overflow-wrap: anywhere; font: var(--fw-regular) var(--fs-lead)/1.6 var(--sans); color: var(--text); }
 .rv .rv-mark { display: flex; flex-wrap: wrap; align-items: center; gap: var(--sp-2) var(--sp-4); margin: var(--sp-2) 0 0; font: var(--fw-regular) var(--fs-meta)/1.5 var(--sans); color: var(--label); }
 .rv .rv-mark button { min-height: var(--hit-min, 44px); }
 .rv .rv-card { padding: var(--sp-4); border: 1px solid var(--hair-2); border-radius: var(--r-md); background: var(--card-2); display: flex; flex-direction: column; gap: var(--sp-3); }
 .rv .rv-card textarea { width: 100%; box-sizing: border-box; min-height: 72px; resize: vertical; padding: var(--sp-3) var(--sp-4); background: var(--card); color: var(--text);
   border: 1px solid var(--hair-2); border-radius: var(--r-md); font: var(--fw-regular) var(--fs-meta)/1.5 var(--sans); }
 .rv .rv-summary { padding: var(--sp-3) var(--sp-4); border-left: 3px solid var(--hair-2); color: var(--label); font: var(--fw-regular) var(--fs-meta)/1.5 var(--sans); white-space: pre-wrap; overflow-wrap: anywhere; }
-.rv .rv-dock { display: flex; flex-direction: column; gap: var(--sp-3); min-width: 0; }
-.rv .rv-input { width: 100%; box-sizing: border-box; min-height: 72px; resize: vertical; padding: var(--sp-3) var(--sp-4); background: var(--card-2); color: var(--text);
+.rv .rv-dock { display: flex; flex-direction: column; gap: var(--sp-3); min-width: 0; width: 100%; max-width: 68ch; margin-inline: auto; box-sizing: border-box; }
+.rv .rv-compose { display: flex; align-items: flex-end; gap: var(--sp-3); }
+.rv .rv-input { flex: 1; min-width: 0; box-sizing: border-box; min-height: var(--hit-min, 44px); max-height: 40dvh; overflow-y: auto; field-sizing: content; resize: none; padding: var(--sp-3) var(--sp-4); background: var(--card-2); color: var(--text);
   border: 1px solid var(--hair-2); border-radius: var(--r-md); font: var(--fw-regular) var(--fs-meta)/1.5 var(--sans); }
 .rv .rv-input:focus-visible { outline: 2px solid var(--accent-line); outline-offset: 1px; border-color: var(--accent-line); }
 .rv .rv-input:disabled { opacity: .55; cursor: not-allowed; }
 .rv .rv-actions { display: flex; flex-wrap: wrap; gap: var(--sp-3); }
-.rv .rv-send, .rv .rv-drop, .rv .rv-stop, .rv .rv-open, .rv .rv-mic, .rv .rv-rotate, .rv .rv-card button { min-height: var(--hit-min, 44px); padding: var(--sp-2) var(--sp-6); border-radius: var(--r-md); cursor: pointer; font: var(--fw-semibold) var(--fs-meta)/1 var(--sans); }
+.rv .rv-send, .rv .rv-stop, .rv .rv-open, .rv .rv-mic, .rv .rv-rotate, .rv .rv-card button { min-height: var(--hit-min, 44px); padding: var(--sp-2) var(--sp-6); border-radius: var(--r-md); cursor: pointer; font: var(--fw-semibold) var(--fs-meta)/1 var(--sans); }
 .rv .rv-send, .rv .rv-open { background: var(--accent); color: var(--on-accent); border: 1px solid var(--accent); }
+.rv .rv-send { flex: none; width: var(--hit-min, 44px); height: var(--hit-min, 44px); padding: 0; border-radius: 50%; font-size: var(--fs-title); }
+.rv .rv-send[aria-disabled="true"] { background: var(--card-2); color: var(--meta); border-color: var(--hair-2); cursor: default; }
 .rv .rv-open[hidden] { display: none; }
 .rv .rv-send:hover:not(:disabled) { filter: brightness(1.08); }
-.rv .rv-drop, .rv .rv-mic, .rv .rv-rotate, .rv .rv-card button { background: none; color: var(--text); border: 1px solid var(--label); }
+.rv .rv-mic, .rv .rv-rotate, .rv .rv-card button { background: none; color: var(--text); border: 1px solid var(--label); }
 .rv .rv-stop { background: none; color: var(--text); border: 1px solid var(--bad); }
 .rv .rv-stop:hover:not(:disabled) { background: color-mix(in oklch, var(--bad) 14%, transparent); }
 .rv button:disabled { opacity: .45; cursor: not-allowed; }
@@ -2823,7 +2837,6 @@ body.ke[data-mode="build"] .th-zone .zone-head { display: flex; }   /* titled li
   .rv .rv-dock { padding-top: var(--sp-3); padding-bottom: env(safe-area-inset-bottom, 0px); }
   .rv .rv-actions { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); }
   .rv .rv-actions > button { min-width: 0; padding-inline: var(--sp-3); overflow-wrap: anywhere; }
-  .rv .rv-actions > .rv-send { grid-column: 1 / -1; }
   .rv .rv-card button { width: 100%; }
 }
 
@@ -2831,7 +2844,7 @@ body.ke[data-mode="build"] .th-zone .zone-head { display: flex; }   /* titled li
    for a list; here it hid the newest reply behind the dock): the card takes its height, the conversation is its own scroll box that ends
    ABOVE the dock, and "Jump to latest" shows while it is scrolled up. The dock is in the flow under it, never over it. */
 .rv .rv-stage { position: relative; min-width: 0; }
-.rv .rv-jump { position: absolute; right: var(--sp-3); bottom: var(--sp-3); min-height: var(--hit-min, 44px); padding: var(--sp-2) var(--sp-5); border-radius: var(--r-md); cursor: pointer;
+.rv .rv-jump { position: absolute; left: 50%; transform: translateX(-50%); bottom: var(--sp-3); min-height: var(--hit-min, 44px); padding: var(--sp-2) var(--sp-5); border-radius: var(--r-pill); cursor: pointer;
   background: var(--accent); color: var(--on-accent); border: 1px solid var(--accent); font: var(--fw-semibold) var(--fs-meta)/1 var(--sans); }
 .rv .rv-jump[hidden] { display: none; }
 .rv .rv-gap { overflow-wrap: anywhere; }
@@ -2846,7 +2859,7 @@ body.ke[data-mode="build"] .th-zone .zone-head { display: flex; }   /* titled li
 @media (max-width: 720px) {
   body.ke .rv-zone .ck-zgrid .panel { height: auto; max-height: none; }
   body.ke .rv-zone .ck-zgrid .panel .pbody { overflow: visible; max-height: none; }
-  .rv .rv-body { max-height: 62vh; max-height: 62dvh; overflow-y: auto; overflow-x: hidden; }
+  .rv .rv-body { max-height: 62vh; max-height: 62dvh; padding: var(--sp-3); }
 }
 
 /* C12: the board kind's painters (board_view.js, bd-*). The panel lists cards grouped under column headings; the six columns (one on a narrow page) are the ⤢ modal's. */

@@ -70,7 +70,7 @@ def test_the_phone_rules_exist_and_use_tokens_only():
     i = css.index("RM-H, the phone")
     block = css[i:css.index(".rv .rv-stage", i)]
     assert "font-size: 16px" in block and "env(safe-area-inset-bottom" in block and "position: sticky" not in block   # the dock sits under the conversation, never over it (1104-29)
-    assert "grid-template-columns: repeat(2" in block and ".rv-send { grid-column: 1 / -1" in block
+    assert "grid-template-columns: repeat(2" in block and ".rv-send { grid-column" not in block   # Send sits beside the draft now (1106-16)
     assert not re.search(r"#[0-9a-fA-F]{3,6}\b", block)
 
 
@@ -106,7 +106,7 @@ const acts = [...document.querySelectorAll('.rv-actions > button')], dock = r(do
 return JSON.stringify({noSideScroll: document.documentElement.scrollWidth <= window.innerWidth,
   inside: acts.every(b => r(b).left >= dock.left - 0.5 && r(b).right <= dock.right + 0.5),
   tall: acts.every(b => r(b).height >= 43.5), unclipped: acts.every(b => b.scrollWidth <= b.clientWidth + 1),
-  sendWide: r(document.querySelector('.rv-send')).width > r(document.querySelector('.rv-drop')).width,
+  send44: r(document.querySelector('.rv-send')).width >= 43.5 && r(document.querySelector('.rv-send')).height >= 43.5,
   rows: new Set(acts.map(b => Math.round(r(b).top))).size, n: acts.length,
   input16: parseFloat(getComputedStyle(document.querySelector('.rv-input')).fontSize),
   sticky: getComputedStyle(document.querySelector('.rv-dock')).position}); })()"""
@@ -122,8 +122,8 @@ def test_the_dock_fits_a_390_phone_with_every_control_whole(tmp_path, w):
             {"eval": _GEOM},
         ])
     g = json.loads(out["values"][1])
-    assert g["noSideScroll"] and g["inside"] and g["tall"] and g["unclipped"] and g["sendWide"], g
-    assert g["n"] == 5 and g["rows"] <= 3 and g["input16"] >= 16 and g["sticky"] != "sticky", g
+    assert g["noSideScroll"] and g["inside"] and g["tall"] and g["unclipped"] and g["send44"], g
+    assert g["n"] == 3 and g["rows"] <= 2 and g["input16"] >= 16 and g["sticky"] != "sticky", g
 
 
 # --- the voice, F1-F4 of the r1 findings -----------------------------------------------------------------------------
@@ -152,16 +152,6 @@ def test_a_late_result_after_send_does_not_bring_the_sent_line_back(tmp_path, w)
     assert json.loads(out["values"][1]) == {"was": "hello there", "stops": 1}
     assert json.loads(out["values"][3]) == {"v": "", "label": "Dictate"}
     assert [r[3] for r in w.lines()] == ["hello there"]
-
-
-@needs_browser
-def test_drop_also_ends_dictation_first(tmp_path, w):
-    out, _w = _run(tmp_path, w, "Live", [
-        {"eval": "document.querySelector('.rv-mic').click(); __recs[0].emit('for the desk');"
-                 " document.querySelector('.rv-drop').click(); __recs[0].emit('and more'); JSON.stringify({stops: __recs[0].stops,"
-                 " v: document.querySelector('.rv-input').value})"},
-    ])
-    assert json.loads(out["values"][1]) == {"stops": 1, "v": "for the desk"}
 
 
 @needs_browser
@@ -201,6 +191,18 @@ def test_dictation_errors_read_by_code(tmp_path, w):
                      " JSON.stringify({n: document.querySelector('.rv-sendnote').textContent, l: document.querySelector('.rv-mic').textContent})" % code}])
         got = json.loads(out["values"][1])
         assert words in got["n"] and got["l"] == "Dictate", (code, got)
+
+
+@needs_browser
+def test_dictation_into_an_empty_draft_enables_send(tmp_path, w):
+    """L3 r1 (codex 5): a recognizer result sets the box's value, which fires no input event; Send stayed aria-disabled."""
+    out, _w = _run(tmp_path, w, "Live", [
+        {"eval": "const ta = document.querySelector('.rv-input'); ta.value = ''; ta.dispatchEvent(new Event('input'));"
+                 " const before = document.querySelector('.rv-send').getAttribute('aria-disabled');"
+                 " document.querySelector('.rv-mic').click(); __recs[0].emit('send this to the desk');"
+                 " JSON.stringify({before, after: document.querySelector('.rv-send').getAttribute('aria-disabled'), v: ta.value})"},
+    ])
+    assert json.loads(out["values"][1]) == {"before": "true", "after": None, "v": "send this to the desk"}
 
 
 @needs_browser
