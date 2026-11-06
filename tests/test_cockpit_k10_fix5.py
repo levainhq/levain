@@ -321,6 +321,12 @@ H_INFO = ("JSON.stringify({badge: (%s || {}).textContent || null, err: (%s || {}
           "rshown: (%s || {dataset: {}}).dataset.rshown || null, max: +%s.getAttribute('aria-valuemax'), resumes: window.__resumes, "
           "urls: (window.__urls || []).filter(u => u.includes('at=')).length})") % (
     _H % ".tv-rbadge", _H % ".tv-rerr", _H % ".tv", _H % ".tv-rtrack")
+# what a timed-out wait on the host card reports (tests/test_cockpit_flip_parity.py `_with_diag`): every field guarded, so it never throws
+H_DIAG = ("JSON.stringify({resumes: window.__resumes, mode: window.__mode, replaying: window.LevainTopologyView.replaying(), paused: window.LevainTopologyView.paused(), "
+          "host: !!document.querySelector('#h6'), badge: (%s || {}).textContent || null, err: (%s || {}).textContent || null, "
+          "rshown: (%s || {dataset: {}}).dataset.rshown || null, live_btn: !!%s, "
+          "at_reads: (window.__urls || []).filter(u => u.includes('at=')).length, topology_reads: (window.__urls || []).filter(u => u.includes('topology.json')).length})") % (
+    _H % ".tv-rbadge", _H % ".tv-rerr", _H % ".tv", _H % ".tv-live")
 H_SCRUB = _scrub(0.4).replace("#ck-hlens .tv-rtrack", "#h6 .tv-rtrack")
 # the host paints first, so the module's one `opts` slot is the host's when the click calls returnToLive: every repaint after that is production's own
 H_LIVE = "window.__opts.repaint(); document.querySelector('#h6 .tv-live').click(); 1"
@@ -416,7 +422,7 @@ def test_a_lens_switch_keeps_the_labelled_frame_until_the_live_read_applies(tmp_
                                             {"eval": "document.querySelector('#h6 [data-tv=work]').click(); 1"},
                                             # `=== 1` is deliberate: the test asserts exactly one resume (mid["resumes"] == 1) below
                                             # the precondition: the host card is in replay, badged (waited for on that state, not a fixed sleep)
-                                            {"until": "window.LevainTopologyView.replaying() && window.__resumes === 1 && !!document.querySelector('#h6 .tv-rbadge')"}, {"eval": H_INFO},
+                                            {"until": "window.LevainTopologyView.replaying() && window.__resumes === 1 && !!document.querySelector('#h6 .tv-rbadge')", "diag": H_DIAG}, {"eval": H_INFO},
                                             {"eval": "window.__mode = 'applied'; 1"}, {"eval": H_LIVE},
                                             # nothing here repaints the card: the badge leaves only if production's own repaint (when the live read applies) redraws it
                                             {"until": "!document.querySelector('#h6 .tv-rbadge')", "ms": 8000}, {"eval": H_INFO}])

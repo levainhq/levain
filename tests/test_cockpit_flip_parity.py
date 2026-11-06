@@ -26,12 +26,40 @@ DRIVE = Path(__file__).with_name("_page_drive.mjs")
 needs_browser = pytest.mark.skipif(NODE is None or not Path(CHROME).exists(), reason="node and Chrome are needed")
 
 
+DIAG_OK = "__levain_diag_ok__"
+
+
+def _with_diag(steps: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """A synchronous `until` step may carry `"diag": "<expression>"`: if its wait never comes true, the drive fails with
+    that expression's value (read from the page at the timeout) in the message, so a CI log names WHY the condition did
+    not hold (slow, or never true). The wait, its bound and its condition are the step's own and unchanged: the driver
+    is told `may_timeout` so the page is still there to read, and the next step fails the drive when the last poll was
+    falsy (a flag the polled expression sets), which also skips every later step. On success that step answers DIAG_OK
+    and `_drive` drops it from `values`, so the callers' indexes do not move."""
+    out: list[dict[str, Any]] = []
+    for i, s in enumerate(steps):
+        if "diag" not in s:
+            out.append(s)
+            continue
+        assert "until" in s and not {"do", "posts", "may_timeout"} & set(s), f"step {i}: diag needs a plain sync until step"
+        until = s["until"]
+        out.append({**{k: v for k, v in s.items() if k != "diag"}, "may_timeout": True,
+                    "until": f"(() => {{ window.__untilOk = false; const v = ({until}); window.__untilOk = !!v; return v; }})()"})
+        head = json.dumps(f"step {i}: until never came true within {s.get('ms', 'the driver default')}ms: {until}")
+        out.append({"eval": f"(() => {{ if (window.__untilOk) return {json.dumps(DIAG_OK)}; let d; "
+                            f"try {{ const x = ({s['diag']}); d = typeof x === 'string' ? x : JSON.stringify(x); }} catch (e) {{ d = 'the diag expression threw: ' + e; }} "
+                            f"throw new Error({head} + ' | PAGE AT THE TIMEOUT: ' + d); }})()"})
+    return out
+
+
 def _drive(tmp_path: Path, url: str, steps: list[dict[str, Any]]) -> dict[str, Any]:
     f = tmp_path / "steps.json"
-    f.write_text(json.dumps(steps))
+    f.write_text(json.dumps(_with_diag(steps)))
     res = run_driver([NODE, str(DRIVE), CHROME, url, str(f)], timeout=300)
     assert res.returncode == 0, res.stderr
-    return json.loads(res.stdout)
+    out = json.loads(res.stdout)
+    out["values"] = [v for v in out["values"] if v != DIAG_OK]
+    return out
 
 
 def _eventually(read: Any, want: Any, seconds: float = 20.0) -> Any:
