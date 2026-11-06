@@ -92,7 +92,7 @@ def test_run_ceiling_still_binds_and_the_dollar_window_does_not(store):
 
 
 def test_a_dollar_window_spent_by_earlier_api_key_runs_does_not_refuse_a_subscription_one(store):
-    api = Limits(run_ceiling=5, budget_window_usd_micros=10_000, **SPAN)
+    api = Limits(run_ceiling=5, budget_window_usd_micros=10_000, budget_run_usd_micros=10_000, **SPAN)
     with store.write() as conn:
         row = _admit(conn, 1)
         assert reserve(conn, row, _Exec(9_000), limits=api) == Reserved(9_000)
@@ -105,7 +105,7 @@ def test_a_dollar_window_spent_by_earlier_api_key_runs_does_not_refuse_a_subscri
 def test_an_api_key_reservation_is_as_it_was_and_carries_no_action_columns(store):
     with store.write() as conn:
         row = _admit(conn, 1)
-        assert reserve(conn, row, _Exec(1000), limits=Limits(5, 10**9, WINDOW, "a", "z")) == Reserved(1000)
+        assert reserve(conn, row, _Exec(1000), limits=Limits(5, 10**9, WINDOW, "a", "z", budget_run_usd_micros=10**9)) == Reserved(1000)
     r = _row(store)
     assert (r["reserved_usd_micros"], r["billing"], r["cap_actions"]) == (1000, None, None)
     with store.write() as conn:

@@ -886,7 +886,7 @@ def _admit(conn: sqlite3.Connection, authority, state: _auth.AuthoritySnapshot, 
                                budget_window_usd_micros=grant["budget_window_usd_micros"],
                                scheduled_window_key=window.scheduled_window_key, span_start=window.span_start,
                                span_end=window.span_end, billing=billing, budget_run_calls=calls,
-                               budget_run_tunnel_bytes=tunnel)
+                               budget_run_tunnel_bytes=tunnel, budget_run_usd_micros=grant["budget_run_usd_micros"])
     conn.execute("SAVEPOINT agent_launch")
     try:
         taken = accounting.reserve(conn, occ, executor, limits=limits)

@@ -150,7 +150,8 @@ _END_STRIPES = 64
 def verify_point_of_use(proof: C.LinkProof, exposure: Optional[ActionExposure], *,
                         replay: Callable[[], Any], now: Callable[[], datetime],
                         bar_of: Callable[[str], tuple[bool, int]],
-                        verify_sig: Optional[Callable[..., bool]] = None, rejudge: bool = False) -> None:
+                        verify_sig: Optional[Callable[..., bool]] = None, rejudge: bool = False,
+                        billing: str = "subscription") -> None:
     """The run server's whole authority check for one fire. Raises :class:`LauncherRefused` (standing, or transient for
     a ledger or store that cannot be read); returns None when the fire may go on.
 
@@ -164,7 +165,10 @@ def verify_point_of_use(proof: C.LinkProof, exposure: Optional[ActionExposure], 
     2. each row's SSHSIG verifies under the enrolled public key of its signer, and that signer is still active;
     3. the link is unexpired, was born after its agent's last revoke and after the last closed bar's revoke
        (:func:`levain.authority.agent_link_arms`), and the agent has no open bar (``bar_of``);
-    4. the requested exposure (calls and tunnel bytes) is inside the link's per-run budgets, on a subscription link.
+    4. the link's billing is the launcher's (``billing``: ``subscription`` for the passthrough launcher, ``api_key`` for the
+       brokered one). A subscription link: the requested exposure (calls and tunnel bytes) is inside its per-run budgets.
+       An api_key link: no action exposure, and the per-run dollar figure he signed is above 0 (the share itself is that
+       figure, read from the link, never from the fire).
 
     ``rejudge=True`` (the SYNC re-judge of a session that is already running, never a LAUNCH or a RELEASE; the server
     sets it, a frame never does) changes two things, and only these:
@@ -218,9 +222,17 @@ def verify_point_of_use(proof: C.LinkProof, exposure: Optional[ActionExposure], 
             else _auth.agent_link_arms(state, proof.link_id, now=now(), closed_bar_revoke_seq=closed))
     if not live:
         raise LauncherRefused("link-not-live", "the link is expired or was revoked")
-    billing, calls, tunnel = _auth.agent_link_terms(grant)
-    if billing != "subscription":
-        raise LauncherRefused("link-not-subscription", "the link is not a subscription link")
+    link_billing, calls, tunnel = _auth.agent_link_terms(grant)
+    if link_billing != billing:
+        raise LauncherRefused("link-billing-not-the-launchers", f"the link is a {link_billing} link, this launcher's is {billing}")
+    if billing == "api_key":
+        # no action caps on an api_key link: the share is the dollar figure he signed, read from his verified link here
+        # and never sent by the fire. A link signing 0 can fund no run.
+        if exposure is not None:
+            raise LauncherRefused("exposure-over-link", "an api_key run carries no action exposure")
+        if not grant["budget_run_usd_micros"] > 0:
+            raise LauncherRefused("link-run-budget-zero", "the link signs no dollars for a run")
+        return
     if exposure is None or exposure.tunnel_bytes is None or exposure.actions > calls or exposure.tunnel_bytes > tunnel:
         raise LauncherRefused("exposure-over-link", "the requested exposure is not inside the link's per-run budgets")
 

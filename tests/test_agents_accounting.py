@@ -13,7 +13,7 @@ from levain.agents.store import open_agent_store
 
 WINDOW = "d:2026-11-02"
 LIMITS = Limits(run_ceiling=1, budget_window_usd_micros=10_000, scheduled_window_key=WINDOW,
-                span_start="2026-11-02T00:00:00Z", span_end="2026-11-03T00:00:00Z")
+                span_start="2026-11-02T00:00:00Z", span_end="2026-11-03T00:00:00Z", budget_run_usd_micros=10_000)
 
 
 class _Exec:
@@ -67,8 +67,8 @@ def test_a_ceiling_of_one_admits_exactly_one_of_two_contending_launches(store):
     # an executor stating no exposure is refused, and nothing is written for it
     with store.write() as conn:
         third = _admit(conn, 3)
-        assert reserve(conn, third, _Exec(None), limits=Limits(5, 10**9, WINDOW, "a", "z")) == Refused("no_exposure")
-        assert reserve(conn, third, _Exec(1000), limits=Limits(5, 1500, WINDOW, "a", "z")) == Refused("budget_window")
+        assert reserve(conn, third, _Exec(None), limits=Limits(5, 10**9, WINDOW, "a", "z", budget_run_usd_micros=10**9)) == Refused("no_exposure")
+        assert reserve(conn, third, _Exec(1000), limits=Limits(5, 1500, WINDOW, "a", "z", budget_run_usd_micros=1500)) == Refused("budget_window")
 
 
 def test_an_open_reservation_left_by_a_crash_settles_whole_on_recovery(store):
@@ -128,7 +128,7 @@ def test_amounts_past_the_sqlite_integer_range_refuse_or_saturate_and_the_window
 def test_a_manual_run_stamped_with_an_offset_counts_at_its_instant(store):
     # 20:00-05:00 on the 2nd is 01:00Z on the 3rd: inside the 3rd's span although its text sorts before it
     day3 = Limits(run_ceiling=5, budget_window_usd_micros=10_000, scheduled_window_key=None,
-                  span_start="2026-11-03T00:00:00Z", span_end="2026-11-04T00:00:00Z")
+                  span_start="2026-11-03T00:00:00Z", span_end="2026-11-04T00:00:00Z", budget_run_usd_micros=10_000)
     with store.write() as conn:
         first = _admit(conn, 1, "manual", "m:2026-11-03", "2026-11-02T20:00:00-05:00")
         second = _admit(conn, 2, "manual", "m:2026-11-03", "2026-11-03T02:00:00Z")
@@ -138,7 +138,7 @@ def test_a_manual_run_stamped_with_an_offset_counts_at_its_instant(store):
 
 def test_a_manual_run_whose_stamp_cannot_be_parsed_counts_against_the_ceiling(store):
     day = Limits(run_ceiling=1, budget_window_usd_micros=10_000, scheduled_window_key=None,
-                 span_start="2026-11-02T00:00:00Z", span_end="2026-11-03T00:00:00Z")
+                 span_start="2026-11-02T00:00:00Z", span_end="2026-11-03T00:00:00Z", budget_run_usd_micros=10_000)
     with store.write() as conn:
         first = _admit(conn, 1, "manual", "m:2026-11-02", "2026/11/02 10:00")
         assert reserve(conn, first, _Exec(1000), limits=day) == Reserved(1000)
@@ -183,3 +183,18 @@ def test_stop_result_is_frozen_and_a_stub_that_cannot_observe_returns_terminated
     assert isinstance(Blind(), Executor) and result.terminated is False
     with pytest.raises(dataclasses.FrozenInstanceError):
         result.terminated = True   # type: ignore[misc]
+
+
+def test_an_api_key_exposure_above_the_links_per_run_figure_refuses_and_writes_nothing(store):
+    """152a / S-B1: the 'at most $X a run' sentence on the card he signs is enforced here, not only shown. Equal passes;
+    one micro-dollar over refuses ``run_budget`` BEFORE the window check (the window is wide enough to hold it); a
+    caller that never read the signed figure (the default 0) refuses any dollar exposure."""
+    wide = Limits(run_ceiling=5, budget_window_usd_micros=10**9, scheduled_window_key=WINDOW,
+                  span_start="2026-11-02T00:00:00Z", span_end="2026-11-03T00:00:00Z", budget_run_usd_micros=2_000)
+    with store.write() as conn:
+        assert reserve(conn, _admit(conn, 1), _Exec(2_001), limits=wide) == Refused("run_budget")
+        assert conn.execute("SELECT COUNT(*) FROM agent_reservations").fetchone()[0] == 0
+        assert reserve(conn, _admit(conn, 2), _Exec(2_000), limits=wide) == Reserved(2_000)
+        unread = Limits(run_ceiling=5, budget_window_usd_micros=10**9, scheduled_window_key=WINDOW,
+                        span_start="2026-11-02T00:00:00Z", span_end="2026-11-03T00:00:00Z")
+        assert reserve(conn, _admit(conn, 3), _Exec(1), limits=unread) == Refused("run_budget")

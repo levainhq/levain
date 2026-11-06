@@ -172,17 +172,18 @@ def test_every_predicate_refusal_ends_stopped_with_its_reason_and_takes_nothing(
     _stopped(rig, oid, case, rig.launch(oid, later=later))
 
 
-@pytest.mark.parametrize("case", ["budget_window", "no_exposure", "ceiling"])
+@pytest.mark.parametrize("case", ["budget_window", "run_budget", "no_exposure", "ceiling"])
 def test_a_budget_or_ceiling_refusal_ends_skipped_budget_and_takes_nothing(rig, case):
     # behaviour: admitted -> skipped-budget with accounting.reserve's reason; the limits are the admitted link's signed
-    # terms (window 5_000_000 micros, run_ceiling 1 here), and the refused launch holds no slot and no reservation
-    rig.link(run_ceiling=1)
+    # terms (window 5_000_000 micros, run_ceiling 1 here), and the refused launch holds no slot and no reservation.
+    # The per-run figure is signed wide except in the run_budget case, so the window refusal is the window's own.
+    rig.link(run_ceiling=1, budget_run_usd_micros=1_000_000 if case == "run_budget" else 10_000_000)
     if case == "ceiling":
         first = rig.claim("k0")
         assert rig.launch(first).outcome == "launched"
         rig.finish(first)
     oid = rig.claim("k")
-    executor = {"budget_window": Exec(10_000_000), "no_exposure": Exec(None), "ceiling": Exec()}[case]
+    executor = {"budget_window": Exec(10_000_000), "run_budget": Exec(1_000_001), "no_exposure": Exec(None), "ceiling": Exec()}[case]
     result = rig.launch(oid, executor)
     assert (result.outcome, result.reason) == ("skipped-budget", case)
     row = rig.row(oid)
@@ -1105,7 +1106,7 @@ def test_the_launchs_refusals_run_before_the_hook_and_are_reported_as_themselves
     # refusal is written as the refusal, never as quiet. (Before r1 the hook ran first: "even with no link to admit"
     # a False answer ended the row skipped-no-input.)
     if case != "no_link":
-        rig.link()
+        rig.link(**({"budget_run_usd_micros": 10_000_000} if case == "budget" else {}))
     oid = rig.claim("k")
     if case == "barred":
         with rig.store.write() as c:

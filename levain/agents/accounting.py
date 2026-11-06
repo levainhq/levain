@@ -114,6 +114,10 @@ class Limits:
 
     ``billing`` and the two per-run action caps are the link's (P7-A §2.2): an ``api_key`` link carries zero caps and a
     ``subscription`` link carries positive ones and zero dollar budgets. The defaults are the shipped link's reading.
+
+    ``budget_run_usd_micros`` is the link's signed per-run dollar figure, the most ONE run's exposure may be on an
+    ``api_key`` link. Its default is 0 on purpose: a caller that does not read the signed figure refuses every dollar
+    exposure rather than leaving the figure he signed unenforced. A subscription link signs 0 and reserves no dollars.
     """
     run_ceiling: int
     budget_window_usd_micros: int
@@ -123,6 +127,7 @@ class Limits:
     billing: str = "api_key"
     budget_run_calls: int = 0
     budget_run_tunnel_bytes: int = 0
+    budget_run_usd_micros: int = 0
 
 
 @dataclass(frozen=True)
@@ -133,7 +138,7 @@ class Reserved:
 @dataclass(frozen=True)
 class Refused:
     """The launch is refused and nothing was taken. The occurrence's terminal state is ``skipped-budget`` (A0 §2.5)
-    and ``reason`` is one of ``no_exposure``, ``ceiling``, ``budget_window`` or ``already_reserved``."""
+    and ``reason`` is one of ``no_exposure``, ``run_budget``, ``ceiling``, ``budget_window`` or ``already_reserved``."""
     reason: str
     state: str = "skipped-budget"
 
@@ -213,7 +218,8 @@ def reserve(conn: sqlite3.Connection, occurrence: Mapping | sqlite3.Row, executo
     """Take the hard maximum exposure for ``occurrence``, in the caller's open write transaction.
 
     Refused (fail-closed, nothing written) when the executor states no non-negative integer exposure, when the
-    agent's launched runs in the window already meet the signed ceiling, or when the window's spend, its open
+    agent's launched runs in the window already meet the signed ceiling, when an ``api_key`` exposure is above the link's
+    signed per-run figure, or when the window's spend, its open
     reservations and this exposure would pass the signed window budget. Spend is what settled reservations debited
     plus what open ones hold, over the same runs the ceiling counts.
 
@@ -240,6 +246,8 @@ def reserve(conn: sqlite3.Connection, occurrence: Mapping | sqlite3.Row, executo
         exposure = getattr(executor, "max_exposure_usd_micros", None)
         if not _is_amount(exposure) or exposure > _MAX_MICROS:
             return Refused("no_exposure")
+        if not _is_amount(limits.budget_run_usd_micros) or exposure > limits.budget_run_usd_micros:
+            return Refused("run_budget")
     # a reservation commits only with its launch (one transaction), so a reserved occurrence is launched, and the
     # transition trigger refuses launched -> skipped-budget: a caller applying this Refused.state cannot end a live row
     if conn.execute("SELECT 1 FROM agent_reservations WHERE occurrence_id = ?", (me,)).fetchone() is not None:

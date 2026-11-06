@@ -6,6 +6,9 @@ All notable changes to Levain. Format is loosely [Keep a Changelog](https://keep
 
 ## [Unreleased]
 
+### Changed
+- **The per-run dollar figure on an `api_key` agent link is now enforced at launch, not only shown on the card.** The signing card says "at most $X a run"; until now nothing held it, `reserve()` bounded only the window. An `api_key` exposure above the link's signed `budget_run_usd_micros` now ends `skipped-budget` / `run_budget` and writes nothing. A link that signs less than a run needs (the dream's per-run limit is $20.00) refuses on its next fire, which is the card's own promise. The run server's point-of-use check now judges the link's billing against the launcher's (`link-billing-not-the-launchers`, replacing `link-not-subscription`) and refuses an `api_key` link that signs a zero figure (`link-run-budget-zero`); the brokered launcher itself is not in this release.
+
 ### Fixed
 - **`levain dream enable` on a store whose agent-schema marker had moved now ends in the one plain refusal, not a raw store exception.** `register_dream` wrapped only its last store call; the earlier ones (default zone, held names, the same-content look, the role write) ran the same marker check outside the guard, so a marker moved before the call escaped as `AgentStoreRefused` instead of `EnableRefused`. Every store call now sits inside the guard.
 

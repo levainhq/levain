@@ -1364,3 +1364,39 @@ def test_the_expected_log_is_the_path_the_unit_gives_launchd(monkeypatch):
     from levain.slot import units
     monkeypatch.setattr(D, "_host", lambda: "darwin")
     assert D._expected_log() == units.launchd_log_path(units.by_name("dispatch_run"))
+
+
+# --- S-B1 (152a): step 4 judges the link's billing against the LAUNCHER's ---------------------------------------------------
+
+def test_an_api_key_link_passes_for_an_api_key_launcher_with_no_action_exposure(rig):
+    oid = _occurrence(rig, billing="api_key")
+    assert _check(rig, _proof(rig, oid), None, billing="api_key") is None
+
+
+@pytest.mark.parametrize("link_billing,launcher,exposure", [("api_key", "subscription", EXP), ("subscription", "api_key", None)])
+def test_a_link_whose_billing_is_not_the_launchers_is_refused(rig, link_billing, launcher, exposure):
+    oid = _occurrence(rig, billing=link_billing, exposure=EXP) if link_billing == "subscription" else _occurrence(rig, billing="api_key")
+    with pytest.raises(D.LauncherRefused) as caught:
+        _check(rig, _proof(rig, oid), exposure, billing=launcher)
+    assert caught.value.name == "link-billing-not-the-launchers"
+
+
+def test_an_api_key_launcher_refuses_an_action_exposure_and_a_zero_dollar_link(rig):
+    oid = _occurrence(rig, billing="api_key")
+    proof = _proof(rig, oid)
+    with pytest.raises(D.LauncherRefused) as caught:
+        _check(rig, proof, EXP, billing="api_key")
+    assert caught.value.name == "exposure-over-link"
+    real = rig.authority.replay()
+
+    class Zeroed:                       # the replayed state, but the figure he signed on this link reads zero
+        policy = type("P", (), {"grants": {**real.policy.grants,
+                                            proof.link_id: {**real.policy.grants[proof.link_id], "budget_run_usd_micros": 0}}})()
+
+        def __getattr__(self, name):
+            return getattr(real, name)
+
+    with pytest.raises(D.LauncherRefused) as caught:
+        D.verify_point_of_use(proof, None, replay=lambda: Zeroed(), now=rig.now, bar_of=D.agent_store_bar(rig.store.path),
+                              billing="api_key")
+    assert caught.value.name == "link-run-budget-zero"
