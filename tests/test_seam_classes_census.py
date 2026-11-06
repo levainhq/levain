@@ -158,10 +158,10 @@ def _declared(statements: tuple[str, ...]) -> list[tuple[str, str]]:
 
 
 def test_the_name_scan_reads_every_statement_and_catches_a_seeded_duplicate() -> None:
-    # the lists as measured: every statement names an object (272 in all), so the scan below skips nothing
+    # the lists as measured: every statement names an object (the total is the sum of the second numbers below), so the scan below skips nothing
     assert {k: (len(v), len(_declared(v))) for k, v in _DISPATCH_DB_LISTS.items()} == {
         "dispatch.jobs._SCHEMA": (57, 57), "store.SCHEMA": (28, 28), "lease.LEASE_SCHEMA": (33, 33),
-        "teamdrafts.DRAFT_SCHEMA": (9, 9), "review.REVIEW_SCHEMA": (15, 15),
+        "teamdrafts.DRAFT_SCHEMA": (9, 9), "review.REVIEW_SCHEMA": (16, 16),
         "first_reader.FIRST_READER_SCHEMA": (16, 16), "ready.LIFECYCLE_SCHEMA": (10, 10),
         "work_delta.OPERATOR_VIEWS_SCHEMA": (4, 4), "store.SEAM_SCHEMA": (4, 4),
         "seam_handoffs.SEAM_HANDOFF_SCHEMA": (8, 8), "seam_open.OPEN_SCHEMA": (21, 21),

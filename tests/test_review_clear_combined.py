@@ -78,12 +78,15 @@ def _pre_r4_store(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> tuple[Path
         a, _ = review.file_item(store, "seat", {"text": "a"}, dedupe_key="a")
         b, _ = review.file_item(store, "seat", {"text": "b"}, dedupe_key="b")
         c, _ = review.file_item(store, "doubt", {"text": "c"}, dedupe_key="c", authority_relevant=True)
-        d, _ = review.file_item(store, "seat", {"text": "d"}, dedupe_key="d")
+        # d is filed BY the coordinator (a doubt, with the lease token): the coordinator's mode now clears only an item
+        # the coordinator filed, so an old-schema store holding a coordinator clear needs d to be the coordinator's own.
+        # The fixture's purpose is unchanged: an OLD-schema store with every kind of event row.
+        tok = store.coord_take()
+        d, _ = review.file_item(store, "doubt", {"text": "d"}, dedupe_key="d", by="coordinator", token=tok)
         review.clear_item(store, a.item_id)
         review.clear_item(store, b.item_id, mode="fresh")
         review.reopen_item(store, b.item_id)
         review.clear_item(store, c.item_id)
-        tok = store.coord_take()
         review.clear_item(store, d.item_id, mode="coordinator", token=tok)
         _strip_s0(store.path)
         assert _snapshot(store.path)["columns"] == ["item_id", "seq", "op", "mode", "by", "at"]
