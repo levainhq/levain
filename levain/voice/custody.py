@@ -34,6 +34,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
+from levain import pathid
 from levain.authority import (VOICE_KEY_KIND, VOICE_KEY_PROVIDERS, VOICE_KEY_USES, AuthorityError, _thaw, anchor_path,
                               append, prepare, voice_key_for, voice_key_record)
 from levain.authority_sig import VerifierUnavailable
@@ -123,8 +124,9 @@ def checked_security(path: str | Path | None = None) -> str:
     chosen = DEFAULT_SECURITY if path is None else str(path)
     if under_test_run():
         try:
-            real = Path(_REAL_SECURITY).resolve()
-            same = Path(chosen).expanduser().resolve() == real
+            # by the filesystem's own spelling, not the one given: `resolve()` keeps `/USR/BIN/SECURITY` as typed (casesweep
+            # row 14, key 1106-1). DENY direction: an unreadable spelling still refuses (the except below).
+            same = pathid.canonical(Path(chosen).expanduser()) == pathid.canonical(_REAL_SECURITY)
         except (OSError, RuntimeError):
             same = True                     # cannot tell: under a test run that is a refusal
         if same:
