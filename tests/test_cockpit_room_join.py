@@ -413,7 +413,7 @@ def test_the_real_page_opens_the_room_sends_and_shows_the_reply(tmp_path, qdir):
             {"until": "!window.__pre && document.querySelector('.rv-zone') && document.querySelector('[data-mode-tab=build]')"},
             {"do": "document.querySelector('[data-mode-tab=build]').click(); 1",
              "until": "document.querySelector('.rv-zone .rv-open') && !document.querySelector('.rv-zone .rv-open').hidden"},
-            {"eval": "JSON.stringify({send: document.querySelector('.rv-send').disabled, drop: document.querySelector('.rv-drop').disabled,"
+            {"eval": "JSON.stringify({send: document.querySelector('.rv-send').disabled,"
                      " stop: document.querySelector('.rv-stop').disabled, input: document.querySelector('.rv-input').disabled,"
                      " rotate: document.querySelector('.rv-rotate').disabled})"},
             {"eval": "document.querySelector('.rv-open').click(); 1"},
@@ -424,7 +424,7 @@ def test_the_real_page_opens_the_room_sends_and_shows_the_reply(tmp_path, qdir):
         ])
         mine = [i for i in _get(base)[1]["stream"] if i["kind"] == "message"]
     dark = json.loads(next(v for v in out["values"] if isinstance(v, str) and v.startswith("{")))
-    assert dark == {"send": True, "drop": True, "stop": True, "input": True, "rotate": True}, dark
+    assert dark == {"send": True, "stop": True, "input": True, "rotate": True}, dark
     assert [m["body"] for m in mine] == ["hello page"]
 
 
