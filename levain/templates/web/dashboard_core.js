@@ -6758,7 +6758,7 @@
     grid.dataset.layout = prefs.layout;
     grid.setAttribute("role", "tabpanel");
     drawNeedsList(grid, prefs.tab === "desk" ? desk : items, prefs, rowOf);
-    const kids = prefs.tab === "you" ? [head, needsBar(items), grid] : [head, grid];   // the filter chips are the Needs you list's
+    const kids = [head, needsBar(items), grid];   // the bar is CSS-hidden on Board and is the only Needs surface on Build and Memory, whichever tab is picked
     if (settled.length) kids.push(answeredSection());
     host.replaceChildren(...kids);
     host.hidden = false;
