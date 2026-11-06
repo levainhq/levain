@@ -315,10 +315,26 @@ _COCKPIT_PAGE_CSP = _CSP + "; frame-src 'self'"
 
 # the one query a cross-site navigation to the cockpit page may carry: a push tap's own deep link (``/?view=notifications``
 # with an optional ``&n=<item id>``, or ``/?view=needs``), exactly the shapes the sender builds (center.push_url, held's
-# summary urls). 1105-7: a tap that reaches Chrome as a launcher intent (an intent-launched navigation was measured on an
+# summary urls; plus ``/?view=needs&item=<id>``, below). 1105-7: a tap that reaches Chrome as a launcher intent (an intent-launched navigation was measured on an
 # Android emulator) arrives ``Sec-Fetch-Site: cross-site``, and the bare-``/`` rule alone answered it a plain-text 403.
 # Every parameter is named and bounded, so a pair code, a token or any other query on ``/`` stays refused.
 _PUSH_TAP_QUERY = re.compile(r"view=(?:needs|notifications(?:&n=[pn][1-9][0-9]{0,17})?)")
+# the one more shape: a deep link to a single Needs-you card, ``/?view=needs&item=<id>`` (a card that has no sign request cannot
+# be reached by ``/sign/<id>``). Checked by parsing, never by substring: exactly the two keys, in this order, each once, ``view``
+# equal to ``needs``, ``item`` a bounded id, and no percent-escape or ``+`` (the raw query must be what it decodes to).
+_NEEDS_ITEM_ID = re.compile(r"[A-Za-z0-9_.:-]{1,64}")
+
+
+def _needs_item_query(query: str) -> bool:
+    """True for exactly ``view=needs&item=<id>`` (see :data:`_NEEDS_ITEM_ID`); every other query is False."""
+    if "%" in query or "+" in query or ";" in query:
+        return False
+    try:
+        pairs = urllib.parse.parse_qsl(query, keep_blank_values=True, strict_parsing=True, max_num_fields=2)
+    except ValueError:
+        return False
+    return (len(pairs) == 2 and pairs[0] == ("view", "needs") and pairs[1][0] == "item"
+            and _NEEDS_ITEM_ID.fullmatch(pairs[1][1]) is not None)
 
 
 def _sheet_id(path: str) -> "str | None":
@@ -1938,7 +1954,7 @@ class _Handler(GuardedHandler):
     def _push_tap_path(self) -> bool:
         """True for ``/?<a push tap's deep link>`` (see :data:`_PUSH_TAP_QUERY`): the exact raw path, no other parameter."""
         path, sep, query = self.path.partition("?")
-        return path == "/" and bool(sep) and _PUSH_TAP_QUERY.fullmatch(query) is not None
+        return path == "/" and bool(sep) and (_PUSH_TAP_QUERY.fullmatch(query) is not None or _needs_item_query(query))
 
     def _cross_site_pair_navigation(self) -> bool:
         """P2 L3 r1 F1: a pair link opened from webmail or another site is a top-level ``GET /pair`` navigation and

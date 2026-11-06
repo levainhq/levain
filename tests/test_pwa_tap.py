@@ -63,3 +63,32 @@ def test_the_query_admission_is_the_taps_own_two_parameters_and_nothing_else(tmp
         assert _get(port, tap, {**NAV, "Sec-Fetch-Dest": "iframe"})[0] == 403
         assert _get(port, tap, NAV, method="HEAD")[0] == 403
         assert _get(port, tap, {**NAV, "Host": "evil.example"})[0] == 403
+
+
+def test_the_needs_item_deep_link_is_admitted_in_exactly_its_own_shape(tmp_path: Path) -> None:
+    """`/?view=needs&item=<id>` opens one Needs-you card (a row with no sign request has no /sign/<id>): admitted cross-site for
+    a bounded id and nothing else."""
+    src = _install(tmp_path)[1]
+    with _serve(src) as (port, _):
+        for ok in ("/?view=needs&item=q-abc123", "/?view=needs&item=np-4e087a4f", "/?view=needs&item=consent:cr-1.x_2",
+                   "/?view=needs&item=" + "a" * 64):
+            assert _get(port, ok, NAV)[0] == 200, ok
+        for bad in ("/?view=needs&item=x&y=1", "/?item=x", "/?view=board&item=x", "/?view=needs&item=a<b",
+                    "/?view=needs&item=a%20b", "/?view=needs&item=%3Cx", "/?view=needs&item=", "/?view=needs&item=" + "a" * 65,
+                    "/?item=x&view=needs", "/?view=needs&item=x&item=y", "/?view=needs&item=x&view=needs",
+                    "/?view=notifications&item=x", "/?view=needs&item=x;y", "/?view=needs&item=a+b", "/?view=needs&item=a/b",
+                    "/?view=needs&n=n12", "/x?view=needs&item=x", "/?view=needs&item=x#y&z=1&write_token=T"):
+            assert _get(port, bad, NAV)[0] == 403, bad
+        tap = "/?view=needs&item=q-abc123"
+        assert _get(port, tap, {**NAV, "Sec-Fetch-Mode": "cors", "Sec-Fetch-Dest": "empty"})[0] == 403
+        assert _get(port, tap, {**NAV, "Sec-Fetch-Dest": "iframe"})[0] == 403
+        assert _get(port, tap, NAV, method="HEAD")[0] == 403
+        assert _get(port, tap, {**NAV, "Host": "evil.example"})[0] == 403
+
+
+def test_the_needs_item_query_check_refuses_a_raw_space_and_every_other_shape() -> None:
+    from levain.web_server import _needs_item_query as ok   # the client cannot send a raw space, so the parser is asked directly
+    assert ok("view=needs&item=q-abc") and ok("view=needs&item=consent:a.b_c-1")
+    for bad in ("view=needs&item=a b", "view=needs&item=a<b", "view=needs&item=x&y=1", "item=x", "view=board&item=x", "view=needs", "",
+                "view=needs&item=a\nb", "view=needs&item=é"):
+        assert not ok(bad), bad

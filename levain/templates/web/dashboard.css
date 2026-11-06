@@ -3503,3 +3503,5 @@ a.nc-pick.is-rec:hover { border-color: var(--text); }
   min-height: var(--hit-min); padding: var(--sp-3) var(--sp-5); border: 1px solid var(--accent-line); border-radius: var(--r-lg);
   background: var(--accent-soft); color: var(--text); font: var(--fw-semibold) var(--fs-lead)/var(--lh-tight) var(--sans);
   text-align: center; box-shadow: var(--shadow-overlay); cursor: pointer; }
+
+.needs-gone-note { margin: 8px 0; padding: 8px 12px; border-left: 3px solid var(--accent); }
