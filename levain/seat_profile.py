@@ -23,12 +23,12 @@ from pathlib import Path
 from typing import Any, Mapping, Sequence
 
 from levain import host_guard as hg
+from levain.authority import SEAT_LEASE_KIND
 from levain.host_guard import (CC_SEAT_TOOLS, PROTECTED_NAMES, SEAT_SOURCE_ARGS, HostRefusal)
 
 __all__ = ["SeatRefusal", "SeatProfile", "seat_deny_write", "seat_permission_deny", "build_seat_profile",
            "CANARY_DIRNAME", "FILE_TOOLS", "SEAT_LEASE_KIND"]
 
-SEAT_LEASE_KIND = "seat-root-lease"
 CANARY_DIRNAME = "levain-seat-canary"
 #: All four file tools are named in every deny, so a later re-admission inherits it.
 FILE_TOOLS = ("Edit", "Write", "MultiEdit", "NotebookEdit")

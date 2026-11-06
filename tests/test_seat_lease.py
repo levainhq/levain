@@ -163,3 +163,11 @@ def test_a_lease_whose_key_is_not_the_launchers_refuses(rig):
     sl.ensure_launcher_key(rig.key_dir)                              # a different key under the same dir
     with pytest.raises(sl.SeatLaunchRefused, match="not the one the lease pins"):
         rig.launch()
+
+
+def test_the_lease_kind_has_one_definition_authority_owns():
+    import levain.authority as authority
+    import levain.seat_lease as seat_lease
+    import levain.seat_profile as seat_profile
+    assert seat_profile.SEAT_LEASE_KIND is authority.SEAT_LEASE_KIND
+    assert seat_lease.SEAT_LEASE_KIND is authority.SEAT_LEASE_KIND
