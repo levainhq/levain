@@ -10,6 +10,7 @@ Everything here is synthetic: a ``ps`` table text, tty access times and a laptop
 """
 from __future__ import annotations
 
+import sys
 import time
 
 import pytest
@@ -186,6 +187,7 @@ def test_linux_ps_no_tty_marker_is_not_a_tty(monkeypatch):
     assert "agent view client pts/2 reached from mosh-server" in (reason() or "")
 
 
+@pytest.mark.skipif(sys.platform != "darwin", reason="the premise (a pty read moves atime) was measured on macOS; the detector is a macOS path")
 def test_the_real_kernel_moves_a_pty_atime_on_read_within_the_tie_bound():
     # the tie's premise, against the kernel and a pty this test opens (never anyone's terminal)
     import os
