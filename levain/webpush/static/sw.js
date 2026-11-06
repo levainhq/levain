@@ -6,7 +6,7 @@
 // whichever opens first creates the store; correctness depends on no timing (an unread key waits for the next trigger).
 const DB = 'levain-sw-2', STORE = 'opened';
 // A short id of this worker's code, recorded in the trace so a device's trace says which worker ran.
-const SW_VERSION = '1106-51-shown-1';
+const SW_VERSION = '1106-51-shown-2';
 // The TRACE: an append-only ring in its own cache, one entry per step, key TRACE_PREFIX + <time ms, zero padded> + '-' +
 // <seq>, value JSON {t, src, step, ...detail}. The /tap_trace page and sw_open.js read and write the same ring. Writes are
 // best effort, serialized on one chain, never awaited by the tap, and carry only urls without fragments, counts and step
@@ -584,17 +584,25 @@ self.addEventListener('push', (e) => {
   // a fixed tag with renotify: a re-ping for the same item replaces the earlier notification and alerts again. The
   // notification is asked for FIRST, before any trace or receipt, and never waits on either; it does not race the
   // receipt budget (only receipts do)
+  // The launch fallback's entry (sw_open.js) is made DURABLE BEFORE the notification can be tapped: its write starts first and the
+  // show waits for it, at most SHOWN_WRITE_WAIT_MS (a slow cache never delays the notification beyond that). A show that
+  // rejects takes its entry away again (below), so an entry never outlives a notification that was not drawn.
+  const pend = startShownPending(d);
+  const ask = () => self.registration.showNotification(title, {
+    body: d.body || '',
+    tag: d.tag || 'levain',
+    renotify: true,
+    icon: '/icon-192.png',
+    badge: '/badge-96.png',   // monochrome alpha: Android draws only the alpha channel in the status bar
+    data: { url: d.url || '/', ping: d.ping },
+  });
   let shown;
-  try {
-    shown = Promise.resolve(self.registration.showNotification(title, {
-      body: d.body || '',
-      tag: d.tag || 'levain',
-      renotify: true,
-      icon: '/icon-192.png',
-      badge: '/badge-96.png',   // monochrome alpha: Android draws only the alpha channel in the status bar
-      data: { url: d.url || '/', ping: d.ping },
-    }));
-  } catch (err) { shown = Promise.reject(err); }
+  if (!pend) {
+    try { shown = Promise.resolve(ask()); } catch (err) { shown = Promise.reject(err); }
+  } else {
+    shown = (async () => { await waitBounded(pend.written, SHOWN_WRITE_WAIT_MS); return ask(); })();
+  }
+  const shownCleanup = pend ? shown.then(null, () => waitBounded(pend.written, SHOWN_WRITE_WAIT_MS).then(() => dropKey(pend.key))) : undefined;
   const badged = applyBadge(d.badge);   // after the notification is asked for; its failure is its own
   trace('sw-version', { version: SW_VERSION, on: 'push' });
   trace('push', { tag: traceScalar(d.tag || 'levain'), ping: traceScalar(d.ping) });
@@ -611,8 +619,7 @@ self.addEventListener('push', (e) => {
                                    .catch(() => false)]);   // total: a throw in this arm would reject Promise.all, and the budget's end would abort `received` too
     if (r.some((x) => x === true)) await drainReceipts(b);
   });
-  const shownPending = putShownPending(d);   // the launch fallback (sw_open.js): best effort and total, after the show was asked
-  e.waitUntil(Promise.allSettled([shown, badged, receipts, shownPending]).finally(traceSettled));
+  e.waitUntil(Promise.allSettled([shown, badged, receipts, shownCleanup, pend && waitBounded(pend.pruned, 2 * SHOWN_WRITE_WAIT_MS)]).finally(traceSettled));
   shown.catch((err) => trace('show-failed', { error: err && err.name || 'error' }));
 });
 
@@ -639,40 +646,84 @@ async function dropPending(key) {
   return c.delete(key);
 }
 // for: 'shown' = the launch fallback for a tap whose notificationclick never runs (iOS Home Screen app, 2026-11-06: pings 607-609
-//                were shown, no click step, the app opened at '/'). Written by the push event AFTER the notification was asked for,
-//                under ONE fixed key (a newer push replaces the older entry: at most one is kept), value {url, nonce, at, for,
-//                ping, tag}. Only a page's first load may take it (sw_open.js), and only at a bare standalone '/' within
-//                SHOWN_TTL_MS with the notification gone from the tray. A click that does run deletes it (dropShownPending).
-const SHOWN_KEY = OPEN_PREFIX + 'shown';
-async function putShownPending(d) {
+//                were shown, no click step, the app opened at '/'). ONE IMMUTABLE ENTRY PER PING, key OPEN_PREFIX + 'shown-' +
+//                ping + '-' + nonce, value {url, nonce, at, for, ping, tag}: a later push writes another key and never replaces
+//                or races an earlier one, and every delete names exactly the key it read (the page) or its own ping's keys (a
+//                click). Written BEFORE the notification can be tapped (see the push handler) and removed if the show rejects.
+//                At most SHOWN_MAX are kept (the oldest go). Only a page's first load may take one (sw_open.js), and only at a
+//                bare standalone '/' within SHOWN_TTL_MS with the ping's notification gone from the tray. A click that does run
+//                deletes its ping's entries (dropShownPending).
+const SHOWN_PREFIX = OPEN_PREFIX + 'shown-', SHOWN_MAX = 10, SHOWN_TTL_MS = 180000, SHOWN_WRITE_WAIT_MS = 1500;
+const waitBounded = (p, ms) => new Promise((res) => {
+  const t = setTimeout(res, ms);
+  p.then(() => { clearTimeout(t); res(); }, () => { clearTimeout(t); res(); });
+});
+// total: returns {key, written, pruned} (written resolves true once the entry is stored, never rejects), or null when this push gets no entry
+function startShownPending(d) {
   try {
-    if (!d || !d.url || typeof d.url !== 'string') return false;
+    if (!d || !d.url || typeof d.url !== 'string') return null;
     const tag = d.tag || 'levain';
-    if (tag === 'summary') return false;   // a held summary links a view and is no item (sender.py: tag = ref or kind)
+    if (tag === 'summary') return null;   // a held summary links a view and is no item (sender.py: tag = ref or kind)
     const ping = typeof d.ping === 'number' ? d.ping : Number(d.ping);
-    if (!Number.isInteger(ping) || ping <= 0) return false;   // the page cannot tell whether it was tapped without the ping
+    if (!Number.isInteger(ping) || ping <= 0) return null;   // the page cannot tell whether it was tapped without the ping
     let u;
     try { u = new URL(d.url, self.location.origin); } catch (_) { u = null; }
     const url = u && u.origin === self.location.origin ? u.pathname + u.search + u.hash : '/';
-    const c = await caches.open(OPEN_CACHE);
-    await c.put(SHOWN_KEY, new Response(JSON.stringify({ url, nonce: newNonce(), at: Date.now(), for: 'shown', ping, tag: String(tag) })));
-    trace('shown-pending', { ping, url: traceUrl(url) });
-    return true;
+    const nonce = newNonce();
+    const key = SHOWN_PREFIX + ping + '-' + nonce;
+    const entry = JSON.stringify({ url, nonce, at: Date.now(), for: 'shown', ping, tag: String(tag) });
+    const written = (async () => {
+      try {
+        const c = await caches.open(OPEN_CACHE);
+        await c.put(key, new Response(entry));
+        trace('shown-pending', { ping, url: traceUrl(url) });
+        return true;
+      } catch (err) {
+        trace('shown-pending-failed', { error: err && err.name || 'error' });
+        return false;
+      }
+    })();
+    const pruned = written.then((ok) => (ok ? pruneShown() : false)).catch(() => false);
+    return { key, written, pruned };
   } catch (err) {
     trace('shown-pending-failed', { error: err && err.name || 'error' });
-    return false;
+    return null;
   }
 }
-// a tap that DID fire its click owns the open: the 'shown' entry of that ping goes (a later bare launch is not redirected twice)
+async function shownKeys(c) {
+  return (await c.keys()).filter((r) => new URL(r.url).pathname.indexOf(SHOWN_PREFIX) === 0);
+}
+// keep the newest SHOWN_MAX live entries: older, expired and unreadable ones go (each delete names the request it read)
+async function pruneShown() {
+  try {
+    const c = await caches.open(OPEN_CACHE);
+    const rows = [];
+    for (const req of await shownKeys(c)) {
+      let at = null;
+      try { const r = await c.match(req); const e = r && await r.json(); at = e && typeof e.at === 'number' ? e.at : null; } catch (_) { at = null; }
+      if (at === null || Date.now() - at > SHOWN_TTL_MS) { await c.delete(req); continue; }
+      rows.push({ req, at });
+    }
+    rows.sort((x, y) => y.at - x.at);
+    for (const x of rows.slice(SHOWN_MAX)) await c.delete(x.req);
+    return true;
+  } catch (_) { return false; }
+}
+async function dropKey(key) {
+  try { const c = await caches.open(OPEN_CACHE); return await c.delete(key); } catch (_) { return false; }
+}
+// a tap that DID fire its click owns the open: that ping's entries go (a later bare launch is not redirected twice); other pings' stay
 async function dropShownPending(ping) {
   try {
     const n = typeof ping === 'number' ? ping : Number(ping);
     if (!Number.isInteger(n)) return false;
     const c = await caches.open(OPEN_CACHE);
-    const r = await c.match(SHOWN_KEY);
-    const e = r && await r.json();
-    if (!e || Number(e.ping) !== n) return false;
-    return await c.delete(SHOWN_KEY);
+    const mine = SHOWN_PREFIX + n + '-';
+    let any = false;
+    for (const req of await shownKeys(c)) {
+      if (new URL(req.url).pathname.indexOf(mine) === 0 && await c.delete(req)) any = true;
+    }
+    return any;
   } catch (_) { return false; }
 }
 const newNonce = () => Math.random().toString(36).slice(2) + Date.now().toString(36);

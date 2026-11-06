@@ -137,38 +137,58 @@
   }
   // The LAUNCH FALLBACK. On the iPhone Home Screen app a tapped push can open the app at the bare '/' without ever running the
   // worker's notificationclick (11-06: pings 607-609 shown, no click, no `opens` row), so the target is lost. The worker writes
-  // a 'shown' entry on every push (sw.js putShownPending). This document, at its first run, takes the newest one ONLY when
-  // everything says "launched by that tap": the page is exactly '/' (no query, no fragment), a standalone launch, the entry at
-  // most SHOWN_TTL_MS old and same-origin, and the notification it names is no longer in the tray (iOS dismisses a tapped
-  // one; a manual launch with the notification still showing must not redirect). Anything unknown (no registration, no
-  // getNotifications, a throw) fails toward the plain launch.
+  // ONE immutable 'shown' entry per ping (sw.js startShownPending). This document, at its first run, takes one ONLY when
+  // everything says "launched by that tap": the page is exactly '/' (no query, no fragment) and was not reloaded, a standalone
+  // launch, the entry at most SHOWN_TTL_MS old and same-origin, and the notification it names is no longer in the tray (iOS
+  // dismisses a tapped one; a manual launch with the notification still showing must not redirect). Every live entry is
+  // judged; when SEVERAL are gone from the tray (several pings were tapped away or dismissed) the NEWEST wins: it is the one on
+  // top of what he would have tapped. Anything unknown (no registration, no getNotifications, a throw) fails toward the plain
+  // launch. Deletes name exactly the requests this page read, so a push arriving meanwhile (its own key) is never touched.
+  // KNOWN, ACCEPTED EDGE: tray absence is not proof of a tap. A ping he swiped away, then an icon launch within SHOWN_TTL_MS,
+  // redirects to that ping's card. It lands inside his own cockpit and costs one tap to leave, and the evidence it replaces is
+  // that today the real tap lands nowhere; so the tray check stays and is not tightened further.
   async function takeShown(cache, entries, here) {
     if (!entries.length) return;
     const bare = here.pathname === "/" && !here.search && !here.hash;
     let standalone = false;
     try { standalone = !!((typeof matchMedia === "function" && matchMedia("(display-mode: standalone)").matches) || navigator.standalone); } catch (_) { standalone = false; }
     if (!bare || !standalone) { trace("shown-skip", { why: !bare ? "not-bare" : "not-standalone" }); return; }
-    entries.sort((x, y) => y.e.at - x.e.at);
-    const f = entries[0];
-    const age = Date.now() - f.e.at;
-    let u = null;
-    try { u = new URL(f.e.url, location.href); } catch (_) { u = null; }
-    if (!u || u.origin !== location.origin) { trace("shown-skip", { why: "cross-origin" }); return; }
-    if (age > SHOWN_TTL_MS) { trace("shown-skip", { why: "expired" }); return; }
-    const ping = Number(f.e.ping), tag = typeof f.e.tag === "string" ? f.e.tag : "";
-    if (!Number.isInteger(ping)) { trace("shown-skip", { why: "no-ping" }); return; }
-    let inTray;
+    // a reload at '/' is never a launch (when the Navigation Timing API says so)
+    let navType = null;
+    try { const n = typeof performance !== "undefined" && performance.getEntriesByType ? performance.getEntriesByType("navigation")[0] : null; navType = n && n.type || null; } catch (_) { navType = null; }
+    if (navType === "reload") { trace("shown-skip", { why: "reload" }); return; }
+    const live = [];
+    for (const f of entries) {
+      let u = null;
+      try { u = new URL(f.e.url, location.href); } catch (_) { u = null; }
+      if (!u || u.origin !== location.origin) { trace("shown-skip", { why: "cross-origin" }); continue; }
+      if (Date.now() - f.e.at > SHOWN_TTL_MS) { trace("shown-skip", { why: "expired" }); continue; }
+      const ping = Number(f.e.ping);
+      if (!Number.isInteger(ping)) { trace("shown-skip", { why: "no-ping" }); continue; }
+      live.push({ ...f, u, ping, tag: typeof f.e.tag === "string" ? f.e.tag : "" });
+    }
+    if (!live.length) return;
+    const gone = [];
     try {
       const sw = navigator.serviceWorker;
-      const reg = await Promise.race([sw.getRegistration ? sw.getRegistration() : sw.ready, new Promise((r) => setTimeout(() => r(null), 3000))]);
+      let timer;
+      const reg = await Promise.race([sw.getRegistration ? sw.getRegistration() : sw.ready, new Promise((r) => { timer = setTimeout(() => r(null), 3000); })]);
+      clearTimeout(timer);
       if (!reg || typeof reg.getNotifications !== "function") { trace("shown-skip", { why: "no-api" }); return; }
-      const list = Array.from(await reg.getNotifications({ tag }));
-      inTray = list.some((n) => n && n.data && Number(n.data.ping) === ping);
+      for (const f of live) {
+        const list = Array.from(await reg.getNotifications({ tag: f.tag }));
+        if (list.some((n) => n && n.data && Number(n.data.ping) === f.ping)) trace("shown-skip", { why: "in-tray" });
+        else gone.push(f);
+      }
     } catch (_) { trace("shown-skip", { why: "error" }); return; }
-    if (inTray) { trace("shown-skip", { why: "in-tray" }); return; }
+    if (!gone.length) return;
+    gone.sort((x, y) => y.e.at - x.e.at);
+    const f = gone[0];
     if (!(await cache.delete(f.req))) return;   // a lost delete: another page took it
-    trace("shown-launch", { url: traceUrl(u.href), ping, ageMs: age });
-    assignTo(u.href);
+    // the launch handled the others that were gone too: a later bare launch must not pop one of them
+    for (const o of gone.slice(1)) { try { await cache.delete(o.req); } catch (_) { /* swept by its TTL */ } }
+    trace("shown-launch", { url: traceUrl(f.u.href), ping: f.ping, ageMs: Date.now() - f.e.at, candidates: gone.length });
+    assignTo(f.u.href);
   }
   // once, at this document's first script run: a pageshow call would let a page opened for one tap consume a later tap's entry
   checkPending();
