@@ -93,8 +93,10 @@ def bound_log(fd: int = 2, expected: Optional[Path] = None) -> None:
     so the cap is a bound plus the lines written between checks, not a quota. The reaper is three single-threaded
     processes (main, worker, revoker) sharing ONE open file description, so there is no lock to take and none would span
     them: a truncate by one is safe for the others only because launchd opens the log for appending [measured on a
-    shared O_APPEND descriptor after ``fork``: no NUL hole; whether launchd's own open is O_APPEND is residue]. Two
-    processes trimming at once can drop a few log lines. Nothing here raises."""
+    shared O_APPEND descriptor after ``fork``: no NUL hole; whether launchd's own open is O_APPEND is residue]. The size
+    is re-read immediately before the truncate, so a process that lost the race does not wipe the lines the winner wrote
+    after its trim; two processes inside the gap between that re-read and the truncate (once per ~4 MiB of log) can still
+    drop a few log lines. The offset is rewound after the truncate (harmless on O_APPEND). Nothing here raises."""
     try:
         st = os.fstat(fd)
         if not (stat.S_ISREG(st.st_mode) and st.st_size > LOG_MAX_BYTES):
@@ -102,8 +104,11 @@ def bound_log(fd: int = 2, expected: Optional[Path] = None) -> None:
         mine = os.stat(_expected_log() if expected is None else expected)
         if (st.st_dev, st.st_ino) != (mine.st_dev, mine.st_ino):
             return
+        if os.fstat(fd).st_size <= LOG_MAX_BYTES:   # re-read just before the truncate: another process may have trimmed
+            return                                  # (and written a line) since the check above; do not wipe its line
         os.ftruncate(fd, 0)
-    except OSError:
+        os.lseek(fd, 0, os.SEEK_SET)   # ftruncate keeps the offset: on a descriptor without O_APPEND the next write would
+    except OSError:                    # leave a NUL hole at the old offset; a no-op on an O_APPEND one
         pass
 
 

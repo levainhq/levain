@@ -136,6 +136,7 @@ def test_a_trim_by_one_process_leaves_no_hole_for_the_others_on_one_shared_descr
             os._exit(code)
     os.close(to_parent_w)
     os.close(to_child_r)
+    status = None
     try:
         assert os.read(to_parent_r, 1) == b"x"
         before = path.stat().st_size
@@ -145,13 +146,72 @@ def test_a_trim_by_one_process_leaves_no_hole_for_the_others_on_one_shared_descr
         for i in range(10):
             os.write(fd, b"parent after %d\n" % i)
         os.write(to_child_w, b"x")
-        _, status = os.waitpid(pid, 0)
-        assert os.WIFEXITED(status) and os.WEXITSTATUS(status) == 0
     finally:
         os.close(fd)
         os.close(to_parent_r)
-        os.close(to_child_w)
+        os.close(to_child_w)                                 # a child still waiting reads EOF and ends
+        _, status = os.waitpid(pid, 0)                       # reaped even when an assertion above failed
+    assert os.WIFEXITED(status) and os.WEXITSTATUS(status) == 0
     data = path.read_bytes()
     assert b"\0" not in data                                 # no sparse hole at the old offset
     lines = data.decode().splitlines()
     assert sorted(lines) == sorted([f"child after {i}" for i in range(10)] + [f"parent after {i}" for i in range(10)])
+
+
+class _OsWithRacingPeer:
+    """``os`` as ``bound_log`` sees it, except that right after its FIRST ``fstat`` returns, a second process takes its
+    turn: it trims the log and writes one line (the interleaving two real processes can produce, forced here from the
+    test, not from the product)."""
+
+    def __init__(self, real, on_first_fstat):
+        self._real = real
+        self._hook = on_first_fstat
+        self._calls = 0
+
+    def __getattr__(self, name):
+        return getattr(self._real, name)
+
+    def fstat(self, fd):
+        st = self._real.fstat(fd)
+        self._calls += 1
+        if self._calls == 1:
+            self._hook()
+        return st
+
+
+def test_a_second_trim_does_not_wipe_the_line_the_first_wrote_after_its_own_trim(tmp_path, monkeypatch):
+    """R1: both processes see the file over the cap; the faster one trims and logs a (quarantine) line; the slower one
+    must notice the file is no longer over the cap and leave that line alone."""
+    path, fd = _log_fd(tmp_path, RP.LOG_MAX_BYTES + 1)
+    monkeypatch.setattr(RP, "_expected_log", lambda: path)
+    other = os.open(path, os.O_WRONLY | os.O_APPEND)         # the other process's own descriptor on the same file
+
+    def peer():
+        os.ftruncate(other, 0)
+        os.write(other, b"quarantine: the line that must survive\n")
+
+    monkeypatch.setattr(RP, "os", _OsWithRacingPeer(os, peer))
+    try:
+        RP.bound_log(fd)
+    finally:
+        os.close(other)
+        os.close(fd)
+    assert path.read_bytes() == b"quarantine: the line that must survive\n"
+
+
+def test_a_trim_rewinds_a_descriptor_that_is_not_appending_so_the_next_write_leaves_no_hole(tmp_path, monkeypatch):
+    """R2: a direct invocation redirecting stderr with ``>`` holds a plain write descriptor at an offset past the cap;
+    ``ftruncate`` does not move that offset, so without the rewind the next line lands at the old offset behind a NUL hole."""
+    path = tmp_path / "reaper.log"
+    path.write_bytes(b"")
+    fd = os.open(path, os.O_WRONLY)                          # no O_APPEND
+    monkeypatch.setattr(RP, "_expected_log", lambda: path)
+    try:
+        os.lseek(fd, RP.LOG_MAX_BYTES + 1, os.SEEK_SET)
+        os.write(fd, b"x")                                   # a sparse file past the cap, the offset at its end
+        RP.bound_log(fd)
+        assert path.stat().st_size == 0
+        os.write(fd, b"after the trim\n")
+    finally:
+        os.close(fd)
+    assert path.read_bytes() == b"after the trim\n"
