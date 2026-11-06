@@ -1951,14 +1951,16 @@ def _terminal_signer(store: QuestionStore, viewer: str, prompt: str, plan: Parse
                            versions=info_ids)
         if on_sign is not None:
             on_sign()
-        remote = ts.is_remote(environ)
+        why_remote = ts.remote_reason(environ, session_id=session)
+        remote = why_remote is not None
         if not remote:
             try:
                 if ts.find_key(key_dir) is not None:    # a notice only where a Touch ID sheet is about to follow
                     ts.post_notice(ts.notice_text(entries))
             except Exception:  # noqa: BLE001 - sign() below names whatever is wrong with the key
                 pass
-        out = ts.sign(message, key_dir=key_dir, signer_factory=signer_factory, remote=remote)
+        out = ts.sign(message, key_dir=key_dir, signer_factory=signer_factory, remote=remote,
+                      remote_why=why_remote)
         if out.state == "signed":
             scope = {"store": f"levain-questions:{sid}", "install": sid, "session": session, "view": str(view_id)}
             ruled, refusals = _apply_carried(carried, message, out.signature, scope, versions)
