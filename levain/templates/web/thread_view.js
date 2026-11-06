@@ -55,12 +55,31 @@
   }
   function modelWords(m) { return typeof m === "string" && m ? "Model in use: " + m : ""; }
 
+  // A Read's result: the vendor numbers every line (``cat -n``: a right-aligned number, a tab, the line). The number is the
+  // vendor's formatting and not the file's text, so it is not drawn. A tool result carries no tool name, so the test is the
+  // shape: the leading run of lines that open with a number and a tab, each one more than the last; the run ends at the first
+  // line that is not the next number. Display only: the record is not changed. This is a COPY of withoutLineNumbers in
+  // room_view.js (two served files with no shared loader); tests/test_thread_rows_1105.py holds the two to the same answers.
+  var NUMBERED = /^ *(\d+)\t/;
+  function withoutLineNumbers(text) {
+    var lines = text.split("\n"), n = 0, prev = -1;
+    for (; n < lines.length; n++) {
+      var m = NUMBERED.exec(lines[n]);
+      if (!m || (prev >= 0 && Number(m[1]) !== prev + 1)) break;
+      prev = Number(m[1]);
+    }
+    if (n === 0) return text;
+    for (var i = 0; i < n; i++) lines[i] = lines[i].replace(NUMBERED, "");
+    return lines.join("\n");
+  }
+
   function line(it) {
     var who = it.kind === "message" ? it.source : (it.source === "vendor" ? "agent side" : it.source);
     var status = it.status ? String(it.status).replace(/_/g, " ") : "";
     return {
       gseq: it.gseq, kind: it.kind, label: label(it.kind), who: who, ref: it.ref == null ? "" : String(it.ref),
-      text: own(APPROVAL_WORDS, it.kind) ? APPROVAL_WORDS[it.kind] : (it.body == null ? "" : String(it.body)),
+      text: own(APPROVAL_WORDS, it.kind) ? APPROVAL_WORDS[it.kind]
+        : (it.body == null ? "" : (it.kind === "vendor_tool_result" ? withoutLineNumbers(String(it.body)) : String(it.body))),
       status: status, unverified: it.unverified === true, truncated: it.truncated === true,
       tool: it.tool ? { open: it.tool.open === true } : null,
       collapsible: own(COLLAPSED_KINDS, it.kind),
@@ -68,9 +87,26 @@
     };
   }
 
+  // Whether a turn is running: `stoppable` says only that a session is held (an idle thread and a running one both have one),
+  // so it is read from the turn rows the server sends in the stream, as the room does. Only the CURRENT launch's turn rows count
+  // (the server names it, body.launch_id): a late row of an older or a room launch decides nothing about it. Its latest turn row
+  // is a start with no end after it => running. With no turn row of it in the stream and the body's gap flag set, a start may be
+  // missing from the record, so the turn is taken as running (unknown is running: Stop stays enabled, and a stop sent in a race
+  // still gets the server's "Nothing was running to stop."). No gap and no turn row is an idle thread. This is a COPY of
+  // turnRunning in room_view.js.
+  function turnRunning(stream, launchId, gap) {
+    if (typeof launchId !== "string" || !launchId) return false;
+    var last = "";
+    for (var i = 0; i < stream.length; i++) {
+      var it = stream[i];
+      if (it && it.launch_id === launchId && (it.kind === "vendor_turn_started" || it.kind === "vendor_turn_ended")) last = it.kind;
+    }
+    return last === "" ? gap === true : last === "vendor_turn_started";
+  }
+
   function threadModel(body) {
     return {
-      id: String(body.thread_id), launchId: body.launch_id == null ? null : String(body.launch_id),
+      id: String(body.thread_id), launchId: body.launch_id == null ? null : String(body.launch_id), running: turnRunning(body.stream || [], body.launch_id, body.gap === true),
       gap: body.gap === true, authority: authorityWords(body.authority), model: modelWords(body.model),
       before: (body.before || []).map(line), stream: (body.stream || []).map(line)
     };
@@ -186,7 +222,7 @@
     host.appendChild(bar); host.appendChild(body); host.appendChild(dock);
 
     function paintBar() {
-      paintStop(null, null);
+      paintStop(null, null, false);
       clear(bar);
       if (current) {
         var back = el(doc, "button", "tv-back", "All threads");
@@ -203,7 +239,7 @@
     }
     // the Stop lives OUTSIDE the redrawn body, so a poll never replaces it mid-request. It carries the launch the page last
     // drew (`launchId`): the server refuses the stop if the thread's launch changed under the page.
-    function paintStop(which, launchId) {
+    function paintStop(which, launchId, running) {
       if (!withStop || !which || launchId == null) { stopForm = null; stopFor = null; clear(dock); return; }
       if (stopFor !== which) {
         stopFor = which; clear(dock);
@@ -219,12 +255,16 @@
             note.textContent = o && own(STOP_WORDS, o) ? STOP_WORDS[o] : ((r.json && r.json.message) || "The stop was not sent.");
             last = ""; pull();
           }).catch(function () { if (stopForm === mine) note.textContent = "The stop could not be sent: the server could not be reached."; })
-            .then(function () { if (stopForm === mine) { mine.stopping = false; stopB.disabled = false; } });
+            .then(function () { if (stopForm === mine) { mine.stopping = false; stopB.disabled = !mine.running; } });
         });
         dock.appendChild(stopB); dock.appendChild(note);
-        stopForm = { stopB: stopB, launchId: null, stopping: false };
+        stopForm = { stopB: stopB, launchId: null, stopping: false, running: false };
       }
       stopForm.launchId = String(launchId);
+      // pressable only while a turn runs; a stop already sent keeps the button down until its answer is drawn. A stop sent in a
+      // race still gets the server's "Nothing was running to stop."
+      stopForm.running = running === true;
+      stopForm.stopB.disabled = stopForm.stopping || !stopForm.running;
     }
     function pull() {
       if (stopped) return Promise.resolve();
@@ -238,8 +278,8 @@
           var j = JSON.parse(t);
           // a Stop only where the server says one can reach a session (j.stoppable): with no chat service the route is a
           // 404, and the room's service holds no work launch (409), so a Stop there could never succeed
-          if (which) { renderThread(doc, body, threadModel(j), ui); paintStop(which, j.stoppable === true ? j.launch_id : null); }
-          else { renderList(doc, body, listModel(j), function (id) { api.open(id); }); paintStop(null, null); }
+          if (which) { var tm = threadModel(j); renderThread(doc, body, tm, ui); paintStop(which, j.stoppable === true ? j.launch_id : null, tm.running); }
+          else { renderList(doc, body, listModel(j), function (id) { api.open(id); }); paintStop(null, null, false); }
         });
       }).catch(function () { if (!stopped && g === gen) say("The thread record could not be read."); });
     }
