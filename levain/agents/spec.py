@@ -424,6 +424,9 @@ def _register_in(conn: Any, spec: dict[str, Any], default_zone: str | None,
     earlier = earlier_version(conn, agent_id, text)
     if earlier is not None:
         raise SpecError("rule 4: " + revert_message(final["name"], agent_id, earlier))
+    from levain.agents import operator as _operator     # lazy: the registry's side, never reached by a fire
+
+    _operator.check_revise(conn, agent_id, final["role"]["role_hash"])
     top = conn.execute("SELECT MAX(version) FROM agent_specs WHERE agent_id = ?", (agent_id,)).fetchone()[0]
     version = (top or 0) + 1
     digest = spec_hash(agent_id, final)
@@ -434,27 +437,41 @@ def _register_in(conn: Any, spec: dict[str, Any], default_zone: str | None,
 
 
 def register_specs(store: AgentStore, specs: list[dict[str, Any]], default_zone: str | None, *,
-                   revise: bool = False) -> list[tuple[str, str, int, bool]]:
+                   revise: bool = False, attach: bool = False) -> list[tuple[str, str, int, bool]]:
     """Write validated, already-refusal-checked specs in ONE transaction: every one is written or none is (a
     :class:`SpecError` or a store error from any of them rolls the whole batch back). Two specs of one name in a
-    batch are refused before anything is written."""
+    batch are refused before anything is written.
+
+    ``attach`` (K2b; passed only by the dream's own registration) attaches each spec to the store's operator agent in the
+    SAME transaction, after :func:`_register_in` returns and on EVERY one of its exits: the identical-content one, which
+    writes nothing, included, because that is the exit an install whose dream was registered before K2b takes when
+    ``levain dream enable`` runs again, and it is how that install gets attached. An attach that is refused or finds an
+    unreadable row rolls the whole batch back."""
     names = [s["name"] for s in specs]
     dup = sorted(n for n, c in Counter(names).items() if c > 1)
     if dup:
         raise SpecError(f"rule 4: {', '.join(repr(n) for n in dup)} appears more than once in one registration")
     with store.write() as conn:
-        return [_register_in(conn, s, default_zone, revise) for s in specs]
+        written = [_register_in(conn, s, default_zone, revise) for s in specs]
+        if attach:
+            from levain.agents import operator as _operator     # lazy: the registry's side, never reached by a fire
+
+            for agent_id, _, _, _ in written:
+                _operator.attach_in(conn, agent_id)
+        return written
 
 
 def register_spec(store: AgentStore, spec: dict[str, Any], default_zone: str | None, *,
-                  revise: bool = False) -> tuple[str, str, int, bool]:
+                  revise: bool = False, attach: bool = False) -> tuple[str, str, int, bool]:
     """Write a validated, already-refusal-checked spec. Return ``(agent_id, spec_hash, version, created)``.
 
     A name no live agent holds mints a NEW agent_id (version 1). A name a live agent holds: the same content is
     returned as is (``created`` False); different content with ``revise`` writes the next version of that agent
     (versions are immutable; the operation axis is untouched); without ``revise`` it is refused (rule 4). Content
-    equal to an EARLIER version of that agent (a revert) is refused, naming the version (spec_hash is unique)."""
-    return register_specs(store, [spec], default_zone, revise=revise)[0]
+    equal to an EARLIER version of that agent (a revert) is refused, naming the version (spec_hash is unique). A
+    revise of a spec attached to the operator agent keeps its role (``operator.check_revise``). ``attach``: see
+    :func:`register_specs`."""
+    return register_specs(store, [spec], default_zone, revise=revise, attach=attach)[0]
 
 
 _AGENT_COLS = "agent_id, name, current_version, registration, operation, failure_streak, created_at"
