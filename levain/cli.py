@@ -3725,8 +3725,9 @@ def _cmd_seat_egress(args: argparse.Namespace, root: Path) -> int:
         print(f"signed: {g['id']}: seat/<lane> branches of clones below {g['lanes_parent']} push to {g['push_remote']}, "
               f"until {g['expires_at']}")
     elif args.seat_egress_cmd == "renew":
-        print(f"renewed: {args.grant_id} until "
-              f"{seat_lease.renew_lease(root, args.grant_id, signer_fp=signer_fp, sign=sign, clock=_utc_now)}")
+        # kind-checked; a refused renew raises (exit 1 with the reason in _cmd_seat), never reaches this print
+        until = seat_push.renew_egress(root, args.grant_id, signer_fp=signer_fp, sign=sign, clock=_utc_now)
+        print(f"renewed: {args.grant_id} until {until}")
     else:
         from levain.consent.grants import revoke_grant
         seq, warning = revoke_grant(root, args.grant_id, signer_fp=signer_fp, sign=sign, clock=_utc_now)

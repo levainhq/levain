@@ -27,7 +27,7 @@ import stat
 import subprocess
 import sys
 from collections.abc import Callable, Mapping
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
@@ -197,8 +197,9 @@ def create_lease(cockpit_root: Path | str, *, lanes_parent: Path | str, returns_
 
 
 def renew_lease(cockpit_root: Path | str, lease_id: str, *, signer_fp: str, sign: Callable[[bytes], str],
-                clock: Callable[[], datetime]) -> str:
-    """Re-sign a live lease for 14 more days (its terms stay). Returns the new ``expires_at``.
+                clock: Callable[[], datetime], max_life: timedelta = SEAT_LEASE_MAX) -> str:
+    """Re-sign a live lease for 14 more days (its terms stay; ``max_life`` is the kind's own cap when another fixed-term
+    kind reuses this, :func:`levain.seat_push.renew_egress`). Returns the new ``expires_at``.
 
     A renew's ``signed_at`` must equal its link's ``at``, so the link is prepared at the SAME clock reading the op
     carries, and appended at a fresh reading taken after the signature (a lease that lapsed during the touch is
@@ -208,7 +209,7 @@ def renew_lease(cockpit_root: Path | str, lease_id: str, *, signer_fp: str, sign
     from levain.cockpit.consent import utc_stamp
     from levain.cockpit.keys import KeyError_, _journal, _now
     now = _now(clock)
-    op = {"op": "renew", "grant_id": lease_id, "expires_at": utc_stamp(now + SEAT_LEASE_MAX), "signed_at": utc_stamp(now)}
+    op = {"op": "renew", "grant_id": lease_id, "expires_at": utc_stamp(now + max_life), "signed_at": utc_stamp(now)}
     db = _journal(cockpit_root)
     try:
         with db.autocommit() as conn:
@@ -353,9 +354,19 @@ def read_mints(key_dir: Path) -> list[dict[str, Any]]:
     """Every mint row, with the chain and each signature verified; a broken chain raises ``ValueError``."""
     key = _load_key(key_dir)
     path = key_dir / _MINTS
-    if not path.is_file():
+    try:
+        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
+    except FileNotFoundError:
         return []
-    return _verify_chain(path.read_bytes(), key.public_key())
+    try:
+        # the same file lock :func:`append_mint` holds EXCLUSIVE across its verify-write-fsync: a reader never sees a
+        # half-written row of a launch in flight (L3 zc r1 codex 4 / deepseek)
+        fcntl.flock(fd, fcntl.LOCK_SH)
+        with os.fdopen(os.dup(fd), "rb") as fh:
+            data = fh.read()
+    finally:
+        os.close(fd)
+    return _verify_chain(data, key.public_key())
 
 
 # --- the launch (build and validate only) --------------------------------------------------------------------------
@@ -398,7 +409,7 @@ def prepare_launch(lane_key: str, remote_url: str, base_sha: str, *, claude_bin:
         raise SeatLaunchRefused("the launcher key is not the one the lease pins: sign a new lease")
     clone, return_dir, row = mint_lane(lease, lane_key, remote_url, base_sha, now=clock())
     try:
-        state = _replay(cockpit_root)
+        state = _replay(cockpit_root)    # the post-clone replay: the egress below is read from THIS one too
         again = None if state is None else live_lease(state, clock())
         if again is None or (again["id"], again["incarnation"]) != (lease["id"], lease["incarnation"]):
             raise SeatLaunchRefused("the seat-root lease is no longer live (revoked, expired or replaced while the "

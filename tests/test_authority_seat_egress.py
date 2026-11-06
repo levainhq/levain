@@ -97,6 +97,41 @@ def test_a_lanes_parent_in_agent_config_or_under_claude_is_refused(world, tmp_pa
         assert said in world.refused({"op": "create_grant", "grant": egress(world, tmp_path, **over)})
 
 
+@pytest.mark.parametrize("kind", ["seat-egress", "seat-root-lease"])
+@pytest.mark.parametrize("name", [".Claude", ".CLAUDE", ".Git", ".Codex", ".LEVAIN"])
+def test_an_agent_config_name_in_another_case_is_refused(world, tmp_path, kind, name):
+    """deepseek MED-2: on a case-insensitive volume ``.Claude`` IS ``.claude``; the names check is case-folded, for the
+    lease's parents too (same class, same helper)."""
+    parent = str(tmp_path / name / "x")
+    if kind == "seat-egress":
+        grant = egress(world, tmp_path, lanes_parent=parent)
+    else:
+        grant = {"id": "sl-000000000001", "kind": "seat-root-lease", "agent": "claude_code", "lanes_parent": parent,
+                 "returns_parent": str(tmp_path / "returns"), "launcher_key_sha256": "a" * 64,
+                 "expires_at": utc_stamp(world.clock.now + timedelta(days=14))}
+    assert "agent-config" in world.refused({"op": "create_grant", "grant": grant})
+
+
+def test_a_loosen_that_revives_a_lapsed_grant_beside_a_live_one_is_refused(world, tmp_path):
+    """gemini MED 3 (refuted, pinned): neither a renew nor a loosen brings a second live seat-egress grant."""
+    old = egress(world, tmp_path, 1, days=1)
+    world.link({"op": "create_grant", "grant": old})
+    world.clock.now += timedelta(days=2)
+    world.link({"op": "create_grant", "grant": egress(world, tmp_path, 2)})
+    now = world.clock.now + timedelta(minutes=1)
+    assert "expired" in world.refused({"op": "renew", "grant_id": old["id"], "signed_at": utc_stamp(now),
+                                       "expires_at": utc_stamp(now + timedelta(days=10))})
+    policy = world.state().policy.as_dict()
+    policy["grants"][old["id"]] = {**policy["grants"][old["id"]], "expires_at": utc_stamp(now + timedelta(days=10))}
+    assert "computes to a renew" in world.refused({"op": "loosen", "policy": policy})
+    # with a new grant beside it the link computes to a LOOSEN: then the one-live rule, judged on the policy AFTER
+    policy["grants"]["sl-000000000001"] = {
+        "id": "sl-000000000001", "kind": "seat-root-lease", "agent": "claude_code",
+        "lanes_parent": str(tmp_path / "lanes"), "returns_parent": str(tmp_path / "returns"),
+        "launcher_key_sha256": "a" * 64, "expires_at": utc_stamp(now + timedelta(days=14))}
+    assert "one live seat-egress grant" in world.refused({"op": "loosen", "policy": policy})
+
+
 def test_terms_are_fixed_and_only_a_renew_moves_the_expiry_by_at_most_14_days(world, tmp_path):
     g = egress(world, tmp_path, days=1)
     world.link({"op": "create_grant", "grant": g})
@@ -108,10 +143,11 @@ def test_terms_are_fixed_and_only_a_renew_moves_the_expiry_by_at_most_14_days(wo
     late = world.clock.now + timedelta(minutes=1)
     assert "14 days" in world.refused({"op": "renew", "grant_id": g["id"],
                                        "expires_at": utc_stamp(late + timedelta(days=20)), "signed_at": utc_stamp(late)})
-    held = world.state().policy.grants[g["id"]]
     for field, value in (("push_remote", "file:///srv/other.git"), ("lanes_parent", str(tmp_path / "elsewhere")),
                          ("allowed_domains", ["evil.example.com"])):
-        assert world.refused({"op": "loosen", "policy": {"grants": {g["id"]: {**held, field: value}}}}), field
+        policy = world.state().policy.as_dict()        # the whole policy, thawed (a frozen grant is no canonical op)
+        policy["grants"][g["id"]] = {**policy["grants"][g["id"]], field: value}
+        assert auth._SEAT_EGRESS_FIXED in world.refused({"op": "loosen", "policy": policy}), field
 
 
 def test_a_second_live_grant_is_refused_until_the_first_is_revoked(world, tmp_path):

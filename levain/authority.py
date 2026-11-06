@@ -1982,6 +1982,19 @@ def _seat_lease_change(o: Mapping[str, Any], n: Mapping[str, Any], o_exp: dateti
     raise AuthorityError(_SEAT_LEASE_FIXED)
 
 
+def _names_agent_config(path: str) -> bool:
+    """True when a component of ``path`` is an agent-config name (``levain.host_guard.PROTECTED_NAMES``), compared
+    case-folded: on a case-insensitive volume (this Mac's APFS) ``.Claude`` IS ``.claude`` (the case-alias class,
+    key 1106-1; ``levain.pathid``). The filesystem's own spelling (:func:`levain.pathid.canonical`) is checked too,
+    so an alias reached through a link is judged by the name it lands on. Folding on a case-sensitive volume only
+    refuses more."""
+    from levain import host_guard as hg
+    from levain import pathid
+    names = {n.casefold() for n in hg.PROTECTED_NAMES}
+    parts = set(path.split("/")) | set(str(pathid.canonical(path)).split("/"))
+    return any(p.casefold() in names for p in parts)
+
+
 def _seat_lease_check(grants: list[Any], after: str = "") -> None:
     """At append and at a renew, a lease's parents meet the root rules (judged against the appender's own home, so an
     append rule): no agent-config name (``levain.host_guard.PROTECTED_NAMES``) among their components, neither under
@@ -1995,7 +2008,7 @@ def _seat_lease_check(grants: list[Any], after: str = "") -> None:
         problems: list[str] = []
         parents = {k: str(grant.get(k)) for k in ("lanes_parent", "returns_parent")}
         for name, path in parents.items():
-            if hg.PROTECTED_NAMES & set(path.split("/")):
+            if _names_agent_config(path):
                 problems.append(f"{name} names an agent-config directory")
             if any(hg.is_within(path, b) for b in barred):
                 problems.append(f"{name} is inside ~/.claude or flow's state")
@@ -2133,7 +2146,7 @@ def _seat_egress_check(grants: list[Any], after: str = "") -> None:
         except ValueError as exc:
             problems.append(f"push_remote: {exc}")
         parent = str(grant.get("lanes_parent"))
-        if hg.PROTECTED_NAMES & set(parent.split("/")):
+        if _names_agent_config(parent):
             problems.append("lanes_parent names an agent-config directory")
         if any(hg.is_within(parent, b) for b in barred):
             problems.append("lanes_parent is inside ~/.claude or flow's state")

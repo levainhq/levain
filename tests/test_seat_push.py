@@ -376,3 +376,203 @@ def test_a_malformed_command_line_or_stdin_never_blocks_the_seat(eg, capsys):
 def test_the_cli_parses_egress_commands(eg, monkeypatch):
     from levain import cli
     assert cli.main(["seat", "egress", "list", "--data-root", str(eg.world.root)]) == 0
+
+
+# --- L3 zc r1 fixes ----------------------------------------------------------------------------------------------
+
+def _revoke_live(eg):
+    from levain.consent.grants import revoke_grant
+    fp, sign = eg.world.keys["laptop"]
+    live = sp.live_egress(sl._replay(eg.world.root), eg.now())
+    eg.world.clock.now += timedelta(minutes=1)
+    revoke_grant(eg.world.root, live["id"], signer_fp=fp, sign=sign, clock=eg.world.clock)
+
+
+def _bare(eg, name):
+    p = eg.tmp / name
+    subprocess.run(["git", "init", "-q", "--bare", str(p)], check=True, env={**os.environ, "GIT_CONFIG_GLOBAL": "/dev/null"})
+    return p
+
+
+def _ref(bare, ref):
+    r = subprocess.run(["git", f"--git-dir={bare}", "rev-parse", "--verify", "--quiet", ref], capture_output=True,
+                       text=True, env={**os.environ, "GIT_CONFIG_GLOBAL": "/dev/null"})
+    return r.stdout.strip() or None
+
+
+def test_an_unmoved_tip_reaches_a_new_grants_remote_after_a_revoke(eg):
+    """codex MED 2: the pushed-tip mark is keyed by the grant (id, incarnation, remote), not the lane alone."""
+    eg.rig.sign_lease()
+    eg.sign()
+    _plan, clone = eg.lane()
+    tip = eg.commit(clone, "one")
+    assert eg.hook(clone) == (0, "") and eg.remote_ref("refs/heads/seat/lane-a") == tip
+    _revoke_live(eg)
+    other = _bare(eg, "remote-b.git")
+    eg.sign(remote=f"file://{other}")
+    assert eg.hook(clone) == (0, "")                                   # the tip did NOT move
+    assert _ref(other, "refs/heads/seat/lane-a") == tip
+    rows = eg.log()
+    assert (rows[-1]["outcome"], rows[-1]["remote"]) == ("pushed", f"file://{other}")
+    n = len(rows)
+    assert eg.hook(clone) == (0, "") and len(eg.log()) == n           # and now silent under THIS grant
+
+
+def test_a_rejected_tip_is_offered_again_under_a_new_grant(eg):
+    eg.rig.sign_lease()
+    eg.sign()
+    _plan, clone = eg.lane()
+    eg.commit(clone, "one")
+    assert eg.hook(clone) == (0, "")
+    _git(clone, "commit", "-q", "--amend", "--allow-empty", "-m", "rewritten")
+    rewritten = _git(clone, "rev-parse", "HEAD")
+    assert eg.hook(clone)[0] == 2                                      # rejected by remote A
+    assert eg.hook(clone) == (0, "")                                   # not retried under A
+    _revoke_live(eg)
+    fresh = _bare(eg, "remote-c.git")
+    eg.sign(remote=f"file://{fresh}")
+    assert eg.hook(clone) == (0, "")
+    assert _ref(fresh, "refs/heads/seat/lane-a") == rewritten
+
+
+def test_a_transport_error_is_not_told_as_a_rejection_and_is_retried(eg):
+    """codex MED 3 / complement 2: git failing with no ref line (here: no repository at the pinned path, the shape of
+    DNS / auth / transport) is status "error": recorded, exit 0, no rebase text, tried again at the next Stop."""
+    eg.rig.sign_lease()
+    eg.sign(remote=f"file://{eg.tmp}/no-such-remote.git")
+    _plan, clone = eg.lane()
+    eg.commit(clone, "one")
+    code, err = eg.hook(clone)
+    assert (code, err) == (0, "")
+    rows = eg.log()
+    assert (rows[-1]["outcome"], rows[-1]["status"]) == ("not-pushed", "error")
+    assert eg.hook(clone) == (0, "") and len(eg.log()) == len(rows) + 1   # retried, not remembered
+
+
+def test_a_mint_read_waits_for_an_append_in_flight_and_never_sees_half_a_row(eg):
+    """codex MED 4 / deepseek: read_mints takes the lock append_mint holds, so a SessionEnd reading while a launch
+    appends sees the whole row (or none of it), never a broken chain."""
+    import fcntl
+    import threading
+    eg.rig.sign_lease()
+    eg.rig.launch("lane-a")
+    path = eg.rig.key_dir / "mints.jsonl"
+    whole = path.read_bytes()
+    fd = os.open(path, os.O_RDWR | os.O_APPEND)
+    out: dict = {}
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX)                                 # what append_mint holds across its write
+        os.ftruncate(fd, 0)
+        os.write(fd, whole[: len(whole) // 2])                         # half a row on disk
+        t = threading.Thread(target=lambda: out.update(rows=_try(lambda: sl.read_mints(eg.rig.key_dir))))
+        t.start()
+        t.join(0.5)
+        assert t.is_alive(), f"the read did not wait for the lock: {out}"
+        os.write(fd, whole[len(whole) // 2:])
+    finally:
+        fcntl.flock(fd, fcntl.LOCK_UN)
+        os.close(fd)
+    t.join(10)
+    assert [r["lane_key"] for r in out["rows"]] == ["lane-a"]
+
+
+def _try(fn):
+    try:
+        return fn()
+    except Exception as exc:  # noqa: BLE001
+        return exc
+
+
+def test_a_record_incomplete_push_is_remembered_and_logged(eg, monkeypatch):
+    """gemini HIGH 1: PushRecordIncomplete is settled like any reported push (the lane comes from the mint row, never
+    re-parsed from the branch); a rejection inside it still reaches the model."""
+    real = push._record
+    monkeypatch.setattr(push, "_record", lambda *a, **k: real(*a, **k) + ["done journal: injected"])
+    eg.rig.sign_lease()
+    eg.sign()
+    _plan, clone = eg.lane()
+    tip = eg.commit(clone, "one")
+    assert eg.hook(clone) == (0, "")
+    assert eg.remote_ref("refs/heads/seat/lane-a") == tip
+    assert [r["outcome"] for r in eg.log()] == ["pushed", "record-incomplete"]
+    assert eg.hook(clone) == (0, "") and len(eg.log()) == 2            # remembered: silent
+    _git(clone, "commit", "-q", "--amend", "--allow-empty", "-m", "rewritten")
+    code, err = eg.hook(clone)
+    assert code == 2 and "rejected your lane branch" in err
+
+
+def test_a_mark_that_cannot_be_written_never_swallows_the_rejection(eg):
+    """deepseek MED-1: a failed remember after a rejection still exits 2 with the text, and leaves a record."""
+    eg.rig.sign_lease()
+    eg.sign()
+    _plan, clone = eg.lane()
+    eg.commit(clone, "one")
+    assert eg.hook(clone) == (0, "")
+    _git(clone, "commit", "-q", "--amend", "--allow-empty", "-m", "rewritten")
+    marks = eg.rig.key_dir / sp.PUSHED_DIR
+    marks.chmod(0o500)
+    try:
+        code, err = eg.hook(clone)
+    finally:
+        marks.chmod(0o700)
+    assert code == 2 and "rejected your lane branch" in err
+    assert "pushed-tip mark was not written" in eg.log()[-1]["detail"]
+
+
+def test_a_grant_signed_while_the_clone_runs_reaches_the_profile(eg, monkeypatch):
+    """deepseek MED-3 (refuted on disk, pinned): the egress is read from the replay taken AFTER the clone."""
+    eg.rig.sign_lease()
+    real = sl.mint_lane
+
+    def slow_clone(*a, **k):
+        out = real(*a, **k)
+        eg.sign()                                                       # signed during the clone
+        return out
+    monkeypatch.setattr(sl, "mint_lane", slow_clone)
+    plan = eg.rig.launch("lane-a", now=eg.world.clock.now + timedelta(minutes=3))
+    assert "Stop" in plan.profile.settings["hooks"]
+
+
+def _cli_signing(eg, monkeypatch):
+    from levain import cli
+    from levain.cockpit import keys
+    monkeypatch.setattr(keys, "ssh_signer", lambda path: eg.world.keys["laptop"])
+    monkeypatch.setattr(cli, "_utc_now", lambda: eg.world.clock.now)
+    return cli
+
+
+def test_egress_renew_refuses_with_a_reason_and_never_prints_success(eg, monkeypatch, capsys):
+    """gemini HIGH 2 / complement 6: a refused renew exits non-zero naming why; a lease id is never renewed here."""
+    cli = _cli_signing(eg, monkeypatch)
+    lease = eg.rig.sign_lease()
+    grant = eg.sign()
+    args = ["--data-root", str(eg.world.root), "--signing-key", str(eg.tmp / "unused")]
+    before = sl._replay(eg.world.root).policy.grants[lease["id"]]["expires_at"]
+    eg.world.clock.now += timedelta(minutes=1)
+    assert cli.main(["seat", "egress", "renew", lease["id"], *args]) == 1
+    out = capsys.readouterr()
+    assert "renewed" not in out.out and "not a seat-egress grant" in out.err
+    assert sl._replay(eg.world.root).policy.grants[lease["id"]]["expires_at"] == before
+    eg.world.clock.now += timedelta(minutes=1)
+    assert cli.main(["seat", "egress", "renew", grant["id"], *args]) == 0
+    out = capsys.readouterr()
+    held = sl._replay(eg.world.root).policy.grants[grant["id"]]["expires_at"]
+    assert out.out.strip() == f"renewed: {grant['id']} until {held}" and held > grant["expires_at"]
+    _revoke_live(eg)
+    eg.world.clock.now += timedelta(minutes=1)
+    assert cli.main(["seat", "egress", "renew", grant["id"], *args]) == 1
+    out = capsys.readouterr()
+    assert "renewed" not in out.out and "seat egress refused" in out.err
+
+
+def test_a_lapsed_grant_is_not_renewed_beside_a_live_one(eg, monkeypatch, capsys):
+    """gemini MED 3 (refuted: the log never renews a lapsed grant, and a loosen is judged on the policy AFTER it)."""
+    cli = _cli_signing(eg, monkeypatch)
+    eg.rig.sign_lease()
+    old = eg.sign()
+    eg.world.clock.now += timedelta(days=15)                          # the first grant lapses
+    eg.rig.sign_lease()
+    eg.sign()
+    assert cli.main(["seat", "egress", "renew", old["id"], "--data-root", str(eg.world.root),
+                     "--signing-key", str(eg.tmp / "unused")]) == 1
+    assert "expired" in capsys.readouterr().err

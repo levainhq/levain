@@ -13,7 +13,9 @@ What the hook does, in order, and what each step trusts:
    cannot name another repository. The clone's realpath must match a row of the launcher's signed mint chain
    (:func:`levain.seat_lease.read_mints`), whose ``lane_key`` fixes the branch: ``seat/<lane_key>`` and no other name.
 2. the tip is read from outside the repository (``git ls-remote`` on the path, which runs none of its hooks). Nothing to
-   push (no such branch, still at the base, or the tip last pushed) ends the hook silently.
+   push (no such branch, still at the base) ends the hook silently; so does a tip already pushed to (or rejected by)
+   the remote of the SAME live grant (``egress_pushed/<lane>`` remembers tip, grant id, incarnation and remote, so a
+   new grant gets the tip again).
 3. :func:`levain.consent.push.execute` pushes: it FETCHES the tip into a Levain-owned bare mirror and pushes from the
    mirror, never reading the clone's ``.git/config`` or ``.git/hooks`` as code. Its fresh judgment under the per-repo
    lock is :func:`egress_refusal`: a LIVE ``seat-egress`` grant (``levain.authority.SEAT_EGRESS_KIND``) in a fresh replay
@@ -22,8 +24,9 @@ What the hook does, in order, and what each step trusts:
    the same (device, inode) as the mint pinned. A revoked or expired grant pushes nothing and leaves a record.
 
 The hook never wedges the seat: every failure is recorded in ``<levain home>/push/seat_egress.jsonl`` and ends in exit
-0, except a remote's rejection on a ``Stop`` (exit 2 once: stderr reaches the model, which may rebase; the second Stop
-has ``stop_hook_active`` and ends 0). Nothing here forces: git's rejection of a non-fast-forward is reported.
+0, except a remote's REJECTION (``status == "rejected"``) on a ``Stop`` (exit 2 once: stderr reaches the model, which
+may rebase; the second Stop has ``stop_hook_active`` and ends 0). A transport, auth or DNS failure is recorded, ends 0
+and is retried at the next Stop. Nothing here forces: git's rejection of a non-fast-forward is reported.
 
 Known edges (one line each): a ``SIGKILL`` between git returning and the pushed-tip file being written re-pushes the
 same tip next time (``up-to-date``, harmless); the seat can rename its clone's ``.git`` away and back, which keeps the
@@ -49,7 +52,7 @@ from levain.authority import SEAT_EGRESS_KIND, SEAT_EGRESS_MAX, AuthoritySnapsho
 from levain.consent import push
 
 __all__ = ["SEAT_EGRESS_KIND", "SeatPushRefused", "SIGN_COMMAND", "STOP_TIMEOUT", "SESSION_END_TIMEOUT",
-           "LOG_NAME", "live_egress", "create_egress", "egress_refusal", "run_hook", "main", "hook_entries"]
+           "LOG_NAME", "live_egress", "create_egress", "renew_egress", "egress_refusal", "run_hook", "main", "hook_entries"]
 
 SIGN_COMMAND = ("levain seat egress create --lanes-parent <dir> --remote <url> [--allow-domain <host> ...] "
                 "--signing-key <key>")
@@ -87,7 +90,7 @@ def live_egress(state: AuthoritySnapshot, now: datetime) -> Mapping[str, Any] | 
         return None
     gid, grant = live[0]
     link = state.grant_link(gid)
-    return {**_thaw(grant), "link_seq": 0 if link is None else link[0]}
+    return {**_thaw(grant), "link_seq": 0 if link is None else link[0], "incarnation": state.grant_born.get(gid, 0)}
 
 
 def create_egress(cockpit_root: Path | str, *, lanes_parent: Path | str, push_remote: str,
@@ -104,17 +107,37 @@ def create_egress(cockpit_root: Path | str, *, lanes_parent: Path | str, push_re
         canon = push.canonical_remote(push_remote)
     except ValueError as exc:
         raise SeatPushRefused(f"the remote: {exc}") from None
+    from levain.authority import AuthorityError, _seat_egress_check
     now = _now(clock)
     parent = Path(os.path.expanduser(str(lanes_parent)))
-    parent.mkdir(mode=0o700, parents=True, exist_ok=True)
     grant = {"id": grant_id or "se-" + secrets.token_hex(6), "kind": SEAT_EGRESS_KIND, "agent": "claude_code",
              "lanes_parent": str(Path(os.path.realpath(parent))), "push_remote": canon,
              "allowed_domains": sorted(set(allowed_domains)), "expires_at": utc_stamp(now + SEAT_EGRESS_MAX)}
+    try:
+        _seat_egress_check([grant])          # the log's own root rule, BEFORE the mkdir: a refused parent is never made
+    except AuthorityError as exc:
+        raise SeatPushRefused(str(exc)) from None
+    parent.mkdir(mode=0o700, parents=True, exist_ok=True)
     db = _journal(cockpit_root)
     _signing_authority(_capture(db, now, DEFAULT_SSH_KEYGEN))
     new = _append(db, {"op": "create_grant", "grant": grant}, signer_fp=signer_fp, sign=sign, clock=clock,
                   ssh_keygen=DEFAULT_SSH_KEYGEN)
     return _thaw(new.policy.grants[grant["id"]])
+
+
+def renew_egress(cockpit_root: Path | str, grant_id: str, *, signer_fp: str, sign: Callable[[bytes], str],
+                 clock: Callable[[], datetime]) -> str:
+    """Re-sign the seat-egress grant ``grant_id`` for :data:`SEAT_EGRESS_MAX` more; returns the new ``expires_at``.
+    Refuses (:class:`SeatPushRefused`) an id the log does not hold as a seat-egress grant, so ``levain seat egress
+    renew`` never extends a lease or another kind; the log's own renew rules (live, not lapsed, capped) judge the rest
+    and their refusal propagates as itself (``KeyError_``), never as a success line."""
+    from levain import seat_lease
+    state = seat_lease._replay(cockpit_root)
+    grant = None if state is None else state.policy.grants.get(grant_id)
+    if not (isinstance(grant, Mapping) and grant.get("kind") == SEAT_EGRESS_KIND):
+        raise SeatPushRefused(f"{grant_id!r} is not a seat-egress grant the log holds: nothing renewed")
+    return seat_lease.renew_lease(cockpit_root, grant_id, signer_fp=signer_fp, sign=sign, clock=clock,
+                                  max_life=SEAT_EGRESS_MAX)
 
 
 # --- the judge -------------------------------------------------------------------------------------------------------
@@ -194,18 +217,31 @@ def _tip(real: str, branch: str) -> str | None:
     return None
 
 
-def _last_pushed(key_dir: Path, lane_key: str) -> str | None:
+def _pushed_mark(sha: str, grant: Mapping[str, Any]) -> dict[str, str]:
+    """What ``egress_pushed/<lane>`` remembers: the tip AND the grant incarnation and remote it went to, so a tip
+    already pushed under one grant is pushed again under another (revoke A, sign B for another remote: B gets it). The
+    incarnation (the seq of the link that brought the id in) survives a renew and changes on a revoke and re-create."""
+    return {"sha": sha, "grant": str(grant["id"]), "incarnation": str(grant.get("incarnation")),
+            "remote": str(grant["push_remote"])}
+
+
+def _last_pushed(key_dir: Path, lane_key: str) -> dict[str, Any] | None:
+    """The remembered mark for ``lane_key``, or None (none yet, unreadable, or the pre-fix bare-sha form: a re-push of
+    a tip the remote already holds is ``up-to-date``, harmless)."""
     try:
-        return (key_dir / PUSHED_DIR / lane_key).read_text().strip() or None
-    except OSError:
+        mark = json.loads((key_dir / PUSHED_DIR / lane_key).read_text())
+    except (OSError, ValueError):
         return None
+    return mark if isinstance(mark, dict) else None
 
 
-def _remember(key_dir: Path, lane_key: str, sha: str) -> None:
+def _remember(key_dir: Path, lane_key: str, sha: str, grant: Mapping[str, Any]) -> None:
     d = key_dir / PUSHED_DIR
     d.mkdir(mode=0o700, exist_ok=True)
     tmp = d / f".{lane_key}.{os.getpid()}"
-    tmp.write_text(sha + "\n")
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW, 0o600)
+    with os.fdopen(fd, "w") as fh:
+        fh.write(json.dumps(_pushed_mark(sha, grant), sort_keys=True) + "\n")
     os.replace(tmp, d / lane_key)
 
 
@@ -227,8 +263,8 @@ def run_hook(event: str, stdin_text: str, *, clone: Path | str, key_dir: Path | 
         branch = f"seat/{lane}"
         base["branch"] = branch
         tip = _tip(clone_real, branch)
-        if tip is None or tip == row.get("base_sha") or tip == _last_pushed(key_dir, lane):
-            return 0                                           # nothing moved: silent
+        if tip is None or tip == row.get("base_sha"):
+            return 0                                           # nothing on the lane branch yet: silent
         base["tip"] = tip
         from levain import seat_lease
         clock = now or (lambda: datetime.now(timezone.utc))
@@ -237,33 +273,48 @@ def run_hook(event: str, stdin_text: str, *, clone: Path | str, key_dir: Path | 
         if grant is None:
             _log(home, {**base, "outcome": "refused", "detail": "no live seat-egress grant: commits stay local"})
             return 0
+        if _last_pushed(key_dir, lane) == _pushed_mark(tip, grant):
+            return 0                                           # this tip already went to THIS grant's remote: silent
         refusal = egress_refusal(cockpit_root, key_dir, now=clock)
 
         def receipt(rec: dict[str, Any]) -> None:
             _log(home, {**base, "outcome": "pushed" if rec.get("ok") else "not-pushed", "via": "seat-egress", **rec})
 
-        result = push.execute({"id": grant["id"]}, repo_path=clone_real, remote=grant["push_remote"], branch=branch,
-                              levain_home=home, refusal=refusal, receipt=receipt)
-        if result.ok or result.status == "rejected":          # a rejected tip is not retried until the seat moves it
-            _remember(key_dir, lane, result.new_sha)
-        if result.ok:
-            return 0
-        if event == "Stop" and not active:
-            print(_REJECT_TEXT.format(branch=branch, detail=str(result.detail)[:300]), file=err)
-            return 2
-        return 0
+        try:
+            result = push.execute({"id": grant["id"]}, repo_path=clone_real, remote=grant["push_remote"],
+                                  branch=branch, levain_home=home, refusal=refusal, receipt=receipt)
+        except push.PushRecordIncomplete as exc:              # git reported; only levain's own record is short
+            _log(home, {**base, "outcome": "record-incomplete", "detail": str(exc)[:400]})
+            result = exc.result
+        return _settle(result, event=event, active=active, key_dir=key_dir, lane=lane, grant=grant, home=home,
+                       base=base, err=err)
     except push.PushRefused as exc:
         _log(home, {**base, "outcome": "refused", "detail": str(exc)[:400]})
     except push.PushOutcomeUnknown as exc:
         _log(home, {**base, "outcome": "unknown", "detail": str(exc)[:400]})
-    except push.PushRecordIncomplete as exc:
-        if exc.result.ok and base.get("tip"):
-            try:
-                _remember(key_dir, base["branch"].split("/", 1)[1], exc.result.new_sha)
-            except OSError:
-                pass
     except Exception as exc:  # noqa: BLE001 - fail closed on the push, open on the seat
         _log(home, {**base, "outcome": "error", "detail": f"{type(exc).__name__}: {str(exc)[:300]}"})
+    return 0
+
+
+def _settle(result: push.PushResult, *, event: str, active: bool, key_dir: Path, lane: str, grant: Mapping[str, Any],
+            home: Path, base: dict[str, Any], err) -> int:
+    """The exit code for a push git reported on. Pushed or rejected: the tip is remembered against this grant (a
+    rejected tip is not retried or re-told until the seat moves it, or another grant is signed). Only a REJECTION
+    (``status == "rejected"``: a non-fast-forward or the remote's own rule) on a first ``Stop`` exits 2 with the
+    rebase text; a transport, auth or DNS failure (``"error"``) is the receipt's record, is retried at the next Stop
+    and ends 0. A remember that fails never costs the model its one rejection message."""
+    if result.ok or result.status == "rejected":
+        try:
+            _remember(key_dir, lane, result.new_sha, grant)
+        except (OSError, TypeError, ValueError) as exc:
+            _log(home, {**base, "outcome": "error", "detail": f"the pushed-tip mark was not written: "
+                                                              f"{type(exc).__name__}: {str(exc)[:200]}"})
+    if result.ok:
+        return 0
+    if result.status == "rejected" and event == "Stop" and not active:
+        print(_REJECT_TEXT.format(branch=base.get("branch"), detail=str(result.detail)[:300]), file=err)
+        return 2
     return 0
 
 

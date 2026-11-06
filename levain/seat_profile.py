@@ -246,7 +246,9 @@ def build_seat_profile(clone: Path, return_dir: Path, *, claude_bin: str, python
     ``egress`` is the live ``seat-egress`` grant (PATHZERO Z2a, :mod:`levain.seat_push`) or None. With it the sandbox's
     ``allowedDomains`` is the grant's ``allowed_domains`` and the profile carries the lane-branch ``Stop`` /
     ``SessionEnd`` push hook (``cockpit_root`` and ``levain_home`` are what the hook reads, both required); with None
-    both are exactly what they were before Z2a (empty domains, no such hook). A grant never reaches a canary profile."""
+    both are exactly what they were before Z2a (empty domains, no such hook). A grant never reaches a canary profile.
+    The domains are frozen at launch: a revoke stops the push at once, the network only at the seat's relaunch (the
+    KNOWN EDGE at the ``allowedDomains`` line)."""
     environ = os.environ if environ is None else environ
     clone, return_dir, key_dir = _real(clone), _real(return_dir), _real(key_dir)
     roots = (clone, return_dir)
@@ -264,7 +266,12 @@ def build_seat_profile(clone: Path, return_dir: Path, *, claude_bin: str, python
         raise SeatRefusal("; ".join(problems))
 
     sandbox = hg.cc_sandbox_block(clone)
-    # strictAllowlist; empty without a live seat-egress grant (D7: no local binding), else the grant's own list
+    # strictAllowlist; empty without a live seat-egress grant (D7: no local binding), else the grant's own list.
+    # KNOWN EDGE (L3 zc r1 codex HIGH 1): this list is FROZEN into the launch's --settings JSON. A revoke or an expiry
+    # cuts the PUSH at once (the hook and the executor re-read the authority log each time) but NOT the network a
+    # running seat already has: the domains last until that seat is relaunched. Mitigated: the seat holds no remote
+    # credential (the push is Levain's executor, outside the bound), and a launch under a revoked or expired grant gets
+    # no domains (and under an expired lease refuses). Killing running seats on a revoke is the launcher lane's (L-F).
     sandbox["network"]["allowedDomains"] = [] if egress is None else list(egress["allowed_domains"])
     sandbox["filesystem"] = {
         "disabled": False,
