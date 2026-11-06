@@ -816,3 +816,14 @@ def test_cli_replace_and_a_second_add_without_it(ck, sec, cli):
     cli.typed["value"] = OTHER
     assert cli("add", "openai", "--replace", "--yes", "--signing-key", str(ck.key))[0] == 0
     assert read(ck, sec, use="stt") == OTHER                         # the replacement allows both uses (the default)
+
+
+@pytest.mark.parametrize("uses", [("stt",), ("stt", "tts")])
+def test_a_key_is_signed_only_for_uses_the_providers_adapter_serves(ck, sec, uses):
+    """L3 inworld r1 codex LOW: an Inworld key signed for stt would be a standing grant for a use nothing serves, taking effect
+    by itself the day an adapter for it exists. Red with: PROVIDER_USES emptied or the check in _check_names removed."""
+    with pytest.raises(VoiceKeyRefused):
+        add(ck, sec, provider="inworld", uses=uses)
+    assert sec.calls() == []
+    assert custody.default_uses("inworld") == ("tts",) and custody.default_uses("openai") == custody.VOICE_KEY_USES
+    assert add(ck, sec, provider="inworld", uses=("tts",))[0]["uses"] == ["tts"]

@@ -506,7 +506,7 @@ def speak(data_root: Path | str, service: Any, raw: bytes, *, directory: Path | 
     words = chunks[req["chunk"]]
     adapter = vprov.provider_for(provider, transport)
     voice, speed = req["voice"], req["speed"]
-    audio, refused = _call(provider, "tts", len(words), data_root, revoke_queue=revoke_queue, meter=meter,
+    audio, refused = _call(provider, "tts", vprov.inworld_units(words) if provider == "inworld" else len(words), data_root, revoke_queue=revoke_queue, meter=meter,
                            read_key=read_key, last_read=last_read,
                            send=lambda secret: adapter.speak(secret.reveal(), words, voice, speed))
     if refused is not None:

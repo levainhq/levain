@@ -363,3 +363,16 @@ def test_the_factory_resolves_inworld_and_the_adapter_is_speech_only():
     assert isinstance(prov, P.InworldProvider) and prov.uses == frozenset({"tts"})
     assert not hasattr(prov, "transcribe") and not hasattr(prov, "stt_model")
     assert set(P.NAMES) == set(P.HOSTS)
+
+
+def test_inworld_counts_its_input_in_utf16_code_units_so_an_emoji_is_two(server):
+    """L3 inworld r1 codex HIGH: Inworld counts its input limit (and bills) in UTF-16 code units, so 2,001 emoji are under 4,000
+    Python characters and over 4,000 units. Red with: the cap or the unit count using len(text)."""
+    assert P.inworld_units("a\U0001F600") == 3 and P.inworld_units("x" * 5) == 5 and P.inworld_units("\ud800") == 1
+    prov, _ = speaker(server)
+    prov.speak(FAKE_KEY, "\U0001F600" * 2000)                              # exactly 4,000 units: sent
+    assert len(server.received) == 1
+    server.received.clear()
+    with pytest.raises(ValueError):
+        prov.speak(FAKE_KEY, "\U0001F600" * 2001)                          # 4,002 units though only 2,001 characters
+    assert server.received == []

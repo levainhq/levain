@@ -361,6 +361,13 @@ def _send(transport: Transport, provider: str, key: _Key, scheme: str, url: str,
     return answer
 
 
+def inworld_units(text: str) -> int:
+    """``text`` in UTF-16 code units, the unit Inworld counts its input limit and its billing in (a character outside the
+    Basic Multilingual Plane, an emoji, is two): https://docs.inworld.ai/api-reference/ttsAPI/texttospeech/synthesize-speech-stream
+    (read by the L3 inworld r1 codex seat, 2026-11-05). A lone surrogate counts as one."""
+    return len(text.encode("utf-16-le", "surrogatepass")) // 2
+
+
 def _need_speech(text: str, speed: float, cap: int = API_CAP,
                  speed_range: tuple[float, float] = (SPEED_MIN, SPEED_MAX)) -> None:
     if not isinstance(text, str) or not text.strip():
@@ -520,6 +527,8 @@ class InworldProvider:
         del key                                             # from here only the emptied-on-exit _Key names it
         with secret:
             _need_speech(text, speed, INWORLD_INPUT_CAP, (INWORLD_SPEED_MIN, INWORLD_SPEED_MAX))
+            if inworld_units(text) > INWORLD_INPUT_CAP:
+                raise ValueError("text is over the provider's input cap; chunk it first")
             body = json.dumps({"model": self.tts_model, "input": text, "voice": _need_voice(voice), "speed": speed,
                                "response_format": "mp3"}).encode("utf-8")
             audio = _send(self.transport, self.name, secret, INWORLD_AUTH_SCHEME,

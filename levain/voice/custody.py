@@ -47,7 +47,7 @@ from levain.consent.queue import AuthoritySource, authority_source
 
 __all__ = ["DEFAULT_ITEM_ACCOUNT", "DEFAULT_SECURITY", "KeychainWriteFailed", "KeychainWriter", "Secret",
            "SecurityStdinWriter", "VoiceKeyPreview", "VoiceKeyRefused", "VoiceKeyUnavailable", "add_key",
-           "authority_for", "checked_security", "default_source", "list_keys", "read_key", "revoke_key"]
+           "authority_for", "checked_security", "default_source", "default_uses", "list_keys", "read_key", "revoke_key"]
 
 _REAL_SECURITY = "/usr/bin/security"
 #: the binary used unless a caller hands in another; a test points this (or the call) at a stand-in
@@ -235,12 +235,25 @@ class VoiceKeyPreview:
     replaces: tuple[str, ...]
 
 
+# The uses a provider's adapter can carry out, where that is fewer than all of them. A key is signed for a use only if the
+# provider has an adapter for it: a standing grant for a use nothing serves would take effect by itself the day an adapter
+# for it is added, with no fresh signature (L3 inworld r1, codex).
+PROVIDER_USES: dict[str, tuple[str, ...]] = {"inworld": ("tts",)}
+
+
+def default_uses(provider: str) -> tuple[str, ...]:
+    """The uses a key for ``provider`` carries when none is named: every use its adapter serves."""
+    return PROVIDER_USES.get(provider, VOICE_KEY_USES)
+
+
 def _check_names(provider: str, uses: Iterable[str]) -> list[str]:
     if provider not in VOICE_KEY_PROVIDERS:
         raise VoiceKeyRefused(f"{str(provider)[:40]!r} is not a voice provider ({', '.join(VOICE_KEY_PROVIDERS)})")
     chosen = sorted(set(uses))
     if not chosen or any(u not in VOICE_KEY_USES for u in chosen):
         raise VoiceKeyRefused(f"uses are drawn from {', '.join(VOICE_KEY_USES)}")
+    if any(u not in default_uses(provider) for u in chosen):
+        raise VoiceKeyRefused(f"{provider} serves only {', '.join(default_uses(provider))}")
     return chosen
 
 

@@ -32,7 +32,7 @@ def add_parsers(subparsers: argparse._SubParsersAction, common: object) -> None:
     add.add_argument("provider", choices=VOICE_KEY_PROVIDERS, help="The speech provider the key belongs to.")
     add.add_argument("--use", dest="uses", action="append", choices=VOICE_KEY_USES, default=None,
                      help="A use the key is allowed (tts: read aloud; stt: premium dictation, which is not "
-                          "offered in this version); repeatable. Default: both.")
+                          "offered in this version); repeatable. Default: every use the provider serves (Inworld reads aloud only).")
     add.add_argument("--source", default=None,
                      help="The keychain item's service (default: levain-voice-<provider>-<record id>, one new item "
                           "per record). It must name no item that exists: a key is never written over one.")
@@ -105,7 +105,7 @@ def _cmd_add(args: argparse.Namespace) -> int:
     try:
         signer_fp, sign = ssh_signer(args.signing_key)
         rec, warning = custody.add_key(
-            _cockpit_root(args), provider=args.provider, uses=args.uses or custody.VOICE_KEY_USES,
+            _cockpit_root(args), provider=args.provider, uses=args.uses or custody.default_uses(args.provider),
             source=args.source,
             account=args.account or custody.DEFAULT_ITEM_ACCOUNT, value=value, signer_fp=signer_fp, sign=sign,
             clock=_utc_now, replace=args.replace, confirm=lambda p: _confirm(p, args.yes))

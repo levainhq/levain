@@ -1673,9 +1673,11 @@ def test_another_providers_key_is_never_used_for_inworld(rig):
     assert rig.transport.seen == [] and [r.status for r in rig.rows()] == ["released"]
 
 
-def test_inworld_is_speech_only_a_transcribe_naming_it_is_refused_before_any_key_or_meter_row(rig):
-    """Premium dictation is off in the product; with the hidden switch on, Inworld still has no dictation to offer.
+def test_inworld_is_speech_only_a_transcribe_naming_it_is_refused_before_any_key_or_meter_row(rig, monkeypatch):
+    """Premium dictation is off in the product; with the hidden switch on, Inworld still has no dictation to offer. The record
+    names ``stt`` as one signed by a build without custody's per-provider uses would (custody refuses it now).
     Red with: the ``stt_model`` check dropped from ``_query_provider``."""
+    monkeypatch.setattr(custody, "PROVIDER_USES", {})
     rig.add_key(provider="inworld", uses=("stt", "tts"), source=SOURCE + "-inworld")
     with served(rig, premium_stt=True) as (port, _httpd):
         status, _h, out = transcribe(port, provider="inworld")
@@ -1684,9 +1686,10 @@ def test_inworld_is_speech_only_a_transcribe_naming_it_is_refused_before_any_key
     assert rig.transport.seen == [] and rig.rows() == []
 
 
-def test_voice_json_never_lists_dictation_for_inworld_even_when_its_record_allows_it(rig):
-    """A key added with the CLI's default uses carries ``stt``; with premium dictation on, Inworld's row must not offer it.
-    Red with: the ``data.stt_model`` condition dropped from ``serve_voice``."""
+def test_voice_json_never_lists_dictation_for_inworld_even_when_its_record_allows_it(rig, monkeypatch):
+    """A record naming ``stt`` for Inworld (signed by a build without custody's per-provider uses; custody refuses it now) with
+    premium dictation on: Inworld's row must not offer it. Red with: the ``data.stt_model`` condition dropped from ``serve_voice``."""
+    monkeypatch.setattr(custody, "PROVIDER_USES", {})
     rig.add_key(provider="inworld", uses=("stt", "tts"), source=SOURCE + "-inworld")
     rig.add_key(provider="openai")
     with served(rig, premium_stt=True) as (port, _httpd):
@@ -1731,3 +1734,14 @@ def test_openai_is_offered_until_the_cutoff_and_not_from_it_in_both_the_listing_
         assert (t_status, js(t_out)["error"]) == (409, "provider_unsupported")
         assert [s["url"] for s in rig.transport.seen] == [INWORLD_URL]          # nothing went to OpenAI
         assert {r.provider for r in rig.rows()} == {"inworld"}
+
+
+def test_an_inworld_call_is_metered_in_utf16_code_units_so_an_emoji_reserves_two(rig):
+    """L3 inworld r1 codex HIGH: Inworld bills what it counts, UTF-16 code units. Red with: the reservation using len(words)."""
+    rig.add_key(provider="inworld", uses=("tts",), source=SOURCE + "-inworld")
+    g = rig.reply("Hi \U0001F600")
+    with served(rig) as (port, _httpd):
+        status, _hdrs, _body = speak(port, rig, g, provider="inworld", voice="Ashley", speed=1.0)
+    assert status == 200
+    (row,) = rig.rows()
+    assert (row.units, row.cost_micros) == (5, 15 * 5), (row.units, row.cost_micros)       # H i space = 3, the emoji = 2
