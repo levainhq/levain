@@ -262,14 +262,14 @@ def test_a_reads_line_numbers_are_not_drawn_and_no_other_leading_number_is_touch
     assert g[0]["head"] == "A tool result — # CLAUDE.md — flow", g[0]
 
 
-def _stop_boot(stream, state="writable", stop_outcome="confirmed"):
-    return ('window.__body = {room_thread: "t1", composer: {state: "%s"}, model: "m", stream: %s, proposals: [], room_error: null};\n'
+def _stop_boot(stream, state="writable", stop_outcome="confirmed", launch="L1", gap=False):
+    return ('window.__body = {room_thread: "t1", launch_id: %s, gap: %s, composer: {state: "%s"}, model: "m", stream: %s, proposals: [], room_error: null};\n'
             'window.__posts = [];\n'
             'const stub = (u, o) => { const post = o && o.method === "POST"; if (post) window.__posts.push(u);\n'
             '  const out = post ? {outcome: "%s"} : window.__body;\n'
             '  return Promise.resolve({status: 200, ok: true, text: () => Promise.resolve(JSON.stringify(out))}); };\n'
             'window.__rv = LevainRoomView.mount(document.getElementById("host"), {pollMs: 0, storage: null, speech: null, fetch: stub, headers: () => ({})});'
-            % (state, json.dumps(stream), stop_outcome))
+            % (json.dumps(launch), json.dumps(gap), state, json.dumps(stream), stop_outcome))
 
 
 def _turn(gseq, kind, launch):
@@ -288,8 +288,8 @@ _READY = {"until": "window.__rv && window.__rv.model() && document.querySelector
 _SERVES = iter(range(1000))
 
 
-def _stop_disabled(tmp_path, w, stream, state="writable"):
-    boot = _stop_boot(stream, state)
+def _stop_disabled(tmp_path, w, stream, state="writable", launch="L1", gap=False):
+    boot = _stop_boot(stream, state, launch=launch, gap=gap)
     with _serve_room(tmp_path, w, "serve%d" % next(_SERVES), extra_assets={"/rvc.html": ("text/html; charset=utf-8", _PAGE.encode()),
                                                 "/rvc.js": ("text/javascript; charset=utf-8", boot.encode())}) as (base, _h):
         out = _drive(tmp_path, base + "/rvc.html", [_READY, {"eval": "JSON.stringify(%s)" % _STOP}])
@@ -309,8 +309,34 @@ def test_stop_is_available_only_while_a_turn_is_running(tmp_path, w):
     assert _stop_disabled(tmp_path, w, running, "ended") is True                    # no launch to stop
     assert _stop_disabled(tmp_path, w, ended + [_said(4), _turn(5, "vendor_turn_started", "L1")], "writable") is False
     # a turn left open by an earlier launch that died is not the new launch's turn
-    assert _stop_disabled(tmp_path, w, running + [_turn(4, "vendor_turn_started", "L2"), _turn(5, "vendor_turn_ended", "L2")]) is True
-    assert _stop_disabled(tmp_path, w, running + [_turn(4, "vendor_agent_text", "L2")]) is True
+    assert _stop_disabled(tmp_path, w, running + [_turn(4, "vendor_turn_started", "L2"), _turn(5, "vendor_turn_ended", "L2")], launch="L2") is True
+    assert _stop_disabled(tmp_path, w, running + [_turn(4, "vendor_agent_text", "L2")], launch="L2") is True
+
+
+@needs_browser
+def test_a_gapped_stream_with_no_turn_row_of_the_current_launch_is_a_running_turn(tmp_path, w):
+    """Reproduced on the first fix (landing 12 L3, finding a): with the stream gapped and a long turn's start row not in it, no turn
+    row meant idle and Stop was disabled on a live turn. The server says ``gap`` and names the current launch (``launch_id``):
+    a gap with none of that launch's turn rows is running; a seen end still outvotes a gap."""
+    cur_start, cur_end = _turn(2, "vendor_turn_started", "L2"), _turn(3, "vendor_turn_ended", "L2")
+    assert _stop_disabled(tmp_path, w, [_said(1), threads._item(_row(4, "vendor_agent_text", "vendor", "agent_text:4", "L2", "x"), {}, set())],
+                          launch="L2", gap=True) is False
+    assert _stop_disabled(tmp_path, w, [_said(1)], launch="L2", gap=True) is False
+    assert _stop_disabled(tmp_path, w, [], launch="L2", gap=False) is True                    # no gap, no turn rows: idle, as before
+    assert _stop_disabled(tmp_path, w, [_said(1)], launch="L2", gap=False) is True
+    assert _stop_disabled(tmp_path, w, [cur_start, cur_end], launch="L2", gap=True) is True    # a gap does not outvote a seen end
+    assert _stop_disabled(tmp_path, w, [cur_start], launch="L2", gap=True) is False
+
+
+@needs_browser
+def test_a_late_turn_row_of_another_launch_decides_nothing_about_the_current_one(tmp_path, w):
+    """The (b) half of the landing 12 L3 finding, see the test above."""
+    cur_start, cur_end = _turn(2, "vendor_turn_started", "L2"), _turn(3, "vendor_turn_ended", "L2")
+    late_old_start, late_old_end = _turn(9, "vendor_turn_started", "L1"), _turn(9, "vendor_turn_ended", "L1")
+    assert _stop_disabled(tmp_path, w, [cur_start, late_old_end], launch="L2") is False       # the turn is still running
+    assert _stop_disabled(tmp_path, w, [cur_start, cur_end, late_old_start], launch="L2") is True   # the turn is over
+    assert _stop_disabled(tmp_path, w, [late_old_start, cur_start], launch="L2") is False
+    assert _stop_disabled(tmp_path, w, [late_old_start], launch="L2") is True                 # an old launch's open turn is nobody's to stop
 
 
 @needs_browser
