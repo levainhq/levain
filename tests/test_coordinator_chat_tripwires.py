@@ -1230,3 +1230,45 @@ def test_j3_an_activation_or_re_enable_racing_a_read_waits_for_its_interrupt(cs,
         t.join(5)
     # the interrupt the read asked for goes out before the write, which waited for the read to end
     assert order[0] == ("interrupt", None) and order[1] in (writer, f"{writer} refused") and len(order) == 2
+
+
+# --- 1106-1 aliasb: the read exemption when the target is spelled in another letter case (casesweep rows 4, 4b, 4c) ---
+
+def _case_alias_of(p):
+    """``p`` spelled with its letters' case swapped, when this filesystem takes that spelling as the same file (a
+    case-insensitive one: macOS APFS by default); else the test is skipped."""
+    full = str(p).swapcase()
+    if full == str(p) or not os.path.exists(full) or not os.path.samefile(full, p):
+        pytest.skip("this filesystem is case-sensitive: no case alias of a directory exists")
+    return full
+
+
+def test_a_read_target_in_a_case_alias_of_the_root_is_inside_but_an_outside_one_still_latches(root):
+    """casesweep rows 4/4c: `read_target_within` compared the resolved target to the root as strings, and `resolve()`
+    keeps the spelling it is given, so an alias-spelled target INSIDE the root latched ("symlink escape") falsely. The
+    latch fires unless the target is surely inside (`pathid.inside`): an OUTSIDE target in alias spelling still latches.
+    Needs a case-insensitive volume (macOS APFS): on a case-sensitive one no alias exists and this skips, so a Linux CI
+    run never reds it; the injected-fold test below runs there."""
+    alias_root = _case_alias_of(root)
+    inside_alias = os.path.join(alias_root, "inside.txt")
+    assert tw.read_target_within({"file_path": str(root / "inside.txt")}, (str(root),))         # canonical: as before
+    assert tw.read_target_within({"file_path": inside_alias}, (str(root),))                     # row 4
+    assert tw.read_target_within({"file_path": str(root / "inside.txt")}, (alias_root,))        # row 4b
+    outside = str(root.parent / "outside" / "secret.txt")
+    assert not tw.read_target_within({"file_path": outside}, (str(root),))                      # row 4c
+    assert not tw.read_target_within({"file_path": outside.swapcase()}, (alias_root,))
+
+
+def test_a_read_target_through_an_injected_case_fold_is_inside_but_a_sibling_still_latches(root, monkeypatch):
+    """The same logic where no alias exists (a Linux CI run): `pathid._fs_spelling` is replaced by a case-insensitive
+    walk over the real tree. The root is passed in alias spelling (row 4b); the resolved target stays canonical."""
+    from levain import pathid
+    from tests.test_pathid import _case_insensitive_spelling
+    monkeypatch.setattr(pathid, "_fs_spelling", _case_insensitive_spelling)
+    alias_root = str(root.parent / "LAUNCH")
+    assert not os.path.exists(alias_root) or os.path.samefile(alias_root, root)
+    assert tw.read_target_within({"file_path": str(root / "inside.txt")}, (alias_root,))
+    assert tw.read_target_within({"file_path": str(root / "inside.txt")}, (str(root),))
+    secret = root.parent / "outside" / "secret.txt"
+    assert not tw.read_target_within({"file_path": str(secret)}, (alias_root,))
+    assert not tw.read_target_within({"file_path": str(secret)}, (str(root),))
