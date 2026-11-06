@@ -6484,7 +6484,7 @@
       questionBody(it.q, row).then((b) => {
         if (!b || b.error) return;
         const first = needsFirstSentence(b.what);
-        if (first) title.textContent = first;
+        if (first) title.textContent = first.replace(/^\s*DESK OWES:\s*/i, "") || first;   // display only, as the placeholder title above
         if (flat(b.what)) row.title = flat(b.what);
         const more = flat(blocksBeyondTitle(b.what, b.blocks));
         if (more) sub.textContent = "blocks: " + more;
