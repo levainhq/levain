@@ -1,0 +1,60 @@
+name: ubuntu-latest-probe
+
+# NON-GATING. The gating jobs in test.yml are pinned to ubuntu-24.04 (719f4fda) because `ubuntu-latest` moved to
+# 26.04 and these tests fail there. This workflow runs exactly that failing subset on `ubuntu-latest` every week,
+# so the day a product fix or a runner change makes them pass shows up as a green probe. It never gates main:
+# the job is continue-on-error and nothing reads this workflow's verdict (the release gate reads `test`).
+# Known 26.04 failures (run 42223831873): (1) sudo-rs rejects `Defaults !requiretty` (levain/firing/hands.py
+# sudoers_text -> visudo "unknown setting"); (2) the confined shell's start probe dies with "Invalid environment
+# variable name evaluates to an empty string" (the runner's ${...} reaches an expander before bash does).
+
+on:
+  schedule:
+    - cron: "17 6 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  probe:
+    name: ubuntu-latest probe (non-gating)
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Show the runner image
+        run: |
+          grep PRETTY_NAME /etc/os-release
+          sudo --version | head -1
+          systemd --version | head -1 || true
+          bash --version | head -1
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+
+      - name: Make the runner's container-daemon socket directory readable
+        run: sudo chmod o+rx /run/podman || true
+
+      - name: Install package with dev and openhands extras
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e ".[dev,openhands]" hatchling
+
+      - name: Run the tests that fail on ubuntu-26.04
+        run: |
+          pytest -q --basetemp=/tmp/levain-pt \
+            tests/test_hands_isolation.py::test_the_sudoers_text_parses \
+            tests/test_firing_tools.py::test_bash_runs_keeps_state_and_refuses_crown_jewels \
+            tests/test_firing_tools.py::test_bash_reports_exit_n_and_keeps_the_shell \
+            tests/test_firing_confinement.py \
+            tests/test_floor_process_view.py \
+            tests/test_floor_project_memory.py \
+            tests/test_floor_spellings.py \
+            tests/test_jewel_recheck.py \
+            tests/test_nlink_floor.py \
+            tests/test_runtime_view.py \
+            tests/test_shell_oob_status.py
