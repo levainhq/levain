@@ -907,12 +907,19 @@ def decide(event: Any, queue: ConsentQueue, settings: AdapterSettings, *, enviro
                     contained_launch=None, **kw)
     if isinstance(out, Decided):
         answer = hook_output(out.decision)
-        # the live hook is a PermissionRequest hook only (no PostToolUse recorder, no PreToolUse gate), so this is the
-        # one place a verified answer can reach the ledger (1106-51). After the output is built; never changes it.
+        # A PermissionRequest decision files its decision-time ledger row here (1106-51), EXCEPT a gate-take: the
+        # request the PreToolUse gate filed (event id ``hook:<tool_use_id>``; this event's own request is ``rand:``)
+        # already has the row `_gate_call`'s ``deliver`` wrote, so a second one would count the call twice.
+        # Known edge (pinned in tests/test_consent_cc_permreq_ledger.py): a PermissionRequest event carries no
+        # tool_use_id, so with PostToolUse also wired the later post row cannot join this one: one call counts twice.
+        # Timing: the write is on the answer's path, bounded as `_gate_call`'s ``deliver`` is (same note-then-return
+        # order): the ledger sets PRAGMA busy_timeout = HOOK_BUSY_SECONDS (2.0 s) per lock wait; a failure is swallowed.
         try:
-            c = out.call
-            _ledger_note(Path(queue.directory), event, c.session, c.tool_name, event.get("tool_input") or {}, c.cwd,
-                         decision=out.decision, request_id=out.request.id)
+            if not str(getattr(out.request, "event_id", "")).startswith("hook:"):
+                c = out.call
+                raw = event.get("tool_input", {})  # decide_ex's normalisation: missing or None -> {}, else as is
+                _ledger_note(Path(queue.directory), event, c.session, c.tool_name, {} if raw is None else raw, c.cwd,
+                             decision=out.decision, request_id=out.request.id)
         except Exception:  # noqa: BLE001 - the ledger is a record, never the answer
             pass
         return answer
