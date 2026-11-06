@@ -29,13 +29,16 @@ const put = (nonce, e) => store.set(PFX + nonce, JSON.stringify({ nonce, ...e })
 const has = (nonce) => store.has(PFX + nonce);
 const left = () => [...store.keys()].map((k) => k.slice(PFX.length)).sort();
 let sandbox;
+let standalone = true, tray = [], trayThrows = false, noGetN = false;   // 'shown' scenario knobs: display mode, what the tray holds
 const tick = () => new Promise((r) => setTimeout(r, 30));
 async function boot(href = 'https://box.example/') {
   handlers = []; winHandlers = {}; docHandlers = {};
   sandbox = {
     URL, Response, Date: scenario === 'datethrow' ? Object.assign(class extends Date { static now() { throw new Error('clock'); } }) : Date, Promise, JSON, setTimeout,
     location: { origin: 'https://box.example', href, assign: (u) => log.assigned.push(u) },
-    navigator: { standalone: true, serviceWorker: { controller: {}, addEventListener: (t, fn) => handlers.push(fn), startMessages: () => { log.started = true; } } },
+    matchMedia: (q) => ({ matches: scenario === 'shown' && standalone && /standalone/.test(q) }),
+    navigator: { get standalone() { return scenario === 'shown' ? false : true; }, serviceWorker: { controller: {},
+      getRegistration: async () => (noGetN ? {} : { getNotifications: async (f) => { log.getN = (log.getN || []).concat([f]); if (trayThrows) throw new TypeError('no'); return tray.filter((n) => !f || !f.tag || n.tag === f.tag); } }), addEventListener: (t, fn) => handlers.push(fn), startMessages: () => { log.started = true; } } },
     window: { addEventListener: (t, fn) => { (winHandlers[t] = winHandlers[t] || []).push(fn); } },
     document: { visibilityState: 'hidden', addEventListener: (t, fn) => { (docHandlers[t] = docHandlers[t] || []).push(fn); } },
   };
@@ -44,6 +47,8 @@ async function boot(href = 'https://box.example/') {
   vm.runInContext(fs.readFileSync(swOpen, 'utf8'), sandbox);
   await tick();
 }
+const SHOWN_U = '/?view=notifications&n=p607';
+const putShown = (e = {}) => store.set(PFX + 'shown', JSON.stringify({ url: SHOWN_U, nonce: 'sn', at: Date.now(), for: 'shown', ping: 607, tag: 'np-607', ...e }));
 const CARD = 'https://box.example/sign/9#sign=a&v=1';
 const U = '/sign/9#sign=a&v=1';
 const send = (data) => handlers.forEach((h) => h({ data, ports: [{ postMessage: (m) => log.acks.push({ m, assignedSoFar: log.assigned.length }) }] }));
@@ -138,6 +143,32 @@ const fire = async (t, o, ev = {}) => { for (const fn of (o[t] || [])) fn(ev); a
     const before = log.assigned.length;
     await boot('https://box.example/?view=needs');
     log.fragment = { moved: log.assigned.length - before, pending: has('q2') };
+  } else if (scenario === 'shown') {
+    // every case is a NEW document over a fresh store. Each case: {assigned: how many moves, kept: is the entry still stored}
+    const run = async (name, { href = 'https://box.example/', st = true, tr = [], throws = false, nogetn = false, entry = {}, none = false, extra } = {}) => {
+      store.clear(); log.assigned.length = 0; standalone = st; tray = tr; trayThrows = throws; noGetN = nogetn;
+      if (!none) putShown(entry);
+      if (extra) extra();
+      await boot(href);
+      log[name] = { assigned: log.assigned.slice(), kept: has('shown') };
+    };
+    await run('launch');                                                          // bare standalone '/', notification gone: redirect, consumed
+    await run('inTray', { tr: [{ tag: 'np-607', data: { ping: 607 } }] });        // still showing: a manual launch stays
+    await run('otherPingInTray', { tr: [{ tag: 'np-607', data: { ping: 600 } }] }); // an older ping under the tag is not this one
+    await run('query', { href: 'https://box.example/?view=needs' });
+    await run('fragment', { href: 'https://box.example/#x' });
+    await run('signPath', { href: 'https://box.example/sign/3' });
+    await run('notStandalone', { st: false });
+    await run('expired', { entry: { at: Date.now() - 181000 } });                 // expired: deleted by the sweep
+    await run('fresh', { entry: { at: Date.now() - 170000 } });                   // inside 180 s
+    await run('throws', { throws: true });
+    await run('noApi', { nogetn: true });
+    await run('crossOrigin', { entry: { url: 'https://evil.example/x' } });
+    await run('noPing', { entry: { ping: undefined } });
+    await run('newWins', { extra: () => put('n9', { url: '/sign/4', at: Date.now(), for: 'new' }) });   // a 'new' entry is claimed, not the shown one
+    log.newWinsLeft = left();
+    await run('none', { none: true });
+    log.getNCalls = log.getN;
   } else if (scenario === 'ntap') {
     // a tap's page address carries the notification-center item id: the trace says THAT it did, never which
     await boot('https://box.example/?view=notifications&n=p123456');

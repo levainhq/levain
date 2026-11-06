@@ -6,7 +6,7 @@
 // whichever opens first creates the store; correctness depends on no timing (an unread key waits for the next trigger).
 const DB = 'levain-sw-2', STORE = 'opened';
 // A short id of this worker's code, recorded in the trace so a device's trace says which worker ran.
-const SW_VERSION = '1105-land9b-1';
+const SW_VERSION = '1106-51-shown-1';
 // The TRACE: an append-only ring in its own cache, one entry per step, key TRACE_PREFIX + <time ms, zero padded> + '-' +
 // <seq>, value JSON {t, src, step, ...detail}. The /tap_trace page and sw_open.js read and write the same ring. Writes are
 // best effort, serialized on one chain, never awaited by the tap, and carry only urls without fragments, counts and step
@@ -611,7 +611,8 @@ self.addEventListener('push', (e) => {
                                    .catch(() => false)]);   // total: a throw in this arm would reject Promise.all, and the budget's end would abort `received` too
     if (r.some((x) => x === true)) await drainReceipts(b);
   });
-  e.waitUntil(Promise.allSettled([shown, badged, receipts]).finally(traceSettled));
+  const shownPending = putShownPending(d);   // the launch fallback (sw_open.js): best effort and total, after the show was asked
+  e.waitUntil(Promise.allSettled([shown, badged, receipts, shownPending]).finally(traceSettled));
   shown.catch((err) => trace('show-failed', { error: err && err.name || 'error' }));
 });
 
@@ -636,6 +637,43 @@ async function dropPending(key) {
   if (!key) return false;
   const c = await caches.open(OPEN_CACHE);
   return c.delete(key);
+}
+// for: 'shown' = the launch fallback for a tap whose notificationclick never runs (iOS Home Screen app, 2026-11-06: pings 607-609
+//                were shown, no click step, the app opened at '/'). Written by the push event AFTER the notification was asked for,
+//                under ONE fixed key (a newer push replaces the older entry: at most one is kept), value {url, nonce, at, for,
+//                ping, tag}. Only a page's first load may take it (sw_open.js), and only at a bare standalone '/' within
+//                SHOWN_TTL_MS with the notification gone from the tray. A click that does run deletes it (dropShownPending).
+const SHOWN_KEY = OPEN_PREFIX + 'shown';
+async function putShownPending(d) {
+  try {
+    if (!d || !d.url || typeof d.url !== 'string') return false;
+    const tag = d.tag || 'levain';
+    if (tag === 'summary') return false;   // a held summary links a view and is no item (sender.py: tag = ref or kind)
+    const ping = typeof d.ping === 'number' ? d.ping : Number(d.ping);
+    if (!Number.isInteger(ping) || ping <= 0) return false;   // the page cannot tell whether it was tapped without the ping
+    let u;
+    try { u = new URL(d.url, self.location.origin); } catch (_) { u = null; }
+    const url = u && u.origin === self.location.origin ? u.pathname + u.search + u.hash : '/';
+    const c = await caches.open(OPEN_CACHE);
+    await c.put(SHOWN_KEY, new Response(JSON.stringify({ url, nonce: newNonce(), at: Date.now(), for: 'shown', ping, tag: String(tag) })));
+    trace('shown-pending', { ping, url: traceUrl(url) });
+    return true;
+  } catch (err) {
+    trace('shown-pending-failed', { error: err && err.name || 'error' });
+    return false;
+  }
+}
+// a tap that DID fire its click owns the open: the 'shown' entry of that ping goes (a later bare launch is not redirected twice)
+async function dropShownPending(ping) {
+  try {
+    const n = typeof ping === 'number' ? ping : Number(ping);
+    if (!Number.isInteger(n)) return false;
+    const c = await caches.open(OPEN_CACHE);
+    const r = await c.match(SHOWN_KEY);
+    const e = r && await r.json();
+    if (!e || Number(e.ping) !== n) return false;
+    return await c.delete(SHOWN_KEY);
+  } catch (_) { return false; }
 }
 const newNonce = () => Math.random().toString(36).slice(2) + Date.now().toString(36);
 
@@ -768,5 +806,6 @@ self.addEventListener('notificationclick', (e) => {
   })();
   // the receipt queue is re-sent beside the tap, under the click's own receipt budget (never holding the tap)
   const rb = receiptBudget(clickT0);
-  e.waitUntil(Promise.allSettled([opened, mark, boundedReceipts(rb, () => drainReceipts(rb))]).then(traceSettled));
+  const dropShown = dropShownPending(data.ping);
+  e.waitUntil(Promise.allSettled([opened, mark, dropShown, boundedReceipts(rb, () => drainReceipts(rb))]).then(traceSettled));
 });

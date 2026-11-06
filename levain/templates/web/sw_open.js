@@ -18,7 +18,9 @@
   const CACHE = "levain-open", PREFIX = "/__levain_open/";
   // a target older than this is a tap nobody followed up (the card it points at is stale, and a later plain visit must not jump).
   // 'new': the window between openWindow and the opened page's first script run. 'asked': the worker's ack wait plus slack.
-  const TTL_MS = { asked: 30000, new: 30000 };
+  // 'shown': the launch fallback for a tap whose notificationclick never ran (see below); SHOWN_TTL_MS is also its expiry here.
+  const SHOWN_TTL_MS = 180000;
+  const TTL_MS = { asked: 30000, new: 30000, shown: SHOWN_TTL_MS };
   const haveCache = typeof caches !== "undefined";
 
   // The TRACE (the worker writes the same ring, see sw.js): one cache entry per step under '/__levain_trace/<time>-<seq>',
@@ -100,7 +102,7 @@
     checking = true;
     try {
       const cache = await caches.open(CACHE);
-      const found = [], seen = [];
+      const found = [], seen = [], shownEntries = [];
       for (const req of await cache.keys()) {
         if (new URL(req.url).pathname.indexOf(PREFIX) !== 0) continue;
         let e = null;
@@ -111,6 +113,7 @@
           await cache.delete(req); continue;
         }
         seen.push({ for: e.for || null, ageMs: Date.now() - e.at, url: traceUrl(e.url) });
+        if (e.for === "shown") { shownEntries.push({ req, e }); continue; }   // never claimable by the 'new' path (below)
         if (e.for !== "new") continue;                       // 'asked' belongs to the message path
         let u;
         try { u = new URL(e.url, location.href); } catch (_) { continue; }
@@ -129,7 +132,43 @@
         return;
       }
       trace("checkPending", { seen, claimed: null, assigned: false });
+      await takeShown(cache, shownEntries, here);
     } catch (_) { /* no cache: nothing pending */ } finally { checking = false; }
+  }
+  // The LAUNCH FALLBACK. On the iPhone Home Screen app a tapped push can open the app at the bare '/' without ever running the
+  // worker's notificationclick (11-06: pings 607-609 shown, no click, no `opens` row), so the target is lost. The worker writes
+  // a 'shown' entry on every push (sw.js putShownPending). This document, at its first run, takes the newest one ONLY when
+  // everything says "launched by that tap": the page is exactly '/' (no query, no fragment), a standalone launch, the entry at
+  // most SHOWN_TTL_MS old and same-origin, and the notification it names is no longer in the tray (iOS dismisses a tapped
+  // one; a manual launch with the notification still showing must not redirect). Anything unknown (no registration, no
+  // getNotifications, a throw) fails toward the plain launch.
+  async function takeShown(cache, entries, here) {
+    if (!entries.length) return;
+    const bare = here.pathname === "/" && !here.search && !here.hash;
+    let standalone = false;
+    try { standalone = !!((typeof matchMedia === "function" && matchMedia("(display-mode: standalone)").matches) || navigator.standalone); } catch (_) { standalone = false; }
+    if (!bare || !standalone) { trace("shown-skip", { why: !bare ? "not-bare" : "not-standalone" }); return; }
+    entries.sort((x, y) => y.e.at - x.e.at);
+    const f = entries[0];
+    const age = Date.now() - f.e.at;
+    let u = null;
+    try { u = new URL(f.e.url, location.href); } catch (_) { u = null; }
+    if (!u || u.origin !== location.origin) { trace("shown-skip", { why: "cross-origin" }); return; }
+    if (age > SHOWN_TTL_MS) { trace("shown-skip", { why: "expired" }); return; }
+    const ping = Number(f.e.ping), tag = typeof f.e.tag === "string" ? f.e.tag : "";
+    if (!Number.isInteger(ping)) { trace("shown-skip", { why: "no-ping" }); return; }
+    let inTray;
+    try {
+      const sw = navigator.serviceWorker;
+      const reg = await Promise.race([sw.getRegistration ? sw.getRegistration() : sw.ready, new Promise((r) => setTimeout(() => r(null), 3000))]);
+      if (!reg || typeof reg.getNotifications !== "function") { trace("shown-skip", { why: "no-api" }); return; }
+      const list = Array.from(await reg.getNotifications({ tag }));
+      inTray = list.some((n) => n && n.data && Number(n.data.ping) === ping);
+    } catch (_) { trace("shown-skip", { why: "error" }); return; }
+    if (inTray) { trace("shown-skip", { why: "in-tray" }); return; }
+    if (!(await cache.delete(f.req))) return;   // a lost delete: another page took it
+    trace("shown-launch", { url: traceUrl(u.href), ping, ageMs: age });
+    assignTo(u.href);
   }
   // once, at this document's first script run: a pageshow call would let a page opened for one tap consume a later tap's entry
   checkPending();

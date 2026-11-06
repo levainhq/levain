@@ -253,12 +253,19 @@ function fire(type, ev) {
     // 'taghostile': a tag whose length throws, so heldByAgent's own failure path throws too (nothing real sends one: the
     // flag exists to reach the chain's trailing catch)
     if (parts.includes('taghostile')) data.tag = { get length() { if (!log.hostileTagDone) throw new TypeError('hostile tag'); return 7; }, toString: () => 'hostile' };
+    // 'nourl': no url in the payload; 'summary': the held-summary tag; 'crossurl': an off-origin url; 'second': a second push (ping 43) after the first;
+    // 'clickping': the `then:...+click` carries ping 42 (as a real notification's data does), 'clickother': ping 99
+    if (parts.includes('nourl')) delete data.url;
+    if (parts.includes('summary')) data.tag = 'summary';
+    if (parts.includes('crossurl')) data.url = 'https://evil.example/x';
     const started = Date.now();
     const evPush = () => ({ data: { json: () => data } });
     if (!parts.includes('clickonly')) {
       await fire('push', evPush());
       if (parts.includes('twice')) await fire('push', evPush());
+      if (parts.includes('second')) { data.ping = 43; data.tag = 'y'; data.url = '/?view=notifications&n=p43'; await fire('push', evPush()); }
     }
+    log.shownAfterPush = pendings().filter((p) => p.for === 'shown');
     log.elapsedMs = Date.now() - started;
     log.afterFirst = { posts: log.posts.length, queued: [...(cacheStores.get('levain-receipts') || new Map()).keys()].sort() };
     log.firstPosts = log.posts;
@@ -269,7 +276,7 @@ function fire(type, ev) {
       log.windows = [windowClient];
       if (parts.includes('rotate')) log.subscription = { endpoint: 'https://fcm.googleapis.com/fcm/send/dev2' };
       const t1 = Date.now();
-      if (parts.includes('click')) await fire('notificationclick', { notification: { close: () => {}, data: { url: '/' } } });
+      if (parts.includes('click')) await fire('notificationclick', { notification: { close: () => {}, data: { url: '/', ...(parts.includes('clickping') ? { ping: 42 } : parts.includes('clickother') ? { ping: 99 } : {}) } } });
       if (parts.includes('push')) await fire('push', evPush());
       log.thenMs = Date.now() - t1;
     }
@@ -279,6 +286,7 @@ function fire(type, ev) {
       await fire('notificationclick', { notification: { close: () => {}, data: { url: '/' } } });
       log.clickMs = Date.now() - t1;
     }
+    log.shownAfterClick = pendings().filter((p) => p.for === 'shown');
     log.queued = [...(cacheStores.get('levain-receipts') || new Map()).keys()].sort();
     log.trace = traceSteps();
   } else if (scenario === 'click') {
