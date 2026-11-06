@@ -52,7 +52,8 @@
       load({ passive: true, auto: true });
     }, RETRY_MS[Math.min(retryN++, RETRY_MS.length - 1)]);
   }
-  window.addEventListener("online", function () { if (!everDrawn && !refusedStop && !inflight) { clearTimeout(retryT); retryT = 0; load({ passive: true, auto: true }); } });
+  // (the node harnesses that load this file hand it a window with no event API)
+  if (typeof window.addEventListener === "function") window.addEventListener("online", function () { if (!everDrawn && !refusedStop && !inflight) { clearTimeout(retryT); retryT = 0; load({ passive: true, auto: true }); } });
   // A non-passive (save / boot) reload is AUTHORITATIVE — it must eventually render. If one
   // lands while a load is in flight, the shared `inflight` guard would drop it; latch it
   // here and re-fire when the current load settles, so a save's reload can't be swallowed by
