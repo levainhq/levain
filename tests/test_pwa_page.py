@@ -120,3 +120,21 @@ def test_a_status_bar_inset_pushes_the_masthead_below_the_clock(tmp_path: Path) 
             {"eval": "document.querySelector('.masthead').getBoundingClientRect().top >= 59"},
         ])
     assert out["values"][-1] is True
+
+
+# every manifest read answers 403 with a token message (this device's token is missing or wrong)
+REFUSE_ALL = ("(() => { const f = window.fetch.bind(window); window.__manifest_reads = 0;"
+              " window.fetch = function (u, o) { if (String(u).indexOf('/cockpit/manifest.json') === 0) { window.__manifest_reads++;"
+              " return Promise.resolve(new Response(JSON.stringify({error: 'forbidden', message: 'missing or invalid write token'}),"
+              " {status: 403, headers: {'Content-Type': 'application/json'}})); } return f(u, o); }; })()")
+
+
+@needs_browser
+def test_a_refused_device_is_not_retried_in_a_loop(tmp_path: Path) -> None:
+    _root, src, _ids = _install(tmp_path)
+    with _serve_plain(src) as url:
+        out = _drive(tmp_path, f"{url}/", [
+            {"init": REFUSE_ALL},
+            {"eval": "new Promise(r => setTimeout(() => r(window.__manifest_reads), 7000))"},
+        ])
+    assert out["values"][-1] <= 3, out["values"]      # the boot read (and its token re-read), never a 2/4/8 s retry loop

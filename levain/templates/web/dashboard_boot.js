@@ -33,9 +33,21 @@
   function drawnOnce() { everDrawn = true; retryN = 0; clearTimeout(retryT); retryT = 0; }
   function retryUntilDrawn(why) {
     if (everDrawn) return;
+    // a refusal (the token the page holds is missing or wrong) is not a network blip: a retry would only ask again, and each ask can
+    // put up the token prompt. Say it and stop; the next foreground or the Refresh button reads again.
+    if (/token|forbidden|refused/i.test(why)) {
+      if (storeEl) { storeEl.hidden = false; storeEl.textContent = "the cockpit refused this device (" + why + "); pair it again or reload"; }
+      return;
+    }
     if (storeEl) { storeEl.hidden = false; storeEl.textContent = "can't reach the cockpit yet (" + why + "), trying again…"; }
     if (retryT) return;
-    retryT = setTimeout(function () { retryT = 0; if (!everDrawn) load({ passive: true }); }, RETRY_MS[Math.min(retryN++, RETRY_MS.length - 1)]);
+    // a read already in flight (a foreground started one) would drop this retry and end the chain: wait and ask again instead
+    retryT = setTimeout(function () {
+      retryT = 0;
+      if (everDrawn) return;
+      if (inflight) { retryUntilDrawn(why); return; }
+      load({ passive: true });
+    }, RETRY_MS[Math.min(retryN++, RETRY_MS.length - 1)]);
   }
   window.addEventListener("online", function () { if (!everDrawn && !inflight) { clearTimeout(retryT); retryT = 0; load({ passive: true }); } });
   // A non-passive (save / boot) reload is AUTHORITATIVE — it must eventually render. If one
