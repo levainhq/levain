@@ -31,7 +31,8 @@ def add_parsers(subparsers: argparse._SubParsersAction, common: object) -> None:
     add = key_sub.add_parser("add", help="Store a provider key and sign its record (a laptop-presence key).")
     add.add_argument("provider", choices=VOICE_KEY_PROVIDERS, help="The speech provider the key belongs to.")
     add.add_argument("--use", dest="uses", action="append", choices=VOICE_KEY_USES, default=None,
-                     help="A use the key is allowed (tts: read aloud, stt: dictation); repeatable. Default: both.")
+                     help="A use the key is allowed (tts: read aloud; stt: premium dictation, which is not "
+                          "offered in this version); repeatable. Default: both.")
     add.add_argument("--source", default=None,
                      help="The keychain item's service (default: levain-voice-<provider>-<record id>, one new item "
                           "per record). It must name no item that exists: a key is never written over one.")

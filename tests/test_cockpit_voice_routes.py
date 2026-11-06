@@ -212,10 +212,12 @@ def rig(tmp_path, qdir, monkeypatch):  # noqa: F811 - the imported fixture, take
 
 @contextmanager
 def served(rig: Rig, *, room: bool = True, signer_q: Path | None = None, signer_on: bool = True,
-           mesh: bool = False):
+           mesh: bool = False, premium_stt: bool = True):
     """``levain serve`` over the rig. By default with a Signer over the consent reader's own queue, as a real install
     runs it, so the phone's grant routes are served (a voice route reads no key without them). ``signer_q`` names
-    another queue; ``signer_on=False`` serves no Signer at all."""
+    another queue; ``signer_on=False`` serves no Signer at all. ``premium_stt`` is the server's premium-dictation
+    switch (``make_server(premium_stt=)``, off in the product): this fixture turns it ON so every transcribe test below
+    runs the route as it was built; the tests of the hidden default pass ``premium_stt=False``."""
     port = _free_port()
     signer = None
     if signer_q is None and signer_on:
@@ -226,7 +228,7 @@ def served(rig: Rig, *, room: bool = True, signer_q: Path | None = None, signer_
     kw = {"room_host": rig.w.host} if room else {}
     httpd = make_server(rig.src, host="127.0.0.1", port=port, write_token=TOKEN,
                         surface_tokens={"browser": TOKEN, "ipad": MESH_TOKEN}, chat_service=rig.w.svc,
-                        signer=signer, **kw)
+                        signer=signer, premium_stt=premium_stt, **kw)
     httpd.voice_transport = rig.transport
     if mesh:
         httpd.is_loopback_bind = False
@@ -1498,3 +1500,101 @@ def test_t_gate_the_too_long_sentence_names_the_size_cap_that_is_enforced_not_a_
     assert sentence == "That recording is too large to transcribe."
     assert not any(w in sentence.lower() for w in ("minute", "second", "hour", "duration", "long"))
     assert isinstance(cockpit_voice.UPLOAD_MAX, int) and cockpit_voice.UPLOAD_MAX == 4 * 1024 * 1024
+
+
+# --- 12. HIDDEN-STT: premium dictation is off for Levain 1.0 (Phill 11-05) -------------------------------------------------
+
+OFF_WORDS = "Premium dictation is not offered in this version."
+
+
+def test_hidestt_the_switch_is_off_unless_named_true_and_the_flag_is_hidden(tmp_path, monkeypatch, capsys):
+    """The default is off in the class, in ``make_server`` and on the CLI, only ``True`` turns it on, and ``--premium-stt``
+    is parsed but absent from ``levain serve --help``.
+    Red with: any default turned to True, ``premium_stt is True`` loosened to a truthiness test (the string case), or the
+    flag's ``help=argparse.SUPPRESS`` removed."""
+    import inspect
+
+    import levain.web_server as ws
+    from levain.cli import main
+
+    assert ws._LevainHTTPServer.premium_stt is False
+    assert inspect.signature(make_server).parameters["premium_stt"].default is False
+    assert inspect.signature(ws.run_web_server).parameters["premium_stt"].default is False
+    got: dict = {}
+    monkeypatch.setattr(ws, "run_web_server", lambda path, **k: got.update(k) or 0)
+    assert main(["serve", "--path", str(tmp_path)]) == 0 and got["premium_stt"] is False
+    got.clear()
+    assert main(["serve", "--path", str(tmp_path), "--premium-stt"]) == 0 and got["premium_stt"] is True
+    with pytest.raises(SystemExit):
+        main(["serve", "--help"])
+    assert "--premium-stt" not in capsys.readouterr().out
+
+
+def test_hidestt_a_truthy_non_true_value_does_not_turn_it_on(rig):
+    """``make_server(premium_stt="yes")`` is off: the route answers the fixed refusal.
+    Red with: ``httpd.premium_stt = premium_stt is True`` loosened to ``bool(premium_stt)``."""
+    rig.add_key()
+    with served(rig, premium_stt="yes") as (port, httpd):      # type: ignore[arg-type]
+        assert httpd.premium_stt is False
+        status, _h, body = transcribe(port)
+    assert (status, js(body)["message"]) == (404, OFF_WORDS)
+    assert rig.transport.seen == [] and rig.rows() == []
+
+
+def test_hidestt_off_the_transcribe_route_refuses_in_fixed_words_before_anything_is_read(rig, monkeypatch):
+    """With the switch off the transcribe POST answers one 404 in the fixed words, the connection closed, BEFORE the
+    content type, the length, the voice slot, the body, the meter and the key are looked at: no key is read, no
+    ledger exists, no provider is called, and the answer is the same with a key set and with none. A request that sends
+    no body at all, a non-audio type and an over-size length get the same answer (the switch precedes those gates).
+    Speak is untouched.
+    Red with: the ``not srv.premium_stt`` guard removed from ``_voice_answer`` (a 200 with a key, a 409 with none,
+    a 415/413 for the wrong type or size), or moved after ``_read_body``/``_call`` (the body is read or the key is read)."""
+    read = []
+    real = custody.read_key
+    monkeypatch.setattr(custody, "read_key", lambda *a, **k: read.append(a) or real(*a, **k))
+    q = TRANSCRIBE + "?provider=openai"
+    answers = []
+    for with_key in (False, True):
+        if with_key:
+            rig.add_key()
+        g = rig.reply("Hello there.")
+        with served(rig, premium_stt=False) as (port, httpd):
+            for request in (head(port, q, ctype="audio/webm", clen="4096"),
+                            head(port, q, ctype="text/plain", clen="4096"),
+                            head(port, q, ctype="audio/webm", clen=str(cockpit_voice.UPLOAD_MAX + 1)),
+                            head(port, q, ctype="audio/webm", clen=None)):
+                got, body, hdrs = raw(port, request)           # answered with no body ever sent
+                assert (got, body["error"], body["message"]) == (404, "not_found", OFF_WORDS), (with_key, request)
+                assert hdrs.get("connection") == "close", request
+                answers.append(json.dumps(body, sort_keys=True))
+            status, _h, out = transcribe(port)                  # and a full audio upload, body sent
+            assert (status, js(out)["message"]) == (404, OFF_WORDS)
+            answers.append(json.dumps(js(out), sort_keys=True))
+            for _ in range(cockpit_voice.VOICE_INFLIGHT):        # the voice slots were never taken
+                assert httpd.voice_gate.acquire(blocking=False)
+            for _ in range(cockpit_voice.VOICE_INFLIGHT):
+                httpd.voice_gate.release()
+            if with_key:
+                assert speak(port, rig, g)[0] == 200             # read-aloud still works beside the hidden dictation
+    assert len(set(answers)) == 1, set(answers)                 # nothing of whether a key exists
+    assert [a[:2] for a in read] == [("openai", "tts")], read      # speak's read only: transcribe read no key
+    assert [(r.use, r.status) for r in rig.rows()] == [("tts", "ok")]
+    assert len(rig.transport.seen) == 1
+
+
+def test_hidestt_off_the_listing_offers_no_dictation_and_on_it_does(rig):
+    """The page reads ``voice.json`` to decide what to offer: off, no provider lists ``stt`` among its uses, the body
+    says ``premium_stt: false`` and the retention words leave transcription out; on, it is as it was.
+    Red with: the ``premium_stt or u != "stt"`` filter dropped (stt listed while off), or the retention choice dropped."""
+    rig.add_key()
+    with served(rig, premium_stt=False) as (port, _httpd):
+        off = js(call(port, "GET", VOICE_JSON)[2])
+    with served(rig, premium_stt=True) as (port, _httpd):
+        on = js(call(port, "GET", VOICE_JSON)[2])
+    openai_off, openai_on = off["providers"][0], on["providers"][0]
+    assert off["premium_stt"] is False and on["premium_stt"] is True
+    assert openai_off["uses"] == ["tts"] and openai_on["uses"] == ["stt", "tts"]
+    assert "ranscri" not in openai_off["retention"] and "Transcription" in openai_on["retention"]
+    for text in _strings(off):
+        assert "dictation" not in text.lower() and "transcri" not in text.lower(), text
+    assert openai_off["key"] == "set"                            # the key itself is as it was: only the use is hidden
