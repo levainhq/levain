@@ -348,3 +348,95 @@ def test_a_pause_wins_over_an_unreadable_log_and_one_bad_judgement_is_one_row(tm
     assert "arming unknown" in bodies[seeing.rid("firing")]["body"]
     assert bodies[seeing.rid("firing")]["facets"]["agent_link"] == ""
     assert bodies[seeing.rid("paused")]["group"] == "paused"
+
+
+# --- P9a-k: the kind facet. Each case was first run as a script against this rig ($CLAUDE_JOB_DIR/tmp/p9ak/run.py) ---
+
+def _kind_role(name: str, kind: str | None = None) -> dict:
+    role = copy.deepcopy(ROLES["notify-role"])
+    role["name"] = name
+    if kind is not None:
+        role["kind"] = kind
+    return role
+
+
+def _kind_agent(world: World, name: str, role: dict) -> str:
+    """Register ``role`` and one agent ``w-<name>`` pinning it; return the agent id."""
+    from levain.agents.role import add_role
+
+    add_role(world.rig.store, role)
+    d = copy.deepcopy(SPECS["job_push_check"])
+    d["name"] = "w-" + name
+    d["role"] = {"name": role["name"], "role_hash": role_hash(role)}
+    return register_spec(world.rig.store, parse_spec(d), "America/New_York")[0]
+
+
+def _kind_rows(world: World) -> dict[str, dict]:
+    return {r["id"]: r for r in world.panel()["rows"]}
+
+
+def test_each_row_carries_the_kind_of_the_role_its_spec_pins(world):
+    # behaviour: a job role and a role role (named or by default) read as such, on the panel and on read_one alike;
+    # `"kind": "role"` is the same role as none, so the two share a row's kind and a hash
+    job = _kind_agent(world, "kjob", _kind_role("kjob-role", "job"))
+    plain = _kind_agent(world, "kplain", _kind_role("kplain-role"))
+    named = _kind_agent(world, "knamed", _kind_role("knamed-role", "role"))
+    rows = _kind_rows(world)
+    assert [rows["agent:" + a]["facets"]["agent_kind"] for a in (job, plain, named)] == ["job", "role", "role"]
+    for a, want in ((job, "job"), (plain, "role"), (named, "role")):
+        assert world.ck.read_one(AGENTS_ID, "agent:" + a).value["facets"]["agent_kind"] == want
+    # every row has the facet: the retired and the paused ones too
+    assert all("agent_kind" in r["facets"] for r in rows.values())
+
+
+def test_the_kind_facet_accepts_every_kind_a_role_can_have_and_unreadable():
+    # behaviour: the registry's vocabulary is derived from the role parser's, so a kind the parser learns (K2's
+    # `agent`) cannot reach the panel and drop its row as an ill-typed facet; this goes red until the registry follows
+    from levain.agents.role import ROLE_KINDS
+    from levain.cockpit.registry import validate_facets
+
+    for kind in (*ROLE_KINDS, "unreadable"):
+        validate_facets({"agent_kind": kind})
+
+
+def _damage(world: World, role: dict, how: str) -> None:
+    import json
+
+    from levain.agents.role import canonical_role
+
+    digest = role_hash(role)
+    text = {"garbage": "{not json",
+            "another_roles_text": canonical_role(_kind_role("else")),
+            "kind_role_written_out": json.dumps({**role, "kind": "role"}, sort_keys=True, separators=(",", ":")),
+            "kind_agent": json.dumps({**role, "kind": "agent"}, sort_keys=True, separators=(",", ":")),
+            "a_blob": b"\x00\x01"}.get(how)
+    conn = sqlite3.connect(world.wiring.store_dir / "autonomic.db")
+    try:
+        if how == "row_gone":
+            conn.execute("DELETE FROM agent_roles WHERE role_hash = ?", (digest,))
+        else:
+            conn.execute("UPDATE agent_roles SET spec = ? WHERE role_hash = ?", (text, digest))
+        conn.commit()
+    finally:
+        conn.close()
+
+
+@pytest.mark.parametrize("how", ["garbage", "another_roles_text", "kind_role_written_out", "kind_agent", "a_blob",
+                                 "row_gone"])
+def test_a_role_row_that_fails_its_check_reads_unreadable_never_absent_and_is_one_row(world, how):
+    # behaviour: the module's rule (an authority log that cannot be read is NEVER read as health) held for the role:
+    # a pinned role whose row is unparsable, does not hash to its key, is not the canonical text (K1: a written-out
+    # `"kind": "role"`), carries the refused `agent` kind, is not text, or is gone, reads "unreadable" and says so
+    # on the row; its neighbours keep their kinds and the panel does not fault
+    role = _kind_role("kbad-role", "job")
+    bad = _kind_agent(world, "kbad", role)
+    good = _kind_agent(world, "kgood", _kind_role("kgood-role", "job"))
+    _damage(world, role, how)
+    before = _snapshot(world)
+    panel = world.panel()
+    rows = {r["id"]: r for r in panel["rows"]}
+    assert rows["agent:" + bad]["facets"]["agent_kind"] == "unreadable"
+    assert "role unreadable" in rows["agent:" + bad]["body"] and rows["agent:" + bad]["group"] in _groups(panel)
+    assert rows["agent:" + good]["facets"]["agent_kind"] == "job"
+    assert world.ck.read_one(AGENTS_ID, "agent:" + bad).value["facets"]["agent_kind"] == "unreadable"
+    assert _snapshot(world) == before                         # reading a bad role row repairs and writes nothing

@@ -19,6 +19,12 @@ A row is one agent, ``agent:<agent_id>``, in one of four groups (the ordering ``
 and the signers' standing, as the launch gate judges them. The launch also matches the occurrence's binding, which the
 panel does not know, so a Firing row means "a live link covers this spec", not "the next launch is certain".
 
+Every row also carries ``agent_kind``: the kind (``job`` or ``role``) of the role its CURRENT spec pins, read from the
+stored role through :mod:`levain.agents.role`'s own check, on the same snapshot as the spec. A role that cannot be read
+(its row is gone, is not text, does not parse, does not hash to its key, or is not the canonical text) is
+``unreadable``, the row says so in its body, and it is never read as a kind or as no kind. The panel only labels: the
+split of rows into Jobs and Fleet is the view's (P9b), and the group above is unchanged by the kind.
+
 The "cleared or not" column is not here (wired after P8a).
 """
 from __future__ import annotations
@@ -32,6 +38,8 @@ from typing import Any
 
 from levain import authority as _auth
 from levain.agent_authority import AgentAuthority, AgentAuthorityError
+from levain.agents.role import DEFAULT_KIND, RoleError
+from levain.agents.role import _check_row as _check_stored_role
 from levain.agents.store import AgentStoreRefused, open_agent_store_view
 from levain.autonomic.db import StoreFormatError
 from levain.cockpit.engine import ProviderSpec, ReadContext
@@ -43,7 +51,8 @@ __all__ = ["AGENTS_ID", "AGENT_ORDER", "AGENT_ROW_PREFIX", "AGENT_VERBS", "Agent
 AGENTS_ID = "agents"
 AGENT_ROW_PREFIX = "agent:"
 AGENT_ORDER = "agents.state"
-AGENT_FACETS = frozenset({"agent_group", "agent_link", "agent_version", "agent_store"})
+AGENT_FACETS = frozenset({"agent_group", "agent_link", "agent_version", "agent_store", "agent_kind"})
+UNREADABLE_KIND = "unreadable"
 # the verbs an agent row offers (levain.cockpit.verbs registers them); `run now` has no owner yet and is not here
 AGENT_VERBS = ("agent_pause", "agent_resume", "agent_renew", "agent_retire")
 # the retired agents listed after the live ones, by name; older ones are in `levain agents list --all`
@@ -51,7 +60,7 @@ RETIRED_SHOWN = 25
 _VERSION_FIELDS = ("*",)
 
 _AGENT_SQL = ("SELECT a.agent_id, a.name, a.current_version, a.registration, a.operation, a.failure_streak,"
-              " s.spec_hash FROM agents a JOIN agent_specs s ON s.agent_id = a.agent_id"
+              " s.spec_hash, s.role_hash FROM agents a JOIN agent_specs s ON s.agent_id = a.agent_id"
               " AND s.version = a.current_version")
 
 
@@ -162,18 +171,41 @@ def _judge_read(arming: _Arming, conn: sqlite3.Connection, agent: dict[str, Any]
                        "signer_revoked": "a signer of its link is no longer trusted"}.get(reason, reason), top, expiry
 
 
-def _row(agent: dict[str, Any], group: str, words: str, link: str, expiry: str, store_id: str) -> RowIn:
+def _kind(conn: sqlite3.Connection, role_hash: str, seen: dict[str, tuple[str, str]]) -> tuple[str, str]:
+    """``(kind, why)`` of the role a spec pins: the kind of the stored role (``why`` empty), or
+    :data:`UNREADABLE_KIND` and the reason. The row passes the check every other read of a stored role passes
+    (:func:`levain.agents.role._check_row`, on this read's own connection, so the spec and its role come from one
+    snapshot): a row that is gone, is not text, does not parse, does not hash to its key or is not the canonical text
+    is "unreadable", never an absent kind and never a default one. ``seen`` holds the answers of this read."""
+    if role_hash not in seen:
+        row = conn.execute("SELECT name, version, spec FROM agent_roles WHERE role_hash = ?", (role_hash,)).fetchone()
+        if row is None:
+            seen[role_hash] = (UNREADABLE_KIND, "no role row has the hash its spec pins")
+        else:
+            try:
+                role = _check_stored_role(row[0], role_hash, row[1], row[2])
+                seen[role_hash] = (role.get("kind", DEFAULT_KIND), "")   # the canonical text omits the default
+            except Exception as exc:  # noqa: BLE001 - a role row that cannot be read is never a kind, nor one row's fault
+                seen[role_hash] = (UNREADABLE_KIND, _one_line(exc, 100) if isinstance(exc, RoleError)
+                                   else f"the role row could not be checked ({type(exc).__name__})")
+    return seen[role_hash]
+
+
+def _row(agent: dict[str, Any], group: str, words: str, link: str, expiry: str, store_id: str,
+         kind: tuple[str, str]) -> RowIn:
     streak = f" · {agent['failure_streak']} failed in a row" if agent["failure_streak"] else ""
     until = f" · link until {expiry}" if expiry and group != "retired" else ""
-    body = _one_line(f"{agent['name']} · v{agent['current_version']} · {words}{streak}{until}")
+    role = f" · role unreadable: {kind[1]}" if kind[0] == UNREADABLE_KIND else ""
+    # the unreadable-role words come last and are never the part a long line cuts
+    body = _one_line(f"{agent['name']} · v{agent['current_version']} · {words}{streak}{until}", 300 - len(role)) + role
     stored = {"agent_id": agent["agent_id"], "name": agent["name"], "version": agent["current_version"],
               "spec_hash": agent["spec_hash"], "registration": agent["registration"],
               "operation": agent["operation"], "failure_streak": agent["failure_streak"], "group": group,
-              "words": words, "link": link, "expires_at": expiry, "store_id": store_id}
+              "words": words, "link": link, "expires_at": expiry, "store_id": store_id, "kind": kind[0]}
     # agent_version and agent_store are what a verb's write checks the agent against, inside its own transaction
     return RowIn(id=AGENT_ROW_PREFIX + agent["agent_id"], title=_one_line(agent["name"], 120), body=body,
                  facets={"agent_group": group, "agent_link": link, "agent_version": agent["current_version"],
-                         "agent_store": store_id}, stored=stored)
+                         "agent_store": store_id, "agent_kind": kind[0]}, stored=stored)
 
 
 def read_rows(wiring: AgentsWiring, *, only: str | None = None) -> tuple[tuple[RowIn, ...], str | None] | None:
@@ -191,8 +223,9 @@ def read_rows(wiring: AgentsWiring, *, only: str | None = None) -> tuple[tuple[R
         if store_id_row is None:
             raise StoreFormatError("the agent store holds no store id")
         store_id = str(store_id_row[0])
+        kinds: dict[str, tuple[str, str]] = {}
         found = [dict(zip(("agent_id", "name", "current_version", "registration", "operation", "failure_streak",
-                           "spec_hash"), r))
+                           "spec_hash", "role_hash"), r))
                  for r in (conn.execute(_AGENT_SQL + " ORDER BY a.name, a.created_at") if only is None else
                            conn.execute(_AGENT_SQL + " WHERE a.agent_id = ?", (only,))).fetchall()]
         retired_seen = 0
@@ -202,10 +235,10 @@ def read_rows(wiring: AgentsWiring, *, only: str | None = None) -> tuple[tuple[R
                 if only is None and retired_seen > RETIRED_SHOWN:
                     older += 1
                     continue
-                rows.append(_row(a, "retired", "retired", "", "", store_id))
+                rows.append(_row(a, "retired", "retired", "", "", store_id, _kind(conn, a["role_hash"], kinds)))
                 continue
             group, words, link, expiry = _judge(arming, conn, a, store_id, now)
-            rows.append(_row(a, group, words, link, expiry, store_id))
+            rows.append(_row(a, group, words, link, expiry, store_id, _kind(conn, a["role_hash"], kinds)))
     note = None
     if arming.why is not None:
         note = f"Arming is unknown: {arming.why}; no agent is shown as firing."
