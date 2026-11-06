@@ -6,6 +6,7 @@ import json
 
 import pytest
 
+from scripts.vm_harness import driver
 from scripts.vm_harness.driver import RESULT_HEADER, SlotPlan, journaled_slots, run_vm_lifecycle
 
 PS_HEADER = "  PID     ELAPSED  %CPU UCOMM                UID\n"
@@ -122,6 +123,9 @@ def test_clean_run_passes_in_order_and_writes_the_verdict(rig):
 def test_uid_scan_covers_each_slots_gw_account(rig):
     rig.ps = PS_HEADER + "  77  00:09  0.0 front   4002\n"   # slot 2's uid; the plan only used slot 1
     assert rig.run((SlotPlan(1, "La"),)).ok
+    second = rig.dir / "second"   # a run is scoped to a fresh evidence dir
+    second.mkdir()
+    rig.dir = second
     res = rig.run((SlotPlan(1, "La"), SlotPlan(2, "Lb")))
     assert not res.ok and any("pid=77" in p for p in res.problems)
 
@@ -145,7 +149,8 @@ def test_mint_never_returned_fails_even_though_nothing_was_revocable(rig):
     rig.mint_exc = Crash("mint reply lost")
     rig.slot_ok = False
     res = rig.run()
-    assert [c[0] for c in rig.calls] == ["alloc", "mint", "slot_check"]   # render never ran, no REVOKE
+    kinds = [c[0] for c in rig.calls]
+    assert kinds[:2] == ["alloc", "mint"] and set(kinds[2:]) == {"slot_check"}   # no render, no REVOKE; the check polls
     assert journal(rig) == [{"slot": 3, "lease": "L3", "intent": "alloc"}]
     assert not res.ok and any("slot 3" in p for p in res.problems)
 
@@ -215,3 +220,121 @@ def test_journaled_slots_reads_intent_and_session_lines_and_skips_torn_ones(tmp_
 def test_empty_plan_is_refused(rig):
     with pytest.raises(ValueError, match="empty plan"):
         rig.run(())
+
+
+# -- L3 r1 fix round: the harness must not report PASS falsely ---------------------------------------------
+
+@pytest.mark.parametrize("answer", [{"reusable": False}, "leased", 1, None, [], {}])
+def test_slot_check_passes_only_on_true_anything_else_is_malformed(rig, answer):
+    rig.slot_ok = answer
+    res = rig.run()
+    assert not res.ok
+    assert any("slot 3" in p and "malformed" in p for p in res.problems)
+    assert result_lines(rig)[1].startswith("RESULT: FAIL")
+
+
+def test_slot_check_is_polled_until_the_async_reaper_commits(rig):
+    answers = iter([False, False, False, True])
+    rig.slot_check = lambda slot: (rig.calls.append(("slot_check", slot)), next(answers))[1]
+    res = rig.run()
+    assert res.ok and res.problems == []
+    assert [c for c in rig.calls if c[0] == "slot_check"] == [("slot_check", 3)] * 4
+    assert rig.ft.t > 0   # it waited on the injected clock, not the wall
+
+
+def test_slot_check_that_never_turns_true_fails_at_the_deadline(rig):
+    rig.slot_ok = False
+    res = rig.run(deadline_s=5.0)
+    assert not res.ok and any("slot 3 is not reusable" in p for p in res.problems)
+    assert 5.0 <= rig.ft.t < 60   # polled to the given deadline, then stopped
+
+
+@pytest.mark.parametrize("exc", [KeyboardInterrupt, SystemExit])
+def test_base_exception_still_runs_slot_checks_and_records_why_then_reraises(rig, exc):
+    rig.render_exc = exc()
+    rig.revoke_exc = RuntimeError("revoke refused")
+    rig.slot_ok = False
+    with pytest.raises(exc):
+        rig.run()
+    assert ("slot_check", 3) in rig.calls
+    lines = result_lines(rig)
+    assert lines[1].startswith("RESULT: FAIL")
+    assert any("interrupted" in x and exc.__name__ in x for x in lines[2:])
+    assert any("revoke refused" in x for x in lines[2:])      # the cleanup notes are on disk
+    assert any("slot 3 is not reusable" in x for x in lines[2:])
+
+
+def test_a_failed_final_write_does_not_replace_a_live_base_exception(rig, monkeypatch):
+    real = driver._write_durable
+
+    def full_disk(path, text, *, append, **kw):
+        if append:
+            raise OSError(28, "No space left on device")
+        return real(path, text, append=append, **kw)
+
+    monkeypatch.setattr(driver, "_write_durable", full_disk)
+    rig.render_exc = KeyboardInterrupt()
+    with pytest.raises(KeyboardInterrupt) as ei:
+        rig.run()
+    assert any("RESULT.txt" in n and "No space left" in n for n in ei.value.__notes__)
+
+
+def test_a_failed_final_write_with_no_live_exception_is_loud(rig, monkeypatch):
+    real = driver._write_durable
+
+    def full_disk(path, text, *, append, **kw):
+        if append:
+            raise OSError(28, "No space left on device")
+        return real(path, text, append=append, **kw)
+
+    monkeypatch.setattr(driver, "_write_durable", full_disk)
+    with pytest.raises(OSError, match="No space left"):
+        rig.run()
+
+
+def test_a_zero_byte_write_is_an_error_not_an_endless_loop(tmp_path, monkeypatch):
+    calls = {"n": 0}
+
+    def zero(fd, data):
+        calls["n"] += 1
+        if calls["n"] > 50:
+            raise AssertionError("looped on a zero-byte write")
+        return 0
+
+    monkeypatch.setattr(driver.os, "write", zero)
+    with pytest.raises(OSError, match="zero"):
+        driver._write_durable(tmp_path / "x.txt", "abc", append=False)
+
+
+@pytest.mark.parametrize("existing", ["cleanup.jsonl", "RESULT.txt"])
+def test_a_non_fresh_evidence_dir_is_refused_and_left_untouched(rig, existing):
+    (rig.dir / existing).write_text("a previous run\n")
+    with pytest.raises(FileExistsError):
+        rig.run()
+    assert (rig.dir / existing).read_text() == "a previous run\n"
+    assert not rig.calls   # nothing ran: no alloc, no REVOKE of the old run's sessions
+    assert sorted(x.name for x in rig.dir.iterdir()) == [existing]
+
+
+def test_a_journal_read_failure_is_a_problem_and_falls_back_to_the_planned_slots(rig, monkeypatch):
+    def unreadable(path):
+        raise OSError(5, "Input/output error")
+
+    monkeypatch.setattr(driver, "journaled_slots", unreadable)
+    res = rig.run((SlotPlan(1, "La"), SlotPlan(2, "Lb")))   # returns, does not raise
+    assert not res.ok
+    assert any("journal" in p and "Input/output error" in p for p in res.problems)
+    assert [c for c in rig.calls if c[0] == "slot_check"] == [("slot_check", 1), ("slot_check", 2)]
+    assert result_lines(rig)[1].startswith("RESULT: FAIL")
+
+
+def test_an_interrupt_inside_the_slot_check_itself_is_recorded_and_reraised(rig):
+    def ctrl_c(slot):
+        raise KeyboardInterrupt()
+
+    rig.slot_check = ctrl_c
+    with pytest.raises(KeyboardInterrupt):
+        rig.run()
+    lines = result_lines(rig)
+    assert lines[1].startswith("RESULT: FAIL")
+    assert any("interrupted" in x and "KeyboardInterrupt" in x for x in lines[2:])
