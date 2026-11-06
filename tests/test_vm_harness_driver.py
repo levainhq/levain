@@ -338,3 +338,34 @@ def test_an_interrupt_inside_the_slot_check_itself_is_recorded_and_reraised(rig)
     lines = result_lines(rig)
     assert lines[1].startswith("RESULT: FAIL")
     assert any("interrupted" in x and "KeyboardInterrupt" in x for x in lines[2:])
+
+
+# -- L3 land11 r1 fix round (1105-49 fix11): each test below was first run RED against bb583d1e -------------------------
+
+@pytest.mark.parametrize("bad", [None, 123, "", b"sess", ["sess-3"]])
+def test_a_mint_that_returns_no_session_id_string_fails_the_run_and_journals_nothing_as_a_session(rig, bad):
+    rig.mint = lambda slot, lease: (rig.calls.append(("mint", slot, lease)), bad)[1]
+    res = rig.run()
+    assert not res.ok
+    assert any(p.startswith("body: ") and "mint" in p for p in res.problems), res.problems
+    assert result_lines(rig)[-2].startswith("RESULT: FAIL")
+    assert not any("session" in e for e in journal(rig))      # a non-id is never journalled as the session, nor rendered
+    assert not any(c[0] == "render" for c in rig.calls)
+
+
+def test_the_result_file_write_fsyncs_the_evidence_directory_as_the_journal_append_does(tmp_path, monkeypatch):
+    import os
+    import stat
+    kinds: list[str] = []
+    real = os.fsync
+
+    def recording(fd):                         # a recording proxy: what KIND of thing each fsync was handed
+        kinds.append("dir" if stat.S_ISDIR(os.fstat(fd).st_mode) else "file")
+        return real(fd)
+
+    monkeypatch.setattr(driver.os, "fsync", recording)
+    driver._write_durable(tmp_path / "RESULT.txt", "x\n", append=False, exclusive=True)
+    assert kinds == ["file", "dir"]
+    kinds.clear()
+    driver._write_durable(tmp_path / "RESULT.txt", "y\n", append=True)
+    assert kinds == ["file", "dir"]

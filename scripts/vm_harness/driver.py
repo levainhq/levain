@@ -76,7 +76,7 @@ def journaled_slots(path: Path | str) -> list[int]:
 
 
 def _write_durable(path: Path, text: str, *, append: bool, exclusive: bool = False) -> None:
-    """Write ``text`` and fsync it. ``exclusive`` creates the file and refuses (FileExistsError) one that exists."""
+    """Write ``text``, fsync it and its directory. ``exclusive`` creates the file and refuses (FileExistsError) one that exists."""
     flags = os.O_WRONLY | os.O_CREAT | (os.O_APPEND if append else os.O_TRUNC) | (os.O_EXCL if exclusive else 0)
     fd = os.open(path, flags, 0o600)
     try:
@@ -89,6 +89,11 @@ def _write_durable(path: Path, text: str, *, append: bool, exclusive: bool = Fal
         os.fsync(fd)
     finally:
         os.close(fd)
+    dfd = os.open(path.parent, os.O_RDONLY)   # make the (possibly new) directory entry durable too, as CleanupJournal.append does
+    try:
+        os.fsync(dfd)
+    finally:
+        os.close(dfd)
 
 
 def _check_slots(slots: list[int], slot_check: Callable[[int], object], clock: Callable[[], float],
@@ -159,9 +164,15 @@ def run_vm_lifecycle(evidence_dir: Path | str, plan: Iterable[SlotPlan], *, allo
         problems.extend(getattr(e, "__notes__", []))
 
     try:
+        def checked_mint(slot: int, lease: str) -> str:
+            session = mint(slot, lease)
+            if not isinstance(session, str) or not session:   # journalled and rendered as the id: a non-id would walk no REVOKE
+                raise TypeError(f"mint({slot}, {lease!r}) returned {session!r}, not a non-empty session id string")
+            return session
+
         def body(j: CleanupJournal) -> None:
             for p in plan:
-                start_session(j, p.slot, p.lease, alloc=alloc, mint=mint, render=render)
+                start_session(j, p.slot, p.lease, alloc=alloc, mint=checked_mint, render=render)
 
         try:
             run_with_cleanup(journal, body, revoke, uids=uids, lister=lister, clock=clock, sleep=sleep,
