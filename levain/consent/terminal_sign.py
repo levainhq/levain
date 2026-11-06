@@ -700,12 +700,17 @@ def default_desk_signer_factory(key_path: Path, timeout: float | None = None) ->
 #
 # ONE detector, four legs, all routing and never evidence (a false "local" costs a prompt nobody touches, which
 # times out; a false "remote" costs one phone signature). Every leg fails to "not remote": a ``ps`` that is missing,
-# slow or unparseable is the status quo, never an exception. Edge notes:
+# slow or unparseable is the status quo, never an exception. The one deliberate exception: once leg 4 has found a
+# remote agent view client open, an unreadable laptop idle time reads remote (the safe side). Edge notes:
 #   - a client attached by NAME (``claude attach <part of the name>``) carries no session id in its argv: not seen;
 #   - two clients on one desk: the session reads remote if ANY attach client is remote;
 #   - leg 4 (agent view) ties a prompt to the client by the keystroke: the client's tty and the viewed session's tty
-#     are read together, so their access times move within milliseconds of each other. No client tied (a reply that
-#     is not delivered as pty bytes) falls back to: a remote agent view client is open AND the laptop is idle;
+#     are read together. The kernel updates a tty's access time lazily (macOS devfs: a read in the same second as the
+#     last update is deferred, and the next stat stamps it with the stat's own fraction of a second, at most one
+#     second later), so the two times can land up to 2 s apart (measured 1.006 s): :data:`TIE_S` covers that. A client
+#     read within that window for another reason also ties, and any tied remote client reads remote. No client tied (a
+#     reply that is not delivered as pty bytes) falls back to: a remote agent view client is open AND the laptop is
+#     idle;
 #   - a process title is read as ``ps`` prints it, so a build that stops rewriting the sshd title is not seen.
 
 _SSH_ENV_NAMES = ("SSH_CONNECTION", "SSH_TTY", "SSH_CLIENT")    # exact names; SSH_AUTH_SOCK, P9K_SSH are not signals
@@ -713,10 +718,10 @@ REMOTE_PROCESSES = ("sshd", "sshd-session", "mosh-server")     # an ancestor wit
 SESSION_ID_ENV = "CLAUDE_CODE_SESSION_ID"
 ATTACH_ID_MIN = 8                  # an attach client is matched by at least this many leading characters of the id
 _PS_TIMEOUT_S = 2.0
-TIE_S = 0.25                       # a client's tty and the session's tty read this close together are one keystroke
+TIE_S = 2.0                        # a client's tty and the session's tty read this close together are one keystroke
 TIE_RECENT_S = 60.0                # ...and only when that read is this recent (an old shared stamp is not this prompt)
 IDLE_S = 60.0                      # the fallback needs the laptop keyboard and mouse idle at least this long
-_NO_TTY = ("", "??", "-")
+_NO_TTY = ("", "?", "??", "-")     # no controlling tty: "??" on macOS ps, "?" on Linux procps
 _FALLBACK_HOPS = 8                 # used only when the ancestry walker's own cap cannot be read
 
 
@@ -837,10 +842,12 @@ def _agentview_remote_reason(text: str, session_id: str) -> str | None:
     under the daemon, so neither its environment nor its ancestry names the client, and an agent view client carries
     no session id in its argv. The client is found by the keystroke instead: the session's own pty (the nearest
     ancestor of this process with a real tty) and the client's tty are both READ for one keystroke, so their access
-    times sit within :data:`TIE_S`. One tied client decides; several tied read remote if ANY is remote. With none
-    tied, the fallback is: some agent view client is remote AND the laptop has been idle :data:`IDLE_S` or more
-    (an unreadable idle time reads as idle). A false remote costs one phone card; a false local stalls on an unseen
-    sheet, so every doubt resolves remote only through these rules and every failure reads as not remote."""
+    times sit within :data:`TIE_S` (the kernel's lazy update included). One tied client decides; several tied read
+    remote if ANY is remote. With none tied, the fallback is: some agent view client is remote AND the laptop has
+    not been seen in use for :data:`IDLE_S` (an unreadable idle time cannot show the laptop in use, so it reads
+    remote and the reason says "laptop activity unreadable"). A false remote costs one phone card; a false local
+    stalls on an unseen sheet, so doubt about a proven remote client resolves remote, and every failure before one
+    is found reads as not remote."""
     table = _ps_table(text)
     try:
         from levain.consent import band
@@ -905,9 +912,10 @@ def _agentview_remote_reason(text: str, session_id: str) -> str | None:
             idle = _hid_idle_s()
         except Exception:  # noqa: BLE001
             idle = None
-        if idle is None or idle >= IDLE_S:
-            when = "unreadable" if idle is None else f"{round(idle)} s"
-            return f"fallback: remote agent view client {tty} reached from {name}, laptop idle {when}"
+        if idle is None:
+            return f"fallback: remote agent view client {tty} reached from {name}, laptop activity unreadable"
+        if idle >= IDLE_S:
+            return f"fallback: remote agent view client {tty} reached from {name}, laptop idle {round(idle)} s"
         return None
     return None
 

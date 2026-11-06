@@ -3,7 +3,8 @@
 
 A ``--bg`` desk's hook runs under the daemon, and an agent view client carries no session id in its argv, so neither the
 ancestry nor the attach leg sees it. Leg 4 ties the client's tty to the session's tty (both are READ for one keystroke,
-so their access times sit within milliseconds), with a fallback of "a remote client is open and the laptop is idle".
+so their access times sit within ``TIE_S``: milliseconds apart, or up to 2 s when the kernel defers one update), with a
+fallback of "a remote client is open and the laptop is idle".
 Everything here is synthetic: a ``ps`` table text, tty access times and a laptop idle time, all seams of
 ``terminal_sign``; no process, tty, mosh or Touch ID sheet is touched.
 """
@@ -116,13 +117,16 @@ def test_no_tie_falls_back_to_remote_client_and_idle_laptop(monkeypatch, idle, r
         assert why.startswith("fallback: remote agent view client ttys002 reached from mosh-server")
 
 
-def test_an_unreadable_idle_time_reads_as_idle(monkeypatch):
+def test_an_unreadable_laptop_activity_reads_remote_and_says_so(monkeypatch):
+    # deliberate (L3 r1): with a remote client proven open and no tie, an unknown idle time cannot say the laptop is
+    # in use, and the safe side is remote (a phone card) over local (an unseen sheet); the echo does not claim idle
     def boom():
         raise OSError("ioreg")
     world(monkeypatch, DESK + MOSH, {"ttys006": 1.0, "ttys002": 900.0}, idle=boom)
-    assert "fallback" in (reason() or "")
+    assert "laptop activity unreadable" in (reason() or "")
     world(monkeypatch, DESK + MOSH, {"ttys006": 1.0, "ttys002": 900.0}, idle=lambda: None)
-    assert "laptop idle unreadable" in (reason() or "")
+    why = reason() or ""
+    assert "laptop activity unreadable" in why and "idle" not in why
 
 
 def test_a_shared_stamp_that_is_old_is_not_this_prompt(monkeypatch):
@@ -132,7 +136,7 @@ def test_a_shared_stamp_that_is_old_is_not_this_prompt(monkeypatch):
 
 # 4. both tied, and every failure ---------------------------------------------------------------------------------------
 
-def test_two_clients_tied_in_the_same_quarter_second_read_remote(monkeypatch):
+def test_two_clients_tied_in_the_same_window_read_remote(monkeypatch):
     world(monkeypatch, DESK + LOCAL + MOSH, {"ttys006": 1.0, "ttys000": 1.1, "ttys002": 1.2}, idle=0.0)
     assert "agent view client ttys002" in (reason() or "")
 
@@ -149,3 +153,61 @@ def test_every_failure_reads_not_remote_and_never_raises(monkeypatch):
     monkeypatch.setattr(ts, "_own_pid", lambda: HOOK_PID)
     monkeypatch.setattr(ts, "_tty_atime", lambda tty: (_ for _ in ()).throw(RuntimeError("stat")))
     assert ts.remote_reason({"CLAUDE_CODE_SESSION_ID": SID}) is None   # a raising seam is swallowed
+
+
+# 5. L3 r1: the kernel's lazy atime, and a Linux ps ----------------------------------------------------------------------
+
+def test_a_keystroke_split_by_the_lazy_atime_flush_still_ties(monkeypatch):
+    # measured on this Mac (L3_av_r1_triage.md, L7): one keystroke read on both ptys 1 ms apart, the session's pty
+    # read alone 0.5 s before, so its update was deferred and flushed later: the two atimes came out 1.006 s apart.
+    # The laptop is in use, so the fallback would have said local: the Touch ID sheet nobody sees.
+    world(monkeypatch, DESK + LOCAL + MOSH, {"ttys006": 1.0, "ttys002": 2.006, "ttys000": 2400.0}, idle=0.0)
+    assert "agent view client ttys002 reached from mosh-server" in (reason() or "")
+
+
+def test_the_tie_window_is_bounded(monkeypatch):
+    # a deferred flush lands under 2 s from the read; a client last read further off than TIE_S is not this keystroke
+    world(monkeypatch, DESK + MOSH, {"ttys006": 1.0, "ttys002": 1.0 + ts.TIE_S + 0.5}, idle=0.0)
+    assert reason() is None
+
+
+LINUX_DESK = [(20, 1, "?", f"{CLAUDE} daemon run --origin transient"),
+              (21, 20, "?", f"{CLAUDE} bg-pty-host --bg-pty-host /tmp/x/pty.sock"),
+              (22, 21, "pts/6", f"{CLAUDE} bg-spare --bg-spare /tmp/x/claim.sock"),
+              (HOOK_PID, 22, "?", "python3 /x/termsign_hook.py")]
+LINUX_MOSH = [(30, 1, "?", "mosh-server new -c 256 -s -l LANG=en_US.UTF-8"),
+              (31, 30, "pts/2", "-bash"),
+              (32, 31, "pts/2", f"{CLAUDE} agents")]
+
+
+def test_linux_ps_no_tty_marker_is_not_a_tty(monkeypatch):
+    # procps prints "?" for no tty: the hook's own row must not become the session pty (that killed the tie)
+    world(monkeypatch, LINUX_DESK + LINUX_MOSH, {"pts/6": 2.000, "pts/2": 2.001}, idle=0.0)
+    assert "agent view client pts/2 reached from mosh-server" in (reason() or "")
+
+
+def test_the_real_kernel_moves_a_pty_atime_on_read_within_the_tie_bound():
+    # the tie's premise, against the kernel and a pty this test opens (never anyone's terminal)
+    import os
+    import pty
+    import tty as tty_mod
+
+    real = REAL_TTY_ATIME
+    master, slave = pty.openpty()
+    try:
+        tty_mod.setraw(slave)
+        name = os.path.relpath(os.ttyname(slave), "/dev")
+        before = real(name)
+        time.sleep(1.1)
+        os.write(master, b"x")
+        read_at = time.time()
+        os.read(slave, 1)
+        after = real(name)
+        assert before is not None and after is not None and after > before
+        assert abs(after - read_at) < ts.TIE_S
+    finally:
+        os.close(master)
+        os.close(slave)
+
+
+REAL_TTY_ATIME = ts._tty_atime                  # captured at import, before conftest's autouse stub replaces the seam
