@@ -283,7 +283,7 @@ class TestJobRuntime:
         # so wait for the callback itself, not for 'done': the read below raced it on a loaded runner.
         _wait(lambda: len(done) >= 1)
         assert s.read_status("j1", _T0)["result"] == {"text": "result", "summary": "s"}
-        assert done ==[("done", {"text": "result", "summary": "s"})]
+        assert done == [("done", {"text": "result", "summary": "s"})]
 
     def test_handler_raise_marks_failed(self, tmp_path: Path) -> None:
         s = JobStore(tmp_path / "jobs.json")
