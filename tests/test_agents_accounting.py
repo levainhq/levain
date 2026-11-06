@@ -187,14 +187,20 @@ def test_stop_result_is_frozen_and_a_stub_that_cannot_observe_returns_terminated
 
 def test_an_api_key_exposure_above_the_links_per_run_figure_refuses_and_writes_nothing(store):
     """152a / S-B1: the 'at most $X a run' sentence on the card he signs is enforced here, not only shown. Equal passes;
-    one micro-dollar over refuses ``run_budget`` BEFORE the window check (the window is wide enough to hold it); a
-    caller that never read the signed figure (the default 0) refuses any dollar exposure."""
+    one micro-dollar over refuses ``run_budget``, named before the window's own refusal (the window here is tighter than
+    the exposure, so either could fire) and after ``already_reserved`` (a launched occurrence is never ended
+    skipped-budget); a caller that never read the signed figure (the default 0) refuses any positive exposure."""
     wide = Limits(run_ceiling=5, budget_window_usd_micros=10**9, scheduled_window_key=WINDOW,
                   span_start="2026-11-02T00:00:00Z", span_end="2026-11-03T00:00:00Z", budget_run_usd_micros=2_000)
     with store.write() as conn:
-        assert reserve(conn, _admit(conn, 1), _Exec(2_001), limits=wide) == Refused("run_budget")
+        tight = dataclasses.replace(wide, budget_window_usd_micros=1_000)
+        assert reserve(conn, _admit(conn, 1), _Exec(2_001), limits=tight) == Refused("run_budget")
+        assert reserve(conn, _admit(conn, 5), _Exec(2_001), limits=wide) == Refused("run_budget")
         assert conn.execute("SELECT COUNT(*) FROM agent_reservations").fetchone()[0] == 0
         assert reserve(conn, _admit(conn, 2), _Exec(2_000), limits=wide) == Reserved(2_000)
         unread = Limits(run_ceiling=5, budget_window_usd_micros=10**9, scheduled_window_key=WINDOW,
                         span_start="2026-11-02T00:00:00Z", span_end="2026-11-03T00:00:00Z")
         assert reserve(conn, _admit(conn, 3), _Exec(1), limits=unread) == Refused("run_budget")
+        again = _admit(conn, 4)
+        assert reserve(conn, again, _Exec(2_000), limits=wide) == Reserved(2_000)
+        assert reserve(conn, again, _Exec(2_001), limits=wide) == Refused("already_reserved")

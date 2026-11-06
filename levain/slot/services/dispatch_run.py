@@ -151,7 +151,7 @@ def verify_point_of_use(proof: C.LinkProof, exposure: Optional[ActionExposure], 
                         replay: Callable[[], Any], now: Callable[[], datetime],
                         bar_of: Callable[[str], tuple[bool, int]],
                         verify_sig: Optional[Callable[..., bool]] = None, rejudge: bool = False,
-                        billing: str = "subscription") -> None:
+                        billing: str) -> None:
     """The run server's whole authority check for one fire. Raises :class:`LauncherRefused` (standing, or transient for
     a ledger or store that cannot be read); returns None when the fire may go on.
 
@@ -314,7 +314,7 @@ def replica_verifier(replica: AuthorityReplica, *,
         if held != digest:                  # the replica holds that seq (append-only, verified): another chain
             raise LauncherRefused("ledger-fork", "the claimed head is not on the replica's chain")
         verify_point_of_use(proof, exposure, replay=lambda: state, now=now, bar_of=lambda agent: (barred, closed),
-                            verify_sig=verify_sig, rejudge=claims.rejudge)
+                            verify_sig=verify_sig, rejudge=claims.rejudge, billing="subscription")
     return verify
 
 

@@ -116,8 +116,8 @@ class Limits:
     ``subscription`` link carries positive ones and zero dollar budgets. The defaults are the shipped link's reading.
 
     ``budget_run_usd_micros`` is the link's signed per-run dollar figure, the most ONE run's exposure may be on an
-    ``api_key`` link. Its default is 0 on purpose: a caller that does not read the signed figure refuses every dollar
-    exposure rather than leaving the figure he signed unenforced. A subscription link signs 0 and reserves no dollars.
+    ``api_key`` link. Its default is 0 on purpose: a caller that does not read the signed figure refuses every positive
+    dollar exposure rather than leaving the figure he signed unenforced. A subscription link signs 0 and reserves no dollars.
     """
     run_ceiling: int
     budget_window_usd_micros: int
@@ -246,12 +246,12 @@ def reserve(conn: sqlite3.Connection, occurrence: Mapping | sqlite3.Row, executo
         exposure = getattr(executor, "max_exposure_usd_micros", None)
         if not _is_amount(exposure) or exposure > _MAX_MICROS:
             return Refused("no_exposure")
-        if not _is_amount(limits.budget_run_usd_micros) or exposure > limits.budget_run_usd_micros:
-            return Refused("run_budget")
     # a reservation commits only with its launch (one transaction), so a reserved occurrence is launched, and the
     # transition trigger refuses launched -> skipped-budget: a caller applying this Refused.state cannot end a live row
     if conn.execute("SELECT 1 FROM agent_reservations WHERE occurrence_id = ?", (me,)).fetchone() is not None:
         return Refused("already_reserved")
+    if not subscription and (not _is_amount(limits.budget_run_usd_micros) or exposure > limits.budget_run_usd_micros):
+        return Refused("run_budget")
     # a scheduled launch counts its OWN window (A0 §2.6), so the key comes from the occurrence and no caller value
     # (a None included) can switch scheduled counting off; Limits.scheduled_window_key is read for a manual launch only
     if _field(occurrence, "kind") == "scheduled":

@@ -74,7 +74,8 @@ class Env:
 
     def _verify(self, proof, exposure, claims=None):
         self.verified += 1
-        D.verify_point_of_use(proof, exposure, replay=self.rig.authority.replay, now=self.rig.now, bar_of=self.bar_of)
+        D.verify_point_of_use(proof, exposure, replay=self.rig.authority.replay, now=self.rig.now, bar_of=self.bar_of,
+                              billing="subscription")
 
     def connect(self):
         a, b = socket.socketpair()
@@ -103,7 +104,8 @@ def _proof(rig, oid):
 
 def _check(rig, proof, exposure=EXP, **kw):
     D.verify_point_of_use(proof, exposure, replay=rig.authority.replay, now=kw.pop("now", rig.now),
-                          bar_of=kw.pop("bar_of", D.agent_store_bar(rig.store.path)), **kw)
+                          bar_of=kw.pop("bar_of", D.agent_store_bar(rig.store.path)),
+                          billing=kw.pop("billing", "subscription"), **kw)
 
 
 # --- Q1: the one function ---------------------------------------------------------------------------------------------
@@ -148,7 +150,7 @@ def test_a_proof_or_standing_that_does_not_hold_at_the_point_of_use_is_refused(r
         kw["bar_of"] = lambda agent: (False, 0)
         with pytest.raises(L.LauncherRefused) as exc:
             D.verify_point_of_use(proof, exposure, replay=lambda: (_ for _ in ()).throw(OSError("gone")), now=rig.now,
-                                  bar_of=kw["bar_of"])
+                                  bar_of=kw["bar_of"], billing="subscription")
         assert exc.value.name == name and exc.value.reason_class == "transient"
         return
     with pytest.raises(L.LauncherRefused) as exc:
