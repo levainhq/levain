@@ -1158,6 +1158,73 @@ def test_r1c_the_unreachable_refusal_reaches_the_user_as_a_sentence_never_a_bare
     assert out["message"] != out["error"] and "revoke_unreachable" not in out["message"]
 
 
+# --- row 50 L3 r1 (codex HIGH, deepseek MED): "the CLI revoke exists" is checked, not assumed ---------------------------
+
+def _revoke_laptop_as_compromised(ck: "KeyedCockpit") -> None:
+    """Revoke ``ck``'s laptop key through the supported lost-or-stolen path (``compromised_since``: the last
+    laptop-presence key can be revoked only that way), signed by itself. The voice-key record before it stands."""
+    conn = sqlite3.connect(ck.root / "cockpit.db", isolation_level=None)
+    try:
+        head = auth.log_head(conn)
+        assert head is not None
+        auth.sign_and_append(conn, {"op": "revoke_key", "fingerprint": ck.fp, "compromised_since": head[0]},
+                             signer_fp=ck.fp, sign=ck.sign, clock=lambda: datetime.now(timezone.utc),
+                             cache=ReplayCache(), anchor=anchor_path(ck.root))
+    finally:
+        conn.close()
+
+
+def test_r50a_no_signer_with_an_unrevoked_laptop_key_is_allowed(rig):
+    """(a) The 50.1 behaviour, now with its condition shown: no Signer, the replayed log holds an unrevoked laptop key
+    the command line can sign with, so speak is allowed. Red with: ``_cli_revoke_refusal`` refusing always."""
+    rig.add_key()
+    assert [k.fingerprint for k in custody.authority_for(rig.data_root)().signing_laptop_keys()] == [rig.ck.fp]
+    g = rig.reply("Read this aloud.")
+    with served(rig, signer_on=False) as (port, httpd):
+        assert httpd.grant_phone is None
+        status, _h, body = speak(port, rig, g)
+        assert status == 200, body
+    assert len(rig.transport.seen) == 1
+
+
+def test_r50b_only_a_passkey_left_and_no_grant_route_refuses_before_anything_is_read(rig):
+    """(b) codex's case: the key was added with laptop key L, passkey P enrolled, L revoked as compromised. With no
+    Signer the only active key is P, which signs only through the absent grant page, and ``levain voice key revoke``
+    has no key to sign with: speak and transcribe refuse ``revoke_unreachable``; nothing reserved, no keychain read, no
+    provider call. Red with: ``revoke_refusal`` answering None for ``revoke_queue`` None (the 50.1 assumption)."""
+    record = rig.add_key()
+    _phone(rig.ck)
+    _revoke_laptop_as_compromised(rig.ck)
+    state = custody.authority_for(rig.data_root)()
+    assert record["id"] in state.policy.grants                  # the voice key stands: a paid call would go out
+    assert state.signing_laptop_keys() == [] and [k.custody for k in state.active_keys()] == ["passkey"]
+    g = rig.reply("Read this aloud.")
+    reads = rig.sec.calls()
+    with served(rig, signer_on=False) as (port, httpd):
+        assert httpd.grant_phone is None
+        _refused_with(port, rig, g, "revoke_unreachable")
+    assert rig.transport.seen == [] and rig.rows() == [] and rig.sec.calls() == reads
+
+
+def test_r50c_a_live_log_with_no_key_the_cli_can_sign_with_refuses_in_a_true_sentence(rig, tmp_path):
+    """(c) The log replays (it is intact) but holds no unrevoked laptop key, phone or not: the refusal is
+    ``revoke_unreachable`` and its sentence claims nothing false (no phone grant page reaches the key; the command
+    line's revoke needs an unrevoked laptop key, which this log lacks). A log that cannot be replayed is
+    ``revoke_unchecked`` instead. Red with: the 50.2 sentence ("Revoke from the command line.") restored."""
+    rig.add_key()
+    _revoke_laptop_as_compromised(rig.ck)
+    assert custody.authority_for(rig.data_root)().active_keys() == []
+    assert cockpit_voice.revoke_refusal(None, rig.data_root) == "revoke_unreachable"
+    words = cockpit_voice.WORDS["revoke_unreachable"]
+    assert "needs an unrevoked laptop key" in words and "Revoke from the command line" not in words
+    assert cockpit_voice.revoke_refusal(None, tmp_path / "no-such-cockpit") == "revoke_unchecked"
+    g = rig.reply("Read this aloud.")
+    reads = rig.sec.calls()
+    with served(rig, signer_on=False) as (port, _httpd):
+        _refused_with(port, rig, g, "revoke_unreachable")
+    assert rig.transport.seen == [] and rig.rows() == [] and rig.sec.calls() == reads
+
+
 @pytest.mark.parametrize("fault", ["raises", "not_a_path"])
 def test_r3_a_fault_checking_the_reach_is_its_own_sentence_and_logs_the_type_only(rig, monkeypatch, caplog, fault):
     """R3: a fault while checking (the hook read raising; a root that is not a path) is not "another cockpit": it
