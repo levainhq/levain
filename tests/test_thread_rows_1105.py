@@ -37,15 +37,15 @@ def _said(gseq):
     return threads._item(_row(gseq, "message", "operator", "cm-%d" % gseq, None, "hi", status="accepted"), {}, set())
 
 
-def _boot(stream, stoppable=True, stop_outcome="confirmed"):
-    return ('window.__body = {thread_id: "t1", launch_id: "L1", stoppable: %s, gap: false, model: null, authority: null, before: [], stream: %s};\n'
+def _boot(stream, stoppable=True, stop_outcome="confirmed", launch="L1", gap=False):
+    return ('window.__body = {thread_id: "t1", launch_id: %s, stoppable: %s, gap: %s, model: null, authority: null, before: [], stream: %s};\n'
             'window.__posts = [];\n'
             'const stub = (u, o) => { const post = o && o.method === "POST"; if (post) window.__posts.push(u);\n'
             '  const out = post ? {outcome: "%s"} : window.__body;\n'
             '  return Promise.resolve({status: 200, ok: true, text: () => Promise.resolve(JSON.stringify(out))}); };\n'
             'window.__tv = LevainThreadView.mount(document.getElementById("host"), {pollMs: 0, fetch: stub, headers: () => ({}), stop: true});\n'
             'window.__tv.open("t1");'
-            % ("true" if stoppable else "false", json.dumps(stream), stop_outcome))
+            % (json.dumps(launch), "true" if stoppable else "false", json.dumps(gap), json.dumps(stream), stop_outcome))
 
 
 class _Page:
@@ -115,9 +115,9 @@ def test_a_reads_line_numbers_are_not_drawn_and_no_other_leading_number_is_touch
     assert g[-1]["text"] == "1\tan agent line\n2\tmore", g[-1]               # an agent's own words are never read as a file
 
 
-def _stop_state(tmp_path, stream, stoppable=True):
+def _stop_state(tmp_path, stream, stoppable=True, launch="L1", gap=False):
     """None when the thread draws no Stop, else whether the Stop button is disabled."""
-    with _Page(_boot(stream, stoppable)) as base:
+    with _Page(_boot(stream, stoppable, launch=launch, gap=gap)) as base:
         out = _drive(tmp_path, base + "/", [{"until": "document.querySelector('.tv-title')"},
                                             {"eval": "JSON.stringify((() => { const b = document.querySelector('.tv-stop'); return b ? b.disabled : null; })())"}])
     return json.loads(out["values"][1])
@@ -134,10 +134,41 @@ def test_stop_is_available_only_while_a_turn_is_running(tmp_path):
     assert _stop_state(tmp_path, running, True) is False                             # a turn is running
     assert _stop_state(tmp_path, ended + [_said(4), _turn(5, "vendor_turn_started", "L1")], True) is False
     # a turn left open by an earlier launch that died is not the new launch's turn
-    assert _stop_state(tmp_path, running + [_turn(4, "vendor_turn_started", "L2"), _turn(5, "vendor_turn_ended", "L2")]) is True
-    assert _stop_state(tmp_path, running + [_turn(4, "vendor_agent_text", "L2")]) is True
+    assert _stop_state(tmp_path, running + [_turn(4, "vendor_turn_started", "L2"), _turn(5, "vendor_turn_ended", "L2")], launch="L2") is True
+    assert _stop_state(tmp_path, running + [_turn(4, "vendor_agent_text", "L2")], launch="L2") is True
     # the server's word still decides whether a Stop exists at all
     assert _stop_state(tmp_path, running, False) is None
+
+
+# The fixtures of the landing 12 L3 finding, shared by the thread's own Stop test and the room-versus-thread agreement test:
+# (name, stream, the body's launch_id, the body's gap, whether a turn is running). The server names the current launch and says gap.
+_C_START, _C_END = _turn(2, "vendor_turn_started", "L2"), _turn(3, "vendor_turn_ended", "L2")
+_OLD_START, _OLD_END = _turn(9, "vendor_turn_started", "L1"), _turn(9, "vendor_turn_ended", "L1")
+_C_TEXT = threads._item(_row(4, "vendor_agent_text", "vendor", "agent_text:4", "L2", "x"), {}, set())
+RUNNING_CASES = [
+    ("gapped, only a non-turn row of the current launch", [_said(1), _C_TEXT], "L2", True, True),      # the start scrolled out: unknown is running
+    ("gapped, nothing of the launch", [_said(1)], "L2", True, True),
+    ("no gap, no turn row", [], "L2", False, False),
+    ("no gap, only a said line", [_said(1)], "L2", False, False),
+    ("gapped but the end is seen", [_C_START, _C_END], "L2", True, False),                              # a gap does not outvote a seen end
+    ("gapped, a start seen", [_C_START], "L2", True, True),
+    ("a late old-launch end beside a running turn", [_C_START, _OLD_END], "L2", False, True),
+    ("a late old-launch start after the turn ended", [_C_START, _C_END, _OLD_START], "L2", False, False),
+    ("an old start before the current start", [_OLD_START, _C_START], "L2", False, True),
+    ("only an old launch's open turn", [_OLD_START], "L2", False, False),
+    ("no launch named", [_C_START], None, True, False),
+]
+
+
+@needs_browser
+def test_a_gapped_stream_and_a_late_row_of_another_launch_read_in_the_work_thread_as_in_the_room(tmp_path):
+    """Reproduced on the first fix (landing 12 L3): a gapped stream whose start row was not in it left Stop disabled on a live
+    turn, and a late turn row of an older or worker launch reset the newest-launch scan. Only the current launch's turn rows count
+    (``launch_id`` is the body's), and a gap with none of them is running."""
+    for name, stream, launch, gap, running in RUNNING_CASES:
+        if launch is None:
+            continue
+        assert _stop_state(tmp_path, stream, True, launch=launch, gap=gap) is (not running), name
 
 
 @needs_browser
@@ -184,3 +215,25 @@ def test_the_room_and_the_thread_strip_a_reads_numbers_alike(tmp_path):
     got = json.loads(res.stdout)
     assert [g["room"] for g in got] == [g["thread"] for g in got], got
     assert got[0]["thread"] == "# CLAUDE.md — flow\n\nbody line"
+
+
+_AGREE_RUNNING = """const fs = require("fs");
+const rv = require(process.argv[2] + "/room_view.js"), tv = require(process.argv[2] + "/thread_view.js");
+const cases = JSON.parse(fs.readFileSync(process.argv[3], "utf8"));
+process.stdout.write(JSON.stringify(cases.map(c => ({
+  room: rv.roomModel({room_thread: "t1", launch_id: c.launch, gap: c.gap, composer: {state: "writable"}, stream: c.stream}).running,
+  thread: tv.threadModel({thread_id: "t1", launch_id: c.launch, gap: c.gap, stream: c.stream}).running}))));
+"""
+
+
+@pytest.mark.skipif(NODE is None, reason="node is needed")
+def test_the_room_and_the_thread_agree_on_whether_a_turn_is_running_on_every_fixture(tmp_path):
+    """turnRunning is copied by design into both served files: on every fixture (the gapped window, the late old-launch rows, the
+    idle cases) the two models give the same answer, and it is the expected one."""
+    script, fixtures = tmp_path / "agree_running.js", tmp_path / "cases.json"
+    script.write_text(_AGREE_RUNNING)
+    fixtures.write_text(json.dumps([{"stream": st, "launch": ln, "gap": gap} for _n, st, ln, gap, _r in RUNNING_CASES]))
+    res = subprocess.run([NODE, str(script), str(WEB), str(fixtures)], capture_output=True, text=True, timeout=60)
+    assert res.returncode == 0, res.stderr
+    got = json.loads(res.stdout)
+    assert [(g["room"], g["thread"]) for g in got] == [(r, r) for *_x, r in RUNNING_CASES], list(zip([c[0] for c in RUNNING_CASES], got))

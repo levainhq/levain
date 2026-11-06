@@ -88,24 +88,25 @@
   }
 
   // Whether a turn is running: `stoppable` says only that a session is held (an idle thread and a running one both have one),
-  // so it is read from the turn rows the server sends in the stream, as the room does: the newest launch's latest turn row is a
-  // start with no end after it. A turn an earlier launch left open belongs to a session that is gone. This is a COPY of
+  // so it is read from the turn rows the server sends in the stream, as the room does. Only the CURRENT launch's turn rows count
+  // (the server names it, body.launch_id): a late row of an older or a room launch decides nothing about it. Its latest turn row
+  // is a start with no end after it => running. With no turn row of it in the stream and the body's gap flag set, a start may be
+  // missing from the record, so the turn is taken as running (unknown is running: Stop stays enabled, and a stop sent in a race
+  // still gets the server's "Nothing was running to stop."). No gap and no turn row is an idle thread. This is a COPY of
   // turnRunning in room_view.js.
-  function turnRunning(stream) {
-    var launch = null, last = "";
+  function turnRunning(stream, launchId, gap) {
+    if (typeof launchId !== "string" || !launchId) return false;
+    var last = "";
     for (var i = 0; i < stream.length; i++) {
       var it = stream[i];
-      if (it && typeof it.launch_id === "string" && it.launch_id) {
-        if (it.launch_id !== launch) { launch = it.launch_id; last = ""; }
-        if (it.kind === "vendor_turn_started" || it.kind === "vendor_turn_ended") last = it.kind;
-      }
+      if (it && it.launch_id === launchId && (it.kind === "vendor_turn_started" || it.kind === "vendor_turn_ended")) last = it.kind;
     }
-    return last === "vendor_turn_started";
+    return last === "" ? gap === true : last === "vendor_turn_started";
   }
 
   function threadModel(body) {
     return {
-      id: String(body.thread_id), launchId: body.launch_id == null ? null : String(body.launch_id), running: turnRunning(body.stream || []),
+      id: String(body.thread_id), launchId: body.launch_id == null ? null : String(body.launch_id), running: turnRunning(body.stream || [], body.launch_id, body.gap === true),
       gap: body.gap === true, authority: authorityWords(body.authority), model: modelWords(body.model),
       before: (body.before || []).map(line), stream: (body.stream || []).map(line)
     };
