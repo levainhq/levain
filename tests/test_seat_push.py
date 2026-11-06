@@ -435,6 +435,20 @@ def test_a_rejected_tip_is_offered_again_under_a_new_grant(eg):
     assert _ref(fresh, "refs/heads/seat/lane-a") == rewritten
 
 
+def test_a_rejection_nobody_heard_on_session_end_is_retried_at_the_next_hook(eg):
+    """gemini MED 4: SessionEnd cannot reach the model, so its rejection is not remembered as settled; the next Stop
+    tells the model once."""
+    eg.rig.sign_lease()
+    eg.sign()
+    _plan, clone = eg.lane()
+    eg.commit(clone, "one")
+    assert eg.hook(clone) == (0, "")
+    _git(clone, "commit", "-q", "--amend", "--allow-empty", "-m", "rewritten")
+    assert eg.hook(clone, event="SessionEnd") == (0, "")               # rejected, no one to tell
+    code, err = eg.hook(clone)
+    assert code == 2 and "rejected your lane branch" in err            # the next Stop still tells the model
+
+
 def test_a_transport_error_is_not_told_as_a_rejection_and_is_retried(eg):
     """codex MED 3 / complement 2: git failing with no ref line (here: no repository at the pinned path, the shape of
     DNS / auth / transport) is status "error": recorded, exit 0, no rebase text, tried again at the next Stop."""

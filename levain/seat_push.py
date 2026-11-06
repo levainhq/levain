@@ -85,7 +85,7 @@ def live_egress(state: AuthoritySnapshot, now: datetime) -> Mapping[str, Any] | 
         except Exception:  # noqa: BLE001 - a grant whose expiry cannot be read is not live
             continue
     if len(live) > 1:
-        raise SeatPushRefused("the authority log holds more than one live seat-egress grant: revoke all but one")
+        raise SeatPushRefused("the authority log holds more than one live seat-egress grant: revoke all but one with `levain seat egress revoke <id>` (see `levain seat egress list`)")
     if not live:
         return None
     gid, grant = live[0]
@@ -299,12 +299,14 @@ def run_hook(event: str, stdin_text: str, *, clone: Path | str, key_dir: Path | 
 
 def _settle(result: push.PushResult, *, event: str, active: bool, key_dir: Path, lane: str, grant: Mapping[str, Any],
             home: Path, base: dict[str, Any], err) -> int:
-    """The exit code for a push git reported on. Pushed or rejected: the tip is remembered against this grant (a
-    rejected tip is not retried or re-told until the seat moves it, or another grant is signed). Only a REJECTION
+    """The exit code for a push git reported on. Pushed, or rejected AND the model told: the tip is remembered against this grant (a
+    told rejection is not retried or re-told until the seat moves it, or another grant is signed; a rejection nobody heard,
+    on SessionEnd or under stop_hook_active, is retried at the next hook). Only a REJECTION
     (``status == "rejected"``: a non-fast-forward or the remote's own rule) on a first ``Stop`` exits 2 with the
     rebase text; a transport, auth or DNS failure (``"error"``) is the receipt's record, is retried at the next Stop
     and ends 0. A remember that fails never costs the model its one rejection message."""
-    if result.ok or result.status == "rejected":
+    told = result.status == "rejected" and event == "Stop" and not active     # the model hears a rejection only here
+    if result.ok or told:
         try:
             _remember(key_dir, lane, result.new_sha, grant)
         except (OSError, TypeError, ValueError) as exc:
@@ -312,7 +314,7 @@ def _settle(result: push.PushResult, *, event: str, active: bool, key_dir: Path,
                                                               f"{type(exc).__name__}: {str(exc)[:200]}"})
     if result.ok:
         return 0
-    if result.status == "rejected" and event == "Stop" and not active:
+    if told:
         print(_REJECT_TEXT.format(branch=base.get("branch"), detail=str(result.detail)[:300]), file=err)
         return 2
     return 0
