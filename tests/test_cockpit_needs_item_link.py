@@ -48,6 +48,21 @@ def test_an_unknown_item_falls_back_to_the_needs_view_with_a_notice(tmp_path: Pa
     assert got["y"] > 100, got                                          # still at the Needs strip, as the plain link goes
 
 
+@needs_browser
+def test_an_answered_item_with_nothing_else_waiting_says_so_and_lands_on_needs(tmp_path: Path, monkeypatch) -> None:
+    """The item was answered and the AUTHORITATIVE Decisions listing is empty: that is an answer, not a transient. The reader gets the
+    "no longer waiting" note (never silence while the jump polls out an expired deadline)."""
+    home = tmp_path / "levain_home"
+    monkeypatch.setenv("LEVAIN_HOME", str(home))
+    (home / "consent").mkdir(parents=True, mode=0o700)
+    _root, src, _ids = _install(tmp_path)
+    with _serve(src, surface_tokens={"browser": "T"}, install_class="reported") as (url, _httpd):
+        out = _drive(tmp_path, f"{url}/?view=needs&item=question:2#write_token=T", [
+            DESKTOP, {"until": "!!document.getElementById('ck-needs') && 1", "ms": 40000}, SETTLE, {"eval": READ}])["values"]
+    got = json.loads(out[-1])
+    assert got["note"] == "That item is no longer waiting." and got["modal"] is False and got["search"] == "", got
+
+
 def _eleven_questions(tmp_path: Path, monkeypatch) -> None:
     from levain.consent.questions import QuestionStore    # as tests/test_cockpit_band_title.py builds its store
     home = tmp_path / "levain_home"
@@ -93,7 +108,7 @@ def test_an_empty_or_partial_listing_never_says_no_longer_waiting() -> None:
     holds the item or the deadline), and the notice is said only of a whole listing (no panel error, no note). The page does not re-read
     the panel on a timer inside the harness's window, so this is pinned on the code, not driven."""
     body = _jump_body()
-    assert "Array.isArray(lines) && lines.length" in body, body
+    assert "lines.length > 0 || (dec.clean === true" in body and "needsDeepJump(run, deadline)" not in body, body
     assert "!dec.error && !dec.note" in body and body.index("!dec.error") < body.index("needsGoneNote()"), body
 
 
