@@ -43,7 +43,9 @@ room's ``--settings`` that answers a Read, Grep or Glob of a path outside the fo
 the vendor's, which names a setting and a remedy. It can only add refusals. Its deny is a ``reject`` decision from source
 ``hook``, which that context already passes without a count (``reject`` is never refused and is "ruled"), and the vendor
 streams no ``hook_response`` for it (the recorded run, ``tests/fixtures/claude_stream/room_hook_denied_read.jsonl``), so
-the hook counts are unchanged. It is part of the containment digest (its settings entry AND its script's sha256). The
+the hook counts are unchanged. It is part of the containment digest (its settings entry AND the sha256 of the script
+bytes written for that launch, to a file in run_dir named by that sha256; spawn refuses when the file no longer holds
+them). The
 open check's two decoys are left to the vendor (the child's :data:`~levain.coordinator.room_readguard.EXEMPT_ENV` names
 them), because a hook deny is also an ``is_error`` result and a ``permission_denials`` entry: a hook that answered them
 would pass the check without the deny rules or the block holding.
@@ -452,16 +454,31 @@ def mcp_config_json(launch_id: str, python: str) -> str:
 
 
 def _guard_source() -> bytes:
-    """The read-guard hook's script, as the launcher copies it into the room's run directory."""
+    """The read-guard hook's script as the package holds it now. A launch reads it ONCE and writes, names and hashes
+    exactly those bytes (:meth:`RoomLauncher._put_guard`); nothing else hashes the package's copy."""
     return Path(room_readguard.__file__).read_bytes()
 
 
-def containment_digest(settings_json: str) -> str:
-    """64 hex: the containment policy a spawn ran under (tool flags, mode, sources, deny rules, the read-guard hook entry
-    and its script's sha256, door name)."""
+def _file_sha256(path: Path) -> Optional[str]:
+    """The sha256 of the file at ``path``, or None when it cannot be read."""
+    try:
+        return hashlib.sha256(path.read_bytes()).hexdigest()
+    except OSError:
+        return None
+
+
+def _guard_name(sha256: str) -> str:
+    """The script's file name in run_dir: one file per version of the script, never replaced by another version."""
+    return f"room_readguard-{sha256[:16]}.py"
+
+
+def containment_digest(settings_json: str, readguard_sha256: str) -> str:
+    """64 hex: the containment policy a spawn ran under (tool flags, mode, sources, deny rules, the read-guard hook entry,
+    door name) and ``readguard_sha256``, the sha256 of the script bytes written for THIS launch (L3 r1 codex MED: never a
+    re-read of the package, which an upgrade can change between the write and activation)."""
     policy = {"tools": list(ROOM_TOOLS), "denied": sorted(ROOM_DENIED_TOOLS), "mode": ROOM_PERMISSION_MODE,
               "setting_sources": "user", "settings": json.loads(settings_json), "door": ROOM_MCP_TOOL,
-              "readguard_sha256": hashlib.sha256(_guard_source()).hexdigest()}
+              "readguard_sha256": readguard_sha256}
     return hashlib.sha256(json.dumps(policy, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
 
 
@@ -521,12 +538,18 @@ class RoomLauncher:
         self._scope_dir = scope_dir          # where the scope decoy's directory is made (None: the system temp dir)
         # refused early, before any launch row: a bad cwd/deny pair is the operator's to fix
         self._deny = default_deny_paths(self._home, levain_home)
-        # the read-guard hook's script lives at one stable path in run_dir (copied at every launch), so the settings
-        # document, and with it the containment digest, is the same for every launch of this launcher
-        self._guard = self._run_dir / "room_readguard.py"
+        # the read-guard hook's script lives in run_dir under a name carrying its sha256 (one immutable file per version,
+        # :meth:`_put_guard`), so every launch of one version has the same settings document and containment digest,
+        # and another launcher with another version never replaces the file a running room runs. Built once here so a
+        # bad cwd/deny pair is refused before any launch row; each launch rebuilds it for the bytes it wrote
+        # (``_settings_json`` is the document for the package's script at construction, read for its deny rules)
+        self._settings_json = self._settings_for(hashlib.sha256(_guard_source()).hexdigest())
+
+    def _settings_for(self, guard_sha256: str) -> str:
+        """The room's ``--settings`` document whose hook runs the script file of ``guard_sha256``."""
         try:
-            self._settings_json = room_settings_json(setting.cwd, self._deny,
-                                                     room_hook_command(self._python, self._guard))
+            return room_settings_json(self._setting.cwd, self._deny,
+                                      room_hook_command(self._python, self._run_dir / _guard_name(guard_sha256)))
         except ValueError as exc:
             raise RoomLaunchError(f"the room's settings could not be built: {exc}") from exc
 
@@ -636,9 +659,16 @@ class RoomLauncher:
             if widened is not None:
                 raise RoomLaunchError(widened)
             scope_dir, scope = self._scope_decoy()
-            argv, decoy, stderr_path = self._write_files(workdir, launch_id, resume, sid)
+            argv, decoy, stderr_path, settings_json, guard, guard_sha = self._write_files(workdir, launch_id, resume, sid)
+            # one absolute string each, for the hook's exemption AND the open check: a relative or Path value can neither
+            # abort the launch after its files were written nor make the hook inert (L3 r1 complement)
+            decoy, scope = str(os.path.abspath(decoy)), str(os.path.abspath(scope))
             # the hook leaves BOTH decoys to the vendor, so each canary is answered by what it tests (room_readguard)
             env[room_readguard.EXEMPT_ENV] = json.dumps([decoy, scope])
+            # fail closed: the script the child will run must still be the bytes this launch's digest is taken over
+            if _file_sha256(guard) != guard_sha:
+                raise RoomLaunchError(f"the room's read-guard script {str(guard)[:160]!r} no longer holds the bytes "
+                                      "written for this launch; nothing was spawned")
             with open(stderr_path, "ab") as errf:
                 proc = self._spawn(argv, cwd=self._setting.cwd, env=env, stderr=errf)
             session = RoomSession(PipeTransport(proc), conn=self._next_conn(), session_id=sid)
@@ -654,7 +684,7 @@ class RoomLauncher:
             self._svc.attach(launch_id, session)
             self._svc.activate(launch_id, "live", "room open check passed", evidence=init, spawn_nonce=nonce,
                                canary=RoomCanary(True, decoy, "the canary Read was denied"),
-                               containment_digest=containment_digest(self._settings_json))
+                               containment_digest=containment_digest(settings_json, guard_sha))
             # the service sends nothing to a launch with no recorded vendor position: record the open check's events
             # (the first read ends at its turn boundary) and make sure they did not latch the room they opened
             self._svc.read_next(launch_id)
@@ -720,31 +750,40 @@ class RoomLauncher:
                 f.write(text)
             return p
 
-        self._put_guard()
+        guard, guard_sha = self._put_guard()
+        settings_json = self._settings_for(guard_sha)
         mcp = put("mcp.json", mcp_config_json(launch_id, self._python))
-        settings = put("settings.json", self._settings_json)
+        settings = put("settings.json", settings_json)
         stderr = put("child.stderr", "")
         decoy_dir = workdir / "decoy"
         decoy_dir.mkdir(mode=0o700)
         decoy = put("decoy/" + _CANARY_NAME, "DECOY\n")
         argv = room_argv(mcp_config=mcp, settings=settings, model=self._setting.model, claude_bin=self._setting.claude_bin,
                          **({"resume": resume} if resume else {"session_id": sid}))
-        return argv, str(decoy), stderr
+        return argv, str(decoy), stderr, settings_json, guard, guard_sha
 
-    def _put_guard(self) -> None:
-        """Copy the read-guard hook's script to its one path in run_dir (0600, replaced whole), the file the room's
-        ``--settings`` hook command names."""
+    def _put_guard(self) -> tuple:
+        """``(path, sha256)``: the read-guard hook's script as the package holds it, read ONCE, written to
+        ``run_dir/<_guard_name(sha256)>`` (0600, replaced whole when that file is missing or holds other bytes). The
+        settings document names that file and the containment digest is taken over that sha256, so both describe the
+        bytes written here, and another version of the script is another file."""
+        data = _guard_source()
+        sha = hashlib.sha256(data).hexdigest()
+        path = self._run_dir / _guard_name(sha)
+        if _file_sha256(path) == sha:
+            return path, sha
         tmp = self._run_dir / f".room_readguard.{secrets.token_hex(6)}.tmp"
         try:
             fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
             with os.fdopen(fd, "wb") as f:
-                f.write(_guard_source())
-            os.replace(tmp, self._guard)
+                f.write(data)
+            os.replace(tmp, path)
         finally:
             try:
                 tmp.unlink()
             except FileNotFoundError:
                 pass
+        return path, sha
 
     def _open_check(self, session: RoomSession, proc: Any, decoy: str, stderr_path: Path,
                     sid: str, scope: str) -> LivenessEvidence:

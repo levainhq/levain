@@ -99,6 +99,33 @@ def test_the_config_dir_and_the_open_checks_decoy_are_left_to_the_vendor_but_the
     assert _decide(room, "Read", str(link)) is None
 
 
+def _volume_folds_case(path: Path) -> bool:
+    """Measured, never assumed: does this volume find ``path`` under its last component in other casing?"""
+    other = path.parent / path.name.swapcase()
+    return other.exists() and os.path.samefile(path, other)
+
+
+def test_the_folder_in_other_casing_is_inside_on_a_case_insensitive_volume(room):
+    """L3 r1 codex MED (complement LOW 4): ``realpath`` keeps the casing it is given, so a string compare judged the
+    room's own folder, written in other casing, outside (a false refusal, never a hole). Ancestry is by filesystem
+    identity; the config-dir and decoy exemptions likewise. A neighbour in other casing is still outside."""
+    if not _volume_folds_case(room["cwd"]):
+        pytest.skip("this volume is case-sensitive: the other casing names another folder")
+    cased = room["cwd"].parent / room["cwd"].name.swapcase()                        # .../CWD for .../cwd
+    assert _decide(room, "Read", str(cased / "note.txt")) is None
+    assert _decide(room, "Read", str(cased)) is None
+    assert _decide(room, "Read", str(cased / "nope" / "missing.txt")) is None        # a tail that does not exist yet
+    assert _decide(room, "Grep", str(cased / "SUB")) is None
+    assert decide(_event("Read", str(room["cwd"] / "note.txt"), cased), exempt=[], config_dir=None) is None
+    assert _decide(room, "Read", str(room["tmp"] / room["cfg"].name.swapcase() / "tool-results" / "x.txt")) is None
+    assert _decide(room, "Read", str(room["decoy"].parent / room["decoy"].name.upper())) is None
+    # a sibling whose name merely starts with the folder's, in either casing, is still outside
+    (room["tmp"] / "cwd-sibling").mkdir()
+    assert _decide(room, "Read", str(room["tmp"] / "CWD-sibling" / "x")) == ROOM_READ_REFUSAL
+    assert _decide(room, "Read", str(room["tmp"] / "CWDX" / "x")) == ROOM_READ_REFUSAL
+    assert _decide(room, "Read", str(room["decoy"].parent / "OTHER.txt")) == ROOM_READ_REFUSAL
+
+
 @pytest.mark.parametrize("event", [
     None, [], "x", {}, {"tool_name": "Read"}, {"tool_name": "Bash", "tool_input": {"command": "ls"}, "cwd": "/tmp"},
     {"tool_name": "Read", "tool_input": {}, "cwd": "/tmp"}, {"tool_name": "Read", "tool_input": {"file_path": ""}, "cwd": "/tmp"},
@@ -137,21 +164,40 @@ def test_the_decision_is_a_pretooluse_deny_with_the_sentence_and_the_hook_never_
 @pytest.mark.parametrize("env", [
     {},                                                                  # no exemption list: the decoy would be masked, so inert
     {EXEMPT_ENV: ""}, {EXEMPT_ENV: "not json"}, {EXEMPT_ENV: "{}"}, {EXEMPT_ENV: json.dumps(["relative/p"])},
-    {EXEMPT_ENV: json.dumps([3])}])
+    {EXEMPT_ENV: json.dumps([3])},
+    {EXEMPT_ENV: "[]"}])     # an EMPTY list exempts no decoy, so the hook would answer the canary: inert too (L3 r1 deepseek)
 def test_a_missing_or_broken_exemption_list_makes_the_hook_inert_never_a_refusal(room, env):
     assert _run_main(json.dumps(_event("Read", "/etc/hosts", room["cwd"])), env) == (0, "")
 
 
+# an exemption list that makes the hook live (an absolute path nothing reads), so "prints nothing" below is the hook's own
+_LIVE_EXEMPT = {EXEMPT_ENV: json.dumps(["/nonexistent-levain-room-exempt"])}
+
+
 @pytest.mark.parametrize("text", ["", "not json", "[]", "null", '{"tool_name": "Read"}', "\x00"])
 def test_a_garbled_event_exits_zero_and_prints_nothing(text):
-    assert _run_main(text, {EXEMPT_ENV: "[]"}) == (0, "")
+    assert _run_main(text, _LIVE_EXEMPT) == (0, "")
 
 
 def test_a_failure_inside_the_hook_exits_zero_and_prints_nothing(room, monkeypatch):
     def boom(*_a, **_k):
         raise RuntimeError("x")
     monkeypatch.setattr(room_readguard, "decide", boom)
-    assert _run_main(json.dumps(_event("Read", "/etc/hosts", room["cwd"])), {EXEMPT_ENV: "[]"}) == (0, "")
+    assert _run_main(json.dumps(_event("Read", "/etc/hosts", room["cwd"])), _LIVE_EXEMPT) == (0, "")
+
+
+def test_the_config_dir_comes_from_the_mapping_main_is_given_never_the_processes_environment(room, monkeypatch):
+    """L3 r1 deepseek LOW: ``_config_dir`` fell back to ``os.path.expanduser``, which reads the process's ``os.environ``
+    and not the mapping ``main`` was given. With no HOME in the mapping the fallback is the OS user's home (the passwd
+    entry, what the vendor's own home lookup falls back to), never the process environment."""
+    proc_home = Path("/nonexistent-levain-proc-home")       # not under the OS user's home (the basetemp may be)
+    monkeypatch.setenv("HOME", str(proc_home))
+    monkeypatch.delenv("CLAUDE_CONFIG_DIR", raising=False)
+    user_home = pwd.getpwuid(os.getuid()).pw_dir
+    assert room_readguard._config_dir({"HOME": str(room["tmp"] / "given")}) == str(room["tmp"] / "given" / ".claude")
+    assert room_readguard._config_dir({}) == os.path.join(user_home, ".claude")
+    env = dict(_LIVE_EXEMPT)                                      # no HOME, no CLAUDE_CONFIG_DIR in the mapping
+    assert _run_main(json.dumps(_event("Read", str(proc_home / ".claude" / "x"), room["cwd"])), env)[1] != ""
 
 
 def test_the_script_runs_isolated_as_the_child_runs_it_and_imports_nothing_of_levain(room):
@@ -206,6 +252,30 @@ def test_the_pages_refusal_regex_matches_the_constant_the_hook_prints(tool):
     assert not res[3].search(f"1\tPreToolUse:Read hook error: {ROOM_READ_REFUSAL}")     # a file's text opens with a line number
     assert not res[3].search("PreToolUse:Read hook error: some other hook said no")
     assert not res[3].search(ROOM_READ_REFUSAL)                                       # the wrapper is part of what is recorded
+
+
+def _js_escape(text: str) -> str:
+    return re.sub(r"([\\^$.*+?()\[\]{}|/])", r"\\\1", text)
+
+
+def test_the_pages_refusal_regex_is_the_whole_constant_in_the_recorded_wrapper_and_nothing_after_it():
+    """L3 r1 codex LOW (complement LOW 6): the regex held only the sentence's first clause and no end anchor, so another
+    hook's reason that opened the same way was drawn as the room's refusal. Its source is now built from
+    ``ROOM_READ_REFUSAL`` (one test ties the two) inside the recorded wrapper only, anchored at the end."""
+    src = ROOM_VIEW.read_text()
+    block = src[src.index("var REFUSED = ["):src.index("];", src.index("var REFUSED = ["))]
+    want = r"^PreToolUse:(?:Read|Grep|Glob) hook error: " + _js_escape(ROOM_READ_REFUSAL) + "$"
+    assert f"re: /{want}/ }}" in block
+    # the recorded wrapper is exactly this (the fixture's tool_result content)
+    blocks = [b for f in _frames() if isinstance(f.get("message"), dict) and isinstance(f["message"].get("content"), list)
+              for b in f["message"]["content"]]
+    recorded = {b["content"] for b in blocks
+                if isinstance(b, dict) and b.get("type") == "tool_result" and "hook error" in str(b.get("content"))}
+    assert recorded == {f"PreToolUse:{t} hook error: {ROOM_READ_REFUSAL}" for t in ("Read", "Grep")}
+    r = _js_refusal_regexes()[3]
+    first = ROOM_READ_REFUSAL.split(". ")[0] + "."
+    assert not r.search(f"PreToolUse:Read hook error: {first} Another hook's own, important detail.")
+    assert not r.search(f"PreToolUse:Read hook error: {ROOM_READ_REFUSAL} And more.")
 
 
 # ---- 4. the recorded real run ---------------------------------------------------------------------------------------
