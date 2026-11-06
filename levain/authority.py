@@ -316,7 +316,7 @@ _EGRESS_KEY_REPOS_MAX = 256
 # nothing but a graduation policy), so a surface token or the phone can never point the room's words at another
 # account; any enrolled key, a passkey included, may revoke one, and a revoke stops the next read.
 VOICE_KEY_KIND = "voice-key"
-VOICE_KEY_PROVIDERS = ("deepgram", "elevenlabs", "openai")
+VOICE_KEY_PROVIDERS = ("deepgram", "elevenlabs", "inworld", "openai")
 VOICE_KEY_USES = ("stt", "tts")
 _VOICE_KEY_FIELDS = frozenset({"id", "kind", "provider", "uses", "source", "account"})
 _VOICE_KEY_ID = re.compile(r"vk-[0-9a-f]{12}")

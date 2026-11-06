@@ -21,7 +21,7 @@ import subprocess
 import sys
 import threading
 from contextlib import contextmanager
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
@@ -208,6 +208,17 @@ class Rig:
 @pytest.fixture
 def rig(tmp_path, qdir, monkeypatch):  # noqa: F811 - the imported fixture, taken by name
     return Rig(tmp_path, qdir, monkeypatch)
+
+
+_REAL_TODAY = cockpit_voice._today
+BEFORE_CUTOFF = date(2026, 11, 5)       # the day OpenAI is still offered; the tests of the cutoff set their own
+
+
+@pytest.fixture(autouse=True)
+def _clock_before_the_openai_cutoff(monkeypatch):
+    """Every test here runs on a pinned day before OpenAI's 2027-01-06 cutoff, so the OpenAI tests do not start failing
+    when the real calendar passes it; the cutoff tests below move the clock themselves."""
+    monkeypatch.setattr(cockpit_voice, "_today", lambda: BEFORE_CUTOFF)
 
 
 @contextmanager
@@ -812,7 +823,8 @@ def test_t_json_voice_json_shows_the_record_id_and_uses_and_nothing_of_the_key(r
         status, hdrs, body = call(port, "GET", VOICE_JSON)
     assert status == 200 and hdrs["cache-control"] == "private, no-store" and "X-Levain-Write-Token" in hdrs["vary"]
     out = js(body)
-    openai, deepgram = out["providers"]
+    inworld, openai, deepgram = out["providers"]
+    assert (inworld["name"], inworld["key"], inworld["record_id"], inworld["uses"]) == ("inworld", "not_set", None, [])
     assert (openai["name"], openai["key"], openai["record_id"], openai["uses"], openai["last_read"]) == (
         "openai", "set", record["id"], ["stt", "tts"], "refused")
     assert (deepgram["key"], deepgram["record_id"]) == ("not_set", None)
@@ -1459,7 +1471,7 @@ def test_f5_a_call_failure_after_a_refused_key_clears_the_refused_state(rig):
         assert speak(port, rig, g)[0] == 503
         assert httpd.voice_last_read["openai"] is None
         _h = call(port, "GET", VOICE_JSON)
-        assert js(_h[2])["providers"][0]["last_read"] is None
+        assert next(p for p in js(_h[2])["providers"] if p["name"] == "openai")["last_read"] is None
 
 
 @pytest.mark.parametrize("later", ["not_set", "use_not_granted"])
@@ -1585,16 +1597,137 @@ def test_hidestt_off_the_transcribe_route_refuses_in_fixed_words_before_anything
 def test_hidestt_off_the_listing_offers_no_dictation_and_on_it_does(rig):
     """The page reads ``voice.json`` to decide what to offer: off, no provider lists ``stt`` among its uses, the body
     says ``premium_stt: false`` and the retention words leave transcription out; on, it is as it was.
-    Red with: the ``premium_stt or u != "stt"`` filter dropped (stt listed while off), or the retention choice dropped."""
+    Red with: the ``u != "stt" or (premium_stt and data.stt_model)`` filter dropped (stt listed while off), or the retention choice dropped."""
     rig.add_key()
     with served(rig, premium_stt=False) as (port, _httpd):
         off = js(call(port, "GET", VOICE_JSON)[2])
     with served(rig, premium_stt=True) as (port, _httpd):
         on = js(call(port, "GET", VOICE_JSON)[2])
-    openai_off, openai_on = off["providers"][0], on["providers"][0]
+    openai_off, openai_on = (next(p for p in body["providers"] if p["name"] == "openai") for body in (off, on))
     assert off["premium_stt"] is False and on["premium_stt"] is True
     assert openai_off["uses"] == ["tts"] and openai_on["uses"] == ["stt", "tts"]
     assert "ranscri" not in openai_off["retention"] and "Transcription" in openai_on["retention"]
     for text in _strings(off):
         assert "dictation" not in text.lower() and "transcri" not in text.lower(), text
     assert openai_off["key"] == "set"                            # the key itself is as it was: only the use is hidden
+
+
+# --- Inworld, the premium default (Phill 11-05, np-c290888c), and OpenAI's 2027-01-06 cutoff ---------------------------
+
+INWORLD_URL = "https://api.inworld.ai/v1/audio/speech"
+
+
+def test_inworld_is_the_first_provider_listed_with_the_documented_voices_and_honest_retention_words(rig):
+    """The first row is the premium default: the only place that says so is the order of ``PROVIDERS``.
+    Red with: the inworld entry moved after openai, a voice added that no page prints, or the retention words claiming
+    what Inworld's pages do not."""
+    with served(rig) as (port, _httpd):
+        status, _h, body = call(port, "GET", VOICE_JSON)
+    rows = js(body)["providers"]
+    assert status == 200 and [r["name"] for r in rows] == ["inworld", "openai", "deepgram"]
+    inworld = rows[0]
+    assert inworld["voices"] == list(vprov.INWORLD_TTS_VOICES) == ["Alex", "Ashley", "Dennis"]
+    assert (inworld["default_voice"], inworld["tts_model"], inworld["speed"]) == ("Dennis", "inworld-tts-2-flash", [0.5, 1.5])
+    assert "do not say how long" in inworld["retention"] and "train AI models" in inworld["retention"]
+    assert "not used to train" not in inworld["retention"].lower()
+
+
+def test_a_speak_naming_inworld_sends_one_call_to_inworld_and_meters_its_characters(rig):
+    """Red with: provider_for lacking inworld, the meter row missing, or the route reading another provider's model.
+    The price is $15 per million characters, so a character is 15 micro-dollars."""
+    rig.add_key(provider="inworld", uses=("tts",), source=SOURCE + "-inworld")
+    g = rig.reply("Hello there.")
+    with served(rig) as (port, _httpd):
+        status, hdrs, body = speak(port, rig, g, provider="inworld", voice="Ashley", speed=1.25)
+    assert (status, body) == (200, MP3) and hdrs["content-type"] == "audio/mpeg"
+    (seen,) = rig.transport.seen
+    assert seen["url"] == INWORLD_URL and seen["keyed"]
+    sent = json.loads(seen["body"])
+    assert sent == {"model": "inworld-tts-2-flash", "input": "Hello there.", "voice": "Ashley", "speed": 1.25,
+                    "response_format": "mp3"}
+    (row,) = rig.rows()
+    assert (row.provider, row.use, row.model, row.units, row.cost_micros, row.status) == (
+        "inworld", "tts", "inworld-tts-2-flash", len("Hello there."), 15 * len("Hello there."), "ok")
+
+
+@pytest.mark.parametrize("bad", [{"voice": "alloy"}, {"voice": "dennis"}, {"voice": "nova"}, {"speed": 1.6},
+                                 {"speed": 0.4}, {"speed": 4.0}])
+def test_a_voice_or_speed_inworld_does_not_offer_is_refused_unsent_and_unreserved(rig, bad):
+    """OpenAI's voice names and speed range do not carry over (the pages: ``alloy`` is a 404, a speed past 0.5-1.5 a 400).
+    Red with: the inworld ``ProviderData`` listing an OpenAI voice, or taking OpenAI's speed range."""
+    rig.add_key(provider="inworld", uses=("tts",), source=SOURCE + "-inworld")
+    g = rig.reply("Hello there.")
+    with served(rig) as (port, _httpd):
+        status, _h, out = speak(port, rig, g, provider="inworld", **{"voice": "Dennis", "speed": 1.0, **bad})
+    assert (status, js(out)["error"]) == (400, "bad_request") and "Inworld" in js(out)["message"]
+    assert rig.transport.seen == [] and rig.rows() == []
+
+
+def test_another_providers_key_is_never_used_for_inworld(rig):
+    """Red with: voice_key_for or the route falling back to any key when the named provider has none."""
+    rig.add_key(provider="openai")
+    g = rig.reply("Hello there.")
+    with served(rig) as (port, _httpd):
+        status, _h, out = speak(port, rig, g, provider="inworld", voice="Dennis")
+    assert (status, js(out)["error"]) == (409, "no_key") and js(out)["message"].startswith("No Inworld key is set")
+    assert rig.transport.seen == [] and [r.status for r in rig.rows()] == ["released"]
+
+
+def test_inworld_is_speech_only_a_transcribe_naming_it_is_refused_before_any_key_or_meter_row(rig):
+    """Premium dictation is off in the product; with the hidden switch on, Inworld still has no dictation to offer.
+    Red with: the ``stt_model`` check dropped from ``_query_provider``."""
+    rig.add_key(provider="inworld", uses=("stt", "tts"), source=SOURCE + "-inworld")
+    with served(rig, premium_stt=True) as (port, _httpd):
+        status, _h, out = transcribe(port, provider="inworld")
+    assert (status, js(out)["error"]) == (409, "no_dictation")
+    assert js(out)["message"] == "Inworld reads aloud only; it does not offer dictation."
+    assert rig.transport.seen == [] and rig.rows() == []
+
+
+def test_voice_json_never_lists_dictation_for_inworld_even_when_its_record_allows_it(rig):
+    """A key added with the CLI's default uses carries ``stt``; with premium dictation on, Inworld's row must not offer it.
+    Red with: the ``data.stt_model`` condition dropped from ``serve_voice``."""
+    rig.add_key(provider="inworld", uses=("stt", "tts"), source=SOURCE + "-inworld")
+    rig.add_key(provider="openai")
+    with served(rig, premium_stt=True) as (port, _httpd):
+        rows = {r["name"]: r for r in js(call(port, "GET", VOICE_JSON)[2])["providers"]}
+    assert rows["inworld"]["uses"] == ["tts"] and rows["openai"]["uses"] == ["stt", "tts"]
+
+
+def test_the_cutoff_is_the_sixth_of_january_2027():
+    """Red with: the constant moved (OpenAI's page announced tts-1's shutdown for 2027-01-06)."""
+    assert cockpit_voice.OPENAI_OFFERED_UNTIL == date(2027, 1, 6)
+
+
+def test_the_real_clock_seam_reads_the_utc_date():
+    """Red with: ``_today`` reading something other than today's UTC date."""
+    assert _REAL_TODAY() in {datetime.now(timezone.utc).date(), date.fromordinal(datetime.now(timezone.utc).date().toordinal() - 1)}
+
+
+@pytest.mark.parametrize("today,offered", [(date(2026, 11, 5), True), (date(2027, 1, 5), True),
+                                           (date(2027, 1, 6), False), (date(2027, 1, 7), False),
+                                           (date(2030, 6, 1), False)])
+def test_openai_is_offered_until_the_cutoff_and_not_from_it_in_both_the_listing_and_the_refusals(rig, monkeypatch, today,
+                                                                                                    offered):
+    """One function (``offered``) decides for ``voice.json``, ``speak`` and ``transcribe``, so they cannot disagree.
+    Red with: the comparison changed to ``>``, the cutoff applied to the listing only, or to the speak route only."""
+    monkeypatch.setattr(cockpit_voice, "_today", lambda: today)
+    rig.add_key(provider="openai")
+    rig.add_key(provider="inworld", uses=("tts",), source=SOURCE + "-inworld")
+    g = rig.reply("Hello there.")
+    with served(rig, premium_stt=True) as (port, _httpd):
+        names = [r["name"] for r in js(call(port, "GET", VOICE_JSON)[2])["providers"]]
+        o_status, _h, o_out = speak(port, rig, g, provider="openai", voice="nova")
+        t_status, _h, t_out = transcribe(port, provider="openai")
+        i_status, _h, i_body = speak(port, rig, g, provider="inworld", voice="Dennis")
+    assert i_status == 200 and i_body == MP3                       # the default is not touched by the date
+    if offered:
+        assert names == ["inworld", "openai", "deepgram"]
+        assert (o_status, t_status) == (200, 200)
+    else:
+        assert names == ["inworld", "deepgram"]
+        assert (o_status, js(o_out)["error"], js(o_out)["message"]) == (
+            409, "provider_unsupported", "OpenAI is not supported in this version.")
+        assert (t_status, js(t_out)["error"]) == (409, "provider_unsupported")
+        assert [s["url"] for s in rig.transport.seen] == [INWORLD_URL]          # nothing went to OpenAI
+        assert {r.provider for r in rig.rows()} == {"inworld"}

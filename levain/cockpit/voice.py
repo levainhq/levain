@@ -41,6 +41,7 @@ import math
 import urllib.parse
 from collections.abc import Callable, MutableMapping
 from dataclasses import dataclass
+from datetime import date, datetime, timezone
 from pathlib import Path
 from typing import Any, NamedTuple
 
@@ -87,7 +88,18 @@ class ProviderData:
     retention_speech: str = ""
 
 
+# The order of this dict is the order ``voice.json`` lists providers in, and the FIRST is the premium default (Phill 11-05:
+# Inworld TTS-2 Flash, np-c290888c). It is the one place that says so; a page that picks a provider takes the first row.
 PROVIDERS: dict[str, ProviderData] = {
+    # Inworld speech only (no transcription: stt_model is empty, so no dictation call can be priced or sent). The voices are
+    # the ids Inworld's docs print, since the full list is behind an authenticated call (vprov.INWORLD_TTS_VOICES). The
+    # retention words are what the pages say and do not say, read 2026-11-05.
+    "inworld": ProviderData("inworld", vprov.INWORLD_TTS_MODEL, "",
+                            vprov.INWORLD_TTS_VOICES, vprov.INWORLD_TTS_VOICE,
+                            vprov.INWORLD_SPEED_MIN, vprov.INWORLD_SPEED_MAX,
+                            "Inworld's pages do not say how long text sent on its pay-as-you-go plan is kept, and its "
+                            "privacy notice says it may use information to train AI models. Zero data retention is a "
+                            "setting its Developer plan and above can turn on. US servers by default."),
     # tts-1's nine voices: OpenAI's speech reference (read by the design lane, 2026-11-05) lists 13 built-in voices
     # without saying which tts-1 takes, so this list is inferred and is data. The speed range is the adapter's own.
     "openai": ProviderData("openai", vprov.OPENAI_TTS_MODEL, vprov.OPENAI_STT_MODEL,
@@ -107,6 +119,22 @@ PROVIDERS: dict[str, ProviderData] = {
 # a record kind exists for these (authority.VOICE_KEY_PROVIDERS) but no adapter does
 UNSUPPORTED = {"elevenlabs": "ElevenLabs"}
 
+# OpenAI announced that tts-1 shuts down on this date (Phill 11-05: OpenAI stays selectable only until then). On and after
+# it voice.json does not list openai and a call naming it is refused; before it nothing changes. The clock is a seam so a
+# test can set it; ``offered`` is the one function every route asks, so the listing and the refusals cannot disagree.
+OPENAI_OFFERED_UNTIL = date(2027, 1, 6)
+
+
+def _today() -> date:
+    return datetime.now(timezone.utc).date()
+
+
+def offered() -> dict[str, ProviderData]:
+    """The providers the routes serve today: :data:`PROVIDERS` in its order, without OpenAI from
+    :data:`OPENAI_OFFERED_UNTIL` on."""
+    cutoff = _today() >= OPENAI_OFFERED_UNTIL
+    return {name: data for name, data in PROVIDERS.items() if not (cutoff and name == "openai")}
+
 # The fixed words. ``{p}`` is the provider's display name (providers.NAMES), ``{cap}`` a dollar amount.
 WORDS = {
     "no_owner": "Premium voice needs a named credential.",
@@ -122,6 +150,7 @@ WORDS = {
     "bad_keys": "A speak request names room_thread_id, reply_gseq, chunk, provider, voice and speed, and nothing else.",
     "bad_provider": "That is not a voice provider.",
     "provider_unsupported": "{p} is not supported in this version.",
+    "no_dictation": "{p} reads aloud only; it does not offer dictation.",
     "bad_reply": "reply_gseq names the reply by its number.",
     "bad_chunk": "chunk is a whole number, 0 or more.",
     "bad_voice": "That voice is not offered for {p}.",
@@ -245,9 +274,10 @@ def serve_voice(data_root: Path | str, meter: vmeter.Meter, *, last_read: Mutabl
     except Exception:       # noqa: BLE001 - any failure is "the log could not be verified now", said, not raised
         grants, authority = {}, "unreadable"
     rows = []
-    for name, data in PROVIDERS.items():
+    for name, data in offered().items():
         record = voice_key_for(grants, name) if grants else None
-        uses = sorted(u for u in record["uses"] if premium_stt or u != "stt") if record is not None else []
+        uses = sorted(u for u in record["uses"] if u != "stt" or (premium_stt and data.stt_model)) \
+            if record is not None else []
         rows.append({"name": name,
                      "uses": uses,
                      "key": "set" if record is not None else "not_set",
@@ -424,6 +454,8 @@ def _parse_speak(raw: bytes) -> tuple[dict[str, Any] | None, Answer | None]:
         return None, refusal(409, "provider_unsupported", "provider_unsupported", provider=provider)
     if not isinstance(provider, str) or provider not in PROVIDERS:
         return None, refusal(400, "bad_request", "bad_provider")
+    if provider not in offered():
+        return None, refusal(409, "provider_unsupported", "provider_unsupported", provider=provider)
     data = PROVIDERS[provider]
     if isinstance(req["reply_gseq"], bool) or not isinstance(req["reply_gseq"], int):
         return None, refusal(400, "bad_request", "bad_reply")
@@ -497,6 +529,10 @@ def _query_provider(query: str) -> tuple[str | None, Answer | None]:
         return None, refusal(409, "provider_unsupported", "provider_unsupported", provider=provider)
     if provider not in PROVIDERS:
         return None, refusal(400, "bad_request", "bad_provider")
+    if provider not in offered():
+        return None, refusal(409, "provider_unsupported", "provider_unsupported", provider=provider)
+    if not PROVIDERS[provider].stt_model:
+        return None, refusal(409, "no_dictation", "no_dictation", provider=provider)
     return provider, None
 
 

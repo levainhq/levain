@@ -84,6 +84,8 @@ def test_price_table_is_dated_and_each_entry_prices_once():
     ("elevenlabs", "stt", "scribe", 3_600, 220_000),              # $0.22 / hour
     ("deepgram", "tts", "aura-2", 1_000, 30_000),                 # $0.030 / 1K characters
     ("deepgram", "stt", "nova-3", 60, 4_300),                     # $0.0043 / minute
+    ("inworld", "tts", "inworld-tts-2-flash", 1_000_000, 15_000_000),   # $15 / 1M characters
+    ("inworld", "tts", "inworld-tts-2-flash", 1_000, 15_000),
 ])
 def test_default_prices_match_the_dated_list_prices(tmp_path, provider, use, model, units, expected_micros):
     meter, _ = make(tmp_path, caps=Caps(10**12, 10**12))
@@ -103,6 +105,16 @@ def test_a_model_the_table_does_not_price_is_refused_and_writes_nothing(tmp_path
     for model in ("gpt-4o-mini-tts", "no-such-model"):
         chk = meter.reserve("openai", "tts", model, 100)
         assert (chk.allowed, chk.reason, chk.reservation_id) == (False, UNPRICED, None)
+    assert meter.ledger() == []
+
+
+def test_inworld_prices_only_the_flash_model_and_no_dictation(tmp_path):
+    """The Inworld row is the Flash model alone: the dearer sibling and any transcription are refused as unpriced, never
+    priced at zero."""
+    meter, _ = make(tmp_path)
+    for use, model in (("tts", "inworld-tts-2"), ("tts", "tts-1"), ("stt", "inworld-tts-2-flash")):
+        chk = meter.reserve("inworld", use, model, 100)
+        assert (chk.allowed, chk.reason, chk.reservation_id) == (False, UNPRICED, None), (use, model)
     assert meter.ledger() == []
 
 

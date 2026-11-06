@@ -56,7 +56,7 @@ DEFAULT_SECURITY = _REAL_SECURITY
 DEFAULT_ITEM_ACCOUNT = "levain-voice"
 
 # What a provider key may be made of. `security -i` parses its stdin like a shell, so a value is written only when it
-# needs no quoting: letters, digits and `. _ ~ + / = -` (the alphabets of OpenAI, ElevenLabs and Deepgram keys). Any
+# needs no quoting: letters, digits and `. _ ~ + / = -` (the alphabets of OpenAI, ElevenLabs and Deepgram keys, and of Inworld's Base64 credential). Any
 # other value is refused whole, never escaped.
 _VALUE = re.compile(r"[A-Za-z0-9._~+/=-]{8,512}")
 # A keychain name the writer will put on a `security -i` line unquoted. The record accepts wider text; the writer

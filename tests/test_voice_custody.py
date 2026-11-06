@@ -741,6 +741,25 @@ def test_cli_add_list_revoke_end_to_end_and_the_value_is_never_printed(ck, sec, 
     assert cli("list")[1].strip() == "no voice keys"
 
 
+def test_cli_add_takes_inworld_and_its_key_reads_back_by_provider(ck, sec, cli):
+    """Inworld is a voice key provider: the CLI's choices and the record's validation both come from
+    ``VOICE_KEY_PROVIDERS``. Red with: ``"inworld"`` dropped from that tuple (the parser refuses it, argparse exit 2)."""
+    code, out, err = cli("add", "inworld", "--use", "tts", "--yes", "--signing-key", str(ck.key))
+    assert code == 0, err
+    assert VALUE not in out + err
+    assert read(ck, sec, provider="inworld") == VALUE
+    assert cli("list")[1].split()[1] == "inworld"
+    with pytest.raises(VoiceKeyUnavailable):                           # a key for one provider reads for no other
+        read(ck, sec, provider="openai")
+
+
+def test_every_provider_the_cockpit_serves_or_names_has_a_voice_key_kind():
+    """Red with: a provider added to the cockpit's ``PROVIDERS`` and not to ``VOICE_KEY_PROVIDERS`` (its key could then
+    never be recorded), or the reverse."""
+    from levain.cockpit import voice as cockpit_voice
+    assert set(cockpit_voice.PROVIDERS) | set(cockpit_voice.UNSUPPORTED) == set(auth.VOICE_KEY_PROVIDERS)
+
+
 @pytest.mark.parametrize("interactive", [False, True])
 def test_cli_add_prints_the_v5_upgrade_order_before_anything_is_stored_or_signed(ck, sec, cli, monkeypatch, capsys,
                                                                                 interactive):

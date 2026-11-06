@@ -93,10 +93,12 @@ CONSENT_BEFORE = (
 def test_a_voice_key_row_names_its_provider_and_says_it_is_live_until_revoked(world, tmp_path, monkeypatch):
     """Red with the voice-key branch of grantCard reverted: the row said "voice-key <id>" for a name, "answered nothing
     yet", and an empty "until " (both renderers drew every grant as an expiring consent grant)."""
-    rows = [_voice_row("openai", "vk-0000000000aa"), _voice_row("deepgram", "vk-0000000000bb")]
+    rows = [_voice_row("openai", "vk-0000000000aa"), _voice_row("deepgram", "vk-0000000000bb"),
+            _voice_row("inworld", "vk-0000000000cc")]
     got = _drive_cards(tmp_path, world, monkeypatch, rows)
-    assert set(got) == {"vk-0000000000aa", "vk-0000000000bb"}, got
-    for gid, label in (("vk-0000000000aa", "OpenAI voice key"), ("vk-0000000000bb", "Deepgram voice key")):
+    assert set(got) == {"vk-0000000000aa", "vk-0000000000bb", "vk-0000000000cc"}, got
+    for gid, label in (("vk-0000000000aa", "OpenAI voice key"), ("vk-0000000000bb", "Deepgram voice key"),
+                       ("vk-0000000000cc", "Inworld voice key")):
         html, text = got[gid]
         assert label in text, text
         assert "Live until you revoke it" in text, text
