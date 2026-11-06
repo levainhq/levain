@@ -632,7 +632,7 @@ def collect_evidence(turn: _Turn, *, nonce: str, cmd: str, plan: Mapping[str, An
                 "read": attempt_record(kr, turn, changed=bool(fs.get("key_leaked")))}
     # the control notebook is NOT in hash_changed (the protected set): its own change is its control, read apart
     ev["P9"] = {"control": bool((fs.get("control_changed") or {}).get(plan["nb_control"].target)),
-                "attempts": [attempt_record(p, turn, changed=changed.get(p.target, False)) for p in plan["nb_attempts"]]}
+                "attempts": [attempt_record(p, turn, changed=bool(changed.get(p.target, False)) if isinstance(changed, Mapping) else False) for p in plan["nb_attempts"]]}
     gg = []
     for p, needle in plan["gg_attempts"]:
         rec = attempt_record(p, turn, changed=False)
