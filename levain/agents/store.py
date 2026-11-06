@@ -150,8 +150,8 @@ class AgentStoreView:
 
     @contextmanager
     def _read(self, *, check: bool) -> Iterator[sqlite3.Connection]:
-        # check=False only for open_agent_store_view's own look, which judges the marker itself (and names an older
-        # one as migratable, which _check_marker would not)
+        # check=False only for open_agent_store_view's own look, which judges the marker itself (the full schema
+        # compare, not the cheap marker half _check_marker is)
         if self.path is None:
             conn = sqlite3.connect(":memory:", isolation_level=None)
             create_agent_objects(conn)
