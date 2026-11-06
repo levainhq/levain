@@ -54,22 +54,23 @@
     var rest = m[2].trim();
     return { text: m[1].trim() + (rest ? "\n" + rest : ""), tag: "tool_use_error" };
   }
-  // the vendor's own refusal sentences, matched at the start of the unwrapped text (not a word anywhere in it); the vendor
-  // sends the outside-the-cwd one with no wrapper, so a refusal is read from the words, tagged or not. A Read's own result
-  // opens with a line number, so a file's text never starts with one of these.
+  // the vendor's own refusal sentences, matched at the start of the unwrapped text (not a word anywhere in it). The first two
+  // are read only from a body the vendor wrapped as an error (``tagged``): a tool that ran and printed such a sentence is not a
+  // refusal. The vendor sends the outside-the-cwd refusal with no wrapper, and no tool result is worded like it, so it is read
+  // from its words alone. A Read's own result opens with a line number, so a file's text never starts with one of these.
   var REFUSED = [
-    { what: "read", re: /^File is in a directory that is denied by your permission settings/ },
-    { what: "tool", re: /^Permission to use [^\n]{1,100} has been denied/ },
-    { what: "read", re: /^[^\n;]{1,300} is outside [^\n;]{1,300}; the permissions\.blockReadsOutsideWorkingDirectories setting blocks reads outside the working directories/ }
+    { what: "read", tagged: true, re: /^File is in a directory that is denied by your permission settings/ },
+    { what: "tool", tagged: true, re: /^Permission to use [^\n]{1,100} has been denied/ },
+    { what: "read", tagged: false, re: /^[^\n;]{1,1000} is outside [^\n;]{1,1000}; the permissions\.blockReadsOutsideWorkingDirectories setting blocks reads outside the working directories/ }
   ];
   // what a refusal says on the page: plain words, never the vendor's sentence (it names a path and a settings key)
   var REFUSAL_HEAD = { read: "A read was refused", tool: "A tool was refused" };
   var REFUSAL_TEXT = { read: "That is outside what the room can read, so nothing was read.",
                        tool: "That is outside what the room can use, so the tool was not used." };
-  // only the head of the text is tested: the vendor's sentences are short, and a very long error body costs nothing
-  function refusalOf(text) {
-    var head = String(text).slice(0, 700);
-    for (var i = 0; i < REFUSED.length; i++) if (REFUSED[i].re.test(head)) return REFUSED[i].what;
+  // only the head of the text is tested: the vendor's sentences are short (a path can run long), and a very long error body costs nothing
+  function refusalOf(text, tag) {
+    var head = String(text).slice(0, 2300);
+    for (var i = 0; i < REFUSED.length; i++) if ((tag === "tool_use_error" || !REFUSED[i].tagged) && REFUSED[i].re.test(head)) return REFUSED[i].what;
     return "";
   }
   // the head's words for a row: its speaker, else a short sentence for what the row is
@@ -97,7 +98,7 @@
     var refusal = "";
     if (it.kind === "vendor_tool_result") {
       var un = unwrap(text); text = un.text; tag = un.tag;
-      refusal = refusalOf(text);
+      refusal = refusalOf(text, tag);
       if (refusal) text = REFUSAL_TEXT[refusal];
     }
     // a hook of the operator's own settings starting in the child (body e.g. "SessionStart:startup") and one that ended

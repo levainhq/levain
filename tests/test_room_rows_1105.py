@@ -166,13 +166,21 @@ def test_a_tool_is_called_refused_only_by_the_vendors_own_refusal_sentences(tmp_
     wrap = lambda t: "<tool_use_error>%s</tool_use_error>" % t
     bodies = [wrap("File is in a directory that is denied by your permission settings."), wrap("Permission to use Bash has been denied."),
               wrap(OUTSIDE), wrap("File not found: /home/permissions/x"), wrap("This was refused by the shell"), OUTSIDE,
-              wrap("README.md is outside this section; its guide blocks reads outside examples")]    # a look-alike of the third phrase (L3 r2 codex)
-    g = _lines(tmp_path, w, _results(*bodies), 7)
+              wrap("README.md is outside this section; its guide blocks reads outside examples"),    # a look-alike of the third phrase (L3 r2 codex)
+              # a tool that RAN and printed the first two sentences, with no error wrapper, is a result and not a refusal (L3 room r1 codex MED)
+              "Permission to use Bash has been denied. (a log line a search printed)",
+              "File is in a directory that is denied by your permission settings. (a log line a search printed)",
+              # two long paths: the vendor's sentence is still replaced whole, never drawn with the path and the setting (L3 room r1 codex MED)
+              "/" + "a" * 420 + "/x is outside /" + "b" * 420 + "; the permissions.blockReadsOutsideWorkingDirectories setting blocks "
+              "reads outside the working directories."]
+    g = _lines(tmp_path, w, _results(*bodies), 10)
     assert [x["head"].split(" — ")[0] for x in g] == ["A read was refused", "A tool was refused", "A read was refused",
-                                                      "A tool failed", "A tool failed", "A read was refused", "A tool failed"], g
+                                                      "A tool failed", "A tool failed", "A read was refused", "A tool failed",
+                                                      "A tool result", "A tool result", "A read was refused"], g
+    assert "aaaa" not in g[9]["text"] and "permissions." not in g[9]["text"], g[9]
     # the untagged outside-the-cwd denial (the vendor sends it without the wrapper) is read from its words and drawn as the
     # same refusal (roomcanary: it drew "A tool result — /etc/hosts is outside /priv..." with the vendor's path and setting)
-    assert not [x for x in g if "permissions." in (x["text"] or "") or "/tmp/real1" in (x["text"] or "") or "/etc/hosts" in (x["text"] or "")
+    assert not [x for x in g[:7] + g[9:] if "permissions." in (x["text"] or "") or "/tmp/real1" in (x["text"] or "") or "/etc/hosts" in (x["text"] or "")
                 or "denied by your" in (x["text"] or "") or "Bash" in (x["text"] or "")], g
     assert [x["text"] for x in g if x["head"].startswith("A tool was refused")] == [
         "That is outside what the room can use, so the tool was not used."], g
