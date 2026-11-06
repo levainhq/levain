@@ -781,14 +781,20 @@ def test_f11_the_drop_button_drops_the_draft_verbatim(tmp_path, w):
 
 @needs_browser
 def test_f11_the_stop_button_interrupts_the_room(tmp_path, w):
-    with _serve_room(tmp_path, w, extra_assets=_assets(_boot())) as (base, _h):
+    # Stop is for a running turn (1105-49), and this World's session is idle: the read carries one added turn-start row, so the
+    # page offers Stop, and the tap goes to the real stop route, which answers for the idle session (the raced-stop words).
+    running = ("fetch: (u, o) => fetch(u, o).then(r => !/room\\.json/.test(u) ? r : r.text().then(t => { const b = JSON.parse(t); "
+               "b.stream.push({gseq: 99999, kind: 'vendor_turn_started', source: 'vendor', ref: 'turn_started:x', launch_id: b.launch_id, body: null, at: ''}); "
+               "return {status: r.status, ok: r.ok, text: () => Promise.resolve(JSON.stringify(b))}; })), ")
+    with _serve_room(tmp_path, w, extra_assets=_assets(_boot(running))) as (base, _h):
         out = _drive(tmp_path, base + "/rvc.html", [
             _UNTIL_READY,
+            {"until": "!document.querySelector('.rv-stop').disabled"},
             {"eval": "document.querySelector('.rv-stop').click(); 1"},
             {"until": "['Stopped.', 'Nothing was running to stop.'].includes(document.querySelector('.rv-sendnote').textContent) && "
                       "document.querySelector('.rv-sendnote').textContent"},
         ])
-    assert out["values"][2] in ("Stopped.", "Nothing was running to stop.")
+    assert out["values"][3] in ("Stopped.", "Nothing was running to stop.")
 
 
 @needs_browser
