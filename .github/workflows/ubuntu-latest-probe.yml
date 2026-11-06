@@ -19,6 +19,25 @@ permissions:
   contents: read
 
 jobs:
+  diag:   # TEMPORARY measurement job, removed before landing
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - run: |
+          cat > /tmp/diag.sh <<'DIAG'
+          #!/bin/bash
+          # TEMPORARY measurement: does systemd-run expand ${...} / $$ in the argv of a --scope command on this runner?
+          systemd --version | head -1
+          loginctl enable-linger "$USER" 2>&1 | head -1
+          export XDG_RUNTIME_DIR=/run/user/$(id -u)
+          echo "--- plain scope, \${BASH_VERSINFO[0]} in -c"
+          /usr/bin/systemd-run --user --scope --quiet bash -c 'echo V=${BASH_VERSINFO[0]} P=${!1} U=${HOME%%/*}' bash 2>&1 | head -5
+          echo "--- doubled dollars"
+          /usr/bin/systemd-run --user --scope --quiet bash -c 'echo V=$${BASH_VERSINFO[0]} P=$${!1} U=$${HOME%%%%/*}' bash 2>&1 | head -5
+          echo "--- plain bash (control)"
+          bash -c 'echo V=${BASH_VERSINFO[0]} U=${HOME%%/*}' bash
+          DIAG
+          bash /tmp/diag.sh
   probe:
     name: ubuntu-latest probe (non-gating)
     runs-on: ubuntu-latest
