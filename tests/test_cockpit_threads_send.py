@@ -175,11 +175,21 @@ def _assets(boot: str) -> dict:
             "/tvc.js": ("text/javascript; charset=utf-8", boot.encode())}
 
 
+# the stored thread has no turn row in it, so the Stop is dark (it is pressable only while a turn runs, 1105-49); this boot
+# gives the page one running turn on top of the real read, so the tap still reaches the real stop route
+_BOOT_RUNNING = ('const real = window.fetch.bind(window);\n'
+                 'const running = (u, o) => real(u, o).then(r => (o && o.method === "POST") || !/\\.json$/.test(u) || u.indexOf("/cockpit/thread/") !== 0 ? r :\n'
+                 '  r.text().then(t => { const j = JSON.parse(t); j.stream = (j.stream || []).concat([{gseq: 9999, kind: "vendor_turn_started", source: "vendor", launch_id: j.launch_id, body: null}]);\n'
+                 '    return {ok: true, status: 200, text: () => Promise.resolve(JSON.stringify(j))}; }));\n'
+                 'window.__tv = LevainThreadView.mount(document.getElementById("host"),'
+                 ' {pollMs: 0, stop: true, fetch: running, headers: () => ({"X-Levain-Write-Token": "%s"})});' % TOKEN)
+
+
 @needs_browser
 def test_a_work_thread_draws_a_stop_and_no_composer(tmp_path, live):
     svc, cs, world, session = live
     _root, src, _ids = _install(tmp_path)
-    with _serve(src, write_token=TOKEN, chat_service=svc, extra_assets=_assets(_BOOT)) as (base, _h):
+    with _serve(src, write_token=TOKEN, chat_service=svc, extra_assets=_assets(_BOOT_RUNNING)) as (base, _h):
         out = _drive(tmp_path, base + "/tvc.html", [
             {"until": "document.querySelector('.tv-row')"},
             {"eval": "document.querySelector('.tv-row').click(); 1"},
