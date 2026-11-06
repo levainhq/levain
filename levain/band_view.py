@@ -1073,7 +1073,10 @@ def apply_plan(store: QuestionStore, plan: Parse, questions: dict[int, Question]
 
             done = [r for r in results if isinstance(r, Answer) and r.question_id in signing.versions]
             if done:
-                card_result = answer_countersign.file_card(store, signing.card, done)
+                # its own bound, as the write's after the signer: the pointers' store write waits at most HOOK_BUSY_MS
+                # (the signing queue's own lock is bounded by sign.LOCK_WAIT_S)
+                card_result = answer_countersign.file_card(store, signing.card, done,
+                                                           deadline=time.monotonic() + HOOK_BUSY_MS / 1000)
     # the ruling's sentence comes from what the queue applied (Signing.ruled), never from what was recorded: a ruling
     # applied whose answer the store then refused (its row moved, the lock busy) is still a ruling applied
     sign_note = _sign_note(by_state, next((e["sign"] for _, e in todo if isinstance(e.get("sign"), Signing)), None),

@@ -102,6 +102,29 @@ def test_a_remote_line_files_one_card_for_all_its_answers_and_a_rerun_files_none
     assert again.request_id == path.stem and cards(signq) == [path]
 
 
+def test_a_busy_store_bounds_the_card_and_the_echo_says_why(monkeypatch, store, env, keydir, signq, pushes):
+    """L3 r1 (codex HIGH, reproduced: 29.96 s): the pointers' write ran on the store's 30 s busy wait, after the
+    answer was already recorded. Now it waits until its deadline and the result says the store stayed busy."""
+    import time
+
+    seen(store, env, 1)
+    spied: list[tuple] = []
+    real = ac.file_card
+    monkeypatch.setattr(ac, "file_card", lambda *a, **k: spied.append((a, k)) or real(*a, **k))
+    remote_line(monkeypatch, store, env, keydir, "1a", signq)
+    (args, kw), = spied
+    holder = sqlite3.connect(store.path, isolation_level=None)
+    holder.execute("BEGIN IMMEDIATE")
+    try:
+        t0 = time.monotonic()
+        got = real(*args, **{**kw, "deadline": time.monotonic() + 0.5})
+        took = time.monotonic() - t0
+    finally:
+        holder.execute("ROLLBACK")
+        holder.close()
+    assert took < 5 and not got.sent and got.why == "the question store stayed busy"
+
+
 # --- 2. the deny path, and the absent card never reads as signed -------------------------------------------------
 
 def test_deny_disowns_and_a_missing_or_unsent_card_is_never_countersigned(monkeypatch, store, env, keydir, signq,

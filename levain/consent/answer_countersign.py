@@ -15,11 +15,11 @@ from __future__ import annotations
 
 import hashlib
 import json
-import os
 import re
 import sqlite3
+import time
 from dataclasses import dataclass
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Mapping, Sequence
 from urllib.parse import urlsplit
@@ -75,7 +75,9 @@ def sign_queue_dir(environ: Mapping[str, str]) -> Path | None:
 
 
 def nonce_of(store_id: str, session: str, stamp: str) -> str:
-    """The card's nonce, a pure function of the recorded line, so the card's bytes (and so its filing) are idempotent."""
+    """The card's nonce, a pure function of the recorded line, so the card's bytes are too: filing the same line again
+    while its card is open returns the same request (once it is signed, denied or expired, a refile would file anew;
+    no caller refiles, since a recorded answer is never answered again)."""
     return hashlib.sha256(f"{store_id}|{session}|{stamp}".encode("utf-8")).hexdigest()[:16]
 
 
@@ -92,21 +94,29 @@ def build_card(card: Mapping[str, Any], entries: Sequence[Any], stamp: str) -> b
                             countersign_of=stamp)
 
 
-def file_card(store: Any, card: Mapping[str, Any] | None, recorded: Sequence[Any], *, push: bool = True) -> CardResult:
+def file_card(store: Any, card: Mapping[str, Any] | None, recorded: Sequence[Any], *, push: bool = True,
+              deadline: float | None = None) -> CardResult:
     """File the card for one typed line whose answers ``recorded`` (``questions.Answer`` values) were just written
     unsigned-remote, point each answer at it, and push it to the phone. ``card`` is ``Signing.card``: the message
-    fields, the information ``entries``, and the ``environ`` subset that names the signing queue. Never raises; a
-    ``CardResult`` that is not ``sent`` says why in words an echo can carry."""
+    fields, the information ``entries``, and the ``environ`` subset that names the signing queue. The pointers' write
+    waits for the store's lock only until ``deadline`` (``time.monotonic()``; default now + ``HOOK_BUSY_MS``): it runs
+    in the seat hook, after the answer is already recorded. Never raises; a ``CardResult`` that is not ``sent`` says
+    why in words an echo can carry."""
     try:
-        return _file_card(store, card, recorded, push)
+        return _file_card(store, card, recorded, push, deadline)
     except Exception as exc:  # noqa: BLE001 - a card is evidence; its failure never undoes an answer
+        if isinstance(exc, sqlite3.OperationalError) and ("locked" in str(exc) or "busy" in str(exc)):
+            # the lock was held past the deadline: the card was filed but nothing points at it; it lapses unsigned
+            return CardResult(False, "the question store stayed busy")
         return CardResult(False, f"{type(exc).__name__}: {str(exc).splitlines()[0] if str(exc) else ''}")
 
 
-def _file_card(store: Any, card: Mapping[str, Any] | None, recorded: Sequence[Any], push: bool) -> CardResult:
+def _file_card(store: Any, card: Mapping[str, Any] | None, recorded: Sequence[Any], push: bool,
+               deadline: float | None) -> CardResult:
     from levain.band_view import BAND_SCHEMA
     from levain.cockpit.consent import utc_stamp
     from levain.consent.cockpit_origin import read_origin
+    from levain.consent.questions import HOOK_BUSY_MS
     from levain.consent.sign import deep_link, levain_request_for
 
     if card is None or not recorded:
@@ -125,7 +135,9 @@ def _file_card(store: Any, card: Mapping[str, Any] | None, recorded: Sequence[An
     message = build_card(card, entries, stamp)
     rid = levain_request_for(qdir, NS, message.decode("utf-8"), title=CARD_TITLE, ttl_s=CARD_TTL_S)
     sha = hashlib.sha256(message).hexdigest()
-    with store._write() as conn:
+    by = deadline if deadline is not None else time.monotonic() + HOOK_BUSY_MS / 1000
+    store.ready_by(by)
+    with store._write_by(by) as conn:
         for stmt in BAND_SCHEMA:
             conn.execute(stmt)
         for e in entries:

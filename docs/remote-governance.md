@@ -90,5 +90,13 @@ verifies over exactly the recorded answer; `remote, unsigned` while the card is 
 `DISOWNED on your phone` after a deny; `countersign FAILED: <reason>` for anything else. A bad signature, a missing
 card or any error is never countersigned. The local Touch ID path files nothing and reads as before.
 
+Known edges. The card's pointer write waits for the question store at most `HOOK_BUSY_MS`; a store held past that
+leaves a filed card nothing points at (it lapses unsigned) and the echo says the store stayed busy. A push that could not
+be started is not retried: the echo says so and the answer reads `remote, unsigned`. The badge finds the signing queue
+from the reading process's settings, so moving `sign_queue_dir` after a card was filed makes that card read as gone
+(`countersign FAILED`) or, with no queue named, `remote, unsigned`, never as signed; the queue path is not stored beside the answer on purpose, since the passkeys the
+verifier trusts are read from that queue. Filing is idempotent only while the card is open; nothing refiles, because a
+recorded answer is never answered again.
+
 Residue, no instrument here holds it: a line typed from a real phone terminal, the push arriving on the phone, Face ID on
 the sheet and the badge turning on the laptop; and the live `sign_queue_dir` key in the hook queue's `claude_code.json`.
