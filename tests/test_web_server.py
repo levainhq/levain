@@ -823,6 +823,29 @@ class TestSecurityBoundary:
                 code = e.code
         assert code == 403
 
+    def test_the_plain_403_names_the_rule_that_fired(self, tmp_path: Path) -> None:
+        """11-06: a Pixel's browser got the bare word "forbidden" and nothing measurable. The body now says why, from the
+        requester's own Sec-Fetch headers; the first line is still the word."""
+        with _serving(_store_with_data(tmp_path)) as (base, _):
+            try:
+                _request(base + "/tap_trace", headers={"Sec-Fetch-Site": "cross-site", "Sec-Fetch-Mode": "navigate",
+                                                       "Sec-Fetch-Dest": "document"})
+                body = ""
+            except urllib.error.HTTPError as e:
+                body = e.read().decode()
+            # a raw socket: urllib refuses a hostile Host value client-side, which would make this assertion vacuous
+            import socket
+            host, port = base.split("//", 1)[1].split(":")
+            with socket.create_connection((host, int(port)), timeout=5) as sk:
+                sk.sendall(b"GET /<i>x HTTP/1.1\r\nHost: evil.example<b>\r\nConnection: close\r\n\r\n")
+                raw = b""
+                while chunk := sk.recv(4096):
+                    raw += chunk
+            bad_host = raw.decode("latin-1").split("\r\n\r\n", 1)[-1]
+        assert body.startswith("forbidden\n") and "Sec-Fetch-Site cross-site" in body and "Mode navigate" in body, body
+        assert bad_host.startswith("forbidden\n") and "Host" in bad_host and "evil.example" in bad_host, bad_host
+        assert "<" not in bad_host
+
     def test_same_origin_fetch_allowed(self, tmp_path: Path) -> None:
         with _serving(_store_with_data(tmp_path)) as (base, _):
             status, _h, _b = _request(

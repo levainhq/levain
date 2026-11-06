@@ -25,8 +25,9 @@ from levain.consent.sign import Signer
 from tests.test_cockpit_k2a import _install
 
 HOST = "box.example"
-SHEETS_ON = "consent and grant sheets on"
-SHEETS_OFF = "consent and grant sheets off: this queue is not the one the cockpit's consent cards are read from"
+SHEETS_ON = "consent sheet on"
+SHEETS_OFF = ("consent sheet off for now: the consent cards are not read from this queue; a host that rebinds "
+              "its reader to it turns the sheet on")
 NAME_WORDS = "--sign-host is the name as the browser address bar shows it: lowercase, no trailing dot, no port"
 
 
