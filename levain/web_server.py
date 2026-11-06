@@ -381,17 +381,31 @@ def _consent_sign_route(route: str) -> "tuple[str, str] | None":
     return rid, action
 
 
+_NO_DIRECTORY = object()
+
+
 def _cards_on_queue(reader: Any, queue: "Path | str") -> bool:
     """Whether the consent cards ``reader`` lists are read from ``queue``: its ``directory`` (None: the default queue,
-    resolved now) resolves to the same path. A reader naming no directory reads no queue: False."""
-    if reader is None or not hasattr(reader, "directory"):
+    resolved now) resolves to the same path. A reader naming no directory reads no queue: False. Fail-closed: any error
+    reading or resolving either path is False (the sheet 404s), never a 500.
+
+    Known edges, judged not reachable in real use and left as they are: ``directory`` is the host's declaration of the
+    queue its cards come from, so a reader that lists rows from another queue while naming the Signer's (flow's
+    SignQueueReader does, deliberately, for the grant cards) opens a sheet over the Signer's queue from a card read
+    elsewhere; request ids are unique per request, so an id present in only one queue answers 404 in the other, never a
+    wrong answer. A default queue re-resolved from LEVAIN_HOME at each request follows a process-global change. The
+    grant routes (``grant_phone``) stay bound at start, as they were before the sheet became a per-request read."""
+    if reader is None:
         return False
     from levain.consent.queue import default_queue_dir
 
     try:
-        card_queue = reader.directory if reader.directory is not None else default_queue_dir()
+        directory = getattr(reader, "directory", _NO_DIRECTORY)    # read once: a property may raise or change
+        if directory is _NO_DIRECTORY:
+            return False
+        card_queue = directory if directory is not None else default_queue_dir()
         return Path(card_queue).resolve() == Path(queue).resolve()
-    except (OSError, RuntimeError, TypeError, ValueError):
+    except Exception:  # noqa: BLE001 - fail-closed: an unreadable queue serves no sheet
         return False
 
 
@@ -2308,9 +2322,10 @@ class _Handler(GuardedHandler):
                         # reason when no passkey may sign it), `sheet_choices` the answers the sheet offers (the
                         # card routes only those to it), `sheet_v` the version the card's link carries
                         row = None
-                        if self.server.consent_sheet is not None and entry.state in ("pending", "undecided"):
+                        sheet = self.server.consent_sheet     # read once: it is decided at each read
+                        if sheet is not None and entry.state in ("pending", "undecided"):
                             try:
-                                row = self.server.consent_sheet.row(request_id)
+                                row = sheet.row(request_id)
                             except _CredentialUnavailable:
                                 raise
                             except Exception:  # noqa: BLE001 - the card keeps its terminal lines
@@ -5542,8 +5557,8 @@ def run_web_server(
     Signer writes to its queue when it is built (it settles orphaned sign attempts), so everything that would refuse
     it is refused first: a name a browser's address bar would not show, ``--chat``, a read-only serve (the last two in
     ``make_server``'s own words, whose checks stay as they are), and a queue that is not an existing readable
-    directory (never created here). The start-up line says whether the consent and grant sheets are on, read from
-    the server ``make_server`` built. Without the pair, nothing differs from a serve that never had them.
+    directory (never created here). The start-up line says whether the consent sheet is on at start, read from the
+    server ``make_server`` built (a host that rebinds its reader to the queue later turns it on then). Without the pair, nothing differs from a serve that never had them.
 
     Returns nonzero only if the store is unreachable before the server starts, a ``--chat``
     entity is refused, or the bind fails (e.g. the port is in use) — mirroring ``levain dashboard`` /
@@ -5700,9 +5715,10 @@ def run_web_server(
     if unlocked != url:
         print(f"  open the cockpit, unlocked: {unlocked}", flush=True)
     if signer is not None:
-        # the consent family serves only while this queue is the one the cockpit's consent cards come from (read now)
-        sheets = ("consent and grant sheets on" if httpd.consent_sheet is not None else
-                  "consent and grant sheets off: this queue is not the one the cockpit's consent cards are read from")
+        # the consent sheet serves while this queue is the one the cockpit's consent cards come from, read per request
+        sheets = ("consent sheet on" if httpd.consent_sheet is not None else
+                  "consent sheet off for now: the consent cards are not read from this queue; a host that rebinds "
+                  "its reader to it turns the sheet on")
         print(f"  signing: {signer.page_origin} (queue {signer.queue_dir}; {sheets})", flush=True)
 
     if open_browser:

@@ -87,3 +87,27 @@ def test_a_reader_moved_off_the_signers_queue_takes_the_sheet_with_it(world, tmp
         httpd.consent_reader = _RebindReader(httpd.consent_reader, other)
         assert _call(url, f"/cockpit/consent/{_q(rid)}/sheet.json")[0] == 404
         assert _call(url, f"/sign/consent/{_q(rid)}", token=None)[0] == 404
+
+
+class _RaisingReader:
+    """A reader whose ``directory`` property raises: the sheet stays closed (404), never a 500."""
+
+    def __init__(self, inner: Any, exc: BaseException) -> None:
+        self._inner, self._exc = inner, exc
+
+    @property
+    def directory(self) -> Path:
+        raise self._exc
+
+    def __call__(self, now: Any) -> Any:
+        return self._inner(now)
+
+
+@pytest.mark.parametrize("exc", [RuntimeError("queue gone"), KeyError("LEVAIN_HOME")])
+def test_a_reader_whose_directory_raises_serves_no_sheet_and_no_500(world, tmp_path, monkeypatch, exc) -> None:
+    monkeypatch.setenv("LEVAIN_HOME", str(world.qdir.parent))      # the sheet would be on with a plain reader
+    rid = _file(world)
+    with _serving(tmp_path / "inst", signer=_signer(world), extra_hosts=[RP]) as (url, httpd):
+        httpd.consent_reader = _RaisingReader(httpd.consent_reader, exc)
+        assert _call(url, f"/sign/consent/{_q(rid)}", token=None)[0] == 404
+        assert _call(url, f"/cockpit/consent/{_q(rid)}/sheet.json")[0] == 404
