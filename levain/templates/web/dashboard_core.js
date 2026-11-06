@@ -6469,7 +6469,12 @@
         sub.textContent = where ? "in " + where + (b.targets ? " \u00b7 targets " + flat(b.targets) : "") : "";
       });
     } else {
-      if (it.q.age) side.appendChild(el("span", "ext-meta needs-left", "asked " + it.q.age));
+      if (it.q.age) {
+        const ag = el("span", "ext-meta needs-left", "");
+        ag.append(el("span", "needs-asked", "asked "), document.createTextNode(it.q.age));
+        side.appendChild(ag);
+      }
+      if (it.q.options > 0) side.appendChild(el("span", "ext-meta needs-row-opts", it.q.options + (it.q.options === 1 ? " option" : " options")));
       const bn = cardBandNum(it.q.n);
       const tag = el("b", "band-num needs-row-band", bn === undefined ? "" : String(bn));   // the band number leads the face; applyBandNumbers retakes it
       tag.hidden = bn === undefined;
@@ -6496,6 +6501,115 @@
   const ANSWERED_KEY = "levain.needs.answeredOpen";
   let answeredOpen = false;
   try { answeredOpen = window.localStorage.getItem(ANSWERED_KEY) === "1"; } catch (e) { answeredOpen = false; }
+  // ---- the section's tabs, layout and fold (Phill 11-06: two tabs in this area only; rows or two-column tiles, both mocked) ----
+  // The "Desk owes" tab: the open questions the desk itself owes (section desk), carried ones included (a carried one is also in
+  // "Needs you", as deskTabs tags it "both"). Nothing here is counted into the badge or the app icon: those stay the waiting items.
+  function deskOwesItems(lines) {
+    const out = [];
+    for (const ln of Array.isArray(lines) ? lines : []) {
+      if (ln && ln.question && ln.question.state === "open" && ln.question.section === "desk") out.push({ kind: "question", q: ln.question });
+    }
+    return out;
+  }
+  const NEEDS_LAYOUT_KEY = "levain.needs.layout", NEEDS_TAB_KEY = "levain.needs.tab";
+  const NEEDS_FOLD = 6;                     // rows shown before the fold in the rows layout
+  let needsViewRef = null;                  // the last view the strip drew from: a tab or layout change re-renders from it, no network
+  let needsLayoutNow = null, needsTabNow = null;
+  let needsMoreOpen = false;                // the fold, per page load
+  const needsRowCache = new Map();          // needs id -> its row, kept across tab switches and folds
+  function needsStore(get, key, val) {
+    try { if (get) return window.localStorage.getItem(key); window.localStorage.setItem(key, val); } catch (e) { /* the choice then lasts this page only */ }
+    return null;
+  }
+  // The page's layout (?needs=rows|tiles beats the remembered choice; default rows), the active tab, and whether the mock-up switch is
+  // drawn: only a page served with the scratch launcher's `mockup_layout_switch` flag, never a real install.
+  function needsPrefs(view) {
+    if (needsLayoutNow === null) {
+      let q = "";
+      try { const m = /[?&]needs=(rows|tiles)(?:&|#|$)/.exec(window.location.search || ""); q = m ? m[1] : ""; } catch (e) { q = ""; }
+      const stored = needsStore(true, NEEDS_LAYOUT_KEY);
+      needsLayoutNow = q || (stored === "tiles" ? "tiles" : "rows");
+      if (q) needsStore(false, NEEDS_LAYOUT_KEY, q);
+    }
+    if (needsTabNow === null) needsTabNow = needsStore(true, NEEDS_TAB_KEY) === "desk" ? "desk" : "you";
+    return { layout: needsLayoutNow, tab: needsTabNow, sw: !!(view && view.mockup_layout_switch === true) };
+  }
+  function rerenderNeeds(focusSel) {
+    const host = document.getElementById("ck-needs");
+    if (!host || !needsViewRef) return;
+    delete host.dataset.sig;
+    renderNeeds(needsViewRef);
+    if (focusSel) { const n = host.querySelector(focusSel); if (n && typeof n.focus === "function") n.focus({ preventScroll: true }); }
+  }
+  function setNeedsTab(key) {
+    needsTabNow = key === "desk" ? "desk" : "you";
+    needsStore(false, NEEDS_TAB_KEY, needsTabNow);
+    needsMoreOpen = false;
+    rerenderNeeds('.needs-tab[data-needs-tab="' + needsTabNow + '"]');
+  }
+  function setNeedsLayout(key) {
+    needsLayoutNow = key === "tiles" ? "tiles" : "rows";
+    needsStore(false, NEEDS_LAYOUT_KEY, needsLayoutNow);
+    try {
+      const u = new URL(window.location.href);
+      u.searchParams.set("needs", needsLayoutNow);
+      window.history.replaceState(window.history.state, "", u.pathname + u.search + u.hash);   // a reload keeps the choice the URL names
+    } catch (e) { /* no history: the remembered choice stands */ }
+    rerenderNeeds('.needs-layout-btn[data-needs-layout="' + needsLayoutNow + '"]');
+  }
+  function needsAgeSecs(it) {
+    if (it.kind !== "question") return null;
+    const ms = Date.parse(it.q.at || "");
+    return Number.isFinite(ms) ? Math.max(0, Math.floor((needsNow() - ms) / 1000)) : null;
+  }
+  function needsAgeText(s) {
+    return s >= 86400 ? Math.floor(s / 86400) + " d" : s >= 3600 ? Math.floor(s / 3600) + " h" : s >= 60 ? Math.floor(s / 60) + " min" : s + " s";
+  }
+  // The list under the tabs. Rows layout: grouped by age (Today, then Older than a day; labels only when both exist), the first
+  // NEEDS_FOLD rows shown, then one fold row whose label carries the hidden count and the oldest hidden age so a row never hides
+  // unseen. Tiles layout: every item, no fold; the page scrolls.
+  function drawNeedsList(grid, list, prefs, rowOf) {
+    const kids = [];
+    if (!list.length) {
+      kids.push(el("div", "needs-empty ext-meta", prefs.tab === "desk" ? "The desk owes you nothing right now." : "Nothing waits on you right now."));
+    } else if (prefs.layout === "tiles") {
+      for (const it of list) kids.push(rowOf(it));
+    } else {
+      const old = (it) => { const s = needsAgeSecs(it); return s !== null && s >= 86400; };
+      const today = list.filter((it) => !old(it)), older = list.filter(old);
+      const grouped = today.length > 0 && older.length > 0;
+      const ordered = grouped ? today.concat(older) : list;
+      const hiddenN = ordered.length - NEEDS_FOLD;
+      const fold = hiddenN >= 2;                     // one hidden row is not worth a row of its own
+      const shown = !fold || needsMoreOpen ? ordered : ordered.slice(0, NEEDS_FOLD);
+      let last = "";
+      for (const it of shown) {
+        const g = grouped ? (old(it) ? "older" : "today") : "";
+        if (g && g !== last) {
+          kids.push(el("div", "needs-group", g === "today" ? "Today (" + today.length + ")" : "Older than a day (" + older.length + ")"));
+          last = g;
+        }
+        kids.push(rowOf(it));
+      }
+      if (fold) {
+        const hidden = ordered.slice(NEEDS_FOLD);
+        let label;
+        if (needsMoreOpen) label = "Show fewer";
+        else {
+          const ages = hidden.map(needsAgeSecs).filter((s) => s !== null);
+          label = "Show " + hiddenN + " more" + (ages.length ? ", oldest " + needsAgeText(Math.max.apply(null, ages)) : "");
+          const due = hidden.filter((it) => it.kind === "consent" && Number.isFinite(Date.parse(it.c.expiresAt)));
+          if (due.length) label += " · " + due.length + " expiring, soonest " + consentLeft(due.sort((a, b) => Date.parse(a.c.expiresAt) - Date.parse(b.c.expiresAt))[0].c.expiresAt);
+        }
+        const b = el("button", "needs-more-row", label);
+        b.type = "button";
+        b.setAttribute("aria-expanded", needsMoreOpen ? "true" : "false");
+        b.addEventListener("click", () => { needsMoreOpen = !needsMoreOpen; rerenderNeeds(".needs-more-row"); });
+        kids.push(b);
+      }
+    }
+    grid.replaceChildren(...kids);
+  }
   function renderNeeds(view) {
     if (needsExpiryTimer) { window.clearTimeout(needsExpiryTimer); needsExpiryTimer = 0; }
     try { renderNeedsNow(view); }
@@ -6520,14 +6634,19 @@
     signRecheck();      // a board read: every frozen card asks the cockpit about its unsettled answer again
     const host = document.getElementById("ck-needs");
     if (!host) return;
-    const all = needsItems(((view.extra_panels || {}).decisions || {}).lines);
+    needsViewRef = view;
+    const lines = ((view.extra_panels || {}).decisions || {}).lines;
+    const all = needsItems(lines);
+    const desk = deskOwesItems(lines);
     const items = needsWaiting(all), settled = all.filter((it) => it.answered);
     ncNeedsCount(items.length);               // the strip's Needs you count and the app-icon badge: the waiting items, nothing else
     syncAppBadge(view, items.length);
-    if (!all.length) { clearNeeds(host); return; }
+    if (!all.length && !desk.length) { clearNeeds(host); return; }
     // the same set of waiting items leaves the strip as it is: a card with half-typed words, an open "details" and a running
-    // countdown is not rebuilt under the reader by a refetch that changed nothing about what waits
-    const sig = all.map(needsKey).join("\n");
+    // countdown is not rebuilt under the reader by a refetch that changed nothing about what waits. The layout, the tab and the
+    // fold are part of what is drawn, so a change of one is a new signature (a plain re-render, no network).
+    const prefs = needsPrefs(view);
+    const sig = all.map(needsKey).join("\n") + "\nD:" + desk.map(needsKey).join(",") + "\nP:" + prefs.layout + "|" + prefs.tab + "|" + (needsMoreOpen ? 1 : 0) + "|" + (prefs.sw ? 1 : 0);
     if (host.dataset.sig === sig && !host.hidden) return;
     // the answered cards are drawn under a quiet label of their own; with nothing waiting that is all the strip holds
     // folded by default (Phill 11-02): a count under a label you click to open; the cards stay in the page, hidden, so the
@@ -6554,22 +6673,52 @@
       sec.append(toggle, body);
       return sec;
     };
-    if (!items.length) {
+    if (!items.length && !desk.length) {
       host.replaceChildren(answeredSection());
       delete host.dataset.waiting;
       host.hidden = false;
       host.dataset.sig = sig;
       return;
     }
-    host.dataset.waiting = "1";
+    if (items.length) host.dataset.waiting = "1"; else delete host.dataset.waiting;
+    host.dataset.needsLayout = prefs.layout;
     const head = el("div", "needs-headline");
-    head.appendChild(el("h3", null, "Needs you"));
-    head.appendChild(el("span", "needs-count", String(items.length)));
+    // The section's two tabs (Phill 11-06: the items that need him apart from the desk's own, in this area only). Each label carries its
+    // live count; the choice is kept per browser; a change is a re-render from the view already held, no network.
+    const tabs = el("div", "needs-tabs");
+    tabs.setAttribute("role", "tablist");
+    tabs.setAttribute("aria-label", "Needs you");
+    for (const [key, text, n] of [["you", "Needs you", items.length], ["desk", "Desk owes", desk.length]]) {
+      const b = el("button", "needs-tab" + (prefs.tab === key ? " is-on" : ""), text + " (" + n + ")");
+      b.type = "button";
+      b.setAttribute("role", "tab");
+      b.setAttribute("aria-selected", prefs.tab === key ? "true" : "false");
+      b.dataset.needsTab = key;
+      b.addEventListener("click", () => setNeedsTab(key));
+      tabs.appendChild(b);
+    }
+    head.appendChild(tabs);
     // no re-ping route exists (the phone is told when a request is filed, and the queue re-pings on its own clock; nothing here
     // pushes), so the gloss claims no ping: it says where the answer is signed
-    if (items.length) head.appendChild(el("span", "needs-gloss", "Agents are waiting on a ruling. Sign it on your phone."));
-    if (items.some((it) => it.kind === "question") && items.some((it) => it.kind === "consent")) {
+    if (items.length && prefs.tab === "you") head.appendChild(el("span", "needs-gloss", "Agents are waiting on a ruling. Sign it on your phone."));
+    if (prefs.tab === "you" && items.some((it) => it.kind === "question") && items.some((it) => it.kind === "consent")) {
       head.appendChild(el("span", "needs-order", "questions first, then soonest to expire"));
+    }
+    if (prefs.sw) {
+      // the mock-up's A/B switch: drawn only on a page served with the scratch launcher's flag, never on a real install
+      const sw = el("span", "needs-layout-sw");
+      sw.setAttribute("role", "group");
+      sw.setAttribute("aria-label", "layout");
+      sw.append(el("span", "needs-layout-lab", "layout:"));
+      for (const key of ["rows", "tiles"]) {
+        const b = el("button", "needs-layout-btn" + (prefs.layout === key ? " is-on" : ""), key);
+        b.type = "button";
+        b.dataset.needsLayout = key;
+        b.setAttribute("aria-pressed", prefs.layout === key ? "true" : "false");
+        b.addEventListener("click", () => setNeedsLayout(key));
+        sw.appendChild(b);
+      }
+      head.appendChild(sw);
     }
     const hist = el("button", "needs-history", "all decisions");
     hist.type = "button";
@@ -6577,10 +6726,14 @@
     hist.addEventListener("click", () => openDecisionsHistory(hist));
     head.appendChild(hist);
     // the rows are kept by their stable id: a row whose item still waits is moved, never rebuilt (words typed into an item live in
-    // its focus view, which stays open while the item waits: refreshModal)
+    // its focus view, which stays open while the item waits: refreshModal). The cache outlives a tab switch: the other tab's rows
+    // wait detached, so switching back reads nothing again.
     let grid = host.querySelector(".needs-grid");
-    const kept = new Map();
-    if (grid) for (const c of grid.children) if (c.dataset && c.dataset.needsId) kept.set(c.dataset.needsId, c);
+    const kept = needsRowCache;
+    const live = new Set();
+    for (const it of items.concat(desk)) { const id = needsIdOf(it); if (id) live.add(id); }
+    for (const id of Array.from(kept.keys())) if (!live.has(id)) kept.delete(id);
+    if (grid) for (const c of grid.children) if (c.dataset && c.dataset.needsId && live.has(c.dataset.needsId)) kept.set(c.dataset.needsId, c);
     // a row kept by id still shows what its item says NOW: a consent whose expiry moved (extended) takes the new clock in place;
     // one whose state changed is rebuilt
     const keep = (row, it) => {
@@ -6596,10 +6749,11 @@
       }
       return row;
     };
-    const cards = items.map((it) => { const id = needsIdOf(it); const k = id && kept.get(id); return k ? keep(k, it) : needsRow(it); });
+    const rowOf = (it) => { const id = needsIdOf(it); let r = id && kept.get(id); r = r ? keep(r, it) : needsRow(it); if (id) kept.set(id, r); return r; };
     if (!grid) grid = el("div", "needs-grid");
-    for (let i = 0; i < cards.length; i++) if (grid.children[i] !== cards[i]) grid.insertBefore(cards[i], grid.children[i] || null);
-    while (grid.children.length > cards.length) grid.removeChild(grid.lastChild);
+    grid.dataset.layout = prefs.layout;
+    grid.setAttribute("role", "tabpanel");
+    drawNeedsList(grid, prefs.tab === "desk" ? desk : items, prefs, rowOf);
     const kids = [head, needsBar(items), grid];
     if (settled.length) kids.push(answeredSection());
     host.replaceChildren(...kids);
@@ -8294,7 +8448,10 @@
       overlay.addEventListener("keydown", onModalKeydown);
       document.body.appendChild(overlay);
       document.body.classList.add("modal-open");
+      if (modalKey && modalKey.indexOf("needs:") === 0) lockNeedsScroll();
     }
+    // a Needs-you item's detail is a sheet over the page where the reader tapped (bottom sheet on a phone, centred on a desk)
+    overlay.classList.toggle("needs-detail", !!modalCustom && !modalCustom.page && String(modalKey || "").indexOf("needs:") === 0);
     overlay.dataset.zone = content.zone;
     const box = el("div", "modal");
     const head = el("div", "modal-head");
@@ -8340,7 +8497,28 @@
     modalPending = modalAwaiting && gen === modalGen ? modalKept : null;   // rows still on the way take it when they land
     const newSearch = wasSearchFocused ? mbody.querySelector(".ep-search-input") : null;
     if (newSearch) newSearch.focus();
-    else if (firstOpen || hadModalFocus) close.focus();
+    else if (firstOpen || hadModalFocus) close.focus({ preventScroll: true });
+  }
+
+  // Scroll lock for the Needs-you detail: the page is held fixed at the scroll position it had, so the sheet opens over the row that was
+  // tapped (never at the top of the page) and the reader gets the same place back at close. overflow:hidden alone does not hold an
+  // iPhone's page still behind a sheet.
+  let needsLockY = null;
+  function lockNeedsScroll() {
+    if (needsLockY !== null) return;
+    needsLockY = window.scrollY || window.pageYOffset || 0;
+    const b = document.body.style;
+    b.position = "fixed"; b.top = (-needsLockY) + "px"; b.left = "0"; b.right = "0";
+    document.body.classList.add("needs-locked");
+  }
+  function unlockNeedsScroll() {
+    if (needsLockY === null) return;
+    const y = needsLockY;
+    needsLockY = null;
+    const b = document.body.style;
+    b.position = ""; b.top = ""; b.left = ""; b.right = "";
+    document.body.classList.remove("needs-locked");
+    window.scrollTo(0, y);
   }
 
   function refreshModal() {
@@ -8351,7 +8529,9 @@
       // a live view repaints from its own source and stays open. buildModal on an open modal is a repaint only: it keeps the one overlay (and
       // its one keydown listener), the scroll and the focus, and swaps the body for the `build` the caller returns
       if (modalCustom.live) { buildModal(null); return; }
-      if (!needsWaiting(needsItems(((currentView && currentView.extra_panels || {}).decisions || {}).lines)).some((it) => needsIdOf(it) === modalCustom.id)) closeModal();
+      const dl = ((currentView && currentView.extra_panels || {}).decisions || {}).lines;
+      // the desk's own questions (the "Desk owes" tab) are waiting items too: their focus view stays open while they are
+      if (!needsWaiting(needsItems(dl)).concat(deskOwesItems(dl)).some((it) => needsIdOf(it) === modalCustom.id)) closeModal();
       return;
     }
     const entry = findEntry(currentView, modalKey);
@@ -8375,6 +8555,7 @@
     phoneJumpRun++;
     pruneModalKinds();
     document.body.classList.remove("modal-open");
+    unlockNeedsScroll();
     modalKey = null;
     modalCustom = null;
     modalGlance = false;
@@ -8398,7 +8579,11 @@
     }
     // restore focus to the ⤢ trigger if it's still in the DOM (an intervening board
     // re-render may have replaced it — then focus simply falls to <body>, acceptable).
-    if (rf && typeof rf.focus === "function" && document.body.contains(rf)) rf.focus();
+    // a Needs-you row replaced by a redraw is found again by its item id
+    if (rf && !document.body.contains(rf) && rf.dataset && rf.dataset.needsId) {
+      rf = Array.prototype.find.call(document.querySelectorAll("#ck-needs .needs-row"), (n) => n.dataset.needsId === rf.dataset.needsId) || null;
+    }
+    if (rf && typeof rf.focus === "function" && document.body.contains(rf)) rf.focus({ preventScroll: true });
   }
 
   function onModalKeydown(ev) {

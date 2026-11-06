@@ -15,7 +15,8 @@ from tests.test_cockpit_needs_rows import LONG_OPTS, READY, ROWS, _file
 SIZES = (("desktop", {"w": 1280, "h": 900, "dpr": 1}, 3), ("ipad", {"w": 820, "h": 1100, "dpr": 1}, 2),
          ("phone", {"w": 390, "h": 844, "dpr": 2, "mobile": True}, 1))
 SHOTS = os.environ.get("CARDS_SHOTS")
-PROBE = (f"JSON.stringify({{cols: getComputedStyle(document.querySelector('#ck-needs .needs-grid')).gridTemplateColumns.split(' ').length,"
+# the phone's default layout is dense rows in a flex column (needs-ab): one column, which is not a grid's track count
+PROBE = (f"JSON.stringify({{cols: (g => g.display === 'grid' ? g.gridTemplateColumns.split(' ').length : 1)(getComputedStyle(document.querySelector('#ck-needs .needs-grid'))),"
          f" lefts: new Set({ROWS}.map(r => Math.round(r.getBoundingClientRect().left))).size,"
          f" titles: {ROWS}.map(r => {{ const t = r.querySelector('.needs-row-title'); const cs = getComputedStyle(t);"
          f"   return {{lines: cs.webkitLineClamp, h: t.getBoundingClientRect().height, lh: parseFloat(cs.lineHeight), text: t.textContent}}; }}),"

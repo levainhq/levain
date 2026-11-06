@@ -378,6 +378,7 @@
           const sv = (x) => (typeof x === "string" ? x : "");
           line.question = { id: r.id, n: isNum(f.question_n) ? f.question_n : 0, agent: sv(f.agent), state: sv(f.question_state),
                             options: isNum(f.question_options) ? f.question_options : 0,
+                            at: typeof f.at === "string" ? f.at : "",
                             age: typeof f.at === "string" ? ageLabel(f.at, nowMs || Date.now(), "") : "",
                             decidedAge: typeof f.decided_at === "string" ? ageLabel(f.decided_at, nowMs || Date.now(), "") : "",
                             decidedAt: typeof f.decided_at === "string" ? f.decided_at : "",
@@ -713,6 +714,7 @@
     if (isObj(m.transport)) {
       view.writable = m.transport.writable === true;
       view.write_token_required = m.transport.write_token_required === true;
+      if (m.transport.mockup_layout_switch === true) view.mockup_layout_switch = true;   // a scratch preview's A/B switch; a real server never sends it
     }
     for (const e of m.errors || []) view.errors[e.source || "manifest"] = e.message;
 
