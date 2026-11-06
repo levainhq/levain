@@ -54,6 +54,14 @@ def test_the_project_urls_still_hold_the_homepage_and_repository():
 # --- docs fix round (1105-36 b1fix): findings of the docs L3 on this branch -------------------------------------------
 
 CHANGELOG = (ROOT / "CHANGELOG.md").read_text(encoding="utf-8")
+
+
+def _install_block_entry() -> str:
+    """The CHANGELOG entry about the README's install block. It is written under [Unreleased] and moves under its
+    version header when the release is prepared, so it is found anywhere in the file (its opening words are unique)."""
+    return next(e for e in CHANGELOG.split("\n- **") if e.startswith("The README's install block"))
+
+
 CONTRIBUTING = (ROOT / "CONTRIBUTING.md").read_text(encoding="utf-8")
 WORKFLOW = (ROOT / ".github" / "workflows" / "test.yml").read_text(encoding="utf-8")
 
@@ -70,8 +78,7 @@ def test_the_node_requirement_is_the_major_the_launch_check_accepts():
     assert f"Node {ACCEPTED_NODE_MAJORS[0]} (other majors are refused)" in line, line
     assert "+" not in line.split("Node", 1)[1].split(" ", 2)[1], line
     assert "every chat launch" in line, line
-    unreleased = CHANGELOG.split("## [Unreleased]", 1)[1].split("\n## [", 1)[0]
-    entry = next(e for e in unreleased.split("\n- **") if e.startswith("The README's install block"))
+    entry = _install_block_entry()
     assert "26+" not in entry, entry
 
 
@@ -118,9 +125,9 @@ def test_contributing_gives_the_literal_ci_install_line():
 
 
 def test_the_changelog_makes_no_claim_about_the_package_index_or_repo_settings():
-    unreleased = CHANGELOG.split("## [Unreleased]", 1)[1].split("\n## [", 1)[0]
-    assert "has_issues" not in unreleased
-    entry = next(e for e in unreleased.split("\n- **") if e.startswith("The README's install block"))
+    newest = CHANGELOG.split("## [Unreleased]", 1)[1].split("\n## [", 2)  # [Unreleased] body, newest release, rest
+    assert "has_issues" not in newest[0] + (newest[1] if len(newest) > 1 else "")
+    entry = _install_block_entry()
     if "placeholder" in entry:
         assert "observed 2026-11-05" in entry, entry
     assert "python3.12 levain" not in entry, entry
