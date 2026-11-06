@@ -599,7 +599,8 @@ def sudo_knows_requiretty(probe: Callable[[], str | None] | None = None) -> bool
     if probe is None:
         def probe() -> str | None:
             try:
-                r = subprocess.run(["sudo", "--version"], capture_output=True, text=True, timeout=10)
+                r = subprocess.run([SUDO, "--version"], capture_output=True, text=True, timeout=10,
+                                   cwd="/", env={**child_env(), "LC_ALL": "C"})
             except (OSError, subprocess.SubprocessError):
                 return None
             return r.stdout.splitlines()[0] if r.returncode == 0 and r.stdout else None
