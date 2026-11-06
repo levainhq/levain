@@ -42,6 +42,26 @@ def test_a_foreground_after_a_dead_first_read_repaints_the_board(tmp_path: Path)
     assert cold and board == 0, f"the dead read must leave the page cold, or this proves nothing: {out['values']}"
 
 
+# the first manifest read FAILS (a radio still waking: the fetch rejects at once), later ones go through
+FAIL_FIRST = ("(() => { const f = window.fetch.bind(window); let n = 0;"
+              " window.fetch = function (u, o) { if (String(u).indexOf('/cockpit/manifest.json') === 0 && n++ === 0)"
+              " return Promise.reject(new TypeError('Failed to fetch')); return f(u, o); }; })()")
+
+
+@needs_browser
+def test_a_failed_first_read_says_so_and_retries_by_itself_without_a_foreground(tmp_path: Path) -> None:
+    """Phill 11-06: both phones sat on the cold "connecting…" line with no panels. A hung read was fixed (above); a FAILED one left
+    the line and nothing to try again. It now names the failure in the line and re-reads on a backoff until a board is drawn."""
+    _root, src, _ids = _install(tmp_path)
+    with _serve_plain(src) as url:
+        out = _drive(tmp_path, f"{url}/", [
+            {"init": FAIL_FIRST},
+            {"until": "document.querySelector('#store') && /trying again/.test(document.querySelector('#store').textContent) && 1", "ms": 8000},
+            {"until": DRAWN, "ms": 12000},
+        ])
+    assert out["values"][-1], out["values"]
+
+
 # a registration whose worker is waiting, with a controller already in charge (an update, not a first install)
 STUB = ("(() => { const posts = []; const l = {}; const w = { postMessage: (m) => posts.push(m) };"
         " const reg = { waiting: w, addEventListener() {}, update: () => Promise.resolve() };"
@@ -100,3 +120,41 @@ def test_a_status_bar_inset_pushes_the_masthead_below_the_clock(tmp_path: Path) 
             {"eval": "document.querySelector('.masthead').getBoundingClientRect().top >= 59"},
         ])
     assert out["values"][-1] is True
+
+
+# every manifest read answers 403 with a token message (this device's token is missing or wrong)
+REFUSE_ALL = ("(() => { const f = window.fetch.bind(window); window.__manifest_reads = 0;"
+              " window.fetch = function (u, o) { if (String(u).indexOf('/cockpit/manifest.json') === 0) { window.__manifest_reads++;"
+              " return Promise.resolve(new Response(JSON.stringify({error: 'forbidden', message: 'missing or invalid write token'}),"
+              " {status: 403, headers: {'Content-Type': 'application/json'}})); } return f(u, o); }; })()")
+
+
+@needs_browser
+def test_a_refused_device_is_not_retried_in_a_loop(tmp_path: Path) -> None:
+    _root, src, _ids = _install(tmp_path)
+    with _serve_plain(src) as url:
+        out = _drive(tmp_path, f"{url}/", [
+            {"init": REFUSE_ALL},
+            {"eval": "new Promise(r => setTimeout(() => r(window.__manifest_reads), 7000))"},
+        ])
+    assert out["values"][-1] <= 3, out["values"]      # the boot read (and its token re-read), never a 2/4/8 s retry loop
+
+
+# the plain-text 403 a Host / cross-site refusal sends (no JSON, no "token" word): refused all the same
+PLAIN_403 = REFUSE_ALL.replace("JSON.stringify({error: 'forbidden', message: 'missing or invalid write token'})", "'forbidden\\n'") \
+    .replace("'Content-Type': 'application/json'", "'Content-Type': 'text/plain'")
+
+
+@needs_browser
+def test_a_plain_403_and_the_online_event_do_not_re_ask(tmp_path: Path) -> None:
+    _root, src, _ids = _install(tmp_path)
+    with _serve_plain(src) as url:
+        out = _drive(tmp_path, f"{url}/", [
+            {"init": PLAIN_403},
+            {"eval": "new Promise(r => setTimeout(() => r(window.__manifest_reads), 3000))"},
+            {"eval": "(() => { window.dispatchEvent(new Event('online')); return 0; })()"},
+            {"eval": "new Promise(r => setTimeout(() => r(window.__manifest_reads), 4000))"},
+        ])
+    first, last = out["values"][-3], out["values"][-1]
+    assert 1 <= first <= 3, out["values"]             # the boot read happened (and was refused)
+    assert last == first, out["values"]               # neither the 2/4 s backoff nor an online event asked again
