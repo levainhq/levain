@@ -127,9 +127,10 @@ INWORLD_AUTH_SCHEME = "Bearer"                  # "Basic" is the other documente
 # from an account and added to this tuple; the adapter accepts any well-formed id (a custom voice id is one).
 INWORLD_TTS_VOICES = ("Alex", "Ashley", "Dennis")
 INWORLD_TTS_VOICE = "Dennis"                    # one of INWORLD_TTS_VOICES
-# "The text to synthesize, up to 4,000 characters" (the route page and the reference above, read 2026-11-05). The unit is
-# unstated, so len() of the Python string is used, UNVERIFIED; a text Inworld counts as longer is answered 400, which maps
-# to ``rejected``, so the unverified unit fails closed.
+# "The text to synthesize, up to 4,000 characters" (the route page and the reference above, read 2026-11-05). The route
+# pages leave the unit unstated; the streaming reference counts input and billing in UTF-16 code units, so the cap and the
+# meter use :func:`inworld_units` (UNVERIFIED against a live call on THIS route); a text Inworld counts as longer is
+# answered 400, which maps to ``rejected``, so a wrong unit still fails closed.
 INWORLD_INPUT_CAP = 4000
 INWORLD_SPEED_MIN, INWORLD_SPEED_MAX = 0.5, 1.5     # "Values outside 0.5 to 1.5 are rejected" (the reference above)
 OPENAI_INPUT_CAP = API_CAP                      # OpenAI's speech input limit, the number the cap was first written for
@@ -520,7 +521,7 @@ class InworldProvider:
     uses: frozenset[str] = frozenset({"tts"})
 
     def speak(self, key: str, text: str, voice: str = INWORLD_TTS_VOICE, speed: float = 1.0) -> bytes:
-        """mp3 bytes for ``text`` (at most :data:`INWORLD_INPUT_CAP` characters) in ``voice`` at ``speed`` (0.5 to 1.5).
+        """mp3 bytes for ``text`` (at most :data:`INWORLD_INPUT_CAP` UTF-16 code units, see :func:`inworld_units`) in ``voice`` at ``speed`` (0.5 to 1.5).
         ``voice`` is any well-formed id; which are OFFERED is the cockpit's list (:data:`INWORLD_TTS_VOICES`), checked by
         its route. The key is sent in the ``Authorization`` header only."""
         secret = _Key(key)

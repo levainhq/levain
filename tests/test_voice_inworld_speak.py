@@ -236,9 +236,10 @@ def test_the_input_cap_is_inworlds_4000_characters_and_inclusive(server):
     assert server.received == []                                         # refused before anything was sent
 
 
-def test_the_chunker_stays_under_the_cap():
-    """Red with: the cap lowered under the chunker's size."""
-    assert CHUNK <= P.INWORLD_INPUT_CAP
+def test_the_chunker_stays_under_the_cap_even_when_every_character_is_two_units():
+    """The cap is in UTF-16 code units and a character is at most two, so a chunk the chunker makes never reaches the adapter's
+    refusal (L3 inworld r2: an emoji-dense chunk). Red with: the cap lowered under twice the chunker's size, or CHUNK raised."""
+    assert 2 * CHUNK <= P.INWORLD_INPUT_CAP
 
 
 @pytest.mark.parametrize("text", ["", "   ", None, b"bytes"])
