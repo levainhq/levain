@@ -1362,3 +1362,27 @@ def test_a_retransmitted_altered_request_is_one_protocol_error():
     evs = list(s.read(None).events)
     changed = [e for e in evs if e.vendor_id.startswith("control_changed:")]
     assert len(evs) == 3 and len(changed) == 2 and len({e.key for e in evs}) == 3
+
+
+# ---- 1105-49: the room's own read-guard hook entry ------------------------------------------------------------------
+def test_the_rooms_settings_carry_the_vendors_block_and_the_hook_entry_together_and_the_argv_gains_no_prompt():
+    from levain.coordinator import room_readguard
+    from levain.coordinator.claude_session import ROOM_READ_REFUSAL, room_hook_command
+    cmd = room_hook_command("/usr/bin/python3", "/run/room_readguard.py")
+    doc = json.loads(room_settings_json("/Users/someone/room", default_deny_paths("/Users/someone"), cmd))
+    assert doc["permissions"]["blockReadsOutsideWorkingDirectories"] is True and doc["permissions"]["deny"]
+    assert doc["hooks"] == {"PreToolUse": [{"matcher": "Read|Grep|Glob", "hooks": [
+        {"type": "command", "command": "/usr/bin/python3 -I /run/room_readguard.py", "timeout": 10}]}]}
+    assert ROOM_READ_REFUSAL is room_readguard.ROOM_READ_REFUSAL
+    for leak in ("/add-dir", "blockReadsOutsideWorkingDirectories", "permissions.", "/Users"):
+        assert leak not in ROOM_READ_REFUSAL
+    argv = room_argv(mcp_config="/m.json", settings="/s.json", session_id="sid")
+    assert "--append-system-prompt" not in argv and "--setting-sources" in argv        # option B is not built
+
+
+def test_a_hook_command_quotes_a_path_with_a_space_and_refuses_a_relative_one():
+    from levain.coordinator.claude_session import room_hook_command
+    assert room_hook_command("/opt/my py/python", "/run dir/g.py") == "'/opt/my py/python' -I '/run dir/g.py'"
+    for py, script in (("python3", "/g.py"), ("/usr/bin/python3", "g.py")):
+        with pytest.raises(ValueError):
+            room_hook_command(py, script)

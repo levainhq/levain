@@ -38,6 +38,16 @@ its argv, so an allow rule answering is the expected path; a worker's rule again
 has none. Everything else latches as it does for a worker: a deny passes, any other decision shape for these tools, any
 other source, and every other tool (``expected_pre_hooks`` refuses them, so they read as a ``deficit``).
 
+**The room's own read-guard hook** (:mod:`levain.coordinator.room_readguard`, 1105-49): a ``hooks.PreToolUse`` entry in the
+room's ``--settings`` that answers a Read, Grep or Glob of a path outside the folder with one fixed sentence instead of
+the vendor's, which names a setting and a remedy. It can only add refusals. Its deny is a ``reject`` decision from source
+``hook``, which that context already passes without a count (``reject`` is never refused and is "ruled"), and the vendor
+streams no ``hook_response`` for it (the recorded run, ``tests/fixtures/claude_stream/room_hook_denied_read.jsonl``), so
+the hook counts are unchanged. It is part of the containment digest (its settings entry AND its script's sha256). The
+open check's two decoys are left to the vendor (the child's :data:`~levain.coordinator.room_readguard.EXEMPT_ENV` names
+them), because a hook deny is also an ``is_error`` result and a ``permission_denials`` entry: a hook that answered them
+would pass the check without the deny rules or the block holding.
+
 **The cached ``permission_mode``** (``ChatService.session_meta``) is read at ``attach``. The room has no path that
 refreshes it in place, because there is nothing to refresh: a mode that changes inside a live session is a latched
 ``mode_changed`` (the room's own rule, ``chat._room_mode_trip``), and a latched or dead room is ended and reopened by
@@ -92,8 +102,9 @@ from levain.coordinator.chat import (ROOM_PERMISSION_MODE, ChatService, ChatStor
 from levain.coordinator.chat_tripwires import TripwireContext
 from levain.coordinator.claude_session import (ROOM_DENIED_TOOLS, ROOM_MCP_SERVER, ROOM_MCP_TOOL, ROOM_TOOLS,
                                                ClaudeSession, PipeTransport, _leads_own_group, canary_denied, default_deny_paths,
-                                               open_probe, room_argv, room_settings_json)
+                                               open_probe, room_argv, room_hook_command, room_settings_json)
 from levain.coordinator.driver import LivenessEvidence, NotSent, SendCommand
+from levain.coordinator import room_readguard
 from levain.coordinator.room_mcp import LAUNCH_ENV
 from levain.coordinator.store import CoordError
 
@@ -440,10 +451,17 @@ def mcp_config_json(launch_id: str, python: str) -> str:
         "env": {LAUNCH_ENV: launch_id, ROOM_ENV: "1"}}}}, sort_keys=True)
 
 
+def _guard_source() -> bytes:
+    """The read-guard hook's script, as the launcher copies it into the room's run directory."""
+    return Path(room_readguard.__file__).read_bytes()
+
+
 def containment_digest(settings_json: str) -> str:
-    """64 hex: the containment policy a spawn ran under (tool flags, mode, sources, deny rules, door name)."""
+    """64 hex: the containment policy a spawn ran under (tool flags, mode, sources, deny rules, the read-guard hook entry
+    and its script's sha256, door name)."""
     policy = {"tools": list(ROOM_TOOLS), "denied": sorted(ROOM_DENIED_TOOLS), "mode": ROOM_PERMISSION_MODE,
-              "setting_sources": "user", "settings": json.loads(settings_json), "door": ROOM_MCP_TOOL}
+              "setting_sources": "user", "settings": json.loads(settings_json), "door": ROOM_MCP_TOOL,
+              "readguard_sha256": hashlib.sha256(_guard_source()).hexdigest()}
     return hashlib.sha256(json.dumps(policy, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
 
 
@@ -503,8 +521,12 @@ class RoomLauncher:
         self._scope_dir = scope_dir          # where the scope decoy's directory is made (None: the system temp dir)
         # refused early, before any launch row: a bad cwd/deny pair is the operator's to fix
         self._deny = default_deny_paths(self._home, levain_home)
+        # the read-guard hook's script lives at one stable path in run_dir (copied at every launch), so the settings
+        # document, and with it the containment digest, is the same for every launch of this launcher
+        self._guard = self._run_dir / "room_readguard.py"
         try:
-            self._settings_json = room_settings_json(setting.cwd, self._deny)
+            self._settings_json = room_settings_json(setting.cwd, self._deny,
+                                                     room_hook_command(self._python, self._guard))
         except ValueError as exc:
             raise RoomLaunchError(f"the room's settings could not be built: {exc}") from exc
 
@@ -615,6 +637,8 @@ class RoomLauncher:
                 raise RoomLaunchError(widened)
             scope_dir, scope = self._scope_decoy()
             argv, decoy, stderr_path = self._write_files(workdir, launch_id, resume, sid)
+            # the hook leaves BOTH decoys to the vendor, so each canary is answered by what it tests (room_readguard)
+            env[room_readguard.EXEMPT_ENV] = json.dumps([decoy, scope])
             with open(stderr_path, "ab") as errf:
                 proc = self._spawn(argv, cwd=self._setting.cwd, env=env, stderr=errf)
             session = RoomSession(PipeTransport(proc), conn=self._next_conn(), session_id=sid)
@@ -696,6 +720,7 @@ class RoomLauncher:
                 f.write(text)
             return p
 
+        self._put_guard()
         mcp = put("mcp.json", mcp_config_json(launch_id, self._python))
         settings = put("settings.json", self._settings_json)
         stderr = put("child.stderr", "")
@@ -705,6 +730,21 @@ class RoomLauncher:
         argv = room_argv(mcp_config=mcp, settings=settings, model=self._setting.model, claude_bin=self._setting.claude_bin,
                          **({"resume": resume} if resume else {"session_id": sid}))
         return argv, str(decoy), stderr
+
+    def _put_guard(self) -> None:
+        """Copy the read-guard hook's script to its one path in run_dir (0600, replaced whole), the file the room's
+        ``--settings`` hook command names."""
+        tmp = self._run_dir / f".room_readguard.{secrets.token_hex(6)}.tmp"
+        try:
+            fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+            with os.fdopen(fd, "wb") as f:
+                f.write(_guard_source())
+            os.replace(tmp, self._guard)
+        finally:
+            try:
+                tmp.unlink()
+            except FileNotFoundError:
+                pass
 
     def _open_check(self, session: RoomSession, proc: Any, decoy: str, stderr_path: Path,
                     sid: str, scope: str) -> LivenessEvidence:

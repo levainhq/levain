@@ -239,3 +239,18 @@ def test_an_empty_backtick_pair_is_not_a_code_span_to_the_bold_scan_either(tmp_p
 def test_the_page_script_has_no_markup_sink():
     js = (WEB / "room_view.js").read_text()
     assert not re.search(r"innerHTML|outerHTML|insertAdjacentHTML|document\.write|DOMParser|createContextualFragment", js)
+
+
+@needs_browser
+def test_a_read_the_rooms_own_hook_refused_is_drawn_as_the_same_refusal_and_never_with_the_models_sentence(tmp_path, w):
+    """1105-49: the vendor wraps a hook's deny as ``PreToolUse:<Tool> hook error: <reason>`` (the recorded run,
+    ``tests/fixtures/claude_stream/room_hook_denied_read.jsonl``); the page reads it from its words and draws the plain
+    sentence, as for the vendor's own refusals. A hook that said something else, or on another tool, is a failure."""
+    from levain.coordinator.claude_session import ROOM_READ_REFUSAL
+    bodies = [f"PreToolUse:{t} hook error: {ROOM_READ_REFUSAL}" for t in ("Read", "Grep", "Glob")]
+    bodies += [f"PreToolUse:Bash hook error: {ROOM_READ_REFUSAL}", "PreToolUse:Read hook error: some other hook said no"]
+    g = _lines(tmp_path, w, _results(*bodies), 5)
+    assert [x["head"].split(" — ")[0] for x in g] == ["A read was refused"] * 3 + ["A tool result", "A tool result"], g
+    for x in g[:3]:
+        assert x["text"] == "That is outside what the room can read, so nothing was read." and "PreToolUse" not in x["head"], x
+        assert "Tell the user" not in x["text"] and "/add-dir" not in x["text"]
