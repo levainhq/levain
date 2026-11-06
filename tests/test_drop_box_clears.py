@@ -11,7 +11,7 @@ from pathlib import Path
 
 from tests.test_cockpit_narrow_layout_rig import NEEDS, TOK, FullRig, drive_touch, needs_browser, needs_ssh
 from tests.test_envelope_sheet import FD, SIGN_ON, _in, _tag, make_init
-from tests.test_msgslot_hero import BOX, READY, _tagged, _type
+from tests.test_msgslot_hero import BOX, READY, TXT, _tagged, _type
 
 WORDS = "tidy the changelog"
 SERVER = """(() => {
@@ -38,7 +38,7 @@ HOME = [{"eval": "document.dispatchEvent(new Event('visibilitychange')); new Pro
 
 
 def _state(t: str) -> dict:
-    return {"eval": f"JSON.stringify({{t: {json.dumps(t)}, box: {BOX}.value, kept: Object.keys(localStorage).filter((k) => k.indexOf('levain-drop-pending') === 0).length}})"}
+    return {"eval": f"JSON.stringify({{t: {json.dumps(t)}, box: {TXT}, kept: Object.keys(localStorage).filter((k) => k.indexOf('levain-drop-pending') === 0).length}})"}
 
 
 def _run(tmp_path: Path, monkeypatch, status: int, signed: bool) -> dict:
