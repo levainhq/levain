@@ -3,17 +3,24 @@
 byte changed (FAIL naming that asset). The origin is always a test server on 127.0.0.1; nothing else is touched."""
 from __future__ import annotations
 
+import http.server
 import importlib.util
+import re
+import shutil
 import socket
 import sys
 import threading
+import time
 from contextlib import contextmanager
 from pathlib import Path
 
 import pytest
 
 from levain import web_server
+from levain.consent.sign import Signer
 from levain.web_server import make_server
+from tests.test_cockpit_sign_origin import NS, PINNED, RP, _file, _Passkey
+from tests.test_cockpit_sign_routes import RID, _serving
 from tests.test_web_server import _store_with_data
 
 REPO = Path(web_server.__file__).resolve().parents[1]
@@ -135,8 +142,182 @@ def test_main_exit_codes_pass_fail_and_unreadable(tmp_path: Path, capsys, monkey
         assert sbc.main(["--url", base, "--tree", str(REPO)]) == 1
         assert "FAIL  tree /sky.js" in capsys.readouterr().out
         assert sbc.main(["--url", base, "--tree", str(tmp_path)]) == 2          # not a tree
-    s = socket.socket()
-    s.bind(("127.0.0.1", 0))
-    port = s.getsockname()[1]
-    s.close()
-    assert sbc.main(["--url", f"http://127.0.0.1:{port}", "--timeout", "2"]) == 2   # nothing listening
+    with socket.socket() as s:                  # bound and never listening, held open so no other process can take the port
+        s.bind(("127.0.0.1", 0))
+        port = s.getsockname()[1]
+        assert sbc.main(["--url", f"http://127.0.0.1:{port}", "--timeout", "2"]) == 2   # nothing listening
+
+
+# ---- L3 r1 fix round (1105-36 b4fix): each test below was first run RED against a6fc89e1 -------------------------------
+
+
+def _tree(tmp: Path) -> Path:
+    """A copy of this checkout's package pieces the checker reads (templates/web, web_server.py, the worker), safe to edit."""
+    pkg = tmp / "levain"
+    shutil.copytree(REPO / "levain" / "templates" / "web", pkg / "templates" / "web")
+    shutil.copy(REPO / "levain" / "web_server.py", pkg / "web_server.py")
+    (pkg / "webpush" / "static").mkdir(parents=True)
+    shutil.copy(REPO / "levain" / "webpush" / "static" / "sw.js", pkg / "webpush" / "static" / "sw.js")
+    return tmp
+
+
+@contextmanager
+def _origin(respond):
+    """A tiny loopback origin (ephemeral port) whose every GET is answered by ``respond(handler)``."""
+    class H(http.server.BaseHTTPRequestHandler):
+        protocol_version = "HTTP/1.1"
+
+        def do_GET(self):
+            try:
+                respond(self)
+            except OSError:                    # the client hung up on us: the point of some tests
+                pass
+
+        def log_message(self, *a):
+            pass
+
+    httpd = http.server.ThreadingHTTPServer(("127.0.0.1", 0), H)
+    httpd.daemon_threads = True
+    t = threading.Thread(target=httpd.serve_forever, daemon=True)
+    t.start()
+    try:
+        yield f"http://127.0.0.1:{httpd.server_address[1]}"
+    finally:
+        httpd.shutdown()
+        httpd.server_close()
+        t.join(timeout=5)
+
+
+def test_a_declared_asset_missing_from_the_tree_is_unreadable_not_a_silent_skip(tmp_path: Path, capsys) -> None:
+    tree = _tree(tmp_path / "t")
+    (tree / "levain" / "templates" / "web" / "pair.html").unlink()       # _ASSETS declares /pair -> pair.html
+    with _up(tmp_path / "a") as base:
+        assert sbc.main(["--url", base, "--tree", str(tree)]) == 2
+    assert "pair.html" in capsys.readouterr().err
+
+
+def test_the_sign_sheet_is_compared_when_served_and_named_unverified_when_not(tmp_path: Path, capsys, monkeypatch) -> None:
+    pk = _Passkey()
+    qdir = tmp_path / "q"
+    signer = Signer(qdir, (NS,), RP, lambda: {pk.key.fingerprint: pk.key})
+    signer.page_origin = PINNED
+    _file(qdir, RID)
+    with _serving(tmp_path / "s1", signer=signer, extra_hosts=[RP]) as (base, _httpd):
+        same = sbc.run(base, REPO)
+    assert _failed(same) == [] and any(r.name == "tree sign sheet" and r.ok and not r.unverified for r in same)
+    real = web_server.load_web_asset
+    monkeypatch.setattr(web_server, "load_web_asset", lambda fn: real(fn) + "<!-- x -->" if fn == "sign.html" else real(fn))
+    with _serving(tmp_path / "s2", signer=signer, extra_hosts=[RP]) as (base, _httpd):
+        changed = sbc.run(base, REPO)
+    assert _failed(changed) == ["tree sign sheet"]
+    monkeypatch.undo()
+    with _up(tmp_path / "s3") as base:                       # no signer: the route is 404, the sheet cannot be read
+        assert sbc.main(["--url", base, "--tree", str(REPO)]) == 0
+    out = capsys.readouterr().out
+    assert "UNVERIFIED  sign sheet (served at /sign/" in out
+    assert out.rstrip().splitlines()[-1].endswith("UNVERIFIED: sign sheet") and "0 FAIL" in out
+
+
+def test_tree_bytes_are_read_as_the_server_reads_them_so_crlf_files_do_not_fail_a_server_on_the_same_checkout(tmp_path: Path, monkeypatch) -> None:
+    tree = _tree(tmp_path / "t")
+    web = tree / "levain" / "templates" / "web"
+    for name in ("sky.js", "pair.html"):
+        (web / name).write_bytes((web / name).read_bytes().replace(b"\n", b"\r\n"))     # a Windows / autocrlf checkout
+    monkeypatch.setattr(web_server, "load_web_asset", lambda fn: (web / fn).read_text(encoding="utf-8"))   # the real function's read
+    with _up(tmp_path / "a") as base:
+        results = sbc.run(base, tree)
+    assert _failed(results) == [], [r.line() for r in results if not r.ok]
+
+
+def test_a_cut_body_and_a_malformed_asset_table_are_exit_two_not_a_traceback(tmp_path: Path, capsys) -> None:
+    def cut(h):                                 # Content-Length 5000, ten bytes, then the connection closes
+        h.send_response(200)
+        h.send_header("Content-Length", "5000")
+        h.end_headers()
+        h.wfile.write(b"0123456789")
+        h.wfile.flush()
+        h.close_connection = True
+
+    def chunk_cut(h):                           # a chunked body that announces 0x64 bytes, sends ten, closes: IncompleteRead
+        h.send_response(200)
+        h.send_header("Transfer-Encoding", "chunked")
+        h.end_headers()
+        h.wfile.write(b"64\r\n0123456789")
+        h.wfile.flush()
+        h.close_connection = True
+
+    def garbage(h):                             # not an HTTP status line at all: BadStatusLine
+        h.wfile.write(b"NOT-HTTP garbage\r\n\r\n")
+        h.wfile.flush()
+        h.close_connection = True
+
+    for respond in (cut, chunk_cut, garbage):
+        with _origin(respond) as base:
+            assert sbc.main(["--url", base, "--timeout", "3"]) == 2, respond.__name__
+        assert capsys.readouterr().err.startswith("ERROR"), respond.__name__
+    tree = _tree(tmp_path / "t")
+    (tree / "levain" / "web_server.py").write_text("_ASSETS = {'/': 5}\n", encoding="utf-8")
+    with _up(tmp_path / "a") as base:
+        assert sbc.main(["--url", base, "--tree", str(tree)]) == 2
+    assert capsys.readouterr().err.startswith("ERROR")
+
+
+def test_a_page_that_omits_or_bares_its_shell_assets_yields_one_result_per_name(tmp_path: Path) -> None:
+    with _up(tmp_path) as base:
+        def strip(url: str):
+            status, body = sbc.fetch(url)
+            return (status, sbc._VERSION_QUERY.sub("", body.decode()).encode()) if url == base + "/" else (status, body)
+
+        def omit(url: str):                     # the page names no sky.js at all
+            status, body = sbc.fetch(url)
+            if url == base + "/":
+                body = re.sub(rb"<script[^>]*sky\.js[^>]*></script>", b"", body)
+            return status, body
+
+        bare = sbc.run(base, REPO, strip)
+        omitted = sbc.run(base, REPO, omit)
+    for results in (bare, omitted):
+        names = [r.name for r in results]
+        assert len(names) == len(set(names)), [r.line() for r in results]
+    assert next(r for r in bare if r.name == "tree /sky.js").ok          # served bare, bytes equal the tree: judged on its bytes
+    assert not next(r for r in omitted if r.name == "tree /sky.js").ok   # the tree's page names it, the served page does not
+
+
+def test_one_path_named_twice_with_different_digests_fails(tmp_path: Path) -> None:
+    with _up(tmp_path) as base:
+        def twice(url: str):
+            status, body = sbc.fetch(url)
+            if url == base + "/":               # a wrong digest FIRST, the right one later (a dict keeps only the last)
+                body = body.replace(b"<head>", b'<head><script src="/sky.js?v=' + b"0" * 12 + b'"></script>', 1)
+            return status, body
+
+        results = sbc.run(base, None, twice)
+    page = [r for r in results if r.name == "page /sky.js"]          # the page's own contradiction is named (the first digest
+    assert len(page) == 1 and not page[0].ok and "different" in page[0].detail    # is then also the one fetched, and fails alone)
+
+
+def test_a_response_is_bounded_in_size_and_in_total_time(monkeypatch) -> None:
+    def big(h):
+        h.send_response(200)
+        h.send_header("Content-Length", "5000")
+        h.end_headers()
+        h.wfile.write(b"x" * 5000)
+
+    def drip(h):                                # one byte per 0.15 s: every socket read is fast, the whole is not
+        h.send_response(200)
+        h.send_header("Content-Length", "100")
+        h.end_headers()
+        for _ in range(100):
+            h.wfile.write(b"x")
+            h.wfile.flush()
+            time.sleep(0.15)
+
+    monkeypatch.setattr(sbc, "MAX_BODY", 1000)
+    with _origin(big) as base:
+        with pytest.raises(OSError, match="larger than"):
+            sbc.fetch(base + "/", timeout=3.0)
+    with _origin(drip) as base:
+        started = time.monotonic()
+        with pytest.raises(OSError, match="deadline"):
+            sbc.fetch(base + "/", timeout=3.0, total_timeout=0.6)
+        assert time.monotonic() - started < 3.0
