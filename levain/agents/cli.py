@@ -1,7 +1,7 @@
 """levain.agents.cli — ``levain agents``: the seam (A0 r6 §3.7). It opens the agent store through
 :func:`levain.agents.store.open_agent_store` and says whether the agent schema is the one this levain writes. The
-verbs of §3.6 arrive with their slices; so far ``role add|show`` (P1) and ``register|list|show|pause|resume|retire|zone``
-(P2) exist.
+verbs of §3.6 arrive with their slices; so far ``role add|show`` (P1), ``register|list|show|pause|resume|retire|zone``
+(P2) and ``agent|attach`` (K2b, the store's one operator agent) exist.
 
 Exit 0: done (bare ``agents``: the agent schema is this levain's). Exit 1: refused, the reason on stderr.
 ``--store-dir`` belongs to ``agents`` and goes before ``role``.
@@ -9,6 +9,7 @@ Exit 0: done (bare ``agents``: the agent schema is this levain's). Exit 1: refus
 from __future__ import annotations
 
 import argparse
+import functools
 import json
 import os
 import sqlite3
@@ -16,6 +17,7 @@ import sys
 from collections import Counter
 from pathlib import Path
 
+from levain.agents import operator as _operator
 from levain.agents.role import DEFAULT_KIND, MAX_VERSION, RoleError, add_role, get_role, latest_version, parse_role_text, role_by_hash
 from levain.agents.refuse import AuditError, audit_verdicts, check_spec, derived_flags, refinement_of
 from levain.agents.spec import (SpecError, finalize_spec, find_revert, get_agent, list_agents, load_json,
@@ -63,10 +65,39 @@ def add_parsers(subparsers: argparse._SubParsersAction) -> None:
     show.add_argument("--version", type=_version_arg, default=None, help="A version (default: the latest).")
     show.set_defaults(func=run_role_show)
     _add_p2_parsers(verbs)
+    _add_operator_parsers(verbs)
     _add_signing_parsers(verbs)
     _add_revoke_parsers(verbs)
+    # the verbs above open the agent store; `fence` never does and `tick` says its own refusal, so they are added after
+    # the one wrap and keep their own functions
+    _say_refusals(p)
     _add_fence_parsers(verbs)
     _add_tick_parsers(verbs)
+
+
+def _refusal_said(fn):
+    """``fn`` with a store refusal raised AFTER the open (a verb's own transaction meeting a marker another process
+    moved: :func:`levain.agents.store._check_marker`) said on stderr with exit 1, like the open's own refusal, never a
+    traceback."""
+    @functools.wraps(fn)
+    def run(args: argparse.Namespace) -> int:
+        try:
+            return fn(args)
+        except AgentStoreRefused as exc:
+            print(f"levain agents: {exc}", file=sys.stderr)
+            return 1
+    return run
+
+
+def _say_refusals(parser: argparse.ArgumentParser) -> None:
+    """Wrap every verb's ``func`` under ``levain agents`` in :func:`_refusal_said`: the ONE catch, at the dispatch."""
+    fn = parser.get_default("func")
+    if fn is not None:
+        parser.set_defaults(func=_refusal_said(fn))
+    for action in parser._actions:
+        if isinstance(action, argparse._SubParsersAction):
+            for sub in dict.fromkeys(action.choices.values()):     # an alias maps to the same parser: wrap it once
+                _say_refusals(sub)
 
 
 def _add_tick_parsers(verbs: argparse._SubParsersAction) -> None:
@@ -497,6 +528,95 @@ def run_zone(args: argparse.Namespace) -> int:
     except (sqlite3.Error, StoreFormatError) as exc:
         return _fail("zone", f"the store refused it: {exc}")
     print(f"default zone: {zone}")
+    return 0
+
+
+# ---- K2b: the one operator agent: `agent` (read it) and `attach` (attach a role to it) ---------------------------------
+
+def _add_operator_parsers(verbs: argparse._SubParsersAction) -> None:
+    ag = verbs.add_parser(
+        "agent", help="Show the store's one operator agent: the roles attached to it and its install.",
+        allow_abbrev=False,
+        description="The operator agent is derived: the registry reads it from the store's operator record, and roles "
+                    "attach to it (`levain agents attach`). Attaching confers nothing in 1.0; each spec is armed by its "
+                    "own signed link. A store with no record says so. Give --store-dir before `agent`.")
+    ag.add_argument("--json", action="store_true", help="One JSON object.")
+    ag.set_defaults(func=run_agent)
+    at = verbs.add_parser(
+        "attach", help="Attach a registered role spec to the operator agent (the first attach creates the agent).",
+        allow_abbrev=False,
+        description="Attach one registered, not-retired spec that pins a role (never a job) to the operator agent. The "
+                    "dream attaches itself at `levain dream enable`. There is no detach: retire the spec and register "
+                    "anew. Attaching confers nothing in 1.0. Give --store-dir before `attach`.")
+    at.add_argument("agent", help="A spec name (not retired) or its agent_id (ag-...).")
+    at.set_defaults(func=run_attach)
+
+
+def _agent_json(agent) -> dict:
+    def role(r):
+        return {"name": r.name, "agent_id": r.agent_id, "version": r.version, "role_name": r.role_name,
+                "role_version": r.role_version, "attached_at": r.attached_at, "operation": r.operation}
+
+    install = None if agent.install is None else {"kind": agent.install.kind, "label": agent.install.label,
+                                                  "memory_path": None if agent.install.memory_path is None
+                                                  else str(agent.install.memory_path)}
+    return {"record_id": agent.record_id, "created_at": agent.created_at, "roles": [role(r) for r in agent.roles],
+            "retired_roles": [role(r) for r in agent.retired_roles], "install": install}
+
+
+def run_agent(args: argparse.Namespace) -> int:
+    store = _open(args)
+    if store is None:
+        return 1
+    try:
+        with store.read() as conn:
+            agent = _operator.materialise(conn, install_dir=store.directory)
+            dream = _operator.unattached_dream(conn) if agent is None else agent.dream_unattached
+    except SpecError as exc:      # OperatorAgentUnreadable too: a row that fails its check is said, never skipped
+        return _fail("agent", str(exc))
+    except (sqlite3.Error, StoreFormatError) as exc:
+        return _fail("agent", f"the store refused it: {exc}")
+    if args.json:
+        doc = {"agent": None if agent is None else _agent_json(agent), "dream_unattached": dream}
+        print(json.dumps(doc, indent=2, sort_keys=True, ensure_ascii=False))
+        return 0
+    if agent is None:
+        print("no operator agent in this store yet: the first `levain agents attach <spec>` (or `levain dream enable`) "
+              "creates it")
+    else:
+        print(f"operator agent {agent.record_id} (created {agent.created_at}; derived from the store's record, not "
+              f"declared by any role)")
+        inst = agent.install
+        print("install: " + ("not consulted" if inst is None else inst.label
+                             + (f"  memory: {inst.memory_path}" if inst.memory_path is not None else "")))
+        print(f"roles attached ({len(agent.roles)}):" + ("" if agent.roles else " none open"))
+        for r in agent.roles:
+            print(f"  {r.name}  {r.agent_id}  v{r.version}  role {r.role_name} v{r.role_version}  {r.operation}  "
+                  f"attached {r.attached_at}")
+        if agent.retired_roles:
+            print(f"retired roles ({len(agent.retired_roles)}):")
+            for r in agent.retired_roles:
+                print(f"  {r.name}  {r.agent_id}  role {r.role_name}  attached {r.attached_at}")
+    if dream:
+        print(f"the dream ({dream}) is registered but not attached to the agent: `levain dream enable` attaches it "
+              f"(nothing stops firing meanwhile; attaching confers nothing)")
+    return 0
+
+
+def run_attach(args: argparse.Namespace) -> int:
+    store = _open(args)
+    if store is None:
+        return 1
+    try:
+        agent, got = _operator.attach(store, args.agent)
+    except SpecError as exc:
+        return _fail("attach", str(exc))
+    except (sqlite3.Error, StoreFormatError) as exc:
+        return _fail("attach", f"the store refused it: {exc}")
+    if got.record_created:
+        print(f"created the operator agent {got.record_id}")
+    print(f"{agent['name']} {agent['agent_id']}: attached to {got.record_id} as role {got.role_name}"
+          + ("" if got.attached else " (already)"))
     return 0
 
 

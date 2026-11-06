@@ -6,10 +6,11 @@ import sqlite3
 import pytest
 
 from levain import cli
-from levain.agents.store import AgentStoreRefused, open_agent_store
+from levain.agents.store import AgentStoreRefused, open_agent_store, open_agent_store_view
 from levain.autonomic import agent_tables as at
 from levain.autonomic import schema3
 from levain.autonomic.db import DB_NAME, AutonomicDB
+from tests import _agent_history as hist
 
 NOW = "2026-10-30T18:00:00Z"
 
@@ -107,7 +108,7 @@ def test_a_marked_store_with_a_dropped_trigger_is_refused_and_reopened_it_still_
             open_agent_store(d)
         text = str(e.value)
         assert "agent_occurrences_one_fire" in text
-        assert "run the levain that wrote marker levain-agent-schema/3" in text
+        assert "run the levain that wrote marker levain-agent-schema/4" in text
     assert not any(r[1] == "agent_occurrences_one_fire" for r in master(d / DB_NAME))
 
 
@@ -124,11 +125,11 @@ def test_a_weakened_trigger_body_is_refused(tmp_path):
 def test_an_unknown_marker_is_refused_and_named(tmp_path):
     d = tmp_path / "m2"
     open_agent_store(d)
-    edit(d, "UPDATE meta SET value = 'levain-agent-schema/4' WHERE key = 'agent_schema'")
+    edit(d, "UPDATE meta SET value = 'levain-agent-schema/5' WHERE key = 'agent_schema'")
     with pytest.raises(AgentStoreRefused) as e:
         open_agent_store(d)
-    assert "unknown agent schema marker 'levain-agent-schema/4'" in str(e.value)
-    assert "run the levain that wrote marker levain-agent-schema/4" in str(e.value)
+    assert "unknown agent schema marker 'levain-agent-schema/5'" in str(e.value)
+    assert "run the levain that wrote marker levain-agent-schema/5" in str(e.value)
 
 
 def test_a_refusal_touches_agents_only_the_autonomic_db_still_opens(tmp_path):
@@ -188,7 +189,7 @@ def run_cli(capsys, *argv: str) -> tuple[int, str, str]:
 def test_levain_agents_passes_a_clean_store(tmp_path, capsys):
     rc, out, err = run_cli(capsys, "--store-dir", str(tmp_path / "ok"))
     assert rc == 0 and err == ""
-    assert out.startswith("agent schema levain-agent-schema/3: ok")
+    assert out.startswith("agent schema levain-agent-schema/4: ok")
 
 
 def test_levain_agents_refuses_a_3_store(tmp_path, capsys):
@@ -222,3 +223,85 @@ def test_the_seam_has_no_verbs(capsys):
         cli.main(["agents", "register"])
     assert e.value.code == 2
     capsys.readouterr()
+
+
+# ------------------------------------------------------------------ K2a: the marker is read inside every transaction
+
+
+def test_a_held_agent_store_refuses_its_next_transaction_after_the_marker_moves(tmp_path):
+    """The design's 1b' flipped: an object opened BEFORE the marker moved kept reading and writing (a fresh open refused
+    it by name, a held one did not). The marker is now read inside every transaction of an opened store."""
+    d = tmp_path / "held"
+    held = open_agent_store(d)
+    with held.read() as c:
+        assert at.agent_marker(c) == at.AGENT_SCHEMA
+    edit(d, "UPDATE meta SET value = 'levain-agent-schema/5' WHERE key = 'agent_schema'")
+    with pytest.raises(AgentStoreRefused, match="unknown agent schema marker 'levain-agent-schema/5'") as e:
+        with held.read():
+            raise AssertionError("the block must not run")
+    assert "run the levain that wrote marker levain-agent-schema/5" in str(e.value)
+    with pytest.raises(AgentStoreRefused, match="unknown agent schema marker 'levain-agent-schema/5'"):
+        with held.write():
+            raise AssertionError("the block must not run")
+    edit(d, "UPDATE meta SET value = 'levain-agent-schema/4' WHERE key = 'agent_schema'")
+    with held.write() as c:      # and the same object works again once the marker is this binary's
+        assert at.agent_marker(c) == at.AGENT_SCHEMA
+
+
+def test_a_held_store_whose_marker_row_is_gone_is_refused_too(tmp_path):
+    d = tmp_path / "heldgone"
+    held = open_agent_store(d)
+    edit(d, "DELETE FROM meta WHERE key = 'agent_schema'")
+    with pytest.raises(AgentStoreRefused, match="no agent_schema marker"):
+        with held.read():
+            raise AssertionError("the block must not run")
+
+
+@pytest.mark.parametrize("which,marker", [("v2", "levain-agent-schema/2"), ("v3", "levain-agent-schema/3")])
+def test_the_read_only_view_of_an_older_store_names_this_versions_verb_not_the_older_binary(tmp_path, monkeypatch,
+                                                                                            which, marker):
+    path = hist.make_store(tmp_path / which, monkeypatch, which)
+    before = master(path)
+    with pytest.raises(AgentStoreRefused) as e:
+        open_agent_store_view(path.parent)
+    text = str(e.value)
+    assert f"unknown agent schema marker '{marker}'" in text
+    assert f"{marker} is an older agent schema that the next `levain agents` verb of this version migrates" in text
+    assert "run the levain that wrote marker" not in text      # the way out is not an older binary
+    assert master(path) == before                              # a view writes nothing
+    open_agent_store(path.parent)                              # and that verb does migrate it
+    assert open_agent_store_view(path.parent) is not None
+
+
+def test_a_held_read_only_view_refuses_its_next_read_after_the_marker_moves(tmp_path):
+    """fixk2 (L3 k2 r1, codex MED): a view opened at /4 read a store another process had moved to a later marker."""
+    d = tmp_path / "heldview"
+    open_agent_store(d)
+    view = open_agent_store_view(d)
+    with view.read() as c:
+        assert at.agent_marker(c) == at.AGENT_SCHEMA
+    edit(d, "UPDATE meta SET value = 'levain-agent-schema/5' WHERE key = 'agent_schema'")
+    with pytest.raises(AgentStoreRefused, match="unknown agent schema marker 'levain-agent-schema/5'"):
+        with view.read():
+            raise AssertionError("the block must not run")
+    edit(d, "UPDATE meta SET value = 'levain-agent-schema/4' WHERE key = 'agent_schema'")
+    with view.read() as c:       # the same view reads again once the marker is this binary's
+        assert at.agent_marker(c) == at.AGENT_SCHEMA
+
+
+def test_the_in_memory_view_of_no_store_still_reads_its_empty_tables(tmp_path):
+    view = open_agent_store_view(tmp_path / "none")
+    assert view.path is None
+    with view.read() as c:
+        assert c.execute("SELECT COUNT(*) FROM agents").fetchone()[0] == 0
+    assert not (tmp_path / "none").exists()
+
+
+def test_a_future_marker_is_still_sent_to_the_levain_that_wrote_it_even_from_the_view(tmp_path):
+    d = tmp_path / "future"
+    open_agent_store(d)
+    edit(d, "UPDATE meta SET value = 'levain-agent-schema/5' WHERE key = 'agent_schema'")
+    with pytest.raises(AgentStoreRefused) as e:
+        open_agent_store_view(d)
+    assert "run the levain that wrote marker levain-agent-schema/5" in str(e.value)
+    assert "older agent schema" not in str(e.value)

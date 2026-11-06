@@ -38,11 +38,20 @@ from dataclasses import dataclass
 from typing import Any
 
 __all__ = ["Refusal", "check_spec", "refinement_of", "derived_flags", "ceiling_problem", "audit_verdicts",
-           "AuditError", "ZONE_VERB", "all_spelling"]
+           "AuditError", "ZONE_VERB", "all_spelling", "is_dream"]
 
 ZONE_VERB = "levain agents zone <IANA>"
 #: The agent name the dream executor owns. A registration reaches it only through the dream's own path (``as_dream``).
 DREAM_NAME = "dream"
+
+
+def is_dream(spec: Mapping[str, Any], role: Mapping[str, Any] | None) -> bool:
+    """True for the dream's own spec: it carries the reserved name and its resolved role runs the ``dream`` executor.
+    The ONE predicate for that fact: :func:`check_spec` calls it to let the dream's registration pass, and the operator
+    agent's read side (``operator.unattached_dream``) calls it to find the dream, so the two never compute it apart."""
+    return spec["name"] == DREAM_NAME and role is not None and role.get("executor") == "dream"
+
+
 # rule 5: the words for "all", and the characters an entry may be made of and still name nothing in particular
 _ALL_WORDS = frozenset({"all", "everything", "any", "anything"})
 _ROOT_CHARS = frozenset("*?/\\.~")
@@ -245,7 +254,7 @@ def check_spec(spec: Mapping[str, Any], *, role: Mapping[str, Any] | None, defau
                                       "deadline is launched_at + stop_at)"))
 
     # the reserved name: ``dream`` belongs to the dream executor, registered by the dream's own path (``as_dream``)
-    if name == DREAM_NAME and not (as_dream and role is not None and role.get("executor") == "dream"):
+    if name == DREAM_NAME and not (as_dream and is_dream(spec, role)):
         out.append(Refusal("name", f"name {DREAM_NAME!r} is reserved for the dream executor: it is registered by "
                                    f"`levain dream enable`, never by an operator's registration"))
 

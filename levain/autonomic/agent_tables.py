@@ -1,6 +1,6 @@
 """levain.autonomic.agent_tables — the agent DDL, its triggers and the agent schema marker (A0 r7 §3.5, §3.7, §4.2).
 
-A leaf: stdlib ``sqlite3`` only. It holds the eight agent tables, one index and the ``BEFORE`` triggers of the
+A leaf: stdlib ``sqlite3`` only. It holds the ten agent tables, one index and the ``BEFORE`` triggers of the
 ``autonomic.db`` store, as ``AGENT_OBJECT_DDL``, and the checks over them:
 
 - :func:`create_agent_objects` runs the DDL and touches no other table (so a reference store needs no ``meta``);
@@ -17,14 +17,20 @@ import sqlite3
 
 __all__ = ["AGENT_SCHEMA", "AGENT_TABLES", "AGENT_TRIGGERS", "AGENT_OBJECT_DDL", "create_agent_objects",
            "ddl_agents", "agent_master", "reference_master", "has_agent_object", "agent_marker",
-           "check_agent_schema", "AGENT_SCHEMA_V2", "RESERVATION_COLUMNS_V3", "migrate_agent_schema",
-           "AgentSchemaNotMigrated"]
+           "check_agent_schema", "AGENT_SCHEMA_V2", "AGENT_SCHEMA_V3", "AGENT_SCHEMA_PREDECESSORS", "AGENT_DDL_V3",
+           "OPERATOR_DDL_V4", "RESERVATION_COLUMNS_V3", "migrate_agent_schema", "AgentSchemaNotMigrated",
+           "AgentSchemaRollbackFailed"]
 
 # /1 named A0 r6's twelve-trigger text (F0 r1, never merged); a store carrying it is refused as an unknown marker.
 # /2 shipped in 0.11.27. /3 adds the seven subscription-route columns to agent_reservations (P7-A §4) and is the first
-# marker with a migration: :func:`migrate_agent_schema` takes exactly a /2 store to /3 and nothing else.
+# marker with a migration. /4 adds the operator agent record and its attachments (K2a): two tables and six triggers.
+# :func:`migrate_agent_schema` takes a /2 or a /3 store to the current marker in ONE transaction and nothing else.
 AGENT_SCHEMA_V2 = "levain-agent-schema/2"
-AGENT_SCHEMA = "levain-agent-schema/3"
+AGENT_SCHEMA_V3 = "levain-agent-schema/3"
+AGENT_SCHEMA = "levain-agent-schema/4"
+
+# the markers an older levain wrote that this one migrates, oldest first; a store carrying one is not corrupt, it is old
+AGENT_SCHEMA_PREDECESSORS = (AGENT_SCHEMA_V2, AGENT_SCHEMA_V3)
 
 # the columns /3 appends to agent_reservations, in order, as (name, type). A fresh store's DDL ends with the same text
 # ``ALTER TABLE ... ADD COLUMN`` leaves in sqlite_master, so a migrated store and a fresh one compare equal.
@@ -33,15 +39,18 @@ RESERVATION_COLUMNS_V3 = (("billing", "TEXT"), ("cap_actions", "INTEGER"), ("cap
                           ("used_seconds", "INTEGER"))
 
 AGENT_TABLES = ("agent_settings", "agent_roles", "agents", "agent_specs", "agent_occurrences", "agent_bars",
-                "agent_slots", "agent_reservations")
+                "agent_slots", "agent_reservations", "agent_operator", "agent_attachments")
 
 AGENT_TRIGGERS = ("agent_occurrences_frozen", "agent_occurrences_identity", "agent_occurrences_launch_epoch",
                   "agent_occurrences_prelaunch", "agent_occurrences_launch_immutable", "agent_occurrences_insert",
                   "agent_occurrences_one_fire", "agent_occurrences_keep", "agent_specs_frozen", "agent_specs_keep",
                   "agent_bars_keep", "agent_bars_closed_frozen", "agent_occurrences_transition",
-                  "agent_occurrences_epoch", "agent_specs_no_replace", "agent_bars_no_replace", "agent_bars_identity")
+                  "agent_occurrences_epoch", "agent_specs_no_replace", "agent_bars_no_replace", "agent_bars_identity",
+                  "agent_operator_no_replace", "agent_operator_frozen", "agent_operator_keep",
+                  "agent_attachments_no_replace", "agent_attachments_frozen", "agent_attachments_keep")
 
-AGENT_OBJECT_DDL: tuple[str, ...] = (
+# the objects of a /3 store, unchanged text since /3 (a frozen copy of the /3 module pins it in the tests)
+AGENT_DDL_V3: tuple[str, ...] = (
     "CREATE TABLE IF NOT EXISTS agent_settings (key TEXT PRIMARY KEY, value TEXT NOT NULL)",
     "CREATE TABLE IF NOT EXISTS agent_roles (role_hash TEXT PRIMARY KEY, name TEXT NOT NULL, version INTEGER NOT NULL,"
     " spec TEXT NOT NULL, created_at TEXT NOT NULL, UNIQUE(name, version))",
@@ -144,6 +153,34 @@ AGENT_OBJECT_DDL: tuple[str, ...] = (
     " BEGIN SELECT RAISE(ABORT, 'bar identity is immutable'); END",
 )
 
+# K2a (agent schema /4): the operator agent record and the roles attached to it. The record is a one-slot table, so "one
+# agent per store" is the schema's, held by SQLite on every connection; an attachment ties a registered spec to the role
+# NAME it pins. Nothing here is read by a fire, a link, a binding or a recall: attaching confers nothing in 1.0.
+OPERATOR_DDL_V4: tuple[str, ...] = (
+    "CREATE TABLE IF NOT EXISTS agent_operator (slot INTEGER PRIMARY KEY CHECK (slot = 1),"
+    " record_id TEXT NOT NULL UNIQUE, created_at TEXT NOT NULL)",
+    "CREATE TABLE IF NOT EXISTS agent_attachments (agent_id TEXT PRIMARY KEY, role_name TEXT NOT NULL,"
+    " attached_at TEXT NOT NULL)",
+    "CREATE TRIGGER IF NOT EXISTS agent_operator_no_replace BEFORE INSERT ON agent_operator"
+    " WHEN EXISTS (SELECT 1 FROM agent_operator)"
+    " BEGIN SELECT RAISE(ABORT, 'one agent per agent store'); END",
+    "CREATE TRIGGER IF NOT EXISTS agent_operator_frozen BEFORE UPDATE ON agent_operator"
+    " BEGIN SELECT RAISE(ABORT, 'the operator agent record is immutable'); END",
+    "CREATE TRIGGER IF NOT EXISTS agent_operator_keep BEFORE DELETE ON agent_operator"
+    " BEGIN SELECT RAISE(ABORT, 'the operator agent record is never deleted'); END",
+    "CREATE TRIGGER IF NOT EXISTS agent_attachments_no_replace BEFORE INSERT ON agent_attachments"
+    " WHEN EXISTS (SELECT 1 FROM agent_attachments WHERE agent_id = NEW.agent_id)"
+    " OR NOT EXISTS (SELECT 1 FROM agent_operator)"
+    " OR NOT EXISTS (SELECT 1 FROM agents WHERE agent_id = NEW.agent_id)"
+    " BEGIN SELECT RAISE(ABORT, 'an attachment is written once, to the store''s agent, for a registered spec'); END",
+    "CREATE TRIGGER IF NOT EXISTS agent_attachments_frozen BEFORE UPDATE ON agent_attachments"
+    " BEGIN SELECT RAISE(ABORT, 'an attachment is immutable'); END",
+    "CREATE TRIGGER IF NOT EXISTS agent_attachments_keep BEFORE DELETE ON agent_attachments"
+    " BEGIN SELECT RAISE(ABORT, 'an attachment is never deleted'); END",
+)
+
+AGENT_OBJECT_DDL: tuple[str, ...] = AGENT_DDL_V3 + OPERATOR_DDL_V4
+
 _MasterRow = tuple[str, str, str, "str | None"]
 
 
@@ -162,7 +199,7 @@ def ddl_agents(conn: sqlite3.Connection) -> None:
 
 
 def agent_master(conn: sqlite3.Connection) -> list[_MasterRow]:
-    """The ``sqlite_master`` rows of every agent object: a row whose table is one of the eight agent tables or
+    """The ``sqlite_master`` rows of every agent object: a row whose table is one of the ten agent tables or
     whose name is in :data:`AGENT_TRIGGERS` (SQLite's own ``sqlite_autoindex_*`` rows of those tables count,
     with their NULL ``sql``)."""
     query = ("SELECT type, name, tbl_name, sql FROM sqlite_master WHERE tbl_name IN ({}) OR name IN ({}) "
@@ -213,61 +250,106 @@ def check_agent_schema(conn: sqlite3.Connection) -> str | None:
 
 
 class AgentSchemaNotMigrated(sqlite3.DatabaseError):
-    """A ``/2`` store that does not reach the ``/3`` reference by the migration (its agent objects were altered by
-    hand): nothing of the migration is kept and the store stays ``/2``, which ``levain agents`` then refuses."""
+    """A ``/2`` or ``/3`` store that does not reach the current reference by the migration (its agent objects were
+    altered by hand): nothing of the migration is kept and the store stays at the marker it started from, which
+    ``levain agents`` then refuses. The message names that starting marker."""
 
 
-_SAVEPOINT = "levain_agent_schema_v3"
+class AgentSchemaRollbackFailed(sqlite3.DatabaseError):
+    """A failed migration whose own undo (``ROLLBACK`` / ``ROLLBACK TO``) also failed: its writes may still be in the
+    caller's transaction. Deliberately NOT an :class:`AgentSchemaNotMigrated`, so the opener does not catch it and its
+    transaction is rolled back instead of committed. The original error is chained."""
+
+
+_SAVEPOINT = "levain_agent_schema_migrate"
+
+
+def _step_v2_to_v3(conn: sqlite3.Connection) -> None:
+    """The seven reservation columns. A column already present is skipped."""
+    have = {r[1] for r in conn.execute("PRAGMA table_info(agent_reservations)")}
+    if not have:
+        raise AgentSchemaNotMigrated("no agent_reservations table")
+    for name, kind in RESERVATION_COLUMNS_V3:
+        if name not in have:
+            conn.execute(f"ALTER TABLE agent_reservations ADD COLUMN {name} {kind}")
+
+
+def _step_v3_to_v4(conn: sqlite3.Connection) -> None:
+    """The operator record and attachment tables and their six triggers, from the SAME statements a fresh store runs, so
+    a migrated store and a fresh one compare equal. An object already there is kept, and the final check judges it."""
+    for stmt in OPERATOR_DDL_V4:
+        conn.execute(stmt)
+
+
+# the step that takes a store AT the key marker one marker on; the chain from a store's marker is every step from there
+_STEPS = ((AGENT_SCHEMA_V2, _step_v2_to_v3), (AGENT_SCHEMA_V3, _step_v3_to_v4))
+
+
+def _short(marker: str | None) -> str:
+    return "/" + marker.rsplit("/", 1)[-1] if marker else "unmarked"
 
 
 def migrate_agent_schema(conn: sqlite3.Connection) -> bool:
-    """Take a ``/2`` store to ``/3``: the seven reservation columns, then the marker, in ONE ``BEGIN IMMEDIATE``.
-    Returns True when it migrated, False when the store was not a ``/2`` store (no marker, already ``/3``, or any other
-    marker: all left untouched, so the caller's opener still refuses an unknown marker through
+    """Take a ``/2`` or ``/3`` store to the current marker: every step from the store's marker on (``/2 -> /3``: the
+    reservation columns; ``/3 -> /4``: the operator tables and triggers), then the marker, ONCE, in ONE ``BEGIN
+    IMMEDIATE``. Returns True when it migrated, False when the store was at neither (no marker, already current, or any
+    other marker: all left untouched, so the caller's opener still refuses an unknown marker through
     :func:`check_agent_schema`).
+
+    The marker is written after the last step and :func:`check_agent_schema` runs ONCE after it, against the CURRENT
+    reference. Checking after each hop would judge a store halfway along the chain against a reference it cannot yet
+    meet, and strand every ``/2`` store.
 
     Inside a caller's open transaction it joins it under a SAVEPOINT (the caller commits or rolls back the whole);
     otherwise it opens its own. On any failure its own writes are undone either way (the savepoint is rolled back to),
-    so a caller that catches the error and commits keeps no half-migrated or ``/3``-marked store. A column already
-    present is skipped, and the marker bump is the last write, so a second run, or one after a crash (which rolled the
-    whole transaction back), lands in the same place. After the writes the store must pass :func:`check_agent_schema`
-    against the ``/3`` reference; a ``/2`` store whose objects were altered by hand fails that (or has no
-    ``agent_reservations`` table to alter), nothing is kept, and :class:`AgentSchemaNotMigrated` is raised with the
-    reason."""
+    so a caller that catches the error and commits keeps no half-migrated or newly marked store. A second run, or one
+    after a crash (which rolled the whole transaction back), lands in the same place. A store whose objects were
+    altered by hand fails the check (or lacks a table a step alters), nothing is kept, and
+    :class:`AgentSchemaNotMigrated` is raised naming the marker the store started from and the reason. When the undo
+    itself fails, :class:`AgentSchemaRollbackFailed` is raised instead (not a subclass: a caller that catches the first
+    and commits must not catch this one; its transaction has to be rolled back)."""
     own = not conn.in_transaction
     conn.execute("BEGIN IMMEDIATE" if own else f"SAVEPOINT {_SAVEPOINT}")
     open_ = True    # the transaction (own) or the savepoint (joined) this call began and has not yet ended
+    start = None
     try:
-        if agent_marker(conn) != AGENT_SCHEMA_V2:
+        start = agent_marker(conn)
+        markers = [m for m, _ in _STEPS]
+        chain = [step for _, step in _STEPS[markers.index(start):]] if start in markers else []
+        if not chain:
             conn.execute("ROLLBACK" if own else f"RELEASE {_SAVEPOINT}")
             open_ = False
             return False
-        have = {r[1] for r in conn.execute("PRAGMA table_info(agent_reservations)")}
-        if not have:
-            raise AgentSchemaNotMigrated("the /2 agent schema did not migrate cleanly: no agent_reservations table")
-        for name, kind in RESERVATION_COLUMNS_V3:
-            if name not in have:
-                conn.execute(f"ALTER TABLE agent_reservations ADD COLUMN {name} {kind}")
-        conn.execute("UPDATE meta SET value = ? WHERE key = 'agent_schema' AND value = ?",
-                     (AGENT_SCHEMA, AGENT_SCHEMA_V2))
+        for step in chain:
+            step(conn)
+        conn.execute("UPDATE meta SET value = ? WHERE key = 'agent_schema' AND value = ?", (AGENT_SCHEMA, start))
         reason = check_agent_schema(conn)
         if reason is not None:
-            raise AgentSchemaNotMigrated(f"the /2 agent schema did not migrate cleanly: {reason}")
+            raise AgentSchemaNotMigrated(reason)
         conn.execute("COMMIT" if own else f"RELEASE {_SAVEPOINT}")
         open_ = False
         return True
     except BaseException as err:
-        # best-effort teardown: a failing ROLLBACK / RELEASE ("no such savepoint") must not replace the real error
         if open_ and conn.in_transaction:
+            # the undo. If it fails, this call's writes may still be in the transaction, and the catchable
+            # AgentSchemaNotMigrated would let a caller that catches it COMMIT them (the opener does): a store marked
+            # current whose objects were never validated. So that failure raises AgentSchemaRollbackFailed, which no
+            # caller catches, and the caller's transaction is rolled back.
             try:
-                if own:
-                    conn.execute("ROLLBACK")
-                else:
-                    conn.execute(f"ROLLBACK TO {_SAVEPOINT}")
+                conn.execute("ROLLBACK" if own else f"ROLLBACK TO {_SAVEPOINT}")
+            except sqlite3.Error as undo:
+                raise AgentSchemaRollbackFailed(
+                    f"the {_short(start)} agent schema did not migrate cleanly and its writes could not be undone "
+                    f"({undo}); the transaction must be rolled back: {err}") from err
+            if not own:
+                # the writes are undone; a RELEASE that fails ("no such savepoint") leaves nothing of them to keep, and
+                # must not replace the real error
+                try:
                     conn.execute(f"RELEASE {_SAVEPOINT}")
-            except sqlite3.Error:
-                pass
-        if isinstance(err, sqlite3.Error) and not isinstance(err, AgentSchemaNotMigrated):
-            # one error class for the opener to catch; the store is left /2 and the cause is chained
-            raise AgentSchemaNotMigrated(f"the /2 agent schema did not migrate cleanly: {err}") from err
+                except sqlite3.Error:
+                    pass
+        if isinstance(err, sqlite3.Error):
+            # one error class for the opener to catch; the store is left at its starting marker and the cause is chained
+            named = f"the {_short(start)} agent schema did not migrate cleanly: "
+            raise AgentSchemaNotMigrated(named + str(err)) from err
         raise

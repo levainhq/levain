@@ -274,6 +274,30 @@ def test_cli_verbs_round_trip(tmp_path, capsys):
     assert main([*d, "list"]) == 0 and capsys.readouterr().out == ""            # --warn stored nothing
 
 
+@pytest.mark.parametrize("verb", [["agent"], ["attach", "job_push_check"], ["list"], ["show", "job_push_check"],
+                                  ["pause", "job_push_check"], ["zone"]])
+def test_a_post_open_marker_refusal_is_said_with_exit_1_never_a_traceback(store, monkeypatch, capsys, verb):
+    """fixk2 (L3 k2 r1, codex MED): the open succeeds at /4, another process moves the marker, and the verb's own
+    transaction raises AgentStoreRefused, which no post-open handler caught: it escaped as a traceback."""
+    import levain.agents.cli as agents_cli
+
+    reg(store, "job_push_check")
+    real_open = agents_cli.open_agent_store
+
+    def open_then_move(store_dir):
+        opened = real_open(store_dir)
+        c = sqlite3.connect(opened.path, isolation_level=None)
+        c.execute("UPDATE meta SET value = 'levain-agent-schema/5' WHERE key = 'agent_schema'")
+        c.close()
+        return opened
+
+    monkeypatch.setattr(agents_cli, "open_agent_store", open_then_move)
+    capsys.readouterr()
+    assert main(["agents", "--store-dir", str(store.directory), *verb]) == 1
+    err = capsys.readouterr().err
+    assert "unknown agent schema marker 'levain-agent-schema/5'" in err and "Traceback" not in err
+
+
 # ---- L3 round 1 -----------------------------------------------------------------------------------------------
 def test_a_retired_id_acts_on_itself_never_on_the_live_successor_or_its_group(store, capsys):
     old, *_ = reg(store, "job_push_check")
@@ -363,3 +387,86 @@ def test_an_invalid_stored_default_zone_is_refused_naming_the_verb(store, tmp_pa
     assert "levain agents zone" in capsys.readouterr().err
     with pytest.raises(SpecError, match="levain agents zone"):
         finalize_spec(spec("job_sync_check", trigger={"kind": "schedule", "cron": "0 7 * * *"}), "Mars/Olympus")
+
+
+# ---- K2b: `levain agents agent` (the one operator agent) and `levain agents attach` ------------------------------------
+
+def _k2b_store(tmp_path):
+    from levain.agents.store import set_default_zone
+
+    s = open_agent_store(tmp_path / "store")
+    set_default_zone(s, ZONE)
+    return s
+
+
+def _k2b_spec(s, name, *, kind=None):
+    role = {"name": f"{name}-role", "brief": {"template": "run", "slots": {}}, "ceiling": {"lands": ["data"]},
+            "model": "", "harness": "", "executor": "dream"}
+    if kind:
+        role["kind"] = kind
+    digest = add_role(s, role)[1]
+    raw = copy.deepcopy(SPECS["job_push_check"])
+    raw["name"], raw["role"] = name, {"name": role["name"], "role_hash": digest}
+    return register_spec(s, parse_spec(raw), ZONE)[0]
+
+
+def test_the_agent_verb_says_there_is_no_operator_agent_yet_and_attach_makes_it(tmp_path, capsys):
+    s = _k2b_store(tmp_path)
+    d = ["agents", "--store-dir", str(s.directory)]
+    assert main([*d, "agent"]) == 0
+    assert "no operator agent" in capsys.readouterr().out
+    a = _k2b_spec(s, "partner-a")
+    assert main([*d, "attach", "partner-a"]) == 0
+    out = capsys.readouterr().out
+    assert "partner-a" in out and a in out and "role partner-a-role" in out and "oa-" in out
+    assert main([*d, "attach", a]) == 0                                   # by id too; already attached
+    assert "(already)" in capsys.readouterr().out
+    assert main([*d, "agent"]) == 0
+    shown = capsys.readouterr().out
+    assert "operator agent oa-" in shown and "partner-a" in shown and a in shown
+    assert main([*d, "agent", "--json"]) == 0
+    doc = json.loads(capsys.readouterr().out)
+    assert doc["agent"]["record_id"].startswith("oa-") and [r["name"] for r in doc["agent"]["roles"]] == ["partner-a"]
+    assert doc["dream_unattached"] is None
+
+
+def test_attach_refuses_a_job_an_unknown_name_and_a_retired_spec_with_exit_1(tmp_path, capsys):
+    s = _k2b_store(tmp_path)
+    d = ["agents", "--store-dir", str(s.directory)]
+    _k2b_spec(s, "worker", kind="job")
+    assert main([*d, "attach", "worker"]) == 1
+    assert "a job is not attached to the agent" in capsys.readouterr().err
+    assert main([*d, "attach", "nobody"]) == 1 and "no agent" in capsys.readouterr().err
+    _k2b_spec(s, "gone")
+    assert main([*d, "retire", "gone"]) == 0
+    capsys.readouterr()
+    assert main([*d, "attach", "gone"]) == 1                              # a retired name is no live agent
+    assert main([*d, "agent"]) == 0 and "no operator agent" in capsys.readouterr().out   # and nothing was created
+
+
+def test_the_agent_verb_reports_an_unattached_dream_as_a_fact_and_a_corrupt_attachment_as_a_refusal(tmp_path, capsys):
+    from levain.dream import agent as da
+
+    s = _k2b_store(tmp_path)
+    d = ["agents", "--store-dir", str(s.directory)]
+    role = da.dream_role()
+    from levain.agents.role import parse_role
+    add_role(s, parse_role(role))
+    register_spec(s, parse_spec(da.dream_spec(role_hash(parse_role(role)))), ZONE)       # as before K2b: unattached
+    assert main([*d, "agent"]) == 0
+    out = capsys.readouterr().out
+    assert "not attached" in out and "levain dream enable" in out
+    assert main([*d, "agent", "--json"]) == 0 and json.loads(capsys.readouterr().out)["dream_unattached"].startswith("ag-")
+    assert main(["dream", "enable", "--agent-store-dir", str(s.directory)]) == 0
+    capsys.readouterr()
+    assert main([*d, "agent"]) == 0
+    healed = capsys.readouterr().out
+    assert "dream" in healed and "not attached" not in healed
+    conn = sqlite3.connect(s.path, isolation_level=None)
+    sql = conn.execute("SELECT sql FROM sqlite_master WHERE name = 'agent_attachments_frozen'").fetchone()[0]
+    conn.execute("DROP TRIGGER agent_attachments_frozen")
+    conn.execute("UPDATE agent_attachments SET role_name = 'impostor'")
+    conn.execute(sql)
+    conn.close()
+    assert main([*d, "agent"]) == 1
+    assert "impostor" in capsys.readouterr().err

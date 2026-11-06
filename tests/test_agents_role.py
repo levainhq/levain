@@ -120,14 +120,20 @@ def test_kind_other_than_job_or_role_is_refused_naming_the_field(value, needle):
     assert needle in str(exc.value) and "unknown field" not in str(exc.value)
 
 
-def test_kind_agent_is_refused_naming_the_pending_ruling_not_accepted_as_an_inert_value():
+AGENT_KIND_WORDS = ("`agent` is not a role kind: the one agent is materialised by the registry from the store's "
+                    "operator record, and roles attach to it (`levain agents attach`)")
+
+
+def test_kind_agent_is_refused_saying_the_agent_is_derived_not_accepted_as_an_inert_value():
     with pytest.raises(RoleError) as exc:
         parse_role(dict(ROLE, kind="agent"))
     msg = str(exc.value)
-    assert "'kind'" in msg and "agent" in msg and "ruling" in msg
-    with pytest.raises(RoleError, match="ruling"):
+    assert "'kind'" in msg and AGENT_KIND_WORDS in msg
+    # the ruling is answered (np-4e087a4f (b)): the refusal no longer says a ruling is pending
+    assert "ruling" not in msg and "pending" not in msg
+    with pytest.raises(RoleError, match="operator record"):
         parse_role_text(json.dumps(dict(ROLE, kind="agent")))
-    with pytest.raises(RoleError, match="ruling"):
+    with pytest.raises(RoleError, match="operator record"):
         role_hash(dict(ROLE, kind="agent"))
 
 
@@ -174,10 +180,10 @@ def test_role_show_prints_the_kind_and_role_when_absent(tmp_path, capsys):
     assert first == f"role chore v1 {role_hash(dict(ROLE, name='chore', kind='job'))} kind=job"
 
 
-def test_role_add_of_kind_agent_exits_1_naming_the_ruling(tmp_path, capsys):
+def test_role_add_of_kind_agent_exits_1_saying_the_agent_is_derived(tmp_path, capsys):
     assert _run(tmp_path, "role", "add", str(_file(tmp_path, dict(ROLE, kind="agent")))) == 1
     err = capsys.readouterr().err
-    assert "'kind'" in err and "ruling" in err
+    assert "'kind'" in err and AGENT_KIND_WORDS in err and "ruling" not in err
     assert _run(tmp_path, "role", "add", str(_file(tmp_path, dict(ROLE, kind="role")))) == 0
 
 

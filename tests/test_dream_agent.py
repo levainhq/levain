@@ -73,6 +73,30 @@ def test_register_is_idempotent_and_the_stored_spec_is_the_template(astore):
     assert role_mod.role_by_hash(astore, first.role_hash)["executor"] == "dream"
 
 
+def test_register_dream_attaches_the_dream_to_the_stores_one_operator_agent(astore):
+    # K2b: the dream is a role the one agent uses; a registration makes the record and the attachment together
+    from levain.agents import operator as op
+
+    with astore.read() as conn:
+        assert op.materialise(conn, install_dir=None) is None
+    reg = da.register_dream(astore)
+    with astore.read() as conn:
+        agent = op.materialise(conn, install_dir=None)
+    assert [(r.agent_id, r.role_name) for r in agent.roles] == [(reg.agent_id, "dream")]
+    da.register_dream(astore)                                   # the same content again: still one record, one row
+    with astore.read() as conn:
+        assert conn.execute("SELECT COUNT(*) FROM agent_operator").fetchone()[0] == 1
+        assert conn.execute("SELECT COUNT(*) FROM agent_attachments").fetchone()[0] == 1
+
+
+def test_a_refused_dream_registration_writes_no_operator_record(tmp_path):
+    bare = agent_store.open_agent_store(tmp_path / "bare")
+    with pytest.raises(da.EnableRefused):
+        da.register_dream(bare)
+    with bare.read() as conn:
+        assert conn.execute("SELECT COUNT(*) FROM agent_operator").fetchone()[0] == 0
+
+
 def test_an_install_with_no_default_zone_refuses_and_names_the_verb(tmp_path):
     bare = agent_store.open_agent_store(tmp_path / "bare")
     with pytest.raises(da.EnableRefused, match="levain agents zone"):
