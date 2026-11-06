@@ -30,7 +30,7 @@ import stat
 import subprocess
 import sys
 import unicodedata
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -51,7 +51,7 @@ __all__ = ["AnswerClass", "DESK_FORMAT", "DESK_NAMESPACE", "DESK_SCOPE_FIELDS", 
            "build_desk_message", "build_message", "create", "default_desk_signer_factory", "default_signer_factory",
            "desk_origin", "desk_surface",
            "enroll_command", "event_time", "find_key", "fresh", "is_remote", "parse_desk_verified", "parse_verified",
-           "session_refusal", "sign", "status", "target_id", "verify"]
+           "remote_reason", "session_refusal", "sign", "status", "target_id", "verify"]
 
 FORMAT = "levain-terminal-answer/1"
 NAMESPACE = "levain-terminal-answer"
@@ -695,11 +695,147 @@ def default_desk_signer_factory(key_path: Path, timeout: float | None = None) ->
     return _keys.ssh_signer(key_path, namespace=DESK_NAMESPACE, timeout=timeout)
 
 
+# --- where the desk is remote ------------------------------------------------------------------------------
+#
+# ONE detector, three legs, all routing and never evidence (a false "local" costs a prompt nobody touches, which
+# times out; a false "remote" costs one phone signature). Every leg fails to "not remote": a ``ps`` that is missing,
+# slow or unparseable is the status quo, never an exception. Edge notes:
+#   - a client attached by NAME (``claude attach <part of the name>``) carries no session id in its argv: not seen;
+#   - two clients on one desk: the session reads remote if ANY attach client is remote;
+#   - a process title is read as ``ps`` prints it, so a build that stops rewriting the sshd title is not seen.
+
+_SSH_ENV_NAMES = ("SSH_CONNECTION", "SSH_TTY", "SSH_CLIENT")    # exact names; SSH_AUTH_SOCK, P9K_SSH are not signals
+REMOTE_PROCESSES = ("sshd", "sshd-session", "mosh-server")     # an ancestor with one of these as argv[0] is remote
+SESSION_ID_ENV = "CLAUDE_CODE_SESSION_ID"
+ATTACH_ID_MIN = 8                  # an attach client is matched by at least this many leading characters of the id
+_PS_TIMEOUT_S = 2.0
+_FALLBACK_HOPS = 8                 # used only when the ancestry walker's own cap cannot be read
+
+
+def _remote_process_name(args: Sequence[str]) -> str | None:
+    """The name in :data:`REMOTE_PROCESSES` that ``args[0]``'s basename is, or ``None``. ``ps`` prints a daemon that
+    rewrites its title with a trailing colon (``sshd-session: user@ttys004``), so one trailing colon is dropped; the
+    match is then exact, never a prefix or a substring."""
+    if not args:
+        return None
+    name = os.path.basename(args[0])
+    name = name[:-1] if name.endswith(":") else name
+    return name if name in REMOTE_PROCESSES else None
+
+
+def _ancestor_commands() -> Iterable[list[str]]:
+    """This process's ancestors' command lines, nearest first: the one walker in :mod:`levain.consent.band`
+    (``_ancestors``, ``ps -o args=``, its own hop cap). A tests' seam; an unreadable ancestry is an empty list."""
+    try:
+        from levain.consent import band
+
+        return (list(args) for _pid, args in band._ancestors())      # lazy: the caller stops at the first match
+    except Exception:  # noqa: BLE001 - routing never raises; no ancestry reads as local
+        return iter(())
+
+
+def _ps_rows() -> str | None:
+    """``ps -Ao pid,ppid,tty,command`` as text, or ``None`` when it cannot be had. The one place the attach leg runs
+    ``ps``, and a tests' seam."""
+    try:
+        done = subprocess.run(["ps", "-ww", "-Ao", "pid,ppid,tty,command"], capture_output=True, text=True,
+                              timeout=_PS_TIMEOUT_S, stdin=subprocess.DEVNULL,
+                              env={"PATH": "/bin:/usr/bin", "LC_ALL": "C"})
+    except (OSError, subprocess.SubprocessError, ValueError):
+        return None
+    return done.stdout if done.returncode == 0 else None
+
+
+def _ps_table(text: str) -> dict[int, tuple[int, list[str]]]:
+    """``pid -> (ppid, argv)`` for every row of ``ps`` text that parses; a row that does not is skipped."""
+    table: dict[int, tuple[int, list[str]]] = {}
+    for line in text.splitlines():
+        parts = line.split(None, 3)
+        if len(parts) < 4:
+            continue
+        try:
+            pid, ppid = int(parts[0]), int(parts[1])
+        except ValueError:
+            continue
+        try:
+            args = shlex.split(parts[3])
+        except ValueError:
+            args = parts[3].split()
+        table[pid] = (ppid, args)
+    return table
+
+
+def _attach_remote_reason(session_id: str) -> str | None:
+    """The reason the desk named ``session_id`` is remote because some ``claude attach <id>`` client of it sits in
+    an sshd or mosh-server ancestry, or ``None``. ``<id>`` is a prefix of the session id of at least
+    :data:`ATTACH_ID_MIN` characters; the client's ancestry is walked in the SAME ``ps`` table (no second
+    ``ps``), at the ancestry walker's hop cap."""
+    if len(session_id) < ATTACH_ID_MIN:
+        return None
+    text = _ps_rows()
+    if not text:
+        return None
+    table = _ps_table(text)
+    try:
+        from levain.consent import band
+
+        hops = int(band._HOPS)
+    except Exception:  # noqa: BLE001
+        hops = _FALLBACK_HOPS
+    for pid, (ppid, args) in table.items():
+        if len(args) < 3 or os.path.basename(args[0]) != "claude" or args[1] != "attach":
+            continue
+        ident = next((a for a in args[2:] if not a.startswith("-")), "")
+        if len(ident) < ATTACH_ID_MIN or not session_id.startswith(ident):
+            continue
+        cur, seen = ppid, 0
+        while cur > 1 and seen < hops and cur in table:
+            parent, cargs = table[cur]
+            name = _remote_process_name(cargs)
+            if name is not None:
+                return f"attach client {ident[:ATTACH_ID_MIN]} reached from {name}"
+            cur, seen = parent, seen + 1
+    return None
+
+
+def remote_reason(env: Mapping[str, str] | None = None, presence: str | None = None,
+                  session_id: str | None = None) -> str | None:
+    """Routing only (never evidence): why this desk is remote, in a few words that name the leg, or ``None``.
+    Remote when ANY of: the presence says so; ``env`` holds ``SSH_CONNECTION``, ``SSH_TTY`` or ``SSH_CLIENT``
+    (:data:`_SSH_ENV_NAMES`, exact names); an ancestor of this process is ``sshd``, ``sshd-session`` or
+    ``mosh-server`` (a scrubbed environment, a mosh session); or ``env`` names the desk's session
+    (:data:`SESSION_ID_ENV`) and a ``claude attach`` client of it was reached from one of those. Never raises: a
+    leg that fails reads as local. ``env`` is the hook's environment, or ``os.environ`` when ``None``; the ancestry
+    is always this process's own."""
+    try:
+        env = os.environ if env is None else env
+        if presence and "remote" in presence.lower():
+            return "presence says remote"
+        for name in _SSH_ENV_NAMES:
+            if env.get(name):
+                return f"env {name}"
+    except Exception:  # noqa: BLE001
+        return None
+    try:
+        for args in _ancestor_commands():
+            name = _remote_process_name(args)
+            if name is not None:
+                return f"ancestor process {name}"
+    except Exception:  # noqa: BLE001
+        pass
+    try:
+        sid = session_id if isinstance(session_id, str) and session_id else env.get(SESSION_ID_ENV) or ""
+        if isinstance(sid, str) and sid:
+            return _attach_remote_reason(sid)
+    except Exception:  # noqa: BLE001
+        pass
+    return None
+
+
 def is_remote(env: Mapping[str, str] | None = None, presence: str | None = None) -> bool:
-    """Routing only (never evidence): the desk is remote when the presence says so or the hook runs in an ssh
-    session. A false "local" costs a prompt nobody touches, which times out."""
-    env = os.environ if env is None else env
-    return bool(presence and "remote" in presence.lower()) or bool(env.get("SSH_CONNECTION") or env.get("SSH_TTY"))
+    """:func:`remote_reason` is not ``None``: routing only (never evidence). Called with no argument it reads
+    ``os.environ`` and this process's own ancestry, which is how flow's band hook calls it."""
+    return remote_reason(env, presence) is not None
 
 
 def _classify(exc: KeyError_) -> tuple[str, str]:
@@ -716,17 +852,19 @@ def _classify(exc: KeyError_) -> tuple[str, str]:
 
 
 def sign(message: bytes, *, key: TerminalKey | None = None, key_dir: Path | None = None,
-         signer_factory: SignerFactory | None = None, remote: bool = False,
+         signer_factory: SignerFactory | None = None, remote: bool = False, remote_why: str | None = None,
          bound_s: float = SIGN_BOUND_S) -> SignOutcome:
     """Sign ``message`` with the terminal key, or say exactly why not (:data:`REASONS`); never raises (an
     unexpected failure is ``signer-error``). ``remote`` routes to ``unsigned/remote`` before any key is looked
-    at, so no prompt reaches an unattended screen.
+    at, so no prompt reaches an unattended screen; ``remote_why`` (from :func:`remote_reason`) is named in the
+    outcome's detail so a log can tell which leg fired.
 
     ``bound_s`` goes to the signer factory, which hands it to the signer as its own per-call timeout, so one
     ``subprocess.run`` timeout ends the ssh-keygen child (and with it the Touch ID sheet) and no process-wide
     value is touched."""
     if remote:
-        return SignOutcome("unsigned", "remote", "the desk is remote")
+        return SignOutcome("unsigned", "remote",
+                           f"the desk is remote ({remote_why})" if remote_why else "the desk is remote")
     if not isinstance(message, (bytes, bytearray)) or len(message) > MAX_BYTES:
         return SignOutcome("unsigned", "signer-error", "message over the size bound")
     try:

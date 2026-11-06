@@ -6960,7 +6960,7 @@
     : Math.max(g && g.answered && Number.isInteger(g.answered.refused_count) ? g.answered.refused_count : 0,
                grantRefusedShown(g)));
   // the speech providers' names as levain.voice.providers.NAMES spells them; a provider not listed shows as it is written
-  const VOICE_PROVIDER_NAMES = { openai: "OpenAI", deepgram: "Deepgram" };
+  const VOICE_PROVIDER_NAMES = { openai: "OpenAI", deepgram: "Deepgram", inworld: "Inworld" };
   function grantCard(g, inertNote, signList) {
     const sv = (x) => (typeof x === "string" ? x : "");
     const state = sv(g.state);

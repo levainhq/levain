@@ -52,6 +52,26 @@ Facts about the providers, and where each comes from (the design is ``project_me
   touch transcription). No Deepgram call has been made with a real key (the slice's named residue). Deepgram bills Aura-2
   as one family, so :attr:`DeepgramProvider.tts_model` is the priced family (``aura-2``) and the voice sent as Deepgram's
   ``model`` must be one of that family's voices.
+* Inworld speech, read from Inworld's pages on 2026-11-05 (the OpenAI-shaped route
+  https://docs.inworld.ai/tts/openai-compatibility.md and its reference
+  https://docs.inworld.ai/api-reference/ttsAPI/texttospeech/create-speech.md, the models
+  https://docs.inworld.ai/tts/tts-models.md, the key header https://docs.inworld.ai/portal/api-key-auth.md): ``POST
+  https://api.inworld.ai/v1/audio/speech`` with an OpenAI-shaped JSON body (``model``, ``input``, ``voice``,
+  ``response_format``, ``speed``) and raw audio back, mp3 by default and asked for by name. The key goes in ``Authorization``;
+  the route page says ``Bearer`` (what the OpenAI SDKs send) and that ``Basic`` is also accepted, the key page says ``Basic``
+  for a direct request and that the same key also works as ``Bearer`` on inference endpoints, so both forms are documented
+  for this route and :data:`INWORLD_AUTH_SCHEME` is the one word that picks (UNVERIFIED against a live call). ``model`` and
+  ``voice`` must be Inworld ids ("OpenAI model names such as ``tts-1`` return ``400``", "OpenAI voice names such as ``alloy``
+  return ``404``"; voice ids are case-sensitive). The Flash model is ``inworld-tts-2-flash``. ``input`` is "up to
+  **4,000 characters**" (:data:`INWORLD_INPUT_CAP`) and ``speed`` runs 0.5 to 1.5; a text or a speed outside either is refused
+  here before sending. No page lists the built-in voices without an account (the list is the authenticated ``GET
+  /tts/v1/voices``), so :data:`INWORLD_TTS_VOICES` holds only the ids a page prints. The documented errors are 400 (a bad
+  parameter), 401 and 403 (the key), 402 (``insufficient_quota``: no credits), 404 (the voice), 429 (``rate_limit_error``,
+  a rate or a concurrency limit), 5xx; they are mapped by status alone (:func:`_code_for`; a 429 body is read only for the
+  OpenAI-format codes, so a body of any other shape is a rate limit), and no spend-limit 429 is documented. The pages do not state the response
+  content type, so the adapter checks only that a 2xx body is not empty, as the others do. Inworld's speech-to-text is not
+  built (premium dictation is off in Levain 1.0). No Inworld call has been made with a real key (the slice's named
+  residue).
 * ElevenLabs is not built in this slice.
 
 No claim above about a provider's behaviour is tested against the provider: the fixtures under ``tests/fixtures/voice``
@@ -73,7 +93,7 @@ from typing import Any
 
 from levain.voice.text import API_CAP, CHUNK
 
-HOSTS = {"openai": "api.openai.com", "deepgram": "api.deepgram.com"}
+HOSTS = {"openai": "api.openai.com", "deepgram": "api.deepgram.com", "inworld": "api.inworld.ai"}
 ALLOWED_HOSTS = frozenset(HOSTS.values())
 
 OPENAI_TTS_MODEL = "tts-1"                      # DATA: announced to shut down 2027-01-06 (module docstring)
@@ -99,6 +119,20 @@ DEEPGRAM_TTS_VOICES = (
     "aura-2-zeus-en",
 )
 DEEPGRAM_STT_MODEL = "nova-3"
+INWORLD_TTS_MODEL = "inworld-tts-2-flash"       # the priced model (levain.voice.meter.DEFAULT_PRICES); the Flash tier
+INWORLD_AUTH_SCHEME = "Bearer"                  # "Basic" is the other documented form for the same key (module docstring)
+# The built-in voice ids a page of Inworld's docs prints (Dennis: the route page's example; Alex, Ashley and Dennis: the list
+# voices reference's example response; Ashley: the quickstart's), sorted and case as printed. The full list of built-in voices
+# is behind the authenticated list-voices call, so a voice Inworld has and no page names is not OFFERED here until it is read
+# from an account and added to this tuple; the adapter accepts any well-formed id (a custom voice id is one).
+INWORLD_TTS_VOICES = ("Alex", "Ashley", "Dennis")
+INWORLD_TTS_VOICE = "Dennis"                    # one of INWORLD_TTS_VOICES
+# "The text to synthesize, up to 4,000 characters" (the route page and the reference above, read 2026-11-05). The route
+# pages leave the unit unstated; the streaming reference counts input and billing in UTF-16 code units, so the cap and the
+# meter use :func:`inworld_units` (UNVERIFIED against a live call on THIS route); a text Inworld counts as longer is
+# answered 400, which maps to ``rejected``, so a wrong unit still fails closed.
+INWORLD_INPUT_CAP = 4000
+INWORLD_SPEED_MIN, INWORLD_SPEED_MAX = 0.5, 1.5     # "Values outside 0.5 to 1.5 are rejected" (the reference above)
 OPENAI_INPUT_CAP = API_CAP                      # OpenAI's speech input limit, the number the cap was first written for
 # Aura-2 and Aura-1: the table "Max Characters" on https://developers.deepgram.com/docs/text-to-speech (read 2026-11-05).
 # The unit those pages name is "characters"; whether Deepgram counts code points, bytes or UTF-16 units was not read from
@@ -133,7 +167,7 @@ WORDS = {
     "unavailable": "{p} did not answer. Nothing was charged that Levain knows of.",
     "rejected": "{p} could not use that request.",
 }
-NAMES = {"openai": "OpenAI", "deepgram": "Deepgram"}
+NAMES = {"openai": "OpenAI", "deepgram": "Deepgram", "inworld": "Inworld"}
 
 
 class VoiceError(Exception):
@@ -328,6 +362,13 @@ def _send(transport: Transport, provider: str, key: _Key, scheme: str, url: str,
     return answer
 
 
+def inworld_units(text: str) -> int:
+    """``text`` in UTF-16 code units, the unit Inworld counts its input limit and its billing in (a character outside the
+    Basic Multilingual Plane, an emoji, is two): https://docs.inworld.ai/api-reference/ttsAPI/texttospeech/synthesize-speech-stream
+    (read by the L3 inworld r1 codex seat, 2026-11-05). A lone surrogate counts as one."""
+    return len(text.encode("utf-16-le", "surrogatepass")) // 2
+
+
 def _need_speech(text: str, speed: float, cap: int = API_CAP,
                  speed_range: tuple[float, float] = (SPEED_MIN, SPEED_MAX)) -> None:
     if not isinstance(text, str) or not text.strip():
@@ -469,6 +510,36 @@ class DeepgramProvider:
         return _text_of(answer, self.name, lambda j: j["results"]["channels"][0]["alternatives"][0]["transcript"])
 
 
+@dataclass(frozen=True)
+class InworldProvider:
+    """Inworld speech (mp3) through its OpenAI-shaped route. Speech only: ``uses`` has no ``stt`` and there is no
+    ``transcribe``. ``tts_model`` is data, see the module docstring."""
+
+    transport: Transport = field(default=urllib_transport, repr=False)
+    tts_model: str = INWORLD_TTS_MODEL
+    name: str = "inworld"
+    uses: frozenset[str] = frozenset({"tts"})
+
+    def speak(self, key: str, text: str, voice: str = INWORLD_TTS_VOICE, speed: float = 1.0) -> bytes:
+        """mp3 bytes for ``text`` (at most :data:`INWORLD_INPUT_CAP` UTF-16 code units, see :func:`inworld_units`) in ``voice`` at ``speed`` (0.5 to 1.5).
+        ``voice`` is any well-formed id; which are OFFERED is the cockpit's list (:data:`INWORLD_TTS_VOICES`), checked by
+        its route. The key is sent in the ``Authorization`` header only."""
+        secret = _Key(key)
+        del key                                             # from here only the emptied-on-exit _Key names it
+        with secret:
+            _need_speech(text, speed, INWORLD_INPUT_CAP, (INWORLD_SPEED_MIN, INWORLD_SPEED_MAX))
+            if inworld_units(text) > INWORLD_INPUT_CAP:
+                raise ValueError("text is over the provider's input cap; chunk it first")
+            body = json.dumps({"model": self.tts_model, "input": text, "voice": _need_voice(voice), "speed": speed,
+                               "response_format": "mp3"}).encode("utf-8")
+            audio = _send(self.transport, self.name, secret, INWORLD_AUTH_SCHEME,
+                          f"https://{HOSTS['inworld']}/v1/audio/speech",
+                          {"Content-Type": "application/json", "Accept": "audio/mpeg"}, body)
+        if not audio:
+            raise VoiceError("unavailable", self.name)      # a 200 with no audio is not an answer
+        return audio
+
+
 def _text_of(body: bytes, provider: str, pick: Callable[[dict], object]) -> str:
     """The transcript out of a 2xx JSON body. A body that is not the documented shape is ``unavailable``, never echoed."""
     ok = False
@@ -483,11 +554,13 @@ def _text_of(body: bytes, provider: str, pick: Callable[[dict], object]) -> str:
     return str(text).strip()
 
 
-def provider_for(name: str, transport: Transport = urllib_transport) -> OpenAIProvider | DeepgramProvider:
+def provider_for(name: str, transport: Transport = urllib_transport) -> OpenAIProvider | DeepgramProvider | InworldProvider:
     """The adapter for ``name`` (a key of :data:`HOSTS`); a ValueError for any other, so an unknown provider can never be
     reached."""
     if name == "openai":
         return OpenAIProvider(transport=transport)
     if name == "deepgram":
         return DeepgramProvider(transport=transport)
+    if name == "inworld":
+        return InworldProvider(transport=transport)
     raise ValueError("unknown voice provider")

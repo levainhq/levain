@@ -741,6 +741,25 @@ def test_cli_add_list_revoke_end_to_end_and_the_value_is_never_printed(ck, sec, 
     assert cli("list")[1].strip() == "no voice keys"
 
 
+def test_cli_add_takes_inworld_and_its_key_reads_back_by_provider(ck, sec, cli):
+    """Inworld is a voice key provider: the CLI's choices and the record's validation both come from
+    ``VOICE_KEY_PROVIDERS``. Red with: ``"inworld"`` dropped from that tuple (the parser refuses it, argparse exit 2)."""
+    code, out, err = cli("add", "inworld", "--use", "tts", "--yes", "--signing-key", str(ck.key))
+    assert code == 0, err
+    assert VALUE not in out + err
+    assert read(ck, sec, provider="inworld") == VALUE
+    assert cli("list")[1].split()[1] == "inworld"
+    with pytest.raises(VoiceKeyUnavailable):                           # a key for one provider reads for no other
+        read(ck, sec, provider="openai")
+
+
+def test_every_provider_the_cockpit_serves_or_names_has_a_voice_key_kind():
+    """Red with: a provider added to the cockpit's ``PROVIDERS`` and not to ``VOICE_KEY_PROVIDERS`` (its key could then
+    never be recorded), or the reverse."""
+    from levain.cockpit import voice as cockpit_voice
+    assert set(cockpit_voice.PROVIDERS) | set(cockpit_voice.UNSUPPORTED) == set(auth.VOICE_KEY_PROVIDERS)
+
+
 @pytest.mark.parametrize("interactive", [False, True])
 def test_cli_add_prints_the_v5_upgrade_order_before_anything_is_stored_or_signed(ck, sec, cli, monkeypatch, capsys,
                                                                                 interactive):
@@ -797,3 +816,32 @@ def test_cli_replace_and_a_second_add_without_it(ck, sec, cli):
     cli.typed["value"] = OTHER
     assert cli("add", "openai", "--replace", "--yes", "--signing-key", str(ck.key))[0] == 0
     assert read(ck, sec, use="stt") == OTHER                         # the replacement allows both uses (the default)
+
+
+@pytest.mark.parametrize("uses", [("stt",), ("stt", "tts")])
+def test_a_key_is_signed_only_for_uses_the_providers_adapter_serves(ck, sec, uses):
+    """L3 inworld r1 codex LOW: an Inworld key signed for stt would be a standing grant for a use nothing serves, taking effect
+    by itself the day an adapter for it exists. Red with: PROVIDER_USES emptied or the check in _check_names removed."""
+    with pytest.raises(VoiceKeyRefused):
+        add(ck, sec, provider="inworld", uses=uses)
+    assert sec.calls() == []
+    assert custody.default_uses("inworld") == ("tts",) and custody.default_uses("openai") == custody.VOICE_KEY_USES
+    assert add(ck, sec, provider="inworld", uses=("tts",))[0]["uses"] == ["tts"]
+
+
+def test_a_provider_with_no_adapter_signs_no_use(ck, sec, cli):
+    """L3 inworld r3 gemini MED: before the fix ``levain voice key add elevenlabs`` signed a standing grant for stt and
+    tts (the CLI printed ``voice key vk-... for elevenlabs: stt, tts`` and ``set: vk-... (elevenlabs)``), though no adapter
+    serves ElevenLabs, so the grant would take effect by itself the day one is added. The adapter table is
+    ``providers.HOSTS``. Red with: the no-adapter refusal in _check_names removed, or default_uses not reading HOSTS."""
+    code, out, err = cli("add", "elevenlabs", "--yes", "--signing-key", str(ck.key))
+    assert code == 1, out
+    assert "add refused" in err and "no adapter" in err
+    assert sec.calls() == [] and ck.state().policy.grants == {}
+    for uses in (("tts",), ("stt",), ("stt", "tts")):
+        with pytest.raises(VoiceKeyRefused, match="no adapter"):
+            add(ck, sec, provider="elevenlabs", uses=uses)
+    assert sec.calls() == [] and ck.state().policy.grants == {}
+    assert custody.default_uses("elevenlabs") == ()
+    for provider in ("openai", "deepgram", "inworld"):                 # every provider with an adapter still signs
+        assert custody.default_uses(provider)

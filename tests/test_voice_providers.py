@@ -340,7 +340,7 @@ def test_every_request_goes_to_an_allowed_https_host_and_carries_no_userinfo():
 
 
 def test_the_hosts_are_the_designs_constants():
-    assert P.HOSTS == {"openai": "api.openai.com", "deepgram": "api.deepgram.com"}
+    assert P.HOSTS == {"openai": "api.openai.com", "deepgram": "api.deepgram.com", "inworld": "api.inworld.ai"}
 
 
 @pytest.mark.parametrize("url", ["http://api.openai.com/v1/audio/speech", "https://evil.example/v1/audio/speech",
@@ -487,7 +487,8 @@ def test_every_adapter_model_is_priced_by_the_meter():
     for name in P.HOSTS:
         prov = P.provider_for(name)
         assert DEFAULT_PRICES.find(name, "tts", prov.tts_model) is not None, name
-        assert DEFAULT_PRICES.find(name, "stt", prov.stt_model) is not None, name
+        if "stt" in prov.uses:      # a speech-only adapter (inworld) has no transcription model to price
+            assert DEFAULT_PRICES.find(name, "stt", prov.stt_model) is not None, name
 
 
 def test_a_deepgram_voice_outside_the_priced_family_is_refused_before_sending():
@@ -502,6 +503,7 @@ def test_a_deepgram_voice_outside_the_priced_family_is_refused_before_sending():
 def test_an_unknown_provider_is_refused_and_the_known_ones_resolve():
     assert isinstance(P.provider_for("openai"), P.OpenAIProvider)
     assert isinstance(P.provider_for("deepgram"), P.DeepgramProvider)
+    assert isinstance(P.provider_for("inworld"), P.InworldProvider)
     with pytest.raises(ValueError):
         P.provider_for("elevenlabs")
     assert set(P.NAMES) == set(P.HOSTS)
