@@ -98,8 +98,8 @@ PROVIDERS: dict[str, ProviderData] = {
                             vprov.INWORLD_TTS_VOICES, vprov.INWORLD_TTS_VOICE,
                             vprov.INWORLD_SPEED_MIN, vprov.INWORLD_SPEED_MAX,
                             "Inworld's pages do not say how long text sent on its pay-as-you-go plan is kept, and its "
-                            "privacy notice says it may use information to train AI models. Zero data retention is a "
-                            "setting its Developer plan and above can turn on. US servers by default."),
+                            "privacy notice says it may use information to train AI models. Which plans can turn on "
+                            "zero data retention is Inworld's to say: https://inworld.ai/pricing. US servers by default."),
     # tts-1's nine voices: OpenAI's speech reference (read by the design lane, 2026-11-05) lists 13 built-in voices
     # without saying which tts-1 takes, so this list is inferred and is data. The speed range is the adapter's own.
     "openai": ProviderData("openai", vprov.OPENAI_TTS_MODEL, vprov.OPENAI_STT_MODEL,

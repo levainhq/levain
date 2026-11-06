@@ -1630,6 +1630,11 @@ def test_inworld_is_the_first_provider_listed_with_the_documented_voices_and_hon
     assert (inworld["default_voice"], inworld["tts_model"], inworld["speed"]) == ("Dennis", "inworld-tts-2-flash", [0.5, 1.5])
     assert "do not say how long" in inworld["retention"] and "train AI models" in inworld["retention"]
     assert "not used to train" not in inworld["retention"].lower()
+    # L3 inworld r3 codex LOW: the words named a plan ("its Developer plan and above") as able to turn on zero data
+    # retention, which Inworld's pricing page (read 2026-11-05) lists only as an add-on on a higher plan. Plan eligibility
+    # moves, so the words name no plan and point at Inworld's own page. Red with: the old sentence restored.
+    assert "plan and above" not in inworld["retention"] and "Developer" not in inworld["retention"]
+    assert "https://inworld.ai/pricing" in inworld["retention"]
 
 
 def test_a_speak_naming_inworld_sends_one_call_to_inworld_and_meters_its_characters(rig):
