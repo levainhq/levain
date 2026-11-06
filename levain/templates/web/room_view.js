@@ -143,24 +143,25 @@
   }
 
   // Whether a turn is running: the composer says nothing of it (an idle room and a running one are both "writable"), so it
-  // is read from the turn rows the server sends in the stream (hidden from the page, still sent): the newest launch's latest
-  // turn row is a start with no end after it. A turn an earlier launch left open belongs to a session that is gone.
-  function turnRunning(stream) {
-    var launch = null, last = "";
+  // is read from the turn rows the server sends in the stream (hidden from the page, still sent). Only the CURRENT launch's turn
+  // rows count (the server names it, body.launch_id): a late row of an older or a worker launch decides nothing about it. Its
+  // latest turn row is a start with no end after it => running. With no turn row of it in the stream and the body's gap flag
+  // set, a start may be missing from the record, so the turn is taken as running (unknown is running: Stop stays enabled, and
+  // a stop sent in a race still gets the server's "Nothing was running to stop."). No gap and no turn row is an idle room.
+  function turnRunning(stream, launchId, gap) {
+    if (typeof launchId !== "string" || !launchId) return false;
+    var last = "";
     for (var i = 0; i < stream.length; i++) {
       var it = stream[i];
-      if (it && typeof it.launch_id === "string" && it.launch_id) {
-        if (it.launch_id !== launch) { launch = it.launch_id; last = ""; }
-        if (it.kind === "vendor_turn_started" || it.kind === "vendor_turn_ended") last = it.kind;
-      }
+      if (it && it.launch_id === launchId && (it.kind === "vendor_turn_started" || it.kind === "vendor_turn_ended")) last = it.kind;
     }
-    return last === "vendor_turn_started";
+    return last === "" ? gap === true : last === "vendor_turn_started";
   }
 
   function roomModel(body) {
     var c = body.composer || null, st = c && own(COMPOSER_WORDS, c.state) ? c.state : "none";
     var thread = typeof body.room_thread === "string" ? body.room_thread : null;
-    var running = turnRunning(body.stream || []);
+    var running = turnRunning(body.stream || [], body.launch_id, body.gap === true);
     return {
       thread: thread, open: thread !== null, running: running,
       // Stop is for a turn that can be stopped; a stop sent in a race still gets the server's "Nothing was running to stop."
