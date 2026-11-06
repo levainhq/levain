@@ -5,12 +5,12 @@
 **A harness for working with an AI agent as a partner: it grows its own memory and identity, pushes back on its training's worst habits, and answers to you, always.**
 
 ```
-pip install levain
+pipx install levain      # or: uv tool install levain
 ```
 
 Levain wraps Claude Code and Codex. It does three things at once, and they only work together. It holds what the agent *does* to your authority: one consent queue across both agents, answered by a signed standing grant or a signed answer from you, from the desk or your phone. It lets the agent *become* someone over time: a memory that persists across sessions and an identity it grows from what it lives, instead of one you write into a system prompt. And it works on how the agent *behaves* turn by turn, with standing pressure against the habits its training rewards. The memory stays **yours**. It lives on your machine, in a store you own and can read, inspect and edit from outside any session. Nothing reaches long-term memory except through a path you govern, and a failed read shows up as *unknown* instead of a false all-clear.
 
-Apache 2.0 · Python 3.12+ · Claude Code and Codex CLI. OpenHands entities also ship, as is (see *Run a sovereign entity*).
+Apache 2.0 · Python 3.12+ · macOS and Linux (Windows planned) · Claude Code and Codex CLI · Node 26 (other majors are refused) only for the cockpit chat network: `levain chat setup` and every chat launch. OpenHands entities also ship, as is (see *Run a sovereign entity*).
 
 ![The cockpit's Health tile and Cognition trace panel: counts of memory links, wraps, graduated and demoted patterns, and a per-consolidation trace of episodes, graduations and links, all real numbers from the author's own long-running memory store.](https://raw.githubusercontent.com/levainhq/levain/main/docs/img/cockpit-health-trace.png)
 
@@ -123,9 +123,13 @@ The store is universal; the *firing* is the harness's job. (Under Codex there's 
 ## Set it up
 
 ```
-pip install levain
+python3 --version                # 3.12 or newer, needed by plain pip only (see below)
+pipx install levain              # or: uv tool install levain
+levain --version                 # must print a version
 levain init --path ./my-partner
 ```
+
+Install it with `pipx` or `uv tool`, not a bare `pip`: either gives levain its own environment and puts the `levain` command on your PATH, and a Homebrew Python refuses a bare `pip install` outright (PEP 668). Install pipx or uv first if you have neither. If `levain --version` finds no command, open a new shell: the install directory is often not on your PATH yet. With pipx, run `pipx ensurepath` and then open one; with uv, run `uv tool update-shell` and then open one. If it still finds none, or the install refused, the Python the installer used is older than 3.12 (the one that ships with macOS is older). `python3 --version` tells you about plain pip only: pipx by default uses the Python it was installed under (`PIPX_DEFAULT_PYTHON` overrides that), so name a 3.12-or-newer interpreter, e.g. `pipx install --python python3.13 levain`. `uv tool install` uses a suitable Python it finds, or fetches one when none is installed and automatic downloads are on, so for uv this check does not apply.
 
 This creates `./my-partner`, runs the interview, lays down the seed, registers the adapter you choose, initializes the store at `.levain/memory.db`, and records the exact version set it composed. Then open that directory with Claude Code or Codex and start working.
 

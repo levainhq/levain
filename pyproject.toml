@@ -176,6 +176,8 @@ levain = "levain.launch:main"
 [project.urls]
 Homepage = "https://levainhq.com"
 Repository = "https://github.com/levainhq/levain"
+Issues = "https://github.com/levainhq/levain/issues"
+Changelog = "https://github.com/levainhq/levain/blob/main/CHANGELOG.md"
 
 [tool.setuptools.packages.find]
 where = ["."]
