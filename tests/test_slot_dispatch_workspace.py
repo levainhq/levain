@@ -27,6 +27,7 @@ realistic size (the bounds are guesses), the operator-uid side that builds and s
 """
 from __future__ import annotations
 
+import copy
 import dataclasses
 import os
 import shutil
@@ -45,7 +46,8 @@ from levain.dispatch import snapshot as SN
 from levain.slot import workspace as WS
 from levain.slot.services import dispatch_run as D
 from tests.test_agents_launch import Rig
-from tests.test_agents_session_launch import EXP, _occurrence
+from levain.agents.role import add_role
+from tests.test_agents_session_launch import EXP, ROLE, _occurrence
 from tests.test_agents_session_launcher import FakeRuntime
 from tests.test_dispatch_snapshot import git, make_repo
 from tests.test_slot_dispatch_run_server import Env
@@ -115,14 +117,22 @@ class HandUploaded(C.DispatchSessionLauncher):
         return None
 
 
+def role_withholding(*patterns: str) -> dict:
+    """The fixture role with ``ceiling.withhold`` (a copy: the shared ROLE is never touched)."""
+    role = copy.deepcopy(ROLE)
+    role["ceiling"]["withhold"] = list(patterns)
+    return role
+
+
 class World:
-    def __init__(self, tmp_path: Path, **uploads_kw) -> None:
+    def __init__(self, tmp_path: Path, *, role=None, **uploads_kw) -> None:
         self.rig = Rig(tmp_path)
+        add_role(self.rig.store, ROLE if role is None else role)       # W2: the server re-derives the withhold from it
         self.uploads = WS.WorkspaceUploads(tmp_path / "scratch", **uploads_kw)
         self.runtime = StagingRuntime(self.uploads.stage, tmp_path / "staging")
         self.env = Env(self.rig, tmp_path, runtime=self.runtime, uploads=self.uploads)
         self.staged = tmp_path / "staging" / "sess-1" / "repo.bundle"
-        self.oid = _occurrence(self.rig, billing="subscription", exposure=EXP)
+        self.oid = _occurrence(self.rig, billing="subscription", exposure=EXP, role=role)
         self._ids = 0
 
     def key(self) -> str:
@@ -151,14 +161,16 @@ class World:
 
     def launch(self, sock, key, ws):
         r = self.rig
-        client = HandUploaded(lambda: sock, lambda occ: C.link_proof(r.store, r.world.root, occ, now=r.now()))
+        client = HandUploaded(lambda: sock, lambda occ: C.link_proof(r.store, r.world.root, occ, now=r.now()),
+                              signed_of=lambda occ: C.signed_role_of(r.store, occ))
         return client.spawn(S.SessionLaunch(self.oid, key, "claude", "sonnet", "b", "passthrough", EXP, ws))
 
     def raw_launch(self, sock, key, ws):
         """A LAUNCH frame sent by hand, so a refusal leaves the connection open for a same-connection retry (the client
         closes it)."""
         r = self.rig
-        proof = C.link_proof(r.store, r.world.root, self.oid, now=r.now())
+        proof = dataclasses.replace(C.link_proof(r.store, r.world.root, self.oid, now=r.now()),
+                                    signed=C.signed_role_of(r.store, self.oid))
         return self.send(sock, "LAUNCH", **C.launch_to_wire(
             S.SessionLaunch(self.oid, key, "claude", "sonnet", "b", "passthrough", EXP, ws), proof))
 
@@ -412,21 +424,66 @@ def test_a_manifest_whose_path_is_both_a_file_and_a_directory_is_refused_by_the_
 
 # --- withhold, .mcp.json, the loosening check ----------------------------------------------------------------------------------
 
-def test_w1_stages_no_withhold_and_the_alternative_is_one_constant(w, tmp_path, monkeypatch):
+def test_a_withhold_the_signed_role_declares_stages_and_the_run_records_its_digest(tmp_path):
+    w = World(tmp_path, role=role_withholding("docs/**"))
     parts, key = make_parts(tmp_path, withhold=("docs/**",)), w.key()
     assert parts.manifest.withheld_paths == ("docs/x.txt",)
-    assert cause(w.refused(key, parts, ws=parts.workspace(withhold=("docs/**",)))) == "withhold-not-in-w1"
-    monkeypatch.setattr(WS, "W1_WITHHOLD_ALLOWED", True)
-    key2 = w.key()
-    sock, _ = w.upload(key2, parts)
-    assert w.launch(sock, key2, parts.workspace(withhold=("docs/**",))).session == "sess-1"
-    assert w.env.launcher.index.get(key2)["workspace"]["withhold_digest"] == SN.withhold_digest(("docs/**",))
+    sock, _ = w.upload(key, parts)
+    assert w.launch(sock, key, parts.workspace(withhold=("docs/**",))).session == "sess-1"
+    assert w.env.launcher.index.get(key)["workspace"]["withhold_digest"] == SN.withhold_digest(("docs/**",))
 
 
-def test_a_withhold_the_member_and_the_manifest_disagree_on_is_refused(w, tmp_path, monkeypatch):
-    monkeypatch.setattr(WS, "W1_WITHHOLD_ALLOWED", True)
+def test_a_snapshot_that_withholds_less_than_the_signed_role_is_a_loosening_and_is_refused(tmp_path):
+    w = World(tmp_path, role=role_withholding("docs/**"))
+    parts, key = make_parts(tmp_path), w.key()                    # cut with NO withhold: docs/x.txt is in it
+    assert cause(w.refused(key, parts)) == "withhold-loosened"
+
+
+def test_a_member_and_manifest_that_withhold_more_than_the_signed_role_are_refused(w, tmp_path):
+    parts, key = make_parts(tmp_path, withhold=("docs/**",)), w.key()      # the fixture role withholds nothing
+    assert cause(w.refused(key, parts, ws=parts.workspace(withhold=("docs/**",)))) == "withhold-mismatch"
+
+
+def test_a_manifest_that_names_the_signed_withhold_but_still_carries_a_withheld_path_is_refused(tmp_path):
+    w = World(tmp_path, role=role_withholding("docs/**"))
+    full = make_parts(tmp_path)                                    # the bytes of an unwithheld snapshot
+    lying = Parts(dataclasses.replace(full.manifest, withhold=("docs/**",)), full.bundle, full.head)
+    key = w.key()
+    assert cause(w.refused(key, lying, ws=lying.workspace(withhold=("docs/**",)))) == "withheld-path-carried"
+
+
+def test_a_withhold_the_member_and_the_manifest_disagree_on_is_refused(tmp_path):
+    w = World(tmp_path, role=role_withholding("docs/**"))
     parts, key = make_parts(tmp_path, withhold=("docs/**",)), w.key()
-    assert cause(w.refused(key, parts, ws=parts.workspace(withhold=("other/**",)))) == "withhold-mismatch"
+    assert cause(w.refused(key, parts, ws=parts.workspace(withhold=("other/**",)))) in ("withhold-loosened",
+                                                                                    "withhold-mismatch")
+
+
+def test_a_workspace_launch_whose_proof_carries_no_role_evidence_is_refused(w, tmp_path):
+    parts, key = make_parts(tmp_path), w.key()
+    sock, answers = w.upload(key, parts)
+    assert all(a["ok"] for a in answers)
+    r = w.rig
+    bare = C.link_proof(r.store, r.world.root, w.oid, now=r.now())          # signed=None: no evidence rides
+    ans = w.send(sock, "LAUNCH", **C.launch_to_wire(
+        S.SessionLaunch(w.oid, key, "claude", "sonnet", "b", "passthrough", EXP, parts.workspace()), bare))
+    assert ans["refused"] == REFUSED and ans["detail"].startswith("signed-role-missing")
+    w.assert_nothing_staged(key, tombstone=False)
+
+
+def test_role_evidence_that_is_not_the_signed_spec_is_refused(w, tmp_path):
+    parts, key = make_parts(tmp_path), w.key()
+    sock, _ = w.upload(key, parts)
+    r = w.rig
+    ok = C.signed_role_of(r.store, w.oid)
+    for bad, name in ((dataclasses.replace(ok, spec=ok.spec.replace('"stop_at":', '"stop_at":1')), "signed-role-spec"),
+                      (dataclasses.replace(ok, role=ok.role.replace(ROLE["name"], "other-name", 1)),
+                       "signed-role-role-hash")):
+        proof = dataclasses.replace(C.link_proof(r.store, r.world.root, w.oid, now=r.now()), signed=bad)
+        ans = w.send(sock, "LAUNCH", **C.launch_to_wire(
+            S.SessionLaunch(w.oid, key, "claude", "sonnet", "b", "passthrough", EXP, parts.workspace()), proof))
+        assert ans["refused"] == REFUSED and ans["detail"].startswith(name), ans
+        sock, _ = w.upload(key, parts)                  # a refused LAUNCH ended the upload: bring it back
 
 
 def test_a_snapshot_whose_settings_loosen_the_sandbox_is_refused_never_stripped(w, tmp_path):
@@ -605,6 +662,7 @@ def test_the_start_up_sweep_removes_a_crashed_verifys_workdir_and_input(w, tmp_p
 
 def test_a_server_that_stages_no_workspace_refuses_the_member_and_the_upload(tmp_path):
     rig = Rig(tmp_path)
+    add_role(rig.store, ROLE)
     env = Env(rig, tmp_path)
     parts = make_parts(tmp_path)
     oid = _occurrence(rig, billing="subscription", exposure=EXP)
@@ -614,7 +672,8 @@ def test_a_server_that_stages_no_workspace_refuses_the_member_and_the_upload(tmp
     ans = C.read_run_frame(sock)
     assert ans["refused"] == REFUSED and ans["detail"].startswith("unavailable")
     client = HandUploaded(lambda: env.connect(), lambda occ: C.link_proof(rig.store, rig.world.root, occ,
-                                                                          now=rig.now()))
+                                                                          now=rig.now()),
+                          signed_of=lambda occ: C.signed_role_of(rig.store, occ))
     with pytest.raises(L.LauncherRefused) as exc:
         client.spawn(S.SessionLaunch(oid, "s-00000000000000b2", "claude", "sonnet", "b", "passthrough", EXP,
                                      parts.workspace()))
@@ -716,7 +775,7 @@ def test_the_real_helper_runtime_stages_the_bundle_before_render_and_ends_the_se
     for part, data in (("manifest", parts.manifest_bytes), ("bundle", parts.bundle)):
         for off in range(0, len(data), C.WS_CHUNK_BYTES):
             uploads.chunk(base.session_key, owner, part, off, data[off:off + C.WS_CHUNK_BYTES])
-    ws = uploads.verify(base.session_key, owner, parts.workspace())
+    ws = uploads.verify(base.session_key, owner, parts.workspace(), signed_withhold=())
     handle = rt.start(dataclasses.replace(base, workspace=ws))
     handle.child.abort()
     assert (h.staging / "repo.bundle").read_bytes() == parts.bundle and h.verbs()[:2] == ["prepare", "render"]

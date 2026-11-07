@@ -438,3 +438,49 @@ def test_store_write_holds_the_write_lock_so_add_role_is_serialised(tmp_path):
                 other.execute("BEGIN IMMEDIATE")
         finally:
             other.close()
+
+
+# --- ceiling.withhold (levain 1107, W2: the signed role declares what its workspace snapshot withholds) -----------------------
+
+def test_ceiling_withhold_is_stored_sorted_and_moves_the_role_hash():
+    base = role_hash(ROLE)
+    r = copy.deepcopy(ROLE)
+    r["ceiling"]["withhold"] = ["secrets/**", "docs/**"]
+    assert parse_role(r)["ceiling"]["withhold"] == ["docs/**", "secrets/**"]
+    assert role_hash(r) != base
+    r2 = copy.deepcopy(ROLE)
+    r2["ceiling"]["withhold"] = ["docs/**", "secrets/**"]
+    assert role_hash(r2) == role_hash(r)                       # one spelling of a set is one hash
+    from levain.agents.role import role_withhold
+    assert role_withhold(r) == ("docs/**", "secrets/**") and role_withhold(ROLE) == ()
+
+
+def test_a_role_without_withhold_hashes_exactly_as_before():
+    # the field is absent from the canonical form, so every role registered before W2 keeps its hash (pinned value)
+    assert role_hash(ROLE) == hashlib.sha256(b"levain-rolespec/1\n" + _canonical(parse_role(ROLE)).encode()).hexdigest()
+    assert "withhold" not in canonical_role(ROLE)
+
+
+@pytest.mark.parametrize("bad,why", [
+    ("docs/**", "must be a list"), ([1], "must be a string"), (["docs/**", "docs/**"], "twice"),
+    ([""], "ceiling.withhold[0]"), (["/abs"], "ceiling.withhold[0]"), ([f"p{i}" for i in range(257)], "more than 256"),
+])
+def test_a_malformed_withhold_is_refused_naming_the_field(bad, why):
+    r = copy.deepcopy(ROLE)
+    r["ceiling"]["withhold"] = bad
+    with pytest.raises(RoleError, match="ceiling.withhold") as exc:
+        parse_role(r)
+    assert why in str(exc.value)
+
+
+def test_withhold_never_reaches_the_envelope_narrowing():
+    from levain.agents.role import envelope_ceiling
+    from levain.coordinator.envelopes import narrow_scope
+    r = copy.deepcopy(ROLE)
+    r["ceiling"]["withhold"] = ["docs/**"]
+    ceiling = instance_ceiling(r)
+    scope = {"where": [{"repo": "r", "paths": ["a/"]}], "lands": [], "pushes": [], "publishes": []}
+    with pytest.raises(Exception, match="withhold"):            # the raw ceiling is refused by narrow_scope ...
+        narrow_scope(scope, ceiling)
+    assert narrow_scope(scope, envelope_ceiling(ceiling))["where"] == [{"repo": "r", "paths": ["a/"]}]   # ... this view is not
+    assert "withhold" not in envelope_ceiling(ceiling) and ceiling["withhold"] == ["docs/**"]

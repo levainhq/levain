@@ -60,7 +60,7 @@ __all__ = ["AgentMoved", "SpecError", "SPEC_FIELDS", "parse_spec", "parse_spec_t
            "canonical_spec", "register_spec", "register_specs", "mint_agent_id", "find_revert", "list_agents", "get_agent", "set_operation", "retire_agent",
            "resolve_agent", "feeder_group", "stored_specs", "occurrence_spec", "can_fire"]
 
-SPEC_HASH_PREFIX = b"levain-agentspec/1\n"
+from levain.agents.signed_role import SPEC_HASH_PREFIX   # noqa: E402  (one home: the run server re-derives this hash)
 SPEC_FIELDS = ("name", "role", "input", "output", "win", "trigger", "stop_at", "overlap", "missed", "on_failure",
                "memory", "placement", "feeds")
 NAME = re.compile(r"[a-z][a-z0-9_-]{0,63}")

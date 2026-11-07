@@ -114,6 +114,7 @@ from levain.agents.authority_replica import AuthorityReplica, ReplicaRefused, Re
 from levain.agents.accounting import ActionExposure, StopResult
 from levain.agents.session_launcher import LauncherRefused, RealLauncher, SessionIndex
 from levain.slot import Refused
+from levain.agents.signed_role import SignedRoleRefused, signed_withhold
 from levain.slot import workspace as WS
 from levain.slot.layout import RUN, STORE, dispatch_store_dir
 
@@ -616,7 +617,7 @@ class RunServer:
                 claims = self._claims(req, bar=True)
                 launch, proof = C.launch_from_wire({k: v for k, v in req.items() if k not in ("ledger_head", "bar")})
                 self._verify(proof, launch.exposure, claims)
-                launch = self._workspace_of(launch, owner)
+                launch = self._workspace_of(launch, owner, proof)
                 self._pool()
                 holder = self._spawn(launch, proof, claims)
             finally:
@@ -698,7 +699,7 @@ class RunServer:
         key, part, offset, raw = C.ws_chunk_from_wire(req)
         return C.ok_answer(rid, received=self._uploads.chunk(self._key(key), owner, part, offset, raw))
 
-    def _workspace_of(self, launch: Any, owner: Optional[WS.UploadOwner]) -> Any:
+    def _workspace_of(self, launch: Any, owner: Optional[WS.UploadOwner], proof: Any = None) -> Any:
         """The LAUNCH's workspace judgment, after the authority check and before the pool check or any mint: the launch
         itself when it names none and no upload exists; the launch with its member's ``manifest_digest`` filled by the
         server's own derivation when the upload verifies; else ``session_refused:workspace``. Only a standing refusal of
@@ -712,7 +713,7 @@ class RunServer:
                     return launch
                 raise WS.WorkspaceRefused("unavailable", "this server stages no workspace")
             ws = self._uploads.verify(launch.session_key, owner if owner is not None else WS.UploadOwner(),
-                                      launch.workspace)
+                                      launch.workspace, signed_withhold=self._signed_withhold(launch, proof))
         except WS.WorkspaceRefused as exc:
             _log.warning("workspace refused for %s: %s", launch.session_key, exc.cause)
             refuse = getattr(self.launcher, "refuse_key", None)
@@ -720,6 +721,23 @@ class RunServer:
                 refuse(launch.session_key, WS.WORKSPACE_REFUSAL, occurrence_id=launch.occurrence_id)
             raise
         return launch if ws is None else dataclasses.replace(launch, workspace=ws)
+
+    @staticmethod
+    def _signed_withhold(launch: Any, proof: Any) -> tuple:
+        """The withhold the SIGNED role declares (levain 1107, W2), for a launch that names a workspace: re-derived from
+        the proof's role evidence against the ``spec_hash`` the point-of-use check just verified against the ledger
+        (:func:`levain.agents.signed_role.signed_withhold`). A workspace launch whose proof carries no evidence, or
+        evidence that does not derive the signed role, is ``session_refused:workspace`` (a standing refusal: the bytes
+        will not become the signed role's by waiting). A launch with no workspace derives nothing."""
+        if launch.workspace is None:
+            return ()
+        signed = getattr(proof, "signed", None)
+        if signed is None:
+            raise WS.WorkspaceRefused("signed-role-missing", "the proof carries no role evidence for the workspace")
+        try:
+            return signed_withhold(signed, proof.spec_hash)
+        except SignedRoleRefused as exc:
+            raise WS.WorkspaceRefused(f"signed-role-{exc.name}", exc.detail) from None
 
     @staticmethod
     def _key(v: object) -> str:

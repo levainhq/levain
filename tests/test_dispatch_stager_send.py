@@ -75,7 +75,8 @@ class RealSender(World):
             self.connects.append(key)                                  # a connection the client took
             return sock
 
-        client = C.DispatchSessionLauncher(connect, lambda occ: C.link_proof(r.store, r.world.root, occ, now=r.now()))
+        client = C.DispatchSessionLauncher(connect, lambda occ: C.link_proof(r.store, r.world.root, occ, now=r.now()),
+                                           signed_of=lambda occ: C.signed_role_of(r.store, occ))
         return client.spawn(S.SessionLaunch(self.oid, key, "claude", "sonnet", "b", "passthrough", EXP, ws))
 
 
@@ -88,6 +89,21 @@ def op_repo(tmp_path: Path, files=None, name="op") -> Path:
     top = Path(os.path.realpath(tmp_path)) / name
     top.mkdir()
     return make_repo(top, FILES if files is None else files)
+
+
+def signed_for(*withhold: str) -> C.SignedRole:
+    """A SignedRole whose spec pins a role declaring ``withhold`` (a real hash chain; the agent id is made up)."""
+    from levain.agents.role import canonical_role, role_hash
+    from levain.authority import _canonical
+    role = {"name": "r", "brief": {"template": "x", "slots": {}}, "ceiling": {"lands": ["flow"], **(
+        {"withhold": list(withhold)} if withhold else {})}, "model": "m", "harness": "claude", "executor": "session"}
+    spec = {"role": {"name": "r", "role_hash": role_hash(role)}}
+    return C.SignedRole("ag-" + "1" * 32, _canonical(spec), canonical_role(role))
+
+
+def plain_launcher(*withhold: str) -> C.DispatchSessionLauncher:
+    """A client with no wire and a signed-role source for a role that withholds ``withhold``."""
+    return C.DispatchSessionLauncher(lambda: None, lambda occ: None, signed_of=lambda occ: signed_for(*withhold))
 
 
 def member(repo: Path, branch=None) -> S.Workspace:
@@ -292,7 +308,7 @@ def test_the_temp_directory_is_private_and_gone_after_success_and_after_a_failed
 def test_a_loosening_or_mcp_snapshot_is_refused_before_any_byte_is_sent(tmp_path, tmpdir_, files, cause):
     repo = op_repo(tmp_path, files)
     conn = RecordingConn()
-    launcher = C.DispatchSessionLauncher(lambda: None, lambda occ: None)
+    launcher = plain_launcher()
     with pytest.raises(C.WorkspaceNotSent) as exc:
         launcher.stage_workspace(conn, launch_of(member(repo)))
     assert exc.value.name == S.WORKSPACE_REFUSED and exc.value.detail.startswith(cause), exc.value.detail
@@ -302,7 +318,7 @@ def test_a_loosening_or_mcp_snapshot_is_refused_before_any_byte_is_sent(tmp_path
 def test_a_clean_settings_file_stages(tmp_path, tmpdir_):
     repo = op_repo(tmp_path, {".claude/settings.json": '{"permissions": {"allow": ["Read"]}}', "src/a.py": "a\n"})
     conn = RecordingConn()
-    C.DispatchSessionLauncher(lambda: None, lambda occ: None).stage_workspace(conn, launch_of(member(repo)))
+    plain_launcher().stage_workspace(conn, launch_of(member(repo)))
     assert conn.requests[0][0] == "WSBEGIN" and conn.requests[-1][0] == "WSDATA"
 
 
@@ -310,7 +326,7 @@ def test_the_refused_names_come_from_the_one_derivation_the_server_uses(monkeypa
     monkeypatch.setattr(WS, "DISPATCH_REFUSED_NAMES", ())                     # parity on: both sides stop refusing it
     repo = op_repo(tmp_path, {".mcp.json": "{}\n", "src/a.py": "a\n"})
     conn = RecordingConn()
-    C.DispatchSessionLauncher(lambda: None, lambda occ: None).stage_workspace(conn, launch_of(member(repo)))
+    plain_launcher().stage_workspace(conn, launch_of(member(repo)))
     assert conn.requests
 
 
@@ -318,14 +334,14 @@ def test_the_upload_is_begin_then_whole_chunks_in_order_and_an_ack_that_disagree
     repo = op_repo(tmp_path, {**FILES, "big.bin": base64.b64encode(os.urandom(3 * C.WS_CHUNK_BYTES)).decode()})
     conn = RecordingConn()
     ws = member(repo)
-    C.DispatchSessionLauncher(lambda: None, lambda occ: None).stage_workspace(conn, launch_of(ws))
+    plain_launcher().stage_workspace(conn, launch_of(ws))
     ops = [(op, f.get("part"), f.get("offset")) for op, f in conn.requests]
     assert ops[0][0] == "WSBEGIN" and ops[1] == ("WSDATA", "manifest", 0)
     bundle = [o for o in ops if o[1] == "bundle"]
     assert len(bundle) >= 2 and [o[2] for o in bundle] == sorted(o[2] for o in bundle) and bundle[0][2] == 0
     lying = RecordingConn(lie=1)
     with pytest.raises(C.WorkspaceNotSent) as exc:
-        C.DispatchSessionLauncher(lambda: None, lambda occ: None).stage_workspace(lying, launch_of(ws))
+        plain_launcher().stage_workspace(lying, launch_of(ws))
     assert exc.value.detail.startswith("upload-ack") and lying.closed and len(lying.requests) == 2
 
 
@@ -354,18 +370,42 @@ def test_the_senders_caps_are_the_servers(tmp_path, tmpdir_, monkeypatch):
     assert exc.value.name == "manifest-over-cap" and os.listdir(tmpdir_) == []
 
 
-def test_w1_sends_no_withhold_and_only_a_workspace_member_is_built(tmp_path, tmpdir_):
+def test_the_stager_cuts_the_snapshot_under_the_signed_withhold_and_refuses_any_other(tmp_path, tmpdir_):
     repo = op_repo(tmp_path)
-    with pytest.raises(stager.StageRefused) as exc:
+    up = stager.build_upload(dataclasses.replace(member(repo), withhold=("docs/**",)), signed_withhold=("docs/**",))
+    assert json.loads(up.manifest)["withheld_paths"] == ["docs/x.txt"]
+    with pytest.raises(stager.StageRefused) as exc:                  # the member withholds less than the role: loosening
+        stager.build_upload(member(repo), signed_withhold=("docs/**",))
+    assert exc.value.name == "withhold-loosened"
+    with pytest.raises(stager.StageRefused) as exc:                  # more than the role declared
         stager.build_upload(dataclasses.replace(member(repo), withhold=("docs/**",)))
-    assert exc.value.name == "withhold-not-in-w1"
+    assert exc.value.name == "withhold-mismatch"
     with pytest.raises(stager.StageRefused) as exc:
         stager.build_upload(object())
     assert exc.value.name == "workspace-member" and os.listdir(tmpdir_) == []
 
 
+def test_a_launcher_that_cannot_prove_the_signed_role_builds_nothing(tmp_path, tmpdir_):
+    launcher = C.DispatchSessionLauncher(lambda: None, lambda occ: None)         # no signed-role source
+    with pytest.raises(C.WorkspaceNotSent) as exc:
+        launcher.build_workspace(launch_of(member(op_repo(tmp_path))))
+    assert exc.value.name == S.WORKSPACE_REFUSED and exc.value.detail.startswith("signed-role-unavailable")
+    assert os.listdir(tmpdir_) == []
+
+
+def test_the_client_builds_under_the_withhold_its_signed_role_declares_and_a_loosened_member_is_refused(tmp_path, tmpdir_):
+    repo = op_repo(tmp_path)
+    launcher = plain_launcher("docs/**")
+    up = launcher.build_workspace(launch_of(dataclasses.replace(member(repo), withhold=("docs/**",))))
+    assert json.loads(up.manifest)["withheld_paths"] == ["docs/x.txt"]
+    with pytest.raises(C.WorkspaceNotSent) as exc:
+        launcher.build_workspace(launch_of(member(repo)))                       # the install's member says nothing
+    assert exc.value.name == S.WORKSPACE_REFUSED and exc.value.detail.startswith("withhold-loosened")
+    assert os.listdir(tmpdir_) == []
+
+
 def test_the_seam_does_nothing_for_a_launch_with_no_workspace_and_names_a_sender_that_broke(tmp_path, tmpdir_, monkeypatch):
-    launcher = C.DispatchSessionLauncher(lambda: None, lambda occ: None)
+    launcher = plain_launcher()
     conn = RecordingConn()
     launcher.stage_workspace(conn, launch_of(None))
     assert conn.requests == []
@@ -385,7 +425,7 @@ def test_a_wire_lost_mid_upload_is_a_transient_not_sent_refusal_and_closes_the_c
 
     conn = Lossy()
     with pytest.raises(C.WorkspaceNotSent) as exc:
-        C.DispatchSessionLauncher(lambda: None, lambda occ: None).stage_workspace(conn, launch_of(member(op_repo(tmp_path))))
+        plain_launcher().stage_workspace(conn, launch_of(member(op_repo(tmp_path))))
     assert (exc.value.name, exc.value.reason_class) == ("dispatch-unreachable", "transient") and conn.closed
 
 
@@ -610,6 +650,15 @@ def test_the_factory_resolves_the_branch_at_the_fire_not_at_install(tmp_path):
     assert W._workspace_kwargs(install, "ag-" + "9" * 32) == {}              # an agent with no setting stages nothing
 
 
+def test_the_factory_hands_the_signed_roles_withhold_to_the_member_and_nothing_else(tmp_path):
+    repo = op_repo(tmp_path)
+    install = W.SessionInstall(tmp_path, None, None, {}, {AG: W.WorkspaceSetting(str(repo), None)})
+    role = {"name": "r", "brief": {"template": "x", "slots": {}}, "ceiling": {"lands": ["flow"], "withhold": ["z/**", "docs/**"]},
+            "model": "m", "harness": "claude", "executor": "session"}
+    assert W._workspace_kwargs(install, AG, role)["workspace"].withhold == ("docs/**", "z/**")
+    assert W._workspace_kwargs(install, AG, {**role, "ceiling": {"lands": ["flow"]}})["workspace"].withhold == ()
+
+
 def test_a_setting_that_does_not_resolve_is_handed_over_as_a_problem_not_raised(tmp_path):
     repo = op_repo(tmp_path)
     for setting in (W.WorkspaceSetting(str(repo), "nope"), W.WorkspaceSetting(str(tmp_path / "gone"), None)):
@@ -724,7 +773,7 @@ def _ordered_client(w, events, sock):
         events.append("proof")
         return C.link_proof(r.store, r.world.root, occ, now=r.now())
 
-    client = C.DispatchSessionLauncher(connect, proof)
+    client = C.DispatchSessionLauncher(connect, proof, signed_of=lambda occ: C.signed_role_of(r.store, occ))
     real = client.build_workspace
 
     def build(launch):
@@ -807,7 +856,7 @@ def test_a_build_that_met_a_host_fault_is_a_transient_not_a_workspace_refusal(tm
 
     monkeypatch.setattr(stager, "build_upload", down)
     with pytest.raises(C.WorkspaceNotSent) as exc:
-        C.DispatchSessionLauncher(lambda: None, lambda occ: None).build_workspace(launch_of(member(op_repo(tmp_path))))
+        plain_launcher().build_workspace(launch_of(member(op_repo(tmp_path))))
     assert (exc.value.name, exc.value.reason_class, exc.value.nothing_sent) == ("snapshot-git-unavailable", "transient", True)
 
 
