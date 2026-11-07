@@ -587,9 +587,9 @@ def doctor_rows(install: Path) -> list[tuple[str, bool, str, str | None, bool]]:
 # created exclusively, and both files are staged before either is renamed in. The registry is read UNDER the hands
 # lock, so a revocation lands either before the read or after the write, never between.
 #
-# Not a launch yet: nothing in the tree opens a hands Claude or Codex chat, so the only caller is the verb. The
-# launcher (the next slice) takes the hands lock, calls ``prepare_launch(..., held=True)`` and execs the argv only
-# when it returned; no launch follows a failed or partial prepare.
+# The launcher is :func:`levain.firing.hands_chat.launch_hands_chat` (``levain hands launch``): it takes the entity's
+# session and one-session locks, calls ``prepare_launch(..., held=True)`` and starts the argv only when it returned; no
+# launch follows a failed or partial prepare. The ``prepare`` verb is the other caller.
 
 CLAUDE_LAUNCH_FILE = "levain-mcp.json"
 CODEX_BEGIN = "# >>> levain hands mcp (written at every launch; edit the registry, not this block) >>>"

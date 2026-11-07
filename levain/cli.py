@@ -1504,7 +1504,7 @@ def build_parser() -> argparse.ArgumentParser:
         description=(
             "`levain hands login claude|codex` runs the vendor's own login AS the entity's user (the account "
             "`levain setup-isolation` made), with the vendor's config home inside that user's home; "
-            "`levain hands logout claude|codex` ends it (locally; the provider's page revokes); `levain hands status [claude|codex]` shows who each is signed in as. Your own ~/.claude and "
+            "`levain hands logout claude|codex` ends it (locally; the provider's page revokes); `levain hands status [claude|codex]` shows who each is signed in as; `levain hands launch claude|codex` starts the hands-uid chat. Your own ~/.claude and "
             "~/.codex are never read or copied. Anything that runs as the entity's user can use the login, "
             "and a logout is local to this machine."
         ),
@@ -1536,6 +1536,22 @@ def build_parser() -> argparse.ArgumentParser:
         if _verb != "remove":
             _p.add_argument("--data-root", type=Path, default=None, help="The cockpit data root holding the authority "
                                                                           "log (default: <path>/.levain/cockpit).")
+    hc_p = hands_sub.add_parser(
+        "launch",
+        help="Start the hands-uid chat: a Claude Code or Codex chat running AS the entity's own user, with only "
+             "the registry's MCP servers. Not the cockpit room (which runs as you, with no hands).",
+        description=(
+            "The hands-uid chat. Takes the entity's session locks, stops anything the entity's user left running, "
+            "rewrites both MCP launch files from the live registry (`levain hands mcp prepare`), and only then starts "
+            "the vendor as the entity's user (Claude with --strict-mcp-config). Any refusal starts nothing; there "
+            "is no fallback to files an earlier prepare wrote. A server revoked while the chat runs is not removed "
+            "from that chat; it is gone from the next launch. This is not `levain chat` and not the cockpit room."
+        ),
+    )
+    hc_p.add_argument("vendor", choices=("claude", "codex"))
+    hc_p.add_argument("--path", type=Path, default=argparse.SUPPRESS, help="Entity directory (default: cwd).")
+    hc_p.add_argument("--data-root", type=Path, default=None, help="The cockpit data root holding the authority "
+                                                                   "log (default: <path>/.levain/cockpit).")
     hands_p.set_defaults(func=_cmd_hands)
 
     wsg_p = subparsers.add_parser(
@@ -5384,6 +5400,9 @@ def _cmd_hands(args: argparse.Namespace) -> int:
         if args.hands_mcp_cmd == "prepare":
             return hands_mcp_login.cmd_prepare(args.path, args.data_root)
         return hands_mcp_login.cmd_list(args.path, args.data_root)
+    if args.hands_cmd == "launch":
+        from levain.firing import hands_chat
+        return hands_chat.cmd_hands_chat(args.path, args.vendor, args.data_root)
     if args.hands_cmd == "login":
         return hands_login.cmd_hands_login(args.path, args.vendor)
     if args.hands_cmd == "logout":

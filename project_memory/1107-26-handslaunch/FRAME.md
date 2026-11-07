@@ -77,9 +77,36 @@ Claude keys the stored OAuth token (`.credentials.json`) by something scope-depe
 real signed-in hands account. **If that measurement fails, fix M3's token placement (or sign in against the
 launch-file definition), not the strict flag**: dropping strict to make sign-in work re-opens the self-grant path.
 
-## Not done / remains
-- The launcher itself (the next slice; Opus, boundary code), with the tests above and the VM `ps -o uid=` of the
-  spawned child (the 1103-27 DONE line).
+## Built (same lane, second commit) and what remains
+The Verdict above was the research commit; the launcher was then built in this lane.
+
+**Built.** `levain/firing/hands_chat.py` `launch_hands_chat(entity_dir, vendor, cockpit_root, spawn=, emit=)`, the one
+path that starts a hands vendor chat, exposed as **`levain hands launch claude|codex`** (named `launch` under `hands`
+so it is not `levain chat`, the chat-network keys verb, nor the room; its help says "the hands-uid chat ... Not the
+cockpit room"). Order: `hold_session_lock` (shared) then `hold_hands_session` (exclusive), the same order
+`EntitySession` takes them -> `hands_live.sweep_hands_user` (refuses if anything of the hands user is left, so nothing
+of that account can rewrite its own launch files between prepare and start) -> `prepare_launch(held=True)` -> the
+vendor from `claude_chat_argv` (strict kept) / `codex_chat_argv`, cwd the hands workspace, through an injectable
+`spawn(argv, cwd)` -> wait (Ctrl-C belongs to the vendor) -> sweep the hands user again -> both locks released in a
+`finally`. Any `HandsMcpError` (incl. `HandsMcpRefused` and a partial prepare), `HandsLoginError`, `WsGitError`,
+`OSError` (incl. a failed spawn), `SubprocessError` or a sweep that leaves processes -> `HandsChatRefused "...; no
+chat was started"`, nothing spawned, locks released, no fallback to earlier files. **No vendor argument passes
+through** (an added `--mcp-config` or Codex `-c mcp_servers...` would add a server outside the registry). Not wired
+into the room or any other path. `hands_mcp_login.py`'s "not a launch yet" comment now names the launcher.
+
+**Tests** (`tests/test_hands_chat_launch.py`, 11, fake vendor reading both files at spawn): (1) A and B registered,
+manual prepare, A revoked: the stale files still hold A (the reproduced HIGH), the launch's vendor sees only B in both
+files, for claude and codex; (2) foreign Codex server / unreadable log / partial prepare / stale hands process / spawn
+OSError -> vendor never started, both locks free after; an open session refuses before any sweep or prepare; the verb
+prints and exits 1; (3) events exactly sweep, prepare, spawn, sweep, each with both locks held. Mutations, each red then
+restored: prepare moved after the spawn (7 red), prepare exception swallowed (4 red), one-session lock skipped (2 red),
+session lock skipped (1 red), lock release skipped (10 red).
+
+**Remains.**
+- Mid-session revoke: a revoke landing while a hands chat runs does not reach it (the vendor read its file at start; a
+  stdio server is already running). Needs the session to end on revoke, or the revoke path to stop the hands session.
+- VM: `ps -o uid=` of the spawned child is the hands uid (the 1103-27 DONE line), and an interactive chat actually
+  works through the sudo prefix with the terminal inherited (untested here: fakes only). Linux has no hands egress for
+  a vendor yet, so a Linux launch is expected to fail at the vendor, not refused up front.
 - M2 Residue 2 (OAuth token found under strict + `--mcp-config`): VM, real hands login.
-- The mid-session revoke residue above.
-- M4: doctor comparing the launch files with the registry (drift is invisible until the next prepare).
+- M4: doctor comparing the launch files with the registry (drift is invisible until the next launch or prepare).
