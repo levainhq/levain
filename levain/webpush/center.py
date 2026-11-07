@@ -609,13 +609,15 @@ def _notice_item(rd: _Reader, num: int, read: bool, read_at: str | None) -> dict
 _DIALOG_MARK = " asks in its own dialog"
 
 
-def _dialog_of(ref: str | None, body: str) -> dict[str, str] | None:
+def _dialog_of(ref: str | None, body: Any) -> dict[str, str] | None:
     """For a ``prompt:`` ping (the agent's own dialog waits, no hold: :func:`levain.consent.adapters.claude_code.prompt_notice`):
-    ``{"agent"}``, the agent the notice names (its words before ``asks in its own dialog``; ``""`` when the body does not say),
-    so the focus view can say plainly that nothing is held and there is nothing to answer there. None for any other ping."""
+    ``{"agent"}``, the agent the notice names (its words before ``asks in its own dialog``, first line only; ``""`` when the
+    body is missing, not text, or does not say), so the focus view can say plainly that nothing was held. The ref alone makes
+    it a dialog notice, and this never raises. None for any other ping."""
     if not isinstance(ref, str) or not ref.startswith("prompt:"):
         return None
-    head = body.split(_DIALOG_MARK, 1)[0] if _DIALOG_MARK in body else ""
+    line = body.splitlines()[0] if isinstance(body, str) and body.strip() else ""
+    head = line.split(_DIALOG_MARK, 1)[0] if _DIALOG_MARK in line else ""
     return {"agent": head.strip()[:64]}
 
 

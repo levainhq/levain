@@ -363,8 +363,8 @@ def _add_prompt(r) -> None:
 @needs_browser
 def test_the_focus_view_of_a_prompt_notice_says_the_dialog_waits_and_offers_nothing_to_press(tmp_path: Path) -> None:
     d = _drive_title(tmp_path, DIALOG_TITLE, setup=_add_prompt)
-    assert d["head"] == ["Waiting in the seat's own dialog"], d
-    assert len(d["notes"]) == 1 and d["notes"][0].startswith("claude_code is asking in its own dialog. Levain did not hold this request, so there is nothing to answer here."), d
+    assert d["head"] == ["Left to the seat's own dialog"], d
+    assert len(d["notes"]) == 1 and d["notes"][0].startswith("claude_code asked in its own dialog. Levain did not hold it, so there was nothing to answer here: if it is still open,"), d
     assert d["signLinks"] == 0 and d["body"] is True, d                  # no sign link or sheet box; the raw command stays below
 
 
@@ -372,3 +372,13 @@ def test_the_focus_view_of_a_prompt_notice_says_the_dialog_waits_and_offers_noth
 def test_a_held_requests_focus_view_has_its_sheet_box_and_no_dialog_section(tmp_path: Path) -> None:
     d = _drive_title(tmp_path, "Write /w/a waits on you", setup=_add_prompt)
     assert d["head"] == [] and d["signLinks"] >= 1, d
+
+
+def test_dialog_of_is_total() -> None:
+    from levain.webpush.center import _dialog_of
+    assert _dialog_of("prompt:x", None) == {"agent": ""}
+    assert _dialog_of("prompt:x", 5) == {"agent": ""}
+    assert _dialog_of("prompt:x", "reworded") == {"agent": ""}
+    assert _dialog_of("prompt:x", "\ncodex asks in its own dialog: y") == {"agent": ""}
+    assert _dialog_of("prompt:x", "codex asks in its own dialog: echo 'a asks in its own dialog'") == {"agent": "codex"}
+    assert _dialog_of("request:x", "codex asks in its own dialog: y") is None and _dialog_of(None, None) is None

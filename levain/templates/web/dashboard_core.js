@@ -9690,8 +9690,8 @@ for (const type of ["touchstart", "wheel", "pointerdown", "click", "keydown"]) d
     if (!dg || typeof dg !== "object") return null;
     const who = typeof dg.agent === "string" && dg.agent ? dg.agent : "An agent";
     const nd = el("div", "nc-dialogbox");
-    nd.appendChild(el("p", "nc-dialoghead", "Waiting in the seat's own dialog"));
-    nd.appendChild(el("p", "nc-note", who + " is asking in its own dialog. Levain did not hold this request, so there is nothing to answer here. Answer it in that seat's dialog at the laptop."));
+    nd.appendChild(el("p", "nc-dialoghead", "Left to the seat's own dialog"));
+    nd.appendChild(el("p", "nc-note", who + " asked in its own dialog. Levain did not hold it, so there was nothing to answer here: if it is still open, answer it in that seat's dialog at the laptop."));
     return nd;
   }
   function ncTokenNote(it) {
