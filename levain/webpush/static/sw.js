@@ -6,7 +6,7 @@
 // whichever opens first creates the store; correctness depends on no timing (an unread key waits for the next trigger).
 const DB = 'levain-sw-2', STORE = 'opened';
 // A short id of this worker's code, recorded in the trace so a device's trace says which worker ran.
-const SW_VERSION = '1106-51-shown-3';
+const SW_VERSION = '1106-53-tap-1';
 // The TRACE: an append-only ring in its own cache, one entry per step, key TRACE_PREFIX + <time ms, zero padded> + '-' +
 // <seq>, value JSON {t, src, step, ...detail}. The /tap_trace page and sw_open.js read and write the same ring. Writes are
 // best effort, serialized on one chain, never awaited by the tap, and carry only urls without fragments, counts and step
@@ -137,13 +137,13 @@ const traceRefused = (kind, ping, status, result) => trace('receipt-refused', { 
 // server answered 200 or refused it (a refused report is dropped: retrying cannot change it); a network failure, a 5xx,
 // 408 or 429, or the budget leaves it queued for a later event. True when the server answered (the network is up, so a
 // drain is worth its time); never throws.
-async function sendReceipt(ping, kind, at, b, hashP) {
+async function sendReceipt(ping, kind, at, b, hashP, extra) {
   try {
     if (!Number.isInteger(ping) || ping <= 0) { trace('receipt', { kind, ping: null, result: 'no-ping' }); return false; }
     const hash = await hashP;
     if (hash === LATE || b.over) { trace('receipt', { kind, ping, result: 'late' }); return false; }
     if (!hash) { trace('receipt-no-sub', { kind, ping }); return false; }
-    const body = { ping, kind, at, endpoint_sha256: hash };
+    const body = { ping, kind, at, endpoint_sha256: hash, ...(extra || {}) };   // extra: a tap report's target and how only
     const key = receiptKey(body);
     const [put, post] = await Promise.allSettled([b.within(() => putReceipt(key, body)), postReceipt(body, b)]);
     const queued = put.status === 'fulfilled' && put.value === true;
@@ -198,6 +198,34 @@ async function drainReceipts(b) {
 // all receipt work of one event, bounded: resolves by the budget's deadline whatever hangs inside
 function boundedReceipts(b, work) {
   return b.within(work).catch(() => null).finally(() => b.end());
+}
+// --- tap reports (1106-53) -----------------------------------------------------------------------------------------
+// What the worker says about a TAP goes to the server by the same queued receipt path, independent of the Cache Storage
+// trace (11-06 21:00: ping 640 was received and shown on the phone, and no click or open step reached the trace). `clicked`
+// is sent first, before any window work; `opened` after the window step, with HOW the worker got a window. Each report has
+// its own budget, so a slow window step cannot starve the click's report. A target is a path and, of the query, only `view`
+// and `item` (nothing else, no fragment, no token, no body).
+const TAP_ITEM = /^[A-Za-z0-9_.:-]{1,64}$/;
+function tapTarget(u) {
+  try {
+    const x = new URL(u, self.location.origin);
+    const p = x.pathname.replace(/[^A-Za-z0-9/_.-]/g, '').slice(0, 60) || '/';
+    const v = x.searchParams.get('view'), it = x.searchParams.get('item');
+    const q = [];
+    if (v !== null && /^[a-z]{1,20}$/.test(v)) q.push('view=' + v);
+    if (it !== null && TAP_ITEM.test(it)) q.push('item=' + it);
+    // the server's grammar has `item` only after `view` or alone; both orders produced here fit it
+    return p + (q.length ? '?' + q.join('&') : '');
+  } catch (_) { return null; }
+}
+// Starts one tap report and records its promise in `work` (the click's waitUntil holds them); total, never throws.
+function reportTap(work, ping, kind, extra) {
+  try {
+    const t = Date.now(), b = receiptBudget(t);
+    const clean = {};
+    for (const k of Object.keys(extra || {})) if (extra[k] !== null && extra[k] !== undefined) clean[k] = extra[k];
+    work.push(boundedReceipts(b, () => sendReceipt(ping, kind, t, b, endpointHash(b), clean)));
+  } catch (_) { /* a report never reaches the tap */ }
 }
 
 function open() {
@@ -781,7 +809,16 @@ self.addEventListener('notificationclick', (e) => {
   const url = u.href;
   trace('sw-version', { version: SW_VERSION, on: 'notificationclick' });
   trace('click', { url: traceUrl(url), ping: traceScalar(data.ping) });
-  const opened = (async () => {
+  // the server-side record of this tap (see reportTap): `clicked` goes out BEFORE any window work, `opened` once with how
+  const tapWork = [], tapPing = typeof data.ping === 'number' ? data.ping : Number(data.ping), tapTo = tapTarget(url);
+  reportTap(tapWork, tapPing, 'clicked', { target: tapTo });
+  let openedReported = false;
+  const reportOpened = (how) => {
+    if (openedReported) return;
+    openedReported = true;
+    reportTap(tapWork, tapPing, 'opened', { target: tapTo, how });
+  };
+  const openedInner = async () => {
     const sameOrigin = (c) => { try { return new URL(c.url).origin === self.location.origin; } catch (_) { return false; } };
     // 1. the 'asked' entry is written in PARALLEL with the window lookups (nothing else is awaited before the ack wait), and
     //    before any focus or message: the page claims it by the nonce the message names
@@ -814,6 +851,7 @@ self.addEventListener('notificationclick', (e) => {
       try {
         const w = await self.clients.openWindow(url);
         trace('openWindow', { why: why || null, client: w ? traceUrl(w.url) : null });
+        reportOpened(w ? 'openWindow' : 'refused');   // before the hold below: the report must not wait NEW_TTL_MS
         if (w) {
           console.info(`levain sw: tap -> openWindow${why ? ` after ${why}` : ''}`);
           // held inside the click's waitUntil: an entry the opened page never claimed (it has no listener) is not left behind
@@ -826,6 +864,7 @@ self.addEventListener('notificationclick', (e) => {
         console.warn(`levain sw: openWindow(${url}) returned no client`);
       } catch (err) {
         trace('openWindow', { why: why || null, client: null, error: err && err.name || 'error' });
+        reportOpened('refused');
         console.warn(`levain sw: openWindow(${url}) failed: ${err}`);
       }
       console.info('levain sw: tap -> openWindow-failed');
@@ -841,6 +880,7 @@ self.addEventListener('notificationclick', (e) => {
     trace('ack', { acked, window: traceUrl(c.url) });
     if (acked) {
       try { await c.focus(); } catch (_) { /* best effort */ }
+      reportOpened('ack');
       console.info('levain sw: tap -> ack');
       return;
     }
@@ -850,7 +890,7 @@ self.addEventListener('notificationclick', (e) => {
       // a cache that throws cannot have been claimed by a page that needs the same cache: the worker owns the open
       try { mine = await dropPending(askedKey); } catch (_) { mine = true; }
       trace('no-ack-claim', { mine });
-      if (!mine) { console.info('levain sw: tap -> ack (late)'); return; }
+      if (!mine) { reportOpened('late-ack'); console.info('levain sw: tap -> ack (late)'); return; }
     }
     if (ctl.includes(c)) {
       try { await c.focus(); } catch (_) { /* navigate anyway */ }
@@ -858,11 +898,13 @@ self.addEventListener('notificationclick', (e) => {
         // accepted when the resolved client is at the target (origin + path + query); null or another page is a navigation that did not happen
         const r = await c.navigate(url);
         trace('navigate', { result: r ? traceUrl(r.url) : null, ok: !!(r && sameTarget(r.url, url)) });
-        if (r && sameTarget(r.url, url)) { console.info('levain sw: tap -> navigate'); return; }
+        if (r && sameTarget(r.url, url)) { reportOpened('navigate'); console.info('levain sw: tap -> navigate'); return; }
       } catch (err) { trace('navigate', { error: err && err.name || 'error' }); /* fall through to a new window */ }
     }
     await openNew('no ack');
-  })();
+  };
+  // whatever path ended without a report is `none` (the window step ran out, or threw)
+  const opened = openedInner().finally(() => reportOpened('none'));
   // the mark is local and best effort: a failed write loses one open's record, never the page. It is said on the
   // console, not swallowed: a VersionError means the page opened `levain-sw-2` at a version other than this pin (1)
   const mark = (async () => {
@@ -879,5 +921,7 @@ self.addEventListener('notificationclick', (e) => {
   // the receipt queue is re-sent beside the tap, under the click's own receipt budget (never holding the tap)
   const rb = receiptBudget(clickT0);
   const dropShown = dropShownPending(data.ping);
-  e.waitUntil(Promise.allSettled([opened, mark, dropShown, boundedReceipts(rb, () => drainReceipts(rb))]).then(traceSettled));
+  // the tap reports are pushed as the window step runs: held after it settles, each under its own budget
+  const tapDone = opened.catch(() => {}).then(() => Promise.allSettled(tapWork));
+  e.waitUntil(Promise.allSettled([opened, mark, dropShown, tapDone, boundedReceipts(rb, () => drainReceipts(rb))]).then(traceSettled));
 });

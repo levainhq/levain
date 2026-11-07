@@ -38,6 +38,16 @@ MAX_SUBSCRIPTIONS_PER_DEVICE = 5
 MAX_SUBSCRIPTIONS = 20
 STAMP = "%Y-%m-%dT%H:%M:%SZ"   # the one stamp format of this store, whole seconds, UTC
 RECEIPT_KINDS = ("received", "shown")
+# The TAP record (1106-53): what the device says happened AFTER a notification was tapped, independent of the page's Cache
+# Storage trace. `clicked` = the worker's notificationclick ran (target = the url as resolved), `opened` = how the worker
+# then got a window (how), `landed` = a cockpit page loaded or resumed (target = where it is, how = what it did about a tap).
+TAP_KINDS = ("clicked", "opened", "landed")
+TAP_SW_KINDS = ("clicked", "opened")                 # reported by the worker under the endpoint hash, against a ping
+TAP_HOWS = ("ack", "late-ack", "navigate", "openWindow", "refused", "none")   # `opened`: how the worker got a window
+# a target: a path and, of the query, only `view` and `item` (nothing else is ever kept: no token, no body)
+TAP_TARGET = re.compile(r"^/[A-Za-z0-9/_.-]{0,60}(?:\?(?:view=[a-z]{1,20}(?:&item=[A-Za-z0-9_.:-]{1,64})?|item=[A-Za-z0-9_.:-]{1,64}))?$")
+LANDED_HOW = re.compile(r"^[a-z]{1,12}(?:>[a-z]{1,12})?$")   # e.g. load, load>shown, resume>shown, message
+MAX_LANDINGS_PER_DEVICE_HOUR = 120
 MAX_RECEIPTS_PER_DEVICE_HOUR = 600   # what one device may report in an hour: a flood cannot grow the table past this
 MAX_RECEIPTS_PER_PING_KIND = 8       # a ping delivered to one device more than once is a few rows, never unbounded
 RECEIPT_MIN_MS = 1_577_836_800_000   # 2020-01-01: a device clock before it is not a clock this record keeps
@@ -163,6 +173,12 @@ _SCHEMA: tuple[str, ...] = (
     "CREATE TABLE IF NOT EXISTS receipts (id INTEGER PRIMARY KEY AUTOINCREMENT, ping_id INTEGER NOT NULL "
     "REFERENCES pings(id), device_id TEXT NOT NULL, kind TEXT NOT NULL CHECK (kind IN ('received','shown')), "
     "at TEXT NOT NULL, reported_at TEXT NOT NULL, UNIQUE (ping_id, device_id, kind, at))",
+    # what a device said about a TAP (TAP_KINDS): the worker's click and how it opened, the page's landing. `ping_id` is NULL
+    # for a landing that names no ping. `at` is the device clock (stamp plus ms), `reported_at` this server's.
+    "CREATE TABLE IF NOT EXISTS taps (id INTEGER PRIMARY KEY AUTOINCREMENT, ping_id INTEGER REFERENCES pings(id), "
+    "device_id TEXT NOT NULL, kind TEXT NOT NULL CHECK (kind IN ('clicked','opened','landed')), at TEXT NOT NULL, "
+    "reported_at TEXT NOT NULL, target TEXT, how TEXT)",
+    "CREATE INDEX IF NOT EXISTS taps_device_reported ON taps (device_id, reported_at)",
     "CREATE TABLE IF NOT EXISTS held (ping_id INTEGER PRIMARY KEY REFERENCES pings(id), url TEXT NOT NULL, "
     "reason TEXT NOT NULL, held_at TEXT NOT NULL, released_at TEXT, claimed_at TEXT)",
     # a push about to go to a subscription (written before the push services are asked; see the module docstring)
@@ -182,7 +198,7 @@ _SCHEMA: tuple[str, ...] = (
     "CREATE INDEX IF NOT EXISTS receipts_device_reported ON receipts (device_id, reported_at)",
     "CREATE INDEX IF NOT EXISTS targets_ping_sub ON targets (ping_id, subscription_id)",
     "CREATE INDEX IF NOT EXISTS deliveries_ping_sub ON deliveries (ping_id, subscription_id)",
-    *_records("pings"), *_records("targets"), *_records("deliveries"), *_records("opens"), *_records("receipts"),
+    *_records("pings"), *_records("targets"), *_records("deliveries"), *_records("opens"), *_records("receipts"), *_records("taps"),
 )
 # every name the schema creates (tables, indexes, triggers), for the lock-free "nothing to do" check
 _SCHEMA_NAMES = frozenset(re.findall(r"IF NOT EXISTS (\w+)", " ".join(_SCHEMA)))
@@ -479,7 +495,8 @@ class PushStore:
                 c.execute("INSERT INTO opens (ping_id, device_id, at) VALUES (?,?,?)", (ping_id, device_id, now_stamp()))
             return True
 
-    def add_receipt(self, endpoint_sha256: str, ping_id: int, kind: str, at_ms: int) -> str:
+    def add_receipt(self, endpoint_sha256: str, ping_id: int, kind: str, at_ms: int, target: str | None = None,
+                    how: str | None = None) -> str:
         """Append what a device reported about a push it got. The device is the one whose live subscription's endpoint
         hashes to ``endpoint_sha256`` (the endpoint is the secret only that device and this server hold). Answers
         ``recorded``, ``duplicate`` (the same report again, nothing written), or the refusal: ``unknown_device`` (no live
@@ -495,7 +512,17 @@ class PushStore:
         digest is compared with :func:`hmac.compare_digest`, all of them, with no early exit; the pairing journal is
         asked only about the one matched device. Only a matched, live, targeted, new, within-cap receipt opens the write
         transaction, which checks the subscription, duplicate and caps again before it appends."""
-        if kind not in RECEIPT_KINDS or isinstance(at_ms, bool) or not isinstance(at_ms, int):
+        tap = kind in TAP_SW_KINDS
+        if (kind not in RECEIPT_KINDS and not tap) or isinstance(at_ms, bool) or not isinstance(at_ms, int):
+            return "bad_report"
+        # target and how belong to the tap kinds only, are bounded, and a click names no `how`
+        if (target is not None or how is not None) and not tap:
+            return "bad_report"
+        if target is not None and (not isinstance(target, str) or len(target) > 160 or TAP_TARGET.match(target) is None):
+            return "bad_report"
+        if how is not None and (kind != "opened" or how not in TAP_HOWS):
+            return "bad_report"
+        if kind == "opened" and how is None:
             return "bad_report"
         if not RECEIPT_MIN_MS <= at_ms <= int(time.time() * 1000) + RECEIPT_FUTURE_MS:
             return "bad_report"
@@ -524,8 +551,29 @@ class PushStore:
             got = _receipt_checks(c, sid, device, ping_id, kind, at)
             if got is not None:
                 return got
-            c.execute("INSERT INTO receipts (ping_id, device_id, kind, at, reported_at) VALUES (?,?,?,?,?)",
-                      (ping_id, device, kind, at, now_stamp()))
+            if tap:
+                c.execute("INSERT INTO taps (ping_id, device_id, kind, at, reported_at, target, how) VALUES (?,?,?,?,?,?,?)",
+                          (ping_id, device, kind, at, now_stamp(), target, how))
+            else:
+                c.execute("INSERT INTO receipts (ping_id, device_id, kind, at, reported_at) VALUES (?,?,?,?,?)",
+                          (ping_id, device, kind, at, now_stamp()))
+            return "recorded"
+
+    def add_landing(self, device_id: str | None, target: str, how: str) -> str:
+        """Append a page's ``landed`` record (the token-gated ``/webpush/landed``; the device is the credential's own).
+        Answers ``recorded``, ``bad_report`` (a target or how outside the allowlist, or no device) or ``limited``."""
+        if (not isinstance(device_id, str) or not device_id or not isinstance(target, str) or len(target) > 160
+                or TAP_TARGET.match(target) is None or not isinstance(how, str) or LANDED_HOW.match(how) is None):
+            return "bad_report"
+        now = time.time()
+        at = time.strftime(STAMP[:-1], time.gmtime(now)) + f".{int(now * 1000) % 1000:03d}Z"
+        with self.write() as c:
+            hour_ago = time.strftime(STAMP, time.gmtime(now - 3600))
+            if c.execute("SELECT COUNT(*) FROM taps WHERE device_id = ? AND kind = 'landed' AND reported_at >= ?",
+                         (device_id, hour_ago)).fetchone()[0] >= MAX_LANDINGS_PER_DEVICE_HOUR:
+                return "limited"
+            c.execute("INSERT INTO taps (ping_id, device_id, kind, at, reported_at, target, how) VALUES (NULL,?,'landed',?,?,?,?)",
+                      (device_id, at, now_stamp(), target, how))
             return "recorded"
 
     def record(self, limit: int = 100) -> list[dict[str, Any]]:
