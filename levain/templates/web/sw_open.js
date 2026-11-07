@@ -59,8 +59,47 @@
       }).catch(() => { /* best effort: a failed trace write never reaches the tap */ });
     } catch (_) { /* best effort */ }
   };
+  // The LANDING record (1106-53): where this document is and what it did about a tap, told to the server (POST /webpush/landed,
+  // the key this paired page holds), so a tap that lands at '/' with no target SAYS so even when Cache Storage lost the trace.
+  // Target = path and, of the query, only `view` and `item` (read at this script's first run; a later script may rewrite the address);
+  // how = load | load>new | load>shown | resume | resume>shown | message ('>' = then it forwarded itself). Best effort, silent,
+  // keepalive (a forward unloads the page), no token in the body.
+  const ITEM_OK = /^[A-Za-z0-9_.:-]{1,64}$/;
+  const landTarget = (loc) => {
+    try {
+      loc = loc || location;
+      // decode the percent-encoded pathname, keep it only when wholly inside the server's grammar (else "/"); never strip characters
+      let p = "/";
+      try { const d = decodeURIComponent(loc.pathname); if (/^\/(?!\/)[A-Za-z0-9/_.-]{0,60}$/.test(d)) p = d; } catch (_) { p = "/"; }
+      const q = new URLSearchParams(loc.search), parts = [];
+      const v = q.get("view"), it = q.get("item");
+      if (v !== null && /^[a-z]{1,20}$/.test(v)) parts.push("view=" + v);
+      if (it !== null && ITEM_OK.test(it)) parts.push("item=" + it);
+      return p + (parts.length ? "?" + parts.join("&") : "");
+    } catch (_) { return "/"; }
+  };
+  const firstTarget = landTarget();
+  let lastLand = 0, loadPosted = false;
+  function postLanding(how, target) {
+    try {
+      let key = "";
+      try { key = window.localStorage.getItem("levain_write_token") || ""; } catch (_) { /* no storage: no key */ }
+      if (!key || typeof fetch !== "function") return;
+      const now = Date.now();
+      if (how === "resume" && now - lastLand < 30000) return;   // a resume without a tap target is told at most every 30 s
+      lastLand = now;
+      fetch("/webpush/landed", { method: "POST", cache: "no-store", keepalive: true,
+        headers: { "Content-Type": "application/json", "X-Levain-Write-Token": key },
+        body: JSON.stringify({ target: target || landTarget(), how }) }).catch(() => { /* best effort */ });
+    } catch (_) { /* best effort */ }
+  }
   // the assign comes first: the trace of it may often be lost to the navigation, which is fine
-  const assignTo = (href) => { location.assign(href); trace("assign", { target: traceUrl(href), ...nFlag(href) }); };
+  const assignTo = (href, how) => {
+    // the landing names the target the notification CARRIED (href), never the address this document holds when the post is made:
+    // the cockpit strips deep-link params from its own address once it has read them
+    if (how) { if (how.indexOf("load") === 0) loadPosted = true; let t; try { t = landTarget(new URL(href, location.href)); } catch (_) { t = undefined; } postLanding(how, t); }
+    location.assign(href); trace("assign", { target: traceUrl(href), ...nFlag(href) });
+  };
   try {
     trace("page-load", {
       href: traceUrl(location.href), ...nFlag(location.href),
@@ -83,7 +122,7 @@
     const port = ev.ports && ev.ports[0];
     const go = () => {
       if (port) { try { port.postMessage({ ok: true }); } catch (_) { /* the worker falls back to its own path */ } }
-      assignTo(u.href);
+      assignTo(u.href, "message");
     };
     // no cache, or the worker could not write a target: message-only, as before
     const msg = { type: d.type, url: traceUrl(u.href), nonce: typeof d.nonce === "string", ...nFlag(u.href) };
@@ -130,13 +169,60 @@
       for (const f of found) {
         if (!(await cache.delete(f.req))) continue;
         trace("checkPending", { seen, claimed: traceUrl(f.u.href), assigned: !sameTarget(f.u, here) });
-        if (!sameTarget(f.u, here)) assignTo(f.u.href);   // already here: consumed, the page stays
+        if (!sameTarget(f.u, here)) assignTo(f.u.href, "load>new");   // already here: consumed, the page stays
+        else { loadPosted = true; postLanding("load>new", landTarget(f.u)); }
         return;
       }
       trace("checkPending", { seen, claimed: null, assigned: false });
-      await takeShown(cache, shownEntries, here);
+      await takeShown(cache, shownEntries, here, false);
     } catch (_) { /* no cache: nothing pending */ } finally { checking = false; }
   }
+  // RESUME. The installed app coming forward does not load a new document (pwa_resume.js: it resumes), and a push can wake the
+  // app into a HIDDEN document that then lives for hours: 11-06 21:01, ping 640, the tap resumed the document loaded at 20:26,
+  // checkPending (once per document) never ran again, and the worker's notificationclick left no trace, so the tap landed on
+  // the home screen. So a document that becomes visible judges the 'shown' entries again, with the same guards (bare standalone
+  // '/', fresh, the notification gone from the tray), then once more 1.5 s later (the tray may not have caught up). 'new' and
+  // 'asked' entries are never claimed here (a resume claims nothing of the worker's own tap paths).
+  async function readShown(cache) {
+    const entries = [];
+    for (const req of await cache.keys()) {
+      const path = new URL(req.url).pathname;
+      if (path.indexOf(PREFIX + "shown-") !== 0) continue;
+      let e = null;
+      try { const r = await cache.match(req); e = r && await r.json(); } catch (_) { e = null; }
+      if (!e || typeof e.url !== "string" || typeof e.at !== "number" || Date.now() - e.at > SHOWN_TTL_MS) { await cache.delete(req); continue; }
+      if (e.for === "shown") entries.push({ req, e });
+    }
+    return entries;
+  }
+  // Answers "busy" (a check is already running: it tells for itself), "taken" (forwarded this page), "retry" (an entry is waiting on
+  // the tray: ONE more look is scheduled, and it tells the plain resume if it too finds nothing) or "none" (looked, nothing to take).
+  async function resumeShown(again) {
+    if (!haveCache) return "none";
+    if (checking) return "busy";
+    checking = true;
+    let taken = false, had = 0;
+    try {
+      const cache = await caches.open(CACHE);
+      const entries = await readShown(cache);
+      had = entries.length;
+      if (had) taken = await takeShown(cache, entries, new URL(location.href), true);
+    } catch (_) { /* no cache: nothing pending */ } finally { checking = false; }
+    if (taken) return "taken";
+    if (had && !again && document.visibilityState === "visible") {
+      // the tray may not have caught up: look once more, but only if the app is still in front when the timer fires
+      setTimeout(() => {
+        if (document.visibilityState !== "visible") return;
+        resumeShown(true).then((r) => { if (r === "none") postLanding("resume"); });
+      }, 1500);
+      return "retry";
+    }
+    return "none";
+  }
+  document.addEventListener("visibilitychange", () => {
+    if (document.visibilityState !== "visible") return;
+    resumeShown(false).then((r) => { if (r === "none") postLanding("resume"); });
+  });
   // The LAUNCH FALLBACK. On the iPhone Home Screen app a tapped push can open the app at the bare '/' without ever running the
   // worker's notificationclick (11-06: pings 607-609 shown, no click, no `opens` row), so the target is lost. The worker writes
   // ONE immutable 'shown' entry per ping (sw.js startShownPending). This document, at its first run, takes one ONLY when
@@ -149,16 +235,17 @@
   // KNOWN, ACCEPTED EDGE: tray absence is not proof of a tap. A ping he swiped away, then an icon launch within SHOWN_TTL_MS,
   // redirects to that ping's card. It lands inside his own cockpit and costs one tap to leave, and the evidence it replaces is
   // that today the real tap lands nowhere; so the tray check stays and is not tightened further.
-  async function takeShown(cache, entries, here) {
-    if (!entries.length) return;
+  // true when it forwarded this page to an entry's url
+  async function takeShown(cache, entries, here, resume) {
+    if (!entries.length) return false;
     const bare = here.pathname === "/" && !here.search && !here.hash;
     let standalone = false;
     try { standalone = !!((typeof matchMedia === "function" && matchMedia("(display-mode: standalone)").matches) || navigator.standalone); } catch (_) { standalone = false; }
-    if (!bare || !standalone) { trace("shown-skip", { why: !bare ? "not-bare" : "not-standalone" }); return; }
-    // a reload at '/' is never a launch (when the Navigation Timing API says so)
+    if (!bare || !standalone) { trace("shown-skip", { why: !bare ? "not-bare" : "not-standalone", resume: !!resume }); return false; }
+    // a reload at '/' is never a launch (when the Navigation Timing API says so); a resume has no navigation of its own
     let navType = null;
     try { const n = typeof performance !== "undefined" && performance.getEntriesByType ? performance.getEntriesByType("navigation")[0] : null; navType = n && n.type || null; } catch (_) { navType = null; }
-    if (navType === "reload") { trace("shown-skip", { why: "reload" }); return; }
+    if (navType === "reload" && !resume) { trace("shown-skip", { why: "reload" }); return false; }
     const live = [];
     for (const f of entries) {
       let u = null;
@@ -169,14 +256,14 @@
       if (!Number.isInteger(ping)) { trace("shown-skip", { why: "no-ping" }); continue; }
       live.push({ ...f, u, ping, tag: typeof f.e.tag === "string" ? f.e.tag : "" });
     }
-    if (!live.length) return;
+    if (!live.length) return false;
     const gone = [];
     try {
       const sw = navigator.serviceWorker;
       let timer;
       const reg = await Promise.race([sw.getRegistration ? sw.getRegistration() : sw.ready, new Promise((r) => { timer = setTimeout(() => r(null), 3000); })]);
       clearTimeout(timer);
-      if (!reg || typeof reg.getNotifications !== "function") { trace("shown-skip", { why: "no-api" }); return; }
+      if (!reg || typeof reg.getNotifications !== "function") { trace("shown-skip", { why: "no-api" }); return false; }
       // one query per TAG. A re-ping reuses the tag (renotify): the newer notification REPLACES the older in the tray, so an
       // entry is in the tray (or superseded by what is) when a notification under its tag carries its ping or a NEWER one
       const byTag = new Map();
@@ -186,18 +273,19 @@
         if (list.some((n) => n && n.data && Number(n.data.ping) >= f.ping)) trace("shown-skip", { why: "in-tray" });
         else gone.push(f);
       }
-    } catch (_) { trace("shown-skip", { why: "error" }); return; }
-    if (!gone.length) return;
+    } catch (_) { trace("shown-skip", { why: "error" }); return false; }
+    if (!gone.length) return false;
     gone.sort((x, y) => y.e.at - x.e.at);
     const f = gone[0];
-    if (!(await cache.delete(f.req))) return;   // a lost delete: another page took it
+    if (!(await cache.delete(f.req))) return false;   // a lost delete: another page took it
     // the launch handled the others that were gone too: a later bare launch must not pop one of them
     for (const o of gone.slice(1)) { try { await cache.delete(o.req); } catch (_) { /* swept by its TTL */ } }
-    trace("shown-launch", { url: traceUrl(f.u.href), ping: f.ping, ageMs: Date.now() - f.e.at, candidates: gone.length });
-    assignTo(f.u.href);
+    trace("shown-launch", { url: traceUrl(f.u.href), ping: f.ping, ageMs: Date.now() - f.e.at, candidates: gone.length, resume: !!resume });
+    assignTo(f.u.href, resume ? "resume>shown" : "load>shown");
+    return true;
   }
   // once, at this document's first script run: a pageshow call would let a page opened for one tap consume a later tap's entry
-  checkPending();
+  checkPending().then(() => { if (!loadPosted) { loadPosted = true; postLanding("load", firstTarget); } });
 
   // The trace REPORT: the ring posted to /webpush/trace with the key this paired page holds in localStorage (the same key
   // pair_card.js posts opens with), so a tap test needs only the tap and the operator reads the report at the laptop

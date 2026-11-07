@@ -1,14 +1,20 @@
 // levain room_view.js — the cockpit's one Claude room (RM-F).
 //
-// A conversation with the room over GET /cockpit/room.json and POST /cockpit/room/*: a draft box with Send, Drop and
-// Stop, the room's cards (a drop it proposed, which only YOUR tap commits), the reconcile of an ambiguous line, and a
+// A conversation with the room over GET /cockpit/room.json and POST /cockpit/room/*: a draft box with Send and Stop (on a
+// desk Enter sends and Shift+Enter is a new line; on a touch screen Return is a new line and the button sends), the room's cards (a drop it proposed, which only YOUR tap commits), the reconcile of an ambiguous line, and a
 // dictation control where the browser has one. The page decides nothing: what may be sent, whether a line arrived and
 // whether a card became a drop are the server's words, drawn as given. Every word that came from the record is set with
 // textContent, never as markup. The stream is drawn in the order the server sent (gseq); nothing here sorts it.
 //
 // A card's words are bytes you sent: the field holds your quoted message (editable), and the room's own summary is a
 // separate, labelled note that is information and never your words. Dictation runs only while this page is in the
-// foreground: it fills the draft, you read it, and Send or Drop works exactly as typing. No audio reaches Levain.
+// foreground: it fills the draft, you read it, and Send works exactly as typing.
+// 1106-51 (Phill, signed row 273: "full-tab Room, one conversation + a New button"): the room is a whole tab, a chat page as the
+// reference products draw it: a thin header (title and New), the conversation as the one scroller, one pinned composer with Send
+// and Stop sharing a slot. There is one conversation and no list of others. On a phone the height follows the visual viewport, so the
+// composer rides above the keyboard.
+// Direct drop removed: this box only talks to the room; the proposed-drop card below is still the one way a drop is committed
+// from here, and that path is replaced when the shared chat-to-desk command lands. No audio reaches Levain.
 (function (root) {
   "use strict";
 
@@ -164,19 +170,42 @@
     return last === "" ? gap === true : last === "vendor_turn_started";
   }
 
+  // The finished replies, read from the RAW stream (the turn rows are hidden from the drawn one). A reply is the room's
+  // words after the operator's last line, up to a vendor_turn_ended; it is the same rule the server uses to rebuild a reply
+  // for the premium voice (cockpit/voice.py), so both tiers read the same words. A turn that said nothing new is no reply.
+  // ``foot`` is the gseq of the reply's last drawn line: the speaker control hangs there.
+  function repliesOf(raw, thread) {
+    var buf = [], fresh = false, out = [], foot = 0;
+    for (var i = 0; i < raw.length; i++) {
+      var it = raw[i];
+      if (!it || typeof it.gseq !== "number") continue;
+      if (it.kind === "message" && it.source === "operator") { buf = []; fresh = false; }
+      else if (it.kind === "vendor_agent_text" && typeof it.body === "string" && it.body.trim() !== "") { buf.push(it.body); fresh = true; foot = it.gseq; }
+      else if (it.kind === "vendor_turn_ended" && fresh) {
+        out.push({ thread: thread, gseq: it.gseq, foot: foot, text: buf.join("\n\n") });
+      }
+      if (it.kind === "vendor_turn_ended") { buf = []; fresh = false; foot = 0; }   // an earlier turn is never read again (the server's rule)
+    }
+    return out;
+  }
   function roomModel(body) {
     var c = body.composer || null, st = c && own(COMPOSER_WORDS, c.state) ? c.state : "none";
     var thread = typeof body.room_thread === "string" ? body.room_thread : null;
     var running = turnRunning(body.stream || [], body.launch_id, body.gap === true);
+    var replies = thread === null ? [] : repliesOf(body.stream || [], thread);
+    var stream = (body.stream || []).map(lineModel).filter(function (l) { return !l.hidden; });
+    replies.forEach(function (r) {
+      for (var i = 0; i < stream.length; i++) if (stream[i].gseq === r.foot && stream[i].kind === "vendor_agent_text") stream[i].voice = r;
+    });
     return {
-      thread: thread, open: thread !== null, running: running,
+      thread: thread, open: thread !== null, running: running, replies: replies,
       // Stop is for a turn that can be stopped; a stop sent in a race still gets the server's "Nothing was running to stop."
       canSend: thread !== null && own(SEND_STATES, st), canStop: thread !== null && own(STOP_STATES, st) && running,
       state: st, words: thread === null ? "No room is open." : (c && c.why && st !== "writable" ? COMPOSER_WORDS[st] + " (" + c.why + ")" : COMPOSER_WORDS[st]),
       model: typeof body.model === "string" && body.model ? "Model in use: " + body.model : "",
-      gap: body.gap === true,
+      gap: body.gap === true, dropsVia: body.drops_via === "desk" ? "desk" : "card",
       error: typeof body.room_error === "string" ? body.room_error : "",
-      stream: (body.stream || []).map(lineModel).filter(function (l) { return !l.hidden; }),
+      stream: stream,
       proposals: (body.proposals || []).map(function (p) {
         return { id: String(p.proposal_id), state: String(p.state), words: String(p.words == null ? "" : p.words),
                  summary: String(p.summary == null ? "" : p.summary), about: p.about == null ? "" : String(p.about) };
@@ -300,6 +329,8 @@
       });
     }
     if (l.truncated) row.appendChild(el(doc, "div", "rv-note", "Cut short; the vendor holds the rest."));
+    // a finished reply gets its speaker control at the foot (voice.js draws it; a page without the module draws none)
+    if (l.voice && hooks && hooks.voiceBtn) { var vb = hooks.voiceBtn(l.voice); if (vb) row.appendChild(vb); }
     if (l.ambiguous && l.ref && hooks && hooks.onMark) {
       var box = el(doc, "div", "rv-mark"), yes = el(doc, "button", "rv-mark-yes", "It arrived"),
         no = el(doc, "button", "rv-mark-no", "It did not arrive"), note = el(doc, "span", "rv-marknote");
@@ -349,7 +380,8 @@
       host.appendChild(st.streamBox); host.appendChild(st.cardsBox);
     }
     clear(st.streamBox);
-    if (m.model) st.streamBox.appendChild(el(doc, "div", "rv-head", m.model));
+    if (hooks && hooks.modelSlot) hooks.modelSlot.textContent = m.model || "";       // the full tab shows the model beside the title
+    else if (m.model) st.streamBox.appendChild(el(doc, "div", "rv-head", m.model));
     if (m.error) {
       var ban = el(doc, "div", "rv-gap rv-banner");
       ban.setAttribute("role", "status");
@@ -358,8 +390,14 @@
       st.streamBox.appendChild(ban);
     }
     if (m.gap) st.streamBox.appendChild(el(doc, "div", "rv-gap", "Some lines may be missing from this conversation."));
-    if (!m.stream.length) st.streamBox.appendChild(el(doc, "div", "rv-note", m.open ? "Nothing has been said yet." : m.words));
+    if (!m.stream.length) st.streamBox.appendChild(el(doc, "div", "rv-note", m.open ? (m.dropsVia === "desk" ? "Say what you need. Ask me to send something to the desk and I will." : "Say what you need. Ask for a drop and the room will propose one for you to tap.") : m.words));
     m.stream.forEach(function (l) { st.streamBox.appendChild(renderLine(doc, l, hooks, ui)); });
+    if (m.running) {          // the room is mid-turn: three quiet dots (still, under reduced motion) until its words arrive
+      var dots = el(doc, "div", "rv-pending", "");
+      dots.setAttribute("role", "status"); dots.setAttribute("aria-label", "The room is replying");
+      for (var d = 0; d < 3; d++) dots.appendChild(el(doc, "span", "rv-dot", ""));
+      st.streamBox.appendChild(dots);
+    }
     var keep = {};
     m.proposals.forEach(function (c, i) {
       var key = c.state + "\u0000" + c.words + "\u0000" + c.summary, have = own(st.cards, c.id) ? st.cards[c.id] : null;
@@ -387,44 +425,89 @@
     if (Speech && !(Speech.prototype && "processLocally" in Speech.prototype)) Speech = null;
     var store = opts.storage === undefined ? (function () { try { return root.sessionStorage; } catch (e) { return null; } })() : opts.storage;
     var stopped = false, timer = 0, gen = 0, last = "", thread = null, current = null, ui = { open: {} }, drafts = {};
-    var wrap = el(doc, "div", "rv"), stage = el(doc, "div", "rv-stage"), body = el(doc, "div", "rv-body"), dock = el(doc, "div", "rv-dock"),
+    var wrap = el(doc, "div", "rv"), top = el(doc, "div", "rv-top"), stage = el(doc, "div", "rv-stage"), body = el(doc, "div", "rv-body"), dock = el(doc, "div", "rv-dock"),
       jumpB = el(doc, "button", "rv-jump", "Jump to latest"), hushed = null;
     jumpB.setAttribute("type", "button"); jumpB.hidden = true;
-    stage.appendChild(body); stage.appendChild(jumpB); wrap.appendChild(stage); wrap.appendChild(dock); host.appendChild(wrap);
+    var modelEl = el(doc, "span", "rv-model", "");
+    top.appendChild(el(doc, "h2", "rv-title", "Room")); top.appendChild(modelEl);
+    stage.appendChild(body); stage.appendChild(jumpB); wrap.appendChild(top); wrap.appendChild(stage); wrap.appendChild(dock); host.appendChild(wrap);
     // On a phone the conversation is its own scroll box that ends above the dock: it follows the newest line while it is at its
     // end, and holds its place (with a way back down) once scrolled up. Where the box does not scroll (a desk) none of this shows.
-    function atEnd() { return body.scrollHeight - body.scrollTop - body.clientHeight <= 48; }
+    function atEnd() { return body.scrollHeight - body.scrollTop - body.clientHeight <= 100; }
     function paintJump() { if (!stopped) jumpB.hidden = atEnd(); }
     function toEnd() { body.scrollTop = body.scrollHeight; }
     var wasEnd = true;       // at its end as of the last scroll or draw: a resize (a phone turned) keeps a box that was at its end there
     body.addEventListener("scroll", function () { wasEnd = atEnd(); paintJump(); });
     // kept by name so stop() can remove it: a stopped mount left its listener, and the detached tree it held, on the window
     var onResize = function () { if (!stopped && wasEnd) toEnd(); paintJump(); };
+    var onHidden = null, onBlur = null;   // the dictation guards, kept by name so stop() can remove them
     if (root.addEventListener) root.addEventListener("resize", onResize);
+    // The phone: the page's height is the VISUAL viewport's (the keyboard shrinks it), so the composer stays above the keyboard.
+    // --rv-vvh / --rv-vvt are read by dashboard.css (body.rv-on); rv-kb marks an open keyboard (the app's header yields room to the
+    // conversation then). A window.scrollTo(0, 0) undoes the page shift iOS applies when a field takes focus.
+    var vv = root.visualViewport || null, rootEl = doc.documentElement;
+    function fitViewport() {
+      if (stopped || !vv) return;
+      rootEl.style.setProperty("--rv-vvh", vv.height + "px");
+      rootEl.style.setProperty("--rv-vvt", vv.offsetTop + "px");
+      var kb = (root.innerHeight || 0) - vv.height > 120;
+      if (doc.body) doc.body.classList.toggle("rv-kb", kb);
+      if (kb && root.scrollY) root.scrollTo(0, 0);
+      if (wasEnd) toEnd();
+      paintJump();
+    }
+    if (vv) { vv.addEventListener("resize", fitViewport); vv.addEventListener("scroll", fitViewport); fitViewport(); }
     jumpB.addEventListener("click", function () { toEnd(); paintJump(); });
     var ta = el(doc, "textarea", "rv-input"), actions = el(doc, "div", "rv-actions"),
-      sendB = el(doc, "button", "rv-send", "Send"), dropB = el(doc, "button", "rv-drop", "Drop"),
-      stopB = el(doc, "button", "rv-stop", "Stop"), note = el(doc, "div", "rv-sendnote"),
+      composer = el(doc, "div", "rv-compose"), sendB = el(doc, "button", "rv-send", "\u2191"),
+      stopB = el(doc, "button", "rv-stop", "\u25A0"), note = el(doc, "div", "rv-sendnote"),
       openB = el(doc, "button", "rv-open", "Open the room");
-    ta.setAttribute("rows", "3"); ta.setAttribute("aria-label", "Message to the room");
+    ta.setAttribute("rows", "1"); ta.setAttribute("aria-label", "Message to the room"); ta.setAttribute("placeholder", "Message the room");
+    sendB.setAttribute("aria-label", "Send"); stopB.setAttribute("aria-label", "Stop"); stopB.setAttribute("title", "Stop");
     prose(ta, "roomdraft");
-    [sendB, dropB, stopB, openB].forEach(function (b) { b.setAttribute("type", "button"); });
+    [sendB, stopB, openB].forEach(function (b) { b.setAttribute("type", "button"); });
     openB.hidden = true;           // shown only once a read says no room is open: with none, every other control is dark
     note.setAttribute("role", "status");
-    actions.appendChild(sendB); actions.appendChild(dropB); actions.appendChild(stopB);
+    actions.className = "rv-actions rv-slot";           // Send and Stop share this one slot (Stop while a reply runs and the draft is empty)
+    actions.appendChild(stopB); actions.appendChild(sendB);
     var micB = null, rec = null;
     if (Speech) {
       micB = el(doc, "button", "rv-mic", "Dictate");
       micB.setAttribute("type", "button");
       micB.setAttribute("title", "On-device dictation where this browser provides it, and only while this page is open");
-      actions.appendChild(micB);
     }
     var rotB = null;
-    if (opts.rotate !== false) { rotB = el(doc, "button", "rv-rotate", "New conversation"); rotB.setAttribute("type", "button"); actions.appendChild(rotB); }
-    dock.appendChild(openB); dock.appendChild(ta); dock.appendChild(actions); dock.appendChild(note);
-    var flight = { send: false, drop: false, stop: false, open: false };
+    if (opts.rotate !== false) {
+      rotB = el(doc, "button", "rv-rotate", "New");
+      rotB.setAttribute("type", "button"); rotB.setAttribute("aria-label", "New conversation"); rotB.setAttribute("title", "Start a new conversation");
+      top.appendChild(rotB);
+    }
+    composer.appendChild(ta); if (micB) composer.appendChild(micB); composer.appendChild(actions);
+    dock.appendChild(openB); dock.appendChild(note); dock.appendChild(composer);
+    var forceEnd = false;       // your own send always lands you at the newest line
+    var flight = { send: false, stop: false, open: false };
     try { if (store && store.getItem("levain.room.draft")) ta.value = store.getItem("levain.room.draft"); } catch (e) { /* no storage */ }
-    ta.addEventListener("input", function () { try { if (store) store.setItem("levain.room.draft", ta.value); } catch (e) { /* no storage */ } });
+    ta.addEventListener("input", function () { try { if (store) store.setItem("levain.room.draft", ta.value); } catch (e) { /* no storage */ } grow(); paintSend(); });
+    // The box grows with its words up to a cap set in CSS, then scrolls. field-sizing does it where the browser has it; this is the
+    // fallback for the rest, and it is harmless beside it.
+    // border-box: scrollHeight leaves out the border, so it is added back (else one line shows a scrollbar where
+    // field-sizing is not supported)
+    function grow() { ta.style.height = "auto"; if (ta.scrollHeight) ta.style.height = (ta.scrollHeight + ta.offsetHeight - ta.clientHeight) + "px"; }
+    // An empty draft cannot be sent. aria-disabled, not disabled: the button still takes focus and the handler refuses an empty line.
+    function paintSend() {
+      if (ta.value.trim()) sendB.removeAttribute("aria-disabled"); else sendB.setAttribute("aria-disabled", "true");
+      // the slot shows Stop only while a reply can be stopped and nothing is typed: a typed line always gets its Send
+      actions.setAttribute("data-mode", current && current.canStop && (!ta.value.trim() || !current.canSend) ? "stop" : "send");
+    }
+    // Desk: Enter sends, Shift+Enter is a new line. A touch screen keeps Return as a new line and Send as the button. Enter while an
+    // input method is composing (isComposing, or keyCode 229 for Safari's out-of-order confirming Enter) belongs to the method.
+    function coarse() { try { return !!(root.matchMedia && root.matchMedia("(pointer: coarse)").matches); } catch (e) { return false; } }
+    ta.addEventListener("keydown", function (ev) {
+      if (ev.key !== "Enter" || ev.shiftKey || ev.isComposing || ev.keyCode === 229) return;
+      if (coarse()) return;
+      ev.preventDefault();
+      sendB.click();
+    });
     // The outbox id a line or a drop was last tried under, and the cards' edits, are kept beside the draft (roomfix1 R2):
     // the dashboard unmounts this view whenever the page is hidden (an app switch on the phone), and a remount that minted
     // a new id would send a line twice after an unanswered try. The store is the truth across mounts of one tab; with no
@@ -463,12 +546,12 @@
       var m = current;
       var can = !!m && m.canSend;
       sendB.disabled = !can || flight.send;
-      dropB.disabled = !m || !m.open || flight.drop;
       stopB.disabled = !m || !m.canStop || flight.stop;
       ta.disabled = !m || !m.open;
       if (rotB) rotB.disabled = !m || !m.open;
       openB.hidden = !m || m.open;
       openB.disabled = flight.open;
+      paintSend();
     }
     function post(path, payload) {
       var h = Object.assign({ "Content-Type": "application/json" }, headers());
@@ -482,11 +565,13 @@
       endDictation();
       var text = ta.value;
       if (!current || !current.thread || !text.trim() || sendB.disabled || flight.send) return;
+      voiceTap();
+      forceEnd = true;
       var sendId = tryId("levain.room.send", text);                     // one id per draft text: a resend reuses it
       flight.send = true; paintDock(); note.textContent = "Sending...";
       post("send", { room_thread_id: current.thread, body: text, outbox_id: sendId }).then(function (r) {
         flight.send = false;
-        if (r.status === 200 && r.json && r.json.receipt) { clearDraft(text); settle("levain.room.send", sendId); }
+        if (r.status === 200 && r.json && r.json.receipt) { clearDraft(text); grow(); paintSend(); settle("levain.room.send", sendId); }
         else if (r.status < 500 && r.status !== 202) settle("levain.room.send", sendId);
         note.textContent = sendWords(r.status, r.json);
         last = ""; paintDock(); return pull();
@@ -495,19 +580,6 @@
         note.textContent = "The server could not be reached; the line may or may not have been sent. Sending again will not duplicate it.";
         paintDock();
       });
-    });
-    dropB.addEventListener("click", function () {
-      endDictation();
-      var text = ta.value;
-      if (!current || !text.trim() || dropB.disabled || flight.drop) return;
-      var dropId = tryId("levain.room.drop", text);
-      flight.drop = true; paintDock(); note.textContent = "Dropping...";
-      post("drop", { words: text, outbox_id: dropId }).then(function (r) {
-        flight.drop = false;
-        if (r.status === 200) { clearDraft(text); settle("levain.room.drop", dropId); note.textContent = "Dropped: your words went to the desk."; }
-        else { if (r.status < 500) settle("levain.room.drop", dropId); note.textContent = (r.json && r.json.message) ? "Not dropped: " + r.json.message : "Not dropped: the server answered " + r.status + "."; }
-        paintDock();
-      }).catch(function () { flight.drop = false; note.textContent = "The server could not be reached; the drop may or may not have gone. Dropping again will not duplicate it."; paintDock(); });
     });
     openB.addEventListener("click", function () {
       if (openB.disabled || flight.open) return;
@@ -530,14 +602,19 @@
     });
     if (rotB) rotB.addEventListener("click", function () {
       if (rotB.disabled) return;
+      var V = voice(); if (V) V.stop();
+      gen++; voiceHold = true;          // a poll already out, or sent before the answer, names the OLD room: it reads nothing
       rotB.disabled = true; note.textContent = "Starting a new conversation...";
       post("rotate", { room_thread_id: current && current.thread }).then(function (r) {
         note.textContent = r.status === 200 ? "A new conversation is open." : ((r.json && r.json.message) || "No new conversation was started.");
         // a one-poll bridge: the old conversation's problem is not the new one's, but a read that still names the OLD
         // thread is only the server catching up. The same error on a new thread is a new problem and shows.
         if (r.status === 200 && current && current.error) hushed = { thread: current.thread, error: current.error };
-        last = ""; return pull();
-      }).catch(function () { note.textContent = "The server could not be reached."; }).then(paintDock);
+        // the next body is backlog: a reply that finished on the old thread during the click (a failed rotate, a pull that still
+        // names the old thread) must not be read as new
+        last = ""; voiceHold = false; voiceThread = null; return pull();
+      }).catch(function () { note.textContent = "The server could not be reached."; voiceHold = false; voiceThread = null; })
+        .then(function () { voiceHold = false; paintDock(); });
     });
     // dictation state: dbase = the text before the transcript, heard = the transcript already placed in the box
     var dbase = "", heard = "", lastHeard = "";
@@ -567,6 +644,7 @@
       } else micB.style.display = "";
       ta.addEventListener("input", function () { if (rec) { dbase = ta.value; heard = lastHeard; } });
       micB.addEventListener("click", function () {
+        voiceTap();
         if (rec) { endDictation(); return; }
         var r = new Speech();
         dbase = ta.value ? ta.value.replace(/\s*$/, " ") : ""; heard = ""; lastHeard = "";
@@ -579,6 +657,7 @@
           lastHeard = t;
           ta.value = dbase + (heard && t.indexOf(heard) === 0 ? t.slice(heard.length) : t);
           try { if (store) store.setItem("levain.room.draft", ta.value); } catch (e) { /* no storage */ }
+          grow(); paintSend();                         // a set value fires no input event: Send and the box follow it here
         };
         r.onend = function () { if (rec === r) endDictation(); };
         r.onerror = function (ev) {
@@ -596,11 +675,55 @@
       });
       // foreground only: leaving the page ends dictation
       var leave = function () { if (rec) endDictation(); };
-      doc.addEventListener("visibilitychange", function () { if (doc.visibilityState === "hidden") leave(); });
-      root.addEventListener && root.addEventListener("blur", leave);
+      onHidden = function () { if (doc.visibilityState === "hidden") leave(); };
+      onBlur = leave;
+      doc.addEventListener("visibilitychange", onHidden);
+      root.addEventListener && root.addEventListener("blur", onBlur);
+    }
+
+    // Voice (V1-5 room hook). voice.js is optional: a page without it draws no control and reads nothing. The module decides
+    // every autoplay question (setting, backlog, hidden, unlocked, the one-waiting queue); this view only reports what the
+    // record shows: the finished replies, which of them were already there at mount, and the operator's own taps.
+    function voice() { return root.LevainVoice || null; }
+    var wraps = {}, voiceThread = null, voiceBase = 0, voiceHold = false;
+    function voiceKey(r) { return r.thread + ":" + r.gseq; }
+    function voiceTap() { var V = voice(); if (V) { V.unlock(); V.stop(); } }     // inside the operator's own tap
+    function voiceBtn(r) {
+      var V = voice(), k = voiceKey(r);
+      if (!V) return null;
+      if (!own(wraps, k)) { var b = V.button(r); if (b) wraps[k] = b; return b || null; }       // a falsy button is not kept
+      return wraps[k];
+    }
+    // after a draw: drop the controls of replies that are gone, then hand the module each reply that finished after mount
+    function voiceSync(m) {
+      var V = voice(), live = {};
+      m.replies.forEach(function (r) { live[voiceKey(r)] = true; });
+      Object.keys(wraps).forEach(function (k) {
+        if (!own(live, k)) { var w = wraps[k]; delete wraps[k]; if (!w) return; if (w.parentNode) w.parentNode.removeChild(w); if (w._unbind) w._unbind(); }
+      });
+      if (m.thread === null) {                              // no open room: nothing plays on, and the next room is backlog again
+        if (voiceThread !== null) { voiceThread = null; voiceBase = 0; if (V) V.stop(); }
+        return;
+      }
+      if (!V) return;
+      if (voiceThread !== m.thread) {                       // the first body of this mount, or a new conversation
+        if (voiceThread !== null) V.stop();
+        voiceThread = m.thread;
+        voiceBase = m.replies.reduce(function (a, r) { return r.gseq > a ? r.gseq : a; }, 0);
+        V.arm(voiceBase);
+        return;
+      }
+      if (voiceHold) return;                                // a New is pending: the old room's replies are not read
+      m.replies.forEach(function (r) { if (r.gseq > voiceBase) V.replyFinished(r); });
+    }
+    function voiceEnd() {
+      var V = voice();
+      Object.keys(wraps).forEach(function (k) { var w = wraps[k]; delete wraps[k]; if (w && w._unbind) w._unbind(); });
+      if (V) V.stop();
     }
 
     var hooks = {
+      voiceBtn: voiceBtn,
       onMark: function (ref, delivered, mnote, done) {
         mnote.textContent = "Marking...";
         post("mark", { room_thread_id: thread, message_id: ref, delivered: delivered }).then(function (r) {
@@ -629,6 +752,7 @@
           btns.forEach(function (b) { b.disabled = false; });
         }).catch(function () { cnote.textContent = "The server could not be reached."; btns.forEach(function (b) { b.disabled = false; }); });
       },
+      modelSlot: modelEl,
       ids: savedCards.ids && typeof savedCards.ids === "object" ? savedCards.ids : {},
       saveCards: function () { saveCards(); }
     };
@@ -650,7 +774,8 @@
               if (current.thread === hushed.thread && current.error === hushed.error) current.error = "";
               hushed = null;                // spent on its first poll, or sooner when the thread or the error moved
             }
-            var stick = thread === null || atEnd();
+            var stick = thread === null || forceEnd || atEnd();
+            forceEnd = false;
             if (current.thread !== thread) {
               stick = true;
               ui.open = {}; thread = current.thread;
@@ -658,6 +783,7 @@
               if (thread !== cardsThread) { drafts = {}; hooks.ids = {}; cardsThread = thread; saveCards(); }
             }
             renderRoom(doc, body, current, hooks, ui, drafts);
+            voiceSync(current);
             if (stick) toEnd();
             wasEnd = atEnd(); paintJump();
           }
@@ -666,9 +792,18 @@
       }).catch(function () { if (!stopped) { clear(body); body.appendChild(el(doc, "div", "rv-note", "The room could not be read.")); last = ""; } });
     }
     function loop() { if (!stopped && pollMs > 0) timer = setTimeout(function () { pull().then(loop); }, pollMs); }
+    grow();
     paintDock();
     pull().then(loop);
-    return { stop: function () { stopped = true; clearTimeout(timer); endDictation(); if (root.removeEventListener) root.removeEventListener("resize", onResize); }, refresh: function () { last = ""; return pull(); }, model: function () { return current; } };
+    return { stop: function () {
+      stopped = true; clearTimeout(timer); endDictation(); voiceEnd(); if (root.removeEventListener) root.removeEventListener("resize", onResize);
+      if (onHidden) doc.removeEventListener("visibilitychange", onHidden);
+      if (onBlur && root.removeEventListener) root.removeEventListener("blur", onBlur);
+      if (vv) {
+        vv.removeEventListener("resize", fitViewport); vv.removeEventListener("scroll", fitViewport);
+        rootEl.style.removeProperty("--rv-vvh"); rootEl.style.removeProperty("--rv-vvt"); if (doc.body) doc.body.classList.remove("rv-kb");
+      }
+    }, refresh: function () { last = ""; return pull(); }, model: function () { return current; } };
   }
 
   var api = { roomModel: roomModel, lineModel: lineModel, sendWords: sendWords, renderRoom: renderRoom, mount: mount };

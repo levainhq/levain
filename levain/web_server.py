@@ -1263,6 +1263,9 @@ _ASSETS: dict[str, tuple[str, str]] = {
     "/pair": ("pair.html", "text/html; charset=utf-8"),
     "/pair.js": ("pair.js", "text/javascript; charset=utf-8"),
     "/devices_panel.js": ("devices_panel.js", "text/javascript; charset=utf-8"),
+    # Reading the room aloud (voice V1-5): the player, the per-reply control and the settings store. Loaded by the Voice
+    # block once /cockpit/voice.json answers; it calls POST /cockpit/voice/speak and no other route.
+    "/voice.js": ("voice.js", "text/javascript; charset=utf-8"),
     "/pair_card.js": ("pair_card.js", "text/javascript; charset=utf-8"),
     # The passkey-making page: a static shell (its reads and its one POST are same-origin and gated) that makes a passkey on
     # this device and prints the laptop commands that enrol it, through POST /cockpit/passkey/key-line (served beside a Signer).
@@ -1278,6 +1281,9 @@ _ASSETS: dict[str, tuple[str, str]] = {
     # trace ring from this origin's Cache Storage. It does not load sw_open.js, so opening it never claims a pending tap.
     "/tap_trace": ("tap_trace.html", "text/html; charset=utf-8"),
     "/tap_trace.js": ("tap_trace.js", "text/javascript; charset=utf-8"),
+    # devtest (band 299): the notification-action device test page; a token-free shell, it reports through the gated POST /webpush/devtest.
+    "/devtest": ("devtest.html", "text/html; charset=utf-8"),
+    "/devtest.js": ("devtest.js", "text/javascript; charset=utf-8"),
     # An old phone link (the phone port shared this origin before the cockpit took it): see the file's header.
     "/legacy_phone_link.js": ("legacy_phone_link.js", "text/javascript; charset=utf-8"),
     # The sign sheet's script (OS-1): its page is GET /sign/<id>, served by _route beside a Signer.
@@ -1340,6 +1346,7 @@ _CENTER_POST = frozenset({_CENTER_READ, _CENTER_READ_ALL, _CENTER_DELETE, _CENTE
 _PUSH_GET = frozenset({"/webpush/key", "/webpush/record", _POLICY_PATH, _PRESENCE_PATH, _NOTIFY_TOKENS, _CENTER,
                        _CENTER_ITEM})
 _PUSH_POST = frozenset({"/webpush/subscribe", "/webpush/unsubscribe", "/webpush/opened", "/webpush/test", "/webpush/trace",
+                        "/webpush/landed", "/webpush/devtest", "/webpush/devtest/send",
                         _POLICY_SET, _POLICY_RESET, _PRESENCE_SET, _PRESENCE_TOKEN_NEW, _PRESENCE_TOKEN_REVOKE,
                         _NOTIFY_TOKENS, _NOTIFY_TOKENS_REVOKE, *_CENTER_POST})
 _PUSH_SUBSCRIBE = "/webpush/subscribe"
@@ -5906,10 +5913,12 @@ def run_web_server(
     return 0
 
 
-def _build_room_serve(room: Path) -> Any:
+def _build_room_serve(room: Path, host_commands: Any = None) -> Any:
     """The :class:`~levain.coordinator.room_serve.RoomServe` ``levain serve --room DIR`` hands ``make_server``, over the
     consent queue's ``dispatch.db`` (the file the cockpit's room reads). ``DIR`` is where the room's file tools see first:
-    an existing directory. Built here, started by ``make_server`` after every refusal has passed."""
+    an existing directory. Built here, started by ``make_server`` after every refusal has passed. ``host_commands`` is
+    the host's :class:`~levain.coordinator.room_host.HostCommands` (flow's bridge passes its desk relay and replies
+    commands; levain names no script): None keeps the room as it was, ``propose_drop`` and his tap on the card."""
     from levain.consent.queue import default_queue_dir
     from levain.coordinator.envelopes import EnvelopeStore
     from levain.coordinator.room_launch import RoomSetting
@@ -5921,7 +5930,7 @@ def _build_room_serve(room: Path) -> Any:
     queue = _canonical_path(Path(default_queue_dir()))
     _room_dir_refusal(cwd, queue)
     # the deny rules are written from these spellings: the canonical ones the refusal checked (roomfix2 K1)
-    return RoomServe(EnvelopeStore(queue), RoomSetting(str(cwd)), run_dir=str(queue / "room-run"),
+    return RoomServe(EnvelopeStore(queue), RoomSetting(str(cwd), host=host_commands), run_dir=str(queue / "room-run"),
                      launcher_kw={"home": str(_canonical_path(Path.home())), "levain_home": str(queue.parent)})
 
 

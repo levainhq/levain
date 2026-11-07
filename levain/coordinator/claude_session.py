@@ -45,7 +45,7 @@ import threading
 import time
 import unicodedata
 from collections import deque
-from collections.abc import Callable, Iterable, Iterator, Mapping
+from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, ClassVar, NamedTuple, Protocol, runtime_checkable
@@ -59,7 +59,7 @@ from levain.coordinator.driver import (APPROVAL_SUBTYPE, ApprovalAnswer, Capabil
 __all__ = [
     "CLOSE_BOUND", "CONN_MAX", "ROOM_DENIED_TOOLS", "ROOM_MCP_SERVER", "ROOM_MCP_TOOL", "ROOM_TOOLS", "SEQ_MAX", "CanaryVerdict",
     "ClaudeSession", "NotLive", "PipeTransport", "Probe", "Transport", "TransportClosed", "canary_denied",
-    "default_deny_paths", "open_probe", "room_argv", "room_hook_command", "room_settings_json",
+    "default_deny_paths", "open_probe", "room_argv", "room_door_tools", "ROOM_DOOR_NAMES", "room_hook_command", "room_settings_json",
     "ROOM_READ_REFUSAL",
 ]
 
@@ -77,7 +77,18 @@ ROOM_MCP_TOOL = "mcp__levain_room__propose_drop"
 # has no fetch (WebFetch is denied), no shell and no write. `levain serve --room`'s help says this in plain words.
 ROOM_TOOLS = ("Read", "Grep", "Glob", "WebSearch")
 ROOM_DENIED_TOOLS = ("Bash", "Edit", "Write", "NotebookEdit", "WebFetch")
-_ROOM_INIT_TOOLS = frozenset((*ROOM_TOOLS, ROOM_MCP_TOOL))
+# D2: the door's tool names a host may configure; the full name is what the vendor's init and --allowedTools carry
+ROOM_DOOR_NAMES = ("propose_drop", "relay_to_desk", "desk_replies")
+
+
+def room_door_tools(names: Sequence[str] | None = None) -> tuple[str, ...]:
+    """The vendor-side names (``mcp__levain_room__<name>``) of the door tools ``names`` (short names, default just
+    ``propose_drop``). A name outside :data:`ROOM_DOOR_NAMES` or a repeat raises ValueError: the room's tool set is a
+    closed list, never a string a caller composed."""
+    names = ("propose_drop",) if names is None else tuple(names)
+    if not names or len(set(names)) != len(names) or any(n not in ROOM_DOOR_NAMES for n in names):
+        raise ValueError(f"the door's tools are drawn from {ROOM_DOOR_NAMES}, each once, at least one")
+    return tuple(f"mcp__{ROOM_MCP_SERVER}__{n}" for n in names)
 _INIT_KEEP = ("type", "subtype", "session_id", "cwd", "tools", "mcp_servers", "model", "permissionMode",
               "claude_code_version", "uuid")
 
@@ -1074,7 +1085,8 @@ def room_settings_json(workdir: str | os.PathLike[str], deny_paths: Iterable[str
 
 
 def room_argv(*, mcp_config: str | os.PathLike[str], settings: str | os.PathLike[str], model: str | None = None,
-              session_id: str | None = None, resume: str | None = None, claude_bin: str = "claude") -> list[str]:
+              session_id: str | None = None, resume: str | None = None, claude_bin: str = "claude",
+              door_tools: Sequence[str] | None = None) -> list[str]:
     """The §2.4 argv: read-only file tools, web search and the room's one MCP door, nothing else, ``dontAsk`` so a
     call outside the allow list is denied without a prompt. Exactly one of ``session_id`` (``--session-id``) and
     ``resume`` (``--resume``). No ``--dangerously-skip-permissions``, no ``--bare`` and no ``--restricted``: the child
@@ -1090,7 +1102,7 @@ def room_argv(*, mcp_config: str | os.PathLike[str], settings: str | os.PathLike
     if model:
         argv += ["--model", model]
     argv += ["--tools", ",".join(ROOM_TOOLS),
-             "--allowedTools", ",".join((*ROOM_TOOLS, ROOM_MCP_TOOL)),
+             "--allowedTools", ",".join((*ROOM_TOOLS, *room_door_tools(door_tools))),
              "--disallowedTools", ",".join(ROOM_DENIED_TOOLS),
              "--strict-mcp-config", "--mcp-config", str(mcp_config),
              "--setting-sources", "user",
@@ -1105,7 +1117,7 @@ class Probe(NamedTuple):
     reason: str
 
 
-def open_probe(init: Mapping[str, Any] | None) -> Probe:
+def open_probe(init: Mapping[str, Any] | None, door_tools: Sequence[str] | None = None) -> Probe:
     """Judge one ``init`` (a frame, or :attr:`LivenessEvidence.raw`): live only for EXACTLY the room's tools and the
     room's one MCP door, connected, under ``dontAsk``. Anything else, or no ``init``, is not live with the reason. The
     ``init`` cannot show deny rules: :func:`canary_denied` is that check."""
@@ -1114,8 +1126,9 @@ def open_probe(init: Mapping[str, Any] | None) -> Probe:
     tools = init.get("tools")
     if not isinstance(tools, list) or not all(isinstance(t, str) for t in tools):
         return Probe(False, "the init names no tool list")
-    if len(set(tools)) != len(tools) or set(tools) != _ROOM_INIT_TOOLS:
-        extra, missing = sorted(set(tools) - _ROOM_INIT_TOOLS), sorted(_ROOM_INIT_TOOLS - set(tools))
+    want = frozenset((*ROOM_TOOLS, *room_door_tools(door_tools)))
+    if len(set(tools)) != len(tools) or set(tools) != want:
+        extra, missing = sorted(set(tools) - want), sorted(want - set(tools))
         return Probe(False, f"the tool set is not the room's (extra {extra[:6]}, missing {missing[:6]})")
     servers = init.get("mcp_servers")
     if not isinstance(servers, list) or len(servers) != 1 or not isinstance(servers[0], Mapping):

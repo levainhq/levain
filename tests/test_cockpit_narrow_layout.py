@@ -102,7 +102,7 @@ def test_the_grants_tab_opens_the_decisions_view_at_the_standing_grants(tmp_path
 def test_the_drop_tab_scrolls_to_the_hero_box_and_focuses_it_with_no_view_opened(tmp_path: Path, monkeypatch) -> None:
     rig = FullRig(tmp_path, monkeypatch)
     url = f"{rig.origin}/#write_token={TOK}"
-    steps = [*PHONE_TOUCH, {"until": NEEDS, "ms": 30000}, {"until": "document.querySelector('#ck-drop-words:not(:disabled)')", "ms": 30000}, SETTLE,
+    steps = [*PHONE_TOUCH, {"until": NEEDS, "ms": 30000}, {"until": "document.querySelector('#ck-drop-words:not([aria-disabled=true])')", "ms": 30000}, SETTLE,
              {"eval": "window.scrollTo(0, 2500); 1"}, {"eval": "document.querySelector('[data-phone-jump=drop]').click(); 1"},
              {"eval": "new Promise(r => setTimeout(r, 900)).then(() => 1)"},
              {"eval": "JSON.stringify({ top: Math.round(document.getElementById('ck-drop').getBoundingClientRect().top), modal: !!document.getElementById('levain-modal'),"

@@ -247,6 +247,8 @@ def _serve(stub: Stub):
         def do_POST(self) -> None:
             req = json.loads(self.rfile.read(int(self.headers.get("Content-Length", "0"))) or b"{}")
             action = self.path.rsplit("/", 1)[-1]
+            if action == "landed":      # the page's own tap report (the notification-tap landing), not a draft action: answered, never counted
+                return self._send(200, b"{}", "application/json")
             stub.posts.append((action, req))
             status, body = stub.reply(action, req)
             if status == 0:              # a lost reply: the connection closes with nothing on it (HTTP/1.0, so no retry)

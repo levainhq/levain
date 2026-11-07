@@ -12,7 +12,7 @@ const fs = require('fs');
 const vm = require('vm');
 const [swOpen, scenario = 'messages'] = process.argv.slice(2);
 let handlers = [], winHandlers = {}, docHandlers = {};
-const log = { assigned: [], acks: [], started: false };
+const log = { assigned: [], acks: [], started: false, landed: [] };
 const store = new Map();
 const PFX = '/__levain_open/';
 const keyOf = (r) => (typeof r === 'string' ? r : new URL(r.url).pathname);
@@ -29,20 +29,25 @@ const put = (nonce, e) => store.set(PFX + nonce, JSON.stringify({ nonce, ...e })
 const has = (nonce) => store.has(PFX + nonce);
 const left = () => [...store.keys()].map((k) => k.slice(PFX.length)).sort();
 let sandbox;
+let skewMs = 0;   // 'resume' scenario: the page's clock runs this far ahead of the rig's
 let standalone = true, tray = [], trayThrows = false, noGetN = false, navType = null, onGetN = null;   // 'shown' scenario knobs: display mode, what the tray holds
 const tick = () => new Promise((r) => setTimeout(r, 30));
 async function boot(href = 'https://box.example/') {
   handlers = []; winHandlers = {}; docHandlers = {};
   sandbox = {
-    URL, Response, Date: scenario === 'datethrow' ? Object.assign(class extends Date { static now() { throw new Error('clock'); } }) : Date, Promise, JSON, setTimeout, clearTimeout,
-    location: { origin: 'https://box.example', href, assign: (u) => log.assigned.push(u) },
-    matchMedia: (q) => ({ matches: scenario === 'shown' && standalone && /standalone/.test(q) }),
-    navigator: { get standalone() { return scenario === 'shown' ? false : true; }, serviceWorker: { controller: {},
+    URL, URLSearchParams, Response, Date: scenario === 'datethrow' ? Object.assign(class extends Date { static now() { throw new Error('clock'); } }) : scenario === 'resume' ? class extends Date { static now() { return super.now() + skewMs; } } : Date, Promise, JSON, setTimeout, clearTimeout,
+    location: { origin: 'https://box.example', href, pathname: new URL(href).pathname, search: new URL(href).search, hash: new URL(href).hash, assign: (u) => log.assigned.push(u) },
+    matchMedia: (q) => ({ matches: (scenario === 'shown' || scenario === 'resume') && standalone && /standalone/.test(q) }),
+    navigator: { get standalone() { return scenario === 'shown' || scenario === 'resume' ? false : true; }, serviceWorker: { controller: {},
       getRegistration: async () => (noGetN ? {} : { getNotifications: async (f) => { log.getN = (log.getN || []).concat([f]); if (onGetN) await onGetN(); if (trayThrows) throw new TypeError('no'); return tray.filter((n) => !f || !f.tag || n.tag === f.tag); } }), addEventListener: (t, fn) => handlers.push(fn), startMessages: () => { log.started = true; } } },
     performance: navType ? { getEntriesByType: () => [{ type: navType }] } : undefined,
     window: { addEventListener: (t, fn) => { (winHandlers[t] = winHandlers[t] || []).push(fn); } },
     document: { visibilityState: 'hidden', addEventListener: (t, fn) => { (docHandlers[t] = docHandlers[t] || []).push(fn); } },
   };
+  if (scenario === 'resume') {   // the page's own landing reports: a paired page holds the key, and posts with fetch
+    sandbox.window.localStorage = { getItem: (k) => (k === 'levain_write_token' ? 'KEY' : null) };
+    sandbox.fetch = (u, o) => { log.landed.push({ u, key: o.headers['X-Levain-Write-Token'], method: o.method, keepalive: o.keepalive, body: JSON.parse(o.body) }); return Promise.resolve({}); };
+  }
   if (scenario !== 'nocache') sandbox.caches = { open: async (n) => (n === 'levain-trace' ? traceCache : cache) };
   vm.createContext(sandbox);
   vm.runInContext(fs.readFileSync(swOpen, 'utf8'), sandbox);
@@ -195,6 +200,53 @@ const fire = async (t, o, ev = {}) => { for (const fn of (o[t] || [])) fn(ev); a
     // the legacy singleton key (the first version, no ping suffix) is swept and never judged
     await run('legacy', { none: true, extra: () => store.set(PFX + 'shown', JSON.stringify({ url: SHOWN_U, nonce: 'old', at: Date.now(), for: 'shown', ping: 607, tag: 'np-607' })) });
     log.legacyLeft = store.has(PFX + 'shown');
+  } else if (scenario === 'resume') {
+    // The app coming forward RESUMES the document (no load): visibilitychange -> visible judges the 'shown' entries again. Each
+    // case: a NEW document at `href` with no entry, then the entry is written (and the tray set), then the page turns visible.
+    const TRAY = { tag: 'np-607', data: { ping: 607 } };
+    const resume = async (name, { href = 'https://box.example/', skew = 0, st = true, mid = [], entry = {}, none = false, hidden = false, cycles = 1, retryTray = null, burst = false, hideBeforeRetry = false, newUrl = null } = {}) => {
+      store.clear(); log.assigned.length = 0; log.landed.length = 0; standalone = st; tray = []; navType = null; trayThrows = false; noGetN = false; onGetN = null;
+      skewMs = 0;
+      if (newUrl) put('nw', { url: newUrl, at: Date.now(), for: 'new' });   // a 'new' entry waiting BEFORE the page script runs
+      await boot(href);
+      skewMs = skew;   // the load landing is told at boot; a resume more than 30 s later is told again
+      if (!none) putShown(entry);
+      tray = mid;
+      for (let i = 0; i < cycles; i++) {
+        sandbox.document.visibilityState = hidden ? 'hidden' : 'visible';
+        if (burst) { for (const fn of (docHandlers.visibilitychange || [])) { fn({}); fn({}); } await tick(); }   // two returns before the first check settles
+        else await fire('visibilitychange', docHandlers);
+      }
+      if (hideBeforeRetry) sandbox.document.visibilityState = 'hidden';   // the app went away again inside the 1.5 s
+      if (retryTray) tray = retryTray;
+      await new Promise((r) => setTimeout(r, 1700));   // the 1.5 s retry of a resume that took nothing runs inside this case
+      log[name] = { assigned: log.assigned.slice(), kept: shownKeys().length > 0, hows: log.landed.map((l) => l.body.how), targets: log.landed.map((l) => l.body.target), post: log.landed[0] };
+    };
+    await resume('forward');                                       // the notification is gone: forwarded to the entry's url, once
+    await resume('forwardTwice', { cycles: 2 });                   // a second visible finds nothing to take, and is throttled
+    await resume('inTray', { mid: [TRAY] });                       // still showing: no move; the resume landing is throttled 30 s after the load's
+    await resume('inTrayLater', { mid: [TRAY], skew: 31000 });     // 31 s on: no move, told as a plain resume
+    await resume('retry', { mid: [TRAY], retryTray: [] });         // gone by the 1.5 s retry: forwarded then
+    await resume('retrySkew', { mid: [TRAY], retryTray: [], skew: 31000 });   // 31 s on: the retry forwards, and NO plain resume was told first
+    await resume('retryNone', { mid: [TRAY], skew: 31000 });                   // in the tray at the retry too: one plain resume, told after it
+    await resume('retryHidden', { mid: [TRAY], retryTray: [], hideBeforeRetry: true });   // hidden again by the retry: it takes and moves nothing
+    await resume('burst', { skew: 31000, burst: true });                       // two returns at once: one check; the busy one tells nothing
+    await resume('encPath', { href: 'https://box.example/my%20doc?view=needs', none: true });          // outside the grammar once decoded: '/'
+    await resume('encOk', { href: 'https://box.example/sign/%39?view=needs', none: true });            // decodes to an allowed path
+    await resume('encSlash', { href: 'https://box.example/%2F%2Fx', none: true });                      // decodes to '//x': never a target
+    await resume('encItem', { href: 'https://box.example/?view=needs&item=a%0A', none: true });         // an item ending in a newline is no item
+    // the landing names the target the notification CARRIED, not the address the document holds (the cockpit strips deep-link params)
+    const NEEDS = '/?view=needs&item=np-0b62cd3b';
+    await resume('newAssign', { newUrl: NEEDS, none: true });                                      // page at '/', entry for the item: assigned, told with the item
+    await resume('newHere', { href: 'https://box.example' + NEEDS, newUrl: NEEDS, none: true });   // already on it: consumed, told with the item
+    await resume('shownAssign', { entry: { url: NEEDS } });                                        // resume>shown forwards to the item
+    await resume('expired', { entry: { at: Date.now() - 181000 } });
+    await resume('fresh', { entry: { at: Date.now() - 170000 } });
+    await resume('nonBare', { href: 'https://box.example/?view=needs' });
+    await resume('tokenHref', { href: 'https://box.example/?write_token=SECRET&view=needs&item=np-0b62cd3b#sign=a', none: true, hidden: true });   // the load landing's target
+    await resume('notStandalone', { st: false });
+    await resume('hidden', { hidden: true });
+    await resume('throttle', { none: true, cycles: 4, skew: 31000 });   // no entry: ONE 'resume' landing, however many returns inside 30 s
   } else if (scenario === 'ntap') {
     // a tap's page address carries the notification-center item id: the trace says THAT it did, never which
     await boot('https://box.example/?view=notifications&n=p123456');

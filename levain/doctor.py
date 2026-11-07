@@ -24,8 +24,10 @@ install is otherwise indistinguishable from a working one.
 
 from __future__ import annotations
 
+import ast
 import contextlib
 import contextvars
+import dataclasses
 import json
 import os
 import re
@@ -161,6 +163,7 @@ def _run_doctor(path: Path, invoke: bool = False, repin_hooks: bool = False) -> 
     core.extend(_check_continuity_headroom(install))
     core.extend(_check_compat_set(install))
     core.extend(_check_consent_hooks(install))
+    core.extend(_guarded("consent ping reach", lambda: _check_consent_ping_reach(install)))
     core.extend(_check_consent_limits())
     core.extend(_check_chat_network())
     core.extend(_check_phone_path())
@@ -502,6 +505,99 @@ def _check_phone_path(*, which: Any = None, run: Any = None, port: int | None = 
                                                 f"tailnet can reach it at {_serve_url(key, dns)}")]
     return [CheckResult(name, True, f"tailscale is running but not serving the cockpit port {port}, so a phone "
                                     "cannot reach this laptop yet", fix_serve, warn=True)]
+
+
+def _consent_hook_in_settings(install: Path, environ: Any = None) -> tuple[str, Path | None] | None:
+    """How a Claude Code settings file of this workspace wires levain's consent hook, and the queue directory that
+    hook binds: ``None`` (not wired), ``("static", dir)`` (the shape `levain init` wires: the static script in the
+    activation tree, in the file :func:`levain.host_guard.cc_levain_hooks_file` names; it binds
+    ``$LEVAIN_HOME/consent`` through :func:`levain.consent.queue.queue_dir_for`), ``("legacy", dir)`` (the earlier
+    per-workspace script, whose own ``--queue-dir`` literal is the queue, else ``$LEVAIN_HOME/consent``), or
+    ``("unreadable", None)`` when levain's hook is named in the wiring but cannot be read or recognised. Reads only."""
+    from levain.consent.adapters import claude_code
+    from levain.consent.canary import _config_references
+    from levain.consent.queue import queue_dir_for
+    from levain.host_guard import cc_levain_hooks_file
+    from levain.install import CONSENT_HOOK_SCRIPTS
+
+    env = os.environ if environ is None else environ
+    legacy = (install / ".claude" / "hooks" / claude_code.HOOK_SCRIPT_NAME, install / ".claude" / "settings.json", "legacy")
+    static = (install / "activation" / "hooks" / CONSENT_HOOK_SCRIPTS["claude-code"], cc_levain_hooks_file(install), "static")
+    unreadable = False
+    for script, config, kind in (legacy, static):
+        text = None
+        try:
+            text = config.read_text(encoding="utf-8")
+            json.loads(text)
+        except FileNotFoundError:
+            continue
+        except (OSError, ValueError):
+            unreadable = unreadable or script.is_file() or (text is not None and script.name in text)   # the hook is there, or the file names it
+            continue
+        if _config_references(config, script):
+            if kind == "static":
+                return "static", queue_dir_for(env)
+            try:
+                calls = re.findall(r"sys\.exit\(main\((\[[^\n]*\])\)\)", script.read_text(encoding="utf-8"))
+                argv = ast.literal_eval(calls[-1]) if calls else None     # the last call; text after it is not the wiring
+                if not isinstance(argv, list):
+                    return "unreadable", None
+            except (OSError, ValueError, SyntaxError):
+                return "unreadable", None
+            if "--queue-dir" in argv:
+                i = argv.index("--queue-dir")
+                return ("legacy", Path(str(argv[i + 1]))) if i + 1 < len(argv) else ("unreadable", None)
+            return "legacy", queue_dir_for(env)
+        if script.name in text and "PermissionRequest" in text:
+            unreadable = True      # names levain's hook script but not in a shape levain recognises
+    return ("unreadable", None) if unreadable else None
+
+
+def _check_consent_ping_reach(install: Path, *, environ: Any = None) -> list[CheckResult]:
+    """The ``consent ping reach`` row: when levain's consent hook is wired into Claude Code's settings, a request it
+    holds pings the operator only if the queue directory THAT HOOK binds (:func:`_consent_hook_in_settings`:
+    ``$LEVAIN_HOME/consent`` for the hook `levain init` wires, as :func:`levain.consent.queue.queue_dir_for` binds
+    it; the ``--queue-dir`` literal of an earlier per-workspace script) has a ping route: a ``notify_argv`` command
+    the runtime can start (:func:`levain.consent.adapters.claude_code.notify_command_path`, the resolution
+    ``run_notify_command`` uses, under the child's PATH, and an existing executable file) or a paired phone with pings
+    on (the phone branch of :func:`levain.consent.adapters.claude_code.ping_configured`, i.e. ``levain.webpush.live``:
+    a configured route, not a live connection). Without one the held request reaches nobody, so
+    it is a WARN, never a FAIL: the hook fails toward the operator's own dialog, so nothing is allowed or lost. The
+    hook not wired here: no row; wired but unreadable: a WARN saying so. The queue is read from THIS process's
+    environment. Read-only."""
+    from levain.consent.adapters import claude_code
+    from levain.launch import child_env
+
+    row = "consent ping reach"
+    found = _consent_hook_in_settings(install, environ)
+    if found is None:
+        return []
+    kind, queue_dir = found
+    if queue_dir is None:
+        return [CheckResult(row, True, "levain's consent hook is named in the Claude Code settings, but the wiring could "
+                            "not be read (malformed settings or hook script), so whether a held request pings you is unknown",
+                            "run `levain update` to rewrite the consent hook, or fix the settings file", warn=True)]
+    try:
+        settings = claude_code.load_settings(queue_dir)
+    except OSError as exc:
+        return [CheckResult(row, True, f"the consent hook is installed, but the queue at {queue_dir} could not be read "
+                            f"({type(exc).__name__}), so whether a held request pings you is unknown",
+                            f"check that {queue_dir} exists and is readable", warn=True)]
+    cmd = claude_code.notify_command_path(settings, child_env())
+    runnable = cmd is not None and os.path.isfile(cmd) and os.access(cmd, os.X_OK)   # the runtime's resolution, and Popen can start it
+    # the phone branch only: ping_configured is True for ANY notify_argv, which is the false OK this row exists to close
+    if runnable or claude_code.ping_configured(dataclasses.replace(settings, notify_argv=()), queue_dir):
+        return [CheckResult(row, True, f"a held request pings you: the queue at {queue_dir} has a ping route")]
+    if settings.notify_argv:
+        why = (f"its notify command {settings.notify_argv[0]!r} cannot be started (a relative path, or not found on "
+               "the hook's PATH) and no paired phone has pings on")
+    else:
+        why = "no notify command, no paired phone with pings on"
+    return [CheckResult(
+        row, True,
+        f"the consent hook is installed, but the queue at {queue_dir} has no ping route ({why}): a held request will reach nobody",
+        f"pair a phone with pings on for this queue, or set `notify_argv` (an absolute path) in {queue_dir / claude_code.SETTINGS_NAME}",
+        warn=True)]
 
 
 def _check_consent_limits() -> list[CheckResult]:

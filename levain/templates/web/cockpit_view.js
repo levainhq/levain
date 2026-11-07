@@ -378,10 +378,13 @@
           const sv = (x) => (typeof x === "string" ? x : "");
           line.question = { id: r.id, n: isNum(f.question_n) ? f.question_n : 0, agent: sv(f.agent), state: sv(f.question_state),
                             options: isNum(f.question_options) ? f.question_options : 0,
+                            at: typeof f.at === "string" ? f.at : "",
                             age: typeof f.at === "string" ? ageLabel(f.at, nowMs || Date.now(), "") : "",
                             decidedAge: typeof f.decided_at === "string" ? ageLabel(f.decided_at, nowMs || Date.now(), "") : "",
                             decidedAt: typeof f.decided_at === "string" ? f.decided_at : "",
                             offered: (Array.isArray(r.actions) ? r.actions : []).some((a) => a && a.verb === "question_answer" && a.gesture === "direct"),
+                            section: f.question_section === "you" || f.question_section === "desk" ? f.question_section : "",
+                            carried: f.question_carried === true,
                             sign: signOf(f) };
         }
         // a coordinator review item: its state, whether it is "yours to clear", and the one verb the kernel offers on it
@@ -711,6 +714,7 @@
     if (isObj(m.transport)) {
       view.writable = m.transport.writable === true;
       view.write_token_required = m.transport.write_token_required === true;
+      if (m.transport.mockup_layout_switch === true) view.mockup_layout_switch = true;   // a scratch preview's A/B switch; a real server never sends it
     }
     for (const e of m.errors || []) view.errors[e.source || "manifest"] = e.message;
 
@@ -1827,13 +1831,19 @@
     if (err) s.body.appendChild(el("p", "err", "search failed — " + err));
     else if (!items.length) s.body.appendChild(el("p", "empty" + (store && !s.results ? " loading" : ""), store && !s.results ? "searching…" : (terms.length ? "no match" : d.empty)));
     // the first screenful, unless the operator asked for all of it or is filtering
-    const cap = s.searchable && !nq && !s.showAll && items.length > (sr.visible || 10) ? (sr.visible || 10) : items.length;
-    const shown = items.slice(0, cap);
+    // the Decisions card's tabs are classified from every filtered row; the chosen tab's rows are what get paginated
+    const CF = root.LevainCardFormat;
+    const rowShaped = d.kind !== "roster" && d.kind !== "log" && s.ctx.rows;
+    const pg = rowShaped && CF && typeof CF.deskTabPage === "function" ? CF.deskTabPage(items, CF.getDeskTab(), items.length) : null;
+    const tabbed = !!(pg && pg.dt.show);
+    const pool = tabbed ? pg.shown : items;
+    const cap = s.searchable && !nq && !s.showAll && pool.length > (sr.visible || 10) ? (sr.visible || 10) : pool.length;
+    const shown = pool.slice(0, cap);
     if (d.kind === "roster") paintRoster(s.body, shown, d);
     else if (d.kind === "log") paintLog(s.body, shown);
-    else if (s.ctx.rows) s.ctx.rows(s.body, shown);
-    if (cap < items.length) {
-      const more = el("button", "xmore", "show all " + items.length);
+    else if (s.ctx.rows) s.ctx.rows(s.body, shown, tabbed ? { dt: pg.dt, tags: pg.tags.slice(0, cap), onTab: () => paint(s) } : null);
+    if (cap < pool.length) {
+      const more = el("button", "xmore", "show all " + pool.length);
       more.type = "button";
       more.addEventListener("click", () => { s.showAll = true; paint(s); });
       s.body.appendChild(more);

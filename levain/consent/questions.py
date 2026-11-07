@@ -146,6 +146,10 @@ class Question:
     # ``stopped_full``). Display only: ``blocks`` is the text a signature covers, and the card draws this one only when it has
     # exactly those words. The kernel's store sets none
     blocks_full: str = ""
+    # the host's band section for this question ("you" or "desk"; "" = the host has none) and whether a desk row has been
+    # open long enough to also list under "you". Both are the host's data, passed through: levain never classifies or ages a row
+    section: str = ""
+    carried: bool = False
 
     @property
     def open_ended(self) -> bool:

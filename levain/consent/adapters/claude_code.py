@@ -1594,6 +1594,20 @@ def prompt_notice(queue_dir: Path | str | None, agent: str, what: str, ref: str,
         return False
 
 
+def notify_command_path(settings: AdapterSettings, env: Mapping[str, str]) -> str | None:
+    """The absolute path :func:`run_notify_command` would start for ``settings.notify_argv`` under ``env``'s PATH, or
+    ``None`` when it would not (no command, a relative path, a bare name not found or found only through a relative
+    PATH entry). Side-effect free; the one resolution the runtime and the doctor share."""
+    import shutil
+
+    if not settings.notify_argv:
+        return None
+    command = settings.notify_argv[0]
+    if "/" not in command:
+        command = shutil.which(command, path=env.get("PATH", os.defpath)) or ""
+    return command if os.path.isabs(command) else None
+
+
 def run_notify_command(settings: AdapterSettings, message: str, *, cwd: Path | str | None,
                        env_extra: Mapping[str, str] | None = None, phone_url: bool = True) -> bool:
     """Start the ``notify_argv`` command with ``message`` as its last argument (the phone page's link after it when
@@ -1602,7 +1616,6 @@ def run_notify_command(settings: AdapterSettings, message: str, *, cwd: Path | s
     (:mod:`levain.consent.band_notice`). True when the command started."""
     if not settings.notify_argv:
         return False
-    import shutil
     import subprocess
 
     from levain.launch import child_env
@@ -1613,10 +1626,8 @@ def run_notify_command(settings: AdapterSettings, message: str, *, cwd: Path | s
         env = child_env()
         if env_extra:
             env.update({k: str(v) for k, v in env_extra.items()})   # Popen takes only str values
-        command = settings.notify_argv[0]
-        if "/" not in command:
-            command = shutil.which(command, path=env.get("PATH", os.defpath)) or ""
-        if not os.path.isabs(command):
+        command = notify_command_path(settings, env)
+        if command is None:
             return False  # a relative path, or a bare name not found (or found only through a relative PATH entry)
         subprocess.Popen([command, *settings.notify_argv[1:], text], stdin=subprocess.DEVNULL,
                          stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True,

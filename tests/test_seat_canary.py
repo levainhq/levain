@@ -745,3 +745,55 @@ def test_the_canary_cli_passes_its_model_flag_to_the_run(monkeypatch, capsys, ar
     monkeypatch.setattr(sc, "run_seat_canary", fake)
     assert sc.main(argv) == 0
     assert seen["model"] == want and f"model {want}" in capsys.readouterr().out
+
+
+class _ModelSpy:
+    env = {"PATH": "/usr/bin"}
+
+    def __init__(self, seen):
+        self.seen = seen
+
+    def argv(self, **kw):
+        self.seen["model"] = kw.get("model", "<absent>")
+        return ["claude-stub", "-p"]
+
+
+def _spy_run(tmp_path, **kw):
+    seen = {}
+
+    def drive(argv, **dkw):
+        t = _Turn()
+        t.timed_out = True
+        return t
+    sc.run_seat_canary(claude_bin="/bin/claude", python="/usr/bin/python3", swap_attempts=2,
+                       environ={"TMPDIR": str(tmp_path)}, drive=drive, profile_factory=lambda clone, ret, **k: _ModelSpy(seen), **kw)
+    return seen["model"]
+
+
+def test_run_seat_canary_default_model_is_sonnet_not_haiku(tmp_path):
+    """Z1e: haiku refuses the canary prompt. A library caller that omits `model` gets the CLI's default."""
+    assert _spy_run(tmp_path) == "sonnet" == sc.DEFAULT_CANARY_MODEL
+
+
+def test_run_seat_canary_accepts_and_threads_a_non_default_model(tmp_path):
+    """The review's TypeError claim (model= not accepted by the callee) is refuted: the kwarg reaches the profile's argv."""
+    assert _spy_run(tmp_path, model="opus") == "opus"
+
+
+def test_the_cli_reaches_the_real_run_with_its_model(tmp_path, monkeypatch):
+    """main -> the real run_seat_canary (only the driver and the profile faked): no TypeError, the model arrives."""
+    seen = {}
+    real = sc.run_seat_canary
+
+    def wrapped(**kw):
+        return real(**kw, drive=lambda argv, **d: _timed_out_turn(),
+                    profile_factory=lambda clone, ret, **k: _ModelSpy(seen), environ={"TMPDIR": str(tmp_path)})
+    monkeypatch.setattr(sc, "run_seat_canary", wrapped)
+    sc.main(["--claude-bin", "/bin/claude", "--swap-attempts", "2", "--model", "opus"])
+    assert seen["model"] == "opus"
+
+
+def _timed_out_turn():
+    t = _Turn()
+    t.timed_out = True
+    return t

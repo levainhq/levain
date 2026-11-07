@@ -675,8 +675,13 @@ def _git(*args: str, cwd: Path) -> None:
     subprocess.run(["git", *args], cwd=cwd, env=env, check=True, capture_output=True, timeout=30)
 
 
+#: The model that drives the canary turn, for the CLI and for :func:`run_seat_canary` alike: haiku refused the canary
+#: prompt as tampering in the Z1e VM run (1106-16/z1e/RETURN_z1e.md, measured, N=20), so a canary under it reads inconclusive.
+DEFAULT_CANARY_MODEL = "sonnet"
+
+
 def run_seat_canary(*, claude_bin: str, python: str, swap_attempts: int, timeout: float = 600.0,
-                    model: str = "haiku", environ: Mapping[str, str] | None = None,
+                    model: str = DEFAULT_CANARY_MODEL, environ: Mapping[str, str] | None = None,
                     drive: Callable[..., _Turn] | None = None,
                     profile_factory: Callable[..., SeatProfile] | None = None,
                     tools: Sequence[str] = CC_SEAT_TOOLS) -> SeatCanaryVerdict:
@@ -958,7 +963,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     p.add_argument("--python", default=sys.executable)
     p.add_argument("--swap-attempts", type=int, default=20)
     p.add_argument("--timeout", type=float, default=600.0)
-    p.add_argument("--model", default="sonnet",
+    p.add_argument("--model", default=DEFAULT_CANARY_MODEL,
                    help="the model that drives the canary turn. Default sonnet: the haiku default refused the canary prompt as "
                         "tampering in the Z1e VM run (1106-16/z1e/RETURN_z1e.md, measured, N=20), so a canary under it reads inconclusive")
     p.add_argument("--tools", default=",".join(CC_SEAT_TOOLS),

@@ -83,6 +83,30 @@ def test_permission_deny_names_all_four_file_tools(rig):
     assert any(r.startswith("Read(") and str(keys).lstrip("/") in r for r in deny)
 
 
+def test_nested_git_is_one_bare_rule_that_covers_a_nested_git_directory(rig):
+    """The nested ``.git`` shape is the bare ``*/**/.git`` and nothing else, per tool and spelling. Measured on the host
+    (2.1.319, the real profile, sonnet, 1106-16/z1e/RETURN_nested_git.md, arms A2/A3): with a real nested repo
+    ``sub/.git/`` planted after the build, a Write to ``sub/.git/{hooks/pre-commit,info/zz,modules/m/zz,worktrees/w/zz}``
+    and an Edit of ``sub/.git/config`` were each "denied by your permission settings" with no prompt, Bash writes to
+    ``sub/.git/hooks`` and ``sub/.git/config`` were "operation not permitted", and ``git commit`` in the lane landed.
+    Arm B1 (these rules removed) prompted on all five file-tool writes, so this rule, not a vendor default, closes
+    them: a bare pattern also denies the CONTENTS of a directory it names (the same fact that made ``**/.git`` break
+    the lane's commit, RETURN_gitdeny.md). Adding ``*/**/.git/**`` or per-path ``*/**/.git/hooks/**`` would be
+    redundant; dropping or narrowing the bare rule reopens the prompt. Measured consequence, not a defect: ``git
+    commit`` INSIDE a nested repo fails (``sub/.git/index.lock: Operation not permitted``)."""
+    base, keys, _ = rig
+    lane, ret = base / "lane", base / "ret"
+    deny = sp.seat_permission_deny((lane, ret), keys)
+    nested = [r for r in deny if "*/**/.git" in r]
+    want = []
+    for i, root in enumerate((lane, ret)):
+        for tool in sp.FILE_TOOLS:
+            want.append(f"{tool}(//{str(root).lstrip('/')}/*/**/.git)")
+            if i == 0:
+                want.append(f"{tool}(*/**/.git)")
+    assert sorted(nested) == sorted(want)   # exactly these: no /** variant, no per-path rule below a nested .git
+
+
 def test_hooks_ride_the_settings(rig):
     p = build(rig)
     hooks = p.settings["hooks"]
