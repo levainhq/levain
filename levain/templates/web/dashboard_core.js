@@ -9067,24 +9067,38 @@ for (const type of ["touchstart", "wheel", "pointerdown", "click", "keydown"]) d
       // The item's own id is a name the card number does not carry: flow numbers its cards with the BAND number, not 1 + the id's hex
       // (11-06, np-0b62cd3b: the ping's `item=np-...` named no card). The band read pairs each item's own id (`subject.id`) with its
       // card number (`question`), so ask it before saying the item is gone.
-      const gone = () => {
+      // `said` is true only when a FRESH, SUCCESSFUL band read lacks the item: that alone concludes "no longer waiting". A cached read
+      // (bandFetch holds one ~2 s, so it may predate the item) or a read that was refused (transient) never does: the first miss
+      // asks once more, fresh; a refusal waits a beat (bounded) and asks fresh once; a second refusal falls back to the plain Needs
+      // view WITHOUT the notice (it was never answered, so "gone" is not known).
+      const gone = (said) => {
         if (run !== phoneJumpRun) return;
         // "no longer waiting" is said only of a whole listing: a panel that carries an error or a note (a partial read says so there) is not one
-        if (!dec.error && !dec.note) needsGoneNote();
+        if (said && !dec.error && !dec.note) needsGoneNote();
         needsDeepJump(run, Date.now() + PHONE_JUMP_WAIT_MS);   // the fallback to plain Needs gets its own wait, not the spent one
       };
-      let p = null;
-      try { p = typeof bandRead === "function" ? bandFetch(false) : null; } catch (e) { p = null; }
-      if (!p || typeof p.then !== "function") { gone(); return; }
+      const find = (b) => {
+        const row = (b && Array.isArray(b.items) ? b.items : []).find((x) => x && x.subject && x.subject.id === item && Number.isInteger(x.question));
+        return row && needsWaiting(needsItems(lines)).find((x) => needsIdOf(x) === "question:" + row.question);
+      };
+      const read = (fresh) => { let q = null; try { q = typeof bandRead === "function" ? bandFetch(fresh) : null; } catch (e) { q = null; } return q && typeof q.then === "function" ? q : null; };
+      const open = (hit) => {
+        if (document.querySelector(PHONE_JUMP_TARGET.needs)) needsGo(needsIdOf(hit), true);
+        openNeedsFocus(hit, null);
+      };
+      const second = (retries) => {
+        const q2 = read(true);                        // bypasses the ~2 s cache: this read cannot predate the item
+        if (!q2) { gone(false); return; }
+        q2.then((b2) => { if (run !== phoneJumpRun) return; const h2 = find(b2); if (h2) open(h2); else gone(true); },
+          () => { if (run !== phoneJumpRun) return; if (retries > 0) window.setTimeout(() => second(retries - 1), 700); else gone(false); });   // the server reads one band at a time: "busy" is a refusal too
+      };
+      const p = read(false);
+      if (!p) { gone(true); return; }                 // no band to ask on this cockpit: the listing alone answered
       p.then((b) => {
         if (run !== phoneJumpRun) return;
-        const row = (b && Array.isArray(b.items) ? b.items : []).find((x) => x && x.subject && x.subject.id === item && Number.isInteger(x.question));
-        const hit = row && needsWaiting(needsItems(lines)).find((x) => needsIdOf(x) === "question:" + row.question);
-        if (hit) {
-          if (document.querySelector(PHONE_JUMP_TARGET.needs)) needsGo(needsIdOf(hit), true);
-          openNeedsFocus(hit, null);
-        } else gone();
-      }, gone);
+        const hit = find(b);
+        if (hit) open(hit); else second(1);
+      }, () => { if (run === phoneJumpRun) window.setTimeout(() => { if (run === phoneJumpRun) second(0); }, 700); });
       return;
     }
     if (Date.now() < deadline) { window.setTimeout(() => needsItemJump(item, run, deadline), PHONE_JUMP_STEP_MS); return; }

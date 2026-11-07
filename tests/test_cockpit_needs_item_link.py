@@ -160,3 +160,46 @@ def test_a_link_naming_the_items_own_id_opens_the_card_the_band_numbers_for_it(t
         out = _drive(tmp_path, f"{url}/?view=needs&item={qid}#write_token=T", [DESKTOP, {"until": ROWS, "ms": 40000}, SETTLE, {"eval": READ}])["values"]
     got = json.loads(out[-1])
     assert got["modal"] and got["title"].endswith("· codex") and got["search"] == "" and got["note"] == "", got
+
+
+# the FIRST band read of the document is stale (a cached read from just before the item appeared) or refused (transient); later ones are real
+FIRST_BAND = """(() => { const f = window.fetch; let n = 0; window.__bandCalls = 0; window.fetch = async (...a) => {
+  if (String(a[0]).indexOf('/cockpit/band.json') === 0) {
+    window.__bandCalls = ++n;
+    if (n === 1 || (MODE === 'refuse' && n === 2)) {   // a refusal outlasts the panel's own retry, so only the jump's retry can recover
+      if (MODE === 'refuse') throw new TypeError('network');
+      const r = await f.apply(window, a); const j = await r.json(); j.items = [];
+      return new Response(JSON.stringify(j), { status: 200, headers: { 'Content-Type': 'application/json' } });
+    } }
+  return f.apply(window, a); }; })();"""
+
+
+def _first_band_bad(tmp_path: Path, monkeypatch, mode: str) -> dict:
+    _home, store = _two_questions(tmp_path, monkeypatch)
+    qid = store.get(2).id
+    _root, src, _ids = _install(tmp_path)
+    go = {"eval": f"location.assign('/?view=needs&item={qid}#write_token=T'); 1"}
+    with _serve(src, surface_tokens={"browser": "T"}, install_class="reported") as (url, _httpd):
+        out = _drive(tmp_path, f"{url}/#write_token=T", [{"init": FIRST_BAND.replace("MODE", json.dumps(mode))}, DESKTOP, go, {"until": ROWS, "ms": 40000}, SETTLE, {"eval": READ}])["values"]
+    return json.loads(out[-1])
+
+
+@needs_browser
+def test_a_stale_cached_band_read_never_makes_a_waiting_card_gone(tmp_path: Path, monkeypatch) -> None:
+    """L3 r1 MED: the band read the jump asks (bandFetch, cached ~2 s) may predate the item; a miss from it re-asks FRESH before the page
+    says "no longer waiting". The first band read of the document here lacks every item; the card must still open, with no notice."""
+    got = _first_band_bad(tmp_path, monkeypatch, "stale")
+    assert got["modal"] and got["title"].endswith("· codex") and got["note"] == "", got
+
+
+@needs_browser
+def test_a_refused_band_read_is_retried_once_not_taken_for_gone(tmp_path: Path, monkeypatch) -> None:
+    got = _first_band_bad(tmp_path, monkeypatch, "refuse")
+    assert got["modal"] and got["title"].endswith("· codex") and got["note"] == "", got
+
+
+def test_only_a_fresh_successful_band_read_concludes_no_longer_waiting() -> None:
+    """Pinned on the code beside the driven cases: the notice is said only from the second (fresh) read's success; a refusal says nothing."""
+    body = _jump_body()
+    assert "bandFetch(fresh)" in body and "read(true)" in body and "gone(true)" in body and "gone(false)" in body, body
+    assert body.count("gone(true)") == 2 and "else gone(true)" in body, body
