@@ -245,13 +245,29 @@ def _codex_link(ws):
     return ".codex"
 
 
+def _codex_upper(ws):
+    # L3 r2 N1: APFS is case-insensitive by default, so Codex opening config.toml reads this file
+    (ws / ".codex").mkdir()
+    (ws / ".codex" / "CONFIG.TOML").write_text('[mcp_servers.evil]\ncommand = "/bin/sh"\n')
+    return ".codex/CONFIG.TOML"
+
+
+def _codex_mixed(ws):
+    (ws / ".codex").mkdir()
+    (ws / ".codex" / "Settings.JSON").write_text("{}")
+    return ".codex/Settings.JSON"
+
+
 def _claude_mcp_json(ws):
     (ws / ".mcp.json").write_text('{"mcpServers": {"evil": {"command": "/bin/sh"}}}')
     return ".mcp.json"
 
 
-@pytest.mark.parametrize("vendor", ["claude", "codex"])
-@pytest.mark.parametrize("plant", [_codex_layer, _codex_other_config, _codex_link, _claude_mcp_json])
+_CODEX_ONLY = [_codex_layer, _codex_other_config, _codex_link, _codex_upper, _codex_mixed]
+
+
+@pytest.mark.parametrize("vendor, plant", [("codex", p) for p in _CODEX_ONLY]
+                         + [("claude", _claude_mcp_json), ("codex", _claude_mcp_json)])
 def test_a_project_layer_in_the_hands_workspace_refuses_and_starts_no_vendor(rig, vendor, plant):
     rig.register("alpha", callback_port=49601)
     ws = rig.h.workspace
@@ -262,6 +278,18 @@ def test_a_project_layer_in_the_hands_workspace_refuses_and_starts_no_vendor(rig
         launch(rig, vendor, spawn=fake)
     assert str(ws / named) in str(info.value) and str(info.value).endswith("no chat was started")
     assert fake.started == [] and "spawn" not in [e for e, _ in rig.events]
+    assert_released(rig)
+
+
+@pytest.mark.parametrize("plant", _CODEX_ONLY)
+def test_a_codex_project_layer_does_not_refuse_a_claude_chat(rig, plant):
+    # L3 r2 (codex MED): Claude does not read .codex/, so a repository's Codex config must not block a Claude launch
+    rig.register("alpha", callback_port=49601)
+    ws = rig.h.workspace
+    ws.mkdir(parents=True, exist_ok=True)
+    plant(ws)
+    fake = FakeVendor(rig)
+    assert launch(rig, "claude", spawn=fake) == 0 and len(fake.started) == 1
     assert_released(rig)
 
 
@@ -360,6 +388,72 @@ def test_processes_left_after_the_chat_make_the_command_exit_non_zero_with_the_w
     assert rc != 0
     assert any("were left after the chat" in s and "pid 4242" in s for s in said)
     assert_released(rig)
+
+
+def test_a_closed_stdout_at_the_survivor_warning_does_not_replace_the_outcome(rig, monkeypatch):
+    # L3 r2 N2: the warning is emitted inside the cleanup finally; a BrokenPipeError there replaced the return code
+    rig.register("alpha", callback_port=49601)
+    answers = iter([None, "pid 4242 is left"])
+    monkeypatch.setattr(hands_live, "sweep_hands_user", lambda user, *, uid, timeout=5.0: next(answers))
+
+    def closed(s):
+        if "were left" in s:
+            raise BrokenPipeError(32, "Broken pipe")
+    rc = hc.launch_hands_chat(rig.entity, "claude", rig.ck.root, spawn=FakeVendor(rig, rc=5), emit=closed)
+    assert rc == 5
+    assert_released(rig)
+
+
+def test_a_closed_stdout_at_the_survivor_warning_keeps_the_signal_exit(rig, monkeypatch):
+    rig.register("alpha", callback_port=49601)
+    answers = iter([None, "pid 4242 is left"])
+    monkeypatch.setattr(hands_live, "sweep_hands_user", lambda user, *, uid, timeout=5.0: next(answers))
+
+    def closed(s):
+        if "were left" in s:
+            raise BrokenPipeError(32, "Broken pipe")
+    with pytest.raises(SystemExit) as info:
+        hc.launch_hands_chat(rig.entity, "claude", rig.ck.root, spawn=BlockingVendor(rig, _deliver(signal.SIGTERM)),
+                             emit=closed)
+    assert info.value.code == 128 + signal.SIGTERM
+    assert_released(rig)
+
+
+# --- (7) the module imports where SIGHUP is absent (L3 r2: evaluated at import, Windows has none) --------------------
+
+def test_the_module_imports_on_a_host_without_sighup():
+    root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    code = ("import signal; del signal.SIGHUP; import levain.firing.hands_chat as h; "
+            "assert h._STOP_SIGNALS == (signal.SIGTERM,), h._STOP_SIGNALS; h._Signals().restore(); print('ok')")
+    r = subprocess.run([sys.executable, "-c", code], cwd=root, capture_output=True, text=True, timeout=120)
+    assert r.returncode == 0 and r.stdout.strip() == "ok", r.stderr
+
+
+# --- (8) the chat gets the operator's terminal type, not the prefix's TERM=dumb (L3 r2 M1, measured: codex refuses
+# --- its TUI under TERM=dumb without a "Continue anyway? [y/N]") -------------------------------------------------------
+
+@pytest.mark.parametrize("vendor", ["claude", "codex"])
+def test_the_chat_argv_carries_the_operators_terminal_type(rig, monkeypatch, vendor):
+    monkeypatch.setenv("TERM", "xterm-256color")
+    argv = hc.chat_argv(rig.h, vendor)
+    assert "TERM=xterm-256color" in argv and "TERM=dumb" not in argv
+    env_at = argv.index("-i")
+    vendor_at = argv.index(vendor)
+    assert env_at < argv.index("TERM=xterm-256color") < vendor_at
+
+
+@pytest.mark.parametrize("term", ["", "dumb", "../../tmp/x", "/etc/passwd", ".hidden", "a b", "x" * 65])
+def test_a_term_that_is_not_a_terminfo_name_leaves_dumb(rig, monkeypatch, term):
+    monkeypatch.setenv("TERM", term)
+    argv = hc.chat_argv(rig.h, "codex")
+    assert "TERM=dumb" in argv and not any(a.startswith("TERM=") and a != "TERM=dumb" for a in argv)
+
+
+def test_only_the_env_assignments_are_rewritten():
+    argv = ["sudo", "-n", "-u", "h", "/usr/bin/env", "-i", "HOME=/x", "TERM=dumb", "codex", "TERM=dumb"]
+    assert hc.interactive_term(argv, "screen") == [
+        "sudo", "-n", "-u", "h", "/usr/bin/env", "-i", "HOME=/x", "TERM=screen", "codex", "TERM=dumb"]
+    assert hc.interactive_term(["codex", "TERM=dumb"], "screen") == ["codex", "TERM=dumb"]
 
 
 # --- the verb ------------------------------------------------------------------------------------------------------

@@ -21,8 +21,9 @@ L3 HIGH this slice closes (a revoked server stayed usable until a launcher refre
 
 Three bounds the 1107-26 L3 round 1 added: the launch is macOS only in this slice (the Linux start program execs the
 bare vendor name with no PATH search, from the hands workspace as cwd), so any other host is refused before a lock is
-taken; a project layer in the hands workspace (a Codex ``.codex/`` config file, a Claude ``.mcp.json``) refuses the
-launch, since the vendor would read servers from it that the registry does not hold; and from the moment the locks are
+taken; a project layer in the hands workspace that the launched vendor may read (a ``.mcp.json``; for Codex also a
+``.codex/`` config file, names compared case-folded) refuses the launch, since the vendor would read servers from it
+that the registry does not hold; and from the moment the locks are
 taken, a SIGTERM or SIGHUP ends in an orderly stop (the child terminated, the hands account swept, both locks released,
 then re-raised as an exit with ``128 + signal``), with processes left after the chat making the command exit non-zero.
 
@@ -33,6 +34,7 @@ from __future__ import annotations
 
 import os
 import platform
+import re
 import signal
 import subprocess
 from pathlib import Path
@@ -64,8 +66,13 @@ Spawn = Callable[[list[str], str], _Proc]
 
 MACOS_ONLY = "the hands chat launch is macOS only in this slice"
 
-#: The signals that end the chat in an orderly stop rather than killing the launcher past its ``finally``.
-_STOP_SIGNALS = (signal.SIGTERM, signal.SIGHUP)
+#: The signals that end the chat in an orderly stop rather than killing the launcher past its ``finally``. Built by
+#: name so the module imports where one is absent (Windows has no SIGHUP); the launch itself is macOS only.
+_STOP_SIGNALS = tuple(getattr(signal, n) for n in ("SIGTERM", "SIGHUP") if hasattr(signal, n))
+
+#: A terminal type the operator's ``TERM`` may pass on as: a terminfo name, never a path (terminfo looks the name up
+#: as a file under its directories, so a ``/`` or a leading ``.`` is refused and the default stands).
+_TERM_NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9._+-]{0,63}")
 
 #: How long the child gets to end after ``terminate`` before ``kill``; the sweep after it is the backstop.
 _STOP_TIMEOUT = 5.0
@@ -77,21 +84,30 @@ def host_refusal() -> str | None:
     return None if platform.system() == "Darwin" else MACOS_ONLY
 
 
-def project_layer(workspace: Path) -> Path | None:
-    """A file in the hands workspace that a vendor reads as a project layer, or None: Claude's ``.mcp.json``, or a
-    Codex ``.codex/`` that is a link or holds a config file (the L3 r1 codex finding: Codex loads
+def project_layer(workspace: Path, vendor: str) -> Path | None:
+    """A file in the hands workspace that ``vendor`` may read as a project layer, or None.
+
+    Both vendors: a ``.mcp.json``. Claude's project file (``--strict-mcp-config`` ignores it; refused anyway), and
+    Codex's binary names ``.mcp.json`` in its plugin discovery, unmeasured whether a workspace can be a plugin root,
+    so it stays refused for Codex too rather than assumed unread.
+    Codex only: a ``.codex/`` that is a link or holds a config file (the L3 r1 codex finding: Codex loads
     ``.codex/config.toml``, its ``[mcp_servers]`` included, for a workspace the hands home marks trusted). A ``.codex``
-    link is refused as such, without following it."""
+    link is refused as such, without following it. Names compare case-folded: APFS is case-insensitive by default, so
+    a ``.codex/CONFIG.TOML`` is what Codex opens as ``config.toml`` (L3 r2 N1). Claude does not read ``.codex/``, so a
+    repository carrying Codex project config does not refuse a Claude chat (L3 r2)."""
     mcp = workspace / ".mcp.json"
     if os.path.lexists(mcp):
         return mcp
+    if vendor != "codex":
+        return None
     codex = workspace / ".codex"
     if codex.is_symlink():
         return codex
     if not codex.is_dir():
         return None
     for name in sorted(os.listdir(codex)):
-        if name.startswith("config") or name.endswith((".toml", ".json")):
+        folded = name.casefold()
+        if folded.startswith("config") or folded.endswith((".toml", ".json")):
             return codex / name
     return None
 
@@ -105,10 +121,31 @@ def chat_argv(hands: HandsIdentity, vendor: str) -> list[str]:
     """The vendor's chat argv with no argument added: an added ``--mcp-config`` (Claude) or ``-c mcp_servers...``
     (Codex) would bring in a server the registry does not hold, so none is passed through."""
     if vendor == "claude":
-        return hml.claude_chat_argv(hands)
+        return interactive_term(hml.claude_chat_argv(hands))
     if vendor == "codex":
-        return hml.codex_chat_argv(hands)
+        return interactive_term(hml.codex_chat_argv(hands))
     raise HandsChatRefused(f"unknown vendor {vendor!r}; one of {', '.join(VENDORS)}")
+
+
+def interactive_term(argv: list[str], term: str | None = None) -> list[str]:
+    """``argv`` with the hands prefix's ``TERM=dumb`` (set for non-interactive bash) replaced by the operator's terminal
+    type, since this chat is the operator's terminal handed over: under ``TERM=dumb`` Codex stops at "Continue anyway?
+    [y/N]" before its TUI (its binary's own text, codex-cli 0.162.1). Only a terminfo name passes (``_TERM_NAME``);
+    anything else, or no ``TERM``, leaves ``dumb``. Only the ``env -i`` assignments are touched, never an argument."""
+    term = os.environ.get("TERM", "") if term is None else term
+    if not _TERM_NAME.fullmatch(term) or term == "dumb":
+        return argv
+    out = list(argv)
+    try:
+        i = next(k for k in range(len(out) - 1) if out[k] == "/usr/bin/env" and out[k + 1] == "-i") + 2
+    except StopIteration:
+        return out
+    while i < len(out) and "=" in out[i]:
+        if out[i] == "TERM=dumb":
+            out[i] = f"TERM={term}"
+            break
+        i += 1
+    return out
 
 
 def _wait(proc: _Proc) -> int:
@@ -199,7 +236,7 @@ def launch_hands_chat(entity_dir: Path | str, vendor: str, cockpit_root: Path | 
             if stale is not None:
                 raise HandsChatRefused(f"processes of the entity's user could not be stopped ({stale})")
             res = hml.prepare_launch(hands, entity_dir, cockpit_root, held=True)
-            layer = project_layer(Path(hands.workspace))
+            layer = project_layer(Path(hands.workspace), vendor)
             if layer is not None:
                 raise HandsChatRefused(f"the hands workspace holds a project layer the vendor would read ({layer}), "
                                        "which can name MCP servers the registry does not hold; remove it")
@@ -232,7 +269,10 @@ def launch_hands_chat(entity_dir: Path | str, vendor: str, cockpit_root: Path | 
                     left = f"the stop failed ({exc})"
                 if left is not None:
                     survivors = True
-                    emit(f"hands chat: processes of {hands.user} were left after the chat ({left})")
+                    try:
+                        emit(f"hands chat: processes of {hands.user} were left after the chat ({left})")
+                    except Exception:  # noqa: BLE001 - a closed stdout must not replace the outcome (L3 r2 N2)
+                        pass
         finally:
             sigs.restore()
             for fd in reversed(fds):
