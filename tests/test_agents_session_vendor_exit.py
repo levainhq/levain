@@ -160,8 +160,10 @@ class _Launched:
 
     def __init__(self, proven):
         self.proven = proven
+        self.calls = []
 
     def end_once(self, *, polling=False):
+        self.calls.append(polling)
         return self.proven
 
 
@@ -170,10 +172,13 @@ class _Launched:
 def test_the_slot_proc_answers_the_vendors_exit_only_once_end_proved_the_group_gone(rc, proven, expect):
     """Revert ``return rc if self._l.end_once(polling=polling) else _ctl.GATE_UNPROVEN`` in ``_SlotProc._settle``:
     a clean exit with END unproven would read ``0`` and run_session would write ``done``."""
-    p = L._SlotProc(_Inner(rc), _Launched(proven))
-    assert p.poll() == expect and p.wait() == expect
+    launched = _Launched(proven)
+    p = L._SlotProc(_Inner(rc), launched)
+    assert p.poll() == expect and launched.calls == [True]
+    assert p.wait() == expect and launched.calls == [True, False]
 
 
 def test_the_slot_proc_poll_answers_none_while_the_vendor_runs():
-    p = L._SlotProc(_Inner(None), _Launched(True))
-    assert p.poll() is None
+    launched = _Launched(True)
+    p = L._SlotProc(_Inner(None), launched)
+    assert p.poll() is None and launched.calls == []
