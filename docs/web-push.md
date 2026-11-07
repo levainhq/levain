@@ -25,7 +25,7 @@ server-side per device (`levain ping receipts` shows it).
 ## The sender's proxy environment is read once, at import
 
 `levain/webpush/sender.py` builds its URL opener at module import (`urllib.request.build_opener`). Python's opener
-captures the proxy mapping (`HTTP_PROXY`, `HTTPS_PROXY` and their lower-case forms) when it is built, so a change to
+captures the proxy mapping (`HTTP_PROXY`, `HTTPS_PROXY` and their lower-case forms; on macOS and Windows the default handler may also take system proxy settings) when it is built, so a change to
 one of those variables in the process after `levain.webpush.sender` was imported is not seen by pushes. `NO_PROXY` is
 different: `urllib` consults it for each request, so a change to it after import does take effect. The decision is to
 keep the import-time capture of the proxy mapping: the process environment a cockpit starts with is the one its pushes
