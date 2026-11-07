@@ -3501,9 +3501,10 @@ body.ke .dev-zone.pr-settings .zone-head { display: flex; }
 .nc-rec .nc-blabel { color: var(--ok); }
 .nc-rec > p:last-child, .nc-rec > :last-child { margin-bottom: 0; }
 .nc-fullurl { color: var(--label); font: var(--fs-meta)/1.4 var(--mono); overflow-wrap: anywhere; }
-.nc-needsbox, .nc-sheetbox { margin: var(--sp-5) 0 0; padding: var(--sp-4); background: var(--accent-soft); border: 1px solid var(--accent-line); border-radius: var(--r-md); }
+.nc-needsbox, .nc-sheetbox, .nc-dialogbox { margin: var(--sp-5) 0 0; padding: var(--sp-4); background: var(--accent-soft); border: 1px solid var(--accent-line); border-radius: var(--r-md); }
 .nc-needsgo { display: inline-flex; align-items: center; min-height: var(--ctl-md); padding: 0 var(--sp-4); background: var(--accent); color: var(--on-accent); border: 0; border-radius: var(--r-md);
   cursor: pointer; font: var(--fw-bold) var(--fs-meta) var(--round); }
+.nc-dialoghead { margin: 0; color: var(--text); font: var(--fw-bold) var(--fs-meta)/var(--lh-list) var(--round); }
 .nc-note { margin: var(--sp-3) 0 0; color: var(--label); font: var(--fw-regular) var(--fs-meta)/var(--lh-list) var(--sans); }
 .nc-tokennote { margin-top: var(--sp-5); }
 .nc-delivery { margin: var(--sp-5) 0 0; padding-top: var(--sp-4); border-top: 1px solid var(--hair); color: var(--meta); font: var(--fw-regular) var(--fs-meta)/var(--lh-list) var(--sans); }

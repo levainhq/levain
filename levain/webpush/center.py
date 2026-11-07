@@ -603,7 +603,20 @@ def _notice_item(rd: _Reader, num: int, read: bool, read_at: str | None) -> dict
             "preview": plain_preview(r["body"]), "at": _iso(r["at"]), "priority": r["priority"], "read": read,
             "read_at": _iso(read_at) if read else None, "needs_ref": None, "needs_open": False,
             "token_name": r["token"], "image_url": None, "sheet": None,
-            "delivery": _delivery(rd, r["ping_id"])}
+            "dialog": None, "delivery": _delivery(rd, r["ping_id"])}
+
+
+_DIALOG_MARK = " asks in its own dialog"
+
+
+def _dialog_of(ref: str | None, body: str) -> dict[str, str] | None:
+    """For a ``prompt:`` ping (the agent's own dialog waits, no hold: :func:`levain.consent.adapters.claude_code.prompt_notice`):
+    ``{"agent"}``, the agent the notice names (its words before ``asks in its own dialog``; ``""`` when the body does not say),
+    so the focus view can say plainly that nothing is held and there is nothing to answer there. None for any other ping."""
+    if not isinstance(ref, str) or not ref.startswith("prompt:"):
+        return None
+    head = body.split(_DIALOG_MARK, 1)[0] if _DIALOG_MARK in body else ""
+    return {"agent": head.strip()[:64]}
 
 
 def _ping_item(rd: _Reader, num: int, read: bool, read_at: str | None) -> dict[str, Any] | None:
@@ -632,7 +645,7 @@ def _ping_item(rd: _Reader, num: int, read: bool, read_at: str | None) -> dict[s
             "read_at": _iso(read_at) if read else None, "needs_ref": needs_ref,
             "needs_open": bool(needs_ref) and rd.needs_open(ref), "token_name": None, "image_url": None,
             "sheet": rd.consent_sheet(ref) if source == "approval" else None,
-            "delivery": _delivery(rd, num)}
+            "dialog": _dialog_of(ref, body), "delivery": _delivery(rd, num)}
 
 
 def _build(rd: _Reader, cands: list[tuple[str, int, str, bool, str | None]]) -> list[dict[str, Any]]:

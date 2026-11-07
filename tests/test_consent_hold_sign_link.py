@@ -222,6 +222,7 @@ def test_a_prompt_notice_is_not_a_request_ping_and_the_center_draws_no_sheet_for
     store, pid = _record(home, calls[0])
     item = center.get(store, f"p{pid}")["item"]
     assert item["sheet"] is None and item["needs_ref"] is None and item["needs_open"] is False
+    assert item["dialog"] == {"agent": "claude_code"}                  # the focus view says what this is (1107-32)
     assert item["source"] == "approval" and item["body"].startswith("claude_code asks in its own dialog")
     # the hold's ping for the very request keeps the notice from repeating it
     other = _file(home, name="b.txt")
@@ -324,3 +325,50 @@ def _queue_withdraw(r) -> None:
 
     cq = ConsentQueue(r.q, authority=authority_source(r.q, anchor=None), home=h4_home(), clock=lambda: datetime.now(timezone.utc))
     assert cq.withdraw(r.req.id)
+
+
+# --- a prompt notice's focus view says what it is (1107-32: Phill 11-07 16:58, a tap on "asks in its own dialog" showed no buttons) ---
+DIALOG_TITLE = "claude_code asks in its own dialog: Bash {command: ls}"
+
+
+def _dialog_probe() -> str:
+    return (f"JSON.stringify({{ head: [...{MODAL}.querySelectorAll('.nc-dialogbox .nc-dialoghead')].map(x => x.textContent),"
+            f" notes: [...{MODAL}.querySelectorAll('.nc-dialogbox .nc-note')].map(x => x.textContent),"
+            f" signLinks: {MODAL}.querySelectorAll('.nc-detail .nc-signgo, .nc-detail .nc-sheetbox').length,"
+            f" body: ({MODAL}.querySelector('.nc-detail').textContent.includes('command: ls')) }})")
+
+
+def _drive_title(tmp_path: Path, title: str, setup=None) -> dict:
+    r = Rig(tmp_path)
+    if setup:
+        setup(r)
+    row = f"[...{MODAL}.querySelectorAll('.nc-row')].find(r => r.querySelector('.nc-title').textContent === {json.dumps(title)})"
+    steps = [{"emulate": {"w": 390, "h": 844, "dpr": 2, "mobile": True}},
+             {"until": f"{MODAL}.querySelectorAll('.nc-row').length >= 6 && 1", "ms": 30000},
+             {"until": f"{row} && 1", "ms": 20000}, {"eval": f"{row}.querySelector('.nc-main').click(); 1"},
+             {"until": f"({MODAL}.querySelector('.nc-dtitle') || {{}}).textContent === {json.dumps(title)} && 1"},
+             {"eval": "new Promise(r => setTimeout(r, 400)).then(() => 1)"}, {"eval": _dialog_probe()}]
+    with _signed(r.src, r.q) as (port, _):
+        r.seed(port)
+        out = _drive(tmp_path, _url(port), [{"emulate": {"w": 1280, "h": 900, "dpr": 1}}, {"until": f"{PILL} && !{PILL}.hidden && 1", "ms": 40000}, OPEN, OPENED, *steps])
+    got = _json(out)
+    assert len(got) == 1, out["values"]
+    return got[0]
+
+
+def _add_prompt(r) -> None:
+    PushStore(r.q).add_ping("consent", claude_code.prompt_ref("abc123"), "levain", DIALOG_TITLE)
+
+
+@needs_browser
+def test_the_focus_view_of_a_prompt_notice_says_the_dialog_waits_and_offers_nothing_to_press(tmp_path: Path) -> None:
+    d = _drive_title(tmp_path, DIALOG_TITLE, setup=_add_prompt)
+    assert d["head"] == ["Waiting in the seat's own dialog"], d
+    assert len(d["notes"]) == 1 and d["notes"][0].startswith("claude_code is asking in its own dialog. Levain did not hold this request, so there is nothing to answer here."), d
+    assert d["signLinks"] == 0 and d["body"] is True, d                  # no sign link or sheet box; the raw command stays below
+
+
+@needs_browser
+def test_a_held_requests_focus_view_has_its_sheet_box_and_no_dialog_section(tmp_path: Path) -> None:
+    d = _drive_title(tmp_path, "Write /w/a waits on you", setup=_add_prompt)
+    assert d["head"] == [] and d["signLinks"] >= 1, d
