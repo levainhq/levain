@@ -120,7 +120,6 @@ TITLE_MAX = 160
 SOON_DAYS = 3
 WRITE_READ_CAP = 32       # source reads made inside writes that may run at once (design §4.4)
 WRITE_READ_CAP_PER_SOURCE = 4   # of those, reads of one source (a panel or a discoverer)
-NOW_ID = "now"
 BOARD_DEFAULT_ID = "work_board"   # the kernel's own board panel: drawn only while no provider brings a board (attach_board)
 # a triage-list view id: lower-case, and never "default" (the panel's own order is the default view)
 _VIEW_ID = re.compile(r"(?!default\Z)[a-z0-9][a-z0-9_-]{0,31}")     # matched whole (fullmatch)
@@ -981,7 +980,7 @@ class Cockpit:
     def spec(self, panel_id: str, *, discover: bool = False) -> "ProviderSpec | None":
         """A panel's registration. ``discover`` runs discovery first when the id is unknown, as
         ``panel()`` does, so a write naming a heading added since the last read finds its panel."""
-        if discover and panel_id not in self._specs and panel_id != NOW_ID:
+        if discover and panel_id not in self._specs:
             self._ensure_discovered(ReadContext(self._clock()))
         return self._specs.get(panel_id)
 
@@ -1035,7 +1034,7 @@ class Cockpit:
             self._unregister_locked(sid)
             self._dec.spec = None
         yielding = self._replaces_builtin_board(sid, spec.kind)     # a board under the built-in's id replaces it, below
-        if not sid or (sid in self._specs and not yielding) or sid == NOW_ID:
+        if not sid or (sid in self._specs and not yielding):
             raise CockpitRegistrationError(f"panel id {sid!r} is empty, reserved or already registered")
         if spec.kind not in KINDS:
             raise CockpitRegistrationError(f"{sid}: unknown kind {spec.kind!r}")
@@ -1785,7 +1784,7 @@ class Cockpit:
             "actions": [],        # verbs and their tiers arrive with K2a
         }
 
-    # --- heads, panels, the now view --------------------------------------------------
+    # --- heads, panels --------------------------------------------------
     def _etag_of(self, snap: _Snap, groups: list[dict[str, Any]] | None, cred: str, today: date,
                  views: tuple[tuple[str, str, str], ...] = (), labels: LabelSnapshot | None = None,
                  face: str = "", compose: dict[str, Any] | None = None, search: dict[str, Any] | None = None,
@@ -1893,84 +1892,6 @@ class Cockpit:
                        "default_visible": roster_visible(spec), "hook": spec.search is not None},
             "searchable": searchable, "window": spec.window,
         }
-
-    def _now_head_and_rows(
-        self, ctx: ReadContext, cred: str, specs_map: dict[str, ProviderSpec],
-        snaps: dict[str, _Snap] | None = None
-    ) -> tuple[dict[str, Any], list[dict[str, Any]]]:
-        """The ``now`` view (design §3.2.4): the ``band == "now"`` rows of the gate panels, in panel
-        rank order, each panel's rows in that panel's own order. No ordering, provider or actions of
-        its own; every row keeps its source ``panel_id``. Its status is the worst of its sources'."""
-        sources = sorted(
-            (s for s in specs_map.values() if s.priority == "gate" and s.kind in ROW_ENGINE_KINDS),
-            key=lambda s: (_REGION_ORDER.index(s.region), s.rank, s.id),
-        )
-        rows: list[dict[str, Any]] = []
-        degraded: list[str] = []
-        lines: list[str] = []
-        worst = "ok"
-        as_ofs: list[str] = []
-        snaps = snaps if snaps is not None else {}
-        auth = ctx.authority
-        if auth is None:
-            raise ValueError("the now view renders under a request's authority (ReadContext.authority)")
-        labels = auth.labels
-        labelled = False
-        for s in sources:
-            if s.id not in snaps:   # one read per source per cycle: the heads and this view agree
-                snaps[s.id] = self._snap_for(s, ctx)
-            snap = snaps[s.id]
-            if snap.status in ("error", "stale"):
-                degraded.append(s.id)
-                lines.append(f"{s.id}: {snap.status}, last good {snap.as_of or 'never'}")
-            if _STATUS_RANK[snap.status] > _STATUS_RANK[worst]:
-                worst = snap.status
-            if snap.as_of:
-                as_ofs.append(snap.as_of)
-            labelled = labelled or s.label_key is not None
-            for r in self._with_provenance(counted_rows(s.order, snap.rows or []), snap.label_keys, labels):
-                if r["band"] == "now":
-                    rows.append({**r, "panel_id": s.id})
-        if worst in ("ok", "empty"):
-            worst = "ok" if rows else "empty"
-        err = None
-        if worst == "error":
-            err = "; ".join(lines) or "a source panel is in error"
-        snap = _Snap(worst, rows, None, [], [], min(as_ofs) if as_ofs else None, err,
-                     "; ".join(lines))
-        head = {
-            "id": NOW_ID, "kind": "list", "title": f"Now ({len(rows)})" if worst != "error" else "Now (unavailable)",
-            "priority": "gate", "rank": -100, "status": worst, "count": len(rows) if worst != "error" else None,
-            "actionable_count": len(rows) if worst != "error" else None,
-            "filtered": [], "skipped": [], "as_of": snap.as_of, "stale_after_s": 0, "refresh_every_s": None,
-            "etag": self._etag_of(snap, None, cred, ctx.today, auth=auth), "error": err,
-            # the Now view applies the snapshot to its rows, so it explains a degraded one as _head does
-            "note": _label_note(snap.note, labels if labelled else None),
-            "empty": "Nothing needs you now.", "order": None, "groups": None,
-            # the gate view is row-shaped, so it carries the same filter box as every other long panel (10-11),
-            # over the rows' own title/body/id. It is never cut to a first screenful: a row waiting on him is not
-            # hidden behind "show all", so default_visible is the row count itself.
-            "search": {"fields": list(ROW_SEARCH_DEFAULT["list"]), "scope": "rows", "default_visible": max(len(rows), 1),
-                       "hook": False} if rows else None,
-            "searchable": bool(rows), "window": None,
-            "actions": [], "degraded": degraded, "edit_class": None,
-        }
-        # the union of the source panels' declared groups (labels and order), counted over the now
-        # rows, so a renderer prints "Today" / "Overdue", not the raw ids the rows carry
-        union: dict[str, dict[str, Any]] = {}
-        for src in sources:
-            if src.order and ORDERINGS[src.order].groups:
-                for gid, title in ORDERINGS[src.order].groups:
-                    if gid in ORDERINGS[src.order].uncounted:
-                        continue      # the now view takes counted groups only
-                    union.setdefault(gid, {"id": gid, "title": title, "count": 0})
-        for r in rows:
-            if r["group"] in union:
-                union[r["group"]]["count"] += 1
-        head["groups"] = list(union.values()) or None
-        head["etag"] = self._etag_of(snap, head["groups"], cred, ctx.today,   # groups are content
-                                     labels=labels if labelled else None, auth=auth)
-        return head, rows
 
     def _entity(self, ctx: ReadContext) -> tuple[dict[str, Any], list[dict[str, Any]]]:
         base = {"name": None, "governance": None, "brand": {"wordmark": None, "model": None}}
@@ -2192,11 +2113,9 @@ class Cockpit:
         for spec in self._ordered_specs(specs_map):
             snaps[spec.id] = self._snap_for(spec, ctx)
             heads[spec.id] = self._head(spec, snaps[spec.id], credential["class"], ctx.today, auth, ctx.now)
-        now_head, _ = self._now_head_and_rows(ctx, credential["class"], specs_map, snaps)
-        heads[NOW_ID] = now_head
         specs = self._ordered_specs(specs_map)
         regions = self._regions(specs)
-        order = [NOW_ID] + [s.id for s in specs]
+        order = [s.id for s in specs]
         # regions are content: a card's size or tabs changes no panel's etag, so they are hashed here
         etag = _sha({"schema": SCHEMA, "panels": [heads[i]["etag"] for i in order], "regions": regions,
                      "credential": credential, "verbs": self._verb_rev(auth),
@@ -2227,8 +2146,7 @@ class Cockpit:
         zones = []
         for zid, zt in ZONES:
             members = [s for s in specs if s.region == zid]
-            cards: list[dict[str, Any]] = [
-                {"panels": [NOW_ID], "size": "medium", "span": 1, "tabs": None}] if zid == "operate" else []
+            cards: list[dict[str, Any]] = []
             by_tabs: dict[str, dict[str, Any]] = {}
             for s in members:
                 if s.tabs and s.tabs in by_tabs:
@@ -2239,23 +2157,21 @@ class Cockpit:
                 if s.tabs:
                     by_tabs[s.tabs] = card
             zones.append({"id": zid, "title": zt, "grid": ZONE_GRID,
-                          "panels": ([NOW_ID] if zid == "operate" else []) + [s.id for s in members],
+                          "panels": [s.id for s in members],
                           "cards": cards})
         widgets = [s.id for s in specs if s.region == WIDGETS]
         return {"hero": hero, "brief": brief, "widgets": widgets,
                 "header": hero + brief + widgets, "zones": zones}
 
     def freshness(self) -> dict[str, dict[str, Any]]:
-        """``{panel_id: {as_of, status}}`` for every registered panel, ``now`` included (design §3.4).
+        """``{panel_id: {as_of, status}}`` for every registered panel (design §3.4).
         A client that got a 304 on a panel reads the panel's current age here. SEMANTICS: a panel's entry
         is its last COMMITTED read; reads of one panel run one at a time and commit in start order, so
         a failure after a success reads ``error``. A client that sees
         ``error`` or ``unread`` re-fetches the panel. It is metadata only:
         it runs NO provider and computes no status of its own. A refresher panel reports its cached
         snapshot (liveness and aging rules applied); an on-demand panel reports its last served read,
-        aged against ``stale_after_s``; ``now`` is rolled up from the gate triage-lists' entries in
-        this same call (error over unread over stale over partial over ok, oldest ``as_of``), so it
-        is as current as its sources; it has no ``empty`` (that needs rows) and reports ``ok``. A refresher
+        aged against ``stale_after_s``. A refresher
         panel that was never started reads ``error``, as in its head; an on-demand panel not yet served is
         ``status: "unread"`` with ``as_of: null``. Panels found by discovery appear
         after the first manifest read. No rows, no etag, never 304."""
@@ -2282,11 +2198,7 @@ class Cockpit:
                     (ctx.now - _parse_iso(as_of)) > timedelta(seconds=spec.stale_after_s):
                 status = "stale"
             out[spec.id] = {"as_of": as_of, "status": status}
-        gate = [out[s.id] for s in specs_map.values() if s.priority == "gate" and s.kind in ROW_ENGINE_KINDS]
-        order = ("error", "unread", "stale", "partial")
-        status = next((o for o in order if any(g["status"] == o for g in gate)), "ok")
-        as_ofs = [g["as_of"] for g in gate if g["as_of"]]
-        return {NOW_ID: {"as_of": min(as_ofs) if as_ofs and status != "unread" else None, "status": status}, **out}
+        return out
 
     def panel(self, panel_id: str, *, profile: str = "full", q: str | None = None,
               row: str | None = None, credential_class: str = "none",
@@ -2324,31 +2236,23 @@ class Cockpit:
         auth = self.authority()
         ctx = ReadContext(auth.now, authority=auth)
         specs_map = self._specs
-        if panel_id != NOW_ID and panel_id not in specs_map:
+        if panel_id not in specs_map:
             self._ensure_discovered(ctx)      # a panel we do not know yet may be a heading added since
             specs_map = self._specs
-        if panel_id == NOW_ID:
-            head, rows = self._now_head_and_rows(ctx, credential_class, specs_map)
-            spec = None
-            snap_rows: list[dict[str, Any]] | None = rows
-            held_rows: list[dict[str, Any]] = []
-            value = None
-            view_order = None
-        else:
-            spec = specs_map.get(panel_id)
-            if spec is None:
-                return None
-            snap = self._snap_for(spec, ctx)
-            head = self._head(spec, snap, credential_class, ctx.today, auth, ctx.now)
-            snap_rows, value, view_order = snap.rows, snap.value, snap.view_order
-            if snap_rows is not None:
-                snap_rows = self._with_provenance(snap_rows, snap.label_keys, auth.labels)
-            held_rows = self._with_provenance(snap.held, snap.label_keys, auth.labels) if snap.held else []
-            if spec.label_key is not None and spec.kind in VERSIONED_VALUE_KINDS and isinstance(value, dict):
-                value = {**value, "provenance": auth.labels.provenance(snap.value_label_key)}
+        spec = specs_map.get(panel_id)
+        if spec is None:
+            return None
+        snap = self._snap_for(spec, ctx)
+        head = self._head(spec, snap, credential_class, ctx.today, auth, ctx.now)
+        snap_rows, value, view_order = snap.rows, snap.value, snap.view_order
+        if snap_rows is not None:
+            snap_rows = self._with_provenance(snap_rows, snap.label_keys, auth.labels)
+        held_rows = self._with_provenance(snap.held, snap.label_keys, auth.labels) if snap.held else []
+        if spec.label_key is not None and spec.kind in VERSIONED_VALUE_KINDS and isinstance(value, dict):
+            value = {**value, "provenance": auth.labels.provenance(snap.value_label_key)}
         out: dict[str, Any] = dict(head)
         out["rows"], out["value"], out["next"] = None, None, None
-        if head["status"] == "error" and panel_id != NOW_ID:
+        if head["status"] == "error":
             return out    # an error never carries rows or a value: nothing stale passes as a read
         if head["kind"] in ROW_ENGINE_KINDS:
             rows_all = snap_rows or []
@@ -2359,7 +2263,7 @@ class Cockpit:
                     raise RowNotFound(row)
                 return out
             matched = None
-            if q and spec is not None:   # the now view declares no search
+            if q and spec is not None:
                 fields = search_fields_of(spec)
                 held = len(rows_all)
                 if spec.search_scope == "store" and spec.search is not None:
@@ -2391,14 +2295,7 @@ class Cockpit:
                     rows_all = keep
                     out["match_label"] = (f"searches the newest {spec.window} only: {matched} of {held}"
                                           if spec.window is not None else f"{matched} of {held}")
-            if profile == "compact" and panel_id == NOW_ID:
-                # The now view repeats rows its source gate panels already send whole in this same
-                # profile, so it sends each one's identity and placement and nothing else; the
-                # renderer joins on (panel_id, id) to the source panel's rows.
-                out["rows"] = [{**{k: r[k] for k in ("id", "panel_id", "version", "group")}, "body": None}
-                               for r in rows_all]
-                out["rows_by_ref"] = True
-            elif profile == "compact":
+            if profile == "compact":
                 if q or head["priority"] == "gate":
                     out["rows"] = [{**r, "body": None} for r in rows_all]
                 else:
@@ -2413,7 +2310,7 @@ class Cockpit:
             if spec is not None and spec.views and out["rows"] is not None and view_order is not None:
                 sent = {r["id"] for r in rows_all}
                 out["view_rows"] = {v: [i for i in ids if i in sent] for v, ids in view_order.items()}
-            if out["rows"] is not None and not out.get("rows_by_ref"):
+            if out["rows"] is not None:
                 out["rows"] = self._with_actions(out["rows"], panel_id, credential_class, ctx.today, auth)
             if out.get("held"):
                 out["held"] = self._with_actions(out["held"], panel_id, credential_class, ctx.today, auth)

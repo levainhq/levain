@@ -57,7 +57,7 @@ def _get(url: str) -> tuple[int, float]:
 def test_burst_of_page_loads_has_no_503_and_bounded_p95(tmp_path: Path, monkeypatch) -> None:
     _fill(tmp_path, monkeypatch)
     _root, src, _ids = _install(tmp_path)
-    paths = ["/cockpit/panel/decisions.json", "/cockpit/panel/now.json", "/cockpit/manifest.json"]
+    paths = ["/cockpit/panel/decisions.json", "/cockpit/panel/tray.json", "/cockpit/manifest.json"]
     with _serve(src, install_class="reported") as (url, httpd):
         assert httpd.question_store is not None
         results: list[tuple[int, float]] = []
@@ -155,11 +155,11 @@ def test_a_slow_read_the_client_abandons_is_still_counted(tmp_path: Path, monkey
         return real_send(self, body, ctype, *a, **kw)
 
     monkeypatch.setattr(web_server._Handler, "_send", dying_send)
-    before, before_ab = _count("panel/now"), _count("panel/now", "aborted")
+    before, before_ab = _count("panel/tray"), _count("panel/tray", "aborted")
     with _serve(src, install_class="reported") as (url, _httpd):
-        _raw_get_and_close(url, "/cockpit/panel/now.json")
-        assert _wait_for(lambda: _count("panel/now") == before + 1)
-    assert _count("panel/now", "aborted") == before_ab + 1
+        _raw_get_and_close(url, "/cockpit/panel/tray.json")
+        assert _wait_for(lambda: _count("panel/tray") == before + 1)
+    assert _count("panel/tray", "aborted") == before_ab + 1
 
 
 def test_a_503_is_counted_when_the_client_has_gone(tmp_path: Path, monkeypatch) -> None:
@@ -173,10 +173,10 @@ def test_a_503_is_counted_when_the_client_has_gone(tmp_path: Path, monkeypatch) 
 
     monkeypatch.setattr(web_server._Handler, "_send", dying_send)
     monkeypatch.setattr(web_server._Handler, "_acquire_read_slot", lambda self: False)
-    before = _count("panel/now", "refused_503")
+    before = _count("panel/tray", "refused_503")
     with _serve(src, install_class="reported") as (url, _httpd):
-        _raw_get_and_close(url, "/cockpit/panel/now.json")
-        assert _wait_for(lambda: _count("panel/now", "refused_503") == before + 1)
+        _raw_get_and_close(url, "/cockpit/panel/tray.json")
+        assert _wait_for(lambda: _count("panel/tray", "refused_503") == before + 1)
 
 
 def test_panel_other_does_not_steal_a_named_slot_and_the_log_names_the_folded_key(caplog) -> None:

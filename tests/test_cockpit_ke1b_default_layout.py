@@ -44,7 +44,7 @@ class TestDefaultLayout:
     def test_work_zone_order(self, regions) -> None:
         r, _ = regions
         ids = [c["panels"][0] for c in _zone(r, "operate")["cards"]]
-        assert ids[:3] == ["now", "tray", "loops"]
+        assert ids[:2] == ["tray", "loops"]
         assert ids.index("loops") < ids.index("episodes") < ids.index("keep") < ids.index("edits")
         assert all(c["span"] == 1 and c["tabs"] is None for c in _zone(r, "operate")["cards"])
 
@@ -68,7 +68,7 @@ class TestDefaultLayout:
     def test_tray_and_loops_are_tall_the_rest_of_the_work_zone_medium(self, regions) -> None:
         r, _ = regions
         sizes = {c["panels"][0]: c["size"] for c in _zone(r, "operate")["cards"]}
-        assert sizes["tray"] == "tall" and sizes["loops"] == "tall" and sizes["now"] == "medium"
+        assert sizes["tray"] == "tall" and sizes["loops"] == "tall"
         assert sizes["episodes"] == sizes["keep"] == "medium"
 
     def test_ranks_leave_the_embedder_gap_and_loops_clears_it(self, regions) -> None:

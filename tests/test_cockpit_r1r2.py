@@ -131,9 +131,6 @@ class TestTuiRenderer:
     def test_control_and_bidi_characters_are_visible(self) -> None:
         assert visible("a‮b\x1b[2Jc") == "a<U+202E>b<U+001B>[2Jc"
 
-    def test_now_view_rides_the_manifest_order(self) -> None:
-        manifest = snapshot(_cockpit())["manifest"]
-        assert manifest["regions"]["zones"][0]["panels"][0] == "now"
 
 
 def _tray_cockpit(*, fault: bool = False, stale: bool = False) -> Cockpit:
@@ -181,7 +178,7 @@ class TestManifestMapper:
         view = _view(snapshot(ck))
         assert [f"spore:{s['id']}" for s in view["tray"]] == served
         assert [s["group_title"] for s in view["tray"]] == ["Odd ids"] * 3 + ["Even ids"] * 2
-        assert [e["id"] for e in view["layout"]][:2] == ["now", "tray"]   # the kernel's panel order
+        assert [e["id"] for e in view["layout"]][:1] == ["tray"]   # the kernel's panel order
 
     def test_a_provider_fault_becomes_an_unavailable_panel_never_an_empty_one(self) -> None:
         view = _view(snapshot(_tray_cockpit(fault=True)))
@@ -354,20 +351,6 @@ class TestManifestMapperAdversarial:
         assert bad["jar"] is None and "jar" in bad["errors"]["entity"]      # never a healthy jar at level 0
         assert bad["health"] is None                                   # a malformed metric degrades the panel, no fake figure
 
-    def test_now_rows_keep_their_full_text_group_titles_and_hostile_characters_are_visible(self) -> None:
-        ck = Cockpit()
-        long = "x" * 200 + "\u202eEND"
-        rows = [RowIn("spore:spore-1", long, {"disposition": "seed", "due": "2020-01-01", "tier": "hot", "salience": 0,
-                                               "handoff_expired": False}, body=long, stored={"id": "spore-1"})]
-        ck.register(ProviderSpec("tray", "triage-list", "Tray", "gate", lambda c: Read(rows=tuple(rows)), order="spore.tray",
-                                 facets=frozenset({"disposition", "due", "tier", "salience", "handoff_expired"}),
-                                 version_fields=("id",)))
-        view = _view(self._snap(ck))
-        now = view["extra_panels"]["now"]["lines"][0]
-        assert now["text"].endswith("<U+202E>END") and len(now["text"]) > 160   # full body, sanitised
-        assert now["grp"] == "OVERDUE"                                          # Now is a dated list: an overdue row sits under OVERDUE
-
-
 @pytest.mark.skipif(NODE is None, reason="node is not installed")
 class TestManifestMapperBoundary:
     """L3 r2 on the redo: ONE sanitising boundary, and the state/dup cases."""
@@ -422,14 +405,6 @@ class TestManifestMapperBoundary:
         view = _view(snapshot(ck))
         assert "focus" not in view and "focus" not in view["errors"]
         assert "focus" not in [e["id"] for e in view["layout"]]
-
-    def test_a_degraded_now_view_names_its_source_and_a_missing_wraps_panel_is_not_unavailable(self) -> None:
-        ck = _tray_cockpit()
-        snap = snapshot(ck)
-        snap["panels"]["now"]["degraded"] = ["tray"]
-        snap["panels"]["now"]["error"] = None
-        view = _view(snap)
-        assert view["extra_panels"]["now"]["note"] == "next 7 days · not complete: tray"
 
     def test_wraps_state_is_tri_state_missing_is_not_unavailable_but_errored_is(self) -> None:
         def health_view(with_wraps: str | None) -> dict[str, Any]:

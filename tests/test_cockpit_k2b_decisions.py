@@ -164,8 +164,6 @@ def test_only_outcomes_is_empty_with_the_history_still_carried(tmp_path):
     groups = {g["id"]: g for g in p["groups"]}
     assert groups["outcomes"] == {"id": "outcomes", "title": "Outcomes", "count": 1, "uncounted": True}
     assert groups["resolved"]["count"] == 0 and "uncounted" not in groups["waiting"]
-    now_rows = ck.panel("now", credential_class="token")["rows"]
-    assert not [r for r in now_rows if r.get("panel_id") == "decisions"]
     assert "no cockpit broker" not in p["note"]
 
 

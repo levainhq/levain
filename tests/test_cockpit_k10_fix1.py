@@ -123,10 +123,6 @@ def test_the_repaint_signature_follows_what_is_drawn_to_the_decimal_and_the_day(
 
 _DAY_JS = r"""
 const row = (id, due) => ({ id, title: id, body: id, facets: due ? { due } : {}, group: null, badges: [], actions: [] });
-const m = wm("now", "list", null, { rows: [row("late", "2026-03-04"), row("same", "2026-03-05"), row("next", "2026-03-06"), row("none", null)], today: "2026-03-05" });
-m.manifest.panels = { now: head("now", "list", "now", {}) };
-const v = V.fromManifest(m);
-out.now = Object.fromEntries(v.extra_panels.now.lines.map((l) => [l.text, l.grp]));
 const tm = {
   manifest: Object.assign(manifest({ hero: [], brief: [], widgets: [], header: [], zones: [{ id: "operate", title: "Work", grid: 3, panels: ["tray"], cards: [{ panels: ["tray"], size: "tall", span: 1, tabs: null }] }] }), {}),
   panels: { tray: head("tray", "list", "Tray", { today: "2026-03-05", rows: [Object.assign(row("spore:spore-1", "2026-03-04"), { facets: { due: "2026-03-04", disposition: "seed" } })], actions: [] }) } };
@@ -154,7 +150,6 @@ def test_the_page_counts_today_and_overdue_in_the_servers_day_not_its_own(tmp_pa
     run = subprocess.run([NODE, str(driver), str(src), "[]"], capture_output=True, text=True, timeout=60)
     assert run.returncode == 0, run.stderr
     out = json.loads(run.stdout.strip().splitlines()[-1])
-    assert out["now"] == {"late": "OVERDUE", "same": "TODAY", "next": "FRI 03-06", "none": "TODAY"}, out
     assert out["tray"] == [["2026-03-04", "2026-03-05"]], out
 
 

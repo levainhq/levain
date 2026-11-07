@@ -1643,9 +1643,9 @@ html {
 html { --stripe-memory: var(--hue-2); --stripe-decisions: var(--hue-1); --stripe-work: var(--hue-3); }
 html :is([data-ck-panel="memory_glance"], [data-ck-panel="health"], [data-ck-panel="doctor"], [data-ck-panel="crystals"], [data-ck-panel="graph"], [data-ck-panel="episodes"], [data-ck-panel="wraps"], [data-ck-panel^="section:"], [data-ck-panel^="config:"])::before { background: var(--stripe-memory); }
 html :is([data-ck-panel="decisions"], [data-ck-panel="edits"])::before { background: var(--stripe-decisions); }
-html :is([data-ck-panel="sessions"], [data-ck-panel="topology"], [data-ck-panel="now"], [data-ck-panel="tray"], [data-ck-panel="loops"], [data-ck-panel="keep"], [data-ck-panel="jobs"], [data-ck-panel="ext:inbox"])::before { background: var(--stripe-work); }
+html :is([data-ck-panel="sessions"], [data-ck-panel="topology"], [data-ck-panel="tray"], [data-ck-panel="loops"], [data-ck-panel="keep"], [data-ck-panel="jobs"], [data-ck-panel="ext:inbox"])::before { background: var(--stripe-work); }
 html :is(.ck-card.w, .ck-zgrid .panel:not(.ck-dash), .ck-mem-row > .panel:not(.ck-dash)):is([data-ck-panel="memory_glance"], [data-ck-panel="health"], [data-ck-panel="doctor"], [data-ck-panel="crystals"], [data-ck-panel="graph"], [data-ck-panel="episodes"],
-  [data-ck-panel="decisions"], [data-ck-panel="edits"], [data-ck-panel="sessions"], [data-ck-panel="topology"], [data-ck-panel="now"], [data-ck-panel="tray"], [data-ck-panel="loops"], [data-ck-panel="keep"], [data-ck-panel="jobs"], [data-ck-panel="ext:inbox"], [data-ck-panel^="section:"]):not(.ck-mem-nest)::before {
+  [data-ck-panel="decisions"], [data-ck-panel="edits"], [data-ck-panel="sessions"], [data-ck-panel="topology"], [data-ck-panel="tray"], [data-ck-panel="loops"], [data-ck-panel="keep"], [data-ck-panel="jobs"], [data-ck-panel="ext:inbox"], [data-ck-panel^="section:"]):not(.ck-mem-nest)::before {
   content: ""; position: absolute; inset: 0 0 auto 0; height: 2px; pointer-events: none; z-index: 1; }
 html :is(.ck-card.w, .ck-zgrid .panel):is([data-ck-panel]) { position: relative; }
 /* a card alone in a column takes the column's width even when empty (the empty rule above sets align-self: start for the grid) */
@@ -2597,7 +2597,7 @@ body.ke [data-ck-panel="tray"] .row > .k7-repo, body.ke [data-ck-panel="loops"] 
 body.ke [data-ck-panel="tray"] .held-line { justify-content: center; padding: var(--sp-3) 0 var(--sp-4); font-size: var(--fs-meta); }
 body.ke [data-ck-panel="tray"] .held-toggle { text-decoration: underline; text-underline-offset: 3px; }
 /* the Board's work lists show their rows whole before they fold: room for a full Tray, Now, Open loops and Keep */
-body.ke[data-mode="board"] .ck-zgrid .panel:is([data-ck-panel="tray"], [data-ck-panel="now"], [data-ck-panel="loops"], [data-ck-panel="keep"]) { max-height: 700px; }
+body.ke[data-mode="board"] .ck-zgrid .panel:is([data-ck-panel="tray"], [data-ck-panel="loops"], [data-ck-panel="keep"]) { max-height: 700px; }
 /* the taller Board stack's last card ends the two stacks together (dashboard_core.js balanceStacks sets the cap) */
 body.ke[data-mode="board"] .ck-zgrid.ck-twocol > .ck-col > .panel[data-stack-cap] { max-height: var(--stack-cap); }
 .grp-col { display: contents; }

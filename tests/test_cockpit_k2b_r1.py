@@ -65,10 +65,10 @@ def test_retier_tiers_on_the_snapshots_date_not_a_second_clock_read(rig_broker, 
     assert seen and set(seen) == {_EVE.date()}
 
 
-def test_the_now_view_notes_an_unreadable_label_snapshot(rig_broker) -> None:
+def test_the_tray_panel_notes_an_unreadable_label_snapshot(rig_broker) -> None:
     rig, _b, _db = rig_broker
     rig.ck.attach_labeller(lambda: unavailable("journal busy"))
-    note = rig.ck.panel("now")["note"] or ""
+    note = rig.ck.panel("tray")["note"] or ""
     assert "provenance unavailable: journal busy" in note
 
 
@@ -85,11 +85,11 @@ class _Degraded:
         return "unverified"
 
 
-def test_the_now_view_notes_degraded_rows_and_its_etag_moves_with_the_snapshot(rig_broker) -> None:
+def test_the_tray_panel_notes_degraded_rows_and_its_etag_moves_with_the_snapshot(rig_broker) -> None:
     rig, _b, _db = rig_broker
     rig.ck.attach_labeller(lambda: _Degraded())
-    degraded = rig.ck.panel("now")
+    degraded = rig.ck.panel("tray")
     assert "2 label row(s) unreadable" in (degraded["note"] or "")
     rig.ck.attach_labeller(lambda: unavailable("journal busy"))
-    busy = rig.ck.panel("now")
+    busy = rig.ck.panel("tray")
     assert busy["etag"] != degraded["etag"]       # a 304 never hides the changed note

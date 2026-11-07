@@ -225,7 +225,7 @@ def test_a_corrupt_store_is_one_panels_error_and_never_the_manifests(tmp_path: P
     ck = _cockpit(d)
     m = ck.manifest(CRED)
     assert not m.get("errors"), m.get("errors")
-    assert "now" in _ids(ck) and REVIEW_ID in _ids(ck) and MORNING_ID in _ids(ck)
+    assert REVIEW_ID in _ids(ck) and MORNING_ID in _ids(ck)
     for pid in (REVIEW_ID, MORNING_ID):
         rows = ck.panel(pid)["rows"]
         assert len(rows) == 1 and rows[0]["body"].startswith("Could not read: "), rows
