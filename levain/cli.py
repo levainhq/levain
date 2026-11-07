@@ -1526,9 +1526,11 @@ def build_parser() -> argparse.ArgumentParser:
     hm_sub = hm_p.add_subparsers(dest="hands_mcp_cmd", required=True)
     for _verb, _help in (("signin", "Sign in to one registered remote MCP server as the entity's user."),
                          ("remove", "Log out of and remove a server `signin` added (local only)."),
-                         ("list", "Show registered servers against what the entity's user holds (read-only).")):
+                         ("list", "Show registered servers against what the entity's user holds (read-only)."),
+                         ("prepare", "Write the registry's servers into the entity's user's Claude and Codex launch "
+                                     "files (what a hands chat launch reads).")):
         _p = hm_sub.add_parser(_verb, help=_help)
-        if _verb != "list":
+        if _verb not in ("list", "prepare"):
             _p.add_argument("name", help="The registered server's name.")
         _p.add_argument("--path", type=Path, default=argparse.SUPPRESS, help="Entity directory (default: cwd).")
         if _verb != "remove":
@@ -5379,6 +5381,8 @@ def _cmd_hands(args: argparse.Namespace) -> int:
             return hands_mcp_login.cmd_signin(args.path, args.name, args.data_root)
         if args.hands_mcp_cmd == "remove":
             return hands_mcp_login.cmd_remove(args.path, args.name)
+        if args.hands_mcp_cmd == "prepare":
+            return hands_mcp_login.cmd_prepare(args.path, args.data_root)
         return hands_mcp_login.cmd_list(args.path, args.data_root)
     if args.hands_cmd == "login":
         return hands_login.cmd_hands_login(args.path, args.vendor)

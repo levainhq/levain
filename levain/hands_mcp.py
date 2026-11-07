@@ -6,8 +6,8 @@ credential is brokered. An entry is a signed authority-log grant of kind :data:`
 (the shape of the egress-key setup record: fixed terms under an id, a renew only moves the expiry, at most 30 days
 past its link). No process is spawned and no file is written; the one read is the stat (and the links) of a stdio
 command and of the directories above it (:func:`command_problems`), at registration and again at every render, and the same entry
-renders to the same bytes. What launches the servers (M2), signs a server in (M3) and audits drift (M4) are later
-slices.
+renders to the same bytes. What writes the launch files from the live entries (M2: ``levain.firing.hands_mcp_login.prepare_launch``, which calls
+both renderers), signs a server in (M3) and audits drift (M4) are other modules.
 
 The entry is signed into the authority log in plaintext, so it carries no secret: not in argv, not in a url's query,
 and not as the value of an env name that says it holds one. A server's credential lives in the hands account's own
