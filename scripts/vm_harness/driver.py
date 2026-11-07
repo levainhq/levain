@@ -7,12 +7,11 @@ Harness code, not product code. Every effect is injected (``alloc`` / ``mint`` /
 
 The seam signatures here are THIS HARNESS'S OWN CONTRACT, not the runtime's API: ``alloc(slot, lease)``,
 ``mint(slot, lease) -> session id``, ``render(session)``, ``revoke(session)``, ``slot_check(slot) -> bool``.
-The real adapters are not written. They are written at the V2 sitting, against a live root CONTROL: the session
-id is expected to come from ``runtime-helper prepare`` and the CONTROL MINT to happen inside ``render``, after
-the front is spawned, so the seam order may be reshaped there to journal the id the moment it exists (L3 r1
-found the current order does not match). Until then only fakes drive this driver; ``cleanup.control_revoke`` is
-the one real seam, and it too needs that live CONTROL. The existing ``levain session`` pty route stays for
-end-to-end runs.
+The real adapters are :class:`VmAdapters` (below), driven from the host against a clone VM. The seam order is
+reshaped to the runtime's: ``mint`` is ``runtime-helper prepare`` (the id exists only once it returns; the
+``intent`` line is already journaled before it), ``render`` is journal-ack, then ``render`` + ``start`` (the vendor
+runs only after the id is fsynced into the journal). ``guest_dispatch.py`` holds the product's own lease across
+that split. The existing ``levain session`` pty route stays for end-to-end runs.
 
 What it does not do: it never reads ACTIVE (or any single success) as health, and it does not test FRONT-LOST
 (3c). The RESULT header says both, on disk, before the first alloc, so a crashed run still carries it. A run is
@@ -205,3 +204,127 @@ def run_vm_lifecycle(evidence_dir: Path | str, plan: Iterable[SlotPlan], *, allo
     if pending is not None:
         raise pending
     return RunResult(not problems, problems, result_path, journal.path)
+
+
+# -- the real adapters (host side, against a clone VM) -------------------------------------------------------------
+
+class AdapterError(Exception):
+    """A real adapter could not do its job (a refusal, a timeout, a slot mismatch)."""
+
+
+class VmAdapters:
+    """The driver's seams against a running clone VM. ``guest(argv, timeout) -> stdout`` runs one command in the
+    guest (raising on a non-zero exit); ``spawn(argv)`` starts a long-lived guest process and returns an object
+    with ``poll()`` and ``terminate()``. Both are injected, so the ordering logic is tested with no VM.
+
+    The journal-before-vendor guarantee: ``mint`` returns the id the moment ``prepare`` has answered, and the vendor
+    cannot start until ``render`` writes the ack, which :func:`start_session` only reaches after journaling the id."""
+
+    OPS = ("sudo", "-n", "/usr/local/bin/python3.13", "-I", "/tmp/fire/guest_ops.py")
+    DISPATCH = ("sudo", "-n", "-u", "_levain_dispatch", "/usr/bin/env", "PATH=/usr/bin:/bin",
+                "/usr/local/bin/python3.13", "-I", "/tmp/fire/guest_dispatch.py")
+
+    def __init__(self, guest: Callable[..., str], spawn: Callable[[list[str]], object], *,
+                 clock: Callable[[], float] = time.monotonic, sleep: Callable[[float], object] = time.sleep,
+                 prepare_s: float = 90.0, run_s: float = 180.0, tag_prefix: str = "drv") -> None:
+        self._guest, self._spawn, self._clock, self._sleep = guest, spawn, clock, sleep
+        self.prepare_s, self.run_s, self.tag_prefix = prepare_s, run_s, tag_prefix
+        self._n = 0
+        self._tags: dict[str, str] = {}     # session -> tag
+        self._planned: dict[str, int] = {}  # session -> the slot the plan said
+        self._children: list[object] = []
+        self._child_of: dict[str, object] = {}   # session -> its guest dispatch process
+
+    def ops(self, verb: str, arg: str, timeout: float = 60) -> str:
+        return self._guest([*self.OPS, verb, str(arg)], timeout)
+
+    def _get(self, name: str) -> dict | None:
+        try:
+            text = self.ops("get", name)
+        except Exception:   # noqa: BLE001 - an absent file is exit 3; anything else surfaces at the deadline
+            return None
+        try:
+            obj = json.loads(text)
+        except ValueError:
+            return None
+        return obj if isinstance(obj, dict) else None
+
+    def _wait(self, tag: str, names: tuple[str, ...], deadline_s: float, child: object, what: str) -> tuple[str, dict]:
+        end = self._clock() + deadline_s
+        while True:
+            for n in names:
+                got = self._get(f"{tag}.{n}.json")
+                if got is not None:
+                    return n, got
+            err = self._get(f"{tag}.error.json")
+            if err is not None:
+                raise AdapterError(f"guest dispatch failed before {what}: {err.get('exc')}")
+            if child.poll() is not None:
+                raise AdapterError(f"guest dispatch exited (rc={child.poll()}) before {what}")
+            if self._clock() >= end:
+                raise AdapterError(f"timed out after {deadline_s}s waiting for {what}")
+            self._sleep(1.0)
+
+    # the seams
+    def alloc(self, slot: int, lease: str) -> None:
+        state = self.ops("slotstate", slot).strip()
+        if state != "reusable":
+            raise AdapterError(f"slot {slot} is {state!r}, not reusable")
+
+    def mint(self, slot: int, lease: str) -> str:
+        self._n += 1
+        tag = f"{self.tag_prefix}{slot}x{self._n}"
+        child = self._spawn([*self.DISPATCH, tag])
+        self._children.append(child)
+        _, prepared = self._wait(tag, ("prepared",), self.prepare_s, child, "prepare")
+        session = prepared.get("session")
+        if not isinstance(session, str) or not session:
+            raise AdapterError(f"prepared record carries no session id: {prepared!r}")
+        self._tags[session] = tag
+        self._child_of[session] = child
+        self._planned[session] = slot
+        return session
+
+    def render(self, session: str) -> None:
+        tag = self._tags[session]
+        got = self.ops("slotof", session).strip()
+        want = f"e{self._planned[session]}"
+        if got != want:   # the id is journaled by now, so the REVOKE walk covers it; the vendor must not run
+            raise AdapterError(f"session {session} landed in slot {got!r}, the plan said {want!r}: not rendering")
+        self.ops("put", f"{tag}.journaled")
+        child = self._child_of[session]
+        name, _ = self._wait(tag, ("final",), self.run_s, child, "the vendor to finish")
+        assert name == "final"
+
+    def revoke(self, session: str) -> str:
+        return self.ops("revoke", session)
+
+    def slot_check(self, slot: int) -> bool:
+        return self.ops("slotstate", slot).strip() == "reusable"
+
+    def lister(self) -> str:
+        return self._guest(["/bin/ps", "-Ao", "pid,etime,pcpu,ucomm,uid"], 60)
+
+    def resolve(self, name: str) -> int | None:
+        v = self.ops("resolve", name).strip()
+        return None if v == "none" else int(v)
+
+    def close(self) -> None:
+        for c in self._children:
+            try:
+                if c.poll() is None:
+                    c.terminate()
+            except Exception:   # noqa: BLE001 - best effort; the REVOKE walk and the uid scan are the proof
+                pass
+
+
+def run_on_vm(evidence_dir: Path | str, plan: Iterable[SlotPlan], adapters: VmAdapters, *,
+              deadline_s: float = 90.0) -> RunResult:
+    """:func:`run_vm_lifecycle` wired to ``adapters``: the guest's ``ps`` and ``getpwnam`` are injected, so the uid
+    scan never silently looks at the host."""
+    try:
+        return run_vm_lifecycle(evidence_dir, plan, alloc=adapters.alloc, mint=adapters.mint, render=adapters.render,
+                                revoke=adapters.revoke, slot_check=adapters.slot_check, lister=adapters.lister,
+                                resolve=adapters.resolve, deadline_s=deadline_s)
+    finally:
+        adapters.close()
