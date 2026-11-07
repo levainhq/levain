@@ -189,6 +189,7 @@
     prSetSec.appendChild(sh);
     const sgrid = el("div", "ck-zgrid dev-grid pr-settings-grid");
     sgrid.appendChild(buildTaps());
+    sgrid.appendChild(buildVoice());   // Voice beside Tap tokens; it shows only where the cockpit serves GET /cockpit/voice.json
     prSetSec.appendChild(sgrid);
     const main = document.querySelector("main.frame");
     if (main) { main.appendChild(section); main.appendChild(prSetSec); } else { document.body.appendChild(section); document.body.appendChild(prSetSec); }
@@ -199,7 +200,7 @@
   // The devices section shows with its own read; the settings section holds two blocks (the standing default, tap tokens) and shows while either does, each with its own gone/refused state.
   function syncSection() {
     section.hidden = devPanel.hidden;
-    if (prSetSec) prSetSec.hidden = !prPanel || prPanel.hidden;
+    if (prSetSec) prSetSec.hidden = (!prPanel || prPanel.hidden) && (!vcPanel || vcPanel.hidden);
   }
   function devShown(on) { devPanel.hidden = !on; syncSection(); }
 
@@ -1345,8 +1346,133 @@
   }
 
 
+  // ---- Voice (V1-5): the per-device read-aloud settings. Every choice is stored in THIS browser (voice.js, localStorage);
+  // nothing here writes to the server. The block reads GET /cockpit/voice.json once when the page opens; a cockpit that does
+  // not serve it (404, no key set up) shows no block. voice.js is loaded only then, so a page without voice never fetches it.
+  // A key is set on the laptop and revoked beside the grants; this block only says which keys are set.
+  let vcPanel = null, vcBody = null, vcState = null;
+  function buildVoice() {
+    vcPanel = el("div", "panel k-list dev-panel vc-panel");
+    vcPanel.dataset.modes = ALL_MODES;
+    vcPanel.hidden = true;
+    const ph = el("div", "phead");
+    ph.appendChild(el("h2", null, "Voice"));
+    vcPanel.appendChild(ph);
+    vcBody = el("div", "pbody dev-body vc-body");
+    vcPanel.appendChild(vcBody);
+    return vcPanel;
+  }
+  function vcLoadScript() {
+    return new Promise((resolve) => {
+      if (window.LevainVoice) { resolve(true); return; }
+      const s = document.createElement("script");
+      s.src = "/voice.js";
+      s.onload = () => resolve(!!window.LevainVoice);
+      s.onerror = () => resolve(false);
+      document.head.appendChild(s);
+    });
+  }
+  async function voiceProbe() {
+    let state = null;
+    try {
+      const res = await api("GET", "/cockpit/voice.json", undefined, READ_TIMEOUT_MS);
+      if (res && res.status === 200 && res.data && Array.isArray(res.data.providers)) state = res.data;
+    } catch (_) { state = null; }
+    if (!state || !(await vcLoadScript())) return;
+    vcState = state;
+    paintVoice();
+    vcPanel.hidden = false;
+    syncSection();
+  }
+  function vcRow(label, control, help) {
+    const r = el("div", "dev-row vc-row");
+    const lab = el("label", "vc-lab", label);
+    r.appendChild(lab);
+    r.appendChild(control);
+    if (help) r.appendChild(el("p", "dev-note vc-help", help));
+    return { row: r, label: lab };
+  }
+  function paintVoice() {
+    const V = window.LevainVoice, st = V.settings();
+    vcBody.replaceChildren();
+    const ready = vcState.providers.filter((p) => p.key === "set" && Array.isArray(p.uses) && p.uses.indexOf("tts") >= 0);
+    // a stored provider that has no live key is not honoured: reading falls back to the on-device voice, and the block says so
+    const prov = ready.find((p) => p.name === st.provider) || ready[0] || null;
+    const premium = st.tier === "premium" && !!prov;
+    const rerun = (patch) => { V.saveSettings(patch); paintVoice(); };
+
+    const tier = el("select", "dev-label vc-tier"); tier.id = "vc-tier";
+    tier.appendChild(new Option("On-device voice", "device"));
+    const po = new Option("Premium voice", "premium"); po.disabled = !prov;
+    tier.appendChild(po);
+    tier.value = premium ? "premium" : "device";
+    tier.addEventListener("change", () => rerun(tier.value === "premium" ? { tier: "premium", provider: (prov || {}).name || "" } : { tier: "device" }));
+    const t = vcRow("Read aloud with", tier, prov ? "" : "Premium voice needs a key. Set one on the laptop with: levain voice key add <provider>");
+    t.label.htmlFor = "vc-tier";
+    vcBody.appendChild(t.row);
+
+    if (prov) {
+      const ps = el("select", "dev-label vc-provider"); ps.id = "vc-provider";
+      for (const p of ready) ps.appendChild(new Option(p.name.charAt(0).toUpperCase() + p.name.slice(1), p.name));
+      ps.value = prov.name;
+      ps.addEventListener("change", () => rerun({ provider: ps.value, voice: "" }));
+      const pr = vcRow("Provider", ps, prov.retention || "");
+      pr.label.htmlFor = "vc-provider";
+      vcBody.appendChild(pr.row);
+
+      const vs = el("select", "dev-label vc-voice"); vs.id = "vc-voice";
+      const voices = Array.isArray(prov.voices) ? prov.voices : [];
+      for (const v of voices) vs.appendChild(new Option(v, v));
+      vs.value = voices.indexOf(st.voice) >= 0 ? st.voice : prov.default_voice;
+      vs.addEventListener("change", () => V.saveSettings({ voice: vs.value }));
+      const vr = vcRow("Voice (" + voices.length + ")", vs);
+      vr.label.htmlFor = "vc-voice";
+      vcBody.appendChild(vr.row);
+
+      const lo = Array.isArray(prov.speed) ? Number(prov.speed[0]) : 0.5, hi = Array.isArray(prov.speed) ? Number(prov.speed[1]) : 2;
+      const sp = el("input", "vc-speed"); sp.id = "vc-speed"; sp.type = "range"; sp.min = String(lo); sp.max = String(hi); sp.step = "0.05";
+      sp.value = String(Math.min(hi, Math.max(lo, st.speed)));
+      const sv = el("span", "vc-speed-val", Number(sp.value).toFixed(2) + "x");
+      sp.addEventListener("input", () => { sv.textContent = Number(sp.value).toFixed(2) + "x"; });
+      sp.addEventListener("change", () => V.saveSettings({ speed: Number(sp.value) }));
+      const wrap = el("span", "vc-speed-wrap"); wrap.appendChild(sp); wrap.appendChild(sv);
+      const sr = vcRow("Speed", wrap);
+      sr.label.htmlFor = "vc-speed";
+      vcBody.appendChild(sr.row);
+    }
+
+    const check = (id, label, on, onSet, help) => {
+      const c = el("input", "vc-check"); c.type = "checkbox"; c.id = id; c.checked = on;
+      c.addEventListener("change", () => onSet(c.checked));
+      const l = vcRow(label, c, help);
+      l.label.htmlFor = id;
+      vcBody.appendChild(l.row);
+    };
+    check("vc-autoplay", "Autoplay replies", st.autoplay, (v) => V.saveSettings({ autoplay: v }),
+          "A reply that finishes while this page is open is read aloud. Replies already there are never read. After the app was away, the first reply asks for a tap.");
+    check("vc-notify", "Read a notification aloud when I open it", st.notify, (v) => V.saveSettings({ notify: v }),
+          "Saved for this device. The page that opens a notification reads it only where the browser allows.");
+
+    // the sample is the on-device voice: the premium route reads only words already in the room, never a sentence the page sends
+    const hear = el("button", "dev-btn vc-hear", "Hear the on-device voice"); hear.type = "button";
+    hear.addEventListener("click", () => { V.sampleDevice(); });
+    const hr = el("div", "dev-row vc-row"); hr.appendChild(hear);
+    if (prov) hr.appendChild(el("p", "dev-note vc-help", "To hear the premium voice, tap Play on a room reply."));
+    vcBody.appendChild(hr);
+
+    // keys and the estimated spend: read only
+    const keys = vcState.providers.map((p) => p.name + ": " + (p.key === "set" ? "key set" : "no key")).join(" · ");
+    vcBody.appendChild(el("p", "dev-note vc-keys", "Keys: " + keys + ". Revoke a key beside its grant."));
+    const caps = vcState.caps;
+    if (caps && caps.spent_month_est !== null && caps.spent_month_est !== undefined) {
+      vcBody.appendChild(el("p", "dev-note vc-caps", "Estimated spend: $" + caps.spent_day_est + " today of a $" + caps.day_usd +
+        " cap, $" + caps.spent_month_est + " this month of $" + caps.month_usd + ". An estimate; the provider's bill is the truth."));
+    }
+  }
+
   function start() {
     build();
+    voiceProbe();
     refresh();
     readPresence();
     // The cockpit stores its token a moment after load when the link carried one; look again, then keep a slow pulse.

@@ -1263,6 +1263,9 @@ _ASSETS: dict[str, tuple[str, str]] = {
     "/pair": ("pair.html", "text/html; charset=utf-8"),
     "/pair.js": ("pair.js", "text/javascript; charset=utf-8"),
     "/devices_panel.js": ("devices_panel.js", "text/javascript; charset=utf-8"),
+    # Reading the room aloud (voice V1-5): the player, the per-reply control and the settings store. Loaded by the Voice
+    # block once /cockpit/voice.json answers; it calls POST /cockpit/voice/speak and no other route.
+    "/voice.js": ("voice.js", "text/javascript; charset=utf-8"),
     "/pair_card.js": ("pair_card.js", "text/javascript; charset=utf-8"),
     # The passkey-making page: a static shell (its reads and its one POST are same-origin and gated) that makes a passkey on
     # this device and prints the laptop commands that enrol it, through POST /cockpit/passkey/key-line (served beside a Signer).
