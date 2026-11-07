@@ -4,6 +4,7 @@ only if it was shown); the page takes one at a bare standalone '/' launch when i
 tests/_sw_worker_rig.js (push/click) and tests/_sw_open_rig.js (scenario 'shown')."""
 from __future__ import annotations
 
+import functools
 import re
 
 from tests.test_sw_worker import _open_rig, _run, needs_node
@@ -169,3 +170,53 @@ def test_the_legacy_singleton_key_is_swept_by_the_worker_and_by_the_page() -> No
     assert got["legacyLeft"] is False, got                                            # the push's best-effort prune deleted it
     got = _open_rig("shown")
     assert got["legacy"]["assigned"] == [] and got["legacyLeft"] is False, got["legacy"]   # the page's sweep: removed, never judged
+
+
+# --- row 268 (1106-53): the app RESUMES (no load) and the page judges the 'shown' entries again ---------------------------
+
+@functools.lru_cache(maxsize=1)
+def _resume_once() -> dict:
+    return _open_rig("resume")                  # ~15 s (the 1.5 s retry of each case runs inside it): once for the four tests
+
+
+def _resume() -> dict:
+    return _resume_once()
+
+
+@needs_node
+def test_a_resume_with_the_notification_gone_forwards_to_the_entry_url_exactly_once() -> None:
+    """11-06 21:01, ping 640: the tap resumed a document loaded hours before, nothing re-ran the launch check."""
+    got = _resume()
+    assert got["forward"]["assigned"] == [NC] and got["forward"]["kept"] is False, got["forward"]
+    assert got["forward"]["hows"] == ["load", "resume>shown"], got["forward"]
+    assert got["forwardTwice"]["assigned"] == [NC], got["forwardTwice"]              # a second return finds nothing to take
+    assert got["forwardTwice"]["hows"] == ["load", "resume>shown"], got["forwardTwice"]
+    assert got["fresh"]["assigned"] == [NC], got["fresh"]                            # 170 s old: inside the 180 s window
+
+
+@needs_node
+def test_a_resume_does_not_forward_with_the_notification_in_the_tray_or_an_old_entry_or_a_non_bare_url() -> None:
+    got = _resume()
+    for name in ("inTray", "inTrayLater", "nonBare", "notStandalone", "hidden"):
+        assert got[name]["assigned"] == [] and got[name]["kept"] is True, (name, got[name])   # the entry stays for a later launch
+    assert got["expired"]["assigned"] == [] and got["expired"]["kept"] is False, got["expired"]   # older than 180 s: swept, no move
+
+
+@needs_node
+def test_a_resume_that_finds_the_notification_gone_a_moment_later_forwards_on_the_one_retry() -> None:
+    got = _resume()
+    assert got["retry"]["assigned"] == [NC] and got["retry"]["hows"] == ["load", "resume>shown"], got["retry"]
+    # the first look took nothing (in the tray), so a resume landing is owed, but it is inside the 30 s of the load's
+    assert got["inTray"]["hows"] == ["load"], got["inTray"]
+
+
+@needs_node
+def test_landings_carry_the_key_a_target_without_a_token_and_the_resume_one_is_told_at_most_every_30_seconds() -> None:
+    got = _resume()
+    first = got["forward"]["post"]
+    assert first["u"] == "/webpush/landed" and first["method"] == "POST" and first["key"] == "KEY" and first["keepalive"] is True, first
+    assert set(first["body"]) == {"target", "how"} and "KEY" not in str(first["body"]), first
+    assert got["tokenHref"]["targets"] == ["/?view=needs&item=np-0b62cd3b"] and "SECRET" not in str(got["tokenHref"]), got["tokenHref"]   # only view and item survive
+    assert got["nonBare"]["targets"] == ["/?view=needs"], got["nonBare"]            # the load landing names where the page was, query kept to view/item
+    assert got["inTrayLater"]["hows"] == ["load", "resume"], got["inTrayLater"]       # 31 s after the load: a plain resume is told
+    assert got["throttle"]["hows"] == ["load", "resume"], got["throttle"]            # four returns inside 30 s: told ONCE

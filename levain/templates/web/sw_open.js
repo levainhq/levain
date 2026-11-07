@@ -61,7 +61,7 @@
   };
   // The LANDING record (1106-53): where this document is and what it did about a tap, told to the server (POST /webpush/landed,
   // the key this paired page holds), so a tap that lands at '/' with no target SAYS so even when Cache Storage lost the trace.
-  // Target = path and, of the query, only `view` and `item` (read at this script's first run, before the board strips them);
+  // Target = path and, of the query, only `view` and `item` (read at this script's first run; a later script may rewrite the address);
   // how = load | load>new | load>shown | resume | resume>shown | message ('>' = then it forwarded itself). Best effort, silent,
   // keepalive (a forward unloads the page), no token in the body.
   const ITEM_OK = /^[A-Za-z0-9_.:-]{1,64}$/;

@@ -202,7 +202,8 @@ function boundedReceipts(b, work) {
 // --- tap reports (1106-53) -----------------------------------------------------------------------------------------
 // What the worker says about a TAP goes to the server by the same queued receipt path, independent of the Cache Storage
 // trace (11-06 21:00: ping 640 was received and shown on the phone, and no click or open step reached the trace). `clicked`
-// is sent first, before any window work; `opened` after the window step, with HOW the worker got a window. Each report has
+// is STARTED before the window step (its post waits only for the subscription, never for a window, so it goes out before any
+// openWindow, navigate or ack outcome; matchAll is started in the same turn); `opened` after the window step, with HOW the worker got a window. Each report has
 // its own budget, so a slow window step cannot starve the click's report. A target is a path and, of the query, only `view`
 // and `item` (nothing else, no fragment, no token, no body).
 const TAP_ITEM = /^[A-Za-z0-9_.:-]{1,64}$/;
@@ -809,7 +810,7 @@ self.addEventListener('notificationclick', (e) => {
   const url = u.href;
   trace('sw-version', { version: SW_VERSION, on: 'notificationclick' });
   trace('click', { url: traceUrl(url), ping: traceScalar(data.ping) });
-  // the server-side record of this tap (see reportTap): `clicked` goes out BEFORE any window work, `opened` once with how
+  // the server-side record of this tap (see reportTap): `clicked` is started before the window step and never waits on it, `opened` once with how
   const tapWork = [], tapPing = typeof data.ping === 'number' ? data.ping : Number(data.ping), tapTo = tapTarget(url);
   reportTap(tapWork, tapPing, 'clicked', { target: tapTo });
   let openedReported = false;
