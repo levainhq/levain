@@ -51,8 +51,11 @@ def test_legacy_row_reads_descends_and_redispositions(install: Path, disp: str) 
     assert bucket_of(row) == (BUCKET_KEEP if disp == "note" else BUCKET_TRAY)
     # re-disposition to seed / agenda works
     for target in ("agenda", "seed"):
-        apply_edit(_scope(install), {"kind": "spore_set_disposition", "spore_id": sid, "disposition": target})
-        assert _spore_store(install).get(sid)["disposition"] == target
+        tsid = _legacy_seed(install, f"old row {target}", disp)
+        apply_edit(_scope(install), {"kind": "spore_set_disposition", "spore_id": tsid, "disposition": target})
+        assert _spore_store(install).get(tsid)["disposition"] == target
+    # an echo of the row's own legacy value is not a new retired row
+    apply_edit(_scope(install), {"kind": "spore_set_disposition", "spore_id": sid, "disposition": disp})
     # a second legacy row descends
     sid2 = _legacy_seed(install, "old row 2", disp)
     res = apply_edit(_scope(install), {"kind": "spore_descend", "spore_id": sid2,
@@ -73,3 +76,43 @@ def test_cockpit_effects_refuse_retired() -> None:
         with pytest.raises(ValueError) as ei:
             _ce_set_disposition({"disposition": d}, pre, origin_key=None, version_of=lambda *a, **k: "v")
         assert msg in str(ei.value)
+
+
+def test_legacy_echo_passes_cockpit_update_and_new_retired_change_refused() -> None:
+    from levain.cockpit.effects import _ce_undo_edit, _ce_update  # noqa: F401
+    from levain.cockpit.effects import _norm_update_field
+
+    pre = {"id": "spore-001", "origin_key": "ok-1", "status": "open", "disposition": "note", "text": "x", "type": "thought"}
+    assert _norm_update_field("disposition", "note", pre) == "note"          # echo of the legacy value
+    with pytest.raises(ValueError):
+        _norm_update_field("disposition", "handoff", pre)                   # a CHANGE into a retired value
+    with pytest.raises(ValueError):
+        _norm_update_field("disposition", "note", {"disposition": "seed"})
+
+
+def test_store_refuses_retired_on_every_writer(tmp_path: Path) -> None:
+    from anneal_memory.spores import ApplyRefused, SporeApply
+
+    from levain.spores import RetiredDisposition, guarded_spore_store
+
+    store = guarded_spore_store(tmp_path / "s.json")
+    for d in ("handoff", "note"):
+        with pytest.raises(RetiredDisposition):
+            store.add(type="thought", text="x", disposition=d)
+    row = store.add(type="thought", text="live", disposition="seed")
+    with pytest.raises(RetiredDisposition):
+        store.update(row["id"], disposition="note")
+    # a legacy row: written through the unguarded base class, as an old install left it
+    from anneal_memory.spores import SporeStore
+    old = SporeStore(tmp_path / "s.json").add(type="thought", text="old", disposition="handoff")
+    store.update(old["id"], disposition="handoff")                             # unchanged: passes
+    # apply(): a planned effect deserialized after an upgrade
+    key = row["origin_key"]
+    eff = SporeApply(op="update", origin_key=key, args={"disposition": "note"}, postcondition={"disposition": "note"})
+    with pytest.raises(ApplyRefused):
+        store.apply(eff)
+    assert store.get(row["id"])["disposition"] == "seed"
+    # crash-after-apply: the create already landed, so the retry reports already, not a refusal
+    add = SporeApply(op="add", origin_key=old["origin_key"], args={"type": "thought", "text": "old", "disposition": "handoff"},
+                     postcondition={"type": "thought", "text": "old", "disposition": "handoff"})
+    assert store.apply(add).outcome == "already"

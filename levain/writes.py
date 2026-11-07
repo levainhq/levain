@@ -94,8 +94,14 @@ from levain.idempotency import StoreCorruptError  # the at-most-once dedup keyst
 from levain.spores import (  # the operator-I/O disposition vocabulary (anneal stays blind)
     LOOP_DISPOSITION,
     NON_COGNITION_DISPOSITIONS,
-    TRAY_DISPOSITIONS,
+    RETIRED_HANDOFF_MSG,
+    RETIRED_KEEP_NOTE_MSG,
+    TRAY_WRITE_DISPOSITIONS,
     VALID_DISPOSITIONS,
+    RetiredDisposition,
+    retired_message,
+    guarded_spore_store,
+    refuse_retired_disposition,
     disposition_of,
     is_loop,
     is_note,
@@ -1792,7 +1798,7 @@ def _apply_spore_verb(
     has NO server gate (any disposition descends — it's how Keep "remove", Tray "dismiss",
     and loop "compost" all work), so its kind/FACE is chosen client-side off the rendered
     snapshot, and the CAS must verify THAT snapshot (an absent key ⇒ no CAS, back-compat)."""
-    from anneal_memory.spores import SporeError, SporeStore  # lazy
+    from anneal_memory.spores import SporeError  # lazy
 
     spore_id = _require_str(req, "spore_id")
     spore_kind: str | None = None
@@ -1818,7 +1824,7 @@ def _apply_spore_verb(
     paths = scope.anneal
     if not paths.spores_json.is_file():
         raise EditError("not_found", 404, "no spore store yet — the entity has no open loops")
-    store = SporeStore(paths.spores_json)
+    store = guarded_spore_store(paths.spores_json)
     ascend_expect: str | None = None  # the raw disposition read for the ascend CAS (below)
     # The descend CAS uses the CLIENT render-time SNAPSHOT (spore-173) — validated + normalized up
     # front (a non-string raises bad_verb_arg BEFORE the store touch). Presence is the gate: an
@@ -1930,7 +1936,7 @@ def _apply_spore_seed(
     it (the lock binds at metabolize, not at drop). A ``note`` still CARRIES a type for
     storage uniformity but it is lifecycle-INERT — a note never ascends (refused) and is
     removed via descend, so its type is never consulted for resolution."""
-    from anneal_memory.spores import SporeError, SporeStore, VALID_TYPES  # lazy
+    from anneal_memory.spores import SporeError, VALID_TYPES  # lazy
 
     text = _require_str(req, "text").strip()
     if not text:
@@ -1946,15 +1952,15 @@ def _apply_spore_seed(
         )
     disposition = req.get("disposition", "seed")
     _refuse_retired_disposition(disposition)
-    if disposition not in TRAY_DISPOSITIONS:
+    if disposition not in TRAY_WRITE_DISPOSITIONS:
         raise EditError(
             "bad_verb_arg", 422,
             f"a captured item's disposition must be a Tray value "
-            f"({list(TRAY_DISPOSITIONS)}; got {disposition!r}) — a seed or an agenda, "
+            f"({list(TRAY_WRITE_DISPOSITIONS)}; got {disposition!r}) — a seed or an agenda, "
             f"never a plain cognition loop (those come from metabolize or the CLI)",
         )
 
-    store = SporeStore(scope.anneal.spores_json)
+    store = guarded_spore_store(scope.anneal.spores_json)
     try:
         # No explicit tier → anneal's default (`warm`). Harmless: an operator-I/O disposition
         # is cognition-EXCLUDED (is_loop=False) regardless of tier, so tier has no
@@ -1978,22 +1984,13 @@ def _apply_spore_seed(
             "action": "seed", "spore_id": spore_id}
 
 
-RETIRED_HANDOFF_MSG = (
-    "handoff is retired: ask the operator with `levain ask` (or `--on <date>` for later), "
-    "or put the work on the board"
-)
-RETIRED_KEEP_NOTE_MSG = (
-    "the Keep is retired: a fact or command goes to memory (Durable Facts), "
-    "an intention is a seed"
-)
-
-
-def _refuse_retired_disposition(disposition: Any) -> None:
-    """TS-1: a NEW handoff or Keep note is refused at the write seam (legacy rows still read)."""
-    if disposition == "handoff":
-        raise EditError("bad_verb_arg", 422, RETIRED_HANDOFF_MSG)
-    if disposition == "note":
-        raise EditError("bad_verb_arg", 422, RETIRED_KEEP_NOTE_MSG)
+def _refuse_retired_disposition(disposition: Any, current: Any = None) -> None:
+    """TS-1: a NEW handoff or Keep note is refused at the write seam (legacy rows still read).
+    A write that leaves a legacy value unchanged (``current`` already holds it) is not a new one."""
+    try:
+        refuse_retired_disposition(disposition, current)
+    except RetiredDisposition as exc:
+        raise EditError("bad_verb_arg", 422, str(exc)) from exc
 
 
 def _apply_spore_set_disposition(
@@ -2022,12 +2019,11 @@ def _apply_spore_set_disposition(
     Everything else — loop→loop, Tray↔Tray, filing INTO Keep, AND promoting a note OUT (a gain
     into cognition / a lateral move into the Tray) — is non-destructive → no confirm. The prior
     disposition is always audited so any move stays reconstructable."""
-    from anneal_memory.spores import SporeError, SporeStore  # lazy
+    from anneal_memory.spores import SporeError  # lazy
 
     spore_id = _require_str(req, "spore_id")
     disposition = req.get("disposition")
-    _refuse_retired_disposition(disposition)
-    if disposition not in VALID_DISPOSITIONS:
+    if disposition not in VALID_DISPOSITIONS and retired_message(disposition) is None:
         raise EditError(
             "bad_verb_arg", 422,
             f"disposition must be one of {list(VALID_DISPOSITIONS)} (got {disposition!r})",
@@ -2067,7 +2063,7 @@ def _apply_spore_set_disposition(
     paths = scope.anneal
     if not paths.spores_json.is_file():
         raise EditError("not_found", 404, "no spore store yet — the entity has no open loops")
-    store = SporeStore(paths.spores_json)
+    store = guarded_spore_store(paths.spores_json)
 
     # Read current state to (a) record the prior disposition in the audit, (b) gate the one
     # silent-loss direction, and (c) seed the optimistic CAS below. `is_loop` (the SAME
@@ -2078,6 +2074,7 @@ def _apply_spore_set_disposition(
     current = store.get(spore_id)
     # raw stored value (None ≡ a key-free loop) — disposition is an unmodeled SporeDict key
     prior_raw = cast("str | None", current.get("disposition")) if current else None
+    _refuse_retired_disposition(disposition, prior_raw)   # TS-1: refuse a CHANGE into a retired value
     snapshot = _client_snapshot(req, current, spore_id)   # a moved row is stale, ahead of the confirm gate
     prior = disposition_of(current) if current else LOOP_DISPOSITION  # normalized, for audit
     # The KEEP-NOTE PROMOTE lifecycle (2026-06-23): a Keep note CAN now be re-routed OUT —
@@ -2177,7 +2174,7 @@ def _apply_spore_surface_at(
     """Schedule WHEN a spore re-surfaces — the operator-input twin of a spore's ``next:``
     alarm: author now, time the surfacing for a future session-open. ``surface_at`` is
     ``YYYY-MM-DD`` (or ``null``/``''`` to clear). Reversible → non-destructive."""
-    from anneal_memory.spores import SporeError, SporeStore  # lazy
+    from anneal_memory.spores import SporeError  # lazy
 
     spore_id = _require_str(req, "spore_id")
     # A MISSING key must NOT silently clear the alarm — that's almost always a client bug
@@ -2190,7 +2187,7 @@ def _apply_spore_surface_at(
     paths = scope.anneal
     if not paths.spores_json.is_file():
         raise EditError("not_found", 404, "no spore store yet — the entity has no open loops")
-    store = SporeStore(paths.spores_json)
+    store = guarded_spore_store(paths.spores_json)
     try:
         store.update(spore_id, next=surface_at or None, **_guard_kwargs(guard))  # anneal re-validates the date
     except ValueError as exc:
@@ -2225,7 +2222,6 @@ def _apply_spore_update(
         VALID_TIERS,
         VALID_TYPES,
         SporeError,
-        SporeStore,
     )
 
     spore_id = _require_str(req, "spore_id")
@@ -2259,7 +2255,7 @@ def _apply_spore_update(
     paths = scope.anneal
     if not paths.spores_json.is_file():
         raise EditError("not_found", 404, "no spore store yet — the entity has no open loops")
-    store = SporeStore(paths.spores_json)
+    store = guarded_spore_store(paths.spores_json)
     current = store.get(spore_id)
     prior_raw = cast("str | None", current.get("disposition")) if current else None
     tier_snapshot = _client_snapshot(req, current, spore_id) if has_tier else _NO_CAS

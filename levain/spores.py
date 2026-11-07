@@ -46,6 +46,13 @@ from typing import Any
 __all__ = [
     "LOOP_DISPOSITION",
     "TRAY_DISPOSITIONS",
+    "TRAY_WRITE_DISPOSITIONS",
+    "RETIRED_HANDOFF_MSG",
+    "RETIRED_KEEP_NOTE_MSG",
+    "RetiredDisposition",
+    "retired_message",
+    "refuse_retired_disposition",
+    "guarded_spore_store",
     "KEEP_DISPOSITIONS",
     "RETIRED_DISPOSITIONS",
     "NON_COGNITION_DISPOSITIONS",
@@ -62,7 +69,8 @@ __all__ = [
 ]
 
 LOOP_DISPOSITION = "loop"
-TRAY_DISPOSITIONS = ("seed", "agenda")              # operator INBOX — forms, then resolves
+TRAY_DISPOSITIONS = ("seed", "handoff", "agenda")   # operator INBOX — the READ set (a legacy handoff still reads)
+TRAY_WRITE_DISPOSITIONS = ("seed", "agenda")        # the Tray values a NEW write may take
 # RETIRED (TS-1): legacy rows still carry these. They stay in the READ sets (a legacy handoff
 # or Keep note still renders, descends, and re-dispositions to seed/agenda) but are OUT of the
 # WRITE set (VALID_DISPOSITIONS): a new handoff or Keep note is refused at the write seam.
@@ -73,7 +81,79 @@ KEEP_DISPOSITIONS = ("note",)                        # legacy operator REFERENCE
 # flood every legacy note and handoff into the agent's collision surface. The order is the
 # hook copies' tuple order (drift contract: byte-equal to ``_NON_COGNITION_DISPOSITIONS``).
 NON_COGNITION_DISPOSITIONS = ("seed", "handoff", "agenda", "note")
-VALID_DISPOSITIONS = (LOOP_DISPOSITION,) + TRAY_DISPOSITIONS   # the WRITE set
+VALID_DISPOSITIONS = (LOOP_DISPOSITION,) + TRAY_WRITE_DISPOSITIONS   # the WRITE set
+
+RETIRED_HANDOFF_MSG = (
+    "handoff is retired: ask the operator with `levain ask` (or `--on <date>` for later), "
+    "or put the work on the board"
+)
+RETIRED_KEEP_NOTE_MSG = (
+    "the Keep is retired: a fact or command goes to memory (Durable Facts), "
+    "an intention is a seed"
+)
+
+
+class RetiredDisposition(ValueError):
+    """A write tried to CREATE a retired disposition (handoff / Keep note)."""
+
+
+def retired_message(value: Any) -> str | None:
+    """The refusal text for a retired disposition value, else None."""
+    if value == "handoff":
+        return RETIRED_HANDOFF_MSG
+    if value == "note":
+        return RETIRED_KEEP_NOTE_MSG
+    return None
+
+
+def refuse_retired_disposition(value: Any, current: Any = None) -> None:
+    """TS-1, the ONE refusal every writer shares. A retired value is refused unless it is NOT a
+    change (``current`` already holds it: an echo, an undo of a permitted re-disposition, or a
+    crash-after-apply retry whose write already landed)."""
+    msg = retired_message(value)
+    if msg is not None and value != current:
+        raise RetiredDisposition(msg)
+
+
+_GUARDED: Any = None
+
+
+def guarded_spore_store(path: Any) -> Any:
+    """An anneal ``SporeStore`` that refuses to CREATE a retired disposition through ``add``,
+    ``update`` or ``apply`` (a planned cockpit effect that deserialized after an upgrade included),
+    so no writer (``apply_edit``, the cockpit effects, a CLI, a migration) can route around the
+    retirement. Legacy rows still read; a write that leaves a retired value unchanged passes."""
+    global _GUARDED
+    if _GUARDED is None:
+        from anneal_memory.spores import ApplyRefused, SporeStore
+
+        class GuardedSporeStore(SporeStore):  # type: ignore[misc]
+            def add(self, *a: Any, **kw: Any) -> Any:
+                refuse_retired_disposition(kw.get("disposition"))
+                return super().add(*a, **kw)
+
+            def update(self, spore_id: str, *a: Any, **kw: Any) -> Any:
+                d = kw.get("disposition")
+                if retired_message(d) is not None:
+                    cur = self.get(spore_id)
+                    refuse_retired_disposition(d, (cur or {}).get("disposition"))
+                return super().update(spore_id, *a, **kw)
+
+            def apply(self, effect: Any) -> Any:
+                d = dict(getattr(effect, "args", None) or {}).get("disposition")
+                if getattr(effect, "op", None) in ("add", "update") and retired_message(d) is not None:
+                    cur = self.get_by_origin_key(effect.origin_key)
+                    try:
+                        if effect.op == "add" and cur is not None:
+                            return super().apply(effect)   # the create already landed: anneal reports ALREADY
+                        refuse_retired_disposition(d, (cur or {}).get("disposition"))
+                    except RetiredDisposition as exc:
+                        raise ApplyRefused(str(exc)) from exc
+                return super().apply(effect)
+
+        _GUARDED = GuardedSporeStore
+    return _GUARDED(path)
+
 
 # The tier value that means *deliberate dormancy* (anneal's own ``Tier`` literal — see
 # ``anneal_memory.spores.VALID_TIERS``). A parked LOOP is Keep — pinned-dormant, exempt
@@ -115,7 +195,7 @@ def is_tray(item: Mapping[str, Any]) -> bool:
     """The operator session-I/O INBOX set (seed/agenda, plus a legacy handoff row) — EXPLICIT membership,
     NOT ``not is_loop``: a ``note`` is also non-cognition but it is Keep reference, not
     the Tray, so the three classes (loop / tray / keep) are distinct."""
-    return disposition_of(item) in TRAY_DISPOSITIONS or disposition_of(item) == "handoff"
+    return disposition_of(item) in TRAY_DISPOSITIONS
 
 
 def is_note(item: Mapping[str, Any]) -> bool:

@@ -436,14 +436,15 @@ class SporeEffectStore:
 
     def __init__(self, path: str | os.PathLike[str],
                  version_of: Callable[[Mapping[str, Any]], str] | None = None) -> None:
-        from anneal_memory.spores import SporeStore
         from levain.cockpit.providers import SPORE_VERSION_FIELDS, spore_row_version
 
         self.path = Path(path)
         self.version_fields = tuple(SPORE_VERSION_FIELDS)
         # resolved here, before any store lock: the callback anneal runs under its lock imports nothing
         self.version_of = version_of or spore_row_version
-        self._store = SporeStore(self.path)
+        from levain.spores import guarded_spore_store
+
+        self._store = guarded_spore_store(self.path)
 
     # -- reads --
 
@@ -540,21 +541,16 @@ def _norm(value: Any) -> str:
     return normalize_spore_field(value)
 
 
-def _refuse_retired_cockpit(value: Any) -> None:
-    """TS-1: a NEW handoff or Keep note is refused (legacy rows still read)."""
-    from levain.writes import RETIRED_HANDOFF_MSG, RETIRED_KEEP_NOTE_MSG
+def _norm_disposition(value: Any, current: Any = None) -> str | None:
+    """``current``: the stored disposition. A retired value is refused only as a CHANGE: an echo of a
+    legacy row's own value, or the undo of a permitted re-disposition, leaves it as it was."""
+    from levain.spores import LOOP_DISPOSITION, VALID_DISPOSITIONS, RetiredDisposition, refuse_retired_disposition
 
-    if value == "handoff":
-        raise ValueError(RETIRED_HANDOFF_MSG)
-    if value == "note":
-        raise ValueError(RETIRED_KEEP_NOTE_MSG)
-
-
-def _norm_disposition(value: Any) -> str | None:
-    from levain.spores import LOOP_DISPOSITION, VALID_DISPOSITIONS
-
-    _refuse_retired_cockpit(value)
-    if value not in VALID_DISPOSITIONS:
+    try:
+        refuse_retired_disposition(value, current)
+    except RetiredDisposition as exc:
+        raise ValueError(str(exc)) from exc
+    if value not in VALID_DISPOSITIONS and value != current:
         raise ValueError(f"disposition must be one of {list(VALID_DISPOSITIONS)} (got {value!r})")
     return None if value == LOOP_DISPOSITION else _norm(value)
 
@@ -571,7 +567,7 @@ def _norm_date(value: Any) -> str | None:
     return value
 
 
-def _norm_update_field(f: str, value: Any) -> Any:
+def _norm_update_field(f: str, value: Any, pre: Mapping[str, Any] | None = None) -> Any:
     from anneal_memory.spores import VALID_TIERS, VALID_TYPES
 
     if f == "text":
@@ -586,7 +582,7 @@ def _norm_update_field(f: str, value: Any) -> Any:
     if f == "disposition":
         if value is None:
             return None
-        return _norm_disposition(value)
+        return _norm_disposition(value, (pre or {}).get("disposition"))
     if f == "type":
         if value not in VALID_TYPES:
             raise ValueError(f"type must be one of {list(VALID_TYPES)} (got {value!r})")
@@ -629,7 +625,7 @@ def _existing_effect(pre: Mapping[str, Any], changes: dict[str, Any], version_of
 def _ce_seed(params: Mapping[str, Any], pre: Mapping[str, Any] | None, *, origin_key: str | None,
              version_of: Callable[..., str]) -> Effect:
     from anneal_memory.spores import VALID_TYPES
-    from levain.spores import TRAY_DISPOSITIONS
+    from levain.spores import TRAY_WRITE_DISPOSITIONS
 
     if pre is not None:
         raise ValueError("a create's origin_key is already in use")
@@ -639,9 +635,14 @@ def _ce_seed(params: Mapping[str, Any], pre: Mapping[str, Any] | None, *, origin
     if stype not in VALID_TYPES:
         raise ValueError(f"type must be one of {list(VALID_TYPES)} (got {stype!r})")
     disposition = params.get("disposition", "seed")
-    _refuse_retired_cockpit(disposition)
-    if disposition not in TRAY_DISPOSITIONS:
-        raise ValueError(f"a captured item's disposition must be one of {list(TRAY_DISPOSITIONS)}")
+    from levain.spores import RetiredDisposition, refuse_retired_disposition
+
+    try:
+        refuse_retired_disposition(disposition)
+    except RetiredDisposition as exc:
+        raise ValueError(str(exc)) from exc
+    if disposition not in TRAY_WRITE_DISPOSITIONS:
+        raise ValueError(f"a captured item's disposition must be one of {list(TRAY_WRITE_DISPOSITIONS)}")
     changes: dict[str, Any] = {"type": stype, "text": _norm_update_field("text", params.get("text")),
                                "disposition": _norm(disposition)}
     if params.get("domain"):
@@ -668,14 +669,14 @@ def _ce_update(params: Mapping[str, Any], pre: Mapping[str, Any] | None, *, orig
         # only while an item is forming in the Tray
         if not is_tray(pre):
             raise ValueError("type is only reclassifiable while an item is forming in the Tray")
-    return _existing_effect(pre, {f: _norm_update_field(f, params[f]) for f in params}, version_of)
+    return _existing_effect(pre, {f: _norm_update_field(f, params[f], pre) for f in params}, version_of)
 
 
 def _ce_set_disposition(params: Mapping[str, Any], pre: Mapping[str, Any] | None, *,
                         origin_key: str | None, version_of: Callable[..., str]) -> Effect:
     pre = _require_open(pre)
     disposition = params.get("disposition")
-    changes: dict[str, Any] = {"disposition": _norm_disposition(disposition)}
+    changes: dict[str, Any] = {"disposition": _norm_disposition(disposition, pre.get("disposition"))}
     surface_at = _norm_date(params.get("surface_at")) if "surface_at" in params else None
     # a move into the Keep is refused above (``_norm_disposition``): the Keep is retired
     if "surface_at" in params:
@@ -724,7 +725,7 @@ def _ce_undo_edit(params: Mapping[str, Any], pre: Mapping[str, Any] | None, *, o
     restore = params.get("restore")
     if not isinstance(restore, Mapping) or not restore:
         raise ValueError("an undo restores at least one field")
-    return _existing_effect(pre, {f: _norm_update_field(f, v) for f, v in restore.items()}, version_of)
+    return _existing_effect(pre, {f: _norm_update_field(f, v, pre) for f, v in restore.items()}, version_of)
 
 
 def _ce_undo_seed(params: Mapping[str, Any], pre: Mapping[str, Any] | None, *, origin_key: str | None,
