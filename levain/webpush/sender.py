@@ -90,7 +90,7 @@ def supports_declarative(endpoint: str) -> bool:
     return host == "push.apple.com" or host.endswith(".push.apple.com")
 
 
-def declarative_payload(data: bytes) -> bytes:
+def declarative_payload(data: bytes, origin: "str | None" = None) -> bytes:
     """``data`` (the legacy payload :func:`build_payload` made) with the Declarative Web Push members added, or ``data``
     unchanged when they cannot be added correctly. WebKit parses ``navigate`` as an ABSOLUTE url and DROPS a declarative
     message whose ``navigate`` is relative (the push service still answers 201, so a wrong one is a silent loss); this
@@ -100,12 +100,16 @@ def declarative_payload(data: bytes) -> bytes:
     ``app_badge`` when the legacy payload has ``badge``. Not added: ``mutable`` (a mutable push reaches the worker with
     ``event.data`` null, which the worker's reader would show as an empty notification) and NO ``actions``, ever. The
     legacy members stay at the top level for a client that does not read declarative payloads. The body is never clipped
-    to make room: if the doubled payload does not fit :data:`ece.MAX_PLAINTEXT`, the legacy bytes go out whole."""
+    to make room: if the doubled payload does not fit :data:`ece.MAX_PLAINTEXT`, the legacy bytes go out whole.
+    ``origin`` (the cockpit's stored https origin, :mod:`levain.consent.cockpit_origin`) is prefixed to a payload ``url`` that
+    is a path on this server (``/...``), for ``navigate`` only: the legacy ``url`` stays as it was."""
     try:
         legacy = json.loads(data.decode("utf-8"))
         if legacy.get("devtest") is True:   # the device test is shown by the worker WITH action buttons; a declarative push has none
             return data
         url = legacy["url"]
+        if isinstance(url, str) and origin and url.startswith("/") and not url.startswith("//"):
+            url = origin + url
         if not (isinstance(url, str) and url.startswith("https://") and urlsplit(url).hostname):
             return data
         notif = {"title": legacy["title"], "body": legacy["body"], "navigate": url, "tag": legacy.get("tag") or "levain"}
@@ -137,7 +141,8 @@ _OPENER = urllib.request.build_opener(_NoRedirect)
 _TRANSIENT = object()   # _prepare: no request this time, and nothing wrong with the subscription
 
 
-def _prepare(queue_dir: Path, sub: dict, data: bytes, topic: str | None) -> "urllib.request.Request | object | None":
+def _prepare(queue_dir: Path, sub: dict, data: bytes, topic: str | None,
+             declarative_origin: "str | None" = None) -> "urllib.request.Request | object | None":
     """The request for one subscription, or None when its endpoint is not a known push service or its keys fail.
     Runs in the sending thread (it touches the store for the VAPID token); the pool only does the network."""
     from levain.webpush.routes import valid_endpoint
@@ -145,8 +150,8 @@ def _prepare(queue_dir: Path, sub: dict, data: bytes, topic: str | None) -> "url
     endpoint = valid_endpoint(sub["endpoint"])
     if endpoint is None:
         return None
-    if supports_declarative(endpoint):
-        data = declarative_payload(data)
+    if declarative_origin is not None and supports_declarative(endpoint):   # OFF unless the device is switched on (levain.webpush.declarative)
+        data = declarative_payload(data, declarative_origin)
     try:
         body = ece.encrypt(data, ece.b64d(sub["p256dh"]), ece.b64d(sub["auth"]))
     except Exception:   # noqa: BLE001 - bad keys: recorded as status 0, never raised at the gate
@@ -216,14 +221,20 @@ def deliver(qdir: Path, store: PushStore, ping_id: int, *, kind: str, ref: str |
 
     subs = store.live_subscriptions(device=device)
     # the push opens the notification center on its own item (the item's id is the push's ``n``)
-    data = build_payload(title, body, ref or kind, center.push_url(store, ping_id, kind, url), ping_id,
+    data = build_payload(title, body, ref or kind, center.push_url(store, ping_id, kind, url, ref=ref), ping_id,
                          needs.badge_value(qdir))
     if extra:
         merged = _dumps({**json.loads(data.decode("utf-8")), **extra})
         if len(merged) <= ece.MAX_PLAINTEXT:
             data = merged
     topic = topic_for(ref)
-    reqs = [(sub, _prepare(qdir, sub, data, topic)) for sub in subs]
+    from levain.consent import cockpit_origin
+    from levain.webpush import declarative
+
+    origin = cockpit_origin.read_origin(qdir)    # None (no stored origin) keeps every device on the legacy payload
+    on = declarative.enabled_devices(qdir) if origin else frozenset()
+    reqs = [(sub, _prepare(qdir, sub, data, topic, origin) if sub.get("device_id") in on
+             else _prepare(qdir, sub, data, topic)) for sub in subs]
     statuses: dict[int, int] = {}
 
     def work(sid: int, req: urllib.request.Request) -> None:

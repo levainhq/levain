@@ -129,8 +129,10 @@ def test_the_sender_builds_its_payload_from_push_url_not_from_the_callers_link(t
     monkeypatch.setattr(sender, "build_payload", spy)
     sender.deliver(tmp_path / "q", s, pid, kind=kind, ref="np-5bf5c022", title="levain",
                    body="body", url=SIGN_URL)
-    assert seen == [center.push_url(s, pid, kind, SIGN_URL)]
-    if kind == "summary":
+    assert seen == [center.push_url(s, pid, kind, SIGN_URL, ref="np-5bf5c022")]
+    if kind == "attention":
+        assert seen == ["/?view=needs&item=np-5bf5c022"]      # a band row's ping opens its Needs card (Phill 11-07, np-029b717e (a))
+    elif kind == "summary":
         assert seen == [SIGN_URL]
     elif kind in NOTICE_KINDS:
         assert seen == [SIGN_URL]          # no notice row was recorded for this ping: it keeps the link it was given

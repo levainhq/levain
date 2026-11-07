@@ -6,7 +6,7 @@
 // whichever opens first creates the store; correctness depends on no timing (an unread key waits for the next trigger).
 const DB = 'levain-sw-2', STORE = 'opened';
 // A short id of this worker's code, recorded in the trace so a device's trace says which worker ran.
-const SW_VERSION = '1106-54-bundle5-2';
+const SW_VERSION = '1107-56-decl-1';
 // The TRACE: an append-only ring in its own cache, one entry per step, key TRACE_PREFIX + <time ms, zero padded> + '-' +
 // <seq>, value JSON {t, src, step, ...detail}. The /tap_trace page and sw_open.js read and write the same ring. Writes are
 // best effort, serialized on one chain, never awaited by the tap, and carry only urls without fragments, counts and step
@@ -622,6 +622,24 @@ self.addEventListener('push', (e) => {
   let d = {};
   try { d = e.data ? e.data.json() : {}; } catch (_) { d = { body: e.data ? e.data.text() : '' }; }
   if (d && d.devtest === true) { e.waitUntil(devtestShow()); return; }   // devtest: the server-sent test push, shown with action buttons
+  // Declarative Web Push (np-029b717e (a), per device, levain.webpush.declarative): the OS shows the notification and a tap
+  // navigates by its own `navigate` url with NO worker code. A showNotification here would REPLACE it (WebKit: "if the
+  // event handler displays a replacement notification properly, the proposed notification is ignored") and put the tap back
+  // on notificationclick, which the iPhone never ran. So the worker stands down: no notification, no launch fallback entry,
+  // only the `received` receipt and the badge. (WebKit runs this handler for a declarative push only when `mutable`; the
+  // blog and the spec differ, so the stand-down holds either way.)
+  if (d && d.web_push === 8030 && d.notification && typeof d.notification === 'object') {
+    trace('sw-version', { version: SW_VERSION, on: 'push-declarative' });
+    trace('push-declarative', { tag: traceScalar(d.tag || 'levain'), ping: traceScalar(d.ping) });
+    const dping = typeof d.ping === 'number' ? d.ping : Number(d.ping);
+    const db = receiptBudget(t0);
+    const dreceipts = boundedReceipts(db, async () => {
+      const r = await sendReceipt(dping, 'received', t0, db, endpointHash(db));
+      if (r === true) await drainReceipts(db);
+    });
+    e.waitUntil(Promise.allSettled([applyBadge(d.badge), dreceipts]).finally(traceSettled));
+    return;
+  }
   const title = d.title || 'Levain';
   // a fixed tag with renotify: a re-ping for the same item replaces the earlier notification and alerts again. The
   // notification is asked for FIRST, before any trace or receipt, and never waits on either; it does not race the
