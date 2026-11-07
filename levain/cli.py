@@ -3602,8 +3602,9 @@ def _add_seat_parser(subparsers: argparse._SubParsersAction, common: object) -> 
             "A terminal Claude Code seat works in one lane clone plus its RETURN directory, minted per launch under a "
             "seat-root lease: a link in the cockpit's signed authority log, 14 days, revocable from the cockpit's "
             "Grants tab. A launch with no live lease refuses and never falls back to a prompt. `launch` mints the "
-            "lane's roots, starts claude in them in its own process group and records the pid in the signed mint "
-            "log; `stop` stops that group; `launch --dry-run` only validates and prints the argv and digest."))
+            "lane's roots, starts claude headless (`--prompt` required) in them in its own process group and records "
+            "the pid in the signed mint log; `stop` stops that group; `launch --dry-run` only validates and prints the "
+            "argv, minting nothing."))
     sub = seat_p.add_subparsers(dest="seat_cmd", required=True)
     lease = sub.add_parser("lease", help="Sign, renew, revoke and list the seat-root lease.")
     lsub = lease.add_subparsers(dest="seat_lease_cmd", required=True)
@@ -3655,17 +3656,21 @@ def _add_seat_parser(subparsers: argparse._SubParsersAction, common: object) -> 
                         help="Comma-separated --tools set (default: the full seat set); a subset a failed canary named, "
                              "checked as the canary checks it.")
     launch.add_argument("--model", default=None, help="The seat's --model.")
-    launch.add_argument("--prompt", default=None, help="The seat's first prompt (one argument).")
-    launch.add_argument("--headless", action="store_true", help="Run claude -p (stream-json) instead of interactive.")
+    launch.add_argument("--prompt", default=None,
+                        help="The seat's prompt (one argument; required for a launch, optional with --dry-run). The seat "
+                             "runs headless (claude -p, stream-json to the log): it has no terminal.")
+    launch.add_argument("--headless", action="store_true",
+                        help="Accepted for compatibility, no effect: every launch is headless.")
     launch.add_argument("--seat-home", dest="seat_home", type=Path, default=None,
                         help="The HOME the seat runs with (default: this process's HOME). Its .claude.json receives the "
                              "workspace trust for the minted clone.")
     launch.add_argument("--dry-run", dest="dry_run", action="store_true",
-                        help="Only validate: print the argv and digest, start nothing.")
+                        help="Only validate: print the argv, mint and start nothing.")
     common(launch)
     stop = sub.add_parser("stop", help="Stop a launched lane's seat: its process group only, verified against the mint log.")
     stop.add_argument("lane_key")
-    stop.add_argument("--grace", type=float, default=10.0, help="Seconds between SIGTERM and SIGKILL (default 10).")
+    stop.add_argument("--grace", type=_grace_seconds, default=10.0,
+                      help="Seconds between SIGTERM and SIGKILL, 0 to 600 (default 10).")
     common(stop)
     # no prefix chars: every token after `canary` (its own --claude-bin, -h ...) passes through to seat_canary.main;
     # with the default ones argparse lifts a leading --flag out of REMAINDER and refuses it (L3 z1 r1, gemini 4)
@@ -3673,6 +3678,21 @@ def _add_seat_parser(subparsers: argparse._SubParsersAction, common: object) -> 
                             add_help=False, prefix_chars="\0")
     canary.add_argument("canary_args", nargs=argparse.REMAINDER)
     seat_p.set_defaults(func=_cmd_seat)
+
+
+def _grace_seconds(text: str) -> float:
+    """``levain seat stop --grace``: a finite number of seconds from 0 to 600 (``inf`` never escalated to SIGKILL,
+    ``nan`` / a negative skipped the grace; L3 lf r1, codex 7)."""
+    from levain.seat_lease import SeatLaunchRefused, check_grace
+    try:
+        return check_grace(text)
+    except SeatLaunchRefused as exc:
+        raise argparse.ArgumentTypeError(str(exc)) from None
+
+
+#: ``levain seat egress revoke``'s exit code when the revoke row IS signed but a seat holding the grant could not be
+#: stopped (1 stays "not revoked"; 2 is argparse's usage error).
+EXIT_REVOKED_NOT_STOPPED = 3
 
 
 def _cmd_seat(args: argparse.Namespace) -> int:
@@ -3692,7 +3712,10 @@ def _cmd_seat(args: argparse.Namespace) -> int:
         if args.seat_cmd == "launch":
             return _cmd_seat_launch(args, root)
         if args.seat_cmd == "stop":
-            res = seat_lease.stop_seat(seat_lease.key_dir_for(args.path, ()), args.lane_key, grace=args.grace)
+            try:
+                res = seat_lease.stop_seat(seat_lease.key_dir_for(args.path, ()), args.lane_key, grace=args.grace)
+            except OSError as exc:
+                raise seat_lease.SeatLaunchRefused(f"{type(exc).__name__}: {exc}") from None
             print(res)
             return 0
         if args.seat_lease_cmd == "list":
@@ -3746,13 +3769,18 @@ def _cmd_seat_launch(args: argparse.Namespace, root: Path) -> int:
     python = args.python or sys.executable
     if args.dry_run:
         return seat_lease.validate_launch(args.lane_key, args.remote, args.base, claude_bin=claude, python=python,
-                                          cockpit_root=root, install=args.path, **kw)
+                                          cockpit_root=root, install=args.path, prompt=args.prompt, model=args.model,
+                                          **kw)
     try:
+        seat_lease.check_prompt(args.prompt)          # before anything is minted (L3 lf r1, gemini HIGH 2)
         plan = seat_lease.prepare_launch(args.lane_key, args.remote, args.base, claude_bin=claude, python=python,
                                          cockpit_root=root, install=args.path, **kw)
-        started = seat_lease.launch_seat(plan, prompt=args.prompt, model=args.model, headless=args.headless)
+        started = seat_lease.launch_seat(plan, prompt=args.prompt, model=args.model)
     except (seat_lease.SeatLaunchRefused, SeatRefusal) as exc:
         print(f"seat launch refused: {exc}", file=sys.stderr)
+        return 1
+    except OSError as exc:      # disk full, a permission, a process gone mid-launch: launch_seat already cleaned up
+        print(f"seat launch refused: {type(exc).__name__}: {exc}", file=sys.stderr)
         return 1
     print(f"seat launched: lane {started['lane']}")
     for key in ("pid", "pgid", "clone", "return_dir", "log"):
@@ -3791,12 +3819,22 @@ def _cmd_seat_egress(args: argparse.Namespace, root: Path) -> int:
         if warning:
             print(f"warning: {warning}", file=sys.stderr)
         # the grant's allowedDomains are frozen in each launch's settings: the revoke cuts the push, so stop the seats
-        # that hold it (a seat launched under no grant, or another, is untouched)
-        failed = False
-        for res in seat_lease.stop_seats_for_grant(seat_lease.key_dir_for(args.path, ()), args.grant_id):
+        # that hold it (a seat launched under no grant, or another, is untouched). From here on the revoke HAS landed:
+        # a failure is "revoked, but could not stop", exit 3, never the "not revoked" exit 1 (L3 lf r1, deepseek)
+        try:
+            results = seat_lease.stop_seats_for_grant(seat_lease.key_dir_for(args.path, ()), args.grant_id)
+        except Exception as exc:  # noqa: BLE001
+            print(f"revoked, but could not stop the seats holding {args.grant_id}: the sweep failed "
+                  f"({type(exc).__name__}: {str(exc)[:200]})", file=sys.stderr)
+            return EXIT_REVOKED_NOT_STOPPED
+        failed = []
+        for res in results:
             print(f"  {res}", file=sys.stderr if res.status == "refused" else sys.stdout)
-            failed = failed or res.status == "refused"
-        return 1 if failed else 0
+            if res.status == "refused":
+                failed.append(res.lane)
+        if failed:
+            print(f"revoked, but could not stop: {', '.join(failed)}", file=sys.stderr)
+            return EXIT_REVOKED_NOT_STOPPED
     return 0
 
 

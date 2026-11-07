@@ -87,7 +87,7 @@ class Seats:
                                  now=self.rig.world.clock.now + timedelta(minutes=1), environ=self.environ(home), **kw)
 
     def go(self, lane="lane-a", **kw):
-        launch_kw = {k: kw.pop(k) for k in ("prompt", "model", "headless") if k in kw}
+        launch_kw = {"prompt": "work", **{k: kw.pop(k) for k in ("prompt", "model") if k in kw}}
         plan = self.plan(lane, **kw)
         info = sl.launch_seat(plan, **launch_kw)
         self.started.append(info)
@@ -132,7 +132,8 @@ def test_a_launch_runs_claude_in_the_clone_in_its_own_group_and_the_row_records_
     assert row["claude"] == plan.mint["claude"] and row["egress_grant"] is None
     assert seats.recorded("cwd").strip() == str(plan.profile.clone)
     argv = seats.recorded("argv").splitlines()
-    assert argv == [*plan.profile.argv(model="sonnet")[1:], "do the thing"]
+    assert argv == [*plan.profile.argv(headless=True, model="sonnet")[1:], "do the thing"]
+    assert argv[0] == "-p", "a launch is headless: the seat has no terminal"
     assert dict(l.split("=", 1) for l in seats.recorded("env").splitlines() if "=" in l)["HOME"] == str(seats.home)
     assert int(seats.recorded("pid")) == info["pid"], "exec kept the recorded pid"
     assert Path(info["log"]) == plan.profile.return_dir / "seat-launch.log" and Path(info["log"]).stat().st_mode & 0o777 == 0o600
@@ -270,7 +271,7 @@ def test_revoke_stops_only_the_seat_holding_that_grant(seats, rig, eg):
     plan = sl.prepare_launch("lane-b", str(rig.src), rig.sha, claude_bin=seats.claude, python=sys.executable,
                              cockpit_root=rig.world.root, install=rig.tmp, managed=(),
                              now=rig.world.clock.now + timedelta(minutes=5), environ=seats.environ())
-    held = sl.launch_seat(plan)
+    held = sl.launch_seat(plan, prompt="work")
     seats.started.append(held)
     assert plan.egress_grant == grant["id"]
     assert [r["egress_grant"] for r in _rows(rig) if r.get("ev") == "start"] == [None, grant["id"]]
@@ -289,7 +290,7 @@ def test_the_egress_revoke_command_stops_the_seats_after_the_revoke_row(seats, r
     plan = sl.prepare_launch("lane-c", str(rig.src), rig.sha, claude_bin=seats.claude, python=sys.executable,
                              cockpit_root=rig.world.root, install=rig.tmp, managed=(),
                              now=rig.world.clock.now + timedelta(minutes=5), environ=seats.environ())
-    held = sl.launch_seat(plan)
+    held = sl.launch_seat(plan, prompt="work")
     seats.started.append(held)
     seats.recorded("child")
     order = []
@@ -327,7 +328,7 @@ def test_the_trust_is_seeded_in_the_seat_home_only_and_the_operators_file_is_unt
     assert data["projects"][str(plan.profile.clone)] == {"hasTrustDialogAccepted": True}
     assert data["userID"] == "seat" and data["projects"]["/old"] == {"k": 1}, "the rest of the file is kept"
     assert data["hasCompletedOnboarding"] is True and seat_file.stat().st_mode & 0o777 == 0o600
-    assert sorted(p.name for p in seats.home.iterdir()) == [".claude.json"], "no temp file is left behind"
+    assert sorted(p.name for p in seats.home.iterdir()) == [".claude.json", ".claude.json.levain-lock"], "no temp file is left behind"
 
 
 def test_seed_trust_into_a_fresh_home_writes_the_first_run_state_and_refuses_a_file_it_cannot_read(tmp_path):
@@ -365,7 +366,7 @@ def test_a_narrowed_tool_set_reaches_the_seats_argv_and_an_unadmitted_tool_refus
 def test_the_cli_validates_tools_as_the_canary_does(seats, rig, capsys):
     from levain import cli
     ns = argparse.Namespace(lane_key="lane-v", remote=str(rig.src), base=rig.sha, claude=seats.claude, python=sys.executable,
-                            tools="Bash,Edit", model=None, prompt=None, headless=False, seat_home=None, dry_run=False,
+                            tools="Bash,Edit", model=None, prompt="work", headless=False, seat_home=None, dry_run=False,
                             path=rig.tmp)
     assert cli._cmd_seat_launch(ns, rig.world.root) == 1       # Edit alone is half a probe's admission
     assert "seat launch refused" in capsys.readouterr().err and not (rig.lanes / "lane-v").exists()
@@ -375,7 +376,7 @@ def test_cli_launch_and_stop_print_the_lines_flow_parses(seats, rig, capsys, mon
     from levain import cli
     monkeypatch.setattr(sl, "_proc_start_ns", sl._proc_start_ns)
     ns = argparse.Namespace(lane_key="lane-w", remote=str(rig.src), base=rig.sha, claude=seats.claude, python=sys.executable,
-                            tools=None, model=None, prompt=None, headless=False, seat_home=seats.home, dry_run=False,
+                            tools=None, model=None, prompt="work", headless=False, seat_home=seats.home, dry_run=False,
                             path=rig.tmp)
     # the rig's lease clock is the world's: run prepare/launch through the CLI with the rig's `now`
     real = sl.prepare_launch
@@ -405,3 +406,293 @@ def test_profile_digest_differs_between_two_launches_of_one_shape_and_a_path_nor
         blob = json.dumps([p.argv(), p.argv(headless=True), sorted(p.env.items())], sort_keys=True)
         return blob.replace(str(p.clone), "<CLONE>").replace(str(p.return_dir), "<RETURN>")
     assert shape(a) == shape(b)
+
+
+# --- L3 lf r1 fixes ---------------------------------------------------------------------------------------------
+
+def _ns(rig, seats, lane, **kw):
+    base = dict(lane_key=lane, remote=str(rig.src), base=rig.sha, claude=seats.claude, python=sys.executable, tools=None,
+                model=None, prompt="work", headless=False, seat_home=seats.home, dry_run=False, path=rig.tmp)
+    return argparse.Namespace(**{**base, **kw})
+
+
+def _rig_clock(rig, monkeypatch):
+    real = sl.prepare_launch
+    monkeypatch.setattr(sl, "prepare_launch", lambda *a, **k: real(*a, now=rig.world.clock.now + timedelta(minutes=1), managed=(), **k))
+
+
+def test_fix1_a_cli_launch_with_no_prompt_refuses_naming_it_and_mints_nothing(seats, rig, capsys, monkeypatch):
+    from levain import cli
+    _rig_clock(rig, monkeypatch)
+    assert cli._cmd_seat_launch(_ns(rig, seats, "lane-np", prompt=None), rig.world.root) == 1
+    assert "--prompt" in capsys.readouterr().err
+    assert _rows(rig) == [] and not (rig.lanes / "lane-np").exists() and not seats.rec.exists()
+    # --headless is an accepted no-op: the launch is headless either way
+    assert cli._cmd_seat_launch(_ns(rig, seats, "lane-hl", headless=True), rig.world.root) == 0
+    seats.started.append({"pgid": int(seats.recorded("pid"))})
+    assert seats.recorded("argv").splitlines()[0] == "-p"
+
+
+def test_fix1_launch_seat_itself_refuses_a_missing_prompt_and_removes_the_roots(seats, rig):
+    plan = seats.plan("lane-np2")
+    with pytest.raises(sl.SeatLaunchRefused, match="--prompt"):
+        sl.launch_seat(plan, prompt="  ")
+    assert not (rig.lanes / "lane-np2").exists() and not seats.rec.exists()
+
+
+def _revoke_egress(rig, gid):
+    fp, sign = rig.world.keys["laptop"]
+    rig.world.clock.now += timedelta(minutes=1)
+    sp.revoke_egress(rig.world.root, gid, signer_fp=fp, sign=sign, clock=rig.world.clock)
+
+
+def test_fix2_a_revoke_between_prepare_and_release_kills_the_stopped_seat_and_refuses(seats, rig, eg, monkeypatch):
+    eg.sign()
+    grant = sp.live_egress(sl._replay(rig.world.root), rig.world.clock.now + timedelta(minutes=5))
+    plan = sl.prepare_launch("lane-rr", str(rig.src), rig.sha, claude_bin=seats.claude, python=sys.executable,
+                             cockpit_root=rig.world.root, install=rig.tmp, managed=(),
+                             now=rig.world.clock.now + timedelta(minutes=5), environ=seats.environ())
+    assert plan.egress_grant == grant["id"]
+    real = sl.append_mint
+    pids = []
+
+    def revoke_after_the_start_row(key_dir, row):
+        out = real(key_dir, row)
+        if row.get("ev") == "start":
+            pids.append(row["pid"])
+            _revoke_egress(rig, grant["id"])          # lands after the row, before the continue
+        return out
+    monkeypatch.setattr(sl, "append_mint", revoke_after_the_start_row)
+    with pytest.raises(sl.SeatLaunchRefused, match="no longer live"):
+        sl.launch_seat(plan, prompt="work")
+    assert pids and _wait(lambda: not _alive(pids[0])), "the stopped seat was killed"
+    time.sleep(0.2)
+    assert not (seats.rec / "pid").exists(), "the seat never ran"
+    assert not (rig.lanes / "lane-rr").exists() and not (rig.returns / "lane-rr").exists()
+    evs = [r.get("ev") for r in _rows(rig) if r.get("ev")]
+    assert evs == ["start", "aborted"]
+    with pytest.raises(sl.SeatLaunchRefused, match="no launched seat is recorded"):
+        sl.stop_seat(rig.key_dir, "lane-rr")
+    assert sl.stop_seats_for_grant(rig.key_dir, grant["id"]) == []
+
+
+def test_fix2_a_lease_revoked_before_the_release_refuses_too(seats, rig, monkeypatch):
+    from levain.consent.grants import revoke_grant
+    plan = seats.plan("lane-rl")
+    lease_id = plan.mint["lease_id"]
+    real = sl.append_mint
+
+    def revoke(key_dir, row):
+        out = real(key_dir, row)
+        if row.get("ev") == "start":
+            fp, sign = rig.world.keys["laptop"]
+            rig.world.clock.now += timedelta(minutes=1)
+            revoke_grant(rig.world.root, lease_id, signer_fp=fp, sign=sign, clock=rig.world.clock)
+        return out
+    monkeypatch.setattr(sl, "append_mint", revoke)
+    with pytest.raises(sl.SeatLaunchRefused, match="lease is no longer live"):
+        sl.launch_seat(plan, prompt="work")
+    time.sleep(0.2)
+    assert not (seats.rec / "pid").exists() and not (rig.lanes / "lane-rl").exists()
+
+
+def test_fix3_two_seeds_into_one_home_at_once_keep_both_entries(tmp_path, monkeypatch):
+    import threading
+    h = tmp_path / "h"
+    h.mkdir()
+    (h / ".claude.json").write_text(json.dumps({"userID": "seat"}))
+    real = sl._read_regular
+
+    def slow(p):                                  # both readers would see the same old file without the lock
+        b = real(p)
+        time.sleep(0.3)
+        return b
+    monkeypatch.setattr(sl, "_read_regular", slow)
+    errors = []
+
+    def seed(clone):
+        try:
+            sl.seed_trust(h, clone)
+        except Exception as exc:  # noqa: BLE001
+            errors.append(exc)
+    ts = [threading.Thread(target=seed, args=(f"/lane/{n}",)) for n in ("a", "b")]
+    for t in ts:
+        t.start()
+    for t in ts:
+        t.join()
+    assert errors == []
+    data = json.loads((h / ".claude.json").read_text())
+    assert set(data["projects"]) == {"/lane/a", "/lane/b"} and data["userID"] == "seat"
+    assert (h / ".claude.json.levain-lock").stat().st_mode & 0o777 == 0o600
+
+
+@pytest.mark.parametrize("body", [b"", b"[]", b"{not json", b'{"projects": []}', b'{"a": 1'])
+def test_fix3_a_file_that_is_not_a_json_object_is_refused_and_left_byte_identical(tmp_path, body):
+    h = tmp_path / "h"
+    h.mkdir()
+    (h / ".claude.json").write_bytes(body)
+    with pytest.raises(sl.SeatLaunchRefused, match="not touched"):
+        sl.seed_trust(h, "/lane/x")
+    assert (h / ".claude.json").read_bytes() == body
+    assert sorted(p.name for p in h.iterdir()) == [".claude.json", ".claude.json.levain-lock"]
+
+
+def test_fix3_a_fifo_or_a_linked_lock_is_refused_without_blocking(tmp_path):
+    h = tmp_path / "h"
+    h.mkdir()
+    os.mkfifo(h / ".claude.json")
+    with pytest.raises(sl.SeatLaunchRefused, match="not touched"):
+        sl.seed_trust(h, "/lane/x")
+    g = tmp_path / "g"
+    g.mkdir()
+    (g / ".claude.json.levain-lock").symlink_to(tmp_path / "elsewhere")
+    with pytest.raises(sl.SeatLaunchRefused, match="trust lock"):
+        sl.seed_trust(g, "/lane/x")
+    assert not (tmp_path / "elsewhere").exists()
+
+
+def test_fix4_a_dry_run_mints_nothing_and_the_real_launch_of_that_lane_then_works(seats, rig):
+    import io
+    out, err = io.StringIO(), io.StringIO()
+    rc = sl.validate_launch("lane-dr", str(rig.src), rig.sha, claude_bin=seats.claude, python=sys.executable,
+                            cockpit_root=rig.world.root, install=rig.tmp, out=out, err=err, managed=(),
+                            now=rig.world.clock.now + timedelta(minutes=1), environ=seats.environ(), prompt="work")
+    assert (rc, err.getvalue()) == (0, ""), err.getvalue()
+    assert "nothing minted" in out.getvalue()
+    argv = json.loads(out.getvalue().split("  argv    ", 1)[1])
+    assert argv[1] == "-p" and argv[-1] == "work" and str(rig.lanes.resolve() / "lane-dr") in json.dumps(argv)
+    assert list(rig.lanes.iterdir()) == [] and list(rig.returns.iterdir()) == [], "no root, no throwaway left"
+    assert _rows(rig) == [], "no mint row"
+    plan, _info = seats.go("lane-dr")
+    assert Path(plan.profile.clone).is_dir()
+    # and a dry run of a lane that exists, or with a bad prompt, refuses
+    for kw in ({}, {"prompt": "-x"}):
+        err = io.StringIO()
+        assert sl.validate_launch("lane-dr" if not kw else "lane-dq", str(rig.src), rig.sha, claude_bin=seats.claude,
+                                  python=sys.executable, cockpit_root=rig.world.root, install=rig.tmp, out=io.StringIO(),
+                                  err=err, managed=(), now=rig.world.clock.now + timedelta(minutes=1),
+                                  environ=seats.environ(), **kw) == 1
+        assert "seat launch refused" in err.getvalue()
+
+
+def test_fix5_the_grant_sweep_continues_past_a_seat_that_raises(seats, rig, eg, monkeypatch):
+    eg.sign()
+    grant = sp.live_egress(sl._replay(rig.world.root), rig.world.clock.now + timedelta(minutes=5))
+    held = []
+    for lane in ("lane-s1", "lane-s2"):
+        plan = sl.prepare_launch(lane, str(rig.src), rig.sha, claude_bin=seats.claude, python=sys.executable,
+                                 cockpit_root=rig.world.root, install=rig.tmp, managed=(),
+                                 now=rig.world.clock.now + timedelta(minutes=5), environ=seats.environ())
+        held.append(sl.launch_seat(plan, prompt="work"))
+        seats.started.append(held[-1])
+    real = sl._stop_row
+
+    def flaky(row, **k):
+        if row["lane_key"] == "lane-s1":
+            raise PermissionError("operation not permitted")
+        return real(row, **k)
+    monkeypatch.setattr(sl, "_stop_row", flaky)
+    out = sl.stop_seats_for_grant(rig.key_dir, grant["id"], grace=5)
+    assert [(r.lane, r.status) for r in out] == [("lane-s1", "refused"), ("lane-s2", "stopped")]
+    assert "PermissionError" in out[0].detail and _wait(lambda: not _alive(held[1]["pid"]))
+
+
+def test_fix5_eperm_on_a_signal_is_gone_when_the_group_lists_nothing_live_and_refused_exactly_when_it_does(seats, rig, monkeypatch):
+    _plan, info = seats.go("lane-ep")
+    seats.recorded("child")
+
+    def eperm(pg, sig):
+        raise PermissionError(1, "Operation not permitted")
+    monkeypatch.setattr(sl.os, "killpg", eperm)
+    with pytest.raises(sl.SeatLaunchRefused, match="EPERM.*still has the recorded start time"):
+        sl.stop_seat(rig.key_dir, "lane-ep")
+    monkeypatch.setattr(sl, "_live_members", lambda pg: [])      # a zombie-only group: macOS answers EPERM
+    assert sl.stop_seat(rig.key_dir, "lane-ep").status == "gone"
+
+
+def test_fix5_a_group_gone_at_the_sigterm_is_gone_not_a_crash(seats, rig, monkeypatch):
+    _plan, info = seats.go("lane-pl")
+    seats.recorded("child")
+    real = os.killpg
+
+    def vanish(pg, sig):
+        if sig == signal.SIGTERM:
+            raise ProcessLookupError(3, "No such process")
+        return real(pg, sig)
+    monkeypatch.setattr(sl.os, "killpg", vanish)
+    assert sl.stop_seat(rig.key_dir, "lane-pl").status == "gone"
+
+
+def test_fix5_any_other_error_in_stop_is_a_refusal_not_a_traceback(seats, rig, monkeypatch):
+    _plan, _info = seats.go("lane-te")
+    monkeypatch.setattr(sl, "_proc_start_ns", lambda pid: (_ for _ in ()).throw(RuntimeError("ps exploded")))
+    with pytest.raises(sl.SeatLaunchRefused, match="RuntimeError"):
+        sl.stop_seat(rig.key_dir, "lane-te")
+    monkeypatch.undo()
+    monkeypatch.setattr(subprocess, "run", lambda *a, **k: (_ for _ in ()).throw(subprocess.TimeoutExpired("ps", 10)))
+    try:
+        with pytest.raises(sl.SeatLaunchRefused, match="ps could not read"):
+            sl._proc_start_ns(os.getpid())
+    finally:
+        monkeypatch.undo()
+
+
+def test_fix6_a_nul_prompt_leaves_no_minted_root_and_the_lane_launches_again(seats, rig, capsys, monkeypatch):
+    plan = seats.plan("lane-nul")
+    with pytest.raises(sl.SeatLaunchRefused, match="NUL"):
+        sl.launch_seat(plan, prompt="a\0b")
+    assert not (rig.lanes / "lane-nul").exists() and not (rig.returns / "lane-nul").exists()
+    seats.go("lane-nul")                                           # the lane is not wedged
+    from levain import cli
+    _rig_clock(rig, monkeypatch)
+    before = len(_rows(rig))
+    assert cli._cmd_seat_launch(_ns(rig, seats, "lane-nul2", prompt="a\0b"), rig.world.root) == 1
+    assert "NUL" in capsys.readouterr().err
+    assert len(_rows(rig)) == before and not (rig.lanes / "lane-nul2").exists(), "the CLI checks before the mint"
+
+
+@pytest.mark.parametrize("value", ["inf", "nan", "-1", "600.5", "-inf", "x"])
+def test_fix7_grace_refuses_what_is_not_finite_or_out_of_range(value, capsys):
+    from levain import cli
+    with pytest.raises(SystemExit):
+        cli.build_parser().parse_args(["seat", "stop", "lane-a", "--grace", value])
+    with pytest.raises(sl.SeatLaunchRefused):
+        sl.check_grace(value)
+
+
+def test_fix7_grace_accepts_its_range():
+    from levain import cli
+    assert cli.build_parser().parse_args(["seat", "stop", "lane-a", "--grace", "0"]).grace == 0.0
+    assert cli.build_parser().parse_args(["seat", "stop", "lane-a", "--grace", "600"]).grace == 600.0
+
+
+def _revoke_ns(rig, grant_id):
+    return argparse.Namespace(seat_cmd="egress", seat_egress_cmd="revoke", grant_id=grant_id, signing_key=Path("k"),
+                              path=rig.tmp, data_root=rig.world.root)
+
+
+def test_fix8_revoke_that_landed_but_could_not_stop_says_so_with_its_own_exit_code(rig, monkeypatch, capsys):
+    from levain import cli
+    import levain.cockpit.keys as keys
+    monkeypatch.setattr(keys, "ssh_signer", lambda path: ("fp", lambda m: "sig"))
+    monkeypatch.setattr(sp, "revoke_egress", lambda root, gid, **k: (7, None))
+    monkeypatch.setattr(sl, "stop_seats_for_grant",
+                        lambda *a, **k: [sl.StopResult("lane-x", "refused", "EPERM"), sl.StopResult("lane-y", "stopped", "ok")])
+    assert cli._cmd_seat(_revoke_ns(rig, "sg-1")) == cli.EXIT_REVOKED_NOT_STOPPED == 3
+    cap = capsys.readouterr()
+    assert "revoked: sg-1" in cap.out and "revoked, but could not stop: lane-x" in cap.err
+    monkeypatch.setattr(sl, "stop_seats_for_grant", lambda *a, **k: (_ for _ in ()).throw(sl.SeatLaunchRefused("the mint chain is broken")))
+    assert cli._cmd_seat(_revoke_ns(rig, "sg-1")) == 3
+    assert "revoked, but could not stop" in capsys.readouterr().err
+    # a revoke that did NOT land is exit 1, "refused"
+    monkeypatch.setattr(sp, "revoke_egress", lambda root, gid, **k: (_ for _ in ()).throw(sp.SeatPushRefused("no such grant")))
+    assert cli._cmd_seat(_revoke_ns(rig, "sg-1")) == 1
+    assert "seat egress refused: no such grant" in capsys.readouterr().err
+
+
+def test_fix8_an_oserror_during_the_launch_is_a_refusal_not_a_traceback(seats, rig, monkeypatch, capsys):
+    from levain import cli
+    _rig_clock(rig, monkeypatch)
+    monkeypatch.setattr(sl, "seed_trust", lambda home, clone: (_ for _ in ()).throw(OSError(28, "No space left on device")))
+    assert cli._cmd_seat_launch(_ns(rig, seats, "lane-os"), rig.world.root) == 1
+    assert "seat launch refused: OSError" in capsys.readouterr().err and not (rig.lanes / "lane-os").exists()
