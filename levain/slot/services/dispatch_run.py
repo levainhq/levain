@@ -121,11 +121,13 @@ NAME = "dispatch_run"
 ACCOUNT = "_levain_dispatch"
 EX_USAGE = 64
 EX_TEMPFAIL = 75
-#: What a `no-free-slot` tells the operator. A dispatch needs ONE slot marked for unattended runs (a credential plus a
-#: baseline naming the vendor) AND at least one other slot that holds no credential and no baseline; the reaper marks
-#: any slot holding either as not dispatch-eligible, so a pool whose every free slot is marked has no spare one.
-_NO_FREE_SLOT_DETAIL = ("no dispatch slot is free: a dispatch needs one marked slot plus at least one spare slot "
-                        "holding no credential and no baseline (a slot with either is reserved for the operator)")
+#: What a `no-free-slot` tells the operator. The gate is CONTROL's `POOL` count (`egress_free`, tickets.pool_free): the
+#: credential-free egress slots the mirror shows, less those other open dispatches already hold, less the EGRESS_RESERVE
+#: the operator keeps; it must leave at least one. A slot holding a credential or baseline (the marked one included) is
+#: not credential-free, so it never counts. The marked slot itself is a separate check (`no-dispatch-credential`).
+_NO_FREE_SLOT_DETAIL = ("no dispatch slot is free: after the slot kept for the operator and the slots other dispatches "
+                        "are using, no spare slot is left that holds no credential and no baseline "
+                        "(a slot with either never counts as spare). Wait for a running dispatch to finish, or add a spare slot")
 EX_CONFIG = 78
 EX_WRONG_USER = 77
 #: [judged] a holder connection that sends nothing for this long is read as gone (EOF): the session is ENDed.

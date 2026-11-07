@@ -502,8 +502,11 @@ def test_a_transient_refusal_leaves_no_upload_and_the_same_connection_retries(w,
     ans = w.raw_launch(sock, key, parts.workspace())
     assert (ans["refused"], ans["reason_class"]) == ("no-free-slot", "transient")
     # row 133: the refusal names its cause (one marked slot AND a spare credential-free slot), not just "none free"
-    text = str(ans)
-    assert "one marked slot" in text and "spare slot" in text and "no credential and no baseline" in text, ans
+    from levain.slot.services.dispatch_run import _NO_FREE_SLOT_DETAIL
+    assert _NO_FREE_SLOT_DETAIL in str(ans), ans
+    # the message states what the gate counts (spares beyond the operator's and other dispatches'), not "one marked + one spare"
+    assert "spare slot" in _NO_FREE_SLOT_DETAIL and "kept for the operator" in _NO_FREE_SLOT_DETAIL and "other dispatches" in _NO_FREE_SLOT_DETAIL
+    assert "marked slot plus" not in _NO_FREE_SLOT_DETAIL and not any(c.isdigit() for c in _NO_FREE_SLOT_DETAIL)
     assert w.uploads._ups == {} and w.env.launcher.index.get(key) is None   # nothing pinned, nothing tombstoned
     w.env.pool = True
     assert w.send(sock, "WSBEGIN", **C.ws_begin_to_wire(key, parts.manifest_bytes, parts.bundle))["ok"]

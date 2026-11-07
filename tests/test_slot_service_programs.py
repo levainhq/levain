@@ -401,6 +401,7 @@ def test_the_no_operator_exit_75_is_restarted_not_failed_and_the_units_module_sa
     for name in ("control", "dispatch_run"):
         text = units.systemd_unit_text(units.by_name(name))
         assert "Restart=always" in text, name                                  # 75 is restarted, so the unit settles
-        prevent = [ln for ln in text.splitlines() if ln.startswith("RestartPreventExitStatus=")][0]
-        assert "75" not in prevent.split("=", 1)[1].split(), (name, prevent)   # never one of the no-restart statuses
+        prevent = next((ln for ln in text.splitlines() if ln.startswith("RestartPreventExitStatus=")), "")
+        assert prevent, (name, "the unit names no RestartPreventExitStatus= line")
+        assert "75" not in prevent.split("=", 1)[1].replace(",", " ").split(), (name, prevent)   # systemd splits on space AND comma
     assert "status=75/TEMPFAIL" in units.__doc__ and "systemctl --failed" in units.__doc__
