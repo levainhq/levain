@@ -6,7 +6,7 @@
 // whichever opens first creates the store; correctness depends on no timing (an unread key waits for the next trigger).
 const DB = 'levain-sw-2', STORE = 'opened';
 // A short id of this worker's code, recorded in the trace so a device's trace says which worker ran.
-const SW_VERSION = '1106-54-bundle5-1';
+const SW_VERSION = '1106-54-bundle5-2';
 // The TRACE: an append-only ring in its own cache, one entry per step, key TRACE_PREFIX + <time ms, zero padded> + '-' +
 // <seq>, value JSON {t, src, step, ...detail}. The /tap_trace page and sw_open.js read and write the same ring. Writes are
 // best effort, serialized on one chain, never awaited by the tap, and carry only urls without fragments, counts and step

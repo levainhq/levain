@@ -65,12 +65,13 @@
   // how = load | load>new | load>shown | resume | resume>shown | message ('>' = then it forwarded itself). Best effort, silent,
   // keepalive (a forward unloads the page), no token in the body.
   const ITEM_OK = /^[A-Za-z0-9_.:-]{1,64}$/;
-  const landTarget = () => {
+  const landTarget = (loc) => {
     try {
+      loc = loc || location;
       // decode the percent-encoded pathname, keep it only when wholly inside the server's grammar (else "/"); never strip characters
       let p = "/";
-      try { const d = decodeURIComponent(location.pathname); if (/^\/(?!\/)[A-Za-z0-9/_.-]{0,60}$/.test(d)) p = d; } catch (_) { p = "/"; }
-      const q = new URLSearchParams(location.search), parts = [];
+      try { const d = decodeURIComponent(loc.pathname); if (/^\/(?!\/)[A-Za-z0-9/_.-]{0,60}$/.test(d)) p = d; } catch (_) { p = "/"; }
+      const q = new URLSearchParams(loc.search), parts = [];
       const v = q.get("view"), it = q.get("item");
       if (v !== null && /^[a-z]{1,20}$/.test(v)) parts.push("view=" + v);
       if (it !== null && ITEM_OK.test(it)) parts.push("item=" + it);
@@ -94,7 +95,9 @@
   }
   // the assign comes first: the trace of it may often be lost to the navigation, which is fine
   const assignTo = (href, how) => {
-    if (how) { if (how.indexOf("load") === 0) loadPosted = true; postLanding(how); }
+    // the landing names the target the notification CARRIED (href), never the address this document holds when the post is made:
+    // the cockpit strips deep-link params from its own address once it has read them
+    if (how) { if (how.indexOf("load") === 0) loadPosted = true; let t; try { t = landTarget(new URL(href, location.href)); } catch (_) { t = undefined; } postLanding(how, t); }
     location.assign(href); trace("assign", { target: traceUrl(href), ...nFlag(href) });
   };
   try {
@@ -167,7 +170,7 @@
         if (!(await cache.delete(f.req))) continue;
         trace("checkPending", { seen, claimed: traceUrl(f.u.href), assigned: !sameTarget(f.u, here) });
         if (!sameTarget(f.u, here)) assignTo(f.u.href, "load>new");   // already here: consumed, the page stays
-        else { loadPosted = true; postLanding("load>new"); }
+        else { loadPosted = true; postLanding("load>new", landTarget(f.u)); }
         return;
       }
       trace("checkPending", { seen, claimed: null, assigned: false });

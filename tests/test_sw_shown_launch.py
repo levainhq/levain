@@ -251,3 +251,13 @@ def test_a_landing_target_is_the_decoded_path_inside_the_grammar_or_slash_never_
     assert got["encOk"]["targets"] == ["/sign/9?view=needs"], got["encOk"]
     assert got["encSlash"]["targets"] == ["/"], got["encSlash"]
     assert got["encItem"]["targets"] == ["/?view=needs"], got["encItem"]           # a trailing newline is not an item
+
+
+@needs_node
+def test_a_forwarding_landing_names_the_target_the_notification_carried_not_the_address_it_left() -> None:
+    got = _resume()
+    item = "/?view=needs&item=np-0b62cd3b"
+    assert got["newAssign"]["assigned"] == ["https://box.example" + item] and got["newAssign"]["hows"] == ["load>new"], got["newAssign"]
+    assert got["newAssign"]["targets"] == [item], got["newAssign"]           # not '/', the address the document held when it forwarded
+    assert got["newHere"]["hows"] == ["load>new"] and got["newHere"]["targets"] == [item], got["newHere"]
+    assert got["shownAssign"]["hows"] == ["load", "resume>shown"] and got["shownAssign"]["targets"] == ["/", item], got["shownAssign"]

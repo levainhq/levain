@@ -404,7 +404,7 @@ def test_a_push_posts_received_then_shown_with_the_endpoint_hash_and_ids_only() 
     assert "secret body" not in json.dumps(got["posts"])
     assert got["shownCalls"] == [{"title": "T", "tag": "x"}] and got["queued"] == []
     assert _receipt_steps(got) == [("received", "ok", None), ("shown", "ok", None)]
-    assert any(e["step"] == "sw-version" and e["version"] == "1106-54-bundle5-1" and e["on"] == "push" for e in got["trace"])
+    assert any(e["step"] == "sw-version" and e["version"] == "1106-54-bundle5-2" and e["on"] == "push" for e in got["trace"])
 
 
 @needs_node
@@ -768,6 +768,20 @@ def test_a_phone_with_a_fast_clock_is_not_silent_the_server_clock_decides(tmp_pa
         c.execute("INSERT INTO receipts (ping_id, device_id, kind, at, reported_at) VALUES (?,?,?,?,?)",
                   (first, PAIRED_PREFIX + "a", "received", _ms_stamp(60 * 24), _ms_stamp(1)))
     assert _by(receipts.build(s), 0, [later], "a")["outcome"] == "no receipt yet"
+
+
+def test_a_devtest_push_is_labelled_devtest_never_silent_or_no_receipt(tmp_path: Path) -> None:
+    # the worker suppresses a devtest push's receipts, so the report must not call it silent / no receipt (band 299 L3 r1 MED)
+    s, sa, _ = _two_phones(tmp_path)
+    dev, norm, later = s.add_ping("devtest", None, "t", "b"), s.add_ping("sign", "np-n", "t", "b"), s.add_ping("sign", "np-3", "t", "b")
+    _rows(s, deliveries=[(dev, sa, 201, _t(0)), (norm, sa, 201, _t(0)), (later, sa, 201, _t(5))],
+          receipts_=[(later, "a", "received", _ms_stamp(6))])                 # A reported later, so a normal ping with no receipt is silent
+    rep = receipts.build(s)
+    assert _by(rep, 0, [norm], "a")["outcome"] == "silent"
+    assert _by(rep, 0, [dev], "a")["outcome"] == "devtest"
+    a = next(d for d in rep["devices"] if d["device"].endswith("a"))
+    assert a["silent"] == 1, a                                                  # the devtest push adds no silent count
+    assert "devtest" in receipts.text(rep)
 
 
 def test_a_tapped_ping_is_shown_even_with_its_receipts_lost(tmp_path: Path) -> None:

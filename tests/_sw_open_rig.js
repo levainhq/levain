@@ -204,9 +204,10 @@ const fire = async (t, o, ev = {}) => { for (const fn of (o[t] || [])) fn(ev); a
     // The app coming forward RESUMES the document (no load): visibilitychange -> visible judges the 'shown' entries again. Each
     // case: a NEW document at `href` with no entry, then the entry is written (and the tray set), then the page turns visible.
     const TRAY = { tag: 'np-607', data: { ping: 607 } };
-    const resume = async (name, { href = 'https://box.example/', skew = 0, st = true, mid = [], entry = {}, none = false, hidden = false, cycles = 1, retryTray = null, burst = false, hideBeforeRetry = false } = {}) => {
+    const resume = async (name, { href = 'https://box.example/', skew = 0, st = true, mid = [], entry = {}, none = false, hidden = false, cycles = 1, retryTray = null, burst = false, hideBeforeRetry = false, newUrl = null } = {}) => {
       store.clear(); log.assigned.length = 0; log.landed.length = 0; standalone = st; tray = []; navType = null; trayThrows = false; noGetN = false; onGetN = null;
       skewMs = 0;
+      if (newUrl) put('nw', { url: newUrl, at: Date.now(), for: 'new' });   // a 'new' entry waiting BEFORE the page script runs
       await boot(href);
       skewMs = skew;   // the load landing is told at boot; a resume more than 30 s later is told again
       if (!none) putShown(entry);
@@ -234,6 +235,11 @@ const fire = async (t, o, ev = {}) => { for (const fn of (o[t] || [])) fn(ev); a
     await resume('encOk', { href: 'https://box.example/sign/%39?view=needs', none: true });            // decodes to an allowed path
     await resume('encSlash', { href: 'https://box.example/%2F%2Fx', none: true });                      // decodes to '//x': never a target
     await resume('encItem', { href: 'https://box.example/?view=needs&item=a%0A', none: true });         // an item ending in a newline is no item
+    // the landing names the target the notification CARRIED, not the address the document holds (the cockpit strips deep-link params)
+    const NEEDS = '/?view=needs&item=np-0b62cd3b';
+    await resume('newAssign', { newUrl: NEEDS, none: true });                                      // page at '/', entry for the item: assigned, told with the item
+    await resume('newHere', { href: 'https://box.example' + NEEDS, newUrl: NEEDS, none: true });   // already on it: consumed, told with the item
+    await resume('shownAssign', { entry: { url: NEEDS } });                                        // resume>shown forwards to the item
     await resume('expired', { entry: { at: Date.now() - 181000 } });
     await resume('fresh', { entry: { at: Date.now() - 170000 } });
     await resume('nonBare', { href: 'https://box.example/?view=needs' });
