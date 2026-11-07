@@ -732,3 +732,16 @@ def test_a_canary_set_that_names_a_tool_not_admitted_or_half_a_probe_is_refused(
         sc.run_seat_canary(claude_bin="c", python="p", swap_attempts=2, environ={"TMPDIR": str(tmp_path)}, tools=tools)
     with pytest.raises(SystemExit):
         sc.main(["--claude-bin", "c", "--tools", ",".join(tools) or ","])
+
+
+@pytest.mark.parametrize("argv, want", [(["--claude-bin", "c"], "sonnet"), (["--claude-bin", "c", "--model", "opus"], "opus")])
+def test_the_canary_cli_passes_its_model_flag_to_the_run(monkeypatch, capsys, argv, want):
+    """Z1e (measured): the haiku default refused the canary prompt, so the CLI names the model, default sonnet."""
+    seen = {}
+
+    def fake(**kw):
+        seen.update(kw)
+        return type("V", (), {"ok": lambda self: True, "report": lambda self: "r"})()
+    monkeypatch.setattr(sc, "run_seat_canary", fake)
+    assert sc.main(argv) == 0
+    assert seen["model"] == want and f"model {want}" in capsys.readouterr().out
