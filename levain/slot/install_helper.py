@@ -2150,7 +2150,7 @@ def _gather_held(cmd: InstallCommand, host: HostOS, caller_uid: int, d: Director
         levain_tombstones=tombs, levain_live=live, intent=journal, host_ids=host_ids, install_shape=shape,
         user_ids=dict(d.users))
     if cmd.verb == "repair":
-        repair = _repair_facts(cmd, host, d, accounts, in_service or {}, skips=skips,
+        repair = _repair_facts(cmd, host, d, accounts, _drop_retired_slots(in_service or {}, tombs), skips=skips,
                                operator_uid=int(orec["uid"]) if orec is not None else None)
         return Gathered(facts, accounts, quiesce=q, repair=repair)
     if cmd.verb == "undo":
@@ -2160,6 +2160,17 @@ def _gather_held(cmd: InstallCommand, host: HostOS, caller_uid: int, d: Director
         return Gathered(facts, {n: u for n, u in accounts.items() if n in wanted}, live=in_service, quiesce=q,
                         pool=pool, configured=configured)
     return Gathered(facts, quiesce=q)
+
+
+def _drop_retired_slots(in_service: Mapping[str, tuple[int, ...]],
+                        tombs: Mapping[str, int]) -> dict[str, tuple[int, ...]]:
+    """A slot dir that survives ``undo`` (which removes the slot's state file and tombstones its accounts, leaving the
+    dir; a later ``setup`` allocates new indices) reads as in service (no state file), yet its accounts are Levain's
+    retired marker: the product's own leftover, not a slot repair could ever serve. Dropped ONLY when EVERY account of
+    the slot carries the exact retired label (``tombs``, read from the directory's account labels, never from the dir
+    name). A live, unlabelled, absent or half-retired slot stays in service, so ``account-missing`` still refuses it."""
+    return {cls: tuple(i for i in idx if not all(n in tombs for n in SlotId(cls, i).accounts))  # type: ignore[arg-type]
+            for cls, idx in in_service.items()}
 
 
 def _repair_facts(cmd: InstallCommand, host: HostOS, d: Directory, accounts: Mapping[str, int],

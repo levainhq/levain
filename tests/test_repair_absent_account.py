@@ -176,3 +176,37 @@ def test_not_set_up_refuses_before_the_source_is_resolved(tmp_path: Path, monkey
     with pytest.raises(Refused) as e:
         IH._repair_facts(cmd, "linux", IH.Directory(users={}, groups={}), {}, {}, operator_uid=None)
     assert e.value.name == "not-set-up" and seen == []
+
+
+# --- retired slot dirs that undo left behind (S7 END rerun, 1107-15) ------------------------------------------
+
+def _tombs(*slots: SlotId) -> dict[str, int]:
+    return {n: 3000 + k for k, n in enumerate(n for s in slots for n in s.accounts)}
+
+
+def test_a_slot_dir_whose_accounts_are_all_retired_is_not_in_service() -> None:
+    """undo leaves the dir (no state file, so it reads in service) and tombstones its accounts; repair must not count
+    it. Revert the `all(n in tombs ...)` filter in `_drop_retired_slots` and this goes red."""
+    got = IH._drop_retired_slots({"egress": (0, 1, 12), "none": (0, 3)},
+                                 _tombs(SlotId("egress", 0), SlotId("egress", 1), SlotId("none", 0)))
+    assert got == {"egress": (12,), "none": (3,)}
+
+
+@pytest.mark.parametrize("tomb_only", [["_levain_s5"], ["_levain_gw5"], []])
+def test_a_half_retired_or_unlabelled_slot_stays_in_service(tomb_only) -> None:
+    """Mutation check: replacing `all` with `any`, or skipping by dir name, turns this red. Live-labelled, absent or
+    half-retired accounts keep the slot in service so `account-missing` still refuses it."""
+    got = IH._drop_retired_slots({"egress": (5,)}, {n: 3000 for n in tomb_only})
+    assert got == {"egress": (5,)}
+
+
+def test_the_gather_drops_retired_slots_but_refuses_a_live_one(tmp_path: Path) -> None:
+    """End to end through the plan: with the retired slot dropped the plan builds; the same rf with that slot's
+    accounts absent from both live and retired (hand-deleted) still refuses."""
+    facts, rf = _host(tmp_path, "linux")
+    rf_old = IH.RepairFacts(**{**rf.__dict__, "egress": (*rf.egress, 7)})
+    with pytest.raises(Refused) as e:
+        _plan(facts, rf_old)                                    # slot 7 in service, no accounts: refuses
+    assert e.value.name == "account-missing"
+    kept = IH._drop_retired_slots({"egress": rf_old.egress}, _tombs(SlotId("egress", 7)))
+    _plan(facts, IH.RepairFacts(**{**rf.__dict__, "egress": kept["egress"]}))

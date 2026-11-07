@@ -1,0 +1,5 @@
+# RETURN repair (lane 1107-20-repair)
+Decision: the retired slot dirs ARE the product's own leftover. `undo` runs `slot_state_undo_steps` (removes each slot's `state` file, not the dir) and tombstones the accounts (`SLOT_RETIRED_MARKER`); `records.in_service(None)` is True, so the dir reads in service; `setup` takes new indices. Hence repair after undo+setup counted dead slots. No security-boundary call: nothing is loosened for a live or unknown account.
+Fix: `install_helper._drop_retired_slots`, applied in `_gather_held` to the repair path. A slot is dropped only if BOTH its accounts are in `tombs` (exact retired label from the directory's account labels, never the dir name). Live, unlabelled, absent or half-retired slots stay and still refuse `account-missing`.
+Tests (tests/test_repair_absent_account.py): all-retired dropped (red if the `all(...)` filter is reverted); half-retired/unlabelled/absent stay (mutation `all`->`any` turned 2 cases red, verified); plan builds with the retired slot dropped and refuses without. Wiring in `_gather_held` is one line, not unit-tested end to end (no VM run).
+CHANGELOG entry added. Not pushed.
