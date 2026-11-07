@@ -9,8 +9,8 @@ never with a provisional number. The whole band is printed every time, never reo
 :data:`COMPACT_AFTER` items the rest take one line each (D15), and an item that cannot be read is listed as UNREADABLE
 (D13). A numbered question the operator snoozed to a later day (row 134) is listed by its number on ONE
 ``LATER (n): <number> <Wkd>[ MM-DD] · ...`` line under the items (flow's format) instead of in full, and the header
-then reads ``N due``, counting only the rest; it stays open and answers by its number. Closed is derived (the question has an answer) and shown as ``closed N`` in the next hook render, then it leaves; its
-number stays retired. The notice is recorded as shown only AFTER the hook's ``emit`` returned True (at-least-once).
+then reads ``N due``, counting only the rest; it stays open and answers by its number. Closed is derived (the
+question has an answer) and shown as ``closed N`` in the next hook render, then it leaves; its number stays retired. The notice is recorded as shown only AFTER the hook's ``emit`` returned True (at-least-once).
 
 Three seams use it: the UserPromptSubmit hook (:func:`hook_prompt`: the render, nothing parsed), the SessionStart
 contract line (:func:`hook_contract`) and ``levain band`` (:func:`run_band`). The hooks FAIL OPEN: any error prints
@@ -3075,7 +3075,10 @@ def _reprint_check(view: View, block: str | None, message: str) -> tuple[list[in
     if block:
         want = [_norm(ln) for ln in block.splitlines() if ln.strip()]
         have = set(lines)
-        missing = [n for n in view.open_list if not any(w.startswith(f"{n}. ") and w in have for w in want)]
+        # a number is reprinted on its item line, or (a snoozed row) on the LATER line: ``LATER (2): 3 Sun · 1 Tue 11-10``
+        missing = [n for n in view.open_list if not any(
+            (w.startswith(f"{n}. ") or (w.startswith("LATER (") and re.search(rf"(?:: |· ){n} ", w))) and w in have
+            for w in want)]
         for i, ln in enumerate(lines):
             if ln != want[0]:
                 continue

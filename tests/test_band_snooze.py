@@ -280,6 +280,21 @@ def test_the_view_does_not_read_a_snooze_as_a_close(store):
     assert band_view._delta_line(store, prev, r2.shown) == "" and r.shown == r2.shown == [1, 2]
 
 
+def test_the_stop_verifier_counts_a_later_number_as_reprinted(store):
+    from levain.band_shorthand import View
+
+    a, b = ask(store, "first?"), ask(store, "second?")
+    text(store)
+    store.snooze(b.id, until="2026-11-08", channel="cli", via="cli")
+    r = band_view.render_full(store)
+    view = View(r.hwm, tuple(r.shown), "s")
+    assert band_view._reprint_check(view, r.text, "ok\n" + r.text) == ([], False)            # whole: verified
+    partial = "\n".join(ln for ln in r.text.splitlines() if not ln.startswith("NEEDS YOU"))
+    assert band_view._reprint_check(view, r.text, partial) == ([], True)                     # both numbers there
+    no_later = "\n".join(ln for ln in r.text.splitlines() if not ln.startswith("LATER"))
+    assert band_view._reprint_check(view, r.text, no_later) == ([2], True)                   # the LATER line dropped
+
+
 # --- the CLI verbs ------------------------------------------------------------------------------------------------
 def test_levain_band_snooze_and_unsnooze_by_band_number(store, qdir, capsys, monkeypatch):
     monkeypatch.setattr(band_view, "QuestionStore", lambda d: QuestionStore(d, clock=store._clock))
