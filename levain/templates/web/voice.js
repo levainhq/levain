@@ -3,39 +3,51 @@
 //
 // The player asks ONE route for audio: POST /cockpit/voice/speak {room_thread_id, reply_gseq, chunk, provider, voice,
 // speed}. The page never sends words to speak; the server rebuilds the reply from the room record. The on-device tier
-// (speechSynthesis) calls no route at all. This file calls no other route: the settings block (devices_panel.js) is the
-// one reader of GET /cockpit/voice.json.
+// (speechSynthesis) calls no route at all and speaks only with a voice the browser marks localService === true. This file
+// calls no other route: the settings block (devices_panel.js) is the one reader of GET /cockpit/voice.json, and hands the
+// providers it read to LevainVoice.offer() so the player and the block use the SAME effective settings.
 //
 // Integration surface (the room view, a later slice; this file is loadable on its own and hooks nothing by itself):
 //   LevainVoice.arm(maxFinishedGseq)       once at mount: replies finished at or before it are backlog, never autoplayed
-//   LevainVoice.unlock()                   inside the operator's own tap (Send, a mic tap, a Play tap)
+//   LevainVoice.unlock()                   inside the operator's own tap (Send, a mic tap, a Play tap); a stop() after it is fine
 //   LevainVoice.replyFinished(reply)       when a reply's vendor_turn_ended arrives on a poll
 //   LevainVoice.button(reply)              the speaker control for a finished reply (draw it at the reply's foot)
-//   LevainVoice.stop()                     on Send, a mic tap, a new conversation, unmount (a hidden page stops itself)
+//   LevainVoice.stop()                     on Send, a mic tap, a new conversation, unmount (a hidden page stops itself and locks)
 //   reply = { thread, gseq, text }  thread = the room_thread_id, gseq = the gseq of the reply's vendor_turn_ended,
 //   text = the reply as drawn (read only by the on-device voice; the premium route never receives it)
+// Two replies that finish in one poll: the first is read to its end, ONE more waits behind it (a third replaces the waiting
+// one, and the replaced reply says so). A tap on a control, Send or a stop clears the wait.
 // Everything is drawn with textContent. Browser storage is wrapped in try/catch: the page works without it.
 (function () {
   "use strict";
   const SETTINGS_KEY = "levain_voice_settings";
   const TOKEN_KEY = "levain_write_token";
   const TOKEN_HEADER = "X-Levain-Write-Token";
-    const SPEAK_PATH = "/cockpit/voice/speak";
+  const SPEAK_PATH = "/cockpit/voice/speak";
   const SAMPLE = "This is how your room will sound.";
+  const VOICE_WAIT_MS = 1500;   // how long the on-device tier waits for the browser to list its voices
+  const CAP = 200;              // the most gseqs each remembered map keeps
   const WORDS = {
     play: "Play", stop: "Stop", tap: "Tap to hear",
-    busy: "Voice is busy; try again in a moment.",
-    failed: "Premium voice failed; reading uses the on-device voice.",
+    failed: "Premium voice failed.",
+    failedDevice: "Premium voice failed; reading uses the on-device voice.",
     midway: "Premium voice stopped partway; the rest is not read aloud.",
     cantPlay: "This browser could not play the audio.",
     noSpeech: "This browser has no on-device voice.",
+    noLocal: "No on-device voice is ready yet; tap again in a moment.",
+    nothing: "There is nothing to read aloud.",
+    queued: "Waiting: another reply is being read first.",
+    skipped: "Not read: a newer reply was waiting.",
   };
   const DEFAULTS = { tier: "device", provider: "", voice: "", speed: 1, autoplay: false, notify: false };
 
   // ---- per-device settings -------------------------------------------------------------------------------------------
+  let mem = null;          // the last settings written: used when this browser will not keep them
+  let storageOk = true;
   function readSettings() {
     let raw = null;
-    try { raw = JSON.parse(window.localStorage.getItem(SETTINGS_KEY) || "null"); } catch (_) { raw = null; }
+    if (storageOk) { try { raw = JSON.parse(window.localStorage.getItem(SETTINGS_KEY) || "null"); } catch (_) { raw = null; } }
+    else raw = mem;
     const s = Object.assign({}, DEFAULTS);
     if (!raw || typeof raw !== "object") return s;
     if (raw.tier === "device" || raw.tier === "premium") s.tier = raw.tier;
@@ -48,8 +60,33 @@
   }
   function writeSettings(patch) {
     const s = Object.assign(readSettings(), patch || {});
-    try { window.localStorage.setItem(SETTINGS_KEY, JSON.stringify(s)); } catch (_) { /* works without storage */ }
+    mem = s;
+    try { window.localStorage.setItem(SETTINGS_KEY, JSON.stringify(s)); } catch (_) { storageOk = false; }
     return s;
+  }
+
+  // The providers the cockpit says hold a live key for speech (devices_panel.js hands them over after GET /cockpit/voice.json).
+  // Until then the player trusts the stored choice, and a premium choice with no stored voice reads on-device.
+  let offered = null;
+  function offer(list) {
+    offered = Array.isArray(list) ? list.filter((p) => p && typeof p.name === "string").map((p) => ({
+      name: p.name, voices: Array.isArray(p.voices) ? p.voices.slice() : [], default_voice: p.default_voice || "",
+      speed: Array.isArray(p.speed) && p.speed.length === 2 ? [Number(p.speed[0]), Number(p.speed[1])] : [0.5, 2],
+    })) : null;
+  }
+  // What the player WILL use, and what the block shows: a stored provider with no live key is replaced by the first live
+  // one, a voice that provider does not offer by its default, a speed outside its range by the nearest end. No live
+  // provider means the on-device tier.
+  function effective() {
+    const st = readSettings(), out = Object.assign({}, st);
+    if (st.tier !== "premium") return out;
+    if (offered === null) { if (!st.provider || !st.voice) out.tier = "device"; return out; }
+    const p = offered.find((x) => x.name === st.provider) || offered[0] || null;
+    if (!p) { out.tier = "device"; return out; }
+    out.provider = p.name;
+    out.voice = p.voices.indexOf(st.voice) >= 0 ? st.voice : p.default_voice;
+    out.speed = Math.min(p.speed[1], Math.max(p.speed[0], st.speed));
+    return out;
   }
 
   function headers(json) {
@@ -76,7 +113,10 @@
   let runId = 0;            // bumped by every play and every stop: a step that finds it changed is stale and does nothing
   let playing = null;       // {thread, gseq} of the reply being read, or null
   let ctl = null;           // AbortController of the chunk fetches in flight
-  let audioEl = null, urls = [], unlocked = false;
+  let audioEl = null;       // the one media element: unlocked inside a tap, then reused for every chunk
+  let settleChunk = null;   // ends the chunk now on the element (stop calls it), or null when no chunk is on it
+  let unlocked = false, lockEpoch = 0, unlocking = false;
+  let queued = null;        // the one reply waiting behind the one being read
   let baseline = null;      // the gseq at or below which a finished reply is backlog; null = not armed, nothing autoplays
   const seen = new Set();   // gseqs replyFinished has already decided on (a poll repeats them)
   const tapNeeded = new Set(); // gseqs whose autoplay was held for a tap
@@ -84,51 +124,95 @@
   const listeners = new Set();
   const key = (r) => String(r.thread) + ":" + String(r.gseq);
 
+  // The three maps keep the newest CAP entries: a cockpit left open for a day does not grow with its replies.
+  function remember(coll, k, v) {
+    if (coll instanceof Map) { coll.delete(k); coll.set(k, v); } else { coll.delete(k); coll.add(k); }
+    while (coll.size > CAP) coll.delete(coll.keys().next().value);
+  }
   function changed() { listeners.forEach((f) => { try { f(); } catch (_) { /* a view's fault never stops the player */ } }); }
-  function dropUrls() { urls.forEach((u) => { try { URL.revokeObjectURL(u); } catch (_) { /* gone */ } }); urls = []; }
 
+  function localVoice() {
+    const ss = window.speechSynthesis;
+    let all = [];
+    try { all = (ss && ss.getVoices && ss.getVoices()) || []; } catch (_) { all = []; }
+    const local = Array.prototype.filter.call(all, (v) => v && v.localService === true);   // on-device only: nothing is sent anywhere
+    return local.find((v) => /^en/i.test(v.lang || "")) || local[0] || null;
+  }
+
+  // The unlock: a media element must be played once inside the operator's own tap. A play() started inside the tap has taken
+  // the gesture whether or not it finishes: the stop() or the first real chunk that follows in the same tap ends it with an
+  // AbortError, which is no refusal. Only a refusal (NotAllowedError) leaves the page locked.
   function unlock() {
-    if (unlocked) return;
+    if (unlocked || unlocking) return;
+    if (settleChunk) { unlocked = true; changed(); return; }       // a chunk is already playing, so the element is allowed
     try {
-      if (window.speechSynthesis && typeof SpeechSynthesisUtterance === "function") {
-        const u = new SpeechSynthesisUtterance(""); u.volume = 0; window.speechSynthesis.speak(u);
+      const v = localVoice(), ss = window.speechSynthesis;
+      if (v && ss && typeof SpeechSynthesisUtterance === "function") {
+        const u = new SpeechSynthesisUtterance(""); u.voice = v; u.volume = 0; ss.speak(u);
       }
     } catch (_) { /* no on-device voice to unlock */ }
     try {
       if (!audioEl) audioEl = new Audio();
-      const url = URL.createObjectURL(silentWav());
-      urls.push(url);
-      audioEl.muted = true; audioEl.src = url;
-      const p = audioEl.play();
-      const ok = () => { try { audioEl.pause(); } catch (_) { /* ok */ } audioEl.muted = false; unlocked = true; changed(); };
-      if (p && typeof p.then === "function") p.then(ok, () => { audioEl.muted = false; });
-      else ok();
-    } catch (_) { /* a browser without media elements stays locked */ }
+      const el = audioEl, epoch = lockEpoch, url = URL.createObjectURL(silentWav());
+      unlocking = true;
+      el.muted = true; el.src = url;
+      let p;
+      try { p = el.play(); } catch (e) { p = Promise.reject(e); }
+      const end = (ok) => {
+        unlocking = false;
+        try { URL.revokeObjectURL(url); } catch (_) { /* gone */ }
+        if (el.src === url) { try { el.pause(); } catch (_) { /* ok */ } el.muted = false; }   // only while the silence is still on the element
+        if (epoch === lockEpoch) { unlocked = ok; changed(); }
+      };
+      if (p && typeof p.then === "function") p.then(() => end(true), (e) => end(!!e && e.name === "AbortError"));
+      else end(true);
+    } catch (_) { unlocking = false; /* a browser without media elements stays locked */ }
   }
+
+  // The page hid, or is going: nothing plays and the next reply asks for a tap.
+  function lock() { stop(); lockEpoch++; unlocked = false; unlocking = false; changed(); }
 
   function stop() {
     runId++;
+    queued = null;
     if (ctl) { try { ctl.abort(); } catch (_) { /* done */ } ctl = null; }
     try { if (window.speechSynthesis) window.speechSynthesis.cancel(); } catch (_) { /* none */ }
-    if (audioEl) { try { audioEl.pause(); } catch (_) { /* ok */ } audioEl.onended = null; audioEl.onerror = null; }
-    dropUrls();
+    const s = settleChunk;
+    if (s) s(false);
     if (playing) { playing = null; changed(); }
   }
 
-  function say(reply, text) { messages.set(key(reply), text || ""); changed(); }
+  function say(reply, text) { remember(messages, key(reply), text || ""); changed(); }
+  function sayIfNone(reply, text) { if (!messages.get(key(reply))) say(reply, text); }
 
-  function speakDevice(reply, text, me, speed) {
+  // Resolves a local voice, or null. The browser lists its voices late (Chrome fires voiceschanged), so it waits, bounded.
+  function waitForLocalVoice() {
+    const have = localVoice();
+    const ss = window.speechSynthesis;
+    if (have || !ss || typeof ss.addEventListener !== "function") return Promise.resolve(have);
     return new Promise((resolve) => {
-      if (!window.speechSynthesis || typeof SpeechSynthesisUtterance !== "function" || !text) { say(reply, WORDS.noSpeech); resolve(); return; }
+      let t = 0;
+      const done = () => { clearTimeout(t); ss.removeEventListener("voiceschanged", on); resolve(localVoice()); };
+      const on = () => { if (localVoice()) done(); };
+      ss.addEventListener("voiceschanged", on);
+      t = setTimeout(done, VOICE_WAIT_MS);
+    });
+  }
+
+  async function speakDevice(reply, text, me, speed) {
+    const ss = window.speechSynthesis;
+    if (!ss || typeof SpeechSynthesisUtterance !== "function") { sayIfNone(reply, WORDS.noSpeech); return; }
+    if (!text) { sayIfNone(reply, WORDS.nothing); return; }
+    const voice = await waitForLocalVoice();
+    if (me !== runId) return;
+    if (!voice) { sayIfNone(reply, WORDS.noLocal); return; }   // never speak(): a default voice may be network-backed
+    await new Promise((resolve) => {
       const u = new SpeechSynthesisUtterance(text);
+      u.voice = voice;
       u.rate = speed;
-      const voices = (window.speechSynthesis.getVoices && window.speechSynthesis.getVoices()) || [];
-      const local = voices.filter((v) => v.localService);   // on-device voices only: the free tier sends nothing anywhere
-      const pick = local.find((v) => /^en/i.test(v.lang || "")) || local[0];
-      if (pick) u.voice = pick;
       u.onend = u.onerror = () => resolve();
-      window.speechSynthesis.speak(u);
-    }).then(() => { if (me === runId) { playing = null; changed(); } });
+      ss.speak(u);
+    });
   }
 
   // One chunk from the one route. Resolves {blob, total} or {refused: {message, fallback}} or {aborted: true}.
@@ -140,30 +224,45 @@
         body: JSON.stringify({ room_thread_id: reply.thread, reply_gseq: reply.gseq, chunk,
                                provider: s.provider, voice: s.voice, speed: s.speed }),
       });
-    } catch (e) { return signal.aborted ? { aborted: true } : { refused: { message: WORDS.failed, fallback: "on_device" } }; }
+    } catch (e) { return signal.aborted ? { aborted: true } : { refused: { message: WORDS.failedDevice, fallback: "on_device" } }; }
     if (!res.ok) {
       let body = null;
       try { body = await res.json(); } catch (_) { body = null; }
+      const onDevice = !!body && body.fallback === "on_device";
       return { refused: { message: (body && typeof body.message === "string" && body.message) || WORDS.failed,
-                          fallback: body && body.fallback === "on_device" ? "on_device" : "" } };
+                          fallback: onDevice ? "on_device" : "" } };
     }
     try {
       return { blob: await res.blob(), total: Math.max(1, Number(res.headers.get("X-Voice-Chunks")) || 1) };
-    } catch (_) { return signal.aborted ? { aborted: true } : { refused: { message: WORDS.failed, fallback: "on_device" } }; }
+    } catch (_) { return signal.aborted ? { aborted: true } : { refused: { message: WORDS.failedDevice, fallback: "on_device" } }; }
   }
 
+  // One chunk on the element. Resolves true when it played to its end, false when it could not play or was stopped. Its blob
+  // URL is revoked the moment the chunk is over, however it ended, and stop() settles it, so no step is left waiting.
   function playBlob(blob, me) {
     return new Promise((resolve) => {
       if (me !== runId) { resolve(true); return; }
       if (!audioEl) audioEl = new Audio();
-      const url = URL.createObjectURL(blob);
-      urls.push(url);
-      audioEl.muted = false;
-      audioEl.onended = () => resolve(true);
-      audioEl.onerror = () => resolve(false);
-      audioEl.src = url;
-      const p = audioEl.play();
-      if (p && typeof p.catch === "function") p.catch(() => resolve(false));
+      const el = audioEl, url = URL.createObjectURL(blob);
+      let over = false;
+      const finish = (heard) => {
+        if (over) return;
+        over = true;
+        if (settleChunk === finish) settleChunk = null;
+        el.onended = null; el.onerror = null;
+        try { el.pause(); } catch (_) { /* ok */ }
+        try { URL.revokeObjectURL(url); } catch (_) { /* gone */ }
+        if (el.src === url) { try { el.removeAttribute("src"); el.load(); } catch (_) { /* ok */ } }
+        resolve(heard);
+      };
+      settleChunk = finish;
+      el.muted = false;
+      el.onended = () => finish(true);
+      el.onerror = () => finish(false);
+      el.src = url;
+      let p;
+      try { p = el.play(); } catch (_) { finish(false); return; }
+      if (p && typeof p.catch === "function") p.catch((e) => { if (!(e && e.name === "AbortError" && over)) finish(false); });
     });
   }
 
@@ -187,7 +286,7 @@
       if (me !== runId) return;
       if (!heard) { say(reply, i === 0 ? WORDS.cantPlay : WORDS.midway); break; }
     }
-    if (me === runId) { playing = null; changed(); }
+    if (me === runId && ctl) { try { ctl.abort(); } catch (_) { /* done */ } ctl = null; }   // a break leaves no chunk billed unheard
   }
 
   // Read one finished reply now: from the tap on its control, or from autoplay. A second call replaces the first.
@@ -195,12 +294,17 @@
     if (!reply || reply.thread === undefined || reply.gseq === undefined) return;
     stop();
     const me = runId;
-    const s = readSettings();
+    const s = effective();
     playing = { thread: reply.thread, gseq: reply.gseq };
     messages.delete(key(reply)); tapNeeded.delete(key(reply));
     changed();
-    if (s.tier === "premium" && s.provider) await playPremium(reply, me, s);
+    if (s.tier === "premium") await playPremium(reply, me, s);
     else await speakDevice(reply, reply.text || "", me, s.speed);
+    if (me !== runId) return;
+    playing = null; changed();
+    const q = queued;
+    queued = null;
+    if (q && !document.hidden && unlocked) play(q);
   }
 
   // The autoplay rule, in one place. Returns the decision as a word so the caller and the tests can see it.
@@ -208,11 +312,17 @@
     if (!reply || reply.thread === undefined || reply.gseq === undefined) return "ignored";
     const k = key(reply);
     if (seen.has(k)) return "seen";
-    seen.add(k);
+    remember(seen, k);
     if (!readSettings().autoplay) return "off";
     if (baseline === null || Number(reply.gseq) <= baseline) return "backlog";
     if (document.hidden) return "hidden";
-    if (!unlocked) { tapNeeded.add(k); changed(); return "tap"; }
+    if (!unlocked) { remember(tapNeeded, k); changed(); return "tap"; }
+    if (playing) {
+      if (queued) say(queued, WORDS.skipped);
+      queued = reply;
+      say(reply, WORDS.queued);
+      return "queued";
+    }
     play(reply);
     return "play";
   }
@@ -242,24 +352,31 @@
     });
     listeners.add(paint);
     paint();
-    wrap._unbind = () => listeners.delete(paint);
+    wrap._unbind = () => { listeners.delete(paint); messages.delete(k); tapNeeded.delete(k); };
     return wrap;
   }
 
-  // A hidden page reads nothing: the room view unmounts then, and a playing reply would otherwise carry on unseen.
-  document.addEventListener("visibilitychange", () => { if (document.hidden) stop(); });
+  // A hidden page reads nothing and locks: the room view unmounts then, and a playing reply would otherwise carry on unseen.
+  // Coming back, the first reply asks for a tap.
+  document.addEventListener("visibilitychange", () => { if (document.hidden) lock(); });
+  window.addEventListener("pagehide", lock);
 
   window.LevainVoice = {
     SAMPLE, WORDS, DEFAULTS,
-    settings: readSettings, saveSettings: writeSettings,
+    settings: readSettings, saveSettings: writeSettings, effective, offer,
     unlock, stop, play, arm, replyFinished, button,
     isUnlocked: () => unlocked,
+    noteFor: (reply) => messages.get(key(reply)) || "",
+    sizes: () => ({ seen: seen.size, tapNeeded: tapNeeded.size, messages: messages.size }),
     onChange: (f) => { listeners.add(f); return () => listeners.delete(f); },
-    sampleDevice: function () {
+    sampleDevice: async function () {
+      const reply = { thread: "sample", gseq: 0 };
       unlock();
       stop();
+      messages.delete(key(reply));
       const me = runId, s = readSettings();
-      return speakDevice({ thread: "sample", gseq: 0 }, SAMPLE, me, s.speed);
+      await speakDevice(reply, SAMPLE, me, s.speed);
+      changed();
     },
   };
 })();

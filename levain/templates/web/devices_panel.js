@@ -1350,7 +1350,7 @@
   // nothing here writes to the server. The block reads GET /cockpit/voice.json once when the page opens; a cockpit that does
   // not serve it (404, no key set up) shows no block. voice.js is loaded only then, so a page without voice never fetches it.
   // A key is set on the laptop and revoked beside the grants; this block only says which keys are set.
-  let vcPanel = null, vcBody = null, vcState = null;
+  let vcPanel = null, vcBody = null, vcState = null, vcFocus = "";
   function buildVoice() {
     vcPanel = el("div", "panel k-list dev-panel vc-panel");
     vcPanel.dataset.modes = ALL_MODES;
@@ -1372,17 +1372,30 @@
       document.head.appendChild(s);
     });
   }
+  // The probe asks once at start and again, bounded, where the first ask could not have worked: a 403 before the page stored
+  // its write token, a gate 503, a network failure. A 404 (no voice on this cockpit) or an answer is final. It re-asks after
+  // the token look in start(), and when the page is focused or shown again.
+  let vcDone = false, vcBusy = false, vcTries = 0;
+  const VC_MAX_TRIES = 6;
   async function voiceProbe() {
-    let state = null;
+    if (vcDone || vcBusy || vcTries >= VC_MAX_TRIES) return;
+    vcBusy = true; vcTries++;
+    let state = null, final = false;
     try {
       const res = await api("GET", "/cockpit/voice.json", undefined, READ_TIMEOUT_MS);
       if (res && res.status === 200 && res.data && Array.isArray(res.data.providers)) state = res.data;
+      else if (res && res.status === 404) final = true;
     } catch (_) { state = null; }
-    if (!state || !(await vcLoadScript())) return;
-    vcState = state;
-    paintVoice();
-    vcPanel.hidden = false;
-    syncSection();
+    if (state && (await vcLoadScript())) {
+      vcDone = true; vcBusy = false;
+      vcState = state;
+      paintVoice();
+      vcPanel.hidden = false;
+      syncSection();
+      return;
+    }
+    vcBusy = false;
+    if (final) vcDone = true;
   }
   function vcRow(label, control, help) {
     const r = el("div", "dev-row vc-row");
@@ -1393,20 +1406,26 @@
     return { row: r, label: lab };
   }
   function paintVoice() {
-    const V = window.LevainVoice, st = V.settings();
+    const V = window.LevainVoice;
     vcBody.replaceChildren();
     const ready = vcState.providers.filter((p) => p.key === "set" && Array.isArray(p.uses) && p.uses.indexOf("tts") >= 0);
-    // a stored provider that has no live key is not honoured: reading falls back to the on-device voice, and the block says so
-    const prov = ready.find((p) => p.name === st.provider) || ready[0] || null;
-    const premium = st.tier === "premium" && !!prov;
-    const rerun = (patch) => { V.saveSettings(patch); paintVoice(); };
+    V.offer(ready);                     // the player reads the same list, so what is shown here is what it will use
+    const eff = V.effective(), st = V.settings();
+    const prov = ready.find((p) => p.name === eff.provider) || ready[0] || null;
+    const premium = eff.tier === "premium" && !!prov;
+    // the shown provider, voice and speed are STORED, so the next Play sends what this block shows
+    if (premium && (st.provider !== eff.provider || st.voice !== eff.voice || st.speed !== eff.speed)) {
+      V.saveSettings({ provider: eff.provider, voice: eff.voice, speed: eff.speed });
+    }
+    const focusId = vcFocus; vcFocus = "";
+    const rerun = (patch, id) => { vcFocus = id; V.saveSettings(patch); paintVoice(); };
 
     const tier = el("select", "dev-label vc-tier"); tier.id = "vc-tier";
     tier.appendChild(new Option("On-device voice", "device"));
     const po = new Option("Premium voice", "premium"); po.disabled = !prov;
     tier.appendChild(po);
     tier.value = premium ? "premium" : "device";
-    tier.addEventListener("change", () => rerun(tier.value === "premium" ? { tier: "premium", provider: (prov || {}).name || "" } : { tier: "device" }));
+    tier.addEventListener("change", () => rerun(tier.value === "premium" ? { tier: "premium", provider: (prov || {}).name || "" } : { tier: "device" }, "vc-tier"));
     const t = vcRow("Read aloud with", tier, prov ? "" : "Premium voice needs a key. Set one on the laptop with: levain voice key add <provider>");
     t.label.htmlFor = "vc-tier";
     vcBody.appendChild(t.row);
@@ -1415,7 +1434,7 @@
       const ps = el("select", "dev-label vc-provider"); ps.id = "vc-provider";
       for (const p of ready) ps.appendChild(new Option(p.name.charAt(0).toUpperCase() + p.name.slice(1), p.name));
       ps.value = prov.name;
-      ps.addEventListener("change", () => rerun({ provider: ps.value, voice: "" }));
+      ps.addEventListener("change", () => rerun({ provider: ps.value, voice: "" }, "vc-provider"));
       const pr = vcRow("Provider", ps, prov.retention || "");
       pr.label.htmlFor = "vc-provider";
       vcBody.appendChild(pr.row);
@@ -1423,7 +1442,7 @@
       const vs = el("select", "dev-label vc-voice"); vs.id = "vc-voice";
       const voices = Array.isArray(prov.voices) ? prov.voices : [];
       for (const v of voices) vs.appendChild(new Option(v, v));
-      vs.value = voices.indexOf(st.voice) >= 0 ? st.voice : prov.default_voice;
+      vs.value = voices.indexOf(eff.voice) >= 0 ? eff.voice : prov.default_voice;
       vs.addEventListener("change", () => V.saveSettings({ voice: vs.value }));
       const vr = vcRow("Voice (" + voices.length + ")", vs);
       vr.label.htmlFor = "vc-voice";
@@ -1431,7 +1450,7 @@
 
       const lo = Array.isArray(prov.speed) ? Number(prov.speed[0]) : 0.5, hi = Array.isArray(prov.speed) ? Number(prov.speed[1]) : 2;
       const sp = el("input", "vc-speed"); sp.id = "vc-speed"; sp.type = "range"; sp.min = String(lo); sp.max = String(hi); sp.step = "0.05";
-      sp.value = String(Math.min(hi, Math.max(lo, st.speed)));
+      sp.value = String(Math.min(hi, Math.max(lo, eff.speed)));
       const sv = el("span", "vc-speed-val", Number(sp.value).toFixed(2) + "x");
       sp.addEventListener("input", () => { sv.textContent = Number(sp.value).toFixed(2) + "x"; });
       sp.addEventListener("change", () => V.saveSettings({ speed: Number(sp.value) }));
@@ -1455,19 +1474,23 @@
 
     // the sample is the on-device voice: the premium route reads only words already in the room, never a sentence the page sends
     const hear = el("button", "dev-btn vc-hear", "Hear the on-device voice"); hear.type = "button";
-    hear.addEventListener("click", () => { V.sampleDevice(); });
-    const hr = el("div", "dev-row vc-row"); hr.appendChild(hear);
+    const hearNote = el("p", "dev-note vc-help vc-hearnote");
+    hearNote.setAttribute("role", "status"); hearNote.hidden = true;
+    const showHear = () => { const m = V.noteFor({ thread: "sample", gseq: 0 }); hearNote.textContent = m; hearNote.hidden = !m; };
+    hear.addEventListener("click", () => { showHear(); V.sampleDevice().then(showHear, showHear); });
+    const hr = el("div", "dev-row vc-row"); hr.appendChild(hear); hr.appendChild(hearNote);
     if (prov) hr.appendChild(el("p", "dev-note vc-help", "To hear the premium voice, tap Play on a room reply."));
     vcBody.appendChild(hr);
 
     // keys and the estimated spend: read only
     const keys = vcState.providers.map((p) => p.name + ": " + (p.key === "set" ? "key set" : "no key")).join(" · ");
     vcBody.appendChild(el("p", "dev-note vc-keys", "Keys: " + keys + ". Revoke a key beside its grant."));
-    const caps = vcState.caps;
+    const caps = vcState.caps, n = (v) => (v === null || v === undefined ? "?" : v);
     if (caps && caps.spent_month_est !== null && caps.spent_month_est !== undefined) {
-      vcBody.appendChild(el("p", "dev-note vc-caps", "Estimated spend: $" + caps.spent_day_est + " today of a $" + caps.day_usd +
-        " cap, $" + caps.spent_month_est + " this month of $" + caps.month_usd + ". An estimate; the provider's bill is the truth."));
+      vcBody.appendChild(el("p", "dev-note vc-caps", "Estimated spend: $" + n(caps.spent_day_est) + " today of a $" + n(caps.day_usd) +
+        " cap, $" + caps.spent_month_est + " this month of $" + n(caps.month_usd) + ". An estimate; the provider's bill is the truth."));
     }
+    if (focusId) { const f = document.getElementById(focusId); if (f) f.focus(); }
   }
 
   function start() {
@@ -1476,7 +1499,9 @@
     refresh();
     readPresence();
     // The cockpit stores its token a moment after load when the link carried one; look again, then keep a slow pulse.
-    setTimeout(() => { refresh(); readPresence(); }, 2500);
+    setTimeout(() => { refresh(); readPresence(); voiceProbe(); }, 2500);
+    window.addEventListener("focus", voiceProbe);
+    document.addEventListener("visibilitychange", () => { if (!document.hidden) voiceProbe(); });
     // The Follow line is the server's one derivation, re-read while the page is visible so a second cockpit (a phone's) never
     // keeps a state the laptop's already left: on a short pulse, when the tab comes back, and when the window gains focus.
     const reread = () => { if (!document.hidden && !prGone && !prBusy) readPresence(); };

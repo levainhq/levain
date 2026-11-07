@@ -57,8 +57,11 @@ def _init(fixture: dict[str, Any] | None) -> str:
   HTMLMediaElement.prototype.play = function () { window.__plays.push({ muted: this.muted, src: this._s || '' }); window.__cur = this; return Promise.resolve(); };
   HTMLMediaElement.prototype.pause = function () {};
   window.__end = () => { const e = window.__cur; if (e && e.onended) e.onended(); };
+  // the output device: one on-device voice (a real SpeechSynthesisVoice cannot be built, so the utterance is a plain class too)
+  window.SpeechSynthesisUtterance = class { constructor(t) { this.text = t; this.voice = null; this.rate = 1; } };
   Object.defineProperty(window, 'speechSynthesis', { configurable: true, value: {
-    speak(u) { if (u.text) window.__spoken.push(u.text); }, cancel() { window.__cancels++; }, getVoices() { return []; } } });
+    speak(u) { if (u.text) window.__spoken.push(u.text); }, cancel() { window.__cancels++; },
+    getVoices() { return [{ name: 'local-en', lang: 'en-US', localService: true }]; } } });
 })();
 """ % json.dumps(fixture)
 
