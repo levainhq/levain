@@ -4,7 +4,7 @@
 class LevainMicTap extends AudioWorkletProcessor {
   process(inputs) {
     const ch = inputs[0] && inputs[0][0];
-    if (ch && ch.length) this.port.postMessage(ch.slice(0));
+    if (ch && ch.length) { const c = ch.slice(0); this.port.postMessage(c, [c.buffer]); }   // the one copy, then handed over
     return true;
   }
 }

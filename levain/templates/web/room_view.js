@@ -570,9 +570,17 @@
     function clearDraft(text) {
       if (!stopped && ta.value === text) { ta.value = ""; try { if (store) store.removeItem("levain.room.draft"); } catch (e) { /* no storage */ } }
     }
-    function endStream() { if (live) { live = false; if (LM.active()) LM.stop(); } }
+    // Send while the mic is open waits for the session to finalise (the close's text is drawn by onFinal), then sends THAT text:
+    // a truncated transcript is never sent silently.
+    var sendWait = false;
+    function endStream() { return live && LM.active() ? Promise.resolve(LM.stop()).then(null, function () {}) : Promise.resolve(); }
     sendB.addEventListener("click", function () {
-      endDictation(); endStream();
+      endDictation();
+      if (sendWait) return;
+      if (live && LM.active()) { sendWait = true; endStream().then(function () { sendWait = false; if (!stopped) doSend(); }); return; }
+      doSend();
+    });
+    function doSend() {
       var text = ta.value;
       if (!current || !current.thread || !text.trim() || sendB.disabled || flight.send) return;
       voiceTap();
@@ -590,7 +598,7 @@
         note.textContent = "The server could not be reached; the line may or may not have been sent. Sending again will not duplicate it.";
         paintDock();
       });
-    });
+    }
     openB.addEventListener("click", function () {
       if (openB.disabled || flight.open) return;
       flight.open = true; paintDock(); note.textContent = "Opening the room...";
@@ -655,6 +663,7 @@
       ta.addEventListener("input", function () { if (rec) { dbase = ta.value; heard = lastHeard; } });
       micB.addEventListener("click", function () {
         voiceTap();
+        if (live) return;                              // the streaming mic holds the box and the microphone: Stop mic first
         if (rec) { endDictation(); return; }
         var r = new Speech();
         dbase = ta.value ? ta.value.replace(/\s*$/, " ") : ""; heard = ""; lastHeard = "";
@@ -701,17 +710,17 @@
       mOff.push(LM.onPartial(drawStream));
       mOff.push(LM.onFinal(function (txt) { drawStream(txt); live = false; }));
       mOff.push(LM.onNote(function (s) { if (!stopped && live) note.textContent = s; }));
-      mOff.push(LM.onEnd(function () { live = false; streamB.textContent = "Mic"; }));
-      Promise.resolve(LM.probe()).then(function (ok) { if (!stopped && ok === true && LM.available()) streamB.hidden = false; }, function () {});
+      mOff.push(LM.onEnd(function () { live = false; ta.readOnly = false; streamB.textContent = "Mic"; }));
+      Promise.resolve().then(function () { return LM.probe(); }).then(function (ok) { if (!stopped && ok === true && LM.available()) streamB.hidden = false; }, function () {});
       streamB.addEventListener("click", function () {
         voiceTap();
-        if (live) { streamB.textContent = "Mic"; LM.stop(); return; }
+        if (live) { streamB.textContent = "Mic"; endStream(); return; }
         if (LM.active()) return;                         // the last session is still closing
         endDictation();
         sbase = ta.value ? ta.value.replace(/\s*$/, " ") : "";
-        live = true; streamB.textContent = "Stop mic";
+        live = true; ta.readOnly = true; streamB.textContent = "Stop mic";     // read-only: a partial redraws the whole box
         LM.start();                                     // inside this tap: the permission and the audio context are asked for here
-        if (!LM.active()) { live = false; streamB.textContent = "Mic"; }
+        if (!LM.active()) { live = false; ta.readOnly = false; streamB.textContent = "Mic"; }
       });
     }
 
@@ -830,7 +839,7 @@
     paintDock();
     pull().then(loop);
     return { stop: function () {
-      stopped = true; clearTimeout(timer); endDictation(); endStream(); mOff.forEach(function (o) { o(); }); voiceEnd(); if (root.removeEventListener) root.removeEventListener("resize", onResize);
+      stopped = true; clearTimeout(timer); endDictation(); endStream(); ta.readOnly = false; mOff.forEach(function (o) { o(); }); voiceEnd(); if (root.removeEventListener) root.removeEventListener("resize", onResize);
       if (onHidden) doc.removeEventListener("visibilitychange", onHidden);
       if (onBlur && root.removeEventListener) root.removeEventListener("blur", onBlur);
       if (vv) {
