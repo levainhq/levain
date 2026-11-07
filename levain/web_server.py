@@ -1267,6 +1267,8 @@ _ASSETS: dict[str, tuple[str, str]] = {
     # Reading the room aloud (voice V1-5): the player, the per-reply control and the settings store. Loaded by the Voice
     # block once /cockpit/voice.json answers; it calls POST /cockpit/voice/speak and no other route.
     "/voice.js": ("voice.js", "text/javascript; charset=utf-8"),
+    # A Needs-you card read aloud (voice V1-7): the card script (the NPCardVoice port) and the speaker on the card.
+    "/card_voice.js": ("card_voice.js", "text/javascript; charset=utf-8"),
     # Streaming dictation (cockpit mic S4): the capture module and its AudioWorklet processor (a worklet is loaded by URL, so it is
     # its own asset). Shown only when GET /cockpit/voice.json says {"stream": true}.
     "/mic.js": ("mic.js", "text/javascript; charset=utf-8"),
@@ -3929,7 +3931,8 @@ class _Handler(GuardedHandler):
                 # the queue the phone's grant routes revoke through; None when none are served (no key is then read)
                 "revoke_queue": srv.grant_phone.queue_dir if srv.grant_phone is not None else None}
             if speak:
-                return cockpit_voice.speak(data_root, srv.chat_service, raw, directory=self._room_directory(directory), **common)
+                return cockpit_voice.speak(data_root, srv.chat_service, raw, directory=self._room_directory(directory),
+                                           question_store=getattr(srv, "question_store", None), **common)
             query = self.path.split("?", 1)[1] if "?" in self.path else ""
             return cockpit_voice.transcribe(data_root, query, self.headers.get("Content-Type", ""), raw, **common)
         finally:

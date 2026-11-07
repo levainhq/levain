@@ -6406,6 +6406,9 @@
     Promise.resolve(questionBody(q, card)).then((b) => {
       if (!b) return;
       drawQuestionBody(q, slot, b, card, settled);
+      // V1-7: the speaker that reads the card aloud (card_voice.js); absent when the page has no player or the card has no words
+      const CV = window.LevainCardVoice, sp = CV && !b.error ? CV.speaker(String(q.id || ""), b) : null;
+      if (sp) card.insertBefore(sp, slot);
       if (!b.error && !settled) card.appendChild(needsDetails([copyLine("levain question show " + q.n, "show command")], ""));
     });
     return card;
@@ -9063,6 +9066,7 @@ for (const type of ["touchstart", "wheel", "pointerdown", "click", "keydown"]) d
       const it = needsWaiting(needsItems(lines)).find((x) => needsItemMatch(x, item));
       if (it) {
         if (document.querySelector(PHONE_JUMP_TARGET.needs)) needsGo(needsIdOf(it), true);
+        if (window.LevainCardVoice) window.LevainCardVoice.opened(needsIdOf(it));   // V1-7: this card came from a notification
         openNeedsFocus(it, null);
         return;
       }
@@ -9098,6 +9102,7 @@ for (const type of ["touchstart", "wheel", "pointerdown", "click", "keydown"]) d
       };
       const open = (hit) => {
         if (document.querySelector(PHONE_JUMP_TARGET.needs)) needsGo(needsIdOf(hit), true);
+        if (window.LevainCardVoice) window.LevainCardVoice.opened(needsIdOf(hit));   // V1-7: this card came from a notification
         openNeedsFocus(hit, null);
       };
       const second = (retries) => {

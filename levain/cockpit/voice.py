@@ -47,6 +47,7 @@ from pathlib import Path
 from typing import Any, NamedTuple
 
 from levain.authority import voice_key_for
+from levain.cockpit import card_script
 from levain.cockpit import room as cockpit_room
 from levain.voice import custody
 from levain.voice import meter as vmeter
@@ -86,6 +87,9 @@ SPEAK_KEYS = frozenset({"room_thread_id", "reply_gseq", "chunk", "provider", "vo
 # The settings block's premium test: no room, no reply. The words are THIS constant (the page sends none), so the route
 # still never speaks a sentence the page chose.
 SAMPLE_KEYS = frozenset({"sample", "provider", "voice", "speed"})
+# V1-7: a Needs-you card read aloud. The page names the card (``question:<n>``); the words are card_script's, built from the
+# filed question, never from the body.
+CARD_KEYS = frozenset({"card_id", "chunk", "provider", "voice", "speed"})
 SAMPLE_WORDS = "This is how your room will sound."
 LAST_READ_STATES = frozenset({"keychain_unreadable", "unusable", "refused", "authority_unreadable"})
 
@@ -173,6 +177,9 @@ WORDS = {
     "no_dictation": "{p} reads aloud only; it does not offer dictation.",
     "bad_reply": "reply_gseq names the reply by its number.",
     "bad_chunk": "chunk is a whole number, 0 or more.",
+    "bad_card": "card_id names the card as question:<number>.",
+    "no_card": "That card is not here.",
+    "card_nothing": "That card has nothing to read aloud.",
     "bad_voice": "That voice is not offered for {p}.",
     "bad_speed": "That speed is outside what {p} accepts.",
     "bad_query": "Name the provider, and only the provider, in the query.",
@@ -511,7 +518,8 @@ def _parse_speak(raw: bytes) -> tuple[dict[str, Any] | None, Answer | None]:
     except (ValueError, UnicodeDecodeError):
         return None, refusal(400, "bad_json", "bad_json")
     sample = isinstance(req, dict) and set(req) == SAMPLE_KEYS and req["sample"] is True
-    if not sample and (not isinstance(req, dict) or set(req) != SPEAK_KEYS):
+    card = isinstance(req, dict) and set(req) == CARD_KEYS
+    if not sample and not card and (not isinstance(req, dict) or set(req) != SPEAK_KEYS):
         return None, refusal(400, "bad_request", "bad_keys")
     provider = req["provider"]
     if isinstance(provider, str) and provider in UNSUPPORTED:
@@ -524,7 +532,10 @@ def _parse_speak(raw: bytes) -> tuple[dict[str, Any] | None, Answer | None]:
     if sample:
         req = {**req, "chunk": 0}
     else:
-        if isinstance(req["reply_gseq"], bool) or not isinstance(req["reply_gseq"], int):
+        if card:
+            if not isinstance(req["card_id"], str) or not card_script.CARD_ID.fullmatch(req["card_id"]):
+                return None, refusal(400, "bad_request", "bad_card")
+        elif isinstance(req["reply_gseq"], bool) or not isinstance(req["reply_gseq"], int):
             return None, refusal(400, "bad_request", "bad_reply")
         chunk = req["chunk"]
         if isinstance(chunk, bool) or not isinstance(chunk, int) or chunk < 0:
@@ -539,8 +550,11 @@ def _parse_speak(raw: bytes) -> tuple[dict[str, Any] | None, Answer | None]:
 
 def speak(data_root: Path | str, service: Any, raw: bytes, *, directory: Path | str,
           revoke_queue: Path | str | None, meter: vmeter.Meter, transport: vprov.Transport,
-          read_key: Callable[..., Any], last_read: MutableMapping[str, str | None]) -> Answer:
-    """``POST /cockpit/voice/speak``: chunk ``chunk`` of the room reply that ended at ``reply_gseq``, as mp3. The words
+          read_key: Callable[..., Any], last_read: MutableMapping[str, str | None],
+          question_store: Any = None) -> Answer:
+    """``POST /cockpit/voice/speak``: chunk ``chunk`` of the room reply that ended at ``reply_gseq``, as mp3. A body naming
+    ``card_id`` (``question:<n>``) instead reads that filed question as the card script (V1-7, ``question_store``: the words
+    are :mod:`card_script`'s over the filed question). The words
     are only the record's (``reply_text`` over the open room's stream, then ``speakable``); a body naming any other key
     is refused. ``directory`` is the store directory the room is read from; ``revoke_queue`` the grant routes' queue
     (:func:`revoke_refusal`). Both keyword-only, like :func:`transcribe`'s: two paths never swap by position."""
@@ -551,7 +565,8 @@ def speak(data_root: Path | str, service: Any, raw: bytes, *, directory: Path | 
     if req.get("sample") is True:
         chunks = [SAMPLE_WORDS]
     else:
-        chunks, refused = _reply_chunks(directory, service, req)
+        chunks, refused = (_card_chunks(question_store, req) if "card_id" in req
+                           else _reply_chunks(directory, service, req))
         if refused is not None or chunks is None:
             return refused or internal_answer()
     words = chunks[req["chunk"]]
@@ -588,6 +603,25 @@ def _reply_chunks(directory: Path | str, service: Any, req: dict[str, Any]) -> t
     chunks = speakable(text)
     if not chunks:
         return None, refusal(404, "nothing_to_read", "nothing_to_read")
+    if not req["chunk"] < len(chunks):
+        return None, refusal(404, "no_such_chunk", "no_such_chunk", chunks=len(chunks))
+    return chunks, None
+
+
+def _card_chunks(store: Any, req: dict[str, Any]) -> tuple[list[str] | None, Answer | None]:
+    """The speakable chunks of the filed question ``req["card_id"]`` names, or the refusal. The words are the record's."""
+    m = card_script.CARD_ID.fullmatch(req["card_id"])
+    if store is None or m is None:
+        return None, refusal(404, "not_found", "no_card")
+    try:
+        q = store.get(int(m.group(1)))
+    except Exception:            # noqa: BLE001 - a store that cannot be read is fixed words, never its detail
+        return None, refusal(500, "internal", "room_unreadable")
+    if q is None:
+        return None, refusal(404, "not_found", "no_card")
+    chunks = speakable(card_script.question_script(q))
+    if not chunks:
+        return None, refusal(404, "nothing_to_read", "card_nothing")
     if not req["chunk"] < len(chunks):
         return None, refusal(404, "no_such_chunk", "no_such_chunk", chunks=len(chunks))
     return chunks, None

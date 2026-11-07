@@ -271,8 +271,8 @@
     try {
       res = await fetch(SPEAK_PATH, {
         method: "POST", headers: headers(true), signal,
-        body: JSON.stringify({ room_thread_id: reply.thread, reply_gseq: reply.gseq, chunk,
-                               provider: s.provider, voice: s.voice, speed: s.speed }),
+        body: JSON.stringify(Object.assign(reply.card ? { card_id: reply.card } : { room_thread_id: reply.thread, reply_gseq: reply.gseq },
+                                           { chunk, provider: s.provider, voice: s.voice, speed: s.speed })),
       });
     } catch (e) { return signal.aborted ? { aborted: true } : { refused: { message: WORDS.failedDevice, fallback: "on_device" } }; }
     if (!res.ok) {
