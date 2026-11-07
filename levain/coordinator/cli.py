@@ -389,7 +389,10 @@ def _threads_line(store: EnvelopeStore | None, thread_id: str, rev: int | None) 
     return f"    {thread_id} rev {rev if rev is not None else '?'}{title}"
 
 
-def _effect_text(kind: str, e: dict[str, Any]) -> str:
+def _effect_text(kind: str, e: dict[str, Any], stop_at: str | None = None) -> str:
+    if kind == "launches":
+        until = "" if stop_at is None else " until " + parse_stamp(stop_at).astimezone().strftime("%Y-%m-%d %H:%M %Z")
+        return f"{e['repo']}  may launch up to {e['count']} seats in {e['repo']}{until}"
     if kind == "lands":
         crit = ", ".join(json.dumps(c, sort_keys=True) for c in e["criteria"])
         # onto_from is signed: an inferred branch says so in the words read before signing (C0 §1, his 10-20 item 1)
@@ -402,27 +405,29 @@ def _effect_text(kind: str, e: dict[str, Any]) -> str:
 
 
 _EFFECT_HEAD = {"lands": "lands (merges) it may do:", "pushes": "pushes it may do:",
-                "publishes": "publishes it may do:"}
+                "publishes": "publishes it may do:", "launches": "launches (seats) it may do:"}
 
 
 def _effects(body: dict[str, Any], old: dict[str, Any] | None) -> list[str]:
     """The effect lists; against ``old`` (the envelope this supersedes) each line is marked + added, = unchanged,
     ~ changed (same target, other criteria), and what ``old`` held and this does not is - removed."""
     L: list[str] = []
-    for kind in env.EFFECT_LISTS:
+    for kind in env.GRANT_LISTS:
+        if kind == env.LAUNCH_LIST and not body.get(kind) and not (old is not None and old.get(kind)):
+            continue          # no grant, no line: a no-launch envelope reads as it always did
         L.append("  " + _EFFECT_HEAD[kind])
-        before = {env.effect_key(kind, e): e for e in old[kind]} if old is not None else {}
+        before = {env.effect_key(kind, e): e for e in old.get(kind, [])} if old is not None else {}
         now_keys = set()
-        for e in body[kind]:
+        for e in body.get(kind, []):
             key = env.effect_key(kind, e)
             now_keys.add(key)
             mark = "" if old is None else "+ added: " if key not in before else \
                 "= unchanged: " if before[key] == e else "~ changed: "
-            L.append(f"    {mark}{_effect_text(kind, e)}")
+            L.append(f"    {mark}{_effect_text(kind, e, body['stop_at'])}")
         for key, e in before.items():
             if key not in now_keys:
-                L.append(f"    - removed: {_effect_text(kind, e)}")
-        if not body[kind] and not any(k not in now_keys for k in before):
+                L.append(f"    - removed: {_effect_text(kind, e, old['stop_at'])}")
+        if not body.get(kind) and not any(k not in now_keys for k in before):
             L.append("    none")
     return L
 
@@ -726,6 +731,8 @@ def run_envelope_extend(args: argparse.Namespace, out: Any) -> int:
             "supersedes": {"envelope_id": head.envelope_id, "digest": head.digest, "seen": seen},
             "draft": None, "where": eff["where"], "lands": eff["lands"], "pushes": eff["pushes"], "publishes": eff["publishes"],
             "budget": new_budget, "stop_at": eff["stop_at"], "issued_at": utc_stamp(now)}
+    if eff.get(env.LAUNCH_LIST):          # extend keeps what the head holds, a launch grant included
+        body[env.LAUNCH_LIST] = eff[env.LAUNCH_LIST]
     text = canonical(body)
     store.check_body(text)
     with read_transaction(store._connect) as conn:
@@ -842,7 +849,7 @@ def run_envelope_accept(args: argparse.Namespace, out: Any) -> int:
     return 0
 
 
-_SPEC_KEYS = {"where", "lands", "pushes", "publishes", "budget", "stop"}
+_SPEC_KEYS = {"where", "lands", "pushes", "publishes", "launches", "budget", "stop"}
 
 
 def _spec_list(spec: dict[str, Any], key: str) -> list[Any]:
@@ -884,6 +891,10 @@ def _spec_body(spec: Any, words: str, source: Source, store: EnvelopeStore) -> d
     pushes = [{**p, "repo": _real(p["repo"])} if isinstance(p, dict) and isinstance(p.get("repo"), str) else p
               for p in _spec_list(spec, "pushes")]
     publishes = _spec_list(spec, "publishes")
+    # the optional launch grant: written into the body only when named (absent = none, the bytes a no-grant envelope
+    # always had); each entry's shape and bounds are parse_body's, so compose and verify refuse in the same words
+    launches = [{**x, "repo": _real(x["repo"])} if isinstance(x, dict) and isinstance(x.get("repo"), str) else x
+                for x in _spec_list(spec, "launches")]
     given = spec.get("budget", {})
     if not isinstance(given, dict):
         raise CoordError("budget in an envelope spec is an object")
@@ -892,11 +903,14 @@ def _spec_body(spec: Any, words: str, source: Source, store: EnvelopeStore) -> d
     if not isinstance(stop, str):
         raise CoordError('stop is a duration text like "2h"')
     now = _tick().replace(microsecond=0)
-    return {"format": env.BODY_FORMAT, "store_id": store.store_id(), "envelope_id": "ev-" + secrets.token_hex(16),
+    body = {"format": env.BODY_FORMAT, "store_id": store.store_id(), "envelope_id": "ev-" + secrets.token_hex(16),
             "origin": "structured", "drop_id": "dr-" + secrets.token_hex(16), "words_sha256": words_sha256(words),
             "binds": [], "supersedes": None, "draft": None, "where": where, "lands": lands, "pushes": pushes,
             "publishes": publishes, "budget": budget, "stop_at": utc_stamp(now + _parse_stop(stop)),
             "issued_at": utc_stamp(now)}
+    if launches:
+        body[env.LAUNCH_LIST] = launches
+    return body
 
 
 def _drop_with_envelope(args: argparse.Namespace, out: Any, store: EnvelopeStore, words: str, source: Source) -> int:
@@ -990,8 +1004,8 @@ def _show(args: argparse.Namespace, out: Any, store: EnvelopeStore, stored: Any,
         else:
             text.append(f"thread {t} (as narrowed):")
             text += _describe(eff, store, binds=False)
-            for k in env.EFFECT_LISTS:
-                text += [f"    {k[:-1]} identity: {env.effect_identity(k, e)}" for e in eff[k]]
+            for k in env.GRANT_LISTS:
+                text += [f"    {k[:-1]} identity: {env.effect_identity(k, e)}" for e in eff.get(k, [])]
         text += [f"  live: {_label(live)}", f"  authority today: {now}"]
         rows.append({"thread_id": t, "effective": eff, "live": live, "authority_today": now,
                      "ended": ends[t]})

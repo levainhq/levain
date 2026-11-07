@@ -179,6 +179,8 @@ def narrow_scope(scope: Mapping[str, Any], ceiling: Mapping[str, Any]) -> dict[s
         if paths:
             where.append({"repo": w["repo"], "paths": paths})
     out["where"] = where
+    if env.LAUNCH_LIST in out:
+        out[env.LAUNCH_LIST] = []     # a role's scope never inherits the operator's launch grant
     for kind in env.EFFECT_LISTS:
         named = set(ceiling.get(kind, ()))
         out[kind] = [e for e in scope.get(kind, []) if _effect_target(kind, e) in named]
@@ -596,7 +598,7 @@ class EnvelopeStore(CoordStore):
                 raise CoordError("stop_earlier names a time before the envelope's current stop (a later one is a "
                                  "widening, which needs a new signed envelope)")
         else:
-            identities = {env.effect_identity(k, e) for k in env.EFFECT_LISTS for e in stored.body[k]}
+            identities = {env.effect_identity(k, e) for k in env.GRANT_LISTS for e in stored.body.get(k, [])}
             if value not in identities:
                 raise CoordError("drop_effect names an effect identity the signed envelope holds")
             if ("drop_effect", value) in rows:
@@ -658,10 +660,16 @@ class EnvelopeStore(CoordStore):
         rows = cls._attenuations(conn, envelope_id, thread_id)
         out = dict(stored.body)
         if any(k in ("kill", "thread_done") for k, _v in rows):
-            return {**out, "where": [], **{k: [] for k in env.EFFECT_LISTS}, "stop_at": out["issued_at"]}
+            killed = {**out, "where": [], **{k: [] for k in env.EFFECT_LISTS}, "stop_at": out["issued_at"]}
+            if env.LAUNCH_LIST in out:
+                killed[env.LAUNCH_LIST] = []
+            return killed
         dropped = {v for k, v in rows if k == "drop_effect"}
         for k in env.EFFECT_LISTS:
             out[k] = [e for e in stored.body[k] if env.effect_identity(k, e) not in dropped]
+        if env.LAUNCH_LIST in out:
+            out[env.LAUNCH_LIST] = [e for e in out[env.LAUNCH_LIST]
+                                    if env.effect_identity(env.LAUNCH_LIST, e) not in dropped]
         out["stop_at"] = utc_stamp(cls._stop(stored, rows))
         return out
 

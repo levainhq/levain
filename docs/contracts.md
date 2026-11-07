@@ -318,3 +318,22 @@ a new tag. anneal reads `expect.levain` as the verdict and ignores `expect.upstr
 - `sshsig` (2): `signed-data-fixed-message`, `embedded-key-not-device-fp-refused`
 - `witness` (5): `old-size-0-with-proof-refused`, `old-above-new-refused`, `sixty-four-proof-lines-refused`, `size-0-non-empty-root-refused`, `proof-hash-31-bytes-refused`
 <!-- /vectors-by-kind -->
+
+## The thread envelope's `launches` grant
+
+A thread envelope (`levain-thread-envelope/2`) names what a coordinator may do: `where`, then the effect lists `lands`, `pushes`
+and `publishes`. It may also carry one optional key, `launches`: a list of `{"repo": ..., "count": N}`, one entry per repo,
+that lets the flow desk start up to N seats in that repo without asking again, until the envelope's stop. The repo must be one of
+the envelope's `where` repos, `count` is a whole number from 1 to 4 (the default offered is 2), and a repo is named once.
+
+- **Absent means no grant.** The key is left out of the body unless it is named, so an envelope signed before it existed has the
+  same bytes, digest and signature as it always did and still verifies. The format stays `/2`. An older levain refuses a body
+  that carries `launches` (its key-set check is exact), which fails closed.
+- **It is not an effect.** `launches` is not in the lists a role ceiling narrows by; a role's scope cut from an envelope always has
+  `launches: []`, and a seat lease never carries it.
+- **Who may set it.** The cockpit's own "Add an envelope" modal, with a toggle that is off by default. A paired phone's sheet cannot.
+- **What the desk checks at each launch.** The envelope is stored and verified; its effective stop (after any earlier-stop
+  narrowing) is still ahead; an effective `launches` entry names the repo; and the desk's own launch log shows fewer than `count`
+  launches for that envelope and repo. `levain.coordinator.envelope.launch_allowance(envelope, repo, now, used)` is that rule as a
+  pure function; levain keeps no counter, because the count is the desk's to log.
+

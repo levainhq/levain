@@ -3159,6 +3159,7 @@ body.sheet-embedded #drop-words { min-height: 7em; }
 .env-seg-opt input:disabled + .env-seg-t { opacity: .5; }
 .env-custom { display: flex; flex-direction: column; gap: var(--sp-3); margin: 0 0 var(--sp-3); }
 .env-field { display: flex; flex-direction: column; gap: var(--sp-1); }
+.env-field[hidden] { display: none; }
 .env-flabel { font: var(--fw-semibold) var(--fs-meta) var(--sans); color: var(--text); }
 .env-warn { color: var(--bad); font: var(--fw-semibold) var(--fs-meta)/1.5 var(--sans); }
 .env-warn[hidden], .env-sr:empty { display: none; }

@@ -142,8 +142,11 @@ def check_proposal(proposal: Any) -> dict[str, Any]:
     """A proposal held to its shape: exactly the body's keys minus ``draft``, each editable value ``None`` or a valid
     one (the body's own checks, with each ``None`` filled by a placeholder), the other keys never ``None``, and the
     stop within :data:`levain.dispatch.contract.MAX_LIFETIME` of the issue time. Raises :class:`DraftError`."""
-    if not isinstance(proposal, dict) or set(proposal) != _PROPOSAL_KEYS:
-        raise DraftError(f"a proposal has exactly the keys {sorted(_PROPOSAL_KEYS)}")
+    # the launch grant is the one OPTIONAL key (absent = none; it is not an editable field, so a renewal or a
+    # replacement never carries it forward: a launch grant is signed on purpose, each time)
+    if not isinstance(proposal, dict) or set(proposal) not in (_PROPOSAL_KEYS, _PROPOSAL_KEYS | env.OPTIONAL_KEYS):
+        raise DraftError(f"a proposal has exactly the keys {sorted(_PROPOSAL_KEYS)} (and optionally "
+                         f"{sorted(env.OPTIONAL_KEYS)})")
     if any(proposal[k] is None for k in _PROPOSAL_KEYS - set(EDITABLE) - {"supersedes"}):
         raise DraftError("only the editable values, and supersedes, may be null")
     if proposal["format"] != env.BODY_FORMAT or proposal["origin"] != "worded":
@@ -242,8 +245,11 @@ def empty_base(body: Mapping[str, Any]) -> dict[str, Any]:
     """What a head that grants nothing (killed, ended, its key no longer valid, or none at all) is diffed as: no where,
     no effect, a stop at its issue time and every budget key zero, so every value of a successor is new, its budget
     included (L3 h11 r1: a budget kept from the head read as "unchanged" while all of it was newly granted)."""
-    return {**body, "where": [], **{k: [] for k in env.EFFECT_LISTS}, "stop_at": body["issued_at"],
-            "budget": {k: 0 for k in env.BUDGET_KEYS}}
+    out = {**body, "where": [], **{k: [] for k in env.EFFECT_LISTS}, "stop_at": body["issued_at"],
+           "budget": {k: 0 for k in env.BUDGET_KEYS}}
+    if env.LAUNCH_LIST in out:
+        out[env.LAUNCH_LIST] = []
+    return out
 
 
 def field_diff(prev: Mapping[str, Any] | None, new: Mapping[str, Any]) -> list[dict[str, Any]]:
@@ -269,9 +275,11 @@ def against_diff(base: Mapping[str, Any], proposal: Mapping[str, Any]) -> dict[s
     for repo, paths in have.items():
         where["removed"] += [f"{repo}  {p}" for p in paths if not env.path_within(p, want.get(repo, ()))]
     effects: dict[str, dict[str, list[str]]] = {}
-    for kind in env.EFFECT_LISTS:
-        before = {env.effect_key(kind, e): e for e in base[kind]}
-        after = {env.effect_key(kind, e): e for e in proposal[kind]}
+    for kind in env.GRANT_LISTS:
+        if kind == env.LAUNCH_LIST and not base.get(kind) and not proposal.get(kind):
+            continue          # no grant on either side: the diff reads as it always did
+        before = {env.effect_key(kind, e): e for e in base.get(kind, [])}
+        after = {env.effect_key(kind, e): e for e in proposal.get(kind, [])}
         effects[kind] = {
             "added": [env.effect_identity(kind, e) for key, e in after.items() if key not in before],
             "removed": [env.effect_identity(kind, e) for key, e in before.items() if key not in after],

@@ -22,6 +22,7 @@
 // The page passes:
 //   o.words        the textarea of the person's words (the page owns it); o.wordsGroup: draw it inside a "Your words" group here
 //   o.left, o.right  where the groups go (the same element for one column)
+//   o.launches     true only on the cockpit's own modal: draws the off-by-default "Launch seats" toggle (never on the phone)
 //   o.repos        the known folders; setRepos() takes a later listing
 //   o.review({words, spec})  a promise of {ok, status, body}, the server's reading (body.view, body.stop_at); o.why(reply): its refusal in words
 //   o.storeId()    the store identity the page holds now, or null on a fresh install; o.refreshStore(): a promise, the page re-reads it
@@ -47,6 +48,8 @@
     standard: { label: "Standard", stop: "8h",  hours: 3, tool_calls: 800,  tokens: 8000000 },
     long:     { label: "Long",     stop: "24h", hours: 8, tool_calls: 2500, tokens: 25000000 },
   };
+  // the launch grant's bounds (levain/coordinator/envelope.py's LAUNCH_DEFAULT and LAUNCH_MAX): a bigger count is refused there
+  const LAUNCH_DEFAULT = 2, LAUNCH_MAX = 4;
   const STOPS = ["1h", "2h", "4h", "8h", "12h", "24h"];
   // the server's bounds on each budget count (levain/coordinator/envelope.py's BUDGET_MAX): a bigger number is refused there, so it is not asked for here
   const BUDGET_MAX = { tool_calls: 100000, tokens: 1000000000, hours: 24 };
@@ -263,6 +266,38 @@
     gLand.appendChild(ontoWrap);
     onto.addEventListener("input", () => changed());
 
+    // ---- launching seats: a signed standing grant, OFF by default, offered only where the page passes o.launches (the
+    // cockpit's own modal; the phone's sheet never sets it, and the server refuses the key from any device but the cockpit) ----
+    const gLaunch = o.launches ? group("env-launch", "Launching seats", "Off: the desk asks you before it starts a seat. On: it may start up to this many seats in the folder above, until the hard stop, without asking again.") : null;
+    let launchOn = null, launchCount = null;
+    if (gLaunch) {
+      const lab = el("label", "env-opt");
+      launchOn = el("input");
+      launchOn.type = "checkbox";
+      launchOn.id = "drop-launch";
+      launchOn.checked = false;
+      const cw = el("div", "env-field");
+      cw.hidden = true;
+      launchCount = el("input");
+      launchCount.type = "number";
+      launchCount.id = "drop-launch-count";
+      launchCount.step = "1";
+      launchCount.min = "1";
+      launchCount.max = String(LAUNCH_MAX);
+      launchCount.value = String(LAUNCH_DEFAULT);
+      launchCount.setAttribute("inputmode", "numeric");
+            const lh = el("span", "env-hint", "the most seats it may start in that folder; the hard stop still ends it");
+      lh.id = "drop-launch-count-hint";
+      launchCount.setAttribute("aria-describedby", lh.id);
+      const ll = el("label", "env-flabel", "Seats, 1 to " + LAUNCH_MAX);
+      ll.htmlFor = "drop-launch-count";
+      cw.append(ll, launchCount, lh);
+      launchOn.addEventListener("change", () => { cw.hidden = !launchOn.checked; changed(); });
+      launchCount.addEventListener("input", () => changed());
+      lab.append(launchOn, el("span", "env-opt-t", "Launch seats without asking again"));
+      gLaunch.append(lab, cw);
+    }
+
     // ---- size: presets (native radios drawn as a segmented control), and Custom (the one fold) ----
     const gSize = group("env-size", "Size", "How long it may run and how much it may do. The limits count across the whole thread, all its workers together; extending sets a new total.");
     const seg = el("div", "env-seg");
@@ -370,6 +405,7 @@
     foot.appendChild(gSum);
 
     o.left.append(gRepo, gLand);
+    if (gLaunch) o.left.append(gLaunch);
     o.right.append(gSize, foot);
     setRepos(o.repos);
     selectSize("standard");
@@ -389,6 +425,13 @@
         if (!b) return { bad: "Name the branch it may land onto." };
         lands = [{ repo: r, onto: b }];
       }
+      let launches = null;
+      if (launchOn && launchOn.checked) {
+        const t = launchCount.value.trim();
+        // the server's own words for a count it will not take (envelope.py parse_body)
+        if (!/^\d+$/.test(t) || Number(t) < 1 || Number(t) > LAUNCH_MAX) return { bad: "launches[0].count is an integer from 1 to " + LAUNCH_MAX };
+        launches = [{ repo: r, count: Number(t) }];
+      }
       let stopV, budget;
       if (size === "custom") {
         const vals = {};
@@ -406,12 +449,14 @@
         stopV = p.stop;
         budget = { tool_calls: p.tool_calls, tokens: p.tokens, hours: p.hours };
       }
-      return { words: w, spec: { where: [{ repo: r, paths: ["."] }], lands: lands, stop: stopV, budget: budget } };
+      const spec = { where: [{ repo: r, paths: ["."] }], lands: lands, stop: stopV, budget: budget };
+      if (launches) spec.launches = launches;          // absent unless the toggle is on: the signed body then carries no launches key
+      return { words: w, spec: spec };
     }
-    const groups = [gWords, gRepo, gLand, gSize, gSum].filter((g) => g);
+    const groups = [gWords, gRepo, gLand, gLaunch, gSize, gSum].filter((g) => g);
     const clearErrs = () => { for (const g of groups) { g.err.hidden = true; g.err.textContent = ""; } };
     // the field a refusal names, only when the server's reply carries one as a structured key; never guessed from its words
-    const FIELD_GROUP = { where: gRepo, lands: gLand, stop: gSize, budget: gSize, words: gWords };
+    const FIELD_GROUP = { where: gRepo, lands: gLand, launches: gLaunch, stop: gSize, budget: gSize, words: gWords };
     const namedGroup = (body) => {
       for (const k of ["field", "key"]) {
         if (body && typeof body[k] === "string") {

@@ -868,7 +868,7 @@ _COORD_SHEET = "/sign/drop"
 # The phone's coordinator routes take a drop from a PAIRED DEVICE only (its token's device id is handed to CoordPhone.step,
 # which binds a kept envelope review to it). The cockpit has no device id: its credential is the surface token every sign
 # route needs (the same gate as every cockpit passkey ceremony), so this one name stands for "this cockpit's page".
-_COORD_DEVICE = "cockpit"
+_COORD_DEVICE = "cockpit"          # == levain.coordinator.phone.COCKPIT_DEVICE (the one device that may add a launch grant)
 
 
 def _coord_route(route: str) -> "str | None":
