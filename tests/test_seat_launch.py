@@ -11,6 +11,7 @@ import json
 import os
 import shutil
 import signal
+import stat
 import subprocess
 import sys
 import time
@@ -549,6 +550,51 @@ def test_fix3_a_fifo_or_a_linked_lock_is_refused_without_blocking(tmp_path):
     with pytest.raises(sl.SeatLaunchRefused, match="trust lock"):
         sl.seed_trust(g, "/lane/x")
     assert not (tmp_path / "elsewhere").exists()
+
+
+def test_mut_a_fifo_claude_json_never_blocks_and_a_fifo_lock_is_refused_as_not_regular(tmp_path):
+    def boom(*_a):
+        raise AssertionError("seed_trust blocked on a FIFO")
+    old = signal.signal(signal.SIGALRM, boom)
+    signal.alarm(5)
+    try:
+        h = tmp_path / "h"
+        h.mkdir()
+        os.mkfifo(h / ".claude.json")
+        with pytest.raises(sl.SeatLaunchRefused, match="cannot be read as JSON"):
+            sl.seed_trust(h, "/lane/x")
+        g = tmp_path / "g"
+        g.mkdir()
+        os.mkfifo(g / ".claude.json.levain-lock")
+        with pytest.raises(sl.SeatLaunchRefused, match="not a regular file"):
+            sl.seed_trust(g, "/lane/x")
+        assert not (g / ".claude.json").exists()
+    finally:
+        signal.alarm(0)
+        signal.signal(signal.SIGALRM, old)
+
+
+def test_mut_a_fifo_that_holds_valid_json_is_still_refused_not_replaced(tmp_path):
+    h = tmp_path / "h"
+    h.mkdir()
+    os.mkfifo(h / ".claude.json")
+    keep = os.open(h / ".claude.json", os.O_RDWR)           # both ends held: the content is readable without a second process
+    try:
+        os.write(keep, b'{"projects": {}}')
+        with pytest.raises(sl.SeatLaunchRefused, match="cannot be read as JSON"):
+            sl.seed_trust(h, "/lane/x")
+        assert stat.S_ISFIFO(os.lstat(h / ".claude.json").st_mode), "the FIFO was not replaced"
+    finally:
+        os.close(keep)
+
+
+def test_mut_eperm_is_gone_when_the_pid_no_longer_has_the_recorded_start_time(monkeypatch):
+    monkeypatch.setattr(sl, "_live_members", lambda pg: [(4242, 501)])
+    monkeypatch.setattr(sl, "_proc_start_ns", lambda pid: None)            # the leader is gone
+    sl._eperm("lane-x", 4242, 4242, 123, "SIGTERM")                          # not ours / gone: returns
+    monkeypatch.setattr(sl, "_proc_start_ns", lambda pid: 123)
+    with pytest.raises(sl.SeatLaunchRefused, match="EPERM.*4242 \\(uid 501\\)"):
+        sl._eperm("lane-x", 4242, 4242, 123, "SIGTERM")
 
 
 def test_fix4_a_dry_run_mints_nothing_and_the_real_launch_of_that_lane_then_works(seats, rig):
