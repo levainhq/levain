@@ -67,19 +67,17 @@ Three things follow, and they're the whole discipline:
 
 The rule underneath: work freely, wrap at the end.
 
-## 5. Dropping things in — the Tray, the Keep, and your state line
+## 5. Dropping things in — the Tray, the band, and your state line
 
-Three ways to hand something to your partner outside the flow of conversation:
+Three ways to hand something to your partner (or to be handed something back) outside the flow of conversation:
 
 - **The Tray** is where you offload things you don't want to lose — a stray thought, a "deal with this later," a prompt to pick up next session. You don't file it; you drop it and the partner sorts it into wherever it belongs — a task, a question, a thread to revisit. The point is that you never categorize anything.
-- **The Keep** is durable reference — the command you always forget, a standing note, context that stays true. It persists until you remove it, and the partner hands the right note back the moment it's relevant.
+- **The band** runs the other way: it is what your partner is stopped on that only you can give. It asks by `levain ask`, you answer from the cockpit or the phone, and it does not nag with things that are merely coming up. A thing with a date on it waits in the Tray as a dated item, not on the band.
 - **The state line** is one freeform line, in your own words, of what's going on right now — "shipping the Q3 audit", "wiped, keep it light". Set it with `levain state "shipping the Q3 audit"` (or from the cockpit); every session opens with it, a change reaches a running session at its next prompt, and the cockpit shows it under the masthead. It's never parsed, scored or used to limit what your partner does. It disappears on its own after 12 hours, so a stale line never passes for current; `levain state` shows it, `levain state --clear` removes it. Each line you set is also saved once, word for word, as a memory episode tagged `felt,state`, for the next consolidate to read; that copy outlives the 12 hours and `levain state --clear`, and you delete it by tombstoning it in the cockpit's Recent episodes panel.
 
-You don't need a command for the Tray or the Keep: you just tell the partner in the conversation. "Hold this for later" drops something in the Tray; "keep this handy" puts it in the Keep; it sorts and files from there. (If you'd rather manage them directly — reorder, edit, clear — the `serve --write` cockpit in §9 lets you.)
+You don't need a command for the Tray: you just tell the partner in the conversation. "Hold this for later" drops something in; if it has a date, say so ("remind me on the 14th") and it is kept with that date. Undated drops are allowed to go stale; your partner sorts them when it reads the Tray. (If you'd rather manage them directly, the `serve --write` cockpit in §9 lets you.) There is no separate shelf for reference: a fact that stays true goes into your partner's memory with the words that bring it back, and a decision you made is recorded as one.
 
-The Tray is the thing that lets you stay in flow. Mid-task, a thought lands that has nothing to do with what you're on — a different thread to circle back to, a config to check later, an idea worth keeping. The old habit is to either chase it and lose your thread, or trust yourself to remember and don't. You offload it in one line, almost mid-sentence, and it's gone from your head but not lost. After a week of it, the background hum of "don't forget to…" quiets down, because the system is holding the loose threads instead of your attention.
-
-The Keep replaces the scattered-notes problem — the command you look up every time, the standing fact you re-explain. Put it in the Keep once and the partner surfaces it exactly when it's relevant, instead of you digging through old messages. And the state line has the biggest payoff for its size: say where you are once, and you stop spending the first two minutes of each session re-establishing it.
+The Tray is the thing that lets you stay in flow. Mid-task, a thought lands that has nothing to do with what you're on — a different thread to circle back to, a config to check later, an idea worth keeping. The old habit is to either chase it and lose your thread, or trust yourself to remember and don't. You offload it in one line, almost mid-sentence, and it's gone from your head but not lost. After a week of it, the background hum of "don't forget to…" quiets down, because the system is holding the loose threads instead of your attention. And the state line has the biggest payoff for its size: say where you are once, and you stop spending the first two minutes of each session re-establishing it.
 
 ## 6. Thinking modes — shifting how the partner thinks
 

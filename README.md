@@ -362,9 +362,9 @@ levain serve --path ./ada --chat ./ada            # the cockpit on ada's memory,
 - **Conversations live in server memory.** A restart of `levain serve` ends every one.
 - **`--path` and `--chat` are independent.** `--path` picks whose memory the cockpit shows; `--chat` picks which entity the chat talks to. Nothing checks that they match, so the page can show one entity's memory while the chat talks to another. `--path` defaults to the current directory, so start `levain serve --chat ./ada` from your own install and the page shows your memory beside ada's chat. Point both at the same directory when you want them to agree.
 
-![The cockpit board on a demo install: the state line, the Decisions waiting and Health tiles, and the Tray, Open loops, Recent episodes and Keep panels.](https://raw.githubusercontent.com/levainhq/levain/main/docs/img/cockpit-operate.png)
+![The cockpit board on a demo install: the state line, the Decisions waiting and Health tiles, and the Tray, Open loops and Recent episodes panels.](https://raw.githubusercontent.com/levainhq/levain/main/docs/img/cockpit-operate.png)
 
-*Open Loops surface on their own when a prompt touches them; Tray is your inbox into the partnership; Keep is durable reference. Shown on a demo install with invented content, not a real one — an operator's actual Open Loops and Tray are exactly the kind of thing this README won't put on the internet.*
+*Open Loops surface on their own when a prompt touches them; Tray is your inbox into the partnership (parked loops show among the Open loops with a parked marker). Shown on a demo install with invented content, not a real one — an operator's actual Open Loops and Tray are exactly the kind of thing this README won't put on the internet.*
 
 ![The cockpit's Neocortex panel on the same demo install, with its State, Active Threads and Decisions tabs.](https://raw.githubusercontent.com/levainhq/levain/main/docs/img/cockpit-state.png)
 
@@ -380,7 +380,7 @@ levain state                           # show it + how old it is
 levain state --clear                   # remove it
 ```
 
-Two of those write targets are your own inbox into the partnership. Dump anything mid-stream (a thought, a handoff, something to pick up next time) and it surfaces at the start of your next session, then resolves. Keep durable reference you want your partner to recall when it's relevant. You dump freely; the kit sorts.
+One of those write targets is your own inbox into the partnership. Dump anything mid-stream (a thought, something to pick up next time) and it lands in the Tray, to be sorted by your partner. A dump with a date is an agenda item and carries that date in the Tray. Durable reference is memory, not a shelf: facts go under Durable Facts and rulings become decision episodes. You dump freely; the kit sorts.
 
 ### The cockpit's Claude room
 
