@@ -205,3 +205,56 @@ def test_a_corrupt_settings_file_with_no_levain_hook_has_no_row(tmp_path, monkey
     install = _install(tmp_path, wired=False)
     (install / ".claude" / "settings.json").write_text("{ not json")
     assert doctor._check_consent_ping_reach(install, environ=_env(tmp_path)) == []
+
+
+def test_the_phone_branch_is_the_gates_own_test(tmp_path, monkeypatch):
+    """review r2 (MED): the row asks claude_code.ping_configured for the phone branch, not a private probe."""
+    seen = []
+    monkeypatch.setattr(claude_code, "ping_configured", lambda s, q: seen.append((s.notify_argv, str(q))) or True)
+    install, env = _install(tmp_path), _env(tmp_path)
+    (row,) = doctor._check_consent_ping_reach(install, environ=env)
+    assert row.ok and not row.warn
+    assert seen == [((), str(Path(env["LEVAIN_HOME"]) / "consent"))]   # phone branch only: a dead notify_argv must not read as a route
+
+
+def test_a_failure_asking_the_gate_is_not_swallowed_into_a_warn(tmp_path, monkeypatch):
+    def boom(_s, _q):
+        raise TypeError("signature drift")
+    monkeypatch.setattr(claude_code, "ping_configured", boom)
+    install, env = _install(tmp_path), _env(tmp_path)
+    try:
+        rows = doctor._check_consent_ping_reach(install, environ=env)
+    except TypeError:
+        return
+    raise AssertionError(f"swallowed: {rows}")
+
+
+def test_an_absolute_command_that_is_missing_or_not_executable_is_a_warn(tmp_path, monkeypatch):
+    _no_phone(monkeypatch)
+    install, env = _install(tmp_path), _env(tmp_path)
+    q = Path(env["LEVAIN_HOME"]) / "consent"
+    plain = Path(os.path.realpath(tmp_path)) / "ping-plain"
+    plain.write_text("#!/bin/sh\n")
+    plain.chmod(0o644)
+    for cmd in ("/opt/ping-moved-xyz", str(plain)):
+        _settings_for(q, [cmd])
+        (row,) = doctor._check_consent_ping_reach(install, environ=env)
+        assert row.warn and "cannot be started" in row.detail, cmd
+
+
+def test_a_legacy_queue_dir_that_does_not_exist_yet_is_a_warn_naming_it(tmp_path, monkeypatch):
+    _no_phone(monkeypatch)
+    missing = Path(os.path.realpath(tmp_path)) / "never-created-q"
+    (row,) = doctor._check_consent_ping_reach(_legacy(tmp_path, missing), environ=_env(tmp_path))
+    assert row.warn and str(missing) in row.detail
+
+
+def test_a_legacy_script_with_a_trailing_line_still_reads(tmp_path, monkeypatch):
+    _no_phone(monkeypatch)
+    custom = Path(os.path.realpath(tmp_path)) / "custom-q"
+    custom.mkdir()
+    ws = _legacy(tmp_path, custom)
+    script = ws / ".claude" / "hooks" / claude_code.HOOK_SCRIPT_NAME
+    script.write_text(script.read_text() + "# end of wrapper\n")
+    (row,) = doctor._check_consent_ping_reach(ws, environ=_env(tmp_path))
+    assert row.warn and str(custom) in row.detail and "could not be read" not in row.detail

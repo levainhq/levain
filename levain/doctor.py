@@ -27,6 +27,7 @@ from __future__ import annotations
 import ast
 import contextlib
 import contextvars
+import dataclasses
 import json
 import os
 import re
@@ -537,8 +538,8 @@ def _consent_hook_in_settings(install: Path, environ: Any = None) -> tuple[str, 
             if kind == "static":
                 return "static", queue_dir_for(env)
             try:
-                lit = re.search(r"sys\.exit\(main\((\[.*\])\)\)\s*$", script.read_text(encoding="utf-8"), re.S)
-                argv = ast.literal_eval(lit.group(1)) if lit else None
+                calls = re.findall(r"sys\.exit\(main\((\[[^\n]*\])\)\)", script.read_text(encoding="utf-8"))
+                argv = ast.literal_eval(calls[-1]) if calls else None     # the last call; text after it is not the wiring
                 if not isinstance(argv, list):
                     return "unreadable", None
             except (OSError, ValueError, SyntaxError):
@@ -558,8 +559,9 @@ def _check_consent_ping_reach(install: Path, *, environ: Any = None) -> list[Che
     ``$LEVAIN_HOME/consent`` for the hook `levain init` wires, as :func:`levain.consent.queue.queue_dir_for` binds
     it; the ``--queue-dir`` literal of an earlier per-workspace script) has a ping route: a ``notify_argv`` command
     the runtime can start (:func:`levain.consent.adapters.claude_code.notify_command_path`, the resolution
-    ``run_notify_command`` uses, under the child's PATH) or a paired phone with pings on
-    (:func:`levain.consent.adapters.claude_code.ping_configured`). Without one the held request reaches nobody, so
+    ``run_notify_command`` uses, under the child's PATH, and an existing executable file) or a paired phone with pings
+    on (the phone branch of :func:`levain.consent.adapters.claude_code.ping_configured`, i.e. ``levain.webpush.live``:
+    a configured route, not a live connection). Without one the held request reaches nobody, so
     it is a WARN, never a FAIL: the hook fails toward the operator's own dialog, so nothing is allowed or lost. The
     hook not wired here: no row; wired but unreadable: a WARN saying so. The queue is read from THIS process's
     environment. Read-only."""
@@ -575,15 +577,16 @@ def _check_consent_ping_reach(install: Path, *, environ: Any = None) -> list[Che
         return [CheckResult(row, True, "levain's consent hook is named in the Claude Code settings, but the wiring could "
                             "not be read (malformed settings or hook script), so whether a held request pings you is unknown",
                             "run `levain update` to rewrite the consent hook, or fix the settings file", warn=True)]
-    settings = claude_code.load_settings(queue_dir)
-    runnable = claude_code.notify_command_path(settings, child_env()) is not None
-    phone = False
     try:
-        from levain.webpush import live
-        phone = bool(live(queue_dir))
-    except Exception:  # noqa: BLE001 - a ping is optional
-        phone = False
-    if runnable or phone:
+        settings = claude_code.load_settings(queue_dir)
+    except OSError as exc:
+        return [CheckResult(row, True, f"the consent hook is installed, but the queue at {queue_dir} could not be read "
+                            f"({type(exc).__name__}), so whether a held request pings you is unknown",
+                            f"check that {queue_dir} exists and is readable", warn=True)]
+    cmd = claude_code.notify_command_path(settings, child_env())
+    runnable = cmd is not None and os.path.isfile(cmd) and os.access(cmd, os.X_OK)   # the runtime's resolution, and Popen can start it
+    # the phone branch only: ping_configured is True for ANY notify_argv, which is the false OK this row exists to close
+    if runnable or claude_code.ping_configured(dataclasses.replace(settings, notify_argv=()), queue_dir):
         return [CheckResult(row, True, f"a held request pings you: the queue at {queue_dir} has a ping route")]
     if settings.notify_argv:
         why = (f"its notify command {settings.notify_argv[0]!r} cannot be started (a relative path, or not found on "
