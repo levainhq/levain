@@ -186,6 +186,7 @@ WORDS = {
     "bad_room": "The request names the room thread the page shows (room_thread_id).",
     "no_room": "No conversation is recorded.",
     "room_rotated": "This conversation was replaced; nothing more is read from it.",
+    "card_unreadable": "The card record could not be read.",
     "room_unreadable": "The room record could not be read.",
     "not_a_reply": "That reply is not finished, or is not in this conversation.",
     "nothing_to_read": "That reply has nothing to read aloud.",
@@ -616,7 +617,7 @@ def _card_chunks(store: Any, req: dict[str, Any]) -> tuple[list[str] | None, Ans
     try:
         q = store.get(int(m.group(1)))
     except Exception:            # noqa: BLE001 - a store that cannot be read is fixed words, never its detail
-        return None, refusal(500, "internal", "room_unreadable")
+        return None, refusal(500, "internal", "card_unreadable")
     if q is None:
         return None, refusal(404, "not_found", "no_card")
     chunks = speakable(card_script.question_script(q))

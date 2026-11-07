@@ -62,6 +62,7 @@ CARDS = [
     ("x" * 300, [("a", "one")], "a"),                                          # no sentence end in 200: cut at a space near 160
     (("word " * 60).strip(), [("a", "  padded  ")], "zz"),                     # cut at a space; a rec naming no option adds nothing
     ("  Spaced   out \n\n headline. And more words follow here.  ", [("a", "A"), ("b", "B")], "b"),
+    ("A headline long enough to stand alone.", [("a", "\n lead and trail \r\n"), ("b", "\tbar\t")], "a"),   # r1: both tiers trim the same set
 ]
 
 
@@ -95,6 +96,18 @@ def test_the_page_and_the_server_build_the_same_script_on_every_shape() -> None:
     assert got == want, [(i, a, b) for i, (a, b) in enumerate(zip(got, want)) if a != b]
     assert want[4].splitlines() == ["Yes. Then what happens next, once the build lands?", "go, Go"]
     assert want[5].splitlines()[0] == "x" * 300 and want[3] == ""
+
+
+def test_a_store_that_cannot_be_read_says_the_card_not_the_room() -> None:
+    """r1 (deepseek, gemini LOW): a question store that raises was answered with the ROOM's words. Red with: the ``_card_chunks``
+    failure refusal back on ``room_unreadable``."""
+    class Store:
+        def get(self, n):
+            raise RuntimeError("db gone")
+
+    chunks, refused = cockpit_voice._card_chunks(Store(), {"card_id": "question:3", "chunk": 0})
+    assert chunks is None and refused.status == 500
+    assert "card" in json.loads(refused.body)["message"].lower() and "room" not in json.loads(refused.body)["message"].lower()
 
 
 def _file(rig, **kw):
@@ -250,3 +263,88 @@ def test_a_card_opened_any_other_way_never_reads_itself(tmp_path: Path, monkeypa
     true without an ``opened(id)`` call (every card opened is read)."""
     got = _page(tmp_path, monkeypatch, notify=True, activation=ACTIVE, via_link=False)[-1]
     assert got == {"btn": "Play", "large": False, "spoken": [], "modal": True}, got
+
+
+# --- the speaker's lifecycle (r1): a node run of the page half over a fake document ----------------------------------------
+
+_VM = r"""
+const vm = require("vm"), fs = require("fs");
+const log = [];
+const el = () => { const e = { children: [], cls: new Set(), isConnected: false, hidden: false, textContent: "", attrs: {}, on: {},
+  appendChild(c) { this.children.push(c); return c; }, setAttribute(k, v) { this.attrs[k] = v; }, addEventListener(t, f) { this.on[t] = f; },
+  classList: { toggle() {} } }; return e; };
+let listeners = new Set(), playing = false, unlockedFlag = %(unlocked)s;
+const V = { settings: () => ({ notify: %(notify)s }), isUnlocked: () => unlockedFlag, unlock() { log.push("unlock"); }, noteFor: () => "",
+  play(r) { log.push("play"); playing = true; return new Promise((res) => { V._done = () => { playing = false; res(); }; }); },
+  stop() { log.push("stop"); playing = false; if (V._done) V._done(); }, onChange: (f) => { listeners.add(f); return () => { listeners.delete(f); log.push("off"); }; } };
+const win = { LevainVoice: V, document: { hidden: false, createElement: el }, navigator: { userActivation: { isActive: true } },
+  Date, setTimeout, clearTimeout, setInterval, clearInterval, Promise, Object, Array, String, JSON, require: undefined };
+win.window = win;
+vm.runInNewContext(fs.readFileSync(%(js)s, "utf8"), win);
+win.window.LevainCardFormat = undefined;
+const CV = win.LevainCardVoice;
+const body = { what: "A question that is long enough to be a sentence.", options: [{ key: "a", label: "yes" }], rec: "a" };
+const tick = (ms) => new Promise((r) => setTimeout(r, ms || 0));
+const fire = () => { for (const f of [...listeners]) f(); };
+(async () => {
+%(prog)s
+process.stdout.write(JSON.stringify({ log, listeners: listeners.size })); process.exit(0);
+})();
+"""
+
+
+def _run_vm(prog: str, *, notify: bool = True, unlocked: bool = True) -> dict:
+    # headline() needs card_format.js: load it into the same context first
+    cf = HERE.parent / "levain" / "templates" / "web" / "card_format.js"
+    head = _VM % {"notify": "true" if notify else "false", "unlocked": "true" if unlocked else "false", "js": json.dumps(str(JS)),
+                  "prog": prog}
+    head = head.replace('vm.runInNewContext(fs.readFileSync(%s, "utf8"), win);' % json.dumps(str(JS)),
+                        'vm.createContext(win); vm.runInContext(fs.readFileSync(%s, "utf8"), win); vm.runInContext(fs.readFileSync(%s, "utf8"), win);'
+                        % (json.dumps(str(cf)), json.dumps(str(JS))))
+    head = head.replace("win.window.LevainCardFormat = undefined;", "")
+    out = subprocess.run(["node", "-e", head], capture_output=True, text=True, timeout=60)
+    assert out.returncode == 0, out.stderr
+    return json.loads(out.stdout)
+
+
+def test_a_card_whose_page_closed_before_its_words_landed_is_not_read() -> None:
+    """r1 (codex/deepseek/complement HIGH, reachable: a slow body fetch and a closed modal): the speaker is drawn after the card
+    left the page. Nothing is played, billed or kept listening. Red with: the ``wrap.isConnected`` test in the arm step removed."""
+    got = _run_vm("""
+      CV.opened("question:2"); const w = CV.speaker("question:2", body);   // never inserted: the card was closed
+      await tick(20); fire(); await tick(20);""")
+    assert "play" not in got["log"] and got["listeners"] == 0, got
+
+
+def test_a_card_that_is_on_the_page_is_read_after_it_is_inserted() -> None:
+    """The arm waits for the insert, and reads once the card is there (the guard must not turn the notification read off)."""
+    got = _run_vm("""
+      CV.opened("question:2"); const w = CV.speaker("question:2", body); w.isConnected = true; await tick(20);""")
+    assert got["log"].count("play") == 1, got
+
+
+def test_closing_a_card_while_it_reads_stops_the_reading() -> None:
+    """r1 (codex/gemini HIGH, reachable: close or refresh the modal mid-read): the audio kept playing and fetching chunks after the card was
+    gone. Red with: the ``V.stop()`` of the detached-while-reading step removed."""
+    got = _run_vm("""
+      CV.opened("question:2"); const w = CV.speaker("question:2", body); w.isConnected = true; await tick(20);
+      w.isConnected = false; await tick(700);""")
+    assert got["log"].count("play") == 1 and "stop" in got["log"] and got["listeners"] == 0, got
+
+
+def test_a_card_closed_without_a_click_lets_go_of_its_listener() -> None:
+    """r1 (codex/deepseek MED): a speaker painted before it was inserted never learned it was attached, so closing it unread kept a
+    listener (and the card's closures) for the life of the page. Red with: the attach step after the insert removed."""
+    got = _run_vm("""
+      const w = CV.speaker("question:2", body); w.isConnected = true; await tick(20);
+      w.isConnected = false; fire(); await tick(20);""", notify=False)
+    assert got["listeners"] == 0 and "play" not in got["log"], got
+
+
+def test_an_opened_flag_is_spent_by_the_first_speaker_even_when_it_builds_nothing() -> None:
+    """r1 (deepseek/complement MED): a notification open whose speaker returned early left the flag live, so a strip open of the same
+    card within 60 s read itself. Red with: ``takeOpened`` moved back below the early returns."""
+    got = _run_vm("""
+      CV.opened("question:2"); const none = CV.speaker("question:2", { error: "x" });
+      const w = CV.speaker("question:2", body); w.isConnected = true; await tick(20);""")
+    assert "play" not in got["log"], got

@@ -16,6 +16,7 @@ from collections.abc import Iterable
 CARD_ID = re.compile(r"question:([1-9][0-9]{0,11})")      # the cockpit's own id for a filed question (needsIdOf)
 HEAD_MIN, HEAD_MAX, HEAD_CUT = 20, 200, 160               # card_format.js headline: a sentence end 20+ chars in, within 200
 
+_TRIM = " \t\r\n"            # the one trim both tiers use (card_voice.js TRIM)
 _SENTENCE_END = re.compile(r"[.!?](?=\s)")
 
 
@@ -44,11 +45,11 @@ def headline(text: str) -> str:
 def script(what: str, options: Iterable[tuple[str, str]], rec: str | None) -> str:
     """The card's read-aloud script (see the module words). ``options`` are ``(key, text)`` pairs in the card's order."""
     lines: list[str] = []
-    head = headline(what).strip()
+    head = headline(what).strip(_TRIM)
     if head:
         lines.append(head)
     for key, text in options:
-        text = str(text).strip()
+        text = str(text).strip(_TRIM)
         if not text:
             continue
         line = f"{key}, {text}"

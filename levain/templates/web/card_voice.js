@@ -21,6 +21,8 @@
   "use strict";
   const CARD_ID = /^question:[1-9][0-9]{0,11}$/;
   const OPENED_MS = 60000;      // how long an opened(id) waits for its card to be drawn
+  const TRIM = /^[ \t\r\n]+|[ \t\r\n]+$/g;   // the one trim both tiers use (card_script.py strips the same four characters)
+  const WATCH_MS = 250;         // how often a card that is reading checks it is still on the page
   const WORDS = { play: "Play", stop: "Stop", tap: "Tap to hear this card" };
 
   function headlineOf(what) {
@@ -30,11 +32,11 @@
   // options: [{key, text}] in the card's order
   function script(what, options, rec) {
     const lines = [];
-    const head = headlineOf(what).replace(/^[ \t]+|[ \t]+$/g, "");
+    const head = headlineOf(what).replace(TRIM, "");
     if (head) lines.push(head);
     for (const o of Array.isArray(options) ? options : []) {
       if (!o) continue;
-      const text = String(o.text === undefined || o.text === null ? "" : o.text).replace(/^[ \t]+|[ \t]+$/g, "");
+      const text = String(o.text === undefined || o.text === null ? "" : o.text).replace(TRIM, "");
       if (!text) continue;
       let line = o.key + ", " + text;
       if (rec && o.key === rec) line += ", recommended";
@@ -72,7 +74,9 @@
   // nothing to read or no player.
   function speaker(id, body) {
     const V = root.LevainVoice;
-    if (!V || typeof id !== "string" || !CARD_ID.test(id)) return null;
+    if (typeof id !== "string" || !CARD_ID.test(id)) return null;
+    const armed = takeOpened(id);          // spent by the first speaker for this card, whether or not it builds one
+    if (!V) return null;
     const text = scriptOfBody(body);
     if (!text) return null;
     const reply = { thread: id, gseq: 0, card: id, text };
@@ -83,10 +87,18 @@
     const note = root.document.createElement("span");
     note.className = "voice-say"; note.setAttribute("role", "status"); note.hidden = true;
     wrap.appendChild(b); wrap.appendChild(note);
-    let mine = false, large = false, run = 0, attached = false, off = null;
+    let mine = false, large = false, run = 0, attached = false, off = null, watch = null;
+    const unwatch = () => { if (watch !== null) { root.clearInterval(watch); watch = null; } };
+    // The card left the page (closed, replaced by a refresh): stop its reading and let go of the player's listener.
+    const gone = () => {
+      unwatch();
+      if (mine) { run++; mine = false; V.stop(); }
+      if (off) off();
+      off = null;
+    };
     const paint = () => {
       if (wrap.isConnected) attached = true;
-      else if (attached) { if (off) off(); off = null; return; }     // the card was closed: stop listening
+      else if (attached) { gone(); return; }
       b.textContent = mine ? WORDS.stop : (large ? WORDS.tap : WORDS.play);
       b.setAttribute("aria-pressed", mine ? "true" : "false");
       wrap.classList.toggle("card-voice-large", large && !mine);
@@ -97,17 +109,25 @@
       large = false; mine = true;
       const me = ++run;
       paint();
-      Promise.resolve(V.play(reply)).then(() => {}, () => {}).then(() => { if (me === run) { mine = false; paint(); } });
+      unwatch();
+      watch = root.setInterval(() => { if (!wrap.isConnected) gone(); }, WATCH_MS);
+      Promise.resolve(V.play(reply)).then(() => {}, () => {}).then(() => { if (me === run) { mine = false; unwatch(); paint(); } });
     };
     b.addEventListener("click", () => {
       V.unlock();
-      if (mine) { run++; mine = false; V.stop(); paint(); } else start();
+      if (mine) { run++; mine = false; unwatch(); V.stop(); paint(); } else start();
     });
     if (typeof V.onChange === "function") off = V.onChange(paint);
-    if (takeOpened(id) && V.settings().notify === true) {
-      if (mayPlay(V)) { V.unlock(); start(); } else large = true;
-    }
     paint();
+    // The caller inserts the card right after this returns: decide on the next turn, when it is (or is not) on the page. A card that
+    // was closed before its words landed is never read; one the page holds is armed as before.
+    Promise.resolve().then(() => {
+      if (!wrap.isConnected) { attached = true; gone(); return; }
+      attached = true;
+      if (armed && V.settings().notify === true) {
+        if (mayPlay(V)) { V.unlock(); start(); } else { large = true; paint(); }
+      }
+    });
     return wrap;
   }
 
