@@ -112,6 +112,8 @@ def declarative_payload(data: bytes, origin: "str | None" = None) -> bytes:
             url = origin + url
         if not (isinstance(url, str) and url.startswith("https://") and urlsplit(url).hostname):
             return data
+        if not (isinstance(legacy.get("title"), str) and legacy["title"].strip()):
+            return data          # WebKit needs a non-empty title and drops a declarative message without one (L3 r1 codex MED)
         notif = {"title": legacy["title"], "body": legacy["body"], "navigate": url, "tag": legacy.get("tag") or "levain"}
         out = {**legacy, "web_push": 8030, "notification": notif}
         if isinstance(legacy.get("badge"), int):
