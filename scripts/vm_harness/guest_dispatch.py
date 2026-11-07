@@ -8,6 +8,9 @@ Harness code. Rig differences from production (the same two the 1105-17 hold rig
 hooks (the root helper holds no hook templates) and the workspace seam is given ``stage.make_bundle`` (production
 leaves it unwired). usage: guest_dispatch.py <tag>   Files live in the profile's exchange dir (owned by the dispatch user).
 """
+from __future__ import annotations
+
+
 import json
 import os
 import sys
