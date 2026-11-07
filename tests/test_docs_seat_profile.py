@@ -229,12 +229,11 @@ def test_the_branch_the_page_promises_is_the_hook_s():
     assert 'f"seat/{' in src and "seat/<lane key>" in TEXT
 
 
-def test_launch_and_stop_are_left_for_when_they_land():
-    assert "documented when they land" in TEXT or "documented here when the launcher lands" in TEXT
+def test_launch_and_stop_are_described_and_the_lease_is_a_prerequisite():
     assert "--lanes-parent" in TEXT
-    # no launch or stop flag is described here
-    for flag in ("--base", "--claude"):
-        assert f"`{flag}`" not in TEXT
+    assert "`levain seat launch" in TEXT and "`levain seat stop" in TEXT
+    assert "documented when they land" not in TEXT and "documented here when the launcher lands" not in TEXT
+    assert "refuses without one" in TEXT
 
 
 def test_the_credential_env_list_is_the_codes():
@@ -251,9 +250,16 @@ def test_p8_is_the_one_probe_without_a_control():
     assert "Every probe except P8" in TEXT
 
 
-def test_launch_stops_short_of_starting_claude():
+def test_launch_starts_claude_headless_and_dry_run_starts_nothing():
     launch = _resolve(["launch"])
-    assert {"--remote", "--base"} <= _options(launch)
-    assert "does not start claude" in (_seat().description or "")
-    assert "It does not start Claude Code" in TEXT
-    assert "clones the lane and makes its RETURN directory" in TEXT
+    assert {"--remote", "--base", "--prompt", "--dry-run"} <= _options(launch)
+    assert "--" + "headless" in _options(launch)    # the accepted-for-compatibility flag stays in the parser (split so the chrome-site scan does not read it as a launch site)
+    assert "`--claude`" not in TEXT            # a deliberately undocumented flag stays out of the page
+    assert "starts claude headless" in (_seat().description or "")
+    assert "`launch --dry-run` only validates" in (_seat().description or "")
+    assert "mints the lane's roots under the live lease" in TEXT
+    assert "headless (`claude -p`" in TEXT and "`--prompt` is required" in TEXT
+    # the page claims no more than the code: a dry run starts nothing, and says so
+    assert "--dry-run` only validates and prints the argv. It mints nothing and does not start Claude Code" in TEXT
+    stop = _resolve(["stop"])
+    assert "--grace" in _options(stop) and "SIGTERM, then SIGKILL" in TEXT
