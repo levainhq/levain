@@ -21,7 +21,6 @@ from tests.test_cockpit_k2a import TOKEN, _install, _serve
 from tests.test_cockpit_room_join import _store
 from tests.test_cockpit_threads_mount import qdir  # noqa: F401  (fixture: the consent directory the server reads)
 from tests.test_coordinator_room_serve import fake_serve
-from tests.test_cockpit_k2a import _install
 
 INIT = """
 (() => {
@@ -199,3 +198,131 @@ def test_the_dashboard_loads_voice_js_and_the_hook_is_wired() -> None:
     js = (web / "room_view.js").read_text()
     for needle in ("V.arm(voiceBase)", "V.replyFinished(r)", "V.unlock(); V.stop();", "V.button(r)", "w._unbind()", "if (V) V.stop();"):
         assert needle in js, needle
+
+
+# --- L3 round 1 fixes ---------------------------------------------------------------------------------------------------
+POLLS = "new Promise((r) => { const n = window.__roomCalls; const t = setInterval(() => { if (window.__roomCalls >= n + 3) { clearInterval(t); r(1); } }, 100); })"
+PLAYING_A = [
+    _set(_room("t1", *A)),
+    _to_room(),
+    {"until": "document.querySelectorAll('.rv-room .voice-btn').length === 1"},
+    SETTINGS,
+    {"eval": "document.querySelector('.rv-room .voice-btn').click(); 1"},
+    {"until": "window.__spoken.length === 1"},
+]
+
+
+@needs_browser
+def test_a_second_turn_with_no_operator_line_between_speaks_only_its_own_words(tmp_path, qdir) -> None:
+    """The server's reply_text starts a reply after the operator's last line OR the previous vendor_turn_ended; the page must
+    match it. Red with: `buf = [];` removed from the vendor_turn_ended branch of repliesOf (the second turn is spoken as
+    "A old reply\\n\\nsecond")."""
+    b = _room("t1", *A, _item(4, "vendor_agent_text", "second"), _item(5, "vendor_turn_ended"))
+    v = _run(tmp_path, qdir, [
+        *PLAYING_A,
+        _set(b),
+        {"until": "document.querySelectorAll('.rv-room .voice-btn').length === 2", "ms": 15000},
+        {"eval": "window.__endUtt(); 1"},
+        {"until": "window.__spoken.length === 2"},
+        {"eval": "JSON.stringify(window.__spoken)"},
+    ])
+    assert json.loads(v[-1]) == ["A old reply", "second"], v[-1]
+
+
+@needs_browser
+def test_a_whitespace_only_agent_text_is_not_a_reply(tmp_path, qdir) -> None:
+    """The server drops a body that is only whitespace (``body.strip()``), so premium would say nothing_to_read. Red with:
+    `.trim()` removed from the vendor_agent_text test of repliesOf (a control appears for the blank turn and it is queued)."""
+    b = _room("t1", *A, _item(4, "vendor_agent_text", "  \n "), _item(5, "vendor_turn_ended"))
+    v = _run(tmp_path, qdir, [
+        *PLAYING_A,
+        _set(b),
+        {"eval": POLLS},
+        {"eval": "window.__endUtt(); 1"},
+        {"eval": "new Promise((r) => setTimeout(r, 500)).then(() => JSON.stringify([window.__spoken, %s]))" % BTNS},
+    ])
+    spoken, btns = json.loads(v[-1])
+    assert spoken == ["A old reply"] and len(btns) == 1, (spoken, btns)
+
+
+@needs_browser
+def test_a_room_that_goes_away_stops_the_reading_and_a_later_room_is_backlog_again(tmp_path, qdir) -> None:
+    """Red with: the `m.thread === null` branch of voiceSync (V.stop(), voiceThread = null) removed: the audio keeps playing
+    and, when t1 comes back with a newer reply, it is read as if it were new."""
+    v = _run(tmp_path, qdir, [
+        *PLAYING_A,
+        {"eval": "window.__before = window.__cancels; 1"},
+        _set(_room(None)),
+        {"until": "window.__cancels > window.__before && document.querySelectorAll('.rv-room .voice-btn').length === 0", "ms": 15000},
+        _set(_room("t1", *A, _op(4, "x"), _item(5, "vendor_agent_text", "T1 later"), _item(6, "vendor_turn_ended"))),
+        {"until": "document.querySelectorAll('.rv-room .voice-btn').length === 2", "ms": 15000},
+        {"eval": "new Promise((r) => setTimeout(r, 600)).then(() => JSON.stringify(window.__spoken))"},
+    ])
+    assert json.loads(v[-1]) == ["A old reply"], v[-1]
+
+
+DEFER = """
+  const f1 = window.fetch;
+  window.__defer = false; window.__holdRot = false; window.__rel = null; window.__relRot = null;
+  window.fetch = (u, o) => {
+    const path = new URL(String(u), location.href).pathname;
+    if (path === '/cockpit/room.json' && window.__defer) {
+      const p = f1(u, o);                                   // the body as it is NOW; the page gets it when released
+      window.__defer = false;
+      return new Promise((res) => { window.__rel = () => res(p); });
+    }
+    if (path.endsWith('/rotate') && window.__holdRot) return new Promise((res) => { window.__relRot = () => res(f1(u, o)); });
+    return f1(u, o);
+  };
+"""
+B_T1 = _room("t1", *A, _op(4, "again"), _item(5, "vendor_agent_text", "B reply"), _item(6, "vendor_turn_ended"))
+
+
+@needs_browser
+def test_a_poll_sent_before_the_new_click_cannot_read_the_old_reply_after_it(tmp_path, qdir) -> None:
+    """Red with: `gen++` removed from the New click (the pre-click poll lands, renders B and voiceSync speaks it)."""
+    v = _run(tmp_path, qdir, [
+        *PLAYING_A,
+        {"eval": "window.__room = %s; window.__defer = true; 1" % json.dumps(B_T1)},
+        {"until": "window.__rel", "ms": 15000},
+        _set(_room("t2", _op(1, "other"), _item(2, "vendor_agent_text", "T2 old"), _item(3, "vendor_turn_ended"))),
+        {"eval": "document.querySelector('.rv-rotate').click(); window.__rel(); 1"},
+        {"eval": "new Promise((r) => setTimeout(r, 1500)).then(() => JSON.stringify(window.__spoken))"},
+    ], init_extra=DEFER)
+    assert json.loads(v[-1]) == ["A old reply"], v[-1]
+
+
+@needs_browser
+def test_a_reply_that_finishes_while_the_new_conversation_is_pending_is_not_read(tmp_path, qdir) -> None:
+    """Red with: the `voiceHold` check removed from voiceSync (a poll sent after the click, before the rotate answers, still
+    names the old room and reads B)."""
+    v = _run(tmp_path, qdir, [
+        *PLAYING_A,
+        {"eval": "window.__holdRot = true; document.querySelector('.rv-rotate').click(); 1"},
+        _set(B_T1),
+        {"eval": POLLS},
+        {"eval": "new Promise((r) => setTimeout(r, 300)).then(() => JSON.stringify(window.__spoken))"},
+    ], init_extra=DEFER)
+    assert json.loads(v[-1]) == ["A old reply"], v[-1]
+
+
+@needs_browser
+def test_a_falsy_voice_button_leaving_the_room_does_not_break_the_poll(tmp_path, qdir) -> None:
+    """Red with: `if (b)` removed from voiceBtn (the null is cached) or `if (!w) return;` removed from voiceSync (the reply
+    leaving the room throws and the room reads "could not be read"). Only the crash is asserted: the drawn rows are not rebuilt,
+    so a late control for A cannot be observed."""
+    b = _room("t1", *A, _op(4, "again"), _item(5, "vendor_agent_text", "B reply"), _item(6, "vendor_turn_ended"))
+    v = _run(tmp_path, qdir, [
+        {"eval": "window.__b = LevainVoice.button; LevainVoice.button = (r) => (r.gseq === 3 ? null : window.__b(r)); 1"},
+        _set(_room("t1", *A)),
+        _to_room(),
+        {"until": "[...document.querySelectorAll('.rv-room .rv-text')].some((n) => n.textContent.includes('A old reply'))"},
+        {"eval": "LevainVoice.button = window.__b; 1"},
+        _set(b),
+        {"until": "[...document.querySelectorAll('.rv-room .rv-text')].some((n) => n.textContent.includes('B reply'))", "ms": 15000},
+        {"eval": "window.__err = false; new MutationObserver(() => { if (document.body.textContent.includes('could not be read')) window.__err = true; }).observe(document.body, {subtree: true, childList: true, characterData: true}); 1"},
+        _set(_room(None)),
+        {"eval": POLLS},
+        {"eval": "JSON.stringify(window.__err)"},
+    ])
+    assert json.loads(v[-1]) is False, v[-1]

@@ -180,11 +180,11 @@
       var it = raw[i];
       if (!it || typeof it.gseq !== "number") continue;
       if (it.kind === "message" && it.source === "operator") { buf = []; fresh = false; }
-      else if (it.kind === "vendor_agent_text" && it.body != null && String(it.body) !== "") { buf.push(String(it.body)); fresh = true; foot = it.gseq; }
+      else if (it.kind === "vendor_agent_text" && typeof it.body === "string" && it.body.trim() !== "") { buf.push(it.body); fresh = true; foot = it.gseq; }
       else if (it.kind === "vendor_turn_ended" && fresh) {
         out.push({ thread: thread, gseq: it.gseq, foot: foot, text: buf.join("\n\n") });
-        fresh = false;
       }
+      if (it.kind === "vendor_turn_ended") { buf = []; fresh = false; foot = 0; }   // an earlier turn is never read again (the server's rule)
     }
     return out;
   }
@@ -603,14 +603,16 @@
     if (rotB) rotB.addEventListener("click", function () {
       if (rotB.disabled) return;
       var V = voice(); if (V) V.stop();
+      gen++; voiceHold = true;          // a poll already out, or sent before the answer, names the OLD room: it reads nothing
       rotB.disabled = true; note.textContent = "Starting a new conversation...";
       post("rotate", { room_thread_id: current && current.thread }).then(function (r) {
         note.textContent = r.status === 200 ? "A new conversation is open." : ((r.json && r.json.message) || "No new conversation was started.");
         // a one-poll bridge: the old conversation's problem is not the new one's, but a read that still names the OLD
         // thread is only the server catching up. The same error on a new thread is a new problem and shows.
         if (r.status === 200 && current && current.error) hushed = { thread: current.thread, error: current.error };
-        last = ""; return pull();
-      }).catch(function () { note.textContent = "The server could not be reached."; }).then(paintDock);
+        last = ""; voiceHold = false; return pull();
+      }).catch(function () { note.textContent = "The server could not be reached."; })
+        .then(function () { voiceHold = false; paintDock(); });
     });
     // dictation state: dbase = the text before the transcript, heard = the transcript already placed in the box
     var dbase = "", heard = "", lastHeard = "";
@@ -681,13 +683,13 @@
     // every autoplay question (setting, backlog, hidden, unlocked, the one-waiting queue); this view only reports what the
     // record shows: the finished replies, which of them were already there at mount, and the operator's own taps.
     function voice() { return root.LevainVoice || null; }
-    var wraps = {}, voiceThread = null, voiceBase = 0;
+    var wraps = {}, voiceThread = null, voiceBase = 0, voiceHold = false;
     function voiceKey(r) { return r.thread + ":" + r.gseq; }
     function voiceTap() { var V = voice(); if (V) { V.unlock(); V.stop(); } }     // inside the operator's own tap
     function voiceBtn(r) {
       var V = voice(), k = voiceKey(r);
       if (!V) return null;
-      if (!own(wraps, k)) wraps[k] = V.button(r);
+      if (!own(wraps, k)) { var b = V.button(r); if (b) wraps[k] = b; return b || null; }       // a falsy button is not kept
       return wraps[k];
     }
     // after a draw: drop the controls of replies that are gone, then hand the module each reply that finished after mount
@@ -695,9 +697,13 @@
       var V = voice(), live = {};
       m.replies.forEach(function (r) { live[voiceKey(r)] = true; });
       Object.keys(wraps).forEach(function (k) {
-        if (!own(live, k)) { var w = wraps[k]; delete wraps[k]; if (w.parentNode) w.parentNode.removeChild(w); if (w._unbind) w._unbind(); }
+        if (!own(live, k)) { var w = wraps[k]; delete wraps[k]; if (!w) return; if (w.parentNode) w.parentNode.removeChild(w); if (w._unbind) w._unbind(); }
       });
-      if (!V || m.thread === null) return;
+      if (m.thread === null) {                              // no open room: nothing plays on, and the next room is backlog again
+        if (voiceThread !== null) { voiceThread = null; voiceBase = 0; if (V) V.stop(); }
+        return;
+      }
+      if (!V) return;
       if (voiceThread !== m.thread) {                       // the first body of this mount, or a new conversation
         if (voiceThread !== null) V.stop();
         voiceThread = m.thread;
@@ -705,11 +711,12 @@
         V.arm(voiceBase);
         return;
       }
+      if (voiceHold) return;                                // a New is pending: the old room's replies are not read
       m.replies.forEach(function (r) { if (r.gseq > voiceBase) V.replyFinished(r); });
     }
     function voiceEnd() {
       var V = voice();
-      Object.keys(wraps).forEach(function (k) { var w = wraps[k]; delete wraps[k]; if (w._unbind) w._unbind(); });
+      Object.keys(wraps).forEach(function (k) { var w = wraps[k]; delete wraps[k]; if (w && w._unbind) w._unbind(); });
       if (V) V.stop();
     }
 
