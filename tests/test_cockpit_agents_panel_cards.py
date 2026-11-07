@@ -44,3 +44,10 @@ def test_wire_agents_carries_the_clock() -> None:
     t = datetime(2020, 1, 1, tzinfo=timezone.utc)
     w = wire_agents(Ck(), object(), clock=lambda: t)
     assert w.now() == t
+
+
+def test_a_card_naming_the_agent_by_id_and_another_by_name_are_both_counted_once():
+    cards = [("agent:ag-1:x", False), ("agent:alice:y", False), ("agent:ag-1:alice", True)]
+    idx = _card_index(cards)
+    # the first names it by id, the second by name, the third by both (one card, counted once)
+    assert _cards_of(_agent("ag-1", "alice"), idx) == (2, 1)

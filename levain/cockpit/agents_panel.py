@@ -258,26 +258,31 @@ def _card_marks(wiring: AgentsWiring) -> tuple[list[tuple[str, bool]], str | Non
         return [], f"the review queue cannot be read ({type(exc).__name__})"
 
 
-def _card_index(cards: list[tuple[str, bool]]) -> tuple[dict[str, list[int]], dict[str, list[int]]]:
-    """One pass over the cards: ``(by_id, by_subject)``, each token to ``[open, cleared]``. An agent id counts wherever it
-    stands in the key (it is unique); a name counts only as the key's subject, the part after the kind
-    (``kind:<subject>:...``), so a kind or a suffix that happens to equal a name is not that agent's card."""
-    by_id: dict[str, list[int]] = {}
-    by_subject: dict[str, list[int]] = {}
-    for key, cleared in cards:
+def _card_index(cards: list[tuple[str, bool]]):
+    """One pass over the cards: ``(by_id, by_subject, cleared)``. ``by_id`` and ``by_subject`` map a token to the SET of
+    card positions it names; ``cleared`` is the per-position flag. An agent id counts wherever it stands in the key (it
+    is unique); a name counts only as the key's subject, the part after the kind (``kind:<subject>:...``), so a kind or a
+    suffix that happens to equal a name is not that agent's card. Positions, not counts, so a card that names the agent
+    by id AND by name is one card."""
+    by_id: dict[str, set[int]] = {}
+    by_subject: dict[str, set[int]] = {}
+    flags: list[bool] = []
+    for pos, (key, cleared) in enumerate(cards):
+        flags.append(cleared)
         parts = key.split(":")
         for token in set(parts):
-            by_id.setdefault(token, [0, 0])[1 if cleared else 0] += 1
+            by_id.setdefault(token, set()).add(pos)
         if len(parts) > 1:
-            by_subject.setdefault(parts[1], [0, 0])[1 if cleared else 0] += 1
-    return by_id, by_subject
+            by_subject.setdefault(parts[1], set()).add(pos)
+    return by_id, by_subject, flags
 
 
-def _cards_of(agent: dict[str, Any], index: tuple[dict[str, list[int]], dict[str, list[int]]]) -> tuple[int, int]:
-    """``(open, cleared)`` of the cards whose key names this agent by id, or by name as the key's subject."""
-    by_id, by_subject = index
-    hit = by_id.get(agent["agent_id"]) or by_subject.get(agent["name"]) or [0, 0]
-    return hit[0], hit[1]
+def _cards_of(agent: dict[str, Any], index) -> tuple[int, int]:
+    """``(open, cleared)`` of the cards whose key names this agent by id, or by name as the key's subject (the union)."""
+    by_id, by_subject, flags = index
+    hit = by_id.get(agent["agent_id"], set()) | by_subject.get(agent["name"], set())
+    cleared = sum(1 for pos in hit if flags[pos])
+    return len(hit) - cleared, cleared
 
 
 def _row(agent: dict[str, Any], group: str, words: str, link: str, expiry: str, store_id: str,

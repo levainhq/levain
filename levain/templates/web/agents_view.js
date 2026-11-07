@@ -62,20 +62,24 @@
       return card;
     }
     const bar = el("div", "verb-actions agent-detail-verbs");
+    const disarmers = [];                        // a tap on any verb returns every other verb's second-tap prompt to its label
     for (const v of verbs) {
       const b = el("button", "verb-btn", v.label);
       b.type = "button";
       b.title = v.gloss;
       b.setAttribute("data-agent-verb", v.verb);
       let armed = false;
+      disarmers.push(() => { if (armed) { armed = false; b.textContent = v.label; } });
       b.addEventListener("click", async () => {
         if (v.sure && !armed) {                  // a verb that cannot be undone asks for a second tap, in words
+          for (const d of disarmers) d();
           armed = true;
           b.textContent = "confirm: " + v.sure;
           msg.className = "edit-msg";
           msg.textContent = v.gloss + ". Tap again to do it.";
           return;
         }
+        for (const d of disarmers) d();
         for (const x of bar.querySelectorAll("button")) x.disabled = true;
         msg.className = "edit-msg busy";
         msg.textContent = v.label + "…";
