@@ -628,7 +628,11 @@ self.addEventListener('push', (e) => {
   // on notificationclick, which the iPhone never ran. So the worker stands down: no notification, no launch fallback entry,
   // only the `received` receipt and the badge. (WebKit runs this handler for a declarative push only when `mutable`; the
   // blog and the spec differ, so the stand-down holds either way.)
-  if (d && d.web_push === 8030 && d.notification && typeof d.notification === 'object') {
+  // Only where this browser reads declarative pushes itself (its Notification has the `navigate` member, the proposed
+  // notification's url): a switched-on device on a WebKit that does not (before iOS 18.4) delivers the same JSON as an ordinary
+  // push, and standing down there would show nothing at all. L3 r1: deepseek HIGH, codex HIGH, complement MED.
+  const declarativeUA = typeof Notification !== 'undefined' && Notification && Notification.prototype && 'navigate' in Notification.prototype;
+  if (declarativeUA && d && d.web_push === 8030 && d.notification && typeof d.notification === 'object') {
     trace('sw-version', { version: SW_VERSION, on: 'push-declarative' });
     trace('push-declarative', { tag: traceScalar(d.tag || 'levain'), ping: traceScalar(d.ping) });
     const dping = typeof d.ping === 'number' ? d.ping : Number(d.ping);

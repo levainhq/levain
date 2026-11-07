@@ -33,7 +33,8 @@ def enabled_devices(queue_dir: Path | str) -> frozenset[str]:
     """The device ids the switch is on for; empty (off) when the file is missing, unreadable or not exactly the shape
     above. Never raises."""
     try:
-        raw = _path(queue_dir).read_bytes()
+        with open(_path(queue_dir), "rb") as fh:
+            raw = fh.read(_FILE_MAX + 1)          # bounded: an oversized file is read as off without reading all of it
         if len(raw) > _FILE_MAX:
             return frozenset()
         data = json.loads(raw.decode("utf-8"))

@@ -53,6 +53,8 @@ def test_the_declarative_navigate_is_the_absolute_url_and_the_legacy_members_sta
     assert out["url"] == "/?view=needs&item=np-0123abcd" and out["ping"] == 7 and "mutable" not in out
     assert sender.declarative_payload(_legacy()) == _legacy()                  # no origin, a relative url: the legacy bytes
     assert sender.declarative_payload(_legacy("//evil.example/x"), ORIGIN) == _legacy("//evil.example/x")
+    blank = sender.build_payload("", "a body", "t", "/?view=needs&item=np-0123abcd", 7)
+    assert sender.declarative_payload(blank, ORIGIN) == blank                    # no title: WebKit would drop it, so it goes legacy
 
 
 def test_only_a_switched_on_apple_device_gets_the_declarative_payload(tmp_path, monkeypatch):
@@ -87,5 +89,7 @@ def test_the_worker_shows_no_notification_for_a_declarative_push_but_still_repor
     assert [p["body"]["kind"] for p in got["posts"]] == ["received"] and got["posts"][0]["body"]["ping"] == 42
     assert any(e["step"] == "push-declarative" for e in got["trace"])
     assert not any(e["step"] == "shown-pending" for e in got["trace"])
+    old_ua = _node("ok+declarative+oldua")        # a switched-on device whose WebKit predates declarative push: it must still show it
+    assert old_ua["shownCalls"] == [{"title": "T", "tag": "x"}]
     plain = _node("ok")
     assert plain["shownCalls"] == [{"title": "T", "tag": "x"}]                 # the legacy path is untouched
