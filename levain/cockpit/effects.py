@@ -543,14 +543,21 @@ def _norm(value: Any) -> str:
 
 def _norm_disposition(value: Any, current: Any = None) -> str | None:
     """``current``: the stored disposition. A retired value is refused only as a CHANGE: an echo of a
-    legacy row's own value, or the undo of a permitted re-disposition, leaves it as it was."""
-    from levain.spores import LOOP_DISPOSITION, VALID_DISPOSITIONS, RetiredDisposition, refuse_retired_disposition
+    legacy row's own retired value leaves it as it was. Any other invalid value (None included) is
+    refused as not one of the valid dispositions."""
+    from levain.spores import (
+        LOOP_DISPOSITION,
+        VALID_DISPOSITIONS,
+        RetiredDisposition,
+        refuse_retired_disposition,
+        retired_message,
+    )
 
     try:
         refuse_retired_disposition(value, current)
     except RetiredDisposition as exc:
         raise ValueError(str(exc)) from exc
-    if value not in VALID_DISPOSITIONS and value != current:
+    if value not in VALID_DISPOSITIONS and not (value == current and retired_message(value) is not None):
         raise ValueError(f"disposition must be one of {list(VALID_DISPOSITIONS)} (got {value!r})")
     return None if value == LOOP_DISPOSITION else _norm(value)
 
@@ -720,7 +727,10 @@ def _ce_resolve(direction: str) -> Callable[..., Effect]:
 
 def _ce_undo_edit(params: Mapping[str, Any], pre: Mapping[str, Any] | None, *, origin_key: str | None,
                   version_of: Callable[..., str]) -> Effect:
-    """``params["restore"]``: the field values the reversed edit replaced."""
+    """``params["restore"]``: the field values the reversed edit replaced. Known edge: an undo that
+    restores a RETIRED disposition (a legacy handoff/note the edit had re-dispositioned) is refused,
+    since the current row no longer holds it, so it is a CHANGE into a retired value. No UI builds
+    ``spore_undo_edit`` for a disposition."""
     pre = _require_open(pre)
     restore = params.get("restore")
     if not isinstance(restore, Mapping) or not restore:

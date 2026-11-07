@@ -2074,6 +2074,8 @@ def _apply_spore_set_disposition(
     current = store.get(spore_id)
     # raw stored value (None ≡ a key-free loop) — disposition is an unmodeled SporeDict key
     prior_raw = cast("str | None", current.get("disposition")) if current else None
+    if current is None and retired_message(disposition) is not None:
+        raise EditError("not_found", 404, f"no spore {spore_id!r}")   # a missing row is 404, ahead of the retirement 422
     _refuse_retired_disposition(disposition, prior_raw)   # TS-1: refuse a CHANGE into a retired value
     snapshot = _client_snapshot(req, current, spore_id)   # a moved row is stale, ahead of the confirm gate
     prior = disposition_of(current) if current else LOOP_DISPOSITION  # normalized, for audit

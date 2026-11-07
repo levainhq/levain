@@ -40,6 +40,7 @@ of the reference implementation's; keep them identical.
 
 from __future__ import annotations
 
+import threading
 from collections.abc import Mapping
 from typing import Any
 
@@ -108,14 +109,15 @@ def retired_message(value: Any) -> str | None:
 
 def refuse_retired_disposition(value: Any, current: Any = None) -> None:
     """TS-1, the ONE refusal every writer shares. A retired value is refused unless it is NOT a
-    change (``current`` already holds it: an echo, an undo of a permitted re-disposition, or a
-    crash-after-apply retry whose write already landed)."""
+    change (``current`` already holds it: an echo, or a crash-after-apply retry whose write already
+    landed). An undo that RESTORES a retired value is a change, so it is refused (known edge)."""
     msg = retired_message(value)
     if msg is not None and value != current:
         raise RetiredDisposition(msg)
 
 
 _GUARDED: Any = None
+_GUARDED_LOCK = threading.Lock()   # anneal is imported lazily (this module stays stdlib-only), so build once under a lock
 
 
 def guarded_spore_store(path: Any) -> Any:
@@ -124,35 +126,46 @@ def guarded_spore_store(path: Any) -> Any:
     so no writer (``apply_edit``, the cockpit effects, a CLI, a migration) can route around the
     retirement. Legacy rows still read; a write that leaves a retired value unchanged passes."""
     global _GUARDED
-    if _GUARDED is None:
-        from anneal_memory.spores import ApplyRefused, SporeStore
-
-        class GuardedSporeStore(SporeStore):  # type: ignore[misc]
-            def add(self, *a: Any, **kw: Any) -> Any:
-                refuse_retired_disposition(kw.get("disposition"))
-                return super().add(*a, **kw)
-
-            def update(self, spore_id: str, *a: Any, **kw: Any) -> Any:
-                d = kw.get("disposition")
-                if retired_message(d) is not None:
-                    cur = self.get(spore_id)
-                    refuse_retired_disposition(d, (cur or {}).get("disposition"))
-                return super().update(spore_id, *a, **kw)
-
-            def apply(self, effect: Any) -> Any:
-                d = dict(getattr(effect, "args", None) or {}).get("disposition")
-                if getattr(effect, "op", None) in ("add", "update") and retired_message(d) is not None:
-                    cur = self.get_by_origin_key(effect.origin_key)
-                    try:
-                        if effect.op == "add" and cur is not None:
-                            return super().apply(effect)   # the create already landed: anneal reports ALREADY
-                        refuse_retired_disposition(d, (cur or {}).get("disposition"))
-                    except RetiredDisposition as exc:
-                        raise ApplyRefused(str(exc)) from exc
-                return super().apply(effect)
-
-        _GUARDED = GuardedSporeStore
+    with _GUARDED_LOCK:
+        if _GUARDED is None:
+            _GUARDED = _build_guarded_class()
     return _GUARDED(path)
+
+
+def _build_guarded_class() -> Any:
+    from anneal_memory.spores import ApplyRefused, SporeStore
+
+    class GuardedSporeStore(SporeStore):  # type: ignore[misc]
+        def add(self, *a: Any, **kw: Any) -> Any:
+            refuse_retired_disposition(kw.get("disposition"))
+            return super().add(*a, **kw)
+
+        def update(self, spore_id: str, *a: Any, **kw: Any) -> Any:
+            d = kw.get("disposition")
+            if retired_message(d) is not None:
+                if "expect_disposition" in kw:
+                    # anneal CAS-checks this INSIDE its transaction, so the stored value IS this
+                    # one when the write lands: no unlocked read, no TOCTOU
+                    cur_d = kw["expect_disposition"]
+                else:
+                    # known edge: no CAS sent, so this read is outside the store lock
+                    cur_d = (self.get(spore_id) or {}).get("disposition")
+                refuse_retired_disposition(d, cur_d)
+            return super().update(spore_id, *a, **kw)
+
+        def apply(self, effect: Any) -> Any:
+            d = dict(getattr(effect, "args", None) or {}).get("disposition")
+            if getattr(effect, "op", None) in ("add", "update") and retired_message(d) is not None:
+                cur = self.get_by_origin_key(effect.origin_key)
+                try:
+                    if effect.op == "add" and cur is not None:
+                        return super().apply(effect)   # the create already landed: anneal reports ALREADY
+                    refuse_retired_disposition(d, (cur or {}).get("disposition"))
+                except RetiredDisposition as exc:
+                    raise ApplyRefused(str(exc)) from exc
+            return super().apply(effect)
+
+    return GuardedSporeStore
 
 
 # The tier value that means *deliberate dormancy* (anneal's own ``Tier`` literal — see

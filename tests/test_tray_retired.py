@@ -116,3 +116,76 @@ def test_store_refuses_retired_on_every_writer(tmp_path: Path) -> None:
     add = SporeApply(op="add", origin_key=old["origin_key"], args={"type": "thought", "text": "old", "disposition": "handoff"},
                      postcondition={"type": "thought", "text": "old", "disposition": "handoff"})
     assert store.apply(add).outcome == "already"
+
+
+def test_norm_disposition_missing_or_corrupt_still_invalid() -> None:
+    """N2: only an ECHO of a retired value is exempt from 'must be one of'."""
+    from levain.cockpit.effects import _norm_disposition
+
+    for bad, cur in ((None, None), ("garbage", "garbage"), ("garbage", "seed"), (None, "seed")):
+        with pytest.raises(ValueError, match="must be one of"):
+            _norm_disposition(bad, cur)
+    assert _norm_disposition("note", "note") == "note"          # a retired echo still passes
+
+
+def test_set_disposition_effect_missing_disposition_refused() -> None:
+    from levain.cockpit.effects import _ce_set_disposition
+
+    pre = {"id": "spore-001", "origin_key": "ok-1", "status": "open", "text": "x", "type": "thought"}  # loop row: no key
+    with pytest.raises(ValueError, match="must be one of"):
+        _ce_set_disposition({}, pre, origin_key=None, version_of=lambda r: "v")
+
+
+def test_undo_edit_restoring_retired_value_is_refused() -> None:
+    """Known edge: an undo back into a legacy handoff/note is a CHANGE into a retired value."""
+    from levain.cockpit.effects import _ce_undo_edit
+
+    pre = {"id": "spore-001", "origin_key": "ok-1", "status": "open", "disposition": "seed", "text": "x", "type": "thought"}
+    for old in ("handoff", "note"):
+        with pytest.raises(ValueError, match="retired"):
+            _ce_undo_edit({"restore": {"disposition": old}}, pre, origin_key=None, version_of=lambda r: "v")
+
+
+def test_retired_disposition_from_store_is_422_not_500(install: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """N: a RetiredDisposition out of the guarded store must be a clean 422 bad_verb_arg on update + verb paths."""
+    from levain import writes
+    from levain.spores import RetiredDisposition
+
+    sid = _add_spore(install, disposition="seed")
+
+    class Boom:
+        def get(self, *_a, **_k):
+            return {"id": sid, "status": "open", "disposition": "seed", "type": "thought", "text": "x"}
+
+        def __getattr__(self, name):
+            def raiser(*_a, **_k):
+                raise RetiredDisposition("retired")
+            return raiser
+
+    monkeypatch.setattr(writes, "guarded_spore_store", lambda _p: Boom())
+    for req in ({"kind": "spore_update", "spore_id": sid, "text": "new"},
+                {"kind": "spore_descend", "spore_id": sid, "spore_kind": "composted", "confirm": True},
+                {"kind": "spore_touch", "spore_id": sid}):
+        with pytest.raises(EditError) as ei:
+            apply_edit(_scope(install), req)
+        assert ei.value.code == "bad_verb_arg" and ei.value.http_status == 422, req
+
+
+@pytest.mark.parametrize("disp", ["handoff", "note"])
+def test_set_disposition_missing_spore_is_404_before_retirement(install: Path, disp: str) -> None:
+    with pytest.raises(EditError) as ei:
+        apply_edit(_scope(install), {"kind": "spore_set_disposition", "spore_id": "spore-999", "disposition": disp})
+    assert ei.value.code == "not_found" and ei.value.http_status == 404
+
+
+def test_guarded_update_uses_cas_value_not_an_unlocked_read(tmp_path: Path) -> None:
+    """N3: with a CAS sent, the echo decision is made on the CAS value (checked inside anneal's lock)."""
+    from anneal_memory.spores import SporeStore
+
+    from levain.spores import RetiredDisposition, guarded_spore_store
+
+    old = SporeStore(tmp_path / "s.json").add(type="thought", text="old", disposition="note")
+    store = guarded_spore_store(tmp_path / "s.json")
+    store.update(old["id"], disposition="note", expect_disposition="note")           # echo under CAS: passes
+    with pytest.raises(RetiredDisposition):
+        store.update(old["id"], disposition="note", expect_disposition="seed")       # a seed->note change: refused
