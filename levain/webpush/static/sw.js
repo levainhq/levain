@@ -770,7 +770,21 @@ function sameTarget(a, b) {
   try { const x = new URL(a), y = new URL(b); return x.origin === y.origin && x.pathname === y.pathname && x.search === y.search; } catch (_) { return false; }
 }
 
+// devtest (band 299): the notification-action device test's tap. The worker holds no credential, so it writes the tap to the
+// trace ring ('devtest-click', with the app state it found) and opens /devtest, whose page reports the ring entry with its key.
+async function devtestClick(e) {
+  e.notification.close();
+  let all = [];
+  try { all = (await self.clients.matchAll({ type: 'window', includeUncontrolled: true })).filter((c) => { try { return new URL(c.url).origin === self.location.origin; } catch (_) { return false; } }); } catch (_) { /* none */ }
+  const state = !all.length ? 'none' : all.some((c) => c.visibilityState === 'visible' || c.focused) ? 'visible' : 'hidden';
+  trace('devtest-click', { action: traceScalar(e.action || '(body tap)'), state, windows: all.length });
+  await traceSettled();
+  const url = new URL('/devtest', self.location.origin).href;
+  try { if (all.length) { const w = all[0]; await w.focus(); await w.navigate(url); return; } } catch (_) { /* fall through to a new window */ }
+  try { await self.clients.openWindow(url); } catch (_) { /* best effort */ }
+}
 self.addEventListener('notificationclick', (e) => {
+  if (e.notification && e.notification.data && e.notification.data.devtest) { e.waitUntil(devtestClick(e)); return; }   // devtest
   const clickT0 = Date.now();
   e.notification.close();
   const data = e.notification.data || {};

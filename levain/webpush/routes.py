@@ -208,4 +208,18 @@ def handle(method: str, path: str, query: dict, body: bytes, *, queue_dir: Path 
             return _err(503, "trace_busy", "the trace report file is busy; the page posts again later")
         except OSError:
             return _err(503, "trace_unavailable", "the trace report could not be written")
+    if method == "POST" and path == "/webpush/devtest":   # devtest (band 299): the notification-action device test's report
+        from levain.webpush import devtest
+
+        report = devtest.clean(_body_json(body))
+        if report is None:
+            return _err(400, "bad_devtest", "send event shown|click and the allowlisted fields only")
+        try:
+            return _json(200, {"kept": devtest.record(queue_dir, device_id, report)})
+        except devtest.RateLimited:
+            return _err(429, "limited", "too many device-test reports; wait a minute")
+        except devtest.Busy:
+            return _err(503, "devtest_busy", "the report file is busy; the page posts again")
+        except OSError:
+            return _err(503, "devtest_unavailable", "the report could not be written")
     return _err(404, "not_found", "no such push path")
