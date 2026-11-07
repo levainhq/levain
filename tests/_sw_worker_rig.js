@@ -182,7 +182,15 @@ function fire(type, ev) {
       self_.clients.openWindow = async (u) => { log.order.push('openWindow'); return o(u); };
       self_.registration.pushManager.getSubscription = async () => { log.order.push('getSubscription'); return g(); };
     }
-    const [kind, ack, extra] = parts.filter((p) => p !== 'tracefail' && p !== 'tap' && p !== 'secretq');
+    // 'slowpost': every receipt POST answers 200 only after 1.5 s (a tap report is still in flight while the click's drain reads the queue)
+    if (parts.includes('slowpost')) behaviour = 'slow';
+    // 'slowdrain': the click's queue drain (the FIRST open of the receipts cache) is slow, so it reads the queue after the click's own
+    // report has been queued and while that report's POST is still in flight
+    if (parts.includes('slowdrain')) {
+      const realOpen = caches.open.bind(caches); let first = true;
+      caches.open = async (n) => { if (n === 'levain-receipts' && first) { first = false; await new Promise((r) => setTimeout(r, 120)); } return realOpen(n); };
+    }
+    const [kind, ack, extra] = parts.filter((p) => !['tracefail', 'tap', 'secretq', 'slowpost', 'slowdrain', 'encpath', 'encok', 'encslash'].includes(p));
     // ack: absent = silent page; 'ack' = acks at once; 'late' = acks after OPEN_ACK_MS (the page claims the pending target first)
     const post = function (m, tr) {
       if (m && m.type === 'levain-open') {
@@ -214,7 +222,9 @@ function fire(type, ev) {
     else if (kind === 'tapwin') log.windows = [win(ok, 'https://box.example/tap_trace')];
     else if (kind === 'tapwin2') log.windows = [win(ok, 'https://box.example/tap_trace'), win(ok, 'https://box.example/docs/guide')];
     else if (kind === 'prefer') log.windows = [win(ok, 'https://box.example/docs/guide'), win(async (u) => { log.navigated.push('cockpit:' + u); return { url: u }; }, 'https://box.example/sign/3')];
-    const url = kind === 'crossorigin' ? 'https://evil.example/x' : kind === 'search' ? '/?view=needs' : kind === 'secreturl' ? '/?write_token=SECRET&view=needs#frag' : parts.includes('secretq') ? '/?write_token=SECRET&view=needs&item=np-0b62cd3b#sign=a' : '/sign/9#sign=a&v=1';
+    // 'enc*': the notification url carries a percent-encoded pathname (the tap target must not be mangled by dropping the '%')
+    const encUrl = parts.includes('encpath') ? '/my%20doc?view=needs' : parts.includes('encok') ? '/sign/%39?view=needs' : parts.includes('encslash') ? '/%2F%2Fx' : null;
+    const url = encUrl ? encUrl : kind === 'crossorigin' ? 'https://evil.example/x' : kind === 'search' ? '/?view=needs' : kind === 'secreturl' ? '/?write_token=SECRET&view=needs#frag' : parts.includes('secretq') ? '/?write_token=SECRET&view=needs&item=np-0b62cd3b#sign=a' : '/sign/9#sign=a&v=1';
     const first = fire('notificationclick', { notification: { close: () => {}, data: { url, ping: kind === 'secreturl' ? { write_token: 'SECRET' } : tap ? 42 : undefined, tag: kind === 'secreturl' ? 'x'.repeat(100) : undefined } } });
     if (extra === 'two') { await new Promise((r) => setTimeout(r, 100)); await fire('notificationclick', { notification: { close: () => {}, data: { url: '/sign/10' } } }); }
     await first;

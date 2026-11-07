@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 import shutil
 import subprocess
 from pathlib import Path
@@ -542,7 +543,7 @@ def test_no_notification_in_the_worker_carries_an_actions_key() -> None:
 @needs_node
 def test_activation_carries_the_last_good_shell_forward_when_the_new_install_cached_none() -> None:
     got = _run("carry")
-    assert [c for c in got["caches"] if c.startswith("levain-shell")] == ["levain-shell-v1106-53-tap-1"], got   # the old shell cache is gone
+    assert [c for c in got["caches"] if c.startswith("levain-shell")] == ["levain-shell-v1106-53-tap-2"], got   # the old shell cache is gone
     assert got["shells"][0][1] == [["/", "<html>old shell</html>"]], got          # its page was carried first
 
 
@@ -700,4 +701,35 @@ def test_a_tap_with_no_ping_posts_nothing() -> None:
 
 @needs_node
 def test_the_worker_version_names_this_build() -> None:
-    assert "const SW_VERSION = '1106-53-tap-1';" in SW.read_text()
+    assert "const SW_VERSION = '1106-53-tap-2';" in SW.read_text()
+
+
+# --- L3 round 1 fixes (1106-53, tapcard3) -----------------------------------------------------------------------------
+
+@needs_node
+def test_a_tap_report_in_flight_is_not_posted_a_second_time_by_the_click_drain() -> None:
+    """sendReceipt queues the report and POSTs beside it; the click's drainReceipts runs in the same event and used to read
+    that queue entry and POST it again while the first POST was still in flight."""
+    got = _run("navigate", "controlled+ack+tap+slowpost+slowdrain")
+    reports = [(p["body"]["kind"], p["body"]["at"]) for p in got["posts"] if p["body"]["kind"] in ("clicked", "opened")]
+    assert len(reports) == 2 and len(set(reports)) == 2, got["posts"]
+    assert sorted(k for k, _ in reports) == ["clicked", "opened"]
+
+
+@needs_node
+@pytest.mark.parametrize("flag,target", [("encpath", "/?view=needs"),              # '/my doc' is outside the allowlist: refused, never mangled
+                                         ("encslash", "/"),                # decodes to '//x': never a target
+                                         ("encok", "/sign/9?view=needs")])  # '%39' decodes to '9', an allowed path
+def test_a_percent_encoded_path_is_decoded_then_allowlisted_never_mangled(flag: str, target: str) -> None:
+    got = _run("navigate", f"controlled+ack+tap+{flag}")
+    assert [t[1] for t in _tap_posts(got)] == [target, target], got["posts"]
+
+
+@needs_node
+def test_a_trailing_newline_is_not_an_item_in_the_worker() -> None:
+    src = SW.read_text()
+    m = re.search(r"const TAP_ITEM = (/.*/);", src)
+    assert m, "TAP_ITEM not found"
+    cp = subprocess.run([NODE, "-e", f"const r = {m.group(1)}; console.log(JSON.stringify([r.test('a'), r.test('a\\n'), r.test('\\na')]))"],
+                        capture_output=True, text=True, timeout=30)
+    assert json.loads(cp.stdout) == [True, False, False], cp.stdout + cp.stderr

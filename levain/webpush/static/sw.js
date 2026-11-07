@@ -6,7 +6,7 @@
 // whichever opens first creates the store; correctness depends on no timing (an unread key waits for the next trigger).
 const DB = 'levain-sw-2', STORE = 'opened';
 // A short id of this worker's code, recorded in the trace so a device's trace says which worker ran.
-const SW_VERSION = '1106-53-tap-1';
+const SW_VERSION = '1106-53-tap-2';
 // The TRACE: an append-only ring in its own cache, one entry per step, key TRACE_PREFIX + <time ms, zero padded> + '-' +
 // <seq>, value JSON {t, src, step, ...detail}. The /tap_trace page and sw_open.js read and write the same ring. Writes are
 // best effort, serialized on one chain, never awaited by the tap, and carry only urls without fragments, counts and step
@@ -110,6 +110,9 @@ async function postReceipt(body, b) {
 // a status that retrying cannot change: delivered, or refused for this report itself (an unknown hash or ping included)
 const receiptSettled = (status) => status === 200 || (status >= 400 && status < 500 && status !== 408 && status !== 429);
 let receiptSeq = 0;
+// keys whose first POST is still in flight in sendReceipt: a drain beside it (the click's) skips them, so one report is
+// never POSTed twice at once (the server would absorb the retry as a duplicate, but not for free)
+const receiptInFlight = new Set();
 const receiptKey = (body) => RECEIPT_PREFIX + body.ping + '-' + body.kind + '-' + String(body.at).padStart(13, '0') + '-' +
   String(receiptSeq++).padStart(4, '0');
 // [time, seq] from a key, for oldest-first; a key of an older form sorts first
@@ -145,6 +148,8 @@ async function sendReceipt(ping, kind, at, b, hashP, extra) {
     if (!hash) { trace('receipt-no-sub', { kind, ping }); return false; }
     const body = { ping, kind, at, endpoint_sha256: hash, ...(extra || {}) };   // extra: a tap report's target and how only
     const key = receiptKey(body);
+    receiptInFlight.add(key);
+    try {
     const [put, post] = await Promise.allSettled([b.within(() => putReceipt(key, body)), postReceipt(body, b)]);
     const queued = put.status === 'fulfilled' && put.value === true;
     const status = post.status === 'fulfilled' ? post.value : null;
@@ -155,6 +160,7 @@ async function sendReceipt(ping, kind, at, b, hashP, extra) {
     }
     trace('receipt', { kind, ping, result: queued ? 'queued' : 'lost', status });
     return status !== null;
+    } finally { receiptInFlight.delete(key); }
   } catch (_) { return false; /* a receipt never reaches the notification */ }
 }
 // Re-send queued receipts, oldest first, at most RECEIPT_DRAIN, inside budget b. Each entry is deleted by the exact key
@@ -171,6 +177,7 @@ async function drainReceipts(b) {
     if (keys === LATE) return;
     for (const k of keys.slice(0, RECEIPT_DRAIN)) {
       if (b.over) return;
+      if (receiptInFlight.has(k)) continue;   // its own sender is still POSTing it
       if (Date.now() - receiptAge(k)[0] > RECEIPT_MAX_AGE_MS && receiptAge(k)[0] > 0) {
         try { await b.within(() => c.delete(k)); } catch (_) { /* best effort */ }
         trace('receipt', { kind: null, ping: null, result: 'expired' });
@@ -210,7 +217,10 @@ const TAP_ITEM = /^[A-Za-z0-9_.:-]{1,64}$/;
 function tapTarget(u) {
   try {
     const x = new URL(u, self.location.origin);
-    const p = x.pathname.replace(/[^A-Za-z0-9/_.-]/g, '').slice(0, 60) || '/';
+    // the pathname is percent-encoded: decode it, then keep it only if it is wholly inside the server's grammar (never strip
+    // characters: dropping '%' leaves the hex digits behind, a different path)
+    let p = '/';
+    try { const d = decodeURIComponent(x.pathname); if (/^\/(?!\/)[A-Za-z0-9/_.-]{0,60}$/.test(d)) p = d; } catch (_) { p = '/'; }
     const v = x.searchParams.get('view'), it = x.searchParams.get('item');
     const q = [];
     if (v !== null && /^[a-z]{1,20}$/.test(v)) q.push('view=' + v);
