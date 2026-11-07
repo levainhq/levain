@@ -134,7 +134,7 @@ class PriceTable:
         return None
 
 
-PRICES_AS_OF = "2026-11-05"
+PRICES_AS_OF = "2026-11-07"
 
 # List prices as the vendors' pages printed them on PRICES_AS_OF. Not here on purpose: OpenAI's gpt-4o-mini-tts, which is
 # priced per token with no per-character or per-minute figure to convert, so it is refused as unpriced until someone

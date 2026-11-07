@@ -197,7 +197,8 @@ class OpenAIStream:
         self._closing = False
         self._closed = False
         self._final_committed = False                 # the closing commit is counted (or none was needed)
-        self._commits = 0
+        self._commits = 0                             # commits Levain SENT (send lock to write, read under the state lock)
+        self._acked = 0                               # input_audio_buffer.committed events that answered one of them
         self._uncommitted = 0                         # bytes of 24 kHz audio appended since the last commit
         self._resampler = Resampler16to24()
         self._ws: wsclient.WebSocketClient | None = None
@@ -272,8 +273,12 @@ class OpenAIStream:
         """Fold one event into the item state. False (and the stream failed) past a bound."""
         with self._lock:
             rec = self._items.get(item)
-            if rec is None and event != "committed":
-                return True               # an id the server never acknowledged as committed: ignored (intent; docs ask for item_id matching)
+            if event == "committed":
+                if rec is not None or self._acked >= self._commits:
+                    return True           # a repeat, or an ack of a commit Levain never sent: ignored
+                self._acked += 1
+            elif rec is None:
+                return True               # an id never acknowledged as committed: ignored (docs ask for item_id matching)
             if rec is None:
                 if len(self._order) >= MAX_ITEMS:
                     ok = False

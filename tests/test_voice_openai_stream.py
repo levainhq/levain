@@ -80,6 +80,18 @@ def collect(peer, out, until):
             return
 
 
+def wait_commits(p, n):
+    """Server side: read the client's frames until it has sent n commits (a `committed` ack is only taken for a commit
+    Levain sent). Returns ``more(k)``, which waits until k commits in all have been seen."""
+    frames, stop = [], threading.Event()
+    threading.Thread(target=collect, args=(p, frames, stop), daemon=True).start()
+
+    def more(k):
+        assert wait_for(lambda: sum(m["type"] == "input_audio_buffer.commit" for m in msgs(frames)) >= k)
+    more(n)
+    return more
+
+
 def msgs(frames):
     return [json.loads(d) for op, d in frames if op == 1]
 
@@ -146,6 +158,7 @@ def test_partial_and_final_folding_in_commit_order(serve):
     """Revert: `rec[0] += text` (delta folding), the `rec[1] = text` completion, or the `_order` join in poll()."""
     def script(p):
         p.handshake()
+        wait_commits(p, 2)
         p.send(1, committed("a"))
         p.send(1, committed("b"))
         p.send(1, delta("a", "hel"))
@@ -154,7 +167,9 @@ def test_partial_and_final_folding_in_commit_order(serve):
         p.send(1, done("b", "world"))        # out of order: b completes before a
         time.sleep(1.5)
 
-    s = open_stream(serve(script))
+    s = open_stream(serve(script), commit_every=100)
+    s.send_audio(pcm16k(400))
+    s.send_audio(pcm16k(400))
     assert wait_for(lambda: s.poll().final == "world")
     up = s.poll()
     assert up.partial == "hello" and not up.failed        # a is the newest pending item
@@ -165,13 +180,16 @@ def test_final_replaces_partial_and_orders_by_item(serve):
     """Revert: `rec[0] = ""` on completion or the commit-order join."""
     def script(p):
         p.handshake()
+        wait_commits(p, 2)
         p.send(1, committed("a"))
         p.send(1, committed("b"))
         p.send(1, done("b", "second"))
         p.send(1, done("a", "first"))
         time.sleep(1.0)
 
-    s = open_stream(serve(script))
+    s = open_stream(serve(script), commit_every=100)
+    s.send_audio(pcm16k(400))
+    s.send_audio(pcm16k(400))
     assert wait_for(lambda: s.poll().final == "first second")
     assert s.poll().partial == ""
     s.close()
@@ -273,16 +291,17 @@ def test_close_deadline_keeps_text_and_marks_incomplete(serve):
     """Revert: the `self._fail("incomplete")` in close()."""
     def script(p):
         p.handshake()
+        more = wait_commits(p, 1)
         p.send(1, committed("a"))
-        p.send(1, committed("b"))
         p.send(1, done("a", "said"))
+        more(2)                                          # the closing commit
+        p.send(1, committed("b"))
         p.send(1, delta("b", "tail"))
         time.sleep(1.5)
 
     s = open_stream(serve(script), close_drain=0.3, commit_every=1000)
     s.send_audio(pcm16k(400))           # commit 1 (periodic)
     s.send_audio(pcm16k(300))           # the tail: commit 2 at close, never completed
-    assert wait_for(lambda: s.poll().partial == "tail")
     assert s.close() == "said tail"
     assert s.poll().failed and s.reason == "incomplete"
 
@@ -305,21 +324,25 @@ def test_overflow_is_bounded(serve, monkeypatch):
 
     def script(p):
         p.handshake()
+        wait_commits(p, 1)
         p.send(1, committed("a"))
         p.send(1, delta("a", "y" * 30))
         time.sleep(0.5)
 
-    s = open_stream(serve(script))
+    s = open_stream(serve(script), commit_every=100)
+    s.send_audio(pcm16k(400))
     assert wait_for(lambda: s.poll().failed) and s.reason == "overflow"
     s.close()
 
     def script2(p):
         p.handshake()
+        wait_commits(p, 1)
         p.send(1, committed("a"))
         p.send(1, done("a", "z" * 30))
         time.sleep(0.5)
 
-    s = open_stream(serve(script2))
+    s = open_stream(serve(script2), commit_every=100)
+    s.send_audio(pcm16k(400))
     assert wait_for(lambda: s.poll().failed) and s.reason == "overflow"
     s.close()
 
@@ -482,6 +505,7 @@ def test_a_completion_for_an_item_never_committed_is_ignored(serve):
     non-committed event."""
     def script(p):
         p.handshake()
+        wait_commits(p, 1)
         p.send(1, committed("a"))
         p.send(1, delta("ghost", "stray partial"))
         p.send(1, done("ghost", "stray words"))
@@ -489,7 +513,8 @@ def test_a_completion_for_an_item_never_committed_is_ignored(serve):
         p.send(1, done("a", "real words"))
         time.sleep(1.0)
 
-    s = open_stream(serve(script))
+    s = open_stream(serve(script), commit_every=100)
+    s.send_audio(pcm16k(400))
     assert wait_for(lambda: s.poll().final == "real words")
     assert "stray" not in s.poll().final + s.poll().partial
     assert not s.poll().failed
@@ -524,3 +549,26 @@ def test_the_sent_model_is_the_priced_model():
     assert oa.TRANSCRIBE_MODEL == providers.STREAM_STT_MODELS["openai"]
     for provider, model in providers.STREAM_STT_MODELS.items():
         assert meter.DEFAULT_PRICES.find(provider, "stt", model) is not None, (provider, model)
+
+
+def test_an_unsolicited_committed_and_its_completion_cannot_satisfy_the_drain(serve):
+    """A `committed` event Levain sent no commit for (acks already equal commits sent) is ignored with its completion, so it
+    cannot make `_resolved` reach `_commits` and end the drain on unsolicited text. Revert: the `_acked >= _commits` test
+    in _take."""
+    def script(p):
+        p.handshake()
+        frames, stop = [], threading.Event()
+        th = threading.Thread(target=collect, args=(p, frames, stop), daemon=True)
+        th.start()
+        assert wait_for(lambda: any(m["type"] == "input_audio_buffer.commit" for m in msgs(frames)))
+        p.send(1, committed("a"))
+        p.send(1, committed("rogue"))                     # no second commit was sent
+        p.send(1, done("rogue", "unsolicited words"))
+        time.sleep(0.5)
+        p.send(1, done("a", "real words"))
+        time.sleep(0.5)
+        stop.set()
+
+    s = open_stream(serve(script))
+    s.send_audio(pcm16k(3200))
+    assert s.close() == "real words"
