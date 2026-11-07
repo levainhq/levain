@@ -45,7 +45,7 @@ STORE_APPLIED = ("applied:0", "journaled:0", "finished")      # the store write 
 VERBS = {
     "seed": ("spore_seed", {"text": "captured", "type": "task"}, None),
     "update_text": ("spore_update", {"text": "edited"}, "k.loop"),
-    "set_disposition": ("spore_set_disposition", {"disposition": "note"}, "k.seed"),
+    "set_disposition": ("spore_set_disposition", {"disposition": "agenda"}, "k.seed"),
     "surface_at": ("spore_surface_at", {"surface_at": "2026-10-11"}, "k.loop"),
     "descend": ("spore_descend", {"spore_kind": "done"}, "k.loop"),
     "ascend": ("spore_ascend", {"spore_kind": "project", "ref": "commit abc"}, "k.loop"),

@@ -143,7 +143,7 @@ def test_rp10_2_a_paired_token_makes_a_c1_write_and_a_broker_backed_t2(src) -> N
         row = _tray_row(port, tok)
         st, out, _ = _call(port, "POST", "/cockpit/verb", {
             "verb": "spore_set_disposition", "panel_id": "tray", "row_id": row["id"], "row_version": row["version"],
-            "params": {"disposition": "note"}, "intent": "reported", "tier_seen": "T2",
+            "params": {"disposition": "agenda"}, "intent": "reported", "tier_seen": "T2",
             "gesture_seen": "direct-reported", "idempotency_key": "t2-1"}, token=tok, headers=PROXY)
         assert (st, out.get("state"), out.get("decision_kind")) == (200, "COMMITTED", "ALLOWED_REPORTED"), out
 
@@ -156,7 +156,7 @@ def test_rp10_4_revoke_refuses_the_next_request_cascades_and_rotates(src) -> Non
         row = _tray_row(port, ta)
         st, held, _ = _call(port, "POST", "/cockpit/verb", {      # a WAITING pending under A (no intent = sign)
             "verb": "spore_set_disposition", "panel_id": "tray", "row_id": row["id"],
-            "row_version": row["version"], "params": {"disposition": "note"}}, token=ta, headers=PROXY)
+            "row_version": row["version"], "params": {"disposition": "agenda"}}, token=ta, headers=PROXY)
         assert (st, held["state"]) == (200, "WAITING"), held
         db = httpd.broker.active_db()
         assert db.token_generation(PAIRED_PREFIX + a) == 1

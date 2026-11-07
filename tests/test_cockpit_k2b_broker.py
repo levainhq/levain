@@ -77,7 +77,7 @@ def _target(spores: Path, key: str) -> dict[str, Any]:
 
 def _move(b: Broker, spores: Path, key: str = "k.seed", *, cred: dict = BROWSER, **kw: Any) -> dict:
     kw.setdefault("tier", "T2")
-    return b.issue(verb="spore_set_disposition", params={"disposition": "note"},
+    return b.issue(verb="spore_set_disposition", params={"disposition": "agenda"},
                    target=_target(spores, key), credential=cred, **kw)
 
 
@@ -149,8 +149,8 @@ def test_a_t2_on_the_token_fires_allowed_reported_and_reads_claims_cockpit_token
     out = _move(broker, spores, intent="reported")
     assert (out["state"], out["decision_kind"], out["label"]) == ("COMMITTED", "ALLOWED_REPORTED",
                                                                   "claims cockpit token")
-    assert _disposition(spores, "k.seed") == "note"
-    assert _label(broker, "spore:k.seed", "disposition", "note") == "claims cockpit token"
+    assert _disposition(spores, "k.seed") == "agenda"
+    assert _label(broker, "spore:k.seed", "disposition", "agenda") == "claims cockpit token"
     # the fire is journalled: no fire without a pending (a handler fired directly fails this line)
     assert _rows(broker, "SELECT verb, intent, state FROM pendings") == [
         ("spore_set_disposition", "reported", "COMMITTED")]
@@ -190,7 +190,7 @@ def test_sign_returns_a_pending_that_fires_only_on_a_valid_signature(broker, spo
 
     done = broker.submit(pid, phone.sign(record))
     assert (done["state"], done["decision_kind"], done["label"]) == ("COMMITTED", "ALLOWED", "signed · reported")
-    assert _disposition(spores, "k.seed") == "note"
+    assert _disposition(spores, "k.seed") == "agenda"
     assert _rows(broker, "SELECT signer_fp FROM pendings") == [(phone.fingerprint,)]
     # a resubmitted signature after the outcome returns it and fires nothing again
     before = spores.read_bytes()
@@ -236,7 +236,7 @@ def test_a_t3_on_the_token_alone_is_refused_and_records_nothing(broker, spores):
     e = _refused("refused", _move, broker, spores, intent="reported", tier="T3")
     assert "T3" in str(e)
     assert _rows(broker, "SELECT 1 FROM pendings") == []
-    _refused("refused", broker.issue, verb="spore_set_disposition", params={"disposition": "note"},
+    _refused("refused", broker.issue, verb="spore_set_disposition", params={"disposition": "agenda"},
              target=_target(spores, "k.seed"), tier="T2", credential={"class": "device", "fingerprint": "SHA256:x"},
              intent="reported")
 
@@ -252,7 +252,7 @@ def test_a_row_without_an_origin_key_is_refused(broker, spores):
     spores.write_text(json.dumps(data))
     spores.parent.chmod(0o500)
     try:
-        e = _refused("refused", broker.issue, verb="spore_set_disposition", params={"disposition": "note"},
+        e = _refused("refused", broker.issue, verb="spore_set_disposition", params={"disposition": "agenda"},
                      target={"kind": "row", "panel_id": "loops", "row_id": f"spore:{sid}"}, tier="T2",
                      credential=BROWSER, intent="reported")
     finally:
@@ -386,7 +386,7 @@ def test_draining_holds_the_lock_while_an_admitted_settler_is_blocked(home, spor
         stopper.join(5)
         assert first.state is Lifecycle.CLOSED
         assert _wait(lambda: second.state is Lifecycle.ACTIVE, 3.0)
-        assert _disposition(spores, "k.seed") == "note"
+        assert _disposition(spores, "k.seed") == "agenda"
     finally:
         store.release.set()
         second.stop()
@@ -434,7 +434,7 @@ def test_a_fault_with_no_reads_retries_by_itself(home, spores):
         assert _rows(b, "SELECT attempts, status FROM effects") == [(1, "PLANNED")]
         # no read of any kind from here: only the thread can finish it, at next_attempt_at (5 s)
         assert _wait(lambda: _state(b, out["pending_id"]) == "COMMITTED", 9.0)
-        assert store.calls == 2 and _disposition(spores, "k.seed") == "note"
+        assert store.calls == 2 and _disposition(spores, "k.seed") == "agenda"
     finally:
         b.stop()
 
@@ -480,7 +480,7 @@ def test_start_recovery_finishes_a_decided_op(home, spores):
         conn.execute("UPDATE effects SET next_attempt_at = '2000-01-01T00:00:00.000000Z'")
     again = _broker(home, spores, store)
     try:
-        assert _state(again, pid) == "COMMITTED" and _disposition(spores, "k.seed") == "note"
+        assert _state(again, pid) == "COMMITTED" and _disposition(spores, "k.seed") == "agenda"
     finally:
         again.stop()
 
@@ -554,7 +554,7 @@ def test_the_post_routes_reach_the_broker_only_in_a_declared_install(tmp_path, m
 
     root, src, ids = _install(tmp_path)
     store = SporeStore(root / ".levain" / "memory.spores.json")
-    body = {"verb": "spore_set_disposition", "panel_id": "tray", "params": {"disposition": "note"}}
+    body = {"verb": "spore_set_disposition", "panel_id": "tray", "params": {"disposition": "agenda"}}
 
     def row(url: str) -> dict:
         from tests.test_cockpit_k2a import _get
@@ -580,7 +580,7 @@ def test_the_post_routes_reach_the_broker_only_in_a_declared_install(tmp_path, m
         pid = held["pending_id"]
         status, out = _post(f"{url}/cockpit/verb", {**at, **seen, "intent": "reported", "idempotency_key": "i1"}, token="T")
         assert (status, out["state"], out["label"]) == (200, "COMMITTED", "claims cockpit token"), out
-        assert store.get(ids["seed"]).get("disposition") == "note"
+        assert store.get(ids["seed"]).get("disposition") == "agenda"
         status, again = _post(f"{url}/cockpit/verb", {**at, **seen, "intent": "reported", "idempotency_key": "i1"}, token="T")
         assert (status, again["pending_id"], again["replay"]) == (200, out["pending_id"], True)
         status, bad = _post(f"{url}/cockpit/pending/{pid}/signature", {"signature": "nope"}, token="T")

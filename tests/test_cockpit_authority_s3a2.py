@@ -253,16 +253,16 @@ def test_a_replayed_reported_pending_on_a_refused_log_is_unavailable_and_stays_w
     tgt = _target(spores, "k.seed")
     dead = new_pending_id()
     with broker._admitted() as db:                 # the request that died after `issued`
-        built = broker._build(db, "spore_set_disposition", {"disposition": "note"}, tgt, dead, at_issue=True)
+        built = broker._build(db, "spore_set_disposition", {"disposition": "agenda"}, tgt, dead, at_issue=True)
         n = broker._now()
         raw = broker._record(pid=dead, verb="spore_set_disposition", intent="reported", built=built,
-                             params={"disposition": "note"}, tier="T2", fence=broker.capture().fence,
+                             params={"disposition": "agenda"}, tier="T2", fence=broker.capture().fence,
                              issued_at=utc_stamp(n), expires_at=utc_stamp(n + timedelta(minutes=15)))
         db.issue(record_bytes=raw, principal="token:browser:1", idempotency_key="died", now=n, cap_exempt=True)
     good = _refuse_the_log(broker.data_root)
 
     def replay() -> dict[str, Any]:
-        return broker.issue(verb="spore_set_disposition", params={"disposition": "note"}, target=tgt, tier="T2",
+        return broker.issue(verb="spore_set_disposition", params={"disposition": "agenda"}, target=tgt, tier="T2",
                             credential=BROWSER, intent="reported", idempotency_key="died")
     err = _refused("authority_unavailable", replay)
     assert err.status == 503
@@ -364,7 +364,7 @@ def test_a_revoked_key_signs_nothing_and_its_compromised_fires_read_revoked(brok
     phone = Key(keydir, "phone").enroll(broker, "display-phone")
     pid, sig = _sign_pending(broker, spores, phone)
     assert broker.submit(pid, sig)["label"] == "signed · reported"
-    key = LabelKey("spore:k.seed", {"disposition": "note"})
+    key = LabelKey("spore:k.seed", {"disposition": "agenda"})
     assert broker.capture().labels.label(key) == "signed · reported"
     fired_at = broker.capture().authority.seq
     revoke_any(broker.db, phone, compromised_since=fired_at)
@@ -381,7 +381,7 @@ def test_a_compromise_after_the_fire_leaves_its_label(broker, spores, keydir):
     broker.submit(pid, sig)
     Key(keydir, "other").enroll(broker, "presence")                    # the head moves past the fire
     revoke_any(broker.db, phone, compromised_since=broker.capture().authority.seq)
-    assert broker.capture().labels.label(LabelKey("spore:k.seed", {"disposition": "note"})) == "signed · reported"
+    assert broker.capture().labels.label(LabelKey("spore:k.seed", {"disposition": "agenda"})) == "signed · reported"
 
 
 def test_an_append_stales_a_waiting_signed_pending(broker, spores, keydir):

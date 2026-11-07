@@ -7,10 +7,12 @@ from levain.spores import (
     BUCKET_LOOP,
     BUCKET_TRAY,
     KEEP_DISPOSITIONS,
+    RETIRED_DISPOSITIONS,
     LOOP_DISPOSITION,
     NON_COGNITION_DISPOSITIONS,
     PARKED_TIER,
     TRAY_DISPOSITIONS,
+    TRAY_WRITE_DISPOSITIONS,
     VALID_DISPOSITIONS,
     bucket_of,
     disposition_of,
@@ -32,10 +34,13 @@ from levain.spores import (
 
 def test_frozen_disposition_literals():
     assert LOOP_DISPOSITION == "loop"
-    assert TRAY_DISPOSITIONS == ("seed", "handoff", "agenda")
+    assert TRAY_DISPOSITIONS == ("seed", "handoff", "agenda")      # the READ set
+    assert TRAY_WRITE_DISPOSITIONS == ("seed", "agenda")
+    assert RETIRED_DISPOSITIONS == ("handoff", "note")
     assert KEEP_DISPOSITIONS == ("note",)
+    # the READ set keeps the retired names (is_loop fails open on an unknown value); the WRITE set loses them
     assert NON_COGNITION_DISPOSITIONS == ("seed", "handoff", "agenda", "note")
-    assert VALID_DISPOSITIONS == ("loop", "seed", "handoff", "agenda", "note")
+    assert VALID_DISPOSITIONS == ("loop", "seed", "agenda")
 
 
 def test_parked_tier_is_a_real_anneal_tier():
