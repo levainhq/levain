@@ -2169,8 +2169,11 @@ def _drop_retired_slots(in_service: Mapping[str, tuple[int, ...]],
     retired marker: the product's own leftover, not a slot repair could ever serve. Dropped ONLY when EVERY account of
     the slot carries the exact retired label (``tombs``, read from the directory's account labels, never from the dir
     name). A live, unlabelled, absent or half-retired slot stays in service, so ``account-missing`` still refuses it."""
-    return {cls: tuple(i for i in idx if not all(n in tombs for n in SlotId(cls, i).accounts))  # type: ignore[arg-type]
-            for cls, idx in in_service.items()}
+    def retired(cls: str, i: int) -> bool:
+        accts = SlotId(cls, i).accounts  # type: ignore[arg-type]
+        return bool(accts) and all(n in tombs for n in accts)      # no accounts is never "retired": fail closed
+
+    return {cls: tuple(i for i in idx if not retired(cls, i)) for cls, idx in in_service.items()}
 
 
 def _repair_facts(cmd: InstallCommand, host: HostOS, d: Directory, accounts: Mapping[str, int],

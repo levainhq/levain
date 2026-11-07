@@ -210,3 +210,16 @@ def test_the_gather_drops_retired_slots_but_refuses_a_live_one(tmp_path: Path) -
     assert e.value.name == "account-missing"
     kept = IH._drop_retired_slots({"egress": rf_old.egress}, _tombs(SlotId("egress", 7)))
     _plan(facts, IH.RepairFacts(**{**rf.__dict__, "egress": kept["egress"]}))
+
+
+def test_a_slot_with_no_accounts_is_never_read_as_retired() -> None:
+    """Revert: the bool(accts) guard in _drop_retired_slots (all([]) is True: an account-less slot was dropped from repair)."""
+    from unittest import mock
+
+    from levain.slot import install_helper as IH
+
+    class _NoAccounts:
+        accounts = ()
+
+    with mock.patch.object(IH, "SlotId", lambda cls, i: _NoAccounts()):
+        assert IH._drop_retired_slots({"claude": (0,)}, {}) == {"claude": (0,)}
