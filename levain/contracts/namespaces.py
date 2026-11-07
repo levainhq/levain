@@ -88,13 +88,15 @@ LEVAIN_SIGN_REQUESTS: dict[str, str] = {
     # verifier re-parses.
     ANSWER_COUNTERSIGN_NAMESPACE: r"levain-terminal-answer/1\nstore: levain-questions:[^\n]+\n(?:.+\n){7}"
                                   r"countersign-of: .+\n(?:.+\n)+",
-    # row 113: the format line and eight fixed lines; the item's bytes are bound by item-sha256 and the approval's
-    # deadline by expires (signed, so editing the request file cannot extend it); change and summary are levain's
-    # words. A shape fence only: kind is the kept item's own (registry.KINDS is its one definition, compared at use)
+    # row 113: the format line and nine fixed lines; the item's bytes are bound by item-sha256, the approval's
+    # deadline by expires (signed, so editing the request file cannot extend it) and the passkey site that may
+    # approve by rp (the queue cockpit's host at filing; the signer's key must be of it); change and summary are
+    # levain's words. A shape fence only: kind is the kept item's own (registry.KINDS is its one definition, compared
+    # at use)
     CONFIG_APPROVE_NAMESPACE: r"levain-dispatch-config-approve/1\nstore: [^\n]+\nkind: [^\n]+\ngeneration: [0-9]+\n"
                               r"prev: [^\n]+\nitem-sha256: [0-9a-f]{64}\n"
                               r"expires: [0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}\.[0-9]{6}Z\n"
-                              r"change: [^\n]+\nsummary: [^\n]+\n",
+                              r"rp: [a-z0-9.-]+\nchange: [^\n]+\nsummary: [^\n]+\n",
 }
 
 # Reserved families: prefix -> the rule. A family reserves the prefix against any other meaning; it registers

@@ -1278,8 +1278,10 @@ def _sign_queue(args: argparse.Namespace) -> Path:
 def _phone_keys(args: argparse.Namespace, d: Path) -> Callable[[str], dict[str, Any]]:
     """``keys(rp_id)``: the active passkeys on site ``rp_id``, read from a fresh replay of the SAME authority log the
     control store is verified against (so a passkey enrolled in some other cockpit approves nothing here) on every
-    call. The site comes from the approval's own record, not the cockpit's published origin: a cockpit stopped
-    between the phone tap and the laptop touch withdraws its origin, and the approval still reads back."""
+    call. The site is the approval message's own signed ``rp`` line, fixed from the queue cockpit's published origin
+    when the request was filed (:func:`levain.dispatch.phone_config.queue_rp`), not read from the cockpit now: a
+    cockpit stopped between the phone tap and the laptop touch withdraws its origin, and the approval still reads
+    back, bound to the site it was filed for."""
     import sqlite3
 
     from levain.authority import AuthorityError

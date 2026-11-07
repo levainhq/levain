@@ -265,7 +265,7 @@ def test_a_kept_item_for_another_store_or_generation_than_approved_is_refused(ca
     raw = ctl.item_bytes("verifier", 1, VERIFIERS, datetime.now(timezone.utc), prev="", store_id=s.store_id())
     pc._write_pending(ddir, hashlib.sha256(raw).hexdigest(), raw)
     lying = (f"{pc.FORMAT_LINE}\nstore: {s.store_id()}\nkind: verifier\ngeneration: 7\nprev: none\n"
-             f"item-sha256: {hashlib.sha256(raw).hexdigest()}\nexpires: {_soon()}\nchange: x\nsummary: y\n")
+             f"item-sha256: {hashlib.sha256(raw).hexdigest()}\nexpires: {_soon()}\nrp: {RP}\nchange: x\nsummary: y\n")
     from levain.consent.sign import file_levain_request
     rid = file_levain_request(signq, ANS, lying, title="t", ttl_s=600)
     phone_sign(signq, rid, phones["good"])
@@ -343,7 +343,7 @@ def test_a_card_in_another_namespace_with_the_same_words_approves_nothing(capsys
     sha = hashlib.sha256(raw).hexdigest()
     pc._write_pending(ddir, sha, raw)
     message = (f"{pc.FORMAT_LINE}\nstore: {s.store_id()}\nkind: verifier\ngeneration: 1\nprev: none\n"
-               f"item-sha256: {sha}\nexpires: {_soon()}\nchange: x\nsummary: y\n")
+               f"item-sha256: {sha}\nexpires: {_soon()}\nrp: {RP}\nchange: x\nsummary: y\n")
     rid = "lv-" + "a" * 32
     d = sign_dir(signq)
     d.mkdir(mode=0o700, parents=True, exist_ok=True)
@@ -497,19 +497,23 @@ def test_a_grammar_refusal_keeps_no_item(ddir, monkeypatch, tmp_path, signq):
     assert not list((ddir / pc.PENDING_DIR).glob("*"))
 
 
-def test_kept_items_are_written_under_a_private_temporary_and_pruned_when_stale(ddir, monkeypatch):
+def test_kept_items_are_written_under_a_private_temporary_and_pruned_when_stale(ddir, monkeypatch, signq):
     raw = ctl.item_bytes("verifier", 1, VERIFIERS, datetime.now(timezone.utc), prev="", store_id="0" * 32)
     sha = hashlib.sha256(raw).hexdigest()
     d = ddir / pc.PENDING_DIR
     d.mkdir(mode=0o700, parents=True)
     (d / f".{sha}.tmp").symlink_to("/nonexistent")       # the old fixed name: another writer's, never reused
-    assert pc._write_pending(ddir, sha, raw) is True and pc._write_pending(ddir, sha, raw) is False
+    pc._write_pending(ddir, sha, raw)
+    ino = os.stat(d / f"{sha}.item").st_ino
+    with pytest.raises(FileExistsError):                  # a kept item is never replaced or shared
+        pc._write_pending(ddir, sha, raw)
+    assert os.stat(d / f"{sha}.item").st_ino == ino
     assert pc.load_pending(ddir, sha) == raw and [p.name for p in d.glob("*.tmp")] == [f".{sha}.tmp"]
-    real_replace = os.replace
-    monkeypatch.setattr(pc.os, "replace", lambda *a: (_ for _ in ()).throw(OSError("disk")))
+    real_link = os.link
+    monkeypatch.setattr(pc.os, "link", lambda *a, **k: (_ for _ in ()).throw(OSError("disk")))
     with pytest.raises(OSError):
         pc._write_pending(ddir, "f" * 64, raw)
-    monkeypatch.setattr(pc.os, "replace", real_replace)
+    monkeypatch.setattr(pc.os, "link", real_link)
     assert not [p for p in d.iterdir() if p.name.endswith(".tmp") and not p.is_symlink()]
     # stale: older than any approval over it can be used, so the next request removes it (a fresh one stays)
     old = __import__("time").time() - pc._PRUNE_AGE_S - 60
@@ -518,7 +522,7 @@ def test_kept_items_are_written_under_a_private_temporary_and_pruned_when_stale(
     monkeypatch.setattr(csign, "file_levain_request", lambda *a, **k: "lv-" + "b" * 32)
     fresh = ctl.item_bytes("verifier", 1, VERIFIERS, datetime.now(timezone.utc) + timedelta(seconds=1), prev="",
                            store_id="0" * 32)
-    assert pc.file_request(ddir, ddir, fresh, change="c", summary="s") == "lv-" + "b" * 32
+    assert pc.file_request(ddir, signq, fresh, change="c", summary="s") == "lv-" + "b" * 32
     assert not (d / f"{sha}.item").exists() and (d / f"{hashlib.sha256(fresh).hexdigest()}.item").exists()
 
 
@@ -542,3 +546,82 @@ def test_an_agent_holding_a_signed_approval_still_cannot_accept_it(capsys, ddir,
     code, out, _ = approve(capsys, ddir, root, keys, signq, rid)
     assert code == 2 and "is the operator's own act" in out and no_touch.calls == 0 and gen(ddir, root) == 0
     assert list((ddir / pc.PENDING_DIR).glob("*.item"))
+
+
+# --- L3 round 2 (cfgsign): the signed site, one owner per kept item, the publish's own failure ------------------------
+
+def test_the_request_signs_the_site_the_queue_cockpit_published(capsys, ddir, root, keys, signq, tmp_path, pushes):
+    rid = _filed(capsys, ddir, root, keys, signq, tmp_path)
+    assert f"\nrp: {RP}\n" in read_request(signq, rid).message
+
+
+def test_a_queue_with_no_published_cockpit_files_nothing_and_keeps_nothing(capsys, ddir, root, keys, signq, tmp_path):
+    init(capsys, ddir, root, keys)
+    (signq / "cockpit-origin.json").unlink()
+    code, out, err = request(capsys, ddir, root, signq, tmp_path)
+    assert code != 0 and "no cockpit origin" in out and "Traceback" not in err
+    assert not sign_dir(signq).exists() or not list(sign_dir(signq).glob("lv-*.json"))
+    assert not (ddir / pc.PENDING_DIR).exists() or not list((ddir / pc.PENDING_DIR).glob("*"))
+
+
+def test_a_passkey_of_another_site_in_the_same_log_approves_nothing(capsys, ddir, root, keys, log, signq, tmp_path,
+                                                                    pushes, no_touch):
+    """codex (verify): the site was recovered from the record's own key, so any active passkey of ANY site in this log
+    approved. The request now signs the site it was filed for, and the signer's key must be of it."""
+    other = _Passkey(rp="elsewhere.example")
+    log.link({"op": "enrol", "fingerprint": other.key.fingerprint, "public_key": other.line, "class": "display-phone",
+              "custody": "passkey"})
+    rid = _filed(capsys, ddir, root, keys, signq, tmp_path)
+    s = Signer(signq, (), other.rp, lambda: {other.key.fingerprint: other.key})
+    ch = s.challenge(rid, {"signer_fp": other.key.fingerprint, "request_sha256": read_request(signq, rid).sha256})
+    s.answer(rid, other.assertion(ch["challenge"], f"https://{other.rp}"))
+    assert json.loads((sign_dir(signq) / f"{rid}.signed.json").read_text())["signer_fp"] == other.key.fingerprint
+    code, out, _ = approve(capsys, ddir, root, keys, signq, rid)
+    assert code != 0 and f"a passkey of elsewhere.example, not of {RP}" in out
+    assert gen(ddir, root) == 0 and no_touch.calls == 0
+
+
+def test_a_second_filing_of_the_same_bytes_cannot_unkeep_the_first(ddir, signq, monkeypatch):
+    """codex MED (verify): two filers of one item; the second fails. Its cleanup must never remove the item the
+    first filing (whose approval is live) depends on, and the first item is never replaced (same inode, same mtime,
+    so neither a claim lock nor the prune age is moved under it)."""
+    from levain.consent import sign as csign
+    raw = ctl.item_bytes("verifier", 1, VERIFIERS, datetime.now(timezone.utc), prev="", store_id="0" * 32)
+    sha = hashlib.sha256(raw).hexdigest()
+    item = ddir / pc.PENDING_DIR / f"{sha}.item"
+    seen: dict = {}
+
+    def filing(*a, **k):
+        if "first" in seen:                       # the second filer, while the first one's request is being filed
+            raise OSError("queue full")
+        seen["first"] = os.stat(item)
+        with pytest.raises(FileExistsError):
+            pc.file_request(ddir, signq, raw, change="c", summary="s")
+        return "lv-" + "c" * 32
+    monkeypatch.setattr(csign, "file_levain_request", filing)
+    assert pc.file_request(ddir, signq, raw, change="c", summary="s") == "lv-" + "c" * 32
+    after = os.stat(item)
+    assert pc.load_pending(ddir, sha) == raw
+    assert (after.st_ino, after.st_mtime_ns) == (seen["first"].st_ino, seen["first"].st_mtime_ns)
+
+
+def test_a_sync_failure_after_publishing_leaves_no_item(ddir, signq, monkeypatch):
+    """codex LOW (verify): the directory sync runs after the item is linked into place; if it fails, the item is
+    removed with it, never left behind with no request."""
+    raw = ctl.item_bytes("verifier", 1, VERIFIERS, datetime.now(timezone.utc), prev="", store_id="0" * 32)
+    real, calls = os.fsync, []
+
+    def fsync(fd):
+        calls.append(fd)
+        if len(calls) == 2:                       # the first is the item's own data; the second, the directory
+            raise OSError("EIO")
+        return real(fd)
+    monkeypatch.setattr(pc.os, "fsync", fsync)
+    with pytest.raises(OSError, match="EIO"):
+        pc.file_request(ddir, signq, raw, change="c", summary="s")
+    assert not list((ddir / pc.PENDING_DIR).iterdir())
+
+
+def test_the_sign_fault_helper_the_accept_path_calls_exists():
+    """gemini (verify, refuted): ``_sign_fault_not_done`` is defined in the dispatch CLI."""
+    assert callable(dcli._sign_fault_not_done)

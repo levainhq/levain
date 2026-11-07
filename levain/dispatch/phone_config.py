@@ -3,8 +3,9 @@
 The consent sheet signs only with a phone passkey, and the control store's trust root can never be a passkey
 (:func:`levain.dispatch.control._root_problem`), so the phone cannot BE the configuration signature. It is a gate in
 front of it (the countersign pattern, as terminal answers): ``config request`` files levain's own plain sign request in
-:data:`CONFIG_APPROVE_NAMESPACE` whose fixed message names the store, kind, generation, prev and the SHA-256 of the
-item's exact canonical bytes; the phone passkey signs it; ``config accept-approved`` verifies that approval, loads the
+:data:`CONFIG_APPROVE_NAMESPACE` whose fixed message names the store, kind, generation, prev, the SHA-256 of the
+item's exact canonical bytes and the passkey site (``rp``) of the cockpit the queue published at filing; a passkey
+of that site signs it; ``config accept-approved`` verifies that approval, loads the
 pending item whose bytes hash to it, and only then asks the trust-root laptop key to sign those bytes (a Touch ID touch,
 no terminal question) and hands them to the unchanged :meth:`ControlStore.accept`. Nothing here widens what the store
 accepts: the trust root, its custody rule and ``accept`` are untouched, so an approval alone writes nothing and no
@@ -42,7 +43,7 @@ from levain.contracts.namespaces import CONFIG_APPROVE_NAMESPACE, LEVAIN_SIGN_RE
 from levain.dispatch import control as dctl
 
 __all__ = ["APPROVE_TIER", "Approval", "FORMAT_LINE", "PENDING_DIR", "REQUEST_TITLE", "REQUEST_TTL_S", "build_message",
-           "claimed", "file_request", "load_pending", "push_request", "read_approval", "remove_pending"]
+           "claimed", "file_request", "load_pending", "push_request", "queue_rp", "read_approval", "remove_pending"]
 
 FORMAT_LINE = "levain-dispatch-config-approve/1"
 REQUEST_TITLE = "Approve a dispatch configuration change"
@@ -82,17 +83,36 @@ def _one_line(text: str) -> str:
     return (out[:_LINE_MAX - 3] + "...") if len(out) > _LINE_MAX else (out or "(none)")
 
 
-def build_message(item: dctl.ConfigItem, raw: bytes, *, expires: datetime, change: str, summary: str) -> str:
+def build_message(item: dctl.ConfigItem, raw: bytes, *, expires: datetime, rp: str, change: str, summary: str) -> str:
     """The approval request's message for ``item`` (parsed from ``raw``, its exact canonical bytes), usable until
-    ``expires`` (signed with it)."""
+    ``expires`` and only by a passkey made on site ``rp`` (both signed with it)."""
     from levain.cockpit.consent import utc_stamp
+    from levain.consent.passkey import is_host_name
 
     if dctl.parse_item(raw).text != item.text:
         raise ValueError("raw is not the item's bytes")
+    if not is_host_name(rp):
+        raise ValueError(f"{str(rp)[:80]!r} is not a passkey site")
     msg = (f"{FORMAT_LINE}\nstore: {_one_line(item.store_id)}\nkind: {item.kind}\ngeneration: {item.generation}\n"
            f"prev: {_one_line(item.prev) if item.prev else 'none'}\nitem-sha256: {hashlib.sha256(raw).hexdigest()}\n"
-           f"expires: {utc_stamp(expires)}\nchange: {_one_line(change)}\nsummary: {_one_line(summary)}\n")
+           f"expires: {utc_stamp(expires)}\nrp: {rp}\nchange: {_one_line(change)}\nsummary: {_one_line(summary)}\n")
     return msg
+
+
+def queue_rp(queue_dir: Path) -> str:
+    """The passkey site of the cockpit ``queue_dir`` has published (its origin's host): the one site whose passkeys
+    can approve a request filed there now. :class:`ValueError` when the queue has published none."""
+    from urllib.parse import urlsplit
+
+    from levain.consent.cockpit_origin import read_origin
+    from levain.consent.passkey import is_host_name
+
+    origin = read_origin(Path(queue_dir))
+    host = urlsplit(origin).hostname if origin else None
+    if not is_host_name(host):
+        raise ValueError(f"the signing queue {queue_dir} has published no cockpit origin, so no passkey site is "
+                         "known to approve it (start the cockpit)")
+    return host
 
 
 def _parse_message(message: str) -> dict[str, str] | None:
@@ -110,33 +130,42 @@ def _pending_dir(directory: Path) -> Path:
     return Path(directory) / PENDING_DIR
 
 
-def _write_pending(directory: Path, sha: str, raw: bytes) -> bool:
-    """Keep ``raw`` as ``<sha>.item`` (written whole under a temporary name only this call uses, then renamed over,
-    the directory synced); True when this call created it, False when it was already there."""
+def _write_pending(directory: Path, sha: str, raw: bytes) -> None:
+    """Keep ``raw`` as a NEW ``<sha>.item``: written whole under a temporary name only this call uses, hard-linked
+    into place (never over another file), the directory synced. An item already kept under that name is never
+    replaced, refreshed or shared (:class:`FileExistsError`): each kept item belongs to the one filing that made
+    it, its inode never changes while kept, and its mtime is its filing time (so :func:`_prune`'s age is honest).
+    Any failure, the sync after publishing included, leaves neither the item nor the temporary behind."""
     d = _pending_dir(directory)
     d.mkdir(mode=0o700, parents=True, exist_ok=True)
     path = d / f"{sha}.item"
-    existed = os.path.lexists(path)
     tmp = d / f".{sha}.{secrets.token_hex(8)}.tmp"
     fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0), 0o600)
+    published = False
     try:
         with os.fdopen(fd, "wb") as fh:
             fh.write(raw)
             fh.flush()
             os.fsync(fh.fileno())
-        os.replace(tmp, path)
-    except BaseException:
         try:
-            os.unlink(tmp)
-        except OSError:
-            pass
+            os.link(tmp, path, follow_symlinks=False)
+        except FileExistsError:
+            raise FileExistsError(f"an item with these exact bytes is already kept ({path}); its own request "
+                                  "stands") from None
+        published = True
+        os.unlink(tmp)
+        dfd = os.open(d, os.O_RDONLY)
+        try:
+            os.fsync(dfd)
+        finally:
+            os.close(dfd)
+    except BaseException:
+        for leftover in ((path, tmp) if published else (tmp,)):
+            try:
+                os.unlink(leftover)
+            except OSError:
+                pass
         raise
-    dfd = os.open(d, os.O_RDONLY)
-    try:
-        os.fsync(dfd)
-    finally:
-        os.close(dfd)
-    return not existed
 
 
 def _prune(directory: Path) -> None:
@@ -200,7 +229,8 @@ def load_pending(directory: Path, sha: str) -> bytes:
 @contextmanager
 def claimed(directory: Path, sha: str) -> Iterator[bytes]:
     """The kept item's bytes (as :func:`load_pending` reads them), held under an exclusive lock on the open file for
-    the block: a second claim of the same item, while the first is held, is refused at once
+    the block (a kept item is never replaced, so every claim of it locks the same inode): a second claim of the same
+    item, while the first is held, is refused at once
     (:class:`levain.dispatch.control.ConfigRefused`), never queued behind it, so it never reaches the key."""
     fd = _open_kept(directory, sha)
     try:
@@ -222,23 +252,26 @@ def remove_pending(directory: Path, sha: str) -> None:
 
 def file_request(directory: Path, queue_dir: Path, raw: bytes, *, change: str, summary: str) -> str:
     """Keep ``raw`` (an item's canonical bytes) and file levain's approval request over it in ``queue_dir``'s sign
-    directory; return the request id. Whatever the filing raises (:class:`ValueError` for a message outside the
-    grammar, :class:`OSError` or :class:`levain.consent.sign.SignRefused` for a queue it cannot write) propagates
-    with nothing filed and the item this call kept removed again."""
+    directory; return the request id. The request names the passkey site of the cockpit the queue has published NOW
+    (:func:`queue_rp`), signed with it, so only a passkey of that site can approve it, however the cockpit stands at
+    the laptop touch. Whatever the filing raises (:class:`ValueError` for no published site or a message outside
+    the grammar, :class:`OSError` or :class:`levain.consent.sign.SignRefused` for a queue it cannot write,
+    :class:`FileExistsError` for these exact bytes already kept) propagates with nothing filed and nothing this call
+    kept left behind. The item this call keeps is its own (:func:`_write_pending` never shares one), so removing it
+    on failure can never take another filing's item."""
     from levain.consent.sign import file_levain_request
 
     item = dctl.parse_item(raw)
-    message = build_message(item, raw, expires=_now() + timedelta(seconds=REQUEST_TTL_S), change=change,
-                            summary=summary)
+    message = build_message(item, raw, expires=_now() + timedelta(seconds=REQUEST_TTL_S), rp=queue_rp(queue_dir),
+                            change=change, summary=summary)
     _prune(directory)
     sha = hashlib.sha256(raw).hexdigest()
-    created = _write_pending(directory, sha, raw)
+    _write_pending(directory, sha, raw)
     try:
         return file_levain_request(Path(queue_dir), CONFIG_APPROVE_NAMESPACE, message, title=REQUEST_TITLE,
                                    ttl_s=REQUEST_TTL_S)
     except BaseException:
-        if created:
-            remove_pending(directory, sha)
+        remove_pending(directory, sha)
         raise
 
 
@@ -270,8 +303,10 @@ def read_approval(queue_dir: Path, request_id: object, *, keys: Callable[[str], 
     """The verified approval in sign request ``request_id``: levain's own request in :data:`CONFIG_APPROVE_NAMESPACE`
     in exactly its grammar, signed (not open, not denied), whose signed ``expires`` (and the request file's own
     expiry) is after ``now`` (default: the clock now) and after the signing, and whose signature verifies over its
-    message in that namespace by an active passkey ``keys(rp_id)`` names (``rp_id`` is the site of the key the record
-    names, so an approval reads back with no cockpit running) whose class covers :data:`APPROVE_TIER`. Raises
+    message in that namespace by an active passkey ``keys(rp_id)`` names, whose class covers :data:`APPROVE_TIER`.
+    ``rp_id`` is the message's own signed ``rp`` line (the site the queue's cockpit had published when the request was
+    filed), and the record's passkey must be of that site too: a passkey of another site, even one active in the same
+    authority log, approves nothing, and the approval still reads back with no cockpit running. Raises
     :class:`levain.dispatch.control.ConfigRefused` saying which check failed and ``not_done``; a passkey list or
     verifier that cannot be had is :class:`levain.dispatch.control.ControlStateUnavailable`. Writes nothing; the
     result files are read as the queue reads them (no link followed, regular files only, bounded)."""
@@ -327,10 +362,14 @@ def read_approval(queue_dir: Path, request_id: object, *, keys: Callable[[str], 
     if signed_at > deadline:
         raise refuse(f"sign request {rid} was signed after it expired")
     fp = record.get("signer_fp")
+    rp_id = fields["rp"]
     try:
-        rp_id = key_application(str(record.get("public_key")))
+        record_rp = key_application(str(record.get("public_key")))
     except (PasskeyError, ValueError, IndexError):
         raise refuse(f"the record of sign request {rid} names no passkey") from None
+    if record_rp != rp_id:
+        raise refuse(f"it was signed by a passkey of {record_rp[:80]}, not of {rp_id}, the site the request was "
+                     "filed for")
     try:
         active = keys(rp_id)
     except SignRefused as exc:
