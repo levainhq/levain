@@ -248,7 +248,7 @@ def test_the_glance_tiles_serve_from_the_install(tmp_path):
     ck = build_default_cockpit(src)
     m = ck.panel("memory_glance", credential_class="none")["value"]
     nums = {n["label"]: n["value"] for n in m["numbers"]}
-    assert nums["open spores"] == 3 and nums["episodes"] >= 0 and m["top"] == "a tray seed"
+    assert nums["open spores"] == 4 and nums["episodes"] >= 0 and m["top"] == "a tray seed"
     d = ck.panel("doctor", credential_class="none")["value"]["metrics"]
     labels = [x["label"] for x in d]
     assert labels[:3] == ["hooks", "memory store", "cockpit keys"]

@@ -52,6 +52,14 @@ def test_where_to_begin_draws_the_overnight_line_only_when_the_install_knows_it(
         assert "overnight" not in _begin(loops=[_sp("s", "x")], **kw), kw
 
 
+def test_where_to_begin_does_not_offer_a_parked_loop():
+    # TS-5a L3: parked loops now ride view.open_spores; a dormant loop is not a place to begin
+    got = _begin(loops=[_sp("spore-p", "dormant", tier="parked")])
+    assert got["headline"] == "Nothing set for today yet" and "threads" not in got
+    mixed = _begin(loops=[_sp("spore-h", "hot", tier="hot"), _sp("spore-p", "dormant", tier="parked")])
+    assert [t["text"] for t in mixed["threads"]] == ["hot"]
+
+
 def test_where_to_begin_with_nothing_has_one_empty_line_and_no_threads():
     got = _begin()
     assert got["headline"] == "Nothing set for today yet" and "threads" not in got and "overnight" not in got

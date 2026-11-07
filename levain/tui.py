@@ -391,7 +391,7 @@ def build_surface_at_req(spore_id: str, surface_at: str | None) -> dict[str, Any
 def build_spore_update_req(
     spore_id: str, *, text: str | None = None,
     spore_type: str | None = None, tier: str | None = None,
-    expect_disposition: Any = _UNSET,
+    expect_disposition: Any = _UNSET, expected_version: str | None = None,
 ) -> dict[str, Any]:
     """The forming-workbench metadata edit: refine ``text``, reclassify ``type`` (only
     while a Tray item is forming — locked once it metabolizes), or re-``tier`` (park a
@@ -402,7 +402,10 @@ def build_spore_update_req(
     ``expect_disposition`` (when supplied) carries the rendered row's SNAPSHOT disposition
     for a TIER edit — park/un-park's route was chosen against it, so the server CASes it and
     a concurrent re-route in the render→submit window fails closed (spore-173). OMITTED ⇒ no
-    CAS (a text-only refine is disposition-independent; the type path CASes server-side)."""
+    CAS (a text-only refine is disposition-independent; the type path CASes server-side).
+
+    ``expected_version`` (a tier edit) is the rendered row's version: park/un-park overwrite the tier, so a tier
+    changed elsewhere since the render must refuse (stale), not be silently replaced (TS-5a L3)."""
     req: dict[str, Any] = {"kind": "spore_update", "spore_id": spore_id}
     if text is not None:
         req["text"] = text
@@ -412,6 +415,8 @@ def build_spore_update_req(
         req["tier"] = tier
     if expect_disposition is not _UNSET:
         req["expect_disposition"] = expect_disposition
+    if expected_version is not None:
+        req["expected_version"] = expected_version   # the driver passes it to apply_edit as the version bind, not as a body field
     return req
 
 

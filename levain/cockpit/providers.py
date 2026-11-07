@@ -342,7 +342,12 @@ def spore_row_version(raw: Mapping[str, Any]) -> str:
     """The ``version`` the spore panels render for this stored spore, from anneal's raw dict. A
     spore write passes it to anneal as ``version_of``, so the compare runs inside anneal's write
     transaction against exactly what the operator was shown (§4.4)."""
-    return row_version_of(spore_stored(open_spore_from(raw)), SPORE_VERSION_FIELDS, SPORE_VERSION_EXCLUDED)
+    return spore_view_version(open_spore_from(raw))
+
+
+def spore_view_version(spore: Any) -> str:
+    """The same ``version`` from a spore already built for the view (an ``OpenSpore``): what the TUI binds a tier write to."""
+    return row_version_of(spore_stored(spore), SPORE_VERSION_FIELDS, SPORE_VERSION_EXCLUDED)
 
 
 # a fresh install has no spore store until something is dropped: each panel says what fills it
@@ -385,7 +390,8 @@ def _where_to_begin(source: SubstrateSource) -> Callable[[ReadContext], Result]:
                 due.append(s)
         late.sort(key=lambda t: t[0])
         first = [s for _d, s in late] + due
-        loops = sorted(v.open_spores, key=lambda s: {"hot": 0, "warm": 1, "cold": 2, "parked": 3}.get(s.tier, 9))
+        # a parked loop is dormant by design (TS-5a: it shows in Open loops, marked): never a place to begin
+        loops = sorted((s for s in v.open_spores if s.tier != "parked"), key=lambda s: {"hot": 0, "warm": 1, "cold": 2, "parked": 3}.get(s.tier, 9))
         lines: list[dict[str, str]] = []
         for i, s in enumerate(first[:3]):
             lines.append({"label": ("first", "then", "after that")[i], "text": clip(s.text)})
@@ -1718,7 +1724,7 @@ def build_default_cockpit(
             v = _view(source, ctx)
             if "open_spores" in v.errors or "store" in v.errors:
                 raise RuntimeError("the spore store did not read")
-            return list(v.open_spores)
+            return [s for s in v.open_spores if s.tier != "parked"]   # a parked loop is dormant (TS-5a)
 
         def hub_label(ctx: ReadContext) -> str:
             try:

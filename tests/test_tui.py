@@ -798,8 +798,11 @@ def test_handle_verb_unpark_updates_tier_with_cas(monkeypatch):
     vpark = SubstrateView(paths=p, open_spores=[_spore("spore-p", tier="parked")])
     _tui_curses._handle_verb(None, _model_on(vpark, "spores", read_only=False), None,
                              tui.Verb("p", "[p] un-park", "spore_unpark"))
+    # ...and the rendered row's version rides too (TS-5a L3): a tier changed elsewhere refuses as stale
+    from levain.cockpit.providers import spore_view_version
     assert cap["req"] == {"kind": "spore_update", "spore_id": "spore-p", "tier": "warm",
-                          "expect_disposition": "loop"}
+                          "expect_disposition": "loop",
+                          "expected_version": spore_view_version(vpark.open_spores[0])}
 
 
 def test_handle_verb_descend_is_panel_aware(monkeypatch):

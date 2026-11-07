@@ -66,3 +66,30 @@ def test_the_page_draws_a_parked_loop_in_open_loops_marked_and_a_legacy_note_in_
             assert parked and "parked" in parked["tags"], (width, parked)                 # the visible marker
             assert "reactivate" in parked["verbs"] and "park" not in parked["verbs"], (width, parked)
             assert note and "note" in note["tags"], (width, note)                         # the legacy badge
+
+
+def test_the_removed_keep_ordering_id_still_resolves_to_the_loops_ordering() -> None:
+    # TS-5a L3 MED: a downstream manifest naming "spore.keep" must still register and sort as loops do
+    from levain.cockpit.registry import ORDERINGS
+    assert ORDERINGS["spore.keep"].key is ORDERINGS["spore.loops"].key
+
+
+def test_the_tui_unpark_is_bound_to_the_version_it_rendered(tmp_path: Path) -> None:
+    # TS-5a L3 MED (codex): the TUI un-park CASed only the disposition, so a tier changed elsewhere
+    # (parked -> hot) was overwritten with warm and reported "reactivated". It is version-bound now.
+    from dataclasses import replace
+    from anneal_memory.spores import SporeStore
+    from levain import _tui_curses, tui
+    root, src, ids = _install(tmp_path)
+    view = src.build()
+    model = tui.TuiModel(view=view, zone_idx=0, panel_idx=0, read_only=False)
+    for zi, (zone, _l) in enumerate(tui.ZONES):
+        for pi, p in enumerate(tui.panels_for_zone(view, zone)):
+            if p.get("kind") == "spores":
+                model = replace(model, zone_idx=zi, panel_idx=pi)
+    idx = next(i for i, s in enumerate(view.open_spores) if s.id == ids["parked"])
+    model = replace(model, item_idx=idx)
+    SporeStore(root / ".levain" / "memory.spores.json").update(ids["parked"], tier="hot")   # another process moved it
+    out = _tui_curses._handle_verb(None, model, src, tui.Verb("p", "[p] un-park", "spore_unpark"))
+    assert SporeStore(root / ".levain" / "memory.spores.json").get(ids["parked"])["tier"] == "hot"   # not overwritten
+    assert "reactivated" not in out.status

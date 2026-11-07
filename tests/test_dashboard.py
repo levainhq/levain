@@ -410,6 +410,17 @@ class TestSporeProjections:
         assert len(v.open_spores) == 50
         assert [s.id for s in v.tray] == ["dump"]
 
+    def test_parked_loops_not_starved_by_a_busy_install(self, tmp_path: Path) -> None:
+        # TS-5a L3 HIGH: parked sorts LAST in the rank, so a shared Open-loops cap dropped every
+        # parked loop once max_spores live loops existed. Parked loops keep their own cap.
+        db = tmp_path / "memory.db"
+        rows = [self._row(id=f"loop{i}", tier="hot", text=f"loop {i}") for i in range(60)]
+        rows.append(self._row(id="parked1", tier="parked", text="dormant"))
+        self._write(tmp_path / "memory.spores.json", rows)
+        v = build_substrate_view(AnnealPaths.from_db(db))  # default max_spores=50
+        assert len([s for s in v.open_spores if s.tier != "parked"]) == 50
+        assert [s.id for s in v.open_spores if s.tier == "parked"] == ["parked1"]
+
     def test_resolved_status_drift_row_is_skipped(self, tmp_path: Path) -> None:
         # A status=resolved row left in the `spores` array is store drift (anneal MOVES
         # resolved spores to the `resolved` array); list_open doesn't filter status, so the

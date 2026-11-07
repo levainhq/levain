@@ -34,6 +34,7 @@ import tempfile
 from dataclasses import replace
 
 from levain.cockpit.engine import Cockpit
+from levain.cockpit.providers import spore_view_version
 from levain.dashboard import CLASS_A, CLASS_B, CLASS_C, SubstrateSource, SubstrateView
 from levain.spores import PARKED_TIER
 from levain.tui import (
@@ -382,7 +383,6 @@ def _handle_verb(
         # Deliberately sends NO `type` → the server defaults to `thought` and the AI sorts it
         # ("human dumps, AI sorts" — the same as the web dump's default "let flow sort" option).
         # The operator classifies post-dump via the Tray `c` (reclassify) verb when they care.
-        panel = model.current_panel()
         disposition = "seed"
         text = _edit_via_editor(stdscr, "")
         if text is None:
@@ -432,7 +432,8 @@ def _handle_verb(
         # CAS the snapshot (spore-173): park is offered only on a loop; the snapshot rides the
         # tier update so a concurrent re-route before the write fails closed (not tier-parks a note).
         return _apply(model, source,
-                      build_spore_update_req(s.id, tier="parked", expect_disposition=s.disposition),
+                      build_spore_update_req(s.id, tier="parked", expect_disposition=s.disposition,
+                                             expected_version=spore_view_version(s)),
                       f"parked {s.id}")
 
     if kind == "spore_unpark":  # a parked Open loop → back into active cognition
@@ -444,7 +445,8 @@ def _handle_verb(
         # a stale note now FAILS CLOSED (stale → re-read, spore-174) instead of accepting tier=warm +
         # falsely reporting "reactivated" while it stays a note.
         return _apply(model, source,
-                      build_spore_update_req(s.id, tier="warm", expect_disposition=s.disposition),
+                      build_spore_update_req(s.id, tier="warm", expect_disposition=s.disposition,
+                                             expected_version=spore_view_version(s)),
                       f"reactivated {s.id} → warm")
 
     if kind == "episode_tombstone":
@@ -544,7 +546,9 @@ def _apply(
         # un-bypassable chokepoint, so it refuses on its OWN state, not a caller flag.
         return replace(model, status="this substrate has no write scope — read-only")
     try:
-        apply_edit(scope, req)
+        req = dict(req)
+        expected_version = req.pop("expected_version", None)   # a version bind rides beside the body, never in it
+        apply_edit(scope, req, expected_version=expected_version)
     except EditError as exc:
         status = edit_error_status(exc.code, str(exc))
         if exc.code == "stale":

@@ -57,6 +57,7 @@ from typing import TYPE_CHECKING, Any, Callable, Iterator, Mapping
 from levain.spores import (
     BUCKET_TRAY,
     LOOP_DISPOSITION,
+    PARKED_TIER,
     bucket_of,
     disposition_of,
 )
@@ -1980,7 +1981,7 @@ def build_substrate_view(
     #     legacy notes included), bucketed via levain.spores.bucket_of. Bucket the
     #     FULL ranked list_open result (NOT a pre-sliced head): an inbox row must not be
     #     starved out of the Tray by loops ahead of it in the rank. Each bucket is independently capped at
-    #     max_spores — keeping each bucket's TOP max_spores BY RANK, which is meaningful
+    #     max_spores (parked loops under their own cap inside Open loops: they rank LAST) — keeping each bucket's TOP max_spores BY RANK, which is meaningful
     #     ONLY because list_open is pre-ranked (a future refactor that feeds an UNRANKED
     #     list here would make each bucket's cap arbitrary). Defensive per-row: one
     #     malformed row skipped, the tier survives.
@@ -1990,6 +1991,7 @@ def build_substrate_view(
         if paths.spores_json.exists():
             # bucket name → its destination list; the BUCKET_LOOP default is open_spores
             bucket_target = {BUCKET_TRAY: view.tray}
+            parked_n = 0   # parked loops in view.open_spores (their cap is separate)
             for s in SporeStore(paths.spores_json).list_open(today=today):
                 # The WHOLE per-row pipeline (status-skip → route → cap → construct) lives
                 # in ONE try, so a fault on ANY phase drops just that row — the "one
@@ -2004,9 +2006,16 @@ def build_substrate_view(
                     if s.get("status") == "resolved":
                         continue
                     target = bucket_target.get(bucket_of(s), view.open_spores)
-                    if len(target) >= max_spores:
-                        continue  # this bucket is full — keep scanning for the others
+                    # A parked loop rides in Open loops but under its OWN cap: it ranks LAST, so a
+                    # shared cap would drop every one of them on a busy install (the starvation the
+                    # old separate Keep bucket existed to prevent) [TS-5a L3].
+                    parked = target is view.open_spores and s.get("tier") == PARKED_TIER
+                    held = parked_n if parked else len(target) - (parked_n if target is view.open_spores else 0)
+                    if held >= max_spores:
+                        continue  # this pool is full — keep scanning for the others
                     target.append(open_spore_from(s))
+                    if parked:
+                        parked_n += 1
                 except (ValueError, TypeError):
                     continue  # one malformed row skipped; the tier survives
     except store_faults as exc:
