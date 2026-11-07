@@ -223,3 +223,39 @@ def test_a_slot_with_no_accounts_is_never_read_as_retired() -> None:
 
     with mock.patch.object(IH, "SlotId", lambda cls, i: _NoAccounts()):
         assert IH._drop_retired_slots({"claude": (0,)}, {}) == {"claude": (0,)}
+
+
+def test_gather_held_hands_repair_the_slots_without_the_retired_dir(tmp_path: Path, monkeypatch) -> None:
+    """The wiring: `_gather_held` passes `_drop_retired_slots(in_service, tombs)` to `_repair_facts`. A retired slot dir
+    (both accounts carry the retired label, read from the directory) is not held; a live one is. Revert the
+    `_drop_retired_slots(...)` call at the `_repair_facts` call site and this goes red."""
+    from levain.slot.accounts import SLOT_MARKER, SLOT_RETIRED_MARKER
+
+    class _Store:
+        def __init__(self, rs) -> None: ...
+        def read(self, *a, **kw): return None
+        def close(self) -> None: ...
+
+    monkeypatch.setattr(IH.RH, "Store", _Store)
+    monkeypatch.setattr(IH.RH, "configured_slots", lambda store: {})
+    monkeypatch.setattr(IH, "_operator_of", lambda store: {"uid": OP_UID})
+    monkeypatch.setattr(IH, "slots_in_service", lambda store: {"egress": (0, 1), "none": (0,)})
+    monkeypatch.setattr(IH, "parse_pool_config", lambda raw: None)
+    monkeypatch.setattr(IH, "parse_install_skips", lambda raw: ())
+    seen: dict = {}
+
+    def fake_repair_facts(cmd, host, d, accounts, in_service, **kw):
+        seen["in_service"] = in_service
+        return "repair-facts"
+
+    monkeypatch.setattr(IH, "_repair_facts", fake_repair_facts)
+    retired, live = SLOT_RETIRED_MARKER["linux"], SLOT_MARKER
+    names = {"_levain_s0": retired, "_levain_gw0": retired, "_levain_s1": live, "_levain_gw1": live,
+             "_levain_v0": live, "_levain_c0": live}
+    d = IH.Directory(users={n: 3000 + k for k, n in enumerate(names)}, groups={}, user_labels=names)
+    L = tmp_path / "levain"
+    L.mkdir()
+    got = IH._gather_held(parse_install_argv(["repair"]), "linux", 0, d, object(), L, None,
+                          state_dir=tmp_path, user_name=lambda uid: None)
+    assert got.repair == "repair-facts"
+    assert seen["in_service"] == {"egress": (1,), "none": (0,)}
