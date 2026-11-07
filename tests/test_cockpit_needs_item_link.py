@@ -12,7 +12,8 @@ from tests.test_cockpit_flip_parity import _drive, needs_browser
 from tests.test_cockpit_k2a import _install, _serve
 from tests.test_cockpit_k4a_needs import DESKTOP
 
-READ = ("JSON.stringify({ title: " + TITLE + " || '', modal: !!document.getElementById('levain-modal'), search: location.search, y: Math.round(window.scrollY),"
+# the open sheet locks the page (body position:fixed, top:-Y), so window.scrollY reads 0 behind it; the held place is -body.style.top
+READ = ("JSON.stringify({ title: " + TITLE + " || '', modal: !!document.getElementById('levain-modal'), search: location.search, y: Math.round(window.scrollY || -parseFloat(document.body.style.top) || 0),"
         " note: (document.querySelector('.needs-gone-note') || {}).textContent || '' })")
 ROWS = "document.querySelectorAll('#ck-needs .needs-row').length === 2 && 1"
 SETTLE = {"eval": "new Promise(r => setTimeout(() => r(1), 2500))"}
@@ -76,12 +77,14 @@ def _eleven_questions(tmp_path: Path, monkeypatch) -> None:
 
 @needs_browser
 def test_an_uppercase_np_id_names_the_same_card_as_its_lowercase_one(tmp_path: Path, monkeypatch) -> None:
-    """The guard admits A-F, so `np-0000000A` is a link that reaches the page; card_number gives 1 + 0xA = 11, the codex card."""
+    """The guard admits A-F, so `np-0000000A` is a link that reaches the page; card_number gives 1 + 0xA = 11, the codex card.
+    The strip folds after 6 rows (the approved layout), so the page DRAWS 6 rows and a "Show 5 more" row; card 11 is not drawn, and the
+    link still opens its sheet (the read is of the sheet, not of a row)."""
     _eleven_questions(tmp_path, monkeypatch)
     _root, src, _ids = _install(tmp_path)
     with _serve(src, surface_tokens={"browser": "T"}, install_class="reported") as (url, _httpd):
         out = _drive(tmp_path, f"{url}/?view=needs&item=np-0000000A#write_token=T", [
-            DESKTOP, {"until": "document.querySelectorAll('#ck-needs .needs-row').length >= 11 && 1", "ms": 40000}, SETTLE, {"eval": READ}])["values"]
+            DESKTOP, {"until": "document.querySelectorAll('#ck-needs .needs-row').length === 6 && !!document.querySelector('#ck-needs .needs-more-row') && 1", "ms": 40000}, SETTLE, {"eval": READ}])["values"]
     got = json.loads(out[-1])
     assert got["modal"] and "codex" in got["title"] and got["note"] == "", got
 

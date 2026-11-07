@@ -6865,7 +6865,7 @@
   // A record that names a card (the Work lens's waiting items) goes to the strip's card with that id: scrolled to and lit by an
   // animation that ends on its own (needs-lit), any earlier light cleared first. Where the strip is the bar (Build, Memory) the matching
   // chip is lit instead. False when no card or chip carries the id, so the caller can open the history.
-  function needsGo(id) {
+  function needsGo(id, instant) {
     const host = document.getElementById("ck-needs");
     if (!host || host.hidden || !id) return false;
     for (const n of host.querySelectorAll(".needs-lit")) n.classList.remove("needs-lit");
@@ -6873,7 +6873,9 @@
     const sel = cards ? ".needs-row" : ".needs-chip-btn";
     const node = Array.prototype.find.call(host.querySelectorAll(sel), (n) => n.dataset.needsId === id);
     if (!node) return false;
-    if (typeof node.scrollIntoView === "function") node.scrollIntoView({ block: "center", behavior: "smooth" });
+    // `instant`: the caller locks the page the next moment (the item link opens the card's sheet at once), and the lock freezes the page at the
+    // scroll position it finds: a smooth scroll only begun would be frozen at the top, so the reader's place behind the sheet would be lost
+    if (typeof node.scrollIntoView === "function") node.scrollIntoView({ block: "center", behavior: instant ? "auto" : "smooth" });
     void node.offsetWidth;   // restart the animation if the same node is lit twice
     node.classList.add("needs-lit");
     const off = () => node.classList.remove("needs-lit");
@@ -9058,7 +9060,7 @@ for (const type of ["touchstart", "wheel", "pointerdown", "click", "keydown"]) d
     if (whole) {
       const it = needsWaiting(needsItems(lines)).find((x) => needsItemMatch(x, item));
       if (it) {
-        if (document.querySelector(PHONE_JUMP_TARGET.needs)) needsGo(needsIdOf(it));
+        if (document.querySelector(PHONE_JUMP_TARGET.needs)) needsGo(needsIdOf(it), true);
         openNeedsFocus(it, null);
         return;
       }
