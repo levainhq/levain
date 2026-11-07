@@ -554,18 +554,56 @@ def _subid_nss_problem(hands_user: str) -> str | None:
     return None
 
 
+def _no_systemd_here() -> str | None:
+    """Why no unit of ours can be loaded on this host, or None when systemd runs here. Setup refuses
+    both cases (:func:`egress_unavailable`), so a host like this never had the boundary's unit."""
+    if not os.path.isabs(_abs("systemctl")):
+        return "no systemctl here, so no boundary unit can be loaded"
+    if not os.path.isdir("/run/systemd/system"):
+        return "systemd is not running as init here, so no boundary unit can be loaded"
+    return None
+
+
+def _egress_unit_stopped(hands_user: str) -> tuple[bool, str]:
+    """Stop the boundary's unit and check it is not active. Only systemd saying the unit is not loaded
+    counts as already stopped; any other stop failure (D-Bus, permission, timeout) fails the step, so
+    undo never reports the boundary gone while its unit is still active."""
+    if why := _no_systemd_here():
+        return True, why
+    systemctl, unit = _abs("systemctl"), egress_unit_name(hands_user)
+    env = {**child_env(), "LC_ALL": "C"}
+    r = subprocess.run([systemctl, "stop", unit], capture_output=True, text=True, cwd="/", env=env)
+    said = (r.stderr or r.stdout).strip()
+    if r.returncode != 0 and "not loaded" not in said:
+        return False, said or f"systemctl stop {unit}: exit {r.returncode}"
+    # is-active prints the state and exits 0 only for "active"; an unknown unit prints "inactive".
+    a = subprocess.run([systemctl, "is-active", unit], capture_output=True, text=True, cwd="/", env=env)
+    state = a.stdout.strip()
+    if a.returncode == 0 or state in ("active", "activating", "deactivating", "reloading", "refreshing"):
+        return False, f"{unit} is still {state or 'active'} after the stop"
+    return True, "" if r.returncode == 0 else f"{unit} is not loaded"
+
+
+def _systemd_reloaded() -> tuple[bool, str]:
+    if why := _no_systemd_here():
+        return True, why
+    return _run_ok((_abs("systemctl"), "daemon-reload"))
+
+
 def egress_undo_steps(hands_user: str) -> list[Step]:
     """Remove the boundary. Run only after every hands process is stopped, so nothing of the hands
     user runs with its network open."""
     systemctl, unit, unit_path = _abs("systemctl"), egress_unit_name(hands_user), egress_unit_path(hands_user)
     return [
         # The unit is RemainAfterExit, so a bare disable left it loaded and active with no file (1107-26 guest). The
-        # stop is not gated on the file: a re-run over that stranded state must still stop it. Not loaded is fine.
-        Step("stop the network boundary unit", (systemctl, "stop", unit), allow_fail=True),
+        # stop is not gated on the file: a re-run over that stranded state must still stop it. Not loaded is fine;
+        # any other stop failure stops the undo before the file goes.
+        Step(f"stop the network boundary unit (systemctl stop {unit}, then check it is not active)",
+             call=lambda: _egress_unit_stopped(hands_user)),
         Step("stop loading the network boundary at boot", (systemctl, "disable", unit),
              skip_if=(_abs("test"), "!", "-e", str(unit_path))),
         Step("remove its systemd unit", ("/bin/rm", "-f", str(unit_path))),
-        Step("tell systemd", (systemctl, "daemon-reload")),
+        Step("tell systemd (systemctl daemon-reload)", call=_systemd_reloaded),
         Step("remove its ruleset file", ("/bin/rm", "-f", str(egress_rules_path(hands_user)))),
         Step("remove the boundary's table", call=lambda: _egress_table_absent(hands_user)),
         Step("retire and remove the group network git ran with", call=lambda: _net_group_retired_and_gone(hands_user)),
