@@ -579,8 +579,10 @@ def _egress_unit_stopped(hands_user: str) -> tuple[bool, str]:
     # is-active prints the state and exits 0 only for "active"; an unknown unit prints "inactive".
     a = subprocess.run([systemctl, "is-active", unit], capture_output=True, text=True, cwd="/", env=env)
     state = a.stdout.strip()
-    if a.returncode == 0 or state in ("active", "activating", "deactivating", "reloading", "refreshing"):
-        return False, f"{unit} is still {state or 'active'} after the stop"
+    if state not in ("inactive", "failed"):
+        # Anything but a plain inactive answer (active, activating, or is-active itself failing with no state)
+        # is not proof the boundary is down.
+        return False, f"{unit} is not confirmed stopped after the stop (is-active: {state or (a.stderr or '').strip() or 'no answer'})"
     return True, "" if r.returncode == 0 else f"{unit} is not loaded"
 
 

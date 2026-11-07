@@ -98,7 +98,14 @@ def test_a_genuine_stop_failure_fails_the_step(systemd, said):
 def test_a_stop_that_leaves_the_unit_active_fails_the_step(systemd):
     systemd(stop=(0, ""), active=(0, "active\n"))
     ok, why = hands._egress_unit_stopped(USER)
-    assert not ok and "still active" in why
+    assert not ok and "not confirmed stopped" in why
+
+
+def test_an_is_active_that_gives_no_state_is_not_proof_of_stopped(systemd):
+    # D-Bus unreachable after a stop that exited 0: no state printed, nonzero exit.
+    systemd(stop=(0, ""), active=(1, ""))
+    ok, why = hands._egress_unit_stopped(USER)
+    assert not ok and "not confirmed stopped" in why
 
 
 def test_a_failed_stop_halts_the_undo_before_the_unit_file_goes(systemd):
