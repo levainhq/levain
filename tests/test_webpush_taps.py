@@ -237,3 +237,123 @@ def test_http_landed_takes_the_pairing_token_and_records_under_the_paired_device
         st, out, _ = _call(port, "POST", "/webpush/landed", {**body, "target": "/?token=x"}, token=tok)
         assert st == 400
     assert _taps(PushStore(qdir)) == [(None, PAIRED_PREFIX + dev, "landed", GOOD, "resume>shown")]
+
+
+# --- L3 round 1 fixes (1106-53, tapcard3): dedupe + caps on the tap kinds, \Z, stamps, outcome, `last` ---------------------
+
+def _tap_count(store: PushStore, kind: str | None = None) -> int:
+    with store.read() as c:
+        if kind is None:
+            return c.execute("SELECT COUNT(*) FROM taps WHERE kind IN ('clicked','opened')").fetchone()[0]
+        return c.execute("SELECT COUNT(*) FROM taps WHERE kind = ?", (kind,)).fetchone()[0]
+
+
+@pytest.mark.parametrize("kind,how", [("clicked", None), ("opened", "navigate")])
+def test_a_retried_tap_report_is_a_duplicate_and_writes_no_second_row(store: PushStore, kind: str, how) -> None:
+    ping = _ping(store)
+    at = _ms()
+    assert store.add_receipt(H, ping, kind, at, GOOD, how) == "recorded"
+    assert store.add_receipt(H, ping, kind, at, GOOD, how) == "duplicate"
+    assert _tap_count(store, kind) == 1
+    # another time is another report
+    assert store.add_receipt(H, ping, kind, at + 1, GOOD, how) == "recorded"
+    assert _tap_count(store, kind) == 2
+
+
+@pytest.mark.parametrize("kind,how", [("clicked", None), ("opened", "ack")])
+def test_a_ping_and_kind_takes_at_most_eight_tap_reports(store: PushStore, kind: str, how) -> None:
+    from levain.webpush.store import MAX_RECEIPTS_PER_PING_KIND
+
+    ping = _ping(store)
+    base = _ms()
+    got = [store.add_receipt(H, ping, kind, base + i, GOOD, how) for i in range(MAX_RECEIPTS_PER_PING_KIND + 2)]
+    assert got == ["recorded"] * MAX_RECEIPTS_PER_PING_KIND + ["limited"] * 2
+    assert _tap_count(store, kind) == MAX_RECEIPTS_PER_PING_KIND
+
+
+def test_a_device_may_report_only_so_many_taps_an_hour(store: PushStore, monkeypatch) -> None:
+    from levain.webpush import store as store_mod
+
+    monkeypatch.setattr(store_mod, "MAX_RECEIPTS_PER_DEVICE_HOUR", 5)
+    ping = _ping(store)
+    base = _ms()
+    got = [store.add_receipt(H, ping, "clicked", base + i, GOOD) for i in range(3)]
+    got += [store.add_receipt(H, ping, "opened", base + i, GOOD, "ack") for i in range(4)]
+    assert got == ["recorded"] * 5 + ["limited"] * 2
+    # the receipts have their own count: a tap flood does not starve them
+    assert store.add_receipt(H, ping, "received", base) == "recorded"
+
+
+def test_receipts_do_not_spend_the_tap_allowance(store: PushStore, monkeypatch) -> None:
+    from levain.webpush import store as store_mod
+
+    monkeypatch.setattr(store_mod, "MAX_RECEIPTS_PER_DEVICE_HOUR", 3)
+    ping = _ping(store)
+    base = _ms()
+    assert [store.add_receipt(H, ping, "received", base + i) for i in range(3)] == ["recorded"] * 3
+    assert store.add_receipt(H, ping, "received", base + 9) == "limited"
+    assert store.add_receipt(H, ping, "clicked", base, GOOD) == "recorded"
+
+
+@pytest.mark.parametrize("target", ["/x\n", "/?view=needs\n", "/?item=a\n", "/\n"])
+def test_a_trailing_newline_is_not_a_valid_target(store: PushStore, tmp_path: Path, target: str) -> None:
+    ping = _ping(store)
+    assert store.add_receipt(H, ping, "clicked", _ms(), target) == "bad_report"
+    assert store.add_landing(PAIRED_PREFIX + "phone", target, "load") == "bad_report"
+    assert _taps(store) == []
+
+
+@pytest.mark.parametrize("how", ["load\n", "load>shown\n", "load\nrogue"])
+def test_a_trailing_newline_is_not_a_valid_landing_how(store: PushStore, how: str) -> None:
+    assert store.add_landing(PAIRED_PREFIX + "phone", "/", how) == "bad_report"
+    assert _taps(store) == []
+
+
+_STAMP = r"^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d\.\d{3}Z$"
+
+
+def test_clicked_and_opened_are_stamps_in_the_report_and_the_text(store: PushStore) -> None:
+    import re
+
+    ping = _ping(store)
+    store.add_receipt(H, ping, "received", _ms())
+    store.add_receipt(H, ping, "clicked", _ms(), GOOD)
+    store.add_receipt(H, ping, "opened", _ms(), GOOD, "ack")
+    (d,) = [d for p in receipts.build(store)["pings"] for d in p["devices"]]
+    for k in ("received_at", "clicked_at", "opened_at"):
+        assert re.match(_STAMP, d[k]), (k, d[k])
+    assert d["clicked_at"] in receipts.text(receipts.build(store))
+
+
+def _delivered(store: PushStore, ping: int, at: str) -> None:
+    with store.write() as c:
+        c.execute("INSERT INTO deliveries (ping_id, subscription_id, status, at) SELECT ?, id, 201, ? FROM subscriptions",
+                  (ping, at))
+
+
+def test_an_open_whose_click_was_lost_still_counts_as_shown(store: PushStore) -> None:
+    ping = _ping(store)
+    store.add_receipt(H, ping, "opened", _ms(), GOOD, "navigate")          # the `clicked` POST never arrived
+    (d,) = [d for p in receipts.build(store)["pings"] for d in p["devices"]]
+    assert d["clicked_at"] is None and d["opened_at"] and d["outcome"] == "shown"
+
+
+def test_a_device_that_reported_only_tap_rows_is_silent_not_no_receipt_yet(store: PushStore) -> None:
+    old = _ping(store, "np-old")
+    _delivered(store, old, "2020-01-01T00:00:00Z")                         # delivered long ago, never reported on
+    new = _ping(store, "np-new")
+    store.add_receipt(H, new, "clicked", _ms(), GOOD)                      # the phone's only report is a tap row
+    rep = receipts.build(store)
+    outcome = {p["ping"]: p["devices"][0]["outcome"] for p in rep["pings"]}
+    assert outcome[old] == "silent", outcome
+    assert rep["devices"][0]["silent"] == 1
+
+
+def test_landings_do_not_spend_the_tap_report_allowance(store: PushStore, monkeypatch) -> None:
+    from levain.webpush import store as store_mod
+
+    monkeypatch.setattr(store_mod, "MAX_RECEIPTS_PER_DEVICE_HOUR", 3)
+    for _ in range(6):
+        assert store.add_landing(PAIRED_PREFIX + "phone", "/", "load") == "recorded"
+    ping = _ping(store)
+    assert store.add_receipt(H, ping, "clicked", _ms(), GOOD) == "recorded"

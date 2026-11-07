@@ -35,6 +35,13 @@ so a report without ``--since`` over a long record stays linear in its rows.
 Known edge, not built against: ``/webpush/receipt`` takes no token, so two slow unauthenticated clients can hold both of
 its semaphore slots; that channel is measurement, not delivery, and has its own semaphore, so no push is affected.
 
+The TAP keys (``clicked_at``, ``click_target``, ``opened_at``, ``opened_how``, the per-device ``clicked`` and the top-level
+``landings``) are ADDITIVE to ``levain-ping-receipts/1`` and the version stays ``/1`` on purpose: every key the format had
+is unchanged, and no consumer in this repo or in the flow scripts reads the report by an exact schema (a consumer that
+rejects unknown keys would be a new constraint, not one that exists). A click or an open also counts as ``shown`` (an
+``opened`` row proves the click ran even when its own POST was lost), and a device whose only reports are worker tap rows
+still counts as having reported (``silent`` rather than ``no receipt yet`` for an older ping).
+
 JSON form (``format`` ``levain-ping-receipts/1``, the keys the desk joins to the native APNs side on ``ref``)::
 
     {"format": "levain-ping-receipts/1", "since": <stamp or null>, "ref": <ref or null>,
@@ -157,9 +164,12 @@ def build(store: PushStore, *, since: timedelta | None = None, ref: str | None =
                     for r in c.execute("SELECT device_id, at, target, how FROM taps WHERE kind = 'landed' "
                                        "AND (? IS NULL OR reported_at >= ?) ORDER BY id DESC LIMIT ?",
                                        (cutoff, cutoff, LANDINGS_SHOWN))]
-        # the newest receipt each device has made, over the whole record (any ping, any kind)
+        # the newest report each device has made, over the whole record (any ping): a receipt, or a worker tap report
+        # (clicked, opened: a phone that reported only those still demonstrably woke and reported)
         last = {r["device_id"]: _t(r["m"]) for r in c.execute(
-            "SELECT device_id, MAX(reported_at) AS m FROM receipts GROUP BY device_id")}
+            "SELECT device_id, MAX(m) AS m FROM (SELECT device_id, MAX(reported_at) AS m FROM receipts GROUP BY device_id "
+            "UNION ALL SELECT device_id, MAX(reported_at) AS m FROM taps WHERE kind IN ('clicked','opened') "
+            "GROUP BY device_id) GROUP BY device_id")}
 
     out_pings, roll = [], {}
     for p in pings:
@@ -172,7 +182,7 @@ def build(store: PushStore, *, since: timedelta | None = None, ref: str | None =
             sent_at = min(x["sent"]) if x["sent"] else None
             last_sent = _t(max(x["sent"])) if x["sent"] else None
             reported = last.get(device)
-            if shown or tapped or x["clicked"]:
+            if shown or tapped or x["clicked"] or x["opened"]:   # an open proves the click ran, whatever happened to its POST
                 outcome = "shown"
             elif recv:
                 outcome = "received"

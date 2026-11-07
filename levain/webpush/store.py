@@ -45,8 +45,8 @@ TAP_KINDS = ("clicked", "opened", "landed")
 TAP_SW_KINDS = ("clicked", "opened")                 # reported by the worker under the endpoint hash, against a ping
 TAP_HOWS = ("ack", "late-ack", "navigate", "openWindow", "refused", "none")   # `opened`: how the worker got a window
 # a target: a path and, of the query, only `view` and `item` (nothing else is ever kept: no token, no body)
-TAP_TARGET = re.compile(r"^/(?!/)[A-Za-z0-9/_.-]{0,60}(?:\?(?:view=[a-z]{1,20}(?:&item=[A-Za-z0-9_.:-]{1,64})?|item=[A-Za-z0-9_.:-]{1,64}))?$")
-LANDED_HOW = re.compile(r"^[a-z]{1,12}(?:>[a-z]{1,12})?$")   # e.g. load, load>shown, resume>shown, message
+TAP_TARGET = re.compile(r"^/(?!/)[A-Za-z0-9/_.-]{0,60}(?:\?(?:view=[a-z]{1,20}(?:&item=[A-Za-z0-9_.:-]{1,64})?|item=[A-Za-z0-9_.:-]{1,64}))?\Z")
+LANDED_HOW = re.compile(r"^[a-z]{1,12}(?:>[a-z]{1,12})?\Z")   # e.g. load, load>shown, resume>shown, message
 MAX_LANDINGS_PER_DEVICE_HOUR = 120
 MAX_RECEIPTS_PER_DEVICE_HOUR = 600   # what one device may report in an hour: a flood cannot grow the table past this
 MAX_RECEIPTS_PER_PING_KIND = 8       # a ping delivered to one device more than once is a few rows, never unbounded
@@ -595,13 +595,19 @@ def _receipt_checks(c: sqlite3.Connection, sid: int, device: str, ping_id: int, 
             and c.execute("SELECT 1 FROM deliveries WHERE ping_id = ? AND subscription_id = ?",
                           (ping_id, sid)).fetchone() is None):
         return "unknown_ping"
-    if c.execute("SELECT 1 FROM receipts WHERE ping_id = ? AND device_id = ? AND kind = ? AND at = ?",
+    # a worker tap report (clicked, opened) lives in `taps`, a receipt in `receipts`: each is checked, deduplicated and
+    # capped against its OWN table, so a retried or flooded tap report is a duplicate or limited like a receipt
+    if kind in TAP_SW_KINDS:
+        table, kinds = "taps", "AND kind IN ('clicked','opened')"
+    else:
+        table, kinds = "receipts", ""
+    if c.execute(f"SELECT 1 FROM {table} WHERE ping_id = ? AND device_id = ? AND kind = ? AND at = ?",
                  (ping_id, device, kind, at)).fetchone() is not None:
         return "duplicate"
     hour_ago = time.strftime(STAMP, time.gmtime(time.time() - 3600))
-    if (c.execute("SELECT COUNT(*) FROM receipts WHERE device_id = ? AND reported_at >= ?",
+    if (c.execute(f"SELECT COUNT(*) FROM {table} WHERE device_id = ? AND reported_at >= ? {kinds}",
                   (device, hour_ago)).fetchone()[0] >= MAX_RECEIPTS_PER_DEVICE_HOUR
-            or c.execute("SELECT COUNT(*) FROM receipts WHERE ping_id = ? AND device_id = ? AND kind = ?",
+            or c.execute(f"SELECT COUNT(*) FROM {table} WHERE ping_id = ? AND device_id = ? AND kind = ?",
                          (ping_id, device, kind)).fetchone()[0] >= MAX_RECEIPTS_PER_PING_KIND):
         return "limited"
     return None
