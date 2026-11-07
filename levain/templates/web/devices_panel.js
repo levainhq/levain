@@ -1411,10 +1411,11 @@
     const ready = vcState.providers.filter((p) => p.key === "set" && Array.isArray(p.uses) && p.uses.indexOf("tts") >= 0);
     V.offer(ready);                     // the player reads the same list, so what is shown here is what it will use
     const eff = V.effective(), st = V.settings();
-    const prov = ready.find((p) => p.name === eff.provider) || ready[0] || null;
-    const premium = eff.tier === "premium" && !!prov;
+    const blocked = eff.blocked || "";     // the stored provider's key is gone: never swapped for another vendor, said here and at the reply
+    const prov = blocked ? null : (ready.find((p) => p.name === eff.provider) || ready[0] || null);
+    const premium = eff.tier === "premium" && (!!prov || !!blocked);
     // the shown provider, voice and speed are STORED, so the next Play sends what this block shows
-    if (premium && (st.provider !== eff.provider || st.voice !== eff.voice || st.speed !== eff.speed)) {
+    if (premium && prov && (st.provider !== eff.provider || st.voice !== eff.voice || st.speed !== eff.speed)) {
       V.saveSettings({ provider: eff.provider, voice: eff.voice, speed: eff.speed });
     }
     const focusId = vcFocus; vcFocus = "";
@@ -1422,14 +1423,25 @@
 
     const tier = el("select", "dev-label vc-tier"); tier.id = "vc-tier";
     tier.appendChild(new Option("On-device voice", "device"));
-    const po = new Option("Premium voice", "premium"); po.disabled = !prov;
+    const po = new Option("Premium voice", "premium"); po.disabled = !prov && !blocked;
     tier.appendChild(po);
     tier.value = premium ? "premium" : "device";
-    tier.addEventListener("change", () => rerun(tier.value === "premium" ? { tier: "premium", provider: (prov || {}).name || "" } : { tier: "device" }, "vc-tier"));
-    const t = vcRow("Read aloud with", tier, prov ? "" : "Premium voice needs a key. Set one on the laptop with: levain voice key add <provider>");
+    tier.addEventListener("change", () => rerun(tier.value === "premium" ? { tier: "premium", provider: (prov || ready[0] || {}).name || "" } : { tier: "device" }, "vc-tier"));
+    const t = vcRow("Read aloud with", tier, blocked || (prov ? "" : "Premium voice needs a key. Set one on the laptop with: levain voice key add <provider>"));
+    if (blocked) { const hp = t.row.querySelector(".vc-help"); if (hp) { hp.classList.add("vc-blocked"); hp.setAttribute("role", "status"); } }
     t.label.htmlFor = "vc-tier";
     vcBody.appendChild(t.row);
 
+    if (blocked && ready.length) {       // a provider is CHOSEN here, never assumed: the select starts empty
+      const ps = el("select", "dev-label vc-provider"); ps.id = "vc-provider";
+      ps.appendChild(new Option("Choose a provider", ""));
+      for (const p of ready) ps.appendChild(new Option(p.name.charAt(0).toUpperCase() + p.name.slice(1), p.name));
+      ps.value = "";
+      ps.addEventListener("change", () => { if (ps.value) rerun({ provider: ps.value, voice: "" }, "vc-provider"); });
+      const pr = vcRow("Provider", ps);
+      pr.label.htmlFor = "vc-provider";
+      vcBody.appendChild(pr.row);
+    }
     if (prov) {
       const ps = el("select", "dev-label vc-provider"); ps.id = "vc-provider";
       for (const p of ready) ps.appendChild(new Option(p.name.charAt(0).toUpperCase() + p.name.slice(1), p.name));

@@ -76,7 +76,11 @@ INIT = """
   class Utt { constructor(t) { this.text = t; this.voice = null; this.rate = 1; this.volume = 1; } }
   window.SpeechSynthesisUtterance = Utt;
   const ss = new EventTarget();
-  ss.speak = (u) => { if (u.text) window.__spoken.push({ text: u.text, voice: u.voice ? u.voice.name : null }); setTimeout(() => u.onend && u.onend(), 20); };
+  ss.speak = (u) => {
+    if (window.__speakThrow) { window.__speakThrow = false; throw new Error('speak refused'); }
+    if (u.text) window.__spoken.push({ text: u.text, voice: u.voice ? u.voice.name : null });
+    if (window.__speakHang) return;                      // an engine that never says "end" (and cancel() ends nothing)
+    setTimeout(() => u.onend && u.onend(), 20); };
   ss.cancel = () => {};
   ss.getVoices = () => window.__voices;
   Object.defineProperty(window, 'speechSynthesis', { configurable: true, value: window.__noSpeech ? undefined : ss });
@@ -166,22 +170,173 @@ def test_selecting_premium_stores_the_shown_voice_and_the_real_route_accepts_the
 
 
 @needs_browser
-def test_a_stored_provider_with_no_key_and_a_speed_out_of_range_are_replaced_by_what_the_block_shows(rig, tmp_path, monkeypatch) -> None:
-    """Stored: openai (no key set here), voice nova, speed 1.9. The block shows inworld / Dennis / 1.5 and stores exactly that, so the
-    player's POST is the one the real route accepts. Revert: paintVoice not persisting / the player not reading effective()."""
+def test_a_speed_out_of_range_is_clamped_to_what_the_block_shows_and_stores(rig, tmp_path, monkeypatch) -> None:
+    """Stored: inworld, no voice, speed 1.9. The block shows Dennis / 1.5 and stores exactly that, so the player's POST is the one
+    the real route accepts. Revert: paintVoice not persisting / the player not reading effective()."""
     r = _reply(rig)
     v, _ = _run(tmp_path, monkeypatch, rig, [
         {"until": READY, "ms": 30000},
         {"eval": "JSON.stringify({s: LevainVoice.settings(), shown: [document.querySelector('#vc-provider').value, document.querySelector('#vc-voice').value, document.querySelector('#vc-speed').value]})"},
         {"eval": "new Promise((res) => { LevainVoice.play(%s).then(() => res(1)); })" % json.dumps(r)},
         {"eval": "JSON.stringify(window.__posts.map((p) => p.body))"},
-    ], pre="localStorage.setItem('levain_voice_settings', JSON.stringify({tier: 'premium', provider: 'openai', voice: 'nova', speed: 1.9}));", free=True)
+    ], pre="localStorage.setItem('levain_voice_settings', JSON.stringify({tier: 'premium', provider: 'inworld', voice: '', speed: 1.9}));", free=True)
     got = json.loads(v[1])
     assert got["shown"] == ["inworld", "Dennis", "1.5"], got
     assert (got["s"]["provider"], got["s"]["voice"], got["s"]["speed"]) == ("inworld", "Dennis", 1.5), got
     (post,) = json.loads(v[3])
     assert (post["provider"], post["voice"], post["speed"]) == ("inworld", "Dennis", 1.5), post
     assert len(rig.transport.seen) == 1
+
+
+@needs_browser
+def test_a_revoked_provider_is_never_swapped_for_another_vendor(rig, tmp_path, monkeypatch) -> None:
+    """Stored: premium / openai (its key is revoked: only inworld holds a key). Play must send NOTHING to inworld, the reply says
+    which key is missing, the block says the same and stores nothing new; choosing a provider in the block is what un-blocks it.
+    Revert: effective() falling back to offered[0] (the words went to a vendor he never chose, and the swap was stored)."""
+    r = _reply(rig)
+    v, _ = _run(tmp_path, monkeypatch, rig, [
+        {"until": READY, "ms": 30000},
+        {"eval": "new Promise((res) => { LevainVoice.play(%s).then(() => res(1)); })" % json.dumps(r)},
+        {"eval": "JSON.stringify({posts: window.__posts.length, note: LevainVoice.noteFor(%s), s: LevainVoice.settings(),"
+                 " block: document.querySelector('.vc-blocked') && document.querySelector('.vc-blocked').textContent,"
+                 " tier: document.querySelector('#vc-tier').value, prov: document.querySelector('#vc-provider').value})" % json.dumps(r)},
+        {"eval": "(() => { const p = document.querySelector('#vc-provider'); p.value = 'inworld'; p.dispatchEvent(new Event('change')); return 1; })()"},
+        {"eval": "new Promise((res) => { LevainVoice.play(%s).then(() => res(1)); })" % json.dumps(r)},
+        {"eval": "JSON.stringify({posts: window.__posts.map((p) => p.body.provider), block: !!document.querySelector('.vc-blocked')})"},
+    ], pre="localStorage.setItem('levain_voice_settings', JSON.stringify({tier: 'premium', provider: 'openai', voice: 'nova', speed: 1}));", free=True)
+    got = json.loads(v[2])
+    assert got["posts"] == 0 and len(rig.transport.seen) == 1, got      # the one provider call is the explicit choice below
+    assert "openai" in got["note"] and "Settings" in got["note"], got
+    assert got["block"] == got["note"] and got["s"]["provider"] == "openai" and got["tier"] == "premium" and got["prov"] == "", got
+    after = json.loads(v[5])
+    assert after == {"posts": ["inworld"], "block": False}, after
+
+
+@needs_browser
+def test_a_throw_inside_a_reading_clears_playing_and_the_next_reply_still_autoplays(rig, tmp_path, monkeypatch) -> None:
+    """speechSynthesis.speak() throws for the first reply. Revert: the `try/finally` in play() -> `playing` stays set, the next
+    reply is `queued` behind a reading that never ends, and nothing is ever read again."""
+    a, b = {"thread": "t", "gseq": 5, "text": "first"}, {"thread": "t", "gseq": 6, "text": "second"}
+    v, _ = _run(tmp_path, monkeypatch, rig, [
+        {"until": READY, "ms": 30000},
+        {"eval": UNLOCK_BTN % "LevainVoice.unlock();"},
+        {"tap": "document.querySelector('#tt')", "ms": 5000},
+        {"until": "LevainVoice.isUnlocked()", "ms": 5000},
+        {"eval": "(async () => { window.__voices = [%s]; window.__speakThrow = true; LevainVoice.saveSettings({tier: 'device', autoplay: true}); LevainVoice.arm(0);"
+                 " const first = LevainVoice.replyFinished(%s); await new Promise((x) => setTimeout(x, 200));"
+                 " const second = LevainVoice.replyFinished(%s); await new Promise((x) => setTimeout(x, 300));"
+                 " return JSON.stringify({first, second, spoken: window.__spoken.map((x) => x.text), note: LevainVoice.noteFor(%s)}); })()"
+                 % (LOCAL, json.dumps(a), json.dumps(b), json.dumps(a))},
+    ], key=False)
+    got = json.loads(v[4])
+    assert got["first"] == "play" and got["second"] == "play" and got["spoken"] == ["second"], got
+    assert got["note"], "the reply that threw says so"
+
+
+@needs_browser
+def test_a_queued_replys_waiting_label_clears_on_stop_on_autoplay_off_and_when_it_starts(rig, tmp_path, monkeypatch) -> None:
+    """A is read, B waits ("Waiting"); stop() drops B and B's label clears (a second pair, C playing and D waiting, stopped). Revert: stop() setting `queued = null` without deleting its message."""
+    a, b = {"thread": "t", "gseq": 5, "text": "first"}, {"thread": "t", "gseq": 6, "text": "second"}
+    c, d = {"thread": "t", "gseq": 7, "text": "third"}, {"thread": "t", "gseq": 8, "text": "fourth"}
+    v, _ = _run(tmp_path, monkeypatch, rig, [
+        {"until": READY, "ms": 30000},
+        {"eval": UNLOCK_BTN % "LevainVoice.unlock();"},
+        {"tap": "document.querySelector('#tt')", "ms": 5000},
+        {"until": "LevainVoice.isUnlocked()", "ms": 5000},
+        {"eval": "(async () => { window.__voices = [%s]; window.__speakHang = true; LevainVoice.saveSettings({tier: 'device', autoplay: true}); LevainVoice.arm(0);"
+                 " LevainVoice.replyFinished(%s); const q = LevainVoice.replyFinished(%s); const waiting = LevainVoice.noteFor(%s);"
+                 " LevainVoice.stop(); const afterStop = LevainVoice.noteFor(%s);"
+                 " LevainVoice.replyFinished(%s); LevainVoice.replyFinished(%s); LevainVoice.saveSettings({autoplay: false});"
+                 " window.__speakHang = false; const w = LevainVoice.noteFor(%s); LevainVoice.stop();"
+                 " return JSON.stringify({q, waiting, afterStop, w, afterOff: LevainVoice.noteFor(%s), spoken: window.__spoken.map((x) => x.text)}); })()"
+                 % (LOCAL, json.dumps(a), json.dumps(b), json.dumps(b), json.dumps(b), json.dumps(c), json.dumps(d), json.dumps(d), json.dumps(d))},
+    ], key=False)
+    got = json.loads(v[4])
+    assert got["q"] == "queued" and "Waiting" in got["waiting"] and got["afterStop"] == "", got
+    assert "Waiting" in got["w"] and got["afterOff"] == "", got
+
+
+@needs_browser
+def test_a_queued_reply_is_not_started_when_autoplay_went_off_while_it_waited(rig, tmp_path, monkeypatch) -> None:
+    """Revert: the drain checking only hidden/unlocked (B still started after the operator turned autoplay off)."""
+    a, b = {"thread": "t", "gseq": 5, "text": "first"}, {"thread": "t", "gseq": 6, "text": "second"}
+    v, _ = _run(tmp_path, monkeypatch, rig, [
+        {"until": READY, "ms": 30000},
+        {"eval": UNLOCK_BTN % "LevainVoice.unlock();"},
+        {"tap": "document.querySelector('#tt')", "ms": 5000},
+        {"until": "LevainVoice.isUnlocked()", "ms": 5000},
+        {"eval": "(async () => { window.__voices = [%s]; LevainVoice.saveSettings({tier: 'device', autoplay: true}); LevainVoice.arm(0);"
+                 " LevainVoice.replyFinished(%s); LevainVoice.replyFinished(%s); LevainVoice.saveSettings({autoplay: false});"
+                 " await new Promise((x) => setTimeout(x, 400));"
+                 " return JSON.stringify({spoken: window.__spoken.map((x) => x.text), note: LevainVoice.noteFor(%s)}); })()"
+                 % (LOCAL, json.dumps(a), json.dumps(b), json.dumps(b))},
+    ], key=False)
+    got = json.loads(v[4])
+    assert got["spoken"] == ["first"] and got["note"] == "", got
+
+
+@needs_browser
+def test_stop_settles_an_on_device_reading_and_the_utterance_is_held_until_it_ends(rig, tmp_path, monkeypatch) -> None:
+    """The engine never says "end" and cancel() ends nothing (the WebKit habit). a) play() resolves after stop(); b) the page holds the
+    utterance while it speaks and lets go at stop. Revert: speakDevice waiting on onend alone (play() never resolves) / `liveUtt` unset."""
+    r = {"thread": "t", "gseq": 1, "text": "read me"}
+    v, _ = _run(tmp_path, monkeypatch, rig, [
+        {"until": READY, "ms": 30000},
+        {"eval": "(() => { window.__voices = [%s]; window.__speakHang = true; window.__done = false;"
+                 " LevainVoice.play(%s).then(() => { window.__done = true; }); return 1; })()" % (LOCAL, json.dumps(r))},
+        {"until": "window.__spoken.length === 1", "ms": 5000},
+        {"eval": "LevainVoice.held()"},
+        {"eval": "LevainVoice.stop() || 1"},
+        {"until": "window.__done === true", "ms": 3000, "may_timeout": True},
+        {"eval": "LevainVoice.held()"},
+    ], key=False)
+    assert v[3] is True and not _timed_out(v[5]) and v[6] is False, v
+
+
+@needs_browser
+def test_an_on_device_reading_whose_engine_never_ends_is_released_by_the_watchdog(rig, tmp_path, monkeypatch) -> None:
+    """Revert: no watchdog in speakDevice -> play() never resolves and the queue behind it never moves."""
+    r = {"thread": "t", "gseq": 1, "text": "hi"}
+    v, _ = _run(tmp_path, monkeypatch, rig, [
+        {"until": READY, "ms": 30000},
+        {"eval": "LevainVoice.speechBound('hi', 1)"},
+        {"eval": "(() => { window.__voices = [%s]; window.__speakHang = true; window.__done = false;"
+                 " LevainVoice.play(%s).then(() => { window.__done = true; }); return 1; })()" % (LOCAL, json.dumps(r))},
+        {"until": "window.__done === true", "ms": 9000, "may_timeout": True},
+        {"eval": "LevainVoice.held()"},
+    ], key=False)
+    assert v[1] <= 10000 and not _timed_out(v[3]) and v[4] is False, v
+
+
+@needs_browser
+def test_replies_past_the_cap_are_never_re_offered_by_a_repeated_poll(rig, tmp_path, monkeypatch) -> None:
+    """250 distinct replies arrive after arm(); a later poll repeats the first 50 (a page polls the same window again). Revert:
+    FIFO-evicting `seen` with no high-water mark -> the evicted 50 are decided again ("tap"/"play"), so they are read again and,
+    on the premium tier, billed again. A reply above every mark is still new."""
+    v, _ = _run(tmp_path, monkeypatch, rig, [
+        {"until": READY, "ms": 30000},
+        {"eval": "(() => { LevainVoice.saveSettings({tier: 'device', autoplay: true}); LevainVoice.arm(0);"
+                 " const first = []; for (let g = 1; g <= 250; g++) first.push(LevainVoice.replyFinished({thread: 't', gseq: g, text: 'x'}));"
+                 " const again = []; for (let g = 1; g <= 50; g++) again.push(LevainVoice.replyFinished({thread: 't', gseq: g, text: 'x'}));"
+                 " const fresh = LevainVoice.replyFinished({thread: 't', gseq: 251, text: 'x'}), other = LevainVoice.replyFinished({thread: 'u', gseq: 1, text: 'x'});"
+                 " return JSON.stringify({first: first.filter((d) => d !== 'tap').length, again: again.filter((d) => d !== 'seen').length, fresh, other, sizes: LevainVoice.sizes()}); })()"},
+    ], key=False)
+    got = json.loads(v[1])
+    assert got["first"] == 0 and got["again"] == 0 and got["fresh"] == "tap" and got["other"] == "tap", got
+    assert got["sizes"]["seen"] <= 200 and got["sizes"]["floor"] <= 200, got
+
+
+@needs_browser
+def test_a_reply_that_finishes_while_the_page_is_hidden_asks_for_a_tap_when_the_poll_offers_it_again(rig, tmp_path, monkeypatch) -> None:
+    """Revert: remembering the reply as decided before the hidden check -> it is never offered a tap."""
+    v, _ = _run(tmp_path, monkeypatch, rig, [
+        {"until": READY, "ms": 30000},
+        {"eval": "(() => { LevainVoice.saveSettings({autoplay: true}); LevainVoice.arm(0); const r = {thread: 't', gseq: 9, text: 'x'};"
+                 " Object.defineProperty(document, 'hidden', {configurable: true, get: () => true}); const a = LevainVoice.replyFinished(r);"
+                 " Object.defineProperty(document, 'hidden', {configurable: true, get: () => false}); const b = LevainVoice.replyFinished(r);"
+                 " return JSON.stringify([a, b, LevainVoice.replyFinished(r)]); })()"},
+    ], key=False)
+    assert json.loads(v[1]) == ["hidden", "tap", "seen"], v[1]
 
 
 @needs_browser

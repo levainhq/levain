@@ -74,13 +74,16 @@
       speed: Array.isArray(p.speed) && p.speed.length === 2 ? [Number(p.speed[0]), Number(p.speed[1])] : [0.5, 2],
     })) : null;
   }
-  // What the player WILL use, and what the block shows: a stored provider with no live key is replaced by the first live
-  // one, a voice that provider does not offer by its default, a speed outside its range by the nearest end. No live
-  // provider means the on-device tier.
+  // What the player WILL use, and what the block shows: a voice the stored provider does not offer is replaced by its default,
+  // a speed outside its range by the nearest end. A stored provider that is NOT offered (its key was revoked) is never swapped
+  // for another vendor (that would move money and the words to a vendor he did not choose): `blocked` names it, the player
+  // reads nothing and sends nothing, and the block shows the same sentence. No stored provider and none live means on-device.
+  function blockedWords(name) { return "Your " + name + " voice key is not available; choose a voice in Settings."; }
   function effective() {
     const st = readSettings(), out = Object.assign({}, st);
     if (st.tier !== "premium") return out;
     if (offered === null) { if (!st.provider || !st.voice) out.tier = "device"; return out; }
+    if (st.provider && !offered.some((x) => x.name === st.provider)) { out.blocked = blockedWords(st.provider); return out; }
     const p = offered.find((x) => x.name === st.provider) || offered[0] || null;
     if (!p) { out.tier = "device"; return out; }
     out.provider = p.name;
@@ -114,11 +117,14 @@
   let playing = null;       // {thread, gseq} of the reply being read, or null
   let ctl = null;           // AbortController of the chunk fetches in flight
   let audioEl = null;       // the one media element: unlocked inside a tap, then reused for every chunk
+  let settleSpeech = null;  // ends the on-device utterance now (stop calls it), or null when none is speaking
+  let liveUtt = null;       // the utterance being spoken, held here until it ends: a browser may collect one only the engine holds
   let settleChunk = null;   // ends the chunk now on the element (stop calls it), or null when no chunk is on it
   let unlocked = false, lockEpoch = 0, unlocking = false;
   let queued = null;        // the one reply waiting behind the one being read
   let baseline = null;      // the gseq at or below which a finished reply is backlog; null = not armed, nothing autoplays
-  const seen = new Set();   // gseqs replyFinished has already decided on (a poll repeats them)
+  const seen = new Set();   // replies replyFinished has already decided on (a poll repeats them)
+  const floor = new Map();  // thread -> the highest gseq evicted from `seen`: a reply at or below it that is not in `seen` was decided
   const tapNeeded = new Set(); // gseqs whose autoplay was held for a tap
   const messages = new Map(); // gseq -> the last fixed sentence about that reply
   const listeners = new Set();
@@ -128,6 +134,23 @@
   function remember(coll, k, v) {
     if (coll instanceof Map) { coll.delete(k); coll.set(k, v); } else { coll.delete(k); coll.add(k); }
     while (coll.size > CAP) coll.delete(coll.keys().next().value);
+  }
+  // `seen` keeps the newest CAP decisions; what it evicts is not forgotten, it moves into `floor` (a high-water mark per thread),
+  // so a poll that repeats an old reply never re-offers it, however many replies came since.
+  function wasSeen(reply, k) {
+    if (seen.has(k)) return true;
+    const f = floor.get(String(reply.thread));
+    return f !== undefined && Number(reply.gseq) <= f;
+  }
+  function markSeen(k) {
+    seen.delete(k); seen.add(k);
+    while (seen.size > CAP) {
+      const old = seen.keys().next().value;
+      seen.delete(old);
+      const i = old.lastIndexOf(":"), thread = old.slice(0, i), g = Number(old.slice(i + 1));
+      if (isFinite(g)) { const f = floor.get(thread); if (f === undefined || g > f) { floor.delete(thread); floor.set(thread, g); } }
+    }
+    while (floor.size > CAP) floor.delete(floor.keys().next().value);
   }
   function changed() { listeners.forEach((f) => { try { f(); } catch (_) { /* a view's fault never stops the player */ } }); }
 
@@ -159,7 +182,7 @@
       let p;
       try { p = el.play(); } catch (e) { p = Promise.reject(e); }
       const end = (ok) => {
-        unlocking = false;
+        if (epoch === lockEpoch) unlocking = false;
         try { URL.revokeObjectURL(url); } catch (_) { /* gone */ }
         if (el.src === url) { try { el.pause(); } catch (_) { /* ok */ } el.muted = false; }   // only while the silence is still on the element
         if (epoch === lockEpoch) { unlocked = ok; changed(); }
@@ -172,13 +195,17 @@
   // The page hid, or is going: nothing plays and the next reply asks for a tap.
   function lock() { stop(); lockEpoch++; unlocked = false; unlocking = false; changed(); }
 
+  function dropQueued() { if (queued) { messages.delete(key(queued)); queued = null; } }
+
   function stop() {
     runId++;
-    queued = null;
+    dropQueued();
     if (ctl) { try { ctl.abort(); } catch (_) { /* done */ } ctl = null; }
     try { if (window.speechSynthesis) window.speechSynthesis.cancel(); } catch (_) { /* none */ }
     const s = settleChunk;
     if (s) s(false);
+    const sp = settleSpeech;
+    if (sp) sp();
     if (playing) { playing = null; changed(); }
   }
 
@@ -206,13 +233,31 @@
     const voice = await waitForLocalVoice();
     if (me !== runId) return;
     if (!voice) { sayIfNone(reply, WORDS.noLocal); return; }   // never speak(): a default voice may be network-backed
-    await new Promise((resolve) => {
+    await new Promise((resolve, reject) => {
       const u = new SpeechSynthesisUtterance(text);
       u.voice = voice;
       u.rate = speed;
-      u.onend = u.onerror = () => resolve();
-      ss.speak(u);
+      let over = false, wd = 0;
+      const finish = (cancel) => {
+        if (over) return;
+        over = true;
+        clearTimeout(wd);
+        if (settleSpeech === finish) settleSpeech = null;
+        if (liveUtt === u) liveUtt = null;
+        u.onend = u.onerror = null;
+        if (cancel === true) { try { ss.cancel(); } catch (_) { /* none */ } }
+        resolve();
+      };
+      u.onend = u.onerror = () => finish();
+      liveUtt = u; settleSpeech = finish;
+      wd = setTimeout(() => finish(true), speechBound(text, speed));   // an engine that never says "end" does not hold the queue
+      try { ss.speak(u); } catch (e) { over = true; clearTimeout(wd); if (settleSpeech === finish) settleSpeech = null; if (liveUtt === u) liveUtt = null; reject(e); }
     });
+  }
+  // The longest an utterance may take: a few seconds plus the slow end of speech (about 7 characters a second at rate 1).
+  function speechBound(text, rate) {
+    const r = Math.max(0.25, Number(rate) || 1);
+    return Math.min(600000, 5000 + Math.ceil(String(text).length * 150 / r));
   }
 
   // One chunk from the one route. Resolves {blob, total} or {refused: {message, fallback}} or {aborted: true}.
@@ -298,24 +343,37 @@
     playing = { thread: reply.thread, gseq: reply.gseq };
     messages.delete(key(reply)); tapNeeded.delete(key(reply));
     changed();
-    if (s.tier === "premium") await playPremium(reply, me, s);
-    else await speakDevice(reply, reply.text || "", me, s.speed);
-    if (me !== runId) return;
-    playing = null; changed();
-    const q = queued;
-    queued = null;
-    if (q && !document.hidden && unlocked) play(q);
+    try {
+      if (s.blocked) say(reply, s.blocked);                      // the stored provider has no key: nothing is read, nothing is sent
+      else if (s.tier === "premium") await playPremium(reply, me, s);
+      else await speakDevice(reply, reply.text || "", me, s.speed);
+    } catch (_) {
+      if (me === runId) {
+        if (ctl) { try { ctl.abort(); } catch (_e) { /* done */ } ctl = null; }
+        sayIfNone(reply, WORDS.cantPlay);
+      }
+    } finally {
+      if (me === runId) {      // whatever happened, this reading is over: `playing` clears and the one waiting reply gets its turn
+        playing = null; changed();
+        const q = queued;
+        queued = null;
+        if (q) {
+          if (!document.hidden && unlocked && readSettings().autoplay) play(q);
+          else { messages.delete(key(q)); if (readSettings().autoplay) remember(tapNeeded, key(q)); changed(); }
+        }
+      }
+    }
   }
 
   // The autoplay rule, in one place. Returns the decision as a word so the caller and the tests can see it.
   function replyFinished(reply) {
     if (!reply || reply.thread === undefined || reply.gseq === undefined) return "ignored";
     const k = key(reply);
-    if (seen.has(k)) return "seen";
-    remember(seen, k);
-    if (!readSettings().autoplay) return "off";
-    if (baseline === null || Number(reply.gseq) <= baseline) return "backlog";
-    if (document.hidden) return "hidden";
+    if (wasSeen(reply, k)) return "seen";
+    if (!readSettings().autoplay) { markSeen(k); return "off"; }
+    if (baseline === null || Number(reply.gseq) <= baseline) { markSeen(k); return "backlog"; }
+    if (document.hidden) return "hidden";           // not decided: when the page is back, the poll offers it again, as a tap
+    markSeen(k);
     if (!unlocked) { remember(tapNeeded, k); changed(); return "tap"; }
     if (playing) {
       if (queued) say(queued, WORDS.skipped);
@@ -367,7 +425,9 @@
     unlock, stop, play, arm, replyFinished, button,
     isUnlocked: () => unlocked,
     noteFor: (reply) => messages.get(key(reply)) || "",
-    sizes: () => ({ seen: seen.size, tapNeeded: tapNeeded.size, messages: messages.size }),
+    held: () => liveUtt !== null,
+    speechBound,
+    sizes: () => ({ seen: seen.size, floor: floor.size, tapNeeded: tapNeeded.size, messages: messages.size }),
     onChange: (f) => { listeners.add(f); return () => listeners.delete(f); },
     sampleDevice: async function () {
       const reply = { thread: "sample", gseq: 0 };
