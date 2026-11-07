@@ -164,6 +164,212 @@ h1{border-top:3px solid #8885;padding-top:1rem}li input{margin-right:.5em;transf
 <p><code>$L9 coord release</code> (ends the lease), <code>$L9 coord agent none</code>, stop or uninstall the serve if installed only for the day (<code>$L9 daemon uninstall</code>), <code>$L9 envelope kill ENV</code> for any live envelope, <code>rm -r /tmp/c9-remote.git</code>, delete the scratch branch, <code>$L9 consent away</code> check that away is back to its starting state <strong>only by his signature</strong> (the desk never turns it off), restore <code>~/Desktop/c9-c7-run/c9/levain-home-backup</code> only if the store is corrupted (compare first). The venv <code>~/.levain-c9-venv</code> may stay.</p>
 <h2 id="how-a-failure-is-reported_1">How a failure is reported</h2>
 <p>Each failed line: the desk writes the row in <code>RUNLOG.md</code> with the exact output, files a levain seat brief named for the DONE-line it blocks (not a summary of Phill's mood), writes one band row if it needs Phill to decide (for example whether C9 repeats), and an episode. A coordinator that stops three times files ONE band row by design (C10 S4); that is expected and is itself C10's residue check. The desk never edits <code>STATUS_1_0.md</code> rows from this run without the stores' evidence in hand, and never marks C9 or C7 done on a partial run.</p>
+<h1 id="part-3.-levain-hands-checks-folded-in-11-07-1608">Part 3. Levain
+hands checks (folded in 11-07 16:08)</h1>
+<p>Signed np-4fe004e5 (a), 11-07 16:08: “Fold the hands checks into
+Sunday’s friction day (np-a739498c) and keep every default and word as
+built”. These are the Levain rows that only his hands, eyes or sign-ins
+can close. Source rows:
+<code>~/Briefcase/levain/project_memory/STATUS_1_0.md</code> LANE MENU
+rows 9, 20, 33, 69 and 104
+(<code>awk 'index($0,"69. ")==1' STATUS_1_0.md</code> after line 562
+prints each) [judged by levain 60 lane, 11-07, against those rows].
+<strong>Nothing here has been run.</strong> Where a step is not
+derivable it says <strong>UNVERIFIED</strong> and what settles it. Order
+matters only for item H4 (it waits on an install) and H2 (it waits on
+Z2b being built and installed).</p>
+<p>State at 11-07 (derived): origin/main is tagged <code>v0.11.28</code>
+(<code>git -C ~/Briefcase/levain tag --sort=-creatordate | head -1</code>);
+Z2b is NOT on main
+(<code>git -C ~/Briefcase/levain merge-base --is-ancestor seat/1107-20-z2b origin/main</code>
+-&gt; exit 1, “z2b-not-on-main”); one VM named
+<code>vend-real-7a6895a7</code> is running (<code>tart list</code>).</p>
+<h2 id="levain-hands-checks-folded-in-11-07-1608">Levain hands checks
+(folded in 11-07 16:08)</h2>
+<ul class="task-list">
+<li><p><label><input type="checkbox" /><strong>H1. The VM sitting:
+Claude then Codex sign-ins on one re-staged VM</strong> (rows 69 and
+104).<br />
+<em>Desk stages first:</em> clones <code>p72-vm</code> into a
+<code>vend-</code> named VM with
+<code>~/Briefcase/levain/project_memory/1105-17/vmend/vmend.py</code>
+(it refuses any non-<code>vend-</code> name), tree = origin/main at the
+time, opens the VM window on your screen, and puts the two launchers on
+the guest desktop (<code>A1_Sign_in_Claude.command</code>,
+<code>A2_Sign_in_Codex.command</code>) [row 69 V1 brief,
+<code>1105-36/RETURN_remaining_a.md</code>; launcher names from
+<code>1106-16/v1/SIGNIN_STEPS.txt</code>]. Desk first runs
+<code>tart list</code> and <code>check_signins.sh</code>
+(<code>1106-16/v1/</code>) and tells you whether the 11-06 VM
+<code>vend-real-7a6895a7</code> already shows both signed in; if it
+does, the desk says so and asks you whether to re-stage anyway (row 69
+says “re-staged VM”).<br />
+<em>You do (at the laptop, inside the VM window):</em> (1) double-click
+<code>A1_Sign_in_Claude.command</code>; (2) type <code>/login</code>,
+Enter, Enter (option 1, Claude account), cmd-click the URL (opens Safari
+in the VM), sign in, copy the short code, paste it into the Terminal,
+Enter; (3) when it says logged in, type <code>/exit</code> and answer
+yes at Levain’s identity confirm; (4) double-click
+<code>A2_Sign_in_Codex.command</code>, press Down once (“Sign in with
+Device Code”), Enter; (5) cmd-click the URL, sign in to ChatGPT in the
+VM Safari, type the one-time code shown in the Terminal (15 minute
+limit); (6) press Ctrl-C to end Codex, answer yes at Levain’s confirm;
+(7) tell the desk “signed in” and leave the VM window open [steps copied
+from <code>1106-16/v1/SIGNIN_STEPS.txt</code>, the 11-06 sitting’s
+instructions; UNVERIFIED: whether the launcher text and menu wording are
+unchanged on a fresh re-stage].<br />
+<em>Pass looks like:</em> desk runs
+<code>~/Briefcase/levain/project_memory/1106-16/v1/check_signins.sh</code>
+and it prints <code>RESULT: both signed in (probes passed)</code> (the
+fixed script, <code>1106-16/v1/RETURN_row54.md</code>), Claude in slot
+8, Codex in slot 9.<br />
+<em>Write down:</em> the Codex slot e9 label. UNVERIFIED which label
+that is: <code>1106-16/v1/RETURN_row54.md</code> says the baseline on
+11-06 was <code>"observed_id":"not-a-check"</code> and that this is by
+design for Codex (Levain reads no Codex account), while row 104 says the
+11-06 driver “ended asking him to record the slot’s label”; you say what
+label you want recorded and the desk writes it, with the
+<code>slots/e9/baseline</code> contents beside it. Also write down the
+time, and anything the VM asked you that is not in step list
+above.<br />
+<em>Desk afterwards (not yours):</em> the rows this sitting closes if it
+passes are 7, 39, 51, 53 and 54 and the identity gate (row 69); the desk
+runs the X1 real Codex END and the C1p / identity-step rows with raw
+output [row 69 V1 brief].</label></p></li>
+<li><p><label><input type="checkbox" /><strong>H2. A throwaway read-only
+GitHub token for the Z2b VM check</strong> (row 104). <strong>Blocked
+until Z2b is built and installed</strong>: Z2b is
+<code>seat/1107-20-z2b</code>, not on main (command above). If it is
+still not installed Sunday, skip this item and write “H2 not reached:
+Z2b not installed” in the log; do NOT mint a token for a command that
+does not exist yet (row 104 D8: “he mints the token only when Z2b is
+built”).<br />
+<em>Desk stages first:</em> confirms
+<code>levain seat gh-token --help</code> exists in the installed levain,
+then says which levain home the tokens go under
+(<code>seat_lease._levain_home()</code>); on the VM that is the VM’s
+home, UNVERIFIED which home Z2b’s VM check is meant to use (the frame
+does not say; settles it: the desk’s Z2b return,
+<code>1107-15-voice/RETURN_z2b_build.md</code> UNVERIFIED item 3, and
+your word).<br />
+<em>You do (github.com in your browser, then one terminal):</em> open
+github.com/settings/personal-access-tokens and mint TWO fine-grained
+tokens, each read-only, ONE repository each, 90 days: (a) resource owner
+<code>levainhq</code>, repository <code>levain</code> (levainhq is an
+organisation; UNVERIFIED that it is, read the owner field on the mint
+page: if levainhq and phillipclapham are the same owner one token
+suffices, <code>Z2B_FRAME.md</code> line 27); (b) resource owner
+<code>phillipclapham</code>, repository <code>flow</code>. Repository
+permissions for both: Contents, Metadata, Pull requests, Issues,
+Actions, each Read-only; nothing else. Then at the hidden prompt, paste
+each token:
+<code>levain seat gh-token set --owner levainhq --expires YYYY-MM-DD</code>
+and
+<code>levain seat gh-token set --owner phillipclapham --expires YYYY-MM-DD</code>
+(the date on the mint page; used only if GitHub’s reply carries no
+expiry) [commands and permission list from
+<code>~/Briefcase/.levain-1107-20-z2b/project_memory/1107-15-voice/RETURN_z2b_build.md</code>,
+“Phill’s commands”]. Never paste a token into chat or an argument.<br />
+<em>Pass looks like:</em> <code>levain seat gh-token status</code>
+prints a fingerprint and an expiry for each owner and never the token;
+each <code>set</code> printed its confirmation after the GET from the
+host. A bad token should refuse with fixed words (“seat gh-token
+refused: …”, <code>cli.py</code> on the Z2b branch); UNVERIFIED what the
+refusal text says for each case.<br />
+<em>Write down:</em> the two expiry dates, each token’s name on the mint
+page (so it can be revoked), and whether the expiry came from GitHub’s
+header or from your <code>--expires</code>. Revoke later with
+<code>levain seat gh-token clear --owner &lt;owner&gt;</code> and delete
+the token on GitHub. The “VM half” itself (what the seat does on the VM
+with the door) is UNVERIFIED: the Z2b return lists the live checks it
+owes (a real token against api.github.com, the seat loading
+<code>levain_gh</code>, the sandbox denying <code>seat_gh</code>); the
+desk writes the exact command when Z2b is installed.</label></p></li>
+<li><p><label><input type="checkbox" /><strong>H3. First real Room chat,
+then a glass look at the voice pieces</strong> (row 20, V1-0 and
+V1-5..V1-8).<br />
+<em>Desk stages first:</em> installs main (the release you are on,
+<code>v0.11.28</code> or later) and starts the room:
+<code>levain serve --write --room &lt;dir&gt;</code>
+[<code>1104-voice/V1_DESIGN.md</code> line 44, V1-0]. UNVERIFIED: the
+exact running URL and <code>&lt;dir&gt;</code>; the desk prints the
+tailnet URL for the iPhone
+(<code>python3 ~/Briefcase/flow/scripts/review_url.py</code>) before you
+start. Desk confirms a voice key is on file if you want premium voice
+(premium needs a Signer today, row 20 / row 50, UNVERIFIED whether that
+has since changed) and that the free voice works without one.<br />
+<em>You do:</em> (1) on the laptop type a line to Claude in the Room,
+read the reply, tap Stop once; (2) the same on the iPhone; (3) then the
+glass look at the voice pieces, per the V1 design’s hands column:
+autoplay after Send; plays with the silent switch on; interrupt halfway;
+the “Tap to hear” degrade after a remount; AirPods; whether the Nova
+voice sounds right; push-to-talk: mic permission re-asked per launch on
+the iPhone and transcript quality in your voice; open a card from a
+notification with the setting on and see whether it plays without a page
+tap or shows “Tap to hear this card” [<code>V1_DESIGN.md</code> rows
+V1-5, V1-6, V1-7]. UNVERIFIED: which of these pieces are in the
+installed release (row 20 says landing 9e is on main and the Deepgram
+picker and speed pin too, but the default provider change, row 62, is
+not on main as of the row); the desk lists what is installed before you
+start (UNVERIFIED: the command that lists it) and skips the rest.<br />
+<em>Pass looks like:</em> a real Claude answer to a typed line, read by
+you, on both devices (V1-0’s own pass line: “he typed a line on the
+laptop and on the iPhone, read the reply and tapped Stop”), and for each
+voice piece you say works / does not / did not try.<br />
+<em>Write down:</em> what you typed and what you saw, per device; the
+felt response in your words (the desk logs it as a <code>felt</code>
+episode); anything you want changed on the page.</label></p></li>
+<li><p><label><input type="checkbox" /><strong>H4. iPhone band-push tap,
+warm and cold</strong> (row 33). <strong>Blocked on the
+install.</strong> Both levain-side gaps are on main but UNRELEASED as of
+the row; this item runs only after a release that contains them is
+installed in the server you tap. Settles whether it is: the desk runs
+<code>git -C ~/Briefcase/levain merge-base --is-ancestor f752261e v0.11.28</code>
+and the same for <code>8c1fe768</code> (a <code>y</code> for both means
+the tag carries them) and <code>diff -rq</code> the installed levain
+against that tag [method from row 33]; if not installed, skip and write
+“H4 not reached: not installed”.<br />
+<em>Desk stages first:</em> re-pairs the iPhone app first (write token)
+[row 33], files ONE test band row for the tap, and has
+<code>/tap_trace</code> readable.<br />
+<em>You do (iPhone):</em> (1) tap the test band-push notification with
+the app in the background (warm); (2) swipe the app away and send a
+second test row, then tap that notification (cold) [row 33].<br />
+<em>Pass looks like:</em> each tap lands on the centre focus view on
+that row inside the app (not on the home page), and
+<code>/tap_trace</code> shows the tap [row 33: “success = the centre
+focus view on that row inside the app, read
+<code>/tap_trace</code>”].<br />
+<em>Write down:</em> warm result, cold result, and the question row 33
+carries: did you mean the center item or the sign sheet by “the card”
+(your answer decides which the push should open).</label></p></li>
+<li><p><label><input type="checkbox" /><strong>H5. Your go on the 3b-8a
+cleanup-journal VM run</strong> (row 9). This is your word, not hands
+work: the cleanup journal and the VM driver are on main and the driver’s
+first VM run was PARTIAL (<code>1106-16/RETURN_vm_driver.md</code>:
+RESULT PASS with host-side adapters the lane wrote, because
+<code>scripts/vm_harness/driver.py</code> has no real adapters in the
+repo) [row 9].<br />
+<em>Desk stages first:</em> names the VM it would clone
+(<code>p72-vm</code> is the one that worked; <code>vdis-mac</code>
+carries a stranded HELD session and refused <code>install</code>,
+<code>RETURN_vm_driver.md</code> finding), states which of the two
+harness defects (rig seed writes no identity seed; rig ships an old
+fake) are fixed first, and says the run clones and deletes its own
+<code>vend-</code> VM and leaves <code>tart list</code> as it found
+it.<br />
+<em>You do:</em> say “go” or “not yet” in the one message the desk
+sends. Nothing else.<br />
+<em>Pass looks like:</em> (after your go) <code>RESULT.txt</code> shows
+a header line then <code>RESULT: PASS</code> (the shape in
+<code>1106-16/vm_driver/driver_run1/RESULT.txt</code>), with the
+adapters being the real ones if they exist by then, otherwise it is
+again PARTIAL; UNVERIFIED whether the three interface decisions of
+<code>1029-5/CLEANUP_SCOPE.md</code> are settled by the driver (row 9
+says not re-derived).<br />
+<em>Write down:</em> “go” or “not yet” with the time, in your
+words.</label></p></li>
+</ul>
 <hr />
 <h1 id="open-questions-the-run-cannot-answer-from-here-all-unverified-above-collected">Open questions the run cannot answer from here (all UNVERIFIED above, collected)</h1>
 <ol>
@@ -175,4 +381,16 @@ h1{border-top:3px solid #8885;padding-top:1rem}li input{margin-right:.5em;transf
 <li>How <code>coord review clear</code> invokes the "fresh" mode (<code>coord review clear --help</code>).</li>
 <li>Whether <code>daemon install</code> needs flags (<code>daemon would-install</code>).</li>
 <li>Which of Phill's real items Sunday are drop-worthy (his answer at C9.0).</li>
-</ol></body></html>
+<li>(Part 3, H1) Which Codex slot e9 label to record, and whether a
+fresh re-stage repeats the 11-06 launcher wording.</li>
+<li>(Part 3, H2) Whether levainhq is an organisation distinct from
+phillipclapham; which levain home Z2b’s VM check uses; the exact VM-half
+command; the refusal text per bad-token case.</li>
+<li>(Part 3, H3) The room URL and directory; which voice pieces the
+installed release carries; whether premium voice still needs a
+Signer.</li>
+<li>(Part 3, H4) Whether the installed release carries f752261e and
+8c1fe768 (blocked on the install).</li>
+<li>(Part 3, H5) Whether the driver has real adapters yet; whether the
+three <code>CLEANUP_SCOPE.md</code> interface decisions are
+settled.</li></ol></body></html>
