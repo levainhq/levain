@@ -420,6 +420,7 @@ class StreamRegistry:
         self._sessions: dict[str, StreamSession] = {}     # live and retained-ended
         self._ended_at: dict[str, float] = {}             # sid -> when it ended, oldest first
         self._unsettled: list[tuple[int, int]] = []       # (reservation_id, seconds) whose settle failed
+        self._retrying = 0                                # entries a retry pass holds detached; they still count
         self._pending = 0                                  # slots taken by an open in progress
         self._closed = False
 
@@ -438,7 +439,7 @@ class StreamRegistry:
         with self._lock:
             if self._closed:
                 code = "stopping"
-            elif len(self._unsettled) >= MAX_UNSETTLED:
+            elif len(self._unsettled) + self._retrying >= MAX_UNSETTLED:
                 code = "settle_backlog"
             elif self._live() + self._pending >= self._max:
                 code = "too_many_sessions"
@@ -602,16 +603,20 @@ class StreamRegistry:
         and it and everything after it wait, in order, for the next reap."""
         with self._lock:
             todo, self._unsettled = self._unsettled, []
+            self._retrying += len(todo)
         done = 0
-        for reservation_id, seconds in todo:
-            try:
-                end_reservation(self._meter, reservation_id, seconds)
-            except Exception:     # noqa: BLE001 - logged once when it first failed; it waits for the next reap
-                break
-            done += 1
-        if done < len(todo):
+        try:
+            for reservation_id, seconds in todo:
+                try:
+                    end_reservation(self._meter, reservation_id, seconds)
+                except Exception:     # noqa: BLE001 - logged once when it first failed; it waits for the next reap
+                    break
+                done += 1
+        finally:
             with self._lock:
-                self._unsettled[:0] = todo[done:]
+                self._retrying -= len(todo)
+                if done < len(todo):
+                    self._unsettled[:0] = todo[done:]
 
     def reap(self) -> int:
         """End every live session past its idle or age limit (each re-checked under its own lock, settling each), drop
