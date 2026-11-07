@@ -408,3 +408,31 @@ def test_the_worklet_posts_one_copy_not_two() -> None:
     from pathlib import Path
     src = (Path(__file__).resolve().parent.parent / "levain" / "templates" / "web" / "mic_worklet.js").read_text()
     assert "postMessage(c, [c.buffer])" in src and "postMessage(ch.slice" not in src
+
+
+@needs_browser
+def test_send_while_dictating_sends_nothing_when_the_close_fails(tmp_path, qdir) -> None:
+    """Revert: the LM.closeFailed() check in room_view's Send handler (a truncated partial went out with no note)."""
+    v = _go(tmp_path, qdir, [
+        *LIVE, *ROOM, {"eval": "window.__sc.hang.close = true; LevainMic.deadlines.close = 300; 1"},
+        CLICK, {"until": "window.__sc.open.length === 1 && window.__sc.node"},
+        {"eval": "window.__feed(12000)"}, {"until": TA + ".value.indexOf('live 0') >= 0", "ms": 20000},
+        {"eval": "document.querySelector('.rv-send').click(); 1"},
+        {"until": "window.__sc.closes.length === 1 && !LevainMic.active()", "ms": 5000},
+        _wait(300),
+    ])
+    st = _state(v[-1])
+    assert st["sc"]["sends"] == [] and "nothing was sent" in (st["note"] or ""), st
+
+
+@needs_browser
+def test_a_worklet_module_that_never_loads_ends_the_session_at_its_deadline(tmp_path, qdir) -> None:
+    """Revert: withDeadline around wire() in start() (the microphone stayed open for ever)."""
+    v = _go(tmp_path, qdir, [
+        *LIVE, {"eval": "window.__sc.modHold = true; LevainMic.deadlines.open = 300; 1"},
+        {"do": MIC + ".click(); 1", "until": "window.__sc.mods.length === 1"},
+        {"until": "!LevainMic.active()", "ms": 5000},
+        _wait(200),
+    ])
+    st = _state(v[-1])
+    assert st["sc"]["open"] == [] and [t["stopped"] for t in st["sc"]["tracks"]] == [1], st

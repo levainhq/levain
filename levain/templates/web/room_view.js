@@ -577,7 +577,12 @@
     sendB.addEventListener("click", function () {
       endDictation();
       if (sendWait) return;
-      if (live && LM.active()) { sendWait = true; endStream().then(function () { sendWait = false; if (!stopped) doSend(); }); return; }
+      if (live && LM.active()) { sendWait = true; endStream().then(function () {
+        sendWait = false;
+        if (stopped) return;
+        if (LM.closeFailed && LM.closeFailed()) { note.textContent = "The dictation could not be finished, so nothing was sent. Your words so far are in the box; tap Send again."; return; }
+        doSend();
+      }); return; }
       doSend();
     });
     function doSend() {

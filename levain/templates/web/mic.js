@@ -157,21 +157,24 @@
     }).catch(function () {
       if (s.dead || s.ended) return;
       s.dead = true;
+      if (s.stopping) closeFailed = true;
       emit("note", WORDS.broke);
       finish(s);                    // the session is over now; the close below is best effort and nothing waits on it
       closeSession(s, false);
     });
   }
+  var closeFailed = false;       // true when the last stop could not confirm the final text with the server
   function closeSession(s, wantFinal) {
     if (!s.sid) { finish(s); return Promise.resolve(); }
     return postJson(s, BASE + "close?sid=" + encodeURIComponent(s.sid), undefined, deadlines.close).then(function (j) {
       if (wantFinal && j && typeof j.text === "string") { s.text = j.text; emit("final", j.text); }
-    }, function () { /* the server ends an idle session itself */ }).then(function () { finish(s); });
+    }, function () { closeFailed = true; /* the server ends an idle session itself */ }).then(function () { finish(s); });
   }
   // resolves with the final text ("" when there is none); safe to call twice
   function stopSession(s) {
     if (s.stopping || s.ended) return s.finP;
     s.stopping = true;
+    closeFailed = false;
     releaseCapture(s);
     // still waiting for the permission or the worklet: there is no server session to close; the init chain finds the session
     // stale when it resumes and stops whatever it then holds
@@ -215,7 +218,7 @@
         // every step below re-asks whether this session is still the live one; a late stream is stopped right here
         if (stale(s)) { stopStream(stream); releaseCapture(s); finish(s); return null; }
         s.stream = stream; s.phase = "wire";
-        return wire(s).then(function () {
+        return withDeadline(wire(s), deadlines.open).then(function () {
           if (stale(s)) { releaseCapture(s); finish(s); return null; }
           s.timer = setTimeout(function () { stopSession(s); }, MAX_MS);
           s.phase = "open";
@@ -227,6 +230,13 @@
       }).then(resolve, function () { fail(); resolve(); });
     });
     s.q = s.openP;
+  }
+  // a worklet module that never loads must not hold the microphone open: the wait is bounded like the open request
+  function withDeadline(p, ms) {
+    return new Promise(function (resolve, reject) {
+      var t = setTimeout(function () { reject(new Error("deadline")); }, ms);
+      p.then(function (v) { clearTimeout(t); resolve(v); }, function (e) { clearTimeout(t); reject(e); });
+    });
   }
   // build the capture graph: an AudioWorklet where there is one, else the deprecated ScriptProcessor
   function wire(s) {
@@ -248,7 +258,7 @@
   }
 
   window.LevainMic = {
-    available: available, probe: probe, start: start, stop: stop, active: function () { return !!S; }, deadlines: deadlines,
+    available: available, probe: probe, start: start, stop: stop, active: function () { return !!S; }, closeFailed: function () { return closeFailed; }, deadlines: deadlines,
     onPartial: function (cb) { return on("partial", cb); }, onFinal: function (cb) { return on("final", cb); },
     onNote: function (cb) { return on("note", cb); }, onEnd: function (cb) { return on("end", cb); },
   };
