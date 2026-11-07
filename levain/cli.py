@@ -3729,8 +3729,7 @@ def _cmd_seat_egress(args: argparse.Namespace, root: Path) -> int:
         until = seat_push.renew_egress(root, args.grant_id, signer_fp=signer_fp, sign=sign, clock=_utc_now)
         print(f"renewed: {args.grant_id} until {until}")
     else:
-        from levain.consent.grants import revoke_grant
-        seq, warning = revoke_grant(root, args.grant_id, signer_fp=signer_fp, sign=sign, clock=_utc_now)
+        seq, warning = seat_push.revoke_egress(root, args.grant_id, signer_fp=signer_fp, sign=sign, clock=_utc_now)
         print(f"revoked: {args.grant_id} at seq {seq}; no later push, commits stay in the clone")
         if warning:
             print(f"warning: {warning}", file=sys.stderr)

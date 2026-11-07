@@ -579,6 +579,32 @@ def test_egress_renew_refuses_with_a_reason_and_never_prints_success(eg, monkeyp
     assert "renewed" not in out.out and "seat egress refused" in out.err
 
 
+def test_egress_revoke_never_revokes_a_lease_or_another_kind(eg, monkeypatch, capsys):
+    """codex MED (bundle3 final): `levain seat egress revoke <lease id>` revoked the lease and printed an egress line."""
+    cli = _cli_signing(eg, monkeypatch)
+    lease = eg.rig.sign_lease()
+    grant = eg.sign()
+    args = ["--data-root", str(eg.world.root), "--signing-key", str(eg.tmp / "unused")]
+    assert cli.main(["seat", "egress", "revoke", lease["id"], *args]) == 1
+    out = capsys.readouterr()
+    assert "revoked" not in out.out and "not a seat-egress grant" in out.err
+    assert sl._replay(eg.world.root).policy.grants[lease["id"]]["expires_at"] == lease["expires_at"]   # untouched
+    assert "revoked_at" not in sl._replay(eg.world.root).policy.grants[lease["id"]]
+    assert cli.main(["seat", "egress", "revoke", grant["id"], *args]) == 0
+    assert capsys.readouterr().out.startswith(f"revoked: {grant['id']}")
+
+
+def test_a_relative_cockpit_root_is_made_absolute_for_the_profile(eg, monkeypatch):
+    """codex MED / gemini HIGH 2: the hooks run from the clone, so a relative --data-root must not reach the profile."""
+    eg.rig.sign_lease()
+    eg.sign()
+    monkeypatch.chdir(eg.world.root.parent)
+    rel = Path(eg.world.root.name)
+    plan = eg.rig.launch("lane-rel", cockpit_root=rel)
+    cmd = plan.profile.settings["hooks"]["Stop"][0]["hooks"][0]["command"]
+    assert str(eg.world.root.resolve()) in cmd or str(eg.world.root) in cmd
+
+
 def test_a_lapsed_grant_is_not_renewed_beside_a_live_one(eg, monkeypatch, capsys):
     """gemini MED 3 (refuted: the log never renews a lapsed grant, and a loosen is judged on the policy AFTER it)."""
     cli = _cli_signing(eg, monkeypatch)

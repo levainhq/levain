@@ -394,6 +394,7 @@ def prepare_launch(lane_key: str, remote_url: str, base_sha: str, *, claude_bin:
     one): a lease revoked, expired or replaced meanwhile refuses and the roots are removed. A seat is "running" only
     once the plan is returned; nothing here outlives a revoke that landed before that."""
     clock = (lambda: now) if now is not None else (lambda: datetime.now(timezone.utc))
+    cockpit_root = Path(os.path.abspath(cockpit_root))   # the hooks run from the clone: a relative root would replay nothing there
     state = _replay(cockpit_root)
     lease = None if state is None else live_lease(state, clock())
     if lease is None:

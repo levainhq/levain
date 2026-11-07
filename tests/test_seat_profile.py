@@ -71,7 +71,9 @@ def test_permission_deny_names_all_four_file_tools(rig):
         assert any(r.startswith(f"{tool}(") and ".claude/**" in r for r in deny)
         assert any(r.startswith(f"{tool}(") and r.endswith("/.mcp.json)") for r in deny)
         for sub in sp._GIT_DENY:
-            assert f"{tool}(.git/{sub}/**)" in deny and f"{tool}(//{str(base / 'lane').lstrip('/')}/.git/{sub}/**)" in deny
+            assert f"{tool}({sp._git_rule_path('.git', sub)})" in deny
+            assert f"{tool}(//{sp._git_rule_path(str(base / 'lane') + '/.git', sub).lstrip('/')})" in deny
+        assert "Edit(.git/config)" in deny and "Edit(.git/config/**)" not in deny   # config is a FILE: /** does not match it
         # git commit needs .git writable (measured, z1e/RETURN_gitdeny.md): no rule may deny .git whole
         assert not any(r.startswith(f"{tool}(") and (r.endswith("/.git/**)") or r.endswith(".git)")) for r in deny)
     assert any(r.startswith("Read(") and str(keys).lstrip("/") in r for r in deny)

@@ -140,6 +140,20 @@ def renew_egress(cockpit_root: Path | str, grant_id: str, *, signer_fp: str, sig
                                   max_life=SEAT_EGRESS_MAX)
 
 
+def revoke_egress(cockpit_root: Path | str, grant_id: str, *, signer_fp: str, sign: Callable[[bytes], str],
+                  clock: Callable[[], datetime]) -> tuple[int, str | None]:
+    """Revoke the seat-egress grant ``grant_id``. Refuses (:class:`SeatPushRefused`) an id the log does not hold as a
+    seat-egress grant, so ``levain seat egress revoke`` never revokes a lease or a consent grant; the kind check and
+    the revoke are two replays (a same-id re-creation between them is a known edge, an operator-only path)."""
+    from levain import seat_lease
+    from levain.consent.grants import revoke_grant
+    state = seat_lease._replay(cockpit_root)
+    grant = None if state is None else state.policy.grants.get(grant_id)
+    if not (isinstance(grant, Mapping) and grant.get("kind") == SEAT_EGRESS_KIND):
+        raise SeatPushRefused(f"{grant_id!r} is not a seat-egress grant the log holds: nothing revoked")
+    return revoke_grant(cockpit_root, grant_id, signer_fp=signer_fp, sign=sign, clock=clock)
+
+
 # --- the judge -------------------------------------------------------------------------------------------------------
 
 def _mint_for(key_dir: Path, clone_real: str) -> dict[str, Any]:

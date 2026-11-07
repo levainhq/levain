@@ -34,6 +34,11 @@ CANARY_DIRNAME = "levain-seat-canary"
 #: ``Edit(...)`` rule refuses the Write tool and a ``Write(...)`` rule alone did NOT, so the Edit rules carry the deny.
 FILE_TOOLS = ("Edit", "Write", "MultiEdit", "NotebookEdit")
 _GIT_DENY = ("hooks", "config", "info", "modules", "worktrees")
+_GIT_DENY_FILES = frozenset({"config"})   # a file under .git: its rule names it, with no /** (a pattern ending /** does not match a file)
+
+
+def _git_rule_path(prefix: str, sub: str) -> str:
+    return f"{prefix}/{sub}" if sub in _GIT_DENY_FILES else f"{prefix}/{sub}/**"
 _WALK_CAP = 200_000
 _HOOK_TIMEOUT = 30
 
@@ -74,13 +79,13 @@ def seat_permission_deny(roots: Sequence[Path], key_dir: Path) -> list[str]:
     names = sorted(PROTECTED_NAMES - {".mcp.json", ".git"})
     for i, root in enumerate(roots):
         pats = [f"{root}/{name}/**" for name in names]
-        pats += [f"{root}/.git/{sub}/**" for sub in _GIT_DENY]
+        pats += [_git_rule_path(f"{root}/.git", sub) for sub in _GIT_DENY]
         pats += [f"{root}/.mcp.json"]
         for tool in FILE_TOOLS:
             rules += [_abs_rule(tool, p) for p in pats]
             if i == 0:
                 rules += [f"{tool}({name}/**)" for name in names]
-                rules += [f"{tool}(.git/{sub}/**)" for sub in _GIT_DENY]
+                rules += [f"{tool}({_git_rule_path('.git', sub)})" for sub in _GIT_DENY]
                 rules += [f"{tool}(.mcp.json)"]
     rules.append(_abs_rule("Read", f"{key_dir}/**"))
     return rules

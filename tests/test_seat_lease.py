@@ -60,9 +60,9 @@ def rig(tmp_path, monkeypatch):
         return sl.create_lease(world.root, lanes_parent=r.lanes, returns_parent=r.returns, key_dir=key_dir,
                                signer_fp=fp, sign=sign, clock=world.clock)
 
-    def launch(lane="lane-a", *, now=None):
+    def launch(lane="lane-a", *, now=None, cockpit_root=None):
         return sl.prepare_launch(lane, str(src), sha, claude_bin=r.claude, python=sys.executable,
-                                 cockpit_root=world.root, install=tmp_path,
+                                 cockpit_root=cockpit_root or world.root, install=tmp_path,
                                  now=now or world.clock.now + timedelta(minutes=1), managed=())
     r.sign_lease, r.launch = sign_lease, launch
     return r
