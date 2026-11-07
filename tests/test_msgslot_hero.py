@@ -220,10 +220,37 @@ def test_an_expanded_recent_list_taller_than_the_composer_does_not_move_the_comp
     with rig.serving():
         got = _tagged(drive_touch(tmp_path, f"{rig.origin}/#write_token={TOK}", steps))
     before, after = got["before"], got["after"]
-    assert after["recent"] > after["left"] + 200, got                  # the list really is taller than the composer
-    assert after["gaps"] == before["gaps"] and after["left"] == before["left"], got   # ...and the composer's rows did not move
+    assert after["recent"] > before["recent"] + 50 and after["left"] == after["recent"], got   # the thread grew, and the composer column stretched with it
+    assert after["gaps"] == before["gaps"], got                        # ...and the composer's rows did not move (the box, not the gaps, takes the extra height)
     assert all(g <= 24 for g in after["gaps"]), got                    # natural gaps, no spread
     assert after["kids"] == 2, got                                     # the composer and the recent column are the card's only children
+
+
+BOXFIT = ("(() => { const h = document.getElementById('ck-drop'); const b = document.getElementById('ck-drop-words'); const m = h.querySelector('.drop-main');"
+          " const mb = m.getBoundingClientRect(); const bb = b.getBoundingClientRect(); const a = h.querySelector('.drop-actions').getBoundingClientRect();"
+          " const rc = h.querySelector('.drop-recent').getBoundingClientRect();"
+          " return JSON.stringify({t: 'TAG', box: Math.round(bb.height), main: Math.round(mb.height), recent: Math.round(rc.height), below: Math.round(mb.bottom - a.bottom),"
+          " boxBottomToActions: Math.round(a.top - bb.bottom)}); })()")
+
+
+@needs_browser
+@needs_ssh
+def test_the_drop_box_grows_to_the_height_of_the_thread_beside_it_at_desktop_width(tmp_path: Path, monkeypatch) -> None:
+    """Phill 11-07: with a long thread to its right the box was a tiny field at the top. At 1280 it now fills the composer column, which is
+    as tall as the thread; the actions stay under it, and the box keeps its floor with a short thread."""
+    rig = FullRig(tmp_path, monkeypatch)
+    steps = [{"emulate": {"w": 1280, "h": 900, "dpr": 1}}, {"init": _many_drops_init(9)}, {"until": NEEDS, "ms": 30000}, {"until": READY, "ms": 30000},
+             {"until": "document.querySelector('#ck-drop .drop-more')", "ms": 20000}, {"eval": BOXFIT.replace("TAG", "short")},
+             {"eval": "document.querySelector('#ck-drop .drop-more').click(); 1"},
+             {"eval": "(() => { const r = document.querySelector('#ck-drop .drop-list'); const row = r.querySelector('.drop-recent-row');"
+                      " for (let i = 0; i < 12; i++) r.appendChild(row.cloneNode(true)); return " + BOXFIT.replace("TAG", "long") + "; })()"}]
+    with rig.serving():
+        got = _tagged(drive_touch(tmp_path, f"{rig.origin}/#write_token={TOK}", steps))
+    short, long_ = got["short"], got["long"]
+    assert long_["main"] == long_["recent"], got                       # the composer column is as tall as the thread
+    assert long_["box"] > short["box"] + 50 and long_["box"] > 500, got   # the box took the height
+    assert long_["boxBottomToActions"] <= 24 and long_["below"] < 120, got  # ...and the actions sit right under it, no hole
+    assert short["box"] >= 12 * 16, got                                # the floor stays
 
 
 @needs_browser
