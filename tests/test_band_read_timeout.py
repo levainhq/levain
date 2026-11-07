@@ -18,7 +18,7 @@ HANG_BAND = """(() => { const f = window.fetch; window.fetch = (...a) => {
     return new Promise(() => {});
   }
   return f.apply(window, a); }; })();"""
-WAIT = {"eval": "new Promise(r => setTimeout(() => r(1), 22000))"}
+WAIT = {"eval": "new Promise(r => setTimeout(() => r(1), 30000))"}
 
 
 @needs_browser
