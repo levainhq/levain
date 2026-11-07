@@ -353,6 +353,56 @@ def test_a_held_ping_is_not_sent_before_the_snooze_ends_and_goes_on_its_day(tmp_
     assert consent_band.release_held_pings(desk.dir) == [] and len(desk.sent) == 1      # once
 
 
+def test_a_snooze_that_lands_after_the_release_reads_the_question_still_holds_the_ping(tmp_path, monkeypatch):
+    """L3 (codex MED): the release worker read the question unsnoozed, the operator snoozed it, and the claim then
+    released and pinged on that stale read. The decision is revalidated at the claim, under the question store's
+    write lock, so the snooze (which takes that lock) lands wholly before it or wholly after."""
+    from levain.coordinator import first_reader
+    from tests.test_questions_held_ping import Desk
+
+    desk = Desk(tmp_path, monkeypatch)
+    desk.coordinator()
+    q, _ = desk.ask()
+    desk.later(minutes=10)                                                # unread past 10 minutes: would ping now
+    real = first_reader._questions
+
+    def racing(directory):
+        qs = real(directory)
+        get = qs.get
+
+        def get_then_snooze(ref):                                         # the operator snoozes right after the read
+            got = get(ref)
+            QuestionStore(desk.dir, clock=lambda: desk.now[0]).snooze(q.id, until="2026-10-24", channel="cli",
+                                                                      via="cli")
+            return got
+        qs.get = get_then_snooze
+        return qs
+
+    monkeypatch.setattr(first_reader, "_questions", racing)
+    assert consent_band.release_held_pings(desk.dir) == [] and desk.sent == []
+    monkeypatch.setattr(first_reader, "_questions", real)
+    desk.later(days=2)                                                    # Sat 10-24: its day; the hold was not spent
+    assert consent_band.release_held_pings(desk.dir) == [f"question #{q.n} (unread): the operator was pinged"]
+
+
+def test_an_escalated_then_snoozed_question_pings_once_on_its_day(tmp_path, monkeypatch):
+    """L3 (deepseek, not a defect): the escalation's release is the one release row, so a snooze defers it and the
+    day's ping goes out once, never twice."""
+    from levain.coordinator import first_reader as fr
+    from tests.test_questions_held_ping import Desk
+
+    desk = Desk(tmp_path, monkeypatch)
+    tok = desk.coordinator()
+    q, _ = desk.ask()
+    fr.escalate(desk.store, q.id, "outside its envelope", token=tok)
+    QuestionStore(desk.dir, clock=lambda: desk.now[0]).snooze(q.id, until="2026-10-24", channel="cli", via="cli")
+    assert consent_band.release_held_pings(desk.dir) == [] and desk.sent == []
+    desk.later(days=2)
+    assert consent_band.release_held_pings(desk.dir) == [f"question #{q.n} (escalated): the operator was pinged"]
+    desk.later(days=1)
+    assert consent_band.release_held_pings(desk.dir) == [] and len(desk.sent) == 1
+
+
 # --- a host's rows (flow's fields, passed through) and the cockpit payload ------------------------------------------
 class Host:
     """A foreign store (flow's NeedsQuestions shape) whose rows carry flow's own ``snoozed_until`` / ``dated``."""
@@ -380,6 +430,21 @@ def test_a_hosts_rows_render_flows_example_line():
     assert out[0] == "NEEDS YOU · 2 due · band@381"
     assert "LATER (2): 343 Sun · 373 Tue 11-10" in out
     assert any(ln.startswith("380.") for ln in out) and any(ln.startswith("381.") for ln in out)
+
+
+def test_a_snoozed_row_is_projected_as_later_in_the_payload_and_the_summary(store):
+    """L3 (codex MED): a client that lists every payload item must not get a full, answerable entry for a snoozed row;
+    the number and subject stay (the view binds every number), and the summary counts only what is due."""
+    a, b = ask(store, "first?"), ask(store, "second?")
+    store.snooze(b.id, until="2026-11-09", channel="cli", via="cli")
+    pay = band_view.band_payload(store, "cockpit:web")
+    first, second = pay["items"]
+    assert first["actions"] and first["options"] and "later" not in first
+    assert second["later"] == "2026-11-09" and second["actions"] == [] and second["n"] == 2
+    assert "options" not in second and "rec" not in second and second["subject"]["id"] == b.id
+    sm = band_view.summary(store)
+    assert sm["count"] == 1 and [i["later"] for i in sm["items"]] == [None, "2026-11-09"]
+    assert band_view.band_payload(Host(), "cockpit:web")["items"][0]["options"]       # a host's rows pass through
 
 
 def test_the_payload_carries_flows_two_fields_raw(store):

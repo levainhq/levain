@@ -1302,10 +1302,21 @@ def _queue_of(entries: Sequence[tuple[dict[str, str], dict[str, Any]]]) -> str:
     return row_version_of({"entries": rows}, ("entries",))
 
 
-def _question_item(q: Question, n: int | None, version: str | None, can_answer: bool) -> tuple[dict[str, str], dict[str, Any]]:
+def _question_item(q: Question, n: int | None, version: str | None, can_answer: bool,
+                   today: str | None = None) -> tuple[dict[str, str], dict[str, Any]]:
+    """One question's payload item. With ``today`` (a native store's local day), a row snoozed past it is projected as
+    LATER (L3): ``later`` is its day, and it carries no options, rec or controls, only what names it (number, subject,
+    ``what``), so a client that lists every item cannot present it as due. Its number and subject still bind an
+    answer (the view lists every number); the answer path is the band's, by number."""
     info = _info_of(q)
     actions = ([_question_sign_action(q)] if info.kind == "authority"
                else [dict(_ANSWER_ACTION)] if can_answer and version is not None else [])
+    later = _later_date(q, today) if today is not None else None
+    if later is not None:
+        item = {"n": n, "kind": info.kind, "tag": _tag(q), "what": q.what, "question": q.n, "later": later,
+                "snoozed_until": getattr(q, "snoozed_until", None), "dated": getattr(q, "dated", None),
+                "subject": {"kind": "question", "id": q.id, "version": version}, "actions": []}
+        return {"source": "question", "id": q.id}, item
     item = {"n": n, "kind": info.kind, "tag": _tag(q), "what": q.what, "blocks": q.blocks,
             "options": [{"letter": _LETTERS[i], "label": lab} for i, (_, lab) in enumerate(q.options) if i < len(_LETTERS)],
             "rec": info.rec_letter, "question": q.n, "open_ended": open_ended_of(q),
@@ -1407,7 +1418,8 @@ def _native_snapshot(store: QuestionStore, writable: bool, gen: int, deadline: f
         elif isinstance(obj, Extra):
             entries.append(_extra_item(obj, number_of(key)))
         else:
-            entries.append(_question_item(obj, number_of(key), subject_version(obj), writable))
+            entries.append(_question_item(obj, number_of(key), subject_version(obj), writable,
+                                          _today_of(store, now)))
     return _finish(entries, unread=dropped or bool(extras.failed), pending=len(shown) < len(order_in),
                    failed=bool(extras.failed), store_id=_store_id_of(store), shown=shown, hwm=hwm, gen=gen,
                    read_only=not writable)
@@ -1417,9 +1429,10 @@ def summary(store: Any, *, writable: bool = True, deadline: float | None = None)
     """The summary read (``GET /cockpit/needs.json``): counts, headlines, kinds, stable keys and ``queue``. It records
     no view and carries nothing to bind an answer to. Its only levain write is numbering the items that had no number."""
     snap = _snapshot(store, writable=writable, deadline=deadline)
-    items = [{"key": key, "n": it["n"], "kind": it["kind"], "headline": _short(it["what"], _HEADLINE), "tag": it["tag"]}
-             for key, it in snap.entries]
-    return {"schema": 1, "store_id": snap.store_id, "count": len(items), "queue": snap.queue, "items": items,
+    items = [{"key": key, "n": it["n"], "kind": it["kind"], "headline": _short(it["what"], _HEADLINE), "tag": it["tag"],
+              "later": it.get("later")} for key, it in snap.entries]
+    due = sum(1 for i in items if i["later"] is None)       # a snoozed row is open and listed, but not due
+    return {"schema": 1, "store_id": snap.store_id, "count": due, "queue": snap.queue, "items": items,
             "note": snap.note, "read_only": snap.read_only}
 
 
