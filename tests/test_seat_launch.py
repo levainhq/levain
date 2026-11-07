@@ -237,7 +237,7 @@ def test_a_reused_pid_is_never_signalled(seats, rig, monkeypatch):
     monkeypatch.setattr(sl.os, "killpg", lambda pg, sig: killed.append((pg, sig)))
     with pytest.raises(sl.SeatLaunchRefused, match="reused"):
         sl.stop_seat(rig.key_dir, "lane-a")
-    assert killed == []
+    assert [s for _pg, s in killed if s != 0] == [], "only the existence probe (signal 0, which sends nothing)"
     monkeypatch.undo()
     assert _alive(info["pid"])
 
@@ -588,13 +588,15 @@ def test_mut_a_fifo_that_holds_valid_json_is_still_refused_not_replaced(tmp_path
         os.close(keep)
 
 
-def test_mut_eperm_is_gone_when_the_pid_no_longer_has_the_recorded_start_time(monkeypatch):
-    monkeypatch.setattr(sl, "_live_members", lambda pg: [(4242, 501)])
+def test_fix2_4_eperm_with_live_members_refuses_even_when_the_leader_is_gone(monkeypatch):
+    """L3 lf r2 codex / deepseek MED: a uid-changed descendant may be what remains of the seat, so EPERM on a group that
+    lists a live member is never 'gone', whatever became of the leader; zombie-only (nothing live) is gone."""
+    monkeypatch.setattr(sl, "_live_members", lambda pg: [(4243, 0)])
     monkeypatch.setattr(sl, "_proc_start_ns", lambda pid: None)            # the leader is gone
-    sl._eperm("lane-x", 4242, 4242, 123, "SIGTERM")                          # not ours / gone: returns
-    monkeypatch.setattr(sl, "_proc_start_ns", lambda pid: 123)
-    with pytest.raises(sl.SeatLaunchRefused, match="EPERM.*4242 \\(uid 501\\)"):
-        sl._eperm("lane-x", 4242, 4242, 123, "SIGTERM")
+    with pytest.raises(sl.SeatLaunchRefused, match="EPERM.*4243 \\(uid 0\\)"):
+        sl._eperm("lane-x", 4242, "SIGTERM")
+    monkeypatch.setattr(sl, "_live_members", lambda pg: [])
+    sl._eperm("lane-x", 4242, "SIGTERM")                                    # zombie-only: returns (gone)
 
 
 def test_fix4_a_dry_run_mints_nothing_and_the_real_launch_of_that_lane_then_works(seats, rig):
@@ -650,7 +652,7 @@ def test_fix5_eperm_on_a_signal_is_gone_when_the_group_lists_nothing_live_and_re
     def eperm(pg, sig):
         raise PermissionError(1, "Operation not permitted")
     monkeypatch.setattr(sl.os, "killpg", eperm)
-    with pytest.raises(sl.SeatLaunchRefused, match="EPERM.*still has the recorded start time"):
+    with pytest.raises(sl.SeatLaunchRefused, match="EPERM.*lists live processes"):
         sl.stop_seat(rig.key_dir, "lane-ep")
     monkeypatch.setattr(sl, "_live_members", lambda pg: [])      # a zombie-only group: macOS answers EPERM
     assert sl.stop_seat(rig.key_dir, "lane-ep").status == "gone"
@@ -742,3 +744,126 @@ def test_fix8_an_oserror_during_the_launch_is_a_refusal_not_a_traceback(seats, r
     monkeypatch.setattr(sl, "seed_trust", lambda home, clone: (_ for _ in ()).throw(OSError(28, "No space left on device")))
     assert cli._cmd_seat_launch(_ns(rig, seats, "lane-os"), rig.world.root) == 1
     assert "seat launch refused: OSError" in capsys.readouterr().err and not (rig.lanes / "lane-os").exists()
+
+
+# --- L3 lf r2 fixes ---------------------------------------------------------------------------------------------
+
+def _strip(row):
+    return {k: v for k, v in row.items() if k not in ("hash", "sig", "prev")}
+
+
+def test_fix2_1_an_aborted_later_launch_hides_only_its_own_row_not_the_older_running_seat(seats, rig):
+    _plan, info = seats.go("lane-a")
+    seats.recorded("child")
+    s1 = [r for r in _rows(rig) if r.get("ev") == "start"][0]
+    s2 = sl.append_mint(rig.key_dir, {**_strip(s1), "pid": 999999, "pgid": 999999, "started_at_ns": 1})
+    sl.append_mint(rig.key_dir, {"v": 1, "ev": "aborted", "lane_key": "lane-a", "start_hash": s2["hash"]})
+    assert sl._start_rows(_rows(rig))["lane-a"]["hash"] == s1["hash"]
+    res = sl.stop_seat(rig.key_dir, "lane-a", grace=5)
+    assert res.status == "stopped" and res.pgid == info["pgid"] and _wait(lambda: not _alive(info["pid"]))
+
+
+def test_fix2_2_a_stale_row_whose_pid_was_reused_elsewhere_is_gone_and_a_live_group_still_refuses(seats, rig, monkeypatch):
+    _plan, info = seats.go("lane-st")
+    seats.recorded("child")
+    os.killpg(info["pgid"], signal.SIGKILL)
+    assert _wait(lambda: not _alive(info["pid"]))
+    # the pid now names an unrelated process in another group: another start time, and no group of the recorded id
+    real = sl._proc_start_ns
+    monkeypatch.setattr(sl, "_proc_start_ns",
+                        lambda pid: info["started_at_ns"] + 86_400 * 10**9 if pid == info["pid"] else real(pid))
+    res = sl.stop_seat(rig.key_dir, "lane-st")
+    assert res.status == "gone", "a stale row does not refuse forever"
+    # a group of that id that ps still lists may be a stranger's: the exact refusal stays
+    monkeypatch.setattr(sl, "_live_members", lambda pg: [(info["pid"], 501)])
+    with pytest.raises(sl.SeatLaunchRefused, match="reused.*exists"):
+        sl.stop_seat(rig.key_dir, "lane-st")
+
+
+def test_fix2_3_a_reused_pid_that_is_an_unrelated_exited_child_of_ours_keeps_its_exit_status(seats, rig):
+    seats.plan("lane-z")                        # the launcher key and a chain; no process
+    child = subprocess.Popen(["/bin/sh", "-c", "exit 7"])
+    try:
+        assert _wait(lambda: subprocess.run(["ps", "-o", "stat=", "-p", str(child.pid)], capture_output=True,
+                                            text=True).stdout.strip()[:1] in ("Z", ""))
+        sl.append_mint(rig.key_dir, {"v": 1, "ev": "start", "lane_key": "lane-r", "pid": child.pid, "pgid": child.pid,
+                                     "started_at_ns": 1})
+        assert sl.stop_seat(rig.key_dir, "lane-r").status == "gone"
+        done, status = os.waitpid(child.pid, os.WNOHANG)     # ChildProcessError here = stop stole the status
+        assert done == child.pid and os.waitstatus_to_exitcode(status) == 7
+        child.returncode = 7
+    finally:
+        if child.returncode is None:
+            child.wait()
+
+
+def test_fix2_5_a_claude_json_over_the_read_bound_is_refused_untouched_and_never_read_whole(tmp_path, monkeypatch):
+    assert sl._TRUST_FILE_MAX == 16 * 1024 * 1024
+    monkeypatch.setattr(sl, "_TRUST_FILE_MAX", 4096)
+    h = tmp_path / "h"
+    h.mkdir()
+    body = json.dumps({"projects": {}}).encode() + b" " * 8192        # valid JSON as a whole: only the bound refuses
+    (h / ".claude.json").write_bytes(body)
+    got = []
+    real_read = os.read
+
+    def counting(fd, n):
+        b = real_read(fd, n)
+        got.append(len(b))
+        return b
+    monkeypatch.setattr(sl.os, "read", counting)
+    with pytest.raises(sl.SeatLaunchRefused, match="cannot be read as JSON"):
+        sl.seed_trust(h, "/lane/x")
+    assert sum(got) <= 4097, f"read {sum(got)} bytes of a file over the bound"
+    assert (h / ".claude.json").read_bytes() == body
+    (h / ".claude.json").write_bytes(json.dumps({"projects": {}}).encode())
+    sl.seed_trust(h, "/lane/x")                                         # within the bound it is read and seeded
+    assert json.loads((h / ".claude.json").read_text())["projects"]["/lane/x"]["hasTrustDialogAccepted"] is True
+
+
+def test_fix2_6_a_held_trust_lock_refuses_in_bounded_time_and_never_hangs(tmp_path, monkeypatch):
+    import fcntl
+    import math
+    assert math.isfinite(sl._TRUST_LOCK_WAIT) and 0 < sl._TRUST_LOCK_WAIT <= 10
+    monkeypatch.setattr(sl, "_TRUST_LOCK_WAIT", 0.3)
+    h = tmp_path / "h"
+    h.mkdir()
+    (h / ".claude.json").write_text('{"projects": {}}')
+    holder = os.open(h / ".claude.json.levain-lock", os.O_RDWR | os.O_CREAT, 0o600)   # another open file: its own lock
+
+    def boom(*_a):
+        raise AssertionError("seed_trust blocked on a held lock")
+    old = signal.signal(signal.SIGALRM, boom)
+    signal.alarm(5)
+    try:
+        fcntl.flock(holder, fcntl.LOCK_EX)
+        t0 = time.monotonic()
+        with pytest.raises(sl.SeatLaunchRefused, match="held by another process"):
+            sl.seed_trust(h, "/lane/x")
+        assert time.monotonic() - t0 < 3
+        assert (h / ".claude.json").read_text() == '{"projects": {}}'
+        fcntl.flock(holder, fcntl.LOCK_UN)
+        sl.seed_trust(h, "/lane/x")                                     # released: the seed goes through
+    finally:
+        signal.alarm(0)
+        signal.signal(signal.SIGALRM, old)
+        os.close(holder)
+    assert "/lane/x" in json.loads((h / ".claude.json").read_text())["projects"]
+
+
+def test_fix2_7_a_cli_stop_refusal_is_one_clean_line_and_exit_1(seats, rig, monkeypatch, capsys):
+    from levain import cli
+
+    def ns(lane):
+        return argparse.Namespace(seat_cmd="stop", lane_key=lane, grace=5.0, path=rig.tmp, data_root=rig.world.root)
+    _plan, info = seats.go("lane-cs")
+    seats.recorded("child")
+    real = sl._proc_start_ns
+    monkeypatch.setattr(sl, "_proc_start_ns", lambda pid: real(pid) + 5_000_000_000 if pid == info["pid"] else real(pid))
+    assert cli._cmd_seat(ns("lane-cs")) == 1
+    err = capsys.readouterr().err
+    assert err.startswith("seat stop refused: pid") and "reused" in err and "Traceback" not in err
+    assert cli._cmd_seat(ns("lane-none")) == 1
+    assert capsys.readouterr().err.startswith("seat stop refused: no launched seat is recorded")
+    monkeypatch.undo()
+    assert _alive(info["pid"]), "a refused stop signalled nothing"

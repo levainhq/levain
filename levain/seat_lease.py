@@ -608,25 +608,45 @@ def seed_trust(home: Path | str, clone: Path | str) -> Path:
         st = os.fstat(lock)
         if not stat.S_ISREG(st.st_mode) or st.st_uid != os.getuid():
             raise SeatLaunchRefused(f"the trust lock beside {str(path)!r} is not a regular file of this user: nothing touched")
-        fcntl.flock(lock, fcntl.LOCK_EX)
+        # a holder that never lets go (wedged, or hostile) refuses the launch in bounded time, never hangs it
+        # (L3 lf r2, codex MED)
+        deadline = time.monotonic() + _TRUST_LOCK_WAIT
+        while True:
+            try:
+                fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                break
+            except BlockingIOError:
+                if time.monotonic() >= deadline:
+                    raise SeatLaunchRefused(f"the trust lock beside {str(path)!r} is held by another process and was "
+                                            f"not released in {_TRUST_LOCK_WAIT:g}s: nothing touched") from None
+                time.sleep(0.05)
         return _seed_locked(home, path, str(clone))
     finally:
         os.close(lock)          # releases the flock
 
 
+#: How long :func:`seed_trust` waits for another holder of the trust lock before it refuses (finite, seconds).
+_TRUST_LOCK_WAIT = 10.0
+#: The largest ``.claude.json`` :func:`seed_trust` reads; a larger one is refused, never read whole (L3 lf r2, codex MED).
+_TRUST_FILE_MAX = 16 << 20
+
+
 def _read_regular(path: Path) -> bytes:
     """The whole of ``path``, opened O_NOFOLLOW and O_NONBLOCK (a FIFO never blocks the launch) and refused unless it
-    is a regular file."""
+    is a regular file of at most :data:`_TRUST_FILE_MAX` bytes (at most one byte past the bound is ever read)."""
     fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
     try:
         if not stat.S_ISREG(os.fstat(fd).st_mode):
             raise ValueError("not a regular file")
-        chunks = []
+        chunks, total = [], 0
         while True:
-            b = os.read(fd, 1 << 20)
+            b = os.read(fd, min(1 << 20, _TRUST_FILE_MAX + 1 - total))
             if not b:
                 return b"".join(chunks)
             chunks.append(b)
+            total += len(b)
+            if total > _TRUST_FILE_MAX:
+                raise ValueError(f"larger than {_TRUST_FILE_MAX} bytes")
     finally:
         os.close(fd)
 
@@ -637,8 +657,9 @@ def _seed_locked(home: Path, path: Path, clone: str) -> Path:
         try:
             data = json.loads(_read_regular(path))
         except (OSError, ValueError):
-            raise SeatLaunchRefused(f"{str(path)!r} cannot be read as JSON (empty, torn, a link or not a regular "
-                                    "file): the trust was not seeded, and the file was not touched") from None
+            raise SeatLaunchRefused(f"{str(path)!r} cannot be read as JSON (empty, torn, a link, not a regular file "
+                                    f"or over {_TRUST_FILE_MAX >> 20} MiB): the trust was not seeded, and the file was "
+                                    "not touched") from None
     projects = data.get("projects", {}) if isinstance(data, dict) else None
     if not isinstance(projects, dict):
         raise SeatLaunchRefused(f"{str(path)!r} is not a JSON object with an object 'projects': not touched")
@@ -803,15 +824,13 @@ class StopResult:
 
 def _start_rows(rows: list[dict[str, Any]]) -> dict[str, dict[str, Any]]:
     """The NEWEST ``start`` row of each lane that no ``aborted`` row names (a launch that killed its own stopped seat
-    before it ran, :func:`launch_seat`)."""
+    before it ran, :func:`launch_seat`). An aborted row hides only itself: an older seat of that lane stays the lane's
+    row (L3 lf r2, complement HIGH)."""
     aborted = {r.get("start_hash") for r in rows if r.get("ev") == "aborted"}
     out: dict[str, dict[str, Any]] = {}
     for r in rows:
-        if r.get("ev") == "start" and isinstance(r.get("lane_key"), str):
-            if r.get("hash") in aborted:
-                out.pop(r["lane_key"], None)
-            else:
-                out[r["lane_key"]] = r
+        if r.get("ev") == "start" and isinstance(r.get("lane_key"), str) and r.get("hash") not in aborted:
+            out[r["lane_key"]] = r
     return out
 
 
@@ -848,29 +867,40 @@ def _live_members(pgid: int) -> list[tuple[int, int]]:
     return out
 
 
-def _eperm(lane: str, pgid: int, pid: int, started: int, what: str) -> None:
-    """A signal to group ``pgid`` answered EPERM. macOS answers that for a group whose members are all zombies, and for
-    a group that is not this user's. Returns (the seat is gone, or the id is not ours: nothing of the seat left to
-    signal) unless the recorded pid still has its recorded start time AND the group lists live members, which is
-    reported exactly as a refusal (L3 lf r1, gemini HIGH 1)."""
+def _eperm(lane: str, pgid: int, what: str) -> None:
+    """A signal to group ``pgid`` answered EPERM. macOS answers that for a group whose members are all zombies, which is
+    gone (returns). A group that still lists a live member is NEVER gone, whatever became of the leader: a seat
+    descendant that changed uid may be what remains, so that is reported exactly as a refusal (L3 lf r1 gemini HIGH 1;
+    r2 codex / deepseek MED)."""
     live = _live_members(pgid)
-    if live and _proc_start_ns(pid) == started:
-        raise SeatLaunchRefused(f"{what} to process group {pgid} of lane {lane!r} was refused (EPERM) while pid {pid} "
-                                f"still has the recorded start time and the group lists live processes "
-                                f"{', '.join(f'{p} (uid {u})' for p, u in live[:8])}")
+    if live:
+        raise SeatLaunchRefused(f"{what} to process group {pgid} of lane {lane!r} was refused (EPERM) while the group "
+                                f"lists live processes {', '.join(f'{p} (uid {u})' for p, u in live[:8])}")
 
 
-def _signal(lane: str, pgid: int, pid: int, started: int, sig: int) -> bool:
+def _signal(lane: str, pgid: int, sig: int) -> bool:
     """Send ``sig`` (0 = probe) to the group: True if it reached a member, False if the group is gone (no such group, or
-    EPERM that :func:`_eperm` reads as gone or not ours)."""
+    EPERM on a group that lists no live member, :func:`_eperm`)."""
     try:
         os.killpg(pgid, sig)
     except ProcessLookupError:
         return False
     except PermissionError:
-        _eperm(lane, pgid, pid, started, "a probe" if sig == 0 else signal.Signals(sig).name)
+        _eperm(lane, pgid, "a probe" if sig == 0 else signal.Signals(sig).name)
         return False
     return True
+
+
+def _group_gone(pgid: int) -> bool:
+    """True only when no process group ``pgid`` exists (the probe answers ESRCH) AND ``ps`` lists no live member of it.
+    Any other answer, EPERM included, is a group that may exist."""
+    try:
+        os.killpg(pgid, 0)
+    except ProcessLookupError:
+        return not _live_members(pgid)
+    except PermissionError:
+        return False
+    return False
 
 
 def _stop_row(row: Mapping[str, Any], *, grace: float, poll: float = 0.05) -> StopResult:
@@ -878,12 +908,21 @@ def _stop_row(row: Mapping[str, Any], *, grace: float, poll: float = 0.05) -> St
     lane, pid, pgid, started = str(row["lane_key"]), row.get("pid"), row.get("pgid"), row.get("started_at_ns")
     if not (isinstance(pid, int) and isinstance(pgid, int) and pid > 1 and pgid > 1 and isinstance(started, int)):
         raise SeatLaunchRefused(f"the start row of lane {lane!r} carries no usable pid, pgid and start time: nothing signalled")
-    _reap(pid)                  # a zombie child of this process is reaped first (waitpid only ever reaps our own children)
+    gone = StopResult(lane, "gone", f"process group {pgid} had already exited; nothing to signal", pgid)
     now = _proc_start_ns(pid)
     if now is not None and now != started:
+        # Start rows are never retired, so a seat that exited long ago keeps its row and its pid may since belong to an
+        # unrelated process. The intent: a stale row must not refuse forever, and a stranger must never be signalled.
+        # So a mismatch is "gone" only when nothing of the recorded group is left (no such group, no live member); while
+        # a group of that id exists it may be a stranger's reused group, and the stop refuses (L3 lf r2, gemini 3 / B).
+        if _group_gone(pgid):
+            return gone
         raise SeatLaunchRefused(f"pid {pid} now has a different start time than lane {lane!r} recorded (the pid was "
-                                "reused): nothing signalled")
+                                f"reused) and a process group {pgid} exists: nothing signalled")
     if now is not None:
+        # reaped only once the identity matched: before the check, a reused pid may be an unrelated exited child of
+        # this process, whose exit status is not ours to take (L3 lf r2, complement C)
+        _reap(pid)
         try:
             if os.getpgid(pid) != pgid:
                 raise SeatLaunchRefused(f"pid {pid} is no longer in the recorded process group {pgid}: nothing signalled")
@@ -891,21 +930,20 @@ def _stop_row(row: Mapping[str, Any], *, grace: float, poll: float = 0.05) -> St
             pass
     # a pid cannot be reused while a process group of that id has members, so a group that is still alive with the
     # leader gone holds only the seat's own descendants
-    gone = StopResult(lane, "gone", f"process group {pgid} had already exited; nothing to signal", pgid)
-    if not _signal(lane, pgid, pid, started, 0) or not _signal(lane, pgid, pid, started, signal.SIGTERM):
+    if not _signal(lane, pgid, 0) or not _signal(lane, pgid, signal.SIGTERM):
         return gone
     deadline = time.monotonic() + grace
     while time.monotonic() < deadline:
         _reap(pid)
-        if not _signal(lane, pgid, pid, started, 0):
+        if not _signal(lane, pgid, 0):
             return StopResult(lane, "stopped", f"SIGTERM to process group {pgid}; it exited", pgid)
         time.sleep(poll)
     ended = f"SIGTERM to process group {pgid} was not enough in {grace:g}s; SIGKILL ended it"
-    if not _signal(lane, pgid, pid, started, signal.SIGKILL):
+    if not _signal(lane, pgid, signal.SIGKILL):
         return StopResult(lane, "stopped", f"SIGTERM to process group {pgid}; it exited after {grace:g}s", pgid)
     for _ in range(100):
         _reap(pid)
-        if not _signal(lane, pgid, pid, started, 0):
+        if not _signal(lane, pgid, 0):
             return StopResult(lane, "stopped", ended, pgid)
         time.sleep(poll)
     raise SeatLaunchRefused(f"process group {pgid} of lane {lane!r} survived SIGKILL")
@@ -914,9 +952,10 @@ def _stop_row(row: Mapping[str, Any], *, grace: float, poll: float = 0.05) -> St
 def stop_seat(key_dir: Path, lane_key: str, *, grace: float = 10.0) -> StopResult:
     """Stop the lane's seat: the NEWEST ``start`` row for ``lane_key`` in the verified mint chain names the pid, the
     process group and the process's own start time. The group is signalled (SIGTERM, ``grace`` seconds, then SIGKILL)
-    only if the pid still has that start time (a reused pid is NEVER signalled: refused). A seat already gone is a
-    success (``gone``). Raises :class:`SeatLaunchRefused` for no such row, a reused pid, or a group that survives, and
-    for any other error on the way (never a bare traceback)."""
+    only if the pid still has that start time (a reused pid is NEVER signalled). A seat already gone is a success
+    (``gone``), and so is a reused pid whose recorded group no longer exists. Raises :class:`SeatLaunchRefused` for no
+    such row, a reused pid while a group of the recorded id exists, a group that survives, and any other error on the
+    way (never a bare traceback)."""
     check_grace(grace)
     try:
         rows = read_mints(key_dir)
