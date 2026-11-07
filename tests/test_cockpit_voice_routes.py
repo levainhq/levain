@@ -161,8 +161,8 @@ class Rig:
         _root, self.src, _ids = _install(tmp_path / "entity")
         self.data_root = Path(self.src.write_scope.ledger_root) / "cockpit"
         self.ck = KeyedCockpit(self.data_root, tmp_path / "keys")
-        # the consent hook names the broker's own cockpit, so the grant routes revoke in the log read_key reads (a voice
-        # route refuses otherwise: test_t_rev_a_voice_route_refuses_when_the_grant_routes_act_on_another_cockpit)
+        # the consent hook names the broker's own cockpit, so the grant routes revoke in the log read_key reads (with
+        # another cockpit named, a voice route reads only while the command-line revoke can be signed: the r5 tests)
         (queue / "claude_code.json").write_text(json.dumps({"cockpit_data_root": str(self.data_root),
                                                            "away_mode": False, "away_hold_seconds": 0}))
         self.sec = FakeSecurity(tmp_path)
@@ -1107,12 +1107,28 @@ def test_t_rev_a_phone_passkey_revoke_of_the_voice_key_stops_the_next_speak(rig)
     assert record["id"] not in {r["id"] for r in gp.listing()["grants"]}
 
 
+def _point_hooks(rig: "Rig", tmp_path: Path, hooks: str) -> "KeyedCockpit":
+    """Make the consent hooks name another cockpit (``other``), none (``none``) or two (``two``)."""
+    other = KeyedCockpit(tmp_path / "other-cockpit", tmp_path / "keys-other")
+    _phone(other)
+    if hooks == "other":
+        _hook(rig.qdir, other.root)
+    elif hooks == "none":
+        (rig.qdir / "claude_code.json").unlink()
+    else:
+        (rig.qdir / "codex.json").write_text(json.dumps({"cockpit_data_root": str(other.root)}))
+    return other
+
+
 @pytest.mark.parametrize("hooks", ["other", "none", "two"])
-def test_t_rev_a_voice_route_refuses_when_the_grant_routes_act_on_another_cockpit(rig, tmp_path, hooks):
-    """The consent hook names a cockpit that is not the broker's data root (or none, or two): the grant page's revoke
-    cannot reach the key read_key would read, so speak and transcribe refuse in fixed words before anything is
-    reserved or read. Red with: the revoke-reach check in ``voice._call`` removed (both answer 200)."""
+def test_t_rev_a_voice_route_refuses_when_the_grant_routes_act_on_another_cockpit_and_no_cli_revoke(rig, tmp_path,
+                                                                                                  hooks):
+    """The consent hook names a cockpit that is not the broker's data root (or none, or two), and the data root's log
+    holds no unrevoked laptop key, so neither the grant page's revoke nor the command line's reaches the key read_key
+    would read: speak and transcribe refuse in fixed words before anything is reserved or read. Red with: the
+    revoke-reach check in ``voice._call`` removed (both answer 200)."""
     record = rig.add_key()
+    _revoke_laptop_as_compromised(rig.ck)
     other = KeyedCockpit(tmp_path / "other-cockpit", tmp_path / "keys-other")
     _phone(other)
     if hooks == "other":
@@ -1186,6 +1202,7 @@ def test_r1c_the_unreachable_refusal_reaches_the_user_as_a_sentence_never_a_bare
         assert words != key and "_" not in words and words.endswith("."), words
     assert "command line" in cockpit_voice.WORDS["revoke_unreachable"]
     rig.add_key()
+    _revoke_laptop_as_compromised(rig.ck)        # no CLI revoke either, so the mismatch refuses
     other = KeyedCockpit(tmp_path / "other-cockpit", tmp_path / "keys-other")
     _phone(other)
     _hook(rig.qdir, other.root)
@@ -1289,6 +1306,88 @@ def test_r3_a_fault_checking_the_reach_is_its_own_sentence_and_logs_the_type_onl
     lines = [r.getMessage() for r in caplog.records if r.name == "levain.cockpit.voice"]
     assert lines and all(("PermissionError" if fault == "raises" else "TypeError") in m for m in lines), lines
     assert not any(secret_text in m for m in lines) and all(r.exc_info is None for r in caplog.records)
+
+
+# --- 1107-15: grant routes on another cockpit fall back to the command-line revoke (Phill 11-06) ----------------------
+# Live 11-07: flow's Signer queue names ~/.levain-sign/cockpit while the voice keys live in the broker's data root, which
+# holds a laptop key; speak answered revoke_unreachable although `levain voice key revoke` reaches the keys.
+
+@pytest.mark.parametrize("hooks", ["other", "none", "two"])
+def test_r5a_grant_routes_on_another_cockpit_with_a_laptop_key_reads_with_the_cli_revoke(rig, tmp_path, hooks):
+    """(a) and (c): the grant routes name another cockpit (or none, or several), so the phone's revoke does not reach
+    these keys, but the data root's log holds an unrevoked laptop key the command line signs with: speak is ALLOWED
+    (200 audio, one provider call). Red with: ``revoke_refusal`` answering ``revoke_unreachable`` on a root mismatch."""
+    rig.add_key()
+    _point_hooks(rig, tmp_path, hooks)
+    assert [k.fingerprint for k in custody.authority_for(rig.data_root)().signing_laptop_keys()] == [rig.ck.fp]
+    assert cockpit_voice.revoke_refusal(rig.qdir, rig.data_root) is None
+    g = rig.reply("Read this aloud.")
+    with served(rig) as (port, httpd):
+        assert httpd.grant_phone is not None                  # the grant routes ARE served, on the other cockpit
+        status, hdrs, body = speak(port, rig, g)
+        assert (status, body) == (200, MP3) and hdrs["content-type"] == "audio/mpeg"
+        # and the Settings "Hear this voice" sample, the live symptom, goes through the same gate
+        sample = {"sample": True, "provider": "openai", "voice": "nova", "speed": 1.0}
+        status, hdrs, out = call(port, "POST", SPEAK, json.dumps(sample).encode())
+        assert (status, out) == (200, MP3) and hdrs["content-type"] == "audio/mpeg"
+    assert len(rig.transport.seen) == 2
+
+
+@pytest.mark.parametrize("hooks", ["other", "two"])
+def test_r5b_grant_routes_on_another_cockpit_and_no_laptop_key_refuses_before_anything_is_read(rig, tmp_path, hooks):
+    """(b) and (c): the same mismatch, the laptop key revoked (a passkey left): neither revoke reaches, so speak and
+    transcribe refuse ``revoke_unreachable``; nothing reserved, no keychain read, no provider call. Red with: the
+    mismatch answering None without the command-line check."""
+    rig.add_key()
+    _phone(rig.ck)
+    _revoke_laptop_as_compromised(rig.ck)
+    _point_hooks(rig, tmp_path, hooks)
+    assert cockpit_voice.revoke_refusal(rig.qdir, rig.data_root) == "revoke_unreachable"
+    g = rig.reply("Read this aloud.")
+    reads = rig.sec.calls()
+    with served(rig) as (port, _httpd):
+        _refused_with(port, rig, g, "revoke_unreachable")
+    assert rig.transport.seen == [] and rig.rows() == [] and rig.sec.calls() == reads
+
+
+def test_r5d_grant_routes_on_this_cockpit_are_unchanged_and_never_ask_the_cli_check(rig, monkeypatch):
+    """(d): the hook names the data root, so the phone's revoke reaches: allowed even with the laptop key revoked and
+    only a passkey left, and the command-line check is never consulted. Red with: the matching branch falling through
+    to ``_cli_revoke_refusal``."""
+    rig.add_key()
+    _phone(rig.ck)
+    _revoke_laptop_as_compromised(rig.ck)
+    asked = []
+    real = cockpit_voice._cli_revoke_refusal
+    monkeypatch.setattr(cockpit_voice, "_cli_revoke_refusal", lambda root: asked.append(root) or real(root))
+    assert cockpit_voice.revoke_refusal(rig.qdir, rig.data_root) is None
+    g = rig.reply("Read this aloud.")
+    with served(rig) as (port, _httpd):
+        assert speak(port, rig, g)[0] == 200
+    assert asked == [] and len(rig.transport.seen) == 1
+
+
+def test_r5e_a_fault_stays_unchecked_on_either_branch(rig, tmp_path, monkeypatch):
+    """(e): a mismatch whose data root's log cannot be replayed is ``revoke_unchecked`` (the fallback fails closed);
+    and a fault reading the hooks is ``revoke_unchecked`` even though a laptop key exists (it never falls back: it is
+    not known which root the grant routes act on). Red with: either fault answering None or ``revoke_unreachable``."""
+    import levain.consent.answering as answering
+
+    rig.add_key()
+    _point_hooks(rig, tmp_path, "other")
+    assert cockpit_voice.revoke_refusal(rig.qdir, tmp_path / "no-such-cockpit") == "revoke_unchecked"
+    assert cockpit_voice.revoke_refusal(rig.qdir, rig.data_root) is None
+
+    def broken(_q):
+        raise PermissionError("hooks unreadable")
+
+    g = rig.reply("Read this aloud.")
+    reads = rig.sec.calls()
+    with served(rig) as (port, _httpd):
+        monkeypatch.setattr(answering, "hook_roots", broken)     # after start, as in r3: the server reads hooks too
+        assert cockpit_voice.revoke_refusal(rig.qdir, rig.data_root) == "revoke_unchecked"
+        _refused_with(port, rig, g, "revoke_unchecked")
+    assert rig.transport.seen == [] and rig.rows() == [] and rig.sec.calls() == reads
 
 
 def test_r4_speak_and_transcribe_take_data_root_first_and_their_paths_by_keyword_only(rig):
