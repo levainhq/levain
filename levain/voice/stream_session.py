@@ -70,6 +70,7 @@ MAX_AGE_S = CEILING_SECONDS + IDLE_TIMEOUT_S   # wall-clock life: a real-time sp
 ENDED_RETAIN_S = 60.0
 MAX_SESSIONS = 4
 MAX_UNSETTLED = 64             # settles waiting for a retry; at this many, new opens are refused until it drains
+OPEN_WAIT_S = 10.0             # how long shutdown waits for opens in progress (on other threads) to end their reservation
 SID_BYTES = 24
 
 # Fixed words: the code is the contract, the words are what the route may show. Nothing here carries a value from outside.
@@ -408,7 +409,7 @@ class StreamRegistry:
     """The sessions: a hard cap on live ones, owner binding, unguessable ids, ended ones kept briefly (rule 4)."""
 
     def __init__(self, meter: vmeter.Meter, *, max_sessions: int = MAX_SESSIONS, idle_timeout: float = IDLE_TIMEOUT_S,
-                 max_age: float = MAX_AGE_S, retain: float = ENDED_RETAIN_S,
+                 max_age: float = MAX_AGE_S, retain: float = ENDED_RETAIN_S, open_wait: float = OPEN_WAIT_S,
                  clock: Callable[[], float] = time.monotonic) -> None:
         self._meter = meter
         self._max = max_sessions
@@ -416,12 +417,15 @@ class StreamRegistry:
         self._max_age = max_age
         self._retain = retain
         self._clock = clock
+        self._open_wait = open_wait
         self._lock = threading.Lock()
+        self._opens_done = threading.Condition(self._lock)  # notified whenever an open in progress gives its slot back
         self._sessions: dict[str, StreamSession] = {}     # live and retained-ended
         self._ended_at: dict[str, float] = {}             # sid -> when it ended, oldest first
         self._unsettled: list[tuple[int, int]] = []       # (reservation_id, seconds) whose settle failed
         self._retrying = 0                                # entries a retry pass holds detached; they still count
         self._pending = 0                                  # slots taken by an open in progress
+        self._pending_by: dict[int, int] = {}              # thread ident -> opens it has in progress (shutdown's wait)
         self._closed = False
 
     def _live(self) -> int:
@@ -446,6 +450,8 @@ class StreamRegistry:
             else:
                 code = ""
                 self._pending += 1
+                me = threading.get_ident()
+                self._pending_by[me] = self._pending_by.get(me, 0) + 1
         if code:
             raise StreamRefused(code)
         session, code, key_code = self._build(owner, provider, model, data_root, read_key, factory)
@@ -516,7 +522,7 @@ class StreamRegistry:
             # not at all, and shutdown either sees this session or this open sees shutdown
             with self._lock:
                 if not self._closed:
-                    self._pending -= 1
+                    self._give_back_slot()
                     slot_held = False
                     self._sessions[sid] = session
             if slot_held:
@@ -524,28 +530,47 @@ class StreamRegistry:
             stream, reservation = None, None    # the session now owns both
             return session, "", ""
         finally:
-            if slot_held:
-                with self._lock:
-                    self._pending -= 1
-            if stream is not None:
-                failed = ""
-                try:
-                    close = getattr(stream, "close", None)     # best effort: a non-stream result may have no close
-                    if callable(close):
-                        close()
-                except Exception as exc:     # noqa: BLE001
-                    failed = type(exc).__name__
-                if failed:
-                    _log.warning("voice stream: the unused provider stream failed on close (%s)", failed)
-            if reservation is not None:
-                failed = ""
-                try:
-                    end_reservation(self._meter, reservation, settle_units)
-                except Exception as exc:     # noqa: BLE001
-                    failed = type(exc).__name__
-                if failed:
-                    _log.warning("voice stream: the meter could not end the reservation (%s)", failed)
-                    self._add_unsettled(reservation, settle_units)
+            # the slot is given back LAST, after the stream is closed and the reservation ended: shutdown waits for
+            # the slots of opens in progress, so a slot given back first would let it return over a reserved row
+            try:
+                self._end_unused(stream, reservation, settle_units)
+            finally:
+                if slot_held:
+                    with self._lock:
+                        self._give_back_slot()
+
+    def _give_back_slot(self) -> None:
+        """An open in progress gives its slot back (caller holds the lock) and wakes a shutdown waiting on it."""
+        self._pending -= 1
+        me = threading.get_ident()
+        left = self._pending_by.get(me, 0) - 1
+        if left > 0:
+            self._pending_by[me] = left
+        else:
+            self._pending_by.pop(me, None)
+        self._opens_done.notify_all()
+
+    def _end_unused(self, stream: Any, reservation: int | None, settle_units: int) -> None:
+        """A failed open's cleanup: close the stream it built, end the reservation it holds."""
+        if stream is not None:
+            failed = ""
+            try:
+                close = getattr(stream, "close", None)     # best effort: a non-stream result may have no close
+                if callable(close):
+                    close()
+            except Exception as exc:     # noqa: BLE001
+                failed = type(exc).__name__
+            if failed:
+                _log.warning("voice stream: the unused provider stream failed on close (%s)", failed)
+        if reservation is not None:
+            failed = ""
+            try:
+                end_reservation(self._meter, reservation, settle_units)
+            except Exception as exc:     # noqa: BLE001
+                failed = type(exc).__name__
+            if failed:
+                _log.warning("voice stream: the meter could not end the reservation (%s)", failed)
+                self._add_unsettled(reservation, settle_units)
 
     # --- lookup -----------------------------------------------------------------------------------------------------
     def get(self, sid: str, owner: str) -> StreamSession:
@@ -635,9 +660,15 @@ class StreamRegistry:
 
     def shutdown(self) -> None:
         """The server is stopping: refuse new opens, end every live session (settling each), retry failed settles once,
-        and drop every session."""
+        and drop every session. Opens in progress on OTHER threads (one holds a reserved row while it reads the key or
+        connects) are waited for, at most ``open_wait`` seconds, so each has ended its own reservation before this
+        returns and the process exits; one on this thread (shutdown called from inside an open) is not waited for. Past
+        the wait a stuck open still ends its own reservation if the process lives long enough."""
+        me = threading.get_ident()
         with self._lock:
             self._closed = True
+            self._opens_done.wait_for(lambda: self._pending - self._pending_by.get(me, 0) <= 0,
+                                      timeout=self._open_wait)
             live = [s for sid, s in self._sessions.items() if sid not in self._ended_at]
         for session in live:
             try:

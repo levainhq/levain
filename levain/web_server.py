@@ -1924,7 +1924,13 @@ class _LevainHTTPServer(ThreadingHTTPServer):
     # under voice_stream_lock, and the reaper thread that ends idle ones every voice_reap_interval seconds. A test sets
     # voice_stream_factory (a fake provider stream; None is the Deepgram adapter) and voice_stream_kwargs (the registry's
     # limits) before the first request. server_close stops the reaper and shuts the registry (settling every stream).
+    # The registry is keyed on its meter's path (a store directory that moves gets a new registry, the old one shut);
+    # voice_streams_closed, set by server_close under the lock, refuses building one afterwards. voice_chunk_gate bounds
+    # chunk body reads (they never take voice_gate).
     voice_streams: "Any" = None
+    voice_stream_meter_path: "Any" = None
+    voice_streams_closed: bool = False
+    voice_chunk_gate: "threading.BoundedSemaphore | None" = None
     voice_stream_lock: "threading.Lock | None" = None
     voice_stream_factory: "Any" = None
     voice_stream_kwargs: "dict[str, Any] | None" = None
@@ -2042,22 +2048,35 @@ class _LevainHTTPServer(ThreadingHTTPServer):
         super().server_close()
 
     def _voice_stream_registry(self, meter: Any) -> Any:
-        """The live-dictation registry over ``meter``, built once (with its reaper thread) on the first stream request."""
+        """The live-dictation registry over ``meter``, built (with its reaper thread) on the first stream request, and
+        rebuilt when ``meter`` is a different ledger than the held registry's (the old one is then stopped and shut, its
+        streams settled on their own ledger). None once server_close has run: nothing built then would ever be
+        stopped. The reaper is started before the registry is published, so a failed start publishes nothing."""
         from levain.voice import stream_session
 
         lock = self.voice_stream_lock
         if lock is None:
             raise RuntimeError("no voice stream lock")
+        path = getattr(meter, "path", None)
+        old: "tuple[Any, Any, Any] | None" = None
         with lock:
-            if self.voice_streams is None:
-                registry = stream_session.StreamRegistry(meter, max_sessions=cockpit_voice.STREAM_MAX_SESSIONS,
-                                                         **(self.voice_stream_kwargs or {}))
-                stop = threading.Event()
-                thread = threading.Thread(target=self._voice_reap_loop, args=(registry, stop), daemon=True,
-                                          name="levain-voice-reaper")
-                self.voice_streams, self.voice_reaper_stop, self.voice_reaper = registry, stop, thread
-                thread.start()
-            return self.voice_streams
+            if self.voice_streams_closed:
+                return None
+            if self.voice_streams is not None and self.voice_stream_meter_path == path:
+                return self.voice_streams
+            registry = stream_session.StreamRegistry(meter, max_sessions=cockpit_voice.STREAM_MAX_SESSIONS,
+                                                     **(self.voice_stream_kwargs or {}))
+            stop = threading.Event()
+            thread = threading.Thread(target=self._voice_reap_loop, args=(registry, stop), daemon=True,
+                                      name="levain-voice-reaper")
+            thread.start()
+            if self.voice_streams is not None:
+                old = (self.voice_streams, self.voice_reaper_stop, self.voice_reaper)
+            self.voice_streams, self.voice_reaper_stop, self.voice_reaper = registry, stop, thread
+            self.voice_stream_meter_path = path
+        if old is not None:      # outside the lock: shutdown may wait for an open in progress on the old registry
+            self._stop_voice_registry(*old)
+        return registry
 
     def _voice_reap_loop(self, registry: Any, stop: threading.Event) -> None:
         while not stop.wait(self.voice_reap_interval):
@@ -2067,16 +2086,21 @@ class _LevainHTTPServer(ThreadingHTTPServer):
                 _log.warning("voice: the stream reaper failed (%s)", type(exc).__name__)
 
     def _close_voice_streams(self) -> None:
-        """Stop the reaper, then end every stream (each settles its meter row). Nothing raised here may stop the rest of
-        server_close."""
+        """Refuse building a registry from now on, stop the reaper, then end every stream (each settles its meter row).
+        Nothing raised here may stop the rest of server_close."""
         lock = self.voice_stream_lock
         if lock is None:
             return
         with lock:
+            self.voice_streams_closed = True
             registry, stop, thread = self.voice_streams, self.voice_reaper_stop, self.voice_reaper
+        self._stop_voice_registry(registry, stop, thread)
+
+    @staticmethod
+    def _stop_voice_registry(registry: Any, stop: Any, thread: Any) -> None:
         if stop is not None:
             stop.set()
-        if thread is not None and thread is not threading.current_thread():
+        if thread is not None and thread.is_alive() and thread is not threading.current_thread():
             thread.join(timeout=10)
         if registry is not None:
             try:
@@ -3915,10 +3939,11 @@ class _Handler(GuardedHandler):
         """The live-dictation POST gates, in transcribe's order (a room host and a broker, a surface token on every bind, a
         named owner, then the premium-dictation switch: off is a 404 in fixed words before a length, a body, the meter or
         a key is looked at). Open and close carry no body (a declared length of 0); a chunk is ``application/octet-stream``
-        of at most :data:`cockpit_voice.STREAM_CHUNK_MAX` bytes, read under a short deadline. Chunks bypass ``voice_gate``
-        (cheap, bounded, owned by a session the registry already capped at one); open and close run the revoke check and
-        the key read in :func:`cockpit_voice.stream_open`. Every request first reaps (the server's timer is the other
-        reaper)."""
+        of at most :data:`cockpit_voice.STREAM_CHUNK_MAX` bytes: its sid, owner and seq are checked before the body is read,
+        then the read takes a ``voice_chunk_gate`` slot without waiting (503 past it) and runs under a short deadline.
+        Chunks bypass ``voice_gate`` (cheap, bounded, owned by a session the registry already capped at one); open runs
+        the revoke check and the key read in :func:`cockpit_voice.stream_open`. Every request first reaps (the server's
+        timer is the other reaper). After server_close every stream route is 503 ``stopping``."""
         srv = self.server
         directory = self._store_directory()
         if srv.room_host is None or srv.broker is None or directory is None or srv.voice_stream_lock is None:
@@ -3945,17 +3970,32 @@ class _Handler(GuardedHandler):
             self._reject(413, "too_large", cockpit_voice.WORDS["too_long"])
             return None
         registry = srv._voice_stream_registry(self._voice_meter(directory))
+        if registry is None:          # the server is stopping
+            self.close_connection = True
+            return cockpit_voice.stream_refusal("stopping")
         registry.reap()
-        pcm = b""
-        if chunk:
-            body = self._read_body(clen, cockpit_voice.STREAM_BODY_DEADLINE_S)
-            if body is None:
-                return None
-            if len(body) != clen:     # the client closed early: a cut-off chunk is never fed
-                self.close_connection = True
-                return None
-            pcm = body
         query = self.path.split("?", 1)[1] if "?" in self.path else ""
+        if chunk:
+            # the sid, its owner and the sequence number are checked before a byte of the body is read (an unknown or
+            # foreign sid costs no read), then the read takes a chunk slot without waiting; both refusals close the
+            # connection, so the unread body is never parsed as the next request
+            early = cockpit_voice.stream_chunk_precheck(registry, query, owner)
+            if early is not None:
+                self.close_connection = True
+                return early
+            if srv.voice_chunk_gate is None or not srv.voice_chunk_gate.acquire(blocking=False):
+                self._reject(503, "voice_busy", cockpit_voice.WORDS["voice_busy"])
+                return None
+            try:
+                body = self._read_body(clen, cockpit_voice.STREAM_BODY_DEADLINE_S)
+                if body is None:
+                    return None
+                if len(body) != clen:     # the client closed early: a cut-off chunk is never fed
+                    self.close_connection = True
+                    return None
+                return cockpit_voice.stream_chunk(registry, query, owner, body)
+            finally:
+                srv.voice_chunk_gate.release()
         data_root = srv.broker.data_root
         if route == cockpit_voice.STREAM_OPEN:
             from levain.voice import deepgram_stream
@@ -3965,8 +4005,6 @@ class _Handler(GuardedHandler):
                 revoke_queue=srv.grant_phone.queue_dir if srv.grant_phone is not None else None,
                 read_key=voice_custody.read_key, factory=srv.voice_stream_factory or deepgram_stream.factory,
                 last_read=srv.voice_last_read if srv.voice_last_read is not None else {})
-        if chunk:
-            return cockpit_voice.stream_chunk(registry, query, owner, pcm)
         return cockpit_voice.stream_close(registry, query, owner)
 
     def _serve_threads(self, path: str, *, head: bool) -> None:
@@ -4580,8 +4618,9 @@ class _Handler(GuardedHandler):
                 self._send(b"not found\n", "text/plain; charset=utf-8", status=404, head=head)
                 return
             if path == _COCKPIT_PAGE:
-                # Permissions-Policy pins the intent that the cockpit page may use the microphone (live dictation, S3)
-                # and no embedded frame may: the default already allows self, so this line only stops it drifting
+                # Permissions-Policy pins the intent that the cockpit page's own origin may use the microphone (live
+                # dictation, S3) and no other origin may, framed or not; a same-origin frame (frame-src 'self') still
+                # can. The default already allows self, so this line only stops it drifting
                 self._send_framing((_COCKPIT_PAGE_CSP, "DENY"), self.server.levain_assets[filename], content_type,
                                    head=head, headers=[("Permissions-Policy", _PERMISSIONS_POLICY)])
             else:
@@ -5676,6 +5715,7 @@ def make_server(
     httpd.voice_transport = voice_providers.urllib_transport
     httpd.voice_last_read = {}
     httpd.voice_stream_lock = threading.Lock()
+    httpd.voice_chunk_gate = threading.BoundedSemaphore(cockpit_voice.STREAM_CHUNK_INFLIGHT)
     httpd.premium_stt = premium_stt is True       # off unless the caller says True outright
     from levain.webpush.presence_tokens import RateLimit as _PresenceRate
 

@@ -433,6 +433,133 @@ def test_server_close_stops_the_reaper_and_settles_every_stream(rig):
     assert not holder["httpd"].voice_reaper.is_alive()
 
 
+# --- S3 L3 r1 fixes ------------------------------------------------------------------------------------------------------
+
+def test_no_registry_or_reaper_is_built_after_server_close(rig):
+    """codex 1 / complement 1: a first stream request that reaches _voice_stream_registry after server_close must build
+    nothing (no registry, no reaper nothing would ever stop). Red with: the `voice_streams_closed` check in
+    _voice_stream_registry dropped, or `_close_voice_streams` not setting it."""
+    from levain.voice import meter as vmeter
+
+    keyed(rig)
+    with served(rig) as (_port, httpd):
+        pass                                                           # no stream request: voice_streams stays None
+    assert httpd.voice_streams is None
+    assert httpd._voice_stream_registry(vmeter.Meter(rig.ledger_path)) is None
+    assert httpd.voice_streams is None and httpd.voice_reaper is None
+
+
+def test_a_reaper_that_cannot_start_publishes_no_registry(rig, monkeypatch):
+    """codex 5: the reaper starts before the registry is published, so a failed start leaves nothing a later request
+    would open sessions on, and close still runs. Red with: `thread.start()` moved back after the publish."""
+    import threading as _threading
+
+    from levain.voice import meter as vmeter
+
+    keyed(rig)
+    with served(rig) as (_port, httpd):
+        real = _threading.Thread.start
+
+        def boom(self):
+            if self.name == "levain-voice-reaper":
+                raise RuntimeError("can't start new thread")
+            return real(self)
+
+        monkeypatch.setattr(_threading.Thread, "start", boom)
+        with pytest.raises(RuntimeError):
+            httpd._voice_stream_registry(vmeter.Meter(rig.ledger_path))
+        assert httpd.voice_streams is None and httpd.voice_reaper is None
+        monkeypatch.setattr(_threading.Thread, "start", real)
+        assert httpd._voice_stream_registry(vmeter.Meter(rig.ledger_path)) is httpd.voice_streams is not None
+
+
+def test_a_meter_rebind_rebuilds_the_registry_over_the_new_ledger(rig, tmp_path):
+    """codex 3 / complement 5: the registry is keyed on the meter's path. When the store directory moves, the next stream
+    request gets a registry over the NEW ledger (its caps and spend), and the old one is shut (it refuses opens, its
+    sessions are settled). Red with: `_voice_stream_registry` returning the held registry without comparing the path."""
+    from levain.voice import meter as vmeter
+
+    keyed(rig)
+    with served(rig) as (port, httpd):
+        fx(httpd)
+        sid = open_session(port)[1]["sid"]
+        assert chunk(port, sid, 0)[0] == 200
+        old = httpd.voice_streams
+        other = vmeter.Meter(tmp_path / "elsewhere" / "voice.db")
+        new = httpd._voice_stream_registry(other)
+        assert new is not old and new is httpd.voice_streams and new._meter is other
+        assert statuses(rig) == ["ok"]                                # the old ledger's stream was settled
+        with pytest.raises(stream_session.StreamRefused, match="stopping"):
+            old.open("o", "deepgram", "nova-3", data_root=rig.data_root, read_key=lambda *a, **k: None,
+                     factory=lambda s: None)
+        assert httpd._voice_stream_registry(other) is new             # same path: the same registry
+
+
+def test_an_unknown_sid_chunk_is_refused_before_its_body_is_read(rig):
+    """codex 4: the sid and its owner are checked before a byte of the chunk body is read, and the connection closes (the
+    body is never drained). The head declares 8000 bytes and sends none: an answer must come at once, not after the 10 s
+    body deadline. Red with: the `stream_chunk_precheck` call moved after `_read_body`."""
+    keyed(rig)
+    with served(rig) as (port, httpd):
+        fx(httpd)
+        sid = open_session(port)[1]["sid"]
+        got, body, hdrs = raw(port, head(port, f"{CHUNK}?sid=no-such-sid&seq=0", ctype="application/octet-stream",
+                                         clen=str(len(PCM))), wait=3.0)
+        assert (got, body["error"]) == (404, "unknown_session") and hdrs["connection"] == "close"
+        got, body, hdrs = raw(port, head(port, f"{CHUNK}?sid={sid}&seq=0", ctype="application/octet-stream",
+                                         clen=str(len(PCM)), token=MESH_TOKEN), wait=3.0)
+        assert (got, body["error"]) == (404, "unknown_session") and hdrs["connection"] == "close"
+        got, body, hdrs = raw(port, head(port, f"{CHUNK}?sid={sid}&seq=x", ctype="application/octet-stream",
+                                         clen=str(len(PCM))), wait=3.0)
+        assert (got, body["error"]) == (409, "bad_sequence") and hdrs["connection"] == "close"
+        assert chunk(port, sid, 0)[0] == 200                          # the owner is unharmed
+
+
+def test_chunk_body_reads_are_bounded_by_their_own_gate(rig):
+    """codex 4: concurrent chunk body reads take a slot of voice_chunk_gate without waiting; past it, a 503 before a byte
+    is read. Red with: the `voice_chunk_gate.acquire(blocking=False)` in the chunk path dropped."""
+    keyed(rig)
+    with served(rig) as (port, httpd):
+        fx(httpd)
+        sid = open_session(port)[1]["sid"]
+        held = 0
+        while httpd.voice_chunk_gate.acquire(blocking=False):
+            held += 1
+        try:
+            assert held == cockpit_voice.STREAM_CHUNK_INFLIGHT
+            got, body, hdrs = raw(port, head(port, f"{CHUNK}?sid={sid}&seq=0", ctype="application/octet-stream",
+                                             clen=str(len(PCM))), wait=3.0)
+            assert (got, body["error"]) == (503, "voice_busy") and hdrs["connection"] == "close"
+        finally:
+            for _ in range(held):
+                httpd.voice_chunk_gate.release()
+        assert chunk(port, sid, 0)[0] == 200
+
+
+def test_a_chunk_with_no_content_type_is_415(rig):
+    """Pins a refuted finding (deepseek 3): base_type(None) is "", so a missing Content-Type is the 415, never a 500."""
+    keyed(rig)
+    with served(rig) as (port, httpd):
+        fx(httpd)
+        sid = open_session(port)[1]["sid"]
+        status, _h, body = chunk(port, sid, 0, ctype=None)
+        assert (status, js(body)["error"]) == (415, "unsupported_media_type")
+
+
+def test_voice_json_with_an_unreadable_meter_and_premium_stt_on_is_200(rig):
+    """Pins a refuted finding (deepseek 1): `rows` is bound before the meter is read, so the stream flag is computed on an
+    unreadable meter too."""
+    from tests.test_cockpit_voice_routes import _foreign
+
+    keyed(rig)
+    rig.ledger_path.parent.mkdir(parents=True, exist_ok=True)
+    _foreign(rig.ledger_path)
+    with served(rig) as (port, _h):
+        status, _hh, body = call(port, "GET", cockpit_voice.VOICE_JSON)
+        out = js(body)
+        assert status == 200 and out["meter"] == "unreadable" and out["stream"] is True
+
+
 # --- the header, the status table ------------------------------------------------------------------------------------------
 
 def test_the_cockpit_page_carries_permissions_policy_microphone_self(rig):

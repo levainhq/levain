@@ -20,8 +20,36 @@ Broader run (888 passed, 7 min): test_cockpit_voice_routes, test_voice_stream_se
 ## Known edges
 - Open reaps inside the registry and every stream request reaps again; reap takes only try-locks, so a hung provider call never blocks it.
 - The reaper thread starts on the first stream request, not at server start (nothing to reap before then).
-- The chunk path reads its body before the session is looked up, so a wrong-owner/unknown-sid chunk still costs one <= 64 KiB read.
+- (Fixed in L3 r1: a chunk's sid, owner and seq are checked before its body is read; reads are bounded by `voice_chunk_gate`.)
 - `deepgram_stream` is imported at open time; a missing wsclient surfaces as a 500 `internal`, not a startup failure.
 
 ## Residue (not verified here)
 Real Deepgram on a real key; a real iPhone (permission prompts, cadence, lock/call); the reaper timer under real load and a real slow provider; Permissions-Policy in a real Safari/Chrome (header presence only is tested).
+
+## L3 r1 fix round (4 lineages: complement, codex, deepseek, gemini@flash-low)
+Every finding resolved against disk first. Tests: `tests/test_cockpit_voice_stream_routes.py` (+7) and `tests/test_voice_stream_session.py` (+2); 94 passed across the two files; broader run (19 voice/web_server/mic/stream files incl. test_web_server, test_cockpit_voice_routes, test_mic_page, test_cockpit_stream) 1113 passed in 10.5 min. Mutation-checked M1-M7 below: each revert turned its test red.
+
+| # | Finding | Verdict | Fix / evidence | Test (revert that turns it red) |
+|---|---|---|---|---|
+| 1 | codex 1, complement 1: first stream request after server_close builds a registry + reaper nothing stops | CONFIRMED | `voice_streams_closed` set under `voice_stream_lock` in `_close_voice_streams`; `_voice_stream_registry` returns None after it; the route answers 503 `stopping` | `test_no_registry_or_reaper_is_built_after_server_close` (M1: drop the closed check) |
+| 2 | codex 2: shutdown does not wait for an open inside `registry.open()` holding a `reserved` row | CONFIRMED | `StreamRegistry.shutdown` waits (Condition, bounded `open_wait`, default `OPEN_WAIT_S` 10 s) for opens in progress on OTHER threads; `_build` now gives its slot back LAST, after closing the stream and ending the reservation | `test_shutdown_waits_for_an_open_in_another_thread_to_end_its_reservation` (M6: no wait; M7: slot given back first), `test_shutdown_wait_is_bounded` |
+| 3 | codex 5: registry published before `thread.start()`; close joins an unstarted thread and skips `shutdown()` | CONFIRMED (red test also hit `cannot join thread before it is started` in teardown) | start before publish; `_stop_voice_registry` joins only a live thread and always reaches `shutdown()` | `test_a_reaper_that_cannot_start_publishes_no_registry` (M2: start after publish) |
+| 4 | codex 3, complement 5: singleton registry pins the first meter | CONFIRMED (latent: needs a store-directory rebind) | registry keyed on `meter.path`; a different path builds a new registry and stops + shuts the old one (its streams settle on their own ledger) outside the lock | `test_a_meter_rebind_rebuilds_the_registry_over_the_new_ledger` (M3: drop the path compare) |
+| 5 | codex 4: chunk bodies bypass every gate; ownership checked after the body is read | CONFIRMED (authenticated client only) | `cockpit_voice.stream_chunk_precheck` (query, seq, sid+owner) before any read, connection closed on refusal; `voice_chunk_gate` (`STREAM_CHUNK_INFLIGHT`=2, non-blocking, 503 `voice_busy`) around read+feed. mic.js sends chunks serially, so 2 never binds a real page | `test_an_unknown_sid_chunk_is_refused_before_its_body_is_read` (M4), `test_chunk_body_reads_are_bounded_by_their_own_gate` (M5) |
+| 6 | deepseek 1: `stream_offered(rows)` UnboundLocalError on an unreadable meter | REFUTED | `rows = []` is bound before the meter `try` in `serve_voice` | pinned: `test_voice_json_with_an_unreadable_meter_and_premium_stt_on_is_200` |
+| 7 | deepseek 2: `_voice_post` releases `voice_gate` unconditionally for stream paths | REFUTED | `_voice_post` touches no gate; acquire/release are both inside `_voice_answer`, which stream paths never enter | existing `test_chunks_do_not_take_a_voice_slot` |
+| 8 | deepseek 3: missing Content-Type on a chunk is 500 | REFUTED | `base_type(None)` returns `""` -> 415 | pinned: `test_a_chunk_with_no_content_type_is_415` |
+| 9 | deepseek 5: meter rebuilt per request | REFUTED | `_voice_meter` returns the held Meter unless the path changed; building one creates no file | - |
+| 10 | deepseek 4: reaper join times out, `shutdown()` races `reap()` | REFUTED | registry state is under `_lock`; `_end_if_expired` takes a try-lock and `_end` is idempotent on `_closed`; `_retry_unsettled` detaches its batch atomically, so no double settle | - |
+| 11 | deepseek 6: `parse_qsl` mangles `+` in sids | REFUTED | sids are `secrets.token_urlsafe` (no `+`); mic.js percent-encodes | - |
+| 12 | gemini 1: missing-`seq` KeyError | REFUTED | `_stream_query` returns None unless the keys are exactly `{sid, seq}` | - |
+| 13 | gemini 2: `voice_custody` NameError | REFUTED | `web_server.py:122` imports `custody as voice_custody` | - |
+| 14 | gemini 3: per-request `reap()` destroys active sessions | REFUTED | reap ends only sessions past idle (15 s) / age limits, re-checked under each session's try-lock; such a chunk would be refused by `feed` anyway | - |
+| 15 | gemini 4: off-by-one on the chunk cap / length on open+close | REFUTED | `clen > MAX` (exactly 64 KiB passes, pinned in `test_chunk_body_rules_size_type_and_whole_samples`); `_declared_length` is the shared framing for every POST | - |
+| 16 | gemini 5: `stream_close` hides a non-str close | REFUTED | `StreamSession.close` always returns `self._final` (str) | - |
+| 17 | gemini 6: `last_read` not set on a revoke-reach refusal | REFUTED | matches `transcribe`/`_call`, which do not set it either (reach is not a key-read state) | - |
+| 18 | complement 3: shutdown hangs on a stuck provider call | REFUTED as a hang (known edge) | the Deepgram stream's socket idle timeout is `TICK_S` 1 s and its send lock waits at most 2 ticks, so `_end_now` waits seconds, not forever | - |
+| 19 | complement 4: Permissions-Policy comment overstates | CONFIRMED (comment only) | comment now says a same-origin frame still can | - |
+| 20 | complement 2: revoke enforced only at open | KNOWN EDGE (not fixed) | a revoke mid-session lets chunks flow until idle (15 s) or the age limit (~135 s); the next open is refused | - |
+
+Note: fix 2 touches `levain/voice/stream_session.py` (micS1's file); a merge with another branch editing `_build`'s finally or `shutdown` will conflict there.

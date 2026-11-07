@@ -71,6 +71,7 @@ STREAM_CHUNK_MAX = stream_session.MAX_CHUNK_BYTES
 STREAM_BODY_DEADLINE_S = 10.0           # a 250 ms chunk is 8000 bytes: a body that takes longer than this is stalled
 STREAM_CHUNK_TYPE = "application/octet-stream"
 STREAM_SID_MAX = 128
+STREAM_CHUNK_INFLIGHT = 2               # chunk bodies read at once (the server's voice_chunk_gate); the page sends one at a time
 VOICE_INFLIGHT = 2                      # voice POSTs in flight at once (the server's voice_gate), apart from request_gate
 SPEAK_MAX = 4 * 1024                    # a speak body is a few ids and numbers; the words come from the record
 UPLOAD_MAX = 4 * 1024 * 1024            # the transcribe body cap, checked on the declared length before a byte is read
@@ -704,6 +705,24 @@ def stream_open(registry: stream_session.StreamRegistry, data_root: Path | str, 
         return stream_refusal(code or "internal", key_code, provider=provider, last_read=last_read)
     last_read[provider] = None
     return _json(200, {"sid": session.sid})
+
+
+def stream_chunk_precheck(registry: stream_session.StreamRegistry, query: str, owner: str) -> Answer | None:
+    """The chunk refusals that need no body, in :func:`stream_chunk`'s order (a bad query or sid, a malformed seq, an
+    unknown or foreign sid), answered before the route reads a byte of it; None when the chunk may be read.
+    :func:`stream_chunk` checks all of it again."""
+    got = _stream_query(query, ("sid", "seq"))
+    sid = _stream_sid(got) if got is not None else None
+    if got is None or sid is None:
+        return stream_refusal("unknown_session")
+    raw_seq = got["seq"]
+    if not (raw_seq.isascii() and raw_seq.isdigit() and len(raw_seq) <= 9):
+        return stream_refusal("bad_sequence")
+    try:
+        registry.get(sid, owner)
+    except stream_session.StreamRefused as exc:
+        return stream_refusal(exc.code or "internal")
+    return None
 
 
 def stream_chunk(registry: stream_session.StreamRegistry, query: str, owner: str, pcm: bytes) -> Answer:

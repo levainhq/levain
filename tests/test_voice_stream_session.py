@@ -544,6 +544,61 @@ def test_shutdown_during_an_open_ends_the_new_stream_and_releases(rig):
     assert len(rig.rows()) == 1                                   # a refused open reserves nothing
 
 
+def test_shutdown_waits_for_an_open_in_another_thread_to_end_its_reservation(rig):
+    """S3 L3 r1 (codex 2): an open holding a reserved row inside the factory when the server stops. shutdown must not
+    return before that open has ended its reservation (the process may exit right after). Red with: the bounded wait in
+    StreamRegistry.shutdown removed, or the slot given back before the reservation is ended in _build's finally."""
+    entered, go = threading.Event(), threading.Event()
+    outcome: dict = {}
+
+    def factory(secret):
+        entered.set()
+        go.wait(5)
+        s = FakeStream()
+        rig.streams.append(s)
+        return s
+
+    def opener():
+        try:
+            rig.open(factory=factory)
+            outcome["got"] = "opened"
+        except StreamRefused as exc:
+            outcome["got"] = exc.code
+
+    t = threading.Thread(target=opener)
+    t.start()
+    assert entered.wait(5)
+    assert [r.status for r in rig.rows()] == ["reserved"]
+    threading.Timer(0.2, go.set).start()
+    rig.registry.shutdown()
+    assert [r.status for r in rig.rows()] == ["released"]          # ended before shutdown returned
+    t.join(5)
+    assert outcome["got"] == "stopping" and rig.streams[0].closed == 1
+
+
+def test_shutdown_wait_is_bounded(tmp_path):
+    """A stuck open never hangs the server's close: shutdown gives up after ``open_wait``. Red with: an unbounded wait."""
+    import time as _time
+
+    r = Rig(tmp_path, open_wait=0.2)
+    entered, go = threading.Event(), threading.Event()
+
+    def factory(secret):
+        entered.set()
+        go.wait(5)
+        return FakeStream()
+
+    t = threading.Thread(target=lambda: pytest.raises(StreamRefused, r.open, factory=factory))
+    t.start()
+    assert entered.wait(5)
+    t0 = _time.monotonic()
+    r.registry.shutdown()
+    assert _time.monotonic() - t0 < 2.0
+    go.set()
+    t.join(5)
+    assert [row.status for row in r.rows()] == ["released"]          # the late open still ends its own reservation
+
+
 def test_shutdown_drops_ended_sessions_too(rig):
     s = rig.open()
     s.feed(0, PCM_1S[:3200])
