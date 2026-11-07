@@ -66,8 +66,9 @@ POLL_MAX_S = 0.1
 
 #: DECISION: how long :meth:`CgroupProcs.no_process` waits for ``populated 0`` before it refuses. Measured: the
 #: kernel reported ``populated 1`` 0.3 and 0.6 ms after the reap of the cgroup's last task and 0 by 6 ms, nothing
-#: alive (levain-memory 1107-26-linuxvm/L4B_RUN); 0.25 s is about 40 x that. A pass waits out only the lag (polled from
-#: POLL_FIRST_S); the whole bound is spent only before a refusal.
+#: alive (levain-memory 1107-26-linuxvm/L4B_RUN); 0.25 s is about 40 x that. Only a population with no live member
+#: waits (polled from POLL_FIRST_S); a live member refuses at once, and the whole bound is spent only when nothing is
+#: alive and ``populated`` still never reads 0.
 NO_PROCESS_SETTLE_S = 0.25
 
 #: V12k (reaper DESIGN §8 Q1, ruled): the bound of one :func:`end_domain`, every step under one deadline.
@@ -411,13 +412,68 @@ class CgroupProcs:
     def kill(self, uid: int, bound_s: float) -> bool:
         return self._act("cgroup.kill", "populated", "0", uid, bound_s)
 
+    def _none_alive(self) -> bool | None:
+        """Whether no thread listed in ``cgroup.threads`` is alive: each listed tid is probed, and only one that is
+        gone or a zombie (exited, awaiting or under its reap) counts as not alive. ``False`` on a running or stopped
+        thread, an unreadable one, or a line that is not a tid (fail closed); ``None`` = the file is absent (the
+        caller decides from ``cgroup.events`` whether the cgroup is gone). ``cgroup.threads`` and not
+        ``cgroup.procs``: a thread-group leader that exited reads ``Z`` while its other threads still run."""
+        try:
+            text = self.seams.read(self.cgroup + "/cgroup.threads")
+        except FileNotFoundError:
+            return None
+        except OSError:
+            return False
+        for line in text.split():
+            if not line.isdigit():
+                return False
+            p = self.seams.probe(int(line))
+            if p is not None and p.state != ZOMBIE:
+                return False
+        return True
+
+    def _settle(self, bound_s: float) -> bool | None:
+        """``populated 0`` within ``bound_s``, waiting out ONLY reaping lag (L4B_RUN, codex cgrace 1). Each round reads
+        ``cgroup.threads`` FIRST, then ``cgroup.events``: any live member refuses at once, so the wait never absorbs a
+        live process; only a population with nothing alive (its last tasks exited and being reaped) is waited for.
+        Nothing can become alive after a round found nothing alive (only a live member can fork into the cgroup,
+        and a move into it is a root act), so the first round is the same snapshot the single read was. ``None`` =
+        the cgroup is gone; ``False`` = a live member, an unreadable or malformed file, ``cgroup.threads`` absent
+        beside a present ``cgroup.events``, or ``populated 0`` not read by the deadline (a read that lands past it
+        refuses; each sleep is clamped to the time left, so a refusal costs at most ``bound_s``)."""
+        deadline = self.seams.clock() + bound_s
+        delay = POLL_FIRST_S
+        while True:
+            alive = self._none_alive()
+            if alive is False:
+                return False
+            ev = self.events()
+            now = self.seams.clock()
+            if ev is None:
+                return None
+            if alive is None:
+                return False        # cgroup.threads gone while cgroup.events is not: no proof, fail closed
+            populated = ev.get("populated")
+            if populated not in ("0", "1"):
+                return False        # malformed or missing: refuse, never treat as gone (deepseek cgrace 1)
+            left = deadline - now
+            if left < 0:
+                return False
+            if populated == "0":
+                return True
+            if left == 0:
+                return False
+            self.seams.sleep(min(delay, left))
+            delay = min(delay * 2, POLL_MAX_S)
+
     def no_process(self, uid: int) -> bool:
-        """The proof: ``populated 0`` within :data:`NO_PROCESS_SETTLE_S`, then the uid sweep's. The cgroup's
-        ``populated`` lags the reap of its last task by milliseconds, so a single read just after the caller reaped
-        that task can say 1 with nothing alive (L4B_RUN); a real survivor keeps it 1 past the bound and refuses. A
-        cgroup absent or gone during the wait held nothing: the uid sweep's answer alone."""
+        """The proof: ``populated 0`` within :data:`NO_PROCESS_SETTLE_S` with no live member seen meanwhile
+        (:meth:`_settle`), then the uid sweep's. The cgroup's ``populated`` lags the reap of its last task by
+        milliseconds, so a single read just after the caller reaped that task can say 1 with nothing alive (L4B_RUN);
+        a live member refuses on the first read, as before. A cgroup absent or gone during the wait held nothing:
+        the uid sweep's answer alone."""
         uid = check_target(uid, self.seams)
-        if self._poll("populated", "0", NO_PROCESS_SETTLE_S) is False:
+        if self._settle(NO_PROCESS_SETTLE_S) is False:
             return False
         return self.uid.no_process(uid)
 

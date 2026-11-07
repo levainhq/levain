@@ -138,20 +138,33 @@ class _Cgroup:
     """A fake kernel for :class:`proc.CgroupProcs`: after the last check child, ``cgroup.events`` reads ``populated
     1`` for ``lag`` reads, then 0; no process of the slot uid anywhere unless ``survivor``."""
 
-    def __init__(self, lag, survivor_after=False):
+    def __init__(self, lag, survivor_after=False, helper=False):
         self.lag, self.survivor_after, self.survivor = lag, survivor_after, False
         self.t, self.after, self.lists = 0.0, None, 0
+        self.helper_after, self.helper = helper, False   # a live slot-uid member left in the cgroup (codex cgrace 1)
+        self.lists_at_finish = None
 
     def finish_children(self):
         self.after = 0
         self.survivor = self.survivor_after
+        self.helper = self.helper_after
+        self.lists_at_finish = self.lists
 
     def read(self, path):
+        if self.helper and self.t > 0:
+            self.helper = False                           # it exits during the first sleep of the wait
+        if path == _CG + "/cgroup.threads":
+            return "4441\n" if self.helper else ""
         assert path == _CG + "/cgroup.events"
         if self.after is None:
             return "populated 0\nfrozen 0\n"
         self.after += 1
+        if self.helper:
+            return "populated 1\nfrozen 0\n"
         return "populated 1\nfrozen 0\n" if self.after <= self.lag else "populated 0\nfrozen 0\n"
+
+    def probe(self, pid):
+        return PR.Proc(pid, (_SLOT,) * 3, 1, PR.RUN) if self.helper and pid == 4441 else None
 
     def listing(self):
         self.lists += 1
@@ -161,7 +174,7 @@ class _Cgroup:
         self.t += s
 
     def no_process(self):
-        seams = PR.ProcSeams(listing=self.listing, probe=lambda pid: None, pin=lambda pid: pid,
+        seams = PR.ProcSeams(listing=self.listing, probe=self.probe, pin=lambda pid: pid,
                              send=lambda h, s: None, read=self.read, clock=lambda: self.t, sleep=self.sleep,
                              self_uids=lambda: (0, 0), self_pid=lambda: 1)
         return PR.CgroupProcs(_CG, seams).no_process(_SLOT)
@@ -195,7 +208,18 @@ def test_linux_a_uid_survivor_after_the_lag_still_refuses(root, sfd):
     with pytest.raises(SS.CheckFailed) as e:
         _linux_check(root, sfd, k)
     assert str(e.value) == "window: a slot-uid process is alive after the last check child"
+    assert k.lists_at_finish == 2               # window 1 ran (one clean uid sweep) before the last check child
     assert k.after == 2 and k.lists >= 3
+
+
+def test_linux_a_live_helper_that_exits_during_the_wait_still_refuses(root, sfd):
+    """codex cgrace 1 (HIGH): a slot-uid helper outlives the last check child (``populated 1``), could change the
+    hashed tree, and exits before the old 250 ms wait ended. The wait absorbs only reaping lag: it refuses at once."""
+    k = _Cgroup(1, helper=True)
+    with pytest.raises(SS.CheckFailed) as e:
+        _linux_check(root, sfd, k)
+    assert str(e.value) == "window: a slot-uid process is alive after the last check child"
+    assert k.lists_at_finish == 2 and k.lists == 2 and k.t == 0   # no wait, no uid sweep after the hash
 
 
 # --- window 2 on macOS (DESIGN_window2) ----------------------------------------------------------------------------

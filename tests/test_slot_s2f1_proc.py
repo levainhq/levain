@@ -367,7 +367,7 @@ CG = "/sys/fs/cgroup/levain.slice/e0.scope/s-0000000000000001"
 def cg_table(populated="1", frozen="0") -> Table:
     t = Table()
     t.files = {CG + "/cgroup.events": f"populated {populated}\nfrozen {frozen}\n", CG + "/cgroup.freeze": "0",
-               CG + "/cgroup.kill": ""}
+               CG + "/cgroup.kill": "", CG + "/cgroup.threads": ""}
     return t
 
 
@@ -451,17 +451,113 @@ def test_cgroup_proof_refuses_a_survivor_that_keeps_populated_1_past_the_settle_
     t = cg_table(populated="1")
     seen = _populated_after(t, 10 ** 6)
     assert P.CgroupProcs(CG, t.seams()).no_process(SLOT) is False
-    assert t.t >= P.NO_PROCESS_SETTLE_S         # it waited the whole bound ...
-    assert t.t < P.NO_PROCESS_SETTLE_S + P.POLL_MAX_S + 1e-9   # ... and no longer
+    assert t.t == pytest.approx(P.NO_PROCESS_SETTLE_S)   # it waited the whole bound, and no longer (sleeps clamped)
     assert len(seen) > 1 and t.lists == 0       # polled, refused before any uid sweep
+
+
+# codex cgrace 1 (HIGH): the wait must absorb only reaping lag, never a live process. A live member of the cgroup
+# that exits during the wait (after it could have changed the already-hashed tree) passed the 3f951507 proof.
+
+def _member_exits_mid_wait(t: Table, pid: int, state: str = RUN, uid: int = SLOT) -> None:
+    """``pid`` is in the cgroup (``cgroup.threads``, ``populated 1``) at the first read and exits during the first
+    sleep: from then on the cgroup reads empty and ``populated 0``."""
+    t.add(pid, uid, state)
+    t.files[CG + "/cgroup.threads"] = f"{pid}\n"
+
+    def kernel(tab, path):
+        if tab.t > 0 and pid in tab.procs:
+            del tab.procs[pid]
+            tab.files[CG + "/cgroup.threads"] = ""
+            tab.files[CG + "/cgroup.events"] = "populated 0\nfrozen 0\n"
+    t.on_read.append(kernel)
+
+
+@pytest.mark.parametrize("state,uid", [(RUN, SLOT), (STOP, SLOT), (RUN, OTHER), (UNKNOWN, SLOT)])
+def test_cgroup_proof_refuses_a_live_member_at_once_even_one_that_exits_during_the_wait(state, uid):
+    t = cg_table(populated="1")
+    _member_exits_mid_wait(t, 4242, state, uid)
+    assert P.CgroupProcs(CG, t.seams()).no_process(SLOT) is False
+    assert t.t == 0 and t.lists == 0            # refused on the first read: no wait, no uid sweep
+    assert ("probe", 4242) in t.order
+
+
+def test_cgroup_proof_waits_for_a_zombie_or_already_gone_member():
+    # The lag the wait exists for: the listed task exited (zombie, or already reaped and gone from /proc).
+    t = cg_table(populated="1")
+    _member_exits_mid_wait(t, 4242, ZOMBIE)
+    assert P.CgroupProcs(CG, t.seams()).no_process(SLOT) is True
+    assert 0 < t.t < P.NO_PROCESS_SETTLE_S and t.lists == 2
+    t = cg_table(populated="1")
+    t.files[CG + "/cgroup.threads"] = "4243\n"  # listed, probe finds nothing
+    _populated_after(t, 1)
+    assert P.CgroupProcs(CG, t.seams()).no_process(SLOT) is True
+
+
+def test_cgroup_proof_sees_a_live_thread_behind_a_zombie_leader():
+    t = cg_table(populated="1")
+    t.add(4242, SLOT, ZOMBIE)                   # the leader exited ...
+    t.add(4250, SLOT, RUN)                      # ... its other thread still runs
+    t.files[CG + "/cgroup.threads"] = "4242\n4250\n"
+    assert P.CgroupProcs(CG, t.seams()).no_process(SLOT) is False
+    assert t.t == 0
+
+
+@pytest.mark.parametrize("events", ["frozen 0\n", "populated\nfrozen 0\n", "populated 2\n", "", "garbage"])
+def test_cgroup_proof_refuses_malformed_cgroup_events_at_once(events):
+    # deepseek cgrace 1: a present cgroup.events without a populated 0/1 must refuse, never read as "gone".
+    t = cg_table(populated="0")
+    t.files[CG + "/cgroup.events"] = events
+    assert P.CgroupProcs(CG, t.seams()).no_process(SLOT) is False
+    assert t.t == 0 and t.lists == 0
+
+
+@pytest.mark.parametrize("threads", ["abc\n", "-1\n", "12 x\n"])
+def test_cgroup_proof_refuses_malformed_cgroup_threads(threads):
+    t = cg_table(populated="0")
+    t.files[CG + "/cgroup.threads"] = threads
+    assert P.CgroupProcs(CG, t.seams()).no_process(SLOT) is False
+
+
+def test_cgroup_proof_refuses_threads_unreadable_or_absent_beside_events():
+    t = cg_table(populated="0")
+    del t.files[CG + "/cgroup.threads"]         # events present, threads absent: no proof
+    assert P.CgroupProcs(CG, t.seams()).no_process(SLOT) is False
+    t = cg_table(populated="0")
+    seams = t.seams()
+    real = seams.read
+
+    def denied(path):
+        if path.endswith("/cgroup.threads"):
+            raise PermissionError(path)
+        return real(path)
+    seams.read = denied
+    assert P.CgroupProcs(CG, seams).no_process(SLOT) is False
+
+
+def test_cgroup_proof_refuses_populated_0_first_read_past_the_deadline():
+    # codex cgrace 2: a read that lands past the deadline never accepts, however the scheduler overslept.
+    t = cg_table(populated="1")
+    n = {"reads": 0}
+
+    def kernel(tab, path):
+        if path == CG + "/cgroup.events":
+            n["reads"] += 1
+            if n["reads"] == 2:
+                tab.t += P.NO_PROCESS_SETTLE_S  # the first sleep overslept past the whole bound
+                tab.files[path] = "populated 0\nfrozen 0\n"
+    t.on_read.append(kernel)
+    assert P.CgroupProcs(CG, t.seams()).no_process(SLOT) is False
+    assert t.lists == 0
 
 
 def test_cgroup_proof_whose_cgroup_goes_away_mid_wait_is_the_uid_sweeps():
     t = cg_table(populated="1")
 
     def kernel(tab, path):
-        if tab.t > 0:
-            tab.files.pop(CG + "/cgroup.events", None)
+        if path == CG + "/cgroup.events":
+            tab.n_events = getattr(tab, "n_events", 0) + 1
+            if tab.n_events >= 2:               # gone from the second read on, whatever the clock says
+                tab.files.pop(path, None)
     t.on_read.append(kernel)
     assert P.CgroupProcs(CG, t.seams()).no_process(SLOT) is True
     t = cg_table(populated="1")
