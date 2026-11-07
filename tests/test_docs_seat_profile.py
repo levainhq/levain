@@ -125,8 +125,8 @@ def test_every_seat_subcommand_the_prose_names_exists():
         assert word in egress
     assert set(egress) == {"create", "renew", "revoke", "list"}
     lease = _subparsers(seat["lease"])
-    m = re.search(r"levain seat lease create\|renew\|revoke\|list", TEXT)
-    assert m and set(lease) == {"create", "renew", "revoke", "list"}
+    assert "`levain seat lease`, with `create`, `renew`, `revoke` and `list`" in TEXT
+    assert set(lease) == {"create", "renew", "revoke", "list"}
 
 
 def test_the_egress_table_covers_every_egress_subcommand():
@@ -234,3 +234,25 @@ def test_launch_and_stop_are_left_for_when_they_land():
     # no launch or stop flag is described here
     for flag in ("--base", "--claude"):
         assert f"`{flag}`" not in TEXT
+
+
+def test_the_credential_env_list_is_the_codes():
+    from levain import host_guard
+    for name in host_guard._ENV_ALLOW:
+        assert f"`{name}`" in TEXT
+    assert host_guard._ENV_ALLOW_PREFIXES == ("LC_",) and "`LC_*`" in TEXT
+
+
+def test_p8_is_the_one_probe_without_a_control():
+    p8 = next(p for p in seat_canary.SEAT_PROBES if p.id == "P8")
+    assert p8.control.startswith("none")
+    assert [p.id for p in seat_canary.SEAT_PROBES if p.control.startswith("none")] == ["P8"]
+    assert "Every probe except P8" in TEXT
+
+
+def test_launch_stops_short_of_starting_claude():
+    launch = _resolve(["launch"])
+    assert {"--remote", "--base"} <= _options(launch)
+    assert "does not start claude" in (_seat().description or "")
+    assert "It does not start Claude Code" in TEXT
+    assert "clones the lane and makes its RETURN directory" in TEXT

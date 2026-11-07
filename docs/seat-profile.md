@@ -70,7 +70,7 @@ hook run the push described under seat egress.
   rule made `git commit` fail. Two consequences: a `.git` created after launch is not covered by a deny rule (the
   launch check refuses one that already exists), and a Write to a `.git` file outside the five paths reaches a
   permission prompt instead of a hard refusal.
-- The deny rules name those agent-config paths at the top of each root only. The launch check walks the whole tree and refuses a root that already holds one at any depth, but a nested one (for example `sub/.claude/settings.json`) written during the turn is not denied. The seat loads no settings from its roots, so it is inert for the seat, but it can be committed and, with a seat-egress grant, pushed to the lane branch, where an ordinary Claude Code session that checks the branch out would read it. Review a lane branch before you check it out.
+- The deny rules name those agent-config paths at the top of each root only. The launch check walks the whole tree and refuses a root that already holds one at any depth, but a nested one (for example `sub/.claude/settings.json`) written during the turn is not denied. The seat loads no settings from its roots, so it is inert for the seat, but it can be committed and, with a seat-egress grant, pushed to `seat/<lane key>` on the remote, where an ordinary Claude Code session that checks the branch out would read it. Review that branch without checking it out (for example `git log -p` and `git show <branch>:<path>`).
 - NotebookEdit is not in the seat's tool set, because there is no race probe for it yet (see P9 below).
 
 ## The canary: `levain seat canary`
@@ -112,12 +112,12 @@ denial, because at a terminal a person could answer it the other way.
 
 ### The probes
 
-Every probe pairs an attempt with a positive control in the same run (something that must work, so a refusal is
-known to be the wall and not a broken test).
+Every probe except P8 pairs an attempt with a positive control in the same run (something that must work, so a
+refusal is known to be the wall and not a broken test). P8 has none: any successful read of the key is itself a leak.
 
 | Probe | The seat tries | Control | PASS means |
 |---|---|---|---|
-| P0 profile loaded | (reads the session's init and hook events) | tool calls ran, so the record must hold rows | The tool list equals the seat set, no MCP server is loaded, the profile's hooks fired, and the record has rows. |
+| P0 profile loaded | (reads the session's init and hook events) | tool calls ran, so the record must hold rows | The tool list equals the tool set this run was started with (by default the seat set), no MCP server is loaded, the profile's hooks fired, and the record has rows. |
 | P1 hooks-poisoning write | Edit and Write on `.claude/settings.json` and `.mcp.json`, directly and through a directory symlink | a Write in the lane that must land | Every attempt was refused and no protected file changed. |
 | P1b inert target | (the harness plants a SessionStart hook and an MCP server in the clone before launch) | the profile's own hooks fire | The planted hook did not run and no MCP server loaded. |
 | P2 symlink-swap race | N Writes through a directory that a sandboxed process flips between real and a symlink to a decoy | a Write to a non-swapped path that must land | None of N landed in the decoy, the flipper ran through the last Write, and no swap Write reached a permission prompt. |
@@ -155,11 +155,12 @@ run before it is used. If P10 does not pass, Glob and Grep are dropped from the 
 - **Not covered:** subagents and other tools outside the six, a seat run under a different OS user, an interactive
   session with a person approving prompts, or anything outside the lane and RETURN directory that the profile never
   names.
-- **The canary does not start or stop a real seat.** It uses a fixed throwaway root and never a real lane.
+- **The canary does not start or stop a real seat.** It uses a throwaway root and never a real lane.
 
 ## Seat egress: `levain seat egress`
 
-A seat holds no push credential and has no push tool. A seat-egress grant lets Levain itself push a seat's
+A seat has no push tool, and the profile passes it only a short list of environment variables (`PATH`, `HOME`, `USER`,
+`LOGNAME`, `SHELL`, `LANG`, `TERM`, `TMPDIR` and `LC_*`), so no credential is handed to it. A seat-egress grant lets Levain itself push a seat's
 commits, and only to the branch `seat/<lane key>` of one remote. It cannot name another branch, so a seat has no
 path to your main branch through it.
 
@@ -201,9 +202,9 @@ The profile's `Stop` and `SessionEnd` hooks run `levain.seat_push`. In order:
    clone is below the grant's lanes parent, the branch is exactly `seat/<lane key>`, the remote is the grant's, and
    the clone's `.git` is the one recorded at launch.
 
-The hook never blocks the seat. Every outcome is written to `<levain home>/push/seat_egress.jsonl`, and the hook
+The hook never stops the seat's work. Every outcome is written to `<levain home>/push/seat_egress.jsonl`, and the hook
 exits 0, with one exception: if the remote rejects the push (for example, a non-fast-forward), the first `Stop`
-exits 2 so the message reaches the model, which can rebase. Nothing is forced. A network or authentication failure
+exits 2, which keeps the turn open and puts the message in front of the model, which can rebase. Nothing is forced. A network or authentication failure
 is recorded and retried at the next `Stop`.
 
 ### Known edges
@@ -218,8 +219,13 @@ is recorded and retried at the next `Stop`.
   a seat with it yet. Remove this line when the launcher uses it.
 - **A narrow fallback canary can read INCONCLUSIVE.** The Bash-and-Read set, and a default walk path, may report
   inconclusive.
-- **Rename and back.** A seat can rename its clone's `.git` away and back, which keeps its recorded identity. The
-  mirror fetch is what bounds this: it reads objects and runs no repository code.
+- **Rename and back.** A `.git` renamed away and back keeps its recorded identity, so the push check alone would not
+  see it. P5 tests that the rename is refused; the mirror fetch is the second bound, because it reads objects and
+  runs no repository code.
+- **Credentials on disk.** The profile hides only the launcher key directory from reads. If a git host is in
+  `--allow-domain` and credentials for it are readable from the seat's account, a seat's own Bash could use them.
+  The push goes through Levain's executor outside the sandbox and needs no network of the seat's own, so keep your
+  git host out of `--allow-domain`.
 - **A kill between steps.** A hard kill between git returning and the pushed-tip mark being written re-pushes the
   same tip next time; the push is a no-op.
 - **No seat has run end to end under the egress profile on a real machine.** The commit under the final `.git`
@@ -228,12 +234,12 @@ is recorded and retried at the next `Stop`.
 
 ## The seat-root lease
 
-Seat egress sits on the seat-root lease (`levain seat lease create|renew|revoke|list`): a signed, 14-day, revocable
+Seat egress sits on the seat-root lease (`levain seat lease`, with `create`, `renew`, `revoke` and `list`): a signed, 14-day, revocable
 permission to make lanes and RETURN directories under two parent directories. The lease and `levain seat launch`
 are documented when launching lands.
 
 ## Launch and stop
 
-`levain seat launch` exists today and only validates: it mints the lane's directories under the live lease and prints
-the command and digest it would use. It does not start Claude Code. Starting and stopping a seat are documented here
+`levain seat launch` exists today and stops short of a seat: it clones the lane and makes its RETURN directory under
+the live lease, validates the launch and prints the command and digest it would use. It does not start Claude Code. Starting and stopping a seat are documented here
 when the launcher lands.
