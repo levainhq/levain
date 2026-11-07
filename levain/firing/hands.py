@@ -559,8 +559,10 @@ def egress_undo_steps(hands_user: str) -> list[Step]:
     user runs with its network open."""
     systemctl, unit, unit_path = _abs("systemctl"), egress_unit_name(hands_user), egress_unit_path(hands_user)
     return [
-        # --now: the unit is RemainAfterExit, so a bare disable left it loaded and active with no file (1107-26 guest).
-        Step("stop the network boundary unit and stop loading it at boot", (systemctl, "disable", "--now", unit),
+        # The unit is RemainAfterExit, so a bare disable left it loaded and active with no file (1107-26 guest). The
+        # stop is not gated on the file: a re-run over that stranded state must still stop it. Not loaded is fine.
+        Step("stop the network boundary unit", (systemctl, "stop", unit), allow_fail=True),
+        Step("stop loading the network boundary at boot", (systemctl, "disable", unit),
              skip_if=(_abs("test"), "!", "-e", str(unit_path))),
         Step("remove its systemd unit", ("/bin/rm", "-f", str(unit_path))),
         Step("tell systemd", (systemctl, "daemon-reload")),
