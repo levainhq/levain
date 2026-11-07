@@ -1042,6 +1042,16 @@ def _owned_by(path: Path, uid: int | None) -> bool:
         return True
 
 
+def keep_work_clone_command(repo: str, destination: str) -> str:
+    """The command that copies a retired entity's repository out to a destination its operator owns. Two
+    ``safe.directory`` entries: the repository, which git 2.56 checks, and its ``.git``, which the upload-pack
+    child of a local clone checks on git 2.43 (Ubuntu 24.04), where the repository entry alone ends
+    ``detected dubious ownership in repository at '<repo>/.git'``. Each git ignores the entry it does not
+    check. ``tests/ci/isolation_e2e.sh`` runs this same flag set (pinned by tests/test_keep_work_clone.py)."""
+    return (f"git -c safe.directory={repo} -c safe.directory={repo}/.git -c core.hooksPath=/dev/null "
+            f"clone --no-local {repo} {destination}")
+
+
 def _git_dir_shaped(path: Path) -> bool:
     return (path / "HEAD").is_file() and (path / "objects").is_dir() and (path / "refs").is_dir()
 
@@ -1091,9 +1101,8 @@ def _readable_and_sanitised(tree: Path, operator_gid: int, *, owner_uid: int | N
     if repos:
         first = repos[0]
         return True, ("the entity's repositories keep its retired id as owner, with no hooks and only basic "
-                      "settings; no git (yours or root's) will use them directly. To keep the work: git -c "
-                      "safe.directory="
-                      f"{first} -c core.hooksPath=/dev/null clone --no-local {first} <destination>   "
+                      "settings; no git (yours or root's) will use them directly. To keep the work: "
+                      f"{keep_work_clone_command(first, '<destination>')}   "
                       f"(repositories: {', '.join(repos)})")
     return True, ""
 
