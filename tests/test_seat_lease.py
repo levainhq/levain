@@ -141,6 +141,26 @@ def test_a_profile_refusal_removes_what_the_mint_made_and_writes_no_row(rig):
     assert list(rig.lanes.iterdir()) == [] and list(rig.returns.iterdir()) == [] and sl.read_mints(rig.key_dir) == []
 
 
+def test_a_source_tracking_a_nested_activation_launches_with_it_read_only(rig):
+    """Phill 11-07 (np-4f771671 a): the launch passes its base sha to the builder, so a tracked nested activation/ (as
+    levain's own templates/activation) launches with the directory in denyWrite and the file-tool deny rules."""
+    rig.sign_lease()
+    src = rig.tmp / "withact"
+    (src / "pkg" / "activation").mkdir(parents=True)
+    _git(src, "init", "-q")
+    (src / "pkg" / "activation" / "posture.md").write_text("p\n")
+    _git(src, "add", "-A")
+    _git(src, "commit", "-q", "-m", "x")
+    sha = _git(src, "rev-parse", "HEAD")
+    plan = sl.prepare_launch("lane-act", str(src), sha, claude_bin=rig.claude, python=sys.executable,
+                             cockpit_root=rig.world.root, install=rig.tmp,
+                             now=rig.world.clock.now + timedelta(minutes=1), managed=())
+    act = Path(plan.profile.clone) / "pkg" / "activation"
+    assert str(act) in plan.profile.settings["sandbox"]["filesystem"]["denyWrite"]
+    assert "Edit(pkg/activation/**)" in plan.profile.settings["permissions"]["deny"]
+    assert plan.mint["base_sha"] == sha and plan.mint["profile_digest"] == plan.profile.digest()
+
+
 def test_validate_launch_prints_the_argv_and_digest_and_never_executes(rig, monkeypatch):
     rig.sign_lease()
     for name in ("execv", "execvp", "execve", "execvpe"):

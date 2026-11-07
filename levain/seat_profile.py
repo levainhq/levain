@@ -16,6 +16,7 @@ import hashlib
 import json
 import os
 import shlex
+import stat
 import sys
 import tempfile
 from dataclasses import dataclass
@@ -27,6 +28,7 @@ from levain.authority import SEAT_EGRESS_KIND, SEAT_LEASE_KIND
 from levain.host_guard import (CC_SEAT_TOOLS, PROTECTED_NAMES, SEAT_SOURCE_ARGS, HostRefusal)
 
 __all__ = ["SeatRefusal", "SeatProfile", "seat_deny_write", "seat_permission_deny", "build_seat_profile",
+           "exempt_permission_deny", "tracked_at_base", "TRACKED_EXEMPT_NAMES",
            "CANARY_DIRNAME", "FILE_TOOLS", "SEAT_LEASE_KIND"]
 
 CANARY_DIRNAME = "levain-seat-canary"
@@ -64,6 +66,17 @@ def seat_deny_write(root: Path, *, git: bool) -> list[str]:
 
 def _abs_rule(tool: str, path: str) -> str:
     return f"{tool}(//{path.lstrip('/')})"
+
+
+def exempt_permission_deny(clone: Path, exempt: Sequence[str]) -> list[str]:
+    """The file-tool deny rules for each tracked-exempt directory (:data:`TRACKED_EXEMPT_NAMES`): all four tools, the
+    absolute spelling and the cwd-relative one, the same two spellings :func:`seat_permission_deny` gives the clone."""
+    rules: list[str] = []
+    for path in exempt:
+        rel = Path(path).relative_to(clone).as_posix()
+        for tool in FILE_TOOLS:
+            rules += [_abs_rule(tool, f"{path}/**"), f"{tool}({rel}/**)"]
+    return rules
 
 
 def seat_permission_deny(roots: Sequence[Path], key_dir: Path) -> list[str]:
@@ -155,10 +168,101 @@ def ensure_canary_prefix(environ: Mapping[str, str]) -> Path:
     return prefix
 
 
-def _contains_agent_config(root: Path, *, git_dir_ok: bool) -> list[str]:
+#: The protected names a lane may hold below its top level when git tracks them at the launch base (Phill 11-07,
+#: np-4f771671 (a)): levain's own repo ships ``levain/templates/activation/`` as package data. ``.claude``, ``.codex``,
+#: ``.levain``, ``.mcp.json`` and ``.git`` never qualify: levain's repo tracks none of them (``git ls-files``, 11-07),
+#: and those are the names a vendor tool reads from any directory it is started in, which ``activation`` is not.
+TRACKED_EXEMPT_NAMES = frozenset({"activation"})
+_BLOB_MODES = {"100644": False, "100755": True}   # regular files only: never 120000 (a symlink) or 160000 (a gitlink)
+_BASE_SHA_LEN = (40, 64)
+_GIT_TIMEOUT = 60
+
+
+def tracked_at_base(clone: Path, base_sha: str) -> dict[str, tuple[str, str]]:
+    """``{path: (mode, object id)}`` of every entry git tracks in ``base_sha``'s tree, read by the LAUNCHER from the
+    clone's object store before any seat runs: no hooks, no global or system config, no replace refs. Never read from
+    the working tree. Raises :class:`SeatRefusal` when the commit cannot be read."""
+    if len(base_sha) not in _BASE_SHA_LEN or any(c not in "0123456789abcdef" for c in base_sha):
+        raise SeatRefusal("the base sha must be a full lowercase hex commit id")
+    import subprocess
+    env = {"PATH": os.environ.get("PATH", "/usr/bin:/bin"), "HOME": os.environ.get("HOME", ""),
+           "GIT_CONFIG_GLOBAL": "/dev/null", "GIT_CONFIG_NOSYSTEM": "1", "GIT_TERMINAL_PROMPT": "0", "LC_ALL": "C"}
+    r = subprocess.run(["git", "--no-replace-objects", f"--git-dir={clone / '.git'}", "-c", "core.hooksPath=/dev/null",
+                        "ls-tree", "-r", "-z", "--full-tree", f"{base_sha}^{{commit}}"],
+                       env=env, capture_output=True, timeout=_GIT_TIMEOUT, check=False)
+    if r.returncode:
+        raise SeatRefusal(f"the base {base_sha[:12]} cannot be read from the clone: "
+                          f"{r.stderr.decode(errors='replace').strip()[:300]}")
+    out: dict[str, tuple[str, str]] = {}
+    for rec in r.stdout.split(b"\0"):
+        if rec:
+            meta, _, path = rec.partition(b"\t")
+            mode, _kind, oid = meta.decode().split(" ")
+            out[os.fsdecode(path)] = (mode, oid)
+    return out
+
+
+def _blob_id(data: bytes, oid_len: int) -> str:
+    h = hashlib.sha1() if oid_len == 40 else hashlib.sha256()   # noqa: S324 (git's object id, not a security hash)
+    h.update(b"blob %d\0" % len(data))
+    h.update(data)
+    return h.hexdigest()
+
+
+def _exempt_problem(root: Path, top: Path, tracked: Mapping[str, tuple[str, str]]) -> str | None:
+    """Why the protected-name directory ``top`` (below ``root``'s top level) is NOT exempt, or None when it is: its
+    working tree is exactly what git tracks under it at the base (same regular files, same bytes, same executable bit,
+    no symlink, no extra file or directory, no other protected name inside)."""
+    rel = top.relative_to(root).as_posix()
+    if os.path.islink(top):
+        return "it is a symlink"
+    want = {p[len(rel) + 1:]: v for p, v in tracked.items() if p.startswith(rel + "/")}
+    if not want:
+        return "git does not track it at the base"
+    bad = [p for p, (mode, _) in want.items() if mode not in _BLOB_MODES]
+    if bad:
+        return f"{rel}/{sorted(bad)[0]} is tracked as mode {want[sorted(bad)[0]][0]}, not a regular file"
+    dirs = {str(Path(p).parent) for p in want} - {"."}
+    dirs |= {str(a) for d in list(dirs) for a in Path(d).parents} - {"."}
+    seen_files: set[str] = set()
+    for dirpath, dirnames, filenames in os.walk(top, followlinks=False):
+        here = Path(dirpath)
+        for name in dirnames + filenames:
+            p = here / name
+            sub = p.relative_to(top).as_posix()
+            if name in PROTECTED_NAMES - TRACKED_EXEMPT_NAMES:
+                return f"{rel}/{sub} is a protected name inside it"
+            st = os.lstat(p)
+            if stat.S_ISLNK(st.st_mode):
+                return f"{rel}/{sub} is a symlink"
+            if stat.S_ISDIR(st.st_mode):
+                if sub not in dirs:
+                    return f"{rel}/{sub} is a directory git does not track at the base"
+                continue
+            if not stat.S_ISREG(st.st_mode):
+                return f"{rel}/{sub} is not a regular file"
+            if sub not in want:
+                return f"{rel}/{sub} is not tracked at the base"
+            mode, oid = want[sub]
+            if bool(st.st_mode & 0o100) != _BLOB_MODES[mode]:
+                return f"{rel}/{sub} differs from the base (executable bit)"
+            with open(p, "rb") as fh:
+                if _blob_id(fh.read(), len(oid)) != oid:
+                    return f"{rel}/{sub} differs from the base"
+            seen_files.add(sub)
+    missing = sorted(set(want) - seen_files)
+    if missing:
+        return f"{rel}/{missing[0]} is tracked at the base but missing"
+    return None
+
+
+def _contains_agent_config(root: Path, *, git_dir_ok: bool, tracked: Mapping[str, tuple[str, str]] | None = None,
+                           exempt: list[str] | None = None) -> list[str]:
     """Every agent-config target under ``root`` (a :data:`PROTECTED_NAMES` entry at any depth). A top-level real
     ``.git`` directory is the clone's own and is not descended into when ``git_dir_ok``; a gitfile or a nested
-    ``.git`` is a target."""
+    ``.git`` is a target. With ``tracked`` (:func:`tracked_at_base`), a :data:`TRACKED_EXEMPT_NAMES` directory BELOW
+    the top level whose tree is exactly the tracked one is not a target: its absolute path is appended to ``exempt``
+    (the caller denies writes to it) and a mismatch is reported with its reason."""
     found: list[str] = []
     seen = 0
     for dirpath, dirnames, filenames in os.walk(root, followlinks=False):
@@ -168,6 +272,14 @@ def _contains_agent_config(root: Path, *, git_dir_ok: bool) -> list[str]:
             if d == ".git" and git_dir_ok and here == root:
                 if os.path.islink(here / d):
                     found.append(str(here / d))
+                continue
+            if d in TRACKED_EXEMPT_NAMES and tracked is not None and here != root:
+                why = _exempt_problem(root, here / d, tracked)
+                if why is None:
+                    if exempt is not None:
+                        exempt.append(str(here / d))
+                else:
+                    found.append(f"{here / d} (not exempt: {why})")
                 continue
             if d in PROTECTED_NAMES:
                 found.append(str(here / d))
@@ -254,7 +366,7 @@ def build_seat_profile(clone: Path, return_dir: Path, *, claude_bin: str, python
                        managed: Sequence[tuple[str, Any]] | None = None, platform: str = sys.platform,
                        home: Path | None = None, egress: Mapping[str, Any] | None = None,
                        cockpit_root: Path | str | None = None, levain_home: Path | str | None = None,
-                       tools: Sequence[str] = CC_SEAT_TOOLS) -> SeatProfile:
+                       tools: Sequence[str] = CC_SEAT_TOOLS, base_sha: str | None = None) -> SeatProfile:
     """Build the terminal seat profile, or raise :class:`SeatRefusal` naming every problem found. ``lease=None`` is
     accepted only with ``canary_root`` under the fixed test prefix. Refuses a root that already holds an agent-config
     target, and an executable (python, claude) a seat could write.
@@ -265,7 +377,13 @@ def build_seat_profile(clone: Path, return_dir: Path, *, claude_bin: str, python
     both are exactly what they were before Z2a (empty domains, no such hook). A grant never reaches a canary profile.
     The domains are frozen at launch: a revoke stops the push at once, the network only at the seat's relaunch (the
     KNOWN EDGE at the ``allowedDomains`` line). ``tools`` is the seat's ``--tools`` set (default ``CC_SEAT_TOOLS``; a
-    subset when a failed canary named a fallback, PATHZERO Z5)."""
+    subset when a failed canary named a fallback, PATHZERO Z5).
+
+    ``base_sha`` is the commit the launcher checked the clone out at (the lease launch passes it; the canary and the
+    dry run do not). With it, a :data:`TRACKED_EXEMPT_NAMES` directory below the clone's top level whose working tree
+    is exactly what git tracks under it at that commit (:func:`tracked_at_base`, read by the launcher, never from the
+    working tree) is launched read-only instead of refused: the sandbox's ``denyWrite`` and the file tools' deny rules
+    name it. Anything extra, changed, symlinked or untracked in it still refuses, as does every other protected name."""
     environ = os.environ if environ is None else environ
     tools = tuple(tools)
     clone, return_dir, key_dir = _real(clone), _real(return_dir), _real(key_dir)
@@ -275,9 +393,18 @@ def build_seat_profile(clone: Path, return_dir: Path, *, claude_bin: str, python
         problems.append(f"the tool set {tools!r} must be a non-empty subset of the admitted seat tools, with no repeats")
     problems += _egress_problems(clone, lease, egress, cockpit_root, levain_home)
     problems += _roots_problems(clone, return_dir, key_dir)
+    exempt: list[str] = []
     if not problems:
-        problems += [f"{t} is an agent-config target inside a seat root" for t in
-                     _contains_agent_config(clone, git_dir_ok=True) + _contains_agent_config(return_dir, git_dir_ok=False)]
+        tracked = None
+        if base_sha is not None:
+            try:
+                tracked = tracked_at_base(clone, base_sha)
+            except SeatRefusal as exc:
+                problems.append(str(exc))
+        if not problems:
+            problems += [f"{t} is an agent-config target inside a seat root" for t in
+                         _contains_agent_config(clone, git_dir_ok=True, tracked=tracked, exempt=exempt)
+                         + _contains_agent_config(return_dir, git_dir_ok=False)]
     problems += hg._check_exec(python, roots, "the Python that runs the seat's hooks")
     problems += hg._check_exec(claude_bin, roots, "the claude binary")
     pkg = Path(__file__).resolve().parent
@@ -297,7 +424,7 @@ def build_seat_profile(clone: Path, return_dir: Path, *, claude_bin: str, python
     sandbox["filesystem"] = {
         "disabled": False,
         "allowWrite": [str(r) for r in roots],
-        "denyWrite": seat_deny_write(clone, git=True) + seat_deny_write(return_dir, git=False),
+        "denyWrite": seat_deny_write(clone, git=True) + seat_deny_write(return_dir, git=False) + exempt,
         "denyRead": [str(key_dir)],
     }
     py = shlex.quote(python)
@@ -322,7 +449,7 @@ def build_seat_profile(clone: Path, return_dir: Path, *, claude_bin: str, python
     settings = {
         "sandbox": sandbox,
         "permissions": {"defaultMode": "acceptEdits", "additionalDirectories": [str(return_dir)],
-                        "deny": seat_permission_deny(roots, key_dir)},
+                        "deny": seat_permission_deny(roots, key_dir) + exempt_permission_deny(clone, exempt)},
         "includeGitInstructions": False,
         "autoMemoryEnabled": False,
         "hooks": hooks,

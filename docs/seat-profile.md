@@ -37,6 +37,7 @@ both use it. It either returns a profile or refuses and names every problem it f
 | Settings, hooks, MCP servers from the lane or anywhere else | The seat is started with an empty settings-source list and `--strict-mcp-config` with an empty server list. Only the profile's own `--settings` apply. A planted `.claude/settings.json` or `.mcp.json` in the clone is never read. |
 | File tools outside the two directories | `--restricted` confines Edit, Write, Read, Glob and Grep to the working directory plus the RETURN directory. |
 | Agent-config names at the top of each root | Edit, Write, MultiEdit and NotebookEdit are denied on `activation/`, `.levain/`, `.claude/`, `.codex/` and `.mcp.json` directly under both roots. The sandbox also denies Bash writes to the same names. Only the check made before launch looks at every depth (see below). |
+| A tracked `activation/` directory below the lane's top level | When the launch exempts one (see below), the sandbox denies Bash writes to it and Edit, Write, MultiEdit and NotebookEdit are denied on it, so the seat can read it and never change it. |
 | `.git` paths that run code or carry configuration | `.git/hooks`, `.git/config`, `.git/info`, `.git/modules` and `.git/worktrees` are denied to the file tools and to Bash writes. |
 | Reading the launcher key directory | A Read rule and the sandbox's `denyRead` both name it. |
 | Loopback and local services | The sandbox binds nothing locally, allows no Unix sockets, and denies `localhost`, `127.0.0.1` and `::1`. |
@@ -51,11 +52,31 @@ Edit rule also refuses the Write tool while a Write rule alone did not. All four
 
 - the lane or RETURN directory is a symlink, is not a directory, or the two overlap;
 - either directory overlaps the launcher key directory, or sits inside `~/.claude`;
-- either directory already holds an agent-config name (a gitfile or a nested `.git` in the lane counts);
+- either directory already holds an agent-config name (a gitfile or a nested `.git` in the lane counts), with one
+  exception below;
 - the Python that runs the seat's hooks, or the `claude` binary, is a relative path, or passes through or lives inside a seat root;
 - the levain package itself is inside a seat root;
 - the host's managed Claude Code settings conflict with the profile;
 - a seat-egress grant is supplied without a lease, or the lane is not below the grant's lanes parent.
+
+### The tracked `activation/` exemption
+
+Levain's own repository ships `levain/templates/activation/` (and the Codex adapter's) as package data, so a seat on
+it would otherwise refuse. A lease launch passes the commit it checked the lane out at, and the builder exempts a
+directory named `activation` below the lane's top level when:
+
+- git tracks files under it in that commit. The launcher reads the commit's tree from the lane's object store with
+  `git ls-tree`, with no hooks, no global or system configuration and no replace refs, before the seat exists. The
+  working tree and the index are never the source;
+- every tracked entry under it is a regular file (never a symlink or a submodule), and the working tree holds exactly
+  those files, with the same bytes and the same executable bit, and only the directories that hold them;
+- nothing inside it is a symlink or another agent-config name.
+
+An exempt directory is added to the sandbox's write denials and to the file tools' deny rules. Anything else still
+refuses, and the refusal names the reason (for example `... (not exempt: hooks/extra.py is not tracked at the base)`).
+Only `activation` qualifies. `.claude`, `.codex`, `.levain`, `.mcp.json` and `.git` never do, tracked or not, and an
+`activation/` at the lane's top level still refuses. The canary and `levain seat launch --dry-run` pass no commit, so
+they exempt nothing.
 
 ### Hooks the profile installs
 
@@ -73,6 +94,11 @@ hook run the push described under seat egress.
   rule (the launch check refuses one that already exists), and a Write to a `.git` file of the root outside the five paths
   reaches a permission prompt instead of a hard refusal.
 - The deny rules name those agent-config paths at the top of each root only. The launch check walks the whole tree and refuses a root that already holds one at any depth, but a nested one (for example `sub/.claude/settings.json`) written during the turn is not denied. The seat loads no settings from its roots, so it is inert for the seat, but it can be committed and, with a seat-egress grant, pushed to `seat/<lane key>` on the remote, where an ordinary Claude Code session that checks the branch out would read it. Review that branch without checking it out (for example `git log -p` and `git show <branch>:<path>`).
+- The tracked `activation/` exemption trusts the commit the operator named and the clone the launcher made from it: it
+  proves the directory matches that commit, not that the commit's contents are safe. The seat loads nothing from it.
+  Its deny rules are the same kind as the other ones, measured for the other names and not yet measured on this path
+  by the canary. A working tree that git would check out differently from the stored bytes (an `eol` or filter
+  attribute) refuses, because the bytes then differ.
 - NotebookEdit is not in the seat's tool set, because there is no race probe for it yet (see P9 below).
 
 ## The canary: `levain seat canary`
