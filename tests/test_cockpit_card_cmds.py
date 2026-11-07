@@ -234,7 +234,12 @@ def _pending_consent_copy_lines(tmp_path: Path, monkeypatch, keys: "list[str] | 
 @needs_browser
 def test_a_pending_consent_row_with_a_passkey_answer_draws_no_copy_lines(tmp_path, monkeypatch) -> None:
     assert _pending_consent_copy_lines(tmp_path, monkeypatch, ["allow", "deny"]) == []
-    assert _pending_consent_copy_lines(tmp_path / "t3", monkeypatch, ["deny"]) == []
+
+
+@needs_browser
+def test_a_pending_t3_row_with_deny_only_choices_keeps_only_the_allow_copy_line(tmp_path, monkeypatch) -> None:
+    """A passkey never signs a T3 allow, so the terminal key is the only allow route: its line stays, the deny line goes."""
+    assert _pending_consent_copy_lines(tmp_path, monkeypatch, ["deny"]) == ["copy allow"]
 
 
 @needs_browser
