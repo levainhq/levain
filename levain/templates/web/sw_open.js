@@ -67,7 +67,9 @@
   const ITEM_OK = /^[A-Za-z0-9_.:-]{1,64}$/;
   const landTarget = () => {
     try {
-      const p = location.pathname.replace(/[^A-Za-z0-9/_.-]/g, "").slice(0, 60) || "/";
+      // decode the percent-encoded pathname, keep it only when wholly inside the server's grammar (else "/"); never strip characters
+      let p = "/";
+      try { const d = decodeURIComponent(location.pathname); if (/^\/(?!\/)[A-Za-z0-9/_.-]{0,60}$/.test(d)) p = d; } catch (_) { p = "/"; }
       const q = new URLSearchParams(location.search), parts = [];
       const v = q.get("view"), it = q.get("item");
       if (v !== null && /^[a-z]{1,20}$/.test(v)) parts.push("view=" + v);
@@ -190,8 +192,11 @@
     }
     return entries;
   }
+  // Answers "busy" (a check is already running: it tells for itself), "taken" (forwarded this page), "retry" (an entry is waiting on
+  // the tray: ONE more look is scheduled, and it tells the plain resume if it too finds nothing) or "none" (looked, nothing to take).
   async function resumeShown(again) {
-    if (!haveCache || checking) return false;
+    if (!haveCache) return "none";
+    if (checking) return "busy";
     checking = true;
     let taken = false, had = 0;
     try {
@@ -200,12 +205,20 @@
       had = entries.length;
       if (had) taken = await takeShown(cache, entries, new URL(location.href), true);
     } catch (_) { /* no cache: nothing pending */ } finally { checking = false; }
-    if (!taken && had && !again && document.visibilityState === "visible") setTimeout(() => { resumeShown(true); }, 1500);
-    return taken;
+    if (taken) return "taken";
+    if (had && !again && document.visibilityState === "visible") {
+      // the tray may not have caught up: look once more, but only if the app is still in front when the timer fires
+      setTimeout(() => {
+        if (document.visibilityState !== "visible") return;
+        resumeShown(true).then((r) => { if (r === "none") postLanding("resume"); });
+      }, 1500);
+      return "retry";
+    }
+    return "none";
   }
   document.addEventListener("visibilitychange", () => {
     if (document.visibilityState !== "visible") return;
-    resumeShown(false).then((taken) => { if (!taken) postLanding("resume"); });
+    resumeShown(false).then((r) => { if (r === "none") postLanding("resume"); });
   });
   // The LAUNCH FALLBACK. On the iPhone Home Screen app a tapped push can open the app at the bare '/' without ever running the
   // worker's notificationclick (11-06: pings 607-609 shown, no click, no `opens` row), so the target is lost. The worker writes

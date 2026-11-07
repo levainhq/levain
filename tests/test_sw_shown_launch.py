@@ -220,3 +220,34 @@ def test_landings_carry_the_key_a_target_without_a_token_and_the_resume_one_is_t
     assert got["nonBare"]["targets"] == ["/?view=needs"], got["nonBare"]            # the load landing names where the page was, query kept to view/item
     assert got["inTrayLater"]["hows"] == ["load", "resume"], got["inTrayLater"]       # 31 s after the load: a plain resume is told
     assert got["throttle"]["hows"] == ["load", "resume"], got["throttle"]            # four returns inside 30 s: told ONCE
+
+
+# --- L3 round 1 fixes (1106-53, tapcard3): the busy resume, the stale retry ---------------------------------------------
+
+@needs_node
+def test_a_resume_that_retries_tells_no_plain_resume_before_the_forward() -> None:
+    got = _resume()
+    assert got["retrySkew"]["assigned"] == [NC] and got["retrySkew"]["hows"] == ["load", "resume>shown"], got["retrySkew"]
+    # in the tray at the retry as well: nothing was taken, so ONE plain resume is told, after the retry
+    assert got["retryNone"]["assigned"] == [] and got["retryNone"]["hows"] == ["load", "resume"], got["retryNone"]
+
+
+@needs_node
+def test_a_resume_while_a_check_is_running_tells_no_spurious_resume() -> None:
+    got = _resume()
+    assert got["burst"]["assigned"] == [NC] and got["burst"]["hows"] == ["load", "resume>shown"], got["burst"]
+
+
+@needs_node
+def test_the_retry_does_nothing_when_the_app_went_hidden_again() -> None:
+    got = _resume()
+    assert got["retryHidden"]["assigned"] == [] and got["retryHidden"]["kept"] is True, got["retryHidden"]   # the entry stays for a later launch
+
+
+@needs_node
+def test_a_landing_target_is_the_decoded_path_inside_the_grammar_or_slash_never_mangled() -> None:
+    got = _resume()
+    assert got["encPath"]["targets"] == ["/?view=needs"], got["encPath"]          # '/my doc' is refused, not turned into '/my20doc'
+    assert got["encOk"]["targets"] == ["/sign/9?view=needs"], got["encOk"]
+    assert got["encSlash"]["targets"] == ["/"], got["encSlash"]
+    assert got["encItem"]["targets"] == ["/?view=needs"], got["encItem"]           # a trailing newline is not an item

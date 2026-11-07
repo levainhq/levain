@@ -204,14 +204,19 @@ const fire = async (t, o, ev = {}) => { for (const fn of (o[t] || [])) fn(ev); a
     // The app coming forward RESUMES the document (no load): visibilitychange -> visible judges the 'shown' entries again. Each
     // case: a NEW document at `href` with no entry, then the entry is written (and the tray set), then the page turns visible.
     const TRAY = { tag: 'np-607', data: { ping: 607 } };
-    const resume = async (name, { href = 'https://box.example/', skew = 0, st = true, mid = [], entry = {}, none = false, hidden = false, cycles = 1, retryTray = null } = {}) => {
+    const resume = async (name, { href = 'https://box.example/', skew = 0, st = true, mid = [], entry = {}, none = false, hidden = false, cycles = 1, retryTray = null, burst = false, hideBeforeRetry = false } = {}) => {
       store.clear(); log.assigned.length = 0; log.landed.length = 0; standalone = st; tray = []; navType = null; trayThrows = false; noGetN = false; onGetN = null;
       skewMs = 0;
       await boot(href);
       skewMs = skew;   // the load landing is told at boot; a resume more than 30 s later is told again
       if (!none) putShown(entry);
       tray = mid;
-      for (let i = 0; i < cycles; i++) { sandbox.document.visibilityState = hidden ? 'hidden' : 'visible'; await fire('visibilitychange', docHandlers); }
+      for (let i = 0; i < cycles; i++) {
+        sandbox.document.visibilityState = hidden ? 'hidden' : 'visible';
+        if (burst) { for (const fn of (docHandlers.visibilitychange || [])) { fn({}); fn({}); } await tick(); }   // two returns before the first check settles
+        else await fire('visibilitychange', docHandlers);
+      }
+      if (hideBeforeRetry) sandbox.document.visibilityState = 'hidden';   // the app went away again inside the 1.5 s
       if (retryTray) tray = retryTray;
       await new Promise((r) => setTimeout(r, 1700));   // the 1.5 s retry of a resume that took nothing runs inside this case
       log[name] = { assigned: log.assigned.slice(), kept: shownKeys().length > 0, hows: log.landed.map((l) => l.body.how), targets: log.landed.map((l) => l.body.target), post: log.landed[0] };
@@ -221,6 +226,14 @@ const fire = async (t, o, ev = {}) => { for (const fn of (o[t] || [])) fn(ev); a
     await resume('inTray', { mid: [TRAY] });                       // still showing: no move; the resume landing is throttled 30 s after the load's
     await resume('inTrayLater', { mid: [TRAY], skew: 31000 });     // 31 s on: no move, told as a plain resume
     await resume('retry', { mid: [TRAY], retryTray: [] });         // gone by the 1.5 s retry: forwarded then
+    await resume('retrySkew', { mid: [TRAY], retryTray: [], skew: 31000 });   // 31 s on: the retry forwards, and NO plain resume was told first
+    await resume('retryNone', { mid: [TRAY], skew: 31000 });                   // in the tray at the retry too: one plain resume, told after it
+    await resume('retryHidden', { mid: [TRAY], retryTray: [], hideBeforeRetry: true });   // hidden again by the retry: it takes and moves nothing
+    await resume('burst', { skew: 31000, burst: true });                       // two returns at once: one check; the busy one tells nothing
+    await resume('encPath', { href: 'https://box.example/my%20doc?view=needs', none: true });          // outside the grammar once decoded: '/'
+    await resume('encOk', { href: 'https://box.example/sign/%39?view=needs', none: true });            // decodes to an allowed path
+    await resume('encSlash', { href: 'https://box.example/%2F%2Fx', none: true });                      // decodes to '//x': never a target
+    await resume('encItem', { href: 'https://box.example/?view=needs&item=a%0A', none: true });         // an item ending in a newline is no item
     await resume('expired', { entry: { at: Date.now() - 181000 } });
     await resume('fresh', { entry: { at: Date.now() - 170000 } });
     await resume('nonBare', { href: 'https://box.example/?view=needs' });
