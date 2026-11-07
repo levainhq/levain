@@ -7,14 +7,17 @@ from __future__ import annotations
 
 import argparse
 import os
+import re
+import shlex
 import subprocess
 import sys
 import tempfile
 from pathlib import Path
 
-from scripts.vm_harness.driver import SlotPlan, VmAdapters, run_on_vm
+from scripts.vm_harness.driver import GuestError, SlotPlan, VmAdapters, run_on_vm
 
-TART = "/Users/phillipclapham/.local/bin/tart"
+TART = os.environ.get("TART_BIN", "/Users/phillipclapham/.local/bin/tart")
+CLONE_RE = re.compile(r"vend-[A-Za-z0-9_][A-Za-z0-9._-]*")
 SSH = "/usr/bin/ssh"
 SSH_OPTS = ["-o", "StrictHostKeyChecking=no", "-o", "UserKnownHostsFile=/dev/null", "-o", "LogLevel=ERROR",
             "-o", "PreferredAuthentications=password,keyboard-interactive", "-o", "PubkeyAuthentication=no",
@@ -27,18 +30,30 @@ def make_ssh(vm: str, askpass_dir: Path):
     os.chmod(askpass, 0o700)
     env = dict(os.environ, SSH_ASKPASS=str(askpass), SSH_ASKPASS_REQUIRE="force", DISPLAY="x")
 
+    cached: list[str] = []
+
     def ip() -> str:
+        if cached:
+            return cached[0]
         r = subprocess.run([TART, "ip", vm, "--wait", "60"], capture_output=True, text=True, timeout=90, check=True)
-        return r.stdout.strip().splitlines()[-1]
+        lines = r.stdout.strip().splitlines()
+        if not lines:
+            raise RuntimeError(f"tart ip {vm} printed nothing")
+        cached.append(lines[-1])
+        return cached[0]
+
+    def remote(argv) -> list[str]:
+        # OpenSSH joins its trailing args with spaces and the remote shell re-parses them: send ONE quoted command
+        return [shlex.join(str(a) for a in argv)]
 
     def guest(argv, timeout=60) -> str:
-        r = subprocess.run([SSH, *SSH_OPTS, f"admin@{ip()}", *argv], capture_output=True, text=True, timeout=timeout, env=env)
+        r = subprocess.run([SSH, *SSH_OPTS, f"admin@{ip()}", *remote(argv)], capture_output=True, text=True, timeout=timeout, env=env)
         if r.returncode:
-            raise RuntimeError(f"guest {list(argv)[:7]} rc={r.returncode}: {r.stderr.strip()[-300:]}")
+            raise GuestError(r.returncode, f"guest {list(argv)[:7]}: {r.stderr.strip()[-300:]}")
         return r.stdout
 
     def spawn(argv):
-        return subprocess.Popen([SSH, *SSH_OPTS, f"admin@{ip()}", *argv], stdout=subprocess.DEVNULL,
+        return subprocess.Popen([SSH, *SSH_OPTS, f"admin@{ip()}", *remote(argv)], stdout=subprocess.DEVNULL,
                                 stderr=subprocess.DEVNULL, stdin=subprocess.DEVNULL, env=env)
     return guest, spawn
 
@@ -50,7 +65,7 @@ def main(argv: list[str]) -> int:
     ap.add_argument("--slot", type=int, default=8)
     ap.add_argument("--lease", default="lease-vmdriver-real")
     a = ap.parse_args(argv)
-    if not a.vm.startswith("vend-"):
+    if not CLONE_RE.fullmatch(a.vm):
         raise SystemExit(f"refusing: clone VM names start with 'vend-' (got {a.vm!r}); existing VMs are never touched")
     with tempfile.TemporaryDirectory() as td:
         guest, spawn = make_ssh(a.vm, Path(td))

@@ -21,7 +21,9 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import time
+import uuid
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, Iterable
@@ -212,13 +214,31 @@ class AdapterError(Exception):
     """A real adapter could not do its job (a refusal, a timeout, a slot mismatch)."""
 
 
+class GuestError(RuntimeError):
+    """A guest command exited non-zero. ``rc`` is its exit status (255 / 1 / ... from ssh or sudo itself)."""
+
+    def __init__(self, rc: int, msg: str = "") -> None:
+        super().__init__(f"rc={rc}: {msg}")
+        self.rc = rc
+
+
+SESSION_RE = re.compile(r"s-[0-9a-f]{16}")        # levain.slot.grammar.SESSION_RE
+SLOT_TAG_RE = re.compile(r"e[0-9]{1,2}")
+ARG_RE = re.compile(r"[A-Za-z0-9_][A-Za-z0-9._-]{0,127}")   # the only shape a guest argv token may take
+ABSENT_RC = 3            # guest_ops get: the file is not there
+WAIT_PROBE_S = 20.0
+
+
 class VmAdapters:
     """The driver's seams against a running clone VM. ``guest(argv, timeout) -> stdout`` runs one command in the
-    guest (raising on a non-zero exit); ``spawn(argv)`` starts a long-lived guest process and returns an object
-    with ``poll()`` and ``terminate()``. Both are injected, so the ordering logic is tested with no VM.
+    guest (raising :class:`GuestError` on a non-zero exit); ``spawn(argv)`` starts a long-lived guest process and
+    returns an object with ``poll()``, ``terminate()`` (and ``wait()`` / ``kill()`` when real). Both are injected, so
+    the ordering logic is tested with no VM.
 
     The journal-before-vendor guarantee: ``mint`` returns the id the moment ``prepare`` has answered, and the vendor
-    cannot start until ``render`` writes the ack, which :func:`start_session` only reaches after journaling the id."""
+    cannot start until ``render`` writes the ack, which :func:`start_session` only reaches after journaling the id.
+    Every rendezvous tag is unique per run and the exchange dir is emptied of old tags first, so a previous run's
+    ack or final can never satisfy this one."""
 
     OPS = ("sudo", "-n", "/usr/local/bin/python3.13", "-I", "/tmp/fire/guest_ops.py")
     DISPATCH = ("sudo", "-n", "-u", "_levain_dispatch", "/usr/bin/env", "PATH=/usr/bin:/bin",
@@ -226,37 +246,51 @@ class VmAdapters:
 
     def __init__(self, guest: Callable[..., str], spawn: Callable[[list[str]], object], *,
                  clock: Callable[[], float] = time.monotonic, sleep: Callable[[float], object] = time.sleep,
-                 prepare_s: float = 90.0, run_s: float = 180.0, tag_prefix: str = "drv") -> None:
+                 prepare_s: float = 90.0, run_s: float = 180.0, tag_prefix: str = "drv",
+                 nonce: Callable[[], str] = lambda: uuid.uuid4().hex[:12]) -> None:
         self._guest, self._spawn, self._clock, self._sleep = guest, spawn, clock, sleep
-        self.prepare_s, self.run_s, self.tag_prefix = prepare_s, run_s, tag_prefix
-        self._n = 0
+        self.prepare_s, self.run_s, self.tag_prefix, self._nonce = prepare_s, run_s, tag_prefix, nonce
+        self._fresh = False
         self._tags: dict[str, str] = {}     # session -> tag
         self._planned: dict[str, int] = {}  # session -> the slot the plan said
+        self._actual: dict[str, str] = {}   # session -> the slot prepare reported (e<n>)
         self._children: list[object] = []
+        self._all_tags: list[str] = []      # every tag spawned, minted or not: close() cancels each
         self._child_of: dict[str, object] = {}   # session -> its guest dispatch process
 
     def ops(self, verb: str, arg: str, timeout: float = 60) -> str:
-        return self._guest([*self.OPS, verb, str(arg)], timeout)
+        arg = str(arg)
+        if not ARG_RE.fullmatch(arg) and arg != "-":   # nothing guest-controlled reaches a remote argv unchecked
+            raise AdapterError(f"refusing to pass {arg[:40]!r} to the guest ({verb})")
+        return self._guest([*self.OPS, verb, arg], timeout)
 
-    def _get(self, name: str) -> dict | None:
+    def _get(self, name: str, timeout: float = 60) -> dict | None:
+        """The named rendezvous record, None ONLY when the guest says the file is absent (rc 3). Any other failure
+        (ssh down, sudo refused, a refused symlink, a probe timeout) is an AdapterError, never "not there yet"."""
         try:
-            text = self.ops("get", name)
-        except Exception:   # noqa: BLE001 - an absent file is exit 3; anything else surfaces at the deadline
-            return None
+            text = self.ops("get", name, timeout)
+        except AdapterError:
+            raise
+        except GuestError as e:
+            if e.rc == ABSENT_RC:
+                return None
+            raise AdapterError(f"guest get {name} failed: {e}") from e
+        except Exception as e:   # noqa: BLE001 - a timeout or a spawn failure
+            raise AdapterError(f"guest get {name} failed: {type(e).__name__}: {e}") from e
         try:
             obj = json.loads(text)
         except ValueError:
-            return None
+            return None    # a record being replaced; the writer renames atomically, so this is not a torn read
         return obj if isinstance(obj, dict) else None
 
     def _wait(self, tag: str, names: tuple[str, ...], deadline_s: float, child: object, what: str) -> tuple[str, dict]:
         end = self._clock() + deadline_s
         while True:
             for n in names:
-                got = self._get(f"{tag}.{n}.json")
+                got = self._get(f"{tag}.{n}.json", self._probe(end))
                 if got is not None:
                     return n, got
-            err = self._get(f"{tag}.error.json")
+            err = self._get(f"{tag}.error.json", self._probe(end))
             if err is not None:
                 raise AdapterError(f"guest dispatch failed before {what}: {err.get('exc')}")
             if child.poll() is not None:
@@ -265,42 +299,62 @@ class VmAdapters:
                 raise AdapterError(f"timed out after {deadline_s}s waiting for {what}")
             self._sleep(1.0)
 
+    def _probe(self, end: float) -> float:
+        """One probe may not outlive the deadline it serves (a floor of 1 s so a probe can still answer)."""
+        return max(1.0, min(WAIT_PROBE_S, end - self._clock()))
+
     # the seams
     def alloc(self, slot: int, lease: str) -> None:
+        if not self._fresh:   # stale tags of an earlier run are removed (and proven gone) before anything is minted
+            left = self.ops("fhclean", "-").strip()
+            if left != "0":
+                raise AdapterError(f"the guest exchange dir still holds {left} old rendezvous entries")
+            self._fresh = True
         state = self.ops("slotstate", slot).strip()
         if state != "reusable":
             raise AdapterError(f"slot {slot} is {state!r}, not reusable")
 
     def mint(self, slot: int, lease: str) -> str:
-        self._n += 1
-        tag = f"{self.tag_prefix}{slot}x{self._n}"
+        tag = f"{self.tag_prefix}{slot}x{self._nonce()}"
+        if not ARG_RE.fullmatch(tag):
+            raise AdapterError(f"bad rendezvous tag {tag!r}")
+        self._all_tags.append(tag)
         child = self._spawn([*self.DISPATCH, tag])
         self._children.append(child)
         _, prepared = self._wait(tag, ("prepared",), self.prepare_s, child, "prepare")
-        session = prepared.get("session")
+        session, actual = prepared.get("session"), prepared.get("slot")
         if not isinstance(session, str) or not session:
             raise AdapterError(f"prepared record carries no session id: {prepared!r}")
+        if not SESSION_RE.fullmatch(session):   # the record is guest-written: nothing else goes to a journal or an argv
+            raise AdapterError(f"prepared record carries a malformed session id: {session[:40]!r}")
+        if not isinstance(actual, str) or not SLOT_TAG_RE.fullmatch(actual):
+            raise AdapterError(f"prepared record carries no slot tag: {actual!r}")
         self._tags[session] = tag
         self._child_of[session] = child
         self._planned[session] = slot
+        self._actual[session] = actual
         return session
 
     def render(self, session: str) -> None:
         tag = self._tags[session]
         got = self.ops("slotof", session).strip()
-        want = f"e{self._planned[session]}"
+        want, actual = f"e{self._planned[session]}", self._actual[session]
+        if got != actual:
+            raise AdapterError(f"session {session} is leased in slot {got!r}, prepare said {actual!r}: not rendering")
         if got != want:   # the id is journaled by now, so the REVOKE walk covers it; the vendor must not run
             raise AdapterError(f"session {session} landed in slot {got!r}, the plan said {want!r}: not rendering")
         self.ops("put", f"{tag}.journaled")
         child = self._child_of[session]
-        name, _ = self._wait(tag, ("final",), self.run_s, child, "the vendor to finish")
-        assert name == "final"
+        _, final = self._wait(tag, ("final",), self.run_s, child, "the vendor to finish")
+        if final.get("poll") != 0 or final.get("session") != session:   # exit 2, GATE_UNPROVEN, None (still running)
+            raise AdapterError(f"the vendor did not finish cleanly: final={final!r}")
 
     def revoke(self, session: str) -> str:
         return self.ops("revoke", session)
 
     def slot_check(self, slot: int) -> bool:
-        return self.ops("slotstate", slot).strip() == "reusable"
+        slots = {slot} | {int(a[1:]) for s, a in self._actual.items() if self._planned.get(s) == slot}
+        return all(self.ops("slotstate", n).strip() == "reusable" for n in sorted(slots))
 
     def lister(self) -> str:
         return self._guest(["/bin/ps", "-Ao", "pid,etime,pcpu,ucomm,uid"], 60)
@@ -310,11 +364,25 @@ class VmAdapters:
         return None if v == "none" else int(v)
 
     def close(self) -> None:
+        """Cancel every remote dispatcher (killing the local ssh client does not), then terminate -> wait -> kill ->
+        reap the local children. Best effort; the REVOKE walk and the uid scan are the proof."""
+        for tag in self._all_tags:
+            try:
+                self.ops("cancel", tag, 20)
+            except Exception:   # noqa: BLE001 - absent pid file (finished) or a dead guest
+                pass
         for c in self._children:
             try:
                 if c.poll() is None:
                     c.terminate()
-            except Exception:   # noqa: BLE001 - best effort; the REVOKE walk and the uid scan are the proof
+                    try:
+                        c.wait(5)
+                    except Exception:   # noqa: BLE001
+                        c.kill()
+                        c.wait(5)
+                else:
+                    c.wait(0)
+            except Exception:   # noqa: BLE001
                 pass
 
 

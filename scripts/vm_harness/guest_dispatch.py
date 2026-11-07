@@ -24,17 +24,34 @@ from levain.slot import layout, stage  # noqa: E402
 from levain.slot.dispatch_runtime import DispatchControlPort, HelperSlotRuntime  # noqa: E402
 from levain.slot.runtime_grammar import RENDER_FORMAT, parse_stdin  # noqa: E402
 from levain.slot.services import dispatch_run as D  # noqa: E402
-from levain.slot.supervisor import pick_routes, read_base_map  # noqa: E402
+from levain.slot.supervisor import pick_routes, prepare_answer, read_base_map  # noqa: E402
 
 FH = Path("/private/tmp/fh")
 ACK_S = 60
 STORE = Path("/private/var/levain")
 CONTROL = Path("/private/var/run/levain/control/control.sock")
-tag = sys.argv[1]
+tag = ""   # set by main(); one per host run, never reused (the host also empties FH first)
 
 
 def say(name: str, obj: object) -> None:
-    (FH / f"{tag}.{name}.json").write_text(json.dumps(obj, default=str) + "\n")
+    """Atomic: a fresh temp file, fsync, rename, so the host never reads a half-written record."""
+    tmp = FH / f".{tag}.{name}.tmp"
+    with open(tmp, "w") as f:
+        f.write(json.dumps(obj, default=str) + "\n")
+        f.flush()
+        os.fsync(f.fileno())
+    os.replace(tmp, FH / f"{tag}.{name}.json")
+
+
+def claim() -> None:
+    """Take this tag's namespace exactly once: O_EXCL on <tag>.pid. Any pre-existing rendezvous artifact of the
+    tag (a stale ack above all) refuses the run before anything is prepared."""
+    stale = sorted(p.name for p in FH.glob(f"{tag}.*"))
+    if stale:
+        raise RuntimeError(f"rendezvous artifacts of {tag} already exist: {stale[:4]}")
+    fd = os.open(FH / f"{tag}.pid", os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o644)
+    with os.fdopen(fd, "w") as f:
+        f.write(str(os.getpid()) + "\n")
 
 
 def opt(name: str, default: str) -> str:
@@ -46,25 +63,35 @@ def opt(name: str, default: str) -> str:
 
 class RendezvousRuntime(HelperSlotRuntime):
     def _run(self, verb, *args, **kw):
-        if verb == "render":   # args[0] is the session id prepare returned
-            say("prepared", {"session": args[0], "t": time.time()})
-            end = time.monotonic() + ACK_S
-            while not (FH / f"{tag}.journaled").exists():
-                if time.monotonic() >= end:
-                    raise RuntimeError(f"no journal ack for {args[0]} within {ACK_S}s: refusing to render")
-                time.sleep(0.25)
-        return super()._run(verb, *args, **kw)
+        if verb == "render":   # args[0] is the session id prepare returned; no ack, no vendor
+            self._wait_ack(args[0])
+        out = super()._run(verb, *args, **kw)
+        if verb == "prepare":   # publish the id the moment it exists: before staging, so a hang after it is revocable
+            session, slot = prepare_answer(out, host=self.host, store=self._store)
+            say("prepared", {"session": session, "slot": f"e{slot}", "t": time.time()})
+        return out
+
+    def _wait_ack(self, session: str) -> None:
+        end = time.monotonic() + ACK_S
+        while not (FH / f"{tag}.journaled").exists():
+            if time.monotonic() >= end:
+                raise RuntimeError(f"no journal ack for {session} within {ACK_S}s: refusing to render")
+            time.sleep(0.25)
 
     def _render_blob(self, req):
-        routes = pick_routes(read_base_map(layout.base_routes_path(self.host)), req.harness, "passthrough")
+        routes = pick_routes(read_base_map(layout.base_routes_path(self.host)), req.harness, "passthrough",
+                             egress=False)   # as HelperSlotRuntime._render_blob: the ticket lists no egress route
         data = canon.canonical_bytes({"format": RENDER_FORMAT, "vendor": req.harness, "routes": list(routes),
                                       "model": req.model, "hooks": []})
         parse_stdin("render", data)
         return data
 
 
-def main() -> None:
+def main(t: str) -> None:
+    global tag
+    tag = t
     os.chdir(str(FH))
+    claim()
     index_dir = STORE / "dispatch" / "sessions"
     rt = RendezvousRuntime(host="darwin", control_socket=CONTROL, store=STORE,
                            workspace=lambda req, staging: stage.make_bundle(
@@ -91,7 +118,9 @@ def main() -> None:
         say("abort", {"rc": child.abort()})
 
 
-try:
-    main()
-except BaseException as exc:   # noqa: BLE001 - the host reads this file; a silent exit would be a hang
-    say("error", {"exc": f"{type(exc).__module__}.{type(exc).__name__}: {exc}", "tb": traceback.format_exc()[-2500:]})
+if __name__ == "__main__":
+    tag = sys.argv[1]
+    try:
+        main(tag)
+    except BaseException as exc:   # noqa: BLE001 - the host reads this file; a silent exit would be a hang
+        say("error", {"exc": f"{type(exc).__module__}.{type(exc).__name__}: {exc}", "tb": traceback.format_exc()[-2500:]})
