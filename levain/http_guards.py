@@ -84,10 +84,11 @@ def _redact_query(text: str) -> str:
 # own JSON. Lock everything else off. Slice 2a moved the one inline <style> block out
 # to a served `/dashboard.css`, so `style-src` is now `'self'` — no `'unsafe-inline'`
 # (the Slice-2 tightening the prior comment flagged). `frame-ancestors 'none'` denies
-# clickjacking / hostile-iframe embedding (paired with X-Frame-Options below).
+# clickjacking / hostile-iframe embedding (paired with X-Frame-Options below). `media-src blob:` is the one
+# media source: the premium voice player plays a fetched response as a blob: <audio>; no network media origin is named.
 _CSP = (
     "default-src 'none'; script-src 'self'; style-src 'self'; "
-    "connect-src 'self'; img-src 'self'; manifest-src 'self'; base-uri 'none'; form-action 'none'; "
+    "connect-src 'self'; img-src 'self'; media-src blob:; manifest-src 'self'; base-uri 'none'; form-action 'none'; "
     "frame-ancestors 'none'"
 )
 
