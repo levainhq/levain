@@ -1635,7 +1635,7 @@ def pick_slot(views: Sequence[SlotView], *, slot_class: str, kind: str, vendor: 
             return marked[0].slot
         free = [v for v in reusable if not v.operator_held]
         if not free:
-            raise Refused(f"no-free-slot:{slot_class}", "no reusable credential-free slot")
+            raise Refused(f"no-free-slot:{slot_class}", "no reusable credential-free slot (a slot holding a credential or baseline is not one)")
         if slot_class == "egress" and len(free) < 2:
             raise Refused("operator-slot-reserved", "the last credential-free egress slot is the operator's")
         return free[0].slot

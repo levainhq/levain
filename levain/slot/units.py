@@ -13,6 +13,13 @@ restart does not restart the dependant). launchd has no ordering key, so on macO
 order setup bootstraps the jobs in; at boot launchd starts them together, and each non-root service
 exits until its run dir is there (§22), restarting under ``KeepAlive``.
 
+A fresh Linux setup therefore logs two ``Main process exited, code=exited, status=75/TEMPFAIL`` lines (control and
+dispatch_run) and each restarts about a second later: setup starts every unit before it writes the operator record, its
+LAST act (§23, so only a complete install reads as set up), and those two services exit 75 (``no-operator``) until it
+exists. This is by design, not a failure: ``systemctl --failed`` stays clean and the units are active within seconds.
+The start is not moved after the record because a run dying between the two would then leave an install that reads as
+complete with nothing running; the services' own stderr line names the cause.
+
 The reaper is ONE long-running root service; its pass interval and its wake socket are inside its
 program, so no unit here carries a timer or a start interval (§23).
 """
