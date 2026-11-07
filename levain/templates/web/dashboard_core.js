@@ -9064,9 +9064,27 @@ for (const type of ["touchstart", "wheel", "pointerdown", "click", "keydown"]) d
         openNeedsFocus(it, null);
         return;
       }
-      // "no longer waiting" is said only of a whole listing: a panel that carries an error or a note (a partial read says so there) is not one
-      if (!dec.error && !dec.note) needsGoneNote();
-      needsDeepJump(run, Date.now() + PHONE_JUMP_WAIT_MS);   // the fallback to plain Needs gets its own wait, not the spent one
+      // The item's own id is a name the card number does not carry: flow numbers its cards with the BAND number, not 1 + the id's hex
+      // (11-06, np-0b62cd3b: the ping's `item=np-...` named no card). The band read pairs each item's own id (`subject.id`) with its
+      // card number (`question`), so ask it before saying the item is gone.
+      const gone = () => {
+        if (run !== phoneJumpRun) return;
+        // "no longer waiting" is said only of a whole listing: a panel that carries an error or a note (a partial read says so there) is not one
+        if (!dec.error && !dec.note) needsGoneNote();
+        needsDeepJump(run, Date.now() + PHONE_JUMP_WAIT_MS);   // the fallback to plain Needs gets its own wait, not the spent one
+      };
+      let p = null;
+      try { p = typeof bandRead === "function" ? bandFetch(false) : null; } catch (e) { p = null; }
+      if (!p || typeof p.then !== "function") { gone(); return; }
+      p.then((b) => {
+        if (run !== phoneJumpRun) return;
+        const row = (b && Array.isArray(b.items) ? b.items : []).find((x) => x && x.subject && x.subject.id === item && Number.isInteger(x.question));
+        const hit = row && needsWaiting(needsItems(lines)).find((x) => needsIdOf(x) === "question:" + row.question);
+        if (hit) {
+          if (document.querySelector(PHONE_JUMP_TARGET.needs)) needsGo(needsIdOf(hit), true);
+          openNeedsFocus(hit, null);
+        } else gone();
+      }, gone);
       return;
     }
     if (Date.now() < deadline) { window.setTimeout(() => needsItemJump(item, run, deadline), PHONE_JUMP_STEP_MS); return; }

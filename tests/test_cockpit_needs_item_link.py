@@ -145,3 +145,18 @@ def test_a_late_decisions_read_never_replaces_the_view_the_reader_chose(tmp_path
     assert _slow_decisions(tmp_path / "a", monkeypatch, press=False)["modal"] is True
     got = _slow_decisions(tmp_path / "b", monkeypatch, press=True)
     assert got["modal"] is False and got["note"] == "", got
+
+
+@needs_browser
+def test_a_link_naming_the_items_own_id_opens_the_card_the_band_numbers_for_it(tmp_path: Path, monkeypatch) -> None:
+    """11-06, np-0b62cd3b: flow numbers its cards with the BAND number (desk_cards.display_numbers), no longer 1 + the id's hex, so the ping
+    `item=np-<hex>` named no card and the tap landed on the plain strip with "no longer waiting". The page now resolves the id through
+    the band read (an item's `subject.id` is the id the store filed it under, its `question` the card's number). A foreign store's id is
+    `np-...`; the local store's is `q-...`, the same path: codex's card (question 2) is named by its own id, which is no card number."""
+    _home, store = _two_questions(tmp_path, monkeypatch)
+    qid = store.get(2).id
+    _root, src, _ids = _install(tmp_path)
+    with _serve(src, surface_tokens={"browser": "T"}, install_class="reported") as (url, _httpd):
+        out = _drive(tmp_path, f"{url}/?view=needs&item={qid}#write_token=T", [DESKTOP, {"until": ROWS, "ms": 40000}, SETTLE, {"eval": READ}])["values"]
+    got = json.loads(out[-1])
+    assert got["modal"] and got["title"].endswith("· codex") and got["search"] == "" and got["note"] == "", got
