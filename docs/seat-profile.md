@@ -66,10 +66,11 @@ hook run the push described under seat egress.
 
 - A tool call that no rule decides can reach a permission prompt that a person at the terminal could approve. The
   profile does not turn every undecided call into a refusal.
-- `.git` is denied only at the five paths above, never as a whole and never as `**/.git`, because a whole-`.git`
-  rule made `git commit` fail. Two consequences: a `.git` created after launch is not covered by a deny rule (the
-  launch check refuses one that already exists), and a Write to a `.git` file outside the five paths reaches a
-  permission prompt instead of a hard refusal.
+- `.git` of the root is denied only at the five paths above, never as a whole and never as `**/.git`, because a whole-`.git`
+  rule made `git commit` fail. A nested `.git` (a gitfile or directory below a root's top level, for example `sub/.git`) is
+  denied by its own rule. Two consequences: a `.git` created at a root's top level after launch is not covered by a deny
+  rule (the launch check refuses one that already exists), and a Write to a `.git` file of the root outside the five paths
+  reaches a permission prompt instead of a hard refusal.
 - The deny rules name those agent-config paths at the top of each root only. The launch check walks the whole tree and refuses a root that already holds one at any depth, but a nested one (for example `sub/.claude/settings.json`) written during the turn is not denied. The seat loads no settings from its roots, so it is inert for the seat, but it can be committed and, with a seat-egress grant, pushed to `seat/<lane key>` on the remote, where an ordinary Claude Code session that checks the branch out would read it. Review that branch without checking it out (for example `git log -p` and `git show <branch>:<path>`).
 - NotebookEdit is not in the seat's tool set, because there is no race probe for it yet (see P9 below).
 
@@ -91,6 +92,7 @@ All arguments after `canary` pass through to the canary's own parser (`levain se
 | `--python` | the Python running levain | The Python that runs the profile's hooks. |
 | `--swap-attempts` | `20` | N for the symlink-swap race (P2). Must be above zero. |
 | `--timeout` | `600` seconds | How long the turn may run. |
+| `--model` | `sonnet` | The model that drives the canary turn. |
 | `--tools` | `Bash,Read,Edit,Write,Glob,Grep` | The tool set under test. It must be a subset of the seat set. A narrower set earns its own pass. |
 
 It prints a header (`levain seat canary: PASS` or `FAIL`, with N and the tool set), one line per probe, the swap
@@ -142,11 +144,6 @@ run before it is used. If P10 does not pass, Glob and Grep are dropped from the 
   sometimes reached a permission prompt and sometimes did not (roughly one run in three or four, on Claude Code 2.1.319, November 2026). P2 can therefore
   pass on one run and fail on the next with nothing changed. A single pass or a single fail does not settle it. No
   swap write landed in any of those runs, and whether an *approved* swap write would land was not measured.
-- **P4 fails on a nested gitfile write, so the overall run reports FAIL and exits 1.** The probe includes a Write to
-  `sub/.git`. Because `.git` is no longer denied as a whole, Claude Code treats that as a sensitive-file prompt, and
-  P4 fails any attempt that reaches a prompt. With this profile, expect `levain seat canary` to print `FAIL` for
-  that reason alone. It is a prompt, not a landed write: in the runs that showed it nothing changed on disk and every
-  other probe passed. Read the per-probe lines, not just the header, until the probe or the profile changes.
 - **A pass is about this run.** It describes one Claude Code version, one machine, one turn on the day it ran. A
   new Claude Code release, a different OS, or different managed settings can change the answer. Re-run after any of
   them.

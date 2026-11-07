@@ -147,11 +147,12 @@ def test_the_egress_flags_the_page_explains_are_the_creates_own():
 def test_the_canary_flag_table_matches_the_canary_parser(monkeypatch):
     helptext = _canary_help()
     table = set(re.findall(r"^\| `(--[a-z-]+)` \|", TEXT, re.M))
-    assert table == {"--claude-bin", "--python", "--swap-attempts", "--timeout", "--tools"}
+    assert table == {"--claude-bin", "--python", "--swap-attempts", "--timeout", "--model", "--tools"}
     assert table == set(re.findall(r"--[a-z][a-z-]*", helptext)) - {"--help"}
     d = _canary_defaults(monkeypatch)
     assert d["swap_attempts"] == 20 and "| `--swap-attempts` | `20` |" in TEXT
     assert d["timeout"] == 600.0 and "| `--timeout` | `600` seconds |" in TEXT
+    assert d["model"] == "sonnet" and "| `--model` | `sonnet` |" in TEXT
     assert tuple(d["tools"]) == CC_SEAT_TOOLS and ",".join(CC_SEAT_TOOLS) in TEXT
 
 
