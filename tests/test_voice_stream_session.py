@@ -4,6 +4,7 @@ No network, no key store, no real time."""
 from __future__ import annotations
 
 import logging
+import traceback
 
 import pytest
 
@@ -25,12 +26,13 @@ class Clock:
 
 
 class FakeStream:
-    def __init__(self, *, fail_send=False, fail_close=False, text="hello world", partial="hel") -> None:
+    def __init__(self, *, fail_send=False, fail_close=False, text="hello world", partial="hel", poll=None) -> None:
         self.sent: list[bytes] = []
         self.closed = 0
         self.fail_send, self.fail_close = fail_send, fail_close
         self.text, self.partial = text, partial
         self.failed = False
+        self.poll_fn = poll
 
     def send_audio(self, pcm: bytes) -> None:
         if self.fail_send:
@@ -38,6 +40,8 @@ class FakeStream:
         self.sent.append(pcm)
 
     def poll(self) -> StreamUpdate:
+        if self.poll_fn is not None:
+            return self.poll_fn()
         return StreamUpdate(partial=self.partial, final="", failed=self.failed)
 
     def close(self) -> str:
@@ -181,12 +185,26 @@ def test_ceiling_ends_the_session_and_settles_at_120_s(rig):
     assert (row.status, row.units) == ("ok", 120)
 
 
-def test_buffer_is_bounded_and_dropped_at_end(rig):
+def test_buffer_is_bounded_and_taken_once_after_close(rig):
     s = rig.open()
     s.feed(0, PCM_1S[:6400])
     assert len(s.take_audio()) == 6400
-    assert len(s.take_audio()) <= ss.CEILING_SECONDS * BYTES_PER_SECOND
+    assert len(s.take_audio()) == 6400                          # while live, a look leaves it in place
     s.close()
+    assert s.take_audio() == PCM_1S[:6400]                     # the stop-time fallback still has it
+    assert s.take_audio() == b""                               # taken once after the end, then dropped
+
+
+def test_the_audio_survives_an_auto_end_for_the_stop_time_fallback(tmp_path):
+    rig = Rig(tmp_path)
+    fake = FakeStream(text="")
+    s = rig.open(stream=fake)
+    s.feed(0, PCM_1S[:3200])
+    fake.failed = True
+    with refused("provider_failed"):
+        s.feed(1, PCM_1S[:3200])
+    assert s.closed
+    assert s.take_audio() == PCM_1S[:3200] * 2
     assert s.take_audio() == b""
 
 
@@ -353,13 +371,41 @@ def test_unexpected_key_reader_fault_and_factory_fault_release(rig):
     with refused("key_unavailable"):
         rig.open(read_key=boom)
 
+    def not_started(secret):
+        raise ss.StreamNotStarted()
+
+    with refused("provider_failed"):
+        rig.open(factory=not_started)
+    assert [r.status for r in rig.rows()] == ["released", "released"] and len(rig.registry) == 0
+    rig.open()                                                    # the slot came back
+
+
+def test_an_untyped_factory_failure_settles_one_unit(rig):
     def bad_factory(secret):
-        raise ConnectionError("no route")
+        raise ConnectionError("no route")                         # the handshake may have happened
 
     with refused("provider_failed"):
         rig.open(factory=bad_factory)
-    assert [r.status for r in rig.rows()] == ["released", "released"] and len(rig.registry) == 0
-    rig.open()                                                    # the slot came back
+    with refused("provider_failed"):
+        rig.open(factory=lambda secret: None)                     # not a provider stream at all
+    assert [(r.status, r.units) for r in rig.rows()] == [("ok", 1), ("ok", 1)]
+    assert len(rig.registry) == 0
+
+
+@pytest.mark.parametrize("break_at", ["token", "session"])
+def test_a_setup_failure_after_the_factory_closes_the_stream(rig, monkeypatch, break_at):
+    def boom(*a, **k):
+        raise RuntimeError("setup")
+
+    if break_at == "token":
+        monkeypatch.setattr(ss.secrets, "token_urlsafe", boom)
+    else:
+        monkeypatch.setattr(ss, "StreamSession", boom)
+    with refused("internal"):
+        rig.open()
+    assert rig.streams[0].closed == 1                              # the provider socket does not outlive the refusal
+    assert [r.status for r in rig.rows()] == ["released"]          # nothing was sent on it
+    assert len(rig.registry) == 0
 
 
 def test_cap_refusal_reads_no_key(tmp_path):
@@ -403,7 +449,7 @@ def test_mailbox_carries_partial_and_final(rig):
     assert up.partial == "hel"
     assert s.mailbox().partial == "hel"
     s.close()
-    assert s.mailbox() == StreamUpdate(partial="", final="hello world")
+    assert s.mailbox() == StreamUpdate(partial="", final="hello world", ended="closed")
 
 
 def test_nothing_spoken_or_secret_is_logged(rig, caplog):
@@ -418,3 +464,258 @@ def test_nothing_spoken_or_secret_is_logged(rig, caplog):
     blob = " ".join(r.getMessage() + repr(r.args) + str(r.exc_info) for r in caplog.records)
     for forbidden in ("SPOKEN-SECRET-TEXT", SECRET_VALUE, "\x07", "hello world"):
         assert forbidden not in blob
+
+
+# --- exception chains carry nothing secret or spoken ----------------------------------------------------------------
+
+SPOKEN = "SPOKEN-SECRET-TEXT"
+
+
+def assert_clean(exc: BaseException) -> None:
+    """No chained exception, and no frame of the traceback holds the key or the spoken text in a local."""
+    assert exc.__context__ is None and exc.__cause__ is None
+    blob = "".join(traceback.format_exception(type(exc), exc, exc.__traceback__)) + str(exc) + repr(exc)
+    tb = exc.__traceback__
+    while tb is not None:
+        for v in tb.tb_frame.f_locals.values():
+            assert not isinstance(v, custody.Secret)
+            blob += repr(v)
+        tb = tb.tb_next
+    for forbidden in (SECRET_VALUE, SPOKEN):
+        assert forbidden not in blob
+
+
+def test_a_failing_factory_leaves_no_secret_in_the_refusal(rig):
+    def leaky_factory(secret):
+        key = secret.reveal()
+        raise ConnectionError(f"handshake refused for {key}")
+
+    with pytest.raises(StreamRefused) as e:
+        rig.open(factory=leaky_factory)
+    assert_clean(e.value)
+
+
+def test_a_failing_key_reader_leaves_nothing_chained(rig):
+    def leaky(provider, use, *, authority):
+        raise OSError(f"keychain said {SECRET_VALUE}")
+
+    with pytest.raises(StreamRefused) as e:
+        rig.open(read_key=leaky)
+    assert_clean(e.value)
+
+
+def test_provider_faults_leave_no_spoken_text_in_the_refusal(tmp_path):
+    rig = Rig(tmp_path)
+    s = rig.open(stream=FakeStream(fail_send=True))
+    with pytest.raises(StreamRefused) as e:
+        s.feed(0, PCM_1S[:320])
+    assert_clean(e.value)
+
+    def poll_raises():
+        raise RuntimeError(f"bad frame: {SPOKEN}")
+
+    s = rig.open(stream=FakeStream(poll=poll_raises))
+    with pytest.raises(StreamRefused) as e:
+        s.feed(0, PCM_1S[:320])
+    assert_clean(e.value)
+
+    s = rig.open(stream=FakeStream(poll=lambda: StreamUpdate(partial=SPOKEN, final=SPOKEN, failed=True), text=""))
+    with pytest.raises(StreamRefused) as e:
+        s.mailbox()
+    assert_clean(e.value)
+
+
+# --- shutdown, and opens in progress ---------------------------------------------------------------------------------
+
+def test_shutdown_during_an_open_ends_the_new_stream_and_releases(rig):
+    def factory(secret):
+        rig.registry.shutdown()                                   # the server stops while the provider connects
+        s = FakeStream()
+        rig.streams.append(s)
+        return s
+
+    with refused("stopping"):
+        rig.open(factory=factory)
+    assert rig.streams[0].closed == 1
+    assert [r.status for r in rig.rows()] == ["released"] and len(rig.registry) == 0
+    with refused("stopping"):
+        rig.open()
+    assert len(rig.rows()) == 1                                   # a refused open reserves nothing
+
+
+def test_shutdown_drops_ended_sessions_too(rig):
+    s = rig.open()
+    s.feed(0, PCM_1S[:3200])
+    rig.clock.t += ss.IDLE_TIMEOUT_S + 1
+    rig.registry.reap()
+    rig.registry.shutdown()
+    with refused("unknown_session"):
+        rig.registry.get(s.sid, "owner-a")
+    assert s.take_audio() == b""
+
+
+def test_an_open_in_progress_holds_its_slot(tmp_path):
+    rig = Rig(tmp_path, max_sessions=1)
+    inner = []
+
+    def factory(secret):
+        with pytest.raises(StreamRefused) as e:
+            rig.open()                                            # the first open's slot is taken while it connects
+        inner.append(e.value.code)
+        return FakeStream()
+
+    s = rig.open(factory=factory)
+    assert inner == ["too_many_sessions"]
+    s.close()
+    rig.open().close()                                            # counted once, given back once
+
+
+# --- ended sessions stay readable for a while ------------------------------------------------------------------------
+
+def test_an_auto_ended_session_stays_readable_by_its_owner_with_its_reason(rig):
+    s = rig.open()
+    s.feed(0, PCM_1S[:3200])
+    rig.clock.t += ss.IDLE_TIMEOUT_S + 1
+    assert rig.registry.reap() == 1
+    got = rig.registry.get(s.sid, "owner-a")
+    assert got is s and len(rig.registry) == 0                    # addressable, but no longer a live slot
+    assert got.mailbox() == StreamUpdate(partial="", final="hello world", ended="idle_timeout")
+    with refused("unknown_session"):
+        rig.registry.get(s.sid, "owner-b")
+    assert s.close() == "hello world"                             # the owner collects it ...
+    with refused("unknown_session"):
+        rig.registry.get(s.sid, "owner-a")                        # ... and then it is gone
+
+
+def test_an_ended_session_is_dropped_after_the_retention_time(rig):
+    s = rig.open()
+    s.feed(0, PCM_1S[:3200])
+    with refused("bad_chunk"):
+        s.feed(1, b"")
+    rig.clock.t += ss.IDLE_TIMEOUT_S + 1
+    with refused("idle_timeout"):
+        s.feed(1, PCM_1S[:320])
+    rig.registry.get(s.sid, "owner-a")
+    rig.clock.t += ss.ENDED_RETAIN_S + 1
+    with refused("unknown_session"):
+        rig.registry.get(s.sid, "owner-a")
+    assert s.take_audio() == b"" and s.mailbox().final == ""       # dropped: its audio and text go with it
+
+
+def test_retained_ended_sessions_are_capped_oldest_first(tmp_path):
+    rig = Rig(tmp_path, max_sessions=2)
+    ended = []
+    for _ in range(3):
+        s = rig.open()
+        s.feed(0, PCM_1S[:320])
+        rig.clock.t += ss.IDLE_TIMEOUT_S + 1
+        rig.registry.reap()
+        ended.append(s)
+    with refused("unknown_session"):
+        rig.registry.get(ended[0].sid, "owner-a")
+    assert [rig.registry.get(s.sid, "owner-a") for s in ended[1:]] == ended[1:]
+    rig.open(); rig.open()                                        # ended sessions hold no live slot
+
+
+# --- intake hardening ------------------------------------------------------------------------------------------------
+
+def test_a_buffer_whose_len_lies_is_measured_by_its_bytes(rig):
+    class Liar(bytearray):
+        def __len__(self):
+            return 2
+
+    class Swapper(bytes):
+        def __bytes__(self):
+            return b"\x09\x00" * 4
+
+    s = rig.open()
+    with refused("bad_chunk"):
+        s.feed(0, Liar(b"\x00" * (ss.MAX_CHUNK_BYTES + 2)))
+    s.feed(0, Liar(b"\x01\x00" * 1600))
+    s.feed(1, Swapper(b"\x02\x00" * 1600))
+    assert s.streamed_bytes == 6400
+    assert rig.streams[0].sent == [b"\x01\x00" * 1600, b"\x02\x00" * 1600]
+    assert all(type(x) is bytes for x in rig.streams[0].sent)
+
+
+@pytest.mark.parametrize("result", [None, {"partial": "x"}, StreamUpdate(partial=None), StreamUpdate(failed="no")])
+def test_a_malformed_poll_result_ends_and_settles(tmp_path, result):
+    rig = Rig(tmp_path)
+    s = rig.open(stream=FakeStream(poll=lambda: result))
+    with refused("provider_failed"):
+        s.feed(0, PCM_1S[:16_000])
+    assert s.closed
+    [row] = rig.rows()
+    assert (row.status, row.units) == ("ok", 1)
+
+
+def test_a_failed_update_does_not_set_the_final_text(tmp_path):
+    rig = Rig(tmp_path)
+    s = rig.open(stream=FakeStream(poll=lambda: StreamUpdate(final="not-final", failed=True), text=""))
+    with refused("provider_failed"):
+        s.feed(0, PCM_1S[:320])
+    assert s.mailbox().final == ""
+
+
+def test_an_absolute_age_ends_a_trickling_session(rig):
+    s = rig.open()
+    seq = 0
+    with refused("ceiling"):
+        while True:
+            rig.clock.t += ss.IDLE_TIMEOUT_S - 1                  # never idle ...
+            s.feed(seq, b"\x00\x00")                              # ... and nowhere near the byte ceiling
+            seq += 1
+    assert s.closed and rig.clock.t - 1000.0 > ss.MAX_AGE_S
+    assert rig.rows()[0].status == "ok"
+
+
+def test_the_age_limit_holds_at_mailbox_and_reap(tmp_path):
+    rig = Rig(tmp_path, max_age=30.0)
+    a, b = rig.open(), rig.open()
+    for t in range(1, 4):
+        rig.clock.t += 10
+        a.feed(t - 1, b"\x00\x00")
+        b.feed(t - 1, b"\x00\x00")
+    rig.clock.t += 1
+    with refused("ceiling"):
+        a.mailbox()
+    assert rig.registry.reap() == 1 and b.closed
+    assert b.mailbox().ended == "ceiling"
+
+
+# --- reap and settle -------------------------------------------------------------------------------------------------
+
+def test_reap_rechecks_idleness_under_the_session_lock(rig, monkeypatch):
+    s = rig.open()
+    s.feed(0, PCM_1S[:320])
+    monkeypatch.setattr(s, "expired", lambda: True)               # a stale outside read says idle; it is not
+    assert rig.registry.reap() == 0 and not s.closed
+
+
+def test_a_failed_settle_is_retried_then_handed_to_the_registry(rig, monkeypatch):
+    s = rig.open()
+    s.feed(0, PCM_1S)
+    real, calls = rig.meter.settle_actual, []
+
+    def flaky(*a):
+        calls.append(a)
+        raise vmeter.MeterError("locked")
+
+    monkeypatch.setattr(rig.meter, "settle_actual", flaky)
+    assert s.close() == "hello world"                             # never raises past the caller
+    assert len(calls) == 2                                        # tried, then retried once
+    assert rig.rows()[0].status == "reserved"                     # still counted: errs toward the cap
+    monkeypatch.setattr(rig.meter, "settle_actual", real)
+    rig.registry.reap()
+    [row] = rig.rows()
+    assert (row.status, row.units) == ("ok", 1)
+
+
+# --- owner binding edge ----------------------------------------------------------------------------------------------
+
+def test_an_owner_with_a_lone_surrogate_is_compared_not_crashed(rig):
+    s = rig.open("owner-\udc80")
+    assert rig.registry.get(s.sid, "owner-\udc80") is s
+    for other in ("owner-\udc81", "owner-?", "owner-a", None, 7):
+        with refused("unknown_session"):
+            rig.registry.get(s.sid, other)

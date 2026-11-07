@@ -392,8 +392,9 @@ class Meter:
 
     def settle_actual(self, reservation_id: int, units: int) -> bool:
         """The call went out and ran for ``units`` (a streamed session's actual seconds): the reserved row stays counted
-        at the cost of ``units``, priced at no less than one unit, and never above what was reserved, so a reservation
-        is a ceiling that settling can only lower. True when a reserved row was moved, False when the id is unknown or
+        at the cost of ``units``, priced at no less than one unit, and never above what was reserved (a zero-unit
+        reservation counts as the one unit :meth:`reserve` priced it at), so a reservation is a ceiling that settling
+        can only lower. True when a reserved row was moved, False when the id is unknown or
         already ended. A row whose model the table no longer prices keeps its reserved cost."""
         if isinstance(units, bool) or not isinstance(units, int) or units < 0:
             raise MeterError(f"units must be a non-negative int, got {units!r}")
@@ -408,7 +409,9 @@ class Meter:
                         return False
                     provider, use, model, reserved_units, reserved_cost = row
                     entry = self.prices.find(provider, use, model)
-                    final_units = min(max(units, 1), reserved_units) if entry is not None else reserved_units
+                    # the ceiling is what reserve PRICED: a zero-unit reservation was priced at one unit
+                    final_units = (min(max(units, 1), max(reserved_units, 1)) if entry is not None
+                                   else reserved_units)
                     cost = min(entry.cost(final_units), reserved_cost) if entry is not None else reserved_cost
                     conn.execute("UPDATE calls SET status = 'ok', units = ?, cost_micros = ? WHERE id = ?",
                                  (final_units, cost, reservation_id))
