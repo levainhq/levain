@@ -21,7 +21,7 @@ FAKE = """
 (() => {
   const FLAG = __FLAG__, DENY = __DENY__, OPEN_STATUS = __OPEN__, WORKLET = __WORKLET__, REAL = __REAL__;
   const sc = window.__sc = { vj: 0, open: [], chunks: [], closes: [], gum: 0, tracks: [], ctxClosed: 0, mods: [], node: null, sp: null,
-    hang: { open: false, chunk: false, close: false, tr: false }, trs: [], tStatus: 500, tText: 'words from the recording', trDelay: 0, chunkStatus: 0, closeDelay: 0, gumHold: false, modHold: false, resumeMode: '', vjFail: __VJFAIL__, sends: [], srStarts: 0, realKeys: null };
+    hang: { open: false, chunk: false, close: false, tr: false }, trs: [], chunkRevoked: false, tStatus: 500, tText: 'words from the recording', trDelay: 0, chunkStatus: 0, closeDelay: 0, gumHold: false, modHold: false, resumeMode: '', vjFail: __VJFAIL__, sends: [], srStarts: 0, realKeys: null };
   const hang = (o) => new Promise((res, rej) => { if (o && o.signal) o.signal.addEventListener('abort', () => rej(new DOMException('aborted', 'AbortError'))); });
   const j = (o, s) => Promise.resolve(new Response(JSON.stringify(o), { status: s || 200, headers: { 'Content-Type': 'application/json' } }));
   const f0 = window.fetch.bind(window);
@@ -47,7 +47,7 @@ FAKE = """
       sc.chunks.push({ seq: url.searchParams.get('seq'), sid: url.searchParams.get('sid'), bytes: o.body.byteLength, isBuf: o.body instanceof ArrayBuffer, tok: tok,
         nonzero: new Int16Array(o.body).some((x) => x !== 0), ct: o.headers['Content-Type'] });
       if (sc.hang.chunk) return hang(o);
-      if (sc.chunkStatus) return j({ error: 'x' }, sc.chunkStatus);
+      if (sc.chunkStatus) return j(sc.chunkRevoked ? { error: 'revoke_unreachable', revoked: true } : { error: 'x' }, sc.chunkStatus);
       return j({ seq: n, partial: 'live ' + n + ' <b>x</b>', final: 'said' });
     }
     if (p === '/cockpit/voice/stream/close') { sc.closes.push({ sid: url.searchParams.get('sid'), tok: tok });
@@ -466,6 +466,27 @@ def test_a_chunk_that_fails_mid_session_is_transcribed_from_the_kept_recording_a
     _tr_ok(st)
     assert st["ta"] == "words from the recording" and st["note"].startswith("Streaming dictation stopped; these words come from the recording"), st
     assert "start of a long recording" not in st["note"] and [t["stopped"] for t in st["sc"]["tracks"]] == [1] and st["sc"]["ctxClosed"] == 1, st
+
+
+@needs_browser
+def test_a_revoked_chunk_is_a_final_stop_with_the_fixed_words_and_never_a_wav(tmp_path, qdir) -> None:
+    """Chunks fail with the server's `revoked: true` refusal after 16000 bytes were captured and a WAV could be built. The
+    session ends with the revoked sentence, no /transcribe request is made (the kept audio is dropped, not sent), the mic is
+    released and the label is back. Red with: the `err.revoked` branch in enqueue's catch removed (the plain-failure path
+    posts the WAV: trs has 1 entry and the note says the recording), or postJson not reading `revoked` off the refusal body
+    (same), or `s.pcm = null` dropped from the branch (nothing observable here, covered by the trs assert only through
+    canWav, so the branch itself is the line)."""
+    v = _go(tmp_path, qdir, [
+        *LIVE, {"eval": WAV_OK + "window.__sc.chunkStatus = 503; window.__sc.chunkRevoked = true; 1"},
+        CLICK, {"until": "window.__sc.open.length === 1 && window.__sc.node"},
+        {"eval": "window.__feed(28800)"},
+        {"until": "!LevainMic.active() && " + MIC + ".textContent === 'Mic'", "ms": 5000},
+        _wait(300),
+    ])
+    st = _state(v[-1])
+    assert st["sc"]["trs"] == [], st
+    assert st["note"] == "Premium voice was turned off, so the dictation stopped; the words so far are in the box.", st
+    assert [t["stopped"] for t in st["sc"]["tracks"]] == [1] and st["sc"]["ctxClosed"] == 1, st
 
 
 @needs_browser

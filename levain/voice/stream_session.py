@@ -193,6 +193,7 @@ class StreamSession:
         self._final = ""
         self._partial = ""
         self._end_reason = ""
+        self._revoke_checked = self._opened       # session time of the last revoke-reach check (the open path ran one)
 
     # --- ownership --------------------------------------------------------------------------------------------------
     def owned_by(self, owner: object) -> bool:
@@ -211,6 +212,25 @@ class StreamSession:
     @property
     def streamed_bytes(self) -> int:
         return self._bytes
+
+    def revoke_check_due(self, interval: float) -> bool:
+        """True (and the clock is restarted) when this live session has gone ``interval`` seconds of session time without a
+        revoke-reach check. The route calls it once per chunk and does the check only when it says True, so the authority
+        log is replayed on a cadence, not per chunk."""
+        with self._lock:
+            if self._closed:
+                return False
+            now = self._clock()
+            if now - self._revoke_checked < interval:
+                return False
+            self._revoke_checked = now
+            return True
+
+    def end_revoked(self) -> None:
+        """End the session because the key or its grant was revoked: the provider stream is closed and the meter settled
+        through the one normal end path. Idempotent. ``revoked`` is an end reason only: the chunk that found the revoke is
+        answered with the open path's own fixed words (:func:`levain.cockpit.voice.stream_chunk`), so it has none here."""
+        self._end_now("revoked")
 
     def _limit(self, now: float) -> str:
         """The time limit this session has passed at ``now``, else ''."""
