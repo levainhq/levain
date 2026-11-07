@@ -1,0 +1,3 @@
+$ /Users/phillipclapham/.local/bin/tart ip vend-s7e --wait 60
+rc=0
+192.168.64.52

@@ -1,0 +1,19 @@
+$ /usr/bin/ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR -o PreferredAuthentications=password,keyboard-interactive -o PubkeyAuthentication=no -o ConnectTimeout=15 admin@192.168.64.52 sudo -n /usr/local/bin/python3.13 -I /tmp/fire/g_vm.py seed --mode real --slot 8 --hold-s 25
+rc=0
+total 40
+drwxr-xr-x   7 root  wheel   224 Nov  7 20:19 .
+drwxr-xr-x  20 root  wheel   640 Nov  3 12:54 ..
+-rw-r--r--   1 root  wheel   208 Nov  7 20:19 dispatch_ceiling
+-rw-r--r--   1 root  wheel  3016 Nov  7 20:18 install-shape
+-rw-r--r--   1 root  wheel    55 Nov  7 20:18 operator
+-rw-r--r--   1 root  wheel    62 Nov  7 20:18 pool
+-rw-r--r--   1 root  wheel    38 Nov  7 20:18 roots
+{"format":"levain-dispatch-ceiling/2","max_calls_per_run":400,"max_deadline_s":7200,"max_open_tickets":4,"max_reserved_microdollars_per_run":5000000,"max_runs_per_day":50,"max_tunnel_bytes_per_run":419430400}
+
+stand-in repo /private/tmp/fh/repo owner _levain_dispatch files ['README.md', 'src/hello.py']
+stand-in repo /Users/admin/vend-repo owner admin files ['README.md', 'src/hello.py']
+/private/var/levain/slots/e12/state {"changed_at":"2026-11-07T20:18:56Z","class":"egress","dispatch_eligible":true,"format":"levain-slot-state/1","index":12,"lease_seq":0,"rev":0,"state":"reusable"}
+/private/var/levain/slots/e13/state {"changed_at":"2026-11-07T20:18:56Z","class":"egress","dispatch_eligible":true,"format":"levain-slot-state/1","index":13,"lease_seq":0,"rev":0,"state":"reusable"}
+/private/var/levain/slots/e14/state {"changed_at":"2026-11-07T20:18:56Z","class":"egress","dispatch_eligible":true,"format":"levain-slot-state/1","index":14,"lease_seq":0,"rev":0,"state":"reusable"}
+/private/var/levain/slots/e15/state {"changed_at":"2026-11-07T20:18:56Z","class":"egress","dispatch_eligible":true,"format":"levain-slot-state/1","index":15,"lease_seq":0,"rev":0,"state":"reusable"}
+/private/var/levain/slots/v3/state {"changed_at":"2026-11-07T20:18:56Z","class":"none","dispatch_eligible":true,"format":"levain-slot-state/1","index":3,"lease_seq":0,"rev":0,"state":"reusable"}

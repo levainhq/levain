@@ -1,0 +1,82 @@
+$ /usr/bin/ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR -o PreferredAuthentications=password,keyboard-interactive -o PubkeyAuthentication=no -o ConnectTimeout=15 admin@192.168.64.52 sudo -n /usr/local/bin/python3.13 -I /tmp/fire/g_vm.py setup --slots 4
+rc=0
+n /usr/local/lib/levain-vendor (a vendor not on this machine is skipped)
+      claude: /usr/local/lib/levain-vendor/bin/claude already matches /Users/admin/.local/bin/claude
+[570/613] place root's copy of the codex CLI (its whole install unit) in /usr/local/lib/levain-vendor (a vendor not on this machine is skipped)
+      codex: /usr/local/lib/levain-vendor/codex/0.162.1-23b737d0e087 already matches /Users/admin/.local/lib/codex/node_modules/@openai/codex-darwin-arm64/vendor/aarch64-apple-darwin
+[571/613] add the lo0 alias 127.0.1.13 for e12
+      /sbin/ifconfig lo0 alias 127.0.1.13 netmask 255.255.255.255
+[572/613] add the lo0 alias 127.0.1.14 for e13
+      /sbin/ifconfig lo0 alias 127.0.1.14 netmask 255.255.255.255
+[573/613] add the lo0 alias 127.0.1.15 for e14
+      /sbin/ifconfig lo0 alias 127.0.1.15 netmask 255.255.255.255
+[574/613] add the lo0 alias 127.0.1.16 for e15
+      /sbin/ifconfig lo0 alias 127.0.1.16 netmask 255.255.255.255
+[575/613] write the pf rules /etc/pf.anchors/levain (checked with pfctl -n)
+      write /etc/pf.anchors/levain (mode 644)
+[576/613] load the rules into the pf anchor com.apple/levain
+      /sbin/pfctl -o none -a com.apple/levain -f /etc/pf.anchors/levain
+      pfctl: Use of -f option, could result in flushing of rules
+present in the main ruleset added by the system at startup.
+See /etc/pf.conf for further details.
+
+No ALTQ support in kernel
+ALTQ related functions disabled
+[577/613] create /var/db/levain
+      /bin/mkdir -p -m 755 /var/db/levain
+[578/613] take pf's enable reference, its token kept in /var/db/levain/pf.token
+[579/613] note each service's started_after threshold (before the first start)
+[580/613] boot out com.levain.control if it is loaded and /Library/LaunchDaemons/com.levain.control.plist is about to change
+[581/613] write the LaunchDaemon com.levain.control (CONTROL, as _levain_control)
+      write /Library/LaunchDaemons/com.levain.control.plist (mode 644)
+[582/613] boot out com.levain.keys if it is loaded and /Library/LaunchDaemons/com.levain.keys.plist is about to change
+[583/613] write the LaunchDaemon com.levain.keys (gw-keys, as _levain_keys)
+      write /Library/LaunchDaemons/com.levain.keys.plist (mode 644)
+[584/613] boot out com.levain.qbroker if it is loaded and /Library/LaunchDaemons/com.levain.qbroker.plist is about to change
+[585/613] write the LaunchDaemon com.levain.qbroker (QUEUE BROKER, as _levain_qbroker)
+      write /Library/LaunchDaemons/com.levain.qbroker.plist (mode 644)
+[586/613] boot out com.levain.dispatch if it is loaded and /Library/LaunchDaemons/com.levain.dispatch.plist is about to change
+[587/613] write the LaunchDaemon com.levain.dispatch (dispatch, as _levain_dispatch)
+      write /Library/LaunchDaemons/com.levain.dispatch.plist (mode 644)
+[588/613] boot out com.levain.dispatch_run if it is loaded and /Library/LaunchDaemons/com.levain.dispatch_run.plist is about to change
+[589/613] write the LaunchDaemon com.levain.dispatch_run (dispatch run server, as _levain_dispatch)
+      write /Library/LaunchDaemons/com.levain.dispatch_run.plist (mode 644)
+[590/613] remove a stale /private/var/levain/dispatch/com.levain.dispatch_run.log (a regular file the _levain_dispatch account does not own) before the job is bootstrapped
+[591/613] boot out com.levain.reaper if it is loaded and /Library/LaunchDaemons/com.levain.reaper.plist is about to change
+[592/613] write the LaunchDaemon com.levain.reaper (reaper, as root)
+      write /Library/LaunchDaemons/com.levain.reaper.plist (mode 644)
+[593/613] boot out com.levain.pf if it is loaded and /Library/LaunchDaemons/com.levain.pf.plist is about to change
+[594/613] write the LaunchDaemon com.levain.pf (pf anchor, as root)
+      write /Library/LaunchDaemons/com.levain.pf.plist (mode 644)
+[595/613] start com.levain.control
+      /bin/launchctl bootstrap system /Library/LaunchDaemons/com.levain.control.plist
+[596/613] start com.levain.keys
+      /bin/launchctl bootstrap system /Library/LaunchDaemons/com.levain.keys.plist
+[597/613] start com.levain.qbroker
+      /bin/launchctl bootstrap system /Library/LaunchDaemons/com.levain.qbroker.plist
+[598/613] start com.levain.dispatch
+      /bin/launchctl bootstrap system /Library/LaunchDaemons/com.levain.dispatch.plist
+[599/613] start com.levain.dispatch_run
+      /bin/launchctl bootstrap system /Library/LaunchDaemons/com.levain.dispatch_run.plist
+[600/613] start com.levain.reaper
+      /bin/launchctl bootstrap system /Library/LaunchDaemons/com.levain.reaper.plist
+[601/613] start com.levain.pf
+      /bin/launchctl bootstrap system /Library/LaunchDaemons/com.levain.pf.plist
+[602/613] hold /private/var/levain/slots/pool.lock to the end of this run (no prepare leases beneath it)
+[603/613] mark e12 reusable in /private/var/levain/slots/e12/state (levain-slot-state/1, under the pool lock)
+[604/613] mark e13 reusable in /private/var/levain/slots/e13/state (levain-slot-state/1, under the pool lock)
+[605/613] mark e14 reusable in /private/var/levain/slots/e14/state (levain-slot-state/1, under the pool lock)
+[606/613] mark e15 reusable in /private/var/levain/slots/e15/state (levain-slot-state/1, under the pool lock)
+[607/613] mark v3 reusable in /private/var/levain/slots/v3/state (levain-slot-state/1, under the pool lock)
+[608/613] report the vendor CLI copies that failed earlier in this run (none: nothing to report)
+[609/613] let the runtime helper run without a password (sudoers drop-in, checked with visudo)
+      write /etc/sudoers.d/levain-runtime (mode 440)
+[610/613] let the install helper run, asking a password every call (sudoers drop-in)
+      write /etc/sudoers.d/levain-install (mode 440)
+[611/613] write the install record /private/var/levain/policy/install-shape (completed_txn bae39bd530b06336cfee7bfbbde77d09)
+[612/613] record admin as this machine's one operator (last)
+      write /private/var/levain/policy/operator (mode 644)
+[613/613] remove the intent journal /var/db/levain/install-intent
+      /bin/rm -f /var/db/levain/install-intent
+
+SETUP_RC=0

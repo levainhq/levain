@@ -1,0 +1,1 @@
+{"format":"levain-prepare-result/1","gwport":47112,"ok":true,"session":"s-e9bee2b996ca36e4","slot":{"class":"egress","index":12},"staging":"/private/var/levain/staging/s-e9bee2b996ca36e4"}

@@ -1,0 +1,42 @@
+INFO  run    C1 on C1pong
+          :: session s-e9bee2b996ca36e4, guest time 2026-11-07 20:23:47
+PASS  R.1    the claude executor process exited 0
+          :: final.json {'poll': 0, 'stop_file': False}
+PASS  R.2    claude's stream-json ends in a successful result (it ran to completion)
+          :: {"duration_api_ms": 1241, "stop_reason": "end_turn", "session_id": "943436c4-ee0c-4f9f-bed8-fc56ceed4a48", "total_cost_usd": 0.0014386, "usage": {"input_tokens": 2, "cache_creation_input_tokens": 6633, "cache_read_input_tokens": 10980, "output_tokens": 4, "output_tokens_details": {"thinking_tokens": 0}, "server_tool_use": {"web_search_requests": 0, "web_fetch_requests": 0}, "service_tier": "standa
+AMBER R.4    the edit reached the retained repo (README.md has the probe line)
+          :: # vmend stand-in
+
+A tiny repo for the var-folders confirmation.
+
+AMBER R.5    the git work reached the retained repo (commit present)
+          :: 199ea81 rig
+
+PASS  L.1    ZERO file-write denials under /private/var/folders (the vendor never needed the folder)
+          :: 162 deny line(s) in all, none there; log rc 0; if the control run (F1) showed 0 lines too, this proves nothing
+INFO  L.2    other sandbox denials in the window (not this change's business, listed for the head)
+          :: {'git mach-lookup com.apple.bsd.dirhelper': 27, 'git mach-lookup com.apple.system.opendirectoryd.membership': 18, 'git mach-lookup com.apple.system.notification_center': 10, 'git mach-lookup com.apple.logd': 10, 'python3 mach-lookup com.apple.bsd.dirhelper': 9, 'security mach-lookup com.apple.logd': 8, 'security mach-lookup com.apple.system.notification_center': 8, 'security mach-lookup com.apple.analyticsd': 8}
+PASS  P.1    the session profile the sandbox ran names no /var/folders path ((e) in effect)
+          :: /private/var/levain/retained/s-e9bee2b996ca36e4/tree/root/profile.sb, 19 lines
+PASS  S.1    END answered RETAINED (not HELD)
+          :: teardown.exit ans: {'state': 'RETAINED', 'tunnel_bytes': 439463}
+PASS  S.2    the tree step raised nothing
+          :: tree_step.exc count 0; detail []
+PASS  S.3    the tree step ran exactly once (no ~31 s retries)
+          :: tree_step.entry count 1
+PASS  S.4    retained/<s>/tree exists and live/<s> is gone
+          :: retained=True tree=True live_has=False
+PASS  S.5    no slot is left leased (the slot went back to reusable)
+          :: slot states {'e12': 'reusable', 'e13': 'reusable', 'e14': 'reusable', 'e15': 'reusable', 'v3': 'reusable'}
+PASS  S.6    no vfcopy / vfkeys.jsonl left in the retained object
+          :: []
+PASS  K.1    the folder holds exactly the empty skeleton 0 C T X
+          :: entries ['0', 'C', 'T', 'X']; non-empty/non-dir {}
+PASS  K.2    the skeleton is untouched: sunlnk still on the folder and on 0 C T X
+          :: folder {'uid': 3969, 'mode': '0o40755', 'flags': '0x100000'}; kids [('0', '0x100000'), ('C', '0x100000'), ('T', '0x100000'), ('X', '0x100000')]
+PASS  K.3    folder flags and owner equal what start.entry saw
+          :: start {'uid': 3969, 'mode': '0o40755', 'flags': '0x100000', 'ino': 573106} / now {'uid': 3969, 'mode': '0o40755', 'flags': '0x100000'}
+PASS  K.6    the kept .levain-var-folders copy holds no files (nothing wrote the folder during the real session)
+          :: []
+
+14 PASS, 0 FAIL, 2 AMBER (read these), 2 INFO

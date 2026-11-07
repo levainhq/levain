@@ -1,0 +1,2 @@
+$ /usr/bin/git -C /Users/phillipclapham/Briefcase/levain archive --format=tar.gz -o /Users/phillipclapham/Briefcase/.levain-1107-20-s7end/project_memory/1107-15-voice/s7end3_results/vend-s7e/up/lv.tgz origin/main levain
+rc=0

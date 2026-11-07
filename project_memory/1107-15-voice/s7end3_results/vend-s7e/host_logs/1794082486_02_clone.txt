@@ -1,0 +1,2 @@
+$ /Users/phillipclapham/.local/bin/tart clone vend-real-7a6895a7 vend-s7e
+rc=0

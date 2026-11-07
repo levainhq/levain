@@ -1,0 +1,3 @@
+$ /usr/bin/git -C /Users/phillipclapham/Briefcase/levain rev-parse origin/main
+rc=0
+6924d8d996692d6e11508cbf560e283f91c76e97

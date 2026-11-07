@@ -1,0 +1,394 @@
+Timestamp               Ty Process[PID:TID]
+2026-11-07 20:22:52.417 E  kernel[0:482c] [com.apple.sandbox.reporting:violation] Sandbox: python3(3397) deny(1) mach-lookup com.apple.system.notification_center
+2026-11-07 20:22:52.417 E  kernel[0:482c] [com.apple.sandbox.reporting:violation] Sandbox: python3(3397) deny(1) mach-lookup com.apple.logd
+2026-11-07 20:22:52.419 E  kernel[0:482c] [com.apple.sandbox.reporting:violation] Sandbox: python3(3397) deny(1) mach-lookup com.apple.system.opendirectoryd.membership
+2026-11-07 20:22:52.419 E  kernel[0:482f] [com.apple.sandbox.reporting:violation] Sandbox: python3(3397) deny(1) mach-lookup com.apple.bsd.dirhelper
+2026-11-07 20:22:52.419 E  kernel[0:482f] [com.apple.sandbox.reporting:violation] 1 duplicate report for Sandbox: python3(3397) deny(1) mach-lookup com.apple.bsd.dirhelper
+2026-11-07 20:22:52.419 E  kernel[0:482f] [com.apple.sandbox.reporting:violation] Sandbox: python3(3397) deny(1) mach-lookup com.apple.system.opendirectoryd.membership
+2026-11-07 20:22:52.419 E  kernel[0:482c] [com.apple.sandbox.reporting:violation] Sandbox: python3(3397) deny(1) mach-lookup com.apple.bsd.dirhelper
+2026-11-07 20:22:52.423 E  kernel[0:482c] [com.apple.sandbox.reporting:violation] Sandbox: python3(3397) deny(1) mach-lookup com.apple.system.opendirectoryd.membership
+2026-11-07 20:22:52.423 E  kernel[0:482c] [com.apple.sandbox.reporting:violation] Sandbox: python3(3397) deny(1) mach-lookup com.apple.bsd.dirhelper
+2026-11-07 20:22:52.423 E  kernel[0:482c] [com.apple.sandbox.reporting:violation] 1 duplicate report for Sandbox: python3(3397) deny(1) mach-lookup com.apple.bsd.dirhelper
+2026-11-07 20:22:52.423 E  kernel[0:482c] [com.apple.sandbox.reporting:violation] Sandbox: python3(3397) deny(1) mach-lookup com.apple.system.opendirectoryd.membership
+2026-11-07 20:22:52.423 E  kernel[0:482f] [com.apple.sandbox.reporting:violation] Sandbox: python3(3397) deny(1) mach-lookup com.apple.bsd.dirhelper
+2026-11-07 20:22:52.434 E  kernel[0:482f] [com.apple.sandbox.reporting:violation] Sandbox: Python(3397) deny(1) mach-lookup com.apple.system.notification_center
+2026-11-07 20:22:52.575 E  kernel[0:482c] [com.apple.sandbox.reporting:violation] Sandbox: claude(3399) deny(1) mach-lookup com.apple.logd
+2026-11-07 20:22:52.576 E  sandboxd[165:447f] [com.apple.sandbox.reporting:violation] Sandbox: claude(3399) deny(1) mach-lookup com.apple.system.notification_center
+Process:         claude [3399]
+Path:            /usr/local/lib/levain-vendor/bin/claude
+Load Address:    0x102b6c000
+Identifier:      com.anthropic.claude-code
+Version:         ??? (???)
+Code Type:       arm64 (Native)
+Parent Process:  Python [3397]
+Responsible:     /usr/libexec/sshd-keygen-wrapper
+User ID:         3969
+
+Date/Time:       2026-11-07 20:22:52.583 GMT
+OS Version:      macOS 15.7.7 (24G720)
+Release Type:    User
+Report Version:  8
+
+MetaData: {"hardware":"VMA2MACOS","binary-in-trust-cache":false,"profile-in-collection":false,"parent-process-name":"Python","normalized_target":["com.apple.system.notification_center"],"primary-filter-value":"com.apple.system.notification_center","summary":"deny(1) mach-lookup com.apple.system.notification_center","build":"macOS 15.7.7 (24G720)","sandbox_checker":"launchd","uid":3969,"platform_binary":"no","pid":3399,"mach_namespace":1,"policy-description":"Sandbox","action":"deny","operation":"mach-lookup","profile-flags":0,"flags":5,"global-name":"com.apple.system.notification_center","checker-pid":1,"team-id":"Q6L2SF6YDW","process":"claude","apple-internal":false,"signing-id":"com.anthropic.claude-code","responsible-process-path":"\134/usr\134/libexec\134/sshd-keygen-wrapper","translated":false,"platform-policy":false,"target":"com.apple.system.notification_center","primary-filter":"global-name","errno":1,"process-path":"\134/usr\134/local\134/lib\134/levain-vendor\134/bin\134/claude","responsible-process-sdk":984832,"platform-binary":false,"responsible-process-signing-id":"com.apple.sshd-keygen-wrapper","process_path":["usr","local","lib","levain-vendor","bin","claude"],"parent-process-pid":3397,"checker":"launchd","release-type":"User"}
+
+Thread 0 (id: 18649):
+0   libsystem_kernel.dylib        	0x000000019c549c34 mach_msg2_trap + 8
+1   libsystem_kernel.dylib        	0x000000019c552764 mach_msg_overwrite + 484
+2   libsystem_kernel.dylib        	0x000000019c549fa8 mach_msg + 24
+3   libxpc.dylib                  	0x000000019c2b5c1c _xpc_pipe_mach_msg + 56
+4   libxpc.dylib                  	0x000000019c2b53f4 _xpc_pipe_routine + 384
+5   libxpc.dylib                  	0x000000019c28a6a8 _xpc_interface_routine + 228
+6   libxpc.dylib                  	0x000000019c28cbac bootstrap_look_up3 + 276
+7   libxpc.dylib                  	0x000000019c28ca70 bootstrap_look_up2 + 48
+8   libsystem_notify.dylib        	0x00000001a04f570c
+9   libdispatch.dylib             	0x000000019c3ed85c _dispatch_client_callout + 16
+10  libdispatch.dylib             	0x000000019c3d6a28 _dispatch_once_callout + 32
+11  libsystem_notify.dylib        	0x00000001a04f5580
+12  libsystem_notify.dylib        	0x00000001a04f3568
+13  libsystem_notify.dylib        	0x00000001a04eee58 notify_register_check + 800
+14  libsystem_c.dylib             	0x000000019c424788 notify_register_tz + 236
+15  libsystem_c.dylib             	0x000000019c441598 gmt_init + 108
+16  libsystem_pthread.dylib       	0x000000019c587b20 __pthread_once_handler + 72
+17  libsystem_platform.dylib      	0x000000019c5c2b18 _os_once_callout + 32
+18  libsystem_platform.dylib      	0x000000019c5c2aec _os_once + 76
+19  libsystem_pthread.dylib       	0x000000019c587abc pthread_once + 100
+20  libsystem_c.dylib             	0x000000019c4414d0 gmtsub + 72
+21  claude                        	0x0000000108cfcbd8
+22  claude                        	0x0000000108cfb304
+23  claude                        	0x0000000109219d38
+24  claude                        	0x00000001092255e4
+25  claude                        	0x000000010922c0c0
+26  claude                        	0x0000000109330024
+27  claude                        	0x00000001091c90fc
+28  claude                        	0x00000001091ea418
+29  dyld                          	0x000000019c1eab98 start + 6076
+
+Binary Images:
+       0x102b6c000 -        0x102b6e93f  com.anthropic.claude-code <4c4c44d4-5555-3144-a135-b2db91af0c70> /usr/local/lib/levain-vendor/bin/claude
+       0x19c1e4000 -        0x19c1e4fff  com.apple.darwin.ignition (1.0.0 - 56) <70dbd61b-24cf-3e2b-aed9-1d345967d2d4> /usr/lib/dyld
+       0x19c284000 -        0x19c285427  libxpc.dylib <df5fb3de-56d8-3e58-b948-1f5577e7844b> /usr/lib/system/libxpc.dylib
+       0x19c3d2000 -        0x19c3d311f  libdispatch.dylib <63a54ce1-2ab6-3673-82e4-d8489d811475> /usr/lib/system/libdispatch.dylib
+       0x19c41c000 -        0x19c41ceb7  libsystem_c.dylib <269515dd-c10d-3845-8d29-3f2f815b8561> /usr/lib/system/libsystem_c.dylib
+       0x19c549000 -        0x19c5497bf  libsystem_kernel.dylib <f865e038-8aea-3fb1-a04f-731060311916> /usr/lib/system/libsystem_kernel.dylib
+       0x19c585000 -        0x19c585907  libsystem_pthread.dylib <2886f4f3-500b-36c8-a20c-c457eb754e3d> /usr/lib/system/libsystem_pthread.dylib
+       0x19c5c2000 -        0x19c5c285f  libsystem_platform.dylib <c26e58a4-34a1-3f9c-bdbc-ebc34426633a> /usr/lib/system/libsystem_platform.dylib
+       0x1a04ee000 -        0x1a04eeb37  libsystem_notify.dylib <ca2aad14-c438-30e8-9699-5a947e2df021> /usr/lib/system/libsystem_notify.dylib
+2026-11-07 20:22:52.587 E  kernel[0:482c] [com.apple.sandbox.reporting:violation] Sandbox: claude(3400) deny(1) mach-lookup com.apple.system.notification_center
+2026-11-07 20:22:52.591 E  kernel[0:482c] [com.apple.sandbox.reporting:violation] Sandbox: claude(3400) deny(1) mach-lookup com.apple.logd
+2026-11-07 20:22:52.606 E  kernel[0:482c] [com.apple.sandbox.reporting:violation] Sandbox: security(3401) deny(1) mach-lookup com.apple.logd
+2026-11-07 20:22:52.606 E  kernel[0:482c] [com.apple.sandbox.reporting:violation] Sandbox: security(3401) deny(1) mach-lookup com.apple.system.notification_center
+2026-11-07 20:22:52.607 E  kernel[0:482c] [com.apple.sandbox.reporting:violation] Sandbox: security(3401) deny(1) mach-lookup com.apple.analyticsd
+2026-11-07 20:22:52.608 E  kernel[0:482f] [com.apple.sandbox.reporting:violation] Sandbox: security(3401) deny(1) mach-lookup com.apple.SecurityServer
+2026-11-07 20:22:52.608 E  kernel[0:482c] [com.apple.sandbox.reporting:violation] Sandbox: security(3402) deny(1) mach-lookup com.apple.logd
+2026-11-07 20:22:52.609 E  kernel[0:482c] [com.apple.sandbox.reporting:violation] Sandbox: security(3402) deny(1) mach-lookup com.apple.system.notification_center
+2026-11-07 20:22:52.609 E  kernel[0:482f] [com.apple.sandbox.reporting:violation] Sandbox: security(3402) deny(1) mach-lookup com.apple.analyticsd
+2026-11-07 20:22:52.610 E  kernel[0:482c] [com.apple.sandbox.reporting:violation] Sandbox: security(3402) deny(1) mach-lookup com.apple.SecurityServer
+2026-11-07 20:22:52.668 E  kernel[0:482c] [com.apple.sandbox.reporting:violation] Sandbox: claude(3400) deny(1) mach-lookup com.apple.securityd.xpc
+2026-11-07 20:22:52.669 E  kernel[0:482f] [com.apple.sandbox.reporting:violation] Sandbox: claude(3400) deny(1) mach-lookup com.apple.SecurityServer
+2026-11-07 20:22:52.692 E  kernel[0:482f] [com.apple.sandbox.reporting:violation] Sandbox: bash(3404) deny(1) mach-lookup com.apple.system.notification_center
+2026-11-07 20:22:52.692 E  kernel[0:482f] [com.apple.sandbox.reporting:violation] Sandbox: bash(3404) deny(1) mach-lookup com.apple.logd
+2026-11-07 20:22:52.693 E  kernel[0:482f] [com.apple.sandbox.reporting:violation] Sandbox: security(3403) deny(1) mach-lookup com.apple.logd
+2026-11-07 20:22:52.694 E  kernel[0:482c] [com.apple.sandbox.reporting:violation] Sandbox: security(3403) deny(1) mach-lookup com.apple.system.notification_center
+2026-11-07 20:22:52.694 E  kernel[0:482c] [com.apple.sandbox.reporting:violation] Sandbox: security(3403) deny(1) mach-lookup com.apple.analyticsd
+2026-11-07 20:22:52.695 E  kernel[0:482c] [com.apple.sandbox.reporting:violation] Sandbox: security(3403) deny(1) mach-lookup com.apple.SecurityServer
+2026-11-07 20:22:52.700 E  kernel[0:482c] [com.apple.sandbox.reporting:violation] Sandbox: security(3404) deny(1) mach-lookup com.apple.logd
+2026-11-07 20:22:52.700 E  kernel[0:482f] [com.apple.sandbox.reporting:violation] Sandbox: security(3404) deny(1) mach-lookup com.apple.system.notification_center
+2026-11-07 20:22:52.701 E  kernel[0:482c] [com.apple.sandbox.reporting:violation] Sandbox: security(3404) deny(1) mach-lookup com.apple.analyticsd
+2026-11-07 20:22:52.702 E  kernel[0:482c] [com.apple.sandbox.reporting:violation] Sandbox: security(3404) deny(1) mach-lookup com.apple.SecurityServer
+2026-11-07 20:22:52.746 E  kernel[0:48f7] [com.apple.sandbox.reporting:violation] System Policy: Python(3405) deny(1) signal same-sandbox [BackgroundTaskManagementAgent(2682)] signum:17
+2026-11-07 20:22:52.746 E  kernel[0:48f7] [com.apple.sandbox.reporting:violation] System Policy: Python(3405) deny(1) signal others [XprotectService(866)] signum:17
+2026-11-07 20:22:52.746 E  kernel[0:48f7] [com.apple.sandbox.reporting:violation] System Policy: Python(3405) deny(1) signal others [UsageTrackingAgent(739)] signum:17
+2026-11-07 20:22:52.746 E  kernel[0:48f7] [com.apple.sandbox.reporting:violation] System Policy: Python(3405) deny(1) signal same-sandbox [XProtectPluginService(703)] signum:17
+2026-11-07 20:22:52.746 E  kernel[0:48f7] [com.apple.sandbox.reporting:violation] System Policy: Python(3405) deny(1) signal same-sandbox [system_installd(684)] signum:17
+2026-11-07 20:22:52.746 E  kernel[0:48f7] [com.apple.sandbox.reporting:violation] System Policy: Python(3405) deny(1) signal others [ScreenTimeAgent(480)] signum:17
+2026-11-07 20:22:52.746 E  kernel[0:48f7] [com.apple.sandbox.reporting:violation] System Policy: Python(3405) deny(1) signal others [dmd(420)] signum:17
+2026-11-07 20:22:52.746 E  kernel[0:48f7] [com.apple.sandbox.reporting:violation] System Policy: Python(3405) deny(1) signal same-sandbox [XProtectPluginService(357)] signum:17
+2026-11-07 20:22:52.746 E  kernel[0:48f7] [com.apple.sandbox.reporting:violation] System Policy: Python(3405) deny(1) signal others [softwareupdated(309)] signum:17
+2026-11-07 20:22:52.746 E  kernel[0:48f7] [com.apple.sandbox.reporting:violation] System Policy: Python(3405) deny(1) signal same-sandbox [suhelperd(288)] signum:17
+2026-11-07 20:22:52.746 E  kernel[0:48f7] [com.apple.sandbox.reporting:violation] System Policy: Python(3405) deny(1) signal others [systemstatusd(193)] signum:17
+2026-11-07 20:22:52.777 E  kernel[0:48f9] [com.apple.sandbox.reporting:violation] System Policy: Python(3406) deny(1) signal same-sandbox [BackgroundTaskManagementAgent(2682)] signum:9
+2026-11-07 20:22:52.777 E  kernel[0:48f9] [com.apple.sandbox.reporting:violation] System Policy: Python(3406) deny(1) signal others [XprotectService(866)] signum:9
+2026-11-07 20:22:52.777 E  kernel[0:48f9] [com.apple.sandbox.reporting:violation] System Policy: Python(3406) deny(1) signal others [UsageTrackingAgent(739)] signum:9
+2026-11-07 20:22:52.777 E  kernel[0:48f9] [com.apple.sandbox.reporting:violation] System Policy: Python(3406) deny(1) signal same-sandbox [XProtectPluginService(703)] signum:9
+2026-11-07 20:22:52.778 E  kernel[0:48f9] [com.apple.sandbox.reporting:violation] System Policy: Python(3406) deny(1) signal same-sandbox [system_installd(684)] signum:9
+2026-11-07 20:22:52.778 E  kernel[0:48f9] [com.apple.sandbox.reporting:violation] System Policy: Python(3406) deny(1) signal others [ScreenTimeAgent(480)] signum:9
+2026-11-07 20:22:52.778 E  kernel[0:48f9] [com.apple.sandbox.reporting:violation] System Policy: Python(3406) deny(1) signal others [dmd(420)] signum:9
+2026-11-07 20:22:52.778 E  kernel[0:48f9] [com.apple.sandbox.reporting:violation] System Policy: Python(3406) deny(1) signal same-sandbox [XProtectPluginService(357)] signum:9
+2026-11-07 20:22:52.778 E  kernel[0:48f9] [com.apple.sandbox.reporting:violation] System Policy: Python(3406) deny(1) signal others [softwareupdated(309)] signum:9
+2026-11-07 20:22:52.778 E  kernel[0:48f9] [com.apple.sandbox.reporting:violation] System Policy: Python(3406) deny(1) signal same-sandbox [suhelperd(288)] signum:9
+2026-11-07 20:22:52.778 E  kernel[0:48f9] [com.apple.sandbox.reporting:violation] System Policy: Python(3406) deny(1) signal others [systemstatusd(193)] signum:9
+2026-11-07 20:22:53.201 E  kernel[0:46db] [com.apple.sandbox.reporting:violation] Sandbox: git(3408) deny(1) mach-lookup com.apple.system.notification_center
+2026-11-07 20:22:53.202 E  kernel[0:46db] [com.apple.sandbox.reporting:violation] Sandbox: git(3408) deny(1) mach-lookup com.apple.logd
+2026-11-07 20:22:53.203 E  kernel[0:46db] [com.apple.sandbox.reporting:violation] Sandbox: git(3408) deny(1) mach-lookup com.apple.system.opendirectoryd.membership
+2026-11-07 20:22:53.203 E  kernel[0:46db] [com.apple.sandbox.reporting:violation] Sandbox: git(3408) deny(1) mach-lookup com.apple.bsd.dirhelper
+2026-11-07 20:22:53.203 E  kernel[0:46db] [com.apple.sandbox.reporting:violation] 1 duplicate report for Sandbox: git(3408) deny(1) mach-lookup com.apple.bsd.dirhelper
+2026-11-07 20:22:53.203 E  kernel[0:46db] [com.apple.sandbox.reporting:violation] Sandbox: git(3408) deny(1) mach-lookup com.apple.system.opendirectoryd.membership
+2026-11-07 20:22:53.203 E  kernel[0:482c] [com.apple.sandbox.reporting:violation] Sandbox: git(3408) deny(1) mach-lookup com.apple.bsd.dirhelper
+2026-11-07 20:22:53.230 E  kernel[0:46db] [com.apple.sandbox.reporting:violation] Sandbox: git(3408) deny(1) mach-lookup com.apple.system.notification_center
+2026-11-07 20:22:53.230 E  kernel[0:482c] [com.apple.sandbox.reporting:violation] Sandbox: git(3408) deny(1) mach-lookup com.apple.logd
+2026-11-07 20:22:53.251 E  kernel[0:490e] [com.apple.sandbox.reporting:violation] System Policy: Python(3412) deny(1) signal same-sandbox [BackgroundTaskManagementAgent(2682)] signum:17
+2026-11-07 20:22:53.251 E  kernel[0:490e] [com.apple.sandbox.reporting:violation] System Policy: Python(3412) deny(1) signal others [XprotectService(866)] signum:17
+2026-11-07 20:22:53.251 E  kernel[0:490e] [com.apple.sandbox.reporting:violation] System Policy: Python(3412) deny(1) signal others [UsageTrackingAgent(739)] signum:17
+2026-11-07 20:22:53.251 E  kernel[0:490e] [com.apple.sandbox.reporting:violation] System Policy: Python(3412) deny(1) signal same-sandbox [XProtectPluginService(703)] signum:17
+2026-11-07 20:22:53.251 E  kernel[0:490e] [com.apple.sandbox.reporting:violation] System Policy: Python(3412) deny(1) signal same-sandbox [system_installd(684)] signum:17
+2026-11-07 20:22:53.251 E  kernel[0:490e] [com.apple.sandbox.reporting:violation] System Policy: Python(3412) deny(1) signal others [ScreenTimeAgent(480)] signum:17
+2026-11-07 20:22:53.252 E  kernel[0:490e] [com.apple.sandbox.reporting:violation] System Policy: Python(3412) deny(1) signal others [dmd(420)] signum:17
+2026-11-07 20:22:53.252 E  kernel[0:490e] [com.apple.sandbox.reporting:violation] System Policy: Python(3412) deny(1) signal same-sandbox [XProtectPluginService(357)] signum:17
+2026-11-07 20:22:53.252 E  kernel[0:490e] [com.apple.sandbox.reporting:violation] System Policy: Python(3412) deny(1) signal others [softwareupdated(309)] signum:17
+2026-11-07 20:22:53.252 E  kernel[0:490e] [com.apple.sandbox.reporting:violation] System Policy: Python(3412) deny(1) signal same-sandbox [suhelperd(288)] signum:17
+2026-11-07 20:22:53.252 E  kernel[0:490e] [com.apple.sandbox.reporting:violation] System Policy: Python(3412) deny(1) signal others [systemstatusd(193)] signum:17
+2026-11-07 20:22:53.284 E  kernel[0:490f] [com.apple.sandbox.reporting:violation] System Policy: Python(3413) deny(1) signal same-sandbox [BackgroundTaskManagementAgent(2682)] signum:9
+2026-11-07 20:22:53.284 E  kernel[0:490f] [com.apple.sandbox.reporting:violation] System Policy: Python(3413) deny(1) signal others [XprotectService(866)] signum:9
+2026-11-07 20:22:53.285 E  kernel[0:490f] [com.apple.sandbox.reporting:violation] System Policy: Python(3413) deny(1) signal others [UsageTrackingAgent(739)] signum:9
+2026-11-07 20:22:53.285 E  kernel[0:490f] [com.apple.sandbox.reporting:violation] System Policy: Python(3413) deny(1) signal same-sandbox [XProtectPluginService(703)] signum:9
+2026-11-07 20:22:53.285 E  kernel[0:490f] [com.apple.sandbox.reporting:violation] System Policy: Python(3413) deny(1) signal same-sandbox [system_installd(684)] signum:9
+2026-11-07 20:22:53.285 E  kernel[0:490f] [com.apple.sandbox.reporting:violation] System Policy: Python(3413) deny(1) signal others [ScreenTimeAgent(480)] signum:9
+2026-11-07 20:22:53.285 E  kernel[0:490f] [com.apple.sandbox.reporting:violation] System Policy: Python(3413) deny(1) signal others [dmd(420)] signum:9
+2026-11-07 20:22:53.285 E  kernel[0:490f] [com.apple.sandbox.reporting:violation] System Policy: Python(3413) deny(1) signal same-sandbox [XProtectPluginService(357)] signum:9
+2026-11-07 20:22:53.285 E  kernel[0:490f] [com.apple.sandbox.reporting:violation] System Policy: Python(3413) deny(1) signal others [softwareupdated(309)] signum:9
+2026-11-07 20:22:53.285 E  kernel[0:490f] [com.apple.sandbox.reporting:violation] System Policy: Python(3413) deny(1) signal same-sandbox [suhelperd(288)] signum:9
+2026-11-07 20:22:53.285 E  kernel[0:490f] [com.apple.sandbox.reporting:violation] System Policy: Python(3413) deny(1) signal others [systemstatusd(193)] signum:9
+2026-11-07 20:22:53.687 E  kernel[0:46db] [com.apple.sandbox.reporting:violation] Sandbox: git(3415) deny(1) mach-lookup com.apple.system.notification_center
+2026-11-07 20:22:53.687 E  kernel[0:46db] [com.apple.sandbox.reporting:violation] Sandbox: git(3415) deny(1) mach-lookup com.apple.logd
+2026-11-07 20:22:53.689 E  kernel[0:46db] [com.apple.sandbox.reporting:violation] Sandbox: git(3415) deny(1) mach-lookup com.apple.system.opendirectoryd.membership
+2026-11-07 20:22:53.689 E  kernel[0:482f] [com.apple.sandbox.reporting:violation] Sandbox: git(3415) deny(1) mach-lookup com.apple.bsd.dirhelper
+2026-11-07 20:22:53.689 E  kernel[0:482f] [com.apple.sandbox.reporting:violation] 1 duplicate report for Sandbox: git(3415) deny(1) mach-lookup com.apple.bsd.dirhelper
+2026-11-07 20:22:53.689 E  kernel[0:482f] [com.apple.sandbox.reporting:violation] Sandbox: git(3415) deny(1) mach-lookup com.apple.system.opendirectoryd.membership
+2026-11-07 20:22:53.689 E  kernel[0:46db] [com.apple.sandbox.reporting:violation] Sandbox: git(3415) deny(1) mach-lookup com.apple.bsd.dirhelper
+2026-11-07 20:22:53.703 E  kernel[0:491e] [com.apple.sandbox.reporting:violation] System Policy: Python(3417) deny(1) signal same-sandbox [BackgroundTaskManagementAgent(2682)] signum:17
+2026-11-07 20:22:53.703 E  kernel[0:491e] [com.apple.sandbox.reporting:violation] System Policy: Python(3417) deny(1) signal others [XprotectService(866)] signum:17
+2026-11-07 20:22:53.703 E  kernel[0:491e] [com.apple.sandbox.reporting:violation] System Policy: Python(3417) deny(1) signal others [UsageTrackingAgent(739)] signum:17
+2026-11-07 20:22:53.703 E  kernel[0:491e] [com.apple.sandbox.reporting:violation] System Policy: Python(3417) deny(1) signal same-sandbox [XProtectPluginService(703)] signum:17
+2026-11-07 20:22:53.703 E  kernel[0:491e] [com.apple.sandbox.reporting:violation] System Policy: Python(3417) deny(1) signal same-sandbox [system_installd(684)] signum:17
+2026-11-07 20:22:53.703 E  kernel[0:491e] [com.apple.sandbox.reporting:violation] System Policy: Python(3417) deny(1) signal others [ScreenTimeAgent(480)] signum:17
+2026-11-07 20:22:53.703 E  kernel[0:491e] [com.apple.sandbox.reporting:violation] System Policy: Python(3417) deny(1) signal others [dmd(420)] signum:17
+2026-11-07 20:22:53.703 E  kernel[0:491e] [com.apple.sandbox.reporting:violation] System Policy: Python(3417) deny(1) signal same-sandbox [XProtectPluginService(357)] signum:17
+2026-11-07 20:22:53.703 E  kernel[0:491e] [com.apple.sandbox.reporting:violation] System Policy: Python(3417) deny(1) signal others [softwareupdated(309)] signum:17
+2026-11-07 20:22:53.703 E  kernel[0:491e] [com.apple.sandbox.reporting:violation] System Policy: Python(3417) deny(1) signal same-sandbox [suhelperd(288)] signum:17
+2026-11-07 20:22:53.703 E  kernel[0:491e] [com.apple.sandbox.reporting:violation] System Policy: Python(3417) deny(1) signal others [systemstatusd(193)] signum:17
+2026-11-07 20:22:53.737 E  kernel[0:491f] [com.apple.sandbox.reporting:violation] System Policy: Python(3418) deny(1) signal same-sandbox [BackgroundTaskManagementAgent(2682)] signum:9
+2026-11-07 20:22:53.737 E  kernel[0:491f] [com.apple.sandbox.reporting:violation] System Policy: Python(3418) deny(1) signal others [XprotectService(866)] signum:9
+2026-11-07 20:22:53.737 E  kernel[0:491f] [com.apple.sandbox.reporting:violation] System Policy: Python(3418) deny(1) signal others [UsageTrackingAgent(739)] signum:9
+2026-11-07 20:22:53.737 E  kernel[0:491f] [com.apple.sandbox.reporting:violation] System Policy: Python(3418) deny(1) signal same-sandbox [XProtectPluginService(703)] signum:9
+2026-11-07 20:22:53.737 E  kernel[0:491f] [com.apple.sandbox.reporting:violation] System Policy: Python(3418) deny(1) signal same-sandbox [system_installd(684)] signum:9
+2026-11-07 20:22:53.737 E  kernel[0:491f] [com.apple.sandbox.reporting:violation] System Policy: Python(3418) deny(1) signal others [ScreenTimeAgent(480)] signum:9
+2026-11-07 20:22:53.738 E  kernel[0:491f] [com.apple.sandbox.reporting:violation] System Policy: Python(3418) deny(1) signal others [dmd(420)] signum:9
+2026-11-07 20:22:53.738 E  kernel[0:491f] [com.apple.sandbox.reporting:violation] System Policy: Python(3418) deny(1) signal same-sandbox [XProtectPluginService(357)] signum:9
+2026-11-07 20:22:53.738 E  kernel[0:491f] [com.apple.sandbox.reporting:violation] System Policy: Python(3418) deny(1) signal others [softwareupdated(309)] signum:9
+2026-11-07 20:22:53.738 E  kernel[0:491f] [com.apple.sandbox.reporting:violation] System Policy: Python(3418) deny(1) signal same-sandbox [suhelperd(288)] signum:9
+2026-11-07 20:22:53.738 E  kernel[0:491f] [com.apple.sandbox.reporting:violation] System Policy: Python(3418) deny(1) signal others [systemstatusd(193)] signum:9
+2026-11-07 20:22:54.261 E  kernel[0:482f] [com.apple.sandbox.reporting:violation] Sandbox: python3(3420) deny(1) mach-lookup com.apple.system.notification_center
+2026-11-07 20:22:54.262 E  kernel[0:482f] [com.apple.sandbox.reporting:violation] Sandbox: python3(3420) deny(1) mach-lookup com.apple.logd
+2026-11-07 20:22:54.264 E  kernel[0:482f] [com.apple.sandbox.reporting:violation] Sandbox: python3(3420) deny(1) mach-lookup com.apple.system.opendirectoryd.membership
+2026-11-07 20:22:54.264 E  kernel[0:482f] [com.apple.sandbox.reporting:violation] Sandbox: python3(3420) deny(1) mach-lookup com.apple.bsd.dirhelper
+2026-11-07 20:22:54.264 E  kernel[0:482f] [com.apple.sandbox.reporting:violation] 1 duplicate report for Sandbox: python3(3420) deny(1) mach-lookup com.apple.bsd.dirhelper
+2026-11-07 20:22:54.264 E  kernel[0:482f] [com.apple.sandbox.reporting:violation] Sandbox: python3(3420) deny(1) mach-lookup com.apple.system.opendirectoryd.membership
+2026-11-07 20:22:54.264 E  kernel[0:46db] [com.apple.sandbox.reporting:violation] Sandbox: python3(3420) deny(1) mach-lookup com.apple.bsd.dirhelper
+2026-11-07 20:22:54.280 E  kernel[0:46db] [com.apple.sandbox.reporting:violation] Sandbox: Python(3420) deny(1) mach-lookup com.apple.system.notification_center
+2026-11-07 20:22:54.547 E  kernel[0:482f] [com.apple.sandbox.reporting:violation] Sandbox: claude(3420) deny(1) mach-lookup com.apple.system.notification_center
+2026-11-07 20:22:54.554 E  kernel[0:482f] [com.apple.sandbox.reporting:violation] Sandbox: claude(3420) deny(1) mach-lookup com.apple.logd
+2026-11-07 20:22:54.587 E  kernel[0:482f] [com.apple.sandbox.reporting:violation] Sandbox: security(3427) deny(1) mach-lookup com.apple.logd
+2026-11-07 20:22:54.588 E  kernel[0:46db] [com.apple.sandbox.reporting:violation] Sandbox: security(3427) deny(1) mach-lookup com.apple.system.notification_center
+2026-11-07 20:22:54.588 E  kernel[0:482f] [com.apple.sandbox.reporting:violation] Sandbox: security(3427) deny(1) mach-lookup com.apple.analyticsd
+2026-11-07 20:22:54.590 E  kernel[0:482f] [com.apple.sandbox.reporting:violation] Sandbox: security(3427) deny(1) mach-lookup com.apple.SecurityServer
+2026-11-07 20:22:54.591 E  kernel[0:46db] [com.apple.sandbox.reporting:violation] Sandbox: security(3428) deny(1) mach-lookup com.apple.logd
+2026-11-07 20:22:54.592 E  kernel[0:46db] [com.apple.sandbox.reporting:violation] Sandbox: security(3428) deny(1) mach-lookup com.apple.system.notification_center
+2026-11-07 20:22:54.592 E  kernel[0:46db] [com.apple.sandbox.reporting:violation] Sandbox: security(3428) deny(1) mach-lookup com.apple.analyticsd
+2026-11-07 20:22:54.594 E  kernel[0:46db] [com.apple.sandbox.reporting:violation] Sandbox: security(3428) deny(1) mach-lookup com.apple.SecurityServer
+2026-11-07 20:22:54.747 E  kernel[0:46db] [com.apple.sandbox.reporting:violation] Sandbox: claude(3420) deny(1) mach-lookup com.apple.securityd.xpc
+2026-11-07 20:22:54.747 E  kernel[0:482f] [com.apple.sandbox.reporting:violation] Sandbox: git(3431) deny(1) mach-lookup com.apple.system.opendirectoryd.membership
+2026-11-07 20:22:54.748 E  kernel[0:482f] [com.apple.sandbox.reporting:violation] Sandbox: git(3431) deny(1) mach-lookup com.apple.bsd.dirhelper
+2026-11-07 20:22:54.748 E  kernel[0:46db] [com.apple.sandbox.reporting:violation] Sandbox: git(3431) deny(1) mach-lookup com.apple.logd
+2026-11-07 20:22:54.748 E  kernel[0:482f] [com.apple.sandbox.reporting:violation] Sandbox: git(3431) deny(1) mach-lookup com.apple.system.notification_center
+2026-11-07 20:22:54.748 E  kernel[0:46db] [com.apple.sandbox.reporting:violation] Sandbox: git(3431) deny(1) mach-lookup com.apple.bsd.dirhelper
+2026-11-07 20:22:54.748 E  kernel[0:482f] [com.apple.sandbox.reporting:violation] Sandbox: git(3431) deny(1) mach-lookup com.apple.system.opendirectoryd.membership
+2026-11-07 20:22:54.749 E  kernel[0:46db] [com.apple.sandbox.reporting:violation] Sandbox: git(3431) deny(1) mach-lookup com.apple.bsd.dirhelper
+2026-11-07 20:22:54.749 E  kernel[0:482f] [com.apple.sandbox.reporting:violation] Sandbox: claude(3420) deny(1) mach-lookup com.apple.SecurityServer
+2026-11-07 20:22:54.803 E  kernel[0:482f] [com.apple.sandbox.reporting:violation] Sandbox: bash(3433) deny(1) mach-lookup com.apple.system.notification_center
+2026-11-07 20:22:54.803 E  kernel[0:482f] [com.apple.sandbox.reporting:violation] Sandbox: bash(3433) deny(1) mach-lookup com.apple.logd
+2026-11-07 20:22:54.806 E  kernel[0:46db] [com.apple.sandbox.reporting:violation] Sandbox: security(3432) deny(1) mach-lookup com.apple.logd
+2026-11-07 20:22:54.807 E  kernel[0:482f] [com.apple.sandbox.reporting:violation] Sandbox: security(3432) deny(1) mach-lookup com.apple.system.notification_center
+2026-11-07 20:22:54.807 E  kernel[0:46db] [com.apple.sandbox.reporting:violation] Sandbox: security(3432) deny(1) mach-lookup com.apple.analyticsd
+2026-11-07 20:22:54.809 E  kernel[0:46db] [com.apple.sandbox.reporting:violation] Sandbox: security(3432) deny(1) mach-lookup com.apple.SecurityServer
+2026-11-07 20:22:54.816 E  kernel[0:46db] [com.apple.sandbox.reporting:violation] Sandbox: security(3433) deny(1) mach-lookup com.apple.logd
+2026-11-07 20:22:54.817 E  kernel[0:482f] [com.apple.sandbox.reporting:violation] Sandbox: security(3433) deny(1) mach-lookup com.apple.system.notification_center
+2026-11-07 20:22:54.817 E  kernel[0:482f] [com.apple.sandbox.reporting:violation] Sandbox: security(3433) deny(1) mach-lookup com.apple.analyticsd
+2026-11-07 20:22:54.818 E  kernel[0:46db] [com.apple.sandbox.reporting:violation] Sandbox: security(3433) deny(1) mach-lookup com.apple.SecurityServer
+2026-11-07 20:22:54.845 E  kernel[0:482f] [com.apple.sandbox.reporting:violation] Sandbox: git(3434) deny(1) mach-lookup com.apple.system.opendirectoryd.membership
+2026-11-07 20:22:54.846 E  kernel[0:482f] [com.apple.sandbox.reporting:violation] Sandbox: git(3434) deny(1) mach-lookup com.apple.bsd.dirhelper
+2026-11-07 20:22:54.846 E  kernel[0:482f] [com.apple.sandbox.reporting:violation] Sandbox: git(3434) deny(1) mach-lookup com.apple.logd
+2026-11-07 20:22:54.846 E  kernel[0:46db] [com.apple.sandbox.reporting:violation] Sandbox: git(3434) deny(1) mach-lookup com.apple.system.notification_center
+2026-11-07 20:22:54.846 E  kernel[0:482f] [com.apple.sandbox.reporting:violation] Sandbox: git(3434) deny(1) mach-lookup com.apple.bsd.dirhelper
+2026-11-07 20:22:54.846 E  kernel[0:46db] [com.apple.sandbox.reporting:violation] Sandbox: git(3434) deny(1) mach-lookup com.apple.system.opendirectoryd.membership
+2026-11-07 20:22:54.846 E  kernel[0:46db] [com.apple.sandbox.reporting:violation] Sandbox: git(3434) deny(1) mach-lookup com.apple.bsd.dirhelper
+2026-11-07 20:22:54.861 E  kernel[0:46db] [com.apple.sandbox.reporting:violation] Sandbox: git(3435) deny(1) mach-lookup com.apple.system.opendirectoryd.membership
+2026-11-07 20:22:54.861 E  kernel[0:46db] [com.apple.sandbox.reporting:violation] Sandbox: git(3435) deny(1) mach-lookup com.apple.bsd.dirhelper
+2026-11-07 20:22:54.862 E  kernel[0:46db] [com.apple.sandbox.reporting:violation] Sandbox: git(3435) deny(1) mach-lookup com.apple.logd
+2026-11-07 20:22:54.862 E  kernel[0:46db] [com.apple.sandbox.reporting:violation] Sandbox: git(3435) deny(1) mach-lookup com.apple.system.notification_center
+2026-11-07 20:22:54.863 E  kernel[0:46db] [com.apple.sandbox.reporting:violation] Sandbox: git(3435) deny(1) mach-lookup com.apple.bsd.dirhelper
+2026-11-07 20:22:54.863 E  kernel[0:46db] [com.apple.sandbox.reporting:violation] Sandbox: git(3435) deny(1) mach-lookup com.apple.system.opendirectoryd.membership
+2026-11-07 20:22:54.863 E  kernel[0:482f] [com.apple.sandbox.reporting:violation] Sandbox: git(3435) deny(1) mach-lookup com.apple.bsd.dirhelper
+2026-11-07 20:22:55.066 E  kernel[0:46db] [com.apple.sandbox.reporting:violation] Sandbox: git(3436) deny(1) mach-lookup com.apple.system.opendirectoryd.membership
+2026-11-07 20:22:55.066 E  kernel[0:482f] [com.apple.sandbox.reporting:violation] Sandbox: git(3436) deny(1) mach-lookup com.apple.bsd.dirhelper
+2026-11-07 20:22:55.067 E  kernel[0:482f] [com.apple.sandbox.reporting:violation] Sandbox: git(3436) deny(1) mach-lookup com.apple.logd
+2026-11-07 20:22:55.067 E  kernel[0:482f] [com.apple.sandbox.reporting:violation] Sandbox: git(3436) deny(1) mach-lookup com.apple.system.notification_center
+2026-11-07 20:22:55.067 E  kernel[0:46db] [com.apple.sandbox.reporting:violation] Sandbox: git(3436) deny(1) mach-lookup com.apple.bsd.dirhelper
+2026-11-07 20:22:55.067 E  kernel[0:482f] [com.apple.sandbox.reporting:violation] Sandbox: git(3436) deny(1) mach-lookup com.apple.system.opendirectoryd.membership
+2026-11-07 20:22:55.067 E  kernel[0:482f] [com.apple.sandbox.reporting:violation] Sandbox: git(3436) deny(1) mach-lookup com.apple.bsd.dirhelper
+2026-11-07 20:22:55.081 E  kernel[0:493d] [com.apple.sandbox.reporting:violation] Sandbox: claude(3420) deny(1) forbidden-exec-sugid
+2026-11-07 20:22:55.091 E  kernel[0:493d] [com.apple.sandbox.reporting:violation] Sandbox: claude(3420) deny(1) network-bind /private/var/levain/live/s-086cf30726872389/tmp/cc-socks/3420.sock
+2026-11-07 20:22:55.106 E  kernel[0:46db] [com.apple.sandbox.reporting:violation] Sandbox: git(3438) deny(1) mach-lookup com.apple.system.opendirectoryd.membership
+2026-11-07 20:22:55.106 E  kernel[0:482f] [com.apple.sandbox.reporting:violation] Sandbox: git(3440) deny(1) mach-lookup com.apple.system.opendirectoryd.membership
+2026-11-07 20:22:55.106 E  kernel[0:46db] [com.apple.sandbox.reporting:violation] Sandbox: git(3440) deny(1) mach-lookup com.apple.bsd.dirhelper
+2026-11-07 20:22:55.106 E  kernel[0:46db] [com.apple.sandbox.reporting:violation] Sandbox: git(3438) deny(1) mach-lookup com.apple.bsd.dirhelper
+2026-11-07 20:22:55.106 E  kernel[0:46db] [com.apple.sandbox.reporting:violation] Sandbox: git(3439) deny(1) mach-lookup com.apple.system.opendirectoryd.membership
+2026-11-07 20:22:55.106 E  kernel[0:46db] [com.apple.sandbox.reporting:violation] Sandbox: git(3440) deny(1) mach-lookup com.apple.logd
+2026-11-07 20:22:55.106 E  kernel[0:46db] [com.apple.sandbox.reporting:violation] Sandbox: git(3438) deny(1) mach-lookup com.apple.logd
+2026-11-07 20:22:55.106 E  kernel[0:46db] [com.apple.sandbox.reporting:violation] Sandbox: git(3440) deny(1) mach-lookup com.apple.system.notification_center
+2026-11-07 20:22:55.106 E  kernel[0:46db] [com.apple.sandbox.reporting:violation] Sandbox: git(3439) deny(1) mach-lookup com.apple.bsd.dirhelper
+2026-11-07 20:22:55.106 E  kernel[0:46db] [com.apple.sandbox.reporting:violation] Sandbox: git(3438) deny(1) mach-lookup com.apple.system.notification_center
+2026-11-07 20:22:55.106 E  kernel[0:46db] [com.apple.sandbox.reporting:violation] Sandbox: git(3440) deny(1) mach-lookup com.apple.bsd.dirhelper
+2026-11-07 20:22:55.106 E  kernel[0:46db] [com.apple.sandbox.reporting:violation] Sandbox: git(3440) deny(1) mach-lookup com.apple.system.opendirectoryd.membership
+2026-11-07 20:22:55.106 E  kernel[0:46db] [com.apple.sandbox.reporting:violation] Sandbox: git(3439) deny(1) mach-lookup com.apple.logd
+2026-11-07 20:22:55.107 E  kernel[0:46db] [com.apple.sandbox.reporting:violation] Sandbox: git(3438) deny(1) mach-lookup com.apple.bsd.dirhelper
+2026-11-07 20:22:55.107 E  kernel[0:46db] [com.apple.sandbox.reporting:violation] Sandbox: git(3440) deny(1) mach-lookup com.apple.bsd.dirhelper
+2026-11-07 20:22:55.107 E  kernel[0:46db] [com.apple.sandbox.reporting:violation] Sandbox: git(3439) deny(1) mach-lookup com.apple.system.notification_center
+2026-11-07 20:22:55.107 E  kernel[0:46db] [com.apple.sandbox.reporting:violation] Sandbox: git(3438) deny(1) mach-lookup com.apple.system.opendirectoryd.membership
+2026-11-07 20:22:55.107 E  kernel[0:46db] [com.apple.sandbox.reporting:violation] Sandbox: git(3438) deny(1) mach-lookup com.apple.bsd.dirhelper
+2026-11-07 20:22:55.107 E  kernel[0:46db] [com.apple.sandbox.reporting:violation] Sandbox: git(3439) deny(1) mach-lookup com.apple.bsd.dirhelper
+2026-11-07 20:22:55.107 E  kernel[0:46db] [com.apple.sandbox.reporting:violation] Sandbox: git(3439) deny(1) mach-lookup com.apple.system.opendirectoryd.membership
+2026-11-07 20:22:55.107 E  kernel[0:46db] [com.apple.sandbox.reporting:violation] Sandbox: git(3439) deny(1) mach-lookup com.apple.bsd.dirhelper
+2026-11-07 20:22:55.224 E  kernel[0:482f] [com.apple.sandbox.reporting:violation] Sandbox: claude(3420) deny(1) mach-lookup com.apple.FSEvents
+2026-11-07 20:22:55.231 E  kernel[0:46db] [com.apple.sandbox.reporting:violation] 2 duplicate reports for Sandbox: claude(3420) deny(1) mach-lookup com.apple.FSEvents
+2026-11-07 20:22:55.231 E  kernel[0:46db] [com.apple.sandbox.reporting:violation] Sandbox: bash(3442) deny(1) mach-lookup com.apple.system.notification_center
+2026-11-07 20:22:55.231 E  kernel[0:46db] [com.apple.sandbox.reporting:violation] Sandbox: bash(3442) deny(1) mach-lookup com.apple.logd
+2026-11-07 20:22:55.947 E  kernel[0:49b6] [com.apple.sandbox.reporting:violation] Sandbox: oahd(3446) deny(1) sysctl-read security.mac.lockdown_mode_state
+2026-11-07 20:22:55.947 E  kernel[0:49b6] [com.apple.sandbox.reporting:violation] Sandbox: oahd(3446) deny(1) sysctl-read kern.bootargs
+2026-11-07 20:22:55.947 E  kernel[0:49b6] [com.apple.sandbox.reporting:violation] Sandbox: oahd(3446) deny(1) file-read-data /usr/libexec/rosetta/oahd
+2026-11-07 20:22:55.949 E  kernel[0:49b6] [com.apple.sandbox.reporting:violation] Sandbox: oahd(3446) deny(1) file-read-data /private/etc/passwd
+2026-11-07 20:22:55.949 E  kernel[0:49b6] [com.apple.sandbox.reporting:violation] Sandbox: oahd(3446) deny(1) file-read-metadata /private/etc/passwd
+2026-11-07 20:22:55.950 E  kernel[0:482c] [com.apple.sandbox.reporting:violation] Sandbox: oahd(3446) deny(1) mach-lookup com.apple.system.opendirectoryd.libinfo
+2026-11-07 20:22:55.950 E  kernel[0:49b6] [com.apple.sandbox.reporting:violation] Sandbox: oahd(3446) deny(1) file-read-data /private/etc/passwd
+2026-11-07 20:22:55.950 E  kernel[0:49b6] [com.apple.sandbox.reporting:violation] Sandbox: oahd(3446) deny(1) file-read-metadata /private/etc/passwd
+2026-11-07 20:22:55.950 E  kernel[0:49b6] [com.apple.sandbox.reporting:violation] Sandbox: oahd(3446) deny(1) file-read-data /private/etc/passwd
+2026-11-07 20:22:55.950 E  kernel[0:49b6] [com.apple.sandbox.reporting:violation] Sandbox: oahd(3446) deny(1) file-read-metadata /private/etc/passwd
+2026-11-07 20:22:55.950 E  kernel[0:482c] [com.apple.sandbox.reporting:violation] Sandbox: oahd(3446) deny(1) mach-lookup com.apple.system.opendirectoryd.libinfo
+2026-11-07 20:22:55.950 E  kernel[0:49b6] [com.apple.sandbox.reporting:violation] Sandbox: oahd(3446) deny(1) file-read-data /private/etc/passwd
+2026-11-07 20:22:55.950 E  kernel[0:49b6] [com.apple.sandbox.reporting:violation] Sandbox: oahd(3446) deny(1) file-read-metadata /private/etc/passwd
+2026-11-07 20:22:55.950 E  kernel[0:49b6] [com.apple.sandbox.reporting:violation] Sandbox: oahd(3446) deny(1) sysctl-read kern.osproductversion
+2026-11-07 20:22:55.950 E  kernel[0:49b6] [com.apple.sandbox.reporting:violation] Sandbox: oahd(3446) deny(1) file-read-data /System/Library/CoreServices/SystemVersion.plist
+2026-11-07 20:22:55.952 E  kernel[0:49b6] [com.apple.sandbox.reporting:violation] Sandbox: oahd(3446) deny(1) file-read-data /System/Library/Frameworks/CoreFoundation.framework
+2026-11-07 20:22:55.952 E  kernel[0:49b6] [com.apple.sandbox.reporting:violation] Sandbox: oahd(3446) deny(1) file-read-data /System/Library/Frameworks
+2026-11-07 20:22:55.953 E  kernel[0:49b6] [com.apple.sandbox.reporting:violation] Sandbox: oahd(3446) deny(1) file-read-metadata /System/Library/Frameworks/CoreFoundation.framework
+2026-11-07 20:22:55.953 E  kernel[0:49b6] [com.apple.sandbox.reporting:violation] 1 duplicate report for Sandbox: oahd(3446) deny(1) file-read-metadata /System/Library/Frameworks/CoreFoundation.framework
+2026-11-07 20:22:55.953 E  kernel[0:49b6] [com.apple.sandbox.reporting:violation] Sandbox: oahd(3446) deny(1) file-read-data /System/Library/Frameworks/CoreFoundation.framework
+2026-11-07 20:22:55.953 E  kernel[0:49b6] [com.apple.sandbox.reporting:violation] Sandbox: oahd(3446) deny(1) file-read-data /System/Library/Frameworks
+2026-11-07 20:22:55.953 E  kernel[0:482f] [com.apple.sandbox.reporting:violation] Sandbox: oahd(3446) deny(1) mach-lookup com.apple.distributed_notifications@1v3
+2026-11-07 20:22:56.991 E  kernel[0:46db] [com.apple.sandbox.reporting:violation] Sandbox: claude(3420) deny(1) mach-lookup com.apple.FSEvents
+2026-11-07 20:22:58.196 E  kernel[0:482c] [com.apple.sandbox.reporting:violation] 1 duplicate report for Sandbox: claude(3420) deny(1) mach-lookup com.apple.FSEvents
+2026-11-07 20:22:58.196 E  kernel[0:482c] [com.apple.sandbox.reporting:violation] Sandbox: bash(3447) deny(1) mach-lookup com.apple.system.notification_center
+2026-11-07 20:22:58.196 E  kernel[0:46db] [com.apple.sandbox.reporting:violation] Sandbox: bash(3447) deny(1) mach-lookup com.apple.logd
+2026-11-07 20:22:58.353 E  kernel[0:482c] [com.apple.sandbox.reporting:violation] Sandbox: python3(3447) deny(1) mach-lookup com.apple.system.opendirectoryd.membership
+2026-11-07 20:22:58.353 E  kernel[0:482c] [com.apple.sandbox.reporting:violation] Sandbox: python3(3447) deny(1) mach-lookup com.apple.bsd.dirhelper
+2026-11-07 20:22:58.353 E  kernel[0:46db] [com.apple.sandbox.reporting:violation] Sandbox: python3(3447) deny(1) mach-lookup com.apple.logd
+2026-11-07 20:22:58.353 E  kernel[0:46db] [com.apple.sandbox.reporting:violation] Sandbox: python3(3447) deny(1) mach-lookup com.apple.system.notification_center
+2026-11-07 20:22:58.354 E  kernel[0:46db] [com.apple.sandbox.reporting:violation] Sandbox: python3(3447) deny(1) mach-lookup com.apple.bsd.dirhelper
+2026-11-07 20:22:58.354 E  kernel[0:482c] [com.apple.sandbox.reporting:violation] Sandbox: python3(3447) deny(1) mach-lookup com.apple.system.opendirectoryd.membership
+2026-11-07 20:22:58.354 E  kernel[0:482c] [com.apple.sandbox.reporting:violation] Sandbox: python3(3447) deny(1) mach-lookup com.apple.bsd.dirhelper
+2026-11-07 20:22:58.365 E  kernel[0:46db] [com.apple.sandbox.reporting:violation] Sandbox: Python(3447) deny(1) mach-lookup com.apple.system.notification_center
+2026-11-07 20:22:58.784 E  kernel[0:482c] [com.apple.sandbox.reporting:violation] Sandbox: Python(3447) deny(1) mach-lookup com.apple.logd
+2026-11-07 20:22:58.856 E  kernel[0:46db] [com.apple.sandbox.reporting:violation] Sandbox: zsh(3448) deny(1) mach-lookup com.apple.system.notification_center
+2026-11-07 20:22:58.856 E  kernel[0:482c] [com.apple.sandbox.reporting:violation] Sandbox: zsh(3448) deny(1) mach-lookup com.apple.logd
+2026-11-07 20:22:58.857 E  kernel[0:46db] [com.apple.sandbox.reporting:violation] Sandbox: zsh(3449) deny(1) mach-lookup com.apple.system.notification_center
+2026-11-07 20:22:58.857 E  kernel[0:482c] [com.apple.sandbox.reporting:violation] Sandbox: zsh(3449) deny(1) mach-lookup com.apple.logd
+2026-11-07 20:22:58.868 E  kernel[0:46db] [com.apple.sandbox.reporting:violation] Sandbox: zsh(3452) deny(1) mach-lookup com.apple.system.notification_center
+2026-11-07 20:22:58.869 E  kernel[0:482c] [com.apple.sandbox.reporting:violation] Sandbox: zsh(3452) deny(1) mach-lookup com.apple.logd
+2026-11-07 20:22:59.792 E  kernel[0:482c] [com.apple.sandbox.reporting:violation] Sandbox: bash(3453) deny(1) mach-lookup com.apple.system.notification_center
+2026-11-07 20:22:59.793 E  kernel[0:46db] [com.apple.sandbox.reporting:violation] Sandbox: bash(3453) deny(1) mach-lookup com.apple.logd
+2026-11-07 20:22:59.796 E  kernel[0:46db] [com.apple.sandbox.reporting:violation] Sandbox: python3(3453) deny(1) mach-lookup com.apple.system.opendirectoryd.membership
+2026-11-07 20:22:59.797 E  kernel[0:46db] [com.apple.sandbox.reporting:violation] Sandbox: python3(3453) deny(1) mach-lookup com.apple.bsd.dirhelper
+2026-11-07 20:22:59.797 E  kernel[0:46db] [com.apple.sandbox.reporting:violation] Sandbox: python3(3453) deny(1) mach-lookup com.apple.logd
+2026-11-07 20:22:59.797 E  kernel[0:46db] [com.apple.sandbox.reporting:violation] Sandbox: python3(3453) deny(1) mach-lookup com.apple.system.notification_center
+2026-11-07 20:22:59.797 E  kernel[0:482c] [com.apple.sandbox.reporting:violation] Sandbox: python3(3453) deny(1) mach-lookup com.apple.bsd.dirhelper
+2026-11-07 20:22:59.797 E  kernel[0:46db] [com.apple.sandbox.reporting:violation] Sandbox: python3(3453) deny(1) mach-lookup com.apple.system.opendirectoryd.membership
+2026-11-07 20:22:59.797 E  kernel[0:482c] [com.apple.sandbox.reporting:violation] Sandbox: python3(3453) deny(1) mach-lookup com.apple.bsd.dirhelper
+2026-11-07 20:22:59.805 E  kernel[0:46db] [com.apple.sandbox.reporting:violation] Sandbox: Python(3453) deny(1) mach-lookup com.apple.system.notification_center
+2026-11-07 20:23:00.175 E  kernel[0:46db] [com.apple.sandbox.reporting:violation] Sandbox: git(3454) deny(1) mach-lookup com.apple.system.opendirectoryd.membership
+2026-11-07 20:23:00.176 E  kernel[0:482c] [com.apple.sandbox.reporting:violation] Sandbox: git(3454) deny(1) mach-lookup com.apple.bsd.dirhelper
+2026-11-07 20:23:00.176 E  kernel[0:46db] [com.apple.sandbox.reporting:violation] Sandbox: git(3454) deny(1) mach-lookup com.apple.logd
+2026-11-07 20:23:00.176 E  kernel[0:46db] [com.apple.sandbox.reporting:violation] Sandbox: git(3454) deny(1) mach-lookup com.apple.system.notification_center
+2026-11-07 20:23:00.176 E  kernel[0:482c] [com.apple.sandbox.reporting:violation] Sandbox: git(3454) deny(1) mach-lookup com.apple.bsd.dirhelper
+2026-11-07 20:23:00.176 E  kernel[0:46db] [com.apple.sandbox.reporting:violation] Sandbox: git(3454) deny(1) mach-lookup com.apple.system.opendirectoryd.membership
+2026-11-07 20:23:00.176 E  kernel[0:482c] [com.apple.sandbox.reporting:violation] Sandbox: git(3454) deny(1) mach-lookup com.apple.bsd.dirhelper
+2026-11-07 20:23:00.184 E  kernel[0:46db] [com.apple.sandbox.reporting:violation] Sandbox: git(3455) deny(1) mach-lookup com.apple.system.opendirectoryd.membership
+2026-11-07 20:23:00.185 E  kernel[0:46db] [com.apple.sandbox.reporting:violation] Sandbox: git(3455) deny(1) mach-lookup com.apple.bsd.dirhelper
+2026-11-07 20:23:00.185 E  kernel[0:482c] [com.apple.sandbox.reporting:violation] Sandbox: git(3455) deny(1) mach-lookup com.apple.logd
+2026-11-07 20:23:00.185 E  kernel[0:46db] [com.apple.sandbox.reporting:violation] Sandbox: git(3455) deny(1) mach-lookup com.apple.system.notification_center
+2026-11-07 20:23:00.185 E  kernel[0:482c] [com.apple.sandbox.reporting:violation] Sandbox: git(3455) deny(1) mach-lookup com.apple.bsd.dirhelper
+2026-11-07 20:23:00.185 E  kernel[0:46db] [com.apple.sandbox.reporting:violation] Sandbox: git(3455) deny(1) mach-lookup com.apple.system.opendirectoryd.membership
+2026-11-07 20:23:00.185 E  kernel[0:482c] [com.apple.sandbox.reporting:violation] Sandbox: git(3455) deny(1) mach-lookup com.apple.bsd.dirhelper
+2026-11-07 20:23:00.251 E  kernel[0:46db] [com.apple.sandbox.reporting:violation] Sandbox: Python(3453) deny(1) mach-lookup com.apple.logd
+2026-11-07 20:23:00.291 E  kernel[0:482c] [com.apple.sandbox.reporting:violation] Sandbox: zsh(3456) deny(1) mach-lookup com.apple.system.notification_center
+2026-11-07 20:23:00.291 E  kernel[0:46db] [com.apple.sandbox.reporting:violation] Sandbox: zsh(3456) deny(1) mach-lookup com.apple.logd
+2026-11-07 20:23:00.296 E  kernel[0:482c] [com.apple.sandbox.reporting:violation] Sandbox: git(3457) deny(1) mach-lookup com.apple.system.opendirectoryd.membership
+2026-11-07 20:23:00.296 E  kernel[0:482c] [com.apple.sandbox.reporting:violation] Sandbox: git(3457) deny(1) mach-lookup com.apple.bsd.dirhelper
+2026-11-07 20:23:00.296 E  kernel[0:46db] [com.apple.sandbox.reporting:violation] Sandbox: git(3457) deny(1) mach-lookup com.apple.logd
+2026-11-07 20:23:00.296 E  kernel[0:46db] [com.apple.sandbox.reporting:violation] Sandbox: git(3457) deny(1) mach-lookup com.apple.system.notification_center
+2026-11-07 20:23:00.296 E  kernel[0:482c] [com.apple.sandbox.reporting:violation] Sandbox: git(3457) deny(1) mach-lookup com.apple.bsd.dirhelper
+2026-11-07 20:23:00.296 E  kernel[0:482c] [com.apple.sandbox.reporting:violation] Sandbox: git(3457) deny(1) mach-lookup com.apple.system.opendirectoryd.membership
+2026-11-07 20:23:00.296 E  kernel[0:46db] [com.apple.sandbox.reporting:violation] Sandbox: git(3457) deny(1) mach-lookup com.apple.bsd.dirhelper
+2026-11-07 20:23:00.311 E  kernel[0:482c] [com.apple.sandbox.reporting:violation] Sandbox: bash(3458) deny(1) mach-lookup com.apple.system.notification_center
+2026-11-07 20:23:00.311 E  kernel[0:46db] [com.apple.sandbox.reporting:violation] Sandbox: bash(3458) deny(1) mach-lookup com.apple.logd
+2026-11-07 20:23:00.315 E  kernel[0:482c] [com.apple.sandbox.reporting:violation] Sandbox: python3(3458) deny(1) mach-lookup com.apple.system.opendirectoryd.membership
+2026-11-07 20:23:00.315 E  kernel[0:46db] [com.apple.sandbox.reporting:violation] Sandbox: python3(3458) deny(1) mach-lookup com.apple.bsd.dirhelper
+2026-11-07 20:23:00.316 E  kernel[0:482c] [com.apple.sandbox.reporting:violation] Sandbox: python3(3458) deny(1) mach-lookup com.apple.logd
+2026-11-07 20:23:00.316 E  kernel[0:46db] [com.apple.sandbox.reporting:violation] Sandbox: python3(3458) deny(1) mach-lookup com.apple.system.notification_center
+2026-11-07 20:23:00.316 E  kernel[0:482c] [com.apple.sandbox.reporting:violation] Sandbox: python3(3458) deny(1) mach-lookup com.apple.bsd.dirhelper
+2026-11-07 20:23:00.316 E  kernel[0:46db] [com.apple.sandbox.reporting:violation] Sandbox: python3(3458) deny(1) mach-lookup com.apple.system.opendirectoryd.membership
+2026-11-07 20:23:00.316 E  kernel[0:482c] [com.apple.sandbox.reporting:violation] Sandbox: python3(3458) deny(1) mach-lookup com.apple.bsd.dirhelper
+2026-11-07 20:23:00.324 E  kernel[0:46db] [com.apple.sandbox.reporting:violation] Sandbox: Python(3458) deny(1) mach-lookup com.apple.system.notification_center
+2026-11-07 20:23:00.735 E  kernel[0:46db] [com.apple.sandbox.reporting:violation] Sandbox: Python(3458) deny(1) mach-lookup com.apple.logd
+2026-11-07 20:23:00.780 E  kernel[0:482c] [com.apple.sandbox.reporting:violation] Sandbox: bash(3459) deny(1) mach-lookup com.apple.system.notification_center
+2026-11-07 20:23:00.780 E  kernel[0:482c] [com.apple.sandbox.reporting:violation] Sandbox: bash(3459) deny(1) mach-lookup com.apple.logd
+2026-11-07 20:23:00.894 E  kernel[0:482c] [com.apple.sandbox.reporting:violation] Sandbox: python3(3459) deny(1) mach-lookup com.apple.system.opendirectoryd.membership
+2026-11-07 20:23:00.894 E  kernel[0:46db] [com.apple.sandbox.reporting:violation] Sandbox: python3(3459) deny(1) mach-lookup com.apple.bsd.dirhelper
+2026-11-07 20:23:00.895 E  kernel[0:482c] [com.apple.sandbox.reporting:violation] Sandbox: python3(3459) deny(1) mach-lookup com.apple.logd
+2026-11-07 20:23:00.895 E  kernel[0:482c] [com.apple.sandbox.reporting:violation] Sandbox: python3(3459) deny(1) mach-lookup com.apple.system.notification_center
+2026-11-07 20:23:00.895 E  kernel[0:482c] [com.apple.sandbox.reporting:violation] Sandbox: python3(3459) deny(1) mach-lookup com.apple.bsd.dirhelper
+2026-11-07 20:23:00.895 E  kernel[0:482c] [com.apple.sandbox.reporting:violation] Sandbox: python3(3459) deny(1) mach-lookup com.apple.system.opendirectoryd.membership
+2026-11-07 20:23:00.895 E  kernel[0:482c] [com.apple.sandbox.reporting:violation] Sandbox: python3(3459) deny(1) mach-lookup com.apple.bsd.dirhelper
+2026-11-07 20:23:00.904 E  kernel[0:46db] [com.apple.sandbox.reporting:violation] Sandbox: Python(3459) deny(1) mach-lookup com.apple.system.notification_center
+2026-11-07 20:23:04.092 E  kernel[0:4a1d] [com.apple.sandbox.reporting:violation] System Policy: Python(3470) deny(1) signal same-sandbox [BackgroundTaskManagementAgent(2682)] signum:17
+2026-11-07 20:23:04.092 E  kernel[0:4a1d] [com.apple.sandbox.reporting:violation] System Policy: Python(3470) deny(1) signal others [XprotectService(866)] signum:17
+2026-11-07 20:23:04.093 E  kernel[0:4a1d] [com.apple.sandbox.reporting:violation] System Policy: Python(3470) deny(1) signal others [UsageTrackingAgent(739)] signum:17
+2026-11-07 20:23:04.093 E  kernel[0:4a1d] [com.apple.sandbox.reporting:violation] System Policy: Python(3470) deny(1) signal same-sandbox [XProtectPluginService(703)] signum:17
+2026-11-07 20:23:04.093 E  kernel[0:4a1d] [com.apple.sandbox.reporting:violation] System Policy: Python(3470) deny(1) signal same-sandbox [system_installd(684)] signum:17
+2026-11-07 20:23:04.093 E  kernel[0:4a1d] [com.apple.sandbox.reporting:violation] System Policy: Python(3470) deny(1) signal others [ScreenTimeAgent(480)] signum:17
+2026-11-07 20:23:04.093 E  kernel[0:4a1d] [com.apple.sandbox.reporting:violation] System Policy: Python(3470) deny(1) signal others [dmd(420)] signum:17
+2026-11-07 20:23:04.093 E  kernel[0:4a1d] [com.apple.sandbox.reporting:violation] System Policy: Python(3470) deny(1) signal same-sandbox [XProtectPluginService(357)] signum:17
+2026-11-07 20:23:04.093 E  kernel[0:4a1d] [com.apple.sandbox.reporting:violation] System Policy: Python(3470) deny(1) signal others [softwareupdated(309)] signum:17
+2026-11-07 20:23:04.093 E  kernel[0:4a1d] [com.apple.sandbox.reporting:violation] System Policy: Python(3470) deny(1) signal same-sandbox [suhelperd(288)] signum:17
+2026-11-07 20:23:04.094 E  kernel[0:4a1d] [com.apple.sandbox.reporting:violation] System Policy: Python(3470) deny(1) signal others [systemstatusd(193)] signum:17
+2026-11-07 20:23:04.149 E  kernel[0:4a1e] [com.apple.sandbox.reporting:violation] System Policy: Python(3471) deny(1) signal same-sandbox [BackgroundTaskManagementAgent(2682)] signum:9
+2026-11-07 20:23:04.150 E  kernel[0:4a1e] [com.apple.sandbox.reporting:violation] System Policy: Python(3471) deny(1) signal others [XprotectService(866)] signum:9
+2026-11-07 20:23:04.150 E  kernel[0:4a1e] [com.apple.sandbox.reporting:violation] System Policy: Python(3471) deny(1) signal others [UsageTrackingAgent(739)] signum:9
+2026-11-07 20:23:04.150 E  kernel[0:4a1e] [com.apple.sandbox.reporting:violation] System Policy: Python(3471) deny(1) signal same-sandbox [XProtectPluginService(703)] signum:9
+2026-11-07 20:23:04.150 E  kernel[0:4a1e] [com.apple.sandbox.reporting:violation] System Policy: Python(3471) deny(1) signal same-sandbox [system_installd(684)] signum:9
+2026-11-07 20:23:04.150 E  kernel[0:4a1e] [com.apple.sandbox.reporting:violation] System Policy: Python(3471) deny(1) signal others [ScreenTimeAgent(480)] signum:9
+2026-11-07 20:23:04.150 E  kernel[0:4a1e] [com.apple.sandbox.reporting:violation] System Policy: Python(3471) deny(1) signal others [dmd(420)] signum:9
+2026-11-07 20:23:04.151 E  kernel[0:4a1e] [com.apple.sandbox.reporting:violation] System Policy: Python(3471) deny(1) signal same-sandbox [XProtectPluginService(357)] signum:9
+2026-11-07 20:23:04.151 E  kernel[0:4a1e] [com.apple.sandbox.reporting:violation] System Policy: Python(3471) deny(1) signal others [softwareupdated(309)] signum:9
+2026-11-07 20:23:04.151 E  kernel[0:4a1e] [com.apple.sandbox.reporting:violation] System Policy: Python(3471) deny(1) signal same-sandbox [suhelperd(288)] signum:9
+2026-11-07 20:23:04.151 E  kernel[0:4a1e] [com.apple.sandbox.reporting:violation] System Policy: Python(3471) deny(1) signal others [systemstatusd(193)] signum:9
+2026-11-07 20:23:04.173 E  kernel[0:4a23] [com.apple.sandbox.reporting:violation] System Policy: Python(3473) deny(1) signal same-sandbox [BackgroundTaskManagementAgent(2682)] signum:9
+2026-11-07 20:23:04.173 E  kernel[0:4a23] [com.apple.sandbox.reporting:violation] System Policy: Python(3473) deny(1) signal others [XprotectService(866)] signum:9
+2026-11-07 20:23:04.173 E  kernel[0:4a23] [com.apple.sandbox.reporting:violation] System Policy: Python(3473) deny(1) signal others [UsageTrackingAgent(739)] signum:9
+2026-11-07 20:23:04.173 E  kernel[0:4a23] [com.apple.sandbox.reporting:violation] System Policy: Python(3473) deny(1) signal same-sandbox [XProtectPluginService(703)] signum:9
+2026-11-07 20:23:04.173 E  kernel[0:4a23] [com.apple.sandbox.reporting:violation] System Policy: Python(3473) deny(1) signal same-sandbox [system_installd(684)] signum:9
+2026-11-07 20:23:04.174 E  kernel[0:4a23] [com.apple.sandbox.reporting:violation] System Policy: Python(3473) deny(1) signal others [ScreenTimeAgent(480)] signum:9
+2026-11-07 20:23:04.174 E  kernel[0:4a23] [com.apple.sandbox.reporting:violation] System Policy: Python(3473) deny(1) signal others [dmd(420)] signum:9
+2026-11-07 20:23:04.174 E  kernel[0:4a23] [com.apple.sandbox.reporting:violation] System Policy: Python(3473) deny(1) signal same-sandbox [XProtectPluginService(357)] signum:9
+2026-11-07 20:23:04.174 E  kernel[0:4a23] [com.apple.sandbox.reporting:violation] System Policy: Python(3473) deny(1) signal others [softwareupdated(309)] signum:9
+2026-11-07 20:23:04.174 E  kernel[0:4a23] [com.apple.sandbox.reporting:violation] System Policy: Python(3473) deny(1) signal same-sandbox [suhelperd(288)] signum:9
+2026-11-07 20:23:04.174 E  kernel[0:4a23] [com.apple.sandbox.reporting:violation] System Policy: Python(3473) deny(1) signal others [systemstatusd(193)] signum:9
+2026-11-07 20:23:09.928 Df log[3529:4ab4] [com.apple.log:] log run noninteractively, parent: 3528 (Python), args: '/usr/bin/log' 'show' '--start' '2026-11-07 20:22:50' '--info' '--style' 'compact' '--predicate' 'eventMessage CONTAINS "deny("'

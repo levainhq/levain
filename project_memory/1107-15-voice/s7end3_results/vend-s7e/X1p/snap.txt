@@ -1,0 +1,376 @@
+=== SNAP X1p 20:21:50
+--- ls -lOdn@ /private/var/folders/*
+drwxr-xr-x@  3 0  0  sunlnk  96 Nov  3 12:54 /private/var/folders/2y
+	com.apple.rootless	  7 
+drwxr-xr-x@  3 0  0  sunlnk  96 Nov  6 15:43 /private/var/folders/39
+	com.apple.rootless	  7 
+drwxr-xr-x@  3 0  0  sunlnk  96 Nov  3 12:54 /private/var/folders/5h
+	com.apple.rootless	  7 
+drwxr-xr-x@  3 0  0  sunlnk  96 Nov  6 15:44 /private/var/folders/6x
+	com.apple.rootless	  7 
+drwxr-xr-x@  3 0  0  sunlnk  96 Jun  4 05:37 /private/var/folders/9m
+	com.apple.rootless	  7 
+drwxr-xr-x@  3 0  0  sunlnk  96 Nov  6 15:43 /private/var/folders/9n
+	com.apple.rootless	  7 
+drwxr-xr-x@  3 0  0  sunlnk  96 Nov  7 20:19 /private/var/folders/g2
+	com.apple.rootless	  7 
+drwxr-xr-x@  3 0  0  sunlnk  96 Nov  7 20:19 /private/var/folders/nm
+	com.apple.rootless	  7 
+drwxr-xr-x@  3 0  0  sunlnk  96 Nov  6 15:44 /private/var/folders/r9
+	com.apple.rootless	  7 
+drwxr-xr-x@  3 0  0  sunlnk  96 Nov  3 12:54 /private/var/folders/rm
+	com.apple.rootless	  7 
+drwxr-xr-x@  3 0  0  sunlnk  96 Nov  3 12:54 /private/var/folders/yj
+	com.apple.rootless	  7 
+drwxr-xr-x@ 31 0  0  sunlnk 992 Nov  6 15:17 /private/var/folders/zz
+	com.apple.rootless	  7 
+
+--- ls -lOdn@ /private/var/folders/*/*
+drwxr-xr-x@ 6 3795  3795  sunlnk 192 Nov  3 12:54 /private/var/folders/2y/sxvhrzmd6vb6by56nz22dfjr0003pl
+	com.apple.rootless	  7 
+drwxr-xr-x@ 6 3979  3979  sunlnk 192 Nov  6 15:43 /private/var/folders/39/q9110f_j0gbfzpd3kc11dk380003wb
+	com.apple.rootless	  7 
+drwxr-xr-x@ 6 3799  3799  sunlnk 192 Nov  3 12:54 /private/var/folders/5h/c36_8jcj23b2472c_kzq688c0003pq
+	com.apple.rootless	  7 
+drwxr-xr-x@ 6 3976  3976  sunlnk 192 Nov  6 15:44 /private/var/folders/6x/xqthptdn1v5g2brkq3zmkr780003w8
+	com.apple.rootless	  7 
+drwxr-xr-x@ 6 501   20    sunlnk 192 Jun  4 05:37 /private/var/folders/9m/b94f0mqn0d327g6_m6p0x0br0000gn
+	com.apple.rootless	  7 
+drwxr-xr-x@ 6 3978  3978  sunlnk 192 Nov  6 15:43 /private/var/folders/9n/zby1v7jd29s8w_67rzfqdz780003w_
+	com.apple.rootless	  7 
+drwxr-xr-x@ 6 3966  3966  sunlnk 192 Nov  7 20:19 /private/var/folders/g2/xrht61zj5xn9g8nmpwyr4cc80003vy
+	com.apple.rootless	  7 
+drwxr-xr-x@ 6 3967  3967  sunlnk 192 Nov  7 20:19 /private/var/folders/nm/mr8xk7px7mz1tz890_0jh5mr0003vz
+	com.apple.rootless	  7 
+drwxr-xr-x@ 6 3977  3977  sunlnk 192 Nov  6 15:44 /private/var/folders/r9/qrj2kft57s58mfps4z016xxc0003w9
+	com.apple.rootless	  7 
+drwxr-xr-x@ 6 3796  3796  sunlnk 192 Nov  3 12:54 /private/var/folders/rm/_zrz0hc90zbb6zqqgltf5gnw0003pm
+	com.apple.rootless	  7 
+drwxr-xr-x@ 6 3797  3797  sunlnk 192 Nov  3 12:54 /private/var/folders/yj/k2hc885j06g5kwwn90gv9pf80003pn
+	com.apple.rootless	  7 
+drwxr-xr-x@ 7 0     0     sunlnk 224 Jun  4 05:34 /private/var/folders/zz/zyxvpxvq6csfxvn_n0000000000000
+	com.apple.rootless	  7 
+drwxr-xr-x@ 6 24    24    sunlnk 192 Jun  4 05:35 /private/var/folders/zz/zyxvpxvq6csfxvn_n000003000000r
+	com.apple.rootless	  7 
+drwxr-xr-x@ 6 55    55    sunlnk 192 Jun  4 05:34 /private/var/folders/zz/zyxvpxvq6csfxvn_n000006w00001q
+	com.apple.rootless	  7 
+drwxr-xr-x@ 6 65    65    sunlnk 192 Jun  4 05:34 /private/var/folders/zz/zyxvpxvq6csfxvn_n0000084000021
+	com.apple.rootless	  7 
+drwxr-xr-x@ 6 88    88    sunlnk 192 Jun  4 05:34 /private/var/folders/zz/zyxvpxvq6csfxvn_n00000b000002r
+	com.apple.rootless	  7 
+drwxr-xr-x@ 6 89    89    sunlnk 192 Jun  4 05:34 /private/var/folders/zz/zyxvpxvq6csfxvn_n00000b400002s
+	com.apple.rootless	  7 
+drwxr-xr-x@ 6 92    92    sunlnk 192 Nov  3 13:08 /private/var/folders/zz/zyxvpxvq6csfxvn_n00000bh00002w
+	com.apple.rootless	  7 
+drwxr-xr-x@ 6 200   200   sunlnk 192 Jun  4 05:34 /private/var/folders/zz/zyxvpxvq6csfxvn_n00000s0000068
+	com.apple.rootless	  7 
+drwxr-xr-x@ 6 202   202   sunlnk 192 Jun  4 05:34 /private/var/folders/zz/zyxvpxvq6csfxvn_n00000s800006_
+	com.apple.rootless	  7 
+drwxr-xr-x@ 6 205   205   sunlnk 192 Jun  4 05:34 /private/var/folders/zz/zyxvpxvq6csfxvn_n00000sm00006d
+	com.apple.rootless	  7 
+drwxr-xr-x@ 6 213   213   sunlnk 192 Jun  4 05:34 /private/var/folders/zz/zyxvpxvq6csfxvn_n00000tm00006n
+	com.apple.rootless	  7 
+drwxr-xr-x@ 6 235   235   sunlnk 192 Jun  4 05:34 /private/var/folders/zz/zyxvpxvq6csfxvn_n00000xc00007b
+	com.apple.rootless	  7 
+drwxr-xr-x@ 6 242   242   sunlnk 192 Jun  4 05:34 /private/var/folders/zz/zyxvpxvq6csfxvn_n00000y800007k
+	com.apple.rootless	  7 
+drwxr-xr-x@ 6 247   247   sunlnk 192 Jun  4 05:36 /private/var/folders/zz/zyxvpxvq6csfxvn_n00000yw00007q
+	com.apple.rootless	  7 
+drwxr-xr-x@ 6 248   248   sunlnk 192 Jun  4 05:35 /private/var/folders/zz/zyxvpxvq6csfxvn_n00000z000007r
+	com.apple.rootless	  7 
+drwxr-xr-x@ 6 260   260   sunlnk 192 Jun  4 05:35 /private/var/folders/zz/zyxvpxvq6csfxvn_n000010h000084
+	com.apple.rootless	  7 
+drwxr-xr-x@ 6 262   262   sunlnk 192 Jun  4 05:34 /private/var/folders/zz/zyxvpxvq6csfxvn_n000010r000086
+	com.apple.rootless	  7 
+drwxr-xr-x@ 6 263   263   sunlnk 192 Jun  4 05:34 /private/var/folders/zz/zyxvpxvq6csfxvn_n000010w000087
+	com.apple.rootless	  7 
+drwxr-xr-x@ 6 265   265   sunlnk 192 Jun  4 05:37 /private/var/folders/zz/zyxvpxvq6csfxvn_n0000114000089
+	com.apple.rootless	  7 
+drwxr-xr-x@ 6 268   268   sunlnk 192 Jun  4 05:36 /private/var/folders/zz/zyxvpxvq6csfxvn_n000011h00008c
+	com.apple.rootless	  7 
+drwxr-xr-x@ 6 271   271   sunlnk 192 Jun  4 05:35 /private/var/folders/zz/zyxvpxvq6csfxvn_n000011w00008g
+	com.apple.rootless	  7 
+drwxr-xr-x@ 6 273   273   sunlnk 192 Jun  4 05:34 /private/var/folders/zz/zyxvpxvq6csfxvn_n000012400008j
+	com.apple.rootless	  7 
+drwxr-xr-x@ 6 277   277   sunlnk 192 Jun  4 05:36 /private/var/folders/zz/zyxvpxvq6csfxvn_n000012m00008n
+	com.apple.rootless	  7 
+drwxr-xr-x@ 6 278   278   sunlnk 192 Jun  4 05:34 /private/var/folders/zz/zyxvpxvq6csfxvn_n000012r00008p
+	com.apple.rootless	  7 
+drwxr-xr-x@ 6 282   282   sunlnk 192 Jun  4 05:34 /private/var/folders/zz/zyxvpxvq6csfxvn_n000013800008t
+	com.apple.rootless	  7 
+drwxr-xr-x@ 6 289   289   sunlnk 192 Jun  4 05:34 /private/var/folders/zz/zyxvpxvq6csfxvn_n0000144000091
+	com.apple.rootless	  7 
+drwxr-xr-x@ 6 294   294   sunlnk 192 Jun  4 05:35 /private/var/folders/zz/zyxvpxvq6csfxvn_n000014r000096
+	com.apple.rootless	  7 
+drwxr-xr-x@ 6 296   296   sunlnk 192 Nov  6 15:17 /private/var/folders/zz/zyxvpxvq6csfxvn_n0000150000098
+	com.apple.rootless	  7 
+drwxr-xr-x@ 6 307   307   sunlnk 192 Jun  4 05:34 /private/var/folders/zz/zyxvpxvq6csfxvn_n000016c00009l
+	com.apple.rootless	  7 
+
+--- slot uids
+_accessoryupdater        278
+_amavisd                 83
+_analyticsd              263
+_aonsensed               300
+_appinstalld             273
+_appleevents             55
+_applepay                260
+_appowner                87
+_appserver               79
+_appstore                33
+_ard                     67
+_assetcache              235
+_astris                  245
+_atsserver               97
+_audiomxd                294
+_avbdeviced              229
+_avphidbridge            288
+_backgroundassets        291
+_biome                   289
+_calendar                93
+_captiveagent            258
+_ces                     32
+_clamav                  82
+_cmiodalassistants       262
+_coreaudiod              202
+_coremediaiod            236
+_coreml                  280
+_corespeechd             306
+_ctkd                    259
+_cvmsroot                212
+_cvs                     72
+_cyrus                   77
+_darwindaemon            284
+_datadetectors           257
+_demod                   275
+_devdocs                 59
+_devicemgr               220
+_diagnosticservicesd     307
+_diskimagesiod           271
+_displaypolicyd          244
+_distnote                241
+_dovecot                 214
+_dovenull                227
+_dpaudio                 215
+_driverkit               270
+_eligibilityd            297
+_eppc                    71
+_findmydevice            254
+_fpsd                    265
+_ftp                     98
+_gamecontrollerd         247
+_geod                    56
+_hidd                    261
+_iconservices            240
+_installassistant        25
+_installcoordinationd    274
+_installer               96
+_jabber                  84
+_kadmin_admin            218
+_kadmin_changepw         219
+_knowledgegraphd         279
+_krb_anonymous           234
+_krb_changepw            232
+_krb_kadmin              231
+_krb_kerberos            233
+_krb_krbtgt              230
+_krbfast                 246
+_krbtgt                  217
+_launchservicesd         239
+_lda                     211
+_levain_c0               3982
+_levain_c1               3980
+_levain_c2               3970
+_levain_c3               3960
+_levain_control          3797
+_levain_dispatch         3795
+_levain_export           3798
+_levain_gw0              3998
+_levain_gw1              3996
+_levain_gw10             3974
+_levain_gw11             3972
+_levain_gw12             3968
+_levain_gw13             3966
+_levain_gw14             3964
+_levain_gw15             3962
+_levain_gw2              3994
+_levain_gw3              3992
+_levain_gw4              3990
+_levain_gw5              3988
+_levain_gw6              3986
+_levain_gw7              3984
+_levain_gw8              3978
+_levain_gw9              3976
+_levain_keys             3799
+_levain_qbroker          3796
+_levain_s0               3999
+_levain_s1               3997
+_levain_s10              3975
+_levain_s11              3973
+_levain_s12              3969
+_levain_s13              3967
+_levain_s14              3965
+_levain_s15              3963
+_levain_s2               3995
+_levain_s3               3993
+_levain_s4               3991
+_levain_s5               3989
+_levain_s6               3987
+_levain_s7               3985
+_levain_s8               3979
+_levain_s9               3977
+_levain_v0               3983
+_levain_v1               3981
+_levain_v2               3971
+_levain_v3               3961
+_locationd               205
+_logd                    272
+_lp                      26
+_mailman                 78
+_mbsetupuser             248
+_mcxalr                  54
+_mdnsresponder           65
+_mmaintenanced           283
+_mobileasset             253
+_mobilegestalthelper     293
+_modelmanagerd           301
+_mysql                   74
+_naturallanguaged        304
+_nearbyd                 268
+_netbios                 222
+_netstatistics           228
+_networkd                24
+_neuralengine            296
+_notification_proxy      285
+_nsurlsessiond           242
+_oahd                    441
+_ondemand                249
+_postfix                 27
+_postgres                216
+_qtss                    76
+_reportmemoryexception   269
+_reportsystemmemory      302
+_rmd                     277
+_sandbox                 60
+_screensaver             203
+_scsd                    31
+_securityagent           92
+_sntpd                   281
+_softwareupdate          200
+_spotlight               89
+_sshd                    75
+_svn                     73
+_swtransparencyd         303
+_systemstatusd           298
+_taskgated               13
+_teamsserver             94
+_terminusd               295
+_timed                   266
+_timezone                210
+_tokend                  91
+_trustd                  282
+_trustevaluationagent    208
+_unknown                 99
+_update_sharing          95
+_usbmuxd                 213
+_uucp                    4
+_warmd                   224
+_webauthserver           221
+_windowserver            88
+_www                     70
+_wwwproxy                252
+_xserverdocs             251
+admin                    501
+daemon                   1
+nobody                   -2
+root                     0
+
+--- slot states
+{
+ "e12": {
+  "changed_at": "2026-11-07T20:19:45Z",
+  "class": "egress",
+  "dispatch_eligible": false,
+  "format": "levain-slot-state/1",
+  "index": 12,
+  "lease_seq": 0,
+  "rev": 1,
+  "state": "reusable"
+ },
+ "e13": {
+  "changed_at": "2026-11-07T20:21:32Z",
+  "class": "egress",
+  "dispatch_eligible": false,
+  "format": "levain-slot-state/1",
+  "index": 13,
+  "lease_seq": 1,
+  "rev": 3,
+  "state": "reusable"
+ },
+ "e14": {
+  "changed_at": "2026-11-07T20:18:56Z",
+  "class": "egress",
+  "dispatch_eligible": true,
+  "format": "levain-slot-state/1",
+  "index": 14,
+  "lease_seq": 0,
+  "rev": 0,
+  "state": "reusable"
+ },
+ "e15": {
+  "changed_at": "2026-11-07T20:18:56Z",
+  "class": "egress",
+  "dispatch_eligible": true,
+  "format": "levain-slot-state/1",
+  "index": 15,
+  "lease_seq": 0,
+  "rev": 0,
+  "state": "reusable"
+ },
+ "v3": {
+  "changed_at": "2026-11-07T20:18:56Z",
+  "class": "none",
+  "dispatch_eligible": true,
+  "format": "levain-slot-state/1",
+  "index": 3,
+  "lease_seq": 0,
+  "rev": 0,
+  "state": "reusable"
+ }
+}
+--- live/ retained/
+/private/var/levain/live:
+total 0
+drwx--x--x   2 root  wheel   64 Nov  7 20:21 .
+drwxr-xr-x  20 root  wheel  640 Nov  3 12:54 ..
+
+/private/var/levain/retained:
+total 0
+drwx------  27 root  wheel  864 Nov  7 20:21 .
+drwxr-xr-x  20 root  wheel  640 Nov  3 12:54 ..
+drwx------   7 root  wheel  224 Nov  6 15:50 s-1fab91d69dd5fc5c
+drwx------   7 root  wheel  224 Nov  6 16:06 s-3cd1d4b42ac54eab
+drwx------   7 root  wheel  224 Nov  6 15:49 s-43037d34b6a747ad
+drwx------   8 root  wheel  256 Nov  7 02:16 s-44a07a38c6871b7d
+drwx------   7 root  wheel  224 Nov  6 16:04 s-48a7461b2a983c1c
+drwx------   7 root  wheel  224 Nov  6 16:10 s-494c355608e058ab
+drwx------   7 root  wheel  224 Nov  6 17:46 s-4c832d64a3311a64
+drwx------   7 root  wheel  224 Nov  6 17:41 s-5909860bbdf61520
+drwx------   7 root  wheel  224 Nov  6 16:04 s-5b0949cd6e47bdda
+drwx------   7 root  wheel  224 Nov  6 15:45 s-6e0c3a26ea8c228f
+drwx------   7 root  wheel  224 Nov  6 16:15 s-771e41827cb90c0e
+drwx------   7 root  wheel  224 Nov  7 17:43 s-790460ccaf5567aa
+drwx------   7 root  wheel  224 Nov  7 20:21 s-7925c502b72e62b6
+drwx------   7 root  wheel  224 Nov  6 17:40 s-7b69c6ae618c81f2
+drwx------   7 root  wheel  224 Nov  7 17:45 s-7c1a54077841a5b3
+drwx------   7 root  wheel  224 Nov  6 16:05 s-8153c3c1c7556cea
+drwx------   7 root  wheel  224 Nov  6 18:17 s-84e43b84e43040f9
+drwx------   7 root  wheel  224 Nov  6 16:11 s-9d050bd0de750589
+drwx------   7 root  wheel  224 Nov  6 15:43 s-a162125b8fa377bc
+drwx------   7 root  wheel  224 Nov  7 14:30 s-ea63ae0b4a14b5c5
+drwx------   7 root  wheel  224 Nov  6 15:49 s-ee959b989aa28dd2
+drwx------   8 root  wheel  256 Nov  6 18:11 s-f0df3308e1661e18
+drwx------   7 root  wheel  224 Nov  6 16:06 s-f195a29fef91f474
+drwx------   8 root  wheel  256 Nov  7 17:39 s-f353c620ae334d1e
+drwx------   7 root  wheel  224 Nov  7 02:12 s-f408db3a392eebee
+

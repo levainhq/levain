@@ -1,0 +1,2 @@
+$ /usr/bin/scp -q -r -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR -o PreferredAuthentications=password,keyboard-interactive -o PubkeyAuthentication=no -o ConnectTimeout=15 admin@192.168.64.52:/private/tmp/vend_out/C1p /Users/phillipclapham/Briefcase/.levain-1107-20-s7end/project_memory/1107-15-voice/s7end3_results/vend-s7e
+rc=0

@@ -1,0 +1,33 @@
+[ip] /Users/phillipclapham/.local/bin/tart ip vend-s7e --wait 60
+[label] /usr/bin/ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR -o PreferredAuthentications=password,keyboard-interactive -o PubkeyAuthentication=no -o ConnectTimeout=15 admin@192.168.64.52 sudo -n /usr/local/bin/python3.13 -I /tmp/fire/g_vm.py label X1p
+label X1p start 2026-11-07 20:19:42
+
+[ip] /Users/phillipclapham/.local/bin/tart ip vend-s7e --wait 60
+[session-X1p] /usr/bin/ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR -o PreferredAuthentications=password,keyboard-interactive -o PubkeyAuthentication=no -o ConnectTimeout=15 admin@192.168.64.52 /usr/local/bin/python3.13 -I /tmp/fire/pty_drive.py --steps /tmp/fire/codex_steps.json --log /private/tmp/vend_out/X1p/transcript.bin --total-timeout 560 -- /usr/local/bin/python3.13 -I /tmp/fire/levain_cli.py session codex --repo /Users/admin/vend-repo --auth passthrough
+[pty_drive 20:19:58] step 1: sent 1 bytes
+[pty_drive 20:20:05] step 3: sent 178 bytes
+[pty_drive 20:20:06] step 5: sent 1 bytes
+[pty_drive 20:21:04] step 7: sent 1 bytes
+[pty_drive 20:21:29] step 9: sent 5 bytes
+[pty_drive 20:21:30] step 11: sent 1 bytes
+[pty_drive 20:21:33] exit status 0
+
+[ip] /Users/phillipclapham/.local/bin/tart ip vend-s7e --wait 60
+[observe-X1p] /usr/bin/ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR -o PreferredAuthentications=password,keyboard-interactive -o PubkeyAuthentication=no -o ConnectTimeout=15 admin@192.168.64.52 sudo -n /usr/local/bin/python3.13 -I /tmp/fire/g_vm.py observe --label X1p
+observe.json written; session s-7925c502b72e62b6 | state ["{'state': 'RETAINED', 'tunnel_bytes': 307919150}"] | tree_step entry/exc 1 0
+
+[ip] /Users/phillipclapham/.local/bin/tart ip vend-s7e --wait 60
+[logshow-X1p] /usr/bin/ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR -o PreferredAuthentications=password,keyboard-interactive -o PubkeyAuthentication=no -o ConnectTimeout=15 admin@192.168.64.52 sudo -n /usr/local/bin/python3.13 -I /tmp/fire/g_vm.py logshow --label X1p
+log show rc 0 deny lines 354 of which under var/folders 0
+
+[ip] /Users/phillipclapham/.local/bin/tart ip vend-s7e --wait 60
+[snap-X1p] /usr/bin/ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR -o PreferredAuthentications=password,keyboard-interactive -o PubkeyAuthentication=no -o ConnectTimeout=15 admin@192.168.64.52 sudo -n /usr/local/bin/python3.13 -I /tmp/fire/g_vm.py snap --label X1p
+snap written /private/tmp/vend_out/X1p/snap.txt
+
+[ip] /Users/phillipclapham/.local/bin/tart ip vend-s7e --wait 60
+[share] /usr/bin/ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR -o PreferredAuthentications=password,keyboard-interactive -o PubkeyAuthentication=no -o ConnectTimeout=15 admin@192.168.64.52 sudo -n /usr/local/bin/python3.13 -I /tmp/fire/g_vm.py share
+shared /private/tmp/vend_out
+
+[ip] /Users/phillipclapham/.local/bin/tart ip vend-s7e --wait 60
+[collect-X1p] /usr/bin/scp -q -r -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR -o PreferredAuthentications=password,keyboard-interactive -o PubkeyAuthentication=no -o ConnectTimeout=15 admin@192.168.64.52:/private/tmp/vend_out/X1p /Users/phillipclapham/Briefcase/.levain-1107-20-s7end/project_memory/1107-15-voice/s7end3_results/vend-s7e
+

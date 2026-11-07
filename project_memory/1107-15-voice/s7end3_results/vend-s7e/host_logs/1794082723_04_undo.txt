@@ -1,0 +1,108 @@
+$ /usr/bin/ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR -o PreferredAuthentications=password,keyboard-interactive -o PubkeyAuthentication=no -o ConnectTimeout=15 admin@192.168.64.52 sudo -n /usr/local/bin/python3.13 -I /tmp/fire/g_vm.py undo
+rc=0
+vain_s10: disabled
+[114/204] tombstone _levain_s10: hidden
+[115/204] tombstone _levain_s10: no home
+[116/204] take _levain_s10 out of every group
+[117/204] tombstone _levain_s10: labelled (last)
+[118/204] stop every process of _levain_s11, and check they are gone
+[119/204] tombstone _levain_s11: no login shell
+[120/204] tombstone _levain_s11: no password
+[121/204] tombstone _levain_s11: disabled
+[122/204] tombstone _levain_s11: hidden
+[123/204] tombstone _levain_s11: no home
+[124/204] take _levain_s11 out of every group
+[125/204] tombstone _levain_s11: labelled (last)
+[126/204] stop every process of _levain_s8, and check they are gone
+[127/204] tombstone _levain_s8: no login shell
+[128/204] tombstone _levain_s8: no password
+[129/204] tombstone _levain_s8: disabled
+[130/204] tombstone _levain_s8: hidden
+[131/204] tombstone _levain_s8: no home
+[132/204] take _levain_s8 out of every group
+[133/204] tombstone _levain_s8: labelled (last)
+[134/204] stop every process of _levain_s9, and check they are gone
+[135/204] tombstone _levain_s9: no login shell
+[136/204] tombstone _levain_s9: no password
+[137/204] tombstone _levain_s9: disabled
+[138/204] tombstone _levain_s9: hidden
+[139/204] tombstone _levain_s9: no home
+[140/204] take _levain_s9 out of every group
+[141/204] tombstone _levain_s9: labelled (last)
+[142/204] stop every process of _levain_v2, and check they are gone
+[143/204] tombstone _levain_v2: no login shell
+[144/204] tombstone _levain_v2: no password
+[145/204] tombstone _levain_v2: disabled
+[146/204] tombstone _levain_v2: hidden
+[147/204] tombstone _levain_v2: no home
+[148/204] take _levain_v2 out of every group
+[149/204] tombstone _levain_v2: labelled (last)
+[150/204] give /private/var/levain/export/operator and everything below it back to wheel (its group levain-export is about to be deleted)
+      /usr/bin/chgrp -R -h -P wheel /private/var/levain/export/operator
+[151/204] give /private/var/levain/export/dispatch and everything below it back to wheel (its group levain-dispatch-export is about to be deleted)
+      /usr/bin/chgrp -R -h -P wheel /private/var/levain/export/dispatch
+[152/204] give /private/var/levain/queue/requests and everything below it back to wheel (its group levain-queue is about to be deleted)
+      /usr/bin/chgrp -R -h -P wheel /private/var/levain/queue/requests
+[153/204] give /private/var/levain/queue/answers and everything below it back to wheel (its group levain-queue is about to be deleted)
+      /usr/bin/chgrp -R -h -P wheel /private/var/levain/queue/answers
+[154/204] give /private/var/levain/contracts and everything below it back to wheel (its group levain-queue is about to be deleted)
+      /usr/bin/chgrp -R -h -P wheel /private/var/levain/contracts
+[155/204] give /private/var/levain/lineage and everything below it back to wheel (its group levain-lineage is about to be deleted)
+      /usr/bin/chgrp -R -h -P wheel /private/var/levain/lineage
+[156/204] give /private/var/run/levain/control and everything below it back to wheel (its group levain-control is about to be deleted)
+      /usr/bin/chgrp -R -h -P wheel /private/var/run/levain/control
+[157/204] give /private/var/run/levain/dispatch and everything below it back to wheel (its group levain-control is about to be deleted)
+      /usr/bin/chgrp -R -h -P wheel /private/var/run/levain/dispatch
+[158/204] give /private/var/run/levain/reaper and everything below it back to wheel (its group levain-wake is about to be deleted)
+      /usr/bin/chgrp -R -h -P wheel /private/var/run/levain/reaper
+[159/204] take _levain_c2 out of levain-slots
+[160/204] take _levain_control out of levain-keysadmin
+[161/204] take _levain_control out of levain-wake
+[162/204] take _levain_dispatch out of levain-control
+[163/204] take _levain_dispatch out of levain-dispatch-export
+[164/204] take _levain_dispatch out of levain-lineage
+[165/204] take _levain_dispatch out of levain-queue
+[166/204] take _levain_gw10 out of levain-gwfronts
+[167/204] take _levain_gw11 out of levain-gwfronts
+[168/204] take _levain_gw8 out of levain-gwfronts
+[169/204] take _levain_gw9 out of levain-gwfronts
+[170/204] take _levain_keys out of levain-control
+[171/204] take _levain_keys out of levain-gwfronts
+[172/204] take _levain_keys out of levain-keysadmin
+[173/204] take _levain_qbroker out of levain-control
+[174/204] take _levain_qbroker out of levain-queue
+[175/204] take _levain_s10 out of levain-slots
+[176/204] take _levain_s11 out of levain-slots
+[177/204] take _levain_s8 out of levain-slots
+[178/204] take _levain_s9 out of levain-slots
+[179/204] take _levain_v2 out of levain-slots
+[180/204] take admin out of levain-control
+[181/204] take admin out of levain-export
+[182/204] take admin out of levain-queue
+[183/204] delete the group levain-control
+[184/204] delete the group levain-dispatch-export
+[185/204] delete the group levain-export
+[186/204] delete the group levain-gwfronts
+[187/204] delete the group levain-keysadmin
+[188/204] delete the group levain-lineage
+[189/204] delete the group levain-queue
+[190/204] delete the group levain-slots
+[191/204] delete the group levain-wake
+[192/204] remove the lo0 alias 127.0.1.10
+[193/204] remove the lo0 alias 127.0.1.11
+[194/204] remove the lo0 alias 127.0.1.12
+[195/204] remove the lo0 alias 127.0.1.9
+[196/204] flush the pf anchor com.apple/levain
+[197/204] remove /etc/pf.anchors/levain
+[198/204] release pf's enable reference (the token in /var/db/levain/pf.token)
+[199/204] remove the install record
+      /bin/rm -f /private/var/levain/policy/install-shape
+[200/204] check the sudoers config with visudo -c before /etc/sudoers.d/levain-install goes
+[201/204] remove /etc/sudoers.d/levain-install (visudo -c checks the config next)
+[202/204] remove the intent journal /var/db/levain/install-intent
+      /bin/rm -f /var/db/levain/install-intent
+[203/204] remove the operator record (last)
+      /bin/rm -f /private/var/levain/policy/operator
+[204/204] check the sudoers config with visudo -c (after /etc/sudoers.d/levain-install)
+
+UNDO_RC=0

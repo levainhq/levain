@@ -1,0 +1,29 @@
+[ip] /Users/phillipclapham/.local/bin/tart ip vend-s7e --wait 60
+[run-C1p] /usr/bin/ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR -o PreferredAuthentications=password,keyboard-interactive -o PubkeyAuthentication=no -o ConnectTimeout=15 admin@192.168.64.52 sudo -n /usr/local/bin/python3.13 -I /tmp/fire/g_vm.py run --label C1p --mode real --slot 12 --timeout 900 --settle 90 --brief-file /tmp/fire/claude_brief.txt --model haiku --tunnel-bytes 100000000 --actions 60 --production-blob
+label C1p start 2026-11-07 20:22:00
+=== C1p mode=real plant=False secret=False 20:22:00
+start phase ended after 22s; planted=no
+-- C1p.final.json {"poll": 0, "stop_file": false}
+
+slots busy=0 after 0s settle (a HELD END keeps the slot leased and retries about every 31 s)
+session s-d0145c81d0227d01
+
+[ip] /Users/phillipclapham/.local/bin/tart ip vend-s7e --wait 60
+[observe-C1p] /usr/bin/ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR -o PreferredAuthentications=password,keyboard-interactive -o PubkeyAuthentication=no -o ConnectTimeout=15 admin@192.168.64.52 sudo -n /usr/local/bin/python3.13 -I /tmp/fire/g_vm.py observe --label C1p
+observe.json written; session s-d0145c81d0227d01 | state ["{'state': 'RETAINED', 'tunnel_bytes': 601371}"] | tree_step entry/exc 1 0
+
+[ip] /Users/phillipclapham/.local/bin/tart ip vend-s7e --wait 60
+[logshow-C1p] /usr/bin/ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR -o PreferredAuthentications=password,keyboard-interactive -o PubkeyAuthentication=no -o ConnectTimeout=15 admin@192.168.64.52 sudo -n /usr/local/bin/python3.13 -I /tmp/fire/g_vm.py logshow --label C1p
+log show rc 0 deny lines 244 of which under var/folders 0
+
+[ip] /Users/phillipclapham/.local/bin/tart ip vend-s7e --wait 60
+[snap-C1p] /usr/bin/ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR -o PreferredAuthentications=password,keyboard-interactive -o PubkeyAuthentication=no -o ConnectTimeout=15 admin@192.168.64.52 sudo -n /usr/local/bin/python3.13 -I /tmp/fire/g_vm.py snap --label C1p
+snap written /private/tmp/vend_out/C1p/snap.txt
+
+[ip] /Users/phillipclapham/.local/bin/tart ip vend-s7e --wait 60
+[share] /usr/bin/ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR -o PreferredAuthentications=password,keyboard-interactive -o PubkeyAuthentication=no -o ConnectTimeout=15 admin@192.168.64.52 sudo -n /usr/local/bin/python3.13 -I /tmp/fire/g_vm.py share
+shared /private/tmp/vend_out
+
+[ip] /Users/phillipclapham/.local/bin/tart ip vend-s7e --wait 60
+[collect-C1p] /usr/bin/scp -q -r -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR -o PreferredAuthentications=password,keyboard-interactive -o PubkeyAuthentication=no -o ConnectTimeout=15 admin@192.168.64.52:/private/tmp/vend_out/C1p /Users/phillipclapham/Briefcase/.levain-1107-20-s7end/project_memory/1107-15-voice/s7end3_results/vend-s7e
+

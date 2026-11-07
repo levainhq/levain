@@ -1,0 +1,9 @@
+$ /usr/bin/ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR -o PreferredAuthentications=password,keyboard-interactive -o PubkeyAuthentication=no -o ConnectTimeout=15 admin@192.168.64.52 sudo -n /usr/local/bin/python3.13 -I /tmp/fire/g_vm.py fixsudo
+rc=0
+before 0o440
+after 0o440
+/etc/sudoers: parsed OK
+/private/etc/sudoers.d/admin-nopasswd: parsed OK
+/private/etc/sudoers.d/levain-install: parsed OK
+/private/etc/sudoers.d/levain-runtime: parsed OK
+
