@@ -525,6 +525,44 @@ def test_t_rotate_a_replaced_conversation_is_refused_and_nothing_is_reserved(rig
     assert not rig.ledger_path.exists() and rig.transport.seen == []
 
 
+def test_t_sample_the_settings_test_speaks_the_fixed_sentence_through_the_chosen_provider(rig):
+    """Phill 11-07: the settings test played the on-device voice whatever the setting. The sample is a body of exactly
+    sample/provider/voice/speed: the words are the server's constant, no room is read, and a body that adds words is refused.
+    Red with: the sample branch removed (the route answers 400 bad_request)."""
+    rig.add_key()
+    with served(rig) as (port, _httpd):
+        body = {"sample": True, "provider": "openai", "voice": "nova", "speed": 1.0}
+        status, hdrs, out = call(port, "POST", SPEAK, json.dumps(body).encode())
+        assert (status, out) == (200, MP3) and hdrs["content-type"] == "audio/mpeg"
+        assert rig.transport.sent_text() == cockpit_voice.SAMPLE_WORDS
+        for bad in ({"text": "say this"}, {"sample": False}, {"reply_gseq": 1}):
+            status, _h, out = call(port, "POST", SPEAK, json.dumps({**body, **bad}).encode())
+            assert (status, js(out)["error"]) == (400, "bad_request"), bad
+        status, _h, out = call(port, "POST", SPEAK, json.dumps({**body, "voice": "ballad"}).encode())
+        assert (status, js(out)["error"]) == (400, "bad_request")
+    assert [r.status for r in rig.rows()] == ["ok"]
+
+
+def test_t_roomdir_the_reply_is_read_from_the_room_hosts_store_not_the_readers(rig, tmp_path):
+    """Phill 11-07, live: flow's bridge swaps the consent reader for the Signer's queue, whose store holds no room, so every
+    speak answered room_rotated for the room the page was showing. The reply now comes from the room host's own store.
+    Red with: speak given `_store_directory()` again (409 room_rotated)."""
+    rig.add_key()
+    g = rig.reply("Hello there.")
+    elsewhere = tmp_path / "other-store"
+    elsewhere.mkdir()
+    with served(rig) as (port, httpd):
+        base = httpd.RequestHandlerClass
+
+        class SwappedReader(base):
+            def _store_directory(self, *a, **k):
+                return elsewhere
+
+        httpd.RequestHandlerClass = SwappedReader
+        status, _h, out = speak(port, rig, g)
+    assert (status, out) == (200, MP3)
+
+
 # --- 6. T-ORDER, 7. T-SETTLE, 8. T-RELEASE -------------------------------------------------------------------------------
 
 def _spy_order(monkeypatch, rig) -> list[str]:

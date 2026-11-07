@@ -71,6 +71,10 @@ BODY_DEADLINE_S = 20.0
 UPLOAD_BYTES_PER_SECOND = 4000
 LEDGER_NAME = vmeter.DB_NAME            # the ledger file, in the store directory beside dispatch.db (parent design 6)
 SPEAK_KEYS = frozenset({"room_thread_id", "reply_gseq", "chunk", "provider", "voice", "speed"})
+# The settings block's premium test: no room, no reply. The words are THIS constant (the page sends none), so the route
+# still never speaks a sentence the page chose.
+SAMPLE_KEYS = frozenset({"sample", "provider", "voice", "speed"})
+SAMPLE_WORDS = "This is how your room will sound."
 LAST_READ_STATES = frozenset({"keychain_unreadable", "unusable", "refused", "authority_unreadable"})
 
 
@@ -474,7 +478,8 @@ def _parse_speak(raw: bytes) -> tuple[dict[str, Any] | None, Answer | None]:
         req = json.loads(raw.decode("utf-8"))
     except (ValueError, UnicodeDecodeError):
         return None, refusal(400, "bad_json", "bad_json")
-    if not isinstance(req, dict) or set(req) != SPEAK_KEYS:
+    sample = isinstance(req, dict) and set(req) == SAMPLE_KEYS and req["sample"] is True
+    if not sample and (not isinstance(req, dict) or set(req) != SPEAK_KEYS):
         return None, refusal(400, "bad_request", "bad_keys")
     provider = req["provider"]
     if isinstance(provider, str) and provider in UNSUPPORTED:
@@ -484,11 +489,14 @@ def _parse_speak(raw: bytes) -> tuple[dict[str, Any] | None, Answer | None]:
     if provider not in offered():
         return None, refusal(409, "provider_unsupported", "provider_unsupported", provider=provider)
     data = PROVIDERS[provider]
-    if isinstance(req["reply_gseq"], bool) or not isinstance(req["reply_gseq"], int):
-        return None, refusal(400, "bad_request", "bad_reply")
-    chunk = req["chunk"]
-    if isinstance(chunk, bool) or not isinstance(chunk, int) or chunk < 0:
-        return None, refusal(400, "bad_request", "bad_chunk")
+    if sample:
+        req = {**req, "chunk": 0}
+    else:
+        if isinstance(req["reply_gseq"], bool) or not isinstance(req["reply_gseq"], int):
+            return None, refusal(400, "bad_request", "bad_reply")
+        chunk = req["chunk"]
+        if isinstance(chunk, bool) or not isinstance(chunk, int) or chunk < 0:
+            return None, refusal(400, "bad_request", "bad_chunk")
     if not isinstance(req["voice"], str) or req["voice"] not in data.voices:
         return None, refusal(400, "bad_request", "bad_voice", provider=provider)
     speed = req["speed"]
@@ -508,28 +516,12 @@ def speak(data_root: Path | str, service: Any, raw: bytes, *, directory: Path | 
     if refused is not None or req is None:
         return refused or internal_answer()
     provider = req["provider"]
-    thread, need = cockpit_room._need_room(directory, req)
-    if need is not None:
-        status = need[0]
-        if status == 409:
-            return refusal(409, "room_rotated", "room_rotated")
-        if status == 404:
-            return refusal(404, "not_found", "no_room")
-        return refusal(400, "bad_request", "bad_room")
-    try:
-        room = cockpit_room.room_read(directory, service)
-    except Exception:            # noqa: BLE001 - a record that cannot be read is fixed words, never its detail
-        return refusal(500, "internal", "room_unreadable")
-    if room.get("room_thread") != thread:       # rotated between the check and the read
-        return refusal(409, "room_rotated", "room_rotated")
-    text = reply_text(room.get("stream") or [], req["reply_gseq"])
-    if text is None:
-        return refusal(404, "not_a_reply", "not_a_reply")
-    chunks = speakable(text)
-    if not chunks:
-        return refusal(404, "nothing_to_read", "nothing_to_read")
-    if not req["chunk"] < len(chunks):
-        return refusal(404, "no_such_chunk", "no_such_chunk", chunks=len(chunks))
+    if req.get("sample") is True:
+        chunks = [SAMPLE_WORDS]
+    else:
+        chunks, refused = _reply_chunks(directory, service, req)
+        if refused is not None or chunks is None:
+            return refused or internal_answer()
     words = chunks[req["chunk"]]
     adapter = vprov.provider_for(provider, transport)
     voice, speed = req["voice"], req["speed"]
@@ -540,6 +532,33 @@ def speak(data_root: Path | str, service: Any, raw: bytes, *, directory: Path | 
         return refused
     return Answer(200, "audio/mpeg", [("X-Voice-Chunks", str(len(chunks))), ("X-Voice-Chunk", str(req["chunk"]))],
                   bytes(audio))
+
+
+def _reply_chunks(directory: Path | str, service: Any, req: dict[str, Any]) -> tuple[list[str] | None, Answer | None]:
+    """The speakable chunks of the room reply the request names, or the refusal. The words are only the record's."""
+    thread, need = cockpit_room._need_room(directory, req)
+    if need is not None:
+        status = need[0]
+        if status == 409:
+            return None, refusal(409, "room_rotated", "room_rotated")
+        if status == 404:
+            return None, refusal(404, "not_found", "no_room")
+        return None, refusal(400, "bad_request", "bad_room")
+    try:
+        room = cockpit_room.room_read(directory, service)
+    except Exception:            # noqa: BLE001 - a record that cannot be read is fixed words, never its detail
+        return None, refusal(500, "internal", "room_unreadable")
+    if room.get("room_thread") != thread:       # rotated between the check and the read
+        return None, refusal(409, "room_rotated", "room_rotated")
+    text = reply_text(room.get("stream") or [], req["reply_gseq"])
+    if text is None:
+        return None, refusal(404, "not_a_reply", "not_a_reply")
+    chunks = speakable(text)
+    if not chunks:
+        return None, refusal(404, "nothing_to_read", "nothing_to_read")
+    if not req["chunk"] < len(chunks):
+        return None, refusal(404, "no_such_chunk", "no_such_chunk", chunks=len(chunks))
+    return chunks, None
 
 
 # --- transcribe -------------------------------------------------------------------------------------------------------
@@ -574,9 +593,9 @@ def transcribe(data_root: Path | str, query: str, content_type: str, audio: byte
         return refused or internal_answer()
     mime = base_type(content_type)
     if mime not in vprov.MIME_ALLOW:
-        return refusal(415, "unsupported_media_type", "unsupported_media_type")
+        return None, refusal(415, "unsupported_media_type", "unsupported_media_type")
     if not audio:
-        return refusal(400, "no_audio", "no_audio")
+        return None, refusal(400, "no_audio", "no_audio")
     adapter = vprov.provider_for(provider, transport)
     text, refused = _call(provider, "stt", upload_units(len(audio)), data_root, revoke_queue=revoke_queue,
                           meter=meter, read_key=read_key, last_read=last_read,

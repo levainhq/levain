@@ -1487,14 +1487,13 @@
     check("vc-notify", "Read a notification aloud when I open it", st.notify, (v) => V.saveSettings({ notify: v }),
           "Saved for this device. The page that opens a notification reads it only where the browser allows.");
 
-    // the sample is the on-device voice: the premium route reads only words already in the room, never a sentence the page sends
-    const hear = el("button", "dev-btn vc-hear", "Hear the on-device voice"); hear.type = "button";
+    // the test plays the tier the settings name: premium asks the route for its fixed sample sentence, on-device speaks locally
+    const hear = el("button", "dev-btn vc-hear", premium && prov ? "Hear this voice" : "Hear the on-device voice"); hear.type = "button";
     const hearNote = el("p", "dev-note vc-help vc-hearnote");
     hearNote.setAttribute("role", "status"); hearNote.hidden = true;
     const showHear = () => { const m = V.noteFor({ thread: "sample", gseq: 0 }); hearNote.textContent = m; hearNote.hidden = !m; };
-    hear.addEventListener("click", () => { showHear(); V.sampleDevice().then(showHear, showHear); });
+    hear.addEventListener("click", () => { showHear(); (V.sample || V.sampleDevice)().then(showHear, showHear); });
     const hr = el("div", "dev-row vc-row"); hr.appendChild(hear); hr.appendChild(hearNote);
-    if (prov) hr.appendChild(el("p", "dev-note vc-help", "To hear the premium voice, tap Play on a room reply."));
     vcBody.appendChild(hr);
 
     // keys and the estimated spend: read only
@@ -1505,7 +1504,11 @@
       vcBody.appendChild(el("p", "dev-note vc-caps", "Estimated spend: $" + n(caps.spent_day_est) + " today of a $" + n(caps.day_usd) +
         " cap, $" + caps.spent_month_est + " this month of $" + n(caps.month_usd) + ". An estimate; the provider's bill is the truth."));
     }
-    if (focusId) { const f = document.getElementById(focusId); if (f) f.focus(); }
+    // Keyboard users keep their place. On a touch screen a focus() on the rebuilt <select> re-opens its picker (iOS Safari), so
+    // choosing a value looked like the list reloading and staying open until he tapped away: no refocus where the pointer is coarse.
+    let coarse = false;
+    try { coarse = !!(window.matchMedia && window.matchMedia("(pointer: coarse)").matches); } catch (_) { coarse = false; }
+    if (focusId && !coarse) { const f = document.getElementById(focusId); if (f) f.focus(); }
   }
 
   function start() {
