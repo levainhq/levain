@@ -265,6 +265,11 @@ Nothing is forced. A network or authentication failure is recorded and retried a
 
 ### Known edges
 
+- **A slow fetch or push can outlast the hook.** The tree judge has one deadline under the hook's ceiling, but `push.execute` (shared with the consent push) still uses git's default 600 s timeout for the fetch and the push. A very slow network can get the hook killed before it writes its `seat_egress.jsonl` line; nothing is pushed past what git itself completed. A deadline threaded into `push.execute` is the fix.
+- **Merging upstream commits that touch `activation` stops the push.** Every commit in `base..tip` is judged, including upstream's; the seat must rebase its own commits onto the grant's branch instead of merging them in.
+- **A clone root under a directory with glob characters is refused with a message that names the exempt path,** not the root.
+- **The candidate-pathspec count is capped (256) but not its total bytes;** a lane with that many near-`PATH_MAX` names is refused as unreadable instead of batched.
+
 - **The network outlives a revoke.** The allowed domains are frozen into the seat's launch settings. A revoke or
   expiry cuts the push at once, but a running seat keeps the network it launched with until it is relaunched.
 - **A short window at revoke.** A revoke that lands between the moment the hook reads the log and the moment the

@@ -309,3 +309,10 @@ def test_the_streamed_read_honours_the_shared_deadline(eg):
     assert tally["paths"] == 1
     with pytest.raises(sp._Late):
         sp._mirror_paths(clone / ".git", args, deadline=time.monotonic() - 1, stdin=b"", tally=dict(tally, hits=set()))
+
+
+def test_the_push_judge_and_the_launch_exemption_name_the_same_trees() -> None:
+    """Revert: either constant gaining a name the other lacks (a tree read-only at launch but pushable, or the reverse)."""
+    from levain import seat_profile, seat_push
+
+    assert set(seat_push._TREE_NAMES) == set(seat_profile.TRACKED_EXEMPT_NAMES)
