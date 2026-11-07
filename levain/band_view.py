@@ -479,7 +479,7 @@ def _render_full(store: QuestionStore, gen: int, deadline: float, coord_conn: sq
                 lines.extend(_item_lines(label, obj, compact=pos >= COMPACT_AFTER))
                 if obj.id in extras.escalations:
                     text, rec = extras.escalations[obj.id]
-                    lines.append(f"    escalated by the coordinator: {_short(text, 200)} · rec on record: {rec}")
+                    lines.append(f"    escalated by the desk: {_short(text, 200)} · rec on record: {rec}")
         except Exception:                     # one item that will not render never drops the band (D13)
             lines.append(f"{label} UNREADABLE: {key[0]} {key[1]} could not be read (listed, never dropped)")
     lines.extend(f"! not read: {why} (items from it are missing, not closed)" for why in extras.failed)

@@ -483,7 +483,7 @@ def test_the_form_says_what_each_limit_counts_and_what_happens_next(tmp_path: Pa
                  "Reaching a limit: no new workers start until you extend. Nothing running is killed.",
                  "Hard stop: it ends at this time regardless.",
                  "sends your words with no limits attached",
-                 "then the coordinator may start work inside these limits"):
+                 "then the desk may start work inside these limits"):
         assert want.lower() in text.lower(), want
     assert "Ends by" not in text and "pauses new work" not in text
 

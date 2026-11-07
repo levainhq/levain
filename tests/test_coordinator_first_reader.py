@@ -70,7 +70,7 @@ def test_an_answer_inside_the_envelope_is_a_know_labelled_as_its_own_and_the_que
     assert band.qs.get(q.id).answer is None and review.question_open(band.store.directory)(q.id) is True
     text = question_context(band.store.directory, "claude_code", SEAT)
     assert text.splitlines() == [
-        "levain: the coordinator, not the operator, answered question #1 «rename helper to _x?» on its own reading: "
+        "levain: the desk, not the operator, answered question #1 «rename helper to _x?» on its own reading: "
         "option a «rename it».", band_mod.KNOW_TAIL, ANSWER_TAIL]
     assert question_context(band.store.directory, "claude_code", SEAT) is None          # once
     # the operator still answers, and his answer is delivered as his
@@ -355,7 +355,7 @@ def test_a_know_that_fails_to_format_is_not_marked_delivered(band, monkeypatch):
     assert question_context(band.store.directory, "claude_code", SEAT) is None
     assert band.c.rows("SELECT COUNT(*) FROM know_deliveries") == [(0,)]
     monkeypatch.undo()
-    assert "the coordinator, not the operator, answered question #1" in question_context(
+    assert "the desk, not the operator, answered question #1" in question_context(
         band.store.directory, "claude_code", SEAT)
 
 

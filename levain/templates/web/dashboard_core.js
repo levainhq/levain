@@ -1543,7 +1543,7 @@
     for (const old of document.querySelectorAll("#ck-hero > .ck-region-err")) old.remove();   // a clean hero render clears its last error line
     guardRegion("the hero", () => renderHero(view, byId), regionErr("ck-hero", false), restoreHero);
     guardRegion("the brief", () => renderBriefRegion(view, byId), regionErr("ck-brief", true), restoreState);
-    guardRegion("the coordinator drop", () => renderDropHero(view), regionErr("ck-drop", false));
+    guardRegion("the desk drop", () => renderDropHero(view), regionErr("ck-drop", false));
     guardRegion("the needs strip", () => renderNeeds(view), regionErr("ck-needs", true));
     guardRegion("the notes strip", () => renderNotes(view), regionErr("ck-notes", true));
     guardRegion("the widgets", () => renderWidgets(view, byId), regionErr("ck-widgets", true));
@@ -6233,7 +6233,7 @@
   }
   // A seat's message box on its agent page: the compose panel's own verb, built by the same box builder the compose card uses (so the
   // confirm, the passkey signature of a signed verb and the failure words are the card's), its reader fixed to this seat.
-  const SEAT_DIRECT_NOTE = "For direct work with this seat (a high-residue build, a deep session on its own problem, or a seat stuck at a prompt). Everything else goes to the coordinator: use the drop box.";
+  const SEAT_DIRECT_NOTE = "For direct work with this seat (a high-residue build, a deep session on its own problem, or a seat stuck at a prompt). Everything else goes to the desk: use the drop box.";
   function seatMessageBox(name) {
     const wrap = el("div", "agent-msg");
     wrap.appendChild(el("div", "needs-sec-label", "Message " + name));
@@ -7415,7 +7415,7 @@
     // the sheet reads them once and removes them
     // (set after openSheet, which closes any sheet first and so clears the key; the frame loads later than this returns;
     // closeSignSheet and an edit of the box clear it again, so a sheet that never reads it leaves nothing behind)
-    const got = openSheet("/sign/drop", "", "", "coordinator drop", "Add an envelope");
+    const got = openSheet("/sign/drop", "", "", "desk drop", "Add an envelope");
     if (got && typeof words === "string" && words) { try { window.sessionStorage.setItem(DROP_PREFILL_KEY, words); } catch (e) { /* the sheet opens empty */ } }
     return got;
   }
@@ -7535,9 +7535,9 @@
     box.setAttribute("contenteditable", "true");      // "true", the markup the 11-06 test found clean; plaintext-only was never tried on the phone
     box.setAttribute("role", "textbox");
     box.setAttribute("aria-multiline", "true");
-    box.setAttribute("aria-label", "your words for the coordinator");
-    box.setAttribute("aria-placeholder", "words for the coordinator");
-    box.dataset.placeholder = "words for the coordinator";
+    box.setAttribute("aria-label", "your words for the desk");
+    box.setAttribute("aria-placeholder", "words for the desk");
+    box.dataset.placeholder = "words for the desk";
     for (const [k, v] of [["autocapitalize", "sentences"], ["autocorrect", "on"], ["spellcheck", "true"], ["inputmode", "text"], ["enterkeyhint", "enter"]]) box.setAttribute(k, v);
     // a cleared box keeps a lone <br> in some browsers, which would hold the placeholder away: empty means empty
     // (only after a deletion: Enter in an empty box leaves <br>s too, and those are the newline the user just typed)
@@ -7619,15 +7619,15 @@
       (res) => {
         if (res.status === 404) return { why: "This cockpit has no coordinator store to send to (no signing is set up here)." };
         if (res.status === 401 || res.status === 403) return { why: "Sign in to send: this cockpit refused this browser's token.", auth: true };
-        if (!res.ok) return { why: "The coordinator could not be read (HTTP " + res.status + ")." };
-        return res.json().then((b) => (b && Array.isArray(b.coord_drops) ? { body: b } : { why: "The coordinator's answer was not a drop list." }),
-                               () => ({ why: "The coordinator's answer could not be read." }));
+        if (!res.ok) return { why: "The desk could not be read (HTTP " + res.status + ")." };
+        return res.json().then((b) => (b && Array.isArray(b.coord_drops) ? { body: b } : { why: "The desk's answer was not a drop list." }),
+                               () => ({ why: "The desk's answer could not be read." }));
       },
-      () => ({ why: "The coordinator could not be reached." })), "the drops could not be read").then((r) => {
-        const out = r && (r.body || r.why) ? r : { why: ((r && r.error) || "The coordinator could not be read") + "." };
+      () => ({ why: "The desk could not be reached." })), "the drops could not be read").then((r) => {
+        const out = r && (r.body || r.why) ? r : { why: ((r && r.error) || "The desk could not be read") + "." };
         if (!out.body) failed(got);      // a failed read is asked again within seconds, not held for the TTL
         return out;
-      }, () => { failed(got); return { why: "The coordinator could not be read." }; });
+      }, () => { failed(got); return { why: "The desk could not be read." }; });
     dropRead = got;
     return got;
   }
@@ -7743,7 +7743,7 @@
   function dropHeroBuild(host) {
     const ui = { req: null, storeId: null, storeRead: false, can: false, shown: false, working: false, drops: [], open: new Set(), seen: null, q: "", sig: null, view: null, read: null };
     const head = el("div", "needs-headline");
-    head.appendChild(el("h3", null, "Drop to the coordinator"));
+    head.appendChild(el("h3", null, "Drop to the desk"));
     ui.say = el("span", "needs-gloss drop-note", "");
     head.appendChild(ui.say);
     // a contenteditable div, not a textarea: iOS Safari classified the textarea as a card/contact field from its page context
@@ -7775,7 +7775,7 @@
     ui.moreHost = el("div", "drop-more-host");
     ui.olderNote = el("p", "drop-older-note ext-meta", "Older drops are not shown here.");      // the listing reads a bounded number of the newest
     ui.olderNote.hidden = true;
-    ui.sub = el("p", "drop-sub ext-meta", "Your drops and the coordinator's replies");
+    ui.sub = el("p", "drop-sub ext-meta", "Your drops and the desk's replies");
     ui.live = el("p", "drop-live");      // announces a new reply; never holds anything else
     ui.live.setAttribute("role", "status");
     ui.live.setAttribute("aria-live", "polite");
@@ -7852,7 +7852,7 @@
           const first = w.split("\n")[0].trim().slice(0, 80) + (w.length > 80 || w.includes("\n") ? "…" : "");
           const how = dropHow(req, a.body);
           setDropBoxText(words, "");
-          paint((a.body.created === false ? "Already delivered: " : "Sent to the coordinator: ") + "“" + first + "” · " + how.text + " · " + String(d.drop_id || ""), !how.ok);
+          paint((a.body.created === false ? "Already delivered: " : "Sent to the desk: ") + "“" + first + "” · " + how.text + " · " + String(d.drop_id || ""), !how.ok);
           resume();      // an earlier unconfirmed drop comes into the box, to send unchanged
           earlierLine();
           lock(false);
@@ -7892,7 +7892,7 @@
     ui.storeRead = !!body && body.coord_store_read === true;
     ui.storeId = body && typeof body.coord_store_id === "string" ? body.coord_store_id : null;
     ui.can = ui.storeRead;
-    const note = !body ? (r && r.why) || "The coordinator could not be read."
+    const note = !body ? (r && r.why) || "The desk could not be read."
       : !ui.storeRead ? (typeof body.coord_note === "string" && body.coord_note ? body.coord_note : "Still reading which Levain answers here; reload.")
       : typeof body.coord_note === "string" ? body.coord_note : "";
     ui.note = note;
@@ -7959,7 +7959,7 @@
     if (!fresh.length) return;
     ui.live.textContent = "";
     if (ui.liveTid) clearTimeout(ui.liveTid);      // one pending announcement at a time
-    ui.liveTid = setTimeout(() => { ui.live.textContent = "The coordinator replied."; }, 30);      // emptied first, so a second reply is spoken again
+    ui.liveTid = setTimeout(() => { ui.live.textContent = "The desk replied."; }, 30);      // emptied first, so a second reply is spoken again
   }
   function dropRefresh(host, fresh) {
     const t = window.LevainCockpitTransport;
@@ -9733,7 +9733,7 @@ for (const type of ["touchstart", "wheel", "pointerdown", "click", "keydown"]) d
       go.setAttribute("href", ncSignHref(n.sign_id, n.sign_v)); go.setAttribute("rel", "noopener noreferrer");
       ask.appendChild(go);
     }
-    const why = live ? (opts.length ? NC_SIGN_NOTE.open : "") : state ? (NC_SIGN_NOTE[state] || NC_SIGN_NOTE.unknown) : opts.length ? "No sign page for this item: answer at the desk." : "";
+    const why = live ? (opts.length ? NC_SIGN_NOTE.open : "") : state ? (NC_SIGN_NOTE[state] || NC_SIGN_NOTE.unknown) : opts.length ? "No sign page for this item: answer at the laptop." : "";
     if (why) {
       const p = el("p", "nc-note" + (live ? "" : " nc-signstate"), why);
       const page = state === "unknown" ? ncSignHref(n.sign_id) : null;

@@ -8,7 +8,7 @@ where you typed it); a detached HEAD or no repo records none. Words come from th
 them back.
 
 ``levain envelope`` (echo, sign, accept, show, list, kill, narrow) and ``levain drop --envelope`` are the operator's own
-door to a thread envelope: what the coordinator may do for a thread, signed by you (y/N on your terminal, or ``--yes``).
+door to a thread envelope: what the desk may do for a thread, signed by you (y/N on your terminal, or ``--yes``).
 Exit codes follow C1's convention: 0 done, 1 refused or faulted (a store that would not answer, a signer that could
 not run included), the refusal on stderr; a drop whose envelope was refused still keeps its words and exits 1.
 """
@@ -238,7 +238,7 @@ def _outcome_text(got: Any) -> str:
     return text
 
 
-# --- thread envelopes (C2b): the operator's own door to the one authority the coordinator adds -----------------------
+# --- thread envelopes (C2b): the operator's own door to the one authority the desk adds -----------------------
 def _faults() -> tuple[type[BaseException], ...]:
     """What an envelope command refuses with: the store's, a body's shape, the dispatch command line's own refusals, a
     log or signer that would not answer. Lazy: the dispatch CLI is only loaded when an envelope command runs."""
@@ -1654,7 +1654,7 @@ def _coord_first_reader(args: argparse.Namespace, out: Any, store: EnvelopeStore
                                authority_source=(lambda: _band_snapshot(args, store)[0]) if head is not None
                                else (lambda: None), authority_head=head)
     _emit(out, args.json, {"item_id": item.item_id, "reply_id": reply_id},
-          f"KNOW {reply_id} filed for your review ({item.item_id}); the seat gets it labelled as the coordinator's "
+          f"KNOW {reply_id} filed for your review ({item.item_id}); the seat gets it labelled as the desk's "
           "own, and the question stays open for you")
     return 0
 
@@ -1693,7 +1693,7 @@ def _coord_reply(args: argparse.Namespace, out: Any, store: EnvelopeStore) -> in
     r = drop_reply.write_reply(store, args.drop_id, text, token=args.token)
     _emit(out, args.json, {"reply_id": r.reply_id, "drop_id": r.drop_id, "gseq": r.gseq, "block": r.block,
                            "covers": {"after": r.after, "through": r.through}},
-          f"replied to drop {r.drop_id} ({r.surface}): reply {r.reply_id}, shown on the Coordinator panel"
+          f"replied to drop {r.drop_id} ({r.surface}): reply {r.reply_id}, shown on the Desk panel"
           + (f"\n{r.block}" if r.block else ""))
     return 0
 
@@ -1983,8 +1983,8 @@ def add_parsers(subparsers: argparse._SubParsersAction) -> None:
                             "the write is refused unless that token is the live lease's.")
 
     d = subparsers.add_parser(
-        "drop", help="Drop words for the coordinator and go (kept verbatim; never authority).", allow_abbrev=False,
-        description="Store your words as a drop for the coordinator and print its drop receipt. The words are data: "
+        "drop", help="Drop words for the desk and go (kept verbatim; never authority).", allow_abbrev=False,
+        description="Store your words as a drop for the desk and print its drop receipt. The words are data: "
                     "they authorise nothing. Read them back with `levain drops`. Words that start with '-' go after "
                     "`--` (levain drop -- -words) or through stdin (levain drop -).")
     d.add_argument("words", nargs="+", help="The words (or - to read them from stdin).")
@@ -2005,9 +2005,9 @@ def add_parsers(subparsers: argparse._SubParsersAction) -> None:
     common(d)
     d.set_defaults(func=run_drop)
 
-    ds = subparsers.add_parser("drops", help="Your drops: list, show, and split (the coordinator's door).")
+    ds = subparsers.add_parser("drops", help="Your drops: list, show, and split (the desk's door).")
     d_sub = ds.add_subparsers(dest="drops_cmd", required=True)
-    sp = d_sub.add_parser("split", help="Name the threads a drop becomes (the coordinator's door).")
+    sp = d_sub.add_parser("split", help="Name the threads a drop becomes (the desk's door).")
     sp.add_argument("drop_id", nargs="?", default=None,
                     help="The drop (or leave it out and name it as drop_id in the JSON).")
     sp.add_argument("--json-file", dest="json_file", type=Path, default=None, metavar="PATH",
@@ -2026,7 +2026,7 @@ def add_parsers(subparsers: argparse._SubParsersAction) -> None:
     common(sp)
     sp.set_defaults(func=run_split)
 
-    nt = d_sub.add_parser("note", help="Mark a drop read with nothing to do (the coordinator's terminal receipt).")
+    nt = d_sub.add_parser("note", help="Mark a drop read with nothing to do (the desk's terminal receipt).")
     nt.add_argument("drop_id")
     nt.add_argument("--why", default=None, metavar="ONE_LINE", help="Why it needs nothing; shown beside the drop.")
     _text_flags(nt)
@@ -2133,7 +2133,7 @@ def add_parsers(subparsers: argparse._SubParsersAction) -> None:
         "agent", help="Choose the coordinator a drop launches: claude (in its own workspace), or none.",
         description="claude: drops with no coordinator start a Claude Code session in DIR (default "
                     "<levain home>/coordinator), which is made a Levain install for Claude Code first when it is not "
-                    "one. The workspace is put in Levain's coordinator record, which the coordinator's "
+                    "one. The workspace is put in Levain's coordinator record, which the desk's "
                     "door reads. codex: removed (a Codex coordinator is no longer launched). none: drops only queue for you. Levain never edits a harness's trust list: run the "
                     "printed line once and trust the directory.")
     ca.add_argument("agent", nargs="?", default=None, choices=("claude", "codex", "none"))
@@ -2200,7 +2200,7 @@ def add_parsers(subparsers: argparse._SubParsersAction) -> None:
                      help=f"At most N records, 1..{LOG_LIMIT_MAX} (default 50).")
     crp = c_sub.add_parser(
         "reply", help="Answer words dropped from the cockpit or the phone (one reply per drop, within 24 hours).",
-        description="Files your reply to a drop, shown on the Coordinator panel with Levain's block frozen at this "
+        description="Files your reply to a drop, shown on the Desk panel with Levain's block frozen at this "
                     "moment (what changed since his last message, and the question band). The store refuses a drop "
                     "that does not exist, a second reply to a drop, and a drop older than the window.")
     crp.add_argument("drop_id", metavar="DROP", help="The drop you answer.")
@@ -2240,7 +2240,7 @@ def add_parsers(subparsers: argparse._SubParsersAction) -> None:
     caw.add_argument("drop_id", metavar="DROP", help="The drop whose words say he is away.")
     caw.add_argument("--token", type=int, required=True, help="Your coordinator lease token.")
     ccl = c_sub.add_parser(
-        "close", help="Leave a handoff for the next coordinator (a rotation, the operator leaving, a dream).",
+        "close", help="Leave a handoff for the next desk (a rotation, the operator leaving, a dream).",
         description="Appends one seam handoff from a JSON body file with every key (state_line, in_flight, next, "
                     "contingencies, notes, attested_operator_present, attested_walked; an empty list is []). A retry "
                     "with the same --request-id returns the same handoff. Names the latest handoff you saw as "
@@ -2262,12 +2262,12 @@ def add_parsers(subparsers: argparse._SubParsersAction) -> None:
         description="Prints the open built for you (the one your launch was started with, else one for the latest "
                     "rotation handoff) and, last, the command that acknowledges it. With no live coordinator lease "
                     "(no --token, or the operator's) it prints the brief read-only and says it cannot be "
-                    "acknowledged. --ack OPEN_ID is the coordinator's fenced acknowledgement: the Since window moves "
+                    "acknowledged. --ack OPEN_ID is the desk's fenced acknowledgement: the Since window moves "
                     "only then. A rotation or dream open needs --read-back-file, your restatement of the handoff. "
                     "A --token that is given and refused exits 1 after printing the read-only open.")
     cop.add_argument("--ack", type=int, default=None, metavar="OPEN_ID")
     cop.add_argument("--light", action="store_true",
-                     help="The coordinator's first turn after the operator spoke: print a light open (what changed since "
+                     help="The desk's first turn after the operator spoke: print a light open (what changed since "
                           "the last acknowledged open, plus the band) only when the operator's previous activity was "
                           "--gap-hours or more before this; otherwise say none is needed.")
     cop.add_argument("--gap-hours", dest="gap_hours", type=float, default=None, metavar="H",
@@ -2277,8 +2277,8 @@ def add_parsers(subparsers: argparse._SubParsersAction) -> None:
     cop.add_argument("--read-back-file", dest="read_back_file", type=Path, default=None, metavar="PATH")
     cop.add_argument("--token", type=int, default=None, help="Your coordinator lease token.")
     crd = c_sub.add_parser(
-        "ready", help="The ready queue: show it (a read), or add, move and correct an item (the coordinator's write).",
-        description="show reads the queue with no coordinator live. add, move and correct are the coordinator's: each "
+        "ready", help="The ready queue: show it (a read), or add, move and correct an item (the desk's write).",
+        description="show reads the queue with no coordinator live. add, move and correct are the desk's: each "
                     "needs --token (the live lease's, levain coord status shows it), --who and --why, writes one "
                     "journal record, and prints its id. A refusal exits 2 and writes nothing. needs-you is the "
                     "band's, never a move target.")
@@ -2316,7 +2316,7 @@ def add_parsers(subparsers: argparse._SubParsersAction) -> None:
             rdw.add_argument("--repo", required=True, help="The item's repo (fixed at add).")
         ready_leaves.append(rdw)
         door_ok(rdw)      # add, move and correct are the coordinator's write: refused without the live lease token
-    chn = c_sub.add_parser("handoff", help="Read the handoffs coordinators left.")
+    chn = c_sub.add_parser("handoff", help="Read the handoffs desks left.")
     chn_sub = chn.add_subparsers(dest="handoff_cmd", required=True)
     chs = chn_sub.add_parser("show", help="The latest handoff, or the one named.",
                              description="Prints the latest handoff, or the one named. A handoff names rows by "
@@ -2372,8 +2372,8 @@ def add_parsers(subparsers: argparse._SubParsersAction) -> None:
     not_door(rvl, rvc, rvo, rvf)
 
     e = subparsers.add_parser(
-        "envelope", help="Thread envelopes: what the coordinator may do for a thread, signed by you.",
-        description="An envelope is the one authority the coordinator adds: where work may happen, which merges, "
+        "envelope", help="Thread envelopes: what the desk may do for a thread, signed by you.",
+        description="An envelope is the one authority the desk adds: where work may happen, which merges, "
                     "pushes and publishes are granted, a budget and a stop time. Sign the envelope, not the plan. "
                     "Before S1 nothing here is authority: every effect is still a per-call SIGN.")
     e_sub = e.add_subparsers(dest="envelope_cmd", required=True)
@@ -2393,7 +2393,7 @@ def add_parsers(subparsers: argparse._SubParsersAction) -> None:
                     help="A repo the work may happen in, with the paths it may touch; the whole repo is REPO=. "
                          "written out. Repeatable.")
     ee.add_argument("--land", action="append", default=[], metavar="REPO=ONTO",
-                    help="A merge the coordinator may land onto that branch. Repeatable.")
+                    help="A merge the desk may land onto that branch. Repeatable.")
     ee.add_argument("--stop", default="2h", metavar="DURATION", help="When it stops: 2h, 90m, 1h30m (at most 24h).")
     ee.add_argument("--budget", default=None, metavar="K=N,...",
                     help="tool_calls=N,tokens=N,hours=N, each named (K=0 means none), and dollars_cents=N if you "

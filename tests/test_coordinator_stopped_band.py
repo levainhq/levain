@@ -55,12 +55,12 @@ def test_three_deaths_file_exactly_one_open_item_with_the_point_and_the_why(stor
     (q,) = _open(qdir)
     why = _panel_state(store, clock)[1]
     assert len(q.what.splitlines()[0]) < 120 and q.what.startswith("The coordinator stopped after three deaths")
-    assert "nothing launches until you act on the Coordinator panel" in q.what
+    assert "nothing launches until you act on the Desk panel" in q.what
     assert why in q.blocks and q.agent == "claude_code"
-    assert "Stop or Hold on the cockpit's Coordinator panel" in q.blocks
+    assert "Stop or Hold on the cockpit's Desk panel" in q.blocks
     # an answer records only: the one option acknowledges, and the panel's verbs are named as where the action is
     (opt,) = q.options
-    assert opt[0] == "seen" and q.rec == "seen" and "Stop or Hold" in opt[1] and "Coordinator panel" in opt[1]
+    assert opt[0] == "seen" and q.rec == "seen" and "Stop or Hold" in opt[1] and "Desk panel" in opt[1]
     assert len(_all(qdir)) == 1
 
 
@@ -97,7 +97,7 @@ def test_stop_and_hold_close_the_item_with_text_naming_the_verb(store, qdir, fak
     assert _open(qdir) == []
     (done,) = _all(qdir)
     assert done.id == q.id and (done.answer.kind, done.answer.channel) == ("text", "cockpit")
-    assert done.answer.value == f"{word} pressed on the cockpit's Coordinator panel"
+    assert done.answer.value == f"{word} pressed on the cockpit's Desk panel"
     assert "The coordinator stopped" not in band_view.render(QuestionStore(qdir))
 
 
@@ -108,7 +108,7 @@ def test_start_closes_it_when_the_start_goes_through(store, qdir, fake, live_hoo
     _fire(_verbs(qdir, clock, launcher=_held_back), START_VERB)
     (done,) = _all(qdir)
     assert done.id == q.id and done.answer.kind == "text" and done.answer.channel == "cockpit"
-    assert done.answer.value == "Start pressed on the cockpit's Coordinator panel" and _open(qdir) == []
+    assert done.answer.value == "Start pressed on the cockpit's Desk panel" and _open(qdir) == []
 
 
 def test_a_refused_start_leaves_it_open(store, qdir, fake, live_hook, clock):

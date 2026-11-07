@@ -142,7 +142,7 @@
   // The queue's own state, said before any column (shared by the grouped tab and the modal's columns).
   function drawNote(doc, host, model) {
     var note = [];
-    if (model.queue === "none") note.push("No queue yet: the coordinator has not filed any work.");
+    if (model.queue === "none") note.push("No queue yet: the desk has not filed any work.");
     if (model.queue === "unreadable") note.push("The queue could not be read; this is not an empty queue.");
     model.unreadable.forEach(function (u) { note.push("Could not read: " + u + "."); });
     if (model.note && model.queue !== "none") note.push(model.note);

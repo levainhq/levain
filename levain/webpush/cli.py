@@ -74,8 +74,8 @@ def register(subparsers) -> None:
                             "recorded beside the word). Which words an agent may set: presence.SEAT_WORDS and "
                             "COORDINATOR_WORDS. (Use --said=\"-text\" if the quote starts with a dash.)")
         w.add_argument("--drop", default=None, metavar="DROP_ID",
-                       help="The coordinator only: the drop that holds the words quoted by --said (a drop reaches the "
-                            "coordinator in its brief file, not as a prompt, so it is the evidence for the quote).")
+                       help="The desk only: the drop that holds the words quoted by --said (a drop reaches the "
+                            "desk in its brief file, not as a prompt, so it is the evidence for the quote).")
         w.set_defaults(func=_word, word=word)
 
     def ending(sp: argparse.ArgumentParser) -> None:

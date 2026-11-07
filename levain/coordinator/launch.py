@@ -709,7 +709,7 @@ def _brief_text(store: CoordStore, launch: Any) -> str:
         f"read with `{lv} coord reply DROP_ID --text-file PATH --token N {tail}` (`--stdin` reads it from stdin; one "
         "reply per drop, within 24 hours). Levain freezes its own block (what changed, and the band) onto that reply "
         "and shows it where he reads it; you do not write the block. A drop with no reply after ten minutes shows on "
-        "the Coordinator panel as `no reply yet`.",
+        "the Desk panel as `no reply yet`.",
         "",
         *_arrival_section(lv, tail),
         "## How your turn ends",

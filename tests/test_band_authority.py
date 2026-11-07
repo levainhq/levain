@@ -200,7 +200,7 @@ def test_an_answer_record_merges_into_its_question_and_is_never_listed_alone(nig
     review.push_answer(night.store, night.T, q.id, "asks which name", rec="a: the short one")
     text = band_view.render(qs)
     assert text.count("rename helper?") == 1 and "NEEDS YOU · 1 open" in text
-    assert "escalated by the coordinator: asks which name · rec on record: a: the short one" in text
+    assert "escalated by the desk: asks which name · rec on record: a: the short one" in text
     assert before.count("\n") + 1 == text.count("\n")        # one line more, no item more
 
 
@@ -827,7 +827,7 @@ def test_one_malformed_reply_body_is_one_unreadable_item_and_the_others_stay(nig
     assert [e.what for e in got.items if e.unreadable is None] == ["SIGN: land it"]
     assert [(e.ref, e.band_key) for e in got.items if e.unreadable] == [("rp-broken", ("consent", other.id))]
     text = band_view.render(qs)
-    assert "UNREADABLE: SIGN rp-broken" in text and "SIGN: land it" in text and "escalated by the coordinator" in text
+    assert "UNREADABLE: SIGN rp-broken" in text and "SIGN: land it" in text and "escalated by the desk" in text
 
 
 # --- S3 fix round 2 (D): the hook's one bound covers the authority reads and a first-time setup -------------------

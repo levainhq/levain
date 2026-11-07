@@ -87,7 +87,7 @@ def away_from_drop(store: CoordStore, drop_id: str, *, token: object, agents: Se
             pass
     except Exception as exc:  # noqa: BLE001 - the marks stand; the KNOW must still be filed (match_drop's read included)
         record = f" The presence record was NOT changed ({str(exc)[:_FIELD]}); `levain ping status` says what it reads."
-    text = (f"the coordinator read your drop {drop_id} ({words!r}) as away and set away ON for "
+    text = (f"the desk read your drop {drop_id} ({words!r}) as away and set away ON for "
             f"{', '.join(marked)}: a SIGN from {'that agent' if len(marked) == 1 else 'those agents'} now waits "
             "UNDECIDED for your morning card. Only you can leave away (`levain consent away off --signing-key KEY`)."
             + skipped_lines(skipped) + record)

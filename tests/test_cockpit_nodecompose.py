@@ -397,6 +397,6 @@ def test_the_seat_box_says_when_to_message_a_seat_directly_and_where_everything_
     _root, src = _sessions_fixture(tmp_path, monkeypatch)
     line = "(%s.querySelector('.agent-msg-frame') || {}).textContent" % MBOX
     want = ("For direct work with this seat (a high-residue build, a deep session on its own problem, or a seat stuck at a prompt). "
-            "Everything else goes to the coordinator: use the drop box.")
+            "Everything else goes to the desk: use the drop box.")
     out = _out(tmp_path, src, [*_open("n3"), {"eval": "JSON.stringify([%s, !!%s.querySelector('textarea.tray-dump-ta'), %s.querySelector('.agent-msg-frame').nextElementSibling !== null])" % (line, MBOX, MBOX)}])
     assert json.loads(out["values"][-1]) == [want, True, True], out["values"]

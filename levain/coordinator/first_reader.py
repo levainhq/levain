@@ -334,7 +334,7 @@ def _answer_once(store: Any, ref: Any, option: str | None, text: str | None, tok
         if not got.may_answer:
             raise CoordError(f"escalate question #{q.n}: {got.why}")
         label = dict(q.options).get(option, "") if option is not None else None
-        summary = (f"the coordinator answered question #{q.n} on its own reading: " +
+        summary = (f"the desk answered question #{q.n} on its own reading: " +
                    (f"option {option} ({label})" if option is not None else f"in its own words: {text}"))
         body = {"by": "coordinator", "question_id": q.id, "question_n": q.n, "what": q.what,
                 "kind": "option" if option is not None else "text", "value": option if option is not None else text,
@@ -533,7 +533,7 @@ def claim_held(directory: Path | str, *, after: timedelta | None = None) -> list
                         conn, ln.threads[0] if ln is not None and len(ln.threads) == 1 else None, "answer",
                         _REF_STORE["answer"], q.id,
                         {"text": f"question #{q.n}: {q.what}"[:_TEXT_MAX], "by": "service",
-                         "why": f"the coordinator had not read it {int(after.total_seconds() // 60)} minutes "
+                         "why": f"the desk had not read it {int(after.total_seconds() // 60)} minutes "
                                 "after it was filed"}, now)
                 conn.execute("INSERT INTO first_reads (question_id, outcome, reply_id, at, gseq) "
                              "VALUES (?, 'escalated', ?, ?, ?)", (q.id, reply_id, now, next_gseq(conn, now)))
