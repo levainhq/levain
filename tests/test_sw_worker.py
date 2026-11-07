@@ -639,3 +639,65 @@ def test_a_failing_asset_write_through_drains_its_copy() -> None:
     """Fix round 5: a put that throws left the tee branch unread. Red on 39be06f7: copyDrained is absent."""
     got = _run("hold", json.dumps({"shellHtml": SHELL_HTML, "key": "/dashboard.css", "putFail": True}))
     assert got["copyDrained"] is True, got
+
+
+# --- row 268 (1106-53): the worker's own record of a tap, sent to the server whatever the window step does ---------------
+
+def _tap_posts(got: dict) -> list[tuple]:
+    return [(p["body"]["kind"], p["body"].get("target"), p["body"].get("how")) for p in got["posts"]
+            if p["body"]["kind"] in ("clicked", "opened")]
+
+
+@needs_node
+@pytest.mark.parametrize("mode,how", [("controlled+ack+tap", "ack"), ("controlled+tap", "navigate"),
+                                      ("uncontrolled+tap", "openWindow"), ("null+tap", "openWindow"),
+                                      ("opennull+tap", "refused"), ("openfail+tap", "refused")])
+def test_a_tap_posts_clicked_then_opened_with_how_the_window_was_got(mode: str, how: str) -> None:
+    got = _run("navigate", mode)
+    assert _tap_posts(got) == [("clicked", "/sign/9", None), ("opened", "/sign/9", how)], got["posts"]
+    assert {p["url"] for p in got["posts"]} == {"/webpush/receipt"} and all(p["body"]["ping"] == 42 for p in got["posts"])
+
+
+@needs_node
+def test_clicked_is_posted_before_the_window_is_opened_and_before_opened() -> None:
+    """The click's report must not depend on the window step: it is sent before openWindow is called and before the
+    `opened` report. (matchAll is STARTED first in the same turn: the report needs the subscription, which is async, and the
+    tap's own path is not delayed for it.)"""
+    got = _run("navigate", "uncontrolled+tap")
+    order = got["order"]
+    first_post = order.index("post")
+    assert first_post < order.index("openWindow"), order
+    kinds = [p["body"]["kind"] for p in got["posts"]]
+    assert kinds == ["clicked", "opened"], kinds
+
+
+@needs_node
+def test_a_tap_is_reported_with_a_target_of_path_view_and_item_only_never_a_token_or_fragment() -> None:
+    got = _run("navigate", "controlled+ack+tap+secretq")
+    assert _tap_posts(got) == [("clicked", "/?view=needs&item=np-0b62cd3b", None), ("opened", "/?view=needs&item=np-0b62cd3b", "ack")]
+    blob = json.dumps(got["posts"])
+    assert "SECRET" not in blob and "write_token" not in blob and "#" not in blob and "sign=a" not in blob
+    got = _run("navigate", "controlled+ack+tap")
+    assert "#" not in json.dumps(got["posts"]) and "sign=a" not in json.dumps(got["posts"])   # the card fragment never leaves
+
+
+@needs_node
+def test_a_failing_window_lookup_still_reports_the_click_and_the_open() -> None:
+    got = _run("navigate", "matchfail+tap")
+    assert _tap_posts(got)[0] == ("clicked", "/sign/9", None) and _tap_posts(got)[-1][0] == "opened", got["posts"]
+
+
+@needs_node
+def test_a_window_step_that_throws_still_ends_with_opened_none() -> None:
+    got = _run("navigate", "hostile+tap")
+    assert _tap_posts(got) == [("clicked", "/sign/9", None), ("opened", "/sign/9", "none")], got["posts"]
+
+
+@needs_node
+def test_a_tap_with_no_ping_posts_nothing() -> None:
+    assert _tap_posts(_run("navigate", "controlled+ack")) == []
+
+
+@needs_node
+def test_the_worker_version_names_this_build() -> None:
+    assert "const SW_VERSION = '1106-53-tap-1';" in SW.read_text()
