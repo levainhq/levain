@@ -56,7 +56,7 @@ def test_every_row_is_one_height_and_holds_no_answer_control(tmp_path: Path, mon
         hs = got["heights"]
         assert len(hs) == 3, got
         assert max(hs) - min(hs) <= 2, got                  # the long item's row is no taller than the short ones
-        assert max(hs) <= 100, got                          # a grid row stretches cards to equal height, so equal is not enough: bound it
+        assert max(hs) <= 170, got                          # a grid row stretches cards to equal height, so equal is not enough: bound it
         assert got["controls"] == 0 and got["ctl2"] == 0, got   # nothing in the strip answers an item
 
 

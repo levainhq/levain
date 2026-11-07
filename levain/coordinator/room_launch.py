@@ -105,9 +105,10 @@ from levain.coordinator.chat import (ROOM_PERMISSION_MODE, ChatService, ChatStor
 from levain.coordinator.chat_tripwires import TripwireContext
 from levain.coordinator.claude_session import (ROOM_DENIED_TOOLS, ROOM_MCP_SERVER, ROOM_MCP_TOOL, ROOM_TOOLS,
                                                ClaudeSession, PipeTransport, _leads_own_group, canary_denied, default_deny_paths,
-                                               open_probe, room_argv, room_hook_command, room_settings_json)
+                                               open_probe, room_argv, room_door_tools, room_hook_command, room_settings_json)
 from levain.coordinator.driver import LivenessEvidence, NotSent, SendCommand
 from levain.coordinator import room_readguard
+from levain.coordinator.room_host import HOSTCMD_ENV, HostCommands, door_tools as host_door_tools
 from levain.coordinator.room_mcp import LAUNCH_ENV
 from levain.coordinator.store import CoordError
 
@@ -302,6 +303,12 @@ class RoomSetting:
     model: Optional[str] = None
     harness: str = "claude"
     claude_bin: str = "claude"
+    host: Optional[HostCommands] = None      # D2: the commands the host gives the room (None: propose_drop only, as before)
+
+    @property
+    def door_names(self) -> tuple:
+        """The door's short tool names this setting opens the room with."""
+        return host_door_tools(self.host)
 
 
 @dataclass(frozen=True)
@@ -394,20 +401,21 @@ def cwd_refusal(raw: Any, cwd: Optional[str]) -> Optional[str]:
     return None if same else _one_line(f"the room child reports cwd {got[:120]!r}, not its launch's {cwd[:120]!r}")
 
 
-def room_probe(launch_id: str, evidence: LivenessEvidence, cwd: Optional[str] = None) -> Verdict:
+def room_probe(launch_id: str, evidence: LivenessEvidence, cwd: Optional[str] = None,
+               door_names: Optional[tuple] = None) -> Verdict:
     """The room's verdict on one ``init``: live only for exactly its tools, its one connected door, under ``dontAsk``,
     in the launch's recorded ``cwd`` (no ``cwd`` given is not live)."""
     raw = evidence.raw if isinstance(evidence, LivenessEvidence) else None
-    got = open_probe(raw)
+    got = open_probe(raw, door_names)
     if not got.live:
         return Verdict(False, got.reason)
     why = cwd_refusal(raw, cwd)
     return Verdict(False, why) if why is not None else Verdict(True, got.reason)
 
 
-def room_tripwire_context(cwd: str) -> TripwireContext:
+def room_tripwire_context(cwd: str, door_names: Optional[tuple] = None) -> TripwireContext:
     """The room's TripwireContext (what it accepts: the module docstring)."""
-    tools = (*ROOM_TOOLS, ROOM_MCP_TOOL)
+    tools = (*ROOM_TOOLS, *room_door_tools(door_names))
 
     def expected(tool: str) -> int:
         raise ValueError(f"{str(tool)[:60]} is not one of the room's tools")
@@ -416,30 +424,30 @@ def room_tripwire_context(cwd: str) -> TripwireContext:
                            frozenset((t, s) for t in tools for s in _SOURCES))
 
 
-def make_probe(store: ChatStore, other: Optional[Callable[[str, LivenessEvidence], Verdict]] = None
-               ) -> Callable[[str, LivenessEvidence], Verdict]:
+def make_probe(store: ChatStore, other: Optional[Callable[[str, LivenessEvidence], Verdict]] = None,
+               door_names: Optional[tuple] = None) -> Callable[[str, LivenessEvidence], Verdict]:
     """The one ``probe`` a ChatService takes: a room launch gets :func:`room_probe` over its recorded cwd, any other
     launch gets ``other`` (no verdict at all, which latches, when there is none)."""
     def probe(launch_id: str, evidence: LivenessEvidence) -> Verdict:
         row = store._read(lambda conn: conn.execute("SELECT role, cwd FROM launches WHERE launch_id = ?",
                                                     (launch_id,)).fetchone())
         if row is not None and row[0] == "room":
-            return room_probe(launch_id, evidence, row[1])
+            return room_probe(launch_id, evidence, row[1], door_names)
         if other is None:
             return Verdict(False, "no probe is configured for this launch")
         return other(launch_id, evidence)
     return probe
 
 
-def make_tripwires(store: ChatStore, other: Optional[Callable[[str], Optional[TripwireContext]]] = None
-                   ) -> Callable[[str], Optional[TripwireContext]]:
+def make_tripwires(store: ChatStore, other: Optional[Callable[[str], Optional[TripwireContext]]] = None,
+                   door_names: Optional[tuple] = None) -> Callable[[str], Optional[TripwireContext]]:
     """The one ``tripwires`` a ChatService takes: a room launch gets :func:`room_tripwire_context` over its recorded
     cwd, any other launch gets ``other`` (None when there is none)."""
     def tripwires(launch_id: str) -> Optional[TripwireContext]:
         row = store._read(lambda conn: conn.execute("SELECT role, cwd FROM launches WHERE launch_id = ?",
                                                     (launch_id,)).fetchone())
         if row is not None and row[0] == "room":
-            return room_tripwire_context(row[1] or "")
+            return room_tripwire_context(row[1] or "", door_names)
         return other(launch_id) if other is not None else None
     return tripwires
 
@@ -449,12 +457,15 @@ def _one_line(text: str, limit: int = 300) -> str:
     return "".join(c if 32 <= ord(c) < 127 else " " for c in " ".join(str(text).split()))[:limit].strip() or "no detail"
 
 
-def mcp_config_json(launch_id: str, python: str) -> str:
+def mcp_config_json(launch_id: str, python: str, host: Optional[HostCommands] = None) -> str:
     """The room's ``--mcp-config``: one stdio server, the door bound to ``launch_id`` in its own environment (a call
     carries no session id; RM0 finding 8)."""
+    env = {LAUNCH_ENV: launch_id, ROOM_ENV: "1"}
+    if host is not None:        # the host's argvs reach the door here, in the launch's own 0700 file, and nowhere the model names
+        env[HOSTCMD_ENV] = host.to_json()
     return json.dumps({"mcpServers": {ROOM_MCP_SERVER: {
         "command": python, "args": ["-P", "-m", "levain.coordinator.room_mcp", "--launch", launch_id],
-        "env": {LAUNCH_ENV: launch_id, ROOM_ENV: "1"}}}}, sort_keys=True)
+        "env": env}}}, sort_keys=True)
 
 
 def _guard_source() -> bytes:
@@ -476,13 +487,16 @@ def _guard_name(sha256: str) -> str:
     return f"room_readguard-{sha256[:16]}.py"
 
 
-def containment_digest(settings_json: str, readguard_sha256: str) -> str:
+def containment_digest(settings_json: str, readguard_sha256: str, host: Optional[HostCommands] = None) -> str:
     """64 hex: the containment policy a spawn ran under (tool flags, mode, sources, deny rules, the read-guard hook entry,
     door name) and ``readguard_sha256``, the sha256 of the script bytes written for THIS launch (L3 r1 codex MED: never a
     re-read of the package, which an upgrade can change between the write and activation)."""
     policy = {"tools": list(ROOM_TOOLS), "denied": sorted(ROOM_DENIED_TOOLS), "mode": ROOM_PERMISSION_MODE,
               "setting_sources": "user", "settings": json.loads(settings_json), "door": ROOM_MCP_TOOL,
               "readguard_sha256": readguard_sha256}
+    if host is not None:        # D2: the door's tool set and the argvs it runs are part of the containment a spawn ran under
+        policy["door"] = list(host_door_tools(host))
+        policy["host_commands"] = json.loads(host.to_json())
     return hashlib.sha256(json.dumps(policy, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
 
 
@@ -688,7 +702,7 @@ class RoomLauncher:
             self._svc.attach(launch_id, session)
             self._svc.activate(launch_id, "live", "room open check passed", evidence=init, spawn_nonce=nonce,
                                canary=RoomCanary(True, decoy, "the canary Read was denied"),
-                               containment_digest=containment_digest(settings_json, guard_sha))
+                               containment_digest=containment_digest(settings_json, guard_sha, self._setting.host))
             # the service sends nothing to a launch with no recorded vendor position: record the open check's events
             # (the first read ends at its turn boundary) and make sure they did not latch the room they opened
             self._svc.read_next(launch_id)
@@ -757,14 +771,14 @@ class RoomLauncher:
 
         guard, guard_sha = self._put_guard()
         settings_json = self._settings_for(guard_sha)
-        mcp = put("mcp.json", mcp_config_json(launch_id, self._python))
+        mcp = put("mcp.json", mcp_config_json(launch_id, self._python, self._setting.host))
         settings = put("settings.json", settings_json)
         stderr = put("child.stderr", "")
         decoy_dir = workdir / "decoy"
         decoy_dir.mkdir(mode=0o700)
         decoy = put("decoy/" + _CANARY_NAME, "DECOY\n")
         argv = room_argv(mcp_config=mcp, settings=settings, model=self._setting.model, claude_bin=self._setting.claude_bin,
-                         **({"resume": resume} if resume else {"session_id": sid}))
+                         door_tools=self._setting.door_names, **({"resume": resume} if resume else {"session_id": sid}))
         return argv, str(decoy), stderr, settings_json, guard, guard_sha
 
     def _put_guard(self) -> tuple:
@@ -834,7 +848,7 @@ class RoomLauncher:
         if proc.poll() is not None:
             raise RoomLaunchError(f"the room child exited (code {proc.returncode}) after its open check"
                                   f"{self._tail(stderr_path)}")
-        probe = open_probe(init.raw)
+        probe = open_probe(init.raw, self._setting.door_names)
         if not probe.live:
             raise RoomLaunchError(f"the room could not open with its read-only tools: {probe.reason}")
         why = cwd_refusal(init.raw, self._setting.cwd)

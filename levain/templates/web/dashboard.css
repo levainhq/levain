@@ -1375,6 +1375,8 @@ body.ke .ck-zgrid .panel > .xbody { flex: 1; min-height: 0; overflow: auto; padd
 .ck-tabs { display: flex; gap: var(--sp-2); flex-wrap: wrap; flex-basis: 100%; margin-top: var(--sp-3); }
 .ck-tab { background: none; border: 0; border-radius: var(--r-md); padding: var(--sp-2) var(--sp-3); color: var(--label); cursor: pointer; font: var(--fw-semibold) var(--fs-meta) var(--round); }
 .ck-tab[aria-selected="true"] { background: var(--card-2); color: var(--text); }
+.ck-desk-tabs { margin: 0 0 var(--sp-3); }
+.ck-dtab-off { display: none !important; }
 @media (max-width: 1180px) {
   body.ke { --gutter-ke: 32px; }
   body.ke .band { grid-template-columns: auto minmax(0, 1fr); }
@@ -1680,17 +1682,19 @@ body.ke .needs-gloss { font-size: var(--fs-meta); color: var(--meta); }
 body.ke .needs-order { font-size: var(--fs-meta); color: var(--meta); text-transform: uppercase; letter-spacing: .06em; }
 body.ke .needs-history { margin-left: auto; font: var(--fw-medium) var(--fs-meta)/var(--lh-list) var(--sans); color: var(--label); background: none; border: 1px solid var(--hair-2); border-radius: var(--r-sm); padding: var(--sp-1) var(--sp-3); cursor: pointer; }
 body.ke .needs-history:hover { color: var(--text); border-color: var(--label); }
-body.ke .needs-grid { display: grid; grid-template-columns: minmax(0, 1fr); gap: var(--sp-3); margin-top: var(--sp-4); }
+body.ke .needs-grid { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: var(--sp-3); margin-top: var(--sp-4); }
+@media (max-width: 1000px) { body.ke .needs-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); } }
+@media (max-width: 600px) { body.ke .needs-grid { grid-template-columns: minmax(0, 1fr); } }
 /* the strip's row: one fixed height for every item (the whole item is in its focus view), the card's ring and tokens, no controls */
-body.ke .needs-row { display: flex; align-items: center; justify-content: space-between; gap: var(--sp-4); box-sizing: border-box; height: 80px; min-width: 0; width: 100%; padding: 0 var(--sp-5); overflow: hidden;
+body.ke .needs-row { display: flex; flex-direction: column; align-items: stretch; justify-content: flex-start; gap: var(--sp-3); box-sizing: border-box; min-height: 112px; min-width: 0; width: 100%; padding: var(--sp-4) var(--sp-5); overflow: hidden;
   text-align: left; font: inherit; color: var(--text); cursor: pointer; background: var(--card); border: 1px solid var(--wait-ring); border-radius: var(--r-lg);
   box-shadow: 0 0 0 1px color-mix(in oklch, var(--accent) 22%, transparent), var(--edge-hi), 0 10px 30px -14px color-mix(in oklch, var(--accent) 35%, transparent); }
 body.ke .needs-row:hover { background: var(--card-2); }
 body.ke .needs-row:focus-visible { outline: none; box-shadow: 0 0 0 3px var(--accent-line); }
 body.ke .needs-row-text { display: flex; flex-direction: column; gap: var(--sp-1); min-width: 0; flex: 1 1 auto; }
-body.ke .needs-row-title { font: var(--fw-bold) var(--fs-title)/1.35 var(--round); color: var(--text); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+body.ke .needs-row-title { font: var(--fw-bold) var(--fs-title)/1.35 var(--round); color: var(--text); display: -webkit-box; -webkit-box-orient: vertical; -webkit-line-clamp: 2; line-clamp: 2; overflow: hidden; overflow-wrap: anywhere; min-height: 2.7em; }
 body.ke .needs-row-sub { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; min-height: 1.4em; }
-body.ke .needs-row-side { display: flex; flex-direction: column; align-items: flex-end; gap: var(--sp-1); flex: none; max-width: 40%; }
+body.ke .needs-row-side { display: flex; flex-direction: row; align-items: center; flex-wrap: wrap; gap: var(--sp-3); flex: none; order: -1; max-width: 100%; }
 body.ke .needs-row-side > * { max-width: 100%; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 body.ke .needs-row-rec { margin-right: 0; }
 /* the waiting ring is ONE recipe with the decisions strip: a crisp 1px ring, no second border, a soft lit edge and an accent bloom below */
@@ -1791,6 +1795,66 @@ body.ke .needs-open { margin-left: 0; flex: none; }
 @keyframes needs-lit { 0% { box-shadow: 0 0 0 3px var(--accent), 0 0 18px var(--accent); } 100% { box-shadow: 0 0 0 3px var(--accent-soft); } }
 body.ke .needs-row.needs-lit, body.ke .needs-card.needs-lit { animation: needs-lit 1.6s ease-out 1; }
 body.ke .needs-chip-btn.needs-lit { animation: needs-lit 1.6s ease-out 1; }
+/* needs-ab begin: the Needs-you section's two tabs, the rows / tiles layouts (Phill 11-06) and the detail sheet. Own block: the Room's CSS is another lane's. */
+body.ke .needs-tabs { display: flex; align-items: flex-end; gap: var(--sp-2); flex: 1 1 auto; min-width: 0; }
+body.ke .needs-tab { flex: 0 1 auto; min-width: 0; min-height: var(--hit-min); padding: 0 var(--sp-4); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; cursor: pointer;
+  font: var(--fw-bold) var(--fs-lead)/1 var(--round); color: var(--label); background: none; border: 0; border-bottom: 3px solid transparent; }
+body.ke .needs-tab:hover { color: var(--text); }
+body.ke .needs-tab.is-on { color: var(--text); border-bottom-color: var(--accent); }
+body.ke .needs-tab:focus-visible, body.ke .needs-more-row:focus-visible, body.ke .needs-layout-btn:focus-visible { outline: none; box-shadow: 0 0 0 3px var(--accent-line); }
+/* the rows | tiles control is a phone choice: at desktop width both draw the same cards, so it is not drawn there (Phill 11-06) */
+body.ke .needs-layout-sw { display: none; }
+body.ke .needs-layout-btn { appearance: none; flex: 1 1 0; min-height: 36px; padding: 0 var(--sp-4); font: var(--fw-semibold) var(--fs-meta)/1 var(--sans); color: var(--label); background: none; border: 0; border-radius: calc(var(--r-sm) - 2px); cursor: pointer; }
+body.ke .needs-layout-btn.is-on { color: var(--text); background: var(--base); box-shadow: 0 1px 2px rgba(0, 0, 0, .18), 0 0 0 .5px var(--hair-2); }
+body.ke .needs-group { grid-column: 1 / -1; font: var(--fw-bold) var(--fs-micro)/1 var(--mono); letter-spacing: .08em; text-transform: uppercase; color: var(--meta); padding: var(--sp-3) var(--sp-2) 0; }
+body.ke .needs-empty { grid-column: 1 / -1; padding: var(--sp-5) var(--sp-2); }
+body.ke .needs-more-row { grid-column: 1 / -1; display: flex; align-items: center; justify-content: center; width: 100%; min-height: 48px; padding: var(--sp-3) var(--sp-5); box-sizing: border-box;
+  font: var(--fw-medium) var(--fs-meta)/1.3 var(--sans); color: var(--meta); background: none; border: 0; border-radius: var(--r-md); cursor: pointer; text-align: center; }
+body.ke .needs-more-row:hover { color: var(--text); background: var(--card-2); }
+body.ke .needs-row-opts { white-space: nowrap; }
+@media (max-width: 599px) {
+  body.ke .needs-headline { flex-wrap: wrap; gap: var(--sp-2) var(--sp-3); align-items: center; }
+  body.ke .needs-tabs { flex: 0 1 auto; gap: 0; }
+  body.ke .needs-tab { font-size: var(--fs-body); padding: 0 var(--sp-3); }
+  body.ke .needs-headline .needs-gloss, body.ke .needs-headline .needs-order { display: none; }
+  body.ke .needs-headline .needs-history { flex: none; min-height: var(--hit-min); font-size: var(--fs-micro); padding: var(--sp-1) var(--sp-3); }
+  /* a native-looking segmented control on a line of its own: a recessed track, the chosen segment raised */
+  body.ke .needs-layout-sw { display: flex; flex: 1 0 100%; order: 9; gap: 2px; padding: 2px; min-height: 40px; box-sizing: border-box; background: var(--card-2); border: 1px solid var(--hair); border-radius: var(--r-sm); }
+  body.ke .needs-asked { display: none; }
+  body.ke .needs-grid .needs-row-sub { display: none; }
+  body.ke .needs-grid .needs-row-title { min-height: 0; }
+  /* A: dense rows, one column */
+  body.ke #ck-needs .needs-grid[data-layout="rows"] { display: flex; flex-direction: column; gap: 0; margin-top: var(--sp-2); border-top: 1px solid var(--hair); }
+  body.ke #ck-needs .needs-grid[data-layout="rows"] .needs-row { height: 68px; min-height: 68px; justify-content: center; gap: 2px; padding: 6px var(--sp-4);
+    background: none; border: 0; border-bottom: 1px solid var(--hair); border-radius: 0; box-shadow: none; }
+  body.ke #ck-needs .needs-grid[data-layout="rows"] .needs-row:hover { background: var(--card-2); }
+  body.ke #ck-needs .needs-grid[data-layout="rows"] .needs-row:focus-visible { box-shadow: inset 0 0 0 3px var(--accent-line); }
+  body.ke #ck-needs .needs-grid[data-layout="rows"] .needs-row-title { font: var(--fw-bold) 15px/1.25 var(--round); }
+  body.ke #ck-needs .needs-grid[data-layout="rows"] .needs-row-side { order: 0; flex-wrap: nowrap; gap: var(--sp-3); overflow: hidden; }
+  body.ke #ck-needs .needs-grid[data-layout="rows"] .needs-row-side > * { flex: 0 1 auto; min-width: 0; }
+  body.ke #ck-needs .needs-grid[data-layout="rows"] .needs-group { padding: var(--sp-4) var(--sp-4) var(--sp-2); }
+  body.ke #ck-needs .needs-grid[data-layout="rows"] .needs-more-row { border-radius: 0; margin-top: var(--sp-3); }
+  /* B: two-column tiles, fixed height, every item shown */
+  body.ke #ck-needs .needs-grid[data-layout="tiles"] { grid-template-columns: repeat(2, minmax(0, 1fr)); gap: var(--sp-3); }
+  body.ke #ck-needs .needs-grid[data-layout="tiles"] .needs-row { height: 104px; min-height: 104px; padding: 10px; gap: var(--sp-2); border-radius: var(--r-md); }
+  body.ke #ck-needs .needs-grid[data-layout="tiles"] .needs-row-text { flex: 0 0 auto; }
+  body.ke #ck-needs .needs-grid[data-layout="tiles"] .needs-row-title { font: var(--fw-bold) 14px/1.3 var(--round); min-height: 2.6em; }
+  body.ke #ck-needs .needs-grid[data-layout="tiles"] .needs-row-side { order: 0; flex-wrap: wrap; gap: 2px var(--sp-3); margin-top: auto; max-height: 2.7em; overflow: hidden; }
+}
+/* the Needs-you detail: a sheet over the page where the row was tapped */
+@keyframes needsSheetRise { from { opacity: 0; transform: translateY(var(--sp-6)); } to { opacity: 1; transform: none; } }
+body.needs-locked { overflow: hidden; }
+.modal-overlay.needs-detail .question-option, .modal-overlay.needs-detail .needs-btn { min-height: var(--hit-min); }
+@media (max-width: 760px) {
+  .modal-overlay.needs-detail { align-items: flex-end; padding: 0 env(safe-area-inset-right, 0px) 0 env(safe-area-inset-left, 0px); }
+  .modal-overlay.needs-detail .modal { width: 100%; height: auto; max-height: min(88dvh, calc(100dvh - 24px - env(safe-area-inset-top, 0px))); border-radius: var(--r-lg) var(--r-lg) 0 0;
+    padding-bottom: env(safe-area-inset-bottom, 0px); animation: needsSheetRise var(--dur-expand) var(--ease-out) both; }
+  .modal-overlay.needs-detail .modal-close { width: var(--hit-min); height: var(--hit-min); }
+  .modal-overlay.needs-detail .modal-head { flex-wrap: nowrap; }
+  .modal-overlay.needs-detail .modal-head h2 { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+}
+@media (prefers-reduced-motion: reduce) { .modal-overlay.needs-detail .modal { animation: none; } }
+/* needs-ab end */
 @media (max-width: 640px) { body.ke .needs-chips { flex-basis: 100%; order: 9; } }
 body.ke .ck-widgets.frame { padding-inline: 0; margin-inline: var(--gutter-ke); }
 body.ke .ck-widgets { margin-top: var(--gap); display: flex; gap: 1px; background: var(--hair); border: 1px solid var(--hair); border-radius: var(--r-lg); overflow: hidden; }
@@ -2777,73 +2841,109 @@ body.ke[data-mode="build"] .th-zone .zone-head { display: flex; }   /* titled li
   .th-body .tv-head .tv-at { margin-left: 0; }
 }
 
-/* RM-F: the cockpit's one Claude room (room_view.js, rv-*): the conversation, the dock (draft, Send, Drop, Stop, mic), the
-   proposal card and the ambiguous-line reconcile. Colours are tokens the page's light and dark themes already define. */
-.rv { display: flex; flex-direction: column; gap: var(--sp-4); min-width: 0; }
+/* RM-F / 1106-51: the cockpit's one Claude room (room_view.js, rv-*), drawn as a whole-tab chat page the way the reference products draw
+   one (chatgpt.com, gemini.google.com; measurements in project_memory/1106-16/design/DESIGN_RESEARCH_1106.md 4.1, 4.2, 7): a thin header
+   (title, New), the conversation as the page's one scroller in a centered column, one pinned composer with Send and Stop in one slot. No
+   card, no history list. Colours are tokens the page's light and dark themes already define. */
+.rv { --rv-col: 672px; --rv-comp: 768px; --rv-pl: 24px; --rv-pr: 24px; display: flex; flex-direction: column; height: 100%; min-width: 0; min-height: 0; background: var(--base); }
+@media (min-width: 1100px) { .rv { --rv-col: 768px; } }                      /* ChatGPT's expanded thread width (48rem), measured */
+@media (max-width: 640px) {
+  .rv { --rv-pl: max(16px, env(safe-area-inset-left, 0px)); --rv-pr: max(16px, env(safe-area-inset-right, 0px)); }
+}
+.rv .rv-top { flex: none; display: flex; align-items: center; gap: var(--sp-4); box-sizing: border-box; height: 52px; padding-inline: var(--rv-pl) var(--rv-pr); border-bottom: 1px solid var(--hair); }
+@media (max-width: 640px) { .rv .rv-top { height: 56px; } }                       /* 44pt target plus 6pt each side (research 7.4 item 2) */
+.rv .rv-title { margin: 0; font: var(--fw-semibold) var(--fs-title)/1 var(--sans); color: var(--text); }
+.rv .rv-model { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font: var(--fw-regular) var(--fs-micro)/1.5 var(--mono); color: var(--label); }
+@media (max-width: 640px) { .rv .rv-model { display: none; } }
 .rv .rv-head { display: flex; flex-wrap: wrap; align-items: baseline; gap: var(--sp-2) var(--sp-4); font: var(--fw-regular) var(--fs-micro)/1.5 var(--mono); color: var(--label); }
 .rv .rv-note { margin: 0; color: var(--label); font: var(--fw-regular) var(--fs-meta)/1.5 var(--sans); overflow-wrap: anywhere; }
-.rv .rv-gap { padding: var(--sp-3) var(--sp-4); border: 1px solid var(--bad); border-radius: var(--r-sm); color: var(--text); font: var(--fw-regular) var(--fs-meta)/1.5 var(--sans); }
-.rv .rv-line { border-left: 3px solid var(--hair-2); padding: var(--sp-2) var(--sp-4); }
-.rv .rv-you { border-left-color: var(--info); }
-.rv .rv-room { border-left-color: var(--accent-line); }
+.rv .rv-gap { padding: var(--sp-3) var(--sp-4); border: 1px solid var(--bad); border-radius: var(--r-sm); color: var(--text); font: var(--fw-regular) var(--fs-meta)/1.5 var(--sans); overflow-wrap: anywhere; }
+/* the conversation: flat. The room's words sit on the page, yours in a subtle block, a tool's rows quiet beside a thin rule */
+.rv .rv-line { padding: 0; }
+.rv .rv-you { align-self: flex-end; max-width: 85%; background: var(--card-2); border-radius: var(--r-lg); padding: var(--sp-3) var(--sp-5); }
+.rv .rv-you .rv-who { display: none; }
+.rv .rv-line:not(.rv-you):not(.rv-room) { border-left: 2px solid var(--hair-2); padding: var(--sp-1) var(--sp-4); color: var(--label); }
+.rv .rv-line:not(.rv-you):not(.rv-room) .rv-text { font-size: var(--fs-body); }
 .rv .rv-error { border-left-color: var(--bad); }
+.rv .rv-stream, .rv .rv-cards { display: flex; flex-direction: column; gap: var(--sp-5); box-sizing: border-box; width: min(100%, calc(var(--rv-col) + var(--rv-pl) + var(--rv-pr))); padding-inline: var(--rv-pl) var(--rv-pr); margin-inline: auto; }
+.rv .rv-stream { min-height: 100%; }
+.rv .rv-stream > .rv-note:only-child { margin: auto; text-align: center; font-size: var(--fs-lead); }   /* the empty state: one centered line */
+.rv .rv-cards { margin-top: var(--sp-5); }
+.rv .rv-cards:empty { display: none; }
+.rv .rv-stage { flex: 1 1 0; min-height: 0; position: relative; display: flex; flex-direction: column; min-width: 0; }
+.rv .rv-body { flex: 1 1 auto; min-height: 0; overflow-y: auto; overflow-x: hidden; overflow-anchor: none; overscroll-behavior: contain; scrollbar-gutter: stable both-edges; padding-block: var(--sp-6) var(--sp-5); }   /* a classic scrollbar (Linux, Windows) must not push the centred column off the composer's centre; overlay scrollbars reserve nothing */
+.rv .rv-pending { display: flex; gap: var(--sp-2); padding: var(--sp-2) 0; }
+.rv .rv-dot { width: 6px; height: 6px; border-radius: 50%; background: var(--label); opacity: .35; animation: rv-pulse 1.2s ease-in-out 25; }   /* finite (30 s), never infinite: tests/test_cockpit_no_infinite_animation.py */
+.rv .rv-dot:nth-child(2) { animation-delay: .2s; }
+.rv .rv-dot:nth-child(3) { animation-delay: .4s; }
+@keyframes rv-pulse { 0%, 80%, 100% { opacity: .25; } 40% { opacity: 1; } }
+@media (prefers-reduced-motion: reduce) { .rv .rv-dot { animation: none; opacity: .6; } }
 .rv .rv-who { font: var(--fw-semibold) var(--fs-micro)/1.5 var(--mono); color: var(--label); }
-.rv .rv-text { margin: var(--sp-1) 0 0; white-space: pre-wrap; overflow-wrap: anywhere; font: var(--fw-regular) var(--fs-meta)/1.5 var(--sans); color: var(--text); }
+.rv .rv-text { margin: var(--sp-1) 0 0; white-space: pre-wrap; overflow-wrap: anywhere; font: var(--fw-regular) 16px/1.65 var(--sans); color: var(--text); }
 .rv .rv-mark { display: flex; flex-wrap: wrap; align-items: center; gap: var(--sp-2) var(--sp-4); margin: var(--sp-2) 0 0; font: var(--fw-regular) var(--fs-meta)/1.5 var(--sans); color: var(--label); }
 .rv .rv-mark button { min-height: var(--hit-min, 44px); }
 .rv .rv-card { padding: var(--sp-4); border: 1px solid var(--hair-2); border-radius: var(--r-md); background: var(--card-2); display: flex; flex-direction: column; gap: var(--sp-3); }
 .rv .rv-card textarea { width: 100%; box-sizing: border-box; min-height: 72px; resize: vertical; padding: var(--sp-3) var(--sp-4); background: var(--card); color: var(--text);
   border: 1px solid var(--hair-2); border-radius: var(--r-md); font: var(--fw-regular) var(--fs-meta)/1.5 var(--sans); }
 .rv .rv-summary { padding: var(--sp-3) var(--sp-4); border-left: 3px solid var(--hair-2); color: var(--label); font: var(--fw-regular) var(--fs-meta)/1.5 var(--sans); white-space: pre-wrap; overflow-wrap: anywhere; }
-.rv .rv-dock { display: flex; flex-direction: column; gap: var(--sp-3); min-width: 0; }
-.rv .rv-input { width: 100%; box-sizing: border-box; min-height: 72px; resize: vertical; padding: var(--sp-3) var(--sp-4); background: var(--card-2); color: var(--text);
-  border: 1px solid var(--hair-2); border-radius: var(--r-md); font: var(--fw-regular) var(--fs-meta)/1.5 var(--sans); }
-.rv .rv-input:focus-visible { outline: 2px solid var(--accent-line); outline-offset: 1px; border-color: var(--accent-line); }
+/* the pinned composer: 768 wide on a desk (ChatGPT, measured), the page's width less the gutters on a phone; the box is at least 52 tall
+   (48 floor on a phone) and its buttons are 44. The status line sits above it, so the composer is the last thing on the page. */
+.rv .rv-dock { flex: none; display: flex; flex-direction: column; gap: var(--sp-3); box-sizing: border-box; min-width: 0; width: min(100%, calc(var(--rv-comp) + var(--rv-pl) + var(--rv-pr)));
+  margin-inline: auto; padding: var(--sp-3) var(--rv-pr) 16px var(--rv-pl); }
+.rv .rv-compose { display: flex; align-items: flex-end; gap: var(--sp-2); box-sizing: border-box; min-height: 52px; padding: 4px; background: var(--card-2); border: 1px solid var(--hair-2); border-radius: 28px; }
+.rv .rv-compose:focus-within { border-color: var(--accent-line); }
+.rv .rv-input { flex: 1; min-width: 0; box-sizing: border-box; align-self: center; min-height: 44px; max-height: min(40dvh, 288px); overflow-y: auto; field-sizing: content; resize: none; padding: 10px var(--sp-4);
+  background: transparent; color: var(--text); border: 0; outline: 0; font: var(--fw-regular) 16px/24px var(--sans); }
 .rv .rv-input:disabled { opacity: .55; cursor: not-allowed; }
-.rv .rv-actions { display: flex; flex-wrap: wrap; gap: var(--sp-3); }
-.rv .rv-send, .rv .rv-drop, .rv .rv-stop, .rv .rv-open, .rv .rv-mic, .rv .rv-rotate, .rv .rv-card button { min-height: var(--hit-min, 44px); padding: var(--sp-2) var(--sp-6); border-radius: var(--r-md); cursor: pointer; font: var(--fw-semibold) var(--fs-meta)/1 var(--sans); }
+.rv .rv-actions, .rv .rv-slot { flex: none; display: flex; }
+.rv .rv-slot[data-mode="stop"] .rv-send, .rv .rv-slot:not([data-mode="stop"]) .rv-stop { display: none; }
+.rv .rv-send, .rv .rv-stop { flex: none; width: var(--hit-min, 44px); height: var(--hit-min, 44px); padding: 0; border-radius: 50%; cursor: pointer; font: var(--fw-semibold) 18px/1 var(--sans); }
 .rv .rv-send, .rv .rv-open { background: var(--accent); color: var(--on-accent); border: 1px solid var(--accent); }
-.rv .rv-open[hidden] { display: none; }
+.rv .rv-send[aria-disabled="true"] { background: var(--hair-2); color: var(--meta); border-color: var(--hair-2); cursor: default; }
 .rv .rv-send:hover:not(:disabled) { filter: brightness(1.08); }
-.rv .rv-drop, .rv .rv-mic, .rv .rv-rotate, .rv .rv-card button { background: none; color: var(--text); border: 1px solid var(--label); }
-.rv .rv-stop { background: none; color: var(--text); border: 1px solid var(--bad); }
-.rv .rv-stop:hover:not(:disabled) { background: color-mix(in oklch, var(--bad) 14%, transparent); }
+.rv .rv-stop { background: var(--text); color: var(--base); border: 1px solid var(--text); }
+.rv .rv-open { min-height: var(--hit-min, 44px); padding: var(--sp-2) var(--sp-6); border-radius: var(--r-pill); cursor: pointer; font: var(--fw-semibold) var(--fs-body)/1 var(--sans); }
+.rv .rv-open[hidden] { display: none; }
+.rv .rv-mic, .rv .rv-rotate, .rv .rv-card button { min-height: var(--hit-min, 44px); padding: var(--sp-2) var(--sp-5); border-radius: var(--r-pill); cursor: pointer; font: var(--fw-semibold) var(--fs-meta)/1 var(--sans); background: none; color: var(--text); border: 1px solid var(--hair-2); }
+.rv .rv-mic { align-self: flex-end; border-color: transparent; color: var(--label); }
+.rv .rv-rotate { min-width: var(--hit-min, 44px); margin-left: auto; }
 .rv button:disabled { opacity: .45; cursor: not-allowed; }
 .rv button:focus-visible { outline: 2px solid var(--accent-line); outline-offset: 2px; }
-.rv .rv-sendnote { min-height: 1.5em; font: var(--fw-regular) var(--fs-meta)/1.5 var(--sans); color: var(--label); overflow-wrap: anywhere; }
-/* RM-H, the phone (390 px is the width the thread fold test uses): the draft box and a card's words are 16px so iOS does not zoom
-   the page on focus; the dock stays under the thumb with the home indicator's inset; Send takes its own row, the rest sit two to a
-   row at the touch size, so no label is squeezed and nothing scrolls sideways. */
+.rv .rv-sendnote { font: var(--fw-regular) var(--fs-meta)/1.5 var(--sans); color: var(--label); overflow-wrap: anywhere; text-align: center; }
+.rv .rv-sendnote:empty { display: none; }
+/* RM-H, the phone: the draft box and a card's words are 16px so iOS does not zoom the page on focus, the dock keeps the home indicator's inset. */
 @media (pointer: coarse), (max-width: 640px) { .rv .rv-input, .rv .rv-card textarea { font-size: 16px; } }
 @media (max-width: 640px) {
-  .rv .rv-dock { padding-top: var(--sp-3); padding-bottom: env(safe-area-inset-bottom, 0px); }
-  .rv .rv-actions { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); }
-  .rv .rv-actions > button { min-width: 0; padding-inline: var(--sp-3); overflow-wrap: anywhere; }
-  .rv .rv-actions > .rv-send { grid-column: 1 / -1; }
+  .rv .rv-dock { padding-bottom: max(12px, env(safe-area-inset-bottom, 0px)); }
   .rv .rv-card button { width: 100%; }
 }
-
-/* The room's conversation, its notice and its code block. On a phone the card does not clamp the room (the Board's 560px card height is
-   for a list; here it hid the newest reply behind the dock): the card takes its height, the conversation is its own scroll box that ends
-   ABOVE the dock, and "Jump to latest" shows while it is scrolled up. The dock is in the flow under it, never over it. */
-.rv .rv-stage { position: relative; min-width: 0; }
-.rv .rv-jump { position: absolute; right: var(--sp-3); bottom: var(--sp-3); min-height: var(--hit-min, 44px); padding: var(--sp-2) var(--sp-5); border-radius: var(--r-md); cursor: pointer;
-  background: var(--accent); color: var(--on-accent); border: 1px solid var(--accent); font: var(--fw-semibold) var(--fs-meta)/1 var(--sans); }
+/* "Jump to latest" shows while the conversation is scrolled up (more than 100 px from its end); the dock is below the stage, never over it */
+.rv .rv-jump { position: absolute; left: 50%; transform: translateX(-50%); bottom: var(--sp-4); min-height: var(--hit-min, 44px); padding: var(--sp-2) var(--sp-5); border-radius: var(--r-pill); cursor: pointer;
+  background: var(--card); color: var(--text); border: 1px solid var(--hair-2); box-shadow: 0 2px 8px color-mix(in oklch, var(--base) 60%, transparent); font: var(--fw-semibold) var(--fs-meta)/1 var(--sans); }
 .rv .rv-jump[hidden] { display: none; }
-.rv .rv-gap { overflow-wrap: anywhere; }
-.rv .rv-banner { display: flex; flex-direction: column; gap: var(--sp-2); background: var(--card-2); }
-@media (max-width: 720px) { .rv .rv-banner { position: sticky; top: 0; z-index: 1; } }   /* the notice stays in view above a scrolled conversation */
+.rv .rv-banner { display: flex; flex-direction: column; gap: var(--sp-2); background: var(--card-2); position: sticky; top: 0; z-index: 1; }   /* the notice stays in view above a scrolled conversation */
 .rv .rv-banner .rv-detail { color: var(--label); font: var(--fw-regular) var(--fs-micro)/1.5 var(--mono); overflow-wrap: anywhere; }
 .rv .rv-code { margin: var(--sp-2) 0 0; padding: var(--sp-3) var(--sp-4); background: var(--card); border: 1px solid var(--hair-2); border-radius: var(--r-sm); overflow-x: auto; white-space: pre; }
 .rv .rv-code code { font: var(--fw-regular) var(--fs-micro)/1.5 var(--mono); color: var(--text); }
 .rv .rv-text strong { font-weight: var(--fw-semibold); }
 .rv .rv-ic { padding: 0 var(--sp-1); background: var(--card); border: 1px solid var(--hair-2); border-radius: var(--r-sm); font: var(--fw-regular) var(--fs-micro)/1.5 var(--mono); color: var(--text); overflow-wrap: anywhere; }
 .rv .rv-text strong .rv-ic { font-weight: var(--fw-regular); }
-@media (max-width: 720px) {
-  body.ke .rv-zone .ck-zgrid .panel { height: auto; max-height: none; }
-  body.ke .rv-zone .ck-zgrid .panel .pbody { overflow: visible; max-height: none; }
-  .rv .rv-body { max-height: 62vh; max-height: 62dvh; overflow-y: auto; overflow-x: hidden; }
-}
+
+/* The Room tab (dashboard_boot.js sets body.rv-on): the room owns the whole viewport below the app's own header and views strip. The deck
+   is one fixed box of the visual viewport's height (room_view.js keeps --rv-vvh / --rv-vvt), so the page itself never scrolls and the
+   composer sits above a phone's keyboard; while the keyboard is up (rv-kb) the header and strip yield their room to the conversation. */
+.rv-zone { display: none; }
+body.rv-on { overflow: hidden; }
+body.rv-on .deck { position: fixed; left: 0; right: 0; top: var(--rv-vvt, 0px); height: var(--rv-vvh, 100dvh); min-height: 0; max-width: none; margin: 0; padding-bottom: 0; box-sizing: border-box; display: flex; flex-direction: column; overflow: hidden; }
+body.rv-on .deck > :not(.masthead):not(.ck-phonetabs):not(.rv-zone) { display: none !important; }
+body.rv-on .deck > .masthead, body.rv-on .deck > .ck-phonetabs { flex: none; }
+body.rv-on .rv-zone { display: flex; flex-direction: column; flex: 1 1 0; min-height: 0; margin: 0; padding: 0; }
+body.rv-on .rv-zone[hidden] { display: none; }
+body.rv-on .rv-zone .rv-body-host { position: relative; flex: 1 1 0; min-height: 0; }
+body.rv-on .rv-zone .rv-body-host > .rv { position: absolute; inset: 0; height: auto; }
+body.rv-on.rv-kb .rv .rv-dock { padding-bottom: 12px; }   /* the home indicator is under the keyboard */
+@media (max-width: 720px) { body.rv-on.rv-kb .deck > .masthead, body.rv-on.rv-kb .deck > .ck-phonetabs { display: none; } }
+body.rv-on .ck-phonetabs button[data-phone-jump="room"] { color: var(--text); background: var(--card-2); }
 
 /* C12: the board kind's painters (board_view.js, bd-*). The panel lists cards grouped under column headings; the six columns (one on a narrow page) are the ⤢ modal's. */
 .bd-cols { display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: var(--sp-4); align-items: start; }
@@ -2950,6 +3050,11 @@ body.ke[data-mode="build"] .th-zone .zone-head { display: flex; }   /* titled li
    so they get the same width and font, not the rows. */
 body :is(#drop-words, .drop-words, .question-words) { display: block; width: 100%; max-width: none; min-width: 0; box-sizing: border-box;
   min-height: 12em; padding: var(--sp-3) var(--sp-4); font-size: 16px; line-height: 1.45; resize: vertical; field-sizing: content; }
+/* The cockpit Drop box is a contenteditable div (role=textbox), so it takes the textarea's look by hand: pre-wrapped text that breaks
+   anywhere, the rows as a min-height, a placeholder from data-placeholder while it is :empty, and a dimmed look while off. */
+body div#ck-drop-words { white-space: pre-wrap; overflow-wrap: anywhere; word-break: break-word; overflow: auto; -webkit-user-select: text; user-select: text; -webkit-appearance: none; appearance: none; cursor: text; }
+body div#ck-drop-words:empty::before { content: attr(data-placeholder); color: var(--meta); pointer-events: none; }
+body div#ck-drop-words[aria-disabled="true"] { opacity: .55; cursor: default; }
 body :is(.sheet-write-in, .sign-write-in) { grid-column: 1 / -1; display: block; width: 100%; max-width: none; min-width: 0; box-sizing: border-box; min-height: 44px; font-size: 16px; }
 /* The same fields wore the browser's own grey slab (rgb 59 59 59, square, a monospace face) beside the page's token inputs (filters, the
    pairing box: --bg, a --hair-2 line, --r-md). One look for all of them: the token field, the page's sans, a quiet placeholder. */

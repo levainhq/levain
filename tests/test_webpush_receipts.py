@@ -404,7 +404,7 @@ def test_a_push_posts_received_then_shown_with_the_endpoint_hash_and_ids_only() 
     assert "secret body" not in json.dumps(got["posts"])
     assert got["shownCalls"] == [{"title": "T", "tag": "x"}] and got["queued"] == []
     assert _receipt_steps(got) == [("received", "ok", None), ("shown", "ok", None)]
-    assert any(e["step"] == "sw-version" and e["version"] == "1106-51-shown-3" and e["on"] == "push" for e in got["trace"])
+    assert any(e["step"] == "sw-version" and e["version"] == "1106-54-bundle5-2" and e["on"] == "push" for e in got["trace"])
 
 
 @needs_node
@@ -770,6 +770,20 @@ def test_a_phone_with_a_fast_clock_is_not_silent_the_server_clock_decides(tmp_pa
     assert _by(receipts.build(s), 0, [later], "a")["outcome"] == "no receipt yet"
 
 
+def test_a_devtest_push_is_labelled_devtest_never_silent_or_no_receipt(tmp_path: Path) -> None:
+    # the worker suppresses a devtest push's receipts, so the report must not call it silent / no receipt (band 299 L3 r1 MED)
+    s, sa, _ = _two_phones(tmp_path)
+    dev, norm, later = s.add_ping("devtest", None, "t", "b"), s.add_ping("sign", "np-n", "t", "b"), s.add_ping("sign", "np-3", "t", "b")
+    _rows(s, deliveries=[(dev, sa, 201, _t(0)), (norm, sa, 201, _t(0)), (later, sa, 201, _t(5))],
+          receipts_=[(later, "a", "received", _ms_stamp(6))])                 # A reported later, so a normal ping with no receipt is silent
+    rep = receipts.build(s)
+    assert _by(rep, 0, [norm], "a")["outcome"] == "silent"
+    assert _by(rep, 0, [dev], "a")["outcome"] == "devtest"
+    a = next(d for d in rep["devices"] if d["device"].endswith("a"))
+    assert a["silent"] == 1, a                                                  # the devtest push adds no silent count
+    assert "devtest" in receipts.text(rep)
+
+
 def test_a_tapped_ping_is_shown_even_with_its_receipts_lost(tmp_path: Path) -> None:
     s, sa, sb = _two_phones(tmp_path)
     p, q = s.add_ping("sign", None, "t", "b"), s.add_ping("sign", None, "t", "b")
@@ -863,13 +877,14 @@ def test_the_command_prints_the_stable_json_shape(tmp_path: Path, capsys) -> Non
     _seed(tmp_path)
     rc, out = _cli(tmp_path, "--json", "--since", "7d", capsys=capsys)
     got = json.loads(out)
-    assert rc == 0 and list(got) == ["format", "since", "ref", "pings", "devices"] and got["format"] == "levain-ping-receipts/1"
+    assert rc == 0 and list(got) == ["format", "since", "ref", "pings", "devices", "landings"] and got["format"] == "levain-ping-receipts/1"
     assert list(got["pings"][0]) == ["ping", "at", "kind", "ref", "devices"]
     assert list(got["pings"][0]["devices"][0]) == ["device", "push", "accepted", "statuses", "sent_at", "received_at", "shown_at",
-                                                   "tapped_at", "received_count", "duplicate", "sent_to_received_s",
+                                                   "tapped_at", "clicked_at", "click_target", "opened_at", "opened_how",
+                                                   "received_count", "duplicate", "sent_to_received_s",
                                                    "received_to_shown_s", "outcome"]
-    assert list(got["devices"][0]) == ["device", "sent", "accepted", "received", "shown", "tapped", "duplicates", "silent",
-                                       "median_sent_to_received_s"]
+    assert list(got["devices"][0]) == ["device", "sent", "accepted", "received", "shown", "tapped", "clicked", "duplicates",
+                                       "silent", "median_sent_to_received_s"]
     assert "title" not in json.dumps(got) and "body" not in got["pings"][0]
 
 

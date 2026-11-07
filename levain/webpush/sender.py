@@ -103,6 +103,8 @@ def declarative_payload(data: bytes) -> bytes:
     to make room: if the doubled payload does not fit :data:`ece.MAX_PLAINTEXT`, the legacy bytes go out whole."""
     try:
         legacy = json.loads(data.decode("utf-8"))
+        if legacy.get("devtest") is True:   # the device test is shown by the worker WITH action buttons; a declarative push has none
+            return data
         url = legacy["url"]
         if not (isinstance(url, str) and url.startswith("https://") and urlsplit(url).hostname):
             return data
@@ -188,8 +190,10 @@ def _post(req: urllib.request.Request) -> int:
 
 def send(queue_dir: Path | str, *, kind: str, ref: str | None, title: str, body: str, url: str = "/",
          command: bool | None = None, push: bool = True, hold: str | None = None,
-         device: str | None = None, data: dict[str, Any] | None = None) -> list[tuple[int, int]]:
-    """Record the ping (``command``: whether the notify command started for it, None when none is set), push it to each live subscription concurrently; returns (subscription id, HTTP status)
+         device: str | None = None, data: dict[str, Any] | None = None,
+         extra: dict[str, Any] | None = None) -> list[tuple[int, int]]:
+    """``extra``: members merged into the pushed payload (the device test's marker and actions); never stored.
+    Record the ping (``command``: whether the notify command started for it, None when none is set), push it to each live subscription concurrently; returns (subscription id, HTTP status)
     pairs (status 0: no answer; :data:`UNKNOWN`: none within :data:`WALL_BUDGET`). 404 and 410 retire the subscription, and so does a refusal that names the key (:class:`_Dead`). Every
     store write happens in this thread; the workers only talk to the push services. ``push=False`` pushes nothing; with
     ``hold`` (the reason, see :meth:`PushStore.add_ping`) the recorded ping also waits in the held queue for
@@ -201,11 +205,11 @@ def send(queue_dir: Path | str, *, kind: str, ref: str | None, title: str, body:
     ping_id = store.add_ping(kind, ref, title, body, command, hold=(url, hold) if hold and not push else None, data=data)
     if not push:   # the caller saw no live phone, or the presence rule held the push
         return []
-    return deliver(qdir, store, ping_id, kind=kind, ref=ref, title=title, body=body, url=url, device=device)
+    return deliver(qdir, store, ping_id, kind=kind, ref=ref, title=title, body=body, url=url, device=device, extra=extra)
 
 
 def deliver(qdir: Path, store: PushStore, ping_id: int, *, kind: str, ref: str | None, title: str, body: str,
-            url: str, device: str | None = None) -> list[tuple[int, int]]:
+            url: str, device: str | None = None, extra: dict[str, Any] | None = None) -> list[tuple[int, int]]:
     """Push the already recorded ping ``ping_id`` to each live subscription (``device``: that device's only) and
     record each answer."""
     from levain.webpush import center, needs
@@ -214,6 +218,10 @@ def deliver(qdir: Path, store: PushStore, ping_id: int, *, kind: str, ref: str |
     # the push opens the notification center on its own item (the item's id is the push's ``n``)
     data = build_payload(title, body, ref or kind, center.push_url(store, ping_id, kind, url), ping_id,
                          needs.badge_value(qdir))
+    if extra:
+        merged = _dumps({**json.loads(data.decode("utf-8")), **extra})
+        if len(merged) <= ece.MAX_PLAINTEXT:
+            data = merged
     topic = topic_for(ref)
     reqs = [(sub, _prepare(qdir, sub, data, topic)) for sub in subs]
     statuses: dict[int, int] = {}

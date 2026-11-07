@@ -139,9 +139,10 @@ def receipt(body: bytes, *, queue_dir: Path | str) -> tuple[int, bytes, str]:
     ping = _int(obj.get("ping")) if obj else None
     digest = obj.get("endpoint_sha256") if obj else None
     if (ping is None or not isinstance(digest, str) or _SHA256.match(digest) is None
-            or set(obj) != {"ping", "kind", "at", "endpoint_sha256"}):
-        return _err(400, "bad_report", "send ping, kind, at and endpoint_sha256, and nothing else")
-    got = PushStore(queue_dir).add_receipt(digest, ping, obj["kind"], obj["at"])
+            or not {"ping", "kind", "at", "endpoint_sha256"} <= set(obj)
+            or not set(obj) <= {"ping", "kind", "at", "endpoint_sha256", "target", "how"}):
+        return _err(400, "bad_report", "send ping, kind, at and endpoint_sha256 (a tap adds target and how), and nothing else")
+    got = PushStore(queue_dir).add_receipt(digest, ping, obj["kind"], obj["at"], obj.get("target"), obj.get("how"))
     if got in _RECEIPT_REFUSALS:
         status, code = _RECEIPT_REFUSALS[got]
         return _err(status, code, "this receipt was not recorded")
@@ -195,6 +196,16 @@ def handle(method: str, path: str, query: dict, body: bytes, *, queue_dir: Path 
         if ping is None:
             return _err(400, "bad_ping", "ping must be an integer id")
         return _json(200, {"recorded": store.add_open(ping, device_id)})
+    if method == "POST" and path == "/webpush/landed":
+        # a cockpit page says where it landed and what it did about a tap (the TAP record, store.TAP_KINDS); the device is
+        # the credential's own, the body only a bounded target and how
+        obj = _body_json(body)
+        if not obj or set(obj) != {"target", "how"}:
+            return _err(400, "bad_report", "send target and how, and nothing else")
+        got = store.add_landing(device_id, obj["target"], obj["how"])
+        if got == "recorded":
+            return _json(200, {"recorded": True})
+        return _err(429 if got == "limited" else 400, got, "this landing was not recorded")
     if method == "POST" and path == "/webpush/trace":
         from levain.webpush import tap_report
 
@@ -208,4 +219,32 @@ def handle(method: str, path: str, query: dict, body: bytes, *, queue_dir: Path 
             return _err(503, "trace_busy", "the trace report file is busy; the page posts again later")
         except OSError:
             return _err(503, "trace_unavailable", "the trace report could not be written")
+    if method == "POST" and path == "/webpush/devtest":   # devtest (band 299): the notification-action device test's report
+        from levain.webpush import devtest
+
+        report = devtest.clean(_body_json(body))
+        if report is None:
+            return _err(400, "bad_devtest", "send event shown|click and the allowlisted fields only")
+        try:
+            return _json(200, {"kept": devtest.record(queue_dir, device_id, report)})
+        except devtest.RateLimited:
+            return _err(429, "limited", "too many device-test reports; wait a minute")
+        except devtest.Busy:
+            return _err(503, "devtest_busy", "the report file is busy; the page posts again")
+        except OSError:
+            return _err(503, "devtest_unavailable", "the report could not be written")
+    if method == "POST" and path == "/webpush/devtest/send":   # devtest: ask the server to push the test notification to THIS device
+        from levain.webpush import devtest
+
+        delay = devtest.clean_send(_body_json(body))
+        if delay is None:
+            return _err(400, "bad_devtest", "send {delay_s: 10 or 60} and nothing else")
+        try:
+            return _json(200, devtest.request_send(queue_dir, device_id, delay))
+        except devtest.NoDevice:
+            return _err(403, "no_device", "only a paired device with pings turned on can run the test")
+        except devtest.Pending:
+            return _err(409, "pending", "a test push is already on its way to this device")
+        except devtest.SendLimited:
+            return _err(429, "limited", "too many test pushes this hour")
     return _err(404, "not_found", "no such push path")

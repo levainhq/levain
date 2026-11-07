@@ -47,6 +47,9 @@ INFRASTRUCTURE: frozenset[str] = frozenset({
     # the room (RM-A): a proposal's settling record, no gseq; a committed one names the drop it became, and that drop is
     # counted in its own table
     "proposal_events",
+    # the room's relay (a message of his handed to the desk): a claim and its outcome, append-only, no gseq, so by the rule
+    # that classified proposal_events they are bookkeeping; the desk thread a sent relay reaches is counted in its own tables
+    "room_relay_claims", "room_relay_outcomes",
 })
 
 _DISPATCH = ("ordered by dispatch's own transitions; the open brief does not report dispatch jobs (the board and the "

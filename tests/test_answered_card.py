@@ -124,7 +124,7 @@ JUMP_SELECTOR = re.search(r'needs: "([^"]+)"', CORE[CORE.index("const PHONE_JUMP
 # Both strip states read the page in build mode, where only the bar draws the strip: an answered card is not drawn there
 STRIP = ("JSON.stringify({rows: document.querySelectorAll('#ck-needs .needs-row').length,"
          " headline: !!document.querySelector('#ck-needs .needs-headline'), pill: !!document.querySelector('#ck-needs .needs-count'),"
-         " count: (document.querySelector('#ck-needs .needs-headline .needs-count') || {}).textContent || null,"
+         " count: (document.querySelector('#ck-needs .needs-headline .needs-tab[data-needs-tab=you]') || {}).textContent || null,"   # the count rides the tab's label now
          " history: !!document.querySelector('#ck-needs .needs-history'),"
          " waiting: !!document.querySelector('#ck-needs[data-waiting]'),"
          " jump: !!document.querySelector(%s),"
@@ -149,7 +149,7 @@ def test_an_answered_card_shows_its_answer_and_moves_no_count(tmp_path: Path, mo
             DESKTOP, {"until": "document.querySelector('#ck-needs .needs-answered .consent-note') && 1", "ms": 30000},
             {"eval": STRIP}, {"eval": BUILD_HIDES}])
     seen, build = _values(out, '"strip"'), _values(out, '"build"')
-    assert seen["rows"] == 1 and seen["count"] == "1" and seen["cards"] == 1 and seen["waiting"] and seen["jump"], seen
+    assert seen["rows"] == 1 and seen["count"] == "Needs you (1)" and seen["cards"] == 1 and seen["waiting"] and seen["jump"], seen
     assert seen["label"] == "Just answered" and seen["ticking"] == 1, seen     # the age in the tag is the page's ticking one
     assert seen["lines"][0].startswith("Answered: ship \u00b7 Ship it tonight") and seen["lines"][0].endswith("via cli"), seen
     assert build == {"hidden": True, "n": 1, "build": 1}, build                 # build and memory draw the bar alone

@@ -4743,6 +4743,10 @@
   // (unsigned, a human channel): an authority item is listed and says it opens its signing sheet. Every string is drawn with
   // textContent, never as HTML.
   const bandNumOf = new Map();    // question n -> band number, from the last band read: a question row leads with it
+  // the cards' own copy of the band numbers (bandNumOf also feeds needsName's title, which must not change when a card reads the band)
+  const cardBandOf = new Map();
+  let cardBandSeq = 0;      // the render whose band read may still set cardBandOf (a superseded response is ignored)
+  const cardBandNum = (n) => { const k = Number(n); return bandNumOf.has(k) ? bandNumOf.get(k) : cardBandOf.get(k); };
   let bandKeep = "";              // what the last send said about refusals and sheets: a redraw gives it back until the next send
   let bandGot = null;             // the last read, shared for a moment by the slots one render draws (the server takes one at a time)
   function bandFetch(fresh) {
@@ -4756,6 +4760,11 @@
     for (const row of document.querySelectorAll("[data-question-row]")) {
       const tag = row.querySelector(".band-num");
       const n = bandNumOf.get(Number(row.dataset.questionN));
+      if (tag) { tag.textContent = n === undefined ? "" : String(n); tag.hidden = n === undefined; }
+    }
+    for (const row of document.querySelectorAll(".needs-row[data-question-n]")) {
+      const tag = row.querySelector(".needs-row-band");
+      const n = cardBandNum(row.dataset.questionN);
       if (tag) { tag.textContent = n === undefined ? "" : String(n); tag.hidden = n === undefined; }
     }
   }
@@ -6074,7 +6083,8 @@
     for (const ln of Array.isArray(lines) ? lines : []) {
       if (!ln || typeof ln !== "object") continue;
       if (ln.consent && ln.consent.state === "pending") consents.push({ kind: "consent", c: ln.consent });
-      else if (ln.question && ln.question.state === "open") questions.push({ kind: "question", q: ln.question });
+      // a question the desk alone owes (section desk, not carried over to him) is the Decisions card's "Desk owes" tab, not his strip
+      else if (ln.question && ln.question.state === "open") { if (!(ln.question.section === "desk" && !ln.question.carried)) questions.push({ kind: "question", q: ln.question }); }
       else if (ln.question && ln.question.state === "answered" && decidedRecently(ln.question.decidedAge, ln.question.decidedAt)) {
         answered.push({ kind: "question", q: ln.question, answered: true });
       }
@@ -6411,6 +6421,22 @@
   // item is drawn whole. Line one is the question's title (a consent's tool and first words), line two what it blocks (a consent's
   // working directory), the right edge the agent, the clock or age, and "rec <key>" when the item carries one. Text is drawn with
   // textContent and cut by CSS to one line each, so a long item never sets its row's height.
+  // The card face's words: the first sentence of the question (CSS clamps it to two lines); a text with no sentence end is whole.
+  function needsFirstSentence(what) {
+    const t = String(what || "").replace(/\s+/g, " ").trim();
+    // a sentence ends at . ! ? followed by a space (or at once by a capital: "Which way?Really."), but not after a title or
+    // an abbreviation (Dr. Mr. Mrs. Ms. e.g. i.e. etc. vs.)
+    const abbr = /(?:^|[\s(])(?:Dr|Mr|Mrs|Ms|St|vs|etc|approx|e\.g|i\.e)\.$/i;
+    const re = /[.!?](?=\s|$|[A-Z])/g;
+    let m;
+    while ((m = re.exec(t))) {
+      if (m.index === 0) continue;
+      const head = t.slice(0, m.index + 1);
+      if (m[0] === "." && abbr.test(head)) continue;
+      return head;
+    }
+    return t;
+  }
   function needsRow(it) {
     const row = el("button", "needs-row" + (it.kind === "consent" ? " needs-consent" : " needs-question"));
     row.type = "button";
@@ -6419,7 +6445,8 @@
     const id = needsIdOf(it);
     if (id) row.dataset.needsId = id;
     row.dataset.needsCard = it.kind;
-    const title = el("span", "needs-row-title", it.kind === "consent" ? (it.c.tool || "request") : needsName(it));
+    // display only: the Desk owes tab says it already, and the 2-line clamp is better spent on the ask
+    const title = el("span", "needs-row-title", it.kind === "consent" ? (it.c.tool || "request") : (String(needsName(it) || "").replace(/^\s*DESK OWES:\s*/i, "") || needsName(it)));
     const sub =el("span", "needs-row-sub ext-meta", "");
     const text = el("span", "needs-row-text");
     text.append(title, sub);
@@ -6443,17 +6470,28 @@
         sub.textContent = where ? "in " + where + (b.targets ? " \u00b7 targets " + flat(b.targets) : "") : "";
       });
     } else {
-      if (it.q.age) side.appendChild(el("span", "ext-meta needs-left", "asked " + it.q.age));
+      if (it.q.age) {
+        const ag = el("span", "ext-meta needs-left", "");
+        ag.append(el("span", "needs-asked", "asked "), document.createTextNode(it.q.age));
+        side.appendChild(ag);
+      }
+      if (it.q.options > 0) side.appendChild(el("span", "ext-meta needs-row-opts", it.q.options + (it.q.options === 1 ? " option" : " options")));
+      const bn = cardBandNum(it.q.n);
+      const tag = el("b", "band-num needs-row-band", bn === undefined ? "" : String(bn));   // the band number leads the face; applyBandNumbers retakes it
+      tag.hidden = bn === undefined;
+      row.dataset.questionN = String(it.q.n);
+      side.insertBefore(tag, side.firstChild);
       questionBody(it.q, row).then((b) => {
         if (!b || b.error) return;
-        const first = flat(b.what);
-        if (first) title.textContent = first;
+        const first = needsFirstSentence(b.what);
+        if (first) title.textContent = first.replace(/^\s*DESK OWES:\s*/i, "") || first;   // display only, as the placeholder title above
+        if (flat(b.what)) row.title = flat(b.what);
         const more = flat(blocksBeyondTitle(b.what, b.blocks));
         if (more) sub.textContent = "blocks: " + more;
         if (typeof b.rec === "string" && b.rec) side.appendChild(el("span", "needs-rec-tag needs-row-rec", "rec " + b.rec));
       });
     }
-    row.title = "open the whole request and decide there";
+    if (!row.title) row.title = "open the whole request and decide there";
     row.append(text, side);
     row.addEventListener("click", () => openNeedsFocus(row._needsItem || it, row));
     return row;
@@ -6464,6 +6502,119 @@
   const ANSWERED_KEY = "levain.needs.answeredOpen";
   let answeredOpen = false;
   try { answeredOpen = window.localStorage.getItem(ANSWERED_KEY) === "1"; } catch (e) { answeredOpen = false; }
+  // ---- the section's tabs, layout and fold (Phill 11-06: two tabs in this area only; rows or two-column tiles, both mocked) ----
+  // The "Desk owes" tab: the open questions the desk itself owes (section desk), carried ones included (a carried one is also in
+  // "Needs you", as deskTabs tags it "both"). Nothing here is counted into the badge or the app icon: those stay the waiting items.
+  function deskOwesItems(lines) {
+    const out = [];
+    for (const ln of Array.isArray(lines) ? lines : []) {
+      if (ln && ln.question && ln.question.state === "open" && ln.question.section === "desk") out.push({ kind: "question", q: ln.question });
+    }
+    return out;
+  }
+  const NEEDS_LAYOUT_KEY = "levain.needs.layout", NEEDS_TAB_KEY = "levain.needs.tab";
+  const NEEDS_FOLD_TILES = 8;               // phone tiles shown before the fold (four rows of two)
+  const NEEDS_FOLD = 6;                     // rows shown before the fold in the rows layout
+  let needsViewRef = null;                  // the last view the strip drew from: a tab or layout change re-renders from it, no network
+  let needsLayoutNow = null, needsTabNow = null;
+  let needsMoreOpen = false;                // the fold, per page load
+  const needsRowCache = new Map();          // needs id -> its row, kept across tab switches and folds
+  function needsStore(get, key, val) {
+    try { if (get) return window.localStorage.getItem(key); window.localStorage.setItem(key, val); } catch (e) { /* the choice then lasts this page only */ }
+    return null;
+  }
+  // The page's layout (?needs=rows|tiles beats the remembered choice; default rows), the active tab, and that the layout switch is drawn
+  // (the stylesheet shows it on a phone only).
+  function needsPrefs(view) {
+    if (needsLayoutNow === null) {
+      let q = "";
+      try { const m = /[?&]needs=(rows|tiles)(?:&|#|$)/.exec(window.location.search || ""); q = m ? m[1] : ""; } catch (e) { q = ""; }
+      const stored = needsStore(true, NEEDS_LAYOUT_KEY);
+      needsLayoutNow = q || (stored === "tiles" ? "tiles" : "rows");
+      if (q) needsStore(false, NEEDS_LAYOUT_KEY, q);
+    }
+    if (needsTabNow === null) needsTabNow = needsStore(true, NEEDS_TAB_KEY) === "desk" ? "desk" : "you";
+    return { layout: needsLayoutNow, tab: needsTabNow, sw: true };
+  }
+  function rerenderNeeds(focusSel) {
+    const host = document.getElementById("ck-needs");
+    if (!host || !needsViewRef) return;
+    delete host.dataset.sig;
+    renderNeeds(needsViewRef);
+    if (focusSel) { const n = host.querySelector(focusSel); if (n && typeof n.focus === "function") n.focus({ preventScroll: true }); }
+  }
+  function setNeedsTab(key) {
+    needsTabNow = key === "desk" ? "desk" : "you";
+    needsStore(false, NEEDS_TAB_KEY, needsTabNow);
+    needsMoreOpen = false;
+    rerenderNeeds('.needs-tab[data-needs-tab="' + needsTabNow + '"]');
+  }
+  function setNeedsLayout(key) {
+    needsLayoutNow = key === "tiles" ? "tiles" : "rows";
+    needsStore(false, NEEDS_LAYOUT_KEY, needsLayoutNow);
+    try {
+      const u = new URL(window.location.href);
+      u.searchParams.set("needs", needsLayoutNow);
+      window.history.replaceState(window.history.state, "", u.pathname + u.search + u.hash);   // a reload keeps the choice the URL names
+    } catch (e) { /* no history: the remembered choice stands */ }
+    rerenderNeeds('.needs-layout-btn[data-needs-layout="' + needsLayoutNow + '"]');
+  }
+  function needsAgeSecs(it) {
+    if (it.kind !== "question") return null;
+    const ms = Date.parse(it.q.at || "");
+    return Number.isFinite(ms) ? Math.max(0, Math.floor((needsNow() - ms) / 1000)) : null;
+  }
+  function needsAgeText(s) {
+    return s >= 86400 ? Math.floor(s / 86400) + " d" : s >= 3600 ? Math.floor(s / 3600) + " h" : s >= 60 ? Math.floor(s / 60) + " min" : s + " s";
+  }
+  // The list under the tabs. Rows layout: grouped by age (Today, then Older than a day; labels only when both exist), the first
+  // NEEDS_FOLD rows shown, then one fold row whose label carries the hidden count and the oldest hidden age so a row never hides
+  // unseen. Tiles layout: every item, no fold; the page scrolls.
+  function drawNeedsList(grid, list, prefs, rowOf) {
+    const kids = [];
+    if (!list.length) {
+      kids.push(el("div", "needs-empty ext-meta", prefs.tab === "desk" ? "The desk owes you nothing right now." : "Nothing waits on you right now."));
+    } else {
+      let phone = false;
+      try { phone = !!(window.matchMedia && window.matchMedia("(max-width: 599px)").matches); } catch (e) { phone = false; }
+      const tiles = prefs.layout === "tiles" && phone;   // the choice is a phone one: a desktop draws the same cards whichever was stored
+      const old = (it) => { const s = needsAgeSecs(it); return s !== null && s >= 86400; };
+      const today = list.filter((it) => !old(it)), older = list.filter(old);
+      const grouped = !tiles && today.length > 0 && older.length > 0;   // the tiles carry no group labels
+      const ordered = grouped ? today.concat(older) : list;
+      // both layouts fold; a phone's tiles show four rows of two before the fold, everything else six items
+      const foldAt = tiles ? NEEDS_FOLD_TILES : NEEDS_FOLD;
+      const hiddenN = ordered.length - foldAt;
+      const fold = hiddenN >= 2;                     // one hidden item is not worth a row of its own
+      const shown = !fold || needsMoreOpen ? ordered : ordered.slice(0, foldAt);
+      let last = "";
+      for (const it of shown) {
+        const g = grouped ? (old(it) ? "older" : "today") : "";
+        if (g && g !== last) {
+          kids.push(el("div", "needs-group", g === "today" ? "Today (" + today.length + ")" : "Older than a day (" + older.length + ")"));
+          last = g;
+        }
+        kids.push(rowOf(it));
+      }
+      if (fold) {
+        const hidden = ordered.slice(foldAt);
+        let label;
+        if (needsMoreOpen) label = "Show fewer";
+        else {
+          const ages = hidden.map(needsAgeSecs).filter((s) => s !== null);
+          label = "Show " + hiddenN + " more" + (ages.length ? ", oldest " + needsAgeText(Math.max.apply(null, ages)) : "");
+          const due = hidden.filter((it) => it.kind === "consent" && Number.isFinite(Date.parse(it.c.expiresAt)));
+          if (due.length) label += " · " + due.length + " expiring, soonest " + consentLeft(due.sort((a, b) => Date.parse(a.c.expiresAt) - Date.parse(b.c.expiresAt))[0].c.expiresAt);
+        }
+        const b = el("button", "needs-more-row", label);
+        b.type = "button";
+        b.setAttribute("aria-expanded", needsMoreOpen ? "true" : "false");
+        b.addEventListener("click", () => { needsMoreOpen = !needsMoreOpen; rerenderNeeds(".needs-more-row"); });
+        kids.push(b);
+      }
+    }
+    grid.replaceChildren(...kids);
+  }
   function renderNeeds(view) {
     if (needsExpiryTimer) { window.clearTimeout(needsExpiryTimer); needsExpiryTimer = 0; }
     try { renderNeedsNow(view); }
@@ -6488,14 +6639,19 @@
     signRecheck();      // a board read: every frozen card asks the cockpit about its unsettled answer again
     const host = document.getElementById("ck-needs");
     if (!host) return;
-    const all = needsItems(((view.extra_panels || {}).decisions || {}).lines);
+    needsViewRef = view;
+    const lines = ((view.extra_panels || {}).decisions || {}).lines;
+    const all = needsItems(lines);
+    const desk = deskOwesItems(lines);
     const items = needsWaiting(all), settled = all.filter((it) => it.answered);
     ncNeedsCount(items.length);               // the strip's Needs you count and the app-icon badge: the waiting items, nothing else
     syncAppBadge(view, items.length);
-    if (!all.length) { clearNeeds(host); return; }
+    if (!all.length && !desk.length) { clearNeeds(host); return; }
     // the same set of waiting items leaves the strip as it is: a card with half-typed words, an open "details" and a running
-    // countdown is not rebuilt under the reader by a refetch that changed nothing about what waits
-    const sig = all.map(needsKey).join("\n");
+    // countdown is not rebuilt under the reader by a refetch that changed nothing about what waits. The layout, the tab and the
+    // fold are part of what is drawn, so a change of one is a new signature (a plain re-render, no network).
+    const prefs = needsPrefs(view);
+    const sig = all.map(needsKey).join("\n") + "\nD:" + desk.map(needsKey).join(",") + "\nP:" + prefs.layout + "|" + prefs.tab + "|" + (needsMoreOpen ? 1 : 0) + "|" + (prefs.sw ? 1 : 0);
     if (host.dataset.sig === sig && !host.hidden) return;
     // the answered cards are drawn under a quiet label of their own; with nothing waiting that is all the strip holds
     // folded by default (Phill 11-02): a count under a label you click to open; the cards stay in the page, hidden, so the
@@ -6522,22 +6678,51 @@
       sec.append(toggle, body);
       return sec;
     };
-    if (!items.length) {
+    if (!items.length && !desk.length) {
       host.replaceChildren(answeredSection());
       delete host.dataset.waiting;
       host.hidden = false;
       host.dataset.sig = sig;
       return;
     }
-    host.dataset.waiting = "1";
+    if (items.length) host.dataset.waiting = "1"; else delete host.dataset.waiting;
+    host.dataset.needsLayout = prefs.layout;
     const head = el("div", "needs-headline");
-    head.appendChild(el("h3", null, "Needs you"));
-    head.appendChild(el("span", "needs-count", String(items.length)));
+    // The section's two tabs (Phill 11-06: the items that need him apart from the desk's own, in this area only). Each label carries its
+    // live count; the choice is kept per browser; a change is a re-render from the view already held, no network.
+    const tabs = el("div", "needs-tabs");
+    tabs.setAttribute("role", "tablist");
+    tabs.setAttribute("aria-label", "Needs you");
+    for (const [key, text, n] of [["you", "Needs you", items.length], ["desk", "Desk owes", desk.length]]) {
+      const b = el("button", "needs-tab" + (prefs.tab === key ? " is-on" : ""), text + " (" + n + ")");
+      b.type = "button";
+      b.setAttribute("role", "tab");
+      b.setAttribute("aria-selected", prefs.tab === key ? "true" : "false");
+      b.dataset.needsTab = key;
+      b.addEventListener("click", () => setNeedsTab(key));
+      tabs.appendChild(b);
+    }
+    head.appendChild(tabs);
     // no re-ping route exists (the phone is told when a request is filed, and the queue re-pings on its own clock; nothing here
     // pushes), so the gloss claims no ping: it says where the answer is signed
-    if (items.length) head.appendChild(el("span", "needs-gloss", "Agents are waiting on a ruling. Sign it on your phone."));
-    if (items.some((it) => it.kind === "question") && items.some((it) => it.kind === "consent")) {
+    if (items.length && prefs.tab === "you") head.appendChild(el("span", "needs-gloss", "Agents are waiting on a ruling. Sign it on your phone."));
+    if (prefs.tab === "you" && items.some((it) => it.kind === "question") && items.some((it) => it.kind === "consent")) {
       head.appendChild(el("span", "needs-order", "questions first, then soonest to expire"));
+    }
+    if (prefs.sw) {
+      // the phone's rows | tiles segmented control: CSS hides it at desktop width, where both choices draw the same cards
+      const sw = el("span", "needs-layout-sw");
+      sw.setAttribute("role", "group");
+      sw.setAttribute("aria-label", "layout");
+      for (const key of ["rows", "tiles"]) {
+        const b = el("button", "needs-layout-btn" + (prefs.layout === key ? " is-on" : ""), key);
+        b.type = "button";
+        b.dataset.needsLayout = key;
+        b.setAttribute("aria-pressed", prefs.layout === key ? "true" : "false");
+        b.addEventListener("click", () => setNeedsLayout(key));
+        sw.appendChild(b);
+      }
+      head.appendChild(sw);
     }
     const hist = el("button", "needs-history", "all decisions");
     hist.type = "button";
@@ -6545,10 +6730,14 @@
     hist.addEventListener("click", () => openDecisionsHistory(hist));
     head.appendChild(hist);
     // the rows are kept by their stable id: a row whose item still waits is moved, never rebuilt (words typed into an item live in
-    // its focus view, which stays open while the item waits: refreshModal)
+    // its focus view, which stays open while the item waits: refreshModal). The cache outlives a tab switch: the other tab's rows
+    // wait detached, so switching back reads nothing again.
     let grid = host.querySelector(".needs-grid");
-    const kept = new Map();
-    if (grid) for (const c of grid.children) if (c.dataset && c.dataset.needsId) kept.set(c.dataset.needsId, c);
+    const kept = needsRowCache;
+    const live = new Set();
+    for (const it of items.concat(desk)) { const id = needsIdOf(it); if (id) live.add(id); }
+    for (const id of Array.from(kept.keys())) if (!live.has(id)) kept.delete(id);
+    if (grid) for (const c of grid.children) if (c.dataset && c.dataset.needsId && live.has(c.dataset.needsId)) kept.set(c.dataset.needsId, c);
     // a row kept by id still shows what its item says NOW: a consent whose expiry moved (extended) takes the new clock in place;
     // one whose state changed is rebuilt
     const keep = (row, it) => {
@@ -6564,14 +6753,33 @@
       }
       return row;
     };
-    const cards = items.map((it) => { const id = needsIdOf(it); const k = id && kept.get(id); return k ? keep(k, it) : needsRow(it); });
+    const rowOf = (it) => { const id = needsIdOf(it); let r = id && kept.get(id); r = r ? keep(r, it) : needsRow(it); if (id) kept.set(id, r); return r; };
     if (!grid) grid = el("div", "needs-grid");
-    for (let i = 0; i < cards.length; i++) if (grid.children[i] !== cards[i]) grid.insertBefore(cards[i], grid.children[i] || null);
-    while (grid.children.length > cards.length) grid.removeChild(grid.lastChild);
-    const kids = [head, needsBar(items), grid];
+    grid.dataset.layout = prefs.layout;
+    grid.setAttribute("role", "tabpanel");
+    drawNeedsList(grid, prefs.tab === "desk" ? desk : items, prefs, rowOf);
+    const kids = [head, needsBar(items), grid];   // the bar is CSS-hidden on Board and is the only Needs surface on Build and Memory, whichever tab is picked
     if (settled.length) kids.push(answeredSection());
     host.replaceChildren(...kids);
     host.hidden = false;
+    // the cards lead with their band number: the band read gives it (the Decisions panel's own slot may not be drawn on this tab)
+    // (no band transport on a read-only manifest surface: the cards then draw without numbers)
+    if (typeof bandRead === "function" && items.some((it) => it.kind === "question")) {
+      const seq = ++cardBandSeq;
+      let p = null;
+      try { p = bandFetch(false); } catch (e) { p = null; }
+      if (p && typeof p.then === "function") p.then((b) => {
+        if (seq !== cardBandSeq) return;     // a newer render's read owns the numbers now
+        const list = b && Array.isArray(b.items) ? b.items : [];
+        cardBandOf.clear();
+        for (const x of list) if (x && Number.isInteger(x.question) && x.n !== undefined) cardBandOf.set(x.question, x.n);
+        applyBandNumbers();
+      }, (e) => {
+        if (/no question store/.test(e && e.message ? String(e.message) : "")) return;     // nothing to retry on a cockpit without one
+        // a refused or busy read is not "done": the next render draws the strip again and asks again
+        if (seq === cardBandSeq && host.dataset.sig === sig) delete host.dataset.sig;
+      });
+    }
     host.dataset.sig = sig;   // only a strip that was drawn is recorded as drawn: a build that threw is tried again at the next render
   }
   // the Decisions focus view (decided requests, outcomes, proposals); false when this page has no Decisions panel
@@ -6657,7 +6865,7 @@
   // A record that names a card (the Work lens's waiting items) goes to the strip's card with that id: scrolled to and lit by an
   // animation that ends on its own (needs-lit), any earlier light cleared first. Where the strip is the bar (Build, Memory) the matching
   // chip is lit instead. False when no card or chip carries the id, so the caller can open the history.
-  function needsGo(id) {
+  function needsGo(id, instant) {
     const host = document.getElementById("ck-needs");
     if (!host || host.hidden || !id) return false;
     for (const n of host.querySelectorAll(".needs-lit")) n.classList.remove("needs-lit");
@@ -6665,7 +6873,9 @@
     const sel = cards ? ".needs-row" : ".needs-chip-btn";
     const node = Array.prototype.find.call(host.querySelectorAll(sel), (n) => n.dataset.needsId === id);
     if (!node) return false;
-    if (typeof node.scrollIntoView === "function") node.scrollIntoView({ block: "center", behavior: "smooth" });
+    // `instant`: the caller locks the page the next moment (the item link opens the card's sheet at once), and the lock freezes the page at the
+    // scroll position it finds: a smooth scroll only begun would be frozen at the top, so the reader's place behind the sheet would be lost
+    if (typeof node.scrollIntoView === "function") node.scrollIntoView({ block: "center", behavior: instant ? "auto" : "smooth" });
     void node.offsetWidth;   // restart the animation if the same node is lit twice
     node.classList.add("needs-lit");
     const off = () => node.classList.remove("needs-lit");
@@ -7223,14 +7433,13 @@
     const outstanding = typeof ui.handed === "string";
     ui.handed = undefined;
     const box = ui.words;
-    if (!outstanding || !box || typeof delivered !== "string" || !delivered.trim() || box.value.trim() !== delivered.trim()) return;
+    if (!outstanding || !box || typeof delivered !== "string" || !delivered.trim() || dropBoxText(box).trim() !== delivered.trim()) return;
     if (ui.req && ui.req.words.trim() === delivered.trim()) {
       dropForget(ui.req);
       ui.req = null;
       ui.fromKeep = false;
     }
-    box.value = "";
-    box.style.height = "";
+    setDropBoxText(box, "");
     dropPrefillClear();
     if (typeof ui.resume === "function") ui.resume();
     if (typeof ui.earlierLine === "function") ui.earlierLine();
@@ -7245,7 +7454,113 @@
   // one whose answer is unknown
   const dropPendKey = () => "levain-drop-pending:" + window.location.hostname;
   const dropPendKeyOf = (id) => dropPendKey() + ":" + id;
-  const dropGrow = (t) => { const f = window.LevainCardFormat; if (f && typeof f.grow === "function") f.grow(t); };   // a programmatic value fires no input event
+  // ---- the hero Drop box is a contenteditable div (role=textbox), not a form control (Phill 11-06): Safari's AutoFill kept
+  // offering cards and contacts on the live textarea whatever its attributes said, and a div has no field kind to classify.
+  // Everything that read or wrote its `.value` goes through these helpers, in this one place.
+  // The words in the box as one string: line breaks (a <br>, a div per Enter) are "\n", a lone <br> left by deleting everything is
+  // nothing, a no-break space is a space, and trailing newlines are dropped.
+  // ONE normaliser for both sides of every "is this the retained request's words" comparison (a kept request from an earlier
+  // build may end in newlines or hold no-break spaces; the box can only ever show the normalised form)
+  function dropNorm(s) { return String(s == null ? "" : s).replace(/\r\n?/g, "\n").replace(/\u00a0/g, " ").replace(/\n+$/, ""); }
+  const dropSame = (a, b) => dropNorm(a) === dropNorm(b);
+  // read by walking the DOM, never innerText: innerText is layout-dependent (a hidden host gives "" in WebKit and the bare
+  // textContent, with no line breaks, in Chrome). A <br> is a newline; a block child (a div per Enter) starts and ends a line.
+  function dropBoxText(box) {
+    if (!box || !box.textContent) return "";
+    let out = "";
+    const nl = () => { if (out && out[out.length - 1] !== "\n") out += "\n"; };
+    const walk = (n) => {
+      for (let c = n.firstChild; c; c = c.nextSibling) {
+        if (c.nodeType === 3) out += c.nodeValue;
+        else if (c.nodeType === 1) {
+          if (c.tagName === "BR") { out += "\n"; continue; }
+          const block = /^(DIV|P|LI|UL|OL|BLOCKQUOTE|PRE|H[1-6])$/.test(c.tagName);
+          if (block) nl();
+          walk(c);
+          if (block) nl();
+        }
+      }
+    };
+    walk(box);
+    return dropNorm(out);
+  }
+  function setDropBoxText(box, text) { if (box) box.textContent = typeof text === "string" ? text : ""; }
+  // the box takes no typing: contenteditable off and aria-disabled (a div has no `disabled`)
+  function dropBoxOff(box, off) {
+    box.setAttribute("contenteditable", off ? "false" : "true");
+    if (off) box.setAttribute("aria-disabled", "true"); else box.removeAttribute("aria-disabled");
+  }
+  function dropBoxIsOff(box) { return box.getAttribute("aria-disabled") === "true"; }
+  function dropCaretEnd(box) {
+    const sel = window.getSelection && window.getSelection();
+    if (!sel) return;
+    const r = document.createRange();
+    r.selectNodeContents(box);
+    r.collapse(false);
+    sel.removeAllRanges();
+    sel.addRange(r);
+  }
+  // plain text in at the caret (or at `at`, a Range): never markup
+  function dropInsertPlain(box, text, at) {
+    const t = String(text || "").replace(/\r\n?/g, "\n");
+    if (!t || dropBoxIsOff(box)) return;      // a box that is off (a send in flight, no coordinator) takes nothing
+    const sel = window.getSelection && window.getSelection();
+    if (at && sel) { sel.removeAllRanges(); sel.addRange(at); }
+    // the selection must sit wholly inside the box (both ends and their common ancestor), else the text goes at the box's end:
+    // never into another field, never deleting DOM outside the composer
+    if (sel) {
+      const inside = (n) => !!n && box.contains(n);
+      let r0 = null;
+      try { r0 = sel.rangeCount ? sel.getRangeAt(0) : null; } catch (e) { r0 = null; }
+      if (!(r0 && inside(r0.startContainer) && inside(r0.endContainer) && inside(r0.commonAncestorContainer))) dropCaretEnd(box);
+    }
+    let ok = false;
+    try { ok = document.execCommand("insertText", false, t); } catch (e) { ok = false; }
+    if (!ok && sel) {
+      if (!sel.rangeCount) dropCaretEnd(box);
+      const r = sel.getRangeAt(0);
+      r.deleteContents();
+      const node = document.createTextNode(t);
+      r.insertNode(node);
+      r.setStartAfter(node);
+      r.collapse(true);
+      sel.removeAllRanges();
+      sel.addRange(r);
+    }
+    box.dispatchEvent(new Event("input", { bubbles: true }));
+  }
+  function dropBoxBuild() {
+    const box = el("div", "drop-words");
+    box.id = "ck-drop-words";
+    box.setAttribute("contenteditable", "true");      // "true", the markup the 11-06 test found clean; plaintext-only was never tried on the phone
+    box.setAttribute("role", "textbox");
+    box.setAttribute("aria-multiline", "true");
+    box.setAttribute("aria-label", "your words for the coordinator");
+    box.setAttribute("aria-placeholder", "words for the coordinator");
+    box.dataset.placeholder = "words for the coordinator";
+    for (const [k, v] of [["autocapitalize", "sentences"], ["autocorrect", "on"], ["spellcheck", "true"], ["inputmode", "text"], ["enterkeyhint", "enter"]]) box.setAttribute(k, v);
+    // a cleared box keeps a lone <br> in some browsers, which would hold the placeholder away: empty means empty
+    // (only after a deletion: Enter in an empty box leaves <br>s too, and those are the newline the user just typed)
+    box.addEventListener("input", (ev) => { if (!box.textContent && box.firstChild && ev && typeof ev.inputType === "string" && ev.inputType.indexOf("delete") === 0) box.replaceChildren(); });
+    box.addEventListener("paste", (ev) => {
+      ev.preventDefault();
+      if (dropBoxIsOff(box)) return;
+      const cd = ev.clipboardData;
+      dropInsertPlain(box, cd && typeof cd.getData === "function" ? cd.getData("text/plain") : "");
+    });
+    box.addEventListener("drop", (ev) => {
+      ev.preventDefault();
+      if (dropBoxIsOff(box)) return;
+      const dt = ev.dataTransfer;
+      const text = dt && typeof dt.getData === "function" ? dt.getData("text/plain") : "";
+      let at = null;
+      try { if (document.caretRangeFromPoint) { at = document.caretRangeFromPoint(ev.clientX, ev.clientY); if (at && !box.contains(at.startContainer)) at = null; } } catch (e) { at = null; }
+      dropInsertPlain(box, text, at);
+    });
+    // no rich text by any route (the iOS edit menu's bold and italic, a style paste)
+    box.addEventListener("beforeinput", (ev) => { if (typeof ev.inputType === "string" && /^(format|insertOrderedList|insertUnorderedList|insertHorizontalRule|insertLink)/.test(ev.inputType)) ev.preventDefault(); });
+    return box;
+  }
   // every kept request, newest first (a record an earlier build kept under the bare key counts too)
   const dropKeptAll = () => {
     const seen = new Map();
@@ -7431,13 +7746,9 @@
     head.appendChild(el("h3", null, "Drop to the coordinator"));
     ui.say = el("span", "needs-gloss drop-note", "");
     head.appendChild(ui.say);
-    const words = el("textarea", "drop-words");
-    words.id = "ck-drop-words";
-    words.placeholder = "words for the coordinator";
-    words.setAttribute("aria-label", "your words for the coordinator");
-    // a plain prose box: iOS keys its field kind off the attributes, and a bare textarea beside the one-time-code pairing box
-    // got payment/code treatment (no predictive text, autocorrect off); say "ordinary text" outright
-    for (const [k, v] of [["autocomplete", "off"], ["autocapitalize", "sentences"], ["autocorrect", "on"], ["spellcheck", "true"], ["inputmode", "text"], ["enterkeyhint", "enter"], ["name", "dropwords"]]) words.setAttribute(k, v);
+    // a contenteditable div, not a textarea: iOS Safari classified the textarea as a card/contact field from its page context
+    // (the pairing code box beside it) whatever its attributes said; a div with role=textbox is no form control (dropBoxBuild)
+    const words = dropBoxBuild();
     words.addEventListener("input", () => { dropPrefillClear(); ui.handed = undefined; });      // words changed since a handoff: that handoff is stale
     const acts = el("div", "needs-actions drop-actions");
     const send = el("button", "needs-btn needs-primary", "Send");
@@ -7484,14 +7795,13 @@
     const earlierLine = () => {
       const mine = ui.req ? ui.req.outbox_id : null;
       const n = dropKeptAll().filter((r) => r.outbox_id !== mine).length;
-      const inBox = ui.fromKeep && ui.req && ui.req.words === words.value ? "The drop in the box was not confirmed earlier: send it again, unchanged, to find out. " : "";
+      const inBox = ui.fromKeep && ui.req && dropSame(ui.req.words, dropBoxText(words)) ? "The drop in the box was not confirmed earlier: send it again, unchanged, to find out. " : "";
       ui.earlier.textContent = inBox + (n ? n + " earlier drop" + (n > 1 ? "s" : "") + " not confirmed." : "");
     };
     const resume = (msg) => {
       const next = dropKeptAll()[0];
       if (!next) return false;
-      words.value = next.words;
-      dropGrow(words);
+      setDropBoxText(words, next.words);
       ui.req = next;
       ui.fromKeep = true;
       if (msg) paint(msg, true);
@@ -7500,23 +7810,23 @@
     ui.earlierLine = earlierLine;
     ui.resume = resume;
     const paint = (msg, bad) => { ui.receipt.textContent = msg; ui.receipt.classList.toggle("bad", !!bad); };
-    const lock = (on) => { ui.working = on; send.disabled = env.disabled = on || !ui.can; words.disabled = dropWordsOff(words, on, ui.can); };
+    const lock = (on) => { ui.working = on; send.disabled = env.disabled = on || !ui.can; dropBoxOff(words, dropWordsOff(words, on, ui.can)); };
     ui.paint = paint;
     ui.lock = lock;
     // (the handoff is marked after the sheet opens: opening closes any sheet first, and a close ends a handoff)
-    env.addEventListener("click", () => { if (ui.can) { const got = openDropSheet(words.value); if (got) ui.handed = words.value; } });
+    env.addEventListener("click", () => { if (ui.can) { const got = openDropSheet(dropBoxText(words)); if (got) ui.handed = dropBoxText(words); } });
     send.addEventListener("click", () => {
       if (ui.working || !ui.can) return;
       if (ui.reading) { ui.reading.then(() => send.click()); return; }      // the read that names the store is still out
-      const w = words.value;
+      const w = dropBoxText(words);
       if (!w.trim()) { paint("Type your words first.", true); words.focus(); return; }
       const t = window.LevainCockpitTransport;
       const headers = Object.assign({}, t && typeof t.headers === "function" ? t.headers() : {}, { "Content-Type": "application/json" });
       // the retained request (words, id, time, store, and an envelope a sheet attached) goes again as it was, so a send whose
       // answer was lost files once; words edited since are a new drop with a new id
       // (a new drop is kept under its own id: the one it replaces in the box stays kept, never overwritten)
-      if (!(ui.req && ui.req.words === w)) ui.fromKeep = false;
-      const req = ui.req && ui.req.words === w ? ui.req : { words: w, outbox_id: dropOutboxId(), sent_at: dropStamp(), store_id: ui.storeId };
+      if (!(ui.req && dropSame(ui.req.words, w))) ui.fromKeep = false;
+      const req = ui.req && dropSame(ui.req.words, w) ? ui.req : { words: w, outbox_id: dropOutboxId(), sent_at: dropStamp(), store_id: ui.storeId };
       ui.req = req;
       const kept = dropKeep(req);
       lock(true);
@@ -7541,8 +7851,7 @@
           const d = a.body.drop || {};
           const first = w.split("\n")[0].trim().slice(0, 80) + (w.length > 80 || w.includes("\n") ? "…" : "");
           const how = dropHow(req, a.body);
-          words.value = "";
-          words.style.height = "";
+          setDropBoxText(words, "");
           paint((a.body.created === false ? "Already delivered: " : "Sent to the coordinator: ") + "“" + first + "” · " + how.text + " · " + String(d.drop_id || ""), !how.ok);
           resume();      // an earlier unconfirmed drop comes into the box, to send unchanged
           earlierLine();
@@ -7565,7 +7874,7 @@
     resume("A drop from earlier was not confirmed. Send it again, unchanged, to find out.");
     earlierLine();
     host._drop = ui;
-    host.addEventListener("keydown", (ev) => { if (ev.key === "Enter" && (ev.metaKey || ev.ctrlKey) && ev.target === words) { ev.preventDefault(); send.click(); } });      // after the commit above, so a failed build leaves none
+    host.addEventListener("keydown", (ev) => { if (ev.key === "Enter" && (ev.metaKey || ev.ctrlKey) && !ev.isComposing && ev.target === words) { ev.preventDefault(); send.click(); } });      // after the commit above, so a failed build leaves none
     return ui;
   }
   // one draw of the drop card from one read; the box and its words are never rebuilt under the reader
@@ -7575,7 +7884,7 @@
   function dropWordsOff(words, working, can) {
     if (working) return true;
     if (can) return false;
-    return !(document.activeElement === words || words.value.trim() !== "");
+    return !(document.activeElement === words || dropBoxText(words).trim() !== "");
   }
   function dropHeroDraw(host, r) {
     const ui = host._drop;
@@ -7590,7 +7899,7 @@
     ui.say.textContent = note;
     ui.say.classList.toggle("bad", !ui.can);
     ui.send.disabled = ui.env.disabled = ui.working || !ui.can;
-    ui.words.disabled = dropWordsOff(ui.words, ui.working, ui.can);
+    dropBoxOff(ui.words, dropWordsOff(ui.words, ui.working, ui.can));
     host.classList.toggle("drop-off", !ui.can);
     // A transient failure (network, 5xx, no store read) leaves the rows already drawn; the note above says why. A refused or
     // missing token leaves nothing of the thread: neither his drops nor the desk's cached rows outlive the authority to read them.
@@ -7684,7 +7993,6 @@
     host.hidden = false;
     host._drop.view = view || null;
     if (host._drop.read) dropThreadDraw(host);      // the desk's side may have changed with this view, whatever the drop read does next
-    if (fresh) dropGrow(host._drop.words);      // restored words are sized once the box is laid out, not while the host was hidden
     if (dropRead && Date.now() - dropAt >= DROP_FAIL_TTL_MS) dropRead = null;      // a render reads again once the last read is a few seconds old
     dropRefresh(host, false);
   }
@@ -7708,11 +8016,11 @@
     if (document.getElementById("levain-modal")) closeModal();      // a focus view stands over the box
     const box = ui.words;
     ui.say.textContent = ui.note || ""; ui.say.classList.remove("bad");      // an earlier refusal's line is stale now; the coordinator's own note stays
-    box.value = box.value.trim() ? box.value.replace(/\s+$/, "") + "\n\n" + words : words;
+    const have = dropBoxText(box);
+    setDropBoxText(box, have.trim() ? have.replace(/\s+$/, "") + "\n\n" + words : words);
     dropPrefillClear();      // a handoff to the sheet left earlier is stale now that these words are in the box
-    dropGrow(box);
     try { box.scrollIntoView({ block: "center" }); } catch (e) { /* scrolling is a convenience */ }
-    try { box.focus({ preventScroll: true }); box.setSelectionRange(box.value.length, box.value.length); } catch (e) { /* focus is a convenience */ }
+    try { box.focus({ preventScroll: true }); dropCaretEnd(box); } catch (e) { /* focus is a convenience */ }
     return true;
   }
   const DISPATCH_VERB = { sign: "Sign", cancel: "Cancel job", authorise: "Authorise" };
@@ -7776,7 +8084,7 @@
     return f;
   }
 
-  function appendExternalLines(host, lines) {
+  function appendExternalLines(host, lines, tabInfo) {
     let lastGroup = null;
     // the Decisions panel's proposal cards (see renderExternalBody) follow the live requests, which are on a clock, and come
     // before the decided ones: ahead of the first "Resolved" / "Outcomes" heading, else after the last row
@@ -7787,7 +8095,17 @@
     if (owner && owner !== host) host.dataset.proposalSlot = "";
     let slotDue = !!(owner && !host.querySelector(".proposal-slot"));
     const eagerQ = newestAnswered(lines, ANSWERED_ROWS_EAGER);
+    // the Decisions card's two tabs (Needs you / Desk owes) when the rows carry a desk section: each row is tagged here, the strip is drawn after
+    // (cockpit_view hands over the classification of ALL the filtered rows and the page of the chosen tab: tags align with `lines`)
+    const CF = window.LevainCardFormat;
+    const dt = tabInfo && tabInfo.dt ? Object.assign({}, tabInfo.dt, { tags: tabInfo.tags })
+      : (CF && typeof CF.deskTabs === "function" ? CF.deskTabs(lines) : null);
+    const tabbed = !!(dt && dt.show);
+    const firstAt = host.children.length;
+    let li = -1;
+    const mark = (node) => { if (tabbed && node) node.dataset.deskTab = dt.tags[li]; };
     for (const ln of lines) {
+      li++;
       const o = ln && typeof ln === "object" ? ln : {};
       // rows that carry a group (a list drawn as a count) come in the kernel's order: a heading where the group changes
       if (typeof o.grp === "string" && o.grp !== lastGroup) {
@@ -7795,9 +8113,9 @@
         if (slotDue && (o.grp === "Resolved" || o.grp === "Outcomes")) { slotDue = false; host.appendChild(standingSlots()); }
         host.appendChild(el("div", "ext-grouphead", o.grp));
       }
-      if (o.consent) { host.appendChild(consentRow(o)); continue; }
-      if (o.question) { host.appendChild(questionRow(o, !!o.question && eagerQ.has(o.question))); continue; }
-      if (o.note) { host.appendChild(noteRow(o)); continue; }
+      if (o.consent) { host.appendChild(consentRow(o)); mark(host.lastElementChild); continue; }
+      if (o.question) { host.appendChild(questionRow(o, !!o.question && eagerQ.has(o.question))); mark(host.lastElementChild); continue; }
+      if (o.note) { host.appendChild(noteRow(o)); mark(host.lastElementChild); continue; }
       const row = el("div", "row" + (o.accent ? " ext-accent" : "") + (o.dim ? " ext-dim" : ""));
       if (o.wrapMeta) row.classList.add("meta-wrap");   // a row whose meta line IS its content (the sessions' chips): it wraps, never ellipsises
       if (typeof o.key === "string" && o.key) row.dataset.keepKey = o.key;   // the id an expanded row is found by after a repaint
@@ -7820,8 +8138,42 @@
       if (o.cancel && cancelPending) appendRowVerbs(row, buildPendingCancel(o.cancel));
       if (o.review) appendReviewVerb(row, o.review);
       host.appendChild(row);
+      mark(row);
     }
     if (slotDue) host.appendChild(standingSlots());
+    if (tabbed) drawDeskTabs(host, firstAt, dt, tabInfo && tabInfo.onTab);
+  }
+
+  // The Decisions card's in-card tabs: "Needs you (n)" first and the default, "Desk owes (n)" second. A row tagged "both" (a desk row
+  // carried past a day) shows under each; an untagged node (a heading, a proposal card) is "you", a heading following its rows' tags.
+  function drawDeskTabs(host, firstAt, dt, onTab) {
+    const CF = window.LevainCardFormat;
+    const choice = () => (CF && typeof CF.getDeskTab === "function" ? CF.getDeskTab() : "you");
+    const kids = Array.from(host.children).slice(firstAt);
+    let head = null, seen = null;
+    const seal = () => { if (head) head.dataset.deskTab = seen.size > 1 || seen.has("both") ? "both" : (Array.from(seen)[0] || "you"); };
+    for (const k of kids) {
+      if (k.classList.contains("ext-grouphead")) { seal(); head = k; seen = new Set(); continue; }
+      if (!k.dataset.deskTab) k.dataset.deskTab = "you";
+      if (seen) seen.add(k.dataset.deskTab);
+    }
+    seal();
+    const nav = el("div", "ck-tabs ck-desk-tabs");
+    nav.setAttribute("role", "tablist");
+    const buttons = [["you", "Needs you (" + dt.you + ")"], ["desk", "Desk owes (" + dt.desk + ")"]].map(([key, text]) => {
+      const b = el("button", "ck-tab", text);
+      b.type = "button";
+      b.setAttribute("role", "tab");
+      b.addEventListener("click", () => { if (CF && CF.setDeskTab) CF.setDeskTab(key); if (onTab) onTab(); else apply(); });
+      nav.appendChild(b);
+      return [key, b];
+    });
+    const apply = () => {
+      for (const [key, b] of buttons) b.setAttribute("aria-selected", key === choice() ? "true" : "false");
+      for (const k of kids) k.classList.toggle("ck-dtab-off", k.dataset.deskTab !== "both" && k.dataset.deskTab !== choice());
+    };
+    host.insertBefore(nav, kids[0] || null);
+    apply();
   }
 
   function renderEdits(entry, view) {
@@ -8102,7 +8454,10 @@
       overlay.addEventListener("keydown", onModalKeydown);
       document.body.appendChild(overlay);
       document.body.classList.add("modal-open");
+      if (modalKey && modalKey.indexOf("needs:") === 0) lockNeedsScroll();
     }
+    // a Needs-you item's detail is a sheet over the page where the reader tapped (bottom sheet on a phone, centred on a desk)
+    overlay.classList.toggle("needs-detail", !!modalCustom && !modalCustom.page && String(modalKey || "").indexOf("needs:") === 0);
     overlay.dataset.zone = content.zone;
     const box = el("div", "modal");
     const head = el("div", "modal-head");
@@ -8148,7 +8503,28 @@
     modalPending = modalAwaiting && gen === modalGen ? modalKept : null;   // rows still on the way take it when they land
     const newSearch = wasSearchFocused ? mbody.querySelector(".ep-search-input") : null;
     if (newSearch) newSearch.focus();
-    else if (firstOpen || hadModalFocus) close.focus();
+    else if (firstOpen || hadModalFocus) close.focus({ preventScroll: true });
+  }
+
+  // Scroll lock for the Needs-you detail: the page is held fixed at the scroll position it had, so the sheet opens over the row that was
+  // tapped (never at the top of the page) and the reader gets the same place back at close. overflow:hidden alone does not hold an
+  // iPhone's page still behind a sheet.
+  let needsLockY = null;
+  function lockNeedsScroll() {
+    if (needsLockY !== null) return;
+    needsLockY = window.scrollY || window.pageYOffset || 0;
+    const b = document.body.style;
+    b.position = "fixed"; b.top = (-needsLockY) + "px"; b.left = "0"; b.right = "0";
+    document.body.classList.add("needs-locked");
+  }
+  function unlockNeedsScroll() {
+    if (needsLockY === null) return;
+    const y = needsLockY;
+    needsLockY = null;
+    const b = document.body.style;
+    b.position = ""; b.top = ""; b.left = ""; b.right = "";
+    document.body.classList.remove("needs-locked");
+    window.scrollTo(0, y);
   }
 
   function refreshModal() {
@@ -8159,7 +8535,9 @@
       // a live view repaints from its own source and stays open. buildModal on an open modal is a repaint only: it keeps the one overlay (and
       // its one keydown listener), the scroll and the focus, and swaps the body for the `build` the caller returns
       if (modalCustom.live) { buildModal(null); return; }
-      if (!needsWaiting(needsItems(((currentView && currentView.extra_panels || {}).decisions || {}).lines)).some((it) => needsIdOf(it) === modalCustom.id)) closeModal();
+      const dl = ((currentView && currentView.extra_panels || {}).decisions || {}).lines;
+      // the desk's own questions (the "Desk owes" tab) are waiting items too: their focus view stays open while they are
+      if (!needsWaiting(needsItems(dl)).concat(deskOwesItems(dl)).some((it) => needsIdOf(it) === modalCustom.id)) closeModal();
       return;
     }
     const entry = findEntry(currentView, modalKey);
@@ -8183,6 +8561,7 @@
     phoneJumpRun++;
     pruneModalKinds();
     document.body.classList.remove("modal-open");
+    unlockNeedsScroll();
     modalKey = null;
     modalCustom = null;
     modalGlance = false;
@@ -8206,7 +8585,11 @@
     }
     // restore focus to the ⤢ trigger if it's still in the DOM (an intervening board
     // re-render may have replaced it — then focus simply falls to <body>, acceptable).
-    if (rf && typeof rf.focus === "function" && document.body.contains(rf)) rf.focus();
+    // a Needs-you row replaced by a redraw is found again by its item id
+    if (rf && !document.body.contains(rf) && rf.dataset && rf.dataset.needsId) {
+      rf = Array.prototype.find.call(document.querySelectorAll("#ck-needs .needs-row"), (n) => n.dataset.needsId === rf.dataset.needsId) || null;
+    }
+    if (rf && typeof rf.focus === "function" && document.body.contains(rf)) rf.focus({ preventScroll: true });
   }
 
   function onModalKeydown(ev) {
@@ -8408,7 +8791,7 @@
         if (run !== phoneJumpRun) return;
         host.scrollIntoView({ block: "start" });
         const ta = host._drop && host._drop.words;
-        if (ta && !ta.disabled) ta.focus({ preventScroll: true });
+        if (ta && !dropBoxIsOff(ta)) ta.focus({ preventScroll: true });
       });
       return;
     }
@@ -8677,13 +9060,45 @@ for (const type of ["touchstart", "wheel", "pointerdown", "click", "keydown"]) d
     if (whole) {
       const it = needsWaiting(needsItems(lines)).find((x) => needsItemMatch(x, item));
       if (it) {
-        if (document.querySelector(PHONE_JUMP_TARGET.needs)) needsGo(needsIdOf(it));
+        if (document.querySelector(PHONE_JUMP_TARGET.needs)) needsGo(needsIdOf(it), true);
         openNeedsFocus(it, null);
         return;
       }
-      // "no longer waiting" is said only of a whole listing: a panel that carries an error or a note (a partial read says so there) is not one
-      if (!dec.error && !dec.note) needsGoneNote();
-      needsDeepJump(run, Date.now() + PHONE_JUMP_WAIT_MS);   // the fallback to plain Needs gets its own wait, not the spent one
+      // The item's own id is a name the card number does not carry: flow numbers its cards with the BAND number, not 1 + the id's hex
+      // (11-06, np-0b62cd3b: the ping's `item=np-...` named no card). The band read pairs each item's own id (`subject.id`) with its
+      // card number (`question`), so ask it before saying the item is gone.
+      // `said` is true only when a FRESH, SUCCESSFUL band read lacks the item: that alone concludes "no longer waiting". A cached read
+      // (bandFetch holds one ~2 s, so it may predate the item) or a read that was refused (transient) never does: the first miss
+      // asks once more, fresh; a refusal waits a beat (bounded) and asks fresh once; a second refusal falls back to the plain Needs
+      // view WITHOUT the notice (it was never answered, so "gone" is not known).
+      const gone = (said) => {
+        if (run !== phoneJumpRun) return;
+        // "no longer waiting" is said only of a whole listing: a panel that carries an error or a note (a partial read says so there) is not one
+        if (said && !dec.error && !dec.note) needsGoneNote();
+        needsDeepJump(run, Date.now() + PHONE_JUMP_WAIT_MS);   // the fallback to plain Needs gets its own wait, not the spent one
+      };
+      const find = (b) => {
+        const row = (b && Array.isArray(b.items) ? b.items : []).find((x) => x && x.subject && x.subject.id === item && Number.isInteger(x.question));
+        return row && needsWaiting(needsItems(lines)).find((x) => needsIdOf(x) === "question:" + row.question);
+      };
+      const read = (fresh) => { let q = null; try { q = typeof bandRead === "function" ? bandFetch(fresh) : null; } catch (e) { q = null; } return q && typeof q.then === "function" ? q : null; };
+      const open = (hit) => {
+        if (document.querySelector(PHONE_JUMP_TARGET.needs)) needsGo(needsIdOf(hit), true);
+        openNeedsFocus(hit, null);
+      };
+      const second = (retries) => {
+        const q2 = read(true);                        // bypasses the ~2 s cache: this read cannot predate the item
+        if (!q2) { gone(false); return; }
+        q2.then((b2) => { if (run !== phoneJumpRun) return; const h2 = find(b2); if (h2) open(h2); else gone(true); },
+          () => { if (run !== phoneJumpRun) return; if (retries > 0) window.setTimeout(() => second(retries - 1), 700); else gone(false); });   // the server reads one band at a time: "busy" is a refusal too
+      };
+      const p = read(false);
+      if (!p) { gone(true); return; }                 // no band to ask on this cockpit: the listing alone answered
+      p.then((b) => {
+        if (run !== phoneJumpRun) return;
+        const hit = find(b);
+        if (hit) open(hit); else second(1);
+      }, () => { if (run === phoneJumpRun) window.setTimeout(() => { if (run === phoneJumpRun) second(0); }, 700); });
       return;
     }
     if (Date.now() < deadline) { window.setTimeout(() => needsItemJump(item, run, deadline), PHONE_JUMP_STEP_MS); return; }
@@ -9440,5 +9855,5 @@ for (const type of ["touchstart", "wheel", "pointerdown", "click", "keydown"]) d
   window.LevainAgentPage = { open: openAgentPage };
   window.LevainNeeds = { items: (lines) => needsWaiting(needsItems(lines)), name: needsName, summary: needsSummary, go: needsGo, history: openDecisionsHistory };
   window.LevainLoops = { find: loopFind, go: loopGo, why: () => loopWhy };
-  window.LevainDashboard = { render: renderKeepingPlace, redraw: ckRedraw, openCustom, composeDrop, adoptPanel, captureKept, settleKept, buildKept: () => buildKept, renderPanel: renderPanelSafe, measureClauses, measureOverflow, hasUnsavedEdit, jobsActive: () => _activeJobs.size > 0, fitLineTile, lineTileCount: () => lineFits.size, noteBodyCount: () => noteBodies.size };
+  window.LevainDashboard = { render: renderKeepingPlace, redraw: ckRedraw, openCustom, composeDrop, adoptPanel, captureKept, settleKept, buildKept: () => buildKept, renderPanel: renderPanelSafe, measureClauses, measureOverflow, hasUnsavedEdit, dropBoxText, setDropBoxText, dropBoxIsOff, jobsActive: () => _activeJobs.size > 0, fitLineTile, lineTileCount: () => lineFits.size, noteBodyCount: () => noteBodies.size };
 })();
