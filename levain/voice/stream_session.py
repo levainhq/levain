@@ -8,9 +8,13 @@ sequenced intake of PCM16 16 kHz mono chunks, a provider-stream object that forw
    provider that fails, shutdown) closes the provider stream and then settles the meter in a ``finally`` with the ACTUAL
    seconds streamed (bytes accepted / :data:`BYTES_PER_SECOND`, rounded up), never the ceiling. What Levain sent is what
    it counts: a session that streamed no audio is released. The one place Levain cannot know what reached the provider
-   is the factory: a factory that raises :class:`StreamNotStarted` is released, any other factory failure settles one
-   unit. A settle that fails is retried once, then handed to the registry, which retries it on every reap; until then
-   the row stays reserved, which errs toward the cap.
+   is the factory: a factory that raises :class:`StreamNotStarted` is released, any other factory failure (or a result
+   that is not a stream) settles one unit. The rule is that provider billing starts at audio: a stream that was built
+   but carried no audio (a setup failure after the factory) is released, while a factory that failed some other way may
+   have sent before failing, which Levain cannot see, so it counts one unit. A settle that fails is retried once, then
+   handed to the registry, which retries the oldest first on every reap and never drops one; until then the row stays
+   reserved, which errs toward the cap, and while :data:`MAX_UNSETTLED` are waiting every new open is refused
+   (``settle_backlog``): a ledger that cannot record spend stops new spend.
 2. The key never becomes an attribute of anything the page can name. :meth:`StreamRegistry.open` reads it once through
    ``custody.read_key`` (the path ``transcribe`` uses), hands the :class:`~levain.voice.custody.Secret` to the provider
    factory and drops it; the session holds the provider-stream, not the key.
@@ -30,8 +34,10 @@ sequenced intake of PCM16 16 kHz mono chunks, a provider-stream object that forw
 
 Known edge: provider calls (send, poll, close) run under the session's lock, so chunks reach the provider in sequence
 order and the provider object is never used from two threads at once; a slow provider call therefore delays another
-call on the SAME session (a mailbox read waits behind a send), never a different session. Shutdown does not wait for an
-open that is still connecting; that open cleans up after itself by rule 6.
+call on the SAME session (a mailbox read waits behind a send). Reap (and so every open, which reaps first) only tries
+each session's lock and skips a busy one, which is mid-call and so not idle, so a hung provider call on one session
+never blocks an open. Shutdown does wait for each live session's lock, since it must end every one. Shutdown does not
+wait for an open that is still connecting; that open cleans up after itself by rule 6.
 
 The provider side is :class:`ProviderStream` (send_audio / poll / close). The Deepgram adapter (S2b) implements it; tests
 use a fake.
@@ -63,7 +69,7 @@ IDLE_TIMEOUT_S = 15.0
 MAX_AGE_S = CEILING_SECONDS + IDLE_TIMEOUT_S   # wall-clock life: a real-time speaker reaches the byte ceiling first
 ENDED_RETAIN_S = 60.0
 MAX_SESSIONS = 4
-MAX_UNSETTLED = 64             # settles waiting for a retry; past this the oldest stays reserved (errs toward the cap)
+MAX_UNSETTLED = 64             # settles waiting for a retry; at this many, new opens are refused until it drains
 SID_BYTES = 24
 
 # Fixed words: the code is the contract, the words are what the route may show. Nothing here carries a value from outside.
@@ -78,6 +84,7 @@ WORDS: dict[str, str] = {
     "too_many_sessions": "Too many dictations are running; try again in a moment.",
     "provider_failed": "The voice provider stopped, so the dictation ended.",
     "meter_unavailable": "Levain could not check the voice budget, so premium voice is off for now.",
+    "settle_backlog": "Levain could not record what earlier dictations cost, so premium voice is off for now.",
     "month_cap": "The monthly voice budget is used up.",
     "day_cap": "Today's voice budget is used up.",
     "unpriced": "That voice model has no price on file, so it is not used.",
@@ -230,7 +237,7 @@ class StreamSession:
         if limit:
             self._end(limit)
             return limit, None
-        if isinstance(seq, bool) or not isinstance(seq, int) or seq != self._next_seq:
+        if type(seq) is not int or seq != self._next_seq:     # exact int: a subclass's __ne__ could lie
             return "bad_sequence", None
         if not isinstance(pcm, (bytes, bytearray)):
             return "bad_chunk", None
@@ -319,14 +326,17 @@ class StreamSession:
         being addressable through the registry (the owner has collected it). Idempotent."""
         with self._lock:
             if not self._closed:
-                self._end("closed")
+                self._end("closed", retain=False)     # collected next, so never counted among the retained ended
             final = self._final
         self._on_collect(self.sid)
         return final
 
     def _end_if_expired(self) -> bool:
-        """End with the limit's reason if, checked under the lock, the session is live and past a limit."""
-        with self._lock:
+        """End with the limit's reason if, checked under the lock, the session is live and past a limit. A session
+        whose lock is held is mid-call, so not idle: it is skipped, never waited for."""
+        if not self._lock.acquire(blocking=False):
+            return False
+        try:
             if self._closed:
                 return False
             code = self._limit(self._clock())
@@ -334,14 +344,17 @@ class StreamSession:
                 return False
             self._end(code)
             return True
+        finally:
+            self._lock.release()
 
     def _end_now(self, reason: str) -> None:
         with self._lock:
             self._end(reason)
 
-    def _end(self, reason: str) -> None:
+    def _end(self, reason: str, *, retain: bool = True) -> None:
         """Close the provider stream, then settle the meter in a ``finally``: every exit path ends the reservation,
-        once. Caller holds the lock."""
+        once. ``retain`` False (the owner is collecting it) skips the registry's retained-ended list. Caller holds
+        the lock."""
         if self._closed:
             return
         self._closed = True
@@ -359,7 +372,8 @@ class StreamSession:
         finally:
             self._partial = ""
             self._settle()
-            self._on_end(self.sid)
+            if retain:
+                self._on_end(self.sid)
             _log.info("voice stream: ended (%s) after %d s", reason, seconds_for(self._bytes))
 
     def _settle(self) -> None:
@@ -424,6 +438,8 @@ class StreamRegistry:
         with self._lock:
             if self._closed:
                 code = "stopping"
+            elif len(self._unsettled) >= MAX_UNSETTLED:
+                code = "settle_backlog"
             elif self._live() + self._pending >= self._max:
                 code = "too_many_sessions"
             else:
@@ -478,7 +494,7 @@ class StreamRegistry:
             finally:
                 del secret
             if not failed and not _is_stream(stream):
-                failed, settle_units, stream = "not a stream", 1, None
+                failed, settle_units = "not a stream", 1     # kept in ``stream``: the cleanup closes it if it can
             if failed:
                 _log.warning("voice stream: the provider stream could not start (%s)", failed)
                 return None, "provider_failed", ""
@@ -513,7 +529,9 @@ class StreamRegistry:
             if stream is not None:
                 failed = ""
                 try:
-                    stream.close()
+                    close = getattr(stream, "close", None)     # best effort: a non-stream result may have no close
+                    if callable(close):
+                        close()
                 except Exception as exc:     # noqa: BLE001
                     failed = type(exc).__name__
                 if failed:
@@ -564,9 +582,8 @@ class StreamRegistry:
             self._ended_at.pop(sid, None)
 
     def _add_unsettled(self, reservation_id: int, seconds: int) -> None:
-        with self._lock:
+        with self._lock:     # never dropped: a full backlog refuses new opens instead (bounded by that refusal)
             self._unsettled.append((reservation_id, seconds))
-            del self._unsettled[:-MAX_UNSETTLED]
 
     # --- maintenance ------------------------------------------------------------------------------------------------
     def _sweep(self) -> None:
@@ -581,18 +598,20 @@ class StreamRegistry:
             session._discard()
 
     def _retry_unsettled(self) -> None:
+        """Retry failed settles oldest first; the first that fails again stops the pass (the ledger is still unusable)
+        and it and everything after it wait, in order, for the next reap."""
         with self._lock:
             todo, self._unsettled = self._unsettled, []
-        still = []
+        done = 0
         for reservation_id, seconds in todo:
             try:
                 end_reservation(self._meter, reservation_id, seconds)
             except Exception:     # noqa: BLE001 - logged once when it first failed; it waits for the next reap
-                still.append((reservation_id, seconds))
-        if still:
+                break
+            done += 1
+        if done < len(todo):
             with self._lock:
-                self._unsettled[:0] = still
-                del self._unsettled[:-MAX_UNSETTLED]
+                self._unsettled[:0] = todo[done:]
 
     def reap(self) -> int:
         """End every live session past its idle or age limit (each re-checked under its own lock, settling each), drop

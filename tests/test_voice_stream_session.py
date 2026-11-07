@@ -4,6 +4,7 @@ No network, no key store, no real time."""
 from __future__ import annotations
 
 import logging
+import threading
 import traceback
 
 import pytest
@@ -688,8 +689,111 @@ def test_the_age_limit_holds_at_mailbox_and_reap(tmp_path):
 def test_reap_rechecks_idleness_under_the_session_lock(rig, monkeypatch):
     s = rig.open()
     s.feed(0, PCM_1S[:320])
+    real_limit, held = s._limit, []
+
+    def limit(now):
+        held.append(s._lock._is_owned())
+        return real_limit(now)
+
+    monkeypatch.setattr(s, "_limit", limit)
     monkeypatch.setattr(s, "expired", lambda: True)               # a stale outside read says idle; it is not
-    assert rig.registry.reap() == 0 and not s.closed
+    assert rig.registry.reap() == 0 and not s.closed              # ended only on a limit read under the lock
+    rig.clock.t += ss.IDLE_TIMEOUT_S + 1
+    assert rig.registry.reap() == 1 and s.end_reason == "idle_timeout"
+    assert held and all(held)
+
+
+def test_reap_skips_a_session_busy_in_a_provider_call(rig):
+    gate, entered = threading.Event(), threading.Event()
+
+    class Hung(FakeStream):
+        def send_audio(self, pcm):
+            entered.set()
+            gate.wait(10)
+            super().send_audio(pcm)
+
+    busy = rig.open(stream=Hung())
+    feeder = threading.Thread(target=busy.feed, args=(0, PCM_1S[:320]))
+    feeder.start()
+    try:
+        assert entered.wait(5)
+        rig.clock.t += ss.IDLE_TIMEOUT_S + 1                      # idle by the clock, but mid-call: not idle
+        result = []
+        reaper = threading.Thread(target=lambda: result.append(rig.registry.reap()))
+        reaper.start()
+        reaper.join(2)
+        assert not reaper.is_alive() and result == [0]            # one hung provider never blocks reap (or open)
+        assert not busy.closed
+    finally:
+        gate.set()
+        feeder.join(5)
+    assert rig.registry.reap() == 1 and busy.closed
+
+
+def test_closing_a_live_session_never_evicts_a_retained_ended_one(tmp_path):
+    rig = Rig(tmp_path, max_sessions=2)
+    ended = []
+    for _ in range(2):
+        s = rig.open()
+        s.feed(0, PCM_1S[:320])
+        rig.clock.t += ss.IDLE_TIMEOUT_S + 1
+        rig.registry.reap()
+        ended.append(s)
+    live = rig.open()
+    live.close()
+    assert [rig.registry.get(s.sid, "owner-a") for s in ended] == ended
+    with refused("unknown_session"):
+        rig.registry.get(live.sid, "owner-a")
+
+
+def test_a_full_settle_backlog_refuses_opens_and_forgets_nothing(rig, monkeypatch):
+    monkeypatch.setattr(ss, "MAX_UNSETTLED", 2)
+    real = rig.meter.settle_actual
+
+    def locked(*a):
+        raise vmeter.MeterError("locked")
+
+    monkeypatch.setattr(rig.meter, "settle_actual", locked)
+    sessions = []
+    for _ in range(3):
+        s = rig.open()
+        s.feed(0, PCM_1S)
+        sessions.append(s)
+    for s in sessions:
+        s.close()
+    with refused("settle_backlog"):                               # an inconsistent ledger stops spending
+        rig.open()
+    assert [r.status for r in rig.rows()] == ["reserved"] * 3
+    monkeypatch.setattr(rig.meter, "settle_actual", real)
+    fresh = rig.open()                                            # the reap drained the backlog, oldest first
+    by_id = sorted(rig.rows(), key=lambda r: r.id)
+    assert [(r.status, r.units) for r in by_id] == [("ok", 1)] * 3 + [("reserved", 120)]
+    assert fresh.streamed_bytes == 0
+
+
+def test_a_factory_result_that_is_not_a_stream_is_still_closed(rig):
+    class HalfStream:
+        closed = 0
+
+        def close(self):
+            HalfStream.closed += 1
+
+    with refused("provider_failed"):
+        rig.open(factory=lambda secret: HalfStream())
+    assert HalfStream.closed == 1
+    assert [(r.status, r.units) for r in rig.rows()] == [("ok", 1)]
+    assert len(rig.registry) == 0
+
+
+def test_an_int_subclass_seq_is_refused(rig):
+    class Liar(int):
+        def __ne__(self, other):
+            return False
+
+    s = rig.open()
+    with refused("bad_sequence"):
+        s.feed(Liar(5), PCM_1S[:320])
+    assert s.streamed_bytes == 0
 
 
 def test_a_failed_settle_is_retried_then_handed_to_the_registry(rig, monkeypatch):
