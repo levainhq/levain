@@ -404,7 +404,7 @@ def test_a_push_posts_received_then_shown_with_the_endpoint_hash_and_ids_only() 
     assert "secret body" not in json.dumps(got["posts"])
     assert got["shownCalls"] == [{"title": "T", "tag": "x"}] and got["queued"] == []
     assert _receipt_steps(got) == [("received", "ok", None), ("shown", "ok", None)]
-    assert any(e["step"] == "sw-version" and e["version"] == "1106-51-shown-3" and e["on"] == "push" for e in got["trace"])
+    assert any(e["step"] == "sw-version" and e["version"] == "1106-53-tap-2" and e["on"] == "push" for e in got["trace"])
 
 
 @needs_node
@@ -863,13 +863,14 @@ def test_the_command_prints_the_stable_json_shape(tmp_path: Path, capsys) -> Non
     _seed(tmp_path)
     rc, out = _cli(tmp_path, "--json", "--since", "7d", capsys=capsys)
     got = json.loads(out)
-    assert rc == 0 and list(got) == ["format", "since", "ref", "pings", "devices"] and got["format"] == "levain-ping-receipts/1"
+    assert rc == 0 and list(got) == ["format", "since", "ref", "pings", "devices", "landings"] and got["format"] == "levain-ping-receipts/1"
     assert list(got["pings"][0]) == ["ping", "at", "kind", "ref", "devices"]
     assert list(got["pings"][0]["devices"][0]) == ["device", "push", "accepted", "statuses", "sent_at", "received_at", "shown_at",
-                                                   "tapped_at", "received_count", "duplicate", "sent_to_received_s",
+                                                   "tapped_at", "clicked_at", "click_target", "opened_at", "opened_how",
+                                                   "received_count", "duplicate", "sent_to_received_s",
                                                    "received_to_shown_s", "outcome"]
-    assert list(got["devices"][0]) == ["device", "sent", "accepted", "received", "shown", "tapped", "duplicates", "silent",
-                                       "median_sent_to_received_s"]
+    assert list(got["devices"][0]) == ["device", "sent", "accepted", "received", "shown", "tapped", "clicked", "duplicates",
+                                       "silent", "median_sent_to_received_s"]
     assert "title" not in json.dumps(got) and "body" not in got["pings"][0]
 
 

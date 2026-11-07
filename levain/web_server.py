@@ -1340,6 +1340,7 @@ _CENTER_POST = frozenset({_CENTER_READ, _CENTER_READ_ALL, _CENTER_DELETE, _CENTE
 _PUSH_GET = frozenset({"/webpush/key", "/webpush/record", _POLICY_PATH, _PRESENCE_PATH, _NOTIFY_TOKENS, _CENTER,
                        _CENTER_ITEM})
 _PUSH_POST = frozenset({"/webpush/subscribe", "/webpush/unsubscribe", "/webpush/opened", "/webpush/test", "/webpush/trace",
+                        "/webpush/landed",
                         _POLICY_SET, _POLICY_RESET, _PRESENCE_SET, _PRESENCE_TOKEN_NEW, _PRESENCE_TOKEN_REVOKE,
                         _NOTIFY_TOKENS, _NOTIFY_TOKENS_REVOKE, *_CENTER_POST})
 _PUSH_SUBSCRIBE = "/webpush/subscribe"

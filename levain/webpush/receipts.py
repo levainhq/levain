@@ -35,6 +35,13 @@ so a report without ``--since`` over a long record stays linear in its rows.
 Known edge, not built against: ``/webpush/receipt`` takes no token, so two slow unauthenticated clients can hold both of
 its semaphore slots; that channel is measurement, not delivery, and has its own semaphore, so no push is affected.
 
+The TAP keys (``clicked_at``, ``click_target``, ``opened_at``, ``opened_how``, the per-device ``clicked`` and the top-level
+``landings``) are ADDITIVE to ``levain-ping-receipts/1`` and the version stays ``/1`` on purpose: every key the format had
+is unchanged, and no consumer in this repo or in the flow scripts reads the report by an exact schema (a consumer that
+rejects unknown keys would be a new constraint, not one that exists). A click or an open also counts as ``shown`` (an
+``opened`` row proves the click ran even when its own POST was lost), and a device whose only reports are worker tap rows
+still counts as having reported (``silent`` rather than ``no receipt yet`` for an older ping).
+
 JSON form (``format`` ``levain-ping-receipts/1``, the keys the desk joins to the native APNs side on ``ref``)::
 
     {"format": "levain-ping-receipts/1", "since": <stamp or null>, "ref": <ref or null>,
@@ -42,11 +49,14 @@ JSON form (``format`` ``levain-ping-receipts/1``, the keys the desk joins to the
                 "devices": [{"device": str, "push": "accepted"|"no-answer"|"gone"|"refused"|"none",
                              "accepted": bool|null, "statuses": [int], "sent_at": stamp|null,
                              "received_at": stamp|null, "shown_at": stamp|null, "tapped_at": stamp|null,
+                             "clicked_at": stamp|null, "click_target": str|null, "opened_at": stamp|null,
+                             "opened_how": str|null,
                              "received_count": int, "duplicate": bool,
                              "sent_to_received_s": float|null, "received_to_shown_s": float|null,
                              "outcome": "shown"|"received"|"silent"|"no receipt yet"|"not accepted"}]}],
      "devices": [{"device": str, "sent": int, "accepted": int, "received": int, "shown": int, "tapped": int,
-                  "duplicates": int, "silent": int, "median_sent_to_received_s": float|null}]}
+                  "clicked": int, "duplicates": int, "silent": int, "median_sent_to_received_s": float|null}],
+     "landings": [{"device": str, "at": stamp, "target": str, "how": str}]}   # newest 20 page landings (the TAP record)
 """
 from __future__ import annotations
 
@@ -63,6 +73,7 @@ PUSH_STATES = ("accepted", "no-answer", "gone", "refused", "none")
 _PUSH_WORDS = {"accepted": "accepted", "no-answer": "no answer", "gone": "gone (404/410)", "refused": "refused",
                "none": "no delivery on record"}
 # the filtered pings, joined by every read below: no SQL parameter per ping
+LANDINGS_SHOWN = 20   # the newest cockpit page landings the report lists
 _PINGS = "(? IS NULL OR p.at >= ?) AND (? IS NULL OR p.ref = ?)"
 
 __all__ = ["FORMAT", "PUSH_STATES", "build", "parse_since", "push_state", "text"]
@@ -115,7 +126,8 @@ def build(store: PushStore, *, since: timedelta | None = None, ref: str | None =
         x = by.get((ping, device))
         if x is None:
             x = by[(ping, device)] = {"statuses": [], "sent": [], "received_n": 0, "received": None, "shown": None,
-                                      "tapped": None}
+                                      "tapped": None, "clicked": None, "click_target": None, "opened": None,
+                                      "opened_how": None}
             per_ping.setdefault(ping, []).append(device)
         return x
 
@@ -139,9 +151,25 @@ def build(store: PushStore, *, since: timedelta | None = None, ref: str | None =
         for o in c.execute("SELECT o.ping_id, o.device_id, MIN(o.at) AS at FROM opens o JOIN pings p ON p.id = o.ping_id "
                            f"WHERE {_PINGS} AND o.device_id IS NOT NULL GROUP BY o.ping_id, o.device_id", args):
             cell(o["ping_id"], o["device_id"])["tapped"] = o["at"]
-        # the newest receipt each device has made, over the whole record (any ping, any kind)
+        # the TAP record (store.TAP_KINDS): the worker's own click and how it then opened a window, per ping and device
+        for t in c.execute("SELECT t.ping_id, t.device_id, t.kind, t.at, t.target, t.how FROM taps t JOIN pings p ON p.id = t.ping_id "
+                           f"WHERE {_PINGS} AND t.kind IN ('clicked','opened') ORDER BY t.at, t.id", args):
+            x = cell(t["ping_id"], t["device_id"])
+            if t["kind"] == "clicked" and x["clicked"] is None:
+                x["clicked"], x["click_target"] = t["at"], t["target"]
+            elif t["kind"] == "opened":
+                x["opened"], x["opened_how"] = t["at"], t["how"]   # the newest wins
+        # where a cockpit page landed, newest first (a page's own word, no ping): the other half of a tap
+        landings = [{"device": r["device_id"], "at": r["at"], "target": r["target"], "how": r["how"]}
+                    for r in c.execute("SELECT device_id, at, target, how FROM taps WHERE kind = 'landed' "
+                                       "AND (? IS NULL OR reported_at >= ?) ORDER BY id DESC LIMIT ?",
+                                       (cutoff, cutoff, LANDINGS_SHOWN))]
+        # the newest report each device has made, over the whole record (any ping): a receipt, or a worker tap report
+        # (clicked, opened: a phone that reported only those still demonstrably woke and reported)
         last = {r["device_id"]: _t(r["m"]) for r in c.execute(
-            "SELECT device_id, MAX(reported_at) AS m FROM receipts GROUP BY device_id")}
+            "SELECT device_id, MAX(m) AS m FROM (SELECT device_id, MAX(reported_at) AS m FROM receipts GROUP BY device_id "
+            "UNION ALL SELECT device_id, MAX(reported_at) AS m FROM taps WHERE kind IN ('clicked','opened') "
+            "GROUP BY device_id) GROUP BY device_id")}
 
     out_pings, roll = [], {}
     for p in pings:
@@ -154,7 +182,7 @@ def build(store: PushStore, *, since: timedelta | None = None, ref: str | None =
             sent_at = min(x["sent"]) if x["sent"] else None
             last_sent = _t(max(x["sent"])) if x["sent"] else None
             reported = last.get(device)
-            if shown or tapped:
+            if shown or tapped or x["clicked"] or x["opened"]:   # an open proves the click ran, whatever happened to its POST
                 outcome = "shown"
             elif recv:
                 outcome = "received"
@@ -165,7 +193,9 @@ def build(store: PushStore, *, since: timedelta | None = None, ref: str | None =
             else:
                 outcome = "no receipt yet"
             row = {"device": device, "push": push, "accepted": ok, "statuses": x["statuses"], "sent_at": sent_at,
-                   "received_at": recv, "shown_at": shown, "tapped_at": tapped, "received_count": x["received_n"],
+                   "received_at": recv, "shown_at": shown, "tapped_at": tapped, "clicked_at": x["clicked"],
+                   "click_target": x["click_target"], "opened_at": x["opened"], "opened_how": x["opened_how"],
+                   "received_count": x["received_n"],
                    "duplicate": x["received_n"] > 1,
                    "sent_to_received_s": _gap(sent_at, recv),
                    "received_to_shown_s": _gap(recv, shown),
@@ -174,12 +204,13 @@ def build(store: PushStore, *, since: timedelta | None = None, ref: str | None =
             r = roll.get(device)
             if r is None:
                 r = roll[device] = {"device": device, "sent": 0, "accepted": 0, "received": 0, "shown": 0,
-                                    "tapped": 0, "duplicates": 0, "silent": 0, "_lat": []}
+                                    "tapped": 0, "clicked": 0, "duplicates": 0, "silent": 0, "_lat": []}
             r["sent"] += 1 if x["statuses"] else 0
             r["accepted"] += 1 if ok else 0
             r["received"] += 1 if recv else 0
             r["shown"] += 1 if shown else 0
             r["tapped"] += 1 if tapped else 0
+            r["clicked"] += 1 if x["clicked"] else 0
             r["duplicates"] += 1 if row["duplicate"] else 0
             r["silent"] += 1 if outcome == "silent" else 0
             if row["sent_to_received_s"] is not None:
@@ -190,7 +221,8 @@ def build(store: PushStore, *, since: timedelta | None = None, ref: str | None =
         lat = r.pop("_lat")
         r["median_sent_to_received_s"] = round(statistics.median(lat), 3) if lat else None
         devices_out.append(r)
-    return {"format": FORMAT, "since": cutoff, "ref": ref, "pings": out_pings, "devices": devices_out}
+    return {"format": FORMAT, "since": cutoff, "ref": ref, "pings": out_pings, "devices": devices_out,
+            "landings": landings}
 
 
 def _s(v: float | None) -> str:
@@ -207,7 +239,8 @@ def text(report: dict[str, Any]) -> str:
             push = _PUSH_WORDS.get(d["push"], d["push"])
             dup = f"; DUPLICATE x{d['received_count']}" if d["duplicate"] else ""
             lines.append(f"    {d['device']}: {d['outcome']} (push service {push}; received {d['received_at'] or '-'}, "
-                         f"shown {d['shown_at'] or '-'}, tapped {d['tapped_at'] or '-'}; sent->received "
+                         f"shown {d['shown_at'] or '-'}, tapped {d['tapped_at'] or '-'}; click {d['clicked_at'] or '-'} "
+                         f"-> {d['click_target'] or '-'}, opened {d['opened_how'] or '-'}; sent->received "
                          f"{_s(d['sent_to_received_s'])}, received->shown {_s(d['received_to_shown_s'])}{dup})")
     if report["devices"]:
         lines.append("")
@@ -215,6 +248,11 @@ def text(report: dict[str, Any]) -> str:
     for r in report["devices"]:
         lines.append(f"  {r['device']}: {r['sent']} / {r['accepted']} / {r['received']} / {r['shown']} / {r['tapped']} / "
                      f"{r['duplicates']} / {r['silent']} / {_s(r['median_sent_to_received_s'])}")
+    if report.get("landings"):
+        lines.append("")
+        lines.append("cockpit landings, newest first: device, time, where the page was (how it handled a tap)")
+        for g in report["landings"]:
+            lines.append(f"  {g['device']}: {g['at']} {g['target']} ({g['how']})")
     lines.append("")
     lines.append("A ping with no receipt is `no receipt yet`, not lost: a phone that has not woken since cannot have "
                  "reported. `silent` means that phone reported something LATER than this ping reached it.")
