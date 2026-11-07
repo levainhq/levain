@@ -485,8 +485,11 @@ def claim_held(directory: Path | str, *, after: timedelta | None = None) -> list
     """Release every held ping now due, once: ``[(question, cause)]`` for the caller to ping, cause ``escalated`` or
     ``unread`` (module docstring). An ``unread`` release also files the escalation's ANSWER record (once per question,
     as :func:`escalate` does) and its ``first_reads`` row (``escalated``), in the same transaction as the release. A question the operator answered meanwhile is
-    released as ``answered`` and returned to nobody. Cheap when nothing waits: one read-only query."""
+    released as ``answered`` and returned to nobody. One he snoozed (a band snooze whose day is after today, local) is
+    not released: it stays held and is released as above once its day comes. Cheap when nothing waits: one read-only
+    query."""
     from levain.cockpit.consent import parse_stamp
+    from levain.consent.questions import later_date, local_today
     from levain.coordinator import lease
 
     after = UNREAD_AFTER if after is None else after
@@ -512,6 +515,8 @@ def claim_held(directory: Path | str, *, after: timedelta | None = None) -> list
             q = qs.get(question_id)
             if q is None or q.answer is not None:
                 cause = "answered"
+            elif later_date(q, local_today(parse_stamp(now))) is not None:
+                continue      # the operator deferred it (a band snooze): it stays held, released on its day as below
             elif outcome == "escalated":
                 cause = "escalated"
             elif parse_stamp(now) - parse_stamp(at) >= after:

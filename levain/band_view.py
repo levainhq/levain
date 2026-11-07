@@ -7,7 +7,9 @@ ref)``, so a number is never reused, not after a restart and not after the band 
 first time an item is SHOWN, inside one bounded write (D3); a busy lock leaves the item as ``new (number pending)``,
 never with a provisional number. The whole band is printed every time, never reordered, never cut: past
 :data:`COMPACT_AFTER` items the rest take one line each (D15), and an item that cannot be read is listed as UNREADABLE
-(D13). Closed is derived (the question has an answer) and shown as ``closed N`` in the next hook render, then it leaves; its
+(D13). A numbered question the operator snoozed to a later day (row 134) is listed by its number on ONE
+``LATER (n): <number> <Wkd>[ MM-DD] · ...`` line under the items (flow's format) instead of in full, and the header
+then reads ``N due``, counting only the rest; it stays open and answers by its number. Closed is derived (the question has an answer) and shown as ``closed N`` in the next hook render, then it leaves; its
 number stays retired. The notice is recorded as shown only AFTER the hook's ``emit`` returned True (at-least-once).
 
 Three seams use it: the UserPromptSubmit hook (:func:`hook_prompt`: the render, nothing parsed), the SessionStart
@@ -59,7 +61,7 @@ from levain.band_sources import Extra, Extras, NotOffered, read_extras, sheet_te
 from levain.coordinator.review import require_aware_now
 from levain.cockpit.consent import ConsentError, utc_stamp
 from levain.consent.questions import (ANSWER_CHANNELS, HOOK_BUSY_MS, _TEXT_MAX, Answer, Question, QuestionStore, _answer_of, _now_utc,
-                                     _select, open_ended_of, read_deadline)
+                                     _select, later_date, local_today, open_ended_of, read_deadline)
 
 __all__ = ["BAND_SCHEMA", "COMPACT_AFTER", "Applied", "apply_plan", "format_echo", "hook_contract", "hook_prompt",
            "gate_notice", "hook_stop", "is_autonomous", "last_view", "mark_closed_shown", "plan_for", "plan_for_full", "record_view", "render", "render_full", "render_with_closed", "session_band_state",
@@ -188,6 +190,36 @@ def _tag(q: Question) -> str:
 
 def _short(text: str, limit: int) -> str:
     return text if len(text) <= limit else text[:limit - 1] + "…"
+
+
+# --- the LATER line (row 134; flow's task_surfaces_1107.md, SD-9): one predicate, flow's names and format -----------
+def _later_date(row: Any, today: str) -> str | None:
+    """Flow's ``needs_phill._later_date``: the day a row comes back when it is after ``today``, its ``snoozed_until``
+    else its ``dated``; ``None`` for a row that is due (:func:`levain.consent.questions.later_date`)."""
+    return later_date(row, today)
+
+
+def _later_label(n: int, day: str, today: str) -> str:
+    """``343 Sun`` for tomorrow, ``373 Tue 11-10`` for any later day (flow's ``_later_label``)."""
+    d = datetime.fromisoformat(day).date()
+    if (d - datetime.fromisoformat(today).date()).days == 1:
+        return f"{n} {d.strftime('%a')}"
+    return f"{n} {d.strftime('%a')} {d.strftime('%m-%d')}"
+
+
+def _later_line(items: list[tuple[int, str]], today: str) -> str:
+    """``LATER (n): 343 Sun · 373 Tue 11-10``, ``items`` as ``(band number, day)`` already sorted by day then number
+    (flow's ``_later_line``)."""
+    return f"LATER ({len(items)}): " + " · ".join(_later_label(n, d, today) for n, d in items)
+
+
+def _today_of(store: Any, now: datetime | None) -> str:
+    """The local day a render judges snoozes against: ``now`` when the caller gave one, else the store's clock (a
+    native store's; a foreign store has none, so the wall clock)."""
+    if now is not None:
+        return local_today(now)
+    clock = getattr(store, "_clock", None)
+    return local_today(_now_utc(clock) if callable(clock) else datetime.now().astimezone())
 
 
 def _item_lines(label: str, q: Question, compact: bool) -> list[str]:
@@ -460,13 +492,29 @@ def _render_full(store: QuestionStore, gen: int, deadline: float, coord_conn: sq
                                                        number_of(entries[p][0]) or 0, p))
     shown = [n for p in order if (n := number_of(entries[p][0])) is not None]
     hwm = max([*shown, *(n for n, _ in closed_all)], default=0)
-    head = [f"NEEDS YOU · {len(entries)} open"]
+    # a numbered question the operator deferred to a later day folds into ONE LATER line (flow's compact footer): still
+    # open, still in ``shown`` (so the view binds its number and an answer by number lands), but not counted as due.
+    # One with no number yet stays listed in full: a LATER entry with no number could not be answered by one
+    today = _today_of(store, now)
+    later: dict[int, tuple[int, str]] = {}
+    for p in order:
+        key, obj = entries[p]
+        n = number_of(key)
+        if n is not None and obj is not None and not isinstance(obj, Extra):
+            try:
+                day = _later_date(obj, today)
+            except Exception:  # noqa: BLE001 - a row whose date cannot be judged is due, never hidden
+                day = None
+            if day is not None:
+                later[p] = (n, day)
+    due = [p for p in order if p not in later]
+    head = [f"NEEDS YOU · {len(due)} due" if later else f"NEEDS YOU · {len(entries)} open"]
     if shown or closed_all:
         head.append(f"band@{hwm}")
     if closed_all:
         head.append("closed " + ", ".join(str(n) for n, _ in closed_all))
     lines = [" · ".join(head)]
-    for pos, p in enumerate(order):
+    for pos, p in enumerate(due):
         key, obj = entries[p]
         n = number_of(key)
         label = f"{n}." if n is not None else "new (number pending):"
@@ -482,6 +530,8 @@ def _render_full(store: QuestionStore, gen: int, deadline: float, coord_conn: sq
                     lines.append(f"    escalated by the coordinator: {_short(text, 200)} · rec on record: {rec}")
         except Exception:                     # one item that will not render never drops the band (D13)
             lines.append(f"{label} UNREADABLE: {key[0]} {key[1]} could not be read (listed, never dropped)")
+    if later:
+        lines.append(_later_line(sorted(later.values(), key=lambda nd: (nd[1], nd[0])), today))
     lines.extend(f"! not read: {why} (items from it are missing, not closed)" for why in extras.failed)
     return Rendered("\n".join(lines), [n for n, _ in closed_all], shown, hwm, gen, bool(extras.failed),
                     len(shown) < len(entries))
@@ -1259,6 +1309,8 @@ def _question_item(q: Question, n: int | None, version: str | None, can_answer: 
     item = {"n": n, "kind": info.kind, "tag": _tag(q), "what": q.what, "blocks": q.blocks,
             "options": [{"letter": _LETTERS[i], "label": lab} for i, (_, lab) in enumerate(q.options) if i < len(_LETTERS)],
             "rec": info.rec_letter, "question": q.n, "open_ended": open_ended_of(q),
+            # flow's two date fields, raw: a surface folds the row by :func:`_later_date` on its own local today
+            "snoozed_until": getattr(q, "snoozed_until", None), "dated": getattr(q, "dated", None),
             "subject": {"kind": "question", "id": q.id, "version": version}, "actions": actions}
     return {"source": "question", "id": q.id}, item
 
@@ -3284,6 +3336,55 @@ def run_band_answer(args: argparse.Namespace) -> int:
     return 0 if done.recorded or done.sheets else EXIT_REFUSED
 
 
+def question_of_band_number(store: QuestionStore, n: int) -> str:
+    """The question id band number ``n`` was allocated to, read-only. Raises :class:`ConsentError` with the reason for
+    a number never shown, one allocated to an authority item or to a host (only a Levain question can be snoozed)."""
+    with store._peek() as conn:
+        row = None
+        if conn is not None and "band_items" in _tables(conn):
+            row = conn.execute("SELECT source, ref FROM band_items WHERE n = ?", (n,)).fetchone()
+    if row is None:
+        raise ConsentError(f"band number {n} was never shown")
+    if row[0] != "question":
+        raise ConsentError(f"band item {n} is a {row[0]} item, not a question: only a question can be snoozed "
+                           "(an item that needs your signature is settled on its own sheet)")
+    return row[1]
+
+
+def _band_number_arg(text: str) -> int:
+    digits = text.strip().lstrip("#")
+    if not (digits.isascii() and digits.isdigit()) or not 0 < len(digits) <= 18 or int(digits) < 1:
+        raise argparse.ArgumentTypeError(f"a band number, e.g. 7: {text!r}")
+    return int(digits)
+
+
+def run_band_snooze(args: argparse.Namespace) -> int:
+    """``levain band snooze N --until YYYY-MM-DD`` / ``levain band unsnooze N``: the operator defers band row ``N`` to
+    a later local day inside the tight window (:data:`levain.consent.questions.SNOOZE_MAX_DAYS`), or brings it back
+    now. The row stays open, keeps its number and answers by it; the band lists it on its LATER line and no ping goes
+    before the day. Refused inside any agent session (the operator's act, as ``levain band answer``)."""
+    from levain.consent.band import AGENT_ANSWER_REFUSAL, EXIT_REFUSED, agent_session_caller
+
+    verb = "snooze" if args.until is not None else "unsnooze"
+    if agent_session_caller():
+        print(f"levain band {verb}: refused: {AGENT_ANSWER_REFUSAL}", file=sys.stderr)
+        return EXIT_REFUSED
+    try:
+        store = QuestionStore(args.queue_dir)
+        qid = question_of_band_number(store, args.number)
+        got = store.snooze(qid, until=args.until, channel="cli", via="cli", note=getattr(args, "note", None))
+    except Exception as exc:
+        print(f"levain band {verb}: refused: {exc}; nothing was recorded", file=sys.stderr)
+        return EXIT_REFUSED
+    if got.until is None:
+        print(f"levain band unsnooze: {args.number} is due again (it was never closed)")
+    else:
+        day = datetime.fromisoformat(got.until).date()
+        print(f"levain band snooze: {args.number} snoozed until {day.strftime('%a')} {got.until}: still open, "
+              f"answered by {args.number} as before, listed on the LATER line, no ping before then")
+    return 0
+
+
 def add_parser(subparsers: argparse._SubParsersAction) -> None:
     p = subparsers.add_parser("band", help="Print the NEEDS YOU band: what waits on you, numbered.")
     p.add_argument("--queue-dir", dest="queue_dir", type=Path, default=None,
@@ -3296,6 +3397,21 @@ def add_parser(subparsers: argparse._SubParsersAction) -> None:
     a.add_argument("--queue-dir", dest="queue_dir", type=Path, default=argparse.SUPPRESS,
                    help="The consent directory holding questions.db.")
     a.set_defaults(func=run_band_answer)
+    from levain.consent.questions import SNOOZE_MAX_DAYS
+
+    sz = sub.add_parser("snooze", help=f"Defer a band row to a later day (at most {SNOOZE_MAX_DAYS} days): it stays "
+                                       "open and numbered, shows on the LATER line, and pings nobody before then.")
+    sz.add_argument("number", type=_band_number_arg, help="The band number, as the band shows it.")
+    sz.add_argument("--until", required=True, help="The local day it comes back, YYYY-MM-DD (after today).")
+    sz.add_argument("--note", default=None, help="Your words, kept with the snooze.")
+    sz.add_argument("--queue-dir", dest="queue_dir", type=Path, default=argparse.SUPPRESS,
+                    help="The consent directory holding questions.db.")
+    sz.set_defaults(func=run_band_snooze)
+    us = sub.add_parser("unsnooze", help="Bring a snoozed band row back now: it is due again.")
+    us.add_argument("number", type=_band_number_arg, help="The band number, as the band shows it.")
+    us.add_argument("--queue-dir", dest="queue_dir", type=Path, default=argparse.SUPPRESS,
+                    help="The consent directory holding questions.db.")
+    us.set_defaults(func=run_band_snooze, until=None)
     hk = sub.add_parser("hooks", help="Opt in to the NEEDS YOU band in every Claude Code session (band-only hooks in "
                                       "your user-level settings): install, remove, status.")
     hsub = hk.add_subparsers(dest="hooks_cmd", required=True)
