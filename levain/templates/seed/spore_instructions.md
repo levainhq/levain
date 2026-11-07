@@ -66,24 +66,24 @@ When you re-engage a spore, `spore_touch` it — that resets its germination clo
 
 When in doubt, ask: *does this close?* If yes, it's a spore. If it only accretes, it's memory.
 
-## Three surfaces and memory — where an intention goes
+## The band, spores and memory — where an intention goes
 
-Everything above is *your* prospective memory: open loops that flow into your cognition. Your operator's side of the work has its own surfaces, and they split on one question: *what is the item waiting on?* The model is three surfaces plus memory.
+Everything above is *your* prospective memory: open loops that flow into your cognition. Your operator's side of the work has its own surfaces, and they split on one question: *what is the item waiting on?* The model is three places: the band, spores and memory.
 
 **The band — what the machine is stopped on that only the operator can give.** A band row is a question, a choice or a signature you cannot do without them. File one with `levain ask` (the band MCP tool `ask` does the same) and keep working. Every row names what waits on the answer (`--blocks`): that is the stopped test. If you can do the next step yourself, it is not a band row, it is work. If nothing is stopped yet because the date has not come, it is not a band row either; it is a dated spore (below). The band is for what is waiting now, not for what will wait later.
 
 **Spores — intentions that are not live yet.** Two kinds the operator reaches you with:
 
 - **seed** — undated, and allowed to go stale. A freeform capture the operator dropped for you to **sort**; the default for anything they dump. Read it and route it: promote it to an open `loop` so it joins your cognition, `ascend` it into a project or an episode, or let it rest. A seed that nobody wants any more is composted (`descend`), not carried.
-- **agenda** — dated, or set off by a date: something for a day, not for now. It sits in the Tray with its date (`surface_at`) and stays out of your cognition surfaces until you sort it. An agenda with no date is a seed.
+- **agenda** — dated, or set off by a date: something for a day, not for now. It sits in the Tray with its date and stays out of your cognition surfaces until you sort it. Give it the date in `next` on your spore tools (the cockpit calls the same field `surface_at`). Treat an agenda with no date as a seed.
 
-There is no `handoff` disposition for new items: "pick this up next session" is a seed, a dated agenda, or a row on the board. And there is no Keep. Reference is memory, not a task:
+There is no `handoff` disposition for new items: "pick this up next session" is a seed, a dated agenda, or, if the machine is stopped on the operator, a band row. And there is no Keep. Reference is memory, not a task:
 
-- a **fact** that stays true goes in your continuity under `## Durable Facts`, written with the cue words that would bring it back;
+- a **fact** that stays true goes in your continuity under `## Durable Facts` (if your store has that section; otherwise as a `decision` or `finding` episode), written with the cue words that would bring it back;
 - a **ruling** (the operator decided something) is a `decision` episode with their words, the date and the premise;
-- a trap with a match condition belongs wherever your install keeps those, not in a note.
+- a trap with a match condition is a `finding` episode that states the condition, not a note.
 
-Old `handoff` and `note` items from earlier installs still list, show and resolve; you just do not create new ones.
+Old `handoff` and `note` items from earlier installs still appear, in the Tray (`spore_list` and the cockpit's Tray panel show them badged `handoff` or `note`). Resolve one with `spore_descend` (done) or `spore_ascend` (it grew), or from the cockpit started with `levain serve --write`; you just do not create new ones.
 
 **The capture contract: the human dumps; you sort.** This is the load-bearing rule. Your operator's mental model is "I drop things for you." They do NOT learn the seed / agenda vocabulary; *you* carry it. Disposition is something you infer and assign, never something the human has to get right. A fresh dump is a `seed` by default (already outside your cognition surfaces, so a raw dump cannot pollute your salience before you have looked at it), and you do the sorting. Keep the freeform door wide.
 
