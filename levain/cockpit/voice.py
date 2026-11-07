@@ -66,7 +66,9 @@ STREAM_OPEN = "/cockpit/voice/stream/open"
 STREAM_CHUNK = "/cockpit/voice/stream/chunk"
 STREAM_CLOSE = "/cockpit/voice/stream/close"
 STREAM_PATHS = (STREAM_OPEN, STREAM_CHUNK, STREAM_CLOSE)
-STREAM_PROVIDERS = ("deepgram",)        # the providers a live stream adapter exists for
+# the providers a live dictation open may select; openai was taken out because its stream was once sent under a model name
+# the ledger did not price, so the cap could be passed several times over
+STREAM_PROVIDERS = ("deepgram",)
 STREAM_MAX_SESSIONS = 1                 # one live dictation at a time (the registry's cap)
 STREAM_CHUNK_MAX = stream_session.MAX_CHUNK_BYTES
 STREAM_BODY_DEADLINE_S = 10.0           # a 250 ms chunk is 8000 bytes: a body that takes longer than this is stalled
@@ -330,20 +332,27 @@ def serve_voice(data_root: Path | str, meter: vmeter.Meter, *, last_read: Mutabl
         body["meter"] = "unreadable"
         body["caps"] = {"month_usd": _usd(caps.month_micros), "day_usd": _usd(caps.day_micros),
                         "spent_month_est": None, "spent_day_est": None, "month_start": None, "day_start": None}
-    if premium_stt and stream_offered(rows):
+    chosen = stream_provider(rows) if premium_stt else None
+    if chosen is not None:
         body["stream"] = True
+        body["stream_provider"] = chosen
     return body
 
 
-def stream_offered(rows: list[dict[str, Any]]) -> bool:
-    """Whether the page may show its live-dictation control: the FIRST provider row that holds a key with ``stt`` among
-    its uses (the one the page sends, S4's contract) is one a stream adapter exists for. The row's ``uses`` already
-    leave ``stt`` out unless premium dictation is on. A stricter reading than "some row": a page that sends the first
-    keyed row would otherwise open a stream with a provider that has none."""
+def stream_provider(rows: list[dict[str, Any]]) -> str | None:
+    """The provider the page sends for live dictation: the FIRST row that holds a key with ``stt`` among its uses AND
+    has a stream adapter (:data:`STREAM_PROVIDERS`); None when no row qualifies. The server names it (the page sends
+    this name, not its own first-row guess), so a keyed provider with no adapter listed before a qualifying one never
+    hides dictation. The row's ``uses`` already leave ``stt`` out unless premium dictation is on."""
     for row in rows:
-        if row.get("key") == "set" and "stt" in row.get("uses", ()):
-            return row.get("name") in STREAM_PROVIDERS
-    return False
+        if row.get("key") == "set" and "stt" in row.get("uses", ()) and row.get("name") in STREAM_PROVIDERS:
+            return row["name"]
+    return None
+
+
+def stream_offered(rows: list[dict[str, Any]]) -> bool:
+    """Whether some row qualifies for live dictation (see :func:`stream_provider`)."""
+    return stream_provider(rows) is not None
 
 
 # --- the shared tail: reserve, read the key, call, settle or release ---------------------------------------------------
@@ -356,12 +365,12 @@ def _refuse_check(check: vmeter.Check, provider: str) -> Answer:
     return refusal(503, "voice_unpriced", "voice_unpriced", provider=provider, fallback=True)
 
 
-def _key_refusal(code: str, provider: str, use: str) -> Answer:
+def _key_refusal(code: str, provider: str, use: str, **extra: Any) -> Answer:
     if code == "use_not_granted":
         return refusal(409, "no_key" if use == "tts" else "no_stt_key", "no_tts_key" if use == "tts" else "no_stt_key",
-                       provider=provider, fallback=True)
+                       provider=provider, fallback=True, **extra)
     status, error, words = KEY_FAILURES.get(code, KEY_FAILURES["not_set"])
-    return refusal(status, error, words, provider=provider, fallback=True)
+    return refusal(status, error, words, provider=provider, fallback=True, **extra)
 
 
 def _end(meter: vmeter.Meter, reservation_id: int, release: bool) -> None:
@@ -760,8 +769,45 @@ def stream_chunk_precheck(registry: stream_session.StreamRegistry, query: str, o
     return None
 
 
-def stream_chunk(registry: stream_session.StreamRegistry, query: str, owner: str, pcm: bytes) -> Answer:
-    """``POST /cockpit/voice/stream/chunk?sid=&seq=``: ``{"seq", "partial", "final"}`` for the next PCM chunk."""
+# How often a live session re-asks whether a revoke still reaches its key and the key is still granted, in seconds of
+# SESSION time (the chunk that finds it due does the check; chunks in between do not touch the authority log). The check
+# is two fresh replays of the log (_stream_revoked); measured on this repo's rig in
+# tests/test_cockpit_voice_stream_routes.py::test_one_revoke_check_costs_little_enough_for_the_cadence. 2 s plus one
+# 250 ms chunk puts the end of a revoked session under 3 s.
+STREAM_REVOKE_RECHECK_S = 2.0
+
+
+def _stream_revoked(provider: str, data_root: Path | str, revoke_queue: Path | str | None) -> Answer | None:
+    """None while the session may go on; else the refusal, marked ``revoked`` so the page stops for good. The checks are
+    the open path's, minus the secret: the voice key record for ``provider`` still lists ``stt`` (a revoked key or
+    grant is gone from a fresh replay; the log failing to replay is a refusal too, as at open), and some revoke still
+    reaches it (:func:`revoke_refusal`). The key itself is not read."""
+    key_code = ""
+    try:
+        record = voice_key_for(custody.authority_for(data_root)().policy.grants, provider)
+        if record is None:
+            key_code = "not_set"
+        elif "stt" not in record["uses"]:
+            key_code = "use_not_granted"
+    except Exception as exc:     # noqa: BLE001 - a log that could not be replayed fails closed, in its own words
+        _log.warning("voice stream: the key record could not be checked (%s); the dictation ends", type(exc).__name__)
+        key_code = "authority_unreadable"
+    if key_code:
+        return _key_refusal(key_code, provider, "stt", revoked=True)
+    reach = revoke_refusal(revoke_queue, data_root)
+    if reach is not None:
+        return refusal(503, reach, reach, fallback=True, revoked=True)
+    return None
+
+
+def stream_chunk(registry: stream_session.StreamRegistry, query: str, owner: str, pcm: bytes, *,
+                 data_root: Path | str, revoke_queue: Path | str | None) -> Answer:
+    """``POST /cockpit/voice/stream/chunk?sid=&seq=``: ``{"seq", "partial", "final"}`` for the next PCM chunk.
+
+    Every :data:`STREAM_REVOKE_RECHECK_S` seconds of session time the chunk first re-asks the open path's revoke
+    question (:func:`_stream_revoked`). A revoked key, grant or revoke path ends the session through its normal end (the
+    provider stream closed, the meter settled) and the chunk is answered with the open path's fixed words plus
+    ``"revoked": true``; its audio is never sent."""
     got = _stream_query(query, ("sid", "seq"))
     sid = _stream_sid(got) if got is not None else None
     if got is None or sid is None:
@@ -772,7 +818,17 @@ def stream_chunk(registry: stream_session.StreamRegistry, query: str, owner: str
     seq = int(raw_seq)
     code, update = "", None
     try:
-        update = registry.get(sid, owner).feed(seq, pcm)
+        session = registry.get(sid, owner)
+        if session.revoke_check_due(STREAM_REVOKE_RECHECK_S):
+            try:
+                stopped = _stream_revoked(session.provider, data_root, revoke_queue)
+            except BaseException:
+                session.revoke_check_failed()
+                raise
+            if stopped is not None:
+                session.end_revoked()
+                return stopped
+        update = session.feed(seq, pcm)
     except stream_session.StreamRefused as exc:
         code = exc.code
     if update is None:

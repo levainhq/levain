@@ -35,6 +35,7 @@
   var WORDS = {
     openFailed: "Streaming dictation could not start; the Dictate control and the keyboard dictation key still work.",
     broke: "Streaming dictation stopped; the words so far are in the box.",
+    revoked: "Premium voice was turned off, so the dictation stopped; the words so far are in the box.",
     wavFilled: "Streaming dictation stopped; these words come from the recording instead. Check them before you send.",
     wavTrimmed: "Streaming dictation stopped; these words come from the recording instead, and the start of a long recording was left out. Check them before you send.",
   };
@@ -42,7 +43,7 @@
   var streamOk = false, provider = "", probing = null;
   var S = null;                              // the live session, or null
   var deadlines = { open: 10000, chunk: 10000, close: 5000, wav: 30000 };
-  var limits = { wavMax: 4 * 1024 * 1024 - 44 };   // bytes of PCM kept for the fallback: the server's UPLOAD_MAX less the WAV header   // ms; a request past its deadline is cancelled, never waited on
+  var limits = { wavMax: 4 * 1024 * 1024 - 44 };   // bytes of PCM kept for the fallback: the server's UPLOAD_MAX less the WAV header
 
   function headers() {
     var h = {}, t = "";
@@ -69,7 +70,9 @@
       return r.json();
     }).then(function (j) {
       streamOk = false; provider = "";
-      if (j && j.stream === true && Array.isArray(j.providers)) {
+      if (j && j.stream === true && typeof j.stream_provider === "string" && j.stream_provider) {
+        provider = j.stream_provider; streamOk = true;
+      } else if (j && j.stream === true && Array.isArray(j.providers)) {
         var q = j.providers.filter(function (x) { return x && typeof x.name === "string" && x.key === "set" && Array.isArray(x.uses) && x.uses.indexOf("stt") >= 0; })[0];
         if (q) { provider = q.name; streamOk = true; }
       }
@@ -121,7 +124,11 @@
       s.reqs.push(h);
       tm = setTimeout(function () { settle(reject, new Error("timeout")); }, ms);
       window.fetch(path, opts).then(function (r) {
-        if (!r.ok) throw new Error("status");
+        if (!r.ok) {
+          // a refusal the server marked "revoked" (the key or its grant was revoked mid-dictation) is a FINAL stop, not a break
+          return r.json().then(function (j) { var e = new Error("status"); e.revoked = !!(j && j.revoked === true); throw e; },
+                               function () { throw new Error("status"); });
+        }
         return r.json();
       }).then(function (j) { settle(resolve, j); }, function (e) { settle(reject, e); });
     });
@@ -196,9 +203,17 @@
         var text = (fin && par ? fin + " " + par : fin + par);
         if (text !== s.last) { s.last = text; emit("partial", text); }
       });
-    }).catch(function () {
+    }).catch(function (err) {
       if (s.dead || s.ended) return;
       s.dead = true;
+      if (err && err.revoked === true) {   // revoked: no WAV fallback, no audio kept or sent anywhere; the fixed words and an end
+        releaseCapture(s);
+        s.pcm = null;
+        emit("note", WORDS.revoked);
+        finish(s);
+        closeSession(s, false);
+        return;
+      }
       if (s.stopping) closeFailed = true;
       if (canWav(s)) {              // the audio is in memory: transcribe it from there, the mic is let go meanwhile
         releaseCapture(s);
