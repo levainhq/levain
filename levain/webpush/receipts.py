@@ -12,7 +12,8 @@ Reading it: a ping with no receipt is ``no receipt yet``, never lost. A device t
 reported, so ``silent`` is said only when that device reported a receipt (on any ping, of any kind) whose time is LATER
 than this ping's delivery to it: ping ids are not send order (a held ping is released later under its old, lower id),
 so the times decide, never the ids. A tap is the strongest sign the ping was seen: a tapped ping's outcome is ``shown``
-even when its receipts were lost. ``received_count`` above one is a duplicate delivery (the repeat-notification signal).
+even when its receipts were lost. A device-test push (kind ``devtest``) never reports receipts (the worker suppresses them), so with no tap it is
+``devtest``, never ``silent`` or ``no receipt yet``, and it adds nothing to a device's ``silent`` count. ``received_count`` above one is a duplicate delivery (the repeat-notification signal).
 Times are the worker's own clock for ``received_at`` and ``shown_at`` and the server's for ``sent_at`` and ``tapped_at``,
 so a latency carries the device's clock skew and can be slightly negative; the ``silent`` comparison uses the time the
 SERVER received the device's newest report (``reported_at``), so a wrong phone clock cannot make a ping silent.
@@ -53,7 +54,7 @@ JSON form (``format`` ``levain-ping-receipts/1``, the keys the desk joins to the
                              "opened_how": str|null,
                              "received_count": int, "duplicate": bool,
                              "sent_to_received_s": float|null, "received_to_shown_s": float|null,
-                             "outcome": "shown"|"received"|"silent"|"no receipt yet"|"not accepted"}]}],
+                             "outcome": "shown"|"received"|"silent"|"no receipt yet"|"not accepted"|"devtest"}]}],
      "devices": [{"device": str, "sent": int, "accepted": int, "received": int, "shown": int, "tapped": int,
                   "clicked": int, "duplicates": int, "silent": int, "median_sent_to_received_s": float|null}],
      "landings": [{"device": str, "at": stamp, "target": str, "how": str}]}   # newest 20 page landings (the TAP record)
@@ -188,6 +189,10 @@ def build(store: PushStore, *, since: timedelta | None = None, ref: str | None =
                 outcome = "received"
             elif ok is False:
                 outcome = "not accepted"
+            elif p["kind"] == "devtest":
+                # the worker suppresses a device-test push's receipts (it is shown by the /devtest flow and reported by POST
+                # /webpush/devtest), so "no receipt" / "silent" would be false for it: say what it is
+                outcome = "devtest"
             elif last_sent is not None and reported is not None and reported > last_sent:
                 outcome = "silent"
             else:
