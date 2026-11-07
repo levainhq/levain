@@ -180,7 +180,7 @@ WORDS = {
     # each is true in every case that returns it (revoke_refusal): no grant page served here acts on this cockpit,
     # and the replayed log holds no unrevoked laptop key for the command line's revoke to sign with
     "revoke_unreachable": ("Premium voice is off: the phone's grant page cannot revoke this Levain's voice keys. "
-                           "A revoke from the command line needs an unrevoked laptop key, and none is enrolled."),
+                           "A revoke from the command line needs an unrevoked laptop key, and no usable one is enrolled."),
     "revoke_unchecked": ("Premium voice is off: Levain could not check that this Levain's voice keys can be revoked, "
                          "so no key is read."),
     "keychain_unreadable": "Levain could not read the key from this Mac's keychain (it may be locked).",
