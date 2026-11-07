@@ -66,21 +66,28 @@ When you re-engage a spore, `spore_touch` it — that resets its germination clo
 
 When in doubt, ask: *does this close?* If yes, it's a spore. If it only accretes, it's memory.
 
-## The Tray and the Keep — your operator's own I/O
+## Three surfaces and memory — where an intention goes
 
-Everything above is *your* prospective memory — open loops that flow into your cognition (salience, and the collision surface that brings the right one back when it's relevant). A spore can also carry a **disposition** that re-routes it to your *operator's* I/O instead of yours. These are deliberately kept OUT of your cognition surfaces — they are the human's inbox and reference shelf, not your open loops — and they split on one question: *does the item resolve, or persist?*
+Everything above is *your* prospective memory: open loops that flow into your cognition. Your operator's side of the work has its own surfaces, and they split on one question: *what is the item waiting on?* The model is three surfaces plus memory. (These pieces ship together in one release; the surfaces below are the model you work to.)
 
-**The Tray — your operator's session inbox (resolves).** Items the operator hands you, surfaced once at the start of each session, then worked off:
+**The band — what the machine is stopped on that only the operator can give.** A band row is a question, a choice or a signature you cannot do without them. File one with `levain ask` (the band MCP tool `ask` does the same), and keep working. It passes the **stopped test**: say in the `--stopped` field what is actually stopped. If you can do the next step yourself, it is not a band row, it is work. If nothing is stopped yet because the date has not come, it is not a band row either; it is a dated spore (below). A row the operator defers shows under a LATER line with a band snooze until its day. The band is for what is waiting now, not for what will wait later.
 
-- **seed** — a freeform capture the operator dropped for you to **sort**. This is the default for anything they dump. Your job: read it and route it — metabolize it into a real object (promote it to an open `loop` so it joins your cognition, or `ascend` it into a project / episode / a Keep note) — or, if it's actually a handoff or an agenda item, re-disposition it. A raw dump stays a `seed` until you've sorted it.
-- **handoff** — "pick this up next session" / "remember this for later." You consume it at the next session-start, act on it, then resolve it.
-- **agenda** — "something to talk about, not ready to track yet." Discussed, then it resolves or promotes to a `seed`.
+**Spores — intentions that are not live yet.** Two kinds the operator reaches you with:
 
-**The Keep — your operator's durable reference (persists).**
+- **seed** — undated, and allowed to go stale. A freeform capture the operator dropped for you to **sort**; the default for anything they dump. Read it and route it: promote it to an open `loop` so it joins your cognition, `ascend` it into a project or an episode, or let it rest. A seed that nobody wants any more is composted, not carried. Open seeds are listed to you once at session start (the count and the first few), so "the human dumps; you sort" has a moment where you actually see the dump.
+- **agenda** — dated, or set off by a date. An agenda **germinates** mechanically on its day (no model call): it becomes a band row, a board row, or a nudge, as its target says. When a dated ask is yours to defer, `levain ask --on <date>` writes an agenda instead of a band row, so the ask reaches the operator on that day and not before. An agenda with no date is a seed.
 
-- **note** — a durable, agent-queryable reference the operator authored (a command they keep forgetting, a pointer, a standing list). It is NOT an open loop: it never germinates, never nags, never ascends. You **recall** it when the current work collides with it — the same collision surface that brings open loops back to you — so you can hand them "that command" without being asked to go look. A note persists until the operator removes it (`descend`); to repurpose one, remove it and author a fresh loop.
+There is no `handoff` disposition: "pick this up next session" is a seed, a dated agenda, or a row on the board. And there is no Keep. Reference is memory, not a task:
 
-**The capture contract — the human dumps; you sort.** This is the load-bearing rule. Your operator's whole mental model is "the Tray is where I drop things for you." They do NOT learn the seed / handoff / agenda / note vocabulary — *you* carry it. Disposition is something **you infer and assign**, never something the human has to get right. So a fresh dump is a `seed` by default (already excluded from your cognition, so a raw dump can never pollute your salience before you've looked at it), and you do the sorting at the next session-start. Keep the freeform door wide: it should always be zero-friction for them to just dump, and yours to make sense of.
+- a **fact** that stays true goes in your continuity under `## Durable Facts`, written with the cue words that would bring it back;
+- a **ruling** (the operator decided something) is a `decision` episode with their words, the date and the premise;
+- a trap with a match condition belongs wherever your install keeps those, not in a note.
+
+Old `handoff` and `note` items from earlier installs still list, show and resolve; you just do not create new ones.
+
+**One word, two things.** *Germination* in the section above is the **computed tier** (growing, resting, dormant) anneal assigns an open loop from when you last touched it. The `germinate` command is the **dated act**: it fires an agenda that has come due. Same root, different mechanisms; a loop going dormant never files anything, and a germinated agenda has nothing to do with the tier.
+
+**The capture contract: the human dumps; you sort.** This is the load-bearing rule. Your operator's mental model is "I drop things for you." They do NOT learn the seed / agenda vocabulary; *you* carry it. Disposition is something you infer and assign, never something the human has to get right. A fresh dump is a `seed` by default (already outside your cognition surfaces, so a raw dump cannot pollute your salience before you have looked at it), and you do the sorting. Keep the freeform door wide.
 
 ---
 
