@@ -263,7 +263,7 @@ def test_ensure_with_a_healthy_launch_spawns_nothing_more(world):
 
 @pytest.mark.parametrize("fake_mode,why", [
     ("bad_tools", "read-only tools"), ("bad_mode", "read-only tools"), ("no_deny", "deny rules not holding"),
-    ("exit_early", r"exited \(code 3\)")])
+    ("exit_early", r"exited \(code 3\)|\(exit code 3\)")])   # the fake exits at once: the launcher sees it either at the first write (exit code 3) or after (exited (code 3)); both refuse the launch
 def test_an_open_check_that_fails_ends_the_launch_and_attaches_nothing(world, fake_mode, why):
     mode(world, fake_mode)
     lr = launcher(world)
