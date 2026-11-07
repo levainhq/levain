@@ -41,6 +41,7 @@ import base64
 import hashlib
 import os
 import re
+import select
 import socket
 import ssl
 import struct
@@ -144,7 +145,8 @@ class WebSocketClient:
     # ---- send side
     def _send_frame(self, opcode: int, payload: bytes, deadline: float | None = None) -> None:
         """Send one frame. A second close frame (from any thread) is a silent no-op; data after the close is refused.
-        With ``deadline`` (``close()`` only) both the wait for the send lock and the send itself end by it."""
+        With ``deadline`` (``close()`` only) both the wait for the send lock and the wait for the socket to take the
+        frame end by it."""
         n = len(payload)
         key = os.urandom(4)
         if n < 126:
@@ -167,11 +169,14 @@ class WebSocketClient:
                 raise WsError("closed")
             try:
                 if deadline is not None:
-                    # Safe to change the shared timeout here: we hold the send lock (no writer), and a reader's
-                    # in-flight recv() keeps the timeout it started with; after _close_sent the reader sets its own.
-                    self._sock.settimeout(max(0.001, min(self._idle, deadline - time.monotonic())))
+                    # Never change the socket timeout here: a reader may be inside recv() on another thread, and the
+                    # timeout is shared. With the send lock held no writer is mid-send, so the close frame (a few bytes)
+                    # goes out at once once the socket is writable; wait for that by the deadline instead.
+                    left = deadline - time.monotonic()
+                    if left <= 0 or not select.select([], [self._sock], [], left)[1]:
+                        raise WsError("timeout")     # the peer stopped reading; the caller drops the socket
                 self._sock.sendall(frame)
-            except (OSError, ssl.SSLError):
+            except (OSError, ssl.SSLError, ValueError):
                 self._shut()
                 raise WsError("closed") from None
             if opcode == OP_CLOSE:
@@ -341,10 +346,13 @@ class WebSocketClient:
     def close(self, code: int = 1000, wait: float = CLOSE_WAIT) -> None:
         """Send a close frame (once, from any thread) and wait for the peer's, all within ``wait`` seconds, then drop the
         socket. If a reader is in ``recv()`` it stays the only socket reader and gets the peer's close; otherwise this
-        reads it. A writer stuck in a send past ``wait`` gets ``WsError("closed")`` when the socket drops. Idempotent;
-        never raises."""
+        reads it. A writer stuck in a send past ``wait`` gets ``WsError("closed")`` when the socket drops. After close()
+        starts, data frames not yet read may be dropped. A ``code`` a peer may not send (1005, 1006, 1015, out of
+        range) goes out as 1000. Idempotent; never raises."""
         if self._closed:
             return
+        if not _valid_close(code):
+            code = 1000
         deadline = time.monotonic() + wait
         try:
             self._send_frame(OP_CLOSE, struct.pack("!H", code), deadline)
@@ -354,9 +362,11 @@ class WebSocketClient:
                     break
                 if self._recv_lock.acquire(timeout=min(left, 0.05)):
                     try:
-                        while not self._close_seen and not self._closed:
+                        while not self._close_seen and not self._closed and time.monotonic() < deadline:
                             try:
                                 self._recv(deadline)
+                            except WsTimeout:
+                                continue             # idle before a frame started: the close wait is not over
                             except WsError:
                                 break
                     finally:
@@ -452,8 +462,9 @@ def _open(url: str, headers: dict[str, str] | None, connect_timeout: float, idle
     try:
         if tls:
             try:
-                sock.settimeout(_left(deadline))        # wrap_socket runs the TLS handshake under this timeout
-                sock = ssl.create_default_context().wrap_socket(sock, server_hostname=host)
+                ctx = ssl.create_default_context()
+                sock.settimeout(_left(deadline))        # sampled after the context exists; the handshake runs under it
+                sock = ctx.wrap_socket(sock, server_hostname=host)
             except (socket.timeout, TimeoutError):
                 raise WsError("timeout") from None
             except (OSError, ssl.SSLError, ValueError):

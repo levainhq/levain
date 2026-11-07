@@ -5,6 +5,7 @@ from __future__ import annotations
 import base64
 import hashlib
 import socket
+import ssl
 import struct
 import threading
 import time
@@ -87,8 +88,9 @@ class Peer:
 
 
 class Server:
-    def __init__(self, script) -> None:
+    def __init__(self, script, ctx: ssl.SSLContext | None = None) -> None:
         self.script = script
+        self.ctx = ctx
         self.sock = socket.socket()
         self.sock.bind(("127.0.0.1", 0))
         self.sock.listen(1)
@@ -103,6 +105,8 @@ class Server:
         try:
             conn, _ = self.sock.accept()
             conn.settimeout(10)
+            if self.ctx is not None:
+                conn = self.ctx.wrap_socket(conn, server_side=True)
             self.peer = Peer(conn)
             self.peer.read_request()
             self.script(self.peer)
@@ -119,7 +123,7 @@ class Server:
 
     @property
     def url(self) -> str:
-        return f"ws://127.0.0.1:{self.port}/v1/listen?x=1"
+        return f"{'wss' if self.ctx else 'ws'}://127.0.0.1:{self.port}/v1/listen?x=1"
 
     def stop(self) -> None:
         self.sock.close()
@@ -130,8 +134,8 @@ class Server:
 def serve():
     servers = []
 
-    def make(script):
-        s = Server(script)
+    def make(script, ctx=None):
+        s = Server(script, ctx)
         servers.append(s)
         return s
 
@@ -854,3 +858,214 @@ def test_f8_idle_timeout_with_one_header_byte_is_recoverable(serve):
         except ws.WsTimeout:
             continue
     c.close(wait=0.1)
+
+
+# ---- L3 round 2 regressions
+
+@pytest.fixture
+def tls(tmp_path, monkeypatch):
+    """A throwaway self-signed cert for 127.0.0.1: returns the server context; the client's default context is made to
+    trust that cert (and only that one) for the test."""
+    import datetime
+    import ipaddress
+
+    from cryptography import x509
+    from cryptography.hazmat.primitives import hashes, serialization
+    from cryptography.hazmat.primitives.asymmetric import ec
+    from cryptography.x509.oid import ExtendedKeyUsageOID, NameOID
+
+    key = ec.generate_private_key(ec.SECP256R1())
+    name = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, "127.0.0.1")])
+    now = datetime.datetime.now(datetime.timezone.utc)
+    ski = x509.SubjectKeyIdentifier.from_public_key(key.public_key())
+    cert = (x509.CertificateBuilder().subject_name(name).issuer_name(name).public_key(key.public_key())
+            .serial_number(x509.random_serial_number())
+            .not_valid_before(now - datetime.timedelta(minutes=5)).not_valid_after(now + datetime.timedelta(hours=1))
+            .add_extension(x509.SubjectAlternativeName([x509.IPAddress(ipaddress.ip_address("127.0.0.1"))]), False)
+            .add_extension(x509.BasicConstraints(ca=True, path_length=None), True)
+            .add_extension(x509.KeyUsage(True, False, False, False, False, True, False, False, False), True)
+            .add_extension(x509.ExtendedKeyUsage([ExtendedKeyUsageOID.SERVER_AUTH]), False)
+            .add_extension(ski, False)
+            .add_extension(x509.AuthorityKeyIdentifier.from_issuer_subject_key_identifier(ski), False)
+            .sign(key, hashes.SHA256()))
+    cert_pem = cert.public_bytes(serialization.Encoding.PEM)
+    (tmp_path / "c.pem").write_bytes(cert_pem)
+    (tmp_path / "k.pem").write_bytes(key.private_bytes(serialization.Encoding.PEM, serialization.PrivateFormat.PKCS8,
+                                                       serialization.NoEncryption()))
+    server_ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+    server_ctx.load_cert_chain(tmp_path / "c.pem", tmp_path / "k.pem")
+    real = ssl.create_default_context
+    monkeypatch.setattr(ws.ssl, "create_default_context", lambda *a, **k: real(cadata=cert_pem.decode("ascii")))
+    return server_ctx
+
+
+def test_r2a_tls_close_from_another_thread_while_reader_blocked(serve, tls):
+    """R2-A over real TLS: a reader blocked in SSLSocket.recv while close() runs on another thread gets the peer's close
+    and nothing else (no exception escapes recv())."""
+    def script(p):
+        p.handshake()
+        fin, op, masked, data, _ = p.read_frame()
+        assert op == 8
+        time.sleep(0.1)
+        p.send(8, data[:2])
+        time.sleep(0.5)
+
+    c = dial(serve(script, tls))
+    assert isinstance(c._sock, ssl.SSLSocket)
+    got, errs = [], []
+
+    def reader():
+        try:
+            got.append(c.recv())
+        except BaseException as e:  # noqa: BLE001
+            errs.append(e)
+
+    t = threading.Thread(target=reader)
+    t.start()
+    time.sleep(0.2)
+    c.close(wait=2.0)
+    t.join(5)
+    assert not t.is_alive()
+    assert errs == [] and got == [("close", (1000, ""))]
+
+
+class TimeoutWatchSocket(socket.socket):
+    """Models CPython-SSL's objection (R2-A): a timeout changed by another thread while a read is in flight makes that
+    read raise RuntimeError."""
+
+    def __init__(self, *a, **kw):
+        super().__init__(*a, **kw)
+        self.reader: int | None = None
+        self.changed = False
+
+    def settimeout(self, t):
+        if self.reader is not None and self.reader != threading.get_ident():
+            self.changed = True
+        super().settimeout(t)
+
+    def recv(self, *a, **kw):
+        self.reader = threading.get_ident()
+        try:
+            out = super().recv(*a, **kw)
+        finally:
+            self.reader = None
+        if self.changed:
+            raise RuntimeError("SSL socket changed timeout")
+        return out
+
+
+def test_r2a_close_never_changes_the_timeout_under_an_active_reader(serve):
+    """R2-A: close() from another thread must not touch the socket timeout while the reader is inside recv()."""
+    def script(p):
+        p.handshake()
+        p.read_frame()
+        time.sleep(0.1)
+        p.send(8, struct.pack("!H", 1000))
+        time.sleep(0.5)
+
+    c = dial(serve(script))
+    watched = TimeoutWatchSocket(fileno=c._sock.detach())
+    watched.settimeout(3.0)
+    c._sock = watched
+    got, errs = [], []
+
+    def reader():
+        try:
+            got.append(c.recv())
+        except BaseException as e:  # noqa: BLE001
+            errs.append(e)
+
+    t = threading.Thread(target=reader)
+    t.start()
+    time.sleep(0.2)
+    c.close(wait=2.0)
+    t.join(5)
+    assert not watched.changed
+    assert errs == [] and got == [("close", (1000, ""))]
+
+
+def test_r2a_close_frame_send_bounded_when_buffer_full_and_no_writer(serve):
+    """R2-A (no regression from deleting the timeout change): the send buffer is full but no writer holds the lock;
+    close(wait) still ends by its wait, not by idle_timeout."""
+    release = threading.Event()
+
+    def script(p):
+        p.handshake()
+        release.wait(10)                             # never reads
+
+    c = dial(serve(script), idle_timeout=6.0)
+    c._sock.setblocking(False)
+    try:
+        while True:
+            c._sock.send(b"x" * 65536)
+    except BlockingIOError:
+        pass
+    c._sock.settimeout(6.0)
+    t0 = time.monotonic()
+    c.close(wait=0.3)
+    elapsed = time.monotonic() - t0
+    release.set()
+    assert elapsed < 1.5, elapsed
+    assert c._closed
+
+
+def test_r2b_close_wait_outlasts_idle_timeout(serve):
+    """R2-B: close(wait) longer than idle_timeout keeps waiting for the peer's close past an idle timeout."""
+    def script(p):
+        p.handshake()
+        fin, op, masked, data, _ = p.read_frame()
+        time.sleep(0.6)                              # > idle_timeout, < wait
+        p.send(8, data[:2])
+        time.sleep(0.3)
+
+    c = dial(serve(script), idle_timeout=0.2)
+    t0 = time.monotonic()
+    c.close(wait=2.0)
+    elapsed = time.monotonic() - t0
+    assert c._close_seen, elapsed
+    assert 0.5 < elapsed < 1.5, elapsed
+
+
+def test_r2c_tls_wrap_gets_the_time_left_after_context_creation(monkeypatch):
+    """R2-C: a slow ssl context creation is charged to handshake_deadline before the TLS handshake gets its timeout."""
+    lst = socket.socket()
+    lst.bind(("127.0.0.1", 0))
+    lst.listen(4)
+    seen = []
+
+    class Ctx:
+        def wrap_socket(self, sock, server_hostname=None):
+            seen.append(sock.gettimeout())
+            raise ssl.SSLError("stop here")
+
+    def slow_context(*a, **k):
+        time.sleep(0.4)
+        return Ctx()
+
+    monkeypatch.setattr(ws.ssl, "create_default_context", slow_context)
+    try:
+        with pytest.raises(ws.WsError):
+            ws.connect(f"wss://127.0.0.1:{lst.getsockname()[1]}/", {}, handshake_deadline=1.0)
+    finally:
+        lst.close()
+    assert seen and seen[0] <= 0.65, seen
+
+
+@pytest.mark.parametrize("code", [1005, 1006, 1015, 999, 2999, 5000, 70000])
+def test_r2d_close_never_sends_a_reserved_or_invalid_code(serve, code):
+    """R2-D: close(code) with a code a peer may not put on the wire sends 1000 instead, and never raises."""
+    seen = []
+
+    def script(p):
+        p.handshake()
+        fin, op, masked, data, _ = p.read_frame()
+        seen.append((op, struct.unpack("!H", data[:2])[0] if len(data) >= 2 else None))
+        p.send(8, data[:2])
+        time.sleep(0.3)
+
+    srv = serve(script)
+    c = dial(srv)
+    c.close(code, wait=1.0)
+    srv.t.join(5)
+    assert seen == [(8, 1000)]
+    assert c._closed
