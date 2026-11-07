@@ -23,6 +23,8 @@ All notable changes to Levain. Format is loosely [Keep a Changelog](https://keep
 - **A notification tap or installed-app launch from another origin (Android Chrome sends Dest `empty`) now opens the app shell.** It was refused with a 403 and only a document-style load was admitted; the bare `/` and a push tap's deep link are admitted, and `/pair` and sign sheets still are not.
 - **The Grants tab now lists the seat-root lease (live or expired), so its revoke is reachable there.**
 - **A seat's `permissions.deny` names `.git` only at `hooks`, `config`, `info`, `modules` and `worktrees`.** Denying the whole of `.git` made `git commit` fail inside a seat.
+- **`levain seat canary` takes `--model` and runs on `sonnet` by default.** The `haiku` default refused the canary prompt as tampering, so a canary under it read inconclusive.
+- **A seat's `permissions.deny` now also covers a nested `.git`** (a gitfile or directory below a root's top level, for example `sub/.git`), which the root's own `.git` rules never matched; `git commit` still works.
 
 ### Fixed
 - **A band answer typed in a remote agent view client (Blink over mosh into a `--bg` desk) no longer raises the Touch ID sheet on the unattended laptop.** The remote detector now has a fourth leg: the prompt is tied to its client by the keystroke (the client's tty and the session's tty are read together, so their access times match within 2 s, the kernel's lazy update included), and a remote client reads the desk remote, so the answer records `unsigned/remote` with no sheet. With no client tied it falls back to a remote agent view client being open while the laptop is idle for a minute. A reply typed in the agent view peek panel is unmeasured and may land on that fallback.
