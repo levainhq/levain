@@ -72,21 +72,23 @@ def seat_permission_deny(roots: Sequence[Path], key_dir: Path) -> list[str]:
     which are the ones measured to fire after symlink resolution. ``.git`` is denied only at the paths that run code or
     carry configuration (:data:`_GIT_DENY`), never whole and never as ``**/.git``: Claude Code turns a file-tool deny
     rule into a sandbox write denial, so a whole-``.git`` rule made ``git commit`` fail with ``index.lock: Operation
-    not permitted`` (1106-16/z1e/RETURN_gitdeny.md, measured). A ``.git`` created after launch is therefore not deny-ruled
-    (the launch walk refuses a gitfile or nested ``.git`` that already exists), and a Write to a ``.git`` file outside
-    those paths reaches a permission prompt instead of a hard deny."""
+    not permitted`` (1106-16/z1e/RETURN_gitdeny.md, measured). A NESTED ``.git`` (a gitfile or directory below a
+    root's top level) is denied by ``<root>/*/**/.git``, a shape that never matches the root's own ``.git`` (measured on
+    the host, one turn each: with it ``git commit`` lands and a Write to ``sub/.git`` is "denied by your permission
+    settings"; the z1e rerun without it prompted on that Write). A Write to a ``.git`` file of the root outside the
+    :data:`_GIT_DENY` paths still reaches the vendor's own "sensitive file" prompt instead of a hard deny."""
     rules: list[str] = []
     names = sorted(PROTECTED_NAMES - {".mcp.json", ".git"})
     for i, root in enumerate(roots):
         pats = [f"{root}/{name}/**" for name in names]
         pats += [_git_rule_path(f"{root}/.git", sub) for sub in _GIT_DENY]
-        pats += [f"{root}/.mcp.json"]
+        pats += [f"{root}/.mcp.json", f"{root}/*/**/.git"]
         for tool in FILE_TOOLS:
             rules += [_abs_rule(tool, p) for p in pats]
             if i == 0:
                 rules += [f"{tool}({name}/**)" for name in names]
                 rules += [f"{tool}({_git_rule_path('.git', sub)})" for sub in _GIT_DENY]
-                rules += [f"{tool}(.mcp.json)"]
+                rules += [f"{tool}(.mcp.json)", f"{tool}(*/**/.git)"]
     rules.append(_abs_rule("Read", f"{key_dir}/**"))
     return rules
 
