@@ -350,7 +350,7 @@ NO_PAGE_TEARDOWN = ("(() => { const V = window.LevainTopologyView, o = V.leaveRe
 def _host_run(tmp_path, monkeypatch, steps, tag="a"):
     (tmp_path / tag).mkdir(exist_ok=True)
     _root, src = _sessions_fixture(tmp_path / tag, monkeypatch)
-    return _run(tmp_path, src, [{"until": STRIP}, {"eval": HOST}, {"eval": NO_PAGE_TEARDOWN}, {"eval": SPY}, *steps])
+    return _run(tmp_path, src, [{"until": STRIP}, {"eval": HOST}, {"eval": NO_PAGE_TEARDOWN}, ISOLATE, {"eval": SPY}, *steps])
 
 
 @needs_browser
@@ -421,9 +421,16 @@ def test_the_live_retry_after_a_failure_issues_a_new_read_and_never_shows_the_un
     assert retry["replaying"] is True and retry["badge"] == "returning to live…" and retry["rshown"] not in (None, "live"), retry   # still the labelled frame
 
 
+# a page card's repaint that lands late (a slow runner's panel read finishing after the host mounted): it calls the one topology module's render with
+# the PAGE's opts, which takes the module's single `opts` slot, so a later click on the host's lens pill would resume through the page's resume (the host's
+# counter stays 0 and replay clears at once). CI run 42330387947 failed on exactly this (resumes 0, replaying false); `_host_run` now keeps the page's
+# render out of the way for the whole test (ISOLATE), so this paint draws nothing and takes no slot.
+LATE_PAGE_PAINT = {"eval": "(() => { const V = window.LevainTopologyView; V.render(window.__live, {lens: 'agents', replay: {readJson: window.LevainCockpitTransport.readJson, resume: () => Promise.resolve('applied')}, repaint: () => {}}); return 1; })()"}
+
+
 @needs_browser
 def test_a_lens_switch_keeps_the_labelled_frame_until_the_live_read_applies(tmp_path, monkeypatch):
-    out = _host_run(tmp_path, monkeypatch, [{"eval": H_SCRUB}, H_PAUSED, {"eval": "window.__mode = 'hang'; 1"},
+    out = _host_run(tmp_path, monkeypatch, [{"eval": H_SCRUB}, H_PAUSED, LATE_PAGE_PAINT, {"eval": "window.__mode = 'hang'; 1"},
                                             {"eval": "document.querySelector('#h6 [data-tv=work]').click(); 1"},
                                             # `=== 1` is deliberate: the test asserts exactly one resume (mid["resumes"] == 1) below
                                             # the precondition: the host card is in replay, badged (waited for on that state, not a fixed sleep)
