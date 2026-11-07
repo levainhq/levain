@@ -12,6 +12,9 @@ usage: guest_ops.py <verb> <arg>
 The exchange dir is owned by the unprivileged dispatch user and this script runs as root, so every access is
 relative to a directory fd opened O_NOFOLLOW and every file is opened O_NOFOLLOW + fstat'd regular: a planted
 symlink or fifo is refused, never followed."""
+from __future__ import annotations
+
+
 import glob
 import json
 import os
