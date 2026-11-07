@@ -660,3 +660,150 @@ def test_status_table_every_stream_refusal_code_has_one_status_and_its_fixed_wor
     assert cockpit_voice.stream_refusal("key_unavailable", "keychain_unreadable", provider="deepgram").status == 503
     assert cockpit_voice.stream_refusal("key_unavailable", "weird", provider="deepgram").status == 500
     assert cockpit_voice.stream_refusal("not-a-code").status == 500
+
+
+# --- a revoke mid-dictation (cockpit mic: the S3 known edge) -----------------------------------------------------------------
+
+class SessionClock:
+    """The registry's clock, moved by the test; chunk spacing is session time, never the wall."""
+
+    def __init__(self) -> None:
+        self.t = 1000.0
+
+    def __call__(self) -> float:
+        return self.t
+
+
+def revoke_key(rig, record) -> None:
+    from levain.voice import custody as voice_custody
+    voice_custody.revoke_key(rig.data_root, record["id"], **rig.ck.kw())
+
+
+def stream_with_clock(httpd) -> SessionClock:
+    clock = SessionClock()
+    httpd.voice_stream_kwargs = {"clock": clock}        # read when the registry is first built (the first stream request)
+    return clock
+
+
+def test_a_key_revoked_between_chunk_3_and_4_ends_the_session_at_the_next_check(rig):
+    """Chunks 0-3 at 0.25 s each pass; the key is revoked; the first chunk past STREAM_REVOKE_RECHECK_S of session time is
+    answered with the open path's no-key words plus `revoked`, its audio never reaches the provider, the provider stream is
+    closed once, nothing stays `reserved` and the key value is in no response. Red with: the `session.revoke_check_due`
+    block in stream_chunk dropped (chunk 8 is 200 and the stream keeps its 9 chunks), `_stream_revoked`'s key-record
+    check returning None, or `session.end_revoked()` dropped (the provider stream is never closed and the row stays
+    reserved)."""
+    record = rig.add_key(provider="deepgram", uses=("stt", "tts"), source="levain-voice-deepgram-s3")
+    with served(rig) as (port, httpd):
+        factory = fx(httpd)
+        clock = stream_with_clock(httpd)
+        sid = open_session(port)[1]["sid"]
+        bodies = []
+        for seq in range(4):
+            clock.t += 0.25
+            status, _h, body = chunk(port, sid, seq)
+            assert status == 200, body
+            bodies.append(body)
+        revoke_key(rig, record)
+        clock.t += 0.25
+        status, _h, body = chunk(port, sid, 4)             # inside the cadence: not yet looked at
+        assert status == 200
+        bodies.append(body)
+        clock.t += cockpit_voice.STREAM_REVOKE_RECHECK_S
+        status, _h, body = chunk(port, sid, 5)             # due: the check finds the key gone
+        bodies.append(body)
+        got = js(body)
+        assert (status, got["error"], got["revoked"], got["fallback"]) == (409, "no_key", True, "on_device"), got
+        assert got["message"] == cockpit_voice.WORDS["no_key"].format(p="Deepgram")
+        assert len(factory.streams[0].sent) == 5 and factory.streams[0].closed == 1       # chunk 5 was never sent
+        assert statuses(rig) == ["ok"]                                  # settled at 5 chunks, nothing `reserved`
+        assert rig.rows()[0].units == seconds_for_chunks(5)
+        assert chunk(port, sid, 6)[0] == 409                           # the ended session answers `closed`
+        no_leak(*(b.decode() for b in bodies))
+    assert "reserved" not in statuses(rig)
+
+
+def seconds_for_chunks(n: int) -> int:
+    return stream_session.seconds_for(n * len(PCM))
+
+
+def test_an_unrevoked_session_streams_on_through_every_check(rig):
+    """The checks run (clock past the cadence every chunk) and pass: 12 chunks all 200, the stream sees all 12. Red with:
+    `_stream_revoked` returning a refusal for a granted key (e.g. the `"stt" not in record["uses"]` test inverted)."""
+    keyed(rig)
+    with served(rig) as (port, httpd):
+        factory = fx(httpd)
+        clock = stream_with_clock(httpd)
+        sid = open_session(port)[1]["sid"]
+        for seq in range(12):
+            clock.t += cockpit_voice.STREAM_REVOKE_RECHECK_S + 0.01
+            assert chunk(port, sid, seq)[0] == 200
+        assert len(factory.streams[0].sent) == 12 and factory.streams[0].closed == 0
+
+
+def test_the_authority_log_is_read_on_a_cadence_not_per_chunk(rig, monkeypatch):
+    """16 chunks 0.25 s apart (4 s of session time) call the check exactly twice. Red with: the cadence test in
+    `revoke_check_due` dropped (16 checks) or its interval not restarted after a check (every chunk after the first
+    due one checks)."""
+    keyed(rig)
+    calls = []
+    real = cockpit_voice._stream_revoked
+    monkeypatch.setattr(cockpit_voice, "_stream_revoked", lambda *a, **k: calls.append(1) or real(*a, **k))
+    with served(rig) as (port, httpd):
+        fx(httpd)
+        clock = stream_with_clock(httpd)
+        sid = open_session(port)[1]["sid"]
+        for seq in range(16):
+            clock.t += 0.25
+            assert chunk(port, sid, seq)[0] == 200
+    assert len(calls) == 2, calls
+
+
+def test_a_revoke_path_that_goes_away_mid_session_ends_it_in_the_open_paths_words(rig, monkeypatch):
+    """The recheck is `revoke_refusal` too: when it starts refusing, the session ends with its words and `revoked`. Red
+    with: the `revoke_refusal` call dropped from `_stream_revoked` (chunk 200)."""
+    keyed(rig)
+    with served(rig) as (port, httpd):
+        factory = fx(httpd)
+        clock = stream_with_clock(httpd)
+        sid = open_session(port)[1]["sid"]
+        clock.t += 0.25
+        assert chunk(port, sid, 0)[0] == 200
+        monkeypatch.setattr(cockpit_voice, "revoke_refusal", lambda q, root: "revoke_unreachable")
+        clock.t += cockpit_voice.STREAM_REVOKE_RECHECK_S
+        status, _h, body = chunk(port, sid, 1)
+        got = js(body)
+        assert (status, got["error"], got["revoked"]) == (503, "revoke_unreachable", True)
+        assert got["message"] == cockpit_voice.WORDS["revoke_unreachable"]
+        assert factory.streams[0].closed == 1 and len(factory.streams[0].sent) == 1
+        assert statuses(rig) == ["ok"]
+
+
+def test_a_log_that_cannot_be_replayed_mid_session_ends_it_closed(rig, monkeypatch):
+    """As at open, an unknown is a refusal (authority_unreadable, 503, `revoked`). Red with: the `except Exception`
+    branch of `_stream_revoked` answering None."""
+    keyed(rig)
+    with served(rig) as (port, httpd):
+        fx(httpd)
+        clock = stream_with_clock(httpd)
+        sid = open_session(port)[1]["sid"]
+        clock.t += cockpit_voice.STREAM_REVOKE_RECHECK_S + 0.01
+
+        def boom(_root):
+            raise OSError("log gone")
+        monkeypatch.setattr(cockpit_voice.custody, "authority_for", boom)
+        status, _h, body = chunk(port, sid, 0)
+        assert (status, js(body)["error"], js(body)["revoked"]) == (503, "authority_unreadable", True)
+
+
+def test_one_revoke_check_costs_little_enough_for_the_cadence(rig):
+    """MEASURED: one `_stream_revoked` (two fresh log replays) on the rig's signed log. The cadence is 2 s of session
+    time; a check must be a small fraction of that or a chunk holds its connection. The bound is 0.5 s (the measured
+    cost is in RETURN_micrevoke.md). Red with: a check slower than that."""
+    keyed(rig)
+    cockpit_voice._stream_revoked("deepgram", rig.data_root, rig.qdir)         # warm
+    t0 = time.perf_counter()
+    for _ in range(5):
+        assert cockpit_voice._stream_revoked("deepgram", rig.data_root, rig.qdir) is None
+    per = (time.perf_counter() - t0) / 5
+    print(f"revoke check: {per * 1000:.1f} ms")
+    assert per < 0.5 and cockpit_voice.STREAM_REVOKE_RECHECK_S + 0.25 < 3.0

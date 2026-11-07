@@ -3993,7 +3993,9 @@ class _Handler(GuardedHandler):
                 if len(body) != clen:     # the client closed early: a cut-off chunk is never fed
                     self.close_connection = True
                     return None
-                return cockpit_voice.stream_chunk(registry, query, owner, body)
+                return cockpit_voice.stream_chunk(
+                    registry, query, owner, body, data_root=srv.broker.data_root,
+                    revoke_queue=srv.grant_phone.queue_dir if srv.grant_phone is not None else None)
             finally:
                 srv.voice_chunk_gate.release()
         data_root = srv.broker.data_root

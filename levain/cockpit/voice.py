@@ -355,12 +355,12 @@ def _refuse_check(check: vmeter.Check, provider: str) -> Answer:
     return refusal(503, "voice_unpriced", "voice_unpriced", provider=provider, fallback=True)
 
 
-def _key_refusal(code: str, provider: str, use: str) -> Answer:
+def _key_refusal(code: str, provider: str, use: str, **extra: Any) -> Answer:
     if code == "use_not_granted":
         return refusal(409, "no_key" if use == "tts" else "no_stt_key", "no_tts_key" if use == "tts" else "no_stt_key",
-                       provider=provider, fallback=True)
+                       provider=provider, fallback=True, **extra)
     status, error, words = KEY_FAILURES.get(code, KEY_FAILURES["not_set"])
-    return refusal(status, error, words, provider=provider, fallback=True)
+    return refusal(status, error, words, provider=provider, fallback=True, **extra)
 
 
 def _end(meter: vmeter.Meter, reservation_id: int, release: bool) -> None:
@@ -732,8 +732,45 @@ def stream_chunk_precheck(registry: stream_session.StreamRegistry, query: str, o
     return None
 
 
-def stream_chunk(registry: stream_session.StreamRegistry, query: str, owner: str, pcm: bytes) -> Answer:
-    """``POST /cockpit/voice/stream/chunk?sid=&seq=``: ``{"seq", "partial", "final"}`` for the next PCM chunk."""
+# How often a live session re-asks whether a revoke still reaches its key and the key is still granted, in seconds of
+# SESSION time (the chunk that finds it due does the check; chunks in between do not touch the authority log). The check
+# is two fresh replays of the log (_stream_revoked); measured on this repo's rig in
+# tests/test_cockpit_voice_stream_routes.py::test_one_revoke_check_costs_little_enough_for_the_cadence. 2 s plus one
+# 250 ms chunk puts the end of a revoked session under 3 s.
+STREAM_REVOKE_RECHECK_S = 2.0
+
+
+def _stream_revoked(provider: str, data_root: Path | str, revoke_queue: Path | str | None) -> Answer | None:
+    """None while the session may go on; else the refusal, marked ``revoked`` so the page stops for good. The checks are
+    the open path's, minus the secret: the voice key record for ``provider`` still lists ``stt`` (a revoked key or
+    grant is gone from a fresh replay; the log failing to replay is a refusal too, as at open), and some revoke still
+    reaches it (:func:`revoke_refusal`). The key itself is not read."""
+    key_code = ""
+    try:
+        record = voice_key_for(custody.authority_for(data_root)().policy.grants, provider)
+        if record is None:
+            key_code = "not_set"
+        elif "stt" not in record["uses"]:
+            key_code = "use_not_granted"
+    except Exception as exc:     # noqa: BLE001 - a log that could not be replayed fails closed, in its own words
+        _log.warning("voice stream: the key record could not be checked (%s); the dictation ends", type(exc).__name__)
+        key_code = "authority_unreadable"
+    if key_code:
+        return _key_refusal(key_code, provider, "stt", revoked=True)
+    reach = revoke_refusal(revoke_queue, data_root)
+    if reach is not None:
+        return refusal(503, reach, reach, fallback=True, revoked=True)
+    return None
+
+
+def stream_chunk(registry: stream_session.StreamRegistry, query: str, owner: str, pcm: bytes, *,
+                 data_root: Path | str, revoke_queue: Path | str | None) -> Answer:
+    """``POST /cockpit/voice/stream/chunk?sid=&seq=``: ``{"seq", "partial", "final"}`` for the next PCM chunk.
+
+    Every :data:`STREAM_REVOKE_RECHECK_S` seconds of session time the chunk first re-asks the open path's revoke
+    question (:func:`_stream_revoked`). A revoked key, grant or revoke path ends the session through its normal end (the
+    provider stream closed, the meter settled) and the chunk is answered with the open path's fixed words plus
+    ``"revoked": true``; its audio is never sent."""
     got = _stream_query(query, ("sid", "seq"))
     sid = _stream_sid(got) if got is not None else None
     if got is None or sid is None:
@@ -744,7 +781,13 @@ def stream_chunk(registry: stream_session.StreamRegistry, query: str, owner: str
     seq = int(raw_seq)
     code, update = "", None
     try:
-        update = registry.get(sid, owner).feed(seq, pcm)
+        session = registry.get(sid, owner)
+        if session.revoke_check_due(STREAM_REVOKE_RECHECK_S):
+            stopped = _stream_revoked(session.provider, data_root, revoke_queue)
+            if stopped is not None:
+                session.end_revoked()
+                return stopped
+        update = session.feed(seq, pcm)
     except stream_session.StreamRefused as exc:
         code = exc.code
     if update is None:
