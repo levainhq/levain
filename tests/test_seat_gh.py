@@ -489,7 +489,8 @@ def test_the_git_child_gets_a_rebuilt_environment_and_the_token_is_in_no_argumen
         assert env["HOME"] != os.environ["HOME"] and "GH_TOKEN" not in env and "SSH_AUTH_SOCK" not in env
     argv = fetch_calls[0][0]
     assert "credential.helper=" in argv and "credential.useHttpPath=true" in argv and "http.followRedirects=false" in argv
-    assert any(a.startswith("credential.https://github.com.helper=!") and "levain.seat_gh credential-helper" in a for a in argv)
+    assert any(a.startswith("credential.https://github.com.helper=!") and "import levain.seat_gh as g" in a
+               and " credential-helper --home " in a for a in argv)
     assert argv[-2:] == [f"file://{upstream}levainhq/levain.git", "+refs/heads/*:refs/heads/*"] or argv[-1] == "+refs/heads/*:refs/heads/*"
     assert TOKEN_L not in log_text(home)
 
@@ -639,3 +640,171 @@ def test_git_fetch_scrubs_a_token_that_appears_in_a_branch_name(home, upstream):
     git("--git-dir", f"{upstream}levainhq/levain.git", "branch", TOKEN_L, "main")
     out = fetch(home, upstream)
     assert TOKEN_L not in out and "[token]" in out
+
+
+
+# --- L3 z2b r1 fixes ----------------------------------------------------------------------------------------------------
+
+def _run_helper_command(cmd: str, env: dict, req: str) -> subprocess.CompletedProcess:
+    """Run a ``credential.<url>.helper`` value the way git does: ``!`` stripped, through ``sh -c`` with the action."""
+    assert cmd.startswith("!")
+    return subprocess.run(["/bin/sh", "-c", cmd[1:] + " get"], input=req, capture_output=True, text=True, env=env, cwd="/")
+
+
+def test_the_helper_imports_under_gits_empty_home_with_a_user_site_install(home, tmp_path):
+    """L3 z2b r1 codex 2. A ``pip install --user`` levain is found through the user site Python derives from HOME; git
+    runs the helper with a fresh empty HOME. Revert: ``_helper_command`` back to ``-m levain.seat_gh`` (the helper then
+    cannot import under the empty HOME and answers nothing)."""
+    both(home)
+    py = os.path.realpath(getattr(sys, "_base_executable", sys.executable))   # outside any venv: the user site is on
+    fake_home = tmp_path / "userhome"
+    fake_home.mkdir()
+    probe = subprocess.run([py, "-EP", "-c", "import site; print(site.getusersitepackages())"], capture_output=True,
+                           text=True, env={"PATH": "/usr/bin:/bin", "HOME": str(fake_home)}, cwd="/")
+    if probe.returncode or not probe.stdout.strip():
+        pytest.skip("this interpreter has no user site")
+    user_site = Path(probe.stdout.strip())
+    user_site.mkdir(parents=True)
+    (user_site / "levain").symlink_to(Path(g.__file__).resolve().parent)        # the --user install's shape
+    empty = tmp_path / "empty"
+    empty.mkdir()
+    imp = [py, "-EP", "-B", "-c", "import levain.seat_gh"]
+    if subprocess.run(imp, env={"PATH": "/usr/bin:/bin", "HOME": str(empty)}, capture_output=True, cwd="/").returncode == 0:
+        pytest.skip("this interpreter imports a levain without the user site; the user-site case cannot be shown")
+    assert subprocess.run(imp, env={"PATH": "/usr/bin:/bin", "HOME": str(fake_home)}, capture_output=True,
+                          cwd="/").returncode == 0                              # the install is real under its HOME
+    req = "protocol=https\nhost=github.com\npath=levainhq/levain.git\n\n"
+    r = _run_helper_command(g._helper_command(py, home), g._git_env(str(empty), "https"), req)
+    assert r.returncode == 0 and r.stdout == f"username=x-access-token\npassword={TOKEN_L}\n", r.stderr
+    old = "!" + " ".join([py, "-EP", "-B", "-m", "levain.seat_gh", "credential-helper", "--home", str(home)])
+    assert _run_helper_command(old, g._git_env(str(empty), "https"), req).stdout == ""   # the defect, shown
+
+
+def test_a_fetch_into_a_mirror_another_fetch_holds_refuses_with_fixed_words(home, upstream, monkeypatch):
+    """L3 z2b r1 codex 3. Revert: the ``_flock(... R_BUSY)`` around the mirror work in ``git_fetch`` (the fetch then
+    runs into the held mirror and returns)."""
+    import fcntl
+    both(home)
+    parent = g._mirror_parent(home, "levainhq/levain")
+    fd = os.open(parent / ".levain.lock", os.O_RDWR | os.O_CREAT, 0o600)
+    fcntl.flock(fd, fcntl.LOCK_EX)
+    monkeypatch.setattr(g, "LOCK_TIMEOUT", 0.3)
+    try:
+        with pytest.raises(g.GhRefused) as e:
+            fetch(home, upstream)
+        assert str(e.value) == g.R_BUSY
+    finally:
+        os.close(fd)
+    assert "main" in fetch(home, upstream)                                     # released: the next one runs
+
+
+def test_concurrent_fetches_into_one_mirror_all_land(home, upstream):
+    """L3 z2b r1 codex 3 / deepseek 1: four fetches at once, each through its own lock descriptor, all succeed."""
+    both(home)
+    results, errors = [], []
+
+    def one():
+        try:
+            results.append(fetch(home, upstream))
+        except Exception as exc:  # noqa: BLE001
+            errors.append(repr(exc))
+    threads = [threading.Thread(target=one) for _ in range(4)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(60)
+    assert errors == [] and len(results) == 4
+    assert not [n for n in os.listdir(home / "gh_mirror" / "levainhq" / "levain.git") if n.startswith("config.levain-tmp")]
+
+
+def test_an_os_error_in_the_mirror_work_is_a_fixed_refusal_and_a_row(home, upstream, monkeypatch):
+    """Revert: the ``except OSError`` around the mirror work in ``git_fetch`` (a bare OSError then escapes)."""
+    both(home)
+
+    def boom(*a, **k):
+        raise OSError(28, "No space left on device")
+    monkeypatch.setattr(g.tempfile, "mkstemp", boom)
+    with pytest.raises(g.GhRefused) as e:
+        fetch(home, upstream)
+    assert str(e.value) == g.R_FETCH and '"outcome": "refused"' in log_text(home)
+
+
+def _break_the_audit(home):
+    (home / "push").write_text("not a directory\n")        # the audit directory cannot be made: every append fails
+
+
+def test_gh_read_fails_closed_when_the_audit_cannot_be_written(home, fake):
+    """L3 z2b r1 codex 4. Revert: the intent ``_audit`` in ``gh_read`` back to the best-effort ``_log`` (the read then
+    goes out with no record)."""
+    both(home)
+    _break_the_audit(home)
+    with pytest.raises(g.GhRefused) as e:
+        g.gh_read(home, "/repos/levainhq/levain", api_base=fake.base, now=NOW)
+    assert str(e.value) == g.R_AUDIT and fake.requests == []                  # the credential was never used
+
+
+def test_git_fetch_fails_closed_when_the_audit_cannot_be_written(home, upstream):
+    """Revert: the intent ``_audit`` in ``git_fetch`` back to ``_log``."""
+    both(home)
+    _break_the_audit(home)
+    with pytest.raises(g.GhRefused) as e:
+        fetch(home, upstream)
+    assert str(e.value) == g.R_AUDIT and not (home / "gh_mirror").exists()
+
+
+def test_the_intent_is_written_before_the_token_is_read(home, fake, monkeypatch):
+    """Revert: the intent ``_audit`` moved after ``_live_token`` (the record would not precede the credential's use)."""
+    both(home)
+    order = []
+    real_audit, real_live = g._audit, g._live_token
+    monkeypatch.setattr(g, "_audit", lambda h, row: (order.append(row["outcome"]), real_audit(h, row))[1])
+    monkeypatch.setattr(g, "_live_token", lambda *a: (order.append("token"), real_live(*a))[1])
+    g.gh_read(home, "/repos/levainhq/levain", api_base=fake.base, now=NOW)
+    assert order == ["intent", "token", "read"]
+
+
+def test_a_killed_set_leaves_no_credential_after_the_next_set_or_clear(home):
+    """L3 z2b r1 codex 5. Revert: ``_sweep_temporaries`` in ``clear_token`` / ``_write_record``."""
+    both(home)
+    d = home / g.TOKEN_DIR
+    stale = d / f"{g._tmp_prefix('levainhq')}abc123"
+    stale.write_text(json.dumps({"token": TOKEN_L}))
+    os.chmod(stale, 0o600)
+    assert g.clear_token(home, "levainhq") is True and not stale.exists()
+    stale.write_text("x")
+    assert g.clear_token(home, "levainhq") is True and not stale.exists()     # only a temporary: still removed
+    stale.write_text("x")
+    install(home)
+    assert not stale.exists()
+    assert [n for n in os.listdir(d) if ".tmp." in n] == []
+
+
+def test_a_failed_write_leaves_no_temporary(home, monkeypatch):
+    """Revert: the ``finally`` unlink in ``_write_record``."""
+    def boom(*a, **k):
+        raise OSError(5, "I/O error")
+    monkeypatch.setattr(g.os, "replace", boom)
+    with pytest.raises(OSError):
+        install(home)
+    assert [n for n in os.listdir(home / g.TOKEN_DIR) if ".tmp." in n] == []
+
+
+def test_the_logged_path_is_capped_and_scrubbed(home, fake):
+    """L3 z2b r1 complement 2 / codex 10. Revert: ``_log_field`` in ``gh_read``'s base row (the raw path is logged)."""
+    both(home)
+    with pytest.raises(g.GhRefused):
+        g.gh_read(home, "/repos/evil/x" + "a" * 50_000, api_base=fake.base, now=NOW)
+    g.gh_read(home, "/repos/levainhq/levain/contents/github_pat_" + "Z" * 30, api_base=fake.base, now=NOW)
+    rows = [json.loads(line) for line in log_text(home).splitlines()]
+    assert max(len(r.get("path") or "") for r in rows) <= 200
+    assert "github_pat_" not in log_text(home)
+
+
+def test_the_server_refuses_an_oversized_frame_and_keeps_serving(home):
+    """L3 z2b r1 codex 9. Revert: the ``MAX_FRAME`` read in ``serve`` (the frame is buffered whole)."""
+    import io as _io
+    big = '{"jsonrpc":"2.0","id":1,"method":"ping","params":{"x":"' + "a" * (mcp.MAX_FRAME + 10) + '"}}\n'
+    out = _io.StringIO()
+    mcp.serve(str(home), _io.StringIO(big + '{"jsonrpc":"2.0","id":2,"method":"ping"}\n'), out)
+    first, second = [json.loads(line) for line in out.getvalue().splitlines()]
+    assert first["error"]["message"] == "frame too large" and second == {"jsonrpc": "2.0", "id": 2, "result": {}}

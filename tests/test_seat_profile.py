@@ -49,7 +49,9 @@ def test_builds_and_shapes(rig):
     assert sb["network"]["allowedDomains"] == []
     assert sb["filesystem"]["allowWrite"] == [str(base / "lane"), str(base / "ret")]
     gh_dir = str(Path(os.path.realpath(os.environ["TMPDIR"])) / sp.CANARY_DIRNAME / "levain-home" / "seat_gh")
-    assert sb["filesystem"]["denyRead"] == [str(keys), gh_dir]     # the read-token directory, as the key directory is
+    real_gh = str(Path(os.path.realpath(sp.real_levain_home(os.environ))) / "seat_gh")
+    # the read-token directory, as the key directory is: the canary server's own AND the real one (L3 z2b r1 HIGH)
+    assert sb["filesystem"]["denyRead"] == [str(keys), gh_dir, real_gh]
     assert s["permissions"]["defaultMode"] == "acceptEdits"
     assert s["includeGitInstructions"] is False and s["autoMemoryEnabled"] is False
     assert hg.check_sandbox_types(sb) == []
@@ -178,10 +180,11 @@ def test_lease_paths_checked(rig, tmp_path):
     base, keys, _ = rig
     lease = {"kind": sp.SEAT_LEASE_KIND, "agent": "claude_code", "lanes_parent": str(base),
              "returns_parent": str(base)}
-    assert build(rig, lease=lease, canary_root=None).clone == base / "lane"
+    home = tmp_path / "lhome"
+    assert build(rig, lease=lease, canary_root=None, levain_home=home).clone == base / "lane"
     bad = {**lease, "lanes_parent": str(tmp_path / "nope")}
     with pytest.raises(sp.SeatRefusal, match="lanes_parent"):
-        build(rig, lease=bad, canary_root=None)
+        build(rig, lease=bad, canary_root=None, levain_home=home)
 
 
 def test_refuses_writable_executable(rig):

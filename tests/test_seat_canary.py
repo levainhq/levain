@@ -24,8 +24,11 @@ def attempt(**kw):
     return {**base, **kw}
 
 
+GH = ("mcp__levain_gh__gh_read", "mcp__levain_gh__git_fetch")
+
+
 def init(**kw):
-    base = {"tools": list(CC_SEAT_TOOLS), "mcp_servers": [{"name": "levain_gh", "status": "connected"}], "plugins": [], "permissionMode": "acceptEdits",
+    base = {"tools": [*CC_SEAT_TOOLS, *GH], "mcp_servers": [{"name": "levain_gh", "status": "connected"}], "plugins": [], "permissionMode": "acceptEdits",
             "claude_code_version": "2.1.319"}
     return {**base, **kw}
 
@@ -67,7 +70,7 @@ def judge_for(pid, evidence):
     if pid != "P9":
         return sc.judge(evidence)
     evidence = copy.deepcopy(evidence)
-    evidence["P0"]["init"]["tools"] = list(WITH_NB)
+    evidence["P0"]["init"]["tools"] = [*WITH_NB, *GH]
     return sc.judge(evidence, WITH_NB)
 
 
@@ -226,7 +229,7 @@ def test_init_event_accepts_exactly_the_terminal_tool_set():
                                    [*CC_SEAT_TOOLS, "Agent"], [*CC_SEAT_TOOLS, "TodoWrite"], [*CC_SEAT_TOOLS, "Skill"],
                                    [*CC_SEAT_TOOLS, "NotebookEdit"], [t for t in CC_SEAT_TOOLS if t != "Grep"]])
 def test_init_event_rejects_an_extra_or_missing_tool(tools):
-    assert sc.check_seat_init(init(tools=tools)).status == "fail"
+    assert sc.check_seat_init(init(tools=[*tools, *GH])).status == "fail"
 
 
 def test_init_event_rejects_an_mcp_server_and_other_modes():
@@ -239,6 +242,7 @@ def test_init_event_rejects_an_mcp_server_and_other_modes():
     assert sc.check_seat_init(init(mcp_servers=[gh, {"name": "planted", "status": "connected"}])).status == "fail"
     assert sc.check_seat_init(init(mcp_servers=[{"name": "levain_gh", "status": "failed"}])).status == "fail"
     assert sc.check_seat_init(init(tools=[*CC_SEAT_TOOLS, "mcp__levain_gh__gh_read", "mcp__levain_gh__git_fetch"])).status == "pass"
+    assert sc.GH_TOOL_ALLOW == GH
     assert sc.check_seat_init(init(permissionMode="bypassPermissions")).status == "fail"
     assert sc.check_seat_init("not an object").status == "fail"
 
@@ -565,7 +569,7 @@ def _run(tmp_path, monkeypatch, *, tools=CC_SEAT_TOOLS, edit_turn=None, swap_att
             nb = cwd / f"nb-ctl-{nonce}.ipynb"
             nb.write_text(nb.read_text(encoding="utf-8").replace("original", "edited"), encoding="utf-8")
         t = make_turn(plan, nonce, cmd)
-        t.init["tools"] = list(tools)
+        t.init["tools"] = [*tools, *GH]
         if edit_turn:
             edit_turn(t, plan, cwd)
         return t
@@ -806,3 +810,14 @@ def _timed_out_turn():
     t = _Turn()
     t.timed_out = True
     return t
+
+
+def test_init_event_compares_the_levain_gh_tools_exactly():
+    """L3 z2b r1 codex 6. Revert: the ``mcp != sorted(GH_TOOL_ALLOW)`` clause of ``check_seat_init``: a connected
+    levain_gh advertising zero tools, one of the two, or an extra ``mcp__levain_gh__*`` tool then passes P0."""
+    assert sc.check_seat_init(init()).status == "pass"
+    for tools in ([*CC_SEAT_TOOLS], [*CC_SEAT_TOOLS, GH[0]], [*CC_SEAT_TOOLS, *GH, "mcp__levain_gh__shell"],
+                  [*CC_SEAT_TOOLS, *GH, GH[0]]):
+        c = sc.check_seat_init(init(tools=tools))
+        assert c.status == "fail" and "MCP tools" in c.evidence, tools
+    assert status(ev(**{"P0.init": init(tools=[*CC_SEAT_TOOLS])}), "P0") == "fail"

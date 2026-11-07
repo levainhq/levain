@@ -124,18 +124,33 @@ def _error(rid: Any, code: int, message: str) -> dict[str, Any]:
     return {"jsonrpc": "2.0", "id": rid, "error": {"code": code, "message": message}}
 
 
+#: The longest frame read (L3 z2b r1 codex 9): a longer line is drained to its newline and answered as a parse error,
+#: never buffered whole (a seat's oversized argument would otherwise grow the server without bound).
+MAX_FRAME = 1_000_000
+
+
 def serve(home: str, stdin: Any = None, stdout: Any = None) -> None:
     stdin = stdin if stdin is not None else sys.stdin
     stdout = stdout if stdout is not None else sys.stdout
-    for raw in stdin:
-        if not raw.strip():
+    while True:
+        raw = stdin.readline(MAX_FRAME + 1)
+        if not raw:
+            break
+        if len(raw) > MAX_FRAME and not raw.endswith("\n"):
+            while True:                                  # drain the rest of the oversized frame
+                more = stdin.readline(MAX_FRAME + 1)
+                if not more or more.endswith("\n"):
+                    break
+            reply: dict[str, Any] | None = _error(None, PARSE_ERROR, "frame too large")
+        elif not raw.strip():
             continue
-        try:
-            msg = json.loads(raw)
-        except (ValueError, RecursionError):
-            reply: dict[str, Any] | None = _error(None, PARSE_ERROR, "parse error")
         else:
-            reply = handle(home, msg)
+            try:
+                msg = json.loads(raw)
+            except (ValueError, RecursionError):
+                reply = _error(None, PARSE_ERROR, "parse error")
+            else:
+                reply = handle(home, msg)
         if reply is not None:
             stdout.write(json.dumps(reply, ensure_ascii=True) + "\n")
             stdout.flush()

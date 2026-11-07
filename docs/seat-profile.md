@@ -79,7 +79,11 @@ checks it with a GET of the repository from this host and records a fingerprint 
 `levain seat gh-token clear --owner <owner>` and `levain seat gh-token status`. An absent or expired token makes the
 tool answer one fixed sentence and stop: there is no fallback to `gh`'s own login, the keychain, `GH_TOKEN` or an ssh
 agent. The token is never in an argument, an environment the seat can see, a log or a returned text (anything
-token-shaped is replaced by `[token]`). Each call leaves one line in `push/seat_gh.jsonl`.
+token-shaped is replaced by `[token]`). A call that reaches a token writes an intent line to `push/seat_gh.jsonl`
+before the token is read and an outcome line after. If either line cannot be written, the call is refused and returns
+nothing. A call refused earlier, for a path or repository outside the list, is logged when the log can be written.
+`<levain home>/seat_gh/` is denied to every seat, with or without a seat-egress grant. Fetches into one mirror run one
+at a time.
 
 ### Hooks the profile installs
 

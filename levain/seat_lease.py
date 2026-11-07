@@ -462,8 +462,10 @@ def prepare_launch(lane_key: str, remote_url: str, base_sha: str, *, claude_bin:
                 egress = seat_push.live_egress(state, clock())
             except seat_push.SeatPushRefused as exc:
                 raise SeatLaunchRefused(str(exc)) from None
-        if egress is not None:
-            profile_kw = {"cockpit_root": cockpit_root, "levain_home": Path(os.path.abspath(_levain_home())), **profile_kw}
+        # the levain home ALWAYS (L3 z2b r1 HIGH): the profile denies its read-token directory to the seat and the
+        # levain_gh server reads it, with or without an egress grant; the cockpit root only the egress hook reads
+        profile_kw = {"levain_home": Path(os.path.abspath(_levain_home())),
+                      **({"cockpit_root": cockpit_root} if egress is not None else {}), **profile_kw}
         profile = build_seat_profile(clone, return_dir, claude_bin=claude_bin, python=python, lease=lease,
                                      key_dir=key_dir, egress=egress, **profile_kw)
         row = {**row, "profile_digest": profile.digest(), "claude": _binary_ident(claude_bin),
@@ -530,8 +532,10 @@ def validate_launch(lane_key: str, remote_url: str, base_sha: str, *, claude_bin
                 egress = seat_push.live_egress(state, clock())
             except seat_push.SeatPushRefused as exc:
                 raise SeatLaunchRefused(str(exc)) from None
-        if egress is not None:
-            profile_kw = {"cockpit_root": cockpit_root, "levain_home": Path(os.path.abspath(_levain_home())), **profile_kw}
+        # the levain home ALWAYS (L3 z2b r1 HIGH): the profile denies its read-token directory to the seat and the
+        # levain_gh server reads it, with or without an egress grant; the cockpit root only the egress hook reads
+        profile_kw = {"levain_home": Path(os.path.abspath(_levain_home())),
+                      **({"cockpit_root": cockpit_root} if egress is not None else {}), **profile_kw}
         for parent in (lanes, returns):
             made.append(Path(tempfile.mkdtemp(prefix=".dry-run-", dir=parent)))
         os.mkdir(made[0] / ".git", 0o700)   # a clone's own .git, which the profile requires to be a real directory

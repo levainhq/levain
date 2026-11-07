@@ -20,7 +20,10 @@ different owners (Z2B_FRAME section 2). An absent, expired or unreadable token i
 verb stops: there is no fallback to ``gh``'s hosts.yml, the keychain, ``GH_TOKEN`` in the environment or an ssh agent.
 Every refusal is fixed words (the seat reads them and learns nothing about the token store).
 
-Every call leaves one line in ``<home>/push/seat_gh.jsonl`` (verb, repository, outcome, status); it never holds a token.
+Every call that reaches the credential leaves an ``intent`` line in ``<home>/push/seat_gh.jsonl`` BEFORE the token is
+read, and an outcome line after (verb, repository, outcome, status); it never holds a token. The record fails CLOSED: an
+intent or outcome line that cannot be written refuses the call (:data:`R_AUDIT`) and returns nothing read. A call refused
+before the credential (a path or repository outside the allowlist) is logged best-effort.
 
 Known edges (one line each): the token's own expiry is the one the operator recorded (or GitHub's response header gave)
 and is enforced here, but GitHub revokes a token on its side first when the operator deletes it; a mirror fetch that is
@@ -29,6 +32,8 @@ killed mid-way leaves a half-updated mirror that the next fetch repairs (git's o
 from __future__ import annotations
 
 import base64
+import contextlib
+import fcntl
 import getpass
 import hashlib
 import http.client
@@ -92,6 +97,10 @@ R_TOKEN_EXPIRED = "levain_gh refuses: the read token for that repository's owner
 R_TOKEN_BAD = "levain_gh refuses: the read token for that repository's owner cannot be used."
 R_TRANSPORT = "levain_gh could not reach GitHub."
 R_FETCH = "levain_gh: the fetch into the mirror failed."
+R_BUSY = "levain_gh: another fetch into that mirror is still running; try again."
+R_AUDIT = "levain_gh refuses: its audit record cannot be written, so nothing is read."
+LOCK_TIMEOUT = FETCH_TIMEOUT + 120
+_LOG_FIELD_MAX = 200
 
 _TOKEN_RE = re.compile(r"[A-Za-z0-9_]{20,255}")
 # the shapes GitHub issues, scrubbed from anything returned even when it is not the token on file
@@ -229,27 +238,97 @@ def _live_token(home: Path | str, owner: str, now: datetime) -> str:
     return rec["token"]
 
 
+@contextlib.contextmanager
+def _flock(path: Path, *, timeout: float, busy: str):
+    """An exclusive ``flock`` on ``path`` (created 0600, never through a link), held for the ``with`` body: the one
+    cross-process serialisation for a token owner or a mirror. Waits up to ``timeout`` seconds, then :class:`GhRefused`
+    ``busy``; a lock file that cannot be opened is ``busy`` too (fixed words, never a bare OSError)."""
+    try:
+        fd = os.open(path, os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, 0o600)
+    except OSError:
+        raise GhRefused(busy) from None
+    try:
+        deadline = time.monotonic() + timeout
+        while True:
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                break
+            except BlockingIOError:
+                if time.monotonic() >= deadline:
+                    raise GhRefused(busy) from None
+                time.sleep(0.1)
+            except OSError:
+                raise GhRefused(busy) from None
+        yield
+    finally:
+        os.close(fd)                                    # closing the descriptor releases the lock
+
+
+def _tmp_prefix(owner: str) -> str:
+    return f".{owner}.tmp."
+
+
+def _sweep_temporaries(d: Path, owner: str) -> int:
+    """Remove the owner's leftover temporaries (a ``set`` killed between write and rename leaves one holding the
+    credential); the caller holds the owner's lock. Returns how many were removed."""
+    n = 0
+    try:
+        names = os.listdir(d)
+    except FileNotFoundError:
+        return 0
+    for name in names:
+        if name.startswith(_tmp_prefix(owner)):
+            try:
+                os.unlink(d / name)
+                n += 1
+            except FileNotFoundError:
+                pass
+    return n
+
+
 def _write_record(home: Path | str, owner: str, token: str, expires: datetime) -> None:
+    """The record, written whole and 0600 under the owner's lock: a unique ``O_EXCL`` temporary (never a reused name),
+    fsynced, renamed over the record, the directory fsynced; the temporary is removed on any failure, and a leftover
+    from a killed earlier ``set`` is swept first."""
     d = token_dir(home)
     Path(home).mkdir(parents=True, exist_ok=True)
     _private_dir(d)
     rec = {"v": 1, "owner": owner, "fingerprint": token_fingerprint(token), "expires_at": expires.isoformat(),
            "token": token}
-    tmp = d / f".{owner}.{os.getpid()}"
-    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW, 0o600)
-    with os.fdopen(fd, "w", encoding="utf-8") as fh:
-        fh.write(json.dumps(rec, sort_keys=True) + "\n")
-    os.replace(tmp, d / owner)
+    with _flock(d / f".{owner}.lock", timeout=30, busy=R_TOKEN_BAD):
+        _sweep_temporaries(d, owner)
+        fd, tmp = tempfile.mkstemp(prefix=_tmp_prefix(owner), dir=d)
+        try:
+            os.fchmod(fd, 0o600)
+            with os.fdopen(fd, "w", encoding="utf-8") as fh:
+                fh.write(json.dumps(rec, sort_keys=True) + "\n")
+                fh.flush()
+                os.fsync(fh.fileno())
+            os.replace(tmp, d / owner)
+            dfd = os.open(d, os.O_RDONLY)
+            try:
+                os.fsync(dfd)
+            finally:
+                os.close(dfd)
+        finally:
+            with contextlib.suppress(FileNotFoundError):
+                os.unlink(tmp)
 
 
 def clear_token(home: Path | str, owner: str) -> bool:
-    """Delete the owner's token file; True when one was there. The next verb for that owner refuses."""
+    """Delete the owner's token file and any leftover temporary of a killed ``set``; True when either was there. The
+    next verb for that owner refuses."""
     if owner not in OWNERS:
         raise GhRefused(R_REPO)
-    try:
-        os.unlink(token_dir(home) / owner)
-    except FileNotFoundError:
+    d = token_dir(home)
+    if not os.path.isdir(d) or os.path.islink(d):
         return False
+    with _flock(d / f".{owner}.lock", timeout=30, busy=R_TOKEN_BAD):
+        swept = _sweep_temporaries(d, owner)
+        try:
+            os.unlink(d / owner)
+        except FileNotFoundError:
+            return swept > 0
     return True
 
 
@@ -308,21 +387,33 @@ def _get(base_url: str, target: str, token: str) -> tuple[int, dict[str, str], s
     return status, headers, raw.decode("utf-8", errors="replace")
 
 
-def _log(home: Path | str, row: dict[str, Any]) -> None:
-    """One line in ``<home>/push/seat_gh.jsonl``; never a token (rows are built from fixed fields only). A record that
-    cannot be written is dropped, never raised."""
+def _log_field(value: Any) -> str | None:
+    """A seat-supplied string as the log holds it: capped and scrubbed of token-shaped text; anything else is None."""
+    return scrub(value[:_LOG_FIELD_MAX]) if isinstance(value, str) else None
+
+
+def _audit(home: Path | str, row: dict[str, Any]) -> None:
+    """One line in ``<home>/push/seat_gh.jsonl``, or :class:`GhRefused` :data:`R_AUDIT` (fail closed): the intent line is
+    written before the credential is read and the outcome line before anything read is returned. Never a token (rows
+    are fixed fields plus capped, scrubbed seat strings)."""
     try:
         push._private_dir(Path(home) / "push")
         push.append_line(Path(home) / "push" / LOG_NAME, {**row, "at": time.time()})
     except Exception:  # noqa: BLE001
-        pass
+        raise GhRefused(R_AUDIT) from None
+
+
+def _log(home: Path | str, row: dict[str, Any]) -> None:
+    """A refusal's line, best-effort: the call is refused already, so a record that cannot be written changes nothing."""
+    with contextlib.suppress(GhRefused):
+        _audit(home, row)
 
 
 def gh_read(home: Path | str, path: Any, query: Any = None, *, method: str = "GET", api_base: str = API_BASE,
             now: datetime | None = None) -> tuple[int, str]:
     """GET ``path`` (+ ``query``) from GitHub's API as the path's owner. Returns ``(status, scrubbed body)``; raises
     :class:`GhRefused` (fixed words) for anything outside the allowlist or a token that is absent or expired."""
-    base: dict[str, Any] = {"verb": "gh_read", "path": path if isinstance(path, str) else None}
+    base: dict[str, Any] = {"verb": "gh_read", "path": _log_field(path)}
     try:
         if method != "GET":
             raise GhRefused(R_METHOD)
@@ -330,11 +421,12 @@ def gh_read(home: Path | str, path: Any, query: Any = None, *, method: str = "GE
         if problem:
             raise GhRefused(problem)
         repo = _PATH.fullmatch(path).group(1)               # type: ignore[union-attr]  # path_refusal vouched for it
+        _audit(home, {**base, "outcome": "intent"})         # BEFORE the credential is read (fail closed)
         token = _live_token(home, REPOS[repo], now or _now())
         target = path + (("?" + urlencode(sorted((str(k), str(v)) for k, v in query.items()))) if query else "")
         status, _headers, body = _get(api_base, target, token)
         body = scrub(body[:MAX_BODY], (token,))
-        _log(home, {**base, "outcome": "read", "status": status})
+        _audit(home, {**base, "outcome": "read", "status": status})
         return status, body
     except GhRefused as exc:
         _log(home, {**base, "outcome": "refused", "detail": str(exc)[:200]})
@@ -348,8 +440,25 @@ def mirror_path(home: Path | str, repo: str) -> Path:
     return Path(home) / MIRROR_DIR / owner / f"{name}.git"
 
 
-def _helper_command(python: str, home: Path | str) -> str:
-    return "!" + " ".join([shlex.quote(python), "-EP", "-B", "-m", "levain.seat_gh", "credential-helper",
+#: The helper's bootstrap (L3 z2b r1 codex 2): it loads THIS levain package from its absolute directory, so the helper
+#: imports under git's fresh empty HOME (a ``pip install --user`` levain lives in a user site Python derives from HOME,
+#: and ``-m levain.seat_gh`` found nothing there). No ``sys.path`` entry is added: the package alone is loaded by path
+#: and its imports are the standard library's. ``{pkg!r}`` is the only substitution.
+_HELPER_BOOT = ("import importlib.util as u,sys;p={pkg!r};"
+                "s=u.spec_from_file_location('levain',p+'/__init__.py',submodule_search_locations=[p]);"
+                "m=u.module_from_spec(s);sys.modules['levain']=m;s.loader.exec_module(m);"
+                "import levain.seat_gh as g;sys.exit(g.main())")
+
+
+def _package_dir() -> str:
+    return str(Path(__file__).resolve().parent)
+
+
+def _helper_command(python: str, home: Path | str, pkg_dir: str | None = None) -> str:
+    """git's ``credential.<url>.helper``: the absolute interpreter, ``-EP -B -c`` the bootstrap that loads this package
+    by its absolute path (independent of HOME, the user site and the cwd), then ``credential-helper --home <dir>``."""
+    boot = _HELPER_BOOT.format(pkg=pkg_dir or _package_dir())
+    return "!" + " ".join([shlex.quote(python), "-EP", "-B", "-c", shlex.quote(boot), "credential-helper",
                            "--home", shlex.quote(str(home))])
 
 
@@ -370,11 +479,19 @@ def _git_env(home_dir: str, scheme: str) -> dict[str, str]:
             "GIT_NO_REPLACE_OBJECTS": "1", "GIT_ALLOW_PROTOCOL": scheme}
 
 
-def _ensure_mirror(git: str, home: Path | str, repo: str, env: dict[str, str]) -> Path:
+def _mirror_parent(home: Path | str, repo: str) -> Path:
+    """``<home>/gh_mirror/<owner>``, made 0700 (the mirror's lock file lives here, Levain-owned, outside the mirror)."""
     m = mirror_path(home, repo)
     Path(home).mkdir(parents=True, exist_ok=True)
     _private_dir(Path(home) / MIRROR_DIR)
     _private_dir(m.parent)
+    return m.parent
+
+
+def _ensure_mirror(git: str, home: Path | str, repo: str, env: dict[str, str]) -> Path:
+    """The bare mirror, its hooks removed and its config rewritten; the caller holds the mirror's lock."""
+    m = mirror_path(home, repo)
+    _mirror_parent(home, repo)
     if not os.path.lexists(m):
         r = subprocess.run([git, "init", "--quiet", "--bare", "--template=", str(m)], env=env, cwd="/",
                            stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=60)
@@ -388,11 +505,14 @@ def _ensure_mirror(git: str, home: Path | str, repo: str, env: dict[str, str]) -
             os.unlink(hooks)
         else:
             shutil.rmtree(hooks)
-    tmp = m / "config.levain-tmp"
-    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW, 0o600)
-    with os.fdopen(fd, "w") as fh:
-        fh.write(push.MIRROR_CONFIG)
-    os.replace(tmp, m / "config")
+    fd, tmp = tempfile.mkstemp(prefix="config.levain-tmp.", dir=m)
+    try:
+        with os.fdopen(fd, "w") as fh:
+            fh.write(push.MIRROR_CONFIG)
+        os.replace(tmp, m / "config")
+    finally:
+        with contextlib.suppress(FileNotFoundError):
+            os.unlink(tmp)
     return m
 
 
@@ -401,33 +521,42 @@ def git_fetch(home: Path | str, repo: Any, *, git_base: str = GIT_BASE, python: 
     """Fetch every branch of the allowed repository ``repo`` into its Levain-owned bare mirror as the repository's
     owner, and return the mirror path and its branch tips (scrubbed). The token is checked FIRST: an absent or expired one
     refuses before any git runs."""
-    base: dict[str, Any] = {"verb": "git_fetch", "repo": repo if isinstance(repo, str) else None}
+    base: dict[str, Any] = {"verb": "git_fetch", "repo": _log_field(repo)}
     try:
         if not isinstance(repo, str) or repo not in REPOS:
             raise GhRefused(R_REPO)
-        token = _live_token(home, REPOS[repo], now or _now())
         scheme = urlsplit(git_base).scheme
         if scheme not in ("https", "file") or not git_base.endswith("/"):
             raise GhRefused(R_HOST)
+        _audit(home, {**base, "outcome": "intent"})         # BEFORE the credential is read (fail closed)
+        token = _live_token(home, REPOS[repo], now or _now())
         git = push.git_bin()
         url = f"{git_base}{repo}.git"
-        with tempfile.TemporaryDirectory(prefix="levain-gh-") as scratch:
-            env = _git_env(scratch, scheme)
-            mirror = _ensure_mirror(git, home, repo, env)
-            argv = _fetch_argv(git, mirror, url, _helper_command(python or sys.executable, home))
-            try:
+        try:
+            parent = _mirror_parent(home, repo)
+            # one fetch per mirror at a time, across processes (L3 z2b r1 codex 3): two seats fetching the same
+            # repository raced the config rewrite, the hook removal and git's ref locks
+            with _flock(parent / f".{repo.split('/')[1]}.lock", timeout=LOCK_TIMEOUT, busy=R_BUSY), \
+                    tempfile.TemporaryDirectory(prefix="levain-gh-") as scratch:
+                env = _git_env(scratch, scheme)
+                mirror = _ensure_mirror(git, home, repo, env)
+                argv = _fetch_argv(git, mirror, url, _helper_command(python or sys.executable, home))
                 r = subprocess.run(argv, env=env, cwd="/", stdin=subprocess.DEVNULL, capture_output=True, text=True,
                                    encoding="utf-8", errors="replace", timeout=FETCH_TIMEOUT)
-            except subprocess.TimeoutExpired:
-                raise GhRefused(R_FETCH) from None
-            if r.returncode:
-                detail = scrub((r.stderr or "").strip()[-300:], (token,))
-                raise GhRefused(f"{R_FETCH} {detail}".strip())
-            refs = subprocess.run(push.git_isolation_args(git, str(mirror)) + [
-                "for-each-ref", "--count=200", "--format=%(objectname:short) %(refname:short)", "refs/heads"],
-                env=env, cwd="/", stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=60)
+                if r.returncode:
+                    detail = scrub((r.stderr or "").strip()[-300:], (token,))
+                    raise GhRefused(f"{R_FETCH} {detail}".strip())
+                refs = subprocess.run(push.git_isolation_args(git, str(mirror)) + [
+                    "for-each-ref", "--count=200", "--format=%(objectname:short) %(refname:short)", "refs/heads"],
+                    env=env, cwd="/", stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=60)
+                if refs.returncode:
+                    raise GhRefused(R_FETCH)
+        except subprocess.TimeoutExpired:
+            raise GhRefused(R_FETCH) from None
+        except OSError:
+            raise GhRefused(R_FETCH) from None
         out = scrub(f"mirror: {mirror}\n{refs.stdout}", (token,))
-        _log(home, {**base, "outcome": "fetched"})
+        _audit(home, {**base, "outcome": "fetched"})
         return out
     except GhRefused as exc:
         _log(home, {**base, "outcome": "refused", "detail": str(exc)[:200]})
@@ -497,7 +626,8 @@ def read_token_stdin(stream: Any = None) -> str:
 
 
 def main(argv: Sequence[str] | None = None) -> int:
-    """``python -EP -B -m levain.seat_gh credential-helper --home <dir> <get|store|erase>`` (git's helper protocol)."""
+    """``credential-helper --home <dir> <get|store|erase>`` (git's helper protocol). git runs it through
+    :func:`_helper_command`'s bootstrap; ``python -m levain.seat_gh`` reaches the same entry."""
     args = list(sys.argv[1:] if argv is None else argv)
     if len(args) == 4 and args[0] == "credential-helper" and args[1] == "--home":
         return credential_helper(args[3], sys.stdin.read(65536), args[2], sys.stdout)

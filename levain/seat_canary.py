@@ -34,8 +34,8 @@ from typing import Any, Callable, Mapping, Sequence
 from levain import canary_probe, seat_record
 from levain.host_canary import Check, _Listener, _Turn, _drive, check_init_event
 from levain.host_guard import CC_SEAT_TOOLS
-from levain.seat_profile import (CANARY_DIRNAME, GH_SERVER_NAME, SeatProfile, build_seat_profile,  # noqa: F401
-                                 ensure_canary_prefix)
+from levain.seat_profile import (CANARY_DIRNAME, GH_SERVER_NAME, GH_TOOL_ALLOW, SeatProfile,  # noqa: F401
+                                 build_seat_profile, ensure_canary_prefix)
 
 __all__ = ["SWAP_FALLBACK_TOOLS", "SEAT_PROBE_IDS", "SEAT_PROBES", "TOOL_PROBES", "READY_TOOL_PROBES", "SeatProbe",
            "SeatCanaryVerdict", "check_seat_init", "run_seat_canary", "collect_evidence", "main"]
@@ -132,7 +132,16 @@ def check_seat_init(init: Any, tools: Sequence[str] = CC_SEAT_TOOLS) -> Check:
     ``acceptEdits`` is read as the expected mode here and nothing else is relaxed."""
     if isinstance(init, dict) and init.get("permissionMode") == "acceptEdits":
         init = {**init, "permissionMode": "default"}
-    return check_init_event(init, expected_tools=tuple(tools), expected_mcp=frozenset({GH_SERVER_NAME}))
+    c = check_init_event(init, expected_tools=tuple(tools), expected_mcp=frozenset({GH_SERVER_NAME}))
+    # the server's TOOLS, exactly (L3 z2b r1 codex 6): check_init_event checks only the server's name and refuses tools
+    # of a foreign server, so a levain_gh advertising zero tools, or an extra mcp__levain_gh__* one, would pass
+    got = init.get("tools") if isinstance(init, dict) else None
+    if isinstance(got, list) and all(isinstance(t, str) for t in got):
+        mcp = sorted(t for t in got if t.startswith("mcp__"))
+        if mcp != sorted(GH_TOOL_ALLOW):
+            gap = f"MCP tools {mcp!r} != {sorted(GH_TOOL_ALLOW)!r}"
+            return Check(c.name, "fail", gap if c.status == "pass" else f"{c.evidence}; {gap}")
+    return c
 
 
 def _p0(ev: Mapping[str, Any]) -> Check:
@@ -154,7 +163,7 @@ def _p0(ev: Mapping[str, Any]) -> Check:
         gaps.append("no record count")
     elif seen > 0 and rows == 0:
         failures.append("BLIND: tool calls ran and the D1 record holds no row")
-    return _verdict("P0 profile loaded", failures, gaps, "tools == seat set, exactly the levain_gh MCP server, hooks fired, record rows present")
+    return _verdict("P0 profile loaded", failures, gaps, "tools == seat set, exactly the levain_gh MCP server and its two tools, hooks fired, record rows present")
 
 
 def _p1(ev: Mapping[str, Any]) -> Check:
