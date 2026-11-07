@@ -11,7 +11,7 @@ import shlex
 import subprocess
 from pathlib import Path
 
-from levain.firing.hands import keep_work_clone_command
+from levain.firing.hands import keep_work_clone_argv, keep_work_clone_command
 
 E2E = Path(__file__).parent / "ci" / "isolation_e2e.sh"
 
@@ -24,7 +24,23 @@ def _flags(argv: list[str]) -> list[str]:
 def test_command_names_the_repository_and_its_dot_git():
     argv = shlex.split(keep_work_clone_command("/ws/repo-h", "/out"))
     assert _flags(argv) == ["safe.directory=/ws/repo-h", "safe.directory=/ws/repo-h/.git", "core.hooksPath=/dev/null"]
-    assert argv[-4:] == ["clone", "--no-local", "/ws/repo-h", "/out"]
+    assert argv[-5:] == ["clone", "--no-local", "--", "/ws/repo-h", "/out"]
+
+
+HOSTILE = "/ws/repo;uname;# a'b\"c $(id) `id` \\"
+
+
+def test_hostile_repository_name_round_trips_as_one_argv():
+    """The repository's name is the entity's choice; the operator pastes the line, so no word may split or expand."""
+    line = keep_work_clone_command(HOSTILE, "<destination>")
+    assert shlex.split(line) == keep_work_clone_argv(HOSTILE, "<destination>")
+    argv = shlex.split(line)
+    assert argv[argv.index("--") + 1:] == [HOSTILE, "<destination>"]
+    assert f"safe.directory={HOSTILE}/.git" in argv
+    # a shell given the line runs git (here: echo in its place) with exactly those words, and nothing else
+    out = subprocess.run(["/bin/sh", "-c", "printf '%s\\n' " + line.split(" ", 1)[1]], capture_output=True, text=True,
+                         check=True).stdout.splitlines()
+    assert out == argv[1:]
 
 
 def test_e2e_runs_the_command_the_operator_is_told():
@@ -34,6 +50,7 @@ def test_e2e_runs_the_command_the_operator_is_told():
                                              .replace("$WS/repo-h", "REPO")))
     told = _flags(shlex.split(keep_work_clone_command("REPO", "OUT")))
     assert e2e_flags == told
+    assert " clone -q --no-local -- '$WS/repo-h' " in line      # the told line ends its options before the paths
 
 
 def test_doctor_message_carries_the_command(tmp_path):

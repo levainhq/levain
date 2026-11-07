@@ -15,10 +15,11 @@ what it did not create per record:
 | the root import tree | `/usr/lib/levain-root` | `/usr/local/lib/levain-root` |
 | the helper entries | `/usr/libexec/levain` | `/usr/local/libexec/levain` |
 
-Inside the store, undo removes only `policy/pool`, `policy/install-shape` and `policy/operator` (plus the limits,
-dispatch-ceiling and allowed-signers files when they exist). The retired-ids lists live outside the store
-(`/var/lib/levain` on Linux, `/var/db/levain` on macOS) and also stay.
+Inside the store, undo removes `policy/pool`, `policy/install-shape` and `policy/operator`, plus `policy/limits`,
+`policy/dispatch_ceiling` and `policy/authority_signers` when they exist; nothing else. That set is derived from
+`plan_undo`: `tests/test_undo_keeps_store.py` runs the plan against a disposable root (every program recorded,
+none run) and compares the tree before and after, so the removals made by call steps are seen too. The retired-ids
+lists live outside the store (`/var/lib/levain` on Linux, `/var/db/levain` on macOS) and also stay.
 
-To list what undo will do before you run it, read the plan: `tests/test_undo_keeps_store.py` pins the kept set
-against `plan_undo` for both hosts, and `plan_undo`'s docstring in `levain/slot/install_helper.py` is the source.
+To see what undo does before you run it, read `plan_undo`'s docstring in `levain/slot/install_helper.py`.
 To free the space of a finished install, delete the store and the two trees by hand after undo reports `ok`.
