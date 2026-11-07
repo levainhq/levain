@@ -43,3 +43,10 @@ Regression run of every test importing a touched module: see the last section.
 
 ## Not run / known edges
 - No real provider and no real audio. `userActivation` is stubbed in the browser tests.
+
+## Regression run of the tests importing a touched module (2026-11-07 ~15:50)
+`tests/test_card_voice.py` 9/9 green; `node tests/card_format_check.js` ALL PASS. The wider files (voice routes, stream routes,
+voice_text, csp_media, room_hook, player_browser, player_real, mic_page, card_format, needs_item_link, band_title,
+band_read_timeout, sign_card_format) were running in four parallel processes when this was written, slowly (browser tests): 47
+dots, 0 failures so far, NOT finished. The seat that lands this branch must see them finish: they are the proof that the
+voice.py key check, the voice.js body line and the dashboard_core.js hooks broke nothing.
