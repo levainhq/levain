@@ -199,12 +199,16 @@ def _later_date(row: Any, today: str) -> str | None:
     return later_date(row, today)
 
 
+_WEEKDAYS = ("Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun")
+
+
 def _later_label(n: int, day: str, today: str) -> str:
     """``343 Sun`` for tomorrow, ``373 Tue 11-10`` for any later day (flow's ``_later_label``)."""
     d = datetime.fromisoformat(day).date()
+    wd = _WEEKDAYS[d.weekday()]          # fixed English: strftime('%a') follows the process locale
     if (d - datetime.fromisoformat(today).date()).days == 1:
-        return f"{n} {d.strftime('%a')}"
-    return f"{n} {d.strftime('%a')} {d.strftime('%m-%d')}"
+        return f"{n} {wd}"
+    return f"{n} {wd} {d.strftime('%m-%d')}"
 
 
 def _later_line(items: list[tuple[int, str]], today: str) -> str:
@@ -1314,6 +1318,7 @@ def _question_item(q: Question, n: int | None, version: str | None, can_answer: 
     later = _later_date(q, today) if today is not None else None
     if later is not None:
         item = {"n": n, "kind": info.kind, "tag": _tag(q), "what": q.what, "question": q.n, "later": later,
+                "blocks": [], "options": [], "rec": None, "open_ended": False,
                 "snoozed_until": getattr(q, "snoozed_until", None), "dated": getattr(q, "dated", None),
                 "subject": {"kind": "question", "id": q.id, "version": version}, "actions": []}
         return {"source": "question", "id": q.id}, item

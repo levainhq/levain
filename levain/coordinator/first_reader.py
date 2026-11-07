@@ -498,6 +498,16 @@ def _release_cause(q: Any, outcome: str, at: str, now: str, after: timedelta, to
     return None
 
 
+def _read_due(db: Path) -> list[Any]:
+    conn = sqlite3.connect(db.resolve().as_uri() + "?mode=ro", uri=True, timeout=2.0)
+    try:
+        return conn.execute(_DUE_SQL).fetchall()
+    except sqlite3.Error:
+        return []
+    finally:
+        conn.close()
+
+
 def claim_held(directory: Path | str, *, after: timedelta | None = None) -> list[tuple[Any, str]]:
     """Release every held ping now due, once: ``[(question, cause)]`` for the caller to ping, cause ``escalated`` or
     ``unread`` (module docstring). An ``unread`` release also files the escalation's ANSWER record (once per question,
@@ -526,6 +536,13 @@ def claim_held(directory: Path | str, *, after: timedelta | None = None) -> list
     qs = _questions(d)
     store = _coord_store(d)
     out: list[tuple[Any, str]] = []
+    # Read first: a due row that stays held (a snooze, not yet unread long enough) must not take the dispatch write
+    # lock for nothing. The decision to release is still re-made under the locks below.
+    now0 = store._stamp()
+    today0 = local_today(parse_stamp(now0))
+    if not any(_release_cause(qs.get(qid), oc, at, now0, after, today0) is not None
+               for qid, at, oc in _read_due(db)):
+        return []
     with write_transaction(store._connect) as conn:
         now = store._stamp()
         today = local_today(parse_stamp(now))

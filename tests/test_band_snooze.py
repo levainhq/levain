@@ -441,7 +441,7 @@ def test_a_snoozed_row_is_projected_as_later_in_the_payload_and_the_summary(stor
     first, second = pay["items"]
     assert first["actions"] and first["options"] and "later" not in first
     assert second["later"] == "2026-11-09" and second["actions"] == [] and second["n"] == 2
-    assert "options" not in second and "rec" not in second and second["subject"]["id"] == b.id
+    assert second["options"] == [] and second["rec"] is None and second["subject"]["id"] == b.id
     sm = band_view.summary(store)
     assert sm["count"] == 1 and [i["later"] for i in sm["items"]] == [None, "2026-11-09"]
     assert band_view.band_payload(Host(), "cockpit:web")["items"][0]["options"]       # a host's rows pass through
@@ -455,3 +455,59 @@ def test_the_payload_carries_flows_two_fields_raw(store):
     hosted = band_view.band_payload(Host(), "cockpit:web")["items"]
     assert [(i["n"], i["snoozed_until"], i["dated"]) for i in hosted][:2] == [(343, "2026-11-08", None),
                                                                                (373, None, "2026-11-10")]
+
+
+# --- L3 verify-round fixes ----------------------------------------------------------------------------------------
+def test_a_later_item_carries_neutral_defaults_for_every_key_a_due_item_has(store):
+    a, b = ask(store, "first?"), ask(store, "second?")
+    text(store)
+    store.snooze(a.id, until="2026-11-10", channel="cli", via="cli")
+    items = {i["question"]: i for i in band_view.band_payload(store, "cockpit:web")["items"]}
+    later, due = items[a.n], items[b.n]
+    assert set(due) <= set(later)
+    assert later["options"] == [] and later["blocks"] == [] and later["open_ended"] is False and later["rec"] is None
+    assert later["actions"] == [] and later["later"] == "2026-11-10"
+
+
+def test_the_later_label_weekday_ignores_the_locale(monkeypatch):
+    # a label built from fixed English names: strftime('%a') is never consulted
+    monkeypatch.setattr(band_view, "datetime", type("DT", (), {
+        "fromisoformat": staticmethod(lambda s: _NoStrftime(datetime.fromisoformat(s)))}))
+    assert band_view._later_label(1, "2026-11-10", "2026-11-07") == "1 Tue 11-10"
+    assert band_view._later_label(3, "2026-11-08", "2026-11-07") == "3 Sun"
+
+
+class _NoStrftime:
+    def __init__(self, dt):
+        self._dt = dt
+
+    def date(self):
+        return _Date(self._dt.date())
+
+
+class _Date:
+    def __init__(self, d):
+        self._d = d
+
+    def weekday(self):
+        return self._d.weekday()
+
+    def strftime(self, fmt):
+        assert fmt == "%m-%d", fmt          # %a would be locale-dependent
+        return self._d.strftime(fmt)
+
+    def __sub__(self, other):
+        return self._d - other._d
+
+
+def test_a_held_due_row_that_stays_held_takes_no_write_lock(tmp_path, monkeypatch):
+    from levain.coordinator import first_reader
+    from tests.test_questions_held_ping import Desk
+
+    desk = Desk(tmp_path, monkeypatch)
+    desk.coordinator()
+    q, _ = desk.ask()
+    QuestionStore(desk.dir, clock=lambda: desk.now[0]).snooze(q.id, until="2026-10-24", channel="cli", via="cli")
+    desk.later(minutes=10)                                                # due in the table, held by the snooze
+    monkeypatch.setattr(first_reader, "write_transaction", lambda *a, **k: pytest.fail("took the write lock"))
+    assert first_reader.claim_held(desk.dir) == []
