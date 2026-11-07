@@ -48,7 +48,8 @@ def test_builds_and_shapes(rig):
     assert sb["network"]["allowLocalBinding"] is False and sb["network"]["strictAllowlist"] is True
     assert sb["network"]["allowedDomains"] == []
     assert sb["filesystem"]["allowWrite"] == [str(base / "lane"), str(base / "ret")]
-    assert sb["filesystem"]["denyRead"] == [str(keys)]
+    gh_dir = str(Path(os.path.realpath(os.environ["TMPDIR"])) / sp.CANARY_DIRNAME / "levain-home" / "seat_gh")
+    assert sb["filesystem"]["denyRead"] == [str(keys), gh_dir]     # the read-token directory, as the key directory is
     assert s["permissions"]["defaultMode"] == "acceptEdits"
     assert s["includeGitInstructions"] is False and s["autoMemoryEnabled"] is False
     assert hg.check_sandbox_types(sb) == []
@@ -210,3 +211,40 @@ def test_the_canary_prefix_is_refused_unless_private_to_this_user(tmp_path):
     prefix.chmod(0o777)                                   # another user could swap a canary root inside it
     with pytest.raises(sp.SeatRefusal, match="not a private directory"):
         sp.ensure_canary_prefix(env)
+
+
+# --- PATHZERO Z2b: the one MCP server, levain_gh, and the read-token directory -------------------------------------------
+
+def test_the_profile_loads_exactly_levain_gh_and_allows_its_two_tools(rig):
+    """Revert: ``gh_mcp_config`` returning another/extra server, or ``"allow"`` dropped from the permissions."""
+    p = build(rig)
+    servers = p.mcp_config["mcpServers"]
+    assert list(servers) == [sp.GH_SERVER_NAME] == ["levain_gh"]
+    entry = servers["levain_gh"]
+    assert entry["type"] == "stdio" and entry["command"] == sys.executable
+    assert entry["args"][:4] == ["-EP", "-B", "-m", "levain.seat_gh_mcp"] and entry["args"][4] == "--home"
+    assert not any("token" in a.lower() or "ghp_" in a for a in entry["args"])
+    assert p.settings["permissions"]["allow"] == ["mcp__levain_gh__gh_read", "mcp__levain_gh__git_fetch"]
+    a = p.argv()
+    assert "--strict-mcp-config" in a and json.loads(a[a.index("--mcp-config") + 1]) == dict(p.mcp_config)
+
+
+def test_the_token_directory_is_denied_to_bash_and_to_read_like_the_key_directory(rig, tmp_path):
+    """Revert: the ``str(gh_dir)`` member of ``denyRead`` or the ``Read`` rule appended after the key directory's."""
+    home = tmp_path / "lhome"
+    home.mkdir()
+    p = build(rig, levain_home=home)
+    gh = str(Path(os.path.realpath(home)) / "seat_gh")
+    assert gh in p.settings["sandbox"]["filesystem"]["denyRead"]
+    assert f"Read(//{gh.lstrip('/')}/**)" in p.settings["permissions"]["deny"]
+    assert p.mcp_config["mcpServers"]["levain_gh"]["args"][-1] == str(Path(os.path.realpath(home)))
+    # the mirror directory is NOT under the denied one: the seat must read it
+    from levain import seat_gh
+    assert not seat_gh.MIRROR_DIR.startswith(seat_gh.TOKEN_DIR)
+
+
+def test_a_root_that_overlaps_the_token_directory_is_refused(rig, tmp_path):
+    """Revert: the ``gh_dir`` clause of ``_roots_problems``."""
+    base, keys, claude = rig
+    with pytest.raises(sp.SeatRefusal, match="read-token directory"):
+        build(rig, levain_home=base / "lane")

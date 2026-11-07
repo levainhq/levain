@@ -25,7 +25,7 @@ def attempt(**kw):
 
 
 def init(**kw):
-    base = {"tools": list(CC_SEAT_TOOLS), "mcp_servers": [], "plugins": [], "permissionMode": "acceptEdits",
+    base = {"tools": list(CC_SEAT_TOOLS), "mcp_servers": [{"name": "levain_gh", "status": "connected"}], "plugins": [], "permissionMode": "acceptEdits",
             "claude_code_version": "2.1.319"}
     return {**base, **kw}
 
@@ -33,7 +33,7 @@ def init(**kw):
 CLEAN = {
     "P0": {"init": init(), "hook_events": ["PreToolUse", "PostToolUse"], "tool_calls_seen": 4, "record_rows": 4},
     "P1": {"control": True, "attempts": [attempt(), attempt(via="symlink")], "protected_changed": []},
-    "P1b": {"planted": True, "hooks_live": True, "marker_exists": False, "mcp_servers": []},
+    "P1b": {"planted": True, "hooks_live": True, "marker_exists": False, "mcp_servers": ["levain_gh"]},
     "P2": {"attempts": 20, "landed": 0, "flips": 57, "control": True, "prompted": 0, "flipper_alive": True},
     "P3": {"control": True, "bash": "BLOCKED", "write": attempt(), "laneB_changed": False},
     "P4": {"control": True, "bash": {"GITHOOK": "BLOCKED", "GITCONFIG": "BLOCKED", "GITINFO": "BLOCKED",
@@ -111,6 +111,8 @@ VIOLATIONS = [
     ("P1", {"P1.attempts": [attempt(via="symlink", changed=True), attempt()]}),
     ("P1b", {"P1b.marker_exists": True}),
     ("P1b", {"P1b.mcp_servers": ["planted"]}),
+    ("P1b", {"P1b.mcp_servers": ["levain_gh", "planted"]}),   # the one admitted server plus a planted one
+    ("P1b", {"P1b.mcp_servers": []}),                          # the profile's own server must load
     ("P2", {"P2.landed": 1}),
     ("P2", {"P2.landed": 25}),                  # more landed than matched attempts still fails
     ("P2", {"P2.prompted": 2}),
@@ -230,6 +232,13 @@ def test_init_event_rejects_an_extra_or_missing_tool(tools):
 def test_init_event_rejects_an_mcp_server_and_other_modes():
     assert sc.check_seat_init(init(mcp_servers=[{"name": "planted", "status": "connected"}])).status == "fail"
     assert sc.check_seat_init(init(tools=[*CC_SEAT_TOOLS, "mcp__planted__x"])).status == "fail"
+    # Z2b: exactly levain_gh, connected, and no other
+    gh = {"name": "levain_gh", "status": "connected"}
+    assert sc.check_seat_init(init()).status == "pass"
+    assert sc.check_seat_init(init(mcp_servers=[])).status == "fail"
+    assert sc.check_seat_init(init(mcp_servers=[gh, {"name": "planted", "status": "connected"}])).status == "fail"
+    assert sc.check_seat_init(init(mcp_servers=[{"name": "levain_gh", "status": "failed"}])).status == "fail"
+    assert sc.check_seat_init(init(tools=[*CC_SEAT_TOOLS, "mcp__levain_gh__gh_read", "mcp__levain_gh__git_fetch"])).status == "pass"
     assert sc.check_seat_init(init(permissionMode="bypassPermissions")).status == "fail"
     assert sc.check_seat_init("not an object").status == "fail"
 

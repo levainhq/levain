@@ -3672,6 +3672,21 @@ def _add_seat_parser(subparsers: argparse._SubParsersAction, common: object) -> 
     stop.add_argument("--grace", type=_grace_seconds, default=10.0,
                       help="Seconds between SIGTERM and SIGKILL, 0 to 600 (default 10).")
     common(stop)
+    ghp = sub.add_parser("gh-token", help="Install, check and clear the seat's GitHub read tokens (one per owner).",
+                         description=(
+                             "A seat reads GitHub only through the host-side `levain_gh` MCP server, which holds one "
+                             "fine-grained read token per resource owner (levainhq, phillipclapham) in <levain home>/"
+                             "seat_gh/. `set` reads the token from STDIN only (never an argument), checks it with a "
+                             "GET from this host, and records only a fingerprint and the expiry beside it. `clear` "
+                             "deletes it: the next seat read refuses."))
+    gsub = ghp.add_subparsers(dest="seat_gh_cmd", required=True)
+    gset = gsub.add_parser("set", help="Install a token for an owner (token on STDIN).")
+    gset.add_argument("--owner", required=True, choices=("levainhq", "phillipclapham"))
+    gset.add_argument("--expires", default=None, metavar="YYYY-MM-DD",
+                      help="The token's expiry date, used when GitHub's response does not report one.")
+    gclear = gsub.add_parser("clear", help="Delete an owner's token.")
+    gclear.add_argument("--owner", required=True, choices=("levainhq", "phillipclapham"))
+    gsub.add_parser("status", help="Show each owner's token state (fingerprint and expiry, never the token).")
     # no prefix chars: every token after `canary` (its own --claude-bin, -h ...) passes through to seat_canary.main;
     # with the default ones argparse lifts a leading --flag out of REMAINDER and refuses it (L3 z1 r1, gemini 4)
     canary = sub.add_parser("canary", help="The seat canary; arguments pass through (`levain seat canary -h`).",
@@ -3701,6 +3716,8 @@ def _cmd_seat(args: argparse.Namespace) -> int:
     if args.seat_cmd == "canary":
         from levain.seat_canary import main as canary_main
         return canary_main(args.canary_args)
+    if args.seat_cmd == "gh-token":
+        return _cmd_seat_gh_token(args)
     from levain import seat_lease, seat_push
     from levain.cockpit.keys import ssh_signer
     from levain.seat_profile import SeatRefusal
@@ -3742,6 +3759,29 @@ def _cmd_seat(args: argparse.Namespace) -> int:
                 print(f"warning: {warning}", file=sys.stderr)
     except (seat_lease.SeatLaunchRefused, seat_push.SeatPushRefused, SeatRefusal, *_cockpit_refusals()) as exc:
         print(f"seat {args.seat_cmd} refused: {exc}", file=sys.stderr)
+        return 1
+    return 0
+
+
+def _cmd_seat_gh_token(args: argparse.Namespace) -> int:
+    """``levain seat gh-token set|clear|status``: the seat's GitHub read tokens (:mod:`levain.seat_gh`). The token is read
+    from STDIN only and is never echoed, logged or placed in an argument; only a fingerprint and the expiry are printed."""
+    from levain import seat_gh, seat_lease
+
+    home = Path(os.path.abspath(seat_lease._levain_home()))
+    try:
+        if args.seat_gh_cmd == "status":
+            for owner in seat_gh.OWNERS:
+                print(seat_gh.token_status(home, owner))
+        elif args.seat_gh_cmd == "clear":
+            print(f"cleared: {args.owner}" if seat_gh.clear_token(home, args.owner) else f"no token for {args.owner}")
+        else:
+            print(seat_gh.set_token(home, args.owner, seat_gh.read_token_stdin(), expires=args.expires))
+    except seat_gh.GhRefused as exc:
+        print(f"seat gh-token refused: {exc}", file=sys.stderr)
+        return 1
+    except OSError as exc:
+        print(f"seat gh-token refused: {type(exc).__name__}", file=sys.stderr)
         return 1
     return 0
 

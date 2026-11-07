@@ -118,8 +118,12 @@ def test_the_fenced_egress_commands_name_every_required_flag():
 
 def test_every_seat_subcommand_the_prose_names_exists():
     seat = _subparsers(_seat())
-    for word in re.findall(r"levain seat (\w+)", TEXT):
+    for word in re.findall(r"levain seat ([\w-]+)", TEXT):
         assert word in seat, f"`levain seat {word}` is not a subcommand"
+    ghp = _subparsers(seat["gh-token"])
+    assert set(ghp) == {"set", "clear", "status"}
+    for word in re.findall(r"levain seat gh-token (\w+)", TEXT):
+        assert word in ghp
     egress = _subparsers(seat["egress"])
     for word in re.findall(r"levain seat egress (\w+)", TEXT):
         assert word in egress
@@ -263,3 +267,22 @@ def test_launch_starts_claude_headless_and_dry_run_starts_nothing():
     assert "--dry-run` only validates and prints the argv. It mints nothing and does not start Claude Code" in TEXT
     stop = _resolve(["stop"])
     assert "--grace" in _options(stop) and "SIGTERM, then SIGKILL" in TEXT
+
+
+def test_the_github_door_the_page_describes_is_the_codes():
+    """PATHZERO Z2b: the server name, tools, token directory, owners, allowlisted segments and commands."""
+    from levain import seat_gh, seat_gh_mcp
+    assert seat_profile.GH_SERVER_NAME == seat_gh_mcp.SERVER_NAME == "levain_gh" and "`levain_gh`" in TEXT
+    for tool in seat_gh_mcp.TOOL_NAMES:
+        assert f"`{tool}`" in TEXT and f"mcp__levain_gh__{tool}" in TEXT
+    assert set(seat_profile.GH_TOOL_ALLOW) == {f"mcp__levain_gh__{t}" for t in seat_gh_mcp.TOOL_NAMES}
+    assert f"<levain home>/{seat_gh.TOKEN_DIR}/" in TEXT and f"<levain home>/{seat_gh.MIRROR_DIR}/" in TEXT
+    for repo in seat_gh.REPOS:
+        assert repo in TEXT
+    for owner in seat_gh.OWNERS:
+        assert f"`{owner}`" in TEXT
+    for seg in seat_gh.READ_SEGMENTS | seat_gh.ACTIONS_CHILDREN:
+        assert f"`{seg}`" in TEXT
+    for cmd in ("levain seat gh-token set --owner", "levain seat gh-token clear --owner", "levain seat gh-token status"):
+        assert cmd in TEXT
+    assert f"push/{seat_gh.LOG_NAME}" in TEXT

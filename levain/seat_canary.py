@@ -34,7 +34,8 @@ from typing import Any, Callable, Mapping, Sequence
 from levain import canary_probe, seat_record
 from levain.host_canary import Check, _Listener, _Turn, _drive, check_init_event
 from levain.host_guard import CC_SEAT_TOOLS
-from levain.seat_profile import CANARY_DIRNAME, SeatProfile, build_seat_profile, ensure_canary_prefix  # noqa: F401
+from levain.seat_profile import (CANARY_DIRNAME, GH_SERVER_NAME, SeatProfile, build_seat_profile,  # noqa: F401
+                                 ensure_canary_prefix)
 
 __all__ = ["SWAP_FALLBACK_TOOLS", "SEAT_PROBE_IDS", "SEAT_PROBES", "TOOL_PROBES", "READY_TOOL_PROBES", "SeatProbe",
            "SeatCanaryVerdict", "check_seat_init", "run_seat_canary", "collect_evidence", "main"]
@@ -125,12 +126,13 @@ def _arm(probe: str, lines: Any, name: str, failures: list[str], gaps: list[str]
 
 def check_seat_init(init: Any, tools: Sequence[str] = CC_SEAT_TOOLS) -> Check:
     """P0's init half: :func:`levain.host_canary.check_init_event` with the tool set the run was started with (the
-    terminal set, or a narrower fallback set under its own canary run) and no MCP server. The seat runs
+    terminal set, or a narrower fallback set under its own canary run) and exactly the ``levain_gh`` MCP server (Z2b)
+    and no other. The seat runs
     ``--permission-mode acceptEdits`` (its settings say so) while that check expects a hosted ``default``, so a reported
     ``acceptEdits`` is read as the expected mode here and nothing else is relaxed."""
     if isinstance(init, dict) and init.get("permissionMode") == "acceptEdits":
         init = {**init, "permissionMode": "default"}
-    return check_init_event(init, expected_tools=tuple(tools), expected_mcp=frozenset())
+    return check_init_event(init, expected_tools=tuple(tools), expected_mcp=frozenset({GH_SERVER_NAME}))
 
 
 def _p0(ev: Mapping[str, Any]) -> Check:
@@ -152,7 +154,7 @@ def _p0(ev: Mapping[str, Any]) -> Check:
         gaps.append("no record count")
     elif seen > 0 and rows == 0:
         failures.append("BLIND: tool calls ran and the D1 record holds no row")
-    return _verdict("P0 profile loaded", failures, gaps, "tools == seat set, no MCP, hooks fired, record rows present")
+    return _verdict("P0 profile loaded", failures, gaps, "tools == seat set, exactly the levain_gh MCP server, hooks fired, record rows present")
 
 
 def _p1(ev: Mapping[str, Any]) -> Check:
@@ -189,9 +191,9 @@ def _p1b(ev: Mapping[str, Any]) -> Check:
     servers = ev.get("mcp_servers")
     if not isinstance(servers, list):
         gaps.append("no MCP server list")
-    elif servers:
-        failures.append(f"MCP servers loaded: {servers!r}")
-    return _verdict(name, failures, gaps, "a planted hook and MCP server in the clone loaded nothing")
+    elif sorted(map(str, servers)) != [GH_SERVER_NAME]:
+        failures.append(f"MCP servers loaded: {servers!r}, expected exactly {[GH_SERVER_NAME]!r}")
+    return _verdict(name, failures, gaps, "a planted hook and MCP server in the clone loaded nothing; only levain_gh is loaded")
 
 
 def _p2(ev: Mapping[str, Any]) -> Check:

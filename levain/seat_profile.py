@@ -23,13 +23,24 @@ from pathlib import Path
 from typing import Any, Mapping, Sequence
 
 from levain import host_guard as hg
+from levain import seat_gh
 from levain.authority import SEAT_EGRESS_KIND, SEAT_LEASE_KIND
 from levain.host_guard import (CC_SEAT_TOOLS, PROTECTED_NAMES, SEAT_SOURCE_ARGS, HostRefusal)
 
 __all__ = ["SeatRefusal", "SeatProfile", "seat_deny_write", "seat_permission_deny", "build_seat_profile",
-           "CANARY_DIRNAME", "FILE_TOOLS", "SEAT_LEASE_KIND"]
+           "CANARY_DIRNAME", "FILE_TOOLS", "SEAT_LEASE_KIND", "GH_SERVER_NAME", "GH_TOOL_ALLOW", "gh_mcp_config"]
 
 CANARY_DIRNAME = "levain-seat-canary"
+#: The one MCP server a seat loads (PATHZERO Z2b): it holds the GitHub read tokens host-side and has two fixed verbs.
+GH_SERVER_NAME = "levain_gh"
+GH_TOOL_ALLOW = (f"mcp__{GH_SERVER_NAME}__gh_read", f"mcp__{GH_SERVER_NAME}__git_fetch")
+
+
+def gh_mcp_config(python: str, levain_home: Path | str) -> dict[str, Any]:
+    """The seat's ``--mcp-config``: exactly the ``levain_gh`` stdio server and no other. Its arguments carry the levain
+    home (so it finds the token directory) and no secret; ``-EP`` keeps the PYTHON* variables and the cwd off its path."""
+    return {"mcpServers": {GH_SERVER_NAME: {"type": "stdio", "command": python,
+                                            "args": ["-EP", "-B", "-m", "levain.seat_gh_mcp", "--home", str(levain_home)]}}}
 #: All four file tools are named in every deny, so a later re-admission inherits it. Measured 11-06 on 2.1.319: an
 #: ``Edit(...)`` rule refuses the Write tool and a ``Write(...)`` rule alone did NOT, so the Edit rules carry the deny.
 FILE_TOOLS = ("Edit", "Write", "MultiEdit", "NotebookEdit")
@@ -66,7 +77,7 @@ def _abs_rule(tool: str, path: str) -> str:
     return f"{tool}(//{path.lstrip('/')})"
 
 
-def seat_permission_deny(roots: Sequence[Path], key_dir: Path) -> list[str]:
+def seat_permission_deny(roots: Sequence[Path], key_dir: Path, gh_dir: Path | None = None) -> list[str]:
     """``permissions.deny``: all four file tools on every protected pattern of every root, and the Read tool on the
     launcher key directory. The first root (the clone, the working directory) also gets the cwd-relative spellings,
     which are the ones measured to fire after symlink resolution. ``.git`` is denied only at the paths that run code or
@@ -90,6 +101,8 @@ def seat_permission_deny(roots: Sequence[Path], key_dir: Path) -> list[str]:
                 rules += [f"{tool}({_git_rule_path('.git', sub)})" for sub in _GIT_DENY]
                 rules += [f"{tool}(.mcp.json)", f"{tool}(*/**/.git)"]
     rules.append(_abs_rule("Read", f"{key_dir}/**"))
+    if gh_dir is not None:                      # the read-token directory (Z2b): one more member of the same deny
+        rules.append(_abs_rule("Read", f"{gh_dir}/**"))
     return rules
 
 
@@ -186,7 +199,7 @@ def _contains_agent_config(root: Path, *, git_dir_ok: bool) -> list[str]:
     return found
 
 
-def _roots_problems(clone: Path, return_dir: Path, key_dir: Path) -> list[str]:
+def _roots_problems(clone: Path, return_dir: Path, key_dir: Path, gh_dir: Path | None = None) -> list[str]:
     problems: list[str] = []
     for what, p in (("the clone", clone), ("the RETURN directory", return_dir)):
         if os.path.islink(p) or not p.is_dir():
@@ -196,6 +209,8 @@ def _roots_problems(clone: Path, return_dir: Path, key_dir: Path) -> list[str]:
     for what, p in (("the clone", clone), ("the RETURN directory", return_dir)):
         if hg.is_within(key_dir, p) or hg.is_within(p, key_dir):
             problems.append(f"{what} overlaps the launcher key directory")
+        if gh_dir is not None and (hg.is_within(gh_dir, p) or hg.is_within(p, gh_dir)):
+            problems.append(f"{what} overlaps the read-token directory")
         if hg.is_within(p, Path.home() / ".claude"):
             problems.append(f"{what} is inside ~/.claude")
     return problems
@@ -274,7 +289,9 @@ def build_seat_profile(clone: Path, return_dir: Path, *, claude_bin: str, python
     if not tools or len(set(tools)) != len(tools) or any(t not in CC_SEAT_TOOLS for t in tools):
         problems.append(f"the tool set {tools!r} must be a non-empty subset of the admitted seat tools, with no repeats")
     problems += _egress_problems(clone, lease, egress, cockpit_root, levain_home)
-    problems += _roots_problems(clone, return_dir, key_dir)
+    gh_home = _real(levain_home) if levain_home is not None else _canary_prefix(environ) / "levain-home"
+    gh_dir = gh_home / seat_gh.TOKEN_DIR
+    problems += _roots_problems(clone, return_dir, key_dir, gh_dir)
     if not problems:
         problems += [f"{t} is an agent-config target inside a seat root" for t in
                      _contains_agent_config(clone, git_dir_ok=True) + _contains_agent_config(return_dir, git_dir_ok=False)]
@@ -298,7 +315,7 @@ def build_seat_profile(clone: Path, return_dir: Path, *, claude_bin: str, python
         "disabled": False,
         "allowWrite": [str(r) for r in roots],
         "denyWrite": seat_deny_write(clone, git=True) + seat_deny_write(return_dir, git=False),
-        "denyRead": [str(key_dir)],
+        "denyRead": [str(key_dir), str(gh_dir)],
     }
     py = shlex.quote(python)
     from levain import observe   # constants only
@@ -322,7 +339,8 @@ def build_seat_profile(clone: Path, return_dir: Path, *, claude_bin: str, python
     settings = {
         "sandbox": sandbox,
         "permissions": {"defaultMode": "acceptEdits", "additionalDirectories": [str(return_dir)],
-                        "deny": seat_permission_deny(roots, key_dir)},
+                        "allow": list(GH_TOOL_ALLOW),
+                        "deny": seat_permission_deny(roots, key_dir, gh_dir)},
         "includeGitInstructions": False,
         "autoMemoryEnabled": False,
         "hooks": hooks,
@@ -335,4 +353,4 @@ def build_seat_profile(clone: Path, return_dir: Path, *, claude_bin: str, python
         raise SeatRefusal("; ".join(problems))
     env = {**hg.host_env(environ, roots=roots), "CLAUDE_CODE_DISABLE_GIT_INSTRUCTIONS": "1"}
     return SeatProfile(clone=clone, return_dir=return_dir, roots=roots, claude_bin=claude_bin, settings=settings,
-                       mcp_config={"mcpServers": {}}, env=env, tools=tools)
+                       mcp_config=gh_mcp_config(python, gh_home), env=env, tools=tools)
