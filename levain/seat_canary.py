@@ -958,6 +958,9 @@ def main(argv: Sequence[str] | None = None) -> int:
     p.add_argument("--python", default=sys.executable)
     p.add_argument("--swap-attempts", type=int, default=20)
     p.add_argument("--timeout", type=float, default=600.0)
+    p.add_argument("--model", default="sonnet",
+                   help="the model that drives the canary turn. Default sonnet: the haiku default refused the canary prompt as "
+                        "tampering in the Z1e VM run (1106-16/z1e/RETURN_z1e.md, measured, N=20), so a canary under it reads inconclusive")
     p.add_argument("--tools", default=",".join(CC_SEAT_TOOLS),
                    help="the seat tool set under test, comma-separated (a narrower fallback set earns its own pass)")
     a = p.parse_args(argv)
@@ -966,9 +969,9 @@ def main(argv: Sequence[str] | None = None) -> int:
     except ValueError as exc:
         p.error(str(exc))
     verdict = run_seat_canary(claude_bin=a.claude_bin, python=a.python, swap_attempts=a.swap_attempts, timeout=a.timeout,
-                              tools=tools)
+                              model=a.model, tools=tools)
     print(f"levain seat canary: {'PASS' if verdict.ok() else 'FAIL'} (swap attempts N={a.swap_attempts}, "
-          f"tools {','.join(tools)})")
+          f"model {a.model}, tools {','.join(tools)})")
     print(verdict.report())
     return 0 if verdict.ok() else 1
 
