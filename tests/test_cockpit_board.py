@@ -455,3 +455,26 @@ def test_a_1000_character_title_cannot_push_a_cards_drop_past_the_drop_routes_ca
     words = _harness_run()["longTitleWords"]
     assert len(words) >= 1000 and len(words) <= 2 * board.TEXT_MAX + 100
     assert check_words(words) == words and len(words) < WORDS_MAX
+
+
+def test_a_snoozed_question_is_one_later_card_not_an_actionable_one(filled):
+    """Row 131: ONE predicate (band_view.later_of) marks a snoozed question LATER on the board card, with the payload."""
+    from datetime import datetime, timedelta
+
+    from levain import band_view
+    from levain.consent.questions import local_today
+    qs = QuestionStore(filled)
+    _file(qs, what="Due question")
+    snz = _file(qs, what="Snoozed question", agent_session_id="sess-2")
+    day = (datetime.fromisoformat(local_today(datetime.now().astimezone())) + timedelta(days=2)).date().isoformat()
+    qs.snooze(snz.id, until=day, channel="cli", via="cli")
+    payload = band_view.band_payload(qs, "test")                 # numbers the rows (the board read numbers nothing)
+    out = board.build(filled, qs)
+    col = next(c for c in out["columns"] if c["category"] == "needs-you")
+    by = {c["title"]: c for c in col["cards"]}
+    assert "later" not in by["Due question"]
+    lat = by["Snoozed question"]
+    assert lat["later"] == day and lat["later_label"].endswith(day[5:]) and lat["blocks"] == ""
+    assert lat["band"] is True                                   # still an open, numbered band card (answerable by number)
+    item = next(i for i in payload["items"] if i["what"] == "Snoozed question")
+    assert item["later"] == day and item["later_label"] == lat["later_label"] and item["options"] == []

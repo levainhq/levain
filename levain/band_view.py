@@ -217,6 +217,22 @@ def _later_line(items: list[tuple[int, str]], today: str) -> str:
     return f"LATER ({len(items)}): " + " · ".join(_later_label(n, d, today) for n, d in items)
 
 
+def later_of(store: Any, q: Any, n: int | None = None, now: datetime | None = None) -> tuple[str, str] | None:
+    """THE one predicate for LATER (row 131): ``(day, label)`` when the open question ``q`` is snoozed past the store's
+    local day, else ``None`` (due, unreadable, or a judgment that fails: due is the safe side, never hidden). The CLI
+    band, the payload and the cockpit board card all call this."""
+    if q is None or isinstance(q, Extra):
+        return None
+    try:
+        today = _today_of(store, now)
+        day = _later_date(q, today)
+        if day is None:
+            return None
+        return day, (_later_label(n, day, today) if n is not None else day)
+    except Exception:  # noqa: BLE001
+        return None
+
+
 def _today_of(store: Any, now: datetime | None) -> str:
     """The local day a render judges snoozes against: ``now`` when the caller gave one, else the store's clock (a
     native store's; a foreign store has none, so the wall clock)."""
@@ -1318,6 +1334,7 @@ def _question_item(q: Question, n: int | None, version: str | None, can_answer: 
     later = _later_date(q, today) if today is not None else None
     if later is not None:
         item = {"n": n, "kind": info.kind, "tag": _tag(q), "what": q.what, "question": q.n, "later": later,
+                "later_label": _later_label(n, later, today) if n is not None else later,
                 "blocks": [], "options": [], "rec": None, "open_ended": False,
                 "snoozed_until": getattr(q, "snoozed_until", None), "dated": getattr(q, "dated", None),
                 "subject": {"kind": "question", "id": q.id, "version": version}, "actions": []}
