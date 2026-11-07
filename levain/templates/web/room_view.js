@@ -723,7 +723,7 @@
         if (LM.active()) return;                         // the last session is still closing
         endDictation();
         sbase = ta.value ? ta.value.replace(/\s*$/, " ") : "";
-        live = true; ta.readOnly = true; streamB.textContent = "Stop mic";     // read-only: a partial redraws the whole box
+        live = true; ta.readOnly = true; streamB.textContent = "Stop mic";     // locked while streaming: a partial redraws the whole box
         LM.start();                                     // inside this tap: the permission and the audio context are asked for here
         if (!LM.active()) { live = false; ta.readOnly = false; streamB.textContent = "Mic"; }
       });
