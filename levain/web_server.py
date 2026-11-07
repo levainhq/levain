@@ -3643,6 +3643,16 @@ class _Handler(GuardedHandler):
 
         return reader.directory if reader.directory is not None else default_queue_dir()
 
+    def _room_directory(self, fallback: Any) -> Any:
+        """The directory the open room is read from: the room host's own store (``RoomServe.directory``), else ``fallback``.
+        An embedder (flow's bridge) swaps the consent reader for the Signer's queue, so ``_store_directory`` can name a store
+        that holds no room; the voice route read it there and answered room_rotated for the room the page was showing. The room
+        routes themselves are pinned to the room's store by the embedder, so only a route outside them needs this."""
+        host = self.server.room_host
+        path = getattr(getattr(host, "store", None), "path", None)
+        parent = getattr(path, "parent", None)
+        return parent if parent is not None else fallback
+
     def _thread_post(self, thread_id: str, action: str, req: Any) -> tuple[dict[str, Any], int]:
         """``POST /cockpit/thread/<th-id>/stop``: the operator's stop of a work thread's turn, reached only past
         ``do_POST``'s write gate (a surface token on every bind). The dispatch store is the consent directory's."""
@@ -3834,7 +3844,7 @@ class _Handler(GuardedHandler):
                 # the queue the phone's grant routes revoke through; None when none are served (no key is then read)
                 "revoke_queue": srv.grant_phone.queue_dir if srv.grant_phone is not None else None}
             if speak:
-                return cockpit_voice.speak(data_root, srv.chat_service, raw, directory=directory, **common)
+                return cockpit_voice.speak(data_root, srv.chat_service, raw, directory=self._room_directory(directory), **common)
             query = self.path.split("?", 1)[1] if "?" in self.path else ""
             return cockpit_voice.transcribe(data_root, query, self.headers.get("Content-Type", ""), raw, **common)
         finally:

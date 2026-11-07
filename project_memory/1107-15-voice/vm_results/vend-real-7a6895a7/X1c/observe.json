@@ -1,0 +1,280 @@
+{
+ "label": "X1c",
+ "session": "s-7c1a54077841a5b3",
+ "guest_time": "2026-11-07 17:45:36",
+ "points": {
+  "count": 11,
+  "start_entry": 1,
+  "tree_step_entry": 1,
+  "tree_step_exc": 0,
+  "tree_step_exit": 1,
+  "teardown_exit_ans": [
+   "{'state': 'RETAINED', 'tunnel_bytes': 918971}"
+  ],
+  "teardown_exc": [],
+  "tree_step_exc_detail": [],
+  "mark_cloned": [
+   true
+  ],
+  "start_entry_vf": "/private/var/folders/39/q9110f_j0gbfzpd3kc11dk380003wb",
+  "start_entry_vf_lstat": {
+   "uid": 3979,
+   "mode": "0o40755",
+   "flags": "0x100000",
+   "ino": 428923
+  },
+  "start_entry_vf_tree": [
+   "total 0",
+   "drwxr-xr-x@ 2 3979  3979  sunlnk 64 Nov  6 15:43 0",
+   "\tcom.apple.rootless\t 7 ",
+   "drwx------@ 2 3979  3979  sunlnk 64 Nov  6 15:43 C",
+   "\tcom.apple.rootless\t 7 ",
+   "drwx------@ 2 3979  3979  sunlnk 64 Nov  6 15:43 T",
+   "\tcom.apple.rootless\t 7 ",
+   "drwxr-xr-x@ 2 3979  3979  sunlnk 64 Nov  6 15:43 X",
+   "\tcom.apple.rootless\t 7 ",
+   "",
+   "/private/var/folders/39/q9110f_j0gbfzpd3kc11dk380003wb/0:",
+   "total 0",
+   "",
+   "/private/var/folders/39/q9110f_j0gbfzpd3kc11dk380003wb/C:",
+   "total 0",
+   "",
+   "/private/var/folders/39/q9110f_j0gbfzpd3kc11dk380003wb/T:",
+   "total 0",
+   "",
+   "/private/var/folders/39/q9110f_j0gbfzpd3kc11dk380003wb/X:",
+   "total 0"
+  ],
+  "start_entry_t": 1794073441.0739908
+ },
+ "slot_states": {
+  "e10": {
+   "changed_at": "2026-11-06T15:04:21Z",
+   "class": "egress",
+   "dispatch_eligible": true,
+   "format": "levain-slot-state/1",
+   "index": 10,
+   "lease_seq": 0,
+   "rev": 0,
+   "state": "reusable"
+  },
+  "e11": {
+   "changed_at": "2026-11-06T15:04:21Z",
+   "class": "egress",
+   "dispatch_eligible": true,
+   "format": "levain-slot-state/1",
+   "index": 11,
+   "lease_seq": 0,
+   "rev": 0,
+   "state": "reusable"
+  },
+  "e8": {
+   "changed_at": "2026-11-07T17:45:21Z",
+   "class": "egress",
+   "dispatch_eligible": false,
+   "format": "levain-slot-state/1",
+   "index": 8,
+   "lease_seq": 14,
+   "rev": 29,
+   "state": "reusable"
+  },
+  "e9": {
+   "changed_at": "2026-11-07T14:30:45Z",
+   "class": "egress",
+   "dispatch_eligible": false,
+   "format": "levain-slot-state/1",
+   "index": 9,
+   "lease_seq": 11,
+   "rev": 23,
+   "state": "reusable"
+  },
+  "v2": {
+   "changed_at": "2026-11-06T15:04:21Z",
+   "class": "none",
+   "dispatch_eligible": true,
+   "format": "levain-slot-state/1",
+   "index": 2,
+   "lease_seq": 0,
+   "rev": 0,
+   "state": "reusable"
+  }
+ },
+ "live_dirs": [],
+ "retained_dirs": [
+  "s-1fab91d69dd5fc5c",
+  "s-3cd1d4b42ac54eab",
+  "s-43037d34b6a747ad",
+  "s-44a07a38c6871b7d",
+  "s-48a7461b2a983c1c",
+  "s-494c355608e058ab",
+  "s-4c832d64a3311a64",
+  "s-5909860bbdf61520",
+  "s-5b0949cd6e47bdda",
+  "s-6e0c3a26ea8c228f",
+  "s-771e41827cb90c0e",
+  "s-790460ccaf5567aa",
+  "s-7b69c6ae618c81f2",
+  "s-7c1a54077841a5b3",
+  "s-8153c3c1c7556cea",
+  "s-84e43b84e43040f9",
+  "s-9d050bd0de750589",
+  "s-a162125b8fa377bc",
+  "s-ea63ae0b4a14b5c5",
+  "s-ee959b989aa28dd2",
+  "s-f0df3308e1661e18",
+  "s-f195a29fef91f474",
+  "s-f353c620ae334d1e",
+  "s-f408db3a392eebee"
+ ],
+ "vf_after": {
+  "path": "/private/var/folders/39/q9110f_j0gbfzpd3kc11dk380003wb",
+  "lstat": {
+   "uid": 3979,
+   "mode": "0o40755",
+   "flags": "0x100000"
+  },
+  "ls_lOdn_at": [
+   "drwxr-xr-x@ 6 3979  3979  sunlnk 192 Nov  6 15:43 /private/var/folders/39/q9110f_j0gbfzpd3kc11dk380003wb",
+   "\tcom.apple.rootless\t  7 "
+  ],
+  "ls_lOnR_at": [
+   "total 0",
+   "drwxr-xr-x@ 2 3979  3979  sunlnk 64 Nov  6 15:43 0",
+   "\tcom.apple.rootless\t 7 ",
+   "drwx------@ 2 3979  3979  sunlnk 64 Nov  6 15:43 C",
+   "\tcom.apple.rootless\t 7 ",
+   "drwx------@ 2 3979  3979  sunlnk 64 Nov  6 15:43 T",
+   "\tcom.apple.rootless\t 7 ",
+   "drwxr-xr-x@ 2 3979  3979  sunlnk 64 Nov  6 15:43 X",
+   "\tcom.apple.rootless\t 7 ",
+   "",
+   "/private/var/folders/39/q9110f_j0gbfzpd3kc11dk380003wb/0:",
+   "total 0",
+   "",
+   "/private/var/folders/39/q9110f_j0gbfzpd3kc11dk380003wb/C:",
+   "total 0",
+   "",
+   "/private/var/folders/39/q9110f_j0gbfzpd3kc11dk380003wb/T:",
+   "total 0",
+   "",
+   "/private/var/folders/39/q9110f_j0gbfzpd3kc11dk380003wb/X:",
+   "total 0"
+  ],
+  "entries": {
+   "0": {
+    "type": "dir",
+    "flags": "0x100000",
+    "children": [],
+    "xattrs": [
+     "com.apple.rootless"
+    ]
+   },
+   "C": {
+    "type": "dir",
+    "flags": "0x100000",
+    "children": [],
+    "xattrs": [
+     "com.apple.rootless"
+    ]
+   },
+   "T": {
+    "type": "dir",
+    "flags": "0x100000",
+    "children": [],
+    "xattrs": [
+     "com.apple.rootless"
+    ]
+   },
+   "X": {
+    "type": "dir",
+    "flags": "0x100000",
+    "children": [],
+    "xattrs": [
+     "com.apple.rootless"
+    ]
+   }
+  }
+ },
+ "live_has_session": false,
+ "retained_has_session": true,
+ "tree_exists": true,
+ "retained_listing": [
+  "total 536",
+  "drwx------   7 root  wheel     224 Nov  7 17:45 .",
+  "drwx------  26 root  wheel     832 Nov  7 17:45 ..",
+  "-rw-------   1 root  wheel  260107 Nov  7 17:45 manifest.jsonl",
+  "-rw-------   1 root  wheel     640 Nov  7 17:45 meta.jsonl",
+  "-rw-------   1 root  wheel     316 Nov  7 17:45 object.json",
+  "-rw-r--r--   1 root  wheel      21 Nov  7 17:45 retained_at",
+  "drwxr-x---  10 root  wheel     320 Nov  7 17:45 tree"
+ ],
+ "kept_vf_copy": {
+  "0": {
+   "type": "dir",
+   "mode": "0o755",
+   "uid": 0
+  },
+  "T": {
+   "type": "dir",
+   "mode": "0o700",
+   "uid": 0
+  },
+  "C": {
+   "type": "dir",
+   "mode": "0o700",
+   "uid": 0
+  },
+  "X": {
+   "type": "dir",
+   "mode": "0o755",
+   "uid": 0
+  }
+ },
+ "manifest_vf": {
+  ".levain-var-folders": {
+   "type": "dir",
+   "size": 0,
+   "digest": ""
+  },
+  ".levain-var-folders/0": {
+   "type": "dir",
+   "size": 0,
+   "digest": ""
+  },
+  ".levain-var-folders/C": {
+   "type": "dir",
+   "size": 0,
+   "digest": ""
+  },
+  ".levain-var-folders/T": {
+   "type": "dir",
+   "size": 0,
+   "digest": ""
+  },
+  ".levain-var-folders/X": {
+   "type": "dir",
+   "size": 0,
+   "digest": ""
+  }
+ },
+ "manifest_exists": true,
+ "leftover_staging": [],
+ "profile": {
+  "path": "/private/var/levain/retained/s-7c1a54077841a5b3/tree/root/profile.sb",
+  "lines": 20,
+  "mentions_var_folders": false
+ },
+ "vendor_err": null,
+ "vendor_out": null,
+ "repo": {
+  "git_log": "fdd318d vmend-probe\n1abd5cd rig\n",
+  "git_status": "",
+  "readme_tail": "# vmend stand-in\n\nA tiny repo for the var-folders confirmation.\nvmend probe line\n"
+ },
+ "cloned_marker": true,
+ "codex_session_files": [],
+ "helper_notes": [],
+ "hold_final": null,
+ "hold_error": null
+}

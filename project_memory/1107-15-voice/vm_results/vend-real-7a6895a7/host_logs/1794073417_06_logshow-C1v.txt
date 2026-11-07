@@ -1,0 +1,3 @@
+$ /usr/bin/ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR -o PreferredAuthentications=password,keyboard-interactive -o PubkeyAuthentication=no -o ConnectTimeout=15 admin@192.168.64.42 sudo -n /usr/local/bin/python3.13 -I /tmp/fire/g_vm.py logshow --label C1v
+rc=0
+log show rc 0 deny lines 292 of which under var/folders 0

@@ -129,7 +129,7 @@ def test_the_voice_block_offers_the_providers_with_a_key_and_keeps_each_choice_o
     assert stored["tier"] == "premium" and stored["provider"] == "inworld" and stored["voice"] == "voice-07", stored
     assert stored["autoplay"] is True and stored["notify"] is True, stored
     assert json.loads(v[4]) == stored | {"speed": 1}, v[4]
-    assert "To hear the premium voice, tap Play on a room reply." in v[5]
+    assert "Hear this voice" in v[5] and "tap Play on a room reply" not in v[5]
 
 
 @needs_browser

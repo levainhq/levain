@@ -434,6 +434,44 @@
     speechBound,
     sizes: () => ({ seen: seen.size, floor: floor.size, tapNeeded: tapNeeded.size, messages: messages.size }),
     onChange: (f) => { listeners.add(f); return () => listeners.delete(f); },
+    // The settings block's test: the tier the settings name. Premium asks the one route for the fixed sample sentence (the
+    // server holds the words; the page sends none); a refusal says its fixed sentence and falls back only when the route said so.
+    sample: async function () {
+      const s = effective();
+      const reply = { thread: "sample", gseq: 0 };
+      if (s.blocked) { stop(); remember(messages, key(reply), s.blocked); changed(); return; }
+      if (s.tier !== "premium" || !s.provider || !s.voice) return window.LevainVoice.sampleDevice();
+      unlock();
+      stop();
+      messages.delete(key(reply));
+      const me = ++runId;
+      ctl = new AbortController();
+      const signal = ctl.signal;
+      try {
+        let res;
+        try {
+          res = await fetch(SPEAK_PATH, { method: "POST", headers: headers(true), signal,
+                                          body: JSON.stringify({ sample: true, provider: s.provider, voice: s.voice, speed: s.speed }) });
+        } catch (_) { if (me === runId) sayIfNone(reply, WORDS.failed); return; }
+        if (me !== runId) return;
+        if (!res.ok) {
+          let body = null;
+          try { body = await res.json(); } catch (_) { body = null; }
+          if (me !== runId) return;
+          say(reply, (body && typeof body.message === "string" && body.message) || WORDS.failed);
+          if (body && body.fallback === "on_device") await speakDevice(reply, SAMPLE, me, s.speed);
+          return;
+        }
+        let blob;
+        try { blob = await res.blob(); } catch (_) { if (me === runId) sayIfNone(reply, WORDS.failed); return; }
+        if (me !== runId) return;
+        const heard = await playBlob(blob, me);
+        if (me === runId && !heard) say(reply, WORDS.cantPlay);
+      } finally {
+        if (me === runId && ctl) { try { ctl.abort(); } catch (_) { /* done */ } ctl = null; }
+        changed();
+      }
+    },
     sampleDevice: async function () {
       const reply = { thread: "sample", gseq: 0 };
       unlock();
