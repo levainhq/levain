@@ -78,11 +78,11 @@ from levain.agents import controller as _ctl
 from levain.agents.accounting import ActionExposure, StopResult, Usage
 from levain.agents.session import S1_DISPATCH, WORKSPACE_REFUSED, SessionLaunch, Workspace
 from levain.agents.session_launcher import LauncherRefused
-from levain.agents.signed_role import SIGNED_TEXT_MAX, SignedRole
+from levain.agents.signed_role import SIGNED_TEXT_MAX, SignedLink, SignedRole
 from levain.contracts import ContractError, canon
 
 __all__ = ["PROTOCOL", "RUN_FRAME_MAX", "LAUNCHER_NAME", "WAIT_SLICE_S", "WireError", "ProofUnavailable", "LinkRow",
-           "LinkProof", "SignedRole", "signed_role_of", "encode_run_frame", "read_run_frame", "check_run_request", "ok_answer", "refused_answer",
+           "LinkProof", "SignedRole", "SignedLink", "signed_role_of", "signed_link_of", "encode_run_frame", "read_run_frame", "check_run_request", "ok_answer", "refused_answer",
            "launch_to_wire", "launch_from_wire", "usage_to_wire", "usage_from_wire", "link_proof",
            "WS_CHUNK_BYTES", "WS_PARTS", "WsBegin", "ws_begin_to_wire", "ws_begin_from_wire", "ws_chunk_frames",
            "ws_chunk_from_wire",
@@ -439,9 +439,42 @@ def link_proof(store: Any, cockpit_root: Path | str, occurrence_id: str, *, now:
     current rows read from the cockpit authority log at ``cockpit_root`` after a verified replay
     (:class:`levain.agent_authority.AgentAuthority`); ``now`` (an aware datetime, default the real clock) is a test seam. Raises :class:`ProofUnavailable` for a row with no link, a link
     that is not an agent link of this occurrence's agent and spec hash, or a log that does not read."""
+    from levain.cockpit.firejournal import DB_NAME
+    spec_hash, link_id, store_id, born, current, _grant = _standing_link(store, cockpit_root, occurrence_id, now)
+    rows: dict[int, LinkRow] = {}
+    try:
+        db = sqlite3.connect("file:" + quote(str(Path(cockpit_root) / DB_NAME), safe="/") + "?mode=ro", uri=True,
+                             timeout=5.0)
+        try:
+            for seq in {born, current}:
+                got = db.execute("SELECT seq, prev_hash, record, signer_fp, signature FROM authority_log"
+                                 " WHERE seq = ?", (seq,)).fetchone()
+                if got is None or not all(type(c) is str for c in got[1:]):
+                    raise ProofUnavailable(f"log row {seq} is absent or not text", standing=False)
+                rows[seq] = LinkRow(*got)
+        finally:
+            db.close()
+    except sqlite3.Error as exc:
+        raise ProofUnavailable(f"the authority log rows do not read ({type(exc).__name__})", standing=False) from None
+    return LinkProof(occurrence_id, spec_hash, link_id, store_id, rows[born], rows[current])
+
+
+def signed_link_of(store: Any, cockpit_root: Path | str, occurrence_id: str, *, now: Any = None) -> SignedLink:
+    """The :class:`SignedLink` (``agent_id``, ``spec_hash``, ``role_hash``) of the standing link ``occurrence_id``
+    launched under, from the same verified replay :func:`link_proof` reads: what the operator-uid half derives the
+    signed role's withhold against (L3 W2 r1 HIGH). Raises :class:`ProofUnavailable` as :func:`link_proof` does."""
+    _spec_hash, _link_id, _sid, _born, _current, grant = _standing_link(store, cockpit_root, occurrence_id, now)
+    try:
+        return SignedLink(grant["agent_id"], grant["spec_hash"], grant["role_hash"])
+    except (KeyError, TypeError, ValueError):
+        raise ProofUnavailable("the link names no role", standing=True) from None
+
+
+def _standing_link(store: Any, cockpit_root: Path | str, occurrence_id: str, now: Any) -> tuple:
+    """``(spec_hash, link_id, store_id, born_seq, current_seq, grant)`` of the standing agent link ``occurrence_id``
+    launched under, after a verified replay of the log at ``cockpit_root`` (:func:`link_proof`'s checks)."""
     from levain import authority as _auth
     from levain.agent_authority import AgentAuthority
-    from levain.cockpit.firejournal import DB_NAME
     try:
         with store.read() as conn:
             row = conn.execute("SELECT agent_id, spec_hash, link_id FROM agent_occurrences WHERE occurrence_id = ?",
@@ -469,22 +502,7 @@ def link_proof(store: Any, cockpit_root: Path | str, occurrence_id: str, *, now:
     from datetime import datetime, timezone
     if not _auth.agent_link_arms(state, link_id, now=now or datetime.now(timezone.utc)):
         raise ProofUnavailable("the link is expired or was revoked", standing=True)
-    rows: dict[int, LinkRow] = {}
-    try:
-        db = sqlite3.connect("file:" + quote(str(Path(cockpit_root) / DB_NAME), safe="/") + "?mode=ro", uri=True,
-                             timeout=5.0)
-        try:
-            for seq in {born, current}:
-                got = db.execute("SELECT seq, prev_hash, record, signer_fp, signature FROM authority_log"
-                                 " WHERE seq = ?", (seq,)).fetchone()
-                if got is None or not all(type(c) is str for c in got[1:]):
-                    raise ProofUnavailable(f"log row {seq} is absent or not text", standing=False)
-                rows[seq] = LinkRow(*got)
-        finally:
-            db.close()
-    except sqlite3.Error as exc:
-        raise ProofUnavailable(f"the authority log rows do not read ({type(exc).__name__})", standing=False) from None
-    return LinkProof(occurrence_id, spec_hash, link_id, sid[0], rows[born], rows[current])
+    return spec_hash, link_id, sid[0], born, current, grant
 
 
 def signed_role_of(store: Any, occurrence_id: str) -> SignedRole:
@@ -874,10 +892,12 @@ class DispatchSessionLauncher:
 
     def __init__(self, connect: Callable[[], socket.socket], proof_of: Callable[[str], LinkProof],
                  feed: AuthorityFeed | None = None,
-                 signed_of: Callable[[str], SignedRole] | None = None) -> None:
+                 signed_of: Callable[[str], SignedRole] | None = None,
+                 link_of: Callable[[str], SignedLink] | None = None) -> None:
         self._connect = connect
         self._proof_of = proof_of
         self._signed_of = signed_of   # None: this client can prove no signed role, so it stages no workspace (W2)
+        self._link_of = link_of       # None: no verified link names the role, so it stages no workspace (W2 r1 HIGH)
         self._feed = feed           # None: a server without a replica (its frames carry no ledger_head or bar)
 
     def _claims(self, conn: _Conn, occurrence_id: str, *, bar: bool) -> dict[str, object]:
@@ -916,9 +936,13 @@ class DispatchSessionLauncher:
         from levain.dispatch import stager
         try:
             signed = self._signed(launch)
+            if self._link_of is None:
+                raise ProofUnavailable("this client holds no signed-link source", standing=True)
+            link = self._link_of(launch.occurrence_id)
             # the operator-uid half of "refuse on loosening" (np-c9e8a60b (a)): the withhold this snapshot is cut under is
-            # the one the SIGNED role declares, derived from the role's own hash chain here and again by the server
-            want = signed_withhold(signed, None)
+            # the one the SIGNED role declares, derived from the role's own hash chain against the role the verified link
+            # names (its agent_id and role_hash, not only its spec_hash: L3 W2 r1 HIGH), here and again by the server
+            want = signed_withhold(signed, link)
         except (ProofUnavailable, SignedRoleRefused) as exc:
             name = exc.name if isinstance(exc, SignedRoleRefused) else "signed-role-unavailable"
             raise WorkspaceNotSent(WORKSPACE_REFUSED, f"{name}: {exc}"[:_DETAIL_MAX]) from None
@@ -1099,4 +1123,5 @@ def build_launcher(store: Any) -> DispatchSessionLauncher:
     return DispatchSessionLauncher(unix_connector(default_run_socket()),
                                    lambda occ: link_proof(store, install.cockpit_root, occ),
                                    AuthorityFeed(store, install.cockpit_root),
-                                   lambda occ: signed_role_of(store, occ))
+                                   lambda occ: signed_role_of(store, occ),
+                                   lambda occ: signed_link_of(store, install.cockpit_root, occ))

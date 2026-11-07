@@ -125,14 +125,14 @@ def role_withholding(*patterns: str) -> dict:
 
 
 class World:
-    def __init__(self, tmp_path: Path, *, role=None, **uploads_kw) -> None:
+    def __init__(self, tmp_path: Path, *, role=None, link_role_hash=None, **uploads_kw) -> None:
         self.rig = Rig(tmp_path)
         add_role(self.rig.store, ROLE if role is None else role)       # W2: the server re-derives the withhold from it
         self.uploads = WS.WorkspaceUploads(tmp_path / "scratch", **uploads_kw)
         self.runtime = StagingRuntime(self.uploads.stage, tmp_path / "staging")
         self.env = Env(self.rig, tmp_path, runtime=self.runtime, uploads=self.uploads)
         self.staged = tmp_path / "staging" / "sess-1" / "repo.bundle"
-        self.oid = _occurrence(self.rig, billing="subscription", exposure=EXP, role=role)
+        self.oid = _occurrence(self.rig, billing="subscription", exposure=EXP, role=role, link_role_hash=link_role_hash)
         self._ids = 0
 
     def key(self) -> str:
@@ -455,8 +455,8 @@ def test_a_manifest_that_names_the_signed_withhold_but_still_carries_a_withheld_
 def test_a_withhold_the_member_and_the_manifest_disagree_on_is_refused(tmp_path):
     w = World(tmp_path, role=role_withholding("docs/**"))
     parts, key = make_parts(tmp_path, withhold=("docs/**",)), w.key()
-    assert cause(w.refused(key, parts, ws=parts.workspace(withhold=("other/**",)))) in ("withhold-loosened",
-                                                                                    "withhold-mismatch")
+    # the member is judged first: it lacks the signed docs/** (L3 W2 r1 LOW, complement: pin the one name)
+    assert cause(w.refused(key, parts, ws=parts.workspace(withhold=("other/**",)))) == "withhold-loosened"
 
 
 def test_a_workspace_launch_whose_proof_carries_no_role_evidence_is_refused(w, tmp_path):
@@ -468,7 +468,9 @@ def test_a_workspace_launch_whose_proof_carries_no_role_evidence_is_refused(w, t
     ans = w.send(sock, "LAUNCH", **C.launch_to_wire(
         S.SessionLaunch(w.oid, key, "claude", "sonnet", "b", "passthrough", EXP, parts.workspace()), bare))
     assert ans["refused"] == REFUSED and ans["detail"].startswith("signed-role-missing")
-    w.assert_nothing_staged(key, tombstone=False)
+    # a standing refusal of THIS connection's upload: tombstoned like every other (L3 W2 r1 LOW, complement; revert: the
+    # derivation passed to WorkspaceUploads.verify as a callable, evaluated inside its judgment)
+    w.assert_nothing_staged(key)
 
 
 def test_role_evidence_that_is_not_the_signed_spec_is_refused(w, tmp_path):
@@ -484,6 +486,66 @@ def test_role_evidence_that_is_not_the_signed_spec_is_refused(w, tmp_path):
             S.SessionLaunch(w.oid, key, "claude", "sonnet", "b", "passthrough", EXP, parts.workspace()), proof))
         assert ans["refused"] == REFUSED and ans["detail"].startswith(name), ans
         sock, _ = w.upload(key, parts)                  # a refused LAUNCH ended the upload: bring it back
+
+
+# --- L3 W2 r1 HIGH (codex): the withhold comes from the role the verified link NAMES -----------------------------------------
+
+SECRET_FILES = {**FILES, "secrets/token": "hunter2\n"}
+
+
+def test_a_link_naming_a_locked_role_beside_a_spec_pinning_an_open_one_never_stages_the_secret(tmp_path):
+    """The exact scenario: the link is signed with role_hash = R_locked (withholds secrets/**) and a spec_hash whose
+    canonical spec pins R_open (no withhold). Authority validation accepts both hashes; the derivation through the
+    spec alone gave R_open's empty withhold and the snapshot carrying secrets/token staged. Refused, standing."""
+    locked = role_withholding("secrets/**")
+    from levain.agents.role import role_hash
+    w = World(tmp_path, link_role_hash=role_hash(locked))           # the spec pins ROLE (no withhold): R_open
+    parts, key = make_parts(tmp_path, files=SECRET_FILES), w.key()
+    assert "secrets/token" in [e[0] for e in parts.manifest.entries]
+    exc = w.refused(key, parts)               # revert: the `role_hash != link.role_hash` line, or of_grant(grant) -> spec
+    assert cause(exc) == "signed-role-link-role", exc.detail
+    assert "verified link" in exc.detail
+
+
+def test_an_honest_link_of_the_same_open_role_still_stages(tmp_path):
+    w = World(tmp_path)                                              # the link names the role the spec pins
+    parts, key = make_parts(tmp_path, files=SECRET_FILES), w.key()
+    sock, _ = w.upload(key, parts)
+    assert w.launch(sock, key, parts.workspace()).session == "sess-1"
+
+
+def test_a_lone_surrogate_in_the_role_evidence_is_a_plain_refusal_never_a_transient_one(w, tmp_path):
+    """L3 W2 r1 MED (complement, deepseek): the claim was that a lone U+D800 passes the wire and SignedRole, then raises
+    UnicodeEncodeError at the role hash, answered ``internal-error``, transient. On the wire it never gets that far: the
+    frame reader's ``canon.parse`` refuses the escape and the server closes the connection unanswered (held here with
+    the RAW bytes, since the client's encoder refuses to write them). In process, ``SignedRole`` now refuses it as invalid text
+    (``test_agents_signed_role``), so no caller reaches the hash with one."""
+    parts, key = make_parts(tmp_path), w.key()
+    sock, _ = w.upload(key, parts)
+    r = w.rig
+    proof = dataclasses.replace(C.link_proof(r.store, r.world.root, w.oid, now=r.now()), signed=C.signed_role_of(r.store, w.oid))
+    body = C.launch_to_wire(S.SessionLaunch(w.oid, key, "claude", "sonnet", "b", "passthrough", EXP, parts.workspace()), proof)
+    body["proof"]["signed"]["role"] = body["proof"]["signed"]["role"][:-1] + ',"x":"SURROGATE-HERE"}'
+    w._ids += 1
+    frame = C.encode_run_frame({"p": C.PROTOCOL, "op": "LAUNCH", "id": w._ids, **body})
+    data = frame[4:].replace(b"SURROGATE-HERE", b"\\ud800")
+    assert b"\\ud800" in data
+    sock.sendall(len(data).to_bytes(4, "big") + data)
+    # an unreadable frame: the server hangs up (dispatch_run ``handle``, the read_run_frame WireError), answers nothing
+    # a client could read as transient, and launches nothing
+    assert C.read_run_frame(sock) is None
+    assert w.runtime.starts == [] and not w.staged.exists() and w.env.control.minted == {}
+
+
+def test_a_lone_surrogate_reaching_launch_from_wire_in_process_is_a_plain_wire_error(w, tmp_path):
+    r = w.rig
+    proof = dataclasses.replace(C.link_proof(r.store, r.world.root, w.oid, now=r.now()), signed=C.signed_role_of(r.store, w.oid))
+    body = C.launch_to_wire(S.SessionLaunch(w.oid, w.key(), "claude", "sonnet", "b", "passthrough", EXP,
+                                            make_parts(tmp_path).workspace()), proof)
+    body["proof"]["signed"]["role"] = body["proof"]["signed"]["role"][:-1] + ',"x":"' + chr(0xD800) + '"}'
+    with pytest.raises(C.WireError) as exc:              # revert: the strict encode in SignedRole.__post_init__
+        C.launch_from_wire(body)
+    assert str(exc.value) == "signed.role is not UTF-8 text"
 
 
 def test_a_snapshot_whose_settings_loosen_the_sandbox_is_refused_never_stripped(w, tmp_path):

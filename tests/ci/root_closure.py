@@ -454,10 +454,10 @@ LAZY_SITES = {
     'levain/agents/role.py::_withhold::from levain.dispatch.policy import _pattern_problem': 'operator',
     # operator: ``default_run_socket`` runs only in the operator's process (the controller, an agent session or the session client); the dispatch run server only imports the module
     'levain/agents/session_client.py::default_run_socket::from levain.slot import layout': 'operator',
-    # operator: ``link_proof`` runs only in the operator's process (the controller, an agent session or the session client); the dispatch run server only imports the module
-    'levain/agents/session_client.py::link_proof::from levain import authority as _auth': 'operator',
-    # operator: ``link_proof`` runs only in the operator's process (the controller, an agent session or the session client); the dispatch run server only imports the module
-    'levain/agents/session_client.py::link_proof::from levain.agent_authority import AgentAuthority': 'operator',
+    # operator: ``_standing_link`` runs only under ``link_proof`` and ``signed_link_of``, in the operator's process (the controller, an agent session or the session client); the dispatch run server only imports the module
+    'levain/agents/session_client.py::_standing_link::from levain import authority as _auth': 'operator',
+    # operator: ``_standing_link`` runs only under ``link_proof`` and ``signed_link_of``, in the operator's process (the controller, an agent session or the session client); the dispatch run server only imports the module
+    'levain/agents/session_client.py::_standing_link::from levain.agent_authority import AgentAuthority': 'operator',
     # operator: ``link_proof`` runs only in the operator's process (the controller, an agent session or the session client); the dispatch run server only imports the module
     'levain/agents/session_client.py::link_proof::from levain.cockpit.firejournal import DB_NAME': 'operator',
     # operator: ``register_specs`` (and ``_register_in`` under it) is called only by ``levain agents register`` (``levain/agents/cli.py``), the operator's process; the dispatch run server only imports the module

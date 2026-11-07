@@ -12,7 +12,7 @@ the server does with them. Two phases, one per side of the mint:
    detail), leaves nothing staged, and drops the upload. In order: the parts are whole and hash to what WSBEGIN
    declared; the manifest parses to exactly its canonical form; the workspace member's ``head`` and ``withhold`` are
    the manifest's, and (W2) both are exactly the SIGNED role's ``ceiling.withhold`` (derived by the caller from the
-   proof's role evidence, ``levain.agents.signed_role``; a missing pattern is ``withhold-loosened``) and no manifest
+   proof's role evidence and the role the verified link names, ``levain.agents.signed_role``; a missing pattern is ``withhold-loosened``) and no manifest
    entry matches a signed pattern (``withheld-path-carried``); the snapshot carries none of :data:`DISPATCH_REFUSED_NAMES`;
    ``snapshot_commit`` derives ``E`` (the commit) and ``N`` (the object count) from the manifest alone; the bundle's
    first bytes are exactly the bundle header for ``E`` and a pack header of ``N`` objects; then
@@ -29,8 +29,8 @@ the server does with them. Two phases, one per side of the mint:
 What is bound is HASH IDENTITY plus the SIGNED ROLE (Phill np-fc4ea962 (a), np-b978efbc (a), np-c9e8a60b (a)): the manifest
 carries no signature of its own; the server re-derives ``E`` and ``N`` from it and refuses on any mismatch, and its
 withhold is the one his signature on the agent link covers (the role's ``ceiling.withhold``, pinned by ``role_hash``,
-pinned by the signed ``spec_hash``), which the caller derives from the proof and passes to :meth:`WorkspaceUploads.verify`
-as ``signed_withhold``. The run record carries the head sha, the manifest digest and the withhold digest
+pinned by the signed ``spec_hash``), which the caller derives from the proof against the verified link's ``agent_id`` and ``role_hash`` and passes
+to :meth:`WorkspaceUploads.verify` as ``signed_withhold``. The run record carries the head sha, the manifest digest and the withhold digest
 (``RealLauncher._workspace_record``). ``.mcp.json`` parity with the interactive path is :data:`DISPATCH_REFUSED_NAMES`.
 
 Not done here (the operator-uid side, a later lane): building the snapshot, cutting the bundle, sending the frames. Not
@@ -49,7 +49,7 @@ import struct
 import threading
 import unicodedata
 from pathlib import Path
-from typing import Mapping, Optional
+from typing import Callable, Mapping, Optional
 
 from levain.agents.session import Workspace
 from levain.agents.session_launcher import LauncherRefused, SlotStart
@@ -287,11 +287,13 @@ class WorkspaceUploads:
     # -- phase 1: verify (before the mint) -------------------------------------------------------------------------
 
     def verify(self, key: str, owner: UploadOwner, ws: Optional[Workspace], *,
-               signed_withhold: tuple = ()) -> Optional[Workspace]:
+               signed_withhold: "tuple | Callable[[], tuple]" = ()) -> Optional[Workspace]:
         """The LAUNCH's workspace judgment. No member and no upload: ``None`` (a launch that stages nothing). A member
         and a whole, matching upload: the member with ``manifest_digest`` set to the server's own derivation. Anything
         else: :class:`WorkspaceRefused`, this connection's upload dropped and NOTHING another connection holds touched.
-        ``tombstone`` is set only on a standing refusal of the upload this connection holds for ``key``."""
+        ``tombstone`` is set only on a standing refusal of the upload this connection holds for ``key``.
+        ``signed_withhold`` is the signed role's withhold, or the callable that derives it (the run server's): called
+        inside the judgment, so a derivation that refuses is a refusal of this upload like any other."""
         with self._mu:
             up = self._ups.get(key)
             mine = up is not None and up.owner is owner
@@ -308,7 +310,8 @@ class WorkspaceUploads:
             raise WorkspaceRefused("no-upload", "the launch names a workspace and this connection holds no upload "
                                    "for its key")
         try:
-            return dataclasses.replace(ws, manifest_digest=self._judge(up, ws, tuple(sorted(signed_withhold))))
+            want = signed_withhold() if callable(signed_withhold) else signed_withhold
+            return dataclasses.replace(ws, manifest_digest=self._judge(up, ws, tuple(sorted(want))))
         except WorkspaceRefused as exc:
             refused = exc
         except (RS.ReadSetRefused, SN.SnapshotRefused, DispatchError) as exc:
@@ -337,8 +340,9 @@ class WorkspaceUploads:
             bad = withhold_problem(signed_withhold, carried_withhold)
             if bad is not None:
                 raise WorkspaceRefused(*bad)
+        folded = tuple(p.casefold() for p in signed_withhold)
         for entry in manifest.entries:     # the withhold is honored in the bytes, not only in the list that names it
-            if any(SN.match(p.casefold(), entry[0].casefold()) for p in signed_withhold):
+            if folded and any(SN.match(p, entry[0].casefold()) for p in folded):
                 raise WorkspaceRefused("withheld-path-carried", f"{entry[0][:120]}: the signed role withholds this path")
         if manifest.head != ws.head:
             raise WorkspaceRefused("head-mismatch", "the manifest was cut from another commit than the launch names")

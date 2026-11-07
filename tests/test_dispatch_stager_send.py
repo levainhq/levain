@@ -76,7 +76,8 @@ class RealSender(World):
             return sock
 
         client = C.DispatchSessionLauncher(connect, lambda occ: C.link_proof(r.store, r.world.root, occ, now=r.now()),
-                                           signed_of=lambda occ: C.signed_role_of(r.store, occ))
+                                           signed_of=lambda occ: C.signed_role_of(r.store, occ),
+                                           link_of=lambda occ: C.signed_link_of(r.store, r.world.root, occ, now=r.now()))
         return client.spawn(S.SessionLaunch(self.oid, key, "claude", "sonnet", "b", "passthrough", EXP, ws))
 
 
@@ -91,19 +92,32 @@ def op_repo(tmp_path: Path, files=None, name="op") -> Path:
     return make_repo(top, FILES if files is None else files)
 
 
-def signed_for(*withhold: str) -> C.SignedRole:
-    """A SignedRole whose spec pins a role declaring ``withhold`` (a real hash chain; the agent id is made up)."""
+def _evidence(*withhold: str) -> tuple:
     from levain.agents.role import canonical_role, role_hash
+    from levain.agents.spec import spec_hash
     from levain.authority import _canonical
     role = {"name": "r", "brief": {"template": "x", "slots": {}}, "ceiling": {"lands": ["flow"], **(
         {"withhold": list(withhold)} if withhold else {})}, "model": "m", "harness": "claude", "executor": "session"}
-    spec = {"role": {"name": "r", "role_hash": role_hash(role)}}
-    return C.SignedRole("ag-" + "1" * 32, _canonical(spec), canonical_role(role))
+    spec, agent = {"role": {"name": "r", "role_hash": role_hash(role)}}, "ag-" + "1" * 32
+    return (C.SignedRole(agent, _canonical(spec), canonical_role(role)),
+            C.SignedLink(agent, spec_hash(agent, spec), role_hash(role)))
 
 
-def plain_launcher(*withhold: str) -> C.DispatchSessionLauncher:
-    """A client with no wire and a signed-role source for a role that withholds ``withhold``."""
-    return C.DispatchSessionLauncher(lambda: None, lambda occ: None, signed_of=lambda occ: signed_for(*withhold))
+def signed_for(*withhold: str) -> C.SignedRole:
+    """A SignedRole whose spec pins a role declaring ``withhold`` (a real hash chain; the agent id is made up)."""
+    return _evidence(*withhold)[0]
+
+
+def link_for(*withhold: str) -> C.SignedLink:
+    """The verified link's terms naming the same role as :func:`signed_for`."""
+    return _evidence(*withhold)[1]
+
+
+def plain_launcher(*withhold: str, link=None) -> C.DispatchSessionLauncher:
+    """A client with no wire and a signed-role source for a role that withholds ``withhold``, under a link naming that
+    role (or ``link``)."""
+    return C.DispatchSessionLauncher(lambda: None, lambda occ: None, signed_of=lambda occ: signed_for(*withhold),
+                                     link_of=lambda occ: link_for(*withhold) if link is None else link)
 
 
 def member(repo: Path, branch=None) -> S.Workspace:
@@ -402,6 +416,39 @@ def test_the_client_builds_under_the_withhold_its_signed_role_declares_and_a_loo
         launcher.build_workspace(launch_of(member(repo)))                       # the install's member says nothing
     assert exc.value.name == S.WORKSPACE_REFUSED and exc.value.detail.startswith("withhold-loosened")
     assert os.listdir(tmpdir_) == []
+
+
+def test_a_launcher_with_no_link_source_builds_nothing(tmp_path, tmpdir_):
+    launcher = C.DispatchSessionLauncher(lambda: None, lambda occ: None, signed_of=lambda occ: signed_for())
+    with pytest.raises(C.WorkspaceNotSent) as exc:       # revert: the `self._link_of is None` refusal in build_workspace
+        launcher.build_workspace(launch_of(member(op_repo(tmp_path))))
+    assert exc.value.name == S.WORKSPACE_REFUSED and exc.value.detail.startswith("signed-role-unavailable")
+    assert os.listdir(tmpdir_) == []
+
+
+# --- L3 W2 r1 HIGH (codex), the operator-uid half: the role the verified link NAMES, before staging touches git ---------------
+
+def test_the_client_refuses_a_link_naming_a_locked_role_beside_a_spec_pinning_an_open_one_before_git(tmp_path, tmpdir_,
+                                                                                                     monkeypatch):
+    locked = dataclasses.replace(link_for(), role_hash=link_for("secrets/**").role_hash)     # the spec still pins R_open
+    launcher = plain_launcher(link=locked)
+    ws = member(op_repo(tmp_path, {**FILES, "secrets/token": "hunter2\n"}))     # resolved now; git is watched below
+    touched: list = []
+    monkeypatch.setattr(SN, "_git", lambda *a, **k: touched.append(a) or b"")
+    with pytest.raises(C.WorkspaceNotSent) as exc:       # revert: the `role_hash != link.role_hash` line in signed_withhold
+        launcher.build_workspace(launch_of(ws))
+    assert exc.value.name == S.WORKSPACE_REFUSED and exc.value.detail.startswith("link-role"), exc.value.detail
+    assert touched == [] and os.listdir(tmpdir_) == []
+
+
+def test_the_real_client_refuses_a_forged_link_with_no_connection_opened(tmp_path, tmpdir_):
+    from levain.agents.role import role_hash
+    from tests.test_slot_dispatch_workspace import role_withholding
+    w = RealSender(tmp_path, link_role_hash=role_hash(role_withholding("secrets/**")))
+    repo = op_repo(tmp_path, {**FILES, "secrets/token": "hunter2\n"})
+    with pytest.raises(L.LauncherRefused) as exc:
+        w.launch(None, w.key(), member(repo))
+    assert "link-role" in exc.value.detail and getattr(w, "connects", []) == [] and os.listdir(tmpdir_) == []
 
 
 def test_the_seam_does_nothing_for_a_launch_with_no_workspace_and_names_a_sender_that_broke(tmp_path, tmpdir_, monkeypatch):
@@ -773,7 +820,8 @@ def _ordered_client(w, events, sock):
         events.append("proof")
         return C.link_proof(r.store, r.world.root, occ, now=r.now())
 
-    client = C.DispatchSessionLauncher(connect, proof, signed_of=lambda occ: C.signed_role_of(r.store, occ))
+    client = C.DispatchSessionLauncher(connect, proof, signed_of=lambda occ: C.signed_role_of(r.store, occ),
+                                       link_of=lambda occ: C.signed_link_of(r.store, r.world.root, occ, now=r.now()))
     real = client.build_workspace
 
     def build(launch):

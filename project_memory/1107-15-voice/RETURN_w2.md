@@ -32,7 +32,7 @@ check; dispatch_run.py missing-evidence refusal; dispatch_run.py `proof.spec_has
 build_snapshot; session_wire.py `role_withhold`.
 
 ## Residue (named)
-- A signed-role refusal is raised before `verify`, so it writes NO zero-usage tombstone (same as `no-upload`); the fire records the refusal itself.
+- (closed in the r1 fix round: a signed-role refusal of this connection's upload now tombstones, see below)
 - The evidence adds the spec and role texts (each <= 64 KiB) to a workspace LAUNCH frame; a very large brief template could push the frame past
   RUN_FRAME_MAX and be refused `launch-frame-refused` before connecting (named, not measured).
 - No migration: a role with a withhold is a NEW role_hash, so the agent that should use it must be re-registered and re-signed by him (his np-b978efbc ruling).
@@ -44,3 +44,52 @@ build_snapshot; session_wire.py `role_withhold`.
 - Sibling suites (spec, session launcher/launch, run server, replica, refuse, lease): 644 passed.
 - Not run on the VM: the unit as `_levain_dispatch` under the root Python 3.9 (signed_role.py has no 3.10-only runtime syntax, not executed on 3.9).
 - The three prior-art URLs in w2_FRAME.md were not fetched.
+
+## L3 r1 fix round (findings: w2_r1.out; 3 lineages: complement, deepseek, codex; gemini errored, a gap, not a pass)
+
+Each finding resolved against disk first. Verdicts:
+
+1. **codex HIGH, dispatch_run.py:738: CONFIRMED, FIXED.** On disk the server derived only spec_hash -> the spec's pin and never
+   compared that pin with the link's own `role_hash`, nor the evidence's agent with the link's `agent_id`; the client passed `None`
+   and compared no link at all. Worse than described: the test fixture's links all carried `role_hash = "c"*64`, never the spec's pin,
+   so every W2 workspace test ran on exactly the mismatched shape and passed. Fix at the point of use, both uids:
+   `signed_role.SignedLink(agent_id, spec_hash, role_hash)`; `signed_withhold(signed, link)` now REQUIRES one and refuses
+   `link` (none), `link-agent`, `spec-hash`, `link-role` ("the role the spec pins is not the role the verified link names"), `role-hash`.
+   Server: `verify_point_of_use` returns the grant from its own replay; LAUNCH hands it to `_workspace_of`; the withhold is derived
+   against `SignedLink.of_grant(grant)` (refused `signed-role-link-role` / `signed-role-link-agent`). Client: `signed_link_of(store,
+   cockpit_root, occ)` (same verified replay as `link_proof`, shared `_standing_link`), `DispatchSessionLauncher(link_of=)`,
+   `build_launcher` wires it; refused before git. Fixture `_occurrence` now signs the role the spec pins (`link_role_hash=` forges).
+   Tests: `test_a_link_naming_a_locked_role_whose_spec_pins_an_open_one_derives_nothing` (signed_role),
+   `test_a_link_naming_a_locked_role_beside_a_spec_pinning_an_open_one_never_stages_the_secret` (real server, secrets/token in the
+   snapshot), `test_the_client_refuses_..._before_git` and `test_the_real_client_refuses_a_forged_link_with_no_connection_opened`.
+2. **complement + deepseek MED, lone surrogate: CLAIM REFUTED ON THE WIRE, guard ADDED in process.** Over the wire the frame reader's
+   `canon.parse` refuses an escaped `\ud800` and the server hangs up unanswered (never internal-error/transient); held with raw bytes
+   in `test_a_lone_surrogate_in_the_role_evidence_is_a_plain_refusal_never_a_transient_one`. In process, `SignedRole.__post_init__`
+   now encodes strict: "signed.<member> is not UTF-8 text" (ValueError, so `launch_from_wire` makes it a plain WireError);
+   `signed_withhold` keeps any encode failure a `SignedRoleRefused`.
+3. **codex MED, role/spec over SIGNED_TEXT_MAX: CONFIRMED (a 70 x 1 KiB `lands` role registered), FIXED at the source.** `role.add_role`
+   and `spec._register_in` refuse a canonical text over SIGNED_TEXT_MAX bytes: "the role's (spec's) canonical text is over 65536 bytes,
+   the most a launch can carry as signed-role evidence: shorten it". Already-stored oversized roles (none expected) stay a standing
+   `signed-role-unavailable` at launch. Inline spawn roles are not registered and never travel (`signed_role_of` reads the registry).
+4. **complement LOW, no tombstone: CONFIRMED, FIXED.** `WorkspaceUploads.verify` takes the derivation as a callable and runs it inside
+   its judgment (after the own-upload check): a standing signed-role refusal of this connection's upload discards it and tombstones,
+   like every other. The missing-evidence test now asserts the tombstone.
+5. **complement LOW, `RoleError` from `role_withhold` in `_workspace_kwargs`: REFUTED.** `role` is `_pinned_role` ->
+   `role_by_hash` -> `_check_row` -> `parse_role`; re-parsing an already-parsed role cannot raise.
+6. **complement LOW, entry check casefolds patterns per entry: FIXED** (folded once, skipped when the withhold is empty).
+7. **complement LOW (test), either name accepted: FIXED**, pinned to `withhold-loosened` (the member is judged first).
+8. **deepseek LOW, server does not re-run `_pattern_problem` on signed patterns: REFUTED as a confinement break.** The patterns are what
+   his signature covers; a pattern that matches less is a looser withhold he could equally sign as `[]`. Registration validates them.
+9. **deepseek LOW, `signed_role_of`'s broad except is transient: NOT CHANGED.** Same convention as `link_proof` (a store that does
+   not read may read next time); enumerating "real" faults is a separate design call.
+10. **codex LOW, protocol version for the new `proof.signed` field: KNOWN EDGE, not fixed.** A client/daemon version skew fails CLOSED
+    (`bad-request` / `signed-role-missing`), never loose; a `levain-run/2` bump is a protocol decision for the head.
+
+Mutation-checked (each revert turned its named tests red, 0 survivors): `role_hash != link.role_hash`; `signed.agent_id != link.agent_id`;
+server deriving the link's role from the spec instead of the grant; `add_role` bound and its `>` vs `>=`; spec bound; SignedRole strict
+encode; derivation evaluated outside `verify` (tombstone); client `link_of is None` refusal.
+/usr/bin/python3 3.9.6: `py_compile` OK on signed_role.py, session_client.py, dispatch_run.py, workspace.py, role.py, spec.py; signed_role imports.
+Root closure: `link_proof`'s two moved imports reclassified under `_standing_link` (operator).
+Suites run after the fix: every test file importing a touched module (46 files: 1878 passed) and tests/test_ci_root_closure.py whole
+(18 passed; this also closes the r0 UNVERIFIED line about the closure file not being re-run). Still not run: the unit on the VM under
+the root Python 3.9 (compile + import only); no L3 r2 yet on this round's diff.

@@ -60,7 +60,7 @@ __all__ = ["RoleError", "ROLE_FIELDS", "ROLE_OPTIONAL_FIELDS", "ROLE_KINDS",
            "instance_ceiling", "envelope_ceiling", "role_withhold", "spawn_namespace", "add_role", "get_role", "latest_version",
            "role_by_hash"]
 
-from levain.agents.signed_role import ROLE_HASH_PREFIX   # noqa: E402  (one home: the run server re-derives this hash)
+from levain.agents.signed_role import ROLE_HASH_PREFIX, SIGNED_TEXT_MAX   # noqa: E402  (one home: the run server re-derives this hash)
 ROLE_NAME = re.compile(r"[a-z][a-z0-9-]{0,47}")
 ROLE_FIELDS = ("name", "brief", "ceiling", "model", "harness", "executor")  # the REQUIRED fields, not all allowed ones
 ROLE_OPTIONAL_FIELDS = ("kind",)
@@ -300,6 +300,11 @@ def add_role(store: AgentStore, role: dict[str, Any]) -> tuple[str, str, int, bo
     returned as it is (``created`` False); new content under a known name takes the next version."""
     role = parse_role(role)
     text = _canonical(role)
+    if len(text.encode("utf-8")) > SIGNED_TEXT_MAX:
+        # a launch that stages a workspace carries this text as signed-role evidence (levain.agents.signed_role): a role
+        # that could never travel is refused HERE, not at every launch of every agent that pins it (L3 W2 r1 MED)
+        raise RoleError(f"the role's canonical text is over {SIGNED_TEXT_MAX} bytes, the most a launch can carry as "
+                        "signed-role evidence: shorten it")
     digest = role_hash(role)
     with store.write() as conn:
         row = conn.execute("SELECT name, version, spec FROM agent_roles WHERE role_hash = ?", (digest,)).fetchone()

@@ -484,3 +484,34 @@ def test_withhold_never_reaches_the_envelope_narrowing():
         narrow_scope(scope, ceiling)
     assert narrow_scope(scope, envelope_ceiling(ceiling))["where"] == [{"repo": "r", "paths": ["a/"]}]   # ... this view is not
     assert "withhold" not in envelope_ceiling(ceiling) and ceiling["withhold"] == ["docs/**"]
+
+
+def test_a_role_too_long_to_travel_as_signed_role_evidence_is_refused_at_registration(tmp_path):
+    """L3 W2 r1 MED (codex): a valid role whose canonical text is over SIGNED_TEXT_MAX was registrable, and every
+    workspace launch of an agent pinning it was then a standing signed-role-unavailable. Refused at the source now."""
+    from levain.agents.signed_role import SIGNED_TEXT_MAX
+    store = open_agent_store(tmp_path / "store")
+    big = copy.deepcopy(ROLE)
+    big["ceiling"]["lands"] = [f"{i:02d}" + "x" * 1022 for i in range(70)]       # 70 x 1 KiB: a valid ceiling
+    assert len(canonical_role(big).encode()) > SIGNED_TEXT_MAX                 # parse_role accepts it
+    with pytest.raises(RoleError) as exc:                # revert: the SIGNED_TEXT_MAX check in add_role
+        add_role(store, big)
+    assert str(exc.value) == (f"the role's canonical text is over {SIGNED_TEXT_MAX} bytes, the most a launch can carry "
+                              "as signed-role evidence: shorten it")
+    fits = copy.deepcopy(ROLE)
+    fits["ceiling"]["lands"] = big["ceiling"]["lands"][:60]
+    assert len(canonical_role(fits).encode()) <= SIGNED_TEXT_MAX
+    assert add_role(store, fits)[3] is True
+
+
+def test_the_role_bound_is_the_byte_length_at_exactly_the_limit(tmp_path, monkeypatch):
+    from levain.agents import role as R
+    store = open_agent_store(tmp_path / "store")
+    n = len(canonical_role(ROLE).encode())
+    monkeypatch.setattr(R, "SIGNED_TEXT_MAX", n)
+    assert add_role(store, ROLE)[3] is True                                     # exactly the limit registers
+    monkeypatch.setattr(R, "SIGNED_TEXT_MAX", n - 1)                           # revert `>` to `>=`: the line above fails
+    other = copy.deepcopy(ROLE)
+    other["model"] = "n"                                                        # same length, new content
+    with pytest.raises(RoleError):
+        add_role(store, other)
