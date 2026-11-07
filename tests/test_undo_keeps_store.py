@@ -85,5 +85,5 @@ def test_undo_leaves_store_root_tree_and_helpers(host, tmp_path, monkeypatch):
     assert not [r for r in removed if r.startswith((tree, helpers))], removed
     assert not [r for r in removed if r.startswith(store) and r[len(store) + 1:] not in REMOVED_IN_STORE | OPTIONAL_IN_STORE]
     in_store = {r[len(store) + 1:] for r in removed if r.startswith(store + "/")}
-    assert REMOVED_IN_STORE <= in_store <= REMOVED_IN_STORE | OPTIONAL_IN_STORE, in_store
+    assert in_store == REMOVED_IN_STORE | OPTIONAL_IN_STORE, in_store   # the fixture creates every optional file
     assert str(STORE[host] / "reserve") not in removed
