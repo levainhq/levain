@@ -593,9 +593,9 @@ def transcribe(data_root: Path | str, query: str, content_type: str, audio: byte
         return refused or internal_answer()
     mime = base_type(content_type)
     if mime not in vprov.MIME_ALLOW:
-        return None, refusal(415, "unsupported_media_type", "unsupported_media_type")
+        return refusal(415, "unsupported_media_type", "unsupported_media_type")
     if not audio:
-        return None, refusal(400, "no_audio", "no_audio")
+        return refusal(400, "no_audio", "no_audio")
     adapter = vprov.provider_for(provider, transport)
     text, refused = _call(provider, "stt", upload_units(len(audio)), data_root, revoke_queue=revoke_queue,
                           meter=meter, read_key=read_key, last_read=last_read,

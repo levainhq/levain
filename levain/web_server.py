@@ -3646,7 +3646,8 @@ class _Handler(GuardedHandler):
     def _room_directory(self, fallback: Any) -> Any:
         """The directory the open room is read from: the room host's own store (``RoomServe.directory``), else ``fallback``.
         An embedder (flow's bridge) swaps the consent reader for the Signer's queue, so ``_store_directory`` can name a store
-        that holds no room; the voice route read it there and answered room_rotated for the room the page was showing."""
+        that holds no room; the voice route read it there and answered room_rotated for the room the page was showing. The room
+        routes themselves are pinned to the room's store by the embedder, so only a route outside them needs this."""
         host = self.server.room_host
         path = getattr(getattr(host, "store", None), "path", None)
         parent = getattr(path, "parent", None)

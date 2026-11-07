@@ -1488,7 +1488,7 @@
           "Saved for this device. The page that opens a notification reads it only where the browser allows.");
 
     // the test plays the tier the settings name: premium asks the route for its fixed sample sentence, on-device speaks locally
-    const hear = el("button", "dev-btn vc-hear", premium && prov ? "Hear this voice" : "Hear the on-device voice"); hear.type = "button";
+    const hear = el("button", "dev-btn vc-hear", premium && prov ? "Hear this voice" : (blocked ? "Hear the voice" : "Hear the on-device voice")); hear.type = "button";
     const hearNote = el("p", "dev-note vc-help vc-hearnote");
     hearNote.setAttribute("role", "status"); hearNote.hidden = true;
     const showHear = () => { const m = V.noteFor({ thread: "sample", gseq: 0 }); hearNote.textContent = m; hearNote.hidden = !m; };

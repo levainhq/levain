@@ -438,9 +438,9 @@
     // server holds the words; the page sends none); a refusal says its fixed sentence and falls back only when the route said so.
     sample: async function () {
       const s = effective();
-      if (s.blocked) { remember(messages, key({ thread: "sample", gseq: 0 }), s.blocked); changed(); return; }
-      if (s.tier !== "premium") return window.LevainVoice.sampleDevice();
       const reply = { thread: "sample", gseq: 0 };
+      if (s.blocked) { stop(); remember(messages, key(reply), s.blocked); changed(); return; }
+      if (s.tier !== "premium" || !s.provider || !s.voice) return window.LevainVoice.sampleDevice();
       unlock();
       stop();
       messages.delete(key(reply));
@@ -457,10 +457,13 @@
         if (!res.ok) {
           let body = null;
           try { body = await res.json(); } catch (_) { body = null; }
+          if (me !== runId) return;
           say(reply, (body && typeof body.message === "string" && body.message) || WORDS.failed);
+          if (body && body.fallback === "on_device") await speakDevice(reply, SAMPLE, me, s.speed);
           return;
         }
-        const blob = await res.blob();
+        let blob;
+        try { blob = await res.blob(); } catch (_) { if (me === runId) sayIfNone(reply, WORDS.failed); return; }
         if (me !== runId) return;
         const heard = await playBlob(blob, me);
         if (me === runId && !heard) say(reply, WORDS.cantPlay);
