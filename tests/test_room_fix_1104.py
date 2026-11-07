@@ -13,13 +13,13 @@ from tests.test_cockpit_threads_mount import qdir  # noqa: F401  (fixture)
 
 WEB = Path(cockpit_room.__file__).resolve().parents[1] / "templates" / "web"
 _PAGE = ('<!doctype html><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">'
-         '<link rel="stylesheet" href="/dashboard.css"><body class="ke"><section class="rv-zone"><div class="ck-zgrid th-grid">'
-         '<div class="panel"><div class="pbody"><div id="host"></div></div></div></div></section>'
+         '<link rel="stylesheet" href="/dashboard.css"><body class="ke"><div id="host"></div>'
          '<script src="/room_view.js"></script><script src="/rvc.js"></script>')
 _BOOT = """
 window.__body = {room_thread: "t1", composer: {state: "writable"}, model: "m", stream: [], proposals: [], room_error: window.__err || null};
 for (let i = 1; i <= 30; i++) window.__body.stream.push({gseq: i, kind: i % 2 ? "message" : "vendor_agent_text", source: i % 2 ? "operator" : "vendor",
   body: i === 30 ? "newest\\n\\n```py\\nx = 1 < 2\\n```\\n```unclosed\\nstill text" : "line " + i + " " + "word ".repeat(40)});
+document.getElementById("host").style.height = "100dvh";      // the room fills its host: the page gives it a height (inline style is CSP-refused, CSSOM is not)
 window.__posts = [];
 const stub = (u, o) => { if (o && o.method === "POST") { window.__posts.push(u); return Promise.resolve({status: 200, ok: true, text: () => Promise.resolve('{"ok":1}')}); }
   return Promise.resolve({status: 200, ok: true, text: () => Promise.resolve(JSON.stringify(window.__body))}); };
@@ -88,13 +88,13 @@ def test_the_room_has_a_jump_entry_in_the_views_strip_that_targets_its_zone():
     assert 'room: "[data-zone=\\"room\\"]:not([hidden])"' in core
 
 
-def test_the_phone_rules_free_the_card_clamp_and_keep_the_dock_in_flow():
+def test_the_room_rules_keep_the_dock_in_flow_and_the_conversation_the_one_scroller():
     css = (WEB / "dashboard.css").read_text()
     i = css.index(".rv .rv-stage")
     block = css[i:css.index("/* C12:", i)]
-    assert "body.ke .rv-zone .ck-zgrid .panel { height: auto; max-height: none; }" in block and ".rv .rv-body { max-height: 62vh" in block
+    assert ".rv .rv-body { flex: 1 1 auto; min-height: 0; overflow-y: auto;" in block and "max-height: 62" not in block
     assert "overflow-wrap: anywhere" in block and "position: sticky" in block      # the notice, not the dock
-    assert "rv-dock" not in block
+    assert "body.rv-on .deck { position: fixed;" in block
 
 
 def _assets_from(boot):

@@ -410,10 +410,10 @@ def test_the_real_page_opens_the_room_sends_and_shows_the_reply(tmp_path, qdir):
         out = _drive(tmp_path, base + "/", [
             {"until": "document.querySelector('[data-mode-tab=board]')"},
             {"eval": f"localStorage.setItem('levain_write_token', {json.dumps(TOKEN)}); window.__pre = 1; location.reload(); 1"},
-            {"until": "!window.__pre && document.querySelector('.rv-zone') && document.querySelector('[data-mode-tab=build]')"},
-            {"do": "document.querySelector('[data-mode-tab=build]').click(); 1",
+            {"until": "!window.__pre && document.querySelector('.rv-zone') && document.querySelector('[data-phone-jump=room]')"},
+            {"do": "document.querySelector('[data-phone-jump=room]').click(); 1",
              "until": "document.querySelector('.rv-zone .rv-open') && !document.querySelector('.rv-zone .rv-open').hidden"},
-            {"eval": "JSON.stringify({send: document.querySelector('.rv-send').disabled, drop: document.querySelector('.rv-drop').disabled,"
+            {"eval": "JSON.stringify({send: document.querySelector('.rv-send').disabled,"
                      " stop: document.querySelector('.rv-stop').disabled, input: document.querySelector('.rv-input').disabled,"
                      " rotate: document.querySelector('.rv-rotate').disabled})"},
             {"eval": "document.querySelector('.rv-open').click(); 1"},
@@ -424,7 +424,7 @@ def test_the_real_page_opens_the_room_sends_and_shows_the_reply(tmp_path, qdir):
         ])
         mine = [i for i in _get(base)[1]["stream"] if i["kind"] == "message"]
     dark = json.loads(next(v for v in out["values"] if isinstance(v, str) and v.startswith("{")))
-    assert dark == {"send": True, "drop": True, "stop": True, "input": True, "rotate": True}, dark
+    assert dark == {"send": True, "stop": True, "input": True, "rotate": True}, dark
     assert [m["body"] for m in mine] == ["hello page"]
 
 
@@ -437,7 +437,7 @@ _HIDE_AND_SHOW = ("Object.defineProperty(document, 'visibilityState', {configura
 _TO_THE_ROOM = [
     {"until": "document.querySelector('[data-mode-tab=board]')"},
     {"eval": f"localStorage.setItem('levain_write_token', {json.dumps(TOKEN)}); window.__pre = 1; location.reload(); 1"},
-    {"until": "!window.__pre && document.querySelector('.rv-zone') && document.querySelector('[data-mode-tab=build]')"},
+    {"until": "!window.__pre && document.querySelector('.rv-zone') && document.querySelector('[data-phone-jump=room]')"},
 ]
 
 
@@ -456,7 +456,7 @@ def test_a_line_tried_before_an_app_switch_is_sent_again_under_the_same_outbox_i
     with _serve(src, write_token=TOKEN, room_serve=rs) as (base, _h):
         out = _drive(tmp_path, base + "/", _TO_THE_ROOM + [
             {"eval": first_fails},
-            {"do": "document.querySelector('[data-mode-tab=build]').click(); 1",
+            {"do": "document.querySelector('[data-phone-jump=room]').click(); 1",
              "until": "document.querySelector('.rv-zone .rv-open') && !document.querySelector('.rv-zone .rv-open').hidden"},
             {"eval": "document.querySelector('.rv-open').click(); 1"},
             {"until": "!document.querySelector('.rv-input').disabled && document.querySelector('.rv-open').hidden"},
@@ -493,7 +493,7 @@ def test_an_edit_to_a_card_survives_an_app_switch(tmp_path, qdir):
         with rs.store._write() as (conn, now):
             coordroom.propose(conn, launch, [mid], "the room's summary", now=now)
         out = _drive(tmp_path, base + "/", _TO_THE_ROOM + [
-            {"do": "document.querySelector('[data-mode-tab=build]').click(); 1", "until": "document.querySelector('.rv-cardwords')"},
+            {"do": "document.querySelector('[data-phone-jump=room]').click(); 1", "until": "document.querySelector('.rv-cardwords')"},
             {"eval": "const t = document.querySelector('.rv-cardwords'); t.value = 'my edited words'; t.dispatchEvent(new Event('input')); 1"},
             {"eval": _HIDE_AND_SHOW},
             {"until": "document.querySelectorAll('.rv-cardwords').length === 1"},
@@ -573,7 +573,7 @@ def test_a_send_answered_after_an_app_switch_leaves_the_new_view_its_draft_and_i
     with _serve(src, write_token=TOKEN, room_serve=rs) as (base, _h):
         out = _drive(tmp_path, base + "/", _TO_THE_ROOM + [
             {"eval": held},
-            {"do": "document.querySelector('[data-mode-tab=build]').click(); 1",
+            {"do": "document.querySelector('[data-phone-jump=room]').click(); 1",
              "until": "document.querySelector('.rv-zone .rv-open') && !document.querySelector('.rv-zone .rv-open').hidden"},
             {"eval": "document.querySelector('.rv-open').click(); 1"},
             {"until": "!document.querySelector('.rv-input').disabled && document.querySelector('.rv-open').hidden"},

@@ -12,7 +12,8 @@ from tests.test_cockpit_flip_parity import _drive, needs_browser
 from tests.test_cockpit_k2a import _install, _serve
 from tests.test_cockpit_k4a_needs import DESKTOP
 
-READ = ("JSON.stringify({ title: " + TITLE + " || '', modal: !!document.getElementById('levain-modal'), search: location.search, y: Math.round(window.scrollY),"
+# the open sheet locks the page (body position:fixed, top:-Y), so window.scrollY reads 0 behind it; the held place is -body.style.top
+READ = ("JSON.stringify({ title: " + TITLE + " || '', modal: !!document.getElementById('levain-modal'), search: location.search, y: Math.round(window.scrollY || -parseFloat(document.body.style.top) || 0),"
         " note: (document.querySelector('.needs-gone-note') || {}).textContent || '' })")
 ROWS = "document.querySelectorAll('#ck-needs .needs-row').length === 2 && 1"
 SETTLE = {"eval": "new Promise(r => setTimeout(() => r(1), 2500))"}
@@ -76,12 +77,14 @@ def _eleven_questions(tmp_path: Path, monkeypatch) -> None:
 
 @needs_browser
 def test_an_uppercase_np_id_names_the_same_card_as_its_lowercase_one(tmp_path: Path, monkeypatch) -> None:
-    """The guard admits A-F, so `np-0000000A` is a link that reaches the page; card_number gives 1 + 0xA = 11, the codex card."""
+    """The guard admits A-F, so `np-0000000A` is a link that reaches the page; card_number gives 1 + 0xA = 11, the codex card.
+    The strip folds after 6 rows (the approved layout), so the page DRAWS 6 rows and a "Show 5 more" row; card 11 is not drawn, and the
+    link still opens its sheet (the read is of the sheet, not of a row)."""
     _eleven_questions(tmp_path, monkeypatch)
     _root, src, _ids = _install(tmp_path)
     with _serve(src, surface_tokens={"browser": "T"}, install_class="reported") as (url, _httpd):
         out = _drive(tmp_path, f"{url}/?view=needs&item=np-0000000A#write_token=T", [
-            DESKTOP, {"until": "document.querySelectorAll('#ck-needs .needs-row').length >= 11 && 1", "ms": 40000}, SETTLE, {"eval": READ}])["values"]
+            DESKTOP, {"until": "document.querySelectorAll('#ck-needs .needs-row').length === 6 && !!document.querySelector('#ck-needs .needs-more-row') && 1", "ms": 40000}, SETTLE, {"eval": READ}])["values"]
     got = json.loads(out[-1])
     assert got["modal"] and "codex" in got["title"] and got["note"] == "", got
 
@@ -142,3 +145,61 @@ def test_a_late_decisions_read_never_replaces_the_view_the_reader_chose(tmp_path
     assert _slow_decisions(tmp_path / "a", monkeypatch, press=False)["modal"] is True
     got = _slow_decisions(tmp_path / "b", monkeypatch, press=True)
     assert got["modal"] is False and got["note"] == "", got
+
+
+@needs_browser
+def test_a_link_naming_the_items_own_id_opens_the_card_the_band_numbers_for_it(tmp_path: Path, monkeypatch) -> None:
+    """11-06, np-0b62cd3b: flow numbers its cards with the BAND number (desk_cards.display_numbers), no longer 1 + the id's hex, so the ping
+    `item=np-<hex>` named no card and the tap landed on the plain strip with "no longer waiting". The page now resolves the id through
+    the band read (an item's `subject.id` is the id the store filed it under, its `question` the card's number). A foreign store's id is
+    `np-...`; the local store's is `q-...`, the same path: codex's card (question 2) is named by its own id, which is no card number."""
+    _home, store = _two_questions(tmp_path, monkeypatch)
+    qid = store.get(2).id
+    _root, src, _ids = _install(tmp_path)
+    with _serve(src, surface_tokens={"browser": "T"}, install_class="reported") as (url, _httpd):
+        out = _drive(tmp_path, f"{url}/?view=needs&item={qid}#write_token=T", [DESKTOP, {"until": ROWS, "ms": 40000}, SETTLE, {"eval": READ}])["values"]
+    got = json.loads(out[-1])
+    assert got["modal"] and got["title"].endswith("· codex") and got["search"] == "" and got["note"] == "", got
+
+
+# the FIRST band read of the document is stale (a cached read from just before the item appeared) or refused (transient); later ones are real
+FIRST_BAND = """(() => { const f = window.fetch; let n = 0; window.__bandCalls = 0; window.fetch = async (...a) => {
+  if (String(a[0]).indexOf('/cockpit/band.json') === 0) {
+    window.__bandCalls = ++n;
+    if (n === 1 || (MODE === 'refuse' && n === 2)) {   // a refusal outlasts the panel's own retry, so only the jump's retry can recover
+      if (MODE === 'refuse') throw new TypeError('network');
+      const r = await f.apply(window, a); const j = await r.json(); j.items = [];
+      return new Response(JSON.stringify(j), { status: 200, headers: { 'Content-Type': 'application/json' } });
+    } }
+  return f.apply(window, a); }; })();"""
+
+
+def _first_band_bad(tmp_path: Path, monkeypatch, mode: str) -> dict:
+    _home, store = _two_questions(tmp_path, monkeypatch)
+    qid = store.get(2).id
+    _root, src, _ids = _install(tmp_path)
+    go = {"eval": f"location.assign('/?view=needs&item={qid}#write_token=T'); 1"}
+    with _serve(src, surface_tokens={"browser": "T"}, install_class="reported") as (url, _httpd):
+        out = _drive(tmp_path, f"{url}/#write_token=T", [{"init": FIRST_BAND.replace("MODE", json.dumps(mode))}, DESKTOP, go, {"until": ROWS, "ms": 40000}, SETTLE, {"eval": READ}])["values"]
+    return json.loads(out[-1])
+
+
+@needs_browser
+def test_a_stale_cached_band_read_never_makes_a_waiting_card_gone(tmp_path: Path, monkeypatch) -> None:
+    """L3 r1 MED: the band read the jump asks (bandFetch, cached ~2 s) may predate the item; a miss from it re-asks FRESH before the page
+    says "no longer waiting". The first band read of the document here lacks every item; the card must still open, with no notice."""
+    got = _first_band_bad(tmp_path, monkeypatch, "stale")
+    assert got["modal"] and got["title"].endswith("· codex") and got["note"] == "", got
+
+
+@needs_browser
+def test_a_refused_band_read_is_retried_once_not_taken_for_gone(tmp_path: Path, monkeypatch) -> None:
+    got = _first_band_bad(tmp_path, monkeypatch, "refuse")
+    assert got["modal"] and got["title"].endswith("· codex") and got["note"] == "", got
+
+
+def test_only_a_fresh_successful_band_read_concludes_no_longer_waiting() -> None:
+    """Pinned on the code beside the driven cases: the notice is said only from the second (fresh) read's success; a refusal says nothing."""
+    body = _jump_body()
+    assert "bandFetch(fresh)" in body and "read(true)" in body and "gone(true)" in body and "gone(false)" in body, body
+    assert body.count("gone(true)") == 2 and "else gone(true)" in body, body

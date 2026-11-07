@@ -43,6 +43,9 @@ def register(subparsers) -> None:
     rc.add_argument("--ref", default=None, help="Only pings about this ref (request:<id> or question:<n>).")
     rc.add_argument("--json", action="store_true", help="The stable JSON form (levain.webpush.receipts docstring).")
     rc.set_defaults(func=_receipts)
+    dv = common(sub.add_parser("devtest", help="What the /devtest notification-action device test reported (band 299)."))   # devtest
+    dv.add_argument("--json", action="store_true")
+    dv.set_defaults(func=_devtest)
     from levain.webpush import presence
 
     for word, text in (("quiet", "Hold phone pushes for a while (default 60 min), except what needs you (approvals and "
@@ -383,6 +386,15 @@ def _receipts(args: argparse.Namespace) -> int:
         return 2
     report = receipts.build(PushStore(_qdir(args)), since=since, ref=args.ref)
     print(json.dumps(report, indent=2) if args.json else receipts.text(report))
+    return 0
+
+
+def _devtest(args: argparse.Namespace) -> int:   # devtest (band 299)
+    from levain.webpush import devtest
+
+    rows = devtest.events(_qdir(args))
+    print(json.dumps({"summary": devtest.summary(rows), "events": rows}, indent=2) if args.json else
+          devtest.render(rows) if rows else "no device-test report yet: open /devtest on the phone and tap Run test")
     return 0
 
 

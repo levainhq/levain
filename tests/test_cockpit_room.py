@@ -580,7 +580,7 @@ def test_the_room_dock_has_styles_for_every_control_it_draws():
     import re
     from pathlib import Path
     css = (Path(cockpit_room.__file__).resolve().parents[1] / "templates" / "web" / "dashboard.css").read_text()
-    for cls in ("rv", "rv-dock", "rv-input", "rv-actions", "rv-send", "rv-drop", "rv-stop", "rv-mic", "rv-rotate", "rv-sendnote",
+    for cls in ("rv", "rv-dock", "rv-input", "rv-actions", "rv-send", "rv-compose", "rv-pending", "rv-stop", "rv-mic", "rv-rotate", "rv-sendnote",
                 "rv-card", "rv-summary", "rv-mark", "rv-line", "rv-you", "rv-room"):
         assert re.search(r"\.%s\b" % cls, css), cls
     assert not re.search(r"\.rv[^{]*\{[^}]*#[0-9a-fA-F]{3,6}\b", css)       # tokens only: both themes follow
@@ -766,17 +766,6 @@ def _post_from_page(path, body):
     """A page-side POST with the write token, for a test that changes the room while the page polls."""
     return ("fetch('/cockpit/room/%s', {method: 'POST', headers: {'Content-Type': 'application/json', 'X-Levain-Write-Token': '%s'},"
             " body: JSON.stringify(%s)}).then(r => r.status)" % (path, TOKEN, json.dumps(body)))
-
-
-@needs_browser
-def test_f11_the_drop_button_drops_the_draft_verbatim(tmp_path, w):
-    with _serve_room(tmp_path, w, extra_assets=_assets(_boot())) as (base, _h):
-        _drive(tmp_path, base + "/rvc.html", [
-            _UNTIL_READY,
-            {"eval": "document.querySelector('.rv-input').value = ' drop <i>this</i> '; document.querySelector('.rv-drop').click(); 1"},
-            {"until": "document.querySelector('.rv-sendnote').textContent.indexOf('Dropped:') === 0 && document.querySelector('.rv-input').value === ''"},
-        ])
-    assert w.drops() == [(" drop <i>this</i> ", "cockpit")] and w.lines() == [] and w.session.written == []
 
 
 @needs_browser

@@ -138,7 +138,7 @@ _VERB_ROW_PREFIXES = (QUESTION_ROW_PREFIX, NOTE_ROW_PREFIX)
 KERNEL_DECISION_FACETS = frozenset({"principal", "pending_tier", "expires_at", "due", "at", "outcome", "verb",
                                     "reason", "unapplied", "cancelled_by",
                                     "agent", "tool", "consent_state", "consent_tier", "decided_at",
-                                    "question_n", "question_state", "question_options", "note_n", "note_state",
+                                    "question_n", "question_state", "question_options", "question_section", "question_carried", "note_n", "note_state",
                                     "note_open_total", "sign", "egress_state"})
 QUESTION_VERB = "question_answer"       # the cockpit verb a question row offers (verbs.py registers it)
 QUESTION_DONE_HOURS = 24                # an answered question stays listed this long, as a decided request does
@@ -535,6 +535,15 @@ def _question_row_in(q: Any) -> RowIn:
                               "question_options": len(q.options)}
     if answered:
         facets["decided_at"] = q.answer.answered_at
+    # a store whose questions carry no section (the kernel's own, an older host) draws no facet: the page then has no tabs
+    section = getattr(q, "section", "")
+    if section in ("you", "desk"):
+        facets["question_section"] = section
+        carried = getattr(q, "carried", False)
+        if isinstance(carried, bool):     # a real boolean only: a string "false" is truthy, so anything else drops the facet
+            facets["question_carried"] = carried
+        else:
+            del facets["question_section"]
     _sign_facet(facets, q)
     return RowIn(id=f"{QUESTION_ROW_PREFIX}{q.n}", title=f"{agent} · question #{q.n}", facets=facets,
                  stored={"n": q.n, "answered_at": q.answer.answered_at if answered else "open"})
