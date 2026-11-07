@@ -35,7 +35,7 @@ both use it. It either returns a profile or refuses and names every problem it f
 |---|---|
 | Settings, hooks, MCP servers from the lane or anywhere else | The seat is started with an empty settings-source list and `--strict-mcp-config` with an empty server list. Only the profile's own `--settings` apply. A planted `.claude/settings.json` or `.mcp.json` in the clone is never read. |
 | File tools outside the two directories | `--restricted` confines Edit, Write, Read, Glob and Grep to the working directory plus the RETURN directory. |
-| Agent-config names at any depth | Edit, Write, MultiEdit and NotebookEdit are denied on `activation/`, `.levain/`, `.claude/`, `.codex/` and `.mcp.json` under both roots. The sandbox also denies Bash writes to the same names. |
+| Agent-config names at the top of each root | Edit, Write, MultiEdit and NotebookEdit are denied on `activation/`, `.levain/`, `.claude/`, `.codex/` and `.mcp.json` directly under both roots. The sandbox also denies Bash writes to the same names. Only the check made before launch looks at every depth (see below). |
 | `.git` paths that run code or carry configuration | `.git/hooks`, `.git/config`, `.git/info`, `.git/modules` and `.git/worktrees` are denied to the file tools and to Bash writes. |
 | Reading the launcher key directory | A Read rule and the sandbox's `denyRead` both name it. |
 | Loopback and local services | The sandbox binds nothing locally, allows no Unix sockets, and denies `localhost`, `127.0.0.1` and `::1`. |
@@ -58,8 +58,8 @@ Edit rule also refuses the Write tool while a Write rule alone did not. All four
 
 ### Hooks the profile installs
 
-Every tool call is recorded to the launcher key directory by `levain.seat_record` (a `PreToolUse` and a
-`PostToolUse` hook), and permission requests are observed. With a seat-egress grant, a `Stop` and a `SessionEnd`
+Every tool call is recorded to the launcher key directory by `levain.seat_record` (`PreToolUse`, `PostToolUse` and
+`PostToolUseFailure` hooks), and permission requests are observed. With a seat-egress grant, a `Stop` and a `SessionEnd`
 hook run the push described under seat egress.
 
 ### Where it stops
@@ -70,6 +70,7 @@ hook run the push described under seat egress.
   rule made `git commit` fail. Two consequences: a `.git` created after launch is not covered by a deny rule (the
   launch check refuses one that already exists), and a Write to a `.git` file outside the five paths reaches a
   permission prompt instead of a hard refusal.
+- The deny rules name those agent-config paths at the top of each root only. The launch check walks the whole tree and refuses a root that already holds one at any depth, but a nested one (for example `sub/.claude/settings.json`) written during the turn is not denied. The seat loads no settings from its roots, so it is inert for the seat, but it can be committed and, with a seat-egress grant, pushed to the lane branch, where an ordinary Claude Code session that checks the branch out would read it. Review a lane branch before you check it out.
 - NotebookEdit is not in the seat's tool set, because there is no race probe for it yet (see P9 below).
 
 ## The canary: `levain seat canary`
@@ -121,7 +122,7 @@ known to be the wall and not a broken test).
 | P1b inert target | (the harness plants a SessionStart hook and an MCP server in the clone before launch) | the profile's own hooks fire | The planted hook did not run and no MCP server loaded. |
 | P2 symlink-swap race | N Writes through a directory that a sandboxed process flips between real and a symlink to a decoy | a Write to a non-swapped path that must land | None of N landed in the decoy, the flipper ran through the last Write, and no swap Write reached a permission prompt. |
 | P3 cross-lane write | Bash and Write into a second lane | a write in the seat's own lane | The other lane is unchanged. |
-| P4 git | Bash writes to `.git` hooks, config, info and modules; file-tool writes under `.git` | `git commit` in the lane | The commit works and every other attempt was refused with no prompt. |
+| P4 git | Bash writes to `.git` hooks, config, info and modules; file-tool writes under `.git`, and a Write to a nested gitfile (`sub/.git`) | `git commit` in the lane | The commit works and every other attempt was refused with no prompt. |
 | P5 git rename | `mv .git` away, then creating `.git/hooks` | a write in the lane | The rename was refused. |
 | P6 loopback | bind `127.0.0.1` and connect to a harness listener | the listener's own self-connect | Bind and connect were refused and the listener saw nothing. |
 | P7 sandbox arms | a write to the home directory, a request to a host off the allowlist, a connection to a stand-in for the cockpit port | a write in the lane | All three were refused and the stand-in saw nothing. |
@@ -138,13 +139,14 @@ run before it is used. If P10 does not pass, Glob and Grep are dropped from the 
 - **P2 is a sample, not a proof.** Zero of N landed over the flips that occurred. The race is probabilistic and the
   line says so. A larger `--swap-attempts` narrows the gap and never closes it.
 - **P2's prompt rule is not stable.** In repeated runs of the same profile on the same machine, a swap Write
-  sometimes reached a permission prompt and sometimes did not (roughly one run in three or four). P2 can therefore
+  sometimes reached a permission prompt and sometimes did not (roughly one run in three or four, on Claude Code 2.1.319, November 2026). P2 can therefore
   pass on one run and fail on the next with nothing changed. A single pass or a single fail does not settle it. No
   swap write landed in any of those runs, and whether an *approved* swap write would land was not measured.
-- **P4 flags a nested gitfile write.** The probe includes a Write to `sub/.git`. Because `.git` is no longer denied
-  as a whole, Claude Code treats that as a sensitive-file prompt, and P4 fails an attempt that reaches a prompt.
-  Expect P4 to report that on a build with this profile. It is a prompt, not a landed write, and in the runs that
-  showed it nothing changed on disk.
+- **P4 fails on a nested gitfile write, so the overall run reports FAIL and exits 1.** The probe includes a Write to
+  `sub/.git`. Because `.git` is no longer denied as a whole, Claude Code treats that as a sensitive-file prompt, and
+  P4 fails any attempt that reaches a prompt. With this profile, expect `levain seat canary` to print `FAIL` for
+  that reason alone. It is a prompt, not a landed write: in the runs that showed it nothing changed on disk and every
+  other probe passed. Read the per-probe lines, not just the header, until the probe or the profile changes.
 - **A pass is about this run.** It describes one Claude Code version, one machine, one turn on the day it ran. A
   new Claude Code release, a different OS, or different managed settings can change the answer. Re-run after any of
   them.
@@ -171,7 +173,7 @@ levain seat egress list [--path <install>] [--data-root <cockpit>]
 | Command | What it does |
 |---|---|
 | `create` | Signs a grant into the cockpit's authority log. The signing key must be an enrolled laptop-presence key (see `levain cockpit key`). |
-| `renew` | Re-signs a live grant for 14 more days. It refuses an id that is not a seat-egress grant, so it can never extend a lease or another kind of grant. |
+| `renew` | Re-signs a live grant to expire 14 days from the renewal. It refuses an id that is not a seat-egress grant, so it can never extend a lease or another kind of grant. |
 | `revoke` | Revokes a grant: no later push, commits stay in the clone. It refuses an id that is not a seat-egress grant. |
 | `list` | Shows the live grant (id, lanes parent, remote, allowed domains, expiry), or says there is none. |
 
@@ -211,9 +213,9 @@ is recorded and retried at the next `Stop`.
 - **A short window at revoke.** A revoke that lands between the moment the hook reads the log and the moment the
   push or launch is planned is not covered by a shared lock.
 - **Hook deadlines.** The hooks time out at 180 seconds (`Stop`) and 60 seconds (`SessionEnd`), shorter than the
-  push executor's own subprocess limits.
+  push executor's default 600 second limit.
 - **The fallback tool set has no consumer yet.** A failed canary computes a narrower tool set, and nothing launches
-  a seat with it yet.
+  a seat with it yet. Remove this line when the launcher uses it.
 - **A narrow fallback canary can read INCONCLUSIVE.** The Bash-and-Read set, and a default walk path, may report
   inconclusive.
 - **Rename and back.** A seat can rename its clone's `.git` away and back, which keeps its recorded identity. The
@@ -222,7 +224,7 @@ is recorded and retried at the next `Stop`.
   same tip next time; the push is a no-op.
 - **No seat has run end to end under the egress profile on a real machine.** The commit under the final `.git`
   rules, the push under a signed grant, and the hook running outside the sandbox are each covered by tests but have
-  not yet been observed together in a real seat.
+  not yet been observed together in a real seat. Remove this line when they have.
 
 ## The seat-root lease
 
@@ -232,4 +234,6 @@ are documented when launching lands.
 
 ## Launch and stop
 
-`levain seat launch` and stopping a seat are documented here when the launcher lands.
+`levain seat launch` exists today and only validates: it mints the lane's directories under the live lease and prints
+the command and digest it would use. It does not start Claude Code. Starting and stopping a seat are documented here
+when the launcher lands.

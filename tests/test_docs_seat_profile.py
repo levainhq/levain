@@ -202,6 +202,7 @@ def test_protected_names_and_git_paths_are_the_codes():
     assert git_paths == set(seat_profile._GIT_DENY)
     assert set(seat_profile.FILE_TOOLS) == {"Edit", "Write", "MultiEdit", "NotebookEdit"}
     assert "Edit, Write, MultiEdit and NotebookEdit are denied" in TEXT
+    assert "PostToolUseFailure" in TEXT and '"PostToolUseFailure"' in Path(seat_profile.__file__).read_text(encoding="utf-8")
 
 
 def test_the_profile_flags_the_page_names_are_the_argv_s():
@@ -213,7 +214,7 @@ def test_the_profile_flags_the_page_names_are_the_argv_s():
 
 
 def test_the_numbers_the_page_states_are_the_codes():
-    assert authority.SEAT_EGRESS_MAX.days == 14 and "14 days" in TEXT and "14 more days" in TEXT
+    assert authority.SEAT_EGRESS_MAX.days == 14 and "14 days" in TEXT and "14 days from the renewal" in TEXT
     assert authority.SEAT_LEASE_MAX.days == 14
     assert authority._SEAT_EGRESS_DOMAINS_MAX == 16 and "At most 16" in TEXT
     assert seat_push.STOP_TIMEOUT == 180 and seat_push.SESSION_END_TIMEOUT == 60
