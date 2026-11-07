@@ -16,11 +16,10 @@ The call sequence is the design's section 3 and its order is the point:
 
 1. validate the request (nothing read or written on a refusal);
 2. (speak) the room thread must be the open room, and the words are the RECORD's reply, never the page's;
-   then, both routes: when the phone's grant routes are served, the consent hooks of THEIR queue must name
-   ``data_root`` as their one cockpit (:func:`revoke_refusal`), so the grant page's revoke reaches the key about to be
-   read (with no grant route served the revoke is ``levain voice key revoke``, allowed only while the replayed log
-   holds an unrevoked laptop key that can sign it); else ``revoke_unreachable`` (or ``revoke_unchecked`` when that
-   could not be checked), nothing reserved or read;
+   then, both routes: some revoke must reach the key about to be read (:func:`revoke_refusal`): the phone's grant
+   page, when the consent hooks of the queue it is served over name ``data_root`` as their one cockpit; else
+   ``levain voice key revoke``, while the replayed log holds an unrevoked laptop key that can sign it. Neither is
+   ``revoke_unreachable`` (or ``revoke_unchecked`` when that could not be checked), nothing reserved or read;
 3. ``meter.reserve`` (a cap, an unpriced model or a meter that cannot be used refuses here, and no key is read);
 4. ``custody.read_key`` (a fresh verified replay, then the keychain): a :class:`~levain.voice.custody.Secret`;
 5. the adapter call, with ``secret.reveal()`` written INLINE in its argument list, so no name in any frame of this
@@ -179,9 +178,9 @@ WORDS = {
     "no_stt_key": "The {p} key is not set for dictation.",
     "authority_unreadable": "Levain could not verify its authority log just now; premium voice is off until it can.",
     # each is true in every case that returns it (revoke_refusal): no grant page served here acts on this cockpit,
-    # and the command line's revoke needs an unrevoked laptop key, which this Levain may or may not hold
+    # and the replayed log holds no unrevoked laptop key for the command line's revoke to sign with
     "revoke_unreachable": ("Premium voice is off: the phone's grant page cannot revoke this Levain's voice keys. "
-                           "A revoke from the command line needs an unrevoked laptop key."),
+                           "A revoke from the command line needs an unrevoked laptop key, and none is enrolled."),
     "revoke_unchecked": ("Premium voice is off: Levain could not check that this Levain's voice keys can be revoked, "
                          "so no key is read."),
     "keychain_unreadable": "Levain could not read the key from this Mac's keychain (it may be locked).",
@@ -368,36 +367,41 @@ def _cli_revoke_refusal(data_root: Path | str) -> str | None:
 
 def revoke_refusal(revoke_queue: Path | str | None, data_root: Path | str) -> str | None:
     """None when a revoke reaches the voice keys at ``data_root``, else the refusal (a key of :data:`WORDS`, also the
-    error code). ``revoke_queue`` is the queue the grant routes are served over (``GrantPhone.queue_dir``), None when
-    the server serves no grant routes (no Signer, or its queue is not the consent reader's): then the only revoke is
-    the command line's ``levain voice key revoke``, which acts on ``data_root`` directly but needs a laptop key that
-    can sign it, so :func:`_cli_revoke_refusal` decides (Phill 11-06: premium voice with no Signer whenever the CLI
-    revoke exists). Otherwise that queue's consent hooks must name exactly one cockpit
-    (:func:`levain.consent.sign.sign_root`'s rule, so the root the grant routes act on) and it must be ``data_root``;
-    any other answer is ``revoke_unreachable``. A fault while checking (the hook file unreadable, an unexpected shape,
-    the log not replayable) is ``revoke_unchecked``, a different sentence: it is not known that no revoke reaches.
-    That fault is logged by its type name only. Re-read on every call: the hook file and the log can change while the
-    server runs."""
+    error code). Two revokes can reach them: the phone's grant page, and the command line's ``levain voice key
+    revoke``, which acts on ``data_root`` directly but needs a laptop key that can sign it (:func:`_cli_revoke_refusal`).
+    Premium voice is allowed whenever either reaches (Phill 11-06: premium voice with no Signer whenever the CLI revoke
+    exists).
+
+    ``revoke_queue`` is the queue the grant routes are served over (``GrantPhone.queue_dir``), None when the server
+    serves no grant routes. The grant page reaches these keys only when that queue's consent hooks name exactly one
+    cockpit (:func:`levain.consent.sign.sign_root`'s rule, so the root the grant routes act on) and it is
+    ``data_root``: then the answer is None. With no grant routes, or with routes acting on another cockpit (or on
+    zero or several), the phone cannot revoke these keys, so the command line's check decides, and its
+    ``revoke_unreachable`` means neither revoke reaches.
+
+    A fault while checking (the hook file unreadable, an unexpected shape, the log not replayable) is
+    ``revoke_unchecked``, a different sentence: it is not known that no revoke reaches. A fault reading the hooks does
+    not fall back to the command line: which root the grant routes act on is then unknown, and failing closed is the
+    rule for an unknown. That fault is logged by its type name only. Re-read on every call: the hook file and the log
+    can change while the server runs."""
     from levain.consent.answering import hook_roots
 
     if revoke_queue is None:
         return _cli_revoke_refusal(data_root)
     try:
         roots = list(hook_roots(Path(revoke_queue)))
-        if len(roots) != 1:
-            return "revoke_unreachable"
-        same = Path(roots[0]).resolve() == Path(data_root).resolve()
+        same = len(roots) == 1 and Path(roots[0]).resolve() == Path(data_root).resolve()
     except Exception as exc:     # noqa: BLE001 - a check that could not be made fails closed, in its own words
         _log.warning("voice: the revoke reach could not be checked (%s); no key is read", type(exc).__name__)
         return "revoke_unchecked"
-    return None if same else "revoke_unreachable"
+    return None if same else _cli_revoke_refusal(data_root)
 
 
 def _call(provider: str, use: str, units: int, data_root: Path | str, *, revoke_queue: Path | str | None,
           meter: vmeter.Meter, read_key: Callable[..., Any], last_read: MutableMapping[str, str | None],
           send: Callable[[Any], Any]) -> tuple[Any, Answer | None]:
     """Steps 3 to 6 of the module docstring for one call, after the revoke-reach check (:func:`revoke_refusal`): a
-    key whose revoke from the phone could not reach it is never read, and nothing is reserved. ``send(secret)`` makes
+    key no revoke could reach is never read, and nothing is reserved. ``send(secret)`` makes
     the adapter call and must write ``secret.reveal()`` inline in the adapter's argument list. Returns
     ``(result, None)`` or ``(None, refusal)``."""
     # known edge, by intent: a hook file edited (or the last laptop key revoked) between this check and read_key lets
