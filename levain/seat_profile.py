@@ -253,7 +253,8 @@ def build_seat_profile(clone: Path, return_dir: Path, *, claude_bin: str, python
                        canary_root: Path | None = None, environ: Mapping[str, str] | None = None,
                        managed: Sequence[tuple[str, Any]] | None = None, platform: str = sys.platform,
                        home: Path | None = None, egress: Mapping[str, Any] | None = None,
-                       cockpit_root: Path | str | None = None, levain_home: Path | str | None = None) -> SeatProfile:
+                       cockpit_root: Path | str | None = None, levain_home: Path | str | None = None,
+                       tools: Sequence[str] = CC_SEAT_TOOLS) -> SeatProfile:
     """Build the terminal seat profile, or raise :class:`SeatRefusal` naming every problem found. ``lease=None`` is
     accepted only with ``canary_root`` under the fixed test prefix. Refuses a root that already holds an agent-config
     target, and an executable (python, claude) a seat could write.
@@ -263,11 +264,15 @@ def build_seat_profile(clone: Path, return_dir: Path, *, claude_bin: str, python
     ``SessionEnd`` push hook (``cockpit_root`` and ``levain_home`` are what the hook reads, both required); with None
     both are exactly what they were before Z2a (empty domains, no such hook). A grant never reaches a canary profile.
     The domains are frozen at launch: a revoke stops the push at once, the network only at the seat's relaunch (the
-    KNOWN EDGE at the ``allowedDomains`` line)."""
+    KNOWN EDGE at the ``allowedDomains`` line). ``tools`` is the seat's ``--tools`` set (default ``CC_SEAT_TOOLS``; a
+    subset when a failed canary named a fallback, PATHZERO Z5)."""
     environ = os.environ if environ is None else environ
+    tools = tuple(tools)
     clone, return_dir, key_dir = _real(clone), _real(return_dir), _real(key_dir)
     roots = (clone, return_dir)
     problems = _lease_problems(clone, return_dir, lease, canary_root, environ)
+    if not tools or len(set(tools)) != len(tools) or any(t not in CC_SEAT_TOOLS for t in tools):
+        problems.append(f"the tool set {tools!r} must be a non-empty subset of the admitted seat tools, with no repeats")
     problems += _egress_problems(clone, lease, egress, cockpit_root, levain_home)
     problems += _roots_problems(clone, return_dir, key_dir)
     if not problems:
@@ -286,7 +291,8 @@ def build_seat_profile(clone: Path, return_dir: Path, *, claude_bin: str, python
     # cuts the PUSH at once (the hook and the executor re-read the authority log each time) but NOT the network a
     # running seat already has: the domains last until that seat is relaunched. Mitigated: the seat holds no remote
     # credential (the push is Levain's executor, outside the bound), and a launch under a revoked or expired grant gets
-    # no domains (and under an expired lease refuses). Killing running seats on a revoke is the launcher lane's (L-F).
+    # no domains (and under an expired lease refuses). ``levain seat egress revoke`` stops the seats launched under the
+    # revoked grant (L-F, ``seat_lease.stop_seats_for_grant``).
     sandbox["network"]["allowedDomains"] = [] if egress is None else list(egress["allowed_domains"])
     sandbox["filesystem"] = {
         "disabled": False,
@@ -325,4 +331,4 @@ def build_seat_profile(clone: Path, return_dir: Path, *, claude_bin: str, python
         raise SeatRefusal("; ".join(problems))
     env = {**hg.host_env(environ, roots=roots), "CLAUDE_CODE_DISABLE_GIT_INSTRUCTIONS": "1"}
     return SeatProfile(clone=clone, return_dir=return_dir, roots=roots, claude_bin=claude_bin, settings=settings,
-                       mcp_config={"mcpServers": {}}, env=env)
+                       mcp_config={"mcpServers": {}}, env=env, tools=tools)

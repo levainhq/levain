@@ -12,10 +12,13 @@ the first lease create, private half 0600 in the key directory, which every seat
 the RETURN directory are created by the mint (an exclusive mkdir under the parent), never adopted from an existing
 path, and the row pins the clone's ``.git`` identity (device, inode) so a later Levain git call can refuse a replaced
 one; a ``.git`` renamed away, edited and renamed back keeps its identity, so that check never vouches for the
-contents (canary P5 measures whether the rename is possible at all). This module BUILDS AND VALIDATES a launch; it never executes ``claude`` (the launch itself is Z1e's, in the VM).
+contents (canary P5 measures whether the rename is possible at all). :func:`prepare_launch` BUILDS AND VALIDATES a
+launch and executes nothing; :func:`launch_seat` (PATHZERO Z5) starts ``claude`` from a prepared plan and :func:`stop_seat`
+stops it, both recorded in the same chain (the ``start`` row).
 """
 from __future__ import annotations
 
+import calendar
 import fcntl
 import hashlib
 import json
@@ -23,9 +26,11 @@ import os
 import re
 import secrets
 import shutil
+import signal
 import stat
 import subprocess
 import sys
+import time
 from collections.abc import Callable, Mapping
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -36,8 +41,8 @@ from levain.authority import SEAT_LEASE_KIND, SEAT_LEASE_MAX, AuthoritySnapshot,
 from levain.seat_profile import SeatProfile, SeatRefusal, build_seat_profile
 
 __all__ = ["SEAT_LEASE_KIND", "SeatLaunchRefused", "LaunchPlan", "live_lease", "key_dir_for", "ensure_launcher_key",
-           "create_lease", "renew_lease", "mint_lane", "append_mint", "read_mints", "prepare_launch", "launch_seat",
-           "SIGN_COMMAND"]
+           "create_lease", "renew_lease", "mint_lane", "append_mint", "read_mints", "prepare_launch", "validate_launch",
+           "launch_seat", "stop_seat", "stop_seats_for_grant", "seed_trust", "SIGN_COMMAND", "StopResult"]
 
 SIGN_COMMAND = "levain seat lease create --lanes-parent <dir> --returns-parent <dir> --signing-key <key>"
 _LANE_KEY = re.compile(r"[a-z0-9][a-z0-9._-]{0,63}")
@@ -374,12 +379,17 @@ def read_mints(key_dir: Path) -> list[dict[str, Any]]:
 class LaunchPlan:
     """What a validated launch would run: the profile, its digest and the mint row already recorded."""
 
-    def __init__(self, profile: SeatProfile, mint: Mapping[str, Any]) -> None:
-        self.profile, self.mint = profile, mint
+    def __init__(self, profile: SeatProfile, mint: Mapping[str, Any], key_dir: Path | None = None) -> None:
+        self.profile, self.mint, self.key_dir = profile, mint, key_dir
 
     @property
     def digest(self) -> str:
         return str(self.mint["profile_digest"])
+
+    @property
+    def egress_grant(self) -> str | None:
+        """The seat-egress grant id the profile was built under (None: no grant; a row from before Z5 has none)."""
+        return self.mint.get("egress_grant")
 
 
 def prepare_launch(lane_key: str, remote_url: str, base_sha: str, *, claude_bin: str, python: str,
@@ -426,13 +436,14 @@ def prepare_launch(lane_key: str, remote_url: str, base_sha: str, *, claude_bin:
             profile_kw = {"cockpit_root": cockpit_root, "levain_home": Path(os.path.abspath(_levain_home())), **profile_kw}
         profile = build_seat_profile(clone, return_dir, claude_bin=claude_bin, python=python, lease=lease,
                                      key_dir=key_dir, egress=egress, **profile_kw)
-        row = {**row, "profile_digest": profile.digest(), "claude": _binary_ident(claude_bin)}
+        row = {**row, "profile_digest": profile.digest(), "claude": _binary_ident(claude_bin),
+               "egress_grant": None if egress is None else egress["id"]}
         mint = append_mint(key_dir, row)
     except BaseException:
         for p in (return_dir, clone):
             shutil.rmtree(p, ignore_errors=True)
         raise
-    return LaunchPlan(profile, mint)
+    return LaunchPlan(profile, mint, key_dir)
 
 
 def _levain_home() -> Path:
@@ -448,10 +459,12 @@ def _binary_ident(claude_bin: str) -> list[int]:
         return []
 
 
-def launch_seat(lane_key: str, remote_url: str, base_sha: str, *, claude_bin: str, python: str,
-                cockpit_root: Path | str, install: Path | str, out=None, err=None, **kw: Any) -> int:
-    """:func:`prepare_launch`, then print the argv and the digest. Never executes ``claude`` (Z1e launches). Returns 0,
-    or 1 with the refusal on ``err``."""
+
+
+def validate_launch(lane_key: str, remote_url: str, base_sha: str, *, claude_bin: str, python: str,
+                    cockpit_root: Path | str, install: Path | str, out=None, err=None, **kw: Any) -> int:
+    """:func:`prepare_launch`, then print the argv and the digest. Starts nothing (``levain seat launch --dry-run``; the
+    roots it mints stay, with their mint row). Returns 0, or 1 with the refusal on ``err``."""
     out, err = out or sys.stdout, err or sys.stderr
     try:
         plan = prepare_launch(lane_key, remote_url, base_sha, claude_bin=claude_bin, python=python,
@@ -463,3 +476,257 @@ def launch_seat(lane_key: str, remote_url: str, base_sha: str, *, claude_bin: st
     print(f"  clone   {plan.profile.clone}\n  return  {plan.profile.return_dir}\n  digest  {plan.digest}", file=out)
     print("  argv    " + json.dumps(plan.profile.argv()), file=out)
     return 0
+
+
+# --- the start and the stop (PATHZERO Z5) ---------------------------------------------------------------------------
+
+#: The seat starts as ``sh``, which stops ITSELF before it execs ``claude``: the launcher records the process in the mint
+#: chain while it is stopped, then continues it. ``exec`` keeps the pid and the process start time, so the recorded
+#: identity is the one ``claude`` runs under. A launcher that dies in that window leaves a stopped ``sh`` that has run
+#: nothing; a seat is never live and unrecorded.
+_WRAP = 'kill -STOP $$; exec "$@"'
+_STOP_WAIT = 15.0
+_PS_ENV = {"LC_ALL": "C", "TZ": "UTC", "PATH": "/bin:/usr/bin"}
+
+
+def _proc_start_ns(pid: int) -> int | None:
+    """The process's OWN start time (epoch ns, ``ps -o lstart=``: one-second resolution), or None when no such process.
+    Never the clock at spawn: a reused pid has a different start time, which is what makes a recorded pid safe to signal."""
+    r = subprocess.run(["ps", "-o", "lstart=", "-p", str(int(pid))], env=_PS_ENV, text=True, capture_output=True,
+                       timeout=10, check=False)
+    text = r.stdout.strip()
+    if not text:
+        return None
+    try:
+        return calendar.timegm(time.strptime(text, "%a %b %d %H:%M:%S %Y")) * 1_000_000_000
+    except ValueError:
+        raise SeatLaunchRefused(f"the start time of process {pid} cannot be read ({text[:60]!r})") from None
+
+
+def seed_trust(home: Path | str, clone: Path | str) -> Path:
+    """Make ``clone`` a trusted workspace for the seat whose HOME is ``home``: claude refuses ``--bg`` and an interactive
+    start in an untrusted path ("Workspace not trusted"; 1106-16/z1e), and a minted clone is a new path every time. Merges
+    exactly ``projects[<clone>].hasTrustDialogAccepted = true`` into ``<home>/.claude.json`` (and the first-run
+    ``hasCompletedOnboarding`` / ``theme`` only if the file lacks them), which is what the vendor writes when a person
+    accepts the dialog. Everything else in the file is kept; a file that cannot be read as a JSON object is refused,
+    never overwritten; written whole to a private temp and renamed, 0600. It touches that one file and nothing else."""
+    home = Path(home)
+    if not home.is_absolute() or not home.is_dir() or home.is_symlink():
+        raise SeatLaunchRefused(f"the seat HOME {str(home)!r} is not an absolute, real directory")
+    path = home / ".claude.json"
+    data: Any = {}
+    if os.path.lexists(path):
+        try:
+            fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
+            try:
+                data = json.loads(os.read(fd, 16 * 1024 * 1024) or b"{}")
+            finally:
+                os.close(fd)
+        except (OSError, ValueError):
+            raise SeatLaunchRefused(f"{str(path)!r} cannot be read as JSON (or is a link): the trust was not seeded, "
+                                    "and the file was not touched") from None
+    projects = data.get("projects", {}) if isinstance(data, dict) else None
+    if not isinstance(projects, dict):
+        raise SeatLaunchRefused(f"{str(path)!r} is not a JSON object with an object 'projects': not touched")
+    data.setdefault("hasCompletedOnboarding", True)
+    data.setdefault("theme", "dark")
+    entry = projects.get(str(clone))
+    projects[str(clone)] = {**(entry if isinstance(entry, dict) else {}), "hasTrustDialogAccepted": True}
+    data["projects"] = projects
+    tmp = home / f".claude.json.levain-{secrets.token_hex(6)}"
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+    try:
+        try:
+            _write_all(fd, json.dumps(data, indent=2).encode())
+            os.fsync(fd)
+        finally:
+            os.close(fd)
+        os.replace(tmp, path)
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+    return path
+
+
+def _reap(pid: int) -> None:
+    try:
+        os.waitpid(pid, os.WNOHANG)
+    except ChildProcessError:
+        pass
+
+
+def _kill_group(pgid: int, sig: int) -> None:
+    try:
+        os.killpg(pgid, sig)
+    except ProcessLookupError:
+        pass
+
+
+def launch_seat(plan: LaunchPlan, *, prompt: str | None = None, model: str | None = None, headless: bool = False,
+                stop_wait: float = _STOP_WAIT) -> dict[str, Any]:
+    """Start the seat ``plan`` describes (``prepare_launch`` already minted its roots and recorded the mint) and return
+    ``{lane, pid, pgid, started_at_ns, clone, return_dir, log, row}``.
+
+    ``claude`` runs with ``plan.profile.argv(...)`` and ``plan.profile.env`` in the clone, in its own session and process
+    group, stdin closed, stdout and stderr to ``<RETURN>/seat-launch.log``. The sequence: seed the trust; spawn the
+    stopped wrapper (:data:`_WRAP`); read its own start time; append the ``start`` row (pid, pgid, start time, the egress
+    grant id, the claude identity) to the chain; only then SIGCONT. A failure at any step before the continue kills the
+    group and removes the roots this launch minted (the mint row stays: the audit trail of a launch that did not run).
+    The caller must treat the returned seat as running."""
+    if plan.key_dir is None:
+        raise SeatLaunchRefused("this plan carries no launcher key directory: it was not made by prepare_launch")
+    profile, lane = plan.profile, str(plan.mint["lane_key"])
+    clone, return_dir = profile.clone, profile.return_dir
+    if prompt is not None and (prompt.startswith("-") or "\0" in prompt):
+        raise SeatLaunchRefused("the prompt must not start with '-' (it would read as a flag) or hold a NUL")
+    pgid = 0
+    log = return_dir / "seat-launch.log"
+    try:
+        home = profile.env.get("HOME", "")
+        seed_trust(home, clone)
+        argv = [*profile.argv(headless=headless, model=model), *([prompt] if prompt else [])]
+        logfd = os.open(log, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+        try:
+            proc = subprocess.Popen(["/bin/sh", "-c", _WRAP, "sh", *argv], cwd=clone, env=dict(profile.env),
+                                    stdin=subprocess.DEVNULL, stdout=logfd, stderr=logfd, start_new_session=True)
+        finally:
+            os.close(logfd)
+        pid = pgid = proc.pid
+        deadline = time.monotonic() + stop_wait
+        while True:
+            done, status = os.waitpid(pid, os.WNOHANG | os.WUNTRACED)
+            if done and os.WIFSTOPPED(status):
+                break
+            if done:
+                pgid = 0
+                raise SeatLaunchRefused(f"the seat process exited before it started (status {status}): see {str(log)!r}")
+            if time.monotonic() > deadline:
+                raise SeatLaunchRefused("the seat process did not reach its start gate in time")
+            time.sleep(0.01)
+        started = _proc_start_ns(pid)
+        if started is None or os.getpgid(pid) != pgid:
+            raise SeatLaunchRefused("the stopped seat process is not the group leader the row would record")
+        row = append_mint(plan.key_dir, {
+            "v": 1, "ev": "start", "lane_key": lane, "lease_id": plan.mint["lease_id"], "mint_hash": plan.mint["hash"],
+            "clone_path": str(clone), "pid": pid, "pgid": pgid, "started_at_ns": started, "log": str(log),
+            "profile_digest": plan.digest, "claude": plan.mint.get("claude", []),
+            "egress_grant": plan.mint.get("egress_grant"), "headless": bool(headless),
+            "at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%fZ")})
+        os.kill(pid, signal.SIGCONT)
+    except BaseException:
+        if pgid > 1:
+            _kill_group(pgid, signal.SIGKILL)
+            _reap(pgid)
+        for p in (return_dir, clone):
+            shutil.rmtree(p, ignore_errors=True)
+        raise
+    return {"lane": lane, "pid": pid, "pgid": pgid, "started_at_ns": started, "clone": str(clone),
+            "return_dir": str(return_dir), "log": str(log), "row": row}
+
+
+class StopResult:
+    """What :func:`stop_seat` did: ``status`` is ``stopped`` (a signal ended it) or ``gone`` (nothing to signal)."""
+
+    def __init__(self, lane: str, status: str, detail: str, pgid: int | None = None) -> None:
+        self.lane, self.status, self.detail, self.pgid = lane, status, detail, pgid
+
+    def __str__(self) -> str:
+        return f"seat {self.lane}: {self.status}: {self.detail}"
+
+
+def _start_rows(rows: list[dict[str, Any]]) -> dict[str, dict[str, Any]]:
+    """The NEWEST ``start`` row of each lane."""
+    out: dict[str, dict[str, Any]] = {}
+    for r in rows:
+        if r.get("ev") == "start" and isinstance(r.get("lane_key"), str):
+            out[r["lane_key"]] = r
+    return out
+
+
+def _group_alive(pgid: int, *, signalled: bool = False) -> bool:
+    """Whether process group ``pgid`` has a member. EPERM before we signalled it means a group that is not this user's
+    (refused); after our own SIGTERM it is macOS answering for a group of zombies, which is dead for our purpose."""
+    try:
+        os.killpg(pgid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        if signalled:
+            return False
+        raise SeatLaunchRefused(f"process group {pgid} is not this user's: nothing signalled") from None
+    return True
+
+
+def _stop_row(row: Mapping[str, Any], *, grace: float, poll: float = 0.05) -> StopResult:
+    lane, pid, pgid = str(row["lane_key"]), row.get("pid"), row.get("pgid")
+    if not (isinstance(pid, int) and isinstance(pgid, int) and pid > 1 and pgid > 1 and isinstance(row.get("started_at_ns"), int)):
+        raise SeatLaunchRefused(f"the start row of lane {lane!r} carries no usable pid, pgid and start time: nothing signalled")
+    now = _proc_start_ns(pid)
+    if now is not None and now != row["started_at_ns"]:
+        raise SeatLaunchRefused(f"pid {pid} now has a different start time than lane {lane!r} recorded (the pid was "
+                                "reused): nothing signalled")
+    if now is not None:
+        try:
+            if os.getpgid(pid) != pgid:
+                raise SeatLaunchRefused(f"pid {pid} is no longer in the recorded process group {pgid}: nothing signalled")
+        except ProcessLookupError:
+            pass
+    _reap(pid)
+    # a pid cannot be reused while a process group of that id has members, so a group that is still alive with the
+    # leader gone holds only the seat's own descendants
+    if not _group_alive(pgid):
+        return StopResult(lane, "gone", f"process group {pgid} had already exited; nothing to signal", pgid)
+    _kill_group(pgid, signal.SIGTERM)
+    deadline = time.monotonic() + grace
+    while time.monotonic() < deadline:
+        _reap(pid)
+        if not _group_alive(pgid, signalled=True):
+            return StopResult(lane, "stopped", f"SIGTERM to process group {pgid}; it exited", pgid)
+        time.sleep(poll)
+    _kill_group(pgid, signal.SIGKILL)
+    for _ in range(100):
+        _reap(pid)
+        if not _group_alive(pgid, signalled=True):
+            return StopResult(lane, "stopped", f"SIGTERM to process group {pgid} was not enough in {grace:g}s; SIGKILL ended it", pgid)
+        time.sleep(poll)
+    raise SeatLaunchRefused(f"process group {pgid} of lane {lane!r} survived SIGKILL")
+
+
+def stop_seat(key_dir: Path, lane_key: str, *, grace: float = 10.0) -> StopResult:
+    """Stop the lane's seat: the NEWEST ``start`` row for ``lane_key`` in the verified mint chain names the pid, the
+    process group and the process's own start time. The group is signalled (SIGTERM, ``grace`` seconds, then SIGKILL)
+    only if the pid still has that start time (a reused pid is NEVER signalled: refused). A seat already gone is a
+    success (``gone``). Raises :class:`SeatLaunchRefused` for no such row, a reused pid, or a group that survives."""
+    try:
+        rows = read_mints(key_dir)
+    except (ValueError, OSError) as exc:
+        raise SeatLaunchRefused(f"the mint chain cannot be verified ({type(exc).__name__}: {str(exc)[:120]})") from None
+    row = _start_rows(rows).get(lane_key)
+    if row is None:
+        raise SeatLaunchRefused(f"no launched seat is recorded for lane {lane_key!r}: nothing signalled")
+    return _stop_row(row, grace=grace)
+
+
+def stop_seats_for_grant(key_dir: Path, grant_id: str, *, grace: float = 10.0) -> list[StopResult]:
+    """Stop every seat whose newest ``start`` row records egress grant ``grant_id`` (the post-step of ``levain seat egress
+    revoke``: the grant's ``allowedDomains`` are frozen in the launch settings, so the revoke cuts the push, not the
+    seat's network). A seat launched under no grant, or another, is untouched. One seat that cannot be stopped is
+    reported as a ``refused`` result and the rest are still tried."""
+    if not os.path.lexists(key_dir / _KEY):
+        return []                       # no launcher key, so no seat was ever launched from this install
+    try:
+        rows = read_mints(key_dir)
+    except (ValueError, OSError) as exc:
+        raise SeatLaunchRefused(f"the mint chain cannot be verified ({type(exc).__name__}: {str(exc)[:120]})") from None
+    out = []
+    for lane, row in _start_rows(rows).items():
+        if row.get("egress_grant") != grant_id:
+            continue
+        try:
+            out.append(_stop_row(row, grace=grace))
+        except SeatLaunchRefused as exc:
+            out.append(StopResult(lane, "refused", str(exc)))
+    return out

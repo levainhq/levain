@@ -141,7 +141,7 @@ def test_a_profile_refusal_removes_what_the_mint_made_and_writes_no_row(rig):
     assert list(rig.lanes.iterdir()) == [] and list(rig.returns.iterdir()) == [] and sl.read_mints(rig.key_dir) == []
 
 
-def test_launch_seat_prints_the_argv_and_digest_and_never_executes(rig, monkeypatch):
+def test_validate_launch_prints_the_argv_and_digest_and_never_executes(rig, monkeypatch):
     rig.sign_lease()
     for name in ("execv", "execvp", "execve", "execvpe"):
         monkeypatch.setattr(os, name, lambda *a, **k: pytest.fail("a launch must not exec claude"))
@@ -150,7 +150,7 @@ def test_launch_seat_prints_the_argv_and_digest_and_never_executes(rig, monkeypa
     monkeypatch.setattr(subprocess, "run", lambda argv, *a, **k: (ran.append(argv[0]), real_run(argv, *a, **k))[1])
     import io
     out, err = io.StringIO(), io.StringIO()
-    rc = sl.launch_seat("lane-p", str(rig.src), rig.sha, claude_bin=rig.claude, python=sys.executable,
+    rc = sl.validate_launch("lane-p", str(rig.src), rig.sha, claude_bin=rig.claude, python=sys.executable,
                         cockpit_root=rig.world.root, install=rig.tmp, out=out, err=err,
                         now=rig.world.clock.now + timedelta(minutes=1), managed=())
     assert rc == 0 and "not started" in out.getvalue() and "digest" in out.getvalue() and err.getvalue() == ""
