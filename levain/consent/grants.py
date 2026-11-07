@@ -24,7 +24,7 @@ from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any
 
-from levain.authority import (CONSENT_CONTAINED_SHELL_KIND, CONSENT_GRANT_KIND, CONSENT_MCP_GRANT_KIND, SEAT_LEASE_KIND,
+from levain.authority import (CONSENT_CONTAINED_SHELL_KIND, CONSENT_GRANT_KIND, CONSENT_MCP_GRANT_KIND, SEAT_EGRESS_KIND, SEAT_LEASE_KIND,
                               VOICE_KEY_KIND, AuthorityError, StaleHead, UnsignedLink, VerifierUnavailable, anchor_path, append,
                               consent_grant, consent_grant_tool_problem, consent_resolved_workspace,
                               contained_shell_grant, inert_grant, passkey_revocable, prepare, voice_key_record)
@@ -265,9 +265,12 @@ def grant_view(queue_dir: Path | str, *, now: datetime, recent: int = 5,
     # a seat-root lease (levain.seat_lease) is passkey-revocable too, so it is listed for its revoke (ruling D2 a); it
     # answers no consent request either
     lease = [gid for gid, g in sorted(state.policy.grants.items()) if g.get("kind") == SEAT_LEASE_KIND]
-    links = {gid: state.grant_link(gid) for gid in [g.id for g in consent] + [i[0] for i in inert] + voice + lease}
+    # a seat-egress grant (levain.seat_push, Z2a) is listed the same way, for the same revoke
+    egress = [gid for gid, g in sorted(state.policy.grants.items()) if g.get("kind") == SEAT_EGRESS_KIND]
+    links = {gid: state.grant_link(gid) for gid in [g.id for g in consent] + [i[0] for i in inert] + voice + lease + egress}
     evidence = read_grant_evidence(queue_dir, [(gid, *link) for gid, link in links.items()
-                                               if link is not None and gid not in voice and gid not in lease], recent=recent)
+                                               if link is not None and gid not in voice and gid not in lease
+                                               and gid not in egress], recent=recent)
     stamp = utc_stamp(now)
     rows: list[dict[str, Any]] = []
 
@@ -304,6 +307,11 @@ def grant_view(queue_dir: Path | str, *, now: datetime, recent: int = 5,
         rows.append({**common(gid, SEAT_LEASE_KIND, str(g["expires_at"]), None if link is None else link[0]),
                      "state": "live" if str(g["expires_at"]) > stamp else "expired", "agent": visible(str(g["agent"])),
                      "tools": [], "workspace": visible(str(g["lanes_parent"])), "postures": []})
+    for gid in egress:              # the pinned remote is shown as its workspace; the lane branch is never a field
+        g, link = state.policy.grants[gid], links[gid]
+        rows.append({**common(gid, SEAT_EGRESS_KIND, str(g["expires_at"]), None if link is None else link[0]),
+                     "state": "live" if str(g["expires_at"]) > stamp else "expired", "agent": visible(str(g["agent"])),
+                     "tools": [], "workspace": visible(str(g["push_remote"])), "postures": []})
     return {"root": visible(str(root)), "note": "", "grants": rows, "inert_note": INERT_NOTE}
 
 

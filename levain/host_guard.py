@@ -76,13 +76,21 @@ CC_HOSTED_TOOLS = ("Bash", "Read")
 # a path policy in front of CC's own tool and that a won symlink-swap race is not excluded; the
 # race's prize was bounded instead: permissions.deny on every protected name for all four file
 # tools, roots minted per lane under his signed lease, and inert targets (the seat loads no
-# settings, hooks or MCP from its own roots). MultiEdit and NotebookEdit were left out until the
-# host probe that measured Edit and Write measures them. The seat canary reports the swap race
+# settings, hooks or MCP from its own roots). The seat canary reports the swap race
 # as a rate over N attempts, never as a pass; a non-zero rate returns the seat set to
 # ("Bash", "Read") as levain 43 ruled for a failed probe. A hosted session is unchanged: a
 # cockpit that can be reached approves held actions, which a terminal seat's prompt does not.
-# The head narrowed the seat set to these four: the web tools run outside the network allowlist.
-CC_SEAT_TOOLS = ("Bash", "Read", "Edit", "Write")
+# The head narrowed the seat set: the web tools run outside the network allowlist.
+# Z1f (H3, go): Glob and Grep are re-admitted BEHIND THEIR CANARY PROBE (levain.seat_canary.TOOL_PROBES:
+# both -> P10, which also tries traversal through a symlink inside a root), so when P10 is not a pass both
+# are dropped from the verdict's fallback set and the canary fails. Measured 11-06 on 2.1.319: Glob and
+# Grep outside the working directories are refused under --restricted. NotebookEdit is NOT admitted:
+# its probe (P9, levain.seat_canary.READY_TOOL_PROBES) is ready, but it has no symlink-swap arm, and
+# NotebookEdit edits an existing file so P2's flipper (an empty real directory) gives it nothing to race
+# for (z1f fix round). Still OUT: MultiEdit (does not exist in 2.1.319),
+# TodoWrite (not in the 2.1.319 tool list), Agent (named Task there), SendMessage, Skill and TaskStop
+# (U11, a VM measurement of subagent inheritance), WebFetch and WebSearch (the narrowing stands).
+CC_SEAT_TOOLS = ("Bash", "Read", "Edit", "Write", "Glob", "Grep")
 
 # Which settings sources a terminal seat loads: none. Measured on the host (headless): without
 # `project` in the source list a clone's CLAUDE.md and .claude/settings.json hooks are not

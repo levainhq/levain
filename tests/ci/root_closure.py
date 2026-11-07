@@ -354,6 +354,13 @@ LAZY_SITES = {
     'levain/authority.py::_hands_mcp_check::from levain import hands_mcp': 'operator',
     # operator: the seat-lease append / renew rule (``SEAT_LEASE_KIND``'s ``append_checks`` / ``renew_checks``), reached through ``_grant_append_checks`` and the renew branch, the signer's process; its docstring: an append rule, not a replay rule, so no root process runs it (``levain.host_guard`` needs 3.11 ``tomllib``)
     'levain/authority.py::_seat_lease_check::from levain import host_guard as hg': 'operator',
+    # operator: the seat-egress append / renew rule (``SEAT_EGRESS_KIND``'s ``append_checks`` / ``renew_checks``, PATHZERO Z2a), reached through ``_grant_append_checks`` and the renew branch, the signer's process; an append rule, not a replay rule, so no root process runs it (``levain.host_guard`` needs 3.11 ``tomllib``; the canonical-remote spelling is ``levain.consent.push``'s)
+    'levain/authority.py::_seat_egress_check::from levain import host_guard as hg': 'operator',
+    'levain/authority.py::_seat_egress_check::from levain.consent import push': 'operator',
+    # operator: the case-folded agent-config name test both rules above call (``_seat_lease_check``,
+    # ``_seat_egress_check``; L3 zc r1 deepseek MED-2), so it runs only where they run: the signer's process
+    'levain/authority.py::_names_agent_config::from levain import host_guard as hg': 'operator',
+    'levain/authority.py::_names_agent_config::from levain import pathid': 'operator',
     # operator: a ``Cockpit`` method; ``Cockpit(`` is constructed only in ``levain/cockpit/providers.py`` (``git grep -n 'Cockpit(' -- levain``), not in the closure; engine is here only as ``levain/cockpit/__init__.py``'s import
     'levain/cockpit/engine.py::Cockpit._note_decision_one::from levain.consent.notes import NoteStoreError': 'operator',
     # operator: a ``Cockpit`` method; ``Cockpit(`` is constructed only in ``levain/cockpit/providers.py``, not in the closure
