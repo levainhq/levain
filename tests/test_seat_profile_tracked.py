@@ -241,3 +241,125 @@ def test_the_real_levain_repo_at_head_builds_a_profile(rig):
     for rel in ("levain/templates/activation", "levain/templates/adapters/codex/activation"):
         assert str(lane / rel) in dw
         assert f"Edit({rel}/**)" in p.settings["permissions"]["deny"]
+
+
+# --- L3 r1 on the exemption (items 1+2 launch half, 3-8) -------------------------------------------------------------
+
+def test_an_exempt_file_with_a_second_hard_link_refuses(rig):
+    """Item 1+2 (launch half): a hard link is another name a write can reach the exempt inode through."""
+    lane = rig[0] / "lane"
+    sha = commit(lane, TREE)
+    os.link(lane / ACT / "posture.md", lane / "alias.md")
+    with pytest.raises(sp.SeatRefusal, match="posture.md has 2 hard links"):
+        build(rig, base_sha=sha)
+
+
+def test_a_file_swapped_for_a_symlink_after_its_lstat_is_not_followed(rig, monkeypatch):
+    """Item 3: the file is opened with O_NOFOLLOW and its identity compared with what the walk saw."""
+    lane = rig[0] / "lane"
+    sha = commit(lane, TREE)
+    target = lane / ACT / "posture.md"
+    real_stat, swapped = os.stat, []
+
+    def racing_stat(p, *a, **kw):
+        st = real_stat(p, *a, **kw)
+        if p == "posture.md" and kw.get("dir_fd") is not None and not swapped:
+            swapped.append(1)
+            os.remove(target)
+            os.symlink(lane / "README.md", target)
+        return st
+    monkeypatch.setattr(os, "stat", racing_stat)
+    with pytest.raises(sp.SeatRefusal, match=r"posture.md (cannot be read|changed while it was checked)"):
+        build(rig, base_sha=sha)
+    assert swapped
+
+
+def test_no_activation_in_the_tree_never_reads_the_base(rig, monkeypatch):
+    """Item 4: the base tree is read only when the walk finds a candidate directory."""
+    lane = rig[0] / "lane"
+    sha = commit(lane, {"README.md": "hi\n", "pkg/x.py": ""})
+    monkeypatch.setattr(sp, "tracked_at_base", lambda *a, **k: pytest.fail("read the base with no candidate"))
+    assert build(rig, base_sha=sha)
+
+
+def test_the_base_read_is_restricted_to_the_candidate_directories(rig):
+    lane = rig[0] / "lane"
+    sha = commit(lane, TREE)
+    got = sp.tracked_at_base(lane, sha, [ACT])
+    assert set(got) == {f"{ACT}/posture.md", f"{ACT}/hooks/stop.py"}
+
+
+def test_a_base_tree_over_the_cap_refuses_before_it_is_held(rig, monkeypatch):
+    lane = rig[0] / "lane"
+    sha = commit(lane, TREE)
+    monkeypatch.setattr(sp, "_WALK_CAP", 1)
+    with pytest.raises(sp.SeatRefusal, match="too large to vet"):
+        sp.tracked_at_base(lane, sha, [ACT])
+
+
+def test_a_base_read_that_cannot_run_or_times_out_refuses_in_words(rig, monkeypatch):
+    lane = rig[0] / "lane"
+    sha = commit(lane, TREE)
+    monkeypatch.setattr(sp, "_GIT_TIMEOUT", 0)
+    with pytest.raises(sp.SeatRefusal, match="did not finish"):
+        sp.tracked_at_base(lane, sha, [ACT])
+    monkeypatch.setattr(sp, "_GIT_TIMEOUT", 60)
+    monkeypatch.setenv("PATH", str(rig[0] / "no-such-bin"))
+    with pytest.raises(sp.SeatRefusal, match="cannot be read from the clone"):
+        sp.tracked_at_base(lane, sha, [ACT])
+
+
+def test_a_large_exempt_file_is_hashed_and_matches(rig):
+    lane = rig[0] / "lane"
+    big = "x" * (3 * 1024 * 1024 + 7)
+    sha = commit(lane, {**TREE, f"{ACT}/big.md": big})
+    assert build(rig, base_sha=sha)
+
+
+@pytest.mark.parametrize("files", [{"pkg[x]/activation/a.md": "a\n"}, {"pkg/activation/a*.md": "a\n"},
+                                   {"pkg/activation/!a.md": "a\n"}, {"pkg/{b}/activation/a.md": "a\n"}])
+def test_a_glob_character_in_an_exempt_path_refuses(rig, files):
+    """Item 5: the deny rules are globs; a name that changes what they match refuses instead of being escaped."""
+    lane = rig[0] / "lane"
+    sha = commit(lane, {"README.md": "hi\n", **files})
+    with pytest.raises(sp.SeatRefusal, match="glob character"):
+        build(rig, base_sha=sha)
+
+
+def test_an_unreadable_exempt_file_refuses_in_words_not_a_traceback(rig):
+    """Item 6: an environment error inside the check is a refusal with a reason."""
+    if os.geteuid() == 0:
+        pytest.skip("root reads a 000 file")
+    lane = rig[0] / "lane"
+    sha = commit(lane, TREE)
+    (lane / ACT / "posture.md").chmod(0)
+    try:
+        with pytest.raises(sp.SeatRefusal, match="posture.md cannot be read"):
+            build(rig, base_sha=sha)
+    finally:
+        (lane / ACT / "posture.md").chmod(0o644)
+
+
+def test_a_nested_activation_inside_an_exempt_activation_refuses(rig):
+    """Item 7: every protected name below an exempt root refuses, activation included."""
+    lane = rig[0] / "lane"
+    sha = commit(lane, {**TREE, f"{ACT}/sub/activation/x.md": "x\n"})
+    with pytest.raises(sp.SeatRefusal, match="sub/activation is a protected name inside it"):
+        build(rig, base_sha=sha)
+
+
+@pytest.mark.parametrize("link,target", [("pkg/alias", "templates"), ("pkg/act", "templates/activation"),
+                                         ("p.md", f"{ACT}/posture.md")])
+def test_a_symlink_onto_an_exempt_directory_or_its_ancestor_refuses(rig, link, target):
+    """Item 8: a symlink that resolves to an exempt directory, an ancestor of one, or a file inside one is another
+    spelling a write could take past the path-based deny rules."""
+    lane = rig[0] / "lane"
+    sha = commit(lane, TREE, links={link: target})
+    with pytest.raises(sp.SeatRefusal, match="is a symlink onto the read-only"):
+        build(rig, base_sha=sha)
+
+
+def test_an_unrelated_symlink_in_the_lane_still_builds(rig):
+    lane = rig[0] / "lane"
+    sha = commit(lane, TREE, links={"docs/readme": "../README.md"})
+    assert build(rig, base_sha=sha)

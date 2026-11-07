@@ -22,6 +22,11 @@ What the hook does, in order, and what each step trusts:
    of the signed authority log, the clone's realpath below the grant's lanes parent, a verified mint row for it, the
    branch equal to ``seat/<lane_key>`` of that row, the remote equal to the grant's pinned one, and the clone's ``.git``
    the same (device, inode) as the mint pinned. A revoked or expired grant pushes nothing and leaves a record.
+4. after the fetch and before the push, :func:`tree_refusal` judges the fetched commits in the mirror: the tip must
+   descend from the signed mint row's ``base_sha``, and no commit since it may add, modify, delete or rename a path with
+   an ``activation`` component. This is what makes a launch-exempt ``activation/`` directory never writable where it
+   matters, at what leaves the seat; the in-seat deny rules on it are defence in depth (a rename of an ancestor and
+   back, or a hard-link alias, is not a write to the denied spelling, and still changes the committed blob).
 
 The hook never wedges the seat: every failure is recorded in ``<levain home>/push/seat_egress.jsonl`` and ends in exit
 0, except a remote's REJECTION (``status == "rejected"``) on a ``Stop`` (exit 2 once: stderr reaches the model, which
@@ -52,7 +57,8 @@ from levain.authority import SEAT_EGRESS_KIND, SEAT_EGRESS_MAX, AuthoritySnapsho
 from levain.consent import push
 
 __all__ = ["SEAT_EGRESS_KIND", "SeatPushRefused", "SIGN_COMMAND", "STOP_TIMEOUT", "SESSION_END_TIMEOUT",
-           "LOG_NAME", "live_egress", "create_egress", "renew_egress", "egress_refusal", "run_hook", "main", "hook_entries"]
+           "LOG_NAME", "live_egress", "create_egress", "renew_egress", "egress_refusal", "tree_refusal",
+           "TREE_REFUSAL_HEAD", "run_hook", "main", "hook_entries"]
 
 SIGN_COMMAND = ("levain seat egress create --lanes-parent <dir> --remote <url> [--allow-domain <host> ...] "
                 "--signing-key <key>")
@@ -62,6 +68,16 @@ PUSHED_DIR = "egress_pushed"
 STOP_TIMEOUT = 180
 SESSION_END_TIMEOUT = 60
 _STDIN_MAX = 1 << 20
+#: The fixed opening of the refusal for a lane tip that changes an ``activation`` directory (L3 r1 on the tracked
+#: exemption): the seat may read such a directory and never change it, and the push is where that is decided.
+TREE_REFUSAL_HEAD = "the lane branch changes an activation directory, which a seat may read and never change"
+_TREE_REFUSAL = (TREE_REFUSAL_HEAD + ": {path} ({n} path(s) across the commits since the launch base {base}). Nothing "
+                 "is pushed. Drop the commits that touch it; a later commit that restores the files does not clear it.")
+#: The names whose any-depth appearance in a changed path refuses the push: the names the launch may exempt read-only
+#: (levain.seat_profile.TRACKED_EXEMPT_NAMES), compared case- and normalisation-insensitively (APFS folds both).
+_TREE_NAMES = frozenset({"activation"})
+_TREE_MAX_COMMITS = 10_000
+_TREE_TIMEOUT = 60
 _REJECT_TEXT = ("seat-egress: the remote rejected your lane branch ({branch}): {detail}. Nothing was forced. Rebase on "
                 "what the remote holds or ask the desk; this message appears once per stop.")
 
@@ -208,6 +224,78 @@ def egress_refusal(cockpit_root: Path | str, key_dir: Path, *, now: Callable[[],
     return refusal
 
 
+# --- the tree check: an activation directory never leaves the seat changed ----------------------------------------------
+
+def _activation_paths(paths: Sequence[bytes]) -> list[str]:
+    """The paths (decoded, in order) that have a :data:`_TREE_NAMES` component at any depth."""
+    import unicodedata
+    out = []
+    for raw in paths:
+        p = os.fsdecode(raw)
+        if any(unicodedata.normalize("NFC", c).casefold() in _TREE_NAMES for c in p.split("/")):
+            out.append(p)
+    return out
+
+
+def _mirror_git(mirror: Path, args: Sequence[str], *, stdin: bytes | None = None):
+    """git on levain's own mirror: no global or system config, no hooks, no replace objects, no transport. Bytes."""
+    import subprocess
+    env = {**push.git_env(""), **push.git_isolation_env(), "LC_ALL": "C"}
+    argv = push.git_isolation_args(push.git_bin(), str(mirror)) + ["--no-replace-objects", *args]
+    return subprocess.run(argv, env=env, cwd="/", input=stdin if stdin is not None else b"",
+                          capture_output=True, timeout=_TREE_TIMEOUT)
+
+
+def _printable(p: str) -> str:
+    return "".join(c if c.isprintable() else "?" for c in p)
+
+
+def tree_refusal(key_dir: Path) -> Callable[..., str | None]:
+    """The ``tip_check=`` of :func:`levain.consent.push.execute` for a seat (L3 r1, items 1+2). Under the per-repo
+    lock, after the tip is fetched into levain's mirror, it re-reads the clone's verified mint row and judges the lane
+    branch from the MIRROR's objects (never the clone's working tree or index): the tip must descend from the row's
+    ``base_sha``, and no commit in ``base..tip`` may add, modify, delete or rename a path with an ``activation``
+    component, against any parent (merges included; renames are seen as a delete and an add). Returns the refusal, or
+    None. A rename of an ancestor and back, or a write through a hard-link alias, changes the committed blob, so it is
+    caught here whatever the in-seat deny rules saw."""
+
+    def check(*, mirror: Path, new: str, path: str) -> str | None:
+        try:
+            row = _mint_for(key_dir, path)
+        except SeatPushRefused as exc:
+            return str(exc)
+        base = row.get("base_sha")
+        if not (isinstance(base, str) and push._SHA.match(base)):
+            return "the mint row carries no launch base: the lane's commits cannot be judged, nothing is pushed"
+        if new == base:
+            return None
+        if _mirror_git(mirror, ["cat-file", "-e", f"{base}^{{commit}}"]).returncode:
+            return f"the lane branch does not descend from the launch base {base[:12]}: nothing is pushed"
+        anc = _mirror_git(mirror, ["merge-base", "--is-ancestor", base, new])
+        if anc.returncode == 1:
+            return f"the lane branch does not descend from the launch base {base[:12]}: nothing is pushed"
+        if anc.returncode:
+            return f"the lane branch's history could not be read ({anc.stderr.decode(errors='replace').strip()[:200]})"
+        revs = _mirror_git(mirror, ["rev-list", f"--max-count={_TREE_MAX_COMMITS + 1}", f"{base}..{new}"])
+        if revs.returncode:
+            return f"the lane branch's commits could not be listed ({revs.stderr.decode(errors='replace').strip()[:200]})"
+        if len(revs.stdout.split()) > _TREE_MAX_COMMITS:
+            return f"the lane branch holds more than {_TREE_MAX_COMMITS} commits since the launch base: nothing is pushed"
+        per = _mirror_git(mirror, ["diff-tree", "--stdin", "-r", "-z", "-m", "--root", "--no-renames", "--name-only",
+                                   "--no-commit-id", "--no-ext-diff", "--ignore-submodules=none"], stdin=revs.stdout)
+        net = _mirror_git(mirror, ["diff-tree", "-r", "-z", "--no-renames", "--name-only", "--no-ext-diff",
+                                   "--ignore-submodules=none", base, new])
+        for r in (per, net):
+            if r.returncode:
+                return f"the lane branch's changes could not be read ({r.stderr.decode(errors='replace').strip()[:200]})"
+        hits = sorted(set(_activation_paths([p for p in (per.stdout + b"\0" + net.stdout).split(b"\0") if p])))
+        if hits:
+            return _TREE_REFUSAL.format(path=_printable(hits[0]), n=len(hits), base=base[:12])
+        return None
+
+    return check
+
+
 # --- the hook ---------------------------------------------------------------------------------------------------------
 
 def _log(home: Path, row: dict[str, Any]) -> None:
@@ -296,7 +384,8 @@ def run_hook(event: str, stdin_text: str, *, clone: Path | str, key_dir: Path | 
 
         try:
             result = push.execute({"id": grant["id"]}, repo_path=clone_real, remote=grant["push_remote"],
-                                  branch=branch, levain_home=home, refusal=refusal, receipt=receipt)
+                                  branch=branch, levain_home=home, refusal=refusal, receipt=receipt,
+                                  tip_check=tree_refusal(key_dir))
         except push.PushRecordIncomplete as exc:              # git reported; only levain's own record is short
             _log(home, {**base, "outcome": "record-incomplete", "detail": str(exc)[:400]})
             result = exc.result

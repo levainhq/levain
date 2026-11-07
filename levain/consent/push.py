@@ -685,7 +685,8 @@ def _record(home: Path, key: str, result: PushResult, real: str,
 
 def execute(grant: dict[str, Any], *, repo_path: str | os.PathLike, remote: str, branch: str,
             levain_home: str | os.PathLike, refusal: Refusal,
-            receipt: Callable[[dict[str, Any]], Any], expect_sha: str | None = None) -> PushResult:
+            receipt: Callable[[dict[str, Any]], Any], expect_sha: str | None = None,
+            tip_check: Callable[..., "str | None"] | None = None) -> PushResult:
     """Push ``branch`` of the repository at ``repo_path`` to ``remote`` under a grant (§3 steps 1-4).
 
     ``grant`` is the grant the caller found before the lock; its ``id`` names the mirror. Under the per-repo lock
@@ -695,7 +696,10 @@ def execute(grant: dict[str, Any], *, repo_path: str | os.PathLike, remote: str,
     receipt record after git ran (also when git rejected the ref); an intent line is journalled under
     ``<levain_home>/push/`` before the push and an outcome line after it, so a receipt write that fails after
     the effect leaves a record. With ``expect_sha``, the branch tip fetched under the lock must be that commit, or
-    the push is refused (an answer that allowed one commit never pushes another).
+    the push is refused (an answer that allowed one commit never pushes another). With ``tip_check``, it is called
+    under the lock as ``tip_check(mirror=<the mirror>, new=<the fetched tip>, path=<repo realpath>)`` after the tip is
+    pinned in the mirror and before the intent line; a returned string, or any exception it raises, refuses the push
+    (the seat egress judges the lane's commits from the mirror's objects this way, never from the working tree).
 
     Raises :class:`PushRefused` for anything levain refuses before the push; an ``OSError`` or
     ``subprocess.SubprocessError`` (a git that timed out or could not run, the lock or the intent line that
@@ -763,6 +767,13 @@ def execute(grant: dict[str, Any], *, repo_path: str | os.PathLike, remote: str,
                   SRC_REF, new])
         if u.returncode:
             raise PushRefused(f"could not pin the mirror's ref to {new}: {u.stderr.strip()[-200:]}")
+        if tip_check is not None:
+            try:
+                why = tip_check(mirror=mirror, new=new, path=real)
+            except Exception as exc:  # noqa: BLE001 - a check that cannot finish refuses, never pushes
+                why = f"the tip check could not finish ({type(exc).__name__}: {str(exc)[:200]})"
+            if why is not None:
+                raise PushRefused(str(why))
         # step 3: the pin must mean the destination
         if hits := _rewrites(mirror, canon):
             raise PushRefused(f"the git config rewrites the pinned remote ({hits[0]}); a pin must mean the "

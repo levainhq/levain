@@ -176,94 +176,197 @@ TRACKED_EXEMPT_NAMES = frozenset({"activation"})
 _BLOB_MODES = {"100644": False, "100755": True}   # regular files only: never 120000 (a symlink) or 160000 (a gitlink)
 _BASE_SHA_LEN = (40, 64)
 _GIT_TIMEOUT = 60
+_LS_TREE_MAX_BYTES = 64 << 20
+_READ_CHUNK = 1 << 20
+#: Characters that change what a permission rule or a sandbox path matches (glob syntax, its escape, gitignore-style
+#: negation and comment at a component's start). An exempt path holding one refuses instead of being escaped (L3 r1 #5).
+_GLOB_CHARS = frozenset("*?[]{}\\")
+_GLOB_LEAD = ("!", "#")
+_PROTECTED_FOLDED = frozenset(n.casefold() for n in PROTECTED_NAMES)
 
 
-def tracked_at_base(clone: Path, base_sha: str) -> dict[str, tuple[str, str]]:
-    """``{path: (mode, object id)}`` of every entry git tracks in ``base_sha``'s tree, read by the LAUNCHER from the
-    clone's object store before any seat runs: no hooks, no global or system config, no replace refs. Never read from
-    the working tree. Raises :class:`SeatRefusal` when the commit cannot be read."""
+def _read_capped(proc, deadline: float) -> bytes:
+    """``proc``'s stdout, streamed under :data:`_WALK_CAP` records and :data:`_LS_TREE_MAX_BYTES` bytes and a wall
+    deadline: the base tree is never held whole past the cap. Raises :class:`SeatRefusal`."""
+    import selectors
+    import time
+    buf, records = bytearray(), 0
+    fd = proc.stdout.fileno()
+    with selectors.DefaultSelector() as sel:
+        sel.register(fd, selectors.EVENT_READ)
+        while True:
+            left = deadline - time.monotonic()
+            if left <= 0:
+                raise SeatRefusal(f"reading the base tree did not finish within {_GIT_TIMEOUT} s")
+            if not sel.select(left):
+                continue
+            chunk = os.read(fd, 65536)
+            if not chunk:
+                return bytes(buf)
+            records += chunk.count(b"\0")
+            buf += chunk
+            if records > _WALK_CAP or len(buf) > _LS_TREE_MAX_BYTES:
+                raise SeatRefusal(f"the base tree under the activation directories is too large to vet "
+                                  f"(over {_WALK_CAP} entries)")
+
+
+def tracked_at_base(clone: Path, base_sha: str, paths: Sequence[str] | None = None) -> dict[str, tuple[str, str]]:
+    """``{path: (mode, object id)}`` of what git tracks in ``base_sha``'s tree under ``paths`` (literal, relative to
+    the clone's top; None: the whole tree), read by the LAUNCHER from the clone's object store before any seat runs: no
+    hooks, no global or system config, no replace refs, no lazy fetch. Never read from the working tree. The output is
+    streamed under the walk cap and a deadline. Raises :class:`SeatRefusal` (with the reason, never a traceback) when
+    the commit cannot be read, git cannot run or time out, or the tree is too large."""
     if len(base_sha) not in _BASE_SHA_LEN or any(c not in "0123456789abcdef" for c in base_sha):
         raise SeatRefusal("the base sha must be a full lowercase hex commit id")
+    if paths is not None and not paths:
+        return {}
     import subprocess
+    import time
     env = {"PATH": os.environ.get("PATH", "/usr/bin:/bin"), "HOME": os.environ.get("HOME", ""),
-           "GIT_CONFIG_GLOBAL": "/dev/null", "GIT_CONFIG_NOSYSTEM": "1", "GIT_TERMINAL_PROMPT": "0", "LC_ALL": "C"}
-    r = subprocess.run(["git", "--no-replace-objects", f"--git-dir={clone / '.git'}", "-c", "core.hooksPath=/dev/null",
-                        "ls-tree", "-r", "-z", "--full-tree", f"{base_sha}^{{commit}}"],
-                       env=env, capture_output=True, timeout=_GIT_TIMEOUT, check=False)
-    if r.returncode:
-        raise SeatRefusal(f"the base {base_sha[:12]} cannot be read from the clone: "
-                          f"{r.stderr.decode(errors='replace').strip()[:300]}")
+           "GIT_CONFIG_GLOBAL": "/dev/null", "GIT_CONFIG_NOSYSTEM": "1", "GIT_TERMINAL_PROMPT": "0", "LC_ALL": "C",
+           "GIT_NO_LAZY_FETCH": "1", "GIT_LITERAL_PATHSPECS": "1", "GIT_NO_REPLACE_OBJECTS": "1"}
+    argv = ["git", "--no-replace-objects", f"--git-dir={clone / '.git'}", "-c", "core.hooksPath=/dev/null",
+            "ls-tree", "-r", "-z", "--full-tree", f"{base_sha}^{{commit}}"]
+    if paths:
+        argv += ["--", *paths]
+    try:
+        with tempfile.TemporaryFile() as errf:
+            proc = subprocess.Popen(argv, env=env, cwd="/", stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                                    stderr=errf)
+            try:
+                data = _read_capped(proc, time.monotonic() + _GIT_TIMEOUT)
+                code = proc.wait(timeout=max(1, _GIT_TIMEOUT))
+            finally:
+                if proc.poll() is None:
+                    proc.kill()
+                    proc.wait()
+                proc.stdout.close()
+            errf.seek(0)
+            err = errf.read(4096).decode(errors="replace").strip()
+    except (OSError, subprocess.SubprocessError) as exc:
+        raise SeatRefusal(f"the base {base_sha[:12]} cannot be read from the clone: {type(exc).__name__}: "
+                          f"{str(exc)[:200]}") from None
+    if code:
+        raise SeatRefusal(f"the base {base_sha[:12]} cannot be read from the clone: {err[:300]}")
     out: dict[str, tuple[str, str]] = {}
-    for rec in r.stdout.split(b"\0"):
-        if rec:
-            meta, _, path = rec.partition(b"\t")
-            mode, _kind, oid = meta.decode().split(" ")
-            out[os.fsdecode(path)] = (mode, oid)
+    try:
+        for rec in data.split(b"\0"):
+            if rec:
+                meta, _, path = rec.partition(b"\t")
+                mode, _kind, oid = meta.decode().split(" ")
+                out[os.fsdecode(path)] = (mode, oid)
+    except ValueError:
+        raise SeatRefusal(f"the base {base_sha[:12]} tree listing could not be parsed") from None
     return out
 
 
-def _blob_id(data: bytes, oid_len: int) -> str:
-    h = hashlib.sha1() if oid_len == 40 else hashlib.sha256()   # noqa: S324 (git's object id, not a security hash)
-    h.update(b"blob %d\0" % len(data))
-    h.update(data)
-    return h.hexdigest()
+def _glob_problem(path: str) -> bool:
+    return any(c in _GLOB_CHARS for c in path) or any(part.startswith(_GLOB_LEAD) for part in path.split("/"))
+
+
+def _file_problem(dir_fd: int, name: str, st: os.stat_result, oid: str, shown: str) -> str | None:
+    """Why the regular file ``name`` (in ``dir_fd``, lstat'd as ``st``) is not the tracked blob ``oid``, or None. One
+    link only (a second name is another way to write the inode, as ``host_guard.hook_pin`` rules); opened with
+    ``O_NOFOLLOW`` and its identity compared with ``st`` (a swap after the walk saw it refuses); hashed in chunks."""
+    if st.st_nlink != 1:
+        return f"{shown} has {st.st_nlink} hard links"
+    try:
+        fd = os.open(name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=dir_fd)
+    except OSError as exc:
+        return f"{shown} cannot be read ({exc.strerror or type(exc).__name__})"
+    try:
+        fst = os.fstat(fd)
+        if (fst.st_dev, fst.st_ino) != (st.st_dev, st.st_ino) or not stat.S_ISREG(fst.st_mode) or fst.st_nlink != 1:
+            return f"{shown} changed while it was checked"
+        h = hashlib.sha1() if len(oid) == 40 else hashlib.sha256()   # noqa: S324 (git's object id, not a security hash)
+        h.update(b"blob %d\0" % fst.st_size)
+        n = 0
+        while chunk := os.read(fd, _READ_CHUNK):
+            n += len(chunk)
+            if n > fst.st_size:
+                break
+            h.update(chunk)
+        if n != fst.st_size:
+            return f"{shown} changed while it was checked"
+    except OSError as exc:
+        return f"{shown} cannot be read ({exc.strerror or type(exc).__name__})"
+    finally:
+        os.close(fd)
+    return None if h.hexdigest() == oid else f"{shown} differs from the base"
 
 
 def _exempt_problem(root: Path, top: Path, tracked: Mapping[str, tuple[str, str]]) -> str | None:
     """Why the protected-name directory ``top`` (below ``root``'s top level) is NOT exempt, or None when it is: its
     working tree is exactly what git tracks under it at the base (same regular files, same bytes, same executable bit,
-    no symlink, no extra file or directory, no other protected name inside)."""
+    one link each, no symlink, no extra file or directory, no protected name inside, ``activation`` included), and no
+    path in it holds a glob character. Walked by file descriptor without following links; an environment error is a
+    reason, never a raised exception."""
     rel = top.relative_to(root).as_posix()
     if os.path.islink(top):
         return "it is a symlink"
+    if _glob_problem(str(top)):
+        return "its path holds a glob character the deny rules would read as a pattern"
     want = {p[len(rel) + 1:]: v for p, v in tracked.items() if p.startswith(rel + "/")}
     if not want:
         return "git does not track it at the base"
-    bad = [p for p, (mode, _) in want.items() if mode not in _BLOB_MODES]
-    if bad:
-        return f"{rel}/{sorted(bad)[0]} is tracked as mode {want[sorted(bad)[0]][0]}, not a regular file"
+    for p, (mode, _) in sorted(want.items()):
+        if mode not in _BLOB_MODES:
+            return f"{rel}/{p} is tracked as mode {mode}, not a regular file"
+        if _glob_problem(p):
+            return f"{rel}/{p} holds a glob character the deny rules would read as a pattern"
     dirs = {str(Path(p).parent) for p in want} - {"."}
     dirs |= {str(a) for d in list(dirs) for a in Path(d).parents} - {"."}
     seen_files: set[str] = set()
-    for dirpath, dirnames, filenames in os.walk(top, followlinks=False):
-        here = Path(dirpath)
-        for name in dirnames + filenames:
-            p = here / name
-            sub = p.relative_to(top).as_posix()
-            if name in PROTECTED_NAMES - TRACKED_EXEMPT_NAMES:
-                return f"{rel}/{sub} is a protected name inside it"
-            st = os.lstat(p)
-            if stat.S_ISLNK(st.st_mode):
-                return f"{rel}/{sub} is a symlink"
-            if stat.S_ISDIR(st.st_mode):
-                if sub not in dirs:
-                    return f"{rel}/{sub} is a directory git does not track at the base"
-                continue
-            if not stat.S_ISREG(st.st_mode):
-                return f"{rel}/{sub} is not a regular file"
-            if sub not in want:
-                return f"{rel}/{sub} is not tracked at the base"
-            mode, oid = want[sub]
-            if bool(st.st_mode & 0o100) != _BLOB_MODES[mode]:
-                return f"{rel}/{sub} differs from the base (executable bit)"
-            with open(p, "rb") as fh:
-                if _blob_id(fh.read(), len(oid)) != oid:
-                    return f"{rel}/{sub} differs from the base"
-            seen_files.add(sub)
+    seen = 0
+    try:
+        for dirpath, dirnames, filenames, dir_fd in os.fwalk(top, follow_symlinks=False):
+            here = Path(dirpath)
+            for name in dirnames + filenames:
+                sub = (here / name).relative_to(top).as_posix()
+                shown = f"{rel}/{sub}"
+                seen += 1
+                if seen > _WALK_CAP:
+                    return "it is too large to vet"
+                if name.casefold() in _PROTECTED_FOLDED:
+                    return f"{shown} is a protected name inside it"
+                st = os.stat(name, dir_fd=dir_fd, follow_symlinks=False)
+                if stat.S_ISLNK(st.st_mode):
+                    return f"{shown} is a symlink"
+                if stat.S_ISDIR(st.st_mode):
+                    if sub not in dirs:
+                        return f"{shown} is a directory git does not track at the base"
+                    continue
+                if not stat.S_ISREG(st.st_mode):
+                    return f"{shown} is not a regular file"
+                if sub not in want:
+                    return f"{shown} is not tracked at the base"
+                mode, oid = want[sub]
+                if bool(st.st_mode & 0o100) != _BLOB_MODES[mode]:
+                    return f"{shown} differs from the base (executable bit)"
+                if why := _file_problem(dir_fd, name, st, oid, shown):
+                    return why
+                seen_files.add(sub)
+    except OSError as exc:
+        return f"it cannot be read ({exc.strerror or type(exc).__name__})"
     missing = sorted(set(want) - seen_files)
     if missing:
         return f"{rel}/{missing[0]} is tracked at the base but missing"
     return None
 
 
-def _contains_agent_config(root: Path, *, git_dir_ok: bool, tracked: Mapping[str, tuple[str, str]] | None = None,
+def _contains_agent_config(root: Path, *, git_dir_ok: bool, base_sha: str | None = None,
                            exempt: list[str] | None = None) -> list[str]:
     """Every agent-config target under ``root`` (a :data:`PROTECTED_NAMES` entry at any depth). A top-level real
     ``.git`` directory is the clone's own and is not descended into when ``git_dir_ok``; a gitfile or a nested
-    ``.git`` is a target. With ``tracked`` (:func:`tracked_at_base`), a :data:`TRACKED_EXEMPT_NAMES` directory BELOW
-    the top level whose tree is exactly the tracked one is not a target: its absolute path is appended to ``exempt``
-    (the caller denies writes to it) and a mismatch is reported with its reason."""
+    ``.git`` is a target. With ``base_sha``, a :data:`TRACKED_EXEMPT_NAMES` directory BELOW the top level is a
+    candidate: only when the walk found one is the base read (:func:`tracked_at_base`, restricted to the candidates),
+    and a candidate whose tree is exactly the tracked one is not a target: its absolute path is appended to ``exempt``
+    (the caller denies writes to it) and a mismatch is reported with its reason. A symlink anywhere in ``root`` that
+    resolves onto an exempt directory, an ancestor of one or a path inside one is a target (another spelling a write
+    could take past the path-based deny rules)."""
     found: list[str] = []
+    candidates: list[Path] = []
+    links: list[Path] = []
     seen = 0
     for dirpath, dirnames, filenames in os.walk(root, followlinks=False):
         here = Path(dirpath)
@@ -273,28 +376,47 @@ def _contains_agent_config(root: Path, *, git_dir_ok: bool, tracked: Mapping[str
                 if os.path.islink(here / d):
                     found.append(str(here / d))
                 continue
-            if d in TRACKED_EXEMPT_NAMES and tracked is not None and here != root:
-                why = _exempt_problem(root, here / d, tracked)
-                if why is None:
-                    if exempt is not None:
-                        exempt.append(str(here / d))
-                else:
-                    found.append(f"{here / d} (not exempt: {why})")
-                continue
-            if d in PROTECTED_NAMES:
+            if d in TRACKED_EXEMPT_NAMES and base_sha is not None and here != root:
+                candidates.append(here / d)            # judged below, after the walk; never descended here
+            elif d in PROTECTED_NAMES:
                 found.append(str(here / d))
-                continue
-            keep.append(d)
+            elif os.path.islink(here / d):
+                links.append(here / d)
+            else:
+                keep.append(d)
         dirnames[:] = keep
         for f in filenames:
             if f in PROTECTED_NAMES:
                 found.append(str(here / f))
+            elif os.path.islink(here / f):
+                links.append(here / f)
         seen += len(dirnames) + len(filenames)
         if seen > _WALK_CAP:
             found.append(f"{root} is too large to vet")
-            break
+            return found
     if git_dir_ok and not (root / ".git").is_dir():
         found.append(f"{root}/.git is not a real directory")
+    if not candidates:
+        return found
+    try:
+        tracked = tracked_at_base(root, base_sha, [c.relative_to(root).as_posix() for c in candidates])
+    except SeatRefusal as exc:
+        return found + [f"{c} (not exempt: {exc})" for c in candidates]
+    ok: list[str] = []
+    for c in candidates:
+        why = _exempt_problem(root, c, tracked)
+        if why is None:
+            ok.append(str(c))
+        else:
+            found.append(f"{c} (not exempt: {why})")
+    for link in links:
+        target = os.path.realpath(link)
+        for ex in ok:
+            if hg.is_within(ex, target) or hg.is_within(target, ex):
+                found.append(f"{link} (it is a symlink onto the read-only {ex})")
+                break
+    if exempt is not None:
+        exempt += ok
     return found
 
 
@@ -382,8 +504,10 @@ def build_seat_profile(clone: Path, return_dir: Path, *, claude_bin: str, python
     ``base_sha`` is the commit the launcher checked the clone out at (the lease launch passes it; the canary and the
     dry run do not). With it, a :data:`TRACKED_EXEMPT_NAMES` directory below the clone's top level whose working tree
     is exactly what git tracks under it at that commit (:func:`tracked_at_base`, read by the launcher, never from the
-    working tree) is launched read-only instead of refused: the sandbox's ``denyWrite`` and the file tools' deny rules
-    name it. Anything extra, changed, symlinked or untracked in it still refuses, as does every other protected name."""
+    working tree) is launched read-only instead of refused. The bound that holds it read-only is the push
+    (:func:`levain.seat_push.tree_refusal` refuses a lane tip that changes it); the sandbox's ``denyWrite`` and the
+    file tools' deny rules name it as defence in depth. Anything extra, changed, symlinked or untracked in it still
+    refuses, as does every other protected name."""
     environ = os.environ if environ is None else environ
     tools = tuple(tools)
     clone, return_dir, key_dir = _real(clone), _real(return_dir), _real(key_dir)
@@ -395,15 +519,12 @@ def build_seat_profile(clone: Path, return_dir: Path, *, claude_bin: str, python
     problems += _roots_problems(clone, return_dir, key_dir)
     exempt: list[str] = []
     if not problems:
-        tracked = None
-        if base_sha is not None:
-            try:
-                tracked = tracked_at_base(clone, base_sha)
-            except SeatRefusal as exc:
-                problems.append(str(exc))
-        if not problems:
+        if base_sha is not None and (len(base_sha) not in _BASE_SHA_LEN
+                                     or any(c not in "0123456789abcdef" for c in base_sha)):
+            problems.append("the base sha must be a full lowercase hex commit id")
+        else:
             problems += [f"{t} is an agent-config target inside a seat root" for t in
-                         _contains_agent_config(clone, git_dir_ok=True, tracked=tracked, exempt=exempt)
+                         _contains_agent_config(clone, git_dir_ok=True, base_sha=base_sha, exempt=exempt)
                          + _contains_agent_config(return_dir, git_dir_ok=False)]
     problems += hg._check_exec(python, roots, "the Python that runs the seat's hooks")
     problems += hg._check_exec(claude_bin, roots, "the claude binary")
