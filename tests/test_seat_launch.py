@@ -367,9 +367,9 @@ def test_a_narrowed_tool_set_reaches_the_seats_argv_and_an_unadmitted_tool_refus
 def test_the_cli_validates_tools_as_the_canary_does(seats, rig, capsys):
     from levain import cli
     ns = argparse.Namespace(lane_key="lane-v", remote=str(rig.src), base=rig.sha, claude=seats.claude, python=sys.executable,
-                            tools="Bash,Edit", model=None, prompt="work", headless=False, seat_home=None, dry_run=False,
+                            tools="Bash,Glob", model=None, prompt="work", headless=False, seat_home=None, dry_run=False,
                             path=rig.tmp)
-    assert cli._cmd_seat_launch(ns, rig.world.root) == 1       # Edit alone is half a probe's admission
+    assert cli._cmd_seat_launch(ns, rig.world.root) == 1       # Glob alone is half of P10's admission (Glob and Grep go together)
     assert "seat launch refused" in capsys.readouterr().err and not (rig.lanes / "lane-v").exists()
 
 
