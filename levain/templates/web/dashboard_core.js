@@ -9029,11 +9029,13 @@ for (const type of ["touchstart", "wheel", "pointerdown", "click", "keydown"]) d
     } catch (_) { return null; }
   }
   // The id a deep link names a Needs-you card by (`/?view=needs&item=<id>`): the card's own id (`question:<n>`, `consent:<request id>`),
-  // the bare request id a sign card was filed under, or flow's `np-<8 hex>` item id (its card is `question:<1 + hex>`). The server admits exactly this shape.
+  // the bare request id a sign card was filed under, or flow's `np-<8 hex>` item id. Guessing its card as `question:<1 + hex>` is only a
+  // first try (flow now numbers cards with the band number); the band read in needsItemJump is the authority. The server admits exactly this shape.
   const NEEDS_ITEM_ID = /^[A-Za-z0-9_.:-]{1,64}$/;
+  const BAND_LOOKUP_MS = 4000;   // how long the tap's card lookup waits on one band read before counting it refused
   function needsItemMatch(it, item) {
     const id = needsIdOf(it);
-    // flow's own card for an `np-` item is `question:<1 + the id's hex>` (flow's desk_cards.card_number): the same card from either name
+    // a first guess only: an older flow numbered an `np-` item's card `question:<1 + the id's hex>`; when it misses, the band read decides
     const hex = /^np-([0-9a-f]{8})$/i.exec(item);
     if (hex && id === "question:" + (1 + parseInt(hex[1], 16))) return true;
     return !!id && (id === item || id === "consent:" + item || id === "question:" + item || id === "np:" + item);
@@ -9081,7 +9083,20 @@ for (const type of ["touchstart", "wheel", "pointerdown", "click", "keydown"]) d
         const row = (b && Array.isArray(b.items) ? b.items : []).find((x) => x && x.subject && x.subject.id === item && Number.isInteger(x.question));
         return row && needsWaiting(needsItems(lines)).find((x) => needsIdOf(x) === "question:" + row.question);
       };
-      const read = (fresh) => { let q = null; try { q = typeof bandRead === "function" ? bandFetch(fresh) : null; } catch (e) { q = null; } return q && typeof q.then === "function" ? q : null; };
+      // A read that never answers (a hung connection) is a refusal after BAND_LOOKUP_MS: an AbortController's abort rejects the wait, so
+      // the lookup falls through its refused path (one retry, then the plain Needs view, no notice) instead of waiting forever.
+      // (The injected reader takes no signal, so the underlying request is left to the browser; only the lookup stops waiting.) A successful read passes through as is.
+      const read = (fresh) => {
+        let q = null;
+        try { q = typeof bandRead === "function" ? bandFetch(fresh) : null; } catch (e) { q = null; }
+        if (!q || typeof q.then !== "function") return null;
+        const ctl = typeof AbortController === "function" ? new AbortController() : null;
+        if (!ctl) return q;
+        return new Promise((resolve, reject) => {
+          const timer = window.setTimeout(() => { try { ctl.abort(); } catch (e) { /* the rejection below still fires */ } reject(new Error("band read timed out")); }, BAND_LOOKUP_MS);
+          q.then((b) => { window.clearTimeout(timer); resolve(b); }, (e) => { window.clearTimeout(timer); reject(e); });
+        });
+      };
       const open = (hit) => {
         if (document.querySelector(PHONE_JUMP_TARGET.needs)) needsGo(needsIdOf(hit), true);
         openNeedsFocus(hit, null);
