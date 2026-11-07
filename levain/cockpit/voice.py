@@ -65,7 +65,9 @@ STREAM_OPEN = "/cockpit/voice/stream/open"
 STREAM_CHUNK = "/cockpit/voice/stream/chunk"
 STREAM_CLOSE = "/cockpit/voice/stream/close"
 STREAM_PATHS = (STREAM_OPEN, STREAM_CHUNK, STREAM_CLOSE)
-STREAM_PROVIDERS = ("deepgram", "openai")        # the providers a live stream adapter exists for
+# the providers a live dictation open may select; openai was taken out because its stream was once sent under a model name
+# the ledger did not price, so the cap could be passed several times over
+STREAM_PROVIDERS = ("deepgram",)
 STREAM_MAX_SESSIONS = 1                 # one live dictation at a time (the registry's cap)
 STREAM_CHUNK_MAX = stream_session.MAX_CHUNK_BYTES
 STREAM_BODY_DEADLINE_S = 10.0           # a 250 ms chunk is 8000 bytes: a body that takes longer than this is stalled
@@ -783,7 +785,11 @@ def stream_chunk(registry: stream_session.StreamRegistry, query: str, owner: str
     try:
         session = registry.get(sid, owner)
         if session.revoke_check_due(STREAM_REVOKE_RECHECK_S):
-            stopped = _stream_revoked(session.provider, data_root, revoke_queue)
+            try:
+                stopped = _stream_revoked(session.provider, data_root, revoke_queue)
+            except BaseException:
+                session.revoke_check_failed()
+                raise
             if stopped is not None:
                 session.end_revoked()
                 return stopped

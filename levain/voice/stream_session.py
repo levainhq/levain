@@ -193,6 +193,7 @@ class StreamSession:
         self._final = ""
         self._partial = ""
         self._end_reason = ""
+        self._revoke_prev = self._opened
         self._revoke_checked = self._opened       # session time of the last revoke-reach check (the open path ran one)
 
     # --- ownership --------------------------------------------------------------------------------------------------
@@ -223,8 +224,14 @@ class StreamSession:
             now = self._clock()
             if now - self._revoke_checked < interval:
                 return False
+            self._revoke_prev = self._revoke_checked
             self._revoke_checked = now
             return True
+
+    def revoke_check_failed(self) -> None:
+        """The check ``revoke_check_due`` announced raised before it finished: put the clock back so the next chunk looks again."""
+        with self._lock:
+            self._revoke_checked = self._revoke_prev
 
     def end_revoked(self) -> None:
         """End the session because the key or its grant was revoked: the provider stream is closed and the meter settled

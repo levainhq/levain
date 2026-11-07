@@ -43,7 +43,7 @@
   var streamOk = false, provider = "", probing = null;
   var S = null;                              // the live session, or null
   var deadlines = { open: 10000, chunk: 10000, close: 5000, wav: 30000 };
-  var limits = { wavMax: 4 * 1024 * 1024 - 44 };   // bytes of PCM kept for the fallback: the server's UPLOAD_MAX less the WAV header   // ms; a request past its deadline is cancelled, never waited on
+  var limits = { wavMax: 4 * 1024 * 1024 - 44 };   // bytes of PCM kept for the fallback: the server's UPLOAD_MAX less the WAV header
 
   function headers() {
     var h = {}, t = "";
@@ -206,7 +206,6 @@
     }).catch(function (err) {
       if (s.dead || s.ended) return;
       s.dead = true;
-      if (s.stopping) closeFailed = true;
       if (err && err.revoked === true) {   // revoked: no WAV fallback, no audio kept or sent anywhere; the fixed words and an end
         releaseCapture(s);
         s.pcm = null;
@@ -215,6 +214,7 @@
         closeSession(s, false);
         return;
       }
+      if (s.stopping) closeFailed = true;
       if (canWav(s)) {              // the audio is in memory: transcribe it from there, the mic is let go meanwhile
         releaseCapture(s);
         recover(s).then(function (ok) {
