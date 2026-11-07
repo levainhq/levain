@@ -276,3 +276,35 @@ def test_compose_drop_refuses_a_box_that_is_busy_or_off_and_clears_a_stale_hando
     assert off[0] is False and json.loads(off[1])[1] == "The drop box is off: no store" and json.loads(off[1])[0] == ""
     assert ok[0] is True and json.loads(ok[1])[0] == "About: " and json.loads(ok[1])[2] is None   # the stale handoff is cleared
     assert json.loads(ok[1])[1] == "queue is read-only"                    # a coordinator note is not hidden by a successful compose
+
+
+@needs_browser
+def test_a_slow_refused_read_does_not_erase_a_token_stored_while_it_was_in_flight(tmp_path: Path, lh) -> None:  # noqa: F811
+    """The Needs strip reads the band as soon as it draws, before an operator's browser holds the token; that first read is
+    refused. A refusal that lands AFTER a token was stored (another tab, a paste; on a loaded machine the test's own reload
+    set-up) used to drop the stored token, so the next load sent none and drew no board (the CI flake on the drop box). The
+    refusal drops only the token it was sent with, and the read goes again with the newer one."""
+    lh.mkdir(parents=True, exist_ok=True, mode=0o700)
+    _seed(lh)
+    _root, src, _ids = _install(tmp_path)
+    with _serve(src, write_token=TOKEN) as (url, httpd):
+        handler = httpd.RequestHandlerClass
+        real = handler._serve_band
+
+        def slow_band(self, *, head):             # the refusal to a tokenless band read arrives late, as on a loaded machine
+            if not self.headers.get("X-Levain-Write-Token"):
+                time.sleep(1.5)
+            return real(self, head=head)
+
+        handler._serve_band = slow_band
+        try:
+            out = _drive(tmp_path, f"{url}/", [
+                {"emulate": {"w": 1280, "h": 1000, "dpr": 1}},
+                {"eval": "sessionStorage.setItem('t0', String(performance.now())); localStorage.setItem('levain_write_token', "
+                         f"{json.dumps(TOKEN)}); 1"},
+                {"until": "performance.now() > 4000"},
+                {"eval": "localStorage.getItem('levain_write_token')"},
+            ])
+        finally:
+            handler._serve_band = real
+    assert out["values"][-1] == TOKEN
