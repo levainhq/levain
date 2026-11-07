@@ -69,7 +69,9 @@
       return r.json();
     }).then(function (j) {
       streamOk = false; provider = "";
-      if (j && j.stream === true && Array.isArray(j.providers)) {
+      if (j && j.stream === true && typeof j.stream_provider === "string" && j.stream_provider) {
+        provider = j.stream_provider; streamOk = true;
+      } else if (j && j.stream === true && Array.isArray(j.providers)) {
         var q = j.providers.filter(function (x) { return x && typeof x.name === "string" && x.key === "set" && Array.isArray(x.uses) && x.uses.indexOf("stt") >= 0; })[0];
         if (q) { provider = q.name; streamOk = true; }
       }

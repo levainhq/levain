@@ -3998,12 +3998,20 @@ class _Handler(GuardedHandler):
                 srv.voice_chunk_gate.release()
         data_root = srv.broker.data_root
         if route == cockpit_voice.STREAM_OPEN:
-            from levain.voice import deepgram_stream
+            from levain.voice import deepgram_stream, openai_stream
 
+            # one factory per provider in cockpit_voice.STREAM_PROVIDERS; a provider with no entry never reaches here
+            # (stream_open refuses it 409 no_stream first). A test's voice_stream_factory stands in for every provider.
+            factories = {"deepgram": deepgram_stream.factory, "openai": openai_stream.factory}
+            query_provider = dict(urllib.parse.parse_qsl(query)).get("provider", "")
+
+            def _no_factory(_secret: Any) -> Any:      # table drift: refuse, never hand a key to another provider's adapter
+                from levain.voice import stream_session
+                raise stream_session.StreamNotStarted("no stream factory")
             return cockpit_voice.stream_open(
                 registry, data_root, query, owner,
                 revoke_queue=srv.grant_phone.queue_dir if srv.grant_phone is not None else None,
-                read_key=voice_custody.read_key, factory=srv.voice_stream_factory or deepgram_stream.factory,
+                read_key=voice_custody.read_key, factory=srv.voice_stream_factory or factories.get(query_provider, _no_factory),
                 last_read=srv.voice_last_read if srv.voice_last_read is not None else {})
         return cockpit_voice.stream_close(registry, query, owner)
 

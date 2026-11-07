@@ -65,7 +65,7 @@ STREAM_OPEN = "/cockpit/voice/stream/open"
 STREAM_CHUNK = "/cockpit/voice/stream/chunk"
 STREAM_CLOSE = "/cockpit/voice/stream/close"
 STREAM_PATHS = (STREAM_OPEN, STREAM_CHUNK, STREAM_CLOSE)
-STREAM_PROVIDERS = ("deepgram",)        # the providers a live stream adapter exists for
+STREAM_PROVIDERS = ("deepgram", "openai")        # the providers a live stream adapter exists for
 STREAM_MAX_SESSIONS = 1                 # one live dictation at a time (the registry's cap)
 STREAM_CHUNK_MAX = stream_session.MAX_CHUNK_BYTES
 STREAM_BODY_DEADLINE_S = 10.0           # a 250 ms chunk is 8000 bytes: a body that takes longer than this is stalled
@@ -322,20 +322,27 @@ def serve_voice(data_root: Path | str, meter: vmeter.Meter, *, last_read: Mutabl
         body["meter"] = "unreadable"
         body["caps"] = {"month_usd": _usd(caps.month_micros), "day_usd": _usd(caps.day_micros),
                         "spent_month_est": None, "spent_day_est": None, "month_start": None, "day_start": None}
-    if premium_stt and stream_offered(rows):
+    chosen = stream_provider(rows) if premium_stt else None
+    if chosen is not None:
         body["stream"] = True
+        body["stream_provider"] = chosen
     return body
 
 
-def stream_offered(rows: list[dict[str, Any]]) -> bool:
-    """Whether the page may show its live-dictation control: the FIRST provider row that holds a key with ``stt`` among
-    its uses (the one the page sends, S4's contract) is one a stream adapter exists for. The row's ``uses`` already
-    leave ``stt`` out unless premium dictation is on. A stricter reading than "some row": a page that sends the first
-    keyed row would otherwise open a stream with a provider that has none."""
+def stream_provider(rows: list[dict[str, Any]]) -> str | None:
+    """The provider the page sends for live dictation: the FIRST row that holds a key with ``stt`` among its uses AND
+    has a stream adapter (:data:`STREAM_PROVIDERS`); None when no row qualifies. The server names it (the page sends
+    this name, not its own first-row guess), so a keyed provider with no adapter listed before a qualifying one never
+    hides dictation. The row's ``uses`` already leave ``stt`` out unless premium dictation is on."""
     for row in rows:
-        if row.get("key") == "set" and "stt" in row.get("uses", ()):
-            return row.get("name") in STREAM_PROVIDERS
-    return False
+        if row.get("key") == "set" and "stt" in row.get("uses", ()) and row.get("name") in STREAM_PROVIDERS:
+            return row["name"]
+    return None
+
+
+def stream_offered(rows: list[dict[str, Any]]) -> bool:
+    """Whether some row qualifies for live dictation (see :func:`stream_provider`)."""
+    return stream_provider(rows) is not None
 
 
 # --- the shared tail: reserve, read the key, call, settle or release ---------------------------------------------------

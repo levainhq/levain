@@ -112,17 +112,78 @@ def test_voice_json_flag_absent_for_a_tts_only_key(rig):
         assert "stream" not in js(call(port, "GET", cockpit_voice.VOICE_JSON)[2])
 
 
-def test_voice_json_flag_absent_when_the_first_keyed_stt_provider_has_no_stream(rig):
-    """A keyed OpenAI row comes before deepgram in the offered order, and the page sends the FIRST keyed stt row, so the
-    flag stays absent rather than send the page to a provider with no stream. Red with: stream_offered returning on any
-    row (not the first) or ignoring STREAM_PROVIDERS."""
+def test_voice_json_names_the_first_keyed_stt_provider_with_a_stream_when_both_keys_are_set(rig):
+    """OpenAI is listed before Deepgram; with both keyed, the server names the FIRST qualifying row, openai, and the key
+    (the secret) is in no part of the body. Red with: `body["stream_provider"] = chosen` dropped, stream_provider
+    returning the last row, or "openai" removed from STREAM_PROVIDERS (it then names deepgram)."""
     keyed(rig, "openai")
     keyed(rig)
     with served(rig) as (port, _h):
-        rows = js(call(port, "GET", cockpit_voice.VOICE_JSON)[2])
-        names = [r["name"] for r in rows["providers"] if r["key"] == "set" and "stt" in r["uses"]]
-        assert names[0] != "deepgram" and "deepgram" in names
-        assert "stream" not in rows
+        body_raw = call(port, "GET", cockpit_voice.VOICE_JSON)[2]
+        got = js(body_raw)
+        names = [r["name"] for r in got["providers"] if r["key"] == "set" and "stt" in r["uses"]]
+        assert names == ["openai", "deepgram"]
+        assert got["stream"] is True and got["stream_provider"] == "openai"
+        assert VALUE.encode() not in body_raw
+
+
+def test_voice_json_names_deepgram_when_only_deepgram_is_keyed_and_openai_tts_only(rig):
+    """A keyed OpenAI row without stt never qualifies. Red with: stream_provider ignoring `"stt" in uses`."""
+    keyed(rig, "openai", uses=("tts",))
+    keyed(rig)
+    with served(rig) as (port, _h):
+        got = js(call(port, "GET", cockpit_voice.VOICE_JSON)[2])
+        assert got["stream"] is True and got["stream_provider"] == "deepgram"
+
+
+def test_stream_provider_skips_a_keyed_row_with_no_adapter_and_is_none_when_none_qualifies():
+    """Pure rows: a keyed stt row outside STREAM_PROVIDERS is skipped for the next qualifying one; none left is None.
+    Red with: the `row.get("name") in STREAM_PROVIDERS` clause dropped (it names the adapter-less row)."""
+    rows = [{"name": "inworld", "key": "set", "uses": ["stt"]}, {"name": "deepgram", "key": "set", "uses": ["stt"]}]
+    assert cockpit_voice.stream_provider(rows) == "deepgram"
+    assert cockpit_voice.stream_provider(rows[:1]) is None
+    assert cockpit_voice.stream_provider([{"name": "openai", "key": "not_set", "uses": []}]) is None
+
+
+def test_every_stream_provider_has_a_factory_and_one_without_is_409_no_stream(rig, monkeypatch):
+    """Every dictation-capable provider has an adapter now, so a provider "with no factory" is built by narrowing
+    STREAM_PROVIDERS: a keyed provider outside it is refused 409 no_stream before any key read. Red with: the `provider
+    not in STREAM_PROVIDERS` line in stream_open dropped (openai then opens), or a name added to STREAM_PROVIDERS with
+    no entry in web_server's factory table (the set check below, which names the two adapters that exist)."""
+    from levain.voice import deepgram_stream, openai_stream
+    assert set(cockpit_voice.STREAM_PROVIDERS) == {"deepgram", "openai"}
+    assert deepgram_stream.factory and openai_stream.factory
+    monkeypatch.setattr(cockpit_voice, "STREAM_PROVIDERS", ("deepgram",))
+    keyed(rig, "openai")
+    with served(rig) as (port, _h):
+        status, body = open_session(port, "openai")
+        assert status == 409 and body["error"] == "no_stream"
+        assert "stream" not in js(call(port, "GET", cockpit_voice.VOICE_JSON)[2])
+
+
+def test_open_builds_each_provider_with_its_own_factory_and_the_key_reaches_only_that_factory(rig, monkeypatch):
+    """No test factory set: the route picks the adapter by the provider named. Red with: `factories.get(query_provider,
+    ...)` in web_server replaced by one factory (openai then gets Deepgram's adapter, or the reverse), or a key read
+    for the wrong provider."""
+    from levain.voice import deepgram_stream, openai_stream
+    seen = []
+
+    def make(name):
+        def f(secret):
+            seen.append((name, secret.reveal()))
+            return FakeStream(secret.reveal())
+        return f
+    monkeypatch.setattr(deepgram_stream, "factory", make("deepgram"))
+    monkeypatch.setattr(openai_stream, "factory", make("openai"))
+    keyed(rig, "openai")
+    keyed(rig)
+    with served(rig) as (port, _h):
+        status, body = open_session(port, "openai")
+        assert status == 200 and [n for n, _k in seen] == ["openai"]
+        assert all(k not in str(body) for _n, k in seen) and seen[0][1] == VALUE
+        assert post(port, f"{CLOSE}?sid={body['sid']}")[0] == 200
+        status, body = open_session(port, "deepgram")
+        assert status == 200 and [n for n, _k in seen] == ["openai", "deepgram"]
 
 
 # --- premium_stt off -----------------------------------------------------------------------------------------------------
@@ -226,9 +287,10 @@ def test_open_returns_a_sid_hands_the_key_to_the_factory_once_and_leaks_it_nowhe
     no_leak(caplog.text)
 
 
-def test_open_refuses_a_provider_with_no_stream_a_bad_query_and_a_body(rig):
+def test_open_refuses_a_provider_with_no_stream_a_bad_query_and_a_body(rig, monkeypatch):
     """Red with: the STREAM_PROVIDERS test dropped (openai opens a deepgram stream), `_query_provider` skipped, or the
-    zero-length check on open dropped."""
+    zero-length check on open dropped. (openai is made adapter-less by narrowing STREAM_PROVIDERS.)"""
+    monkeypatch.setattr(cockpit_voice, "STREAM_PROVIDERS", ("deepgram",))
     keyed(rig, "openai")
     keyed(rig)
     with served(rig) as (port, httpd):

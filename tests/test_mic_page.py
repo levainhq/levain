@@ -31,7 +31,10 @@ FAKE = """
       sc.vj++;
       if (sc.vjFail > 0) { sc.vjFail--; return Promise.reject(new TypeError('net')); }
       if (REAL) return f0(u, o).then((r) => { r.clone().json().then((b) => { sc.realKeys = Object.keys(b); }); return r; });
-      return j({ stream: FLAG, premium_stt: FLAG, authority: 'ok', estimate: true, prices_as_of: 'x', caps: {}, providers: [
+      // openai is the FIRST keyed stt row but the server names deepgram: the page must send stream_provider, not row one.
+      // Red with: the `j.stream_provider` branch in mic.js probe() removed (the page then sends provider=openai).
+      return j({ stream: FLAG, stream_provider: 'deepgram', premium_stt: FLAG, authority: 'ok', estimate: true, prices_as_of: 'x', caps: {}, providers: [
+        { name: 'openai', uses: ['stt'], key: 'set', record_id: 'vk-0', last_read: null, voices: [], default_voice: '', tts_model: '', speed: [0.5, 1.5], retention: 'r' },
         { name: 'deepgram', uses: ['stt'], key: 'set', record_id: 'vk-1', last_read: null, voices: [], default_voice: '', tts_model: '', speed: [0.5, 1.5], retention: 'r' }] });
     }
     if (p === '/cockpit/voice/stream/open') {
