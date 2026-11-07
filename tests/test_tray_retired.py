@@ -6,7 +6,7 @@ from pathlib import Path
 
 import pytest
 
-from levain.spores import BUCKET_KEEP, BUCKET_TRAY, NON_COGNITION_DISPOSITIONS, bucket_of, is_loop
+from levain.spores import BUCKET_TRAY, NON_COGNITION_DISPOSITIONS, bucket_of, is_loop
 from levain.writes import RETIRED_HANDOFF_MSG, RETIRED_KEEP_NOTE_MSG, EditError, apply_edit
 
 from tests.test_writes import _add_spore, _legacy_seed, _scope, _spore_store, install  # noqa: F401
@@ -48,7 +48,7 @@ def test_legacy_row_reads_descends_and_redispositions(install: Path, disp: str) 
     sid = _legacy_seed(install, "old row", disp)
     row = _spore_store(install).get(sid)
     assert not is_loop(row) and disp in NON_COGNITION_DISPOSITIONS
-    assert bucket_of(row) == (BUCKET_KEEP if disp == "note" else BUCKET_TRAY)
+    assert bucket_of(row) == BUCKET_TRAY   # TS-5a: no Keep bucket; a legacy note renders in the Tray
     # re-disposition to seed / agenda works
     for target in ("agenda", "seed"):
         tsid = _legacy_seed(install, f"old row {target}", disp)
