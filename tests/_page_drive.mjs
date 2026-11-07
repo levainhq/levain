@@ -233,7 +233,8 @@ ws.addEventListener("message", (m) => {
   if (d.method === "Page.javascriptDialogOpening") dialogs.push(`${d.params.type}: ${String(d.params.message)}`);
   if (d.method === "Page.frameStartedLoading" || d.method === "Page.frameRequestedNavigation" || d.method === "Page.frameNavigated") navStarts++;
   if (d.method === "Page.javascriptDialogOpening") trail.push(`dialog declined: ${d.params.type} ${String(d.params.message).slice(0, 80)}`);
-  if (d.method === "Network.requestWillBeSent" && d.params.request.method === "POST") {
+  // the SW-open landing report (POST /webpush/landed, sw_open.js 1106-53) is the page's own telemetry, never an operator POST
+  if (d.method === "Network.requestWillBeSent" && d.params.request.method === "POST" && !/^https?:\/\/[^/]+\/webpush\/landed(\?|$)/.test(d.params.request.url)) {
     posts.push(d.params.request.url.replace(/^https?:\/\/[^/]+/, "") + " " + (d.params.request.postData || ""));
   }
   // a prompt (the write-token ask) is declined, as an operator who has no token would
