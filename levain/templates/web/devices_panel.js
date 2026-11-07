@@ -1488,11 +1488,12 @@
           "Saved for this device. The page that opens a notification reads it only where the browser allows.");
 
     // the test plays the tier the settings name: premium asks the route for its fixed sample sentence, on-device speaks locally
-    const hear = el("button", "dev-btn vc-hear", premium && prov ? "Hear this voice" : (blocked ? "Hear the voice" : "Hear the on-device voice")); hear.type = "button";
+    const hear = el("button", "dev-btn vc-hear", blocked ? "Hear the voice" : (premium && prov && eff.voice ? "Hear this voice" : "Hear the on-device voice")); hear.type = "button";
     const hearNote = el("p", "dev-note vc-help vc-hearnote");
     hearNote.setAttribute("role", "status"); hearNote.hidden = true;
     const showHear = () => { const m = V.noteFor({ thread: "sample", gseq: 0 }); hearNote.textContent = m; hearNote.hidden = !m; };
-    hear.addEventListener("click", () => { showHear(); (V.sample || V.sampleDevice)().then(showHear, showHear); });
+    hear.addEventListener("click", () => { const done = (V.sample || V.sampleDevice)().then(showHear, showHear); showHear(); return done; });
+    if (V.onChange) V.onChange(() => { if (hear.isConnected) showHear(); });
     const hr = el("div", "dev-row vc-row"); hr.appendChild(hear); hr.appendChild(hearNote);
     vcBody.appendChild(hr);
 
