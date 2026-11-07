@@ -110,7 +110,7 @@ def _cases(root: Path):
     edits, ctxj, jobs = lv / "edits.jsonl", lv / "context.json", lv / "jobs.json"
     cont = lv / "memory.continuity.md"
     out = []
-    for pid in ("tray", "loops", "keep"):
+    for pid in ("tray", "loops"):
         out.append((pid, "spores", _rm(spores), _garble(spores)))
     for pid in ("episodes", "health", "graph", "wraps"):
         out.append((pid, "db", _rm(db), _garble(db)))
@@ -541,27 +541,27 @@ class TestProfilesAndSearch:
     def test_compact_gate_rows_feed_pointer_and_gauge_value(self, env) -> None:
         _r, _s, ck = env
         assert ck.panel("tray", profile="compact")["rows"] is not None          # gate: every row
-        keep = ck.panel("keep", profile="compact")                              # feed: count + pointer
-        assert keep["rows"] is None and keep["count"] == 1 and "profile=full" in keep["next"]
+        loops = ck.panel("loops", profile="compact")                            # feed: count + pointer
+        assert loops["rows"] is None and loops["count"] == 1 and "profile=full" in loops["next"]
         assert ck.panel("health", profile="compact")["value"]["metrics"]        # gauge: the metric
         assert "data" not in ck.panel("graph", profile="compact")["value"]      # visual: its text projection
 
-    def test_a_keep_q_search_matches_body_text_the_compact_rows_do_not_carry(self, env) -> None:
+    def test_a_tray_q_search_matches_a_legacy_note_body_text_the_compact_rows_do_not_carry(self, env) -> None:
         _r, _s, ck = env
-        hit = ck.panel("keep", profile="compact", q="needleinbody")
+        hit = ck.panel("tray", profile="compact", q="needleinbody")
         assert hit["matched"] == 1 and hit["rows"][0]["body"] is None
-        assert "NEEDLEINBODY" not in json.dumps(ck.panel("keep", profile="compact"))  # not in the compact rows
-        assert ck.panel("keep", profile="compact", q="zzz-nothing")["rows"] == []
+        assert "NEEDLEINBODY" not in json.dumps(ck.panel("tray", profile="compact"))  # not in the compact rows
+        assert ck.panel("tray", profile="compact", q="zzz-nothing")["rows"] == []
 
     def test_row_returns_one_row_in_full(self, env) -> None:
         _r, _s, ck = env
-        rid = ck.panel("keep")["rows"][0]["id"]
-        got = ck.panel("keep", profile="compact", row=rid)
+        rid = next(r["id"] for r in ck.panel("tray")["rows"] if r["facets"]["disposition"] == "note")
+        got = ck.panel("tray", profile="compact", row=rid)
         assert [r["id"] for r in got["rows"]] == [rid] and "NEEDLEINBODY" in got["rows"][0]["body"]
 
     def test_the_title_is_cut_by_the_kernel_and_flagged(self, env) -> None:
         _r, _s, ck = env
-        row = ck.panel("keep")["rows"][0]
+        row = next(r for r in ck.panel("tray")["rows"] if r["facets"]["disposition"] == "note")
         assert len(row["title"]) <= 160 and row["truncated"] is True
 
 
@@ -573,10 +573,11 @@ class TestOrderingAndGroups:
         _r, _s, ck = env
         p = ck.panel("tray")
         by_group = {r["id"]: r["group"] for r in p["rows"]}
-        assert by_group == {"spore:spore-003": "today", "spore:spore-002": "overdue"}
+        # spore-004 is the fixture's legacy note: shown in the Tray (the Keep is gone), undated -> "also"
+        assert by_group == {"spore:spore-003": "today", "spore:spore-002": "overdue", "spore:spore-004": "also"}
         assert [g["id"] for g in p["groups"]] == ["overdue", "today", "also"]
-        assert [r["group"] for r in p["rows"]] == ["overdue", "today"]  # group order leads
-        assert all(r["band"] == "now" for r in p["rows"])
+        assert [r["group"] for r in p["rows"]] == ["overdue", "today", "also"]  # group order leads
+        assert all(r["band"] == "now" for r in p["rows"] if r["group"] != "also")
 
     def test_overdue_is_ordered_most_overdue_first_and_providers_do_not_sort(self) -> None:
         ck = Cockpit()
@@ -605,7 +606,7 @@ class TestOrderingAndGroups:
         SporeStore(root / ".levain" / "memory.spores.json").add(type="task", text="later", disposition="seed", next="2999-01-01")
         p = ck.panel("tray")
         assert p["status"] == "ok" and p["filtered"] == [{"count": 1, "reason": "surface date not reached"}]
-        assert p["count"] == 2
+        assert p["count"] == 3
 
 
 # --- the JobStore list -----------------------------------------------------------------------------
@@ -800,7 +801,7 @@ class TestL3R1Fixes:
         ck = Cockpit()
         rows = [RowIn("a", "a", {"tier": "hot"}, stored={"id": "a"}), RowIn("b", "b", {"tier": "scorching"}, stored={"id": "b"})]
         ck.register(_derived({**_simple().__dict__, "read": lambda c: Read(rows=tuple(rows)),
-                                    "facets": frozenset({"tier"}), "order": "spore.keep"}))
+                                    "facets": frozenset({"tier"}), "order": "spore.loops"}))
         got = ck.panel("p")
         assert got["status"] == "partial" and [r["id"] for r in got["rows"]] == ["a"] and got["skipped"][0]["count"] == 1
 
@@ -1131,7 +1132,7 @@ class TestSession2Gaps:
         _r, _s, ck = env
         heads = ck.manifest(NONE_CRED)["panels"]
         assert {k: v["edit_class"] for k, v in heads.items() if not k.startswith(("section:", "config:"))} == {
-            "now": None, "state": None, "begin": "C", "tray": "B", "loops": "B", "keep": "B",
+            "now": None, "state": None, "begin": "C", "tray": "B", "loops": "B",
             "episodes": "B", "edits": None, "jobs": None, "health": "C", "graph": "C",
             "crystals": "C", "wraps": "C", "team-status": None, "sessions": None,
             "activity": "C", "memory_glance": "C", "doctor": "C", "topology": "C",

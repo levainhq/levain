@@ -55,7 +55,6 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any, Callable, Iterator, Mapping
 
 from levain.spores import (
-    BUCKET_KEEP,
     BUCKET_TRAY,
     LOOP_DISPOSITION,
     bucket_of,
@@ -581,7 +580,7 @@ class OpenSpore:
     pointer: str | None
     # The operator-I/O disposition (control-plane Slice 3): ``loop`` (default — the
     # entity's own prospective loop) vs ``seed``/``handoff``/``agenda`` (the operator Tray).
-    # Drives the Open-Loops / Tray / Keep render split; absent/falsy → ``loop`` (every
+    # Drives the Open-Loops / Tray render split; absent/falsy → ``loop`` (every
     # pre-Slice-3 spore). See ``levain.spores`` for the vocab + the bucketing partition.
     disposition: str = LOOP_DISPOSITION
     # The valid Class-B resolve kinds for THIS spore's type, derived from anneal's
@@ -1217,11 +1216,10 @@ class SubstrateView:
     # FULL list_open result is bucketed via ``levain.spores.bucket_of`` — a total
     # partition, so a spore lands in exactly one. ``open_spores`` keeps its name (the
     # active prospective loops — the entity's live cognition) for backward-compat with
-    # every existing consumer; ``tray`` (the operator session-I/O inbox) and ``keep`` (the
-    # durable pinned-dormant loops) are new. Each is independently capped at ``max_spores``.
+    # every existing consumer (parked loops included, marked by their tier); ``tray`` (the
+    # operator session-I/O inbox, plus any legacy note) is new. Each is independently capped at ``max_spores``.
     open_spores: list[OpenSpore] = field(default_factory=list)
     tray: list[OpenSpore] = field(default_factory=list)
-    keep: list[OpenSpore] = field(default_factory=list)
     episodes: list[EpisodeRow] = field(default_factory=list)
     sections: list[Section] = field(default_factory=list)
     config_docs: list[ConfigDoc] = field(default_factory=list)
@@ -1262,19 +1260,18 @@ class SubstrateView:
             )
 
         # --- Operate: the inputs/loops you steer -----------------------------
-        # The three spore projections, adjacent: the entity's active loops, the operator
-        # session-I/O inbox, the durable pinned-dormant shelf (Slice 3 capture-UX (A) —
-        # ONE Tray, not three disposition panels). All three are Class B: Open Loops gets
+        # The two spore projections, adjacent: the entity's loops (parked ones marked), the operator
+        # session-I/O inbox (Slice 3 capture-UX (A) — ONE Tray, not three disposition panels;
+        # the Keep panel is gone, TS-5a). Both are Class B: Open Loops gets
         # the lifecycle verbs; Tray (Slice 3b) gets the freeform dump box + per-row triage
-        # verbs (metabolize / schedule / dismiss); Keep gets the lifecycle verbs + schedule.
-        # Honesty floor: the three projections share ONE spore read; when it FAULTS the
+        # verbs (metabolize / schedule / dismiss).
+        # Honesty floor: the two projections share ONE spore read; when it FAULTS the
         # count is meaningless, so the header must show "(unavailable)" — never "(0)" over
         # an unreadable store (that would contradict the body's "unavailable" and read as a
         # false zero on a header-only glance). [no_data != no_event; header/body parity]
         _spore_err = "open_spores" in self.errors
         _oc = "unavailable" if _spore_err else len(self.open_spores)
         _tc = "unavailable" if _spore_err else len(self.tray)
-        _kc = "unavailable" if _spore_err else len(self.keep)
         panels.append(
             {"kind": "spores", "zone": ZONE_OPERATE, "edit_class": CLASS_B,
              "title": f"Open loops ({_oc})"}
@@ -1282,10 +1279,6 @@ class SubstrateView:
         panels.append(
             {"kind": "tray", "zone": ZONE_OPERATE, "edit_class": CLASS_B,
              "title": f"Tray ({_tc})"}
-        )
-        panels.append(
-            {"kind": "keep", "zone": ZONE_OPERATE, "edit_class": CLASS_B,
-             "title": f"Keep ({_kc})"}
         )
         panels.append(
             {"kind": "episodes", "zone": ZONE_OPERATE, "edit_class": CLASS_B,
@@ -1350,7 +1343,6 @@ class SubstrateView:
             "crystal_index": [c.to_dict() for c in self.crystal_index],
             "open_spores": [s.to_dict() for s in self.open_spores],
             "tray": [s.to_dict() for s in self.tray],
-            "keep": [s.to_dict() for s in self.keep],
             "episodes": [e.to_dict() for e in self.episodes],
             "sections": [s.to_dict() for s in self.sections],
             "config_docs": [d.to_dict() for d in self.config_docs],
@@ -1984,11 +1976,10 @@ def build_substrate_view(
         view.errors["crystal_index"] = f"{type(exc).__name__}: {exc}"
 
     # --- open spores → the three operator-facing projections (Slice 3) ------
-    #     Open Loops (active cognition) / Tray (operator session-I/O inbox) / Keep
-    #     (durable pinned-dormant), bucketed via levain.spores.bucket_of. Bucket the
-    #     FULL ranked list_open result (NOT a pre-sliced head): parked-tier Keep items
-    #     rank LAST (parked sorts after hot/warm/cold) and a flat [:max_spores] would
-    #     starve them out of their own panel. Each bucket is independently capped at
+    #     Open Loops (cognition, parked loops marked) / Tray (operator session-I/O inbox,
+    #     legacy notes included), bucketed via levain.spores.bucket_of. Bucket the
+    #     FULL ranked list_open result (NOT a pre-sliced head): an inbox row must not be
+    #     starved out of the Tray by loops ahead of it in the rank. Each bucket is independently capped at
     #     max_spores — keeping each bucket's TOP max_spores BY RANK, which is meaningful
     #     ONLY because list_open is pre-ranked (a future refactor that feeds an UNRANKED
     #     list here would make each bucket's cap arbitrary). Defensive per-row: one
@@ -1998,7 +1989,7 @@ def build_substrate_view(
 
         if paths.spores_json.exists():
             # bucket name → its destination list; the BUCKET_LOOP default is open_spores
-            bucket_target = {BUCKET_TRAY: view.tray, BUCKET_KEEP: view.keep}
+            bucket_target = {BUCKET_TRAY: view.tray}
             for s in SporeStore(paths.spores_json).list_open(today=today):
                 # The WHOLE per-row pipeline (status-skip → route → cap → construct) lives
                 # in ONE try, so a fault on ANY phase drops just that row — the "one
@@ -2178,19 +2169,12 @@ def render_text(view: SubstrateView) -> str:
             out.append(f"  - [{s.tier}] {s.text}{nxt}")
         out.append("")
 
-    # Tray — the operator session-I/O inbox (badged by disposition); Keep — durable
-    # pinned-dormant loops (the parked tier, lifted out of Open loops above).
+    # Tray — the operator session-I/O inbox (badged by disposition; a legacy note shows as "note").
     if view.tray:
         out.append(f"Tray ({len(view.tray)})")
         for s in view.tray:
             nxt = f" → surface {s.next}" if s.next else ""
             out.append(f"  - [{s.disposition}] {s.text}{nxt}")
-        out.append("")
-
-    if view.keep:
-        out.append(f"Keep ({len(view.keep)})")
-        for s in view.keep:
-            out.append(f"  - [{s.tier}] {s.text}")
         out.append("")
 
     if view.episodes:
@@ -2277,8 +2261,6 @@ def render_summary(view: SubstrateView) -> str:
     lines.append(f"Open loops: {len(view.open_spores)}")
     if view.tray:
         lines.append(f"Tray (operator inbox): {len(view.tray)}")
-    if view.keep:
-        lines.append(f"Keep (pinned-dormant): {len(view.keep)}")
     lines.append(f"Recent episodes: {len(view.episodes)}")
     if view.config_docs:
         lines.append(f"Seed/config docs: {len(view.config_docs)}")

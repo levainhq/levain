@@ -660,7 +660,7 @@ const sporeQueries = {};
 const f = new Function("el", "sporeQueries", "measureOverflow", "measureClauses", block + "\nreturn mountSporeFilter;");
 const rowsOf = (panel) => panel.children[1].children.filter((c) => c.className === "row").length;
 const ROWS = [1, 2, 3, 4, 5].map((i) => ({ id: "spore-" + i, text: i === 4 ? "Kettle bell" : "item " + i }));
-for (const kind of ["tray", "keep"]) {
+for (const kind of ["tray", "spores"]) {
   const mount = f(el, sporeQueries, () => {}, () => {});
   const p = mk("div");
   mount(p, ROWS, "items", kind, (rows, results) => rows.forEach((s) => results.appendChild(el("div", "row", s.id))));
@@ -680,14 +680,14 @@ for (const kind of ["tray", "keep"]) {
 console.log("OK");
 """
 
-    def test_filtering_narrows_rows_and_clearing_restores_them_on_tray_and_keep(self, tmp_path: Path) -> None:
+    def test_filtering_narrows_rows_and_clearing_restores_them_on_tray_and_loops(self, tmp_path: Path) -> None:
         drv = tmp_path / "filter_check.js"
         drv.write_text(self.DRIVER, encoding="utf-8")
         r = subprocess.run([NODE, str(drv), str(WEB / "dashboard_core.js")], capture_output=True, text=True, timeout=20)
         assert r.returncode == 0, r.stderr
         assert "OK" in r.stdout
 
-    def test_tray_and_keep_projections_mount_the_filter_by_panel_kind(self) -> None:
+    def test_tray_and_loops_projections_mount_the_filter_by_panel_kind(self) -> None:
         core = (WEB / "dashboard_core.js").read_text(encoding="utf-8")
         body = core[core.index("function renderSporeProjection"):core.index("function renderSpores(")]
         assert "mountSporeFilter(p, list" in body and "entry.kind" in body

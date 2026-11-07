@@ -6,17 +6,18 @@ A spore's ``disposition`` routes it across THREE operator-facing classes:
   - the **Tray** inbox (``seed`` / ``handoff`` / ``agenda``) — operator session-I/O that
     should NOT pollute cognition; a ``seed`` metabolizes into a ``loop`` (or resolves). It
     FORMS, then resolves.
-  - **Keep** reference (``note``) — durable operator reference; persists until removed,
-    resolve-EXEMPT (never germinates, never ascends; removed via descend). Keep ALSO holds
-    pinned-dormant loops via the existing ``parked`` TIER.
-Tray + Keep are both ``NON_COGNITION``; lineage rides the existing ``pointer``.
+  - legacy **note** reference (``note``) — durable operator reference; persists until removed,
+    resolve-EXEMPT (never germinates, never ascends; removed via descend). There is no Keep
+    panel any more: a note still in a store renders in the Tray, and a pinned-dormant loop
+    (the ``parked`` TIER) renders in Open loops, marked parked.
+Tray + note are both ``NON_COGNITION``; lineage rides the existing ``pointer``.
 
 The field is ADDITIVE: every pre-Slice-3 spore has no ``disposition`` key and reads as a
 ``loop`` (no migration; anneal round-trips an unknown ``disposition`` untouched — the
 Slice-3 de-risk, proven empirically, is exactly why anneal needs NO change).
 
 This module is the dashboard's render half: it CLASSIFIES a spore dict into the three
-operator-facing projections — Open Loops / Tray / Keep — via :func:`bucket_of`.
+operator-facing projections — Open Loops / Tray — via :func:`bucket_of`.
 
 ⚠ **Scope of the "keep operator-I/O OUT of cognition" invariant.** ``is_loop`` is the
 PREDICATE; who ENFORCES it depends on the surface. The embedder's own store enforces it at its
@@ -52,7 +53,6 @@ __all__ = [
     "PARKED_TIER",
     "BUCKET_LOOP",
     "BUCKET_TRAY",
-    "BUCKET_KEEP",
     "disposition_of",
     "is_loop",
     "is_tray",
@@ -70,16 +70,17 @@ NON_COGNITION_DISPOSITIONS = TRAY_DISPOSITIONS + KEEP_DISPOSITIONS
 VALID_DISPOSITIONS = (LOOP_DISPOSITION,) + NON_COGNITION_DISPOSITIONS
 
 # The tier value that means *deliberate dormancy* (anneal's own ``Tier`` literal — see
-# ``anneal_memory.spores.VALID_TIERS``). A parked LOOP is Keep — pinned-dormant, exempt
+# ``anneal_memory.spores.VALID_TIERS``). A parked LOOP is pinned-dormant (shown in Open loops, marked parked), exempt
 # from the dormancy→compost prompt — NOT a disposition. Kept as a literal (not an anneal
 # import) so this render-vocab module stays import-light; anneal owns the tier taxonomy.
 PARKED_TIER = "parked"
 
-# The three operator-facing render buckets (the capture-UX (A) projection: ONE Tray, not
-# three disposition panels — seed/handoff/agenda all land in Tray).
-BUCKET_LOOP = "loop"   # the entity's active prospective loops (Open Loops panel)
-BUCKET_TRAY = "tray"   # the operator inbox awaiting AI triage (Tray panel)
-BUCKET_KEEP = "keep"   # durable reference (notes) + pinned-dormant loops (Keep panel)
+# The two operator-facing render buckets (the capture-UX (A) projection: ONE Tray, not
+# three disposition panels — seed/handoff/agenda all land in Tray). There is no Keep panel
+# (task surfaces TS-5a, Phill 11-07): a parked loop shows in Open loops with a parked marker,
+# and a legacy ``note`` row still in a store shows in the Tray as legacy, never dropped.
+BUCKET_LOOP = "loop"   # the entity's prospective loops, parked ones marked (Open Loops panel)
+BUCKET_TRAY = "tray"   # the operator inbox awaiting AI triage + legacy notes (Tray panel)
 
 
 def disposition_of(item: Mapping[str, Any]) -> str:
@@ -122,18 +123,13 @@ def bucket_of(item: Mapping[str, Any]) -> str:
     """Classify a spore into its operator-facing render bucket — a TOTAL partition (every
     spore lands in exactly one):
 
-    - ``BUCKET_TRAY`` — a Tray inbox disposition (seed/handoff/agenda), ANY tier.
-      Disposition wins over tier: a parked-but-un-triaged seed is still a Tray item.
-    - ``BUCKET_KEEP`` — durable reference: a ``note`` disposition (resolve-exempt) OR a
-      loop on the ``parked`` tier (pinned-dormant, exempt from the dormancy→compost
-      prompt). The two Keep halves from the original FATE design.
-    - ``BUCKET_LOOP`` — a loop on any active tier: the entity's live cognition.
-
-    Disposition is checked before tier so a (hypothetical) parked note still reads Keep.
+    - ``BUCKET_TRAY`` — a Tray inbox disposition (seed/handoff/agenda), ANY tier, or a legacy
+      ``note`` row (the Keep is gone; a note still in a store is shown, badged ``note``, never
+      dropped). Disposition wins over tier.
+    - ``BUCKET_LOOP`` — a loop on any tier, a ``parked`` one included (pinned-dormant, exempt
+      from the dormancy→compost prompt; its row carries the parked marker).
     """
     d = disposition_of(item)
-    if d in TRAY_DISPOSITIONS:
+    if d in TRAY_DISPOSITIONS or d in KEEP_DISPOSITIONS:
         return BUCKET_TRAY
-    if d in KEEP_DISPOSITIONS or item.get("tier") == PARKED_TIER:
-        return BUCKET_KEEP
     return BUCKET_LOOP

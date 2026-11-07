@@ -113,7 +113,8 @@ ZONES: tuple[tuple[str, str], ...] = (
 # including the Class-C crystals/wraps lists — is a text panel that scrolls as one
 # body (no verb, so no cursor needed). Tray + Keep joined the list when their
 # Class-B operator-I/O verbs landed (the curses peer of the web's Slice-3b verbs).
-_LIST_KINDS = frozenset({"spores", "tray", "keep", "episodes", "edits"})
+# There is no Keep list: a parked loop is an Open loops row, a legacy note a Tray row.
+_LIST_KINDS = frozenset({"spores", "tray", "episodes", "edits"})
 
 # Audit-record kinds that are NOT file-undoable — verb-mediated lifecycle ops
 # whose reversibility is anneal's, not this layer's. Mirrors writes._VERB_KINDS
@@ -188,8 +189,6 @@ def panel_item_count(view: SubstrateView, panel: dict[str, Any]) -> int:
         return len(view.open_spores)
     if kind == "tray":
         return len(view.tray)
-    if kind == "keep":
-        return len(view.keep)
     if kind == "episodes":
         return len(view.episodes)
     if kind == "edits":
@@ -234,7 +233,7 @@ class Verb:
     drives the confirm gate; ``needs_kind`` flags a spore resolve verb that must
     choose an anneal-validated kind first. ``row_scoped`` is True for a verb that
     acts on the selected row (touch/edit/descend/…) and False for a PANEL-level verb
-    (the Tray/Keep freeform capture) — the panel-level verb is still offered on an
+    (the Tray freeform capture) — the panel-level verb is still offered on an
     EMPTY list (you dump INTO an empty Tray), where row-scoped verbs are suppressed."""
 
     key: str
@@ -253,10 +252,9 @@ def panel_verbs(panel: dict[str, Any] | None, *, read_only: bool = False) -> lis
     - **Open Loops** (spores): touch / edit-text / schedule / park / descend / ascend.
     - **Tray** (operator inbox): new-dump (panel-level) / edit / reclassify / metabolize
       (→ loop) / schedule / dismiss.
-    - **Keep** (durable): note-dump (panel-level) / edit / activate (the keep-note
-      promote — note→loop / parked-loop→un-park) / →tray / remind / drop. The note-only
-      verbs (→tray, remind) are pruned for a parked LOOP row by ``_active_verbs`` — this
-      returns the panel SUPERSET (it has no row), so the driver does the row shaping.
+    There is no Keep panel (TS-5a): a parked loop is an Open Loops row whose ``[p]ark``
+    becomes ``un-park`` (``_active_verbs`` shapes it by the selected row), and a legacy note
+    is a Tray row.
 
     Episodes offer tombstone; the edits panel offers ``[u]ndo`` of a file-undoable
     record. Returns ``[]`` for a panel that affords nothing — the footer then shows
@@ -295,18 +293,6 @@ def panel_verbs(panel: dict[str, Any] | None, *, read_only: bool = False) -> lis
             Verb("m", "[m]etabolize", "spore_metabolize"),
             Verb("s", "[s]chedule", "spore_schedule"),
             Verb("d", "[d]ismiss", "spore_descend", destructive=True, needs_kind=True),
-        ]
-    if kind == "keep" and edit_class == CLASS_B:  # durable reference (notes + parked loops)
-        # The full superset; _active_verbs prunes the note-only promote verbs for a
-        # parked-loop row (NO THEATER per the SELECTED row). `activate` is row-dispatched
-        # in the driver: a note → set_disposition{loop}, a parked loop → un-park (tier=warm).
-        return [
-            Verb("n", "[n]ote", "spore_capture", row_scoped=False),
-            Verb("e", "[e]dit", "spore_edit"),
-            Verb("m", "[m] activate", "keep_activate"),
-            Verb("y", "→ tra[y]", "spore_to_tray"),
-            Verb("s", "remind [s]", "keep_remind"),
-            Verb("d", "[d]rop", "spore_descend", destructive=True, needs_kind=True),
         ]
     if kind == "episodes" and edit_class == CLASS_B:
         return [Verb("x", "[x] tombstone", "episode_tombstone", destructive=True)]
@@ -409,7 +395,7 @@ def build_spore_update_req(
 ) -> dict[str, Any]:
     """The forming-workbench metadata edit: refine ``text``, reclassify ``type`` (only
     while a Tray item is forming — locked once it metabolizes), or re-``tier`` (park a
-    loop → ``parked``, un-park a Keep loop → ``warm``). At least one field; all
+    loop → ``parked``, un-park a parked loop → ``warm``). At least one field; all
     non-destructive (reversible by re-edit) → no confirm. ``type`` is sent under the
     wire key ``type`` (named ``spore_type`` here to avoid shadowing the builtin).
 
@@ -492,8 +478,6 @@ def render_panel_lines(view: SubstrateView, panel: dict[str, Any]) -> list[str]:
         return _render_spores(view)
     if kind == "tray":
         return _render_tray(view)
-    if kind == "keep":
-        return _render_keep(view)
     if kind == "episodes":
         return _render_episodes(view)
     if kind == "edits":
@@ -565,17 +549,6 @@ def _render_tray(view: SubstrateView) -> list[str]:
         + f"  · {s.id}"
         for s in view.tray
     ]
-
-
-def _render_keep(view: SubstrateView) -> list[str]:
-    """ONE line per Keep item — durable pinned-dormant loops (the parked tier), exempt
-    from the dormancy→compost prompt. Read-only display in 3a."""
-    err = view.errors.get("open_spores")  # all three projections share the spore-read fault key
-    if err:
-        return [f"(unavailable — {err})"]
-    if not view.keep:
-        return ["(keep empty)"]
-    return [f"[{s.tier}] {_oneline(s.text)}  · {s.id}" for s in view.keep]
 
 
 def _render_episodes(view: SubstrateView) -> list[str]:
@@ -735,7 +708,7 @@ def with_view(model: TuiModel, view: SubstrateView, status: str = "") -> TuiMode
 
 def current_spore(model: TuiModel) -> Any | None:
     """The selected OPEN-LOOP row specifically (the spores panel only). The driver uses
-    the broader ``current_row`` (which spans Open Loops / Tray / Keep); ``current_spore``
+    the broader ``current_row`` (which spans Open Loops / Tray); ``current_spore``
     remains the narrower public accessor for a spores-panel-only consumer."""
     panel = model.current_panel()
     if panel is None or panel.get("kind") != "spores":
@@ -746,11 +719,10 @@ def current_spore(model: TuiModel) -> Any | None:
 
 
 def current_row(model: TuiModel) -> Any | None:
-    """The selected spore-like item for whichever of the THREE spore projections is
-    active — Open Loops (``view.open_spores``), Tray (``view.tray``), or Keep
-    (``view.keep``). Each maps the item cursor 1:1 onto its own list, so the shared
-    lifecycle verbs (touch/edit/descend/disposition/…) act on the right row across all
-    three. Returns ``None`` off a spore panel or past the list end."""
+    """The selected spore-like item for whichever of the TWO spore projections is
+    active — Open Loops (``view.open_spores``) or Tray (``view.tray``). Each maps the item
+    cursor 1:1 onto its own list, so the shared lifecycle verbs (touch/edit/descend/…) act
+    on the right row across both. Returns ``None`` off a spore panel or past the list end."""
     panel = model.current_panel()
     if panel is None:
         return None
@@ -760,7 +732,6 @@ def current_row(model: TuiModel) -> Any | None:
     src = {
         "spores": model.view.open_spores,
         "tray": model.view.tray,
-        "keep": model.view.keep,
     }.get(kind)
     if src is None or model.item_idx >= len(src):
         return None

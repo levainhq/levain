@@ -35,6 +35,7 @@ from dataclasses import replace
 
 from levain.cockpit.engine import Cockpit
 from levain.dashboard import CLASS_A, CLASS_B, CLASS_C, SubstrateSource, SubstrateView
+from levain.spores import PARKED_TIER
 from levain.tui import (
     ZONES,
     TuiModel,
@@ -227,14 +228,12 @@ def _active_verbs(model: TuiModel) -> list[Verb]:
     changes the affordance (NO THEATER — never advertise a key the selected row can't
     honor):
     - **edits** — ``[u]ndo`` only on a file-undoable record (mirrors the server refusal).
-    - **keep** — the note-promote verbs (→ tray / remind) apply ONLY to a Keep NOTE; a
-      pinned-dormant LOOP keeps ``activate`` (which row-dispatches to un-park) but not those.
-    - **spores/tray/keep** — a resolve verb is advertised only when the SELECTED row's
+    - **spores/tray** — a resolve verb is advertised only when the SELECTED row's
       type actually yields that kind (``descend_kinds`` / ``ascend_kinds``), mirroring the
-      web's ``Array.isArray(...) && .length`` gate; the Keep note-promote verbs (→ tray /
-      remind) apply ONLY to a Keep NOTE; a pinned-dormant LOOP keeps ``activate`` (which
-      row-dispatches to un-park) but not those.
-    - **empty list** — the row-scoped verbs vanish, but a PANEL-level verb (the Tray/Keep
+      web's ``Array.isArray(...) && .length`` gate; on a PARKED loop ``[p]ark`` is
+      replaced by ``un-park``; on a legacy note in the Tray ``re[c]lassify`` is dropped
+      (a type is only reclassifiable while an item forms in the Tray).
+    - **empty list** — the row-scoped verbs vanish, but a PANEL-level verb (the Tray
       freeform capture, ``row_scoped=False``) stays: you dump INTO an empty Tray.
     A read-only model suppresses everything (``panel_verbs(read_only=True)`` → ``[]``)."""
     sel = model.current_panel()
@@ -251,10 +250,10 @@ def _active_verbs(model: TuiModel) -> list[Verb]:
         return verbs
     if kind == "episodes":
         # episode_tombstone acts on the selected EPISODE — a DIFFERENT row source than the
-        # spore projections below (`current_row` covers only spores/tray/keep). Keep its verb
+        # spore projections below (`current_row` covers only spores/tray). Keep its verb
         # when a row is selected; the empty case already returned above (codex L3).
         return verbs if current_episode(model) is not None else []
-    # the three spore projections — prune by the SELECTED row so the footer never advertises
+    # the two spore projections — prune by the SELECTED row so the footer never advertises
     # a key the row can't honor (the NO-THEATER contract this function exists to keep).
     row = current_row(model)
     if row is None:
@@ -263,8 +262,10 @@ def _active_verbs(model: TuiModel) -> list[Verb]:
         verbs = [v for v in verbs if v.kind != "spore_descend"]
     if not getattr(row, "ascend_kinds", None):
         verbs = [v for v in verbs if v.kind != "spore_ascend"]
-    if kind == "keep" and getattr(row, "disposition", None) != "note":
-        verbs = [v for v in verbs if v.kind not in ("spore_to_tray", "keep_remind")]
+    if kind == "spores" and getattr(row, "tier", None) == PARKED_TIER:
+        verbs = [Verb("p", "[p] un-park", "spore_unpark") if v.kind == "spore_park" else v for v in verbs]
+    if kind == "tray" and getattr(row, "disposition", None) == "note":
+        verbs = [v for v in verbs if v.kind != "spore_reclassify"]
     return verbs
 
 
@@ -314,7 +315,7 @@ def _handle_verb(
         return _handle_edit(stdscr, model, source)
 
     # The spore lifecycle verbs act on the SELECTED row of whichever spore projection is
-    # active (Open Loops / Tray / Keep) — current_row dispatches to the right list.
+    # active (Open Loops / Tray) — current_row dispatches to the right list.
     if kind == "spore_touch":
         s = current_row(model)
         if s is None:
@@ -322,14 +323,13 @@ def _handle_verb(
         return _apply(model, source, build_touch_req(s.id), f"touched {s.id}")
 
     if kind == "spore_descend":
-        # One verb, three faces by panel (parity with the web): Open Loops "compost" +
-        # Tray "dismiss" both pick a resolve kind; Keep "remove" auto-picks 'composted'
-        # (else the first kind) with a single confirm and NO picker (web openRemoveConfirm).
+        # One verb, two faces by panel (parity with the web): Open Loops "compost" +
+        # Tray "dismiss" both pick a resolve kind.
         # CAS-GUARDED (spore-173): the kind/face is chosen off the SNAPSHOT row, so the
         # snapshot disposition rides the request as expect_disposition; the server descend
         # CASes it (anneal AM-SPORE-CAS-DESCEND, parity with ascend), so a cross-process
         # re-route in the confirm window FAILS CLOSED (stale → re-read, spore-174) rather than
-        # composting a now-live loop under a Keep-"remove" intent. (s.disposition is the
+        # composting a now-live loop under a stale intent. (s.disposition is the
         # rendered value; the server normalizes 'loop'→key-absent for the raw compare.)
         s = current_row(model)
         if s is None:
@@ -337,14 +337,6 @@ def _handle_verb(
         if not s.descend_kinds:
             return replace(model, status="⚠ no resolve kinds for this item's type")
         pk = (model.current_panel() or {}).get("kind")
-        if pk == "keep":
-            chosen = "composted" if "composted" in s.descend_kinds else s.descend_kinds[0]
-            if not _confirm(stdscr, f"remove {s.id} from Keep (as '{chosen}')? "
-                                    "(recoverable in anneal's resolved set)"):
-                return replace(model, status="cancelled")
-            return _apply(model, source,
-                          build_descend_req(s.id, chosen, expect_disposition=s.disposition),
-                          f"removed {s.id}")
         word, past = ("dismiss", "dismissed") if pk == "tray" else ("compost", "composted")
         chosen = _choose(stdscr, f"{word} {s.id} as:", list(s.descend_kinds))
         if chosen is None:
@@ -386,12 +378,12 @@ def _handle_verb(
             return replace(model, status="no change")
         return _apply(model, source, build_spore_update_req(s.id, text=edited), f"edited {s.id}")
 
-    if kind == "spore_capture":  # PANEL-level freeform dump → Tray seed / Keep note
+    if kind == "spore_capture":  # PANEL-level freeform dump → Tray seed
         # Deliberately sends NO `type` → the server defaults to `thought` and the AI sorts it
         # ("human dumps, AI sorts" — the same as the web dump's default "let flow sort" option).
         # The operator classifies post-dump via the Tray `c` (reclassify) verb when they care.
         panel = model.current_panel()
-        disposition = "note" if (panel and panel.get("kind") == "keep") else "seed"
+        disposition = "seed"
         text = _edit_via_editor(stdscr, "")
         if text is None:
             return replace(model, status="⚠ capture not saved — $EDITOR is missing or exited non-zero")
@@ -433,7 +425,7 @@ def _handle_verb(
         ok = f"cleared schedule on {s.id}" if value == "" else f"scheduled {s.id} → {date}"
         return _apply(model, source, build_surface_at_req(s.id, value), ok)
 
-    if kind == "spore_park":  # pin a loop to Keep (hide from cognition, stays open)
+    if kind == "spore_park":  # pin a loop dormant (hide from cognition, stays open, shown parked)
         s = current_row(model)
         if s is None:
             return replace(model, status="no loop selected")
@@ -441,40 +433,19 @@ def _handle_verb(
         # tier update so a concurrent re-route before the write fails closed (not tier-parks a note).
         return _apply(model, source,
                       build_spore_update_req(s.id, tier="parked", expect_disposition=s.disposition),
-                      f"parked {s.id} → Keep")
+                      f"parked {s.id}")
 
-    if kind == "spore_to_tray":  # promote a Keep note → the Tray inbox (note→seed)
-        s = current_row(model)
-        if s is None:
-            return replace(model, status="no note selected")
-        return _apply(model, source, build_set_disposition_req(s.id, "seed", expect_disposition=s.disposition),
-                      f"promoted {s.id} → Tray")
-
-    if kind == "keep_activate":  # row-dispatched: a note → loop; a parked loop → un-park
+    if kind == "spore_unpark":  # a parked Open loop → back into active cognition
         s = current_row(model)
         if s is None:
             return replace(model, status="no item selected")
-        if getattr(s, "disposition", None) == "note":
-            # note → loop: backstopped server-side (set_disposition CASes the disposition).
-            return _apply(model, source, build_set_disposition_req(s.id, "loop", expect_disposition=s.disposition),
-                          f"activated {s.id} → loop")
-        # parked loop → un-park: CAS-GUARDED (spore-173) — the note-vs-parked route is read off
+        # un-park: CAS-GUARDED (spore-173) — the loop-vs-note route is read off
         # the SNAPSHOT, so the snapshot disposition rides the tier update as expect_disposition;
         # a stale note now FAILS CLOSED (stale → re-read, spore-174) instead of accepting tier=warm +
         # falsely reporting "reactivated" while it stays a note.
         return _apply(model, source,
                       build_spore_update_req(s.id, tier="warm", expect_disposition=s.disposition),
                       f"reactivated {s.id} → warm")
-
-    if kind == "keep_remind":  # note → Tray seed + future surface, atomically (one CAS)
-        s = current_row(model)
-        if s is None:
-            return replace(model, status="no note selected")
-        date = _prompt_line(stdscr, f"remind ({s.id}) in the Tray on (YYYY-MM-DD):")
-        if not date:
-            return replace(model, status="cancelled")
-        return _apply(model, source, build_set_disposition_req(s.id, "seed", surface_at=date, expect_disposition=s.disposition),
-                      f"reminder: {s.id} → Tray on {date}")
 
     if kind == "episode_tombstone":
         e = current_episode(model)
@@ -780,7 +751,7 @@ def _paint(stdscr: "curses.window", model: TuiModel) -> TuiModel:
         pidx = left_scroll + row_i
         cls = panel.get("edit_class") or ""
         # NO-THEATER: the metal [A]/[B] chip + bold is THIS surface's operability signal. A
-        # panel can be Class B in the shared manifest because the WEB operates it (Tray/Keep,
+        # panel can be Class B in the shared manifest because the WEB operates it (Tray,
         # Slice 3b) while the curses surface has no verb for it yet → render it as glass (no
         # chip, dim) rather than a false metal [B] until the TUI grows the verb [codex L3
         # NO-THEATER]. `read_only=False` probes "can this surface EVER operate this kind?",
@@ -865,14 +836,12 @@ _HELP_LINES = [
     "",
     "  verbs (only where the SELECTED panel + row affords them)",
     "    config / sections   e            edit a Class-A input ($EDITOR): State / world.md",
-    "    Open Loops          t e s p d a  touch · edit · schedule · park · descend · ascend",
+    "    Open Loops          t e s p d a  touch · edit · schedule · park (un-park on a parked",
+    "                                     loop) · descend · ascend",
     "    Tray (inbox)        n e c m s d  new-dump · edit · re(c)lassify · metabolize→loop ·",
     "                                     schedule · dismiss",
-    "    Keep (durable)      n e m y s d  note-dump · edit · activate · →tra(y) · remind · drop",
-    "                                     (→tray / remind are note-only; on a parked loop,",
-    "                                      m un-parks it back into cognition)",
     "    Episodes / Edits    x · u        tombstone an episode · undo a Class-A file edit",
-    "    n (new-dump / note) works on an EMPTY Tray/Keep too — it's a panel-level capture.",
+    "    n (new-dump) works on an EMPTY Tray too — it's a panel-level capture.",
     "",
     "  Class-C is dim (consolidated cognition — glass, read-only);",
     "  Class-A/B is bold (operator inputs — metal, steerable).",

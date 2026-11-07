@@ -349,7 +349,6 @@ def spore_row_version(raw: Mapping[str, Any]) -> str:
 SPORE_EMPTY = {
     "tray": "Nothing yet. Drop a thought in the box above and {entity} sorts it.",
     "loops": "Nothing yet. What stays open after {entity} sorts the Tray is listed here.",
-    "keep": "Nothing yet. Add a note above to keep something handy.",
 }
 # what the Tray's capture box says when the install has no name for its entity (dashboard_core.js ``buildTrayDump`` says the same)
 SPORE_EMPTY_ENTITY = "the assistant"
@@ -456,7 +455,7 @@ def _spore_provider(
             return bad
         if not path.exists():           # removed while the view was being built
             return Absent(f"no spore store at {path}")
-        items = {"tray": view.tray, "loops": view.open_spores, "keep": view.keep}[bucket]
+        items = {"tray": view.tray, "loops": view.open_spores}[bucket]
         filtered = 0
         rows = []
         held_rows = []
@@ -1647,12 +1646,11 @@ def build_default_cockpit(
                              region="brief", rank=5, empty="Nothing set for today yet.", edit_class=CLASS_C))
     # mock-e's default layout (design 1011, "mock-e: what it decides"). The WORK zone (`operate`) is a
     # 3-column grid whose cards flow in rank order, `now` first: Now, Tray, Open loops (row a, tall) / [Inbox, Fleet,
-    # Stream: downstream-only] / Recent episodes, Keep, Recent edits. Ranks leave gaps so a downstream's
+    # Stream: downstream-only] / Recent episodes, Recent edits. Ranks leave gaps so a downstream's
     # Inbox, Fleet and Stream slot in 16-39, between Open loops and Recent episodes without renumbering the kernel's.
     for pid, title, bucket, prio, order, rank, views, size in (
         ("tray", "Tray", "tray", "gate", "spore.tray", 10, TRAY_VIEWS, "tall"),
         ("loops", "Open loops", "loops", "feed", "spore.loops", 15, (), "tall"),
-        ("keep", "Keep", "keep", "feed", "spore.keep", 50, (), "medium"),
     ):
         ck.register(ProviderSpec(
             pid, "triage-list", title, prio, _spore_provider(source, bucket), region="operate", rank=rank, size=size,

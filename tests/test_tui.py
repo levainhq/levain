@@ -108,12 +108,15 @@ def _view() -> SubstrateView:
             pointer=None, disposition="handoff",
         ),
     ]
-    keep = [
-        OpenSpore(
-            id="spore-029", type="task", tier="parked", salience=1, domain="ops",
-            text="open-model partner laptop", seen="2026-06-10", next=None, pointer=None,
-        ),
-    ]
+    # TS-5a: no Keep. The parked loop is an Open loop (marked by its tier), the legacy note a Tray row.
+    spores.append(OpenSpore(
+        id="spore-029", type="task", tier="parked", salience=1, domain="ops",
+        text="open-model partner laptop", seen="2026-06-10", next=None, pointer=None,
+    ))
+    tray.append(OpenSpore(
+        id="spore-030", type="thought", tier="warm", salience=1, domain="ops",
+        text="docker: levain-vps init", seen="2026-06-10", next=None, pointer=None, disposition="note",
+    ))
     episodes = [
         EpisodeRow("ep1", "2026-06-15T16:55:00", "finding", "session-tui", "built the TUI scaffold", ["levain"]),
         EpisodeRow("ep2", "2026-06-15T12:00:00", "decision", "session-tui", "chose curses", ["levain"]),
@@ -135,7 +138,7 @@ def _view() -> SubstrateView:
     ]
     return SubstrateView(
         paths=paths, entity_name="flow", health=health, graph=graph,
-        crystal_index=crystals, open_spores=spores, tray=tray, keep=keep, episodes=episodes,
+        crystal_index=crystals, open_spores=spores, tray=tray, episodes=episodes,
         sections=sections, config_docs=config_docs, wraps=wraps, recent_edits=recent_edits,
     )
 
@@ -153,17 +156,17 @@ def test_panels_for_zone_identity_is_config_docs():
 def test_panels_for_zone_operate_order():
     v = _view()
     panels = tui.panels_for_zone(v, ZONE_OPERATE)
-    # the three spore projections are adjacent (Open Loops · Tray · Keep), then episodes,
+    # the two spore projections are adjacent (Open Loops · Tray; no Keep, TS-5a), then episodes,
     # then the edit log (Slice 3 capture-UX (A) ordering).
-    assert [p["kind"] for p in panels] == ["spores", "tray", "keep", "episodes", "edits"]
+    assert [p["kind"] for p in panels] == ["spores", "tray", "episodes", "edits"]
     by_kind = {p["kind"]: p for p in panels}
-    # spores + episodes are Class B (verb-mediated); Tray + Keep FLIP to Class B in 3b
+    # spores + episodes are Class B (verb-mediated); Tray FLIPs to Class B in 3b
     # (the governed dump/triage/park verbs); only the edit log carries no chip.
     assert by_kind["spores"]["edit_class"] == CLASS_B
     assert by_kind["episodes"]["edit_class"] == CLASS_B
     assert by_kind["edits"]["edit_class"] == ""
     assert by_kind["tray"]["edit_class"] == CLASS_B
-    assert by_kind["keep"]["edit_class"] == CLASS_B
+    assert "keep" not in by_kind
 
 
 def test_panels_for_zone_mind_has_sections_and_state_is_class_a():
@@ -182,7 +185,7 @@ def test_panels_for_zone_mind_has_sections_and_state_is_class_a():
 def test_panel_item_count_only_verb_lists_are_selectable():
     v = _view()
     by_kind = {p["kind"]: p for p in v.layout()}
-    assert tui.panel_item_count(v, by_kind["spores"]) == 2
+    assert tui.panel_item_count(v, by_kind["spores"]) == 3
     assert tui.panel_item_count(v, by_kind["episodes"]) == 2
     assert tui.panel_item_count(v, by_kind["edits"]) == 2
     # crystals + wraps render rich and scroll, but carry no per-item verb → 0
@@ -253,18 +256,10 @@ def test_tray_panel_verbs():
     assert dismiss.destructive and dismiss.needs_kind
 
 
-def test_keep_panel_verbs():
-    # Keep SUPERSET (panel-level; _active_verbs prunes the note-only verbs for a parked loop).
-    verbs = tui.panel_verbs({"kind": "keep", "edit_class": CLASS_B}, read_only=False)
-    assert [x.kind for x in verbs] == [
-        "spore_capture", "spore_edit", "keep_activate",
-        "spore_to_tray", "keep_remind", "spore_descend",
-    ]
-    assert next(x for x in verbs if x.kind == "spore_capture").row_scoped is False
-    assert next(x for x in verbs if x.kind == "spore_descend").destructive
-    # the promote/activate verbs are GAINS into cognition / a lateral move → no confirm gate
-    for k in ("keep_activate", "spore_to_tray", "keep_remind"):
-        assert not next(x for x in verbs if x.kind == k).destructive
+def test_keep_panel_has_no_verbs():
+    # TS-5a: the Keep is gone; a "keep" panel kind affords nothing and is no item list.
+    assert tui.panel_verbs({"kind": "keep", "edit_class": CLASS_B}, read_only=False) == []
+    assert not tui.is_item_list({"kind": "keep"})
 
 
 def test_episode_panel_offers_tombstone_and_edits_offers_undo():
@@ -284,7 +279,7 @@ def test_tray_keep_read_only_suppresses_all_verbs():
     # The inspect-only mode (levain tui --read-only / the flow cockpit over a no-.levain
     # substrate) suppresses EVERY Tray/Keep verb so the chip renders glass + the footer
     # advertises navigation only (NO THEATER — no governed write target behind them).
-    for kind in ("tray", "keep"):
+    for kind in ("tray",):
         assert tui.panel_verbs({"kind": kind, "edit_class": CLASS_B}, read_only=True) == []
 
 
@@ -424,7 +419,7 @@ def test_apply_backstop_refuses_write_in_read_only(monkeypatch):
 def test_panel_verbs_require_class_b_for_lifecycle():
     # The manifest's edit_class owns the affordance: a mistagged Class-C spores/
     # episodes panel must offer NO mutation verb.
-    for kind in ("spores", "tray", "keep", "episodes"):
+    for kind in ("spores", "tray", "episodes"):
         assert tui.panel_verbs({"kind": kind, "edit_class": CLASS_C}) == []
     assert [v.kind for v in tui.panel_verbs({"kind": "spores", "edit_class": CLASS_B})] == [
         "spore_touch", "spore_edit", "spore_schedule", "spore_park",
@@ -463,9 +458,9 @@ def test_select_zone_clamps_and_resets():
 
 
 def test_select_panel_clamps_within_zone():
-    m = tui.TuiModel(view=_view(), zone_idx=1)  # Operate: 5 panels (spores·tray·keep·episodes·edits)
+    m = tui.TuiModel(view=_view(), zone_idx=1)  # Operate: 4 panels (spores·tray·episodes·edits)
     assert tui.select_panel(m, +1).panel_idx == 1
-    assert tui.select_panel(m, +99).panel_idx == 4
+    assert tui.select_panel(m, +99).panel_idx == 3
     assert tui.select_panel(m, -99).panel_idx == 0
     # moving panel resets item + scroll
     m2 = tui.TuiModel(view=_view(), zone_idx=1, panel_idx=0, item_idx=1, scroll=3)
@@ -474,10 +469,10 @@ def test_select_panel_clamps_within_zone():
 
 
 def test_move_in_panel_selects_items_in_list_panel():
-    # Operate zone, spores panel (2 items) → j/k moves item cursor, clamped.
+    # Operate zone, spores panel (3 items) → j/k moves item cursor, clamped.
     m = tui.TuiModel(view=_view(), zone_idx=1, panel_idx=0)
     assert tui.move_in_panel(m, +1).item_idx == 1
-    assert tui.move_in_panel(m, +5).item_idx == 1  # clamped to last
+    assert tui.move_in_panel(m, +5).item_idx == 2  # clamped to last
     assert tui.move_in_panel(m, -5).item_idx == 0
 
 
@@ -505,17 +500,16 @@ def test_current_item_helpers():
     assert tui.current_spore(m).id == "spore-093"
     # off the spores panel → None
     assert tui.current_episode(m) is None
-    # Operate panels: 0=spores, 1=tray, 2=keep, 3=episodes, 4=edits (Slice 3 inserted
-    # Tray + Keep between Open Loops and episodes).
-    me = tui.TuiModel(view=_view(), zone_idx=1, panel_idx=3, item_idx=0)
+    # Operate panels: 0=spores, 1=tray, 2=episodes, 3=edits.
+    me = tui.TuiModel(view=_view(), zone_idx=1, panel_idx=2, item_idx=0)
     assert tui.current_episode(me).id == "ep1"
-    med = tui.TuiModel(view=_view(), zone_idx=1, panel_idx=4, item_idx=0)
+    med = tui.TuiModel(view=_view(), zone_idx=1, panel_idx=3, item_idx=0)
     assert tui.current_edit_record(med)["id"] == "edit1"
 
 
 # --- per-kind detail renderers (smoke + key content) -----------------------
 
-@pytest.mark.parametrize("kind", ["config", "section", "spores", "tray", "keep",
+@pytest.mark.parametrize("kind", ["config", "section", "spores", "tray",
                                   "episodes", "edits", "health", "graph", "crystals", "wraps"])
 def test_render_panel_lines_nonempty_per_kind(kind):
     v = _view()
@@ -543,8 +537,10 @@ def test_render_spores_one_line_per_loop_with_id():
     v = _view()
     panel = next(p for p in v.layout() if p["kind"] == "spores")
     lines = tui.render_panel_lines(v, panel)
-    assert len(lines) == 2  # one line per open loop
+    assert len(lines) == 3  # one line per open loop, the parked one included
     assert "spore-099" in lines[0] and "give Levain a canonical" in lines[0]
+    parked = [l for l in lines if "spore-029" in l]
+    assert len(parked) == 1 and "[parked" in parked[0]  # the parked marker rides the tier badge
 
 
 def test_render_tray_badges_disposition():
@@ -553,25 +549,18 @@ def test_render_tray_badges_disposition():
     v = _view()
     panel = next(p for p in v.layout() if p["kind"] == "tray")
     lines = tui.render_panel_lines(v, panel)
-    assert len(lines) == 2
+    assert len(lines) == 3
     assert "[seed]" in lines[0] and "spore-110" in lines[0]
     assert "[handoff]" in lines[1] and "surface 2026-06-19" in lines[1]
+    # a legacy note still in a store is shown, badged "note", never dropped
+    assert "[note]" in lines[2] and "spore-030" in lines[2]
 
 
-def test_render_keep_badges_parked_tier():
-    v = _view()
-    panel = next(p for p in v.layout() if p["kind"] == "keep")
-    lines = tui.render_panel_lines(v, panel)
-    assert len(lines) == 1
-    assert "[parked]" in lines[0] and "spore-029" in lines[0]
-
-
-def test_render_tray_keep_empty_states():
+def test_render_tray_empty_state_and_no_keep_panel():
     v = SubstrateView(paths=AnnealPaths.from_db(Path("/x/memory.db")))
     tray_panel = next(p for p in v.layout() if p["kind"] == "tray")
-    keep_panel = next(p for p in v.layout() if p["kind"] == "keep")
     assert tui.render_panel_lines(v, tray_panel) == ["(tray clear)"]
-    assert tui.render_panel_lines(v, keep_panel) == ["(keep empty)"]
+    assert not any(p["kind"] == "keep" for p in v.layout())
 
 
 def test_spore_panels_degraded_on_store_fault_not_false_zero():
@@ -581,12 +570,12 @@ def test_spore_panels_degraded_on_store_fault_not_false_zero():
     # web path already degraded — caught by codex L3 on the trust audit.)
     v = SubstrateView(paths=AnnealPaths.from_db(Path("/x/memory.db")),
                       errors={"open_spores": "SporeError: spores.json is not valid JSON"})
-    for kind in ("spores", "tray", "keep"):
+    for kind in ("spores", "tray"):
         panel = next(p for p in v.layout() if p["kind"] == kind)
         lines = tui.render_panel_lines(v, panel)
         assert len(lines) == 1
         assert "unavailable" in lines[0] and "SporeError" in lines[0], (kind, lines)
-        for false_zero in ("(no open loops)", "(tray clear)", "(keep empty)"):
+        for false_zero in ("(no open loops)", "(tray clear)"):
             assert false_zero not in lines[0], (kind, lines)
 
 
@@ -597,25 +586,24 @@ def test_spore_panel_titles_degraded_not_zero_count_on_fault():
     titles = {p["kind"]: p["title"] for p in v.layout() if p["kind"] in ("spores", "tray", "keep")}
     assert titles["spores"] == "Open loops (unavailable)", titles
     assert titles["tray"] == "Tray (unavailable)", titles
-    assert titles["keep"] == "Keep (unavailable)", titles
+    assert "keep" not in titles, titles
     # control: a healthy (empty) store still shows the honest "(0)" count, not a false degrade
     ok = SubstrateView(paths=AnnealPaths.from_db(Path("/x/memory.db")))
     ok_titles = {p["kind"]: p["title"] for p in ok.layout() if p["kind"] in ("spores", "tray", "keep")}
     assert ok_titles["spores"] == "Open loops (0)", ok_titles
 
 
-def test_tray_keep_are_verb_navigable():
-    # Tray + Keep grew Class-B operator-I/O verbs (the curses peer of the web's Slice-3b
-    # verbs), so they are now item-navigable: a per-row cursor the verbs act on. (The
-    # inverse of the retired 3a-era assertion that they were read-only display panels.)
+def test_tray_is_verb_navigable():
+    # Tray grew Class-B operator-I/O verbs (the curses peer of the web's Slice-3b
+    # verbs), so it is item-navigable: a per-row cursor the verbs act on.
     v = _view()
-    for kind in ("tray", "keep"):
+    for kind in ("tray",):
         panel = next(p for p in v.layout() if p["kind"] == kind)
         assert tui.panel_item_count(v, panel) > 0
         assert tui.is_item_list(panel)
 
 
-@pytest.mark.parametrize("kind", ["spores", "tray", "keep", "episodes", "edits"])
+@pytest.mark.parametrize("kind", ["spores", "tray", "episodes", "edits"])
 def test_verb_list_panels_render_one_line_per_item(kind):
     # The driver's cursor highlight + auto-scroll depend on 1 line == 1 item.
     v = _view()
@@ -711,7 +699,7 @@ def test_build_spore_update_req_threads_only_given_fields():
     }
 
 
-# --- current_row: the unified selector over the three spore projections -----
+# --- current_row: the unified selector over the two spore projections -----
 
 def _spore(sid: str, **kw: object) -> OpenSpore:
     base: dict[str, object] = dict(
@@ -729,44 +717,46 @@ def test_current_row_selects_from_the_active_projection():
         paths=AnnealPaths.from_db(Path("/x/memory.db")),
         open_spores=[_spore("spore-1")],
         tray=[_spore("spore-2", disposition="seed")],
-        keep=[_spore("spore-3", disposition="note")],
     )
     assert tui.current_row(_model_on(v, "spores", read_only=False)).id == "spore-1"
     assert tui.current_row(_model_on(v, "tray", read_only=False)).id == "spore-2"
-    assert tui.current_row(_model_on(v, "keep", read_only=False)).id == "spore-3"
     # out of range -> None; a non-spore panel -> None
-    m = _model_on(v, "keep", read_only=False)
+    m = _model_on(v, "tray", read_only=False)
     assert tui.current_row(_replace(m, item_idx=9)) is None
     assert tui.current_row(_model_on(v, "episodes", read_only=False)) is None
 
 
-# --- _active_verbs: row-aware Keep + panel-level capture on empty lists ------
+# --- _active_verbs: row-aware park / legacy note + panel-level capture on empty lists ------
 
-def test_active_verbs_keep_note_offers_promote_lifecycle():
+def test_active_verbs_parked_loop_offers_unpark_not_park():
     from levain import _tui_curses
     v = SubstrateView(paths=AnnealPaths.from_db(Path("/x/memory.db")),
-                      keep=[_spore("spore-n", disposition="note")])
-    kinds = [x.kind for x in _tui_curses._active_verbs(_model_on(v, "keep", read_only=False))]
-    assert "spore_to_tray" in kinds and "keep_remind" in kinds and "keep_activate" in kinds
+                      open_spores=[_spore("spore-p", tier="parked"), _spore("spore-w")])
+    kinds = [x.kind for x in _tui_curses._active_verbs(_model_on(v, "spores", read_only=False))]
+    assert "spore_unpark" in kinds and "spore_park" not in kinds
+    m = _model_on(v, "spores", read_only=False)
+    from dataclasses import replace as _r
+    kinds2 = [x.kind for x in _tui_curses._active_verbs(_r(m, item_idx=1))]
+    assert "spore_park" in kinds2 and "spore_unpark" not in kinds2
 
 
-def test_active_verbs_keep_parked_loop_drops_note_only_verbs():
+def test_active_verbs_legacy_note_in_tray_drops_reclassify():
     from levain import _tui_curses
-    # a pinned-dormant LOOP (tier=parked, disposition defaults to loop) -- NOT a note.
     v = SubstrateView(paths=AnnealPaths.from_db(Path("/x/memory.db")),
-                      keep=[_spore("spore-p", tier="parked")])
-    kinds = [x.kind for x in _tui_curses._active_verbs(_model_on(v, "keep", read_only=False))]
-    assert "keep_activate" in kinds       # un-park stays (row-dispatched)
-    assert "spore_to_tray" not in kinds    # the note-only promote verbs are pruned
-    assert "keep_remind" not in kinds
+                      tray=[_spore("spore-n", disposition="note"), _spore("spore-s", disposition="seed")])
+    kinds = [x.kind for x in _tui_curses._active_verbs(_model_on(v, "tray", read_only=False))]
+    assert "spore_reclassify" not in kinds and "spore_metabolize" in kinds
+    from dataclasses import replace as _r
+    m = _model_on(v, "tray", read_only=False)
+    assert "spore_reclassify" in [x.kind for x in _tui_curses._active_verbs(_r(m, item_idx=1))]
 
 
 def test_active_verbs_empty_list_keeps_only_panel_level_capture():
     from levain import _tui_curses
     v = SubstrateView(paths=AnnealPaths.from_db(Path("/x/memory.db")),
-                      open_spores=[], tray=[], keep=[])
-    # empty Tray/Keep -> only the panel-level dump survives (you capture INTO an empty inbox)...
-    for kind in ("tray", "keep"):
+                      open_spores=[], tray=[])
+    # empty Tray -> only the panel-level dump survives (you capture INTO an empty inbox)...
+    for kind in ("tray",):
         kinds = [x.kind for x in _tui_curses._active_verbs(_model_on(v, kind, read_only=False))]
         assert kinds == ["spore_capture"]
     # ...but Open Loops has no panel-level verb -> an empty list advertises nothing.
@@ -775,7 +765,7 @@ def test_active_verbs_empty_list_keeps_only_panel_level_capture():
 
 # --- _handle_verb dispatch routing (the driver decides WHICH builder runs per row) ----
 # The pure builders + _active_verbs are covered above; these lock the ROUTING in
-# _handle_verb — the riskiest branch logic (keep_activate's note-vs-parked fork, the
+# _handle_verb — the riskiest branch logic (the un-park CAS, the
 # panel-aware descend, the schedule '-'-clear). apply_edit + the modal helpers are
 # monkeypatched, so we assert the exact request _handle_verb hands to the governed seam.
 
@@ -798,22 +788,16 @@ def _capture_apply(monkeypatch) -> dict:
     return cap
 
 
-def test_handle_verb_keep_activate_dispatches_by_row_type(monkeypatch):
+def test_handle_verb_unpark_updates_tier_with_cas(monkeypatch):
     from levain import _tui_curses
     cap = _capture_apply(monkeypatch)
-    verb = _verb_of("keep", "keep_activate")
     p = AnnealPaths.from_db(Path("/x/memory.db"))
-    # a NOTE → metabolize into a loop (set_disposition{loop})
-    vnote = SubstrateView(paths=p, keep=[_spore("spore-n", disposition="note")])
-    _tui_curses._handle_verb(None, _model_on(vnote, "keep", read_only=False), None, verb)
-    assert cap["req"] == {"kind": "spore_set_disposition", "spore_id": "spore-n", "disposition": "loop",
-                          "expect_disposition": "note"}
-    # a parked LOOP → un-park (spore_update{tier:warm}) — the SAME key, different op. The
-    # rendered snapshot ('loop' — a parked plain loop) rides as expect_disposition (spore-173):
-    # a concurrent re-route to a note now fails closed server-side instead of tier-warming a note.
-    cap.clear()
-    vpark = SubstrateView(paths=p, keep=[_spore("spore-p", tier="parked")])
-    _tui_curses._handle_verb(None, _model_on(vpark, "keep", read_only=False), None, verb)
+    # a parked LOOP in Open loops → un-park (spore_update{tier:warm}). The rendered snapshot
+    # ('loop' — a parked plain loop) rides as expect_disposition (spore-173): a concurrent
+    # re-route to a note fails closed server-side instead of tier-warming a note.
+    vpark = SubstrateView(paths=p, open_spores=[_spore("spore-p", tier="parked")])
+    _tui_curses._handle_verb(None, _model_on(vpark, "spores", read_only=False), None,
+                             tui.Verb("p", "[p] un-park", "spore_unpark"))
     assert cap["req"] == {"kind": "spore_update", "spore_id": "spore-p", "tier": "warm",
                           "expect_disposition": "loop"}
 
@@ -832,15 +816,13 @@ def test_handle_verb_descend_is_panel_aware(monkeypatch):
                              _verb_of("spores", "spore_descend"))
     assert cap["req"] == {"kind": "spore_descend", "spore_id": "spore-1",
                           "spore_kind": "done", "confirm": True, "expect_disposition": "loop"}
-    # Keep "remove": NO picker — auto-picks 'composted' over the first kind ('done'); the note
-    # snapshot rides so removing it CASes 'note' (a concurrent promote→loop fails closed).
+    # Tray "dismiss" of a legacy note: the note snapshot rides so the descend CASes 'note'.
     cap.clear()
-    vk = SubstrateView(paths=p, keep=[_spore("spore-k", disposition="note",
+    vk = SubstrateView(paths=p, tray=[_spore("spore-k", disposition="note",
                                              descend_kinds=["done", "composted"])])
-    _tui_curses._handle_verb(None, _model_on(vk, "keep", read_only=False), None,
-                             _verb_of("keep", "spore_descend"))
-    assert (cap["req"]["kind"] == "spore_descend" and cap["req"]["spore_kind"] == "composted"
-            and cap["req"]["expect_disposition"] == "note")
+    _tui_curses._handle_verb(None, _model_on(vk, "tray", read_only=False), None,
+                             _verb_of("tray", "spore_descend"))
+    assert cap["req"]["kind"] == "spore_descend" and cap["req"]["expect_disposition"] == "note"
 
 
 def test_handle_verb_schedule_dash_clears_the_alarm(monkeypatch):
@@ -859,15 +841,11 @@ def test_handle_verb_capture_disposition_by_panel(monkeypatch):
     cap = _capture_apply(monkeypatch)
     monkeypatch.setattr(_tui_curses, "_edit_via_editor", lambda stdscr, initial: "a fresh dump")
     p = AnnealPaths.from_db(Path("/x/memory.db"))
-    v = SubstrateView(paths=p, tray=[], keep=[])
-    # Tray panel → a seed; Keep panel → a note (and NO type is sent — the AI sorts).
+    v = SubstrateView(paths=p, tray=[])
+    # Tray panel → a seed (and NO type is sent — the AI sorts). No Keep panel → no note capture.
     _tui_curses._handle_verb(None, _model_on(v, "tray", read_only=False), None,
                              _verb_of("tray", "spore_capture"))
     assert cap["req"] == {"kind": "spore_seed", "text": "a fresh dump", "disposition": "seed"}
-    cap.clear()
-    _tui_curses._handle_verb(None, _model_on(v, "keep", read_only=False), None,
-                             _verb_of("keep", "spore_capture"))
-    assert cap["req"] == {"kind": "spore_seed", "text": "a fresh dump", "disposition": "note"}
 
 
 def test_active_verbs_prunes_resolve_verbs_when_row_has_no_kinds():

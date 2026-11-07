@@ -94,7 +94,7 @@ class TestTrayAgeView:
         _src, _i, ck = rig
         heads = ck.manifest(CRED)["panels"]
         assert heads["tray"]["views"] == [{"id": "age", "title": "By age", "order": "spore.age"}]
-        for pid in ("loops", "keep", "episodes", "edits"):
+        for pid in ("loops", "episodes", "edits"):
             assert heads[pid]["views"] is None
 
     def test_view_rows_oldest_first_undated_last(self, rig) -> None:

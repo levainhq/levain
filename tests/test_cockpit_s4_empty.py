@@ -10,7 +10,7 @@ from levain.cockpit.providers import build_default_cockpit
 from tests.test_cockpit_k1 import _install, _status
 
 
-@pytest.mark.parametrize("pid", ["tray", "loops", "keep"])
+@pytest.mark.parametrize("pid", ["tray", "loops"])
 def test_an_absent_spore_store_never_created_is_empty_not_error(tmp_path: Path, pid: str) -> None:
     root, src = _install(tmp_path)
     (root / ".levain" / "memory.spores.json").unlink()

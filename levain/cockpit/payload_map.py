@@ -30,13 +30,13 @@ def _add(payload: str, disposition: str, target: str, literal: bool, *patterns: 
 B = "board"
 _add(B, "map", "manifest generated_at", True, "generated")
 _add(B, "map", "manifest errors entry with the count", True, "skipped")
-_add(B, "map", "panel status/error", True, "decisions.ok", "loops.ok", "tray.ok", "keep.ok")
+_add(B, "map", "panel status/error", True, "decisions.ok", "loops.ok", "tray.ok")
 _add(B, "map", "decisions panel rows: title / Row.id / facets repo,seat,stopped / due", True,
      "decisions.items[].what", "decisions.items[].id", "decisions.items[].repo",
      "decisions.items[].seat", "decisions.items[].stopped", "decisions.items[].dated")
 _add(B, "map", "at (decisions row)", True, "decisions.items[].ts")
 _add(B, "drop", "same instant as ts / fold state", True, "decisions.items[].iso", "decisions.items[].event")
-for panel in ("loops", "tray", "keep"):
+for panel in ("loops", "tray"):
     _add(B, "map", f"{panel} panel Row.id / title / body / truncated", True,
          f"{panel}.items[].id", f"{panel}.items[].title", f"{panel}.items[].body", f"{panel}.items[].truncated")
     _add(B, "map", f"{panel} row facets of the same name", True,
@@ -51,14 +51,14 @@ _add(S, "map", "manifest entity.store_label: a home-relative display label for t
 _add(S, "drop", "install-private paths", True, "paths.continuity_md", "paths.crystal_json", "paths.spores_json", "scope")
 _add(S, "map", "regions.zones[].panels + PanelHead", True,
      "layout[].kind", "layout[].id", "layout[].zone", "layout[].title")
-_add(S, "map", "Row.id / title / body / facets (open_spores, tray, keep rows)", True,
+_add(S, "map", "Row.id / title / body / facets (open_spores, tray rows)", True,
      "open_spores[].type", "open_spores[].salience", "open_spores[].text",
-     "tray[].type", "tray[].salience", "tray[].text", "keep[].type", "keep[].salience", "keep[].text")
-_add(S, "map", "spore row facets / Row.id of the tray, loops and keep panels", False,
-     *(f"{b}[].{f}" for b in ("open_spores", "tray", "keep")
+     "tray[].type", "tray[].salience", "tray[].text")
+_add(S, "map", "spore row facets / Row.id of the tray and loops panels", False,
+     *(f"{b}[].{f}" for b in ("open_spores", "tray")
        for f in ("id", "tier", "domain", "disposition", "next", "seen", "pointer")))
 _add(S, "drop", "derived from the spore type by anneal; verbs and their kinds arrive with K2a's registry", False,
-     *(f"{b}[].{f}" for b in ("open_spores", "tray", "keep") for f in ("descend_kinds", "ascend_kinds")))
+     *(f"{b}[].{f}" for b in ("open_spores", "tray") for f in ("descend_kinds", "ascend_kinds")))
 _add(S, "map", "episodes panel: facets episode_type, source, at", True,
      "episodes[].type", "episodes[].source", "episodes[].timestamp")
 _add(S, "map", "episodes row Row.id / title+body / tags", False, "episodes[].id", "episodes[].content", "episodes[].tags")

@@ -40,7 +40,8 @@ def test_the_held_rows_ride_beside_the_due_rows_in_surface_order(tmp_path: Path)
     rig = Rig(tmp_path)
     extra = _two_held(rig)
     p = _panel(rig)
-    assert [r["id"] for r in p["rows"]] == [f"spore:{rig.ids['seed']}"]
+    # the fixture's legacy note is a Tray row too (TS-5a: the Keep is gone), undated so after the due seed
+    assert [r["id"] for r in p["rows"]] == [f"spore:{rig.ids['seed']}", f"spore:{rig.ids['note']}"]
     assert [r["id"] for r in p["held"]] == [f"spore:{extra['soon']}", f"spore:{rig.ids['held']}"]
     assert all(r["facets"]["held"] is True for r in p["held"])
     assert [r["facets"]["due"] for r in p["held"]] == sorted(r["facets"]["due"] for r in p["held"])
@@ -52,9 +53,9 @@ def test_the_count_and_the_held_back_line_are_what_they_were(tmp_path: Path) -> 
     _two_held(rig)
     p = _panel(rig)
     assert p["filtered"] == [{"count": 2, "reason": HELD_REASON}]
-    assert p["count"] == 1 and p["status"] == "ok"
-    assert p["title"] == "Tray (1)"
-    assert p["groups"] is not None and sum(g["count"] for g in p["groups"]) == 1
+    assert p["count"] == 2 and p["status"] == "ok"      # the seed and the legacy note
+    assert p["title"] == "Tray (2)"
+    assert p["groups"] is not None and sum(g["count"] for g in p["groups"]) == 2
     assert all(rid not in ids for ids in p["view_rows"].values() for rid in [r["id"] for r in p["held"]])
 
 
@@ -71,7 +72,6 @@ def test_a_panel_without_held_rows_is_byte_for_byte_what_it_was(tmp_path: Path) 
     rig = Rig(tmp_path)
     # the other panels never gain the key, and the Tray gains it only while it holds a held spore
     assert "held" not in rig.ck.panel("loops", credential_class="token")
-    assert "held" not in rig.ck.panel("keep", credential_class="token")
     assert "held" in _panel(rig)
     rig.clock.advance(6)       # the surface date has come
     p = _panel(rig)
@@ -169,15 +169,16 @@ def _served(tmp_path: Path, *, keep_seed: bool = True):
     _root, src, ids = _install(tmp_path)
     store = SporeStore(_root / ".levain" / "memory.spores.json")
     real = date.today()
+    store.update(ids["note"], disposition="loop")    # the fixture's legacy note would show in the Tray (the Keep is gone)
     held_ids = [
         store.add(type="task", text="a sooner held seed", disposition="seed", next=(real + timedelta(days=3)).isoformat())["id"],
         store.add(type="task", text="a later held seed", disposition="seed", next=(real + timedelta(days=10)).isoformat())["id"],
     ]
     if not keep_seed:
-        # only held rows are left in the Tray: the due seed and the fixture's now-due held seed leave it
+        # only held rows are left in the Tray: the due seed and the fixture's now-due held seed move to Open loops
         for key in ("seed", "held"):
             assert store.get(ids[key])
-            store.update(ids[key], disposition="note")
+            store.update(ids[key], disposition="loop")
     served = _Served(src, surface_tokens={"browser": "T"}, install_class="reported")
     served.store, served.held_ids = store, held_ids + [ids["held"]]  # type: ignore[attr-defined]
     return real, served

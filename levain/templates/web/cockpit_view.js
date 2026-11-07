@@ -16,7 +16,7 @@
   // The kernel's own built-in panel ids and the native component each feeds. A panel with any other
   // id (or kind) is a downstream's and takes the generic path. A Map: ids come from the wire, and an
   // id like "constructor" or "__proto__" must never reach an object's prototype.
-  const NATIVE = new Map([["tray", "tray"], ["loops", "spores"], ["keep", "keep"], ["episodes", "episodes"],
+  const NATIVE = new Map([["tray", "tray"], ["loops", "spores"], ["episodes", "episodes"],
     ["edits", "edits"], ["health", "health"], ["graph", "graph"], ["crystals", "crystals"], ["wraps", "wraps"]]);
   // The /1 kind names the kernel normalises to the /2 ones; a payload from an older kernel may still carry them.
   const ALIAS = { "triage-list": "list", metric: "status-dots", visual: "ambient", prose: "brief" };
@@ -519,7 +519,7 @@
   }
 
   // Which of the four tabs show a panel (F3). Morning is the intake (Today, the glance, the Tray), Board the work (Tray, loops, Now,
-  // Keep, episodes, Team), Build the live agents (the sessions, hot loops, edits, results), Memory the mind (the six sections,
+  // episodes, Team), Build the live agents (the sessions, hot loops, edits, results), Memory the mind (the six sections,
   // crystals, cognition, identity). The hero is the page's header and is in all four. A panel the table does not name takes its
   // region's tabs: a glance tile on Morning and Board, the brief on Morning, a work card on Board, a mind or identity card on Memory.
   const ALL_TABS = "morning board build memory";
@@ -527,7 +527,7 @@
   // rather than an inherited function.
   const tableOf = (o) => Object.assign(Object.create(null), o);
   const TABS_OF_ID = tableOf({
-    tray: "morning board", loops: "board build", now: "board", keep: "board", episodes: "board", "team-status": "board",
+    tray: "morning board", loops: "board build", now: "board", episodes: "board", "team-status": "board",
     edits: "build", jobs: "build", sessions: "morning board", "coord-morning": "morning board", "review-queue": "morning board", topology: "build", health: "memory",
     graph: "memory", wraps: "memory", crystals: "memory"
   });
@@ -703,7 +703,7 @@
       // the store line is the kernel's home-relative label, never an absolute path; no label, no line
       paths: ent.store ? { episodic_db: ent.store } : { omitted: true }, scope: ent.governance, entity_name: ent.name,
       brand_wordmark: ent.wordmark, brand_model: ent.model,
-      health: null, graph: null, crystal_index: [], open_spores: [], tray: [], keep: [], episodes: [],
+      health: null, graph: null, crystal_index: [], open_spores: [], tray: [], episodes: [],
       sections: [], config_docs: [], wraps: [], recent_edits: [], state: null, jar: ent.jar,
       layout: [], errors: view_errors, extra_panels: Object.create(null), writable: false, write_token_required: false,
       // the write surface: the transport's own flags, the verb heads, and every target a write names. A
@@ -805,12 +805,9 @@
       for (const r of rows.concat(heldRows)) if (r && typeof r.id === "string" && Array.isArray(r.actions) && r.actions.length) {
         view.targets.rows[r.id] = targetOf(pid, r);
       }
-      // every capture is the Tray's create, so the Keep's capture box shows whenever the Tray offers one
-      const tp = P.get("tray");
-      const traySeeds = isObj(tp) && Array.isArray(tp.actions) && tp.actions.some((a) => isObj(a) && a.verb === "spore_seed" && isPostable(a));
-      if ((rowsAct || pActions.length || (nat === "keep" && traySeeds)) && (nat === "tray" || nat === "loops" || nat === "keep" || nat === "episodes")) entry.edit_class = "B";
-      const lists = { tray: "tray", loops: "open_spores", keep: "keep" };
-      if ((nat === "tray" || nat === "loops" || nat === "keep") && (panel.kind === "triage-list" || panel.kind === "list")) {
+      if ((rowsAct || pActions.length) && (nat === "tray" || nat === "loops" || nat === "episodes")) entry.edit_class = "B";
+      const lists = { tray: "tray", loops: "open_spores" };
+      if ((nat === "tray" || nat === "loops") && (panel.kind === "triage-list" || panel.kind === "list")) {
         view[lists[pid]] = rows.map((r) => sporeOf(pid, r, groupTitles, hiddenRows, panel.today));
         if (heldRows.length) {
           view.tray_held = heldRows.map((r) => sporeOf(pid, r, groupTitles, hiddenRows, panel.today));
@@ -2147,7 +2144,7 @@
       const none = !!p.querySelector(".pbody .empty") && !p.querySelector(".xfilter, .pbody .row, .pbody .rrow, .pbody .lrow, .pbody .section-display, .pbody .ep-search-input");
       p.classList.toggle("ck-is-empty", none);
       // an empty card folds into a slim bar at the end of its zone, unless it has a compose box or an editor behind an Edit link on it
-      // (Tray, Keep, Inbox, an empty identity card) or tabs (Cognition trace): they are its content, so it stays a card
+      // (Tray, Inbox, an empty identity card) or tabs (Cognition trace): they are its content, so it stays a card
       p.classList.toggle("ck-fold", none && !p.querySelector(".tray-dump, .ck-tabs, .edit-trigger-row"));
     }
   }
@@ -2180,9 +2177,9 @@
     }
     return repoMatchers;
   }
-  // The work lists' rows (Tray, Open loops, Keep, Now) carry the repo tag in the meta line, after the id, the date and the age, as the
+  // The work lists' rows (Tray, Open loops, Now) carry the repo tag in the meta line, after the id, the date and the age, as the
   // mock draws it; every other row keeps it at the head of its text. `tagHome` is where that tag lives for a row.
-  const META_TAG_PANELS = ["tray", "loops", "keep", "now"];
+  const META_TAG_PANELS = ["tray", "loops", "now"];
   function tagHome(row, clause) {
     const panel = row.closest("[data-ck-panel]");
     const inMeta = !!panel && META_TAG_PANELS.indexOf(panel.dataset.ckPanel) >= 0 && row.classList.contains("row");

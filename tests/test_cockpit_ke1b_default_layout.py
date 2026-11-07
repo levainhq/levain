@@ -45,7 +45,8 @@ class TestDefaultLayout:
         r, _ = regions
         ids = [c["panels"][0] for c in _zone(r, "operate")["cards"]]
         assert ids[:3] == ["now", "tray", "loops"]
-        assert ids.index("loops") < ids.index("episodes") < ids.index("keep") < ids.index("edits")
+        assert ids.index("loops") < ids.index("episodes") < ids.index("edits")
+        assert "keep" not in ids      # TS-5a: no Keep card
         assert all(c["span"] == 1 and c["tabs"] is None for c in _zone(r, "operate")["cards"])
 
     def test_the_neocortex_sections_are_tabs_of_one_card_span_2(self, regions) -> None:
@@ -69,7 +70,7 @@ class TestDefaultLayout:
         r, _ = regions
         sizes = {c["panels"][0]: c["size"] for c in _zone(r, "operate")["cards"]}
         assert sizes["tray"] == "tall" and sizes["loops"] == "tall" and sizes["now"] == "medium"
-        assert sizes["episodes"] == sizes["keep"] == "medium"
+        assert sizes["episodes"] == "medium" and "keep" not in sizes
 
     def test_ranks_leave_the_embedder_gap_and_loops_clears_it(self, regions) -> None:
         _, heads = regions

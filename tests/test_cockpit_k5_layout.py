@@ -50,7 +50,7 @@ def test_the_default_board_is_the_kernel_order_with_controls_on_cards_and_none_o
         {"eval": "[...document.querySelectorAll('.ck-hero .ck-lay-btn, #ck-skycol .ck-lay-btn, #ck-band .ck-lay-btn, #ck-widgets .ck-lay-btn, #ck-brief .ck-lay-btn')].length"},
     ])
     stacks, dashes, tray_btns, fixed = out
-    assert stacks["left"] == ["tray", "now"] and stacks["right"] == ["loops", "keep"], stacks   # the default the CSS order rules used to draw
+    assert stacks["left"] == ["tray", "now"] and stacks["right"] == ["loops"], stacks   # the default the CSS order rules used to draw (TS-5a: no Keep under Open loops)
     assert dashes and all(n == 0 for _id, n in dashes), dashes        # an F7 empty line gets no controls
     assert tray_btns == 3, tray_btns                                    # earlier, later, collapse
     assert fixed == 0, fixed                                            # the now band, the sky, the widgets and the brief are fixed
@@ -60,16 +60,17 @@ def test_the_default_board_is_the_kernel_order_with_controls_on_cards_and_none_o
 def test_a_stored_order_is_applied_within_each_stack(tmp_path: Path) -> None:
     order = json.dumps({"v": 1, "zones": {"operate": {"order": ["now", "tray", "keep", "loops"]}}, "collapsed": []})
     out = _run(tmp_path, _seed(json.dumps(order)) + [{"eval": STACKS}])
-    assert out[-1]["left"] == ["now", "tray"] and out[-1]["right"] == ["keep", "loops"], out[-1]
+    # "keep" is a name the board no longer draws: ignored, nothing vanishes
+    assert out[-1]["left"] == ["now", "tray"] and out[-1]["right"] == ["loops"], out[-1]
 
 
 @needs_browser
 def test_cards_the_stored_order_does_not_name_follow_in_kernel_order_and_unknown_names_are_ignored(tmp_path: Path) -> None:
-    order = json.dumps({"v": 1, "zones": {"operate": {"order": ["ghost", "keep"]}}, "collapsed": []})
+    order = json.dumps({"v": 1, "zones": {"operate": {"order": ["ghost", "now"]}}, "collapsed": []})
     out = _run(tmp_path, [{"eval": STACKS}] + _seed(json.dumps(order)) + [{"eval": STACKS}])
     before, after = out[0], out[-1]
-    assert after["right"] == ["keep", "loops"], after                   # keep named first; the unnamed loops follows
-    assert after["left"] == ["tray", "now"], after                      # unnamed: kernel order, nothing vanished
+    assert after["left"] == ["now", "tray"], after                      # now named first; the unnamed tray follows
+    assert after["right"] == ["loops"], after                           # unnamed: kernel order, nothing vanished
     assert sorted(after["loose"] + after["left"] + after["right"]) == sorted(before["loose"] + before["left"] + before["right"])
 
 
@@ -84,7 +85,7 @@ def test_garbage_in_storage_is_ignored_and_the_board_draws_the_kernel_order(tmp_
     out = _run(tmp_path, steps)
     for i in range(len(junk)):
         stacks, (collapsed, has_controls) = out[i * 5 + 3], out[i * 5 + 4]
-        assert stacks["left"] == ["tray", "now"] and stacks["right"] == ["loops", "keep"], (junk[i], stacks)
+        assert stacks["left"] == ["tray", "now"] and stacks["right"] == ["loops"], (junk[i], stacks)
         assert collapsed is False and has_controls, (junk[i], collapsed, has_controls)
 
 
@@ -124,16 +125,16 @@ def test_collapse_hides_the_body_keeps_the_head_and_round_trips_through_storage(
 @needs_browser
 def test_a_reorder_and_a_collapse_survive_the_live_refresh_and_a_tab_switch(tmp_path: Path) -> None:
     out = _run(tmp_path, [
-        {"eval": f"{PANEL % 'now'}.querySelector('.ck-lay-up').click(); {PANEL % 'keep'}.querySelector('.ck-lay-fold').click(); 1"},
+        {"eval": f"{PANEL % 'now'}.querySelector('.ck-lay-up').click(); {PANEL % 'loops'}.querySelector('.ck-lay-fold').click(); 1"},
         SETTLE, {"eval": STACKS},
         {"eval": "document.getElementById('refresh').click(); new Promise(r => setTimeout(r, 800)).then(() => 1)"},
         {"eval": STACKS},
         {"eval": "document.querySelector('[data-mode-tab=\"morning\"]').click(); new Promise(r => setTimeout(r, 300)).then(() => 1)"},
         {"eval": "document.querySelector('[data-mode-tab=\"board\"]').click(); new Promise(r => setTimeout(r, 300)).then(() => 1)"},
-        {"eval": STACKS}, {"eval": f"{PANEL % 'keep'}.classList.contains('ck-collapsed')"},
-        {"eval": f"{PANEL % 'keep'}.querySelector('.ck-lay-fold').getAttribute('aria-expanded')"},
+        {"eval": STACKS}, {"eval": f"{PANEL % 'loops'}.classList.contains('ck-collapsed')"},
+        {"eval": f"{PANEL % 'loops'}.querySelector('.ck-lay-fold').getAttribute('aria-expanded')"},
     ])
-    first, refreshed, back, keep_folded, keep_aria = out[2], out[4], out[7], out[8], out[9]
+    first, refreshed, back, keep_folded, keep_aria = out[2], out[4], out[7], out[8], out[9]   # (the folded card is Open loops)
     assert first["left"] == ["now", "tray"], first
     assert refreshed["left"] == ["now", "tray"], refreshed
     assert back["left"] == ["now", "tray"] and keep_folded is True and keep_aria == "false", (back, keep_folded, keep_aria)
@@ -142,16 +143,17 @@ def test_a_reorder_and_a_collapse_survive_the_live_refresh_and_a_tab_switch(tmp_
 @needs_browser
 def test_a_card_moves_within_its_own_stack_side_and_the_ends_do_not_wrap(tmp_path: Path) -> None:
     out = _run(tmp_path, [
-        {"eval": f"[{PANEL % 'tray'}.querySelector('.ck-lay-up').disabled, {PANEL % 'tray'}.querySelector('.ck-lay-down').disabled, {PANEL % 'loops'}.querySelector('.ck-lay-up').disabled]"},
+        {"eval": f"[{PANEL % 'tray'}.querySelector('.ck-lay-up').disabled, {PANEL % 'tray'}.querySelector('.ck-lay-down').disabled, {PANEL % 'loops'}.querySelector('.ck-lay-up').disabled, {PANEL % 'loops'}.querySelector('.ck-lay-down').disabled]"},
         {"eval": f"{PANEL % 'tray'}.querySelector('.ck-lay-down').click(); 1"}, SETTLE, {"eval": STACKS},
-        {"eval": f"{PANEL % 'loops'}.querySelector('.ck-lay-down').click(); 1"}, SETTLE, {"eval": STACKS},
-        {"eval": f"{PANEL % 'loops'}.querySelector('.ck-lay-up').click(); 1"}, SETTLE, {"eval": STACKS}, {"eval": STORED},
+        {"eval": f"[{PANEL % 'tray'}.querySelector('.ck-lay-up').disabled, {PANEL % 'tray'}.querySelector('.ck-lay-down').disabled]"},
+        {"eval": f"{PANEL % 'tray'}.querySelector('.ck-lay-up').click(); 1"}, SETTLE, {"eval": STACKS}, {"eval": STORED},
     ])
-    ends, s1, s2, s3, stored = out[0], out[3], out[6], out[9], out[10]
-    assert ends == [True, False, True], ends                            # first card of a side cannot move earlier
-    assert s1["left"] == ["now", "tray"] and s1["right"] == ["loops", "keep"], s1
-    assert s2["left"] == ["now", "tray"] and s2["right"] == ["keep", "loops"], s2     # neither move crossed to the other side
-    assert s3["right"] == ["loops", "keep"], s3
+    ends, s1, ends2, s3, stored = out[0], out[3], out[4], out[7], out[8]
+    # first card of a side cannot move earlier; Open loops is alone on its side (TS-5a: no Keep), so neither way
+    assert ends == [True, False, True, True], ends
+    assert s1["left"] == ["now", "tray"] and s1["right"] == ["loops"], s1       # the move did not cross to the other side
+    assert ends2 == [False, True], ends2                                        # last card of a side cannot move later
+    assert s3["left"] == ["tray", "now"] and s3["right"] == ["loops"], s3
     assert stored["v"] == 1 and "operate" in stored["zones"] and isinstance(stored["zones"]["operate"]["order"], list), stored
 
 
@@ -340,7 +342,7 @@ def test_an_unsaved_draft_disables_the_layout_controls_and_nothing_is_written(tm
         {"eval": f"{PANEL % 'tray'}.querySelector('.ck-lay-fold').click(); 1"}, SETTLE, {"eval": STORED},     # a saved layout, so Reset exists
         {"eval": DRAFT},
         # no input event yet: the click itself must refuse
-        {"eval": f"{PANEL % 'now'}.querySelector('.ck-lay-up').click(); {PANEL % 'keep'}.querySelector('.ck-lay-fold').click(); "
+        {"eval": f"{PANEL % 'now'}.querySelector('.ck-lay-up').click(); {PANEL % 'loops'}.querySelector('.ck-lay-fold').click(); "
                  "document.querySelector('[data-layout-reset]').click(); 1"},
         SETTLE, {"eval": STORED}, {"eval": STACKS},
         {"eval": "document.querySelector('.tray-dump-ta').dispatchEvent(new Event('input', {bubbles: true})); new Promise(r => setTimeout(r, 200)).then(() => 1)"},
@@ -370,12 +372,12 @@ def test_a_card_with_an_open_edit_row_is_not_folded(tmp_path: Path) -> None:
 def test_the_handlers_resolve_the_card_and_grid_at_click_time(tmp_path: Path) -> None:
     """N4: a surviving (adopted) panel is moved by its key now, not the key of the render that built its buttons."""
     out = _run(tmp_path, [
-        {"eval": f"{PANEL % 'now'}.dataset.ckCard = 'keep'; {PANEL % 'now'}.querySelector('.ck-lay-up').disabled = false; "
-                 f"{PANEL % 'now'}.querySelector('.ck-lay-up').click(); 1"},
+        {"eval": f"{PANEL % 'now'}.dataset.ckCard = 'tray'; {PANEL % 'tray'}.dataset.ckCard = 'now'; {PANEL % 'now'}.querySelector('.ck-lay-down').disabled = false; "
+                 f"{PANEL % 'now'}.querySelector('.ck-lay-down').click(); 1"},
         SETTLE, {"eval": STACKS}, {"eval": STORED},
     ])
-    stacks = out[-2]
-    assert stacks["right"] == ["keep", "loops"] and stacks["left"] == ["tray", "now"], stacks
+    stacks = out[-2]       # the button on the now panel moved the card named NOW (tray), not the one that built it
+    assert stacks["left"] == ["now", "tray"] and stacks["right"] == ["loops"], stacks
 
 
 @needs_browser
@@ -418,15 +420,15 @@ EVERY_MOVE = ("(async () => { const seq = () => " + SEQ + "; const res = [];"
 def test_a_tabbed_card_folds_as_a_whole_by_its_card_key(tmp_path: Path) -> None:
     """P1: fold is stored by CARD key and every panel of the card is folded, whichever tab shows."""
     out = _run(tmp_path, [
-        {"eval": f"{PANEL % 'keep'}.dataset.ckCard = 'now'; 1"},                      # keep joins now's card: a two-panel card
+        {"eval": f"{PANEL % 'loops'}.dataset.ckCard = 'now'; 1"},                     # loops joins now's card: a two-panel card
         {"eval": f"{PANEL % 'now'}.querySelector('.ck-lay-fold').click(); 1"},
         # wait on the state the next read asserts (both panels folded, the fold stored), not on a fixed settle
-        {"until": f"{PANEL % 'now'}.classList.contains('ck-collapsed') && {PANEL % 'keep'}.classList.contains('ck-collapsed') && (({STORED}) || {{}}).collapsed?.includes('now')"},
-        {"eval": f"[{PANEL % 'now'}.classList.contains('ck-collapsed'), {PANEL % 'keep'}.classList.contains('ck-collapsed'), {STORED}]"},
-        {"eval": f"{PANEL % 'keep'}.querySelector('.ck-lay-fold').getAttribute('aria-expanded')"},
-        {"eval": f"{PANEL % 'keep'}.querySelector('.ck-lay-fold').click(); 1"},
-        {"until": f"!{PANEL % 'now'}.classList.contains('ck-collapsed') && !{PANEL % 'keep'}.classList.contains('ck-collapsed') && !((({STORED}) || {{}}).collapsed || []).length"},
-        {"eval": f"[{PANEL % 'now'}.classList.contains('ck-collapsed'), {PANEL % 'keep'}.classList.contains('ck-collapsed'), {STORED}]"},
+        {"until": f"{PANEL % 'now'}.classList.contains('ck-collapsed') && {PANEL % 'loops'}.classList.contains('ck-collapsed') && (({STORED}) || {{}}).collapsed?.includes('now')"},
+        {"eval": f"[{PANEL % 'now'}.classList.contains('ck-collapsed'), {PANEL % 'loops'}.classList.contains('ck-collapsed'), {STORED}]"},
+        {"eval": f"{PANEL % 'loops'}.querySelector('.ck-lay-fold').getAttribute('aria-expanded')"},
+        {"eval": f"{PANEL % 'loops'}.querySelector('.ck-lay-fold').click(); 1"},
+        {"until": f"!{PANEL % 'now'}.classList.contains('ck-collapsed') && !{PANEL % 'loops'}.classList.contains('ck-collapsed') && !((({STORED}) || {{}}).collapsed || []).length"},
+        {"eval": f"[{PANEL % 'now'}.classList.contains('ck-collapsed'), {PANEL % 'loops'}.classList.contains('ck-collapsed'), {STORED}]"},
     ])
     assert out[3] == [True, True, {"v": 1, "zones": {}, "collapsed": ["now"]}], out[3]
     assert out[4] == "false", out[4]
@@ -468,7 +470,7 @@ def test_a_store_that_refuses_removal_leaves_an_empty_layout_not_the_old_one(tmp
     """P3: Reset with a read-only store: the page draws the default; the stored copy the page cannot remove is not read back."""
     out = _run(tmp_path, _seed("JSON.stringify({v: 1, zones: {operate: {order: ['now', 'tray']}}, collapsed: ['tray']})") + [
         {"eval": "Storage.prototype.setItem = () => { throw new Error('quota'); }; Storage.prototype.removeItem = () => { throw new Error('ro'); }; 1"},
-        {"eval": f"{PANEL % 'keep'}.querySelector('.ck-lay-fold').click(); 1"}, SETTLE,
+        {"eval": f"{PANEL % 'loops'}.querySelector('.ck-lay-fold').click(); 1"}, SETTLE,
         {"eval": "document.querySelector('[data-layout-reset]').click(); new Promise(r => setTimeout(r, 600)).then(() => 1)"},
         {"eval": STACKS},
         {"eval": f"[{PANEL % 'tray'}.classList.contains('ck-collapsed'), document.querySelectorAll('[data-layout-reset]').length]"},

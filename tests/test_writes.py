@@ -1005,14 +1005,14 @@ class TestTrayWriteKinds:
         assert ei.value.code == "too_large" and ei.value.http_status == 413
 
     def test_seed_creates_a_keep_note(self, install: Path) -> None:
-        # the Keep durable-reference half: disposition=note → cognition-excluded, bucket Keep
-        from levain.spores import BUCKET_KEEP, bucket_of, is_loop
+        # a legacy durable-reference note: disposition=note → cognition-excluded, shown in the Tray
+        from levain.spores import BUCKET_TRAY, bucket_of, is_loop
         res = apply_edit(_scope(install), {
             "kind": "spore_seed", "text": "docker: levain-vps init", "disposition": "note",
         })
         sp = _spore_store(install).get(res["spore_id"])
         assert sp["disposition"] == "note"
-        assert not is_loop(sp) and bucket_of(sp) == BUCKET_KEEP
+        assert not is_loop(sp) and bucket_of(sp) == BUCKET_TRAY
 
     def test_seed_defaults_to_thought_type(self, install: Path) -> None:
         sid = apply_edit(_scope(install), {"kind": "spore_seed", "text": "untyped dump"})["spore_id"]
@@ -1613,10 +1613,10 @@ class TestSporeUpdate:
         apply_edit(_scope(install), {"kind": "spore_update", "spore_id": sid, "tier": "warm"})
         assert _spore_store(install).get(sid)["tier"] == "warm"
 
-    def test_park_pins_an_open_loop_to_keep_without_resolving(self, install: Path) -> None:
+    def test_park_pins_an_open_loop_without_resolving(self, install: Path) -> None:
         # The "park" verb = spore_update{tier:parked} (the mirror of un-park). The loop must
         # stay OPEN — park is pause-not-resolve (that's why it is NOT a compost/descend kind);
-        # bucket_of then routes the parked-tier OPEN loop into Keep [Phill 2026-06-19].
+        # bucket_of keeps the parked-tier OPEN loop in Open loops, marked parked [TS-5a].
         sid = _add_spore(install, tier="warm")
         apply_edit(_scope(install), {"kind": "spore_update", "spore_id": sid, "tier": "parked"})
         rec = _spore_store(install).get(sid)

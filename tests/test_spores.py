@@ -4,7 +4,6 @@ bucketing partition (control-plane Slice 3)."""
 from __future__ import annotations
 
 from levain.spores import (
-    BUCKET_KEEP,
     BUCKET_LOOP,
     BUCKET_TRAY,
     KEEP_DISPOSITIONS,
@@ -93,15 +92,18 @@ def test_bucket_of_is_a_total_partition():
     # any Tray disposition → Tray (regardless of tier)
     for d in TRAY_DISPOSITIONS:
         assert bucket_of({"disposition": d, "tier": "warm"}) == BUCKET_TRAY
-    # both Keep halves → Keep: a note (reference, any tier) AND a parked loop
+    # TS-5a: no Keep. A legacy note (any tier) is shown in the Tray, never dropped ...
     for d in KEEP_DISPOSITIONS:
-        assert bucket_of({"disposition": d, "tier": "warm"}) == BUCKET_KEEP
-    assert bucket_of({"tier": "parked"}) == BUCKET_KEEP
-    assert bucket_of({"disposition": "loop", "tier": "parked"}) == BUCKET_KEEP
+        assert bucket_of({"disposition": d, "tier": "warm"}) == BUCKET_TRAY
+    # ... and a parked loop stays an Open loop (the row carries the parked marker)
+    assert bucket_of({"tier": "parked"}) == BUCKET_LOOP
+    assert bucket_of({"disposition": "loop", "tier": "parked"}) == BUCKET_LOOP
+    import levain.spores as sp
+    assert not hasattr(sp, "BUCKET_KEEP")
 
 
 def test_bucket_of_disposition_wins_over_parked():
     # A parked-but-un-triaged seed is still a Tray item (it needs the AI's sort).
     assert bucket_of({"disposition": "seed", "tier": "parked"}) == BUCKET_TRAY
-    # a parked note is still Keep reference (disposition checked before tier).
-    assert bucket_of({"disposition": "note", "tier": "parked"}) == BUCKET_KEEP
+    # a parked legacy note is a Tray row (disposition checked before tier).
+    assert bucket_of({"disposition": "note", "tier": "parked"}) == BUCKET_TRAY

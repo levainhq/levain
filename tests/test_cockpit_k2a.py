@@ -363,7 +363,7 @@ class TestBinding:
 class TestTierLadder:
     def test_every_row_provenance_is_null(self, rig: Rig) -> None:
         """'every row's provenance is null (no label is claimed before K2b's journal exists)'"""
-        for pid in ("tray", "loops", "keep", "episodes", "edits"):
+        for pid in ("tray", "loops", "episodes", "edits"):
             for r in (rig.ck.panel(pid, credential_class="token") or {}).get("rows") or []:
                 assert r["provenance"] is None
 
@@ -376,9 +376,9 @@ class TestTierLadder:
         """'on an UNVERIFIED Tray row a later-dated snooze and a re-tier fire as C1 (RULED Q4)'"""
         assert rig.post("spore_surface_at", "tray", "seed", {"surface_at": "2031-01-01"})["ok"]
         assert rig.spore("seed")["next"] == "2031-01-01"
-        r = rig.ck.read_one("keep", f"spore:{rig.ids['note']}").value
+        r = rig.ck.read_one("tray", f"spore:{rig.ids['note']}").value
         out = dispatch(registry=rig.reg, cockpit=rig.ck, scope=rig.src.write_scope,
-                       req={"verb": "spore_update", "panel_id": "keep", "row_id": r["id"],
+                       req={"verb": "spore_update", "panel_id": "tray", "row_id": r["id"],
                             "row_version": r["version"], "params": {"tier": "hot"}},
                        credential=CRED, install_class=INSTALL_CLASS, route="cockpit")
         assert out["ok"] and rig.spore("note")["tier"] == "hot"
@@ -398,24 +398,25 @@ class TestTierLadder:
         assert held not in rig.panel_ids("tray")
         assert held not in rig.panel_ids(NOW_ID)
 
-    def test_surface_at_on_a_keep_note_leaves_it_out_of_the_tray(self, rig: Rig) -> None:
-        """'surface_at on a Keep note leaves it out of the tray panel'"""
-        r = rig.ck.read_one("keep", f"spore:{rig.ids['note']}").value
+    def test_surface_at_on_a_legacy_note_keeps_it_in_the_tray(self, rig: Rig) -> None:
+        """'surface_at on a legacy note (shown in the Tray since the Keep left) is accepted'"""
+        r = rig.ck.read_one("tray", f"spore:{rig.ids['note']}").value
         dispatch(registry=rig.reg, cockpit=rig.ck, scope=rig.src.write_scope,
-                 req={"verb": "spore_surface_at", "panel_id": "keep", "row_id": r["id"], "row_version": r["version"],
+                 req={"verb": "spore_surface_at", "panel_id": "tray", "row_id": r["id"], "row_version": r["version"],
                       "params": {"surface_at": TODAY.isoformat()}},
                  credential=CRED, install_class=INSTALL_CLASS, route="cockpit")
-        assert f"spore:{rig.ids['note']}" not in rig.panel_ids("tray")
+        assert f"spore:{rig.ids['note']}" in rig.panel_ids("tray")   # legacy, but never dropped from view
 
     def test_set_disposition_reports_t2_for_every_target_on_every_row(self, rig: Rig) -> None:
         """'spore_set_disposition reports T2 for every target on every row'"""
-        for key, panel in (("seed", "tray"), ("held", "tray"), ("loop", "loops"), ("note", "keep"), ("parked", "keep")):
+        for key, panel in (("seed", "tray"), ("held", "tray"), ("loop", "loops"), ("note", "tray"), ("parked", "loops")):
             for target in ("seed", "handoff", "agenda", "note", "loop"):
                 assert rig.tier("spore_set_disposition", panel, key, {"disposition": target}) == "T2"
 
     def test_a_retier_of_an_unverified_parked_loop_to_hot_reports_t2(self, rig: Rig) -> None:
         """'a re-tier of an unverified parked loop to hot reports T2'"""
-        panel = "loops" if f"spore:{rig.ids['parked']}" in rig.panel_ids("loops") else "keep"
+        panel = "loops"
+        assert f"spore:{rig.ids['parked']}" in rig.panel_ids("loops")   # a parked loop is an Open loops row
         r = rig.ck.read_one(panel, f"spore:{rig.ids['parked']}")
         assert r.value["facets"]["tier"] == "parked"
         assert rig.tier("spore_update", panel, "parked", {"tier": "hot"}) == "T2"
@@ -973,7 +974,7 @@ class TestSporeCas:
         odd.pop("next", None)
         data["spores"].append(odd)
         p.write_text(json.dumps(data))
-        rows = {r["id"]: r for pid in ("tray", "loops", "keep")
+        rows = {r["id"]: r for pid in ("tray", "loops")
                 for r in (rig.ck.panel(pid, credential_class="token") or {}).get("rows") or []}
         stored = {sp["id"]: sp for sp in json.loads(p.read_text())["spores"]}
         assert set(rows) == {f"spore:{i}" for i in stored} - {f"spore:{rig.ids['held']}"}   # held is out of view
