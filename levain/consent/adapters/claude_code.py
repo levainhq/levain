@@ -50,6 +50,7 @@ import subprocess
 import sys
 import sysconfig
 import tempfile
+import threading
 import time
 from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass, replace
@@ -1015,12 +1016,36 @@ def foreground_session(event_session: str, *, home: Path, queue_dir: Path | str 
                        clock: Callable[[], float] = time.monotonic,
                        budget: float = FOREGROUND_BUDGET) -> tuple[bool, str]:
     """``(is_foreground, why)``; see :func:`_foreground_session`, whose answer this bounds: an answer reached after
-    ``budget`` seconds (default :data:`FOREGROUND_BUDGET`) is unknown, and unknown is not foreground. Never raises."""
+    ``budget`` seconds (default :data:`FOREGROUND_BUDGET`) is unknown, and unknown is not foreground. Never raises.
+    The bound is ENFORCED, not only read afterwards (L3 c-prime v1 codex MED): the check runs in a daemon thread that
+    is waited on for ``budget`` wall seconds, so a lease or roster read that blocks (an unresponsive filesystem) costs
+    the caller at most the budget and answers unknown; the abandoned thread dies with the hook's process, and its lsof
+    child is bounded by its own timeout. A budget at or below zero runs nothing and is unknown."""
     try:
+        budget = float(budget)
+        if not budget > 0:
+            return False, f"unknown (no budget for the foreground check: {budget:g} s)"
         start = clock()
-        fg, why = _foreground_session(event_session, home=home, queue_dir=queue_dir, roster_reader=roster_reader,
-                                      lsof_runner=lsof_runner, lease_reader=lease_reader,
-                                      remaining=lambda: budget - (clock() - start))
+        box: list[Any] = []
+
+        def run() -> None:
+            try:
+                box.append(_foreground_session(event_session, home=home, queue_dir=queue_dir,
+                                               roster_reader=roster_reader, lsof_runner=lsof_runner,
+                                               lease_reader=lease_reader,
+                                               remaining=lambda: budget - (clock() - start)))
+            except BaseException as e:  # noqa: BLE001 - carried back to the caller as unknown
+                box.append(e)
+
+        worker = threading.Thread(target=run, name="levain-foreground-check", daemon=True)
+        worker.start()
+        worker.join(budget)
+        if not box:
+            return False, f"unknown (the foreground check did not answer within its {budget:g} s budget)"
+        got = box[0]
+        if isinstance(got, BaseException):
+            return False, f"unknown ({type(got).__name__}: {got})"
+        fg, why = got
         if clock() - start > budget:
             return False, f"unknown (the foreground check ran past its {budget:g} s budget; it read: {why})"
         return fg, why
@@ -1047,9 +1072,10 @@ def _foreground_session(event_session: str, *, home: Path, queue_dir: Path | str
     ERR TOWARD PINGING (Phill: *"it is better to err towards pinging than not"*): anything else is NOT foreground, the
     unknown included, and every identifier (b) leans on must be present and well formed or (b) answers unknown. A
     missing session id; an unreadable or malformed roster; no roster row; a ``ptySock`` that is not an absolute path; a
-    worker ``pid``, a ``supervisorPid`` or a present ``replPid`` that is not a positive int (without the supervisor's pid
-    its permanent row would read as a client); a ``ptySock`` with no rows owned by the worker (a stale roster), with a
-    row owned by any other process, or whose address is zero or is shared by a row that is not the worker's (Linux
+    worker ``pid``, a ``supervisorPid`` or a non-null ``replPid`` that is not a positive int (without the supervisor's
+    pid its permanent row would read as a client; an absent or null ``replPid`` is no REPL); a ``ptySock`` with no rows
+    owned by the worker (a stale roster), with a row owned by any other process, or whose address is zero or is shared
+    by a row another process owns (the worker's own rows there count whatever lsof names them) (Linux
     hides kernel addresses as ``0x0000000000000000``: no address, no identity); an lsof that is missing, timed out or
     failed; and a lease read that raised each answer ``(False, reason)``; the wrong answer then costs one redundant card
     while the native dialog still shows.
@@ -1063,7 +1089,12 @@ def _foreground_session(event_session: str, *, home: Path, queue_dir: Path | str
     FRAGILE BY INTENT: (b) rests on the daemon's roster layout and on how claude 2.1.319 opens its pty socket,
     both claude-internal, undocumented and bound to that version. The attached-client row shape was derived from the
     unattached rows and the supervisor's own, and had not been observed with a real client when this was written; a
-    version that changes either makes (b) answer not-foreground, which holds and pings, never silent."""
+    version that changes either makes (b) answer not-foreground, which holds and pings, never silent.
+    KNOWN EDGE, THE CLIENT'S COMMAND (L3 c-prime v1 deepseek LOW 3): a client must run the worker's own COMMAND (its
+    process title). No attached client's row has been observed, and nothing in the repo shows what COMMAND it prints, so
+    the match is left as it is rather than widened to a guessed set. If a real client prints something else (``claude``,
+    ``node``), (b) never finds it and every approval from a daemon session is held and pinged: a hold, never a false
+    foreground. Widen the match only from a measured attached-client row."""
     session = event_session.split("#", 1)[0] if isinstance(event_session, str) else ""
     if not session:
         return False, "no session id"
@@ -1085,7 +1116,8 @@ def _foreground_session(event_session: str, *, home: Path, queue_dir: Path | str
     if not isinstance(sock, str) or not os.path.isabs(sock):
         return False, "the roster row has no ptySock" + lease_note
     worker, supervisor = _pid(row.get("pid")), _pid(roster.get("supervisorPid"))
-    repl = _pid(row.get("replPid")) if "replPid" in row else 0
+    # an absent or null replPid is no REPL (0); a present non-null value that is not a positive int is unknown
+    repl = 0 if row.get("replPid") is None else _pid(row.get("replPid"))
     if worker is None or supervisor is None or repl is None:
         return False, "unknown (the roster has no usable worker pid, supervisorPid or replPid)" + lease_note
     own = {worker, supervisor, repl} - {0}
@@ -1101,9 +1133,10 @@ def _foreground_session(event_session: str, *, home: Path, queue_dir: Path | str
     mine = {r["dev"] for r in on_sock}
     if any(int(d, 16) == 0 for d in mine):
         return False, "unknown (the ptySock's address is hidden)" + lease_note
-    # every row at one of the ptySock's addresses is the worker's own row on that path: this also refuses a ptySock
-    # path any other process holds (its row brings its address into `mine`, owned by another pid)
-    if any(r["dev"] in mine and (int(r["pid"]) != worker or r["name"] != sock) for r in parsed):
+    # every row at one of the ptySock's addresses is the worker's own, whatever lsof names it (the path, empty, a bare
+    # `->` or a peer: L3 c-prime v1 deepseek LOW 4): only a row owned by another pid there is ambiguous. This also
+    # refuses a ptySock path any other process holds (its row brings its address into `mine`, owned by another pid)
+    if any(r["dev"] in mine and int(r["pid"]) != worker for r in parsed):
         return False, "unknown (the ptySock's address is not unique to the worker)" + lease_note
     cmd = {r["cmd"] for r in on_sock}
     for r in parsed:
@@ -1250,15 +1283,24 @@ def decide_ex(event: Any, queue: ConsentQueue, settings: AdapterSettings, *, env
         except Exception:  # noqa: BLE001 - an unreadable push store is no phone to reach
             paired = False
         if paired:
+            # the check's time comes out of the hold window, never all of it (L3 c-prime v1 deepseek LOW 5 + codex
+            # MED): it gets at most half of what is left before the deadline, enforced by foreground_session, so a
+            # check that blocks still leaves a wait above zero and the request is still pinged
+            fg_budget = min(FOREGROUND_BUDGET, max(0.0, deadline - clock()) / 2)
             try:
-                fg, why = (foreground or (lambda s: foreground_session(s, home=home, queue_dir=queue.directory)))(session)
+                fg, why = (foreground or (lambda s: foreground_session(s, home=home, queue_dir=queue.directory,
+                                                                       budget=fg_budget)))(session)
             except Exception as e:  # noqa: BLE001 - a check that fails is unknown, and unknown holds and pings
                 fg, why = False, f"the foreground check failed ({type(e).__name__})"
             if not fg:
                 elsewhere = True
                 if hold <= 0:
                     hold = settings.away_hold_seconds if settings.away_hold_seconds > 0 else DEFAULT_HOLDS[AGENT]
-                print(f"levain consent hook: holding for the phone, not the foreground session ({why})", file=sys.stderr)
+                try:
+                    print(f"levain consent hook: holding for the phone, not the foreground session ({why})",
+                          file=sys.stderr)
+                except Exception:  # noqa: BLE001 - a diagnostic never escapes: the hold and its ping still run
+                    pass
     hold = min(hold, max(0.0, deadline - clock()))
     if hold > 0 and settings.cockpit_data_root and not Path(settings.cockpit_data_root).is_dir():
         # away mode is on by the operator's word, but the cockpit it names is not there: no answer can verify, so a

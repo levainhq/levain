@@ -6,6 +6,8 @@ lsof, no real session."""
 from __future__ import annotations
 
 import os
+import threading
+import time
 from pathlib import Path
 
 import pytest
@@ -151,10 +153,32 @@ def test_every_unix_row_of_this_hosts_real_lsof_parses():
     _roster(pid="4001"),                        # the worker pid not an int
     _roster(pid=None),
     _roster(replPid="4005"),                    # a replPid that is there but malformed
+    _roster(replPid=True),                      # a bool is malformed too
 ])
 def test_a_roster_without_usable_pids_is_unknown_even_with_only_the_supervisors_row(roster):
     fg, why = _fg(roster_reader=lambda h: roster)
     assert fg is False and "unknown" in why
+
+
+def test_a_null_replpid_is_no_repl_not_unknown():
+    """L3 c-prime v1 deepseek MED 2: a roster that serialises ``"replPid": null`` for a worker with no REPL reads as no
+    REPL (0), so the socket signal is still read; only a non-null malformed value stays unknown."""
+    fg, why = _fg(roster_reader=lambda h: _roster(replPid=None), lsof_runner=lambda: _lsof(client=True))
+    assert fg is True and str(CLIENT) in why
+    fg, why = _fg(roster_reader=lambda h: _roster(replPid=None))
+    assert fg is False and why == "no client on the ptySock"
+
+
+@pytest.mark.parametrize("name", ["", "->", "->0xc32fd6880c2ee4b2"])
+def test_the_workers_own_row_at_its_address_under_another_name_is_not_ambiguous(name):
+    """L3 c-prime v1 deepseek LOW 4: a worker fd at one of the ptySock's addresses that lsof names other than the path
+    (empty, a bare ``->`` or a peer) is still the worker's own; only a foreign pid there makes it unknown."""
+    row = f"2.1.319   {WORKER} me   12u  unix {A_ACCEPTED}      0t0      {name}"
+    assert cc._LSOF_ROW.match(row)["name"] == name, "the fixture row parses with that name"
+    fg, why = _fg(lsof_runner=lambda: _lsof(client=True, extra=[row]))
+    assert fg is True and str(CLIENT) in why
+    fg, why = _fg(lsof_runner=lambda: _lsof(client=False, extra=[row]))
+    assert fg is False and why == "no client on the ptySock"
 
 
 def test_the_repl_pids_own_row_is_not_a_client():
@@ -226,6 +250,26 @@ def test_the_default_runner_gets_what_is_left_of_the_budget(monkeypatch):
     assert fg is True and got == [pytest.approx(0.7)]
 
 
+def test_a_check_that_blocks_answers_unknown_at_the_budget_not_after_it():
+    """L3 c-prime v1 codex MED: the budget is enforced, not only read after the check returns: a roster read that
+    blocks (an unresponsive filesystem) answers unknown when the budget runs out."""
+    release = threading.Event()
+    try:
+        t0 = time.monotonic()
+        fg, why = _fg(roster_reader=lambda h: release.wait(10) and _roster(),
+                      lsof_runner=lambda: _lsof(client=True), budget=0.2)
+        took = time.monotonic() - t0
+    finally:
+        release.set()
+    assert fg is False and "budget" in why
+    assert took < 2.0, took
+
+
+def test_no_budget_at_all_runs_nothing():
+    fg, why = _fg(roster_reader=_boom, lsof_runner=_boom, budget=0.0)
+    assert fg is False and "budget" in why
+
+
 def test_lsof_resolves_from_the_fixed_list_never_path(tmp_path, monkeypatch):
     exe = tmp_path / "lsof"
     exe.write_text("#!/bin/sh\n")
@@ -256,7 +300,8 @@ def rig(tmp_path, monkeypatch):
     return {"ws": os.path.realpath(ws), "home": Path(os.path.realpath(home)), "ck": ck, "q": q}
 
 
-def _run(rig, monkeypatch, *, foreground=None, settings=None, away=0.0, entrypoint="cli"):
+def _run(rig, monkeypatch, *, foreground=None, settings=None, away=0.0, entrypoint="cli",
+         max_hold=cc.CLEANUP_RESERVE + 30):
     seen: dict = {"pings": []}
 
     def fake_hold(queue, request, wait, **kw):
@@ -275,7 +320,7 @@ def _run(rig, monkeypatch, *, foreground=None, settings=None, away=0.0, entrypoi
     ev = _event("Bash", {"command": "echo hi"}, cwd=rig["ws"])
     kw = {} if foreground is None else {"foreground": foreground}
     out = cc.decide_ex(ev, rig["q"], settings, environ=env, home=rig["home"], launch_nonce="", contained_launch=None,
-                       idle=lambda: 0.0, max_hold=cc.CLEANUP_RESERVE + 30,
+                       idle=lambda: 0.0, max_hold=max_hold,
                        still_away=lambda: (False, "intent", "present"), **kw)
     return out, seen
 
@@ -315,6 +360,37 @@ def test_a_foreground_check_that_raises_still_holds(rig, monkeypatch):
     def worse(session):
         raise RuntimeError("a check that fails")
     out, seen = _run(rig, monkeypatch, foreground=worse)   # never a silent skip
+    assert isinstance(out, cc.Abstained) and out.held is True and seen["pings"]
+
+
+def test_a_slow_foreground_check_near_the_deadline_still_leaves_a_hold_and_pings(rig, monkeypatch):
+    """L3 c-prime v1 deepseek LOW 5 + codex MED: with about a second left before the deadline, a foreground check that
+    blocks must not eat the window: its time comes out of the hold before the wait is computed, bounded so a wait is
+    left, and the request is still pinged."""
+    release = threading.Event()
+    monkeypatch.setattr(cc, "_lease_holds", lambda q, s: False)
+    monkeypatch.setattr(cc, "_read_roster", lambda h: release.wait(10) and _roster())
+    monkeypatch.setattr(cc, "_run_lsof", _boom)
+    try:
+        out, seen = _run(rig, monkeypatch, max_hold=cc.CLEANUP_RESERVE + 1.0)
+    finally:
+        release.set()
+    assert isinstance(out, cc.Abstained) and out.held is True, out
+    assert seen["wait"] > 0 and seen["pings"] == [out.request.id], seen
+
+
+def test_a_diagnostic_print_that_fails_never_escapes(rig, monkeypatch):
+    """L3 c-prime v1 deepseek MED 1 / gemini LOW 2: a closed or broken stderr must not turn the hold into an
+    exception out of decide_ex."""
+    class Broken:
+        def write(self, *_):
+            raise BrokenPipeError("stderr is gone")
+
+        def flush(self):
+            raise BrokenPipeError("stderr is gone")
+
+    monkeypatch.setattr(cc.sys, "stderr", Broken())
+    out, seen = _run(rig, monkeypatch, foreground=lambda s: (False, "no client on the ptySock"))
     assert isinstance(out, cc.Abstained) and out.held is True and seen["pings"]
 
 
