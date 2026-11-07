@@ -77,7 +77,7 @@ INIT = """
   window.SpeechSynthesisUtterance = Utt;
   const ss = new EventTarget();
   ss.speak = (u) => {
-    if (window.__speakThrow) { window.__speakThrow = false; throw new Error('speak refused'); }
+    if (window.__speakThrow && u.text) { window.__speakThrow = false; throw new Error('speak refused'); }
     if (u.text) window.__spoken.push({ text: u.text, voice: u.voice ? u.voice.name : null });
     if (window.__speakHang) return;                      // an engine that never says "end" (and cancel() ends nothing)
     setTimeout(() => u.onend && u.onend(), 20); };
@@ -482,3 +482,101 @@ def test_two_replies_finished_in_one_poll_are_read_one_after_the_other(rig, tmp_
     posts = json.loads(v[7])
     assert [p[0] for p in posts[:2]] == [a["gseq"], b["gseq"]], posts
     assert posts[1][1] >= 1, ("the second reply must be asked for only after the first one ended", posts)
+
+
+@needs_browser
+def test_a_sample_started_over_a_reply_settles_the_reply_and_neither_strands_the_other(rig, tmp_path, monkeypatch) -> None:
+    """L3 r3 (complement): reply A is read on-device by an engine that never says "end"; the operator taps "Hear the on-device voice".
+    A must settle at once (its play() resolves, `playing` clears, the queue is free), the sample must hold the one utterance slot,
+    and a Stop must then settle the sample too. The sample goes through the same stop() path a reply does.
+    Revert: sampleDevice() without its stop() -> the sample overwrites A's settler, A waits for its watchdog (up to 10 minutes)."""
+    r = {"thread": "t", "gseq": 1, "text": "read me a long one"}
+    v, _ = _run(tmp_path, monkeypatch, rig, [
+        {"until": READY, "ms": 30000},
+        {"eval": "(() => { window.__voices = [%s]; window.__speakHang = true; window.__done = false; window.__sdone = false;"
+                 " LevainVoice.play(%s).then(() => { window.__done = true; }); return 1; })()" % (LOCAL, json.dumps(r))},
+        {"until": "window.__spoken.length === 1", "ms": 5000},
+        {"eval": "(() => { LevainVoice.sampleDevice().then(() => { window.__sdone = true; }); return 1; })()"},
+        {"until": "window.__done === true", "ms": 3000, "may_timeout": True},
+        {"until": "window.__spoken.length === 2", "ms": 3000},
+        {"eval": "JSON.stringify({held: LevainVoice.held(), sdone: window.__sdone})"},
+        {"eval": "LevainVoice.stop() || 1"},
+        {"until": "window.__sdone === true", "ms": 3000, "may_timeout": True},
+        {"eval": "LevainVoice.held()"},
+    ], key=False)
+    assert not _timed_out(v[4]) and not _timed_out(v[5]), ("the reply must settle when the sample starts", v)
+    assert json.loads(v[6]) == {"held": True, "sdone": False}, v
+    assert not _timed_out(v[8]) and v[9] is False, v
+
+
+@needs_browser
+def test_a_sample_whose_engine_throws_says_so_and_does_not_reject(rig, tmp_path, monkeypatch) -> None:
+    """L3 r3 (gemini): speak() throwing inside the sample must not leave an unhandled rejection or a silent button.
+    Revert: sampleDevice() with no try/catch around speakDevice()."""
+    v, _ = _run(tmp_path, monkeypatch, rig, [
+        {"until": READY, "ms": 30000},
+        {"eval": "(async () => { window.__voices = [%s]; window.__speakThrow = true;"
+                 " try { await LevainVoice.sampleDevice(); } catch (e) { return 'rejected ' + e.message; }"
+                 " return LevainVoice.noteFor({thread: 'sample', gseq: 0}); })()" % LOCAL},
+    ], key=False)
+    assert v[1] == "This browser could not play the audio.", v
+    assert not str(v[1]).startswith("rejected"), v
+
+
+@needs_browser
+def test_premium_with_two_vendors_picks_none_for_him(rig, tmp_path, monkeypatch) -> None:
+    """L3 r3 (complement): two providers hold a key. One tap on "Premium voice" must not choose a vendor: nothing is stored, nothing is
+    sent, the reply and the block both say to choose, and the explicit choice then reads. With exactly one key the tap still
+    pre-selects it (the test above). Revert: the tier handler storing `ready[0]` / effective() falling to offered[0]."""
+    r = _reply(rig)
+    rig.add_key(provider="openai", uses=("tts",), source=SOURCE + "-openai")
+    v, _ = _run(tmp_path, monkeypatch, rig, [
+        {"until": READY, "ms": 30000},
+        {"eval": "(() => { const t = document.querySelector('#vc-tier'); t.value = 'premium'; t.dispatchEvent(new Event('change')); return 1; })()"},
+        {"eval": "new Promise((res) => { LevainVoice.play(%s).then(() => res(1)); })" % json.dumps(r)},
+        {"eval": "JSON.stringify({s: LevainVoice.settings(), posts: window.__posts.length, note: LevainVoice.noteFor(%s),"
+                 " tier: document.querySelector('#vc-tier').value, prov: document.querySelector('#vc-provider').value,"
+                 " opts: Array.from(document.querySelector('#vc-provider').options).map((o) => o.value)})" % json.dumps(r)},
+        {"eval": "(() => { const p = document.querySelector('#vc-provider'); p.value = 'inworld'; p.dispatchEvent(new Event('change')); return 1; })()"},
+        {"eval": "new Promise((res) => { LevainVoice.play(%s).then(() => res(1)); })" % json.dumps(r)},
+        {"eval": "JSON.stringify(window.__posts.map((p) => p.body.provider))"},
+    ], free=True)
+    got = json.loads(v[3])
+    assert got["s"]["tier"] == "premium" and not got["s"]["provider"] and got["posts"] == 0, got
+    assert "provider" in got["note"].lower() and got["tier"] == "premium" and got["prov"] == "" and got["opts"][0] == "", got
+    assert json.loads(v[6]) == ["inworld"], v
+
+
+@needs_browser
+def test_a_watermark_for_a_thread_survives_four_hundred_other_threads(rig, tmp_path, monkeypatch) -> None:
+    """L3 r3 (codex MED): `floor` was itself capped at 200 threads; after 401 threads' decisions the first thread's mark was gone and
+    a poll that repeated its old reply read (and billed) it again. Revert: floor capped at CAP."""
+    v, _ = _run(tmp_path, monkeypatch, rig, [
+        {"until": READY, "ms": 30000},
+        {"eval": "(() => { LevainVoice.saveSettings({tier: 'device', autoplay: true}); LevainVoice.arm(0);"
+                 " for (let i = 0; i <= 400; i++) LevainVoice.replyFinished({thread: 'th' + i, gseq: 1, text: 'x'});"
+                 " return JSON.stringify({again: LevainVoice.replyFinished({thread: 'th0', gseq: 1, text: 'x'}), sizes: LevainVoice.sizes()}); })()"},
+    ], key=False)
+    got = json.loads(v[1])
+    assert got["again"] == "seen" and got["sizes"]["seen"] <= 200, got
+
+
+@needs_browser
+def test_a_reply_waiting_in_the_queue_when_the_page_hides_asks_for_a_tap(rig, tmp_path, monkeypatch) -> None:
+    """L3 r3 (complement, gemini, deepseek): A is read, B waits behind it, the page hides. B was decided ("seen") so the poll never
+    offers it again: it must carry a "Tap to hear" cue. Revert: lock() calling stop() with the queue not moved to tapNeeded."""
+    a = {"thread": "t", "gseq": 1, "text": "first"}
+    b = {"thread": "t", "gseq": 2, "text": "second"}
+    v, _ = _run(tmp_path, monkeypatch, rig, [
+        {"until": READY, "ms": 30000},
+        {"eval": UNLOCK_BTN % "LevainVoice.unlock();"},
+        {"tap": "document.querySelector('#tt')", "ms": 5000},
+        {"until": "LevainVoice.isUnlocked()", "ms": 5000},
+        {"eval": "(() => { window.__voices = [%s]; window.__speakHang = true; LevainVoice.saveSettings({tier: 'device', autoplay: true});"
+                 " LevainVoice.arm(0); return JSON.stringify([LevainVoice.replyFinished(%s), LevainVoice.replyFinished(%s)]); })()" % (LOCAL, json.dumps(a), json.dumps(b))},
+        {"eval": "(() => { window.dispatchEvent(new Event('pagehide')); const c = LevainVoice.button(%s);"
+                 " return JSON.stringify({text: c.querySelector('button').textContent, again: LevainVoice.replyFinished(%s)}); })()" % (json.dumps(b), json.dumps(b))},
+    ], key=False)
+    assert json.loads(v[4]) == ["play", "queued"], v
+    got = json.loads(v[5])
+    assert got["text"] == "Tap to hear" and got["again"] == "seen", got

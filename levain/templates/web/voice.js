@@ -26,6 +26,7 @@
   const SPEAK_PATH = "/cockpit/voice/speak";
   const SAMPLE = "This is how your room will sound.";
   const VOICE_WAIT_MS = 1500;   // how long the on-device tier waits for the browser to list its voices
+  const FLOOR_CAP = 5000;       // threads whose high-water mark is kept (a mark is a few bytes; losing one re-offers that thread's old replies)
   const CAP = 200;              // the most gseqs each remembered map keeps
   const WORDS = {
     play: "Play", stop: "Stop", tap: "Tap to hear",
@@ -84,8 +85,10 @@
     if (st.tier !== "premium") return out;
     if (offered === null) { if (!st.provider || !st.voice) out.tier = "device"; return out; }
     if (st.provider && !offered.some((x) => x.name === st.provider)) { out.blocked = blockedWords(st.provider); return out; }
-    const p = offered.find((x) => x.name === st.provider) || offered[0] || null;
-    if (!p) { out.tier = "device"; return out; }
+    if (!offered.length) { out.tier = "device"; return out; }
+    // No stored provider: exactly one live key is the only choice there is; with several, none is picked for him.
+    if (!st.provider && offered.length > 1) { out.blocked = "Choose a provider for the premium voice in Settings."; return out; }
+    const p = offered.find((x) => x.name === st.provider) || offered[0];
     out.provider = p.name;
     out.voice = p.voices.indexOf(st.voice) >= 0 ? st.voice : p.default_voice;
     out.speed = Math.min(p.speed[1], Math.max(p.speed[0], st.speed));
@@ -150,7 +153,7 @@
       const i = old.lastIndexOf(":"), thread = old.slice(0, i), g = Number(old.slice(i + 1));
       if (isFinite(g)) { const f = floor.get(thread); if (f === undefined || g > f) { floor.delete(thread); floor.set(thread, g); } }
     }
-    while (floor.size > CAP) floor.delete(floor.keys().next().value);
+    while (floor.size > FLOOR_CAP) floor.delete(floor.keys().next().value);
   }
   function changed() { listeners.forEach((f) => { try { f(); } catch (_) { /* a view's fault never stops the player */ } }); }
 
@@ -193,7 +196,9 @@
   }
 
   // The page hid, or is going: nothing plays and the next reply asks for a tap.
-  function lock() { stop(); lockEpoch++; unlocked = false; unlocking = false; changed(); }
+  function lock() {
+    if (queued && readSettings().autoplay) remember(tapNeeded, key(queued));   // it was decided, so the poll never offers it again: it keeps a tap cue
+    stop(); lockEpoch++; unlocked = false; unlocking = false; changed(); }
 
   function dropQueued() { if (queued) { messages.delete(key(queued)); queued = null; } }
 
@@ -435,7 +440,8 @@
       stop();
       messages.delete(key(reply));
       const me = runId, s = readSettings();
-      await speakDevice(reply, SAMPLE, me, s.speed);
+      try { await speakDevice(reply, SAMPLE, me, s.speed); }
+      catch (_) { if (me === runId) sayIfNone(reply, WORDS.cantPlay); }
       changed();
     },
   };
