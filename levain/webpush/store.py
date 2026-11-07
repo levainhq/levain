@@ -45,7 +45,7 @@ TAP_KINDS = ("clicked", "opened", "landed")
 TAP_SW_KINDS = ("clicked", "opened")                 # reported by the worker under the endpoint hash, against a ping
 TAP_HOWS = ("ack", "late-ack", "navigate", "openWindow", "refused", "none")   # `opened`: how the worker got a window
 # a target: a path and, of the query, only `view` and `item` (nothing else is ever kept: no token, no body)
-TAP_TARGET = re.compile(r"^/[A-Za-z0-9/_.-]{0,60}(?:\?(?:view=[a-z]{1,20}(?:&item=[A-Za-z0-9_.:-]{1,64})?|item=[A-Za-z0-9_.:-]{1,64}))?$")
+TAP_TARGET = re.compile(r"^/(?!/)[A-Za-z0-9/_.-]{0,60}(?:\?(?:view=[a-z]{1,20}(?:&item=[A-Za-z0-9_.:-]{1,64})?|item=[A-Za-z0-9_.:-]{1,64}))?$")
 LANDED_HOW = re.compile(r"^[a-z]{1,12}(?:>[a-z]{1,12})?$")   # e.g. load, load>shown, resume>shown, message
 MAX_LANDINGS_PER_DEVICE_HOUR = 120
 MAX_RECEIPTS_PER_DEVICE_HOUR = 600   # what one device may report in an hour: a flood cannot grow the table past this
