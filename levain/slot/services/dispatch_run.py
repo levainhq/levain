@@ -126,7 +126,7 @@ EX_TEMPFAIL = 75
 #: the operator keeps; it must leave at least one. A slot holding a credential or baseline (the marked one included) is
 #: not credential-free, so it never counts. The marked slot itself is a separate check (`no-dispatch-credential`).
 _NO_FREE_SLOT_DETAIL = ("no dispatch slot is free: after the slot kept for the operator and the slots other dispatches "
-                        "are using, no spare slot is left that holds no credential and no baseline "
+                        "are using or have asked for, no spare slot is left that holds no credential and no baseline "
                         "(a slot with either never counts as spare). Wait for a running dispatch to finish, or add a spare slot")
 EX_CONFIG = 78
 EX_WRONG_USER = 77
