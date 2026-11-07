@@ -6,7 +6,7 @@
 // whichever opens first creates the store; correctness depends on no timing (an unread key waits for the next trigger).
 const DB = 'levain-sw-2', STORE = 'opened';
 // A short id of this worker's code, recorded in the trace so a device's trace says which worker ran.
-const SW_VERSION = '1106-51-shown-3';
+const SW_VERSION = '1106-54-devtest-2';
 // The TRACE: an append-only ring in its own cache, one entry per step, key TRACE_PREFIX + <time ms, zero padded> + '-' +
 // <seq>, value JSON {t, src, step, ...detail}. The /tap_trace page and sw_open.js read and write the same ring. Writes are
 // best effort, serialized on one chain, never awaited by the tap, and carry only urls without fragments, counts and step
@@ -389,6 +389,8 @@ self.addEventListener('install', (e) => e.waitUntil(precacheShell()));
 self.addEventListener('message', (e) => {
   const d = e.data;
   if (d && typeof d === 'object' && d.type === 'levain-skip-waiting') e.waitUntil(self.skipWaiting());
+  // devtest: the page asks which build is ACTIVE (an older worker has no such branch and never answers)
+  if (d && typeof d === 'object' && d.type === 'devtest-version' && e.ports && e.ports[0]) { try { e.ports[0].postMessage({ devtest: true, version: SW_VERSION }); } catch (_) { /* best effort */ } }
 });
 
 // Navigations only: network first, the cached shell (or the offline page) when the network fails. Never intercepted:
@@ -580,6 +582,7 @@ self.addEventListener('push', (e) => {
   const t0 = Date.now();
   let d = {};
   try { d = e.data ? e.data.json() : {}; } catch (_) { d = { body: e.data ? e.data.text() : '' }; }
+  if (d && d.devtest === true) { e.waitUntil(devtestShow()); return; }   // devtest: the server-sent test push, shown with action buttons
   const title = d.title || 'Levain';
   // a fixed tag with renotify: a re-ping for the same item replaces the earlier notification and alerts again. The
   // notification is asked for FIRST, before any trace or receipt, and never waits on either; it does not race the
@@ -770,18 +773,48 @@ function sameTarget(a, b) {
   try { const x = new URL(a), y = new URL(b); return x.origin === y.origin && x.pathname === y.pathname && x.search === y.search; } catch (_) { return false; }
 }
 
-// devtest (band 299): the notification-action device test's tap. The worker holds no credential, so it writes the tap to the
-// trace ring ('devtest-click', with the app state it found) and opens /devtest, whose page reports the ring entry with its key.
-async function devtestClick(e) {
-  e.notification.close();
+// devtest (band 299): the notification-action device test. The notification is a real push (the server sends it after the page's
+// request), shown here WITH action buttons; a tap is recorded here too. The worker holds no credential, so both the show and
+// the tap go to the trace ring ('devtest-shown', 'devtest-click', with the app state found) and the /devtest page reports the
+// ring entries with the paired key whenever it opens or is told (a 'devtest-drain' message).
+async function devtestClients() {
   let all = [];
   try { all = (await self.clients.matchAll({ type: 'window', includeUncontrolled: true })).filter((c) => { try { return new URL(c.url).origin === self.location.origin; } catch (_) { return false; } }); } catch (_) { /* none */ }
   const state = !all.length ? 'none' : all.some((c) => c.visibilityState === 'visible' || c.focused) ? 'visible' : 'hidden';
+  return { all, state };
+}
+function onDevtestPage(c) { try { return new URL(c.url).pathname === '/devtest'; } catch (_) { return false; } }
+async function devtestShow() {
+  let held = 'show-failed';
+  try {
+    await self.registration.showNotification('levain device test', { body: 'Tap Approve, Deny, or the body. This asks nothing of you.', tag: 'devtest', requireInteraction: false,
+      icon: '/icon-192.png', actions: [{ action: 'approve', title: 'Approve' }, { action: 'deny', title: 'Deny' }], data: { devtest: true, url: '/devtest' } });
+    held = 'not-listed';
+    try {
+      const n = (await self.registration.getNotifications({ tag: 'devtest' }))[0];
+      if (n) held = n.actions === undefined ? 'actions=absent' : 'actions=' + (Array.isArray(n.actions) ? n.actions.length : '?');
+    } catch (_) { /* unsupported */ }
+  } catch (_) { /* held stays show-failed */ }
+  const { all, state } = await devtestClients();
+  trace('devtest-shown', { action: held, state, windows: all.length });
+  await traceSettled();
+  for (const c of all) if (onDevtestPage(c)) { try { c.postMessage({ type: 'devtest-drain' }); } catch (_) { /* best effort */ } }
+}
+// a tap: closes the notification, traces the action and the app state, then shows the test page. Only a window ALREADY on
+// /devtest is focused (never navigated: its on-screen log stays; it is told to drain); any other window is left alone and the
+// page opens in a new one.
+async function devtestClick(e) {
+  e.notification.close();
+  const { all, state } = await devtestClients();
   trace('devtest-click', { action: traceScalar(e.action || '(body tap)'), state, windows: all.length });
   await traceSettled();
-  const url = new URL('/devtest', self.location.origin).href;
-  try { if (all.length) { const w = all[0]; await w.focus(); await w.navigate(url); return; } } catch (_) { /* fall through to a new window */ }
-  try { await self.clients.openWindow(url); } catch (_) { /* best effort */ }
+  const w = all.find(onDevtestPage);
+  if (w) {
+    try { await w.focus(); } catch (_) { /* still told below */ }
+    try { w.postMessage({ type: 'devtest-drain' }); } catch (_) { /* best effort */ }
+    return;
+  }
+  try { await self.clients.openWindow(new URL('/devtest', self.location.origin).href); } catch (_) { /* best effort */ }
 }
 self.addEventListener('notificationclick', (e) => {
   if (e.notification && e.notification.data && e.notification.data.devtest) { e.waitUntil(devtestClick(e)); return; }   // devtest

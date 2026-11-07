@@ -222,4 +222,18 @@ def handle(method: str, path: str, query: dict, body: bytes, *, queue_dir: Path 
             return _err(503, "devtest_busy", "the report file is busy; the page posts again")
         except OSError:
             return _err(503, "devtest_unavailable", "the report could not be written")
+    if method == "POST" and path == "/webpush/devtest/send":   # devtest: ask the server to push the test notification to THIS device
+        from levain.webpush import devtest
+
+        delay = devtest.clean_send(_body_json(body))
+        if delay is None:
+            return _err(400, "bad_devtest", "send {delay_s: 10 or 60} and nothing else")
+        try:
+            return _json(200, devtest.request_send(queue_dir, device_id, delay))
+        except devtest.NoDevice:
+            return _err(403, "no_device", "only a paired device with pings turned on can run the test")
+        except devtest.Pending:
+            return _err(409, "pending", "a test push is already on its way to this device")
+        except devtest.SendLimited:
+            return _err(429, "limited", "too many test pushes this hour")
     return _err(404, "not_found", "no such push path")

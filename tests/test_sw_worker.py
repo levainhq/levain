@@ -530,19 +530,24 @@ def test_no_notification_in_the_worker_carries_an_actions_key() -> None:
     src = SW.read_text()
     calls = [m.start() for m in re.finditer(r"showNotification\(", src)]
     assert calls, "no showNotification call found: the pin would pass vacuously"
+    exempt = 0
     for at in calls:
         depth, i = 0, src.index("(", at)
         for j in range(i, len(src)):
             depth += (src[j] == "(") - (src[j] == ")")
             if depth == 0:
                 break
+        if src[at:j].startswith("showNotification('levain device test'"):
+            exempt += 1   # band 299: the ONE device-test notification (devtestShow), which exists to learn whether buttons work on his phone
+            continue
         assert not re.search(r"\bactions\b", src[at:j]), src[at:j]
+    assert exempt == 1, "the only notification allowed to carry actions is the device test's"
 
 
 @needs_node
 def test_activation_carries_the_last_good_shell_forward_when_the_new_install_cached_none() -> None:
     got = _run("carry")
-    assert [c for c in got["caches"] if c.startswith("levain-shell")] == ["levain-shell-v1106-51-shown-3"], got   # the old shell cache is gone
+    assert [c for c in got["caches"] if c.startswith("levain-shell")] == ["levain-shell-v1106-54-devtest-2"], got   # the old shell cache is gone
     assert got["shells"][0][1] == [["/", "<html>old shell</html>"]], got          # its page was carried first
 
 
