@@ -253,6 +253,8 @@ def test_p8_is_the_one_probe_without_a_control():
 def test_launch_starts_claude_headless_and_dry_run_starts_nothing():
     launch = _resolve(["launch"])
     assert {"--remote", "--base", "--prompt", "--dry-run"} <= _options(launch)
+    assert "--headless" in _options(launch)    # the accepted-for-compatibility flag stays in the parser
+    assert "`--claude`" not in TEXT            # a deliberately undocumented flag stays out of the page
     assert "starts claude headless" in (_seat().description or "")
     assert "`launch --dry-run` only validates" in (_seat().description or "")
     assert "mints the lane's roots under the live lease" in TEXT

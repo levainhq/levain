@@ -244,12 +244,24 @@ headless (`claude -p`, with no terminal), so `--prompt` is required. It runs in 
 the profile's environment, stdin closed, and stdout and stderr written to `seat-launch.log` in the RETURN directory.
 The launcher records the seat's pid, process group and start time in the signed mint log, then prints `seat launched`
 with the pid, pgid, clone, RETURN directory, log, profile digest and the `levain seat stop` command. Any failure before
-the seat is released kills its group and removes the roots that launch made; the mint row stays as the audit trail.
+the seat is released kills its group and removes the roots that launch made. The mint row stays as the audit trail only
+for a failure after the profile is built and the mint row appended; a refusal before that point (a nested `.claude` in
+the clone, a managed-settings conflict) removes the roots and leaves no mint row.
 
 `levain seat launch ... --dry-run` only validates and prints the argv. It mints nothing and does not start Claude Code.
 
 `levain seat stop <lane>` stops that lane's seat: it finds the newest start row for the lane in the mint log and signals
-the recorded process group (SIGTERM, then SIGKILL after `--grace` seconds, default 10). It signals only if the pid
-still has the start time the row recorded, so a reused pid is never signalled. A seat that is already gone is reported
-as gone, not as a failure. A launch with `--tools` takes a subset a failed canary named. Revoking the egress grant
-also stops the seats launched under it.
+the recorded process group (SIGTERM, then SIGKILL after `--grace` seconds, default 10). It identifies the seat by the
+recorded pid's start time (read with `ps -o lstart`, one-second resolution) and by the pid still being in the recorded
+process group (the group id equals the pid, since the seat is its own group leader). A different start time reports the
+seat as gone when no member of the group is left, and refuses while a group of that id exists; a pid that left the group
+refuses. A seat that is already gone is reported
+as gone, not as a failure. A launch with `--tools` takes a subset a failed canary named.
+
+Revoking the egress grant revokes push authorization unconditionally, then attempts to stop the seats launched under that
+grant. If a seat could not be stopped, or the sweep itself failed, `levain seat egress revoke` exits 3 ("revoked, but
+could not stop"); that seat keeps running with the `allowedDomains` it was minted with until it is stopped by hand
+(`levain seat stop <lane>`).
+
+Known edge: a pid reused within the same second by an unrelated process that is also a session leader (pgid equal to
+pid) would not be told apart from the recorded seat by that check.
