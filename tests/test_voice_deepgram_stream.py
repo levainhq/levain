@@ -415,7 +415,7 @@ def test_partials_coalesce_and_never_fill_a_queue(serve):
 
     s = open_stream(serve(script))
     assert sent.wait(5)
-    time.sleep(1.3)                               # longer than any put timeout a bounded queue would block for
+    assert wait_for(lambda: (u := s.poll()).final == "done" and u.partial == "tail", 10)
     up = s.poll()
     assert not up.failed and up.final == "done" and up.partial == "tail"
     s.close()
