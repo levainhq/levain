@@ -540,9 +540,20 @@ def _norm(value: Any) -> str:
     return normalize_spore_field(value)
 
 
+def _refuse_retired_cockpit(value: Any) -> None:
+    """TS-1: a NEW handoff or Keep note is refused (legacy rows still read)."""
+    from levain.writes import RETIRED_HANDOFF_MSG, RETIRED_KEEP_NOTE_MSG
+
+    if value == "handoff":
+        raise ValueError(RETIRED_HANDOFF_MSG)
+    if value == "note":
+        raise ValueError(RETIRED_KEEP_NOTE_MSG)
+
+
 def _norm_disposition(value: Any) -> str | None:
     from levain.spores import LOOP_DISPOSITION, VALID_DISPOSITIONS
 
+    _refuse_retired_cockpit(value)
     if value not in VALID_DISPOSITIONS:
         raise ValueError(f"disposition must be one of {list(VALID_DISPOSITIONS)} (got {value!r})")
     return None if value == LOOP_DISPOSITION else _norm(value)
@@ -618,7 +629,7 @@ def _existing_effect(pre: Mapping[str, Any], changes: dict[str, Any], version_of
 def _ce_seed(params: Mapping[str, Any], pre: Mapping[str, Any] | None, *, origin_key: str | None,
              version_of: Callable[..., str]) -> Effect:
     from anneal_memory.spores import VALID_TYPES
-    from levain.spores import NON_COGNITION_DISPOSITIONS
+    from levain.spores import TRAY_DISPOSITIONS
 
     if pre is not None:
         raise ValueError("a create's origin_key is already in use")
@@ -628,8 +639,9 @@ def _ce_seed(params: Mapping[str, Any], pre: Mapping[str, Any] | None, *, origin
     if stype not in VALID_TYPES:
         raise ValueError(f"type must be one of {list(VALID_TYPES)} (got {stype!r})")
     disposition = params.get("disposition", "seed")
-    if disposition not in NON_COGNITION_DISPOSITIONS:
-        raise ValueError(f"a captured item's disposition must be one of {list(NON_COGNITION_DISPOSITIONS)}")
+    _refuse_retired_cockpit(disposition)
+    if disposition not in TRAY_DISPOSITIONS:
+        raise ValueError(f"a captured item's disposition must be one of {list(TRAY_DISPOSITIONS)}")
     changes: dict[str, Any] = {"type": stype, "text": _norm_update_field("text", params.get("text")),
                                "disposition": _norm(disposition)}
     if params.get("domain"):
@@ -665,12 +677,8 @@ def _ce_set_disposition(params: Mapping[str, Any], pre: Mapping[str, Any] | None
     disposition = params.get("disposition")
     changes: dict[str, Any] = {"disposition": _norm_disposition(disposition)}
     surface_at = _norm_date(params.get("surface_at")) if "surface_at" in params else None
-    # a Keep note carries no surface date, so a move into Keep clears it
-    if disposition == "note":
-        if surface_at is not None:
-            raise ValueError("a Keep note doesn't resurface on a schedule")
-        changes["next"] = None
-    elif "surface_at" in params:
+    # a move into the Keep is refused above (``_norm_disposition``): the Keep is retired
+    if "surface_at" in params:
         changes["next"] = surface_at
     return _existing_effect(pre, changes, version_of)
 

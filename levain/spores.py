@@ -47,6 +47,7 @@ __all__ = [
     "LOOP_DISPOSITION",
     "TRAY_DISPOSITIONS",
     "KEEP_DISPOSITIONS",
+    "RETIRED_DISPOSITIONS",
     "NON_COGNITION_DISPOSITIONS",
     "VALID_DISPOSITIONS",
     "PARKED_TIER",
@@ -61,13 +62,18 @@ __all__ = [
 ]
 
 LOOP_DISPOSITION = "loop"
-TRAY_DISPOSITIONS = ("seed", "handoff", "agenda")   # operator INBOX — forms, then resolves
-KEEP_DISPOSITIONS = ("note",)                        # operator durable REFERENCE — never resolves
-# Everything the operator authored as I/O (inbox + reference) — all excluded from the
-# entity's OWN cognition, the complement of a cognition loop. (Tray resolves; a note is
-# resolve-exempt reference. Both are operator I/O, not the entity's prospective loops.)
-NON_COGNITION_DISPOSITIONS = TRAY_DISPOSITIONS + KEEP_DISPOSITIONS
-VALID_DISPOSITIONS = (LOOP_DISPOSITION,) + NON_COGNITION_DISPOSITIONS
+TRAY_DISPOSITIONS = ("seed", "agenda")              # operator INBOX — forms, then resolves
+# RETIRED (TS-1): legacy rows still carry these. They stay in the READ sets (a legacy handoff
+# or Keep note still renders, descends, and re-dispositions to seed/agenda) but are OUT of the
+# WRITE set (VALID_DISPOSITIONS): a new handoff or Keep note is refused at the write seam.
+RETIRED_DISPOSITIONS = ("handoff", "note")
+KEEP_DISPOSITIONS = ("note",)                        # legacy operator REFERENCE — read-only vocabulary
+# Everything the operator authored as I/O — all excluded from the entity's OWN cognition.
+# The retired names STAY: ``is_loop`` fails OPEN on an unknown value, so dropping them would
+# flood every legacy note and handoff into the agent's collision surface. The order is the
+# hook copies' tuple order (drift contract: byte-equal to ``_NON_COGNITION_DISPOSITIONS``).
+NON_COGNITION_DISPOSITIONS = ("seed", "handoff", "agenda", "note")
+VALID_DISPOSITIONS = (LOOP_DISPOSITION,) + TRAY_DISPOSITIONS   # the WRITE set
 
 # The tier value that means *deliberate dormancy* (anneal's own ``Tier`` literal — see
 # ``anneal_memory.spores.VALID_TIERS``). A parked LOOP is Keep — pinned-dormant, exempt
@@ -106,10 +112,10 @@ def is_loop(item: Mapping[str, Any]) -> bool:
 
 
 def is_tray(item: Mapping[str, Any]) -> bool:
-    """The operator session-I/O INBOX set (seed/handoff/agenda) — EXPLICIT membership,
+    """The operator session-I/O INBOX set (seed/agenda, plus a legacy handoff row) — EXPLICIT membership,
     NOT ``not is_loop``: a ``note`` is also non-cognition but it is Keep reference, not
     the Tray, so the three classes (loop / tray / keep) are distinct."""
-    return disposition_of(item) in TRAY_DISPOSITIONS
+    return disposition_of(item) in TRAY_DISPOSITIONS or disposition_of(item) == "handoff"
 
 
 def is_note(item: Mapping[str, Any]) -> bool:
@@ -132,7 +138,7 @@ def bucket_of(item: Mapping[str, Any]) -> str:
     Disposition is checked before tier so a (hypothetical) parked note still reads Keep.
     """
     d = disposition_of(item)
-    if d in TRAY_DISPOSITIONS:
+    if d in TRAY_DISPOSITIONS or d == "handoff":   # a legacy handoff still renders in the Tray
         return BUCKET_TRAY
     if d in KEEP_DISPOSITIONS or item.get("tier") == PARKED_TIER:
         return BUCKET_KEEP

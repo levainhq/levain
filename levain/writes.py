@@ -94,6 +94,7 @@ from levain.idempotency import StoreCorruptError  # the at-most-once dedup keyst
 from levain.spores import (  # the operator-I/O disposition vocabulary (anneal stays blind)
     LOOP_DISPOSITION,
     NON_COGNITION_DISPOSITIONS,
+    TRAY_DISPOSITIONS,
     VALID_DISPOSITIONS,
     disposition_of,
     is_loop,
@@ -1944,12 +1945,13 @@ def _apply_spore_seed(
             f"type must be one of {list(VALID_TYPES)} (got {stype!r})",
         )
     disposition = req.get("disposition", "seed")
-    if disposition not in NON_COGNITION_DISPOSITIONS:
+    _refuse_retired_disposition(disposition)
+    if disposition not in TRAY_DISPOSITIONS:
         raise EditError(
             "bad_verb_arg", 422,
-            f"a captured item's disposition must be operator I/O "
-            f"({list(NON_COGNITION_DISPOSITIONS)}; got {disposition!r}) — a Tray seed or a "
-            f"Keep note, never a plain cognition loop (those come from metabolize or the CLI)",
+            f"a captured item's disposition must be a Tray value "
+            f"({list(TRAY_DISPOSITIONS)}; got {disposition!r}) — a seed or an agenda, "
+            f"never a plain cognition loop (those come from metabolize or the CLI)",
         )
 
     store = SporeStore(scope.anneal.spores_json)
@@ -1974,6 +1976,24 @@ def _apply_spore_seed(
     )
     return {"ok": True, "id": edit_id, "source": f"spore:{spore_id}",
             "action": "seed", "spore_id": spore_id}
+
+
+RETIRED_HANDOFF_MSG = (
+    "handoff is retired: ask the operator with `levain ask` (or `--on <date>` for later), "
+    "or put the work on the board"
+)
+RETIRED_KEEP_NOTE_MSG = (
+    "the Keep is retired: a fact or command goes to memory (Durable Facts), "
+    "an intention is a seed"
+)
+
+
+def _refuse_retired_disposition(disposition: Any) -> None:
+    """TS-1: a NEW handoff or Keep note is refused at the write seam (legacy rows still read)."""
+    if disposition == "handoff":
+        raise EditError("bad_verb_arg", 422, RETIRED_HANDOFF_MSG)
+    if disposition == "note":
+        raise EditError("bad_verb_arg", 422, RETIRED_KEEP_NOTE_MSG)
 
 
 def _apply_spore_set_disposition(
@@ -2006,6 +2026,7 @@ def _apply_spore_set_disposition(
 
     spore_id = _require_str(req, "spore_id")
     disposition = req.get("disposition")
+    _refuse_retired_disposition(disposition)
     if disposition not in VALID_DISPOSITIONS:
         raise EditError(
             "bad_verb_arg", 422,
