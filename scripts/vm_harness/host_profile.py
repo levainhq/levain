@@ -104,3 +104,14 @@ def check_guest_os(profile: HostProfile, uname_output: str) -> None:
     got = uname_output.strip()
     if got != profile.uname:
         raise ProfileMismatch(f"profile {profile.name!r} expects a {profile.uname} guest, the guest says {got!r}")
+
+
+def pick_levain_root(profile: HostProfile, isdir=None) -> str | None:
+    """The first of ``profile.levain_roots`` that holds a ``levain/`` package, or None. The one selection both guest
+    scripts use, so they cannot import different trees."""
+    import os
+    isdir = isdir or os.path.isdir
+    for root in profile.levain_roots:
+        if isdir(os.path.join(root, "levain")):
+            return root
+    return None

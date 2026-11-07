@@ -314,11 +314,11 @@ def test_ssh_transport_is_unchanged_for_darwin(monkeypatch, tmp_path):
     guest, _ = vm_run.make_ssh("vend-x", tmp_path)
     guest(["/bin/echo", "a; touch /pwned"])
     assert seen[-1][0][-1] == "/bin/echo 'a; touch /pwned'" and seen[-1][0][-2] == "admin@10.0.0.5"
-    assert (tmp_path / "askpass.sh").read_text() == "#!/bin/sh\necho admin\n"
+    assert (tmp_path / "askpass.sh").read_text() == "#!/bin/sh\nprintf '%s\\n' admin\n"
     import dataclasses
     other = dataclasses.replace(LINUX, ssh_user="ubuntu", ssh_password="pw")
     vm_run.make_ssh("vend-x", tmp_path, other)
-    assert (tmp_path / "askpass.sh").read_text() == "#!/bin/sh\necho pw\n"      # the password, not the login name
+    assert (tmp_path / "askpass.sh").read_text() == "#!/bin/sh\nprintf '%s\\n' pw\n"      # the password, not the login name
 
 
 # ---- no host-bound literal outside the profile ---------------------------------------------------------------
@@ -360,3 +360,59 @@ def test_the_scan_is_not_vacuous():
         assert bad in literal_text, f"{bad!r} is not defined in host_profile.py: stale HOST_BOUND entry"
     assert _offenders('x = "/private/tmp/fh"\ny = f"{a}/usr/local/bin/python3.13"')       # the scanner sees it
     assert not _offenders('"""docstring naming /private/tmp/fh"""\n# comment /private\nx = 1')
+
+
+# ---- lv follow-ups: askpass quoting, one levain-root selection, tart-exec spawns are cancelled by close() --------
+
+def test_askpass_hands_over_a_hostile_password_verbatim(tmp_path):
+    # revert: shlex.quote on the password in make_ssh
+    import dataclasses
+    nasty = "pa$$word `touch " + str(tmp_path / "pwned") + "` 'q\" x"
+    prof = dataclasses.replace(DARWIN, ssh_password=nasty)
+    vm_run.make_ssh("vend-x", tmp_path, prof)
+    r = subprocess.run(["/bin/sh", str(tmp_path / "askpass.sh")], capture_output=True, text=True, timeout=20)
+    assert r.stdout == nasty + "\n" and not (tmp_path / "pwned").exists()
+
+
+def test_pick_levain_root_takes_the_first_root_holding_the_package():
+    # revert: guest_dispatch back to a fixed roots[-1]
+    prof = DARWIN
+    first, last = prof.levain_roots[0], prof.levain_roots[-1]
+    only_last = lambda p: p == f"{last}/levain"
+    only_first = lambda p: p == f"{first}/levain"
+    assert HP.pick_levain_root(prof, only_last) == last
+    assert HP.pick_levain_root(prof, only_first) == first
+    assert HP.pick_levain_root(prof, lambda p: True) == first
+    assert HP.pick_levain_root(prof, lambda p: False) is None
+
+
+def test_both_guest_scripts_select_the_levain_root_through_the_one_helper():
+    for n in ("guest_ops.py", "guest_dispatch.py"):
+        assert "pick_levain_root(PROFILE)" in (HARNESS / n).read_text(), n
+
+
+def test_close_cancels_the_dispatcher_of_a_tart_exec_spawn(monkeypatch, tmp_path):
+    # the cancel is a guest op by tag, independent of how the local client was spawned: a killed `tart exec` client
+    # leaves the guest dispatcher, and close() reaches it through guest.  revert: the cancel loop in VmAdapters.close
+    popen = []
+
+    class P:
+        def __init__(self, argv, **kw):
+            popen.append(list(argv))
+        def poll(self):
+            return 0
+        def wait(self, t=None):
+            return 0
+    monkeypatch.setattr(subprocess, "Popen", P)
+    cancelled = []
+
+    def guest(argv, timeout=60):
+        if argv[-2] == "cancel":
+            cancelled.append(argv[-1])
+        return ""
+    _, spawn = vm_run.make_tart_exec("vend-lin-1")
+    ad = VmAdapters(guest, spawn, profile=LINUX)
+    ad._all_tags.append("drv8xabc")
+    ad._children.append(spawn([*ad.DISPATCH, "drv8xabc"]))
+    ad.close()
+    assert popen[0][:3] == [vm_run.TART, "exec", "vend-lin-1"] and cancelled == ["drv8xabc"]

@@ -26,16 +26,15 @@ import subprocess
 import sys
 
 if __package__:
-    from scripts.vm_harness.host_profile import profile_for_platform
+    from scripts.vm_harness.host_profile import pick_levain_root, profile_for_platform
 else:   # run as a script in the clone, next to host_profile.py (python -I leaves the script's own dir off sys.path)
     sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-    from host_profile import profile_for_platform
+    from host_profile import pick_levain_root, profile_for_platform
 
 PROFILE = profile_for_platform(sys.platform)
-for root in PROFILE.levain_roots:
-    if os.path.isdir(os.path.join(root, "levain")):
-        sys.path.insert(0, root)
-        break
+_ROOT = pick_levain_root(PROFILE)
+if _ROOT:
+    sys.path.insert(0, _ROOT)
 SLOTS = f"{PROFILE.store}/slots"
 FH = PROFILE.exchange_dir
 NAME_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}")

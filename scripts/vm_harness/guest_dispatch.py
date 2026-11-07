@@ -19,13 +19,15 @@ import traceback
 from pathlib import Path
 
 if __package__:
-    from scripts.vm_harness.host_profile import profile_for_platform
+    from scripts.vm_harness.host_profile import pick_levain_root, profile_for_platform
 else:   # run as a script in the clone, next to host_profile.py (python -I leaves the script's own dir off sys.path)
     sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-    from host_profile import profile_for_platform
+    from host_profile import pick_levain_root, profile_for_platform
 
 PROFILE = profile_for_platform(sys.platform)
-sys.path.insert(0, PROFILE.levain_roots[-1])
+_ROOT = pick_levain_root(PROFILE)
+if _ROOT:   # none staged: the levain imports below fail loudly unless the package is already importable
+    sys.path.insert(0, _ROOT)
 from levain.agents.accounting import ActionExposure  # noqa: E402
 from levain.agents.session import SessionLaunch  # noqa: E402
 from levain.agents.session_launcher import RealLauncher, SessionIndex  # noqa: E402

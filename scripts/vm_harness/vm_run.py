@@ -40,7 +40,7 @@ def _clone_guard(vm: str) -> None:
 
 def make_ssh(vm: str, askpass_dir: Path, profile: HostProfile = DARWIN):
     askpass = askpass_dir / "askpass.sh"
-    askpass.write_text(f"#!/bin/sh\necho {profile.ssh_password}\n")
+    askpass.write_text(f"#!/bin/sh\nprintf '%s\\n' {shlex.quote(profile.ssh_password)}\n")
     os.chmod(askpass, 0o700)
     env = dict(os.environ, SSH_ASKPASS=str(askpass), SSH_ASKPASS_REQUIRE="force", DISPLAY="x")
 
