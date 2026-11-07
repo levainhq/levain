@@ -19,20 +19,30 @@
 //   LevainMic.onFinal(cb)      cb(text) the text of the closed session
 //   LevainMic.onNote(cb)       cb(sentence) one of the fixed sentences below
 //   LevainMic.onEnd(cb)        cb() whenever a session ends, for any reason
+//
+// Stop-time WAV fallback (cockpit mic S5b): every PCM chunk the page captures is also kept in memory (bounded: the oldest are dropped
+// past limits.wavMax, which is the transcribe route's 4 MiB upload cap less the 44-byte header). When the stream breaks (a chunk
+// fails or times out, the open is refused after audio was captured, or the close cannot confirm the final text), the kept PCM is
+// wrapped as a 16 kHz mono PCM16 WAV and POSTed ONCE to the existing POST /cockpit/voice/transcribe?provider=<name>
+// (Content-Type audio/wav); its text arrives through onFinal with one fixed note. Nothing is kept or sent once the session ends.
 (function () {
   "use strict";
   var TOKEN_KEY = "levain_write_token", TOKEN_HEADER = "X-Levain-Write-Token";
-  var BASE = "/cockpit/voice/stream/";
+  var BASE = "/cockpit/voice/stream/", TRANSCRIBE = "/cockpit/voice/transcribe?provider=";
+  var MIN_WAV = 8000;                        // under 250 ms of audio there is nothing worth transcribing
   var RATE = 16000, CHUNK = 4000;            // 4000 samples at 16 kHz = 250 ms = 8000 bytes
   var MAX_MS = 120000;                       // the server's session ceiling; the page ends a session at it
   var WORDS = {
     openFailed: "Streaming dictation could not start; the Dictate control and the keyboard dictation key still work.",
     broke: "Streaming dictation stopped; the words so far are in the box.",
+    wavFilled: "Streaming dictation stopped; these words come from the recording instead. Check them before you send.",
+    wavTrimmed: "Streaming dictation stopped; these words come from the recording instead, and the start of a long recording was left out. Check them before you send.",
   };
   var listeners = { partial: [], final: [], note: [], end: [] };
   var streamOk = false, provider = "", probing = null;
   var S = null;                              // the live session, or null
-  var deadlines = { open: 10000, chunk: 10000, close: 5000 };   // ms; a request past its deadline is cancelled, never waited on
+  var deadlines = { open: 10000, chunk: 10000, close: 5000, wav: 30000 };
+  var limits = { wavMax: 4 * 1024 * 1024 - 44 };   // bytes of PCM kept for the fallback: the server's UPLOAD_MAX less the WAV header   // ms; a request past its deadline is cancelled, never waited on
 
   function headers() {
     var h = {}, t = "";
@@ -95,10 +105,10 @@
 
   // ---- the session -----------------------------------------------------------------------------------------------------
   // Every request has a deadline and a handle the session can cancel: a hung request must never wedge the session.
-  function postJson(s, path, body, ms) {
+  function postJson(s, path, body, ms, ctype) {
     return new Promise(function (resolve, reject) {
       var opts = { method: "POST", headers: headers() }, ctl = null, done = false, tm = 0, h = null;
-      if (body !== undefined) { opts.body = body; opts.headers["Content-Type"] = "application/octet-stream"; }
+      if (body !== undefined) { opts.body = body; opts.headers["Content-Type"] = ctype || "application/octet-stream"; }
       if (typeof window.AbortController === "function") { ctl = new window.AbortController(); opts.signal = ctl.signal; }
       function settle(fn, v) {
         if (done) return;
@@ -134,17 +144,49 @@
     window.removeEventListener("pagehide", s.onHide);
   }
   function finish(s) {
-    if (s.ended) return;
+    if (s.ended || s.wavBusy) return;     // a recording being transcribed is the session's last act: nothing ends it early
     if (S === s) S = null;
     s.ended = true;
     releaseCapture(s);
     cancelAll(s);
+    s.pcm = null;
     emit("end");
     s.resFin(s.text);
   }
   function stale(s) { return S !== s || s.stopping || s.released || s.dead || s.ended; }
+  // ---- the stop-time WAV fallback --------------------------------------------------------------------------------------
+  function keepPcm(s, bytes) {
+    if (!s.pcm) return;
+    s.pcm.push(bytes); s.pcmN += bytes.byteLength;
+    while (s.pcmN > limits.wavMax && s.pcm.length > 1) { s.pcmN -= s.pcm.shift().byteLength; s.pcmDropped = true; }
+  }
+  function canWav(s) { return !!(provider && s.pcm && s.pcmN >= MIN_WAV && !s.wavTried); }
+  function wavOf(s) {
+    var n = s.pcmN, buf = new ArrayBuffer(44 + n), v = new DataView(buf), u = new Uint8Array(buf), off = 44, i;
+    function tag(at, t) { for (var k = 0; k < 4; k++) v.setUint8(at + k, t.charCodeAt(k)); }
+    tag(0, "RIFF"); v.setUint32(4, 36 + n, true); tag(8, "WAVE"); tag(12, "fmt "); v.setUint32(16, 16, true);
+    v.setUint16(20, 1, true); v.setUint16(22, 1, true); v.setUint32(24, RATE, true); v.setUint32(28, RATE * 2, true);
+    v.setUint16(32, 2, true); v.setUint16(34, 16, true); tag(36, "data"); v.setUint32(40, n, true);
+    for (i = 0; i < s.pcm.length; i++) { u.set(new Uint8Array(s.pcm[i]), off); off += s.pcm[i].byteLength; }
+    return buf;
+  }
+  // Resolves true when the kept recording was transcribed and its text delivered (one note, then onFinal), false otherwise.
+  // While it runs the session cannot be ended by anything but its own result (see finish).
+  function recover(s) {
+    if (!canWav(s)) return Promise.resolve(false);
+    s.wavTried = true; s.wavBusy = true;
+    return postJson(s, TRANSCRIBE + encodeURIComponent(provider), wavOf(s), deadlines.wav, "audio/wav").then(function (j) {
+      if (!j || typeof j.text !== "string" || !j.text.trim()) throw new Error("empty");
+      s.text = j.text.trim();
+      emit("note", s.pcmDropped ? WORDS.wavTrimmed : WORDS.wavFilled);
+      emit("final", s.text);
+      return true;
+    }).then(null, function () { return false; }).then(function (ok) { s.wavBusy = false; return ok; });
+  }
   function enqueue(s, bytes) {
-    if (s.dead || s.ended) return;
+    if (s.ended) return;
+    keepPcm(s, bytes);
+    if (s.dead) return;
     var seq = s.seq++;
     s.q = s.q.then(function () {
       if (s.dead || s.ended) return;
@@ -158,6 +200,15 @@
       if (s.dead || s.ended) return;
       s.dead = true;
       if (s.stopping) closeFailed = true;
+      if (canWav(s)) {              // the audio is in memory: transcribe it from there, the mic is let go meanwhile
+        releaseCapture(s);
+        recover(s).then(function (ok) {
+          if (ok) closeFailed = false; else emit("note", WORDS.broke);
+          finish(s);
+          closeSession(s, false);
+        });
+        return;
+      }
       emit("note", WORDS.broke);
       finish(s);                    // the session is over now; the close below is best effort and nothing waits on it
       closeSession(s, false);
@@ -168,7 +219,11 @@
     if (!s.sid) { finish(s); return Promise.resolve(); }
     return postJson(s, BASE + "close?sid=" + encodeURIComponent(s.sid), undefined, deadlines.close).then(function (j) {
       if (wantFinal && j && typeof j.text === "string") { s.text = j.text; emit("final", j.text); }
-    }, function () { closeFailed = true; /* the server ends an idle session itself */ }).then(function () { finish(s); });
+    }, function () {
+      closeFailed = true;           // the server ends an idle session itself
+      if (!wantFinal) return null;
+      return recover(s).then(function (ok) { if (ok) closeFailed = false; });
+    }).then(function () { finish(s); });
   }
   // resolves with the final text ("" when there is none); safe to call twice
   function stopSession(s) {
@@ -190,13 +245,17 @@
   function start() {
     if (S || !available()) return;
     var s = S = { sid: "", seq: 0, q: null, openP: null, dead: false, stopping: false, released: false, ended: false, last: "", text: "",
-      phase: "gum", reqs: [], node: null, src: null, stream: null, ctx: null, timer: 0, chunker: null };
+      phase: "gum", reqs: [], pcm: [], pcmN: 0, pcmDropped: false, wavTried: false, wavBusy: false, node: null, src: null, stream: null, ctx: null, timer: 0, chunker: null };
     s.finP = new Promise(function (res) { s.resFin = res; });
     var AC = window.AudioContext || window.webkitAudioContext;
     var fail = function () {
       if (s.ended) { releaseCapture(s); return; }
       var announce = !s.stopping;
       s.dead = true; releaseCapture(s);
+      if (announce && canWav(s)) {  // audio was captured while the open was pending: the recording can still be transcribed
+        recover(s).then(function (ok) { if (!ok) emit("note", WORDS.openFailed); finish(s); });
+        return;
+      }
       if (announce) emit("note", WORDS.openFailed);
       finish(s);
     };
@@ -258,7 +317,7 @@
   }
 
   window.LevainMic = {
-    available: available, probe: probe, start: start, stop: stop, active: function () { return !!S; }, closeFailed: function () { return closeFailed; }, deadlines: deadlines,
+    available: available, probe: probe, start: start, stop: stop, active: function () { return !!S; }, closeFailed: function () { return closeFailed; }, deadlines: deadlines, limits: limits,
     onPartial: function (cb) { return on("partial", cb); }, onFinal: function (cb) { return on("final", cb); },
     onNote: function (cb) { return on("note", cb); }, onEnd: function (cb) { return on("end", cb); },
   };
