@@ -271,7 +271,10 @@ DEFER = """
       window.__defer = false;
       return new Promise((res) => { window.__rel = () => res(p); });
     }
-    if (path.endsWith('/rotate') && window.__holdRot) return new Promise((res) => { window.__relRot = () => res(f1(u, o)); });
+    if (path.endsWith('/rotate') && window.__holdRot) return new Promise((res) => {
+      window.__relRot = () => res(f1(u, o));
+      window.__failRot = () => res(new Response(JSON.stringify({message: 'no'}), { status: 500, headers: { 'Content-Type': 'application/json' } }));
+    });
     return f1(u, o);
   };
 """
@@ -326,3 +329,36 @@ def test_a_falsy_voice_button_leaving_the_room_does_not_break_the_poll(tmp_path,
         {"eval": "JSON.stringify(window.__err)"},
     ])
     assert json.loads(v[-1]) is False, v[-1]
+
+
+@needs_browser
+def test_a_failed_new_click_does_not_read_the_reply_that_finished_during_it(tmp_path, qdir) -> None:
+    """The rotate is held, reply B finishes on the OLD thread meanwhile, then the rotate fails (500). The pull after it still
+    names t1 with B: the hold is gone, so without a re-baseline B is read as new.
+    Red with: `voiceThread = null` removed from the rotate settle in the New click."""
+    v = _run(tmp_path, qdir, [
+        *PLAYING_A,
+        {"eval": "window.__holdRot = true; document.querySelector('.rv-rotate').click(); 1"},
+        _set(B_T1),
+        {"eval": POLLS},
+        {"eval": "window.__failRot(); 1"},
+        {"eval": POLLS},
+        {"eval": "new Promise((r) => setTimeout(r, 500)).then(() => JSON.stringify(window.__spoken))"},
+    ], init_extra=DEFER)
+    assert json.loads(v[-1]) == ["A old reply"], v[-1]
+
+
+@needs_browser
+def test_a_new_click_answered_before_the_poll_names_the_new_room_does_not_read_the_old_rooms_reply(tmp_path, qdir) -> None:
+    """The rotate answers 200 but the next poll still names t1 (the server catching up) and carries B, which finished during
+    the click. Red with: `voiceThread = null` removed from the rotate settle in the New click."""
+    v = _run(tmp_path, qdir, [
+        *PLAYING_A,
+        {"eval": "window.__holdRot = true; document.querySelector('.rv-rotate').click(); 1"},
+        _set(B_T1),
+        {"eval": POLLS},
+        {"eval": "window.__relRot(); 1"},
+        {"eval": POLLS},
+        {"eval": "new Promise((r) => setTimeout(r, 500)).then(() => JSON.stringify(window.__spoken))"},
+    ], init_extra=DEFER)
+    assert json.loads(v[-1]) == ["A old reply"], v[-1]

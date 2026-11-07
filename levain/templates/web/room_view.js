@@ -610,8 +610,10 @@
         // a one-poll bridge: the old conversation's problem is not the new one's, but a read that still names the OLD
         // thread is only the server catching up. The same error on a new thread is a new problem and shows.
         if (r.status === 200 && current && current.error) hushed = { thread: current.thread, error: current.error };
-        last = ""; voiceHold = false; return pull();
-      }).catch(function () { note.textContent = "The server could not be reached."; })
+        // the next body is backlog: a reply that finished on the old thread during the click (a failed rotate, a pull that still
+        // names the old thread) must not be read as new
+        last = ""; voiceHold = false; voiceThread = null; return pull();
+      }).catch(function () { note.textContent = "The server could not be reached."; voiceHold = false; voiceThread = null; })
         .then(function () { voiceHold = false; paintDock(); });
     });
     // dictation state: dbase = the text before the transcript, heard = the transcript already placed in the box
