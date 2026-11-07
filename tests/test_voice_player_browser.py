@@ -97,7 +97,7 @@ def test_voice_js_is_served_and_a_cockpit_without_voice_shows_no_block_and_never
             {"until": "document.querySelector('.dev-zone') && document.querySelectorAll('.dev-row').length >= 0", "ms": 20000},
             {"eval": "new Promise((r) => setTimeout(() => r(JSON.stringify([!!document.querySelector('.vc-panel') && document.querySelector('.vc-panel').hidden, typeof window.LevainVoice])), 3500))"},
         ])
-    assert json.loads(out["values"][1]) == [True, "undefined"], out["values"]
+    assert json.loads(out["values"][1]) == [True, "object"], out["values"]   # dashboard.html carries /voice.js since the room hook; the panel stays hidden without voice.json
 
 
 @needs_browser
