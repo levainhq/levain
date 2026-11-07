@@ -51,6 +51,7 @@ from levain.cockpit import room as cockpit_room
 from levain.voice import custody
 from levain.voice import meter as vmeter
 from levain.voice import providers as vprov
+from levain.voice import stream_session
 from levain.voice.text import reply_text, speakable
 
 _log = logging.getLogger(__name__)
@@ -59,6 +60,17 @@ VOICE_JSON = "/cockpit/voice.json"
 SPEAK_PATH = "/cockpit/voice/speak"
 TRANSCRIBE_PATH = "/cockpit/voice/transcribe"
 VOICE_PATHS = (SPEAK_PATH, TRANSCRIBE_PATH)
+# live dictation (cockpit mic S3): three POSTs carved out beside the two above, behind the same premium-dictation switch
+STREAM_OPEN = "/cockpit/voice/stream/open"
+STREAM_CHUNK = "/cockpit/voice/stream/chunk"
+STREAM_CLOSE = "/cockpit/voice/stream/close"
+STREAM_PATHS = (STREAM_OPEN, STREAM_CHUNK, STREAM_CLOSE)
+STREAM_PROVIDERS = ("deepgram",)        # the providers a live stream adapter exists for
+STREAM_MAX_SESSIONS = 1                 # one live dictation at a time (the registry's cap)
+STREAM_CHUNK_MAX = stream_session.MAX_CHUNK_BYTES
+STREAM_BODY_DEADLINE_S = 10.0           # a 250 ms chunk is 8000 bytes: a body that takes longer than this is stalled
+STREAM_CHUNK_TYPE = "application/octet-stream"
+STREAM_SID_MAX = 128
 VOICE_INFLIGHT = 2                      # voice POSTs in flight at once (the server's voice_gate), apart from request_gate
 SPEAK_MAX = 4 * 1024                    # a speak body is a few ids and numbers; the words come from the record
 UPLOAD_MAX = 4 * 1024 * 1024            # the transcribe body cap, checked on the declared length before a byte is read
@@ -151,6 +163,8 @@ WORDS = {
     # premium dictation is hidden for Levain 1.0 (Phill 11-05): the transcribe route answers this, in these words only,
     # whether or not a key exists, until the server is started with the switch (``levain serve --premium-stt``)
     "premium_stt_off": "Premium dictation is not offered in this version.",
+    "no_stream": "{p} does not offer live dictation.",
+    "stream_media_type": "Send each audio chunk as application/octet-stream.",
     "bad_json": "The request is not valid JSON.",
     "bad_keys": "A speak request names room_thread_id, reply_gseq, chunk, provider, voice and speed, and nothing else.",
     "bad_provider": "That is not a voice provider.",
@@ -307,7 +321,20 @@ def serve_voice(data_root: Path | str, meter: vmeter.Meter, *, last_read: Mutabl
         body["meter"] = "unreadable"
         body["caps"] = {"month_usd": _usd(caps.month_micros), "day_usd": _usd(caps.day_micros),
                         "spent_month_est": None, "spent_day_est": None, "month_start": None, "day_start": None}
+    if premium_stt and stream_offered(rows):
+        body["stream"] = True
     return body
+
+
+def stream_offered(rows: list[dict[str, Any]]) -> bool:
+    """Whether the page may show its live-dictation control: the FIRST provider row that holds a key with ``stt`` among
+    its uses (the one the page sends, S4's contract) is one a stream adapter exists for. The row's ``uses`` already
+    leave ``stt`` out unless premium dictation is on. A stricter reading than "some row": a page that sends the first
+    keyed row would otherwise open a stream with a provider that has none."""
+    for row in rows:
+        if row.get("key") == "set" and "stt" in row.get("uses", ()):
+            return row.get("name") in STREAM_PROVIDERS
+    return False
 
 
 # --- the shared tail: reserve, read the key, call, settle or release ---------------------------------------------------
@@ -608,4 +635,108 @@ def transcribe(data_root: Path | str, query: str, content_type: str, audio: byte
     del audio
     if refused is not None:
         return refused
+    return _json(200, {"text": text if isinstance(text, str) else ""})
+
+
+# --- live dictation (cockpit mic S3) ------------------------------------------------------------------------------------
+# What a stream refusal is answered with. The code is stream_session's (its WORDS are the only text); the status is this
+# table's. tests/test_cockpit_voice_stream_routes.py pins it row by row.
+STREAM_STATUS = {
+    "bad_sequence": 409, "bad_chunk": 400, "too_fast": 429, "ceiling": 409, "idle_timeout": 409, "closed": 409,
+    "unknown_session": 404, "too_many_sessions": 503, "provider_failed": 502, "meter_unavailable": 503,
+    "settle_backlog": 503, "month_cap": 402, "day_cap": 402, "unpriced": 503, "stopping": 503, "internal": 500,
+}
+
+
+def stream_refusal(code: str, key_code: str = "", *, provider: str = "",
+                   last_read: MutableMapping[str, str | None] | None = None) -> Answer:
+    """A stream refusal in fixed words. ``key_unavailable`` is answered as ``transcribe`` answers a key that cannot be
+    read (custody's own code decides the status and words)."""
+    if code == "key_unavailable":
+        if last_read is not None and provider:
+            last_read[provider] = key_code if key_code in LAST_READ_STATES else None
+        if key_code in KEY_FAILURES or key_code == "use_not_granted":
+            return _key_refusal(key_code, provider, "stt")
+        return internal_answer()
+    words = stream_session.WORDS.get(code)
+    if words is None:
+        return internal_answer()
+    return _json(STREAM_STATUS.get(code, 500), {"error": code, "message": words, "fallback": "on_device"})
+
+
+def _stream_query(query: str, names: tuple[str, ...]) -> dict[str, str] | None:
+    """The query as ``{name: value}`` when it holds exactly ``names``, each once; else None."""
+    try:
+        pairs = urllib.parse.parse_qsl(query, keep_blank_values=True, strict_parsing=True)
+    except ValueError:
+        return None
+    got = dict(pairs)
+    if len(pairs) != len(names) or set(got) != set(names):
+        return None
+    return got
+
+
+def _stream_sid(got: dict[str, str]) -> str | None:
+    sid = got.get("sid", "")
+    return sid if 0 < len(sid) <= STREAM_SID_MAX else None
+
+
+def stream_open(registry: stream_session.StreamRegistry, data_root: Path | str, query: str, owner: str, *,
+                revoke_queue: Path | str | None, read_key: Callable[..., Any],
+                factory: stream_session.StreamFactory, last_read: MutableMapping[str, str | None]) -> Answer:
+    """``POST /cockpit/voice/stream/open?provider=``: ``{"sid": ...}``. The revoke-reach check runs before anything is
+    reserved or read; the registry reserves the ceiling, reads the key once and builds the provider stream."""
+    provider, refused = _query_provider(query)
+    if refused is not None or provider is None:
+        return refused or internal_answer()
+    if provider not in STREAM_PROVIDERS:
+        return refusal(409, "no_stream", "no_stream", provider=provider)
+    reach = revoke_refusal(revoke_queue, data_root)
+    if reach is not None:
+        return refusal(503, reach, reach, fallback=True)
+    code, key_code, session = "", "", None
+    try:
+        session = registry.open(owner, provider, PROVIDERS[provider].stt_model, data_root=data_root,
+                                read_key=read_key, factory=factory)
+    except stream_session.StreamRefused as exc:
+        code, key_code = exc.code, exc.key_code
+    if session is None:
+        return stream_refusal(code or "internal", key_code, provider=provider, last_read=last_read)
+    last_read[provider] = None
+    return _json(200, {"sid": session.sid})
+
+
+def stream_chunk(registry: stream_session.StreamRegistry, query: str, owner: str, pcm: bytes) -> Answer:
+    """``POST /cockpit/voice/stream/chunk?sid=&seq=``: ``{"seq", "partial", "final"}`` for the next PCM chunk."""
+    got = _stream_query(query, ("sid", "seq"))
+    sid = _stream_sid(got) if got is not None else None
+    if got is None or sid is None:
+        return stream_refusal("unknown_session")
+    raw_seq = got["seq"]
+    if not (raw_seq.isascii() and raw_seq.isdigit() and len(raw_seq) <= 9):
+        return stream_refusal("bad_sequence")
+    seq = int(raw_seq)
+    code, update = "", None
+    try:
+        update = registry.get(sid, owner).feed(seq, pcm)
+    except stream_session.StreamRefused as exc:
+        code = exc.code
+    if update is None:
+        return stream_refusal(code or "internal")
+    return _json(200, {"seq": seq, "partial": update.partial, "final": update.final})
+
+
+def stream_close(registry: stream_session.StreamRegistry, query: str, owner: str) -> Answer:
+    """``POST /cockpit/voice/stream/close?sid=``: ``{"text": ...}``, the session's final text; it is collected."""
+    got = _stream_query(query, ("sid",))
+    sid = _stream_sid(got) if got is not None else None
+    if got is None or sid is None:
+        return stream_refusal("unknown_session")
+    code, text = "", None
+    try:
+        text = registry.get(sid, owner).close()
+    except stream_session.StreamRefused as exc:
+        code = exc.code
+    if text is None:
+        return stream_refusal(code or "internal")
     return _json(200, {"text": text if isinstance(text, str) else ""})

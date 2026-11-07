@@ -308,6 +308,7 @@ if _SHEET_CSP == _CSP:     # pragma: no cover - a reworded policy must not leave
 # The cockpit page that shows the sheet over itself may frame its own origin (default-src 'none' refuses any frame);
 # it stays unframable itself.
 _COCKPIT_PAGE = "/"
+_PERMISSIONS_POLICY = "microphone=(self)"
 if "frame-src" in _CSP:     # pragma: no cover - the cockpit page's frame-src is appended once, never beside another
     raise ImportError("levain.web_server: the shared CSP already names a frame-src")
 _COCKPIT_PAGE_CSP = _CSP + "; frame-src 'self'"
@@ -1445,7 +1446,7 @@ _RESERVED_PATHS: frozenset[str] = frozenset(_ASSETS) | {
     "/cockpit/manifest.json", "/cockpit/freshness.json", EVENTS_PATH, _COCKPIT_VERB_PATH, _SIGN_LIST_PATH,
     _BAND_PATH, _GRANT_LIST_PATH, cockpit_threads.THREADS_LIST_PATH, cockpit_room.ROOM_PATH, _COORD_LIST, _COORD_SHEET,
     cockpit_board.BOARD_PATH, _DISPATCH_LIST, _KEY_LINE_ROUTE, _DESK_ANSWER_ROUTE, _DESK_TEXT_ROUTE,
-    cockpit_voice.VOICE_JSON, *cockpit_voice.VOICE_PATHS,
+    cockpit_voice.VOICE_JSON, *cockpit_voice.VOICE_PATHS, *cockpit_voice.STREAM_PATHS,
     _PAIR_OFFER, _PAIR_REVOKE, _PAIR_REVOKE_PREVIEW, _PAIR_LIST, _PAIR_CLAIM,
     _NOTIFY_PATH,
 } | frozenset(_CHAT_GET_ROUTES) | frozenset(_CHAT_POST_ROUTES) | _push_static()
@@ -1919,6 +1920,17 @@ class _LevainHTTPServer(ThreadingHTTPServer):
     # premium dictation (the transcribe route) is OFF unless the server was built with ``premium_stt=True`` (``levain
     # serve --premium-stt``); off, the route refuses before it reads a key, a meter row or a body byte
     premium_stt: bool = False
+    # live dictation (cockpit mic S3), only with premium_stt: the registry of streams, built on the first stream request
+    # under voice_stream_lock, and the reaper thread that ends idle ones every voice_reap_interval seconds. A test sets
+    # voice_stream_factory (a fake provider stream; None is the Deepgram adapter) and voice_stream_kwargs (the registry's
+    # limits) before the first request. server_close stops the reaper and shuts the registry (settling every stream).
+    voice_streams: "Any" = None
+    voice_stream_lock: "threading.Lock | None" = None
+    voice_stream_factory: "Any" = None
+    voice_stream_kwargs: "dict[str, Any] | None" = None
+    voice_reap_interval: float = 5.0
+    voice_reaper: "threading.Thread | None" = None
+    voice_reaper_stop: "threading.Event | None" = None
     # the dispatch family's sign, cancel and authorise (OS-2), built by make_server beside the Signer; None serves no
     # dispatch signing route
     dispatch_sheet: "DispatchSheet | None" = None
@@ -2014,6 +2026,7 @@ class _LevainHTTPServer(ThreadingHTTPServer):
             withdraw_origin(*self.published_origin)
             self.published_origin = None
         self.stream_stop.set()      # open streams end first: nothing is left holding a thread
+        self._close_voice_streams()
         self.stream_watcher.stop()
         if self.room_serve is not None:
             # the pump and the room's child end. stop() waits for a send in flight (an open can take the launcher's
@@ -2027,6 +2040,49 @@ class _LevainHTTPServer(ThreadingHTTPServer):
         if self.cockpit is not None:
             self.cockpit.stop()
         super().server_close()
+
+    def _voice_stream_registry(self, meter: Any) -> Any:
+        """The live-dictation registry over ``meter``, built once (with its reaper thread) on the first stream request."""
+        from levain.voice import stream_session
+
+        lock = self.voice_stream_lock
+        if lock is None:
+            raise RuntimeError("no voice stream lock")
+        with lock:
+            if self.voice_streams is None:
+                registry = stream_session.StreamRegistry(meter, max_sessions=cockpit_voice.STREAM_MAX_SESSIONS,
+                                                         **(self.voice_stream_kwargs or {}))
+                stop = threading.Event()
+                thread = threading.Thread(target=self._voice_reap_loop, args=(registry, stop), daemon=True,
+                                          name="levain-voice-reaper")
+                self.voice_streams, self.voice_reaper_stop, self.voice_reaper = registry, stop, thread
+                thread.start()
+            return self.voice_streams
+
+    def _voice_reap_loop(self, registry: Any, stop: threading.Event) -> None:
+        while not stop.wait(self.voice_reap_interval):
+            try:
+                registry.reap()
+            except Exception as exc:     # noqa: BLE001 - the timer must outlive one bad pass; the type name only
+                _log.warning("voice: the stream reaper failed (%s)", type(exc).__name__)
+
+    def _close_voice_streams(self) -> None:
+        """Stop the reaper, then end every stream (each settles its meter row). Nothing raised here may stop the rest of
+        server_close."""
+        lock = self.voice_stream_lock
+        if lock is None:
+            return
+        with lock:
+            registry, stop, thread = self.voice_streams, self.voice_reaper_stop, self.voice_reaper
+        if stop is not None:
+            stop.set()
+        if thread is not None and thread is not threading.current_thread():
+            thread.join(timeout=10)
+        if registry is not None:
+            try:
+                registry.shutdown()
+            except Exception as exc:     # noqa: BLE001
+                _log.warning("voice: the stream registry did not shut down cleanly (%s)", type(exc).__name__)
 
     def handle_error(self, request: Any, client_address: Any) -> None:
         """Swallow the benign client-disconnect family instead of dumping a traceback.
@@ -3773,7 +3829,8 @@ class _Handler(GuardedHandler):
         failed = None
         got: "cockpit_voice.Answer | None" = None
         try:
-            got = self._voice_answer(route)
+            got = (self._voice_stream_answer(route) if route in cockpit_voice.STREAM_PATHS
+                   else self._voice_answer(route))
         except _CredentialUnavailable:   # RU-5: only the outer catch answers it
             raise
         except Exception as exc:  # noqa: BLE001 - see the docstring
@@ -3853,6 +3910,64 @@ class _Handler(GuardedHandler):
             return cockpit_voice.transcribe(data_root, query, self.headers.get("Content-Type", ""), raw, **common)
         finally:
             srv.voice_gate.release()
+
+    def _voice_stream_answer(self, route: str) -> "cockpit_voice.Answer | None":
+        """The live-dictation POST gates, in transcribe's order (a room host and a broker, a surface token on every bind, a
+        named owner, then the premium-dictation switch: off is a 404 in fixed words before a length, a body, the meter or
+        a key is looked at). Open and close carry no body (a declared length of 0); a chunk is ``application/octet-stream``
+        of at most :data:`cockpit_voice.STREAM_CHUNK_MAX` bytes, read under a short deadline. Chunks bypass ``voice_gate``
+        (cheap, bounded, owned by a session the registry already capped at one); open and close run the revoke check and
+        the key read in :func:`cockpit_voice.stream_open`. Every request first reaps (the server's timer is the other
+        reaper)."""
+        srv = self.server
+        directory = self._store_directory()
+        if srv.room_host is None or srv.broker is None or directory is None or srv.voice_stream_lock is None:
+            self._reject(404, "not_found", "no such route")
+            return None
+        if not self._off_box_token_valid():
+            self._token_403("credential_required")
+            return None
+        owner = self._thread_owner()
+        if owner is None:
+            self._reject(403, "forbidden", cockpit_voice.WORDS["no_owner"])
+            return None
+        if not srv.premium_stt:
+            self._reject(404, "not_found", cockpit_voice.WORDS["premium_stt_off"])
+            return None
+        chunk = route == cockpit_voice.STREAM_CHUNK
+        if chunk and cockpit_voice.base_type(self.headers.get("Content-Type")) != cockpit_voice.STREAM_CHUNK_TYPE:
+            self._reject(415, "unsupported_media_type", cockpit_voice.WORDS["stream_media_type"])
+            return None
+        clen = self._declared_length()
+        if clen is None:
+            return None
+        if clen > (cockpit_voice.STREAM_CHUNK_MAX if chunk else 0):
+            self._reject(413, "too_large", cockpit_voice.WORDS["too_long"])
+            return None
+        registry = srv._voice_stream_registry(self._voice_meter(directory))
+        registry.reap()
+        pcm = b""
+        if chunk:
+            body = self._read_body(clen, cockpit_voice.STREAM_BODY_DEADLINE_S)
+            if body is None:
+                return None
+            if len(body) != clen:     # the client closed early: a cut-off chunk is never fed
+                self.close_connection = True
+                return None
+            pcm = body
+        query = self.path.split("?", 1)[1] if "?" in self.path else ""
+        data_root = srv.broker.data_root
+        if route == cockpit_voice.STREAM_OPEN:
+            from levain.voice import deepgram_stream
+
+            return cockpit_voice.stream_open(
+                registry, data_root, query, owner,
+                revoke_queue=srv.grant_phone.queue_dir if srv.grant_phone is not None else None,
+                read_key=voice_custody.read_key, factory=srv.voice_stream_factory or deepgram_stream.factory,
+                last_read=srv.voice_last_read if srv.voice_last_read is not None else {})
+        if chunk:
+            return cockpit_voice.stream_chunk(registry, query, owner, pcm)
+        return cockpit_voice.stream_close(registry, query, owner)
 
     def _serve_threads(self, path: str, *, head: bool) -> None:
         """``GET /cockpit/threads.json`` and ``GET /cockpit/thread/<th-id>.json`` (CH-U1a): the coordinator's threads and
@@ -4465,8 +4580,10 @@ class _Handler(GuardedHandler):
                 self._send(b"not found\n", "text/plain; charset=utf-8", status=404, head=head)
                 return
             if path == _COCKPIT_PAGE:
+                # Permissions-Policy pins the intent that the cockpit page may use the microphone (live dictation, S3)
+                # and no embedded frame may: the default already allows self, so this line only stops it drifting
                 self._send_framing((_COCKPIT_PAGE_CSP, "DENY"), self.server.levain_assets[filename], content_type,
-                                   head=head)
+                                   head=head, headers=[("Permissions-Policy", _PERMISSIONS_POLICY)])
             else:
                 self._send(self.server.levain_assets[filename], content_type, head=head)
             return
@@ -4586,7 +4703,7 @@ class _Handler(GuardedHandler):
         # generic path refuses any body that is not JSON (a transcribe upload is audio) and reads the body inside
         # request_gate, which a voice call must never hold; _voice_post runs the gates it skips, in the order of the
         # design's section 2 (DESIGN_voice_v14.md), with the same status codes.
-        if route in cockpit_voice.VOICE_PATHS:
+        if route in cockpit_voice.VOICE_PATHS or route in cockpit_voice.STREAM_PATHS:
             return self._voice_post(route)
         # PAIR (RP-4): the claim is the one credential-less POST, carved out by exact path BEFORE the token gates (on
         # his proxied path every POST would otherwise need a token it cannot have yet); the live code is its
@@ -5558,6 +5675,7 @@ def make_server(
     httpd.voice_gate = threading.BoundedSemaphore(cockpit_voice.VOICE_INFLIGHT)
     httpd.voice_transport = voice_providers.urllib_transport
     httpd.voice_last_read = {}
+    httpd.voice_stream_lock = threading.Lock()
     httpd.premium_stt = premium_stt is True       # off unless the caller says True outright
     from levain.webpush.presence_tokens import RateLimit as _PresenceRate
 
