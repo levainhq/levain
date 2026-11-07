@@ -1,0 +1,4 @@
+# L3 log, voice fixes (seat levain 58, 11-07)
+- r1 (a3d659ef, mesh complement/codex/deepseek-openrouter/gemini, 4 lineages): HIGH 0. CRITICAL regression found by L1 and codex, fixed in fc4ba1d8: transcribe()/_query_provider tuple shape (my edit leaked into them; suite caught it: 5 failures, then 158 pass). MEDs: sample on_device fallback, label vs guard, stale-run rechecks: fixed in fc4ba1d8.
+- r2 --verify --final (fc4ba1d8, same 4 lineages): HIGH 0, regressions 0. Two LOW (label order vs sample(), note repaint during playback): fixed in the last commit (9cde0a6e), covered by test_voice_player_* and test_devices_panel_tabs (46 pass), full voice suites 158 pass on fc4ba1d8. One LOW known edge: coarse-pointer + hardware keyboard loses focus after a change (CHANGELOG).
+- The last commit (9cde0a6e) was not re-reviewed by the mesh: label/guard order and an onChange repaint only.
