@@ -15,7 +15,7 @@ No identifier, file, JSON key or CLI flag was renamed.
 
 ## What changed (H and P), by surface
 
-- README.md: heading and section 481-508 (the wakes/replies/ladder section) H -> desk; command table rows
+- README.md: heading and section "The desk: wakes, replies and the ladder" (the wakes/replies/ladder section) H -> desk; command table rows
   `levain drop`, `levain drops`, `levain envelope` H -> desk; P edits ("at the desk" -> "at the laptop").
   Left M: `coordinator role`, `coordinator launch`, `coordinator lease`, `coordinator:` status line, source paths, `levain coord`.
 - docs/: `cockpit-contract.md` (3 hits) and `contracts.md` (2 paths) are all M (the ready queue's six columns, the board's
@@ -42,10 +42,10 @@ web_server.py and the matching tests, where they quoted a renamed string.
 
 - `desk` in the presence code (`webpush/desk.py`, "desk message", "desk presence"): identifiers and docstrings, unchanged. Its user
   text ("a message you typed to a desk session") now reads "a message you typed into a session at the laptop".
-- `consent/terminal_sign.py:1473` "a desk-namespace signature on an answer that was not made at the desk" and
-  `desk_click.py:300` "cannot be signed at the desk yet": "desk" there may mean the seat's own click path, not the laptop; not changed.
-- Text that tells an answerer apart from the operator keeps "coordinator": `consent/band.py` `know_line` ("the coordinator, not
-  the operator, answered"), since "desk" is the seat where the operator meets Levain. The coordinator's handoff help
+- `consent/terminal_sign.py` "a desk-namespace signature on an answer that was not made at the desk" and
+  `desk_click.py` "cannot be signed at the desk yet": "desk" there may mean the seat's own click path, not the laptop; not changed.
+- The one line that quotes the recorded answerer keeps "coordinator": `consent/band.py` `know_line` ("the coordinator, not
+  the operator, answered"), since it echoes the record value `by: coordinator`; summaries elsewhere (first_reader, team draft) say "the desk". The coordinator's handoff help
   ("Read the handoffs coordinators left", "the next coordinator") stays too: a handoff is a record.
 - In the README, "the desk" is the session holding the coordinator role, the one the cockpit labels Desk (README
   "The desk: wakes, replies and the ladder"). Where text means "the session you typed into", it says "a session at the laptop".

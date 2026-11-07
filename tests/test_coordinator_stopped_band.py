@@ -98,7 +98,7 @@ def test_stop_and_hold_close_the_item_with_text_naming_the_verb(store, qdir, fak
     (done,) = _all(qdir)
     assert done.id == q.id and (done.answer.kind, done.answer.channel) == ("text", "cockpit")
     assert done.answer.value == f"{word} pressed on the cockpit's Desk panel"
-    assert "The coordinator stopped" not in band_view.render(QuestionStore(qdir))
+    assert "The desk stopped" not in band_view.render(QuestionStore(qdir))
 
 
 def test_start_closes_it_when_the_start_goes_through(store, qdir, fake, live_hook, clock):

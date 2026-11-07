@@ -27,7 +27,7 @@ MECHANISM = [
     r"<levain home>/coordinator", r"coordinator runs", r"Codex coordinator", r"writing as coordinator",
     r"coordinator's own mode", r"handoffs coordinators left",
 ]
-PHYSICAL = re.compile(r"\b(?:at|from) (?:the|your) desk\b", re.I)
+PHYSICAL = re.compile(r"\b(?:(?:at|from) (?:the|your)|wait for (?:the|your)) desk\b", re.I)
 
 
 def _stripped(text: str) -> str:

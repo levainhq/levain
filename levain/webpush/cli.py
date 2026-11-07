@@ -87,7 +87,7 @@ def register(subparsers) -> None:
 
     dv = common(sub.add_parser(
         "devices", help="Whether pings reach your devices: on, off, or follow where you are (operator only).",
-        description="Devices on: pings reach your phone and cockpit. Off: they wait for the desk. Follow (the standing default): "
+        description="Devices on: pings reach your phone and cockpit. Off: they wait for you at the laptop. Follow (the standing default): "
                     "they reach your devices once you have not typed a message into a session at the laptop for `--after` (default 10 min; input at this Mac never counts), or when "
                     "you are on a remote terminal. With neither --for nor --until-input the setting becomes your standing "
                     "default; with one of them it holds only that long and your standing default returns."))
