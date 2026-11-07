@@ -8,8 +8,9 @@ This page covers three things that keep a terminal seat inside those two directo
 2. the **canary**: `levain seat canary`, a behavioural test of whether the profile holds on your machine;
 3. **seat egress**: `levain seat egress ...`, the one signed permission that lets a seat's commits reach one branch of one remote.
 
-Everything here is inert until you sign a grant and a seat is launched under the profile. Nothing on this page
-starts a seat. Launching and stopping a seat are documented when they land.
+Everything here is inert until you sign a grant and a seat is launched under the profile. `levain seat launch`
+(without `--dry-run`) is what starts a seat, and `levain seat stop` is what stops one; both are described under
+"Launch and stop" below. Nothing else on this page starts a seat.
 
 Every claim below can be re-derived from the code. `tests/test_docs_seat_profile.py` checks the commands, flags,
 tool set, protected names, probe ids and limits named on this page against the code, and fails when one drifts.
@@ -232,11 +233,23 @@ is recorded and retried at the next `Stop`.
 ## The seat-root lease
 
 Seat egress sits on the seat-root lease (`levain seat lease`, with `create`, `renew`, `revoke` and `list`): a signed, 14-day, revocable
-permission to make lanes and RETURN directories under two parent directories. The lease and `levain seat launch`
-are documented when launching lands.
+permission to make lanes and RETURN directories under two parent directories. `levain seat launch` needs a live
+lease and refuses without one; it never falls back to a prompt.
 
 ## Launch and stop
 
-`levain seat launch` exists today and stops short of a seat: it clones the lane and makes its RETURN directory under
-the live lease, validates the launch and prints the command and digest it would use. It does not start Claude Code. Starting and stopping a seat are documented here
-when the launcher lands.
+`levain seat launch <lane> --remote <source> --base <commit>` mints the lane's roots under the live lease (a clone at
+the full commit id, and its RETURN directory), builds the profile, and starts Claude Code in the clone. The seat runs
+headless (`claude -p`, with no terminal), so `--prompt` is required. It runs in its own session and process group with
+the profile's environment, stdin closed, and stdout and stderr written to `seat-launch.log` in the RETURN directory.
+The launcher records the seat's pid, process group and start time in the signed mint log, then prints `seat launched`
+with the pid, pgid, clone, RETURN directory, log, profile digest and the `levain seat stop` command. Any failure before
+the seat is released kills its group and removes the roots that launch made; the mint row stays as the audit trail.
+
+`levain seat launch ... --dry-run` only validates and prints the argv. It mints nothing and does not start Claude Code.
+
+`levain seat stop <lane>` stops that lane's seat: it finds the newest start row for the lane in the mint log and signals
+the recorded process group (SIGTERM, then SIGKILL after `--grace` seconds, default 10). It signals only if the pid
+still has the start time the row recorded, so a reused pid is never signalled. A seat that is already gone is reported
+as gone, not as a failure. A launch with `--tools` takes a subset a failed canary named. Revoking the egress grant
+also stops the seats launched under it.

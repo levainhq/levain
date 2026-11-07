@@ -428,7 +428,7 @@ def test_fix1_a_cli_launch_with_no_prompt_refuses_naming_it_and_mints_nothing(se
     assert cli._cmd_seat_launch(_ns(rig, seats, "lane-np", prompt=None), rig.world.root) == 1
     assert "--prompt" in capsys.readouterr().err
     assert _rows(rig) == [] and not (rig.lanes / "lane-np").exists() and not seats.rec.exists()
-    # --headless is an accepted no-op: the launch is headless either way
+    # the headless flag is an accepted no-op: the launch is headless either way
     assert cli._cmd_seat_launch(_ns(rig, seats, "lane-hl", headless=True), rig.world.root) == 0
     seats.started.append({"pgid": int(seats.recorded("pid"))})
     assert seats.recorded("argv").splitlines()[0] == "-p"

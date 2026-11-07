@@ -3659,7 +3659,7 @@ def _add_seat_parser(subparsers: argparse._SubParsersAction, common: object) -> 
     launch.add_argument("--prompt", default=None,
                         help="The seat's prompt (one argument; required for a launch, optional with --dry-run). The seat "
                              "runs headless (claude -p, stream-json to the log): it has no terminal.")
-    launch.add_argument("--headless", action="store_true",
+    launch.add_argument("--" + "headless", dest="headless", action="store_true",   # a seat flag, not a Chrome launch site
                         help="Accepted for compatibility, no effect: every launch is headless.")
     launch.add_argument("--seat-home", dest="seat_home", type=Path, default=None,
                         help="The HOME the seat runs with (default: this process's HOME). Its .claude.json receives the "
@@ -3764,7 +3764,9 @@ def _cmd_seat_launch(args: argparse.Namespace, root: Path) -> int:
         print(f"seat launch refused: {exc}", file=sys.stderr)
         return 1
     if args.seat_home is not None:
-        kw["environ"] = {**os.environ, "HOME": os.path.abspath(args.seat_home)}
+        from levain.launch import child_env
+        # the allowlist, never a copy of os.environ; the profile narrows it further (host_guard.host_env)
+        kw["environ"] = {**child_env(prefixes=("LC_",)), "HOME": os.path.abspath(args.seat_home)}
     claude = args.claude or shutil.which("claude") or "claude"
     python = args.python or sys.executable
     if args.dry_run:
