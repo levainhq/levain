@@ -1,7 +1,9 @@
 """The user-facing naming: "desk" is the word for the seat where the operator meets Levain, "coordinator" is the
 mechanism's name (store, lease, launch, record, workspace, role). "At the desk" for being physically present is
 "at the laptop". The table that classed each phrase is project_memory/1107-26-naming/NAMING_TABLE.md; this test holds
-the README, docs/, the main parser's help text and the cockpit's visible strings to it."""
+the README (both words), docs/ ("at/from the desk" only), the main parser's help text (both words) and the double- and
+single-quoted literals with a space in every .js/.html under levain/templates/web (both words) to it. Strings the CLI
+prints and the band's text are not scanned."""
 import argparse
 import re
 from pathlib import Path
@@ -23,7 +25,7 @@ MECHANISM = [
     r"coordinator runs in", r"coordinator whose", r"no live coordinator", r"coordinator live", r"coordinator \(needs",
     r"a coordinator thread", r"next coordinator", r"fresh coordinator", r"live coordinator lease",
     r"<levain home>/coordinator", r"coordinator runs", r"Codex coordinator", r"writing as coordinator",
-    r"coordinator's own mode",
+    r"coordinator's own mode", r"handoffs coordinators left",
 ]
 PHYSICAL = re.compile(r"\b(?:at|from) (?:the|your) desk\b", re.I)
 
@@ -45,7 +47,9 @@ def test_readme_says_desk_for_the_seat_and_laptop_for_presence():
 
 
 def test_docs_say_laptop_for_presence():
-    for path in sorted((ROOT / "docs").rglob("*.md")):
+    paths = sorted((ROOT / "docs").rglob("*.md"))
+    assert paths
+    for path in paths:
         found = PHYSICAL.findall(path.read_text())
         assert not found, (path.name, found)
 
@@ -77,16 +81,20 @@ def test_cli_help_says_desk_for_the_seat_and_laptop_for_presence():
         assert not _seat_hits(t), (_seat_hits(t), t[:120])
 
 
+def _literals(line: str):
+    return [a or b for a, b in re.findall(r'"([^"\\]*(?:\\.[^"\\]*)*)"|\'([^\'\\]*(?:\\.[^\'\\]*)*)\'', line)]
+
+
 def test_cockpit_visible_strings_say_desk_for_the_seat():
     web = ROOT / "levain" / "templates" / "web"
     bad = []
-    for path in sorted(web.iterdir()):
+    for path in sorted(web.rglob("*")):
         if path.suffix not in (".js", ".html"):
             continue
         for n, line in enumerate(path.read_text().splitlines(), 1):
             if re.match(r"\s*(//|/\*|\*|<!--)", line):
                 continue
-            for lit in re.findall(r'"([^"\\]*(?:\\.[^"\\]*)*)"', line):
+            for lit in _literals(re.sub(r"\s//\s.*$", "", line)):   # a trailing comment is not a string
                 if " " not in lit.strip():
                     continue
                 if PHYSICAL.search(lit) or _seat_hits(lit):

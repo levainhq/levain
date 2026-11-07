@@ -183,7 +183,7 @@ def question_context(directory: Path | str, agent: str, session: str | None) -> 
 def know_line(question: Question, body: dict[str, Any]) -> str:
     """The fixed text one coordinator KNOW is delivered as (C5): it names the COORDINATOR as the one who answered, on
     its own reading, never the operator, and the value arrives quoted or escaped exactly as an answer's does."""
-    head = (f"levain: the desk, not the operator, answered question #{question.n} {_quoted(question.what)} "
+    head = (f"levain: the coordinator, not the operator, answered question #{question.n} {_quoted(question.what)} "
             "on its own reading")
     if body.get("kind") == "option":
         key = str(body.get("value", ""))
@@ -653,7 +653,7 @@ def file_coordinator_stopped(qdir: Path | str, agent: str, why: str, episode: st
         text = _plain_line(why)
         q, filed = QuestionStore(qdir).file_once(
             agent=agent, key=f"{COORDINATOR_STOPPED_KEY}:{episode}",
-            what="The coordinator stopped after three deaths in a row; nothing launches until you act on the "
+            what="The desk stopped after three deaths in a row; nothing launches until you act on the "
                  "Desk panel.",
             options=list(_STOPPED_OPTIONS), rec="seen",
             blocks=f"every new coordinator launch, until you press Stop or Hold on the cockpit's Desk "

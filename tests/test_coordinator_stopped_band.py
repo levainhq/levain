@@ -54,7 +54,7 @@ def test_three_deaths_file_exactly_one_open_item_with_the_point_and_the_why(stor
     _deaths(store, fake, clock, 1)
     (q,) = _open(qdir)
     why = _panel_state(store, clock)[1]
-    assert len(q.what.splitlines()[0]) < 120 and q.what.startswith("The coordinator stopped after three deaths")
+    assert len(q.what.splitlines()[0]) < 120 and q.what.startswith("The desk stopped after three deaths")
     assert "nothing launches until you act on the Desk panel" in q.what
     assert why in q.blocks and q.agent == "claude_code"
     assert "Stop or Hold on the cockpit's Desk panel" in q.blocks
@@ -67,7 +67,7 @@ def test_three_deaths_file_exactly_one_open_item_with_the_point_and_the_why(stor
 def test_a_further_pass_files_no_second_item_and_the_number_is_unchanged(store, qdir, fake, live_hook, clock):
     (first,) = _stopped(store, fake, clock, qdir)
     qs = QuestionStore(qdir)
-    assert "The coordinator stopped after three deaths" in band_view.render(qs)
+    assert "The desk stopped after three deaths" in band_view.render(qs)
     n_band = band_view._number(qs, [first.id], time.monotonic() + 5)[first.id]
     episode = first.agent_session_id.split(":", 1)[1]
     for _ in range(2):
@@ -77,14 +77,14 @@ def test_a_further_pass_files_no_second_item_and_the_number_is_unchanged(store, 
     (again,) = _all(qdir)
     assert (again.id, again.n) == (first.id, first.n) and again.answer is None
     assert band_view._number(qs, [first.id], time.monotonic() + 5)[first.id] == n_band
-    assert band_view.render(qs).count("The coordinator stopped") == 1
+    assert band_view.render(qs).count("The desk stopped") == 1
 
 
 def test_the_item_is_an_ordinary_numbered_open_item_in_the_band_view(store, qdir, fake, live_hook, clock, capsys):
     _stopped(store, fake, clock, qdir)
     assert band_view.run_band(argparse.Namespace(queue_dir=qdir)) == 0
     out = capsys.readouterr().out
-    assert out.startswith("NEEDS YOU") and "1. [" in out and "The coordinator stopped after three deaths" in out
+    assert out.startswith("NEEDS YOU") and "1. [" in out and "The desk stopped after three deaths" in out
     assert "Seen: I will press Stop or Hold" in out
     con = sqlite3.connect(qdir / "questions.db")
     assert con.execute("SELECT n, source FROM band_items").fetchall() == [(1, "question")]

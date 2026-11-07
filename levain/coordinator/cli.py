@@ -2240,7 +2240,7 @@ def add_parsers(subparsers: argparse._SubParsersAction) -> None:
     caw.add_argument("drop_id", metavar="DROP", help="The drop whose words say he is away.")
     caw.add_argument("--token", type=int, required=True, help="Your coordinator lease token.")
     ccl = c_sub.add_parser(
-        "close", help="Leave a handoff for the next desk (a rotation, the operator leaving, a dream).",
+        "close", help="Leave a handoff for the next coordinator (a rotation, the operator leaving, a dream).",
         description="Appends one seam handoff from a JSON body file with every key (state_line, in_flight, next, "
                     "contingencies, notes, attested_operator_present, attested_walked; an empty list is []). A retry "
                     "with the same --request-id returns the same handoff. Names the latest handoff you saw as "
@@ -2316,7 +2316,7 @@ def add_parsers(subparsers: argparse._SubParsersAction) -> None:
             rdw.add_argument("--repo", required=True, help="The item's repo (fixed at add).")
         ready_leaves.append(rdw)
         door_ok(rdw)      # add, move and correct are the coordinator's write: refused without the live lease token
-    chn = c_sub.add_parser("handoff", help="Read the handoffs desks left.")
+    chn = c_sub.add_parser("handoff", help="Read the handoffs coordinators left.")
     chn_sub = chn.add_subparsers(dest="handoff_cmd", required=True)
     chs = chn_sub.add_parser("show", help="The latest handoff, or the one named.",
                              description="Prints the latest handoff, or the one named. A handoff names rows by "
