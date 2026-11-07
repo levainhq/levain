@@ -4377,7 +4377,10 @@
       const audit = row.querySelector(".consent-audit");
       if (audit) audit.textContent = egress ? egress.label : sv(b.audit);
     }
-    if (pending) {
+    // The terminal copy lines were the Q6a answer route while the cockpit was read-only; a passkey answer (Q6b) replaced them.
+    // They stay only where no passkey answers here: the sheet is absent, or open only to say why no passkey answers (no choices).
+    const passkeyAnswers = b.sheet === true && Array.isArray(b.sheet_choices) && b.sheet_choices.length > 0;
+    if (pending && !passkeyAnswers) {
       for (const [label, cmd] of [["allow", sv(b.answer_allow)], ["deny", sv(b.answer_deny)]]) {
         if (!cmd) continue;
         const line = el("div", "consent-cmd");
