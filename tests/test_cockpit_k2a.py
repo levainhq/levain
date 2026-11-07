@@ -156,7 +156,7 @@ T2_T3_EDIT_BODIES = {
     "entity_name": {"kind": "entity_name", "value": "n", "expected": None},
     "state": {"kind": "state", "heading": "State", "expected_body": "", "new_body": "y"},
     "spore_seed": {"kind": "spore_seed", "text": "planted"},
-    "spore_set_disposition": {"kind": "spore_set_disposition", "disposition": "note"},
+    "spore_set_disposition": {"kind": "spore_set_disposition", "disposition": "agenda"},
     "spore_ascend": {"kind": "spore_ascend", "spore_kind": "x", "ref": "r", "confirm": True},
     "spore_update_text": {"kind": "spore_update", "text": "new words"},
     "episode_tombstone": {"kind": "episode_tombstone", "episode_id": "e1", "confirm": True},
@@ -214,7 +214,7 @@ class TestCredentialAndTiers:
         """'no T2 or T3 ever fires from the POST handler (before K2b lands they are refused with
         "needs the broker")'"""
         before = rig.store.get(rig.ids["loop"])
-        cases = [("spore_set_disposition", "loops", "loop", {"disposition": "note"}),
+        cases = [("spore_set_disposition", "loops", "loop", {"disposition": "agenda"}),
                  ("spore_ascend", "loops", "loop", {"spore_kind": "x", "ref": "r"}),
                  ("spore_update", "loops", "loop", {"text": "new"}),
                  ("spore_seed", "tray", None, {"text": "planted"})]
@@ -995,7 +995,7 @@ class TestSporeCas:
         assert e.http_status == 409
 
     @pytest.mark.parametrize("req", [
-        {"kind": "spore_set_disposition", "disposition": "note", "confirm": True},
+        {"kind": "spore_set_disposition", "disposition": "agenda", "confirm": True},
         {"kind": "spore_ascend", "spore_kind": "done", "ref": "r", "confirm": True},
     ])
     def test_the_t2_spore_writes_are_guarded_too(self, rig: Rig, req: dict) -> None:
