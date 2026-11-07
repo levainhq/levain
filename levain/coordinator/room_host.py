@@ -32,6 +32,8 @@ import time
 from dataclasses import dataclass
 from typing import Any, NamedTuple, Optional
 
+from levain.launch import child_env
+
 __all__ = ["HOSTCMD_ENV", "NOT_STARTED", "OUTPUT_MAX", "TIMED_OUT", "TIMEOUT", "HostCommands", "HostCommandError",
            "RELAY_TOOL", "REPLIES_TOOL", "Ran", "THREAD_RE", "door_tools", "from_env", "run"]
 
@@ -184,7 +186,8 @@ def run(argv: tuple[str, ...], stdin_text: str = "", extra: tuple[str, ...] = ()
     at :data:`OUTPUT_MAX`."""
     try:
         proc = subprocess.Popen([*argv, *extra], stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                                shell=False, start_new_session=True)
+                                shell=False, start_new_session=True,
+                                env=child_env())    # the allowlist, never the whole parent environment (test_launch's invariant)
     except (OSError, ValueError) as exc:     # ValueError: an argument Popen will not pass (it never ran either way)
         return Ran(NOT_STARTED, f"the host command could not start ({type(exc).__name__})", False)
     out_b, err_b = bytearray(), bytearray()
