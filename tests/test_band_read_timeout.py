@@ -12,23 +12,34 @@ from tests.test_cockpit_k2a import _install, _serve
 from tests.test_cockpit_k4a_needs import DESKTOP
 from tests.test_cockpit_needs_item_link import READ, ROWS
 
-# every band read of the document never answers (the connection hangs; the request ends only when the page aborts it)
+# every band read of the document never answers (the connection hangs; the page never passes a signal, so the request simply stays pending)
 HANG_BAND = """(() => { const f = window.fetch; window.fetch = (...a) => {
   if (String(a[0]).indexOf('/cockpit/band.json') === 0) {
-    const sig = a[1] && a[1].signal;
-    return new Promise((_res, rej) => { if (sig) sig.addEventListener('abort', () => rej(new DOMException('aborted', 'AbortError'))); });
+    return new Promise(() => {});
   }
   return f.apply(window, a); }; })();"""
-WAIT = {"eval": "new Promise(r => setTimeout(() => r(1), 16000))"}
+WAIT = {"eval": "new Promise(r => setTimeout(() => r(1), 22000))"}
 
 
 @needs_browser
 def test_a_hung_band_read_falls_through_to_the_plain_needs_view_without_the_notice(tmp_path: Path, monkeypatch) -> None:
+    _run(tmp_path, monkeypatch, HANG_BAND)
+
+
+NO_ABORT = "window.AbortController = undefined;"
+
+
+@needs_browser
+def test_the_timeout_holds_in_a_runtime_without_abortcontroller(tmp_path: Path, monkeypatch) -> None:
+    _run(tmp_path, monkeypatch, NO_ABORT + HANG_BAND)
+
+
+def _run(tmp_path: Path, monkeypatch, init: str) -> None:
     _home, store = _two_questions(tmp_path, monkeypatch)
     qid = store.get(2).id               # the item's own id: no card number carries it, so only the band read can name the card
     _root, src, _ids = _install(tmp_path)
     go = {"eval": f"location.assign('/?view=needs&item={qid}#write_token=T'); 1"}
     with _serve(src, surface_tokens={"browser": "T"}, install_class="reported") as (url, _httpd):
-        out = _drive(tmp_path, f"{url}/#write_token=T", [{"init": HANG_BAND}, DESKTOP, go, {"until": ROWS, "ms": 40000}, WAIT, {"eval": READ}])["values"]
+        out = _drive(tmp_path, f"{url}/#write_token=T", [{"init": init}, DESKTOP, go, {"until": ROWS, "ms": 40000}, WAIT, {"eval": READ}])["values"]
     got = json.loads(out[-1])
     assert got["modal"] is False and got["search"] == "" and got["note"] == "" and got["y"] > 100, got
