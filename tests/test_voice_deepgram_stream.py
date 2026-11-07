@@ -14,7 +14,9 @@ import pytest
 
 try:                                                    # the head merges S1 first; until then a stand-in stands in
     import levain.voice.stream_session  # noqa: F401
-except ImportError:                                     # pragma: no cover - only in the S2b worktree before the merge
+except ModuleNotFoundError as _exc:                     # pragma: no cover - only in the S2b worktree before the merge
+    if _exc.name != "levain.voice.stream_session":      # a broken real module (or its imports) must fail loudly
+        raise
     _m = types.ModuleType("levain.voice.stream_session")
 
     class StreamNotStarted(Exception):
@@ -87,6 +89,26 @@ def read_text(peer):
             return data.decode()
         if op == 8:
             return None
+
+
+def collect(peer, out, until, stop_on_close=True):
+    """Server side: append every client frame as (op, data) to ``out`` until ``until`` (an Event) is set or the client
+    closes. Short socket timeouts only pace the loop; nothing is asserted on timing."""
+    peer.conn.settimeout(0.05)
+    while not until.is_set():
+        try:
+            fin, op, masked, data, key = peer.read_frame()
+        except (TimeoutError, OSError):
+            continue
+        except EOFError:
+            return
+        out.append((op, data))
+        if op == 8 and stop_on_close:
+            return
+
+
+def kinds(frames):
+    return [json.loads(d)["type"] if op == 1 else ("audio" if op == 2 else "close") for op, d in frames]
 
 
 def test_query_string_and_header(serve):
@@ -183,6 +205,8 @@ def test_close_keeps_unfinalised_partial_at_deadline(serve):
     s = open_stream(serve(script), close_drain=0.3)
     assert wait_for(lambda: s.poll().partial == "tail")
     assert s.close() == "said tail"
+    up = s.poll()                                 # the provider never confirmed the end: the text is kept, and so is
+    assert up.failed and s.reason == "incomplete"  # the fact that it may be short
 
 
 def test_provider_error_close_is_failed_with_fixed_reason(serve):
@@ -247,25 +271,28 @@ def test_normal_close_from_provider_before_we_ask_is_failed(serve):
     s.close()
 
 
-def test_keepalive_when_idle_and_bounded(serve):
-    msgs = []
+def test_keepalive_bounded_then_reset_by_audio_and_never_after_closestream(serve, monkeypatch):
+    monkeypatch.setattr(dg, "MAX_KEEPALIVES", 2)
+    frames, done = [], threading.Event()
 
     def script(p):
         p.handshake()
-        end = time.monotonic() + 1.6
-        p.conn.settimeout(0.3)
-        while time.monotonic() < end:
-            try:
-                msgs.append(read_text(p))
-            except OSError:
-                pass
+        collect(p, frames, done)
 
-    s = open_stream(serve(script), keepalive_after=0.2)
-    time.sleep(1.7)
+    srv = serve(script)
+    s = open_stream(srv, keepalive_after=0.1, tick=0.05, close_drain=0.3)
+    count = lambda: kinds(frames).count("KeepAlive")  # noqa: E731
+    assert wait_for(lambda: count() == 2)
+    time.sleep(0.5)                                # five more idle windows: the cap holds (an absence check; load can
+    assert count() == 2                            # only make it pass more easily, never fail it falsely)
+    s.send_audio(b"\x00\x00" * 10)                 # a successful audio send resets the run
+    assert wait_for(lambda: count() == 4)
     s.close()
-    kinds = [json.loads(m)["type"] for m in msgs if m]
-    assert kinds.count("KeepAlive") >= 2 and kinds.count("KeepAlive") <= dg.MAX_KEEPALIVES
-    assert set(kinds) <= {"KeepAlive", "CloseStream"}
+    done.set()
+    k = kinds(frames)
+    assert "CloseStream" in k
+    assert "KeepAlive" not in k[k.index("CloseStream"):]
+    assert set(k) <= {"KeepAlive", "CloseStream", "audio", "close"}
 
 
 def test_overlong_final_text_fails(serve, monkeypatch):
@@ -369,3 +396,227 @@ def test_factory_returns_stream_interface(monkeypatch):
     monkeypatch.setattr(dg, "DeepgramStream", Fake)
     sec = custody.Secret(KEY)
     assert isinstance(dg.factory(sec), Fake) and seen["secret"] is sec
+
+
+# --- L3 r1 fixes -------------------------------------------------------------------------------------------------------
+
+def test_partials_coalesce_and_never_fill_a_queue(serve):
+    """400 partials with nobody polling: only the newest is kept, nothing overflows (r1 #1)."""
+    sent = threading.Event()
+
+    def script(p):
+        p.handshake()
+        for i in range(400):
+            p.send(1, results(f"word {i}", False).encode())
+        p.send(1, results("done", True).encode())
+        p.send(1, results("tail", False).encode())
+        sent.set()
+        time.sleep(2.5)
+
+    s = open_stream(serve(script))
+    assert sent.wait(5)
+    time.sleep(1.3)                               # longer than any put timeout a bounded queue would block for
+    up = s.poll()
+    assert not up.failed and up.final == "done" and up.partial == "tail"
+    s.close()
+
+
+def test_oversized_partial_fails_and_is_not_kept(serve, monkeypatch):
+    monkeypatch.setattr(dg, "MAX_TEXT_CHARS", 20)
+
+    def script(p):
+        p.handshake()
+        p.send(1, results("ok", True).encode())
+        p.send(1, results("y" * 30, False).encode())
+        time.sleep(0.8)
+
+    s = open_stream(serve(script))
+    assert wait_for(lambda: s.poll().failed)
+    up = s.poll()
+    assert s.reason == "overflow" and up.partial == "" and up.final == "ok"
+    s.close()
+
+
+def test_finals_before_an_overflow_are_kept(serve, monkeypatch):
+    monkeypatch.setattr(dg, "MAX_TEXT_CHARS", 20)
+
+    def script(p):
+        p.handshake()
+        p.send(1, results("first", True).encode())
+        p.send(1, results("second", True).encode())
+        p.send(1, results("z" * 30, True).encode())
+        time.sleep(0.8)
+
+    s = open_stream(serve(script))
+    assert wait_for(lambda: s.poll().failed)
+    assert s.reason == "overflow"
+    assert s.close() == "first second"
+
+
+def test_socket_is_closed_only_after_the_reader_stopped(serve):
+    """wsclient.close() reads (and drops) frames it takes while the reader is between recv calls, so the stream must
+    stop its reader before closing the socket; a final that arrived before the drain deadline is in the text (r1 #2)."""
+    seen = {}
+
+    def script(p):
+        p.handshake()
+        read_text(p)                                    # CloseStream
+        p.send(1, results("last words", True).encode())  # no Metadata: the drain deadline ends it
+        time.sleep(2.0)
+
+    s = open_stream(serve(script), close_drain=0.4)
+    real = s._ws.close
+
+    def spy(*a, **kw):
+        seen["reader_alive"] = s._reader.is_alive()
+        return real(*a, **kw)
+
+    s._ws.close = spy
+    assert s.close() == "last words"
+    assert seen["reader_alive"] is False
+
+
+def test_reset_after_closestream_is_incomplete_not_success(serve):
+    def script(p):
+        p.handshake()
+        p.send(1, results("early", True).encode())
+        read_text(p)                                    # CloseStream
+        p.send(1, results("partly", True).encode())
+        p.conn.shutdown(2)                              # reset: no Metadata, no close frame
+
+    s = open_stream(serve(script))
+    assert wait_for(lambda: s.poll().final == "early")
+    text = s.close()
+    assert text == "early partly"
+    up = s.poll()
+    assert up.failed and s.reason == "incomplete"
+
+
+def test_stall_inside_the_closing_results_frame_is_incomplete_and_close_is_bounded(serve):
+    release = threading.Event()
+
+    def script(p):
+        p.handshake()
+        p.send(1, results("kept", True).encode())
+        read_text(p)                                    # CloseStream
+        p.raw(b"\x81\x7e\x01\x00" + b"{" * 10)          # a 256-byte text frame, 10 bytes of it, then nothing
+        release.wait(5)
+
+    tick, drain = 0.1, 0.4
+    s = open_stream(serve(script), close_drain=drain, tick=tick)
+    assert wait_for(lambda: s.poll().final == "kept")
+    t0 = time.monotonic()
+    text = s.close()
+    took = time.monotonic() - t0
+    release.set()
+    assert text == "kept" and s.poll().failed and s.reason == "incomplete"
+    assert took <= dg.close_bound(drain, tick) + 0.5
+
+
+def test_bad_chunk_is_refused_and_the_stream_lives(serve):
+    frames, done = [], threading.Event()
+
+    def script(p):
+        p.handshake()
+        collect(p, frames, done)
+
+    s = open_stream(serve(script))
+    for bad in (b"", b"\x00" * (dg.SEND_MAX + 1)):
+        with pytest.raises(dg.DeepgramStreamError) as e:
+            s.send_audio(bad)
+        assert e.value.code == "chunk"
+    assert not s.poll().failed
+    s.send_audio(b"\x02\x00" * 4)
+    assert wait_for(lambda: (2, b"\x02\x00" * 4) in frames)
+    s.close()
+    done.set()
+
+
+def test_concurrent_close_calls_return_the_same_full_text(serve):
+    def script(p):
+        p.handshake()
+        p.send(1, results("early", True).encode())
+        read_text(p)                                    # CloseStream
+        time.sleep(0.3)
+        p.send(1, results("late", True).encode())
+        p.send(1, METADATA.encode())
+        time.sleep(0.5)
+
+    s = open_stream(serve(script))
+    assert wait_for(lambda: s.poll().final == "early")
+    out = []
+    ts = [threading.Thread(target=lambda: out.append(s.close())) for _ in range(3)]
+    for t in ts:
+        t.start()
+    for t in ts:
+        t.join(10)
+    assert out == ["early late"] * 3
+    assert not s.poll().failed
+
+
+def test_send_audio_racing_close_never_sends_audio_after_closestream(serve):
+    frames, done = [], threading.Event()
+
+    def script(p):
+        p.handshake()
+        collect(p, frames, done, stop_on_close=True)
+
+    s = open_stream(serve(script), close_drain=0.3)
+    stop = threading.Event()
+    errors = []
+
+    def pump():
+        while not stop.is_set():
+            try:
+                s.send_audio(b"\x01\x00" * 160)
+            except dg.DeepgramStreamError as e:
+                errors.append(e.code)
+                return
+
+    t = threading.Thread(target=pump)
+    t.start()
+    assert wait_for(lambda: len(frames) > 20)
+    s.close()
+    stop.set()
+    t.join(5)
+    done.set()
+    k = kinds(frames)
+    assert "CloseStream" in k and "audio" not in k[k.index("CloseStream"):]
+    assert errors == ["closed"]
+
+
+def test_thread_start_failure_closes_the_socket(serve, monkeypatch):
+    seen = threading.Event()
+
+    def script(p):
+        p.handshake()
+        try:
+            p.read_frame()                              # a close frame or EOF: either way the client let go
+        except EOFError:
+            pass
+        seen.set()
+
+    srv = serve(script)
+
+    def boom(self):
+        raise RuntimeError("can't start new thread")
+
+    with monkeypatch.context() as m:
+        m.setattr(dg.threading.Thread, "start", boom)
+        with pytest.raises(dg.DeepgramStreamError) as e:
+            open_stream(srv)
+    assert e.value.code == "connect"
+    assert seen.wait(3)
+
+
+@pytest.mark.parametrize("code", ["timeout", "handshake", "closed"])
+def test_connect_phase_timeout_settles_one_unit(monkeypatch, code):
+    """wsclient reports a TCP-connect timeout and a post-request timeout with the same code, so a timeout is treated as
+    possibly started (DeepgramStreamError, one unit), never as StreamNotStarted (r1 #5, documented rule)."""
+    def fake(*a, **kw):
+        raise dg.wsclient.WsError(code)
+
+    monkeypatch.setattr(dg.wsclient, "connect", fake)
+    with pytest.raises(dg.DeepgramStreamError) as e:
+        dg.DeepgramStream(custody.Secret(KEY))
+    assert e.value.code == "connect" and not isinstance(e.value, StreamNotStarted)

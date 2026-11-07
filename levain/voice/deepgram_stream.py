@@ -9,16 +9,31 @@ Rules, in the order they matter:
 1. **The key is revealed once**, into the ``Authorization: Token`` header handed to ``wsclient.connect``, in a frame that
    lets go of it before returning. It is never an attribute of the stream, never in a ``repr``, never in an exception
    frame. :func:`factory` is what S3 passes to ``StreamRegistry.open``; it receives the Secret and calls ``reveal()``
-   inline.
-2. **One reader thread** is the only socket reader. It parses each message and puts a small tuple on a bounded queue;
-   :meth:`DeepgramStream.poll` (called by the session, under its lock) drains the queue into the text state and never
-   blocks. The same thread sends ``KeepAlive`` when the line has been idle, at most :data:`MAX_KEEPALIVES` times in a row.
-3. **Nothing from the provider is echoed.** Malformed JSON, an unexpected shape, a binary frame, an error message, a
-   close with a non-normal code, an over-long transcript or a full queue all end in ``failed=True`` with a fixed reason
-   code in :data:`WORDS`; no provider text reaches a log line, an exception or a reason.
-4. **close()** sends ``CloseStream``, waits for Deepgram's closing ``Metadata`` (or its close frame) up to
-   :data:`CLOSE_DRAIN_S`, folds what arrived, closes the socket, joins the reader and returns the text: every final plus
-   a partial that never got finalised (speech is not dropped because the deadline hit). Idempotent.
+   inline. ``StreamNotStarted`` means nothing could have reached Deepgram (a refused URL or header, or a refused TCP
+   connect); every other open failure is a :class:`DeepgramStreamError` and counts as started. wsclient reports a TCP
+   connect timeout and a timeout after the request went out with the same code, so a timeout counts as started: it
+   settles one unit, the conservative side.
+2. **One reader thread** is the only socket reader, start to end. It parses each message and folds it straight into the
+   text state under a short lock: a partial replaces the previous partial (only the newest is kept), a final is appended.
+   Both are bounded: the finals together by :data:`MAX_TEXT_CHARS`, a single partial by the same number; past either the
+   stream fails. Nothing is queued, so memory is bounded by text, not by message count. :meth:`DeepgramStream.poll` reads
+   the state and never blocks for longer than that fold. The reader wakes at least every ``tick`` seconds (the socket
+   idle timeout) and sends ``KeepAlive`` when no audio has gone out for ``keepalive_after``, at most
+   :data:`MAX_KEEPALIVES` in a row; a successful audio send resets the run.
+3. **One send discipline.** Every write (audio, KeepAlive, CloseStream) and the ``closing`` flip happen under one send
+   lock, so no audio and no KeepAlive goes out after CloseStream. An empty or over-:data:`SEND_MAX` chunk is refused with
+   ``code="chunk"`` and the stream lives on.
+4. **Nothing from the provider is echoed.** Malformed JSON, an unexpected shape, a binary frame, an error message, a
+   close with a non-normal code or an over-long transcript all end in ``failed=True`` with a fixed reason code in
+   :data:`WORDS`; no provider text reaches a log line, an exception or a reason.
+5. **close()** sends ``CloseStream`` and waits up to ``close_drain`` for Deepgram's closing ``Metadata`` or its normal
+   close frame (1000/1005): only those two are success. A reset, a stall inside a frame, a send that could not go out or
+   the deadline passing first leaves ``failed=True`` with reason ``incomplete``. Either way close() returns every final
+   plus a partial that never got finalised (speech is not dropped because the deadline hit); ``poll().failed`` says
+   whether the provider confirmed the end. wsclient already serialises socket reads (one receive lock), but its close()
+   reads, and drops, any frame it takes while the reader is between recv calls; so close() stops the reader first and
+   only then closes the socket. Concurrent and repeated calls return the same text. close() returns within
+   :func:`close_bound` seconds.
 
 Sources (read 2026-11-07): https://developers.deepgram.com/docs/lower-level-websockets (Results fields is_final /
 speech_final, channel.alternatives[].transcript; "no audio for roughly 10 seconds" ends the connection; KeepAlive is a
@@ -32,7 +47,6 @@ from __future__ import annotations
 
 import json
 import logging
-import queue
 import threading
 import time
 import urllib.parse
@@ -58,9 +72,10 @@ QUERY = (
 )
 KEEPALIVE_AFTER_S = 4.0         # idle this long (no audio sent) => KeepAlive; Deepgram drops the line near 10 s
 MAX_KEEPALIVES = 6              # in a row without audio; past it the line is left to lapse (the session's idle limit ends it)
+TICK_S = 1.0                    # the socket idle timeout: the reader wakes at least this often (also wsclient's mid-frame budget)
 CLOSE_DRAIN_S = 3.0
-QUEUE_MAX = 256
-MAX_TEXT_CHARS = 64 * 1024      # finals kept; past it the stream fails rather than grow
+CLOSE_WAIT_S = 0.5              # wsclient.close(): our close frame out, the peer's back
+MAX_TEXT_CHARS = 64 * 1024      # finals kept, and the longest single partial; past either the stream fails rather than grow
 SEND_MAX = 64 * 1024
 
 WORDS = {
@@ -71,7 +86,18 @@ WORDS = {
     "send": "The audio could not be sent to the voice provider.",
     "connect": "Levain could not open the voice provider's stream.",
     "closed": "That stream has ended.",
+    "chunk": "That audio chunk was empty or too large.",
+    "incomplete": "The voice provider's stream ended before it confirmed its last words.",
 }
+
+_KEEPALIVE = '{"type": "KeepAlive"}'
+_CLOSESTREAM = '{"type": "CloseStream"}'
+
+
+def close_bound(close_drain: float = CLOSE_DRAIN_S, tick: float = TICK_S) -> float:
+    """The longest close() takes: the send-lock wait, the drain, the reader's stop (one idle wait, or a started frame's
+    body budget plus wsclient's overrun of one more), the socket close and a last join."""
+    return 2 * tick + close_drain + (2 * tick + 0.5) + 2 * CLOSE_WAIT_S
 
 
 class DeepgramStreamError(Exception):
@@ -117,38 +143,53 @@ class DeepgramStream:
     """One live Deepgram stream. Build it with :func:`factory`; the secret is not kept."""
 
     def __init__(self, secret: Any, *, base_url: str = URL_BASE, connect_opts: dict[str, Any] | None = None,
-                 keepalive_after: float = KEEPALIVE_AFTER_S, close_drain: float = CLOSE_DRAIN_S) -> None:
+                 keepalive_after: float = KEEPALIVE_AFTER_S, close_drain: float = CLOSE_DRAIN_S,
+                 tick: float = TICK_S) -> None:
         self._keepalive_after = keepalive_after
         self._close_drain = close_drain
-        self._q: queue.Queue[tuple[str, str]] = queue.Queue(QUEUE_MAX)
+        self._tick = min(tick, keepalive_after)
         self._finals: list[str] = []
         self._partial = ""
         self._chars = 0
         self.reason = ""                      # a key of WORDS once failed, else ""
         self._failed = threading.Event()
-        self._ended = threading.Event()       # Deepgram's Metadata / close was seen
-        self._stop = threading.Event()
+        self._ended = threading.Event()       # Deepgram's Metadata / normal close was seen, or the stream failed
+        self._stop = threading.Event()        # the reader leaves at its next wake
+        self._lock = threading.Lock()         # the text state + reason
+        self._send_lock = threading.Lock()    # every write, the keepalive run and the closing flip
+        self._close_lock = threading.Lock()   # one close() at a time; the rest wait and return the same text
         self._closing = False
         self._closed = False
-        self._lock = threading.Lock()         # guards the text state + reason
-        self._last_send = time.monotonic()
+        self._keepalives = 0
+        self._last_write = time.monotonic()
         self._ws: wsclient.WebSocketClient | None = None
         opts = dict(connect_opts or {})
         opts.setdefault("allowed_hosts", providers.ALLOWED_HOSTS)
-        opts.setdefault("idle_timeout", keepalive_after)
+        opts.setdefault("idle_timeout", self._tick)
         err = self._open(secret, stream_url(base_url), opts)
         del secret
         if err:
             raise StreamNotStarted() if err == "not_started" else DeepgramStreamError("connect")
         self._reader = threading.Thread(target=self._read_loop, name="deepgram-stream-reader", daemon=True)
-        self._reader.start()
+        started = False
+        try:
+            self._reader.start()
+            started = True
+        except Exception:  # noqa: BLE001 - e.g. RuntimeError("can't start new thread"); the socket must not leak
+            pass
+        if not started:
+            ws, self._ws = self._ws, None
+            if ws is not None:
+                ws.close(wait=0)
+            raise DeepgramStreamError("connect")
 
     def __repr__(self) -> str:
         return "<DeepgramStream>"
 
     def _open(self, secret: Any, url: str, opts: dict[str, Any]) -> str:
         """Connect with the key in the header. Returns '' on success, else 'not_started' (refused before any byte was
-        sent) or 'failed' (a connection may have been made). Never raises, so no frame of a raise holds the header."""
+        sent) or 'failed' (a connection may have been made; a timeout is here, see rule 1). Never raises, so no frame of
+        a raise holds the header."""
         code = ""
         try:
             headers = {"Authorization": f"Token {secret.reveal()}"}
@@ -170,136 +211,134 @@ class DeepgramStream:
         self._stop.set()
         _log.warning("voice stream: deepgram stream failed (%s)", reason)
 
-    def _put(self, item: tuple[str, str]) -> bool:
-        try:
-            self._q.put(item, timeout=1.0)
-            return True
-        except queue.Full:
+    def _take(self, event: str, text: str) -> bool:
+        """Fold one transcript into the text state. False (and the stream failed) past the text bound."""
+        with self._lock:
+            if event == "partial":
+                ok = len(text) <= MAX_TEXT_CHARS
+                if ok:
+                    self._partial = text
+            else:
+                self._partial = ""
+                ok = not text or self._chars + len(text) + 1 <= MAX_TEXT_CHARS
+                if ok and text:
+                    self._chars += len(text) + 1
+                    self._finals.append(text)
+        if not ok:
             self._fail("overflow")
-            return False
+        return ok
+
+    def _keepalive(self) -> None:
+        if self._closing or not self._send_lock.acquire(blocking=False):
+            return                                   # a send in progress is not an idle line
+        try:
+            if self._closing or self._keepalives >= MAX_KEEPALIVES or \
+                    time.monotonic() - self._last_write < self._keepalive_after:
+                return
+            assert self._ws is not None
+            try:
+                self._ws.send_text(_KEEPALIVE)
+            except wsclient.WsError:
+                return
+            self._keepalives += 1
+            self._last_write = time.monotonic()
+        finally:
+            self._send_lock.release()
 
     def _read_loop(self) -> None:
         ws = self._ws
-        keepalives = 0
-        while not self._stop.is_set() and ws is not None:
-            fail = ""
-            event = ("ignore", "")
+        assert ws is not None
+        while not self._stop.is_set():
             try:
                 kind, data = ws.recv()
             except wsclient.WsTimeout:
-                kind, data = "idle", None
-            except wsclient.WsError:
-                kind, data = "gone", None
-            if kind == "idle":
-                if not self._closing and keepalives < MAX_KEEPALIVES and \
-                        time.monotonic() - self._last_send >= self._keepalive_after:
-                    try:
-                        ws.send_text('{"type": "KeepAlive"}')
-                        keepalives += 1
-                    except wsclient.WsError:
-                        pass
+                self._keepalive()
                 continue
-            if kind == "gone":
-                if not self._closing:
-                    fail = "provider_closed"
-                else:
-                    self._ended.set()
-                    return
-            elif kind == "close":
+            except wsclient.WsError:
+                self._fail("incomplete" if self._closing else "provider_closed")
+                return
+            if kind == "close":
                 code = data[0] if isinstance(data, tuple) and data else 0
                 if self._closing and code in (1000, 1005):
                     self._ended.set()
                     return
-                fail = "provider_closed"
-            elif kind != "text" or not isinstance(data, str):
-                fail = "malformed"
-            else:
-                try:
-                    event = _parse(data)
-                except ValueError:
-                    fail = "malformed"
-                except LookupError:
-                    fail = "provider_error"
-            if fail:
-                self._fail(fail)
+                self._fail("provider_closed")
                 return
-            keepalives = 0 if event[0] in ("partial", "final") else keepalives
-            if event[0] == "end":
+            if kind != "text" or not isinstance(data, str):
+                self._fail("malformed")
+                return
+            try:
+                event, text = _parse(data)
+            except ValueError:
+                self._fail("malformed")
+                return
+            except LookupError:
+                self._fail("provider_error")
+                return
+            if event == "end":
                 if self._closing:
-                    self._put(event)
                     self._ended.set()
                     return
-            elif event[0] != "ignore":
-                if not self._put(event):
-                    return
+            elif event != "ignore" and not self._take(event, text):
+                return
+            self._keepalive()
 
     # --- ProviderStream ------------------------------------------------------------------------------------------------
-    def _fold(self) -> None:
-        """Move queued messages into the text state (caller: poll/close, any thread; the lock serialises)."""
-        with self._lock:
-            while True:
-                try:
-                    ev, text = self._q.get_nowait()
-                except queue.Empty:
-                    return
-                if ev == "partial":
-                    self._partial = text
-                elif ev == "final":
-                    self._partial = ""
-                    if text:
-                        self._chars += len(text) + 1
-                        if self._chars > MAX_TEXT_CHARS:
-                            if not self.reason:
-                                self.reason = "overflow"
-                            self._failed.set()
-                            self._stop.set()
-                            return
-                        self._finals.append(text)
-
     def send_audio(self, pcm: bytes) -> None:
-        if self._closed or self._closing:
-            raise DeepgramStreamError("closed")
-        if self._failed.is_set():
-            raise DeepgramStreamError("provider_closed" if not self.reason else self.reason)
-        ok = False
-        try:
+        with self._send_lock:
+            if self._closing:
+                raise DeepgramStreamError("closed")
+            if self._failed.is_set():
+                raise DeepgramStreamError(self.reason or "provider_closed")
             if not pcm or len(pcm) > SEND_MAX:
-                raise wsclient.WsError("too_big")
+                raise DeepgramStreamError("chunk")
             assert self._ws is not None
-            self._ws.send_binary(bytes(pcm))
-            ok = True
-        except Exception:  # noqa: BLE001 - nothing from the exception is kept
-            ok = False
-        if not ok:
-            self._fail("send")
-            raise DeepgramStreamError("send")
-        self._last_send = time.monotonic()
+            try:
+                self._ws.send_binary(bytes(pcm))
+                ok = True
+            except Exception:  # noqa: BLE001 - nothing from the exception is kept
+                ok = False
+            if ok:
+                self._keepalives = 0
+                self._last_write = time.monotonic()
+                return
+        self._fail("send")
+        raise DeepgramStreamError("send")
 
     def poll(self) -> StreamUpdate:
-        self._fold()
         with self._lock:
             return StreamUpdate(partial=self._partial, final=" ".join(self._finals),
                                 failed=self._failed.is_set())
 
     def close(self) -> str:
-        if self._closed:
-            return self._text()
-        self._closed = True
-        ws = self._ws
-        if ws is not None and not self._failed.is_set():
-            self._closing = True
+        with self._close_lock:
+            if self._closed:
+                return self._text()
+            ws = self._ws
+            assert ws is not None
+            sent = False
+            # A writer stuck in a send holds the lock for at most about one socket timeout (tick).
+            locked = self._send_lock.acquire(timeout=2 * self._tick)
             try:
-                ws.send_text('{"type": "CloseStream"}')
-                self._ended.wait(self._close_drain)
-            except Exception:  # noqa: BLE001
-                pass
-        self._stop.set()
-        self._fold()
-        if ws is not None:
-            ws.close(wait=0.5)
-        self._reader.join(2.0)
-        self._fold()
-        return self._text()
+                self._closing = True
+                if locked and not self._failed.is_set():
+                    try:
+                        ws.send_text(_CLOSESTREAM)
+                        sent = True
+                    except wsclient.WsError:
+                        pass
+            finally:
+                if locked:
+                    self._send_lock.release()
+            if not sent or not self._ended.wait(self._close_drain):
+                if not self._failed.is_set():
+                    self._fail("incomplete")
+            self._stop.set()
+            self._reader.join(2 * self._tick + 0.5)   # it wakes within one idle wait or one frame's budget
+            ws.close(wait=CLOSE_WAIT_S)               # the reader is gone: nothing it would have read is taken
+            self._reader.join(CLOSE_WAIT_S)
+            self._closed = True
+            return self._text()
 
     def _text(self) -> str:
         with self._lock:
