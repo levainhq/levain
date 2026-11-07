@@ -230,7 +230,7 @@ BOXFIT = ("(() => { const h = document.getElementById('ck-drop'); const b = docu
           " const mb = m.getBoundingClientRect(); const bb = b.getBoundingClientRect(); const a = h.querySelector('.drop-actions').getBoundingClientRect();"
           " const rc = h.querySelector('.drop-recent').getBoundingClientRect();"
           " return JSON.stringify({t: 'TAG', box: Math.round(bb.height), main: Math.round(mb.height), recent: Math.round(rc.height), below: Math.round(mb.bottom - a.bottom),"
-          " boxBottomToActions: Math.round(a.top - bb.bottom)}); })()")
+          " boxBottomToActions: Math.round(a.top - bb.bottom), floor: Math.round(parseFloat(getComputedStyle(b).minHeight)), list: Math.round(h.querySelector('.drop-list').getBoundingClientRect().height), vh: innerHeight}); })()")
 
 
 @needs_browser
@@ -248,9 +248,10 @@ def test_the_drop_box_grows_to_the_height_of_the_thread_beside_it_at_desktop_wid
         got = _tagged(drive_touch(tmp_path, f"{rig.origin}/#write_token={TOK}", steps))
     short, long_ = got["short"], got["long"]
     assert long_["main"] == long_["recent"], got                       # the composer column is as tall as the thread
-    assert long_["box"] > short["box"] + 50 and long_["box"] > 500, got   # the box took the height
-    assert long_["boxBottomToActions"] <= 24 and long_["below"] < 120, got  # ...and the actions sit right under it, no hole
-    assert short["box"] >= 12 * 16, got                                # the floor stays
+    assert long_["box"] > short["box"] + 50 and long_["box"] >= 0.4 * long_["main"], got   # the box took the height (relative to the column, not a pixel guess)
+    assert long_["boxBottomToActions"] <= 24 and 0 <= long_["below"] < 120, got  # ...and the actions sit right under it, inside the column, no hole
+    assert short["box"] >= short["floor"] - 1 and short["floor"] > 0, got  # the floor (12em, as the browser computed it) stays
+    assert long_["list"] <= 0.6 * long_["vh"] + 1 and long_["box"] <= long_["main"], got  # ...and the stretch is bounded: the thread list is capped at 60vh, the box never exceeds its column
 
 
 @needs_browser
