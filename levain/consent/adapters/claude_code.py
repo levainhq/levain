@@ -1051,7 +1051,18 @@ def decide_ex(event: Any, queue: ConsentQueue, settings: AdapterSettings, *, env
                 taken = _verified(took, got_row[0])
                 if taken is not None:
                     return Decided(call, got_row[0], taken)
-    hold = min(away_hold(settings, AGENT, idle, queue_dir=Path(queue.directory)), max(0.0, deadline - clock()))
+    hold = away_hold(settings, AGENT, idle, queue_dir=Path(queue.directory))
+    # Phill 11-07 (08:38): *"the damn stuck-seat approvals start working properly and for that we must made sure they show
+    # up as band items"*. A `claude -p` session (entrypoint ``sdk-*``) has no dialog anyone can answer: its prompt is
+    # simply not granted. So his presence, which says whose terminal the dialog is on, decides nothing for it: it is held
+    # for a signed answer whenever one could verify, unless the operator's own word is off. The hold is not cut short
+    # when presence reads present (``still_away`` is dropped for it): the dialog it would hand back to does not exist.
+    unattended = environ.get("CLAUDE_CODE_ENTRYPOINT", "").startswith("sdk") and not settings.explicit_off
+    if hold <= 0 and unattended and _can_sign(settings):
+        hold = settings.away_hold_seconds if settings.away_hold_seconds > 0 else DEFAULT_HOLDS[AGENT]
+    else:
+        unattended = False
+    hold = min(hold, max(0.0, deadline - clock()))
     if hold > 0 and settings.cockpit_data_root and not Path(settings.cockpit_data_root).is_dir():
         # away mode is on by the operator's word, but the cockpit it names is not there: no answer can verify, so a
         # hold would only stall the session. Hold nothing; Claude Code's own dialog asks (1104-8)
@@ -1081,7 +1092,8 @@ def decide_ex(event: Any, queue: ConsentQueue, settings: AdapterSettings, *, env
             wait = min(wait, max(0.0, deadline - clock()))   # the ping's spawn time comes out of the hold, not the reserve
             held = held and wait > 0   # the spawn can have used the whole wait: then no hold runs and the dialog's notice goes (L3 round c)
             got, back = hold_for_answer(queue, request, wait, tool_input=tool_input, posture=posture,
-                                        still_away=still_away, contained_launch=contained_launch)
+                                        still_away=None if unattended else still_away,
+                                        contained_launch=contained_launch)
         if got is None:
             note = f"away mode ended ({back}); the native dialog stands" if back else \
                 "the hook stopped waiting; the native dialog stands"
