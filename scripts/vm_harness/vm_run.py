@@ -14,10 +14,11 @@ import shlex
 import subprocess
 import sys
 import tempfile
+import time
 from pathlib import Path
 
-from scripts.vm_harness.driver import GuestError, SlotPlan, VmAdapters, run_on_vm
-from scripts.vm_harness.host_profile import DARWIN, PROFILES, HostProfile, profile_named
+from scripts.vm_harness.driver import AdapterError, GuestError, SlotPlan, VmAdapters, run_on_vm
+from scripts.vm_harness.host_profile import DARWIN, PROFILES, HostProfile, ProfileMismatch, profile_named
 
 TART = os.environ.get("TART_BIN", "/Users/phillipclapham/.local/bin/tart")
 CLONE_RE = re.compile(r"vend-[A-Za-z0-9_][A-Za-z0-9._-]*")
@@ -25,7 +26,11 @@ SSH = "/usr/bin/ssh"
 SSH_OPTS = ["-o", "StrictHostKeyChecking=no", "-o", "UserKnownHostsFile=/dev/null", "-o", "LogLevel=ERROR",
             "-o", "PreferredAuthentications=password,keyboard-interactive", "-o", "PubkeyAuthentication=no",
             "-o", "ConnectTimeout=15"]
-SCRIPT_ARGV = ("sudo", "bash", "-s")   # the interpreter a multi-command staging script is piped to (``tart exec -i``)
+# A multi-command staging script is piped to this (``tart exec -i``). ``bash -s`` would let a stdin-reading command in the
+# script eat the rest of it, so the guest first reads ALL of stdin into a file, then runs that with stdin closed.
+SCRIPT_ARGV = ("sudo", "-n", "bash", "-c", 'f=$(mktemp) && cat >"$f" && bash "$f" </dev/null; rc=$?; rm -f "$f"; exit $rc')
+
+_now, _nap = time.monotonic, time.sleep   # module names so a test can drive the probe's clock
 
 
 def _clone_guard(vm: str) -> None:
@@ -35,7 +40,7 @@ def _clone_guard(vm: str) -> None:
 
 def make_ssh(vm: str, askpass_dir: Path, profile: HostProfile = DARWIN):
     askpass = askpass_dir / "askpass.sh"
-    askpass.write_text(f"#!/bin/sh\necho {profile.ssh_user}\n")
+    askpass.write_text(f"#!/bin/sh\necho {profile.ssh_password}\n")
     os.chmod(askpass, 0o700)
     env = dict(os.environ, SSH_ASKPASS=str(askpass), SSH_ASKPASS_REQUIRE="force", DISPLAY="x")
 
@@ -98,13 +103,20 @@ def make_tart_exec(vm: str):
     return guest, spawn
 
 
-def agent_answers(vm: str, timeout: float = 30) -> bool:
-    """Whether the guest agent runs a trivial command (the probe the ssh fallback hangs on)."""
-    try:
-        r = subprocess.run(tart_exec_argv(vm, ["/usr/bin/true"]), capture_output=True, text=True, timeout=timeout)
-    except (subprocess.TimeoutExpired, OSError):
-        return False
-    return r.returncode == 0
+def agent_answers(vm: str, timeout: float = 30, *, wait: float = 90) -> bool:
+    """Whether the guest agent runs a trivial command (the probe the ssh fallback hangs on). A freshly booted clone's
+    agent is often not up yet, so the probe retries for ``wait`` seconds before saying no."""
+    deadline = _now() + wait
+    while True:
+        try:
+            r = subprocess.run(tart_exec_argv(vm, ["/usr/bin/true"]), capture_output=True, text=True, timeout=timeout)
+            if r.returncode == 0:
+                return True
+        except (subprocess.TimeoutExpired, OSError):
+            pass
+        if _now() >= deadline:
+            return False
+        _nap(3)
 
 
 def make_transport(vm: str, profile: HostProfile, askpass_dir: Path):
@@ -117,6 +129,7 @@ def make_transport(vm: str, profile: HostProfile, askpass_dir: Path):
         raise ValueError(f"unknown transport {profile.transport!r} in profile {profile.name!r}")
     if agent_answers(vm) or not profile.ssh_fallback:
         return make_tart_exec(vm)
+    print(f"vm_run: guest agent of {vm} did not answer; falling back to ssh as {profile.ssh_user}", file=sys.stderr)
     return make_ssh(vm, askpass_dir, profile)
 
 
@@ -133,7 +146,11 @@ def main(argv: list[str]) -> int:
     with tempfile.TemporaryDirectory() as td:
         guest, spawn = make_transport(a.vm, profile, Path(td))
         adapters = VmAdapters(guest, spawn, profile=profile)
-        adapters.verify_host()
+        try:
+            adapters.verify_host()
+        except (ProfileMismatch, AdapterError) as e:
+            print(f"vm_run: refusing: {e}", file=sys.stderr)
+            return 2
         res = run_on_vm(a.evidence, [SlotPlan(a.slot, a.lease)], adapters)
     print(res.result_path.read_text())
     return 0 if res.ok else 1

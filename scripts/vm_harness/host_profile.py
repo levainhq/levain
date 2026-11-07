@@ -38,6 +38,8 @@ class HostProfile:
     ssh_fallback: bool             # a tart_exec profile falls back to ssh when the guest agent does not answer
     service_manager: str           # "launchd" / "systemd"
     account_tool: str              # how the product creates slot accounts there
+    ssh_password: str = "admin"    # the Tart image's public default password (askpass hands it over; NOT the login name)
+    levain_roots: tuple = ("/tmp/lvclean", "/tmp/lv")   # where the rig stages the levain source; the first with ``levain/`` wins
 
     def ops_argv(self) -> tuple[str, ...]:
         """The root-side guest_ops invocation prefix (``sudo -n`` is passwordless for the image's admin)."""

@@ -25,7 +25,7 @@ else:   # run as a script in the clone, next to host_profile.py (python -I leave
     from host_profile import profile_for_platform
 
 PROFILE = profile_for_platform(sys.platform)
-sys.path.insert(0, "/tmp/lv")
+sys.path.insert(0, PROFILE.levain_roots[-1])
 from levain.agents.accounting import ActionExposure  # noqa: E402
 from levain.agents.session import SessionLaunch  # noqa: E402
 from levain.agents.session_launcher import RealLauncher, SessionIndex  # noqa: E402

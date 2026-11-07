@@ -32,7 +32,7 @@ else:   # run as a script in the clone, next to host_profile.py (python -I leave
     from host_profile import profile_for_platform
 
 PROFILE = profile_for_platform(sys.platform)
-for root in ["/tmp/lvclean", "/tmp/lv"]:
+for root in PROFILE.levain_roots:
     if os.path.isdir(os.path.join(root, "levain")):
         sys.path.insert(0, root)
         break

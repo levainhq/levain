@@ -48,10 +48,12 @@ def test_the_default_adapter_profile_is_darwin():
     assert ad.profile is DARWIN and ad.OPS == VmAdapters.OPS and ad.DISPATCH == VmAdapters.DISPATCH
 
 
-def test_darwin_guest_script_constants_are_the_old_literals():
-    from scripts.vm_harness import guest_dispatch, guest_ops
+def test_darwin_guest_script_constants_are_the_old_literals(monkeypatch):
+    # loaded as isolated modules with sys.platform pinned: on a Linux runner a plain import would select LINUX
+    guest_ops = _load_as_package_module("guest_ops", "darwin", monkeypatch)
+    guest_dispatch = _load_as_package_module("guest_dispatch", "darwin", monkeypatch)
     assert guest_ops.SLOTS == "/private/var/levain/slots" and guest_ops.FH == "/private/tmp/fh"
-    assert guest_ops.PROFILE is DARWIN      # this test host is the darwin one; the guest picks by its own sys.platform
+    assert guest_ops.PROFILE is DARWIN
     assert str(guest_dispatch.FH) == "/private/tmp/fh" and str(guest_dispatch.STORE) == "/private/var/levain"
     assert str(guest_dispatch.CONTROL) == "/private/var/run/levain/control/control.sock"
 
@@ -158,10 +160,10 @@ def test_verify_host_turns_an_unanswering_guest_into_a_refusal():
         VmAdapters(dead, lambda a: None, profile=LINUX).verify_host()
 
 
-def test_main_refuses_a_linux_profile_against_a_darwin_guest(monkeypatch, tmp_path):
+def test_main_refuses_a_linux_profile_against_a_darwin_guest(monkeypatch, tmp_path, capsys):
     monkeypatch.setattr(vm_run, "make_transport", lambda vm, profile, d: ((lambda argv, timeout=60: "Darwin\n"), lambda a: None))
-    with pytest.raises(ProfileMismatch):
-        vm_run.main(["vend-lin-x", str(tmp_path / "ev"), "--profile", "linux"])
+    assert vm_run.main(["vend-lin-x", str(tmp_path / "ev"), "--profile", "linux"]) == 2      # a clean refusal, no traceback
+    assert "expects a Linux guest" in capsys.readouterr().err
     assert not (tmp_path / "ev").exists()
 
 
@@ -196,8 +198,23 @@ def test_tart_exec_script_form_pipes_the_script_on_stdin(monkeypatch):
     guest, _ = vm_run.make_tart_exec("vend-lin-1")
     guest.script("echo hi\nid\n")
     argv, kw = seen[-1]
-    assert argv == [vm_run.TART, "exec", "-i", "vend-lin-1", "sudo", "bash", "-s"]
+    assert argv == [vm_run.TART, "exec", "-i", "vend-lin-1", *vm_run.SCRIPT_ARGV]
+    assert vm_run.SCRIPT_ARGV[:2] == ("sudo", "-n")      # no password prompt eating the script
     assert kw["input"] == "echo hi\nid\n"
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="needs bash")
+def test_the_script_form_keeps_trailing_lines_when_a_command_reads_stdin(tmp_path):
+    # reproduced shape: ``bash -s`` lets ``cat`` swallow the lines after it; the staged form must not
+    argv = [a for a in vm_run.SCRIPT_ARGV if a != "sudo" and a != "-n"]
+    argv = ["bash", *argv[1:]] if argv[0] == "bash" else argv
+    out = tmp_path / "out"
+    text = f"cat >/dev/null\necho after >{out}\n"
+    r = subprocess.run(argv, input=text, capture_output=True, text=True, timeout=30)
+    assert r.returncode == 0 and out.read_text() == "after\n"
+    naive = tmp_path / "naive"
+    subprocess.run(["bash", "-s"], input=f"cat >/dev/null\necho after >{naive}\n", capture_output=True, text=True, timeout=30)
+    assert not naive.exists()       # the old form really did lose the tail
 
 
 def test_tart_exec_nonzero_exit_is_a_guest_error_with_the_rc(monkeypatch):
@@ -231,6 +248,25 @@ def test_tart_exec_only_addresses_vend_clones(name, monkeypatch):
     with pytest.raises(SystemExit):
         vm_run.make_transport(name, LINUX, Path("."))
     assert not seen
+
+
+@pytest.fixture(autouse=True)
+def _fast_probe(monkeypatch):
+    t = [0.0]
+    monkeypatch.setattr(vm_run, "_now", lambda: t[0])
+    monkeypatch.setattr(vm_run, "_nap", lambda s: t.__setitem__(0, t[0] + s))
+
+
+def test_the_agent_probe_retries_a_freshly_booted_guest(monkeypatch):
+    rcs = iter([1, 1, 0])
+    monkeypatch.setattr(subprocess, "run", lambda argv, **kw: _Run(rc=next(rcs)))
+    assert vm_run.agent_answers("vend-lin-1") is True
+
+
+def test_the_agent_probe_gives_up_after_its_wait(monkeypatch):
+    n = []
+    monkeypatch.setattr(subprocess, "run", lambda argv, **kw: n.append(1) or _Run(rc=1))
+    assert vm_run.agent_answers("vend-lin-1", wait=10) is False and 2 <= len(n) <= 6
 
 
 def test_transport_choice_follows_the_profile(monkeypatch, tmp_path):
@@ -279,6 +315,10 @@ def test_ssh_transport_is_unchanged_for_darwin(monkeypatch, tmp_path):
     guest(["/bin/echo", "a; touch /pwned"])
     assert seen[-1][0][-1] == "/bin/echo 'a; touch /pwned'" and seen[-1][0][-2] == "admin@10.0.0.5"
     assert (tmp_path / "askpass.sh").read_text() == "#!/bin/sh\necho admin\n"
+    import dataclasses
+    other = dataclasses.replace(LINUX, ssh_user="ubuntu", ssh_password="pw")
+    vm_run.make_ssh("vend-x", tmp_path, other)
+    assert (tmp_path / "askpass.sh").read_text() == "#!/bin/sh\necho pw\n"      # the password, not the login name
 
 
 # ---- no host-bound literal outside the profile ---------------------------------------------------------------
@@ -287,7 +327,7 @@ GUARDED = ("guest_ops.py", "guest_dispatch.py", "vm_run.py", "driver.py")
 #: a value a profile owns; every one of these must also appear in host_profile.py (the scan is not vacuous)
 HOST_BOUND = ("/private", "/var/levain", "/var/run/levain", "/run/levain", "/tmp/fh", "/tmp/fire", "python3.1",
               "/usr/local/bin", "/Library/Developer", "/usr/bin/git", "darwin", "Darwin", "linux", "Linux",
-              "launchd", "systemd", "dscl", "useradd", "_levain_dispatch", "ucomm")
+              "launchd", "systemd", "dscl", "useradd", "_levain_dispatch", "ucomm", "/tmp/lv")
 
 
 def _string_literals(source: str) -> list[tuple[int, str]]:
