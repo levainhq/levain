@@ -793,11 +793,18 @@ def clear(store: PushStore) -> int:
 
 
 # --- the push --------------------------------------------------------------------------------------------------------
-def push_url(store: PushStore, ping_id: int, kind: str, url: str) -> str:
+_BAND_ROW = re.compile(r"np-[0-9a-f]{8}")
+
+
+def push_url(store: PushStore, ping_id: int, kind: str, url: str, ref: str | None = None) -> str:
     """Where a push opens: the center on the ping's own item (``/?view=notifications&n=<id>``). A held-summary ping is no
-    item and keeps the link it was given. Any trouble reading the record keeps the given link: a push is never lost to it."""
+    item and keeps the link it was given. A band row's ping (kind ``attention``, ``ref`` flow's ``np-<8 hex>`` id) opens its
+    Needs card, ``/?view=needs&item=<ref>`` (Phill 11-07, np-029b717e (a)). Any trouble reading the record keeps the given
+    link: a push is never lost to it."""
     if kind == "summary":
         return url
+    if kind == "attention" and isinstance(ref, str) and _BAND_ROW.fullmatch(ref):
+        return f"/?view=needs&item={ref}"
     try:
         with store.read() as c:
             row = c.execute("SELECT id FROM notices WHERE ping_id = ?", (int(ping_id),)).fetchone()

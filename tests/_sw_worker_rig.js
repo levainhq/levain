@@ -290,6 +290,8 @@ function fire(type, ev) {
     if (parts.includes('summary')) data.tag = 'summary';
     if (parts.includes('crossurl')) data.url = 'https://evil.example/x';
     if (parts.includes('legacy')) { const m = new Map(); m.set('/__levain_open/shown', JSON.stringify({ url: '/', nonce: 'old', at: Date.now(), for: 'shown', ping: 41, tag: 'x' })); cacheNames.add('levain-open'); cacheStores.set('levain-open', m); }
+    // 'declarative': the payload a Declarative Web Push device is sent (web_push 8030 and a notification with an absolute navigate)
+    if (parts.includes('declarative')) { data.web_push = 8030; data.notification = { title: 'T', body: 'secret body', navigate: 'https://box.example/?view=needs&item=np-0123abcd', tag: 'x' }; }
     const started = Date.now();
     const evPush = () => ({ data: { json: () => data } });
     if (!parts.includes('clickonly')) {

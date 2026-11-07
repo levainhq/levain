@@ -4,6 +4,7 @@ from __future__ import annotations
 import argparse
 import json
 import re
+import sys
 from pathlib import Path
 
 
@@ -46,6 +47,14 @@ def register(subparsers) -> None:
     dv = common(sub.add_parser("devtest", help="What the /devtest notification-action device test reported (band 299)."))   # devtest
     dv.add_argument("--json", action="store_true")
     dv.set_defaults(func=_devtest)
+    dc = common(sub.add_parser(
+        "declarative", help="Declarative Web Push per device: on, off or status (OFF for every device until switched on).",
+        description="Declarative Web Push lets the OS open the app on a tap with no service-worker code (iOS 18.4+ Home Screen "
+                    "apps, Apple push only). Off for every device; `on --device <id>` adds one (the id as the subscription "
+                    "stores it, e.g. paired-d-750e832de5b7). Needs the cockpit's stored https origin."))
+    dc.add_argument("mode", choices=("on", "off", "status"))
+    dc.add_argument("--device", default=None, metavar="ID", help="The device id (required for on and off).")
+    dc.set_defaults(func=_declarative)
     from levain.webpush import presence
 
     for word, text in (("quiet", "Hold phone pushes for a while (default 60 min), except what needs you (approvals and "
@@ -386,6 +395,31 @@ def _receipts(args: argparse.Namespace) -> int:
         return 2
     report = receipts.build(PushStore(_qdir(args)), since=since, ref=args.ref)
     print(json.dumps(report, indent=2) if args.json else receipts.text(report))
+    return 0
+
+
+def _declarative(args: argparse.Namespace) -> int:
+    from levain.consent import cockpit_origin
+    from levain.webpush import declarative
+    from levain.webpush.store import PushStore
+
+    qdir = _qdir(args)
+    if args.mode != "status":
+        if not args.device:
+            print("levain ping declarative: --device is required for on and off", file=sys.stderr)
+            return 2
+        try:
+            declarative.set_device(qdir, args.device, args.mode == "on")
+        except ValueError as exc:
+            print(f"levain ping declarative: {exc}", file=sys.stderr)
+            return 2
+    devices = sorted(declarative.enabled_devices(qdir))
+    origin = cockpit_origin.read_origin(qdir)
+    live = {s["device_id"]: s["endpoint"] for s in PushStore(qdir).live_subscriptions()}
+    print("declarative web push is on for: " + (", ".join(devices) if devices else "no device (off)"))
+    print("cockpit origin: " + (origin or "NONE stored: every device stays on the legacy payload"))
+    for d in devices:
+        print(f"  {d}: " + ("a live subscription" if d in live else "NO live subscription under this id"))
     return 0
 
 

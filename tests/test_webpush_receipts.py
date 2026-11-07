@@ -404,7 +404,7 @@ def test_a_push_posts_received_then_shown_with_the_endpoint_hash_and_ids_only() 
     assert "secret body" not in json.dumps(got["posts"])
     assert got["shownCalls"] == [{"title": "T", "tag": "x"}] and got["queued"] == []
     assert _receipt_steps(got) == [("received", "ok", None), ("shown", "ok", None)]
-    assert any(e["step"] == "sw-version" and e["version"] == "1106-54-bundle5-2" and e["on"] == "push" for e in got["trace"])
+    assert any(e["step"] == "sw-version" and e["version"] == "1107-56-decl-1" and e["on"] == "push" for e in got["trace"])
 
 
 @needs_node
