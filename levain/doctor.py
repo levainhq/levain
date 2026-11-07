@@ -161,6 +161,7 @@ def _run_doctor(path: Path, invoke: bool = False, repin_hooks: bool = False) -> 
     core.extend(_check_continuity_headroom(install))
     core.extend(_check_compat_set(install))
     core.extend(_check_consent_hooks(install))
+    core.extend(_guarded("consent ping reach", lambda: _check_consent_ping_reach(install)))
     core.extend(_check_consent_limits())
     core.extend(_check_chat_network())
     core.extend(_check_phone_path())
@@ -502,6 +503,44 @@ def _check_phone_path(*, which: Any = None, run: Any = None, port: int | None = 
                                                 f"tailnet can reach it at {_serve_url(key, dns)}")]
     return [CheckResult(name, True, f"tailscale is running but not serving the cockpit port {port}, so a phone "
                                     "cannot reach this laptop yet", fix_serve, warn=True)]
+
+
+def _consent_hook_in_settings(install: Path) -> bool:
+    """True when a Claude Code settings file of this workspace has a PermissionRequest handler that runs levain's
+    consent hook: the shape `levain init` wires (the static script in the activation tree, in the file
+    :func:`levain.host_guard.cc_levain_hooks_file` names) or the earlier per-workspace script. Reads only."""
+    from levain.consent.adapters import claude_code
+    from levain.consent.canary import _config_references
+    from levain.host_guard import cc_levain_hooks_file
+    from levain.install import CONSENT_HOOK_SCRIPTS
+
+    return any(_config_references(config, script) for script, config in (
+        (install / ".claude" / "hooks" / claude_code.HOOK_SCRIPT_NAME, install / ".claude" / "settings.json"),
+        (install / "activation" / "hooks" / CONSENT_HOOK_SCRIPTS["claude-code"], cc_levain_hooks_file(install))))
+
+
+def _check_consent_ping_reach(install: Path, *, environ: Any = None) -> list[CheckResult]:
+    """The ``consent ping reach`` row: when levain's consent hook is wired into Claude Code's settings, a request it
+    holds pings the operator only if the queue directory the hook resolves (``$LEVAIN_HOME/consent``, as the hook
+    binds it: :func:`levain.consent.queue.queue_dir_for`) has a ping route, the very test the gate runs
+    (:func:`levain.consent.adapters.claude_code.ping_configured`: a ``notify_argv`` command or a paired phone with
+    pings on). Without one the held request reaches nobody, so it is a WARN, never a FAIL: the hook fails toward
+    the operator's own dialog, so nothing is allowed or lost. The hook not wired here: no row. Read-only."""
+    from levain.consent.adapters import claude_code
+    from levain.consent.queue import queue_dir_for
+
+    if not _consent_hook_in_settings(install):
+        return []
+    queue_dir = queue_dir_for(os.environ if environ is None else environ)
+    settings = claude_code.load_settings(queue_dir)
+    if claude_code.ping_configured(settings, queue_dir):
+        return [CheckResult("consent ping reach", True, f"a held request pings you: the queue at {queue_dir} has a ping route")]
+    return [CheckResult(
+        "consent ping reach", True,
+        f"the consent hook is installed, but the queue at {queue_dir} has no ping route (no notify command, no paired "
+        "phone with pings on): a held request will reach nobody",
+        f"pair a phone with pings on for this queue, or set `notify_argv` in {queue_dir / claude_code.SETTINGS_NAME}",
+        warn=True)]
 
 
 def _check_consent_limits() -> list[CheckResult]:
