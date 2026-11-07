@@ -1266,6 +1266,10 @@ _ASSETS: dict[str, tuple[str, str]] = {
     # Reading the room aloud (voice V1-5): the player, the per-reply control and the settings store. Loaded by the Voice
     # block once /cockpit/voice.json answers; it calls POST /cockpit/voice/speak and no other route.
     "/voice.js": ("voice.js", "text/javascript; charset=utf-8"),
+    # Streaming dictation (cockpit mic S4): the capture module and its AudioWorklet processor (a worklet is loaded by URL, so it is
+    # its own asset). Shown only when GET /cockpit/voice.json says {"stream": true}.
+    "/mic.js": ("mic.js", "text/javascript; charset=utf-8"),
+    "/mic_worklet.js": ("mic_worklet.js", "text/javascript; charset=utf-8"),
     "/pair_card.js": ("pair_card.js", "text/javascript; charset=utf-8"),
     # The passkey-making page: a static shell (its reads and its one POST are same-origin and gated) that makes a passkey on
     # this device and prints the laptop commands that enrol it, through POST /cockpit/passkey/key-line (served beside a Signer).

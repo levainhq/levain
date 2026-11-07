@@ -482,7 +482,16 @@
       rotB.setAttribute("type", "button"); rotB.setAttribute("aria-label", "New conversation"); rotB.setAttribute("title", "Start a new conversation");
       top.appendChild(rotB);
     }
-    composer.appendChild(ta); if (micB) composer.appendChild(micB); composer.appendChild(actions);
+    // Streaming dictation (mic.js, cockpit mic S4): a second control beside Dictate, drawn only when LevainMic says the server
+    // offers it. Its words reach the box through textContent-safe .value writes; the page sends the server audio, never text.
+    var LM = opts.mic === undefined ? (root.LevainMic || null) : opts.mic;
+    var streamB = null, live = false, sbase = "", mOff = [];
+    if (LM && typeof LM.probe === "function") {
+      streamB = el(doc, "button", "rv-mic rv-mic-stream", "Mic");
+      streamB.setAttribute("type", "button"); streamB.hidden = true;
+      streamB.setAttribute("title", "Streaming dictation through your speech provider, only while this page is open");
+    }
+    composer.appendChild(ta); if (micB) composer.appendChild(micB); if (streamB) composer.appendChild(streamB); composer.appendChild(actions);
     dock.appendChild(openB); dock.appendChild(note); dock.appendChild(composer);
     var forceEnd = false;       // your own send always lands you at the newest line
     var flight = { send: false, stop: false, open: false };
@@ -561,8 +570,9 @@
     function clearDraft(text) {
       if (!stopped && ta.value === text) { ta.value = ""; try { if (store) store.removeItem("levain.room.draft"); } catch (e) { /* no storage */ } }
     }
+    function endStream() { if (live) { live = false; if (LM.active()) LM.stop(); } }
     sendB.addEventListener("click", function () {
-      endDictation();
+      endDictation(); endStream();
       var text = ta.value;
       if (!current || !current.thread || !text.trim() || sendB.disabled || flight.send) return;
       voiceTap();
@@ -681,6 +691,30 @@
       root.addEventListener && root.addEventListener("blur", onBlur);
     }
 
+    if (streamB) {
+      var drawStream = function (txt) {
+        if (stopped || !live) return;
+        ta.value = sbase + txt;
+        try { if (store) store.setItem("levain.room.draft", ta.value); } catch (e) { /* no storage */ }
+        grow(); paintSend();
+      };
+      mOff.push(LM.onPartial(drawStream));
+      mOff.push(LM.onFinal(function (txt) { drawStream(txt); live = false; }));
+      mOff.push(LM.onNote(function (s) { if (!stopped && live) note.textContent = s; }));
+      mOff.push(LM.onEnd(function () { live = false; streamB.textContent = "Mic"; }));
+      Promise.resolve(LM.probe()).then(function (ok) { if (!stopped && ok === true && LM.available()) streamB.hidden = false; }, function () {});
+      streamB.addEventListener("click", function () {
+        voiceTap();
+        if (live) { streamB.textContent = "Mic"; LM.stop(); return; }
+        if (LM.active()) return;                         // the last session is still closing
+        endDictation();
+        sbase = ta.value ? ta.value.replace(/\s*$/, " ") : "";
+        live = true; streamB.textContent = "Stop mic";
+        LM.start();                                     // inside this tap: the permission and the audio context are asked for here
+        if (!LM.active()) { live = false; streamB.textContent = "Mic"; }
+      });
+    }
+
     // Voice (V1-5 room hook). voice.js is optional: a page without it draws no control and reads nothing. The module decides
     // every autoplay question (setting, backlog, hidden, unlocked, the one-waiting queue); this view only reports what the
     // record shows: the finished replies, which of them were already there at mount, and the operator's own taps.
@@ -796,7 +830,7 @@
     paintDock();
     pull().then(loop);
     return { stop: function () {
-      stopped = true; clearTimeout(timer); endDictation(); voiceEnd(); if (root.removeEventListener) root.removeEventListener("resize", onResize);
+      stopped = true; clearTimeout(timer); endDictation(); endStream(); mOff.forEach(function (o) { o(); }); voiceEnd(); if (root.removeEventListener) root.removeEventListener("resize", onResize);
       if (onHidden) doc.removeEventListener("visibilitychange", onHidden);
       if (onBlur && root.removeEventListener) root.removeEventListener("blur", onBlur);
       if (vv) {
