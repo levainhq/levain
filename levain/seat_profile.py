@@ -304,6 +304,8 @@ def build_seat_profile(clone: Path, return_dir: Path, *, claude_bin: str, python
     from levain import observe   # constants only
     # -EP, not -I: -I also drops the user site, where levain may be installed (the consent hooks' ruling, HOOK_FLAGS in
     # levain.consent.adapters.claude_code); -E and -P keep the PYTHON* variables and the cwd off the import path.
+    # Known edge (L3 r1 codex, closed under the reachability line): Python derives the user site from the child's HOME, so a
+    # user-site install is found only while the seat's HOME is the one levain was installed under; -I never found it at all.
     hook = lambda sub: {"type": "command", "command": f"{py} -EP -B -m levain.seat_record {sub}", "timeout": _HOOK_TIMEOUT}
     records = shlex.quote(str(key_dir / "records"))
     hooks = {

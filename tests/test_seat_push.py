@@ -358,9 +358,9 @@ def test_every_seat_hook_keeps_the_user_site_on_the_import_path(eg, tmp_path):
     eg.sign()
     plan = eg.rig.launch("lane-a")
     hooks = plan.profile.settings["hooks"]
-    cmds = [h["command"] for event in ("Stop", "SessionEnd", "PreToolUse", "PostToolUse", "PermissionRequest")
-            for g in hooks[event] for h in g["hooks"]]
-    assert len(cmds) == 5
+    cmds = [h["command"] for event in ("Stop", "SessionEnd", "PreToolUse", "PostToolUse", "PostToolUseFailure",
+                                       "PermissionRequest") for g in hooks[event] for h in g["hooks"]]
+    assert len(cmds) == 6
     base = getattr(sys, "_base_executable", sys.executable)
     ub = tmp_path / "userbase"
     probe = subprocess.run([base, "-c", "import site; print(int(site.ENABLE_USER_SITE)); print(site.getusersitepackages())"],

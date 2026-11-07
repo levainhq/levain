@@ -25,7 +25,7 @@ def rig(tmp_path):
     return {"ws": os.path.realpath(ws), "home": Path(os.path.realpath(home)), "ck": ck, "q": q}
 
 
-def _run(rig, monkeypatch, *, entrypoint, settings, present=True):
+def _run(rig, monkeypatch, *, entrypoint, settings, present=True, away_hold=0.0):
     seen: dict = {}
 
     def fake_hold(queue, request, wait, **kw):
@@ -35,7 +35,7 @@ def _run(rig, monkeypatch, *, entrypoint, settings, present=True):
     monkeypatch.setattr(cc, "hold_for_answer", fake_hold)
     monkeypatch.setattr(cc, "hold_ping", lambda *a, **k: True)
     # the presence record reads present: no away hold (the record lives outside this rig, so it is stood in for)
-    monkeypatch.setattr(cc, "away_hold", lambda *a, **k: 0.0)
+    monkeypatch.setattr(cc, "away_hold", lambda *a, **k: away_hold)
     env = {"HOME": str(rig["home"]), "PATH": "/usr/bin:/bin"}
     if entrypoint:
         env["CLAUDE_CODE_ENTRYPOINT"] = entrypoint
@@ -54,6 +54,13 @@ def _settings(rig, **kw):
 def test_a_headless_seat_is_held_while_he_is_present_and_the_hold_is_not_cut_short(rig, monkeypatch):
     out, seen = _run(rig, monkeypatch, entrypoint="sdk-cli", settings=_settings(rig))
     assert isinstance(out, cc.Abstained) and out.reason == "hold_expired"
+    assert seen["wait"] > 0 and seen["still_away"] is None, seen
+
+
+def test_a_headless_seat_already_held_for_away_is_not_cut_short_when_he_returns(rig, monkeypatch):
+    """L3 r1 (complement, deepseek, codex converged): the away hold was already positive, so the forced path was
+    skipped and the presence recheck ended the wait the moment he came back."""
+    out, seen = _run(rig, monkeypatch, entrypoint="sdk-cli", settings=_settings(rig), away_hold=30.0)
     assert seen["wait"] > 0 and seen["still_away"] is None, seen
 
 

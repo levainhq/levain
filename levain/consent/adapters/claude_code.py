@@ -1057,11 +1057,10 @@ def decide_ex(event: Any, queue: ConsentQueue, settings: AdapterSettings, *, env
     # simply not granted. So his presence, which says whose terminal the dialog is on, decides nothing for it: it is held
     # for a signed answer whenever one could verify, unless the operator's own word is off. The hold is not cut short
     # when presence reads present (``still_away`` is dropped for it): the dialog it would hand back to does not exist.
-    unattended = environ.get("CLAUDE_CODE_ENTRYPOINT", "").startswith("sdk") and not settings.explicit_off
-    if hold <= 0 and unattended and _can_sign(settings):
+    unattended = (environ.get("CLAUDE_CODE_ENTRYPOINT", "").startswith("sdk") and not settings.explicit_off
+                  and _can_sign(settings))
+    if unattended and hold <= 0:
         hold = settings.away_hold_seconds if settings.away_hold_seconds > 0 else DEFAULT_HOLDS[AGENT]
-    else:
-        unattended = False
     hold = min(hold, max(0.0, deadline - clock()))
     if hold > 0 and settings.cockpit_data_root and not Path(settings.cockpit_data_root).is_dir():
         # away mode is on by the operator's word, but the cockpit it names is not there: no answer can verify, so a
