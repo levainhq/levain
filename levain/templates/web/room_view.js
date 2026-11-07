@@ -170,19 +170,42 @@
     return last === "" ? gap === true : last === "vendor_turn_started";
   }
 
+  // The finished replies, read from the RAW stream (the turn rows are hidden from the drawn one). A reply is the room's
+  // words after the operator's last line, up to a vendor_turn_ended; it is the same rule the server uses to rebuild a reply
+  // for the premium voice (cockpit/voice.py), so both tiers read the same words. A turn that said nothing new is no reply.
+  // ``foot`` is the gseq of the reply's last drawn line: the speaker control hangs there.
+  function repliesOf(raw, thread) {
+    var buf = [], fresh = false, out = [], foot = 0;
+    for (var i = 0; i < raw.length; i++) {
+      var it = raw[i];
+      if (!it || typeof it.gseq !== "number") continue;
+      if (it.kind === "message" && it.source === "operator") { buf = []; fresh = false; }
+      else if (it.kind === "vendor_agent_text" && typeof it.body === "string" && it.body.trim() !== "") { buf.push(it.body); fresh = true; foot = it.gseq; }
+      else if (it.kind === "vendor_turn_ended" && fresh) {
+        out.push({ thread: thread, gseq: it.gseq, foot: foot, text: buf.join("\n\n") });
+      }
+      if (it.kind === "vendor_turn_ended") { buf = []; fresh = false; foot = 0; }   // an earlier turn is never read again (the server's rule)
+    }
+    return out;
+  }
   function roomModel(body) {
     var c = body.composer || null, st = c && own(COMPOSER_WORDS, c.state) ? c.state : "none";
     var thread = typeof body.room_thread === "string" ? body.room_thread : null;
     var running = turnRunning(body.stream || [], body.launch_id, body.gap === true);
+    var replies = thread === null ? [] : repliesOf(body.stream || [], thread);
+    var stream = (body.stream || []).map(lineModel).filter(function (l) { return !l.hidden; });
+    replies.forEach(function (r) {
+      for (var i = 0; i < stream.length; i++) if (stream[i].gseq === r.foot && stream[i].kind === "vendor_agent_text") stream[i].voice = r;
+    });
     return {
-      thread: thread, open: thread !== null, running: running,
+      thread: thread, open: thread !== null, running: running, replies: replies,
       // Stop is for a turn that can be stopped; a stop sent in a race still gets the server's "Nothing was running to stop."
       canSend: thread !== null && own(SEND_STATES, st), canStop: thread !== null && own(STOP_STATES, st) && running,
       state: st, words: thread === null ? "No room is open." : (c && c.why && st !== "writable" ? COMPOSER_WORDS[st] + " (" + c.why + ")" : COMPOSER_WORDS[st]),
       model: typeof body.model === "string" && body.model ? "Model in use: " + body.model : "",
       gap: body.gap === true, dropsVia: body.drops_via === "desk" ? "desk" : "card",
       error: typeof body.room_error === "string" ? body.room_error : "",
-      stream: (body.stream || []).map(lineModel).filter(function (l) { return !l.hidden; }),
+      stream: stream,
       proposals: (body.proposals || []).map(function (p) {
         return { id: String(p.proposal_id), state: String(p.state), words: String(p.words == null ? "" : p.words),
                  summary: String(p.summary == null ? "" : p.summary), about: p.about == null ? "" : String(p.about) };
@@ -306,6 +329,8 @@
       });
     }
     if (l.truncated) row.appendChild(el(doc, "div", "rv-note", "Cut short; the vendor holds the rest."));
+    // a finished reply gets its speaker control at the foot (voice.js draws it; a page without the module draws none)
+    if (l.voice && hooks && hooks.voiceBtn) { var vb = hooks.voiceBtn(l.voice); if (vb) row.appendChild(vb); }
     if (l.ambiguous && l.ref && hooks && hooks.onMark) {
       var box = el(doc, "div", "rv-mark"), yes = el(doc, "button", "rv-mark-yes", "It arrived"),
         no = el(doc, "button", "rv-mark-no", "It did not arrive"), note = el(doc, "span", "rv-marknote");
@@ -540,6 +565,7 @@
       endDictation();
       var text = ta.value;
       if (!current || !current.thread || !text.trim() || sendB.disabled || flight.send) return;
+      voiceTap();
       forceEnd = true;
       var sendId = tryId("levain.room.send", text);                     // one id per draft text: a resend reuses it
       flight.send = true; paintDock(); note.textContent = "Sending...";
@@ -576,14 +602,19 @@
     });
     if (rotB) rotB.addEventListener("click", function () {
       if (rotB.disabled) return;
+      var V = voice(); if (V) V.stop();
+      gen++; voiceHold = true;          // a poll already out, or sent before the answer, names the OLD room: it reads nothing
       rotB.disabled = true; note.textContent = "Starting a new conversation...";
       post("rotate", { room_thread_id: current && current.thread }).then(function (r) {
         note.textContent = r.status === 200 ? "A new conversation is open." : ((r.json && r.json.message) || "No new conversation was started.");
         // a one-poll bridge: the old conversation's problem is not the new one's, but a read that still names the OLD
         // thread is only the server catching up. The same error on a new thread is a new problem and shows.
         if (r.status === 200 && current && current.error) hushed = { thread: current.thread, error: current.error };
-        last = ""; return pull();
-      }).catch(function () { note.textContent = "The server could not be reached."; }).then(paintDock);
+        // the next body is backlog: a reply that finished on the old thread during the click (a failed rotate, a pull that still
+        // names the old thread) must not be read as new
+        last = ""; voiceHold = false; voiceThread = null; return pull();
+      }).catch(function () { note.textContent = "The server could not be reached."; voiceHold = false; voiceThread = null; })
+        .then(function () { voiceHold = false; paintDock(); });
     });
     // dictation state: dbase = the text before the transcript, heard = the transcript already placed in the box
     var dbase = "", heard = "", lastHeard = "";
@@ -613,6 +644,7 @@
       } else micB.style.display = "";
       ta.addEventListener("input", function () { if (rec) { dbase = ta.value; heard = lastHeard; } });
       micB.addEventListener("click", function () {
+        voiceTap();
         if (rec) { endDictation(); return; }
         var r = new Speech();
         dbase = ta.value ? ta.value.replace(/\s*$/, " ") : ""; heard = ""; lastHeard = "";
@@ -649,7 +681,49 @@
       root.addEventListener && root.addEventListener("blur", onBlur);
     }
 
+    // Voice (V1-5 room hook). voice.js is optional: a page without it draws no control and reads nothing. The module decides
+    // every autoplay question (setting, backlog, hidden, unlocked, the one-waiting queue); this view only reports what the
+    // record shows: the finished replies, which of them were already there at mount, and the operator's own taps.
+    function voice() { return root.LevainVoice || null; }
+    var wraps = {}, voiceThread = null, voiceBase = 0, voiceHold = false;
+    function voiceKey(r) { return r.thread + ":" + r.gseq; }
+    function voiceTap() { var V = voice(); if (V) { V.unlock(); V.stop(); } }     // inside the operator's own tap
+    function voiceBtn(r) {
+      var V = voice(), k = voiceKey(r);
+      if (!V) return null;
+      if (!own(wraps, k)) { var b = V.button(r); if (b) wraps[k] = b; return b || null; }       // a falsy button is not kept
+      return wraps[k];
+    }
+    // after a draw: drop the controls of replies that are gone, then hand the module each reply that finished after mount
+    function voiceSync(m) {
+      var V = voice(), live = {};
+      m.replies.forEach(function (r) { live[voiceKey(r)] = true; });
+      Object.keys(wraps).forEach(function (k) {
+        if (!own(live, k)) { var w = wraps[k]; delete wraps[k]; if (!w) return; if (w.parentNode) w.parentNode.removeChild(w); if (w._unbind) w._unbind(); }
+      });
+      if (m.thread === null) {                              // no open room: nothing plays on, and the next room is backlog again
+        if (voiceThread !== null) { voiceThread = null; voiceBase = 0; if (V) V.stop(); }
+        return;
+      }
+      if (!V) return;
+      if (voiceThread !== m.thread) {                       // the first body of this mount, or a new conversation
+        if (voiceThread !== null) V.stop();
+        voiceThread = m.thread;
+        voiceBase = m.replies.reduce(function (a, r) { return r.gseq > a ? r.gseq : a; }, 0);
+        V.arm(voiceBase);
+        return;
+      }
+      if (voiceHold) return;                                // a New is pending: the old room's replies are not read
+      m.replies.forEach(function (r) { if (r.gseq > voiceBase) V.replyFinished(r); });
+    }
+    function voiceEnd() {
+      var V = voice();
+      Object.keys(wraps).forEach(function (k) { var w = wraps[k]; delete wraps[k]; if (w && w._unbind) w._unbind(); });
+      if (V) V.stop();
+    }
+
     var hooks = {
+      voiceBtn: voiceBtn,
       onMark: function (ref, delivered, mnote, done) {
         mnote.textContent = "Marking...";
         post("mark", { room_thread_id: thread, message_id: ref, delivered: delivered }).then(function (r) {
@@ -709,6 +783,7 @@
               if (thread !== cardsThread) { drafts = {}; hooks.ids = {}; cardsThread = thread; saveCards(); }
             }
             renderRoom(doc, body, current, hooks, ui, drafts);
+            voiceSync(current);
             if (stick) toEnd();
             wasEnd = atEnd(); paintJump();
           }
@@ -721,7 +796,7 @@
     paintDock();
     pull().then(loop);
     return { stop: function () {
-      stopped = true; clearTimeout(timer); endDictation(); if (root.removeEventListener) root.removeEventListener("resize", onResize);
+      stopped = true; clearTimeout(timer); endDictation(); voiceEnd(); if (root.removeEventListener) root.removeEventListener("resize", onResize);
       if (onHidden) doc.removeEventListener("visibilitychange", onHidden);
       if (onBlur && root.removeEventListener) root.removeEventListener("blur", onBlur);
       if (vv) {
