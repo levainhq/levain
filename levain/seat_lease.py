@@ -423,7 +423,7 @@ def prepare_launch(lane_key: str, remote_url: str, base_sha: str, *, claude_bin:
             except seat_push.SeatPushRefused as exc:
                 raise SeatLaunchRefused(str(exc)) from None
         if egress is not None:
-            profile_kw = {"cockpit_root": cockpit_root, "levain_home": _levain_home(), **profile_kw}
+            profile_kw = {"cockpit_root": cockpit_root, "levain_home": Path(os.path.abspath(_levain_home())), **profile_kw}
         profile = build_seat_profile(clone, return_dir, claude_bin=claude_bin, python=python, lease=lease,
                                      key_dir=key_dir, egress=egress, **profile_kw)
         row = {**row, "profile_digest": profile.digest(), "claude": _binary_ident(claude_bin)}
