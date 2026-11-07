@@ -498,14 +498,20 @@ def _release_cause(q: Any, outcome: str, at: str, now: str, after: timedelta, to
     return None
 
 
-def _read_due(db: Path) -> list[Any]:
-    conn = sqlite3.connect(db.resolve().as_uri() + "?mode=ro", uri=True, timeout=2.0)
-    try:
-        return conn.execute(_DUE_SQL).fetchall()
-    except sqlite3.Error:
+def _read_due(db: Path) -> list[Any] | None:
+    """The due held-ping rows, read-only: ``[]`` when the database does not exist (nothing was ever held), ``None``
+    when the read FAILED (busy, locked, corrupt), which is not "no rows": the caller then takes the locked path, which
+    re-reads under the lock, so a transient failure never drops a sweep's due rows."""
+    if not db.exists():
         return []
-    finally:
-        conn.close()
+    try:
+        conn = sqlite3.connect(db.resolve().as_uri() + "?mode=ro", uri=True, timeout=2.0)
+        try:
+            return conn.execute(_DUE_SQL).fetchall()
+        finally:
+            conn.close()
+    except sqlite3.Error:
+        return None
 
 
 def claim_held(directory: Path | str, *, after: timedelta | None = None) -> list[tuple[Any, str]]:
@@ -540,8 +546,9 @@ def claim_held(directory: Path | str, *, after: timedelta | None = None) -> list
     # lock for nothing. The decision to release is still re-made under the locks below.
     now0 = store._stamp()
     today0 = local_today(parse_stamp(now0))
-    if not any(_release_cause(qs.get(qid), oc, at, now0, after, today0) is not None
-               for qid, at, oc in _read_due(db)):
+    due = _read_due(db)
+    if due is not None and not any(_release_cause(qs.get(qid), oc, at, now0, after, today0) is not None
+                                   for qid, at, oc in due):      # a failed read (None) falls through to the lock
         return []
     with write_transaction(store._connect) as conn:
         now = store._stamp()

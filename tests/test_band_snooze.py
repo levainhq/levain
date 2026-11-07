@@ -511,3 +511,38 @@ def test_a_held_due_row_that_stays_held_takes_no_write_lock(tmp_path, monkeypatc
     desk.later(minutes=10)                                                # due in the table, held by the snooze
     monkeypatch.setattr(first_reader, "write_transaction", lambda *a, **k: pytest.fail("took the write lock"))
     assert first_reader.claim_held(desk.dir) == []
+
+
+# --- the claim's pre-read: a missing db, a failed read, a purged question ----------------------------------------------
+def test_the_due_pre_read_of_a_missing_db_is_nothing_due_not_a_crash(tmp_path):
+    from levain.coordinator import first_reader
+
+    assert first_reader._read_due(tmp_path / "no-such-dispatch.db") == []
+    assert first_reader.claim_held(tmp_path) == []                       # a fresh directory with no db either
+
+
+def test_a_failed_pre_read_falls_through_to_the_locked_path_and_drops_no_due_row(tmp_path, monkeypatch):
+    from levain.coordinator import first_reader
+    from tests.test_questions_held_ping import Desk
+
+    desk = Desk(tmp_path, monkeypatch)
+    desk.coordinator()
+    q, _ = desk.ask()
+    desk.later(minutes=10)                                                # unread past 10 minutes: due
+    monkeypatch.setattr(first_reader, "_read_due", lambda db: None)       # BUSY / corruption: a distinct failure
+    assert [(r.id, c) for r, c in first_reader.claim_held(desk.dir)] == [(q.id, "unread")]
+
+
+def test_a_dispatch_row_whose_question_was_purged_is_released_answered_and_pings_nobody(tmp_path, monkeypatch):
+    from levain.coordinator import first_reader
+    from tests.test_questions_held_ping import Desk
+
+    desk = Desk(tmp_path, monkeypatch)
+    desk.coordinator()
+    q, _ = desk.ask()
+    desk.later(minutes=10)
+    # the questions table is append-only by trigger, so the purge is modelled where it is observed: the read
+    monkeypatch.setattr(QuestionStore, "get", lambda self, ref: None)
+    assert first_reader.claim_held(desk.dir) == []                        # skipped, no crash, nobody pinged
+    assert first_reader.claim_held(desk.dir) == []
+    assert desk.rows("SELECT cause FROM held_ping_releases") == [("answered",)]
