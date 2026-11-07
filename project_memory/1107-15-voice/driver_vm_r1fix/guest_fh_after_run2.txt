@@ -1,0 +1,10 @@
+total 40
+drwxr-xr-x   9 _levain_dispatch  wheel  288 Nov  7 20:33 .
+drwxrwxrwt  13 root              wheel  416 Nov  7 20:33 ..
+-rw-r--r--   1 _levain_dispatch  wheel   45 Nov  7 20:33 drv8xa40a2100b4bd.final.json
+-rw-r--r--   1 root              wheel    0 Nov  7 20:33 drv8xa40a2100b4bd.journaled
+-rw-r--r--   1 _levain_dispatch  wheel    5 Nov  7 20:33 drv8xa40a2100b4bd.pid
+-rw-r--r--   1 _levain_dispatch  wheel   73 Nov  7 20:33 drv8xa40a2100b4bd.prepared.json
+-rw-r--r--   1 _levain_dispatch  wheel   63 Nov  7 20:33 drv8xa40a2100b4bd.released.json
+-rw-r--r--   1 _levain_dispatch  wheel   63 Nov  7 20:33 drv8xa40a2100b4bd.spawned.json
+drwxr-xr-x   5 _levain_dispatch  wheel  160 Nov  7 20:31 repo
