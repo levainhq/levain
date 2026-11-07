@@ -943,12 +943,115 @@ def _notice_what(tool_name: str, tool_input: Any) -> str:
         return tool_name
 
 
+# --- the foreground session (row 135, c-prime; Phill 11-07 band 407) ------------------------------------------------
+LSOF_PATH = "/usr/sbin/lsof"
+LSOF_TIMEOUT = 2.0
+_LSOF_ROW = re.compile(r"^(?P<cmd>.*?)\s+(?P<pid>\d+)\s+\S+\s+\S+\s+unix\s+(?P<dev>0x[0-9a-f]+)\s+\S+\s+(?P<name>.+?)\s*$")
+
+
+def _read_roster(home: Path) -> Any:
+    """The claude daemon's roster (``~/.claude/daemon/roster.json``), parsed. Raises on anything unreadable."""
+    return json.loads((Path(home) / ".claude" / "daemon" / "roster.json").read_text(encoding="utf-8"))
+
+
+def _run_lsof() -> str:
+    """``lsof -U`` (every unix socket), the absolute binary, an empty environment, bounded by :data:`LSOF_TIMEOUT`.
+    Raises on a missing binary, a timeout or a non-zero exit with no output."""
+    done = subprocess.run([LSOF_PATH, "-U"], capture_output=True, timeout=LSOF_TIMEOUT, check=False, env={},
+                          stdin=subprocess.DEVNULL)
+    if not done.stdout:
+        raise OSError(f"lsof -U gave no output (exit {done.returncode})")
+    return done.stdout.decode("utf-8", "replace")
+
+
+def _lease_holds(queue_dir: Path | str, session: str) -> bool:
+    """Whether ``session`` is the harness session of the launch that holds the live coordinator lease. Raises when the
+    store cannot be read; a store that is not there is no lease (False)."""
+    from datetime import datetime, timezone
+
+    from levain.cockpit.consent import utc_stamp
+    from levain.coordinator import lease
+    from levain.coordinator.store import CoordStore, StoreAbsent
+
+    try:
+        conn = CoordStore(queue_dir).open_readonly(busy_s=0.25)
+    except StoreAbsent:
+        return False
+    try:
+        held = lease.lease(conn, utc_stamp(datetime.now(timezone.utc)))
+        if held is None or not held.live:
+            return False
+        ln = lease.by_harness_session(conn, session)
+        return ln is not None and ln.session_key == held.holder
+    finally:
+        conn.close()
+
+
+def foreground_session(event_session: str, *, home: Path, queue_dir: Path | str | None,
+                       roster_reader: Callable[[Path], Any] | None = None,
+                       lsof_runner: Callable[[], str] | None = None,
+                       lease_reader: Callable[[Path | str, str], bool] | None = None) -> tuple[bool, str]:
+    """``(is_foreground, why)`` for the Claude Code session ``event_session``: whether the operator is looking at it
+    now, so its own dialog is the right place to ask. The hook's event names the session and nothing about which client is
+    attached (measured 11-07, desk reply to band 407), so the answer is read from two places, either of which says
+    foreground: (a) ``event_session`` is the harness session of the launch that holds the live coordinator lease
+    (``lease_reader``, default the coordinator store read-only); (b) the claude daemon's worker for that session
+    (``roster_reader`` reads ``roster.json``, matched on ``sessionId``) has a client attached to its ``ptySock``: one
+    ``lsof -U`` (``lsof_runner``, default :func:`_run_lsof`, bounded) lists the worker's socket rows by address, and a
+    live client is a row ``->`` one of those addresses from a process that is neither the worker nor the roster's
+    ``supervisorPid`` (the supervisor holds one such row for every worker whether or not anyone is attached; measured).
+    ERR TOWARD PINGING (Phill: *"it is better to err towards pinging than not"*): anything else is NOT foreground, the
+    unknown included. A missing session id, an unreadable or malformed roster, no roster row, a ``ptySock`` that is not
+    an absolute path or has no rows in the listing (a stale roster), an lsof that is missing, timed out or failed, and a
+    lease read that raised each answer ``(False, reason)``; the wrong answer then costs one redundant card while the
+    native dialog still shows. The function never raises.
+    FRAGILE BY INTENT: (b) rests on the daemon's roster layout and on how claude 2.1.319 opens its pty socket,
+    both claude-internal, undocumented and bound to that version. The attached-client row shape was derived from the
+    unattached rows and the supervisor's own, and had not been observed with a real client when this was written; a
+    version that changes either makes (b) answer not-foreground, which holds and pings, never silent."""
+    try:
+        session = event_session.split("#", 1)[0] if isinstance(event_session, str) else ""
+        if not session:
+            return False, "no session id"
+        lease_note = ""
+        try:
+            if queue_dir is not None and (lease_reader or _lease_holds)(queue_dir, session):
+                return True, "the coordinator lease holder"
+        except Exception as e:  # noqa: BLE001 - an unreadable lease is unknown, and unknown holds
+            lease_note = f"; lease unreadable ({type(e).__name__})"
+        roster = (roster_reader or _read_roster)(Path(home))
+        workers = roster.get("workers") if isinstance(roster, Mapping) else None
+        rows = list(workers.values()) if isinstance(workers, Mapping) else workers if isinstance(workers, list) else None
+        if rows is None:
+            return False, "roster has no workers" + lease_note
+        row = next((w for w in rows if isinstance(w, Mapping) and w.get("sessionId") == session), None)
+        if row is None:
+            return False, "no roster row for the session" + lease_note
+        sock, worker_pid = row.get("ptySock"), row.get("pid")
+        if not isinstance(sock, str) or not os.path.isabs(sock):
+            return False, "the roster row has no ptySock" + lease_note
+        supervisor = roster.get("supervisorPid")
+        own = {p for p in (worker_pid, supervisor) if isinstance(p, int) and not isinstance(p, bool)}
+        listing = (lsof_runner or _run_lsof)()
+        parsed = [m.groupdict() for m in map(_LSOF_ROW.match, listing.splitlines()) if m]
+        mine = {r["dev"] for r in parsed if r["name"] == sock}
+        if not mine:
+            return False, "the ptySock has no open rows (stale roster)" + lease_note
+        for r in parsed:
+            if r["name"].startswith("->") and r["name"][2:] in mine and int(r["pid"]) not in own:
+                return True, f"a client (pid {r['pid']}) is attached to the ptySock"
+        return False, "no client on the ptySock" + lease_note
+    except Exception as e:  # noqa: BLE001 - never raises: unknown is not foreground
+        return False, f"unknown ({type(e).__name__}: {e})"
+
+
 def decide_ex(event: Any, queue: ConsentQueue, settings: AdapterSettings, *, environ: Mapping[str, str], home: Path,
               launch_nonce: str, contained_launch: ContainedLaunchProof | None,
               claude_pid: int | None = None, max_hold: float = DEFAULT_MAX_HOLD,
               policy: Policy | None = None, clock: Callable[[], float] = time.monotonic,
               idle: Callable[[], float | None] | None = None,
-              still_away: Callable[[], tuple[bool, str, str]] | None = None) -> CoreResult:
+              still_away: Callable[[], tuple[bool, str, str]] | None = None,
+              foreground: Callable[[str], tuple[bool, str]] | None = None) -> CoreResult:
     """The core's result for one event, tagged (:data:`CoreResult`), every result bound to the :class:`CoreCall`
     :func:`core_call_of` computes from ``event``. ``launch_nonce`` is ``""`` for every hook caller and the launch's
     spawn nonce for a chat call; ``contained_launch`` is ``None`` for every hook caller and the launch's SH1
@@ -957,7 +1060,9 @@ def decide_ex(event: Any, queue: ConsentQueue, settings: AdapterSettings, *, env
     ``max_hold`` is a total deadline: the wait ends :data:`CLEANUP_RESERVE` seconds before it. The hold is
     :func:`away_hold` (``idle`` is its input-idle source, default the platform's); ``still_away`` (:func:`main`
     passes :func:`still_away_from`) ends a hold early when it says away mode ended (the operator is back, or no
-    key could sign), leaving the native dialog to ask. A hold that will run (a wait above zero after the request is
+    key could sign), leaving the native dialog to ask. With a paired phone and a key that could sign, a request from a
+    session that is not the foreground one (``foreground``, default :func:`foreground_session`) is held as well, whatever
+    presence reads and not cut short by it (row 135). A hold that will run (a wait above zero after the request is
     filed) first pings the request to his devices (:func:`hold_ping`), and the result's ``held`` says so. ``policy``
     (default :func:`levain.consent.policy.decide`) is only ever reached through :func:`guarded_policy`, called with
     the event's ``permission_mode`` as ``posture`` (``None`` when absent: no grant matches) and the tool input the
@@ -1061,6 +1166,29 @@ def decide_ex(event: Any, queue: ConsentQueue, settings: AdapterSettings, *, env
                   and _can_sign(settings))
     if unattended and hold <= 0:
         hold = settings.away_hold_seconds if settings.away_hold_seconds > 0 else DEFAULT_HOLDS[AGENT]
+    # Phill 11-07 (band 407, row 135): a paired phone hears of every approval from a session that is not the one he is
+    # looking at: *"it is better to err towards pinging than not"*. Presence still rules the foreground session (its
+    # dialog, and the away hold when away); a hook call (no chat), a key that could sign, a phone that can receive
+    # and his explicit word not off make the rest a hold. Not foreground includes unknown (:func:`foreground_session`).
+    # Like an unattended seat's, the hold is not cut short by presence reading present: the dialog it hands back to is
+    # in a window he is not in; it ends at its timeout and the native dialog asks.
+    elsewhere = False
+    if hold <= 0 and not unattended and not launch_nonce and not settings.explicit_off and _can_sign(settings):
+        try:
+            from levain.webpush import live
+
+            paired = live(queue.directory)
+        except Exception:  # noqa: BLE001 - an unreadable push store is no phone to reach
+            paired = False
+        if paired:
+            try:
+                fg, why = (foreground or (lambda s: foreground_session(s, home=home, queue_dir=queue.directory)))(session)
+            except Exception as e:  # noqa: BLE001 - a check that fails is unknown, and unknown holds and pings
+                fg, why = False, f"the foreground check failed ({type(e).__name__})"
+            if not fg:
+                elsewhere = True
+                hold = settings.away_hold_seconds if settings.away_hold_seconds > 0 else DEFAULT_HOLDS[AGENT]
+                print(f"levain consent hook: holding for the phone, not the foreground session ({why})", file=sys.stderr)
     hold = min(hold, max(0.0, deadline - clock()))
     if hold > 0 and settings.cockpit_data_root and not Path(settings.cockpit_data_root).is_dir():
         # away mode is on by the operator's word, but the cockpit it names is not there: no answer can verify, so a
@@ -1091,7 +1219,7 @@ def decide_ex(event: Any, queue: ConsentQueue, settings: AdapterSettings, *, env
             wait = min(wait, max(0.0, deadline - clock()))   # the ping's spawn time comes out of the hold, not the reserve
             held = held and wait > 0   # the spawn can have used the whole wait: then no hold runs and the dialog's notice goes (L3 round c)
             got, back = hold_for_answer(queue, request, wait, tool_input=tool_input, posture=posture,
-                                        still_away=None if unattended else still_away,
+                                        still_away=None if unattended or elsewhere else still_away,
                                         contained_launch=contained_launch)
         if got is None:
             note = f"away mode ended ({back}); the native dialog stands" if back else \
