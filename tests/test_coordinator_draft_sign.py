@@ -669,8 +669,8 @@ def test_the_cockpit_sheet_names_the_actions_and_refuses_a_signing_one_off_its_p
         assert _coord_route("/cockpit/coord/" + a) == a
     sheet = CoordSheet(world["qdir"], "localhost", None, SimpleNamespace(keys=lambda: {}))     # pinned to no page
     with pytest.raises(CoordRefused) as exc:
-        sheet.step("draft-review", {"draft_id": "x"})
+        sheet.step("draft-review", {"draft_id": "x"}, device="cockpit")
     assert refused(exc) == (422, "sign_refused")
     with pytest.raises(CoordRefused) as exc:                      # a read signs nothing, so it is not refused for it
-        sheet.step("draft-cards", {"thread_id": "x"})
+        sheet.step("draft-cards", {"thread_id": "x"}, device="cockpit")
     assert exc.value.status == 400          # past the page check, the phone port's own request check answers

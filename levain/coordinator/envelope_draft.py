@@ -42,6 +42,9 @@ _CITE_KEYS = {"field", "kind", "ref", "digest"}
 _REFS = {"drop": re.compile(r"dr-[0-9a-f]{32}"), "envelope": re.compile(r"ev-[0-9a-f]{32}")}
 _SHA = re.compile(r"sha256:[0-9a-f]{64}")
 _PROPOSAL_KEYS = frozenset(env.BODY_KEYS - {"draft"})
+# the one refusal for a launch grant in any draft path (the proposal check and the spec rule)
+_NO_LAUNCH_DRAFT = ("a draft never carries a launch grant: sign one on purpose from the cockpit's own envelope sheet "
+                    "(Add an envelope), or with levain drop --envelope")
 
 
 class DraftError(ValueError):
@@ -142,11 +145,12 @@ def check_proposal(proposal: Any) -> dict[str, Any]:
     """A proposal held to its shape: exactly the body's keys minus ``draft``, each editable value ``None`` or a valid
     one (the body's own checks, with each ``None`` filled by a placeholder), the other keys never ``None``, and the
     stop within :data:`levain.dispatch.contract.MAX_LIFETIME` of the issue time. Raises :class:`DraftError`."""
-    # the launch grant is the one OPTIONAL key (absent = none; it is not an editable field, so a renewal or a
-    # replacement never carries it forward: a launch grant is signed on purpose, each time)
-    if not isinstance(proposal, dict) or set(proposal) not in (_PROPOSAL_KEYS, _PROPOSAL_KEYS | env.OPTIONAL_KEYS):
-        raise DraftError(f"a proposal has exactly the keys {sorted(_PROPOSAL_KEYS)} (and optionally "
-                         f"{sorted(env.OPTIONAL_KEYS)})")
+    # a draft never carries the launch grant: it is no editable field, no rule cites one, and a renewal or a replacement
+    # must not carry it forward. A launch grant is signed on purpose, each time, from the cockpit's own envelope sheet.
+    if isinstance(proposal, dict) and env.LAUNCH_LIST in proposal:
+        raise DraftError(_NO_LAUNCH_DRAFT)
+    if not isinstance(proposal, dict) or set(proposal) != _PROPOSAL_KEYS:
+        raise DraftError(f"a proposal has exactly the keys {sorted(_PROPOSAL_KEYS)}")
     if any(proposal[k] is None for k in _PROPOSAL_KEYS - set(EDITABLE) - {"supersedes"}):
         raise DraftError("only the editable values, and supersedes, may be null")
     if proposal["format"] != env.BODY_FORMAT or proposal["origin"] != "worded":
@@ -247,8 +251,7 @@ def empty_base(body: Mapping[str, Any]) -> dict[str, Any]:
     included (L3 h11 r1: a budget kept from the head read as "unchanged" while all of it was newly granted)."""
     out = {**body, "where": [], **{k: [] for k in env.EFFECT_LISTS}, "stop_at": body["issued_at"],
            "budget": {k: 0 for k in env.BUDGET_KEYS}}
-    if env.LAUNCH_LIST in out:
-        out[env.LAUNCH_LIST] = []
+    out.pop(env.LAUNCH_LIST, None)          # absent is the one no-grant form
     return out
 
 

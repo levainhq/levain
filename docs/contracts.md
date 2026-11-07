@@ -328,12 +328,19 @@ the envelope's `where` repos, `count` is a whole number from 1 to 4 (the default
 
 - **Absent means no grant.** The key is left out of the body unless it is named, so an envelope signed before it existed has the
   same bytes, digest and signature as it always did and still verifies. The format stays `/2`. An older levain refuses a body
-  that carries `launches` (its key-set check is exact), which fails closed.
-- **It is not an effect.** `launches` is not in the lists a role ceiling narrows by; a role's scope cut from an envelope always has
-  `launches: []`, and a seat lease never carries it.
-- **Who may set it.** The cockpit's own "Add an envelope" modal, with a toggle that is off by default. A paired phone's sheet cannot.
+  that carries `launches` (its key-set check is exact), which fails closed. An empty list is refused: leaving the key out is the
+  only way to say "no grant".
+- **It is not an effect.** `launches` is not in the lists a role ceiling narrows by, and the ceiling checks refuse it; a role's
+  scope cut from an envelope never carries it, and neither does a seat lease.
+- **Who may set it.** The cockpit's own "Add an envelope" modal, with a toggle that is off by default. A paired phone cannot, on
+  its own sheet or on the cockpit's routes: the server decides by the credential the request was authenticated with (a paired
+  device's token runs as that device), never by anything the page sends.
+- **Carried forward only by extend.** `levain envelope extend` signs the head's grant again and the card shows it. A conversation
+  draft never carries one: a renewal or replacement drops it (its card shows it removed), and a draft that names `launches`
+  is refused.
 - **What the desk checks at each launch.** The envelope is stored and verified; its effective stop (after any earlier-stop
   narrowing) is still ahead; an effective `launches` entry names the repo; and the desk's own launch log shows fewer than `count`
   launches for that envelope and repo. `levain.coordinator.envelope.launch_allowance(envelope, repo, now, used)` is that rule as a
-  pure function; levain keeps no counter, because the count is the desk's to log.
+  pure function (`now` must be an aware datetime); levain keeps no counter, because the count is the desk's to log, and the desk
+  serialises its launches and reads `used` under its own lock, since the helper reserves nothing.
 

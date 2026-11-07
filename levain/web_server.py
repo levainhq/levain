@@ -866,8 +866,10 @@ _COORD_PREFIX = "/cockpit/coord/"
 _COORD_LIST = "/cockpit/coord/drops.json"
 _COORD_SHEET = "/sign/drop"
 # The phone's coordinator routes take a drop from a PAIRED DEVICE only (its token's device id is handed to CoordPhone.step,
-# which binds a kept envelope review to it). The cockpit has no device id: its credential is the surface token every sign
-# route needs (the same gate as every cockpit passkey ceremony), so this one name stands for "this cockpit's page".
+# which binds a kept envelope review to it). The cockpit's gate takes a surface token OR a paired device's token, so the
+# device a step runs as is read from the request's AUTHENTICATED credential (_coord_device), never fixed: a paired device
+# runs as its own id ("d-" + hex, never this name), and only a surface token runs as this one name, "this cockpit's page"
+# (L3 r1: a fixed label let a paired phone set the launch grant only the cockpit may).
 _COORD_DEVICE = "cockpit"          # == levain.coordinator.phone.COCKPIT_DEVICE (the one device that may add a launch grant)
 
 
@@ -917,9 +919,10 @@ class CoordSheet:
         return (f"an envelope signature verifies only when signed on https://{self.rp_id} (no port), and this cockpit is "
                 f"served on {self.page_origin}: sign it on that page or from the terminal")
 
-    def step(self, action: str, req: Any) -> "dict[str, Any]":
+    def step(self, action: str, req: Any, *, device: "str | None") -> "dict[str, Any]":
         """``POST /cockpit/coord/<action>``: :meth:`CoordPhone.step`'s reply (a challenge's also carries ``line``, the exact
-        text signed). :class:`levain.coordinator.phone.CoordRefused` with the phone port's status, word and words."""
+        text signed). ``device`` is the authenticated device the request runs as (the handler's ``_coord_device``).
+        :class:`levain.coordinator.phone.CoordRefused` with the phone port's status, word and words."""
         from levain.coordinator import envelope as env
         from levain.coordinator.draft_sign import SIGNING
         from levain.coordinator.phone import CoordRefused
@@ -935,7 +938,7 @@ class CoordSheet:
                 raise CoordRefused(503, "closing", "the cockpit is shutting down; nothing was delivered")
             self._running += 1
         try:
-            out = self.phone.step(action, req, device=_COORD_DEVICE)
+            out = self.phone.step(action, req, device=device)
         finally:
             with self._gate:
                 self._running -= 1
@@ -3375,9 +3378,19 @@ class _Handler(GuardedHandler):
         if sheet is None:      # the route is not served without one; an explicit check survives `python -O`
             return {"error": "not_found", "message": "no such route"}, 404
         try:
-            return sheet.step(action, req), 200
+            return sheet.step(action, req, device=self._coord_device()), 200
         except CoordRefused as exc:
             return {"error": exc.error, "message": exc.message}, exc.status
+
+    def _coord_device(self) -> "str | None":
+        """The device a coord step runs as, from the credential verified in ``_credential`` (never anything the client
+        says): a paired device's own id, ``_COORD_DEVICE`` for a surface token, None for no credential (CoordPhone refuses
+        None, 403). A paired name with no id after the prefix is ``""``, which CoordPhone refuses the same way."""
+        cred = self._credential(required=True)
+        name = cred.get("name") if cred.get("class") == "token" else None
+        if not isinstance(name, str) or not name:
+            return None
+        return name[len(PAIRED_PREFIX):] if name.startswith(PAIRED_PREFIX) else _COORD_DEVICE
 
     def _key_line_post(self, req: Any) -> "tuple[dict[str, Any], int]":
         """``POST /cockpit/passkey/key-line`` (OS-2): :meth:`levain.phone_server._PhoneServer.key_line` itself, run over

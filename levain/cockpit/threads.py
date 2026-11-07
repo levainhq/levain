@@ -125,7 +125,11 @@ def _effects_words(body: dict[str, Any], stop: Any = None) -> str:
         _bad()
     until = f" until {_clock_words(stop)}" if stop is not None else ""
     for e in launches:
-        words += f"; may launch up to {_count(e['count'])} seats in {e['repo']}{until}"
+        # parse_body's own bounds, so a line it would refuse is never worded (fail closed upstream)
+        if (not isinstance(e, dict) or set(e) != {"repo", "count"} or not isinstance(e["repo"], str)
+                or type(e["count"]) is not int or not 1 <= e["count"] <= env.LAUNCH_MAX):
+            _bad()
+        words += f"; may launch up to {e['count']} seats in {e['repo']}{until}"
     return words
 
 

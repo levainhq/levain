@@ -109,7 +109,7 @@ def test_a_bad_count_is_refused_at_compose_in_the_same_words(ctx, count):
     with pytest.raises((CoordError, env.EnvelopeError)):
         ctx.store.check_body(canonical(body))
     proposal = _proposal(launches=[{"repo": REPO, "count": count}])
-    with pytest.raises((ed.DraftError, ValueError), match=refusal):
+    with pytest.raises(ed.DraftError, match="a draft never carries a launch grant"):
         ed.check_proposal(proposal)
 
 
@@ -120,11 +120,39 @@ def _proposal(**over):
     return p
 
 
-def test_a_draft_proposal_may_carry_launches_or_not_and_nothing_else_extra():
+def test_a_draft_proposal_never_carries_launches_and_says_so():
+    """L3 r1 #2: drafts never carry a launch grant (a renewal or replacement must not, and nothing in the draft rules
+    cites one), so a proposal that holds the key is refused in words, valid or not, and nothing else extra passes."""
     assert ed.check_proposal(_proposal())
-    assert ed.check_proposal(_proposal(launches=_grant()))
+    for launches in (_grant(), [], _grant(9)):
+        with pytest.raises(ed.DraftError, match="a draft never carries a launch grant"):
+            ed.check_proposal(_proposal(launches=launches))
     with pytest.raises(ed.DraftError, match="exactly the keys"):
         ed.check_proposal(_proposal(surprise=[]))
+
+
+def test_a_spec_drop_naming_launches_is_refused_as_a_draft_rule_not_silently_dropped(ctx):
+    """L3 r1 #3: spec_rule read the CLI's spec keys (launches included) but copied only the draft's editable fields, so a
+    complete spec carrying a grant made a signable draft that had silently lost it. It is refused, in plain words."""
+    from levain.coordinator import envelope_drafts as drafts
+
+    _d, t = ctx.plain_thread("draft me")
+    drafts.drop_rule(ctx.store, t.thread_id, by="operator")                 # the series a later spec drop revises
+    spec ={"where": [{"repo": ctx.path, "paths": ["."]}], "lands": [], "pushes": [], "publishes": [],
+            "budget": {"tool_calls": 10, "tokens": 1000, "dollars_cents": 0, "hours": 1}, "stop": "2h",
+            "launches": [{"repo": ctx.path, "count": 2}]}
+    correction = ctx.plain(json.dumps(spec))
+    with pytest.raises(CoordError, match="a draft never carries a launch grant"):
+        drafts.spec_rule(ctx.store, t.thread_id, correction.drop_id, by="operator")
+    no_grant = ctx.plain(json.dumps({k: v for k, v in spec.items() if k != "launches"}))
+    assert drafts.spec_rule(ctx.store, t.thread_id, no_grant.drop_id, by="operator").proposal["where"]
+
+
+def test_an_empty_launches_list_is_refused_absent_is_the_one_no_grant_form():
+    """L3 r1 #5: two canonical encodings of 'no grant' would be two digests for one meaning."""
+    with pytest.raises(env.EnvelopeError, match="an empty launches list is not a grant: leave the key out"):
+        env.parse_body(canonical(_body(launches=[])))
+    assert "launches" not in env.parse_body(canonical(_body()))
 
 
 def test_a_spec_that_names_no_launches_builds_a_body_without_the_key(ctx):
@@ -199,6 +227,13 @@ def test_launch_allowance_refuses_a_used_that_is_not_a_count(used):
         env.launch_allowance(_body(launches=_grant()), REPO, AT, used)
 
 
+@pytest.mark.parametrize("now", [datetime(2026, 10, 20, 12, 30), "2026-10-20T12:30:00Z", None])
+def test_launch_allowance_refuses_a_now_that_is_not_an_aware_time(now):
+    """L3 r1 #6: a naive datetime raised TypeError from the stop comparison; it is a refusal, never a crash."""
+    with pytest.raises(env.EnvelopeError, match="now is an aware datetime"):
+        env.launch_allowance(_body(launches=_grant()), REPO, now, 0)
+
+
 def test_the_effective_stop_earlier_and_a_dropped_grant_end_the_allowance(ctx):
     d, _f, b, _s = ctx.structured("launch twice", launches=[{"repo": ctx.path, "count": 2}])
     (t,) = ctx.store.split(d.drop_id, [Part("work", "w")])
@@ -216,7 +251,20 @@ def test_the_effective_stop_earlier_and_a_dropped_grant_end_the_allowance(ctx):
     (t2,) = ctx.store.split(d2.drop_id, [Part("work", "w")])
     ctx.store.attenuate(b2["envelope_id"], "kill")
     killed = ctx.store.effective(b2["envelope_id"], t2.thread_id)
-    assert killed["launches"] == [] and env.launch_allowance(killed, ctx.path, NOW, 0) == 0
+    assert "launches" not in killed and env.launch_allowance(killed, ctx.path, NOW, 0) == 0
+
+
+def test_the_ceiling_apis_refuse_a_launch_as_an_effect_and_never_raise(ctx):
+    """L3 r1 #4: effect_key accepts "launches", so the ceiling APIs passed validation then indexed eff["launches"] on a
+    no-grant envelope (KeyError). Launches are not effects: both APIs refuse, with or without a grant."""
+    launch = {"repo": ctx.path, "count": 1}
+    for grant in (None, [{"repo": ctx.path, "count": 2}]):
+        kw = {} if grant is None else {"launches": grant}
+        d, _f, b, _s = ctx.structured("ceiling", **kw)
+        (t,) = ctx.store.split(d.drop_id, [Part("work", "w")])
+        refused = ctx.store.ceiling_refusal(b["envelope_id"], t.thread_id, effect=("launches", launch))
+        assert refused == "the effect asked for is not a land, push or publish this reader knows"
+        assert ctx.store.ceiling_criteria(b["envelope_id"], t.thread_id, "launches", launch) is None
 
 
 # 6 -- widens ------------------------------------------------------------------------------------------------------
@@ -247,7 +295,7 @@ def test_a_role_scope_cut_from_an_envelope_with_launches_carries_none():
     scope = {"where": [{"repo": REPO, "paths": ["."]}], "lands": [], "pushes": [], "publishes": [],
              "launches": _grant(3)}
     got = narrow_scope(scope, {"where": [{"repo": REPO, "paths": ["."]}]})
-    assert got["launches"] == []
+    assert "launches" not in got                                               # absent: the one no-grant form
     assert "launches" not in narrow_scope({k: v for k, v in scope.items() if k != "launches"},
                                           {"where": [{"repo": REPO, "paths": ["."]}]})
     with pytest.raises(CoordError, match="not one of"):
@@ -264,7 +312,27 @@ def test_the_signed_card_says_in_plain_words_what_may_be_launched():
     text = "\n".join(ccli._describe(body, None, now=AT))
     stop = datetime(2026, 10, 20, 14, 0, tzinfo=timezone.utc).astimezone().strftime("%Y-%m-%d %H:%M %Z")
     assert "launches (seats) it may do:" in text
-    assert f"may launch up to 2 seats in {REPO} until {stop}" in text
+    (line,) = [x for x in text.splitlines() if "may launch" in x]
+    assert line.strip() == f"may launch up to 2 seats in {REPO} until {stop}"          # the repo once (L3 r1 #7)
+
+
+def test_a_launch_grant_whose_stop_moved_is_marked_changed_not_unchanged():
+    """L3 r1 #8: the rendered line carries `until <stop>`, so a grant whose stop moved did change in what is read."""
+    old = _body(launches=_grant(2))
+    new = _body(launches=_grant(2), stop_at="2026-10-20T16:00:00.000000Z")
+    marked = "\n".join(ccli._describe(new, None, old=old, now=AT))
+    assert "~ changed: may launch up to 2 seats" in marked and "= unchanged: may launch" not in marked
+    same = "\n".join(ccli._describe(old, None, old=old, now=AT))
+    assert "= unchanged: may launch up to 2 seats" in same
+
+
+def test_the_show_identity_lines_name_each_kind_in_the_singular():
+    """L3 r1 #7: k[:-1] read "launche", "pushe", "publishe"."""
+    body = _body(launches=_grant(2))
+    lines = ccli._identity_lines(body)
+    assert lines == [f"    launch identity: {env.effect_identity('launches', _grant(2)[0])}"]
+    push = {"repo": REPO, "remote": "origin", "url": "https://x/y.git", "branch": "main"}
+    assert ccli._identity_lines(_body(pushes=[push]))[0].startswith("    push identity: pushes:sha256:")
 
 
 def test_no_grant_means_no_launches_line_and_a_changed_one_is_marked_against_its_predecessor():
@@ -283,6 +351,17 @@ def test_the_cockpit_authority_line_names_the_launch_grant_only_when_there_is_on
     assert cockpit_threads._effects_words(_body()) == "effects named: 0 land, 0 push, 0 publish"
     words = cockpit_threads._effects_words(_body(launches=_grant(2)), STOP)
     assert words.endswith(f"; may launch up to 2 seats in {REPO} until 2026-10-20 14:00 UTC")
+
+
+@pytest.mark.parametrize("launches", [[{"repo": REPO}], [{"count": 2}], [None], [{"repo": 7, "count": 2}],
+                                      [{"repo": REPO, "count": 0}], [{"repo": REPO, "count": 5}],
+                                      [{"repo": REPO, "count": True}], [{"repo": REPO, "count": 2, "x": 1}]])
+def test_the_cockpit_authority_line_refuses_a_launch_entry_it_cannot_read(launches):
+    """L3 r1 #8: each entry goes through the same _bad() refusal as the effect lists (fail closed upstream)."""
+    with pytest.raises(ValueError, match="an effect list is a list"):
+        cockpit_threads._effects_words(_body(launches=launches), STOP)
+    # every entry dropped by a narrowing leaves an empty list behind there: no words, not a refusal
+    assert cockpit_threads._effects_words(_body(launches=[]), STOP) == "effects named: 0 land, 0 push, 0 publish"
 
 
 # 9 -- who may set it -------------------------------------------------------------------------------------------------
@@ -333,3 +412,15 @@ def test_the_composer_source_matches_the_servers_bounds_and_only_the_cockpit_mod
     assert "launchOn.checked = false;" in form and "if (launches) spec.launches = launches;" in form
     sign = (WEB / "sign.js").read_text()
     assert "launches: embedded," in sign
+
+
+def test_a_draft_replacing_a_head_with_a_grant_shows_the_grant_removed_in_words():
+    """L3 r1 #8: drafts never carry a grant, so a replacement of a head that holds one drops it; the diff names it removed,
+    and the draft card words it as a noun (it read "removes a launches")."""
+    head = _body(launches=_grant(2))
+    proposal = {k: v for k, v in _body(origin="worded").items() if k != "draft"}
+    diff = ed.against_diff(head, proposal)
+    assert diff["effects"]["launches"]["removed"] == [env.effect_identity("launches", _grant(2)[0])]
+    assert "launches" not in ed.against_diff(_body(), proposal)["effects"]
+    sign = (WEB / "sign.js").read_text()
+    assert 'const EFFECT = { lands: "landing", pushes: "push", publishes: "publish", launches: "seat-launch grant" };' in sign

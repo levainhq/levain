@@ -334,6 +334,8 @@ def parse_body(text: Any) -> dict[str, Any]:
         launches = body[LAUNCH_LIST]
         if not isinstance(launches, list) or len(launches) > _LIST_MAX:
             raise EnvelopeError("launches is a list of {repo, count}")
+        if not launches:      # absent is the one no-grant form: two encodings of one meaning would be two digests
+            raise EnvelopeError("an empty launches list is not a grant: leave the key out")
         seen_repos: set[str] = set()
         for i, entry in enumerate(launches):
             if not isinstance(entry, dict) or set(entry) != {"repo", "count"}:
@@ -387,9 +389,15 @@ def launch_allowance(envelope: Mapping[str, Any], where_repo: str, now: datetime
     """The seats still launchable in ``where_repo`` under ``envelope`` (the EFFECTIVE body, what the store resolves
     after attenuations): 0 when the grant is absent, the repo is not covered, ``now`` is at or past ``stop_at``, or
     ``used`` has reached the count; never negative. Pure: the caller's own log supplies ``used`` (levain keeps no
-    counter for a signed grant), and it launches only while this is above 0, then logs one more."""
+    counter for a signed grant), and it launches only while this is above 0, then logs one more.
+
+    Check-then-act by design: this reads a count, it reserves nothing. The CALLER serialises its launches and reads
+    ``used`` under its own lock (flow's launch log), or two launches racing on one read both see the last seat free.
+    ``now`` is an aware datetime; anything else is refused, never compared."""
     if type(used) is not int or used < 0:
         raise EnvelopeError("used is a count of seats already launched, an integer from 0")
+    if not isinstance(now, datetime) or now.utcoffset() is None:
+        raise EnvelopeError("now is an aware datetime (a naive one names no instant)")
     if now >= parse_stamp(envelope["stop_at"]):
         return 0
     for entry in envelope.get(LAUNCH_LIST, []):

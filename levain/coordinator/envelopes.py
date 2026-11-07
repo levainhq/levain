@@ -179,8 +179,7 @@ def narrow_scope(scope: Mapping[str, Any], ceiling: Mapping[str, Any]) -> dict[s
         if paths:
             where.append({"repo": w["repo"], "paths": paths})
     out["where"] = where
-    if env.LAUNCH_LIST in out:
-        out[env.LAUNCH_LIST] = []     # a role's scope never inherits the operator's launch grant
+    out.pop(env.LAUNCH_LIST, None)    # a role's scope never inherits the operator's launch grant (absent = none)
     for kind in env.EFFECT_LISTS:
         named = set(ceiling.get(kind, ()))
         out[kind] = [e for e in scope.get(kind, []) if _effect_target(kind, e) in named]
@@ -661,15 +660,17 @@ class EnvelopeStore(CoordStore):
         out = dict(stored.body)
         if any(k in ("kill", "thread_done") for k, _v in rows):
             killed = {**out, "where": [], **{k: [] for k in env.EFFECT_LISTS}, "stop_at": out["issued_at"]}
-            if env.LAUNCH_LIST in out:
-                killed[env.LAUNCH_LIST] = []
+            killed.pop(env.LAUNCH_LIST, None)          # absent is the one no-grant form
             return killed
         dropped = {v for k, v in rows if k == "drop_effect"}
         for k in env.EFFECT_LISTS:
             out[k] = [e for e in stored.body[k] if env.effect_identity(k, e) not in dropped]
         if env.LAUNCH_LIST in out:
-            out[env.LAUNCH_LIST] = [e for e in out[env.LAUNCH_LIST]
-                                    if env.effect_identity(env.LAUNCH_LIST, e) not in dropped]
+            kept = [e for e in out[env.LAUNCH_LIST] if env.effect_identity(env.LAUNCH_LIST, e) not in dropped]
+            if kept:
+                out[env.LAUNCH_LIST] = kept
+            else:
+                del out[env.LAUNCH_LIST]               # every entry dropped: absent, the one no-grant form
         out["stop_at"] = utc_stamp(cls._stop(stored, rows))
         return out
 
@@ -736,6 +737,8 @@ class EnvelopeStore(CoordStore):
         if effect is not None:
             try:
                 kind, obj = effect
+                if kind not in env.EFFECT_LISTS:     # a launch grant is not an effect: it has no ceiling (L3 r1)
+                    raise TypeError
                 key = env.effect_key(kind, obj)
                 if not all(isinstance(k, str) for k in key):
                     raise TypeError

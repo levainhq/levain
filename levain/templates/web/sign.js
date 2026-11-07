@@ -1294,7 +1294,7 @@
       const KIND = { ENVELOPE: "Draft to sign", REVOKED: "Revoked", LAPSED: "Lapsed" };
       const FIELD = { where: "Where it may work", budget: "Size", stop_at: "Stops", lands: "Landings", pushes: "Pushes", publishes: "Publishes" };
       const BUDGET = { tool_calls: "tool calls", tokens: "tokens", dollars_cents: "dollars", hours: "hours" };
-      const EFFECT = { lands: "landing", pushes: "push", publishes: "publish" };
+      const EFFECT = { lands: "landing", pushes: "push", publishes: "publish", launches: "seat-launch grant" };
       const VERB = { "draft-rule": "Drafting", "draft-withdraw": "Withdrawing", "draft-review": "Reviewing" };
       const unset = (v) => v === null || v === undefined;
       const budgetVal = (k, v) => (unset(v) ? "not set" : k === "dollars_cents" ? "$" + (Number(v) / 100).toFixed(2) : String(v));

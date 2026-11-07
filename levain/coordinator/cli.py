@@ -392,7 +392,7 @@ def _threads_line(store: EnvelopeStore | None, thread_id: str, rev: int | None) 
 def _effect_text(kind: str, e: dict[str, Any], stop_at: str | None = None) -> str:
     if kind == "launches":
         until = "" if stop_at is None else " until " + parse_stamp(stop_at).astimezone().strftime("%Y-%m-%d %H:%M %Z")
-        return f"{e['repo']}  may launch up to {e['count']} seats in {e['repo']}{until}"
+        return f"may launch up to {e['count']} seats in {e['repo']}{until}"
     if kind == "lands":
         crit = ", ".join(json.dumps(c, sort_keys=True) for c in e["criteria"])
         # onto_from is signed: an inferred branch says so in the words read before signing (C0 §1, his 10-20 item 1)
@@ -421,9 +421,12 @@ def _effects(body: dict[str, Any], old: dict[str, Any] | None) -> list[str]:
         for e in body.get(kind, []):
             key = env.effect_key(kind, e)
             now_keys.add(key)
+            text = _effect_text(kind, e, body["stop_at"])
+            # unchanged means the line READ is the same (a launch line carries its stop, so a moved stop changed it)
             mark = "" if old is None else "+ added: " if key not in before else \
-                "= unchanged: " if before[key] == e else "~ changed: "
-            L.append(f"    {mark}{_effect_text(kind, e, body['stop_at'])}")
+                "= unchanged: " if before[key] == e and _effect_text(kind, before[key], old["stop_at"]) == text \
+                else "~ changed: "
+            L.append(f"    {mark}{text}")
         for key, e in before.items():
             if key not in now_keys:
                 L.append(f"    - removed: {_effect_text(kind, e, old['stop_at'])}")
@@ -976,6 +979,14 @@ def _ended(store: EnvelopeStore, envelope_id: str, thread_id: str) -> str | None
     return f"its thread is done, at {when}" if kind == "thread_done" else f"killed by you at {when}"
 
 
+_SINGULAR = {"lands": "land", "pushes": "push", "publishes": "publish", "launches": "launch"}
+
+
+def _identity_lines(eff: dict[str, Any]) -> list[str]:
+    """The identity of each grant a thread's effective envelope holds: what ``drop_effect`` names to narrow one."""
+    return [f"    {_SINGULAR[k]} identity: {env.effect_identity(k, e)}" for k in env.GRANT_LISTS for e in eff.get(k, [])]
+
+
 def _show(args: argparse.Namespace, out: Any, store: EnvelopeStore, stored: Any, threads: list[str]) -> int:
     authority, unchecked = None, ""
     try:
@@ -1004,8 +1015,7 @@ def _show(args: argparse.Namespace, out: Any, store: EnvelopeStore, stored: Any,
         else:
             text.append(f"thread {t} (as narrowed):")
             text += _describe(eff, store, binds=False)
-            for k in env.GRANT_LISTS:
-                text += [f"    {k[:-1]} identity: {env.effect_identity(k, e)}" for e in eff.get(k, [])]
+            text += _identity_lines(eff)
         text += [f"  live: {_label(live)}", f"  authority today: {now}"]
         rows.append({"thread_id": t, "effective": eff, "live": live, "authority_today": now,
                      "ended": ends[t]})
