@@ -21,7 +21,7 @@ FAKE = """
 (() => {
   const FLAG = __FLAG__, DENY = __DENY__, OPEN_STATUS = __OPEN__, WORKLET = __WORKLET__, REAL = __REAL__;
   const sc = window.__sc = { vj: 0, open: [], chunks: [], closes: [], gum: 0, tracks: [], ctxClosed: 0, mods: [], node: null, sp: null,
-    hang: { open: false, chunk: false, close: false }, chunkStatus: 0, closeDelay: 0, gumHold: false, modHold: false, resumeMode: '', vjFail: __VJFAIL__, sends: [], srStarts: 0, realKeys: null };
+    hang: { open: false, chunk: false, close: false, tr: false }, trs: [], tStatus: 500, tText: 'words from the recording', trDelay: 0, chunkStatus: 0, closeDelay: 0, gumHold: false, modHold: false, resumeMode: '', vjFail: __VJFAIL__, sends: [], srStarts: 0, realKeys: null };
   const hang = (o) => new Promise((res, rej) => { if (o && o.signal) o.signal.addEventListener('abort', () => rej(new DOMException('aborted', 'AbortError'))); });
   const j = (o, s) => Promise.resolve(new Response(JSON.stringify(o), { status: s || 200, headers: { 'Content-Type': 'application/json' } }));
   const f0 = window.fetch.bind(window);
@@ -51,6 +51,16 @@ FAKE = """
       if (sc.hang.close) return hang(o);
       if (sc.closeDelay) return new Promise((r) => setTimeout(() => r(j({ text: 'the final text' })), sc.closeDelay));
       return j({ text: 'the final text' }); }
+    if (p === '/cockpit/voice/transcribe') {
+      const dv = new DataView(o.body), tag = (at) => String.fromCharCode(dv.getUint8(at), dv.getUint8(at + 1), dv.getUint8(at + 2), dv.getUint8(at + 3));
+      sc.trs.push({ q: url.search, tok: tok, ct: o.headers['Content-Type'], len: o.body.byteLength, riff: tag(0), wave: tag(8), fmt: tag(12), data: tag(36),
+        riffSize: dv.getUint32(4, true), fmtLen: dv.getUint32(16, true), pcmTag: dv.getUint16(20, true), ch: dv.getUint16(22, true), rate: dv.getUint32(24, true),
+        byteRate: dv.getUint32(28, true), align: dv.getUint16(32, true), bits: dv.getUint16(34, true), dlen: dv.getUint32(40, true),
+        nonzero: new Int16Array(o.body.slice(44)).some((x) => x !== 0) });
+      if (sc.hang.tr) return hang(o);
+      const answer = () => (sc.tStatus === 200 ? j({ text: sc.tText }) : j({ error: 'x' }, sc.tStatus));
+      return sc.trDelay ? new Promise((r) => setTimeout(() => r(answer()), sc.trDelay)) : answer();
+    }
     if (p === '/cockpit/room/send') { sc.sends.push(JSON.parse(o.body).body); return j({ receipt: { id: 1 } }); }
     return f0(u, o);
   };
@@ -423,6 +433,154 @@ def test_send_while_dictating_sends_nothing_when_the_close_fails(tmp_path, qdir)
     ])
     st = _state(v[-1])
     assert st["sc"]["sends"] == [] and "nothing was sent" in (st["note"] or ""), st
+
+WAV_OK = "window.__sc.tStatus = 200; "
+RECOVERED = "window.__sc.trs.length === 1 && !LevainMic.active() && " + MIC + ".textContent === 'Mic'"
+
+
+def _tr_ok(st, data_bytes=16000):
+    t = st["sc"]["trs"][0]
+    assert t["q"] == "?provider=deepgram" and t["ct"] == "audio/wav" and t["tok"] == TOKEN, t
+    assert (t["riff"], t["wave"], t["fmt"], t["data"]) == ("RIFF", "WAVE", "fmt ", "data"), t
+    assert (t["fmtLen"], t["pcmTag"], t["ch"], t["rate"], t["byteRate"], t["align"], t["bits"]) == (16, 1, 1, 16000, 32000, 2, 16), t
+    assert t["dlen"] == data_bytes and t["len"] == 44 + data_bytes and t["riffSize"] == 36 + data_bytes and t["nonzero"], t
+
+
+@needs_browser
+def test_a_chunk_that_fails_mid_session_is_transcribed_from_the_kept_recording_as_one_wav(tmp_path, qdir) -> None:
+    """28800 samples at 48 kHz = 16000 bytes of PCM16 at 16 kHz, so the WAV is 44 + 16000 bytes with a 16 kHz mono PCM16 header.
+    Red with: keepPcm() removed from enqueue (canWav false, no POST, the note says the words so far), wavOf's header fields changed
+    (the header asserts), the Content-Type left octet-stream in recover (ct), the token header dropped, or recover() not called
+    from the enqueue catch (no transcribe request, the box stays empty)."""
+    v = _go(tmp_path, qdir, [
+        *LIVE, {"eval": WAV_OK + "window.__sc.chunkStatus = 500; 1"},
+        CLICK, {"until": "window.__sc.open.length === 1 && window.__sc.node"},
+        {"eval": "window.__feed(28800)"},
+        {"until": RECOVERED, "ms": 5000},
+        _wait(200),
+    ])
+    st = _state(v[-1])
+    _tr_ok(st)
+    assert st["ta"] == "words from the recording" and st["note"].startswith("Streaming dictation stopped; these words come from the recording"), st
+    assert "start of a long recording" not in st["note"] and [t["stopped"] for t in st["sc"]["tracks"]] == [1] and st["sc"]["ctxClosed"] == 1, st
+
+
+@needs_browser
+def test_an_open_that_fails_after_audio_was_captured_falls_back_to_the_wav(tmp_path, qdir) -> None:
+    """The open hangs past its deadline while 16000 bytes are captured. Red with: recover() removed from fail() (the old
+    "could not start" sentence and no transcribe request), or keepPcm() removed (nothing to send)."""
+    v = _go(tmp_path, qdir, [
+        *LIVE, {"eval": WAV_OK + "window.__sc.hang.open = true; LevainMic.deadlines.open = 600; 1"},
+        CLICK, {"until": "window.__sc.node"},
+        {"eval": "window.__feed(28800)"},
+        {"until": RECOVERED, "ms": 5000},
+        _wait(200),
+    ])
+    st = _state(v[-1])
+    _tr_ok(st)
+    assert st["ta"] == "words from the recording" and st["sc"]["chunks"] == [] and [t["stopped"] for t in st["sc"]["tracks"]] == [1], st
+
+
+@needs_browser
+def test_a_close_that_cannot_confirm_the_text_falls_back_and_send_is_not_blocked(tmp_path, qdir) -> None:
+    """Revert: the recover() call in closeSession's failure handler (closeFailed stays true: Send is refused, the box keeps only the
+    partial), or `closeFailed = false` after a good recovery."""
+    v = _go(tmp_path, qdir, [
+        *LIVE, {"eval": WAV_OK + "window.__sc.hang.close = true; LevainMic.deadlines.close = 300; 1"},
+        CLICK, {"until": "window.__sc.open.length === 1 && window.__sc.node"},
+        {"eval": "window.__feed(28800)"}, {"until": "window.__sc.chunks.length === 2"},
+        CLICK,
+        {"until": RECOVERED, "ms": 5000},
+        _wait(100, "JSON.stringify({s: " + STATE + ", cf: LevainMic.closeFailed()})"),
+    ])
+    out = _state(v[-1]); st = _state(out["s"])
+    _tr_ok(st, 19200)      # 16000 bytes of chunks plus the 3200-byte tail flushed by the stop
+    assert st["ta"] == "words from the recording" and out["cf"] is False, out
+
+
+@needs_browser
+def test_a_transcribe_that_fails_leaves_the_partial_the_old_sentence_and_close_failed(tmp_path, qdir) -> None:
+    """Red with: closeFailed cleared before the recovery result is known (cf false), or the broke note dropped on a failed
+    recovery. The fake answers 500 by default."""
+    v = _go(tmp_path, qdir, [
+        *LIVE, {"eval": "window.__sc.hang.close = true; LevainMic.deadlines.close = 300; 1"},
+        CLICK, {"until": "window.__sc.open.length === 1 && window.__sc.node"},
+        {"eval": "window.__feed(28800)"}, {"until": "window.__sc.chunks.length === 2"},
+        CLICK,
+        {"until": RECOVERED, "ms": 5000},
+        _wait(100, "JSON.stringify({s: " + STATE + ", cf: LevainMic.closeFailed()})"),
+    ])
+    out = _state(v[-1]); st = _state(out["s"])
+    assert out["cf"] is True and st["ta"].startswith("said ") and "recording" not in st["ta"], out
+    (tmp_path / "two").mkdir()
+    v = _go(tmp_path / "two", qdir, [
+        *LIVE, {"eval": "window.__sc.chunkStatus = 500; 1"},
+        CLICK, {"until": "window.__sc.open.length === 1 && window.__sc.node"},
+        {"eval": "window.__feed(28800)"},
+        {"until": RECOVERED, "ms": 5000}, _wait(100),
+    ])
+    st = _state(v[-1])
+    assert st["note"] == "Streaming dictation stopped; the words so far are in the box." and st["ta"] == "", st
+
+
+@needs_browser
+def test_a_transcribe_that_never_answers_ends_at_its_deadline(tmp_path, qdir) -> None:
+    """Revert: the deadlines.wav timeout on the recover POST (the session never ends, the mic label stays Stop mic)."""
+    v = _go(tmp_path, qdir, [
+        *LIVE, {"eval": "window.__sc.chunkStatus = 500; window.__sc.hang.tr = true; LevainMic.deadlines.wav = 400; 1"},
+        CLICK, {"until": "window.__sc.open.length === 1 && window.__sc.node"},
+        {"eval": "window.__feed(28800)"},
+        {"until": RECOVERED, "ms": 5000}, _wait(100),
+    ])
+    st = _state(v[-1])
+    assert st["note"].startswith("Streaming dictation stopped; the words so far") and len(st["sc"]["trs"]) == 1, st
+
+
+@needs_browser
+def test_stopping_while_the_wav_is_being_transcribed_does_not_cancel_it(tmp_path, qdir) -> None:
+    """The transcribe answers after 700 ms and the operator taps Mic meanwhile. Red with: the `s.wavBusy` guard removed from
+    finish() (stop() ends the session, cancelAll aborts the request, the text never lands)."""
+    v = _go(tmp_path, qdir, [
+        *LIVE, {"eval": WAV_OK + "window.__sc.chunkStatus = 500; window.__sc.trDelay = 700; 1"},
+        CLICK, {"until": "window.__sc.open.length === 1 && window.__sc.node"},
+        {"eval": "window.__feed(28800)"},
+        {"until": "window.__sc.trs.length === 1", "ms": 5000},
+        CLICK,
+        {"until": RECOVERED, "ms": 5000}, _wait(100),
+    ])
+    st = _state(v[-1])
+    assert st["ta"] == "words from the recording", st
+
+
+@needs_browser
+def test_the_kept_recording_is_bounded_and_the_oldest_audio_is_dropped_with_a_note(tmp_path, qdir) -> None:
+    """With wavMax 12000 and 16000 bytes captured, the first chunk is dropped: the WAV carries 8000 data bytes and the note says
+    the start was left out. Red with: the shift loop in keepPcm removed (16000 bytes sent), or pcmDropped not set (wrong note).
+    The default cap is the server's UPLOAD_MAX less the header."""
+    from levain.cockpit.voice import UPLOAD_MAX
+    v = _go(tmp_path, qdir, [
+        *LIVE, {"eval": WAV_OK + "window.__sc.chunkStatus = 500; LevainMic.limits.wavMax = 12000; 1"},
+        CLICK, {"until": "window.__sc.open.length === 1 && window.__sc.node"},
+        {"eval": "window.__feed(28800)"},
+        {"until": RECOVERED, "ms": 5000}, _wait(100),
+    ])
+    st = _state(v[-1])
+    _tr_ok(st, 8000)
+    assert "start of a long recording was left out" in st["note"], st
+    (tmp_path / "two").mkdir()
+    d = _go(tmp_path / "two", qdir, [*LIVE, {"eval": "LevainMic.limits.wavMax"}])
+    assert d[-1] == UPLOAD_MAX - 44
+
+
+@needs_browser
+def test_a_healthy_session_never_posts_a_wav(tmp_path, qdir) -> None:
+    """Red with: recover() called on the success path of closeSession."""
+    v = _go(tmp_path, qdir, [
+        *LIVE, CLICK, {"until": "window.__sc.open.length === 1 && window.__sc.node"},
+        {"eval": "window.__feed(28800)"}, {"until": "window.__sc.chunks.length === 2"},
+        CLICK, {"until": "window.__sc.closes.length === 1 && " + TA + ".value === 'the final text'", "ms": 20000}, _wait(300),
+    ])
+    assert _state(v[-1])["sc"]["trs"] == []
 
 
 @needs_browser
