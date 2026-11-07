@@ -320,7 +320,7 @@ def test_the_profile_with_a_live_grant_carries_the_hooks_with_timeouts_and_the_g
     assert stop["timeout"] == sp.STOP_TIMEOUT and end["timeout"] == sp.SESSION_END_TIMEOUT   # U9: SessionEnd needs one
     for entry, event in ((stop, "Stop"), (end, "SessionEnd")):
         argv = shlex.split(entry["command"])
-        assert argv[1:6] == ["-I", "-B", "-m", "levain.seat_push", event]
+        assert argv[1:6] == ["-EP", "-B", "-m", "levain.seat_push", event]
         assert argv[argv.index("--clone") + 1] == str(plan.profile.clone)
         assert argv[argv.index("--key-dir") + 1] == str(eg.rig.key_dir)
         assert argv[argv.index("--cockpit-root") + 1] == str(eg.world.root)
@@ -348,14 +348,46 @@ def test_a_canary_profile_never_takes_a_grant(eg):
                            canary_root=Path("/nonexistent"), egress=grant)
 
 
+def test_every_seat_hook_keeps_the_user_site_on_the_import_path(eg, tmp_path):
+    """Reproduced 11-07: a levain installed with ``pip install --user`` was invisible to the seat hooks, because ``-I``
+    also turns the user site off, and the seat's Stop push, its tool-call records and its observe hook then failed with
+    ModuleNotFoundError. The consent hooks already run ``-EP`` for this reason. Takes the interpreter flags from the
+    commands the profile really carries and runs them on a non-venv interpreter against a stub package in a throwaway
+    user site."""
+    eg.rig.sign_lease()
+    eg.sign()
+    plan = eg.rig.launch("lane-a")
+    hooks = plan.profile.settings["hooks"]
+    cmds = [h["command"] for event in ("Stop", "SessionEnd", "PreToolUse", "PostToolUse", "PermissionRequest")
+            for g in hooks[event] for h in g["hooks"]]
+    assert len(cmds) == 5
+    base = getattr(sys, "_base_executable", sys.executable)
+    ub = tmp_path / "userbase"
+    probe = subprocess.run([base, "-c", "import site; print(int(site.ENABLE_USER_SITE)); print(site.getusersitepackages())"],
+                           capture_output=True, text=True, env={**os.environ, "PYTHONUSERBASE": str(ub)}, timeout=60)
+    enabled, _, usersite = probe.stdout.partition("\n")
+    if probe.returncode != 0 or enabled != "1":
+        pytest.skip("the base interpreter has no user site here")
+    (Path(usersite.strip()) / "levainprobe").mkdir(parents=True)
+    (Path(usersite.strip()) / "levainprobe" / "__init__.py").write_text("")
+    (Path(usersite.strip()) / "levainprobe" / "mod.py").write_text("print('PROBE-RAN')\n")
+    for cmd in cmds:
+        argv = shlex.split(cmd)
+        flags = argv[1:argv.index("-m")]
+        assert "-I" not in flags, cmd
+        r = subprocess.run([base, *flags, "-m", "levainprobe.mod"], capture_output=True, text=True, timeout=60,
+                           env={"PATH": "/usr/bin:/bin", "PYTHONUSERBASE": str(ub), "HOME": str(tmp_path)})
+        assert "PROBE-RAN" in r.stdout, (cmd, r.stderr)
+
+
 def test_the_hook_command_runs_as_a_process_and_pushes(eg):
-    """The exact command the profile carries, run through a shell with the Stop payload on stdin. (`-I` ignores
+    """The exact command the profile carries, run through a shell with the Stop payload on stdin. (`-EP` ignores
     PYTHONPATH and the installed levain is not this tree, so the one flag differs here: RESIDUE for the VM run.)"""
     eg.rig.sign_lease()
     eg.sign()
     plan, clone = eg.lane()
     tip = eg.commit(clone, "via a process")
-    cmd = plan.profile.settings["hooks"]["Stop"][0]["hooks"][0]["command"].replace(" -I ", " ", 1)
+    cmd = plan.profile.settings["hooks"]["Stop"][0]["hooks"][0]["command"].replace(" -EP ", " ", 1)
     src = str(Path(sp.__file__).resolve().parents[1])
     r = subprocess.run(cmd, shell=True, input=json.dumps({"stop_hook_active": False, "cwd": "/anywhere"}), text=True,
                        capture_output=True, env={"PATH": "/usr/bin:/bin", "PYTHONPATH": src, "HOME": str(eg.tmp / "home"),

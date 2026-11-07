@@ -302,11 +302,13 @@ def build_seat_profile(clone: Path, return_dir: Path, *, claude_bin: str, python
     }
     py = shlex.quote(python)
     from levain import observe   # constants only
-    hook = lambda sub: {"type": "command", "command": f"{py} -I -B -m levain.seat_record {sub}", "timeout": _HOOK_TIMEOUT}
+    # -EP, not -I: -I also drops the user site, where levain may be installed (the consent hooks' ruling, HOOK_FLAGS in
+    # levain.consent.adapters.claude_code); -E and -P keep the PYTHON* variables and the cwd off the import path.
+    hook = lambda sub: {"type": "command", "command": f"{py} -EP -B -m levain.seat_record {sub}", "timeout": _HOOK_TIMEOUT}
     records = shlex.quote(str(key_dir / "records"))
     hooks = {
         "PermissionRequest": [{"matcher": "", "hooks": [{
-            "type": "command", "command": f"{py} -I -m {observe.MARKER} {observe.SUFFIX}"}]}],
+            "type": "command", "command": f"{py} -EP -m {observe.MARKER} {observe.SUFFIX}"}]}],
         "PreToolUse": [{"matcher": "", "hooks": [hook(f"pre {records}")]}],
         "PostToolUse": [{"matcher": "", "hooks": [hook("post")]}],
         "PostToolUseFailure": [{"matcher": "", "hooks": [hook("post")]}],

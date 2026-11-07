@@ -2019,15 +2019,6 @@ def _seat_lease_check(grants: list[Any], after: str = "") -> None:
             raise AuthorityError(f"seat-root lease {str(grant.get('id'))[:40]!r}: " + "; ".join(problems) + after)
 
 
-def _seat_lease_live(grant: Any, now: datetime) -> bool:
-    if not (isinstance(grant, Mapping) and grant.get("kind") == SEAT_LEASE_KIND):
-        return False
-    try:
-        return _parse_stamp(grant["expires_at"], "expires_at") > now
-    except (AuthorityError, KeyError, OverflowError):
-        return False
-
-
 def _unique_live_check(state: AuthoritySnapshot, rec: Mapping[str, Any], now: datetime, kind: str, label: str) -> None:
     """At append: a create, a loosen or a renew may not leave two LIVE grants of ``kind`` (``label`` names it; revoke the
     first). Judged with the appender's clock, so an append rule."""

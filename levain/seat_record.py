@@ -9,7 +9,7 @@ where the BOUND classifier reads what the vendor's sandbox refused inside it.
 Both exit 0 whatever happens: a record is never a gate. A seat whose rows are zero after tool calls the transcript
 shows is BLIND, never quiet (:func:`blind`).
 
-Run as ``python -I -B -m levain.seat_record pre|post <record dir>``.
+Run as ``python -EP -B -m levain.seat_record pre|post <record dir>``.
 """
 from __future__ import annotations
 

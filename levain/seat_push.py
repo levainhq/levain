@@ -2,7 +2,7 @@
 and a seat has no path to main.
 
 The seat holds no push credential and has no push tool. Its profile (``levain.seat_profile``) carries a ``Stop`` and a
-``SessionEnd`` command hook that runs ``python -I -B -m levain.seat_push <event> ...``; a command hook runs outside the
+``SessionEnd`` command hook that runs ``python -EP -B -m levain.seat_push <event> ...``; a command hook runs outside the
 sandbox bound by vendor design, measured on 2.1.319 to fire under the seat's source arguments and ``--restricted`` (U9,
 ``project_memory/1106-16/z0d/RETURN_u9.md``: Stop has no 60 s ceiling but takes an explicit ``timeout``; SessionEnd's
 default is about 1 s, so it needs one; exit-2 stderr on Stop reaches the model; guard ``stop_hook_active``).
@@ -338,7 +338,7 @@ def hook_entries(python: str, *, clone: Path, key_dir: Path, cockpit_root: Path 
                  ) -> dict[str, list[dict[str, Any]]]:
     """The profile's ``hooks`` entries for the egress: ``Stop`` and ``SessionEnd``, each with an explicit timeout."""
     def entry(event: str, timeout: int) -> list[dict[str, Any]]:
-        cmd = " ".join([shlex.quote(python), "-I", "-B", "-m", "levain.seat_push", event,
+        cmd = " ".join([shlex.quote(python), "-EP", "-B", "-m", "levain.seat_push", event,
                         "--clone", shlex.quote(str(clone)), "--key-dir", shlex.quote(str(key_dir)),
                         "--cockpit-root", shlex.quote(str(cockpit_root)), "--home", shlex.quote(str(home))])
         return [{"hooks": [{"type": "command", "command": cmd, "timeout": timeout}]}]
