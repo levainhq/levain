@@ -8,20 +8,31 @@ It carries a provider key in a handshake header, so what it refuses matters more
   is accepted only as ``101``; a redirect (or any other status) is a refusal and is never followed. ``allowed_hosts``
   lets the caller pin the URL's host to a set (``providers.ALLOWED_HOSTS``) before any socket opens.
 * **Header values are never logged or raised.** Caller headers (the ``Authorization`` one) go into the request bytes and
-  nowhere else: no attribute of the client, no exception text, no ``repr``. :class:`WsError` carries a fixed code and a
-  fixed sentence. A header name or value that could split the request (CR, LF, NUL, other controls) is refused, and so is
-  a caller header that would override one the client owns (``Host``, ``Upgrade``, ``Connection``, ``Sec-WebSocket-*``).
+  nowhere else: no attribute of the client, no exception text, no ``repr``, and no frame reachable from a raised error's
+  traceback (:func:`connect` does the work in an inner frame that is gone before it raises a fresh error with no
+  ``__context__``). :class:`WsError` carries a fixed code and a fixed sentence. A header name or value that could split
+  the request (CR, LF, NUL, other controls) is refused, and so is a caller header that would override one the client
+  owns (``Host``, ``Upgrade``, ``Connection``, ``Sec-WebSocket-*``).
 * **The answer is checked:** status ``101``, ``Upgrade: websocket``, ``Connection`` containing ``upgrade``,
   ``Sec-WebSocket-Accept`` equal to the base64 SHA-1 of our key plus the RFC GUID, and no extension or sub-protocol
-  (we offered none). The handshake has a header-size cap and a wall-clock deadline.
-* **Frames:** client frames are masked with a fresh random key each; server frames must be unmasked, RSV bits zero, control
-  frames <= 125 bytes and unfragmented, continuation rules obeyed, text valid UTF-8. A message past ``max_message``
-  is refused from its declared length, before its payload is read. A protocol violation sends a close frame with the
+  (we offered none). The head must end within ``MAX_HANDSHAKE`` bytes. ``handshake_deadline`` is one wall-clock deadline
+  over the whole open: TCP connect (each attempt also capped by ``connect_timeout``), TLS handshake, request send and
+  head read. Running out of it anywhere is ``WsError("timeout")``. Known edge: name resolution (``getaddrinfo``) has no
+  timeout in the stdlib and is not covered.
+* **Frames:** client frames are masked with a fresh random key each; server frames must be unmasked, RSV bits zero,
+  lengths minimally encoded, control frames <= 125 bytes and unfragmented, continuation rules obeyed, text valid UTF-8,
+  close codes in the RFC 6455 / IANA sendable range. A message past ``max_message`` is refused from the declared length
+  of the frame that would cross it, before that payload is read. A protocol violation sends a close frame with the
   matching code and closes the socket.
 
 ``recv()`` returns ``(kind, data)``: ``("text", str)``, ``("binary", bytes)`` or ``("close", (code, reason))``. Ping is
-answered with a pong inside ``recv()`` and pong is swallowed. One reader and one writer thread may use a client at once
-(sends are serialised by a lock; ``recv`` is for a single reader).
+answered with a pong inside ``recv()`` and pong is swallowed. ``idle_timeout`` bounds the wait for a frame to start
+(:class:`WsTimeout`, recoverable) and, once it has started, the time for the rest of it (fatal; enforced between socket
+reads, so it can overrun by up to one more ``idle_timeout``).
+
+Threads: one reader and any number of writers (sends are serialised by a lock). There is only ever one socket reader:
+``recv`` holds a receive lock, and ``close()`` (callable from any thread) sends its close frame once and then either waits
+for the active reader to see the peer's close or, when no reader is active, reads it itself.
 """
 
 from __future__ import annotations
@@ -61,7 +72,11 @@ WORDS = {
 
 _TOKEN = re.compile(r"^[!#$%&'*+\-.^_`|~0-9A-Za-z]+$")
 _OWNED = frozenset({"host", "upgrade", "connection", "content-length", "transfer-encoding"})
-_VALID_CLOSE = lambda c: 1000 <= c <= 1003 or 1007 <= c <= 1011 or 3000 <= c <= 4999  # noqa: E731
+
+
+def _valid_close(code: int) -> bool:
+    """Close codes a peer may put on the wire (RFC 6455 7.4 + the IANA registry): 1004-1006 and 1015 are reserved."""
+    return 1000 <= code <= 1003 or 1007 <= code <= 1014 or 3000 <= code <= 4999
 
 
 class WsError(Exception):
@@ -74,7 +89,7 @@ class WsError(Exception):
 
 
 class WsTimeout(WsError):
-    """No frame arrived within the idle timeout and the stream is still intact (``recv`` may be called again)."""
+    """No frame started within the idle timeout and the stream is still intact (``recv`` may be called again)."""
 
     def __init__(self) -> None:
         super().__init__("timeout")
@@ -107,13 +122,19 @@ class WebSocketClient:
 
     def __init__(self, sock: socket.socket, leftover: bytes, max_message: int, idle_timeout: float) -> None:
         self._sock = sock
-        self._buf = bytearray(leftover)
         self._max = max_message
         self._idle = idle_timeout
+        # The socket timeout stays at idle while writers may send: a socket timeout is shared by every thread using the
+        # socket, so the reader may change it only once _close_sent is set (after that no writer touches the socket).
+        sock.settimeout(idle_timeout)
         self._send_lock = threading.Lock()
-        self._closed = False            # the socket is shut
+        self._recv_lock = threading.Lock()   # held by the one socket reader; guards _buf, _frag_op, _frag
+        self._state_lock = threading.Lock()  # guards the _closed transition
+        self._done = threading.Event()       # set when the peer's close is seen or the socket is shut
+        self._closed = False                 # the socket is shut
         self._close_sent = False
         self._close_seen = False
+        self._buf = bytearray(leftover)
         self._frag_op: int | None = None
         self._frag = bytearray()
 
@@ -121,7 +142,9 @@ class WebSocketClient:
         return "WebSocketClient(open)" if not self._closed else "WebSocketClient(closed)"
 
     # ---- send side
-    def _send_frame(self, opcode: int, payload: bytes) -> None:
+    def _send_frame(self, opcode: int, payload: bytes, deadline: float | None = None) -> None:
+        """Send one frame. A second close frame (from any thread) is a silent no-op; data after the close is refused.
+        With ``deadline`` (``close()`` only) both the wait for the send lock and the send itself end by it."""
         n = len(payload)
         key = os.urandom(4)
         if n < 126:
@@ -131,19 +154,30 @@ class WebSocketClient:
         else:
             head = struct.pack("!BBQ", 0x80 | opcode, 0x80 | 127, n)
         frame = head + key + _mask(payload, key)
-        with self._send_lock:
+        if deadline is None:
+            self._send_lock.acquire()
+        elif not self._send_lock.acquire(timeout=max(0.0, deadline - time.monotonic())):
+            raise WsError("timeout")                 # a writer is stuck in sendall; the caller drops the socket
+        try:
             if self._closed:
                 raise WsError("closed")
-            if self._close_sent and opcode != OP_CLOSE:
+            if self._close_sent:
+                if opcode == OP_CLOSE:
+                    return
                 raise WsError("closed")
             try:
-                self._sock.settimeout(self._idle)
+                if deadline is not None:
+                    # Safe to change the shared timeout here: we hold the send lock (no writer), and a reader's
+                    # in-flight recv() keeps the timeout it started with; after _close_sent the reader sets its own.
+                    self._sock.settimeout(max(0.001, min(self._idle, deadline - time.monotonic())))
                 self._sock.sendall(frame)
             except (OSError, ssl.SSLError):
                 self._shut()
                 raise WsError("closed") from None
             if opcode == OP_CLOSE:
                 self._close_sent = True
+        finally:
+            self._send_lock.release()
 
     def send_binary(self, data: bytes) -> None:
         if len(data) > self._max:
@@ -161,20 +195,28 @@ class WebSocketClient:
             raise WsError("too_big")
         self._send_frame(OP_PING, bytes(data))
 
-    # ---- receive side
-    def _fill(self, n: int, started: bool) -> bytes:
-        """Exactly ``n`` bytes. A timeout before any byte of a frame (``started`` False, buffer empty) is a
-        recoverable :class:`WsTimeout`; one mid-frame leaves the stream unusable, so it closes."""
+    # ---- receive side (every method below runs with _recv_lock held)
+    def _timed_out(self, started: bool) -> WsError:
+        if not started:
+            return WsTimeout()
+        self._shut()
+        return WsError("timeout")
+
+    def _fill(self, n: int, started: bool, deadline: float) -> bytes:
+        """Exactly ``n`` bytes by ``deadline``. A timeout before a frame has started (``started`` False: only header
+        bytes are wanted and none consumed, any partial header stays in ``_buf``) is a recoverable :class:`WsTimeout`;
+        one mid-frame leaves the stream unusable, so it closes."""
         while len(self._buf) < n:
+            left = deadline - time.monotonic()
+            if left <= 0:
+                raise self._timed_out(started)
             try:
-                self._sock.settimeout(self._idle)
+                if self._close_sent:
+                    self._sock.settimeout(min(self._idle, left))
                 chunk = self._sock.recv(65536)
             except (socket.timeout, TimeoutError):
-                if not started and not self._buf:
-                    raise WsTimeout() from None
-                self._shut()
-                raise WsError("timeout") from None
-            except (OSError, ssl.SSLError):
+                raise self._timed_out(started) from None
+            except (OSError, ssl.SSLError, ValueError):
                 self._shut()
                 raise WsError("closed") from None
             if not chunk:
@@ -187,37 +229,53 @@ class WebSocketClient:
 
     def _fail(self, code: int, err: str) -> WsError:
         try:
-            if not self._close_sent and not self._closed:
-                self._send_frame(OP_CLOSE, struct.pack("!H", code))
+            self._send_frame(OP_CLOSE, struct.pack("!H", code))
         except WsError:
             pass
         self._shut()
         return WsError(err)
 
-    def _read_frame(self) -> tuple[bool, int, bytes]:
-        b0, b1 = self._fill(2, False)
+    def _read_frame(self, until: float | None) -> tuple[bool, int, bytes]:
+        b0, b1 = self._fill(2, False, until if until is not None else time.monotonic() + self._idle)
+        deadline = until if until is not None else time.monotonic() + self._idle
         fin, rsv, op = bool(b0 & 0x80), b0 & 0x70, b0 & 0x0F
         if rsv or (b1 & 0x80) or op in (3, 4, 5, 6, 7) or op > 0xA:
             raise self._fail(1002, "protocol")
         n = b1 & 0x7F
         if n == 126:
-            (n,) = struct.unpack("!H", self._fill(2, True))
+            (n,) = struct.unpack("!H", self._fill(2, True, deadline))
+            if n < 126:
+                raise self._fail(1002, "protocol")
         elif n == 127:
-            (n,) = struct.unpack("!Q", self._fill(8, True))
-            if n >> 63:
+            (n,) = struct.unpack("!Q", self._fill(8, True, deadline))
+            if n >> 63 or n < 65536:
                 raise self._fail(1002, "protocol")
         if op >= 0x8:
             if n > 125 or not fin:
                 raise self._fail(1002, "protocol")
-        elif n > self._max:
-            raise self._fail(1009, "too_big")
-        return fin, op, self._fill(n, True) if n else b""
+        else:
+            # Fragmentation state and the message budget are checked from the header, before any payload is read.
+            if op == OP_CONT:
+                if self._frag_op is None:
+                    raise self._fail(1002, "protocol")
+                room = self._max - len(self._frag)
+            else:
+                if self._frag_op is not None:
+                    raise self._fail(1002, "protocol")
+                room = self._max
+            if n > room:
+                raise self._fail(1009, "too_big")
+        return fin, op, self._fill(n, True, deadline) if n else b""
 
     def recv(self) -> tuple[str, object]:
-        if self._closed and not self._buf:
+        with self._recv_lock:
+            return self._recv(None)
+
+    def _recv(self, until: float | None) -> tuple[str, object]:
+        if self._closed:
             raise WsError("closed")
         while True:
-            fin, op, payload = self._read_frame()
+            fin, op, payload = self._read_frame(until)
             if op == OP_PING:
                 try:
                     self._send_frame(OP_PONG, payload)
@@ -228,16 +286,9 @@ class WebSocketClient:
                 continue
             if op == OP_CLOSE:
                 return self._on_close(payload)
-            if op == OP_CONT:
-                if self._frag_op is None:
-                    raise self._fail(1002, "protocol")
-            else:
-                if self._frag_op is not None:
-                    raise self._fail(1002, "protocol")
+            if op != OP_CONT:
                 self._frag_op = op
             self._frag += payload
-            if len(self._frag) > self._max:
-                raise self._fail(1009, "too_big")
             if not fin:
                 continue
             kind, data = self._frag_op, bytes(self._frag)
@@ -255,46 +306,61 @@ class WebSocketClient:
             raise self._fail(1002, "protocol")
         if len(payload) >= 2:
             (code,) = struct.unpack("!H", payload[:2])
-            if not _VALID_CLOSE(code):
+            if not _valid_close(code):
                 raise self._fail(1002, "protocol")
             try:
                 reason = payload[2:].decode("utf-8")
             except UnicodeDecodeError:
                 raise self._fail(1007, "protocol") from None
         self._close_seen = True
-        if not self._close_sent:
-            try:
-                self._send_frame(OP_CLOSE, payload[:2] if len(payload) >= 2 else b"")
-            except WsError:
-                pass
+        try:
+            self._send_frame(OP_CLOSE, payload[:2] if len(payload) >= 2 else b"")   # no-op if ours already went
+        except WsError:
+            pass
         self._shut()
         return "close", (code, reason)
 
     # ---- close
     def _shut(self) -> None:
-        if self._closed:
-            return
-        self._closed = True
+        with self._state_lock:
+            if self._closed:
+                return
+            self._closed = True
+        # shutdown() wakes a reader blocked in recv() on another thread; the base-class call skips SSLSocket.shutdown,
+        # which would drop the SSL object out from under that reader.
+        try:
+            socket.socket.shutdown(self._sock, socket.SHUT_RDWR)
+        except (OSError, ValueError):
+            pass
         try:
             self._sock.close()
         except OSError:
             pass
+        self._done.set()
 
     def close(self, code: int = 1000, wait: float = CLOSE_WAIT) -> None:
-        """Send a close frame, wait up to ``wait`` seconds for the peer's, then drop the socket. Idempotent; never raises."""
+        """Send a close frame (once, from any thread) and wait for the peer's, all within ``wait`` seconds, then drop the
+        socket. If a reader is in ``recv()`` it stays the only socket reader and gets the peer's close; otherwise this
+        reads it. A writer stuck in a send past ``wait`` gets ``WsError("closed")`` when the socket drops. Idempotent;
+        never raises."""
         if self._closed:
             return
+        deadline = time.monotonic() + wait
         try:
-            if not self._close_sent:
-                self._send_frame(OP_CLOSE, struct.pack("!H", code))
-            deadline = time.monotonic() + wait
-            self._idle = max(0.05, min(self._idle, wait))
-            while not self._close_seen and not self._closed and time.monotonic() < deadline:
-                try:
-                    self.recv()
-                except WsTimeout:
+            self._send_frame(OP_CLOSE, struct.pack("!H", code), deadline)
+            while not self._done.is_set():
+                left = deadline - time.monotonic()
+                if left <= 0:
                     break
-                except WsError:
+                if self._recv_lock.acquire(timeout=min(left, 0.05)):
+                    try:
+                        while not self._close_seen and not self._closed:
+                            try:
+                                self._recv(deadline)
+                            except WsError:
+                                break
+                    finally:
+                        self._recv_lock.release()
                     break
         except Exception:  # noqa: BLE001 - close must not raise; the socket is dropped below
             pass
@@ -313,7 +379,57 @@ def connect(
     allowed_hosts: Iterable[str] | None = None,
     insecure_for_test: bool = False,
 ) -> WebSocketClient:
-    """Open ``url`` (``wss://``) and complete the handshake. ``headers`` may hold the provider's ``Authorization``."""
+    """Open ``url`` (``wss://``) and complete the handshake. ``headers`` may hold the provider's ``Authorization``.
+
+    The work happens in :func:`_open`. On failure its frames (which hold the headers and the request bytes) are dropped
+    and a fresh :class:`WsError` is raised from here, outside the ``except`` block (no ``__context__``), after this frame
+    has let go of ``headers``. An unexpected non-``WsError`` exception is reported as ``connect`` for the same reason."""
+    failed = "connect"
+    try:
+        return _open(url, headers, connect_timeout, idle_timeout, handshake_deadline, max_message, allowed_hosts,
+                     insecure_for_test)
+    except WsError as e:
+        failed = e.code
+    except Exception:  # noqa: BLE001 - its traceback would carry the secret; see the docstring
+        failed = "connect"
+    headers = None  # noqa: F841 - drop the caller's dict from this frame before raising
+    raise WsError(failed)
+
+
+def _left(deadline: float) -> float:
+    left = deadline - time.monotonic()
+    if left <= 0:
+        raise WsError("timeout")
+    return left
+
+
+def _dial(host: str, port: int, connect_timeout: float, deadline: float) -> socket.socket:
+    try:
+        infos = socket.getaddrinfo(host, port, type=socket.SOCK_STREAM)
+    except (OSError, ValueError):
+        raise WsError("connect") from None
+    timed_out = False
+    for family, kind, proto, _, addr in infos:
+        left = deadline - time.monotonic()
+        if left <= 0:
+            timed_out = True
+            break
+        sock = socket.socket(family, kind, proto)
+        try:
+            sock.settimeout(min(connect_timeout, left))
+            sock.connect(addr)
+            return sock
+        except (socket.timeout, TimeoutError):
+            timed_out = True
+        except OSError:
+            pass
+        sock.close()
+    raise WsError("timeout" if timed_out else "connect")
+
+
+def _open(url: str, headers: dict[str, str] | None, connect_timeout: float, idle_timeout: float,
+          handshake_deadline: float, max_message: int, allowed_hosts: Iterable[str] | None,
+          insecure_for_test: bool) -> WebSocketClient:
     extra = _check_headers(headers)
     try:
         u = urllib.parse.urlsplit(url)
@@ -331,16 +447,16 @@ def connect(
     if any(ord(c) <= 0x20 or ord(c) >= 0x7F for c in path):
         raise WsError("url")
 
-    started = time.monotonic()
-    try:
-        sock = socket.create_connection((host, port), timeout=connect_timeout)
-    except (OSError, ValueError):
-        raise WsError("connect") from None
+    deadline = time.monotonic() + handshake_deadline
+    sock = _dial(host, port, connect_timeout, deadline)
     try:
         if tls:
             try:
+                sock.settimeout(_left(deadline))        # wrap_socket runs the TLS handshake under this timeout
                 sock = ssl.create_default_context().wrap_socket(sock, server_hostname=host)
-            except (OSError, ssl.SSLError):
+            except (socket.timeout, TimeoutError):
+                raise WsError("timeout") from None
+            except (OSError, ssl.SSLError, ValueError):
                 raise WsError("connect") from None
         key = base64.b64encode(os.urandom(16)).decode("ascii")
         hostline = host if ":" not in host else f"[{host}]"
@@ -351,12 +467,14 @@ def connect(
         lines += [f"{n}: {v}" for n, v in extra]
         request = ("\r\n".join(lines) + "\r\n\r\n").encode("latin-1")
         try:
-            sock.settimeout(connect_timeout)
+            sock.settimeout(_left(deadline))
             sock.sendall(request)
+        except (socket.timeout, TimeoutError):
+            raise WsError("timeout") from None
         except (OSError, ssl.SSLError):
             raise WsError("handshake") from None
-        del request, lines
-        raw = _read_head(sock, started + handshake_deadline)
+        del request, lines, extra
+        raw = _read_head(sock, deadline)
         head, _, leftover = raw.partition(b"\r\n\r\n")
         _validate(head, key)
     except BaseException:
@@ -369,22 +487,29 @@ def connect(
 
 
 def _read_head(sock: socket.socket, deadline: float) -> bytes:
+    """Read until the blank line that ends the head. The head (terminator included) must end within MAX_HANDSHAKE
+    bytes: each read is bounded to the remaining allowance, so the buffer never grows past it."""
     buf = bytearray()
-    while b"\r\n\r\n" not in buf:
-        left = deadline - time.monotonic()
-        if left <= 0 or len(buf) > MAX_HANDSHAKE:
+    while True:
+        room = MAX_HANDSHAKE - len(buf)
+        if room <= 0:
             raise WsError("handshake")
+        left = deadline - time.monotonic()
+        if left <= 0:
+            raise WsError("timeout")
         try:
             sock.settimeout(left)
-            chunk = sock.recv(4096)
+            chunk = sock.recv(min(4096, room))
         except (socket.timeout, TimeoutError):
             raise WsError("timeout") from None
         except (OSError, ssl.SSLError):
             raise WsError("handshake") from None
         if not chunk:
             raise WsError("handshake")
+        start = max(0, len(buf) - 3)
         buf += chunk
-    return bytes(buf)
+        if buf.find(b"\r\n\r\n", start) >= 0:
+            return bytes(buf)
 
 
 def _validate(head: bytes, key: str) -> None:

@@ -588,3 +588,269 @@ def test_no_header_value_in_any_error_or_repr(serve):
     assert "SECRET" not in repr(c) and "SECRET" not in str(vars(c).keys())
     assert not any(isinstance(v, str) and "SECRET" in v for v in vars(c).values())
     c.close(wait=0.1)
+
+
+# ---- L3 round 1 regressions (one test per finding, each built from the failing scenario)
+
+def _holds_secret(v, depth=0) -> bool:
+    if depth > 6:
+        return False
+    if isinstance(v, (bytes, bytearray, memoryview)):
+        return b"SECRET" in bytes(v)
+    if isinstance(v, str):
+        return "SECRET" in v
+    if isinstance(v, dict):
+        return any(_holds_secret(k, depth + 1) or _holds_secret(x, depth + 1) for k, x in v.items())
+    if isinstance(v, (list, tuple, set, frozenset)):
+        return any(_holds_secret(x, depth + 1) for x in v)
+    try:
+        return "SECRET" in repr(v)
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def _closed_port() -> int:
+    s = socket.socket()
+    s.bind(("127.0.0.1", 0))
+    port = s.getsockname()[1]
+    s.close()
+    return port
+
+
+@pytest.mark.parametrize("case", ["refused", "status401", "bad_header"])
+def test_f1_secret_in_no_traceback_frame(serve, case):
+    """F1: a failed connect must not leave the Authorization value in any frame of the raised error's traceback."""
+    if case == "refused":
+        call = lambda: ws.connect(f"ws://127.0.0.1:{_closed_port()}/", {"Authorization": SECRET},  # noqa: E731
+                                  insecure_for_test=True, connect_timeout=1)
+    elif case == "status401":
+        srv = serve(lambda p: p.handshake(status="401 Unauthorized"))
+        call = lambda: dial(srv)  # noqa: E731
+    else:
+        call = lambda: ws.connect("wss://api.deepgram.com/", {"Authorization": SECRET + "\r\nX: 1"})  # noqa: E731
+    with pytest.raises(ws.WsError) as e:
+        call()
+    err = e.value
+    assert err.__context__ is None and err.__cause__ is None
+    tb = err.__traceback__
+    frames = 0
+    while tb is not None:
+        frames += 1
+        leaked = [k for k, v in tb.tb_frame.f_locals.items() if _holds_secret(v)]
+        assert not leaked, (tb.tb_frame.f_code.co_name, leaked)
+        tb = tb.tb_next
+    assert frames >= 2
+
+
+class CountingSocket(socket.socket):
+    """Counts how many threads are inside recv() at once."""
+
+    lock = threading.Lock()
+
+    def __init__(self, *a, **kw):
+        super().__init__(*a, **kw)
+        self.inside = 0
+        self.max_inside = 0
+
+    def recv(self, *a, **kw):
+        with CountingSocket.lock:
+            self.inside += 1
+            self.max_inside = max(self.max_inside, self.inside)
+        try:
+            return super().recv(*a, **kw)
+        finally:
+            with CountingSocket.lock:
+                self.inside -= 1
+
+
+def test_f2_close_from_another_thread_while_reader_blocked(serve):
+    """F2: close() while a reader is blocked in recv() must not start a second socket reader; the reader gets the
+    peer's close."""
+    def script(p):
+        p.handshake()
+        fin, op, masked, data, _ = p.read_frame()
+        assert op == 8
+        time.sleep(0.1)
+        p.send(8, data[:2])
+        time.sleep(0.5)
+
+    c = dial(serve(script))
+    counting = CountingSocket(fileno=c._sock.detach())
+    counting.settimeout(3.0)
+    c._sock = counting
+    got, errs = [], []
+
+    def reader():
+        try:
+            got.append(c.recv())
+        except BaseException as e:  # noqa: BLE001
+            errs.append(e)
+
+    t = threading.Thread(target=reader)
+    t.start()
+    time.sleep(0.2)
+    t0 = time.monotonic()
+    c.close(wait=2.0)
+    t.join(5)
+    assert not t.is_alive()
+    assert time.monotonic() - t0 < 1.5
+    assert errs == [] and got == [("close", (1000, ""))]
+    assert counting.max_inside == 1
+
+
+def test_f3_fragment_overflow_refused_from_continuation_header(serve):
+    """F3: a continuation whose declared length overflows max_message is refused at its header, not after a wait."""
+    sent = []
+
+    def script(p):
+        p.handshake()
+        p.send(2, b"a" * 60, fin=False)
+        p.raw(struct.pack("!BB", 0x00, 60))        # declares 60 more, sends none
+        sent.append(p.read_frame())
+
+    srv = serve(script)
+    c = dial(srv, max_message=100, idle_timeout=2.0)
+    t0 = time.monotonic()
+    with pytest.raises(ws.WsError) as e:
+        c.recv()
+    assert e.value.code == "too_big"
+    assert time.monotonic() - t0 < 1.0
+    srv.t.join(5)
+    assert sent and sent[0][1] == 8 and struct.unpack("!H", sent[0][3][:2])[0] == 1009
+
+
+def test_f4_handshake_deadline_covers_tls():
+    """F4: a peer that accepts TCP and never speaks TLS is bounded by handshake_deadline, not connect_timeout."""
+    lst = socket.socket()
+    lst.bind(("127.0.0.1", 0))
+    lst.listen(4)                                   # the kernel completes TCP; nobody ever answers
+    try:
+        t0 = time.monotonic()
+        with pytest.raises(ws.WsError) as e:
+            ws.connect(f"wss://127.0.0.1:{lst.getsockname()[1]}/", {}, connect_timeout=5, handshake_deadline=0.3)
+        assert time.monotonic() - t0 < 1.5
+        assert e.value.code == "timeout"
+    finally:
+        lst.close()
+
+
+def test_f5_registered_close_code_passes_through(serve):
+    """F5: 1012/1013/1014 are valid close codes and reach the caller."""
+    def script(p):
+        p.handshake()
+        p.send(8, struct.pack("!H", 1013) + b"try later")
+        p.read_frame()
+
+    c = dial(serve(script))
+    assert c.recv() == ("close", (1013, "try later"))
+
+
+def test_f6_head_crossing_cap_in_last_read_refused(serve):
+    """F6: a head whose terminator lands past MAX_HANDSHAKE in the read that crosses the cap is refused."""
+    def script(p):
+        base = (f"HTTP/1.1 101 x\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n"
+                f"Sec-WebSocket-Accept: {p.accept_key()}\r\n").encode()
+        pad_line_overhead = len(b"X-Pad: \r\n") + len(b"\r\n")
+        pad = ws.MAX_HANDSHAKE + 123 - len(base) - pad_line_overhead
+        p.raw(base + b"X-Pad: " + b"a" * pad + b"\r\n\r\n")
+        time.sleep(0.5)
+
+    with pytest.raises(ws.WsError) as e:
+        dial(serve(script))
+    assert e.value.code == "handshake"
+
+
+def test_f6_deadline_between_chunks_is_timeout(monkeypatch):
+    """F6 (gemini): a head whose deadline expires between chunks (each recv returns in time) reports timeout."""
+    clock = [1000.0]
+    monkeypatch.setattr(ws.time, "monotonic", lambda: clock[0])
+
+    class Dribble:
+        def settimeout(self, t):
+            assert t > 0
+
+        def recv(self, n):
+            clock[0] += 0.1
+            return b"H"
+
+    with pytest.raises(ws.WsError) as e:
+        ws._read_head(Dribble(), clock[0] + 0.25)
+    assert e.value.code == "timeout"
+
+
+@pytest.mark.parametrize("frame", [
+    struct.pack("!BBH", 0x81, 126, 5) + b"hello",           # 16-bit form for a 5-byte payload
+    struct.pack("!BBQ", 0x82, 127, 300) + b"x" * 300,       # 64-bit form under 65536
+])
+def test_f7_non_minimal_length_refused(serve, frame):
+    """F7: RFC 6455 5.2 minimal length encoding."""
+    sent = []
+
+    def script(p):
+        p.handshake()
+        p.raw(frame)
+        sent.append(p.read_frame())
+
+    srv = serve(script)
+    c = dial(srv)
+    with pytest.raises(ws.WsError) as e:
+        c.recv()
+    assert e.value.code == "protocol"
+    srv.t.join(5)
+    assert sent and struct.unpack("!H", sent[0][3][:2])[0] == 1002
+
+
+def test_self_review_close_wait_bounds_the_close_frame_send(serve):
+    """Self-review (deadline-covers-one-phase class): close(wait) must bound its own close-frame send too, not only
+    the drain. A writer stuck in sendall (peer not reading) holds the send lock for up to idle_timeout."""
+    release = threading.Event()
+
+    def script(p):
+        p.handshake()
+        release.wait(10)                             # never reads: the client's send buffer fills
+
+    srv = serve(script)
+    c = dial(srv, idle_timeout=6.0, max_message=4 * 1024 * 1024)
+    stuck = threading.Event()
+    errs = []
+
+    def writer():
+        try:
+            while True:
+                stuck.set()
+                c.send_binary(b"x" * (4 * 1024 * 1024))
+        except ws.WsError as e:
+            errs.append(e.code)
+
+    t = threading.Thread(target=writer)
+    t.start()
+    stuck.wait(2)
+    time.sleep(0.5)                                  # let the buffers fill and the writer block in sendall
+    t0 = time.monotonic()
+    c.close(wait=0.3)
+    elapsed = time.monotonic() - t0
+    release.set()
+    t.join(8)
+    assert elapsed < 1.5, elapsed
+    assert c._closed and not t.is_alive() and errs == ["closed"]
+
+
+def test_f8_idle_timeout_with_one_header_byte_is_recoverable(serve):
+    """F8: an idle timeout after only the first header byte is a WsTimeout and the byte is kept."""
+    def script(p):
+        p.handshake()
+        p.raw(b"\x81")
+        time.sleep(0.5)
+        p.raw(b"\x02hi")
+        time.sleep(0.3)
+
+    c = dial(serve(script), idle_timeout=0.2)
+    with pytest.raises(ws.WsTimeout):
+        c.recv()
+    while True:
+        try:
+            assert c.recv() == ("text", "hi")
+            break
+        except ws.WsTimeout:
+            continue
+    c.close(wait=0.1)
