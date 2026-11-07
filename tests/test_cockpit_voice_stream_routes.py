@@ -112,10 +112,10 @@ def test_voice_json_flag_absent_for_a_tts_only_key(rig):
         assert "stream" not in js(call(port, "GET", cockpit_voice.VOICE_JSON)[2])
 
 
-def test_voice_json_names_deepgram_even_when_openai_is_also_keyed_for_stt(rig):
-    """OpenAI is listed before Deepgram and both are keyed for stt, but openai is not in STREAM_PROVIDERS, so the server
-    names deepgram and the key (the secret) is in no part of the body. Red with: "openai" put back in STREAM_PROVIDERS
-    (it then names openai), or `body["stream_provider"] = chosen` dropped."""
+def test_voice_json_names_openai_first_when_both_are_keyed_for_stt(rig):
+    """OpenAI is listed before Deepgram and both are keyed for stt, both have stream adapters, so the server names the
+    first (openai) and the key is in no part of the body. Red with: "openai" out of STREAM_PROVIDERS (it then names
+    deepgram), or `body["stream_provider"] = chosen` dropped."""
     keyed(rig, "openai")
     keyed(rig)
     with served(rig) as (port, _h):
@@ -123,7 +123,7 @@ def test_voice_json_names_deepgram_even_when_openai_is_also_keyed_for_stt(rig):
         got = js(body_raw)
         names = [r["name"] for r in got["providers"] if r["key"] == "set" and "stt" in r["uses"]]
         assert names == ["openai", "deepgram"]
-        assert got["stream"] is True and got["stream_provider"] == "deepgram"
+        assert got["stream"] is True and got["stream_provider"] == "openai"
         assert VALUE.encode() not in body_raw
 
 
@@ -145,24 +145,19 @@ def test_stream_provider_skips_a_keyed_row_with_no_adapter_and_is_none_when_none
     assert cockpit_voice.stream_provider([{"name": "openai", "key": "not_set", "uses": []}]) is None
 
 
-def test_deepgram_is_the_only_stream_provider_and_a_keyed_openai_is_409_no_stream(rig):
-    """openai is out of STREAM_PROVIDERS: a keyed openai is refused 409 no_stream before any key read and never offers
-    dictation. Red with: "openai" put back in STREAM_PROVIDERS (it then opens 200)."""
-    from levain.voice import deepgram_stream
-    assert tuple(cockpit_voice.STREAM_PROVIDERS) == ("deepgram",)
-    assert deepgram_stream.factory
-    keyed(rig, "openai")
-    with served(rig) as (port, _h):
-        status, body = open_session(port, "openai")
-        assert status == 409 and body["error"] == "no_stream"
-        assert "stream" not in js(call(port, "GET", cockpit_voice.VOICE_JSON)[2])
-    assert rig.rows() == []
+def test_stream_providers_are_openai_and_deepgram_and_each_has_a_model_and_a_price(rig):
+    """Every stream provider has a row in STREAM_STT_MODELS and that model has a price row, so a stream cannot be sent
+    under a model the ledger does not price. Red with: a provider added to STREAM_PROVIDERS without both rows."""
+    from levain.voice import deepgram_stream, meter, openai_stream, providers
+    assert tuple(cockpit_voice.STREAM_PROVIDERS) == ("openai", "deepgram")
+    assert deepgram_stream.factory and openai_stream.factory
+    for name in cockpit_voice.STREAM_PROVIDERS:
+        assert meter.DEFAULT_PRICES.find(name, "stt", providers.STREAM_STT_MODELS[name]) is not None
 
 
-def test_open_builds_the_deepgram_factory_with_the_key_reaching_only_it_and_refuses_openai(rig, monkeypatch):
-    """No test factory set: the route builds Deepgram's adapter for deepgram and refuses openai before any factory runs.
-    Red with: "openai" put back in STREAM_PROVIDERS (the openai open reaches a factory), or a key read for the wrong
-    provider."""
+def test_open_builds_each_providers_factory_with_the_key_reaching_only_it(rig, monkeypatch):
+    """No test factory set: the route builds the named provider's adapter and only that one gets the key. Red with: a key
+    read for the wrong provider, or the factory lookup mixed up."""
     from levain.voice import deepgram_stream, openai_stream
     seen = []
 
@@ -177,9 +172,10 @@ def test_open_builds_the_deepgram_factory_with_the_key_reaching_only_it_and_refu
     keyed(rig)
     with served(rig) as (port, _h):
         status, body = open_session(port, "openai")
-        assert status == 409 and body["error"] == "no_stream" and seen == []
+        assert status == 200 and [n for n, _k in seen] == ["openai"]
+        post(port, f"{CLOSE}?sid={body['sid']}")
         status, body = open_session(port, "deepgram")
-        assert status == 200 and [n for n, _k in seen] == ["deepgram"]
+        assert status == 200 and [n for n, _k in seen] == ["openai", "deepgram"]
         assert all(k not in str(body) for _n, k in seen) and seen[0][1] == VALUE
 
 

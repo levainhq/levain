@@ -65,7 +65,7 @@ _log = logging.getLogger("levain.voice.openai_stream")
 
 HOST = providers.HOSTS["openai"]
 URL_BASE = f"wss://{HOST}/v1/realtime?intent=transcription"
-TRANSCRIBE_MODEL = "gpt-live-transcribe"      # UNVERIFIED against a live key (named on the docs page)
+TRANSCRIBE_MODEL = providers.STREAM_STT_MODELS["openai"]      # the model the ledger prices (one table)
 IN_RATE, OUT_RATE = 16000, 24000
 COMMIT_EVERY_BYTES = 2 * OUT_RATE * 2         # ~2 s of 24 kHz PCM16 between commits
 MIN_COMMIT_BYTES = OUT_RATE * 2 // 10         # the API refuses a commit under 100 ms
@@ -272,6 +272,8 @@ class OpenAIStream:
         """Fold one event into the item state. False (and the stream failed) past a bound."""
         with self._lock:
             rec = self._items.get(item)
+            if rec is None and event != "committed":
+                return True               # an id the server never acknowledged as committed: ignored (intent; docs ask for item_id matching)
             if rec is None:
                 if len(self._order) >= MAX_ITEMS:
                     ok = False

@@ -65,9 +65,10 @@ STREAM_OPEN = "/cockpit/voice/stream/open"
 STREAM_CHUNK = "/cockpit/voice/stream/chunk"
 STREAM_CLOSE = "/cockpit/voice/stream/close"
 STREAM_PATHS = (STREAM_OPEN, STREAM_CHUNK, STREAM_CLOSE)
-# the providers a live dictation open may select; openai was taken out because its stream was once sent under a model name
-# the ledger did not price, so the cap could be passed several times over
-STREAM_PROVIDERS = ("deepgram",)
+# the providers a live dictation open may select; each must have a row in vprov.STREAM_STT_MODELS (the model sent and the
+# model reserved) and a price row for it. Past: openai was once out because its stream was sent under a model name the
+# ledger did not price. Still behind premium_stt, off by default.
+STREAM_PROVIDERS = ("openai", "deepgram")
 STREAM_MAX_SESSIONS = 1                 # one live dictation at a time (the registry's cap)
 STREAM_CHUNK_MAX = stream_session.MAX_CHUNK_BYTES
 STREAM_BODY_DEADLINE_S = 10.0           # a 250 ms chunk is 8000 bytes: a body that takes longer than this is stalled
@@ -706,7 +707,7 @@ def stream_open(registry: stream_session.StreamRegistry, data_root: Path | str, 
         return refusal(503, reach, reach, fallback=True)
     code, key_code, session = "", "", None
     try:
-        session = registry.open(owner, provider, PROVIDERS[provider].stt_model, data_root=data_root,
+        session = registry.open(owner, provider, vprov.STREAM_STT_MODELS[provider], data_root=data_root,
                                 read_key=read_key, factory=factory)
     except stream_session.StreamRefused as exc:
         code, key_code = exc.code, exc.key_code

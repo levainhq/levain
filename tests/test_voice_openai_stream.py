@@ -305,6 +305,7 @@ def test_overflow_is_bounded(serve, monkeypatch):
 
     def script(p):
         p.handshake()
+        p.send(1, committed("a"))
         p.send(1, delta("a", "y" * 30))
         time.sleep(0.5)
 
@@ -314,6 +315,7 @@ def test_overflow_is_bounded(serve, monkeypatch):
 
     def script2(p):
         p.handshake()
+        p.send(1, committed("a"))
         p.send(1, done("a", "z" * 30))
         time.sleep(0.5)
 
@@ -472,3 +474,53 @@ def test_thread_start_failure_closes_the_socket(serve, monkeypatch):
             open_stream(srv)
     assert e.value.code == "connect"
     assert seen.wait(3)
+
+
+def test_a_completion_for_an_item_never_committed_is_ignored(serve):
+    """A stray completed / delta for an id the server never acknowledged with input_audio_buffer.committed neither counts
+    toward the closing drain nor reaches the text. Revert: the `rec is None` branch in _take creating a record for a
+    non-committed event."""
+    def script(p):
+        p.handshake()
+        p.send(1, committed("a"))
+        p.send(1, delta("ghost", "stray partial"))
+        p.send(1, done("ghost", "stray words"))
+        time.sleep(0.4)
+        p.send(1, done("a", "real words"))
+        time.sleep(1.0)
+
+    s = open_stream(serve(script))
+    assert wait_for(lambda: s.poll().final == "real words")
+    assert "stray" not in s.poll().final + s.poll().partial
+    assert not s.poll().failed
+    s.close()
+
+
+def test_a_stray_completion_cannot_end_the_closing_drain_early(serve):
+    """After close() commits, a completion for a never-committed id used to satisfy `_resolved >= _commits` and end the
+    drain before the real item completed, returning the stray text. Revert: the same `_take` guard."""
+    def script(p):
+        p.handshake()
+        frames, stop = [], threading.Event()
+        th = threading.Thread(target=collect, args=(p, frames, stop), daemon=True)
+        th.start()
+        assert wait_for(lambda: any(m["type"] == "input_audio_buffer.commit" for m in msgs(frames)))
+        p.send(1, committed("a"))
+        p.send(1, done("ghost", "stray words"))
+        time.sleep(0.5)
+        p.send(1, done("a", "real words"))
+        time.sleep(0.5)
+        stop.set()
+
+    s = open_stream(serve(script))
+    s.send_audio(pcm16k(3200))
+    assert s.close() == "real words"
+
+
+def test_the_sent_model_is_the_priced_model():
+    """One table feeds the model the adapter sends and the model the ledger reserves and prices. Revert: TRANSCRIBE_MODEL
+    back to a literal, or the openai row dropped from providers.STREAM_STT_MODELS."""
+    from levain.voice import meter, providers
+    assert oa.TRANSCRIBE_MODEL == providers.STREAM_STT_MODELS["openai"]
+    for provider, model in providers.STREAM_STT_MODELS.items():
+        assert meter.DEFAULT_PRICES.find(provider, "stt", model) is not None, (provider, model)
