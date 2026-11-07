@@ -1411,10 +1411,12 @@
     const ready = vcState.providers.filter((p) => p.key === "set" && Array.isArray(p.uses) && p.uses.indexOf("tts") >= 0);
     V.offer(ready);                     // the player reads the same list, so what is shown here is what it will use
     const eff = V.effective(), st = V.settings();
-    const blocked = eff.blocked || "";     // the stored provider's key is gone: never swapped for another vendor, said here and at the reply
-    // a vendor is shown only when it is the stored one or the only one: with several keys and none stored, none is picked for him
-    const prov = blocked ? null : (ready.find((p) => p.name === eff.provider) || (ready.length === 1 ? ready[0] : null));
-    const premium = eff.tier === "premium" && (!!prov || !!blocked);
+    // a stored provider whose key is gone is never swapped for another vendor, on either tier: said here and at the reply
+    const gone = !!st.provider && !ready.some((p) => p.name === st.provider);
+    const blocked = eff.blocked || (gone ? V.blockedWords(st.provider) : "");
+    // a vendor is shown only when it is the stored one, or the only one with NOTHING stored (several keys and none stored: none is picked)
+    const prov = blocked ? null : (ready.find((p) => p.name === eff.provider) || (!st.provider && ready.length === 1 ? ready[0] : null));
+    const premium = eff.tier === "premium" && (!!prov || !!eff.blocked);
     // the shown provider, voice and speed are STORED, so the next Play sends what this block shows
     if (premium && prov && (st.provider !== eff.provider || st.voice !== eff.voice || st.speed !== eff.speed)) {
       V.saveSettings({ provider: eff.provider, voice: eff.voice, speed: eff.speed });
@@ -1427,7 +1429,7 @@
     const po = new Option("Premium voice", "premium"); po.disabled = !ready.length && !blocked;
     tier.appendChild(po);
     tier.value = premium ? "premium" : "device";
-    tier.addEventListener("change", () => rerun(tier.value === "premium" ? { tier: "premium", provider: prov ? prov.name : (ready.length === 1 ? ready[0].name : "") } : { tier: "device" }, "vc-tier"));
+    tier.addEventListener("change", () => rerun(tier.value === "premium" ? (prov ? { tier: "premium", provider: prov.name } : { tier: "premium" }) : { tier: "device" }, "vc-tier"));
     const t = vcRow("Read aloud with", tier, blocked || (ready.length ? "" : "Premium voice needs a key. Set one on the laptop with: levain voice key add <provider>"));
     if (blocked) { const hp = t.row.querySelector(".vc-help"); if (hp) { hp.classList.add("vc-blocked"); hp.setAttribute("role", "status"); } }
     t.label.htmlFor = "vc-tier";

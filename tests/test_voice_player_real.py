@@ -580,3 +580,82 @@ def test_a_reply_waiting_in_the_queue_when_the_page_hides_asks_for_a_tap(rig, tm
     assert json.loads(v[4]) == ["play", "queued"], v
     got = json.loads(v[5])
     assert got["text"] == "Tap to hear" and got["again"] == "seen", got
+
+
+STORED_GONE = "localStorage.setItem('levain_voice_settings', JSON.stringify({tier: '%s', provider: 'openai', voice: 'nova', speed: 1}));"
+TIER_FLIP = "(() => { const t = document.querySelector('#vc-tier'); t.value = '%s'; t.dispatchEvent(new Event('change')); return 1; })()"
+SNAP = ("JSON.stringify({s: LevainVoice.settings(), tier: document.querySelector('#vc-tier').value,"
+        " block: (document.querySelector('.vc-blocked') || {}).textContent || '',"
+        " opts: document.querySelector('#vc-provider') ? Array.from(document.querySelector('#vc-provider').options).map((o) => o.value) : null,"
+        " prov: document.querySelector('#vc-provider') ? document.querySelector('#vc-provider').value : null,"
+        " voiceRow: !!document.querySelector('#vc-voice'), posts: window.__posts.length})")
+
+
+@needs_browser
+def test_a_tier_flip_never_swaps_a_revoked_stored_provider_for_the_one_remaining_vendor(rig, tmp_path, monkeypatch) -> None:
+    """L3 r4 (codex MED): stored openai (key revoked), inworld the only live key. Premium -> On-device -> Premium must leave the
+    stored provider openai, show 'Your openai voice key is not available; choose a voice in Settings' with an EMPTY chooser,
+    send nothing to inworld, and only his explicit choice un-blocks it.
+    Revert: the tier handler's `ready.length === 1 ? ready[0].name` / paintVoice's `ready.length === 1 ? ready[0]` ignoring a stored provider."""
+    r = _reply(rig)
+    v, _ = _run(tmp_path, monkeypatch, rig, [
+        {"until": READY, "ms": 30000},
+        {"eval": TIER_FLIP % "device"},
+        {"eval": SNAP},
+        {"eval": TIER_FLIP % "premium"},
+        {"eval": "new Promise((res) => { LevainVoice.play(%s).then(() => res(1)); })" % json.dumps(r)},
+        {"eval": SNAP},
+        {"eval": "(() => { const p = document.querySelector('#vc-provider'); p.value = 'inworld'; p.dispatchEvent(new Event('change')); return 1; })()"},
+        {"eval": "new Promise((res) => { LevainVoice.play(%s).then(() => res(1)); })" % json.dumps(r)},
+        {"eval": "JSON.stringify(window.__posts.map((p) => p.body.provider))"},
+    ], pre=STORED_GONE % "premium", free=True)
+    dev, back = json.loads(v[2]), json.loads(v[5])
+    for got in (dev, back):
+        assert got["s"]["provider"] == "openai" and "openai" in got["block"] and "Settings" in got["block"], got
+        assert got["opts"] and got["opts"][0] == "" and got["prov"] == "" and not got["voiceRow"] and got["posts"] == 0, got
+    assert dev["tier"] == "device" and back["tier"] == "premium" and back["s"]["tier"] == "premium", (dev, back)
+    assert json.loads(v[8]) == ["inworld"], v
+
+
+@needs_browser
+def test_a_device_tier_block_with_a_revoked_stored_provider_shows_no_vendor_picked_for_him(rig, tmp_path, monkeypatch) -> None:
+    """Stored tier device + provider openai (revoked), inworld the only live key: the block says the key is gone with an empty
+    chooser and no inworld provider/voice rows; nothing is stored. Revert: paintVoice's `prov` falling to the sole ready vendor."""
+    v, _ = _run(tmp_path, monkeypatch, rig, [
+        {"until": READY, "ms": 30000},
+        {"eval": SNAP},
+    ], pre=STORED_GONE % "device", free=True)
+    got = json.loads(v[1])
+    assert got["s"]["provider"] == "openai" and got["s"]["tier"] == "device" and "openai" in got["block"], got
+    assert got["opts"] and got["opts"][0] == "" and got["prov"] == "" and not got["voiceRow"], got
+
+
+@needs_browser
+def test_with_nothing_stored_the_sole_live_vendor_is_still_pre_selected_and_a_device_read_sends_nothing(rig, tmp_path, monkeypatch) -> None:
+    """The other half of the rule: nothing stored and exactly one live key -> Premium pre-selects it (stored). The sample button and an
+    on-device read never POST to the speak route, whatever is stored."""
+    r = _reply(rig)
+    v, _ = _run(tmp_path, monkeypatch, rig, [
+        {"until": READY, "ms": 30000},
+        {"eval": TIER_FLIP % "premium"},
+        {"eval": "JSON.stringify(LevainVoice.settings())"},
+        {"eval": "(() => { const t = document.querySelector('#vc-tier'); t.value = 'device'; t.dispatchEvent(new Event('change')); return 1; })()"},
+        {"eval": "new Promise((res) => { document.querySelector('.vc-hear').click(); setTimeout(() => res(1), 300); })"},
+        {"eval": "new Promise((res) => { LevainVoice.play(%s).then(() => res(1)); })" % json.dumps(r)},
+        {"eval": "window.__posts.length"},
+    ], free=True)
+    assert json.loads(v[2])["provider"] == "inworld", v[2]
+    assert v[6] == 0, v
+
+
+@needs_browser
+def test_the_sample_and_an_on_device_read_send_nothing_when_the_stored_provider_is_revoked(rig, tmp_path, monkeypatch) -> None:
+    """The sample button and the player's device path never POST to the speak route, whatever provider is stored."""
+    r = _reply(rig)
+    v2, _ = _run(tmp_path, monkeypatch, rig, [
+        {"until": READY, "ms": 30000},
+        {"eval": "new Promise((res) => { document.querySelector('.vc-hear').click(); setTimeout(() => res(1), 300); })"},
+        {"eval": "new Promise((res) => { LevainVoice.play(%s).then(() => res(1)); })" % json.dumps(r)},
+        {"eval": "window.__posts.length"},
+    ], pre=STORED_GONE % "device", free=True)
+    assert v2[3] == 0, v2

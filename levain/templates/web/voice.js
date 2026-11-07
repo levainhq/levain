@@ -88,7 +88,7 @@
     if (!offered.length) { out.tier = "device"; return out; }
     // No stored provider: exactly one live key is the only choice there is; with several, none is picked for him.
     if (!st.provider && offered.length > 1) { out.blocked = "Choose a provider for the premium voice in Settings."; return out; }
-    const p = offered.find((x) => x.name === st.provider) || offered[0];
+    const p = st.provider ? offered.find((x) => x.name === st.provider) : offered[0];   // nothing stored + one live key: the only choice
     out.provider = p.name;
     out.voice = p.voices.indexOf(st.voice) >= 0 ? st.voice : p.default_voice;
     out.speed = Math.min(p.speed[1], Math.max(p.speed[0], st.speed));
@@ -426,7 +426,7 @@
 
   window.LevainVoice = {
     SAMPLE, WORDS, DEFAULTS,
-    settings: readSettings, saveSettings: writeSettings, effective, offer,
+    settings: readSettings, saveSettings: writeSettings, effective, offer, blockedWords,
     unlock, stop, play, arm, replyFinished, button,
     isUnlocked: () => unlocked,
     noteFor: (reply) => messages.get(key(reply)) || "",
