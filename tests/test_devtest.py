@@ -348,6 +348,17 @@ def test_the_watermark_stays_before_a_refused_report() -> None:
 
 
 @needs_node
+def test_a_transient_cache_read_failure_stops_the_pass_and_loses_no_tap() -> None:
+    # L3 r1 LOW-MED: a cache.match()/json() throw was "passed over" and the watermark advanced, so the valid tap was skipped forever
+    ring = _ring(("devtest-click", "approve", "none"), ("devtest-click", "deny", "none"))
+    keys = sorted(ring)
+    got = _page(entries=ring, plan=[200], matchThrow={keys[0]: 1}, steps=["load"])
+    assert got["posts"] == [] and got["sent"] in (None, ""), got              # stopped at the first failure: nothing passed, nothing skipped
+    got = _page(entries=ring, plan=[200], matchThrow={keys[0]: 1}, steps=["load", "visible", "wait"])
+    assert [p["action"] for p in got["posts"]] == ["approve", "deny"] and got["sent"] == keys[1], got   # the next pass reports both, in order
+
+
+@needs_node
 def test_a_report_the_network_dropped_is_retried_not_lost() -> None:
     ring = _ring(("devtest-shown", "actions=2", "none"))
     got = _page(entries=ring, plan=["throw", 200], steps=["load", "visible"])

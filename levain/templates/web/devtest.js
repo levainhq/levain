@@ -40,7 +40,9 @@
       const keys = (await c.keys()).map((r) => new URL(r.url).pathname).filter((k) => k.indexOf(TRACE_PREFIX) === 0 && k > last).sort();
       for (const k of keys) {
         let e = null;
-        try { e = await (await c.match(k)).json(); } catch (_) { /* unreadable: passed over */ }
+        // a key the ring no longer holds (trimmed meanwhile) is passed over; a read that THROWS (cache.match or json, perhaps only
+        // this once) stops the pass with the watermark where it was, so a valid tap is read again by the next pass, never skipped
+        try { const m = await c.match(k); e = m ? await m.json() : null; } catch (_) { return; }
         const click = e && e.step === "devtest-click", shown = e && e.step === "devtest-shown";
         if (click || shown) {
           const action = plain(e.action), state = plain(e.state);

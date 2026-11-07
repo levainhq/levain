@@ -1,6 +1,7 @@
 // Runs templates/web/devtest.js (band 299) in a vm with a fake DOM, Cache Storage, fetch and service worker, and prints what it did.
 // usage: node _page_devtest_rig.js <path to devtest.js> '<scenario json>'
 // scenario: {entries: {key: obj}, sent: "", plan: [status...] (reports; last repeats), sendStatus: 200, active: "new"|"old"|"none",
+//            matchThrow: {key: n} (cache.match of that key throws the first n times),
 //            steps: ["load"|"visible"|"visible2"|"run10"|"swmsg"]}
 const fs = require('fs');
 const vm = require('vm');
@@ -29,7 +30,8 @@ const sandbox = {
   MessageChannel: class { constructor() { const a = {}, b = {}; this.port1 = a; this.port2 = { postMessage: (d) => a.onmessage && a.onmessage({ data: d }) }; void b; } },
   URL, JSON, String, Number, Promise, Object, Array, Math, Date, setTimeout, clearTimeout, console,
   caches: { open: async () => ({ keys: async () => [...store.keys()].map((k) => ({ url: 'https://box.example' + k })), match: async (k) => {
-    const key = typeof k === 'string' ? k : new URL(k.url).pathname; await delay(sc.slow || 0); return store.has(key) ? { json: async () => JSON.parse(store.get(key)) } : undefined; } }) },
+    const key = typeof k === 'string' ? k : new URL(k.url).pathname; await delay(sc.slow || 0);
+    if ((sc.matchThrow || {})[key] > 0) { sc.matchThrow[key] -= 1; throw new Error('transient cache read'); } return store.has(key) ? { json: async () => JSON.parse(store.get(key)) } : undefined; } }) },
   fetch: async (path, opts) => {
     const body = JSON.parse(opts.body);
     if (path === '/webpush/devtest/send') { out.sends.push(body); return { status: sc.sendStatus }; }
