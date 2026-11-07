@@ -2069,14 +2069,18 @@ def _check_held(status: tuple[bool, Any], beat: tuple[str, Any], now: float) -> 
 def reaper_log_where(host: HostOS, exists: Callable[[str], bool] = os.path.exists) -> str:
     """Where the reaper's stderr (its quarantine and failed-pass lines) is kept, as words for a hint: on macOS the file the
     LaunchDaemon's own ``StandardErrorPath`` names (read from the unit, never a literal here), on Linux the journal
-    command for its systemd unit. A Mac installed before the plist kept a log has no such file until setup is re-run, and
+    command for its systemd unit. A Mac installed before the plist kept a log has no such file until `repair --source` is run, and
     the words say so while the path does not exist."""
-    from levain.slot import units
+    from levain.slot import layout, units
 
     svc = units.by_name("reaper")
     if host == "darwin":
         path = str(units.launchd_log_path(svc))
-        gap = "" if exists(path) else " (not created until `sudo levain setup-isolation` is re-run)"
+        # Measured on a real Mac (RETURN_reaper_log): setup-isolation neither rewrites the plist nor creates the file;
+        # `install-helper repair --source <tree>` does, and wants `h11` as a sibling directory of that tree.
+        src = shlex.quote(os.path.dirname(os.path.abspath(__file__)))
+        gap = "" if exists(path) else (f" (not created until `{layout.repair_line(host)} --source {src}` is run; "
+                                       "`h11` must sit beside that folder)")
         return f"service log {path}{gap}"
     return f"journal (`journalctl -u {units.systemd_name(svc)}`)"
 
