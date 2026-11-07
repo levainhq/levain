@@ -19,12 +19,21 @@ A refusal or a failure at any step before the start (a lock, the stop, the prepa
 releases both locks and reports. There is no fallback to the files an earlier prepare left: a launch on those is the
 L3 HIGH this slice closes (a revoked server stayed usable until a launcher refreshed the files).
 
+Three bounds the 1107-26 L3 round 1 added: the launch is macOS only in this slice (the Linux start program execs the
+bare vendor name with no PATH search, from the hands workspace as cwd), so any other host is refused before a lock is
+taken; a project layer in the hands workspace (a Codex ``.codex/`` config file, a Claude ``.mcp.json``) refuses the
+launch, since the vendor would read servers from it that the registry does not hold; and from the moment the locks are
+taken, a SIGTERM or SIGHUP ends in an orderly stop (the child terminated, the hands account swept, both locks released,
+then re-raised as an exit with ``128 + signal``), with processes left after the chat making the command exit non-zero.
+
 What this does not close: a revoke that lands while a chat is running does not reach it (the vendor read its file at
-start, and a stdio server is already running). See the frame's last section.
+start, and a stdio server is already running). See the frame's last section and its Known edges.
 """
 from __future__ import annotations
 
 import os
+import platform
+import signal
 import subprocess
 from pathlib import Path
 from typing import Callable, Protocol
@@ -44,11 +53,47 @@ class HandsChatRefused(RuntimeError):
 
 
 class _Proc(Protocol):
-    def wait(self) -> int: ...
+    def wait(self, timeout: float | None = None) -> int: ...
+    def terminate(self) -> None: ...
+    def kill(self) -> None: ...
 
 
-#: ``spawn(argv, cwd)`` starts the vendor and returns something with ``wait()``; tests pass a fake vendor.
+#: ``spawn(argv, cwd)`` starts the vendor and returns something with ``wait()``, ``terminate()`` and ``kill()``
+#: (a ``Popen``); tests pass a fake vendor.
 Spawn = Callable[[list[str], str], _Proc]
+
+MACOS_ONLY = "the hands chat launch is macOS only in this slice"
+
+#: The signals that end the chat in an orderly stop rather than killing the launcher past its ``finally``.
+_STOP_SIGNALS = (signal.SIGTERM, signal.SIGHUP)
+
+#: How long the child gets to end after ``terminate`` before ``kill``; the sweep after it is the backstop.
+_STOP_TIMEOUT = 5.0
+
+
+def host_refusal() -> str | None:
+    """Why this host cannot launch a hands chat, or None. On Linux the start program ``os.execv``s the bare vendor
+    name with the hands workspace as cwd (no PATH search), so a file planted there would run as the vendor."""
+    return None if platform.system() == "Darwin" else MACOS_ONLY
+
+
+def project_layer(workspace: Path) -> Path | None:
+    """A file in the hands workspace that a vendor reads as a project layer, or None: Claude's ``.mcp.json``, or a
+    Codex ``.codex/`` that is a link or holds a config file (the L3 r1 codex finding: Codex loads
+    ``.codex/config.toml``, its ``[mcp_servers]`` included, for a workspace the hands home marks trusted). A ``.codex``
+    link is refused as such, without following it."""
+    mcp = workspace / ".mcp.json"
+    if os.path.lexists(mcp):
+        return mcp
+    codex = workspace / ".codex"
+    if codex.is_symlink():
+        return codex
+    if not codex.is_dir():
+        return None
+    for name in sorted(os.listdir(codex)):
+        if name.startswith("config") or name.endswith((".toml", ".json")):
+            return codex / name
+    return None
 
 
 def _spawn(argv: list[str], cwd: str) -> _Proc:
@@ -76,15 +121,75 @@ def _wait(proc: _Proc) -> int:
             continue
 
 
+class _Signals:
+    """SIGTERM and SIGHUP handlers for the duration of a launch. While the chat runs, the first one raises
+    ``SystemExit(128 + signal)`` so the launcher's cleanup runs; once cleanup has begun (:meth:`quiet`) every stop
+    signal and SIGINT are recorded and ignored, so a second one cannot cut the sweep short. :meth:`restore` puts back
+    what was installed before."""
+
+    def __init__(self) -> None:
+        self.stopping = False
+        self.before: dict[int, object] = {}
+        for s in (*_STOP_SIGNALS, signal.SIGINT):
+            self.before[s] = signal.getsignal(s)
+        for s in _STOP_SIGNALS:
+            signal.signal(s, self._on_stop)
+
+    def _on_stop(self, signum: int, frame: object) -> None:
+        if not self.stopping:
+            self.stopping = True
+            raise SystemExit(128 + signum)
+
+    def _ignore(self, signum: int, frame: object) -> None:
+        pass
+
+    def quiet(self) -> None:
+        self.stopping = True
+        for s in (*_STOP_SIGNALS, signal.SIGINT):
+            signal.signal(s, self._ignore)
+
+    def restore(self) -> None:
+        for s, h in self.before.items():
+            # None: a handler installed outside Python, which cannot be put back from here; the default stands in
+            signal.signal(s, signal.SIG_DFL if h is None else h)  # type: ignore[arg-type]
+
+
+def _stop(proc: _Proc) -> None:
+    """Best effort: terminate the child, then kill it if it has not ended. The child is sudo, and signalling it can
+    fail (it runs as root); the sweep that follows is what stops the hands account's processes either way."""
+    try:
+        proc.terminate()
+        try:
+            proc.wait(timeout=_STOP_TIMEOUT)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.wait(timeout=_STOP_TIMEOUT)
+    except Exception:  # noqa: BLE001 - the sweep is the backstop
+        pass
+
+
 def launch_hands_chat(entity_dir: Path | str, vendor: str, cockpit_root: Path | str | None = None, *,
                       spawn: Spawn | None = None,
                       emit: Callable[[str], None] = print) -> int:
-    """Start the hands-uid ``vendor`` chat for ``entity_dir`` and wait for it; its exit code. Raises
-    :class:`HandsChatRefused` (nothing started, both locks released) for any refusal or failure before the start."""
+    """Start the hands-uid ``vendor`` chat for ``entity_dir`` and wait for it; its exit code, or non-zero when
+    processes of the hands account were left after it. Raises :class:`HandsChatRefused` (nothing started, both locks
+    released) for any refusal or failure before the start, and ``SystemExit(128 + signal)`` after an orderly stop on
+    SIGTERM or SIGHUP."""
     start = spawn if spawn is not None else _spawn
+    refusal = host_refusal()
+    if refusal is not None:
+        raise HandsChatRefused(f"{refusal}; no chat was started")
     if vendor not in VENDORS:
         raise HandsChatRefused(f"unknown vendor {vendor!r}; one of {', '.join(VENDORS)}")
+    try:
+        sigs = _Signals()
+    except ValueError as exc:   # not the main thread: no handler, so no orderly stop; refuse rather than run without
+        raise HandsChatRefused(f"the stop signals cannot be handled here ({exc}); no chat was started") from None
     fds: list[int] = []
+    hands: HandsIdentity | None = None
+    proc: _Proc | None = None
+    attempted = False           # set just before the spawn: from then on the hands account may be running a chat
+    survivors = False
     try:
         try:
             hands = hl.load_hands_identity(entity_dir)
@@ -94,11 +199,16 @@ def launch_hands_chat(entity_dir: Path | str, vendor: str, cockpit_root: Path | 
             if stale is not None:
                 raise HandsChatRefused(f"processes of the entity's user could not be stopped ({stale})")
             res = hml.prepare_launch(hands, entity_dir, cockpit_root, held=True)
+            layer = project_layer(Path(hands.workspace))
+            if layer is not None:
+                raise HandsChatRefused(f"the hands workspace holds a project layer the vendor would read ({layer}), "
+                                       "which can name MCP servers the registry does not hold; remove it")
             argv = chat_argv(hands, vendor)
             for gid, why in res.skipped:
                 emit(f"hands chat: registry entry {gid} not rendered ({why})")
             emit(f"hands chat: {vendor} as {hands.user} with {len(res.names)} registered MCP server(s)"
                  + (f" ({', '.join(res.names)})" if res.names else ""))
+            attempted = True
             proc = start(argv, str(hands.workspace))
         except HandsChatRefused as exc:
             raise HandsChatRefused(f"{exc}; no chat was started") from None
@@ -107,16 +217,27 @@ def launch_hands_chat(entity_dir: Path | str, vendor: str, cockpit_root: Path | 
             # next launch rewrites both from the registry
             raise HandsChatRefused(f"{exc}; no chat was started") from None
         rc = _wait(proc)
-        try:
-            left = hands_live.sweep_hands_user(hands.user, uid=hands.uid)
-        except Exception as exc:  # noqa: BLE001 - reported; the chat's own exit code is the answer
-            left = f"the stop failed ({exc})"
-        if left is not None:
-            emit(f"hands chat: processes of {hands.user} were left after the chat ({left})")
-        return rc
+    except BaseException:
+        sigs.quiet()
+        if proc is not None:
+            _stop(proc)
+        raise
     finally:
-        for fd in reversed(fds):
-            os.close(fd)
+        sigs.quiet()
+        try:
+            if attempted and hands is not None:
+                try:
+                    left = hands_live.sweep_hands_user(hands.user, uid=hands.uid)
+                except Exception as exc:  # noqa: BLE001 - reported, and the command exits non-zero
+                    left = f"the stop failed ({exc})"
+                if left is not None:
+                    survivors = True
+                    emit(f"hands chat: processes of {hands.user} were left after the chat ({left})")
+        finally:
+            sigs.restore()
+            for fd in reversed(fds):
+                os.close(fd)
+    return (rc or 1) if survivors else rc
 
 
 def cmd_hands_chat(entity_dir: Path | str, vendor: str, cockpit_root: Path | str | None = None) -> int:

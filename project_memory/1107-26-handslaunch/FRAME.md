@@ -106,7 +106,34 @@ session lock skipped (1 red), lock release skipped (10 red).
 - Mid-session revoke: a revoke landing while a hands chat runs does not reach it (the vendor read its file at start; a
   stdio server is already running). Needs the session to end on revoke, or the revoke path to stop the hands session.
 - VM: `ps -o uid=` of the spawned child is the hands uid (the 1103-27 DONE line), and an interactive chat actually
-  works through the sudo prefix with the terminal inherited (untested here: fakes only). Linux has no hands egress for
-  a vendor yet, so a Linux launch is expected to fail at the vendor, not refused up front.
+  works through the sudo prefix with the terminal inherited (untested here: fakes only). Linux launches are refused
+  up front since L3 r1 (below); Linux support is not built.
 - M2 Residue 2 (OAuth token found under strict + `--mcp-config`): VM, real hands login.
 - M4: doctor comparing the launch files with the registry (drift is invisible until the next launch or prepare).
+
+## L3 round 1 fixes (3 lineages: complement, codex, deepseek; gemini produced nothing)
+- **macOS only (codex HIGH, Linux).** On Linux `hands_prefix` runs `_HANDS_START`, which `os.execv`s the bare
+  `claude`/`codex` with no PATH search from the hands workspace as cwd: a planted `<workspace>/codex` would run, or
+  every launch fails ENOENT. Fixed by deletion: `host_refusal()` refuses any host that is not macOS ("the hands chat
+  launch is macOS only in this slice") before a lock, the sweep or prepare.
+- **Project layers (codex HIGH).** Codex loads `<workspace>/.codex/config.toml` (its `[mcp_servers]` included) when the
+  hands home marks the workspace trusted, which prepare preserves. The launcher now refuses, after the sweep and the
+  prepare and before the spawn, when the workspace holds a `.mcp.json`, a `.codex` link, or a `.codex/` entry named
+  `config*` or ending `.toml`/`.json`, naming the file; nothing starts, both locks are released.
+- **Signals and survivors (codex MED, complement MED).** SIGTERM/SIGHUP handlers are installed for the launch (refused
+  outright if they cannot be, off the main thread): the first raises `SystemExit(128 + signal)`, the child is
+  terminated (killed after 5 s), the hands account swept, both locks released, handlers restored, then re-raised;
+  further signals and SIGINT are ignored during cleanup. Cleanup is `except BaseException` plus `finally`, and the
+  sweep runs whenever the spawn was attempted (an interrupt inside the spawn included). Processes left after the chat
+  make the command exit non-zero (the vendor's code, or 1 when that was 0) with the warning.
+
+## Known edges
+- **Concurrent revoke vs launch.** Authority writers take neither entity lock, so a revoke can land between prepare
+  reading the registry and the spawn. That is equivalent to a revoke landing a moment after the launch, which a
+  running chat never sees anyway (the mid-session revoke above); closing either needs the revoke path to reach the
+  hands session.
+- **`TERM=dumb`.** `confinement._hands_env` / `hands_prefix` run the vendor under `env -i ... TERM=dumb`, which may
+  degrade or refuse the TUI. Belongs to the VM chat check; `confinement.py` is not edited in this slice.
+- **Ancestor project layers.** The project-layer refusal checks the workspace itself only; if Codex walks from the cwd
+  up to a project root above the workspace, a `.codex/config.toml` in an ancestor between them is not checked here.
+  Unmeasured; the VM chat check can confirm where Codex stops.

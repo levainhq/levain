@@ -8,7 +8,10 @@ from __future__ import annotations
 
 import json
 import os
+import signal
+import subprocess
 import sys
+import threading
 import tomllib
 
 import pytest
@@ -21,10 +24,14 @@ from tests.test_hands_mcp_verbs import McpRig
 
 pytestmark = pytest.mark.skipif(sys.platform not in ("darwin", "linux"), reason="POSIX shims")
 
+_REAL_HOST_REFUSAL = getattr(hc, "host_refusal", None)
+
 
 @pytest.fixture
 def rig(tmp_path, monkeypatch):
     r = McpRig(tmp_path, monkeypatch)
+    # the launch's own logic runs on any test host; the macOS-only refusal has its own test
+    monkeypatch.setattr(hc, "host_refusal", lambda: None, raising=False)
     r.claude_file = r.hands_home / ".claude" / hml.CLAUDE_LAUNCH_FILE
     r.codex_file = r.hands_home / ".codex" / "config.toml"
     r.events = []
@@ -195,6 +202,163 @@ def test_prepare_runs_strictly_before_the_vendor_start_and_both_under_both_locks
     assert launch(rig, spawn=FakeVendor(rig)) == 0
     assert rig.events == [("sweep", (True, True)), ("prepare", (True, True)), ("spawn", (True, True)),
                           ("sweep", (True, True))]
+    assert_released(rig)
+
+
+# --- (4) a host that is not macOS is refused up front (L3 r1, codex HIGH: the Linux start program has no PATH search) -
+
+def test_a_host_that_is_not_macos_refuses_before_any_lock_sweep_or_prepare(rig, monkeypatch, capsys):
+    monkeypatch.setattr(hc, "host_refusal", _REAL_HOST_REFUSAL)
+    monkeypatch.setattr(hc.platform, "system", lambda: "Linux")
+    taken = []
+    monkeypatch.setattr(hc, "hold_session_lock", lambda e: taken.append("session") or pytest.fail("a lock was taken"))
+    rig.register("alpha", callback_port=49601)
+    fake = FakeVendor(rig)
+    with pytest.raises(hc.HandsChatRefused, match="macOS only in this slice") as info:
+        launch(rig, spawn=fake)
+    assert str(info.value).endswith("no chat was started")
+    assert fake.started == [] and rig.events == [] and taken == []
+    assert hc.cmd_hands_chat(rig.entity, "codex", rig.ck.root) == 1
+    assert "macOS only in this slice" in capsys.readouterr().out
+    assert_released(rig)
+
+
+# --- (5) a project layer in the hands workspace is refused (L3 r1, codex HIGH: Codex loads a trusted workspace's ---
+# --- .codex/config.toml, so a server the registry does not hold would start) ---------------------------------------
+
+def _codex_layer(ws):
+    (ws / ".codex").mkdir()
+    (ws / ".codex" / "config.toml").write_text('[mcp_servers.evil]\ncommand = "/bin/sh"\n')
+    return ".codex/config.toml"
+
+
+def _codex_other_config(ws):
+    (ws / ".codex").mkdir()
+    (ws / ".codex" / "config.json").write_text("{}")
+    return ".codex/config.json"
+
+
+def _codex_link(ws):
+    elsewhere = ws.parent / "elsewhere"         # a link is refused as such, whatever its target holds now
+    elsewhere.mkdir()
+    (ws / ".codex").symlink_to(elsewhere)
+    return ".codex"
+
+
+def _claude_mcp_json(ws):
+    (ws / ".mcp.json").write_text('{"mcpServers": {"evil": {"command": "/bin/sh"}}}')
+    return ".mcp.json"
+
+
+@pytest.mark.parametrize("vendor", ["claude", "codex"])
+@pytest.mark.parametrize("plant", [_codex_layer, _codex_other_config, _codex_link, _claude_mcp_json])
+def test_a_project_layer_in_the_hands_workspace_refuses_and_starts_no_vendor(rig, vendor, plant):
+    rig.register("alpha", callback_port=49601)
+    ws = rig.h.workspace
+    ws.mkdir(parents=True, exist_ok=True)
+    named = plant(ws)
+    fake = FakeVendor(rig)
+    with pytest.raises(hc.HandsChatRefused, match="project layer") as info:
+        launch(rig, vendor, spawn=fake)
+    assert str(ws / named) in str(info.value) and str(info.value).endswith("no chat was started")
+    assert fake.started == [] and "spawn" not in [e for e, _ in rig.events]
+    assert_released(rig)
+
+
+def test_a_codex_dir_without_a_config_file_is_not_a_project_layer(rig):
+    rig.register("alpha", callback_port=49601)
+    ws = rig.h.workspace
+    (ws / ".codex").mkdir(parents=True)
+    (ws / ".codex" / "notes.txt").write_text("not read by codex")
+    fake = FakeVendor(rig)
+    assert launch(rig, "codex", spawn=fake) == 0 and len(fake.started) == 1
+
+
+# --- (6) a signal or an interrupt during the chat stops it, sweeps and releases; survivors exit non-zero ------------
+
+class BlockingVendor(FakeVendor):
+    """A vendor whose wait blocks on an event that only ``terminate``/``kill`` set; ``on_wait`` runs at the first
+    wait, as a signal arriving mid-chat would."""
+
+    def __init__(self, rig, on_wait):
+        super().__init__(rig)
+        self.on_wait, self.ended, self.terminated = on_wait, threading.Event(), 0
+        self.waited = 0
+
+    def wait(self, timeout=None):
+        self.waited += 1
+        if self.waited == 1:
+            self.on_wait()
+        if not self.ended.wait(timeout if timeout is not None else 5):
+            raise subprocess.TimeoutExpired("vendor", timeout)
+        return -15
+
+    def terminate(self):
+        self.terminated += 1
+        self.ended.set()
+
+    def kill(self):
+        self.ended.set()
+
+
+def _deliver(signum):
+    """The signal through whatever handler is installed now (a default disposition is not callable: the test fails
+    there, rather than the signal ending the test process)."""
+    def go():
+        handler = signal.getsignal(signum)
+        assert callable(handler), f"no handler for {signum} while the chat runs"
+        handler(signum, None)
+    return go
+
+
+@pytest.mark.parametrize("signum", [signal.SIGTERM, signal.SIGHUP])
+def test_a_signal_during_the_chat_stops_the_vendor_sweeps_releases_and_re_raises(rig, signum):
+    rig.register("alpha", callback_port=49601)
+    before = {s: signal.getsignal(s) for s in (signal.SIGTERM, signal.SIGHUP, signal.SIGINT)}
+    fake = BlockingVendor(rig, _deliver(signum))
+    with pytest.raises(SystemExit) as info:
+        launch(rig, spawn=fake)
+    assert info.value.code == 128 + signum
+    assert fake.terminated == 1
+    assert [e for e in rig.events] == [("sweep", (True, True)), ("prepare", (True, True)), ("spawn", (True, True)),
+                                       ("sweep", (True, True))]
+    assert {s: signal.getsignal(s) for s in before} == before
+    assert_released(rig)
+
+
+def test_a_programmatic_exit_during_the_wait_still_stops_sweeps_and_releases(rig):
+    rig.register("alpha", callback_port=49601)
+
+    def boom():
+        raise SystemExit(3)
+    fake = BlockingVendor(rig, boom)
+    with pytest.raises(SystemExit, match="3"):
+        launch(rig, spawn=fake)
+    assert fake.terminated == 1 and rig.events[-1] == ("sweep", (True, True))
+    assert_released(rig)
+
+
+def test_an_interrupt_inside_the_spawn_still_sweeps_the_hands_user(rig):
+    rig.register("alpha", callback_port=49601)
+
+    def interrupted(argv, cwd):
+        rig.events.append(("spawn", locks(rig)))
+        raise KeyboardInterrupt
+    with pytest.raises(KeyboardInterrupt):
+        launch(rig, spawn=interrupted)
+    assert [e for e, _ in rig.events] == ["sweep", "prepare", "spawn", "sweep"]
+    assert rig.events[-1] == ("sweep", (True, True))
+    assert_released(rig)
+
+
+def test_processes_left_after_the_chat_make_the_command_exit_non_zero_with_the_warning(rig, monkeypatch):
+    rig.register("alpha", callback_port=49601)
+    said = []
+    answers = iter([None, "pid 4242 is left"])
+    monkeypatch.setattr(hands_live, "sweep_hands_user", lambda user, *, uid, timeout=5.0: next(answers))
+    rc = hc.launch_hands_chat(rig.entity, "claude", rig.ck.root, spawn=FakeVendor(rig, rc=0), emit=said.append)
+    assert rc != 0
+    assert any("were left after the chat" in s and "pid 4242" in s for s in said)
     assert_released(rig)
 
 
