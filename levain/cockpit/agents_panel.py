@@ -33,7 +33,10 @@ stored role through :mod:`levain.agents.role`'s own check, on the same snapshot 
 ``unreadable``, the row says so in its body, and it is never read as a kind or as no kind. The panel only labels: the
 split of rows into Jobs and Fleet is the view's (P9b), and the group above is unchanged by the kind.
 
-The "cleared or not" column is not here (wired after P8a).
+The "cleared or not" column: a row also says how many of its review cards (the coordinator's ``agent`` feed, P8a) are
+open and how many are cleared, read from the review queue of the dispatch directory the wiring names. A card belongs to
+the agent whose id or name is one of the colon-separated parts of its ``dedupe_key``. An agent with no card says nothing; a queue that cannot be read is said in the panel's
+note and no counts are drawn, so an unreadable queue is never read as "all cleared".
 """
 from __future__ import annotations
 
@@ -55,7 +58,7 @@ from levain.cockpit.engine import ProviderSpec, ReadContext
 from levain.cockpit.results import Absent, Fault, Read, Result, RowIn
 
 __all__ = ["AGENTS_ID", "AGENT_ORDER", "AGENT_ROW_PREFIX", "AGENT_VERBS", "AgentsWiring", "OPERATOR_ROW_PREFIX",
-           "RETIRED_SHOWN", "agents_discoverer", "cockpit_wiring"]
+           "RETIRED_SHOWN", "agents_discoverer", "cockpit_wiring", "wire_agents"]
 
 AGENTS_ID = "agents"
 AGENT_ROW_PREFIX = "agent:"
@@ -80,7 +83,8 @@ class AgentsWiring:
     """What the agents panel and its verbs reach: ``store_dir`` the autonomic store directory (None: this levain
     home's), ``cockpit_root`` the cockpit's data root (the authority log, and where a renew appends), ``signing`` a
     callable returning ``(signer_fp, sign)`` of a laptop-presence key (None: this cockpit holds none, so a renew is
-    refused and says so), ``clock`` the instant the panel judges arming at. A cockpit carries it as
+    refused and says so), ``clock`` the instant the panel judges arming at, ``dispatch_dir`` a callable naming the coordinator's directory (None:
+    no review-card counts). A cockpit carries it as
     ``cockpit.agents_wiring``, the ONE place the panel (:func:`agents_discoverer`) and the verbs both read it: a
     cockpit that carries none draws no agents panel, and an agent verb on it refuses (never a default store)."""
 
@@ -88,6 +92,7 @@ class AgentsWiring:
     cockpit_root: Path | None = None
     signing: Callable[[], tuple[str, Callable[[bytes], str]]] | None = None
     clock: Callable[[], datetime] | None = None
+    dispatch_dir: Callable[[], Any] | None = None
 
     def now(self) -> datetime:
         return (self.clock or (lambda: datetime.now(timezone.utc)))()
@@ -97,6 +102,26 @@ def cockpit_wiring(cockpit: Any) -> AgentsWiring | None:
     """The cockpit's agents wiring, or None when it carries none."""
     wiring = getattr(cockpit, "agents_wiring", None)
     return wiring if isinstance(wiring, AgentsWiring) else None
+
+
+def wire_agents(cockpit: Any, source: Any, *, dispatch_dir: Callable[[], Any] | None = None) -> AgentsWiring:
+    """Give ``cockpit`` the agents wiring of the install ``source`` names, and register the panel on it. The store is the
+    one ``levain agents`` opens (this levain home's); the authority log is the ``cockpit/`` directory under the source's
+    write-scope ledger root, else the install's own ``.levain/cockpit`` when that directory exists, else None. The wiring
+    carries no signing key: a cockpit draws, pauses, resumes and retires, and a renew is refused until a laptop-presence key is
+    wired. An install whose home has no agent store draws no panel (:func:`agents_discoverer`)."""
+    scope = getattr(source, "write_scope", None)
+    root = getattr(source, "install_root", None)
+    if scope is not None:
+        cockpit_root: Path | None = Path(scope.ledger_root) / "cockpit"
+    elif root is not None and (Path(root) / ".levain" / "cockpit").is_dir():
+        cockpit_root = Path(root) / ".levain" / "cockpit"
+    else:
+        cockpit_root = None
+    wiring = AgentsWiring(store_dir=None, cockpit_root=cockpit_root, dispatch_dir=dispatch_dir)
+    cockpit.agents_wiring = wiring
+    cockpit.discover(agents_discoverer(cockpit), retire=True)
+    return wiring
 
 
 def _one_line(text: object, limit: int = 300) -> str:
@@ -203,17 +228,53 @@ def _kind(conn: sqlite3.Connection, role_hash: str, seen: dict[str, tuple[str, s
     return seen[role_hash]
 
 
+_CARD_SQL = ("SELECT i.dedupe_key, e.op FROM review_items i LEFT JOIN review_events e ON e.item_id = i.item_id AND "
+             "e.seq = (SELECT MAX(seq) FROM review_events WHERE item_id = i.item_id) WHERE i.feed = 'agent'")
+
+
+def _card_marks(wiring: AgentsWiring) -> tuple[list[tuple[str, bool]], str | None]:
+    """``([(dedupe_key, cleared)], why)`` of the ``agent`` review cards: every card with the state its latest event
+    gives it, or no cards and the reason the queue could not be read. No coordinator store is no cards, not a fault."""
+    if wiring.dispatch_dir is None:
+        return [], None
+    try:
+        from levain.autonomic.durable_sqlite import read_transaction
+        from levain.coordinator.store import CoordStore, StoreAbsent
+
+        directory = wiring.dispatch_dir()
+        if directory is None:
+            return [], None
+        store = CoordStore(Path(directory))
+        try:
+            store.open_readonly().close()
+        except StoreAbsent:
+            return [], None
+        with read_transaction(store.open_readonly) as conn:
+            return [(str(k), op == "cleared") for k, op in conn.execute(_CARD_SQL).fetchall()], None
+    except Exception as exc:  # noqa: BLE001 - a queue that cannot be read is said, never read as "nothing is open"
+        return [], f"the review queue cannot be read ({type(exc).__name__})"
+
+
+def _cards_of(agent: dict[str, Any], cards: list[tuple[str, bool]]) -> tuple[int, int]:
+    """``(open, cleared)`` of the cards whose key names this agent by id or by name."""
+    mine = [cleared for key, cleared in cards if {agent["agent_id"], agent["name"]} & set(key.split(":"))]
+    return mine.count(False), mine.count(True)
+
+
 def _row(agent: dict[str, Any], group: str, words: str, link: str, expiry: str, store_id: str,
-         kind: tuple[str, str]) -> RowIn:
+         kind: tuple[str, str], cards: tuple[int, int] = (0, 0)) -> RowIn:
     streak = f" · {agent['failure_streak']} failed in a row" if agent["failure_streak"] else ""
     until = f" · link until {expiry}" if expiry and group != "retired" else ""
     role = f" · role unreadable: {kind[1]}" if kind[0] == UNREADABLE_KIND else ""
-    # the unreadable-role words come last and are never the part a long line cuts
-    body = _one_line(f"{agent['name']} · v{agent['current_version']} · {words}{streak}{until}", 300 - len(role)) + role
+    held = f" · cards: {cards[0]} open, {cards[1]} cleared" if cards[0] or cards[1] else ""
+    # the card counts and the unreadable-role words come last and are never the part a long line cuts
+    body = _one_line(f"{agent['name']} · v{agent['current_version']} · {words}{streak}{until}",
+                     300 - len(role) - len(held)) + held + role
     stored = {"agent_id": agent["agent_id"], "name": agent["name"], "version": agent["current_version"],
               "spec_hash": agent["spec_hash"], "registration": agent["registration"],
               "operation": agent["operation"], "failure_streak": agent["failure_streak"], "group": group,
-              "words": words, "link": link, "expires_at": expiry, "store_id": store_id, "kind": kind[0]}
+              "words": words, "link": link, "expires_at": expiry, "store_id": store_id, "kind": kind[0],
+              "cards_open": cards[0], "cards_cleared": cards[1]}
     # agent_version and agent_store are what a verb's write checks the agent against, inside its own transaction
     return RowIn(id=AGENT_ROW_PREFIX + agent["agent_id"], title=_one_line(agent["name"], 120), body=body,
                  facets={"agent_group": group, "agent_link": link, "agent_version": agent["current_version"],
@@ -268,6 +329,7 @@ def read_rows(wiring: AgentsWiring, *, only: str | None = None) -> tuple[tuple[R
         return None
     now = wiring.now()
     arming = _Arming(wiring)
+    cards, cards_why = _card_marks(wiring)
     rows: list[RowIn] = []
     older = 0
     with view.read() as conn:
@@ -289,13 +351,17 @@ def read_rows(wiring: AgentsWiring, *, only: str | None = None) -> tuple[tuple[R
                 if only is None and retired_seen > RETIRED_SHOWN:
                     older += 1
                     continue
-                rows.append(_row(a, "retired", "retired", "", "", store_id, _kind(conn, a["role_hash"], kinds)))
+                rows.append(_row(a, "retired", "retired", "", "", store_id, _kind(conn, a["role_hash"], kinds),
+                                 _cards_of(a, cards)))
                 continue
             group, words, link, expiry = _judge(arming, conn, a, store_id, now)
-            rows.append(_row(a, group, words, link, expiry, store_id, _kind(conn, a["role_hash"], kinds)))
+            rows.append(_row(a, group, words, link, expiry, store_id, _kind(conn, a["role_hash"], kinds),
+                             _cards_of(a, cards)))
     note = None
+    if cards_why is not None:
+        note = f"Card counts are not shown: {cards_why}."
     if arming.why is not None:
-        note = f"Arming is unknown: {arming.why}; no agent is shown as firing."
+        note = (note + " " if note else "") + f"Arming is unknown: {arming.why}; no agent is shown as firing."
     if older:
         note = (note + " " if note else "") + (f"Retired shows {RETIRED_SHOWN}; {older} older: "
                                                 "levain agents list --all")

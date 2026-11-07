@@ -397,7 +397,7 @@
   // `headers` is the SAME read-header function the reads above use, so the change stream (a fetch read that
   // cannot go through res.json()) carries the same credential; `reload` is the board's one passive re-read and
   // resolves true only once a board was drawn (false: deferred by an edit or a load in flight, or it failed).
-  window.LevainCockpitTransport = { readJson: authedReadJson, headers: readHeaders, reload: () => load({ passive: true }) };
+  window.LevainCockpitTransport = { readJson: authedReadJson, headers: readHeaders, reload: () => load({ passive: true }), rowActions, rowVerb };
 
   // Poll an async job's status → { status, result?, error? }. Rides authedReadJson (spore-220 gates
   // /job.json off-box; token-free on loopback/read-only). Throws on a non-OK (incl. the fail-closed
@@ -817,6 +817,19 @@
     const action = row && Array.isArray(row.actions) ? row.actions.find((a) => a && a.verb === verb) : null;
     if (!action) return { ok: false, error: "not_offered", message: "the cockpit no longer offers that here; nothing was sent" };
     return postVerb(action, params || {}, signTxn ? { signTxn: signTxn } : {});
+  }
+
+  // The row actions the cockpit offered on a row now, and one of them posted by name (the agents card's detail view): the row's own
+  // offered action, so a verb the kernel did not offer on it is never sent. `confirm` is the second tap of a verb that asks one.
+  function rowActions(rowId) {
+    const row = live && live.rows ? live.rows[rowId] : null;
+    return row && Array.isArray(row.actions) ? row.actions : [];
+  }
+  async function rowVerb(rowId, verb, params, confirm) {
+    if (!live) return { ok: false, error: "not_ready", message: "the page has not finished reading" };
+    const action = rowActions(rowId).find((a) => a && a.verb === verb);
+    if (!action) return { ok: false, error: "not_offered", message: "the cockpit no longer offers that here; nothing was sent" };
+    return postVerb(action, params || {}, { confirm: confirm === true });
   }
 
   // Draw what the last write said on its row (or in the status line when the row is gone). The status
