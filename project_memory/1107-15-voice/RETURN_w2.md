@@ -39,7 +39,8 @@ build_snapshot; session_wire.py `role_withhold`.
 - No operator CLI doc/doctor line for `ceiling.withhold` was written.
 
 ## UNVERIFIED
-- tests/test_ci_root_closure.py and the broader sibling suites (spec, launcher, run-server, replica, refuse, lease) were started last; see the final line of the
-  lane summary for their result. Not run on the VM: the unit as `_levain_dispatch` under the root Python 3.9 (signed_role.py uses `X | None` only in annotations
-  under `from __future__ import annotations`; no 3.10-only runtime syntax, but not executed on 3.9).
+- Closure test: first run failed (4 new function-local imports unclassified); classified all four as `operator` in tests/ci/root_closure.py; the
+  classification test and the lazy-site tests pass (7). The full closure file was not re-run after the fix (first run: 17 pass, that 1 fail).
+- Sibling suites (spec, session launcher/launch, run server, replica, refuse, lease): 644 passed.
+- Not run on the VM: the unit as `_levain_dispatch` under the root Python 3.9 (signed_role.py has no 3.10-only runtime syntax, not executed on 3.9).
 - The three prior-art URLs in w2_FRAME.md were not fetched.
