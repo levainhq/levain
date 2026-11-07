@@ -1,0 +1,23 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<meta name="referrer" content="no-referrer" />
+<title>Levain · device test</title>
+<link rel="stylesheet" href="/dashboard.css" />
+</head>
+<body class="pair-body">
+  <main class="pair-card" aria-live="polite">
+    <div class="pair-brand"><span class="pair-dot"></span>Levain notification device test</div>
+    <p id="dt-head" class="pair-msg">Asks the server to push one notification with Approve and Deny buttons to this phone, then reports what the phone did. Tap Send, then lock the phone or close the app while you wait.</p>
+    <div class="pair-actions">
+      <button id="dt-run10" class="dev-btn" type="button">Send test notification (10 s)</button>
+      <button id="dt-run60" class="dev-btn" type="button">Send test notification (60 s)</button>
+    </div>
+    <div id="dt-log"></div>
+  </main>
+  <!-- No sw_open.js here: this page must never claim a pending tap target. The script is its own file (CSP: no inline). -->
+  <script src="/devtest.js"></script>
+</body>
+</html>

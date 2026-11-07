@@ -1278,6 +1278,9 @@ _ASSETS: dict[str, tuple[str, str]] = {
     # trace ring from this origin's Cache Storage. It does not load sw_open.js, so opening it never claims a pending tap.
     "/tap_trace": ("tap_trace.html", "text/html; charset=utf-8"),
     "/tap_trace.js": ("tap_trace.js", "text/javascript; charset=utf-8"),
+    # devtest (band 299): the notification-action device test page; a token-free shell, it reports through the gated POST /webpush/devtest.
+    "/devtest": ("devtest.html", "text/html; charset=utf-8"),
+    "/devtest.js": ("devtest.js", "text/javascript; charset=utf-8"),
     # An old phone link (the phone port shared this origin before the cockpit took it): see the file's header.
     "/legacy_phone_link.js": ("legacy_phone_link.js", "text/javascript; charset=utf-8"),
     # The sign sheet's script (OS-1): its page is GET /sign/<id>, served by _route beside a Signer.
@@ -1340,7 +1343,7 @@ _CENTER_POST = frozenset({_CENTER_READ, _CENTER_READ_ALL, _CENTER_DELETE, _CENTE
 _PUSH_GET = frozenset({"/webpush/key", "/webpush/record", _POLICY_PATH, _PRESENCE_PATH, _NOTIFY_TOKENS, _CENTER,
                        _CENTER_ITEM})
 _PUSH_POST = frozenset({"/webpush/subscribe", "/webpush/unsubscribe", "/webpush/opened", "/webpush/test", "/webpush/trace",
-                        "/webpush/landed",
+                        "/webpush/landed", "/webpush/devtest", "/webpush/devtest/send",
                         _POLICY_SET, _POLICY_RESET, _PRESENCE_SET, _PRESENCE_TOKEN_NEW, _PRESENCE_TOKEN_REVOKE,
                         _NOTIFY_TOKENS, _NOTIFY_TOKENS_REVOKE, *_CENTER_POST})
 _PUSH_SUBSCRIBE = "/webpush/subscribe"
