@@ -6,7 +6,7 @@ write ``<tag>.journaled`` (the host writes it only after the id is fsynced into 
 
 Harness code. Rig differences from production (the same two the 1105-17 hold rig carried): the render blob names no
 hooks (the root helper holds no hook templates) and the workspace seam is given ``stage.make_bundle`` (production
-leaves it unwired). usage: guest_dispatch.py <tag>   Files live in /private/tmp/fh (owned by _levain_dispatch).
+leaves it unwired). usage: guest_dispatch.py <tag>   Files live in the profile's exchange dir (owned by the dispatch user).
 """
 import json
 import os
@@ -15,6 +15,13 @@ import time
 import traceback
 from pathlib import Path
 
+if __package__:
+    from scripts.vm_harness.host_profile import profile_for_platform
+else:   # run as a script in the clone, next to host_profile.py (python -I leaves the script's own dir off sys.path)
+    sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+    from host_profile import profile_for_platform
+
+PROFILE = profile_for_platform(sys.platform)
 sys.path.insert(0, "/tmp/lv")
 from levain.agents.accounting import ActionExposure  # noqa: E402
 from levain.agents.session import SessionLaunch  # noqa: E402
@@ -26,10 +33,10 @@ from levain.slot.runtime_grammar import RENDER_FORMAT, parse_stdin  # noqa: E402
 from levain.slot.services import dispatch_run as D  # noqa: E402
 from levain.slot.supervisor import pick_routes, prepare_answer, read_base_map  # noqa: E402
 
-FH = Path("/private/tmp/fh")
+FH = Path(PROFILE.exchange_dir)
 ACK_S = 60
-STORE = Path("/private/var/levain")
-CONTROL = Path("/private/var/run/levain/control/control.sock")
+STORE = Path(PROFILE.store)
+CONTROL = Path(PROFILE.run_dir) / "control" / "control.sock"
 tag = ""   # set by main(); one per host run, never reused (the host also empties FH first)
 
 
@@ -93,10 +100,10 @@ def main(t: str) -> None:
     os.chdir(str(FH))
     claim()
     index_dir = STORE / "dispatch" / "sessions"
-    rt = RendezvousRuntime(host="darwin", control_socket=CONTROL, store=STORE,
+    rt = RendezvousRuntime(host=PROFILE.host_os, control_socket=CONTROL, store=STORE,
                            workspace=lambda req, staging: stage.make_bundle(
-                               "/private/tmp/fh/repo", "main", Path(staging) / "repo.bundle", tmp_parent="/private/tmp/fh",
-                               git="/Library/Developer/CommandLineTools/usr/bin/git"))
+                               f"{PROFILE.exchange_dir}/repo", "main", Path(staging) / "repo.bundle",
+                               tmp_parent=PROFILE.exchange_dir, git=PROFILE.git))
     launcher = RealLauncher(DispatchControlPort(CONTROL), rt,
                             D.bound_usage_sources(queue_root=STORE / "queue", store=STORE, index_dir=index_dir),
                             SessionIndex(index_dir))

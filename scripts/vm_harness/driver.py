@@ -31,6 +31,7 @@ from typing import Callable, Iterable
 from scripts.vm_harness.cleanup import (
     CleanupFailed, CleanupJournal, default_lister, run_with_cleanup, start_session,
 )
+from scripts.vm_harness.host_profile import DARWIN, HostProfile, check_guest_os
 
 #: DESIGN r17 W12: the harness states what it tests. One line, first in RESULT.txt.
 RESULT_HEADER = (
@@ -240,14 +241,16 @@ class VmAdapters:
     Every rendezvous tag is unique per run and the exchange dir is emptied of old tags first, so a previous run's
     ack or final can never satisfy this one."""
 
-    OPS = ("sudo", "-n", "/usr/local/bin/python3.13", "-I", "/tmp/fire/guest_ops.py")
-    DISPATCH = ("sudo", "-n", "-u", "_levain_dispatch", "/usr/bin/env", "PATH=/usr/bin:/bin",
-                "/usr/local/bin/python3.13", "-I", "/tmp/fire/guest_dispatch.py")
+    OPS = DARWIN.ops_argv()            # the default profile's prefixes; an instance with another profile carries its own
+    DISPATCH = DARWIN.dispatch_argv()
 
     def __init__(self, guest: Callable[..., str], spawn: Callable[[list[str]], object], *,
                  clock: Callable[[], float] = time.monotonic, sleep: Callable[[float], object] = time.sleep,
                  prepare_s: float = 90.0, run_s: float = 180.0, tag_prefix: str = "drv",
-                 nonce: Callable[[], str] = lambda: uuid.uuid4().hex[:12]) -> None:
+                 nonce: Callable[[], str] = lambda: uuid.uuid4().hex[:12],
+                 profile: HostProfile = DARWIN) -> None:
+        self.profile = profile
+        self.OPS, self.DISPATCH = profile.ops_argv(), profile.dispatch_argv()
         self._guest, self._spawn, self._clock, self._sleep = guest, spawn, clock, sleep
         self.prepare_s, self.run_s, self.tag_prefix, self._nonce = prepare_s, run_s, tag_prefix, nonce
         self._fresh = False
@@ -357,7 +360,16 @@ class VmAdapters:
         return all(self.ops("slotstate", n).strip() == "reusable" for n in sorted(slots))
 
     def lister(self) -> str:
-        return self._guest(["/bin/ps", "-Ao", "pid,etime,pcpu,ucomm,uid"], 60)
+        return self._guest(self.profile.ps_argv(), 60)
+
+    def verify_host(self) -> None:
+        """Refuse a guest that is not the profile's OS (``uname -s``), before any lifecycle runs. Opt-in: a caller with a
+        real guest runs it once; the injected-guest unit tests do not answer ``uname``."""
+        try:
+            out = self._guest(["/usr/bin/uname", "-s"], 30)
+        except Exception as e:   # noqa: BLE001 - an unanswerable guest is a refusal, not a pass
+            raise AdapterError(f"cannot ask the guest its OS: {type(e).__name__}: {e}") from e
+        check_guest_os(self.profile, out)
 
     def resolve(self, name: str) -> int | None:
         v = self.ops("resolve", name).strip()

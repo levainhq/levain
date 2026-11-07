@@ -4,8 +4,8 @@
   revoke <session>       the REVOKE CONTROL verb through the repo's own ControlClient (cleanup.control_revoke's body)
   resolve <name>         uid of <name> or 'none'
   fhclean -              unlink every drv<slot>x<nonce>.* rendezvous entry in the exchange dir; prints how many survived
-  put <name>             create (O_EXCL, no symlink) /private/tmp/fh/<name>, mode 644; <name> is a bare file name
-  get <name>             print /private/tmp/fh/<name>; exit 3 when absent, 5 when it is not a plain regular file
+  put <name>             create (O_EXCL, no symlink) <exchange dir>/<name>, mode 644; <name> is a bare file name
+  get <name>             print <exchange dir>/<name>; exit 3 when absent, 5 when it is not a plain regular file
   cancel <tag>           SIGTERM the guest dispatcher of <tag> (pid from <tag>.pid, checked against ps)
 usage: guest_ops.py <verb> <arg>
 
@@ -22,12 +22,19 @@ import stat
 import subprocess
 import sys
 
+if __package__:
+    from scripts.vm_harness.host_profile import profile_for_platform
+else:   # run as a script in the clone, next to host_profile.py (python -I leaves the script's own dir off sys.path)
+    sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+    from host_profile import profile_for_platform
+
+PROFILE = profile_for_platform(sys.platform)
 for root in ["/tmp/lvclean", "/tmp/lv"]:
     if os.path.isdir(os.path.join(root, "levain")):
         sys.path.insert(0, root)
         break
-SLOTS = "/private/var/levain/slots"
-FH = "/private/tmp/fh"
+SLOTS = f"{PROFILE.store}/slots"
+FH = PROFILE.exchange_dir
 NAME_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}")
 MAX_GET = 1 << 20
 RENDEZVOUS_RE = re.compile(r"\.?drv[0-9]+x[0-9a-f]+\.")
@@ -96,7 +103,7 @@ def main(argv: list[str]) -> int:
         print(hits[0] if len(hits) == 1 else "none")
     elif verb == "revoke":
         from levain.slot.control_client import ControlClient
-        with ControlClient("/var/run/levain/control/control.sock") as c:
+        with ControlClient(PROFILE.ops_control_sock) as c:
             print(json.dumps(c.call("REVOKE", session=arg), sort_keys=True))
     elif verb == "resolve":
         try:
@@ -154,7 +161,7 @@ def main(argv: list[str]) -> int:
         if raw is None or not raw.strip().isdigit():
             return 3
         pid = int(raw.strip())
-        ps = subprocess.run(["/bin/ps", "-o", "command=", "-p", str(pid)], capture_output=True, text=True).stdout
+        ps = subprocess.run([PROFILE.ps_bin, "-o", "command=", "-p", str(pid)], capture_output=True, text=True).stdout
         if "guest_dispatch.py" not in ps or tag not in ps.split():
             print(f"pid {pid} is not the dispatcher of {tag}", file=sys.stderr)
             return 5
