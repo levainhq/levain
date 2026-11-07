@@ -3505,3 +3505,14 @@ a.nc-pick.is-rec:hover { border-color: var(--text); }
   text-align: center; box-shadow: var(--shadow-overlay); cursor: pointer; }
 
 .needs-gone-note { margin: 8px 0; padding: 8px 12px; border-left: 3px solid var(--accent); }
+
+/* Settings > Voice (voice.js / devices_panel.js): a labelled control per row, the help line under it at full width */
+.vc-row { display: flex; flex-wrap: wrap; align-items: center; gap: var(--sp-2) var(--sp-4); }
+.vc-lab { flex: 1 1 140px; font: var(--fw-regular) var(--fs-meta) var(--sans); color: var(--text); }
+.vc-row .dev-label, .vc-speed-wrap { flex: 1 1 160px; }
+.vc-speed-wrap { display: flex; align-items: center; gap: var(--sp-3); }
+.vc-speed { flex: 1 1 auto; min-width: 0; }
+.vc-help { flex: 1 1 100%; margin: 0; }
+.vc-check { width: 24px; height: 24px; }
+.voice-ctl { display: inline-flex; align-items: center; gap: var(--sp-3); }
+.voice-btn { min-height: var(--hit-min, 44px); }

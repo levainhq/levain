@@ -47,6 +47,7 @@ def _init(fixture: dict[str, Any] | None) -> str:
     window.__calls.push({ path: path, method: (o && o.method) || 'GET', body: o && o.body ? String(o.body) : null, fromVoice: new Error().stack.indexOf('/voice.js') >= 0 });
     if (FIX && path === '/cockpit/voice.json') return Promise.resolve(new Response(JSON.stringify(FIX), { status: 200, headers: { 'Content-Type': 'application/json' } }));
     if (path === '/cockpit/voice/speak') {
+      if (window.__delay) return new Promise((r) => setTimeout(r, window.__delay)).then(() => new Response(new Blob([new Uint8Array([1])], { type: 'audio/mpeg' }), { status: 200, headers: { 'X-Voice-Chunks': '1' } }));
       if (window.__refuse) return Promise.resolve(new Response(JSON.stringify({ error: 'month_cap', message: 'Premium voice is paused: this month cap is reached.', fallback: 'on_device' }), { status: 402, headers: { 'Content-Type': 'application/json' } }));
       return Promise.resolve(new Response(new Blob([new Uint8Array([1, 2, 3])], { type: 'audio/mpeg' }), { status: 200, headers: { 'X-Voice-Chunks': String(window.__chunks) } }));
     }
@@ -260,7 +261,7 @@ def test_a_device_tier_read_calls_no_route(tmp_path, monkeypatch) -> None:
     """Revert: the device tier going through fetchChunk (any call after the mark)."""
     v = _run(tmp_path, monkeypatch, [
         {"until": READY_BLOCK, "ms": 20000},
-        {"eval": "LevainVoice.saveSettings({tier: 'device'}) && 0"},
+        {"eval": "LevainVoice.saveSettings({tier: 'device', provider: 'inworld', voice: 'voice-07'}) && 0"},   # a stored provider does not make it premium
         MARK,
         {"eval": "(() => { const w = LevainVoice.button(%s); document.body.appendChild(w); w.querySelector('button').click(); return 1; })()" % R6},
         {"until": "window.__spoken.length >= 1", "ms": 5000},
@@ -268,3 +269,30 @@ def test_a_device_tier_read_calls_no_route(tmp_path, monkeypatch) -> None:
         {"eval": "JSON.stringify(window.__spoken)"},
     ], _fixture())
     assert json.loads(v[5]) == [] and json.loads(v[6]) == ["six"], v[5:7]
+
+
+@needs_browser
+def test_a_stop_while_the_audio_is_still_being_fetched_plays_nothing_when_it_arrives(tmp_path, monkeypatch) -> None:
+    """Revert: `runId++` in stop() (a chunk that arrives after the stop is played)."""
+    v = _run(tmp_path, monkeypatch, [
+        {"until": READY_BLOCK, "ms": 20000},
+        {"eval": SET % json.dumps(PREMIUM) + " && 0"},
+        {"eval": "(() => { window.__delay = 400; window.__w = LevainVoice.button(%s); document.body.appendChild(window.__w);"
+                 " const b = window.__w.querySelector('button'); b.click(); const mid = b.textContent; b.click(); return mid + '/' + b.textContent; })()" % R6},
+        {"eval": "new Promise((r) => setTimeout(() => r(window.__plays.filter((p) => !p.muted).length), 900))"},
+    ], _fixture())
+    assert v[2] == "Stop/Play" and v[3] == 0, v[2:4]
+
+
+@needs_browser
+def test_the_voice_block_does_not_scroll_sideways_at_phone_width_and_its_controls_are_tappable(tmp_path, monkeypatch) -> None:
+    """Revert: nothing in the block's markup may widen the page; a control under 44px fails the hit-size floor."""
+    v = _run(tmp_path, monkeypatch, [
+        {"emulate": {"w": 390, "h": 844, "dpr": 3, "mobile": True}},
+        {"until": READY_BLOCK, "ms": 20000},
+        {"eval": "document.documentElement.scrollWidth - document.documentElement.clientWidth"},
+        {"eval": "JSON.stringify([...document.querySelectorAll('.vc-panel select, .vc-panel button, .vc-panel input[type=checkbox]')].map((n) => Math.round(n.getBoundingClientRect().height)))"},
+        {"shot": "/tmp/voice_block_390.png", "full": True},
+    ], _fixture())
+    assert v[1] <= 0, v[1]
+    assert all(h >= 24 for h in json.loads(v[2])), v[2]
