@@ -63,14 +63,122 @@ def commit_all(clone, msg="work"):
 
 
 def assert_refused(eg, clone, name="lane-t", path=None):
-    assert eg.hook(clone) == (0, "")
+    """A tree refusal is recorded AND told once on the first Stop (L3 r2 #1): exit 2 with the fixed words and the first
+    path; the next Stop for the same tip is silent and records nothing new."""
+    code, err = eg.hook(clone)
+    assert code == 2 and sp.TREE_REFUSAL_HEAD in err and "Drop the commits" in err
     assert eg.remote_ref(f"refs/heads/seat/{name}") is None
-    row = eg.log()[-1]
+    rows = eg.log()
+    row = rows[-1]
     assert row["outcome"] == "refused"
     assert sp.TREE_REFUSAL_HEAD in row["detail"]
     if path is not None:
-        assert path in row["detail"]
+        assert path in row["detail"] and path in err
+    assert eg.hook(clone) == (0, "")                     # told once: remembered, never loops
+    assert len(eg.log()) == len(rows)
     return row
+
+
+def test_a_tree_refusal_is_never_told_on_session_end_or_a_second_stop(eg):
+    """SessionEnd has no model to tell, and a Stop with stop_hook_active must not loop: both record and exit 0, and
+    the refusal nobody heard is told at the next first Stop. Reverting the ``event != "Stop" or active`` guard in
+    ``_tell_tree`` turns this red."""
+    clone, _ = act_lane(eg)
+    (clone / ACT / "posture.md").write_text("changed\n")
+    commit_all(clone)
+    assert eg.hook(clone, event="SessionEnd") == (0, "")
+    assert eg.log()[-1]["outcome"] == "refused"
+    assert eg.hook(clone, stdin={"stop_hook_active": True}) == (0, "")
+    assert eg.log()[-1]["outcome"] == "refused"
+    code, err = eg.hook(clone)
+    assert code == 2 and f"{ACT}/posture.md" in err
+
+
+def test_dropping_the_commits_after_the_tell_pushes(eg):
+    clone, base = act_lane(eg)
+    (clone / ACT / "posture.md").write_text("changed\n")
+    commit_all(clone)
+    assert eg.hook(clone)[0] == 2
+    _git(clone, "reset", "-q", "--hard", base)
+    (clone / "README.md").write_text("ok\n")
+    tip = commit_all(clone)
+    assert eg.hook(clone) == (0, "")
+    assert eg.remote_ref("refs/heads/seat/lane-t") == tip
+
+
+def test_other_push_refusals_stay_silent(eg):
+    """Only the activation refusal is told: a branch that does not descend from the base is recorded, exit 0."""
+    clone, _ = act_lane(eg)
+    _git(clone, "checkout", "-q", "--orphan", "tmp2")
+    (clone / "only2.txt").write_text("x\n")
+    commit_all(clone)
+    _git(clone, "branch", "-f", "seat/lane-t", "tmp2")
+    assert eg.hook(clone) == (0, "")
+
+
+def test_too_many_changed_paths_refuses_with_fixed_words(eg, monkeypatch):
+    """The diff-tree reads are streamed under a path cap; over it, the fixed words and nothing pushed. Reverting the
+    ``tally["paths"] > _TREE_MAX_PATHS`` check in ``_mirror_paths`` turns this red (the lane pushes)."""
+    clone, _ = act_lane(eg)
+    for i in range(3):
+        (clone / f"f{i}.txt").write_text("x\n")
+    commit_all(clone)
+    monkeypatch.setattr(sp, "_TREE_MAX_PATHS", 2)
+    assert eg.hook(clone) == (0, "")
+    assert eg.remote_ref("refs/heads/seat/lane-t") is None
+    assert "the lane branch changes too many paths to judge" in eg.log()[-1]["detail"]
+
+
+def test_too_many_changed_path_bytes_refuses_with_fixed_words(eg, monkeypatch):
+    """The byte cap, the same words. Reverting the ``tally["bytes"] > _TREE_MAX_BYTES`` check turns this red."""
+    clone, _ = act_lane(eg)
+    (clone / ("long-name-" * 8 + ".txt")).write_text("x\n")
+    commit_all(clone)
+    monkeypatch.setattr(sp, "_TREE_MAX_BYTES", 40)
+    assert eg.hook(clone) == (0, "")
+    assert eg.remote_ref("refs/heads/seat/lane-t") is None
+    assert "the lane branch changes too many paths to judge" in eg.log()[-1]["detail"]
+
+
+def test_a_judge_past_its_deadline_refuses_and_still_records(eg, monkeypatch):
+    """ONE deadline for the whole judge: with no budget left the check refuses in fixed words, nothing is pushed, and
+    seat_egress.jsonl still gets the line. Reverting ``_left``'s expiry raise turns this red."""
+    clone, _ = act_lane(eg)
+    (clone / "README.md").write_text("changed\n")
+    commit_all(clone)
+    monkeypatch.setattr(sp, "_JUDGE_BUDGET", 0)
+    assert eg.hook(clone) == (0, "")
+    assert eg.remote_ref("refs/heads/seat/lane-t") is None
+    assert "could not be judged in time" in eg.log()[-1]["detail"]
+
+
+def test_a_git_call_that_times_out_refuses_as_late(eg, monkeypatch):
+    """A git call that hits the shared deadline (TimeoutExpired) is the same fixed-words refusal, never a traceback."""
+    import subprocess
+    clone, _ = act_lane(eg)
+    (clone / "README.md").write_text("changed\n")
+    commit_all(clone)
+    real_run = subprocess.run
+
+    def slow(argv, *a, **k):
+        if "merge-base" in argv:
+            raise subprocess.TimeoutExpired(argv, k.get("timeout"))
+        return real_run(argv, *a, **k)
+    monkeypatch.setattr(subprocess, "run", slow)
+    assert eg.hook(clone) == (0, "")
+    assert eg.remote_ref("refs/heads/seat/lane-t") is None
+    assert "could not be judged in time" in eg.log()[-1]["detail"]
+
+
+def test_the_hook_deadline_bounds_the_judge(eg, monkeypatch):
+    """The judge stops at the hook's own deadline when that comes first (SessionEnd's ceiling minus the reserve)."""
+    clone, _ = act_lane(eg)
+    (clone / "README.md").write_text("changed\n")
+    commit_all(clone)
+    monkeypatch.setattr(sp, "_HOOK_RESERVE", sp.SESSION_END_TIMEOUT)    # SessionEnd leaves the judge nothing
+    assert eg.hook(clone, event="SessionEnd") == (0, "")
+    assert eg.remote_ref("refs/heads/seat/lane-t") is None
+    assert "could not be judged in time" in eg.log()[-1]["detail"]
 
 
 def test_a_lane_commit_touching_only_ordinary_files_still_pushes(eg):
@@ -186,3 +294,18 @@ def test_activation_component_matching():
     hit = sp._activation_paths
     assert hit([b"pkg/activation/x", b"a.txt", b"activation", b"x/ACTIVATION/y", b"deactivation/x",
                 b"pkg/activation.py"]) == ["pkg/activation/x", "activation", "x/ACTIVATION/y"]
+
+
+def test_the_streamed_read_honours_the_shared_deadline(eg):
+    """The streamed diff-tree read checks the one deadline itself (a select with no time left would poll, never stop).
+    Reverting ``_left``'s expiry raise turns this red: the read then finishes past its deadline."""
+    import time
+    clone, base = act_lane(eg)
+    (clone / "README.md").write_text("changed\n")
+    tip = commit_all(clone)
+    tally = {"paths": 0, "bytes": 0, "hits": set(), "base": base[:12]}
+    args = ["diff-tree", "-r", "-z", "--no-renames", "--name-only", base, tip]
+    assert sp._mirror_paths(clone / ".git", args, deadline=time.monotonic() + 30, stdin=b"", tally=tally) is None
+    assert tally["paths"] == 1
+    with pytest.raises(sp._Late):
+        sp._mirror_paths(clone / ".git", args, deadline=time.monotonic() - 1, stdin=b"", tally=dict(tally, hits=set()))

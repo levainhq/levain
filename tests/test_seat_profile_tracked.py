@@ -363,3 +363,59 @@ def test_an_unrelated_symlink_in_the_lane_still_builds(rig):
     lane = rig[0] / "lane"
     sha = commit(lane, TREE, links={"docs/readme": "../README.md"})
     assert build(rig, base_sha=sha)
+
+
+# --- L3 r2 #4, #5 ----------------------------------------------------------------------------------------------------
+
+def _act_dirs(root: Path, n: int) -> None:
+    for i in range(n):
+        (root / f"d{i}" / "activation").mkdir(parents=True)
+
+
+def test_candidate_activation_dirs_count_against_the_walk_cap(tmp_path, monkeypatch):
+    """Candidates are filtered out of the walk, but they are counted first: 5 parents + 5 candidates = 10 entries.
+    Moving the ``seen +=`` back below the filtering (counting only the kept 5) turns this red."""
+    root = Path(os.path.realpath(tmp_path)) / "lane"
+    _act_dirs(root, 5)
+    monkeypatch.setattr(sp, "_WALK_CAP", 7)
+    monkeypatch.setattr(sp, "tracked_at_base", lambda *a, **k: pytest.fail("read the base past the walk cap"))
+    found = sp._contains_agent_config(root, git_dir_ok=False, base_sha="0" * 40, exempt=[])
+    assert found == [f"{root} is too large to vet"]
+
+
+def test_candidates_are_capped_and_refuse_over_the_cap(tmp_path, monkeypatch):
+    """Reverting the ``len(candidates) > _CANDIDATE_CAP`` refusal turns this red (the base is read for all three)."""
+    root = Path(os.path.realpath(tmp_path)) / "lane"
+    _act_dirs(root, 3)
+    monkeypatch.setattr(sp, "_CANDIDATE_CAP", 2)
+    monkeypatch.setattr(sp, "tracked_at_base", lambda *a, **k: pytest.fail("read the base past the candidate cap"))
+    found = sp._contains_agent_config(root, git_dir_ok=False, base_sha="0" * 40, exempt=[])
+    assert found == [f"{root} holds more than 2 activation directories to vet"]
+
+
+@pytest.mark.parametrize("shape", ["file", "broken-link", "link-to-file", "link-to-dir"])
+def test_a_top_level_dot_git_that_is_not_a_real_directory_is_reported_once(tmp_path, shape):
+    """The final .git validity check is the sole reporter (L3 r2 #5): a regular file, a broken symlink or a symlink to
+    a file was reported twice (protected filename, then not-a-real-directory); a symlink to a directory once, under
+    another wording. Restoring the filename branch's report for the root .git turns the first three red."""
+    root = Path(os.path.realpath(tmp_path)) / "lane"
+    root.mkdir()
+    g = root / ".git"
+    if shape == "file":
+        g.write_text("gitdir: /elsewhere\n")
+    elif shape == "broken-link":
+        os.symlink(root / "missing", g)
+    elif shape == "link-to-file":
+        (root / "f").write_text("x")
+        os.symlink(root / "f", g)
+    else:
+        (root / "realgit").mkdir()
+        os.symlink(root / "realgit", g)
+    found = sp._contains_agent_config(root, git_dir_ok=True)
+    assert found == [f"{root}/.git is not a real directory"]
+
+
+def test_a_real_top_level_dot_git_is_not_reported(tmp_path):
+    root = Path(os.path.realpath(tmp_path)) / "lane"
+    (root / ".git").mkdir(parents=True)
+    assert sp._contains_agent_config(root, git_dir_ok=True) == []

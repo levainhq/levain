@@ -178,6 +178,9 @@ _BASE_SHA_LEN = (40, 64)
 _GIT_TIMEOUT = 60
 _LS_TREE_MAX_BYTES = 64 << 20
 _READ_CHUNK = 1 << 20
+#: The most candidate ``activation`` directories one lane may hold for vetting; more refuses (L3 r2 #4): the candidates
+#: become ``ls-tree`` pathspecs, so an unbounded list is an unbounded argv. levain's own repo holds one.
+_CANDIDATE_CAP = 256
 #: Characters that change what a permission rule or a sandbox path matches (glob syntax, its escape, gitignore-style
 #: negation and comment at a component's start). An exempt path holding one refuses instead of being escaped (L3 r1 #5).
 _GLOB_CHARS = frozenset("*?[]{}\\")
@@ -370,14 +373,20 @@ def _contains_agent_config(root: Path, *, git_dir_ok: bool, base_sha: str | None
     seen = 0
     for dirpath, dirnames, filenames in os.walk(root, followlinks=False):
         here = Path(dirpath)
+        # every entry counts, BEFORE any is filtered out: a candidate or a protected name is never free (L3 r2 #4)
+        seen += len(dirnames) + len(filenames)
+        if seen > _WALK_CAP:
+            found.append(f"{root} is too large to vet")
+            return found
         keep = []
         for d in dirnames:
             if d == ".git" and git_dir_ok and here == root:
-                if os.path.islink(here / d):
-                    found.append(str(here / d))
-                continue
+                continue                               # judged once, after the walk (L3 r2 #5)
             if d in TRACKED_EXEMPT_NAMES and base_sha is not None and here != root:
                 candidates.append(here / d)            # judged below, after the walk; never descended here
+                if len(candidates) > _CANDIDATE_CAP:
+                    found.append(f"{root} holds more than {_CANDIDATE_CAP} activation directories to vet")
+                    return found
             elif d in PROTECTED_NAMES:
                 found.append(str(here / d))
             elif os.path.islink(here / d):
@@ -386,15 +395,14 @@ def _contains_agent_config(root: Path, *, git_dir_ok: bool, base_sha: str | None
                 keep.append(d)
         dirnames[:] = keep
         for f in filenames:
+            if f == ".git" and git_dir_ok and here == root:
+                continue                               # a file, broken link or link to a file: judged once, below
             if f in PROTECTED_NAMES:
                 found.append(str(here / f))
             elif os.path.islink(here / f):
                 links.append(here / f)
-        seen += len(dirnames) + len(filenames)
-        if seen > _WALK_CAP:
-            found.append(f"{root} is too large to vet")
-            return found
-    if git_dir_ok and not (root / ".git").is_dir():
+    # the SOLE report for the clone's own top-level .git: anything but a real directory (a symlink to one included)
+    if git_dir_ok and (os.path.islink(root / ".git") or not (root / ".git").is_dir()):
         found.append(f"{root}/.git is not a real directory")
     if not candidates:
         return found

@@ -110,8 +110,11 @@ hook run the push described under seat egress.
 - The deny rules name those agent-config paths at the top of each root only. The launch check walks the whole tree and refuses a root that already holds one at any depth, but a nested one (for example `sub/.claude/settings.json`) written during the turn is not denied. The seat loads no settings from its roots, so it is inert for the seat, but it can be committed and, with a seat-egress grant, pushed to `seat/<lane key>` on the remote, where an ordinary Claude Code session that checks the branch out would read it. Review that branch without checking it out (for example `git log -p` and `git show <branch>:<path>`).
 - The tracked `activation/` exemption trusts the commit the operator named and the clone the launcher made from it: it
   proves the directory matches that commit, not that the commit's contents are safe. The seat loads nothing from it.
-  Its deny rules are the same kind as the other ones, measured for the other names and not yet measured on this path
-  by the canary; the push refusal does not depend on them. A working tree that git would check out differently from
+  Its deny rules are the same kind as the other ones, measured for the other names; on this path the deny is
+  UNMEASURED. It is not tested by hand: the machine guard forbids ad-hoc sandbox testing (never a hand-written sandbox
+  profile; one once kernel-panicked the operator's Mac). The cheapest proof is a real `levain seat launch` with a
+  canary write probe into a tracked activation file, and Z2 owns that run after this lands. The push refusal does not
+  depend on the deny rules. A working tree that git would check out differently from
   the stored bytes (an `eol` or filter attribute) refuses, because the bytes then differ.
 - The seat CAN change an exempt directory in its own working tree (by the rename or hard-link routes above); what it
   cannot do is get that change out through Levain's push. A lane directory is the seat's scratch space: review its
@@ -248,12 +251,17 @@ The profile's `Stop` and `SessionEnd` hooks run `levain.seat_push`. In order:
    base may add, modify, delete or rename a path with an `activation` component at any depth (compared regardless of
    case), against any of its parents. Otherwise nothing is pushed and the record says, in fixed words, "the lane branch
    changes an activation directory, which a seat may read and never change", with the first path. A later commit that
-   restores the files does not clear it; the commits that touch it must be dropped.
+   restores the files does not clear it; the commits that touch it must be dropped. A lane branch that changes more
+   paths than Levain will judge (200,000 across the commits, or 64 MiB of path names) is refused in the fixed words
+   "the lane branch changes too many paths to judge". The judgment has one deadline of 30 seconds, inside the hook's
+   own time limit; a judgment that does not finish in time is refused ("could not be judged in time") and recorded.
 
 The hook never stops the seat's work. Every outcome is written to `<levain home>/push/seat_egress.jsonl`, and the hook
-exits 0, with one exception: if the remote rejects the push (for example, a non-fast-forward), the first `Stop`
-exits 2, which keeps the turn open and puts the message in front of the model, which can rebase. Nothing is forced. A network or authentication failure
-is recorded and retried at the next `Stop`.
+exits 0, with two exceptions, both on the first `Stop` only: if the remote rejects the push (for example, a
+non-fast-forward), or if step 5 refuses because the lane branch changes an activation directory. Then the hook exits 2,
+which keeps the turn open and puts the message in front of the model, which can rebase or drop the commits. Each is
+told once: the tip is remembered, a second `Stop` (with `stop_hook_active`) exits 0, and `SessionEnd` never exits 2.
+Nothing is forced. A network or authentication failure is recorded and retried at the next `Stop`.
 
 ### Known edges
 
