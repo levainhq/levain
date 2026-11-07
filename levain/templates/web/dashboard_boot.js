@@ -948,9 +948,12 @@
         if (myGen !== loadGen) return false;     // superseded while it was stuck: the newer read owns the board
         if (passive && editInProgress()) { notice = null; status("editing — refresh deferred"); return false; }
         writeTokenRequired = mview.write_token_required === true;
-        window.LevainDashboard.render(mview, mview.writable
-          ? { commit: manifestCommit, commitAction: manifestAction, cancelPending, answerQuestion, bandRead, answerBand, dismissNote, reviewItem, onJobsIdle, recall } : { recall });
-        live = { rows: mview.targets.rows, panels: mview.targets.panels, heads: mview.verb_heads };
+        const liveBefore = live;
+        live = { rows: mview.targets.rows, panels: mview.targets.panels, heads: mview.verb_heads };   // published before the draw: an open detail rebuilds inside render and must read THIS read's actions
+        try {
+          window.LevainDashboard.render(mview, mview.writable
+            ? { commit: manifestCommit, commitAction: manifestAction, cancelPending, answerQuestion, bandRead, answerBand, dismissNote, reviewItem, onJobsIdle, recall } : { recall });
+        } catch (e) { live = liveBefore; throw e; }
         if (heldNext) {    // published once drawn: only then can a panel be refetched in place
           window.LevainCockpitHeld = heldNext;
           document.dispatchEvent(new CustomEvent("levain:cockpit-held"));   // the change stream starts, or restarts, on this

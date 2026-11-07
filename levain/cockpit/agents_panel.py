@@ -104,7 +104,8 @@ def cockpit_wiring(cockpit: Any) -> AgentsWiring | None:
     return wiring if isinstance(wiring, AgentsWiring) else None
 
 
-def wire_agents(cockpit: Any, source: Any, *, dispatch_dir: Callable[[], Any] | None = None) -> AgentsWiring:
+def wire_agents(cockpit: Any, source: Any, *, dispatch_dir: Callable[[], Any] | None = None,
+                clock: Callable[[], datetime] | None = None) -> AgentsWiring:
     """Give ``cockpit`` the agents wiring of the install ``source`` names, and register the panel on it. The store is the
     one ``levain agents`` opens (this levain home's); the authority log is the ``cockpit/`` directory under the source's
     write-scope ledger root, else the install's own ``.levain/cockpit`` when that directory exists, else None. The wiring
@@ -118,7 +119,7 @@ def wire_agents(cockpit: Any, source: Any, *, dispatch_dir: Callable[[], Any] | 
         cockpit_root = Path(root) / ".levain" / "cockpit"
     else:
         cockpit_root = None
-    wiring = AgentsWiring(store_dir=None, cockpit_root=cockpit_root, dispatch_dir=dispatch_dir)
+    wiring = AgentsWiring(store_dir=None, cockpit_root=cockpit_root, clock=clock, dispatch_dir=dispatch_dir)
     cockpit.agents_wiring = wiring
     cockpit.discover(agents_discoverer(cockpit), retire=True)
     return wiring
@@ -246,19 +247,37 @@ def _card_marks(wiring: AgentsWiring) -> tuple[list[tuple[str, bool]], str | Non
             return [], None
         store = CoordStore(Path(directory))
         try:
-            store.open_readonly().close()
+            with read_transaction(store.open_readonly) as conn:
+                return [(str(k), op == "cleared") for k, op in conn.execute(_CARD_SQL).fetchall()], None
         except StoreAbsent:
-            return [], None
-        with read_transaction(store.open_readonly) as conn:
-            return [(str(k), op == "cleared") for k, op in conn.execute(_CARD_SQL).fetchall()], None
+            # no file is no cards; a file that is there without the current tables is a queue that cannot be read
+            if not store.path.exists():
+                return [], None
+            return [], "the review queue holds no current tables"
     except Exception as exc:  # noqa: BLE001 - a queue that cannot be read is said, never read as "nothing is open"
         return [], f"the review queue cannot be read ({type(exc).__name__})"
 
 
-def _cards_of(agent: dict[str, Any], cards: list[tuple[str, bool]]) -> tuple[int, int]:
-    """``(open, cleared)`` of the cards whose key names this agent by id or by name."""
-    mine = [cleared for key, cleared in cards if {agent["agent_id"], agent["name"]} & set(key.split(":"))]
-    return mine.count(False), mine.count(True)
+def _card_index(cards: list[tuple[str, bool]]) -> tuple[dict[str, list[int]], dict[str, list[int]]]:
+    """One pass over the cards: ``(by_id, by_subject)``, each token to ``[open, cleared]``. An agent id counts wherever it
+    stands in the key (it is unique); a name counts only as the key's subject, the part after the kind
+    (``kind:<subject>:...``), so a kind or a suffix that happens to equal a name is not that agent's card."""
+    by_id: dict[str, list[int]] = {}
+    by_subject: dict[str, list[int]] = {}
+    for key, cleared in cards:
+        parts = key.split(":")
+        for token in set(parts):
+            by_id.setdefault(token, [0, 0])[1 if cleared else 0] += 1
+        if len(parts) > 1:
+            by_subject.setdefault(parts[1], [0, 0])[1 if cleared else 0] += 1
+    return by_id, by_subject
+
+
+def _cards_of(agent: dict[str, Any], index: tuple[dict[str, list[int]], dict[str, list[int]]]) -> tuple[int, int]:
+    """``(open, cleared)`` of the cards whose key names this agent by id, or by name as the key's subject."""
+    by_id, by_subject = index
+    hit = by_id.get(agent["agent_id"]) or by_subject.get(agent["name"]) or [0, 0]
+    return hit[0], hit[1]
 
 
 def _row(agent: dict[str, Any], group: str, words: str, link: str, expiry: str, store_id: str,
@@ -330,6 +349,7 @@ def read_rows(wiring: AgentsWiring, *, only: str | None = None) -> tuple[tuple[R
     now = wiring.now()
     arming = _Arming(wiring)
     cards, cards_why = _card_marks(wiring)
+    cards = _card_index(cards)
     rows: list[RowIn] = []
     older = 0
     with view.read() as conn:

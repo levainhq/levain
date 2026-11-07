@@ -99,7 +99,7 @@
     const D = root.LevainDashboard;
     if (!D || typeof D.openCustom !== "function") return;
     const id = row.dataset.keepKey;
-    D.openCustom({ id: "agent:" + id, title: nameOf(wordsOf(row).body), live: true, opener: row, build: () => build(id) });
+    D.openCustom({ id: id, title: nameOf(wordsOf(row).body), live: true, opener: row, build: () => build(id) });
   }
 
   function decorate() {
@@ -115,7 +115,7 @@
 
   function rowOf(ev) {
     const t = ev.target && ev.target.closest ? ev.target : null;
-    if (!t || t.closest(".clause-toggle")) return null;     // the text's own expand control keeps its job
+    if (!t || t.closest(".clause-toggle, button, a, input, select, textarea, summary")) return null;   // a row's own controls keep their jobs
     const r = t.closest(".row[data-keep-key]");
     return r && r.dataset.agentRow === "1" ? r : null;
   }

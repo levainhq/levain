@@ -1799,7 +1799,7 @@ def build_default_cockpit(
     ck.discover(coordinator_discoverer(lambda: _dispatch_dir(ck.consent_reader)), retire=True)
     from levain.cockpit.agents_panel import wire_agents
 
-    wire_agents(ck, source, dispatch_dir=lambda: _dispatch_dir(ck.consent_reader))   # the agents panel and the verbs read one wiring; no agent store, no panel
+    wire_agents(ck, source, dispatch_dir=lambda: _dispatch_dir(ck.consent_reader), clock=clock)   # the agents panel and the verbs read one wiring; no agent store, no panel
     start = team_start if team_start is not None else source.install_root
     if start is not None:
         from levain.cockpit.team_panels import TeamSource, team_discoverer
