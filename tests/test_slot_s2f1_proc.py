@@ -414,6 +414,62 @@ def test_cgroup_proof_needs_populated_0_and_no_uid_process_anywhere():
     assert t.sent == []                 # ... and the cgroup kill sends no uid signal (END's proof refuses)
 
 
+def _populated_after(t: Table, ones: int) -> list:
+    """``cgroup.events`` reads ``populated 1`` for its first ``ones`` reads, then 0 (the kernel's lag after the reap of
+    the cgroup's last task, L4B_RUN); returns the clock at each read."""
+    seen: list = []
+
+    def kernel(tab, path):
+        if path == CG + "/cgroup.events":
+            seen.append(tab.t)
+            tab.files[path] = "populated 1\nfrozen 0\n" if len(seen) <= ones else "populated 0\nfrozen 0\n"
+    t.on_read.append(kernel)
+    return seen
+
+
+@pytest.mark.parametrize("ones", [1, 2])
+def test_cgroup_proof_waits_out_the_populated_lag_after_the_last_reap(ones):
+    # L4B_RUN: populated 1 at +0.3 and +0.6 ms after the last check child's reap, 0 by +6 ms, nothing alive. One read
+    # refused that window; the proof waits for populated 0 within the settle bound, then runs the uid sweep.
+    t = cg_table(populated="1")
+    seen = _populated_after(t, ones)
+    assert P.CgroupProcs(CG, t.seams()).no_process(SLOT) is True
+    assert len(seen) == ones + 1
+    assert t.t < P.NO_PROCESS_SETTLE_S
+    assert t.lists == 2                 # the uid sweep ran (two scans) after the clean populated 0
+
+
+def test_cgroup_proof_after_the_lag_still_refuses_a_uid_survivor():
+    t = cg_table(populated="1")
+    _populated_after(t, 1)
+    t.add(100, SLOT)                    # outside the cgroup: populated settles to 0, the uid sweep still sees it
+    assert P.CgroupProcs(CG, t.seams()).no_process(SLOT) is False
+    assert t.lists >= 1
+
+
+def test_cgroup_proof_refuses_a_survivor_that_keeps_populated_1_past_the_settle_bound():
+    t = cg_table(populated="1")
+    seen = _populated_after(t, 10 ** 6)
+    assert P.CgroupProcs(CG, t.seams()).no_process(SLOT) is False
+    assert t.t >= P.NO_PROCESS_SETTLE_S         # it waited the whole bound ...
+    assert t.t < P.NO_PROCESS_SETTLE_S + P.POLL_MAX_S + 1e-9   # ... and no longer
+    assert len(seen) > 1 and t.lists == 0       # polled, refused before any uid sweep
+
+
+def test_cgroup_proof_whose_cgroup_goes_away_mid_wait_is_the_uid_sweeps():
+    t = cg_table(populated="1")
+
+    def kernel(tab, path):
+        if tab.t > 0:
+            tab.files.pop(CG + "/cgroup.events", None)
+    t.on_read.append(kernel)
+    assert P.CgroupProcs(CG, t.seams()).no_process(SLOT) is True
+    t = cg_table(populated="1")
+    t.on_read.append(kernel)
+    t.add(100, SLOT)
+    assert P.CgroupProcs(CG, t.seams()).no_process(SLOT) is False
+
+
 def test_absent_cgroup_falls_back_to_the_uid_sweep():
     t = Table()
     c = P.CgroupProcs(CG, t.seams())

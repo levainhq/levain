@@ -64,6 +64,12 @@ V12_SECONDS = 10.0
 POLL_FIRST_S = 0.005
 POLL_MAX_S = 0.1
 
+#: DECISION: how long :meth:`CgroupProcs.no_process` waits for ``populated 0`` before it refuses. Measured: the
+#: kernel reported ``populated 1`` 0.3 and 0.6 ms after the reap of the cgroup's last task and 0 by 6 ms, nothing
+#: alive (levain-memory 1107-26-linuxvm/L4B_RUN); 0.25 s is about 40 x that. A pass waits out only the lag (polled from
+#: POLL_FIRST_S); the whole bound is spent only before a refusal.
+NO_PROCESS_SETTLE_S = 0.25
+
 #: V12k (reaper DESIGN §8 Q1, ruled): the bound of one :func:`end_domain`, every step under one deadline.
 V12K_SECONDS = 10.0
 #: Q: the quiet window after an accepted bootout: 3 x the longest observed teardown (42.1 ms, R0 d3b), floor 250 ms.
@@ -406,9 +412,12 @@ class CgroupProcs:
         return self._act("cgroup.kill", "populated", "0", uid, bound_s)
 
     def no_process(self, uid: int) -> bool:
+        """The proof: ``populated 0`` within :data:`NO_PROCESS_SETTLE_S`, then the uid sweep's. The cgroup's
+        ``populated`` lags the reap of its last task by milliseconds, so a single read just after the caller reaped
+        that task can say 1 with nothing alive (L4B_RUN); a real survivor keeps it 1 past the bound and refuses. A
+        cgroup absent or gone during the wait held nothing: the uid sweep's answer alone."""
         uid = check_target(uid, self.seams)
-        ev = self.events()
-        if ev is not None and ev.get("populated") != "0":
+        if self._poll("populated", "0", NO_PROCESS_SETTLE_S) is False:
             return False
         return self.uid.no_process(uid)
 
@@ -957,7 +966,8 @@ def default_seams(host: HostOS | None = None) -> ProcSeams:
 
 
 __all__ = ["BOOTOUT_RETRY_FIRST_S", "CgroupProcs", "Domain", "EDOMAIN_TEARDOWN", "END_PROVE_MARGIN_S", "FREEZE_SHARE",
-           "K2_FLOOR_S", "POLL_FIRST_S", "POLL_MAX_S", "PROVEN", "SIGNAL_CHILD_S", "SIGNAL_HANGS_MAX",
+           "K2_FLOOR_S", "NO_PROCESS_SETTLE_S", "POLL_FIRST_S", "POLL_MAX_S", "PROVEN", "SIGNAL_CHILD_S",
+           "SIGNAL_HANGS_MAX",
            "Proc", "ProcSeams", "QUIET_S", "REAP_GRACE_S", "RUN", "SETTLE_POLL_S", "SIGNAL_SENT", "STOP", "UNKNOWN",
            "UidProcs", "V12K_SECONDS", "V12_SECONDS", "ZOMBIE", "check_target", "darwin_seams", "default_seams",
            "end_domain", "end_seams", "kill_and_reap", "linux_listing", "linux_probe", "linux_seams",

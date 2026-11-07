@@ -128,6 +128,76 @@ def test_the_last_window_stays_a_detection(root, sfd, monkeypatch):
     assert t.kills == 1
 
 
+# --- the Linux closing window over the real cgroup proof (L4B_RUN, row 136) ---------------------------------------
+
+_CG = "/sys/fs/cgroup/levain.slice/e0.scope/s-0000000000000001"
+_SLOT = 899
+
+
+class _Cgroup:
+    """A fake kernel for :class:`proc.CgroupProcs`: after the last check child, ``cgroup.events`` reads ``populated
+    1`` for ``lag`` reads, then 0; no process of the slot uid anywhere unless ``survivor``."""
+
+    def __init__(self, lag, survivor_after=False):
+        self.lag, self.survivor_after, self.survivor = lag, survivor_after, False
+        self.t, self.after, self.lists = 0.0, None, 0
+
+    def finish_children(self):
+        self.after = 0
+        self.survivor = self.survivor_after
+
+    def read(self, path):
+        assert path == _CG + "/cgroup.events"
+        if self.after is None:
+            return "populated 0\nfrozen 0\n"
+        self.after += 1
+        return "populated 1\nfrozen 0\n" if self.after <= self.lag else "populated 0\nfrozen 0\n"
+
+    def listing(self):
+        self.lists += 1
+        return [PR.Proc(4440, (_SLOT,) * 3, 1, PR.RUN)] if self.survivor else []
+
+    def sleep(self, s):
+        self.t += s
+
+    def no_process(self):
+        seams = PR.ProcSeams(listing=self.listing, probe=lambda pid: None, pin=lambda pid: pid,
+                             send=lambda h, s: None, read=self.read, clock=lambda: self.t, sleep=self.sleep,
+                             self_uids=lambda: (0, 0), self_pid=lambda: 1)
+        return PR.CgroupProcs(_CG, seams).no_process(_SLOT)
+
+
+def _linux_check(root, sfd, k):
+    files = _write(root, {"a.txt": b"one\n"})
+    run = _fake_run(root, files, SimpleNamespace(kills=0), on_hash=k.finish_children)
+    return SS.clone_check(sfd, "dispatch", run, k.no_process, spec_base=lambda: 0)
+
+
+@pytest.mark.parametrize("lag", [1, 2])
+def test_linux_the_populated_lag_after_the_last_child_passes(root, sfd, lag):
+    """The soak refusal: ``populated 1`` for a read or two after the last check child's reap, nothing alive."""
+    k = _Cgroup(lag)
+    assert _linux_check(root, sfd, k) is not None
+    assert k.after == lag + 1 and k.t < PR.NO_PROCESS_SETTLE_S and k.lists == 4   # both windows' uid sweeps ran
+
+
+def test_linux_a_survivor_past_the_settle_bound_still_refuses_with_the_same_text(root, sfd):
+    k = _Cgroup(10 ** 6)
+    with pytest.raises(SS.CheckFailed) as e:
+        _linux_check(root, sfd, k)
+    assert str(e.value) == "window: a slot-uid process is alive after the last check child"
+    assert k.t >= PR.NO_PROCESS_SETTLE_S
+
+
+def test_linux_a_uid_survivor_after_the_lag_still_refuses(root, sfd):
+    """``populated`` settles to 0 but a slot-uid process outside the cgroup is alive: the uid sweep still runs."""
+    k = _Cgroup(1, survivor_after=True)
+    with pytest.raises(SS.CheckFailed) as e:
+        _linux_check(root, sfd, k)
+    assert str(e.value) == "window: a slot-uid process is alive after the last check child"
+    assert k.after == 2 and k.lists >= 3
+
+
 # --- window 2 on macOS (DESIGN_window2) ----------------------------------------------------------------------------
 
 def _git_id(data: bytes) -> str:
