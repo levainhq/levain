@@ -9,8 +9,9 @@ command and of the directories above it (:func:`command_problems`), at registrat
 renders to the same bytes. What writes the launch files from the live entries (M2: ``levain.firing.hands_mcp_login.prepare_launch``, which calls
 both renderers), signs a server in (M3) and audits drift (M4) are other modules.
 
-The entry is signed into the authority log in plaintext, so it carries no secret: not in argv, not in a url's query,
-and not as the value of an env name that says it holds one. A server's credential lives in the hands account's own
+The entry is signed into the authority log in plaintext, so it carries no secret: not in argv, not in a url's query
+(by name or by value) or path, and not as the value of an env name that says it holds one; the rules run again at
+every render, so an entry signed before a rule existed is not written into a launch file. A server's credential lives in the hands account's own
 environment or its own login (M3's sign-in).
 
 ``identity_kind`` records whose login the server will hold: ``dedicated`` (an identity made for the hands account,
@@ -39,7 +40,7 @@ import sys
 from collections.abc import Iterable, Mapping, Sequence
 from datetime import datetime, timedelta
 from typing import Any
-from urllib.parse import parse_qsl, urlsplit
+from urllib.parse import parse_qsl, unquote, urlsplit
 
 __all__ = ["CLAUDE_TYPE", "DIGEST_REFUSAL", "HandsMcpRefused", "RESERVED_NAMES", "build_entry", "claude_servers",
            "codex_toml", "command_problems", "default_callback_port", "lease_expiry", "live_entries",
@@ -258,7 +259,18 @@ def _url_problems(url: str) -> list[str]:
     for k, v in query:
         if v and _SECRET_NAME.search(k):
             problems.append(f"the url query name {k[:60]!r} says it holds a credential: {_NO_SECRET}")
+        elif v and _secret_value(v):                   # L3 r1 (codex HIGH): a token under an innocent name
+            problems.append(f"the value of the url query name {k[:60]!r} is shaped like a credential: {_NO_SECRET}")
+    for seg in unquote(parts.path).split("/"):        # the same token as a path segment (``/s/<token>/mcp``)
+        if seg and _secret_value(seg):
+            problems.append(f"a segment of the url path is shaped like a credential: {_NO_SECRET}")
+            break
     return problems
+
+
+def _secret_value(v: str) -> bool:
+    """A value of a known token spelling, or a bare run of 40+ token characters (the argv rules, on a value alone)."""
+    return bool(_SECRET_VALUE.search(v) or _LONG_RUN.search(v))
 
 
 # ---------------------------------------------------------------------------------------------------------------
@@ -325,7 +337,10 @@ def _render_problem(entry: Mapping[str, Any]) -> str | None:
         problems = command_problems(entry["command"], home=os.path.expanduser("~"))
         if problems:
             return problems[0]
-    return None
+    # every registration rule again at render (L3 r1, codex HIGH): an entry signed before a rule was tightened (a
+    # token in a url query value) is not written into a launch file
+    problems = registration_problems(entry, home=os.path.expanduser("~"))
+    return problems[0] if problems else None
 
 
 def _renderable(entries: Iterable[Mapping[str, Any]]) -> list[Mapping[str, Any]]:
@@ -386,9 +401,10 @@ def _unique(entries: Iterable[Mapping[str, Any]]) -> list[Mapping[str, Any]]:
 
 def live_entries(grants: Mapping[str, Any], now: datetime) -> tuple[list[dict[str, Any]], list[tuple[str, str]]]:
     """``(renderable, skipped)`` from an authority policy's grants at ``now``. A renderable entry is of the hands-mcp
-    kind, unexpired, its ``server_sha256`` the digest of the table this renderer makes of it, and (stdio) its command
-    still passing :func:`command_problems`. ``skipped`` is ``(id, why)`` for every hands-mcp entry left out
-    (``expired``, ``digest``, ``name`` or ``command``): reported rather than rendered, so one stale entry does not refuse the
+    kind, unexpired, its ``server_sha256`` the digest of the table this renderer makes of it, and still passing every
+    registration rule (:func:`registration_problems`, the stdio command's included). ``skipped`` is ``(id, why)`` for every hands-mcp entry left out
+    (``expired``, ``digest``, ``name``, ``command``, or ``rules`` for any other registration rule the entry no longer
+    passes, such as a credential-shaped url value): reported rather than rendered, so one stale entry does not refuse the
     rest. ``now`` is the caller's clock alone (the log's head time is not consulted)."""
     from levain.authority import HANDS_MCP_KIND, _parse_stamp, _thaw
     ok: list[dict[str, Any]] = []
@@ -402,7 +418,9 @@ def live_entries(grants: Mapping[str, Any], now: datetime) -> tuple[list[dict[st
         elif server_sha256(entry) != entry["server_sha256"]:
             skipped.append((gid, "digest"))
         elif _render_problem(entry) is not None:
-            skipped.append((gid, "name" if entry["name"] in RESERVED_NAMES else "command"))
+            skipped.append((gid, "name" if entry["name"] in RESERVED_NAMES else "command"
+                            if entry["transport"] == "stdio" and command_problems(entry["command"], home=os.path.expanduser("~"))
+                            else "rules"))
         else:
             ok.append(entry)
     return ok, skipped

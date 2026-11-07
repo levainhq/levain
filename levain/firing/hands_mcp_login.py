@@ -579,8 +579,17 @@ def doctor_rows(install: Path) -> list[tuple[str, bool, str, str | None, bool]]:
 # Claude: ``<hands home>/.claude/levain-mcp.json``, the whole file Levain's, written fresh at every call; the launch
 # passes it as ``--strict-mcp-config --mcp-config <path>`` (:func:`claude_chat_argv`). Codex: the registry's tables go
 # into ``<hands home>/.codex/config.toml`` between two marker lines, with the two file-store pins at the top level; any
-# other content of that file is kept, and a foreign server of a name the registry renders is refused, never merged.
-# Every write is made BY the hands user (tee to a temp name, chmod, rename), as :func:`hl.ensure_config_home` does.
+# other content of that file is kept. Codex has no strict flag, so a server the file declares outside the block would
+# launch beside the registry's: any such server refuses the call (L3 r1, codex HIGH), never merged and never deleted
+# (deleting would destroy what the account holds; refusing tells the operator, who registers it or removes it).
+# Every read and write is made BY the hands user through the config-home helper (:func:`hl.conf_read`,
+# :func:`hl.conf_stage`, :func:`hl.conf_commit`): no link is followed, a new file has an unpredictable name and is
+# created exclusively, and both files are staged before either is renamed in. The registry is read UNDER the hands
+# lock, so a revocation lands either before the read or after the write, never between.
+#
+# Not a launch yet: nothing in the tree opens a hands Claude or Codex chat, so the only caller is the verb. The
+# launcher (the next slice) takes the hands lock, calls ``prepare_launch(..., held=True)`` and execs the argv only
+# when it returned; no launch follows a failed or partial prepare.
 
 CLAUDE_LAUNCH_FILE = "levain-mcp.json"
 CODEX_BEGIN = "# >>> levain hands mcp (written at every launch; edit the registry, not this block) >>>"
@@ -633,20 +642,37 @@ def render_launch(entries: list[dict[str, Any]]) -> tuple[str, str]:
 def merge_codex_config(existing: str, tables: str, names: set[str]) -> str:
     """``existing`` (the hands account's ``config.toml``) with the managed block replaced by ``tables`` (dropped when
     empty), the file-store pins at the top level, everything else kept as it was. :class:`HandsMcpRefused` for: text
-    that is not TOML, an unbalanced or repeated marker, a store key set to anything but ``"file"``, and a server of a
-    rendered name that the file holds outside the block. The result is parsed again and must hold exactly the
-    foreign servers plus the rendered ones."""
+    that is not TOML, an unbalanced, repeated or reversed marker, a marker line inside a TOML string, a store key set
+    to anything but ``"file"``, and ANY server the file declares outside the block (Codex would launch it beside the
+    registry's). The result is parsed again and must hold exactly the rendered servers.
+
+    A marker is a whole line equal to :data:`CODEX_BEGIN` or :data:`CODEX_END` (L3 r1: never a substring count), and
+    it must be a comment: deleting the two marker lines alone must leave the parsed document as it was, which fails
+    when they sit inside a multi-line string (whose content between them would otherwise be deleted)."""
     import tomllib
     from levain import hands_mcp as hm
-    if existing.count(CODEX_BEGIN) != existing.count(CODEX_END) or existing.count(CODEX_BEGIN) > 1:
+
+    def parse(text: str) -> dict[str, Any]:
+        try:
+            return tomllib.loads(text)
+        except tomllib.TOMLDecodeError as exc:
+            raise HandsMcpRefused(f"the hands account's Codex config.toml is not valid TOML ({exc}); change it by "
+                                  "hand. Nothing was changed") from None
+
+    lines = existing.splitlines(keepends=True)
+    begins = [i for i, ln in enumerate(lines) if ln.rstrip() == CODEX_BEGIN]
+    ends = [i for i, ln in enumerate(lines) if ln.rstrip() == CODEX_END]
+    if len(begins) != len(ends) or len(begins) > 1 or (begins and begins[0] > ends[0]):
         raise HandsMcpRefused("the hands account's Codex config.toml has an unbalanced or repeated Levain block; "
                               "change it by hand. Nothing was changed")
-    rest = re.sub(re.escape(CODEX_BEGIN) + r".*?" + re.escape(CODEX_END) + r"[ \t]*\n?", "", existing, flags=re.S)
-    try:
-        doc = tomllib.loads(rest)
-    except tomllib.TOMLDecodeError as exc:
-        raise HandsMcpRefused(f"the hands account's Codex config.toml is not valid TOML ({exc}); change it by hand. "
-                              "Nothing was changed") from None
+    rest = existing
+    if begins:
+        b, e = begins[0], ends[0]
+        if parse(existing) != parse("".join(ln for i, ln in enumerate(lines) if i not in (b, e))):
+            raise HandsMcpRefused("a Levain marker line of the hands account's Codex config.toml sits inside a TOML "
+                                  "string; change it by hand. Nothing was changed")
+        rest = "".join(lines[:b] + lines[e + 1:])
+    doc = parse(rest)
     for key in (hl.CODEX_STORE_KEY, _OAUTH_STORE_KEY):
         if key in doc and doc[key] != "file":
             raise HandsMcpRefused(f'the hands account\'s Codex config.toml sets {key} to something other than "file"; '
@@ -654,10 +680,10 @@ def merge_codex_config(existing: str, tables: str, names: set[str]) -> str:
     foreign = doc.get("mcp_servers", {})
     if not isinstance(foreign, dict):
         raise HandsMcpRefused("the hands account's Codex config.toml has an mcp_servers that is not a table; change it by hand")
-    clash = sorted(names & set(foreign))
-    if clash:
-        raise HandsMcpRefused(f"the hands account's Codex config.toml already holds a server named {clash[0]!r} that the "
-                              "registry did not put there; remove it by hand first. Nothing was changed")
+    if foreign:                       # registry-only (L3 r1): any server outside the block, not only a rendered name
+        raise HandsMcpRefused(f"the hands account's Codex config.toml already holds a server named {sorted(foreign)[0]!r} "
+                              "that the registry did not put there, and a hands Codex launch would run it; register it "
+                              "or remove it by hand first. Nothing was changed")
     head = ""
     if hl.CODEX_STORE_KEY not in doc:
         head += hl.CODEX_STORE_LINE
@@ -670,88 +696,105 @@ def merge_codex_config(existing: str, tables: str, names: set[str]) -> str:
         after = tomllib.loads(out)
     except tomllib.TOMLDecodeError as exc:                              # not reachable from valid inputs; a refusal, not a write
         raise HandsMcpRefused(f"the merged Codex config.toml does not parse ({exc}); nothing was changed") from None
-    if set(after.get("mcp_servers", {})) != set(foreign) | names:
-        raise HandsMcpRefused("the merged Codex config.toml does not hold exactly the registry's servers beside the "
-                              "hands account's own; nothing was changed")
+    if set(after.get("mcp_servers", {})) != names:
+        raise HandsMcpRefused("the merged Codex config.toml does not hold exactly the registry's servers; "
+                              "nothing was changed")
     return out
 
 
-def _read_as_hands(hands: HandsIdentity, vendor: str, path: str, entity_dir: Path | str) -> str | None:
-    """The text of ``path`` read as the hands user, None when it is absent; anything that is not a plain UTF-8 file
-    raises :class:`hl.HandsLoginError`."""
-    st = hl._lstat(hands, vendor, path, entity_dir=entity_dir, held=True)
+def _preflight_dir(hands: HandsIdentity, vendor: str, d: str, entity_dir: Path | str) -> None:
+    """``d`` absent, or a real directory of the hands uid; judged WITHOUT a change (L3 r1: both config homes are
+    judged before either is made or chmodded, and before any file in them is read)."""
+    st = hl._lstat(hands, vendor, d, entity_dir=entity_dir, held=True)
     if st is None:
+        return
+    kind, uid, owner, _ = st
+    if kind != "directory":
+        raise hl.HandsLoginError(f"{d} is a {kind}, not a directory; change it by hand")
+    if uid != hands.uid:
+        raise hl.HandsLoginError(f"{d} belongs to {owner}, not {hands.user}; change it by hand")
+
+
+def _read_launch(hands: HandsIdentity, vendor: str, d: str, name: str, entity_dir: Path | str) -> tuple[str, str] | None:
+    """``(mode, text)`` of the launch file ``d/name`` read as the hands user through the config-home helper (no link
+    followed, the directory judged first), None when it is absent. A file of another owner refuses (L3 r1: an
+    identical-bytes file of another account is not "unchanged"); a mode other than 600 is repaired by the caller."""
+    got = hl.conf_read(hands, vendor, d, name, entity_dir=entity_dir)
+    if got is None:
         return None
-    if not st[0].startswith("regular"):
-        raise hl.HandsLoginError(f"{path} is a {st[0]}, not a file; change it by hand")
-    r = hl.run_as_hands_bounded(hands, hl._as_hands_argv(hands, vendor, "/bin/cat", path), entity_dir=entity_dir,
-                                held=True, what=f"cat {path}")
-    if r.returncode != 0:
-        raise hl.HandsLoginError(f"could not read {path} as {hands.user}: {hl._brief(hl._text(r))}")
-    try:
-        return r.stdout.decode("utf-8")
-    except UnicodeDecodeError:
-        raise hl.HandsLoginError(f"{path} is not UTF-8 text; change it by hand") from None
-
-
-def _replace_as_hands(hands: HandsIdentity, vendor: str, path: str, text: str, entity_dir: Path | str) -> None:
-    """``path`` replaced by ``text``, mode 600, by the hands user: a temp name beside it, then a rename (never a
-    truncating write). The temp is removed when a step fails."""
-    tmp = f"{path}.levain-tmp"
-    steps = ((("/usr/bin/tee", tmp), text.encode("utf-8")),
-             (("/bin/chmod", "600", tmp), None),
-             (("/bin/mv", "-f", tmp, path), None))
-    for argv, data in steps:
-        r = hl.run_as_hands_bounded(hands, hl._as_hands_argv(hands, vendor, *argv), entity_dir=entity_dir, held=True,
-                                    what=f"{argv[0]} {path}", stdin=data)
-        if r.returncode != 0:
-            try:
-                hl.run_as_hands_bounded(hands, hl._as_hands_argv(hands, vendor, "/bin/rm", "-f", "--", tmp),
-                                        entity_dir=entity_dir, held=True, what=f"rm {tmp}")
-            except hl.HandsLoginError:
-                pass
-            raise hl.HandsLoginError(f"could not write {path} as {hands.user}: {hl._brief(hl._text(r))}")
+    uid, mode, text = got
+    if uid != hands.uid:
+        raise hl.HandsLoginError(f"{d}/{name} belongs to another account, not {hands.user}; change it by hand")
+    return mode, text
 
 
 def prepare_launch(hands: HandsIdentity, entity_dir: Path | str, cockpit_root: Path | str | None = None, *,
                    now: datetime | None = None, held: bool = False) -> LaunchFiles:
     """Write the hands account's two launch files from the live registry. ``held`` is for a launcher that already
-    holds the entity's hands lock (a session open); otherwise the exclusive lock is taken here and a session in
-    progress refuses it. Raises :class:`HandsMcpRefused` before anything changed (the store, the registry, a renderer
-    refusal, the merge) and :class:`HandsMcpError` after a write began."""
+    holds the entity's hands lock (a session open) and has not read the registry itself; otherwise the exclusive
+    lock is taken here and a session in progress refuses it. Either way the registry is read under the lock.
+
+    Raises :class:`HandsMcpRefused` before anything changed (the store, the lock, the registry, a renderer refusal,
+    a config home or launch file that is not a plain one of the hands account, the merge) and :class:`HandsMcpError`
+    once a change began; its message says which launch file, if any, was already replaced. Both files are staged
+    before either is renamed in, so a failure while staging changes neither; a failure (or a death) between the two
+    renames leaves the first new and the second as it was, which the next call rewrites from the registry. No launch
+    follows a call that did not return."""
     root = cockpit_root if cockpit_root is not None else cockpit_root_of(entity_dir)
     bad = store_problem(hands)
     if bad:
         raise HandsMcpRefused(f"{bad}; nothing was changed")
-    try:
-        live, skipped = load_registry(root, now)
-    except HandsMcpError as exc:                       # an unreadable log is no registry: nothing is rendered over it
-        raise HandsMcpRefused(f"{exc}; nothing was changed") from None
-    claude_body, tables = render_launch(live)
-    names = {e["name"] for e in live}
-    changed = {"claude": False, "codex": False}
+    claude_dir, codex_dir = hl.config_home(hands, "claude"), hl.config_home(hands, "codex")
     claude_path, codex_path = claude_launch_path(hands), hl.codex_config_path(hands)
+    changed = {"claude": False, "codex": False}
+    out: dict[str, Any] = {}
 
     def work() -> None:
+        # the registry under the lock (L3 r1): a revocation lands before this read or after the write, never between
         try:
-            # read and judge first: a refusal must leave the account as found (``hl.ensure_config_home`` would add the
-            # Codex pin to a file this call then refuses), so only the two directories are made, after the merge
-            old_claude = _read_as_hands(hands, "claude", claude_path, entity_dir)
-            old_codex = _read_as_hands(hands, "codex", codex_path, entity_dir)
-            new_codex = merge_codex_config(old_codex or "", tables, names)
-            for vendor in ("claude", "codex"):
-                hl._ensure_dir(hands, vendor, hl.config_home(hands, vendor), entity_dir)
-        except hl.HandsLoginError as exc:
+            live, skipped = load_registry(root, now)
+        except (HandsMcpError, OSError) as exc:        # an unreadable log is no registry: nothing is rendered over it
             raise HandsMcpRefused(f"{exc}; nothing was changed") from None
+        claude_body, tables = render_launch(live)
+        names = {e["name"] for e in live}
+        out.update(names=sorted(names), skipped=skipped)
         try:
-            if old_claude != claude_body:
-                _replace_as_hands(hands, "claude", claude_path, claude_body, entity_dir)
-                changed["claude"] = True
-            if old_codex != new_codex:
-                _replace_as_hands(hands, "codex", codex_path, new_codex, entity_dir)
-                changed["codex"] = True
-        except hl.HandsLoginError as exc:
-            raise HandsMcpError(str(exc)) from None
+            # judge everything first, changing nothing: both config homes, then both files through the helper (which
+            # follows no link), then the merge; only then is a directory made or a file staged
+            for vendor, d in (("claude", claude_dir), ("codex", codex_dir)):
+                _preflight_dir(hands, vendor, d, entity_dir)
+            old_claude = _read_launch(hands, "claude", claude_dir, CLAUDE_LAUNCH_FILE, entity_dir)
+            old_codex = _read_launch(hands, "codex", codex_dir, "config.toml", entity_dir)
+        except (hl.HandsLoginError, OSError) as exc:
+            raise HandsMcpRefused(f"{exc}; nothing was changed") from None
+        new_codex = merge_codex_config(old_codex[1] if old_codex else "", tables, names)
+        todo = [(vendor, d, name, body) for vendor, d, name, old, body in (
+            ("claude", claude_dir, CLAUDE_LAUNCH_FILE, old_claude, claude_body),
+            ("codex", codex_dir, "config.toml", old_codex, new_codex))
+            if old is None or old != ("600", body)]            # new bytes, or a mode to repair
+        staged: list[tuple[str, str, str, str]] = []
+
+        def drop(rest: list[tuple[str, str, str, str]]) -> None:
+            for vendor, d, name, t in rest:
+                hl.conf_drop(hands, vendor, d, name, t, entity_dir=entity_dir)
+
+        try:
+            for vendor, d, name, body in todo:
+                hl._ensure_dir(hands, vendor, d, entity_dir)
+                staged.append((vendor, d, name, hl.conf_stage(hands, vendor, d, name, body, entity_dir=entity_dir)))
+        except (hl.HandsLoginError, OSError, subprocess.SubprocessError) as exc:
+            drop(staged)
+            raise HandsMcpError(f"{exc}; neither launch file was changed") from None
+        for i, (vendor, d, name, t) in enumerate(staged):
+            try:
+                hl.conf_commit(hands, vendor, d, name, t, entity_dir=entity_dir)
+            except (hl.HandsLoginError, OSError, subprocess.SubprocessError) as exc:
+                drop(staged[i:])
+                done = [f"{dd}/{nn}" for _, dd, nn, _ in staged[:i]]
+                raise HandsMcpError(f"{exc}; " + (f"{done[0]} was already replaced, the other was not (the next "
+                                                  "prepare writes both from the registry)" if done
+                                                  else "neither launch file was changed")) from None
+            changed[vendor] = True
 
     try:
         if held:
@@ -761,7 +804,9 @@ def prepare_launch(hands: HandsIdentity, entity_dir: Path | str, cockpit_root: P
                 work()
     except hl.HandsRefused as exc:
         raise HandsMcpRefused(str(exc)) from None
-    return LaunchFiles(claude_path, codex_path, sorted(names), skipped, changed)
+    except OSError as exc:                              # the lock itself (work() reports its own)
+        raise HandsMcpRefused(f"the hands lock could not be taken ({exc}); nothing was changed") from None
+    return LaunchFiles(claude_path, codex_path, out["names"], out["skipped"], changed)
 
 
 def cmd_prepare(entity_dir: Path | str, cockpit_root: Path | str | None = None) -> int:

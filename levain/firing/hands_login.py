@@ -49,7 +49,7 @@ from typing import Callable, Iterator
 
 from levain import hands_live
 from levain.firing.confinement import (
-    ConfinementConfig, ConfinementError, HandsIdentity, _hands_env, hands_for, hands_prefix,
+    HANDS_PYTHON, HANDS_ZSH, ConfinementConfig, ConfinementError, HandsIdentity, _hands_env, hands_for, hands_prefix,
     load_confinement_config,
 )
 from levain.launch import child_env
@@ -341,6 +341,223 @@ def _ensure_dir(hands: HandsIdentity, vendor: str, d: str, entity_dir: Path | st
             raise HandsLoginError(f"could not set {d} to mode 700 as {hands.user}: {_brief(_text(r))}")
 
 
+# --- the config-home file helper (hands-MCP M2 L3 r1) ----------------------------------------------------------
+#
+# Every read and replacement of a file in a vendor config home goes through ONE fixed program run as the hands user,
+# so it is made with that user's rights and follows no link it did not expect. The directory must be a real directory
+# (not a symlink) owned by the hands uid, and the program ENTERS it and checks that the directory it is in is the one
+# it judged; everything after is relative to it. Operations (exit 0 done, 2 the directory or file is absent, 3 refused
+# with the reason on stderr, anything else a failure):
+#   read    <name>              the regular file opened O_NOFOLLOW|O_NONBLOCK, "uid mode\n" then its bytes (at most
+#                               :data:`_CONF_READ_LIMIT`); a symlink, directory, FIFO or device is refused, never read
+#   stage   <name> <mode>       stdin into a NEW file of an unpredictable name beside it (O_CREAT|O_EXCL|O_NOFOLLOW,
+#                               mode 600, then ``mode``), printing that name; leftovers of an earlier stage of the same
+#                               name are removed first (a link is removed, never followed)
+#   commit  <name> <staged>     the staged file renamed over ``name`` (a link at ``name`` is replaced; a directory there
+#                               is refused)
+#   drop    <name> <staged>     the staged file removed
+# Two programs with one contract, because no one interpreter is on every host: zsh ships with every macOS (its
+# zsh/system module opens with O_NOFOLLOW, which no stock utility can), and on Linux every hands process already
+# starts through python3 (:data:`HANDS_PYTHON`), while a Linux runner need not have zsh. The tests run both.
+_CONF_READ_LIMIT = 1024 * 1024
+_CONF_ZSH = r"""emulate -R zsh
+zmodload zsh/system zsh/stat 2>/dev/null || { print -ru2 -- 'zsh modules are unavailable'; exit 70 }
+refuse() { print -rnu2 -- "$1"; exit 3 }
+op=$1 d=$2 uid=$3 n=$4 x=$5
+[[ $d == /* ]] || refuse "not an absolute path: $d"
+[[ -n $n && $n != */* && $n != . && $n != .. ]] || refuse "not a file name: $n"
+[[ -L $d ]] && refuse "$d is a symlink, not a directory; change it by hand"
+[[ -e $d ]] || exit 2
+zstat -L -H st -- $d 2>/dev/null || refuse "could not read $d"
+(( (st[mode] & 8#170000) == 8#040000 )) || refuse "$d is not a directory; change it by hand"
+[[ $st[uid] == $uid ]] || refuse "$d belongs to another account; change it by hand"
+id="$st[device]:$st[inode]"
+builtin cd -q -- $d 2>/dev/null || refuse "could not read $d: permission denied"
+zstat -L -H st -- . 2>/dev/null && [[ "$st[device]:$st[inode]" == $id ]] || refuse "$d changed while it was entered"
+staged() { [[ $x == .$n.levain-* && $x != */* ]] || refuse "not a staged name: $x" }
+case $op in
+  read)
+    if ! sysopen -r -o nofollow,nonblock -u 5 -- ./$n 2>/dev/null; then
+      [[ -e ./$n || -L ./$n ]] || exit 2
+      [[ -L ./$n ]] && refuse "$d/$n is a symlink, not a file; change it by hand"
+      refuse "could not read $d/$n: permission denied"
+    fi
+    zstat -f 5 -H st 2>/dev/null || refuse "could not read $d/$n"
+    (( (st[mode] & 8#170000) == 8#100000 )) || refuse "$d/$n is not a file; change it by hand"
+    (( st[size] <= LIM )) || refuse "$d/$n is larger than LIM bytes; change it by hand"
+    print -rn -- "$st[uid] $(( [##8] st[mode] & 8#7777 ))"$'\n'
+    /bin/cat <&5
+    ;;
+  stage)
+    [[ $x == [0-7][0-7][0-7] ]] || refuse "not a mode: $x"
+    for o in ./.$n.levain-*(N); do /bin/rm -f -- $o 2>/dev/null; done
+    t=.$n.levain-$$-$RANDOM$RANDOM$RANDOM
+    sysopen -w -o create,excl,nofollow -m 600 -u 6 -- ./$t 2>/dev/null || refuse "could not create a new file in $d"
+    if ! /bin/cat >&6; then exec 6>&-; /bin/rm -f -- ./$t; refuse "writing in $d failed"; fi
+    exec 6>&-
+    /bin/chmod $x ./$t || { /bin/rm -f -- ./$t; refuse "could not set the mode of a new file in $d" }
+    print -rn -- $t
+    ;;
+  commit)
+    staged
+    [[ -f ./$x && ! -L ./$x ]] || refuse "the staged $d/$x is gone or not a file"
+    [[ -d ./$n ]] && refuse "$d/$n is a directory; change it by hand"
+    /bin/mv -f -- ./$x ./$n || refuse "could not replace $d/$n"
+    ;;
+  drop) staged; /bin/rm -f -- ./$x ;;
+  *) refuse "unknown operation $op" ;;
+esac
+""".replace("LIM", str(_CONF_READ_LIMIT))
+_CONF_PY = r"""import os, secrets, stat, sys
+def refuse(m):
+    sys.stderr.write(m); sys.exit(3)
+op, d, uid, n, x = (sys.argv[1:] + [""] * 5)[:5]
+if not d.startswith("/"): refuse("not an absolute path: " + d)
+if not n or "/" in n or n in (".", ".."): refuse("not a file name: " + n)
+if os.path.islink(d): refuse(d + " is a symlink, not a directory; change it by hand")
+try:
+    dfd = os.open(d, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+except FileNotFoundError:
+    sys.exit(2)
+except OSError as e:
+    refuse(d + " is not a directory; change it by hand" if os.path.lexists(d) and not os.path.isdir(d) else "could not read %s: %s" % (d, e.strerror))
+st = os.fstat(dfd)
+if not stat.S_ISDIR(st.st_mode): refuse(d + " is not a directory; change it by hand")
+if str(st.st_uid) != uid: refuse(d + " belongs to another account; change it by hand")
+def staged():
+    if not x.startswith("." + n + ".levain-") or "/" in x: refuse("not a staged name: " + x)
+p = d + "/" + n
+if op == "read":
+    try:
+        fd = os.open(n, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=dfd)
+    except FileNotFoundError:
+        sys.exit(2)
+    except OSError as e:
+        try:
+            link = stat.S_ISLNK(os.lstat(n, dir_fd=dfd).st_mode)
+        except OSError:
+            link = False
+        refuse(p + " is a symlink, not a file; change it by hand" if link else "could not read %s: %s" % (p, e.strerror))
+    fs = os.fstat(fd)
+    if not stat.S_ISREG(fs.st_mode): refuse(p + " is not a file; change it by hand")
+    if fs.st_size > LIM: refuse(p + " is larger than LIM bytes; change it by hand")
+    out = sys.stdout.buffer
+    out.write(("%d %o\n" % (fs.st_uid, stat.S_IMODE(fs.st_mode))).encode())
+    while True:
+        b = os.read(fd, 65536)
+        if not b: break
+        out.write(b)
+    out.flush()
+elif op == "stage":
+    if len(x) != 3 or any(c not in "01234567" for c in x): refuse("not a mode: " + x)
+    for e in os.listdir(dfd):
+        if e.startswith("." + n + ".levain-"):
+            try:
+                os.unlink(e, dir_fd=dfd)
+            except OSError:
+                pass
+    t = ".%s.levain-%d-%s" % (n, os.getpid(), secrets.token_hex(8))
+    try:
+        fd = os.open(t, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600, dir_fd=dfd)
+    except OSError:
+        refuse("could not create a new file in " + d)
+    try:
+        data = sys.stdin.buffer.read()
+        while data:
+            data = data[os.write(fd, data):]
+        os.fchmod(fd, int(x, 8)); os.fsync(fd); os.close(fd)
+    except OSError:
+        os.unlink(t, dir_fd=dfd); refuse("writing in %s failed" % d)
+    sys.stdout.write(t)
+elif op == "commit":
+    staged()
+    try:
+        ok = stat.S_ISREG(os.lstat(x, dir_fd=dfd).st_mode)
+    except OSError:
+        ok = False
+    if not ok: refuse("the staged %s/%s is gone or not a file" % (d, x))
+    try:
+        if stat.S_ISDIR(os.stat(n, dir_fd=dfd).st_mode): refuse(p + " is a directory; change it by hand")
+    except FileNotFoundError:
+        pass
+    try:
+        os.rename(x, n, src_dir_fd=dfd, dst_dir_fd=dfd)
+    except OSError:
+        refuse("could not replace " + p)
+elif op == "drop":
+    staged()
+    try:
+        os.unlink(x, dir_fd=dfd)
+    except FileNotFoundError:
+        pass
+else:
+    refuse("unknown operation " + op)
+""".replace("LIM", str(_CONF_READ_LIMIT))
+
+
+def _conf_program() -> list[str]:
+    """The config-home helper for this host: zsh on macOS, the hands python3 elsewhere (one contract, above)."""
+    if platform.system() == "Darwin":
+        return [HANDS_ZSH, "-f", "-c", _CONF_ZSH, "zsh"]
+    return [HANDS_PYTHON, "-I", "-S", "-c", _CONF_PY]
+
+
+def _conf_run(hands: HandsIdentity, vendor: str, op: str, d: str, name: str, extra: str = "", *,
+              entity_dir: Path | str, stdin: bytes | None = None) -> "subprocess.CompletedProcess[bytes] | None":
+    """One helper run as the hands user (under the caller's hands lock); None for exit 2 (absent), the run for exit
+    0, :class:`HandsLoginError` with the helper's reason for a refusal or a failure."""
+    r = run_as_hands_bounded(hands, _as_hands_argv(hands, vendor, *_conf_program(), op, d, str(hands.uid), name, extra),
+                             entity_dir=entity_dir, held=True, what=f"{op} {d}/{name}", stdin=stdin)
+    if r.returncode == 0:
+        return r
+    if r.returncode == 2 and op == "read":
+        return None
+    err = r.stderr.decode("utf-8", "replace").strip()
+    if r.returncode == 3 and err:
+        raise HandsLoginError(err)
+    raise HandsLoginError(f"could not {op} {d}/{name} as {hands.user}: {_brief(err) or f'exit {r.returncode}'}")
+
+
+def conf_read(hands: HandsIdentity, vendor: str, d: str, name: str, *,
+              entity_dir: Path | str) -> tuple[int, str, str] | None:
+    """``(uid, mode, text)`` of ``d/name`` read as the hands user without following a link, None when the directory
+    or the file is absent; anything that is not a plain UTF-8 file in a real hands-owned directory raises."""
+    r = _conf_run(hands, vendor, "read", d, name, entity_dir=entity_dir)
+    if r is None:
+        return None
+    head, sep, body = r.stdout.partition(b"\n")
+    parts = head.decode("ascii", "replace").split(" ")
+    if not sep or len(parts) != 2 or not parts[0].isdigit():
+        raise HandsLoginError(f"could not read {d}/{name} as {hands.user}: the helper printed {head[:80]!r}")
+    try:
+        return int(parts[0]), parts[1], body.decode("utf-8")
+    except UnicodeDecodeError:
+        raise HandsLoginError(f"{d}/{name} is not UTF-8 text; change it by hand") from None
+
+
+def conf_stage(hands: HandsIdentity, vendor: str, d: str, name: str, text: str, *, entity_dir: Path | str,
+               mode: str = "600") -> str:
+    """``text`` written as the hands user into a new file of an unpredictable name in ``d``; returns that name."""
+    r = _conf_run(hands, vendor, "stage", d, name, mode, entity_dir=entity_dir, stdin=text.encode("utf-8"))
+    assert r is not None
+    staged = r.stdout.decode("utf-8", "replace")
+    if not staged.startswith(f".{name}.levain-") or "/" in staged:
+        raise HandsLoginError(f"could not write {d}/{name} as {hands.user}: the helper printed {staged[:80]!r}")
+    return staged
+
+
+def conf_commit(hands: HandsIdentity, vendor: str, d: str, name: str, staged: str, *, entity_dir: Path | str) -> None:
+    _conf_run(hands, vendor, "commit", d, name, staged, entity_dir=entity_dir)
+
+
+def conf_drop(hands: HandsIdentity, vendor: str, d: str, name: str, staged: str, *, entity_dir: Path | str) -> None:
+    """Remove a staged file; never raises (it runs on a failure path, after the failure that is reported)."""
+    try:
+        _conf_run(hands, vendor, "drop", d, name, staged, entity_dir=entity_dir)
+    except HandsLoginError:
+        pass
+
+
 def ensure_config_home(hands: HandsIdentity, vendor: str, *, entity_dir: Path | str) -> None:
     """Under the hands lock (the caller's): the vendor's config home is a real directory owned by the hands user,
     mode 700 (made BY it when absent, its mode repaired, a symlink refused), and Codex's ``config.toml`` pins the
@@ -352,20 +569,10 @@ def ensure_config_home(hands: HandsIdentity, vendor: str, *, entity_dir: Path | 
     if vendor != "codex":
         return
     cfg = codex_config_path(hands)
-    st = _lstat(hands, vendor, cfg, entity_dir=entity_dir, held=True)
-    existing, mode = "", "600"
-    if st is not None:
-        kind, _, _, mode = st
-        if not kind.startswith("regular"):
-            raise HandsLoginError(f"{cfg} is a {kind}, not a file; change it by hand")
-        r = run_as_hands_bounded(hands, _as_hands_argv(hands, vendor, "/bin/cat", cfg),
-                                 entity_dir=entity_dir, held=True, what=f"cat {cfg}")
-        if r.returncode != 0:
-            raise HandsLoginError(f"could not read {cfg} as {hands.user}: {_brief(_text(r))}")
-        try:
-            existing = r.stdout.decode("utf-8")
-        except UnicodeDecodeError:
-            raise HandsLoginError(f"{cfg} is not UTF-8 text; change it by hand") from None
+    # read and replaced through the config-home helper (hands-MCP M2 L3 r1): never a followed link, never a fixed
+    # temp name a hands session could have planted as a link to a file of its own
+    got = conf_read(hands, vendor, d, "config.toml", entity_dir=entity_dir)
+    existing, mode = ("", "600") if got is None else (got[2], got[1][-3:].rjust(3, "0"))
     try:
         doc = tomllib.loads(existing)
     except tomllib.TOMLDecodeError as exc:
@@ -375,20 +582,12 @@ def ensure_config_home(hands: HandsIdentity, vendor: str, *, entity_dir: Path | 
             raise HandsLoginError(f'{cfg} sets {CODEX_STORE_KEY} to something other than "file"; '
                                   "change it by hand, a login would not be kept in a file")
         return
-    tmp = f"{cfg}.levain-tmp"
-    steps = ((("/usr/bin/tee", tmp), (CODEX_STORE_LINE + existing).encode("utf-8")),
-             (("/bin/chmod", mode, tmp), None),
-             (("/bin/mv", "-f", tmp, cfg), None))
-    for argv, data in steps:
-        r = run_as_hands_bounded(hands, _as_hands_argv(hands, vendor, *argv), entity_dir=entity_dir, held=True,
-                                 what=f"{argv[0]} {cfg}", stdin=data)
-        if r.returncode != 0:
-            try:
-                run_as_hands_bounded(hands, _as_hands_argv(hands, vendor, "/bin/rm", "-f", "--", tmp),
-                                     entity_dir=entity_dir, held=True, what=f"rm {tmp}")
-            except HandsLoginError:
-                pass
-            raise HandsLoginError(f"could not write {cfg} as {hands.user}: {_brief(_text(r))}")
+    staged = conf_stage(hands, vendor, d, "config.toml", CODEX_STORE_LINE + existing, entity_dir=entity_dir, mode=mode)
+    try:
+        conf_commit(hands, vendor, d, "config.toml", staged, entity_dir=entity_dir)
+    except HandsLoginError:
+        conf_drop(hands, vendor, d, "config.toml", staged, entity_dir=entity_dir)
+        raise
 
 
 def credential_state(hands: HandsIdentity, vendor: str, *, entity_dir: Path | str, held: bool = False,
