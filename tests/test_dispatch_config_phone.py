@@ -95,6 +95,28 @@ def gen(ddir, root) -> int:
     return store(ddir, root).generation()
 
 
+def _soon(minutes: int = 10) -> str:
+    from levain.cockpit.consent import utc_stamp
+    return utc_stamp(datetime.now(timezone.utc) + timedelta(minutes=minutes))
+
+
+class DuringTouch:
+    """The real ``ssh_signer`` whose sign runs ``hook`` first: what happens while the operator's touch waits."""
+
+    def __init__(self, hook):
+        from levain.cockpit import keys as ck
+        self.real, self.hook, self.calls = ck.ssh_signer, hook, 0
+
+    def __call__(self, path, namespace):
+        fp, sign = self.real(path, namespace=namespace)
+
+        def touched(message: bytes) -> str:
+            self.calls += 1
+            self.hook()
+            return sign(message)
+        return fp, touched
+
+
 # --- the request ------------------------------------------------------------------------------------------------------
 
 def test_request_files_levains_own_card_signs_nothing_and_pushes(capsys, ddir, root, keys, signq, tmp_path, pushes,
@@ -243,7 +265,7 @@ def test_a_kept_item_for_another_store_or_generation_than_approved_is_refused(ca
     raw = ctl.item_bytes("verifier", 1, VERIFIERS, datetime.now(timezone.utc), prev="", store_id=s.store_id())
     pc._write_pending(ddir, hashlib.sha256(raw).hexdigest(), raw)
     lying = (f"{pc.FORMAT_LINE}\nstore: {s.store_id()}\nkind: verifier\ngeneration: 7\nprev: none\n"
-             f"item-sha256: {hashlib.sha256(raw).hexdigest()}\nchange: x\nsummary: y\n")
+             f"item-sha256: {hashlib.sha256(raw).hexdigest()}\nexpires: {_soon()}\nchange: x\nsummary: y\n")
     from levain.consent.sign import file_levain_request
     rid = file_levain_request(signq, ANS, lying, title="t", ttl_s=600)
     phone_sign(signq, rid, phones["good"])
@@ -305,7 +327,7 @@ def test_the_message_is_one_ascii_line_per_field():
 def test_an_expired_request_says_so(capsys, ddir, root, keys, phones, signq, tmp_path, pushes):
     rid = _filed(capsys, ddir, root, keys, signq, tmp_path)
     phone_sign(signq, rid, phones["good"])
-    mine = lambda: {phones["good"].key.fingerprint: phones["good"].key}  # noqa: E731
+    mine = lambda rp: {phones["good"].key.fingerprint: phones["good"].key}  # noqa: E731
     assert pc.read_approval(signq, rid, keys=mine).request_id == rid                     # usable now
     with pytest.raises(ctl.ConfigRefused, match="expired"):                                # not two hours on
         pc.read_approval(signq, rid, keys=mine, now=datetime.now(timezone.utc) + timedelta(hours=2))
@@ -321,7 +343,7 @@ def test_a_card_in_another_namespace_with_the_same_words_approves_nothing(capsys
     sha = hashlib.sha256(raw).hexdigest()
     pc._write_pending(ddir, sha, raw)
     message = (f"{pc.FORMAT_LINE}\nstore: {s.store_id()}\nkind: verifier\ngeneration: 1\nprev: none\n"
-               f"item-sha256: {sha}\nchange: x\nsummary: y\n")
+               f"item-sha256: {sha}\nexpires: {_soon()}\nchange: x\nsummary: y\n")
     rid = "lv-" + "a" * 32
     d = sign_dir(signq)
     d.mkdir(mode=0o700, parents=True, exist_ok=True)
@@ -347,3 +369,176 @@ def test_a_record_not_over_the_message_is_refused(capsys, ddir, root, keys, phon
     rec.write_text(json.dumps(data))
     code, out, _ = approve(capsys, ddir, root, keys, signq, rid)
     assert code != 0 and "is not over its message" in out and gen(ddir, root) == 0 and no_touch.calls == 0
+
+
+# --- L3 round (cfgsign): the point of use, the lock, the bounded reads, the signed deadline ----------------------------
+
+def test_a_passkey_revoked_while_the_touch_waits_lands_nothing(capsys, ddir, root, keys, phones, log, signq, tmp_path,
+                                                               pushes, monkeypatch):
+    """codex/gemini HIGH: the approval held when read; the passkey is revoked during the laptop touch. The approval
+    is judged again after the touch, so the signature is discarded and the store is never given the item."""
+    pk = _Passkey()
+    log.link({"op": "enrol", "fingerprint": pk.key.fingerprint, "public_key": pk.line, "class": "display-phone",
+              "custody": "passkey"})
+    rid = _filed(capsys, ddir, root, keys, signq, tmp_path)
+    phone_sign(signq, rid, pk)
+    touch = DuringTouch(lambda: log.link({"op": "revoke_key", "fingerprint": pk.key.fingerprint}))
+    monkeypatch.setattr("levain.cockpit.keys.ssh_signer", touch)
+    code, out, err = approve(capsys, ddir, root, keys, signq, rid)
+    assert touch.calls == 1                                          # it got as far as the touch, then refused
+    assert code != 0 and "discarded" in out and "not an active passkey" in out and gen(ddir, root) == 0
+    assert list((ddir / pc.PENDING_DIR).glob("*.item"))                # nothing was spent
+
+
+def test_an_approval_that_expires_while_the_touch_waits_lands_nothing(capsys, ddir, root, keys, phones, signq, tmp_path,
+                                                                      pushes, monkeypatch):
+    rid = _filed(capsys, ddir, root, keys, signq, tmp_path)
+    phone_sign(signq, rid, phones["good"])
+    later = datetime.now(timezone.utc) + timedelta(hours=2)
+    touch = DuringTouch(lambda: monkeypatch.setattr(pc, "_now", lambda: later))
+    monkeypatch.setattr("levain.cockpit.keys.ssh_signer", touch)
+    code, out, _ = approve(capsys, ddir, root, keys, signq, rid)
+    assert touch.calls == 1 and code != 0 and "expired" in out and "discarded" in out and gen(ddir, root) == 0
+
+
+def test_the_deadline_is_the_signed_one_editing_the_request_file_cannot_extend_it(capsys, ddir, root, keys, phones,
+                                                                                    signq, tmp_path, pushes):
+    rid = _filed(capsys, ddir, root, keys, signq, tmp_path)
+    phone_sign(signq, rid, phones["good"])
+    path = sign_dir(signq) / f"{rid}.json"
+    body = json.loads(path.read_text())
+    body["expires_at"] = (datetime.now(timezone.utc) + timedelta(days=30)).strftime("%Y-%m-%dT%H:%M:%S.%fZ")
+    path.write_text(json.dumps(body) + "\n")
+    mine = lambda rp: {phones["good"].key.fingerprint: phones["good"].key}  # noqa: E731
+    with pytest.raises(ctl.ConfigRefused, match="expired"):
+        pc.read_approval(signq, rid, keys=mine, now=datetime.now(timezone.utc) + timedelta(hours=2))
+    assert "\nexpires: " in read_request(signq, rid).message                    # the phone signs the deadline
+
+
+def test_a_second_accept_approved_on_a_held_item_is_refused_before_the_touch(capsys, ddir, root, keys, phones, signq,
+                                                                            tmp_path, pushes, no_touch):
+    rid = _filed(capsys, ddir, root, keys, signq, tmp_path)
+    phone_sign(signq, rid, phones["good"])
+    [kept] = (ddir / pc.PENDING_DIR).glob("*.item")
+    with pc.claimed(ddir, kept.stem):
+        code, out, _ = approve(capsys, ddir, root, keys, signq, rid)
+    assert code != 0 and "holds this item" in out and no_touch.calls == 0 and gen(ddir, root) == 0
+
+
+def test_the_item_is_shown_in_full_before_the_touch(capsys, ddir, root, keys, phones, signq, tmp_path, pushes,
+                                                   monkeypatch):
+    """complement MED: no y/N, so the view above the touch is the operator's only look; it is printed before the
+    signer is even built."""
+    rid = _filed(capsys, ddir, root, keys, signq, tmp_path)
+    phone_sign(signq, rid, phones["good"])
+    seen: list[str] = []
+    touch = DuringTouch(lambda: seen.append(capsys.readouterr().out))
+    monkeypatch.setattr("levain.cockpit.keys.ssh_signer", touch)
+    code, out, _ = approve(capsys, ddir, root, keys, signq, rid)
+    assert code == 0, out
+    [shown] = seen
+    assert "levain dispatch config: the item" in shown and "new kind: no verifier item is active" in shown
+    assert '+  "verifiers": [' in shown                                      # the body itself, not a count
+
+
+def test_an_approval_reads_back_after_the_cockpit_withdrew_its_origin(capsys, ddir, root, keys, phones, signq, tmp_path,
+                                                                      pushes):
+    """codex MED: the cockpit stopped between the phone tap and the laptop touch (shutdown withdraws the origin)."""
+    rid = _filed(capsys, ddir, root, keys, signq, tmp_path)
+    phone_sign(signq, rid, phones["good"])
+    (signq / "cockpit-origin.json").unlink()
+    code, out, _ = approve(capsys, ddir, root, keys, signq, rid)
+    assert code == 0 and gen(ddir, root) == 1, out
+
+
+@pytest.mark.parametrize("shape", ["fifo", "symlink", "huge"])
+def test_result_files_are_read_bounded_regular_and_unfollowed(capsys, ddir, root, keys, phones, signq, tmp_path,
+                                                              pushes, no_touch, shape):
+    rid = _filed(capsys, ddir, root, keys, signq, tmp_path)
+    phone_sign(signq, rid, phones["good"])
+    rec = sign_dir(signq) / f"{rid}.signed.json"
+    real = rec.read_text()
+    rec.unlink()
+    if shape == "fifo":
+        os.mkfifo(rec)
+    elif shape == "symlink":
+        other = tmp_path / "rec.json"
+        other.write_text(real)
+        rec.symlink_to(other)
+    else:
+        rec.write_text(real[:-2] + " " * (1 << 17) + "}\n")
+    code, out, _ = approve(capsys, ddir, root, keys, signq, rid)
+    assert code != 0 and "cannot be read" in out and no_touch.calls == 0 and gen(ddir, root) == 0
+
+
+def test_a_request_the_queue_cannot_take_keeps_no_item_and_raises_no_traceback(capsys, ddir, root, keys, signq,
+                                                                              tmp_path):
+    init(capsys, ddir, root, keys)
+    d = sign_dir(signq)
+    d.mkdir(mode=0o700)
+    d.chmod(0o500)
+    try:
+        code, out, err = request(capsys, ddir, root, signq, tmp_path)
+    finally:
+        d.chmod(0o700)
+    assert code != 0 and "could not be filed" in out and "Traceback" not in err
+    assert not list((ddir / pc.PENDING_DIR).glob("*"))
+
+
+def test_a_grammar_refusal_keeps_no_item(ddir, monkeypatch, tmp_path, signq):
+    from levain.consent import sign as csign
+    raw = ctl.item_bytes("verifier", 1, VERIFIERS, datetime.now(timezone.utc), prev="", store_id="0" * 32)
+
+    def boom(*a, **k):
+        raise ValueError("outside the grammar")
+    monkeypatch.setattr(csign, "file_levain_request", boom)
+    with pytest.raises(ValueError):
+        pc.file_request(ddir, signq, raw, change="c", summary="s")
+    assert not list((ddir / pc.PENDING_DIR).glob("*"))
+
+
+def test_kept_items_are_written_under_a_private_temporary_and_pruned_when_stale(ddir, monkeypatch):
+    raw = ctl.item_bytes("verifier", 1, VERIFIERS, datetime.now(timezone.utc), prev="", store_id="0" * 32)
+    sha = hashlib.sha256(raw).hexdigest()
+    d = ddir / pc.PENDING_DIR
+    d.mkdir(mode=0o700, parents=True)
+    (d / f".{sha}.tmp").symlink_to("/nonexistent")       # the old fixed name: another writer's, never reused
+    assert pc._write_pending(ddir, sha, raw) is True and pc._write_pending(ddir, sha, raw) is False
+    assert pc.load_pending(ddir, sha) == raw and [p.name for p in d.glob("*.tmp")] == [f".{sha}.tmp"]
+    real_replace = os.replace
+    monkeypatch.setattr(pc.os, "replace", lambda *a: (_ for _ in ()).throw(OSError("disk")))
+    with pytest.raises(OSError):
+        pc._write_pending(ddir, "f" * 64, raw)
+    monkeypatch.setattr(pc.os, "replace", real_replace)
+    assert not [p for p in d.iterdir() if p.name.endswith(".tmp") and not p.is_symlink()]
+    # stale: older than any approval over it can be used, so the next request removes it (a fresh one stays)
+    old = __import__("time").time() - pc._PRUNE_AGE_S - 60
+    os.utime(d / f"{sha}.item", (old, old))
+    from levain.consent import sign as csign
+    monkeypatch.setattr(csign, "file_levain_request", lambda *a, **k: "lv-" + "b" * 32)
+    fresh = ctl.item_bytes("verifier", 1, VERIFIERS, datetime.now(timezone.utc) + timedelta(seconds=1), prev="",
+                           store_id="0" * 32)
+    assert pc.file_request(ddir, ddir, fresh, change="c", summary="s") == "lv-" + "b" * 32
+    assert not (d / f"{sha}.item").exists() and (d / f"{hashlib.sha256(fresh).hexdigest()}.item").exists()
+
+
+def test_the_class_floor_is_judged(signq, capsys, ddir, root, keys, phones, tmp_path, pushes):
+    """complement LOW: a passkey is always display-phone today, so the floor is fed a key of a class below it."""
+    from types import SimpleNamespace
+    rid = _filed(capsys, ddir, root, keys, signq, tmp_path)
+    phone_sign(signq, rid, phones["good"])
+    fp = phones["good"].key.fingerprint
+    low = SimpleNamespace(key_class="no-such-class", public_key=phones["good"].line, fingerprint=fp)
+    with pytest.raises(ctl.ConfigRefused, match="does not cover T2"):
+        pc.read_approval(signq, rid, keys=lambda rp: {fp: low})
+
+
+def test_an_agent_holding_a_signed_approval_still_cannot_accept_it(capsys, ddir, root, keys, phones, signq, tmp_path,
+                                                                   pushes, monkeypatch, no_touch):
+    """gemini HIGH (verify): through the real dispatch, with an approval that WOULD land for the operator."""
+    rid = _filed(capsys, ddir, root, keys, signq, tmp_path)
+    phone_sign(signq, rid, phones["good"])
+    monkeypatch.setattr(dcli, "agent_caller", lambda: "claude_code")
+    code, out, _ = approve(capsys, ddir, root, keys, signq, rid)
+    assert code == 2 and "is the operator's own act" in out and no_touch.calls == 0 and gen(ddir, root) == 0
+    assert list((ddir / pc.PENDING_DIR).glob("*.item"))

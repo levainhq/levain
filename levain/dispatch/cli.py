@@ -51,8 +51,10 @@ shown, kind, generation, store, prev and a diff against the active body of its k
 takes an item signed elsewhere, and ``show`` reads the active configuration back. ``request`` and ``accept-approved``
 are the phone path (:mod:`levain.dispatch.phone_config`): ``request`` keeps the next item's bytes and files a phone
 approval request over their hash, and ``accept-approved`` verifies that passkey approval, then has the pinned laptop
-key sign those exact bytes (the touch is the question; the trust root and ``accept`` are unchanged). ``init``,
-``request``, ``sign``, ``accept`` and ``accept-approved`` are refused to an agent, as ``sign`` is; ``show`` is open. :func:`resolvers` reads the template registry and the
+key sign those exact bytes (the touch is the question; the trust root and ``accept`` are unchanged) and judges the
+approval again after the touch, before the store is given the item. Every ``config`` verb but ``show`` (``init``,
+``trust``, ``request``, ``sign``, ``accept``, ``accept-approved``) is refused to an agent, as ``sign`` is; ``show`` is
+open. :func:`resolvers` reads the template registry and the
 provider policy from that store, in one verified read, so a filing resolves through what the operator signed; with
 no store, ``file`` refuses (every contract would be R2, which is never dispatched), and a store that cannot be
 trusted is exit 3 with nothing filed. Under a detected agent, ``file`` refuses ``--data-root`` and ``--dispatch-dir``:
@@ -1101,10 +1103,13 @@ def _config_request(args: argparse.Namespace, d: Path, view_out: Any, emit: Call
     print("\n".join(lines), file=view_out, flush=True)
     queue = _sign_queue(args)
     summary = _kind_summary(args.kind, dctl.parse_item(raw), {**items})[1]
+    from levain.consent.sign import SignRefused
+
     try:
         rid = pc.file_request(d, queue, raw, change=change, summary=summary)
-    except (ValueError, OSError) as exc:
-        raise dctl.ConfigRefused(f"the approval request could not be filed: {exc}") from None
+    except (ValueError, OSError, SignRefused) as exc:
+        raise dctl.ConfigRefused(f"the approval request could not be filed: {exc}; nothing was filed or kept") \
+            from None
     why = pc.push_request(queue, rid)
     emit({"request_id": rid, "generation": top + 1, "kind": args.kind, "pushed": why is None, "push_note": why},
          f"levain dispatch config: approval request {rid} filed for {args.kind} generation {top + 1} "
@@ -1117,42 +1122,55 @@ def _config_request(args: argparse.Namespace, d: Path, view_out: Any, emit: Call
 def _config_accept_approved(args: argparse.Namespace, d: Path, view_out: Any,
                             emit: Callable[[Any, str], None]) -> int:
     """``config accept-approved``: verify the phone's approval of a kept item, then sign those exact bytes with the
-    pinned trust-root laptop key (the touch is the question; no y/N) and hand them to the unchanged store accept."""
+    pinned trust-root laptop key (the touch is the question; no y/N, the item printed in full above it), verify the
+    approval AGAIN after the touch (fresh clock, fresh authority replay: a passkey revoked or an approval expired
+    while the touch waited refuses, the signature discarded) and hand the bytes to the unchanged store accept. The
+    kept item is locked from the first read to the accept, so a second run on it is refused before any touch."""
     from levain.dispatch import phone_config as pc
 
     store = _control(args, d)
     queue = _sign_queue(args)
-    approval = pc.read_approval(queue, args.request_id, keys=_phone_keys(args, d, queue))
-    raw = pc.load_pending(d, approval.item_sha256)
-    parsed = dctl.parse_item(raw)
-    sid = store.store_id()
-    if (parsed.store_id, parsed.kind, parsed.generation, parsed.prev) != (
-            approval.store_id, approval.kind, approval.generation, approval.prev) or parsed.store_id != sid:
-        raise dctl.ConfigRefused("the kept item is not the item (store, kind, generation, prev) the phone approved; "
-                                 "nothing was signed")
-    items, top, head = _verified(store)
-    if (top, head) != (parsed.generation - 1, parsed.prev):
-        raise InputRefused(f"the store is at generation {top}, not {parsed.generation - 1}, since the request was "
-                           "filed: the approval is stale; nothing was signed, file a new request")
-    lines, _change = _item_view(parsed.kind, parsed.generation, parsed.store_id, sid, parsed.prev, parsed.body,
-                                items.get(parsed.kind))
-    print("\n".join(lines), file=view_out, flush=True)
-    signer_fp, sign = _signer(args, dctl.CONFIG_NAMESPACE, "config accept-approved")
-    root = store.trust_root()
-    if signer_fp != root:
-        raise InputRefused(f"--signing-key is {signer_fp}, which is not the pinned trust root ({root}): only the "
-                           "root's signature is accepted. Nothing was signed")
-    _head_unmoved(store, top, head, "before the touch", "signed")
-    try:
-        signature = _sign_bytes(sign, raw)
-    except SignerUnavailable as exc:
-        raise _NotDone(exc, _sign_fault_not_done(store, top, head)) from exc
-    try:
-        accepted = _accept_guarded(store, raw, signature, top)
-    except dctl.ConfigRefused as exc:
-        raise dctl.ConfigRefused(f"signed but not accepted: {exc}; this signature cannot be used, file a new "
-                                 "request") from None
-    pc.remove_pending(d, approval.item_sha256)
+    keys = _phone_keys(args, d)
+    approval = pc.read_approval(queue, args.request_id, keys=keys)
+    with pc.claimed(d, approval.item_sha256) as raw:
+        parsed = dctl.parse_item(raw)
+        sid = store.store_id()
+        if (parsed.store_id, parsed.kind, parsed.generation, parsed.prev) != (
+                approval.store_id, approval.kind, approval.generation, approval.prev) or parsed.store_id != sid:
+            raise dctl.ConfigRefused("the kept item is not the item (store, kind, generation, prev) the phone "
+                                     "approved; nothing was signed")
+        items, top, head = _verified(store)
+        if (top, head) != (parsed.generation - 1, parsed.prev):
+            raise InputRefused(f"the store is at generation {top}, not {parsed.generation - 1}, since the request "
+                               "was filed: the approval is stale; nothing was signed, file a new request")
+        lines, _change = _item_view(parsed.kind, parsed.generation, parsed.store_id, sid, parsed.prev, parsed.body,
+                                    items.get(parsed.kind))
+        # the item in full, before the signer exists: there is no path to the touch that skips it
+        print("\n".join(lines), file=view_out, flush=True)
+        signer_fp, sign = _signer(args, dctl.CONFIG_NAMESPACE, "config accept-approved")
+        root = store.trust_root()
+        if signer_fp != root:
+            raise InputRefused(f"--signing-key is {signer_fp}, which is not the pinned trust root ({root}): only "
+                               "the root's signature is accepted. Nothing was signed")
+        _head_unmoved(store, top, head, "before the touch", "signed")
+        try:
+            signature = _sign_bytes(sign, raw)
+        except SignerUnavailable as exc:
+            raise _NotDone(exc, _sign_fault_not_done(store, top, head)) from exc
+        # the point of use: the touch can wait up to the signer's timeout, so the approval is judged again now
+        discarded = "the laptop signature was discarded and nothing was accepted"
+        try:
+            again = pc.read_approval(queue, approval.request_id, keys=keys, not_done=discarded)
+        except dctl.ControlStateUnavailable as exc:
+            raise _NotDone(exc, f"{discarded}; generation is still {top}") from exc
+        if again != approval:
+            raise dctl.ConfigRefused(f"the phone approval changed while the touch waited; {discarded}")
+        try:
+            accepted = _accept_guarded(store, raw, signature, top)
+        except dctl.ConfigRefused as exc:
+            raise dctl.ConfigRefused(f"signed but not accepted: {exc}; this signature cannot be used, file a new "
+                                     "request") from None
+        pc.remove_pending(d, approval.item_sha256)
     emit({"kind": accepted.kind, "generation": accepted.generation, "digest": accepted.digest,
           "approved_by": approval.signer_fp, "request_id": approval.request_id},
          f"levain dispatch config: accepted generation {accepted.generation} ({accepted.kind}), {accepted.digest}, "
@@ -1257,26 +1275,22 @@ def _sign_queue(args: argparse.Namespace) -> Path:
     return found
 
 
-def _phone_keys(args: argparse.Namespace, d: Path, queue_dir: Path) -> Callable[[], dict[str, Any]]:
-    """The active phone passkeys, read from the SAME authority log the control store is verified against (so a
-    passkey enrolled in some other cockpit approves nothing here), on the site the queue's cockpit published."""
+def _phone_keys(args: argparse.Namespace, d: Path) -> Callable[[str], dict[str, Any]]:
+    """``keys(rp_id)``: the active passkeys on site ``rp_id``, read from a fresh replay of the SAME authority log the
+    control store is verified against (so a passkey enrolled in some other cockpit approves nothing here) on every
+    call. The site comes from the approval's own record, not the cockpit's published origin: a cockpit stopped
+    between the phone tap and the laptop touch withdraws its origin, and the approval still reads back."""
     import sqlite3
-    from urllib.parse import urlsplit
 
     from levain.authority import AuthorityError
     from levain.consent.answering import passkey_keys
-    from levain.consent.cockpit_origin import read_origin
     from levain.consent.sign import SignRefused
 
-    origin = read_origin(queue_dir)
-    host = urlsplit(origin).hostname if origin else None
-    if not host:
-        raise InputRefused(f"the signing queue {queue_dir} has no cockpit origin, so no passkey site is known")
     source = _authority_source(d, args.data_root)
 
-    def keys() -> dict[str, Any]:
+    def keys(rp_id: str) -> dict[str, Any]:
         try:
-            return {k.fingerprint: k for k in passkey_keys(source(), host)}
+            return {k.fingerprint: k for k in passkey_keys(source(), rp_id)}
         except (AuthorityError, OSError, sqlite3.Error) as exc:
             raise SignRefused(f"the cockpit's keys cannot be read now: {exc}", 503) from None
 

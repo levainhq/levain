@@ -11,27 +11,38 @@ accepts: the trust root, its custody rule and ``accept`` are untouched, so an ap
 laptop signature is ever made without a verified approval of those bytes.
 
 What the phone is shown is levain's own one-line ``change`` and ``summary`` beside the item's hash; the full diff is
-printed at the laptop before the touch. A signature in this namespace therefore binds the hash, and the words are the
-operator's reading aid, not part of what is verified. The approval class floor is T2 (a ``display-phone`` passkey,
-what a thread envelope and a signed review clear need): the T3 authority over configuration stays the laptop key's.
+printed at the laptop before the touch, and the touch is the only laptop-side question. A signature in this namespace
+therefore binds the hash, and the words are the operator's reading aid, not part of what is verified. The approval's
+deadline is the ``expires`` line of the SIGNED message (the request file's own ``expires_at`` is a second, never a
+looser, bound). The approval class floor is T2 (a ``display-phone`` passkey, what a thread envelope and a signed
+review clear need): the T3 authority over configuration stays the laptop key's.
+
+The approval is judged at the point of use: ``accept-approved`` reads it once before the touch and again after it
+(fresh clock, fresh authority replay), and a signature made while the approval stopped holding is discarded. The
+kept item is held under an exclusive lock from the first read to the store's accept, so two runs on one item never
+both reach the key.
 """
 from __future__ import annotations
 
+import fcntl
 import hashlib
 import json
 import os
 import re
+import secrets
 import stat
+import time
+from contextlib import contextmanager
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any, Callable, Mapping
+from typing import Any, Callable, Iterator, Mapping
 
 from levain.contracts.namespaces import CONFIG_APPROVE_NAMESPACE, LEVAIN_SIGN_REQUESTS
 from levain.dispatch import control as dctl
 
 __all__ = ["APPROVE_TIER", "Approval", "FORMAT_LINE", "PENDING_DIR", "REQUEST_TITLE", "REQUEST_TTL_S", "build_message",
-           "file_request", "load_pending", "push_request", "read_approval", "remove_pending"]
+           "claimed", "file_request", "load_pending", "push_request", "read_approval", "remove_pending"]
 
 FORMAT_LINE = "levain-dispatch-config-approve/1"
 REQUEST_TITLE = "Approve a dispatch configuration change"
@@ -40,6 +51,14 @@ APPROVE_TIER = "T2"
 PENDING_DIR = "config-pending"
 _LINE_MAX = 300
 _SHA = re.compile(r"[0-9a-f]{64}")
+#: a kept item (or a temporary one) older than this can back no usable approval (its signed deadline is
+#: REQUEST_TTL_S after filing), so the next request removes it: the pending directory stays bounded
+_PRUNE_AGE_S = 2 * REQUEST_TTL_S
+_SCAN_MAX = 4096
+
+
+def _now() -> datetime:
+    return datetime.now(timezone.utc)
 
 
 @dataclass(frozen=True)
@@ -63,13 +82,16 @@ def _one_line(text: str) -> str:
     return (out[:_LINE_MAX - 3] + "...") if len(out) > _LINE_MAX else (out or "(none)")
 
 
-def build_message(item: dctl.ConfigItem, raw: bytes, *, change: str, summary: str) -> str:
-    """The approval request's message for ``item`` (parsed from ``raw``, its exact canonical bytes)."""
+def build_message(item: dctl.ConfigItem, raw: bytes, *, expires: datetime, change: str, summary: str) -> str:
+    """The approval request's message for ``item`` (parsed from ``raw``, its exact canonical bytes), usable until
+    ``expires`` (signed with it)."""
+    from levain.cockpit.consent import utc_stamp
+
     if dctl.parse_item(raw).text != item.text:
         raise ValueError("raw is not the item's bytes")
     msg = (f"{FORMAT_LINE}\nstore: {_one_line(item.store_id)}\nkind: {item.kind}\ngeneration: {item.generation}\n"
            f"prev: {_one_line(item.prev) if item.prev else 'none'}\nitem-sha256: {hashlib.sha256(raw).hexdigest()}\n"
-           f"change: {_one_line(change)}\nsummary: {_one_line(summary)}\n")
+           f"expires: {utc_stamp(expires)}\nchange: {_one_line(change)}\nsummary: {_one_line(summary)}\n")
     return msg
 
 
@@ -88,37 +110,107 @@ def _pending_dir(directory: Path) -> Path:
     return Path(directory) / PENDING_DIR
 
 
-def _write_pending(directory: Path, sha: str, raw: bytes) -> None:
+def _write_pending(directory: Path, sha: str, raw: bytes) -> bool:
+    """Keep ``raw`` as ``<sha>.item`` (written whole under a temporary name only this call uses, then renamed over,
+    the directory synced); True when this call created it, False when it was already there."""
     d = _pending_dir(directory)
     d.mkdir(mode=0o700, parents=True, exist_ok=True)
     path = d / f"{sha}.item"
-    tmp = d / f".{sha}.tmp"
-    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | getattr(os, "O_NOFOLLOW", 0), 0o600)
-    with os.fdopen(fd, "wb") as fh:
-        fh.write(raw)
-        fh.flush()
-        os.fsync(fh.fileno())
-    os.replace(tmp, path)
+    existed = os.path.lexists(path)
+    tmp = d / f".{sha}.{secrets.token_hex(8)}.tmp"
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0), 0o600)
+    try:
+        with os.fdopen(fd, "wb") as fh:
+            fh.write(raw)
+            fh.flush()
+            os.fsync(fh.fileno())
+        os.replace(tmp, path)
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+    dfd = os.open(d, os.O_RDONLY)
+    try:
+        os.fsync(dfd)
+    finally:
+        os.close(dfd)
+    return not existed
+
+
+def _prune(directory: Path) -> None:
+    """Remove kept items and temporaries older than :data:`_PRUNE_AGE_S` (no approval over them can still be used),
+    looking at no more than :data:`_SCAN_MAX` entries. Never raises."""
+    d = _pending_dir(directory)
+    cutoff = time.time() - _PRUNE_AGE_S
+    try:
+        with os.scandir(d) as it:
+            for n, entry in enumerate(it):
+                if n >= _SCAN_MAX:
+                    break
+                if not (entry.name.endswith(".item") or entry.name.endswith(".tmp")):
+                    continue
+                try:
+                    if entry.stat(follow_symlinks=False).st_mtime < cutoff:
+                        os.unlink(entry.path)
+                except OSError:
+                    continue
+    except OSError:
+        return
+
+
+def _read_kept(fd: int, sha: str) -> bytes:
+    if not stat.S_ISREG(os.fstat(fd).st_mode):
+        raise dctl.ConfigRefused("the kept item is not a regular file")
+    chunks, size = [], 0
+    while size <= dctl.ITEM_MAX_BYTES:
+        chunk = os.read(fd, dctl.ITEM_MAX_BYTES + 1 - size)
+        if not chunk:
+            break
+        chunks.append(chunk)
+        size += len(chunk)
+    raw = b"".join(chunks)
+    if len(raw) > dctl.ITEM_MAX_BYTES or hashlib.sha256(raw).hexdigest() != sha:
+        raise dctl.ConfigRefused("the kept item is not the one the approval is over")
+    return raw
+
+
+def _open_kept(directory: Path, sha: str) -> int:
+    if _SHA.fullmatch(sha or "") is None:
+        raise dctl.ConfigRefused("the approval names no item hash")
+    path = _pending_dir(directory) / f"{sha}.item"
+    try:
+        return os.open(path, os.O_RDONLY | os.O_NONBLOCK | getattr(os, "O_NOFOLLOW", 0))
+    except OSError:
+        raise dctl.ConfigRefused(f"the item this approval is over is not kept here ({path}): the request was filed "
+                                 "elsewhere, its item was spent or is gone; file a new request") from None
 
 
 def load_pending(directory: Path, sha: str) -> bytes:
     """The pending item whose bytes hash to ``sha``, or :class:`levain.dispatch.control.ConfigRefused`. The file is a
     regular file read without following a link; its bytes are re-hashed, so a swapped file is refused."""
-    if _SHA.fullmatch(sha or "") is None:
-        raise dctl.ConfigRefused("the approval names no item hash")
-    path = _pending_dir(directory) / f"{sha}.item"
+    fd = _open_kept(directory, sha)
     try:
-        fd = os.open(path, os.O_RDONLY | os.O_NONBLOCK | getattr(os, "O_NOFOLLOW", 0))
-    except OSError:
-        raise dctl.ConfigRefused(f"the item this approval is over is not kept here ({path}): the request was filed "
-                                 "elsewhere or its item is gone; file a new request") from None
-    with os.fdopen(fd, "rb") as fh:
-        if not stat.S_ISREG(os.fstat(fh.fileno()).st_mode):
-            raise dctl.ConfigRefused("the kept item is not a regular file")
-        raw = fh.read(dctl.ITEM_MAX_BYTES + 1)
-    if len(raw) > dctl.ITEM_MAX_BYTES or hashlib.sha256(raw).hexdigest() != sha:
-        raise dctl.ConfigRefused("the kept item is not the one the approval is over")
-    return raw
+        return _read_kept(fd, sha)
+    finally:
+        os.close(fd)
+
+
+@contextmanager
+def claimed(directory: Path, sha: str) -> Iterator[bytes]:
+    """The kept item's bytes (as :func:`load_pending` reads them), held under an exclusive lock on the open file for
+    the block: a second claim of the same item, while the first is held, is refused at once
+    (:class:`levain.dispatch.control.ConfigRefused`), never queued behind it, so it never reaches the key."""
+    fd = _open_kept(directory, sha)
+    try:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            raise dctl.ConfigRefused("another accept-approved holds this item now; nothing was signed") from None
+        yield _read_kept(fd, sha)
+    finally:
+        os.close(fd)
 
 
 def remove_pending(directory: Path, sha: str) -> None:
@@ -130,14 +222,24 @@ def remove_pending(directory: Path, sha: str) -> None:
 
 def file_request(directory: Path, queue_dir: Path, raw: bytes, *, change: str, summary: str) -> str:
     """Keep ``raw`` (an item's canonical bytes) and file levain's approval request over it in ``queue_dir``'s sign
-    directory; return the request id. :class:`ValueError` for a message outside the grammar (nothing is filed)."""
+    directory; return the request id. Whatever the filing raises (:class:`ValueError` for a message outside the
+    grammar, :class:`OSError` or :class:`levain.consent.sign.SignRefused` for a queue it cannot write) propagates
+    with nothing filed and the item this call kept removed again."""
     from levain.consent.sign import file_levain_request
 
     item = dctl.parse_item(raw)
-    message = build_message(item, raw, change=change, summary=summary)
-    _write_pending(directory, hashlib.sha256(raw).hexdigest(), raw)
-    return file_levain_request(Path(queue_dir), CONFIG_APPROVE_NAMESPACE, message, title=REQUEST_TITLE,
-                               ttl_s=REQUEST_TTL_S)
+    message = build_message(item, raw, expires=_now() + timedelta(seconds=REQUEST_TTL_S), change=change,
+                            summary=summary)
+    _prune(directory)
+    sha = hashlib.sha256(raw).hexdigest()
+    created = _write_pending(directory, sha, raw)
+    try:
+        return file_levain_request(Path(queue_dir), CONFIG_APPROVE_NAMESPACE, message, title=REQUEST_TITLE,
+                                   ttl_s=REQUEST_TTL_S)
+    except BaseException:
+        if created:
+            remove_pending(directory, sha)
+        raise
 
 
 def push_request(queue_dir: Path, rid: str) -> str | None:
@@ -163,20 +265,24 @@ def push_request(queue_dir: Path, rid: str) -> str | None:
 
 
 # --- reading the approval back ----------------------------------------------------------------------------------------
-def read_approval(queue_dir: Path, request_id: object, *, keys: Callable[[], Mapping[str, Any]],
-                  now: datetime | None = None) -> Approval:
+def read_approval(queue_dir: Path, request_id: object, *, keys: Callable[[str], Mapping[str, Any]],
+                  now: datetime | None = None, not_done: str = "nothing was signed") -> Approval:
     """The verified approval in sign request ``request_id``: levain's own request in :data:`CONFIG_APPROVE_NAMESPACE`
-    in exactly its grammar, signed (not open, not denied) before it expired, whose signature verifies over its message
-    in that namespace by an active passkey ``keys()`` names whose class covers :data:`APPROVE_TIER`. Raises
-    :class:`levain.dispatch.control.ConfigRefused` saying which check failed; a passkey list or verifier that cannot be
-    had is :class:`levain.dispatch.control.ControlStateUnavailable`. Writes nothing."""
+    in exactly its grammar, signed (not open, not denied), whose signed ``expires`` (and the request file's own
+    expiry) is after ``now`` (default: the clock now) and after the signing, and whose signature verifies over its
+    message in that namespace by an active passkey ``keys(rp_id)`` names (``rp_id`` is the site of the key the record
+    names, so an approval reads back with no cockpit running) whose class covers :data:`APPROVE_TIER`. Raises
+    :class:`levain.dispatch.control.ConfigRefused` saying which check failed and ``not_done``; a passkey list or
+    verifier that cannot be had is :class:`levain.dispatch.control.ControlStateUnavailable`. Writes nothing; the
+    result files are read as the queue reads them (no link followed, regular files only, bounded)."""
     from levain.authority import VerifierUnavailable, verify_link_sig
     from levain.cockpit.consent import parse_stamp
+    from levain.consent.passkey import PasskeyError, key_application
     from levain.consent.queue import class_covers
-    from levain.consent.sign import SignRefused, read_request, request_id_ok, sign_dir, state_of
+    from levain.consent.sign import SignRefused, _read_bytes, read_request, request_id_ok, sign_dir, state_of
 
     def refuse(why: str) -> dctl.ConfigRefused:
-        return dctl.ConfigRefused(f"the phone approval is not usable: {why}; nothing was signed")
+        return dctl.ConfigRefused(f"the phone approval is not usable: {why}; {not_done}")
 
     if not request_id_ok(request_id):
         raise refuse("no sign request was named")
@@ -194,15 +300,22 @@ def read_approval(queue_dir: Path, request_id: object, *, keys: Callable[[], Map
     state = state_of(qdir, rid)
     if state != "signed":
         raise refuse(f"sign request {rid} is {'denied on the phone' if state == 'denied' else 'not signed yet'}")
-    moment = now or datetime.now(timezone.utc)
-    if request.expires_at is None or request.expires_at <= moment:
+    try:
+        signed_deadline = parse_stamp(fields["expires"])
+    except Exception:  # noqa: BLE001 - the grammar fences the shape; a date that is not one is unusable
+        raise refuse(f"sign request {rid} names no readable deadline") from None
+    if request.expires_at is None:
+        raise refuse(f"sign request {rid} has no expiry")
+    deadline = min(signed_deadline, request.expires_at)
+    moment = now or _now()
+    if deadline <= moment:
         raise refuse(f"sign request {rid} expired")
     message = request.message.encode("utf-8")
     d = sign_dir(qdir)
     try:
-        record = json.loads((d / f"{rid}.signed.json").read_text(encoding="utf-8"))
-        signature = (d / f"{rid}.sig").read_text(encoding="ascii")
-    except (OSError, ValueError):
+        record = json.loads(_read_bytes(d / f"{rid}.signed.json"))
+        signature = _read_bytes(d / f"{rid}.sig").decode("ascii")
+    except (SignRefused, OSError, ValueError, RecursionError):
         raise refuse(f"the signature of sign request {rid} cannot be read") from None
     if (not isinstance(record, dict) or record.get("namespace") != CONFIG_APPROVE_NAMESPACE
             or record.get("message_sha256") != hashlib.sha256(message).hexdigest()):
@@ -211,13 +324,17 @@ def read_approval(queue_dir: Path, request_id: object, *, keys: Callable[[], Map
         signed_at = parse_stamp(record.get("signed_at"))
     except Exception:  # noqa: BLE001 - an unreadable stamp is an unusable record
         raise refuse(f"sign request {rid} carries no readable signing time") from None
-    if signed_at > request.expires_at:
+    if signed_at > deadline:
         raise refuse(f"sign request {rid} was signed after it expired")
+    fp = record.get("signer_fp")
     try:
-        active = keys()
+        rp_id = key_application(str(record.get("public_key")))
+    except (PasskeyError, ValueError, IndexError):
+        raise refuse(f"the record of sign request {rid} names no passkey") from None
+    try:
+        active = keys(rp_id)
     except SignRefused as exc:
         raise dctl.ControlStateUnavailable(f"the phone passkeys cannot be read now: {exc}") from None
-    fp = record.get("signer_fp")
     key = active.get(fp) if isinstance(fp, str) else None
     if key is None:
         raise refuse(f"{str(fp)[:80]} is not an active passkey enrolled here")
