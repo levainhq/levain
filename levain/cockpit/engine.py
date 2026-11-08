@@ -120,6 +120,7 @@ TITLE_MAX = 160
 SOON_DAYS = 3
 WRITE_READ_CAP = 32       # source reads made inside writes that may run at once (design §4.4)
 WRITE_READ_CAP_PER_SOURCE = 4   # of those, reads of one source (a panel or a discoverer)
+RETIRED_PANEL_IDS = ("now",)   # ids no panel may take: cockpit_view.js scrubs them from stored layouts (a test pins both lists equal)
 BOARD_DEFAULT_ID = "work_board"   # the kernel's own board panel: drawn only while no provider brings a board (attach_board)
 # a triage-list view id: lower-case, and never "default" (the panel's own order is the default view)
 _VIEW_ID = re.compile(r"(?!default\Z)[a-z0-9][a-z0-9_-]{0,31}")     # matched whole (fullmatch)
@@ -1034,7 +1035,7 @@ class Cockpit:
             self._unregister_locked(sid)
             self._dec.spec = None
         yielding = self._replaces_builtin_board(sid, spec.kind)     # a board under the built-in's id replaces it, below
-        if not sid or (sid in self._specs and not yielding):
+        if not sid or sid in RETIRED_PANEL_IDS or (sid in self._specs and not yielding):
             raise CockpitRegistrationError(f"panel id {sid!r} is empty, reserved or already registered")
         if spec.kind not in KINDS:
             raise CockpitRegistrationError(f"{sid}: unknown kind {spec.kind!r}")

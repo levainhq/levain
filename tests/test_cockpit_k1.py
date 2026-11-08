@@ -205,6 +205,19 @@ class TestWhyProvidersCheckTheirOwnSources:
 
 
 class TestRegistrationRefusals:
+    def test_a_retired_panel_id_is_refused(self) -> None:
+        from levain.cockpit.engine import RETIRED_PANEL_IDS
+        assert "now" in RETIRED_PANEL_IDS
+        with pytest.raises(CockpitRegistrationError, match="reserved"):
+            Cockpit().register(_simple("now"))
+
+    def test_the_view_scrubs_exactly_the_engine_retired_ids(self) -> None:
+        import re
+        from levain.cockpit.engine import RETIRED_PANEL_IDS
+        js = (Path(__file__).resolve().parent.parent / "levain/templates/web/cockpit_view.js").read_text()
+        m = re.search(r"const RETIRED_PANEL_IDS = (\[[^\]]*\]);", js)
+        assert m and tuple(json.loads(m.group(1))) == tuple(RETIRED_PANEL_IDS)
+
     def test_a_gate_panel_registering_an_optional_source_is_refused(self) -> None:
         with pytest.raises(CockpitRegistrationError, match="optional"):
             Cockpit().register(_simple(priority="gate", optional=True))
