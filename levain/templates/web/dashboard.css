@@ -2418,10 +2418,10 @@ body.ke .panel[data-ck-panel="loops"] .row[data-spore] { scroll-margin-top: calc
 }
 /* the Agents lens: the graph as the F12 mock draws it. The SVG carries every node, ring, edge and face; a canvas under it carries only the particle streams. */
 .tv-agents { display: flex; flex-direction: column; gap: var(--sp-5); min-width: 0; }
-.tv-stage { position: relative; min-width: 0; overflow: hidden; background: var(--base); border: 1px solid var(--hair); border-radius: var(--r-md); }
+.tv-stage { position: relative; min-width: 0; max-height: min(60vh, 28rem); overflow: auto; overscroll-behavior: contain; background: var(--base); border: 1px solid var(--hair); border-radius: var(--r-md); }
 .tv-graph { position: relative; z-index: 1; display: block; width: 100%; height: auto; }
 /* a phone keeps the graph at a readable scale and pans it sideways (the svg and the particle canvas carry their own pixel width) */
-.tv-stage.tv-phone { overflow-x: auto; overflow-y: hidden; overscroll-behavior-x: contain; -webkit-overflow-scrolling: touch; }
+.tv-stage.tv-phone { overflow-x: auto; overflow-y: auto; overscroll-behavior: contain; -webkit-overflow-scrolling: touch; }
 .tv-stage.tv-phone .tv-graph { max-width: none; }
 .tv-particles { position: absolute; top: 0; left: 0; z-index: 0; pointer-events: none; color: var(--text); }
 :root[data-theme="light"] .tv-particles { color: var(--label); }
