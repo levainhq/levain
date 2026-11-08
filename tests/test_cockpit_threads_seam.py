@@ -160,3 +160,25 @@ def test_an_already_mounted_zone_is_torn_down_when_the_flag_arrives_late(tmp_pat
         ])
     first, second, hidden = out["values"][-3:]
     assert hidden is True and second == first, out["values"]     # the mounted view stopped, not just hid
+
+
+@needs_browser
+def test_the_zone_is_hidden_at_first_paint_and_shown_only_once_the_manifest_says_threads_are_on(tmp_path):
+    # the manifest read is held in the page (an init script wraps fetch) so the zone's first state is observable
+    hold = (f"localStorage.setItem('levain_write_token', {json.dumps(TOKEN)}); window.__held = 0; window.__go = null; "
+            "const real = window.fetch.bind(window); "
+            "window.fetch = (u, ...a) => { const s = String(u && u.url || u); "
+            "if (s.includes('/cockpit/manifest.json')) { window.__held++; return new Promise(r => { const prev = window.__go; "
+            "window.__go = () => { if (prev) prev(); r(real(u, ...a)); }; }); } return real(u, ...a); };")
+    _root, src, _ids = _install(tmp_path)
+    with _serve(src, write_token=TOKEN) as (base, _h):
+        out = _drive(tmp_path, base + "/", [
+            {"init": hold},
+            {"until": "document.querySelector('[data-zone=threads]') && window.__held >= 1"},
+            {"eval": "new Promise(r => setTimeout(() => r(document.querySelector('[data-zone=threads]').hidden), 400))"},
+            {"eval": "window.__go(); 1"},
+            {"until": "document.querySelector('[data-zone=threads]').hidden === false"},
+            {"eval": "document.querySelector('[data-zone=threads]').hidden"},
+        ])
+    before, after = out["values"][-4], out["values"][-1]
+    assert before is True and after is False, out["values"]      # hidden while the manifest is unread, shown once it says on

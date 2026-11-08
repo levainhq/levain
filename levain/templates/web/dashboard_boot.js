@@ -867,6 +867,13 @@
     window.dispatchEvent(new Event("levain:threads-off"));
   }
 
+  // the zone stays hidden until a read says threads are on (no flash before the manifest lands): both data sources call it
+  function markThreadsRead() {
+    if (document.body.dataset.threadsRead === "1") return;
+    document.body.dataset.threadsRead = "1";
+    window.dispatchEvent(new Event("levain:threads-off"));   // the zone's sync listens on this one event
+  }
+
   async function loadManifestView(passive) {
     const usedToken = storedToken();      // the credential this read goes out with: a decline drops that one, never a newer one
     let manifest = await authedReadJson("/cockpit/manifest.json");   // settles the token: panels do not re-prompt
@@ -874,6 +881,7 @@
     // would draw every action refused. Ask for the token now, then read again as that credential.
     const cred = manifest && manifest.credential;
     if (manifest && manifest.transport && manifest.transport.threads === false) markThreadsOff();
+    else if (manifest && manifest.transport) markThreadsRead();
     if (manifest && manifest.transport && typeof manifest.transport.owner_key === "boolean") tokenAuth = manifest.transport.owner_key ? "owner" : "pair";
     const wantsToken = !!(manifest && manifest.transport && manifest.transport.write_token_required === true
       && cred && cred.class === "none");
@@ -1012,7 +1020,7 @@
       // Track whether THIS surface demands the write token so commit()'s writeHeaders attaches it.
       // True on any writable surface (K2a), false on a read-only one.
       writeTokenRequired = view.write_token_required === true;
-      if (view.threads === false) markThreadsOff();
+      if (view.threads === false) markThreadsOff(); else markThreadsRead();
       // Gate the write transport on the substrate being writable (NO THEATER): a
       // read-only source (no install root → POST /edit 422s) renders with no edit
       // affordances at all, matching the server. An older payload without
@@ -1133,8 +1141,9 @@
 
   function sync() {
     const off = document.body.dataset.threads === "off";
-    const want = !off && !!token() && document.body.dataset.mode === "build" && document.visibilityState !== "hidden";
-    section.hidden = off || !token();
+    const read = document.body.dataset.threadsRead === "1";
+    const want = !off && read && !!token() && document.body.dataset.mode === "build" && document.visibilityState !== "hidden";
+    section.hidden = off || !read || !token();
     if (want && !view) {
       host.replaceChildren();
       const T = window.LevainCockpitTransport;
