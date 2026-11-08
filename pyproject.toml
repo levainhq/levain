@@ -177,7 +177,7 @@ openhands = ["openhands-sdk==1.26.0", "openhands-tools==1.26.0", "mcp>=1.27,<2"]
 # The S1 gateway's HTTP parser (`levain.broker.front`): h11, strict and sans-IO; 0.16.0 is the release that
 # fixes CVE-2025-43859, its one advisory. Only an isolation install runs the gateway.
 isolation = ["h11>=0.16.0"]
-dev = ["pytest>=7.4", "mcp>=1.27,<2", "h11>=0.16.0"]
+dev = ["pytest>=7.4", "mcp>=1.27,<2", "h11>=0.16.0", "pyyaml>=6"]
 
 [project.scripts]
 levain = "levain.launch:main"
