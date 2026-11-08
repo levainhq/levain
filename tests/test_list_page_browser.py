@@ -264,3 +264,77 @@ def test_the_list_fits_a_390_phone_with_real_shaped_rows(tmp_path: Path) -> None
     assert lev["pills"] in ([], ["levain"]), lev
     mention = next(r for t, r in by.items() if "HACK THE ECHO" in r["t"] or t.startswith("TALK"))
     assert mention["pills"] == [], mention                             # a row that only MENTIONS a repo wears no pill
+
+
+# --- listfix2 (levain 72, key 1108-34): one pill per row, one media listener, a lead word is an origin only if known -----------
+
+_MQ_SPY = ("(function(){const o=window.matchMedia.bind(window);window.__mqAdds=0;"
+           "window.matchMedia=function(q){const m=o(q);if(/max-width:\\s*720px/.test(q)){const a=m.addEventListener.bind(m);"
+           "m.addEventListener=function(t,f,c){window.__mqAdds++;return a(t,f,c);};}return m;};})()")
+
+_LISTFIX_PROBE = f"""(() => {{
+  const T = {TRAY}; const rows = [];
+  for (const row of T.querySelectorAll('.sp-results .row')) {{
+    const clause = row.querySelector('.clause');
+    const meta = row.querySelector('.list-meta') || row;
+    rows.push({{t: (clause ? clause.textContent : '').slice(0, 24), surface: row.dataset.surface || '',
+      pills: [...meta.querySelectorAll('.k7-repo')].map(p => p.textContent), all: row.querySelectorAll('.k7-repo').length}});
+  }}
+  return JSON.stringify({{rows}});
+}})()"""
+
+
+@needs_browser
+def test_listfix2_one_pill_one_listener_and_known_origins_only(tmp_path: Path) -> None:
+    from levain.consent.questions import QuestionStore
+
+    root, src, _ids = _install(tmp_path)
+    _seed_more(root)
+    _seed_phone(root)
+    qs = QuestionStore(default_queue_dir())
+    qs.file(agent="claude_code", agent_session_id="s3", what="note: call Alice about the thing on Friday",
+            options=[("ship", "Ship it"), ("hold", "Hold")], rec="hold", blocks="detail", cwd="/w/levain")
+    from datetime import date, timedelta
+    SporeStore(root / ".levain" / "memory.spores.json").add(type="task", text="plain domain row zz", domain="life", disposition="seed",
+                                                            next=(date.today() + timedelta(days=30)).isoformat())   # held: the path that draws a trailing chip
+    ph = f"{TRAY}.querySelector('.list-intake-input').placeholder"
+    with _serve(src, write_token=TOKEN, surface_tokens={"browser": TOKEN}, install_class="reported") as (url, _httpd):
+        out = _drive(tmp_path, f"{url}/", [
+            {"emulate": {"w": 390, "h": 844, "dpr": 3, "mobile": True}},
+            {"init": _MQ_SPY},
+            {"eval": "localStorage.setItem('levain.tray.showHeld', '1'); 1"},
+            *_reload(),
+            {"until": f"{TRAY} && {TRAY}.querySelectorAll('.sp-results .row[data-surface=band]').length > 1 && 1"},
+            {"eval": _LISTFIX_PROBE},
+            {"eval": "JSON.stringify({adds: window.__mqAdds})"},
+            # rebuild the List the way the page does on a refresh: the tab coming back
+            *[{"eval": "document.dispatchEvent(new Event('visibilitychange')); 1"} for _ in range(6)],
+            {"eval": "new Promise(r => setTimeout(() => r(1), 1500))"},
+            {"eval": "JSON.stringify({adds: window.__mqAdds})"},
+            {"eval": f"JSON.stringify({{ph: {ph}}})"},
+            {"emulate": {"w": 1000, "h": 844, "dpr": 1}},
+            {"until": f"{ph}.startsWith('@mon 9am call X  ') && 1"},
+            {"eval": f"JSON.stringify({{ph: {ph}}})"},
+            {"emulate": {"w": 390, "h": 844, "dpr": 3, "mobile": True}},
+            {"until": f"{ph} === '@mon 9am call X · ? talk Y' && 1"},
+        ])
+    vals = [json.loads(x) for x in out["values"] if isinstance(x, str) and x.startswith("{")]
+    rows = vals[0]["rows"]
+    by = {r["t"]: r for r in rows}
+    bad: list[str] = []
+    dom = next(r for r in rows if r["t"].startswith("plain domain row"))
+    if not (dom["pills"] == ["life"] and dom["all"] == 1):
+        bad.append(f"A: a domain row carries one chip, got {dom}")                # A: one chip, not two
+    note = next(r for t, r in by.items() if t.startswith("note:"))
+    if note["pills"] != []:
+        bad.append(f"C: 'note:' is no origin, got {note}")                         # C: a lead word counts only if known
+    for lead in ("desk", "levain"):
+        got = next(r for t, r in by.items() if t.startswith(lead + ":"))["pills"]
+        if got != [lead]:
+            bad.append(f"C: '{lead}:' should show {lead}, got {got}")
+    first, after = vals[1]["adds"], vals[2]["adds"]
+    if after != first:
+        bad.append(f"B: the media listener count grew {first} -> {after}")        # B: no listener per rebuild
+    assert vals[3]["ph"].startswith("@mon 9am call X · "), vals[3]                 # narrow at 390
+    assert vals[4]["ph"].startswith("@mon 9am call X  ·  "), vals[4]               # wide again after the width change
+    assert not bad, bad

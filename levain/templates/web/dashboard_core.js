@@ -2065,9 +2065,14 @@
     // A List row's pill names THAT ROW'S OWN origin: its repo, or the lowercase "<origin>:" its text leads with ("desk: ...",
     // "levain: ..."). Never the store the row sits in (the pointer already says that) and never a repo its words merely mention;
     // a row with no origin wears no pill. It leads the meta line, inline, so it wraps with the rest of it.
+    let originDrawn = false;
     if (s.surface) {
       const lead = /^([a-z][a-z0-9_-]{1,23}):\s/.exec(String(s.text || ""));
-      const origin = (typeof s.repo === "string" && s.repo) || (!foreign && typeof s.domain === "string" && s.domain) || (lead ? lead[1] : "");
+      // the lead word is an origin only when it is a repo this page already knows (the sky's registry) or "desk" / "flow":
+      // "note: call Alice" and "re: invoice" lead with a word, not an origin
+      const leadOrigin = lead && knownOrigin(lead[1]) ? lead[1] : "";
+      const origin = (typeof s.repo === "string" && s.repo) || (!foreign && typeof s.domain === "string" && s.domain) || leadOrigin;
+      originDrawn = !!origin;
       if (origin) { const pill = el("span", "k7-repo", String(origin)); pill.dataset.repoFacet = String(origin); pill.dataset.originPill = "1"; host.appendChild(pill); }
     }
     if (s.id && !foreign) { host.appendChild(el("span", "sid", s.id)); row.dataset.spore = String(s.id); }   // the Work lens finds a loop's row by this
@@ -2130,7 +2135,7 @@
     // Build's Open loops draw "open N d" and the repo chip under the title (cockpit.css hides both elsewhere)
     // the integer the kernel sends (the spore's own created date), never the badge words parsed back
     if (Number.isInteger(s.age_days) && s.age_days >= 0) host.appendChild(el("span", "k7-opend", "open " + s.age_days + " d"));
-    if (s.domain) { const rc = el("span", "k7-repo", String(s.domain)); rc.dataset.repoFacet = String(s.domain); host.appendChild(rc); }
+    if (s.domain && !originDrawn) { const rc = el("span", "k7-repo", String(s.domain)); rc.dataset.repoFacet = String(s.domain); host.appendChild(rc); }
     if (verbs && s.id) appendRowVerbs(row, buildSporeVerbs(s, panelKind), panelKind === "tray" ? ["Resolve", "Snooze"] : null, panelKind === "tray" ? 2 : 0);
     return row;
   }
@@ -2397,11 +2402,30 @@
     }
   }
   // A placeholder that must fit its box: the full words on a wide screen, a shorter line on a phone (re-chosen when the width crosses).
+  // ONE media listener for every such input, registered once: an input opts in by data-ph-wide / data-ph-narrow, and the
+  // listener sets every opted-in input still in the document (a rebuilt List leaves its old inputs out of it).
+  let phListening = false;
+  function phNarrow() { try { return typeof window.matchMedia === "function" && window.matchMedia("(max-width: 720px)").matches; } catch (e) { return false; } }
+  function setPlaceholders() {
+    const narrow = phNarrow();
+    for (const i of document.querySelectorAll("[data-ph-wide]")) i.placeholder = narrow ? i.getAttribute("data-ph-narrow") : i.getAttribute("data-ph-wide");
+  }
   function narrowPlaceholder(input, wide, narrow) {
-    const mq = typeof window.matchMedia === "function" ? window.matchMedia("(max-width: 720px)") : null;
-    const set = () => { input.placeholder = mq && mq.matches ? narrow : wide; };
-    set();
-    if (mq && mq.addEventListener) mq.addEventListener("change", set);
+    input.setAttribute("data-ph-wide", wide);
+    input.setAttribute("data-ph-narrow", narrow);
+    input.placeholder = phNarrow() ? narrow : wide;
+    if (!phListening && typeof window.matchMedia === "function") {
+      phListening = true;
+      try { const mq = window.matchMedia("(max-width: 720px)"); if (mq.addEventListener) mq.addEventListener("change", setPlaceholders); } catch (e) { /* the placeholder then keeps its first choice */ }
+    }
+  }
+  // an origin a List row's lead word may name: a repo the sky's registry knows, or "desk" / "flow"
+  function knownOrigin(word) {
+    const w = String(word).toLowerCase();
+    if (w === "desk" || w === "flow") return true;
+    const sky = window.LevainSky;
+    const names = sky && typeof sky.repos === "function" ? sky.repos() : [];
+    return names.some((n) => String(n).toLowerCase() === w);
   }
   function buildListIntake() {
     const box = el("div", "tray-dump list-intake");
