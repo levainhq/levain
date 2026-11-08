@@ -218,10 +218,28 @@ def test_j3_a_push_is_tapped_and_the_app_lands_on_the_pending_card(tmp_path: Pat
         assert posted == [sub["endpoint"]], posted                           # the push went to the stub, once, and nowhere else
         payload = json.loads(built[-1])
         assert payload["url"] == f"/?view=needs&item={NP_ID}" and isinstance(payload["ping"], int), payload
-        # Apple's declarative push: the worker stands down and the OS opens the push's own absolute `navigate` url. Its payload is the
-        # server's (declarative_payload on the same bytes), and that url, followed on this server, must land on the same card
-        decl = json.loads(sender.declarative_payload(built[-1], origin="https://box.example"))
+        # Apple's declarative push: the worker stands down and the OS opens the push's own absolute `navigate` url. Its bytes come from the
+        # production delivery: a second paired device on an Apple endpoint, the declarative switch on for it and the cockpit origin stored,
+        # then the same send; only the network post is stubbed, and the plaintext handed to the encryption is what is asserted
+        from levain.consent import cockpit_origin
+        from levain.webpush import declarative
+
+        apple_id, apple_tok = _pair(port, label="iPhone-apple")
+        apple_dev = f"paired-{apple_id}"                                     # the device name the push store files its subscription under
+        apple = {**_sub(2), "endpoint": "https://web.push.apple.com/journey2"}
+        assert _call(port, "POST", "/webpush/subscribe", apple, token=apple_tok)[0] == 200
+        assert cockpit_origin.write_origin(qdir, "https://box.example") is not None
+        declarative.set_device(qdir, apple_dev, True)
+        plain: list[bytes] = []
+        real_encrypt = sender.ece.encrypt
+        monkeypatch.setattr(sender.ece, "encrypt", lambda data, p256dh, auth: plain.append(data) or real_encrypt(data, p256dh, auth))
+        posted.clear()
+        sender.send(qdir, kind="attention", ref=NP_ID, title="Which retry policy?", body="the feed PR is waiting on you", url="/", device=apple_dev)
+        assert posted == [apple["endpoint"]], posted                         # to the Apple subscription only
+        assert len(plain) == 1, plain                                         # one subscription, one encryption
+        decl = json.loads(plain[0])
         assert decl["web_push"] == 8030 and decl["notification"]["navigate"] == "https://box.example" + payload["url"], decl
+        assert decl["url"] == payload["url"], decl                           # the legacy members stay beside it
         via = _drive(tmp_path, f"http://localhost:{port}{decl['notification']['navigate'].removeprefix('https://box.example')}#write_token={PUSH_T}", [
             PHONE, {"until": "document.querySelector('#levain-modal .needs-question') && 1", "ms": 30000},
             {"eval": "document.querySelector('#levain-modal .needs-q-title').textContent"}])
