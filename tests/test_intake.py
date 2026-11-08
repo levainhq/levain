@@ -12,7 +12,7 @@ import pytest
 from levain.intake import IntakeRefused, parse_intake, receipt, receipt_line
 
 VECTORS = Path(__file__).parent / "vectors" / "list_intake_vectors.json"
-VECTORS_SHA256 = "04cb93dded23889bd6a3f2dd5c4ab20047eb196fce8dc4d62312896af2d0b81b"
+VECTORS_SHA256 = "25b2e8ca3776689a4c0c3425eec57e7a9bd4ac61a9726638e763feeb5d965334"
 _DATA = json.loads(VECTORS.read_text(encoding="utf-8"))
 _NOW = datetime.fromisoformat(_DATA["now"])
 
@@ -69,3 +69,17 @@ def test_a_yearless_date_crosses_the_year_seam_and_a_written_year_does_not():
     assert parse_intake("@02-29 leap", datetime(2027, 3, 1, 12, 0))["when"] == "2028-02-29T09:00"
     with pytest.raises(IntakeRefused, match="not a calendar date"):
         parse_intake("@02-30 never", now)
+
+
+def test_a_bad_time_after_a_date_is_named_as_the_time_not_the_date():
+    """L3 r1 codex MED: a broad except swallowed the clock's own refusal and blamed the date."""
+    now = datetime(2026, 11, 8, 12, 0)
+    for line in ("@12-31 25:00 x", "@2027-12-31 25:00 x"):
+        with pytest.raises(IntakeRefused) as e:
+            parse_intake(line, now)
+        assert "not a calendar date" not in str(e.value), str(e.value)
+
+
+def test_a_leap_day_finds_the_next_leap_year():
+    assert parse_intake("@02-29 leap", datetime(2026, 11, 8, 12, 0))["when"] == "2028-02-29T09:00"
+    assert parse_intake("@02-29 leap", datetime(2028, 3, 1, 12, 0))["when"] == "2032-02-29T09:00"

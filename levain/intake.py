@@ -94,21 +94,21 @@ def _resolve_when(tokens, now):
     m = re.match(r"^(?:(\d{4})-)?(\d{1,2})-(\d{1,2})$", head)
     if m:
         month, dom = int(m.group(2)), int(m.group(3))
-        if m.group(1):          # a written year is held to: a past moment in it is refused below, never moved
-            years = [int(m.group(1))]
-        else:                   # no year: the next occurrence (Phill 2026-11-08, row 456 (a)), this year if still ahead
-            years = [now.year, now.year + 1]
-        last = None
+        # a written year is held to (a past moment in it is refused by the caller, never moved); no year means the next
+        # occurrence (Phill 2026-11-08, row 456 (a)): this year if still ahead, else the next year that has the date
+        # (a leap day can be up to 8 years off)
+        years = [int(m.group(1))] if m.group(1) else range(now.year, now.year + 9)
+        day = None
         for year in years:
             try:
-                last = with_clock(date(year, month, dom), 1)
+                day = date(year, month, dom)
             except ValueError:
                 continue
-            if last[0] > now:
-                return last
-        if last is None:
+            if m.group(1) or with_clock(day, 1)[0] > now:
+                break
+        if day is None:
             raise IntakeRefused(f"{tokens[0]!r} is not a calendar date")
-        return last
+        return with_clock(day, 1)
     raise IntakeRefused(f"cannot read {tokens[0]!r} as a time. Forms: HH:MM, 9am, tomorrow [time], mon..sun [time], "
                         f"MM-DD [time], YYYY-MM-DD [time], +30m, +2h, +3d (no time means {DEFAULT_DROP_HOUR:02d}:00)")
 

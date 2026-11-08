@@ -213,7 +213,11 @@
   },
   {
    "line": "@02-29 leap",
-   "refuse": true
+   "expect": {
+    "kind": "drop",
+    "when": "2028-02-29T09:00",
+    "text": "leap"
+   }
   },
   {
    "line": "@tomorrow 25:00 x",
