@@ -112,15 +112,16 @@ def test_the_section_bounds_the_parse_a_done_title_enters_done_and_a_coordinator
     assert gone.absent == ["levain:row-10"]
 
 
-def test_hold_matches_held_and_on_hold_in_any_case_as_whole_words_outside_the_history(board, tmp_path):
+def test_hold_is_uppercase_held_or_on_hold_in_any_case_as_whole_words_outside_the_history(board, tmp_path):
+    # The board marks a hold as uppercase HELD; a lowercase "held" is ordinary prose ("a held consent request").
     store, token = board
-    rows = [_row(5, "Lower thing", lead=" this one is held by Phill until Monday."),
+    rows = [_row(5, "Lower thing", lead=" a held consent request becomes one row."),
             _row(6, "Upheld thing", lead=" the earlier ruling was upheld and withheld nothing; beholden to none."),
-            _row(7, "Quiet thing", lead=" a plain lead."),
+            _row(7, "Quiet thing", lead=" the panel's N HELD BACK chip and the HELD BRANCHES list."),
             _row(8, "Mixed thing", lead=" it is on hold for the plan.")]
     rows[2] = rows[2].replace("[re-derived", "[re-derived HELD then freed;")
     status_import.import_status(store, token, _file(tmp_path, rows))
-    assert ready.item_facts(store, "levain:row-5")["hold"] == "this one is held by Phill until Monday."
+    assert ready.item_facts(store, "levain:row-5")["hold"] is None
     assert ready.item_facts(store, "levain:row-6")["hold"] is None
     assert ready.item_facts(store, "levain:row-7")["hold"] is None
     assert ready.item_facts(store, "levain:row-8")["hold"] == "it is on hold for the plan."
