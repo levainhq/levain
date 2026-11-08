@@ -88,11 +88,12 @@ INSTALL_SCRIPT = ('set -e; d="$1/keys/cred"; n="$2"; umask 077; '
 #: Remove ONLY the half-written file, and only when it is PROVABLY ours: stdin carries the exact bytes this run wrote, and the
 #: file is unlinked only if it is a regular file (not a link) equal to them. A ``.json.new`` that differs (another writer's
 #: in-progress update, a partial of ours, a planted link) is left in place and answered ``cred-foreign-new``, which the harness
-#: reports as a cleanup problem. Never ``<cred>.json``.
-REMOVE_NEW_SCRIPT = ('set -e; f="$1/keys/cred/$2.json.new"; e=$(mktemp); cat > "$e"; '
+#: reports as a cleanup problem. Never ``<cred>.json``. The temp copy of the credential is removed on every exit by the trap,
+#: including a ``set -e`` failure. Known edge: another writer's byte-identical ``.json.new`` reads as ours (cmp, then rm).
+REMOVE_NEW_SCRIPT = ('set -e; f="$1/keys/cred/$2.json.new"; e=$(mktemp); trap \'rm -f "$e"\' EXIT HUP INT TERM; cat > "$e"; '
                      'if [ ! -e "$f" ] && [ ! -L "$f" ]; then echo "cred-removed-new $2"; '
                      'elif [ ! -L "$f" ] && [ -f "$f" ] && cmp -s "$e" "$f"; then rm -f "$f"; echo "cred-removed-new $2"; '
-                     'else echo "cred-foreign-new $2"; fi; rm -f "$e"')
+                     'else echo "cred-foreign-new $2"; fi')
 #: ``$3`` is ``all`` (the credential and its half-written twin) or ``new`` (the twin only); prints ``cred-absent`` or ``cred-present``.
 VERIFY_SCRIPT = ('d="$1/keys/cred"; if [ "$3" = all ] && [ -e "$d/$2.json" ]; then echo "cred-present $2.json"; exit 0; fi; '
                  'if [ -e "$d/$2.json.new" ]; then echo "cred-present $2.json.new"; exit 0; fi; echo "cred-absent $2"')
