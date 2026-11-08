@@ -829,8 +829,7 @@ def test_the_fifth_push_state_is_none_without_a_delivery(tmp_path: Path) -> None
     assert receipts.PUSH_STATES == ("accepted", "no-answer", "gone", "refused", "none")
 
 
-def test_a_long_record_reports_without_since_in_bounded_time(tmp_path: Path, capsys) -> None:
-    n = 5000
+def _seed_long(tmp_path: Path, n: int) -> list[int]:
     phone(tmp_path, "https://fcm.googleapis.com/fcm/send/a", "a")
     phone(tmp_path, "https://web.push.apple.com/b", "b")
     phone(tmp_path, "https://updates.push.services.mozilla.com/c", "c")
@@ -847,16 +846,42 @@ def test_a_long_record_reports_without_since_in_bounded_time(tmp_path: Path, cap
                        for i, p in enumerate(ids) for d in ("a", "b") for k in ("received", "shown")])
         c.executemany("INSERT INTO opens (ping_id, device_id, at) VALUES (?,?,?)",
                       [(p, PAIRED_PREFIX + "a", _t(i % 600)) for i, p in enumerate(ids[::10])])
-    t0 = time.monotonic()
-    rep = receipts.build(s)                                  # no --since: every ping, more than any SQLite variable limit
-    took = time.monotonic() - t0
-    assert len(rep["pings"]) == n and all(len(p["devices"]) == 3 for p in rep["pings"])
-    roll = {r["device"]: r for r in rep["devices"]}
-    assert roll[PAIRED_PREFIX + "a"]["shown"] == n and roll[PAIRED_PREFIX + "c"]["received"] == 0
-    assert took < 10.0, took
-    t0 = time.monotonic()
-    rc, out = _cli(tmp_path, capsys=capsys)
-    assert rc == 0 and f"#{ids[-1]} " in out and time.monotonic() - t0 < 15.0
+    return ids
+
+
+def test_a_long_record_reports_without_since_in_a_statement_count_independent_of_its_length(tmp_path: Path, capsys, monkeypatch) -> None:
+    """Guards: ``receipts.build`` with no --since reads the whole record in a fixed number of set-based queries, never one per
+    ping (and never an ``IN (?, ?, ...)`` past SQLite's variable limit). Measured as SQL statements executed, not seconds:
+    a wall-clock bound fails on a loaded runner (25 s, 10.5 s) and says nothing about the shape."""
+    executed: list[str] = []
+    real = PushStore._connect
+
+    def counting(self):
+        conn = real(self)
+        conn.set_trace_callback(executed.append)
+        return conn
+
+    monkeypatch.setattr(PushStore, "_connect", counting)
+    got: dict[int, tuple[int, int]] = {}
+    for n in (500, 5000):
+        d = tmp_path / f"n{n}"
+        d.mkdir()
+        ids = _seed_long(d, n)
+        s = PushStore(d)
+        executed.clear()
+        t0 = time.monotonic()
+        rep = receipts.build(s)                              # no --since: every ping, more than any SQLite variable limit
+        build_stmts = len(executed)
+        assert len(rep["pings"]) == n and all(len(p["devices"]) == 3 for p in rep["pings"])
+        roll = {r["device"]: r for r in rep["devices"]}
+        assert roll[PAIRED_PREFIX + "a"]["shown"] == n and roll[PAIRED_PREFIX + "c"]["received"] == 0
+        executed.clear()
+        rc, out = _cli(d, capsys=capsys)
+        assert rc == 0 and f"#{ids[-1]} " in out
+        got[n] = (build_stmts, len(executed))
+        assert time.monotonic() - t0 < 120.0                 # a hang backstop only; the bound is the count below
+    assert got[500] == got[5000], got
+    assert 0 < got[5000][0] <= 20 and 0 < got[5000][1] <= 40, got
 
 
 # --- the command -----------------------------------------------------------------------------------------------------
