@@ -488,14 +488,19 @@ class Meter:
     def spent_by_provider_if_present(self) -> dict[str, dict[str, tuple[int, int]]]:
         """Counted calls per provider and period, read-only and creating nothing: ``{provider: {"day": (calls, micros),
         "month": (calls, micros)}}``. Same rows and periods as :meth:`spent_if_present` (reserved and ok, never released);
-        a missing ledger is ``{}``. Feeds the panel's per-provider readout; an estimate like every figure here."""
+        a missing ledger is ``{}``. An estimate like every figure here. See :meth:`snapshot_if_present`."""
+        return self.snapshot_if_present()[1]
+
+    def snapshot_if_present(self) -> tuple[Spend, dict[str, dict[str, tuple[int, int]]]]:
+        """The totals AND the per-provider rows from ONE clock read and ONE statement, so the two always agree: the totals
+        are the sum of the rows. Read-only, creates nothing (a missing ledger is zero and ``{}``); a symlink or a file
+        that is not a ledger is a :class:`MeterError`."""
         now = self._clock()
-        _m0, _m1, _d0, _d1 = self._periods(now)
+        m0, m1, d0, d1 = self._periods(now)
         if os.path.islink(self.path):
             raise MeterError(f"voice ledger {self.path} is a symlink")
         if not self.path.exists():
-            return {}
-        m0, m1, d0, d1 = _m0, _m1, _d0, _d1
+            return Spend(0, 0, m0, d0, self.prices.as_of), {}
         try:
             uri = self.path.resolve().as_uri() + "?mode=ro"
             with closing(sqlite3.connect(uri, uri=True, timeout=_BUSY_WAIT_S, isolation_level=None)) as conn:
@@ -507,7 +512,10 @@ class Meter:
                     "COALESCE(SUM(CASE WHEN at >= ? AND at < ? THEN cost_micros ELSE 0 END), 0) "
                     f"FROM calls WHERE {_COUNTED} AND at >= ? AND at < ? GROUP BY provider",
                     (d0, d1, d0, d1, m0, m1)).fetchall()
-            return {r[0]: {"month": (r[1], r[2]), "day": (r[3], r[4])} for r in rows}
+            by = {r[0]: {"month": (r[1], r[2]), "day": (r[3], r[4])} for r in rows}
+            month = sum(v["month"][1] for v in by.values())
+            day = sum(v["day"][1] for v in by.values())
+            return Spend(month, day, m0, d0, self.prices.as_of), by
         except sqlite3.Error as exc:
             failed = type(exc).__name__
         raise MeterError(f"the voice ledger could not be read: {failed}")
