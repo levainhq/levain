@@ -144,7 +144,7 @@ def test_send_writes_the_drop_through_the_one_route_clears_the_box_and_says_what
                       {"eval": after}, _shot(tmp_path, "1280_sent")])
     a = _tagged(out)["after"]
     assert a["box"] == "" and a["focused"] is True, a
-    assert a["receipt"].startswith("Sent to the coordinator: “tell the coordinator: land c-12”"), a
+    assert a["receipt"].startswith("Sent to the desk: “tell the coordinator: land c-12”"), a
     assert len(a["rows"]) == 1 and "tell the coordinator: land c-12" in a["rows"][0] and "unsigned" in a["rows"][0], a   # read back from the store
     assert len(out["posts"]) == 1 and out["posts"][0].startswith("/cockpit/coord/drop "), out["posts"]                   # the sheet's route, once
     sent = json.loads(out["posts"][0].split(" ", 1)[1])
@@ -156,7 +156,7 @@ def test_send_writes_the_drop_through_the_one_route_clears_the_box_and_says_what
 @needs_ssh
 def test_add_an_envelope_opens_the_drop_sheet_with_the_typed_words(tmp_path: Path, monkeypatch) -> None:
     rig = FullRig(tmp_path, monkeypatch)
-    frame = "document.querySelector('#levain-sign-sheet-frame, iframe[title=\"coordinator drop\"]')"
+    frame = "document.querySelector('#levain-sign-sheet-frame, iframe[title=\"desk drop\"]')"
     inner = f"(() => {{ const f = {frame}; const d = f && f.contentDocument; return d && d.getElementById('drop-words') ? d.getElementById('drop-words').value : null; }})()"
     with rig.serving():
         out = _drive(tmp_path, f"{rig.origin}/#write_token={TOK}",
@@ -333,7 +333,7 @@ def test_a_repeated_send_press_over_a_slow_reply_files_one_drop_and_leaves_the_b
     posted = _posted(out)
     end = _tagged(out)["end"]
     assert len(posted) == 1 and posted[0]["words"] == "one drop only", out["posts"]      # the press repeated past the reply filed nothing more
-    assert end["box"] == "" and end["receipt"].startswith("Sent to the coordinator: “one drop only”"), end
+    assert end["box"] == "" and end["receipt"].startswith("Sent to the desk: “one drop only”"), end
 
 
 @needs_browser
@@ -365,7 +365,7 @@ def test_words_edited_after_a_lost_reply_are_a_new_drop_not_the_old_id(tmp_path:
 @needs_ssh
 def test_a_signed_drop_from_the_sheet_shows_in_the_hero_at_once_not_after_the_read_cache(tmp_path: Path, monkeypatch) -> None:
     rig = FullRig(tmp_path, monkeypatch)
-    frame = "document.querySelector('#levain-sign-sheet-frame, iframe[title=\"coordinator drop\"]')"
+    frame = "document.querySelector('#levain-sign-sheet-frame, iframe[title=\"desk drop\"]')"
     click_in = f"(() => {{ const f = {frame}; const d = f && f.contentDocument; const b = d && d.getElementById('drop-send'); if (!b || b.disabled) return 0; d.getElementById('drop-words').value = 'from the sheet'; b.click(); return 1; }})()"
     steps = [{"emulate": {"w": 1280, "h": 900, "dpr": 1}}, {"until": NEEDS, "ms": 30000}, {"until": READY, "ms": 30000},
              {"eval": "document.querySelector('#ck-drop [data-coord-drop=envelope]').click(); 1"}, {"until": click_in, "ms": 30000}, {"posts": 1, "ms": 15000},
@@ -535,7 +535,7 @@ def test_the_sheets_reload_message_reads_the_drops_again_not_from_the_cache(tmp_
     rig = FullRig(tmp_path, monkeypatch)
     count = ("(() => { const f = window.fetch; window.__gets = 0; window.fetch = function (u, o) { const url = typeof u === 'string' ? u : (u && u.url) || '';"
              " if (url.indexOf('/cockpit/coord/drops.json') >= 0) window.__gets++; return f.apply(this, arguments); }; })();")
-    msg = ("(() => { const fr = document.querySelector('#levain-sign-sheet-frame, iframe[title=\"coordinator drop\"]'); window.__before = window.__gets;"
+    msg = ("(() => { const fr = document.querySelector('#levain-sign-sheet-frame, iframe[title=\"desk drop\"]'); window.__before = window.__gets;"
            " window.dispatchEvent(new MessageEvent('message', {data: {levainSheet: 'reload'}, origin: location.origin, source: fr.contentWindow})); return 1; })()")
     steps = [{"emulate": {"w": 1280, "h": 900, "dpr": 1}}, {"init": count}, {"until": NEEDS, "ms": 30000}, {"until": READY, "ms": 30000},
              {"eval": "window.LevainSignSheet.openDrop(''); 1"}, {"eval": msg}, {"eval": "new Promise(r => setTimeout(r, 700)).then(() => 1)"},
@@ -568,7 +568,7 @@ def test_restored_words_fill_the_hero_box_with_no_height_script(tmp_path: Path, 
 @needs_ssh
 def test_words_handed_to_the_sheet_grow_its_box_where_the_browser_has_no_field_sizing(tmp_path: Path, monkeypatch) -> None:
     rig = FullRig(tmp_path, monkeypatch)
-    frame = "document.querySelector('#levain-sign-sheet-frame, iframe[title=\"coordinator drop\"]')"
+    frame = "document.querySelector('#levain-sign-sheet-frame, iframe[title=\"desk drop\"]')"
     box = f"({frame} && {frame}.contentDocument && {frame}.contentDocument.getElementById('drop-words'))"
     steps = [{"emulate": {"w": 1280, "h": 900, "dpr": 1}}, {"init": NO_FIELD_SIZING}, {"until": NEEDS, "ms": 30000}, {"until": READY, "ms": 30000},
              {"eval": f"window.LevainSignSheet.openDrop({json.dumps(LONG)}); 1"}, {"until": f"{box} && {box}.value.length > 100", "ms": 30000},
@@ -629,7 +629,7 @@ def test_one_malformed_kept_entry_hides_neither_valid_pending_drop_and_a_bare_tw
 @needs_ssh
 def test_the_sheet_restores_a_valid_kept_drop_past_a_malformed_entry(tmp_path: Path, monkeypatch) -> None:
     rig = FullRig(tmp_path, monkeypatch)
-    frame = "document.querySelector('#levain-sign-sheet-frame, iframe[title=\"coordinator drop\"]')"
+    frame = "document.querySelector('#levain-sign-sheet-frame, iframe[title=\"desk drop\"]')"
     box = f"({frame} && {frame}.contentDocument && {frame}.contentDocument.getElementById('drop-words'))"
     steps = [{"emulate": {"w": 1280, "h": 900, "dpr": 1}}, {"init": BAD_FIRST + _seed(OLDER)}, {"until": NEEDS, "ms": 30000}, {"until": READY, "ms": 30000},
              {"eval": "window.LevainSignSheet.openDrop(''); 1"}, {"until": f"{box} && {box}.value === 'older kept'", "ms": 30000},

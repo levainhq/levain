@@ -1,4 +1,4 @@
-"""The Coordinator panel's Start, Stop and Hold (C10 S3): downstream panel verbs over the real coordinator store, a fake
+"""The Desk panel's Start, Stop and Hold (C10 S3): downstream panel verbs over the real coordinator store, a fake
 ``claude`` on PATH recording every call (no test here runs the real one, a real serve loop, the watcher thread or a
 browser). The verbs are fired directly and through a real cockpit server that registers them."""
 from __future__ import annotations
@@ -158,7 +158,7 @@ def test_start_in_backoff_or_stopped_says_the_panels_why_and_writes_nothing(stor
     with pytest.raises(EditError) as ei:
         _fire(v, START_VERB)
     assert (ei.value.code, ei.value.http_status) == ("refused", 409)
-    assert str(ei.value) == f"{word}: {why}" and row == f"Coordinator: {word}: {why}"   # the panel's own line
+    assert str(ei.value) == f"{word}: {why}" and row == f"Desk: {word}: {why}"   # the panel's own line
     assert ei.value.extra == {"state": word, "why": why}
     assert _snapshot(qdir) == before and len(fake.spawns()) == spawns and called == []
 
@@ -443,7 +443,7 @@ def test_a_caller_cannot_take_a_coordinator_verbs_name(store, qdir, tmp_path):
 
     _root, src, _ids = _install(tmp_path)
     mine = status_verbs(lambda: qdir)
-    with pytest.raises(ValueError, match="those names are the Coordinator panel's verbs"):
+    with pytest.raises(ValueError, match="those names are the Desk panel's verbs"):
         with _serve(src, surface_tokens={"browser": "T"}, install_class="reported", extra_verbs={START_VERB: mine[START_VERB]},
                     coordinator_verbs=True):
             pass

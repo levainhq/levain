@@ -141,6 +141,26 @@ def test_a_profile_refusal_removes_what_the_mint_made_and_writes_no_row(rig):
     assert list(rig.lanes.iterdir()) == [] and list(rig.returns.iterdir()) == [] and sl.read_mints(rig.key_dir) == []
 
 
+def test_a_source_tracking_a_nested_activation_launches_with_it_read_only(rig):
+    """Phill 11-07 (np-4f771671 a): the launch passes its base sha to the builder, so a tracked nested activation/ (as
+    levain's own templates/activation) launches with the directory in denyWrite and the file-tool deny rules."""
+    rig.sign_lease()
+    src = rig.tmp / "withact"
+    (src / "pkg" / "activation").mkdir(parents=True)
+    _git(src, "init", "-q")
+    (src / "pkg" / "activation" / "posture.md").write_text("p\n")
+    _git(src, "add", "-A")
+    _git(src, "commit", "-q", "-m", "x")
+    sha = _git(src, "rev-parse", "HEAD")
+    plan = sl.prepare_launch("lane-act", str(src), sha, claude_bin=rig.claude, python=sys.executable,
+                             cockpit_root=rig.world.root, install=rig.tmp,
+                             now=rig.world.clock.now + timedelta(minutes=1), managed=())
+    act = Path(plan.profile.clone) / "pkg" / "activation"
+    assert str(act) in plan.profile.settings["sandbox"]["filesystem"]["denyWrite"]
+    assert "Edit(pkg/activation/**)" in plan.profile.settings["permissions"]["deny"]
+    assert plan.mint["base_sha"] == sha and plan.mint["profile_digest"] == plan.profile.digest()
+
+
 def test_validate_launch_prints_the_argv_and_digest_and_never_executes(rig, monkeypatch):
     rig.sign_lease()
     for name in ("execv", "execvp", "execve", "execvpe"):
@@ -276,3 +296,35 @@ def test_levain_seat_canary_passes_its_own_flags_through(monkeypatch):
     assert cli.main(["seat", "canary", "--claude-bin", "/x/claude", "--swap-attempts", "3"]) == 0
     assert cli.main(["seat", "canary", "-h"]) == 0
     assert seen == [["--claude-bin", "/x/claude", "--swap-attempts", "3"], ["-h"]]
+
+
+def test_a_launch_with_no_egress_grant_denies_the_real_token_directory_and_points_levain_gh_at_the_real_home(
+        rig, monkeypatch):
+    """L3 z2b r1 HIGH. Revert: ``prepare_launch`` passing ``levain_home`` only under an egress grant (the MCP config
+    then names the canary home under $TMPDIR and the real ``seat_gh`` is not denied), or the ``real_home`` member of
+    ``gh_dirs`` in ``build_seat_profile``."""
+    home = rig.tmp / "real-levain-home"
+    home.mkdir()
+    monkeypatch.setenv("LEVAIN_HOME", str(home))
+    rig.sign_lease()
+    plan = rig.launch()
+    real_gh = str(Path(os.path.realpath(home)) / "seat_gh")
+    s = plan.profile.settings
+    assert real_gh in s["sandbox"]["filesystem"]["denyRead"]
+    assert f"Read(//{real_gh.lstrip('/')}/**)" in s["permissions"]["deny"]
+    args = plan.profile.mcp_config["mcpServers"]["levain_gh"]["args"]
+    assert args[args.index("--home") + 1] == str(Path(os.path.realpath(home)))
+    assert not any("levain-seat-canary" in d for d in s["sandbox"]["filesystem"]["denyRead"])
+
+
+def test_a_lease_profile_without_the_levain_home_refuses(rig):
+    """Revert: the ``lease is not None and levain_home is None`` problem in ``build_seat_profile``."""
+    from levain import seat_profile as sp
+    lane, ret = rig.tmp / "lanes" / "x", rig.tmp / "returns" / "x"
+    (lane / ".git").mkdir(parents=True)
+    ret.mkdir(parents=True)
+    lease = {"kind": sp.SEAT_LEASE_KIND, "agent": "claude_code", "lanes_parent": str(rig.tmp / "lanes"),
+             "returns_parent": str(rig.tmp / "returns")}
+    with pytest.raises(SeatRefusal, match="needs the levain home"):
+        sp.build_seat_profile(lane, ret, claude_bin=rig.claude, python=sys.executable, lease=lease,
+                              key_dir=rig.key_dir, managed=())

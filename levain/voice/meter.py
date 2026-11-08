@@ -134,7 +134,7 @@ class PriceTable:
         return None
 
 
-PRICES_AS_OF = "2026-11-05"
+PRICES_AS_OF = "2026-11-07"
 
 # List prices as the vendors' pages printed them on PRICES_AS_OF. Not here on purpose: OpenAI's gpt-4o-mini-tts, which is
 # priced per token with no per-character or per-minute figure to convert, so it is refused as unpriced until someone
@@ -146,10 +146,14 @@ DEFAULT_PRICES = PriceTable(
         PriceEntry("openai", "tts", "tts-1", micros=15_000_000, per=1_000_000),          # $15 / 1M characters
         PriceEntry("openai", "tts", "tts-1-hd", micros=30_000_000, per=1_000_000),       # $30 / 1M characters
         PriceEntry("openai", "stt", "gpt-4o-mini-transcribe", micros=3_000, per=60),     # $0.003 / minute
+        # https://developers.openai.com/api/docs/pricing, read 2026-11-07: gpt-live-transcribe, estimated per minute
+        PriceEntry("openai", "stt", "gpt-live-transcribe", micros=17_000, per=60),       # $0.017 / minute
         PriceEntry("elevenlabs", "tts", "eleven_flash_v2_5", micros=40_000, per=1_000),  # $0.04 / 1K characters
         PriceEntry("elevenlabs", "stt", "scribe", micros=220_000, per=3_600),            # $0.22 / hour
         PriceEntry("deepgram", "tts", "aura-2", micros=30_000, per=1_000),               # $0.030 / 1K characters
         PriceEntry("deepgram", "stt", "nova-3", micros=4_300, per=60),                   # $0.0043 / minute, pre-recorded
+        # https://deepgram.com/pricing, read 2026-11-08: Nova-3 Monolingual pay-as-you-go, Streaming $0.0077 / min
+        PriceEntry("deepgram", "stt", "nova-3-stream", micros=7_700, per=60),            # $0.0077 / minute, live WebSocket
         # https://inworld.ai/pricing, read 2026-11-05: Realtime TTS-2 Flash on the On-Demand plan, per 1M characters
         PriceEntry("inworld", "tts", "inworld-tts-2-flash", micros=15_000_000, per=1_000_000),   # $15 / 1M characters
     ),
@@ -389,6 +393,40 @@ class Meter:
         """The call went out: the reserved row stays counted. True when a reserved row was moved, False when the id is
         unknown or already ended (so a second settle changes nothing)."""
         return self._end(reservation_id, "UPDATE calls SET status = 'ok' WHERE id = ? AND status = 'reserved'")
+
+    def settle_actual(self, reservation_id: int, units: int) -> bool:
+        """The call went out and ran for ``units`` (a streamed session's actual seconds): the reserved row stays counted
+        at the cost of ``units``, priced at no less than one unit, and never above what was reserved (a zero-unit
+        reservation counts as the one unit :meth:`reserve` priced it at), so a reservation is a ceiling that settling
+        can only lower. True when a reserved row was moved, False when the id is unknown or
+        already ended. A row whose model the table no longer prices keeps its reserved cost."""
+        if isinstance(units, bool) or not isinstance(units, int) or units < 0:
+            raise MeterError(f"units must be a non-negative int, got {units!r}")
+        try:
+            with closing(self._connect()) as conn:
+                conn.execute("BEGIN IMMEDIATE")
+                try:
+                    row = conn.execute("SELECT provider, use, model, units, cost_micros FROM calls "
+                                       "WHERE id = ? AND status = 'reserved'", (reservation_id,)).fetchone()
+                    if row is None:
+                        conn.execute("ROLLBACK")
+                        return False
+                    provider, use, model, reserved_units, reserved_cost = row
+                    entry = self.prices.find(provider, use, model)
+                    # the ceiling is what reserve PRICED: a zero-unit reservation was priced at one unit
+                    final_units = (min(max(units, 1), max(reserved_units, 1)) if entry is not None
+                                   else reserved_units)
+                    cost = min(entry.cost(final_units), reserved_cost) if entry is not None else reserved_cost
+                    conn.execute("UPDATE calls SET status = 'ok', units = ?, cost_micros = ? WHERE id = ?",
+                                 (final_units, cost, reservation_id))
+                    conn.execute("COMMIT")
+                    return True
+                except BaseException:
+                    _rollback(conn)
+                    raise
+        except sqlite3.Error as exc:
+            failed = type(exc).__name__
+        raise MeterError(f"the voice ledger could not be used: {failed}")
 
     def release(self, reservation_id: int) -> bool:
         """The call failed before anything was served: the row stops counting and its cost reads zero. A call that

@@ -462,10 +462,14 @@ def prepare_launch(lane_key: str, remote_url: str, base_sha: str, *, claude_bin:
                 egress = seat_push.live_egress(state, clock())
             except seat_push.SeatPushRefused as exc:
                 raise SeatLaunchRefused(str(exc)) from None
-        if egress is not None:
-            profile_kw = {"cockpit_root": cockpit_root, "levain_home": Path(os.path.abspath(_levain_home())), **profile_kw}
+        # the levain home ALWAYS (L3 z2b r1 HIGH): the profile denies its read-token directory to the seat and the
+        # levain_gh server reads it, with or without an egress grant; the cockpit root only the egress hook reads
+        profile_kw = {"levain_home": Path(os.path.abspath(_levain_home())),
+                      **({"cockpit_root": cockpit_root} if egress is not None else {}), **profile_kw}
+        # base_sha: a directory git tracks at this commit under a TRACKED_EXEMPT_NAMES name launches read-only
+        # instead of refusing (levain's own templates/activation, Phill 11-07)
         profile = build_seat_profile(clone, return_dir, claude_bin=claude_bin, python=python, lease=lease,
-                                     key_dir=key_dir, egress=egress, **profile_kw)
+                                     key_dir=key_dir, egress=egress, base_sha=base_sha, **profile_kw)
         row = {**row, "profile_digest": profile.digest(), "claude": _binary_ident(claude_bin),
                "egress_grant": None if egress is None else egress["id"]}
         mint = append_mint(key_dir, row)
@@ -500,8 +504,8 @@ def validate_launch(lane_key: str, remote_url: str, base_sha: str, *, claude_bin
     clean them). Checked: the lease is live and pins the launcher key, the lane key / base / remote are well formed,
     the lane's two roots do not exist yet, the source answers ``git ls-remote``, the egress grant (if any) is readable,
     the prompt (when given) and the profile builds, from two throwaway directories under the lease's parents that are
-    removed again. NOT checked: the base commit is in the source and the clone holds no agent-config target (both need
-    the clone; the real launch refuses them). Writes no mint row. Returns 0, or 1 with the refusal on ``err``."""
+    removed again. NOT checked: the base commit is in the source and the clone holds no agent-config target, nor which
+    tracked directories the real launch exempts read-only (all need the clone; the real launch decides them). Writes no mint row. Returns 0, or 1 with the refusal on ``err``."""
     import tempfile
     out, err = out or sys.stdout, err or sys.stderr
     clock = (lambda: now) if now is not None else (lambda: datetime.now(timezone.utc))
@@ -530,8 +534,10 @@ def validate_launch(lane_key: str, remote_url: str, base_sha: str, *, claude_bin
                 egress = seat_push.live_egress(state, clock())
             except seat_push.SeatPushRefused as exc:
                 raise SeatLaunchRefused(str(exc)) from None
-        if egress is not None:
-            profile_kw = {"cockpit_root": cockpit_root, "levain_home": Path(os.path.abspath(_levain_home())), **profile_kw}
+        # the levain home ALWAYS (L3 z2b r1 HIGH): the profile denies its read-token directory to the seat and the
+        # levain_gh server reads it, with or without an egress grant; the cockpit root only the egress hook reads
+        profile_kw = {"levain_home": Path(os.path.abspath(_levain_home())),
+                      **({"cockpit_root": cockpit_root} if egress is not None else {}), **profile_kw}
         for parent in (lanes, returns):
             made.append(Path(tempfile.mkdtemp(prefix=".dry-run-", dir=parent)))
         os.mkdir(made[0] / ".git", 0o700)   # a clone's own .git, which the profile requires to be a real directory

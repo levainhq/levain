@@ -1077,13 +1077,13 @@
     section.hidden = true;
     const head = el("div", "zone-head");
     head.appendChild(el("div", "zone-title", "Threads"));
-    head.appendChild(el("span", "zone-gloss", "what each coordinator thread said, in the order it happened"));
+    head.appendChild(el("span", "zone-gloss", "what each desk thread said, in the order it happened"));
     section.appendChild(head);
     const grid = el("div", "ck-zgrid th-grid");
     const panel = el("div", "panel k-list th-panel");
     panel.dataset.modes = "build";   // dashboard.css hides a zone whose panel names no tab for the current mode
     const ph = el("div", "phead");
-    ph.appendChild(el("h2", null, "Coordinator threads"));
+    ph.appendChild(el("h2", null, "Desk threads"));
     panel.appendChild(ph);
     host = el("div", "pbody th-body");
     panel.appendChild(host);

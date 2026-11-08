@@ -435,11 +435,13 @@ def test_a_collapsed_loops_card_is_expanded_through_its_own_control_and_the_row_
 def test_a_card_that_will_not_unfold_lights_nothing_and_says_false(tmp_path, monkeypatch):
     root, src = _sessions_fixture(tmp_path, monkeypatch)
     _spore(root)
+    # ONE synchronous eval: the fold click schedules a 60 ms ckRefreshAll, whose layoutControls re-enables the button; disabling it in
+    # a later step let a loaded runner's refresh undo it (CI flake), so disable and go() share one task, before any refresh can run.
     out = _to_work(tmp_path, src, [
-        {"eval": LOOPS + ".querySelector('.ck-lay-fold').click(); " + LOOPS + ".querySelector('.ck-lay-fold').disabled = true; 1"},
-        {"eval": "JSON.stringify([window.LevainLoops.go(" + PAGE_ROW + ".dataset.spore), " + LOOPS + ".classList.contains('ck-collapsed'), "
+        {"eval": LOOPS + ".querySelector('.ck-lay-fold').click(); " + LOOPS + ".querySelector('.ck-lay-fold').disabled = true; "
+                 "JSON.stringify([window.LevainLoops.go(" + PAGE_ROW + ".dataset.spore), " + LOOPS + ".classList.contains('ck-collapsed'), "
                  + PAGE_ROW + ".classList.contains('tv-lit')])"}])
-    assert json.loads(out[1]) == [False, True, False], out
+    assert json.loads(out[0]) == [False, True, False], out
 
 
 @needs_browser

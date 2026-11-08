@@ -105,10 +105,12 @@ class KeyedStub(Stub):
         return Usage(None, None, None, "stub:no-record")
 
 
-def _occurrence(rig: Rig, *, billing="api_key", exposure=EXP, micros=100_000, role=None, name=None, memory=None):
+def _occurrence(rig: Rig, *, billing="api_key", exposure=EXP, micros=100_000, role=None, name=None, memory=None,
+                link_role_hash=None):
     """A launched occurrence of a ``session`` role agent: its reservation carries ``billing``'s caps (``exposure``
     on a subscription, ``micros`` on an api_key run); its spec pins ``role`` (default ROLE) and is signed under
-    ``name`` and ``memory`` when given (default the fixture's own)."""
+    ``name`` and ``memory`` when given (default the fixture's own). The link names the role the spec pins, unless
+    ``link_role_hash`` forges another (a hand-authored link: L3 W2 r1 HIGH)."""
     d = copy.deepcopy(SPECS["job_feeder_downstream"])
     d["role"]["role_hash"] = role_hash(ROLE if role is None else role)
     if name is not None:
@@ -118,8 +120,10 @@ def _occurrence(rig: Rig, *, billing="api_key", exposure=EXP, micros=100_000, ro
     agent, spec_hash, *_ = register_spec(rig.store, parse_spec(d), "America/New_York")
     rig.n += 1
     over = SUB if billing == "subscription" else {}
+    pinned = d["role"]["role_hash"] if link_role_hash is None else link_role_hash
     rig.world.link({"op": "create_grant", "grant": link_record(rig.world, rig.n, agent=agent, store=rig.sid,
-                                                              spec_hash=spec_hash, binding_id=BINDING, **over)},
+                                                              spec_hash=spec_hash, role_hash=pinned, binding_id=BINDING,
+                                                              **over)},
                    "laptop")
     with rig.store.write() as c:
         oid, outcome = ctl.claim(c, agent_id=agent, kind="manual", key="s", spec_hash=spec_hash, binding_id=BINDING,

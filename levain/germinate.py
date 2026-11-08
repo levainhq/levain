@@ -38,7 +38,8 @@ filed raises ``DropConflict`` on every run (his new words are never silently dro
 re-labelled), until he resolves it by hand. A band row already filed keeps its first ``what`` text if the spore is
 edited before the stamp. A nudge whose ping can never succeed (no channel) stays open and errors each run; the band row
 is still there. Two due spores naming the same open ``q-…`` both adopt it. ``--dry-run`` reads the spore store through
-anneal's ``list_open``, which backfills a missing ``origin_key`` on a legacy file. The default ``--agent`` is
+``levain.spores.list_open_readonly``, which does not backfill a missing ``origin_key`` (a keyless row gets a temporary
+in-memory key). The default ``--agent`` is
 ``claude_code`` (a Codex install passes ``--agent codex``). An empty-text spore cannot exist (anneal refuses it). The
 band row's ``Due MM-DD`` carries no year.
 

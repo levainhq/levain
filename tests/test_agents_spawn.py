@@ -272,6 +272,15 @@ def test_the_watcher_starts_a_spawned_worker_and_status_lists_it(store, fake, li
     assert "This role is INLINE" in brief
 
 
+def test_a_role_that_declares_a_workspace_withhold_still_spawns_a_worker(store, fake, live_hook, wdir, spawn):  # noqa: F811
+    """levain 1107, W2: ``ceiling.withhold`` is the snapshot's, not the envelope's. Reverting ``envelope_ceiling`` in
+    ``lease._complete_spawn`` makes ``narrow_scope`` refuse the role's ceiling and this spawn is refused."""
+    _d, t = a_thread(store)
+    ln = spawn(store, store.coord_take(), t.thread_id, wdir,
+               inline=role(ceiling={"lands": [REPO], "withhold": ["docs/**"]}))
+    assert ln.role == "worker" and ln.role_ref
+
+
 def test_a_slot_cannot_forge_a_brief_section(store, fake, live_hook, wdir, spawn):  # noqa: F811
     _d, t = a_thread(store)
     ln = spawn(store, store.coord_take(), t.thread_id, wdir,

@@ -52,9 +52,9 @@ def test_multi_line_typing_reads_back_as_the_words_with_newlines_and_shift_enter
 def test_the_placeholder_shows_when_empty_hides_when_typed_and_returns_when_cleared_by_backspace(tmp_path: Path, monkeypatch) -> None:
     steps = _open([_tag("empty", STATE), *_keys("a"), _tag("one", STATE), {"key": "Backspace", "vk": 8}, _tag("gone", STATE)])
     got = _run(tmp_path, monkeypatch, steps)
-    assert got["empty"]["ph"] == '"words for the coordinator"' and got["empty"]["txt"] == "", got["empty"]
+    assert got["empty"]["ph"] == '"words for the desk"' and got["empty"]["txt"] == "", got["empty"]
     assert got["one"]["ph"] in ("none", "normal") and got["one"]["txt"] == "a", got["one"]
-    assert got["gone"]["txt"] == "" and got["gone"]["html"] == "" and got["gone"]["ph"] == '"words for the coordinator"', got["gone"]
+    assert got["gone"]["txt"] == "" and got["gone"]["html"] == "" and got["gone"]["ph"] == '"words for the desk"', got["gone"]
 
 
 PASTE = ("(() => {{ const dt = new DataTransfer(); dt.setData('text/html', '<b style=\"color:red\">bold</b> <a href=\"x\">link</a><img src=x>');"
@@ -77,7 +77,7 @@ def test_send_clears_the_box_and_the_placeholder_returns(tmp_path: Path, monkeyp
     done = "window.__sent = /^Sent/.test(document.querySelector('#ck-drop .drop-receipt').textContent) && " + TXT + " === ''"
     steps = _open([_type("two\nlines"), _send(until=done, ms=20000), _tag("after", STATE)])
     got = _run(tmp_path, monkeypatch, steps)["after"]
-    assert got["txt"] == "" and got["html"] == "" and got["ph"] == '"words for the coordinator"', got
+    assert got["txt"] == "" and got["html"] == "" and got["ph"] == '"words for the desk"', got
 
 
 @needs_browser

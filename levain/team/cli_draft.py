@@ -127,7 +127,7 @@ def _promote(args, store, v: dict) -> None:
         # a ruling is signed in the decider's own words: the coordinator's draft words are shown, never signed as his
         if not (words or "").strip():
             raise TeamError("a ruling is signed in the decider's own words: pass them with --words or --words-file "
-                            "(the draft's words above are the coordinator's and are not signed)")
+                            "(the draft's words above are the desk's and are not signed)")
     else:
         words = words or e.get("words")
     if not args.yes:
@@ -202,7 +202,7 @@ def _promote(args, store, v: dict) -> None:
 
 
 def register(sub, add) -> None:
-    p = sub.add_parser("draft", help="The coordinator drafts ledger entries; promote signs one (the operator's).")
+    p = sub.add_parser("draft", help="The desk drafts ledger entries; promote signs one (the operator's).")
     dsub = p.add_subparsers(dest="draft_command", required=True)
 
     def common(q, *, repo: bool = False) -> None:

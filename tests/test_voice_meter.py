@@ -84,6 +84,7 @@ def test_price_table_is_dated_and_each_entry_prices_once():
     ("elevenlabs", "stt", "scribe", 3_600, 220_000),              # $0.22 / hour
     ("deepgram", "tts", "aura-2", 1_000, 30_000),                 # $0.030 / 1K characters
     ("deepgram", "stt", "nova-3", 60, 4_300),                     # $0.0043 / minute
+    ("deepgram", "stt", "nova-3-stream", 60, 7_700),              # $0.0077 / minute, streaming
     ("inworld", "tts", "inworld-tts-2-flash", 1_000_000, 15_000_000),   # $15 / 1M characters
     ("inworld", "tts", "inworld-tts-2-flash", 1_000, 15_000),
 ])
@@ -203,6 +204,16 @@ def test_a_call_is_priced_at_no_less_than_one_unit(tmp_path):
     meter, _ = make(tmp_path)
     chk = meter.reserve("openai", "stt", "gpt-4o-mini-transcribe", 0)            # a sub-second clip estimated as 0 s
     assert chk.allowed and chk.estimate_micros == 50 and meter.ledger()[0].cost_micros == 50
+
+
+def test_settle_actual_on_a_zero_unit_reservation_keeps_the_one_unit_it_was_priced_at(tmp_path):
+    meter, _ = make(tmp_path)
+    chk = meter.reserve("deepgram", "stt", "nova-3", 0)                           # priced at one unit by reserve
+    reserved = meter.ledger()[0].cost_micros
+    assert reserved == DEFAULT_PRICES.find("deepgram", "stt", "nova-3").cost(1) > 0
+    assert meter.settle_actual(chk.reservation_id, 5)
+    [row] = meter.ledger()
+    assert (row.status, row.units, row.cost_micros) == ("ok", 1, reserved)       # never a free call, never above
 
 
 def test_the_clock_is_read_while_the_write_lock_is_held(tmp_path):
@@ -598,3 +609,14 @@ def test_spent_if_present_requires_the_ledger_format_stamp_the_normal_path_requi
     if "someone-elses" in damage:
         with pytest.raises(MeterError, match=pattern):
             Meter(meter.path).spent()      # the creating path refuses the same wrong stamp (one shared test)
+
+
+def test_deepgram_live_stream_is_priced_at_its_streaming_row_not_the_prerecorded_one():
+    """The stream-open route reserves STREAM_STT_MODELS['deepgram'] while the adapter sends DEEPGRAM_STT_MODEL on the wire.
+    Red with: the ledger name back to 'nova-3' (billed at $0.0043 against Deepgram's $0.0077 streaming rate)."""
+    from levain.voice import deepgram_stream, providers
+    ledger = providers.STREAM_STT_MODELS["deepgram"]
+    assert ledger != providers.DEEPGRAM_STT_MODEL == "nova-3"
+    assert dict(deepgram_stream.QUERY)["model"] == "nova-3"        # the wire model is untouched
+    assert DEFAULT_PRICES.find("deepgram", "stt", ledger).cost(60) == 7_700
+    assert DEFAULT_PRICES.find("deepgram", "stt", ledger).cost(60) > DEFAULT_PRICES.find("deepgram", "stt", "nova-3").cost(60)

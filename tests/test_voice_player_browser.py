@@ -29,7 +29,7 @@ def _fixture(*, key: str = "set") -> dict[str, Any]:
             {"name": "deepgram", "uses": [], "key": "not_set", "record_id": None, "last_read": None, "voices": ["a"],
              "default_voice": "a", "tts_model": "m", "speed": [0.5, 1.5], "retention": "Deepgram words."},
         ],
-        "prices_as_of": "2026-11-05", "estimate": True, "authority": "ok", "premium_stt": False, "meter": "ok",
+        "prices_as_of": "2026-11-07", "estimate": True, "authority": "ok", "premium_stt": False, "meter": "ok",
         "caps": {"month_usd": "10.00", "day_usd": "2.00", "spent_month_est": "1.25", "spent_day_est": "0.10",
                  "month_start": "x", "day_start": "y"},
     }

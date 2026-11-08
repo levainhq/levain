@@ -1,0 +1,38 @@
+--- a/rig/g_vm.py
++++ b/rig/g_vm.py
+@@ -269,6 +269,10 @@
+         os.chown(bp, 0, 0)
+         os.chmod(bp, 0o644)
+         say("baseline", b.decode())
++        # 11-07 rigfix: the slot's account record; without it start refuses identity-seed-missing (was a hand-run helper)
++        sys.path.insert(0, str(Path(__file__).resolve().parent))
++        import rig_seed
++        rig_seed.write_identity_seed(STORE, tag)
+         say(run(["/bin/ls", "-lOdn@", vf])[1])
+     for p in sorted(glob.glob(str(STORE / "slots/*/state"))):
+         say(p, Path(p).read_text().strip())
+--- a/vmend.py
++++ b/vmend.py
+@@ -241,11 +241,18 @@
+         up.mkdir(parents=True)
+     step_check_rev(c, argparse.Namespace(rev=a.rev))
+     c.sh([GIT, "-C", LEVAIN, "archive", "--format=tar.gz", "-o", up / "lv.tgz", a.rev, "levain"], step="git-archive", timeout=300)
+-    files = [HERE / "rig" / n for n in sorted(os.listdir(HERE / "rig")) if not n.startswith("__")] if not c.dry else [HERE / "rig" / "*"]
+-    files += [HERE / "briefs" / "claude_brief.txt", HERE / "briefs" / "codex_steps.json"]
+-    if not c.dry:
+-        for f in files:
++    # 11-07 rigfix: the rig keeps NO copy of fire_fakeclaude.c; the staged one is the rev's tests/vm_fakes file (byte-checked),
++    # and rig_seed.py (the identity-seed writer `seed` calls) rides along. Both from scripts/vm_harness in the repo.
++    sys.path.insert(0, str(LEVAIN / "scripts" / "vm_harness"))
++    import rig_stage
++    extra = [HERE / "briefs" / "claude_brief.txt", HERE / "briefs" / "codex_steps.json"]
++    if c.dry:
++        files = [HERE / "rig" / "*"] + extra
++    else:
++        files = rig_stage.stage_rig_files(HERE / "rig", up, rig_stage.canonical_fakeclaude(LEVAIN, a.rev))
++        for f in extra:
+             shutil.copy2(f, up / f.name)
++        files += [up / f.name for f in extra]
+         (c.vmdir / "rev.txt").write_text(a.rev + "\n")
+     c.ssh(["/bin/rm", "-rf", "/tmp/vend_up"], step="rm-up", check=False)
+     c.ssh(["/bin/mkdir", "-p", "/tmp/vend_up"], step="mkdir-up")

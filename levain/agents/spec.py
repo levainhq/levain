@@ -60,7 +60,7 @@ __all__ = ["AgentMoved", "SpecError", "SPEC_FIELDS", "parse_spec", "parse_spec_t
            "canonical_spec", "register_spec", "register_specs", "mint_agent_id", "find_revert", "list_agents", "get_agent", "set_operation", "retire_agent",
            "resolve_agent", "feeder_group", "stored_specs", "occurrence_spec", "can_fire"]
 
-SPEC_HASH_PREFIX = b"levain-agentspec/1\n"
+from levain.agents.signed_role import SIGNED_TEXT_MAX, SPEC_HASH_PREFIX   # noqa: E402  (one home: the run server re-derives this hash)
 SPEC_FIELDS = ("name", "role", "input", "output", "win", "trigger", "stop_at", "overlap", "missed", "on_failure",
                "memory", "placement", "feeds")
 NAME = re.compile(r"[a-z][a-z0-9_-]{0,63}")
@@ -402,6 +402,10 @@ def _register_in(conn: Any, spec: dict[str, Any], default_zone: str | None,
                  revise: bool) -> tuple[str, str, int, bool]:
     final = finalize_spec(spec, default_zone)
     text = _canonical(final)
+    if len(text.encode("utf-8")) > SIGNED_TEXT_MAX:
+        # carried as signed-role evidence by a launch that stages a workspace (levain.agents.signed_role, L3 W2 r1 MED)
+        raise SpecError(f"the spec's canonical text is over {SIGNED_TEXT_MAX} bytes, the most a launch can carry as "
+                        "signed-role evidence: shorten it")
     held = conn.execute("SELECT agent_id, current_version FROM agents WHERE name = ? AND registration = "
                         "'registered'", (final["name"],)).fetchone()
     if held is None:

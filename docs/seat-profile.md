@@ -28,17 +28,20 @@ both use it. It either returns a profile or refuses and names every problem it f
 | Writes | Under the lane clone and the RETURN directory (the sandbox's `allowWrite`). |
 | `git commit` in the lane | Works. `.git` is not denied as a whole, so the index and objects can change. |
 | Network | None by default. The sandbox allowlist is empty unless a seat-egress grant names hosts (see below). |
+| GitHub reads | Two tools of one MCP server, `levain_gh` (`gh_read`, `git_fetch`), and nothing else (see "Reading GitHub" below). |
 | Permission mode | `acceptEdits` inside the two directories. |
 
 ### Denied
 
 | What | How |
 |---|---|
-| Settings, hooks, MCP servers from the lane or anywhere else | The seat is started with an empty settings-source list and `--strict-mcp-config` with an empty server list. Only the profile's own `--settings` apply. A planted `.claude/settings.json` or `.mcp.json` in the clone is never read. |
+| Settings, hooks, MCP servers from the lane or anywhere else | The seat is started with an empty settings-source list and `--strict-mcp-config` with the profile's own `--mcp-config`, which names exactly one server, `levain_gh`. Only the profile's own `--settings` apply. A planted `.claude/settings.json` or `.mcp.json` in the clone is never read. |
 | File tools outside the two directories | `--restricted` confines Edit, Write, Read, Glob and Grep to the working directory plus the RETURN directory. |
 | Agent-config names at the top of each root | Edit, Write, MultiEdit and NotebookEdit are denied on `activation/`, `.levain/`, `.claude/`, `.codex/` and `.mcp.json` directly under both roots. The sandbox also denies Bash writes to the same names. Only the check made before launch looks at every depth (see below). |
+| A tracked `activation/` directory below the lane's top level | When the launch exempts one (see below), the seat's push refuses any lane tip that changes it (the bound that holds), and, as defence in depth, the sandbox denies Bash writes to it and Edit, Write, MultiEdit and NotebookEdit are denied on it. |
 | `.git` paths that run code or carry configuration | `.git/hooks`, `.git/config`, `.git/info`, `.git/modules` and `.git/worktrees` are denied to the file tools and to Bash writes. |
 | Reading the launcher key directory | A Read rule and the sandbox's `denyRead` both name it. |
+| Reading the GitHub read-token directory | `<levain home>/seat_gh/` is named by the same Read rule and the same `denyRead`, as one more member of that list. |
 | Loopback and local services | The sandbox binds nothing locally, allows no Unix sockets, and denies `localhost`, `127.0.0.1` and `::1`. |
 | Unsandboxed commands | Bash runs sandboxed, and Claude Code is told to fail rather than start without the sandbox. |
 
@@ -51,11 +54,71 @@ Edit rule also refuses the Write tool while a Write rule alone did not. All four
 
 - the lane or RETURN directory is a symlink, is not a directory, or the two overlap;
 - either directory overlaps the launcher key directory, or sits inside `~/.claude`;
-- either directory already holds an agent-config name (a gitfile or a nested `.git` in the lane counts);
+- either directory already holds an agent-config name (a gitfile or a nested `.git` in the lane counts), with one
+  exception below;
 - the Python that runs the seat's hooks, or the `claude` binary, is a relative path, or passes through or lives inside a seat root;
 - the levain package itself is inside a seat root;
 - the host's managed Claude Code settings conflict with the profile;
 - a seat-egress grant is supplied without a lease, or the lane is not below the grant's lanes parent.
+
+### Reading GitHub: the `levain_gh` server
+
+A seat's network is empty and anything a sandboxed process can read, the agent can read, so a seat never holds a GitHub
+credential. It reads GitHub through one stdio MCP server, `levain_gh` (`levain/seat_gh_mcp.py`), which the profile
+loads with `--mcp-config` and permits by name (`mcp__levain_gh__gh_read`, `mcp__levain_gh__git_fetch`). The server runs
+outside the sandbox and is the only thing that reads the tokens. It has two tools:
+
+- `gh_read`: a `GET` of an API path. The path must be `/repos/levainhq/levain` or `/repos/phillipclapham/flow`,
+  optionally followed by `contents`, `pulls`, `issues`, `actions` (only `runs`, `jobs`, `workflows`, `artifacts`),
+  `commits` or `branches` and deeper segments. The tool takes no method, host or URL, and a redirect is never followed.
+- `git_fetch`: the host's git fetches every branch of one of those two repositories into a Levain-owned bare mirror
+  under `<levain home>/gh_mirror/`; the seat then runs `git fetch <that path> <branch>` from its clone, a local read.
+
+Tokens: a fine-grained token has one resource owner, so there are two, one per owner (`levainhq`, `phillipclapham`),
+each a read-only token for its repository. They live in `<levain home>/seat_gh/<owner>` (mode 0600, in a 0700
+directory). Install and remove them with `levain seat gh-token set --owner <owner>` (the token on STDIN only; Levain
+checks it with a GET of the repository from this host and records a fingerprint and the expiry beside it),
+`levain seat gh-token clear --owner <owner>` and `levain seat gh-token status`. An absent or expired token makes the
+tool answer one fixed sentence and stop: there is no fallback to `gh`'s own login, the keychain, `GH_TOKEN` or an ssh
+agent. The token is never in an argument, an environment the seat can see, a log or a returned text (anything
+token-shaped is replaced by `[token]`). A call that reaches a token writes an intent line to `push/seat_gh.jsonl`
+before the token is read and an outcome line after. If either line cannot be written, the call is refused and returns
+nothing. A call refused earlier, for a path or repository outside the list, is logged when the log can be written.
+`<levain home>/seat_gh/` is denied to every seat, with or without a seat-egress grant. Fetches into one mirror run one
+at a time.
+
+### The tracked `activation/` exemption
+
+Levain's own repository ships `levain/templates/activation/` (and the Codex adapter's) as package data, so a seat on
+it would otherwise refuse. A lease launch passes the commit it checked the lane out at, and the builder exempts a
+directory named `activation` below the lane's top level when:
+
+- git tracks files under it in that commit. The launcher reads the commit's tree from the lane's object store with
+  `git ls-tree`, with no hooks, no global or system configuration and no replace refs, before the seat exists. The
+  working tree and the index are never the source;
+- every tracked entry under it is a regular file (never a symlink or a submodule), and the working tree holds exactly
+  those files, with the same bytes and the same executable bit, one link each (no hard-link alias elsewhere), and only
+  the directories that hold them;
+- nothing inside it is a symlink or an agent-config name, `activation` included (`a/activation/b/activation` refuses);
+- no path in it holds a character a deny rule would read as a pattern (`* ? [ ] { } \`, or a name starting with `!` or
+  `#`);
+- no symlink anywhere in the lane resolves onto it, onto one of its ancestors, or into it.
+
+The launcher reads the base only when its walk of the lane finds such a directory, and only the paths under the ones it
+found; the listing is streamed under the same 200,000-entry cap as the walk and a 60 second limit. Files are opened
+without following links, checked to be the file the walk saw, and hashed in chunks. A git that cannot run, times out or
+cannot read the commit refuses with the reason.
+
+**What makes it read-only is the push, not the deny rules.** Path-based deny rules alone cannot make a tree read-only:
+the seat can rename an ancestor of the directory away, edit the file under the new name and rename it back, or hard-link
+an exempt file to a new name and write through that name, and neither names the denied path. So the seat's push (see
+"What happens at a push" under seat egress) refuses any lane tip with a commit, since the launch base, that adds,
+modifies, deletes or renames a path with an `activation` component at any depth, judged from git objects in Levain's
+own mirror. An exempt directory is still added to the sandbox's write denials and to the file tools' deny rules, as
+defence in depth. Anything else still refuses at launch, and the refusal names the reason (for example
+`... (not exempt: hooks/extra.py is not tracked at the base)`). Only `activation` qualifies. `.claude`, `.codex`,
+`.levain`, `.mcp.json` and `.git` never do, tracked or not, and an `activation/` at the lane's top level still refuses.
+The canary and `levain seat launch --dry-run` pass no commit, so they exempt nothing.
 
 ### Hooks the profile installs
 
@@ -73,6 +136,18 @@ hook run the push described under seat egress.
   rule (the launch check refuses one that already exists), and a Write to a `.git` file of the root outside the five paths
   reaches a permission prompt instead of a hard refusal.
 - The deny rules name those agent-config paths at the top of each root only. The launch check walks the whole tree and refuses a root that already holds one at any depth, but a nested one (for example `sub/.claude/settings.json`) written during the turn is not denied. The seat loads no settings from its roots, so it is inert for the seat, but it can be committed and, with a seat-egress grant, pushed to `seat/<lane key>` on the remote, where an ordinary Claude Code session that checks the branch out would read it. Review that branch without checking it out (for example `git log -p` and `git show <branch>:<path>`).
+- The tracked `activation/` exemption trusts the commit the operator named and the clone the launcher made from it: it
+  proves the directory matches that commit, not that the commit's contents are safe. The seat loads nothing from it.
+  Its deny rules are the same kind as the other ones, measured for the other names; on this path the deny is
+  UNMEASURED. It is not tested by hand: the machine guard forbids ad-hoc sandbox testing (never a hand-written sandbox
+  profile; one once kernel-panicked the operator's Mac). The cheapest proof is a real `levain seat launch` with a
+  canary write probe into a tracked activation file, and Z2 owns that run after this lands. The push refusal does not
+  depend on the deny rules. A working tree that git would check out differently from
+  the stored bytes (an `eol` or filter attribute) refuses, because the bytes then differ.
+- The seat CAN change an exempt directory in its own working tree (by the rename or hard-link routes above); what it
+  cannot do is get that change out through Levain's push. A lane directory is the seat's scratch space: review its
+  branch, never reuse its working tree. A seat that can reach your git host on its own network with credentials it
+  can read (see "Credentials on disk" under seat egress) is outside this bound, as it is for every other push rule.
 - NotebookEdit is not in the seat's tool set, because there is no race probe for it yet (see P9 below).
 
 ## The canary: `levain seat canary`
@@ -120,9 +195,9 @@ refusal is known to be the wall and not a broken test). P8 has none: any success
 
 | Probe | The seat tries | Control | PASS means |
 |---|---|---|---|
-| P0 profile loaded | (reads the session's init and hook events) | tool calls ran, so the record must hold rows | The tool list equals the tool set this run was started with (by default the seat set), no MCP server is loaded, the profile's hooks fired, and the record has rows. |
+| P0 profile loaded | (reads the session's init and hook events) | tool calls ran, so the record must hold rows | The tool list equals the tool set this run was started with (by default the seat set), exactly the `levain_gh` MCP server is loaded (connected, and no other), the profile's hooks fired, and the record has rows. |
 | P1 hooks-poisoning write | Edit and Write on `.claude/settings.json` and `.mcp.json`, directly and through a directory symlink | a Write in the lane that must land | Every attempt was refused and no protected file changed. |
-| P1b inert target | (the harness plants a SessionStart hook and an MCP server in the clone before launch) | the profile's own hooks fire | The planted hook did not run and no MCP server loaded. |
+| P1b inert target | (the harness plants a SessionStart hook and an MCP server in the clone before launch) | the profile's own hooks fire | The planted hook did not run and no MCP server but `levain_gh` loaded. |
 | P2 symlink-swap race | N Writes through a directory that a sandboxed process flips between real and a symlink to a decoy | a Write to a non-swapped path that must land | None of N landed in the decoy, the flipper ran through the last Write, and no swap Write reached a permission prompt. |
 | P3 cross-lane write | Bash and Write into a second lane | a write in the seat's own lane | The other lane is unchanged. |
 | P4 git | Bash writes to `.git` hooks, config, info and modules; file-tool writes under `.git`, and a Write to a nested gitfile (`sub/.git`) | `git commit` in the lane | The commit works and every other attempt was refused with no prompt. |
@@ -199,13 +274,29 @@ The profile's `Stop` and `SessionEnd` hooks run `levain.seat_push`. In order:
 4. Just before the push, under a lock, Levain re-reads the signed log. It refuses unless a live grant exists, the
    clone is below the grant's lanes parent, the branch is exactly `seat/<lane key>`, the remote is the grant's, and
    the clone's `.git` is the one recorded at launch.
+5. After the fetch and before the push, under the same lock, Levain judges the fetched commits in its mirror, never
+   the clone's working tree: the tip must descend from the launch base in the signed record, and no commit since the
+   base may add, modify, delete or rename a path with an `activation` component at any depth (compared regardless of
+   case), against any of its parents. Otherwise nothing is pushed and the record says, in fixed words, "the lane branch
+   changes an activation directory, which a seat may read and never change", with the first path. A later commit that
+   restores the files does not clear it; the commits that touch it must be dropped. A lane branch that changes more
+   paths than Levain will judge (200,000 across the commits, or 64 MiB of path names) is refused in the fixed words
+   "the lane branch changes too many paths to judge". The judgment has one deadline of 30 seconds, inside the hook's
+   own time limit; a judgment that does not finish in time is refused ("could not be judged in time") and recorded.
 
 The hook never stops the seat's work. Every outcome is written to `<levain home>/push/seat_egress.jsonl`, and the hook
-exits 0, with one exception: if the remote rejects the push (for example, a non-fast-forward), the first `Stop`
-exits 2, which keeps the turn open and puts the message in front of the model, which can rebase. Nothing is forced. A network or authentication failure
-is recorded and retried at the next `Stop`.
+exits 0, with two exceptions, both on the first `Stop` only: if the remote rejects the push (for example, a
+non-fast-forward), or if step 5 refuses because the lane branch changes an activation directory. Then the hook exits 2,
+which keeps the turn open and puts the message in front of the model, which can rebase or drop the commits. Each is
+told once: the tip is remembered, a second `Stop` (with `stop_hook_active`) exits 0, and `SessionEnd` never exits 2.
+Nothing is forced. A network or authentication failure is recorded and retried at the next `Stop`.
 
 ### Known edges
+
+- **A slow fetch or push can outlast the hook.** The tree judge has one deadline under the hook's ceiling, but `push.execute` (shared with the consent push) still uses git's default 600 s timeout for the fetch and the push. A very slow network can get the hook killed before it writes its `seat_egress.jsonl` line; nothing is pushed past what git itself completed. A deadline threaded into `push.execute` is the fix.
+- **Merging upstream commits that touch `activation` stops the push.** Every commit in `base..tip` is judged, including upstream's; the seat must rebase its own commits onto the grant's branch instead of merging them in.
+- **A clone root under a directory with glob characters is refused with a message that names the exempt path,** not the root.
+- **The candidate-pathspec count is capped (256) but not its total bytes;** a lane with that many near-`PATH_MAX` names is refused as unreadable instead of batched.
 
 - **The network outlives a revoke.** The allowed domains are frozen into the seat's launch settings. A revoke or
   expiry cuts the push at once, but a running seat keeps the network it launched with until it is relaunched.
