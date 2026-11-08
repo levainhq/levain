@@ -4005,9 +4005,10 @@ class _Handler(GuardedHandler):
         a key is looked at). The switch (the AUTO decision from key presence) gates OPEN only: a session exists only
         because open passed, so chunk and close never replay the log for it; a key revoked mid-stream is the session's
         own ``_stream_revoked`` check (the next due chunk answers ``revoked: true``), and close still settles and returns
-        the collected text. Only a forced-off server (``premium_stt is False``) refuses chunk and close. Open and close carry no body (a declared length of 0); a chunk is ``application/octet-stream``
-        of at most :data:`cockpit_voice.STREAM_CHUNK_MAX` bytes: its sid, owner and seq are checked before the body is read,
-        then the read takes a ``voice_chunk_gate`` slot without waiting (503 past it) and runs under a short deadline.
+        the collected text. Only a forced-off server (``premium_stt is False``) refuses chunk and close. Open and close
+        carry no body (a declared length of 0); a chunk is ``application/octet-stream`` of at most
+        :data:`cockpit_voice.STREAM_CHUNK_MAX` bytes: its sid, owner and seq are checked before the body is read, then
+        the read takes a ``voice_chunk_gate`` slot without waiting (503 past it) and runs under a short deadline.
         Chunks bypass ``voice_gate`` (cheap, bounded, owned by a session the registry already capped at one); open runs
         the revoke check and the key read in :func:`cockpit_voice.stream_open`. Every request first reaps (the server's
         timer is the other reaper). After server_close every stream route is 503 ``stopping``."""

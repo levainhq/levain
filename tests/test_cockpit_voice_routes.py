@@ -234,8 +234,9 @@ def served(rig: Rig, *, room: bool = True, signer_q: Path | None = None, signer_
     """``levain serve`` over the rig. By default with a Signer over the consent reader's own queue, as a real install
     runs it, so the phone's grant routes are served (a voice route reads no key without them). ``signer_q`` names
     another queue; ``signer_on=False`` serves no Signer at all. ``premium_stt`` is the server's premium-dictation
-    switch (``make_server(premium_stt=)``, AUTO from key presence in the product): this fixture forces it ON so every transcribe test below
-    runs the route as it was built; the tests of the forced-off and AUTO settings pass ``premium_stt=False``."""
+    switch (``make_server(premium_stt=)``, AUTO from key presence in the product): this fixture forces it ON so every
+    transcribe test below runs the route as it was built; the forced-off tests pass ``premium_stt=False`` and the AUTO
+    tests pass ``premium_stt=None``."""
     port = _free_port()
     signer = None
     if signer_q is None and signer_on:
