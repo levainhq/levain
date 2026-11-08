@@ -45,6 +45,10 @@ Tools not in the matrix: Codex ``apply_patch`` on a headless brokered route (leg
 edit, the sandbox stopping the write): its expected verdict is a design question, not a measurement this table may
 invent. Add it here with its single verdict once he rules.
 
+Known edges (closed on purpose): ``raw_ok`` is checked against the EXPECTED verdict's pattern, not the observed one, so it is a
+diagnostic only (the PASS gate also needs obs == expected); :data:`RAW_PATTERNS` is provisional until the VM adapter's real
+raw lines are known; an adapter that fabricates a matching verdict / raw pair is not detectable here.
+
 Harness code: no import of ``levain``. From the repo root, ``python3 -m scripts.vm_harness.conformance table`` prints the
 table (no ``-I``: ``-I`` leaves the cwd off ``sys.path`` and ``scripts`` is then not importable).
 """
@@ -114,6 +118,13 @@ class Cell:
     version: str
     case: str
 
+    def __post_init__(self) -> None:
+        # the key joins the parts with "/": a "/" inside a part would make two different cells share one key
+        for name in ("vendor", "tool", "route", "version", "case"):
+            v = getattr(self, name)
+            if not isinstance(v, str) or not v or "/" in v:
+                raise ValueError(f"Cell.{name} must be a non-empty string without '/', got {v!r}")
+
     @property
     def key(self) -> str:
         return f"{self.vendor}/{self.tool}/{self.route}/{self.version}/{self.case}"
@@ -123,14 +134,30 @@ class Cell:
         return EXPECTED[(self.vendor, self.tool, self.case)]
 
 
-def build_matrix(routes: Mapping[str, Sequence[str]], versions: Mapping[str, Sequence[str]]) -> list[Cell]:
+def _ids(vendor: str, what: str, v: object) -> list[str]:
+    if isinstance(v, (str, bytes)) or not isinstance(v, Sequence):
+        raise ValueError(f"{vendor}: {what} must be a list of ids, not {type(v).__name__}")
+    out = list(v)
+    if len(set(out)) != len(out):
+        raise ValueError(f"{vendor}: duplicate {what} in {out!r}")
+    return out
+
+
+def build_matrix(routes: Mapping[str, Sequence[str]], versions: Mapping[str, Sequence[str]], *,
+                 vendors: Iterable[str] | None = None) -> list[Cell]:
     """``routes`` and ``versions`` map a vendor to its route ids / binary versions. Every named vendor must have both
-    and a row in :data:`TOOLS`; the result is every (tool, route, version, case) cell, in a fixed order."""
+    and a row in :data:`TOOLS`; the result is every (tool, route, version, case) cell, in a fixed order. ``vendors`` is
+    the set that MUST be covered (default: every vendor in :data:`TOOLS`): a required vendor the caller omitted is an
+    error, so narrowing the matrix is always spelled out. A bare string, or a duplicate id, is refused."""
+    required = sorted(TOOLS if vendors is None else set(vendors))
+    missing = [v for v in required if v not in routes or v not in versions]
+    if missing:
+        raise ValueError(f"vendors {missing} are required but have no routes/versions (name a narrower vendors=...)")
     cells: list[Cell] = []
-    for vendor in sorted(set(routes) | set(versions)):
+    for vendor in sorted(set(routes) | set(versions) | set(required)):
         if vendor not in TOOLS:
             raise ValueError(f"unknown vendor {vendor!r}")
-        rs, vs = list(routes.get(vendor, ())), list(versions.get(vendor, ()))
+        rs, vs = _ids(vendor, "routes", routes.get(vendor, ())), _ids(vendor, "versions", versions.get(vendor, ()))
         if not rs or not vs:
             raise ValueError(f"{vendor}: needs at least one route and one version")
         for tool in TOOLS[vendor]:
@@ -146,6 +173,7 @@ def build_matrix(routes: Mapping[str, Sequence[str]], versions: Mapping[str, Seq
 def _write_durable(path: Path, text: str, *, append: bool = False, exclusive: bool = False) -> None:
     flags = os.O_WRONLY | os.O_CREAT | (os.O_APPEND if append else os.O_TRUNC) | (os.O_EXCL if exclusive else 0)
     fd = os.open(path, flags | getattr(os, "O_NOFOLLOW", 0), 0o644)
+    ok = False
     try:
         data = text.encode()
         while data:
@@ -154,8 +182,21 @@ def _write_durable(path: Path, text: str, *, append: bool = False, exclusive: bo
                 raise OSError("short write: os.write made no progress")
             data = data[n:]
         os.fsync(fd)
+        ok = True
     finally:
         os.close(fd)
+        if not ok and not append:
+            # a half-written EXPECTED / RESULT must not sit there looking like evidence (the append-only log is kept: it
+            # holds earlier rows)
+            try:
+                os.unlink(path)
+            except OSError:
+                pass
+    dfd = os.open(path.parent, os.O_RDONLY)          # the new directory entry itself must survive a crash
+    try:
+        os.fsync(dfd)
+    finally:
+        os.close(dfd)
 
 
 class Evidence:
@@ -186,6 +227,7 @@ class _Frozen:
     """One cell as it was when the table was frozen: grading reads ONLY this, never the module tables again."""
     cell: Cell
     key: str
+    case: str                  # snapshotted: injected code gets the Cell and could rewrite its __dict__
     expected: str
     pattern: str
     rx: "re.Pattern[str]"
@@ -194,20 +236,45 @@ class _Frozen:
 
 def _freeze(cells: Sequence[Cell]) -> tuple[_Frozen, ...]:
     out = []
+    seen: set[str] = set()
     for c in cells:
         try:
             exp = EXPECTED[(c.vendor, c.tool, c.case)]
             pat = RAW_PATTERNS[exp]
         except KeyError:
             raise ValueError(f"cell {c.key} is not in the expected table") from None
-        out.append(_Frozen(c, c.key, exp, pat, re.compile(pat), NOT_RUNNABLE.get(c.vendor)))
+        if c.key in seen:
+            raise ValueError(f"duplicate cell {c.key}")
+        seen.add(c.key)
+        out.append(_Frozen(c, c.key, c.case, exp, pat, re.compile(pat), NOT_RUNNABLE.get(c.vendor)))
     return tuple(out)
+
+
+def _missing_cells(frozen: Sequence[_Frozen], vendors: Iterable[str]) -> list[str]:
+    """Keys of the cells absent from what a full matrix would hold for the same vendors / routes / versions: every
+    (route, version) present for a vendor needs every tool x case, and every required vendor must be present at all."""
+    have = {f.key for f in frozen}
+    rv: dict[str, tuple[set[str], set[str]]] = {}
+    for f in frozen:
+        rs, vs = rv.setdefault(f.cell.vendor, (set(), set()))
+        rs.add(f.cell.route)
+        vs.add(f.cell.version)
+    missing = [f"{v}/*" for v in sorted(set(vendors)) if v not in rv]
+    for v, (rs, vs) in sorted(rv.items()):
+        for route in sorted(rs):
+            for version in sorted(vs):
+                for tool in TOOLS[v]:
+                    for case in CASES:
+                        k = Cell(v, tool, route, version, case).key
+                        if k not in have:
+                            missing.append(k)
+    return missing
 
 
 def _table_text(frozen: Sequence[_Frozen]) -> str:
     lines = ["conformance: expected verdicts", "cell | expected verdict | raw line regex (fullmatch) | precondition"]
     for f in frozen:
-        pre = "queue unreachable before and after the attempt" if f.cell.case == "queue-down" else "-"
+        pre = "queue unreachable before and after the attempt" if f.case == "queue-down" else "-"
         if f.not_runnable:
             pre = f"NOT RUNNABLE: {f.not_runnable}"
         lines.append(f"{f.key} | {f.expected} | /{f.pattern}/ | {pre}")
@@ -231,21 +298,31 @@ def _shown(v: object, limit: int = 300) -> str:
     """A string for the evidence log: a str as it is (bounded), anything else as a bounded repr that names its type."""
     if isinstance(v, str):
         return v[:limit]
-    return f"<{type(v).__name__}: {repr(v)[:80]}>"
+    try:
+        return f"<{type(v).__name__}: {repr(v)[:80]}>"
+    except Exception:   # noqa: BLE001 - a hostile __repr__ is still just a non-string answer
+        return f"<{type(v).__name__}: unrepresentable>"
 
 
 def run_matrix(cells: Iterable[Cell], attempt: Callable[[Cell], Mapping[str, str]], *, evidence_dir: Path | str,
-               queue_reachable: Callable[[Cell], bool] | None = None) -> dict:
+               queue_reachable: Callable[[Cell], bool] | None = None, vendors: Iterable[str] | None = None) -> dict:
     """Grade every cell. ``attempt(cell)`` returns ``{"verdict": <one of VERDICTS>, "raw": <the raw line>}``.
     ``queue_reachable(cell)`` observes the queue broker's state (a real ``bool``, True = reachable); it is REQUIRED when any
     runnable cell is a ``queue-down`` one, and is called before and after that cell's attempt. ``evidence_dir`` is a fresh
     directory: the expected table is written to it (EXPECTED.txt + sha256) before the first attempt, so no verdict can be
-    fitted to what was seen. Cells of a :data:`NOT_RUNNABLE` vendor are recorded and counted, never attempted."""
+    fitted to what was seen. Cells of a :data:`NOT_RUNNABLE` vendor are recorded and counted, never attempted.
+    The cells must be the FULL matrix for ``vendors`` (default: every vendor in :data:`TOOLS`): every route x version present
+    needs every tool x case, and a required vendor must be present; anything missing, or any duplicate cell, is a
+    ValueError before any evidence is written (a filtered list never certifies). A narrower ``vendors`` is spelled out."""
     cells = list(cells)
     if not cells:
         raise ValueError("an empty matrix checks nothing")
     frozen = _freeze(cells)
-    if queue_reachable is None and any(f.cell.case == "queue-down" and not f.not_runnable for f in frozen):
+    gaps = _missing_cells(frozen, TOOLS if vendors is None else vendors)
+    if gaps:
+        raise ValueError(f"the cells are not the full matrix, {len(gaps)} missing (first: {gaps[:3]}): a partial matrix "
+                         "cannot certify")
+    if queue_reachable is None and any(f.case == "queue-down" and not f.not_runnable for f in frozen):
         raise ValueError("a queue-down cell needs a queue_reachable hook: without it the precondition is unobserved")
     ev = Evidence(evidence_dir)
     digest = ev.write_expected(_table_text(frozen))
@@ -259,20 +336,28 @@ def run_matrix(cells: Iterable[Cell], attempt: Callable[[Cell], Mapping[str, str
             if f.not_runnable:
                 row.update(status="NOT_RUNNABLE", reason=f.not_runnable)
             else:
+                observed = False
                 try:
-                    down_before = None if c.case != "queue-down" else _unreachable(queue_reachable, c)    # type: ignore[arg-type]
+                    qd = f.case == "queue-down"          # the snapshot, never c.case: injected code may rewrite the Cell
+                    down_before = None if not qd else _unreachable(queue_reachable, c)    # type: ignore[arg-type]
                     got = attempt(c)
-                    obs, raw = got["verdict"], got.get("raw")
-                    down_after = None if c.case != "queue-down" else _unreachable(queue_reachable, c)     # type: ignore[arg-type]
-                    row.update(observed=_shown(obs), raw=_shown(raw))
+                    # a result without a verdict (or not a mapping) is a contract FAIL: obs stays None and never matches
+                    obs, raw = (got.get("verdict"), got.get("raw")) if isinstance(got, Mapping) else (None, None)
+                    row.update(observed=_shown(obs), raw=_shown(raw))      # kept even if the post-attempt probe raises
+                    observed = True
+                    down_after = None if not qd else _unreachable(queue_reachable, c)     # type: ignore[arg-type]
                     raw_ok = isinstance(raw, str) and bool(raw.strip()) and f.rx.fullmatch(raw) is not None
-                    pre_ok = c.case != "queue-down" or (down_before is True and down_after is True)
+                    pre_ok = not qd or (down_before is True and down_after is True)
                     good = isinstance(obs, str) and obs in VERDICTS and obs == f.expected and raw_ok and pre_ok
                     row.update(raw_ok=raw_ok, status="PASS" if good else "FAIL")
-                    if c.case == "queue-down":
+                    if qd:
                         row.update(queue_down_before=down_before, queue_down_after=down_after)
                 except (Exception, SystemExit) as e:   # noqa: BLE001 - a crashed attempt is a finding, never a pass
-                    row.update(status="ERROR", raw=f"{type(e).__name__}: {e}"[:300])
+                    msg = f"{type(e).__name__}: {e}"[:300]
+                    if observed:
+                        row.update(status="ERROR", error=msg)       # the attempt's observed verdict / raw stay on the row
+                    else:
+                        row.update(status="ERROR", raw=msg)
             result["rows"].append(row)
             ev.log(json.dumps(row, default=repr))
         for r in result["rows"]:
