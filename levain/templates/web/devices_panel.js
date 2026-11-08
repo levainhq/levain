@@ -1505,6 +1505,35 @@
       vcBody.appendChild(el("p", "dev-note vc-caps", "Estimated spend: $" + n(caps.spent_day_est) + " today of a $" + n(caps.day_usd) +
         " cap, $" + caps.spent_month_est + " this month of $" + n(caps.month_usd) + ". An estimate; the provider's bill is the truth."));
     }
+    // Dictation and per-provider spend: read only, all from voice.json (the server names the dictation provider; this page never picks one).
+    const cap1 = (s) => s.charAt(0).toUpperCase() + s.slice(1), dict = vcState.mic_in;
+    if (dict) {
+
+      const why = { turned_off: "off (turned off on the server)", no_stt_key: "off (no speech-to-text key set)",
+                    no_stream_key: "off (no key that can stream)", unreadable: "unknown (the key log could not be read)" };
+      const words = dict.on ? cap1(dict.provider || "") + (dict.model ? " (" + dict.model + ")" : "") : (why[dict.reason] || "off");
+      const dr = el("div", "dev-row vc-row vc-dictation");
+      dr.appendChild(el("span", "vc-lab", "Dictation"));
+      dr.appendChild(el("span", "vc-dict-val", words));
+      vcBody.appendChild(dr);
+    }
+    for (const p of vcState.providers) {
+      if (p.key !== "set") continue;
+      const r = el("div", "dev-row vc-row vc-spend"); r.dataset.provider = p.name;
+      r.appendChild(el("span", "vc-lab", cap1(p.name)));
+      const sp = p.spend;
+      const txt = sp ? "$" + sp.day_est_usd + " today (" + sp.day_calls + " calls) · $" + sp.month_est_usd + " this month (" + sp.month_calls + " calls)"
+                     : "spend unreadable";
+      r.appendChild(el("span", "vc-spend-val", txt));
+      if (p.console_url) {
+        const a = el("a", "vc-console", "Reload credit"); a.href = p.console_url; a.target = "_blank"; a.rel = "noopener noreferrer";
+        r.appendChild(a);
+      }
+      vcBody.appendChild(r);
+    }
+    if (vcState.providers.some((p) => p.key === "set" && p.console_url)) {
+      vcBody.appendChild(el("p", "dev-note vc-balance", "Balance is not shown here: check it in the provider's console (the link beside each provider)."));
+    }
     // Keyboard users keep their place. On a touch screen a focus() on the rebuilt <select> re-opens its picker (iOS Safari), so
     // choosing a value looked like the list reloading and staying open until he tapped away: no refocus where the pointer is coarse.
     let coarse = false;

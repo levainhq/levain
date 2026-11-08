@@ -143,6 +143,10 @@ PROVIDERS: dict[str, ProviderData] = {
                              "periods are not stated on Deepgram's pages."),
 }
 # a record kind exists for these (authority.VOICE_KEY_PROVIDERS) but no adapter does
+# Where to add credit, per provider (read-only panel link). Deepgram: the console root resolves (fetched 11-08); Inworld: its
+# docs name the Billing page as where the credit balance is shown and credits are added. Neither provider's balance is
+# read: Deepgram's balances endpoint needs a project id and documents no key scope, Inworld documents no balance API.
+CONSOLE_URLS = {"deepgram": "https://console.deepgram.com", "inworld": "https://platform.inworld.ai/billing"}
 UNSUPPORTED = {"elevenlabs": "ElevenLabs"}
 
 # OpenAI announced that tts-1 shuts down on this date (Phill 11-05: OpenAI stays selectable only until then). On and after
@@ -345,6 +349,7 @@ def serve_voice(data_root: Path | str, meter: vmeter.Meter, *, last_read: Mutabl
     retention words leave transcription out, so a page has nothing to offer a dictation control from; the body says
     ``"premium_stt": false``."""
     grants, authority = _grants_for(data_root)
+    premium_stt_setting = premium_stt
     premium_stt = premium_stt if premium_stt is True or premium_stt is False else _stt_keyed(grants)
     rows = []
     for name, data in offered().items():
@@ -360,6 +365,18 @@ def serve_voice(data_root: Path | str, meter: vmeter.Meter, *, last_read: Mutabl
                      "speed": [data.speed_min, data.speed_max],
                      "retention": data.retention if premium_stt or not data.retention_speech
                      else data.retention_speech})
+    try:
+        by_provider = meter.spent_by_provider_if_present()
+    except vmeter.MeterError:
+        by_provider = None
+    for row in rows:
+        row["console_url"] = CONSOLE_URLS.get(row["name"])
+        if by_provider is None:
+            row["spend"] = None
+        else:
+            got = by_provider.get(row["name"], {})
+            (dn, dm), (mn, mm) = got.get("day", (0, 0)), got.get("month", (0, 0))
+            row["spend"] = {"day_calls": dn, "day_est_usd": _usd(dm), "month_calls": mn, "month_est_usd": _usd(mm)}
     caps = meter.caps
     body: dict[str, Any] = {"providers": rows, "prices_as_of": meter.prices.as_of, "estimate": True,
                             "authority": authority, "premium_stt": bool(premium_stt)}
@@ -377,6 +394,17 @@ def serve_voice(data_root: Path | str, meter: vmeter.Meter, *, last_read: Mutabl
     if chosen is not None:
         body["stream"] = True
         body["stream_provider"] = chosen
+    # the dictation readout: what the server itself picked (never re-derived by the page), or why there is none
+    if chosen is not None:
+        body["mic_in"] = {"on": True, "provider": chosen, "model": vprov.STREAM_STT_MODELS.get(chosen, "")}
+    elif premium_stt_setting is False:
+        body["mic_in"] = {"on": False, "reason": "turned_off"}
+    elif authority != "ok":
+        body["mic_in"] = {"on": False, "reason": "unreadable"}
+    elif premium_stt:
+        body["mic_in"] = {"on": False, "reason": "no_stream_key"}
+    else:
+        body["mic_in"] = {"on": False, "reason": "no_stt_key"}
     return body
 
 

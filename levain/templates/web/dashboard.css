@@ -3699,3 +3699,5 @@ body.ke [data-ck-panel="tray"] .row > .list-meta > [data-ck-tag][data-ck-tag-sta
   body.ke [data-ck-panel="tray"] .panel > .more-foot, body.ke [data-ck-panel="tray"] > .more-foot { align-self: stretch; margin: 0 var(--sp-6) var(--sp-4);
     min-height: var(--hit-min); border: 1px solid var(--hair-2); border-radius: var(--r-md); text-decoration: none; }
 }
+.vc-dict-val, .vc-spend-val { flex: 1 1 200px; min-width: 0; font: var(--fw-regular) var(--fs-meta) var(--sans); color: var(--text); overflow-wrap: anywhere; }
+.vc-console { min-height: var(--hit-min, 44px); display: inline-flex; align-items: center; color: var(--accent); }
