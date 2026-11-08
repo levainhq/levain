@@ -661,6 +661,8 @@ def build_parser() -> argparse.ArgumentParser:
     _add_agents_parsers(subparsers)
     from levain.dream.cli import add_parsers as _add_dream_parsers
     _add_dream_parsers(subparsers)
+    from levain.germinate import add_parsers as _add_germinate_parsers
+    _add_germinate_parsers(subparsers)
 
     run_p = subparsers.add_parser(
         "run",
