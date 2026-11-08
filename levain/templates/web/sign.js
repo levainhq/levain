@@ -466,6 +466,7 @@
       before = n ? n.textContent : "";
     }).then(readRequest).then((got) => {
       $("sheet-body").replaceChildren();
+      micsOff();
       $("sheet-actions").replaceChildren();
       draw(got);
     }).catch((e) => {
@@ -542,11 +543,32 @@
   // flight, which ends on every outcome; `active` is the request it signs
   let busy = false, flight = false, unsure = false, active = null;     // `unsure`: a drop's delivery is not known
   function ended() { flight = false; closeAsked = false; }
+  // every mic the sheet's actions hold: let go (off) when the actions they sit in are replaced or the sheet closes, idle ones too
+  let sheetMics = [];
+  function micsOff() { const ms = sheetMics; sheetMics = []; for (const m of ms) m.off(); }
   function offer(r, rp, signers, held) {
+    micsOff();
     const acts = $("sheet-actions");
     acts.hidden = false;
     const controls = [];          // every button and the write-in: frozen together for the whole ceremony
-    const lock = (on) => { for (const b of controls) b.disabled = on; };
+    // the mics lock through their own lock(on), which never disables a live capture's Stop
+    const lock = (on) => { for (const b of controls) b.disabled = on; for (const m of mics) m.lock(on); };
+    // the mic on a write-in or reason box (board row 140): drawn only where the server offers streaming and the browser offers
+    // on-device dictation. A tap that SIGNS a box's words is refused while its mic is open or still closing (micOpen), so a
+    // partial is never signed: the words are the box's once the mic has ended, taken at the click as ever.
+    const mics = [];
+    const withMic = (box) => {
+      if (!window.LevainMic || typeof window.LevainMic.attach !== "function") return null;
+      const m = window.LevainMic.attach(box, { cls: "dev-btn", note: (t) => say(t) });
+      mics.push(m);
+      sheetMics.push(m);
+      return m;
+    };
+    const micOpen = (m) => {
+      if (!m || !m.busy()) return false;
+      say("Stop the mic first: your words are signed as they stand when it has ended.", "bad");
+      return true;
+    };
     // a dispatch option names the keys that may do THAT act (the sign tier's and the landing tier's differ): only those are
     // offered for it; any other row signs with the row's keys
     const keysFor = (choice) => {
@@ -555,6 +577,11 @@
     };
     const run = (choice, words, expect) => {
       if (busy) return;
+      // a ceremony never runs under a live mic: a capture still open is ended at once (off: no tail, no more words), not
+      // stopped and waited for, because the passkey call below must stay inside this tap's user activation and a normal
+      // option signs none of a box's words (a tap that signs them is refused while the mic is open). An idle mic keeps its
+      // control for a retry after a ceremony that signs nothing.
+      for (const m of mics) if (m.busy()) m.off();
       busy = true;
       active = r;
       lock(true);
@@ -562,11 +589,11 @@
       whom(rp, keysFor(choice), held, acts, !consent && !dispatch).then((k) => (k ? ceremony(r, rp, k, choice, words) : "unsigned"))
         .catch(() => "unsigned")
         .then((done) => {
-          if (done === "signed") { busy = false; ended(); acts.replaceChildren(); acts.hidden = true; tell("signed", { choice: choice, sha256: r.sha256 }); return; }
+          if (done === "signed") { busy = false; ended(); micsOff(); acts.replaceChildren(); acts.hidden = true; tell("signed", { choice: choice, sha256: r.sha256 }); return; }
           if (done === "unsure") {
             relabel("Not confirmed");
             return settle(r, () => { relabel("Not signed"); busy = false; lock(false); },
-                          (said) => { busy = false; acts.replaceChildren(); acts.hidden = true; tell("signed", { choice: said || choice, sha256: r.sha256 }); }).then(ended);
+                          (said) => { busy = false; micsOff(); acts.replaceChildren(); acts.hidden = true; tell("signed", { choice: said || choice, sha256: r.sha256 }); }).then(ended);
           }
           relabel("Not signed");
           ended();
@@ -589,7 +616,7 @@
     const options = (Array.isArray(r.options) ? r.options : []).filter((o) => !dispatch || (o && dispatchAct(o.key)));
     // a dispatch cancel carries a reason (one line, optional) typed in the box the row asks for; it is frozen as typed
     // (trimmed) from the click on, like a write-in, and is the `words` of the run
-    let reasonBox = null;
+    let reasonBox = null, reasonMic = null;
     if (dispatch && r.reason && typeof r.reason === "object" && options.some((o) => o && o.key === "cancel")) {
       reasonBox = el("input", "sheet-write-in");
       reasonBox.type = "text";
@@ -598,11 +625,13 @@
       reasonBox.maxLength = Number(r.reason.max) || 256;
       reasonBox.placeholder = "reason for cancelling (optional)";
       controls.push(reasonBox);
+      reasonMic = withMic(reasonBox);
     }
     // what an option's tap runs: a cancel takes the reason box's words as typed now
     const tap = (o) => () => {
       if (busy) return;
       if (o.key === "cancel" && reasonBox) {
+        if (micOpen(reasonMic)) return;
         const w = reasonBox.value.trim();
         reasonBox.value = w;
         return run("cancel", w, lineOf(o) + (w ? ": " + w : ""));
@@ -650,7 +679,7 @@
       b.dataset.choice = o.key;
       acts.appendChild(b);
     }
-    if (reasonBox) acts.appendChild(reasonBox);
+    if (reasonBox) { acts.appendChild(reasonBox); if (reasonMic) acts.append(...reasonMic.buttons); }
     const wi = options.length && r.write_in && typeof r.write_in === "object" ? r.write_in : null;
     if (wi) {
       const box = el("input", "sheet-write-in");
@@ -660,8 +689,11 @@
       box.maxLength = Number(wi.max) || 200;
       box.placeholder = "or write your own answer";
       controls.push(box);
-      acts.append(box, button("(" + String(wi.key) + ") Sign my words", "", () => {
+      const wmic = withMic(box);
+      if (wmic) acts.append(box, ...wmic.buttons); else acts.appendChild(box);
+      acts.append(button("(" + String(wi.key) + ") Sign my words", "", () => {
         if (busy) return;
+        if (micOpen(wmic)) return;
         // the words signed are the box's at this click, trimmed, and the box shows exactly them until the ceremony ends
         const w = box.value.trim();
         if (!w) return say("Type your answer first.", "bad");
@@ -753,7 +785,7 @@
       say("Signing is still in progress, so it is not confirmed (close again to leave).", "bad");
       return tell("reload");
     }
-    if (!(flight || (coord && unsure)) || closeAsked) return tell("close");
+    if (!(flight || (coord && unsure)) || closeAsked) { micsOff(); return tell("close"); }
     closeAsked = true;
     relabel("Not confirmed");
     say("Signing is still in progress, so it is not confirmed. Checking where the request stands… (close again to leave).", "bad");

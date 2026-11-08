@@ -4832,7 +4832,13 @@
   // the options, the words box and the send button go to the card's own bottom row, so cards in a row end their actions together.
   // `receipt` (a settled Needs-you card): the question is decided, so only the title, the answer line and what it blocked are
   // drawn; the options, the recommendation and every control are not built at all.
+  // the mics a slot's last draw made (board row 140) end with it: a redraw never leaves a capture running into a box that left
+  function offSlotMics(slot) {
+    if (Array.isArray(slot.__mics)) for (const m of slot.__mics) m.off();
+    slot.__mics = [];
+  }
   function drawQuestionBody(q, slot, b, card, receipt) {
+    offSlotMics(slot);
     const sv = (x) => (typeof x === "string" ? x : "");
     const open = q.state === "open";
     const cli = "levain question show " + q.n;   // the options are listed there; answer with: levain question answer N --option KEY
@@ -4895,6 +4901,7 @@
       // answered by a signature (DESIGN_SIGN D5): the sign request's own options are the buttons, and no unsigned answer is
       // drawn beside them (an unsigned tap on a row its caller asked to be signed is refused there, never his word)
       const facet = signFacet(q.sign, head, blocksOf(b));
+      slot.__mics = facet.__mics;
       slot.replaceChildren(...parts);
       if (card) { const bottom = el("div", "needs-actions needs-qa needs-sign"); bottom.appendChild(facet); card.appendChild(bottom); }
       else slot.appendChild(facet);
@@ -4909,14 +4916,17 @@
     const wrap = el("div", "verb-actions question-answer");
     const controls = [];
     const msg = el("span", "edit-msg", "");
+    // a mic's own buttons are locked by its lock(): a live capture's Stop stays enabled
+    const lockAll = (on) => { for (const c of controls) c.disabled = on; if (wmic) wmic.lock(on); };
     const send = async (params) => {
-      for (const c of controls) c.disabled = true;
+      if (wmic) wmic.stop();     // an answer under a live mic ends the mic first
+      lockAll(true);
       let res;
       try { res = await answerQuestion(q.id, params); } catch (e) { res = { ok: false, message: "the answer could not be sent" }; }
       if (res && res.ok) { words.value = ""; return; }   // the board re-reads and redraws this row as answered
       const kept = res && res.error === "stale" && words.value.trim() !== "";
       if (kept) { questionDrafts.set(q.id, words.value); words.value = ""; }
-      for (const c of controls) c.disabled = false;
+      lockAll(false);
       msg.textContent = ((res && (res.message || res.error)) || "failed") +
         (kept ? " (your words are kept: they come back here while the question is still open)" : "");
       if (kept) document.dispatchEvent(new CustomEvent("levain:editor-closed"));   // the re-read the refusal owes may land now
@@ -4939,16 +4949,24 @@
     if (questionDrafts.has(q.id)) { words.value = questionDrafts.get(q.id); questionDrafts.delete(q.id); }
     const sendWords = el("button", "undo-btn question-send", "send words");
     sendWords.type = "button";
-    sendWords.addEventListener("click", () => { if (words.value.trim()) send({ text: words.value }); });
+    // the streaming Mic and on-device Dictate on the reply box (board row 140), drawn only where the server and browser offer them;
+    // send words waits for the mic to end, so a partial is never sent
+    const wmic = window.LevainMic && typeof window.LevainMic.attach === "function" ? window.LevainMic.attach(words, { cls: "undo-btn", note: (t) => { msg.textContent = t; } }) : null;
+    sendWords.addEventListener("click", () => {
+      if (wmic && wmic.busy()) { msg.textContent = "Stop the mic first: your words are sent as they stand when it has ended."; return; }
+      if (words.value.trim()) send({ text: words.value });
+    });
     controls.push(words, sendWords);
+    slot.__mics = wmic ? [wmic] : [];
+    const micBtns = wmic ? wmic.buttons : [];
     if (card) {
       const bottom = el("div", "needs-actions needs-qa");
-      bottom.append(wrap, words, sendWords, msg);
+      bottom.append(wrap, words, ...micBtns, sendWords, msg);
       slot.replaceChildren(...parts);
       card.appendChild(bottom);
       return;
     }
-    parts.push(wrap, words, sendWords, msg);
+    parts.push(wrap, words, ...micBtns, sendWords, msg);
     slot.replaceChildren(...parts);
   }
   // iOS keyboards take a free-text box for a contact field when the card around it reads like mail (Phill 11-07, an
@@ -5212,6 +5230,7 @@
     return got;
   }
   function drawNoteBody(n, slot, b) {
+    offSlotMics(slot);        // a redraw ends the write-in mics of the sign facet it replaces
     const sv = (x) => (typeof x === "string" ? x : "");
     if (b.error) { slot.replaceChildren(el("div", "consent-note ext-meta", b.error)); return; }
     const parts = [el("div", "note-what", sv(b.what))];
@@ -5237,7 +5256,7 @@
       parts.push(bar);
     }
     // a note its caller filed a sign request for (DESIGN_SIGN D5) carries that request's ceremony under its words
-    if (!d && n.state === "open" && n.sign) parts.push(signFacet(n.sign));
+    if (!d && n.state === "open" && n.sign) { const facet = signFacet(n.sign); slot.__mics = facet.__mics; parts.push(facet); }
     slot.replaceChildren(...parts);
   }
   function noteRow(o) {
@@ -5730,6 +5749,7 @@
   // `head`: the focus view's question lines a needs-phill card replaces (signCardOf), else none
   function signFacet(id, head, full) {
     const wrap = el("div", "sign-facet");
+    wrap.__mics = [];       // the write-in's mic, ended with the card by its slot's next draw
     wrap.dataset.signRequest = id;
     const note = el("div", "sign-note ext-meta", "reading the sign request…");
     wrap.appendChild(note);
@@ -5798,7 +5818,7 @@
       const acts = el("div", "sign-actions");
       const buttons = [];
       let sheetBtn = null;    // "open the sheet": locked with the card's own controls, whether or not a key may sign
-      const lock = (on) => { for (const b of buttons) b.disabled = on || !signers.length; if (sheetBtn) sheetBtn.disabled = on; };
+      const lock = (on) => { for (const b of buttons) b.disabled = on || !signers.length; if (sheetBtn) sheetBtn.disabled = on; for (const m of wrap.__mics) m.lock(on || !signers.length); };
       let freeze = null;      // the write-in's frozen state while its ceremony runs (set below when it offers one)
       // the frozen card's view of its unsettled answer (signPending): "signed" says so and the board reads again;
       // "refused" gives the card back; anything else keeps it frozen until the next board read asks again (signRecheck)
@@ -5838,6 +5858,9 @@
       };
       const run = (choice, words) => {
         if (signBusy) return say(SIGN_BUSY, "bad");   // the lease holds a second tap, never a button drawn disabled
+        // a ceremony under a live mic ends the mic first, at once (off): a Dictate tail must not land in the write-in after the tap,
+        // so the box shown stays the words a ceremony signs; an idle mic keeps its control for a retry
+        for (const m of wrap.__mics) if (m.busy()) m.off();
         signBusy++;
         lock(true);
         if (!signInFlight.has(id)) signInFlight.set(id, new Set());
@@ -5913,12 +5936,16 @@
         box.addEventListener("input", () => signWriteIns.set(id, { sha256: r.sha256 || "", words: box.value }));
         const b = el("button", "undo-btn question-option sign-option", "(" + String(wi.key) + ") sign my words");
         b.type = "button";
+        // the streaming Mic and on-device Dictate on the write-in (board row 140); a tap that signs the words waits for the mic to end
+        const wmic = window.LevainMic && typeof window.LevainMic.attach === "function" ? window.LevainMic.attach(box, { cls: "undo-btn", note: (t) => say(t) }) : null;
+        if (wmic) wrap.__mics.push(wmic);
         // the words being signed are frozen from the tap until the ceremony ends; only a definite "nothing was signed"
         // unfreezes them, so a retry is a new tap over the same words
         freeze = { release: () => { box.readOnly = box.disabled = false; } };
         if (signInFlight.has(id)) box.readOnly = box.disabled = true;
         b.addEventListener("click", () => {
           if (signBusy) return say(SIGN_BUSY, "bad");
+          if (wmic && wmic.busy()) return say("Stop the mic first: your words are signed as they stand when it has ended.", "bad");
           const w = box.value.trim();
           if (!w) return say("type your answer first", "bad");
           box.value = w;
@@ -5927,7 +5954,7 @@
           run(String(wi.key), w);
         });
         buttons.push(b);
-        acts.append(box, b);
+        acts.append(box, ...(wmic ? wmic.buttons : []), b);
       }
       lock(false);
       sheetBtn = signSheetButton(r, say);
