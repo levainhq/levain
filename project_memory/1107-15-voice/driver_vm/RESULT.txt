@@ -1,2 +1,0 @@
-RESULT: this run tests an incomplete lifecycle (alloc, MINT, render, REVOKE; no FRONT-LOST until 3c); ACTIVE is not health and is never read as health.
-RESULT: PASS
