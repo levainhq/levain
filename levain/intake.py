@@ -9,7 +9,7 @@ contract: ``tests/vectors/list_intake_vectors.json``.
 
 ``<when>``: ``HH:MM`` / ``9am`` / ``5:30 pm`` (today if still ahead, else tomorrow) ·
 ``tomorrow [time]`` · ``mon..sun`` or full weekday ``[time]`` (the next one) ·
-``MM-DD [time]`` (the next one: this year if still ahead, else next year) · ``YYYY-MM-DD [time]`` · ``+Nm`` / ``+Nh`` / ``+Nd``. No time given
+``MM-DD [time]`` (the next one: this year if still ahead, else the next year that has the date) · ``YYYY-MM-DD [time]`` · ``+Nm`` / ``+Nh`` / ``+Nd``. No time given
 means 09:00. A ``<when>`` that does not read, a moment not in the future, an empty line,
 or no words after the prefix raises :class:`IntakeRefused` with the reason: a parser
 informs the human, it never guesses and never authorises.
