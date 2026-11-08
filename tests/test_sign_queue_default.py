@@ -160,3 +160,14 @@ def test_q4_the_hint_says_not_a_directory_for_a_file_and_reads_nothing_again(tmp
     (q / "claude_code.json").unlink()                      # the hint works from the one resolution, not a second read
     hint = ac.sign_queue_hint(found)
     assert f"{afile} is not a directory" in hint and "does not exist" not in hint, hint
+
+
+def test_q1_a_named_but_relative_env_queue_is_no_queue_never_the_settings_one(tmp_path, monkeypatch):
+    home, q = _hook_queue(tmp_path, {"sign_queue_dir": str(tmp_path)})
+    monkeypatch.setenv("LEVAIN_HOME", str(home))
+    monkeypatch.setenv("LEVAIN_SIGN_QUEUE_DIR", "relative/q")
+    found = ac.resolve_sign_queue(__import__("os").environ)
+    assert found.path is None
+    assert "LEVAIN_SIGN_QUEUE_DIR" in found.why and "relative/q" in found.why
+    monkeypatch.setenv("LEVAIN_SIGN_QUEUE_DIR", "")                     # empty counts as unset: the settings key wins
+    assert ac.resolve_sign_queue(__import__("os").environ).path == tmp_path

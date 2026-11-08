@@ -70,7 +70,8 @@ def _absolute(value: Any) -> Path | None:
 
 
 def resolve_sign_queue(environ: Mapping[str, str]) -> SignQueue:
-    """The cockpit Signer's queue dir, and why there is none. In order: an absolute ``$LEVAIN_SIGN_QUEUE_DIR``; else
+    """The cockpit Signer's queue dir, and why there is none. In order: ``$LEVAIN_SIGN_QUEUE_DIR`` when set and
+    non-empty (an absolute path, else no queue and ``why`` names it); else
     the hook queue's ``claude_code.json``. When that file is present it must be readable, a JSON object, and any
     ``sign_queue_dir`` key in it an absolute path string: otherwise no queue (``why`` names the file and the value),
     never a guess past a broken setting. The key's value is taken as named (whether it is a directory is the
@@ -79,8 +80,11 @@ def resolve_sign_queue(environ: Mapping[str, str]) -> SignQueue:
     origin or its sign-request directory exists (so a request filed there is still found after that cockpit stops).
     A stale origin after a crash still counts: a request filed then waits for the next serve on that queue.
     Relative paths are never resolved, since the hook runs in a project's directory."""
-    got = _absolute(environ.get(ENV_QUEUE))
-    if got is not None:
+    raw_env = environ.get(ENV_QUEUE)
+    if raw_env:   # an empty value counts as unset; a named one that is not absolute is refused, never passed over
+        got = _absolute(raw_env)
+        if got is None:
+            return SignQueue(None, None, f"${ENV_QUEUE} is {raw_env[:_TITLE_CUT]!r}, not an absolute directory path")
         return SignQueue(got)
     try:
         from levain.consent.queue import queue_dir_for
