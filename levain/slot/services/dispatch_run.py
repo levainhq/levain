@@ -1246,7 +1246,16 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         listener = _bind(Path(a.socket))
         brokered = None
         if server.brokered is not None:
-            brokered = (server.brokered, _bind(Path(a.socket).parent / BROKERED_SOCKET_NAME))
+            try:
+                brokered = (server.brokered, _bind(Path(a.socket).parent / BROKERED_SOCKET_NAME))
+            except Refused:
+                raise
+            except OSError as exc:
+                # ON never takes OFF's server down (PRE-W L2): the passthrough socket serves alone, as with the
+                # setting OFF; the unserved brokered server is marked stopping so nothing waits on it
+                print(f"levain dispatch-run: brokered socket not bound ({type(exc).__name__}: {exc}); serving the "
+                      "passthrough socket only", file=sys.stderr, flush=True)
+                server.brokered.shutdown(0.0)
     except Refused as exc:
         # Setup starts this unit before it writes the operator record, its LAST act (§23): on a fresh host the first
         # start finds none. EX_TEMPFAIL is restarted (Restart=always / KeepAlive); EX_CONFIG would leave it down.

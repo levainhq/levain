@@ -469,6 +469,19 @@ def test_main_on_serves_the_brokered_server_on_its_own_socket(tmp_path, monkeypa
     assert rig.server.shut and rig.server.brokered.shut and all(lis.closed for lis in rig.bound)
 
 
+def test_main_on_whose_brokered_bind_fails_logs_it_and_still_serves_the_passthrough_socket(tmp_path, monkeypatch,
+                                                                                            capsys):
+    """L2 small obs 1: ON must never take OFF's server down. An OSError binding run-brokered.sock (not a Refused) is
+    one stderr line and the service serves run.sock alone, as OFF does."""
+    rig = _MainRig(tmp_path, monkeypatch, "brokered",
+                   bind_fail={DR.BROKERED_SOCKET_NAME: OSError(48, "Address already in use")})
+    assert rig.run() == 0
+    assert rig.served == [("passthrough", "run.sock")]
+    assert rig.server.shut and all(lis.closed for lis in rig.bound)
+    err = capsys.readouterr().err
+    assert "brokered" in err and "OSError" in err and err.count("\n") == 1, err
+
+
 
 
 # --- the two run servers share ONE holder registry (L2 HIGH-1, MED-1, MED-2; L1 W1) ---------------------------------------
