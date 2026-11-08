@@ -43,6 +43,7 @@ from levain.coordinator.store import CoordError, CoordStore
 __all__ = ["Delivery", "FEEDS_LOCK", "deliver", "faults", "pass_line", "run", "run_exclusive", "waiting_lines"]
 
 _TEXT = 500
+_NAME_KEPT = 80      # the most of an agent or tool name a SIGN text keeps
 _CWD_KEPT = 120     # the most of a cwd a SIGN text keeps (its tail: the folder nearest the command)
 
 
@@ -52,9 +53,9 @@ def _sign_text(agent: str, tool: str, display: str, cwd: str) -> str:
     command run in two folders must not read alike). Each part is cut on its own, with an ellipsis. Known edge: a SIGN
     filed before this wording keeps its old text (replies are append-only and a re-run finds it by request id)."""
     where = cwd if len(cwd) <= _CWD_KEPT else "\u2026" + cwd[-(_CWD_KEPT - 1):]
-    head, tail = f"{agent} asks to run {tool}: ", f" (in {where})"
+    head, tail = f"{agent[:_NAME_KEPT]} asks to run {tool[:_NAME_KEPT]}: ", f" (in {where})"   # bounded: head + tail < _TEXT
     room = max(0, _TEXT - len(head) - len(tail))
-    what = display if len(display) <= room else display[:max(0, room - 1)] + "\u2026"
+    what = display if len(display) <= room else display[:room - 1] + "\u2026"
     return (head + what + tail)[:_TEXT]
 
 

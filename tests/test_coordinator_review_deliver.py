@@ -626,3 +626,9 @@ def test_a_long_command_never_pushes_the_cwd_out_of_the_sign_text():
     text = deliver._sign_text("seat", "Bash", "git push origin main", deep)
     assert "git push origin main" in text and text.endswith("/repo)") and len(text) <= deliver._TEXT
     assert deliver._sign_text("a", "Bash", "ls", "/w") == "a asks to run Bash: ls (in /w)"
+
+
+def test_an_absurd_tool_name_cannot_crowd_out_the_cwd():
+    """L3 r2 codex MED / gemini LOW: a 473-char tool name made head + tail exceed _TEXT and the cut ate "/a)"."""
+    a, b = (deliver._sign_text("codex", "T" * 473, "ls", cwd) for cwd in ("/a", "/b"))
+    assert a != b and a.endswith("(in /a)") and len(a) <= deliver._TEXT
