@@ -134,7 +134,7 @@ class PriceTable:
         return None
 
 
-PRICES_AS_OF = "2026-11-05"
+PRICES_AS_OF = "2026-11-07"
 
 # List prices as the vendors' pages printed them on PRICES_AS_OF. Not here on purpose: OpenAI's gpt-4o-mini-tts, which is
 # priced per token with no per-character or per-minute figure to convert, so it is refused as unpriced until someone
@@ -146,6 +146,8 @@ DEFAULT_PRICES = PriceTable(
         PriceEntry("openai", "tts", "tts-1", micros=15_000_000, per=1_000_000),          # $15 / 1M characters
         PriceEntry("openai", "tts", "tts-1-hd", micros=30_000_000, per=1_000_000),       # $30 / 1M characters
         PriceEntry("openai", "stt", "gpt-4o-mini-transcribe", micros=3_000, per=60),     # $0.003 / minute
+        # https://developers.openai.com/api/docs/pricing, read 2026-11-07: gpt-live-transcribe, estimated per minute
+        PriceEntry("openai", "stt", "gpt-live-transcribe", micros=17_000, per=60),       # $0.017 / minute
         PriceEntry("elevenlabs", "tts", "eleven_flash_v2_5", micros=40_000, per=1_000),  # $0.04 / 1K characters
         PriceEntry("elevenlabs", "stt", "scribe", micros=220_000, per=3_600),            # $0.22 / hour
         PriceEntry("deepgram", "tts", "aura-2", micros=30_000, per=1_000),               # $0.030 / 1K characters
