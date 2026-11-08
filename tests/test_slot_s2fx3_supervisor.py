@@ -840,3 +840,13 @@ def test_kitty_pushes_past_the_cap_are_dropped_and_so_are_their_pops() -> None:
     g = TermFilter()
     g.feed(push * (_KITTY_PUSH_MAX + 1))
     assert g.reset() == b"\x1b[<" + str(_KITTY_PUSH_MAX).encode() + b"u"
+
+
+@pytest.mark.parametrize("data, undo", [
+    (b"\x1b[?47h\x1b[>1u", b"\x1b[<1u\x1b[?47l"),     # left the way it was entered: no 1049l without its 1049h
+    (b"\x1b[?1047h\x1b[>1u\x1b[=5u", b"\x1b[<1u\x1b[?1047l"),
+])
+def test_kitty_entries_on_an_alternate_screen_the_slot_is_still_on_leave_only_the_modes_it_set(data, undo) -> None:
+    f = TermFilter()
+    f.feed(data)
+    assert f.reset() == undo

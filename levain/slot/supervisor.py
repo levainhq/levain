@@ -168,8 +168,8 @@ class TermFilter:
         if self._kitty_pushes[True] or self._kitty_set[True]:
             if not alt:
                 out += b"\x1b[?1049h"   # the alternate screen's stack is reached only from that screen
+                alt = {1049}            # and left the way it was entered: no 1049l without a matching 1049h
             out += self._kitty_undo(True)
-            alt = alt | {1049}
         if alt:
             out += b"\x1b[?" + ";".join(map(str, sorted(alt, reverse=True))).encode("ascii") + b"l"
         out += self._kitty_undo(False)
