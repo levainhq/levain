@@ -25,7 +25,9 @@ def test_the_pair_page_and_its_scripts_are_served_without_a_credential_proxied_a
             for headers in (None, PROXY):                    # off-box (his :8443 path) is the one that matters
                 st, out, hdrs = _call(port, "GET", path, headers=headers)
                 assert st == 200 and hdrs["content-type"].startswith(kind), (path, headers, st)
-                assert hdrs["cache-control"] == "no-store" and "script-src 'self'" in hdrs["content-security-policy"]
+                # the html shell stays no-store; a static script revalidates (no-cache + ETag, gzip when accepted)
+                assert hdrs["cache-control"] == ("no-store" if kind == "text/html" else "no-cache")
+                assert "script-src 'self'" in hdrs["content-security-policy"]
         html = load_web_asset("pair.html")
         assert '<script src="/pair.js"></script>' in html and not re.search(r"<script(?![^>]*\bsrc=)", html)
         assert '<script src="/devices_panel.js"></script>' in load_web_asset("dashboard.html")

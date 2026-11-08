@@ -78,6 +78,7 @@ Sovereignty boundary (load-bearing, not incidental):
 from __future__ import annotations
 
 import dataclasses
+import gzip
 import hashlib
 import hmac
 import re
@@ -1500,6 +1501,75 @@ _ANY_REF = re.compile(r"""(?<![\w-])(?:src|href)\s*=\s*\\?["']?(/[^\s"'>\\]+)"""
 _SHELL_ASSET_EXT = (".js", ".css")
 
 
+# Static .css/.js assets (never HTML, never JSON): served compressed when the client allows it, with a strong ETag and
+# ``no-cache`` so a repeat load revalidates to a 304 instead of re-downloading (the consent card pulled ~538 KB uncompressed
+# under ``no-store`` on every load). The bytes are immutable for a server's life, so the compressed body and the ETag are
+# computed once per body; the entry keeps a reference to the body so its ``id`` cannot be reused.
+_STATIC_CACHE: dict[int, tuple[bytes, str, str, bytes]] = {}
+_STATIC_CACHE_LOCK = threading.Lock()
+_STATIC_CACHE_MAX = 256
+_COMPRESSIBLE_TYPES = frozenset({"text/css", "text/javascript", "application/javascript"})
+STATIC_CACHE_CONTROL = "no-cache"
+
+
+def _compressible(content_type: str) -> bool:
+    """The media type (parameters such as charset ignored, case-insensitive) is a CSS/JS one the server can emit."""
+    return content_type.partition(";")[0].strip().lower() in _COMPRESSIBLE_TYPES
+
+
+def _coding_q(params: str) -> float:
+    """The qvalue of one Accept-Encoding member; no ``q`` is 1, a malformed one is 0 (identity is the safe answer)."""
+    m = re.search(r"(?:^|;)\s*q\s*=\s*([^;\s]*)", params, re.IGNORECASE)
+    if m is None:
+        return 1.0
+    try:
+        return float(m.group(1))
+    except ValueError:
+        return 0.0
+
+
+def _accepts_gzip(header: str | None) -> bool:
+    """RFC 9110 12.5.3: an explicit ``gzip`` (or ``x-gzip``) entry decides; otherwise ``*`` with q>0 allows it."""
+    star: float | None = None
+    for part in (header or "").split(","):
+        name, _, params = part.strip().partition(";")
+        name = name.strip().lower()
+        if name in ("gzip", "x-gzip"):
+            return _coding_q(params) > 0
+        if name == "*":
+            star = _coding_q(params)
+    return star is not None and star > 0
+
+
+def _static_entry(body: bytes) -> tuple[str, str, bytes]:
+    """``(identity etag, gzip etag, gzip of the bytes)``, cached per body. The hash and compression run outside the
+    lock, so a large uncached body never blocks a cache hit for another; two cold racers on the same body may both
+    compress it (identical output), and the first insert wins."""
+    with _STATIC_CACHE_LOCK:
+        hit = _STATIC_CACHE.get(id(body))
+        if hit is not None and hit[0] is body:
+            return hit[1], hit[2], hit[3]
+    digest = hashlib.sha256(body).hexdigest()[:32]
+    etag, gz_etag = '"' + digest + '"', '"' + digest + '-gz"'
+    gz = gzip.compress(body, compresslevel=9, mtime=0)
+    with _STATIC_CACHE_LOCK:
+        hit = _STATIC_CACHE.get(id(body))
+        if hit is not None and hit[0] is body:
+            return hit[1], hit[2], hit[3]
+        if len(_STATIC_CACHE) >= _STATIC_CACHE_MAX:
+            _STATIC_CACHE.clear()
+        _STATIC_CACHE[id(body)] = (body, etag, gz_etag, gz)
+    return etag, gz_etag, gz
+
+
+def _etag_matches(if_none_match: str | None, *etags: str) -> bool:
+    if not if_none_match:
+        return False
+    if if_none_match.strip() == "*":
+        return True
+    return any(t.strip().removeprefix("W/") in etags for t in if_none_match.split(","))
+
+
 def _asset_digest(data: bytes) -> str:
     return hashlib.sha256(data).hexdigest()[:12]
 
@@ -1962,12 +2032,14 @@ class _LevainHTTPServer(ThreadingHTTPServer):
     stream_gate: threading.BoundedSemaphore
     stream_heartbeat_s: float
     stream_stop: threading.Event
+    room_waiter_gate: threading.BoundedSemaphore
     stream_watcher: "cockpit_stream.Watcher"
 
     def __init__(self, *args: Any, **kwargs: Any) -> None:
         self.stream_gate = threading.BoundedSemaphore(cockpit_stream.DEFAULT_MAX_STREAMS)
         self.stream_heartbeat_s = cockpit_stream.DEFAULT_HEARTBEAT_S
         self.stream_stop = threading.Event()
+        self.room_waiter_gate = threading.BoundedSemaphore(cockpit_room.WAITERS_MAX)
         self.stream_watcher = cockpit_stream.Watcher(self._watch_manifest, epoch=secrets.token_hex(4))
         # PAIR: the paired lookups' and the claim's own semaphores (RT-3, RP-4), and the in-process revocation epoch
         # a revoke bumps AFTER its transaction commits, which every open stream compares before each frame (RU-3)
@@ -2172,6 +2244,30 @@ class _Handler(GuardedHandler):
             self._send(*args, **kw)
         finally:
             self._frame_headers = None
+
+    def _send_static(self, body: bytes, content_type: str, *, head: bool) -> None:
+        """A static .css/.js asset: strong ETag + ``no-cache`` (revalidate, 304 on a match) and gzip when the client
+        accepts it. Anything else (HTML shells, JSON) goes through ``_send`` and keeps its own cache policy."""
+        if not _compressible(content_type):
+            self._send(body, content_type, head=head)
+            return
+        etag, gz_etag, gz = _static_entry(body)
+        use_gz = _accepts_gzip(self.headers.get("Accept-Encoding"))
+        served = gz_etag if use_gz else etag
+        vary = ("Vary", "Accept-Encoding")
+        if _etag_matches(self.headers.get("If-None-Match"), served):
+            self.send_response(304)
+            self.send_header("ETag", served)
+            self.send_header(*vary)
+            self._cache_control = STATIC_CACHE_CONTROL
+            self.end_headers()
+            self._cache_control = None
+            return
+        hdrs = [("ETag", served), vary]
+        if use_gz:
+            body = gz
+            hdrs.append(("Content-Encoding", "gzip"))
+        self._send(body, content_type, head=head, headers=hdrs, cache_control=STATIC_CACHE_CONTROL)
 
     def _push_tap_path(self) -> bool:
         """True for ``/?<a push tap's deep link>`` (see :data:`_PUSH_TAP_QUERY`): the exact raw path, no other parameter."""
@@ -2445,11 +2541,16 @@ class _Handler(GuardedHandler):
                 _log.debug("paired device last_seen stamp skipped", exc_info=True)
         return device
 
-    def _transport(self) -> dict[str, bool]:
-        """The manifest's ``transport``: the same two flags ``/substrate.json`` carries."""
-        return {"writable": self.server.levain_source.write_scope is not None,
-                "write_token_required": self._write_token_required() or self._writes_need_credential(),
-                "owner_key": self._owner_key_accepted()}
+    def _transport(self) -> dict[str, Any]:
+        """The manifest's ``transport``: the same flags ``/substrate.json`` carries, and ``room`` (where the room is read
+        and how: its cursor, thread and long-poll bound) only on a server that mounts a room."""
+        out: dict[str, Any] = {"writable": self.server.levain_source.write_scope is not None,
+                               "write_token_required": self._write_token_required() or self._writes_need_credential(),
+                               "owner_key": self._owner_key_accepted()}
+        if self.server.room_host is not None:
+            out["room"] = {"read": cockpit_room.ROOM_PATH, "cursor": "gseq", "after": True, "thread": True,
+                           "wait_max_s": cockpit_room.WAIT_MAX_S, "live": True}
+        return out
 
     def _writes_need_credential(self) -> bool:
         """K2a: a writable surface needs a credential on every write, on every bind."""
@@ -3809,10 +3910,27 @@ class _Handler(GuardedHandler):
         if not self._off_box_token_valid():
             self._gated_read_403("the room record needs", head=head)
             return
+        query = urllib.parse.urlsplit(self.path).query
+        # the query is parsed once, up front, with no gate held: a malformed one can neither hold a request slot nor
+        # leak one (L3 room r1 codex HIGH), and both branches below refuse the same bad parameters alike (r1 LOWs)
+        try:
+            after, thread = cockpit_room.parse_cursor(query)
+            wait = cockpit_room.parse_wait(query, after)
+            live_seq = cockpit_room.parse_live_seq(query)
+        except cockpit_room.CursorError as e:
+            self._send(cockpit_room.encode({"error": "bad_request", "message": str(e)}),
+                       "application/json; charset=utf-8", status=400, head=head,
+                       headers=[("Vary", _WRITE_TOKEN_HEADER)], cache_control="private, no-store")
+            return
         directory = self._store_directory()
+        reader: "Callable[[], tuple[int, dict[str, Any]]] | None" = None
         if directory is None:
-            status, payload = 200, {"room_thread": None, "launch_id": None, "composer": None, "model": None, "gap": False,
-                                    "stream": [], "proposals": []}
+            def reader() -> "tuple[int, dict[str, Any]]":
+                # no store: the quiet empty room, and a wait on it is honoured like any other (never a tight loop)
+                return 200, cockpit_room.apply_cursor(
+                    {"room_thread": None, "launch_id": None, "composer": None, "model": None, "gap": False,
+                     "stream": [], "proposals": [], "live": None}, after, thread)
+            status, payload = reader()
         else:
             if not self.server.request_gate.acquire(blocking=False):
                 self._send(b"busy\n", "text/plain; charset=utf-8", status=503, head=head)
@@ -3820,11 +3938,69 @@ class _Handler(GuardedHandler):
             try:
                 host = self.server.room_host
                 status, payload = cockpit_room.serve_room(path, directory=directory, service=self.server.chat_service,
-                                                          view=host.view if host is not None else None)
+                                                          view=host.view if host is not None else None, query=query)
             finally:
                 self.server.request_gate.release()
+        if wait is not None and status == 200 and not head:
+            waited = self._room_wait(path, directory, query, wait, (status, payload), live_seq, reader=reader)
+            if waited is None:
+                if not self._peer_open():   # nobody is there to read an answer: send none (r1 gemini MED)
+                    self.close_connection = True
+                    return
+                self._gated_read_403("the room record needs", head=head)     # the credential ended: the one 403
+                return
+            status, payload = waited
         self._send(cockpit_room.encode(payload), "application/json; charset=utf-8", status=status, head=head,
-                   headers=[("Vary", _WRITE_TOKEN_HEADER)], cache_control="private, no-store")
+                   headers=[("Vary", _WRITE_TOKEN_HEADER)] + ([("Retry-After", "2")] if status == 503 else []),
+                   cache_control="private, no-store")
+
+    def _room_wait(self, path: str, directory: Any, query: str, wait: int,
+                   first: "tuple[int, dict[str, Any]]",
+                   live_seq: "int | None" = None, *,
+                   reader: "Callable[[], tuple[int, dict[str, Any]]] | None" = None,
+                   ) -> "tuple[int, dict[str, Any]] | None":
+        """The long-poll half of ``_serve_room`` (``first`` is the read the request gate already admitted). The wait holds
+        NO ``request_gate`` or read slot: each tick re-reads under a non-blocking ``request_gate`` slot of its own (a busy
+        gate skips the tick), and the wait itself is counted by ``room_waiters`` (cap ``cockpit_room.WAITERS_MAX``, past it a 503
+        with ``Retry-After``, like ``stream_gate``). Before each re-read the credential is re-checked by the change
+        stream's own check (``_stream_allowed``: a paired device must still be live, the epoch and the journal read
+        fresh); a surface token is never revoked from the panel, so it has none. None: the caller answers 403.
+
+        A ``first`` that is already an answer (a newer item, a ``reset``, live text past ``live_seq``) is returned before
+        any waiter slot is taken, so a full waiter cap never turns it into a 503. ``reader`` (the no-store branch's
+        empty room) replaces the store read on each tick."""
+        srv = self.server
+        if cockpit_room.is_news(first[0], first[1], live_seq):
+            return first
+        allowed = self._stream_allowed()
+        host = srv.room_host
+
+        def read() -> "tuple[int, dict[str, Any]] | None":
+            if reader is not None:
+                return reader()
+            if not srv.request_gate.acquire(blocking=False):
+                return None
+            try:
+                return cockpit_room.serve_room(path, directory=directory, service=srv.chat_service,
+                                               view=host.view if host is not None else None, query=query)
+            finally:
+                srv.request_gate.release()
+
+        first_given = []
+
+        def one() -> "tuple[int, dict[str, Any]] | None":
+            if not first_given:
+                first_given.append(True)
+                return first
+            return read()
+
+        if not srv.room_waiter_gate.acquire(blocking=False):
+            return 503, {"error": "busy", "message": "too many rooms waiting; read again shortly"}
+        try:
+            return cockpit_room.wait_for_news(one, wait, allowed=allowed, alive=self._peer_open, stop=srv.stream_stop,
+                                           live_seq=live_seq)
+        finally:
+            srv.room_waiter_gate.release()
 
     def _room_post(self, route: tuple[str, str | None], req: Any) -> tuple[dict[str, Any], int]:
         """``POST /cockpit/room/*`` (RM-F), reached only past ``do_POST``'s write gate (a surface token on every bind).
@@ -4690,7 +4866,7 @@ class _Handler(GuardedHandler):
                 self._send_framing((_COCKPIT_PAGE_CSP, "DENY"), self.server.levain_assets[filename], content_type,
                                    head=head, headers=[("Permissions-Policy", _PERMISSIONS_POLICY)])
             else:
-                self._send(self.server.levain_assets[filename], content_type, head=head)
+                self._send_static(self.server.levain_assets[filename], content_type, head=head)
             return
 
         # Downstream-registered static assets (cached bytes, ungated — same class as the
@@ -4699,7 +4875,7 @@ class _Handler(GuardedHandler):
         extra = self.server.extra_assets.get(path)
         if extra is not None:
             content_type, body = extra
-            self._send(body, content_type, head=head)
+            self._send_static(body, content_type, head=head)
             return
 
         self._send(b"not found\n", "text/plain; charset=utf-8", status=404, head=head)
