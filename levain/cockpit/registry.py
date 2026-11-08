@@ -148,7 +148,7 @@ FACETS: dict[str, tuple[str, Callable[[Any], bool]]] = {
     "question_carried": ("bool", _is_bool),
     # an open question snoozed past today (band_view.later_of): the day (YYYY-MM-DD) and its words ("Mon", "Tue 11-10")
     "question_later": ("YYYY-MM-DD calendar date", _is_iso_day),
-    "question_later_words": ("printable string of 1..40 chars", _is_later_words),
+    "question_later_words": ("Mon..Sun, optionally followed by MM-DD", _is_later_words),
     # an agent's note (levain.consent.notes): its number and whether it was dismissed; its words are never a facet
     "note_n": ("int", _is_int),
     "note_state": ("enum", _enum("open", "dismissed")),
