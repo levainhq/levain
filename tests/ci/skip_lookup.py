@@ -29,6 +29,15 @@ LANDING_REFS = ("land/", "seat/")
 PAGE = 100
 
 
+def _well_formed(r):
+    """A run record with an id (int or str, not bool), string head_branch, event and status, and a string or null
+    conclusion."""
+    return (isinstance(r, dict)
+            and isinstance(r.get("id"), (int, str)) and not isinstance(r.get("id"), bool)
+            and all(isinstance(r.get(k), str) for k in ("head_branch", "event", "status"))
+            and (r.get("conclusion") is None or isinstance(r.get("conclusion"), str)))
+
+
 def decide(event, ref_type, ref_name, run_id, runs_reply):
     """(skip, ref, verifying_run_id) from the push's own facts and the API's reply for this sha.
 
@@ -40,7 +49,10 @@ def decide(event, ref_type, ref_name, run_id, runs_reply):
     try:
         runs = runs_reply["workflow_runs"]
         total = runs_reply["total_count"]
-        if not isinstance(runs, list) or isinstance(total, bool) or not isinstance(total, int) or total > len(runs):
+        # The one page asked for must be the whole answer (the count equals the page), and every record on it must have
+        # the shape the choice below reads, so a malformed record beside a valid one is doubt, not a skipped record.
+        if (not isinstance(runs, list) or isinstance(total, bool) or not isinstance(total, int)
+                or total != len(runs) or not all(_well_formed(r) for r in runs)):
             return no
         for r in runs:
             if (r["conclusion"] == "success" and r["status"] == "completed" and r["event"] in VERIFYING_EVENTS

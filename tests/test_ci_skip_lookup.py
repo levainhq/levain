@@ -92,3 +92,20 @@ def test_a_write_failure_on_the_output_file_exits_nonzero_and_says_the_suite_run
     assert skip_lookup.main(env, lambda *a: reply(run(11, "land/k"))) != 0
     err = capsys.readouterr().err
     assert "could not write" in err and "full suite runs" in err
+
+
+@pytest.mark.parametrize("rep", [
+    reply(run(1, "land/k"), None),                              # a valid record beside a non-record
+    reply(run(1, "land/k"), {"id": 2}),                         # a valid record beside a partial one
+    reply(run(1, "land/k"), run(2, "land/k", conclusion=5)),    # a wrong-typed field beside a valid one
+    reply(run(1, "land/k"), run(2, ["land/k"])),
+    reply(run(1, "land/k"), {**run(2), "head_branch": None}),
+    reply(run(1, "land/k"), {**run(2), "id": None}),
+    reply(run(1, "land/k"), {**run(2), "status": None}),
+    reply(run(1, "land/k"), {**run(2), "event": 3}),
+    reply(run(1, "land/k"), total=0),                           # a count that disagrees with the page, short
+    reply(run(1, "land/k"), total=2),                           # and long
+    reply(total=1),                                             # a count with no run
+])
+def test_every_record_is_checked_and_the_count_must_match_the_page(rep):
+    assert decide(rep) == (False, "", "")
