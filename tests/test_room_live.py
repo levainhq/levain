@@ -79,9 +79,9 @@ class T:
 
 @pytest.fixture(autouse=True)
 def _clean():
-    room_live.forget(LID)
+    room_live._purge(LID)
     yield
-    room_live.forget(LID)
+    room_live._purge(LID)
 
 
 def make():
@@ -236,3 +236,57 @@ def test_real_capture_replays_one_agent_text_and_live_grows_then_clears():
     assert len(set(seen_live)) > 10                              # it grew across the deltas
     assert len(agent_texts) == 1 and agent_texts[0] == streamed and streamed
     assert room_live.snapshot(LID) is None
+
+
+# ---- L3 stream r1 fixes ------------------------------------------------------------------------------------------------
+def test_a_delta_in_flight_at_teardown_never_resurrects_an_ended_launch():
+    """codex + complement MED: the pump had polled a delta; ``_end`` forgets the buffer and closes the session; the pump
+    then ingests the delta it already held. The ended launch must show nothing and hold no buffer, in either order."""
+    s, t = make()
+    t.feed(init(), start(), block_start(), delta("before"))
+    s.read(None)
+    room_live.forget(LID)                    # RoomLauncher._end: forget first ...
+    s.close()                                # ... then the session's close
+    s._ingest(json.dumps(delta("late")))     # the delta the pump polled before the end
+    assert room_live.snapshot(LID) is None and LID not in room_live._BUF
+    room_live.Sink(LID).delta("t", "direct")  # a write straight to the sink is refused alike
+    assert room_live.snapshot(LID) is None and LID not in room_live._BUF and LID not in room_live._SEQ
+
+
+def test_a_character_split_at_the_cap_ends_the_buffer_as_a_pure_head():
+    """gemini MED / complement LOW: a 2-byte char with 1 byte of room is dropped AND the buffer is full, so a later
+    1-byte delta cannot land after the hole; the live text equals the stored cap of the same reply."""
+    sink = room_live.Sink(LID)
+    head = "a" * (room_live.LIVE_MAX - 1)
+    sink.delta("t", head)
+    sink.delta("t", "é")
+    sink.delta("t", "b")
+    snap = room_live.snapshot(LID)
+    assert snap["text"] == head and snap["text"] == cs._cap(head + "é" + "b")
+
+
+def test_an_open_buffer_outlives_newer_launches_and_seq_never_goes_back():
+    """gemini MED: past LAUNCH_MAX an idle buffer goes first, never the one mid-reply; complement LOW: a buffer that
+    WAS evicted keeps its seq rising when it is written again."""
+    others = [f"lru-{i}" for i in range(room_live.LAUNCH_MAX + 2)]
+    for i in others:
+        room_live._purge(i)
+    active = room_live.Sink(LID)
+    active.delta("t1", "mid-reply")
+    try:
+        for i in others:                     # newer launches whose turn has ended (written, then cleared)
+            room_live.Sink(i).delta("t", "x")
+            room_live.clear(i)
+        assert room_live.snapshot(LID)["text"] == "mid-reply"
+        # now evict the active one deliberately: every other buffer is open too
+        seq = room_live.snapshot(LID)["seq"]
+        active.clear()
+        seq = room_live._SEQ[LID]
+        for i in others:
+            room_live.Sink(i).delta("t", "y")
+        assert LID not in room_live._BUF
+        active.delta("t2", "again")
+        assert room_live.snapshot(LID)["seq"] > seq
+    finally:
+        for i in others:
+            room_live._purge(i)

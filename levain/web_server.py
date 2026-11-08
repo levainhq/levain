@@ -3809,30 +3809,30 @@ class _Handler(GuardedHandler):
         if not self._off_box_token_valid():
             self._gated_read_403("the room record needs", head=head)
             return
-        directory = self._store_directory()
         query = urllib.parse.urlsplit(self.path).query
+        # the query is parsed once, up front, with no gate held: a malformed one can neither hold a request slot nor
+        # leak one (L3 room r1 codex HIGH), and both branches below refuse the same bad parameters alike (r1 LOWs)
+        try:
+            after, thread = cockpit_room.parse_cursor(query)
+            wait = cockpit_room.parse_wait(query, after)
+            live_seq = cockpit_room.parse_live_seq(query)
+        except cockpit_room.CursorError as e:
+            self._send(cockpit_room.encode({"error": "bad_request", "message": str(e)}),
+                       "application/json; charset=utf-8", status=400, head=head,
+                       headers=[("Vary", _WRITE_TOKEN_HEADER)], cache_control="private, no-store")
+            return
+        directory = self._store_directory()
+        reader: "Callable[[], tuple[int, dict[str, Any]]] | None" = None
         if directory is None:
-            try:
-                after, thread = cockpit_room.parse_cursor(query)
-            except cockpit_room.CursorError as e:
-                status, payload = 400, {"error": "bad_request", "message": str(e)}
-            else:
-                status, payload = 200, cockpit_room.apply_cursor(
+            def reader() -> "tuple[int, dict[str, Any]]":
+                # no store: the quiet empty room, and a wait on it is honoured like any other (never a tight loop)
+                return 200, cockpit_room.apply_cursor(
                     {"room_thread": None, "launch_id": None, "composer": None, "model": None, "gap": False,
                      "stream": [], "proposals": [], "live": None}, after, thread)
+            status, payload = reader()
         else:
             if not self.server.request_gate.acquire(blocking=False):
                 self._send(b"busy\n", "text/plain; charset=utf-8", status=503, head=head)
-                return
-            try:
-                after, _thread = cockpit_room.parse_cursor(query)
-                wait = cockpit_room.parse_wait(query, after)
-                live_seq = cockpit_room.parse_live_seq(query)
-            except cockpit_room.CursorError as e:
-                self.server.request_gate.release()
-                self._send(cockpit_room.encode({"error": "bad_request", "message": str(e)}),
-                           "application/json; charset=utf-8", status=400, head=head,
-                           headers=[("Vary", _WRITE_TOKEN_HEADER)], cache_control="private, no-store")
                 return
             try:
                 host = self.server.room_host
@@ -3840,32 +3840,43 @@ class _Handler(GuardedHandler):
                                                           view=host.view if host is not None else None, query=query)
             finally:
                 self.server.request_gate.release()
-            if wait is not None and status == 200 and not head:
-                waited = self._room_wait(path, directory, query, wait, (status, payload), live_seq)
-                if waited is None:      # the credential ended, or the peer went: the one token 403
-                    self._gated_read_403("the room record needs", head=head)
+        if wait is not None and status == 200 and not head:
+            waited = self._room_wait(path, directory, query, wait, (status, payload), live_seq, reader=reader)
+            if waited is None:
+                if not self._peer_open():   # nobody is there to read an answer: send none (r1 gemini MED)
+                    self.close_connection = True
                     return
-                status, payload = waited
+                self._gated_read_403("the room record needs", head=head)     # the credential ended: the one 403
+                return
+            status, payload = waited
         self._send(cockpit_room.encode(payload), "application/json; charset=utf-8", status=status, head=head,
                    headers=[("Vary", _WRITE_TOKEN_HEADER)] + ([("Retry-After", "2")] if status == 503 else []),
                    cache_control="private, no-store")
 
     def _room_wait(self, path: str, directory: Any, query: str, wait: int,
                    first: "tuple[int, dict[str, Any]]",
-                   live_seq: "int | None" = None) -> "tuple[int, dict[str, Any]] | None":
+                   live_seq: "int | None" = None, *,
+                   reader: "Callable[[], tuple[int, dict[str, Any]]] | None" = None,
+                   ) -> "tuple[int, dict[str, Any]] | None":
         """The long-poll half of ``_serve_room`` (``first`` is the read the request gate already admitted). The wait holds
         NO ``request_gate`` or read slot: each tick re-reads under a non-blocking ``request_gate`` slot of its own (a busy
         gate skips the tick), and the wait itself is counted by ``room_waiters`` (cap ``cockpit_room.WAITERS_MAX``, past it a 503
         with ``Retry-After``, like ``stream_gate``). Before each re-read the credential is re-checked by the change
         stream's own check (``_stream_allowed``: a paired device must still be live, the epoch and the journal read
-        fresh); a surface token is never revoked from the panel, so it has none. None: the caller answers 403."""
+        fresh); a surface token is never revoked from the panel, so it has none. None: the caller answers 403.
+
+        A ``first`` that is already an answer (a newer item, a ``reset``, live text past ``live_seq``) is returned before
+        any waiter slot is taken, so a full waiter cap never turns it into a 503. ``reader`` (the no-store branch's
+        empty room) replaces the store read on each tick."""
         srv = self.server
+        if cockpit_room.is_news(first[0], first[1], live_seq):
+            return first
         allowed = self._stream_allowed()
-        if not srv.room_waiter_gate.acquire(blocking=False):
-            return 503, {"error": "busy", "message": "too many rooms waiting; read again shortly"}
         host = srv.room_host
 
         def read() -> "tuple[int, dict[str, Any]] | None":
+            if reader is not None:
+                return reader()
             if not srv.request_gate.acquire(blocking=False):
                 return None
             try:
@@ -3882,6 +3893,8 @@ class _Handler(GuardedHandler):
                 return first
             return read()
 
+        if not srv.room_waiter_gate.acquire(blocking=False):
+            return 503, {"error": "busy", "message": "too many rooms waiting; read again shortly"}
         try:
             return cockpit_room.wait_for_news(one, wait, allowed=allowed, alive=self._peer_open, stop=srv.stream_stop,
                                            live_seq=live_seq)

@@ -12,8 +12,9 @@ as ``httpd.room_host``). The two share this module's dict under :data:`_LOCK`. A
 nothing here; none exists today.
 
 **Bounds.** At most :data:`LIVE_MAX` UTF-8 bytes of text per launch (the head, the same rule and the same number as the
-stored ``agent_text`` cap, ``claude_session._BODY_MAX``; a test holds the two equal), at most :data:`LAUNCH_MAX`
-launches held (the oldest-touched is dropped past it). There is NO redaction here because there is none on stored
+stored ``agent_text`` cap, ``claude_session._BODY_MAX``; a test holds the two equal; once a delta is cut there, the
+buffer takes nothing more until it is cleared), at most :data:`LAUNCH_MAX` launches held (past it the oldest-touched
+buffer with no live text is dropped first). A launch :func:`forget` ended never gets a buffer again. There is NO redaction here because there is none on stored
 ``agent_text`` either: both carry the model's words as written, and the room's containment is the child's argv, not a
 scrub of its output.
 
@@ -30,20 +31,36 @@ LIVE_MAX = 16 * 1024
 # [seat, UNMEASURED] launches whose buffer is held at once; a room holds one, so this only bounds a leak
 LAUNCH_MAX = 8
 
+# [seat] ended launch ids remembered so a delta already in flight when the launch ended cannot re-create its buffer
+# (L3 stream r1 codex + complement MED); launch ids are never reused, so this only needs to outlive the pump's last read
+ENDED_MAX = 64
+
 _LOCK = threading.Lock()
 _BUF: dict[str, dict[str, Any]] = {}      # launch_id -> {"turn", "text", "bytes", "seq"}; text "" = nothing live
-_SEQ: dict[str, int] = {}                 # launch_id -> last seq handed out; survives a clear so seq only grows
+_SEQ: dict[str, int] = {}                 # launch_id -> last seq handed out; survives a clear AND an eviction
+_ENDED: dict[str, None] = {}              # launch ids :func:`forget` ended, oldest first (an ordered set)
 
 
-def _entry(launch_id: str) -> dict[str, Any]:
+def _entry(launch_id: str) -> Optional[dict[str, Any]]:
+    """The launch's buffer, made most recent; None for an ended launch (it is never re-created). Past
+    :data:`LAUNCH_MAX` the oldest buffer with NO live text is dropped first; an open buffer (mid-reply) goes only when
+    every other one is open too (L3 stream r1 gemini MED). ``_SEQ`` is kept on an eviction, so a re-created buffer's
+    ``seq`` still only grows."""
+    if launch_id in _ENDED:
+        return None
     e = _BUF.pop(launch_id, None)          # re-insert last: dict order is the recency order
     if e is None:
         e = {"turn": "", "text": "", "bytes": 0, "seq": _SEQ.get(launch_id, 0)}
     _BUF[launch_id] = e
     while len(_BUF) > LAUNCH_MAX:
-        old = next(iter(_BUF))
-        _BUF.pop(old)
-        _SEQ.pop(old, None)
+        idle = [k for k, v in _BUF.items() if k != launch_id and not v["text"]]
+        _BUF.pop(idle[0] if idle else next(iter(_BUF)))
+    # a counter outlives its buffer only to keep seq rising; bound the ones whose buffer is gone
+    while len(_SEQ) > 4 * LAUNCH_MAX:
+        gone = next((k for k in _SEQ if k not in _BUF), None)
+        if gone is None:
+            break
+        _SEQ.pop(gone)
     return e
 
 
@@ -65,16 +82,24 @@ class Sink:
             return
         with _LOCK:
             e = _entry(self.launch_id)
+            if e is None:                  # the launch ended while this delta was in flight: nothing is live for it
+                return
             room = LIVE_MAX - e["bytes"]
             if room <= 0:
                 return
-            raw = text.encode("utf-8", "replace")[:room]
-            piece = raw.decode("utf-8", "ignore")
+            whole = text.encode("utf-8", "replace")
+            raw = whole[:room]
+            piece = raw.decode("utf-8", "ignore")       # a character split at the cap is dropped, never half-kept
+            if len(raw) < len(whole):
+                # the cap is reached: the buffer is the head of the reply (the same bytes the stored agent_text keeps,
+                # claude_session._cap), so no later, shorter delta may land after a dropped character
+                e["bytes"] = LIVE_MAX
+            else:
+                e["bytes"] += len(raw)
             if not piece:
                 return
             e["turn"] = turn or ""
             e["text"] += piece
-            e["bytes"] += len(piece.encode("utf-8"))
             _bump(self.launch_id, e)
 
     def clear(self) -> None:
@@ -92,10 +117,24 @@ def clear(launch_id: str) -> None:
 
 
 def forget(launch_id: str) -> None:
-    """The launch is over: drop its buffer and its counter."""
+    """The launch is over: drop its buffer and its counter, for good. A delta that arrives after this (the pump had
+    already polled it when the launch ended) is refused under the same lock, so an ended launch never shows text again,
+    whatever order ``forget`` and the session's close run in."""
     with _LOCK:
         _BUF.pop(launch_id, None)
         _SEQ.pop(launch_id, None)
+        _ENDED.pop(launch_id, None)
+        _ENDED[launch_id] = None
+        while len(_ENDED) > ENDED_MAX:
+            _ENDED.pop(next(iter(_ENDED)))
+
+
+def _purge(launch_id: str) -> None:
+    """Every trace of ``launch_id``, its end included. Tests only (they reuse one id); production never reuses an id."""
+    with _LOCK:
+        _BUF.pop(launch_id, None)
+        _SEQ.pop(launch_id, None)
+        _ENDED.pop(launch_id, None)
 
 
 def snapshot(launch_id: str) -> Optional[dict[str, Any]]:

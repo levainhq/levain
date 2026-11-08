@@ -15,9 +15,9 @@ from tests.test_cockpit_room_wait import (FAR, GET, _dcall, _dserve, _in_thread,
 
 @pytest.fixture(autouse=True)
 def _clean(w):  # noqa: F811
-    room_live.forget(w.launch)
+    room_live._purge(w.launch)
     yield
-    room_live.forget(w.launch)
+    room_live._purge(w.launch)
 
 
 def test_live_is_present_while_streaming_and_null_after_the_frame(tmp_path, w):  # noqa: F811
@@ -69,7 +69,10 @@ def test_a_bad_live_seq_is_a_400(tmp_path, w, v):  # noqa: F811
             assert status == 400 and body["error"] == "bad_request"
 
 
-def test_a_revoked_device_still_gets_403_within_a_tick_while_live_changes(tmp_path, w):  # noqa: F811
+def test_a_revoked_device_gets_403_never_live_text_written_after_the_revoke(tmp_path, w):  # noqa: F811
+    """The revoke COMMITS (its POST answered) strictly before the live text changes, and more than one tick before it,
+    so no read can be in flight across the revoke (the documented one-frame window is closed). The waiter must answer
+    403; a 200 here would be live text handed to a revoked device."""
     with _dserve(tmp_path, w) as port:
         dev, tok = _pair(port)
         sink = room_live.Sink(w.launch)
@@ -78,9 +81,10 @@ def test_a_revoked_device_still_gets_403_within_a_tick_while_live_changes(tmp_pa
         t, out = _in_thread(_dcall, port, "GET", f"{GET}?after={FAR}&live_seq={seq}&wait=20", None, tok)
         time.sleep(0.4)
         assert t.is_alive()
-        _revoke(port, dev)
-        t0 = time.monotonic()
-        t.join(8)          # the revoke lands first; the next tick's recheck refuses before any read
-        assert out and out[0][0] in (403, 200)
-        if out[0][0] == 200:   # a live wake raced the revoke: the very next read is refused
-            assert _dcall(port, "GET", f"{GET}?after={FAR}", token=tok)[0] == 403
+        _revoke(port, dev)                                   # committed: the POST returned
+        time.sleep(4 * cockpit_room.WAIT_TICK_S)             # past any read that began before the commit
+        sink.delta("t1-1", " written after the revoke")      # the live change a stale waiter would wake on
+        t.join(8)
+        assert out, "the waiter never answered"
+        assert out[0][0] == 403, out[0]
+        assert "written after the revoke" not in repr(out[0][1])

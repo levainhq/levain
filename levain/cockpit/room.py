@@ -248,7 +248,19 @@ def room_read(directory: Path | str, service: Any = None) -> dict[str, Any]:
 
 
 class CursorError(ValueError):
-    """The ``after`` of a cursor read is not a non-negative integer."""
+    """A read's ``after``, ``wait`` or ``live_seq`` is not a whole number the read accepts."""
+
+
+# a gseq, a live seq or a wait in seconds never needs more digits than this; a longer run of digits is refused BEFORE
+# int(), which raises a plain ValueError past the interpreter's 4300-digit limit (L3 room r1 codex HIGH)
+_DIGITS_MAX = 20
+
+
+def _whole(raw: str, message: str) -> int:
+    """``raw`` as a non-negative int, or ``CursorError(message)``: ASCII digits only, at most :data:`_DIGITS_MAX`."""
+    if not (raw.isascii() and raw.isdigit()) or len(raw) > _DIGITS_MAX:
+        raise CursorError(message)
+    return int(raw)
 
 
 def parse_wait(query: str, after: int | None) -> int | None:
@@ -258,12 +270,13 @@ def parse_wait(query: str, after: int | None) -> int | None:
     values = urllib.parse.parse_qs(query, keep_blank_values=True)
     if "wait" not in values:
         return None
-    raw = values["wait"][0]
-    if not (raw.isascii() and raw.isdigit()) or not 1 <= int(raw) <= WAIT_MAX_S:
-        raise CursorError(f"wait must be a whole number of seconds from 1 to {WAIT_MAX_S}")
+    message = f"wait must be a whole number of seconds from 1 to {WAIT_MAX_S}"
+    wait = _whole(values["wait"][0], message)
+    if not 1 <= wait <= WAIT_MAX_S:
+        raise CursorError(message)
     if after is None:
         raise CursorError("wait needs after: only a cursor read can wait for a newer item")
-    return int(raw)
+    return wait
 
 
 def parse_live_seq(query: str) -> int | None:
@@ -271,10 +284,7 @@ def parse_live_seq(query: str) -> int | None:
     values = urllib.parse.parse_qs(query, keep_blank_values=True)
     if "live_seq" not in values:
         return None
-    raw = values["live_seq"][0]
-    if not (raw.isascii() and raw.isdigit()):
-        raise CursorError("live_seq must be a non-negative integer")
-    return int(raw)
+    return _whole(values["live_seq"][0], "live_seq must be a non-negative integer")
 
 
 def _live_moved(body: dict[str, Any], live_seq: int | None) -> bool:
@@ -286,6 +296,13 @@ def _live_moved(body: dict[str, Any], live_seq: int | None) -> bool:
     return live_seq > 0
 
 
+def is_news(status: int, body: Mapping[str, Any], live_seq: int | None = None) -> bool:
+    """True when a read is an answer a long-poll returns at once: not a 200, a newer item, a ``reset``, or (with
+    ``live_seq``) live text that moved past it. The handler asks this of its first read BEFORE it takes a waiter slot,
+    so an answer already in hand is never turned into a 503 by a full waiter cap (L3 room r1 codex MED)."""
+    return status != 200 or bool(body.get("stream")) or bool(body.get("reset")) or _live_moved(dict(body), live_seq)
+
+
 def parse_cursor(query: str) -> tuple[int | None, str | None]:
     """``(after, thread)`` from a read's query string: ``after`` is the last ``gseq`` the client holds (None for a cold
     read), ``thread`` the ``room_thread`` that cursor was read from. A non-integer or negative ``after`` raises
@@ -294,9 +311,7 @@ def parse_cursor(query: str) -> tuple[int | None, str | None]:
     after = None
     if "after" in values:
         raw = values["after"][0]
-        if not (raw.isascii() and raw.isdigit()):
-            raise CursorError("after must be a non-negative integer")
-        after = int(raw)
+        after = _whole(raw, "after must be a non-negative integer")
     thread = values["thread"][0] if "thread" in values and values["thread"][0] else None
     return after, thread
 
@@ -318,7 +333,7 @@ def apply_cursor(body: dict[str, Any], after: int | None, thread: str | None) ->
     return body
 
 
-def wait_for_news(read: Callable[[], tuple[int, dict[str, Any]]], wait: int, *,
+def wait_for_news(read: Callable[[], "tuple[int, dict[str, Any]] | None"], wait: int, *,
                   allowed: Callable[[bool], bool] | None = None, alive: Callable[[], bool] | None = None,
                   stop: Any = None, tick: float | None = None,
                   now: Callable[[], float] | None = None, live_seq: int | None = None) -> tuple[int, dict[str, Any]] | None:
@@ -327,19 +342,21 @@ def wait_for_news(read: Callable[[], tuple[int, dict[str, Any]]], wait: int, *,
     ``next`` the cursor held, is then the answer). ``read`` may return None for a tick it could not take a slot for: that
     tick is skipped, never an answer. Before EACH re-read ``allowed(True)`` (the credential's own recheck) must hold, else
     this returns None and the caller answers 403. A peer that went away (``alive`` False) is also None (nobody reads the
-    answer); with ``live_seq`` the wait also ends when ``body["live"]`` moved past it; a ``stop`` event set (the server is shutting down) ends with the last body."""
+    answer); with ``live_seq`` the wait also ends when ``body["live"]`` moved past it; a ``stop`` event set (the server is
+    shutting down) ends with the last body, before any further read. The FIRST ``read()`` must return a pair."""
     import time
     clock = now or time.monotonic
     step = WAIT_TICK_S if tick is None else tick
     deadline = clock() + wait
-    status, body = read()
+    status, body = read()  # type: ignore[misc]   # the first read is the one the caller already admitted: a pair
     while True:
-        if status != 200 or body.get("stream") or body.get("reset") or _live_moved(body, live_seq):
+        if is_news(status, body, live_seq):
             return status, body
         if clock() >= deadline or (stop is not None and stop.wait(0)):
             return status, body
         if stop is not None:
-            stop.wait(step)
+            if stop.wait(step):         # woken by shutdown: answer with what is in hand, no read against a closing server
+                return status, body
         else:
             time.sleep(step)
         if alive is not None and not alive():
