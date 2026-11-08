@@ -242,10 +242,18 @@ def test_a_line_that_does_not_read_is_refused_with_its_reason_and_writes_nothing
     assert spores.read_bytes() == before
 
 
-def test_the_broker_refuses_a_sort_line_and_a_malformed_body(broker, spores):
+def test_the_broker_builds_a_sort_as_one_coordinator_drop_and_refuses_a_malformed_body(broker, spores, home):
+    from levain.cockpit.coord_effects import COORDINATOR, CoordDropEffectStore
+
+    # no coordinator store registered: the sort keeps its 501
     with pytest.raises(BrokerError) as e:
         _issue(broker, "plain words", credential=DEVICE, tier="C1", intent="sign")
     assert e.value.status == 501
+    broker.stores[COORDINATOR] = CoordDropEffectStore(lambda: home / "dispatch")
+    out = _issue(broker, "plain words", credential=DEVICE, tier="C1", intent="sign")
+    assert out["state"] == "WAITING"
+    (eff,) = json.loads(out["record"])["effects"]
+    assert (eff["store"], eff["changes"]) == (COORDINATOR, {"text": "plain words"})
     with pytest.raises(BrokerError) as e:
         broker.issue(verb=INTAKE_VERB, params={"line": "@+1h x", "next": "2026-11-09T09:00"},
                      target={"kind": "create", "panel_id": "list"}, tier="T2", credential=BROWSER, intent="reported")

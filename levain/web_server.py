@@ -5261,8 +5261,21 @@ def _build_broker(source: SubstrateSource, install_class: str | None,
     if scope is None:
         return None
     spores, episodes = scope.anneal.spores_json, scope.anneal.episodic_db
+    from levain.cockpit.coord_effects import COORDINATOR, CoordDropEffectStore
+    from levain.cockpit.providers import _dispatch_dir
+
+    def coord_dir() -> Any:
+        # the directory the C1 sort path writes (verbs._intake_fire): the consent reader is attached after the server
+        # is built, so it is read on each call, and a call before that resolves as a server with none does
+        try:
+            reader = getattr(httpd, "consent_reader", None)
+        except NameError:
+            reader = None
+        return _dispatch_dir(reader)
+
     return Broker(scope.ledger_root / "cockpit",
                   stores={SPORES: SporeEffectStore(spores), EPISODES: EpisodeEffectStore(episodes),
+                          COORDINATOR: CoordDropEffectStore(coord_dir),
                           **({SECTIONS: SectionEffectStore(episodes)} if section_paths_agree(scope.anneal)
                              else {})},
                   install_class=install_class, store_paths=[spores, episodes], downstream=downstream,

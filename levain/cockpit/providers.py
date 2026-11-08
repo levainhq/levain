@@ -791,6 +791,8 @@ def _edit_target(resource_key: str) -> str:
         return f"item {ident}"
     if kind == "section" and ident:
         return f"the {ident} section"
+    if kind == "drop" and ident:
+        return "sent to the desk to sort"       # a sort's coordinator drop (coord_effects)
     if kind == "token":
         return ident          # a surface token: "rotated the surface token browser"
     if kind == "pend":
