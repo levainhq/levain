@@ -163,7 +163,7 @@ WAIT = f"{TRAY} && {TRAY}.querySelector('.sp-results') && 1"
 OLD_ROWS_TEXT = f"{ALL_ROWS}.map(r => r.textContent)"
 
 
-def _served(tmp_path: Path, *, keep_seed: bool = True):
+def _served(tmp_path: Path, *, keep_seed: bool = True, plain: bool = False):   # plain: see PLAIN below
     """A served install on the real clock: the page reads today from the server, so the held dates are
     relative to it (the rig's fixed day would put them in the past)."""
     _root, src, ids = _install(tmp_path)
@@ -182,6 +182,14 @@ def _served(tmp_path: Path, *, keep_seed: bool = True):
     served = _Served(src, surface_tokens={"browser": "T"}, install_class="reported")
     served.store, served.held_ids = store, held_ids + [ids["held"]]  # type: ignore[attr-defined]
     return real, served
+
+
+# The plain Tray is a panel that does not offer list_intake (the page marks the List by that action alone). The init script, run on
+# every load, renames the verb in every cockpit read, so the page draws the Tray with its held toggle, not the List.
+PLAIN = {"init": "(() => { const f = window.fetch; window.fetch = async (...a) => { const r = await f(...a);"
+                 " if (!/cockpit/.test(String(a[0] && a[0].url || a[0]))) return r;"
+                 " const t = (await r.text()).split('\"list_intake\"').join('\"list_intake_off\"');"
+                 " return new Response(t, {status: r.status, headers: r.headers}); }; })()"}
 
 
 def _label(d: date) -> str:
@@ -259,3 +267,129 @@ def test_the_focus_views_filter_covers_the_held_rows(tmp_path: Path) -> None:
             {"eval": f"[{FOCUS}.querySelectorAll('.sp-results .row').length, {FOCUS_HELD}.length]"},
         ])
     assert out["values"][-1] == [1, 1], out
+
+
+# --- the plain Tray (a panel that offers no list_intake: a read-only credential) keeps its held toggle ------------------------
+# The List card replaced the toggle with one control (levain 73); the toggle code is live for every other Tray, so it keeps its tests
+# (default hidden + toggle, persistence, blocked storage, the show hint, a read with no held rows, the focus modal).
+
+
+@needs_browser
+def test_the_page_hides_the_held_rows_by_default_and_a_toggle_shows_them_on_the_plain_tray(tmp_path: Path) -> None:
+    real, served = _served(tmp_path, plain=True)
+    with served as url:
+        out = _drive(tmp_path, f"{url}/", [
+            PLAIN,
+            {"until": WAIT},
+            {"eval": f"[{HELD_ROWS}.length, {ALL_ROWS}.length, {TOGGLE} && {TOGGLE}.textContent, {TRAY}.textContent.includes('2 held back')]"},
+            {"eval": f"{TOGGLE}.click(); 1"},
+            {"eval": f"[{HELD_ROWS}.length, {ALL_ROWS}.length, {TOGGLE}.textContent, {TOGGLE}.getAttribute('aria-expanded')]"},
+            {"eval": f"{HELD_ROWS}.map(r => r.textContent)"},
+            {"eval": f"{TOGGLE}.click(); {HELD_ROWS}.length"},
+        ])
+    v = out["values"]
+    assert v[1] == [0, 2, "show", True], v
+    assert v[3] == [2, 4, "hide", "true"], v
+    assert f"surfaces {_label(real + timedelta(days=3))}" in v[4][0] and "a sooner held seed" in v[4][0], v
+    assert f"surfaces {_label(real + timedelta(days=10))}" in v[4][1] and "a later held seed" in v[4][1], v
+    assert v[5] == 0, v
+
+
+@needs_browser
+def test_the_choice_survives_a_reload_and_the_filter_covers_held_rows_while_shown_on_the_plain_tray(tmp_path: Path) -> None:
+    _real, served = _served(tmp_path, plain=True)
+    with served as url:
+        out = _drive(tmp_path, f"{url}/", [
+            PLAIN,
+            {"until": WAIT},
+            {"eval": f"{TOGGLE}.click(); 1"},
+            {"eval": "location.reload(); 1"},
+            {"until": f"{WAIT} && {TOGGLE} && 1"},
+            {"eval": f"new Promise(r => setTimeout(() => r([{HELD_ROWS}.length, {TOGGLE}.textContent]), 500))"},
+            {"eval": f"(() => {{ const i = {TRAY}.querySelector('.ep-search-input'); i.value = 'sooner'; "
+                     "i.dispatchEvent(new Event('input', {bubbles: true})); return 1; })()"},
+            {"eval": f"[{ALL_ROWS}.length, {HELD_ROWS}.length]"},
+        ])
+    v = out["values"]
+    assert v[4] == [2, "hide"], f"the shown choice did not survive a reload: {v}"
+    assert v[6] == [1, 1], f"the filter did not cover the held rows: {v}"
+
+
+@needs_browser
+def test_a_blocked_local_storage_leaves_the_toggle_working_for_the_page_on_the_plain_tray(tmp_path: Path) -> None:
+    _real, served = _served(tmp_path, plain=True)
+    with served as url:
+        out = _drive(tmp_path, f"{url}/", [
+            PLAIN,
+            {"until": WAIT},
+            {"eval": "Storage.prototype.setItem = function () { throw new Error('blocked'); }; 1"},
+            {"eval": f"{TOGGLE}.click(); {HELD_ROWS}.length"},
+        ])
+    assert out["values"][2] == 2, out
+
+
+@needs_browser
+def test_a_filter_matching_only_hidden_held_rows_says_so_and_offers_to_show_them_on_the_plain_tray(tmp_path: Path) -> None:
+    _real, served = _served(tmp_path, plain=True)
+    type_q = (f"(() => {{ const i = {TRAY}.querySelector('.ep-search-input'); i.value = 'sooner'; "
+              "i.dispatchEvent(new Event('input', {bubbles: true})); return 1; })()")
+    with served as url:
+        out = _drive(tmp_path, f"{url}/", [
+            PLAIN,
+            {"until": WAIT},
+            {"eval": type_q},
+            {"eval": f"[{TRAY}.querySelector('.sp-results .empty').textContent, {ALL_ROWS}.length]"},
+            {"eval": f"{TRAY}.querySelector('[data-held-show-matches]').click(); [{HELD_ROWS}.length, {TOGGLE}.textContent]"},
+        ])
+    v = out["values"]
+    assert "no items match" in v[2][0] and "1 held row matches" in v[2][0] and v[2][1] == 0, v
+    assert v[3] == [1, "hide"], v
+
+
+def _filter(q: str) -> str:
+    return (f"(() => {{ const i = {TRAY}.querySelector('.ep-search-input'); i.value = {json.dumps(q)}; "
+            "i.dispatchEvent(new Event('input', {bubbles: true})); return 1; })()")
+
+
+@needs_browser
+def test_a_read_with_no_held_rows_does_not_forget_that_they_are_shown_on_the_plain_tray(tmp_path: Path) -> None:
+    """A read that carries no held rows (a compact read, a filter matching none) must leave the stored choice alone."""
+    _real, served = _served(tmp_path, plain=True)
+    strip = ("window.__fetch = window.fetch; window.fetch = async (...a) => { const r = await window.__fetch(...a); "
+             "if (!/panel\\/tray/.test(String(a[0] && a[0].url || a[0]))) return r; const j = await r.json(); "
+             "delete j.held; j.filtered = []; return new Response(JSON.stringify(j), {status: r.status, headers: r.headers}); }; 1")
+    pause = "new Promise(r => setTimeout(() => r(1), 800))"
+    with served as url:
+        out = _drive(tmp_path, f"{url}/", [
+            PLAIN,
+            {"until": WAIT},
+            {"eval": f"{TOGGLE}.click(); {HELD_ROWS}.length"},
+            {"eval": strip},
+            {"eval": "window.LevainCockpitTransport.reload(); 1"},
+            {"eval": pause},
+            {"eval": f"[{TOGGLE} && 1, {HELD_ROWS}.length]"},
+            {"eval": "window.fetch = window.__fetch; window.LevainCockpitTransport.reload(); 1"},
+            {"eval": pause},
+            {"eval": f"[{HELD_ROWS}.length, {TOGGLE}.textContent, localStorage.getItem('levain.tray.showHeld')]"},
+        ])
+    v = out["values"]
+    assert v[1] == 2 and v[5] == [None, 0], v    # the stripped read really carried no held rows
+    assert v[8] == [2, "hide", "1"], v
+
+
+@needs_browser
+def test_toggling_in_the_focus_modal_redraws_the_board_tray_too_on_the_plain_tray(tmp_path: Path) -> None:
+    _real, served = _served(tmp_path, plain=True)
+    modal_toggle = "document.querySelector('#levain-modal [data-held-toggle]')"
+    with served as url:
+        out = _drive(tmp_path, f"{url}/", [
+            PLAIN,
+            {"until": WAIT},
+            {"eval": f"{TRAY}.querySelector('.pexpand').click(); 1"},
+            {"until": f"{modal_toggle} && 1"},
+            {"eval": f"{modal_toggle}.click(); document.querySelectorAll('#levain-modal .row[data-held]').length"},
+            {"eval": "document.querySelector('#levain-modal .modal-close').click(); 1"},
+            {"eval": f"[{HELD_ROWS}.length, {TOGGLE}.textContent]"},
+        ])
+    v = out["values"]
+    assert v[3] == 2 and v[5] == [2, "hide"], v

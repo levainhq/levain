@@ -462,7 +462,11 @@
     more.type = "button";
     more.dataset.listMore = "1";
     more.setAttribute("aria-label", parts.join(", ") + ": open the full list");
-    more.addEventListener("click", () => { const x = panel.querySelector(".pexpand"); if (x) x.click(); });
+    more.addEventListener("click", () => {
+      const x = panel.querySelector(".pexpand");
+      if (x) x.click();
+      modalReturnFocus = more;      // closing the focus view lands back on the control he pressed (its successor is found by closeModal)
+    });
     panel.appendChild(more);
     return hidden > 0;
   }
@@ -2115,6 +2119,8 @@
       // read-only by construction: band rows point at the Decisions panel, board rows at the agents' queue; no verbs below
       if (s.support && !s.text_locked) host.appendChild(el("span", "muted list-support", s.support));
       if (s.later_words) host.appendChild(tagEl("muted", "back " + s.later_words));
+      // a desk row the desk has carried past its day is listed under Needs you, tagged as flow's footer tags it
+      if (s.band_section === "desk" && s.carried) host.appendChild(tagEl("muted list-desk-owed", "desk-owed"));
       if (s.list_pointer) host.appendChild(tagEl("muted list-pointer", s.list_pointer));
       if (s.surface === "board") {
         if (s.board_tier) host.appendChild(tagEl("muted", s.board_tier));
@@ -2215,6 +2221,13 @@
   // The three spore projections share one renderer — same read/verb contract, different
   // source list + badge axis + empty copy. All three read their fault from the single
   // `open_spores` error key (the dashboard does ONE spore read that fills all three).
+  // a group heading in a list is a heading to a screen reader too (VoiceOver rotor), the look is the same
+  function headingEl(text) {
+    const h = el("div", "grp-head", text);
+    h.setAttribute("role", "heading");
+    h.setAttribute("aria-level", "3");
+    return h;
+  }
   function renderSporeProjection(entry, view, list, emptyMsg, badgeField, ropts) {
     const p = panel(entry);
     // Both projections (Open Loops / Tray) come from ONE dashboard spore read,
@@ -2239,22 +2252,35 @@
     const inCard = isList && !(ropts && ropts.modal);
     const apart = (s) => s.group === "desk" || s.group === "later";
     const cardHides = (s) => inCard && apart(s);
-    const heldShown = isList ? !inCard : trayHeldShown;
+    // read live: the plain Tray's toggle flips trayHeldShown and redraws without rebuilding this closure
+    const heldShownNow = () => (isList ? !inCard : trayHeldShown);
+    // what the card leaves to the focus view, counted as flow's footer counts it: DESK OWES is every desk row, a carried one too
+    // (it is also listed under Needs you); LATER the rows that come back on a later day
+    const apartCount = { desk: (list || []).filter((s) => s.band_section === "desk").length,
+                         later: (list || []).filter((s) => s.group === "later").length, held: heldLine ? heldLine.count : 0 };
+    const cardHasApart = inCard && (apartCount.desk > 0 || apartCount.later > 0 || apartCount.held > 0);
     // held rows count when they are shown: a surface only held rows carry still gets its chip and stays selectable
-    const listAll = () => (list || []).filter((s) => !cardHides(s)).concat(heldLine && heldShown ? held : []);
+    const listAll = () => (list || []).filter((s) => !cardHides(s)).concat(heldLine && heldShownNow() ? held : []);
     const listNow = () => (isList && listAll().some((s) => s.surface === listSurface) ? listSurface : "");
     const inSurface = (s) => !listNow() || s.surface === listNow();
     const opts = views.length || heldLine || isList ? {
-      empty: emptyMsg,
-      extra: () => (heldLine && heldShown ? held.filter(inSurface) : []),
-      unlisted: () => (heldLine && !heldShown && !isList ? held.filter(inSurface) : []),
+      // a card whose due rows are all done still holds the desk's, the later and the held ones: it says nothing is due, not that it is empty
+      empty: cardHasApart ? "Nothing due for you." : emptyMsg,
+      extra: () => (heldLine && heldShownNow() ? held.filter(inSurface) : []),
+      // the card's search also reads what the card leaves to the focus view, so a match there is told, never "no items match"
+      unlisted: () => (inCard ? (list || []).filter(cardHides).concat(heldLine ? held : []).filter(inSurface)
+                              : (heldLine && !heldShownNow() && !isList ? held.filter(inSurface) : [])),
       hintShow: (note, n) => {
-        note.appendChild(document.createTextNode(" — " + n + (n === 1 ? " held row matches — " : " held rows match — ")));
+        note.appendChild(document.createTextNode(inCard ? " — " + n + (n === 1 ? " row matches in the full list — " : " rows match in the full list — ")
+                                                        : " — " + n + (n === 1 ? " held row matches — " : " held rows match — ")));
         const go = el("button", "held-toggle");
         go.type = "button";
         go.dataset.heldShowMatches = "1";
-        go.textContent = "show";
-        go.addEventListener("click", () => { const t = p.querySelector("[data-held-toggle]"); if (t) t.click(); });
+        go.textContent = inCard ? "open it" : "show";
+        go.addEventListener("click", () => {
+          if (inCard) { const m = p.querySelector("[data-list-more]"); if (m) m.click(); return; }
+          const t = p.querySelector("[data-held-toggle]"); if (t) t.click();
+        });
         note.appendChild(go);
       },
       controls: (bar, redraw) => {
@@ -2306,22 +2332,21 @@
     } : undefined;
     if (inCard) {
       // what the card leaves to the focus view, for its one control (foldRowsAt words it)
-      const n = (g) => (list || []).filter((s) => s.group === g).length;
-      p.dataset.listApart = JSON.stringify({ desk: n("desk"), later: n("later"), held: heldLine ? heldLine.count : 0 });
+      p.dataset.listApart = JSON.stringify(apartCount);
     }
     mountSporeFilter(p, list || [], "items", entry.kind, (rows, results) => {
       let lastGroup = null;
       let heldHead = false;
       let box = results;
       for (const s of rows) {
-        if (s.held && !heldHead) { heldHead = true; box = results; results.appendChild(el("div", "grp-head", "Held until their surface date")); }
+        if (s.held && !heldHead) { heldHead = true; box = results; results.appendChild(headingEl("Held until their surface date")); }
         // a manifest source brings the kernel's own bands (Today / Overdue / Also pending), in its order;
         // a chosen view is ungrouped
         const g = s.group || null;
         if (s.group_title && g !== lastGroup && !viewOf() && !s.held) {
           // each band is a column of its own where the page is wide (Morning's Tray: Overdue | Today); `display: contents` elsewhere
           box = entry.kind === "tray" ? results.appendChild(el("div", "grp-col")) : results;
-          box.appendChild(el("div", "grp-head", s.group_title));
+          box.appendChild(headingEl(s.group_title));
         }
         lastGroup = g;
         box.appendChild(sporeRow(s, verbs, badgeField, entry.kind));
@@ -8834,6 +8859,10 @@
         const t = n.closest(".tv-task");
         return n.dataset.node === rf.dataset.node && !!t && t.dataset.task === wasTask;
       }) || null;
+    }
+    // the List card's control is rebuilt by every fold: its successor is the card's control now
+    if (rf && !document.body.contains(rf) && rf.dataset && rf.dataset.listMore) {
+      rf = document.querySelector('[data-ck-panel="tray"] [data-list-more]') || document.querySelector('[data-ck-panel="tray"] .pexpand');
     }
     // restore focus to the ⤢ trigger if it's still in the DOM (an intervening board
     // re-render may have replaced it — then focus simply falls to <body>, acceptable).

@@ -2610,6 +2610,8 @@ body.ke [data-ck-panel="tray"] .row .verb-actions > .verb-btn:not(.verb-more) { 
 /* the "N more" foot of a work list that folds its lower rows (dashboard_core.js foldRows) */
 body.ke .panel > .more-foot { align-self: center; flex: none; margin: 0 0 var(--sp-4); padding: var(--sp-1) var(--sp-5); border: 0; background: none; color: var(--label); font: var(--fw-medium) var(--fs-meta)/1.4 var(--sans); text-decoration: underline; text-underline-offset: 3px; cursor: pointer; }
 body.ke .panel > .more-foot:hover, body.ke .panel > .more-foot:focus-visible { color: var(--text); }
+/* the List card's one control is a touch target at every width (a landscape phone, an iPad), not only under 720px */
+body.ke [data-ck-panel="tray"] .more-foot[data-list-more] { min-height: var(--hit-min); display: inline-flex; align-items: center; justify-content: center; }
 /* the Crystallized panel's "Read all" starts where its content does */
 body.ke .ck-zgrid .ck-mem-crys > .more-foot { padding-inline: var(--sp-6); margin-bottom: var(--sp-4); }
 

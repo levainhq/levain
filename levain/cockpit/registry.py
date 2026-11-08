@@ -428,9 +428,11 @@ def _list_group(row: RowIn, today: date) -> str:
     s = row.facets.get("surface")
     if s == "band":
         # the desk's own rows are the desk's whether or not they carry a date (flow's footer files them under DESK OWES); a row of
-        # the operator's that comes back on a later day is LATER; the rest is needs-you
+        # the operator's that comes back on a later day is LATER; the rest is needs-you. A desk row the desk has carried past
+        # its day (open > 24h, `band_carried`) is ALSO needs-you, as flow's footer lists it (tagged desk-owed) and never LATER;
+        # the page counts it under DESK OWES from `band_section`, which it keeps
         if row.facets.get("band_section") == "desk":
-            return "desk"
+            return "band" if row.facets.get("band_carried") is True else "desk"
         return "later" if row.facets.get("held_until") else "band"
     if s in ("board", "talk"):
         return s

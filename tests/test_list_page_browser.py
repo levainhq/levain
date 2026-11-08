@@ -396,9 +396,9 @@ def test_listpanel_141_the_focus_views_sticky_filter_bar_is_opaque(tmp_path: Pat
 # --- 531 round 4 (levain 73, key 1108-37): desk-owed and LATER rows have their own groups; the card has ONE control ------------
 
 
-def _host_band(monkeypatch: Any) -> None:
-    """The band as flow's adapter fills it: a "desk:" row is the desk's (section desk), a "levain: TUE" row comes back on a later day,
-    every other row is the operator's (section you)."""
+def _host_band(monkeypatch: Any, *, all_desk: bool = False) -> None:
+    """The band as flow's adapter fills it: a "desk:" row is the desk's (section desk; "desk: carried" is one open > 24h, flow's
+    `carried`), a "levain: TUE" row comes back on a later day, every other row is the operator's (section you)."""
     from dataclasses import replace
     from datetime import date, timedelta
 
@@ -413,7 +413,7 @@ def _host_band(monkeypatch: Any) -> None:
         for ref, q in items:
             if q is not None:
                 what = str(q.what)
-                q = replace(q, section="desk" if what.startswith("desk:") else "you", carried=False,
+                q = replace(q, section="desk" if all_desk or what.startswith("desk:") else "you", carried=what.startswith("desk: carried") and not all_desk,
                             snoozed_until=later if what.startswith("levain: TUE") else None)
             out.append((ref, q))
         return out, numbers, closed
@@ -449,6 +449,8 @@ def test_r4_the_card_holds_due_rows_and_one_control_and_the_focus_view_every_gro
     from levain.consent.questions import QuestionStore
     QuestionStore(default_queue_dir()).file(agent="claude_code", agent_session_id="s9", what="One look on your iPhone once the List is fixed.",
                                             options=[("ship", "Ship it"), ("hold", "Hold")], rec="hold", blocks="his look", cwd="/w/levain")
+    QuestionStore(default_queue_dir()).file(agent="claude_code", agent_session_id="s8", what="desk: carried Launch the TAOSERV upgrade seat before Monday 20:00.",
+                                            options=[("ship", "Ship it"), ("hold", "Hold")], rec="hold", blocks="the upgrade", cwd="/w/taoserv")
     _host_band(monkeypatch)
     with _serve(src, write_token=TOKEN, surface_tokens={"browser": TOKEN}, install_class="reported") as (url, _httpd):
         out = _drive(tmp_path, f"{url}/", [
@@ -465,11 +467,100 @@ def test_r4_the_card_holds_due_rows_and_one_control_and_the_focus_view_every_gro
         ])
     vals = [json.loads(x) for x in out["values"] if isinstance(x, str) and x.startswith("{")]
     card, focus = vals[0], vals[1]
-    assert not any(t.startswith("desk:") or t.startswith("levain: TUE") for t in card["shown"]), card   # not the operator's, not due
+    assert not any((t.startswith("desk:") and not t.startswith("desk: carried")) or t.startswith("levain: TUE") for t in card["shown"]), card   # not the operator's, not due
+    assert any(t.startswith("desk: carried") for t in card["shown"]), card      # a CARRIED desk row is needs-you, as flow's footer lists it
     assert len(card["more"]) == 1 and card["heldToggles"] == 0, card                                    # ONE control, no held toggle
-    assert "desk owes 1" in card["more"][0] and "later 1" in card["more"][0] and "held" in card["more"][0], card
+    assert "desk owes 2" in card["more"][0] and "later 1" in card["more"][0] and "held" in card["more"][0], card
     assert focus["desk"] and focus["desk"][0].startswith("desk:"), focus                                 # the desk's row under its heading
     assert focus["later"] and focus["later"][0].startswith("levain: TUE"), focus                         # the later row under LATER
-    assert focus["needs"] and not any(t.startswith(("desk:", "levain: TUE")) for t in focus["needs"]), focus
+    assert focus["needs"] and not any(t.startswith(("levain: TUE", "desk: Write")) for t in focus["needs"]), focus
+    assert any(t.startswith("desk: carried") for t in focus["needs"]), focus                             # the carried one is under Needs you
     assert focus["held"] > 0 and focus["toggles"] == 0, focus                                            # held spores listed, no toggle
     assert "Held until their surface date" in focus["heads"], focus
+
+
+# --- 531 r4 round 5 (levain 74, key 1108-39): L1+L2 fixes -----------------------------------------------------------------------
+
+_CTL_PROBE = f"""(() => {{
+  const T = {TRAY}; const c = T.querySelector('[data-list-more]');
+  const tags = [...T.querySelectorAll('.sp-results .row')].filter(r => /desk: carried/.test(r.textContent)).map(r => !!r.querySelector('.list-desk-owed'));
+  return JSON.stringify({{h: c ? c.getBoundingClientRect().height : 0, label: c ? c.getAttribute('aria-label') : null, tags,
+    empty: [...T.querySelectorAll('.sp-results .empty')].map(n => n.textContent)}});
+}})()"""
+
+
+def _carried_install(tmp_path: Path, monkeypatch: Any, *, all_desk: bool = False, spores: bool = True) -> Any:
+    root, src, ids = _install(tmp_path)
+    _seed_more(root)
+    from levain.consent.questions import QuestionStore
+    qs = QuestionStore(default_queue_dir())
+    qs.file(agent="claude_code", agent_session_id="s7", what="One look on your iPhone once the List is fixed.",
+            options=[("ship", "Ship it"), ("hold", "Hold")], rec="hold", blocks="his look", cwd="/w/levain")
+    qs.file(agent="claude_code", agent_session_id="s8", what="desk: carried Launch the TAOSERV upgrade seat before Monday 20:00.",
+            options=[("ship", "Ship it"), ("hold", "Hold")], rec="hold", blocks="the upgrade", cwd="/w/taoserv")
+    qs.file(agent="claude_code", agent_session_id="s6", what="levain: TUE 11-10: read the release essay draft 2.",
+            options=[("ship", "Ship it"), ("hold", "Hold")], rec="hold", blocks="the essay", cwd="/w/levain")
+    qs.file(agent="claude_code", agent_session_id="s9", what="desk: Write the BJE plan.",
+            options=[("ship", "Ship it"), ("hold", "Hold")], rec="hold", blocks="the plan", cwd="/w/bje")
+    if not spores:       # nothing but band rows is left on the card
+        store = SporeStore(root / ".levain" / "memory.spores.json")
+        for sp in store.list_open():
+            store.update(sp["id"], disposition="loop")
+        for key in ("seed", "held", "note"):
+            if store.get(ids[key]):
+                store.update(ids[key], disposition="loop")
+    _host_band(monkeypatch, all_desk=all_desk)
+    return src
+
+
+@needs_browser
+def test_listpanel_r5_the_control_is_44px_at_every_width_has_its_label_and_closing_returns_focus_to_it(tmp_path: Path, monkeypatch: Any) -> None:
+    src = _carried_install(tmp_path, monkeypatch)
+    focus_is_control = "document.activeElement && document.activeElement.hasAttribute('data-list-more')"
+    with _serve(src, write_token=TOKEN, surface_tokens={"browser": TOKEN}, install_class="reported") as (url, _httpd):
+        out = _drive(tmp_path, f"{url}/", [
+            {"emulate": {"w": 1024, "h": 800, "dpr": 1, "mobile": False}},
+            *_reload(),
+            {"until": f"{TRAY} && {TRAY}.querySelector('[data-list-more]') && 1"},
+            {"eval": "new Promise(r => setTimeout(() => r(1), 700))"},
+            {"eval": _CTL_PROBE},
+            {"eval": f"{TRAY}.querySelector('[data-list-more]').click(); 1"},
+            {"until": "document.querySelector('#levain-modal .modal-body .sp-results .row') && 1"},
+            {"eval": "JSON.stringify([...document.querySelectorAll('#levain-modal .grp-head')].map(h => [h.textContent.trim().slice(0, 12), h.getAttribute('role'), h.getAttribute('aria-level')]))"},
+            {"eval": "document.querySelector('#levain-modal .modal-close').click(); new Promise(r => setTimeout(() => r(1), 400))"},
+            {"eval": f"!!({focus_is_control})"},
+        ])
+    wide = json.loads(out["values"][-6])
+    assert wide["h"] >= 44, wide                                                   # a touch target on a tablet / landscape phone too
+    assert wide["label"] and "desk owes 2" in wide["label"] and "open the full list" in wide["label"], wide
+    assert wide["tags"] == [True], wide                                            # the carried row is tagged desk-owed, as the footer tags it
+    heads = json.loads(out["values"][-3])
+    assert heads and all(h[1] == "heading" and h[2] == "3" for h in heads), heads
+    assert {h[0] for h in heads} >= {"Needs you (a", "Desk owes (t", "Later"}, heads
+    assert out["values"][-1] is True, out["values"]                                # focus is back on the control that opened the view
+
+
+@needs_browser
+def test_listpanel_r5_a_card_with_only_desk_and_later_rows_says_nothing_is_due_and_a_search_finds_them_in_the_full_list(tmp_path: Path, monkeypatch: Any) -> None:
+    src = _carried_install(tmp_path, monkeypatch, all_desk=True, spores=False)
+    type_q = lambda q: (f"(() => {{ const i = {TRAY}.querySelector('.ep-search-input'); i.value = {json.dumps(q)}; "
+                        "i.dispatchEvent(new Event('input', {bubbles: true})); return 1; })()")
+    with _serve(src, write_token=TOKEN, surface_tokens={"browser": TOKEN}, install_class="reported") as (url, _httpd):
+        out = _drive(tmp_path, f"{url}/", [
+            {"emulate": {"w": 390, "h": 844, "dpr": 3, "mobile": True}},
+            *_reload(),
+            {"until": f"{TRAY} && {TRAY}.querySelector('[data-list-more]') && 1"},
+            {"eval": "new Promise(r => setTimeout(() => r(1), 700))"},
+            {"eval": _CTL_PROBE},
+            {"eval": type_q("BJE")},
+            {"eval": f"[{TRAY}.querySelector('.sp-results .empty').textContent, !!{TRAY}.querySelector('[data-held-show-matches]')]"},
+            {"eval": f"{TRAY}.querySelector('[data-held-show-matches]').click(); 1"},
+            {"until": "document.querySelector('#levain-modal .modal-body .sp-results .row') && 1"},
+            {"eval": "[...document.querySelectorAll('#levain-modal .sp-results .row .clause')].map(c => c.textContent.slice(0, 18))"},
+        ])
+    card = json.loads(out["values"][-6])
+    assert card["empty"] == ["Nothing due for you."], card                         # never "Nothing yet. Drop a line ..." over the control
+    assert card["h"] > 0, card                                                     # the control is still there
+    note, hint = out["values"][-4]
+    assert "no items match" in note and "in the full list" in note and hint is True, (note, hint)
+    assert any(t.startswith("desk: Write the BJ") for t in out["values"][-1]), out["values"][-1]

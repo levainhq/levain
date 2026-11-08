@@ -340,11 +340,27 @@ def _band_with(monkeypatch: pytest.MonkeyPatch, rig: Rig, **fields: Any) -> None
 
 
 def test_r1_a_desk_section_row_carries_its_section_and_sorts_under_desk_owes(rig: Rig, monkeypatch: pytest.MonkeyPatch) -> None:
-    _band_with(monkeypatch, rig, section="desk", carried=True)
+    before = rig.panel()["count"]
+    _band_with(monkeypatch, rig, section="desk", carried=False)
     row = rig.rows()[f"band:{rig.q.id}"]
-    assert row["facets"]["band_section"] == "desk" and row["facets"]["band_carried"] is True, row["facets"]
+    assert row["facets"]["band_section"] == "desk" and row["facets"]["band_carried"] is False, row["facets"]
     assert row["group"] == "desk", row["group"]
     assert "desk" in {g["id"] for g in rig.panel()["groups"]}
+    assert rig.panel()["count"] == before - 1       # a desk row not yet carried is not the operator's: the header does not count it
+
+
+def test_listpanel_r1_a_carried_desk_row_is_needs_you_and_counted_as_flows_footer_does(rig: Rig, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Flow's build_footer: a desk row open > 24h is `carried`, listed under NEEDS YOU (tagged desk-owed) AND under DESK OWES, never LATER."""
+    before = rig.panel()["count"]
+    _band_with(monkeypatch, rig, section="desk", carried=True)
+    p = rig.panel()
+    row = {r["id"]: r for r in p["rows"]}[f"band:{rig.q.id}"]
+    assert row["facets"]["band_section"] == "desk" and row["facets"]["band_carried"] is True, row["facets"]
+    assert row["group"] == "band", row["group"]
+    assert p["count"] == before, (before, p["count"])      # counted in the header, as the footer's NEEDS YOU counts it
+    day = (TODAY + timedelta(days=3)).isoformat()
+    _band_with(monkeypatch, rig, section="desk", carried=True, snoozed_until=day)    # carried is never LATER in flow
+    assert {r["id"]: r for r in rig.panel()["rows"]}[f"band:{rig.q.id}"]["group"] == "band"
 
 
 def test_r1_a_you_section_row_is_needs_you_and_a_store_with_no_section_draws_no_facet(rig: Rig, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -383,3 +399,18 @@ def test_r2_a_desk_owes_row_is_not_counted_either(rig: Rig, monkeypatch: pytest.
     before = rig.panel()["count"]
     _band_with(monkeypatch, rig, section="desk")
     assert rig.panel()["count"] == before - 1
+
+
+@pytest.mark.parametrize("fields,heading", [({"section": "desk", "carried": False}, "Desk owes"),
+                                            ({"snoozed_until": (TODAY + timedelta(days=3)).isoformat()}, "Later")])
+def test_listpanel_r1_the_text_cockpit_draws_desk_owes_and_later_as_the_footer_does(rig: Rig, monkeypatch: pytest.MonkeyPatch,
+                                                                                  fields: dict, heading: str) -> None:
+    from levain.cockpit.text import render_lines, snapshot
+
+    def lines() -> str:
+        return "\n".join(t for _s, t in render_lines(snapshot(rig.ck), now=NOW))
+
+    assert heading not in lines()
+    _band_with(monkeypatch, rig, **fields)
+    out = lines()
+    assert heading in out and "Ship the sweep fix tonight?" in out, out         # the row is not silently dropped
