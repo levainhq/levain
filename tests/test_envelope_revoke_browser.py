@@ -32,6 +32,8 @@ NARROW = {"emulate": {"w": 390, "h": 844, "dpr": 2, "mobile": True}}
 WIDE = {"emulate": {"w": 1280, "h": 900, "dpr": 1, "mobile": False}}
 _CARD = f"document.querySelector('#levain-modal [data-envelope=\"{EID}\"]')"
 _SHOTS = os.environ.get("LEVAIN_ENVREVOKE_SHOTS")
+# the modal fades in (opacity 0 -> 1): a shot waits until the fade has finished
+_FADED = "getComputedStyle(document.querySelector('#levain-modal .modal') || document.querySelector('#levain-modal')).opacity === '1'"
 
 
 class _Recording:
@@ -93,22 +95,31 @@ def test_the_card_lists_a_scratch_envelope_and_revoke_runs_the_ceremony(world, t
             {"eval": f"{_CARD}.querySelector('.consent-head').textContent"},
             {"eval": f"{_CARD}.querySelector('.envelope-revoke').textContent"},
             {"eval": _METRICS},
+            {"eval": f"{_CARD}.querySelector('.consent-facts').textContent"},
+            {"until": _FADED},
             *_shot(f"envelopes-{tag}.png"),
             {"tap": f"{_CARD}.querySelector('.envelope-revoke')"},
             {"posts": 2},
-            {"until": "/revoked/.test(document.querySelector('#levain-modal').textContent)"},
+            {"until": "!!document.querySelector('#levain-modal .envelope-said')"},
+            {"eval": "document.querySelector('#levain-modal .envelope-said').textContent"},
+            {"until": _FADED},
             *_shot(f"envelopes-{tag}-revoked.png"),
         ])
     values = [v for v in out["values"] if not (isinstance(v, dict) and "shot" in v)]
     m = next(v for v in values if isinstance(v, dict) and "sideways" in v)
     head = next(v for v in values if isinstance(v, str) and "morning seats" in v)
     button = next(v for v in values if v == "Revoke")
+    facts = next(v for v in values if isinstance(v, str) and EID[:11] in v)
+    said = next(v for v in values if isinstance(v, str) and v.startswith("Revoked "))
+    # the expiry is plain words in local time, never the raw stamp
+    assert "until" not in facts and "000000Z" not in facts, facts
+    assert said == f"Revoked {EID[:11]}. Work it authorised stops at its next step.", said
     assert "run the morning seats on flow" in head and "ends in" in head, head
     assert button == "Revoke", button
     # the phone width: nothing scrolls sideways and the button is a full-size target inside the screen
     assert m["sideways"] is False and m["bodySideways"] is False, m
     assert m["h"] >= 43.9 and m["w"] >= 43.9 and m["left"] >= 0 and m["right"] <= m["vw"], m
-    paths = [p.split(" ", 1)[0] for p in out["posts"]]
+    paths = [p.split(" ", 1)[0] for p in out["posts"] if p.startswith("/cockpit/envelope/")]   # the page's own trace posts are not the ceremony
     assert paths == [f"/cockpit/envelope/{EID}/revoke-challenge", f"/cockpit/envelope/{EID}/revoke"], out["posts"]
     (e1, a1, r1), (e2, a2, r2) = rec.steps
     assert (e1, a1) == (EID, "revoke-challenge") and r1["signer_fp"] == pk.key.fingerprint

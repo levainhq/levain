@@ -20,6 +20,7 @@ does not blank this. Stdlib plus the package's own verifier.
 from __future__ import annotations
 
 import base64
+import logging
 import re
 import secrets
 from datetime import datetime
@@ -32,7 +33,9 @@ from levain.cockpit.consent import parse_stamp, utc_stamp
 from levain.consent.grant_phone import HOLD, GrantPhone, GrantRefused
 from levain.consent.passkey import PasskeyError, b64url_decode, challenge, to_sshsig
 from levain.coordinator.envelopes import EnvelopeStore
-from levain.coordinator.store import CoordError
+from levain.coordinator.store import CoordError, StoreAbsent
+
+_log = logging.getLogger(__name__)
 
 __all__ = ["HOLD", "NAMESPACE", "EnvelopeRevoke", "GrantRefused", "envelope_state", "revoke_message"]
 
@@ -77,27 +80,54 @@ class EnvelopeRevoke(GrantPhone):
     def _store(self) -> EnvelopeStore:
         return EnvelopeStore(self.queue_dir)
 
+    def _read(self) -> Any:
+        """A read-only snapshot of the store: it never makes or migrates anything (a GET must not write)."""
+        store = self._store()
+        return read_transaction(store.open_readonly)
+
+    def _row_of(self, conn: Any, eid: str, now: datetime) -> "dict[str, Any] | None":
+        """One envelope as the list shows it, read by id. ``state`` is the envelope-wide state; a narrowing written for
+        one bound thread only (``kill`` or ``thread_done``) is counted in ``ended_threads`` of ``threads``, never read as
+        the whole envelope ending (it is what the coordinator's effective stop reads per thread)."""
+        store = self._store()
+        e = store._envelope(conn, eid)
+        if e is None:
+            return None
+        rows = [(k, v) for k, v in conn.execute(
+            "SELECT kind, value FROM envelope_attenuations WHERE envelope_id = ? AND thread_id IS NULL "
+            "ORDER BY gseq", (eid,)).fetchall()]
+        threads = conn.execute("SELECT count(*) FROM envelope_binds WHERE envelope_id = ?", (eid,)).fetchone()[0]
+        ended = conn.execute(
+            "SELECT count(DISTINCT thread_id) FROM envelope_attenuations WHERE envelope_id = ? AND thread_id IS NOT NULL "
+            "AND kind IN ('kill', 'thread_done')", (eid,)).fetchone()[0]
+        words = conn.execute("SELECT words FROM drops WHERE drop_id = ?", (e.drop_id,)).fetchone()
+        label = " ".join(str(words[0]).split())[:_LABEL_MAX] if words else ""
+        return {"id": eid, "label": label, "scope": _scope(e.body),
+                "issued": e.body.get("issued_at", e.accepted_at), "expires": e.stop_at,
+                "state": envelope_state(e.stop_at, rows, now), "instance": e.digest,
+                "threads": int(threads), "ended_threads": int(ended)}
+
     def _rows(self) -> "list[dict[str, Any]]":
+        """Every live envelope, newest first, then at most :data:`_LIST_CAP` of the ended ones: the cap bounds the
+        history, never hides an envelope that can still act."""
         store = self._store()
         if not store.coordinator_present():
             return []
         now = self._clock()
         out: list[dict[str, Any]] = []
-        with read_transaction(lambda: store._connect(create=False)) as conn:
-            found = conn.execute("SELECT envelope_id FROM envelopes ORDER BY gseq DESC LIMIT ?",
-                                 (_LIST_CAP,)).fetchall()
-            for (eid,) in found:
-                e = store._envelope(conn, eid)
-                if e is None:
+        ended = 0
+        with self._read() as conn:
+            if conn.execute("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'envelopes'").fetchone() is None:
+                return []
+            for (eid,) in conn.execute("SELECT envelope_id FROM envelopes ORDER BY gseq DESC").fetchall():
+                row = self._row_of(conn, eid, now)
+                if row is None:
                     continue
-                rows = [(k, v) for k, v in conn.execute(
-                    "SELECT kind, value FROM envelope_attenuations WHERE envelope_id = ? AND thread_id IS NULL "
-                    "ORDER BY gseq", (eid,)).fetchall()]
-                words = conn.execute("SELECT words FROM drops WHERE drop_id = ?", (e.drop_id,)).fetchone()
-                label = " ".join(str(words[0]).split())[:_LABEL_MAX] if words else ""
-                out.append({"id": eid, "label": label, "scope": _scope(e.body),
-                            "issued": e.body.get("issued_at", e.accepted_at), "expires": e.stop_at,
-                            "state": envelope_state(e.stop_at, rows, now), "instance": e.digest})
+                if row["state"] != "live":
+                    if ended >= _LIST_CAP:
+                        continue
+                    ended += 1
+                out.append(row)
         return out
 
     def listing(self) -> dict[str, Any]:
@@ -112,12 +142,25 @@ class EnvelopeRevoke(GrantPhone):
         return {"envelopes": rows, "signers": sorted(signers), "note": note}
 
     def _one(self, envelope_id: str) -> "dict[str, Any]":
+        """One envelope by id, whatever its age. A store that cannot be read answers 503, nothing was signed."""
         if not _ID.fullmatch(envelope_id):
             raise GrantRefused(404, "not_found", "no such envelope")
-        for row in self._rows():
-            if row["id"] == envelope_id:
-                return row
-        raise GrantRefused(404, "not_found", f"no envelope {envelope_id[:40]}")
+        try:
+            store = self._store()
+            if not store.coordinator_present():
+                raise GrantRefused(404, "not_found", f"no envelope {envelope_id[:40]}")
+            with self._read() as conn:
+                row = self._row_of(conn, envelope_id, self._clock())
+        except GrantRefused:
+            raise
+        except StoreAbsent:
+            raise GrantRefused(404, "not_found", f"no envelope {envelope_id[:40]}") from None
+        except Exception as exc:  # noqa: BLE001 - a store fault is a plain refusal, never a 500
+            raise GrantRefused(503, "unavailable", f"the envelope store cannot be read ({type(exc).__name__}); "
+                                                   "nothing was signed") from None
+        if row is None:
+            raise GrantRefused(404, "not_found", f"no envelope {envelope_id[:40]}")
+        return row
 
     def _live_or_refuse(self, row: "dict[str, Any]") -> None:
         if row["state"] == "killed":
@@ -137,8 +180,8 @@ class EnvelopeRevoke(GrantPhone):
                                                      "was signed")
         try:
             store_id = self._store().store_id()
-        except (CoordError, OSError) as exc:
-            raise GrantRefused(503, "unavailable", f"{str(exc)[:160]}; nothing was signed") from None
+        except Exception as exc:  # noqa: BLE001 - JobStoreError, CoordError, sqlite and OS faults are all one plain refusal
+            raise GrantRefused(503, "unavailable", f"{type(exc).__name__}: {str(exc)[:160]}; nothing was signed") from None
         message = revoke_message(store_id, grant_id, utc_stamp(self._clock()), secrets.token_hex(16))
         with self._lock:
             now = self._monotonic()
@@ -181,9 +224,15 @@ class EnvelopeRevoke(GrantPhone):
             wrote = self._store().attenuate(grant_id, "kill", by="operator")
         except CoordError as exc:
             raise GrantRefused(409, "refused", f"{str(exc)[:160]}; nothing was revoked") from None
+        except Exception as exc:  # noqa: BLE001 - a store fault is a plain refusal; the write is one transaction
+            raise GrantRefused(503, "unavailable", f"{type(exc).__name__}; nothing was revoked") from None
         if not wrote:
             raise GrantRefused(409, "already_ended", "this envelope is already killed; nothing was signed")
-        return {"revoked": grant_id, "warning": ""}
+        # the attenuation row can name only the actor ("operator"); the proof that a passkey signed it is this line
+        nonce = next((ln[7:] for ln in message.splitlines() if ln.startswith("nonce: ")), "")
+        _log.warning("envelope %s killed by a passkey-signed revoke: signer %s, challenge nonce %s, namespace %s",
+                     grant_id, signer_fp, nonce, NAMESPACE)
+        return {"revoked": grant_id, "warning": "", "signer": signer_fp, "nonce": nonce}
 
 
 def _b64u_challenge(message: str) -> str:

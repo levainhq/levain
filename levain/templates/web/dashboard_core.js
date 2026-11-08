@@ -7576,8 +7576,8 @@
   function grantFill(slot) {
     const n = ++grantFillSeq;
     Promise.all([grantFetch(), grantSignList()]).then(([b, signList]) => {
-      if (n === grantFillSeq) slot.dataset.filled = "1";     // the grants' read has answered: the phone jump may fall back to the envelopes
       if (!b || n !== grantFillSeq) return;
+      slot.dataset.filled = "1";     // the grants' read answered and was read: the phone jump may fall back to the envelopes
       // sort is stable: the server's order holds among grants with and among grants without a refused call
       const rows = b.grants.slice().sort((x, y) => (grantRefused(y) ? 1 : 0) - (grantRefused(x) ? 1 : 0));
       const note = typeof b.note === "string" ? b.note : "";
@@ -7644,7 +7644,15 @@
     row.appendChild(head);
     const facts = el("div", "consent-facts");
     if (sv(e.label) && sv(e.scope)) facts.appendChild(el("span", "ext-meta", sv(e.scope)));
-    facts.appendChild(el("span", "ext-meta", "until " + sv(e.expires)));
+    const ends = Date.parse(sv(e.expires));
+    if (Number.isFinite(ends)) {
+      const when = el("span", "ext-meta", new Date(ends).toLocaleString([], { weekday: "short", hour: "numeric", minute: "2-digit" }));
+      when.title = sv(e.expires);
+      facts.appendChild(when);
+    }
+    // a narrowing written for one bound thread only is said, never read as the whole envelope ending
+    const tn = Number(e.threads), en = Number(e.ended_threads);
+    if (en > 0) facts.appendChild(el("span", "ext-meta envelope-threads", "ended for " + en + " of " + (tn || en) + " thread" + ((tn || en) === 1 ? "" : "s")));
     facts.appendChild(el("span", "ext-meta", sv(e.id).slice(0, 11)));
     row.appendChild(facts);
     const signers = Array.isArray(listing.signers) ? listing.signers : [];
@@ -7709,7 +7717,7 @@
               if (!r.ok) { envelopeSaid = "not revoked " + e.id + ": " + signWhy(r); say(envelopeSaid, "bad"); return; }
               signKeep(c.body.rp_id, who.fp, cred);
               revoked = true;
-              envelopeSaid = "revoked " + e.id.slice(0, 11);
+              envelopeSaid = "Revoked " + e.id.slice(0, 11) + ". Work it authorised stops at its next step.";
               say(envelopeSaid, "ok");
             });
           }, (err) => say(signDeclined(err, "nothing was revoked"), "bad"));
@@ -7742,6 +7750,7 @@
       const live = b.envelopes.filter((e) => e && e.state === "live");
       const ended = b.envelopes.length - live.length;
       const said = envelopeSaid ? [el("div", "consent-note ext-meta envelope-said", envelopeSaid)] : [];
+      envelopeSaid = "";                                 // said once: a later redraw never repeats a stale revoke message
       const why = typeof b.note === "string" && b.note ? [el("div", "consent-note ext-meta envelope-why", b.note)] : [];
       slot.replaceChildren(el("div", "ext-grouphead", "Envelopes"), ...said, ...why,
         ...(live.length ? live.map((e) => envelopeCard(e, b)) : [el("div", "consent-note ext-meta envelope-empty", "No live envelopes")]),

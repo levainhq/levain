@@ -5,6 +5,7 @@ checks are not what is under test), and the passkey is the dispatch tests' softw
 from __future__ import annotations
 
 import json
+import logging
 import shutil
 import sqlite3
 import urllib.parse
@@ -216,3 +217,96 @@ def test_a_localhost_passkey_lists_no_signer(world) -> None:
     er = EnvelopeRevoke(world.qdir, "localhost", None, lambda: {})
     out = er.listing()
     assert out["signers"] == [] and "localhost" in out["note"] and out["envelopes"][0]["state"] == "live"
+
+
+def _ev(i: int) -> str:
+    return "ev-" + f"{i:032x}"
+
+
+def test_a_live_envelope_older_than_the_newest_fifty_is_listed_and_revocable(world, tmp_path) -> None:
+    """The list caps the ENDED ones; a live envelope is never hidden, and the challenge reads one envelope by id."""
+    _seed(world.qdir, EID, hours=24)                      # the oldest, live
+    for i in range(1, 60):
+        _seed(world.qdir, _ev(i), hours=-1)               # 59 newer, all expired
+    with _serving(tmp_path / "inst", signer=_signer(world), extra_hosts=[RP]) as (url, _h):
+        status, listed = _call(url, "/cockpit/envelope/list.json")
+        assert status == 200, listed
+        by_id = {e["id"]: e for e in listed["envelopes"]}
+        assert by_id[EID]["state"] == "live", "the oldest live envelope is listed"
+        assert sum(1 for e in listed["envelopes"] if e["state"] != "live") == 50, "only the ended are capped"
+        q = urllib.parse.quote(EID, safe="")
+        status, c = _call(url, f"/cockpit/envelope/{q}/revoke-challenge",
+                          {"signer_fp": world.phone.fp, "instance": by_id[EID]["instance"]})
+        assert status == 200, c
+        status, out = _call(url, f"/cockpit/envelope/{q}/revoke", world.phone.assertion(c["challenge"], origin=PAGE))
+        assert (status, out["revoked"]) == (200, EID), out
+        # an ended envelope past the cap is still answered by id, plainly
+        status, out = _call(url, f"/cockpit/envelope/{_ev(1)}/revoke-challenge",
+                            {"signer_fp": world.phone.fp, "instance": "x"})
+        assert (status, out["error"]) == (409, "expired"), out
+
+
+def test_a_thread_scoped_kill_is_named_not_shown_as_plain_live(world, tmp_path) -> None:
+    _seed(world.qdir)
+    raw = sqlite3.connect(world.qdir / "dispatch.db")      # a scratch store: foreign keys are off on a fresh connection
+    raw.execute("INSERT INTO envelope_binds (envelope_id, thread_id, rev, gseq, at) VALUES (?, 'th-1', 1, 9001, 'now')", (EID,))
+    raw.execute("INSERT INTO envelope_binds (envelope_id, thread_id, rev, gseq, at) VALUES (?, 'th-2', 1, 9002, 'now')", (EID,))
+    raw.execute("INSERT INTO envelope_attenuations (envelope_id, thread_id, kind, value, by, gseq, at) "
+                "VALUES (?, 'th-1', 'kill', '', 'operator', 9003, 'now')", (EID,))
+    raw.commit()
+    raw.close()
+    with _serving(tmp_path / "inst", signer=_signer(world), extra_hosts=[RP]) as (url, _h):
+        row = _row(url)
+        assert row["state"] == "live" and (row["threads"], row["ended_threads"]) == (2, 1), row
+
+
+def test_a_store_fault_in_the_ceremony_is_a_plain_refusal_not_a_500(world, tmp_path, monkeypatch) -> None:
+    from levain.dispatch.jobs import JobStoreError
+
+    _seed(world.qdir)
+    with _serving(tmp_path / "inst", signer=_signer(world), extra_hosts=[RP]) as (url, _h):
+        row = _row(url)
+        q = urllib.parse.quote(EID, safe="")
+
+        def boom(self) -> str:
+            raise JobStoreError("the dispatch store has no valid store_id")
+
+        monkeypatch.setattr(EnvelopeStore, "store_id", boom)
+        status, out = _call(url, f"/cockpit/envelope/{q}/revoke-challenge",
+                            {"signer_fp": world.phone.fp, "instance": row["instance"]})
+        assert (status, out["error"]) == (503, "unavailable") and "nothing was signed" in out["message"], (status, out)
+        monkeypatch.undo()
+
+        def broken(self, *a, **k):
+            raise sqlite3.OperationalError("disk I/O error")
+
+        monkeypatch.setattr(EnvelopeStore, "open_readonly", broken)
+        status, out = _call(url, f"/cockpit/envelope/{q}/revoke-challenge",
+                            {"signer_fp": world.phone.fp, "instance": row["instance"]})
+        assert (status, out["error"]) == (503, "unavailable"), (status, out)
+
+
+def test_the_signed_kill_leaves_its_proof_in_the_audit_line(world, tmp_path, caplog) -> None:
+    _seed(world.qdir)
+    caplog.set_level(logging.INFO, logger="levain.coordinator.envelope_revoke")
+    with _serving(tmp_path / "inst", signer=_signer(world), extra_hosts=[RP]) as (url, _h):
+        row = _row(url)
+        q = urllib.parse.quote(EID, safe="")
+        status, c = _call(url, f"/cockpit/envelope/{q}/revoke-challenge",
+                          {"signer_fp": world.phone.fp, "instance": row["instance"]})
+        nonce = c["line"].rstrip("\n").rsplit("nonce: ", 1)[1]
+        status, out = _call(url, f"/cockpit/envelope/{q}/revoke", world.phone.assertion(c["challenge"], origin=PAGE))
+        assert status == 200 and out["signer"] == world.phone.fp and out["nonce"] == nonce, out
+    lines = [r.getMessage() for r in caplog.records if "passkey-signed revoke" in r.getMessage()]
+    assert len(lines) == 1 and world.phone.fp in lines[0] and nonce in lines[0] and EID in lines[0], lines
+
+
+def test_the_list_read_never_migrates_the_store(world, tmp_path, monkeypatch) -> None:
+    _seed(world.qdir)
+
+    def no_ensure(self, *a, **k):
+        raise AssertionError("the list read ran the store's ensure/migrate path")
+
+    with _serving(tmp_path / "inst", signer=_signer(world), extra_hosts=[RP]) as (url, _h):
+        monkeypatch.setattr(EnvelopeStore, "_ensure", no_ensure)
+        assert _row(url)["state"] == "live"
