@@ -866,6 +866,10 @@
     // A writable install that wants a token and read the manifest without one (a loopback read needs none)
     // would draw every action refused. Ask for the token now, then read again as that credential.
     const cred = manifest && manifest.credential;
+    if (manifest && manifest.transport && manifest.transport.threads === false && document.body.dataset.threads !== "off") {
+      document.body.dataset.threads = "off";   // the server offers no Threads zone (make_server(threads=False)): the zone's boot reads this
+      window.dispatchEvent(new Event("levain:threads-off"));
+    }
     if (manifest && manifest.transport && typeof manifest.transport.owner_key === "boolean") tokenAuth = manifest.transport.owner_key ? "owner" : "pair";
     const wantsToken = !!(manifest && manifest.transport && manifest.transport.write_token_required === true
       && cred && cred.class === "none");
@@ -1123,8 +1127,9 @@
   }
 
   function sync() {
-    const want = !!token() && document.body.dataset.mode === "build" && document.visibilityState !== "hidden";
-    section.hidden = !token();
+    const off = document.body.dataset.threads === "off";
+    const want = !off && !!token() && document.body.dataset.mode === "build" && document.visibilityState !== "hidden";
+    section.hidden = off || !token();
     if (want && !view) {
       host.replaceChildren();
       const T = window.LevainCockpitTransport;
@@ -1172,6 +1177,7 @@
     }, true);
     document.addEventListener("visibilitychange", sync);
     window.addEventListener("storage", (e) => { if (e.key === WRITE_TOKEN_KEY) sync(); });
+    window.addEventListener("levain:threads-off", sync);
     window.addEventListener("levain:write-token-change", sync);   // the same page's own set / remove (dashboard_boot's token handling)
     sync();
   }

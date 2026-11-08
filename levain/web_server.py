@@ -1912,6 +1912,8 @@ class _LevainHTTPServer(ThreadingHTTPServer):
         self._consent_sheet = sheet
     # whether the cockpit draws levain's own Work board when no provider brings one (make_server's work_board)
     work_board: bool = True
+    # whether the Build tab's Threads zone is offered (make_server's threads): False answers its two routes 404 and the manifest says so
+    threads: bool = True
     # the ChatService the work thread's Stop acts through; None serves none of it
     chat_service: "ChatService | None" = None
     # the room's host (RM-F): its ChatService, CoordStore and the launcher's verbs; None serves no room write route
@@ -4066,6 +4068,17 @@ class _Handler(GuardedHandler):
                 last_read=srv.voice_last_read if srv.voice_last_read is not None else {})
         return cockpit_voice.stream_close(registry, query, owner)
 
+    def _manifest_transport(self) -> dict[str, bool]:
+        """The manifest's ``transport`` plus ``threads: false`` when the server offers no Threads zone (absent otherwise)."""
+        out = self._transport()
+        if not self.server.threads:
+            out["threads"] = False
+        return out
+
+    def _send_threads_off(self, head: bool) -> None:
+        self._send(cockpit_threads.encode({"error": "not_found", "message": "no threads here"}),
+                   "application/json; charset=utf-8", status=404, head=head, cache_control="private, no-store")
+
     def _serve_threads(self, path: str, *, head: bool) -> None:
         """``GET /cockpit/threads.json`` and ``GET /cockpit/thread/<th-id>.json`` (CH-U1a): the coordinator's threads and
         one thread's stream, read-only (:func:`levain.cockpit.threads.serve_threads`). A thread carries the operator's
@@ -4477,6 +4490,9 @@ class _Handler(GuardedHandler):
             self._serve_voice(head=head)
             return
         if cockpit_threads.is_threads_path(path):
+            if not self.server.threads:
+                self._send_threads_off(head)
+                return
             self._serve_threads(path, head=head)
             return
         if path == cockpit_board.BOARD_PATH:
@@ -4509,7 +4525,7 @@ class _Handler(GuardedHandler):
                 try:
                     status, body, hdrs = handle_cockpit_get(
                         self._cockpit(), self.path, credential=self._credential(),
-                        if_none_match=self.headers.get("If-None-Match"), transport=self._transport(),
+                        if_none_match=self.headers.get("If-None-Match"), transport=self._manifest_transport(),
                     )
                 except _CredentialUnavailable:   # RU-5: only the outer catch answers it
                     raise
@@ -5305,6 +5321,7 @@ def make_server(
     room_host: "cockpit_room.RoomHost | None" = None,
     room_serve: "Any" = None,
     premium_stt: bool = False,
+    threads: bool = True,
 ) -> _LevainHTTPServer:
     """Build a configured, bound (but not-yet-serving) web server over a substrate.
 
@@ -5344,6 +5361,9 @@ def make_server(
 
     ``work_board=False`` draws no Work board of levain's own: an embedder with no board of its own gets none (a board a
     provider registers still draws; the built-in is only the default when none does).
+
+    ``threads=False`` offers no Threads zone: ``GET /cockpit/threads.json`` and ``/cockpit/thread/<id>.json`` answer 404 and
+    the manifest's ``transport`` carries ``threads: false`` (absent by default), which the page reads to draw no zone.
 
     ``coordinator_verbs`` says a coordinator watcher runs beside this server: only then, over a write scope, are the
     Desk panel's Start / Stop / Hold registered (a caller's verb or effect under one of their names is then a
@@ -5698,6 +5718,7 @@ def make_server(
     # until every refusal below has passed and the Signer is pinned.
     httpd.cockpit = cockpit
     httpd.work_board = work_board
+    httpd.threads = threads is not False
     httpd.chat_service = chat_service
     httpd.room_host = room_host
     httpd.room_serve = None         # set only once the RoomServe has started, at the very end
