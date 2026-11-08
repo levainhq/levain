@@ -12,6 +12,7 @@ import re
 from pathlib import Path
 
 import levain
+import pytest
 from tests.test_cockpit_narrow_layout_rig import NEEDS, PHONE_TOUCH, TOK, FullRig, drive_touch, needs_browser, needs_ssh
 from tests.test_msgslot_hero import READY, _tagged, _type
 
@@ -68,7 +69,8 @@ INIT_JS = """(() => {
       const later = sheet && top.__frameLists > 1;
       const body = {coord_drops: [], coord_note: null, coord_repos: __REPOS__, coord_store_id: later && 'storeAfter' in CFG ? CFG.storeAfter : CFG.store,
                     coord_store_read: true, coord_signers: ['SHA256:abcdefabcdefabcdefabcdef'], coord_signer_note: null, origin: location.origin,
-                    rp_id: location.hostname, credentials: {}};
+                    rp_id: location.hostname, credentials: {},
+                    coord_may_launch: 'mayLaunch' in CFG ? CFG.mayLaunch : sheet};   // the server's one cockpit test (CoordPhone.may_launch)
       if (later && CFG.holdList) return new Promise((r) => top.__heldList.push(() => r(reply(200, body))));
       return json(body);
     }
@@ -304,7 +306,7 @@ def test_the_launch_toggle_is_off_by_default_clamped_to_the_servers_bounds_and_a
                        "dflt: d.getElementById('drop-launch-count').value};"),
         _click(FD, "#drop-launch"), _reviews(2), last("on"),
         _tag("shown", FD, "return {countShown: d.getElementById('drop-launch-count').getClientRects().length > 0};"),
-        _set(FD, "#drop-launch-count", "5"),
+        _set(FD, "#drop-launch-count", "13"),
         _tag("five", FD, "return {review: d.getElementById('drop-review').textContent, btn: d.getElementById('drop-sign').disabled};"),
         _set(FD, "#drop-launch-count", "0"),
         _tag("zero", FD, "return {btn: d.getElementById('drop-sign').disabled};"),
@@ -315,7 +317,7 @@ def test_the_launch_toggle_is_off_by_default_clamped_to_the_servers_bounds_and_a
     assert t["ui"] == {"t": "ui", "on": False, "countShown": False, "dflt": "2"}, t["ui"]
     assert t["on"]["spec"] == {**STANDARD, "launches": [{"repo": "/work/alpha", "count": 2}]}, t["on"]
     assert t["shown"]["countShown"] is True, t["shown"]
-    assert t["five"]["btn"] is True and "launches[0].count is an integer from 1 to 4" in t["five"]["review"], t["five"]
+    assert t["five"]["btn"] is True and "launches[0].count is an integer from 1 to 12" in t["five"]["review"], t["five"]
     assert t["zero"]["btn"] is True, t["zero"]
     assert t["three"]["spec"]["launches"] == [{"repo": "/work/alpha", "count": 3}], t["three"]
     assert "launches" not in t["offAgain"]["spec"], t["offAgain"]       # turned off again: the key leaves the spec
@@ -323,17 +325,20 @@ def test_the_launch_toggle_is_off_by_default_clamped_to_the_servers_bounds_and_a
 
 @needs_browser
 @needs_ssh
-def test_the_phone_page_has_no_launch_toggle(tmp_path: Path, monkeypatch) -> None:
+@pytest.mark.parametrize("may", [False, True])
+def test_the_phone_page_draws_the_launch_toggle_exactly_when_the_server_says_it_may(tmp_path: Path, monkeypatch, may) -> None:
+    """Row 460 (Phill 2026-11-08): the toggle follows the listing's coord_may_launch (the server's one cockpit test), never
+    where the page is framed: his cockpit on his phone draws it, a page the server would refuse does not."""
     rig = FullRig(tmp_path, monkeypatch)
     steps = list(PHONE_TOUCH) + [
         {"eval": "window.localStorage.setItem('levain_write_token', %s); 1" % json.dumps(TOK)},
-        {"init": INIT},
+        {"init": make_init(mayLaunch=may)},
         {"eval": f"(() => {{ location.href = '{rig.origin}/sign/drop'; return 1; }})()"},
         {"until": "document.getElementById('drop-words')", "ms": 30000},
         {"eval": "JSON.stringify({t: 'p', toggle: !!document.getElementById('drop-launch'), group: !!document.getElementById('env-launch')})"}]
     with rig.serving():
         out = drive_touch(tmp_path, f"{rig.origin}/nope", steps)
-    assert _tagged(out)["p"] == {"t": "p", "toggle": False, "group": False}
+    assert _tagged(out)["p"] == {"t": "p", "toggle": may, "group": may}
 
 
 @needs_browser

@@ -82,6 +82,7 @@ overwrite the other's change; the page says "one tab at a time" there. iOS Safar
 from __future__ import annotations
 
 import base64
+import re
 import secrets
 import sqlite3
 import threading
@@ -93,7 +94,7 @@ from typing import Any
 from levain.coordinator.store import SURFACES
 
 __all__ = ["REVIEWS_KEPT", "REVIEW_CLEARED_SHOWN", "REVIEW_OPEN_SHOWN", "REVIEW_TTL", "CoordPhone",
-           "CoordRefused"]
+           "CoordRefused", "may_launch"]
 
 # the drops a listing shows, newest first, are those of these surfaces: every surface the store records. A drop typed
 # at a terminal is his words as much as one sent from the phone or the cockpit, so no surface is left out of his thread
@@ -116,10 +117,20 @@ REVIEW_TTL = timedelta(minutes=15)
 REVIEWS_KEPT = 32
 # what the phone sheet may set in an envelope (pushes and publishes stay the laptop's: a push's url is resolved there)
 _SPEC_KEYS = frozenset({"where", "lands", "budget", "stop"})
-# the cockpit's own device id (web_server's _COORD_DEVICE). Only the cockpit composer may add a launch grant; a paired
-# phone's sheet never can, however its request is worded (the phone refuses the key before any body is built)
+# the cockpit's own device id (web_server's _COORD_DEVICE)
 COCKPIT_DEVICE = "cockpit"
 _COCKPIT_SPEC_KEYS = _SPEC_KEYS | {"launches"}
+_PAIRED_DEVICE = re.compile(r"d-[0-9a-f]{1,64}")     # a paired device's id (firejournal mints "d-" + hex)
+
+
+def may_launch(device: Any) -> bool:
+    """Whether a step running as ``device`` may add a launch grant: THE one cockpit test, read by the server's spec check
+    and handed to the page (``coord_may_launch``) so the toggle is drawn exactly where it is taken. True for the cockpit
+    page's own token and for a paired device's (his cockpit opened on his phone: Phill's ruling of 2026-11-08, row 460);
+    false for any other surface's token and for no credential. The authority itself is the envelope's passkey: a review
+    names an enrolled passkey covering the envelope's floor (:meth:`CoordPhone._key`) before its spec is read, and the
+    store verifies that passkey's signature, so a paired device with no enrolled passkey of its own signs nothing."""
+    return device == COCKPIT_DEVICE or (isinstance(device, str) and _PAIRED_DEVICE.fullmatch(device) is not None)
 
 
 class CoordRefused(Exception):
@@ -408,10 +419,14 @@ class CoordPhone:
         """The sheet's spec as the CLI builder takes it: where (absolute repos), lands always named and inferred."""
         from levain.coordinator.store import CoordError
 
-        cockpit = device == COCKPIT_DEVICE
+        cockpit = may_launch(device)
         allowed = _COCKPIT_SPEC_KEYS if cockpit else _SPEC_KEYS
         if not isinstance(spec, dict) or not set(spec) <= allowed:
-            raise CoordError(f"an envelope from {'the cockpit' if cockpit else 'the phone'} sets only {sorted(allowed)}")
+            hint = "" if cockpit or not isinstance(spec, dict) or "launches" not in spec else (
+                "; a launch grant is signed from the cockpit only. Turn Launching seats off and sign again: the "
+                "envelope still starts the desk, which asks you before it starts a seat")
+            raise CoordError(f"an envelope from {'the cockpit' if cockpit else 'this page'} sets only {sorted(allowed)}"
+                             + hint)
         where = spec.get("where", [])
         lands = spec.get("lands", [])
         if not isinstance(where, list) or not isinstance(lands, list):

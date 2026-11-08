@@ -83,13 +83,13 @@ def test_an_older_reader_refuses_a_body_that_carries_launches(monkeypatch):
 
 
 # 2 -- counts ---------------------------------------------------------------------------------------------------------
-BAD_COUNTS = [0, -1, 5, 2.0, "2", True, None]
+BAD_COUNTS = [0, -1, env.LAUNCH_MAX + 1, 2.0, "2", True, None]
 
 
 @pytest.mark.parametrize("count", BAD_COUNTS)
 def test_a_bad_count_is_refused_by_parse_body(count):
     # 2.0 is refused even earlier: canonical JSON has no floats at all
-    with pytest.raises(env.EnvelopeError, match=r"launches\[0\]\.count is an integer from 1 to 4|float 2\.0 in a leaf"):
+    with pytest.raises(env.EnvelopeError, match=rf"launches\[0\]\.count is an integer from 1 to {env.LAUNCH_MAX}|float 2\.0 in a leaf"):
         env.parse_body(canonical(_body(launches=_grant(count))))
 
 
@@ -103,7 +103,7 @@ def test_a_bad_count_is_refused_at_compose_in_the_same_words(ctx, count):
     """The CLI spec builder and the draft proposal both end in parse_body, so compose and verify refuse alike."""
     spec = {"where": [{"repo": ctx.path, "paths": ["."]}], "launches": [{"repo": ctx.path, "count": count}]}
     body = ccli._spec_body(spec, "words", ctx.src, ctx.store)
-    refusal = r"launches\[0\]\.count is an integer from 1 to 4|float 2\.0 in a leaf"
+    refusal = rf"launches\[0\]\.count is an integer from 1 to {env.LAUNCH_MAX}|float 2\.0 in a leaf"
     with pytest.raises(env.EnvelopeError, match=refusal):
         env.parse_body(canonical(body))
     with pytest.raises((CoordError, env.EnvelopeError)):
@@ -191,7 +191,7 @@ def test_the_key_set_is_exactly_the_body_keys_with_or_without_launches():
     assert env.OPTIONAL_KEYS == {"launches"} and "launches" not in env.BODY_KEYS
     assert env.EFFECT_LISTS == ("lands", "pushes", "publishes")            # a launch is not an irreversible effect
     assert env.GRANT_LISTS == env.EFFECT_LISTS + ("launches",)
-    assert (env.LAUNCH_DEFAULT, env.LAUNCH_MAX) == (2, 4)
+    assert (env.LAUNCH_DEFAULT, env.LAUNCH_MAX) == (2, 12)   # row 461, Phill 2026-11-08
 
 
 def test_a_non_canonical_launches_body_is_refused():
@@ -435,7 +435,7 @@ def test_the_cockpit_authority_line_names_the_launch_grant_only_when_there_is_on
 
 
 @pytest.mark.parametrize("launches", [[{"repo": REPO}], [{"count": 2}], [None], [{"repo": 7, "count": 2}],
-                                      [{"repo": REPO, "count": 0}], [{"repo": REPO, "count": 5}],
+                                      [{"repo": REPO, "count": 0}], [{"repo": REPO, "count": env.LAUNCH_MAX + 1}],
                                       [{"repo": REPO, "count": True}], [{"repo": REPO, "count": 2, "x": 1}]])
 def test_the_cockpit_authority_line_refuses_a_launch_entry_it_cannot_read(launches):
     """L3 r1 #8: each entry goes through the same _bad() refusal as the effect lists (fail closed upstream)."""
@@ -492,7 +492,7 @@ def test_the_composer_source_matches_the_servers_bounds_and_only_the_cockpit_mod
     assert f"LAUNCH_DEFAULT = {env.LAUNCH_DEFAULT}, LAUNCH_MAX = {env.LAUNCH_MAX};" in form
     assert "launchOn.checked = false;" in form and "if (launches) spec.launches = launches;" in form
     sign = (WEB / "sign.js").read_text()
-    assert "launches: embedded," in sign
+    assert "launches: got.coord_may_launch === true," in sign and "launches: embedded" not in sign
 
 
 def test_a_draft_replacing_a_head_with_a_grant_shows_the_grant_removed_in_words():

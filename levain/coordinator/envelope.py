@@ -63,9 +63,9 @@ LAUNCH_LIST = "launches"
 OPTIONAL_KEYS = frozenset({LAUNCH_LIST})
 GRANT_LISTS = EFFECT_LISTS + (LAUNCH_LIST,)
 LAUNCH_DEFAULT = 2
-# the desk's fan-in runs 4 lanes a round at most; the widest standing no-further-auth grant stays the smallest number
-# that covers a real round. Raising it is a code change, never a typo.
-LAUNCH_MAX = 4
+# Phill's ruling of 2026-11-08 (row 461, signed): a morning ritual can need 8+ seats from one envelope, so a grant
+# names up to 12 (it was 4, set 11-07 with no ruling behind it). Raising it again is a code change and his call.
+LAUNCH_MAX = 12
 ORIGINS = ("structured", "worded")
 
 BODY_MAX = 64 * 1024

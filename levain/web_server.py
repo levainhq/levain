@@ -870,9 +870,10 @@ _COORD_SHEET = "/sign/drop"
 # which binds a kept envelope review to it). The cockpit's gate takes a surface token OR a paired device's token, so the
 # device a step runs as is read from the request's AUTHENTICATED credential (_coord_device), never fixed: a paired device
 # runs as its own id ("d-" + hex, never this name), and only the cockpit page's own surface token ("browser") runs as this
-# one name, "this cockpit's page"; another surface runs as "surface:<name>" (L3 r1: a fixed label let a paired phone set
-# the launch grant only the cockpit may; L3 r2: so could any other surface's token).
-_COORD_DEVICE = "cockpit"          # == levain.coordinator.phone.COCKPIT_DEVICE (the one device that may add a launch grant)
+# one name, "this cockpit's page"; another surface runs as "surface:<name>" (L3 r2: a fixed label let any surface's token
+# run as the cockpit). Who may add a launch grant is levain.coordinator.phone.may_launch over that device: the cockpit
+# page and a paired device's cockpit (Phill 2026-11-08, row 460), never another surface's token.
+_COORD_DEVICE = "cockpit"          # == levain.coordinator.phone.COCKPIT_DEVICE
 
 
 def _coord_route(route: str) -> "str | None":
@@ -3430,7 +3431,9 @@ class _Handler(GuardedHandler):
     def _serve_coord_sheet(self, *, head: bool) -> None:
         """``GET /cockpit/coord/drops.json`` (OS-2): the drop sheet's read, ``{coord_drops, coord_store_id, coord_repos,
         coord_signers, coord_note, ..., credentials, origin, rp_id}`` (:meth:`CoordSheet.listing`), behind the sign listing's
-        gate exactly. Without a coord sheet, 404 ``not_found``."""
+        gate exactly, plus ``coord_may_launch`` for this request's credential. Without a coord sheet, 404 ``not_found``."""
+        from levain.coordinator.phone import may_launch
+
         sheet = self.server.coord_sheet
         hdrs = [("Vary", _WRITE_TOKEN_HEADER)]
         if sheet is None:
@@ -3446,6 +3449,9 @@ class _Handler(GuardedHandler):
             except Exception:  # noqa: BLE001 - display facts only
                 credentials = {}
             payload.update(credentials=credentials, origin=self.server.signer_page_origin, rp_id=sheet.rp_id)
+            # the one cockpit test, for THIS request's credential: the page draws the launch toggle exactly where the
+            # envelope-review would take it
+            payload["coord_may_launch"] = may_launch(self._coord_device())
             status = 200
         except _CredentialUnavailable:   # RU-5: only the outer catch answers it
             raise
@@ -3472,8 +3478,8 @@ class _Handler(GuardedHandler):
     def _coord_device(self) -> "str | None":
         """The device a coord step runs as, from the credential verified in ``_credential`` (never anything the client
         says): a paired device's own id; ``_COORD_DEVICE`` for the cockpit page's own surface token (``browser``) and
-        for no other; ``surface:<name>`` for any other surface's token, a device that is not the cockpit and so never
-        sets a launch grant. None (CoordPhone refuses it, 403) for a request with no credential (``_credential``
+        for no other; ``surface:<name>`` for any other surface's token, which never sets a launch grant
+        (:func:`levain.coordinator.phone.may_launch`). None (CoordPhone refuses it, 403) for a request with no credential (``_credential``
         answers class ``none``; where one cannot be read now it raises ``_CredentialUnavailable``, the outer 503) and
         for a paired name with no id after the prefix."""
         cred = self._credential(required=True)
