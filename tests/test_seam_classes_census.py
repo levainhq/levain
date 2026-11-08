@@ -74,7 +74,7 @@ def test_the_classes_do_not_overlap() -> None:
 def test_every_table_of_the_maximal_database_is_in_exactly_one_class(maximal: Path) -> None:
     tables = _tables(maximal)
     assert "sqlite_sequence" in tables and sc.EXEMPT["sqlite_sequence"] == "SQLite's own"
-    assert len(tables) == 77 and len(set(tables)) == 77           # the census's 54, SQLite's, S0, S1, S2b's five, P3, S5, CH-H2's three, the room's four, H1-1's two (envelope_drafts, envelope_draft_withdrawals: each row takes a gseq, so COUNTED), the room relay's two (room_relay_claims, room_relay_outcomes: no gseq, so INFRASTRUCTURE), the board store's two (worker_attach, report_refusals: INFRASTRUCTURE, a decision recorded in seam_classes)
+    assert len(tables) == 78 and len(set(tables)) == 78           # the census's 54, SQLite's, S0, S1, S2b's five, P3, S5, CH-H2's three, the room's four, H1-1's two (envelope_drafts, envelope_draft_withdrawals: each row takes a gseq, so COUNTED), the room relay's two (room_relay_claims, room_relay_outcomes: no gseq, so INFRASTRUCTURE), the board store's two (worker_attach, report_refusals: INFRASTRUCTURE, a decision recorded in seam_classes) and its sessions_seen (the service's sightings, INFRASTRUCTURE)
     # `_r4` is the transient name of the review events' rebuild: gone by commit, so a finished store holds none
     assert not [t for t in tables if t.endswith("_r4")]
     known = sc.COUNTED | sc.INFRASTRUCTURE | set(sc.EXEMPT)
@@ -170,7 +170,7 @@ def test_the_name_scan_reads_every_statement_and_catches_a_seeded_duplicate() ->
         "first_reader.FIRST_READER_SCHEMA": (16, 16), "ready.LIFECYCLE_SCHEMA": (12, 12),
         "work_delta.OPERATOR_VIEWS_SCHEMA": (4, 4), "store.SEAM_SCHEMA": (4, 4),
         "seam_handoffs.SEAM_HANDOFF_SCHEMA": (8, 8), "seam_open.OPEN_SCHEMA": (21, 21),
-        "intake.INTAKE_SCHEMA": (4, 4), "work_attach.WORK_SCHEMA": (11, 11),
+        "intake.INTAKE_SCHEMA": (4, 4), "work_attach.WORK_SCHEMA": (14, 14),
         "envelopes.ENVELOPE_SCHEMA": (12, 12), "chat.CHAT_SCHEMA": (52, 52), "chat_egress.EGRESS_SCHEMA": (6, 6)}
     # IF NOT EXISTS hides a second declaration from the database: the scan must see it in the source
     assert _declared(("CREATE TABLE IF NOT EXISTS replies (a)", "CREATE UNIQUE INDEX IF NOT EXISTS i ON t (a)",

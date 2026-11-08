@@ -1827,10 +1827,29 @@ def _coord_report(args: argparse.Namespace, out: Any) -> int:
         directory, report_id=args.report_id, item_id=args.item, worker=args.worker, worker_kind=args.kind,
         event=args.event, at=at, launch_id=args.launch, harness_session_id=session, sha=args.sha, branch=args.branch,
         why=args.why)
-    words = (f"queued report {rid} for {args.item}; it is applied when the board store's watcher next runs"
-             if queued else f"report {rid} was already queued; nothing was added")
+    words = work_attach.report_line(directory, rid, queued)
     _emit(out, args.json, {"report_id": rid, "queued": queued, "item": args.item, "store": str(directory)}, words)
     return 0
+
+
+def _coord_reports(args: argparse.Namespace, out: Any = None) -> int:
+    """``levain coord reports REPORT_ID`` (row 156 L2 F16): what became of one report, read-only (queued, applied,
+    refused with its reason, or unknown). Opens no store for writing and takes no token. Exit 1 when the id is unknown."""
+    from levain.coordinator import work_attach
+
+    out = out or sys.stdout
+    directory = args.board_store.expanduser() if args.board_store is not None else work_attach.board_store_dir()
+    try:
+        st = work_attach.report_status(directory, args.report_id)
+    except (CoordError, sqlite3.Error, OSError) as exc:
+        print(f"levain coord reports: {exc}", file=sys.stderr)
+        return 2
+    words = {"queued": "queued; the next `levain coord watch` pass applies or refuses it",
+             "applied": f"applied ({st['kind']}, {st['attach_id']})",
+             "refused": f"refused ({st['reason']}: {st['detail']})",
+             "unknown": f"not in the queue at {directory}"}[st["state"]]
+    _emit(out, args.json, st, f"report {args.report_id}: {words}")
+    return 1 if st["state"] == "unknown" else 0
 
 
 def _coord_spawn(args: argparse.Namespace, out: Any, store: EnvelopeStore) -> int:
@@ -2348,6 +2367,15 @@ def add_parsers(subparsers: argparse._SubParsersAction) -> None:
                      help="The board store directory (default: <levain home>/board).")
     crt.add_argument("--json", action="store_true", help="Machine-readable output.")
     crt.set_defaults(func=run_coord)
+    crs = c_sub.add_parser(
+        "reports", help="What became of a report you queued: queued, applied, or refused and why (read-only).",
+        description="Reads the board store's queue and its records for one report id. Writes nothing; no token.")
+    crs.add_argument("report_id", metavar="REPORT_ID", help="The id `levain coord report` printed.")
+    crs.add_argument("--board-store", dest="board_store", type=Path, default=None, metavar="DIR",
+                     help="The board store directory (default: <levain home>/board).")
+    crs.add_argument("--json", action="store_true", help="Machine-readable output.")
+    crs.set_defaults(func=_coord_reports)
+    door_ok(crs)
     caw = c_sub.add_parser(
         "away", help="Read a drop as the operator's word that he is away: set away ON (never off).",
         description="Sets away ON for both agents through `levain consent away on`'s own path, so every SIGN waits "

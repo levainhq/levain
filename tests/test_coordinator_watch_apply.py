@@ -27,8 +27,9 @@ def coord(board):
 
 
 def _report(board, rid, **kw):
-    base = {"report_id": rid, "item_id": "levain:a", "worker": "wa2d", "worker_kind": "lane",
-            "event": "attach", "at": "2026-11-08T12:00:00-05:00"}
+    from datetime import datetime, timezone
+    base = {"report_id": rid, "item_id": "levain:a", "worker": kw.get("launch_id") or "wa2d", "worker_kind": "lane",
+            "event": "attach", "at": datetime.now(timezone.utc).isoformat()}
     work_attach.enqueue_report(board, **{**base, **kw})
 
 
@@ -46,7 +47,7 @@ def _none_live(_store):
 
 def test_a_queued_attach_is_applied_by_one_pass_and_the_lease_is_given_back(board, coord):
     store, token, launch_id = coord
-    store.coord_release()                                  # no coordinator holds the board now
+    store.coord_release(token, by="coordinator")           # no coordinator holds the board now
     _report(board, "r-1", launch_id=launch_id)
     lines = work_attach.watch_apply(board, sessions=_none_live)
     assert [r[0] for r in _rows(board, "SELECT report_id FROM worker_attach")] == ["r-1"]
@@ -71,7 +72,7 @@ def test_a_live_coordinator_lease_makes_the_pass_skip_and_say_why(board, coord):
 
 def test_an_unknown_item_is_refused_with_a_visible_record(board, coord):
     store, token, launch_id = coord
-    store.coord_release()
+    store.coord_release(token, by="coordinator")
     _report(board, "r-bad", item_id="levain:nowhere", launch_id=launch_id)
     lines = work_attach.watch_apply(board, sessions=_none_live)
     assert _rows(board, "SELECT count(*) FROM worker_attach") == [(0,)]
@@ -79,14 +80,15 @@ def test_an_unknown_item_is_refused_with_a_visible_record(board, coord):
     assert any("refused 1" in ln for ln in lines)
 
 
-def test_a_session_listing_that_cannot_be_read_defers_and_still_gives_the_lease_back(board, coord):
+def test_a_session_listing_that_cannot_be_read_defers_and_takes_no_lease(board, coord):
     store, token, _ = coord
     store.coord_release()
     _report(board, "r-1", harness_session_id="sess-1")
     lines = work_attach.watch_apply(board, sessions=lambda _s: None)
     assert _rows(board, "SELECT count(*) FROM worker_attach") == [(0,)]
     assert _rows(board, "SELECT count(*) FROM report_refusals") == [(0,)]
-    assert any("deferred 1" in ln for ln in lines) and store.coord_lease() is None
+    assert any("deferred" in ln for ln in lines) and store.coord_lease() is None
+    assert _rows(board, "SELECT count(*) FROM lease_events WHERE holder = 'service'") == [(0,)]
 
 
 def test_the_service_role_refuses_a_deciding_write(board, coord):
@@ -111,7 +113,7 @@ def test_watch_once_applies_beside_its_own_work_and_is_unchanged_without_reports
     token = seed.coord_take()
     ready.add(seed, token, "levain:a", repo="levain", title="item a", who="desk", why="seed", to="ready")
     ln = seed.launch_request(token, harness="claude", role="coordinator")
-    seed.coord_release()
+    seed.coord_release(token, by="coordinator")
     _report(board, "r-1", launch_id=ln.launch_id)
     after = launch.watch_once(consent)
     assert after[:len(before)] == before and any("applied 1" in line for line in after[len(before):])
@@ -265,3 +267,89 @@ def test_f10_a_service_claim_is_not_a_coordinator_to_the_wake_rule(board):
 def ready_stamp(when):
     from levain.cockpit.consent import utc_stamp
     return utc_stamp(when)
+
+
+def _now(**ago: float) -> str:
+    from datetime import datetime, timedelta, timezone
+    return (datetime.now(timezone.utc) - timedelta(**ago)).isoformat()
+
+
+def _free(board, coord):
+    store, token, launch_id = coord
+    store.coord_release(token, by="coordinator")             # a holder release: its launches stay as they are
+    return store, launch_id
+
+
+def test_f6_a_landed_report_after_the_session_exits_is_accepted(board, coord):
+    _free(board, coord)
+    sha = "b" * 40
+    _report(board, "r-att", worker="seat-a", worker_kind="seat", harness_session_id="sess-a", at=_now())
+    assert any("applied 1" in ln for ln in work_attach.watch_apply(board, sessions=lambda _s: frozenset({"sess-a"})))
+    # the seat's last acts, then it exits before the next pass
+    _report(board, "r-land", worker="seat-a", worker_kind="seat", harness_session_id="sess-a", event="landed",
+            sha=sha, branch="seat/x", at=_now())
+    _report(board, "r-end", worker="seat-a", worker_kind="seat", harness_session_id="sess-a", event="ended", at=_now())
+    lines = work_attach.watch_apply(board, sessions=_none_live)
+    assert any("applied 2" in ln for ln in lines), lines
+    assert [r[0] for r in _rows(board, "SELECT kind FROM worker_attach ORDER BY seq")] == ["attach", "landed", "ended"]
+    assert ready.item_facts(CoordStore(board), "levain:a")["landed_sha"] == sha
+
+
+def test_f6_a_session_never_seen_live_is_refused(board, coord):
+    _free(board, coord)
+    _report(board, "r-ghost", worker="seat-g", worker_kind="seat", harness_session_id="sess-ghost", at=_now())
+    work_attach.watch_apply(board, sessions=lambda _s: frozenset({"someone-else"}))
+    assert _rows(board, "SELECT report_id, reason FROM report_refusals") == [("r-ghost", "worker-not-a-launch")]
+
+
+def test_f7_a_report_deferred_past_the_deadline_is_refused_with_a_record(board, coord):
+    _free(board, coord)
+    minutes = work_attach.DEFER_DEADLINE.total_seconds() / 60
+    _report(board, "r-old", worker="seat-o", worker_kind="seat", harness_session_id="sess-o", at=_now(minutes=minutes + 1))
+    _report(board, "r-new", worker="seat-n", worker_kind="seat", harness_session_id="sess-n", at=_now())
+    lines = work_attach.watch_apply(board, sessions=lambda _s: None)
+    assert any("deferred 1" in ln for ln in lines), lines
+    assert _rows(board, "SELECT report_id, reason FROM report_refusals") == [("r-old", "no-evidence-timeout")]
+
+
+def test_l1_deferred_passes_take_no_lease(board, coord):
+    _free(board, coord)
+    _report(board, "r-1", worker="seat-a", worker_kind="seat", harness_session_id="sess-a", at=_now())
+    before = _rows(board, "SELECT count(*) FROM lease_events")
+    for _ in range(3):
+        lines = work_attach.watch_apply(board, sessions=lambda _s: None)
+        assert len(lines) == 1 and "deferred" in lines[0] and "no lease" in lines[0]
+    assert _rows(board, "SELECT count(*) FROM lease_events") == before
+
+
+def test_l1_watch_apply_never_raises(board, coord):
+    _free(board, coord)
+    _report(board, "r-1", worker="seat-a", worker_kind="seat", harness_session_id="sess-a", at=_now())
+
+    def listing_blows_up(_store):
+        raise ValueError("the listing's JSON was not a list")
+
+    lines = work_attach.watch_apply(board, sessions=listing_blows_up)
+    assert len(lines) == 1 and "not applied this pass" in lines[0] and "JSON" in lines[0]
+    assert CoordStore(board).coord_lease() is None
+
+
+def test_f15_a_watch_over_a_scratch_store_never_opens_the_real_homes_board(tmp_path, monkeypatch):
+    real = tmp_path / "real-home"
+    monkeypatch.setenv("LEVAIN_HOME", str(real))
+    monkeypatch.setattr(launch, "_harness", lambda: (None, {}))
+    board = real / "board"
+    board.mkdir(parents=True, mode=0o700)
+    seed = CoordStore(board)
+    token = seed.coord_take()
+    ready.add(seed, token, "levain:a", repo="levain", title="item a", who="desk", why="seed", to="ready")
+    ln = seed.launch_request(token, harness="claude", role="coordinator")
+    seed.coord_release(token, by="coordinator")
+    _report(board, "r-1", worker=ln.launch_id, launch_id=ln.launch_id)
+    events = _rows(board, "SELECT count(*) FROM lease_events")
+    scratch = CoordStore(tmp_path / "scratch" / "consent")
+    scratch.coord_status()
+    launch.watch_once(scratch)
+    assert _rows(board, "SELECT count(*) FROM worker_attach") == [(0,)]
+    assert _rows(board, "SELECT count(*) FROM lease_events") == events
+    assert not (tmp_path / "scratch" / "board").exists()

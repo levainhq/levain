@@ -54,6 +54,9 @@ INFRASTRUCTURE: frozenset[str] = frozenset({
     # a gseq in its own transaction, but a fact about who works on an item is read by the Work lens, not counted as
     # something that happened since the operator left; promoting either to COUNTED is the head's call
     "worker_attach", "report_refusals",
+    # the board store's sightings (row 156 L2 F6): one row per session the service's listing showed, its first and last
+    # sighting, no gseq. Evidence the applier reads, never something that happened since the operator left
+    "sessions_seen",
 })
 
 _DISPATCH = ("ordered by dispatch's own transitions; the open brief does not report dispatch jobs (the board and the "

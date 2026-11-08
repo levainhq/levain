@@ -16,9 +16,33 @@ home>/board/``, never the consent directory). This module holds:
   triggers below keep a ``service`` row of ``ready_items`` / ``ready_journal`` from changing anything but a landed sha
   and branch.
 
-A worker is real when its report names a ``launch_id`` present in the store's ``launches`` table, or a
-``harness_session_id`` in the coordinator's own live session listing (:func:`live_session_ids`, the listing the watcher
-uses to end launches). Both are deterministic; neither needs a model.
+Who the worker is, and whether it is real (row 156 L1+L2 round 1, the head's rulings), judged on evidence the store
+holds, never on the worker name a report carries:
+
+* A report whose ``launch_id``, or whose ``harness_session_id``, resolves to a launch row of this store is that
+  launch's: its ``worker`` must be the launch's recorded worker (the worker of the launch's attach, else the launch id),
+  or it is refused ``worker-mismatch``. An ``attach`` also needs the launch pending or active.
+* Any other report rests on its session (a flow seat). The FIRST accepted attach binds worker and session: a later report
+  naming that worker from another session, or that session under another name, is refused ``worker-mismatch``. The
+  session is real when this pass's live listing (:func:`live_session_ids`) shows it, or the service saw it live
+  (``sessions_seen``, written by the service on every pass whose listing it could read) at a time no earlier than one
+  pass interval before the report's ``at``: a seat whose last act is ``landed`` or ``ended`` and which then exits is
+  still judged on what was true when it spoke. An unreadable listing defers such a report, and one deferred past
+  :data:`DEFER_DEADLINE` after its ``at`` is refused ``no-evidence-timeout``.
+* An ``attach`` on an item another worker holds (an open attach) is refused ``held-by-other``: only a coordinator
+  reassigns.
+
+Known edges (ruled, one line each):
+
+* A ``landed`` sha is what the seat reported, checked only for its shape; landing truth is the land waiter's (L2 F5).
+* A seat-chosen ``--report-id`` is the seat's own; one that repeats another seat's id is queued once (L2 F17).
+* A worker name is bound to the session of its first attach for good: a rotated seat reusing the name reports under a
+  new one.
+* No coordinator verb applies the board's queue: while a coordinator or the operator holds the board lease the service
+  skips its pass and the reports wait for the lease to end (the coordinator role of :func:`apply_reports` is there for a
+  holder to call; no per-wake hook of the coordinator calls it).
+* A stale lease of someone other than the service is left for its holder or a coordinator to lapse: the service's pass
+  is skipped until then.
 """
 from __future__ import annotations
 
@@ -26,20 +50,26 @@ import os
 import sqlite3
 from collections.abc import Collection, Mapping
 from dataclasses import dataclass, field
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any
 
 from levain.autonomic.durable_sqlite import BUSY_WAIT_S, open_durable
 from levain.coordinator.store import _OID, CoordError, CoordStore, _append_only, _in, next_gseq
 
-__all__ = ["ApplyResult", "watch_apply", "EVENTS", "REFUSAL_REASONS", "REPORT_SCHEMA", "WORKER_KINDS", "WORK_SCHEMA", "apply_reports",
-           "attach_launch", "board_store_dir", "enqueue_report", "live_session_ids", "queue_report",
-           "reports_path"]
+__all__ = ["ApplyResult", "watch_apply", "DEFER_DEADLINE", "EVENTS", "PASS_INTERVAL_S", "REFUSAL_REASONS",
+           "REPORT_SCHEMA", "WORKER_KINDS", "WORK_SCHEMA", "apply_reports", "attach_launch", "board_store_dir",
+           "enqueue_report", "live_session_ids", "queue_report", "report_line", "report_status", "reports_path"]
 
 EVENTS = ("attach", "progress", "blocked", "landed", "ended")
 WORKER_KINDS = ("seat", "lane", "launch")
 REFUSAL_REASONS = ("unknown-item", "worker-not-a-launch", "malformed-report", "no-open-attach", "already-attached",
-                   "item-refused")
+                   "item-refused", "held-by-other", "worker-mismatch", "no-evidence-timeout")
+# ruled (row 156 L2 F7): how long after its ``at`` a report resting on a session waits for a readable listing
+DEFER_DEADLINE = timedelta(minutes=30)
+# the watch's pass interval, in seconds, when the caller gives none: a session seen live at a pass this long before a
+# report's ``at`` was live when the report was written
+PASS_INTERVAL_S = 30.0
 _ROLES = ("coordinator", "service")
 _WHY_MAX = 1000
 _FIELD_MAX = 200
@@ -83,6 +113,15 @@ WORK_SCHEMA: tuple[str, ...] = (
     "CREATE TRIGGER IF NOT EXISTS report_refusals_not_applied BEFORE INSERT ON report_refusals WHEN EXISTS (SELECT 1 "
     "FROM worker_attach WHERE report_id = NEW.report_id) "
     "BEGIN SELECT RAISE(ABORT, 'an applied report is never refused'); END",
+    # the sessions the service's listing showed, one row per session: when it was first and last seen live (L2 F6).
+    # Written only by the service's pass; a row is never deleted and its last sighting only moves forward
+    "CREATE TABLE IF NOT EXISTS sessions_seen (session_id TEXT PRIMARY KEY CHECK (length(session_id) BETWEEN 1 AND "
+    f"{_FIELD_MAX}), first_seen TEXT NOT NULL, last_seen TEXT NOT NULL, CHECK (last_seen >= first_seen))",
+    "CREATE TRIGGER IF NOT EXISTS sessions_seen_kept BEFORE DELETE ON sessions_seen "
+    "BEGIN SELECT RAISE(ABORT, 'a seen session is never deleted'); END",
+    "CREATE TRIGGER IF NOT EXISTS sessions_seen_forward BEFORE UPDATE ON sessions_seen WHEN NEW.session_id IS NOT "
+    "OLD.session_id OR NEW.first_seen IS NOT OLD.first_seen OR NEW.last_seen < OLD.last_seen "
+    "BEGIN SELECT RAISE(ABORT, 'a seen session only moves its last sighting forward'); END",
 )
 
 # ------------------------------------------------------------------------------------------------ the report queue
@@ -114,12 +153,20 @@ def reports_path(directory: Path | str) -> Path:
     return Path(directory) / "reports.db"
 
 
+def _key_ok(value: Any) -> bool:
+    """A report id the refusal record can hold: one printable line of 1 to 100 characters."""
+    return isinstance(value, str) and bool(value.strip()) and len(value) <= 100 and value.isprintable()
+
+
 def enqueue_report(directory: Path | str, *, report_id: str, item_id: str, worker: str, worker_kind: str, event: str,
                    at: str, launch_id: str | None = None, harness_session_id: str | None = None,
                    sha: str | None = None, branch: str | None = None, why: str | None = None) -> bool:
     """Append one report to ``<directory>/reports.db`` (made on first use). Never touches ``dispatch.db`` or the lease.
     False when ``report_id`` is already queued (a resend is a no-op), True when this call queued it. The directory
-    must exist: this never makes a board store."""
+    must exist: this never makes a board store. An empty or malformed ``report_id`` is a :class:`CoordError` and
+    queues nothing: it is the one field the queue keys on."""
+    if not _key_ok(report_id):
+        raise CoordError("report not queued: report_id is one printable line of at most 100 characters")
     d = Path(directory)
     if not d.is_dir():
         raise CoordError(f"no board store directory at {d}; no report was queued")
@@ -145,21 +192,33 @@ def enqueue_report(directory: Path | str, *, report_id: str, item_id: str, worke
         conn.close()
 
 
+def _ro(path: Path) -> sqlite3.Connection:
+    conn = sqlite3.connect(path.resolve().as_uri() + "?mode=ro", uri=True, timeout=BUSY_WAIT_S, isolation_level=None)
+    conn.execute("PRAGMA query_only = ON")
+    return conn
+
+
 def _queued(directory: Path) -> list[dict[str, Any]]:
-    """Every queued report, in arrival order, read-only; none when there is no queue yet."""
+    """Every queued report, in arrival order, with its queue ``seq``, read-only; none when there is no queue yet."""
     path = reports_path(directory)
     if not path.exists():
         return []
-    conn = sqlite3.connect(path.resolve().as_uri() + "?mode=ro", uri=True, timeout=BUSY_WAIT_S, isolation_level=None)
+    conn = _ro(path)
     try:
-        conn.execute("PRAGMA query_only = ON")
         try:
-            rows = conn.execute(f"SELECT {', '.join(_REPORT_COLS)} FROM reports ORDER BY seq").fetchall()
+            rows = conn.execute(f"SELECT seq, {', '.join(_REPORT_COLS)} FROM reports ORDER BY seq").fetchall()
         except sqlite3.OperationalError:          # a queue file that was made empty: nothing queued
             return []
-        return [dict(zip(_REPORT_COLS, r)) for r in rows]
+        return [dict(zip(("seq", *_REPORT_COLS), r)) for r in rows]
     finally:
         conn.close()
+
+
+def _key(raw: Mapping[str, Any]) -> str:
+    """The key a queued row is applied or refused under: its own id, or, when the refusal record could not hold that id
+    (empty, too long, not one printable line), ``bad-seq-<its queue seq>``, so one bad row never stops the queue."""
+    rid = raw.get("report_id")
+    return rid if _key_ok(rid) else f"bad-seq-{raw.get('seq')}"
 
 
 def live_session_ids(store: CoordStore) -> frozenset[str] | None:
@@ -175,12 +234,23 @@ def live_session_ids(store: CoordStore) -> frozenset[str] | None:
     return None if rows is None else frozenset(launch._by_session(rows))
 
 
+def _record_seen(conn: sqlite3.Connection, now: str, live: Collection[str]) -> None:
+    """The service's fact: each session in a listing it read was live at ``now`` (``sessions_seen``)."""
+    for sid in live:
+        if isinstance(sid, str) and 0 < len(sid) <= _FIELD_MAX:
+            conn.execute("INSERT INTO sessions_seen (session_id, first_seen, last_seen) VALUES (?, ?, ?) "
+                         "ON CONFLICT (session_id) DO UPDATE SET last_seen = excluded.last_seen "
+                         "WHERE excluded.last_seen > sessions_seen.last_seen", (sid, now, now))
+
+
 # ------------------------------------------------------------------------------------------------ the applier
 @dataclass
 class ApplyResult:
     applied: list[str] = field(default_factory=list)                       # report ids copied into worker_attach
     refused: list[tuple[str, str]] = field(default_factory=list)           # (report id, reason) written to report_refusals
-    deferred: list[str] = field(default_factory=list)                      # left queued: the live listing was unreadable
+    deferred: list[str] = field(default_factory=list)                      # left queued: no evidence yet either way
+    faults: list[tuple[str, str]] = field(default_factory=list)            # (report id, why): its refusal could not be
+                                                                           # recorded; left queued, the pass went on
 
 
 def queue_report(directory: Path | str, *, report_id: str | None = None, **fields: Any) -> tuple[str, bool]:
@@ -221,6 +291,15 @@ def _text(value: Any, name: str, high: int, *, required: bool = False) -> str | 
     return value
 
 
+def _when(text: str) -> datetime | None:
+    """An ISO 8601 time that names its zone, or None."""
+    try:
+        got = datetime.fromisoformat(text)
+    except (TypeError, ValueError):
+        return None
+    return got if got.tzinfo is not None and got.utcoffset() is not None else None
+
+
 def _check(r: Mapping[str, Any]) -> dict[str, Any]:
     """The report's fields, checked mechanically, or ValueError naming the first bad one."""
     out = {"report_id": _text(r.get("report_id"), "report_id", 100, required=True),
@@ -230,6 +309,8 @@ def _check(r: Mapping[str, Any]) -> dict[str, Any]:
            "harness_session_id": _text(r.get("harness_session_id"), "harness_session_id", _FIELD_MAX),
            "why": None if r.get("why") is None else _text(r["why"], "why", _WHY_MAX),
            "at": _text(r.get("at"), "at", 64, required=True)}
+    if _when(out["at"]) is None:
+        raise ValueError("at is an ISO 8601 time with its zone")
     if r.get("worker_kind") not in WORKER_KINDS:
         raise ValueError(f"worker_kind is one of {', '.join(WORKER_KINDS)}")
     if r.get("event") not in EVENTS:
@@ -255,6 +336,13 @@ def _open_attach(conn: sqlite3.Connection, item_id: str, worker: str) -> str | N
     return row[0]
 
 
+def _held_by_other(conn: sqlite3.Connection, item_id: str, worker: str) -> tuple[str, str] | None:
+    """``(worker, attach id)`` of another worker's open attach on this item, the latest; None when there is none."""
+    return conn.execute("SELECT a.worker, a.attach_id FROM worker_attach a WHERE a.item_id = ? AND a.kind = 'attach' "
+                        "AND a.worker != ? AND NOT EXISTS (SELECT 1 FROM worker_attach e WHERE e.attach_id = "
+                        "a.attach_id AND e.kind = 'ended') ORDER BY a.seq DESC LIMIT 1", (item_id, worker)).fetchone()
+
+
 def _refuse(conn: sqlite3.Connection, now: str, by: str, report_id: str, item_id: Any, worker: Any, reason: str,
             detail: str) -> None:
     def keep(v: Any) -> str | None:
@@ -264,27 +352,92 @@ def _refuse(conn: sqlite3.Connection, now: str, by: str, report_id: str, item_id
                  (next_gseq(conn, now), report_id, keep(item_id), keep(worker), reason, detail[:_DETAIL_MAX], now, by))
 
 
+class _Refused(Exception):
+    def __init__(self, reason: str, detail: str) -> None:
+        super().__init__(detail)
+        self.reason, self.detail = reason, detail
+
+
+def _evidence(conn: sqlite3.Connection, now: str, r: Mapping[str, Any], live: Collection[str] | None,
+              every: float) -> str:
+    """Is the worker of checked report ``r`` real, and is it the worker it names? ``"real"`` or ``"deferred"`` (no
+    evidence either way yet), or :class:`_Refused`. Reads only (the module docstring states the rules)."""
+    from levain.coordinator import lease
+
+    ln = lease.launch(conn, r["launch_id"]) if r["launch_id"] is not None else None
+    sid = r["harness_session_id"]
+    if sid is not None:
+        mine = lease.by_harness_session(conn, sid)
+        if mine is not None:
+            if ln is not None and ln.launch_id != mine.launch_id:
+                raise _Refused("worker-mismatch", f"session {sid} is launch {mine.launch_id}, not {ln.launch_id}")
+            ln = mine
+    if ln is not None:
+        row = conn.execute("SELECT worker FROM worker_attach WHERE launch_id = ? AND kind = 'attach' ORDER BY seq "
+                           "LIMIT 1", (ln.launch_id,)).fetchone()
+        expect = ln.launch_id if row is None else row[0]
+        if r["worker"] != expect:
+            raise _Refused("worker-mismatch", f"launch {ln.launch_id} reports as {expect}, not as {r['worker']}")
+        if r["event"] == "attach" and ln.state not in ("pending", "active"):
+            raise _Refused("worker-not-a-launch", f"launch {ln.launch_id} is {ln.state}; an attach needs one that runs")
+        return "real"
+    if sid is None:
+        raise _Refused("worker-not-a-launch", "the report names no launch of this store and no session")
+    bound = conn.execute("SELECT harness_session_id FROM worker_attach WHERE worker = ? AND kind = 'attach' AND "
+                         "harness_session_id IS NOT NULL ORDER BY seq LIMIT 1", (r["worker"],)).fetchone()
+    if bound is not None and bound[0] != sid:
+        raise _Refused("worker-mismatch", f"{r['worker']} attached from another session; its reports come from that one")
+    other = conn.execute("SELECT worker FROM worker_attach WHERE harness_session_id = ? AND kind = 'attach' AND "
+                         "worker != ? ORDER BY seq LIMIT 1", (sid, r["worker"])).fetchone()
+    if other is not None:
+        raise _Refused("worker-mismatch", f"session {sid} attached as {other[0]}, not as {r['worker']}")
+    if live is not None and sid in live:
+        return "real"
+    at = _when(r["at"])
+    seen = conn.execute("SELECT last_seen FROM sessions_seen WHERE session_id = ?", (sid,)).fetchone()
+    if seen is not None and (last := _when(seen[0])) is not None and last >= at - timedelta(seconds=every):
+        return "real"
+    if live is None:
+        if _when(now) - at > DEFER_DEADLINE:
+            raise _Refused("no-evidence-timeout", f"no readable session listing showed session {sid} live within "
+                                                  f"{int(DEFER_DEADLINE.total_seconds() // 60)} minutes of the report")
+        return "deferred"
+    raise _Refused("worker-not-a-launch", f"session {sid} was not seen live at the report's time ({r['at']})")
+
+
+def _judge(conn: sqlite3.Connection, now: str, r: Mapping[str, Any], live: Collection[str] | None, every: float,
+           deferred: set[str]) -> str:
+    """The checks that come before any write, in order: ``"refuse"`` raises :class:`_Refused`; else ``"deferred"`` (also
+    for every later report of a worker already deferred this pass, so a fact never lands before the attach it follows)
+    or ``"go"``. Reads only."""
+    if conn.execute("SELECT 1 FROM ready_items WHERE id = ?", (r["item_id"],)).fetchone() is None:
+        raise _Refused("unknown-item", f"{r['item_id']} is not a ready item in this store")
+    if r["worker"] in deferred:
+        return "deferred"
+    if _evidence(conn, now, r, live, every) == "deferred":
+        deferred.add(r["worker"])
+        return "deferred"
+    return "go"
+
+
 def _apply_one(conn: sqlite3.Connection, now: str, token: int, by: str, r: dict[str, Any],
-               live: Collection[str] | None) -> str:
+               live: Collection[str] | None, *, every: float = PASS_INTERVAL_S,
+               deferred: set[str] | None = None) -> str:
     """Apply one checked report inside the caller's savepoint. Returns 'applied' or 'deferred'; a refusal raises
     :class:`_Refused`."""
     from levain.coordinator import ready
 
+    if _judge(conn, now, r, live, every, set() if deferred is None else deferred) == "deferred":
+        return "deferred"
     item = conn.execute("SELECT MAX(ver) FROM ready_items WHERE id = ?", (r["item_id"],)).fetchone()[0]
-    if item is None:
-        raise _Refused("unknown-item", f"{r['item_id']} is not a ready item in this store")
-    real = r["launch_id"] is not None and conn.execute("SELECT 1 FROM launches WHERE launch_id = ?",
-                                                       (r["launch_id"],)).fetchone() is not None
-    if not real and r["harness_session_id"] is not None:
-        if live is None:
-            return "deferred"
-        real = r["harness_session_id"] in live
-    if not real:
-        raise _Refused("worker-not-a-launch", "the report names no launch of this store and no live session")
     open_id = _open_attach(conn, r["item_id"], r["worker"])
     if r["event"] == "attach":
         if open_id is not None:
             raise _Refused("already-attached", f"{r['worker']} is already attached to {r['item_id']} ({open_id})")
+        holder = _held_by_other(conn, r["item_id"], r["worker"])
+        if holder is not None:
+            raise _Refused("held-by-other", f"{r['item_id']} is held by {holder[0]} ({holder[1]}); only a coordinator "
+                                            "reassigns an item")
         attach_id = "wa-" + os.urandom(16).hex()
     else:
         if open_id is None:
@@ -305,21 +458,27 @@ def _apply_one(conn: sqlite3.Connection, now: str, token: int, by: str, r: dict[
     return "applied"
 
 
-class _Refused(Exception):
-    def __init__(self, reason: str, detail: str) -> None:
-        super().__init__(detail)
-        self.reason, self.detail = reason, detail
+def _done_ids(conn: sqlite3.Connection) -> set[str]:
+    seen = {r[0] for r in conn.execute("SELECT report_id FROM worker_attach WHERE report_id IS NOT NULL")}
+    return seen | {r[0] for r in conn.execute("SELECT report_id FROM report_refusals")}
 
 
-def apply_reports(store: CoordStore, token: Any, *, live_sessions: Collection[str] | None) -> ApplyResult:
+def apply_reports(store: CoordStore, token: Any, *, live_sessions: Collection[str] | None,
+                  every: float = PASS_INTERVAL_S) -> ApplyResult:
     """Copy every unapplied report in ``<store>/reports.db`` into ``worker_attach``, or refuse it with a
     ``report_refusals`` row, in ONE write transaction. Idempotent on ``report_id``: a report already applied or refused
     is skipped, so a re-run writes nothing twice. Facts only, by the store's role: ``service`` writes as the service
-    (``token`` must be the live lease's), ``coordinator`` as the lease holder (fenced). A landed report also sets the
-    item's ``landed_sha`` and ``branch`` (:func:`levain.coordinator.ready.record_landed`) and nothing else about it.
+    (``token`` must be the live claim the service itself holds, :func:`levain.coordinator.lease.service_claim`; a
+    coordinator's claim taking it over makes this refuse, and nothing is applied), ``coordinator`` as the lease holder
+    (fenced). A landed report also sets the item's ``landed_sha`` and ``branch``
+    (:func:`levain.coordinator.ready.record_landed`) and nothing else about it.
 
-    ``live_sessions``: the harness session ids the coordinator's own listing shows (:func:`live_session_ids`). None means
-    the listing could not be read: a report resting on a session id alone is left queued, never refused on no evidence."""
+    ``live_sessions``: the harness session ids the coordinator's own listing shows (:func:`live_session_ids`); the
+    service records them as seen now. None means the listing could not be read. ``every``: the watch's pass interval in
+    seconds (the module docstring says how both judge a report).
+
+    A queued row whose id the refusal record cannot hold is judged under ``bad-seq-<seq>``; a row whose refusal still
+    cannot be recorded is left queued and named in ``faults``, and the pass goes on."""
     if not isinstance(token, int) or isinstance(token, bool):
         raise CoordError("applying reports needs the live lease token, an integer")
     queued = _queued(store.directory)
@@ -330,15 +489,17 @@ def apply_reports(store: CoordStore, token: Any, *, live_sessions: Collection[st
     by = "service" if service else "coordinator"
     with store._write(by, None if service else token, create=False) as (conn, now):
         if service:
-            from levain.coordinator.lease import lease
+            from levain.coordinator.lease import SERVICE_HOLDER, lease
 
             held = lease(conn, now)
-            if held is None or not held.live or held.token != token:
-                raise CoordError(f"lease token {token} is not the live lease's; no report was applied")
-        seen = {r[0] for r in conn.execute("SELECT report_id FROM worker_attach WHERE report_id IS NOT NULL")}
-        seen |= {r[0] for r in conn.execute("SELECT report_id FROM report_refusals")}
+            if held is None or not held.live or held.holder != SERVICE_HOLDER or held.token != token:
+                raise CoordError(f"lease token {token} is not the live lease's service claim; no report was applied")
+            if live_sessions is not None:
+                _record_seen(conn, now, live_sessions)
+        seen = _done_ids(conn)
+        deferred: set[str] = set()
         for raw in queued:
-            rid = str(raw["report_id"])[:100]
+            rid = _key(raw)
             if rid in seen:
                 continue
             seen.add(rid)
@@ -348,43 +509,65 @@ def apply_reports(store: CoordStore, token: Any, *, live_sessions: Collection[st
                     checked = _check(raw)
                 except ValueError as exc:
                     raise _Refused("malformed-report", str(exc)) from exc
-                got = _apply_one(conn, now, token, by, checked, live_sessions)
+                got = _apply_one(conn, now, token, by, checked, live_sessions, every=every, deferred=deferred)
                 conn.execute("RELEASE report")
                 (result.applied if got == "applied" else result.deferred).append(rid)
             except (_Refused, sqlite3.IntegrityError) as exc:
                 conn.execute("ROLLBACK TO report")
-                conn.execute("RELEASE report")
                 reason, detail = (exc.reason, exc.detail) if isinstance(exc, _Refused) else ("item-refused", str(exc))
-                _refuse(conn, now, by, rid, raw.get("item_id"), raw.get("worker"), reason, detail)
-                result.refused.append((rid, reason))
+                try:
+                    _refuse(conn, now, by, rid, raw.get("item_id"), raw.get("worker"), reason, detail)
+                except sqlite3.Error as err:
+                    conn.execute("ROLLBACK TO report")
+                    result.faults.append((rid, f"its refusal ({reason}) could not be recorded: {err}"))
+                else:
+                    result.refused.append((rid, reason))
+                conn.execute("RELEASE report")
     return result
 
 
 # ------------------------------------------------------------------------------------------------ the watch's pass
-def _unapplied(store: CoordStore) -> int:
-    """How many queued reports have neither a ``worker_attach`` row nor a refusal yet; nothing written."""
+def _waiting(store: CoordStore, live: Collection[str] | None, every: float) -> tuple[int, int]:
+    """``(waiting, applicable)``: how many queued reports have neither a ``worker_attach`` row nor a refusal yet, and
+    how many of them a pass would apply or refuse now rather than defer. Nothing written."""
     from levain.autonomic.durable_sqlite import read_transaction
 
-    queued = {str(r["report_id"])[:100] for r in _queued(store.directory)}
+    queued = _queued(store.directory)
     if not queued:
-        return 0
+        return 0, 0
     with read_transaction(lambda: store._connect(create=False)) as conn:
-        done = {r[0] for r in conn.execute("SELECT report_id FROM worker_attach WHERE report_id IS NOT NULL")}
-        done |= {r[0] for r in conn.execute("SELECT report_id FROM report_refusals")}
-    return len(queued - done)
+        done = _done_ids(conn)
+        now = store._stamp()
+        waiting = applicable = 0
+        deferred: set[str] = set()
+        for raw in queued:
+            rid = _key(raw)
+            if rid in done:
+                continue
+            done.add(rid)
+            waiting += 1
+            try:
+                if _judge(conn, now, _check(raw), live, every, deferred) == "go":
+                    applicable += 1
+            except (ValueError, _Refused):
+                applicable += 1                     # a refusal to record is work
+    return waiting, applicable
 
 
-def watch_apply(board: Path | str | None = None, *, sessions: Any = None) -> list[str]:
+def watch_apply(board: Path | str | None = None, *, sessions: Any = None, every: float = PASS_INTERVAL_S) -> list[str]:
     """The ``levain coord watch`` pass over the board store: apply the queued reports as the ``service``, facts only.
 
-    Nothing happens, and no line is returned, when the board has no ``dispatch.db`` or no report is waiting. A live
-    lease (a coordinator's, or the operator's) is never taken from its holder: the pass applies nothing and says so in
-    one line, and the reports wait for the next pass. With no live lease the pass claims it as holder ``service``,
-    reads the live session listing once (``sessions(store)``, default :func:`live_session_ids`), applies, and
-    releases the lease in a ``finally``, so a coordinator that wakes meanwhile is refused only for the length of one
-    apply. The service role refuses every write that decides (:meth:`CoordStore._write`), so the only things this
-    pass can write are ``worker_attach``, ``report_refusals``, the item's landed sha and branch, and its own lease
-    rows. A fault is a line, never a raise: the watch goes on."""
+    Nothing happens, and no line is returned, when the board has no ``dispatch.db`` or no queue. Otherwise, in order:
+    the live session listing is read once (``sessions(store)``, default :func:`live_session_ids`) and, when it could be
+    read, recorded as seen (``sessions_seen``; no lease is needed for it). With no report waiting the pass ends there.
+    With reports waiting but every one deferred (the listing could not be read, and each rests on a session alone), it
+    says so in one line and takes no lease. Else it claims the lease as holder ``service`` for
+    :data:`levain.coordinator.lease.SERVICE_TTL`, applies, and releases it in a ``finally``; any other claim standing,
+    live or lapsed, is never taken: the pass applies nothing and says why in one line. A coordinator that claims
+    meanwhile takes the service's claim, and the apply then refuses as a whole. The service role refuses every write that
+    decides (:meth:`CoordStore._write`), so the only things this pass can write are ``worker_attach``,
+    ``report_refusals``, ``sessions_seen``, the item's landed sha and branch, and its own lease rows. Every fault is
+    caught here and returned as one line: this never raises."""
     from levain.coordinator import lease as _lease
 
     directory = Path(board) if board is not None else board_store_dir()
@@ -392,10 +575,17 @@ def watch_apply(board: Path | str | None = None, *, sessions: Any = None) -> lis
         return []
     try:
         store = CoordStore(directory, role="service")
-        waiting = _unapplied(store)
+        live = (sessions or live_session_ids)(store)
+        if live is not None:
+            with store._write("service", None, create=False) as (conn, now):
+                _record_seen(conn, now, live)
+        waiting, applicable = _waiting(store, live, every)
         if not waiting:
             return []
         plural = "report" if waiting == 1 else "reports"
+        if not applicable:
+            return [f"{waiting} {plural} waiting: deferred, the live session listing could not be read and each rests "
+                    "on a session; no lease taken"]
         with store._write("service", None, create=False) as (conn, now):
             token, held = _lease.service_claim(conn, now, cause="watch apply")
             if held is not None:
@@ -403,12 +593,58 @@ def watch_apply(board: Path | str | None = None, *, sessions: Any = None) -> lis
                        f"of {held.holder} lapsed at {held.until}, and recording that is the coordinator's")
                 return [f"{waiting} {plural} waiting: the board's lease {how}; applied nothing this pass"]
         try:
-            live = (sessions or live_session_ids)(store)
-            got = apply_reports(store, token, live_sessions=live)
+            got = apply_reports(store, token, live_sessions=live, every=every)
         finally:
             with store._write("service", None, create=False) as (conn, now):
                 _lease.service_release(conn, now, token, cause="watch apply done")
         return [f"board reports: applied {len(got.applied)}, refused {len(got.refused)}, deferred {len(got.deferred)}"
-                + "".join(f"; {rid} refused: {why}" for rid, why in got.refused)]
-    except (CoordError, sqlite3.Error, OSError) as exc:
+                + "".join(f"; {rid} refused: {why}" for rid, why in got.refused)
+                + "".join(f"; {rid} not recorded: {why}" for rid, why in got.faults)]
+    except Exception as exc:    # noqa: BLE001 - the watch's pass goes on whatever this does
         return [f"board reports: not applied this pass ({exc})"]
+
+
+# ------------------------------------------------------------------------------------------------ a report's outcome
+def report_status(directory: Path | str, report_id: str) -> dict[str, Any]:
+    """What became of one report, read-only (``levain coord reports ID``): ``state`` is ``applied`` (with its
+    ``kind`` and ``attach_id``), ``refused`` (with ``reason`` and ``detail``), ``queued`` (waiting for a pass), or
+    ``unknown`` (not in this board's queue). Opens nothing for writing and makes nothing."""
+    d = Path(directory)
+    out: dict[str, Any] = {"report_id": report_id, "state": "unknown", "item_id": None, "reason": None,
+                           "detail": None, "kind": None, "attach_id": None}
+    row = next((r for r in _queued(d) if r["report_id"] == report_id), None)
+    if row is not None:
+        out.update(state="queued", item_id=row["item_id"])
+    db = d / "dispatch.db"
+    if not db.exists():
+        return out
+    conn = _ro(db)
+    try:
+        try:
+            got = conn.execute("SELECT item_id, kind, attach_id FROM worker_attach WHERE report_id = ?",
+                               (report_id,)).fetchone()
+            no = conn.execute("SELECT item_id, reason, detail FROM report_refusals WHERE report_id = ?",
+                              (report_id,)).fetchone()
+        except sqlite3.OperationalError:          # a store made before the board tables: nothing applied there
+            return out
+    finally:
+        conn.close()
+    if got is not None:
+        out.update(state="applied", item_id=got[0], kind=got[1], attach_id=got[2])
+    elif no is not None:
+        out.update(state="refused", item_id=no[0], reason=no[1], detail=no[2])
+    return out
+
+
+def report_line(directory: Path | str, report_id: str, queued: bool) -> str:
+    """The line ``levain coord report`` prints: the report id and what happens next, or, for a resend, what already
+    happened to it (:func:`report_status`)."""
+    nxt = "the next `levain coord watch` pass applies or refuses it"
+    if queued:
+        return f"report {report_id} queued; {nxt}"
+    st = report_status(directory, report_id)
+    if st["state"] == "refused":
+        return f"report {report_id} was refused ({st['reason']}: {st['detail']}); nothing was added"
+    if st["state"] == "applied":
+        return f"report {report_id} was already applied ({st['kind']}); nothing was added"
+    return f"report {report_id} is already queued; nothing was added, and {nxt}"

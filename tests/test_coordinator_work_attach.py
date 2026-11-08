@@ -4,6 +4,7 @@ a ``report_refusals`` row. Synthetic items; a scratch store."""
 from __future__ import annotations
 
 import sqlite3
+from datetime import datetime, timedelta, timezone
 
 import pytest
 
@@ -29,10 +30,26 @@ def coord(board):
     return store, token, ln.launch_id
 
 
+def _now(**ago: float) -> str:
+    return (datetime.now(timezone.utc) - timedelta(**ago)).isoformat()
+
+
 def _report(board, rid, **kw):
     base = {"report_id": rid, "item_id": "levain:a", "worker": "wa2a", "worker_kind": "lane", "event": "attach",
-            "at": "2026-11-08T12:00:00-05:00"}
+            "at": _now()}
     work_attach.enqueue_report(board, **{**base, **kw})
+
+
+def _svc(board, store, token):
+    """The service's own claim on the board: the holder gives the lease back (its launches stay as they are) and the
+    service claims it, as the watch does."""
+    from levain.coordinator import lease
+    store.coord_release(token, by="coordinator")
+    svc = CoordStore(board, role="service")
+    with svc._write("service", None, create=False) as (conn, now):
+        got, held = lease.service_claim(conn, now, cause="test")
+    assert held is None
+    return svc, got
 
 
 def _rows(board, sql):
@@ -68,12 +85,13 @@ def test_service_role_is_refused_every_deciding_write(board, coord):
 # (b) THE VALIDATION: an unknown item and an unreal worker are each refused, each leaving a visible record
 def test_invalid_reports_are_refused_and_leave_a_refusal_row(board, coord):
     store, token, launch_id = coord
-    _report(board, "r-unknown", item_id="levain:nowhere", launch_id=launch_id)
+    _report(board, "r-unknown", item_id="levain:nowhere", worker=launch_id, launch_id=launch_id)
     _report(board, "r-unreal", harness_session_id="not-listed")
     _report(board, "r-nobody")
-    _report(board, "r-bad", event="promote", launch_id=launch_id)
-    _report(board, "r-real", launch_id=launch_id)
-    got = work_attach.apply_reports(CoordStore(board, role="service"), token, live_sessions=frozenset({"other"}))
+    _report(board, "r-bad", event="promote", worker=launch_id, launch_id=launch_id)
+    _report(board, "r-real", worker=launch_id, launch_id=launch_id)
+    svc, stoken = _svc(board, store, token)
+    got = work_attach.apply_reports(svc, stoken, live_sessions=frozenset({"other"}))
     assert got.applied == ["r-real"]
     assert dict(got.refused) == {"r-unknown": "unknown-item", "r-unreal": "worker-not-a-launch",
                                  "r-nobody": "worker-not-a-launch", "r-bad": "malformed-report"}
@@ -119,9 +137,11 @@ def test_item_facts_round_trip_and_an_old_store_migrates(tmp_path, monkeypatch):
         with store._write("coordinator", token, create=False) as (conn, now):
             ready.record_landed(conn, now, token, "levain:old", "abc", "main", by="coordinator", why="x")
     ln = store.launch_request(token, harness="claude", role="coordinator")
-    _report(old_dir, "r-att", item_id="levain:old", launch_id=ln.launch_id)
-    _report(old_dir, "r-land", item_id="levain:old", launch_id=ln.launch_id, event="landed", sha=SHA, branch="seat/x")
-    got = work_attach.apply_reports(CoordStore(old_dir, role="service"), token, live_sessions=frozenset())
+    _report(old_dir, "r-att", item_id="levain:old", worker=ln.launch_id, launch_id=ln.launch_id)
+    _report(old_dir, "r-land", item_id="levain:old", worker=ln.launch_id, launch_id=ln.launch_id, event="landed",
+            sha=SHA, branch="seat/x")
+    svc, stoken = _svc(old_dir, store, token)
+    got = work_attach.apply_reports(svc, stoken, live_sessions=frozenset())
     assert got.applied == ["r-att", "r-land"] and got.refused == []
     facts = ready.item_facts(store, "levain:old")
     assert (facts["landed_sha"], facts["branch"], facts["hold"]) == (SHA, "seat/x", "waits on Phill")
@@ -132,11 +152,12 @@ def test_item_facts_round_trip_and_an_old_store_migrates(tmp_path, monkeypatch):
 # (d) apply_reports is idempotent on report_id; an unreadable listing defers a session-only report, never refuses it
 def test_apply_is_idempotent_and_defers_on_an_unreadable_listing(board, coord):
     store, token, launch_id = coord
-    _report(board, "r1", launch_id=launch_id)
-    _report(board, "r2", event="progress", launch_id=launch_id, why="halfway")
-    _report(board, "r-gone", item_id="levain:nowhere", launch_id=launch_id)
-    _report(board, "r-sess", worker="other", harness_session_id="s-1")
-    svc = CoordStore(board, role="service")
+    _report(board, "r1", worker=launch_id, launch_id=launch_id)
+    _report(board, "r2", event="progress", worker=launch_id, launch_id=launch_id, why="halfway")
+    _report(board, "r-gone", item_id="levain:nowhere", worker=launch_id, launch_id=launch_id)
+    _report(board, "r-sess", worker="other", harness_session_id="s-1", item_id="levain:b")
+    ready.add(store, token, "levain:b", repo="levain", title="item b", who="desk", why="seed", to="ready")
+    svc, token = _svc(board, store, token)
     first = work_attach.apply_reports(svc, token, live_sessions=None)
     assert first.applied == ["r1", "r2"] and first.refused == [("r-gone", "unknown-item")]
     assert first.deferred == ["r-sess"]
@@ -147,8 +168,8 @@ def test_apply_is_idempotent_and_defers_on_an_unreadable_listing(board, coord):
     # the listing comes back showing the session: the deferred report applies, once
     later = work_attach.apply_reports(svc, token, live_sessions=frozenset({"s-1"}))
     assert later.applied == ["r-sess"] and counts()[0] == [(before[0][0][0] + 1,)]
-    assert [r[0] for r in _rows(board, "SELECT kind FROM worker_attach WHERE worker = 'wa2a' ORDER BY seq")] == [
-        "attach", "progress"]
+    assert [r[0] for r in _rows(board, f"SELECT kind FROM worker_attach WHERE worker = '{launch_id}' ORDER BY seq")] \
+        == ["attach", "progress"]
 
 
 # ------------------------------------------------------------------------------------------------ L1/L2 round 1 (r156fA)
@@ -187,3 +208,106 @@ def test_f2_a_service_row_after_a_version_gap_is_refused(board, coord):
                       "NULL, NULL, '[]', 1, 'service', 'x')")
     finally:
         c.close()
+
+
+def _refusals(board):
+    return dict(_rows(board, "SELECT report_id, reason FROM report_refusals"))
+
+
+def test_f3_a_second_workers_attach_is_refused_and_the_first_stays_current(board, coord):
+    store, token, _ = coord
+    _report(board, "r-a", worker="seat-a", harness_session_id="sess-a")
+    _report(board, "r-b", worker="seat-b", harness_session_id="sess-b")
+    svc, stoken = _svc(board, store, token)
+    got = work_attach.apply_reports(svc, stoken, live_sessions=frozenset({"sess-a", "sess-b"}))
+    assert got.applied == ["r-a"] and got.refused == [("r-b", "held-by-other")]
+    (detail,) = _rows(board, "SELECT detail FROM report_refusals WHERE report_id = 'r-b'")[0]
+    assert "seat-a" in detail
+    assert _rows(board, "SELECT worker FROM worker_attach WHERE kind = 'attach'") == [("seat-a",)]
+
+
+def test_f4_a_report_resolving_to_a_launch_must_name_that_launchs_worker(board, coord):
+    store, token, launch_id = coord
+    _report(board, "r-name", worker="1108-43", launch_id=launch_id)                 # a seat name over a launch id
+    _report(board, "r-mine", worker=launch_id, launch_id=launch_id)
+    svc, stoken = _svc(board, store, token)
+    got = work_attach.apply_reports(svc, stoken, live_sessions=frozenset())
+    assert got.refused == [("r-name", "worker-mismatch")] and got.applied == ["r-mine"]
+
+
+def test_f4_a_seat_is_bound_to_the_session_of_its_first_attach(board, coord):
+    store, token, _ = coord
+    ready.add(store, token, "levain:b", repo="levain", title="item b", who="desk", why="seed", to="ready")
+    _report(board, "r-att", worker="seat-a", harness_session_id="sess-a")
+    _report(board, "r-forged", worker="seat-a", harness_session_id="sess-z", event="ended")   # another session, same name
+    _report(board, "r-alias", worker="seat-q", harness_session_id="sess-a", item_id="levain:b")  # same session, new name
+    _report(board, "r-own", worker="seat-a", harness_session_id="sess-a", event="progress")
+    svc, stoken = _svc(board, store, token)
+    got = work_attach.apply_reports(svc, stoken, live_sessions=frozenset({"sess-a", "sess-z"}))
+    assert got.applied == ["r-att", "r-own"]
+    assert dict(got.refused) == {"r-forged": "worker-mismatch", "r-alias": "worker-mismatch"}
+    assert _refusals(board) == dict(got.refused)
+
+
+def test_l1_service_apply_needs_the_services_own_claim(board, coord):
+    store, token, launch_id = coord
+    _report(board, "r-1", worker=launch_id, launch_id=launch_id)
+    with pytest.raises(CoordError, match="service claim"):
+        work_attach.apply_reports(CoordStore(board, role="service"), token, live_sessions=frozenset())   # the take's
+    assert _rows(board, "SELECT count(*) FROM worker_attach WHERE report_id IS NOT NULL") == [(0,)]
+
+
+def test_l1_a_deferred_attach_holds_back_that_workers_later_launch_report(board, coord):
+    store, token, launch_id = coord
+    _report(board, "r-att", worker=launch_id, harness_session_id="sess-ln", launch_id="ln-" + "0" * 32)
+    _report(board, "r-prog", worker=launch_id, launch_id=launch_id, event="progress")
+    svc, stoken = _svc(board, store, token)
+    # the attach rests on its session (the launch id it names is no launch here); the listing is unreadable
+    got = work_attach.apply_reports(svc, stoken, live_sessions=None)
+    assert got.deferred == ["r-att", "r-prog"] and got.refused == [] and got.applied == []
+
+
+def test_l1_an_empty_report_id_is_refused_at_the_door_and_a_planted_one_never_wedges_the_queue(board, coord):
+    store, token, launch_id = coord
+    with pytest.raises(CoordError, match="report_id"):
+        work_attach.enqueue_report(board, report_id="", item_id="levain:a", worker="w", worker_kind="seat",
+                                   event="attach", at=_now())
+    with pytest.raises(CoordError, match="report_id"):
+        work_attach.queue_report(board, report_id="", item_id="levain:a", worker="w", worker_kind="seat",
+                                 event="attach", at=_now())
+    _report(board, "r-1", worker=launch_id, launch_id=launch_id)
+    q = sqlite3.connect(board / "reports.db")                  # a seat-writable file: plant what the door refuses
+    try:
+        q.execute("INSERT INTO reports (report_id, item_id, worker, worker_kind, event, at) VALUES "
+                  "('', 'levain:a', 'w', 'seat', 'attach', 'x')")
+        q.execute("INSERT INTO reports (report_id, item_id, worker, worker_kind, event, at) VALUES "
+                  "(?, 'levain:a', 'w', 'seat', 'attach', 'x')", ("z" * 150,))
+        q.commit()
+    finally:
+        q.close()
+    _report(board, "r-4", worker=launch_id, launch_id=launch_id, event="progress")
+    svc, stoken = _svc(board, store, token)
+    got = work_attach.apply_reports(svc, stoken, live_sessions=frozenset())
+    assert got.applied == ["r-1", "r-4"] and got.faults == []
+    assert [r for r, _ in got.refused] == ["bad-seq-2", "bad-seq-3"]
+    assert set(_refusals(board).values()) == {"malformed-report"}
+    again = work_attach.apply_reports(svc, stoken, live_sessions=frozenset())
+    assert (again.applied, again.refused) == ([], [])
+
+
+def test_l1_a_refusal_that_cannot_be_recorded_is_a_fault_and_the_pass_goes_on(board, coord, monkeypatch):
+    store, token, launch_id = coord
+    _report(board, "r-bad", item_id="levain:nowhere", worker=launch_id, launch_id=launch_id)
+    _report(board, "r-ok", worker=launch_id, launch_id=launch_id)
+    svc, stoken = _svc(board, store, token)
+    real = work_attach._refuse
+
+    def broken(conn, now, by, rid, *a):
+        if rid == "r-bad":
+            raise sqlite3.IntegrityError("the refusal record is unwritable")
+        return real(conn, now, by, rid, *a)
+
+    monkeypatch.setattr(work_attach, "_refuse", broken)
+    got = work_attach.apply_reports(svc, stoken, live_sessions=frozenset())
+    assert got.applied == ["r-ok"] and got.refused == [] and [r for r, _ in got.faults] == ["r-bad"]
+    assert _rows(board, "SELECT count(*) FROM report_refusals") == [(0,)]
