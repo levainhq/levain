@@ -36,8 +36,6 @@ def test_no_webpush_source_or_worker_names_band_answer() -> None:
 def test_a_card_payload_carries_no_actions_and_no_allow(tmp_path, monkeypatch) -> None:
     got = _sent(tmp_path, monkeypatch, "https://fcm.googleapis.com/fcm/send/abc", data={**DATA, "kind": "decision"})
     assert "actions" not in got and "Allow" not in json.dumps(got) and "allow" not in got
-    for key in ("headline", "options", "rec", "subject", "v"):
-        assert key not in ("actions",)
     assert got["subject"] == ITEM and got["rec"] == "a" and got["options"] == [["a", "Host A"], ["b", "Host B"]]
     assert got["headline"]
 
@@ -67,7 +65,49 @@ def test_a_huge_card_declarative_payload_stays_in_one_request() -> None:
     legacy = sender.build_payload("Needs you", "b" * 3000, ITEM, "https://cockpit.example/?view=needs&item=" + ITEM, 7, 3,
                                   headline="h" * 300, options=[["a", "x" * 300]] * 8, rec="a", subject_id=ITEM, version="v1")
     out = sender.declarative_payload(legacy)
-    assert len(out) <= ece.MAX_PLAINTEXT and json.loads(out)["title"] == "Needs you"
+    # the doubled 3000-byte body cannot fit even with the card shed, so the legacy bytes go out whole, card included
+    assert out == legacy and len(out) <= ece.MAX_PLAINTEXT
+    got = json.loads(out)
+    assert "web_push" not in got and got["subject"] == ITEM and got["options"] and got["headline"]
+
+
+def test_a_mid_size_card_sheds_the_bulky_members_first_and_keeps_subject_and_v() -> None:
+    url = "https://cockpit.example/?view=needs&item=" + ITEM
+    legacy = sender.build_payload("Needs you", "b" * 1500, ITEM, url, 7, 3, headline="h" * 300,
+                                  options=[["a", "x" * 150]] * 8, rec="a", subject_id=ITEM, version="v1")
+    full = json.loads(legacy)
+    assert full["options"] and full["headline"]
+    out = sender.declarative_payload(legacy)
+    got = json.loads(out)
+    assert len(out) <= ece.MAX_PLAINTEXT and got["web_push"] == 8030
+    assert "options" not in got and "headline" not in got and "rec" not in got
+    assert got["subject"] == ITEM and got["v"] == "v1"
+
+
+def test_rec_is_dropped_when_the_fit_drops_its_option() -> None:
+    opts = [["a", "x" * 160], ["b", "y" * 160], ["c", "\x01" * 160]]
+    for room_pad in range(0, 1000, 10):
+        got = sender._card_members("h" * room_pad, opts, "c", ITEM, "v1")
+        if got.get("options") and len(got["options"]) == 2:
+            assert "rec" not in got
+            break
+    else:
+        raise AssertionError("never forced exactly one pop")
+    kept = sender._card_members("", [["a", "A"], ["b", "B"]], "b", ITEM, "v1")
+    assert kept["rec"] == "b"
+    assert "rec" not in sender._card_members("", [["a", "A"]], "zz", ITEM, "v1")
+
+
+def test_a_long_key_is_dropped_never_truncated() -> None:
+    got = sender._card_members("", [["option-number-one-long", "A"], ["option-number-two-long", "B"], ["ok", "C"]],
+                               "option-number-one-long", ITEM, "v1")
+    assert got["options"] == [["ok", "C"]] and "rec" not in got
+
+
+def test_the_card_fit_terminates_even_if_fit_gives_no_byte_bound(monkeypatch) -> None:
+    monkeypatch.setattr(sender, "_fit", lambda text, room: text)
+    got = sender._card_members("\x01" * 3000, [["a", "\x01" * 900]] * 8, "a", ITEM, "v1")
+    assert got == {} or len(sender._dumps(got)) <= sender._CARD_ROOM
 
 
 def test_the_card_fields_round_trip_and_unknown_ones_are_omitted() -> None:

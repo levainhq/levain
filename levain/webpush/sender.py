@@ -66,6 +66,7 @@ _STRIP_IN = 40000
 _CARD_ROOM = 1400        # serialized bytes the card members (headline, options, rec, subject, v) may take together
 _CARD_KEYS = ("headline", "options", "rec", "subject", "v")
 _OPT_TEXT_ROOM = 160
+_KEY_ROOM = 16           # an option key or rec longer than this is dropped, never cut
 
 
 def _card_members(headline: object, options: object, rec: object, subject_id: object, version: object) -> dict:
@@ -82,15 +83,23 @@ def _card_members(headline: object, options: object, rec: object, subject_id: ob
         for o in options[:8]:
             if isinstance(o, dict):
                 o = (o.get("key"), o.get("text"))
-            if isinstance(o, (list, tuple)) and len(o) == 2 and isinstance(o[0], str) and isinstance(o[1], str) and o[0]:
-                opts.append([_fit(o[0], 16), _fit(o[1], _OPT_TEXT_ROOM)])
-    if isinstance(rec, str) and rec:
-        card["rec"] = _fit(rec, 16)
+            # a key is an identifier: never truncated (a cut key could collide with another); a too-long one drops its option
+            if (isinstance(o, (list, tuple)) and len(o) == 2 and isinstance(o[0], str) and isinstance(o[1], str)
+                    and o[0] and len(o[0]) <= _KEY_ROOM and _jlen(o[0]) <= _KEY_ROOM):
+                opts.append([o[0], _fit(o[1], _OPT_TEXT_ROOM)])
+    if isinstance(rec, str) and rec and len(rec) <= _KEY_ROOM:
+        card["rec"] = rec
     if isinstance(headline, str) and headline.strip():
         card["headline"] = headline.strip()
-    if not opts:
-        card.pop("rec", None)
-    while True:
+
+    def _prune_rec() -> None:
+        if "rec" in card and not any(o[0] == card["rec"] for o in opts):
+            card.pop("rec")          # a rec names a carried option: with that option gone it means nothing
+
+    _prune_rec()
+    # bounded: every pass removes an option, shrinks/removes the headline, or returns; the cap is a backstop that
+    # falls back to no card even if _fit stopped guaranteeing a byte bound
+    for _ in range(len(opts) + 8):
         trial = dict(card)
         if opts:
             trial["options"] = opts
@@ -98,15 +107,17 @@ def _card_members(headline: object, options: object, rec: object, subject_id: ob
             return trial
         if opts:
             opts.pop()
-            if not opts:
-                card.pop("rec", None)       # a rec names an option: with none carried it means nothing
+            _prune_rec()
         elif "headline" in card:
             room = max(0, _CARD_ROOM - len(_dumps({k: v for k, v in card.items() if k != "headline"})) - 20)
-            card["headline"] = _fit(card["headline"], room) if room > 8 else ""
-            if not card["headline"]:
-                card.pop("headline")
+            cut = _fit(card["headline"], room) if room > 8 else ""
+            if not cut or cut == card["headline"]:
+                card.pop("headline")     # no shrink progress: the headline goes
+            else:
+                card["headline"] = cut
         else:
             return {}
+    return {}
 
 
 def build_payload(title: str, body: str, tag: str, url: str, ping_id: int, badge: "int | None" = None, *,
@@ -174,10 +185,13 @@ def declarative_payload(data: bytes, origin: "str | None" = None) -> bytes:
         return data
     if len(enc) <= ece.MAX_PLAINTEXT:
         return enc
-    # too big doubled: the card members ride only in the legacy copy's place, so the declarative push still goes
-    slim = {k: v for k, v in out.items() if k not in _CARD_KEYS}
-    enc = _dumps(slim)
-    return enc if len(enc) <= ece.MAX_PLAINTEXT else data
+    # too big doubled: shed card members in a fixed order (the bulky ones first; subject and v, the tap's identity, last),
+    # then fall back to the legacy bytes, which already carry the whole card and fit
+    for shed in (("headline", "options", "rec"), _CARD_KEYS):
+        enc = _dumps({k: v for k, v in out.items() if k not in shed})
+        if len(enc) <= ece.MAX_PLAINTEXT:
+            return enc
+    return data
 
 
 def topic_for(ref: str | None) -> str | None:
