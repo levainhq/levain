@@ -683,6 +683,27 @@ def test_repo_settings_credential_helper_keys_refused():
             assert key in got[0].detail and path in got[0].detail
 
 
+def test_supervisor_has_no_second_fold():
+    """PRE-L3 fix4 (L1 LOW-1): the settings reader folds names with render's ``fold_name``, not a copy of it; and
+    that fold treats case, unicode compatibility, decomposition and whitespace as ruled."""
+    import unicodedata
+    from levain.slot import supervisor as sv
+    assert not hasattr(sv, "_fold")
+    assert rd.fold_name("Settings.JSON") == rd.fold_name("settings.json")
+    assert rd.fold_name("ＣＬＡＵＤＥ.md") != rd.fold_name("claude.md")      # NFD, not NFKC: width forms stay distinct
+    assert rd.fold_name(unicodedata.normalize("NFD", "é")) == rd.fold_name("É")
+    assert rd.fold_name(" .claude") != rd.fold_name(".claude")              # whitespace is part of the name
+
+
+def test_codex_config_toml_exemption_is_not_a_directory_entry():
+    """PRE-L3 fix4 (L1 LOW-3): a ``config.toml/`` entry (a directory marker) is not the rendered file."""
+    blob, facts = egress(vendor="codex")
+    mine = rd.render(blob, facts).file("config/codex/config.toml").data
+    assert [e.name for e in rd.discovery_refusals({"codex": ["config.toml/"]}, codex_config=mine,
+                                                  rendered_codex_config=mine)] == ["planted-discovery:codex-config-toml"]
+    assert rd.discovery_refusals({"codex": ["config.toml"]}, codex_config=mine, rendered_codex_config=mine) == []
+
+
 def test_levain_repo_settings_pass():
     """The negative control. ``.claude/settings.json`` is absent from this repo, so the control is (a) a hooks-only
     settings file and (b) the Claude Code settings template Levain ships (hooks + permissions)."""

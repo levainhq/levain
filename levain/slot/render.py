@@ -1124,8 +1124,7 @@ REPO_DISCOVERY = (".claude", ".codex", "CLAUDE.md", "AGENTS.md", ".mcp.json", ".
 def fold_name(name: str) -> str:
     """The one fold for a config-surface file name: a case- and normalization-insensitive store (APFS, the Mac slots'
     default) resolves the vendor's ``open("settings.json")`` to a planted ``Settings.JSON`` or an NFD spelling, so a
-    name check compares folded names (PRE-L3 4-2). ``levain.slot.workspace`` takes its dispatch refused-name fold from
-    here; ``levain.slot.supervisor._fold`` is the same expression, kept local so the supervisor imports render lazily."""
+    name check compares folded names (PRE-L3 4-2)."""
     return unicodedata.normalize("NFD", name).casefold()
 
 
@@ -1152,7 +1151,7 @@ def discovery_refusals(listings: Mapping[str, Iterable[str]], *, codex_config: b
                 continue
             if root == "codex" and name == "config.toml" and codex_config is not None \
                     and rendered_codex_config is not None and codex_config == rendered_codex_config \
-                    and [e.strip("/") for e in listing if _present([e], name)] == ["config.toml"]:
+                    and [e for e in listing if _present([e], name)] == ["config.toml"]:
                 # the exemption is the rendered file under its exact name, alone: a second spelling that folds to it
                 # (Linux keeps both) or a folded-only spelling is not the file render made
                 continue
