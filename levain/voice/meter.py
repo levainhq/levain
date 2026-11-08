@@ -493,8 +493,8 @@ class Meter:
 
     def snapshot_if_present(self) -> tuple[Spend, dict[str, dict[str, tuple[int, int]]]]:
         """The totals AND the per-provider rows from ONE clock read and ONE statement, so the two always agree: the totals
-        are the sum of the rows. Read-only, creates nothing (a missing ledger is zero and ``{}``); a symlink or a file
-        that is not a ledger is a :class:`MeterError`."""
+        are the sum of the rows. Read-only, creates nothing (a missing ledger is zero and ``{}``); a symlink, a path that cannot be
+        resolved or opened, or a file that is not a ledger is a :class:`MeterError`."""
         now = self._clock()
         m0, m1, d0, d1 = self._periods(now)
         if os.path.islink(self.path):
@@ -516,7 +516,7 @@ class Meter:
             month = sum(v["month"][1] for v in by.values())
             day = sum(v["day"][1] for v in by.values())
             return Spend(month, day, m0, d0, self.prices.as_of), by
-        except sqlite3.Error as exc:
+        except (sqlite3.Error, OSError) as exc:        # an unresolvable or unopenable path reads like an unreadable ledger
             failed = type(exc).__name__
         raise MeterError(f"the voice ledger could not be read: {failed}")
 

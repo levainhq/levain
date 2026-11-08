@@ -203,3 +203,19 @@ def test_no_stream_key_needs_a_keyed_provider_whose_grant_includes_stt(tmp_path,
     assert _body(tmp_path, monkeypatch, {"deepgram": ["tts"]}, setting=True)["mic_in"] == {"on": False, "reason": "no_stt_key"}
     assert _body(tmp_path, monkeypatch, {"deepgram": ["tts"], "inworld": ["tts"]}, setting=True)["mic_in"] == {"on": False, "reason": "no_stt_key"}
     assert _body(tmp_path, monkeypatch, {"deepgram": ["stt", "tts"]}, setting=True)["mic_in"] == {"on": False, "reason": "no_stream_key"}
+
+
+def test_a_path_that_cannot_be_resolved_is_a_meter_error_and_the_panel_says_unreadable(tmp_path, monkeypatch):
+    import pytest
+
+    class _Unresolvable(type(Path())):
+        def resolve(self, *a, **k):
+            raise OSError("too many levels of symbolic links")
+
+    meter = _seed(tmp_path / "voice.db")
+    meter.path = _Unresolvable(meter.path)
+    with pytest.raises(vm.MeterError):
+        meter.snapshot_if_present()
+    monkeypatch.setattr(cv, "_grants_for", lambda root: ({"g": 1}, "ok"))
+    monkeypatch.setattr(cv, "voice_key_for", lambda grants, name: _rec(["tts"]) if name == "inworld" else None)
+    assert cv.serve_voice(tmp_path, meter, last_read={})["meter"] == "unreadable"
