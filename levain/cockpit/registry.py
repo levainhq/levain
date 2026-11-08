@@ -329,8 +329,11 @@ def _queue_group(row: RowIn, today: date) -> str:
     if row.id.startswith(QUESTION_ROW_PREFIX):
         if row.facets.get("question_state") != "open":
             return "resolved"
-        # an open question snoozed past today (band_view.later_of, served as question_later) waits on no one today: not counted
-        return "later" if _is_iso_day(row.facets.get("question_later")) else "needs_input"
+        # an open question snoozed past today (band_view.later_of, served as question_later) waits on no one today: not counted.
+        # The day is compared against ``today`` too, so a row kept past the midnight its snooze ends at counts again instead
+        # of hiding a due question.
+        later = row.facets.get("question_later")
+        return "later" if _is_iso_day(later) and str(later) > today.isoformat() else "needs_input"
     if row.id.startswith(CONSENT_ROW_PREFIX):
         # an undecided request waits on the operator's late ruling, as a pending one waits on his answer
         return "needs_input" if row.facets.get("consent_state") in ("pending", "undecided") else "resolved"
@@ -343,15 +346,16 @@ def _queue_group(row: RowIn, today: date) -> str:
 
 def _queue_key(row: RowIn, today: date) -> tuple:
     # open and waiting: dated first (a pending's due is its expiry date); history: newest first
-    if _queue_group(row, today) == "needs_input":      # an agent is blocked on it: soonest expiry first
+    g = _queue_group(row, today)
+    if g == "needs_input":      # an agent is blocked on it: soonest expiry first
         if row.id.startswith(QUESTION_ROW_PREFIX):     # a question never expires: after the requests, oldest first
             return (0, 1, str(row.facets.get("at") or ""), row.id)
         return (0, 0, str(row.facets.get("expires_at") or ""), row.id)
-    if _queue_group(row, today) == "later":            # snoozed: soonest day first, then oldest
+    if g == "later":            # snoozed: soonest day first, then oldest
         return (0, str(row.facets.get("question_later")), str(row.facets.get("at") or ""), row.id)
-    if _queue_group(row, today) == "notes":            # an open note: oldest first
+    if g == "notes":            # an open note: oldest first
         return (0, str(row.facets.get("at") or ""), row.id)
-    if _queue_group(row, today) in ("open", "waiting"):
+    if g in ("open", "waiting"):
         return _decision_key(row, today)
     if row.id.startswith((CONSENT_ROW_PREFIX, QUESTION_ROW_PREFIX, NOTE_ROW_PREFIX)):   # a decided consent, answered question or dismissed note: newest first (`at` is the filing)
         at = str(row.facets.get("decided_at") or row.facets.get("at") or "")

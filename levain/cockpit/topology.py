@@ -472,7 +472,8 @@ def _questions_at(store: Any, at: datetime | None, now: datetime | None = None) 
     (band_view.later_facets, the one LATER predicate; a fault there is due, so the question stays). At a past instant T: every question filed
     at or before T and not answered by T (the store keeps both stamps and never deletes), oldest first; raises
     ``LookupError`` when the store cannot answer for T (no ``recent`` read, or more than ``QUESTIONS_SCAN`` questions,
-    so an older one answered after T would not be seen)."""
+    so an older one answered after T would not be seen). Known edge (reachability line): the past read keeps a question
+    snoozed at T, since a snooze carries no stamp of when it was set; it fails open (shown waiting), never hidden."""
     if at is None:
         from levain.band_view import later_facets
         return [q for q in store.open_questions() if later_facets(store, q, now) is None]

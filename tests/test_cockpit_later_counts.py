@@ -34,7 +34,7 @@ def test_the_work_panels_waiting_list_leaves_out_a_dated_question(tmp_path: Path
     for sid in ("s-due", "s-l1", "s-l2"):
         _session(root, sid, "/w", timedelta(minutes=1))
     read = topo.topology_reader(install_root=root, consent=lambda: None, questions=lambda: qs, hub_label=lambda c: "x")
-    v = read(ReadContext(datetime.now(timezone.utc))).value
+    v = read(ReadContext(now.astimezone(timezone.utc))).value      # the instant _store judged its days at: no midnight race
     waiting = [t["card"] for t in v["tasks"] if t["kind"] == "question"]
     assert waiting == [f"question:{due.n}"], waiting          # the strip's and flow's footer's count: one
     assert [n["state"] for n in v["nodes"] if n["state"] == "waiting"] == ["waiting"], "only the due question's session waits"
@@ -60,3 +60,18 @@ def test_the_decisions_tile_counts_only_due_questions(tmp_path: Path) -> None:
     assert [d["id"] for d in counted_rows(DECISION, done)] == [f"question:{due.n}"]
     assert ("later", "Later") in ORDERINGS[DECISION].groups and "later" in ORDERINGS[DECISION].uncounted
     assert [d["id"] for d in done if d["group"] == "later"] == [f"question:{l1.n}", f"question:{l2.n}"]    # soonest day first
+
+
+def test_the_push_badge_counts_only_due_questions(tmp_path: Path) -> None:
+    from levain.webpush.needs import open_needs_count
+    _store(tmp_path)
+    assert open_needs_count(tmp_path / "q") == 1        # the strip's count, not the three open rows
+
+
+def test_a_later_facet_kept_past_its_day_counts_again(tmp_path: Path) -> None:
+    """A row whose question_later day has come (kept across the midnight its snooze ended at) is due on the tile."""
+    qs, now, due, l1, l2 = _store(tmp_path)
+    rows, _left = _question_rows_in(qs, now)
+    groups = {r.id: g for r, g in apply_ordering(DECISION, rows, now.date() + timedelta(days=1))}
+    assert groups[f"question:{l1.n}"] == "needs_input"     # snoozed until tomorrow: on tomorrow it is due
+    assert groups[f"question:{l2.n}"] == "later"
