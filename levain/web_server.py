@@ -78,6 +78,7 @@ Sovereignty boundary (load-bearing, not incidental):
 from __future__ import annotations
 
 import dataclasses
+import gzip
 import hashlib
 import hmac
 import re
@@ -1500,6 +1501,75 @@ _ANY_REF = re.compile(r"""(?<![\w-])(?:src|href)\s*=\s*\\?["']?(/[^\s"'>\\]+)"""
 _SHELL_ASSET_EXT = (".js", ".css")
 
 
+# Static .css/.js assets (never HTML, never JSON): served compressed when the client allows it, with a strong ETag and
+# ``no-cache`` so a repeat load revalidates to a 304 instead of re-downloading (the consent card pulled ~538 KB uncompressed
+# under ``no-store`` on every load). The bytes are immutable for a server's life, so the compressed body and the ETag are
+# computed once per body; the entry keeps a reference to the body so its ``id`` cannot be reused.
+_STATIC_CACHE: dict[int, tuple[bytes, str, str, bytes]] = {}
+_STATIC_CACHE_LOCK = threading.Lock()
+_STATIC_CACHE_MAX = 256
+_COMPRESSIBLE_TYPES = frozenset({"text/css", "text/javascript", "application/javascript"})
+STATIC_CACHE_CONTROL = "no-cache"
+
+
+def _compressible(content_type: str) -> bool:
+    """The media type (parameters such as charset ignored, case-insensitive) is a CSS/JS one the server can emit."""
+    return content_type.partition(";")[0].strip().lower() in _COMPRESSIBLE_TYPES
+
+
+def _coding_q(params: str) -> float:
+    """The qvalue of one Accept-Encoding member; no ``q`` is 1, a malformed one is 0 (identity is the safe answer)."""
+    m = re.search(r"(?:^|;)\s*q\s*=\s*([^;\s]*)", params, re.IGNORECASE)
+    if m is None:
+        return 1.0
+    try:
+        return float(m.group(1))
+    except ValueError:
+        return 0.0
+
+
+def _accepts_gzip(header: str | None) -> bool:
+    """RFC 9110 12.5.3: an explicit ``gzip`` (or ``x-gzip``) entry decides; otherwise ``*`` with q>0 allows it."""
+    star: float | None = None
+    for part in (header or "").split(","):
+        name, _, params = part.strip().partition(";")
+        name = name.strip().lower()
+        if name in ("gzip", "x-gzip"):
+            return _coding_q(params) > 0
+        if name == "*":
+            star = _coding_q(params)
+    return star is not None and star > 0
+
+
+def _static_entry(body: bytes) -> tuple[str, str, bytes]:
+    """``(identity etag, gzip etag, gzip of the bytes)``, cached per body. The hash and compression run outside the
+    lock, so a large uncached body never blocks a cache hit for another; two cold racers on the same body may both
+    compress it (identical output), and the first insert wins."""
+    with _STATIC_CACHE_LOCK:
+        hit = _STATIC_CACHE.get(id(body))
+        if hit is not None and hit[0] is body:
+            return hit[1], hit[2], hit[3]
+    digest = hashlib.sha256(body).hexdigest()[:32]
+    etag, gz_etag = '"' + digest + '"', '"' + digest + '-gz"'
+    gz = gzip.compress(body, compresslevel=9, mtime=0)
+    with _STATIC_CACHE_LOCK:
+        hit = _STATIC_CACHE.get(id(body))
+        if hit is not None and hit[0] is body:
+            return hit[1], hit[2], hit[3]
+        if len(_STATIC_CACHE) >= _STATIC_CACHE_MAX:
+            _STATIC_CACHE.clear()
+        _STATIC_CACHE[id(body)] = (body, etag, gz_etag, gz)
+    return etag, gz_etag, gz
+
+
+def _etag_matches(if_none_match: str | None, *etags: str) -> bool:
+    if not if_none_match:
+        return False
+    if if_none_match.strip() == "*":
+        return True
+    return any(t.strip().removeprefix("W/") in etags for t in if_none_match.split(","))
+
+
 def _asset_digest(data: bytes) -> str:
     return hashlib.sha256(data).hexdigest()[:12]
 
@@ -2172,6 +2242,30 @@ class _Handler(GuardedHandler):
             self._send(*args, **kw)
         finally:
             self._frame_headers = None
+
+    def _send_static(self, body: bytes, content_type: str, *, head: bool) -> None:
+        """A static .css/.js asset: strong ETag + ``no-cache`` (revalidate, 304 on a match) and gzip when the client
+        accepts it. Anything else (HTML shells, JSON) goes through ``_send`` and keeps its own cache policy."""
+        if not _compressible(content_type):
+            self._send(body, content_type, head=head)
+            return
+        etag, gz_etag, gz = _static_entry(body)
+        use_gz = _accepts_gzip(self.headers.get("Accept-Encoding"))
+        served = gz_etag if use_gz else etag
+        vary = ("Vary", "Accept-Encoding")
+        if _etag_matches(self.headers.get("If-None-Match"), served):
+            self.send_response(304)
+            self.send_header("ETag", served)
+            self.send_header(*vary)
+            self._cache_control = STATIC_CACHE_CONTROL
+            self.end_headers()
+            self._cache_control = None
+            return
+        hdrs = [("ETag", served), vary]
+        if use_gz:
+            body = gz
+            hdrs.append(("Content-Encoding", "gzip"))
+        self._send(body, content_type, head=head, headers=hdrs, cache_control=STATIC_CACHE_CONTROL)
 
     def _push_tap_path(self) -> bool:
         """True for ``/?<a push tap's deep link>`` (see :data:`_PUSH_TAP_QUERY`): the exact raw path, no other parameter."""
@@ -4690,7 +4784,7 @@ class _Handler(GuardedHandler):
                 self._send_framing((_COCKPIT_PAGE_CSP, "DENY"), self.server.levain_assets[filename], content_type,
                                    head=head, headers=[("Permissions-Policy", _PERMISSIONS_POLICY)])
             else:
-                self._send(self.server.levain_assets[filename], content_type, head=head)
+                self._send_static(self.server.levain_assets[filename], content_type, head=head)
             return
 
         # Downstream-registered static assets (cached bytes, ungated — same class as the
@@ -4699,7 +4793,7 @@ class _Handler(GuardedHandler):
         extra = self.server.extra_assets.get(path)
         if extra is not None:
             content_type, body = extra
-            self._send(body, content_type, head=head)
+            self._send_static(body, content_type, head=head)
             return
 
         self._send(b"not found\n", "text/plain; charset=utf-8", status=404, head=head)
