@@ -7625,14 +7625,28 @@
     });
   }
   // "ends in 3 h 20 min", in the words a person says it
+  // (rounded up: "ended" only once the expiry has passed)
   function envelopeWhen(iso) {
     const t = Date.parse(iso);
     if (!Number.isFinite(t)) return "";
-    const mins = Math.round((t - Date.now()) / 60000);
-    if (mins <= 0) return "ended";
+    const ms = t - Date.now();
+    if (ms <= 0) return "ended";
+    if (ms < 60000) return "ends in <1 min";
+    const mins = Math.ceil(ms / 60000);
     if (mins < 60) return "ends in " + mins + " min";
     if (mins < 48 * 60) return "ends in " + Math.floor(mins / 60) + " h" + (mins % 60 ? " " + (mins % 60) + " min" : "");
     return "ends in " + Math.round(mins / 1440) + " days";
+  }
+  const ENVELOPE_ID = /^ev-[0-9a-f]{32}$/;
+  // the states a revoke is offered for, as levain.coordinator.envelope_revoke.REVOCABLE names them
+  const ENVELOPE_REVOCABLE = ["live", "live-unknown", "unreadable"];
+  // the WHOLE signed text, field by field, as levain.coordinator.envelope_revoke.revoke_message writes it: a line with a
+  // field more, a field less or a field changed, another envelope's id, or another namespace is never put to the passkey
+  const ENVELOPE_LINE = /^levain-envelope-revoke\/1\nstore: [0-9a-f]{32}\nenvelope: (ev-[0-9a-f]{32})\nat: [0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}\.[0-9]{6}Z\nnonce: [0-9a-f]{32}\n$/;
+  function envelopeLineOk(body, id) {
+    if (!body || typeof body.line !== "string" || body.namespace !== "levain-envelope-revoke") return false;
+    const m = ENVELOPE_LINE.exec(body.line);
+    return !!m && m[1] === id;
   }
   function envelopeCard(e, listing) {
     const sv = (x) => (typeof x === "string" ? x : "");
@@ -7654,7 +7668,11 @@
     const tn = Number(e.threads), en = Number(e.ended_threads);
     if (en > 0) facts.appendChild(el("span", "ext-meta envelope-threads", "ended for " + en + " of " + (tn || en) + " thread" + ((tn || en) === 1 ? "" : "s")));
     facts.appendChild(el("span", "ext-meta", sv(e.id).slice(0, 11)));
+    // a row the server could not read in full is still a row, said plainly, and its revoke stays
+    if (e.state === "live-unknown") facts.appendChild(el("span", "ext-meta envelope-unknown", "an earlier stop it carries cannot be read; treat it as live"));
+    if (e.state === "unreadable") facts.appendChild(el("span", "ext-meta envelope-unknown", sv(e.note) || "this envelope cannot be read in full"));
     row.appendChild(facts);
+    if (!ENVELOPE_ID.test(sv(e.id))) return row;          // no id a revoke can name: nothing to offer
     const signers = Array.isArray(listing.signers) ? listing.signers : [];
     const line = el("div", "consent-cmd envelope-sign");
     const btn = el("button", "undo-btn envelope-revoke", "Revoke");
@@ -7688,10 +7706,9 @@
       say("asking for the revoke to sign…");
       return signCall(base + "revoke-challenge", { signer_fp: who.fp, instance: e.instance }).then((c) => {
         if (!c.ok) { say("not revoked: " + signWhy(c), "bad"); return; }
-        // the server builds the message itself; one that does not name this envelope is not put to the passkey
-        if (typeof c.body.line !== "string" || c.body.line.indexOf("\nenvelope: " + e.id + "\n") < 0
-            || typeof c.body.challenge !== "string") {
-          say("not revoked: the text the server sent does not name this envelope, so nothing was signed", "bad");
+        // the server builds the message itself; one that is not exactly a revoke of this envelope is not put to the passkey
+        if (!envelopeLineOk(c.body, e.id) || typeof c.body.challenge !== "string") {
+          say("not revoked: the text the server sent is not a revoke of this envelope, so nothing was signed", "bad");
           return;
         }
         return envelopeChallenge(c.body.line).then((want) => {
@@ -7699,7 +7716,14 @@
             say("not revoked: the challenge the server sent is not over the text it shows, so nothing was signed", "bad");
             return;
           }
-          say("confirm with your passkey to end this envelope…");
+          // the exact text the passkey signs, on the screen before the prompt opens
+          const row = host.closest(".envelope-row");
+          const old = row && row.querySelector(".envelope-line");
+          if (old) old.remove();
+          const shown = el("pre", "envelope-line", c.body.line);
+          host.parentNode.insertBefore(shown, host);
+          shown.scrollIntoView({ block: "nearest" });
+          say("confirm with your passkey to end this envelope: it signs the text above…");
           const pk = { challenge: want, rpId: c.body.rp_id, userVerification: "required", timeout: 60000 };
           return signAsk(pk, c.body.rp_id, who.fp, who.rawId).then((cred) => {
             if (!cred || !cred.response) { say("not revoked: the passkey gave nothing to send; nothing was revoked", "bad"); return; }
@@ -7743,19 +7767,34 @@
     return slot;
   }
   let envelopeFillSeq = 0;     // the newest fill wins
+  // what the last revoke said, taken once: whichever fill draws next shows it and clears it, so it is never repeated stale
+  function envelopeSaidOnce() {
+    const said = envelopeSaid ? [el("div", "consent-note ext-meta envelope-said", envelopeSaid)] : [];
+    envelopeSaid = "";
+    return said;
+  }
+  // Every fill that answers draws the heading and marks the slot filled (the phone jump waits on it): a failed read (no
+  // token, no route, a fault) says so under the heading, never leaves the slot blank.
   function envelopeFill(slot) {
     const n = ++envelopeFillSeq;
+    const unavailable = () => {
+      if (n !== envelopeFillSeq) return;
+      slot.replaceChildren(el("div", "ext-grouphead", "Envelopes"), ...envelopeSaidOnce(),
+        el("div", "consent-note ext-meta envelope-unavailable", "The envelopes cannot be read here now"));
+      slot.dataset.filled = "1";
+    };
     envelopeFetch().then((b) => {
-      if (!b || n !== envelopeFillSeq) return;       // no token, no route (no signing here), or a failed read: no card
-      const live = b.envelopes.filter((e) => e && e.state === "live");
-      const ended = b.envelopes.length - live.length;
-      const said = envelopeSaid ? [el("div", "consent-note ext-meta envelope-said", envelopeSaid)] : [];
-      envelopeSaid = "";                                 // said once: a later redraw never repeats a stale revoke message
+      if (n !== envelopeFillSeq) return;
+      if (!b) { unavailable(); return; }
+      const open = b.envelopes.filter((e) => e && ENVELOPE_REVOCABLE.includes(e.state));
+      const ended = b.envelopes.length - open.length;
+      const said = envelopeSaidOnce();
       const why = typeof b.note === "string" && b.note ? [el("div", "consent-note ext-meta envelope-why", b.note)] : [];
       slot.replaceChildren(el("div", "ext-grouphead", "Envelopes"), ...said, ...why,
-        ...(live.length ? live.map((e) => envelopeCard(e, b)) : [el("div", "consent-note ext-meta envelope-empty", "No live envelopes")]),
+        ...(open.length ? open.map((e) => envelopeCard(e, b)) : [el("div", "consent-note ext-meta envelope-empty", "No live envelopes")]),
         ...(ended ? [el("div", "consent-note ext-meta", ended + " ended")] : []));
-    }).catch(() => {});
+      slot.dataset.filled = "1";
+    }).catch(unavailable);
   }
   // OS-2, the dispatch family: the live dispatch jobs as cards, each act (Sign, Cancel, Authorise) a button that opens the sign
   // sheet at /sign/dispatch/<job> with that act picked. /cockpit/dispatch.json lists them as the sheet's rows (one object per
@@ -9130,9 +9169,11 @@
     const heads = Array.from(overlay.querySelectorAll(".ext-grouphead"));
     const grants = heads.find((h) => /standing grants/i.test(h.textContent)) || null;
     if (grants) return { slot: grants, filled: grants };
-    // no grant under a heading: once the grants' read has answered (its slot says so), the envelopes' heading is where the tab lands
-    const gs = overlay.querySelector(".grant-slot");
-    const env = gs && gs.dataset.filled ? heads.find((h) => /^envelopes$/i.test(h.textContent.trim())) || null : null;
+    // no grant under a heading: once BOTH reads have answered (each slot says so), the envelopes' heading is where the tab
+    // lands; before that a grants heading may still be drawn above it
+    const gs = overlay.querySelector(".grant-slot"), es = overlay.querySelector(".envelope-slot");
+    const env = gs && gs.dataset.filled && es && es.dataset.filled
+      ? heads.find((h) => /^envelopes$/i.test(h.textContent.trim())) || null : null;
     return { slot: env, filled: env };
   }
   const phoneJumpDrawn = (n) => !!n && n.getClientRects().length > 0;

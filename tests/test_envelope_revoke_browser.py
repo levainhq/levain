@@ -9,6 +9,7 @@ import base64
 import json
 import os
 import shutil
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
@@ -22,7 +23,7 @@ from tests.test_cockpit_consent_rows import OPEN_DECISIONS, TILE
 from tests.test_cockpit_flip_parity import _drive, needs_browser
 from tests.test_cockpit_k2a import _install
 from tests.test_cockpit_sign_origin import _Passkey
-from tests.test_envelope_revoke import EID, _seed, _signer
+from tests.test_envelope_revoke import EID, EID2, _seed, _signer
 from tests.test_cockpit_grant_revoke import _free_port, _serve_on
 from tests.test_grant_phone import world  # noqa: F401  (world is a fixture)
 
@@ -40,21 +41,35 @@ class _Recording:
     """The real listing with the localhost passkey as its one signer, and a step that records what the page sent and
     answers the challenge the real ceremony would (the SSHSIG blob over the message text)."""
 
-    def __init__(self, real: EnvelopeRevoke, fp: str) -> None:
+    def __init__(self, real: EnvelopeRevoke, fp: str, *, bad: "list[tuple[str, str]] | None" = None,
+                 fail_refill: bool = False, expires_in: "float | None" = None) -> None:
         self.real, self.fp, self.steps = real, fp, []
+        self.bad = list(bad or [])              # (line, namespace) answered by each challenge in turn
+        self.fail_refill = fail_refill          # the first listing after a revoke fails
+        self.expires_in = expires_in            # seconds from now, written over every envelope's expiry
+        self.lines: list[str] = []
 
     def listing(self) -> dict[str, Any]:
+        if self.fail_refill and any(a == "revoke" for _e, a, _r in self.steps):
+            self.fail_refill = False
+            raise RuntimeError("the refill's read fails once")
         got = self.real.listing()
         got["signers"], got["note"] = [self.fp], ""
+        if self.expires_in is not None:
+            at = datetime.now(timezone.utc) + timedelta(seconds=self.expires_in)
+            for e in got["envelopes"]:
+                e["expires"] = at.strftime("%Y-%m-%dT%H:%M:%S.%fZ")
         return got
 
     def step(self, envelope_id: str, action: str, req: Any) -> dict[str, Any]:
         self.steps.append((envelope_id, action, req))
         if action == "revoke-challenge":
-            line = revoke_message("5" * 32, envelope_id, "2026-11-08T20:00:00.000000Z", "n" * 32)
+            line, ns = self.bad.pop(0) if self.bad else (
+                revoke_message("5" * 32, envelope_id, "2026-11-08T20:00:00.000000Z", "e" * 32), NAMESPACE)
+            self.lines.append(line)
             blob = challenge(line.encode(), NAMESPACE)
             return {"envelope_id": envelope_id, "rp_id": "localhost", "signer_fp": req["signer_fp"], "line": line,
-                    "namespace": NAMESPACE, "challenge": base64.urlsafe_b64encode(blob).decode().rstrip("=")}
+                    "namespace": ns, "challenge": base64.urlsafe_b64encode(blob).decode().rstrip("=")}
         if action == "revoke":
             return {"revoked": envelope_id, "warning": ""}
         raise GrantRefused(404, "not_found", "no such route")
@@ -139,8 +154,148 @@ def test_an_empty_store_says_no_live_envelopes_and_the_grants_jump_lands_on_it(w
             NARROW, {"until": TILE},
             {"eval": "document.querySelector('[data-phone-jump=grants]').click(); 1"},
             {"until": "[...document.querySelectorAll('#levain-modal .ext-grouphead')].some(h => h.textContent.trim() === 'Envelopes')"},
+            {"until": _LANDED},       # the jump landed on the heading, not only drew it
             {"eval": "document.querySelector('#levain-modal .envelope-empty').textContent"},
             *_shot("envelopes-empty-390.png"),
         ])
     values = [v for v in out["values"] if not (isinstance(v, dict) and "shot" in v)]
     assert values[-1] == "No live envelopes", values
+
+
+# --- L3 r1 fix round ---------------------------------------------------------------------------------------------------
+
+_ENV_HEAD = "[...document.querySelectorAll('#levain-modal .ext-grouphead')].find(h => h.textContent.trim() === 'Envelopes')"
+# the jump LANDED: the heading is drawn and inside the screen
+_LANDED = ("(() => { const h = " + _ENV_HEAD + "; if (!h) return false; const r = h.getBoundingClientRect();"
+           " return r.height > 0 && r.top >= 0 && r.bottom <= window.innerHeight; })()")
+# every passkey prompt the page opens records what the signed text on the screen was at that moment
+_WRAP_GET = ("(() => { window.__envGets = []; const c = navigator.credentials; const g = c.get.bind(c);"
+             " c.get = (o) => { const n = document.querySelector('#levain-modal .envelope-line');"
+             " const r = n ? n.getBoundingClientRect() : null;"
+             " window.__envGets.push(n ? {text: n.textContent, shown: n.getClientRects().length > 0, top: r.top,"
+             " bottom: r.bottom, vh: window.innerHeight} : null); return g(o); }; return 1; })()")
+_GOOD = revoke_message("5" * 32, EID, "2026-11-08T20:00:00.000000Z", "e" * 32)
+
+
+def _served(world, tmp_path, port: int):
+    pk = _Passkey("localhost")
+    _root, src, _ids = _install(tmp_path)
+    signer = _signer(world, rp="localhost", origin=f"http://localhost:{port}")
+    return pk, src, signer
+
+
+class _Failing(_Recording):
+    def listing(self) -> dict[str, Any]:
+        raise RuntimeError("the envelopes cannot be read")
+
+
+@needs_browser
+def test_the_signed_text_is_on_the_screen_when_the_passkey_asks(world, tmp_path) -> None:
+    """codex MED-2: the sheet shows the exact text signed, before the passkey prompt opens."""
+    _seed(world.qdir)
+    port = _free_port()
+    pk, src, signer = _served(world, tmp_path, port)
+    with _serve_on(port, src, surface_tokens={"browser": "T"}, install_class="reported", signer=signer) as httpd:
+        rec = _Recording(httpd.envelope_revoke, pk.key.fingerprint)
+        httpd.envelope_revoke = rec
+        out = _drive(tmp_path, f"http://localhost:{port}/#write_token=T", [
+            _authenticator(pk), NARROW, {"until": TILE}, {"eval": OPEN_DECISIONS},
+            {"until": f"!!{_CARD} && {_CARD}.querySelector('.envelope-revoke').title === 'revoke with your passkey'"},
+            {"eval": _WRAP_GET},
+            {"tap": f"{_CARD}.querySelector('.envelope-revoke')"},
+            {"posts": 2},
+            {"eval": "window.__envGets"},
+        ])
+    gets = [v for v in out["values"] if isinstance(v, list)][-1]
+    assert len(gets) == 1 and gets[0] is not None, gets
+    assert gets[0]["text"] == rec.lines[0] == _GOOD, gets
+    assert gets[0]["shown"] and gets[0]["top"] >= 0 and gets[0]["bottom"] <= gets[0]["vh"], gets
+
+
+@needs_browser
+def test_a_line_with_an_extra_or_altered_field_is_never_put_to_the_passkey(world, tmp_path) -> None:
+    """codex MED-2: the page checks the whole line's grammar, the namespace and the envelope id before WebAuthn."""
+    _seed(world.qdir)
+    bad = [(_GOOD + "extra: x\n", NAMESPACE),
+           (_GOOD.replace("at: 2026-11-08T20:00:00.000000Z", "at: tomorrow"), NAMESPACE),
+           (_GOOD.replace("levain-envelope-revoke/1", "levain-envelope-revoke/2"), NAMESPACE),
+           (revoke_message("5" * 32, EID2, "2026-11-08T20:00:00.000000Z", "e" * 32), NAMESPACE),
+           (_GOOD, "levain-grant-revoke")]
+    port = _free_port()
+    pk, src, signer = _served(world, tmp_path, port)
+    note = f"{_CARD}.querySelector('.sign-note')"
+    steps: list[dict[str, Any]] = []
+    for _ in bad:
+        steps += [{"until": f"!{_CARD}.querySelector('.envelope-revoke').disabled"},
+                  {"eval": f"{note}.textContent = ''; 1"},
+                  {"tap": f"{_CARD}.querySelector('.envelope-revoke')"},
+                  {"until": f"{note}.textContent.startsWith('not revoked')"},
+                  {"eval": f"{note}.textContent"}]
+    with _serve_on(port, src, surface_tokens={"browser": "T"}, install_class="reported", signer=signer) as httpd:
+        rec = _Recording(httpd.envelope_revoke, pk.key.fingerprint, bad=bad)
+        httpd.envelope_revoke = rec
+        out = _drive(tmp_path, f"http://localhost:{port}/#write_token=T", [
+            _authenticator(pk), NARROW, {"until": TILE}, {"eval": OPEN_DECISIONS},
+            {"until": f"!!{_CARD} && {_CARD}.querySelector('.envelope-revoke').title === 'revoke with your passkey'"},
+            {"eval": _WRAP_GET}, *steps, {"eval": "window.__envGets"}])
+    said = [v for v in out["values"] if isinstance(v, str) and v.startswith("not revoked")]
+    assert len(said) == len(bad) and all("nothing was signed" in v for v in said), said
+    assert [v for v in out["values"] if isinstance(v, list)][-1] == [], "a bad line was put to the passkey"
+    assert [a for _e, a, _r in rec.steps] == ["revoke-challenge"] * len(bad), rec.steps
+
+
+@needs_browser
+def test_a_failed_envelope_read_still_draws_the_heading_and_the_jump_lands_on_it(world, tmp_path) -> None:
+    """deepseek MED-4 / complement LOW-5: the envelopes' slot says it could not read, and the grants jump lands there."""
+    port = _free_port()
+    pk, src, signer = _served(world, tmp_path, port)
+    with _serve_on(port, src, surface_tokens={"browser": "T"}, install_class="reported", signer=signer) as httpd:
+        httpd.envelope_revoke = _Failing(httpd.envelope_revoke, pk.key.fingerprint)
+        out = _drive(tmp_path, f"http://localhost:{port}/#write_token=T", [
+            NARROW, {"until": TILE},
+            {"eval": "document.querySelector('[data-phone-jump=grants]').click(); 1"},
+            {"until": _LANDED},
+            {"eval": "document.querySelector('#levain-modal .envelope-unavailable').textContent"},
+        ])
+    assert out["values"][-1] == "The envelopes cannot be read here now", out["values"]
+
+
+@needs_browser
+def test_under_a_minute_left_reads_less_than_a_minute(world, tmp_path) -> None:
+    _seed(world.qdir)
+    port = _free_port()
+    pk, src, signer = _served(world, tmp_path, port)
+    with _serve_on(port, src, surface_tokens={"browser": "T"}, install_class="reported", signer=signer) as httpd:
+        httpd.envelope_revoke = _Recording(httpd.envelope_revoke, pk.key.fingerprint, expires_in=40)
+        out = _drive(tmp_path, f"http://localhost:{port}/#write_token=T", [
+            NARROW, {"until": TILE}, {"eval": OPEN_DECISIONS},
+            {"until": f"!!{_CARD}"},
+            {"eval": f"{_CARD}.querySelector('.consent-head').textContent"},
+        ])
+    assert out["values"][-1].endswith("ends in <1 min"), out["values"]
+
+
+@needs_browser
+def test_a_revoke_said_over_a_failed_refill_is_said_once(world, tmp_path) -> None:
+    """deepseek LOW-7: a failed refill says the revoke once and clears it; a later read never repeats it."""
+    _seed(world.qdir)
+    port = _free_port()
+    pk, src, signer = _served(world, tmp_path, port)
+    with _serve_on(port, src, surface_tokens={"browser": "T"}, install_class="reported", signer=signer) as httpd:
+        httpd.envelope_revoke = _Recording(httpd.envelope_revoke, pk.key.fingerprint, fail_refill=True)
+        out = _drive(tmp_path, f"http://localhost:{port}/#write_token=T", [
+            _authenticator(pk), NARROW, {"until": TILE}, {"eval": OPEN_DECISIONS},
+            {"until": f"!!{_CARD} && {_CARD}.querySelector('.envelope-revoke').title === 'revoke with your passkey'"},
+            {"tap": f"{_CARD}.querySelector('.envelope-revoke')"},
+            {"posts": 2},
+            {"until": "!!document.querySelector('#levain-modal .envelope-unavailable')"},
+            {"eval": "(document.querySelector('#levain-modal .envelope-said') || {}).textContent || ''"},
+            {"eval": "document.querySelector('#levain-modal .modal-close').click(); 1"},
+            {"until": "!document.getElementById('levain-modal')"},
+            {"eval": OPEN_DECISIONS},
+            {"until": f"!!{_CARD}"},
+            {"eval": "!!document.querySelector('#levain-modal .envelope-said')"},
+        ])
+    values = [v for v in out["values"] if not (isinstance(v, dict) and "shot" in v)]
+    assert values[-1] is False, values
+    assert any(isinstance(v, str) and v.startswith("Revoked ") for v in values), values

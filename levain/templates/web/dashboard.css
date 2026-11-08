@@ -1308,6 +1308,8 @@ body.ke .ck-card.w.w-open:focus-visible { outline: 1px solid var(--line-hot); ou
 .envelope-sign { flex-wrap: wrap; }
 .envelope-sign .consent-code, .envelope-row .consent-head, .envelope-row .consent-facts { overflow-wrap: anywhere; min-width: 0; }
 .envelope-revoke { min-height: var(--hit-min, 44px); min-width: var(--hit-min, 44px); }
+/* the exact text a revoke signs, shown above the passkey prompt: every byte visible, wrapped, never scrolled sideways */
+.envelope-line { white-space: pre-wrap; overflow-wrap: anywhere; font-size: 0.75rem; margin: var(--sp-2, 6px) 0; max-width: 100%; }
 .grant-calls { margin-top: var(--sp-2); }
 .grant-call { display: block; overflow-wrap: anywhere; }
 .grant-call.grant-refused { color: var(--bad); font-weight: var(--fw-semibold); }
