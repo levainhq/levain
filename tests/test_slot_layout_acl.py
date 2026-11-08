@@ -80,9 +80,9 @@ def test_every_darwin_row_clears_its_acl_after_the_chown_and_before_the_mode():
     for r in _all_rows("darwin"):
         argvs = [s.argv for s in LY.row_steps("darwin", [r]) if s.argv]
         p = str(r.path)
-        chown = argvs.index(("/usr/sbin/chown", f"{r.owner}:{r.group}", p))
-        clear = argvs.index(("/bin/chmod", "-N", p))
-        mode = argvs.index(("/bin/chmod", f"{r.mode:04o}", p))
+        chown = argvs.index(("/usr/sbin/chown", "-h", f"{r.owner}:{r.group}", p))
+        clear = argvs.index(("/bin/chmod", "-h", "-N", p))
+        mode = argvs.index(("/bin/chmod", "-h", f"{r.mode:04o}", p))
         assert chown < clear < mode == len(argvs) - 1, (p, argvs)
 
 

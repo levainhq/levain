@@ -258,24 +258,56 @@ def _tools(host: HostOS) -> dict[str, str]:
     raise Refused("unsupported-host", repr(host))
 
 
+def _mode_no_follow(path: str, mode: int, kind: Literal["dir", "file"]) -> tuple[bool, str]:
+    """Set ``path``'s mode through a descriptor opened without following a link, after checking it is the row's kind.
+    GNU chmod has no portable no-follow flag, so a Linux row's mode is set here rather than by the tool."""
+    import stat
+
+    flags = os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_NOCTTY | os.O_CLOEXEC
+    if kind == "dir":
+        flags |= os.O_DIRECTORY
+    try:
+        fd = os.open(path, flags)
+    except OSError as e:
+        return False, f"{path} could not be opened without following a link: {e.strerror or e}"
+    try:
+        st = os.fstat(fd)
+        if not (stat.S_ISDIR(st.st_mode) if kind == "dir" else stat.S_ISREG(st.st_mode)):
+            return False, f"{path} is not a {'directory' if kind == 'dir' else 'regular file'}"
+        os.fchmod(fd, mode)
+    except OSError as e:
+        return False, f"{path}: {e.strerror or e}"
+    finally:
+        os.close(fd)
+    return True, ""
+
+
 def row_steps(host: HostOS, rows: Iterable[Row]) -> list[Step]:
+    """Make each row, then own it and set its mode. A service account owns the parent of some rows, so it can put a
+    symlink where a row goes: a link already there is refused before anything is made, and each act after that is
+    no-follow on its own (``chown -h``; ``chmod -h`` on macOS; a descriptor opened ``O_NOFOLLOW`` on Linux), so a
+    link swapped in between the refusal and the acts is never followed to its target."""
     t = _tools(host)
     steps: list[Step] = []
     for r in rows:
         p = str(r.path)
+        steps.append(Step(f"refuse a link at {p}", (t["test"], "!", "-L", p)))
         if r.kind == "dir":
             steps.append(Step(f"create {p}", (t["mkdir"], p), skip_if=(t["test"], "-d", p)))
         else:
             # Created only when absent: a lock file is never replaced under a process holding it.
             steps.append(Step(f"create {p}", write=(r.path, "", r.mode), skip_if=(t["test"], "-e", p)))
-        steps.append(Step(f"own {p} as {r.owner}:{r.group}", (t["chown"], f"{r.owner}:{r.group}", p)))
+        steps.append(Step(f"own {p} as {r.owner}:{r.group}", (t["chown"], "-h", f"{r.owner}:{r.group}", p)))
         if host == "darwin":
             # A numeric chmod leaves an extended ACL in place, and the trust check reads only owner and mode bits, so
             # a grant an earlier owner set (add_file, delete_child) would outlive this row. Cleared after the chown:
             # until then the old owner can still add an entry, as an owner always can. Linux: no install code reads
             # or writes POSIX ACLs, so a Linux row has no such step.
-            steps.append(Step(f"no extended ACL on {p}", (t["chmod"], "-N", p)))
-        steps.append(Step(f"set {p} to {r.mode:04o}", (t["chmod"], f"{r.mode:04o}", p)))
+            steps.append(Step(f"no extended ACL on {p}", (t["chmod"], "-h", "-N", p)))
+            steps.append(Step(f"set {p} to {r.mode:04o}", (t["chmod"], "-h", f"{r.mode:04o}", p)))
+        else:
+            steps.append(Step(f"set {p} to {r.mode:04o}",
+                              call=lambda p=p, m=r.mode, k=r.kind: _mode_no_follow(p, m, k)))
     return steps
 
 
