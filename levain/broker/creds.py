@@ -648,15 +648,20 @@ _TARGET_RE = re.compile(r"/[\x21-\x22\x24-\x7e]*")
 #: refresh for good
 EXPIRES_IN_MAX_S = 365 * 86400
 _DIGITS_RE = re.compile(r"[0-9]{1,20}")
+#: commits a refresh tries, with the same fields and `rev`, before it holds them on its gate for the next attempt
+COMMIT_ATTEMPTS = 3
 
 
 class RefreshRejected(Exception):
     """The token endpoint's answer is not a refresh keys commits; `detail` is a fixed token (the response body is never
-    logged): `status`, `json`, `access_token`, `expires_in`, `refresh_token`, or `token-url` (refused before any byte)."""
+    logged): `status`, `json`, `access_token`, `expires_in`, `refresh_token`, or `token-url` (refused before any byte).
+    `keep`, when set, is the credential's object with only a rotated refresh token the answer carried: the endpoint
+    has spent the old one, so the refresh commits `keep` though the rest of the answer is refused."""
 
-    def __init__(self, detail: str) -> None:
+    def __init__(self, detail: str, keep: Optional[dict] = None) -> None:
         super().__init__(detail)
         self.detail = detail
+        self.keep = keep
 
 
 class _Gate:
@@ -664,8 +669,11 @@ class _Gate:
     a refresh commits keeps its gate, so one refresh's own success never opens the next attempt early): an attempt is
     admitted at most once per GATE_MIN_S from the last attempt's start, and not while a failure's backoff runs.
     `own` is the `rev` this gate's latest refresh commits, set BEFORE that commit is submitted: the new file can be
-    observed before the refresh resumes to call `succeeded`, and that observation must find this gate, not open one."""
-    __slots__ = ("rev", "own", "last_start", "failures", "shut_until")
+    observed before the refresh resumes to call `succeeded`, and that observation must find this gate, not open one.
+    `held` is (the `rev` compared, the fields, their `rev`) of a refresh whose every commit failed: the endpoint has
+    rotated the refresh token, so the next attempt commits these instead of spending the old token on a POST. It
+    goes with the gate when the operator's act brings a new `rev`."""
+    __slots__ = ("rev", "own", "last_start", "failures", "shut_until", "held")
 
     def __init__(self, rev: str) -> None:
         self.rev = rev
@@ -673,6 +681,7 @@ class _Gate:
         self.last_start: Optional[float] = None
         self.failures = 0
         self.shut_until = float("-inf")
+        self.held: Optional[Tuple[str, dict, str]] = None
 
     def admits(self, now: float) -> bool:
         return (self.last_start is None or now - self.last_start >= GATE_MIN_S) and now >= self.shut_until
@@ -706,7 +715,8 @@ def _refreshed(cred: Credential, resp: "upstream.RefreshResponse", now: float) -
     """The credential's object with the endpoint's new tokens, or `RefreshRejected`: a status other than 200, a body
     that is not a JSON object, an `access_token` or `refresh_token` that is not a string of at most VALUE_CAP bytes, an
     `expires_in` that is not a positive whole number (`_expires_in`; absent is a failure: the expiry is what the next
-    want reads). A returned `refresh_token` replaces the old one (rotation); none keeps it. `render` parses the result
+    want reads). A returned `refresh_token` replaces the old one (rotation); none keeps it. A valid rotated token in an
+    answer refused for its `access_token` or `expires_in` rides the rejection as `keep`. `render` parses the result
     before it is written."""
     if resp.status != 200:
         raise RefreshRejected("status")
@@ -717,18 +727,24 @@ def _refreshed(cred: Credential, resp: "upstream.RefreshResponse", now: float) -
     if not isinstance(d, dict):
         raise RefreshRejected("json")
     try:
-        access = _value(d.get("access_token"), "access_token")
         rotated = d.get("refresh_token")
         if rotated is not None:
             rotated = _value(rotated, "refresh_token")
     except Unparseable as e:
         raise RefreshRejected(str(e)) from None
-    exp = _expires_in(d.get("expires_in"))
     fields = json.loads(json.dumps(cred.fields))
-    fields["access"] = access
-    fields["expires_at"] = int(now) + exp
     if rotated is not None:
         fields["refresh"]["refresh_token"] = rotated
+    keep = fields if rotated is not None else None
+    try:
+        access = _value(d.get("access_token"), "access_token")
+        exp = _expires_in(d.get("expires_in"))
+    except Unparseable as e:
+        raise RefreshRejected(str(e), keep) from None
+    except RefreshRejected as e:
+        raise RefreshRejected(e.detail, keep) from None
+    fields["access"] = access
+    fields["expires_at"] = int(now) + exp
     return fields
 
 
@@ -859,20 +875,31 @@ class CredWriter:
             return await _post(cred)
 
     async def _refresh(self, cred: Credential, gate: _Gate, fut: "asyncio.Future") -> None:
-        """The detached refresh: the POST, the new object, the commit on the writer thread awaited SHIELDED (the job
-        runs to its end whatever happens to this task; it is held in `_commit_jobs`) with the generation compare, its
-        new `rev` made first and set as the gate's `own`. A failure counts on the gate and leaves the old file; a
-        DISCARD (the operator's act landed) is neither. The `finally` resolves the future with the outcome; the
-        task's done-callback repeats the cleanup for a task cancelled before its first step."""
+        """The detached refresh: the POST (or the gate's `held` fields, when a prior refresh's commits all failed), the
+        new object, the commit (`_land`). A refused answer that carried a rotated refresh token commits that token
+        alone and still counts as a failure, the gate now holding the committed `rev`. Any other failure counts on
+        the gate and leaves the old file; a DISCARD (the operator's act landed) is neither. The `finally` resolves the future with the outcome; the task's
+        done-callback repeats the cleanup for a task cancelled before its first step."""
         result = "cancelled"
         try:
-            response = await asyncio.wait_for(self._post_bounded(cred), REFRESH_DEADLINE_S)
-            fields = _refreshed(cred, response, self.seams.clock())
-            gate.own = rev = new_rev()   # no await between this and the submit below
-            job = asyncio.ensure_future(self.commit(cred.name, fields, expect_rev=cred.rev, rev=rev))
-            self._commit_jobs.add(job)
-            job.add_done_callback(self._commit_ended)
-            out = await asyncio.shield(job)
+            refused: Optional[RefreshRejected] = None
+            held = gate.held if gate.held is not None and gate.held[0] == cred.rev else None
+            if held is not None:
+                fields, rev = held[1], held[2]
+            else:
+                response = await asyncio.wait_for(self._post_bounded(cred), REFRESH_DEADLINE_S)
+                try:
+                    fields = _refreshed(cred, response, self.seams.clock())
+                except RefreshRejected as e:
+                    if e.keep is None:
+                        raise
+                    fields, refused = e.keep, e
+                rev = new_rev()
+            out = await self._land(cred, gate, fields, rev)
+            if refused is not None:
+                if out.result == COMMITTED:
+                    gate.rev = out.rev   # the file is this refresh's: the next attempt must find this gate and its hold
+                raise refused
             result = out.result
             if out.result == COMMITTED:
                 gate.succeeded(out.rev)
@@ -888,6 +915,29 @@ class CredWriter:
             task = asyncio.current_task()
             if task is not None:
                 self._refresh_ended((cred.name, cred.rev), fut, task)
+
+    async def _land(self, cred: Credential, gate: _Gate, fields: dict, rev: str) -> Outcome:
+        """Commit `fields` as `rev` against `cred.rev` on the writer thread, awaited SHIELDED (the job runs to its end
+        whatever happens to this task; it is held in `_commit_jobs`), `rev` set as the gate's `own` first. A
+        `CommitFailed` (nothing written) is tried again with the same fields and `rev`, COMMIT_ATTEMPTS in all; when
+        every one fails the fields are held on the gate, since they may carry a rotated refresh token the endpoint
+        will not take back, and the last failure is raised. An outcome (committed or discarded) clears the hold."""
+        failed: Optional[CommitFailed] = None
+        for _ in range(COMMIT_ATTEMPTS):
+            gate.own = rev   # no await between this and the submit below
+            job = asyncio.ensure_future(self.commit(cred.name, fields, expect_rev=cred.rev, rev=rev))
+            self._commit_jobs.add(job)
+            job.add_done_callback(self._commit_ended)
+            try:
+                out = await asyncio.shield(job)
+            except CommitFailed as e:
+                failed = e
+                continue
+            gate.held = None
+            return out
+        gate.held = (cred.rev, fields, rev)
+        assert failed is not None
+        raise failed
 
     # -- the writer thread --
 

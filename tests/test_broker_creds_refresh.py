@@ -540,9 +540,11 @@ def test_a_refresh_failing_mid_response_leaves_no_open_transport(env):
 
 @pytest.mark.parametrize("mode", ["big-token", "zero-expiry", "big-body", "fail"])
 def test_a_response_past_a_cap_or_refused_is_a_failure_and_the_old_file_stays(env, mode):
+    # no rotated refresh token in the answer: nothing of it is kept (3b-7's rotation case is its own test below)
     ep, d, store, cert, mp = env
     _write(d, _fields(int(time.time()) - 5))
     ep.mode = mode
+    ep.rotate = False
     before = (d / (NAME + ".json")).read_bytes()
 
     async def go():
@@ -1051,3 +1053,129 @@ def test_3b6_a_stalled_token_endpoint_falls_through_to_the_unexpired_token(env, 
 def test_3b6_the_deadline_leaves_the_token_unexpired_inside_the_ahead_window():
     # a want starts at the latest REFRESH_AHEAD_S before expiry; falling through at the deadline must still find it valid
     assert 0 < C.REFRESH_DEADLINE_S < C.REFRESH_AHEAD_S
+
+
+def _flaky_commit(w: C.CredWriter, broken):
+    """Replace `w.commit`: a call fails `CommitFailed` (nothing written) while `broken(n)` is true for its number n;
+    every call's (refresh_token, rev) is recorded."""
+    real = w.commit
+    calls = []
+
+    async def commit(name, fields, expect_rev=None, rev=None):
+        calls.append((fields["refresh"]["refresh_token"], rev))
+        if broken(len(calls)):
+            raise C.CommitFailed("credential-lock-timeout")
+        return await real(name, fields, expect_rev=expect_rev, rev=rev)
+    w.commit = commit
+    return calls
+
+
+def test_3b7_a_failed_first_commit_keeps_the_rotated_refresh_token(env):
+    """3b-7: the endpoint rotated the refresh token (the old one is dead upstream); the first commit fails. The commit
+    is retried with the same fields and rev, so the rotated token lands."""
+    ep, d, store, cert, mp = env
+    _write(d, _fields(int(time.time()) - 5))
+
+    async def go():
+        await _serve(ep, cert, mp)
+        w, s = _writer(d), store()
+        calls = _flaky_commit(w, lambda n: n == 1)
+        try:
+            c = await C.fresh(w, s, NAME)
+        except Refused:
+            c = None
+        await _settle(w)
+        w.close()
+        return c, calls
+    c, calls = run(go())
+    assert _file(d)["refresh"]["refresh_token"] == "new-refresh-1", "the rotated refresh token was lost"
+    assert ep.calls == 1
+    assert c is not None and c.secret == "new-access-1"
+    assert len(calls) == 2 and calls[0] == calls[1]
+
+
+@pytest.mark.parametrize("mode", ["big-token", "zero-expiry"])
+def test_3b7_an_unusable_access_token_still_lands_the_rotated_refresh_token(env, mode):
+    """3b-7: a 200 whose access token (or its expiry) is refused but whose rotated refresh token is valid: the refresh
+    token is kept (the access token and its expiry stay as they were) and the refresh still counts as a failure on the
+    gate."""
+    ep, d, store, cert, mp = env
+    exp = int(time.time()) - 5
+    _write(d, _fields(exp))
+    ep.mode = mode
+
+    async def go():
+        await _serve(ep, cert, mp)
+        w, s = _writer(d), store()
+        with pytest.raises(Refused):
+            await C.fresh(w, s, NAME)
+        await _settle(w)
+        failures = w._gates[NAME].failures
+        w.close()
+        return failures
+    failures = run(go())
+    f = _file(d)
+    assert f["refresh"]["refresh_token"] == "new-refresh-1", "the rotated refresh token was lost"
+    assert f["access"] == "old-access" and f["expires_at"] == exp
+    assert failures == 1
+
+
+def test_3b7_a_rotated_token_whose_commits_all_failed_lands_before_the_next_post(env):
+    """3b-7: every commit of a refresh fails; the rotated token is held, and the next attempt the gate admits commits
+    it instead of spending the dead old refresh token on a second POST."""
+    ep, d, store, cert, mp = env
+    clk = Clock()
+    _write(d, _fields(int(clk.wall()) - 5))
+    down = [True]
+
+    async def go():
+        await _serve(ep, cert, mp)
+        w, s = _writer(d, clk), store()
+        _flaky_commit(w, lambda n: down[0])
+        with pytest.raises(Refused):
+            await C.fresh(w, s, NAME)
+        await _settle(w)
+        down[0] = False
+        clk.t = C.GATE_MAX_S + 1   # past any backoff
+        c = await C.fresh(w, s, NAME)
+        await _settle(w)
+        w.close()
+        return c
+    c = run(go())
+    assert ep.calls == 1, "a second POST spent the old refresh token"
+    assert _file(d)["refresh"]["refresh_token"] == "new-refresh-1"
+    assert c.secret == "new-access-1"
+
+
+def test_3b7_after_a_kept_rotation_a_failed_commit_is_still_held_on_the_same_gate(env):
+    """3b-7: the rotated token alone landed (the access token was refused); the next refresh rotates again and every
+    commit fails. That attempt's fields stay held on the credential's gate, so the attempt after commits them with no
+    third POST."""
+    ep, d, store, cert, mp = env
+    clk = Clock()
+    _write(d, _fields(int(clk.wall()) - 5))
+    ep.mode = "big-token"
+    down = [False]
+
+    async def go():
+        await _serve(ep, cert, mp)
+        w, s = _writer(d, clk), store()
+        _flaky_commit(w, lambda n: down[0])
+        with pytest.raises(Refused):
+            await C.fresh(w, s, NAME)
+        await _settle(w)
+        ep.mode, down[0] = "ok", True
+        clk.t = C.GATE_MAX_S + 1
+        with pytest.raises(Refused):
+            await C.fresh(w, s, NAME)
+        await _settle(w)
+        down[0] = False
+        clk.t = 2 * (C.GATE_MAX_S + 1)
+        c = await C.fresh(w, s, NAME)
+        await _settle(w)
+        w.close()
+        return c
+    c = run(go())
+    assert ep.calls == 2, "a third POST spent a dead refresh token"
+    assert _file(d)["refresh"]["refresh_token"] == "new-refresh-2"
+    assert c.secret == "new-access-2"
