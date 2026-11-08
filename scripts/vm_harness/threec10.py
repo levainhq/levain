@@ -15,6 +15,14 @@ The steps, each with ONE expected verdict (:data:`EXPECTED`), written to ``EXPEC
   T4  an overrun: a lineage row with ``overrun`` set (the session stopped)                        -> ``overrun-row ...``
   T5  install the unlimited key                                                                   -> ``cred-installed <cred>``
   T6  ``levain doctor``: the same row says there is no limit                                      -> ``no credit limit is set ...``
+What a verdict PROVES, exactly: the raw line of T3 and T4 is synthesized by this runner (T3 from the lineage rows the call
+added, the provider's usage delta and the tolerance; T4 from the new lineage rows and the call's exit code), so the regex match
+is a format check. The real verdict is the Python check that chose the word: T3 ``AGREE`` = a settled lineage row exists, the
+provider's usage MOVED, and the two totals are within tolerance (an unmoved provider is ``NOMOVE``, never an agreement, however
+small the lineage total); T4 ``overrun-row`` = a NEW lineage row appeared during that call carrying an integer ``overrun``
+(it does not prove the session was killed, only that the sink recorded an overrun). T1/T5 install refuse an existing credential
+and an empty one (``cred-refused``; the run ends REFUSED, exit 2). A step that timed out or lost its transport mid-run is ERROR
+(no verdict observed): the run ends INCOMPLETE (exit 3).
 The credential file is removed on the way out whatever happens. A step whose input is missing (a key not in the environment, no
 ``--call``) is UNBOUND and the run ends INCOMPLETE, never PASS.
 
@@ -33,6 +41,7 @@ import os
 import re
 import secrets
 import shlex
+import subprocess
 import sys
 import tempfile
 import time
@@ -54,10 +63,17 @@ KEYS_USER = "_levain_keys"                          # levain.slot.layout's owner
 USD = r"\$-?[\d,]+\.\d\d"
 CRED_NAME_RE = re.compile(r"[a-z0-9-]{1,48}")       # levain.broker.creds.NAME_RE
 
-INSTALL_SCRIPT = ('set -e; d="$1/keys/cred"; n="$2"; umask 077; cat > "$d/$n.json.new"; '
+#: ``$3`` is ``new`` (refuse when the credential already exists: a file of his is never overwritten) or ``replace`` (the
+#: sitting's own T1 file, swapped for the unlimited key). An empty credential is refused before it can be moved into place.
+#: A refusal prints ``cred-refused ...`` and exits 0, so the runner reads it as data.
+INSTALL_SCRIPT = ('set -e; d="$1/keys/cred"; n="$2"; umask 077; '
+                  'if [ "$3" != replace ] && [ -e "$d/$n.json" ]; then cat > /dev/null; '
+                  'echo "cred-refused $n: $d/$n.json already exists"; exit 0; fi; '
+                  'cat > "$d/$n.json.new"; '
+                  'if [ ! -s "$d/$n.json.new" ]; then rm -f "$d/$n.json.new"; echo "cred-refused $n: empty credential"; exit 0; fi; '
                   'chown ' + KEYS_USER + ':' + KEYS_USER + ' "$d/$n.json.new"; mv "$d/$n.json.new" "$d/$n.json"; '
                   'echo "cred-installed $n"')
-REMOVE_SCRIPT = 'set -e; rm -f "$1/keys/cred/$2.json"; echo "cred-removed $2"'
+REMOVE_SCRIPT = 'set -e; rm -f "$1/keys/cred/$2.json" "$1/keys/cred/$2.json.new"; echo "cred-removed $2"'
 
 #: (id, name, rc, pattern with <cred>, line selector): the verdicts, one each, fixed before any run.
 EXPECTED: tuple[tuple[str, str, int | None, str, str | None], ...] = (
@@ -65,7 +81,7 @@ EXPECTED: tuple[tuple[str, str, int | None, str, str | None], ...] = (
     ("T2", "doctor, key with a limit", None,
      r"\s*\S+ invoice ceiling \(<cred>(?: at [^)]+)?\): key limit " + USD + r" total, " + USD + r" remaining.*",
      r"invoice ceiling \(<cred>"),
-    ("T3", "one real call settles from real usage", None, r"AGREE .*", r"^(AGREE|DISAGREE|NOCALL) "),
+    ("T3", "one real call settles from real usage", None, r"AGREE .*", r"^(AGREE|DISAGREE|NOCALL|NOMOVE) "),
     ("T4", "an overrun stops the session", None, r"overrun-row .*", r"^(overrun-row|no-overrun-row) "),
     ("T5", "install the unlimited key", 0, r"cred-installed <cred>", r"^cred-installed "),
     ("T6", "doctor, key with no limit", None,
@@ -196,21 +212,37 @@ def run_3c10(guest, stdin_run, evidence_dir, cfg: Config, *, fetch: Fetch = defa
         done(sid, "PASS" if ok else "FAIL", raw, detail if ok else (detail + f" rc={rc}").strip())
 
     installed = False
+    refused = False
 
     def install(sid: str, which: str) -> bool:
-        nonlocal installed
+        nonlocal installed, refused
         key = keys.get(which)
+        if refused:
+            unbound(sid, "an earlier install was refused; nothing more is installed")
+            return False
         if not key:
             unbound(sid, f"the {which} key is not in the environment")
             return False
-        argv = ("sudo", "-n", "/bin/sh", "-c", INSTALL_SCRIPT, "sh", cfg.profile.store, cfg.cred)
+        mode = "replace" if installed else "new"     # replace only the sitting's own file; never one that was already there
+        argv = ("sudo", "-n", "/bin/sh", "-c", INSTALL_SCRIPT, "sh", cfg.profile.store, cfg.cred, mode)
+        prior = installed
+        installed = True          # BEFORE the call: a transport failure after the write must still reach the cleanup
         try:
             out = stdin_run(argv, credential_json(cfg.cred, key), 60)
         except (GuestError, OSError) as e:
             done(sid, "FAIL", detail=f"transport: {e}")
             return False
-        installed = True
-        judged(sid, out.splitlines(), 0)
+        except subprocess.SubprocessError as e:
+            done(sid, "ERROR", detail=f"{type(e).__name__}: {e}")
+            return False
+        lines = out.splitlines()
+        refusal = next((ln for ln in lines if ln.startswith("cred-refused ")), None)
+        if refusal:
+            installed = prior     # nothing of ours was written: do not remove a file that was there before
+            refused = True
+            done(sid, "REFUSED", detail=refusal)
+            return False
+        judged(sid, lines, 0)
         return results[sid].status == "PASS"
 
     def doctor(sid: str) -> None:
@@ -218,6 +250,9 @@ def run_3c10(guest, stdin_run, evidence_dir, cfg: Config, *, fetch: Fetch = defa
             lines, rc = capture(guest, _doctor_argv(cfg), 180)
         except (GuestError, RunbookError, OSError) as e:
             done(sid, "FAIL", detail=f"transport: {e}")
+            return
+        except subprocess.SubprocessError as e:
+            done(sid, "ERROR", detail=f"{type(e).__name__}: {e}")
             return
         judged(sid, lines, rc)
 
@@ -240,11 +275,19 @@ def run_3c10(guest, stdin_run, evidence_dir, cfg: Config, *, fetch: Fetch = defa
         except (GuestError, RunbookError, OSError) as e:
             done(sid, "FAIL", detail=f"{type(e).__name__}: {e}")
             return
+        except subprocess.SubprocessError as e:
+            done(sid, "ERROR", detail=f"{type(e).__name__}: {e}")
+            return
         settled = [r for r in new if isinstance(r.get("cost_microdollars"), int) and r.get("model_answered") is not None]
         lin = sum(r["cost_microdollars"] for r in settled)
         prov = u1 - u0
         tol = max(cfg.tolerance_pct / 100.0 * prov, cfg.tolerance_floor_microdollars)
-        word = "NOCALL" if not settled else ("AGREE" if abs(lin - prov) <= tol else "DISAGREE")
+        if not settled:
+            word = "NOCALL"
+        elif u1 == u0 or prov <= 0:
+            word = "NOMOVE"       # the provider's books never moved: a small lineage total is inside any floor, so NOT an agreement
+        else:
+            word = "AGREE" if abs(lin - prov) <= tol else "DISAGREE"
         raw = f"{word} lineage_microdollars={lin} provider_delta_microdollars={prov} rows={len(settled)} tolerance={int(tol)}"
         judged(sid, [raw], 0)
 
@@ -255,6 +298,9 @@ def run_3c10(guest, stdin_run, evidence_dir, cfg: Config, *, fetch: Fetch = defa
             new = lineage_rows(guest, cfg.profile)[before_rows:]
         except (GuestError, RunbookError, OSError) as e:
             done(sid, "FAIL", detail=f"{type(e).__name__}: {e}")
+            return
+        except subprocess.SubprocessError as e:
+            done(sid, "ERROR", detail=f"{type(e).__name__}: {e}")
             return
         hits = [r for r in new if isinstance(r.get("overrun"), int)]
         raw = (f"overrun-row run_id={hits[0].get('run_id')} overrun={hits[0]['overrun']} settled={hits[0].get('settled')} "
@@ -284,7 +330,7 @@ def run_3c10(guest, stdin_run, evidence_dir, cfg: Config, *, fetch: Fetch = defa
             try:
                 stdin_run(("sudo", "-n", "/bin/sh", "-c", REMOVE_SCRIPT, "sh", cfg.profile.store, cfg.cred), "", 60)
                 ev.log(f"cleanup: credential {cfg.cred} removed")
-            except (GuestError, OSError) as e:
+            except (GuestError, OSError, subprocess.SubprocessError) as e:
                 ev.log(f"cleanup: credential {cfg.cred} NOT removed ({e}); remove {cfg.profile.store}/keys/cred/{cfg.cred}.json by hand")
     ordered = [results[sid] for sid, *_ in EXPECTED]
     status = overall([r.status for r in ordered])
@@ -329,7 +375,7 @@ def main(argv: Sequence[str]) -> int:
             print(f"threec10: refusing: {e}", file=sys.stderr)
             return 2
     print(path.read_text())
-    return {"PASS": 0, "FAIL": 1}.get(status, 3)
+    return {"PASS": 0, "FAIL": 1, "REFUSED": 2}.get(status, 3)
 
 
 if __name__ == "__main__":

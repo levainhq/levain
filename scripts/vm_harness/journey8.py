@@ -28,6 +28,7 @@ from __future__ import annotations
 
 import argparse
 import re
+import subprocess
 import sys
 import tempfile
 from dataclasses import dataclass
@@ -174,7 +175,7 @@ def expected_text(os_name: str, steps: Sequence[Step] = STEPS) -> str:
 class StepResult:
     id: str
     name: str
-    status: str               # PASS | FAIL | UNBOUND | SKIP | NA
+    status: str               # PASS | FAIL | UNBOUND | SKIP | NA | ERROR (timed out / no verdict observed)
     raw: str = ""
     expected: str = ""
     detail: str = ""
@@ -232,12 +233,18 @@ def run_journey(guest, profile: HostProfile, evidence_dir, *, session: str = "",
                                detail="" if ok else f"rc={rc}")
             except (GuestError, RunbookError, OSError) as e:
                 r = StepResult(s.id, s.name, "FAIL", expected=f"rc={v.rc} /{v.pattern}/", detail=f"transport: {e}")
+            except subprocess.SubprocessError as e:       # TimeoutExpired included: no verdict was observed, so not a FAIL
+                r = StepResult(s.id, s.name, "ERROR", expected=f"rc={v.rc} /{v.pattern}/",
+                               detail=f"{type(e).__name__}: {e}")
         results.append(r)
         ev.log(r.line())
-    status = overall([r.status for r in results])
+    omitted = [s.id for s in steps if s not in chosen]
+    status = overall([r.status for r in results], omitted)
     body = [f"RESULT: {status}", f"journey 3b-8, os={os_name}, expected-table sha256 {digest} (EXPECTED.txt, written before the first step)"]
+    if omitted:
+        body.append("PARTIAL: a --step subset ran; omitted: " + ", ".join(omitted))
     body += [r.line() for r in results]
-    counts = {k: sum(r.status == k for r in results) for k in ("PASS", "FAIL", "UNBOUND", "SKIP", "NA")}
+    counts = {k: sum(r.status == k for r in results) for k in ("PASS", "FAIL", "UNBOUND", "ERROR", "SKIP", "NA")}
     body.append("counts: " + " ".join(f"{k}={v}" for k, v in counts.items()))
     path = ev.write_result("\n".join(body) + "\n")
     return JourneyResult(status, results, path)

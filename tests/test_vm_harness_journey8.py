@@ -6,6 +6,7 @@ import hashlib
 import inspect
 import io
 import re
+import subprocess
 
 import pytest
 
@@ -283,3 +284,34 @@ def test_adopt_prints_took_in_the_shape_the_verdict_expects():
     assert re.fullmatch(J.V_ADOPT.pattern, f"took head: refs/x/y -> {OID}")
     assert re.fullmatch(J.V_ADOPT.pattern, "took head: refs/x/y -> " + "2" * 64)
     assert not re.fullmatch(J.V_ADOPT.pattern, f"took wip: refs/x/y -> {OID}")
+
+
+# ---- L1 fixes ---------------------------------------------------------------------------------------------------------
+
+def test_a_step_subset_is_partial_and_lists_what_it_left_out(tmp_path):
+    cells = {o: Cell("vm", Verdict(0, "ok-.*"), Probe(("session", "adopt", "{session}"))) for o in J.OS_NAMES}
+    steps = (Step("A1", "one", cells), Step("A2", "two", cells))
+    g = FakeGuest({"session adopt": ("ok-1", 0)})
+    res = run(tmp_path, g, steps=steps, only=["A1"])
+    text = res.result_path.read_text()
+    assert res.status == "PARTIAL" and not res.ok and text.splitlines()[0] == "RESULT: PARTIAL"
+    assert "omitted: A2" in text
+    assert RB.overall(["PASS"], ["J01"]) == "PARTIAL" and RB.overall(["PASS", "FAIL"], ["J01"]) == "FAIL"
+    assert RB.overall(["PASS"]) == "PASS"
+
+
+def test_a_timeout_is_an_error_step_incomplete_not_a_crash_and_not_a_fail(tmp_path):
+    g = FakeGuest({"session adopt": (subprocess.TimeoutExpired(["ssh"], 300), 0), "session discard": (f"discard {SID}: done (x)", 0),
+                   "session restore": (f"restore {SID}: done (x)", 0)})
+    res = run(tmp_path, g)
+    r = {x.id: x for x in res.steps}["J06"]
+    assert r.status == "ERROR" and "TimeoutExpired" in r.detail and "300" in r.detail
+    assert res.status == "INCOMPLETE" and "TimeoutExpired" in res.result_path.read_text()
+
+
+def test_capture_tolerates_output_with_no_trailing_newline_and_a_blank_line():
+    def real(argv, timeout=60):
+        return subprocess.run(argv, capture_output=True, text=True).stdout
+    assert RB.capture(real, ["printf", "tail"]) == (["tail"], 0)        # glued to the marker before the fix
+    assert RB.capture(real, ["/bin/sh", "-c", "echo a; exit 7"]) == (["a"], 7)
+    assert RB.capture(lambda a, timeout=60: f"x\n\n{RB.RC_MARK} 0\n", ["q"]) == (["x"], 0)

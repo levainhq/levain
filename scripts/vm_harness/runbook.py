@@ -28,8 +28,9 @@ from typing import Callable, Iterable, Sequence
 
 RC_MARK = "JOURNEY-RC"
 #: ``"$@"`` runs the probe argv with no shell parsing of its words; stderr joins stdout so a refusal (which levain writes to
-#: stderr) is a raw line; the exit code is printed on the last line, so a failing probe is data, not a transport error.
-CAPTURE_ARGV = ("/bin/sh", "-c", '"$@" 2>&1; echo "' + RC_MARK + ' $?"', "sh")
+#: stderr) is a raw line; the exit code is printed on the last line, so a failing probe is data, not a transport error. A
+#: newline is printed first, so a probe whose output lacks a trailing newline cannot glue its last line to the marker.
+CAPTURE_ARGV = ("/bin/sh", "-c", '"$@" 2>&1; rc=$?; printf "\\n"; echo "' + RC_MARK + ' $rc"', "sh")
 
 Guest = Callable[..., str]
 StdinRunner = Callable[[Sequence[str], str, float], str]
@@ -70,7 +71,10 @@ def capture(guest: Guest, argv: Sequence[str], timeout: float = 120) -> tuple[li
         rc = int(lines[-1].split()[1])
     except (IndexError, ValueError):
         raise RunbookError(f"unreadable exit-code line {lines[-1]!r}") from None
-    return lines[:-1], rc
+    body = lines[:-1]
+    while body and not body[-1].strip():      # the wrapper's own newline (and any blank tail) is not probe output
+        body.pop()
+    return body, rc
 
 
 def pick_line(lines: Sequence[str], select: str | None) -> str | None:
@@ -146,15 +150,19 @@ class Evidence:
         return p
 
 
-def overall(statuses: Sequence[str]) -> str:
-    """FAIL beats INCOMPLETE beats PASS. ``statuses`` are per-step words; SKIP and NA count as neither pass nor fail."""
+def overall(statuses: Sequence[str], omitted: Sequence[str] = ()) -> str:
+    """REFUSED beats FAIL beats INCOMPLETE beats PARTIAL beats PASS. ``statuses`` are per-step words; SKIP and NA count as
+    neither pass nor fail; UNBOUND and ERROR (a step that timed out or whose transport broke, no verdict observed) make the
+    run INCOMPLETE. ``omitted`` are the step ids a ``--step`` subset left out: with any, the word is never plain PASS."""
+    if any(s == "REFUSED" for s in statuses):
+        return "REFUSED"
     if any(s == "FAIL" for s in statuses):
         return "FAIL"
-    if any(s == "UNBOUND" for s in statuses):
+    if any(s in ("UNBOUND", "ERROR") for s in statuses):
         return "INCOMPLETE"
     if not any(s == "PASS" for s in statuses):
         return "INCOMPLETE"       # nothing ran: not a pass
-    return "PASS"
+    return "PARTIAL" if omitted else "PASS"
 
 
 # ---- the stdin transport (a secret never goes in an argv) ----------------------------------------------------------

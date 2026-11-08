@@ -4,7 +4,9 @@ not the Monday sitting."""
 from __future__ import annotations
 
 import json
+import os
 import re
+import subprocess
 
 import pytest
 
@@ -25,8 +27,8 @@ class World:
     """One fake guest + one fake provider. ``usage`` is the provider's books (microdollars); a call adds ``charge`` to the
     lineage and, after ``lag`` reads of the key status, to ``usage``."""
 
-    def __init__(self, charge=250_000, lineage_charge=None, lag=0, overrun=True, doctor_exc=None):
-        self.files = {}                     # cred name -> credential json text
+    def __init__(self, charge=250_000, lineage_charge=None, lag=0, overrun=True, doctor_exc=None, preexisting=None):
+        self.files = dict(preexisting or {})  # cred name -> credential json text
         self.argvs = []                     # every argv any call saw (a secret must never be in one)
         self.stdins = []
         self.rows = []
@@ -92,6 +94,8 @@ class World:
         script, store, name = argv[4], argv[6], argv[7]
         assert store == STORE
         if script == T.INSTALL_SCRIPT:
+            if argv[8] != "replace" and name in self.files:
+                return f"cred-refused {name}: already exists\n"
             self.files[name] = text
             return f"cred-installed {name}\n"
         if script == T.REMOVE_SCRIPT:
@@ -220,11 +224,11 @@ def test_provider_settling_late_is_waited_for(tmp_path):
     assert by_id(steps)["T3"].status == "PASS" and by_id(steps)["T3"].raw.count("provider_delta_microdollars=250000") == 1
 
 
-def test_a_provider_that_never_moves_is_a_disagreement(tmp_path):
+def test_a_provider_that_never_moves_is_nomove_not_an_agreement(tmp_path):
     w = World(lag=10_000)
     w2, ev, (status, steps, path) = go(tmp_path, w, settle_wait_s=3.0)
     t3 = by_id(steps)["T3"]
-    assert t3.status == "FAIL" and t3.raw.startswith("DISAGREE") and "provider_delta_microdollars=0" in t3.raw
+    assert t3.status == "FAIL" and t3.raw.startswith("NOMOVE") and "provider_delta_microdollars=0" in t3.raw
     assert status == "FAIL"
 
 
@@ -327,3 +331,89 @@ def test_a_bad_credential_name_refuses_before_any_evidence(tmp_path):
     with pytest.raises(RB.RunbookError):
         T.run_3c10(lambda *a, **k: "", lambda *a: "", ev, T.Config(DARWIN, "/i", "Bad Name"))
     assert list(ev.iterdir()) == []
+
+
+# ---- L1 fixes ---------------------------------------------------------------------------------------------------------
+
+def test_a_small_lineage_total_against_an_unmoved_provider_is_not_an_agreement(tmp_path):
+    # lineage 500 < the 1000 microdollar floor, provider books unmoved: the old tolerance test said AGREE
+    _w, _ev, (status, steps, _p) = go(tmp_path, World(charge=0, lineage_charge=500), settle_wait_s=3.0)
+    t3 = by_id(steps)["T3"]
+    assert t3.raw.startswith("NOMOVE") and t3.status == "FAIL" and status == "FAIL"
+
+
+def test_a_transport_failure_after_the_write_still_removes_the_credential(tmp_path):
+    w = World()
+    orig = w.stdin_run
+
+    def run(argv, text, timeout=60):
+        out = orig(argv, text, timeout)
+        if argv[4] == T.INSTALL_SCRIPT:
+            raise GuestError(255, "ssh dropped after the write")
+        return out
+
+    w.stdin_run = run
+    _w, ev, (status, steps, _p) = go(tmp_path, w)
+    assert by_id(steps)["T1"].status == "FAIL" and w.files == {}
+    assert "removed" in (ev / "steps.log").read_text()
+    assert ".json.new" in T.REMOVE_SCRIPT
+
+
+def _sh(tmp_path, script, name, mode, stdin):
+    """Run the REAL script under /bin/sh against a temp store; chown is a no-op stub (the sitting runs it as root)."""
+    store = tmp_path / "store"
+    (store / "keys" / "cred").mkdir(parents=True, exist_ok=True)
+    fb = tmp_path / "fakebin"
+    fb.mkdir(exist_ok=True)
+    (fb / "chown").write_text("#!/bin/sh\nexit 0\n")
+    os.chmod(fb / "chown", 0o755)
+    args = ["/bin/sh", "-c", script, "sh", str(store), name] + ([mode] if mode else [])
+    r = subprocess.run(args, input=stdin, capture_output=True, text=True, env=dict(os.environ, PATH=f"{fb}:{os.environ['PATH']}"))
+    return r, store / "keys" / "cred"
+
+
+def test_install_script_installs_a_new_credential(tmp_path):
+    r, d = _sh(tmp_path, T.INSTALL_SCRIPT, "k", "new", '{"a":1}')
+    assert r.returncode == 0 and r.stdout.strip() == "cred-installed k" and (d / "k.json").read_text() == '{"a":1}'
+    assert not (d / "k.json.new").exists()
+
+
+def test_install_script_refuses_an_existing_credential_and_leaves_it(tmp_path):
+    (tmp_path / "store" / "keys" / "cred").mkdir(parents=True)
+    (tmp_path / "store" / "keys" / "cred" / "k.json").write_text("HIS")
+    r, d = _sh(tmp_path, T.INSTALL_SCRIPT, "k", "new", '{"a":1}')
+    assert r.returncode == 0 and r.stdout.startswith("cred-refused k") and (d / "k.json").read_text() == "HIS"
+    assert not (d / "k.json.new").exists()
+    r, d = _sh(tmp_path, T.INSTALL_SCRIPT, "k", "replace", '{"a":2}')       # the sitting's own file may be replaced
+    assert r.stdout.strip() == "cred-installed k" and (d / "k.json").read_text() == '{"a":2}'
+
+
+def test_install_script_refuses_an_empty_credential(tmp_path):
+    r, d = _sh(tmp_path, T.INSTALL_SCRIPT, "k", "new", "")
+    assert r.stdout.startswith("cred-refused k: empty") and list(d.iterdir()) == []
+
+
+def test_remove_script_removes_the_half_written_file_too(tmp_path):
+    (tmp_path / "store" / "keys" / "cred").mkdir(parents=True)
+    d = tmp_path / "store" / "keys" / "cred"
+    (d / "k.json").write_text("x")
+    (d / "k.json.new").write_text("half")
+    r, d = _sh(tmp_path, T.REMOVE_SCRIPT, "k", None, "")
+    assert r.returncode == 0 and list(d.iterdir()) == []
+
+
+def test_a_refused_install_ends_refused_and_never_removes_his_file(tmp_path):
+    w = World(preexisting={CRED: "HIS"})
+    _w, ev, (status, steps, path) = go(tmp_path, w)
+    s = by_id(steps)
+    assert status == "REFUSED" and s["T1"].status == "REFUSED" and w.files == {CRED: "HIS"}
+    assert [s[i].status for i in ("T2", "T3", "T4", "T5", "T6")] == ["UNBOUND"] * 5
+    assert "RESULT: REFUSED" in path.read_text() and "cred-refused" in path.read_text()
+
+
+def test_an_overall_word_for_a_timeout_is_incomplete_and_names_it(tmp_path):
+    w = World(doctor_exc=subprocess.TimeoutExpired(["ssh"], 180))
+    _w, ev, (status, steps, path) = go(tmp_path, w)
+    t2 = by_id(steps)["T2"]
+    assert t2.status == "ERROR" and "TimeoutExpired" in t2.detail and status == "INCOMPLETE"
+    assert "RESULT: INCOMPLETE" in path.read_text() and w.files == {}
