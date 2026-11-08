@@ -28,3 +28,10 @@ def test_every_heavy_job_runs_when_the_gate_was_skipped_or_failed():
 def test_the_verified_job_needs_a_successful_gate_that_said_skip():
     cond = JOBS["verified"]["if"]
     assert "needs.gate.result == 'success'" in cond and "needs.gate.outputs.skip == 'true'" in cond
+
+
+def test_a_main_push_neither_cancels_nor_is_cancelled_by_another_main_push():
+    c = WF["concurrency"]
+    assert "github.sha" in c["group"] and "refs/heads/main" in c["group"]
+    assert "refs/heads/main" in str(c["cancel-in-progress"])  # the flag is an expression that is false for a main push
+    assert c["cancel-in-progress"] is not True

@@ -28,8 +28,10 @@ concurrency:
   # verdict the release gate reads (3e2aef8d, 11-05) nor is cancelled by the next dispatch; a push or PR run still
   # cancels the superseded run of the same ref. A scheduled run is grouped like a dispatch: a main push must not cancel
   # the nightly (a cancelled nightly is a missing flake check), nor the nightly a main push.
-  group: ${{ github.workflow }}-${{ github.ref }}-${{ (github.event_name == 'workflow_dispatch' || github.event_name == 'schedule') && github.run_id || 'ci' }}
-  cancel-in-progress: true
+  # A push to main is grouped by its sha and never cancels: each main sha's run is a verdict the release gate may read,
+  # so a newer main push must not cancel it. land/** and seat/** pushes and PRs keep cancelling the superseded run of the ref.
+  group: ${{ github.workflow }}-${{ github.ref }}-${{ (github.event_name == 'workflow_dispatch' || github.event_name == 'schedule') && github.run_id || (github.event_name == 'push' && github.ref == 'refs/heads/main') && github.sha || 'ci' }}
+  cancel-in-progress: ${{ !(github.event_name == 'push' && github.ref == 'refs/heads/main') }}
 
 env:
   # The one place the shard count is written. The `plan` job emits the matrix's shard list from it, and each
