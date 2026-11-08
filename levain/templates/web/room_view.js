@@ -581,6 +581,7 @@
         sendWait = false;
         if (stopped) return;
         if (LM.closeFailed && LM.closeFailed()) { note.textContent = "The dictation could not be finished, so nothing was sent. Your words so far are in the box; tap Send again."; return; }
+        if (LM.revoked && LM.revoked()) { note.textContent = "Premium voice was turned off, so nothing was sent. Your words so far are in the box; tap Send again."; return; }
         doSend();
       }); return; }
       doSend();

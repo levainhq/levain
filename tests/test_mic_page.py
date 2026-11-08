@@ -636,3 +636,39 @@ def test_a_worklet_module_that_never_loads_ends_the_session_at_its_deadline(tmp_
     ])
     st = _state(v[-1])
     assert st["sc"]["open"] == [] and [t["stopped"] for t in st["sc"]["tracks"]] == [1], st
+
+
+@needs_browser
+def test_send_that_stops_a_session_cut_short_by_a_revoke_sends_nothing(tmp_path, qdir) -> None:
+    """The key is revoked mid-dictation and the Send click's own stop flushes a tail chunk the server refuses `revoked`. The
+    words so far stay in the box and Send transmits nothing. Red with: the `s.revoked` flag (or room_view's LM.revoked() check)
+    removed, so the truncated transcript went out."""
+    v = _go(tmp_path, qdir, [
+        *LIVE, *ROOM, {"eval": WAV_OK + "window.__sc.chunkStatus = 503; window.__sc.chunkRevoked = true; window.__sc.chunkDelay = 800; 1"},
+        CLICK, {"until": "window.__sc.open.length === 1 && window.__sc.node"},
+        {"eval": "window.__feed(28800)"}, {"until": "window.__sc.chunks.length >= 1"},
+        {"eval": "document.querySelector('.rv-send').click(); 1"},
+        {"until": "!LevainMic.active()", "ms": 5000},
+        _wait(300),
+    ])
+    st = _state(v[-1])
+    assert st["sc"]["sends"] == [] and "nothing was sent" in (st["note"] or ""), st
+
+
+@needs_browser
+def test_a_stale_sessions_late_close_failure_does_not_block_the_next_sessions_stop(tmp_path, qdir) -> None:
+    """Session A breaks on a chunk, its recovery fails and its best-effort close hangs; session B starts and stops cleanly
+    while A's close is still pending. A's close times out afterwards. closeFailed() answers for B (false). Red with: closeFailed
+    back to a module variable (A's late timeout wrote true over B's clean stop, blocking B's finalized Send)."""
+    v = _go(tmp_path, qdir, [
+        *LIVE, {"eval": "window.__sc.chunkStatus = 500; window.__sc.hang.close = true; LevainMic.deadlines.close = 2500; 1"},
+        CLICK, {"until": "window.__sc.open.length === 1 && window.__sc.node"},
+        {"eval": "window.__feed(28800)"}, {"until": "!LevainMic.active()", "ms": 5000},
+        {"eval": "window.__sc.chunkStatus = 0; window.__sc.hang.close = false; 1"},
+        CLICK, {"until": "window.__sc.open.length === 2 && LevainMic.active()", "ms": 5000},
+        {"eval": "window.__feed(12000)"}, _wait(200),
+        CLICK, {"until": "!LevainMic.active()", "ms": 5000},
+        _wait(3000, "JSON.stringify({s: " + STATE + ", cf: LevainMic.closeFailed()})"),
+    ])
+    out = _state(v[-1])
+    assert out["cf"] is False, out

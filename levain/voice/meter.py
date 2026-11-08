@@ -152,6 +152,8 @@ DEFAULT_PRICES = PriceTable(
         PriceEntry("elevenlabs", "stt", "scribe", micros=220_000, per=3_600),            # $0.22 / hour
         PriceEntry("deepgram", "tts", "aura-2", micros=30_000, per=1_000),               # $0.030 / 1K characters
         PriceEntry("deepgram", "stt", "nova-3", micros=4_300, per=60),                   # $0.0043 / minute, pre-recorded
+        # https://deepgram.com/pricing, read 2026-11-08: Nova-3 Monolingual pay-as-you-go, Streaming $0.0077 / min
+        PriceEntry("deepgram", "stt", "nova-3-stream", micros=7_700, per=60),            # $0.0077 / minute, live WebSocket
         # https://inworld.ai/pricing, read 2026-11-05: Realtime TTS-2 Flash on the On-Demand plan, per 1M characters
         PriceEntry("inworld", "tts", "inworld-tts-2-flash", micros=15_000_000, per=1_000_000),   # $15 / 1M characters
     ),

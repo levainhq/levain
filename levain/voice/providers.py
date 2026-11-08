@@ -102,7 +102,9 @@ OPENAI_STT_MODEL = "gpt-4o-mini-transcribe"
 # model they send), by the stream-open route (the model the ledger reserves and settles) and by the meter's price check, so
 # a stream cannot be sent as one model and priced as another. Past: openai's adapter sent gpt-live-transcribe while the
 # ledger reserved gpt-4o-mini-transcribe ($0.003 / min against $0.017 / min, 2026-11-07, https://developers.openai.com/api/docs/pricing).
-STREAM_STT_MODELS = {"openai": "gpt-live-transcribe", "deepgram": "nova-3"}
+# The VALUE is the LEDGER model. Deepgram's wire model stays "nova-3" (DEEPGRAM_STT_MODEL below), but its live WebSocket
+# bills at its own streaming rate, so the ledger row is "nova-3-stream" (https://deepgram.com/pricing, read 2026-11-08).
+STREAM_STT_MODELS = {"openai": "gpt-live-transcribe", "deepgram": "nova-3-stream"}
 OPENAI_DEFAULT_VOICE = "nova"
 DEEPGRAM_TTS_MODEL = "aura-2"                   # the priced family (levain.voice.meter.DEFAULT_PRICES)
 DEEPGRAM_TTS_VOICE = "aura-2-thalia-en"         # a model id, the default; one of DEEPGRAM_TTS_VOICES
@@ -123,7 +125,7 @@ DEEPGRAM_TTS_VOICES = (
     "aura-2-saturn-en", "aura-2-selene-en", "aura-2-thalia-en", "aura-2-theia-en", "aura-2-vesta-en",
     "aura-2-zeus-en",
 )
-DEEPGRAM_STT_MODEL = STREAM_STT_MODELS["deepgram"]
+DEEPGRAM_STT_MODEL = "nova-3"                   # the wire model, for the pre-recorded POST and the live socket alike
 INWORLD_TTS_MODEL = "inworld-tts-2-flash"       # the priced model (levain.voice.meter.DEFAULT_PRICES); the Flash tier
 INWORLD_AUTH_SCHEME = "Bearer"                  # "Basic" is the other documented form for the same key (module docstring)
 # The built-in voice ids a page of Inworld's docs prints (Dennis: the route page's example; Alex, Ashley and Dennis: the list
