@@ -2695,7 +2695,8 @@ class Reserve:
         does not guarantee: space taken by other writers after entry, or by metadata beyond the margin."""
         if self.current() >= self.size:
             return True
-        if free_bytes() <= floor:
+        start = free_bytes() - floor - _REFILL_MARGIN
+        if start <= 0:     # the file's own metadata is charged to the host too, so nothing is opened or created here
             return False
         created = not os.path.lexists(self.path)
         fd = os.open(self.path, os.O_WRONLY | os.O_CREAT | os.O_NOFOLLOW | os.O_CLOEXEC, 0o600)
@@ -2704,7 +2705,7 @@ class Reserve:
             cur = os.fstat(fd).st_size
             os.lseek(fd, cur, os.SEEK_SET)
             zeros = bytes(_CHUNK)
-            head = free_bytes() - floor - _REFILL_MARGIN
+            head = min(start, free_bytes() - floor - _REFILL_MARGIN)
             try:
                 while cur < self.size:
                     # never write past the floor: a refill that starves the host would make the next pass BRAKE

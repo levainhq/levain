@@ -1102,3 +1102,14 @@ def test_facts_from_alloc(tmp_path):
                 {k: v for k, v in alloc.items() if k != "auth"}):
         with pytest.raises(Refused):
             facts_from_alloc(bad, store=tmp_path)
+
+
+def test_reserve_refill_at_floor_plus_one_opens_and_writes_nothing(tmp_path):
+    """5c-1 r2 (codex): free space inside the margin above the floor must not even create the reserve, since the
+    file's own metadata is charged to the host."""
+    floor = 8 << 30
+    r = Reserve(tmp_path / "reserve", size=8 << 20)
+    assert r.refill(lambda: floor + 1, floor=floor) is False
+    assert not os.path.lexists(tmp_path / "reserve")
+    assert r.refill(lambda: floor + end_mod._REFILL_MARGIN, floor=floor) is False
+    assert not os.path.lexists(tmp_path / "reserve")
