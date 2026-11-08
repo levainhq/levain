@@ -444,7 +444,10 @@ def test_a_snoozed_row_is_projected_as_later_in_the_payload_and_the_summary(stor
     assert second["options"] == [] and second["rec"] is None and second["subject"]["id"] == b.id
     sm = band_view.summary(store)
     assert sm["count"] == 1 and [i["later"] for i in sm["items"]] == [None, "2026-11-09"]
-    assert band_view.band_payload(Host(), "cockpit:web")["items"][0]["options"]       # a host's rows pass through
+    items = {i["n"]: i for i in band_view.band_payload(Host(), "cockpit:web")["items"]}
+    assert items[380]["options"] and items[381]["options"]       # a host's due rows (a garbage snooze is due) pass through
+    held = {e[1]["n"]: e[1] for e in band_view._foreign_snapshot(Host(), True, 0, NOW).entries}
+    assert held[343]["later"] == "2026-11-08" and held[343]["options"] == []   # L3: a foreign future snooze is LATER here too
 
 
 def test_the_payload_carries_flows_two_fields_raw(store):

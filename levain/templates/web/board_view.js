@@ -41,7 +41,8 @@
             return {
               id: String(k.id), title: k.title == null ? "" : String(k.title), repo: k.repo || "",
               tier: k.tier || "", held: k.held_reason || "", number: k.number == null ? null : k.number,
-              band: k.band === true, later: k.later ? String(k.later) : "", laterLabel: k.later_label ? String(k.later_label) : "", source: k.source || "", blocks: k.blocks || "",
+              band: k.band === true, later: k.band === true && typeof k.later === "string" && /^\d{4}-\d{2}-\d{2}$/.test(k.later) ? k.later : "",
+              laterLabel: k.band === true && typeof k.later === "string" && /^\d{4}-\d{2}-\d{2}$/.test(k.later) && typeof k.later_label === "string" ? k.later_label.slice(0, 80) : "", source: k.source || "", blocks: k.blocks || "",
               malformed: k.well_formed === false, unknownCategory: k.unknown_category || "",
               done: k.done_line == null ? "" : String(k.done_line),
               dependsOn: Array.isArray(k.depends_on)
@@ -60,7 +61,7 @@
   function termsOf(q) { return fold(q || "").split(/\s+/).filter(Boolean); }
   function hayOf(col, k) {
     return fold([col.category, k.number != null ? k.number : "", k.title, k.repo, k.tier, k.source, k.id, k.held, k.blocks,
-      k.unknownCategory, k.done && "done when: " + k.done, k.dependsOn.length ? "after: " + k.dependsOn.join(", ") : "",
+      k.unknownCategory, k.later && "later", k.later && k.laterLabel, k.later, k.done && "done when: " + k.done, k.dependsOn.length ? "after: " + k.dependsOn.join(", ") : "",
       k.held && "held: " + k.held, k.malformed ? "not well formed" : "", k.journal].filter(function (x) { return x !== "" && x != null; }).join(" "));
   }
   // The model narrowed to the cards a query matches (the columns stay, so a column with no match still says so), with the
@@ -169,7 +170,7 @@
       col.cards.forEach(function (k) {
         var row = el(doc, "div", "bd-row" + (k.later ? " bd-later" : ""));
         row.dataset.id = k.id;
-        if (k.later) { row.appendChild(el(doc, "div", "bd-title", "LATER: " + (k.laterLabel || k.later) + " " + laterWords(k.title))); wrap.appendChild(row); return; }
+        if (k.later) { row.appendChild(el(doc, "div", "bd-title", "LATER: " + (k.laterLabel || k.later) + " " + laterWords(k.title))); drawDrop(doc, row, k, model); wrap.appendChild(row); return; }
         row.appendChild(el(doc, "div", "bd-title", (k.number != null ? k.number + ". " : "") + (String(k.title == null ? "" : k.title).replace(/^\s*DESK OWES:\s*/i, "") || String(k.title == null ? "" : k.title))));
         var meta = [k.repo, k.tier, k.source, k.id].filter(Boolean).join(" · ");
         if (meta) row.appendChild(el(doc, "div", "bd-meta", meta));
@@ -202,7 +203,7 @@
       col.cards.forEach(function (k) {
         var card = el(doc, "article", "bd-card" + (k.later ? " bd-later" : ""));
         card.dataset.id = k.id;
-        if (k.later) { card.appendChild(el(doc, "div", "bd-title", "LATER: " + (k.laterLabel || k.later) + " " + laterWords(k.title))); c.appendChild(card); return; }
+        if (k.later) { card.appendChild(el(doc, "div", "bd-title", "LATER: " + (k.laterLabel || k.later) + " " + laterWords(k.title))); drawDrop(doc, card, k, model); c.appendChild(card); return; }
         card.appendChild(el(doc, "div", "bd-title", (k.number != null ? k.number + ". " : "") + (String(k.title == null ? "" : k.title).replace(/^\s*DESK OWES:\s*/i, "") || String(k.title == null ? "" : k.title))));
         var meta = [k.repo, k.tier, k.source, k.id].filter(Boolean).join(" · ");
         if (meta) card.appendChild(el(doc, "div", "bd-meta", meta));

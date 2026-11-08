@@ -74,7 +74,7 @@ def _band_cards(question_store: Any) -> tuple[list[dict[str, Any]], str | None]:
             card.update(title=_text(str(q.what)[:_WHAT_MAX]), source=band_view._tag(q), blocks=q.blocks, filed_at=q.filed_at)
             lat = band_view.later_of(question_store, q, numbers.get(ref))
             if lat is not None:       # a snoozed question: one collapsed LATER card, no blocks (row 131)
-                card.update(later=lat[0], later_label=lat[1], blocks="")
+                card.update(later=lat[0], later_label=_text(lat[1]), blocks="")
         cards.append(card)
     return cards, None
 

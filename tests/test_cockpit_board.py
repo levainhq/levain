@@ -478,3 +478,33 @@ def test_a_snoozed_question_is_one_later_card_not_an_actionable_one(filled):
     assert lat["band"] is True                                   # still an open, numbered band card (answerable by number)
     item = next(i for i in payload["items"] if i["what"] == "Snoozed question")
     assert item["later"] == day and item["later_label"] == lat["later_label"] and item["options"] == []
+
+
+@pytest.mark.skipif(shutil.which("node") is None, reason="node is not installed")
+def test_later_cards_keep_their_drop_and_are_recognised_only_as_band_cards_with_a_real_day():
+    """L3 later round: a LATER card keeps 'Drop about this card' in both bodies; `later` is read only for band === true with
+    an ISO day; the label is bounded; the filter finds `later` and the day."""
+    r = _harness_run()["laterCards"]
+    assert r["later"] == ["2026-11-09", "", "", "2026-11-09"]
+    assert r["labelLen"] == 80
+    assert r["groupedDrops"] == ["band:a", "band:b", "band:c", "band:d"] and r["colDrops"] == r["groupedDrops"]
+    assert r["found"] == 2
+
+
+def test_a_malformed_snooze_is_due_on_every_surface_and_a_foreign_row_agrees_with_the_board(filled):
+    """L3 later round: one fail-open path (`_later_pair`); a foreign store's future snooze is LATER in the payload too."""
+    from datetime import datetime, timedelta
+    from types import SimpleNamespace
+
+    from levain import band_view
+    from levain.consent.questions import local_today
+    q = SimpleNamespace(snoozed_until=object(), dated=None)
+    assert band_view._later_pair(q, 1, "2026-11-07") is None
+    day = (datetime.fromisoformat(local_today(datetime.now().astimezone())) + timedelta(days=3)).date().isoformat()
+    ok = SimpleNamespace(snoozed_until=day, dated=None)
+    assert band_view._later_pair(ok, 4, local_today(datetime.now().astimezone())) == band_view.later_of(
+        SimpleNamespace(), ok, 4)
+    qs = QuestionStore(filled)
+    _file(qs, what="Bad", agent_session_id="s1")
+    item = band_view._question_item(next(iter(band_view._read(qs)[0]))[1], 1, None, True, "2026-11-07")[1]
+    assert "later" not in item
