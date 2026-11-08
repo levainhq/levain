@@ -438,13 +438,13 @@ def test_kitty_entries_pushed_on_the_alternate_screen_are_popped_there_before_it
 def test_kitty_entries_left_on_an_alternate_screen_the_slot_already_left_are_reached_by_entering_it() -> None:
     f = TermFilter()
     f.feed(b"\x1b[?1049h\x1b[>1u\x1b[?1049l")
-    assert f.reset() == b"\x1b[?1049h\x1b[<1u\x1b[?1049l"
+    assert f.reset() == b"\x1b[?47h\x1b[<1u\x1b[?47l"      # the non-clearing pair: 1049h would clear that screen
 
 
-def test_every_alternate_screen_mode_set_is_left_in_one_sequence() -> None:
+def test_the_alternate_screen_is_left_once_by_the_mode_that_entered_it_from_main() -> None:
     f = TermFilter()
     f.feed(b"\x1b[?47h\x1b[?1049h\x1b[?1h\x1b[>4;2m")
-    assert f.reset() == b"\x1b[?1049;47l\x1b[?1l\x1b[>4m"
+    assert f.reset() == b"\x1b[?47l\x1b[?1l\x1b[>4m"
 
 
 def test_supervisor_resets_passed_modes_when_the_session_ends(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -822,7 +822,7 @@ def test_a_kitty_set_is_undone_by_zeroing_only_when_the_slot_had_nothing_pushed(
     (b"\x1b[<3u", b"", b""),
     (b"\x1b[>1u\x1b[<u", b"\x1b[>1u\x1b[<u", b""),    # within the pushes: passed as written
     (b"\x1b[>1u\x1b[<0u", b"\x1b[>1u", b"\x1b[<1u"),  # a pop of 0: terminals differ on it, dropped
-    (b"\x1b[?1049h\x1b[>1u\x1b[?1049l\x1b[<1u", b"\x1b[?1049h\x1b[>1u\x1b[?1049l", b"\x1b[?1049h\x1b[<1u\x1b[?1049l"),
+    (b"\x1b[?1049h\x1b[>1u\x1b[?1049l\x1b[<1u", b"\x1b[?1049h\x1b[>1u\x1b[?1049l", b"\x1b[?47h\x1b[<1u\x1b[?47l"),
 ])
 def test_the_filter_never_passes_a_kitty_pop_beyond_the_slots_own_pushes(data, passed, undo) -> None:
     f = TermFilter()
@@ -850,3 +850,32 @@ def test_kitty_entries_on_an_alternate_screen_the_slot_is_still_on_leave_only_th
     f = TermFilter()
     f.feed(data)
     assert f.reset() == undo
+
+
+# --- prel3fix L3 r1 A1: the screen the terminal is on is one state, and kitty entries are charged to it ---------------
+
+@pytest.mark.parametrize("data, passed, undo", [
+    # codex-1: 1047l returns the terminal to the main screen, so the second push lands on the main stack
+    (b"\x1b[?1049h\x1b[>1u\x1b[?1047l\x1b[>2u", b"\x1b[?1049h\x1b[>1u\x1b[?1047l\x1b[>2u",
+     b"\x1b[?47h\x1b[<1u\x1b[?47l\x1b[<1u"),
+    # complement-2: 47h while on the alternate screen, then 1049l: the terminal is back on main
+    (b"\x1b[?1049h\x1b[?47h\x1b[?1049l\x1b[>1u", b"\x1b[?1049h\x1b[?47h\x1b[?1049l\x1b[>1u", b"\x1b[<1u"),
+    # complement-2: after XTRESTORE of an alternate-screen mode the screen is unknown: a kitty push is not passed,
+    # and teardown visits both stacks, landing on main
+    (b"\x1b[?1049h\x1b[>1u\x1b[?1049l\x1b[?1049r\x1b[>2u", b"\x1b[?1049h\x1b[>1u\x1b[?1049l\x1b[?1049r",
+     b"\x1b[?47h\x1b[<1u\x1b[?47l"),
+    (b"\x1b[>1u\x1b[?47r", b"\x1b[>1u\x1b[?47r", b"\x1b[?47l\x1b[<1u"),
+    (b"\x1b[>1u\x1b[?1049r\x1b[<1u\x1b[=5u", b"\x1b[>1u\x1b[?1049r", b"\x1b[?47l\x1b[<1u"),
+    # an unknown screen is known again after the next alternate-screen DECSET or DECRST
+    (b"\x1b[?1049r\x1b[?1049l\x1b[>1u", b"\x1b[?1049r\x1b[?1049l\x1b[>1u", b"\x1b[<1u"),
+    (b"\x1b[?1049r\x1b[?1049h\x1b[>1u", b"\x1b[?1049r\x1b[?1049h\x1b[>1u", b"\x1b[<1u\x1b[?1049l"),
+    # codex-6: the alternate stack is revisited with the non-clearing 47 pair, never 1049 (which clears that screen)
+    (b"\x1b[?47h\x1b[>1u\x1b[?47l", b"\x1b[?47h\x1b[>1u\x1b[?47l", b"\x1b[?47h\x1b[<1u\x1b[?47l"),
+    # left by the mode that entered it from main: 1049l restores the cursor 1049h saved there
+    (b"\x1b[?1049h\x1b[?47h\x1b[>1u", b"\x1b[?1049h\x1b[?47h\x1b[>1u", b"\x1b[<1u\x1b[?1049l"),
+])
+def test_kitty_entries_are_charged_to_the_screen_the_terminal_is_on(data, passed, undo) -> None:
+    f = TermFilter()
+    assert f.feed(data) == passed
+    assert f.reset() == undo
+    assert f.reset() == b""

@@ -97,7 +97,9 @@ _REPORTING_MODES = frozenset({9, 1000, 1001, 1002, 1003, 1004, 1005, 1006, 1015,
 #: he sees (47, 1047, 1049: the alternate screen). They pass and are reset when the session ends, like the above.
 _KEY_MODES = frozenset({1})
 _ALT_SCREEN_MODES = frozenset({47, 1047, 1049})
-_TRACKED_MODES = _REPORTING_MODES | _KEY_MODES | _ALT_SCREEN_MODES
+_TRACKED_MODES = _REPORTING_MODES | _KEY_MODES
+#: the screen the terminal is on is not known (an XTRESTORE of an alternate-screen mode restores whatever was saved)
+_SCREEN_UNKNOWN = -1
 _OSC_COLOUR = frozenset({4, 104, *range(10, 20), *range(110, 120)})
 _ASCII_RUN = re.compile(rb"[\x00-\x04\x06-\x1a\x1c-\x7f]+")
 _CSI_MAX = 256        # DECISION: a CSI longer than this is no sequence a terminal answers; it is dropped whole
@@ -122,6 +124,9 @@ class TermFilter:
         self._taint = False          # the OSC being parsed is dropped at its terminator
         self._over = False           # the OSC payload passed _OSC_MAX: discard to the terminator
         self._modes: set = set()     # _TRACKED_MODES the filter passed set and not since reset
+        # the screen the terminal is on, one state for 47, 1047 and 1049 alike: 0 main; on the alternate screen, the
+        # mode that entered it from main (its DECRST leaves it the way it was entered); or _SCREEN_UNKNOWN
+        self._screen = 0
         # per screen (False main, True alternate: the kitty keyboard protocol keeps one stack each): the pushes the
         # filter passed and no pop since undid, and whether a set (``CSI = flags u``) changed the top entry
         self._kitty_pushes = {False: 0, True: 0}
@@ -158,22 +163,28 @@ class TermFilter:
         another encoding, or on the slot's screen.
 
         Order: the alternate screen's kitty entries are undone while on it, then the alternate screen is left, then
-        the main screen's entries are undone. Pops undo exactly the pushes the slot made (the filter passes no pop of
+        the main screen's entries are undone. The alternate screen is left by the DECRST of the mode that entered it
+        from main; a stack on an alternate screen the slot already left is reached with the non-clearing ``?47h`` /
+        ``?47l`` pair (1049 would clear that screen). With the screen unknown (an XTRESTORE of an alternate-screen
+        mode), the alternate stack is visited the same way and ``?47l`` lands on main before the main stack's pops
+        (the filter passes no kitty sequence while the screen is unknown, so every recorded entry is on a known
+        stack). Pops undo exactly the pushes the slot made (the filter passes no pop of
         the slot's beyond them, and no push past :data:`_KITTY_PUSH_MAX`), so an entry the operator's own shell
         pushed before the session survives; only when the slot SET flags in place with none of its own
         pushes outstanding (which overwrites an entry it may not own) are the current flags zeroed (``CSI = 0 u``,
         which acts with nothing pushed too). A set on an entry the slot pushed is undone by its pop."""
         out = bytearray()
-        alt = self._modes & _ALT_SCREEN_MODES
-        if self._kitty_pushes[True] or self._kitty_set[True]:
-            if not alt:
-                out += b"\x1b[?1049h"   # the alternate screen's stack is reached only from that screen
-                alt = {1049}            # and left the way it was entered: no 1049l without a matching 1049h
-            out += self._kitty_undo(True)
-        if alt:
-            out += b"\x1b[?" + ";".join(map(str, sorted(alt, reverse=True))).encode("ascii") + b"l"
+        screen, self._screen = self._screen, 0
+        if screen not in (0, _SCREEN_UNKNOWN):
+            out += self._kitty_undo(True) + b"\x1b[?%dl" % screen
+        else:
+            visit = bool(self._kitty_pushes[True] or self._kitty_set[True])
+            if visit:
+                out += b"\x1b[?47h" + self._kitty_undo(True)   # the alternate stack is reached only from that screen
+            if visit or screen == _SCREEN_UNKNOWN:
+                out += b"\x1b[?47l"
         out += self._kitty_undo(False)
-        modes = sorted(self._modes - _ALT_SCREEN_MODES)
+        modes = sorted(self._modes)
         if modes:
             out += b"\x1b[?" + ";".join(map(str, modes)).encode("ascii") + b"l"
         for pp in sorted(self._modkeys):
@@ -314,14 +325,23 @@ class TermFilter:
         if prefix == b"?" and final in (b"h", b"l", b"r"):
             # DECSET / DECRST (``CSI ? Pm h|l``) and XTRESTORE (``CSI ? Pm r``, which may set any mode it restores)
             for p in params:
-                if p.isdigit() and int(p) in _TRACKED_MODES:
+                if p.isdigit() and int(p) in _ALT_SCREEN_MODES:
+                    if final == b"r":
+                        self._screen = _SCREEN_UNKNOWN
+                    elif final == b"l":
+                        self._screen = 0                # any of the three returns the terminal to main
+                    elif self._screen in (0, _SCREEN_UNKNOWN):
+                        self._screen = int(p)
+                elif p.isdigit() and int(p) in _TRACKED_MODES:
                     if final == b"l":
                         self._modes.discard(int(p))
                     else:
                         self._modes.add(int(p))
         elif final == b"u" and prefix in (b">", b"<", b"="):
             # the kitty keyboard protocol: push (``CSI > flags u``), pop (``CSI < n u``), set (``CSI = flags ; mode u``)
-            screen = bool(self._modes & _ALT_SCREEN_MODES)
+            if self._screen == _SCREEN_UNKNOWN:
+                return b""                              # which stack it would reach is not known: not passed
+            screen = self._screen != 0
             pushes = self._kitty_pushes[screen]
             if prefix == b">":
                 if pushes >= _KITTY_PUSH_MAX:
