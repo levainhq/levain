@@ -100,6 +100,9 @@ def _panel_lines(head: dict[str, Any], panel: dict[str, Any] | None, now: dateti
     if head.get("note"):
         out.append((NOTE, _fit(f"  {visible(head['note'])}", width)))
     searched = bool(panel.get("search_error") or panel.get("match_label"))
+    if status == "empty" and head.get("id") == "tray" and not searched \
+            and any(r.get("group") in LIST_APART for r in panel.get("rows") or []):
+        status = "ok"           # the List's DESK OWES / LATER rows are uncounted, so a List of only those reads empty: draw them
     if status == "empty":
         if not searched:
             out.append((DIM, _fit(f"  {visible(head.get('empty') or 'Nothing here.')}", width)))

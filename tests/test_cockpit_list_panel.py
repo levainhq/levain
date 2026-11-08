@@ -434,3 +434,19 @@ def test_listpanel_r6_a_band_rows_age_reads_the_refile_clock_in_the_footers_form
     assert {r["id"]: r for r in rig.panel()["rows"]}[f"band:{rig.q.id}"]["facets"]["band_age"] == "3h"
     _band_with(monkeypatch, rig, section="you", filed_at=_iso(-0.5), section_since="")
     assert {r["id"]: r for r in rig.panel()["rows"]}[f"band:{rig.q.id}"]["facets"]["band_age"] == "30m"
+
+
+# --- 531 round 7 (levain 76, lpr3): L3 r1 fixes --------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("fields,heading", [({"section": "desk", "carried": False}, "Desk owes"),
+                                            ({"snoozed_until": (TODAY + timedelta(days=3)).isoformat()}, "Later")])
+def test_lpr3_a_list_holding_only_desk_or_later_rows_draws_them_in_the_text_cockpit(tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+                                                                                  fields: dict, heading: str) -> None:
+    """Both groups are uncounted, so a List with nothing else is classified empty; the text view must still draw its rows."""
+    from levain.cockpit.text import render_lines, snapshot
+
+    r = Rig(tmp_path, spores=False, board=False)
+    _band_with(monkeypatch, r, **fields)
+    out = "\n".join(t for _s, t in render_lines(snapshot(r.ck), now=NOW))
+    assert heading in out and "Ship the sweep fix tonight?" in out, out
