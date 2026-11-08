@@ -258,8 +258,10 @@ class LinkProof:
 _ROW_KEYS = ("seq", "prev_hash", "record", "signer_fp", "signature")
 _EXPOSURE_KEYS = ("actions", "unit", "seconds", "tunnel_bytes")
 _LAUNCH_KEYS = ("occurrence_id", "session_key", "harness", "model", "brief", "auth", "exposure")
-#: OPTIONAL on the wire (an absent member is None), so a client that stages no workspace sends the frame it always sent
-_LAUNCH_OPTIONAL = ("workspace",)
+#: OPTIONAL on the wire (an absent member is None), so a client that stages no workspace, or prices no brokered run
+#: (``usd_micros``: the dollars the fire's reservation took, which the server only compares, never mints from),
+#: sends the frame it always sent
+_LAUNCH_OPTIONAL = ("workspace", "usd_micros")
 _WORKSPACE_KEYS = ("repo", "head", "withhold")
 _PROOF_KEYS = ("occurrence_id", "spec_hash", "link_id", "store_id", "born", "current")
 _PROOF_OPTIONAL = ("signed",)
@@ -289,6 +291,8 @@ def launch_to_wire(launch: SessionLaunch, proof: LinkProof) -> dict[str, object]
     ws = launch.workspace
     if ws is not None:         # the manifest digest is the server's own derivation and never travels (Workspace)
         body["workspace"] = {"repo": ws.repo, "head": ws.head, "withhold": list(ws.withhold)}
+    if launch.usd_micros is not None:
+        body["usd_micros"] = launch.usd_micros
     wire_proof = {"occurrence_id": proof.occurrence_id, "spec_hash": proof.spec_hash, "link_id": proof.link_id,
                   "store_id": proof.store_id, "born": _row_to_wire(proof.born), "current": _row_to_wire(proof.current)}
     if proof.signed is not None:
@@ -323,7 +327,8 @@ def launch_from_wire(request: Mapping[str, object]) -> tuple[SessionLaunch, Link
                            _str(lo["session_key"], "session_key", max_len=128),
                            _str(lo["harness"], "harness", max_len=64), _str(lo["model"], "model", max_len=256),
                            _str(lo["brief"], "brief", max_len=RUN_FRAME_MAX), _str(lo["auth"], "auth", max_len=32),
-                           exposure, workspace)
+                           exposure, workspace,
+                           _int(lo["usd_micros"], "launch.usd_micros") if "usd_micros" in lo else None)
     po = _exact(body["proof"], _PROOF_KEYS, "proof", optional=_PROOF_OPTIONAL)
     signed = None
     if "signed" in po:

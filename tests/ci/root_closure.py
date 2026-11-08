@@ -477,6 +477,14 @@ LAZY_SITES = {
     'levain/slot/services/dispatch_run.py::build_server::from levain.qbroker.peercred import peer_uid': 'root',
     # root: ``build_server`` runs in the dispatch run server's own process (``_levain_dispatch``, never the operator's), which is a service entry
     'levain/slot/services/dispatch_run.py::build_server::from levain.slot.dispatch_runtime import DispatchControlPort, HelperSlotRuntime': 'root',
+    # root: ``build_server`` runs in the dispatch run server's own process (``_levain_dispatch``, never the operator's), which is a service entry (PRE-W: the brokered launcher's spend reader, setting ON)
+    'levain/slot/services/dispatch_run.py::build_server::from levain.slot.dispatch_usage import lineage_spend_reader': 'root',
+    # root: ``build_server`` runs in the dispatch run server's own process (``_levain_dispatch``, never the operator's), which is a service entry (PRE-W: the lineage sink's name)
+    'levain/slot/services/dispatch_run.py::build_server::from levain.slot.lineage import SINK': 'root',
+    # root: ``supervisor_facts`` runs in the dispatch follower's own process (``follow_run.main``, ``_levain_dispatch``), which is a service entry (PRE-W)
+    'levain/dispatch/follow_run.py::supervisor_facts::from levain.slot.dispatch_runtime import DispatchControlPort': 'root',
+    # root: ``_parser`` runs in the dispatch run server's own process (``_levain_dispatch``, never the operator's), which is a service entry (PRE-W: the setting's path)
+    'levain/slot/services/dispatch_run.py::_parser::from levain.slot.layout import policy_dispatch_auth_path': 'root',
     # root: ``main`` runs in the dispatch run server's own process (``_levain_dispatch``, never the operator's), which is a service entry
     'levain/slot/services/dispatch_run.py::main::from levain.slot.layout import operator_record_path': 'root',
     # root: ``main`` runs in the dispatch run server's own process (``_levain_dispatch``, never the operator's), which is a service entry

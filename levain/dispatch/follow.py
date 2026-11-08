@@ -11,7 +11,8 @@ before the event, and the next follower's re-delivery converges the same way.
 Handled:
 
 - a ``state`` event into a terminal session state (``jobs._SESSION_TERMINAL``) that carries a verifier report digest or
-  refusal: :meth:`JobStore.record_verification` with the inputs the caller's ``resolve`` gives for it, then
+  refusal: :meth:`JobStore.record_verification` with the inputs the caller's ``resolve`` gives for it and the
+  follower's ``routemap`` and ``ticket_for`` (the backend identity's one source, F9a), then
   ``ARTIFACT-ACK {ticket, verifier_report_digest}`` (no digest for ``verifier_report_refused``). The ACK goes only
   when the store holds THIS event's outcome (written now, or :class:`levain.dispatch.jobs.AlreadyRecorded`: this
   ticket and this digest, never the digest alone); a run holding another report's or another ticket's record stops the
@@ -56,8 +57,8 @@ from typing import Any, Callable, Mapping
 
 from levain.dispatch import DispatchError
 from levain.dispatch.export import ArtifactIOError, ArtifactUnreadable, read_artifact
-from levain.dispatch.jobs import (_SESSION_TERMINAL, AlreadyRecorded, JobStore, RecordConflict, TransitionRefused,
-                                  report_of)
+from levain.dispatch.jobs import (_SESSION_TERMINAL, AlreadyRecorded, JobStore, RecordConflict, TicketFor,
+                                  TransitionRefused, report_of)
 from levain.dispatch.take import TakeFailed, take_artifact
 from levain.dispatch.verifier_report import VerifierRun
 from levain.slot import Refused
@@ -112,14 +113,22 @@ Resolve = Callable[[Mapping[str, Any]], "VerifierCall | None"]
 class EventFollower:
     """``jobs`` holds the cursor and the records; ``stream(after_seq, journal_id)`` opens SESSION-EVENTS and
     ``connect()`` a ControlClient for the ACK; ``resolve`` maps a verifier's terminal event to its inputs.
+    ``routemap(generation)`` is the gateway's own checked route map of that generation (``None`` when it cannot be
+    read) and ``ticket_for(job_id, run_index)`` the supervisor's own record of that run's executor ticket
+    (:data:`levain.dispatch.jobs.TicketFor`): every run record's backend identity is read from the map for that
+    ticket (F9a), never from what ``resolve`` returns; a follower missing either records no run, each failing closed
+    ``backend-unresolved`` (:meth:`JobStore.record_verification`).
     ``export_dir`` is root's ``export/dispatch`` directory (None: artifact events are passed unacked). ``fault``
     is the crash seam: called after (1) with ``("written", seq)``, or ``("repeat", seq)`` when the store already held
     the event's outcome (``("taken", seq)`` after an artifact's take), and with ``("acked", seq)`` after (2)."""
 
     def __init__(self, jobs: JobStore, stream: Callable[[int, str | None], CC.EventStream],
                  connect: Callable[[], CC.ControlClient], resolve: Resolve, *,
-                 export_dir: Path | str | None = None, fault: Callable[[str, int], None] | None = None) -> None:
+                 export_dir: Path | str | None = None, fault: Callable[[str, int], None] | None = None,
+                 routemap: Callable[[int], Any] | None = None, ticket_for: TicketFor | None = None) -> None:
         self.jobs = jobs
+        self.routemap = routemap
+        self.ticket_for = ticket_for
         self._export_dir = export_dir
         self._stream = stream
         self._connect = connect
@@ -273,7 +282,8 @@ class EventFollower:
         seam = "written"
         try:
             self.jobs.record_verification(call.run, envelope=call.envelope, event=body, repo=call.repo,
-                                          tree=call.tree, model=call.model)
+                                          tree=call.tree, model=call.model, routemap=self.routemap,
+                                          ticket_for=self.ticket_for)
         except AlreadyRecorded:
             seam = "repeat"                            # an idempotent repeat: dispatch holds this outcome, so ACK
         except RecordConflict as e:
