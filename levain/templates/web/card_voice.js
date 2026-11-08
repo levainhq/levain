@@ -1,7 +1,7 @@
 // levain card_voice.js — reading a Needs-you card aloud: the card script and the speaker on the opened card (voice V1-7;
 // design project_memory/1104-voice/V1_DESIGN.md section 4.3).
 //
-// script(what, options, rec) is the NPCardVoice port (flowConnect's Shared/NPCardVoice.swift, removed 1105-13): the headline
+// script(what, options, rec) is the NPCardVoice port (the native app's Shared/NPCardVoice.swift, removed 1105-13): the headline
 // verbatim (card_format.js headline, the card's first sentence), then each option as "<key>, <its full text>", the rec's line
 // ending ", recommended". Those are the only words added. No options reads the headline alone; an empty `what` reads nothing.
 // levain/cockpit/card_script.py builds the SAME script for the premium route; tests/test_card_voice.py pins the two against

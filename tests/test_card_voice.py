@@ -348,3 +348,14 @@ def test_an_opened_flag_is_spent_by_the_first_speaker_even_when_it_builds_nothin
       CV.opened("question:2"); const none = CV.speaker("question:2", { error: "x" });
       const w = CV.speaker("question:2", body); w.isConnected = true; await tick(20);""")
     assert "play" not in got["log"], got
+
+
+def test_an_answered_card_mounts_no_speaker() -> None:
+    """An answered question's card is a receipt: nothing is left to read aloud (and one ask per card). The page mounts the speaker
+    only for a card that is not settled. Red with: ``!settled`` removed from the ``CV.speaker`` guard in dashboard_core.js
+    ``questionCard`` (the receipt shows a Play button; tests/test_answered_card.py goes red in the browser)."""
+    src = (HERE.parent / "levain" / "templates" / "web" / "dashboard_core.js").read_text(encoding="utf-8")
+    start = src.index("function questionCard(q)")
+    body = src[start:src.index("function clearNeeds", start)]
+    assert "const settled = q.state === \"answered\";" in body
+    assert "CV && !b.error && !settled ? CV.speaker(" in body, body

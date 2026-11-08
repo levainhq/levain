@@ -4,10 +4,12 @@ from __future__ import annotations
 
 import re
 import shlex
-import tomllib
 from pathlib import Path
 
 import pytest
+
+# tomllib is 3.11+; the root-run job collects this file on the 3.9 floor, and pyproject carries no tomli fallback
+tomllib = pytest.importorskip("tomllib")
 
 from levain.slot import grammar
 from levain.slot.grammar import Refused, parse_install_argv

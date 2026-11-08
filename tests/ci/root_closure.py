@@ -452,6 +452,8 @@ LAZY_SITES = {
     'levain/agents/session_client.py::signed_role_of::from levain.authority import _canonical': 'operator',
     # operator: ``_withhold`` validates a role file's ceiling.withhold at registration (the operator's CLI); the run server never parses a role file
     'levain/agents/role.py::_withhold::from levain.dispatch.policy import _pattern_problem': 'operator',
+    # root: ``signed_withhold`` runs in the dispatch run server (``RunServer._signed_withhold`` re-derives the signed role's withhold), so its lazy target ``levain.agents.role`` joins the closure
+    'levain/agents/signed_role.py::signed_withhold::from levain.agents.role import RoleError, _withhold     # role imports this module: resolved at the call': 'root',
     # operator: ``default_run_socket`` runs only in the operator's process (the controller, an agent session or the session client); the dispatch run server only imports the module
     'levain/agents/session_client.py::default_run_socket::from levain.slot import layout': 'operator',
     # operator: ``_standing_link`` runs only under ``link_proof`` and ``signed_link_of``, in the operator's process (the controller, an agent session or the session client); the dispatch run server only imports the module

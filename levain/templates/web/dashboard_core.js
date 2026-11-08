@@ -6330,8 +6330,9 @@
     Promise.resolve(questionBody(q, card)).then((b) => {
       if (!b) return;
       drawQuestionBody(q, slot, b, card, settled);
-      // V1-7: the speaker that reads the card aloud (card_voice.js); absent when the page has no player or the card has no words
-      const CV = window.LevainCardVoice, sp = CV && !b.error ? CV.speaker(String(q.id || ""), b) : null;
+      // V1-7: the speaker that reads the card aloud (card_voice.js); absent when the page has no player or the card has no words;
+      // never on an answered card: a receipt has nothing left to read aloud
+      const CV = window.LevainCardVoice, sp = CV && !b.error && !settled ? CV.speaker(String(q.id || ""), b) : null;
       if (sp) card.insertBefore(sp, slot);
       if (!b.error && !settled) card.appendChild(needsDetails([copyLine("levain question show " + q.n, "show command")], ""));
     });
