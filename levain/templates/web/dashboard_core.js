@@ -8985,6 +8985,14 @@
     window.addEventListener("resize", cue);
     window.addEventListener("load", cue);
     if (typeof MutationObserver === "function") new MutationObserver(cue).observe(strip, { childList: true, subtree: true, characterData: true });
+    // Labels can widen with no watched event (a late webfont swap, a text-size change, a container resize that is not a window resize).
+    // Toggling the mask classes changes neither the strip's box nor a button's, so the observer cannot loop on its own cue.
+    if (document.fonts && document.fonts.ready) document.fonts.ready.then(cue);
+    if (typeof ResizeObserver === "function") {
+      const ro = new ResizeObserver(cue);
+      ro.observe(strip);
+      strip.querySelectorAll("button").forEach((b) => ro.observe(b));   // the strip's own box is fixed; a widening label moves its buttons
+    }
     cue();
   })();
   // Any trusted reader input ends a pending automatic jump (a late Decisions read must never replace the view the reader chose): a touch, a

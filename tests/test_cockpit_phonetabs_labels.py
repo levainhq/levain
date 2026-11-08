@@ -67,3 +67,26 @@ def test_strip_cues_the_tabs_off_screen_at_390(tmp_path: Path, monkeypatch) -> N
 def test_strip_has_no_cue_when_every_tab_fits(tmp_path: Path, monkeypatch) -> None:
     (got,) = _cue_values(tmp_path, monkeypatch, {"emulate": {"w": 1000, "h": 800, "dpr": 1}}, scroll_end=False)
     assert not got["scrolls"] and not got["right"] and not got["left"], got
+
+
+SHRINK = """(() => { document.querySelectorAll('#ck-phonetabs button').forEach(b => { b.style.setProperty('font-size', '1px', 'important');
+  b.style.setProperty('padding', '0', 'important'); b.style.setProperty('width', '8px', 'important'); b.style.setProperty('min-width', '0', 'important');
+  b.style.setProperty('overflow', 'hidden', 'important'); });
+  return new Promise(r => setTimeout(r, 600)).then(() => 1); })()"""
+# Inline styles on the buttons (CSSOM, so a style-src policy allows them): no window resize and no change to the strip's child list,
+# only the labels' width moves. The attribute write is on the button, not a childList/characterData change under the strip.
+UNSHRINK = """(() => { document.querySelectorAll('#ck-phonetabs button').forEach(b => b.style.cssText = '');
+  return new Promise(r => setTimeout(r, 600)).then(() => 1); })()"""
+
+
+@needs_browser
+@needs_ssh
+def test_strip_cue_returns_when_labels_widen_without_a_watched_event(tmp_path: Path, monkeypatch) -> None:
+    rig = FullRig(tmp_path, monkeypatch)
+    url = f"{rig.origin}/#write_token={TOK}"
+    steps = [PHONE, {"touch": True}, {"until": NEEDS, "ms": 30000}, SETTLE, {"eval": SHRINK}, {"eval": CUE}, {"eval": UNSHRINK}, {"eval": CUE}]
+    with rig.serving():
+        vals = drive_touch(tmp_path, url, steps)["values"]
+    fit, widened = [json.loads(v) for v in vals if isinstance(v, str) and v.startswith("{") and '"cue"' in v]
+    assert not fit["scrolls"] and not fit["right"], (fit, vals)            # the shrunk labels fit: the cue cleared
+    assert widened["scrolls"] and widened["right"], widened        # widened again with no resize or strip mutation: the cue is back
