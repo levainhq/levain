@@ -1536,7 +1536,7 @@ class TestListPagePinsRound2:
 
     def test_a_write_in_flight_never_clobbers_the_draft_typed_since(self) -> None:
         core = self._js("dashboard_core.js")
-        assert "if (intakeKept.draft === line) intakeKept.draft = \"\"" in core
+        assert "if (intakeKept.draft.trim() === line) intakeKept.draft = \"\"" in core
         assert "if (!intakeKept.draft) intakeKept.draft = line" in core
 
     def test_the_surface_and_pointer_chips_are_styled_as_the_meta_cells_children(self) -> None:
