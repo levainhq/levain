@@ -671,6 +671,8 @@ def test_repo_env_vendor_namespace_is_default_deny():
         "CLAUDE_CODE_SAFE_MODE": deny, "CLAUDE_CODE_DISABLE_DANGEROUS_RM_TIMEOUT": deny,
         "CLAUDE_CODE_USE_POWERSHELL_TOOL": deny, "DISABLE_AUTOUPDATER": deny,
         "CLAUDE_CODE_DISABLE_BACKGROUND_TASKS": deny,
+        # L3 r3 complement: the auto-mode permission classifier's model, and prompt text sent to Claude on resume
+        "CLAUDE_CODE_AUTO_MODE_MODEL": deny, "CLAUDE_CODE_RESUME_PROMPT": deny,
         # outside the namespace: a provider prefix, or a credential or endpoint suffix on any stem
         "AWS_PROFILE": "prefix AWS_", "GOOGLE_APPLICATION_CREDENTIALS": "prefix GOOGLE_",
         "VERTEX_REGION_NEXT_MODEL": "prefix VERTEX_", "OPENAI_ORG_ID": "prefix OPENAI_",
