@@ -364,7 +364,7 @@ levain serve --path ./ada --chat ./ada            # the cockpit on ada's memory,
 
 ![The cockpit board on a demo install: the state line, the Decisions waiting and Health tiles, and the cockpit's operate panels.](https://raw.githubusercontent.com/levainhq/levain/main/docs/img/cockpit-operate.png)
 
-*Open Loops surface on their own when a prompt touches them; Tray is your inbox into the partnership (parked loops show among the Open loops with a parked marker). Shown on a demo install with invented content, not a real one — an operator's actual Open Loops and Tray are exactly the kind of thing this README won't put on the internet.*
+*Open Loops surface on their own when a prompt touches them; the List is your inbox into the partnership (parked loops show among the Open loops with a parked marker). Shown on a demo install with invented content, not a real one — an operator's actual Open Loops and List are exactly the kind of thing this README won't put on the internet.*
 
 ![The cockpit's Neocortex panel on the same demo install, with its State, Active Threads and Decisions tabs.](https://raw.githubusercontent.com/levainhq/levain/main/docs/img/cockpit-state.png)
 
@@ -380,7 +380,7 @@ levain state                           # show it + how old it is
 levain state --clear                   # remove it
 ```
 
-The Tray is your own inbox into the partnership. Dump anything mid-stream (a thought, something to pick up next time) and it lands in the Tray, to be sorted by your partner. A dump with a date is an agenda item and carries that date in the Tray. Durable reference is memory, not a shelf: facts go under Durable Facts and rulings become decision episodes. You dump freely; the kit sorts.
+The List is one view over three things: the band (what waits on your answer), the board (what the machine can do next) and your spores, with a one-line intake box on top. Band rows are read-only pointers to Decisions, never a second needs-you list; open loops are machine-side and live on the Build tab. The intake takes one line and says in words what it did. `@when words` is a scheduled drop to your partner, `? words` is a talk seed, and a plain line goes to your partner to sort. The first two are written only once you sign them on a device; the plain line needs no signature. A line that cannot be read is refused in words and nothing is written. A dump with a date is an agenda item and carries that date on the List. Durable reference is memory, not a shelf: facts go under Durable Facts and rulings become decision episodes. You dump freely; the kit sorts.
 
 ### The cockpit's Claude room
 
