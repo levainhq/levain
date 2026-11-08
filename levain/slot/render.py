@@ -35,6 +35,7 @@ import hashlib
 import json
 import os
 import re
+import unicodedata
 from dataclasses import dataclass, field
 from pathlib import PurePosixPath
 from typing import Any, Iterable, Mapping
@@ -1107,11 +1108,20 @@ DISCOVERY: Mapping[str, tuple[str, ...]] = {
 REPO_DISCOVERY = (".claude", ".codex", "CLAUDE.md", "AGENTS.md", ".mcp.json", ".agents")
 
 
+def fold_name(name: str) -> str:
+    """The one fold for a config-surface file name: a case- and normalization-insensitive store (APFS, the Mac slots'
+    default) resolves the vendor's ``open("settings.json")`` to a planted ``Settings.JSON`` or an NFD spelling, so a
+    name check compares folded names (PRE-L3 4-2). ``levain.slot.workspace`` takes its dispatch refused-name fold from
+    here; ``levain.slot.supervisor._fold`` is the same expression, kept local so the supervisor imports render lazily."""
+    return unicodedata.normalize("NFD", name).casefold()
+
+
 def _norm(entry: str) -> str:
-    return entry.strip("/")
+    return fold_name(entry.strip("/"))
 
 
 def _present(listing: Iterable[str], name: str) -> bool:
+    name = fold_name(name)
     return any(e == name or e.startswith(name + "/") for e in (_norm(x) for x in listing))
 
 
@@ -1129,7 +1139,9 @@ def discovery_refusals(listings: Mapping[str, Iterable[str]], *, codex_config: b
                 continue
             if root == "codex" and name == "config.toml" and codex_config is not None \
                     and rendered_codex_config is not None and codex_config == rendered_codex_config \
-                    and "config.toml" in (_norm(e) for e in listing):
+                    and [e.strip("/") for e in listing if _present([e], name)] == ["config.toml"]:
+                # the exemption is the rendered file under its exact name, alone: a second spelling that folds to it
+                # (Linux keeps both) or a folded-only spelling is not the file render made
                 continue
             out.append(_refused("planted-discovery", f"{root}-{name}", f"{root}: {name}"))
     return out
@@ -1197,5 +1209,6 @@ __all__ = [
     "render_importer_profile", "render_verifier_profile",
     "render", "render_from_stdin", "expected_effective_cc",
     "expected_effective_codex", "readback_refusals", "refuse_readback", "repo_loosening_refusals",
-    "refuse_repo_loosening", "discovery_refusals", "refuse_discovery", "repo_discovery_names", "parse_driver_input",
+    "refuse_repo_loosening", "fold_name", "discovery_refusals", "refuse_discovery", "repo_discovery_names",
+    "parse_driver_input",
 ]

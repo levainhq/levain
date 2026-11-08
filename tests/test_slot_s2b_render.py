@@ -497,6 +497,33 @@ def test_planted_discovery_refused_by_name():
     assert len(rd.discovery_refusals(allp)) == sum(len(n) for n in rd.DISCOVERY.values())
 
 
+def test_planted_discovery_folds_case_and_unicode():
+    """PRE-L3 4-2 (complement MED): on a case- and normalization-insensitive store (APFS, the Mac slots) the vendor's
+    ``open("settings.json")`` resolves to a planted ``Settings.JSON``, so every spelling that folds to a §5.5 name is
+    refused, by the one fold the settings check and the dispatch workspace use (NFD, then casefold)."""
+    import unicodedata
+    for root, spelled, name in (("claude", "Settings.JSON", "settings.json"), ("claude", "claude.md", "CLAUDE.md"),
+                                ("claude", "SKILLS/x", "skills"), ("home", ".Config/Git", ".config/git"),
+                                ("codex", "Config.TOML", "config.toml")):
+        got = rd.discovery_refusals({root: [spelled]})
+        assert [e.name for e in got] == [f"planted-discovery:{rd.wire_name(root + '-' + name)}"], spelled
+    # an NFD-decomposed spelling folds to the same name as its NFC twin
+    nfd = unicodedata.normalize("NFD", "settings.json")
+    assert [e.name for e in rd.discovery_refusals({"claude": [nfd.upper()]})] == ["planted-discovery:claude-settings-json"]
+    assert rd.fold_name("Ｓ") == rd.fold_name("ｓ")
+    assert rd.fold_name("É") == rd.fold_name(unicodedata.normalize("NFD", "é"))
+    # the codex config.toml exemption holds only for the exact rendered spelling, alone
+    blob, facts = egress(vendor="codex")
+    mine = rd.render(blob, facts).file("config/codex/config.toml").data
+    assert rd.discovery_refusals({"codex": ["config.toml"]}, codex_config=mine, rendered_codex_config=mine) == []
+    for listing in (["Config.TOML"], ["config.toml", "CONFIG.toml"]):
+        assert [e.name for e in rd.discovery_refusals({"codex": listing}, codex_config=mine,
+                                                      rendered_codex_config=mine)] == \
+            ["planted-discovery:codex-config-toml"], listing
+    # the repo-level listing (adopt preview) folds the same way
+    assert rd.repo_discovery_names([".Claude/settings.json", "agents.md"]) == [".claude", "AGENTS.md"]
+
+
 def test_repo_level_names_not_refused_but_listed():
     repo = [".claude/settings.json", ".codex", "CLAUDE.md", "AGENTS.md", ".mcp.json", ".agents/x", "src"]
     assert rd.discovery_refusals({}) == []
