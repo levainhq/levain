@@ -397,19 +397,16 @@ def watch_apply(board: Path | str | None = None, *, sessions: Any = None) -> lis
             return []
         plural = "report" if waiting == 1 else "reports"
         with store._write("service", None, create=False) as (conn, now):
-            held = _lease._lapse_if_past(conn, now)
+            token, held = _lease.service_claim(conn, now, cause="watch apply")
             if held is not None:
                 return [f"{waiting} {plural} waiting: the board's lease is held by {held.holder} until {held.until}; "
                         f"applied nothing this pass"]
-            token = _lease._event(conn, now, "claim", "service", token=None,
-                                  until=_lease._plus(now, _lease.LEASE_TTL), cause="watch apply", by="service")
         try:
             live = (sessions or live_session_ids)(store)
             got = apply_reports(store, token, live_sessions=live)
         finally:
             with store._write("service", None, create=False) as (conn, now):
-                _lease._event(conn, now, "release", "service", token=token, until=None, cause="watch apply done",
-                              by="service")
+                _lease.service_release(conn, now, token, cause="watch apply done")
         return [f"board reports: applied {len(got.applied)}, refused {len(got.refused)}, deferred {len(got.deferred)}"
                 + "".join(f"; {rid} refused: {why}" for rid, why in got.refused)]
     except (CoordError, sqlite3.Error, OSError) as exc:

@@ -413,6 +413,27 @@ def release(conn: sqlite3.Connection, now: str, token: int | None, *, by: str) -
     return held
 
 
+def service_claim(conn: sqlite3.Connection, now: str, *, cause: str) -> tuple[int | None, Lease | None]:
+    """The service takes a free lease for one short job. Returns ``(token, None)`` once claimed (holder ``service``,
+    held for :data:`LEASE_TTL`), or ``(None, held)`` with the live lease when anyone holds one: a live lease is never
+    taken from its holder. A lapsed claim is recorded as lapsed first. Runs in the caller's write transaction."""
+    held = _lapse_if_past(conn, now)
+    if held is not None:
+        return None, held
+    return _event(conn, now, "claim", "service", token=None, until=_plus(now, LEASE_TTL), cause=cause,
+                  by="service"), None
+
+
+def service_release(conn: sqlite3.Connection, now: str, token: int, *, cause: str) -> bool:
+    """Give back the lease the service claimed with ``token``. Writes nothing and returns False unless the standing
+    lease is that claim, held by ``service``; a lease someone else holds is never released here."""
+    held = lease(conn, now)
+    if held is None or held.holder != "service" or held.token != token:
+        return False
+    _event(conn, now, "release", "service", token=token, until=None, cause=cause, by="service")
+    return True
+
+
 def take(conn: sqlite3.Connection, now: str, *, hold: timedelta = LEASE_TTL) -> int:
     """You take the coordinator role (writer 2): a ``takeover`` ends whatever was held, every pending launch is
     voided, every running coordinator launch is ended (so none claims again when your hold runs out), and you hold
