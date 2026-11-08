@@ -227,6 +227,7 @@ def _work_item(row: Mapping[str, Any], *, source: str, ref: str, default_repo: s
     it = _item(id=str(row["id"]), repo=str(row.get("repo") or default_repo), title=row.get("title"),
                declared=_category(raw), status=row.get("status") if raw in CATEGORIES else None,
                done_line=row.get("done_line"), tier=row.get("tier"), depends_on=row.get("depends_on"),
+               held_reason=row.get("hold") or None,
                rank=_int(row.get("rank")), source=source, ref=ref, set_by=row.get("set_by"),
                set_at=row.get("set_at"))
     it["unknown_category"] = raw if raw is not None and raw not in CATEGORIES else None
@@ -445,8 +446,12 @@ def _current(conn: sqlite3.Connection, item_id: str | None = None) -> builtins.l
     if not _lifecycle_present(conn):
         return []
     if item_id is None:
-        return [_row(r) for r in conn.execute(_CURRENT + " ORDER BY i.id")]
-    return [_row(r) for r in conn.execute(_CURRENT + " AND i.id = ?", (item_id,))]
+        rows = [_row(r) for r in conn.execute(_CURRENT + " ORDER BY i.id")]
+    else:
+        rows = [_row(r) for r in conn.execute(_CURRENT + " AND i.id = ?", (item_id,))]
+    for r in rows:      # the prose hold rides on the store row so a reader derives "held" from it
+        r["hold"] = _facts(conn, r["id"])["hold"]
+    return rows
 
 
 def migrate_item_facts(conn: sqlite3.Connection) -> None:
