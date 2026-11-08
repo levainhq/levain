@@ -613,6 +613,32 @@ def test_repo_settings_env_naming_a_proxy_var_refused():
     assert rd.repo_loosening_refusals({f: {"env": {"PROXY_HOST": "x", "HTTPS_PROXYX": "y"}}}) == []
 
 
+def test_repo_settings_env_moving_the_billing_identity_refused():
+    """PRE-L3 4-1 (codex HIGH): a repo settings ``env`` naming a key or bearer token Claude Code prefers to the stored
+    login (:data:`ABSENT_ENV` / :data:`PASSTHROUGH_ABSENT_ENV`) moves the bill of an unattended run (or stops it at the
+    "use this API key?" prompt), and a ``*_BASE_URL`` moves where its traffic goes; each is refused by name."""
+    f = ".claude/settings.json"
+    # class 1: ABSENT_ENV (claude)
+    for name in rd.ABSENT_ENV["claude"]:
+        got = rd.repo_loosening_refusals({f: {"env": {name: "sk-x"}}})
+        assert [x.name for x in got] == ["loosening:" + rd.wire_name("env." + name)], name
+        assert f in got[0].detail
+    # class 2: PASSTHROUGH_ABSENT_ENV (claude), the bearer token included
+    assert "ANTHROPIC_AUTH_TOKEN" in rd.PASSTHROUGH_ABSENT_ENV["claude"]
+    for name in rd.PASSTHROUGH_ABSENT_ENV["claude"]:
+        got = rd.repo_loosening_refusals({".claude/settings.local.json": {"env": {name: "t"}}})
+        assert [x.name for x in got] == ["loosening:" + rd.wire_name("env." + name)], name
+    # class 3: any *_BASE_URL
+    for name in ("ANTHROPIC_BASE_URL", "ANTHROPIC_BEDROCK_BASE_URL", "OPENAI_BASE_URL"):
+        got = rd.repo_loosening_refusals({f: {"env": {name: "http://x"}}})
+        assert [x.name for x in got] == ["loosening:" + rd.wire_name("env." + name)], name
+    e = refused(rd.refuse_repo_loosening, {f: {"env": {"ANTHROPIC_AUTH_TOKEN": "t"}}})
+    assert refusal_line(e) == '{"ok":false,"refused":"loosening:env-anthropic-auth-token"}\n'
+    # controls: a name that only contains the suffix, or a model id, still launches
+    assert rd.repo_loosening_refusals({f: {"env": {"MY_BASE_URL_NOTE": "x", "ANTHROPIC_MODEL": "y",
+                                                   "BASE_URL": "z"}}}) == []
+
+
 def test_levain_repo_settings_pass():
     """The negative control. ``.claude/settings.json`` is absent from this repo, so the control is (a) a hooks-only
     settings file and (b) the Claude Code settings template Levain ships (hooks + permissions)."""
