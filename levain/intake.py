@@ -9,7 +9,7 @@ contract: ``tests/vectors/list_intake_vectors.json``.
 
 ``<when>``: ``HH:MM`` / ``9am`` / ``5:30 pm`` (today if still ahead, else tomorrow) ·
 ``tomorrow [time]`` · ``mon..sun`` or full weekday ``[time]`` (the next one) ·
-``MM-DD [time]`` · ``YYYY-MM-DD [time]`` · ``+Nm`` / ``+Nh`` / ``+Nd``. No time given
+``MM-DD [time]`` (the next one: this year if still ahead, else next year) · ``YYYY-MM-DD [time]`` · ``+Nm`` / ``+Nh`` / ``+Nd``. No time given
 means 09:00. A ``<when>`` that does not read, a moment not in the future, an empty line,
 or no words after the prefix raises :class:`IntakeRefused` with the reason: a parser
 informs the human, it never guesses and never authorises.
@@ -93,11 +93,22 @@ def _resolve_when(tokens, now):
         return (when if when > now else when + timedelta(days=7)), used
     m = re.match(r"^(?:(\d{4})-)?(\d{1,2})-(\d{1,2})$", head)
     if m:
-        try:
-            day = date(int(m.group(1) or now.year), int(m.group(2)), int(m.group(3)))
-        except ValueError:
-            raise IntakeRefused(f"{tokens[0]!r} is not a calendar date") from None
-        return with_clock(day, 1)
+        month, dom = int(m.group(2)), int(m.group(3))
+        if m.group(1):          # a written year is held to: a past moment in it is refused below, never moved
+            years = [int(m.group(1))]
+        else:                   # no year: the next occurrence (Phill 2026-11-08, row 456 (a)), this year if still ahead
+            years = [now.year, now.year + 1]
+        last = None
+        for year in years:
+            try:
+                last = with_clock(date(year, month, dom), 1)
+            except ValueError:
+                continue
+            if last[0] > now:
+                return last
+        if last is None:
+            raise IntakeRefused(f"{tokens[0]!r} is not a calendar date")
+        return last
     raise IntakeRefused(f"cannot read {tokens[0]!r} as a time. Forms: HH:MM, 9am, tomorrow [time], mon..sun [time], "
                         f"MM-DD [time], YYYY-MM-DD [time], +30m, +2h, +3d (no time means {DEFAULT_DROP_HOUR:02d}:00)")
 

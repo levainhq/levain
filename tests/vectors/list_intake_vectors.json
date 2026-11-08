@@ -180,6 +180,42 @@
    "refuse": true
   },
   {
+   "line": "@11-01 next year",
+   "expect": {
+    "kind": "drop",
+    "when": "2027-11-01T09:00",
+    "text": "next year"
+   }
+  },
+  {
+   "line": "@11-08 a year on",
+   "expect": {
+    "kind": "drop",
+    "when": "2027-11-08T09:00",
+    "text": "a year on"
+   }
+  },
+  {
+   "line": "@11-08 13:00 later today",
+   "expect": {
+    "kind": "drop",
+    "when": "2026-11-08T13:00",
+    "text": "later today"
+   }
+  },
+  {
+   "line": "@01-03 call the landlord",
+   "expect": {
+    "kind": "drop",
+    "when": "2027-01-03T09:00",
+    "text": "call the landlord"
+   }
+  },
+  {
+   "line": "@02-29 leap",
+   "refuse": true
+  },
+  {
    "line": "@tomorrow 25:00 x",
    "refuse": true
   },
