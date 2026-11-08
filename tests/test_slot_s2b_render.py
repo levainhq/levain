@@ -634,41 +634,111 @@ def test_repo_settings_env_moving_the_billing_identity_refused():
         assert [x.name for x in got] == ["loosening:" + rd.wire_name("env." + name)], name
     e = refused(rd.refuse_repo_loosening, {f: {"env": {"ANTHROPIC_AUTH_TOKEN": "t"}}})
     assert refusal_line(e) == '{"ok":false,"refused":"loosening:env-anthropic-auth-token"}\n'
-    # controls: a name that only contains the suffix, or a model id, still launches
-    assert rd.repo_loosening_refusals({f: {"env": {"MY_BASE_URL_NOTE": "x", "ANTHROPIC_MODEL": "y",
-                                                   "BASE_URL": "z"}}}) == []
+    # controls: a name that only contains the suffix, and harmless toggles, still launch (an ANTHROPIC_ model id
+    # no longer does: the whole ANTHROPIC_ family is refused, pf4r2 R1)
+    assert rd.repo_loosening_refusals({f: {"env": {"MY_BASE_URL_NOTE": "x", "BASE_URL": "z",
+                                                   "CLAUDE_CODE_MAX_OUTPUT_TOKENS": "8000",
+                                                   "DISABLE_TELEMETRY": "1"}}}) == []
 
 
-def test_repo_settings_env_every_credential_or_endpoint_name_refused():
-    """PRE-L3 fix4 (L1 MED-1, L2 MED-1/MED-3/LOW-1): one shared set names every Claude env var that moves a slot's
-    credential, billing identity or endpoint; a repo settings ``env`` naming any of them is refused by name."""
+def _env_refusal(name: str):
+    return rd.repo_loosening_refusals({".claude/settings.json": {"env": {name: "x"}}})
+
+
+def test_repo_env_refused_by_family_not_by_list():
+    """pf4r2 R1 (L3 r1 codex HIGH, complement MED, gemini MED): a repo settings ``env`` name is refused by family, so a
+    vendor variable added later in a covered family is refused by default. Each name below is either one the vendor's
+    reference added after the exact list was written or one invented for this test; each is refused once, by name,
+    with the rule that caught it in the detail."""
     from levain import sandbox_keys as sk
-    f = ".claude/settings.json"
-    for name in ("CLAUDE_CODE_OAUTH_TOKEN", "CLAUDE_CODE_USE_BEDROCK", "CLAUDE_CODE_USE_VERTEX",
-                 "CLAUDE_CODE_USE_FOUNDRY", "AWS_BEARER_TOKEN_BEDROCK", "ANTHROPIC_CUSTOM_HEADERS",
-                 "CLAUDE_CONFIG_DIR", "ANTHROPIC_FOUNDRY_API_KEY", "CLAUDE_CODE_OAUTH_REFRESH_TOKEN",
-                 "ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_BASE_URL"):
-        assert name in sk.CLAUDE_CREDENTIAL_ENV, name
-        got = rd.repo_loosening_refusals({f: {"env": {name: "x"}}})
-        assert [x.name for x in got] == ["loosening:" + rd.wire_name("env." + name)], name
-        assert name in got[0].detail
+    cases = {
+        # a provider family prefix
+        "ANTHROPIC_AWS_API_KEY": "prefix ANTHROPIC_", "ANTHROPIC_AWS_WORKSPACE_ID": "prefix ANTHROPIC_",
+        "ANTHROPIC_PROFILE": "prefix ANTHROPIC_", "ANTHROPIC_FOUNDRY_AUTH_TOKEN": "prefix ANTHROPIC_",
+        "ANTHROPIC_UNIX_SOCKET": "prefix ANTHROPIC_", "ANTHROPIC_NOT_YET_INVENTED": "prefix ANTHROPIC_",
+        "AWS_ACCESS_KEY_ID": "prefix AWS_", "AWS_PROFILE": "prefix AWS_", "AWS_SESSION_TOKEN": "prefix AWS_",
+        "GOOGLE_APPLICATION_CREDENTIALS": "prefix GOOGLE_", "GCLOUD_PROJECT": "prefix GCLOUD_",
+        "CLOUDSDK_CORE_PROJECT": "prefix CLOUDSDK_", "CLOUD_ML_REGION": "prefix CLOUD_ML_",
+        "AZURE_CLIENT_ID": "prefix AZURE_", "OPENAI_ORG_ID": "prefix OPENAI_", "VERTEX_REGION_X": "prefix VERTEX_",
+        "BEDROCK_ANYTHING": "prefix BEDROCK_",
+        # a credential or endpoint suffix, on any stem
+        "NEWVENDOR_BASE_URL": "suffix _BASE_URL", "NEWVENDOR_API_KEY": "suffix _API_KEY",
+        "NEWVENDOR_AUTH_TOKEN": "suffix _AUTH_TOKEN", "NEWVENDOR_ACCESS_TOKEN": "suffix _ACCESS_TOKEN",
+        "NEWVENDOR_REFRESH_TOKEN": "suffix _REFRESH_TOKEN", "MCP_CLIENT_SECRET": "suffix _SECRET",
+        "NEWVENDOR_SECRET_KEY": "suffix _SECRET_KEY", "NEWVENDOR_CREDENTIALS": "suffix _CREDENTIALS",
+        "NEWVENDOR_PROFILE": "suffix _PROFILE",
+        # a provider switch
+        "CLAUDE_CODE_USE_ANTHROPIC_AWS": "prefix CLAUDE_CODE_USE_", "CLAUDE_CODE_USE_MANTLE": "prefix CLAUDE_CODE_USE_",
+        "CLAUDE_CODE_USE_NEXTCLOUD": "prefix CLAUDE_CODE_USE_",
+        # a credential, TLS-identity, transport or provider word under CLAUDE_CODE_
+        "CLAUDE_CODE_OAUTH_TOKEN": "CLAUDE_CODE_ with AUTH", "CLAUDE_CODE_OAUTH_SCOPES": "CLAUDE_CODE_ with AUTH",
+        "CLAUDE_CODE_SKIP_VERTEX_AUTH": "CLAUDE_CODE_ with AUTH", "CLAUDE_CODE_CLIENT_CERT": "CLAUDE_CODE_ with CERT",
+        "CLAUDE_CODE_CERT_STORE": "CLAUDE_CODE_ with CERT", "CLAUDE_CODE_CLIENT_KEY": "CLAUDE_CODE_ with CLIENT_KEY",
+        "CLAUDE_CODE_DISABLE_MTLS_RELOAD_ON_STALE_CONNECTION": "CLAUDE_CODE_ with MTLS",
+        "CLAUDE_CODE_UNIX_SOCKET": "CLAUDE_CODE_ with UNIX_SOCKET",
+        "CLAUDE_CODE_PROVIDER_MANAGED_BY_HOST": "CLAUDE_CODE_ with PROVIDER",
+        "CLAUDE_CODE_PROXY_RESOLVES_HOSTS": "CLAUDE_CODE_ with PROXY",
+        "CLAUDE_CODE_PROCESS_WRAPPER": "CLAUDE_CODE_ with WRAPPER", "CLAUDE_CODE_SKIP_AWS_CRED_CACHE": "CLAUDE_CODE_ with CRED",
+        "CLAUDE_CODE_AWS_CHAIN_RESOLVE_TIMEOUT_MS": "CLAUDE_CODE_ with AWS",
+        "CLAUDE_CODE_GCP_SOMETHING": "CLAUDE_CODE_ with GCP",
+        # exact names: the config dir, the request body, and TLS trust or the runtime's own options
+        "CLAUDE_CONFIG_DIR": "name CLAUDE_CONFIG_DIR", "CLAUDE_CODE_EXTRA_BODY": "name CLAUDE_CODE_EXTRA_BODY",
+        "NODE_EXTRA_CA_CERTS": "name NODE_EXTRA_CA_CERTS", "NODE_TLS_REJECT_UNAUTHORIZED": "name NODE_TLS_REJECT_UNAUTHORIZED",
+        "NODE_OPTIONS": "name NODE_OPTIONS", "SSL_CERT_FILE": "name SSL_CERT_FILE", "SSL_CERT_DIR": "name SSL_CERT_DIR",
+        "REQUESTS_CA_BUNDLE": "name REQUESTS_CA_BUNDLE",
+    }
+    for name, rule in cases.items():
+        assert sk.repo_env_rule(name) == rule, name
+        for spelled in (name, name.lower()):          # compared upper-cased
+            got = _env_refusal(spelled)
+            # the name as _refused caps it (refusal_line's 64)
+            assert [x.name for x in got] == [rd._refused("loosening", "env." + spelled, "").name], spelled
+            assert spelled in got[0].detail and rule in got[0].detail, got[0].detail
+    # codex's AWS bypass, whole: every name refused, none by accident of another
+    doc = {"env": {"CLAUDE_CODE_USE_ANTHROPIC_AWS": "1", "ANTHROPIC_AWS_API_KEY": "repo-key",
+                   "ANTHROPIC_AWS_WORKSPACE_ID": "repo-workspace"}}
+    assert sorted(x.name for x in rd.repo_loosening_refusals({".claude/settings.json": doc})) == [
+        "loosening:env-anthropic-aws-api-key", "loosening:env-anthropic-aws-workspace-id",
+        "loosening:env-claude-code-use-anthropic-aws"]
+    # harmless toggles and near-misses launch
+    for name in ("CLAUDE_CODE_MAX_OUTPUT_TOKENS", "DISABLE_TELEMETRY", "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC",
+                 "MAX_THINKING_TOKENS", "BASH_DEFAULT_TIMEOUT_MS", "MY_BASE_URL_NOTE", "BASE_URL", "API_KEY_NOTE",
+                 "CLAUDE_CODE_AUTO_COMPACT_WINDOW", "CLAUDE_CODE_SUBAGENT_MODEL"):
+        assert sk.repo_env_rule(name) is None, name
+        assert _env_refusal(name) == [], name
+    # the proxy names keep their own refusal, once
+    assert [x.name for x in _env_refusal("HTTPS_PROXY")] == ["loosening:env-https-proxy"]
 
 
-def test_the_credential_name_lists_are_pinned_to_the_shared_set():
-    """The repo-env refusal reads the shared set itself; the render's absent-env lists and the two carry lists
-    (a room child's kept names, a resumed session's carried names) are subsets of it, so a name added to one list
-    that moves a credential must be added to the shared set or this fails."""
+def test_repo_env_rule_over_the_vendor_reference():
+    """pf4r2 R1: every variable in the vendor's env-var reference (the table, fetched on the date the fixture names)
+    gets the verdict recorded for it. A refused one changes the endpoint, provider, credential, identity, tenant or
+    TLS trust, or sits in a family that does; an allowed one is a toggle or limit. The fixture is the review record:
+    a new variable in the reference is judged by adding its row."""
+    from levain import sandbox_keys as sk
+    table = json.loads((REPO / "tests/fixtures/claude_code_env_vars_1108.json").read_text())
+    assert table["fetched"] == "2026-11-08" and table["source"].startswith("https://code.claude.com/docs/en/env-vars")
+    got = {n: ("refused" if sk.repo_env_rule(n) else "allowed") for n in table["verdicts"]}
+    assert got == table["verdicts"]
+    for must in ("ANTHROPIC_AWS_API_KEY", "ANTHROPIC_FOUNDRY_AUTH_TOKEN", "ANTHROPIC_PROFILE", "CLAUDE_CODE_USE_MANTLE",
+                 "CLAUDE_CODE_CLIENT_CERT", "CLAUDE_CODE_CERT_STORE", "CLAUDE_CODE_PROVIDER_MANAGED_BY_HOST"):
+        assert table["verdicts"][must] == "refused", must
+    for must in ("CLAUDE_CODE_MAX_OUTPUT_TOKENS", "DISABLE_TELEMETRY", "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC"):
+        assert table["verdicts"][must] == "allowed", must
+
+
+def test_the_credential_name_lists_are_refused_by_the_repo_env_rule():
+    """The render's absent-env lists and the two carry lists (a room child's kept names, a resumed session's carried
+    names) each name only variables the repo-env rule refuses, so a name added to one of them that the rule lets
+    through fails here."""
     from levain import sandbox_keys as sk
     from levain.consent import delivery as dv
     from levain.coordinator import room_launch as rl
-    assert rd._REPO_BILLING_ENV >= sk.CLAUDE_CREDENTIAL_ENV
+    assert not hasattr(rd, "_REPO_BILLING_ENV") and not hasattr(sk, "CLAUDE_CREDENTIAL_ENV")
+    names = set(dv._AGENT_AUTH) | {n for n in rl.ENV_KEEP if n.startswith("CLAUDE_")}
     for v in ("claude",):
-        assert rd.ABSENT_ENV[v] <= sk.CLAUDE_CREDENTIAL_ENV
-        assert rd.PASSTHROUGH_ABSENT_ENV[v] <= sk.CLAUDE_CREDENTIAL_ENV
-    claude_carried = {n for n in dv._AGENT_AUTH if not n.startswith(("OPENAI_", "CODEX_"))}
-    assert claude_carried <= sk.CLAUDE_CREDENTIAL_ENV
-    kept = {n for n in rl.ENV_KEEP if n.startswith("CLAUDE_")}
-    assert kept <= sk.CLAUDE_CREDENTIAL_ENV
+        names |= rd.ABSENT_ENV[v] | rd.PASSTHROUGH_ABSENT_ENV[v]
+    assert names and all(sk.repo_env_rule(n) for n in names), sorted(n for n in names if not sk.repo_env_rule(n))
 
 
 def test_repo_settings_credential_helper_keys_refused():
