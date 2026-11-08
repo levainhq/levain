@@ -466,6 +466,7 @@
       before = n ? n.textContent : "";
     }).then(readRequest).then((got) => {
       $("sheet-body").replaceChildren();
+      micsOff();
       $("sheet-actions").replaceChildren();
       draw(got);
     }).catch((e) => {
@@ -542,11 +543,16 @@
   // flight, which ends on every outcome; `active` is the request it signs
   let busy = false, flight = false, unsure = false, active = null;     // `unsure`: a drop's delivery is not known
   function ended() { flight = false; closeAsked = false; }
+  // every mic the sheet's actions hold: let go (off) when the actions they sit in are replaced or the sheet closes, idle ones too
+  let sheetMics = [];
+  function micsOff() { const ms = sheetMics; sheetMics = []; for (const m of ms) m.off(); }
   function offer(r, rp, signers, held) {
+    micsOff();
     const acts = $("sheet-actions");
     acts.hidden = false;
     const controls = [];          // every button and the write-in: frozen together for the whole ceremony
-    const lock = (on) => { for (const b of controls) b.disabled = on; };
+    // the mics lock through their own lock(on), which never disables a live capture's Stop
+    const lock = (on) => { for (const b of controls) b.disabled = on; for (const m of mics) m.lock(on); };
     // the mic on a write-in or reason box (board row 140): drawn only where the server offers streaming and the browser offers
     // on-device dictation. A tap that SIGNS a box's words is refused while its mic is open or still closing (micOpen), so a
     // partial is never signed: the words are the box's once the mic has ended, taken at the click as ever.
@@ -554,8 +560,8 @@
     const withMic = (box) => {
       if (!window.LevainMic || typeof window.LevainMic.attach !== "function") return null;
       const m = window.LevainMic.attach(box, { cls: "dev-btn", note: (t) => say(t) });
-      for (const b of m.buttons) controls.push(b);
       mics.push(m);
+      sheetMics.push(m);
       return m;
     };
     const micOpen = (m) => {
@@ -571,6 +577,11 @@
     };
     const run = (choice, words, expect) => {
       if (busy) return;
+      // a ceremony never runs under a live mic: a capture still open is ended at once (off: no tail, no more words), not
+      // stopped and waited for, because the passkey call below must stay inside this tap's user activation and a normal
+      // option signs none of a box's words (a tap that signs them is refused while the mic is open). An idle mic keeps its
+      // control for a retry after a ceremony that signs nothing.
+      for (const m of mics) if (m.busy()) m.off();
       busy = true;
       active = r;
       lock(true);
@@ -578,11 +589,11 @@
       whom(rp, keysFor(choice), held, acts, !consent && !dispatch).then((k) => (k ? ceremony(r, rp, k, choice, words) : "unsigned"))
         .catch(() => "unsigned")
         .then((done) => {
-          if (done === "signed") { busy = false; ended(); acts.replaceChildren(); acts.hidden = true; tell("signed"); return; }
+          if (done === "signed") { busy = false; ended(); micsOff(); acts.replaceChildren(); acts.hidden = true; tell("signed"); return; }
           if (done === "unsure") {
             relabel("Not confirmed");
             return settle(r, () => { relabel("Not signed"); busy = false; lock(false); },
-                          () => { busy = false; acts.replaceChildren(); acts.hidden = true; tell("signed"); }).then(ended);
+                          () => { busy = false; micsOff(); acts.replaceChildren(); acts.hidden = true; tell("signed"); }).then(ended);
           }
           relabel("Not signed");
           ended();
@@ -774,7 +785,7 @@
       say("Signing is still in progress, so it is not confirmed (close again to leave).", "bad");
       return tell("reload");
     }
-    if (!(flight || (coord && unsure)) || closeAsked) return tell("close");
+    if (!(flight || (coord && unsure)) || closeAsked) { micsOff(); return tell("close"); }
     closeAsked = true;
     relabel("Not confirmed");
     say("Signing is still in progress, so it is not confirmed. Checking where the request stands… (close again to leave).", "bad");

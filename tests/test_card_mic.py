@@ -137,3 +137,75 @@ def test_the_needs_card_reply_box_gets_the_mic_and_send_words_waits_for_it(tmp_p
     held = json.loads([v for v in out["values"] if isinstance(v, str) and v.startswith("[\"Stop")][0])
     assert "Stop the mic first" in held[0] and held[1] == [] and "live 0" in held[2], held
     assert json.loads(out["values"][-1]), out["values"]
+
+
+# --- cmr2 (L3 r1): the signed-words boundary on the sheet ------------------------------------------------------------
+
+DICT = "document.querySelector('#sheet-actions .card-mic-dictate')"
+# the passkey call, watched: what the microphone was doing when the ceremony asked for the passkey
+WATCH_GET = ("(() => { const c = navigator.credentials, g = c.get.bind(c); window.__atGet = [];"
+             " c.get = (o) => { window.__atGet.push({ tracks: window.__sc.tracks.map((t) => t.stopped),"
+             " srs: (window.__srs || []).map((r) => r.stops) }); return g(o); }; })();")
+# Stop mic disabled while a capture is live, watched from before the tap
+WATCH_STOP = ("(() => { const m = " + MIC + "; window.__deadStop = 0; new MutationObserver(() => {"
+              " if (m.disabled && window.__sc.tracks.some((t) => !t.stopped)) window.__deadStop++; })"
+              ".observe(m, { attributes: true, attributeFilter: ['disabled'] }); return 1; })()")
+
+
+@needs_browser
+@needs_ssh
+def test_an_interim_that_dictate_ends_on_is_never_signed(tmp_path: Path, monkeypatch) -> None:
+    """Red with: Dictate leaving its interim words in the box when the engine ends (they are then signed as his words)."""
+    from tests.test_card_mic_lifecycle import RECOG
+    rig = _Rig(tmp_path, monkeypatch)
+    with rig.serving():
+        _drive(tmp_path, f"{rig.origin}/nope", [
+            DESKTOP, {"init": _fake() + RECOG}, rig.authenticator(), *_open(rig),
+            {"until": f"!!{DICT} && !{DICT}.hidden && 1", "ms": 30000},
+            {"eval": f"{BOX}.value = 'mine'; {DICT}.click(); window.__srs[0].onresult(window.__res([['ghost', false]])); window.__srs[0].onend(); 1"},
+            {"tap": WRITE_IN_BTN},
+            {"until": f"/^signed/.test({NOTE}) && {NOTE}", "ms": 30000},
+        ])
+    assert _signed_message(rig).endswith("(*): mine")
+    assert rig.verifies(QRID)
+
+
+@needs_browser
+@needs_ssh
+def test_an_option_tap_under_a_live_sheet_mic_ends_the_mic_before_the_passkey_and_never_disables_a_live_stop(tmp_path: Path, monkeypatch) -> None:
+    """Red with: the sheet's run() locking every control (Stop mic too) and starting the ceremony under a live mic."""
+    rig = _Rig(tmp_path, monkeypatch)
+    with rig.serving():
+        out = _drive(tmp_path, f"{rig.origin}/nope", [
+            DESKTOP, {"init": _fake() + WATCH_GET}, rig.authenticator(), *_open(rig),
+            {"until": f"{SHOWN} && 1", "ms": 30000},
+            {"eval": f"{MIC}.click(); 1"},
+            {"until": "window.__sc.gum >= 1 && !!window.__sc.node", "ms": 20000},
+            FEED, {"until": _fill(BOX), "ms": 20000},
+            {"eval": WATCH_STOP},
+            {"tap": "document.querySelector('#sheet-actions [data-choice=\"a\"]')"},
+            {"until": f"/^signed/.test({NOTE}) && {NOTE}", "ms": 30000},
+            {"eval": "JSON.stringify([window.__atGet, window.__deadStop])"},
+        ])
+    at, dead = json.loads(out["values"][-1])
+    assert at and all(n >= 1 for n in at[0]["tracks"]), at       # every track stopped before the passkey call
+    assert dead == 0, dead
+    assert rig.verifies(QRID)
+
+
+@needs_browser
+@needs_ssh
+def test_a_signed_sheet_lets_go_of_its_idle_mics(tmp_path: Path, monkeypatch) -> None:
+    """Red with: the sheet never calling off() on its mics (an idle one keeps its document listener after the actions go)."""
+    from tests.test_card_mic_lifecycle import RECOG
+    rig = _Rig(tmp_path, monkeypatch)
+    with rig.serving():
+        out = _drive(tmp_path, f"{rig.origin}/nope", [
+            DESKTOP, {"init": _fake() + RECOG}, rig.authenticator(), *_open(rig),
+            {"until": f"!!{DICT} && 1", "ms": 30000},
+            {"eval": "window.__visN"},
+            {"tap": "document.querySelector('#sheet-actions [data-choice=\"a\"]')"},
+            {"until": f"/^signed/.test({NOTE}) && {NOTE}", "ms": 30000},
+            {"eval": "window.__visN"},
+        ])
+    assert out["values"][-4] == 1 and out["values"][-1] == 0, out["values"]
