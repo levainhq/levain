@@ -783,3 +783,72 @@ def test_a_cancelled_executor_ticket_is_still_compacted_to_its_tombstone(rig):
     rig.restart()
     assert [x["op"] for x in rig.lines()] == ["tombstone"]
     assert rig.ask("RUN-TICKET-FACTS", job_id="job-1", run_index=0)["refused"] == "ticket-unknown"
+
+
+# --- L3 r1 (prewr2): a record with no ``auth`` is passthrough's; a tombstone keeps its record's auth (codex OPEN-4) -----
+
+def _launchers(tmp_path):
+    from levain.agents import session_launcher as L
+    from tests.test_agents_session_launcher import FakeControl, FakeRuntime, FakeSources
+    index = L.SessionIndex(tmp_path / "idx")
+    pt = L.RealLauncher(FakeControl(), FakeRuntime(), FakeSources(), index)
+    br = L.RealLauncher(FakeControl(), FakeRuntime(), FakeSources(), index, auth="brokered", spend=lambda run: 4242)
+    return index, pt, br
+
+
+def test_a_record_with_no_auth_predates_the_split_and_is_passthrough(tmp_path):
+    """Every record written before the split socket is a passthrough launch: the brokered launcher answers the caps by
+    name for one, never its own reading; the passthrough launcher reads it as before."""
+    index, pt, br = _launchers(tmp_path)
+    index.put("s-00000000000000d1", "ended", run_id="r-" + "1" * 16, session="sess-9", created_s=1.0)
+    assert "auth" not in index.get("s-00000000000000d1")
+    got = br.usage("s-00000000000000d1")
+    assert (got.usd_micros, got.source) == (None, "session:auth-mismatch"), got
+    assert pt.usage("s-00000000000000d1").source != "session:auth-mismatch"
+    index.put("s-00000000000000d2", "refused", reason="x", created_s=1.0)
+    assert br.usage("s-00000000000000d2").source == "session:auth-mismatch"
+    assert pt.usage("s-00000000000000d2").source == "session:not-started"
+
+
+@pytest.mark.parametrize("auth", ["passthrough", "brokered"])
+def test_a_tombstone_keeps_the_auth_of_the_record_it_replaces(tmp_path, auth):
+    """A spawn's ``undone``/``refused`` replaces its own ``pending``/``minted`` record: the auth stays, so its own
+    launcher reads zero and the other launcher reads the caps by name."""
+    index, pt, br = _launchers(tmp_path)
+    own, other = (pt, br) if auth == "passthrough" else (br, pt)
+    key = "s-00000000000000e1"
+    index.create(key, "minted", run_id="r-" + "2" * 16, created_s=1.0, auth=auth)
+    own._tombstone(key, "undone", "spawn-failed")
+    assert index.get(key)["state"] == "undone" and index.get(key)["auth"] == auth
+    assert own.usage(key).source == "session:not-started"
+    assert other.usage(key).source == "session:auth-mismatch"
+
+
+@pytest.mark.parametrize("auth", ["passthrough", "brokered"])
+def test_a_new_tombstone_carries_its_launchers_auth(tmp_path, auth):
+    """A refusal before anything was allocated (no record to replace) is the writing launcher's: it reads zero there."""
+    index, pt, br = _launchers(tmp_path)
+    own, other = (pt, br) if auth == "passthrough" else (br, pt)
+    own.refuse_key("s-00000000000000f1", "workspace-refused")
+    assert index.get("s-00000000000000f1")["auth"] == auth
+    assert own.usage("s-00000000000000f1").source == "session:not-started"
+    assert other.usage("s-00000000000000f1").source == "session:auth-mismatch"
+
+
+def test_a_brokered_spawn_whose_start_fails_reads_zero_on_its_own_socket(tmp_path):
+    """End to end through ``spawn``: the undone tombstone of a brokered launch is the brokered launcher's zero."""
+    from levain.agents import session_launcher as L
+    from tests.test_agents_session_launcher import FakeControl, FakeRuntime, FakeSources, launch
+    ctl = FakeControl()
+    ctl.script["ROUTE-RESOLVE"] = lambda f: {"route": "glm", "routemap_generation": 1,
+                                             "route_policy_digest": "sha256:" + "a" * 64}
+    br = L.RealLauncher(ctl, FakeRuntime(fail=OSError("no slot")), FakeSources(), L.SessionIndex(tmp_path / "idx"),
+                        auth="brokered", spend=lambda run: 4242)
+    lz = launch(auth="brokered", exposure=None)
+    import dataclasses
+    lz = dataclasses.replace(lz, usd_micros=1_000_000)
+    with pytest.raises(OSError):
+        br.spawn(lz)
+    rec = br.index.get(lz.session_key)
+    assert (rec["state"], rec["auth"]) == ("undone", "brokered"), rec
+    assert br.usage(lz.session_key).source == "session:not-started"

@@ -217,7 +217,8 @@ def test_the_mint_call_is_still_written_once():
 # --- usage: the run's spend --------------------------------------------------------------------------------------------
 
 def _ended(ln):
-    ln.index.put(KEY, "ended", run_id=RUN, session="sess-1")
+    # every brokered write stamps its auth; a record with none is a passthrough one (PRE-W L3 r1)
+    ln.index.put(KEY, "ended", run_id=RUN, session="sess-1", auth="brokered")
 
 
 def test_a_brokered_runs_usage_is_its_spend_once_ended(tmp_path):
@@ -250,10 +251,10 @@ def test_a_spend_reader_that_raises_or_is_absent_is_none(tmp_path):
 def test_spend_is_read_only_after_end_is_proven(tmp_path):
     asked = []
     ln, _, _ = bbuild(tmp_path, spend=lambda run_id: asked.append(run_id) or 5)
-    ln.index.put(KEY, "started", run_id=RUN, session="sess-1")
+    ln.index.put(KEY, "started", run_id=RUN, session="sess-1", auth="brokered")
     # REVERT: moving the `rec["state"] != "ended"` test below the brokered branch (a live run's partial spend would settle)
     assert ln.usage(KEY).usd_micros is None and asked == []
-    ln.index.put("s-refused0000000001", "refused", reason="x")
+    ln.index.put("s-refused0000000001", "refused", reason="x", auth="brokered")
     assert ln.usage("s-refused0000000001") == zero() and asked == []
 
 

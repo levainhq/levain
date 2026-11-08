@@ -369,18 +369,21 @@ class SessionIndex:
         finally:
             os.close(lock)
 
-    def transition(self, key: str, from_states: tuple[str, ...], state: str, **fields: Any) -> str | None:
+    def transition(self, key: str, from_states: tuple[str, ...], state: str, *, keep: tuple[str, ...] = (),
+                   **fields: Any) -> str | None:
         """:meth:`put`, only while the record is in one of ``from_states``: the read and the write are one step under
         the key's lock, so a concurrent END's ``ended`` (written under the same lock, :meth:`RealLauncher._mark_ended`)
-        is never replaced by a spawn's non-terminal write. None when written; else the state found (``"absent"`` for
-        no record). A record that does not read raises, as :meth:`get` does."""
+        is never replaced by a spawn's non-terminal write. ``keep``: fields of the replaced record the new one carries
+        over (one the record lacks stays absent). None when written; else the state found (``"absent"`` for no
+        record). A record that does not read raises, as :meth:`get` does."""
         with self.locked(key):
             rec = self.get(key)
             if rec is None:
                 return "absent"
             if rec["state"] not in from_states:
                 return str(rec["state"])
-            self.put(key, state, **fields)
+            carried = {k: rec[k] for k in keep if k in rec and k not in fields}
+            self.put(key, state, **carried, **fields)
             return None
 
     def put(self, key: str, state: str, **fields: Any) -> None:
@@ -737,13 +740,15 @@ class RealLauncher:
 
     def _tombstone(self, key: str, state: str, reason: str, *, new: bool = False, **extra: Any) -> None:
         """A zero-usage record. ``new``: only where the key holds no record (a refusal of a key some other spawn
-        holds leaves that spawn's record as it is); else it replaces the record this spawn created, and only while
-        that record is still ``pending`` or ``minted`` (a concurrent END's ``ended`` is never replaced by a zero)."""
+        holds leaves that spawn's record as it is), stamped with this launcher's ``auth``; else it replaces the record
+        this spawn created, and only while that record is still ``pending`` or ``minted`` (a concurrent END's ``ended``
+        is never replaced by a zero), keeping that record's ``auth``. :meth:`usage` reads a record by the auth it
+        carries, so a tombstone without one would read as passthrough's (PRE-W L3 r1, codex OPEN-4)."""
         try:
             if new:
-                self.index.create(key, state, reason=reason, created_s=self.clock(), **extra)
+                self.index.create(key, state, reason=reason, created_s=self.clock(), **{"auth": self.auth, **extra})
             else:
-                found = self.index.transition(key, ("pending", "minted"), state, reason=reason,
+                found = self.index.transition(key, ("pending", "minted"), state, keep=("auth",), reason=reason,
                                               created_s=self.clock(), **extra)
                 if found is not None:
                     _log.warning("no %s record was written for session %s: the record is %s", state, key, found)
@@ -997,9 +1002,10 @@ class RealLauncher:
             return Usage(None, None, None, "session:index-unreadable")
         if rec is None:
             return Usage(None, None, None, "session:unindexed")
-        if rec.get("auth") is not None and rec.get("auth") != self.auth:
+        if rec.get("auth", "passthrough") != self.auth:
             # launched under the other auth (the run servers share one index): this launcher's reading would be the
-            # wrong one (a brokered run read as a passthrough's zero dollars), so the caps (PRE-W L1 W1, L2 MED-1)
+            # wrong one (a brokered run read as a passthrough's zero dollars), so the caps (PRE-W L1 W1, L2 MED-1). A
+            # record with no ``auth`` predates the split socket, when every launch was passthrough (PRE-W L3 r1)
             return Usage(None, None, None, "session:auth-mismatch")
         if rec["state"] in _ZERO_STATES:
             return Usage(0, 0, 0, "session:not-started", actions=0, tunnel_bytes=0, seconds=0)
