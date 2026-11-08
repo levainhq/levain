@@ -1,0 +1,1197 @@
+{
+ "actionable_count": 9,
+ "actions": [
+  {
+   "escalates": [],
+   "gesture": "direct-reported",
+   "target": {
+    "panel_id": "tray"
+   },
+   "tier": "T2",
+   "verb": "spore_seed"
+  }
+ ],
+ "as_of": "<as_of>",
+ "count": 9,
+ "edit_class": "B",
+ "empty": "Nothing yet. Drop a line in the box above and Sage sorts it.",
+ "error": null,
+ "etag": "<etag>",
+ "facets": [
+  "age_days",
+  "attention",
+  "band_number",
+  "board_rank",
+  "board_tier",
+  "disposition",
+  "domain",
+  "due",
+  "fires",
+  "handoff_expired",
+  "held",
+  "held_until",
+  "last_seen",
+  "list_pointer",
+  "overdue",
+  "overdue_days",
+  "repo",
+  "salience",
+  "source",
+  "spore_type",
+  "surface",
+  "target",
+  "tier"
+ ],
+ "filtered": [
+  {
+   "count": 1,
+   "reason": "surface date not reached"
+  }
+ ],
+ "groups": [
+  {
+   "count": 1,
+   "id": "band",
+   "title": "Needs you (answer it in Decisions)"
+  },
+  {
+   "count": 2,
+   "id": "overdue",
+   "title": "Overdue"
+  },
+  {
+   "count": 1,
+   "id": "today",
+   "title": "Today"
+  },
+  {
+   "count": 2,
+   "id": "board",
+   "title": "Ready for agents"
+  },
+  {
+   "count": 2,
+   "id": "talk",
+   "title": "To talk through"
+  },
+  {
+   "count": 1,
+   "id": "also",
+   "title": "Also pending"
+  }
+ ],
+ "held": [
+  {
+   "actions": [
+    {
+     "escalates": [],
+     "gesture": "direct",
+     "target": {
+      "panel_id": "tray",
+      "row_id": "spore:spore-006",
+      "row_version": "9284dd3362484b1f"
+     },
+     "tier": "C1",
+     "verb": "spore_touch"
+    },
+    {
+     "escalates": [],
+     "gesture": "direct",
+     "options": {
+      "spore_kind": [
+       "composted",
+       "done",
+       "dropped"
+      ]
+     },
+     "target": {
+      "panel_id": "tray",
+      "row_id": "spore:spore-006",
+      "row_version": "9284dd3362484b1f"
+     },
+     "tier": "C1",
+     "verb": "spore_descend"
+    },
+    {
+     "escalates": [
+      {
+       "op": "before",
+       "param": "surface_at",
+       "tier": "T2",
+       "value": "2026-11-10"
+      },
+      {
+       "op": "clear",
+       "param": "surface_at",
+       "tier": "T2"
+      }
+     ],
+     "gesture": "direct",
+     "target": {
+      "panel_id": "tray",
+      "row_id": "spore:spore-006",
+      "row_version": "9284dd3362484b1f"
+     },
+     "tier": "C1",
+     "verb": "spore_surface_at"
+    },
+    {
+     "escalates": [
+      {
+       "op": "present",
+       "param": "text",
+       "tier": "T2"
+      },
+      {
+       "op": "present",
+       "param": "domain",
+       "tier": "T2"
+      },
+      {
+       "op": "present",
+       "param": "type",
+       "tier": "T2"
+      },
+      {
+       "op": "eq",
+       "param": "tier",
+       "tier": "T2",
+       "value": "parked"
+      }
+     ],
+     "gesture": "direct",
+     "target": {
+      "panel_id": "tray",
+      "row_id": "spore:spore-006",
+      "row_version": "9284dd3362484b1f"
+     },
+     "tier": "C1",
+     "verb": "spore_update"
+    },
+    {
+     "escalates": [],
+     "gesture": "direct-reported",
+     "target": {
+      "panel_id": "tray",
+      "row_id": "spore:spore-006",
+      "row_version": "9284dd3362484b1f"
+     },
+     "tier": "T2",
+     "verb": "spore_set_disposition"
+    },
+    {
+     "escalates": [],
+     "gesture": "direct-reported",
+     "options": {
+      "spore_kind": [
+       "project",
+       "thread"
+      ]
+     },
+     "target": {
+      "panel_id": "tray",
+      "row_id": "spore:spore-006",
+      "row_version": "9284dd3362484b1f"
+     },
+     "tier": "T2",
+     "verb": "spore_ascend"
+    }
+   ],
+   "badges": [
+    {
+     "kind": "age_days",
+     "value": 0
+    },
+    {
+     "kind": "due",
+     "value": "2026-11-10"
+    }
+   ],
+   "band": "soon",
+   "body": "renew the domain",
+   "emphasis": "none",
+   "facets": {
+    "age_days": 0,
+    "attention": null,
+    "disposition": "agenda",
+    "domain": "",
+    "due": "2026-11-10",
+    "fires": "2026-11-10T09:00",
+    "handoff_expired": false,
+    "held": true,
+    "last_seen": "2026-11-08",
+    "overdue": false,
+    "overdue_days": 0,
+    "salience": 0,
+    "spore_type": "task",
+    "surface": "drop",
+    "target": "desk",
+    "tier": "warm"
+   },
+   "group": "also",
+   "id": "spore:spore-006",
+   "provenance": null,
+   "text_hidden": false,
+   "title": "renew the domain",
+   "truncated": false,
+   "version": "<version>"
+  }
+ ],
+ "id": "tray",
+ "kind": "list",
+ "next": null,
+ "note": "Band rows are what only you can answer: answer them in Decisions. Board rows are the agents' ready queue.",
+ "order": "spore.list",
+ "priority": "gate",
+ "rank": 10,
+ "refresh_every_s": null,
+ "rows": [
+  {
+   "actions": [],
+   "badges": [
+    {
+     "kind": "age_days",
+     "value": 0
+    }
+   ],
+   "band": "later",
+   "body": "the nightly sweep stays red",
+   "emphasis": "none",
+   "facets": {
+    "age_days": 0,
+    "band_number": null,
+    "list_pointer": "answer it in Decisions (levain band)",
+    "source": "levain · claude_code",
+    "surface": "band"
+   },
+   "group": "band",
+   "id": "band:q-0001",
+   "provenance": null,
+   "text_hidden": false,
+   "title": "Ship the sweep fix tonight?",
+   "truncated": false,
+   "version": "<version>"
+  },
+  {
+   "actions": [
+    {
+     "escalates": [],
+     "gesture": "direct",
+     "target": {
+      "panel_id": "tray",
+      "row_id": "spore:spore-007",
+      "row_version": "44ac0bf9c1b40ea5"
+     },
+     "tier": "C1",
+     "verb": "spore_touch"
+    },
+    {
+     "escalates": [],
+     "gesture": "direct",
+     "options": {
+      "spore_kind": [
+       "composted",
+       "done",
+       "dropped"
+      ]
+     },
+     "target": {
+      "panel_id": "tray",
+      "row_id": "spore:spore-007",
+      "row_version": "44ac0bf9c1b40ea5"
+     },
+     "tier": "C1",
+     "verb": "spore_descend"
+    },
+    {
+     "escalates": [],
+     "gesture": "direct",
+     "target": {
+      "panel_id": "tray",
+      "row_id": "spore:spore-007",
+      "row_version": "44ac0bf9c1b40ea5"
+     },
+     "tier": "C1",
+     "verb": "spore_surface_at"
+    },
+    {
+     "escalates": [
+      {
+       "op": "present",
+       "param": "text",
+       "tier": "T2"
+      },
+      {
+       "op": "present",
+       "param": "domain",
+       "tier": "T2"
+      },
+      {
+       "op": "present",
+       "param": "type",
+       "tier": "T2"
+      },
+      {
+       "op": "eq",
+       "param": "tier",
+       "tier": "T2",
+       "value": "parked"
+      }
+     ],
+     "gesture": "direct",
+     "target": {
+      "panel_id": "tray",
+      "row_id": "spore:spore-007",
+      "row_version": "44ac0bf9c1b40ea5"
+     },
+     "tier": "C1",
+     "verb": "spore_update"
+    },
+    {
+     "escalates": [],
+     "gesture": "direct-reported",
+     "target": {
+      "panel_id": "tray",
+      "row_id": "spore:spore-007",
+      "row_version": "44ac0bf9c1b40ea5"
+     },
+     "tier": "T2",
+     "verb": "spore_set_disposition"
+    },
+    {
+     "escalates": [],
+     "gesture": "direct-reported",
+     "options": {
+      "spore_kind": [
+       "project",
+       "thread"
+      ]
+     },
+     "target": {
+      "panel_id": "tray",
+      "row_id": "spore:spore-007",
+      "row_version": "44ac0bf9c1b40ea5"
+     },
+     "tier": "T2",
+     "verb": "spore_ascend"
+    }
+   ],
+   "badges": [
+    {
+     "kind": "overdue_days",
+     "value": 7
+    },
+    {
+     "kind": "age_days",
+     "value": 9
+    },
+    {
+     "kind": "due",
+     "value": "2026-11-01"
+    }
+   ],
+   "band": "now",
+   "body": "an agenda from last week",
+   "emphasis": "accent",
+   "facets": {
+    "age_days": 9,
+    "attention": null,
+    "disposition": "agenda",
+    "domain": "",
+    "due": "2026-11-01",
+    "fires": null,
+    "handoff_expired": false,
+    "last_seen": "2026-10-30",
+    "overdue": true,
+    "overdue_days": 7,
+    "salience": 0,
+    "spore_type": "task",
+    "surface": "spore",
+    "target": null,
+    "tier": "warm"
+   },
+   "group": "overdue",
+   "id": "spore:spore-007",
+   "provenance": null,
+   "text_hidden": false,
+   "title": "an agenda from last week",
+   "truncated": false,
+   "version": "<version>"
+  },
+  {
+   "actions": [
+    {
+     "escalates": [],
+     "gesture": "direct",
+     "target": {
+      "panel_id": "tray",
+      "row_id": "spore:spore-004",
+      "row_version": "164a4a67ac2df7b4"
+     },
+     "tier": "C1",
+     "verb": "spore_touch"
+    },
+    {
+     "escalates": [],
+     "gesture": "direct",
+     "options": {
+      "spore_kind": [
+       "composted",
+       "done",
+       "dropped"
+      ]
+     },
+     "target": {
+      "panel_id": "tray",
+      "row_id": "spore:spore-004",
+      "row_version": "164a4a67ac2df7b4"
+     },
+     "tier": "C1",
+     "verb": "spore_descend"
+    },
+    {
+     "escalates": [],
+     "gesture": "direct",
+     "target": {
+      "panel_id": "tray",
+      "row_id": "spore:spore-004",
+      "row_version": "164a4a67ac2df7b4"
+     },
+     "tier": "C1",
+     "verb": "spore_surface_at"
+    },
+    {
+     "escalates": [
+      {
+       "op": "present",
+       "param": "text",
+       "tier": "T2"
+      },
+      {
+       "op": "present",
+       "param": "domain",
+       "tier": "T2"
+      },
+      {
+       "op": "present",
+       "param": "type",
+       "tier": "T2"
+      },
+      {
+       "op": "eq",
+       "param": "tier",
+       "tier": "T2",
+       "value": "parked"
+      }
+     ],
+     "gesture": "direct",
+     "target": {
+      "panel_id": "tray",
+      "row_id": "spore:spore-004",
+      "row_version": "164a4a67ac2df7b4"
+     },
+     "tier": "C1",
+     "verb": "spore_update"
+    },
+    {
+     "escalates": [],
+     "gesture": "direct-reported",
+     "target": {
+      "panel_id": "tray",
+      "row_id": "spore:spore-004",
+      "row_version": "164a4a67ac2df7b4"
+     },
+     "tier": "T2",
+     "verb": "spore_set_disposition"
+    },
+    {
+     "escalates": [],
+     "gesture": "direct-reported",
+     "options": {
+      "spore_kind": [
+       "project",
+       "thread"
+      ]
+     },
+     "target": {
+      "panel_id": "tray",
+      "row_id": "spore:spore-004",
+      "row_version": "164a4a67ac2df7b4"
+     },
+     "tier": "T2",
+     "verb": "spore_ascend"
+    }
+   ],
+   "badges": [
+    {
+     "kind": "age_days",
+     "value": 3
+    },
+    {
+     "kind": "due",
+     "value": "2026-11-08"
+    }
+   ],
+   "band": "now",
+   "body": "call Sunil",
+   "emphasis": "accent",
+   "facets": {
+    "age_days": 3,
+    "attention": null,
+    "disposition": "agenda",
+    "domain": "",
+    "due": "2026-11-08",
+    "fires": "2026-11-08T11:00",
+    "handoff_expired": false,
+    "last_seen": "2026-11-05",
+    "overdue": true,
+    "overdue_days": 0,
+    "salience": 0,
+    "spore_type": "task",
+    "surface": "drop",
+    "target": "desk",
+    "tier": "warm"
+   },
+   "group": "overdue",
+   "id": "spore:spore-004",
+   "provenance": null,
+   "text_hidden": false,
+   "title": "call Sunil",
+   "truncated": false,
+   "version": "<version>"
+  },
+  {
+   "actions": [
+    {
+     "escalates": [],
+     "gesture": "direct",
+     "target": {
+      "panel_id": "tray",
+      "row_id": "spore:spore-005",
+      "row_version": "bede778e01aa61b4"
+     },
+     "tier": "C1",
+     "verb": "spore_touch"
+    },
+    {
+     "escalates": [],
+     "gesture": "direct",
+     "options": {
+      "spore_kind": [
+       "composted",
+       "done",
+       "dropped"
+      ]
+     },
+     "target": {
+      "panel_id": "tray",
+      "row_id": "spore:spore-005",
+      "row_version": "bede778e01aa61b4"
+     },
+     "tier": "C1",
+     "verb": "spore_descend"
+    },
+    {
+     "escalates": [],
+     "gesture": "direct",
+     "target": {
+      "panel_id": "tray",
+      "row_id": "spore:spore-005",
+      "row_version": "bede778e01aa61b4"
+     },
+     "tier": "C1",
+     "verb": "spore_surface_at"
+    },
+    {
+     "escalates": [
+      {
+       "op": "present",
+       "param": "text",
+       "tier": "T2"
+      },
+      {
+       "op": "present",
+       "param": "domain",
+       "tier": "T2"
+      },
+      {
+       "op": "present",
+       "param": "type",
+       "tier": "T2"
+      },
+      {
+       "op": "eq",
+       "param": "tier",
+       "tier": "T2",
+       "value": "parked"
+      }
+     ],
+     "gesture": "direct",
+     "target": {
+      "panel_id": "tray",
+      "row_id": "spore:spore-005",
+      "row_version": "bede778e01aa61b4"
+     },
+     "tier": "C1",
+     "verb": "spore_update"
+    },
+    {
+     "escalates": [],
+     "gesture": "direct-reported",
+     "target": {
+      "panel_id": "tray",
+      "row_id": "spore:spore-005",
+      "row_version": "bede778e01aa61b4"
+     },
+     "tier": "T2",
+     "verb": "spore_set_disposition"
+    },
+    {
+     "escalates": [],
+     "gesture": "direct-reported",
+     "options": {
+      "spore_kind": [
+       "project",
+       "thread"
+      ]
+     },
+     "target": {
+      "panel_id": "tray",
+      "row_id": "spore:spore-005",
+      "row_version": "bede778e01aa61b4"
+     },
+     "tier": "T2",
+     "verb": "spore_ascend"
+    }
+   ],
+   "badges": [
+    {
+     "kind": "age_days",
+     "value": 1
+    },
+    {
+     "kind": "due",
+     "value": "2026-11-08"
+    }
+   ],
+   "band": "now",
+   "body": "send the invoice",
+   "emphasis": "none",
+   "facets": {
+    "age_days": 1,
+    "attention": null,
+    "disposition": "agenda",
+    "domain": "",
+    "due": "2026-11-08",
+    "fires": "2026-11-08T13:00",
+    "handoff_expired": false,
+    "last_seen": "2026-11-07",
+    "overdue": false,
+    "overdue_days": 0,
+    "salience": 0,
+    "spore_type": "task",
+    "surface": "drop",
+    "target": "desk",
+    "tier": "warm"
+   },
+   "group": "today",
+   "id": "spore:spore-005",
+   "provenance": null,
+   "text_hidden": false,
+   "title": "send the invoice",
+   "truncated": false,
+   "version": "<version>"
+  },
+  {
+   "actions": [],
+   "badges": [],
+   "band": "later",
+   "body": "green",
+   "emphasis": "none",
+   "facets": {
+    "board_rank": 1,
+    "board_tier": "sonnet",
+    "list_pointer": "the agents' ready queue (levain board)",
+    "repo": "levain",
+    "surface": "board"
+   },
+   "group": "board",
+   "id": "board:levain:a",
+   "provenance": null,
+   "text_hidden": false,
+   "title": "Land A",
+   "truncated": false,
+   "version": "<version>"
+  },
+  {
+   "actions": [],
+   "badges": [],
+   "band": "later",
+   "body": "green",
+   "emphasis": "none",
+   "facets": {
+    "board_rank": 2,
+    "board_tier": "opus",
+    "list_pointer": "the agents' ready queue (levain board)",
+    "repo": "levain",
+    "surface": "board"
+   },
+   "group": "board",
+   "id": "board:levain:b",
+   "provenance": null,
+   "text_hidden": false,
+   "title": "Land B",
+   "truncated": false,
+   "version": "<version>"
+  },
+  {
+   "actions": [
+    {
+     "escalates": [],
+     "gesture": "direct",
+     "target": {
+      "panel_id": "tray",
+      "row_id": "spore:spore-002",
+      "row_version": "60880bf5cafebdd8"
+     },
+     "tier": "C1",
+     "verb": "spore_touch"
+    },
+    {
+     "escalates": [],
+     "gesture": "direct",
+     "options": {
+      "spore_kind": [
+       "composted",
+       "done",
+       "dropped"
+      ]
+     },
+     "target": {
+      "panel_id": "tray",
+      "row_id": "spore:spore-002",
+      "row_version": "60880bf5cafebdd8"
+     },
+     "tier": "C1",
+     "verb": "spore_descend"
+    },
+    {
+     "escalates": [],
+     "gesture": "direct",
+     "target": {
+      "panel_id": "tray",
+      "row_id": "spore:spore-002",
+      "row_version": "60880bf5cafebdd8"
+     },
+     "tier": "C1",
+     "verb": "spore_surface_at"
+    },
+    {
+     "escalates": [
+      {
+       "op": "present",
+       "param": "text",
+       "tier": "T2"
+      },
+      {
+       "op": "present",
+       "param": "domain",
+       "tier": "T2"
+      },
+      {
+       "op": "present",
+       "param": "type",
+       "tier": "T2"
+      },
+      {
+       "op": "eq",
+       "param": "tier",
+       "tier": "T2",
+       "value": "parked"
+      }
+     ],
+     "gesture": "direct",
+     "target": {
+      "panel_id": "tray",
+      "row_id": "spore:spore-002",
+      "row_version": "60880bf5cafebdd8"
+     },
+     "tier": "C1",
+     "verb": "spore_update"
+    },
+    {
+     "escalates": [],
+     "gesture": "direct-reported",
+     "target": {
+      "panel_id": "tray",
+      "row_id": "spore:spore-002",
+      "row_version": "60880bf5cafebdd8"
+     },
+     "tier": "T2",
+     "verb": "spore_set_disposition"
+    },
+    {
+     "escalates": [],
+     "gesture": "direct-reported",
+     "options": {
+      "spore_kind": [
+       "project",
+       "thread"
+      ]
+     },
+     "target": {
+      "panel_id": "tray",
+      "row_id": "spore:spore-002",
+      "row_version": "60880bf5cafebdd8"
+     },
+     "tier": "T2",
+     "verb": "spore_ascend"
+    }
+   ],
+   "badges": [
+    {
+     "kind": "age_days",
+     "value": 12
+    }
+   ],
+   "band": "later",
+   "body": "talk about the cockpit",
+   "emphasis": "none",
+   "facets": {
+    "age_days": 12,
+    "attention": "talk",
+    "disposition": "seed",
+    "domain": "",
+    "due": null,
+    "fires": null,
+    "handoff_expired": false,
+    "last_seen": "2026-10-27",
+    "overdue": false,
+    "salience": 0,
+    "spore_type": "task",
+    "surface": "talk",
+    "target": null,
+    "tier": "warm"
+   },
+   "group": "talk",
+   "id": "spore:spore-002",
+   "provenance": null,
+   "text_hidden": false,
+   "title": "talk about the cockpit",
+   "truncated": false,
+   "version": "<version>"
+  },
+  {
+   "actions": [
+    {
+     "escalates": [],
+     "gesture": "direct",
+     "target": {
+      "panel_id": "tray",
+      "row_id": "spore:spore-003",
+      "row_version": "7b23c40a31ed9106"
+     },
+     "tier": "C1",
+     "verb": "spore_touch"
+    },
+    {
+     "escalates": [],
+     "gesture": "direct",
+     "options": {
+      "spore_kind": [
+       "composted",
+       "done",
+       "dropped"
+      ]
+     },
+     "target": {
+      "panel_id": "tray",
+      "row_id": "spore:spore-003",
+      "row_version": "7b23c40a31ed9106"
+     },
+     "tier": "C1",
+     "verb": "spore_descend"
+    },
+    {
+     "escalates": [],
+     "gesture": "direct",
+     "target": {
+      "panel_id": "tray",
+      "row_id": "spore:spore-003",
+      "row_version": "7b23c40a31ed9106"
+     },
+     "tier": "C1",
+     "verb": "spore_surface_at"
+    },
+    {
+     "escalates": [
+      {
+       "op": "present",
+       "param": "text",
+       "tier": "T2"
+      },
+      {
+       "op": "present",
+       "param": "domain",
+       "tier": "T2"
+      },
+      {
+       "op": "present",
+       "param": "type",
+       "tier": "T2"
+      },
+      {
+       "op": "eq",
+       "param": "tier",
+       "tier": "T2",
+       "value": "parked"
+      }
+     ],
+     "gesture": "direct",
+     "target": {
+      "panel_id": "tray",
+      "row_id": "spore:spore-003",
+      "row_version": "7b23c40a31ed9106"
+     },
+     "tier": "C1",
+     "verb": "spore_update"
+    },
+    {
+     "escalates": [],
+     "gesture": "direct-reported",
+     "target": {
+      "panel_id": "tray",
+      "row_id": "spore:spore-003",
+      "row_version": "7b23c40a31ed9106"
+     },
+     "tier": "T2",
+     "verb": "spore_set_disposition"
+    },
+    {
+     "escalates": [],
+     "gesture": "direct-reported",
+     "options": {
+      "spore_kind": [
+       "project",
+       "thread"
+      ]
+     },
+     "target": {
+      "panel_id": "tray",
+      "row_id": "spore:spore-003",
+      "row_version": "7b23c40a31ed9106"
+     },
+     "tier": "T2",
+     "verb": "spore_ascend"
+    }
+   ],
+   "badges": [
+    {
+     "kind": "age_days",
+     "value": 2
+    }
+   ],
+   "band": "later",
+   "body": "talk about the water",
+   "emphasis": "none",
+   "facets": {
+    "age_days": 2,
+    "attention": "talk",
+    "disposition": "seed",
+    "domain": "",
+    "due": null,
+    "fires": null,
+    "handoff_expired": false,
+    "last_seen": "2026-11-06",
+    "overdue": false,
+    "salience": 0,
+    "spore_type": "task",
+    "surface": "talk",
+    "target": null,
+    "tier": "warm"
+   },
+   "group": "talk",
+   "id": "spore:spore-003",
+   "provenance": null,
+   "text_hidden": false,
+   "title": "talk about the water",
+   "truncated": false,
+   "version": "<version>"
+  },
+  {
+   "actions": [
+    {
+     "escalates": [],
+     "gesture": "direct",
+     "target": {
+      "panel_id": "tray",
+      "row_id": "spore:spore-001",
+      "row_version": "5bbfdd0c164e7506"
+     },
+     "tier": "C1",
+     "verb": "spore_touch"
+    },
+    {
+     "escalates": [],
+     "gesture": "direct",
+     "options": {
+      "spore_kind": [
+       "composted",
+       "done",
+       "dropped"
+      ]
+     },
+     "target": {
+      "panel_id": "tray",
+      "row_id": "spore:spore-001",
+      "row_version": "5bbfdd0c164e7506"
+     },
+     "tier": "C1",
+     "verb": "spore_descend"
+    },
+    {
+     "escalates": [],
+     "gesture": "direct",
+     "target": {
+      "panel_id": "tray",
+      "row_id": "spore:spore-001",
+      "row_version": "5bbfdd0c164e7506"
+     },
+     "tier": "C1",
+     "verb": "spore_surface_at"
+    },
+    {
+     "escalates": [
+      {
+       "op": "present",
+       "param": "text",
+       "tier": "T2"
+      },
+      {
+       "op": "present",
+       "param": "domain",
+       "tier": "T2"
+      },
+      {
+       "op": "present",
+       "param": "type",
+       "tier": "T2"
+      },
+      {
+       "op": "eq",
+       "param": "tier",
+       "tier": "T2",
+       "value": "parked"
+      }
+     ],
+     "gesture": "direct",
+     "target": {
+      "panel_id": "tray",
+      "row_id": "spore:spore-001",
+      "row_version": "5bbfdd0c164e7506"
+     },
+     "tier": "C1",
+     "verb": "spore_update"
+    },
+    {
+     "escalates": [],
+     "gesture": "direct-reported",
+     "target": {
+      "panel_id": "tray",
+      "row_id": "spore:spore-001",
+      "row_version": "5bbfdd0c164e7506"
+     },
+     "tier": "T2",
+     "verb": "spore_set_disposition"
+    },
+    {
+     "escalates": [],
+     "gesture": "direct-reported",
+     "options": {
+      "spore_kind": [
+       "project",
+       "thread"
+      ]
+     },
+     "target": {
+      "panel_id": "tray",
+      "row_id": "spore:spore-001",
+      "row_version": "5bbfdd0c164e7506"
+     },
+     "tier": "T2",
+     "verb": "spore_ascend"
+    }
+   ],
+   "badges": [
+    {
+     "kind": "age_days",
+     "value": 0
+    }
+   ],
+   "band": "later",
+   "body": "a plain seed",
+   "emphasis": "none",
+   "facets": {
+    "age_days": 0,
+    "attention": null,
+    "disposition": "seed",
+    "domain": "",
+    "due": null,
+    "fires": null,
+    "handoff_expired": false,
+    "last_seen": "2026-11-08",
+    "overdue": false,
+    "salience": 0,
+    "spore_type": "task",
+    "surface": "spore",
+    "target": null,
+    "tier": "warm"
+   },
+   "group": "also",
+   "id": "spore:spore-001",
+   "provenance": null,
+   "text_hidden": false,
+   "title": "a plain seed",
+   "truncated": false,
+   "version": "<version>"
+  }
+ ],
+ "search": {
+  "default_visible": 10,
+  "fields": [
+   "title",
+   "body",
+   "domain"
+  ],
+  "hook": false,
+  "scope": "rows"
+ },
+ "searchable": true,
+ "skipped": [],
+ "stale_after_s": 900.0,
+ "status": "ok",
+ "title": "List (9)",
+ "today": "2026-11-08",
+ "value": null,
+ "view_rows": {
+  "age": [
+   "spore:spore-002",
+   "spore:spore-007",
+   "spore:spore-004",
+   "spore:spore-003",
+   "spore:spore-005",
+   "band:q-0001",
+   "spore:spore-001",
+   "board:levain:a",
+   "board:levain:b"
+  ]
+ },
+ "views": [
+  {
+   "id": "age",
+   "order": "spore.age",
+   "title": "By age"
+  }
+ ],
+ "window": null
+}

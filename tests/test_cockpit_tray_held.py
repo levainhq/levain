@@ -54,7 +54,7 @@ def test_the_count_and_the_held_back_line_are_what_they_were(tmp_path: Path) -> 
     p = _panel(rig)
     assert p["filtered"] == [{"count": 2, "reason": HELD_REASON}]
     assert p["count"] == 2 and p["status"] == "ok"      # the seed and the legacy note
-    assert p["title"] == "Tray (2)"
+    assert p["title"] == "List (2)"
     assert p["groups"] is not None and sum(g["count"] for g in p["groups"]) == 2
     assert all(rid not in ids for ids in p["view_rows"].values() for rid in [r["id"] for r in p["held"]])
 
@@ -154,7 +154,7 @@ def test_the_text_surface_still_counts_the_held_rows_and_never_lists_them(tmp_pa
 # --- the page -------------------------------------------------------------------------------------
 
 BOX = "document.querySelector('[data-ck-zone] .sp-results') || document.querySelector('.sp-results')"
-TRAY = ("[...document.querySelectorAll('#board .panel')].find(p => /^\\s*Tray/.test("
+TRAY = ("[...document.querySelectorAll('#board .panel')].find(p => /^\\s*List/.test("
         "(p.querySelector('h2')||{}).textContent||''))")
 TOGGLE = f"{TRAY}.querySelector('[data-held-toggle]')"
 HELD_ROWS = f"[...{TRAY}.querySelectorAll('.row[data-held]')]"
