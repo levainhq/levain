@@ -39,9 +39,9 @@ def cq(band, keys, tmp_path):  # noqa: F811
     return ConsentQueue(band.store.directory, authority=lg.source, home=h4_home())
 
 
-def _file(cq, band, *, session=SEAT, command="git push origin main"):
+def _file(cq, band, *, session=SEAT, command="git push origin main", cwd=None):
     return cq.file(agent="claude_code", agent_session_id=session, tool_name="Bash", tool_input={"command": command},
-                   cwd=band.c.path, hold=HOLD)
+                   cwd=cwd or band.c.path, hold=HOLD)
 
 
 def _waiting(band):
@@ -149,7 +149,9 @@ def test_a_band_that_cannot_be_read_is_named_and_the_other_half_still_runs(band,
 
 
 def test_cli_list_shows_the_sign_and_the_waiting_line_and_a_second_list_adds_nothing(band, cq):
-    req = _file(cq, band)
+    # a short cwd: the waiting line cuts the SIGN text at 160 chars, cwd first, so a long pytest basetemp (macOS
+    # /private/var/folders/...) pushed the command off the line; the cwd is not what this test is about
+    req = _file(cq, band, cwd="/work/repo")
     out = io.StringIO()
     assert run_coord(_args(band, "list", all=False, feed=None), out) == 0
     text = out.getvalue()
