@@ -119,7 +119,9 @@ def rows(root: Path | str, *, now: datetime | None = None, signers: SignersSnaps
     """Every request row in the broker's queue at ``root`` (``L/queue``), oldest first.
 
     ``answered`` is True only for an answer row that verifies for its request against ``signers`` (the check the
-    writer and the broker make, :func:`~levain.qbroker.broker.answer_row_refusal`): any ``levain-queue`` member can
+    writer and the broker make, :func:`~levain.qbroker.broker.answer_row_refusal`) over a head the receipts hold
+    now, reaching the request's filing (:meth:`~levain.qbroker.receipts.Receipts.head_refusal`, as the broker's
+    ``Receipts.decided`` requires): any ``levain-queue`` member can
     create a file at an answer's name, so a file being there says nothing. With no snapshot nothing verifies, and
     every row lists as unanswered."""
     store, receipts = _open(root)
@@ -145,7 +147,7 @@ def rows(root: Path | str, *, now: datetime | None = None, signers: SignersSnaps
             received_at=request.received_at, expires_at=request.expires_at,
             state=_state(recorded.get(rid), request.expires_at, stamp),
             answered=signers is not None and store.has_answer(rid)
-            and _signed_answer(row, store.answers / f"{rid}.json", signers, when, ssh_keygen),
+            and _signed_answer(row, store.answers / f"{rid}.json", signers, when, ssh_keygen, receipts, rid),
             claims={k: getattr(request, k) for k in CLAIM_KEYS}))
     return sorted(out, key=lambda r: (r.received_at, r.request_id))
 
@@ -245,15 +247,17 @@ def write_answer(root: Path | str, request_id: str, payload: Mapping[str, Any], 
             return path
         except FileExistsError:
             pass
-        if _clear_squat(store, row, request_id, path, signers, now, ssh_keygen):
+        if _clear_squat(store, receipts, row, request_id, path, signers, now, ssh_keygen):
             raise OperatorError(f"request {request_id} already has an answer row")
     raise OperatorError(f"request {request_id}'s answer name was taken again each time it was cleared")
 
 
 def _signed_answer(row: Mapping[str, Any], path: Path, signers: SignersSnapshot | None, now: datetime,
-                   ssh_keygen: Path | str | None) -> bool:
-    """Whether ``path`` holds a signed answer for the request ``row`` holds (False for a symlink, a non-regular
-    file, an unreadable one, or none)."""
+                   ssh_keygen: Path | str | None, receipts: Receipts, request_id: str) -> bool:
+    """Whether ``path`` holds a signed answer for ``request_id`` (whose request row is ``row``) that the broker could
+    accept: it verifies, and its ``receipts_head`` is a head of ``receipts`` now reaching the request's filing (an
+    answer over another branch's head is refused by ``Receipts.decided``). False for a symlink, a non-regular file,
+    an unreadable one, or none."""
     try:
         got = _read_untrusted(path)
     except (ValueError, OSError):
@@ -264,10 +268,12 @@ def _signed_answer(row: Mapping[str, Any], path: Path, signers: SignersSnapshot 
         answer = _parsed(got)
     except ValueError:
         return False
-    return answer_row_refusal(row, answer, signers, now, ssh_keygen=ssh_keygen) is None
+    if answer_row_refusal(row, answer, signers, now, ssh_keygen=ssh_keygen) is not None:
+        return False
+    return receipts.head_refusal(answer["payload"]["receipts_head"], request_id) is None
 
 
-def _clear_squat(store: QueueStore, row: Mapping[str, Any], request_id: str, path: Path,
+def _clear_squat(store: QueueStore, receipts: Receipts, row: Mapping[str, Any], request_id: str, path: Path,
                  signers: SignersSnapshot | None, now: datetime, ssh_keygen: Path | str | None) -> bool:
     """True when ``path`` holds a signed answer (left in place). Otherwise whatever is there is renamed aside and
     False is returned, for the caller to link its own answer again. What the rename moved is judged again from its
@@ -280,14 +286,14 @@ def _clear_squat(store: QueueStore, row: Mapping[str, Any], request_id: str, pat
     exists: a quarantine file gone is a name cleared, never an error. Any other ``OSError`` is :class:`OperatorError`,
     the one failure the cockpit and phone writers handle."""
     try:
-        return _clear_squat_os(store, row, request_id, path, signers, now, ssh_keygen)
+        return _clear_squat_os(store, receipts, row, request_id, path, signers, now, ssh_keygen)
     except OSError as exc:
         raise OperatorError(f"request {request_id}'s answer name could not be cleared ({exc})") from None
 
 
-def _clear_squat_os(store: QueueStore, row: Mapping[str, Any], request_id: str, path: Path,
+def _clear_squat_os(store: QueueStore, receipts: Receipts, row: Mapping[str, Any], request_id: str, path: Path,
                     signers: SignersSnapshot | None, now: datetime, ssh_keygen: Path | str | None) -> bool:
-    if _signed_answer(row, path, signers, now, ssh_keygen):
+    if _signed_answer(row, path, signers, now, ssh_keygen, receipts, request_id):
         return True
     aside = store.answers / f".quarantine-{request_id}-{os.urandom(8).hex()}.json"
     try:
@@ -295,7 +301,7 @@ def _clear_squat_os(store: QueueStore, row: Mapping[str, Any], request_id: str, 
     except FileNotFoundError:
         return False
     fsync_dir(store.answers)
-    if _signed_answer(row, aside, signers, now, ssh_keygen):
+    if _signed_answer(row, aside, signers, now, ssh_keygen, receipts, request_id):
         try:
             os.link(aside, path, follow_symlinks=False)
         except FileExistsError:

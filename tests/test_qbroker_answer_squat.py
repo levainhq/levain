@@ -363,3 +363,19 @@ def test_a_signed_answer_on_the_inode_the_check_judged_is_linked_back(L, broker,
     assert name.read_bytes() == signed_bytes
     assert sorted(p.name for p in answers.iterdir()) == [name.name]
     assert ask(broker, rid)["decision"] == "deny"
+
+
+# --- prel3fix L3 r1 B2: a signed answer over a head the receipts do not hold is no answer here either ---------------
+
+def test_a_signed_answer_over_a_head_not_in_the_receipts_neither_lists_as_answered_nor_blocks_a_replacement(
+        L, broker, keys, answers):
+    rid = filed(broker)
+    # codex-5: authentic and signed, but over a head this log does not hold (a receipts log restored to another
+    # branch): the broker's Receipts.decided refuses it
+    write_answer(L, rid, keys["operator"], decision="deny", receipts_head={"size": 99, "root": "ab" * 32})
+    listed = {r.request_id: r for r in operator.rows(L / "queue", now=LATER, signers=rbase.snapshot(L))}
+    assert (listed[rid].state, listed[rid].answered) == ("pending", False)
+    payload, sig = rbase.signed(L, rid, keys["operator"])
+    operator.write_answer(L / "queue", rid, payload, sig, rbase.snapshot(L), now=LATER)
+    assert ask(broker, rid)["decision"] == "allow"
+    assert len([p for p in answers.iterdir() if p.name.startswith(f".quarantine-{rid}-")]) == 1
