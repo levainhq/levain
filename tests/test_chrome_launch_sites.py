@@ -251,18 +251,15 @@ def _fake_exe(path: Path) -> str:
     return str(path)
 
 
-def test_the_skip_check_and_the_launch_resolver_agree_on_linux(tmp_path, monkeypatch):
-    """Linux, CHROME unset, only chromium on PATH: the launch uses it (not the macOS bundle path) and the check does not skip."""
+def test_linux_with_chrome_unset_skips_even_with_chromium_on_path(tmp_path, monkeypatch):
+    """Linux, CHROME unset, chromium on PATH: SKIPS (CI's plain shards rely on it) and the launch is not the PATH binary."""
     chromium = _fake_exe(tmp_path / "bin" / "chromium")
     monkeypatch.delenv("CHROME", raising=False)
     monkeypatch.setattr(_shared_chrome.platform, "system", lambda: "Linux")
     monkeypatch.setattr(_shared_chrome.shutil, "which", lambda n: chromium if n == "chromium" else None)
-    assert _shared_chrome._session_chrome() == chromium
-    assert _shared_chrome.chrome_skip_reason() is None
-    monkeypatch.setattr(_shared_chrome.shutil, "which", lambda n: None)
     monkeypatch.setattr(_shared_chrome, "DEFAULT_CHROME", str(tmp_path / "absent" / "Google Chrome"))
-    assert _shared_chrome._session_chrome() == _shared_chrome.DEFAULT_CHROME
-    assert "Chrome is not installed" in _shared_chrome.chrome_skip_reason()
+    assert _shared_chrome._session_chrome() != chromium
+    assert "CHROME is unset" in _shared_chrome.chrome_skip_reason()
 
 
 def test_the_skip_check_follows_the_resolver_to_a_cached_headless_shell(tmp_path, monkeypatch):

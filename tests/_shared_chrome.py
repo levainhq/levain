@@ -97,20 +97,14 @@ def _pick_chrome(given: str, *, explicit: bool = False, flags_file: Path = CHROM
     return given
 
 
-LINUX_CHROMES = ("google-chrome", "google-chrome-stable", "chromium", "chromium-browser")
-
-
 def _session_chrome() -> str:
     """THE resolver for which Chrome runs (the launch and the skip check both read it, nothing else decides): ``CHROME`` when
-    set (explicit), else the shell if installed, else the platform's Chrome (the app bundle on macOS; on Linux the first of
-    ``LINUX_CHROMES`` on PATH, the app-bundle path when none is, which then names nothing and skips)."""
+    set (explicit), else the shell if installed, else the macOS app bundle. There is NO PATH lookup: off macOS with ``CHROME``
+    unset this names nothing usable (CI's plain ``test`` shards rely on every browser test skipping; only the ``browser`` job
+    installs a pinned Chrome and sets ``CHROME``)."""
     named = os.environ.get("CHROME")
     if named:
         named = shutil.which(named) or named   # a command name resolves; a path that resolves to nothing stays as typed and FAILS at launch
-    elif platform.system() == "Linux":
-        named_linux = next((found for found in map(shutil.which, LINUX_CHROMES) if found), None)
-        if named_linux:
-            return _pick_chrome(named_linux)
     return _pick_chrome(named or DEFAULT_CHROME, explicit=bool(named))
 
 
@@ -120,6 +114,8 @@ def chrome_skip_reason() -> str | None:
     (CI sets CHROME on purpose)."""
     if os.environ.get("CHROME"):
         return None
+    if platform.system() != "Darwin":
+        return "CHROME is unset off macOS (only the browser job sets it)"
     chrome = _session_chrome()
     if Path(chrome).is_file() and os.access(chrome, os.X_OK):
         return None
