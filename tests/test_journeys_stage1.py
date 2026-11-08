@@ -1,8 +1,11 @@
 """Stage-1 golden journeys (levain 74, key 1108-39; Phill np-3d6e2bc0 (a): "build the 5 as proposed"). Five runs of what the
 operator actually does on the cockpit, picked from 30 days of his usage ledgers (flow: projects/levain/reference/golden_paths_1108).
-Each one drives the real page in the session's shared headless Chrome (``tests/_page_drive.mjs`` through ``_drive``) over the real
-server and real stores, and asserts what HE sees at the end (the card closed, the signed line, the landed card, the receipt and the
-thread row), with the store read only as the cross-check.
+Each one drives the real page (``tests/_page_drive.mjs`` through ``_drive``) over the real server and real stores, and asserts what HE
+sees at the end (the signed line, the landed card, the receipt and the thread row), with the store read only as the cross-check. J1-J2
+and J4-J5 run in the session's shared headless Chrome; J3 starts its own full Chrome (a service worker and Push need it). A signed
+card staying in the strip is not asserted: the desk's reader, not the page, closes it. J3 covers the legacy notification tap through the
+real worker and the declarative push's absolute ``navigate`` url followed on the server; the worker's stand-down on a declarative
+push needs a WebKit ``Notification.navigate`` that headless Chrome lacks, so that branch is not driven here.
 
   1. sign a band answer in the cockpit's sign sheet with a passkey, an option picked
   2. the NEEDS band at phone width (390x844 by CDP device metrics), a tap on an option answers it
@@ -215,6 +218,13 @@ def test_j3_a_push_is_tapped_and_the_app_lands_on_the_pending_card(tmp_path: Pat
         assert posted == [sub["endpoint"]], posted                           # the push went to the stub, once, and nowhere else
         payload = json.loads(built[-1])
         assert payload["url"] == f"/?view=needs&item={NP_ID}" and isinstance(payload["ping"], int), payload
+        # Apple's declarative push: the worker stands down and the OS opens the push's own absolute `navigate` url. Its payload is the
+        # server's (declarative_payload on the same bytes), and that url, followed on this server, must land on the same card
+        decl = json.loads(sender.declarative_payload(built[-1], origin="https://box.example"))
+        assert decl["web_push"] == 8030 and decl["notification"]["navigate"] == "https://box.example" + payload["url"], decl
+        via = _drive(tmp_path, f"http://localhost:{port}{decl['notification']['navigate'].removeprefix('https://box.example')}#write_token={PUSH_T}", [
+            PHONE, {"until": "document.querySelector('#levain-modal .needs-question') && 1", "ms": 30000},
+            {"eval": "document.querySelector('#levain-modal .needs-q-title').textContent"}])
         out = _phone_tap(tmp_path, f"http://localhost:{port}/#write_token={PUSH_T}", payload)
         quiet = _phone_tap(tmp_path, f"http://localhost:{port}/#write_token={PUSH_T}", payload, tap=False)
     # the control: the same push, no tap: the notification is shown and the app stays where it was (so the landing above is the tap's)
@@ -225,6 +235,7 @@ def test_j3_a_push_is_tapped_and_the_app_lands_on_the_pending_card(tmp_path: Pat
     assert tapped["url"] == payload["url"], tapped                           # the notification carries the server's link
     assert v[6] == "Which retry policy?", v                                  # the app landed on that pending card, open
     assert v[3] == "home", v                                                 # and it did so from the tap, not because it was already open
+    assert via["values"][-1] == "Which retry policy?", via["values"]         # the declarative navigate url lands on that card too
     assert _answer(store, q.n) is None                                       # landing answers nothing
 
 
@@ -249,7 +260,8 @@ def _phone_tap(tmp_path: Path, url: str, payload: dict, *, tap: bool = True) -> 
             {"sw": worker, "ms": 40000},                                      # the real push handler, then the real notificationclick handler
             *([{"until": "document.querySelector('#levain-modal .needs-question') && 1", "ms": 30000},
                {"eval": "document.querySelector('#levain-modal .needs-q-title').textContent"}] if tap else
-              [{"eval": "new Promise(r => setTimeout(r, 4000)).then(() => document.querySelector('#levain-modal .needs-question') ? 'landed' : 'still home')"}]),
+              [{"eval": "new Promise(r => { const t0 = Date.now(); const id = setInterval(() => { const hit = !!document.querySelector('#levain-modal .needs-question');"
+                        " if (hit || Date.now() - t0 > 3000) { clearInterval(id); r(hit ? 'landed' : 'still home'); } }, 50); })"}]),
     ])
 
 
