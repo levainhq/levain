@@ -207,3 +207,14 @@ def test_a_rebuild_at_a_new_width_keeps_the_canvas_on_the_svg_after_the_reader_s
     before, after = _states(out)
     assert before["cv"] and all(abs(v) <= 2 for v in before["cv"].values()), before
     assert after["cv"] and all(abs(v) <= 2 for v in after["cv"].values()), after
+
+
+@needs_browser
+def test_lpr3_a_window_narrowed_to_a_phone_width_hides_the_grip_and_drops_the_stored_height(tmp_path, monkeypatch):
+    """L3 r1 (complement-5, checked): the stage's ResizeObserver rebuilds at the new width, and that build is what hides the grip."""
+    _root, src = _sessions_fixture(tmp_path, monkeypatch)
+    out = _run(tmp_path, src, [*PRIME, {"eval": "localStorage.setItem('%s', '400'); 1" % KEY}, {"eval": _paint(_many(80), "agents")}, WAIT, _mark(),
+                               {"eval": "document.getElementById('ck-hlens').style.width = '360px'; 1"}, WAIT, WAIT, _mark()], first=DESKTOP)
+    wide, narrow = _states(out)
+    assert wide["grip"] and not wide["phone"] and wide["h"] == "400px", wide
+    assert narrow["phone"] and not narrow["grip"] and narrow["h"] == "", narrow

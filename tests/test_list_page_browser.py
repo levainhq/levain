@@ -615,3 +615,22 @@ def test_lpr3_one_carried_desk_row_only_is_counted_in_the_control_and_listed_und
     assert "desk owes 1" in control, control
     assert focus["desk"] and len(focus["desk"]) == 1 and focus["desk"][0].startswith("desk: carried"), focus
     assert focus["needs"] and focus["needs"][0].startswith("desk: carried"), focus        # and it is still under Needs you
+
+
+@needs_browser
+def test_lpr3_the_cards_one_control_is_drawn_once_and_not_redrawn_by_its_own_layout(tmp_path: Path, monkeypatch: Any) -> None:
+    """L3 r1 (gemini-2, checked): drawing the control changes the panel's children; nothing observing the board may fold the card again for it,
+    or the button would be replaced on every pass. The same node is still there after the page has been idle."""
+    src = _carried_install(tmp_path, monkeypatch)
+    with _serve(src, write_token=TOKEN, surface_tokens={"browser": TOKEN}, install_class="reported") as (url, _httpd):
+        out = _drive(tmp_path, f"{url}/", [
+            {"emulate": {"w": 390, "h": 844, "dpr": 2, "mobile": True}},
+            *_reload(),
+            {"until": f"{TRAY} && {TRAY}.querySelector('[data-list-more]') && 1"},
+            {"eval": f"window.__m = {TRAY}.querySelector('[data-list-more]'); window.__n = 0; "
+                     f"new MutationObserver((r) => {{ window.__n += r.length; }}).observe({TRAY}, {{childList: true}}); 1"},
+            {"eval": "new Promise(r => setTimeout(() => r(1), 2500))"},
+            {"eval": f"JSON.stringify({{same: window.__m === {TRAY}.querySelector('[data-list-more]'), n: window.__n, count: {TRAY}.querySelectorAll('[data-list-more]').length}})"},
+        ])
+    got = json.loads(out["values"][-1])
+    assert got == {"same": True, "n": 0, "count": 1}, got
