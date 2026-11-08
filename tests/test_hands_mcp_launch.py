@@ -45,14 +45,14 @@ def codex(rig) -> dict:
 
 def later(monkeypatch, days=31):
     real = hml.load_registry                                  # the log refuses a back-dated link, so the clock moves instead
-    monkeypatch.setattr(hml, "load_registry", lambda root, now=None: real(root, datetime.now(timezone.utc) + timedelta(days=days)))
+    monkeypatch.setattr(hml, "load_registry", lambda root, now=None, **k: real(root, datetime.now(timezone.utc) + timedelta(days=days), **k))
 
 
 # --- refusals first: each leaves every file as it was ----------------------------------------------------------
 
 def test_two_entries_pinning_one_callback_port_refuse_the_render_and_write_nothing(rig, monkeypatch):
     two = [rig.entry("alpha", callback_port=49555), rig.entry("beta", callback_port=49555)]   # the log itself refuses this pair
-    monkeypatch.setattr(hml, "load_registry", lambda root, now=None: (two, []))
+    monkeypatch.setattr(hml, "load_registry", lambda root, now=None, **k: (two, []))
     with pytest.raises(hml.HandsMcpRefused, match="one callback port"):
         prepare(rig)
     assert not rig.claude_file.exists() and not rig.codex_file.exists()
@@ -369,12 +369,12 @@ def test_the_registry_is_read_under_the_hands_lock(rig, monkeypatch):
     rig.register("linear")
     real, seen = hml.load_registry, []
 
-    def spy(root, now=None):
+    def spy(root, now=None, **k):
         fd = hands_live.take_exclusive(rig.entity)          # None while someone (this call) holds the lock
         seen.append(fd is None)
         if fd is not None:
             os.close(fd)
-        return real(root, now)
+        return real(root, now, **k)
     monkeypatch.setattr(hml, "load_registry", spy)
     prepare(rig)
     assert seen == [True]

@@ -42,6 +42,7 @@ import platform
 import re
 import signal
 import subprocess
+import time
 from pathlib import Path
 from typing import Callable, Protocol
 
@@ -177,29 +178,47 @@ def _wait(proc: _Proc, check: Callable[[], tuple[str, str] | None] | None = None
     ``WATCH_S``: a ``gone`` answer raises :class:`_Revoked` at once, an ``unreadable`` one only on the
     ``UNREADABLE_LIMIT``-th in a row, and a readable answer resets that count. Any exception out of the read counts
     as ``unreadable`` (its type named in the reason), never as live; a ``SystemExit`` from a stop signal goes on to
-    the orderly stop."""
+    the orderly stop.
+
+    The read is due every ``WATCH_S`` by the clock, not by a wait that ran its full length, so Ctrl-C pressed faster
+    than ``WATCH_S`` cannot starve it; a read a Ctrl-C cut short is due again at once (L3 1108-23). Before a revoke
+    ends the chat the vendor is polled: one that already exited on its own gives its own code, with no line and no
+    note, since the revoke ended nothing (L3 1108-23, codex MED)."""
+    if check is None:
+        while True:
+            try:
+                return proc.wait()
+            except KeyboardInterrupt:
+                continue
     unreadable = 0
+    due = time.monotonic() + WATCH_S
     while True:
         try:
-            return proc.wait() if check is None else proc.wait(timeout=WATCH_S)
-        except KeyboardInterrupt:
+            try:
+                return proc.wait(timeout=max(0.0, due - time.monotonic()))
+            except subprocess.TimeoutExpired:
+                pass
+            try:
+                moved = check()
+            except Exception as exc:    # noqa: BLE001 - an unconfirmed read is never a live one
+                moved = (hml.UNREADABLE, f"{type(exc).__name__}: {exc}")
+            reason: str | None = None
+            if moved is None:
+                unreadable = 0
+            elif moved[0] == hml.GONE:
+                reason = f"registry entry {moved[1]} was revoked or ran out"
+            else:
+                unreadable += 1
+                if unreadable >= UNREADABLE_LIMIT:
+                    reason = f"the hands grants could not be confirmed ({moved[1]})"
+            if reason is not None:
+                try:
+                    return proc.wait(timeout=0)     # it exited on its own during the read: its code stands
+                except subprocess.TimeoutExpired:
+                    raise _Revoked(reason) from None
+            due = time.monotonic() + WATCH_S
+        except KeyboardInterrupt:       # the vendor's Ctrl-C: the wait goes on, a cut-short read is due at once
             continue
-        except subprocess.TimeoutExpired:
-            pass
-        try:
-            moved = check() if check is not None else None
-        except KeyboardInterrupt:       # the vendor's Ctrl-C landed during the read: no answer this tick
-            continue
-        except Exception as exc:        # noqa: BLE001 - an unconfirmed read is never a live one
-            moved = (hml.UNREADABLE, f"{type(exc).__name__}: {exc}")
-        if moved is None:
-            unreadable = 0
-        elif moved[0] == hml.GONE:
-            raise _Revoked(f"registry entry {moved[1]} was revoked or ran out")
-        else:
-            unreadable += 1
-            if unreadable >= UNREADABLE_LIMIT:
-                raise _Revoked(f"the hands grants could not be confirmed ({moved[1]})")
 
 
 class _Signals:
@@ -338,6 +357,14 @@ def launch_hands_chat(entity_dir: Path | str, vendor: str, cockpit_root: Path | 
     except _Revoked as exc:
         sigs.quiet()
         revoked = exc.reason
+        # "end now" (457 (c)): the hands account's processes are swept FIRST, so a vendor that traps SIGTERM does not
+        # keep the revoked servers through _stop's graceful wait; sudo then exits with its child. Best effort: the
+        # sweep in the finally is the one whose result is reported (L3 1108-23).
+        if hands is not None:
+            try:
+                hands_live.sweep_hands_user(hands.user, uid=hands.uid)
+            except Exception:  # noqa: BLE001 - the final sweep reports
+                pass
         if proc is not None:        # always held here (raised only from the wait); the guard is for the type
             _stop(proc)
     except BaseException:

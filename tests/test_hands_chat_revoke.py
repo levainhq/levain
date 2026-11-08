@@ -292,3 +292,115 @@ def test_a_vendor_with_no_note_agent_is_not_filed_as_codex(monkeypatch, tmp_path
     lines = []
     hc._report_revoked("registry entry g-1 was revoked or ran out", "gemini", lines.append)
     assert len(lines) == 1 and store.open_page(10) == ([], 0)
+
+
+# --- L3 r1 (1108-23) ----------------------------------------------------------------------------------------------
+
+def _alpha(rig):
+    """The rig's one registered entry, as signed."""
+    from levain.authority import _thaw
+    [g] = [_thaw(g) for g in rig.ck.state().policy.grants.values() if g.get("kind") == "hands-mcp"]
+    return g
+
+
+def test_a_revoke_then_a_create_of_the_same_id_between_ticks_ends_the_chat(rig):
+    """codex HIGH: the log allows a revoked id to be created again (a new incarnation, authority ``grant_born``).
+    The running chat's servers came from the old one, so the watch must see the id's birth move, not only its
+    presence. Real append API, real liveness read."""
+    e = _alpha(rig)
+
+    class Swap(FakeChat):
+        def wait(self, timeout=None):
+            if self.waits == 0 and not self.stopped:
+                self.rig.ck.link({"op": "revoke_grant", "grant_id": e["id"]})
+                self.rig.ck.link({"op": "create_grant", "grant": e})       # the same id, born again
+            return super().wait(timeout)
+    chat = Swap(rig, exit_after=6, rc=0)
+    assert e["id"] in rig.ck.state().policy.grants
+    rc, lines = run(rig, chat)
+    assert rc == 77 and chat.stopped
+    [line] = revoked_lines(lines)
+    assert line == f"hands chat: hands revoked: registry entry {e['id']} was revoked or ran out; this chat was ended"
+    assert_released(rig)
+
+
+def test_a_renew_between_ticks_does_not_end_the_chat(rig):
+    """The incarnation is the id's birth, which a renew keeps: only a later expiry, the chat goes on."""
+    from datetime import datetime, timedelta, timezone
+
+    from levain import authority as auth
+    e = _alpha(rig)
+
+    class Renew(FakeChat):
+        def wait(self, timeout=None):
+            if self.waits == 0 and not self.stopped:
+                now = datetime.now(timezone.utc)
+                self.rig.ck.link({"op": "renew", "grant_id": e["id"], "signed_at": auth._stamp(now),
+                                  "expires_at": auth._stamp(now + timedelta(days=30))}, at=now)
+            return super().wait(timeout)
+    chat = Renew(rig, exit_after=4, rc=0)
+    rc, lines = run(rig, chat)
+    assert rc == 0 and not chat.stopped and not revoked_lines(lines)
+    assert_released(rig)
+
+
+@pytest.mark.parametrize("answers,exit_after", [([None, (hml.GONE, "g-1")], 2),
+                                                ([(hml.UNREADABLE, "slow")] * 3, 3)])
+def test_a_chat_that_exited_on_its_own_during_the_read_keeps_its_code(rig, monkeypatch, answers, exit_after):
+    """codex/deepseek MED: the vendor exits while the read runs and the read then says revoked (or the limit is
+    reached). The revoke ended nothing: the vendor's own code, no line, no note."""
+    script(monkeypatch, answers)
+    chat = FakeChat(rig, exit_after=exit_after, rc=9)
+    rc, lines = run(rig, chat)
+    assert rc == 9 and not chat.stopped
+    assert not revoked_lines(lines) and rig.filed == []
+    assert_released(rig)
+
+
+def test_ctrl_c_faster_than_the_watch_does_not_starve_the_read(rig, monkeypatch):
+    """codex/gemini: a Ctrl-C inside every blocking wait restarted a full WATCH_S and the read never ran. The read
+    is due by the clock; a poll (timeout 0) is not where a Ctrl-C lands in this fake, as it is near-instant."""
+    import time as _time
+    monkeypatch.setattr(hc, "WATCH_S", 0.05)
+    script(monkeypatch, [(hml.GONE, "g-1")])
+
+    class Mash(FakeChat):
+        def wait(self, timeout=None):
+            if self.stopped:
+                return -15
+            self.waits += 1
+            if self.waits > 200:
+                raise AssertionError("the read was starved by Ctrl-C")
+            if timeout:
+                _time.sleep(0.01)
+                raise KeyboardInterrupt
+            raise subprocess.TimeoutExpired("chat", timeout)
+    chat = Mash(rig)
+    rc, lines = run(rig, chat)
+    assert rc == 77 and chat.stopped and len(revoked_lines(lines)) == 1
+
+
+def test_on_a_revoke_the_hands_are_swept_before_the_graceful_stop(rig, monkeypatch):
+    """complement MED: "end now". The hands account's processes go before _stop's terminate and its wait, so a vendor
+    that traps SIGTERM does not keep the revoked servers for _STOP_TIMEOUT; the final sweep still runs, under both
+    locks, and is the one reported."""
+    script(monkeypatch, [(hml.GONE, "g-1")])
+    chat = FakeChat(rig)
+    rc, _ = run(rig, chat)
+    assert rc == 77
+    kinds = [e[0] for e in rig.events]
+    assert kinds == ["sweep", "sweep", "terminate", "sweep"]    # pre-start, the revoke's, the stop, the final
+    assert rig.events[1] == ("sweep", (True, True))
+    assert_released(rig)
+
+
+def test_a_stop_that_raises_on_a_revoke_still_reports(rig, monkeypatch):
+    """deepseek MED, refuted on disk (_stop swallows every Exception, and calls no sweep): pinned so it stays so."""
+    script(monkeypatch, [(hml.GONE, "g-1")])
+
+    class Stubborn(FakeChat):
+        def terminate(self):
+            raise PermissionError("sudo runs as root")
+    rc, lines = run(rig, Stubborn(rig))
+    assert rc == 77 and len(revoked_lines(lines)) == 1 and len(rig.filed) == 1
+    assert_released(rig)

@@ -74,9 +74,12 @@ def cockpit_root_of(entity_dir: Path | str) -> Path:
     return Path(entity_dir) / ".levain" / "cockpit"
 
 
-def load_registry(cockpit_root: Path | str, now: datetime | None = None) -> tuple[list[dict[str, Any]], list[tuple[str, str]]]:
+def load_registry(cockpit_root: Path | str, now: datetime | None = None, *,
+                  born: dict[str, int | None] | None = None) -> tuple[list[dict[str, Any]], list[tuple[str, str]]]:
     """``(live entries, skipped (id, why))`` from the cockpit's verified, anchored replay, or :class:`HandsMcpError`.
-    A log that cannot be read is an error, never an empty registry."""
+    A log that cannot be read is an error, never an empty registry. ``born``, when given, is filled from the same
+    replay with each live entry's incarnation: the seq of the link that brought its id into the policy (authority
+    ``grant_born``). A renew keeps it; a revoke and a later create of the same id moves it (L3 1108-23, codex HIGH)."""
     from levain.agent_authority import AgentAuthority
     from levain.authority import NotInitialised
     from levain.cockpit.firejournal import DB_NAME
@@ -89,7 +92,10 @@ def load_registry(cockpit_root: Path | str, now: datetime | None = None) -> tupl
         return [], []                                   # a journal with an empty log registered nothing
     except Exception as exc:  # noqa: BLE001 - a log that cannot be replayed is a fault, never "nothing registered"
         raise HandsMcpError(f"the authority log cannot be read ({type(exc).__name__}: {str(exc)[:160]})") from None
-    return live_entries(state.policy.grants, now or datetime.now(timezone.utc))
+    live, skipped = live_entries(state.policy.grants, now or datetime.now(timezone.utc))
+    if born is not None:
+        born.update({e["id"]: state.grant_born.get(e["id"]) for e in live})
+    return live, skipped
 
 
 def _grants_named(cockpit_root: Path | str, name: str) -> list[dict[str, Any]]:
@@ -604,10 +610,13 @@ class LaunchFiles:
 
     def __init__(self, claude_path: str, codex_path: str, names: list[str], skipped: list[tuple[str, str]],
                  changed: dict[str, bool], *, ids: list[str] | None = None,
+                 born: Mapping[str, int | None] | None = None,
                  cockpit_root: Path | str | None = None) -> None:
         self.claude_path, self.codex_path, self.names, self.skipped, self.changed = (
             claude_path, codex_path, names, skipped, changed)
         self.ids = list(ids or [])                      # the rendered entries' ids, for :func:`launch_still_live`
+        # each rendered id's incarnation (:func:`load_registry`'s ``born``), read in the same replay as the files
+        self.born = dict(born or {})
         self.cockpit_root = cockpit_root
 
 
@@ -635,14 +644,19 @@ UNREADABLE = "unreadable"   # the log could not be read, so nothing is known
 
 def launch_check(res: LaunchFiles, now: datetime | None = None) -> tuple[str, str] | None:
     """:func:`launch_still_live`'s answer as data: None while every entry the files carry is live, else
-    ``(GONE, the first entry id)`` or ``(UNREADABLE, the read error)``. A running chat's watch tells the two apart."""
+    ``(GONE, the first entry id)`` or ``(UNREADABLE, the read error)``. A running chat's watch tells the two apart.
+    An entry is live only as the same incarnation the files were written from: the log lets a revoked id be created
+    again (a new ``grant_born``), and a chat started on the old one is gone even though the id is present again
+    (L3 1108-23, codex HIGH). A renew keeps the incarnation."""
     if not res.ids:
         return None
+    born: dict[str, int | None] = {}
     try:
-        live, _ = load_registry(res.cockpit_root, now)
+        live, _ = load_registry(res.cockpit_root, now, born=born)
     except (HandsMcpError, OSError) as exc:
         return UNREADABLE, str(exc)
-    gone = sorted(set(res.ids) - {e["id"] for e in live})
+    present = {e["id"] for e in live}
+    gone = sorted(i for i in set(res.ids) if i not in present or born.get(i) != res.born.get(i))
     if gone:
         return GONE, gone[0]
     return None
@@ -804,13 +818,15 @@ def prepare_launch(hands: HandsIdentity, entity_dir: Path | str, cockpit_root: P
         # the registry under the lock (L3 r1): it orders this against other launchers and prepares, NOT against a
         # revoke, which is an authority-log append that takes no hands lock (L3 r3 G5); the launcher re-reads the
         # log at its last boundary (:func:`launch_still_live`)
+        born: dict[str, int | None] = {}
         try:
-            live, skipped = load_registry(root, now)
+            live, skipped = load_registry(root, now, born=born)
         except (HandsMcpError, OSError) as exc:        # an unreadable log is no registry: nothing is rendered over it
             raise HandsMcpRefused(f"{exc}; nothing was changed") from None
         claude_body, tables = render_launch(live)
         names = {e["name"] for e in live}
-        out.update(names=sorted(names), skipped=skipped, ids=sorted(e["id"] for e in live))
+        out.update(names=sorted(names), skipped=skipped, ids=sorted(e["id"] for e in live),
+                   born={e["id"]: born.get(e["id"]) for e in live})
         try:
             # judge everything first, changing nothing: both config homes, then both files through the helper (which
             # follows no link), then the merge; only then is a directory made or a file staged
@@ -860,7 +876,7 @@ def prepare_launch(hands: HandsIdentity, entity_dir: Path | str, cockpit_root: P
     except OSError as exc:                              # the lock itself (work() reports its own)
         raise HandsMcpRefused(f"the hands lock could not be taken ({exc}); nothing was changed") from None
     return LaunchFiles(claude_path, codex_path, out["names"], out["skipped"], changed, ids=out["ids"],
-                       cockpit_root=root)
+                       born=out["born"], cockpit_root=root)
 
 
 def cmd_prepare(entity_dir: Path | str, cockpit_root: Path | str | None = None) -> int:
