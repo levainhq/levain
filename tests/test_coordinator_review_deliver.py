@@ -169,7 +169,7 @@ def test_a_long_cwd_never_pushes_the_command_off_the_waiting_line(band, cq):
     deliver.deliver(band.store)
     sign = [ln for ln in deliver.waiting_lines(_waiting(band)) if "SIGN:" in ln]
     assert len(sign) == 1 and cmd in sign[0], sign
-    assert sign[0].index(cmd) < sign[0].index("(in /ddd"), sign
+    assert sign[0].index(cmd) < sign[0].index("(in "), sign
 
 
 def test_cli_clear_reopen_and_feeds(band):
@@ -613,3 +613,16 @@ def test_every_fault_free_run_on_an_existing_store_leaves_one_mark(band, cq):
     _file(cq, band)
     deliver.run(band.store)                    # delivers a SIGN pointer
     assert len(_pass_rows(band)) == 3
+
+
+def test_a_long_command_never_pushes_the_cwd_out_of_the_sign_text():
+    """L3 codex MED (11-08): with the command first, a long command cut the cwd off the stored text whole, so one long
+    command run in /srv/production and /srv/staging read alike. Both parts are now cut on their own."""
+    long_cmd = "./deploy " + "x" * 1900
+    for cwd in ("/srv/production", "/srv/staging"):
+        text = deliver._sign_text("seat", "Bash", long_cmd, cwd)
+        assert len(text) <= deliver._TEXT and text.endswith(f" (in {cwd})") and text.index("./deploy") < text.index("(in ")
+    deep = "/" + "d" * 300 + "/repo"
+    text = deliver._sign_text("seat", "Bash", "git push origin main", deep)
+    assert "git push origin main" in text and text.endswith("/repo)") and len(text) <= deliver._TEXT
+    assert deliver._sign_text("a", "Bash", "ls", "/w") == "a asks to run Bash: ls (in /w)"

@@ -43,6 +43,19 @@ from levain.coordinator.store import CoordError, CoordStore
 __all__ = ["Delivery", "FEEDS_LOCK", "deliver", "faults", "pass_line", "run", "run_exclusive", "waiting_lines"]
 
 _TEXT = 500
+_CWD_KEPT = 120     # the most of a cwd a SIGN text keeps (its tail: the folder nearest the command)
+
+
+def _sign_text(agent: str, tool: str, display: str, cwd: str) -> str:
+    """A SIGN reply's text, at most ``_TEXT`` characters: the command first (a waiting line cuts the text short, and the
+    command is what is decided on), then the cwd, which a long command never pushes out (L3 codex MED: the same long
+    command run in two folders must not read alike). Each part is cut on its own, with an ellipsis. Known edge: a SIGN
+    filed before this wording keeps its old text (replies are append-only and a re-run finds it by request id)."""
+    where = cwd if len(cwd) <= _CWD_KEPT else "\u2026" + cwd[-(_CWD_KEPT - 1):]
+    head, tail = f"{agent} asks to run {tool}: ", f" (in {where})"
+    room = max(0, _TEXT - len(head) - len(tail))
+    what = display if len(display) <= room else display[:max(0, room - 1)] + "\u2026"
+    return (head + what + tail)[:_TEXT]
 
 
 @dataclass
@@ -159,7 +172,7 @@ def deliver(store: CoordStore, *, queue_dir: Path | str | None = None) -> Delive
     for kind, row, thread in todo:
         try:
             if kind == "sign":
-                text = f"{row.agent} asks to run {row.tool_name}: {row.display} (in {row.cwd})"[:_TEXT]
+                text = _sign_text(row.agent, row.tool_name, row.display, row.cwd)
                 reply_id, new = review.push_sign(store, thread, row.id, text, rec=review.NO_REC)
                 out.signs.append((row.id, reply_id, new))
             else:
