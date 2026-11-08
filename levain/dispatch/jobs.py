@@ -169,6 +169,10 @@ NOT_THE_TEMPLATES = "verifier-not-the-template's"
 # the verifier_refused evidence when the minted run is not a contract entry and its steps (the envelope check's own
 # refusal name, so one cause reads the same from either place)
 ENTRY_REFUSED = "verifier-entry"
+# the verifier_refused evidence when the run's route facts name no backend in the gateway's own route map (F9a): no
+# record is written for that run, so the consumer's contrast finds the run missing and escalates; a guessed or
+# placeholder identity could instead pair with a real one and pass as "distinct"
+BACKEND_UNRESOLVED = "backend-unresolved"
 _STORE_ID = re.compile(r"[0-9a-f]{32}")
 
 STATES = ("filed", "signed", "queued", "running", "verifying", "verified", "recommended", "authorised", "adopted",
@@ -672,6 +676,23 @@ def _refuse_repeat(conn: sqlite3.Connection, job: Job, run: int, ticket: str, re
         raise RecordConflict(f"ticket {ticket[:64]} already failed job {job.id} with another outcome")
     if job.state != "verifying":
         raise TransitionRefused(f"job {job.id} is {job.state}; only a verifying job records its verifier")
+
+
+def resolve_backend_identity(routes: Any, route_facts: Any, requested: Any) -> str | None:
+    """The backend identity of the route a run used, read from the GATEWAY'S OWN route map (F9a), never from the
+    model or provider label an answer carries. ``routes`` is the :class:`levain.slot.routemaps.Checked` the run's
+    ticket was minted against, ``route_facts`` the ticket's ``{route, routemap_generation}``, ``requested`` the model
+    the run asked for. ``None`` when anything does not line up: no map, a generation other than the ticket's (the map
+    moved since the mint, so the entry is not the one the run used), a route not in the map, or a model the route does
+    not carry. Never a guess."""
+    if routes is None or not isinstance(route_facts, Mapping) or not isinstance(requested, str):
+        return None
+    if route_facts.get("routemap_generation") != getattr(routes, "generation", None):
+        return None
+    route = route_facts.get("route")
+    entry = routes.routes.get(route) if isinstance(route, str) else None
+    backend = entry.backends.get(requested) if entry is not None else None
+    return backend if isinstance(backend, str) and backend else None
 
 
 def _stored_record(job_id: str, run: Any, text: Any, digest: Any) -> ArtifactRecord:
@@ -1504,11 +1525,20 @@ class JobStore:
         return out
 
     def record_verification(self, run: VerifierRun, *, envelope: bytes | None, event: Mapping[str, Any], repo: str,
-                            tree: str, model: Mapping[str, str]) -> Job:
+                            tree: str, model: Mapping[str, str], routes: Any = None,
+                            route_facts: Mapping[str, Any] | None = None) -> Job:
         """Record the end of run ``run.run``'s verifier session on its verifying job. ``event`` is the session's
         terminal ``state`` event (``session``, ``ticket``, ``at`` and one of ``verifier_report_digest`` /
         ``verifier_report_refused``), ``envelope`` the report envelope file's bytes (``None`` when none was read),
         ``tree`` the run's artifact tree, ``model`` the run's ``{requested, answered, backend_identity}``.
+
+        F9a: given ``route_facts`` (the run ticket's ``{route, routemap_generation}``) the record's
+        ``backend_identity`` is DERIVED by :func:`resolve_backend_identity` from ``routes`` (the route map the ticket
+        was minted against) and any ``backend_identity`` the caller put in ``model`` is overwritten, so a response's
+        label never reaches it. A route that resolves to no backend fails the job ``verifier_refused``,
+        :data:`BACKEND_UNRESOLVED`, writes no run record, and the landing contrast then escalates on the missing run.
+        Without ``route_facts`` the caller's ``model`` is recorded as given (the pre-F9a path, kept for callers that
+        have no route map).
 
         A refused event, a minted run that is not a contract entry and its steps (:data:`ENTRY_REFUSED`), a minted
         verifier entry that is not the template's (:data:`NOT_THE_TEMPLATES`), both checked before anything is
@@ -1556,6 +1586,13 @@ class JobStore:
                 report = check_envelope(envelope, expected=run, event_digest=report_digest)
             except ReportRefused as exc:
                 name = exc.name
+            if name is None and route_facts is not None:
+                identity = resolve_backend_identity(routes, route_facts,
+                                                    model.get("requested") if isinstance(model, Mapping) else None)
+                if identity is None:
+                    name = BACKEND_UNRESOLVED
+                else:
+                    model = {**model, "backend_identity": identity}
         record: ArtifactRecord | None = None
         if name is None:
             verified_at = _verified_at(event["at"])
