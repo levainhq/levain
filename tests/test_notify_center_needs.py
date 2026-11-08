@@ -301,11 +301,11 @@ def test_inert_rows_a_whole_last_bullet_the_structured_fields_and_the_needs_card
     assert [(p[2], p[5]) for p in c["picks"]] == [(None, "DIV"), (None, "DIV")] and c["note"] == ["This sign request is closed: it was answered or withdrawn."], c
     assert n["li"][-1] == "the agency box (the owner) Brian is cc d on the thread OK, pick a" and n["li"][1] == "a cloud VM, e.g. Google Cloud or Linode", n
     assert n["after"][-1].startswith("UL:"), n                                                               # nothing split off the last bullet
-    assert n["note"] == ["No sign page for this item: answer at the desk."] and n["stop"] is None and [p[5] for p in n["picks"]] == ["DIV", "DIV"], n
+    assert n["note"] == ["No sign page for this item: answer at the laptop."] and n["stop"] is None and [p[5] for p in n["picks"]] == ["DIV", "DIV"], n
     base = f"{s['origin']}/sign/{sid}#sign={sid}&v={v['v']}"
     assert s["li"] == ["MX at the new host", "SPF and DKIM set"] and s["why"] == "the DMARC date is 11-16" and s["stop"] == "the MX switch", s
     assert [p[2] for p in s["picks"]] == [base + "&choice=a", base + "&choice=b"] and s["picks"][0][3] == "✓ Rec", s
-    assert q["box"] is True and len(q["picks"]) == 2 and q["note"] == ["No sign page for this item: answer at the desk."], q
+    assert q["box"] is True and len(q["picks"]) == 2 and q["note"] == ["No sign page for this item: answer at the laptop."], q
 
 
 # --- review r2 (L1-1..5, L2-1/2): a bad stored row never takes the list down, a lone surrogate keeps the ping -----------------

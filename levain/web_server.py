@@ -5137,7 +5137,7 @@ def make_server(
     provider registers still draws; the built-in is only the default when none does).
 
     ``coordinator_verbs`` says a coordinator watcher runs beside this server: only then, over a write scope, are the
-    Coordinator panel's Start / Stop / Hold registered (a caller's verb or effect under one of their names is then a
+    Desk panel's Start / Stop / Hold registered (a caller's verb or effect under one of their names is then a
     ``ValueError``). Without a watcher a Stop would end the launch's record while its session ran on.
 
     Non-loopback binding (a LAN / Tailscale IP) is governed by the source's nature:
@@ -5348,7 +5348,7 @@ def make_server(
         extra_verbs.update(team_v)
         extra_effects.update(team_e)
     if coordinator_verbs and source.write_scope is not None:
-        # C10 S3: Start / Stop / Hold on the Coordinator panel, over the directory that panel reads, only beside the
+        # C10 S3: Start / Stop / Hold on the Desk panel, over the directory that panel reads, only beside the
         # watcher that stops a released session and retries a pending launch. The directory is read on each call (the
         # consent reader is attached below), and a caller's verb under one of these names is refused.
         from levain.cockpit import coordinator_status
@@ -5365,7 +5365,7 @@ def make_server(
         coord_v = coordinator_status.status_verbs(coord_dir)
         clash = sorted(n for n in coord_v if n in extra_verbs or n in extra_effects)
         if clash:
-            raise ValueError(f"refusing extra_verbs/extra_effects {clash}: those names are the Coordinator panel's verbs")
+            raise ValueError(f"refusing extra_verbs/extra_effects {clash}: those names are the Desk panel's verbs")
         extra_verbs.update(coord_v)
     stray = sorted(v for v in extra_effects if v not in extra_verbs)
     if stray:
@@ -5844,7 +5844,7 @@ def run_web_server(
     if premium_stt is True:
         sign_kw["premium_stt"] = True    # hidden for 1.0 (levain.cockpit.voice): only a literal True turns the route on
     try:
-        # the Coordinator panel's verbs exactly when the watcher below runs beside this server
+        # the Desk panel's verbs exactly when the watcher below runs beside this server
         httpd = make_server(source, host=host, port=port, chat_host=chat_host, install_class=install_class,
                             coordinator_verbs=write, **sign_kw)
     # bind refused — wildcard/public, an install-bearing/writable source off-loopback, or --chat off-loopback — or
@@ -5923,7 +5923,7 @@ def run_web_server(
     watcher = None
     try:
         if write:
-            # C10 S1: a writable serve supervises the coordinator, over the directory its Coordinator panel reads
+            # C10 S1: a writable serve supervises the coordinator, over the directory its Desk panel reads
             from levain.cockpit.providers import _dispatch_dir
             from levain.coordinator.supervise import Watcher, default_store
 

@@ -157,7 +157,7 @@
     words.addEventListener("input", () => changed());
 
     // ---- where it may work: a picker over the folders this store knows, "Another folder…" last ----
-    const gRepo = group("env-repo", "Where it may work", "The repo the coordinator may change. Nothing outside it.");
+    const gRepo = group("env-repo", "Where it may work", "The repo the desk may change. Nothing outside it.");
     const repo = el("input");           // the typed path: shown only for "Another folder…" (or when no folder is known)
     repo.id = "drop-repo";
     repo.setAttribute("name", "droprepo");        // dash-free, like the Drop box (Safari AutoFill Contact, 11-04)

@@ -1,4 +1,4 @@
-"""The Coordinator panel's Start, Stop and Hold fired with a PAIRED DEVICE's token on the web cockpit.
+"""The Desk panel's Start, Stop and Hold fired with a PAIRED DEVICE's token on the web cockpit.
 
 A paired token resolves to the same credential class the shared write token does (a ``token`` named
 ``paired-<device>``), so the three C1 panel verbs must answer it exactly as they answer the shared token, and must

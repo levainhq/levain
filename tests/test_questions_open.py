@@ -240,7 +240,7 @@ def _through_the_push(monkeypatch, tmp_path, q, extra=""):
 
 
 @pytest.mark.parametrize("ch", ["\U0001F600", "é", '"', "w"])
-@pytest.mark.parametrize("extra", ["", "\nThe coordinator has not read it in 10 minutes; it waits on you."])
+@pytest.mark.parametrize("extra", ["", "\nThe desk has not read it in 10 minutes; it waits on you."])
 def test_the_push_layer_never_cuts_the_options_or_the_answer_line(tmp_path, monkeypatch, ch, extra):
     # codex MED: a 1,000-emoji what and six 600-emoji labels were a 3,800-CHARACTER ping but ~14 KB serialized
     opts = [(f"k{i}", ch * 600) for i in range(6)]

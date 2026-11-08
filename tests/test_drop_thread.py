@@ -223,7 +223,7 @@ def test_a_row_names_its_panel_with_separators_and_shows_its_text_once(tmp_path:
     assert closed["label"].startswith("desk, ") and closed["label"].endswith(": The long reply begins here."), closed
     assert opened["hidden"] is False and opened["previewHidden"] is True, opened
     assert opened["sent"].startswith("sent ") and "2026-10-30" in opened["sent"], opened
-    assert closed["head"] == "Drop to the coordinator" and closed["sub"] == "Your drops and the coordinator's replies", closed
+    assert closed["head"] == "Drop to the desk" and closed["sub"] == "Your drops and the desk's replies", closed
 
 
 def _many(n: int) -> list:
@@ -252,7 +252,7 @@ def test_a_new_coordinator_reply_is_announced_once_and_nothing_else_is(tmp_path:
                                       add("r-new", "desk"), REDRAW, SETTLE2, {"eval": live}])
     first, quiet, mine, new = [x["live"] for x in _all(_run(tmp_path, monkeypatch, steps))]
     assert (first, quiet, mine) == ("", "", ""), (first, quiet, mine)
-    assert new == "The coordinator replied.", new
+    assert new == "The desk replied.", new
 
 
 @needs_browser
