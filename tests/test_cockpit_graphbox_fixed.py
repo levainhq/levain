@@ -13,7 +13,7 @@ from tests.test_cockpit_k10_agents import PRIME, _graph_value
 from tests.test_cockpit_k7_build import DESKTOP, _sessions_fixture
 
 REM = 16
-MAX_REM = 28    # the box is min(60vh, 28rem) tall at most
+MAX_REM = 36    # the box is min(72vh, 36rem) tall at most
 
 
 def _many(n: int) -> dict:
@@ -55,8 +55,9 @@ def _case(tmp_path, monkeypatch, first, name):
 
 def _check(few: dict, many: dict) -> None:
     assert many["nodes"] == 80 and few["nodes"] == 4, (few, many)
-    cap = min(0.6 * many["vh"], MAX_REM * REM) + 2
+    cap = min(0.72 * many["vh"], MAX_REM * REM) + 2
     assert many["box"] <= cap, many                           # the box stops at its fixed height
+    assert many["box"] >= cap - 4, many                     # and it IS that tall: a revert to 60vh / 28rem fails (cap carries +2)
     assert many["inner"] > many["box"], many                  # and the rest of the graph is inside it, scrolled
     assert many["oy"] in ("auto", "scroll"), many
     assert many["doc"] - few["doc"] <= cap, (few, many)       # eighty nodes grew the page by no more than the box's own height

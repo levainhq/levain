@@ -2062,6 +2062,19 @@
     // the spore id is the common reference handle (how flow tracks + you name it,
     // e.g. "compost spore-049") — show it leading so the row is addressable; the TUI
     // shows the same id trailing (tui.render_panel_lines).
+    // A List row's pill names THAT ROW'S OWN origin: its repo, or the lowercase "<origin>:" its text leads with ("desk: ...",
+    // "levain: ..."). Never the store the row sits in (the pointer already says that) and never a repo its words merely mention;
+    // a row with no origin wears no pill. It leads the meta line, inline, so it wraps with the rest of it.
+    let originDrawn = false;
+    if (s.surface) {
+      const lead = /^([a-z][a-z0-9_-]{1,23}):\s/.exec(String(s.text || ""));
+      // the lead word is an origin only when it is a repo this page already knows (the sky's registry) or "desk" / "flow":
+      // "note: call Alice" and "re: invoice" lead with a word, not an origin
+      const leadOrigin = lead ? knownOrigin(lead[1]) : "";
+      const origin = (typeof s.repo === "string" && s.repo) || (!foreign && typeof s.domain === "string" && s.domain) || leadOrigin;
+      originDrawn = !!origin;
+      if (origin) { const pill = el("span", "k7-repo", String(origin)); pill.dataset.repoFacet = String(origin); pill.dataset.originPill = "1"; host.appendChild(pill); }
+    }
     if (s.id && !foreign) { host.appendChild(el("span", "sid", s.id)); row.dataset.spore = String(s.id); }   // the Work lens finds a loop's row by this
     // Tray badges the disposition (a legacy note badges "note"); Open Loops the tier (a parked loop badges "parked").
     let badge;
@@ -2079,7 +2092,6 @@
       if (s.support && !s.text_locked) host.appendChild(el("span", "muted list-support", s.support));
       if (s.list_pointer) host.appendChild(tagEl("muted list-pointer", s.list_pointer));
       if (s.surface === "board") {
-        if (s.repo) host.appendChild(tagEl("muted", s.repo));
         if (s.board_tier) host.appendChild(tagEl("muted", s.board_tier));
       }
       if (Number.isInteger(s.age_days) && s.age_days >= 0) host.appendChild(el("span", "muted", s.age_days + " d"));
@@ -2123,7 +2135,7 @@
     // Build's Open loops draw "open N d" and the repo chip under the title (cockpit.css hides both elsewhere)
     // the integer the kernel sends (the spore's own created date), never the badge words parsed back
     if (Number.isInteger(s.age_days) && s.age_days >= 0) host.appendChild(el("span", "k7-opend", "open " + s.age_days + " d"));
-    if (s.domain) { const rc = el("span", "k7-repo", String(s.domain)); rc.dataset.repoFacet = String(s.domain); host.appendChild(rc); }
+    if (s.domain && !originDrawn) { const rc = el("span", "k7-repo", String(s.domain)); rc.dataset.repoFacet = String(s.domain); host.appendChild(rc); }
     if (verbs && s.id) appendRowVerbs(row, buildSporeVerbs(s, panelKind), panelKind === "tray" ? ["Resolve", "Snooze"] : null, panelKind === "tray" ? 2 : 0);
     return row;
   }
@@ -2141,7 +2153,7 @@
     const bar = el("div", "ep-search");
     const input = el("input", "ep-search-input");
     input.type = "search";
-    input.placeholder = "filter " + noun + " by text or spore-id…";
+    narrowPlaceholder(input, "filter " + noun + " by text or spore-id…", "filter by text or id…");
     input.setAttribute("aria-label", "filter " + kind + " by text or spore id");
     const status = el("span", "ep-search-status", "");
     bar.append(input, status);
@@ -2389,6 +2401,37 @@
       n.textContent = r ? r.text : "";
     }
   }
+  // A placeholder that must fit its box: the full words on a wide screen, a shorter line on a phone (re-chosen when the width crosses).
+  // ONE media listener for every such input, registered once: an input opts in by data-ph-wide / data-ph-narrow, and the
+  // listener sets every opted-in input still in the document (a rebuilt List leaves its old inputs out of it).
+  let phListening = false;
+  let phMq = null;   // held at module scope so the browser cannot collect the list and stop delivering "change"
+  function phNarrow() { try { return typeof window.matchMedia === "function" && window.matchMedia("(max-width: 720px)").matches; } catch (e) { return false; } }
+  function setPlaceholders() {
+    const narrow = phNarrow();
+    for (const i of document.querySelectorAll("[data-ph-wide]")) i.placeholder = narrow ? i.getAttribute("data-ph-narrow") : i.getAttribute("data-ph-wide");
+  }
+  function narrowPlaceholder(input, wide, narrow) {
+    input.setAttribute("data-ph-wide", wide);
+    input.setAttribute("data-ph-narrow", narrow);
+    input.placeholder = phNarrow() ? narrow : wide;
+    if (!phListening && typeof window.matchMedia === "function") {
+      try {
+        phMq = window.matchMedia("(max-width: 720px)");
+        if (phMq && typeof phMq.addEventListener === "function") { phMq.addEventListener("change", setPlaceholders); phListening = true; }   // only once it is registered
+      } catch (e) { /* the placeholder keeps its first choice; a later call may try again */ }
+    }
+  }
+  // an origin a List row's lead word may name: a repo the sky's registry knows, or "desk" / "flow".
+  // Returns the canonical name (the registry's own spelling), or "" when the word is no origin.
+  function knownOrigin(word) {
+    const w = String(word).toLowerCase();
+    if (w === "desk" || w === "flow") return w;
+    const sky = window.LevainSky;
+    const names = sky && typeof sky.repos === "function" ? sky.repos() : [];
+    const hit = names.find((n) => String(n).toLowerCase() === w);
+    return hit === undefined ? "" : String(hit);
+  }
   function buildListIntake() {
     const box = el("div", "tray-dump list-intake");
     const row = el("div", "list-intake-row");
@@ -2397,7 +2440,7 @@
     noContactFill(input);
     input.setAttribute("enterkeyhint", "send");      // overrides the helper's default: this box sends on Enter
     input.setAttribute("aria-label", "add a line to the List");
-    input.placeholder = "@mon 9am call X  ·  ? talk about Y  ·  or a plain line";
+    narrowPlaceholder(input, "@mon 9am call X  ·  ? talk about Y  ·  or a plain line", "@mon 9am call X · ? talk Y");
     input.value = intakeKept.draft;
     input.maxLength = 500;
     const go = el("button", "tray-dump-btn list-intake-btn", "add");
@@ -6226,6 +6269,13 @@
     const bk = (it) => { const b = cardBandNum(it.q.n); return Number(b === undefined ? it.q.n : b); };
     return out.sort((a, b) => (a.later < b.later ? -1 : a.later > b.later ? 1 : bk(a) - bk(b)));
   }
+  // the headline is cut on a word boundary (never mid-token); the page's 2-line clamp does the rest
+  function needsLaterCut(t) {
+    t = String(t);
+    if (t.length <= 160) return t;
+    const c = t.slice(0, 160), i = c.lastIndexOf(" ");
+    return (i > 0 ? c.slice(0, i) : c).replace(/[\s,;:]+$/, "") + "\u2026";   // the last space anywhere before the limit; a headline with none keeps its one token to the limit
+  }
   function needsLaterLine(it) {
     const row = el("div", "needs-later-line band-later");
     row.dataset.needsLater = String(it.q.n);
@@ -6236,11 +6286,11 @@
     tag.hidden = bn === undefined;
     const words = el("span", "ext-meta needs-later-text", it.q.laterWords || it.q.later);
     const title = el("span", "ext-meta needs-later-title", "");
-    row.append(el("span", "ext-meta needs-later-mark", "LATER"), tag, words, title);
+    row.append(tag, words, title);        // no per-row LATER word: the section's one header says it (a narrow screen wrapped it "LAT / ER")
     questionBody(it.q, row).then((b) => {
       if (!b || b.error) return;
       const first = needsFirstSentence(b.what);
-      if (first) title.textContent = " \u00b7 " + (first.replace(/^\s*DESK OWES:\s*/i, "") || first).slice(0, 80);
+      if (first) title.textContent = needsLaterCut(first.replace(/^\s*DESK OWES:\s*/i, "") || first);
     });
     return row;
   }
@@ -6830,7 +6880,14 @@
       sec.append(toggle, body);
       return sec;
     };
-    const laterSection = (rows) => { const sec = el("div", "needs-later"); for (const it of rows) sec.appendChild(needsLaterLine(it)); return sec; };
+    const laterSection = (rows) => {
+      const sec = el("div", "needs-later");
+      const hd = el("div", "needs-later-head");       // one header like Just answered's: the label and the count, then the rows
+      hd.append(el("span", "needs-sec-label", "Later"), el("span", "needs-answered-n", String(rows.length)));
+      sec.appendChild(hd);
+      for (const it of rows) sec.appendChild(needsLaterLine(it));
+      return sec;
+    };
     // each tab draws its own LATER lines: a "you" row never sits in the Desk owes tab, nor a desk one in Needs you
     const laterShown = prefs.tab === "desk" ? laterDesk : laterYou;
     if (!items.length && !desk.length && !laterYou.length && !laterDesk.length) {

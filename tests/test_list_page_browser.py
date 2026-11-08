@@ -183,3 +183,164 @@ def test_open_loops_is_off_the_board_tab_and_on_build(tmp_path: Path) -> None:
     assert shown_values == [False, True], v                            # absent on Board, present on Build
     board = json.loads(next(x for x in v if isinstance(x, str) and x.startswith('{"cols"')))
     assert board["hs"] is True and board["cols"] in (None, "1"), board  # the right column is gone, not a hole
+
+
+# --- the List at a true phone width, with real-shaped rows (levain 72, key 1108-34, lane listmobile) ---------------------------
+
+
+def _seed_phone(root: Path) -> None:
+    """Rows shaped like the ones on an operator's phone: band rows led by their own origin ("desk:", "levain:") with a long
+    unbroken detail line, a spore that merely MENTIONS a repo, more spores than the first page, and held rows."""
+    from datetime import date, timedelta
+
+    from levain.consent.questions import QuestionStore
+
+    qdir = default_queue_dir()
+    qdir.mkdir(parents=True, exist_ok=True, mode=0o700)
+    qs = QuestionStore(qdir)
+    long_path = "/Users/someone/Briefcase/levain/project_memory/1108-34-handoff/a_very_long_unbroken_path_name_for_the_detail_line.md"
+    qs.file(agent="claude_code", agent_session_id="s1", what="desk: Write the BJE 1.6.2 release plan Monday 11-09 morning, then file the go as a band row.",
+            options=[("ship", "Ship it"), ("hold", "Hold")], rec="hold",
+            blocks=f"Monday 11-09 morning (competitor research, harder-selling copy) {long_path}", cwd="/w/levain")
+    qs.file(agent="claude_code", agent_session_id="s2", what="levain: TUE 11-10: read the release essay draft 2 and fill its 17 slots; it ships with a long tail of words after that",
+            options=[("ship", "Ship it"), ("hold", "Hold")], rec="hold",
+            blocks=f"Tuesday 11-10, your read (04_DRAFT.md; levain 59 surfaces the essay) {long_path}", cwd="/w/levain")
+    store = SporeStore(root / ".levain" / "memory.spores.json")
+    store.add(type="task", text="TALK: HACK THE ECHO: reflash an old Echo (routed by desk 26 on 11-07)", disposition="seed", attention="talk")
+    for i in range(14):
+        store.add(type="task", text=f"a plain seed number {i} with some words to fill the line a bit", disposition="seed")
+    far = (date.today() + timedelta(days=30)).isoformat()
+    store.add(type="task", text="a held seed", disposition="seed", next=far)
+
+
+_PHONE_PROBE = f"""(() => {{
+  const T = {TRAY}; const card = T.getBoundingClientRect(); const out = {{rows: [], over: [], pills: [], ph: []}};
+  const clip = (n) => {{ const r = n.getBoundingClientRect(); return r.width > 0 && (r.right > card.right + 0.5 || r.left < card.left - 0.5); }};
+  for (const row of T.querySelectorAll('.sp-results .row')) {{
+    const clause = row.querySelector('.clause'); const txt = clause ? clause.textContent : '';
+    const pills = [...row.querySelectorAll('.k7-repo,.rp-tag')];
+    const det = row.querySelector('.list-support');
+    const b = (n) => n.getBoundingClientRect();
+    for (const p of pills) if (det) {{ const a = b(p), d = b(det);
+      if (a.left < d.right && a.right > d.left && a.top < d.bottom && a.bottom > d.top) out.over.push(txt.slice(0, 30) + ' | ' + p.textContent); }}
+    for (const n of [row, ...row.querySelectorAll('.list-meta, .list-meta > *, .clause')]) if (clip(n)) out.over.push('edge ' + txt.slice(0, 30) + ' | ' + n.className + ' ' + Math.round(b(n).left) + '-' + Math.round(b(n).right) + ' card ' + Math.round(card.left) + '-' + Math.round(card.right));
+    out.rows.push({{t: txt.slice(0, 24), pills: pills.map(p => p.textContent), support: !!det}});
+  }}
+  for (const sel of ['.list-intake-input', '.ep-search-input']) {{
+    const i = T.querySelector(sel); const cs = getComputedStyle(i); const c = document.createElement('canvas').getContext('2d');
+    c.font = cs.font; const w = c.measureText(i.placeholder).width;
+    out.ph.push({{sel, w, room: i.clientWidth - parseFloat(cs.paddingLeft) - parseFloat(cs.paddingRight), ph: i.placeholder}});
+  }}
+  out.hs = document.documentElement.scrollWidth <= window.innerWidth + 1;
+  return JSON.stringify(out);
+}})()"""
+
+
+@needs_browser
+def test_the_list_fits_a_390_phone_with_real_shaped_rows(tmp_path: Path) -> None:
+    root, src, _ids = _install(tmp_path)
+    _seed_more(root)
+    _seed_phone(root)
+    shots = Path(os.environ.get("LEVAIN_LIST_SHOTS") or tmp_path)
+    shots.mkdir(parents=True, exist_ok=True)
+    with _serve(src, write_token=TOKEN, surface_tokens={"browser": TOKEN}, install_class="reported") as (url, _httpd):
+        out = _drive(tmp_path, f"{url}/", [
+            {"emulate": {"w": 390, "h": 844, "dpr": 3, "mobile": True}},
+            *_reload(),
+            {"until": f"{TRAY} && {TRAY}.querySelectorAll('.sp-results .row[data-surface=band]').length > 1 && 1"},
+            {"eval": f"{TRAY}.scrollIntoView(); 1"},
+            {"eval": _PHONE_PROBE},
+            {"shot": str(shots / "phone_390.png")},
+        ])
+    got = json.loads(next(x for x in out["values"] if isinstance(x, str) and x.startswith('{"rows"')))
+    assert got["over"] == [], got["over"]                              # nothing overlaps the detail line or passes the card's edge
+    assert got["hs"] is True, got                                      # and the page does not scroll sideways
+    for ph in got["ph"]:
+        assert ph["w"] <= ph["room"] + 0.5, ph                         # neither placeholder is cut at 390
+    by = {r["t"]: r for r in got["rows"]}
+    desk = next(r for t, r in by.items() if t.startswith("desk:"))
+    assert desk["pills"] in ([], ["desk"]), desk                       # a "desk:" row names desk or nothing, never the band's store
+    lev = next(r for t, r in by.items() if t.startswith("levain:"))
+    assert lev["pills"] in ([], ["levain"]), lev
+    mention = next(r for t, r in by.items() if "HACK THE ECHO" in r["t"] or t.startswith("TALK"))
+    assert mention["pills"] == [], mention                             # a row that only MENTIONS a repo wears no pill
+
+
+# --- listfix2 (levain 72, key 1108-34): one pill per row, one media listener, a lead word is an origin only if known -----------
+
+_MQ_SPY = ("(function(){const o=window.matchMedia.bind(window);window.__mqAdds=0;"
+           "window.matchMedia=function(q){const m=o(q);if(/max-width:\\s*720px/.test(q)){const a=m.addEventListener.bind(m);"
+           "m.addEventListener=function(t,f,c){window.__mqAdds++;return a(t,f,c);};}return m;};})()")
+
+_LISTFIX_PROBE = f"""(() => {{
+  const T = {TRAY}; const rows = [];
+  for (const row of T.querySelectorAll('.sp-results .row')) {{
+    const clause = row.querySelector('.clause');
+    const meta = row.querySelector('.list-meta') || row;
+    rows.push({{t: (clause ? clause.textContent : '').slice(0, 24), surface: row.dataset.surface || '',
+      pills: [...meta.querySelectorAll('.k7-repo')].map(p => p.textContent), all: row.querySelectorAll('.k7-repo').length}});
+  }}
+  return JSON.stringify({{rows}});
+}})()"""
+
+
+@needs_browser
+def test_listfix2_one_pill_one_listener_and_known_origins_only(tmp_path: Path) -> None:
+    from levain.consent.questions import QuestionStore
+
+    root, src, _ids = _install(tmp_path)
+    _seed_more(root)
+    _seed_phone(root)
+    qs = QuestionStore(default_queue_dir())
+    qs.file(agent="claude_code", agent_session_id="s3", what="note: call Alice about the thing on Friday",
+            options=[("ship", "Ship it"), ("hold", "Hold")], rec="hold", blocks="detail", cwd="/w/levain")
+    from datetime import date, timedelta
+    SporeStore(root / ".levain" / "memory.spores.json").add(type="task", text="plain domain row zz", domain="life", disposition="seed",
+                                                            next=(date.today() + timedelta(days=30)).isoformat())   # held: the path that draws a trailing chip
+    ph = f"{TRAY}.querySelector('.list-intake-input').placeholder"
+    with _serve(src, write_token=TOKEN, surface_tokens={"browser": TOKEN}, install_class="reported") as (url, _httpd):
+        out = _drive(tmp_path, f"{url}/", [
+            {"emulate": {"w": 390, "h": 844, "dpr": 3, "mobile": True}},
+            {"init": _MQ_SPY},
+            {"eval": "localStorage.setItem('levain.tray.showHeld', '1'); 1"},
+            *_reload(),
+            {"until": f"{TRAY} && {TRAY}.querySelectorAll('.sp-results .row[data-surface=band]').length > 1 && 1"},
+            # the registry must know "levain" and that row must have drawn its pill before the probe reads it
+            {"until": f"window.LevainSky && window.LevainSky.repos().includes('levain') && {TRAY} && "
+                      f"[...{TRAY}.querySelectorAll('.sp-results .row')].some(r => (r.querySelector('.clause')||{{}}).textContent "
+                      f"&& r.querySelector('.clause').textContent.startsWith('levain:') && r.querySelector('.k7-repo')) && 1"},
+            {"eval": _LISTFIX_PROBE},
+            {"eval": "JSON.stringify({adds: window.__mqAdds})"},
+            # rebuild the List the way the page does on a refresh: the tab coming back
+            *[{"eval": "document.dispatchEvent(new Event('visibilitychange')); 1"} for _ in range(6)],
+            {"eval": "new Promise(r => setTimeout(() => r(1), 1500))"},
+            {"eval": "JSON.stringify({adds: window.__mqAdds})"},
+            {"eval": f"JSON.stringify({{ph: {ph}}})"},
+            {"emulate": {"w": 1000, "h": 844, "dpr": 1}},
+            {"until": f"{ph}.startsWith('@mon 9am call X  ') && 1"},
+            {"eval": f"JSON.stringify({{ph: {ph}}})"},
+            {"emulate": {"w": 390, "h": 844, "dpr": 3, "mobile": True}},
+            {"until": f"{ph} === '@mon 9am call X · ? talk Y' && 1"},
+        ])
+    vals = [json.loads(x) for x in out["values"] if isinstance(x, str) and x.startswith("{")]
+    rows = vals[0]["rows"]
+    by = {r["t"]: r for r in rows}
+    bad: list[str] = []
+    dom = next(r for r in rows if r["t"].startswith("plain domain row"))
+    if not (dom["pills"] == ["life"] and dom["all"] == 1):
+        bad.append(f"A: a domain row carries one chip, got {dom}")                # A: one chip, not two
+    note = next(r for t, r in by.items() if t.startswith("note:"))
+    if note["pills"] != []:
+        bad.append(f"C: 'note:' is no origin, got {note}")                         # C: a lead word counts only if known
+    for lead in ("desk", "levain"):
+        got = next(r for t, r in by.items() if t.startswith(lead + ":"))["pills"]
+        if got != [lead]:
+            bad.append(f"C: '{lead}:' should show {lead}, got {got}")
+    first, after = vals[1]["adds"], vals[2]["adds"]
+    if first != 1:
+        bad.append(f"B: expected exactly one media listener after the first build, got {first}")
+    if after != first:
+        bad.append(f"B: the media listener count grew {first} -> {after}")        # B: no listener per rebuild
+    assert vals[3]["ph"].startswith("@mon 9am call X · "), vals[3]                 # narrow at 390
+    assert vals[4]["ph"].startswith("@mon 9am call X  ·  "), vals[4]               # wide again after the width change
+    assert not bad, bad

@@ -2185,6 +2185,7 @@
     for (const row of document.querySelectorAll(".ck-zgrid .row")) {
       const clause = row.querySelector(":scope > .clause");
       if (!clause) continue;
+      if (row.dataset.surface) continue;   // a List row names its own origin (a pill the page drew); its words never choose one
       const home = tagHome(row, clause);
       if (home.inMeta && row.querySelector(":scope > .k7-repo")) continue;   // a chip already names the repo (Build's loops)
       // decided again on every pass, on the row's words without its own tag: a repo noted later can be the longer name
