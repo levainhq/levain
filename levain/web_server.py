@@ -1959,12 +1959,14 @@ class _LevainHTTPServer(ThreadingHTTPServer):
     stream_gate: threading.BoundedSemaphore
     stream_heartbeat_s: float
     stream_stop: threading.Event
+    room_waiter_gate: threading.BoundedSemaphore
     stream_watcher: "cockpit_stream.Watcher"
 
     def __init__(self, *args: Any, **kwargs: Any) -> None:
         self.stream_gate = threading.BoundedSemaphore(cockpit_stream.DEFAULT_MAX_STREAMS)
         self.stream_heartbeat_s = cockpit_stream.DEFAULT_HEARTBEAT_S
         self.stream_stop = threading.Event()
+        self.room_waiter_gate = threading.BoundedSemaphore(cockpit_room.WAITERS_MAX)
         self.stream_watcher = cockpit_stream.Watcher(self._watch_manifest, epoch=secrets.token_hex(4))
         # PAIR: the paired lookups' and the claim's own semaphores (RT-3, RP-4), and the in-process revocation epoch
         # a revoke bumps AFTER its transaction commits, which every open stream compares before each frame (RU-3)
@@ -2442,11 +2444,16 @@ class _Handler(GuardedHandler):
                 _log.debug("paired device last_seen stamp skipped", exc_info=True)
         return device
 
-    def _transport(self) -> dict[str, bool]:
-        """The manifest's ``transport``: the same two flags ``/substrate.json`` carries."""
-        return {"writable": self.server.levain_source.write_scope is not None,
-                "write_token_required": self._write_token_required() or self._writes_need_credential(),
-                "owner_key": self._owner_key_accepted()}
+    def _transport(self) -> dict[str, Any]:
+        """The manifest's ``transport``: the same flags ``/substrate.json`` carries, and ``room`` (where the room is read
+        and how: its cursor, thread and long-poll bound) only on a server that mounts a room."""
+        out: dict[str, Any] = {"writable": self.server.levain_source.write_scope is not None,
+                               "write_token_required": self._write_token_required() or self._writes_need_credential(),
+                               "owner_key": self._owner_key_accepted()}
+        if self.server.room_host is not None:
+            out["room"] = {"read": cockpit_room.ROOM_PATH, "cursor": "gseq", "after": True, "thread": True,
+                           "wait_max_s": cockpit_room.WAIT_MAX_S}
+        return out
 
     def _writes_need_credential(self) -> bool:
         """K2a: a writable surface needs a credential on every write, on every bind."""
@@ -3818,13 +3825,65 @@ class _Handler(GuardedHandler):
                 self._send(b"busy\n", "text/plain; charset=utf-8", status=503, head=head)
                 return
             try:
+                after, _thread = cockpit_room.parse_cursor(query)
+                wait = cockpit_room.parse_wait(query, after)
+            except cockpit_room.CursorError as e:
+                self.server.request_gate.release()
+                self._send(cockpit_room.encode({"error": "bad_request", "message": str(e)}),
+                           "application/json; charset=utf-8", status=400, head=head,
+                           headers=[("Vary", _WRITE_TOKEN_HEADER)], cache_control="private, no-store")
+                return
+            try:
                 host = self.server.room_host
                 status, payload = cockpit_room.serve_room(path, directory=directory, service=self.server.chat_service,
                                                           view=host.view if host is not None else None, query=query)
             finally:
                 self.server.request_gate.release()
+            if wait is not None and status == 200 and not head:
+                waited = self._room_wait(path, directory, query, wait, (status, payload))
+                if waited is None:      # the credential ended, or the peer went: the one token 403
+                    self._gated_read_403("the room record needs", head=head)
+                    return
+                status, payload = waited
         self._send(cockpit_room.encode(payload), "application/json; charset=utf-8", status=status, head=head,
-                   headers=[("Vary", _WRITE_TOKEN_HEADER)], cache_control="private, no-store")
+                   headers=[("Vary", _WRITE_TOKEN_HEADER)] + ([("Retry-After", "2")] if status == 503 else []),
+                   cache_control="private, no-store")
+
+    def _room_wait(self, path: str, directory: Any, query: str, wait: int,
+                   first: "tuple[int, dict[str, Any]]") -> "tuple[int, dict[str, Any]] | None":
+        """The long-poll half of ``_serve_room`` (``first`` is the read the request gate already admitted). The wait holds
+        NO ``request_gate`` or read slot: each tick re-reads under a non-blocking ``request_gate`` slot of its own (a busy
+        gate skips the tick), and the wait itself is counted by ``room_waiters`` (cap ``cockpit_room.WAITERS_MAX``, past it a 503
+        with ``Retry-After``, like ``stream_gate``). Before each re-read the credential is re-checked by the change
+        stream's own check (``_stream_allowed``: a paired device must still be live, the epoch and the journal read
+        fresh); a surface token is never revoked from the panel, so it has none. None: the caller answers 403."""
+        srv = self.server
+        allowed = self._stream_allowed()
+        if not srv.room_waiter_gate.acquire(blocking=False):
+            return 503, {"error": "busy", "message": "too many rooms waiting; read again shortly"}
+        host = srv.room_host
+
+        def read() -> "tuple[int, dict[str, Any]] | None":
+            if not srv.request_gate.acquire(blocking=False):
+                return None
+            try:
+                return cockpit_room.serve_room(path, directory=directory, service=srv.chat_service,
+                                               view=host.view if host is not None else None, query=query)
+            finally:
+                srv.request_gate.release()
+
+        first_given = []
+
+        def one() -> "tuple[int, dict[str, Any]] | None":
+            if not first_given:
+                first_given.append(True)
+                return first
+            return read()
+
+        try:
+            return cockpit_room.wait_for_news(one, wait, allowed=allowed, alive=self._peer_open, stop=srv.stream_stop)
+        finally:
+            srv.room_waiter_gate.release()
 
     def _room_post(self, route: tuple[str, str | None], req: Any) -> tuple[dict[str, Any], int]:
         """``POST /cockpit/room/*`` (RM-F), reached only past ``do_POST``'s write gate (a surface token on every bind).
