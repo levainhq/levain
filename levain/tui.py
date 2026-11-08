@@ -547,7 +547,7 @@ def _render_tray(view: SubstrateView) -> list[str]:
     if err:
         return [f"(unavailable — {err})"]
     if not view.tray:
-        return ["(tray clear)"]
+        return ["(List clear)"]
     return [
         f"[{s.disposition}] {_oneline(s.text)}"
         + (f" → surface {_oneline(s.next)}" if s.next else "")

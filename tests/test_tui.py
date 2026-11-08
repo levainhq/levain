@@ -559,13 +559,13 @@ def test_render_tray_badges_disposition():
 def test_render_tray_empty_state_and_no_keep_panel():
     v = SubstrateView(paths=AnnealPaths.from_db(Path("/x/memory.db")))
     tray_panel = next(p for p in v.layout() if p["kind"] == "tray")
-    assert tui.render_panel_lines(v, tray_panel) == ["(tray clear)"]
+    assert tui.render_panel_lines(v, tray_panel) == ["(List clear)"]
     assert not any(p["kind"] == "keep" for p in v.layout())
 
 
 def test_spore_panels_degraded_on_store_fault_not_false_zero():
     # Honesty floor (no_data != no_event): a spore-store fault lands under "open_spores"; the TUI
-    # must render DEGRADED on all three projections, NEVER a false "(no open loops)/(tray clear)/
+    # must render DEGRADED on all three projections, NEVER a false "(no open loops)/(List clear)/
     # (keep empty)" over an unreadable store. (The bug: TUI renderers ignored view.errors while the
     # web path already degraded — caught by codex L3 on the trust audit.)
     v = SubstrateView(paths=AnnealPaths.from_db(Path("/x/memory.db")),
@@ -575,7 +575,7 @@ def test_spore_panels_degraded_on_store_fault_not_false_zero():
         lines = tui.render_panel_lines(v, panel)
         assert len(lines) == 1
         assert "unavailable" in lines[0] and "SporeError" in lines[0], (kind, lines)
-        for false_zero in ("(no open loops)", "(tray clear)"):
+        for false_zero in ("(no open loops)", "(List clear)"):
             assert false_zero not in lines[0], (kind, lines)
 
 

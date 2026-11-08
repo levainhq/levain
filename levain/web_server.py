@@ -1260,6 +1260,8 @@ _ASSETS: dict[str, tuple[str, str]] = {
     "/cockpit_view.js": ("cockpit_view.js", "text/javascript; charset=utf-8"),
     # The topology's renderer (F12b): the work view drawn in the Build tab's Sessions card from the topology panel's value.
     "/topology_view.js": ("topology_view.js", "text/javascript; charset=utf-8"),
+    # The agents card's detail view (P9b): a row opens the verbs the cockpit offered on it, posted through the page's own transport.
+    "/agents_view.js": ("agents_view.js", "text/javascript; charset=utf-8"),
     # The ambient panel's sky: its own asset so the renderer and the sky evolve apart.
     "/sky.js": ("sky.js", "text/javascript; charset=utf-8"),
     # The change stream's client: one fetch-read stream per page, through the page's own read transport.
@@ -5259,8 +5261,17 @@ def _build_broker(source: SubstrateSource, install_class: str | None,
     if scope is None:
         return None
     spores, episodes = scope.anneal.spores_json, scope.anneal.episodic_db
+    from levain.cockpit.coord_effects import COORDINATOR, CoordDropEffectStore
+    from levain.cockpit.providers import _dispatch_dir
+
+    def coord_dir() -> Any:
+        # the directory the C1 sort path writes (verbs._intake_fire): the consent reader is attached after the server
+        # is built, so it is read on each call, and a call before that resolves as a server with none does
+        return _dispatch_dir(getattr(httpd, "consent_reader", None))
+
     return Broker(scope.ledger_root / "cockpit",
                   stores={SPORES: SporeEffectStore(spores), EPISODES: EpisodeEffectStore(episodes),
+                          COORDINATOR: CoordDropEffectStore(coord_dir),
                           **({SECTIONS: SectionEffectStore(episodes)} if section_paths_agree(scope.anneal)
                              else {})},
                   install_class=install_class, store_paths=[spores, episodes], downstream=downstream,

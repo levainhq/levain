@@ -102,12 +102,14 @@ are not rank-contiguous). Regions are content: they are hashed into the manifest
 ### Kernel default layout
 
 `build_default_cockpit` places: `brief` the state line; `widgets` Health; `operate` (rank order)
-Tray 10 and Open loops 15 (both `tall`), Recent episodes 40, Recent edits 60 (no Keep card: a parked loop is an Open loops row marked parked, a legacy `note` row shows in the Tray), Recent jobs 70 (`medium`);
+The List (wire id `tray`) 10 and Open loops 15 (both `tall`), Recent episodes 40, Recent edits 60 (no Keep card: a parked loop is an Open loops row marked parked, a legacy `note` row shows on the List), Recent jobs 70 (`medium`);
 `mind` the Neocortex tabs card (one tab per continuity heading, ranked in heading order from 0, span 2, `tall`), Crystallized patterns 100
 (`tall`) and the Cognition card (graph 200 and projection history 210, `tabs="Cognition"`, `short`). Ranks 16-39 of
 `operate` are left for an embedder's Inbox, Fleet and Stream; a rank outside the kernel's bands is the embedder's.
 A zone grid row's height is its tallest card's, and the cards in a row stretch to it.
 The `Neocortex` and `Cognition` tab titles are the kernel's: a panel that joins one with a different `size` or `span` than the card's first member is refused, so an embedder panel registered before the sections refuses every section, and one registered after them is refused itself. A discovered panel's rank and verbs are re-read at every manifest, so a heading moved while the server runs moves its tab.
+
+**The List.** The operator's `List` panel (wire id `tray`, a code name that does not change) is a view over three sources: the band, the board and the spore store. Band rows are read-only pointers to Decisions and never a second needs-you list; board rows are what the machine can do next; spore rows carry only the verbs their own row offers. Open loops are machine-side; the page shows them on its Build tab rather than the Board tab (their place in the kernel layout above is unchanged). A one-line intake sits on top, with a grammar the server parses (a parser informs, it never authorises): `@when words` is a scheduled drop to the desk (a signed T2 write), `? words` is a talk seed (a signed T2 write), and a plain line is sent to the desk to sort (a C1 write, which asks the desk and does not wake it with authority). The receipt prints verbatim, a line that cannot be read is refused in words with nothing written, and a signature still pending is reported as pending, never as fired.
 
 **Reading tokens.** `value.symbol` is optional and one of `clear`, `clear-night`, `partly-cloudy`,
 `partly-cloudy-night`, `cloudy`, `fog`, `drizzle`, `rain`, `heavy-rain`, `thunderstorm`, `snow`, `sleet`, `wind`,

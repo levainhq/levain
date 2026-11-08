@@ -25,5 +25,10 @@ const desks = []; for (let i = 0; i < 15; i++) desks.push(q("desk", "open"));
 pg = C.deskTabPage(desks, "desk", 10);
 check(pg.dt.desk === 15 && pg.shown.length === 10 && pg.total === 15, "15 desk rows: label counts 15, page cuts to 10");
 check(C.deskTabPage([q("you", "open")], "you", 10).dt.show === false, "no desk row: plain cut, no tabs");
+// an open question dated past today (its served later day) counts in no tab, as on the strip (L3 later2 r1, codex MED)
+const dated = { question: { section: "you", state: "open", carried: false, later: "2099-01-01" } };
+const dt2 = C.deskTabs([q("you", "open"), dated, q("desk", "open")]);
+check(dt2.you === 1 && dt2.desk === 1, "a dated question is not counted: " + dt2.you + "/" + dt2.desk);
+check(C.deskTabs([{ question: { section: "you", state: "open", later: "soon" } }, q("desk", "open")]).you === 1, "a malformed later day is due");
 console.log(failures === 0 ? "ALL PASS" : failures + " FAILED");
 process.exit(failures === 0 ? 0 : 1);

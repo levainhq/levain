@@ -186,3 +186,67 @@ def test_a_question_body_carries_blocks_full_only_when_its_store_has_one(tmp_pat
         assert "blocks_full" not in plain and plain["blocks"] == q.blocks
         httpd.question_store = Host(dataclasses.replace(q, blocks_full=7))     # not a string: not carried
         assert "blocks_full" not in _get_status(f"{base}/cockpit/question/{q.n}.json", TOKEN)[1]
+
+
+# Phill 11-07 (296): a pending consent row stops drawing the terminal "copy allow" / "copy deny" lines where a passkey answers;
+# they stay where it cannot (the sheet only says why, or the cockpit has no sheet for the row). The body route is real; only the
+# sheet it reads is a stand-in that returns the row (or none) the case needs.
+_COPY_LINES = ("[...document.querySelectorAll('#levain-modal [data-consent-row] .consent-body .consent-cmd .consent-copy')]"
+               ".map(b => b.textContent)")
+
+
+class _Sheet:
+    def __init__(self, keys: "list[str] | None", queue_dir: Path, signers: bool = True) -> None:
+        self.keys, self.queue_dir, self.signers = keys, queue_dir, signers
+
+    def row(self, _rid: str) -> "dict | None":
+        if self.keys is None:
+            return None
+        return {"options": [{"key": k} for k in self.keys], "signers": ["fp"] if self.signers else [], "sha256": "v" * 64}
+
+
+def _pending_consent_copy_lines(tmp_path: Path, monkeypatch, keys: "list[str] | None", signers: bool = True) -> list:
+    from datetime import timedelta
+
+    from levain.consent.queue import ConsentQueue, authority_source
+    from tests._h4 import h4_home
+    from tests.test_cockpit_consent_rows import OPEN_DECISIONS, TILE
+
+    home = tmp_path / "levain_home"
+    monkeypatch.setenv("LEVAIN_HOME", str(home))
+    (home / "consent").mkdir(parents=True, mode=0o700)
+    q = ConsentQueue(home / "consent", authority=authority_source(home / "consent", anchor=None), home=h4_home())
+    q.file(agent="claude_code", agent_session_id="s", tool_name="Bash", tool_input={"command": "ls /w"}, cwd="/w",
+           hold=timedelta(minutes=5), event_id="cc1")
+    _root, src, _ids = _install(tmp_path)
+    with _serve(src, surface_tokens={"browser": "T"}, install_class="reported") as (url, httpd):
+        httpd.consent_sheet = None if keys is None else _Sheet(keys, home / "consent", signers)
+        out = _drive(tmp_path, f"{url}/#write_token=T", [
+            {"until": TILE},
+            {"eval": OPEN_DECISIONS},
+            {"until": "document.querySelector('#levain-modal [data-consent-row] .consent-display')", "ms": 30000},
+            {"eval": "new Promise(r => setTimeout(() => r(1), 600))"},
+            {"eval": _COPY_LINES},
+        ])
+    return out["values"][-1]
+
+
+@needs_browser
+def test_a_pending_consent_row_with_a_passkey_answer_draws_no_copy_lines(tmp_path, monkeypatch) -> None:
+    assert _pending_consent_copy_lines(tmp_path, monkeypatch, ["allow", "deny"]) == []
+
+
+@needs_browser
+def test_a_pending_t3_row_with_deny_only_choices_keeps_only_the_allow_copy_line(tmp_path, monkeypatch) -> None:
+    """A passkey never signs a T3 allow, so the terminal key is the only allow route: its line stays, the deny line goes."""
+    assert _pending_consent_copy_lines(tmp_path, monkeypatch, ["deny"]) == ["copy allow"]
+
+
+@needs_browser
+def test_a_pending_consent_row_no_passkey_can_answer_keeps_the_copy_lines(tmp_path, monkeypatch) -> None:
+    assert _pending_consent_copy_lines(tmp_path, monkeypatch, ["allow", "deny"], signers=False) == ["copy allow", "copy deny"]
+
+
+@needs_browser
+def test_a_pending_consent_row_with_no_sheet_keeps_the_copy_lines(tmp_path, monkeypatch) -> None:
+    assert _pending_consent_copy_lines(tmp_path, monkeypatch, None) == ["copy allow", "copy deny"]

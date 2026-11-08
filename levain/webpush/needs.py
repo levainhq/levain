@@ -32,9 +32,13 @@ def open_needs_count(queue_dir: "Path | str") -> "int | None":
     except Exception:  # noqa: BLE001 - this half is unknown; the other is still read, but the answer is None
         failed = True
     try:
+        from levain.band_view import later_facets
         from levain.consent.questions import QuestionStore
 
-        total += len(QuestionStore(queue_dir).open_questions())
+        store = QuestionStore(queue_dir)
+        # an open question snoozed past today is not counted, as on the strip (band_view.later_facets, the one LATER
+        # predicate; a fault there is due, so the question still counts)
+        total += sum(1 for q in store.open_questions() if later_facets(store, q) is None)
     except Exception:  # noqa: BLE001 - likewise
         failed = True
     # a half that could not be read makes the count unknown, never a smaller number: a partial count could lower a real badge (6 -> 2)

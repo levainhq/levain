@@ -26,7 +26,7 @@ TOP_MAX = 80
 
 def memory_glance_reader(view: Callable[[Any], Any]) -> Callable[[Any], Result]:
     """``read(ctx)`` over the cycle's substrate view (``view(ctx)``): the store's episode counts and the open
-    spores (Tray and Open loops), with the first open loop named."""
+    spores (the List's own and Open loops), with the first open loop named."""
     def read(ctx: Any) -> Result:
         v = view(ctx)
         for k in ("store", "health"):

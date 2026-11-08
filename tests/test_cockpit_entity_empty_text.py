@@ -31,8 +31,8 @@ def _install(tmp_path: Path, *, store: bool, config: bool) -> SubstrateSource:
 
 
 def test_the_wording_names_the_entity_and_falls_back_to_the_capture_boxs_name() -> None:
-    assert spore_empty("tray", NAME) == f"Nothing yet. Drop a thought in the box above and {NAME} sorts it."
-    assert spore_empty("loops", NAME) == f"Nothing yet. What stays open after {NAME} sorts the Tray is listed here."
+    assert spore_empty("tray", NAME) == f"Nothing yet. Drop a line in the box above and {NAME} sorts it."
+    assert spore_empty("loops", NAME) == f"Nothing yet. What stays open after {NAME} sorts the List is listed here."
     for blank in (None, "", "   ", 3):
         assert SPORE_EMPTY_ENTITY in spore_empty("tray", blank)
     assert OLD not in "".join(providers.SPORE_EMPTY.values())
@@ -73,7 +73,7 @@ def test_a_rename_with_no_store_shows_on_the_next_read(tmp_path: Path) -> None:
 @needs_browser
 def test_the_page_names_the_entity_in_the_empty_tray_and_loops(tmp_path: Path) -> None:
     src = _install(tmp_path, store=True, config=False)
-    texts = ("[...document.querySelectorAll('#board .panel')].filter(p => /^\\s*(Tray|Open loops)/.test("
+    texts = ("[...document.querySelectorAll('#board .panel')].filter(p => /^\\s*(List|Open loops)/.test("
              "(p.querySelector('h2')||{}).textContent||'')).map(p => (p.querySelector('.empty')||{}).textContent||'')")
     with _Served(src, surface_tokens={"browser": "T"}, install_class="reported") as url:
         out = _drive(tmp_path, f"{url}/", [
