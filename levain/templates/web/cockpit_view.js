@@ -167,6 +167,8 @@
     return [];
   }
 
+  // the stores a List row can come from (the `surface` facet): the kernel names them, the page only labels and filters by them
+  const LIST_SURFACES = ["band", "board", "spore", "talk", "drop"];
   const HIDDEN_TEXT = "contains hidden characters; edit with the CLI";
   function sporeOf(pid, row, groupTitles, hidden, today) {
     const f = row.facets || {};
@@ -176,6 +178,14 @@
       disposition: f.disposition, text: row.body || row.title, next: f.due || null, held: f.held === true, today: typeof today === "string" ? today : null,
       descend_kinds: kindsOf(t.actions, "spore_descend"), ascend_kinds: kindsOf(t.actions, "spore_ascend"),
       group_title: row.group ? (groupTitles.get(row.group) || row.group) : null, group: row.group || null,
+      // the List's facets (a panel that sends no `surface` is the old Tray and draws as before): which store the row comes from
+      // and what the kernel computed about it. The page reads these, never derives them (no date maths on `fires`, no grammar).
+      surface: LIST_SURFACES.indexOf(f.surface) >= 0 ? f.surface : null,
+      fires: typeof f.fires === "string" && f.fires ? f.fires : null, overdue: f.overdue === true,
+      deliver_to: typeof f.target === "string" && f.target ? f.target : null,
+      attention: typeof f.attention === "string" && f.attention ? f.attention : null,
+      list_pointer: typeof f.list_pointer === "string" && f.list_pointer ? f.list_pointer : null,
+      repo: typeof f.repo === "string" && f.repo ? f.repo : null, board_tier: typeof f.board_tier === "string" && f.board_tier ? f.board_tier : null,
     }, t, hidden && hidden.has(row.id) ? { text_locked: HIDDEN_TEXT } : {});
   }
 
@@ -495,7 +505,8 @@
   // rather than an inherited function.
   const tableOf = (o) => Object.assign(Object.create(null), o);
   const TABS_OF_ID = tableOf({
-    tray: "morning board", loops: "board build", episodes: "board", "team-status": "board",
+    // Open loops is machine-side (Phill 11-07: the Tray BECOMES the List, Open loops stays machine-side): off the default Board tab, on Build
+    tray: "morning board", loops: "build", episodes: "board", "team-status": "board",
     edits: "build", jobs: "build", sessions: "morning board", "coord-morning": "morning board", "review-queue": "morning board", topology: "build", health: "memory",
     graph: "memory", wraps: "memory", crystals: "memory"
   });

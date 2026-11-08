@@ -1445,3 +1445,56 @@ class TestHealthOraclesRound2:
         for age, want in ((2.5, "3h ago"), (3.5, "4h ago"), (0.99, "under 1h ago")):
             h.save_age_hours = age
             assert want in (health_oracle_line(h) or "")
+
+
+# --- THE LIST's page (levain 64 L3): string-level pins on the served assets and the frozen payload ------------------
+
+class TestListPagePins:
+    WEB = Path(__file__).resolve().parent.parent / "levain" / "templates" / "web"
+
+    def _js(self, name: str) -> str:
+        return (self.WEB / name).read_text()
+
+    def _fn(self, src: str, head: str, tail: str) -> str:
+        a = src.index(head)
+        return src[a:src.index(tail, a)]
+
+    def test_open_loops_is_on_build_only_and_the_list_keeps_morning_and_board(self) -> None:
+        view = self._js("cockpit_view.js")
+        assert 'tray: "morning board", loops: "build",' in view
+        assert 'loops: "board build"' not in view
+
+    def test_the_intake_box_posts_one_line_and_holds_no_grammar(self) -> None:
+        core = self._js("dashboard_core.js")
+        box = self._fn(core, "function buildListIntake()", "    return box;\n  }")
+        assert 'commit({ kind: "list_intake", line })' in box
+        assert "noContactFill(input)" in box and 'ev.key === "Enter"' in box
+        assert "receipt_line" in box and "intakeKept" in box
+        # the grammar is the server's: the box has no regular expression, no @ or ? test, no date maths
+        for tell in ("RegExp", "startsWith(\"@\")", "startsWith(\"?\")", "new Date", "[0]===\"@\"", "/^@", "/^\\?"):
+            assert tell not in box, tell
+        assert "list_intake" in self._js("dashboard_boot.js").split("function panelActionFor")[1].split("async function manifestCommit")[0]
+
+    def test_a_refusals_reason_reaches_the_box_and_501_503_have_words(self) -> None:
+        boot = self._js("dashboard_boot.js")
+        assert 'code === "intake_refused"' in boot
+        assert "intake_refused:" in boot and "source_unavailable:" in boot
+
+    def test_a_band_or_board_row_returns_before_any_verb(self) -> None:
+        core = self._js("dashboard_core.js")
+        row = self._fn(core, "  function sporeRow(", "  // The filter bar the spore panels share")
+        foreign = row[row.index("if (foreign) {"):]
+        foreign = foreign[:foreign.index("return row;")]
+        assert "buildSporeVerbs" not in foreign and "appendRowVerbs" not in foreign 
+
+    def test_the_frozen_payload_offers_band_and_board_rows_no_verb_and_the_panel_offers_the_intake(self) -> None:
+        import json
+
+        panel = json.loads((Path(__file__).parent / "fixtures" / "list_panel.json").read_text())
+        assert panel["id"] == "tray" and "list_intake" in {a["verb"] for a in panel["actions"]}
+        surfaces = {r["facets"]["surface"] for r in panel["rows"]}
+        assert {"band", "board", "spore", "talk", "drop"} <= surfaces
+        for r in panel["rows"]:
+            if r["facets"]["surface"] in ("band", "board"):
+                assert r["actions"] == [] if "actions" in r else True, r["id"]
+        assert panel["note"]
