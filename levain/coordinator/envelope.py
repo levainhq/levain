@@ -386,14 +386,17 @@ def widens(base: Mapping[str, Any], new: Mapping[str, Any]) -> bool:
 
 
 def launch_allowance(envelope: Mapping[str, Any], where_repo: str, now: datetime, used: int) -> int:
-    """The seats still launchable in ``where_repo`` under ``envelope`` (the EFFECTIVE body, what the store resolves
-    after attenuations): 0 when the grant is absent, the repo is not covered, ``now`` is at or past ``stop_at``, or
-    ``used`` has reached the count; never negative. Pure: the caller's own log supplies ``used`` (levain keeps no
-    counter for a signed grant), and it launches only while this is above 0, then logs one more.
+    """The arithmetic of a launch allowance, NOT the decision: the seats left in ``where_repo`` under ``envelope`` (the
+    EFFECTIVE body, what the store resolves after attenuations): 0 when the grant is absent, the repo is not covered,
+    ``now`` is at or past ``stop_at``, or ``used`` has reached the count; never negative. It reads no liveness (a
+    revoked signing key, a superseded or unbound envelope, a moved thread revision all pass here), so the desk asks
+    :meth:`levain.coordinator.envelopes.EnvelopeStore.launch_allowance`, which checks those first and then calls this.
 
-    Check-then-act by design: this reads a count, it reserves nothing. The CALLER serialises its launches and reads
-    ``used`` under its own lock (flow's launch log), or two launches racing on one read both see the last seat free.
-    ``now`` is an aware datetime; anything else is refused, never compared."""
+    Pure: the caller's own log supplies ``used`` (levain keeps no counter for a signed grant), and it launches only
+    while the answer is above 0, then logs one more. Check-then-act by design: this reads a count, it reserves
+    nothing. The CALLER serialises its launches and reads ``used`` under its own lock (flow's launch log), or two
+    launches racing on one read both see the last seat free. ``now`` is an aware datetime; anything else is refused,
+    never compared."""
     if type(used) is not int or used < 0:
         raise EnvelopeError("used is a count of seats already launched, an integer from 0")
     if not isinstance(now, datetime) or now.utcoffset() is None:

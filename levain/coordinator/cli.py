@@ -424,12 +424,12 @@ def _effects(body: dict[str, Any], old: dict[str, Any] | None) -> list[str]:
             text = _effect_text(kind, e, body["stop_at"])
             # unchanged means the line READ is the same (a launch line carries its stop, so a moved stop changed it)
             mark = "" if old is None else "+ added: " if key not in before else \
-                "= unchanged: " if before[key] == e and _effect_text(kind, before[key], old["stop_at"]) == text \
+                "= unchanged: " if before[key] == e and _effect_text(kind, before[key], old.get("stop_at")) == text \
                 else "~ changed: "
             L.append(f"    {mark}{text}")
         for key, e in before.items():
             if key not in now_keys:
-                L.append(f"    - removed: {_effect_text(kind, e, old['stop_at'])}")
+                L.append(f"    - removed: {_effect_text(kind, e, old.get('stop_at'))}")
         if not body.get(kind) and not any(k not in now_keys for k in before):
             L.append("    none")
     return L
@@ -697,7 +697,8 @@ def run_envelope_echo(args: argparse.Namespace, out: Any) -> int:
 
 def run_envelope_extend(args: argparse.Namespace, out: Any) -> int:
     """``levain envelope extend THREAD --budget K=N,...`` (C6, T6): the body that raises a thread's budget, for YOU to
-    sign. It is the thread's head envelope as narrowed (its effective where, effects and stop) with the budget you
+    sign. It is the thread's head envelope as narrowed (its effective where, effects and stop; never its launch grant,
+    which the card shows removed) with the budget you
     name (keys you leave out keep the head's), a worded envelope bound to the thread's current revision that supersedes
     the head. Writing it grants nothing: only ``levain envelope sign`` (your key) makes it an envelope."""
     from levain.coordinator import budget
@@ -734,8 +735,9 @@ def run_envelope_extend(args: argparse.Namespace, out: Any) -> int:
             "supersedes": {"envelope_id": head.envelope_id, "digest": head.digest, "seen": seen},
             "draft": None, "where": eff["where"], "lands": eff["lands"], "pushes": eff["pushes"], "publishes": eff["publishes"],
             "budget": new_budget, "stop_at": eff["stop_at"], "issued_at": utc_stamp(now)}
-    if eff.get(env.LAUNCH_LIST):          # extend keeps what the head holds, a launch grant included
-        body[env.LAUNCH_LIST] = eff[env.LAUNCH_LIST]
+    # extend never carries the head's launch grant: the desk counts launches per envelope, so a copy under the new id
+    # would start its count again and replenish what was used (L3 r2). The card shows it removed; a grant is signed anew.
+    dropped_launches = bool(eff.get(env.LAUNCH_LIST))
     text = canonical(body)
     store.check_body(text)
     with read_transaction(store._connect) as conn:
@@ -743,9 +745,13 @@ def run_envelope_extend(args: argparse.Namespace, out: Any) -> int:
     used = "" if g is None else ("used so far on this thread: " + ", ".join(
         f"{k} {budget._num(k, g.used[k])}" for k in budget.METERS) + "; dollars not metered")
     shown = _view(body, store) + (f"\n{used}" if used else "")
+    if dropped_launches:
+        shown += ("\nthe head's launch grant is NOT carried: once this is signed the desk may start no seat without "
+                  "asking; a launch grant is signed on its own (the cockpit's Add an envelope)")
     if args.output is not None:
         _write_new(args.output, text + "\n", args.force)
     _emit(out, args.json, {"body": body, "digest": env.envelope_digest(body), "used": None if g is None else g.used,
+                           "launches_dropped": dropped_launches,
                            "file": None if args.output is None else str(args.output)},
           shown + (f"\nbody written to {args.output}; YOU sign it: `levain envelope sign {args.output} "
                    "--signing-key KEY`" if args.output is not None else f"\nbody: {text}"))

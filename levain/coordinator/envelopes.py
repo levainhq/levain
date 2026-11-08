@@ -709,6 +709,24 @@ class EnvelopeStore(CoordStore):
             return f"envelope {envelope_id}'s signature no longer holds: {refused}"
         return None
 
+    def launch_allowance(self, envelope_id: str, thread_id: str, where_repo: str, *, authority: AuthoritySnapshot,
+                         used: int) -> int:
+        """The seats the desk may still start in ``where_repo`` for ``thread_id`` under ``envelope_id``: the launch
+        decision. 0 unless the envelope is live as the thread's CURRENT head (:meth:`live_refusal` with ``new_pin``:
+        bound, signed for the thread's revision, not superseded, not killed or ended, before its stop, and its
+        signature still held under ``authority``, a fresh snapshot); then :func:`envelope.launch_allowance` over the
+        effective body, at the same store instant, in the same read. ``used`` is the desk's own count of seats it
+        launched under this envelope for this repo (levain keeps none). The caller still serialises its launches and
+        reads ``used`` under its own lock: this reads, it reserves nothing."""
+        if type(used) is not int or used < 0:
+            raise env.EnvelopeError("used is a count of seats already launched, an integer from 0")
+        with read_transaction(self._connect) as conn:
+            now = self._stamp()
+            if self._live_refusal(conn, now, envelope_id, thread_id, authority, True) is not None:
+                return 0
+            return env.launch_allowance(self._effective(conn, envelope_id, thread_id), where_repo, parse_stamp(now),
+                                        used)
+
     def _chain(self, conn: sqlite3.Connection, envelope_id: str, thread_id: str) -> list[str]:
         """``envelope_id`` and every successor in its chain for ``thread_id``, oldest first. Single-parent: the
         supersede CAS refuses a fork."""

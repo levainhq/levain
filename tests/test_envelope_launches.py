@@ -2,8 +2,8 @@
 
 A signed, optional body key: ``"launches": [{"repo": ..., "count": N}]``, absent = no grant. These pin its shape and bounds
 (parse_body, the CLI spec, the draft proposal, the composer), the compat promise (a body signed before it parses, hashes and
-verifies byte for byte; an older reader refuses a body that carries it), the pure allowance helper the desk calls at each
-launch, narrowing and widening, the plain words on the signed card, and who may set it (the cockpit composer, never a phone).
+verifies byte for byte; an older reader refuses a body that carries it), the store's launch decision the desk calls at each
+launch (liveness first, then the pure allowance arithmetic), extend never carrying a grant, narrowing and widening, the plain words on the signed card, and who may set it (the cockpit composer, never a phone).
 Fixtures are the envelope tests' own: real keys, real scratch repos, a fixed store clock."""
 from __future__ import annotations
 
@@ -252,6 +252,87 @@ def test_the_effective_stop_earlier_and_a_dropped_grant_end_the_allowance(ctx):
     ctx.store.attenuate(b2["envelope_id"], "kill")
     killed = ctx.store.effective(b2["envelope_id"], t2.thread_id)
     assert "launches" not in killed and env.launch_allowance(killed, ctx.path, NOW, 0) == 0
+
+
+def _launch_thread(ctx, words, count=2, **kw):
+    d, _f, b, _s = ctx.structured(words, launches=[{"repo": ctx.path, "count": count}], **kw)
+    (t,) = ctx.store.split(d.drop_id, [Part("work", "w")])
+    return d, b, t
+
+
+def test_the_store_decision_counts_what_is_left_on_a_live_head(ctx):
+    _d, b, t = _launch_thread(ctx, "launch twice, live")
+    eid = b["envelope_id"]
+    allow = lambda used, repo=ctx.path: ctx.store.launch_allowance(eid, t.thread_id, repo, authority=ctx.snap,  # noqa: E731
+                                                                     used=used)
+    assert (allow(0), allow(1), allow(2), allow(0, "/work/beta")) == (2, 1, 0, 0)
+    for used in (-1, 1.0, True):
+        with pytest.raises(env.EnvelopeError, match="used is a count"):
+            allow(used)
+    ctx.store.attenuate(eid, "kill")
+    assert allow(0) == 0
+
+
+def test_a_revoked_signing_key_ends_the_launch_grant(ctx, keys, tmp_path):
+    """L3 r2 codex HIGH: effective() kept the grant and the pure helper read only stop, repo and count, so a grant
+    signed by a key revoked since still answered 2. The store decision reads the signature under a fresh snapshot."""
+    from tests.test_consent_queue import Log
+
+    (tmp_path / "auth").mkdir(mode=0o700)
+    lg = Log(tmp_path / "auth", keys)
+    lg.enrol("laptop", "laptop-presence")
+    lg.enrol("phone", "display-phone")
+    before = lg.source()
+    words = "launch twice, then the key is revoked"
+    b = ctx.body("dr-" + secrets.token_hex(16), words, launches=[{"repo": ctx.path, "count": 2}])
+    d, _fresh = ctx.store.accept_drop(words, surface="cli", source=ctx.src, authority=before, envelope=ctx.sign(b))
+    assert d.envelope_id == b["envelope_id"]
+    (t,) = ctx.store.split(d.drop_id, [Part("work", "w")])
+    assert ctx.store.launch_allowance(b["envelope_id"], t.thread_id, ctx.path, authority=before, used=0) == 2
+    lg.revoke("phone")
+    after = lg.source()
+    assert env.launch_allowance(ctx.store.effective(b["envelope_id"], t.thread_id), ctx.path, NOW, 0) == 2  # the bug
+    assert ctx.store.launch_allowance(b["envelope_id"], t.thread_id, ctx.path, authority=after, used=0) == 0
+
+
+def test_a_superseded_envelope_grants_no_launch(ctx):
+    """L3 r2 codex HIGH: a superseded head's grant still answered its count; only the current head may launch."""
+    d, b, t = _launch_thread(ctx, "launch twice, then superseded")
+    t = ctx.store.thread(t.thread_id)
+    bw, sw = ctx.worded(d, t, supersedes={"envelope_id": b["envelope_id"], "digest": env.envelope_digest(b)})
+    ctx.accept(sw)
+    assert env.launch_allowance(ctx.store.effective(b["envelope_id"], t.thread_id), ctx.path, NOW, 0) == 2  # the bug
+    assert ctx.store.launch_allowance(b["envelope_id"], t.thread_id, ctx.path, authority=ctx.snap, used=0) == 0
+    assert ctx.store.launch_allowance(bw["envelope_id"], t.thread_id, ctx.path, authority=ctx.snap, used=0) == 0
+
+
+def test_extend_never_carries_the_launch_grant_and_the_card_says_it_is_removed(ctx, monkeypatch):
+    """L3 r2 codex HIGH: extend copied the grant under a new envelope id while the desk counts launches per envelope, so
+    a budget-only extension handed back every seat already used, and its card read the grant "= unchanged"."""
+    import io
+    from argparse import Namespace
+
+    d, b, t = _launch_thread(ctx, "launch twice, then extend the budget")
+    monkeypatch.setattr(ccli, "_tick", lambda: NOW)
+    out = io.StringIO()
+    args = dict(thread=t.thread_id, budget="tool_calls=500", output=None, force=False, queue_dir=ctx.store.directory)
+    assert ccli.run_envelope_extend(Namespace(**args, json=False), out) == 0
+    text = out.getvalue()
+    assert "- removed: may launch up to 2 seats" in text and "= unchanged: may launch" not in text
+    assert "the head's launch grant is NOT carried" in text
+    out = io.StringIO()
+    assert ccli.run_envelope_extend(Namespace(**args, json=True), out) == 0
+    got = json.loads(out.getvalue())
+    body = got["body"]
+    assert "launches" not in body and got["launches_dropped"] is True
+    ctx.accept(ctx.sign(body))
+    assert ctx.store.launch_allowance(body["envelope_id"], t.thread_id, ctx.path, authority=ctx.snap, used=0) == 0
+    # with no grant on the head, extend says nothing about one
+    d2, _f2, _b2, _s2 = ctx.structured("no grant, extend the budget")
+    (t2,) = ctx.store.split(d2.drop_id, [Part("work", "w")])
+    out = io.StringIO()
+    assert ccli.run_envelope_extend(Namespace(**{**args, "thread": t2.thread_id}, json=False), out) == 0
+    assert "launch" not in out.getvalue()
 
 
 def test_the_ceiling_apis_refuse_a_launch_as_an_effect_and_never_raise(ctx):

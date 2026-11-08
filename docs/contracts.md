@@ -335,12 +335,16 @@ the envelope's `where` repos, `count` is a whole number from 1 to 4 (the default
 - **Who may set it.** The cockpit's own "Add an envelope" modal, with a toggle that is off by default. A paired phone cannot, on
   its own sheet or on the cockpit's routes: the server decides by the credential the request was authenticated with (a paired
   device's token runs as that device), never by anything the page sends.
-- **Carried forward only by extend.** `levain envelope extend` signs the head's grant again and the card shows it. A conversation
-  draft never carries one: a renewal or replacement drops it (its card shows it removed), and a draft that names `launches`
-  is refused.
-- **What the desk checks at each launch.** The envelope is stored and verified; its effective stop (after any earlier-stop
-  narrowing) is still ahead; an effective `launches` entry names the repo; and the desk's own launch log shows fewer than `count`
-  launches for that envelope and repo. `levain.coordinator.envelope.launch_allowance(envelope, repo, now, used)` is that rule as a
-  pure function (`now` must be an aware datetime); levain keeps no counter, because the count is the desk's to log, and the desk
-  serialises its launches and reads `used` under its own lock, since the helper reserves nothing.
+- **Never carried forward.** The desk counts launches per envelope, so a grant copied into a successor would start counting
+  again. `levain envelope extend` leaves the head's grant out, and its card shows it removed. A conversation draft never
+  carries one either: a renewal or replacement drops it (its card shows it removed), and a draft that names `launches` is
+  refused. A grant is signed on its own.
+- **What the desk checks at each launch.** The envelope is live as the thread's current head: bound to the thread at its
+  current revision, not superseded, killed or ended, before its effective stop (after any earlier-stop narrowing), and its
+  signature still verifies under a fresh authority snapshot (a revoked signing key ends the grant). An effective `launches`
+  entry names the repo, and the desk's own launch log shows fewer than `count` launches for that envelope and repo.
+  `EnvelopeStore.launch_allowance(envelope_id, thread_id, repo, authority=..., used=...)` makes that decision in one read and
+  answers 0 when any of it fails. `levain.coordinator.envelope.launch_allowance(envelope, repo, now, used)` is only its
+  arithmetic over an effective body, with no liveness check. Levain keeps no counter, because the count is the desk's to log.
+  The desk serialises its launches and reads `used` under its own lock, since neither function reserves anything.
 

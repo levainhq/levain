@@ -408,9 +408,10 @@ class CoordPhone:
         """The sheet's spec as the CLI builder takes it: where (absolute repos), lands always named and inferred."""
         from levain.coordinator.store import CoordError
 
-        allowed = _COCKPIT_SPEC_KEYS if device == COCKPIT_DEVICE else _SPEC_KEYS
+        cockpit = device == COCKPIT_DEVICE
+        allowed = _COCKPIT_SPEC_KEYS if cockpit else _SPEC_KEYS
         if not isinstance(spec, dict) or not set(spec) <= allowed:
-            raise CoordError(f"an envelope from the phone sets only {sorted(_SPEC_KEYS)}")
+            raise CoordError(f"an envelope from {'the cockpit' if cockpit else 'the phone'} sets only {sorted(allowed)}")
         where = spec.get("where", [])
         lands = spec.get("lands", [])
         if not isinstance(where, list) or not isinstance(lands, list):
@@ -429,7 +430,14 @@ class CoordPhone:
                               "criteria": land.get("criteria", [])})
         out = {**{k: spec[k] for k in ("budget", "stop") if k in spec}, "where": where, "lands": out_lands}
         if "launches" in spec:
-            out["launches"] = spec["launches"]          # shape and bounds: parse_body's, at check_body
+            # the entry shape here, so a hand-made request is refused in words (a float count made canonical() raise
+            # a ContractError, an HTTP 500); the bounds, a repo outside where and a repo named twice stay parse_body's
+            launches = spec["launches"]
+            if not isinstance(launches, list) or any(
+                    not isinstance(e, dict) or set(e) != {"repo", "count"} or not isinstance(e["repo"], str)
+                    or not e["repo"].startswith("/") or type(e["count"]) is not int for e in launches):
+                raise CoordError('launches is a list of {"repo": "/an/absolute/path", "count": <a whole number>}')
+            out["launches"] = launches
         return out
 
     def _review(self, req: dict[str, Any], device: str) -> dict[str, Any]:
