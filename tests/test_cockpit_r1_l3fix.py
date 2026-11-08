@@ -75,6 +75,7 @@ from datetime import datetime, timezone
 import pytest
 
 CHROME = _session_chrome()   # chrome-headless-shell when installed (no keychain), else the CHROME env or the default Chrome
+needs_browser = pytest.mark.skipif(not Path(CHROME).exists(), reason="Chrome is not installed")
 
 
 def _dump(url: str) -> str:
@@ -97,7 +98,7 @@ def _bare_install(tmp_path: Path, texts: list[str]):
     return SubstrateSource.local(root)
 
 
-@pytest.mark.skipif(not Path(CHROME).exists(), reason="Chrome is not installed")
+@needs_browser
 def test_the_default_cockpit_in_a_browser_offers_no_rename_and_no_text_edit_on_a_hidden_character_row(tmp_path: Path) -> None:
     src = _bare_install(tmp_path, ["plain seed", "zero​width seed"])
     with _serve(src, surface_tokens={"browser": "T"}, install_class="reported") as (url, _httpd):
@@ -124,7 +125,7 @@ def test_action_verb_fields_must_be_none_or_a_tuple_of_unique_non_empty_strings(
             ActionVerb(handler=h, fields=bad)
 
 
-@pytest.mark.skipif(not Path(CHROME).exists(), reason="Chrome is not installed")
+@needs_browser
 def test_the_default_page_draws_the_manifest_and_offers_a_downstream_send(tmp_path: Path) -> None:
     """The useManifest flip (HANDOFF OPEN #2): the default page is the manifest source, so an embedder's
     downstream send fires through /cockpit/verb and the broker. Before the flip `/` drew the legacy page,
