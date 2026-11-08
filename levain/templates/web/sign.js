@@ -547,6 +547,22 @@
     acts.hidden = false;
     const controls = [];          // every button and the write-in: frozen together for the whole ceremony
     const lock = (on) => { for (const b of controls) b.disabled = on; };
+    // the mic on a write-in or reason box (board row 140): drawn only where the server offers streaming and the browser offers
+    // on-device dictation. A tap that SIGNS a box's words is refused while its mic is open or still closing (micOpen), so a
+    // partial is never signed: the words are the box's once the mic has ended, taken at the click as ever.
+    const mics = [];
+    const withMic = (box) => {
+      if (!window.LevainMic || typeof window.LevainMic.attach !== "function") return null;
+      const m = window.LevainMic.attach(box, { cls: "dev-btn", note: (t) => say(t) });
+      for (const b of m.buttons) controls.push(b);
+      mics.push(m);
+      return m;
+    };
+    const micOpen = (m) => {
+      if (!m || !m.busy()) return false;
+      say("Stop the mic first: your words are signed as they stand when it has ended.", "bad");
+      return true;
+    };
     // a dispatch option names the keys that may do THAT act (the sign tier's and the landing tier's differ): only those are
     // offered for it; any other row signs with the row's keys
     const keysFor = (choice) => {
@@ -589,7 +605,7 @@
     const options = (Array.isArray(r.options) ? r.options : []).filter((o) => !dispatch || (o && dispatchAct(o.key)));
     // a dispatch cancel carries a reason (one line, optional) typed in the box the row asks for; it is frozen as typed
     // (trimmed) from the click on, like a write-in, and is the `words` of the run
-    let reasonBox = null;
+    let reasonBox = null, reasonMic = null;
     if (dispatch && r.reason && typeof r.reason === "object" && options.some((o) => o && o.key === "cancel")) {
       reasonBox = el("input", "sheet-write-in");
       reasonBox.type = "text";
@@ -598,11 +614,13 @@
       reasonBox.maxLength = Number(r.reason.max) || 256;
       reasonBox.placeholder = "reason for cancelling (optional)";
       controls.push(reasonBox);
+      reasonMic = withMic(reasonBox);
     }
     // what an option's tap runs: a cancel takes the reason box's words as typed now
     const tap = (o) => () => {
       if (busy) return;
       if (o.key === "cancel" && reasonBox) {
+        if (micOpen(reasonMic)) return;
         const w = reasonBox.value.trim();
         reasonBox.value = w;
         return run("cancel", w, lineOf(o) + (w ? ": " + w : ""));
@@ -650,7 +668,7 @@
       b.dataset.choice = o.key;
       acts.appendChild(b);
     }
-    if (reasonBox) acts.appendChild(reasonBox);
+    if (reasonBox) { acts.appendChild(reasonBox); if (reasonMic) acts.append(...reasonMic.buttons); }
     const wi = options.length && r.write_in && typeof r.write_in === "object" ? r.write_in : null;
     if (wi) {
       const box = el("input", "sheet-write-in");
@@ -660,8 +678,11 @@
       box.maxLength = Number(wi.max) || 200;
       box.placeholder = "or write your own answer";
       controls.push(box);
-      acts.append(box, button("(" + String(wi.key) + ") Sign my words", "", () => {
+      const wmic = withMic(box);
+      if (wmic) acts.append(box, ...wmic.buttons); else acts.appendChild(box);
+      acts.append(button("(" + String(wi.key) + ") Sign my words", "", () => {
         if (busy) return;
+        if (micOpen(wmic)) return;
         // the words signed are the box's at this click, trimmed, and the box shows exactly them until the ceremony ends
         const w = box.value.trim();
         if (!w) return say("Type your answer first.", "bad");

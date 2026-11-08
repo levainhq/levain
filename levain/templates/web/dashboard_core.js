@@ -4807,16 +4807,24 @@
     if (questionDrafts.has(q.id)) { words.value = questionDrafts.get(q.id); questionDrafts.delete(q.id); }
     const sendWords = el("button", "undo-btn question-send", "send words");
     sendWords.type = "button";
-    sendWords.addEventListener("click", () => { if (words.value.trim()) send({ text: words.value }); });
+    // the streaming Mic and on-device Dictate on the reply box (board row 140), drawn only where the server and browser offer them;
+    // send words waits for the mic to end, so a partial is never sent
+    const wmic = window.LevainMic && typeof window.LevainMic.attach === "function" ? window.LevainMic.attach(words, { cls: "undo-btn", note: (t) => { msg.textContent = t; } }) : null;
+    sendWords.addEventListener("click", () => {
+      if (wmic && wmic.busy()) { msg.textContent = "Stop the mic first: your words are sent as they stand when it has ended."; return; }
+      if (words.value.trim()) send({ text: words.value });
+    });
     controls.push(words, sendWords);
+    if (wmic) for (const b of wmic.buttons) controls.push(b);
+    const micBtns = wmic ? wmic.buttons : [];
     if (card) {
       const bottom = el("div", "needs-actions needs-qa");
-      bottom.append(wrap, words, sendWords, msg);
+      bottom.append(wrap, words, ...micBtns, sendWords, msg);
       slot.replaceChildren(...parts);
       card.appendChild(bottom);
       return;
     }
-    parts.push(wrap, words, sendWords, msg);
+    parts.push(wrap, words, ...micBtns, sendWords, msg);
     slot.replaceChildren(...parts);
   }
   // iOS keyboards take a free-text box for a contact field when the card around it reads like mail (Phill 11-07, an

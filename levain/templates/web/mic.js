@@ -19,6 +19,7 @@
 //   LevainMic.onFinal(cb)      cb(text) the text of the closed session
 //   LevainMic.onNote(cb)       cb(sentence) one of the fixed sentences below
 //   LevainMic.onEnd(cb)        cb() whenever a session ends, for any reason
+//   LevainMic.attach(box, o)   the Mic and Dictate controls for ONE text box (card replies): {buttons, busy(), off()}; busy() is true until the final text is in
 //
 // Stop-time WAV fallback (cockpit mic S5b): every PCM chunk the page captures is also kept in memory (bounded: the oldest are dropped
 // past limits.wavMax, which is the transcribe route's 4 MiB upload cap less the 44-byte header). When the stream breaks (a chunk
@@ -334,8 +335,86 @@
     return Promise.resolve();
   }
 
+  // A card reply box's mic (board row 140): the SAME streaming mic and on-device Dictate the Room composer has, for any one
+  // text box. attach(box, {cls, note}) returns {buttons, busy(), off()}: the caller places `buttons` (hidden until the server
+  // offers streaming / the browser offers on-device dictation). busy() is true from a tap until the session has ended and its
+  // final text is in the box, so a caller that SIGNS the box refuses while it is true: a partial is never signed. Words reach
+  // the box through .value writes only.
+  function attach(box, o) {
+    o = o || {};
+    var doc = box.ownerDocument, cls = o.cls || "", say = typeof o.note === "function" ? o.note : function () {};
+    var buttons = [], mine = false, base = "", rec = null, dBase = "", dHeard = "", dLast = "", writing = false, gone = false, offs = [];
+    function detached() { return gone || !box.isConnected; }
+    function put(text) {
+      var v = base + text;
+      if (box.maxLength > 0 && v.length > box.maxLength) v = v.slice(0, box.maxLength);
+      writing = true; box.value = v; writing = false;
+      try { box.dispatchEvent(new window.Event("input", { bubbles: true })); } catch (e) { /* no events */ }
+    }
+    function off() { gone = true; offs.forEach(function (f) { try { f(); } catch (e) { /* gone */ } }); offs = []; }
+    function mk(label, extra) {
+      var b = doc.createElement("button");
+      b.type = "button"; b.className = (cls ? cls + " " : "") + "card-mic " + extra; b.textContent = label; b.hidden = true;
+      buttons.push(b); return b;
+    }
+    var api = { buttons: buttons, off: off, busy: function () { return mine || !!rec; } };
+    var SR = window.SpeechRecognition || window.webkitSpeechRecognition;
+    if (SR) {                                           // on-device dictation, the room's rule: processLocally or off
+      var db = mk("Dictate", "card-mic-dictate"), lang = doc.documentElement.lang || (window.navigator && window.navigator.language) || "en-US";
+      var endDict = function () {
+        var r = rec; rec = null; db.textContent = "Dictate";
+        if (r) { r.onresult = null; r.onend = null; r.onerror = null; try { r.stop(); } catch (e) { /* stopped */ } }
+      };
+      // SpeechRecognition.available() is never asked: MEASURED 2026-11-04 (RM-G2) it froze the renderer of headless Chrome, so
+      // the control shows on the prototype test alone and the click-time processLocally readback and onerror stay the guard.
+      db.hidden = false;
+      box.addEventListener("input", function () { if (rec && !writing) { dBase = box.value; dHeard = dLast; } });
+      db.addEventListener("click", function () {
+        if (mine) return;
+        if (rec) { endDict(); return; }
+        var r = new SR();
+        dBase = box.value ? box.value.replace(/\s*$/, " ") : ""; dHeard = ""; dLast = "";
+        r.interimResults = true; r.continuous = false; r.processLocally = true; r.lang = lang;
+        if (r.processLocally !== true) { say("This browser will not keep dictation on this device, so it is off; the keyboard dictation key works."); return; }
+        r.onresult = function (ev) {
+          if (rec !== r) return;
+          var t = "";
+          for (var i = 0; i < ev.results.length; i++) t += ev.results[i][0].transcript;
+          dLast = t; base = dBase; put(dHeard && t.indexOf(dHeard) === 0 ? t.slice(dHeard.length) : t);
+        };
+        r.onend = function () { if (rec === r) endDict(); };
+        r.onerror = function (ev) { if (rec === r) { endDict(); say(ev && ev.error === "not-allowed" ? "Dictation needs permission to use the microphone." : "Dictation stopped."); } };
+        rec = r; db.textContent = "Stop dictating";
+        try { r.start(); } catch (e) { endDict(); }
+      });
+      var leave = function () { if (detached()) { endDict(); doc.removeEventListener("visibilitychange", leave); return; } if (doc.visibilityState === "hidden") endDict(); };
+      doc.addEventListener("visibilitychange", leave);
+      offs.push(function () { endDict(); doc.removeEventListener("visibilitychange", leave); });
+    }
+    if (typeof probe === "function") {
+      var sb = mk("Mic", "card-mic-stream");
+      var live = function () { return mine && !detached(); };
+      var draw = function (t) { if (detached()) { if (mine) { stop(); mine = false; } off(); return; } if (mine) put(t); };
+      offs.push(on("partial", draw));
+      offs.push(on("final", draw));
+      offs.push(on("note", function (s) { if (live()) say(s); }));
+      offs.push(on("end", function () { if (!mine) return; mine = false; box.readOnly = false; sb.textContent = "Mic"; }));
+      Promise.resolve().then(probe).then(function (ok) { if (!gone && ok === true && available()) sb.hidden = false; }, function () {});
+      sb.addEventListener("click", function () {
+        if (mine) { sb.textContent = "Mic"; stop(); return; }        // the session closes; busy() holds until its end
+        if (S) return;                                                // the last session is still closing
+        if (rec) { var r = rec; rec = null; r.onresult = null; r.onend = null; r.onerror = null; try { r.stop(); } catch (e) { /* stopped */ } }
+        base = box.value ? box.value.replace(/\s*$/, " ") : "";
+        mine = true; box.readOnly = true; sb.textContent = "Stop mic";     // locked while streaming: a partial redraws the whole box
+        start();
+        if (!S) { mine = false; box.readOnly = false; sb.textContent = "Mic"; }
+      });
+    }
+    return api;
+  }
+
   window.LevainMic = {
-    available: available, probe: probe, start: start, stop: stop, active: function () { return !!S; }, closeFailed: function () { return !!(lastStopped && lastStopped.closeFailed); }, revoked: function () { return !!(lastStopped && lastStopped.revoked); }, deadlines: deadlines, limits: limits,
+    attach: attach, available: available, probe: probe, start: start, stop: stop, active: function () { return !!S; }, closeFailed: function () { return !!(lastStopped && lastStopped.closeFailed); }, revoked: function () { return !!(lastStopped && lastStopped.revoked); }, deadlines: deadlines, limits: limits,
     onPartial: function (cb) { return on("partial", cb); }, onFinal: function (cb) { return on("final", cb); },
     onNote: function (cb) { return on("note", cb); }, onEnd: function (cb) { return on("end", cb); },
   };
