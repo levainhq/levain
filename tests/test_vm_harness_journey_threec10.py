@@ -42,6 +42,7 @@ class World:
         self.doctor_calls = 0
         self.fetches = []
         self.new_removed = 0
+        self.foreign_new = None             # a .json.new another writer left on the guest (None: none)
 
     # guest(argv, timeout): capture's wrapper first
     def guest(self, argv, timeout=60):
@@ -103,6 +104,8 @@ class World:
             self.files.pop(name, None)
             return f"cred-removed {name}\n"
         if script == T.REMOVE_NEW_SCRIPT:
+            if self.foreign_new is not None and text != self.foreign_new:
+                return f"cred-foreign-new {name}\n"
             self.new_removed += 1
             return f"cred-removed-new {name}\n"
         if script == T.VERIFY_SCRIPT:
@@ -504,7 +507,7 @@ def test_the_verify_script_reports_what_is_on_disk(tmp_path):
     (d / "k.json.new").write_text("x")
     r, d = _sh(tmp_path, T.VERIFY_SCRIPT, "k", "new", "")
     assert r.stdout.startswith("cred-present k.json.new")
-    r, d = _sh(tmp_path, T.REMOVE_NEW_SCRIPT, "k", None, "")
+    r, d = _sh(tmp_path, T.REMOVE_NEW_SCRIPT, "k", None, "x")
     assert (d / "k.json").exists() and not (d / "k.json.new").exists()      # removes the twin only
 
 
@@ -618,3 +621,40 @@ def test_a_write_that_makes_no_progress_raises_instead_of_looping(tmp_path, monk
     monkeypatch.setattr(RB.os, "write", lambda fd, data: 0)
     with pytest.raises(OSError, match="no progress"):
         RB._write_durable(tmp_path / "f", "abc")
+
+
+def test_a_foreign_json_new_is_not_deleted_after_an_ambiguous_t1(tmp_path):
+    """Another credential writer's in-progress .json.new sits there at cleanup: it is left alone and the run is not a PASS."""
+    w = World()
+    w.foreign_new = "SOMEONE ELSE'S UPDATE"
+    orig = w.stdin_run
+
+    def run(argv, text, timeout=60):
+        out = orig(argv, text, timeout)
+        if argv[4] == T.INSTALL_SCRIPT:
+            raise GuestError(255, "ssh dropped after the write")
+        return out
+
+    w.stdin_run = run
+    _w, _ev, (status, _s, path) = go(tmp_path, w)
+    assert w.new_removed == 0 and status == "INCOMPLETE"
+    assert "left in place" in path.read_text() and "RESULT: PASS" not in path.read_text()
+    assert any(LIMITED in t for t in w.stdins)       # the proof (our exact bytes) was what cleanup sent
+
+
+def test_remove_new_script_unlinks_only_a_byte_equal_file(tmp_path):
+    (tmp_path / "store" / "keys" / "cred").mkdir(parents=True)
+    r, d = _sh(tmp_path, T.REMOVE_NEW_SCRIPT, "k", None, "mine")
+    assert r.stdout.strip() == "cred-removed-new k"                         # nothing there: nothing to leave behind
+    (d / "k.json.new").write_text("theirs")
+    r, d = _sh(tmp_path, T.REMOVE_NEW_SCRIPT, "k", None, "mine")
+    assert r.stdout.strip() == "cred-foreign-new k" and (d / "k.json.new").read_text() == "theirs"
+    (d / "k.json.new").unlink()
+    (d / "target").write_text("mine")
+    os.symlink(d / "target", d / "k.json.new")
+    r, d = _sh(tmp_path, T.REMOVE_NEW_SCRIPT, "k", None, "mine")
+    assert r.stdout.strip() == "cred-foreign-new k" and os.path.islink(d / "k.json.new")   # a link is never ours
+    os.unlink(d / "k.json.new")
+    (d / "k.json.new").write_text("mine")
+    r, d = _sh(tmp_path, T.REMOVE_NEW_SCRIPT, "k", None, "mine")
+    assert r.stdout.strip() == "cred-removed-new k" and not (d / "k.json.new").exists()

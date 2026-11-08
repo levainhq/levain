@@ -26,7 +26,7 @@ and an empty one (``cred-refused``; the run ends REFUSED, exit 2). A step that t
 The credential file is removed on the way out, and the removal is a GRADED result: a removal that times out, exits nonzero
 or whose absence cannot be confirmed afterwards makes the run at least INCOMPLETE (exit nonzero) and RESULT.txt names it. An
 install whose result is AMBIGUOUS (a transport error after the script may have run) never authorises replacing or deleting
-``<cred>.json``: only ``<cred>.json.new`` is cleaned, T5 is not attempted, and the run is INCOMPLETE with the reason. Only the
+``<cred>.json``: only a ``<cred>.json.new`` byte-equal to what this run wrote is cleaned (a different one is left and reported), T5 is not attempted, and the run is INCOMPLETE with the reason. Only the
 script's own ``cred-installed`` line makes the file ours to replace and remove. A step whose input is missing (a key not in the environment, no
 ``--call``) is UNBOUND and the run ends INCOMPLETE, never PASS.
 
@@ -85,8 +85,14 @@ INSTALL_SCRIPT = ('set -e; d="$1/keys/cred"; n="$2"; umask 077; '
                   'if [ ! -s "$d/$n.json.new" ]; then rm -f "$d/$n.json.new"; echo "cred-refused $n: empty credential"; exit 0; fi; '
                   'chown ' + KEYS_USER + ':' + KEYS_USER + ' "$d/$n.json.new"; mv "$d/$n.json.new" "$d/$n.json"; '
                   'echo "cred-installed $n"')
-#: Remove ONLY the half-written file: what an uncertain install leaves behind that is surely ours. Never ``<cred>.json``.
-REMOVE_NEW_SCRIPT = 'set -e; rm -f "$1/keys/cred/$2.json.new"; echo "cred-removed-new $2"'
+#: Remove ONLY the half-written file, and only when it is PROVABLY ours: stdin carries the exact bytes this run wrote, and the
+#: file is unlinked only if it is a regular file (not a link) equal to them. A ``.json.new`` that differs (another writer's
+#: in-progress update, a partial of ours, a planted link) is left in place and answered ``cred-foreign-new``, which the harness
+#: reports as a cleanup problem. Never ``<cred>.json``.
+REMOVE_NEW_SCRIPT = ('set -e; f="$1/keys/cred/$2.json.new"; e=$(mktemp); cat > "$e"; '
+                     'if [ ! -e "$f" ] && [ ! -L "$f" ]; then echo "cred-removed-new $2"; '
+                     'elif [ ! -L "$f" ] && [ -f "$f" ] && cmp -s "$e" "$f"; then rm -f "$f"; echo "cred-removed-new $2"; '
+                     'else echo "cred-foreign-new $2"; fi; rm -f "$e"')
 #: ``$3`` is ``all`` (the credential and its half-written twin) or ``new`` (the twin only); prints ``cred-absent`` or ``cred-present``.
 VERIFY_SCRIPT = ('d="$1/keys/cred"; if [ "$3" = all ] && [ -e "$d/$2.json" ]; then echo "cred-present $2.json"; exit 0; fi; '
                  'if [ -e "$d/$2.json.new" ]; then echo "cred-present $2.json.new"; exit 0; fi; echo "cred-absent $2"')
@@ -244,11 +250,12 @@ def run_3c10(guest, stdin_run, evidence_dir, cfg: Config, *, fetch: Fetch = defa
     #: NEVER replaced or removed, only the ``.json.new`` twin).
     state = "none"
     uncertain_why = ""
+    uncertain_payload = ""      # the exact bytes the uncertain install was sent: the proof a ``.json.new`` is ours
     refused = False
     cleanup_problems: list[str] = []
 
     def install(sid: str, which: str) -> bool:
-        nonlocal state, refused, uncertain_why
+        nonlocal state, refused, uncertain_why, uncertain_payload
         key = keys.get(which)
         if refused:
             unbound(sid, "an earlier install was refused; nothing more is installed")
@@ -262,14 +269,15 @@ def run_3c10(guest, stdin_run, evidence_dir, cfg: Config, *, fetch: Fetch = defa
         mode = "replace" if state == "confirmed" else "new"   # replace only a file whose install was CONFIRMED to be ours
         argv = ("sudo", "-n", "/bin/sh", "-c", INSTALL_SCRIPT, "sh", cfg.profile.store, cfg.cred, mode)
         attempted_from = state
+        payload = credential_json(cfg.cred, key)
         try:
-            out = stdin_run(argv, credential_json(cfg.cred, key), 60)
+            out = stdin_run(argv, payload, 60)
         except (GuestError, OSError, subprocess.SubprocessError) as e:
             why = f"{sid}: no answer from the install script ({type(e).__name__}: {e})"
             if attempted_from == "confirmed":
                 done(sid, "ERROR", detail=f"transport: {e}; the file there is the sitting's own either way")
             else:
-                state, uncertain_why = "uncertain", why
+                state, uncertain_why, uncertain_payload = "uncertain", why, payload
                 done(sid, "ERROR", detail=f"transport: {e}; install result UNCERTAIN, {cfg.cred}.json will not be touched")
             return False
         lines = out.splitlines()
@@ -282,7 +290,7 @@ def run_3c10(guest, stdin_run, evidence_dir, cfg: Config, *, fetch: Fetch = defa
             state = "confirmed"
         else:
             if attempted_from != "confirmed":
-                state, uncertain_why = "uncertain", f"{sid}: the install script printed neither cred-installed nor cred-refused"
+                state, uncertain_why, uncertain_payload = "uncertain", f"{sid}: the install script printed neither cred-installed nor cred-refused", payload
             done(sid, "ERROR", raw=lines[-1] if lines else "", detail="no cred-installed line: install result UNCERTAIN")
             return False
         judged(sid, lines, 0)
@@ -366,8 +374,11 @@ def run_3c10(guest, stdin_run, evidence_dir, cfg: Config, *, fetch: Fetch = defa
             problems.append(f"{uncertain_why}; {cfg.profile.store}/keys/cred/{cfg.cred}.json may be the sitting's credential or "
                             f"one of his: check it by hand, it was NOT touched")
         try:
-            out = stdin_run(base + (script,) + tail, "", 60)
-            if f"cred-{label} {cfg.cred}" not in out.splitlines():
+            out = stdin_run(base + (script,) + tail, "" if confirmed else uncertain_payload, 60)
+            if f"cred-foreign-new {cfg.cred}" in out.splitlines():
+                problems.append(f"{cfg.cred}.json.new differs from what this run wrote (another writer's, or a partial): "
+                                f"left in place, NOT removed; check it by hand")
+            elif f"cred-{label} {cfg.cred}" not in out.splitlines():
                 problems.append(f"removal of {cfg.cred} printed no cred-{label} line")
             seen = stdin_run(base + (VERIFY_SCRIPT,) + tail + (vmode,), "", 60)
             if f"cred-absent {cfg.cred}" not in seen.splitlines():
