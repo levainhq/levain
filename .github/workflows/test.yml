@@ -41,11 +41,48 @@ env:
   TEST_SHARDS: "6"
 
 jobs:
+  gate:
+    # A push to main lands a sha the land waiter already tested on its land/** candidate, so the heavy jobs skip when
+    # tests/ci/skip_lookup.py finds a green run of this sha on another ref. It fails closed (see that file): any doubt
+    # runs everything. Only a plain push to main can skip; tags, manual runs, the nightly and PRs always run.
+    name: look up a verifying run
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    # least privilege: read the run list, and check out the one script
+    permissions:
+      actions: read
+      contents: read
+    outputs:
+      skip: ${{ steps.lookup.outputs.skip }}
+      ref: ${{ steps.lookup.outputs.ref }}
+      run_id: ${{ steps.lookup.outputs.run_id }}
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Look for a green run of this sha on another ref
+        id: lookup
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: python3 tests/ci/skip_lookup.py
+
+  verified:
+    # Present only when the heavy jobs were skipped. Its NAME carries the verdict ("verified on <ref> run <id>") so a
+    # reader of the job list, such as the land waiter's main follow, sees it without reading a log.
+    name: verified on ${{ needs.gate.outputs.ref }} run ${{ needs.gate.outputs.run_id }}
+    needs: gate
+    if: needs.gate.outputs.skip == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - run: echo "verified on ${{ needs.gate.outputs.ref }} run ${{ needs.gate.outputs.run_id }}"
+
   plan:
     # Emits the shard list [0..TEST_SHARDS-1] the `test` matrix runs. It does not collect: each shard job collects
     # under its own Python and picks its own files (see that job's last step), so a file one Python collects and
     # another does not is still in that Python's shards.
     name: plan test shards
+    needs: gate
+    if: needs.gate.outputs.skip != 'true'
     # Pinned because ubuntu-latest moved to ubuntu-26.04, whose sudo/bash/python differ; revisit when the tests are made to pass on it.
     runs-on: ubuntu-24.04
     timeout-minutes: 5
@@ -145,6 +182,8 @@ jobs:
     # (ii) run the test files that import only that closure. The package is not installed (it needs a newer Python):
     # the files import from the checkout, and --noconftest keeps the repo conftest, which is written for 3.12+, out.
     name: root-run code (Python 3.9)
+    needs: gate
+    if: needs.gate.outputs.skip != 'true'
     # Pinned because ubuntu-latest moved to ubuntu-26.04, whose sudo/bash/python differ; revisit when the tests are made to pass on it.
     runs-on: ubuntu-24.04
     # The closure tests step took 14 min on green main and 13 min 7 s on the run the 15 min cap cancelled (run 41522235194):
@@ -193,6 +232,8 @@ jobs:
     # refusal names, and then requires the live tests to run (LEVAIN_REQUIRE_LINUX_LIVE=1 fails a
     # skip). It runs the floor test files only.
     name: bwrap floor live (Python 3.12)
+    needs: gate
+    if: needs.gate.outputs.skip != 'true'
     # Pinned because ubuntu-latest moved to ubuntu-26.04, whose sudo/bash/python differ; revisit when the tests are made to pass on it.
     runs-on: ubuntu-24.04
     timeout-minutes: 30
@@ -246,6 +287,8 @@ jobs:
     # over it once the sign-attempt tests joined), so the files are dealt round-robin into three shards: each
     # shard keeps the same rules (selection by file, nothing collected fails, any skip fails).
     name: cockpit browser tests (Python 3.13, shard ${{ matrix.shard }})
+    needs: gate
+    if: needs.gate.outputs.skip != 'true'
     # Pinned because ubuntu-latest moved to ubuntu-26.04, whose sudo/bash/python differ; revisit when the tests are made to pass on it.
     runs-on: ubuntu-24.04
     timeout-minutes: 40
@@ -327,6 +370,8 @@ jobs:
     # `levain setup-isolation` for real: create the hands user, check the uid gate, undo. Only on
     # throwaway runners (passwordless sudo); this is the only place the Linux setup is exercised.
     name: setup-isolation e2e (${{ matrix.os }})
+    needs: gate
+    if: needs.gate.outputs.skip != 'true'
     # Pinned because ubuntu-latest moved to ubuntu-26.04, whose sudo/bash/python differ; revisit when the tests are made to pass on it.
     runs-on: ${{ matrix.os == 'ubuntu-latest' && 'ubuntu-24.04' || matrix.os }}
     timeout-minutes: 20
@@ -364,6 +409,8 @@ jobs:
     # Deselected, and not part of this gate: chat_egress_network (conftest skips it whenever CI is set) and
     # chat_egress_slow (the minutes-long git dumps, skipped in CI unless CHD2_SLOW=1).
     name: chat egress srt (${{ matrix.os }})
+    needs: gate
+    if: needs.gate.outputs.skip != 'true'
     # Pinned because ubuntu-latest moved to ubuntu-26.04, whose sudo/bash/python differ; revisit when the tests are made to pass on it.
     runs-on: ${{ matrix.os == 'ubuntu-latest' && 'ubuntu-24.04' || matrix.os }}
     timeout-minutes: 40
