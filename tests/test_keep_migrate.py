@@ -511,3 +511,42 @@ def test_the_guard_still_refuses_a_new_retired_write(env: Env):
 
     with pytest.raises(RetiredDisposition):
         guarded_spore_store(env.spores).add(type="thought", text="x", disposition="note")
+
+
+# --- the private-anneal pin: _add_verbatim leans on three private names; this is the one place that says so.
+
+_VERBATIM_ONLY = {"notes", "created", "seen"}
+
+
+def test_add_verbatim_stores_the_same_shape_as_anneals_public_add(tmp_path: Path):
+    """If an anneal release changes what `add` stores (a new key, a different value shape), the
+    verbatim copy of it must change too. This fails then, instead of the migration writing rows the
+    rest of the stack reads differently. Apart from notes / created / seen (set verbatim on purpose)
+    the two rows must carry the same keys with the same value types."""
+    from anneal_memory.spores import SporeStore
+
+    kw = dict(type="thought", domain="ops", tier="warm", salience=2, pointer="p/q.md",
+              disposition="seed", target=None, attention=None, germinated=None)
+    pub = SporeStore(tmp_path / "pub.json").add(text="the same words", next="2030-01-01",
+                                                origin_key="pt-a1b2c3d4e5f6", **kw)
+    row = {**kw, "notes": ["n1"], "created": "2020-01-02", "seen": "2020-01-03"}
+    ver, created = km._add_verbatim(
+        SporeStore(tmp_path / "ver.json"), origin_key="pt-a1b2c3d4e5f6", row=row, text="the same words",
+        disposition="seed", next_="2030-01-01", guard=False)
+    assert created
+    assert ver["notes"] == ["n1"] and ver["created"] == "2020-01-02" and ver["seen"] == "2020-01-03"
+    shape = lambda d: {k: type(v).__name__ for k, v in d.items() if k not in _VERBATIM_ONLY}  # noqa: E731
+    assert shape(ver) == shape(pub), (
+        "anneal's add now stores a different row shape than _add_verbatim writes. Update "
+        "levain.keep_migrate._add_verbatim, or ask anneal for a public add taking notes/created/seen.")
+    assert set(ver) - _VERBATIM_ONLY == set(pub) - _VERBATIM_ONLY
+    assert _VERBATIM_ONLY <= set(pub)             # the three fields exist on a public row too
+
+
+@pytest.mark.parametrize("name", ["_prepare_add", "_find_by_origin_key", "_add_locked", "_transaction"])
+def test_the_private_anneal_names_add_verbatim_uses_still_exist(name: str):
+    from anneal_memory.spores import SporeStore
+
+    assert hasattr(SporeStore, name), (
+        f"anneal's SporeStore no longer has {name}, which levain.keep_migrate._add_verbatim calls. "
+        "Update _add_verbatim, or ask anneal for a public add that takes notes/created/seen.")

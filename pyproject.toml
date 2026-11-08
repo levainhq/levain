@@ -140,7 +140,10 @@ dependencies = [
     # `>=1.0.3,<2` (2026-11-07, TS-0): anneal 1.0.3 passes `target`, `attention` and `germinated` through as opaque
     # keys, which the task-surface port needs. No migration-manifest entry, so TEMPLATES_RECONCILED_ANNEAL stays 1.0.2
     # (the seed templates are unchanged). KNOWN_GOOD_ANNEAL moves with this floor.
-    "anneal-memory>=1.0.3,<2",
+    # `<1.1` (2026-11-07): `levain.keep_migrate._add_verbatim` calls three PRIVATE anneal SporeStore methods (_prepare_add,
+    # _find_by_origin_key, _add_locked), pinned by tests/test_keep_migrate.py. A new anneal minor is where such a change could
+    # land, so levain takes it deliberately (re-run that test, raise the cap) rather than resolving to it on install.
+    "anneal-memory>=1.0.3,<1.1",
     # The reply classifier (levain.firing.agent_reply.unreadable_tool_call) reads Markdown code regions with a
     # CommonMark parser rather than a hand-written one: four review rounds on a hand reader each found its next edge
     # (Phill 2026-10-05, "Let's do A"). Floor 4.0: 3.0.0 took 23 s on a reply of 5,000 reference definitions,
