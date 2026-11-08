@@ -798,3 +798,17 @@ def test_render_blob_names_a_bad_route_by_the_grammar_not_as_the_identity() -> N
     assert e.value.name == "git-identity-invalid"
     blob = json.loads(SV.render_blob("claude", "brokered", ["anthropic"], ident, "repo"))
     assert blob["git_identity"] == ident and blob["repo_label"] == "repo"
+
+
+# --- prel3fix r1: kitty sets on the slot's own entry, pops beyond its pushes, and 1049l without its 1049h -----------
+
+@pytest.mark.parametrize("data, undo", [
+    (b"\x1b[>1u\x1b[=5u", b"\x1b[<1u"),               # a set on the slot's own pushed entry: the pop undoes it
+    (b"\x1b[>1u\x1b[=5;2u\x1b[>3u\x1b[=1u", b"\x1b[<2u"),
+    (b"\x1b[?1049h\x1b[>1u\x1b[=5u", b"\x1b[<1u\x1b[?1049l"),
+    (b"\x1b[>1u\x1b[<1u\x1b[=5u", b"\x1b[=0u"),       # its pushes already popped: the set is on an entry it may not own
+])
+def test_a_kitty_set_is_undone_by_zeroing_only_when_the_slot_had_nothing_pushed(data, undo) -> None:
+    f = TermFilter()
+    f.feed(data)
+    assert f.reset() == undo

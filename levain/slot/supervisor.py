@@ -156,8 +156,9 @@ class TermFilter:
 
         Order: the alternate screen's kitty entries are undone while on it, then the alternate screen is left, then
         the main screen's entries are undone. Pops undo exactly the pushes the slot made, so an entry the operator's
-        own shell pushed before the session survives; only when the slot SET flags in place (which overwrites an
-        entry it may not own) are the current flags zeroed (``CSI = 0 u``, which acts with nothing pushed too)."""
+        own shell pushed before the session survives; only when the slot SET flags in place with none of its own
+        pushes outstanding (which overwrites an entry it may not own) are the current flags zeroed (``CSI = 0 u``,
+        which acts with nothing pushed too). A set on an entry the slot pushed is undone by its pop."""
         out = bytearray()
         alt = self._modes & _ALT_SCREEN_MODES
         if self._kitty_pushes[True] or self._kitty_set[True]:
@@ -321,7 +322,9 @@ class TermFilter:
             elif prefix == b"<":
                 n = params[0]
                 self._kitty_pushes[screen] = max(0, self._kitty_pushes[screen] - (int(n) if n.isdigit() else 1))
-            else:
+            elif not self._kitty_pushes[screen]:
+                # a set while the slot has pushes outstanding changes the slot's own entry, which the pop undoes;
+                # only with none is the entry it changes one the slot may not own
                 self._kitty_set[screen] = True
         elif prefix == b">" and final == b"m":
             # XTMODKEYS: ``CSI > Pp ; Pv m`` sets resource Pp, ``CSI > Pp m`` resets it, ``CSI > m`` resets all
