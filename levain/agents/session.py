@@ -116,8 +116,8 @@ def branch_problem(branch: object) -> str | None:
 class Workspace:
     """The workspace member of a launch (levain 34, W1): which repo, at which commit, minus which patterns. ``repo`` is
     the operator's absolute repo path (a RECORD for the run: the run server cannot read it), ``head`` the 40-hex commit
-    the snapshot was cut from, ``withhold`` the role's withhold patterns (a tuple; empty in W1, see
-    ``levain.slot.workspace.W1_WITHHOLD_ALLOWED``). The shape is checked here, at construction, so a malformed member
+    the snapshot was cut from, ``withhold`` the SIGNED role's ``ceiling.withhold`` (a tuple; W2, see
+    ``levain.agents.signed_role``: both uids refuse any other). The shape is checked here, at construction, so a malformed member
     never exists to be passed on; pattern GRAMMAR is the snapshot's (``levain.dispatch.snapshot``), checked where the
     manifest is.
 

@@ -18,6 +18,9 @@ REVIEW_CLEAR_NAMESPACE = "levain-review-clear"
 # The operator's phone passkey countersigning a band answer typed at a REMOTE terminal (board row 64, B2): evidence
 # beside an answer already recorded unsigned, never a gate on it.
 ANSWER_COUNTERSIGN_NAMESPACE = "levain-answer-countersign"
+# The operator's phone passkey APPROVING a dispatch configuration item (board row 113, option F2): a gate before the
+# laptop key signs, never the configuration signature itself (that stays in ``levain-dispatch-config``).
+CONFIG_APPROVE_NAMESPACE = "levain-dispatch-config-approve"
 
 # namespace -> (status, owner, meaning). status is "shipped" (a released levain uses it) or "reserved" (a design
 # names it; nothing signs in it yet).
@@ -61,6 +64,10 @@ REGISTRY: dict[str, tuple[str, str, str]] = {
     ANSWER_COUNTERSIGN_NAMESPACE: ("shipped", "levain/consent/answer_countersign.py",
                                    "the operator's phone passkey countersigning a band answer typed at a remote "
                                    "terminal (message format levain-terminal-answer/1 with a countersign-of line)"),
+    CONFIG_APPROVE_NAMESPACE: ("shipped", "levain/dispatch/phone_config.py",
+                               "the operator's phone passkey approving one dispatch configuration item (by the "
+                               "SHA-256 of its exact bytes) before the laptop trust-root key signs it; never a "
+                               "configuration signature"),
     "levain-terminal-answer": ("shipped", "levain/consent/terminal_sign.py",
                                "the laptop Touch ID key's signature over a band answer typed at the terminal "
                                "(TERMSIGN; message format levain-terminal-answer/1)"),
@@ -81,6 +88,15 @@ LEVAIN_SIGN_REQUESTS: dict[str, str] = {
     # verifier re-parses.
     ANSWER_COUNTERSIGN_NAMESPACE: r"levain-terminal-answer/1\nstore: levain-questions:[^\n]+\n(?:.+\n){7}"
                                   r"countersign-of: .+\n(?:.+\n)+",
+    # row 113: the format line and nine fixed lines; the item's bytes are bound by item-sha256, the approval's
+    # deadline by expires (signed, so editing the request file cannot extend it) and the passkey site that may
+    # approve by rp (the queue cockpit's host at filing; the signer's key must be of it); change and summary are
+    # levain's words. A shape fence only: kind is the kept item's own (registry.KINDS is its one definition, compared
+    # at use)
+    CONFIG_APPROVE_NAMESPACE: r"levain-dispatch-config-approve/1\nstore: [^\n]+\nkind: [^\n]+\ngeneration: [0-9]+\n"
+                              r"prev: [^\n]+\nitem-sha256: [0-9a-f]{64}\n"
+                              r"expires: [0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}\.[0-9]{6}Z\n"
+                              r"rp: [a-z0-9.-]+\nchange: [^\n]+\nsummary: [^\n]+\n",
 }
 
 # Reserved families: prefix -> the rule. A family reserves the prefix against any other meaning; it registers

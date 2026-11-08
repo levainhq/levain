@@ -1,4 +1,4 @@
-"""levain.cockpit.coordinator_verbs: the Coordinator panel's Start, Stop and Hold (C10 S3).
+"""levain.cockpit.coordinator_verbs: the Desk panel's Start, Stop and Hold (C10 S3).
 
 Each is an act the coordinator already has, fired from the panel; nothing here adds state or a rule.
 

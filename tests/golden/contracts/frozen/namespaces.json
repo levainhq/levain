@@ -109,6 +109,11 @@
    "owner": "levain/consent/answer_countersign.py"
   },
   {
+   "namespace": "levain-dispatch-config-approve",
+   "status": "shipped",
+   "owner": "levain/dispatch/phone_config.py"
+  },
+  {
    "namespace": "levain-terminal-answer",
    "status": "shipped",
    "owner": "levain/consent/terminal_sign.py"

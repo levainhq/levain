@@ -79,7 +79,7 @@ def _reply_line(kind: str, ref_store: str, ref_id: str, body: str) -> str:
         at = _clean(b.get("received_at"), 40)
         hhmm = local_clock(at) if len(at) >= 16 else at
         return (f"1 reply to your {_clean(b.get('surface'), 12) or 'drop'} message at {hhmm} "
-                f"(drop {_short_id(b.get('drop_id') or ref_id)}): on the Coordinator panel")
+                f"(drop {_short_id(b.get('drop_id') or ref_id)}): on the Desk panel")
     if kind == "know":
         n = b.get("question_n")
         if isinstance(n, int):

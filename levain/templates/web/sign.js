@@ -1008,7 +1008,7 @@
     const sendNote = el("p", "env-hint", "Send words only: sends your words with no limits attached.");
     sendNote.id = "drop-send-note";
     send.setAttribute("aria-describedby", sendNote.id);
-    buttonNotes.append(sendNote, el("p", "env-hint", "Sign, then the coordinator may start work inside these limits."));
+    buttonNotes.append(sendNote, el("p", "env-hint", "Sign, then the desk may start work inside these limits."));
     let oid = newOutboxId();       // held for these words: a resend after a lost reply files once, never twice
     let cannot = "";
     const why0 = !storeRead ? "still reading which Levain answers here; reload" : "";

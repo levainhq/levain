@@ -518,6 +518,7 @@ def _complete_spawn(conn: sqlite3.Connection, draft: dict[str, Any], *, harness:
     request comes through the lease holder, and one that names no parent is depth 1. It is not a bound a caller
     cannot get around; the lease and the live-spawn cap (:data:`MAX_SPAWNS_LIVE`) are what bind."""
     from levain.agents import role as role_mod
+    from levain.agents.role import envelope_ceiling
     from levain.coordinator.envelopes import EnvelopeStore, narrow_scope
     from levain.coordinator.store import CoordStore
 
@@ -561,7 +562,7 @@ def _complete_spawn(conn: sqlite3.Connection, draft: dict[str, Any], *, harness:
         eff = EnvelopeStore._effective(conn, envelope_id, thread.thread_id)
         scope = {k: eff[k] for k in sorted(_SCOPE_KEYS)}
     try:
-        narrowed = narrow_scope(scope, role["ceiling"])
+        narrowed = narrow_scope(scope, envelope_ceiling(role["ceiling"]))
     except CoordError as exc:
         raise _refused(f"the role's ceiling is refused ({exc})") from None
     rec = {**draft, "depth": depth, "drop_id": thread.members[0], "envelope_id": envelope_id,

@@ -74,7 +74,7 @@ class Env:
 
     def _verify(self, proof, exposure, claims=None):
         self.verified += 1
-        D.verify_point_of_use(proof, exposure, replay=self.rig.authority.replay, now=self.rig.now, bar_of=self.bar_of,
+        return D.verify_point_of_use(proof, exposure, replay=self.rig.authority.replay, now=self.rig.now, bar_of=self.bar_of,
                               billing="subscription")
 
     def connect(self):

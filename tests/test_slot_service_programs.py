@@ -392,3 +392,16 @@ def test_programs_run_as_processes(store):
     assert keys_rc == 0, keys.lines
     assert "levain gw-keys: stopped" in keys.lines
     assert ctl_rc == 0, ctl.lines
+
+
+# --- row 133: the fresh-setup TEMPFAIL lines are explained, and the property that makes them safe is pinned ------------------
+
+def test_the_no_operator_exit_75_is_restarted_not_failed_and_the_units_module_says_why():
+    from levain.slot import units
+    for name in ("control", "dispatch_run"):
+        text = units.systemd_unit_text(units.by_name(name))
+        assert "Restart=always" in text, name                                  # 75 is restarted, so the unit settles
+        prevent = next((ln for ln in text.splitlines() if ln.startswith("RestartPreventExitStatus=")), "")
+        assert prevent, (name, "the unit names no RestartPreventExitStatus= line")
+        assert "75" not in prevent.split("=", 1)[1].replace(",", " ").split(), (name, prevent)   # systemd splits on space AND comma
+    assert "status=75/TEMPFAIL" in units.__doc__ and "systemctl --failed" in units.__doc__

@@ -302,24 +302,30 @@ def fire_factory(store: AgentStore, occurrence_id: str, launch_epoch: int, *,
     return {**extra, "sup": sup, "role": role, "values": dict(install.values), "recall": recall, "launcher": launcher,
             "exposure": None if reserved is None else reserved.exposure,
             "max_exposure_usd_micros": 0 if reserved is None or reserved.usd_micros is None else reserved.usd_micros,
-            **_workspace_kwargs(install, row[0])}
+            **_workspace_kwargs(install, row[0], role)}
 
 
-def _workspace_kwargs(install: SessionInstall, agent_id: str) -> dict[str, Any]:
+def _workspace_kwargs(install: SessionInstall, agent_id: str, role: dict[str, Any] | None = None) -> dict[str, Any]:
     """``run_session``'s ``workspace`` (or ``workspace_problem``) for this agent: its install setting resolved to a
     40-hex commit now, on this (the operator's) uid, by ``levain.dispatch.stager``. Nothing for an agent with no
     setting. A setting that cannot be resolved is a REFUSAL the run records (``session_refused:workspace``), handed
     over with the setting itself (``workspace_setting``) so a rerun of a run that already launched can still hash
     to its first attempt and replay. A HOST fault (git could not run: ``StageRefused.transient``) raises instead:
     that is no answer about the setting, a run that cannot be built is left ``launched`` (``make_run``), and the next
-    try resolves it again."""
+    try resolves it again.
+
+    The member's ``withhold`` is the SIGNED role's ``ceiling.withhold`` (levain 1107, W2: ``role`` is the role the signed
+    spec pins, ``_pinned_role``), never anything the install or the repo says; the client re-derives it from the role's
+    hash chain and the server again, and either refuses a member that carries another."""
     setting = install.workspaces.get(agent_id)
     if setting is None:
         return {}
+    from levain.agents.role import role_withhold
     from levain.dispatch import stager
     try:
         head = stager.resolve_head(setting.repo, setting.branch)
-        return {"workspace": _session.Workspace(setting.repo, head, (), None, setting.branch)}
+        withhold = () if role is None else role_withhold(role)
+        return {"workspace": _session.Workspace(setting.repo, head, withhold, None, setting.branch)}
     except stager.StageRefused as exc:
         if exc.transient:
             raise

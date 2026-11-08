@@ -54,7 +54,7 @@ def build_parser() -> argparse.ArgumentParser:
                    help="A login session: sign the slot in to the vendor (needs --auth passthrough).")
     p.add_argument("--dispatch", action="store_true",
                    help="With --login: a yes at the confirm also marks this slot's login for unattended runs "
-                        "(dispatch). Your consent that agents may spend this login without you at the desk.")
+                        "(dispatch). Your consent that agents may spend this login without you at the laptop.")
     return p
 
 

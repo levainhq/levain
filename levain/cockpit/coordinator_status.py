@@ -1,4 +1,4 @@
-"""levain.cockpit.coordinator_status: the cockpit's Coordinator panel (C10 S2), read-only.
+"""levain.cockpit.coordinator_status: the cockpit's Desk panel (C10 S2), read-only.
 
 It draws :func:`levain.coordinator.lease.status`, the data ``levain coord status`` prints: the ``wake_state`` word and
 its ``why`` (quoted, never reworded), who holds the lease and until when, the coordinator setting and the latest
@@ -155,7 +155,7 @@ def status_rows(st: dict[str, Any], now: datetime | None = None) -> tuple[RowIn,
     stamp = None if now is None else utc_stamp(now)
     from levain.cockpit.coordinator_panels import _row
 
-    rows = [_row("state", "Coordinator", f"{st['wake']}: {st['why']}"),
+    rows = [_row("state", "Desk", f"{st['wake']}: {st['why']}"),
             _row("lease", "Lease", _lease_body(st["lease"])),
             _row("setting", "Setting", _setting_body(st["setting"]))]
     rows += [_row(f"launch:{ln['launch_id']}", f"Launch · {ln['state']}", _launch_body(ln, stamp)) for ln in st["launches"]]

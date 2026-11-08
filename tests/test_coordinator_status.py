@@ -1,4 +1,4 @@
-"""C10 S2: the read-only Coordinator panel, one fixture store per wake_state, built with the store's own API."""
+"""C10 S2: the read-only Desk panel, one fixture store per wake_state, built with the store's own API."""
 from __future__ import annotations
 
 import sqlite3
@@ -79,7 +79,7 @@ def _state_line(panel: dict) -> str:
 
 def test_wake_names_the_next_drop_in_the_stores_own_words(store, qdir, clock) -> None:
     body = _state_line(_panel(qdir, clock))
-    assert body == "Coordinator: wake: no coordinator holds the lease; the next drop asks for one"
+    assert body == "Desk: wake: no coordinator holds the lease; the next drop asks for one"
     assert _rows(_panel(qdir, clock))["lease"] == "Lease: none held"
     assert _rows(_panel(qdir, clock))["setting"].startswith("Setting: claude, in ")
 
@@ -88,7 +88,7 @@ def test_launching_names_the_pending_launch_and_its_until(store, qdir, clock) ->
     _drop(store)
     ln = store.pending_coordinator()
     panel = _panel(qdir, clock)
-    assert _state_line(panel) == (f"Coordinator: launching: coordinator launch {ln.launch_id} is pending until "
+    assert _state_line(panel) == (f"Desk: launching: coordinator launch {ln.launch_id} is pending until "
                                   f"{ln.until}")
     rows = _rows(panel)
     assert f"launch:{ln.launch_id}" in rows and "pending until " + ln.until in rows[f"launch:{ln.launch_id}"]
@@ -99,7 +99,7 @@ def test_held_names_the_holder_until_and_token(store, qdir, clock) -> None:
     got = _boot(store)
     held = store.coord_lease()
     panel = _panel(qdir, clock)
-    assert _state_line(panel) == (f"Coordinator: held: {got.session_key} holds the lease until {held.until} "
+    assert _state_line(panel) == (f"Desk: held: {got.session_key} holds the lease until {held.until} "
                                   f"(token {held.token})")
     assert f"{got.session_key} until {held.until} (token {held.token}" in _rows(panel)["lease"]
     assert "past its until" not in _rows(panel)["lease"]
@@ -110,7 +110,7 @@ def test_idle_is_a_running_coordinator_without_the_lease(store, qdir, clock) -> 
     clock.advance(seconds=(lease.LEASE_TTL + timedelta(minutes=1)).total_seconds())
     panel = _panel(qdir, clock)
     body = _state_line(panel)
-    assert body.startswith(f"Coordinator: idle: coordinator launch {got.launch_id} is running without the lease; ")
+    assert body.startswith(f"Desk: idle: coordinator launch {got.launch_id} is running without the lease; ")
     assert "levain coord claim" in body
     assert "past its until, the lapse is not yet recorded" in _rows(panel)["lease"]    # nothing wrote the lapse
 
@@ -119,14 +119,14 @@ def test_unset_with_no_setting_shows_the_cli_line_verbatim(qdir, clock) -> None:
     s = CoordStore(qdir, clock=clock)
     _drop(s)                                    # the store exists; a drop with no agent set only queues
     panel = _panel(qdir, clock)
-    assert _state_line(panel) == ("Coordinator: unset: no coordinator agent is set; drops queue for you "
+    assert _state_line(panel) == ("Desk: unset: no coordinator agent is set; drops queue for you "
                                   "(levain coord agent claude sets one)")
     assert _rows(panel)["setting"] == "Setting: none set (levain coord agent claude sets one)"
 
 
 def test_unset_with_agent_none_says_so(store, qdir, clock) -> None:
     store.coord_set_agent("none")
-    assert _state_line(_panel(qdir, clock)) == ("Coordinator: unset: the coordinator agent is none; drops queue "
+    assert _state_line(_panel(qdir, clock)) == ("Desk: unset: the coordinator agent is none; drops queue "
                                                 "for you (levain coord agent claude sets one)")
 
 
@@ -136,7 +136,7 @@ def test_backoff_names_when_the_next_wake_is_allowed(store, qdir, clock) -> None
     clock.advance(seconds=lease.LAUNCH_TTL.total_seconds())
     _drop(store, "one death")                   # a drop is what writes the expiry the view then reads
     panel = _panel(qdir, clock)
-    assert _state_line(panel).startswith("Coordinator: backoff: 1 coordinator launch(es) died; the next waits until ")
+    assert _state_line(panel).startswith("Desk: backoff: 1 coordinator launch(es) died; the next waits until ")
     assert any(r["id"].startswith("launch:") and r["body"].startswith("Launch · expired: claude coordinator · ")
                for r in panel["rows"])
 
@@ -151,7 +151,7 @@ def test_stopped_after_three_deaths_names_the_two_ways_to_look(store, qdir, cloc
         clock.advance(seconds=lease.LAUNCH_TTL.total_seconds())
     _drop(store, "after three deaths")
     panel = _panel(qdir, clock)
-    assert _state_line(panel) == ("Coordinator: stopped: 3 coordinator launches in a row died; nothing launches "
+    assert _state_line(panel) == ("Desk: stopped: 3 coordinator launches in a row died; nothing launches "
                                   "until you look (levain coord take, or levain coord release)")
     assert sum(r["id"].startswith("launch:") for r in panel["rows"]) == 3
 
@@ -195,7 +195,7 @@ def test_the_provider_reaches_the_store_only_through_the_readonly_opener(store, 
 
     for name in ("_write", "_connect", "coord_status", "coord_wake", "coord_take", "coord_release"):
         monkeypatch.setattr(CoordStore, name, refuse)
-    assert _state_line(_panel(qdir, clock)).startswith("Coordinator: wake: ")
+    assert _state_line(_panel(qdir, clock)).startswith("Desk: wake: ")
 
 
 def test_the_readonly_connection_refuses_a_write(store) -> None:
@@ -228,7 +228,7 @@ def test_a_pending_launch_past_its_until_reads_as_the_cli_reads_it(store, qdir, 
     cli = CoordStore(copy, clock=clock).coord_status()
     assert cli["wake"] == "backoff"
     panel = _panel(qdir, clock)
-    assert _state_line(panel) == f"Coordinator: {cli['wake']}: {cli['why']}"
+    assert _state_line(panel) == f"Desk: {cli['wake']}: {cli['why']}"
     launch = next(b for i, b in _rows(panel).items() if i.startswith("launch:"))
     assert "pending, past its until; not yet recorded as expired" in launch
     assert store.coord_status()["wake"] == cli["wake"]      # and the real CLI agrees with the panel afterwards
@@ -241,7 +241,7 @@ def test_the_reader_uses_the_contexts_now_unless_a_clock_is_injected(store, qdir
     _boot(store)
     soon = ReadContext(T0 + timedelta(minutes=1))           # far from wall time, inside the lease
     rows = {r.id: r.body for r in status_reader(lambda: qdir)(soon).rows}
-    assert rows["state"].startswith("Coordinator: held: ")
+    assert rows["state"].startswith("Desk: held: ")
     injected = {r.id: r.body for r in status_reader(lambda: qdir, lambda: T0 + lease.LEASE_TTL + timedelta(minutes=1))(soon).rows}
     assert "idle" in injected["state"]                      # an explicitly injected clock still wins
 
@@ -266,11 +266,11 @@ def test_an_unrecorded_expiry_shows_a_time_that_does_not_move_with_the_read(stor
     for seconds in (0, 7, 30):
         clock.now = until + timedelta(seconds=seconds)
         states.append(next(r for r in _panel(qdir, clock)["rows"] if r["id"] == "state"))
-    assert len({(s["body"], s["version"]) for s in states}) == 1 and states[0]["body"].startswith("Coordinator: backoff: ")
+    assert len({(s["body"], s["version"]) for s in states}) == 1 and states[0]["body"].startswith("Desk: backoff: ")
     copy = tmp_path / "copy"
     shutil.copytree(qdir, copy)
     cli = CoordStore(copy, clock=lambda: until + timedelta(seconds=30)).coord_status()
-    assert cli["wake"] == "backoff" and states[0]["body"] == f"Coordinator: {cli['wake']}: {cli['why']}"
+    assert cli["wake"] == "backoff" and states[0]["body"] == f"Desk: {cli['wake']}: {cli['why']}"
 
 
 def test_a_pending_launch_with_no_until_does_not_fault_the_panel(store, qdir, clock) -> None:

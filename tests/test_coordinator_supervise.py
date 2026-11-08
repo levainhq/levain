@@ -164,7 +164,7 @@ def test_the_serve_runs_the_watcher_while_it_is_up_and_ends_it_with_the_serve(st
         write_token = None
         closed = False
 
-        class consent_reader:                           # the directory the Coordinator panel and its verbs read
+        class consent_reader:                           # the directory the Desk panel and its verbs read
             directory = tmp_path / "panel-dir"
 
         def serve_forever(self):
