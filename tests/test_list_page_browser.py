@@ -8,6 +8,7 @@ surface chips filter the rows; Open loops is off the default Board tab and on Bu
 from __future__ import annotations
 
 import json
+import re
 import os
 from pathlib import Path
 from typing import Any
@@ -274,12 +275,15 @@ _MQ_SPY = ("(function(){const o=window.matchMedia.bind(window);window.__mqAdds=0
 
 _LISTFIX_PROBE = f"""(() => {{
   const T = document.querySelector('#levain-modal .modal-body') || {TRAY}; const rows = [];
-  for (const row of T.querySelectorAll('.sp-results .row')) {{
+  const grab = () => {{ for (const row of T.querySelectorAll('.sp-results .row')) {{
     const clause = row.querySelector('.clause');
     const meta = row.querySelector('.list-meta') || row;
     rows.push({{t: (clause ? clause.textContent : '').slice(0, 24), surface: row.dataset.surface || '',
       pills: [...meta.querySelectorAll('.k7-repo')].map(p => p.textContent), all: row.querySelectorAll('.k7-repo').length}});
-  }}
+  }} }};
+  grab();                                                   // the rows under "all", then the held ones under their own chip
+  const held = T.querySelector('.list-surface-chip[data-surface="held"]');
+  if (held) {{ held.click(); grab(); }}
   return JSON.stringify({{rows}});
 }})()"""
 
@@ -311,7 +315,7 @@ def test_listfix2_one_pill_one_listener_and_known_origins_only(tmp_path: Path) -
                       f"&& r.querySelector('.clause').textContent.startsWith('levain:') && r.querySelector('.k7-repo')) && 1"},
             # held rows are listed in the focus view only (the card names them in its one control): read the rows there
             {"eval": f"{TRAY}.querySelector('.pexpand').click(); 1"},
-            {"until": "document.querySelector('#levain-modal .modal-body .sp-results .row[data-held=\"1\"]') && 1"},
+            {"until": "document.querySelector('#levain-modal .list-surface-chip[data-surface=\"held\"]') && 1"},
             {"eval": _LISTFIX_PROBE},
             {"eval": "document.querySelector('#levain-modal .modal-close').click(); 1"},
             {"eval": "JSON.stringify({adds: window.__mqAdds})"},
@@ -427,7 +431,9 @@ _CARD_PROBE = f"""(() => {{
   const text = (r) => (r.querySelector('.clause') || {{}}).textContent || '';
   const foot = [...T.querySelectorAll('.more-foot, .held-toggle, .held-line, .xmore')].filter(n => !n.hidden && n.getClientRects().length);
   return JSON.stringify({{shown: rows.map(text), more: foot.map(n => n.className + ' | ' + n.textContent.trim()),
-    heldToggles: T.querySelectorAll('[data-held-toggle]').length}});
+    heldToggles: T.querySelectorAll('[data-held-toggle]').length,
+    chips: [...T.querySelectorAll('.list-surface-chip')].map(c => c.textContent),
+    head: (T.querySelector('.ck-count') || {{}}).textContent}});
 }})()"""
 
 _FOCUS_PROBE = """(() => {
@@ -437,7 +443,8 @@ _FOCUS_PROBE = """(() => {
     const col = h && h.parentElement; return col ? [...col.querySelectorAll('.row .clause')].map(c => c.textContent.slice(0, 20)) : null; };
   return JSON.stringify({heads, desk: group('Desk owes'), later: group('Later'), needs: group('Needs you'),
     held: [...mb.querySelectorAll('.row[data-held="1"]')].length, toggles: mb.querySelectorAll('[data-held-toggle], .held-toggle').length,
-    chips: [...mb.querySelectorAll('.list-surface-chip')].map(c => c.textContent)});
+    chips: [...mb.querySelectorAll('.list-surface-chip')].map(c => c.textContent),
+    title: document.querySelector('#levain-modal-title').textContent});
 })()"""
 
 
@@ -475,8 +482,18 @@ def test_r4_the_card_holds_due_rows_and_one_control_and_the_focus_view_every_gro
     assert focus["later"] and focus["later"][0].startswith("levain: TUE"), focus                         # the later row under LATER
     assert focus["needs"] and not any(t.startswith(("levain: TUE", "desk: Write")) for t in focus["needs"]), focus
     assert any(t.startswith("desk: carried") for t in focus["needs"]), focus                             # the carried one is under Needs you
-    assert focus["held"] > 0 and focus["toggles"] == 0, focus                                            # held spores listed, no toggle
-    assert "Held until their surface date" in focus["heads"], focus
+    assert focus["held"] == 0 and focus["toggles"] == 0, focus                                           # held rows are in no group and no "all": their own chip
+    # ONE rule for "all": each view's header and its "all" chip agree, the focus view's follows from the card's (+ the desk's and the
+    # later rows the card names in its control), and held rows stand apart in their own chip
+    num = lambda chips, word: next((int(c.rsplit(" ", 1)[1]) for c in chips if c.startswith(word + " ")), None)
+    assert card["head"] and int(card["head"]) == num(card["chips"], "all"), card
+    assert focus["title"].endswith(f"({num(focus['chips'], 'all')})"), focus
+    desk, later = (int(re.search(rf"{w} (\d+)", card["more"][0]).group(1)) for w in ("desk owes", "later"))
+    carried = 1       # the carried desk row is in the card's "all" already (it is needs-you) and in the control's desk owes
+    assert num(focus["chips"], "all") == num(card["chips"], "all") + (desk - carried) + later, (card, focus)
+    assert len(focus["desk"]) == desk - carried and len(focus["later"]) == later, focus
+    assert num(card["chips"], "spores") == num(focus["chips"], "spores"), (card["chips"], focus["chips"])    # live spores only, in both
+    assert num(focus["chips"], "held") == int(re.search(r"(\d+) held", card["more"][0]).group(1)), (card, focus)
 
 
 # --- 531 r4 round 5 (levain 74, key 1108-39): L1+L2 fixes -----------------------------------------------------------------------

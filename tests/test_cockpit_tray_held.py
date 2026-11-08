@@ -207,6 +207,15 @@ def _open_focus() -> list[dict[str, Any]]:
             {"until": f"{FOCUS} && {FOCUS}.querySelector('.sp-results') && 1"}]
 
 
+HELD_CHIP = f"{FOCUS}.querySelector('.list-surface-chip[data-surface=\"held\"]')"
+
+
+def _open_held() -> list[dict[str, Any]]:
+    """The focus view lists held rows under their own chip only (levain 75): never inside "all" or a surface's chip."""
+    return [*_open_focus(), {"eval": f"{FOCUS_HELD}.length"}, {"eval": f"{HELD_CHIP}.click(); 1"},
+            {"until": f"{FOCUS_HELD}.length > 0 && 1"}]
+
+
 @needs_browser
 def test_the_card_hides_the_held_rows_and_names_them_in_one_control_and_the_focus_view_lists_them(tmp_path: Path) -> None:
     real, served = _served(tmp_path)
@@ -214,15 +223,16 @@ def test_the_card_hides_the_held_rows_and_names_them_in_one_control_and_the_focu
         out = _drive(tmp_path, f"{url}/", [
             {"until": f"{WAIT} && {MORE} && 1"},
             {"eval": f"[{HELD_ROWS}.length, {ALL_ROWS}.length, {MORE}.textContent.trim(), {TOGGLE} === null]"},
-            *_open_focus(),
+            *_open_held(),
             {"eval": f"[{FOCUS_HELD}.length, {FOCUS}.querySelectorAll('[data-held-toggle]').length]"},
             {"eval": f"{FOCUS_HELD}.map(r => r.textContent)"},
         ])
     v = out["values"]
     assert v[1] == [0, 2, "2 held", True], v
-    assert v[4] == [2, 0], v
-    assert f"surfaces {_label(real + timedelta(days=3))}" in v[5][0] and "a sooner held seed" in v[5][0], v
-    assert f"surfaces {_label(real + timedelta(days=10))}" in v[5][1] and "a later held seed" in v[5][1], v
+    assert v[4] == 0, v                      # not inside "all"
+    assert v[7] == [2, 0], v
+    assert f"surfaces {_label(real + timedelta(days=3))}" in v[8][0] and "a sooner held seed" in v[8][0], v
+    assert f"surfaces {_label(real + timedelta(days=10))}" in v[8][1] and "a later held seed" in v[8][1], v
 
 
 @needs_browser
@@ -233,11 +243,12 @@ def test_a_held_row_in_the_focus_view_carries_the_same_verbs_as_a_due_row(tmp_pa
     with served as url:
         out = _drive(tmp_path, f"{url}/", [
             {"until": f"{WAIT} && {MORE} && 1"},
-            *_open_focus(),
+            *_open_held(),
             {"eval": names % f"{FOCUS_HELD}[0]"},
+            {"eval": f"{HELD_CHIP}.parentElement.querySelector('[data-surface=\"\"]').click(); 1"},
             {"eval": names % due_rows},
         ])
-    held, due = out["values"][-2], out["values"][-1]
+    held, due = out["values"][-3], out["values"][-1]
     assert held and held == due, out
 
 
@@ -248,10 +259,10 @@ def test_a_list_with_only_held_rows_still_offers_them(tmp_path: Path) -> None:
         out = _drive(tmp_path, f"{url}/", [
             {"until": f"{WAIT} && {MORE} && 1"},
             {"eval": f"[{MORE}.textContent.trim(), {ALL_ROWS}.length, {TRAY}.textContent.includes('nothing waiting')]"},
-            *_open_focus(),
+            *_open_held(),
             {"eval": f"{FOCUS_HELD}.length"},
         ])
-    assert out["values"][1][0] == "2 held" and out["values"][1][1] == 0 and out["values"][4] == 2, out
+    assert out["values"][1][0] == "2 held" and out["values"][1][1] == 0 and out["values"][-1] == 2, out
 
 
 @needs_browser
@@ -264,9 +275,12 @@ def test_the_focus_views_filter_covers_the_held_rows(tmp_path: Path) -> None:
             {"until": f"{WAIT} && {MORE} && 1"},
             *_open_focus(),
             {"eval": q},
+            {"eval": f"[{FOCUS}.querySelectorAll('.sp-results .row').length, {FOCUS_HELD}.length, !!{FOCUS}.querySelector('[data-held-show-matches]')]"},
+            {"eval": f"{FOCUS}.querySelector('[data-held-show-matches]').click(); 1"},
             {"eval": f"[{FOCUS}.querySelectorAll('.sp-results .row').length, {FOCUS_HELD}.length]"},
         ])
-    assert out["values"][-1] == [1, 1], out
+    # "all" holds no held rows: the search tells of the held match and its button opens the held chip, which lists exactly that row
+    assert out["values"][-3] == [0, 0, True] and out["values"][-1] == [1, 1], out
 
 
 # --- the plain Tray (a panel that offers no list_intake: a read-only credential) keeps its held toggle ------------------------

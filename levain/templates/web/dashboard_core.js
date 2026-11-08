@@ -2260,17 +2260,22 @@
     const apartCount = { desk: (list || []).filter((s) => s.band_section === "desk").length,
                          later: (list || []).filter((s) => s.group === "later").length, held: heldLine ? heldLine.count : 0 };
     const cardHasApart = inCard && (apartCount.desk > 0 || apartCount.later > 0 || apartCount.held > 0);
-    // held rows count when they are shown: a surface only held rows carry still gets its chip and stays selectable
-    const listAll = () => (list || []).filter((s) => !cardHides(s)).concat(heldLine && heldShownNow() ? held : []);
-    const listNow = () => (isList && listAll().some((s) => s.surface === listSurface) ? listSurface : "");
-    const inSurface = (s) => !listNow() || s.surface === listNow();
+    // ONE rule for "all", in the card and the focus view: the rows in this view's own list (the card's without the desk's and the
+    // later ones it names in its control, the focus view's with them). Held rows are never in it, nor in a surface chip: they have
+    // their own "held" chip. So the header, the "all" chip and the control's numbers follow from each other.
+    const listAll = () => (list || []).filter((s) => !cardHides(s));
+    const heldChosen = () => isList && listSurface === "held" && !!heldLine;
+    const listNow = () => (heldChosen() ? "held" : isList && listAll().some((s) => s.surface === listSurface) ? listSurface : "");
+    const inSurface = (s) => !listNow() || listNow() === "held" || s.surface === listNow();
+    if (isList && !inCard) p.dataset.listTotal = String(listAll().length);   // the focus view's header counts what its "all" chip counts
+    let chipRow = null;     // the chips' row, drawn by controls(); the panel's own element is empty once the focus view moves its body
     const opts = views.length || heldLine || isList ? {
       // a card whose due rows are all done still holds the desk's, the later and the held ones: it says nothing is due, not that it is empty
       empty: cardHasApart ? "Nothing due for you." : emptyMsg,
-      extra: () => (heldLine && heldShownNow() ? held.filter(inSurface) : []),
+      extra: () => (isList ? (heldChosen() ? held : []) : heldLine && heldShownNow() ? held.filter(inSurface) : []),
       // the card's search also reads what the card leaves to the focus view, so a match there is told, never "no items match"
       unlisted: () => (inCard ? (list || []).filter(cardHides).concat(heldLine ? held : []).filter(inSurface)
-                              : (heldLine && !heldShownNow() && !isList ? held.filter(inSurface) : [])),
+                              : (heldLine && !isList && !heldShownNow() ? held.filter(inSurface) : isList && heldLine && !heldChosen() ? held.filter(inSurface) : [])),
       hintShow: (note, n) => {
         note.appendChild(document.createTextNode(inCard ? " — " + n + (n === 1 ? " row matches in the full list — " : " rows match in the full list — ")
                                                         : " — " + n + (n === 1 ? " held row matches — " : " held rows match — ")));
@@ -2280,12 +2285,13 @@
         go.textContent = inCard ? "open it" : "show";
         go.addEventListener("click", () => {
           if (inCard) { const m = p.querySelector("[data-list-more]"); if (m) m.click(); return; }
+          if (isList) { const c = chipRow && chipRow.querySelector('[data-surface="held"]'); if (c) c.click(); return; }
           const t = p.querySelector("[data-held-toggle]"); if (t) t.click();
         });
         note.appendChild(go);
       },
       controls: (bar, redraw) => {
-        if (isList) bar.after(buildSurfaceChips(listAll(), listNow, (v) => { listSurface = v; redraw(); }));
+        if (isList) bar.after(chipRow = buildSurfaceChips(listAll(), listNow, (v) => { listSurface = v; redraw(); }, heldLine ? heldLine.count : 0));
         if (heldLine && !isList) {
           const line = el("div", "ext-note held-line");
           // the earliest surface date among the held rows: "1 held back until Dec 3"
@@ -2321,7 +2327,7 @@
         bar.appendChild(sel);
       },
       pick: (rows) => {
-        const all = (listNow() ? rows.filter((s) => s.surface === listNow()) : rows).filter((s) => !cardHides(s));
+        const all = (listNow() === "held" ? [] : listNow() ? rows.filter((s) => s.surface === listNow()) : rows).filter((s) => !cardHides(s));
         const ids = views.length && viewOf() ? view.tray_view_rows[viewOf()] : null;
         if (!Array.isArray(ids)) return all;
         const byId = new Map(all.map((s) => [s.id, Object.assign({}, s, { age_shown: true })]));
@@ -2431,7 +2437,7 @@
   // The List's surface filter: one chip per store that has a row now, with its count, plus All. A display choice only
   // (`listSurface`); the rows and their order are the kernel's.
   const SURFACE_WORDS = { band: "band", board: "board", spore: "spores", talk: "talk", drop: "drops" };
-  function buildSurfaceChips(list, current, choose) {
+  function buildSurfaceChips(list, current, choose, heldCount) {
     const row = el("div", "list-surfaces");
     row.setAttribute("role", "group");
     row.setAttribute("aria-label", "filter the List by where a row comes from");
@@ -2451,6 +2457,7 @@
     const sync = (now) => { for (const c of chips) c.setAttribute("aria-pressed", c.dataset.surface === now ? "true" : "false"); };
     mk("", "all " + list.length);
     for (const k of Object.keys(SURFACE_WORDS)) if (counts.has(k)) mk(k, SURFACE_WORDS[k] + " " + counts.get(k));
+    if (heldCount > 0) mk("held", "held " + heldCount);     // its own chip: held rows are never folded into "all" or a surface's number
     sync(current());
     return row;
   }
@@ -8688,7 +8695,10 @@
     if (p.dataset.editable === "1" && p._levainEdit) {
       host.appendChild(buildEditRow(host, p._levainEdit.entry, p._levainEdit.doc));
     }
-    return { host, zone: p.dataset.zone || "", title: entry.title || "", editClass: entry.edit_class || "" };
+    // the List's focus view counts its header as its "all" chip does (the card's count is the kernel's, without the desk's and later rows)
+    const total = p.dataset.listTotal;
+    const title = total ? String(entry.title || "").replace(/ \(\d+\)$/, " (" + total + ")") : entry.title || "";
+    return { host, zone: p.dataset.zone || "", title, editClass: entry.edit_class || "" };
   }
 
   function customModalContent(c) {
