@@ -5,7 +5,12 @@ sees at the end (the signed line, the landed card, the receipt and the thread ro
 and J4-J5 run in the session's shared headless Chrome; J3 starts its own full Chrome (a service worker and Push need it). A signed
 card staying in the strip is not asserted: the desk's reader, not the page, closes it. J3 covers the legacy notification tap through the
 real worker and the declarative push's absolute ``navigate`` url followed on the server; the worker's stand-down on a declarative
-push needs a WebKit ``Notification.navigate`` that headless Chrome lacks, so that branch is not driven here.
+push needs a WebKit ``Notification.navigate`` that headless Chrome lacks, so that branch is not driven here. The tap itself is
+SYNTHETIC: the driver dispatches a ``notificationclick`` event inside the worker, which Chrome does not treat as a user activation.
+What that proves is the worker's click handler routing a tap to an already open, controlled page by messaging it (its own trace
+must say ``ack``) and the page landing on the card; it does NOT prove ``clients.openWindow`` or ``WindowClient.focus`` (both need
+a real click's activation; the handler's focus is best effort), the fallback ``navigate`` / new-window branches, a closed-app
+launch, or the OS handing the tap to the worker. No headless check of those exists; the phone is the oracle for them.
 
   1. sign a band answer in the cockpit's sign sheet with a passkey, an option picked
   2. the NEEDS band at phone width (390x844 by CDP device metrics), a tap on an option answers it
@@ -251,6 +256,7 @@ def test_j3_a_push_is_tapped_and_the_app_lands_on_the_pending_card(tmp_path: Pat
     tapped = json.loads(v[4])
     assert tapped["shown"] == 1 and tapped["title"] == "Which retry policy?" and tapped["closed"] == 1, tapped
     assert tapped["url"] == payload["url"], tapped                           # the notification carries the server's link
+    assert tapped["acked"] is True, tapped                                   # the worker's own trace: it routed the tap by the page's ack (no openWindow)
     assert v[6] == "Which retry policy?", v                                  # the app landed on that pending card, open
     assert v[3] == "home", v                                                 # and it did so from the tap, not because it was already open
     assert via["values"][-1] == "Which retry policy?", via["values"]         # the declarative navigate url lands on that card too
@@ -268,7 +274,9 @@ def _phone_tap(tmp_path: Path, url: str, payload: dict, *, tap: bool = True) -> 
               " click.notification = {close: () => closed.push(1), data: n.data, tag: n.tag}; click.action = '';"
               " const w2 = []; click.waitUntil = (p) => { w2.push(Promise.resolve(p)); };"
               " self.dispatchEvent(click); await Promise.allSettled(w2);"
-              " return JSON.stringify({shown: shown.length, title: n.title, url: n.data.url, closed: closed.length}); })()" % (json.dumps(json.dumps(payload)), "true" if tap else "false"))
+              " const tc = await caches.open('levain-trace'); const rows = await Promise.all((await tc.keys()).map(async (r) => (await tc.match(r)).json()));"
+              " const ack = rows.find((r) => r.step === 'ack');"
+              " return JSON.stringify({shown: shown.length, title: n.title, url: n.data.url, closed: closed.length, acked: !!(ack && ack.acked)}); })()" % (json.dumps(json.dumps(payload)), "true" if tap else "false"))
     return _drive(tmp_path, url, [
             PHONE,
             {"until": "document.querySelector('#ck-needs .needs-row') && 1", "ms": 30000},
