@@ -38,9 +38,9 @@ def test_one_verdict_per_cell_in_the_vocabulary():
 
 
 def test_queue_down_differs_by_vendor_and_says_why():
-    # Claude Code: onFailure block, so a dead queue blocks; Codex fails open (the OS boundary alone holds it)
+    # Claude Code: onFailure block, so a dead queue blocks; Codex's slot_gate denies (fail closed) when the broker is down
     assert cf.expected_verdict("claude", "Write", "queue-down") == cf.BLOCKED_QUEUE_UNREACHABLE != cf.BLOCKED
-    assert cf.expected_verdict("codex", "shell", "queue-down") == cf.FAILS_OPEN
+    assert cf.expected_verdict("codex", "shell", "queue-down") == cf.BLOCKED_QUEUE_UNREACHABLE
     assert cf.expected_verdict("codex", "shell", "blocked") == cf.BLOCKED
     assert cf.expected_verdict("codex", "shell", "allowed") == cf.ALLOWED
 
@@ -71,21 +71,55 @@ def test_matrix_refuses_empty_and_incomplete():
         cf.run_matrix([], honest, evidence_dir="/nonexistent")
 
 
+CLAUDE_ONLY = ({"claude": ["anthropic", "or-claude"]}, {"claude": ["2.1.300"]})
+
+
+def test_the_codex_queue_down_expectation_is_what_the_levain_code_does():
+    """Quote the code, not memory: the broker-unreachable path of codex.slot_gate is a deny (exit 0), and rendering refuses
+    Codex hooks, which is why the Codex cells are NOT_RUNNABLE."""
+    import inspect
+    from levain.consent.adapters import codex
+    src = inspect.getsource(codex.slot_gate)
+    assert "fail closed: the broker down, refusing or malformed is a deny" in src
+    assert "return could_not_run(\"this call\")" in src
+    render = (Path(inspect.getsourcefile(codex)).parents[2] / "slot" / "render.py").read_text()
+    assert 'hooks-not-wired:codex' in render and "codex" in cf.NOT_RUNNABLE and "hooks-not-wired:codex" in cf.NOT_RUNNABLE["codex"]
+
+
 def test_honest_attempt_passes_all(run):
-    cells = cf.build_matrix(ROUTES, VERSIONS)
+    cells = cf.build_matrix(*CLAUDE_ONLY)
     res = run(cells, honest)
-    assert res["ok"] is True and res["counts"] == {"PASS": len(cells)}
+    assert res["ok"] is True and res["status"] == "PASS" and res["counts"] == {"PASS": len(cells)}
     assert set(res["expected"]) == {c.key for c in cells}
 
 
-def test_a_wrong_verdict_fails_exactly_that_cell(run):
+def test_codex_cells_are_not_runnable_never_pass_or_fail_and_the_overall_says_how_many(run, tmp_path):
     cells = cf.build_matrix(ROUTES, VERSIONS)
-    bad = "codex/shell/openai/0.171.0/queue-down"
+    n_codex = sum(1 for c in cells if c.vendor == "codex")
+    called = []
+    res = run(cells, lambda c: called.append(c.vendor) or honest(c))
+    assert "codex" not in called                                           # never attempted
+    assert res["counts"] == {"PASS": len(cells) - n_codex, "NOT_RUNNABLE": n_codex} and res["not_runnable"] == n_codex
+    assert res["ok"] is False and res["status"] == "PARTIAL"              # what ran passed; the route is not certified
+    row = next(r for r in res["rows"] if r["cell"].startswith("codex/"))
+    assert row["status"] == "NOT_RUNNABLE" and "hooks-not-wired:codex" in row["reason"]
+    dirs = sorted(tmp_path.iterdir())
+    text = (dirs[-1] / "RESULT.txt").read_text()
+    assert text.startswith("RESULT: PARTIAL") and f"not runnable: {n_codex} of {len(cells)} cells" in text
+    assert "NOT RUNNABLE: hooks-not-wired:codex" in (dirs[-1] / "EXPECTED.txt").read_text()
+    only_codex = cf.build_matrix({"codex": ["o"]}, {"codex": ["1"]})
+    r2 = run(only_codex, honest, queue_reachable=None)                      # no hook needed: nothing runnable
+    assert r2["counts"] == {"NOT_RUNNABLE": len(only_codex)} and r2["ok"] is False
+
+
+def test_a_wrong_verdict_fails_exactly_that_cell(run):
+    cells = cf.build_matrix(*CLAUDE_ONLY)
+    bad = "claude/Bash/or-claude/2.1.300/queue-down"
 
     def attempt(c):
-        # a Codex that started failing closed would look like a pass to a lax runner; here it is a FAIL
-        return {"verdict": cf.BLOCKED if c.key == bad else c.expected,
-                "raw": cf.BLOCKED if c.key == bad else c.expected}
+        # a verdict that is not the one expected is a FAIL
+        return {"verdict": cf.ALLOWED if c.key == bad else c.expected,
+                "raw": cf.ALLOWED if c.key == bad else c.expected}
     res = run(cells, attempt)
     assert res["ok"] is False
     assert [r["cell"] for r in res["rows"] if r["status"] == "FAIL"] == [bad]
@@ -144,7 +178,7 @@ def test_raw_patterns_cover_every_verdict_with_one_pattern():
 
 
 def test_a_queue_that_silently_stayed_up_cannot_pass_queue_down(run):
-    cells = cf.build_matrix({"claude": ["a"], "codex": ["o"]}, {"claude": ["1"], "codex": ["1"]})
+    cells = cf.build_matrix({"claude": ["a"]}, {"claude": ["1"]})
     res = run(cells, honest, queue_reachable=lambda c: True)       # the verdict and raw are right; the queue never went down
     failed = {r["cell"] for r in res["rows"] if r["status"] == "FAIL"}
     assert failed == {c.key for c in cells if c.case == "queue-down"} and res["ok"] is False
@@ -189,3 +223,91 @@ def test_cli_table(capsys):
     assert cf.main(["table"]) == 0
     assert len(capsys.readouterr().out.splitlines()) == len(cf.EXPECTED)
     assert cf.main(["run"]) == 2
+
+
+# ---- L3 round 1 fixes -------------------------------------------------------------------------------------------------
+
+@pytest.mark.parametrize("answer", [None, 0, 1, "", "yes", [], 0.0])
+def test_a_non_bool_queue_answer_is_an_error_never_a_pass(run, answer):
+    cells = cf.build_matrix({"claude": ["a"]}, {"claude": ["1"]})
+    res = run(cells, honest, queue_reachable=lambda c: answer)
+    qd = [r for r in res["rows"] if r["cell"].endswith("queue-down")]
+    assert qd and all(r["status"] == "ERROR" and "want a bool" in r["raw"] for r in qd) and res["ok"] is False
+
+
+def test_only_false_before_and_after_passes_queue_down(run):
+    cells = cf.build_matrix({"claude": ["a"]}, {"claude": ["1"]})
+    res = run(cells, honest, queue_reachable=lambda c: False)
+    assert res["ok"] is True
+
+
+def test_an_attempt_that_mutates_the_tables_mid_run_cannot_pass_a_row(run, monkeypatch):
+    cells = cf.build_matrix({"claude": ["a"]}, {"claude": ["1"]})
+    exp = dict(cf.EXPECTED)
+    pats = dict(cf.RAW_PATTERNS)
+    monkeypatch.setattr(cf, "EXPECTED", exp)                 # mutable stand-ins, the worst case for the old code
+    monkeypatch.setattr(cf, "RAW_PATTERNS", pats)
+
+    def cheat(c):
+        exp[(c.vendor, c.tool, c.case)] = cf.ALLOWED         # move the goalposts to what this attempt will say
+        pats[cf.ALLOWED] = "forged"
+        pats[cf.BLOCKED] = "forged"
+        return {"verdict": cf.ALLOWED, "raw": "forged"}
+    res = run(cells, cheat)
+    blocked = [r for r in res["rows"] if r["cell"].endswith("/blocked")]
+    assert blocked and all(r["status"] == "FAIL" and r["expected"] == cf.BLOCKED for r in blocked)
+    # the very first cell was graded against the frozen table; the ones after it the same
+    assert res["ok"] is False and "PASS" not in {r["status"] for r in res["rows"] if r["cell"].endswith("/blocked")}
+
+
+def test_the_shipped_tables_are_read_only():
+    with pytest.raises(TypeError):
+        cf.EXPECTED[("claude", "Write", "blocked")] = cf.ALLOWED          # type: ignore[index]
+    with pytest.raises(TypeError):
+        cf.RAW_PATTERNS[cf.BLOCKED] = "x"                                  # type: ignore[index]
+
+
+@pytest.mark.parametrize("bad", [b"allowed", 7, ["allowed"], object(), {"a": 1}])
+def test_a_non_string_adapter_answer_is_a_fail_and_the_run_finishes(run, tmp_path, bad):
+    cells = cf.build_matrix({"claude": ["a"]}, {"claude": ["1"]})
+    res = run(cells, lambda c: {"verdict": bad, "raw": bad})
+    assert res["counts"] == {"FAIL": len(cells)} and len(res["rows"]) == len(cells)
+    assert all(len(r["raw"]) <= 300 for r in res["rows"])
+    log = sorted(tmp_path.iterdir())[-1] / "steps.log"
+    assert len(log.read_text().splitlines()) == len(cells)               # every row serialised
+    assert (log.parent / "RESULT.txt").read_text().startswith("RESULT: FAIL")
+
+
+def test_a_run_that_dies_still_writes_a_result_that_says_aborted(tmp_path):
+    cells = cf.build_matrix({"claude": ["a"]}, {"claude": ["1"]})
+    ev = tmp_path / "ev"
+    ev.mkdir()
+
+    def die(c):
+        raise KeyboardInterrupt
+    with pytest.raises(KeyboardInterrupt):
+        cf.run_matrix(cells, die, evidence_dir=ev, queue_reachable=down)
+    assert (ev / "RESULT.txt").read_text().startswith("RESULT: ABORTED")
+
+
+def test_a_system_exit_in_an_attempt_is_an_error_row(run):
+    cells = cf.build_matrix({"claude": ["a"]}, {"claude": ["1"]})
+
+    def quit_(c):
+        raise SystemExit(3)
+    res = run(cells, quit_)
+    assert res["counts"] == {"ERROR": len(cells)}
+
+
+def test_a_cell_outside_the_table_is_a_value_error_before_any_evidence(tmp_path):
+    ev = tmp_path / "ev"
+    ev.mkdir()
+    with pytest.raises(ValueError, match="not in the expected table"):
+        cf.run_matrix([cf.Cell("claude", "apply_patch", "r", "1", "blocked")], honest, evidence_dir=ev, queue_reachable=down)
+    assert list(ev.iterdir()) == []
+
+
+def test_a_short_write_that_makes_no_progress_raises(tmp_path, monkeypatch):
+    monkeypatch.setattr(cf.os, "write", lambda fd, data: 0)
+    with pytest.raises(OSError, match="no progress"):
+        cf._write_durable(tmp_path / "f", "abc")
