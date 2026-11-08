@@ -687,7 +687,10 @@ def close_coordinator_stopped(qdir: Path | str, verb: str) -> list[Question]:
 def _find_install(start: Path) -> Path | None:
     """The spore store of the INNERMOST Levain install holding ``start``: the first directory, walking up, with a
     ``.levain`` directory (a fresh install has no ``memory.spores.json`` yet; the store creates it)."""
+    home = Path.home().resolve()
     for d in (start, *start.parents):
+        if d == home:
+            continue   # ~/.levain is the user's global config directory, never an install's store
         if (d / ".levain").is_dir():
             return d / ".levain" / "memory.spores.json"
     return None
@@ -744,7 +747,9 @@ def file_agenda(what: str, blocks: str, on: str, attention: str | None = None, *
         return refuse(f"no Levain install (.levain directory) at or above {here}: run it from inside the install "
                       "or pass --path")
     # a retry after a failed save is the same ask: the key is the ask's identity, so the store returns the first spore
-    origin_key = "ask-on-" + hashlib.sha256(f"{what}\0{on}\0{spores}".encode()).hexdigest()[:32]
+    # and only an EXACT retry: a differing blocks, attention or target is a different ask and files its own spore
+    ident = "\0".join((what, blocks, on, attention or "", target, str(spores)))
+    origin_key = "ask-on-" + hashlib.sha256(ident.encode()).hexdigest()[:32]
     try:
         item = guarded_spore_store(spores).add(
             type="thought", text=f"{what} (waits on: {blocks})" if blocks else what, disposition="agenda", next=on,

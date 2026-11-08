@@ -175,8 +175,26 @@ def test_a_retry_is_idempotent(tmp_path, inst):
         rc, text, _q = _ask(tmp_path, "--on", FUT)
         assert rc == 0, text
     assert len(_spores(inst)) == 1
+
+
+def test_a_differing_ask_files_its_own_spore(tmp_path, inst):
+    _ask(tmp_path, "--on", FUT)
     rc, _t, _q = _ask(tmp_path, "--on", FUT, "--attention", "talk")
-    assert rc == 0 and len(_spores(inst)) == 1   # same ask, same identity: not a second spore
+    assert rc == 0 and len(_spores(inst)) == 2
+    item, _x = band.file_agenda("Which plan?", "another block", FUT)
+    assert item is not None and len(_spores(inst)) == 3
+
+
+def test_a_global_home_levain_dir_is_not_an_install(tmp_path, monkeypatch):
+    home = tmp_path / "home"
+    (home / ".levain").mkdir(parents=True)
+    work = home / "work"
+    work.mkdir()
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.chdir(work)
+    item, text = band.file_agenda("w", "b", FUT)
+    assert item is None and "no Levain install" in text
+    assert not (home / ".levain" / "memory.spores.json").exists()
 
 
 def test_fresh_install_without_a_store_is_found_and_nested_resolves_innermost(tmp_path, monkeypatch):
