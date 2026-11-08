@@ -36,19 +36,23 @@ def _stamp(when: datetime) -> str:
     return when.strftime("%Y-%m-%dT%H:%M:%S.000000Z")
 
 
-def _seed(qdir, eid: str = EID, *, hours: float = 24, words: str = "run the morning seats on flow") -> EnvelopeStore:
-    """One envelope row in a scratch store, as a signed envelope leaves it (body, digest and stop are what is read)."""
+def _seed(qdir, eid: str = EID, *, hours: float = 24, words: str = "run the morning seats on flow",
+          body_changes: "dict[str, Any] | None" = None, stop_at: "str | None" = None) -> EnvelopeStore:
+    """One envelope row in a scratch store, as a signed envelope leaves it (body, digest and stop are what is read).
+    ``body_changes`` and ``stop_at`` seed a malformed row (the store's signature checks are not what is under test)."""
     store = EnvelopeStore(qdir)
     drop, _ = store.accept_drop(words, surface="phone")
     now = datetime.now(timezone.utc)
     body = {"envelope_id": eid, "drop_id": drop.drop_id, "issued_at": _stamp(now), "stop_at": _stamp(now + timedelta(hours=hours)),
             "where": [{"repo": "/tmp/scratch/flow", "paths": ["."]}], "launches": [{"repo": "/tmp/scratch/flow", "count": 12}],
             "budget": {"hours": 8}, "origin": "structured"}
+    body.update(body_changes or {})
     with store._write() as (conn, at):
         conn.execute("INSERT INTO envelopes (envelope_id, gseq, origin, drop_id, body, digest, payload, signature, "
                      "signer_fp, signer_class, supersedes, stop_at, accepted_at) VALUES (?, ?, 'structured', ?, ?, ?, '{}', "
                      "'sig', 'SHA256:x', 'display-phone', NULL, ?, ?)",
-                     (eid, store._next_gseq(conn, at), drop.drop_id, json.dumps(body), "digest-" + eid[3:9], body["stop_at"], at))
+                     (eid, store._next_gseq(conn, at), drop.drop_id, json.dumps(body), "digest-" + eid[3:9],
+                      body["stop_at"] if stop_at is None else stop_at, at))
     return store
 
 
@@ -261,17 +265,18 @@ def test_a_thread_scoped_kill_is_named_not_shown_as_plain_live(world, tmp_path) 
 
 
 def test_a_store_fault_in_the_ceremony_is_a_plain_refusal_not_a_500(world, tmp_path, monkeypatch) -> None:
-    from levain.dispatch.jobs import JobStoreError
+    from levain.dispatch.jobs import JobStore, JobStoreError
 
     _seed(world.qdir)
     with _serving(tmp_path / "inst", signer=_signer(world), extra_hosts=[RP]) as (url, _h):
         row = _row(url)
         q = urllib.parse.quote(EID, safe="")
 
-        def boom(self) -> str:
+        def boom(conn) -> str:
             raise JobStoreError("the dispatch store has no valid store_id")
 
-        monkeypatch.setattr(EnvelopeStore, "store_id", boom)
+        # the challenge reads the store id in the envelope's own snapshot
+        monkeypatch.setattr(JobStore, "_store_id", staticmethod(boom))
         status, out = _call(url, f"/cockpit/envelope/{q}/revoke-challenge",
                             {"signer_fp": world.phone.fp, "instance": row["instance"]})
         assert (status, out["error"]) == (503, "unavailable") and "nothing was signed" in out["message"], (status, out)
@@ -310,3 +315,198 @@ def test_the_list_read_never_migrates_the_store(world, tmp_path, monkeypatch) ->
     with _serving(tmp_path / "inst", signer=_signer(world), extra_hosts=[RP]) as (url, _h):
         monkeypatch.setattr(EnvelopeStore, "_ensure", no_ensure)
         assert _row(url)["state"] == "live"
+
+
+# --- L3 r1 fix round ---------------------------------------------------------------------------------------------------
+
+def _move_store(src_dir, dst_dir) -> None:
+    """Move a store's file (and any side files) from one directory to another, replacing what is there."""
+    import os
+
+    for suffix in ("", "-wal", "-shm"):
+        src = src_dir / ("dispatch.db" + suffix)
+        dst = dst_dir / ("dispatch.db" + suffix)
+        if src.exists():
+            os.replace(src, dst)
+        elif dst.exists():
+            dst.unlink()
+
+
+def _challenged(url: str, world) -> dict[str, Any]:
+    row = _row(url)
+    q = urllib.parse.quote(EID, safe="")
+    status, c = _call(url, f"/cockpit/envelope/{q}/revoke-challenge", {"signer_fp": world.phone.fp, "instance": row["instance"]})
+    assert status == 200, c
+    return c
+
+
+def _kills(path) -> int:
+    conn = sqlite3.connect(f"file:{path}?mode=ro", uri=True)
+    try:
+        return conn.execute("SELECT count(*) FROM envelope_attenuations").fetchone()[0]
+    finally:
+        conn.close()
+
+
+def test_a_store_removed_between_challenge_and_revoke_refuses_and_makes_no_store(world, tmp_path) -> None:
+    """codex HIGH-1: the kill lands only in the store that was signed for, and a missing one is never made."""
+    _seed(world.qdir)
+    aside = tmp_path / "aside"
+    aside.mkdir(mode=0o700)
+    with _serving(tmp_path / "inst", signer=_signer(world), extra_hosts=[RP]) as (url, _h):
+        c = _challenged(url, world)
+        _move_store(world.qdir, aside)
+        q = urllib.parse.quote(EID, safe="")
+        status, out = _call(url, f"/cockpit/envelope/{q}/revoke", world.phone.assertion(c["challenge"], origin=PAGE))
+        assert status == 409 and "nothing was revoked" in out["message"], (status, out)
+        assert not (world.qdir / "dispatch.db").exists(), "a revoke made a store"
+    assert _kills(aside / "dispatch.db") == 0
+
+
+def test_a_store_swapped_between_challenge_and_revoke_refuses_and_writes_neither(world, tmp_path) -> None:
+    """codex HIGH-1: another store holding the same envelope id is not the one the operator signed for."""
+    _seed(world.qdir)
+    other = tmp_path / "other"
+    other.mkdir(mode=0o700)
+    _seed(other)                                           # the same ev- id, the same digest, a different store_id
+    aside = tmp_path / "aside"
+    aside.mkdir(mode=0o700)
+    with _serving(tmp_path / "inst", signer=_signer(world), extra_hosts=[RP]) as (url, _h):
+        c = _challenged(url, world)
+        _move_store(world.qdir, aside)
+        _move_store(other, world.qdir)
+        q = urllib.parse.quote(EID, safe="")
+        status, out = _call(url, f"/cockpit/envelope/{q}/revoke", world.phone.assertion(c["challenge"], origin=PAGE))
+        assert status == 409 and "nothing was revoked" in out["message"], (status, out)
+    assert _kills(aside / "dispatch.db") == 0 and _kills(world.qdir / "dispatch.db") == 0
+
+
+def test_one_malformed_envelope_never_empties_the_listing(world, tmp_path) -> None:
+    """deepseek HIGH-1: a bad count and a bad stop_earlier stamp are each one row, never the whole list."""
+    eid3 = "ev-" + "c3" * 16
+    _seed(world.qdir)
+    _seed(world.qdir, EID2, body_changes={"launches": [{"repo": "/tmp/scratch/flow", "count": None}]})
+    _seed(world.qdir, eid3)
+    raw = sqlite3.connect(world.qdir / "dispatch.db")
+    raw.execute("INSERT INTO envelope_attenuations (envelope_id, thread_id, kind, value, by, gseq, at) "
+                "VALUES (?, NULL, 'stop_earlier', 'not-a-stamp', 'operator', 9101, 'now')", (eid3,))
+    raw.commit()
+    raw.close()
+    with _serving(tmp_path / "inst", signer=_signer(world), extra_hosts=[RP]) as (url, _h):
+        status, listed = _call(url, "/cockpit/envelope/list.json")
+        assert status == 200, listed
+        by_id = {e["id"]: e for e in listed["envelopes"]}
+        assert set(by_id) == {EID, EID2, eid3}, listed
+        assert by_id[EID]["state"] == "live"
+        assert by_id[EID2]["state"] == "live" and by_id[EID2]["scope"] == "flow · 8 h", by_id[EID2]
+        assert by_id[eid3]["state"] == "live-unknown", by_id[eid3]
+        assert listed["signers"] == [world.phone.fp], listed
+        # the live-unknown one is still revocable
+        q = urllib.parse.quote(eid3, safe="")
+        status, c = _call(url, f"/cockpit/envelope/{q}/revoke-challenge",
+                          {"signer_fp": world.phone.fp, "instance": by_id[eid3]["instance"]})
+        assert status == 200, c
+        status, out = _call(url, f"/cockpit/envelope/{q}/revoke", world.phone.assertion(c["challenge"], origin=PAGE))
+        assert (status, out.get("revoked")) == (200, eid3), out
+
+
+def test_an_unreadable_envelope_is_a_row_with_its_revoke(world, tmp_path) -> None:
+    """deepseek HIGH-1: a row that fails to read is listed as unreadable, by id, never dropped."""
+    _seed(world.qdir)
+    _seed(world.qdir, EID2, stop_at="garbage")
+    with _serving(tmp_path / "inst", signer=_signer(world), extra_hosts=[RP]) as (url, _h):
+        status, listed = _call(url, "/cockpit/envelope/list.json")
+        assert status == 200, listed
+        by_id = {e["id"]: e for e in listed["envelopes"]}
+        assert by_id[EID]["state"] == "live" and by_id[EID2]["state"] == "unreadable", listed
+        assert by_id[EID2]["note"] and by_id[EID2]["instance"], by_id[EID2]
+        q = urllib.parse.quote(EID2, safe="")
+        status, c = _call(url, f"/cockpit/envelope/{q}/revoke-challenge",
+                          {"signer_fp": world.phone.fp, "instance": by_id[EID2]["instance"]})
+        assert status == 200, c
+        status, out = _call(url, f"/cockpit/envelope/{q}/revoke", world.phone.assertion(c["challenge"], origin=PAGE))
+        assert (status, out.get("revoked")) == (200, EID2), out
+
+
+def test_a_second_challenge_returns_the_held_message(world, tmp_path) -> None:
+    """deepseek MED-2: two tabs or a double tap sign the same bytes; the held message is still used once."""
+    _seed(world.qdir)
+    with _serving(tmp_path / "inst", signer=_signer(world), extra_hosts=[RP]) as (url, _h):
+        c1 = _challenged(url, world)
+        c2 = _challenged(url, world)
+        assert (c1["line"], c1["challenge"]) == (c2["line"], c2["challenge"])
+        q = urllib.parse.quote(EID, safe="")
+        status, out = _call(url, f"/cockpit/envelope/{q}/revoke", world.phone.assertion(c1["challenge"], origin=PAGE))
+        assert (status, out.get("revoked")) == (200, EID), out
+        status, out = _call(url, f"/cockpit/envelope/{q}/revoke", world.phone.assertion(c2["challenge"], origin=PAGE))
+        assert (status, out["error"]) == (409, "no_challenge"), out
+
+
+def test_threads_counts_distinct_threads_across_a_rebind(world, tmp_path) -> None:
+    """deepseek MED-3: one thread is one thread however often it is bound. The bind table's key is (envelope, thread), so
+    a second row for one thread is refused by the schema; the count reads distinct threads all the same."""
+    _seed(world.qdir)
+    raw = sqlite3.connect(world.qdir / "dispatch.db")
+    raw.execute("INSERT INTO envelope_binds (envelope_id, thread_id, rev, gseq, at) VALUES (?, 'th-1', 1, 9001, 'now')", (EID,))
+    with pytest.raises(sqlite3.IntegrityError):
+        raw.execute("INSERT INTO envelope_binds (envelope_id, thread_id, rev, gseq, at) VALUES (?, 'th-1', 2, 9002, 'now')",
+                    (EID,))
+    raw.commit()
+    raw.close()
+    with _serving(tmp_path / "inst", signer=_signer(world), extra_hosts=[RP]) as (url, _h):
+        assert _row(url)["threads"] == 1
+
+
+def test_an_envelope_that_ends_after_the_signature_says_so_and_logs_the_nonce(world, tmp_path, caplog) -> None:
+    """deepseek LOW-5 / complement MED-LOW-1: after a verified signature the refusal never says nothing was signed."""
+    store = _seed(world.qdir)
+    caplog.set_level(logging.INFO, logger="levain.coordinator.envelope_revoke")
+    with _serving(tmp_path / "inst", signer=_signer(world), extra_hosts=[RP]) as (url, _h):
+        c = _challenged(url, world)
+        nonce = c["line"].rstrip("\n").rsplit("nonce: ", 1)[1]
+        store.attenuate(EID, "kill")                        # the terminal's kill lands first
+        q = urllib.parse.quote(EID, safe="")
+        status, out = _call(url, f"/cockpit/envelope/{q}/revoke", world.phone.assertion(c["challenge"], origin=PAGE))
+        assert status == 409, out
+        assert "ended before your signature landed" in out["message"] and "nothing was signed" not in out["message"], out
+    assert any(nonce in r.getMessage() and EID in r.getMessage() for r in caplog.records), \
+        [r.getMessage() for r in caplog.records]
+
+
+def test_the_no_signer_note_names_the_envelope_kill(world) -> None:
+    """codex LOW-3: the laptop fallback for an envelope is `levain envelope kill`, never the grant revoke."""
+    _seed(world.qdir)
+    note = EnvelopeRevoke(world.qdir, "localhost", None, lambda: {}).listing()["note"]
+    assert "levain envelope kill" in note and "consent grant revoke" not in note, note
+    note = EnvelopeRevoke(world.qdir, RP, PAGE, lambda: {}).listing()["note"]
+    assert "levain envelope kill" in note and "consent grant revoke" not in note, note
+
+
+def test_a_store_without_envelope_tables_answers_not_found(world, tmp_path) -> None:
+    """codex LOW-4 / complement LOW-2: a coordinator store never migrated for envelopes holds no envelope: 404."""
+    from levain.coordinator.store import CoordStore
+
+    CoordStore(world.qdir).accept_drop("a drop", surface="phone")
+    raw = sqlite3.connect(world.qdir / "dispatch.db")
+    assert not raw.execute("SELECT 1 FROM sqlite_master WHERE name = 'envelopes'").fetchall(), "the scratch store has envelopes"
+    raw.close()
+    with _serving(tmp_path / "inst", signer=_signer(world), extra_hosts=[RP]) as (url, _h):
+        status, out = _call(url, f"/cockpit/envelope/{EID}/revoke-challenge", {"signer_fp": world.phone.fp, "instance": "x"})
+        assert (status, out["error"]) == (404, "not_found"), (status, out)
+
+
+def test_the_list_builds_full_rows_only_for_what_it_shows(world, tmp_path, monkeypatch) -> None:
+    """complement LOW-3: ended envelopes past the cap are never built in full."""
+    _seed(world.qdir, EID, hours=24)
+    for i in range(1, 60):
+        _seed(world.qdir, _ev(i), hours=-1)
+    built: list[str] = []
+    real = EnvelopeStore._envelope
+
+    def counting(conn, envelope_id):
+        built.append(envelope_id)
+        return real(conn, envelope_id)
+
+    monkeypatch.setattr(EnvelopeStore, "_envelope", staticmethod(counting))
+    rows = EnvelopeRevoke(world.qdir, RP, PAGE, lambda: {})._rows()
+    assert len(rows) == 51 and len(built) == 51, (len(rows), len(built))
