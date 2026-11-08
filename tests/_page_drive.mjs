@@ -120,6 +120,7 @@ const extraFlags = process.env.LEVAIN_DRIVE_CHROME_FLAGS ? JSON.parse(process.en
 // fail-safe that also routes to the full Chrome (union with the declaration, never instead of it). LEVAIN_FULL_CHROME=1 also takes
 // a drive off the session's shell port: the drive spawns its own full Chrome.
 const needsFullChrome = process.env.LEVAIN_DRIVE_FULL_CHROME === "1" || process.env.LEVAIN_FULL_CHROME === "1"
+  || steps.some((s) => s.sw !== undefined)   // a `sw` step talks to a worker the shell cannot run, whatever its expression says
   || /serviceWorker|[Pp]ushManager\.|\.pushManager|Notification\.|new Notification/.test(JSON.stringify(steps));   // actual use only: a drive that DELETES window.PushManager (no push API on purpose) stays on the shell
 let sharedPort = /^[0-9]+$/.test(process.env.LEVAIN_DRIVE_CDP_PORT ?? "") && extraFlags.length === 0 && !needsFullChrome ? Number(process.env.LEVAIN_DRIVE_CDP_PORT) : null;
 // a Chrome of our own: this process owns it, its port and its profile (also the way out when the shared Chrome fails to set up)

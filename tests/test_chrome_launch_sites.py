@@ -297,7 +297,7 @@ def test_an_ambient_full_chrome_variable_does_not_leak_into_the_cases(tmp_path, 
     assert _run_table(_node_pick(script), tmp_path / "node", driver_cases=script == "_page_drive.mjs") == []
 
 
-def _drive_pick(tmp_path: Path, steps_text: str) -> str:
+def _drive_pick(tmp_path: Path, steps_text: str, key: str = "eval") -> str:
     """The Chrome ``_page_drive.mjs`` would launch for a drive whose steps are ``steps_text`` (dry run), with a shell installed."""
     root = tmp_path / "cache"
     shell = _shell(root, "156.0.8078.80", HOST_ARCH)
@@ -306,7 +306,7 @@ def _drive_pick(tmp_path: Path, steps_text: str) -> str:
     (d / "_page_drive.mjs").write_text((ROOT / "tests" / "_page_drive.mjs").read_text(encoding="utf-8"), encoding="utf-8")
     (d / "chrome_flags.json").write_text(json.dumps({"flags": [], "headless_shell_root": str(root)}))
     steps = d / "steps.json"
-    steps.write_text(json.dumps([{"eval": steps_text}]))
+    steps.write_text(json.dumps([{key: steps_text}]))
     r = subprocess.run([NODE, str(d / "_page_drive.mjs"), GIVEN, "about:blank", str(steps)], capture_output=True, text=True, timeout=60,
                        env={**_clean_env(), "LEVAIN_TEST_PICK_CHROME_DRY": "1"})
     assert r.returncode == 0, r.stderr
@@ -330,3 +330,11 @@ def test_the_source_sniff_routes_real_push_use_to_full_chrome_and_a_push_api_del
     wrong = [f"{text!r}: got {got}, want {want}" for i, (text, want) in enumerate(cases)
              if (got := _drive_pick(tmp_path / f"c{i}", text)) != want]
     assert wrong == []
+
+
+@pytest.mark.skipif(NODE is None, reason="node is needed")
+@on_mac
+def test_a_drive_with_a_service_worker_step_runs_on_full_chrome_whatever_its_text(tmp_path):
+    """A `sw` step talks to a worker the shell cannot run, so the step alone routes to the full Chrome (its expression need not name the API)."""
+    assert _drive_pick(tmp_path / "sw", "1 + 1", key="sw") == "full"
+    assert _drive_pick(tmp_path / "ev", "1 + 1") == "shell"          # the control: the same text as an eval stays on the shell
