@@ -93,6 +93,11 @@ _OSC_PASS = frozenset({0, 1, 2, 7, 8, 9, 133, 777})
 #: operator's own input, which the slot gets anyway), and every one passed is reset when the session ends
 #: (:meth:`TermFilter.reset`). DECISION: 9 (X10 mouse) is the same class as 1000-1006.
 _REPORTING_MODES = frozenset({9, 1000, 1001, 1002, 1003, 1004, 1005, 1006, 1015, 1016, 2004})
+#: DEC private modes that change what the operator's keys SEND (1, DECCKM: application cursor keys) or which screen
+#: he sees (47, 1047, 1049: the alternate screen). They pass and are reset when the session ends, like the above.
+_KEY_MODES = frozenset({1})
+_ALT_SCREEN_MODES = frozenset({47, 1047, 1049})
+_TRACKED_MODES = _REPORTING_MODES | _KEY_MODES | _ALT_SCREEN_MODES
 _OSC_COLOUR = frozenset({4, 104, *range(10, 20), *range(110, 120)})
 _ASCII_RUN = re.compile(rb"[\x00-\x04\x06-\x1a\x1c-\x7f]+")
 _CSI_MAX = 256        # DECISION: a CSI longer than this is no sequence a terminal answers; it is dropped whole
@@ -113,7 +118,12 @@ class TermFilter:
         self._lo, self._hi = 0x80, 0xBF   # the range of the character's NEXT continuation byte
         self._taint = False          # the OSC being parsed is dropped at its terminator
         self._over = False           # the OSC payload passed _OSC_MAX: discard to the terminator
-        self._modes: set = set()     # _REPORTING_MODES the filter passed set and not since reset
+        self._modes: set = set()     # _TRACKED_MODES the filter passed set and not since reset
+        # per screen (False main, True alternate: the kitty keyboard protocol keeps one stack each): the pushes the
+        # filter passed and no pop since undid, and whether a set (``CSI = flags u``) changed the top entry
+        self._kitty_pushes = {False: 0, True: 0}
+        self._kitty_set = {False: False, True: False}
+        self._modkeys: set = set()   # XTMODKEYS resources (``CSI > Pp ; Pv m``) the filter passed set
 
     # -- the UTF-8 layer: whole code points, or one stray byte ------------------------------------------------------
 
@@ -139,11 +149,38 @@ class TermFilter:
         return bytes(out)
 
     def reset(self) -> bytes:
-        """The sequence that turns off every reporting mode this filter let the slot set (empty when none). Sent at
-        the session's end, after :meth:`flush`, so the operator's shell is never left sending mouse or focus
-        reports."""
-        modes, self._modes = sorted(self._modes), set()
-        return b"\x1b[?" + ";".join(map(str, modes)).encode("ascii") + b"l" if modes else b""
+        """The sequence that undoes every terminal mode this filter let the slot set (empty when none): reporting
+        modes, application cursor keys, the alternate screen, the kitty keyboard flags and XTMODKEYS. Sent at the
+        session's end, after :meth:`flush`, so the operator's shell is never left sending reports, reading keys in
+        another encoding, or on the slot's screen.
+
+        Order: the alternate screen's kitty entries are undone while on it, then the alternate screen is left, then
+        the main screen's entries are undone. Pops undo exactly the pushes the slot made, so an entry the operator's
+        own shell pushed before the session survives; only when the slot SET flags in place (which overwrites an
+        entry it may not own) are the current flags zeroed (``CSI = 0 u``, which acts with nothing pushed too)."""
+        out = bytearray()
+        alt = self._modes & _ALT_SCREEN_MODES
+        if self._kitty_pushes[True] or self._kitty_set[True]:
+            if not alt:
+                out += b"\x1b[?1049h"   # the alternate screen's stack is reached only from that screen
+            out += self._kitty_undo(True)
+            alt = alt | {1049}
+        if alt:
+            out += b"\x1b[?" + ";".join(map(str, sorted(alt, reverse=True))).encode("ascii") + b"l"
+        out += self._kitty_undo(False)
+        modes = sorted(self._modes - _ALT_SCREEN_MODES)
+        if modes:
+            out += b"\x1b[?" + ";".join(map(str, modes)).encode("ascii") + b"l"
+        for pp in sorted(self._modkeys):
+            out += b"\x1b[>" + str(pp).encode("ascii") + b"m"   # no value: the resource's initial setting
+        self._modes, self._modkeys = set(), set()
+        return bytes(out)
+
+    def _kitty_undo(self, screen: bool) -> bytes:
+        pushes, was_set = self._kitty_pushes[screen], self._kitty_set[screen]
+        self._kitty_pushes[screen], self._kitty_set[screen] = 0, False
+        out = b"\x1b[<" + str(pushes).encode("ascii") + b"u" if pushes else b""
+        return out + b"\x1b[=0u" if was_set else out
 
     def _byte(self, b: int, out: bytearray) -> None:
         if self._need:
@@ -267,15 +304,34 @@ class TermFilter:
             self._st = _CSI_IGN                         # malformed: consumed to its final byte and dropped
 
     def _track_modes(self, seq: bytes) -> None:
-        # DECSET / DECRST (``CSI ? Pm h|l``) and XTRESTORE (``CSI ? Pm r``, which may set any mode it restores).
-        if seq[2:3] != b"?" or seq[-1:] not in (b"h", b"l", b"r"):
-            return
-        for p in seq[3:-1].split(b";"):
-            if p.isdigit() and int(p) in _REPORTING_MODES:
-                if seq[-1:] == b"l":
-                    self._modes.discard(int(p))
+        prefix, final, params = seq[2:3], seq[-1:], seq[3:-1].split(b";")
+        if prefix == b"?" and final in (b"h", b"l", b"r"):
+            # DECSET / DECRST (``CSI ? Pm h|l``) and XTRESTORE (``CSI ? Pm r``, which may set any mode it restores)
+            for p in params:
+                if p.isdigit() and int(p) in _TRACKED_MODES:
+                    if final == b"l":
+                        self._modes.discard(int(p))
+                    else:
+                        self._modes.add(int(p))
+        elif final == b"u" and prefix in (b">", b"<", b"="):
+            # the kitty keyboard protocol: push (``CSI > flags u``), pop (``CSI < n u``), set (``CSI = flags ; mode u``)
+            screen = bool(self._modes & _ALT_SCREEN_MODES)
+            if prefix == b">":
+                self._kitty_pushes[screen] += 1
+            elif prefix == b"<":
+                n = params[0]
+                self._kitty_pushes[screen] = max(0, self._kitty_pushes[screen] - (int(n) if n.isdigit() else 1))
+            else:
+                self._kitty_set[screen] = True
+        elif prefix == b">" and final == b"m":
+            # XTMODKEYS: ``CSI > Pp ; Pv m`` sets resource Pp, ``CSI > Pp m`` resets it, ``CSI > m`` resets all
+            if params == [b""]:
+                self._modkeys.clear()
+            elif params[0].isdigit():
+                if len(params) > 1:
+                    self._modkeys.add(int(params[0]))
                 else:
-                    self._modes.add(int(p))
+                    self._modkeys.discard(int(params[0]))
 
     def _osc(self, cp: int, raw: bytes, out: bytearray) -> None:
         if self._st == _OSC_ESC:

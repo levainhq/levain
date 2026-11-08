@@ -143,7 +143,7 @@ __all__ = ["ANSWER_BURST", "ANSWER_RATE", "CAP_MAX", "GATE_BURST", "GATE_RATE",
            "KINDS", "PENDING_PER_SESSION", "QUOTA_PER_RUN",
            "RECEIVED_SKEW", "RESOLVE_TTL", "RUN_CALLS_KIND", "RUN_DEADLINE_KIND", "RUN_KEYS", "RUN_OPTIONAL_KEYS",
            "RUN_STATE_FORMAT", "run_state_path", "FenceSource", "FenceUnavailable", "SLOT_CLASS", "Broker", "Resolved",
-           "Resolver", "resolved_from", "slot_ref", "stored_request"]
+           "Resolver", "answer_row_refusal", "resolved_from", "slot_ref", "stored_request"]
 
 log = logging.getLogger("levain.qbroker")
 
@@ -345,6 +345,16 @@ def stored_request(row: Any, queue_id: str, request_id: str | None = None) -> Ex
     if resolved_from({"session": row["session"], "kind": row["kind"], "run": row.get("run")}) is None:
         return None
     return request
+
+
+def answer_row_refusal(row: Mapping[str, Any], answer: Any, signers: SignersSnapshot | None, now: datetime, *,
+                       ssh_keygen: Path | str | None = None) -> str | None:
+    """Why the parsed answer file ``answer`` is not authority for the request ``row`` holds (its shape, then its
+    signature by :func:`~levain.qbroker.seam.answer_refusal`); ``None`` when it is. It reads no receipts: the head
+    the answer signed is checked by whoever applies it."""
+    if not isinstance(answer, Mapping) or set(answer) != _ANSWER_ROW_KEYS or answer["format"] != ANSWER_ROW_FORMAT:
+        return f"not a {ANSWER_ROW_FORMAT} row"
+    return answer_refusal(row, answer["payload"], answer["signature"], signers, now, ssh_keygen=ssh_keygen)
 
 
 def cap_digest(cap: Any) -> str | None:
@@ -747,9 +757,9 @@ class Broker:
         neither checked against nor entered in the pending cap."""
         with self._mutex:
             held = dict(self._pending.get(who.session, {}))
-        # pending = unexpired with no answer file: once the operator has written one, the row has had his
-        # attention, whatever the file proves
-        settled = {i for i, exp in held.items() if exp <= now or self._store.has_answer(i) or self._granted(i)}
+        # pending = unexpired, not granted, and no VERIFIED answer: any levain-queue member can create a file at an
+        # answer name, so a file that is not the operator's signed answer for that request frees no place
+        settled = {i for i, exp in held.items() if exp <= now or self._granted(i) or self._answer_settles(i)}
         key = _quota_key(who.session, who.run)
         with self._mutex:
             mine = self._pending.setdefault(who.session, {})
@@ -776,6 +786,22 @@ class Broker:
                     self._pending.get(who.session, {}).pop(request.id, None)
         # a linked row's receipts are written by _file, after any grant row
         return None if linked else "request-exists"
+
+    def _answer_settles(self, request_id: str) -> bool:
+        """Whether ``request_id`` holds an answer :meth:`_answered` accepts (its decision is recorded as a poll would
+        record it). Anything else, a check that fails included, keeps the row in the pending cap: the stricter side."""
+        try:
+            if not self._store.has_answer(request_id):
+                return False
+            row = self._store.read_request(request_id)
+            request = stored_request(row, self._store.queue_id, request_id)
+            if request is None:
+                return False
+            decision, _ = self._answered(row, request, self._clock())
+        except Exception:
+            log.exception("qbroker: the answer for %s could not be checked; its row stays pending", request_id)
+            return False
+        return decision is not None
 
     def _linked(self, row: dict[str, Any]) -> bool:
         try:
@@ -1090,12 +1116,9 @@ class Broker:
         """The verified decision ``answer`` carries, recorded in the broker's receipts (or recorded there already),
         or ``None`` when it is not authority."""
         request_id = request.id
-        if set(answer) != _ANSWER_ROW_KEYS or answer["format"] != ANSWER_ROW_FORMAT:
-            log.warning("qbroker: answer row for %s is not a %s row", request_id, ANSWER_ROW_FORMAT)
-            return None
-        payload = answer["payload"]
-        why = answer_refusal(row, payload, answer["signature"], snapshot, now, ssh_keygen=self._ssh_keygen)
+        why = answer_row_refusal(row, answer, snapshot, now, ssh_keygen=self._ssh_keygen)
         if why is None:
+            payload = answer["payload"]
             # the apply: the head it signed must be a head of the broker's own receipts, inside the write that
             # records the decision (a write failure raises: the poll is refused broker-error, nothing cached)
             why = self._receipts.decided(request, payload["decision"], payload["signer_fp"],

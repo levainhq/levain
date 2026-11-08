@@ -18,7 +18,10 @@ them) and writes only ``answers/<request_id>.json``:
 - :func:`write_answer`: the signed answer row, for a ``pending`` request only, checked first with
   :func:`levain.qbroker.seam.answer_refusal` and the head against the receipts as they stand (reaching the request's
   filing receipt), then linked no-replace, mode 0640: an answer that fails any check is never written, since nothing
-  can replace it once it is there.
+  can replace it once it is there. Any ``levain-queue`` member can create a file at an answer's name, so a file
+  already there that is not a signed answer for that request is
+  renamed aside to ``answers/.quarantine-<request_id>-<random>.json``, a name no reader takes for an answer, and the
+  signed answer is linked in its place; one that is a signed answer is never moved or replaced.
 
 A receipts log that cannot be read is :class:`OperatorError`.
 
@@ -26,6 +29,7 @@ Stdlib only.
 """
 from __future__ import annotations
 
+import os
 import time
 from collections.abc import Mapping
 from dataclasses import dataclass, field
@@ -38,11 +42,12 @@ from levain.consent import record
 from levain.contracts import ContractError
 from levain.contracts.canon import canonical_bytes, parse
 from levain.qbroker.broker import (RUN_CALLS_KIND, RUN_DEADLINE_KIND, RUN_STATE_FORMAT, _calls_ok, _deadline_ok,
-                                   run_state_path, stored_request)
+                                   answer_row_refusal, run_state_path, stored_request)
 from levain.qbroker.receipts import Receipts, ReceiptsError
 from levain.qbroker.seam import answer_refusal
 from levain.qbroker.signers import SignersSnapshot
-from levain.qbroker.store import ANSWER_ROW_FORMAT, ROW_MAX, QueueStore, _parsed, _read_untrusted, valid_request_id
+from levain.qbroker.store import (ANSWER_ROW_FORMAT, ROW_MAX, QueueStore, _parsed, _read_untrusted,
+                                  _read_untrusted_stamped, fsync_dir, valid_request_id)
 
 __all__ = ["CLAIM_KEYS", "Listed", "OperatorError", "answer_payload", "rows", "run_state", "write_answer"]
 
@@ -51,6 +56,9 @@ CLAIM_KEYS = ("agent", "agent_session_id", "cwd", "display")
 # the keys of a published run state (tests/test_qbroker_run_caps.py reads GATE's own through run_state)
 _RUN_STATE_KEYS = frozenset({"format", "run_id", "calls", "cap", "deadline", "tripped"})
 _SETTLED = frozenset({"allowed", "denied", "expired"})
+# how many times write_answer clears a squatted answer name before it gives up: another member recreating the file
+# between the move and the link each time is a fight the operator's writer does not loop on forever
+_SQUAT_TRIES = 4
 
 
 class OperatorError(Exception):
@@ -221,8 +229,61 @@ def write_answer(root: Path | str, request_id: str, payload: Mapping[str, Any], 
     if len(data) > ROW_MAX:
         raise OperatorError(f"the answer row is over {ROW_MAX} bytes")
     path = store.answers / f"{request_id}.json"
+    now = _now(now)
+    for _ in range(_SQUAT_TRIES):
+        try:
+            store._link_new(path, data)
+            return path
+        except FileExistsError:
+            pass
+        if _clear_squat(store, row, request_id, path, signers, now, ssh_keygen):
+            raise OperatorError(f"request {request_id} already has an answer row")
+    raise OperatorError(f"request {request_id}'s answer name was taken again each time it was cleared")
+
+
+def _signed_answer(row: Mapping[str, Any], path: Path, signers: SignersSnapshot | None, now: datetime,
+                   ssh_keygen: Path | str | None) -> tuple[bool, tuple[int, int] | None]:
+    """Whether ``path`` holds a signed answer for the request ``row`` holds, with the (dev, ino) of the file judged
+    (``None`` when nothing was opened: a symlink, a non-regular file, an unreadable one, or none)."""
     try:
-        store._link_new(path, data)
-    except FileExistsError:
-        raise OperatorError(f"request {request_id} already has an answer row") from None
-    return path
+        got = _read_untrusted_stamped(path)
+    except (ValueError, OSError):
+        return False, None
+    if got is None:
+        return False, None
+    try:
+        answer = _parsed(got[0])
+    except ValueError:
+        return False, got[1][:2]
+    return answer_row_refusal(row, answer, signers, now, ssh_keygen=ssh_keygen) is None, got[1][:2]
+
+
+def _clear_squat(store: QueueStore, row: Mapping[str, Any], request_id: str, path: Path,
+                 signers: SignersSnapshot | None, now: datetime, ssh_keygen: Path | str | None) -> bool:
+    """True when ``path`` holds a signed answer (left in place). Otherwise whatever is there is renamed aside and
+    False is returned, for the caller to link its own answer again. Should the thing renamed turn out not to be the
+    thing judged (swapped in between) and be a signed answer, it is linked back, never lost."""
+    try:
+        before = os.lstat(path)
+    except FileNotFoundError:
+        return False
+    signed, judged = _signed_answer(row, path, signers, now, ssh_keygen)
+    if signed:
+        return True
+    if judged is None:
+        judged = (before.st_dev, before.st_ino)
+    aside = store.answers / f".quarantine-{request_id}-{os.urandom(8).hex()}.json"
+    try:
+        os.rename(path, aside)
+    except FileNotFoundError:
+        return False
+    fsync_dir(store.answers)
+    moved = os.lstat(aside)
+    if (moved.st_dev, moved.st_ino) != judged and _signed_answer(row, aside, signers, now, ssh_keygen)[0]:
+        try:
+            os.link(aside, path, follow_symlinks=False)
+        except FileExistsError:
+            return False
+        os.unlink(aside)
+        fsync_dir(store.answers)
+    return False

@@ -386,7 +386,7 @@ def test_filter_tracks_reporting_modes_it_passed() -> None:
     f = TermFilter()
     data = b"\x1b[?1000;1006h\x1b[?1004h\x1b[?2004h\x1b[?25l\x1b[?1049h\x1b[?2004l"
     assert f.feed(data) == data              # they pass
-    assert f.reset() == b"\x1b[?1000;1004;1006l"
+    assert f.reset() == b"\x1b[?1049l\x1b[?1000;1004;1006l"   # the alternate screen is left first
     assert f.reset() == b""
     assert TermFilter().reset() == b""
     g = TermFilter()
@@ -395,6 +395,56 @@ def test_filter_tracks_reporting_modes_it_passed() -> None:
     h = TermFilter()
     h.feed(b"\x1b[6n\x1b[?1000$p")           # a dropped sequence sets nothing
     assert h.reset() == b""
+
+
+# --- PREL3 2b-5: the other modes the slot's output can set are undone at the end too ----------------------------------
+
+@pytest.mark.parametrize("set_, undo", [
+    (b"\x1b[?1049h", b"\x1b[?1049l"),
+    (b"\x1b[?1047h", b"\x1b[?1047l"),
+    (b"\x1b[?47h", b"\x1b[?47l"),
+    (b"\x1b[?1h", b"\x1b[?1l"),                       # application cursor keys
+    (b"\x1b[?1r", b"\x1b[?1l"),                       # XTRESTORE may set it
+    (b"\x1b[>1u", b"\x1b[<1u"),                       # one kitty push: one pop, nothing more
+    (b"\x1b[>1u\x1b[>3u\x1b[<u\x1b[>8u", b"\x1b[<2u"),  # pushes net of pops
+    (b"\x1b[=5u", b"\x1b[=0u"),                       # a set in place: the current flags zeroed
+    (b"\x1b[=5;1u\x1b[>1u", b"\x1b[<1u\x1b[=0u"),
+    (b"\x1b[>4;2m", b"\x1b[>4m"),                     # modifyOtherKeys
+    (b"\x1b[>1;3m\x1b[>4;1m", b"\x1b[>1m\x1b[>4m"),
+])
+def test_reset_undoes_each_mode_the_slot_set(set_, undo) -> None:
+    f = TermFilter()
+    assert f.feed(set_) == set_                # it passes
+    assert f.reset() == undo
+    assert f.reset() == b""
+
+
+@pytest.mark.parametrize("data", [
+    b"\x1b[?1049h\x1b[?1049l", b"\x1b[?1h\x1b[?1l", b"\x1b[>1u\x1b[<1u", b"\x1b[>1u\x1b[<5u",
+    b"\x1b[>4;2m\x1b[>4m", b"\x1b[>4;2m\x1b[>1;2m\x1b[>m", b"\x1b[?u", b"\x1b[?25l\x1b[?7h\x1b[u",
+])
+def test_reset_emits_nothing_for_a_mode_the_slot_undid_itself_or_never_set(data) -> None:
+    f = TermFilter()
+    f.feed(data)
+    assert f.reset() == b""
+
+
+def test_kitty_entries_pushed_on_the_alternate_screen_are_popped_there_before_it_is_left() -> None:
+    f = TermFilter()
+    f.feed(b"\x1b[>1u\x1b[?1049h\x1b[>3u\x1b[>3u\x1b[?1000h")
+    assert f.reset() == b"\x1b[<2u\x1b[?1049l\x1b[<1u\x1b[?1000l"
+
+
+def test_kitty_entries_left_on_an_alternate_screen_the_slot_already_left_are_reached_by_entering_it() -> None:
+    f = TermFilter()
+    f.feed(b"\x1b[?1049h\x1b[>1u\x1b[?1049l")
+    assert f.reset() == b"\x1b[?1049h\x1b[<1u\x1b[?1049l"
+
+
+def test_every_alternate_screen_mode_set_is_left_in_one_sequence() -> None:
+    f = TermFilter()
+    f.feed(b"\x1b[?47h\x1b[?1049h\x1b[?1h\x1b[>4;2m")
+    assert f.reset() == b"\x1b[?1049;47l\x1b[?1l\x1b[>4m"
 
 
 def test_supervisor_resets_passed_modes_when_the_session_ends(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
