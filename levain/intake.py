@@ -9,7 +9,7 @@ contract: ``tests/vectors/list_intake_vectors.json``.
 
 ``<when>``: ``HH:MM`` / ``9am`` / ``5:30 pm`` (today if still ahead, else tomorrow) ·
 ``tomorrow [time]`` · ``mon..sun`` or full weekday ``[time]`` (the next one) ·
-``MM-DD [time]`` · ``YYYY-MM-DD [time]`` · ``+Nm`` / ``+Nh`` / ``+Nd``. No time given
+``MM-DD [time]`` (the next one: this year if still ahead, else the next year that has the date) · ``YYYY-MM-DD [time]`` · ``+Nm`` / ``+Nh`` / ``+Nd``. No time given
 means 09:00. A ``<when>`` that does not read, a moment not in the future, an empty line,
 or no words after the prefix raises :class:`IntakeRefused` with the reason: a parser
 informs the human, it never guesses and never authorises.
@@ -93,10 +93,21 @@ def _resolve_when(tokens, now):
         return (when if when > now else when + timedelta(days=7)), used
     m = re.match(r"^(?:(\d{4})-)?(\d{1,2})-(\d{1,2})$", head)
     if m:
-        try:
-            day = date(int(m.group(1) or now.year), int(m.group(2)), int(m.group(3)))
-        except ValueError:
-            raise IntakeRefused(f"{tokens[0]!r} is not a calendar date") from None
+        month, dom = int(m.group(2)), int(m.group(3))
+        # a written year is held to (a past moment in it is refused by the caller, never moved); no year means the next
+        # occurrence (Phill 2026-11-08, row 456 (a)): this year if still ahead, else the next year that has the date
+        # (a leap day can be up to 8 years off)
+        years = [int(m.group(1))] if m.group(1) else range(now.year, now.year + 9)
+        day = None
+        for year in years:
+            try:
+                day = date(year, month, dom)
+            except ValueError:
+                continue
+            if m.group(1) or with_clock(day, 1)[0] > now:
+                break
+        if day is None:
+            raise IntakeRefused(f"{tokens[0]!r} is not a calendar date")
         return with_clock(day, 1)
     raise IntakeRefused(f"cannot read {tokens[0]!r} as a time. Forms: HH:MM, 9am, tomorrow [time], mon..sun [time], "
                         f"MM-DD [time], YYYY-MM-DD [time], +30m, +2h, +3d (no time means {DEFAULT_DROP_HOUR:02d}:00)")
