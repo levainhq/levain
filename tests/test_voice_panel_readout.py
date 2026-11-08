@@ -142,6 +142,7 @@ def test_the_panel_says_when_spend_cannot_be_read_and_shows_the_other_row(tmp_pa
     ], b)
     got = json.loads(v[1])
     assert len(got["other"]) == 1 and "Other providers (no key now)" in got["other"][0] and "2 calls" in got["other"][0], got
+    (tmp_path / "two").mkdir()
     v = _run(tmp_path / "two", monkeypatch, [
         {"until": READY_BLOCK, "ms": 20000},
         {"eval": "JSON.stringify([...document.querySelectorAll('.vc-spend-gone, .vc-spend-val')].map((r) => r.textContent))"},
