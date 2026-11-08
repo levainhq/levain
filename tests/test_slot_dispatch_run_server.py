@@ -67,6 +67,7 @@ class Env:
         self.launcher = L.RealLauncher(self.control, self.runtime, FakeSources(), L.SessionIndex(tmp_path / "idx"))
         self.bar_of = bar or D.agent_store_bar(rig.store.path)
         self.verified = 0
+        self.billing = "subscription"        # the launcher's billing the point of use judges against
         self.pool, self.peer = pool, peer
         self.server = D.RunServer(self.launcher, verify=self._verify, pool_free=lambda: self.pool,
                                   peer_ok=lambda s: self.peer, holder_idle_s=20, **server_kw)
@@ -74,8 +75,8 @@ class Env:
 
     def _verify(self, proof, exposure, claims=None):
         self.verified += 1
-        return D.verify_point_of_use(proof, exposure, replay=self.rig.authority.replay, now=self.rig.now, bar_of=self.bar_of,
-                              billing="subscription")
+        return D.verify_point_of_use(proof, exposure, replay=self.rig.authority.replay, now=self.rig.now,
+                                     bar_of=self.bar_of, billing=self.billing)
 
     def connect(self):
         a, b = socket.socketpair()
@@ -103,9 +104,13 @@ def _proof(rig, oid):
 
 
 def _check(rig, proof, exposure=EXP, **kw):
-    D.verify_point_of_use(proof, exposure, replay=rig.authority.replay, now=kw.pop("now", rig.now),
-                          bar_of=kw.pop("bar_of", D.agent_store_bar(rig.store.path)),
-                          billing=kw.pop("billing", "subscription"), **kw)
+    _grant(rig, proof, exposure, **kw)
+
+
+def _grant(rig, proof, exposure=EXP, **kw):
+    return D.verify_point_of_use(proof, exposure, replay=rig.authority.replay, now=kw.pop("now", rig.now),
+                                 bar_of=kw.pop("bar_of", D.agent_store_bar(rig.store.path)),
+                                 billing=kw.pop("billing", "subscription"), **kw)
 
 
 # --- Q1: the one function ---------------------------------------------------------------------------------------------
@@ -1372,7 +1377,19 @@ def test_the_expected_log_is_the_path_the_unit_gives_launchd(monkeypatch):
 
 def test_an_api_key_link_passes_for_an_api_key_launcher_with_no_action_exposure(rig):
     oid = _occurrence(rig, billing="api_key")
-    assert _check(rig, _proof(rig, oid), None, billing="api_key") is None
+    proof = _proof(rig, oid)
+    figure = rig.authority.replay().policy.grants[proof.link_id]["budget_run_usd_micros"]
+    # dispatch wave 3: the check hands back the grant, and the share is read from it (his verified link)
+    grant = _grant(rig, proof, None, billing="api_key")
+    assert figure > 0 and D.signed_share(grant) == figure
+
+
+def test_a_subscription_grant_signs_no_share(rig):
+    oid = _occurrence(rig, billing="subscription", exposure=EXP)
+    grant = _grant(rig, _proof(rig, oid))
+    # REVERT: the `billing != "api_key"` leg of signed_share
+    assert grant is not None and D.signed_share(grant) is None
+    assert D.signed_share(None) is None and D.signed_share({"billing": "api_key", "budget_run_usd_micros": 0}) is None
 
 
 @pytest.mark.parametrize("link_billing,launcher,exposure", [("api_key", "subscription", EXP), ("subscription", "api_key", None)])
@@ -1402,3 +1419,40 @@ def test_an_api_key_launcher_refuses_an_action_exposure_and_a_zero_dollar_link(r
         D.verify_point_of_use(proof, None, replay=lambda: Zeroed(), now=rig.now, bar_of=D.agent_store_bar(rig.store.path),
                               billing="api_key")
     assert caught.value.name == "link-run-budget-zero"
+
+
+# --- dispatch wave 3 (S-B2): the run server stamps the signed link's figure as a brokered launch's share ---------------------
+
+def test_a_brokered_launch_is_priced_at_the_links_signed_figure_and_nothing_the_fire_sent(rig, env):
+    oid = _occurrence(rig, billing="api_key")
+    proof = _proof(rig, oid)
+    figure = rig.authority.replay().policy.grants[proof.link_id]["budget_run_usd_micros"]
+    env.billing = "api_key"
+    env.launcher.auth = "brokered"
+    env.control.script["ROUTE-RESOLVE"] = lambda f: {"route": "glm", "routemap_generation": 1,
+                                                     "route_policy_digest": "sha256:" + "a" * 64}
+    # the launch the fire builds carries a share of 1 in its own field: on no wire, so it never reaches the server
+    sent = S.SessionLaunch(oid, "s-00000000000000b1", "claude", "sonnet", "b", "brokered", None, None, 1)
+    env.client().spawn(sent)
+    mint = [f for op, f in env.control.calls if op == "RUN-TICKET-MINT"]
+    # REVERT: the `dataclasses.replace(launch, usd_micros=...)` stamp in RunServer._op LAUNCH (the launcher refuses
+    # `no-dollar-share`), or reading the figure from the wire instead of the verified link
+    assert len(mint) == 1 and mint[0]["reserved_microdollars"] == figure != 1
+    assert env.runtime.starts[0].auth == "brokered"
+
+
+def test_a_passthrough_server_never_stamps_a_share(rig, env):
+    oid = _occurrence(rig, billing="subscription", exposure=EXP)
+    env.client().spawn(S.SessionLaunch(oid, "s-00000000000000b2", "claude", "sonnet", "b", "passthrough", EXP))
+    (mint,) = [f for op, f in env.control.calls if op == "RUN-TICKET-MINT"]
+    assert mint["reserved_microdollars"] == 0 and "route" not in mint
+
+
+def test_a_brokered_launcher_behind_a_verifier_that_answers_no_share_refuses(rig, env):
+    oid = _occurrence(rig, billing="api_key")
+    env.launcher.auth = "brokered"
+    env._verify = lambda proof, exposure, claims=None: None            # a verifier with no figure to hand back
+    env.server._verify = env._verify
+    with pytest.raises(L.LauncherRefused) as exc:
+        env.client().spawn(S.SessionLaunch(oid, "s-00000000000000b3", "claude", "sonnet", "b", "brokered", None))
+    assert exc.value.name == "no-dollar-share" and env.control.minted == {}

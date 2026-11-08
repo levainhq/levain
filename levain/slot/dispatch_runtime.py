@@ -54,7 +54,7 @@ __all__ = ["PORT_OPS", "DispatchControlPort", "HelperSlotRuntime", "StreamDrain"
 _log = logging.getLogger(__name__)
 
 #: the ops ``RealLauncher`` uses through its ControlPort. Nothing else crosses (the lease is the runtime's own).
-PORT_OPS = frozenset({"RUN-TICKET-MINT", "RUN-TICKET-CANCEL", "RUN-TICKET-STATUS"})
+PORT_OPS = frozenset({"RUN-TICKET-MINT", "RUN-TICKET-CANCEL", "RUN-TICKET-STATUS", "ROUTE-RESOLVE"})
 
 _HELPER_OUT_MAX = 1 << 20     # a helper answer past this is no single line (the supervisor's bound)
 _ERR_TAIL = 1 << 14           # DECISION: the helper's stderr and the vendor's stderr are kept to their last 16 KiB
@@ -240,7 +240,7 @@ class HelperSlotRuntime:
         if set(req.hooks) != set(HOOKS):
             raise LauncherRefused("hooks-incomplete", ",".join(sorted(set(req.hooks) ^ set(HOOKS))))
         if self._routes is None:
-            routes = pick_routes(read_base_map(layout.base_routes_path(self.host)), req.harness, "passthrough",
+            routes = pick_routes(read_base_map(layout.base_routes_path(self.host)), req.harness, req.auth,
                                  egress=False)   # the ticket lists none by default (11-02); render refuses extras
         else:
             routes = self._routes(req) if callable(self._routes) else self._routes
@@ -257,7 +257,7 @@ class HelperSlotRuntime:
             nonce = ans.get("lease_nonce")
             if type(nonce) is not str or not nonce:
                 raise Refused("lease-nonce-missing", "LEASE-OPEN")
-            prep = self._run("prepare", "egress", "dispatch", req.harness, "passthrough",
+            prep = self._run("prepare", "egress", "dispatch", req.harness, req.auth,
                              stdin=canon.canonical_bytes({"lease_nonce": nonce, "ticket": req.ticket}), lease=lease)
             session, _slot = prepare_answer(prep, host=self.host, store=self._store)   # type: ignore[arg-type]
         except BaseException:

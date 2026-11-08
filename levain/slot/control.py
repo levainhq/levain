@@ -91,7 +91,8 @@ PEER_VERBS: Mapping[str, frozenset[str]] = {
     "root": frozenset({"ATTACH", "CAS", "MINT", "FRONT-ARM", "SECRETS", "REVOKE", "REVOKED-SET", "SLOT-SYNC"}),
     "qbroker": frozenset({"QUEUE-RESOLVE"}),
     "keys": frozenset({"TOKEN-RESOLVE", "KEYS-ATTACH", "FRONT-LOST", "SPEND-OVERRUN", "SESSIONS", "LINEAGE-APPEND"}),
-    "dispatch": frozenset({"LEASE-OPEN", "ROUTE-SUBMIT", "RUN-TICKET-MINT", "RUN-TICKET-CANCEL", "RUN-TICKET-STATUS",
+    "dispatch": frozenset({"LEASE-OPEN", "ROUTE-SUBMIT", "ROUTE-RESOLVE", "RUN-TICKET-MINT", "RUN-TICKET-CANCEL",
+                           "RUN-TICKET-STATUS",
                            "POOL", "CONFIG-SUBMIT", "SESSION-EVENTS", "ARTIFACT-ACK"}),
     "foreign": frozenset(),
 }
@@ -129,6 +130,7 @@ _ARGS: Mapping[str, tuple[frozenset[str], frozenset[str]]] = {
     "RUN-TICKET-MINT": (frozenset({"attempt_id"}) | T.MINT_FIELDS, frozenset({"attempt_id"})),
     "RUN-TICKET-CANCEL": (frozenset({"ticket"}),) * 2,
     "RUN-TICKET-STATUS": (frozenset({"attempt_id"}),) * 2,
+    "ROUTE-RESOLVE": (frozenset({"model"}),) * 2,             # dispatch wave 3 (S-B2): read-only, the brokered mint's route facts
 }
 
 #: DECISION: how long a mint waits for keys to serve CONTROL's route-map head on the current attachment (an
@@ -2679,6 +2681,30 @@ class Control:
         for rid in facts["egress_routes"]:            # type: ignore[union-attr]
             if types.get(rid) != "egress":
                 raise Refused("ticket-field:egress_routes", f"{rid} is not a base-map egress route")
+
+    def _op_route_resolve(self, conn: Conn, args: dict) -> dict[str, object]:
+        """``ROUTE-RESOLVE {model}`` -> ``{route, routemap_generation, route_policy_digest}`` (dispatch wave 3, S-B2): the
+        route facts a brokered executor ticket for ``model`` carries, read from the ACTIVE dispatch generation under the
+        activation lock. The one ``brokered`` route whose models hold ``model``; none is ``no-brokered-route`` and more
+        than one is ``route-ambiguous`` (refused, never chosen). Read-only and no authority: these are CONTROL's own
+        records echoed back, and the mint re-checks all four facts (:meth:`_check_route_facts`), so an activation
+        between the resolve and the mint refuses ``ticket-field:routemap_generation`` and the caller resolves again."""
+        model = args["model"]
+        if type(model) is not str or T._NAME.fullmatch(model) is None:
+            raise Refused("bad-value", "model")
+        with self._activation:
+            active = self.routes.active() if self.routes is not None else None
+            if active is None:
+                raise Refused("no-brokered-route", "no route-map generation is active")
+            serving = sorted(rid for rid, entry in active.routes.items()
+                             if entry.policy.type == "brokered" and model in entry.backends)
+            if not serving:
+                raise Refused("no-brokered-route", "no brokered route of the active dispatch map serves this model")
+            if len(serving) > 1:
+                raise Refused("route-ambiguous", "more than one brokered route of the active dispatch map serves this model")
+            route = serving[0]
+            return {"route": route, "routemap_generation": active.generation,
+                    "route_policy_digest": active.digests[route]}
 
     def _op_run_ticket_cancel(self, conn: Conn, args: dict) -> dict[str, object]:
         """``RUN-TICKET-CANCEL {ticket}`` -> ``{}``: an UNBOUND ticket only (``ticket-bound`` once a lease bound it)."""

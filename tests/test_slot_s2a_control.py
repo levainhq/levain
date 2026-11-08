@@ -44,6 +44,8 @@ SESSION2 = {"operator": {"LEASE-OPEN", "STATUS", "KEYS-STATUS", "REVOKE-OWN"},
             "dispatch": {"ROUTE-SUBMIT",
                          # S1 3c-5 adds the ticket verbs (CONTRACT §3.3, §3.5)
                          "RUN-TICKET-MINT", "RUN-TICKET-CANCEL", "RUN-TICKET-STATUS",
+                         # dispatch wave 3 (S-B2): the brokered mint's read-only route resolve
+                         "ROUTE-RESOLVE",
                          # S1 3c-5 session 2: a ticket-bound lease (CONTRACT §3.1 step 1)
                          "LEASE-OPEN",
                          # S1 3c-7: the pool count (CONTRACT §3.3 dispatch row, §3.5 Pool)

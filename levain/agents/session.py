@@ -162,6 +162,10 @@ class SessionLaunch:
     auth: str
     exposure: ActionExposure | None
     workspace: Workspace | None = None
+    #: the dollar share of a BROKERED run, in micro-dollars: the per-run figure on the operator's signed api_key link, which
+    #: the run server reads from its own verified replay and stamps here (``dataclasses.replace``). It is on no wire
+    #: (``session_client._LAUNCH_KEYS`` does not name it), so a fire cannot send one. None for a passthrough launch.
+    usd_micros: int | None = None
 
 
 @runtime_checkable

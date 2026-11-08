@@ -15,8 +15,8 @@ three seams, so the whole of it runs in pytest against fakes:
 * :class:`UsageSources`: the three figures a subscription run settles on (P7-A section 3.3 item 4): the broker's call
   count by ``run_id``, the front's byte total and the session's seconds by slot session.
 
-Order of :meth:`RealLauncher.spawn`: the launch is refused by name before anything is allocated (the API-key branch is
-always ``brokered-route-not-built``: it needs dispatch wave 3's per-run keys and dollar caps, 3c-10); the ticket facts
+Order of :meth:`RealLauncher.spawn`: the launch is refused by name before anything is allocated (a BROKERED launch needs
+a dollar share, :attr:`SessionLaunch.usd_micros`, and carries no action exposure; see below); the ticket facts
 are checked by CONTROL's own shape function (:func:`levain.slot.tickets.check_facts`) and the model by render's grammar;
 a ``pending`` record is CREATED (exclusively: that create is the key's existence check, so a second spawn of one key is
 refused before it mints and no refusal ever replaces a record) in the :class:`SessionIndex`; the run ticket is minted
@@ -45,6 +45,17 @@ passthrough ticket, the unmodified ``claude`` binary running as the slot uid und
 total, a real broker call count, and a real S1 END proving a live uid group gone. Also unverified: that the fire's uid
 may mint at all. CONTROL answers the ``dispatch`` verbs to ``_levain_dispatch``'s uid only (``Control.peer_kind``), so
 the production :class:`ControlPort` must be a connection made as that uid; no such adapter is in this module.
+
+**The brokered branch (dispatch wave 3, S-B2/S-B3 of ``1105-49/DESIGN_brokered_launcher.md``).** ``RealLauncher(auth=
+"brokered")`` mints a PRICED executor ticket: ``reserved_microdollars`` is the launch's share (the run server stamps it
+from the operator's signed link; it is never a fire's input), the three route fields come from CONTROL's read-only
+``ROUTE-RESOLVE {model}`` (CONTROL's own records echoed back; ``_check_route_facts`` re-checks all four at the mint, and
+an activation between the resolve and the mint is retried ONCE with a fresh resolve), and none of the passthrough caps
+ride. keys then books every call of the run under ``("run", run_id)`` against that share and stops the run past it.
+Usage is the run's spend: the injected ``spend(run_id)`` reader (production: :func:`levain.slot.dispatch_usage.
+lineage_spend`, the lineage sink summed by run id); a reader that is absent, or answers None, is ``usd_micros=None``,
+which ``accounting.settle`` debits as the WHOLE reservation. What no test here holds is in the module RETURN
+(``1107-15-voice/RETURN_wave3.md``): a real provider call through a real brokered slot.
 
 Nothing imports this module from an entry point, and :class:`~levain.agents.session.UnwiredLauncher` stays the default.
 """
@@ -90,8 +101,16 @@ _ZERO_STATES = ("refused", "undone")                  # nothing ran: usage reads
 _TRANSIENT = frozenset({"no-free-slot", "locked", "internal-error", "journal-unavailable", "control-down"})
 
 
+#: a mint refused because the route map moved under it (an activation between ``ROUTE-RESOLVE`` and the mint): the next
+#: attempt resolves afresh. Named whole, because the prefix ``ticket-field`` is standing for every other field.
+_STALE_ROUTE = frozenset({"ticket-field:routemap_generation", "ticket-field:route_policy_digest",
+                          "ticket-field:route", "ticket-field:model_requested"})
+_TRANSIENT_WHOLE = frozenset({"ticket-field:routemap_generation", "ticket-field:route_policy_digest"})
+_ROUTE_FIELDS = ("route", "routemap_generation", "route_policy_digest")
+
+
 def _reason_class(name: str) -> str:
-    return "transient" if name.split(":", 1)[0] in _TRANSIENT else "standing"
+    return "transient" if name in _TRANSIENT_WHOLE or name.split(":", 1)[0] in _TRANSIENT else "standing"
 
 
 def teardown_proves(answer: object) -> bool:
@@ -170,6 +189,9 @@ class SlotStart:
     brief_digest: str
     hooks: tuple[str, ...]
     workspace: Workspace | None = None
+    #: the ticket's auth axis (``passthrough`` or ``brokered``): the runtime picks the slot's routes and the helper's
+    #: ``prepare`` by it, so a brokered ticket is never started as a passthrough session
+    auth: str = "passthrough"
 
 
 @dataclass(frozen=True)
@@ -535,18 +557,22 @@ class _Launched:
 
 
 class RealLauncher:
-    """A subscription session on an S1 dispatch slot. ``auth`` is the ticket's auth axis this launcher mints with
-    (``passthrough``; ``brokered`` is accepted so its refusal is named, not mistaken for a wiring gap: no setting makes
-    a brokered launcher mint). ``clock`` returns seconds since the epoch."""
+    """A session on an S1 dispatch slot. ``auth`` is the ticket's auth axis this launcher mints with: ``passthrough``
+    (a subscription session, three per-run caps) or ``brokered`` (an API-key session, a dollar share and a CONTROL-resolved
+    route). ``spend(run_id)`` answers the micro-dollars the run spent (a brokered launcher's usage), or None when it
+    cannot be read; without one a brokered run reads None, the whole reservation. ``clock`` returns seconds since the
+    epoch."""
 
     route = S1_DISPATCH
 
     def __init__(self, control: ControlPort, runtime: SlotRuntime, sources: UsageSources, index: SessionIndex, *,
-                 auth: str = "passthrough", clock: Callable[[], float] = time.time) -> None:
+                 auth: str = "passthrough", clock: Callable[[], float] = time.time,
+                 spend: Callable[[str], Any] | None = None) -> None:
         if auth not in T.AUTHS:
             raise ValueError(f"auth is one of {T.AUTHS}")
         self.control, self.runtime, self.sources, self.index = control, runtime, sources, index
         self.auth = auth
+        self.spend = spend
         self.clock = clock
 
     # -- spawn -------------------------------------------------------------------------------------------------------
@@ -565,14 +591,14 @@ class RealLauncher:
             raise LauncherRefused("session-key-already-used", f"the index already holds state {self._existing(key)!r}")
         # AUTHORITY: whoever builds a launcher can mint for any occurrence_id and caps; run_session is the guard,
         # with CONTROL's ceiling behind it
-        ticket, run_id = self._mint(key, facts)
+        ticket, run_id = self._mint(key, facts, (lambda: self._resolve(launch.model)) if self.auth == "brokered" else None)
         try:
             found = self.index.transition(key, ("pending",), "minted", occurrence_id=launch.occurrence_id,
                                           run_id=run_id, created_s=self.clock(), **ws_rec)
             if found is not None:
                 raise RuntimeError(f"the index record left pending ({found}) before the start")
             handle = self.runtime.start(SlotStart(ticket, run_id, key, launch.harness, launch.model, launch.brief,
-                                                   str(facts["brief_digest"]), HOOKS, launch.workspace))
+                                                   str(facts["brief_digest"]), HOOKS, launch.workspace, self.auth))
         except Exception as exc:
             held = self._undo(key, ticket, run_id, launch.occurrence_id)
             if held is None:
@@ -647,29 +673,39 @@ class RealLauncher:
 
     def _refuse_before_allocating(self, launch: SessionLaunch) -> None:
         why = None
-        if self.auth == "brokered":
-            why = ("brokered-route-not-built", "the API-key route needs dispatch wave 3's per-run keys and dollar "
-                   "caps (3c-10); only a subscription session is launchable")
-        elif self.auth != "passthrough":
-            why = ("auth-not-launchable", f"a session launcher mints passthrough tickets only, not {self.auth!r}")
+        if self.auth not in ("passthrough", "brokered"):
+            why = ("auth-not-launchable", f"a session launcher mints passthrough or brokered tickets only, not {self.auth!r}")
         elif launch.auth != self.auth:
             why = ("launch-auth-not-the-launchers", f"launch {launch.auth!r}, launcher {self.auth!r}")
         elif launch.harness != VENDOR:
             why = ("harness-not-claude", str(launch.harness))
         elif type(launch.model) is not str or _RENDER_MODEL_RE.fullmatch(launch.model) is None:
             why = ("model-outside-render-grammar", "the slot's render would refuse this model")
+        elif self.auth == "brokered":
+            why = self._brokered_problem(launch)
         elif launch.exposure is None:
             why = ("no-action-exposure", "a passthrough ticket carries three per-run caps")
         elif launch.exposure.unit != "tool_calls":
             why = ("exposure-unit-not-tool-calls", str(launch.exposure.unit))
         elif launch.exposure.tunnel_bytes is None:
             why = ("no-tunnel-byte-cap", "a passthrough ticket carries a byte cap")
-        else:
+        if why is None:
             why = self._brief_problem(launch.brief)
         if why is None:
             return
         self._tombstone(launch.session_key, "refused", why[0], new=True)
         raise LauncherRefused(*why)
+
+    @staticmethod
+    def _brokered_problem(launch: SessionLaunch) -> tuple[str, str] | None:
+        """A brokered ticket carries a dollar share and no action caps: the share is the signed link's figure the run
+        server stamped, so a launch without one (a fire's own, a passthrough's) mints nothing."""
+        if launch.exposure is not None:
+            return ("exposure-on-a-brokered-launch", "a brokered ticket carries a dollar share, not action caps")
+        share = launch.usd_micros
+        if type(share) is not int or share <= 0:
+            return ("no-dollar-share", "a brokered ticket reserves the link's per-run dollars, which must be above 0")
+        return None
 
     @staticmethod
     def _brief_problem(brief: object) -> tuple[str, str] | None:
@@ -709,16 +745,27 @@ class RealLauncher:
 
     def _facts(self, launch: SessionLaunch) -> dict[str, object]:
         """The mint request, checked by CONTROL's own shape function before anything is sent."""
-        exp = launch.exposure
-        assert exp is not None
         digest = hashlib.sha256(json.dumps({"occurrence_id": launch.occurrence_id, "brief": launch.brief},
                                            sort_keys=True).encode("utf-8")).hexdigest()
         fields: dict[str, object] = {
             "attempt_id": launch.session_key, "job_id": launch.occurrence_id, "run_index": 0,
             "contract_digest": f"sha256:{digest}", "kind": "executor", "egress_routes": [],
-            "reserved_microdollars": 0, "auth": self.auth, "vendor": VENDOR, "model_requested": launch.model,
-            "brief_digest": stage.brief_digest(stage.brief_bytes(launch.brief)),
-            "max_calls": exp.actions, "max_tunnel_bytes": exp.tunnel_bytes, "deadline_s": exp.seconds}
+            "auth": self.auth, "model_requested": launch.model,
+            "brief_digest": stage.brief_digest(stage.brief_bytes(launch.brief))}
+        if self.auth == "brokered":
+            # the PRICED ticket: the link's share, and the route facts CONTROL resolves for the model
+            fields["reserved_microdollars"] = launch.usd_micros
+            try:
+                fields.update(self._resolve(launch.model))
+            except LauncherRefused as exc:
+                self._tombstone(launch.session_key, "refused", exc.name, new=True, reason_class=exc.reason_class,
+                                occurrence_id=launch.occurrence_id)
+                raise
+        else:
+            exp = launch.exposure
+            assert exp is not None
+            fields.update({"reserved_microdollars": 0, "vendor": VENDOR, "max_calls": exp.actions,
+                           "max_tunnel_bytes": exp.tunnel_bytes, "deadline_s": exp.seconds})
         try:
             T.check_attempt_id(fields["attempt_id"])
             T.check_facts(fields)
@@ -727,25 +774,62 @@ class RealLauncher:
             raise LauncherRefused(f"mint-facts:{exc.name}", exc.detail) from None
         return fields
 
-    def _mint(self, key: str, fields: Mapping[str, object]) -> tuple[str, str]:
-        """THE mint: ``RUN-TICKET-MINT`` through the control port (the only call of it in the repo's launchers)."""
+    def _resolve(self, model: str) -> dict[str, object]:
+        """``ROUTE-RESOLVE {model}``: the three route facts of the one brokered route of CONTROL's active map that serves
+        ``model``. Read-only, so a refusal here has minted nothing. Raises :class:`LauncherRefused` by CONTROL's name
+        (``no-brokered-route`` and ``route-ambiguous`` are standing: the operator's map says so)."""
         try:
-            ans = self.control.call("RUN-TICKET-MINT", **fields)
+            ans = self.control.call("ROUTE-RESOLVE", model=model)
         except Refused as exc:
-            # a refused mint minted nothing; a control-down one may have (the journal is idempotent per attempt, and the
-            # index says pending: usage reads the caps until a stop proves otherwise)
-            cls = _reason_class(exc.name)
-            if exc.name != "control-down":
-                self._tombstone(key, "refused", f"mint:{exc.name}", reason_class=cls, occurrence_id=fields["job_id"])
-            raise LauncherRefused(f"mint-refused:{exc.name}", exc.detail, reason_class=cls) from None
-        except Exception as exc:  # noqa: BLE001 - not a CONTROL answer: it may have minted, so the record stays pending
-            raise LauncherRefused("mint-failed", f"{type(exc).__name__}; the record is left pending",
-                                  reason_class="transient") from None
+            raise LauncherRefused(f"route-resolve:{exc.name}", exc.detail, reason_class=_reason_class(exc.name)) from None
+        except Exception as exc:  # noqa: BLE001 - not a CONTROL answer; nothing was minted
+            raise LauncherRefused("route-resolve-failed", type(exc).__name__, reason_class="transient") from None
+        if type(ans) is not dict or any(k not in ans for k in _ROUTE_FIELDS):
+            raise LauncherRefused("route-resolve-malformed", "the answer names no route, generation and digest")
+        return {k: ans[k] for k in _ROUTE_FIELDS}
+
+    def _mint(self, key: str, fields: Mapping[str, object],
+              refresh: Callable[[], dict[str, object]] | None = None) -> tuple[str, str]:
+        """THE mint: ``RUN-TICKET-MINT`` through the control port (the only call of it in the repo's launchers).
+        ``refresh`` (a brokered launch's re-resolve): when CONTROL refuses the mint because the route map moved since
+        the resolve (:data:`_STALE_ROUTE`), the route facts are resolved afresh and the mint is sent ONCE more."""
+        for again in (False, True):
+            try:
+                ans = self.control.call("RUN-TICKET-MINT", **fields)
+                break
+            except Refused as exc:
+                if not again and refresh is not None and exc.name in _STALE_ROUTE:
+                    fields = self._refreshed(key, fields, refresh)
+                    continue
+                # a refused mint minted nothing; a control-down one may have (the journal is idempotent per attempt, and
+                # the index says pending: usage reads the caps until a stop proves otherwise)
+                cls = _reason_class(exc.name)
+                if exc.name != "control-down":
+                    self._tombstone(key, "refused", f"mint:{exc.name}", reason_class=cls, occurrence_id=fields["job_id"])
+                raise LauncherRefused(f"mint-refused:{exc.name}", exc.detail, reason_class=cls) from None
+            except Exception as exc:  # noqa: BLE001 - not a CONTROL answer: it may have minted, so the record stays pending
+                raise LauncherRefused("mint-failed", f"{type(exc).__name__}; the record is left pending",
+                                      reason_class="transient") from None
         ticket = ans.get("ticket") if type(ans) is dict else None
         run_id = ans.get("run_id") if type(ans) is dict else None
         if type(ticket) is not str or not ticket or type(run_id) is not str or T.RUN_ID_RE.fullmatch(run_id) is None:
             raise LauncherRefused("mint-answer-malformed", self._settle_malformed(key))
         return ticket, run_id
+
+    def _refreshed(self, key: str, fields: Mapping[str, object], refresh: Callable[[], dict[str, object]]
+                   ) -> dict[str, object]:
+        """The mint's facts with the route facts resolved afresh, checked again by CONTROL's own shape function. A refusal
+        here (the map no longer serves the model, a bad answer) leaves the record ``refused`` and raises; the mint that was
+        refused for staleness minted nothing."""
+        try:
+            new = {**fields, **refresh()}
+            T.check_facts(new)
+        except (LauncherRefused, Refused) as exc:
+            name = exc.name if isinstance(exc, LauncherRefused) else f"mint-facts:{exc.name}"
+            cls = exc.reason_class if isinstance(exc, LauncherRefused) else "standing"
+            self._tombstone(key, "refused", name, reason_class=cls, occurrence_id=fields["job_id"])
+            raise LauncherRefused(name, getattr(exc, "detail", ""), reason_class=cls) from None
+        return new
 
     def _settle_malformed(self, key: str) -> str:
         """A mint answer that names no ticket and run id: ask CONTROL by attempt id what was minted, cancel it while
@@ -884,7 +968,8 @@ class RealLauncher:
         """What the run spent, read under the RECORDED ``session_key`` and nothing else. Never raises. A launch that
         provably started nothing (``refused``, ``undone``) reads zero. The sources are read only for an ``ended``
         record (S1 END proved the group gone); every other case (an unknown key, a record that does not read, a
-        session not proven ended, a figure the source cannot read, a brokered launcher) is None, the caps."""
+        session not proven ended, a figure the source cannot read) is None, the caps. A brokered launcher's figure is the
+        dollars its ``spend`` reader answers for the run."""
         try:
             rec = self.index.get(session_key)
         except Exception:  # noqa: BLE001
@@ -893,11 +978,19 @@ class RealLauncher:
             return Usage(None, None, None, "session:unindexed")
         if rec["state"] in _ZERO_STATES:
             return Usage(0, 0, 0, "session:not-started", actions=0, tunnel_bytes=0, seconds=0)
-        if self.auth != "passthrough":
-            return Usage(None, None, None, f"session:{self.auth}-usage-unbuilt")
         if rec["state"] != "ended":
             return Usage(None, None, None, "session:end-unproven")
         run_id, session = rec.get("run_id"), rec.get("session")
+        if self.auth == "brokered":
+            # the run's spend, once S1 END proved its group gone; unread (no reader, no rows, a torn sink) is None,
+            # which settle debits as the whole reservation
+            spent = None
+            if self.spend is not None and type(run_id) is str and run_id:
+                try:
+                    spent = _count_i64(self.spend(run_id))
+                except Exception:  # noqa: BLE001 - a reader that broke read nothing
+                    spent = None
+            return Usage(spent, None, None, "session:brokered" if spent is not None else "session:brokered-spend-unread")
         return Usage(0, None, None, "session:passthrough",
                      actions=self._read(self.sources.calls, run_id), tunnel_bytes=self._read(self.sources.tunnel_bytes, session),
                      seconds=self._read(self.sources.seconds, session))

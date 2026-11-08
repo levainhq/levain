@@ -163,7 +163,8 @@ def verify_point_of_use(proof: C.LinkProof, exposure: Optional[ActionExposure], 
     """The run server's whole authority check for one fire. Raises :class:`LauncherRefused` (standing, or transient for
     a ledger or store that cannot be read); returns the link's grant, as THIS replay holds it, when the fire may go on
     (a LAUNCH that stages a workspace derives the signed role's withhold against its ``agent_id`` and ``role_hash``:
-    :meth:`RunServer._signed_withhold`).
+    :meth:`RunServer._signed_withhold`; a brokered LAUNCH reads its dollar share from the grant's signed
+    ``budget_run_usd_micros``: :func:`signed_share`).
 
     The ruling (Q1 = (a), Phill 11-04): the operator's enrolled signature over the agent's LINK, which names the spec
     hash, is what authorises a fire. There is no per-occurrence signature (none exists when he signs). So, at the point
@@ -240,12 +241,29 @@ def verify_point_of_use(proof: C.LinkProof, exposure: Optional[ActionExposure], 
         # and never sent by the fire. A link signing 0 can fund no run.
         if exposure is not None:
             raise LauncherRefused("exposure-over-link", "an api_key run carries no action exposure")
-        if not grant["budget_run_usd_micros"] > 0:
+        share = grant["budget_run_usd_micros"]
+        if type(share) is not int or not share > 0:
             raise LauncherRefused("link-run-budget-zero", "the link signs no dollars for a run")
         return grant
     if exposure is None or exposure.tunnel_bytes is None or exposure.actions > calls or exposure.tunnel_bytes > tunnel:
         raise LauncherRefused("exposure-over-link", "the requested exposure is not inside the link's per-run budgets")
     return grant
+
+
+def signed_share(grant: Any) -> Optional[int]:
+    """The per-run dollar share, in micro-dollars, of a grant :func:`verify_point_of_use` returned: the figure he signed
+    on an ``api_key`` link, read from his verified link and never from the fire. None for a subscription link, a grant
+    that is no mapping, or a figure that is not a positive int (the brokered launcher then refuses ``no-dollar-share``)."""
+    if not isinstance(grant, Mapping):
+        return None
+    try:
+        billing = _auth.agent_link_terms(grant)[0]
+    except (KeyError, TypeError):
+        return None
+    share = grant.get("budget_run_usd_micros")
+    if billing != "api_key" or type(share) is not int or not share > 0:
+        return None
+    return share
 
 
 def _row_is_the_ledgers(state: Any, row: C.LinkRow, want_seq: int, verify_sig: Callable[..., bool]) -> None:
@@ -288,10 +306,11 @@ class FrameClaims:
 
 def replica_verifier(replica: AuthorityReplica, *,
                      now: Callable[[], datetime] = lambda: datetime.now(timezone.utc),
-                     verify_sig: Optional[Callable[..., bool]] = None
+                     verify_sig: Optional[Callable[..., bool]] = None, billing: str = "subscription"
                      ) -> Callable[[C.LinkProof, Optional[ActionExposure], Optional[FrameClaims]], Any]:
     """The production ``verify`` of :class:`RunServer`: :func:`verify_point_of_use` over THIS server's replica, with
-    the ledger head and the bar taken from the frame. No second authority, no operator-home read."""
+    the ledger head and the bar taken from the frame. No second authority, no operator-home read. ``billing`` is the
+    launcher's (``subscription`` for the passthrough launcher, ``api_key`` for the brokered one)."""
     def verify(proof: C.LinkProof, exposure: Optional[ActionExposure], claims: Optional[FrameClaims]) -> Any:
         if claims is None:
             raise LauncherRefused("ledger-head-missing", "the frame names no ledger head")
@@ -325,7 +344,7 @@ def replica_verifier(replica: AuthorityReplica, *,
         if held != digest:                  # the replica holds that seq (append-only, verified): another chain
             raise LauncherRefused("ledger-fork", "the claimed head is not on the replica's chain")
         return verify_point_of_use(proof, exposure, replay=lambda: state, now=now, bar_of=lambda agent: (barred, closed),
-                                   verify_sig=verify_sig, rejudge=claims.rejudge, billing="subscription")
+                                   verify_sig=verify_sig, rejudge=claims.rejudge, billing=billing)
     return verify
 
 
@@ -627,6 +646,7 @@ class RunServer:
                 claims = self._claims(req, bar=True)
                 launch, proof = C.launch_from_wire({k: v for k, v in req.items() if k not in ("ledger_head", "bar")})
                 grant = self._verify(proof, launch.exposure, claims)
+                launch = self._priced(launch, grant)
                 launch = self._workspace_of(launch, owner, proof, grant)
                 self._pool()
                 holder = self._spawn(launch, proof, claims)
@@ -708,6 +728,14 @@ class RunServer:
             return C.ok_answer(rid)
         key, part, offset, raw = C.ws_chunk_from_wire(req)
         return C.ok_answer(rid, received=self._uploads.chunk(self._key(key), owner, part, offset, raw))
+
+    def _priced(self, launch: Any, grant: Any) -> Any:
+        """The launch with a BROKERED launcher's dollar share stamped on it: the verified link's signed figure
+        (:func:`signed_share`) and nothing the fire sent. A grant that holds no figure stamps None, so the launcher
+        refuses ``no-dollar-share``. A passthrough launcher's launch is returned as it came."""
+        if getattr(self.launcher, "auth", None) != "brokered":
+            return launch
+        return dataclasses.replace(launch, usd_micros=signed_share(grant))
 
     def _workspace_of(self, launch: Any, owner: Optional[WS.UploadOwner], proof: Any = None, grant: Any = None) -> Any:
         """The LAUNCH's workspace judgment, after the authority check and before the pool check or any mint: the launch
