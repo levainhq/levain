@@ -3113,8 +3113,9 @@ body.ke .ck-drop .is-open .drop-words-first { color: var(--dim, inherit); }
 body.ke .ck-drop .drop-full { margin-top: var(--sp-3); white-space: pre-wrap; overflow-wrap: anywhere; word-break: break-word; min-width: 0; }
 body.ke .ck-drop .drop-more { align-self: flex-start; margin-top: var(--sp-3); }
 @media (min-width: 760px) {
-  body.ke .ck-drop.frame { display: grid; grid-template-columns: minmax(0, 1fr) minmax(300px, 40%); gap: 0; align-items: start; align-content: start; }
+  body.ke .ck-drop.frame { display: grid; grid-template-columns: minmax(0, 1fr) minmax(300px, 40%); gap: 0; align-items: stretch; align-content: start; }   /* stretch: the composer column is as tall as the thread beside it, and the box takes the slack (below) */
   body.ke .ck-drop.frame:has(> .drop-recent[hidden]) { grid-template-columns: minmax(0, 1fr); }
+  body.ke .ck-drop.frame > .drop-main > #ck-drop-words { flex: 1 1 auto; }   /* the box fills the height the thread gives the card; its 12em min-height stays the floor. No ceiling of its own: the stretch is bounded by the thread column, whose list is capped at 60vh, and a cap here would clip typed words that field-sizing grows the box to hold */
   body.ke .ck-drop.frame > .drop-recent { margin-left: var(--sp-6); padding-left: var(--sp-6); border-left: 1px solid var(--hair); }
 }
 @media (max-width: 720px) {
