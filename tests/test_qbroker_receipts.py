@@ -190,11 +190,11 @@ def test_rows_lists_pend_rows_only_labelled_by_control_with_the_hooks_fields_as_
     (req_dir / "notes.txt").write_text("x")
     write_answer(L, a, keys["operator"])
     assert ask(broker, a)["decision"] == "allow"
-    write_answer(L, b, keys["stranger"])                 # answered, not accepted
-    got = {r.request_id: r for r in operator.rows(L / "queue", now=LATER)}
+    write_answer(L, b, keys["stranger"])                 # a file at the name that does not verify: not answered
+    got = {r.request_id: r for r in operator.rows(L / "queue", now=LATER, signers=snapshot(L))}
     assert set(got) == {a, b, c}
-    assert (got[a].state, got[a].settled) == ("allowed", True)
-    assert (got[b].state, got[b].settled, got[b].answered) == ("pending", False, True)
+    assert (got[a].state, got[a].settled, got[a].answered) == ("allowed", True, True)
+    assert (got[b].state, got[b].settled, got[b].answered) == ("pending", False, False)
     assert (got[c].state, got[c].answered) == ("pending", False)
     assert got[c].session == "sess-a" and got[c].slot == {"class": "egress", "index": 1} and got[c].kind == "interactive"
     assert dict(got[c].claims) == {"agent": "claude_code", "agent_session_id": "cc-1", "cwd": "/w",

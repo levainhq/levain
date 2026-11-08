@@ -239,3 +239,21 @@ def test_a_swapped_signed_answer_that_cannot_be_linked_back_is_reported_with_its
     parked = [p for p in answers.iterdir() if p.name.startswith(f".quarantine-{rid}-")]
     assert len(parked) == 1 and parked[0].read_bytes() == first
     assert str(parked[0]) in str(got.value)
+
+
+# --- prel3fix r1 F3: a row lists as answered only for an answer that verifies ------------------------------------------
+
+@pytest.mark.parametrize("how", ["junk", "stranger", "unsigned", "dir"])
+def test_an_unverifiable_answer_file_never_lists_its_row_as_answered(L, broker, keys, answers, how):
+    rid = filed(broker)
+    squat(L, keys, answers, rid, how)
+    listed = {r.request_id: r for r in operator.rows(L / "queue", now=LATER, signers=rbase.snapshot(L))}
+    assert (listed[rid].state, listed[rid].answered) == ("pending", False)
+
+
+def test_a_signed_answer_lists_its_row_as_answered_only_against_a_signers_snapshot(L, broker, keys, answers):
+    rid = filed(broker)
+    write_answer(L, rid, keys["operator"])               # signed, not yet polled: the row still reads pending
+    listed = {r.request_id: r for r in operator.rows(L / "queue", now=LATER, signers=rbase.snapshot(L))}
+    assert (listed[rid].state, listed[rid].answered) == ("pending", True)
+    assert [r.answered for r in operator.rows(L / "queue", now=LATER)] == [False]   # no snapshot: nothing verifies

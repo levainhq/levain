@@ -114,11 +114,18 @@ def _pending(receipts: Receipts, request: record.ExternalGateRequest, stamp: str
         raise OperatorError(f"request {request.id} is already {state}")
 
 
-def rows(root: Path | str, *, now: datetime | None = None) -> list[Listed]:
-    """Every request row in the broker's queue at ``root`` (``L/queue``), oldest first."""
+def rows(root: Path | str, *, now: datetime | None = None, signers: SignersSnapshot | None = None,
+         ssh_keygen: Path | str | None = None) -> list[Listed]:
+    """Every request row in the broker's queue at ``root`` (``L/queue``), oldest first.
+
+    ``answered`` is True only for an answer row that verifies for its request against ``signers`` (the check the
+    writer and the broker make, :func:`~levain.qbroker.broker.answer_row_refusal`): any ``levain-queue`` member can
+    create a file at an answer's name, so a file being there says nothing. With no snapshot nothing verifies, and
+    every row lists as unanswered."""
     store, receipts = _open(root)
     recorded = _recorded(receipts)
-    stamp = utc_stamp(_now(now))
+    when = _now(now)
+    stamp = utc_stamp(when)
     out = []
     for path in store.requests.iterdir():
         name = path.name
@@ -136,7 +143,9 @@ def rows(root: Path | str, *, now: datetime | None = None) -> list[Listed]:
             request_id=rid, session=row["session"], slot=dict(row["slot"]), kind=row.get("kind"),
             run=None if row.get("run") is None else dict(row["run"]), tier=request.tier, tool_name=request.tool_name,
             received_at=request.received_at, expires_at=request.expires_at,
-            state=_state(recorded.get(rid), request.expires_at, stamp), answered=store.has_answer(rid),
+            state=_state(recorded.get(rid), request.expires_at, stamp),
+            answered=signers is not None and store.has_answer(rid)
+            and _signed_answer(row, store.answers / f"{rid}.json", signers, when, ssh_keygen)[0],
             claims={k: getattr(request, k) for k in CLAIM_KEYS}))
     return sorted(out, key=lambda r: (r.received_at, r.request_id))
 
