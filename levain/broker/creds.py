@@ -17,7 +17,8 @@ The refresh (kind `oauth2-refresh`, design 1.8) is `CredWriter`'s: it is wanted 
 within REFRESH_AHEAD_S, before the exchange goes upstream) or by `on_upstream_401` (on the generation the 401'd
 exchange used, if it is still the file's). `CredWriter.want` passes the one gate keyed by `(name, rev)` and the
 single-flight table, and runs the refresh as a DETACHED task (`_refresh`, the one `upstream.refresh_post` caller) that
-nothing an exchange does can cancel; every waiter awaits `asyncio.shield` of its future.
+nothing an exchange does can cancel; every waiter awaits `asyncio.shield` of its future, at most REFRESH_DEADLINE_S
+from the refresh's start.
 """
 from __future__ import annotations
 
@@ -296,11 +297,13 @@ def _now(lifecycle: object) -> float:
 async def fresh(lifecycle: object, store: CredStore, name: str) -> Credential:
     """Before an exchange goes upstream: the credential `name`, observed. A refresh-kind credential whose access token
     expires within REFRESH_AHEAD_S wants a refresh (proactive); when `lifecycle` is the real writer and the want
-    starts or joins one, the exchange waits for it SHIELDED (cancelling the exchange never cancels the refresh), at
-    most REFRESH_DEADLINE_S, then observes the file again. An access token that has expired by then is
-    `credential-unavailable`, never sent; a still-valid one is used while the gate is shut, the refresh failed, or it
-    has not finished in time (a stalled token endpoint never holds an exchange a valid token can serve). Any other
-    `lifecycle` (the in-process stand-in) refreshes nothing."""
+    starts or joins one, the exchange waits for it SHIELDED (cancelling the exchange never cancels the refresh) until
+    REFRESH_DEADLINE_S after that refresh STARTED (`CredWriter.wait_left`; a joiner gets only what is left), then
+    observes the file again. The refresh itself runs on past that point. An access token that has expired by then is
+    `credential-unavailable`, never sent; a still-valid one is served when the gate is shut, the refresh failed, or
+    it has not finished by the deadline. So a stalled token endpoint holds an exchange at most REFRESH_DEADLINE_S
+    (the first one; any token within REFRESH_AHEAD_S of expiry waits, valid or not). Any other `lifecycle` (the
+    in-process stand-in) refreshes nothing."""
     cred = store.observe(name)
     if cred.kind != "oauth2-refresh" or cred.expires_at - _now(lifecycle) >= REFRESH_AHEAD_S:
         return cred
@@ -892,8 +895,10 @@ class CredWriter:
         """The detached refresh: the POST (or the gate's `held` fields, when a prior refresh's commits all failed), the
         new object, the commit (`_land`). A refused answer that carried a rotated refresh token commits that token
         alone and still counts as a failure, the gate now holding the committed `rev`. Any other failure counts on
-        the gate and leaves the old file; a DISCARD (the operator's act landed) is neither. The `finally` resolves the future with the outcome; the task's
-        done-callback repeats the cleanup for a task cancelled before its first step."""
+        the gate and leaves the old file. A DISCARD (the operator's act landed) is neither, except after a refused
+        answer, which still counts (on a gate the operator's new `rev` has already left). The `finally` resolves the
+        future with the outcome; the task's done-callback repeats the cleanup for a task cancelled before its first
+        step."""
         result = "cancelled"
         try:
             refused: Optional[RefreshRejected] = None
