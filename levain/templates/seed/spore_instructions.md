@@ -79,9 +79,9 @@ Everything above is *your* prospective memory: open loops that flow into your co
 
 There is no `handoff` disposition for new items: "pick this up next session" is a seed, a dated agenda, or, if the machine is stopped on the operator, a band row. And there is no Keep. Reference is memory, not a task:
 
-- a **fact** that stays true goes in your continuity under `## Durable Facts` (if your store has that section; otherwise as a `decision` or `finding` episode), written with the cue words that would bring it back;
+- a **fact** that stays true goes in your continuity under `## Durable Facts` (if your store has that section; otherwise as a `finding` episode), written with the cue words that would bring it back;
 - a **ruling** (the operator decided something) is a `decision` episode with their words, the date and the premise;
-- a trap with a match condition is a `finding` episode that states the condition, not a note.
+- a trap with a match condition (a thing that must fire when the condition is met) is not a note, and a Levain install ships no mechanism that fires on a match condition. Record it as a `finding` episode that states the condition, and tell the operator that nothing will fire it until they add a mechanical trigger or hook of their own.
 
 Old `handoff` and `note` items from earlier installs still appear, in the Tray (`spore_list` and the cockpit's Tray panel show them badged `handoff` or `note`). Resolve one with `spore_descend` (done) or `spore_ascend` (it grew), or from the cockpit started with `levain serve --write`; you just do not create new ones.
 
