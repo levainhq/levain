@@ -299,10 +299,10 @@ def test_the_log_refuses_a_grant_naming_any_shell_tool_in_any_case(tmp_path, too
         _granted_codex_hook(tmp_path, [tool])
 
 
-def test_every_shell_name_the_hook_templates_know_is_a_shell_tool_to_consent():
-    """The PostToolUse templates are standalone files copied into an install, so they cannot import the set: a shell
-    name a hook knows (and so an agent may send) that consent does not would be grantable. Consent may know more
-    (write_stdin carries ``chars``, not the ``command`` those hooks summarise)."""
+def test_the_hook_templates_shell_names_equal_the_consent_list():
+    """The PostToolUse templates are standalone files copied into an install, so they cannot import the set: a copy
+    that knows a name consent does not, or lacks one it does, has drifted. They must EQUAL the authority list
+    (compared lowercased; the hooks match case-sensitively, which only affects which spelling they list)."""
     import ast
 
     import levain
@@ -314,7 +314,7 @@ def test_every_shell_name_the_hook_templates_know_is_a_shell_tool_to_consent():
                                                     for t in node.targets):
                 names = ast.literal_eval(node.value.args[0])
                 found += 1
-                assert {n.lower() for n in names} <= CONSENT_SHELL_TOOLS, path
+                assert {n.lower() for n in names} == CONSENT_SHELL_TOOLS, path
     assert found >= 2      # both PostToolUse templates (Claude Code's and Codex's)
 
 
