@@ -80,8 +80,8 @@ function makeEnv(over) {
   const ls = store(); ls.setItem("levain_write_token", "tok");
   const win = { LevainCockpitView: View, localStorage: ls, sessionStorage: store(), location: { search: "?source=manifest", hash: "", pathname: "/" },
     crypto: { randomUUID: () => "key-" + (++n) }, prompt: () => "",
-    LevainDashboard: { render: (view, opts) => renders.push({ view, opts }), hasUnsavedEdit: () => false, jobsActive: () => false } };
-  const doc = { getElementById: () => null, addEventListener() {}, querySelectorAll: () => [], createElement: () => ({ className: "", textContent: "" }), visibilityState: "visible" };
+    LevainDashboard: { render: (view, opts) => renders.push({ view, opts }), hasUnsavedEdit: () => false, jobsActive: () => false }, dispatchEvent() {} };
+  const doc = { getElementById: () => null, addEventListener() {}, querySelectorAll: () => [], createElement: () => ({ className: "", textContent: "" }), visibilityState: "visible", body: { dataset: {} } };
   const env = { posts, renders, fx };
   env.start = async () => {
     new Function("window", "document", "location", "history", "fetch", "console", bootSrc)(win, doc, win.location, { replaceState() {} }, fetchFn, console);
