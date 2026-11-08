@@ -2018,7 +2018,9 @@
   // {"v":1,"zones":{"<zone id>":{"order":["<card key>",...]}},"collapsed":["<card key>",...]}; a card's key is its first panel id, and a folded card folds all its panels.
   // Anything that is not that shape is ignored part by part, and a browser that refuses storage draws the kernel order.
   const LAYOUT_KEY = "levain_cockpit_layout_v1";
-  const strings = (a) => (Array.isArray(a) ? a.filter((s) => typeof s === "string" && s) : []);
+  // Panel ids that no longer exist: a layout saved before their removal never reorders or folds a future card that takes the id.
+  const RETIRED_PANEL_IDS = ["now"];
+  const strings = (a) => (Array.isArray(a) ? a.filter((s) => typeof s === "string" && s && RETIRED_PANEL_IDS.indexOf(s) < 0) : []);
   // The page's own copy of the last layout written: when the store refuses a write (Safari private, quota) it is the truth for the page's life.
   let memLayout = null, memStale = false;
   const copyLayout = (l) => { const zones = Object.create(null); for (const z of Object.keys(l.zones)) zones[z] = l.zones[z].slice(); return { zones, collapsed: l.collapsed.slice() }; };
@@ -2031,7 +2033,10 @@
     if (v.zones && typeof v.zones === "object") {
       for (const z of Object.keys(v.zones)) {
         const o = v.zones[z];
-        if (o && typeof o === "object" && Array.isArray(o.order)) out.zones[z] = strings(o.order);
+        if (o && typeof o === "object" && Array.isArray(o.order)) {
+          const kept = strings(o.order);
+          if (kept.length || !o.order.some((s) => RETIRED_PANEL_IDS.indexOf(s) >= 0)) out.zones[z] = kept;   // an order that was only retired ids is no saved order
+        }
       }
     }
     out.collapsed = strings(v.collapsed);

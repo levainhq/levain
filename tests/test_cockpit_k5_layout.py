@@ -182,6 +182,15 @@ def test_no_saved_layout_draws_no_reset_control_and_a_saved_one_draws_it_in_the_
 
 
 @needs_browser
+def test_a_layout_that_only_names_the_retired_now_is_no_saved_layout(tmp_path: Path) -> None:
+    ALL = "[...document.querySelectorAll('[data-layout-reset]')].filter(b => b.getClientRects().length > 0).length"
+    stale = "JSON.stringify({v: 1, zones: {operate: {order: ['now']}}, collapsed: ['now']})"
+    out = _run(tmp_path, _seed(stale) + [{"eval": ALL}, {"eval": STACKS}])
+    assert out[-2] == 0, out[-2]                                         # no Reset layout control for a layout that is only stale
+    assert out[-1]["left"] == ["tray"] and out[-1]["right"] == ["loops", "keep"], out[-1]
+
+
+@needs_browser
 def test_the_entity_name_in_the_bar_is_not_truncated_at_1440_with_a_saved_layout(tmp_path: Path) -> None:
     out = _run(tmp_path, _seed("JSON.stringify({v: 1, zones: {operate: {order: ['now', 'tray']}}, collapsed: ['loops']})") + [
         {"eval": "const e = document.getElementById('entity'); [e.scrollWidth, e.clientWidth, e.textContent]"}])[-1]
