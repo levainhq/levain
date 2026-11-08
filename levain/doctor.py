@@ -159,6 +159,7 @@ def _run_doctor(path: Path, invoke: bool = False, repin_hooks: bool = False) -> 
     core.extend(_check_host_awake())
     core.extend(_check_cockpit_authority(install))
     core.extend(_check_authority_signers(install))
+    core.extend(_check_cockpit_key_files(install))
     core.extend(_guarded("terminal key", _check_terminal_key))
     core.extend(_check_continuity_headroom(install))
     core.extend(_guarded("keep", lambda: _check_keep_migration(install)))
@@ -3583,6 +3584,91 @@ def _check_cockpit_authority(install: Path) -> list[CheckResult]:
                                    warn=True)]
     return rows + [CheckResult(name, True,
                                f"{len(laptops)} {LAPTOP} keys enrolled (head at seq {auth.authority.seq})")]
+
+
+def _check_cockpit_key_files(install: Path, *, key_dirs: list[Path] | None = None) -> list[CheckResult]:
+    """An ACTIVE laptop-presence key whose enrol record declares ``passphrase`` (or ``touch-id`` for a software
+    ed25519 key) but whose local private key file is an UNENCRYPTED OpenSSH key: any process running as the user can
+    sign authority records with it. An install enrolled before custody checks existed (2026-10-12) can hold one; the
+    enrol door refuses it today. Doctor FINDS it and never blocks signing (the owner's re-key needs this very key
+    to sign the new key's enrolment). The key dirs (default: the default key dir) are searched by ``.pub`` file
+    only; the private file is opened for its cipher header only, so no passphrase is needed. A key whose file is
+    not found locally gives no row. Nothing here can abort doctor."""
+    try:
+        return _cockpit_key_file_rows(install, key_dirs)
+    except Exception as exc:  # noqa: BLE001 - a doctor check reports, it never crashes the run
+        return [CheckResult("cockpit key custody", True, f"could not check: {type(exc).__name__}: {exc}", warn=True)]
+
+
+def _cockpit_key_file_rows(install: Path, key_dirs: list[Path] | None) -> list[CheckResult]:
+    from datetime import datetime, timezone
+
+    from levain.authority import LAPTOP, anchor_path
+    from levain.cockpit import custody
+    from levain.cockpit.authority import RequestAuthority
+    from levain.cockpit.firejournal import DB_NAME, STORE_FORMAT
+
+    root = install / ".levain" / "cockpit"
+    journal = root / DB_NAME
+    if not journal.is_file():
+        return []
+    conn = sqlite3.connect(f"file:{journal}?mode=ro", uri=True, timeout=2, isolation_level=None)
+    try:
+        fmt = conn.execute("SELECT value FROM meta WHERE key = 'format'").fetchone()
+        if fmt is None or fmt[0] != STORE_FORMAT:
+            return []                                 # the cockpit authority row reports an unreadable journal
+        conn.execute("BEGIN")
+        auth = RequestAuthority.capture(conn, now=datetime.now(timezone.utc), anchor=anchor_path(root),
+                                        source=str(journal))
+        conn.execute("COMMIT")
+    finally:
+        conn.close()
+    if auth.authority is None or auth.authority_error is not None:
+        return []
+    dirs = key_dirs if key_dirs is not None else [custody.default_key_dir()]
+    pubs: dict[str, Path] = {}                        # "<type> <base64>" -> the private file beside its .pub
+    for d in dirs:
+        try:
+            entries = sorted(Path(d).expanduser().glob("*.pub"))
+        except OSError:
+            continue
+        for pub in entries:
+            try:
+                fields = pub.read_text(encoding="utf-8").split()
+            except (OSError, UnicodeDecodeError):
+                continue
+            if len(fields) >= 2:
+                pubs.setdefault(" ".join(fields[:2]), pub.with_name(pub.name[:-4]))
+    rows: list[CheckResult] = []
+    found = 0
+    for key in auth.authority.keys.values():
+        if not key.active or key.key_class != LAPTOP:
+            continue
+        private = pubs.get(" ".join(key.public_key.split()[:2]))
+        if private is None or not private.is_file():
+            continue
+        found += 1
+        software = key.public_key.split()[0] == "ssh-ed25519"
+        if key.custody not in (custody.PASSPHRASE, custody.TOUCH_ID) or (key.custody == custody.TOUCH_ID
+                                                                           and not software):
+            continue                                  # nothing in the key file says it is a plain file
+        if custody.is_encrypted_file(private):
+            continue
+        rows.append(CheckResult(
+            "cockpit key custody", False,
+            f"laptop-presence key {key.fingerprint} is enrolled as custody {key.custody!r}, but its key file "
+            f"{private} is an UNENCRYPTED private key: any process running as you can sign with it",
+            "Re-key it; this key is still needed to sign the new key's enrolment, so levain does not block it. "
+            "`levain cockpit key create` (Touch ID where available), then `levain cockpit enroll <new key.pub> "
+            f"--class {LAPTOP} --signing-key {private}`, then `levain cockpit revoke {key.fingerprint} "
+            "--signing-key <the new key>`. A plain revoke: --compromised-since would void every record this key "
+            "signed, which includes the phone passkey enrolments."))
+    if rows:
+        return rows
+    if found:
+        return [CheckResult("cockpit key custody", True,
+                            f"{found} local laptop-presence key file(s) match their declared custody")]
+    return []
 
 
 #: What each refusal of the install helper's ``enrol-authority-signer`` / ``remove-authority-signer`` means, in the
