@@ -21,7 +21,9 @@ them) and writes only ``answers/<request_id>.json``:
   can replace it once it is there. Any ``levain-queue`` member can create a file at an answer's name, so a file
   already there that is not a signed answer for that request is
   renamed aside to ``answers/.quarantine-<request_id>-<random>.json``, a name no reader takes for an answer, and the
-  signed answer is linked in its place; one that is a signed answer is never moved or replaced.
+  signed answer is linked in its place. One signed by a key in the current signer snapshot (over a head the receipts
+  hold) is never moved or replaced; one signed by a key no longer in that snapshot is not a valid answer (the broker
+  refuses it too), so it is cleared like any other file.
 
 A receipts log that cannot be read is :class:`OperatorError`.
 
@@ -275,13 +277,15 @@ def _signed_answer(row: Mapping[str, Any], path: Path, signers: SignersSnapshot 
 
 def _clear_squat(store: QueueStore, receipts: Receipts, row: Mapping[str, Any], request_id: str, path: Path,
                  signers: SignersSnapshot | None, now: datetime, ssh_keygen: Path | str | None) -> bool:
-    """True when ``path`` holds a signed answer (left in place). Otherwise whatever is there is renamed aside and
-    False is returned, for the caller to link its own answer again. What the rename moved is judged again from its
-    own fd, never assumed to be the thing judged at the name (a swap in between, or a freed inode reused, makes
-    them differ while the name or the (dev, ino) look the same); should it be a signed answer, it is linked back.
+    """True when ``path`` holds an answer signed by a key in the current snapshot ``signers`` (left in place); an
+    answer signed by a key no longer in it is no valid answer (the broker refuses it too) and is cleared. Otherwise
+    whatever is there is renamed aside and False is returned, for the caller to link its own answer again. What the
+    rename moved is judged again from its own fd, never assumed to be the thing judged at the name (a swap in
+    between, or a freed inode reused, makes them differ while the name or the (dev, ino) look the same); should it
+    be a signed answer, it is linked back.
     Should the link-back fail (the name taken again, or any other ``OSError`` but the quarantine file gone),
-    :class:`OperatorError` names the quarantine file that holds it. A signed answer is never left in quarantine
-    unreported.
+    :class:`OperatorError` names the quarantine file that holds it. An answer signed by a key in the current
+    snapshot is never left in quarantine unreported.
 
     ``answers/`` has no sticky bit, so the member that squatted can delete or rename the quarantine file once it
     exists: a quarantine file gone is a name cleared, never an error. Any other ``OSError`` is :class:`OperatorError`,
