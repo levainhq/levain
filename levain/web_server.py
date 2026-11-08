@@ -1617,6 +1617,7 @@ def build_substrate_json(
     *,
     write_token_required: bool = False,
     extra_verbs: "Mapping[str, ActionVerb] | None" = None,
+    threads: bool = True,
 ) -> bytes:
     """The ``/substrate.json`` body: a fresh read-only ``SubstrateView`` snapshot.
 
@@ -1651,6 +1652,8 @@ def build_substrate_json(
     if "write_token_required" in payload:
         raise RuntimeError("to_dict() collided with transport `write_token_required`")
     payload["write_token_required"] = write_token_required
+    if not threads:
+        payload["threads"] = False     # make_server(threads=False): the legacy /?source=substrate page reads it too (absent by default)
     # Inline external panels (the read-only extra-PANEL seam): a per-request provider returns
     # full panel descriptors+data; split each into a layout entry (kind:"external") + its data
     # under payload["extra_panels"][id], so the frontend renders them inline among the substrate
@@ -2445,7 +2448,7 @@ class _Handler(GuardedHandler):
         return device
 
     def _transport(self) -> dict[str, bool]:
-        """The manifest's ``transport``: the same two flags ``/substrate.json`` carries."""
+        """The manifest's ``transport``: the same capability flags ``/substrate.json`` carries (``_manifest_transport`` adds ``threads``)."""
         return {"writable": self.server.levain_source.write_scope is not None,
                 "write_token_required": self._write_token_required() or self._writes_need_credential(),
                 "owner_key": self._owner_key_accepted()}
@@ -4070,7 +4073,7 @@ class _Handler(GuardedHandler):
 
     def _manifest_transport(self) -> dict[str, bool]:
         """The manifest's ``transport`` plus ``threads: false`` when the server offers no Threads zone (absent otherwise)."""
-        out = self._transport()
+        out = dict(self._transport())     # a copy: never mutate what _transport() hands back
         if not self.server.threads:
             out["threads"] = False
         return out
@@ -4555,7 +4558,7 @@ class _Handler(GuardedHandler):
                 body = build_substrate_json(
                     self.server.levain_source, self.server.extra_panels,
                     write_token_required=self._write_token_required() or self._writes_need_credential(),
-                    extra_verbs=self.server.extra_verbs)
+                    extra_verbs=self.server.extra_verbs, threads=self.server.threads)
             except _CredentialUnavailable:   # RU-5: only the outer catch answers it
                 raise
             except Exception as exc:  # noqa: BLE001 — never 500 on a runtime fault
@@ -4571,6 +4574,7 @@ class _Handler(GuardedHandler):
                     "writable": self.server.levain_source.write_scope is not None,
                     "write_token_required": self._write_token_required() or self._writes_need_credential(),
                     "errors": {"server": f"{type(exc).__name__}: {exc}"},
+                    **({} if self.server.threads else {"threads": False}),
                 }).encode("utf-8")
             finally:
                 self.server.request_gate.release()
@@ -4598,6 +4602,7 @@ class _Handler(GuardedHandler):
                     "episodes": [],
                     "count": 0,
                     "errors": {"server": f"{type(exc).__name__}: {exc}"},
+                    **({} if self.server.threads else {"threads": False}),
                 }).encode("utf-8")
             finally:
                 self.server.request_gate.release()
@@ -4859,7 +4864,8 @@ class _Handler(GuardedHandler):
         desk = (route in (_DESK_ANSWER_ROUTE, _DESK_TEXT_ROUTE)
                 and getattr(self.server, "question_store", None) is not None)
         # and the thread view's write routes (CH-U1b): the same gate; served only beside a ChatService
-        thread = cockpit_threads.post_route(route) if self.server.chat_service is not None else None
+        thread = (cockpit_threads.post_route(route)
+                  if self.server.chat_service is not None and self.server.threads else None)   # threads=False: its writes are unknown routes too
         # and the room's write routes (RM-F): the same gate; served only beside a room host
         room = cockpit_room.post_route(route) if self.server.room_host is not None else None
         # and web push (OS-4): a token on every bind

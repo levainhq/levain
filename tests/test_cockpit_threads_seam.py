@@ -12,6 +12,9 @@ from levain.web_server import make_server
 from tests.test_cockpit_flip_parity import _drive, needs_browser
 from tests.test_cockpit_k2a import TOKEN, _install, _serve
 from tests.test_cockpit_questions import _get_status
+from tests.test_cockpit_threads_mount import qdir  # noqa: F401  (fixture)
+from tests.test_cockpit_threads import clock  # noqa: F401  (fixture)
+from tests.test_cockpit_threads_send import _call, _rows, _stop_path, live  # noqa: F401
 
 ONE = "/cockpit/thread/th-" + "0" * 32 + ".json"
 
@@ -75,3 +78,85 @@ def test_the_real_page_draws_no_threads_zone_when_off_and_one_when_on(tmp_path):
     with _serve(src, write_token=TOKEN) as (base, _h):
         out = _drive(tmp_path, base + "/", probe("document.querySelector('.th-body > *')"))
     assert json.loads(out["values"][-1]) == {"hidden": False, "off": ""}
+
+
+def test_threads_off_also_404s_the_thread_write_routes_and_touches_no_session(tmp_path, live):
+    svc, cs, world, session = live
+    _root, src, _ids = _install(tmp_path)
+    with _serve(src, write_token=TOKEN, chat_service=svc, threads=False) as (base, _h):
+        for token in (None, TOKEN):
+            status, body = _call(base, _stop_path(world), {"expected_launch_id": world["launch"]}, token)
+            assert status == 404 and body["error"] == "not_found", (token, body)
+    assert session.written == [] and _rows(cs) == []
+    with _serve(src, write_token=TOKEN, chat_service=svc) as (base, _h):          # control: on, the same call is the route
+        status, _b = _call(base, _stop_path(world), {"expected_launch_id": world["launch"]}, None)
+        assert status == 403
+
+
+def test_substrate_json_carries_threads_false_only_when_off(tmp_path):
+    _root, src, _ids = _install(tmp_path)
+    with _serve(src, write_token=TOKEN, threads=False) as (base, _h):
+        status, body = _get_status(base + "/substrate.json", TOKEN)
+        assert status == 200 and body["threads"] is False
+    with _serve(src, write_token=TOKEN) as (base, _h):
+        status, body = _get_status(base + "/substrate.json", TOKEN)
+        assert status == 200 and "threads" not in body
+
+
+def test_manifest_transport_is_a_copy_and_only_the_manifest_reads_it(tmp_path):
+    _root, src, _ids = _install(tmp_path)
+    httpd = make_server(src, host="127.0.0.1", port=0, threads=False)
+    try:
+        cls = httpd.RequestHandlerClass
+        shared = {"writable": True}
+        handler = cls.__new__(cls)
+        handler.server = httpd
+        handler._transport = lambda: shared          # a cached dict handed back to every caller
+        assert handler._manifest_transport() == {"writable": True, "threads": False}
+        assert shared == {"writable": True}          # never mutated
+    finally:
+        httpd.server_close()
+    routes = (Path(threads.__file__).resolve().parent / "routes.py").read_text()
+    uses = [ln for ln in routes.splitlines() if "transport=transport" in ln]
+    assert len(uses) == 1 and "manifest(" in uses[0], uses         # the one consumer is the manifest response
+
+
+def _count(pattern="cockpit/thread"):
+    return f"performance.getEntriesByType('resource').filter(e => e.name.includes('{pattern}')).length"
+
+
+def _quiet_after(until):
+    return [
+        {"until": "document.querySelector('[data-mode-tab=board]')"},
+        {"eval": f"localStorage.setItem('levain_write_token', {json.dumps(TOKEN)}); window.__pre = 1; location.reload(); 1"},
+        {"until": "!window.__pre && document.querySelector('[data-zone=threads]')"},
+        {"do": "document.querySelector('[data-mode-tab=build]').click(); 1", "until": "document.body.dataset.mode === 'build'"},
+        {"until": until},
+        {"eval": f"new Promise(r => setTimeout(() => r({_count()}), 300))"},
+        {"eval": f"new Promise(r => setTimeout(() => r({_count()}), 3500))"},
+        {"eval": "document.querySelector('[data-zone=threads]').hidden"},
+    ]
+
+
+@needs_browser
+def test_the_legacy_substrate_page_also_draws_no_zone_and_stops_polling_when_off(tmp_path):
+    _root, src, _ids = _install(tmp_path)
+    with _serve(src, write_token=TOKEN, threads=False) as (base, _h):
+        out = _drive(tmp_path, base + "/?source=substrate", _quiet_after("document.body.dataset.threads === 'off'"))
+    first, second, hidden = out["values"][-3:]
+    assert hidden is True and second == first, out["values"]     # no thread request after the flag, over two poll periods
+
+
+@needs_browser
+def test_an_already_mounted_zone_is_torn_down_when_the_flag_arrives_late(tmp_path):
+    _root, src, _ids = _install(tmp_path)
+    with _serve(src, write_token=TOKEN) as (base, _h):
+        out = _drive(tmp_path, base + "/", _quiet_after("document.querySelector('.th-body > *')")[:5] + [
+            {"until": f"{_count()} >= 1"},
+            {"eval": "document.body.dataset.threads = 'off'; window.dispatchEvent(new Event('levain:threads-off')); 1"},
+            {"eval": f"new Promise(r => setTimeout(() => r({_count()}), 300))"},
+            {"eval": f"new Promise(r => setTimeout(() => r({_count()}), 3500))"},
+            {"eval": "document.querySelector('[data-zone=threads]').hidden"},
+        ])
+    first, second, hidden = out["values"][-3:]
+    assert hidden is True and second == first, out["values"]     # the mounted view stopped, not just hid
