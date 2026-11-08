@@ -238,6 +238,15 @@ def test_agent_sentence():
         assert agent_sentence(other, "Bash") is None
 
 
+@pytest.mark.parametrize("tool", ["write_stdin", "Write_Stdin"])
+def test_write_stdin_eperm_reads_unknown(tool):
+    """L2-MED-1: write_stdin may feed a terminal launched outside the sandbox, so an EPERM text is neither touched nor none."""
+    rec = classify("codex", "PostToolUse", tool, {"chars": "x"}, "sandbox_apply: Operation not permitted\n",
+                   bound_active=True)
+    assert rec.bound == "unknown"
+    assert rec.denials == 0
+
+
 def test_shell_tools_are_the_authority_list():
     """6b-1: one source for the shell-tool names, so bound cannot drift from the consent authority again."""
     from levain import authority
@@ -245,7 +254,7 @@ def test_shell_tools_are_the_authority_list():
     assert bound.SHELL_TOOLS is authority.CONSENT_SHELL_TOOLS
 
 
-@pytest.mark.parametrize("tool", ["write_stdin", "Write_Stdin", "PowerShell", "Bash", "exec_command"])
+@pytest.mark.parametrize("tool", ["PowerShell", "Bash", "exec_command"])
 def test_every_consent_shell_tool_reads_touched(tool):
     rec = classify("codex", "PostToolUse", tool, {"chars": "x"}, "sandbox_apply: Operation not permitted\n",
                    bound_active=True)

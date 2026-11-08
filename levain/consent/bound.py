@@ -42,7 +42,9 @@ CLASSES: tuple[str, ...] = ("write_outside_roots", "agent_config", "network", "p
 MAX_DENIALS = 999
 MAX_SCAN_CHARS = 1_000_000
 # the tools whose `command` is a shell line: the consent authority's own list (one source, lowercase, compared
-# case-insensitively), so the two cannot drift
+# case-insensitively), so the two cannot drift on the NAMES. Not the matching rule: authority also accepts an MCP
+# tool's own name (`mcp__shell__exec_command`); bound matches the whole tool name only, since an MCP server runs
+# outside the vendor sandbox whose EPERM text bound scans
 SHELL_TOOLS = CONSENT_SHELL_TOOLS
 PATCH_TOOL = "apply_patch"     # Codex only
 FETCH_TOOL = "WebFetch"        # Claude Code only
@@ -197,6 +199,8 @@ def classify(agent: str, event: str, tool_name: Any, tool_input: Any, tool_respo
         # a Codex call that asked to run outside its sandbox (the field and value Codex 0.162.1 sent on an escalated
         # write_stdin input) may have run outside it, where an EPERM is the OS's and not the bound's: neither touched
         # nor none can be claimed
+        if isinstance(tool_name, str) and tool_name.lower() == "write_stdin":
+            return _unknown()     # it may feed a terminal launched outside the sandbox; the launch is not on this call
         if shell and agent == "codex" and isinstance(tool_input, Mapping) \
                 and tool_input.get(_CODEX_ESCALATION_KEY) == _CODEX_ESCALATED:
             return _unknown()
