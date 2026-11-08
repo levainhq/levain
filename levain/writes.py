@@ -143,6 +143,8 @@ _CONTEXT_SOURCE_ALLOWLIST = frozenset({"web", "tui", "cli", "app", "phone"})
 # Strict YYYY-MM-DD shape — anchored \d so a space-padded "2026-06- 1" (which len==10 +
 # datetime.strptime would wrongly accept) is rejected; a real-date check follows.
 _ISO_DATE_RE = re.compile(r"\A\d{4}-\d{2}-\d{2}\Z")
+# anneal 1.0.4's timed ``next``: ``YYYY-MM-DDTHH:MM`` (local, no zone, minute precision), stored verbatim
+_ISO_TIMED_RE = re.compile(r"\A\d{4}-\d{2}-\d{2}T\d{2}:\d{2}\Z")
 
 # Ledger artifacts live UNDER a WriteScope.ledger_root (a Levain install's `.levain/`,
 # or any explicit dir — e.g. the embedder's `state/bridge/`). These names are ledger-RELATIVE;
@@ -2154,7 +2156,7 @@ def _apply_spore_set_disposition(
 
 
 def _validate_surface_at(value: Any) -> str | None:
-    """Validate a surface_at date value → the normalized result (a ``YYYY-MM-DD`` string, or
+    """Validate a surface_at date value → the normalized result (a ``YYYY-MM-DD`` or ``YYYY-MM-DDTHH:MM`` string, or
     ``None`` for a clear). Shared by ``spore_surface_at`` AND the optional schedule carried on a
     ``spore_set_disposition`` promote (the "remind me" tickler) so the date contract can't drift
     between them. Caller owns the key-PRESENCE policy (surface_at requires the key present;
@@ -2166,14 +2168,19 @@ def _validate_surface_at(value: Any) -> str | None:
     internal "next" field."""
     if value in (None, ""):
         return None
-    if not isinstance(value, str) or not _ISO_DATE_RE.match(value):
-        raise EditError("bad_verb_arg", 422,
-                        "surface_at must be YYYY-MM-DD (or null/'' to clear)")
+    msg = "surface_at must be YYYY-MM-DD or YYYY-MM-DDTHH:MM (or null/'' to clear)"
+    if not isinstance(value, str):
+        raise EditError("bad_verb_arg", 422, msg)
+    if _ISO_DATE_RE.match(value):
+        fmt = "%Y-%m-%d"
+    elif _ISO_TIMED_RE.match(value):
+        fmt = "%Y-%m-%dT%H:%M"
+    else:
+        raise EditError("bad_verb_arg", 422, msg)
     try:
-        datetime.strptime(value, "%Y-%m-%d")
+        datetime.strptime(value, fmt)
     except ValueError:
-        raise EditError("bad_verb_arg", 422,
-                        "surface_at must be YYYY-MM-DD (or null/'' to clear)") from None
+        raise EditError("bad_verb_arg", 422, msg) from None
     return value
 
 

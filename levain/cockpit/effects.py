@@ -602,14 +602,18 @@ def _norm_disposition(value: Any, current: Any = None) -> str | None:
 
 
 _ISO_DATE = re.compile(r"\d{4}-\d{2}-\d{2}")
+_ISO_TIMED = re.compile(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}")   # anneal 1.0.4: local, no zone, minute precision
 
 
 def _norm_date(value: Any) -> str | None:
     if value in (None, ""):
         return None
-    if not isinstance(value, str) or not _ISO_DATE.fullmatch(value):
-        raise ValueError(f"a date must be YYYY-MM-DD or null (got {value!r})")
-    datetime.strptime(value, "%Y-%m-%d")
+    if isinstance(value, str) and _ISO_DATE.fullmatch(value):
+        datetime.strptime(value, "%Y-%m-%d")
+    elif isinstance(value, str) and _ISO_TIMED.fullmatch(value):
+        datetime.strptime(value, "%Y-%m-%dT%H:%M")
+    else:
+        raise ValueError(f"a date must be YYYY-MM-DD, YYYY-MM-DDTHH:MM or null (got {value!r})")
     return value
 
 
