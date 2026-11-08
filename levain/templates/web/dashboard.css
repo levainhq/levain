@@ -1303,6 +1303,11 @@ body.ke .ck-card.w.w-open:focus-visible { outline: 1px solid var(--line-hot); ou
 .proposal-slot:first-child > .ext-grouphead:first-child { margin-top: 0; }
 /* M17: the standing grants follow the proposals, under the same heading rule; a refused call (the demotion signal) reads in the bad colour */
 .grant-slot > .ext-grouphead:first-child { margin-top: var(--sp-5); }
+/* row 153: the envelopes follow the grants under the same heading rule; the revoke is a full-size target and a long line wraps */
+.envelope-slot > .ext-grouphead:first-child { margin-top: var(--sp-5); }
+.envelope-sign { flex-wrap: wrap; }
+.envelope-sign .consent-code, .envelope-row .consent-head, .envelope-row .consent-facts { overflow-wrap: anywhere; min-width: 0; }
+.envelope-revoke { min-height: var(--hit-min, 44px); min-width: var(--hit-min, 44px); }
 .grant-calls { margin-top: var(--sp-2); }
 .grant-call { display: block; overflow-wrap: anywhere; }
 .grant-call.grant-refused { color: var(--bad); font-weight: var(--fw-semibold); }

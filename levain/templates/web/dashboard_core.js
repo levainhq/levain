@@ -7576,6 +7576,7 @@
   function grantFill(slot) {
     const n = ++grantFillSeq;
     Promise.all([grantFetch(), grantSignList()]).then(([b, signList]) => {
+      if (n === grantFillSeq) slot.dataset.filled = "1";     // the grants' read has answered: the phone jump may fall back to the envelopes
       if (!b || n !== grantFillSeq) return;
       // sort is stable: the server's order holds among grants with and among grants without a refused call
       const rows = b.grants.slice().sort((x, y) => (grantRefused(y) ? 1 : 0) - (grantRefused(x) ? 1 : 0));
@@ -7595,6 +7596,156 @@
       slot.replaceChildren(head, ...said, ...(note ? [el("div", "consent-note ext-meta", note)] : []),
                            ...(why ? [el("div", "consent-note ext-meta grant-why", why)] : []),
                            ...rows.map((g) => grantCard(g, inert, signList)));
+    }).catch(() => {});
+  }
+  // Board row 153: the envelopes beside the grants, each live one ended with a passkey, the grant revoke's own ceremony
+  // (levain.coordinator.envelope_revoke.EnvelopeRevoke). /cockpit/envelope/list.json lists the envelopes and the passkeys
+  // that may revoke (a 404 is a cockpit with no signing: no card), then /cockpit/envelope/<id>/revoke-challenge ->
+  // navigator.credentials.get -> /revoke. The server builds and holds the message; the page recomputes the challenge from
+  // the text it is sent, so what the prompt signs is the text shown. Without a usable passkey the button copies the
+  // terminal line, as the grant card's does.
+  const ENVELOPE_LIST = "/cockpit/envelope/list.json";
+  let envelopeSaid = "";       // what the last revoke said, kept across the slot's redraw
+  function envelopeFetch() {
+    const headers = signHeaders(false);
+    if (!headers["X-Levain-Write-Token"]) return Promise.resolve(null);
+    return fetchBounded(ENVELOPE_LIST, { cache: "no-store", headers: headers },
+      (res) => (res.ok ? res.json().then((b) => (b && Array.isArray(b.envelopes) ? b : null), () => null) : null),
+      () => null);
+  }
+  // the bytes a passkey signs for `line` in the envelope-revoke namespace, as levain.consent.passkey.challenge builds them
+  function envelopeChallenge(line) {
+    const enc = (t) => new TextEncoder().encode(t);
+    const str = (b) => { const n = b.length, out = new Uint8Array(4 + n); out.set([n >>> 24 & 255, n >>> 16 & 255, n >>> 8 & 255, n & 255]); out.set(b, 4); return out; };
+    return crypto.subtle.digest("SHA-512", enc(line)).then((h) => {
+      const parts = [enc("SSHSIG"), str(enc("levain-envelope-revoke")), str(new Uint8Array(0)), str(enc("sha512")), str(new Uint8Array(h))];
+      const out = new Uint8Array(parts.reduce((n, p) => n + p.length, 0));
+      parts.reduce((at, p) => { out.set(p, at); return at + p.length; }, 0);
+      return out;
+    });
+  }
+  // "ends in 3 h 20 min", in the words a person says it
+  function envelopeWhen(iso) {
+    const t = Date.parse(iso);
+    if (!Number.isFinite(t)) return "";
+    const mins = Math.round((t - Date.now()) / 60000);
+    if (mins <= 0) return "ended";
+    if (mins < 60) return "ends in " + mins + " min";
+    if (mins < 48 * 60) return "ends in " + Math.floor(mins / 60) + " h" + (mins % 60 ? " " + (mins % 60) + " min" : "");
+    return "ends in " + Math.round(mins / 1440) + " days";
+  }
+  function envelopeCard(e, listing) {
+    const sv = (x) => (typeof x === "string" ? x : "");
+    const row = el("div", "row consent-row envelope-row");
+    row.setAttribute("data-envelope", sv(e.id));
+    const head = el("div", "consent-head");
+    head.appendChild(el("b", "consent-tool", sv(e.label) || sv(e.scope) || "envelope"));
+    head.appendChild(el("span", "ext-meta", envelopeWhen(sv(e.expires))));
+    row.appendChild(head);
+    const facts = el("div", "consent-facts");
+    if (sv(e.label) && sv(e.scope)) facts.appendChild(el("span", "ext-meta", sv(e.scope)));
+    facts.appendChild(el("span", "ext-meta", "until " + sv(e.expires)));
+    facts.appendChild(el("span", "ext-meta", sv(e.id).slice(0, 11)));
+    row.appendChild(facts);
+    const signers = Array.isArray(listing.signers) ? listing.signers : [];
+    const line = el("div", "consent-cmd envelope-sign");
+    const btn = el("button", "undo-btn envelope-revoke", "Revoke");
+    btn.type = "button";
+    if (signers.length && !signElsewhere(listing)) {
+      btn.title = "revoke with your passkey";
+      const note = el("span", "sign-note ext-meta");
+      const say = (text, kind) => { note.textContent = text; note.className = "sign-note ext-meta" + (kind ? " sign-" + kind : ""); };
+      btn.addEventListener("click", () => envelopeRevoke(e, signers, listing, btn, line, say));
+      line.append(btn, note);
+    } else {
+      const cmd = "levain envelope kill " + sv(e.id);
+      const code = el("code", "consent-code", cmd);
+      btn.dataset.label = btn.textContent;
+      btn.title = "copy the revoke command; run it in a terminal. This page signs nothing here";
+      btn.addEventListener("click", () => copyText(cmd, code, btn));
+      line.append(btn, code);
+    }
+    row.appendChild(line);
+    return row;
+  }
+  function envelopeRevoke(e, signers, listing, btn, host, say) {
+    if (signBusy) { say(SIGN_BUSY.replace("signed", "revoked"), "bad"); return; }
+    signBusy++;
+    btn.disabled = true;
+    const base = "/cockpit/envelope/" + encodeURIComponent(e.id) + "/";
+    const slot = host.closest(".envelope-slot");
+    let sent = false, revoked = false;
+    signWho({ signers: signers, origin: listing.origin, credentials: listing.credentials }, host, say).then((who) => {
+      if (!who) { say("nothing was revoked"); return; }
+      say("asking for the revoke to sign…");
+      return signCall(base + "revoke-challenge", { signer_fp: who.fp, instance: e.instance }).then((c) => {
+        if (!c.ok) { say("not revoked: " + signWhy(c), "bad"); return; }
+        // the server builds the message itself; one that does not name this envelope is not put to the passkey
+        if (typeof c.body.line !== "string" || c.body.line.indexOf("\nenvelope: " + e.id + "\n") < 0
+            || typeof c.body.challenge !== "string") {
+          say("not revoked: the text the server sent does not name this envelope, so nothing was signed", "bad");
+          return;
+        }
+        return envelopeChallenge(c.body.line).then((want) => {
+          if (signB64u(want) !== c.body.challenge) {
+            say("not revoked: the challenge the server sent is not over the text it shows, so nothing was signed", "bad");
+            return;
+          }
+          say("confirm with your passkey to end this envelope…");
+          const pk = { challenge: want, rpId: c.body.rp_id, userVerification: "required", timeout: 60000 };
+          return signAsk(pk, c.body.rp_id, who.fp, who.rawId).then((cred) => {
+            if (!cred || !cred.response) { say("not revoked: the passkey gave nothing to send; nothing was revoked", "bad"); return; }
+            say("verifying the signature…");
+            sent = true;
+            return signCall(base + "revoke", {
+              authenticator_data: signB64u(cred.response.authenticatorData), client_data_json: signB64u(cred.response.clientDataJSON),
+              signature: signB64u(cred.response.signature) }).then((r) => {
+              const refused = !r.ok && r.status >= 400 && r.status < 500 && r.body && typeof r.body.error === "string";
+              if (!r.ok && !refused) {
+                envelopeSaid = "result unknown for " + e.id + " (" + signWhy(r) + "): the envelopes were read again to show whether it is still live";
+                say(envelopeSaid, "bad");
+                return;
+              }
+              if (!r.ok) { envelopeSaid = "not revoked " + e.id + ": " + signWhy(r); say(envelopeSaid, "bad"); return; }
+              signKeep(c.body.rp_id, who.fp, cred);
+              revoked = true;
+              envelopeSaid = "revoked " + e.id.slice(0, 11);
+              say(envelopeSaid, "ok");
+            });
+          }, (err) => say(signDeclined(err, "nothing was revoked"), "bad"));
+        });
+      });
+    }).catch((err) => {
+      const name = (err && err.name) || "error";
+      if (sent) envelopeSaid = "result unknown for " + e.id + " (the page failed: " + name + "): the envelopes were read again to show where it stands";
+      say(sent ? envelopeSaid : "the page failed (" + name + "); nothing was revoked", "bad");
+    }).finally(() => {
+      signBusy--;
+      btn.disabled = false;
+      if (!sent && !revoked) return;
+      setTimeout(() => {
+        const live = slot && slot.isConnected ? slot : document.querySelector(".envelope-slot");
+        if (live) envelopeFill(live);
+      }, 1500);
+    });
+  }
+  function envelopeSlot() {
+    const slot = el("div", "envelope-slot");
+    envelopeFill(slot);
+    return slot;
+  }
+  let envelopeFillSeq = 0;     // the newest fill wins
+  function envelopeFill(slot) {
+    const n = ++envelopeFillSeq;
+    envelopeFetch().then((b) => {
+      if (!b || n !== envelopeFillSeq) return;       // no token, no route (no signing here), or a failed read: no card
+      const live = b.envelopes.filter((e) => e && e.state === "live");
+      const ended = b.envelopes.length - live.length;
+      const said = envelopeSaid ? [el("div", "consent-note ext-meta envelope-said", envelopeSaid)] : [];
+      const why = typeof b.note === "string" && b.note ? [el("div", "consent-note ext-meta envelope-why", b.note)] : [];
+      slot.replaceChildren(el("div", "ext-grouphead", "Envelopes"), ...said, ...why,
+        ...(live.length ? live.map((e) => envelopeCard(e, b)) : [el("div", "consent-note ext-meta envelope-empty", "No live envelopes")]),
+        ...(ended ? [el("div", "consent-note ext-meta", ended + " ended")] : []));
     }).catch(() => {});
   }
   // OS-2, the dispatch family: the live dispatch jobs as cards, each act (Sign, Cancel, Authorise) a button that opens the sign
@@ -8293,7 +8444,7 @@
   // the Decisions history's standing-rule slots (and the dispatch jobs), drawn together wherever the proposals are
   function standingSlots() {
     const f = document.createDocumentFragment();
-    f.append(proposalSlot(), grantSlot(), dispatchSlot());   // the drop is its own card under the Needs-you row (renderDropHero), not a slot here
+    f.append(proposalSlot(), grantSlot(), envelopeSlot(), dispatchSlot());   // the drop is its own card under the Needs-you row (renderDropHero), not a slot here
     return f;
   }
 
@@ -8967,8 +9118,13 @@
   // `slot`: where the tab's section sits once it is drawn; `filled`: the same node once its read has filled it (the grants heading
   // exists only with a grant under it)
   function phoneJumpFind(which, overlay) {
-    const head = Array.from(overlay.querySelectorAll(".ext-grouphead")).find((h) => /standing grants/i.test(h.textContent)) || null;
-    return { slot: head, filled: head };
+    const heads = Array.from(overlay.querySelectorAll(".ext-grouphead"));
+    const grants = heads.find((h) => /standing grants/i.test(h.textContent)) || null;
+    if (grants) return { slot: grants, filled: grants };
+    // no grant under a heading: once the grants' read has answered (its slot says so), the envelopes' heading is where the tab lands
+    const gs = overlay.querySelector(".grant-slot");
+    const env = gs && gs.dataset.filled ? heads.find((h) => /^envelopes$/i.test(h.textContent.trim())) || null : null;
+    return { slot: env, filled: env };
   }
   const phoneJumpDrawn = (n) => !!n && n.getClientRects().length > 0;
   // The filled node is scrolled to again until the view stops growing above it (steady looks at the same height), so a row that
