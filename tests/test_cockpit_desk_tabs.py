@@ -103,7 +103,7 @@ def test_a_dated_question_is_one_later_line_after_the_due_rows_and_is_not_counte
     assert got, vals
     g = got[-1]
     assert g["rows"] == 3 and g["tab"] == "Needs you (3)", g
-    assert len(g["later"]) == 1 and g["later"][0].startswith("LATER") and datetime.fromisoformat(day).strftime("%a") in g["later"][0], g
+    assert len(g["later"]) == 1 and datetime.fromisoformat(day).strftime("%a") in g["later"][0], g
     assert g["lastIsLater"] is True and g["controls"] == 0, g
 
 
@@ -245,3 +245,44 @@ def test_the_later_facets_are_a_real_day_and_bounded_words() -> None:
     for bad in ("", "x" * 41, "Tue\n11-10", "\x00", 5, "not a weekday", "Tue 13-01", "tue", "Tue 11-10 "):
         with pytest.raises(FacetValueError):
             validate_facets({"question_later_words": bad})
+
+
+# ---- LATER on a phone (Phill 11-08, iPhone screenshot): one header, then number | day | headline, nothing wrapped mid-token ----
+
+REAL_LATER = [
+    ("TALK: trans-allies-ohio: Mon 11-09 before 20:00: send Jeanne the upgrade notice on Signal, then take the pre-2404 Linode snapshot. Draft and steps are in RUNBOOK 5.", 1),
+    ("DECISION: flow: Friction day + prompts-logger session (also Levain C9 one-real-day run, C7 closed-lid test), moved to Mon 11-09 (469c). Start it?", 1),
+    ("levain: TUE 11-10: read Levain 1.0's release essay draft 2 and fill its 17 [[PHILL]] slots; it ships with 1.0. Your word 14:59: (a)", 2),
+]
+LATER_PROBE = """(() => { const rows = Array.from(document.querySelectorAll('#ck-needs .needs-later-line'));
+  const lines = (e) => Math.round(e.getBoundingClientRect().height / parseFloat(getComputedStyle(e).lineHeight || 16));
+  const sec = document.querySelector('#ck-needs .needs-later'), head = sec && sec.querySelector('.needs-later-head');
+  const lefts = rows.map(r => Math.round(r.querySelector('.needs-later-title').getBoundingClientRect().left));
+  return JSON.stringify({ marks: document.querySelectorAll('#ck-needs .needs-later-mark').length, head: head ? head.textContent : null,
+    n: rows.length, docW: document.documentElement.scrollWidth, winW: window.innerWidth,
+    oneLine: rows.every(r => [r.querySelector('.needs-later-band'), r.querySelector('.needs-later-text')].every(e => e.getBoundingClientRect().height < 1.6 * parseFloat(getComputedStyle(e).fontSize) * 1.5)),
+    lefts: lefts, titles: rows.map(r => r.querySelector('.needs-later-title').textContent) }); })()"""
+
+
+@needs_browser
+def test_later_on_a_phone_is_one_header_and_aligned_rows(tmp_path: Path, monkeypatch) -> None:
+    import os
+    _later_home(tmp_path, monkeypatch, REAL_LATER)
+    _root, src, _ids = _install(tmp_path)
+    shots = os.environ.get("LEVAIN_LATER_SHOTS")
+    shot = lambda n, w: ([{"eval": "document.querySelector('#ck-needs .needs-later').scrollIntoView({block: 'center'}); 1"},
+                          {"eval": "new Promise(r => setTimeout(r, 300)).then(() => 1)"}, {"shot": str(Path(shots) / n), "full": False}] if shots else [])
+    if shots:
+        Path(shots).mkdir(parents=True, exist_ok=True)
+    ready = "document.querySelectorAll('#ck-needs .needs-later-line').length === 3 && Array.from(document.querySelectorAll('#ck-needs .needs-later-title')).every(e => e.textContent)"
+    with _serve(src, surface_tokens={"browser": "T"}, install_class="reported") as (url, _httpd):
+        vals = _drive(tmp_path, f"{url}/#write_token=T", [
+            {"emulate": {"w": 390, "h": 844, "dpr": 2, "mobile": True}}, {"until": READY_ANY, "ms": 20000}, {"until": ready, "ms": 20000},
+            {"eval": LATER_PROBE}, *shot("narrow.png", 390),
+            {"emulate": {"w": 1440, "h": 900, "dpr": 1}}, {"until": ready, "ms": 20000}, *shot("wide.png", 1440)])["values"]
+    g = json.loads(next(v for v in vals if isinstance(v, str) and v.startswith('{"marks"')))
+    assert g["marks"] == 0 and g["n"] == 3 and g["head"] and g["head"].lower().startswith("later") and g["head"].endswith("3"), g
+    assert g["oneLine"] and g["docW"] <= g["winW"], g                       # the number and the day never wrap, and the page does not scroll sideways
+    assert len(set(g["lefts"])) == 1, g                                    # the headline column lines up across rows
+    for t in g["titles"]:                                                  # a cut is on a word boundary, never inside "[[PHILL]]"
+        assert not t.rstrip("…").endswith("[[PHI") and ("[[" not in t or "]]" in t), t

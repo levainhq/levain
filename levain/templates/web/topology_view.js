@@ -119,10 +119,12 @@
     return JSON.stringify([l, sane, Array.from(shownAll), replaySig()]);       // T is in it: two instants repaint even when the value reads alike
   }
   // one OS-level observer at a time: the card calls this before it replaces its children
+  let resizeOff = null;     // removes the one window resize listener the Agents lens holds (a repaint must not stack another)
   function release() {
     if (linkObserver) { linkObserver.disconnect(); linkObserver = null; }
     if (streamStop) { streamStop(); streamStop = null; }
     if (ticker) { root.clearInterval(ticker); ticker = null; }
+    if (resizeOff) { resizeOff(); resizeOff = null; }
   }
 
   // ---- small formatters ----
@@ -1330,8 +1332,8 @@
   const GRAPH_MIN_REM = 12, GRAPH_MAX_VH = 0.9, GRIP_STEP = 24;
   function remPx() { try { return parseFloat(root.getComputedStyle(root.document.documentElement).fontSize) || 16; } catch (_) { return 16; } }
   function clampGraphH(h) {
-    const vh = root.innerHeight || 800, min = GRAPH_MIN_REM * remPx();
-    return Math.round(Math.max(min, Math.min(vh * GRAPH_MAX_VH, h)));
+    const vh = root.innerHeight || 800, max = vh * GRAPH_MAX_VH, min = Math.min(GRAPH_MIN_REM * remPx(), max);   // a viewport shorter than the minimum: the 90vh ceiling wins
+    return Math.round(Math.max(min, Math.min(max, h)));
   }
   function storedGraphH() { try { const n = parseFloat(root.localStorage.getItem(GRAPH_H_KEY)); return n > 0 ? n : 0; } catch (_) { return 0; } }
   function keepGraphH(h) { try { root.localStorage.setItem(GRAPH_H_KEY, String(Math.round(h))); } catch (_) { /* the page still resized */ } }
@@ -1362,39 +1364,63 @@
     grip.title = "Drag to set the graph height. Double-click for the default.";
     wrap.appendChild(grip);
     const gripHeight = () => { const h = storedGraphH(); return h ? clampGraphH(h) : 0; };
+    let centreOn = false;                                   // centreOn: keep centring after each rebuild until the reader scrolls it themselves
+    const centreGraph = () => {                                          // keep the graph's middle in the middle of the box (a shrink must not leave a node cut at the bottom)
+      if (!svgNode || !stage.isConnected) return;
+      const ch = stage.clientHeight, sr = svgNode.getBoundingClientRect(), sh = sr.height, pm = parseFloat(svgNode.style.marginTop) || 0;   // (an svg has no offsetTop: its top in the stage's scroll space is measured)
+      const m = sh < ch - 2 ? Math.round((ch - sh) / 2) : 0;           // content smaller than the box: centred by a margin (the particle canvas follows the svg)
+      svgNode.style.marginTop = m ? m + "px" : ""; canvas.style.top = m ? m + "px" : "";
+      stage.scrollTop = m ? 0 : Math.max(0, Math.round(sr.top - stage.getBoundingClientRect().top - stage.clientTop + stage.scrollTop - pm + sh / 2 - ch / 2));
+      centreOn = true;
+    };
     const applyGraphH = () => {                                          // a stored height is an explicit height that replaces max-height; the phone and the default have none
       const h = stage.classList.contains("tv-phone") ? 0 : gripHeight();
       stage.style.height = h ? h + "px" : "";
       stage.style.maxHeight = h ? "none" : "";
       grip.setAttribute("aria-valuenow", String(Math.round(h || stage.getBoundingClientRect().height)));
+      const vmax = (root.innerHeight || 800) * GRAPH_MAX_VH;
+      grip.setAttribute("aria-valuemin", String(Math.round(Math.min(GRAPH_MIN_REM * remPx(), vmax)))); grip.setAttribute("aria-valuemax", String(Math.round(vmax)));
     };
-    const setGraphH = (h, persist) => { stage.style.height = h + "px"; stage.style.maxHeight = "none"; grip.setAttribute("aria-valuenow", String(Math.round(h))); if (persist) keepGraphH(h); };
-    let dragFrom = null;
+    const setGraphH = (h, persist) => { stage.style.height = h + "px"; stage.style.maxHeight = "none"; grip.setAttribute("aria-valuenow", String(Math.round(h))); if (persist) keepGraphH(h); centreGraph(); };
+    let dragFrom = null, needCentre = !!gripHeight();
+    for (const t of ["wheel", "touchmove", "pointerdown"]) stage.addEventListener(t, () => { centreOn = false; }, { passive: true });   // the reader's own scroll ends the centring (a rebuild's own scroll clamp is not theirs)
     grip.addEventListener("pointerdown", (ev) => {
       if (ev.button > 0) return;
       ev.preventDefault();
-      dragFrom = { y: ev.clientY, h: stage.getBoundingClientRect().height };
+      if (dragFrom) return;                                              // a second finger does not take the drag over
+      dragFrom = { y: ev.clientY, h: stage.getBoundingClientRect().height, id: ev.pointerId, moved: false };
+      try { grip.focus({ preventScroll: true }); } catch (_) { /* the arrow keys then need a Tab first */ }
       try { grip.setPointerCapture(ev.pointerId); } catch (_) { /* a synthetic pointer has no capture: the move still arrives */ }
       grip.classList.add("tv-grip-on");
     });
-    grip.addEventListener("pointermove", (ev) => { if (dragFrom) setGraphH(clampGraphH(dragFrom.h + ev.clientY - dragFrom.y), false); });
+    grip.addEventListener("pointermove", (ev) => {
+      if (!dragFrom || ev.pointerId !== dragFrom.id) return;
+      if (ev.clientY !== dragFrom.y) dragFrom.moved = true;
+      setGraphH(clampGraphH(dragFrom.h + ev.clientY - dragFrom.y), false);
+    });
     const endDrag = (ev) => {
-      if (!dragFrom) return;
-      const h = clampGraphH(dragFrom.h + ev.clientY - dragFrom.y);
+      if (!dragFrom || ev.pointerId !== dragFrom.id) return;
+      const h = clampGraphH(dragFrom.h + ev.clientY - dragFrom.y), moved = dragFrom.moved;
       dragFrom = null; grip.classList.remove("tv-grip-on");
-      setGraphH(h, true);
+      if (moved) setGraphH(h, true);                                     // a click with no movement pins nothing
     };
     grip.addEventListener("pointerup", endDrag);
-    grip.addEventListener("pointercancel", () => { dragFrom = null; grip.classList.remove("tv-grip-on"); });
-    grip.addEventListener("dblclick", () => { dragFrom = null; clearGraphH(); applyGraphH(); });
+    grip.addEventListener("pointercancel", (ev) => {                       // a cancelled drag is reverted to the stored (or default) height, never left half-applied
+      if (!dragFrom || ev.pointerId !== dragFrom.id) return;
+      dragFrom = null; grip.classList.remove("tv-grip-on"); applyGraphH();
+    });
+    grip.addEventListener("dblclick", () => { dragFrom = null; clearGraphH(); applyGraphH(); centreGraph(); });
     grip.addEventListener("keydown", (ev) => {
       const d = ev.key === "ArrowUp" ? -GRIP_STEP : ev.key === "ArrowDown" ? GRIP_STEP : 0;
       if (!d) return;
       ev.preventDefault();
       setGraphH(clampGraphH(stage.getBoundingClientRect().height + d), true);
     });
-    const onWinResize = () => { if (!stage.isConnected) { root.removeEventListener("resize", onWinResize); return; } applyGraphH(); };
-    if (typeof root.addEventListener === "function") root.addEventListener("resize", onWinResize);
+    const onWinResize = () => { if (!stage.isConnected) { root.removeEventListener("resize", onWinResize); return; } if (!dragFrom) { applyGraphH(); centreGraph(); } };
+    if (typeof root.addEventListener === "function") {
+      root.addEventListener("resize", onWinResize);
+      resizeOff = () => root.removeEventListener("resize", onWinResize);     // release() takes it off at the next repaint
+    }
     lastStage = stage;
     stage.addEventListener("scroll", () => { if (stage.isConnected) stageScroll = { top: stage.scrollTop, left: stage.scrollLeft }; });
     const restoreScroll = () => {
@@ -1471,6 +1497,7 @@
       stage.dataset.nodes = String(arr(v.nodes).length);
       built = true;
       restoreScroll();
+      if ((needCentre || centreOn) && stage.isConnected && stage.clientHeight) { needCentre = false; centreGraph(); }             // a stored height on load: the graph opens centred in its box
       if (reanchorPin) reanchorPin();
       restoreFocus();
     };

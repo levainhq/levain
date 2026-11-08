@@ -107,3 +107,48 @@ def test_a_phone_has_no_grip_and_ignores_a_stored_height(tmp_path, monkeypatch):
     out = _run(tmp_path, src, [*PRIME, {"eval": "localStorage.setItem('%s', '300'); 1" % KEY}, {"eval": _paint(_many(80), "agents")}, WAIT, _mark()], first=NARROW)
     (m,) = _states(out)
     assert m["phone"] and not m["grip"] and m["h"] == "", m
+
+
+# --- L3 r1 + desk cosmetic: centred after a resize, a click pins nothing, one resize listener ---------------------------------------------
+
+CENTRE = ("JSON.stringify({kind: 'st', off: (() => { const s = %s, g = s.querySelector('svg.tv-graph'), a = s.getBoundingClientRect(), b = g.getBoundingClientRect(); "
+          "return (b.top + b.height / 2) - (a.top + s.clientTop + s.clientHeight / 2); })(), box: %s.clientHeight, scroll: %s.scrollTop})") % (ST, ST, ST)
+
+
+@needs_browser
+def test_a_shrunk_box_keeps_the_graph_centred(tmp_path, monkeypatch):
+    """Desk cosmetic: shrinking with the grip must not leave the content scrolled off its middle (a node cut at the bottom); a stored height centres on load."""
+    out = _go(tmp_path, monkeypatch, [{"eval": _drag(-200)}, WAIT, {"eval": CENTRE},
+                                      {"eval": "localStorage.setItem('%s', '300'); 1" % KEY}, {"eval": _paint(_many(80), "agents")}, WAIT, {"eval": CENTRE}])
+    shrunk, loaded = _states(out)
+    assert abs(shrunk["off"]) <= 6 and abs(loaded["off"]) <= 6, (shrunk, loaded)
+
+
+@needs_browser
+def test_a_small_graph_in_a_tall_box_is_centred(tmp_path, monkeypatch):
+    _root, src = _sessions_fixture(tmp_path, monkeypatch)
+    out = _run(tmp_path, src, [*PRIME, {"eval": "localStorage.setItem('%s', '700'); 1" % KEY}, {"eval": _paint(_many(1), "agents")}, WAIT, {"eval": CENTRE}], first=DESKTOP)
+    (c,) = _states(out)
+    assert abs(c["off"]) <= 6, c
+
+
+@needs_browser
+def test_a_click_without_movement_pins_no_height(tmp_path, monkeypatch):
+    """L3 r1 (4 seats, MED): a plain click on the grip stored the current height and fixed the box until a double-click."""
+    click = ("(() => { const g = %s, r = g.getBoundingClientRect(), x = r.left + 5, y = r.top + 5; "
+             "const e = (t) => g.dispatchEvent(new PointerEvent(t, {bubbles: true, pointerId: 7, button: 0, clientX: x, clientY: y})); e('pointerdown'); e('pointerup'); return 1; })()") % GRIP
+    out = _go(tmp_path, monkeypatch, [{"eval": click}, _mark()])
+    (m,) = _states(out)
+    assert m["stored"] is None and m["h"] == "" and m["mh"] == "", m
+
+
+@needs_browser
+def test_repaints_do_not_stack_resize_listeners(tmp_path, monkeypatch):
+    """L3 r1 (4 seats, HIGH/MED): each Agents repaint added a window resize listener only a resize removed."""
+    count = ("(() => { let n = 0; const add = window.addEventListener, rm = window.removeEventListener; "
+             "window.__rs = 0; window.addEventListener = function (t, ...a) { if (t === 'resize') window.__rs++; return add.call(this, t, ...a); }; "
+             "window.removeEventListener = function (t, ...a) { if (t === 'resize') window.__rs--; return rm.call(this, t, ...a); }; return 1; })()")
+    out = _go(tmp_path, monkeypatch, [{"eval": count}, {"eval": _paint(_many(80), "agents")}, {"eval": _paint(_many(80), "agents")}, {"eval": _paint(_many(80), "agents")},
+                                      WAIT, {"eval": "JSON.stringify({kind: 'st', n: window.__rs})"}])
+    (m,) = _states(out)
+    assert m["n"] <= 1, m

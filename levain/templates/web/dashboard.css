@@ -3644,8 +3644,14 @@ a.nc-pick.is-rec:hover { border-color: var(--text); }
 .vc-check { width: 24px; height: 24px; }
 .voice-ctl { display: inline-flex; align-items: center; gap: var(--sp-3); }
 .voice-btn { min-height: var(--hit-min, 44px); }
-.needs-later { display: flex; flex-direction: column; gap: 2px; padding: 4px 2px; }
-.needs-later-line { display: flex; gap: 6px; align-items: baseline; }
+/* LATER: one header (label + count, like Just answered), then a grid of number | day | headline; the row wrappers dissolve so the columns line up across rows */
+.needs-later { display: grid; grid-template-columns: max-content max-content minmax(0, 1fr); column-gap: var(--sp-3); row-gap: var(--sp-2); align-items: baseline; padding: 4px 2px; }
+.needs-later-head { grid-column: 1 / -1; display: flex; align-items: center; gap: var(--sp-2); }
+.needs-later-head .needs-sec-label { margin-top: 0; }
+.needs-later-line { display: contents; }
+.needs-later-line .needs-later-band, .needs-later-line .needs-later-text { white-space: nowrap; }
+.needs-later-line .needs-later-title { overflow-wrap: anywhere; display: -webkit-box; -webkit-box-orient: vertical; -webkit-line-clamp: 2; line-clamp: 2; overflow: hidden; }
+.needs-later-line .needs-later-band[hidden] { display: block; visibility: hidden; }   /* an unnumbered row keeps its column, so the rest still line up */
 
 /* The List (the Tray's wire id `tray` stays): the surface chips, the one-line intake box and its receipt. */
 .list-surfaces { display: flex; flex-wrap: wrap; gap: var(--sp-2); margin: 0 0 var(--sp-3); }

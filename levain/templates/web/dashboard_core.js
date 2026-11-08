@@ -6226,6 +6226,13 @@
     const bk = (it) => { const b = cardBandNum(it.q.n); return Number(b === undefined ? it.q.n : b); };
     return out.sort((a, b) => (a.later < b.later ? -1 : a.later > b.later ? 1 : bk(a) - bk(b)));
   }
+  // the headline is cut on a word boundary (never mid-token); the page's 2-line clamp does the rest
+  function needsLaterCut(t) {
+    t = String(t);
+    if (t.length <= 160) return t;
+    const c = t.slice(0, 160), i = c.lastIndexOf(" ");
+    return (i > 80 ? c.slice(0, i) : c).replace(/[\s,;:]+$/, "") + "\u2026";
+  }
   function needsLaterLine(it) {
     const row = el("div", "needs-later-line band-later");
     row.dataset.needsLater = String(it.q.n);
@@ -6236,11 +6243,11 @@
     tag.hidden = bn === undefined;
     const words = el("span", "ext-meta needs-later-text", it.q.laterWords || it.q.later);
     const title = el("span", "ext-meta needs-later-title", "");
-    row.append(el("span", "ext-meta needs-later-mark", "LATER"), tag, words, title);
+    row.append(tag, words, title);        // no per-row LATER word: the section's one header says it (a narrow screen wrapped it "LAT / ER")
     questionBody(it.q, row).then((b) => {
       if (!b || b.error) return;
       const first = needsFirstSentence(b.what);
-      if (first) title.textContent = " \u00b7 " + (first.replace(/^\s*DESK OWES:\s*/i, "") || first).slice(0, 80);
+      if (first) title.textContent = needsLaterCut(first.replace(/^\s*DESK OWES:\s*/i, "") || first);
     });
     return row;
   }
@@ -6830,7 +6837,14 @@
       sec.append(toggle, body);
       return sec;
     };
-    const laterSection = (rows) => { const sec = el("div", "needs-later"); for (const it of rows) sec.appendChild(needsLaterLine(it)); return sec; };
+    const laterSection = (rows) => {
+      const sec = el("div", "needs-later");
+      const hd = el("div", "needs-later-head");       // one header like Just answered's: the label and the count, then the rows
+      hd.append(el("span", "needs-sec-label", "Later"), el("span", "needs-answered-n", String(rows.length)));
+      sec.appendChild(hd);
+      for (const it of rows) sec.appendChild(needsLaterLine(it));
+      return sec;
+    };
     // each tab draws its own LATER lines: a "you" row never sits in the Desk owes tab, nor a desk one in Needs you
     const laterShown = prefs.tab === "desk" ? laterDesk : laterYou;
     if (!items.length && !desk.length && !laterYou.length && !laterDesk.length) {
