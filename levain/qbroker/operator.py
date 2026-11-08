@@ -46,8 +46,8 @@ from levain.qbroker.broker import (RUN_CALLS_KIND, RUN_DEADLINE_KIND, RUN_STATE_
 from levain.qbroker.receipts import Receipts, ReceiptsError
 from levain.qbroker.seam import answer_refusal
 from levain.qbroker.signers import SignersSnapshot
-from levain.qbroker.store import (ANSWER_ROW_FORMAT, ROW_MAX, QueueStore, _parsed, _read_untrusted,
-                                  _read_untrusted_stamped, fsync_dir, valid_request_id)
+from levain.qbroker.store import (ANSWER_ROW_FORMAT, ROW_MAX, QueueStore, _parsed, _read_untrusted, fsync_dir,
+                                  valid_request_id)
 
 __all__ = ["CLAIM_KEYS", "Listed", "OperatorError", "answer_payload", "rows", "run_state", "write_answer"]
 
@@ -145,7 +145,7 @@ def rows(root: Path | str, *, now: datetime | None = None, signers: SignersSnaps
             received_at=request.received_at, expires_at=request.expires_at,
             state=_state(recorded.get(rid), request.expires_at, stamp),
             answered=signers is not None and store.has_answer(rid)
-            and _signed_answer(row, store.answers / f"{rid}.json", signers, when, ssh_keygen)[0],
+            and _signed_answer(row, store.answers / f"{rid}.json", signers, when, ssh_keygen),
             claims={k: getattr(request, k) for k in CLAIM_KEYS}))
     return sorted(out, key=lambda r: (r.received_at, r.request_id))
 
@@ -251,27 +251,28 @@ def write_answer(root: Path | str, request_id: str, payload: Mapping[str, Any], 
 
 
 def _signed_answer(row: Mapping[str, Any], path: Path, signers: SignersSnapshot | None, now: datetime,
-                   ssh_keygen: Path | str | None) -> tuple[bool, tuple[int, int] | None]:
-    """Whether ``path`` holds a signed answer for the request ``row`` holds, with the (dev, ino) of the file judged
-    (``None`` when nothing was opened: a symlink, a non-regular file, an unreadable one, or none)."""
+                   ssh_keygen: Path | str | None) -> bool:
+    """Whether ``path`` holds a signed answer for the request ``row`` holds (False for a symlink, a non-regular
+    file, an unreadable one, or none)."""
     try:
-        got = _read_untrusted_stamped(path)
+        got = _read_untrusted(path)
     except (ValueError, OSError):
-        return False, None
+        return False
     if got is None:
-        return False, None
+        return False
     try:
-        answer = _parsed(got[0])
+        answer = _parsed(got)
     except ValueError:
-        return False, got[1][:2]
-    return answer_row_refusal(row, answer, signers, now, ssh_keygen=ssh_keygen) is None, got[1][:2]
+        return False
+    return answer_row_refusal(row, answer, signers, now, ssh_keygen=ssh_keygen) is None
 
 
 def _clear_squat(store: QueueStore, row: Mapping[str, Any], request_id: str, path: Path,
                  signers: SignersSnapshot | None, now: datetime, ssh_keygen: Path | str | None) -> bool:
     """True when ``path`` holds a signed answer (left in place). Otherwise whatever is there is renamed aside and
-    False is returned, for the caller to link its own answer again. Should the thing renamed turn out not to be the
-    thing judged (swapped in between) and be a signed answer, it is linked back; should the name be taken again
+    False is returned, for the caller to link its own answer again. What the rename moved is judged again from its
+    own fd, never assumed to be the thing judged at the name (a swap in between, or a freed inode reused, makes
+    them differ while the name or the (dev, ino) look the same); should it be a signed answer, it is linked back; should the name be taken again
     before it can be, :class:`OperatorError` names the quarantine file that holds it. A signed answer is never left
     in quarantine unreported.
 
@@ -286,26 +287,15 @@ def _clear_squat(store: QueueStore, row: Mapping[str, Any], request_id: str, pat
 
 def _clear_squat_os(store: QueueStore, row: Mapping[str, Any], request_id: str, path: Path,
                     signers: SignersSnapshot | None, now: datetime, ssh_keygen: Path | str | None) -> bool:
-    try:
-        before = os.lstat(path)
-    except FileNotFoundError:
-        return False
-    signed, judged = _signed_answer(row, path, signers, now, ssh_keygen)
-    if signed:
+    if _signed_answer(row, path, signers, now, ssh_keygen):
         return True
-    if judged is None:
-        judged = (before.st_dev, before.st_ino)
     aside = store.answers / f".quarantine-{request_id}-{os.urandom(8).hex()}.json"
     try:
         os.rename(path, aside)
     except FileNotFoundError:
         return False
     fsync_dir(store.answers)
-    try:
-        moved = os.lstat(aside)
-    except FileNotFoundError:
-        return False
-    if (moved.st_dev, moved.st_ino) != judged and _signed_answer(row, aside, signers, now, ssh_keygen)[0]:
+    if _signed_answer(row, aside, signers, now, ssh_keygen):
         try:
             os.link(aside, path, follow_symlinks=False)
         except FileExistsError:

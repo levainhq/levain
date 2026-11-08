@@ -129,7 +129,7 @@ def test_a_signed_answer_swapped_in_between_the_check_and_the_move_is_linked_bac
     def stale_once(row, path, *a):
         calls.append(path)
         if len(calls) == 1:                                      # the check saw some other file at the name
-            return False, (0, 0)
+            return False
         return real(row, path, *a)
 
     monkeypatch.setattr(operator, "_signed_answer", stale_once)
@@ -188,7 +188,7 @@ def test_a_swapped_signed_answer_that_vanishes_before_it_is_linked_back_frees_th
 
     def stale_once(row, path, *a):
         calls.append(path)
-        return (False, (0, 0)) if len(calls) == 1 else real_judge(row, path, *a)
+        return False if len(calls) == 1 else real_judge(row, path, *a)
 
     def vanished(src, dst, **kw):
         if ".quarantine-" in str(src):
@@ -224,7 +224,7 @@ def test_a_swapped_signed_answer_that_cannot_be_linked_back_is_reported_with_its
 
     def stale_once(row, path, *a):
         calls.append(path)
-        return (False, (0, 0)) if len(calls) == 1 else real_judge(row, path, *a)
+        return False if len(calls) == 1 else real_judge(row, path, *a)
 
     def retaken(src, dst):
         real_rename(src, dst)
@@ -304,3 +304,62 @@ def test_a_session_at_its_cap_with_junk_is_busy_and_logs_one_line_per_refusal_ki
     assert sorted(seen) == sorted(rids)                  # every held row had to be checked to know the cap is full
     lines = [r for r in caplog.records if r.name == "levain.qbroker"]
     assert len(lines) == 1 and all(rid in lines[0].getMessage() for rid in rids), [r.getMessage() for r in lines]
+
+
+# --- prel3fix L3 r1 B1: whatever the rename moved is judged from its own fd before the new answer goes in -----------
+
+def test_a_signed_answer_hidden_from_the_check_by_a_swap_and_restored_before_the_move_is_linked_back(L, broker, keys,
+                                                                                                    answers,
+                                                                                                    monkeypatch):
+    rid = filed(broker)
+    write_answer(L, rid, keys["operator"], decision="deny")      # another writer's signed answer
+    name = answers / f"{rid}.json"
+    first = name.read_bytes()
+    hidden = answers / "hidden.json"
+    real, calls = operator._signed_answer, []
+
+    def swapped_once(row, path, *a):
+        calls.append(path)
+        if len(calls) > 1:
+            return real(row, path, *a)
+        os.rename(name, hidden)                  # codex-4: a symlink at the name while the check opens it ...
+        os.symlink(hidden, name)
+        try:
+            return real(row, path, *a)
+        finally:
+            os.unlink(name)
+            os.rename(hidden, name)              # ... and the signed answer back before the rename moves it
+
+    monkeypatch.setattr(operator, "_signed_answer", swapped_once)
+    payload, sig = rbase.signed(L, rid, keys["operator"])
+    with pytest.raises(operator.OperatorError, match="already has an answer row"):
+        operator.write_answer(L / "queue", rid, payload, sig, rbase.snapshot(L), now=LATER)
+    assert name.read_bytes() == first
+    assert sorted(p.name for p in answers.iterdir()) == [name.name]
+    assert ask(broker, rid)["decision"] == "deny"
+
+
+def test_a_signed_answer_on_the_inode_the_check_judged_is_linked_back(L, broker, keys, answers, monkeypatch):
+    rid = filed(broker)
+    write_answer(L, rid, keys["operator"], decision="deny")
+    name = answers / f"{rid}.json"
+    signed_bytes = name.read_bytes()
+    name.write_bytes(b"not an answer")           # junk, on the inode the signed answer will hold
+    real, calls = operator._signed_answer, []
+
+    def rewritten_once(row, path, *a):
+        calls.append(path)
+        got = real(row, path, *a)
+        if len(calls) == 1:
+            # complement-4: the junk judged is gone and a signed answer holds its (dev, ino), as a filesystem reusing
+            # the freed inode would give it
+            name.write_bytes(signed_bytes)
+        return got
+
+    monkeypatch.setattr(operator, "_signed_answer", rewritten_once)
+    payload, sig = rbase.signed(L, rid, keys["operator"])
+    with pytest.raises(operator.OperatorError, match="already has an answer row"):
+        operator.write_answer(L / "queue", rid, payload, sig, rbase.snapshot(L), now=LATER)
+    assert name.read_bytes() == signed_bytes
+    assert sorted(p.name for p in answers.iterdir()) == [name.name]
+    assert ask(broker, rid)["decision"] == "deny"
