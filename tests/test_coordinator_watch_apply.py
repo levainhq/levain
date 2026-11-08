@@ -116,3 +116,36 @@ def test_watch_once_applies_beside_its_own_work_and_is_unchanged_without_reports
     after = launch.watch_once(consent)
     assert after[:len(before)] == before and any("applied 1" in line for line in after[len(before):])
     assert [r[0] for r in _rows(board, "SELECT report_id FROM worker_attach")] == ["r-1"]
+
+
+# ------------------------------------------------------------------------------------------------ the public service lease
+def test_service_claim_refuses_a_live_coordinator_lease_and_hands_back_the_holder(board, coord):
+    from levain.coordinator import lease
+    store, token, _ = coord
+    with store._write("service", None, create=False) as (conn, now):
+        got, held = lease.service_claim(conn, now, cause="test")
+    assert got is None and held is not None and held.token == token
+    assert _rows(board, "SELECT count(*) FROM lease_events WHERE holder = 'service'") == [(0,)]
+
+
+def test_service_claim_takes_a_free_lease_and_service_release_gives_it_back(board, coord):
+    from levain.coordinator import lease
+    store, _, _ = coord
+    store.coord_release()
+    with store._write("service", None, create=False) as (conn, now):
+        got, held = lease.service_claim(conn, now, cause="test")
+    assert held is None and isinstance(got, int)
+    assert store.coord_lease().holder == "service"
+    with store._write("service", None, create=False) as (conn, now):
+        assert lease.service_release(conn, now, got, cause="test done") is True
+    assert store.coord_lease() is None
+
+
+def test_service_release_does_not_release_a_lease_it_does_not_hold(board, coord):
+    from levain.coordinator import lease
+    store, token, _ = coord
+    with store._write("service", None, create=False) as (conn, now):
+        assert lease.service_release(conn, now, token, cause="test") is False
+        assert lease.service_release(conn, now, token + 99, cause="test") is False
+    assert store.coord_lease().token == token
+    assert _rows(board, "SELECT count(*) FROM lease_events WHERE kind = 'release'") == [(0,)]
