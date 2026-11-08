@@ -124,13 +124,16 @@ def make_transport(vm: str, profile: HostProfile, askpass_dir: Path):
     when the agent does not answer and the profile allows the fallback."""
     _clone_guard(vm)
     if profile.transport == "ssh":
-        return make_ssh(vm, askpass_dir, profile)
-    if profile.transport != "tart_exec":
+        pair, kind = make_ssh(vm, askpass_dir, profile), "ssh"
+    elif profile.transport != "tart_exec":
         raise ValueError(f"unknown transport {profile.transport!r} in profile {profile.name!r}")
-    if agent_answers(vm) or not profile.ssh_fallback:
-        return make_tart_exec(vm)
-    print(f"vm_run: guest agent of {vm} did not answer; falling back to ssh as {profile.ssh_user}", file=sys.stderr)
-    return make_ssh(vm, askpass_dir, profile)
+    elif agent_answers(vm) or not profile.ssh_fallback:
+        pair, kind = make_tart_exec(vm), "tart_exec"
+    else:
+        print(f"vm_run: guest agent of {vm} did not answer; falling back to ssh as {profile.ssh_user}", file=sys.stderr)
+        pair, kind = make_ssh(vm, askpass_dir, profile), "ssh"
+    pair[0].kind = kind        # the selection, for a caller that must open a second channel (a stdin runner) the same way
+    return pair
 
 
 def main(argv: list[str]) -> int:
