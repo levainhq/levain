@@ -51,7 +51,12 @@ def run_ticket(job_id, run, *, route=None, model="glm-5") -> dict:
 def vrun(job_id="dj-" + "0" * 32, run=0, entry=None) -> VerifierRun:
     return VerifierRun(job_id=job_id, run=run, session=f"v-{run}", ticket=f"t-{run}", verifier=entry or ENTRY,
                        steps=STEPS, driver_input_digest=ENTRY["driver_input_digest"],
-                       input_bundle_digest="sha256:" + "e" * 64, run_ticket=run_ticket(job_id, run))
+                       input_bundle_digest="sha256:" + "e" * 64)
+
+
+def ticket_for(job_id, run):
+    """The fixture's supervisor-owned ``ticket_for(job_id, run_index)``: run ``run``'s executor ticket as minted."""
+    return run_ticket(job_id, run)
 
 
 def body(verdicts=("pass", "pass"), **over) -> dict:

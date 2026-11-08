@@ -1018,6 +1018,7 @@ def verify(store, repo, job, run=0, *, verdicts=("pass", "pass"), entry=None, ra
         raw, digest = tvr.envelope(r, tvr.body(verdicts))
         ev = ev or tvr.event(r, at=VERIFIED_AT, verifier_report_digest=digest)
     kw.setdefault("routemap", tvr.routemap)
+    kw.setdefault("ticket_for", tvr.ticket_for)
     return store.record_verification(r, envelope=raw, event=ev or tvr.event(r, at=VERIFIED_AT), repo=str(repo[0]),
                                      tree=kw.pop("tree", base_tree(repo)), model=kw.pop("model", model(run)), **kw)
 

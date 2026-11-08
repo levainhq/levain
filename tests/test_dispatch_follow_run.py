@@ -82,7 +82,8 @@ def test_control_down_backs_off_doubling_then_resumes_and_converges(store, repo,
             servers.append(server)
 
     waits = Waits(then=then)
-    f = F.EventFollower.at(store, path, d.resolve, read_deadline=0.5, routemap=tvr.routemap)
+    f = F.EventFollower.at(store, path, d.resolve, read_deadline=0.5, routemap=tvr.routemap,
+                           ticket_for=tvr.ticket_for)
     runner = FR.FollowRunner(f, first_s=1.0, max_s=8.0, lasting_s=100.0, wait=waits)
     t = in_thread(runner)
     try:

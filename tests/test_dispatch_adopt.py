@@ -876,14 +876,13 @@ def test_a_land_reads_the_records_the_verifier_wrote_and_takes_none_from_its_cal
         e = {k: v for k, v in tc.BB_ENTRY.items() if k not in ("steps", "driver_input")}   # the run carries the entry without the registry-only fields
         r = VerifierRun(job_id=j.id, run=i, session=f"v-{i}", ticket=f"t-{i}", verifier=e,
                         steps=tuple(tc.BB_ENTRY["steps"]),
-                        driver_input_digest=e["driver_input_digest"], input_bundle_digest="sha256:" + "e" * 64,
-                        run_ticket=tvr.run_ticket(j.id, i))
+                        driver_input_digest=e["driver_input_digest"], input_bundle_digest="sha256:" + "e" * 64)
         raw, digest = tvr.envelope(r, tvr.body(("pass",)))
         j = jstore.record_verification(r, envelope=raw, event=tvr.event(r, at=VERIFIED_AT,
                                                                          verifier_report_digest=digest),
                                         repo=str(path), tree=tree,
                                         model={"requested": "glm-5", "answered": "glm-5", "backend_identity": f"b{i}"},
-                                        routemap=tvr.routemap)
+                                        routemap=tvr.routemap, ticket_for=tvr.ticket_for)
     assert j.state == "verified"
     stored = jstore.run_records(j.id)
     jstore._clock.now = NOW + timedelta(minutes=10)
@@ -1038,14 +1037,14 @@ class LandWorld:
             e = {k: v for k, v in tc.BB_ENTRY.items() if k not in ("steps", "driver_input")}
             r = VerifierRun(job_id=job.id, run=run, session=f"v-{run}", ticket=f"t-{run}", verifier=e,
                             steps=tuple(tc.BB_ENTRY["steps"]), driver_input_digest=e["driver_input_digest"],
-                            input_bundle_digest="sha256:" + "e" * 64, run_ticket=tvr.run_ticket(job.id, run))
+                            input_bundle_digest="sha256:" + "e" * 64)
             raw, digest = tvr.envelope(r, tvr.body((result,)))
             job = self.jstore.record_verification(
                 r, envelope=raw, event=tvr.event(r, at=utc_stamp(datetime.now(timezone.utc)),
                                                  verifier_report_digest=digest),
                 repo=str(self.repo), tree=tree,
                 model={"requested": "glm-5", "answered": "glm-5", "backend_identity": f"backend-{run}"},
-                routemap=tvr.routemap)
+                routemap=tvr.routemap, ticket_for=tvr.ticket_for)
         return job
 
     def verified(self, change=None, **kw):

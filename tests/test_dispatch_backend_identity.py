@@ -1,5 +1,6 @@
 """F9a producer: the run record's ``backend_identity`` comes from the gateway's own route map for the run's OWN executor
-ticket, never a response label or a caller's argument, and fails closed when it cannot be read; the consumer's
+ticket, read by the supervisor-owned ``ticket_for`` (never a VerifierRun field a ``resolve`` could set), never a
+response label or a caller's argument, and fails closed when it cannot be read; the consumer's
 K-contrast (:func:`levain.dispatch.adopt._contrast_problem`) trusts only a record that says so (``identity_source``).
 
 The e2e proof (a real gateway run on the VM) is 3c-10's; here the route map is a real ``routemaps.Checked`` and the
@@ -49,10 +50,17 @@ def _ticket(job_id: str, run: int, route: str, model: str = "glm-5", over: dict 
     return t
 
 
+#: verify_routed's default: a ticket_for answering each run's ticket from ``runs``
+FROM_RUNS = object()
+
+
 class World(LandWorld):
-    def verify_routed(self, job_id, runs, *, routemap=None):
+    def verify_routed(self, job_id, runs, *, routemap=None, ticket_for=FROM_RUNS):
         """``runs``: per run ``(ticket_or_builder, caller_model)``; a builder is called with ``(job_id, run)``. The
-        caller's model claims whatever it likes."""
+        supervisor's ``ticket_for(job_id, run_index)`` answers, for the run it is asked about, that run's entry (so a
+        builder's ``over`` is a ticket_for answering with another job's or run's ticket); ``ticket_for=None`` wires
+        none, and a callable replaces it. ``self.asked`` records what ticket_for was asked. The caller's model claims
+        whatever it likes."""
         from tests import test_dispatch_control as tc
         from tests import test_dispatch_verifier_report as tvr
 
@@ -60,17 +68,24 @@ class World(LandWorld):
         for to, cause in (("signed", "signature"), ("running", "slot_taken"), ("verifying", "runs_exited")):
             job = self.jstore._transition(job.id, to, cause)
         tree = make_tree(self.repo, job.contract.base, A_FIX, self.tmp)
-        for i, (ticket, model) in enumerate(runs):
+        answers = {(job.id, i): (t(job.id, i) if callable(t) else t) for i, (t, _m) in enumerate(runs)}
+        self.asked = []
+
+        def from_runs(jid, run_index):
+            self.asked.append((jid, run_index))
+            return answers.get((jid, run_index))
+
+        reader = from_runs if ticket_for is FROM_RUNS else ticket_for
+        for i, (_ticket, model) in enumerate(runs):
             e = {k: v for k, v in tc.BB_ENTRY.items() if k not in ("steps", "driver_input")}
             r = VerifierRun(job_id=job.id, run=i, session=f"v-{i}", ticket=f"t-{i}", verifier=e,
                             steps=tuple(tc.BB_ENTRY["steps"]), driver_input_digest=e["driver_input_digest"],
-                            input_bundle_digest="sha256:" + "e" * 64,
-                            run_ticket=ticket(job.id, i) if callable(ticket) else ticket)
+                            input_bundle_digest="sha256:" + "e" * 64)
             raw, digest = tvr.envelope(r, tvr.body(("pass",)))
             job = self.jstore.record_verification(
                 r, envelope=raw, event=tvr.event(r, at=utc_stamp(datetime.now(timezone.utc)),
                                                  verifier_report_digest=digest),
-                repo=str(self.repo), tree=tree, model=model, routemap=routemap)
+                repo=str(self.repo), tree=tree, model=model, routemap=routemap, ticket_for=reader)
             if job.state == "failed":
                 break
         return job
@@ -137,6 +152,42 @@ def test_the_map_read_is_the_tickets_generation_and_a_moved_map_is_unresolved(wo
     job = world.verify_routed(job.id, [(on("rt-a"), says("x"))], routemap=routemap)
     assert asked == [7]
     assert_unresolved(world, job)
+
+
+# --- R2': the ticket is the supervisor's (ticket_for), never the resolve's --------------------------------------
+
+def test_a_verifier_run_carries_no_ticket_facts_for_a_resolve_to_forge():
+    """L3 r2 finding 2: a resolve builds the VerifierRun, so the run's executor ticket facts are not a field of it."""
+    assert "run_ticket" not in {f.name for f in dataclasses.fields(VerifierRun)}
+    with pytest.raises(TypeError):
+        VerifierRun(job_id="dj-" + "0" * 32, run=0, session="v-0", ticket="t-0", verifier={}, steps=(),  # type: ignore[call-arg]
+                    driver_input_digest="", input_bundle_digest="",
+                    run_ticket=_ticket("dj-" + "0" * 32, 0, "rt-b"))
+
+
+def test_no_ticket_for_is_unresolved_even_with_the_map(world):
+    job, _ = world.file()
+    job = world.verify_routed(job.id, [(on("rt-a"), says("backend-x"))], routemap=_routemap(), ticket_for=None)
+    assert_unresolved(world, job)
+    assert world.jstore.run_records(job.id) == []
+
+
+def test_a_ticket_for_that_answers_none_is_unresolved(world):
+    job, _ = world.file()
+    job = world.verify_routed(job.id, [(on("rt-a"), says("backend-x"))], routemap=_routemap(),
+                              ticket_for=lambda jid, ri: None)
+    assert_unresolved(world, job)
+
+
+def test_the_identity_follows_ticket_for_asked_for_this_job_and_run(world):
+    """Same caller model both times; only ticket_for's answer moves the record (rt-a -> alpha, rt-b -> gamma)."""
+    job, _ = world.file()
+    job = world.verify_routed(job.id, [(on("rt-a"), says("backend-forged")), (on("rt-b"), says("backend-forged"))],
+                              routemap=_routemap())
+    assert world.asked == [(job.id, 0), (job.id, 1)]
+    recs = world.jstore.run_records(job.id)
+    assert [r.model["backend_identity"] for r in recs] == ["backend-alpha", "backend-gamma"]
+    assert world.contrast(job) is None
 
 
 # --- R2: bound to the ticket ---------------------------------------------------------------------------------------

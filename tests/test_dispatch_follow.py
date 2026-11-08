@@ -103,7 +103,7 @@ class Dispatch:
 
     def follower(self) -> F.EventFollower:
         return F.EventFollower.at(self.store, self.rig.path, self.resolve, read_deadline=0.5, fault=self.fault,
-                                  routemap=tvr.routemap)
+                                  routemap=tvr.routemap, ticket_for=tvr.ticket_for)
 
 
 def setup_verifier(store, repo, rig, *, refused=None):  # noqa: F811
@@ -320,7 +320,8 @@ def test_a_byte_copy_of_another_tickets_stored_envelope_stops_the_follower_unack
     d.raw, d.digest = tvr.envelope(a_run)
     store.record_verification(a_run, envelope=d.raw, event=tvr.event(a_run, at="2026-10-25T00:00:00Z",
                                                                       verifier_report_digest=d.digest),
-                              repo=str(repo[0]), tree=base_tree(repo), model=model(0), routemap=tvr.routemap)
+                              repo=str(repo[0]), tree=base_tree(repo), model=model(0), routemap=tvr.routemap,
+                              ticket_for=tvr.ticket_for)
     assert served.vattach(ticket)["ok"]
     cas(served, R.ALLOCATED, R.RENDERING, SESSION_V)
     assert root(served, "REVOKE", session=SESSION_V)["ok"]
@@ -472,7 +473,7 @@ def test_a_close_while_an_event_is_handled_connects_no_ack_and_ends_cancelled(st
         return CC.ControlClient(served.path)
 
     f = F.EventFollower(store, lambda after, jid: CC.follow_events(served.path, after, jid, read_deadline=0.5),
-                        connect, resolve, routemap=tvr.routemap)
+                        connect, resolve, routemap=tvr.routemap, ticket_for=tvr.ticket_for)
     assert f.step().outcome == CC.CANCELLED
     assert connects == [] and not acked(served) and f._ack_client is None
     assert [r.run for r in store.run_records(d.job.id)] == [0]
@@ -1110,6 +1111,21 @@ def test_a_follower_with_no_route_map_records_no_label_and_fails_the_run_closed(
 
     d = setup_verifier(store, repo, served)
     f = F.EventFollower.at(store, served.path, d.resolve, read_deadline=0.5)
+    assert f.step().outcome == CC.DEADLINE
+    job = store.get(d.job.id)
+    assert (job.state, job.history[-1].cause, job.history[-1].evidence) == ("failed", "verifier_refused",
+                                                                           J.BACKEND_UNRESOLVED)
+    assert store.run_records(d.job.id) == []
+    f.close()
+
+
+def test_a_follower_with_the_map_but_no_ticket_for_fails_the_run_closed(store, repo, served):  # noqa: F811
+    """L3 r2 finding 2: the run's executor ticket is read only by the supervisor-owned ticket_for, never from what
+    resolve returns, so a follower without one records nothing even with the route map."""
+    from levain.dispatch import jobs as J
+
+    d = setup_verifier(store, repo, served)
+    f = F.EventFollower.at(store, served.path, d.resolve, read_deadline=0.5, routemap=tvr.routemap)
     assert f.step().outcome == CC.DEADLINE
     job = store.get(d.job.id)
     assert (job.state, job.history[-1].cause, job.history[-1].evidence) == ("failed", "verifier_refused",

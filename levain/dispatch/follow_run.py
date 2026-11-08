@@ -32,7 +32,7 @@ from pathlib import Path
 from typing import Any, Callable, Mapping, Optional, Sequence
 
 from levain.dispatch.follow import PERMANENT_TAKES, EventFollower, FollowStopped, VerifierCall
-from levain.dispatch.jobs import JobStore
+from levain.dispatch.jobs import JobStore, TicketFor
 from levain.slot import Refused
 from levain.slot import control_client as CC
 from levain.slot.layout import RUN, STORE, dispatch_store_dir
@@ -166,7 +166,8 @@ def _parser(host: str) -> argparse.ArgumentParser:
 
 
 def main(argv: Optional[Sequence[str]] = None, *, resolve: Callable[[Mapping[str, Any]], Optional[VerifierCall]]
-         = no_minted_runs, routemap: Optional[Callable[[int], Any]] = None) -> int:
+         = no_minted_runs, routemap: Optional[Callable[[int], Any]] = None,
+         ticket_for: Optional[TicketFor] = None) -> int:
     if os.geteuid() == 0:
         print("levain dispatch follower: refusing to run as root (it runs as _levain_dispatch)", file=sys.stderr)
         return EX_USAGE
@@ -185,9 +186,12 @@ def main(argv: Optional[Sequence[str]] = None, *, resolve: Callable[[Mapping[str
         return EX_INSTANCE_HELD
     try:
         jobs.event_cursor()                             # opens the database under the lock: a broken store ends here
-        # no reader of the gateway's route map is wired here yet (3c-10): without one every run's backend identity
-        # is unresolved and fails closed, never a label (F9a)
-        runner = FollowRunner(EventFollower.at(jobs, a.socket, resolve, export_dir=a.export_dir, routemap=routemap))
+        # neither a route-map reader nor a ticket_for is wired here yet, so every run's backend identity is
+        # unresolved and fails closed, never a label (F9a). The intent: 3c-10/PRE-W supplies both from the
+        # supervisor's own side (ticket_for from its executor ticket mint, levain/slot/control.py
+        # _op_run_ticket_mint), never from resolve
+        runner = FollowRunner(EventFollower.at(jobs, a.socket, resolve, export_dir=a.export_dir, routemap=routemap,
+                                               ticket_for=ticket_for))
         requested: list[int] = []
         old: dict[int, Any] = {}
         failed: list[BaseException] = []

@@ -705,15 +705,26 @@ def resolve_backend_identity(routes: Any, ticket: Any) -> str | None:
     return backend if isinstance(backend, str) and backend else None
 
 
-def _routed_model(run: VerifierRun, model: Any, routemap: Callable[[int], Any] | None) -> dict[str, Any] | None:
+#: ``ticket_for(job_id, run_index)``: the facts of that run's EXECUTOR ticket as the supervisor minted it (``kind``,
+#: ``job_id``, ``run_index``, ``route``, ``routemap_generation``, ``route_policy_digest``, ``model_requested``), read
+#: from the supervisor's own record by the wiring that owns the CONTROL store, never from a follower's ``resolve``;
+#: ``None`` when there is none (F9a)
+TicketFor = Callable[[str, int], "Mapping[str, Any] | None"]
+
+
+def _routed_model(run: VerifierRun, model: Any, routemap: Callable[[int], Any] | None,
+                  ticket_for: TicketFor | None) -> dict[str, Any] | None:
     """The model a run's record keeps (F9a), or ``None`` (unresolved): ``requested`` and the route are the run's OWN
-    executor ticket's (``run.run_ticket``, minted by the supervisor for this job and run), the backend identity the
-    route map's entry for them (``routemap`` asked for the ticket's generation), ``identity_source`` says so, and only
-    ``answered`` is the caller's. A ``requested`` the caller gives must be the ticket's; a ``backend_identity`` it
-    gives is never read."""
-    ticket = run.run_ticket
-    if routemap is None or not isinstance(ticket, Mapping) or not isinstance(model, Mapping):
+    executor ticket's (``ticket_for(run.job_id, run.run)``, the supervisor's mint, which must answer with this job's
+    and this run's executor ticket), the backend identity the route map's entry for them (``routemap`` asked for the
+    ticket's generation), ``identity_source`` says so, and only ``answered`` is the caller's. A ``requested`` the
+    caller gives must be the ticket's; a ``backend_identity`` it gives is never read."""
+    if routemap is None or ticket_for is None or not isinstance(model, Mapping):
         return None
+    ticket = ticket_for(run.job_id, run.run)
+    if not isinstance(ticket, Mapping):
+        return None
+    ticket = dict(ticket)                              # one read: every check below and the map lookup see the same
     if (ticket.get("kind") != "executor" or ticket.get("job_id") != run.job_id
             or type(ticket.get("run_index")) is not int or ticket.get("run_index") != run.run):
         return None
@@ -1562,7 +1573,8 @@ class JobStore:
 
     def record_verification(self, run: VerifierRun, *, envelope: bytes | None, event: Mapping[str, Any], repo: str,
                             tree: str, model: Mapping[str, str],
-                            routemap: Callable[[int], Any] | None = None) -> Job:
+                            routemap: Callable[[int], Any] | None = None,
+                            ticket_for: TicketFor | None = None) -> Job:
         """Record the end of run ``run.run``'s verifier session on its verifying job. ``event`` is the session's
         terminal ``state`` event (``session``, ``ticket``, ``at`` and one of ``verifier_report_digest`` /
         ``verifier_report_refused``), ``envelope`` the report envelope file's bytes (``None`` when none was read),
@@ -1570,10 +1582,12 @@ class JobStore:
         run ticket's; a ``backend_identity`` beside it is never read).
 
         F9a, FAIL CLOSED: the record's ``model`` is built by :func:`_routed_model`: ``requested``, the route and the
-        route-map generation are the run's own executor ticket's (``run.run_ticket``, which must be this job's and this
-        run's), the ``backend_identity`` is :func:`resolve_backend_identity`'s read of ``routemap(generation)`` (the
-        gateway's route map of the ticket's generation), and ``identity_source`` is :data:`IDENTITY_SOURCE`. No
-        ``routemap``, no ticket facts, a caller ``requested`` other than the ticket's, or a route that names no backend
+        route-map generation are the run's own executor ticket's, read by ``ticket_for(run.job_id, run.run)`` (the
+        supervisor's mint, :data:`TicketFor`; ``run`` carries no ticket facts, so whoever builds the VerifierRun, a
+        follower's ``resolve`` included, cannot supply them), whose answer must be this job's and this run's executor ticket, the ``backend_identity`` is
+        :func:`resolve_backend_identity`'s read of ``routemap(generation)`` (the gateway's route map of the ticket's
+        generation), and ``identity_source`` is :data:`IDENTITY_SOURCE`. No ``routemap``, no ``ticket_for``, no
+        ticket facts or another run's, a caller ``requested`` other than the ticket's, or a route that names no backend
         fails the job ``verifier_refused``, :data:`BACKEND_UNRESOLVED`, writes no run record, and the landing contrast
         then escalates on the missing run. A map that moved since the mint is unresolved too: that is terminal for the
         job (the operator files again), never a retry with a guessed entry.
@@ -1625,7 +1639,7 @@ class JobStore:
             except ReportRefused as exc:
                 name = exc.name
             if name is None:
-                routed = _routed_model(run, model, routemap)
+                routed = _routed_model(run, model, routemap, ticket_for)
                 if routed is None:
                     name = BACKEND_UNRESOLVED
                 else:
