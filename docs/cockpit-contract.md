@@ -101,11 +101,16 @@ are not rank-contiguous). Regions are content: they are hashed into the manifest
 
 ### Kernel default layout
 
-`build_default_cockpit` places: `brief` the state line; `widgets` Health; `operate` (rank order)
-The List (wire id `tray`) 10 and Open loops 15 (both `tall`), Recent episodes 40, Recent edits 60 (no Keep card: a parked loop is an Open loops row marked parked, a legacy `note` row shows on the List), Recent jobs 70 (`medium`);
-`mind` the Neocortex tabs card (one tab per continuity heading, ranked in heading order from 0, span 2, `tall`), Crystallized patterns 100
-(`tall`) and the Cognition card (graph 200 and projection history 210, `tabs="Cognition"`, `short`). Ranks 16-39 of
-`operate` are left for an embedder's Inbox, Fleet and Stream; a rank outside the kernel's bands is the embedder's.
+`build_default_cockpit` registers, by region and in rank order (the ranks are in `levain/cockpit/providers.py`; this
+page does not copy them): `brief` the state line, then Where to begin; `hero` the Activity feed (it takes the hero
+ambient, and a downstream's own hero yields to it); `widgets` Sessions, Memory, Health and Levain health; `operate`
+the List (wire id `tray`) and Open loops (both `tall`), Recent episodes, Recent edits (no Keep card: a parked loop is
+an Open loops row marked parked, a legacy `note` row shows on the List), Recent jobs (`medium`), the Notification
+record and Topology (`tall`); `mind` the Neocortex tabs card (one tab per continuity heading, ranked in heading order
+from 0, span 2, `tall`), Crystallized patterns (`tall`) and the Cognition card (graph and projection history,
+`tabs="Cognition"`, `short`). Some of these are optional or left out by an embedder (`exclude`), and Recent jobs
+appears only with a job store. A gap in `operate`'s ranks is left for an embedder's Inbox, Fleet and Stream; a rank
+outside the kernel's bands is the embedder's.
 A zone grid row's height is its tallest card's, and the cards in a row stretch to it.
 The `Neocortex` and `Cognition` tab titles are the kernel's: a panel that joins one with a different `size` or `span` than the card's first member is refused, so an embedder panel registered before the sections refuses every section, and one registered after them is refused itself. A discovered panel's rank and verbs are re-read at every manifest, so a heading moved while the server runs moves its tab.
 

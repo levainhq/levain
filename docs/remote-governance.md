@@ -10,6 +10,12 @@ Every claim below carries the test that re-derives it (run from the repo root:
 Measurements were taken on loopback with a scratch sshd and mosh and stubs, never on a phone:
 `[judged by levain 41, 2026-11-05, against project_memory/1105-31/RETURN_remotegov_m1.md]`.
 
+Two kinds of source named below are not in a clone of this repository. `project_memory/` files (`RETURN_remotegov_m1.md`,
+`L3_remotegov_r2.txt`) are ignored by git, as in [web-push.md](web-push.md): a tag that names one records who judged
+what and when, and it cannot be re-run from a clone. `scripts/termsign_hook.py`, `scripts/remote_stamp.py`, `peer_roster`
+and "flow" are the operator's own tooling outside Levain; Levain's part is the detector and its tests, and what that
+tooling does is stated here as the operator reported it, not as something this repo can check.
+
 ## The detector
 
 One function decides, `terminal_sign.remote_reason(env, presence)`, and `terminal_sign.is_remote(...)` is
