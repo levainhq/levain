@@ -104,7 +104,7 @@ def test_the_default_cockpit_in_a_browser_offers_no_rename_and_no_text_edit_on_a
         dom = _dump(f"{url}/?source=manifest#write_token=T")
     assert "plain seed" in dom and "&lt;U+200B&gt;" in dom, dom[:400]
     assert 'class="name-edit"' not in dom, "rename is not offered by the kernel"
-    assert 'placeholder="Add a note' in dom, "an empty Keep still has its capture box"
+    assert 'aria-label="add a line to the List"' in dom, "the List has its capture box (the Keep's note box retired with the Keep)"
     edits = re.findall(r'<button[^>]*data-verb="spore_update"[^>]*>edit</button>', dom)
     locked = [b for b in edits if "hidden characters" in b]
     assert len(edits) == 2 and len(locked) == 1 and "disabled" in locked[0], edits
@@ -140,6 +140,6 @@ def test_the_default_page_draws_the_manifest_and_offers_a_downstream_send(tmp_pa
                 install_class="reported") as (url, _httpd):
         default = _dump(f"{url}/#write_token=T")
         legacy = _dump(f"{url}/?source=substrate#write_token=T")
-    # the shell draws a card's count as its own chip beside the title (`<h2>Tray</h2><span class="ck-count">1`), not inside it
-    assert '<h2>Tray</h2><span class="ck-count">' in default and 'aria-label="message"' in default, default[:400]
-    assert '<h2>Tray</h2><span class="ck-count">' not in legacy and 'aria-label="message"' not in legacy
+    # the shell draws a card's count as its own chip beside the title (`<h2>List</h2><span class="ck-count">1`), not inside it
+    assert '<h2>List</h2><span class="ck-count">' in default and 'aria-label="message"' in default, default[:400]
+    assert '<h2>List</h2><span class="ck-count">' not in legacy and 'aria-label="message"' not in legacy
