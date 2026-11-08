@@ -109,8 +109,10 @@ an Open loops row marked parked, a legacy `note` row shows on the List), Recent 
 record and Topology (`tall`); `mind` the Neocortex tabs card (one tab per continuity heading, ranked in heading order
 from 0, span 2, `tall`), Crystallized patterns (`tall`) and the Cognition card (graph and projection history,
 `tabs="Cognition"`, `short`). Some of these are optional or left out by an embedder (`exclude`), and Recent jobs
-appears only with a job store. A gap in `operate`'s ranks is left for an embedder's Inbox, Fleet and Stream; a rank
-outside the kernel's bands is the embedder's.
+appears only with a job store. In `operate`, cards flow in rank order, and the kernel leaves its ranks between Open
+loops and Recent episodes free for an embedder's Inbox, Fleet and Stream (the comment above the registrations in
+`providers.py` names the gap). Any other panel an embedder registers takes the rank it declares, ordered among the
+kernel's by the same rule.
 A zone grid row's height is its tallest card's, and the cards in a row stretch to it.
 The `Neocortex` and `Cognition` tab titles are the kernel's: a panel that joins one with a different `size` or `span` than the card's first member is refused, so an embedder panel registered before the sections refuses every section, and one registered after them is refused itself. A discovered panel's rank and verbs are re-read at every manifest, so a heading moved while the server runs moves its tab.
 
