@@ -613,6 +613,29 @@ _PASSTHROUGH_TAIL_BYTES = 1 << 20
 _INT64_MAX = 2**63 - 1
 
 
+def _tail_lines(fd: int, off: int) -> List[bytes]:
+    """The log's lines from byte ``off`` on. A tail that starts mid-file reads one byte early: that byte says whether
+    the tail begins on a record boundary, so a complete first line is kept and only a partial fragment is dropped."""
+    if off:
+        os.lseek(fd, off - 1, os.SEEK_SET)
+    chunks: List[bytes] = []
+    left = _PASSTHROUGH_TAIL_BYTES + 1 + (1 if off else 0)
+    while left > 0:
+        c = os.read(fd, min(left, 1 << 16))
+        if not c:
+            break
+        chunks.append(c)
+        left -= len(c)
+    data = b"".join(chunks)
+    before = b""
+    if off:
+        before, data = data[:1], data[1:]
+    lines = data.split(b"\n")
+    if off and before != b"\n":
+        lines = lines[1:]
+    return lines
+
+
 def read_passthrough_total(log_path: object) -> Optional[int]:
     """The front's cumulative passthrough byte total, read from its tunnel log: the ``passthrough_total`` of the LAST
     line that is a JSON object with ``event`` ``tunnel`` and an int (not a bool) ``passthrough_total`` in
@@ -627,21 +650,9 @@ def read_passthrough_total(log_path: object) -> Optional[int]:
             if not stat.S_ISREG(st.st_mode):
                 return None
             off = max(0, st.st_size - _PASSTHROUGH_TAIL_BYTES)
-            if off:
-                os.lseek(fd, off, os.SEEK_SET)
-            chunks: List[bytes] = []
-            left = _PASSTHROUGH_TAIL_BYTES + 1
-            while left > 0:
-                c = os.read(fd, min(left, 1 << 16))
-                if not c:
-                    break
-                chunks.append(c)
-                left -= len(c)
+            lines = _tail_lines(fd, off)
         finally:
             os.close(fd)
-        lines = b"".join(chunks).split(b"\n")
-        if off:
-            lines = lines[1:]
         total: Optional[int] = None
         for line in lines:
             try:
@@ -704,19 +715,7 @@ def _session_total_and_reason(fd: int, session: str) -> Tuple[Optional[int], str
         if not stat.S_ISREG(st.st_mode):
             return None, "not-regular"
         off = max(0, st.st_size - _PASSTHROUGH_TAIL_BYTES)
-        if off:
-            os.lseek(fd, off, os.SEEK_SET)
-        chunks: List[bytes] = []
-        left = _PASSTHROUGH_TAIL_BYTES + 1
-        while left > 0:
-            c = os.read(fd, min(left, 1 << 16))
-            if not c:
-                break
-            chunks.append(c)
-            left -= len(c)
-        lines = b"".join(chunks).split(b"\n")
-        if off:
-            lines = lines[1:]
+        lines = _tail_lines(fd, off)
         if lines and lines[-1] == b"":
             lines = lines[:-1]
         missing = "tail-window" if off else "gap"

@@ -571,3 +571,28 @@ def test_fr3_a_session_cut_by_the_tail_window_names_its_reason(tmp_path):
         assert H._session_total_and_reason(fd, "S") == (None, "unmatched")
     finally:
         os.close(fd)
+
+
+def _boundary_log(tmp_path, shift=0):
+    """A log whose 1 MiB tail starts exactly on the first byte of the session's open record (shift=0), or `shift`
+    bytes into it."""
+    head = b"older junk\n"
+    body = _rec("A", 4242).encode()
+    pad_rec = {"event": "refused", "session": "other", "detail": ""}
+    room = H._PASSTHROUGH_TAIL_BYTES - len(body) - len((json.dumps(pad_rec) + "\n").encode())
+    pad_rec["detail"] = "x" * room
+    log = tmp_path / "front.log"
+    log.write_bytes(head + body + (json.dumps(pad_rec) + "\n").encode() + b"y" * shift)
+    return log, len(head)
+
+
+def test_a_complete_first_record_at_an_exact_tail_boundary_is_kept(tmp_path):
+    log, head = _boundary_log(tmp_path)
+    assert log.stat().st_size - H._PASSTHROUGH_TAIL_BYTES == head
+    assert H.read_session_total(log, "A") == 4242
+    assert H.read_passthrough_total(log) == 4242
+
+
+def test_a_partial_first_fragment_is_still_dropped(tmp_path):
+    log, _head = _boundary_log(tmp_path, shift=1)
+    assert H.read_session_total(log, "A") is None
