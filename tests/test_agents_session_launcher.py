@@ -170,7 +170,7 @@ def test_a_brokered_launch_without_a_dollar_share_is_refused_by_name_before_anyt
     assert not hasattr(L, "BROKERED_ROUTE_BUILT")               # no flag turns anything on: the share is the launch's
     ln, control, runtime = build(tmp_path, auth="brokered")
     with pytest.raises(L.LauncherRefused) as e:
-        ln.spawn(launch(auth="brokered", exposure=None))        # no usd_micros: nothing the fire sent can supply one
+        ln.spawn(launch(auth="brokered", exposure=None))        # no usd_micros: no share, so nothing is minted
     assert e.value.name == "no-dollar-share"
     assert control.calls == [] and runtime.starts == []
     assert ln.usage(KEY) == zero()                       # nothing ran: zero, not the caps
@@ -532,10 +532,12 @@ def test_a_rerun_after_a_crash_reads_usage_under_the_key_the_first_attempt_recor
 
 def test_an_api_key_run_through_run_session_fails_with_the_named_reason_and_settles_at_zero(rig, tmp_path):
     oid = _occurrence(rig)                                      # billing api_key
-    ln, control, runtime = build(tmp_path, auth="brokered")
+    # the fire states its reserved dollars (finding 1), so the launcher gets as far as the route: none serves the model
+    ln, control, runtime = build(tmp_path, FakeControl(**{"ROUTE-RESOLVE": Refused("no-brokered-route")}),
+                                 auth="brokered")
     sup, report = _run(rig, oid, ln)
     assert report.state == "failed" and rig.row(oid)["reason"] == "session_spawn_failed"
-    assert control.calls == [] and runtime.starts == []
+    assert control.ops() == ["ROUTE-RESOLVE"] and runtime.starts == []
     res = _reservation(rig, oid)                                # an api_key run's dollars are the last column
     assert res[:2] == ("settled", "actual") and res[5] == 0
 

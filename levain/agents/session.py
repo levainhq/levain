@@ -162,9 +162,12 @@ class SessionLaunch:
     auth: str
     exposure: ActionExposure | None
     workspace: Workspace | None = None
-    #: the dollar share of a BROKERED run, in micro-dollars: the per-run figure on the operator's signed api_key link, which
-    #: the run server reads from its own verified replay and stamps here (``dataclasses.replace``). It is on no wire
-    #: (``session_client._LAUNCH_KEYS`` does not name it), so a fire cannot send one. None for a passthrough launch.
+    #: the dollar share of a BROKERED run, in micro-dollars. The fire sets it to the dollars its reservation took (the
+    #: window was debited exactly this); it travels as the OPTIONAL wire member ``usd_micros``, and the run server
+    #: refuses the launch (``dollars-not-the-links-share``) unless it EQUALS the per-run figure on the operator's signed
+    #: api_key link, read from its own verified replay, which is the figure the ticket is minted with. So the fire's number
+    #: can only refuse a launch, never price one, and a keys cap is never above what the window holds (wave-3 RETURN
+    #: finding 1: S-B1 admits an exposure BELOW the figure). None for a passthrough launch, which must send none.
     usd_micros: int | None = None
 
 
@@ -510,8 +513,11 @@ def run_session(sup: Any, store: AgentStore, occurrence_id: str, launch_epoch: i
     except BriefRefused as exc:
         end = sup.finish(occurrence_id, unstarted, ok=False, reason="session_refused:brief")
         return SessionReport(1, outcome="refused", state=end.state, note=str(exc))
+    # an api_key run states the dollars its reservation took (launch_refusal proved them the executor's own), so a
+    # brokered run server can refuse a share above what the window was debited; a subscription run states none
     launch = SessionLaunch(occurrence_id, session_key, role["harness"], role["model"], brief,
-                           AUTH_FOR_BILLING[reserved.billing], exposure, workspace)
+                           AUTH_FOR_BILLING[reserved.billing], exposure, workspace,
+                           reserved.usd_micros if reserved.billing == "api_key" else None)
     # what the fire records of its workspace: the setting it resolved and the commit that gave
     ws_record: dict[str, Any] = {} if workspace is None else {
         "workspace": {"repo": workspace.repo, "branch": workspace.branch, "head": workspace.head}}

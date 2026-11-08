@@ -238,7 +238,8 @@ def verify_point_of_use(proof: C.LinkProof, exposure: Optional[ActionExposure], 
         raise LauncherRefused("link-billing-not-the-launchers", f"the link is a {link_billing} link, this launcher's is {billing}")
     if billing == "api_key":
         # no action caps on an api_key link: the share is the dollar figure he signed, read from his verified link here
-        # and never sent by the fire. A link signing 0 can fund no run.
+        # and never priced by the fire (its reserved dollars are only compared: RunServer._priced). A link signing 0
+        # can fund no run.
         if exposure is not None:
             raise LauncherRefused("exposure-over-link", "an api_key run carries no action exposure")
         share = grant["budget_run_usd_micros"]
@@ -731,11 +732,21 @@ class RunServer:
 
     def _priced(self, launch: Any, grant: Any) -> Any:
         """The launch with a BROKERED launcher's dollar share stamped on it: the verified link's signed figure
-        (:func:`signed_share`) and nothing the fire sent. A grant that holds no figure stamps None, so the launcher
-        refuses ``no-dollar-share``. A passthrough launcher's launch is returned as it came."""
+        (:func:`signed_share`), which the ticket is minted with. The fire's own ``usd_micros`` (the dollars its
+        reservation took from the window) never prices the run: it must EQUAL that figure, or the launch is refused
+        ``dollars-not-the-links-share`` before anything is minted, so a keys cap is never above what the window was
+        debited (S-B1 admits an exposure below the figure: wave-3 RETURN finding 1). A grant that holds no figure stamps
+        None, so the launcher refuses ``no-dollar-share``. A passthrough launch carries no dollars
+        (``dollars-on-a-passthrough-launch``) and is otherwise returned as it came."""
         if getattr(self.launcher, "auth", None) != "brokered":
+            if launch.usd_micros is not None:
+                raise LauncherRefused("dollars-on-a-passthrough-launch", "a passthrough run reserves no dollars")
             return launch
-        return dataclasses.replace(launch, usd_micros=signed_share(grant))
+        share = signed_share(grant)
+        if share is not None and launch.usd_micros != share:
+            raise LauncherRefused("dollars-not-the-links-share",
+                                  "the fire's reserved dollars are not the link's signed per-run figure")
+        return dataclasses.replace(launch, usd_micros=share)
 
     def _workspace_of(self, launch: Any, owner: Optional[WS.UploadOwner], proof: Any = None, grant: Any = None) -> Any:
         """The LAUNCH's workspace judgment, after the authority check and before the pool check or any mint: the launch

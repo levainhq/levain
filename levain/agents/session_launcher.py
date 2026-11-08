@@ -699,7 +699,8 @@ class RealLauncher:
     @staticmethod
     def _brokered_problem(launch: SessionLaunch) -> tuple[str, str] | None:
         """A brokered ticket carries a dollar share and no action caps: the share is the signed link's figure the run
-        server stamped, so a launch without one (a fire's own, a passthrough's) mints nothing."""
+        server stamped once it found it equal to the dollars the fire reserved (``RunServer._priced``), so a launch
+        without one (a passthrough's, or one whose link signs none) mints nothing."""
         if launch.exposure is not None:
             return ("exposure-on-a-brokered-launch", "a brokered ticket carries a dollar share, not action caps")
         share = launch.usd_micros
