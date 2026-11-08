@@ -387,3 +387,37 @@ def test_listpanel_141_the_focus_views_sticky_filter_bar_is_opaque(tmp_path: Pat
     assert got["max"] > 0 and got["scrolled"] > 0, got                 # rows really pass under the bar
     assert got["alpha"] == 1 and got["bg"] != "rgba(0, 0, 0, 0)" and got["bg"] != "transparent", got
     assert got["gap"] <= 0.5, got                                      # and it pins flush: no strip above it where a row shows
+
+
+@needs_browser
+def test_listpanel_142_the_panels_show_opens_the_focus_view_with_the_held_rows(tmp_path: Path) -> None:
+    root, src, _ids = _install(tmp_path)
+    _seed_more(root)
+    _seed_phone(root)
+    held_in_modal = "document.querySelectorAll('#levain-modal .modal-body .row[data-held=\"1\"]').length"
+    held_in_panel = (f"[...{TRAY}.querySelectorAll('.sp-results .row[data-held=\"1\"]')]"
+                     ".filter(r => r.style.display !== 'none' && r.getClientRects().length).length")
+    with _serve(src, write_token=TOKEN, surface_tokens={"browser": TOKEN}, install_class="reported") as (url, _httpd):
+        out = _drive(tmp_path, f"{url}/", [
+            {"emulate": {"w": 390, "h": 844, "dpr": 3, "mobile": True}},
+            {"eval": "localStorage.removeItem('levain.tray.showHeld'); 1"},
+            *_reload(),
+            {"until": f"{TRAY} && {TRAY}.querySelector('[data-held-toggle]') && 1"},
+            {"eval": f"JSON.stringify({{before_modal: {held_in_modal}, before_label: {TRAY}.querySelector('[data-held-toggle]').textContent}})"},
+            {"eval": f"{TRAY}.querySelector('[data-held-toggle]').click(); 1"},
+            {"eval": "new Promise(r => setTimeout(() => r(1), 900))"},
+            {"eval": f"JSON.stringify({{after_modal: {held_in_modal}, after_panel: {held_in_panel}, "
+                     "open: !!document.querySelector('#levain-modal .modal-body .sp-results')})"},
+            {"eval": "document.querySelector('#levain-modal .modal-close').click(); 1"},
+            {"eval": "new Promise(r => setTimeout(() => r(1), 600))"},
+            {"eval": f"JSON.stringify({{label: {TRAY}.querySelector('[data-held-toggle]').textContent, closed: !document.querySelector('#levain-modal .modal-body .sp-results')}})"},
+            # hiding again, from the panel, is only a hide: it opens nothing
+            {"eval": f"{TRAY}.querySelector('[data-held-toggle]').click(); 1"},
+            {"eval": "new Promise(r => setTimeout(() => r(1), 600))"},
+            {"eval": f"JSON.stringify({{hid_label: {TRAY}.querySelector('[data-held-toggle]').textContent, hid_open: !!document.querySelector('#levain-modal .modal-body .sp-results')}})"},
+        ])
+    vals = {k: v for x in out["values"] if isinstance(x, str) and x.startswith("{") for k, v in json.loads(x).items()}
+    assert vals["before_modal"] == 0 and vals["before_label"] == "show", vals
+    assert vals["open"] is True and vals["after_modal"] > 0, vals          # show opens the focus view, and the held rows are drawn there
+    assert vals["closed"] is True and vals["label"] == "hide", vals        # closing it leaves the choice made
+    assert vals["hid_label"] == "show" and vals["hid_open"] is False, vals
