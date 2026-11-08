@@ -103,6 +103,9 @@ _ASCII_RUN = re.compile(rb"[\x00-\x04\x06-\x1a\x1c-\x7f]+")
 _CSI_MAX = 256        # DECISION: a CSI longer than this is no sequence a terminal answers; it is dropped whole
 _OSC_MAX = 8192       # DECISION: an OSC payload past this is discarded to its terminator, never buffered further
 _ESC_I_MAX = 8
+#: DECISION: the kitty keyboard pushes the filter passes per screen. A terminal's stack is bounded and a push onto a
+#: full one evicts its OLDEST entry, which is the operator's own; a slot needs only a few, so pushes past this drop.
+_KITTY_PUSH_MAX = 16
 
 
 class TermFilter:
@@ -155,8 +158,9 @@ class TermFilter:
         another encoding, or on the slot's screen.
 
         Order: the alternate screen's kitty entries are undone while on it, then the alternate screen is left, then
-        the main screen's entries are undone. Pops undo exactly the pushes the slot made, so an entry the operator's
-        own shell pushed before the session survives; only when the slot SET flags in place with none of its own
+        the main screen's entries are undone. Pops undo exactly the pushes the slot made (the filter passes no pop of
+        the slot's beyond them, and no push past :data:`_KITTY_PUSH_MAX`), so an entry the operator's own shell
+        pushed before the session survives; only when the slot SET flags in place with none of its own
         pushes outstanding (which overwrites an entry it may not own) are the current flags zeroed (``CSI = 0 u``,
         which acts with nothing pushed too). A set on an entry the slot pushed is undone by its pop."""
         out = bytearray()
@@ -291,8 +295,7 @@ class TermFilter:
             keep = self._st == _CSI and not _csi_is_report(seq)
             self._ground()
             if keep:
-                self._track_modes(seq)
-                out += seq
+                out += self._track_modes(seq)
             return
         if not 0x20 <= cp <= 0x3F:
             self._abort(cp, raw, out)
@@ -304,7 +307,9 @@ class TermFilter:
         if len(self._seq) > _CSI_MAX or not _csi_shape(body):
             self._st = _CSI_IGN                         # malformed: consumed to its final byte and dropped
 
-    def _track_modes(self, seq: bytes) -> None:
+    def _track_modes(self, seq: bytes) -> bytes:
+        """Track the modes ``seq`` (a complete CSI that passes) sets, and return what of it reaches the terminal:
+        ``seq`` itself, except for the kitty pops and pushes that would reach entries the slot does not own."""
         prefix, final, params = seq[2:3], seq[-1:], seq[3:-1].split(b";")
         if prefix == b"?" and final in (b"h", b"l", b"r"):
             # DECSET / DECRST (``CSI ? Pm h|l``) and XTRESTORE (``CSI ? Pm r``, which may set any mode it restores)
@@ -317,11 +322,24 @@ class TermFilter:
         elif final == b"u" and prefix in (b">", b"<", b"="):
             # the kitty keyboard protocol: push (``CSI > flags u``), pop (``CSI < n u``), set (``CSI = flags ; mode u``)
             screen = bool(self._modes & _ALT_SCREEN_MODES)
+            pushes = self._kitty_pushes[screen]
             if prefix == b">":
+                if pushes >= _KITTY_PUSH_MAX:
+                    return b""
                 self._kitty_pushes[screen] += 1
             elif prefix == b"<":
+                # the protocol's count defaults to 1 when omitted; an explicit 0 is read as none by some terminals
+                # and as the default by others, so it is dropped, and so is anything but a plain count
                 n = params[0]
-                self._kitty_pushes[screen] = max(0, self._kitty_pushes[screen] - (int(n) if n.isdigit() else 1))
+                if len(params) > 1 or not (n == b"" or n.isdigit()) or n.isdigit() and int(n) == 0:
+                    return b""
+                want = int(n) if n else 1
+                if want > pushes:
+                    # a pop past the slot's own pushes would pop the operator's entries: clipped to the slot's
+                    if not pushes:
+                        return b""
+                    seq, want = b"\x1b[<" + str(pushes).encode("ascii") + b"u", pushes
+                self._kitty_pushes[screen] = pushes - want
             elif not self._kitty_pushes[screen]:
                 # a set while the slot has pushes outstanding changes the slot's own entry, which the pop undoes;
                 # only with none is the entry it changes one the slot may not own
@@ -335,6 +353,7 @@ class TermFilter:
                     self._modkeys.add(int(params[0]))
                 else:
                     self._modkeys.discard(int(params[0]))
+        return seq
 
     def _osc(self, cp: int, raw: bytes, out: bytearray) -> None:
         if self._st == _OSC_ESC:

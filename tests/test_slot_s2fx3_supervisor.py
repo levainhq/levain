@@ -420,7 +420,7 @@ def test_reset_undoes_each_mode_the_slot_set(set_, undo) -> None:
 
 
 @pytest.mark.parametrize("data", [
-    b"\x1b[?1049h\x1b[?1049l", b"\x1b[?1h\x1b[?1l", b"\x1b[>1u\x1b[<1u", b"\x1b[>1u\x1b[<5u",
+    b"\x1b[?1049h\x1b[?1049l", b"\x1b[?1h\x1b[?1l", b"\x1b[>1u\x1b[<1u",
     b"\x1b[>4;2m\x1b[>4m", b"\x1b[>4;2m\x1b[>1;2m\x1b[>m", b"\x1b[?u", b"\x1b[?25l\x1b[?7h\x1b[u",
 ])
 def test_reset_emits_nothing_for_a_mode_the_slot_undid_itself_or_never_set(data) -> None:
@@ -812,3 +812,31 @@ def test_a_kitty_set_is_undone_by_zeroing_only_when_the_slot_had_nothing_pushed(
     f = TermFilter()
     f.feed(data)
     assert f.reset() == undo
+
+
+@pytest.mark.parametrize("data, passed, undo", [
+    # a pop beyond the slot's own pushes would pop the operator's entries on the real terminal: clipped to them
+    (b"\x1b[>1u\x1b[<5u", b"\x1b[>1u\x1b[<1u", b""),
+    (b"\x1b[>1u\x1b[>2u\x1b[<9u", b"\x1b[>1u\x1b[>2u\x1b[<2u", b""),
+    (b"\x1b[<u", b"", b""),                            # no pushes: dropped
+    (b"\x1b[<3u", b"", b""),
+    (b"\x1b[>1u\x1b[<u", b"\x1b[>1u\x1b[<u", b""),    # within the pushes: passed as written
+    (b"\x1b[>1u\x1b[<0u", b"\x1b[>1u", b"\x1b[<1u"),  # a pop of 0: terminals differ on it, dropped
+    (b"\x1b[?1049h\x1b[>1u\x1b[?1049l\x1b[<1u", b"\x1b[?1049h\x1b[>1u\x1b[?1049l", b"\x1b[?1049h\x1b[<1u\x1b[?1049l"),
+])
+def test_the_filter_never_passes_a_kitty_pop_beyond_the_slots_own_pushes(data, passed, undo) -> None:
+    f = TermFilter()
+    assert f.feed(data) == passed
+    assert f.reset() == undo
+
+
+def test_kitty_pushes_past_the_cap_are_dropped_and_so_are_their_pops() -> None:
+    from levain.slot.supervisor import _KITTY_PUSH_MAX
+    f = TermFilter()
+    push = b"\x1b[>1u"
+    assert f.feed(push * (_KITTY_PUSH_MAX + 3)) == push * _KITTY_PUSH_MAX
+    assert f.feed(b"\x1b[<" + str(_KITTY_PUSH_MAX + 3).encode() + b"u") == b"\x1b[<" + str(_KITTY_PUSH_MAX).encode() + b"u"
+    assert f.reset() == b""
+    g = TermFilter()
+    g.feed(push * (_KITTY_PUSH_MAX + 1))
+    assert g.reset() == b"\x1b[<" + str(_KITTY_PUSH_MAX).encode() + b"u"
