@@ -291,11 +291,43 @@ def test_the_supervisor_readers_over_the_real_handler_resolve_a_bound_ticket(rig
     assert sup.ticket_for("job-1", 1) is None                       # refused ticket-unknown: None, never raised
 
 
-def test_follow_run_wires_the_supervisor_readers_on_its_socket_by_default():
-    import inspect
-    src = inspect.getsource(FR.main)
-    assert 'supervisor: Any = "socket"' in src and "supervisor_facts(a.socket)" in src
+class _Wired(Exception):
+    """Raised by the captured ``EventFollower.at``: what ``follow_run.main`` handed it, and the follower never runs."""
+
+
+def _follow_main_wiring(tmp_path, monkeypatch, **kw):
+    """Run ``follow_run.main`` up to the follower's construction; answer the ``routemap``/``ticket_for`` it passed."""
+    seen = {}
+
+    def at(jobs, socket, resolve, **fields):
+        seen.update(fields, socket=socket)
+        raise _Wired()
+    monkeypatch.setattr(FR.EventFollower, "at", staticmethod(at))
+    sock = str(tmp_path / "control.sock")
+    with pytest.raises(_Wired):
+        FR.main(["--store-dir", str(tmp_path / "store"), "--socket", sock, "--export-dir", str(tmp_path / "export")],
+                **kw)
+    return seen, sock
+
+
+def test_follow_run_main_hands_the_follower_the_supervisor_readers_on_its_socket(tmp_path, monkeypatch):
+    """L1 W2 (a): the behaviour, not the source text: by default the follower gets ``SupervisorFacts`` bound methods on
+    the ``--socket`` CONTROL serves, limited to the two read verbs; ``supervisor=None`` wires none; an explicit reader
+    replaces only its own default."""
+    seen, sock = _follow_main_wiring(tmp_path, monkeypatch)
+    for name in ("routemap", "ticket_for"):
+        reader = seen[name]
+        assert isinstance(reader.__self__, FR.SupervisorFacts) and reader.__func__ is getattr(FR.SupervisorFacts, name)
+        assert reader.__self__._port._path == sock and reader.__self__._port._ops == FR.SUPERVISOR_OPS
+    assert seen["routemap"].__self__ is seen["ticket_for"].__self__ and seen["socket"] == sock
     assert FR.SUPERVISOR_OPS == frozenset({"RUN-TICKET-FACTS", "ROUTEMAP-ACTIVE"})
+    seen, _ = _follow_main_wiring(tmp_path, monkeypatch, supervisor=None)
+    assert seen["routemap"] is None and seen["ticket_for"] is None
+    mine = object()
+    seen, _ = _follow_main_wiring(tmp_path, monkeypatch, routemap=mine)
+    assert seen["routemap"] is mine and isinstance(seen["ticket_for"].__self__, FR.SupervisorFacts)
+    seen, _ = _follow_main_wiring(tmp_path, monkeypatch, ticket_for=mine)
+    assert seen["ticket_for"] is mine and isinstance(seen["routemap"].__self__, FR.SupervisorFacts)
 
 
 # --- the default-off setting ----------------------------------------------------------------------------------------
@@ -346,12 +378,85 @@ def test_on_builds_a_separate_brokered_launcher_sharing_the_replica_index_and_up
     assert b.launcher.spend is not None and b.launcher.spend("run-x") is None      # no completeness proof: the whole share
 
 
-def test_main_reads_the_setting_before_it_builds_and_binds_the_brokered_socket_only_when_on():
-    import inspect
-    src = inspect.getsource(DR.main)
-    assert src.index("read_dispatch_auth(") < src.index("build_server(")
-    assert 'brokered=auth == "brokered"' in src and "if server.brokered is not None:" in src
-    assert src.count("_bind(") == 2 and "BROKERED_SOCKET_NAME" in src
+class _MainRig:
+    """``dispatch_run.main`` with the process edges stubbed (account check, log bound, signals) and its collaborators
+    recorded: ``read_dispatch_auth`` answers ``auth``, ``build_server`` returns fakes, ``_bind`` hands out fake
+    listeners (``bind_fail`` maps a socket name to the exception its bind raises), ``serve`` records and returns."""
+
+    class Server:
+        def __init__(self, name, brokered=None):
+            import types
+            self.name, self.brokered, self.shut = name, brokered, []
+            self.launcher = types.SimpleNamespace(runtime=types.SimpleNamespace(close=lambda: None))
+
+        def shutdown(self, budget):
+            self.shut.append(budget)
+
+    class Listener:
+        def __init__(self, path):
+            self.path, self.closed = path, False
+
+        def close(self):
+            self.closed = True
+
+    def __init__(self, tmp_path, monkeypatch, auth, bind_fail=None):
+        import threading
+        import types
+        self.events, self.served, self.bound = [], [], []
+        self.sock = tmp_path / "run" / "run.sock"
+        self.lock = threading.Lock()
+        monkeypatch.setattr(DR.pwd, "getpwnam", lambda name: types.SimpleNamespace(pw_uid=os.geteuid()))
+        monkeypatch.setattr(DR, "_bound_log", lambda *a, **k: None)
+        monkeypatch.setattr(DR.signal, "signal", lambda *a: None)
+
+        def read(path, owner=0):
+            self.events.append("read")
+            return (auth, None if auth == "brokered" else "absent")
+
+        def build(host, store, control, op_uid, *, brokered=False):
+            self.events.append(f"build:{brokered}")
+            self.server = self.Server("passthrough", self.Server("brokered") if brokered else None)
+            return self.server
+
+        def bind(path):
+            self.events.append(f"bind:{path.name}")
+            if bind_fail and path.name in bind_fail:
+                raise bind_fail[path.name]
+            lis = self.Listener(path)
+            self.bound.append(lis)
+            return lis
+
+        def serve(server, listener, stop):
+            with self.lock:
+                self.served.append((server.name, listener.path.name))
+        monkeypatch.setattr(DR, "read_dispatch_auth", read)
+        monkeypatch.setattr(DR, "build_server", build)
+        monkeypatch.setattr(DR, "_bind", bind)
+        monkeypatch.setattr(DR, "serve", serve)
+
+    def run(self):
+        return DR.main(["--socket", str(self.sock), "--operator-uid", str(ME), "--store-dir", "/nonexistent-store",
+                        "--auth-setting", "/nonexistent-setting"])
+
+
+def test_main_off_serves_the_passthrough_socket_alone(tmp_path, monkeypatch):
+    """L1 W2 (b), OFF: the setting is read before the build, nothing brokered is built, bound or served."""
+    rig = _MainRig(tmp_path, monkeypatch, "passthrough")
+    assert rig.run() == 0
+    assert rig.events == ["read", "build:False", "bind:run.sock"]
+    assert rig.served == [("passthrough", "run.sock")]
+    assert rig.server.shut and all(lis.closed for lis in rig.bound)
+
+
+def test_main_on_serves_the_brokered_server_on_its_own_socket(tmp_path, monkeypatch):
+    """L1 W2 (b), ON: the brokered server is built, bound beside run.sock, SERVED (its accept loop runs), shut down
+    and its listener closed. Deleting the side thread's start, or binding it on the wrong path, turns this red."""
+    rig = _MainRig(tmp_path, monkeypatch, "brokered")
+    assert rig.run() == 0
+    assert rig.events == ["read", "build:True", "bind:run.sock", f"bind:{DR.BROKERED_SOCKET_NAME}"]
+    assert sorted(rig.served) == sorted([("passthrough", "run.sock"), ("brokered", DR.BROKERED_SOCKET_NAME)])
+    assert rig.bound[1].path == rig.sock.parent / DR.BROKERED_SOCKET_NAME
+    assert rig.server.shut and rig.server.brokered.shut and all(lis.closed for lis in rig.bound)
 
 
 
