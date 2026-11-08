@@ -209,3 +209,6 @@ levain = ["**/__pycache__/*", "**/*.pyc", "**/*.pyo"]
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 addopts = "-ra --strict-markers"
+markers = [
+    "journey: a stage-1 golden journey (tests/test_journeys_stage1.py): one real operator act driven end to end in the shared Chrome",
+]

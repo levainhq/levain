@@ -38,6 +38,11 @@
 //                                            page's navigator.credentials.get with userVerification "required" is refused,
 //                                            a cancelled Face ID as the page sees it); nothing is collected
 //   {"key": "<key>"}                        one trusted key press (down, then up) to the focused element; nothing is collected
+//   {"sw": "<expression>", "ms": <n>}      evaluates the expression (awaited, by value) inside the page origin's service worker (its /sw.js
+//                                            target, found over the same debugging port) and collects the value; the worker must already be
+//                                            running (a page that registered it and a step that waited for `navigator.serviceWorker.ready`).
+//                                            Needs the full Chrome (a drive that names serviceWorker is routed there). A worker that never
+//                                            shows up, or an expression that throws, FAILS the drive
 //   {"tap": "<expression>", "ms": <n>}      one trusted mouse press and release at the centre of the element the expression
 //                                            names, scrolled into view first, so the page's listeners read event.isTrusted
 //                                            true (an evaluated .click() is never trusted). Polled until the element exists,
@@ -445,6 +450,36 @@ for (const s of steps) {
       }
     }
     values.push(1);
+  } else if (s.sw !== undefined) {
+    // the service worker of the page's origin: a target of its own, listed by the browser at /json beside the pages
+    const origin = await evaluate("location.origin");
+    let target = null;
+    for (;;) {
+      try {
+        const list = await (await fetch(`http://127.0.0.1:${sharedPort || port}/json`, { signal: AbortSignal.timeout(3000) })).json();
+        target = list.find((x) => x.type === "service_worker" && String(x.url).startsWith(origin + "/") && /\/sw\.js$/.test(x.url) && x.webSocketDebuggerUrl) || null;
+      } catch {}
+      if (target || Date.now() >= deadline) break;
+      await sleep(150);
+    }
+    if (!target) {
+      console.error(`step ${steps.indexOf(s)}: sw found no running service worker for ${origin} within ${waitMs}ms`);
+      await shotOnTimeout(steps.indexOf(s));
+      done(1); await sleep(10000);
+    }
+    const sws = await within(openSocket(target.webSocketDebuggerUrl, "the service worker"), 15000, "the service worker websocket");
+    try {
+      const answer = await new Promise((res, rej) => {
+        const timer = setTimeout(() => rej(new Error(`no answer from the service worker within ${waitMs}ms`)), Math.max(deadline - Date.now(), 1000));
+        sws.addEventListener("message", (m) => { const d = JSON.parse(m.data); if (d.id === 1) { clearTimeout(timer); res(d); } });
+        sws.send(JSON.stringify({ id: 1, method: "Runtime.evaluate", params: { expression: s.sw, awaitPromise: true, returnByValue: true } }));
+      });
+      if (answer.error || answer.result?.exceptionDetails) {
+        console.error(`step ${steps.indexOf(s)}: sw evaluation failed: ` + JSON.stringify(answer.error || answer.result.exceptionDetails.exception?.description || answer.result.exceptionDetails.text) + `: ${s.sw}`);
+        done(1); await sleep(10000);
+      }
+      values.push(answer.result?.result?.value ?? null);
+    } finally { try { sws.close(); } catch {} }
   } else if (s.focus !== undefined) {
     await send("Emulation.setFocusEmulationEnabled", { enabled: !!s.focus });         // a headless page is never the focused window: without this no focusin / focusout fires
   } else if (s.motion !== undefined) {
