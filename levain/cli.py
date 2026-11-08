@@ -1438,6 +1438,40 @@ def build_parser() -> argparse.ArgumentParser:
     )
     adopt_p.set_defaults(func=_cmd_adopt_answers)
 
+    spores_p = subparsers.add_parser(
+        "spores",
+        help="Spore-store maintenance (the Keep migration).",
+        description="Maintenance verbs for the install's spore store.",
+    )
+    spores_sub = spores_p.add_subparsers(dest="spores_cmd", metavar="<verb>", required=True)
+    km_p = spores_sub.add_parser(
+        "keep-migrate",
+        help="Move the retired Keep (notes, handoffs) into episodes and seeds: dry run, apply, revert.",
+        description=(
+            "With no --apply or --revert, writes a PLAN file under .levain/migrations/ and prints it; the "
+            "spore store is not touched. Edit the plan if a destination is wrong, then --apply PLAN moves "
+            "each Keep row to its destination (an episode or a spore) and composts the original; "
+            "--revert PLAN puts the originals back and removes what the apply made. Both are resumable "
+            "and safe to run twice."
+        ),
+    )
+    km_p.add_argument("--path", type=Path, default=Path.cwd(), help="Install directory (default: cwd).")
+    km_mode = km_p.add_mutually_exclusive_group()
+    km_mode.add_argument("--apply", type=Path, default=None, metavar="PLAN", help="Apply this plan.")
+    km_mode.add_argument("--revert", type=Path, default=None, metavar="PLAN", help="Revert this plan.")
+    km_p.add_argument(
+        "--handoff-to", choices=("seed", "agenda"), default=None, dest="handoff_to",
+        help="Dry run only: where handoffs go (default: seed). agenda needs --agenda-date.",
+    )
+    km_p.add_argument(
+        "--agenda-date", default=None, dest="agenda_date", metavar="D",
+        help="Dry run only: the YYYY-MM-DD date handoffs are scheduled for with --handoff-to agenda.",
+    )
+    km_p.set_defaults(func=_cmd_spores_keep_migrate)
+    from levain.coordinator.door import not_door as _not_door
+
+    _not_door(km_p)
+
     iso_p = subparsers.add_parser(
         "setup-isolation",
         help="Create a dedicated unprivileged user for an entity's bash (one-time, needs sudo).",
@@ -2093,6 +2127,46 @@ def _cmd_tui(args: argparse.Namespace) -> int:
     from levain.tui import run_tui
 
     return run_tui(path=args.path, read_only=args.read_only, manifest=args.manifest)
+
+
+def _cmd_spores_keep_migrate(args: argparse.Namespace) -> int:
+    from levain import keep_migrate as km
+    from levain.dashboard import AnnealPaths
+
+    act = args.apply or args.revert
+    if act is not None and (args.handoff_to is not None or args.agenda_date is not None):
+        print("levain spores keep-migrate: --handoff-to and --agenda-date shape a dry run; the plan file "
+              "already holds the choice, so they cannot be combined with --apply or --revert.", file=sys.stderr)
+        return 1
+    root = Path(args.path).expanduser().resolve()
+    db = root / ".levain" / "memory.db"
+    paths = AnnealPaths.from_db(db)
+    try:
+        if act is None:
+            out = km.plan(paths.spores_json, migrations_dir=root / ".levain" / km.MIGRATIONS_SUBDIR,
+                          episodic_db=db, handoff_to=args.handoff_to or "seed", agenda_date=args.agenda_date)
+            doc = km.load_plan(out)
+            c = doc["counts"]
+            print(f"keep-migrate plan: {out}")
+            print(f"  {c['items']} items: {c['notes']} notes, {c['handoffs']} handoffs, {c['agendas']} undated agendas")
+            for it in doc["items"]:
+                d = it["destination"]
+                label = d.get("episode_type") if d.get("kind") == km.DEST_EPISODE else d.get("disposition")
+                print(f"  [{it['index']}] {it['disposition']} -> {d.get('kind')} {label}: {str(it['text'])[:70]}")
+            print(f"Nothing was changed. Apply with: levain spores keep-migrate --apply {out}")
+            return 0
+        fn = km.apply if args.apply is not None else km.revert
+        rep = fn(act, episodic_db=db)
+    except km.KeepMigrateError as exc:
+        print(f"levain spores keep-migrate: {exc}", file=sys.stderr)
+        return 1
+    done, verb = (rep.applied, "applied") if args.apply is not None else (rep.reverted, "reverted")
+    print(f"keep-migrate {verb}: {len(done)} items ({rep.plan_path})")
+    for idx, why in rep.skipped:
+        print(f"  skipped [{idx}]: {why}")
+    for idx, why in rep.kept:
+        print(f"  kept [{idx}]: {why}")
+    return 0
 
 
 def _cmd_state(args: argparse.Namespace) -> int:

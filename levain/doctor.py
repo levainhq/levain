@@ -161,6 +161,7 @@ def _run_doctor(path: Path, invoke: bool = False, repin_hooks: bool = False) -> 
     core.extend(_check_authority_signers(install))
     core.extend(_guarded("terminal key", _check_terminal_key))
     core.extend(_check_continuity_headroom(install))
+    core.extend(_guarded("keep", lambda: _check_keep_migration(install)))
     core.extend(_check_compat_set(install))
     core.extend(_check_consent_hooks(install))
     core.extend(_guarded("consent ping reach", lambda: _check_consent_ping_reach(install)))
@@ -3842,6 +3843,24 @@ def _check_continuity_headroom(install: Path) -> list[CheckResult]:
             "a durable section is outside this count.")]
     tight = " (under 10% left)" if room * 10 < bound else ""
     return [CheckResult(name, True, f"{used} of {bound} characters, {room} left{tight}")]
+
+
+def _check_keep_migration(install: Path) -> list[CheckResult]:
+    """One row, only while Keep rows (notes, handoffs, undated agendas) still await ``levain spores keep-migrate``.
+    A warning, never a failure; says nothing when nothing waits or there is no spore store."""
+    from levain import keep_migrate
+
+    spores = install / ".levain" / "memory.spores.json"
+    if not spores.is_file():
+        return []
+    try:
+        line = keep_migrate.doctor_line(spores)
+    except keep_migrate.KeepMigrateError as exc:
+        return [CheckResult("keep", True, f"could not be read ({exc})", warn=True)]
+    if line is None:
+        return []
+    return [CheckResult("keep", True, line.removeprefix("keep: "), "Run `levain spores keep-migrate` for a dry run.",
+                        warn=True)]
 
 
 def _check_compat_set(install: Path) -> list[CheckResult]:
