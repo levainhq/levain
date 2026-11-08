@@ -236,3 +236,36 @@ def test_agent_sentence():
     assert agent_sentence(rec, None) is None
     for other in (BoundRecord("unknown", 0, ()), BoundRecord("clean", 0, ()), BoundRecord("none", 0, ())):
         assert agent_sentence(other, "Bash") is None
+
+
+@pytest.mark.parametrize("tool", ["write_stdin", "Write_Stdin"])
+def test_write_stdin_eperm_reads_unknown(tool):
+    """L2-MED-1: write_stdin may feed a terminal launched outside the sandbox, so an EPERM text is neither touched nor none."""
+    rec = classify("codex", "PostToolUse", tool, {"chars": "x"}, "sandbox_apply: Operation not permitted\n",
+                   bound_active=True)
+    assert rec.bound == "unknown"
+    assert rec.denials == 0
+
+
+def test_write_stdin_ordinary_reads_its_normal_class():
+    """L2-MED-1 r2: only the EPERM text reads unknown; a proxy refusal or a clean write keeps the class a shell call gets."""
+    rec = classify("codex", "PostToolUse", "write_stdin", {"chars": "x"}, "CONNECT tunnel failed, response 403\n",
+                   bound_active=True)
+    assert rec.bound == "touched" and rec.denials == 1
+    clean = classify("codex", "PostToolUse", "write_stdin", {"chars": "x"}, "ok\n", bound_active=True)
+    assert clean.bound == classify("codex", "PostToolUse", "Bash", {"chars": "x"}, "ok\n", bound_active=True).bound
+
+
+def test_shell_tools_are_the_authority_list():
+    """6b-1: one source for the shell-tool names, so bound cannot drift from the consent authority again."""
+    from levain import authority
+    from levain.consent import bound
+    assert bound.SHELL_TOOLS is authority.CONSENT_SHELL_TOOLS
+
+
+@pytest.mark.parametrize("tool", ["PowerShell", "Bash", "exec_command", "shell", "shell_command", "local_shell"])
+def test_every_consent_shell_tool_reads_touched(tool):
+    rec = classify("codex", "PostToolUse", tool, {"chars": "x"}, "sandbox_apply: Operation not permitted\n",
+                   bound_active=True)
+    assert rec.bound == "touched"
+    assert agent_sentence(rec, tool) is not None

@@ -1021,6 +1021,33 @@ def test_keep_shape_check(tmp_path):
 # --- the reserve -----------------------------------------------------------------------------------
 
 
+def test_reserve_refill_never_crosses_the_floor(tmp_path, monkeypatch):
+    """5c-1: free space just above the floor must stay at or above it; the refill caps each write at the headroom."""
+    floor = 8 << 30
+    mib = 1 << 20
+    free = {"n": floor + end_mod._REFILL_MARGIN + 2 * mib + mib // 2}     # 2.5 MiB of headroom past the margin
+    real = end_mod.write_all
+
+    def spend(fd, data):
+        real(fd, data)
+        free["n"] -= len(data)
+    monkeypatch.setattr(end_mod, "write_all", spend)
+    r = Reserve(tmp_path / "reserve", size=8 * mib)
+    assert r.refill(lambda: free["n"], floor=floor) is False
+    assert free["n"] >= floor + end_mod._REFILL_MARGIN and r.current() == 2 * mib + mib // 2
+
+
+def test_reserve_refill_stops_at_the_entry_headroom_when_free_space_lags(tmp_path):
+    """5c-1 r1 (L1-W1, L2-LOW-1): a free-space reading that does NOT drop as bytes are written (APFS, btrfs, NFS) must not
+    let the refill write the whole reserve past the floor: the headroom read at entry bounds it."""
+    floor = 8 << 30
+    mib = 1 << 20
+    frozen = floor + end_mod._REFILL_MARGIN + 3 * mib
+    r = Reserve(tmp_path / "reserve", size=16 * mib)
+    assert r.refill(lambda: frozen, floor=floor) is False
+    assert r.current() == 3 * mib
+
+
 def test_reserve_releases_on_enospc(tmp_path, world, monkeypatch):
     r = Reserve(tmp_path / "reserve", size=8 * 1024)
     assert r.refill(lambda: 10 << 30) is True
@@ -1075,3 +1102,14 @@ def test_facts_from_alloc(tmp_path):
                 {k: v for k, v in alloc.items() if k != "auth"}):
         with pytest.raises(Refused):
             facts_from_alloc(bad, store=tmp_path)
+
+
+def test_reserve_refill_at_floor_plus_one_opens_and_writes_nothing(tmp_path):
+    """5c-1 r2 (codex): free space inside the margin above the floor must not even create the reserve, since the
+    file's own metadata is charged to the host."""
+    floor = 8 << 30
+    r = Reserve(tmp_path / "reserve", size=8 << 20)
+    assert r.refill(lambda: floor + 1, floor=floor) is False
+    assert not os.path.lexists(tmp_path / "reserve")
+    assert r.refill(lambda: floor + end_mod._REFILL_MARGIN, floor=floor) is False
+    assert not os.path.lexists(tmp_path / "reserve")
