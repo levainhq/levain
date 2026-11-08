@@ -82,8 +82,8 @@ MAX_SESSIONS = 4
 MAX_UNSETTLED = 64             # settles waiting for a retry; at this many, new opens are refused until it drains
 OPEN_WAIT_S = 10.0             # how long shutdown waits for opens in progress (on other threads) to end their reservation
 REVOKE_CLOSE_WAIT_S = 0.5      # how long a revoke waits for the provider close before it is answered (the rest runs on)
-REVOKE_COLLECT_WAIT_S = 4.0    # how long an owner's close waits for a revoke's unfinished provider close (under the
-                               # page's own close deadline, so the answer still reaches it)
+REVOKE_COLLECT_WAIT_S = 4.0    # how long an owner's close waits for a revoke's unfinished provider close; past it the
+                               # close answers provider_failed and the revoke worker collects the session itself
 SID_BYTES = 24
 
 # Fixed words: the code is the contract, the words are what the route may show. Nothing here carries a value from outside.
