@@ -63,7 +63,66 @@ def _fit(text: str, room: int) -> str:
 _STRIP_IN = 40000
 
 
-def build_payload(title: str, body: str, tag: str, url: str, ping_id: int, badge: "int | None" = None) -> bytes:
+_CARD_ROOM = 1400        # serialized bytes the card members (headline, options, rec, subject, v) may take together
+_CARD_KEYS = ("headline", "options", "rec", "subject", "v")
+_OPT_TEXT_ROOM = 160
+_KEY_ROOM = 16           # an option key or rec longer than this is dropped, never cut
+
+
+def _card_members(headline: object, options: object, rec: object, subject_id: object, version: object) -> dict:
+    """The card members that are known and well-formed, fitted to :data:`_CARD_ROOM` serialized bytes: options are
+    dropped from the end first (then ``rec`` goes if its option is gone), then the headline is cut. Never raises: a card
+    that does not fit is a smaller card, and the ping goes."""
+    card: dict = {}
+    if isinstance(subject_id, str) and subject_id:
+        card["subject"] = _fit(subject_id, 64)
+    if isinstance(version, str) and version:
+        card["v"] = _fit(version, 64)
+    opts = []
+    if isinstance(options, (list, tuple)):
+        for o in options[:8]:
+            if isinstance(o, dict):
+                o = (o.get("key"), o.get("text"))
+            # a key is an identifier: never truncated (a cut key could collide with another); a too-long one drops its option
+            if (isinstance(o, (list, tuple)) and len(o) == 2 and isinstance(o[0], str) and isinstance(o[1], str)
+                    and o[0] and len(o[0]) <= _KEY_ROOM and _jlen(o[0]) <= _KEY_ROOM):
+                opts.append([o[0], _fit(o[1], _OPT_TEXT_ROOM)])
+    if isinstance(rec, str) and rec and len(rec) <= _KEY_ROOM:
+        card["rec"] = rec
+    if isinstance(headline, str) and headline.strip():
+        card["headline"] = headline.strip()
+
+    def _prune_rec() -> None:
+        if "rec" in card and not any(o[0] == card["rec"] for o in opts):
+            card.pop("rec")          # a rec names a carried option: with that option gone it means nothing
+
+    _prune_rec()
+    # bounded: every pass removes an option, shrinks/removes the headline, or returns; the cap is a backstop that
+    # falls back to no card even if _fit stopped guaranteeing a byte bound
+    for _ in range(len(opts) + 8):
+        trial = dict(card)
+        if opts:
+            trial["options"] = opts
+        if len(_dumps(trial)) <= _CARD_ROOM:
+            return trial
+        if opts:
+            opts.pop()
+            _prune_rec()
+        elif "headline" in card:
+            room = max(0, _CARD_ROOM - len(_dumps({k: v for k, v in card.items() if k != "headline"})) - 20)
+            cut = _fit(card["headline"], room) if room > 8 else ""
+            if not cut or cut == card["headline"]:
+                card.pop("headline")     # no shrink progress: the headline goes
+            else:
+                card["headline"] = cut
+        else:
+            return {}
+    return {}
+
+
+def build_payload(title: str, body: str, tag: str, url: str, ping_id: int, badge: "int | None" = None, *,
+                  headline: "str | None" = None, options: "list | None" = None, rec: "str | None" = None,
+                  subject_id: "str | None" = None, version: "str | None" = None) -> bytes:
     """The JSON the service worker reads, at most :data:`ece.MAX_PLAINTEXT` bytes as SERIALIZED (quotes and control
     characters escape to two and six bytes, so the clip is by serialized size, never by raw length). ``badge``: the open
     Needs-you count at send time (an int 0..99); omitted when unknown (None, or anything but a plain int), so the worker
@@ -75,6 +134,9 @@ def build_payload(title: str, body: str, tag: str, url: str, ping_id: int, badge
               "url": _fit(url, _URL_ROOM), "ping": ping_id}
     if type(badge) is int and 0 <= badge <= 99:
         payload["badge"] = badge
+    # the card (a band row's subject): carried so a tap's page knows which card and version; the notification itself never
+    # answers (no ``actions``, ever). Counted before the body is fitted, so the fixed members and the card outrank the body's tail.
+    payload.update(_card_members(headline, options, rec, subject_id, version))
     payload["body"] = _fit(body, ece.MAX_PLAINTEXT - len(_dumps(payload)))
     data = _dumps(payload)
     assert len(data) <= ece.MAX_PLAINTEXT
@@ -121,7 +183,15 @@ def declarative_payload(data: bytes, origin: "str | None" = None) -> bytes:
         enc = _dumps(out)
     except Exception:   # noqa: BLE001 - never fails a send: the legacy payload goes out
         return data
-    return enc if len(enc) <= ece.MAX_PLAINTEXT else data
+    if len(enc) <= ece.MAX_PLAINTEXT:
+        return enc
+    # too big doubled: shed card members in a fixed order (the bulky ones first; subject and v, the tap's identity, last),
+    # then fall back to the legacy bytes, which already carry the whole card and fit
+    for shed in (("headline", "options", "rec"), _CARD_KEYS):
+        enc = _dumps({k: v for k, v in out.items() if k not in shed})
+        if len(enc) <= ece.MAX_PLAINTEXT:
+            return enc
+    return data
 
 
 def topic_for(ref: str | None) -> str | None:
@@ -215,6 +285,27 @@ def send(queue_dir: Path | str, *, kind: str, ref: str | None, title: str, body:
     return deliver(qdir, store, ping_id, kind=kind, ref=ref, title=title, body=body, url=url, device=device, extra=extra)
 
 
+def _card_of(qdir: Path, store: PushStore, ping_id: int, kind: str, ref: "str | None", body: str) -> dict[str, Any]:
+    """The card fields of a band row's ping (kind ``attention``, ``ref`` flow's ``np-<8 hex>`` id), read the way the Needs
+    card reads them (:func:`levain.webpush.center.needs_item`: the ping's structured data, else its body); ``{}`` for any
+    other ping or when the row does not read. A field the row lacks is simply absent. Never raises: a ping goes without it."""
+    try:
+        from levain.webpush import center
+
+        if kind != "attention" or not (isinstance(ref, str) and center._BAND_ROW.fullmatch(ref)):
+            return {}
+        with store.read() as c:
+            row = c.execute("SELECT data FROM pings WHERE id = ?", (int(ping_id),)).fetchone()
+        item = center.needs_item(body, row[0] if row else None, qdir, ref)
+        out: dict[str, Any] = {"subject_id": ref}
+        if item:
+            out.update(headline=item.get("headline"), options=item.get("options") or None, rec=item.get("rec"),
+                       version=item.get("sign_v"))
+        return out
+    except Exception:   # noqa: BLE001 - a ping is never lost to its card
+        return {}
+
+
 def deliver(qdir: Path, store: PushStore, ping_id: int, *, kind: str, ref: str | None, title: str, body: str,
             url: str, device: str | None = None, extra: dict[str, Any] | None = None) -> list[tuple[int, int]]:
     """Push the already recorded ping ``ping_id`` to each live subscription (``device``: that device's only) and
@@ -224,7 +315,7 @@ def deliver(qdir: Path, store: PushStore, ping_id: int, *, kind: str, ref: str |
     subs = store.live_subscriptions(device=device)
     # the push opens the notification center on its own item (the item's id is the push's ``n``)
     data = build_payload(title, body, ref or kind, center.push_url(store, ping_id, kind, url, ref=ref), ping_id,
-                         needs.badge_value(qdir))
+                         needs.badge_value(qdir), **_card_of(qdir, store, ping_id, kind, ref, body))
     if extra:
         merged = _dumps({**json.loads(data.decode("utf-8")), **extra})
         if len(merged) <= ece.MAX_PLAINTEXT:

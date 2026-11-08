@@ -122,9 +122,9 @@ def test_the_sender_builds_its_payload_from_push_url_not_from_the_callers_link(t
     seen: list[str] = []
     real = sender.build_payload
 
-    def spy(title, body, tag, url, ping_id, badge=None):
+    def spy(title, body, tag, url, ping_id, badge=None, **card):
         seen.append(url)
-        return real(title, body, tag, url, ping_id, badge)
+        return real(title, body, tag, url, ping_id, badge, **card)
 
     monkeypatch.setattr(sender, "build_payload", spy)
     sender.deliver(tmp_path / "q", s, pid, kind=kind, ref="np-5bf5c022", title="levain",
