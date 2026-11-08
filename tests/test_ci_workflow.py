@@ -71,36 +71,138 @@ def test_the_verified_job_needs_a_successful_gate_that_said_skip():
         assert evaluate(cond, result, skip) is (not runs), (result, skip)
 
 
-def _transitive_needs(name):
-    seen, todo = set(), [name]
-    while todo:
-        needs = JOBS[todo.pop()].get("needs") or []
-        for n in ([needs] if isinstance(needs, str) else needs):
-            if n not in seen:
-                seen.add(n)
-                todo.append(n)
-    return seen
+# Jobs that run no suite. `gate` is the skip-lookup job (it only decides); `verified` exists only when the gate said skip.
+NO_TESTS = {"gate": "the skip lookup: decides, runs no tests", "verified": "runs only when the gate skipped the suite"}
+
+STATUS_FN = re.compile(r"\b(always|cancelled|success|failure)\(\)")
 
 
-def _can_be_skipped(name):
-    return "if" in JOBS[name]
+def evaluate_job_if(cond, results, outputs, event, ref, cancelled=False):
+    """Evaluate one job's `if` the way GitHub does: the expression may use always(), !cancelled(), github.event_name,
+    github.ref and needs.<job>.result / needs.<job>.outputs.skip. Anything else raises. With no status function in the
+    expression GitHub prepends an implicit success(), which is false when any needed job did not succeed."""
+    expr = cond
+    m = re.fullmatch(r"\$\{\{ (.*) \}\}", cond) if cond else None
+    if cond:
+        assert m, cond
+        expr = m.group(1)
+    else:
+        expr = ""
+    py = expr.replace("!cancelled()", "(not CANCELLED)").replace("always()", "True")
+    py = re.sub(r"needs\.([\w-]+)\.result", lambda g: "R[%r]" % g.group(1), py)
+    py = re.sub(r"needs\.([\w-]+)\.outputs\.skip", lambda g: "O[%r]" % g.group(1), py)
+    py = py.replace("github.event_name", "EV").replace("github.ref", "REF")
+    py = py.replace("&&", " and ").replace("||", " or ")
+    py = re.sub(r"!(?!=)", " not ", py)
+    leftover = re.sub(r"\b(True|and|or|not|EV|REF|CANCELLED)\b|[RO]\['[\w-]+'\]|'[^']*'|==|!=|[()\s]", "", py)
+    assert leftover == "", (cond, leftover)
+    if py.strip():
+        value = bool(eval(py, {"__builtins__": {}}, {"R": results, "O": outputs, "EV": event, "REF": ref,
+                                                     "CANCELLED": cancelled}))
+    else:
+        value = True
+    return value
 
 
-# `verified` runs no tests: it exists only when the gate skipped them, so a skipped gate must skip it.
-NO_TESTS = {"verified"}
+def _needs(name):
+    needs = JOBS[name].get("needs") or []
+    return [needs] if isinstance(needs, str) else list(needs)
 
 
-@pytest.mark.parametrize("name", [n for n in JOBS if n not in NO_TESTS])
-def test_a_job_downstream_of_a_skippable_job_carries_always(name):
-    # Without always() the implicit success() sees a skipped ancestor (the gate, skipped on every non-main push)
-    # and skips the job, so a seat/** or land/** run goes green without the suite (run 42524643315).
-    if any(_can_be_skipped(n) for n in _transitive_needs(name)):
-        assert "always()" in str(JOBS[name].get("if", "")), name
+def _topological():
+    order, seen = [], set()
+
+    def visit(n):
+        if n in seen:
+            return
+        seen.add(n)
+        for d in _needs(n):
+            visit(d)
+        order.append(n)
+
+    for n in JOBS:
+        visit(n)
+    return order
 
 
-def test_the_test_matrix_runs_when_the_plan_succeeded():
-    cond = JOBS["test"]["if"]
-    assert "always()" in cond and "!cancelled()" in cond and "needs.plan.result == 'success'" in cond
+def simulate(event, ref, gate_outcome=None, skip="", cancelled=False):
+    """Propagate job results through `needs` in topological order. A job whose condition holds RUNS and succeeds (the
+    suite is assumed green: this tests whether the job runs, not whether the code passes). The gate's outcome is only
+    consulted when its own `if` lets it run. Returns {job: 'success' | 'skipped' | gate_outcome}."""
+    results, outputs = {}, {}
+    for n in _topological():
+        cond = JOBS[n].get("if")
+        expr = cond or ""
+        has_status_fn = bool(STATUS_FN.search(expr))
+        implicit = has_status_fn or (not cancelled and all(results[d] == "success" for d in _needs(n)))
+        runs = implicit and evaluate_job_if(cond, results, outputs, event, ref, cancelled)
+        if not runs:
+            results[n] = "skipped"
+        elif n == "gate":
+            results[n] = gate_outcome
+            outputs[n] = skip
+        else:
+            results[n] = "success"
+    return results
+
+
+# Every kind of run that is not a push to main. The gate's own `if` is false for all of them, so it is skipped.
+NON_MAIN = [
+    ("push", "refs/heads/seat/x"),
+    ("push", "refs/heads/land/x"),
+    ("push", "refs/tags/v1.0"),
+    ("pull_request", "refs/pull/1/merge"),
+    ("schedule", "refs/heads/main"),
+    ("workflow_dispatch", "refs/heads/seat/x"),
+]
+SUITE_JOBS = [n for n in JOBS if n not in NO_TESTS]
+
+
+def test_there_are_suite_jobs():
+    assert "test" in SUITE_JOBS and len(SUITE_JOBS) >= 7
+
+
+@pytest.mark.parametrize("event,ref", NON_MAIN)
+def test_every_suite_job_runs_on_a_run_that_is_not_a_main_push(event, ref):
+    # The gate is skipped here, and a job without a status function in its `if` inherits the skip through `needs`
+    # (run 42524643315: a seat/** run went green without the suite). Checked as behaviour, not as text.
+    results = simulate(event, ref)
+    assert results["gate"] == "skipped", (event, ref)
+    assert results["verified"] == "skipped", (event, ref)
+    skipped = [n for n in SUITE_JOBS if results[n] != "success"]
+    assert skipped == [], (event, ref, skipped)
+
+
+@pytest.mark.parametrize("outcome,skip", [("success", "false"), ("success", ""), ("failure", ""), ("failure", "true")])
+def test_every_suite_job_runs_on_a_main_push_the_gate_did_not_skip(outcome, skip):
+    results = simulate("push", "refs/heads/main", outcome, skip)
+    assert results["gate"] == outcome
+    assert results["verified"] == "skipped"
+    assert [n for n in SUITE_JOBS if results[n] != "success"] == []
+
+
+def test_a_main_push_the_gate_skipped_runs_verified_and_no_suite_job():
+    results = simulate("push", "refs/heads/main", "success", "true")
+    assert results["verified"] == "success"
+    assert [n for n in SUITE_JOBS if results[n] != "skipped"] == []
+
+
+def test_a_cancelled_workflow_runs_no_suite_job():
+    for event, ref in NON_MAIN + [("push", "refs/heads/main")]:
+        results = simulate(event, ref, "success", "false", cancelled=True)
+        assert [n for n in SUITE_JOBS if results[n] != "skipped"] == [], (event, ref)
+
+
+def test_the_simulation_detects_a_job_that_would_inherit_the_skip():
+    # A control: the same propagation must flag a job whose `if` has no status function, or the tests above prove nothing.
+    saved = JOBS["plan"]["if"]
+    try:
+        JOBS["plan"]["if"] = "${{ always() && needs.gate.result == 'success' }}"
+        assert simulate("push", "refs/heads/seat/x")["test"] == "skipped"
+        JOBS["plan"]["if"] = "${{ needs.gate.result != 'cancelled' }}"
+        assert simulate("push", "refs/heads/seat/x")["plan"] == "skipped"
+    finally:
+        JOBS["plan"]["if"] = saved
 
 
 def test_a_main_push_neither_cancels_nor_is_cancelled_by_another_main_push():
