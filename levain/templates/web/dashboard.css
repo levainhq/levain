@@ -3009,6 +3009,10 @@ body.rv-on .ck-phonetabs button[data-phone-jump="room"] { color: var(--text); ba
     overflow-x: auto; overscroll-behavior-x: contain; scrollbar-width: none;
   }
   body.ke .ck-phonetabs::-webkit-scrollbar { display: none; }
+  /* the scrollbar is hidden, so the edge a tab continues past fades out: the cue that more is there to scroll to */
+  body.ke .ck-phonetabs.ck-more-right { -webkit-mask-image: linear-gradient(to right, #000 calc(100% - 28px), transparent); mask-image: linear-gradient(to right, #000 calc(100% - 28px), transparent); }
+  body.ke .ck-phonetabs.ck-more-left { -webkit-mask-image: linear-gradient(to left, #000 calc(100% - 28px), transparent); mask-image: linear-gradient(to left, #000 calc(100% - 28px), transparent); }
+  body.ke .ck-phonetabs.ck-more-left.ck-more-right { -webkit-mask-image: linear-gradient(to right, transparent, #000 28px, #000 calc(100% - 28px), transparent); mask-image: linear-gradient(to right, transparent, #000 28px, #000 calc(100% - 28px), transparent); }
   body.ke .ck-phonetabs button {
     flex: 0 0 auto; min-width: auto; min-height: var(--hit-min); padding: 0 var(--sp-3); white-space: nowrap;
     background: none; border: 0; border-radius: var(--r-md); color: var(--label); cursor: pointer;

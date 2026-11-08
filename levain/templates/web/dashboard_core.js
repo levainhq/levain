@@ -8973,6 +8973,20 @@
     const b = ev.target && ev.target.closest ? ev.target.closest("[data-phone-jump]") : null;
     if (b) phoneJump(b.dataset.phoneJump, b);
   });
+  // The jump strip hides its scrollbar, so a tab past either edge gets a cue: the edge it continues past fades (classes the CSS masks on).
+  (function () {
+    const strip = document.getElementById("ck-phonetabs");
+    if (!strip) return;
+    const cue = () => {
+      strip.classList.toggle("ck-more-right", strip.scrollLeft + strip.clientWidth < strip.scrollWidth - 1);
+      strip.classList.toggle("ck-more-left", strip.scrollLeft > 1);
+    };
+    strip.addEventListener("scroll", cue, { passive: true });
+    window.addEventListener("resize", cue);
+    window.addEventListener("load", cue);
+    if (typeof MutationObserver === "function") new MutationObserver(cue).observe(strip, { childList: true, subtree: true, characterData: true });
+    cue();
+  })();
   // Any trusted reader input ends a pending automatic jump (a late Decisions read must never replace the view the reader chose): a touch, a
 // wheel, a press or click anywhere (a panel's expand, a nav link, Notifications) or a key. Script-made events (isTrusted false) do not.
 for (const type of ["touchstart", "wheel", "pointerdown", "click", "keydown"]) document.addEventListener(type, (ev) => { if (ev.isTrusted) phoneJumpRun++; }, { passive: true, capture: true });

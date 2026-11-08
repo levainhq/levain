@@ -6,7 +6,7 @@ import json
 import os
 from pathlib import Path
 
-from tests.test_cockpit_narrow_layout_rig import (NEEDS, PHONE_TOUCH, SETTLE, TOK, FullRig, drive_touch, needs_browser, needs_ssh)
+from tests.test_cockpit_narrow_layout_rig import (NEEDS, PHONE, PHONE_TOUCH, SETTLE, TOK, FullRig, drive_touch, needs_browser, needs_ssh)
 
 STRIP = """(() => { const s = document.querySelector('#ck-phonetabs'); const bs = [...s.querySelectorAll('button')];
   return JSON.stringify({ wrap: getComputedStyle(s).flexWrap, overflowX: getComputedStyle(s).overflowX,
@@ -34,3 +34,36 @@ def test_every_phone_tab_shows_its_whole_label_and_the_strip_scrolls_not_wraps(t
     assert got["wrap"] == "nowrap" and len(got["tops"]) == 1, got           # one row
     assert got["stripScrolls"] and got["overflowX"] in ("auto", "scroll"), got   # the overflow goes sideways inside the strip
     assert got["pageScrollW"] <= got["vw"], got                             # never the page
+
+
+CUE = """(() => { const s = document.querySelector('#ck-phonetabs');
+  return JSON.stringify({ cue: true, right: s.classList.contains('ck-more-right'), left: s.classList.contains('ck-more-left'),
+    scrolls: s.scrollWidth > s.clientWidth + 1, x: Math.round(s.scrollLeft) }); })()"""
+TO_END = """(() => { const s = document.querySelector('#ck-phonetabs'); s.scrollLeft = s.scrollWidth;
+  return new Promise(r => setTimeout(r, 400)).then(() => 1); })()"""
+
+
+def _cue_values(tmp_path: Path, monkeypatch, view: dict, *, scroll_end: bool) -> list[dict]:
+    rig = FullRig(tmp_path, monkeypatch)
+    url = f"{rig.origin}/#write_token={TOK}"
+    steps = [view, {"touch": True}, {"until": NEEDS, "ms": 30000}, SETTLE, {"eval": CUE}]
+    if scroll_end:
+        steps += [{"eval": TO_END}, {"eval": CUE}]
+    with rig.serving():
+        vals = drive_touch(tmp_path, url, steps)["values"]
+    return [json.loads(v) for v in vals if isinstance(v, str) and v.startswith("{") and '"cue"' in v]
+
+
+@needs_browser
+@needs_ssh
+def test_strip_cues_the_tabs_off_screen_at_390(tmp_path: Path, monkeypatch) -> None:
+    start, end = _cue_values(tmp_path, monkeypatch, PHONE, scroll_end=True)
+    assert start["scrolls"] and start["right"] and not start["left"], start   # Room is off the right edge: the right edge fades
+    assert end["x"] > 0 and end["left"] and not end["right"], end             # at the far end the fade moves to the left edge
+
+
+@needs_browser
+@needs_ssh
+def test_strip_has_no_cue_when_every_tab_fits(tmp_path: Path, monkeypatch) -> None:
+    (got,) = _cue_values(tmp_path, monkeypatch, {"emulate": {"w": 1000, "h": 800, "dpr": 1}}, scroll_end=False)
+    assert not got["scrolls"] and not got["right"] and not got["left"], got
