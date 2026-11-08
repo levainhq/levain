@@ -209,7 +209,7 @@ def test_a_passkey_never_signs_a_t3_a_laptop_pending_another_phones_or_a_non_pho
     view = SimpleNamespace(principal=f"device:{w.phone.fingerprint}@run", record={"verb": "section_edit", "tier": "T2"})
     assert "not a phone verb" in str(w.b._passkey_refusal(key, "x", view))
     assert DEVICE_VERBS == {"spore_descend", "spore_surface_at", "spore_update", "spore_set_disposition",
-                            "spore_ascend", "spore_seed"}
+                            "spore_ascend", "spore_seed", "list_intake"}
     assert not {"section_edit", "episode_tombstone", "undo", "question_answer", "operator_state", "config",
                 "entity_name", "spore_touch"} & DEVICE_VERBS
     assert all(v.floor != "T3" for v in KERNEL_VERBS if v.device_ok)

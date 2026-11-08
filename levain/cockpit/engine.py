@@ -138,7 +138,7 @@ _VERB_ROW_PREFIXES = (QUESTION_ROW_PREFIX, NOTE_ROW_PREFIX)
 KERNEL_DECISION_FACETS = frozenset({"principal", "pending_tier", "expires_at", "due", "at", "outcome", "verb",
                                     "reason", "unapplied", "cancelled_by",
                                     "agent", "tool", "consent_state", "consent_tier", "decided_at",
-                                    "question_n", "question_state", "question_options", "question_section", "question_carried", "note_n", "note_state",
+                                    "question_n", "question_state", "question_options", "question_section", "question_carried", "question_later", "question_later_words", "note_n", "note_state",
                                     "note_open_total", "sign", "egress_state"})
 QUESTION_VERB = "question_answer"       # the cockpit verb a question row offers (verbs.py registers it)
 QUESTION_DONE_HOURS = 24                # an answered question stays listed this long, as a decided request does
@@ -522,7 +522,7 @@ def _consent_rows_in(got: Any, egress_lookup: Callable[[str, str], tuple[Any, bo
     return rows, bad
 
 
-def _question_row_in(q: Any) -> RowIn:
+def _question_row_in(q: Any, later: tuple[str, str] | None = None) -> RowIn:
     """One question (``levain.consent.questions.Question``) as a row: ``question:<n>``. A row carries who asked,
     when, how many options it offers and whether it is answered, and NOTHING the agent wrote (the question, the
     option labels, what it blocks): this panel is token-free on loopback, so those words are served only to a token
@@ -544,6 +544,8 @@ def _question_row_in(q: Any) -> RowIn:
             facets["question_carried"] = carried
         else:
             del facets["question_section"]
+    if later is not None and not answered:     # snoozed past today (band_view.later_of): the strip draws it as LATER, not due
+        facets["question_later"], facets["question_later_words"] = later
     _sign_facet(facets, q)
     return RowIn(id=f"{QUESTION_ROW_PREFIX}{q.n}", title=f"{agent} · question #{q.n}", facets=facets,
                  stored={"n": q.n, "answered_at": q.answer.answered_at if answered else "open"})
@@ -560,7 +562,9 @@ def _sign_facet(facets: dict[str, Any], item: Any) -> None:
 
 def _question_rows_in(store: Any, now: datetime) -> tuple[list[RowIn], int]:
     """The question store's open questions, and those answered in the last day, as rows (with the count of open
-    ones left out past the cap). A queue with no ``questions.db`` lists nothing and creates nothing."""
+    ones left out past the cap). A queue with no ``questions.db`` lists nothing and creates nothing. Known edge (reachability
+    line): the cap is applied before the later/due split, so a band of more than ``PENDING_CAP`` open rows could show later ones
+    in place of due ones; no real band holds that many."""
     from levain.consent.listing import PENDING_CAP
 
     open_ = store.open_questions()
@@ -570,7 +574,9 @@ def _question_rows_in(store: Any, now: datetime) -> tuple[list[RowIn], int]:
     # two reads: a question answered between them is in both, and its row id is shown once (the answered state)
     shown = {q.n: q for q in open_[:PENDING_CAP]}
     shown.update((q.n, q) for q in done)
-    return [_question_row_in(q) for q in shown.values()], max(len(open_) - PENDING_CAP, 0)
+    from levain.band_view import later_facets
+    return [_question_row_in(q, None if q.answer is not None else later_facets(store, q, now))
+            for q in shown.values()], max(len(open_) - PENDING_CAP, 0)
 
 
 def _note_row_in(n: Any, open_total: int | None = None) -> RowIn:

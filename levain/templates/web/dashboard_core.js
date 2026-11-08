@@ -155,6 +155,10 @@
   // The Tray's chosen view ("" = the kernel's own order, else a view id) and the Episodes agent filter
   // ("" = all). Both are display choices that survive a refresh re-render in the same page.
   let trayView = "";
+  // The List's surface filter ("" = all, else band | board | spore | talk | drop) and the intake box's kept state: the receipt
+  // line under the box and an unsent line. A landed write re-reads the page and rebuilds the box, so both live here, not in the DOM.
+  let listSurface = "";
+  const intakeKept = { receipt: null, draft: "" };   // receipt: { text, cls } | null
   // Whether the Tray lists the rows held until their surface date. Per viewer and per browser: it is a display
   // choice, so it lives in localStorage (which may be absent or throw) and never on the server. Default hidden.
   const HELD_KEY = "levain.tray.showHeld";
@@ -2035,24 +2039,72 @@
     row.appendChild(group);
     return row;
   }
+  // The words of a List row's surface chip. A drop says when it fires, read from the kernel's own minute ("YYYY-MM-DDTHH:MM", a
+  // calendar label only: no zone, no comparison with now).
+  const WEEKDAYS = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
+  function listChipText(s) {
+    if (s.surface === "drop" && s.fires) {
+      const m = /^(\d{4})-(\d{2})-(\d{2})T(\d{2}:\d{2})$/.exec(s.fires);
+      if (m) return "drop " + m[4] + " " + WEEKDAYS[new Date(+m[1], +m[2] - 1, +m[3]).getDay()] + " " + m[2] + "-" + m[3];
+    }
+    return s.surface;
+  }
   function sporeRow(s, verbs, badgeField, panelKind) {
     const row = el("div", "row");
     if (s.row_id) row.dataset.rowKey = s.row_id;   // where a transport notice lands after the board is rebuilt
+    // A List row says which store it comes from. A band or board row is NOT a spore (an operator question, a ready work item): it
+    // shows no spore id and no spore verb, whatever the row's actions say.
+    const foreign = s.surface === "band" || s.surface === "board";
+    // a List row keeps its meta (id, surface chip, tags) in ONE grid cell that wraps: the row grid has four
+    // fixed meta columns, and a drop row carries more than four small facts
+    const host = s.surface ? el("span", "list-meta") : row;
+    if (s.surface) row.dataset.surface = s.surface;
     // the spore id is the common reference handle (how flow tracks + you name it,
     // e.g. "compost spore-049") — show it leading so the row is addressable; the TUI
     // shows the same id trailing (tui.render_panel_lines).
-    if (s.id) { row.appendChild(el("span", "sid", s.id)); row.dataset.spore = String(s.id); }   // the Work lens finds a loop's row by this
+    if (s.id && !foreign) { host.appendChild(el("span", "sid", s.id)); row.dataset.spore = String(s.id); }   // the Work lens finds a loop's row by this
     // Tray badges the disposition (a legacy note badges "note"); Open Loops the tier (a parked loop badges "parked").
     let badge;
     if (badgeField === "disposition") badge = s.disposition;
     else badge = s.tier;
-    if (badge) row.appendChild(tagEl("tier", badge));
+    if (s.surface) {
+      const chip = tagEl("tier list-surface", listChipText(s));
+      chip.dataset.surfaceChip = s.surface;
+      host.appendChild(chip);
+    } else if (badge) host.appendChild(tagEl("tier", badge));
     appendClause(row, s.text);  // FULL text + per-item expand (no truncation, no edit data-loss)
+    if (host !== row) row.appendChild(host);
+    if (foreign) {
+      // read-only by construction: band rows point at the Decisions panel, board rows at the agents' queue; no verbs below
+      if (s.support && !s.text_locked) host.appendChild(el("span", "muted list-support", s.support));
+      if (s.list_pointer) host.appendChild(tagEl("muted list-pointer", s.list_pointer));
+      if (s.surface === "board") {
+        if (s.repo) host.appendChild(tagEl("muted", s.repo));
+        if (s.board_tier) host.appendChild(tagEl("muted", s.board_tier));
+      }
+      if (Number.isInteger(s.age_days) && s.age_days >= 0) host.appendChild(el("span", "muted", s.age_days + " d"));
+      return row;
+    }
+    if (s.surface && !s.held) {
+      // the kernel computed `overdue` and `fires`; this only says so
+      if (s.overdue) {
+        row.dataset.band = "overdue";
+        const od = tagEl("muted", "overdue");
+        od.setAttribute("data-ck-tag-state", "overdue");
+        host.appendChild(od);
+      }
+      if (s.next && !s.fires) host.appendChild(tagEl("muted", "due " + shortDate(s.next)));
+      if (s.surface === "talk" && Number.isInteger(s.age_days) && s.age_days >= 0) host.appendChild(tagEl("muted", s.age_days + " d old"));
+      if (s.deliver_to && s.surface === "drop") host.appendChild(tagEl("muted", "to " + s.deliver_to));
+      if (s.age_shown && s.age) host.appendChild(el("span", "muted", s.age));
+      if (verbs && s.id) appendRowVerbs(row, buildSporeVerbs(s, panelKind), panelKind === "tray" ? ["Resolve", "Snooze"] : null, panelKind === "tray" ? 2 : 0);
+      return row;
+    }
     if (s.held) {
       row.dataset.held = "1";
       const sf = tagEl("muted", "surfaces " + surfaceLabel(s.next));
       sf.setAttribute("data-ck-tag-state", "held");
-      row.appendChild(sf);
+      host.appendChild(sf);
     } else if (s.next) {
       // a late row says how late ("overdue 4 d") and keeps its date ("due 10-17"); a row due today says so
       const late = daysLate(s.next, s.today);
@@ -2060,18 +2112,18 @@
         row.dataset.band = "overdue";
         const od = tagEl("muted", "overdue " + late + " d");
         od.setAttribute("data-ck-tag-state", "overdue");
-        row.appendChild(od);
-        row.appendChild(tagEl("muted", "due " + shortDate(s.next)));
+        host.appendChild(od);
+        host.appendChild(tagEl("muted", "due " + shortDate(s.next)));
       } else {
-        row.appendChild(tagEl("muted", late === 0 ? "due today" : "due " + shortDate(s.next)));
+        host.appendChild(tagEl("muted", late === 0 ? "due today" : "due " + shortDate(s.next)));
       }
     }
     if (panelKind !== "tray" && s.tier) row.dataset.heat = String(s.tier);   // Open loops: a stripe per heat
-    if (s.age_shown && s.age) row.appendChild(el("span", "muted", s.age));
+    if (s.age_shown && s.age) host.appendChild(el("span", "muted", s.age));
     // Build's Open loops draw "open N d" and the repo chip under the title (cockpit.css hides both elsewhere)
     // the integer the kernel sends (the spore's own created date), never the badge words parsed back
-    if (Number.isInteger(s.age_days) && s.age_days >= 0) row.appendChild(el("span", "k7-opend", "open " + s.age_days + " d"));
-    if (s.domain) { const rc = el("span", "k7-repo", String(s.domain)); rc.dataset.repoFacet = String(s.domain); row.appendChild(rc); }
+    if (Number.isInteger(s.age_days) && s.age_days >= 0) host.appendChild(el("span", "k7-opend", "open " + s.age_days + " d"));
+    if (s.domain) { const rc = el("span", "k7-repo", String(s.domain)); rc.dataset.repoFacet = String(s.domain); host.appendChild(rc); }
     if (verbs && s.id) appendRowVerbs(row, buildSporeVerbs(s, panelKind), panelKind === "tray" ? ["Resolve", "Snooze"] : null, panelKind === "tray" ? 2 : 0);
     return row;
   }
@@ -2101,6 +2153,7 @@
       const picked = opts && opts.pick ? opts.pick(all) : all;
       const base = opts && opts.extra ? picked.concat(opts.extra()) : picked;   // rows listed apart, filtered with the rest
       const hit = (s) => String(s.text == null ? "" : s.text).toLowerCase().includes(q) ||
+                         String(s.support || "").toLowerCase().includes(q) ||
                          String(s.id || "").toLowerCase().includes(q);
       const rows = q ? base.filter(hit) : base;
       results.replaceChildren();
@@ -2141,10 +2194,16 @@
     const views = entry.kind === "tray" && Array.isArray(view.tray_views) && view.tray_view_rows ? view.tray_views : [];
     const viewOf = () => (views.some((v) => v.id === trayView) ? trayView : "");
     const heldLine = held.length && view.tray_held_line && typeof view.tray_held_line === "object" ? view.tray_held_line : null;
-    const opts = views.length || heldLine ? {
+    // the List: rows that carry a `surface` get the surface filter (the kernel names the stores; the page only filters by them)
+    const isList = entry.kind === "tray" && view.tray_is_list === true;   // the panel offers list_intake: a marker, never the rows' contents
+    // held rows count when they are shown: a surface only held rows carry still gets its chip and stays selectable
+    const listAll = () => (list || []).concat(heldLine && trayHeldShown ? held : []);
+    const listNow = () => (isList && listAll().some((s) => s.surface === listSurface) ? listSurface : "");
+    const inSurface = (s) => !listNow() || s.surface === listNow();
+    const opts = views.length || heldLine || isList ? {
       empty: emptyMsg,
-      extra: () => (heldLine && trayHeldShown ? held : []),
-      unlisted: () => (heldLine && !trayHeldShown ? held : []),
+      extra: () => (heldLine && trayHeldShown ? held.filter(inSurface) : []),
+      unlisted: () => (heldLine && !trayHeldShown ? held.filter(inSurface) : []),
       hintShow: (note, n) => {
         note.appendChild(document.createTextNode(" — " + n + (n === 1 ? " held row matches — " : " held rows match — ")));
         const go = el("button", "held-toggle");
@@ -2155,6 +2214,7 @@
         note.appendChild(go);
       },
       controls: (bar, redraw) => {
+        if (isList) bar.after(buildSurfaceChips(listAll(), listNow, (v) => { listSurface = v; redraw(); }));
         if (heldLine) {
           const line = el("div", "ext-note held-line");
           // the earliest surface date among the held rows: "1 held back until Dec 3"
@@ -2181,14 +2241,16 @@
         }
         if (!views.length) return;
         const sel = el("select", "tray-dump-type");
-        sel.setAttribute("aria-label", "Tray order");
-        sel.appendChild(Object.assign(el("option", null, "Tray order"), { value: "" }));
+        const orderWord = isList ? "List order" : "Tray order";
+        sel.setAttribute("aria-label", orderWord);
+        sel.appendChild(Object.assign(el("option", null, orderWord), { value: "" }));
         for (const v of views) sel.appendChild(Object.assign(el("option", null, v.title), { value: v.id }));
         sel.value = viewOf();
         sel.addEventListener("change", () => { trayView = sel.value; redraw(); });
         bar.appendChild(sel);
       },
-      pick: (all) => {
+      pick: (rows) => {
+        const all = listNow() ? rows.filter((s) => s.surface === listNow()) : rows;
         const ids = views.length && viewOf() ? view.tray_view_rows[viewOf()] : null;
         if (!Array.isArray(ids)) return all;
         const byId = new Map(all.map((s) => [s.id, Object.assign({}, s, { age_shown: true })]));
@@ -2280,11 +2342,121 @@
 
   function renderTray(entry, view) {
     const p = renderSporeProjection(entry, view, view.tray,
-      "Nothing yet. Drop a thought in the box above and " + (view.entity_name || "the assistant") + " sorts it.", "disposition");
-    // The dump box is the primary capture affordance — mounted under the title when
-    // writable. A read-only port (mesh) shows the Tray but offers no dump (NO-THEATER).
-    if (isVerbPanel(entry)) mountCaptureBox(p, buildTrayDump(view.entity_name || "the assistant"));
+      "Nothing yet. Drop a line in the box above and " + (view.entity_name || "the assistant") + " sorts it.", "disposition");
+    // The intake box is the primary capture affordance (the List's one line) — mounted under the title when
+    // writable. A read-only port (mesh) shows the List but offers no box (NO-THEATER). A panel that sends no `surface` on its
+    // rows is the old Tray and keeps its dump box.
+    if (isVerbPanel(entry)) {
+      const isList = view.tray_is_list === true;
+      mountCaptureBox(p, isList ? buildListIntake() : buildTrayDump(view.entity_name || "the assistant"));
+    }
     return p;
+  }
+
+  // The List's surface filter: one chip per store that has a row now, with its count, plus All. A display choice only
+  // (`listSurface`); the rows and their order are the kernel's.
+  const SURFACE_WORDS = { band: "band", board: "board", spore: "spores", talk: "talk", drop: "drops" };
+  function buildSurfaceChips(list, current, choose) {
+    const row = el("div", "list-surfaces");
+    row.setAttribute("role", "group");
+    row.setAttribute("aria-label", "filter the List by where a row comes from");
+    const counts = new Map();
+    for (const s of list) if (s && s.surface) counts.set(s.surface, (counts.get(s.surface) || 0) + 1);
+    const chips = [];
+    const mk = (value, label) => {
+      const c = el("button", "rc-chip list-surface-chip", label);
+      c.type = "button";
+      c.dataset.surface = value;
+      c.addEventListener("click", () => { choose(value); sync(value); });
+      chips.push(c);
+      row.appendChild(c);
+    };
+    const sync = (now) => { for (const c of chips) c.setAttribute("aria-pressed", c.dataset.surface === now ? "true" : "false"); };
+    mk("", "all " + list.length);
+    for (const k of Object.keys(SURFACE_WORDS)) if (counts.has(k)) mk(k, SURFACE_WORDS[k] + " " + counts.get(k));
+    sync(current());
+    return row;
+  }
+
+  // The List's INTAKE box: ONE line, posted as list_intake {line}. The page holds no grammar: `@when words`, `? words` and a
+  // plain line all go to the server, which reads the line, decides the tier (a plain line is answered at once; `@` and `?` lines are
+  // signed on a device) and returns the receipt sentence, printed here verbatim under the box. A refusal prints the server's reason.
+  // The idempotency key is minted per submit by the page's one write path (postVerb): fresh for each submit, kept across a retry.
+  function paintIntakeReceipts() {
+    for (const n of document.querySelectorAll("[data-list-receipt]")) {
+      const r = intakeKept.receipt;
+      n.className = "edit-msg list-receipt" + (r ? " " + r.cls : "");
+      n.textContent = r ? r.text : "";
+    }
+  }
+  function buildListIntake() {
+    const box = el("div", "tray-dump list-intake");
+    const row = el("div", "list-intake-row");
+    const input = el("input", "list-intake-input");
+    input.type = "text";
+    noContactFill(input);
+    input.setAttribute("enterkeyhint", "send");      // overrides the helper's default: this box sends on Enter
+    input.setAttribute("aria-label", "add a line to the List");
+    input.placeholder = "@mon 9am call X  ·  ? talk about Y  ·  or a plain line";
+    input.value = intakeKept.draft;
+    input.maxLength = 500;
+    const go = el("button", "tray-dump-btn list-intake-btn", "add");
+    go.type = "button";
+    row.append(input, go);
+    const receipt = el("div", "edit-msg list-receipt");
+    receipt.setAttribute("data-list-receipt", "");
+    receipt.setAttribute("role", "status");
+    receipt.setAttribute("aria-live", "polite");
+    box.append(row, receipt);
+    let busy = false;
+    const submit = async () => {
+      const line = input.value.trim();
+      if (busy) return;
+      if (!line) { intakeKept.receipt = { text: "nothing to add", cls: "err" }; paintIntakeReceipts(); return; }
+      busy = true; go.disabled = true;
+      intakeKept.receipt = { text: "…", cls: "busy" }; paintIntakeReceipts();
+      let res;
+      try { res = await commit({ kind: "list_intake", line }); } catch (e) { res = { ok: false, message: "the request failed" }; }
+      busy = false;
+      // ok:true is transport; the write landed only on COMMITTED/done (or pends on WAITING/applying). Any other state is a failure.
+      const st = res && res.ok ? ((res.data || {}).state || "done") : "";
+      const landed = st === "COMMITTED" || st === "done";
+      const pending = st === "WAITING" || st === "applying";
+      if (res && res.ok && (landed || pending)) {
+        const d = res.data || {};
+        // the server's sentence, verbatim; a state it did not word still says so
+        const text = typeof d.receipt_line === "string" && d.receipt_line ? d.receipt_line
+          : d.state === "WAITING" ? "waiting for your signature" : "added";
+        if (intakeKept.draft.trim() === line) intakeKept.draft = "";   // what he typed since stays his
+        intakeKept.receipt = { text, cls: pending ? "preview" : "ok" };
+        // the page was re-read inside the write: the box on screen is a new one holding the sent line, so clear every box
+        for (const n of document.querySelectorAll(".list-intake-input")) if (n.value.trim() === line) n.value = "";
+      } else {
+        // the page was already re-read for some refusals (stale, not_built): the unsent line is kept in the new box
+        if (!intakeKept.draft) intakeKept.draft = line;   // keep what he has typed since; restore the unsent line only into an empty box
+        const d = (res && res.data) || {};
+        const why = res && res.ok ? ((typeof d.receipt_line === "string" && d.receipt_line) || "not written (" + st + ")")
+          : (res && (res.detail || res.message || res.error)) || "failed";
+        intakeKept.receipt = { text: why, cls: "err" };
+      }
+      go.disabled = false;
+      paintIntakeReceipts();
+    };
+    input.addEventListener("input", () => { intakeKept.draft = input.value; });
+    input.addEventListener("keydown", (ev) => {
+      if (ev.key === "Enter" && !ev.isComposing && !ev.shiftKey) { ev.preventDefault(); submit(); }
+    });
+    // a phone keyboard rises over the lower half: bring the box to the middle of what is left
+    input.addEventListener("focus", () => {
+      setTimeout(() => { try { box.scrollIntoView({ block: "center", behavior: "smooth" }); } catch (e) { /* a convenience only */ } }, 300);
+    });
+    go.addEventListener("click", submit);
+    // a rebuilt box carries the last receipt and the unsent line
+    if (intakeKept.receipt) {
+      receipt.className = "edit-msg list-receipt " + intakeKept.receipt.cls;
+      receipt.textContent = intakeKept.receipt.text;
+    }
+    return box;
   }
 
   // One episode row — the SINGLE markup for both the recent list and keyword-search
@@ -4282,8 +4454,12 @@
       const audit = row.querySelector(".consent-audit");
       if (audit) audit.textContent = egress ? egress.label : sv(b.audit);
     }
+    // The terminal copy lines were the Q6a answer route while the cockpit was read-only; a passkey answer (Q6b) replaced them.
+    // Each stays unless the sheet offers that same answer here (a passkey never signs a T3 allow, so its choices are deny only).
+    const sheetOffers = (k) => b.sheet === true && Array.isArray(b.sheet_choices) && b.sheet_choices.includes(k);
     if (pending) {
       for (const [label, cmd] of [["allow", sv(b.answer_allow)], ["deny", sv(b.answer_deny)]]) {
+        if (sheetOffers(label)) continue;
         if (!cmd) continue;
         const line = el("div", "consent-cmd");
         const code = el("code", "consent-code", cmd);
@@ -4679,10 +4855,17 @@
       const n = bandNumOf.get(Number(row.dataset.questionN));
       if (tag) { tag.textContent = n === undefined ? "" : String(n); tag.hidden = n === undefined; }
     }
-    for (const row of document.querySelectorAll(".needs-row[data-question-n]")) {
-      const tag = row.querySelector(".needs-row-band");
+    for (const row of document.querySelectorAll(".needs-row[data-question-n], .needs-later-line[data-question-n]")) {
+      const tag = row.querySelector(".needs-row-band, .needs-later-band");
       const n = cardBandNum(row.dataset.questionN);
       if (tag) { tag.textContent = n === undefined ? "" : String(n); tag.hidden = n === undefined; }
+    }
+    // the LATER lines keep flow's order: soonest day, then band number (known only once the band is read)
+    for (const sec of document.querySelectorAll(".needs-later")) {
+      const rows = Array.from(sec.children).filter((r) => r.dataset && r.dataset.laterDay);
+      const key = (r) => { const b = cardBandNum(r.dataset.questionN); return Number(b === undefined ? r.dataset.questionN : b); };
+      const sorted = rows.slice().sort((a, b) => (a.dataset.laterDay < b.dataset.laterDay ? -1 : a.dataset.laterDay > b.dataset.laterDay ? 1 : key(a) - key(b)));
+      if (sorted.some((r, i) => r !== rows[i])) for (const r of sorted) sec.appendChild(r);
     }
   }
   function bandSlot() {
@@ -6008,6 +6191,7 @@
       if (!ln || typeof ln !== "object") continue;
       if (ln.consent && ln.consent.state === "pending") consents.push({ kind: "consent", c: ln.consent });
       // a question the desk alone owes (section desk, not carried over to him) is the Decisions card's "Desk owes" tab, not his strip
+      else if (ln.question && ln.question.state === "open" && needsLaterDay(ln.question)) continue;     // dated past today: a LATER line (needsLaterItems), not a waiting item
       else if (ln.question && ln.question.state === "open") { if (!(ln.question.section === "desk" && !ln.question.carried)) questions.push({ kind: "question", q: ln.question }); }
       else if (ln.question && ln.question.state === "answered" && decidedRecently(ln.question.decidedAge, ln.question.decidedAt)) {
         answered.push({ kind: "question", q: ln.question, answered: true });
@@ -6020,6 +6204,45 @@
     const keep = newestAnswered(answered.map((it) => ({ question: it.q })), NEEDS_ANSWERED_MAX);
     const byQ = new Map(answered.map((it) => [it.q, it]));
     return questions.concat(consents, Array.from(keep).map((q) => byQ.get(q)));
+  }
+  // The day a question is LATER until: its question_later facet, else "" (due). The server alone judges the day, in the install's
+  // zone, per request (band_view.later_of), and the panel's etag covers that zone's date, so a view refreshes when midnight passes
+  // there. The page never re-judges it with its own clock: a phone in another zone would disagree with flow (L3 r2).
+  function needsLaterDay(q) {
+    const d = q && typeof q.later === "string" ? q.later : "";
+    return /^\d{4}-\d{2}-\d{2}$/.test(d) ? d : "";
+  }
+  // the open questions dated past today (row 131's one predicate, served as the question_later facet): drawn as one collapsed LATER
+  // line each at the end of the strip, never counted, no answer controls. Soonest day first, then band number. `scope` "desk" is the
+  // Desk owes tab's own (section desk, carried or not); anything else is Needs you's (every row but one the desk alone owes).
+  function needsLaterItems(lines, scope) {
+    const out = [];
+    for (const ln of Array.isArray(lines) ? lines : []) {
+      const q = ln && ln.question;
+      const day = q && q.state === "open" ? needsLaterDay(q) : "";
+      if (!day) continue;
+      if (scope === "desk" ? q.section === "desk" : !(q.section === "desk" && !q.carried)) out.push({ kind: "question", q: q, later: day });
+    }
+    const bk = (it) => { const b = cardBandNum(it.q.n); return Number(b === undefined ? it.q.n : b); };
+    return out.sort((a, b) => (a.later < b.later ? -1 : a.later > b.later ? 1 : bk(a) - bk(b)));
+  }
+  function needsLaterLine(it) {
+    const row = el("div", "needs-later-line band-later");
+    row.dataset.needsLater = String(it.q.n);
+    row.dataset.questionN = String(it.q.n);
+    row.dataset.laterDay = it.later;
+    const bn = cardBandNum(it.q.n);
+    const tag = el("b", "band-num needs-later-band", bn === undefined ? "" : String(bn));
+    tag.hidden = bn === undefined;
+    const words = el("span", "ext-meta needs-later-text", it.q.laterWords || it.q.later);
+    const title = el("span", "ext-meta needs-later-title", "");
+    row.append(el("span", "ext-meta needs-later-mark", "LATER"), tag, words, title);
+    questionBody(it.q, row).then((b) => {
+      if (!b || b.error) return;
+      const first = needsFirstSentence(b.what);
+      if (first) title.textContent = " \u00b7 " + (first.replace(/^\s*DESK OWES:\s*/i, "") || first).slice(0, 80);
+    });
+    return row;
   }
   // an item the strip shows only so the answer given stays visible for a while: it waits on nothing and is never counted
   const needsWaiting = (items) => items.filter((it) => !it.answered);
@@ -6436,7 +6659,7 @@
   function deskOwesItems(lines) {
     const out = [];
     for (const ln of Array.isArray(lines) ? lines : []) {
-      if (ln && ln.question && ln.question.state === "open" && ln.question.section === "desk") out.push({ kind: "question", q: ln.question });
+      if (ln && ln.question && ln.question.state === "open" && ln.question.section === "desk" && !needsLaterDay(ln.question)) out.push({ kind: "question", q: ln.question });
     }
     return out;
   }
@@ -6570,16 +6793,17 @@
     needsViewRef = view;
     const lines = ((view.extra_panels || {}).decisions || {}).lines;
     const all = needsItems(lines);
+    const laterYou = needsLaterItems(lines, "you"), laterDesk = needsLaterItems(lines, "desk");
     const desk = deskOwesItems(lines);
     const items = needsWaiting(all), settled = all.filter((it) => it.answered);
     ncNeedsCount(items.length);               // the strip's Needs you count and the app-icon badge: the waiting items, nothing else
     syncAppBadge(view, items.length);
-    if (!all.length && !desk.length) { clearNeeds(host); return; }
+    if (!all.length && !desk.length && !laterYou.length && !laterDesk.length) { clearNeeds(host); return; }
     // the same set of waiting items leaves the strip as it is: a card with half-typed words, an open "details" and a running
     // countdown is not rebuilt under the reader by a refetch that changed nothing about what waits. The layout, the tab and the
     // fold are part of what is drawn, so a change of one is a new signature (a plain re-render, no network).
     const prefs = needsPrefs(view);
-    const sig = all.map(needsKey).join("\n") + "\nD:" + desk.map(needsKey).join(",") + "\nP:" + prefs.layout + "|" + prefs.tab + "|" + (needsMoreOpen ? 1 : 0) + "|" + (prefs.sw ? 1 : 0);
+    const sig = all.map(needsKey).join("\n") + "\nD:" + desk.map(needsKey).join(",") + "\nL:" + laterYou.map((it) => it.q.n + "@" + it.later + "@" + (it.q.laterWords || "")).join(",") + "\nLD:" + laterDesk.map((it) => it.q.n + "@" + it.later + "@" + (it.q.laterWords || "")).join(",") + "\nP:" + prefs.layout + "|" + prefs.tab + "|" + (needsMoreOpen ? 1 : 0) + "|" + (prefs.sw ? 1 : 0);
     if (host.dataset.sig === sig && !host.hidden) return;
     // the answered cards are drawn under a quiet label of their own; with nothing waiting that is all the strip holds
     // folded by default (Phill 11-02): a count under a label you click to open; the cards stay in the page, hidden, so the
@@ -6606,8 +6830,11 @@
       sec.append(toggle, body);
       return sec;
     };
-    if (!items.length && !desk.length) {
-      host.replaceChildren(answeredSection());
+    const laterSection = (rows) => { const sec = el("div", "needs-later"); for (const it of rows) sec.appendChild(needsLaterLine(it)); return sec; };
+    // each tab draws its own LATER lines: a "you" row never sits in the Desk owes tab, nor a desk one in Needs you
+    const laterShown = prefs.tab === "desk" ? laterDesk : laterYou;
+    if (!items.length && !desk.length && !laterYou.length && !laterDesk.length) {
+      host.replaceChildren(...(settled.length ? [answeredSection()] : []));
       delete host.dataset.waiting;
       host.hidden = false;
       host.dataset.sig = sig;
@@ -6687,12 +6914,13 @@
     grid.setAttribute("role", "tabpanel");
     drawNeedsList(grid, prefs.tab === "desk" ? desk : items, prefs, rowOf);
     const kids = [head, needsBar(items), grid];   // the bar is CSS-hidden on Board and is the only Needs surface on Build and Memory, whichever tab is picked
+    if (laterShown.length) kids.push(laterSection(laterShown));
     if (settled.length) kids.push(answeredSection());
     host.replaceChildren(...kids);
     host.hidden = false;
     // the cards lead with their band number: the band read gives it (the Decisions panel's own slot may not be drawn on this tab)
     // (no band transport on a read-only manifest surface: the cards then draw without numbers)
-    if (typeof bandRead === "function" && items.some((it) => it.kind === "question")) {
+    if (typeof bandRead === "function" && (items.some((it) => it.kind === "question") || laterYou.length || laterDesk.length)) {
       const seq = ++cardBandSeq;
       let p = null;
       try { p = bandFetch(false); } catch (e) { p = null; }

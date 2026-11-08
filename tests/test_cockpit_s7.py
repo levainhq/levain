@@ -32,7 +32,7 @@ def _wrap(at="2026-10-20T16:31:00+00:00"):
 def test_where_to_begin_names_its_sources_and_hands_the_open_loops_to_the_card():
     loops = [_sp("spore-1", "cold thing", tier="cold", domain="alpha"), _sp("spore-2", "hot thing", tier="hot", domain="beta")]
     got = _begin(loops=loops)
-    assert got["title"] == "Where to begin" and got["source"] == "from the Tray and Open loops"
+    assert got["title"] == "Where to begin" and got["source"] == "from the List and Open loops"
     assert [t["text"] for t in got["threads"]] == ["hot thing", "cold thing"]          # hottest first, none dropped
     assert [t["domain"] for t in got["threads"]] == ["beta", "alpha"]
     assert [ln["label"] for ln in got["lines"]] == ["loop"]                            # every item still on the wire
@@ -86,7 +86,7 @@ def test_the_card_groups_threads_by_repo_loudest_first(tmp_path: Path) -> None:
         out = _drive(tmp_path, f"{url}/#write_token=T", [DESKTOP, {"until": "document.querySelector('.brief-card')"},
                                                           {"eval": _PROBE}])["values"]
     got = json.loads(out[-1])
-    assert got["card"] and got["title"] == "Next from the Tray" and got["source"] == "from the Tray and Open loops", got   # the data says "Where to begin"; the card names what it holds, and the caption sits under the loops heading
+    assert got["card"] and got["title"] == "Next from the List" and got["source"] == "from the List and Open loops", got   # the data says "Where to begin"; the card names what it holds, and the caption sits under the loops heading
     assert got["lead"] and got["rows"], got
     counts = [int(r["n"].split()[0]) for r in got["rows"]]
     assert counts == sorted(counts, reverse=True), got                  # loudest first

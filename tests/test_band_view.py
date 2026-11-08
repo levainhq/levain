@@ -385,3 +385,11 @@ def test_a_real_launch_row_in_the_real_coordinator_store_classes_a_worker_autono
     assert band_view.hook_prompt({"session_id": "real-worker-1"}, env(qdir))[0] == ""
     assert band_view.hook_contract({"session_id": "real-worker-1"}, env(qdir)) == ""
     assert numbers_of(band_view.hook_prompt({"session_id": "some-human-seat"}, env(qdir))[0]) == [1]
+
+
+def test_later_label_and_later_words_share_one_format_home():
+    from levain.band_view import _later_label, later_words
+    for day, today in (("2026-11-09", "2026-11-08"), ("2026-11-10", "2026-11-08"), ("2027-01-02", "2026-12-30")):
+        assert _later_label(373, day, today) == f"373 {later_words(day, today)}"
+    assert later_words("2026-11-09", "2026-11-08") == "Mon"
+    assert later_words("2026-11-10", "2026-11-08") == "Tue 11-10"

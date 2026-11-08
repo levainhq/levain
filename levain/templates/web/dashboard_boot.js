@@ -397,7 +397,7 @@
   // `headers` is the SAME read-header function the reads above use, so the change stream (a fetch read that
   // cannot go through res.json()) carries the same credential; `reload` is the board's one passive re-read and
   // resolves true only once a board was drawn (false: deferred by an edit or a load in flight, or it failed).
-  window.LevainCockpitTransport = { readJson: authedReadJson, headers: readHeaders, reload: () => load({ passive: true }) };
+  window.LevainCockpitTransport = { readJson: authedReadJson, headers: readHeaders, reload: () => load({ passive: true }), rowActions, rowVerb };
 
   // Poll an async job's status → { status, result?, error? }. Rides authedReadJson (spore-220 gates
   // /job.json off-box; token-free on loopback/read-only). Throws on a non-OK (incl. the fail-closed
@@ -580,6 +580,9 @@
     bad_kind: "This page and the server disagree about that request. Reload and try again.",
     confirm_required: "That needs a confirmation. Try again and confirm it.",
     bad_request: "That request was not understood. Reload and try again.",
+    intake_refused: "That line was not understood. Nothing was added.",
+    source_unavailable: "The store behind that is unavailable right now. Nothing was added.",
+    drop_refused: "The desk's store refused that line. Nothing was added.",
     bad_signature: "That signature was not accepted. Sign again.",
     sign_required: "That is sent only after your passkey signs it; nothing was sent. Send it again.",
     credential_required: "Saving needs the write token for this page. Open the page from the link that carries it."
@@ -604,7 +607,9 @@
     // `detail` is the server's own words for why, only for the semantic refusal of a band answer (it names the item it
     // refused); any other fault (a 503, a 5xx) shows the fixed line, never the server's raw text
     return { ok: false, error: code, message: text, status: r.status,
-             detail: code === "answer_refused" && r.status === 422 && typeof d.message === "string" ? d.message : "" };
+             // an intake refusal's reason is the parser's own sentence ("that time has passed"): the box shows it, since
+             // the grammar lives on the server only
+             detail: (code === "answer_refused" || code === "intake_refused") && r.status === 422 && typeof d.message === "string" ? d.message : "" };
   }
 
   // One write per fingerprint at a time: a second identical submit while the first is still asking, firing or
@@ -707,7 +712,8 @@
 
   function panelActionFor(verb, req) {
     // every capture, a note included, is the Tray's create; the disposition rides in params
-    const want = verb === "spore_seed" ? "tray" : null;
+    // the List's panel keeps its wire id `tray`; its create (spore_seed) and its intake box (list_intake) are both offered there
+    const want = verb === "spore_seed" || verb === "list_intake" ? "tray" : null;
     for (const pid of Object.keys(live.panels)) {
       if (want && pid !== want) continue;
       const a = live.panels[pid].actions.find((x) => x && x.verb === verb);
@@ -817,6 +823,19 @@
     const action = row && Array.isArray(row.actions) ? row.actions.find((a) => a && a.verb === verb) : null;
     if (!action) return { ok: false, error: "not_offered", message: "the cockpit no longer offers that here; nothing was sent" };
     return postVerb(action, params || {}, signTxn ? { signTxn: signTxn } : {});
+  }
+
+  // The row actions the cockpit offered on a row now, and one of them posted by name (the agents card's detail view): the row's own
+  // offered action, so a verb the kernel did not offer on it is never sent. `confirm` is the second tap of a verb that asks one.
+  function rowActions(rowId) {
+    const row = live && live.rows ? live.rows[rowId] : null;
+    return row && Array.isArray(row.actions) ? row.actions : [];
+  }
+  async function rowVerb(rowId, verb, params, confirm) {
+    if (!live) return { ok: false, error: "not_ready", message: "the page has not finished reading" };
+    const action = rowActions(rowId).find((a) => a && a.verb === verb);
+    if (!action) return { ok: false, error: "not_offered", message: "the cockpit no longer offers that here; nothing was sent" };
+    return postVerb(action, params || {}, { confirm: confirm === true });
   }
 
   // Draw what the last write said on its row (or in the status line when the row is gone). The status
@@ -935,9 +954,12 @@
         if (myGen !== loadGen) return false;     // superseded while it was stuck: the newer read owns the board
         if (passive && editInProgress()) { notice = null; status("editing — refresh deferred"); return false; }
         writeTokenRequired = mview.write_token_required === true;
-        window.LevainDashboard.render(mview, mview.writable
-          ? { commit: manifestCommit, commitAction: manifestAction, cancelPending, answerQuestion, bandRead, answerBand, dismissNote, reviewItem, onJobsIdle, recall } : { recall });
-        live = { rows: mview.targets.rows, panels: mview.targets.panels, heads: mview.verb_heads };
+        const liveBefore = live;
+        live = { rows: mview.targets.rows, panels: mview.targets.panels, heads: mview.verb_heads };   // published before the draw: an open detail rebuilds inside render and must read THIS read's actions
+        try {
+          window.LevainDashboard.render(mview, mview.writable
+            ? { commit: manifestCommit, commitAction: manifestAction, cancelPending, answerQuestion, bandRead, answerBand, dismissNote, reviewItem, onJobsIdle, recall } : { recall });
+        } catch (e) { live = liveBefore; throw e; }
         if (heldNext) {    // published once drawn: only then can a panel be refetched in place
           window.LevainCockpitHeld = heldNext;
           document.dispatchEvent(new CustomEvent("levain:cockpit-held"));   // the change stream starts, or restarts, on this

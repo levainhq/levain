@@ -370,6 +370,8 @@ LAZY_SITES = {
     'levain/cockpit/engine.py::_egress_lookup_of::from levain.consent.listing import egress_reading': 'operator',
     # operator: <- ``Cockpit._compose_decisions`` only; ``Cockpit(`` is constructed only in ``levain/cockpit/providers.py``
     'levain/cockpit/engine.py::_note_rows_in::from levain.consent.listing import PENDING_CAP': 'operator',
+    # operator: the same function as the row below (``Cockpit._compose_decisions`` only)
+    'levain/cockpit/engine.py::_question_rows_in::from levain.band_view import later_facets': 'operator',
     'levain/cockpit/engine.py::_question_rows_in::from levain.consent.listing import PENDING_CAP': 'operator',
     # operator: <- ``CockpitDB._ensure_schema_txn`` <- ``_ensure_schema``; ``CockpitDB(`` is constructed in ``levain/cli.py`` and ``cockpit/{broker,keys,sign_client}.py`` only (``git grep -n 'CockpitDB(' -- levain``)
     'levain/cockpit/firejournal.py::_take_store_lock::from levain.cockpit.broker import LOCK_NAME': 'operator',

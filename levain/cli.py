@@ -945,7 +945,7 @@ def build_parser() -> argparse.ArgumentParser:
             "serves a fresh SubstrateView snapshot on every request. READ-ONLY by "
             "default — it binds a socket, so read-only is the safe default (unlike "
             "`levain tui`, a local terminal, which defaults writable); pass --write for "
-            "the GOVERNED WRITABLE cockpit (operate State / spores / Tray-Keep through "
+            "the GOVERNED WRITABLE cockpit (operate State / spores / the List through "
             "the same governed seam `levain tui` uses; every write needs the write token "
             "the server prints at start). "
             "`serve-app` is the in-host MCP App alternative."
@@ -983,7 +983,7 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help=(
             "Serve the GOVERNED WRITABLE cockpit instead of a read-only glance — "
-            "enables State / spore touch/descend/ascend / Tray-Keep / episode-tombstone "
+            "enables State / spore touch/descend/ascend / the List / episode-tombstone "
             "edits through the governed write seam. Every write needs the write token "
             "this server prints at start, with a link that carries it (loopback too: "
             "127.0.0.1 is reachable by every local user). Loopback-ONLY — there "

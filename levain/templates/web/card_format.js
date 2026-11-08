@@ -606,7 +606,9 @@
       const q = ln && ln.question, c = ln && ln.consent, n = ln && ln.note;
       const desk = !!(q && q.section === "desk");
       const tag = desk ? (q.carried ? "both" : "desk") : "you";
-      const open = q ? q.state === "open" : c ? c.state === "pending" : n ? n.state === "open" : false;
+      // an open question served with a `later` day was judged dated past today by the server: counted in no tab
+      const later = !!(q && typeof q.later === "string" && /^\d{4}-\d{2}-\d{2}$/.test(q.later));
+      const open = q ? q.state === "open" && !later : c ? c.state === "pending" : n ? n.state === "open" : false;
       out.tags.push(tag);
       if (desk) out.show = true;
       if (open && tag !== "desk") out.you++;

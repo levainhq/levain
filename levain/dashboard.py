@@ -595,6 +595,11 @@ class OpenSpore:
     # anneal's store-assigned origin key ("" when the store has none): the key a cockpit label is
     # written under (K2b-3b), so a rendered row can name its own label resource. Never versioned
     origin_key: str = ""
+    # an agenda's germinate target (``band``/``nudge``/``desk``/``board:<repo>``) and its attention, or a
+    # seed's ``attention: talk`` (anneal 1.0.4), as stored; None when absent. Versioned: a re-target from
+    # elsewhere stales a card signed on the old one
+    target: str | None = None
+    attention: str | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return self.__dict__.copy()
@@ -632,6 +637,8 @@ def open_spore_from(s: Mapping[str, Any]) -> "OpenSpore":
         ascend_kinds=sorted(ASCEND_BY_TYPE.get(stype, frozenset())),
         origin_key=ok if isinstance(ok := s.get("origin_key"), str) else "",
         created=str(s.get("created") or ""),
+        target=(str(tg) if (tg := s.get("target")) is not None else None),
+        attention=(str(at) if (at := s.get("attention")) is not None else None),
     )
 
 

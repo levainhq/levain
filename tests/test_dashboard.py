@@ -1445,3 +1445,101 @@ class TestHealthOraclesRound2:
         for age, want in ((2.5, "3h ago"), (3.5, "4h ago"), (0.99, "under 1h ago")):
             h.save_age_hours = age
             assert want in (health_oracle_line(h) or "")
+
+
+# --- THE LIST's page (levain 64 L3): string-level pins on the served assets and the frozen payload ------------------
+
+class TestListPagePins:
+    WEB = Path(__file__).resolve().parent.parent / "levain" / "templates" / "web"
+
+    def _js(self, name: str) -> str:
+        return (self.WEB / name).read_text()
+
+    def _fn(self, src: str, head: str, tail: str) -> str:
+        a = src.index(head)
+        return src[a:src.index(tail, a)]
+
+    def test_open_loops_is_on_build_only_and_the_list_keeps_morning_and_board(self) -> None:
+        view = self._js("cockpit_view.js")
+        assert 'tray: "morning board", loops: "build",' in view
+        assert 'loops: "board build"' not in view
+
+    def test_the_intake_box_posts_one_line_and_holds_no_grammar(self) -> None:
+        core = self._js("dashboard_core.js")
+        box = self._fn(core, "function buildListIntake()", "    return box;\n  }")
+        assert 'commit({ kind: "list_intake", line })' in box
+        assert "noContactFill(input)" in box and 'ev.key === "Enter"' in box
+        assert "receipt_line" in box and "intakeKept" in box
+        # the grammar is the server's: the box has no regular expression, no @ or ? test, no date maths
+        for tell in ("RegExp", "startsWith(\"@\")", "startsWith(\"?\")", "new Date", "[0]===\"@\"", "/^@", "/^\\?"):
+            assert tell not in box, tell
+        assert "list_intake" in self._js("dashboard_boot.js").split("function panelActionFor")[1].split("async function manifestCommit")[0]
+
+    def test_the_intake_counts_only_a_landed_state_as_sent_and_trims_the_draft(self) -> None:
+        core = self._js("dashboard_core.js")
+        box = self._fn(core, "function buildListIntake()", "    return box;\n  }")
+        # ok:true is transport: REFUSED / EXPIRED / CANCELLED / STALE / COMMITTED_INCOMPLETE must take the failure path
+        assert 'st === "COMMITTED" || st === "done"' in box and 'st === "WAITING" || st === "applying"' in box
+        assert "res.ok && (landed || pending)" in box and '"not written ("' in box
+        assert "intakeKept.draft.trim() === line" in box and "intakeKept.draft === line" not in box
+        # support obeys text_locked like the primary text; held rows shown count for the chips and the filter
+        assert "s.support && !s.text_locked" in core
+        assert "const listAll = () =>" in core and "buildSurfaceChips(listAll()," in core
+        assert "listAll().some((s) => s.surface === listSurface)" in core
+
+    def test_a_refusals_reason_reaches_the_box_and_501_503_have_words(self) -> None:
+        boot = self._js("dashboard_boot.js")
+        assert 'code === "intake_refused"' in boot
+        assert "intake_refused:" in boot and "source_unavailable:" in boot
+
+    def test_a_band_or_board_row_returns_before_any_verb(self) -> None:
+        core = self._js("dashboard_core.js")
+        row = self._fn(core, "  function sporeRow(", "  // The filter bar the spore panels share")
+        foreign = row[row.index("if (foreign) {"):]
+        foreign = foreign[:foreign.index("return row;")]
+        assert "buildSporeVerbs" not in foreign and "appendRowVerbs" not in foreign 
+
+    def test_the_frozen_payload_offers_band_and_board_rows_no_verb_and_the_panel_offers_the_intake(self) -> None:
+        import json
+
+        panel = json.loads((Path(__file__).parent / "fixtures" / "list_panel.json").read_text())
+        assert panel["id"] == "tray" and "list_intake" in {a["verb"] for a in panel["actions"]}
+        surfaces = {r["facets"]["surface"] for r in panel["rows"]}
+        assert {"band", "board", "spore", "talk", "drop"} <= surfaces
+        for r in panel["rows"]:
+            if r["facets"]["surface"] in ("band", "board"):
+                assert r["actions"] == [] if "actions" in r else True, r["id"]
+        assert panel["note"]
+
+
+class TestListPagePinsRound2:
+    """Review findings (levain 64 L3 round 1) pinned as strings; each fails against the pre-fix source."""
+    WEB = Path(__file__).resolve().parent.parent / "levain" / "templates" / "web"
+
+    def _js(self, name: str) -> str:
+        return (self.WEB / name).read_text()
+
+    def test_the_list_is_marked_by_the_panels_intake_action_never_by_its_rows(self) -> None:
+        view, core = self._js("cockpit_view.js"), self._js("dashboard_core.js")
+        assert 'a.verb === "list_intake"' in view and "view.tray_is_list = true" in view
+        assert "view.tray_is_list === true" in core
+        assert "some((s) => s && s.surface)" not in core                      # the old row-content inference is gone
+
+    def test_a_band_or_board_row_keeps_its_title_and_shows_the_body_beside_it(self) -> None:
+        view, core = self._js("cockpit_view.js"), self._js("dashboard_core.js")
+        assert "row.title || row.body" in view and "support:" in view
+        assert 'el("span", "muted list-support", s.support)' in core
+
+    def test_the_surface_filter_reaches_the_held_rows(self) -> None:
+        core = self._js("dashboard_core.js")
+        assert "held.filter(inSurface)" in core and core.count("held.filter(inSurface)") == 2
+
+    def test_a_write_in_flight_never_clobbers_the_draft_typed_since(self) -> None:
+        core = self._js("dashboard_core.js")
+        assert "if (intakeKept.draft.trim() === line) intakeKept.draft = \"\"" in core
+        assert "if (!intakeKept.draft) intakeKept.draft = line" in core
+
+    def test_the_surface_and_pointer_chips_are_styled_as_the_meta_cells_children(self) -> None:
+        css = self._js("dashboard.css")
+        assert ".row > .list-meta > .list-surface" in css and ".row > .list-meta > .list-pointer" in css
+        assert ".row > .list-surface" not in css.replace(".row > .list-meta > .list-surface", "")
