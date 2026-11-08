@@ -155,8 +155,7 @@ def _file_card(store: Any, card: Mapping[str, Any] | None, recorded: Sequence[An
     if not webpush.live(qdir):
         return CardResult(False, "no phone is subscribed to the signing queue", rid)
     body = str(card["typed"])[:_TITLE_CUT]
-    if not sender.spawn(qdir, kind="question", ref=entries[0].item, title=CARD_TITLE, body=body,
-                        url=deep_link(origin, rid)):
+    if not sender.spawn_sign_request(qdir, rid, title=CARD_TITLE, body=body, url=deep_link(origin, rid)):
         return CardResult(False, "the push could not be started", rid)
     return CardResult(True, None, rid)
 
