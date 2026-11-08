@@ -278,7 +278,7 @@ check "the entity's repository keeps the retired id as owner" test "$(stat -c %u
 refused "operator git reads the entity's repository after undo" opgit -C "$WS/repo-h" status --short
 refused "sudo git reads it after undo (git checks SUDO_UID, the operator)" sudo env GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL=/dev/null git -C "$WS/repo-h" status --short
 refused "root's own git reads it after undo" sudo env -u SUDO_UID GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL=/dev/null git -C "$WS/repo-h" status --short
-check "operator can clone it to keep the work" bash -c "opgit -c safe.directory='$WS/repo-h' -c core.hooksPath=/dev/null clone -q --no-local '$WS/repo-h' /tmp/levain-iso-kept && test -e /tmp/levain-iso-kept/a"
+check "operator can clone it to keep the work" bash -c "opgit -c safe.directory='$WS/repo-h' -c safe.directory='$WS/repo-h/.git' -c core.hooksPath=/dev/null clone -q --no-local '$WS/repo-h' /tmp/levain-iso-kept && test -e /tmp/levain-iso-kept/a"
 if grep -qx "$ME" "$CANARY_LOG"; then fail "entity-planted code ran as the operator after undo"; else pass "no entity-planted code ran as the operator after undo"; fi
 if [ "$(uname)" = Darwin ]; then
   if ls -leR "$(dirname "$WS")" 2>/dev/null | grep -qE '^ [0-9]+: '; then fail "ACL entries left in the workspace"; else pass "no ACL entries left in the workspace"; fi
