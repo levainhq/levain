@@ -102,11 +102,11 @@ are not rank-contiguous). Regions are content: they are hashed into the manifest
 ### Kernel default layout
 
 `build_default_cockpit` registers, by region and in rank order (the ranks are in `levain/cockpit/providers.py`; this
-page does not copy them): `brief` the state line, then Where to begin; `hero` the Activity feed (it takes the hero
-ambient, and a downstream's own hero yields to it); `widgets` Sessions, Memory, Health and Levain health; `operate`
+page does not copy them): `brief` the state line, then Where to begin; `hero` the Activity feed (it holds the hero
+ambient until a downstream registers its own hero, which takes the slot: Activity yields); `widgets` Sessions, Memory, Health and Levain health; `operate`
 the List (wire id `tray`) and Open loops (both `tall`), Recent episodes, Recent edits (no Keep card: a parked loop is
 an Open loops row marked parked, a legacy `note` row shows on the List), Recent jobs (`medium`), the Notification
-record and Topology (`tall`); `mind` the Neocortex tabs card (one tab per continuity heading, ranked in heading order
+record (`medium`) and Topology (`tall`); `mind` the Neocortex tabs card (one tab per continuity heading, ranked in heading order
 from 0, span 2, `tall`), Crystallized patterns (`tall`) and the Cognition card (graph and projection history,
 `tabs="Cognition"`, `short`). Some of these are optional or left out by an embedder (`exclude`), and Recent jobs
 appears only with a job store. In `operate`, cards flow in rank order, and the kernel leaves its ranks between Open

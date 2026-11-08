@@ -44,7 +44,7 @@ L2 ran `--slots 4 --verifier-slots 1 --operator admin` and got, with rc=0:
 
 Progress goes to stderr, one numbered line per step. L2 also saw a stderr line `pending: ... verb-unbuilt for: ...` naming helper verbs the build lacked; the list changes as verbs land, and in L2 it was informational.
 
-After it, L2 saw six systemd units active (`levain-control`, `levain-dispatch`, `levain-dispatch_run`, `levain-keys`, `levain-qbroker`, `levain-reaper`). Those six are what L2 saw; the units the code installs on Linux are the entries of `SERVICES` in `levain/slot/units.py` whose hosts include `linux`, and that list is the one to trust, the store under `/var/levain`, and the helpers under `/usr/libexec/levain/`.
+After it, L2 saw six systemd units active (`levain-control`, `levain-dispatch`, `levain-dispatch_run`, `levain-keys`, `levain-qbroker`, `levain-reaper`). Those six are what L2 saw; the units the code installs on Linux are the entries of `SERVICES` in `levain/slot/units.py` whose hosts include `linux`, and that list is the one to trust. L2 also saw the store under `/var/levain` and the helpers under `/usr/libexec/levain/`.
 
 ## 3. Repair
 
