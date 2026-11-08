@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import json
 import os
+import sqlite3
 import subprocess
 import time
 from pathlib import Path
@@ -160,6 +161,9 @@ def test_j2_the_needs_band_at_phone_width_a_tap_on_an_option_answers_it(tmp_path
 
 # --- 3. a push arrives, the notification is tapped, the app lands on the pending card ---------------------------------------------
 
+NP_ID = "np-1a2b3c4d"
+
+
 def _sub(n: int = 1) -> dict[str, Any]:
     import base64
 
@@ -175,7 +179,7 @@ def _sub(n: int = 1) -> dict[str, Any]:
 
 @needs_browser
 def test_j3_a_push_is_tapped_and_the_app_lands_on_the_pending_card(tmp_path: Path, monkeypatch) -> None:
-    from levain.webpush import center, presence, sender
+    from levain.webpush import presence, sender
     from tests.test_cockpit_pairing_http import _pair
     from tests.test_cockpit_webpush import T as PUSH_T, _call, _signed
 
@@ -187,25 +191,30 @@ def test_j3_a_push_is_tapped_and_the_app_lands_on_the_pending_card(tmp_path: Pat
     lh.mkdir(parents=True, mode=0o700)
     store = QuestionStore(lh)
     _scratch(tmp_path, qdir, lh, store.path)
-    q = _file(store, "Which retry policy?")
+    _file(store, "Ship the sweep fix tonight?", rec="fix")                   # a decoy card, number 1
+    q = _file(store, "Which retry policy?")                                  # the card the push is about, number 2
+    # flow's band rows carry its own `np-<8 hex>` item id, and the band read pairs it with the card number: here the target is filed under
+    # such an id (no card number is 1 + its hex), so only the page's band-read lookup can find the card the link names
+    with sqlite3.connect(store.path) as c:
+        c.execute("DROP TRIGGER questions_frozen")                           # the scratch copy only: the store refuses a rewrite of its own id
+        c.execute("UPDATE questions SET id = ? WHERE n = ?", (NP_ID, q.n))
     # the push, through the server's own sender: a live subscription, the transport stubbed at its seam (no push leaves the machine),
-    # the payload bytes read at build_payload (the JSON the worker would decrypt). flow's band refs are np-<8 hex>, which push_url
-    # turns into this very link; the question here has no such ref, so the link is the attention form it returns.
+    # the payload bytes read at build_payload (the JSON the worker would decrypt). The server builds the link itself: push_url runs
+    # unpatched on flow's real ref shape.
     sub = _sub()
     posted: list[str] = []
     built: list[bytes] = []
     real_build = sender.build_payload
     monkeypatch.setattr(sender, "_post", lambda req: posted.append(req.full_url) or 201)
     monkeypatch.setattr(sender, "build_payload", lambda *a, **k: built.append(real_build(*a, **k)) or built[-1])
-    monkeypatch.setattr(center, "push_url", lambda st, ping, kind, url, ref=None: f"/?view=needs&item={ref}")
     monkeypatch.setattr(presence, "should_push", lambda *a, **k: presence.Decision(True, "pushing", "journey"))
     with _signed(src, qdir) as (port, _httpd):
         _dev, dev_tok = _pair(port, label="iPhone")                          # his paired phone, then its push subscription
         assert _call(port, "POST", "/webpush/subscribe", sub, token=dev_tok)[0] == 200
-        sender.send(qdir, kind="attention", ref=q.id, title="Which retry policy?", body="the feed PR is waiting on you", url="/")
+        sender.send(qdir, kind="attention", ref=NP_ID, title="Which retry policy?", body="the feed PR is waiting on you", url="/")
         assert posted == [sub["endpoint"]], posted                           # the push went to the stub, once, and nowhere else
         payload = json.loads(built[-1])
-        assert payload["url"] == f"/?view=needs&item={q.id}" and isinstance(payload["ping"], int), payload
+        assert payload["url"] == f"/?view=needs&item={NP_ID}" and isinstance(payload["ping"], int), payload
         out = _phone_tap(tmp_path, f"http://localhost:{port}/#write_token={PUSH_T}", payload)
         quiet = _phone_tap(tmp_path, f"http://localhost:{port}/#write_token={PUSH_T}", payload, tap=False)
     # the control: the same push, no tap: the notification is shown and the app stays where it was (so the landing above is the tap's)
