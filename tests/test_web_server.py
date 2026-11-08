@@ -526,7 +526,8 @@ class TestAssets:
         boot = load_web_asset("dashboard_boot.js")
         for m in re.finditer(r'kind: "spore_set_disposition"[^}]*\}', core):
             assert "expect_disposition: s.disposition" in m.group(0), m.group(0)
-        assert len(re.findall(r'kind: "spore_set_disposition"', core)) == 4
+        # one route-dependent write is left (metabolize); the Keep's to-tray / activate / remind-me went with the panel (TS-5a)
+        assert len(re.findall(r'kind: "spore_set_disposition"', core)) == 1
         assert "req.expect_disposition = s.disposition;" in core
         assert 'if (kind === "spore_descend") req.expect_disposition' not in core
         assert "retireStaleForm(form)" in core and "levain:editor-closed" in core

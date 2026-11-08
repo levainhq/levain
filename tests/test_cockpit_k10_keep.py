@@ -4,7 +4,7 @@ across the refresh button and across a real store write seen through the change 
 
 The K10 board folds the rows that do not fit a card (`foldRows`); a row that grew past the card on the reader's click used to be
 folded away with the rest, so the open spore vanished on the click and on every redraw. Driven in headless Chrome against a
-served cockpit with a long Keep: a tall spore at the top and thirty more under it."""
+served cockpit with a long Tray: a tall spore at the top and thirty more under it (the Keep panel was removed, TS-5a; the Tray is the surviving list that holds these rows)."""
 
 from __future__ import annotations
 
@@ -20,11 +20,11 @@ from tests.test_cockpit_k4a_needs import DESKTOP
 from tests.test_cockpit_scroll_keep_page import _serve_plain
 
 PARA = "The whole situation, what was tried, what failed, who owns it and what would close it. " * 6
-GIANT = "GIANTKEEP " + "\n\n".join(f"{i}. {PARA}" for i in range(8))
-PANEL = "document.querySelector('[data-ck-panel=keep]')"
+GIANT = "GIANTTRAY " + "\n\n".join(f"{i}. {PARA}" for i in range(8))
+PANEL = "document.querySelector('[data-ck-panel=tray]')"
 BODY = f"{PANEL}.querySelector('.pbody')"
 # the tall row, the way a reader sees it: open or not, drawn or folded away, and how far the card's body is scrolled
-GIANT_ROW = f"[...{PANEL}.querySelectorAll('.row')].find(r => r.textContent.indexOf('GIANTKEEP') >= 0)"
+GIANT_ROW = f"[...{PANEL}.querySelectorAll('.row')].find(r => r.textContent.indexOf('GIANTTRAY') >= 0)"
 STATE = (f"(() => {{ const g = {GIANT_ROW}, b = {BODY}; if (!g) return null;"
          " const t = g.querySelector(':scope > .clause-toggle');"
          " return {open: g.classList.contains('row-expanded'), drawn: g.offsetHeight > 0,"
@@ -38,12 +38,12 @@ COUNT_RENDERS = ("window.__r = 0; const L = window.LevainDashboard, o = L.render
                  "L.render = function () { try { return o.apply(this, arguments); } finally { window.__r++; } }; 1")
 
 
-def _long_keep(tmp_path: Path) -> tuple[Path, Any]:
+def _long_tray(tmp_path: Path) -> tuple[Path, Any]:
     root, src, _ids = _install(tmp_path)
     store = SporeStore(root / ".levain" / "memory.spores.json")
     for i in range(30):
-        store.add(type="task", text=f"KEEPBULK {i:02d} a reference note " + PARA, disposition="note", today=TODAY - timedelta(days=i % 5))
-    store.add(type="task", text=GIANT, disposition="note", today=TODAY + timedelta(days=2))   # newest: the first row of the Keep
+        store.add(type="task", text=f"TRAYBULK {i:02d} a note " + PARA, disposition="seed", today=TODAY - timedelta(days=i % 5))
+    store.add(type="task", text=GIANT, disposition="seed", today=TODAY + timedelta(days=2))   # newest: the first row of the Tray
     return root, src
 
 
@@ -58,7 +58,7 @@ def _assert_held(opened: dict[str, Any], after: Any, why: str) -> None:
 
 @needs_browser
 def test_the_refresh_button_keeps_a_tall_open_spore_and_its_scroll(tmp_path: Path) -> None:
-    _root, src = _long_keep(tmp_path)
+    _root, src = _long_tray(tmp_path)
     with _serve_plain(src) as url:
         out = _drive(tmp_path, f"{url}/", [
             DESKTOP,
@@ -76,8 +76,8 @@ def test_the_refresh_button_keeps_a_tall_open_spore_and_its_scroll(tmp_path: Pat
 
 @needs_browser
 def test_a_store_write_keeps_a_tall_open_spore_and_its_scroll(tmp_path: Path) -> None:
-    """The change stream path: a seat writes a spore while the page is open, the Keep moves, the board is drawn again."""
-    root, src = _long_keep(tmp_path)
+    """The change stream path: a seat writes a spore while the page is open, the Tray moves, the board is drawn again."""
+    root, src = _long_tray(tmp_path)
     store = SporeStore(root / ".levain" / "memory.spores.json")
     stop = threading.Event()
 
@@ -85,7 +85,7 @@ def test_a_store_write_keeps_a_tall_open_spore_and_its_scroll(tmp_path: Path) ->
         n = 0
         while not stop.wait(1.5):
             n += 1
-            store.add(type="task", text=f"written while open {n}", disposition="note", today=TODAY)
+            store.add(type="task", text=f"written while open {n}", disposition="seed", today=TODAY)
 
     t = threading.Thread(target=writer, daemon=True)
     with _serve_plain(src) as url:
@@ -119,7 +119,7 @@ REMEASURE = (f"(async () => {{ const b = {BODY}; window.LevainDashboard.measureO
 @needs_browser
 def test_a_folded_card_whose_open_row_scrolls_stays_keyboard_reachable(tmp_path: Path) -> None:
     """K1: the fold returned early and left the scrolling body with no tabindex, role or name: a keyboard reader could not scroll it."""
-    _root, src = _long_keep(tmp_path)
+    _root, src = _long_tray(tmp_path)
     with _serve_plain(src) as url:
         out = _drive(tmp_path, f"{url}/", [
             DESKTOP,
@@ -135,7 +135,7 @@ def test_a_folded_card_whose_open_row_scrolls_stays_keyboard_reachable(tmp_path:
 @needs_browser
 def test_any_remeasure_keeps_the_reading_place(tmp_path: Path) -> None:
     """K2: a search, another row opening or fonts settling re-fold the card; the reading place must not jump."""
-    _root, src = _long_keep(tmp_path)
+    _root, src = _long_tray(tmp_path)
     with _serve_plain(src) as url:
         out = _drive(tmp_path, f"{url}/", [
             DESKTOP,
@@ -151,10 +151,10 @@ def test_any_remeasure_keeps_the_reading_place(tmp_path: Path) -> None:
 @needs_browser
 def test_opening_another_row_keeps_the_reading_place(tmp_path: Path) -> None:
     """K2: a row above the open one opening re-folds the card (the click path); the scroll must stay where the reader put it."""
-    root, src = _long_keep(tmp_path)
+    root, src = _long_tray(tmp_path)
     store = SporeStore(root / ".levain" / "memory.spores.json")
-    store.add(type="task", text="ABOVEKEEP " + PARA, disposition="note", today=TODAY + timedelta(days=3))   # newest: above the tall one
-    above = f"[...{PANEL}.querySelectorAll('.row')].find(r => r.textContent.indexOf('ABOVEKEEP') >= 0)"
+    store.add(type="task", text="ABOVETRAY " + PARA, disposition="seed", today=TODAY + timedelta(days=3))   # newest: above the tall one
+    above = f"[...{PANEL}.querySelectorAll('.row')].find(r => r.textContent.indexOf('ABOVETRAY') >= 0)"
     click = (f"(async () => {{ const b = {BODY}; {above}.querySelector(':scope > .clause-toggle').click();"
              " await new Promise(r => setTimeout(r, 400)); return Math.round(b.scrollTop); })()")
     with _serve_plain(src) as url:
