@@ -356,7 +356,7 @@ def test_set_disposition_echo_on_a_legacy_row_drops_the_disposition(install: Pat
 
 def test_cockpit_echo_on_a_legacy_row_omits_the_disposition(tmp_path: Path) -> None:
     """The cockpit: a set_disposition on a legacy note that keeps it a note and moves its date lands, its
-    SporeApply naming no disposition and no CAS; a pure echo (nothing else changes) is ALREADY; a text
+    SporeApply writing no disposition (it rides only as anneal's expect_disposition CAS); a pure echo (nothing else changes) is ALREADY; a text
     edit on a legacy row lands."""
     from levain.cockpit.effects import ApplyOutcome, SporeEffectStore, canonical_effect, spore_resource_key
 
@@ -370,8 +370,10 @@ def test_cockpit_echo_on_a_legacy_row_omits_the_disposition(tmp_path: Path) -> N
 
     echo = canonical_effect("spore_set_disposition", {"disposition": "note", "surface_at": "2026-12-01"}, pre)
     sa = es.spore_apply(echo)
-    assert dict(sa.args) == {"next": "2026-12-01"} and dict(sa.postcondition) == {"next": "2026-12-01"}
+    assert dict(sa.args) == {"next": "2026-12-01", "expect_disposition": "note"}
+    assert dict(sa.postcondition) == {"next": "2026-12-01"}
     assert run(echo) is ApplyOutcome.APPLIED
+    assert run(echo) is ApplyOutcome.ALREADY   # a retry of the landed write: leaves hold, CAS holds
     row = es.snapshot(spore_resource_key("k.note")).row
     assert row["disposition"] == "note" and row["next"] == "2026-12-01"
     pre = row
@@ -397,6 +399,92 @@ def test_cockpit_pure_echo_after_the_row_moved_is_changed_not_already(tmp_path: 
     SporeStore(tmp_path / "s.json").update(old["id"], disposition="agenda")
     (unit,) = es.units([(0, echo)])
     assert es.apply_unit(unit).outcome is ApplyOutcome.PRECONDITION_LOST
+
+
+def test_cockpit_dropped_echo_is_not_already_after_the_disposition_moved(tmp_path: Path) -> None:
+    """L3b codex/gemini HIGH: the echo is dropped from the write, so the date was its only leaf. A note
+    already dated D, an effect {note, D}, another writer moves it to agenda: the date still matches, but
+    the row no longer holds what the effect kept, so it is PRECONDITION_LOST, never ALREADY."""
+    from anneal_memory.spores import SporeStore
+
+    from levain.cockpit.effects import ApplyOutcome, SporeEffectStore, canonical_effect, spore_resource_key
+
+    old = _legacy(tmp_path / "s.json", "note", origin_key="k.note", next="2026-12-01")
+    es = SporeEffectStore(tmp_path / "s.json")
+    pre = es.snapshot(spore_resource_key("k.note")).row
+    eff = canonical_effect("spore_set_disposition", {"disposition": "note", "surface_at": "2026-12-01"}, pre)
+    sa = es.spore_apply(eff)
+    # the CAS rides as anneal's own precondition; no disposition is written or postconditioned
+    assert dict(sa.args) == {"next": "2026-12-01", "expect_disposition": "note"}
+    assert dict(sa.postcondition) == {"next": "2026-12-01"}
+    SporeStore(tmp_path / "s.json").update(old["id"], disposition="agenda")
+    before = (tmp_path / "s.json").read_bytes()
+    (unit,) = es.units([(0, eff)])
+    assert es.apply_unit(unit).outcome is ApplyOutcome.PRECONDITION_LOST
+    assert (tmp_path / "s.json").read_bytes() == before
+
+
+def test_cockpit_dropped_echo_with_a_write_still_cas_the_disposition(tmp_path: Path) -> None:
+    """The applied path: the date differs, so anneal writes; the CAS (and the version) refuse it once
+    the disposition moved, and nothing is written."""
+    from anneal_memory.spores import SporeStore
+
+    from levain.cockpit.effects import ApplyOutcome, SporeEffectStore, canonical_effect, spore_resource_key
+
+    old = _legacy(tmp_path / "s.json", "note", origin_key="k.note")
+    es = SporeEffectStore(tmp_path / "s.json")
+    pre = es.snapshot(spore_resource_key("k.note")).row
+    eff = canonical_effect("spore_set_disposition", {"disposition": "note", "surface_at": "2026-12-01"}, pre)
+    SporeStore(tmp_path / "s.json").update(old["id"], disposition="agenda")
+    before = (tmp_path / "s.json").read_bytes()
+    (unit,) = es.units([(0, eff)])
+    assert es.apply_unit(unit).outcome is ApplyOutcome.PRECONDITION_LOST
+    assert (tmp_path / "s.json").read_bytes() == before
+
+
+def test_cockpit_pure_echo_on_a_stale_version_is_precondition_lost(tmp_path: Path) -> None:
+    """L3b gemini HIGH / deepseek MED 1: a pure echo writes nothing, so its expected_version is checked
+    by levain: another writer edited the text (the disposition untouched) -> PRECONDITION_LOST."""
+    from anneal_memory.spores import SporeStore
+
+    from levain.cockpit.effects import ApplyOutcome, SporeEffectStore, canonical_effect, spore_resource_key
+
+    old = _legacy(tmp_path / "s.json", "note", origin_key="k.note")
+    es = SporeEffectStore(tmp_path / "s.json")
+    pre = es.snapshot(spore_resource_key("k.note")).row
+    echo = canonical_effect("spore_set_disposition", {"disposition": "note"}, pre)
+    assert es.spore_apply(echo) is None
+    SporeStore(tmp_path / "s.json").update(old["id"], text="edited elsewhere")
+    (unit,) = es.units([(0, echo)])
+    assert es.apply_unit(unit).outcome is ApplyOutcome.PRECONDITION_LOST
+    # on the current version the same echo is ALREADY
+    pre = es.snapshot(spore_resource_key("k.note")).row
+    (unit,) = es.units([(0, canonical_effect("spore_set_disposition", {"disposition": "note"}, pre))])
+    assert es.apply_unit(unit).outcome is ApplyOutcome.ALREADY
+
+
+def test_guarded_store_lets_a_retired_cas_through_but_never_a_retired_write(tmp_path: Path) -> None:
+    """expect_disposition is a compare, not a write: a retired value there passes the guard (update and
+    apply) and anneal checks it; the same value as ``disposition`` is still refused."""
+    from anneal_memory.spores import ApplyRefused, SporeApply, SporeError, spore_version
+
+    from levain.spores import RetiredDisposition, guarded_spore_store
+
+    old = _legacy(tmp_path / "s.json", "note", origin_key="k.note")
+    store = guarded_spore_store(tmp_path / "s.json")
+    assert store.update(old["id"], text="ok", expect_disposition="note")["text"] == "ok"
+    with pytest.raises(SporeError):
+        store.update(old["id"], text="no", expect_disposition="handoff")
+    row = store.get(old["id"])
+    res = store.apply(SporeApply(op="update", origin_key="k.note", args={"next": "2026-12-03", "expect_disposition": "note"},
+                                 postcondition={"next": "2026-12-03"}, expected_version=spore_version(row)))
+    assert res.outcome == "applied" and res.spore["disposition"] == "note"
+    with pytest.raises(RetiredDisposition):
+        store.update(old["id"], disposition="note", expect_disposition="note")
+    with pytest.raises(ApplyRefused):
+        store.apply(SporeApply(op="update", origin_key="k.note",
+                               args={"disposition": "note", "expect_disposition": "note"},
+                               postcondition={"disposition": "note"}, expected_version=spore_version(store.get(old["id"]))))
 
 
 def test_disposition_sets_read_vs_write() -> None:

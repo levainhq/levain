@@ -425,6 +425,14 @@ def _stored_authority(row: Mapping[str, Any], f: str) -> Any:
     return row.get(f)
 
 
+_NO_CAS = object()
+
+
+def _keeps_disposition(effect: Effect) -> bool:
+    """An update that names the disposition the row already holds (an echo: not in ``writes``)."""
+    return "disposition" in effect.changes and "disposition" not in effect.writes
+
+
 class SporeEffectStore:
     """The ``EffectStore`` over an anneal ``SporeStore`` (§4.1.2's anneal mapping). Versions are the
     cockpit's own row version (``providers.spore_row_version``), which anneal recomputes under its
@@ -473,8 +481,9 @@ class SporeEffectStore:
         """The ``SporeApply`` for one concrete effect: the op from its shape, ``args`` from its
         ``changes``, and the postcondition leaves anneal requires (add/update: the fields in
         ``args``; descend: ``status`` + ``resolution.kind``; ascend: those + ``resolution.ref``;
-        delete: none). An update leaves out a disposition it does not change; ``None`` when that leaves
-        nothing to write."""
+        delete: none). An update does not write a disposition it does not change: it carries it as
+        ``expect_disposition`` (anneal's CAS), out of the postcondition. ``None`` when that leaves
+        nothing to write (only ``apply_unit`` calls this; it answers that case itself)."""
         from anneal_memory.spores import SporeApply
 
         key = _origin_key_of(effect.resource_key)
@@ -505,13 +514,16 @@ class SporeEffectStore:
         stray = sorted(set(changes) - set(SPORE_UPDATE_FIELDS))
         if not changes or stray:
             raise PermanentApplyRefusal(f"an update changes {list(SPORE_UPDATE_FIELDS)} only (got {sorted(changes)})")
-        if "disposition" in changes and "disposition" not in effect.writes:
-            # the disposition the row already holds is not written (the guarded store refuses a legacy
-            # handoff/note it is handed, unchanged or not); expected_version still pins the row
-            del changes["disposition"]
+        args: dict[str, Any] = {}
+        if _keeps_disposition(effect):
+            # the disposition the row already holds is not WRITTEN (the guarded store refuses a legacy
+            # handoff/note it is handed, unchanged or not); it rides as anneal's own CAS, a compare on
+            # the row inside the transaction that writes nothing. It is the stored form (an absent key
+            # for a plain loop), and it is out of the postcondition (anneal: no leaf names a CAS).
+            args["expect_disposition"] = changes.pop("disposition")
             if not changes:
-                return None   # writes nothing: apply_unit answers it as anneal would
-        return SporeApply(op="update", origin_key=key, args=dict(changes), postcondition=dict(changes), **guard)
+                return None   # writes nothing: apply_unit answers it, version and CAS both checked
+        return SporeApply(op="update", origin_key=key, args={**changes, **args}, postcondition=dict(changes), **guard)
 
     def apply_unit(self, unit: ApplyUnit) -> UnitApplyResult:
         from anneal_memory.spores import ApplyRefused, PostconditionFailed, SporeError
@@ -525,10 +537,14 @@ class SporeEffectStore:
         if not effect.is_create and (not self.path.parent.is_dir() or not self.path.exists()):
             raise StoreGone(f"{self.path} is absent")
         if spore_apply is None:
-            # an update whose one field, the disposition, is the row's own: nothing to write. anneal's
-            # answer to such an effect: ALREADY while the row still holds it, else the row changed
+            # an update whose one field, the disposition, is the row's own: nothing to write, so nothing
+            # anneal can be handed. Both guards are checked here, on one read of the store: ALREADY only
+            # while the row is open, at the signed version, and still holds that disposition (the CAS,
+            # compared raw as anneal compares it); anything else means the row moved.
             row = self.snapshot(effect.resource_key).row
-            if row is not None and _stored_authority(row, "disposition") == _stored_authority(effect.changes, "disposition"):
+            if (row is not None and row.get("status") != "resolved"
+                    and self.version_of(copy.deepcopy(row)) == effect.expect.get("version")
+                    and row.get("disposition") == effect.changes.get("disposition")):
                 return UnitApplyResult(ApplyOutcome.ALREADY, (MemberApply(row.get("id"), row),))
             return UnitApplyResult(ApplyOutcome.PRECONDITION_LOST, (MemberApply(None if row is None else row.get("id"), row),))
         try:
@@ -541,6 +557,13 @@ class SporeEffectStore:
                    "precondition_lost": ApplyOutcome.PRECONDITION_LOST}.get(res.outcome)
         if outcome is None:
             raise TransientApplyFault("ValueError", f"anneal apply outcome {res.outcome!r}")
+        cas = dict(spore_apply.args).get("expect_disposition", _NO_CAS)
+        if (outcome is ApplyOutcome.ALREADY and cas is not _NO_CAS
+                and (res.spore is None or res.spore.get("disposition") != cas)):
+            # anneal answers ALREADY from the written leaves before it reads its CAS, so a kept
+            # disposition that is no longer the row's is checked here, on the row anneal read under
+            # its lock (``res.spore``): the leaves match, the row the effect was signed on does not
+            outcome = ApplyOutcome.PRECONDITION_LOST
         return UnitApplyResult(outcome, (MemberApply(res.spore_id, res.spore),))
 
 
