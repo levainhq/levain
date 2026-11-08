@@ -285,7 +285,8 @@ def _clear_squat(store: QueueStore, receipts: Receipts, row: Mapping[str, Any], 
     be a signed answer, it is linked back and True is returned (a verified answer is in place).
     Should the link-back fail (the name taken again, or any other ``OSError`` but the quarantine file gone),
     :class:`OperatorError` names the quarantine file that holds it. An answer signed by a key in the current
-    snapshot is never left in quarantine unreported.
+    snapshot is never left in quarantine unreported: an ``OSError`` syncing the directory after the rename is held
+    until ``aside`` is judged (a signed answer is linked back regardless) and then names ``aside``.
 
     ``answers/`` has no sticky bit, so the member that squatted can delete or rename the quarantine file once it
     exists: a quarantine file gone is a name cleared, never an error. Any other ``OSError`` is :class:`OperatorError`,
@@ -305,7 +306,12 @@ def _clear_squat_os(store: QueueStore, receipts: Receipts, row: Mapping[str, Any
         os.rename(path, aside)
     except FileNotFoundError:
         return False
-    fsync_dir(store.answers)
+    try:
+        fsync_dir(store.answers)
+    except OSError as exc:                       # the rename happened: judge ``aside`` first, never lose its path
+        unsynced: OSError | None = exc
+    else:
+        unsynced = None
     if _signed_answer(row, aside, signers, now, ssh_keygen, receipts, request_id):
         try:
             os.link(aside, path, follow_symlinks=False)
@@ -323,4 +329,7 @@ def _clear_squat_os(store: QueueStore, receipts: Receipts, row: Mapping[str, Any
             pass
         fsync_dir(store.answers)
         return True                              # a verified answer is in place: the caller writes none of its own
+    if unsynced is not None:
+        raise OperatorError(f"request {request_id}'s answer name could not be cleared ({unsynced}): "
+                            f"what was moved aside is at {aside}") from None
     return False

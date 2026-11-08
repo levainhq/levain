@@ -439,3 +439,50 @@ def test_a_swapped_signed_answer_linked_back_on_the_last_try_is_reported_not_a_s
     assert (answers / f"{rid}.json").read_bytes() == first
     assert sorted(p.name for p in answers.iterdir()) == [f"{rid}.json"]
 
+
+def test_an_fsync_error_after_the_move_aside_never_leaves_a_signed_answer_in_quarantine_unreported(L, broker, keys,
+                                                                                                answers,
+                                                                                                monkeypatch):
+    rid = filed(broker)
+    write_answer(L, rid, keys["operator"], decision="deny")
+    first = (answers / f"{rid}.json").read_bytes()
+    real_judge, real_fsync, calls, fsyncs = operator._signed_answer, operator.fsync_dir, [], []
+
+    def stale_once(row, path, *a):
+        calls.append(path)
+        return False if len(calls) == 1 else real_judge(row, path, *a)
+
+    def eio_once(d):
+        fsyncs.append(d)
+        if len(fsyncs) == 1:
+            raise OSError(5, "Input/output error")               # the fsync right after the rename
+        return real_fsync(d)
+
+    monkeypatch.setattr(operator, "_signed_answer", stale_once)
+    monkeypatch.setattr(operator, "fsync_dir", eio_once)
+    payload, sig = rbase.signed(L, rid, keys["operator"])
+    with pytest.raises(operator.OperatorError) as got:
+        operator.write_answer(L / "queue", rid, payload, sig, rbase.snapshot(L), now=LATER)
+    left = [p for p in answers.iterdir() if p.name.startswith(".quarantine-")]
+    assert [p.name for p in answers.iterdir() if not p.name.startswith(".quarantine-")] == [f"{rid}.json"]
+    assert (answers / f"{rid}.json").read_bytes() == first
+    assert all(str(p) in str(got.value) for p in left), (left, str(got.value))
+
+
+def test_an_fsync_error_after_the_move_aside_of_junk_names_the_aside_path(L, broker, keys, answers, monkeypatch):
+    rid = filed(broker)
+    squat(L, keys, answers, rid, "junk")
+    real_fsync, fsyncs = operator.fsync_dir, []
+
+    def eio_once(d):
+        fsyncs.append(d)
+        if len(fsyncs) == 1:
+            raise OSError(5, "Input/output error")
+        return real_fsync(d)
+
+    monkeypatch.setattr(operator, "fsync_dir", eio_once)
+    payload, sig = rbase.signed(L, rid, keys["operator"])
+    with pytest.raises(operator.OperatorError) as got:
+        operator.write_answer(L / "queue", rid, payload, sig, rbase.snapshot(L), now=LATER)
+    parked = [p for p in answers.iterdir() if p.name.startswith(".quarantine-")]
+    assert len(parked) == 1 and str(parked[0]) in str(got.value)
