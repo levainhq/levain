@@ -18,7 +18,7 @@ PROSE = {"autocapitalize": "sentences", "autocorrect": "on", "spellcheck": "true
 
 _STYLED = ('<!doctype html><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">'
            '<link rel="stylesheet" href="/dashboard.css"><body class="ke"><div id="host"></div>'
-           '<script src="/room_view.js"></script><script src="/rvc.js"></script>')
+           '<script src="/mic.js"></script><script src="/room_view.js"></script><script src="/rvc.js"></script>')
 
 
 def _assets(boot):
@@ -78,7 +78,7 @@ def test_voice_never_names_a_cloud_recognizer_or_a_transcribe_route():
     js = (WEB / "room_view.js").read_text()
     for word in ("getUserMedia", "MediaRecorder", "audio/transcriptions", "api.openai.com"):
         assert word not in js, word
-    assert 'Speech.prototype && "processLocally" in Speech.prototype' in js and "r.processLocally = true" in js
+    assert 'LevainMic.localSpeech(Speech)' in js and "r.processLocally = true" in js   # the on-device test is mic.js's one function
 
 
 @needs_browser
@@ -86,7 +86,7 @@ def test_a_recognizer_that_cannot_stay_on_the_device_gets_no_control(tmp_path, w
     with _serve_room(tmp_path, w, extra_assets=_assets(_boot("Cloud"))) as (base, _h):
         out = _drive(tmp_path, base + "/rvc.html", [
             {"until": "document.querySelector('.rv-input') && !document.querySelector('.rv-send').disabled"},
-            {"eval": "document.querySelectorAll('.rv-mic').length"},
+            {"eval": "document.querySelectorAll('.rv-mic:not(.rv-mic-stream)').length"},
         ])
     assert out["values"][1] == 0
 
@@ -95,14 +95,14 @@ def test_a_recognizer_that_cannot_stay_on_the_device_gets_no_control(tmp_path, w
 def test_an_on_device_recognizer_gets_a_control_that_asks_for_local_processing(tmp_path, w):
     with _serve_room(tmp_path, w, extra_assets=_assets(_boot("Local"))) as (base, _h):
         out = _drive(tmp_path, base + "/rvc.html", [
-            {"until": "document.querySelector('.rv-mic')"},
-            {"eval": "document.querySelector('.rv-mic').click(); JSON.stringify(window.__started)"},
+            {"until": "document.querySelector('.rv-mic:not(.rv-mic-stream)')"},
+            {"eval": "document.querySelector('.rv-mic:not(.rv-mic-stream)').click(); JSON.stringify(window.__started)"},
         ])
     assert json.loads(out["values"][1]) == [{"local": True}]
 
 
 _GEOM = """(() => { const r = n => n.getBoundingClientRect();
-const acts = [...document.querySelectorAll('.rv-mic, .rv-send')], dock = r(document.querySelector('.rv-dock'));
+const acts = [...document.querySelectorAll('.rv-mic:not(.rv-mic-stream), .rv-send')], dock = r(document.querySelector('.rv-dock'));
 return JSON.stringify({noSideScroll: document.documentElement.scrollWidth <= window.innerWidth,
   inside: acts.every(b => r(b).left >= dock.left - 0.5 && r(b).right <= dock.right + 0.5),
   tall: acts.every(b => r(b).height >= 43.5), unclipped: acts.every(b => b.scrollWidth <= b.clientWidth + 1),
@@ -118,7 +118,7 @@ def test_the_dock_fits_a_390_phone_with_every_control_whole(tmp_path, w):
     with _serve_room(tmp_path, w, extra_assets=_assets(_boot("Local"))) as (base, _h):
         out = _drive(tmp_path, base + "/rvc.html", [
             {"emulate": {"w": 390, "h": 800, "dpr": 2, "mobile": True}},
-            {"until": "document.querySelector('.rv-mic') && document.querySelector('.rv-rotate')"},
+            {"until": "document.querySelector('.rv-mic:not(.rv-mic-stream)') && document.querySelector('.rv-rotate')"},
             {"eval": _GEOM},
         ])
     g = json.loads(out["values"][1])
@@ -142,12 +142,12 @@ def _run(tmp_path, w, speech, steps):
 def test_a_late_result_after_send_does_not_bring_the_sent_line_back(tmp_path, w):
     """F1, reproduced first: Send while dictating, then the recognizer fires a late result with the pre-send base."""
     out, w = _run(tmp_path, w, "Live", [
-        {"eval": "document.querySelector('.rv-mic').click(); __recs[0].emit('hello there');"
+        {"eval": "document.querySelector('.rv-mic:not(.rv-mic-stream)').click(); __recs[0].emit('hello there');"
                  " const ta = document.querySelector('.rv-input'); const was = ta.value;"
                  " document.querySelector('.rv-send').click(); __recs[0].emit('hello there again'); JSON.stringify({was, stops: __recs[0].stops})"},
         {"until": "document.querySelector('.rv-sendnote').textContent === 'Sent.'"},
         {"eval": "__recs[0].emit('late and unwanted'); JSON.stringify({v: document.querySelector('.rv-input').value,"
-                 " label: document.querySelector('.rv-mic').textContent})"},
+                 " label: document.querySelector('.rv-mic:not(.rv-mic-stream)').textContent})"},
     ])
     assert json.loads(out["values"][1]) == {"was": "hello there", "stops": 1}
     assert json.loads(out["values"][3]) == {"v": "", "label": "Dictate"}
@@ -158,8 +158,8 @@ def test_a_late_result_after_send_does_not_bring_the_sent_line_back(tmp_path, w)
 def test_a_recognizer_that_ignores_processlocally_never_starts(tmp_path, w):
     """F2: the property exists on the prototype but the setter does nothing, so reading it back is the only proof."""
     out, _w = _run(tmp_path, w, "Ignores", [
-        {"eval": "document.querySelector('.rv-mic').click(); JSON.stringify({started: __started.length,"
-                 " note: document.querySelector('.rv-sendnote').textContent, label: document.querySelector('.rv-mic').textContent})"},
+        {"eval": "document.querySelector('.rv-mic:not(.rv-mic-stream)').click(); JSON.stringify({started: __started.length,"
+                 " note: document.querySelector('.rv-sendnote').textContent, label: document.querySelector('.rv-mic:not(.rv-mic-stream)').textContent})"},
     ])
     got = json.loads(out["values"][1])
     assert got["started"] == 0 and got["label"] == "Dictate" and "keep dictation on this device" in got["note"], got
@@ -167,17 +167,17 @@ def test_a_recognizer_that_ignores_processlocally_never_starts(tmp_path, w):
 
 @needs_browser
 def test_the_mic_follows_availability_not_capability(tmp_path, w):
-    out, _w = _run(tmp_path, w, "Unavailable", [{"eval": "document.querySelectorAll('.rv-mic').length"}])
+    out, _w = _run(tmp_path, w, "Unavailable", [{"eval": "document.querySelectorAll('.rv-mic:not(.rv-mic-stream)').length"}])
     assert out["values"][1] == 0
     out, _w = _run(tmp_path, w, "Downloadable", [
         {"until": "document.querySelector('.rv-sendnote').textContent"},
-        {"eval": "JSON.stringify({mics: document.querySelectorAll('.rv-mic').length, started: __started.length,"
+        {"eval": "JSON.stringify({mics: document.querySelectorAll('.rv-mic:not(.rv-mic-stream)').length, started: __started.length,"
                  " note: document.querySelector('.rv-sendnote').textContent})"}])
     got = json.loads(out["values"][2])
     assert got["mics"] == 0 and got["started"] == 0 and "not installed" in got["note"] and "keyboard dictation key" in got["note"], got
     out, _w = _run(tmp_path, w, "Installed", [
-        {"until": "document.querySelector('.rv-mic') && document.querySelector('.rv-mic').style.display !== 'none'"},
-        {"eval": "document.querySelector('.rv-mic').click(); __recs[0].lang"}])
+        {"until": "document.querySelector('.rv-mic:not(.rv-mic-stream)') && document.querySelector('.rv-mic:not(.rv-mic-stream)').style.display !== 'none'"},
+        {"eval": "document.querySelector('.rv-mic:not(.rv-mic-stream)').click(); __recs[0].lang"}])
     assert out["values"][2] != ""            # lang is set explicitly from the document / browser language
 
 
@@ -187,8 +187,8 @@ def test_dictation_errors_read_by_code(tmp_path, w):
             "no-speech": "Heard nothing", "language-not-supported": "not installed for this language", "network": "Dictation stopped."}
     for code, words in want.items():
         out, _w = _run(tmp_path, w, "Live", [
-            {"eval": "window.__err = '%s'; document.querySelector('.rv-mic').click();"
-                     " JSON.stringify({n: document.querySelector('.rv-sendnote').textContent, l: document.querySelector('.rv-mic').textContent})" % code}])
+            {"eval": "window.__err = '%s'; document.querySelector('.rv-mic:not(.rv-mic-stream)').click();"
+                     " JSON.stringify({n: document.querySelector('.rv-sendnote').textContent, l: document.querySelector('.rv-mic:not(.rv-mic-stream)').textContent})" % code}])
         got = json.loads(out["values"][1])
         assert words in got["n"] and got["l"] == "Dictate", (code, got)
 
@@ -199,7 +199,7 @@ def test_dictation_into_an_empty_draft_enables_send(tmp_path, w):
     out, _w = _run(tmp_path, w, "Live", [
         {"eval": "const ta = document.querySelector('.rv-input'); ta.value = ''; ta.dispatchEvent(new Event('input'));"
                  " const before = document.querySelector('.rv-send').getAttribute('aria-disabled');"
-                 " document.querySelector('.rv-mic').click(); __recs[0].emit('send this to the desk');"
+                 " document.querySelector('.rv-mic:not(.rv-mic-stream)').click(); __recs[0].emit('send this to the desk');"
                  " JSON.stringify({before, after: document.querySelector('.rv-send').getAttribute('aria-disabled'), v: ta.value})"},
     ])
     assert json.loads(out["values"][1]) == {"before": "true", "after": None, "v": "send this to the desk"}
@@ -209,7 +209,7 @@ def test_dictation_into_an_empty_draft_enables_send(tmp_path, w):
 def test_typing_during_dictation_is_kept_and_the_next_result_extends_it(tmp_path, w):
     """F4: the next result must not overwrite what was typed in between."""
     out, _w = _run(tmp_path, w, "Live", [
-        {"eval": "const ta = document.querySelector('.rv-input'); document.querySelector('.rv-mic').click(); __recs[0].emit('one two');"
+        {"eval": "const ta = document.querySelector('.rv-input'); document.querySelector('.rv-mic:not(.rv-mic-stream)').click(); __recs[0].emit('one two');"
                  " ta.value = ta.value + ' typed'; ta.dispatchEvent(new Event('input')); __recs[0].emit('one two three'); ta.value"},
     ])
     assert out["values"][1] == "one two typed three"
