@@ -2336,11 +2336,11 @@
         bar.appendChild(sel);
       },
       pick: (rows) => {
-        const base = (listNow() === "held" ? [] : listNow() ? rows.filter((s) => s.surface === listNow()) : rows).filter((s) => !cardHides(s));
+        const base = (listNow() === "held" ? [] : listNow() ? rows.filter((s) => s.surface === listNow() && inSurfaceChip(s)) : rows).filter((s) => !cardHides(s));
         const ids = views.length && viewOf() ? view.tray_view_rows[viewOf()] : null;
         // the focus view draws a carried desk row under Needs you AND under Desk owes, as flow's footer prints it, so the control's
         // "desk owes N" is the number of rows a person can see under that heading (a chosen view is ungrouped: no copy there)
-        const all = isList && !inCard && !Array.isArray(ids) ? withCarriedDesk(base) : base;
+        const all = isList && !inCard && !Array.isArray(ids) && !listNow() ? withCarriedDesk(base) : base;
         if (!Array.isArray(ids)) return all;
         const byId = new Map(all.map((s) => [s.id, Object.assign({}, s, { age_shown: true })]));
         // a row the view did not name still shows, after the named ones
@@ -2449,6 +2449,11 @@
   // The List's surface filter: one chip per store that has a row now, with its count, plus All. A display choice only
   // (`listSurface`); the rows and their order are the kernel's.
   const SURFACE_WORDS = { band: "band", board: "board", spore: "spores", talk: "talk", drop: "drops" };
+  // ONE rule for which rows a surface chip stands for: the chip's count and the rows the focus view draws under it both use it, so
+  // a number on a chip is the number of rows its tap shows. The band's chip excludes the desk's rows and the later ones.
+  function inSurfaceChip(s) {
+    return !!(s && s.surface) && !(s.surface === "band" && (s.group === "desk" || s.group === "later"));
+  }
   function buildSurfaceChips(list, current, choose, heldCount) {
     const row = el("div", "list-surfaces");
     row.setAttribute("role", "group");
@@ -2456,7 +2461,7 @@
     const counts = new Map();
     // the band chip counts the rows due for the operator, as the panel's header does: the desk's rows and the later ones sit
     // under their own headings, outside it
-    for (const s of list) if (s && s.surface && !(s.surface === "band" && (s.group === "desk" || s.group === "later"))) counts.set(s.surface, (counts.get(s.surface) || 0) + 1);
+    for (const s of list) if (inSurfaceChip(s)) counts.set(s.surface, (counts.get(s.surface) || 0) + 1);
     const chips = [];
     const mk = (value, label) => {
       const c = el("button", "rc-chip list-surface-chip", label);

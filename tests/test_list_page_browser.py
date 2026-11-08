@@ -448,6 +448,16 @@ _FOCUS_PROBE = """(() => {
 })()"""
 
 
+_BAND_CHIP_PROBE = """(() => {
+  const mb = document.querySelector('#levain-modal .modal-body');
+  const chip = mb.querySelector('.list-surface-chip[data-surface="band"]');
+  const rows = [...mb.querySelectorAll('.sp-results .row')].filter(r => r.getClientRects().length);
+  return JSON.stringify({count: parseInt(chip.textContent.trim().split(' ').pop(), 10), rows: rows.length,
+    texts: rows.map(r => ((r.querySelector('.clause') || {}).textContent || '').slice(0, 20)),
+    heads: [...mb.querySelectorAll('.grp-head')].map(h => h.textContent.trim())});
+})()"""
+
+
 @needs_browser
 def test_r4_the_card_holds_due_rows_and_one_control_and_the_focus_view_every_group(tmp_path: Path, monkeypatch: Any) -> None:
     root, src, _ids = _install(tmp_path)
@@ -471,9 +481,16 @@ def test_r4_the_card_holds_due_rows_and_one_control_and_the_focus_view_every_gro
             {"until": "document.querySelector('#levain-modal .modal-body .sp-results .row') && 1"},
             {"eval": "new Promise(r => setTimeout(() => r(1), 900))"},
             {"eval": _FOCUS_PROBE},
+            {"eval": "document.querySelector('#levain-modal .list-surface-chip[data-surface=\"band\"]').click(); 1"},
+            {"eval": "new Promise(r => setTimeout(() => r(1), 500))"},
+            {"eval": _BAND_CHIP_PROBE},
         ])
     vals = [json.loads(x) for x in out["values"] if isinstance(x, str) and x.startswith("{")]
-    card, focus = vals[0], vals[1]
+    card, focus, band = vals[0], vals[1], vals[2]
+    # the band chip's number is the number of rows its tap shows: no desk-owes or later rows, no carried copy
+    assert band["rows"] == band["count"] and band["rows"] > 0, band
+    assert not any(t.startswith(("desk: Write", "levain: TUE")) for t in band["texts"]), band
+    assert not any(h.startswith(("Desk owes", "Later")) for h in band["heads"]), band
     assert not any((t.startswith("desk:") and not t.startswith("desk: carried")) or t.startswith("levain: TUE") for t in card["shown"]), card   # not the operator's, not due
     assert any(t.startswith("desk: carried") for t in card["shown"]), card      # a CARRIED desk row is needs-you, as flow's footer lists it
     assert len(card["more"]) == 1 and card["heldToggles"] == 0, card                                    # ONE control, no held toggle
