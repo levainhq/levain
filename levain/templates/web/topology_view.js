@@ -1323,6 +1323,7 @@
 
   let pinned = null;                                                      // the fallback pin (no agent page in the page): {id, x, y, dx, dy} in stage px
   let kbFocus = null;                                                     // the control the keyboard focus sits on ("n:<node id>", or "b:hub" / "b:node:<node id>" for a need badge (the owner is typed, so a node whose id is "hub" is not the desk)), kept across a redraw
+  let stageScroll = { top: 0, left: 0 };                                   // the graph box's scroll, kept across a rebuild of the lens (a live repaint replaces the stage)
   function agentsLens(v, opts) {
     release();
     const wrap = el("div", "tv-agents");
@@ -1339,6 +1340,12 @@
     tip.hidden = true;
     tip.setAttribute("aria-hidden", "true");
     wrap.appendChild(stage);
+    stage.addEventListener("scroll", () => { if (stage.isConnected) stageScroll = { top: stage.scrollTop, left: stage.scrollLeft }; });
+    const restoreScroll = () => {
+      if (!stage.isConnected) return;
+      if (stage.scrollTop !== stageScroll.top) stage.scrollTop = stageScroll.top;
+      if (stage.scrollLeft !== stageScroll.left) stage.scrollLeft = stageScroll.left;
+    };
     let LW = 0, svgNode = null, scale = 1, built = false;
     // keyboard focus follows its control across every rebuild of the graph (the card's own redraw, and a resize that redraws it after): the key is
     // "n:<node id>", or "b:hub" / "b:node:<node id>" for a need badge (the owner is typed, so a node whose id is "hub" is not the desk); pending holds the key until a rebuilt element takes the focus
@@ -1406,14 +1413,16 @@
       streamStop = startStreams(canvas, stage, edges, () => scale, !!(opts && opts.still));
       stage.dataset.nodes = String(arr(v.nodes).length);
       built = true;
+      restoreScroll();
       if (reanchorPin) reanchorPin();
       restoreFocus();
     };
+    if (typeof root.requestAnimationFrame === "function") root.requestAnimationFrame(restoreScroll);   // the stage is in the page by the next frame: put the scroll back
     build(920);                                                           // a width to draw at before the card has one; the observer redraws at the real one
     let seen = 0;
     if (typeof ResizeObserver === "function") {
       linkObserver = new ResizeObserver(() => {
-        const w = Math.round(stage.getBoundingClientRect().width);
+        const w = Math.round(stage.clientWidth);
         if (w > 0 && (w !== seen || !built)) { const first = seen === 0; seen = w; if (first || Math.abs(w - LW) > 1 || scale < 1) build(w); }
       });
       linkObserver.observe(stage);
@@ -1433,7 +1442,7 @@
       const place = () => {
         const box = stage.getBoundingClientRect();
         tip.style.left = Math.max(4, Math.min(Math.max(box.width, stage.scrollWidth) - tip.offsetWidth - 4, x + 16)) + "px";
-        tip.style.top = Math.max(4, Math.min(box.height - tip.offsetHeight - 4, y + 14)) + "px";
+        tip.style.top = Math.max(stage.scrollTop + 4, Math.min(stage.scrollTop + stage.clientHeight - tip.offsetHeight - 4, y + 14)) + "px";
       };
       // a pin restored by the live redraw runs before the new stage is in the page: measured then, the card clamps to the corner,
       // so it is placed on the next frame, once the stage has its size
@@ -1446,7 +1455,7 @@
       const g = nodeOf(ev.target), n = g ? byId.get(g.dataset.node) : null;
       if (!n) { tip.hidden = true; return; }
       const box = stage.getBoundingClientRect();
-      showTip(n, ev.clientX - box.left + stage.scrollLeft, ev.clientY - box.top);
+      showTip(n, ev.clientX - box.left + stage.scrollLeft, ev.clientY - box.top + stage.scrollTop);
     });
     stage.addEventListener("pointerleave", () => { if (!pinned) hideTip(); });
     const syncPins = () => {
@@ -1459,7 +1468,7 @@
       const g = svgNode && Array.from(svgNode.querySelectorAll("[data-node]")).find((e) => e.dataset.node === id);
       if (!g) return null;
       const rc = (g.querySelector(".tv-ring") || g).getBoundingClientRect(), box = stage.getBoundingClientRect();
-      return rc.width ? { x: rc.left + rc.width / 2 - box.left + stage.scrollLeft, y: rc.top + rc.height / 2 - box.top } : null;
+      return rc.width ? { x: rc.left + rc.width / 2 - box.left + stage.scrollLeft, y: rc.top + rc.height / 2 - box.top + stage.scrollTop } : null;
     };
     const toggle = (n, x, y) => {
       if (!n || (pinned && pinned.id === n.id)) { pinned = null; hideTip(); }
@@ -1488,7 +1497,7 @@
     stage.addEventListener("click", (ev) => {
       const g = nodeOf(ev.target), n = g ? byId.get(g.dataset.node) : null;
       const box = stage.getBoundingClientRect();
-      openPage(g, n, ev.clientX - box.left + stage.scrollLeft, ev.clientY - box.top);
+      openPage(g, n, ev.clientX - box.left + stage.scrollLeft, ev.clientY - box.top + stage.scrollTop);
     });
     // keyboard: a focused node opens its page on Enter or Space as a click does
     stage.addEventListener("keydown", (ev) => {
@@ -1497,7 +1506,7 @@
       if (!n) return;
       ev.preventDefault();
       const ring = g.querySelector(".tv-ring") || g, rc = ring.getBoundingClientRect(), box = stage.getBoundingClientRect();
-      openPage(g, n, rc.left + rc.width / 2 - box.left + stage.scrollLeft, rc.top + rc.height / 2 - box.top);
+      openPage(g, n, rc.left + rc.width / 2 - box.left + stage.scrollLeft, rc.top + rc.height / 2 - box.top + stage.scrollTop);
     });
     // a redraw replaces the focused node: keyboard focus follows the id to its new element (focus that leaves while the node is still there clears it)
     stage.addEventListener("focusin", (ev) => { const k = focusKey(ev.target); if (k) kbFocus = k; });
