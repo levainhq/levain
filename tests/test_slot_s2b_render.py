@@ -788,6 +788,26 @@ def test_supervisor_has_no_second_fold():
     assert rd.fold_name(" .claude") != rd.fold_name(".claude")              # whitespace is part of the name
 
 
+def test_fold_name_is_nfd_after_casefold():
+    """pf4r2 R3 (L3 r1 complement LOW): the fold is Unicode's canonical caseless form, NFD(casefold(NFD(x))), so its
+    output is NFD whatever casefold returns. Measured on 2026-11-08: under the Unicode tables of CPython 3.12
+    (15.0.0) and 3.9 (13.0.0) no single code point, and no pair of a case-changing character with a combining mark,
+    gives a non-NFD casefold of its NFD, so the outer NFD changes nothing today; it is the guard for a table where it
+    would. The characters below are the ones whose casefold expands or decomposes."""
+    import unicodedata
+    def canonical(x: str) -> str:
+        return unicodedata.normalize("NFD", unicodedata.normalize("NFD", x).casefold())
+    for c in ("ΐ", "ﬃ", "İ", "ᾷ", "ẞ", "ͅ", "ᾀ", "ŉ", "ǰ"):
+        assert rd.fold_name(c) == canonical(c), ascii(c)
+        assert unicodedata.is_normalized("NFD", rd.fold_name(c)), ascii(c)
+    assert rd.fold_name("ΐ") == "ΐ"     # the ruling's example, expanded and decomposed
+    assert rd.fold_name("ﬃ") == "ffi"                     # a ligature folds to three letters
+    for cp in range(0x10000):
+        if 0xD800 <= cp <= 0xDFFF:
+            continue
+        assert unicodedata.is_normalized("NFD", rd.fold_name(chr(cp))), hex(cp)
+
+
 def test_codex_config_toml_exemption_is_not_a_directory_entry():
     """PRE-L3 fix4 (L1 LOW-3): a ``config.toml/`` entry (a directory marker) is not the rendered file."""
     blob, facts = egress(vendor="codex")

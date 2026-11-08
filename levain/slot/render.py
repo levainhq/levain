@@ -1124,8 +1124,9 @@ REPO_DISCOVERY = (".claude", ".codex", "CLAUDE.md", "AGENTS.md", ".mcp.json", ".
 def fold_name(name: str) -> str:
     """The one fold for a config-surface file name: a case- and normalization-insensitive store (APFS, the Mac slots'
     default) resolves the vendor's ``open("settings.json")`` to a planted ``Settings.JSON`` or an NFD spelling, so a
-    name check compares folded names (PRE-L3 4-2)."""
-    return unicodedata.normalize("NFD", name).casefold()
+    name check compares folded names (PRE-L3 4-2). Unicode's canonical caseless form: NFD again after the casefold,
+    whose output need not be NFD (pf4r2)."""
+    return unicodedata.normalize("NFD", unicodedata.normalize("NFD", name).casefold())
 
 
 def _norm(entry: str) -> str:
