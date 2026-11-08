@@ -3803,9 +3803,16 @@ class _Handler(GuardedHandler):
             self._gated_read_403("the room record needs", head=head)
             return
         directory = self._store_directory()
+        query = urllib.parse.urlsplit(self.path).query
         if directory is None:
-            status, payload = 200, {"room_thread": None, "launch_id": None, "composer": None, "model": None, "gap": False,
-                                    "stream": [], "proposals": []}
+            try:
+                after, thread = cockpit_room.parse_cursor(query)
+            except cockpit_room.CursorError as e:
+                status, payload = 400, {"error": "bad_request", "message": str(e)}
+            else:
+                status, payload = 200, cockpit_room.apply_cursor(
+                    {"room_thread": None, "launch_id": None, "composer": None, "model": None, "gap": False,
+                     "stream": [], "proposals": []}, after, thread)
         else:
             if not self.server.request_gate.acquire(blocking=False):
                 self._send(b"busy\n", "text/plain; charset=utf-8", status=503, head=head)
@@ -3813,7 +3820,7 @@ class _Handler(GuardedHandler):
             try:
                 host = self.server.room_host
                 status, payload = cockpit_room.serve_room(path, directory=directory, service=self.server.chat_service,
-                                                          view=host.view if host is not None else None)
+                                                          view=host.view if host is not None else None, query=query)
             finally:
                 self.server.request_gate.release()
         self._send(cockpit_room.encode(payload), "application/json; charset=utf-8", status=status, head=head,

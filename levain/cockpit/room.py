@@ -30,6 +30,7 @@ from __future__ import annotations
 import json
 import re
 import sqlite3
+import urllib.parse
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -229,15 +230,55 @@ def room_read(directory: Path | str, service: Any = None) -> dict[str, Any]:
         conn.close()
 
 
+class CursorError(ValueError):
+    """The ``after`` of a cursor read is not a non-negative integer."""
+
+
+def parse_cursor(query: str) -> tuple[int | None, str | None]:
+    """``(after, thread)`` from a read's query string: ``after`` is the last ``gseq`` the client holds (None for a cold
+    read), ``thread`` the ``room_thread`` that cursor was read from. A non-integer or negative ``after`` raises
+    ``CursorError``; any other parameter is ignored."""
+    values = urllib.parse.parse_qs(query, keep_blank_values=True)
+    after = None
+    if "after" in values:
+        raw = values["after"][0]
+        if not (raw.isascii() and raw.isdigit()):
+            raise CursorError("after must be a non-negative integer")
+        after = int(raw)
+    thread = values["thread"][0] if "thread" in values and values["thread"][0] else None
+    return after, thread
+
+
+def apply_cursor(body: dict[str, Any], after: int | None, thread: str | None) -> dict[str, Any]:
+    """``body`` with ``next`` (the newest ``gseq`` in what is returned, else the cursor held) and, for a cursor read,
+    ``stream`` cut to items newer than ``after`` (compared with ``>``: the filtered open-probe turn leaves gaps). A cursor
+    from another room thread, or held against no open room, gets the whole body and ``reset: true``. An item without a
+    ``gseq`` is only ever in a cold read."""
+    stream = body.get("stream") or []
+    if after is not None and thread is not None and thread != body.get("room_thread"):
+        body["reset"] = True
+        after = None
+    if after is not None:
+        stream = [i for i in stream if isinstance(i.get("gseq"), int) and i["gseq"] > after]
+        body["stream"] = stream
+    seqs = [i["gseq"] for i in stream if isinstance(i.get("gseq"), int)]
+    body["next"] = max(seqs) if seqs else after
+    return body
+
+
 def serve_room(path: str, *, directory: Path | str, service: Any = None,
-               view: Callable[[], Mapping[str, Any]] | None = None) -> tuple[int, dict[str, Any]]:
+               view: Callable[[], Mapping[str, Any]] | None = None, query: str = "") -> tuple[int, dict[str, Any]]:
     """``(status, body)`` for ``GET /cockpit/room.json``: a store that cannot be read is a 500 with a fixed sentence.
     ``view`` (the host's, when a serve holds the room) adds ``room_error``: the pump's or the launch's last error, or
     None, so a room that cannot start says why on the page instead of staying silent."""
     if path != ROOM_PATH:
         return 404, {"error": "not_found", "message": "no such room route"}
     try:
-        body = room_read(directory, service)
+        after, thread = parse_cursor(query)
+    except CursorError as e:
+        return 400, {"error": "bad_request", "message": str(e)}
+    try:
+        body = apply_cursor(room_read(directory, service), after, thread)
     except Exception:       # the boundary: whatever broke, the caller gets the fixed sentence and no detail
         return 500, {"error": "internal", "message": "the room record could not be read"}
     if view is not None:
