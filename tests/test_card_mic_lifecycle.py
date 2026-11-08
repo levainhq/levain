@@ -27,9 +27,18 @@ RECOG = """
     get processLocally() { return true; } set processLocally(v) {}
     constructor() { window.__srs.push(this); this.starts = 0; this.stops = 0; }
     start() { this.starts++; }
-    stop() { this.stops++; if (window.__tail) setTimeout(() => { this.onresult && this.onresult({ results: [[{ transcript: window.__tail }]] }); this.onend && this.onend(); }, 60); }
+    stop() { this.stops++; if (window.__tail) setTimeout(() => { this.onresult && this.onresult(window.__res([...(this.heard || []).filter((p) => p[1]), [window.__tail, true]])); this.onend && this.onend(); }, 60); }
   };
   delete window.webkitSpeechRecognition;
+  // a result event as an engine sends it: [transcript, isFinal] per result, in order
+  window.__res = (pairs) => ({ results: pairs.map(([t, f]) => Object.assign([{ transcript: t }], { isFinal: f })) });
+  // recognizer r delivers a result event; its results list is the whole session's so far (as SpeechRecognitionEvent.results is)
+  window.__say = (r, pairs) => { r.heard = pairs; r.onresult && r.onresult(window.__res(pairs)); };
+  // the visibilitychange listeners mic.js holds on the document (every attach() with Dictate holds one until it is let go)
+  window.__visN = 0;
+  const add = Document.prototype.addEventListener, rm = Document.prototype.removeEventListener, held = new Set();
+  Document.prototype.addEventListener = function (k, f, o) { if (k === "visibilitychange" && !held.has(f) && String(new Error().stack).indexOf("/mic.js") >= 0) { held.add(f); window.__visN++; } return add.call(this, k, f, o); };
+  Document.prototype.removeEventListener = function (k, f, o) { if (k === "visibilitychange" && held.has(f)) { held.delete(f); window.__visN--; } return rm.call(this, k, f, o); };
 })();
 """
 # a Safari-shaped recognizer: no processLocally on the prototype (the engine ignores the property)
@@ -146,7 +155,7 @@ def test_stop_dictating_keeps_the_last_phrase_the_engine_delivers_after_stop(tmp
     out = _page(tmp_path, w, [
         {"eval": "window.__tail = ' and the tail'; 1"},
         *_boxes("a"),
-        {"eval": f"{_dict()}.click(); window.__srs[0].onresult({{ results: [[{{ transcript: 'hello' }}]] }}); 1"},
+        {"eval": f"{_dict()}.click(); window.__say(window.__srs[0], [['hello', true]]); 1"},
         {"eval": f"{_dict()}.click(); JSON.stringify([window.__m.a.busy(), document.getElementById('a').value])"},
         {"until": "document.getElementById('a').value.indexOf('and the tail') >= 0 && !window.__m.a.busy() && 1", "ms": 5000},
         {"eval": "document.getElementById('a').value"},
@@ -253,3 +262,135 @@ def test_an_option_tap_under_a_live_mic_ends_the_mic_and_leaves_stop_enabled(tmp
         ])
     assert json.loads(out["values"][-2]) == [False], out["values"]
     assert out["values"][-1] == 1
+
+
+# --- cmr2 (L3 r1): only FINAL words stay in a box once its capture ends ---------------------------------------------
+
+VAL = "document.getElementById('{}').value"
+
+
+@needs_browser
+def test_dictate_that_ends_on_an_interim_leaves_only_the_typed_and_final_words(tmp_path, w) -> None:
+    """Red with: Dictate's onresult writing every result into the box with no isFinal test (the interim stays, busy() false)."""
+    out = _page(tmp_path, w, [
+        *_boxes("a", "b"),
+        {"eval": "document.getElementById('a').value = 'typed'; document.getElementById('b').value = 'typed'; 1"},
+        {"eval": f"{_dict(0)}.click(); window.__srs[0].onresult(window.__res([['ghost', false]])); {VAL.format('a')}"},
+        {"eval": f"window.__srs[0].onend(); JSON.stringify([window.__m.a.busy(), {VAL.format('a')}])"},
+        {"eval": f"{_dict(1)}.click(); window.__srs[1].onresult(window.__res([['kept', true], [' ghost', false]])); {VAL.format('b')}"},
+        {"eval": f"window.__srs[1].onerror({{ error: 'network' }}); JSON.stringify([window.__m.b.busy(), {VAL.format('b')}])"},
+    ])
+    assert out["values"][-4] == "typed ghost", out["values"]                     # shown while capturing
+    assert json.loads(out["values"][-3]) == [False, "typed"], out["values"]      # an interim-only end: the typed words alone
+    assert out["values"][-2] == "typed kept ghost", out["values"]
+    assert json.loads(out["values"][-1]) == [False, "typed kept"], out["values"]   # an error: typed + the final segment
+
+
+@needs_browser
+def test_stop_dictating_that_times_out_on_an_interim_drops_the_interim(tmp_path, w) -> None:
+    """Red with: the tail timeout (finishDict) freeing the box without restoring it (the interim stays and can be signed)."""
+    out = _page(tmp_path, w, [
+        *_boxes("a"),
+        {"eval": "document.getElementById('a').value = 'typed'; 1"},
+        {"eval": f"{_dict()}.click(); window.__srs[0].onresult(window.__res([['ghost', false]])); 1"},
+        {"eval": f"{_dict()}.click(); 1"},
+        {"until": "!window.__m.a.busy() && 1", "ms": 8000},
+        {"eval": VAL.format("a")},
+    ])
+    assert out["values"][-1] == "typed", out["values"]
+
+
+def _break_after_a_partial(revoked: bool) -> list[dict]:
+    status = 403 if revoked else 500
+    return [
+        *_boxes("a"),
+        {"until": f"window.__sc.vj >= 1 && !!{_stream()} && !{_stream()}.hidden && 1", "ms": 20000},
+        {"eval": f"document.getElementById('a').value = 'typed'; {_stream()}.click(); 1"},
+        {"until": "window.__sc.gum >= 1 && !!window.__sc.node", "ms": 20000},
+        FEED, {"until": "document.getElementById('a').value.indexOf('live 0') >= 0 && 1", "ms": 20000},
+        {"eval": f"window.__sc.chunkRevoked = {str(revoked).lower()}; window.__sc.chunkStatus = {status}; window.__feed(12000)"},
+        {"until": "!window.__m.a.busy() && 1", "ms": 20000},
+        {"eval": f"JSON.stringify([{VAL.format('a')}, window.__notes])"},
+    ]
+
+
+@needs_browser
+def test_a_stream_that_breaks_after_a_partial_keeps_only_the_committed_words(tmp_path, w) -> None:
+    """Red with: the stream's `end` listener freeing the box as it stands (the partial's live words stay and can be signed)."""
+    value, notes = json.loads(_page(tmp_path, w, _break_after_a_partial(False))["values"][-1])
+    assert value == "typed said" and "live" not in value, (value, notes)   # `said` is what the server had committed
+    assert any(n.startswith("Streaming dictation stopped") for n in notes), notes
+
+
+@needs_browser
+def test_a_revoked_stream_after_a_partial_keeps_only_the_committed_words(tmp_path, w) -> None:
+    """Red with: the same `end` listener: a revoke ends the session with the partial left in the box."""
+    value, notes = json.loads(_page(tmp_path, w, _break_after_a_partial(True))["values"][-1])
+    assert value == "typed said" and "live" not in value, (value, notes)
+    assert any(n.startswith("Premium voice was turned off") for n in notes), notes
+
+
+# --- cmr2: an idle mic is let go with its box ----------------------------------------------------------------------
+
+@needs_browser
+def test_an_idle_box_that_leaves_the_page_lets_go_of_its_listeners(tmp_path, w) -> None:
+    """Red with: the detach watch run only while a capture is live (an idle box keeps its document listener for ever)."""
+    out = _page(tmp_path, w, [
+        *_boxes("a"),
+        {"eval": "window.__visN"},
+        {"eval": "document.getElementById('host').replaceChildren(); 1"},
+        {"eval": "new Promise((r) => setTimeout(r, 1500)).then(() => window.__visN)"},
+    ])
+    assert out["values"][-3] == 1 and out["values"][-1] == 0, out["values"]
+
+
+@needs_browser
+def test_a_box_that_never_reaches_the_page_lets_go_of_its_listeners(tmp_path, w) -> None:
+    """Red with: no bound on a box that is never connected (a draw that lands after its card closed keeps its listeners)."""
+    out = _page(tmp_path, w, [
+        {"eval": "window.__orph = LevainMic.attach(document.createElement('textarea'), {}); window.__visN"},
+        {"eval": "new Promise((r) => setTimeout(r, 7000)).then(() => window.__visN)"},
+    ])
+    assert out["values"][-2] == 1 and out["values"][-1] == 0, out["values"]
+
+
+SIGN_DICT = "document.querySelector('#levain-modal .needs-question .card-mic-dictate')"
+SIGN_OPT = ("[...document.querySelectorAll('#levain-modal .needs-question .sign-option')]"
+            ".find(b => !/sign my words/.test(b.textContent))")
+
+
+@needs_browser
+@needs_ssh
+def test_closing_the_cockpit_card_lets_go_of_its_idle_write_in_mic(tmp_path: Path, monkeypatch) -> None:
+    """Red with: the detach watch run only while a capture is live (the closed modal's idle mic keeps its listener)."""
+    rig = _Rig(tmp_path, monkeypatch)
+    with rig.serving():
+        out = _drive(tmp_path, f"{rig.origin}/#write_token={TOK}", [
+            DESKTOP, {"init": _fake() + RECOG}, rig.authenticator(),
+            {"until": f"{OPEN_Q} && {SIGN_BOX} && !!{SIGN_DICT} && 1", "ms": 30000},
+            {"eval": f"window.__wb = {SIGN_BOX}; window.__visN"},
+            {"eval": "document.querySelector('#levain-modal .modal-close').click(); 1"},
+            {"eval": "new Promise((r) => setTimeout(r, 1500)).then(() => JSON.stringify([!!document.getElementById('levain-modal'), window.__visN, window.__wb.isConnected]))"},
+        ])
+    before = out["values"][-3]
+    gone, after, connected = json.loads(out["values"][-1])
+    assert before >= 1 and not gone and not connected and after == before - 1, out["values"]
+
+
+@needs_browser
+@needs_ssh
+def test_a_cockpit_ceremony_drops_dictates_tail_so_the_write_in_is_not_written_after_the_tap(tmp_path: Path, monkeypatch) -> None:
+    """Red with: run() calling stop() on a live Dictate (its tail lands in the write-in after the ceremony started)."""
+    rig = _Rig(tmp_path, monkeypatch)
+    with rig.serving():
+        out = _drive(tmp_path, f"{rig.origin}/#write_token={TOK}", [
+            DESKTOP, {"init": _fake() + RECOG}, rig.authenticator(),
+            {"until": f"{OPEN_Q} && {SIGN_BOX} && !!{SIGN_DICT} && 1", "ms": 30000},
+            {"eval": f"window.__tail = ' and the tail'; window.__wb = {SIGN_BOX}; {SIGN_DICT}.click(); "
+                     "window.__say(window.__srs[0], [['hello', true]]); window.__wb.value"},
+            {"tap": SIGN_OPT},
+            {"eval": "new Promise((r) => setTimeout(r, 800)).then(() => JSON.stringify([window.__wb.value, window.__srs[0].stops]))"},
+        ])
+    assert out["values"][-3] == "hello", out["values"]
+    value, stops = json.loads(out["values"][-1])
+    assert value == "hello" and stops >= 1, (value, stops)

@@ -5098,6 +5098,7 @@
     return got;
   }
   function drawNoteBody(n, slot, b) {
+    offSlotMics(slot);        // a redraw ends the write-in mics of the sign facet it replaces
     const sv = (x) => (typeof x === "string" ? x : "");
     if (b.error) { slot.replaceChildren(el("div", "consent-note ext-meta", b.error)); return; }
     const parts = [el("div", "note-what", sv(b.what))];
@@ -5123,7 +5124,7 @@
       parts.push(bar);
     }
     // a note its caller filed a sign request for (DESIGN_SIGN D5) carries that request's ceremony under its words
-    if (!d && n.state === "open" && n.sign) parts.push(signFacet(n.sign));
+    if (!d && n.state === "open" && n.sign) { const facet = signFacet(n.sign); slot.__mics = facet.__mics; parts.push(facet); }
     slot.replaceChildren(...parts);
   }
   function noteRow(o) {
@@ -5709,7 +5710,9 @@
       };
       const run = (choice, words) => {
         if (signBusy) return say(SIGN_BUSY, "bad");   // the lease holds a second tap, never a button drawn disabled
-        for (const m of wrap.__mics) m.stop();         // a ceremony under a live mic ends the mic first
+        // a ceremony under a live mic ends the mic first, at once (off): a Dictate tail must not land in the write-in after the tap,
+        // so the box shown stays the words a ceremony signs; an idle mic keeps its control for a retry
+        for (const m of wrap.__mics) if (m.busy()) m.off();
         signBusy++;
         lock(true);
         if (!signInFlight.has(id)) signInFlight.set(id, new Set());
