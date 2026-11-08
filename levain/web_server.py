@@ -1690,6 +1690,7 @@ def build_substrate_json(
     *,
     write_token_required: bool = False,
     extra_verbs: "Mapping[str, ActionVerb] | None" = None,
+    threads: bool = True,
 ) -> bytes:
     """The ``/substrate.json`` body: a fresh read-only ``SubstrateView`` snapshot.
 
@@ -1724,6 +1725,8 @@ def build_substrate_json(
     if "write_token_required" in payload:
         raise RuntimeError("to_dict() collided with transport `write_token_required`")
     payload["write_token_required"] = write_token_required
+    if not threads:
+        payload["threads"] = False     # make_server(threads=False): the legacy /?source=substrate page reads it too (absent by default)
     # Inline external panels (the read-only extra-PANEL seam): a per-request provider returns
     # full panel descriptors+data; split each into a layout entry (kind:"external") + its data
     # under payload["extra_panels"][id], so the frontend renders them inline among the substrate
@@ -1985,6 +1988,8 @@ class _LevainHTTPServer(ThreadingHTTPServer):
         self._consent_sheet = sheet
     # whether the cockpit draws levain's own Work board when no provider brings one (make_server's work_board)
     work_board: bool = True
+    # whether the Build tab's Threads zone is offered (make_server's threads): False answers its two routes 404 and the manifest says so
+    threads: bool = True
     # the ChatService the work thread's Stop acts through; None serves none of it
     chat_service: "ChatService | None" = None
     # the room's host (RM-F): its ChatService, CoordStore and the launcher's verbs; None serves no room write route
@@ -2543,7 +2548,8 @@ class _Handler(GuardedHandler):
 
     def _transport(self) -> dict[str, Any]:
         """The manifest's ``transport``: the same flags ``/substrate.json`` carries, and ``room`` (where the room is read
-        and how: its cursor, thread and long-poll bound) only on a server that mounts a room."""
+        and how: its cursor, thread and long-poll bound) only on a server that mounts a room
+        (``_manifest_transport`` adds ``threads``)."""
         out: dict[str, Any] = {"writable": self.server.levain_source.write_scope is not None,
                                "write_token_required": self._write_token_required() or self._writes_need_credential(),
                                "owner_key": self._owner_key_accepted()}
@@ -4249,6 +4255,17 @@ class _Handler(GuardedHandler):
                 last_read=srv.voice_last_read if srv.voice_last_read is not None else {})
         return cockpit_voice.stream_close(registry, query, owner)
 
+    def _manifest_transport(self) -> dict[str, Any]:
+        """The manifest's ``transport`` plus ``threads: false`` when the server offers no Threads zone (absent otherwise)."""
+        out = dict(self._transport())     # a copy: never mutate what _transport() hands back
+        if not self.server.threads:
+            out["threads"] = False
+        return out
+
+    def _send_threads_off(self, head: bool) -> None:
+        self._send(cockpit_threads.encode({"error": "not_found", "message": "no threads here"}),
+                   "application/json; charset=utf-8", status=404, head=head, cache_control="private, no-store")
+
     def _serve_threads(self, path: str, *, head: bool) -> None:
         """``GET /cockpit/threads.json`` and ``GET /cockpit/thread/<th-id>.json`` (CH-U1a): the coordinator's threads and
         one thread's stream, read-only (:func:`levain.cockpit.threads.serve_threads`). A thread carries the operator's
@@ -4660,6 +4677,9 @@ class _Handler(GuardedHandler):
             self._serve_voice(head=head)
             return
         if cockpit_threads.is_threads_path(path):
+            if not self.server.threads:
+                self._send_threads_off(head)
+                return
             self._serve_threads(path, head=head)
             return
         if path == cockpit_board.BOARD_PATH:
@@ -4692,7 +4712,7 @@ class _Handler(GuardedHandler):
                 try:
                     status, body, hdrs = handle_cockpit_get(
                         self._cockpit(), self.path, credential=self._credential(),
-                        if_none_match=self.headers.get("If-None-Match"), transport=self._transport(),
+                        if_none_match=self.headers.get("If-None-Match"), transport=self._manifest_transport(),
                     )
                 except _CredentialUnavailable:   # RU-5: only the outer catch answers it
                     raise
@@ -4722,7 +4742,7 @@ class _Handler(GuardedHandler):
                 body = build_substrate_json(
                     self.server.levain_source, self.server.extra_panels,
                     write_token_required=self._write_token_required() or self._writes_need_credential(),
-                    extra_verbs=self.server.extra_verbs)
+                    extra_verbs=self.server.extra_verbs, threads=self.server.threads)
             except _CredentialUnavailable:   # RU-5: only the outer catch answers it
                 raise
             except Exception as exc:  # noqa: BLE001 — never 500 on a runtime fault
@@ -4738,6 +4758,7 @@ class _Handler(GuardedHandler):
                     "writable": self.server.levain_source.write_scope is not None,
                     "write_token_required": self._write_token_required() or self._writes_need_credential(),
                     "errors": {"server": f"{type(exc).__name__}: {exc}"},
+                    **({} if self.server.threads else {"threads": False}),
                 }).encode("utf-8")
             finally:
                 self.server.request_gate.release()
@@ -4765,6 +4786,7 @@ class _Handler(GuardedHandler):
                     "episodes": [],
                     "count": 0,
                     "errors": {"server": f"{type(exc).__name__}: {exc}"},
+                    **({} if self.server.threads else {"threads": False}),
                 }).encode("utf-8")
             finally:
                 self.server.request_gate.release()
@@ -5026,7 +5048,8 @@ class _Handler(GuardedHandler):
         desk = (route in (_DESK_ANSWER_ROUTE, _DESK_TEXT_ROUTE)
                 and getattr(self.server, "question_store", None) is not None)
         # and the thread view's write routes (CH-U1b): the same gate; served only beside a ChatService
-        thread = cockpit_threads.post_route(route) if self.server.chat_service is not None else None
+        thread = (cockpit_threads.post_route(route)
+                  if self.server.chat_service is not None and self.server.threads else None)   # threads=False: its writes are unknown routes too
         # and the room's write routes (RM-F): the same gate; served only beside a room host
         room = cockpit_room.post_route(route) if self.server.room_host is not None else None
         # and web push (OS-4): a token on every bind
@@ -5488,6 +5511,7 @@ def make_server(
     room_host: "cockpit_room.RoomHost | None" = None,
     room_serve: "Any" = None,
     premium_stt: bool = False,
+    threads: bool = True,
 ) -> _LevainHTTPServer:
     """Build a configured, bound (but not-yet-serving) web server over a substrate.
 
@@ -5527,6 +5551,9 @@ def make_server(
 
     ``work_board=False`` draws no Work board of levain's own: an embedder with no board of its own gets none (a board a
     provider registers still draws; the built-in is only the default when none does).
+
+    ``threads=False`` offers no Threads zone: ``GET /cockpit/threads.json`` and ``/cockpit/thread/<id>.json`` answer 404 and
+    the manifest's ``transport`` carries ``threads: false`` (absent by default), which the page reads to draw no zone.
 
     ``coordinator_verbs`` says a coordinator watcher runs beside this server: only then, over a write scope, are the
     Desk panel's Start / Stop / Hold registered (a caller's verb or effect under one of their names is then a
@@ -5885,6 +5912,7 @@ def make_server(
     # until every refusal below has passed and the Signer is pinned.
     httpd.cockpit = cockpit
     httpd.work_board = work_board
+    httpd.threads = threads is not False
     httpd.chat_service = chat_service
     httpd.room_host = room_host
     httpd.room_serve = None         # set only once the RoomServe has started, at the very end
