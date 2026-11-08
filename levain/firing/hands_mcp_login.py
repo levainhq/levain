@@ -618,16 +618,33 @@ def launch_still_live(res: LaunchFiles, now: datetime | None = None) -> str | No
     boundary before the vendor starts. It narrows the window to this read and the exec, it does not close it: a revoke
     after it lands as one during the chat does (the frame's Known edges). An entry registered since is not a reason
     (the files only lack it)."""
+    moved = launch_check(res, now)
+    if moved is None:
+        return None
+    kind, detail = moved
+    if kind == UNREADABLE:
+        return f"the authority log could not be read again before the start ({detail})"
+    return (f"registry entry {detail} was revoked or ran out after the launch files were written; "
+            "launch again to write them from the registry")
+
+
+#: The two ways :func:`launch_check` can say the launch files are no longer the live registry.
+GONE = "gone"               # an entry the files carry was revoked or ran out
+UNREADABLE = "unreadable"   # the log could not be read, so nothing is known
+
+
+def launch_check(res: LaunchFiles, now: datetime | None = None) -> tuple[str, str] | None:
+    """:func:`launch_still_live`'s answer as data: None while every entry the files carry is live, else
+    ``(GONE, the first entry id)`` or ``(UNREADABLE, the read error)``. A running chat's watch tells the two apart."""
     if not res.ids:
         return None
     try:
         live, _ = load_registry(res.cockpit_root, now)
     except (HandsMcpError, OSError) as exc:
-        return f"the authority log could not be read again before the start ({exc})"
+        return UNREADABLE, str(exc)
     gone = sorted(set(res.ids) - {e["id"] for e in live})
     if gone:
-        return (f"registry entry {gone[0]} was revoked or ran out after the launch files were written; "
-                "launch again to write them from the registry")
+        return GONE, gone[0]
     return None
 
 

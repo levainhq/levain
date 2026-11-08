@@ -28,9 +28,11 @@ that the registry does not hold; and from the moment the locks are
 taken, a SIGTERM or SIGHUP ends in an orderly stop (the child terminated, the hands account swept, both locks released,
 then re-raised as an exit with ``128 + signal``), with processes left after the chat making the command exit non-zero.
 
-What this does not close: a revoke that lands while a chat is running does not reach it (the vendor read its file at
-start, and a stdio server is already running), and nor does one in the moment between step 4's re-read and the
-start. See the frame's last section and its Known edges.
+A hands-MCP revoke ends a chat that is starting or running (the 457 (c) ruling). The wait is a watched wait: every
+``WATCH_S`` it re-reads the authority log, and an entry the launch files carry that is gone ends the chat now (the
+vendor stopped, the hands account swept, both locks released), with one line on the terminal, a cockpit note, and
+``HANDS_REVOKED_EXIT``. A log that cannot be read ends it only after ``UNREADABLE_LIMIT`` ticks in a row. There is no
+grace and the agent is not told: the revoked hands are not usable while it is told.
 """
 from __future__ import annotations
 
@@ -43,6 +45,7 @@ from pathlib import Path
 from typing import Callable, Protocol
 
 from levain import hands_live
+from levain.consent import notes as notes_mod
 from levain.firing import hands_login as hl
 from levain.firing import hands_mcp_login as hml
 from levain.firing.confinement import HandsIdentity
@@ -78,6 +81,21 @@ _TERM_NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9._+-]{0,63}")
 
 #: How long the child gets to end after ``terminate`` before ``kill``; the sweep after it is the backstop.
 _STOP_TIMEOUT = 5.0
+
+#: Seconds between the watch's reads of the authority log while the chat runs.
+WATCH_S = 5
+#: Consecutive reads that could not be confirmed before the chat ends (fail closed on consent that stays unknown).
+UNREADABLE_LIMIT = 6
+#: The exit code of a chat a revoke ended (EX_NOPERM).
+HANDS_REVOKED_EXIT = 77
+
+
+class _Revoked(Exception):
+    """Raised out of the watched wait to take the chat's normal stop-and-sweep path; ``reason`` is for the operator."""
+
+    def __init__(self, reason: str) -> None:
+        super().__init__(reason)
+        self.reason = reason
 
 
 def host_refusal() -> str | None:
@@ -150,14 +168,30 @@ def interactive_term(argv: list[str], term: str | None = None) -> list[str]:
     return out
 
 
-def _wait(proc: _Proc) -> int:
+def _wait(proc: _Proc, check: Callable[[], tuple[str, str] | None] | None = None) -> int:
     """The chat's exit code. A Ctrl-C at the terminal reaches the vendor too, which owns it (it clears a prompt, it
-    does not end the chat), so it does not end the wait here."""
+    does not end the chat), so it does not end the wait here.
+
+    With ``check`` (the liveness read, :func:`levain.firing.hands_mcp_login.launch_check`) the wait wakes every
+    ``WATCH_S``: a ``gone`` answer raises :class:`_Revoked` at once, an ``unreadable`` one only on the
+    ``UNREADABLE_LIMIT``-th in a row, and a readable answer resets that count."""
+    unreadable = 0
     while True:
         try:
-            return proc.wait()
+            return proc.wait() if check is None else proc.wait(timeout=WATCH_S)
         except KeyboardInterrupt:
             continue
+        except subprocess.TimeoutExpired:
+            pass
+        moved = check() if check is not None else None
+        if moved is None:
+            unreadable = 0
+        elif moved[0] == hml.GONE:
+            raise _Revoked(f"registry entry {moved[1]} was revoked or ran out")
+        else:
+            unreadable += 1
+            if unreadable >= UNREADABLE_LIMIT:
+                raise _Revoked(f"the hands grants could not be confirmed ({moved[1]})")
 
 
 class _Signals:
@@ -259,6 +293,7 @@ def launch_hands_chat(entity_dir: Path | str, vendor: str, cockpit_root: Path | 
     proc: _Proc | None = None
     attempted = False           # set just before the spawn: from then on the hands account may be running a chat
     survivors = False
+    revoked: str | None = None
     try:
         try:
             hands = hl.load_hands_identity(entity_dir)
@@ -289,7 +324,11 @@ def launch_hands_chat(entity_dir: Path | str, vendor: str, cockpit_root: Path | 
             # HandsMcpRefused is a HandsMcpError; a partial prepare (one file replaced) lands here too, and the
             # next launch rewrites both from the registry
             raise HandsChatRefused(f"{exc}; no chat was started") from None
-        rc = _wait(proc)
+        rc = _wait(proc, lambda: hml.launch_check(res))
+    except _Revoked as exc:
+        sigs.quiet()
+        revoked = exc.reason
+        _stop(proc)
     except BaseException:
         sigs.quiet()
         if proc is not None:
@@ -313,7 +352,26 @@ def launch_hands_chat(entity_dir: Path | str, vendor: str, cockpit_root: Path | 
             sigs.restore()
             for fd in reversed(fds):
                 os.close(fd)
+    if revoked is not None:
+        _report_revoked(revoked, vendor, emit)
+        return HANDS_REVOKED_EXIT
     return (rc or 1) if survivors else rc
+
+
+def _report_revoked(reason: str, vendor: str, emit: Callable[[str], None]) -> None:
+    """The one terminal line and the cockpit note, with the same words. Each is a courtesy that must not replace the
+    outcome: a failed note or a closed stdout leaves the exit code as it is."""
+    line = f"hands revoked: {reason}; this chat was ended"
+    try:
+        emit(f"hands chat: {line}")
+    except Exception:  # noqa: BLE001
+        pass
+    try:
+        notes_mod.NoteStore().file(agent="claude_code" if vendor == "claude" else "codex",
+                                   agent_session_id=notes_mod.NO_SESSION, what=f"hands chat: {line}", detail=None,
+                                   cwd=os.getcwd())
+    except Exception:  # noqa: BLE001 - the line above already told the terminal
+        pass
 
 
 def cmd_hands_chat(entity_dir: Path | str, vendor: str, cockpit_root: Path | str | None = None) -> int:

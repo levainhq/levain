@@ -1,0 +1,181 @@
+"""457 (c): a hands-MCP revoke ends a hands chat that is starting or running. The rig is the launch tests' one (a
+sudo shim, a real scratch authority log); the vendor is a fake that never exits on its own, and the liveness read is
+a scripted answer per tick. No hands account, no real vendor, no real note store."""
+from __future__ import annotations
+
+import os
+import subprocess
+import sys
+
+import pytest
+
+from levain import hands_live
+from levain.firing import hands_chat as hc, hands_mcp_login as hml
+from tests.test_hands_chat_launch import assert_released, locks
+from tests.test_hands_mcp_verbs import McpRig
+
+pytestmark = pytest.mark.skipif(sys.platform not in ("darwin", "linux"), reason="POSIX shims")
+
+
+@pytest.fixture
+def rig(tmp_path, monkeypatch):
+    r = McpRig(tmp_path, monkeypatch)
+    monkeypatch.setattr(hc, "host_refusal", lambda: None, raising=False)
+    monkeypatch.setattr(hc, "WATCH_S", 0.01)
+    monkeypatch.setattr(hc, "UNREADABLE_LIMIT", 3)
+    r.events = []
+    real_sweep = hands_live.sweep_hands_user
+
+    def sweep(user, *, uid, timeout=5.0):
+        r.events.append(("sweep", locks(r)))
+        return real_sweep(user, uid=uid, timeout=timeout)
+    monkeypatch.setattr(hands_live, "sweep_hands_user", sweep)
+    r.register("alpha", callback_port=49601)
+    r.filed = []
+    r.note_raises = False
+
+    class Store:
+        def file(self, **kw):
+            if r.note_raises:
+                raise OSError("the note store is down")
+            r.filed.append(kw)
+
+    monkeypatch.setattr(hc.notes_mod, "NoteStore", Store)
+    yield r
+    r.oauth.close()
+
+
+class FakeChat:
+    """A vendor that runs until stopped, or exits by itself after ``exit_after`` timed waits."""
+
+    def __init__(self, rig, exit_after=None, rc=0):
+        self.rig, self.exit_after, self.rc, self.waits, self.stopped = rig, exit_after, rc, 0, False
+
+    def __call__(self, argv, cwd):
+        return self
+
+    def wait(self, timeout=None):
+        if self.stopped:
+            return -15
+        self.waits += 1
+        if self.exit_after is not None and self.waits > self.exit_after:
+            return self.rc
+        raise subprocess.TimeoutExpired("chat", timeout)
+
+    def terminate(self):
+        self.rig.events.append(("terminate", locks(self.rig)))
+        self.stopped = True
+
+    def kill(self):
+        self.stopped = True
+
+
+def script(monkeypatch, answers):
+    """``hml.launch_check`` answers from ``answers`` in order, then live (None) for good."""
+    calls = []
+    seq = [None, *answers]      # the first read is the pre-start one
+
+    def check(res, now=None):
+        calls.append(1)
+        return seq.pop(0) if seq else None
+    monkeypatch.setattr(hml, "launch_check", check)
+    return calls
+
+
+def run(rig, chat):
+    lines = []
+    rc = hc.launch_hands_chat(rig.entity, "claude", rig.ck.root, spawn=chat, emit=lines.append)
+    return rc, lines
+
+
+def revoked_lines(lines):
+    return [x for x in lines if "hands revoked" in x]
+
+
+def test_gone_on_tick_two_ends_the_chat(rig, monkeypatch):
+    script(monkeypatch, [None, (hml.GONE, "g-1")])
+    chat = FakeChat(rig)
+    rc, lines = run(rig, chat)
+    assert rc == hc.HANDS_REVOKED_EXIT == 77
+    assert chat.stopped
+    kinds = [e[0] for e in rig.events]
+    assert "terminate" in kinds
+    # the final sweep ran with both locks still held, after the stop
+    assert kinds.index("terminate") < max(i for i, k in enumerate(kinds) if k == "sweep")
+    assert rig.events[-1] == ("sweep", (True, True))
+    assert_released(rig)
+    [line] = revoked_lines(lines)
+    assert line == "hands chat: hands revoked: registry entry g-1 was revoked or ran out; this chat was ended"
+    [note] = rig.filed
+    assert note["what"] == line and note["agent"] == "claude_code"
+
+
+def test_unreadable_below_the_limit_then_live_is_not_stopped(rig, monkeypatch):
+    script(monkeypatch, [(hml.UNREADABLE, "slow")] * 2)
+    chat = FakeChat(rig, exit_after=6, rc=3)
+    rc, lines = run(rig, chat)
+    assert rc == 3 and not chat.stopped
+    assert not revoked_lines(lines) and rig.filed == []
+    assert_released(rig)
+
+
+def test_a_live_answer_resets_the_unreadable_count(rig, monkeypatch):
+    u = (hml.UNREADABLE, "slow")
+    script(monkeypatch, [u, u, None, u, u])
+    chat = FakeChat(rig, exit_after=8, rc=0)
+    rc, _ = run(rig, chat)
+    assert rc == 0 and not chat.stopped
+
+
+def test_unreadable_at_the_limit_ends_the_chat(rig, monkeypatch):
+    script(monkeypatch, [(hml.UNREADABLE, "log gone")] * 3)
+    chat = FakeChat(rig)
+    rc, lines = run(rig, chat)
+    assert rc == 77 and chat.stopped
+    [line] = revoked_lines(lines)
+    assert "could not be confirmed (log gone); this chat was ended" in line
+    assert len(rig.filed) == 1
+    assert_released(rig)
+
+
+def test_the_chat_exiting_on_its_own_gives_its_own_code_no_line_no_note(rig, monkeypatch):
+    script(monkeypatch, [])
+    chat = FakeChat(rig, exit_after=2, rc=9)
+    rc, lines = run(rig, chat)
+    assert rc == 9 and not chat.stopped
+    assert not revoked_lines(lines) and rig.filed == []
+    assert_released(rig)
+
+
+def test_a_note_store_that_raises_still_prints_and_exits_77(rig, monkeypatch):
+    script(monkeypatch, [(hml.GONE, "g-1")])
+    rig.note_raises = True
+    rc, lines = run(rig, FakeChat(rig))
+    assert rc == 77 and len(revoked_lines(lines)) == 1 and rig.filed == []
+    assert_released(rig)
+
+
+def test_the_pre_start_check_and_its_refusal_text_are_unchanged(rig, monkeypatch):
+    """A revoke between the prepare and the start refuses with today's words and starts nothing."""
+    res = hml.prepare_launch(rig.h, rig.entity, rig.ck.root)
+    assert hml.launch_still_live(res) is None
+    monkeypatch.setattr(hml, "load_registry", lambda *a, **k: ([], []))
+    assert hml.launch_check(res) == (hml.GONE, res.ids[0])
+    assert hml.launch_still_live(res) == (f"registry entry {res.ids[0]} was revoked or ran out after the launch "
+                                          "files were written; launch again to write them from the registry")
+
+    def boom(*a, **k):
+        raise hml.HandsMcpError("the log is unreadable")
+    monkeypatch.setattr(hml, "load_registry", boom)
+    assert hml.launch_still_live(res) == ("the authority log could not be read again before the start "
+                                          "(the log is unreadable)")
+
+
+def test_the_pre_start_refusal_stops_the_launch_with_today_s_text(rig, monkeypatch):
+    monkeypatch.setattr(hml, "launch_check", lambda res, now=None: (hml.UNREADABLE, "x"))
+    started = []
+    with pytest.raises(hc.HandsChatRefused) as ei:
+        hc.launch_hands_chat(rig.entity, "claude", rig.ck.root, spawn=lambda a, c: started.append(1),
+                             emit=lambda s: None)
+    assert "the authority log could not be read again before the start (x); no chat was started" == str(ei.value) and started == []
+    assert_released(rig)

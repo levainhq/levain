@@ -83,7 +83,7 @@ class FakeVendor:
         })
         return self
 
-    def wait(self):
+    def wait(self, timeout=None):
         return self.rc
 
 
