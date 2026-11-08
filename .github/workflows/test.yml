@@ -48,6 +48,8 @@ jobs:
     name: look up a verifying run
     runs-on: ubuntu-24.04
     timeout-minutes: 5
+    # A gate only has a verdict to look up on a push to main; every other run has nothing to skip, so it does not queue.
+    if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
     # least privilege: read the run list, and check out the one script
     permissions:
       actions: read
@@ -70,7 +72,7 @@ jobs:
     # reader of the job list, such as the land waiter's main follow, sees it without reading a log.
     name: verified on ${{ needs.gate.outputs.ref }} run ${{ needs.gate.outputs.run_id }}
     needs: gate
-    if: needs.gate.outputs.skip == 'true'
+    if: ${{ needs.gate.result == 'success' && needs.gate.outputs.skip == 'true' }}
     runs-on: ubuntu-24.04
     timeout-minutes: 5
     steps:
@@ -82,7 +84,9 @@ jobs:
     # another does not is still in that Python's shards.
     name: plan test shards
     needs: gate
-    if: needs.gate.outputs.skip != 'true'
+    # The gate exists only on a main push, so on every other run it is skipped and these jobs run; a FAILED gate also
+    # runs them (fail closed: any doubt is a test). Only a gate that succeeded and said skip skips them.
+    if: ${{ always() && !cancelled() && (needs.gate.result == 'skipped' || (needs.gate.result == 'success' && needs.gate.outputs.skip != 'true')) }}
     # Pinned because ubuntu-latest moved to ubuntu-26.04, whose sudo/bash/python differ; revisit when the tests are made to pass on it.
     runs-on: ubuntu-24.04
     timeout-minutes: 5
@@ -183,7 +187,9 @@ jobs:
     # the files import from the checkout, and --noconftest keeps the repo conftest, which is written for 3.12+, out.
     name: root-run code (Python 3.9)
     needs: gate
-    if: needs.gate.outputs.skip != 'true'
+    # The gate exists only on a main push, so on every other run it is skipped and these jobs run; a FAILED gate also
+    # runs them (fail closed: any doubt is a test). Only a gate that succeeded and said skip skips them.
+    if: ${{ always() && !cancelled() && (needs.gate.result == 'skipped' || (needs.gate.result == 'success' && needs.gate.outputs.skip != 'true')) }}
     # Pinned because ubuntu-latest moved to ubuntu-26.04, whose sudo/bash/python differ; revisit when the tests are made to pass on it.
     runs-on: ubuntu-24.04
     # The closure tests step took 14 min on green main and 13 min 7 s on the run the 15 min cap cancelled (run 41522235194):
@@ -233,7 +239,9 @@ jobs:
     # skip). It runs the floor test files only.
     name: bwrap floor live (Python 3.12)
     needs: gate
-    if: needs.gate.outputs.skip != 'true'
+    # The gate exists only on a main push, so on every other run it is skipped and these jobs run; a FAILED gate also
+    # runs them (fail closed: any doubt is a test). Only a gate that succeeded and said skip skips them.
+    if: ${{ always() && !cancelled() && (needs.gate.result == 'skipped' || (needs.gate.result == 'success' && needs.gate.outputs.skip != 'true')) }}
     # Pinned because ubuntu-latest moved to ubuntu-26.04, whose sudo/bash/python differ; revisit when the tests are made to pass on it.
     runs-on: ubuntu-24.04
     timeout-minutes: 30
@@ -288,7 +296,9 @@ jobs:
     # shard keeps the same rules (selection by file, nothing collected fails, any skip fails).
     name: cockpit browser tests (Python 3.13, shard ${{ matrix.shard }})
     needs: gate
-    if: needs.gate.outputs.skip != 'true'
+    # The gate exists only on a main push, so on every other run it is skipped and these jobs run; a FAILED gate also
+    # runs them (fail closed: any doubt is a test). Only a gate that succeeded and said skip skips them.
+    if: ${{ always() && !cancelled() && (needs.gate.result == 'skipped' || (needs.gate.result == 'success' && needs.gate.outputs.skip != 'true')) }}
     # Pinned because ubuntu-latest moved to ubuntu-26.04, whose sudo/bash/python differ; revisit when the tests are made to pass on it.
     runs-on: ubuntu-24.04
     timeout-minutes: 40
@@ -371,7 +381,9 @@ jobs:
     # throwaway runners (passwordless sudo); this is the only place the Linux setup is exercised.
     name: setup-isolation e2e (${{ matrix.os }})
     needs: gate
-    if: needs.gate.outputs.skip != 'true'
+    # The gate exists only on a main push, so on every other run it is skipped and these jobs run; a FAILED gate also
+    # runs them (fail closed: any doubt is a test). Only a gate that succeeded and said skip skips them.
+    if: ${{ always() && !cancelled() && (needs.gate.result == 'skipped' || (needs.gate.result == 'success' && needs.gate.outputs.skip != 'true')) }}
     # Pinned because ubuntu-latest moved to ubuntu-26.04, whose sudo/bash/python differ; revisit when the tests are made to pass on it.
     runs-on: ${{ matrix.os == 'ubuntu-latest' && 'ubuntu-24.04' || matrix.os }}
     timeout-minutes: 20
@@ -410,7 +422,9 @@ jobs:
     # chat_egress_slow (the minutes-long git dumps, skipped in CI unless CHD2_SLOW=1).
     name: chat egress srt (${{ matrix.os }})
     needs: gate
-    if: needs.gate.outputs.skip != 'true'
+    # The gate exists only on a main push, so on every other run it is skipped and these jobs run; a FAILED gate also
+    # runs them (fail closed: any doubt is a test). Only a gate that succeeded and said skip skips them.
+    if: ${{ always() && !cancelled() && (needs.gate.result == 'skipped' || (needs.gate.result == 'success' && needs.gate.outputs.skip != 'true')) }}
     # Pinned because ubuntu-latest moved to ubuntu-26.04, whose sudo/bash/python differ; revisit when the tests are made to pass on it.
     runs-on: ${{ matrix.os == 'ubuntu-latest' && 'ubuntu-24.04' || matrix.os }}
     timeout-minutes: 40
