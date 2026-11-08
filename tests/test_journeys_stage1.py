@@ -61,7 +61,7 @@ def _scratch(tmp_path: Path, *paths: Any) -> None:
     """Refuse to go on if LEVAIN_HOME, HOME or any store path the rig resolved is one of his real stores, or is outside this
     test's scratch dir. Called at fixture start (the environment) and again after each rig is built (its own paths)."""
     named = [Path(os.environ[k]) for k in ("LEVAIN_HOME", "HOME") if os.environ.get(k)] + [Path(str(p)) for p in paths if p is not None]
-    scratch_roots = (tmp_path.parent, Path("/private/tmp"), Path("/tmp"), Path(os.environ.get("TMPDIR", "/nonexistent")))
+    scratch_roots = (tmp_path.parent, Path("/private/tmp"), Path("/tmp"), *([Path(os.environ["TMPDIR"])] if os.environ.get("TMPDIR") else []))   # an empty TMPDIR would be "."
     for p in named:
         for live in _LIVE:
             assert not _under(p, live), f"JOURNEY GUARD: {p} is under his live store {live}"
@@ -70,6 +70,7 @@ def _scratch(tmp_path: Path, *paths: Any) -> None:
 
 @pytest.fixture(autouse=True)
 def _journey_env(tmp_path, monkeypatch):
+    monkeypatch.setenv("HOME", str(tmp_path / "home"))                       # this fixture's own scratch HOME, whatever the session set
     monkeypatch.setenv("LEVAIN_HOME", str(tmp_path / "levain_home"))
     _scratch(tmp_path)
     monkeypatch.setattr(band, "deliver_answer", lambda store, ref, **kw: type(
@@ -84,6 +85,13 @@ def test_the_guard_refuses_each_of_his_live_stores(tmp_path: Path) -> None:
         with pytest.raises(AssertionError, match="JOURNEY GUARD"):
             _scratch(tmp_path, live / "queue.db")
 
+
+def test_the_guard_ignores_an_empty_tmpdir(tmp_path: Path, monkeypatch) -> None:
+    """An empty TMPDIR must not turn the working directory into a scratch root: a path under it that is not scratch still refuses."""
+    monkeypatch.setenv("TMPDIR", "")
+    monkeypatch.chdir(_REAL_HOME)
+    with pytest.raises(AssertionError, match="not under a scratch root"):
+        _scratch(tmp_path, _REAL_HOME / "Documents" / "not-a-store")
 
 # --- 1. sign a band answer in the cockpit's sign sheet with a passkey ----------------------------------------------------------
 
