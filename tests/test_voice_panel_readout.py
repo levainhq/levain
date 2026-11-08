@@ -63,12 +63,13 @@ def test_dictation_off_says_why(tmp_path, monkeypatch):
 
 @needs_browser
 def test_the_panel_shows_dictation_spend_and_console_links(tmp_path, monkeypatch):
-    b = _body(tmp_path, monkeypatch, {"deepgram": ["stt", "tts"], "inworld": ["tts"]})
+    b = _body(tmp_path, monkeypatch, {"deepgram": ["stt", "tts"]})        # inworld spent, then lost its key: still its own row
     v = _run(tmp_path, monkeypatch, [
         {"emulate": {"w": 390, "h": 844, "dpr": 3, "mobile": True}},
         {"until": READY_BLOCK, "ms": 20000},
         {"eval": "JSON.stringify({dict: document.querySelector('.vc-dictation').textContent,"
                  " spend: [...document.querySelectorAll('.vc-spend')].map((r) => r.textContent),"
+                 " other: document.querySelectorAll('.vc-spend-other').length,"
                  " links: [...document.querySelectorAll('.vc-console')].map((a) => a.href),"
                  " wide: document.documentElement.scrollWidth - document.documentElement.clientWidth})"},
         {"shot": "/tmp/lv1108-39-after_390.png", "full": True},
@@ -76,6 +77,10 @@ def test_the_panel_shows_dictation_spend_and_console_links(tmp_path, monkeypatch
     got = json.loads(v[1])
     assert "Deepgram (nova-3-stream)" in got["dict"], got
     assert len(got["spend"]) == 2 and not any("1 calls" in s for s in got["spend"]) and any("2 calls" in s for s in got["spend"]) and any("(1 call)" in s for s in got["spend"]), got
+    inworld = [s for s in got["spend"] if s.startswith("Inworld")]
+    assert len(inworld) == 1 and "no key now" in inworld[0] and "2 calls" in inworld[0], got
+    assert not any("no key now" in s for s in got["spend"] if s.startswith("Deepgram")), got
+    assert got["other"] == 0, got
     assert sorted(got["links"]) == ["https://console.deepgram.com/", "https://platform.inworld.ai/billing"], got
     assert got["wide"] <= 0, got
 
@@ -84,16 +89,26 @@ def _micros(usd: str) -> int:
     return round(float(usd) * 1_000_000)
 
 
-def test_rows_add_up_to_the_caps_line_and_unkeyed_spend_is_one_other_row(tmp_path, monkeypatch):
+def test_every_provider_with_spend_or_a_key_has_a_row_and_the_rows_add_up_to_the_caps_line(tmp_path, monkeypatch):
     b = _body(tmp_path, monkeypatch, {"deepgram": ["stt", "tts"]})         # inworld spent, then lost its key
-    other = b["spend_other"]
-    assert other["day_calls"] == 2 and other["month_calls"] == 2 and other["day_est_usd"] == "0.01", other
-    rows = [r["spend"] for r in b["providers"] if r["key"] == "set"] + [other]
+    drawn = {r["name"]: r["spend"] for r in b["providers"] if r["spend"] is not None}
+    assert set(drawn) == {"deepgram", "inworld"}, drawn                     # spend is set exactly for the rows drawn
+    assert b["spend_other"] is None
+    assert drawn["inworld"]["day_calls"] == 2 and drawn["inworld"]["day_est_usd"] == "0.01"
     for period in ("day", "month"):
-        shown = sum(_micros(r[period + "_est_usd"]) for r in rows)
+        shown = sum(_micros(r[period + "_est_usd"]) for r in drawn.values())
         total = _micros(b["caps"]["spent_" + period + "_est"])
-        assert abs(shown - total) <= 10_000 * len(rows), (period, shown, total)   # display rounding only
-        assert sum(r[period + "_calls"] for r in rows) == 3
+        assert abs(shown - total) <= 10_000 * len(drawn), (period, shown, total)   # display rounding only
+        assert sum(r[period + "_calls"] for r in drawn.values()) == 3
+    keyless = _body(tmp_path, monkeypatch, {})                              # a spent provider with no key is drawn too
+    assert {r["name"] for r in keyless["providers"] if r["spend"] is not None} == {"deepgram", "inworld"}
+
+
+def test_spend_from_a_provider_that_is_not_offered_is_the_other_row(tmp_path, monkeypatch):
+    b = _body(tmp_path, monkeypatch, {"deepgram": ["stt"], "inworld": ["tts"]}, extra=[("acme", "tts", "m", 5, 20000)])
+    other = b["spend_other"]
+    assert other["day_calls"] == 1 and other["month_calls"] == 1 and other["day_est_usd"] == "0.02", other
+    assert all(r["spend"] is not None for r in b["providers"] if r["name"] in ("deepgram", "inworld"))
     assert _body(tmp_path, monkeypatch, {"deepgram": ["stt"], "inworld": ["tts"]})["spend_other"] is None
 
 
@@ -116,12 +131,13 @@ def test_an_unreadable_ledger_says_so(tmp_path, monkeypatch):
     assert [r["spend"] for r in b["providers"]] == [None] * len(b["providers"])
 
 
-def test_an_unreadable_key_log_is_the_reason_and_spend_is_not_split(tmp_path, monkeypatch):
+def test_an_unreadable_key_log_is_the_reason_and_spend_is_still_by_provider(tmp_path, monkeypatch):
     monkeypatch.setattr(cv, "_grants_for", lambda root: ({}, "unreadable"))
     meter = _seed(tmp_path / "voice.db")
     b = cv.serve_voice(tmp_path, meter, last_read={})
     assert b["mic_in"] == {"on": False, "reason": "unreadable"} and b["authority"] == "unreadable"
     assert b["spend_other"] is None and b["meter"] == "ok"
+    assert {r["name"] for r in b["providers"] if r["spend"] is not None} == {"deepgram", "inworld"}
 
 
 def test_no_stream_key_and_no_key_at_all_read_differently(tmp_path, monkeypatch):
@@ -131,20 +147,11 @@ def test_no_stream_key_and_no_key_at_all_read_differently(tmp_path, monkeypatch)
 
 
 @needs_browser
-def test_the_panel_says_when_spend_cannot_be_read_and_shows_the_other_row(tmp_path, monkeypatch):
-    b = _body(tmp_path, monkeypatch, {"deepgram": ["stt", "tts"]})
-    bad = dict(b, meter="unreadable", authority="ok", spend_other=None,
-               providers=[dict(r, spend=None) for r in b["providers"]])
+def test_the_panel_shows_a_not_offered_providers_spend_as_the_other_row(tmp_path, monkeypatch):
+    b = _body(tmp_path, monkeypatch, {"deepgram": ["stt", "tts"], "inworld": ["tts"]}, extra=[("acme", "tts", "m", 5, 20000)])
     v = _run(tmp_path, monkeypatch, [
         {"until": READY_BLOCK, "ms": 20000},
-        {"eval": "JSON.stringify({other: [...document.querySelectorAll('.vc-spend-other')].map((r) => r.textContent),"
-                 " why: document.querySelector('.vc-dict-val') && document.querySelector('.vc-dict-val').textContent})"},
+        {"eval": "JSON.stringify([...document.querySelectorAll('.vc-spend-other')].map((r) => r.textContent))"},
     ], b)
     got = json.loads(v[1])
-    assert len(got["other"]) == 1 and "Other providers (no key now)" in got["other"][0] and "2 calls" in got["other"][0], got
-    (tmp_path / "two").mkdir()
-    v = _run(tmp_path / "two", monkeypatch, [
-        {"until": READY_BLOCK, "ms": 20000},
-        {"eval": "JSON.stringify([...document.querySelectorAll('.vc-spend-gone, .vc-spend-val')].map((r) => r.textContent))"},
-    ], bad)
-    assert any("the ledger can't be read" in t for t in json.loads(v[1])), v
+    assert len(got) == 1 and "Other providers (not shown above)" in got[0] and "1 call" in got[0], got

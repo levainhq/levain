@@ -348,7 +348,7 @@ def serve_voice(data_root: Path | str, meter: vmeter.Meter, *, last_read: Mutabl
     resolved here against the same replay the rows come from: off, no provider lists ``stt`` among its uses and its
     retention words leave transcription out, so a page has nothing to offer a dictation control from; the body says
     ``"premium_stt": false``. The panel's readout adds ``mic_in`` (the provider the server picked for dictation, or why
-    none), per row ``spend`` and ``console_url``, and ``spend_other`` (counted spend from providers with no key now).
+    none), per row ``console_url`` and ``spend`` (set for a provider that holds a key or has counted spend this month, the rows the page draws), and ``spend_other`` (counted spend from providers the page has no row for).
     The totals in ``caps`` and every ``spend`` come from ONE read of the ledger, so the rows add up to the totals."""
     grants, authority = _grants_for(data_root)
     premium_stt_setting = premium_stt
@@ -371,20 +371,21 @@ def serve_voice(data_root: Path | str, meter: vmeter.Meter, *, last_read: Mutabl
         spend, by_provider = meter.snapshot_if_present()      # ONE read, ONE clock: totals are the sum of the rows
     except vmeter.MeterError:
         spend, by_provider = None, None
-    keyed = {row["name"] for row in rows if row["key"] == "set"}
     for row in rows:
         row["console_url"] = CONSOLE_URLS.get(row["name"])
-        if by_provider is None:
-            row["spend"] = None
-        else:
-            got = by_provider.get(row["name"], {})
+        got = (by_provider or {}).get(row["name"], {})
+        spent = any(got.get(period, (0, 0)) != (0, 0) for period in ("day", "month"))
+        # a row is drawn for a provider that holds a key or has counted spend; its ``spend`` is set exactly then (None when
+        # the ledger cannot be read, where the keyed rows are still drawn)
+        if by_provider is not None and (row["key"] == "set" or spent):
             (dn, dm), (mn, mm) = got.get("day", (0, 0)), got.get("month", (0, 0))
             row["spend"] = {"day_calls": dn, "day_est_usd": _usd(dm), "month_calls": mn, "month_est_usd": _usd(mm)}
-    # counted spend from providers the page shows no row for (no key now, or not offered): it counts toward the caps, so the
-    # page says so. With the key log unreadable no provider is known to be keyed, so it is not split out at all.
+        else:
+            row["spend"] = None
+    # counted spend from providers the page has no row for at all (not offered): it counts toward the caps, so the page says so
     body_other = None
-    if by_provider is not None and authority == "ok":
-        rest = [v for name, v in by_provider.items() if name not in keyed]
+    if by_provider is not None:
+        rest = [v for name, v in by_provider.items() if name not in {row["name"] for row in rows}]
         dn, dm = sum(v["day"][0] for v in rest), sum(v["day"][1] for v in rest)
         mn, mm = sum(v["month"][0] for v in rest), sum(v["month"][1] for v in rest)
         if mn or dn or mm or dm:

@@ -1519,29 +1519,29 @@
     const calls = (c) => c + (c === 1 ? " call" : " calls");
     const spendWords = (sp) => "$" + sp.day_est_usd + " today (" + calls(sp.day_calls) + ") · $" + sp.month_est_usd + " this month (" + calls(sp.month_calls) + ")";
     for (const p of vcState.providers) {
-      if (p.key !== "set") continue;
+      if (p.key !== "set" && !p.spend) continue;         // a row for every provider that holds a key or has counted spend
       const r = el("div", "dev-row vc-row vc-spend"); r.dataset.provider = p.name;
       r.appendChild(el("span", "vc-lab", cap1(p.name)));
-      r.appendChild(el("span", "vc-spend-val", p.spend ? spendWords(p.spend) : "spend unavailable: the ledger can't be read"));
+      let words = p.spend ? spendWords(p.spend) : "—";
+      if (p.key !== "set" && p.spend && (!vcState.authority || vcState.authority === "ok")) words += " · no key now";
+      r.appendChild(el("span", "vc-spend-val", words));
       if (p.console_url) {
         const a = el("a", "vc-console", "Reload credit"); a.href = p.console_url; a.target = "_blank"; a.rel = "noopener noreferrer";
         r.appendChild(a);
       }
       vcBody.appendChild(r);
     }
-    // spend that counts toward the caps but belongs to a provider with no key now: one row, so the rows add up to the caps line
+    // spend that counts toward the caps but belongs to a provider this page has no row for: one row, so the rows add up to the caps line
     if (vcState.spend_other) {
       const r = el("div", "dev-row vc-row vc-spend vc-spend-other");
-      r.appendChild(el("span", "vc-lab", "Other providers (no key now)"));
+      r.appendChild(el("span", "vc-lab", "Other providers (not shown above)"));
       r.appendChild(el("span", "vc-spend-val", spendWords(vcState.spend_other)));
       vcBody.appendChild(r);
     }
     if (vcState.meter === "unreadable") {
       vcBody.appendChild(el("p", "dev-note vc-spend-gone", "Spend unavailable: the ledger can't be read."));
-    } else if (vcState.authority && vcState.authority !== "ok") {
-      vcBody.appendChild(el("p", "dev-note vc-spend-gone", "Spend by provider unavailable: the key log can't be read."));
     }
-    if (vcState.providers.some((p) => p.key === "set" && p.console_url)) {
+    if (vcState.providers.some((p) => (p.key === "set" || p.spend) && p.console_url)) {
       vcBody.appendChild(el("p", "dev-note vc-balance", "Balance is not shown here: check it in the provider's console (the link beside each provider)."));
     }
     // Keyboard users keep their place. On a touch screen a focus() on the rebuilt <select> re-opens its picker (iOS Safari), so
