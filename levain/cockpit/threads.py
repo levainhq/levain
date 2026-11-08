@@ -115,9 +115,22 @@ def _caps_words(budget: Any) -> str:
     return "up to " + ", ".join(parts) if parts else "no caps named"
 
 
-def _effects_words(body: dict[str, Any]) -> str:
+def _effects_words(body: dict[str, Any], stop: Any = None) -> str:
     n = {k: len(body[k]) if isinstance(body.get(k), list) else _bad() for k in ("lands", "pushes", "publishes")}
-    return f"effects named: {n['lands']} land, {n['pushes']} push, {n['publishes']} publish"
+    words = f"effects named: {n['lands']} land, {n['pushes']} push, {n['publishes']} publish"
+    launches = body.get(env.LAUNCH_LIST)          # absent = no grant, and no words about it
+    if launches is None:
+        return words
+    if not isinstance(launches, list):
+        _bad()
+    until = f" until {_clock_words(stop)}" if stop is not None else ""
+    for e in launches:
+        # parse_body's own bounds, so a line it would refuse is never worded (fail closed upstream)
+        if (not isinstance(e, dict) or set(e) != {"repo", "count"} or not isinstance(e["repo"], str)
+                or type(e["count"]) is not int or not 1 <= e["count"] <= env.LAUNCH_MAX):
+            _bad()
+        words += f"; may launch up to {e['count']} seats in {e['repo']}{until}"
+    return words
 
 
 def _bad() -> int:
@@ -162,14 +175,14 @@ def authority_header(conn: sqlite3.Connection, thread_id: str, now: datetime | N
                     raise ValueError("a stop_earlier stamp") from None
         stamp = utc_stamp(stop)
         dropped = {v for k, v, _by, _at in rows if k == "drop_effect"}
-        for kind in env.EFFECT_LISTS:        # the effective body's rule (EnvelopeStore._effective): a drop names an identity
+        for kind in env.GRANT_LISTS:        # the effective body's rule (EnvelopeStore._effective): a drop names an identity
             if isinstance(body.get(kind), list):
                 body[kind] = [e for e in body[kind] if env.effect_identity(kind, e) not in dropped]
         clock = now if now is not None else datetime.now(timezone.utc)
         if stop <= clock:
             return _authority("expired", f"No standing authority: envelope {short} stopped {_clock_words(stamp)}.",
                               envelope_id, stop_at=stamp)
-        line = (f"Standing authority: envelope {short}, {_caps_words(body.get('budget'))}; {_effects_words(body)}; "
+        line = (f"Standing authority: envelope {short}, {_caps_words(body.get('budget'))}; {_effects_words(body, stamp)}; "
                 f"stops {_clock_words(stamp)}. {_NOT_IN_FORCE_WORDS if not IN_FORCE else ''}").rstrip()
         return _authority("bound", line, envelope_id, stop_at=stamp)
     except Exception:       # noqa: BLE001 - fail closed: a record this reader cannot read is never "no authority"

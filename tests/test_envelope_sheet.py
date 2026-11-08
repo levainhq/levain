@@ -294,6 +294,50 @@ def test_each_size_and_landing_sends_exactly_its_spec_and_custom_starts_from_the
 
 @needs_browser
 @needs_ssh
+def test_the_launch_toggle_is_off_by_default_clamped_to_the_servers_bounds_and_absent_on_the_phone_page(tmp_path: Path, monkeypatch) -> None:
+    def last(tag: str) -> dict:
+        return {"eval": f"JSON.stringify({{t: {json.dumps(tag)}, n: {REVIEWS}.length, spec: ({REVIEWS}[{REVIEWS}.length - 1] || {{}}).spec}})"}
+
+    steps = _open_from_cockpit("1280") + [
+        last("off"),
+        _tag("ui", FD, "return {on: d.getElementById('drop-launch').checked, countShown: d.getElementById('drop-launch-count').getClientRects().length > 0, "
+                       "dflt: d.getElementById('drop-launch-count').value};"),
+        _click(FD, "#drop-launch"), _reviews(2), last("on"),
+        _tag("shown", FD, "return {countShown: d.getElementById('drop-launch-count').getClientRects().length > 0};"),
+        _set(FD, "#drop-launch-count", "5"),
+        _tag("five", FD, "return {review: d.getElementById('drop-review').textContent, btn: d.getElementById('drop-sign').disabled};"),
+        _set(FD, "#drop-launch-count", "0"),
+        _tag("zero", FD, "return {btn: d.getElementById('drop-sign').disabled};"),
+        _set(FD, "#drop-launch-count", "3"), _reviews(3), last("three"),
+        _click(FD, "#drop-launch"), _reviews(4), last("offAgain")]
+    t = _tagged(_run(tmp_path, monkeypatch, "1280", steps))
+    assert t["off"]["spec"] == STANDARD and "launches" not in t["off"]["spec"], t["off"]
+    assert t["ui"] == {"t": "ui", "on": False, "countShown": False, "dflt": "2"}, t["ui"]
+    assert t["on"]["spec"] == {**STANDARD, "launches": [{"repo": "/work/alpha", "count": 2}]}, t["on"]
+    assert t["shown"]["countShown"] is True, t["shown"]
+    assert t["five"]["btn"] is True and "launches[0].count is an integer from 1 to 4" in t["five"]["review"], t["five"]
+    assert t["zero"]["btn"] is True, t["zero"]
+    assert t["three"]["spec"]["launches"] == [{"repo": "/work/alpha", "count": 3}], t["three"]
+    assert "launches" not in t["offAgain"]["spec"], t["offAgain"]       # turned off again: the key leaves the spec
+
+
+@needs_browser
+@needs_ssh
+def test_the_phone_page_has_no_launch_toggle(tmp_path: Path, monkeypatch) -> None:
+    rig = FullRig(tmp_path, monkeypatch)
+    steps = list(PHONE_TOUCH) + [
+        {"eval": "window.localStorage.setItem('levain_write_token', %s); 1" % json.dumps(TOK)},
+        {"init": INIT},
+        {"eval": f"(() => {{ location.href = '{rig.origin}/sign/drop'; return 1; }})()"},
+        {"until": "document.getElementById('drop-words')", "ms": 30000},
+        {"eval": "JSON.stringify({t: 'p', toggle: !!document.getElementById('drop-launch'), group: !!document.getElementById('env-launch')})"}]
+    with rig.serving():
+        out = drive_touch(tmp_path, f"{rig.origin}/nope", steps)
+    assert _tagged(out)["p"] == {"t": "p", "toggle": False, "group": False}
+
+
+@needs_browser
+@needs_ssh
 def test_the_sign_button_waits_for_a_current_review(tmp_path: Path, monkeypatch) -> None:
     steps = _open_from_cockpit("1280") + [
         _tag("ready", FD, "return {btn: d.getElementById('drop-sign').disabled};"),
@@ -464,7 +508,7 @@ def test_the_form_is_native_radios_with_hints_tied_to_their_inputs_and_only_a_se
     t = _tagged(_run(tmp_path, monkeypatch, "1280", steps))
     a = t["a11y"]
     assert a["radios"] == ["quick", "standard", "long", "custom"] and a["roleRadio"] == 0 and a["labelled"] == 0, a
-    assert a["fieldN"] == 4 and a["fieldsTied"] and a["groupN"] == 3 and a["groupsTied"] and a["repoPath"], a
+    assert a["fieldN"] == 5 and a["fieldsTied"] and a["groupN"] == 4 and a["groupsTied"] and a["repoPath"], a
     assert a["summaryLive"] is False and a["liveAttr"] == "polite" and a["liveText"] == a["review"], a
     assert t["reading"]["live"] == "" and "Reading" in t["reading"]["review"], t["reading"]   # the wait is never announced
     assert t["settled"]["live"] == t["settled"]["review"] and "review 2" in t["settled"]["live"], t["settled"]

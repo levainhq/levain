@@ -41,6 +41,9 @@ __all__ = [
 RULES = ("drop/1", "spec/1", "renew/1", "replace/1")
 _UNAUTH = "as reported by the sender; not authenticated before S1"
 _EDIT_SPEC = ("where", "lands", "pushes", "publishes", "budget")
+# the spec keys a draft rule takes: exactly what it copies, plus the stop (the CLI's spec also takes launches, which a
+# draft never carries, so the two sets are separate on purpose)
+_DRAFT_SPEC_KEYS = frozenset(_EDIT_SPEC) | {"stop"}
 
 
 class DraftStale(CoordError):
@@ -515,9 +518,12 @@ def spec_rule(store: EnvelopeStore, thread_id: str, drop_id: str, *, by: str, to
         spec = json.loads(drop.words)
     except ValueError:
         raise CoordError(f"drop {drop_id} is not an envelope spec: its words are not JSON") from None
-    if not isinstance(spec, dict) or not spec or not set(spec) <= cli._SPEC_KEYS:
+    if isinstance(spec, dict) and env.LAUNCH_LIST in spec:
+        # the CLI's spec takes the grant; a draft never carries one (ed.check_proposal), so it is refused, never dropped
+        raise CoordError(f"drop {drop_id} names launches: {ed._NO_LAUNCH_DRAFT}")
+    if not isinstance(spec, dict) or not spec or not set(spec) <= _DRAFT_SPEC_KEYS:
         raise CoordError(f"drop {drop_id} is not an envelope spec: a JSON object with keys among "
-                         f"{sorted(cli._SPEC_KEYS)}")
+                         f"{sorted(_DRAFT_SPEC_KEYS)}")
     stop_span = cli._parse_stop(spec["stop"]) if "stop" in spec and isinstance(spec["stop"], str) else None
     if "stop" in spec and stop_span is None:
         raise CoordError('stop is a duration text like "2h"')

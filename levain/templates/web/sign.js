@@ -1021,7 +1021,7 @@
     const refuseOther = () => { moved = MOVED; form.stop(MOVED); };
     // the fields, the spec and the review are the shared form's (envelope_form.js); this page passes how a review is asked for
     const form = window.LevainEnvelopeForm.create({
-      words: words, wordsGroup: true, left: colL, right: colR, lockRoots: [grid], repos: got.coord_repos, sign: sign, signWhy: signWhy, why: why,
+      words: words, wordsGroup: true, launches: embedded, left: colL, right: colR, lockRoots: [grid], repos: got.coord_repos, sign: sign, signWhy: signWhy, why: why,
       storeId: () => storeId,
       // asked only after a review sent with no store id: a store identity the page already holds is never replaced
       refreshStore: () => readDrops().then((g) => {
@@ -1294,7 +1294,7 @@
       const KIND = { ENVELOPE: "Draft to sign", REVOKED: "Revoked", LAPSED: "Lapsed" };
       const FIELD = { where: "Where it may work", budget: "Size", stop_at: "Stops", lands: "Landings", pushes: "Pushes", publishes: "Publishes" };
       const BUDGET = { tool_calls: "tool calls", tokens: "tokens", dollars_cents: "dollars", hours: "hours" };
-      const EFFECT = { lands: "landing", pushes: "push", publishes: "publish" };
+      const EFFECT = { lands: "landing", pushes: "push", publishes: "publish", launches: "seat-launch grant" };
       const VERB = { "draft-rule": "Drafting", "draft-withdraw": "Withdrawing", "draft-review": "Reviewing" };
       const unset = (v) => v === null || v === undefined;
       const budgetVal = (k, v) => (unset(v) ? "not set" : k === "dollars_cents" ? "$" + (Number(v) / 100).toFixed(2) : String(v));

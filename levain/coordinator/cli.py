@@ -389,7 +389,10 @@ def _threads_line(store: EnvelopeStore | None, thread_id: str, rev: int | None) 
     return f"    {thread_id} rev {rev if rev is not None else '?'}{title}"
 
 
-def _effect_text(kind: str, e: dict[str, Any]) -> str:
+def _effect_text(kind: str, e: dict[str, Any], stop_at: str | None = None) -> str:
+    if kind == "launches":
+        until = "" if stop_at is None else " until " + parse_stamp(stop_at).astimezone().strftime("%Y-%m-%d %H:%M %Z")
+        return f"may launch up to {e['count']} seats in {e['repo']}{until}"
     if kind == "lands":
         crit = ", ".join(json.dumps(c, sort_keys=True) for c in e["criteria"])
         # onto_from is signed: an inferred branch says so in the words read before signing (C0 §1, his 10-20 item 1)
@@ -402,27 +405,32 @@ def _effect_text(kind: str, e: dict[str, Any]) -> str:
 
 
 _EFFECT_HEAD = {"lands": "lands (merges) it may do:", "pushes": "pushes it may do:",
-                "publishes": "publishes it may do:"}
+                "publishes": "publishes it may do:", "launches": "launches (seats) it may do:"}
 
 
 def _effects(body: dict[str, Any], old: dict[str, Any] | None) -> list[str]:
     """The effect lists; against ``old`` (the envelope this supersedes) each line is marked + added, = unchanged,
     ~ changed (same target, other criteria), and what ``old`` held and this does not is - removed."""
     L: list[str] = []
-    for kind in env.EFFECT_LISTS:
+    for kind in env.GRANT_LISTS:
+        if kind == env.LAUNCH_LIST and not body.get(kind) and not (old is not None and old.get(kind)):
+            continue          # no grant, no line: a no-launch envelope reads as it always did
         L.append("  " + _EFFECT_HEAD[kind])
-        before = {env.effect_key(kind, e): e for e in old[kind]} if old is not None else {}
+        before = {env.effect_key(kind, e): e for e in old.get(kind, [])} if old is not None else {}
         now_keys = set()
-        for e in body[kind]:
+        for e in body.get(kind, []):
             key = env.effect_key(kind, e)
             now_keys.add(key)
+            text = _effect_text(kind, e, body["stop_at"])
+            # unchanged means the line READ is the same (a launch line carries its stop, so a moved stop changed it)
             mark = "" if old is None else "+ added: " if key not in before else \
-                "= unchanged: " if before[key] == e else "~ changed: "
-            L.append(f"    {mark}{_effect_text(kind, e)}")
+                "= unchanged: " if before[key] == e and _effect_text(kind, before[key], old.get("stop_at")) == text \
+                else "~ changed: "
+            L.append(f"    {mark}{text}")
         for key, e in before.items():
             if key not in now_keys:
-                L.append(f"    - removed: {_effect_text(kind, e)}")
-        if not body[kind] and not any(k not in now_keys for k in before):
+                L.append(f"    - removed: {_effect_text(kind, e, old.get('stop_at'))}")
+        if not body.get(kind) and not any(k not in now_keys for k in before):
             L.append("    none")
     return L
 
@@ -689,7 +697,8 @@ def run_envelope_echo(args: argparse.Namespace, out: Any) -> int:
 
 def run_envelope_extend(args: argparse.Namespace, out: Any) -> int:
     """``levain envelope extend THREAD --budget K=N,...`` (C6, T6): the body that raises a thread's budget, for YOU to
-    sign. It is the thread's head envelope as narrowed (its effective where, effects and stop) with the budget you
+    sign. It is the thread's head envelope as narrowed (its effective where, effects and stop; never its launch grant,
+    which the card shows removed) with the budget you
     name (keys you leave out keep the head's), a worded envelope bound to the thread's current revision that supersedes
     the head. Writing it grants nothing: only ``levain envelope sign`` (your key) makes it an envelope."""
     from levain.coordinator import budget
@@ -726,6 +735,9 @@ def run_envelope_extend(args: argparse.Namespace, out: Any) -> int:
             "supersedes": {"envelope_id": head.envelope_id, "digest": head.digest, "seen": seen},
             "draft": None, "where": eff["where"], "lands": eff["lands"], "pushes": eff["pushes"], "publishes": eff["publishes"],
             "budget": new_budget, "stop_at": eff["stop_at"], "issued_at": utc_stamp(now)}
+    # extend never carries the head's launch grant: the desk counts launches per envelope, so a copy under the new id
+    # would start its count again and replenish what was used (L3 r2). The card shows it removed; a grant is signed anew.
+    dropped_launches = bool(eff.get(env.LAUNCH_LIST))
     text = canonical(body)
     store.check_body(text)
     with read_transaction(store._connect) as conn:
@@ -733,9 +745,13 @@ def run_envelope_extend(args: argparse.Namespace, out: Any) -> int:
     used = "" if g is None else ("used so far on this thread: " + ", ".join(
         f"{k} {budget._num(k, g.used[k])}" for k in budget.METERS) + "; dollars not metered")
     shown = _view(body, store) + (f"\n{used}" if used else "")
+    if dropped_launches:
+        shown += ("\nthe head's launch grant is NOT carried: once this is signed the desk may start no seat without "
+                  "asking; a launch grant is signed on its own (the cockpit's Add an envelope)")
     if args.output is not None:
         _write_new(args.output, text + "\n", args.force)
     _emit(out, args.json, {"body": body, "digest": env.envelope_digest(body), "used": None if g is None else g.used,
+                           "launches_dropped": dropped_launches,
                            "file": None if args.output is None else str(args.output)},
           shown + (f"\nbody written to {args.output}; YOU sign it: `levain envelope sign {args.output} "
                    "--signing-key KEY`" if args.output is not None else f"\nbody: {text}"))
@@ -842,7 +858,7 @@ def run_envelope_accept(args: argparse.Namespace, out: Any) -> int:
     return 0
 
 
-_SPEC_KEYS = {"where", "lands", "pushes", "publishes", "budget", "stop"}
+_SPEC_KEYS = {"where", "lands", "pushes", "publishes", "launches", "budget", "stop"}
 
 
 def _spec_list(spec: dict[str, Any], key: str) -> list[Any]:
@@ -884,6 +900,10 @@ def _spec_body(spec: Any, words: str, source: Source, store: EnvelopeStore) -> d
     pushes = [{**p, "repo": _real(p["repo"])} if isinstance(p, dict) and isinstance(p.get("repo"), str) else p
               for p in _spec_list(spec, "pushes")]
     publishes = _spec_list(spec, "publishes")
+    # the optional launch grant: written into the body only when named (absent = none, the bytes a no-grant envelope
+    # always had); each entry's shape and bounds are parse_body's, so compose and verify refuse in the same words
+    launches = [{**x, "repo": _real(x["repo"])} if isinstance(x, dict) and isinstance(x.get("repo"), str) else x
+                for x in _spec_list(spec, "launches")]
     given = spec.get("budget", {})
     if not isinstance(given, dict):
         raise CoordError("budget in an envelope spec is an object")
@@ -892,11 +912,14 @@ def _spec_body(spec: Any, words: str, source: Source, store: EnvelopeStore) -> d
     if not isinstance(stop, str):
         raise CoordError('stop is a duration text like "2h"')
     now = _tick().replace(microsecond=0)
-    return {"format": env.BODY_FORMAT, "store_id": store.store_id(), "envelope_id": "ev-" + secrets.token_hex(16),
+    body = {"format": env.BODY_FORMAT, "store_id": store.store_id(), "envelope_id": "ev-" + secrets.token_hex(16),
             "origin": "structured", "drop_id": "dr-" + secrets.token_hex(16), "words_sha256": words_sha256(words),
             "binds": [], "supersedes": None, "draft": None, "where": where, "lands": lands, "pushes": pushes,
             "publishes": publishes, "budget": budget, "stop_at": utc_stamp(now + _parse_stop(stop)),
             "issued_at": utc_stamp(now)}
+    if launches:
+        body[env.LAUNCH_LIST] = launches
+    return body
 
 
 def _drop_with_envelope(args: argparse.Namespace, out: Any, store: EnvelopeStore, words: str, source: Source) -> int:
@@ -962,6 +985,14 @@ def _ended(store: EnvelopeStore, envelope_id: str, thread_id: str) -> str | None
     return f"its thread is done, at {when}" if kind == "thread_done" else f"killed by you at {when}"
 
 
+_SINGULAR = {"lands": "land", "pushes": "push", "publishes": "publish", "launches": "launch"}
+
+
+def _identity_lines(eff: dict[str, Any]) -> list[str]:
+    """The identity of each grant a thread's effective envelope holds: what ``drop_effect`` names to narrow one."""
+    return [f"    {_SINGULAR[k]} identity: {env.effect_identity(k, e)}" for k in env.GRANT_LISTS for e in eff.get(k, [])]
+
+
 def _show(args: argparse.Namespace, out: Any, store: EnvelopeStore, stored: Any, threads: list[str]) -> int:
     authority, unchecked = None, ""
     try:
@@ -990,8 +1021,7 @@ def _show(args: argparse.Namespace, out: Any, store: EnvelopeStore, stored: Any,
         else:
             text.append(f"thread {t} (as narrowed):")
             text += _describe(eff, store, binds=False)
-            for k in env.EFFECT_LISTS:
-                text += [f"    {k[:-1]} identity: {env.effect_identity(k, e)}" for e in eff[k]]
+            text += _identity_lines(eff)
         text += [f"  live: {_label(live)}", f"  authority today: {now}"]
         rows.append({"thread_id": t, "effective": eff, "live": live, "authority_today": now,
                      "ended": ends[t]})

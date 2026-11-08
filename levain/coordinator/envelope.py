@@ -36,9 +36,10 @@ from levain.dispatch.registry import CRITERION_INT_MAX, CRITERION_KEYS
 
 __all__ = [
     "BODY_FORMAT", "BODY_FORMAT_V1", "BODY_KEYS", "BODY_MAX", "BUDGET_KEYS", "BUDGET_MAX", "DRAFT_ID_RE",
-    "DRAFT_REVISIONS_MAX", "EFFECT_LISTS", "EnvelopeError", "PAYLOAD_KEYS", "SIGN_FORMAT", "SIGN_NAMESPACE",
-    "SIGN_TIER", "effect_identity", "effect_key", "envelope_digest", "parse_body", "path_within", "refusal",
-    "sign_message", "sign_payload", "widens",
+    "DRAFT_REVISIONS_MAX", "EFFECT_LISTS", "EnvelopeError", "GRANT_LISTS", "LAUNCH_DEFAULT", "LAUNCH_LIST",
+    "LAUNCH_MAX", "OPTIONAL_KEYS", "PAYLOAD_KEYS", "SIGN_FORMAT", "SIGN_NAMESPACE",
+    "SIGN_TIER", "effect_identity", "effect_key", "envelope_digest", "launch_allowance", "parse_body", "path_within",
+    "refusal", "sign_message", "sign_payload", "widens",
 ]
 
 BODY_FORMAT = "levain-thread-envelope/2"
@@ -54,6 +55,17 @@ BODY_KEYS = frozenset({"format", "store_id", "envelope_id", "origin", "drop_id",
 PAYLOAD_KEYS = frozenset({"format", "store_id", "envelope_id", "digest", "signer_fp", "signed_at"})
 BUDGET_KEYS = ("tool_calls", "tokens", "dollars_cents", "hours")
 EFFECT_LISTS = ("lands", "pushes", "publishes")
+# the launch grant: how many seats the flow desk may start in a repo without asking again. OPTIONAL in the body (absent =
+# no grant), so every body signed before it existed still parses, hashes and verifies byte for byte; an older reader
+# refuses a body that carries it (its key-set check is exact), which fails closed. It is NOT in EFFECT_LISTS: that
+# tuple keys the role ceiling and the irreversible-effect machinery, and launching a seat is neither.
+LAUNCH_LIST = "launches"
+OPTIONAL_KEYS = frozenset({LAUNCH_LIST})
+GRANT_LISTS = EFFECT_LISTS + (LAUNCH_LIST,)
+LAUNCH_DEFAULT = 2
+# the desk's fan-in runs 4 lanes a round at most; the widest standing no-further-auth grant stays the smallest number
+# that covers a real round. Raising it is a code change, never a typo.
+LAUNCH_MAX = 4
 ORIGINS = ("structured", "worded")
 
 BODY_MAX = 64 * 1024
@@ -220,8 +232,9 @@ def parse_body(text: Any) -> dict[str, Any]:
         shown = eid if isinstance(eid, str) and _ENVELOPE_ID.fullmatch(eid) is not None else "<id>"
         raise EnvelopeError(f"a {BODY_FORMAT_V1} body is no longer accepted; if it was accepted before the upgrade, "
                             f"`levain envelope show {shown}` shows it")
-    if not isinstance(body, dict) or set(body) != BODY_KEYS:
-        raise EnvelopeError(f"an envelope body has exactly the keys {sorted(BODY_KEYS)}")
+    if not isinstance(body, dict) or set(body) not in (BODY_KEYS, BODY_KEYS | OPTIONAL_KEYS):
+        raise EnvelopeError(f"an envelope body has exactly the keys {sorted(BODY_KEYS)} (and optionally "
+                            f"{sorted(OPTIONAL_KEYS)})")
     if canonical(body) != text:
         raise EnvelopeError("an envelope body is accepted only as its own canonical encoding")
     if body["format"] != BODY_FORMAT:
@@ -317,6 +330,24 @@ def parse_body(text: Any) -> dict[str, Any]:
         _text(p["index"], f"publishes[{i}].index", 1024)
         if not isinstance(p["version"], str) or _VERSION.fullmatch(p["version"]) is None:
             raise EnvelopeError(f"publishes[{i}].version is one exact version")
+    if LAUNCH_LIST in body:
+        launches = body[LAUNCH_LIST]
+        if not isinstance(launches, list) or len(launches) > _LIST_MAX:
+            raise EnvelopeError("launches is a list of {repo, count}")
+        if not launches:      # absent is the one no-grant form: two encodings of one meaning would be two digests
+            raise EnvelopeError("an empty launches list is not a grant: leave the key out")
+        seen_repos: set[str] = set()
+        for i, entry in enumerate(launches):
+            if not isinstance(entry, dict) or set(entry) != {"repo", "count"}:
+                raise EnvelopeError("launches is a list of {repo, count}")
+            repo = _repo(entry["repo"], f"launches[{i}].repo")
+            if repo not in scope:
+                raise EnvelopeError(f"launches[{i}].repo is not one of the envelope's where repos")
+            if type(entry["count"]) is not int or not 1 <= entry["count"] <= LAUNCH_MAX:
+                raise EnvelopeError(f"launches[{i}].count is an integer from 1 to {LAUNCH_MAX}")
+            if repo in seen_repos:
+                raise EnvelopeError("launches names one repo twice")
+            seen_repos.add(repo)
     # after every effect's shape is checked, so each key is text and hashable
     for kind in ("pushes", "publishes"):
         keys = [effect_key(kind, e) for e in body[kind]]
@@ -348,7 +379,34 @@ def widens(base: Mapping[str, Any], new: Mapping[str, Any]) -> bool:
         before = {effect_key(kind, e): e for e in base[kind]}
         if any(before.get(effect_key(kind, e)) != e for e in new[kind]):
             return True
+    held = {e["repo"]: e["count"] for e in base.get(LAUNCH_LIST, [])}
+    if any(e["count"] > held.get(e["repo"], 0) for e in new.get(LAUNCH_LIST, [])):
+        return True
     return False
+
+
+def launch_allowance(envelope: Mapping[str, Any], where_repo: str, now: datetime, used: int) -> int:
+    """The arithmetic of a launch allowance, NOT the decision: the seats left in ``where_repo`` under ``envelope`` (the
+    EFFECTIVE body, what the store resolves after attenuations): 0 when the grant is absent, the repo is not covered,
+    ``now`` is at or past ``stop_at``, or ``used`` has reached the count; never negative. It reads no liveness (a
+    revoked signing key, a superseded or unbound envelope, a moved thread revision all pass here), so the desk asks
+    :meth:`levain.coordinator.envelopes.EnvelopeStore.launch_allowance`, which checks those first and then calls this.
+
+    Pure: the caller's own log supplies ``used`` (levain keeps no counter for a signed grant), and it launches only
+    while the answer is above 0, then logs one more. Check-then-act by design: this reads a count, it reserves
+    nothing. The CALLER serialises its launches and reads ``used`` under its own lock (flow's launch log), or two
+    launches racing on one read both see the last seat free. ``now`` is an aware datetime; anything else is refused,
+    never compared."""
+    if type(used) is not int or used < 0:
+        raise EnvelopeError("used is a count of seats already launched, an integer from 0")
+    if not isinstance(now, datetime) or now.utcoffset() is None:
+        raise EnvelopeError("now is an aware datetime (a naive one names no instant)")
+    if now >= parse_stamp(envelope["stop_at"]):
+        return 0
+    for entry in envelope.get(LAUNCH_LIST, []):
+        if entry["repo"] == where_repo:
+            return max(0, entry["count"] - used)
+    return 0
 
 
 def envelope_digest(body: Mapping[str, Any]) -> str:
@@ -367,14 +425,16 @@ def effect_key(kind: str, effect: Mapping[str, Any]) -> tuple[str, ...]:
         return (kind, effect["repo"], effect["remote"], effect["url"], effect["branch"])
     if kind == "publishes":
         return (kind, effect["package"], effect["index"], effect["version"])
-    raise EnvelopeError(f"an effect is one of {list(EFFECT_LISTS)}")
+    if kind == LAUNCH_LIST:
+        return (kind, effect["repo"])
+    raise EnvelopeError(f"an effect is one of {list(GRANT_LISTS)}")
 
 
 def effect_identity(kind: str, effect: Mapping[str, Any]) -> str:
     """An effect's exact identity inside an envelope (C0 §4.4): its list and the digest of its canonical object, so a
     narrowing names exactly one effect the signed body holds."""
-    if kind not in EFFECT_LISTS:
-        raise EnvelopeError(f"an effect is one of {list(EFFECT_LISTS)}")
+    if kind not in GRANT_LISTS:
+        raise EnvelopeError(f"an effect is one of {list(GRANT_LISTS)}")
     return f"{kind}:sha256:" + hashlib.sha256(canonical_bytes(dict(effect))).hexdigest()
 
 

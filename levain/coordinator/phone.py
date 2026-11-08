@@ -116,6 +116,10 @@ REVIEW_TTL = timedelta(minutes=15)
 REVIEWS_KEPT = 32
 # what the phone sheet may set in an envelope (pushes and publishes stay the laptop's: a push's url is resolved there)
 _SPEC_KEYS = frozenset({"where", "lands", "budget", "stop"})
+# the cockpit's own device id (web_server's _COORD_DEVICE). Only the cockpit composer may add a launch grant; a paired
+# phone's sheet never can, however its request is worded (the phone refuses the key before any body is built)
+COCKPIT_DEVICE = "cockpit"
+_COCKPIT_SPEC_KEYS = _SPEC_KEYS | {"launches"}
 
 
 class CoordRefused(Exception):
@@ -400,12 +404,14 @@ class CoordPhone:
             raise CoordRefused(503, "unavailable", f"the coordinator store cannot answer now ({type(exc).__name__}: "
                                                    f"{str(exc)[:200]}): {not_done}") from None
 
-    def _spec(self, spec: Any) -> dict[str, Any]:
+    def _spec(self, spec: Any, device: str | None = None) -> dict[str, Any]:
         """The sheet's spec as the CLI builder takes it: where (absolute repos), lands always named and inferred."""
         from levain.coordinator.store import CoordError
 
-        if not isinstance(spec, dict) or not set(spec) <= _SPEC_KEYS:
-            raise CoordError(f"an envelope from the phone sets only {sorted(_SPEC_KEYS)}")
+        cockpit = device == COCKPIT_DEVICE
+        allowed = _COCKPIT_SPEC_KEYS if cockpit else _SPEC_KEYS
+        if not isinstance(spec, dict) or not set(spec) <= allowed:
+            raise CoordError(f"an envelope from {'the cockpit' if cockpit else 'the phone'} sets only {sorted(allowed)}")
         where = spec.get("where", [])
         lands = spec.get("lands", [])
         if not isinstance(where, list) or not isinstance(lands, list):
@@ -422,7 +428,17 @@ class CoordPhone:
             # the phone records no source, so where a land goes is never "where you dropped from" (C0 §4.3)
             out_lands.append({"repo": land["repo"], "onto": land["onto"], "from": "named", "onto_from": "inferred",
                               "criteria": land.get("criteria", [])})
-        return {**{k: spec[k] for k in ("budget", "stop") if k in spec}, "where": where, "lands": out_lands}
+        out = {**{k: spec[k] for k in ("budget", "stop") if k in spec}, "where": where, "lands": out_lands}
+        if "launches" in spec:
+            # the entry shape here, so a hand-made request is refused in words (a float count made canonical() raise
+            # a ContractError, an HTTP 500); the bounds, a repo outside where and a repo named twice stay parse_body's
+            launches = spec["launches"]
+            if not isinstance(launches, list) or any(
+                    not isinstance(e, dict) or set(e) != {"repo", "count"} or not isinstance(e["repo"], str)
+                    or not e["repo"].startswith("/") or type(e["count"]) is not int for e in launches):
+                raise CoordError('launches is a list of {"repo": "/an/absolute/path", "count": <a whole number>}')
+            out["launches"] = launches
+        return out
 
     def _review(self, req: dict[str, Any], device: str) -> dict[str, Any]:
         from levain.contracts.canon import canonical
@@ -446,7 +462,7 @@ class CoordPhone:
             # a resend returns the stored drop as it was, so an envelope signed now would never be read
             raise CoordRefused(409, "conflict", f"this drop is already delivered as {sent.drop_id}; nothing new is "
                                                 "signed for it")
-        body = ccli._spec_body(self._spec(req["spec"]), words, Source(), store)
+        body = ccli._spec_body(self._spec(req["spec"], device), words, Source(), store)
         text = canonical(body)
         body = store.check_body(text)          # a body the store can only refuse is never put to the passkey
         review_id = "rv-" + secrets.token_hex(16)

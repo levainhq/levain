@@ -179,6 +179,7 @@ def narrow_scope(scope: Mapping[str, Any], ceiling: Mapping[str, Any]) -> dict[s
         if paths:
             where.append({"repo": w["repo"], "paths": paths})
     out["where"] = where
+    out.pop(env.LAUNCH_LIST, None)    # a role's scope never inherits the operator's launch grant (absent = none)
     for kind in env.EFFECT_LISTS:
         named = set(ceiling.get(kind, ()))
         out[kind] = [e for e in scope.get(kind, []) if _effect_target(kind, e) in named]
@@ -596,7 +597,7 @@ class EnvelopeStore(CoordStore):
                 raise CoordError("stop_earlier names a time before the envelope's current stop (a later one is a "
                                  "widening, which needs a new signed envelope)")
         else:
-            identities = {env.effect_identity(k, e) for k in env.EFFECT_LISTS for e in stored.body[k]}
+            identities = {env.effect_identity(k, e) for k in env.GRANT_LISTS for e in stored.body.get(k, [])}
             if value not in identities:
                 raise CoordError("drop_effect names an effect identity the signed envelope holds")
             if ("drop_effect", value) in rows:
@@ -658,10 +659,18 @@ class EnvelopeStore(CoordStore):
         rows = cls._attenuations(conn, envelope_id, thread_id)
         out = dict(stored.body)
         if any(k in ("kill", "thread_done") for k, _v in rows):
-            return {**out, "where": [], **{k: [] for k in env.EFFECT_LISTS}, "stop_at": out["issued_at"]}
+            killed = {**out, "where": [], **{k: [] for k in env.EFFECT_LISTS}, "stop_at": out["issued_at"]}
+            killed.pop(env.LAUNCH_LIST, None)          # absent is the one no-grant form
+            return killed
         dropped = {v for k, v in rows if k == "drop_effect"}
         for k in env.EFFECT_LISTS:
             out[k] = [e for e in stored.body[k] if env.effect_identity(k, e) not in dropped]
+        if env.LAUNCH_LIST in out:
+            kept = [e for e in out[env.LAUNCH_LIST] if env.effect_identity(env.LAUNCH_LIST, e) not in dropped]
+            if kept:
+                out[env.LAUNCH_LIST] = kept
+            else:
+                del out[env.LAUNCH_LIST]               # every entry dropped: absent, the one no-grant form
         out["stop_at"] = utc_stamp(cls._stop(stored, rows))
         return out
 
@@ -700,6 +709,24 @@ class EnvelopeStore(CoordStore):
             return f"envelope {envelope_id}'s signature no longer holds: {refused}"
         return None
 
+    def launch_allowance(self, envelope_id: str, thread_id: str, where_repo: str, *, authority: AuthoritySnapshot,
+                         used: int) -> int:
+        """The seats the desk may still start in ``where_repo`` for ``thread_id`` under ``envelope_id``: the launch
+        decision. 0 unless the envelope is live as the thread's CURRENT head (:meth:`live_refusal` with ``new_pin``:
+        bound, signed for the thread's revision, not superseded, not killed or ended, before its stop, and its
+        signature still held under ``authority``, a fresh snapshot); then :func:`envelope.launch_allowance` over the
+        effective body, at the same store instant, in the same read. ``used`` is the desk's own count of seats it
+        launched under this envelope for this repo (levain keeps none). The caller still serialises its launches and
+        reads ``used`` under its own lock: this reads, it reserves nothing."""
+        if type(used) is not int or used < 0:
+            raise env.EnvelopeError("used is a count of seats already launched, an integer from 0")
+        with read_transaction(self._connect) as conn:
+            now = self._stamp()
+            if self._live_refusal(conn, now, envelope_id, thread_id, authority, True) is not None:
+                return 0
+            return env.launch_allowance(self._effective(conn, envelope_id, thread_id), where_repo, parse_stamp(now),
+                                        used)
+
     def _chain(self, conn: sqlite3.Connection, envelope_id: str, thread_id: str) -> list[str]:
         """``envelope_id`` and every successor in its chain for ``thread_id``, oldest first. Single-parent: the
         supersede CAS refuses a fork."""
@@ -728,6 +755,8 @@ class EnvelopeStore(CoordStore):
         if effect is not None:
             try:
                 kind, obj = effect
+                if kind not in env.EFFECT_LISTS:     # a launch grant is not an effect: it has no ceiling (L3 r1)
+                    raise TypeError
                 key = env.effect_key(kind, obj)
                 if not all(isinstance(k, str) for k in key):
                     raise TypeError
