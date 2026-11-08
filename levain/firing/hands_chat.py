@@ -31,8 +31,9 @@ then re-raised as an exit with ``128 + signal``), with processes left after the 
 A hands-MCP revoke ends a chat that is starting or running (the 457 (c) ruling). The wait is a watched wait: every
 ``WATCH_S`` it re-reads the authority log, and an entry the launch files carry that is gone ends the chat now (the
 vendor stopped, the hands account swept, both locks released), with one line on the terminal, a cockpit note, and
-``HANDS_REVOKED_EXIT``. A log that cannot be read ends it only after ``UNREADABLE_LIMIT`` ticks in a row. There is no
-grace and the agent is not told: the revoked hands are not usable while it is told.
+``HANDS_REVOKED_EXIT``. A log that cannot be read ends it only after ``UNREADABLE_LIMIT`` ticks in a row. When
+processes of the hands account are left after that stop, the line and the note say so rather than that the chat
+ended. There is no grace and the agent is not told: a grace in which it was told would leave the revoked hands usable.
 """
 from __future__ import annotations
 
@@ -170,11 +171,13 @@ def interactive_term(argv: list[str], term: str | None = None) -> list[str]:
 
 def _wait(proc: _Proc, check: Callable[[], tuple[str, str] | None] | None = None) -> int:
     """The chat's exit code. A Ctrl-C at the terminal reaches the vendor too, which owns it (it clears a prompt, it
-    does not end the chat), so it does not end the wait here.
+    does not end the chat), so it does not end the wait here, nor the read below.
 
     With ``check`` (the liveness read, :func:`levain.firing.hands_mcp_login.launch_check`) the wait wakes every
     ``WATCH_S``: a ``gone`` answer raises :class:`_Revoked` at once, an ``unreadable`` one only on the
-    ``UNREADABLE_LIMIT``-th in a row, and a readable answer resets that count."""
+    ``UNREADABLE_LIMIT``-th in a row, and a readable answer resets that count. Any exception out of the read counts
+    as ``unreadable`` (its type named in the reason), never as live; a ``SystemExit`` from a stop signal goes on to
+    the orderly stop."""
     unreadable = 0
     while True:
         try:
@@ -183,7 +186,12 @@ def _wait(proc: _Proc, check: Callable[[], tuple[str, str] | None] | None = None
             continue
         except subprocess.TimeoutExpired:
             pass
-        moved = check() if check is not None else None
+        try:
+            moved = check() if check is not None else None
+        except KeyboardInterrupt:       # the vendor's Ctrl-C landed during the read: no answer this tick
+            continue
+        except Exception as exc:        # noqa: BLE001 - an unconfirmed read is never a live one
+            moved = (hml.UNREADABLE, f"{type(exc).__name__}: {exc}")
         if moved is None:
             unreadable = 0
         elif moved[0] == hml.GONE:
@@ -275,7 +283,8 @@ def launch_hands_chat(entity_dir: Path | str, vendor: str, cockpit_root: Path | 
                       spawn: Spawn | None = None,
                       emit: Callable[[str], None] = print) -> int:
     """Start the hands-uid ``vendor`` chat for ``entity_dir`` and wait for it; its exit code, or non-zero when
-    processes of the hands account were left after it. Raises :class:`HandsChatRefused` (nothing started, both locks
+    processes of the hands account were left after it, or ``HANDS_REVOKED_EXIT`` (returned, not raised) when a
+    revoke, or a log that stayed unreadable, ended it. Raises :class:`HandsChatRefused` (nothing started, both locks
     released) for any refusal or failure before the start, and ``SystemExit(128 + signal)`` after an orderly stop on
     SIGTERM or SIGHUP."""
     start = spawn if spawn is not None else _spawn
@@ -293,6 +302,7 @@ def launch_hands_chat(entity_dir: Path | str, vendor: str, cockpit_root: Path | 
     proc: _Proc | None = None
     attempted = False           # set just before the spawn: from then on the hands account may be running a chat
     survivors = False
+    left: str | None = None
     revoked: str | None = None
     try:
         try:
@@ -328,7 +338,8 @@ def launch_hands_chat(entity_dir: Path | str, vendor: str, cockpit_root: Path | 
     except _Revoked as exc:
         sigs.quiet()
         revoked = exc.reason
-        _stop(proc)
+        if proc is not None:        # always held here (raised only from the wait); the guard is for the type
+            _stop(proc)
     except BaseException:
         sigs.quiet()
         if proc is not None:
@@ -344,31 +355,57 @@ def launch_hands_chat(entity_dir: Path | str, vendor: str, cockpit_root: Path | 
                     left = f"the stop failed ({exc})"
                 if left is not None:
                     survivors = True
-                    try:
-                        emit(f"hands chat: processes of {hands.user} were left after the chat ({left})")
-                    except Exception:  # noqa: BLE001 - a closed stdout must not replace the outcome (L3 r2 N2)
-                        pass
+                    if revoked is None:     # a revoke's one line names them instead (_report_revoked)
+                        try:
+                            emit(f"hands chat: {_left_after(hands.user, left)}")
+                        except Exception:  # noqa: BLE001 - a closed stdout must not replace the outcome (L3 r2 N2)
+                            pass
         finally:
             sigs.restore()
             for fd in reversed(fds):
                 os.close(fd)
     if revoked is not None:
-        _report_revoked(revoked, vendor, emit)
+        _report_revoked(revoked, vendor, emit,
+                        None if left is None or hands is None else _left_after(hands.user, left))
         return HANDS_REVOKED_EXIT
     return (rc or 1) if survivors else rc
 
 
-def _report_revoked(reason: str, vendor: str, emit: Callable[[str], None]) -> None:
-    """The one terminal line and the cockpit note, with the same words. Each is a courtesy that must not replace the
-    outcome: a failed note or a closed stdout leaves the exit code as it is."""
-    line = f"hands revoked: {reason}; this chat was ended"
+def _left_after(user: str, left: str) -> str:
+    """The words for processes of the hands account the final sweep could not stop, on either path."""
+    return f"processes of {user} were left after the chat ({left})"
+
+
+#: The note store's agent name for each vendor. A vendor not here is passed through as itself, so the store refuses
+#: it rather than the note being filed under another vendor's name.
+_NOTE_AGENT = {"claude": "claude_code", "codex": "codex"}
+
+
+def _note_text(text: str) -> tuple[str, str | None]:
+    """The note's ``what`` and ``detail`` for ``text``. The store refuses a ``what`` that is not one line within
+    ``WHAT_MAX``, and a sweep's or a read error's words can be either; such a text keeps its whole form in ``detail``
+    and a one-line cut of it as ``what``, so the note still files."""
+    one = " ".join(text.split())
+    if one == text and len(one) <= notes_mod.WHAT_MAX:
+        return text, None
+    cut = one if len(one) <= notes_mod.WHAT_MAX else one[:notes_mod.WHAT_MAX - 1] + "…"
+    return cut, text[:notes_mod.DETAIL_MAX]
+
+
+def _report_revoked(reason: str, vendor: str, emit: Callable[[str], None], survivors: str | None = None) -> None:
+    """The one terminal line and the cockpit note, with the same words. ``survivors``, the sweep's words for what it
+    left running, replaces the claim that the chat was ended. Each is a courtesy that must not replace the outcome: a
+    failed note or a closed stdout leaves the exit code as it is."""
+    tail = "this chat was ended" if survivors is None else f"the chat was stopped but {survivors}"
+    line = f"hands revoked: {reason}; {tail}"
     try:
         emit(f"hands chat: {line}")
     except Exception:  # noqa: BLE001
         pass
+    what, detail = _note_text(f"hands chat: {line}")
     try:
-        notes_mod.NoteStore().file(agent="claude_code" if vendor == "claude" else "codex",
-                                   agent_session_id=notes_mod.NO_SESSION, what=f"hands chat: {line}", detail=None,
+        notes_mod.NoteStore().file(agent=_NOTE_AGENT.get(vendor, vendor),
+                                   agent_session_id=notes_mod.NO_SESSION, what=what, detail=detail,
                                    cwd=os.getcwd())
     except Exception:  # noqa: BLE001 - the line above already told the terminal
         pass

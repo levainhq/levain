@@ -1,15 +1,16 @@
 """457 (c): a hands-MCP revoke ends a hands chat that is starting or running. The rig is the launch tests' one (a
 sudo shim, a real scratch authority log); the vendor is a fake that never exits on its own, and the liveness read is
-a scripted answer per tick. No hands account, no real vendor, no real note store."""
+a scripted answer per tick. No hands account and no real vendor; the note store is a fake except where a test
+files through a real one on a scratch directory."""
 from __future__ import annotations
 
-import os
 import subprocess
 import sys
 
 import pytest
 
 from levain import hands_live
+from levain.consent.notes import NoteStore as RealNoteStore
 from levain.firing import hands_chat as hc, hands_mcp_login as hml
 from tests.test_hands_chat_launch import assert_released, locks
 from tests.test_hands_mcp_verbs import McpRig
@@ -77,7 +78,10 @@ def script(monkeypatch, answers):
 
     def check(res, now=None):
         calls.append(1)
-        return seq.pop(0) if seq else None
+        answer = seq.pop(0) if seq else None
+        if isinstance(answer, BaseException):
+            raise answer
+        return answer
     monkeypatch.setattr(hml, "launch_check", check)
     return calls
 
@@ -179,3 +183,112 @@ def test_the_pre_start_refusal_stops_the_launch_with_today_s_text(rig, monkeypat
                              emit=lambda s: None)
     assert "the authority log could not be read again before the start (x); no chat was started" == str(ei.value) and started == []
     assert_released(rig)
+
+
+def test_a_ctrl_c_during_the_check_does_not_end_the_chat(rig, monkeypatch):
+    """Ctrl-C belongs to the vendor: one landing inside the liveness read skips that tick and the chat goes on."""
+    calls = script(monkeypatch, [KeyboardInterrupt(), None])
+    chat = FakeChat(rig, exit_after=4, rc=0)
+    try:
+        rc, lines = run(rig, chat)
+    except KeyboardInterrupt:
+        pytest.fail("a Ctrl-C inside the check escaped the watched wait")
+    assert rc == 0 and not chat.stopped and len(calls) >= 3
+    assert not revoked_lines(lines) and rig.filed == []
+    assert_released(rig)
+
+
+def test_any_exception_from_the_check_counts_as_unreadable_and_ends_at_the_limit(rig, monkeypatch):
+    """A malformed grant can raise outside launch_check's own except: it is an unconfirmed read, never a live one,
+    and never a traceback with no line, no note and no 77."""
+    script(monkeypatch, [ValueError("bad stamp")] * 3)
+    chat = FakeChat(rig)
+    rc, lines = run(rig, chat)
+    assert rc == 77 and chat.stopped
+    [line] = revoked_lines(lines)
+    assert line == ("hands chat: hands revoked: the hands grants could not be confirmed (ValueError: bad stamp); "
+                    "this chat was ended")
+    [note] = rig.filed
+    assert note["what"] == line
+    assert_released(rig)
+
+
+def test_an_exception_below_the_limit_then_live_is_not_stopped(rig, monkeypatch):
+    script(monkeypatch, [KeyError("id"), None])
+    chat = FakeChat(rig, exit_after=4, rc=5)
+    rc, lines = run(rig, chat)
+    assert rc == 5 and not chat.stopped and not revoked_lines(lines)
+
+
+def test_a_system_exit_from_the_check_still_propagates(rig, monkeypatch):
+    """A stop signal's SystemExit raised inside the read keeps its orderly stop and its exit code."""
+    script(monkeypatch, [SystemExit(143)])
+    chat = FakeChat(rig)
+    with pytest.raises(SystemExit) as ei:
+        run(rig, chat)
+    assert ei.value.code == 143 and chat.stopped and rig.filed == []
+    assert_released(rig)
+
+
+def test_survivors_after_a_revoke_are_named_and_the_exit_is_non_zero(rig, monkeypatch):
+    """The revoked hands may still run: the line and the note must not say the chat simply ended."""
+    script(monkeypatch, [(hml.GONE, "g-1")])
+    sweeps = []
+
+    def sweep(user, *, uid, timeout=5.0):
+        sweeps.append(user)
+        return None if len(sweeps) == 1 else "pid 4242 is still running"
+    monkeypatch.setattr(hands_live, "sweep_hands_user", sweep)
+    chat = FakeChat(rig)
+    rc, lines = run(rig, chat)
+    assert rc != 0 and rc == 77
+    user = sweeps[-1]
+    want = (f"hands chat: hands revoked: registry entry g-1 was revoked or ran out; the chat was stopped but "
+            f"processes of {user} were left after the chat (pid 4242 is still running)")
+    assert [x for x in lines if "pid 4242" in x] == [want]
+    assert "this chat was ended" not in "\n".join(lines)
+    [note] = rig.filed
+    assert note["what"] == want
+    assert_released(rig)
+
+
+def _real_notes(monkeypatch, tmp_path):
+    monkeypatch.setenv("LEVAIN_HOME", str(tmp_path / "lh"))
+    monkeypatch.setattr(hc.notes_mod, "NoteStore", RealNoteStore)
+    return RealNoteStore(tmp_path / "lh" / "consent")
+
+
+@pytest.mark.parametrize("vendor,agent", [("claude", "claude_code"), ("codex", "codex")])
+def test_the_note_files_through_a_real_note_store(rig, monkeypatch, tmp_path, vendor, agent):
+    store = _real_notes(monkeypatch, tmp_path)
+    script(monkeypatch, [(hml.GONE, "g-1")])
+    lines = []
+    rc = hc.launch_hands_chat(rig.entity, vendor, rig.ck.root, spawn=FakeChat(rig), emit=lines.append)
+    assert rc == 77
+    [line] = revoked_lines(lines)
+    notes, total = store.open_page(10)
+    assert total == 1
+    [n] = notes
+    assert n.what == line and n.agent == agent and n.agent_session_id == hc.notes_mod.NO_SESSION
+    assert_released(rig)
+
+
+def test_a_long_or_multi_line_survivor_report_still_files_its_note(monkeypatch, tmp_path):
+    """The store refuses a ``what`` past WHAT_MAX or with a line break; the sweep's words can be both."""
+    store = _real_notes(monkeypatch, tmp_path)
+    left = "processes of levain-hands were left after the chat (" + "pid 1 claude\n" * 40 + ")"
+    lines = []
+    hc._report_revoked("registry entry g-1 was revoked or ran out", "claude", lines.append, left)
+    [n], total = store.open_page(10)
+    assert total == 1 and len(n.what) <= hc.notes_mod.WHAT_MAX and "\n" not in n.what
+    assert n.what.startswith("hands chat: hands revoked: registry entry g-1 was revoked or ran out; the chat was "
+                             "stopped but processes of levain-hands")
+    assert n.detail == lines[0]
+
+
+def test_a_vendor_with_no_note_agent_is_not_filed_as_codex(monkeypatch, tmp_path):
+    """No guess: a vendor outside the map files nothing (the store refuses the name); the terminal line stands."""
+    store = _real_notes(monkeypatch, tmp_path)
+    lines = []
+    hc._report_revoked("registry entry g-1 was revoked or ran out", "gemini", lines.append)
+    assert len(lines) == 1 and store.open_page(10) == ([], 0)

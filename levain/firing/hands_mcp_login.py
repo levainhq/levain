@@ -615,9 +615,9 @@ def launch_still_live(res: LaunchFiles, now: datetime | None = None) -> str | No
     """Why the files :func:`prepare_launch` just wrote are no longer the live registry, or None (L3 r3 G5, codex
     HIGH): an entry they hold was revoked, or ran out, after the registry was read. A revoke is an authority-log append
     that takes no hands lock, so the hands lock cannot order it against a launch; this re-reads the log at the last
-    boundary before the vendor starts. It narrows the window to this read and the exec, it does not close it: a revoke
-    after it lands as one during the chat does (the frame's Known edges). An entry registered since is not a reason
-    (the files only lack it)."""
+    boundary before the vendor starts. A revoke after this read is the running chat's to catch: its watched wait
+    re-reads the log through :func:`launch_check` and ends the chat (:mod:`levain.firing.hands_chat`). An entry
+    registered since is not a reason (the files only lack it)."""
     moved = launch_check(res, now)
     if moved is None:
         return None
