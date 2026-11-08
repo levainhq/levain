@@ -89,9 +89,16 @@ def pin(name: str, *, owner: str = "", purpose: str = "", home: Path | str | Non
     """Set ``pin: true``. A VM with no sidecar (an existing base image) gets a full one, pinned."""
     rec = _load(name, home)
     if not rec:
+        if not owner_path(name, home).parent.is_dir():      # a typo'd name must not mint a pinned phantom dir the reaper keeps forever
+            raise FileNotFoundError(f"no VM directory for {name}; refusing to pin a name tart does not hold")
         created = now().replace(microsecond=0)
         rec = {"owner": owner or "unknown", "created": created.isoformat(), "purpose": purpose or "pinned",
                "expires": (created + DEFAULT_TTL).isoformat()}
+    else:
+        if owner:
+            rec["owner"] = owner
+        if purpose:
+            rec["purpose"] = purpose
     rec["pin"] = True
     _write_atomic(owner_path(name, home), rec)
     return rec

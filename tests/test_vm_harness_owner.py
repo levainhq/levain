@@ -40,5 +40,20 @@ def test_pin_and_extend_keep_other_keys(tmp_path):
     owner.pin("vm1", home=tmp_path)
     after = _read(tmp_path, "vm1")
     assert after["pin"] is True and after["expires"] == "2026-12-01" and after["owner"] == "seat-63"
+    (tmp_path / "vms" / "existing-base").mkdir(parents=True)
     owner.pin("existing-base", owner="seat-63", home=tmp_path, now=lambda: T0)   # no sidecar yet
     assert _read(tmp_path, "existing-base")["pin"] is True
+
+
+def test_pin_refuses_a_name_with_no_vm_dir(tmp_path):
+    import pytest
+    with pytest.raises(FileNotFoundError):
+        owner.pin("typo-vm", home=tmp_path)
+    assert not (tmp_path / "vms" / "typo-vm").exists()
+
+
+def test_pin_applies_owner_and_purpose_to_an_existing_sidecar(tmp_path):
+    owner.write_owner("vm1", "seat-01", "drill", home=tmp_path, now=lambda: T0)
+    owner.pin("vm1", owner="seat-63", purpose="bug 404", home=tmp_path)
+    d = _read(tmp_path, "vm1")
+    assert d["owner"] == "seat-63" and d["purpose"] == "bug 404" and d["pin"] is True
