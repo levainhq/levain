@@ -399,8 +399,9 @@ def watch_apply(board: Path | str | None = None, *, sessions: Any = None) -> lis
         with store._write("service", None, create=False) as (conn, now):
             token, held = _lease.service_claim(conn, now, cause="watch apply")
             if held is not None:
-                return [f"{waiting} {plural} waiting: the board's lease is held by {held.holder} until {held.until}; "
-                        f"applied nothing this pass"]
+                how = (f"is held by {held.holder} until {held.until}" if held.live else
+                       f"of {held.holder} lapsed at {held.until}, and recording that is the coordinator's")
+                return [f"{waiting} {plural} waiting: the board's lease {how}; applied nothing this pass"]
         try:
             live = (sessions or live_session_ids)(store)
             got = apply_reports(store, token, live_sessions=live)
