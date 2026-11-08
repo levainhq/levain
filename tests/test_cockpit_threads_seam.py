@@ -56,7 +56,7 @@ def test_the_boot_script_reads_the_flag_and_keeps_the_zone_hidden():
     js = (Path(threads.__file__).resolve().parents[1] / "templates" / "web" / "dashboard_boot.js").read_text()
     assert "manifest.transport.threads === false" in js
     assert 'document.body.dataset.threads === "off"' in js
-    assert "section.hidden = off || !token();" in js
+    assert "section.hidden = off || !read || !token();" in js
 
 
 @needs_browser
