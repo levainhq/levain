@@ -105,10 +105,6 @@ def test_a_labelled_row_carries_its_provenance_and_the_etag_moves(rig: Rig) -> N
     # a panel that declares no label key renders as read
     assert all(r["provenance"] is None
                for r in rig.ck.panel("episodes", credential_class="token")["rows"])
-    # the now view takes its rows' provenance from the same snapshot
-    now = {r["id"]: r for r in rig.ck.panel("now", credential_class="token")["rows"]}
-    if seed in now:
-        assert now[seed]["provenance"]["label"] == "verified"
 
 
 def test_a_failing_labeller_is_an_error_snapshot_never_a_failed_panel(rig: Rig) -> None:

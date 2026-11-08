@@ -8,7 +8,7 @@ from datetime import datetime, timezone
 import pytest
 
 from levain.cockpit import Cockpit, CockpitRegistrationError, ProviderSpec, Read, RowIn
-from levain.cockpit.engine import READING_BANDS, READING_SYMBOLS, NOW_ID
+from levain.cockpit.engine import READING_BANDS, READING_SYMBOLS
 
 CRED = {"class": "none", "device_class": None}
 NOW = datetime(2026, 10, 12, 12, 0, tzinfo=timezone.utc)
@@ -126,13 +126,12 @@ class TestZoneLayout:
         assert z["mind"]["grid"] == 3 and z["mind"]["panels"] == ["a"]
         assert z["mind"]["cards"] == [{"panels": ["a"], "size": "medium", "span": 1, "tabs": None}]
 
-    def test_now_is_its_own_first_card_in_operate(self):
+    def test_operate_holds_only_its_registered_cards(self):
         ck = _ck()
         ck.register(_spec("a", "line", "operate", size="tall", span=2))
         op = _regions(ck)["zones"][0]
-        assert op["panels"] == [NOW_ID, "a"]
-        assert op["cards"] == [{"panels": [NOW_ID], "size": "medium", "span": 1, "tabs": None},
-                               {"panels": ["a"], "size": "tall", "span": 2, "tabs": None}]
+        assert op["panels"] == ["a"]
+        assert op["cards"] == [{"panels": ["a"], "size": "tall", "span": 2, "tabs": None}]
 
     def test_tabs_share_one_card_in_rank_order(self):
         ck = _ck()

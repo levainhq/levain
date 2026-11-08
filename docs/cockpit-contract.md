@@ -72,7 +72,7 @@ Notes a provider relies on:
 | `operate` / `mind` / `identity` | any kind | |
 
 - **`face`** is `""` (the kind's own face) or `"count"`. `"count"` is valid only on a `list` or `count-queue`, in any
-  region; in a widget it draws the row count and the panel's note, and the rows surface through `now` and the
+  region; in a widget it draws the row count and the panel's note, and the rows surface through the
   panel's own view. A panel head carries `face` only when it is non-empty.
 - **`size`** (`tall`, `medium`, `short`; default `medium`), **`span`** (`1`, `2`, `3`; default `1`) and **`tabs`** (a card
   title) lay out a zone panel; a non-default on a hero, brief or widgets panel is refused. Panels of one zone that
@@ -97,13 +97,11 @@ The manifest's `regions`:
 `header` is **compat**: what a renderer that predates the hero reads (hero, brief, then widgets, so a widget is drawn
 by the old page's header-extra path rather than lost), derived and never declared. A zone's `panels` is the flat list
 as before, in rank order; `cards` is the layout over the same ids and is authoritative (the two differ when tab members
-are not rank-contiguous). `now` leads `operate` as a card
-of its own (size `medium`, span 1, no tabs). Regions are content: they are hashed into the manifest etag.
+are not rank-contiguous). Regions are content: they are hashed into the manifest etag.
 
 ### Kernel default layout
 
-`build_default_cockpit` places: `brief` the state line; `widgets` Health; `operate` (rank order) Now (engine-fixed),
-Tray 10 and Open loops 15 (both `tall`), Recent episodes 40, Keep 50, Recent edits 60, Recent jobs 70 (`medium`);
+`build_default_cockpit` places: `brief` the state line; `widgets` Health; `operate` (rank order) Tray 10 and Open loops 15 (both `tall`), Recent episodes 40, Keep 50, Recent edits 60, Recent jobs 70 (`medium`);
 `mind` the Neocortex tabs card (one tab per continuity heading, ranked in heading order from 0, span 2, `tall`), Crystallized patterns 100
 (`tall`) and the Cognition card (graph 200 and projection history 210, `tabs="Cognition"`, `short`). Ranks 16-39 of
 `operate` are left for an embedder's Inbox, Fleet and Stream; a rank outside the kernel's bands is the embedder's.

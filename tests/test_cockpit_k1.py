@@ -27,7 +27,6 @@ from levain.cockpit import (
     Read,
     RowIn,
 )
-from levain.cockpit.engine import NOW_ID
 from levain.cockpit.providers import build_default_cockpit
 from levain.dashboard import SubstrateSource
 from levain.jobs import JobStore
@@ -206,6 +205,19 @@ class TestWhyProvidersCheckTheirOwnSources:
 
 
 class TestRegistrationRefusals:
+    def test_a_retired_panel_id_is_refused(self) -> None:
+        from levain.cockpit.engine import RETIRED_PANEL_IDS
+        assert "now" in RETIRED_PANEL_IDS
+        with pytest.raises(CockpitRegistrationError, match="reserved"):
+            Cockpit().register(_simple("now"))
+
+    def test_the_view_scrubs_exactly_the_engine_retired_ids(self) -> None:
+        import re
+        from levain.cockpit.engine import RETIRED_PANEL_IDS
+        js = (Path(__file__).resolve().parent.parent / "levain/templates/web/cockpit_view.js").read_text()
+        m = re.search(r"const RETIRED_PANEL_IDS = (\[[^\]]*\]);", js)
+        assert m and tuple(json.loads(m.group(1))) == tuple(RETIRED_PANEL_IDS)
+
     def test_a_gate_panel_registering_an_optional_source_is_refused(self) -> None:
         with pytest.raises(CockpitRegistrationError, match="optional"):
             Cockpit().register(_simple(priority="gate", optional=True))
@@ -407,47 +419,6 @@ class TestHttpRoutes:
             make_server(src, host="127.0.0.1", port=0, extra_json={"/cockpit/manifest.json": lambda: b"{}"})
 
 
-# --- the `now` view --------------------------------------------------------------------------------
-
-
-def _decision_rows(n: int, due: str = "2020-01-01") -> list[RowIn]:
-    return [RowIn(f"np:{i}", f"decision {i}", {"due": due, "overdue_days": 5}, stored={"id": f"np:{i}"}) for i in range(n)]
-
-
-class TestNowView:
-    def _ck(self, env, decisions: Any) -> Cockpit:
-        _root, _src, ck = env
-        ck.register(ProviderSpec(
-            id="decisions", kind="triage-list", title="Decisions", priority="gate", read=decisions,
-            region="operate", rank=-1, order="decision.dated", facets=frozenset({"due", "overdue_days"}),
-            version_fields=("id",)))
-        return ck
-
-    def test_now_rows_are_the_concatenation_of_the_gate_panels_band_now_rows_in_source_order(self, env) -> None:
-        ck = self._ck(env, lambda c: Read(rows=tuple(_decision_rows(2))))
-        now = ck.panel(NOW_ID)
-        expect = []
-        for pid in ("decisions", "tray"):  # decisions rank -1 comes before tray rank 0
-            expect += [(pid, r["id"]) for r in ck.panel(pid)["rows"] if r["band"] == "now"]
-        assert [(r["panel_id"], r["id"]) for r in now["rows"]] == expect
-        assert expect and {p for p, _ in expect} == {"decisions", "tray"}
-        assert now["count"] == len(expect)
-
-    def test_with_decisions_in_error_the_view_reads_error_and_names_it(self, env) -> None:
-        def boom(ctx):
-            raise OSError("needs_phill log gone")
-        ck = self._ck(env, boom)
-        now = ck.panel(NOW_ID)
-        assert now["status"] == "error" and "decisions" in now["error"] and now["degraded"] == ["decisions"]
-        assert [r["panel_id"] for r in now["rows"]] == ["tray", "tray"]  # the sources still ok still render
-        assert "decisions" in now["note"]
-
-    def test_the_manifest_lists_now_first_in_operate(self, env) -> None:
-        _root, _src, ck = env
-        m = ck.manifest(NONE_CRED)
-        assert m["regions"]["zones"][0]["panels"][0] == NOW_ID and NOW_ID in m["panels"]
-
-
 # --- row versions ----------------------------------------------------------------------------------
 
 
@@ -532,7 +503,7 @@ class TestRowVersions:
 class TestProfilesAndSearch:
     def test_no_compact_profile_panel_carries_a_row_body(self, env) -> None:
         _r, _s, ck = env
-        for pid in ck.panel_ids + [NOW_ID]:
+        for pid in ck.panel_ids:
             panel = ck.panel(pid, profile="compact")
             for row in panel["rows"] or []:
                 assert row["body"] is None, pid
@@ -804,10 +775,6 @@ class TestL3R1Fixes:
         got = ck.panel("p")
         assert got["status"] == "partial" and [r["id"] for r in got["rows"]] == ["a"] and got["skipped"][0]["count"] == 1
 
-    def test_q_on_the_now_view_is_a_no_op_not_zero_rows(self, env) -> None:
-        _r, _s, ck = env
-        assert ck.panel(NOW_ID, q="anything")["rows"] == ck.panel(NOW_ID)["rows"]
-
     def test_a_context_file_that_is_valid_json_of_the_wrong_shape_is_error(self, env) -> None:
         root, _s, ck = env
         (root / ".levain" / "context.json").write_text("[]")
@@ -979,17 +946,6 @@ class TestL3R3Fixes:
         assert ck.panel("crystals")["count"] == 1
 
 
-class TestNowGroups:
-    def test_the_now_head_carries_the_union_of_its_sources_groups_counted(self, env) -> None:
-        _r, _s, ck = env
-        now = ck.panel(NOW_ID)
-        assert [g["id"] for g in now["groups"]] == ["overdue", "today", "also"]
-        assert [g["title"] for g in now["groups"]][:2] == ["Overdue", "Today"]
-        by = {g["id"]: g["count"] for g in now["groups"]}
-        assert by == {"today": 1, "overdue": 1, "also": 0} and sum(by.values()) == now["count"]
-        assert ck.manifest(NONE_CRED)["panels"][NOW_ID]["groups"] == now["groups"]
-
-
 class TestSession2Freshness:
     """K1 DONE (rev 12): after a 304 on a panel, ``GET /cockpit/freshness.json`` (never answered 304)
     returns that panel's newer ``as_of``."""
@@ -1040,7 +996,7 @@ class TestSession2Freshness:
             facets=frozenset({"at"}), version_fields=("id",)))
         fr = ck.freshness()
         assert calls == [] and fr["probe"] == {"as_of": None, "status": "unread"}
-        assert fr[NOW_ID]["status"] == "unread"
+        assert "now" not in fr           # the Now panel is gone (board row 137)
         ck.panel("probe")
         assert calls == [1] and ck.freshness()["probe"]["status"] == "empty"
         assert len(calls) == 1
@@ -1131,27 +1087,13 @@ class TestSession2Gaps:
         _r, _s, ck = env
         heads = ck.manifest(NONE_CRED)["panels"]
         assert {k: v["edit_class"] for k, v in heads.items() if not k.startswith(("section:", "config:"))} == {
-            "now": None, "state": None, "begin": "C", "tray": "B", "loops": "B", "keep": "B",
+            "state": None, "begin": "C", "tray": "B", "loops": "B", "keep": "B",
             "episodes": "B", "edits": None, "jobs": None, "health": "C", "graph": "C",
             "crystals": "C", "wraps": "C", "team-status": None, "sessions": None,
             "activity": "C", "memory_glance": "C", "doctor": "C", "topology": "C",
             "notifications": None}      # the Team zone's one card: this install root has no team ledger
         sections = {k: v["edit_class"] for k, v in heads.items() if k.startswith(("section:", "config:"))}
         assert sections and all(c in ("A", "B", "C") for c in sections.values())
-
-
-class TestSession2CompactNow:
-    def test_compact_now_rows_are_refs_that_join_to_the_source_panels_compact_rows(self, env) -> None:
-        _r, _s, ck = env
-        now = ck.panel(NOW_ID, profile="compact")
-        full = ck.panel(NOW_ID)
-        assert now["rows_by_ref"] is True and "rows_by_ref" not in full
-        assert [(r["panel_id"], r["id"]) for r in now["rows"]] == [(r["panel_id"], r["id"]) for r in full["rows"]]
-        assert all(set(r) == {"id", "panel_id", "version", "group", "body"} and r["body"] is None for r in now["rows"])
-        tray = {r["id"]: r for r in ck.panel("tray", profile="compact")["rows"]}
-        for r in now["rows"]:
-            assert tray[r["id"]]["version"] == r["version"] and tray[r["id"]]["group"] == r["group"]
-        assert now["count"] == full["count"]
 
 
 class TestK6CrystalMode:
@@ -1208,31 +1150,14 @@ class TestL3R4CodexFixes:
         monkeypatch.setattr(CrystalStore, "active", active)
         assert ck.panel("crystals")["status"] == "error"
 
-    def test_the_now_etag_covers_its_groups(self, env) -> None:
-        from levain.cockpit.engine import _Snap
-        _r, _s, ck = env
-        now = ck.panel(NOW_ID)
-        assert now["groups"] and now["etag"] == ck.manifest(NONE_CRED)["panels"][NOW_ID]["etag"]
-        snap = _Snap(now["status"], now["rows"], None, [], [], now["as_of"], now["error"], now["note"])
-        today = ck._clock().astimezone().date()
-        a = ck.authority()
-        assert ck._etag_of(snap, None, "none", today, auth=a) != ck._etag_of(snap, now["groups"], "none", today, auth=a)
-        assert now["etag"] == ck._etag_of(snap, now["groups"], "none", today, auth=a)
-
-
 class TestL3R6Freshness:
-    def test_freshness_now_rolls_up_its_sources_in_the_same_call_and_ages_with_them(self, env) -> None:
-        root, _s, ck = env
-        assert ck.freshness()[NOW_ID] == {"as_of": None, "status": "unread"}
-        head = ck.manifest(NONE_CRED)["panels"][NOW_ID]
-        assert ck.freshness()[NOW_ID] == {"as_of": head["as_of"], "status": "ok"}
-        (root / ".levain" / "memory.spores.json").unlink()          # a gate source fails: error, not masked
-        ck.manifest(NONE_CRED)
-        assert ck.freshness()[NOW_ID]["status"] == "error"
-        ck.register(ProviderSpec(id="late", kind="triage-list", title="l", priority="gate",
-                                 read=lambda c: Read(rows=()), order="time.desc",
-                                 facets=frozenset({"at"}), version_fields=("id",)))
-        assert ck.freshness()[NOW_ID]["status"] == "error"          # an unread source does not hide a known error
+    def test_the_now_panel_is_gone_from_the_manifest_the_freshness_and_the_panel_route(self, env) -> None:
+        _r, _s, ck = env
+        m = ck.manifest(NONE_CRED)
+        assert "now" not in m["panels"]
+        assert all("now" not in z["panels"] and all("now" not in c["panels"] for c in z["cards"]) for z in m["regions"]["zones"])
+        assert "now" not in ck.freshness()
+        assert ck.panel("now") is None
 
     def test_an_on_demand_panels_freshness_ages_against_its_stale_after(self, tmp_path: Path) -> None:
         _root, src = _install(tmp_path)

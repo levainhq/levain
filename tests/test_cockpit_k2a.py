@@ -21,7 +21,7 @@ from anneal_memory.spores import SporeStore
 from levain.authority import AuthoritySnapshot, StandingPolicy, genesis_policy
 from levain.cockpit import verbs as verbs_mod
 from levain.cockpit.authority import RequestAuthority
-from levain.cockpit.engine import NOW_ID, ProviderSpec
+from levain.cockpit.engine import ProviderSpec
 from levain.cockpit.results import Absent, Read
 from levain.cockpit.providers import build_default_cockpit
 from levain.cockpit.verbs import VerbRegistry, VerbSpec, VerbView, dispatch
@@ -396,7 +396,6 @@ class TestTierLadder:
         rig.clock.advance(2)    # past every rejected date, still before the stored one
         held = f"spore:{rig.ids['held']}"
         assert held not in rig.panel_ids("tray")
-        assert held not in rig.panel_ids(NOW_ID)
 
     def test_surface_at_on_a_keep_note_leaves_it_out_of_the_tray(self, rig: Rig) -> None:
         """'surface_at on a Keep note leaves it out of the tray panel'"""

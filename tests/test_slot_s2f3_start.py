@@ -71,9 +71,11 @@ class Table:
         return [p for p in self.cg if p in self.procs]
 
     def read(self, path: str) -> str:
-        if not self.cgroup_made or not path.endswith("/cgroup.events"):
+        if not self.cgroup_made or not path.endswith(("/cgroup.events", "/cgroup.threads")):
             raise FileNotFoundError(path)
         m = self._members()
+        if path.endswith("/cgroup.threads"):
+            return "".join(f"{p}\n" for p in m)
         frozen = all(self.procs[p].state == PR.STOP for p in m)
         return f"populated {int(bool(m))}\nfrozen {int(frozen)}\n"
 

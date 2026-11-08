@@ -481,12 +481,48 @@ _DUE_SQL = ("SELECT h.question_id, h.at, f.outcome FROM held_pings h LEFT JOIN f
             "r.question_id = h.question_id) AND (f.outcome IS NULL OR f.outcome = 'escalated') ORDER BY h.rowid")
 
 
+def _release_cause(q: Any, outcome: str, at: str, now: str, after: timedelta, today: str) -> str | None:
+    """Why a held ping is released now (``answered`` / ``escalated`` / ``unread``), or ``None`` to leave it held: not
+    yet unread long enough, or deferred by a band snooze whose day is after ``today``."""
+    from levain.cockpit.consent import parse_stamp
+    from levain.consent.questions import later_date
+
+    if q is None or q.answer is not None:
+        return "answered"
+    if later_date(q, today) is not None:
+        return None           # the operator deferred it: it stays held, released on its day
+    if outcome == "escalated":
+        return "escalated"
+    if parse_stamp(now) - parse_stamp(at) >= after:
+        return "unread"
+    return None
+
+
+def _read_due(db: Path) -> list[Any] | None:
+    """The due held-ping rows, read-only: ``[]`` when the database does not exist (nothing was ever held), ``None``
+    when the read FAILED (busy, locked, corrupt), which is not "no rows": the caller then takes the locked path, which
+    re-reads under the lock, so a transient failure never drops a sweep's due rows."""
+    if not db.exists():
+        return []
+    try:
+        conn = sqlite3.connect(db.resolve().as_uri() + "?mode=ro", uri=True, timeout=2.0)
+        try:
+            return conn.execute(_DUE_SQL).fetchall()
+        finally:
+            conn.close()
+    except sqlite3.Error:
+        return None
+
+
 def claim_held(directory: Path | str, *, after: timedelta | None = None) -> list[tuple[Any, str]]:
     """Release every held ping now due, once: ``[(question, cause)]`` for the caller to ping, cause ``escalated`` or
     ``unread`` (module docstring). An ``unread`` release also files the escalation's ANSWER record (once per question,
     as :func:`escalate` does) and its ``first_reads`` row (``escalated``), in the same transaction as the release. A question the operator answered meanwhile is
-    released as ``answered`` and returned to nobody. Cheap when nothing waits: one read-only query."""
+    released as ``answered`` and returned to nobody. One he snoozed (a band snooze whose day is after today, local) is
+    not released: it stays held and is released as above once its day comes. Cheap when nothing waits: one read-only
+    query."""
     from levain.cockpit.consent import parse_stamp
+    from levain.consent.questions import later_date, local_today
     from levain.coordinator import lease
 
     after = UNREAD_AFTER if after is None else after
@@ -506,20 +542,35 @@ def claim_held(directory: Path | str, *, after: timedelta | None = None) -> list
     qs = _questions(d)
     store = _coord_store(d)
     out: list[tuple[Any, str]] = []
+    # Read first: a due row that stays held (a snooze, not yet unread long enough) must not take the dispatch write
+    # lock for nothing. The decision to release is still re-made under the locks below.
+    now0 = store._stamp()
+    today0 = local_today(parse_stamp(now0))
+    due = _read_due(db)
+    if due is not None and not any(_release_cause(qs.get(qid), oc, at, now0, after, today0) is not None
+                                   for qid, at, oc in due):      # a failed read (None) falls through to the lock
+        return []
     with write_transaction(store._connect) as conn:
         now = store._stamp()
+        today = local_today(parse_stamp(now))
         for question_id, at, outcome in conn.execute(_DUE_SQL).fetchall():
             q = qs.get(question_id)
-            if q is None or q.answer is not None:
-                cause = "answered"
-            elif outcome == "escalated":
-                cause = "escalated"
-            elif parse_stamp(now) - parse_stamp(at) >= after:
-                cause = "unread"
+            if q is not None and q.answer is None:
+                # The decision to ping is made on a read taken UNDER the question store's write lock, which a snooze and
+                # an answer both take: one landing between the read above and the release row would otherwise be pinged
+                # past (L3). Lock order is always dispatch, then questions; nothing takes them the other way.
+                with qs._write() as qconn:
+                    q = qs._by_ref(qconn, question_id)
+                    cause = _release_cause(q, outcome, at, now, after, today)
+                    if cause is not None:
+                        conn.execute("INSERT INTO held_ping_releases (question_id, cause, at) VALUES (?, ?, ?)",
+                                     (question_id, cause, now))
             else:
+                cause = "answered"
+                conn.execute("INSERT INTO held_ping_releases (question_id, cause, at) VALUES (?, ?, ?)",
+                             (question_id, cause, now))
+            if cause is None:
                 continue
-            conn.execute("INSERT INTO held_ping_releases (question_id, cause, at) VALUES (?, ?, ?)",
-                         (question_id, cause, now))
             if cause == "unread":
                 # the release IS the question's first read (an escalation), so a later ``coord answer`` or
                 # ``coord escalate`` on it is refused by name (L3 r3): the KNOW would contradict the push to him

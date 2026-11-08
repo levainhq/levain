@@ -429,7 +429,7 @@
   // The work lists draw whole rows and say how many they leave out: a list that does not fit its card folds the rows below the fold
   // (display none, never a half row) and ends in an "N more" link that opens the panel's focus view. Re-runnable: a redraw, a filter
   // or a resize unfolds first and measures again.
-  const FOLD_PANELS = ["tray", "loops", "keep", "episodes", "now", "inbox", "roster", "stream", "flow-episodes", "flow-spores"];
+  const FOLD_PANELS = ["tray", "loops", "keep", "episodes", "inbox", "roster", "stream", "flow-episodes", "flow-spores"];
   // what a folding list is made of: its rows (a work row, a roster row, a log line) and the headings that group them
   const FOLD_ROW = ".row, .rrow, .lrow", FOLD_HEAD = ".grp-head, .grp-h";
   function foldRows(body) {
@@ -1003,13 +1003,13 @@
     h2.after(pill);
   }
 
-  // The Board is two independent stacks, not rows that pair: Tray and Now down the left, Open loops and Keep down the right, each as
+  // The Board is two independent stacks, not rows that pair: Tray down the left, Open loops and Keep down the right, each as
   // tall as its own cards, so the shorter card of a pair never leaves a hole. Other tabs lay the same cards out as plain grid items
   // (the stacks are display: contents there). Only a zone that holds both sides is stacked; a card the table does not name stays a
   // direct, full-width child.
-  const CK_STACK_SIDE = Object.assign(Object.create(null), { tray: 0, now: 0, loops: 1, keep: 1 });
+  const CK_STACK_SIDE = Object.assign(Object.create(null), { tray: 0, loops: 1, keep: 1 });
   // Top to bottom inside a side when nothing is saved (the CSS used to draw this with `order`, which would override a saved order).
-  const CK_STACK_RANK = Object.assign(Object.create(null), { tray: 0, now: 1, loops: 0, keep: 1 });
+  const CK_STACK_RANK = Object.assign(Object.create(null), { tray: 0, loops: 0, keep: 1 });
   // ---- K5: collapse and reorder the cards of a zone, saved per browser (cockpit_view.js holds the storage). Reorder is within a zone and,
   // on the Board's two stacks, within a side. The Memory and Identity zones are composed by composeMemory (their own rows and sections),
   // so the layout does not reach them; the now band, sky, widgets, brief and Needs-you strip are not zone cards and have no controls.
@@ -4842,6 +4842,13 @@
     for (const it of items) {
       if (!it || typeof it !== "object") continue;
       const authority = it.kind === "authority";
+      if (typeof it.later === "string" && it.later) {     // snoozed (row 131): one collapsed LATER line, number kept, no answer controls
+        const lrow = el("div", "row consent-row band-row band-later");
+        lrow.setAttribute("data-band-row", String(it.n));
+        lrow.appendChild(el("span", "ext-meta", "LATER " + (typeof it.later_label === "string" && it.later_label ? it.later_label : String(it.n) + " " + it.later) + " · " + (typeof it.what === "string" ? it.what.slice(0, 80) : "")));
+        kids.push(lrow);
+        continue;
+      }
       const row = el("div", "row consent-row band-row" + (authority ? "" : " ext-accent"));
       row.setAttribute("data-band-row", String(it.n));
       const head = el("div", "consent-head");

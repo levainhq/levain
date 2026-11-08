@@ -249,32 +249,6 @@
     return { verb: c.verb, fields: fields };
   }
 
-  // Now's rows in date order with the heading each sits under. Overdue and undated (waiting on you) rows lead as TODAY / OVERDUE,
-  // each later day within a week is "TUE 10-20", anything further is LATER.
-  // `today` is the server's calendar day ("YYYY-MM-DD", the panel's own `today`); the browser's clock and zone decide nothing here
-  function nowByDate(rows, today) {
-    const day = (y, m, d) => Date.UTC(y, m, d);
-    const tm = /^(\d{4})-(\d{2})-(\d{2})/.exec(String(today || ""));
-    const d0 = new Date();
-    const today0 = tm ? day(+tm[1], +tm[2] - 1, +tm[3]) : day(d0.getFullYear(), d0.getMonth(), d0.getDate());   // an old server sends none: the page's own day
-    const iso = (r) => { const m = /^(\d{4})-(\d{2})-(\d{2})/.exec(String((r.facets || {}).due || "")); return m ? day(+m[1], +m[2] - 1, +m[3]) : null; };
-    const keyed = rows.map((r, i) => ({ r: r, i: i, t: iso(r) }));
-    const rank = (k) => (k.t === null ? today0 : k.t);     // undated: due now
-    keyed.sort((a, b) => rank(a) - rank(b) || a.i - b.i);
-    const label = new Map();
-    const names = ["SUN", "MON", "TUE", "WED", "THU", "FRI", "SAT"];
-    for (const k of keyed) {
-      const t = rank(k);
-      let text;
-      if (t < today0) text = "OVERDUE";
-      else if (t === today0) text = "TODAY";
-      else if (t - today0 <= 7 * 86400000) { const d = new Date(t); text = names[d.getUTCDay()] + " " + String(d.getUTCMonth() + 1).padStart(2, "0") + "-" + String(d.getUTCDate()).padStart(2, "0"); }
-      else text = "LATER";
-      label.set(k.r.id, text);
-    }
-    return { rows: keyed.map((k) => k.r), label: label };
-  }
-
   function externalOf(head, panel, groupTitles, nowMs) {
     const v = panel.value || {};
     const kind = ALIAS[head.kind] || head.kind;
@@ -297,12 +271,7 @@
       const declared = Array.isArray(head.facets) ? head.facets : Array.isArray(panel.facets) ? panel.facets : [];
       const addressed = !!rfield || declared.indexOf("for") >= 0;
       if (compose) out.compose = compose;
-      // Now reads as a dated list, as the mock draws it: what is late and what is due today first, then each day of the next seven by
-      // date ("TUE 10-20"), one line per item. A row with no date is due now (a decision waiting on you).
-      const nowRows = head.id === "now" ? nowByDate(panel.rows || [], panel.today) : null;
-      const srcRows = nowRows ? nowRows.rows : (panel.rows || []);
-      if (nowRows) out.note = "next 7 days";
-      out.lines = srcRows.map((r) => {
+      out.lines = (panel.rows || []).map((r) => {
         const grp = r.group ? (groupTitles.get(r.group) || r.group) : "";
         const badges = (r.badges || []).map(badgeText).join(" · ");
         const prov = r.provenance ? r.provenance.label : "";
@@ -325,7 +294,6 @@
         // the coordinator thread the drop card hosts reads each row whole: its one-line title, its full text, its instant and its source
         if (head.id === "desk-thread") line.thread = { title: r.title, body: r.body, at: (r.facets || {}).at, source: (r.facets || {}).source };
         if (grouped) line.grp = grp;
-        if (nowRows) { line.grp = nowRows.label.get(r.id) || ""; line.meta = ""; }
         if (head.id === "jobs") {
           // Build's Results: a finished job is a result: ok or failed, what ran, and when (never the raw result body)
           const jf = r.facets || {};
@@ -410,7 +378,7 @@
         return line;
       });
       const fields = fieldsOf(out.search, ROW_FIELDS);
-      out.hays = srcRows.map((r) => hayOfRow(r, fields));
+      out.hays = (panel.rows || []).map((r) => hayOfRow(r, fields));
       out.typed = true;
       out.count = isNum(panel.count) ? panel.count : null;
       if (panel.degraded && panel.degraded.length) {
@@ -527,7 +495,7 @@
   // rather than an inherited function.
   const tableOf = (o) => Object.assign(Object.create(null), o);
   const TABS_OF_ID = tableOf({
-    tray: "morning board", loops: "board build", now: "board", keep: "board", episodes: "board", "team-status": "board",
+    tray: "morning board", loops: "board build", keep: "board", episodes: "board", "team-status": "board",
     edits: "build", jobs: "build", sessions: "morning board", "coord-morning": "morning board", "review-queue": "morning board", topology: "build", health: "memory",
     graph: "memory", wraps: "memory", crystals: "memory"
   });
@@ -2050,7 +2018,9 @@
   // {"v":1,"zones":{"<zone id>":{"order":["<card key>",...]}},"collapsed":["<card key>",...]}; a card's key is its first panel id, and a folded card folds all its panels.
   // Anything that is not that shape is ignored part by part, and a browser that refuses storage draws the kernel order.
   const LAYOUT_KEY = "levain_cockpit_layout_v1";
-  const strings = (a) => (Array.isArray(a) ? a.filter((s) => typeof s === "string" && s) : []);
+  // Panel ids that no longer exist: a layout saved before their removal never reorders or folds a future card that takes the id.
+  const RETIRED_PANEL_IDS = ["now"];
+  const strings = (a) => (Array.isArray(a) ? a.filter((s) => typeof s === "string" && s && RETIRED_PANEL_IDS.indexOf(s) < 0) : []);
   // The page's own copy of the last layout written: when the store refuses a write (Safari private, quota) it is the truth for the page's life.
   let memLayout = null, memStale = false;
   const copyLayout = (l) => { const zones = Object.create(null); for (const z of Object.keys(l.zones)) zones[z] = l.zones[z].slice(); return { zones, collapsed: l.collapsed.slice() }; };
@@ -2063,7 +2033,10 @@
     if (v.zones && typeof v.zones === "object") {
       for (const z of Object.keys(v.zones)) {
         const o = v.zones[z];
-        if (o && typeof o === "object" && Array.isArray(o.order)) out.zones[z] = strings(o.order);
+        if (o && typeof o === "object" && Array.isArray(o.order)) {
+          const kept = strings(o.order);
+          if (kept.length || !o.order.some((s) => RETIRED_PANEL_IDS.indexOf(s) >= 0)) out.zones[z] = kept;   // an order that was only retired ids is no saved order
+        }
       }
     }
     out.collapsed = strings(v.collapsed);
@@ -2182,7 +2155,7 @@
   }
   // The work lists' rows (Tray, Open loops, Keep, Now) carry the repo tag in the meta line, after the id, the date and the age, as the
   // mock draws it; every other row keeps it at the head of its text. `tagHome` is where that tag lives for a row.
-  const META_TAG_PANELS = ["tray", "loops", "keep", "now"];
+  const META_TAG_PANELS = ["tray", "loops", "keep"];
   function tagHome(row, clause) {
     const panel = row.closest("[data-ck-panel]");
     const inMeta = !!panel && META_TAG_PANELS.indexOf(panel.dataset.ckPanel) >= 0 && row.classList.contains("row");

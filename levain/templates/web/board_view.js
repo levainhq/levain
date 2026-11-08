@@ -41,7 +41,8 @@
             return {
               id: String(k.id), title: k.title == null ? "" : String(k.title), repo: k.repo || "",
               tier: k.tier || "", held: k.held_reason || "", number: k.number == null ? null : k.number,
-              band: k.band === true, source: k.source || "", blocks: k.blocks || "",
+              band: k.band === true, later: k.band === true && typeof k.later === "string" && /^\d{4}-\d{2}-\d{2}$/.test(k.later) ? k.later : "",
+              laterLabel: k.band === true && typeof k.later === "string" && /^\d{4}-\d{2}-\d{2}$/.test(k.later) && typeof k.later_label === "string" ? k.later_label.slice(0, 80) : "", source: k.source || "", blocks: k.blocks || "",
               malformed: k.well_formed === false, unknownCategory: k.unknown_category || "",
               done: k.done_line == null ? "" : String(k.done_line),
               dependsOn: Array.isArray(k.depends_on)
@@ -60,7 +61,7 @@
   function termsOf(q) { return fold(q || "").split(/\s+/).filter(Boolean); }
   function hayOf(col, k) {
     return fold([col.category, k.number != null ? k.number : "", k.title, k.repo, k.tier, k.source, k.id, k.held, k.blocks,
-      k.unknownCategory, k.done && "done when: " + k.done, k.dependsOn.length ? "after: " + k.dependsOn.join(", ") : "",
+      k.unknownCategory, k.later && "later", k.later && k.laterLabel, k.later, k.done && "done when: " + k.done, k.dependsOn.length ? "after: " + k.dependsOn.join(", ") : "",
       k.held && "held: " + k.held, k.malformed ? "not well formed" : "", k.journal].filter(function (x) { return x !== "" && x != null; }).join(" "));
   }
   // The model narrowed to the cards a query matches (the columns stay, so a column with no match still says so), with the
@@ -136,6 +137,9 @@
     return bad ? "unknown (could not read)" : "nothing";
   }
 
+  // A snoozed question is one collapsed line: its label (number and day), then the first words of the title.
+  function laterWords(t) { t = String(t == null ? "" : t); return t.length > 60 ? t.slice(0, 57) + "..." : t; }
+
   // The needs-you column's one sentence: said by the grouped tab and the six columns alike, so the two cannot drift.
   function needsYouNote(model) { return "This column is the Needs you band. Answer there (`" + model.hint + "`)."; }
 
@@ -164,8 +168,9 @@
       }
       if (!col.cards.length) wrap.appendChild(el(doc, "p", "bd-empty", emptyText(model, col)));
       col.cards.forEach(function (k) {
-        var row = el(doc, "div", "bd-row");
+        var row = el(doc, "div", "bd-row" + (k.later ? " bd-later" : ""));
         row.dataset.id = k.id;
+        if (k.later) { row.appendChild(el(doc, "div", "bd-title", "LATER: " + (k.laterLabel || k.later) + " " + laterWords(k.title))); drawDrop(doc, row, k, model); wrap.appendChild(row); return; }
         row.appendChild(el(doc, "div", "bd-title", (k.number != null ? k.number + ". " : "") + (String(k.title == null ? "" : k.title).replace(/^\s*DESK OWES:\s*/i, "") || String(k.title == null ? "" : k.title))));
         var meta = [k.repo, k.tier, k.source, k.id].filter(Boolean).join(" · ");
         if (meta) row.appendChild(el(doc, "div", "bd-meta", meta));
@@ -196,8 +201,9 @@
       }
       if (!col.cards.length) c.appendChild(el(doc, "p", "bd-empty", emptyText(model, col)));
       col.cards.forEach(function (k) {
-        var card = el(doc, "article", "bd-card");
+        var card = el(doc, "article", "bd-card" + (k.later ? " bd-later" : ""));
         card.dataset.id = k.id;
+        if (k.later) { card.appendChild(el(doc, "div", "bd-title", "LATER: " + (k.laterLabel || k.later) + " " + laterWords(k.title))); drawDrop(doc, card, k, model); c.appendChild(card); return; }
         card.appendChild(el(doc, "div", "bd-title", (k.number != null ? k.number + ". " : "") + (String(k.title == null ? "" : k.title).replace(/^\s*DESK OWES:\s*/i, "") || String(k.title == null ? "" : k.title))));
         var meta = [k.repo, k.tier, k.source, k.id].filter(Boolean).join(" · ");
         if (meta) card.appendChild(el(doc, "div", "bd-meta", meta));
