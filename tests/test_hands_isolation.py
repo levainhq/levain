@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import json
 import os
+import stat
 import shutil
 import subprocess
 from pathlib import Path
@@ -1057,3 +1058,21 @@ def test_a_linux_repair_does_not_need_setfacl(tmp_path: Path, monkeypatch, capsy
     monkeypatch.setattr(hands.subprocess, "run", lambda argv, **kw: subprocess.CompletedProcess(argv, 0, "", ""))
     assert hands.cmd_setup_isolation(ed, undo=False, dry_run=False) == 0
     assert agent_dirs and "refusing" not in capsys.readouterr().out
+
+
+def test_an_installed_file_is_synced_before_its_rename_and_its_directory_after(tmp_path: Path, monkeypatch) -> None:
+    """PREL3 1a-11/1a-12/1b-23: the operator record and undo's retired ids go through ``_install_file``, so it must be
+    durable at power loss. Not reproducible as a power cut: a spy records each sync, and what was on disk at it."""
+    target = tmp_path / "policy" / "operator"
+    seen: list[tuple[str, bool]] = []
+
+    def spy(fd: int) -> None:
+        kind = "dir" if stat.S_ISDIR(os.fstat(fd).st_mode) else "file"
+        seen.append((kind, target.exists()))
+
+    monkeypatch.setattr(hands, "_durable_sync", spy)
+    monkeypatch.setattr(hands.os, "chown", lambda *a, **kw: None)     # root's chown: this test is not root
+    ok, why = hands._install_file(target, "content\n", 0o644, validate=())
+    assert ok, why
+    assert target.read_text() == "content\n"
+    assert seen == [("file", False), ("dir", True)], seen

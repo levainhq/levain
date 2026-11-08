@@ -60,6 +60,7 @@ import re
 import shutil
 import stat
 import subprocess
+import sys
 import tempfile
 import time
 from dataclasses import dataclass, field
@@ -1493,12 +1494,24 @@ def run_plan(plan: Plan, *, dry_run: bool, emit: Callable[[str], None] = print) 
     return 0
 
 
+def _durable_sync(fd: int) -> None:
+    """Force ``fd``'s data to the drive: on macOS ``fsync`` stops at the drive's cache and ``F_FULLFSYNC`` does not."""
+    if sys.platform == "darwin":
+        import fcntl
+
+        fcntl.fcntl(fd, fcntl.F_FULLFSYNC)
+    else:
+        os.fsync(fd)
+
+
 def _install_file(path: Path, content: str, mode: int, *, validate: tuple[str, ...],
                   check: Callable[[], tuple[bool, str]] | None = None) -> tuple[bool, str]:
     """Write ``content`` to a temp file beside ``path``, validate it, then move it into place with
     ``mode``, owned by root. ``check`` runs after the move (for a config whose validator reads the
     installed tree, like ``sshd -t``); if it fails the file is removed again. A drop-in that fails
-    validation is never left installed: a broken sudoers.d file breaks sudo for the whole machine."""
+    validation is never left installed: a broken sudoers.d file breaks sudo for the whole machine.
+    Durable once it returns: the temp file is synced before the rename and the directory after it, so a
+    power cut leaves the old file or the whole new one (records such as the operator's go through here)."""
     path.parent.mkdir(parents=True, exist_ok=True)
     # Same directory, so the final rename is atomic and never crosses filesystems; the ".tmp" suffix
     # makes sudo ignore the file while it is being validated (sudoers.d skips names with a ".").
@@ -1512,10 +1525,24 @@ def _install_file(path: Path, content: str, mode: int, *, validate: tuple[str, .
             if r.returncode != 0:
                 return False, (r.stderr or r.stdout).strip()
         os.chown(tmp, 0, 0)
+        # Synced after its mode and owner are set, so the new file arrives whole with both.
+        sfd = os.open(tmp, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC)
+        try:
+            _durable_sync(sfd)
+        finally:
+            os.close(sfd)
         os.replace(tmp, path)
     finally:
         if os.path.exists(tmp):
             os.unlink(tmp)
+    try:
+        dfd = os.open(path.parent, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC)
+        try:
+            _durable_sync(dfd)
+        finally:
+            os.close(dfd)
+    except OSError as e:
+        return False, f"{path}: moved into place, but its directory could not be synced: {e.strerror or e}"
     if check is not None:
         ok, why = check()
         if not ok:
