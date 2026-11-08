@@ -53,7 +53,7 @@ def test_reimport_of_an_unchanged_file_writes_nothing_and_a_changed_row_one_corr
 
 def test_a_prose_hold_lands_in_hold_and_holds_the_item_back(board, tmp_path):
     store, token = board
-    path = _file(tmp_path, [_row(3, "Held thing", lead=" HELD until Phill rules on the plan. Other prose np-0123abcd."),
+    path = _file(tmp_path, [_row(3, "Waiting thing", lead=" HELD until Phill rules on the plan. Other prose np-0123abcd."),
                             _row(4, "Free thing", lead=" a plain lead.")])
     status_import.import_status(store, token, path)
     assert ready.item_facts(store, "levain:row-3")["hold"] == "HELD until Phill rules on the plan."
@@ -63,7 +63,7 @@ def test_a_prose_hold_lands_in_hold_and_holds_the_item_back(board, tmp_path):
     assert by_id["levain:row-3"]["held_reason"] == "HELD until Phill rules on the plan."
     assert by_id["levain:row-3"]["status_category"] == "backlog" and by_id["levain:row-4"]["independent"]
     # the hold leaves the text -> a correction clears it
-    status_import.import_status(store, token, _file(tmp_path, [_row(3, "Held thing", lead=" a plain lead."),
+    status_import.import_status(store, token, _file(tmp_path, [_row(3, "Waiting thing", lead=" a plain lead."),
                                                                   _row(4, "Free thing", lead=" a plain lead.")]))
     assert ready.item_facts(store, "levain:row-3")["hold"] is None
 
