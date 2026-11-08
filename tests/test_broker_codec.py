@@ -916,3 +916,36 @@ def test_codec_responses_call_names_read_the_requests_tools():
     r.feed(ev)
     assert r.result() == want
     assert _read("openai-responses", json.dumps(body).encode(), False).uses == (("file_search", 1), ("web_search", 1))
+
+
+# --- prel3 L3 3ca (1108-34-handoff/l3_prel3_3ca.txt): each test is its finding's own failure ------------------------
+
+
+@pytest.mark.parametrize("cname,body", [
+    # 3ca-2 (codex HIGH): OpenRouter runs `openrouter:*` server tools upstream and feeds their results back
+    ("openai-chat", '{"model":"m1","messages":[],"tools":[{"type":"openrouter:web_search"}]}'),
+    ("openai-responses", '{"model":"m1","input":"x","tools":[{"type":"openrouter:web_fetch"}]}'),
+    ("anthropic-messages", '{"model":"m1","max_tokens":10,"messages":[],"tools":[{"type":"openrouter:web_search"}]}'),
+])
+def test_3ca2_an_openrouter_server_tool_is_unbounded(cname, body):
+    tool = json.loads(body)["tools"][0]["type"]
+    assert _go(cname, body, EA if cname.startswith("anthropic") else EO, dispatch=True) == f"body-unbounded:{tool}"
+    got = _go(cname, body, EA if cname.startswith("anthropic") else EO)
+    assert got[1] == (tool,)
+
+
+@pytest.mark.parametrize("cname,body", [
+    # 3ca-2: `max_tool_calls` sets how many server-side tool calls a request may make
+    ("openai-chat", '{"model":"m1","messages":[],"max_tool_calls":30}'),
+    ("openai-responses", '{"model":"m1","input":"x","max_tool_calls":30}'),
+])
+def test_3ca2_max_tool_calls_is_unbounded(cname, body):
+    assert _go(cname, body, EO, dispatch=True) == "body-unbounded:max_tool_calls"
+
+
+def test_3ca2_max_tool_calls_null_is_disabled():
+    for cname, body in (("openai-chat", '{"model":"m1","messages":[],"max_tool_calls":null}'),
+                        ("openai-responses", '{"model":"m1","input":"x","max_tool_calls":null}')):
+        got = _go(cname, body, EO, dispatch=True)
+        assert not isinstance(got, str) and got[1] == ()
+

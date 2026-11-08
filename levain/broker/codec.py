@@ -42,12 +42,14 @@ def _tool_name(t: Any) -> Optional[str]:
 #:   `web_search_options` (OpenAI Chat): presence enables search, `{}` included; nothing but absence disables it.
 #:   `plugins` (OpenRouter) and `mcp_servers` (Anthropic): a list of things to enable; `[]` enables none.
 #:   `previous_response_id` and `conversation` (OpenAI Responses): `string or null`; `null` is no prior state.
+#:   `max_tool_calls` (OpenAI, OpenRouter): how many server-side tool calls the provider may run; `null` is unset.
 _DISABLED_BY = {
     "web_search_options": (),
     "plugins": ("[]",),
     "mcp_servers": ("[]",),
     "previous_response_id": ("null",),
     "conversation": ("null",),
+    "max_tool_calls": ("null",),
 }
 
 
@@ -144,6 +146,9 @@ class Codec:
     unbounded_fields: Tuple[str, ...] = ()
     #: tool types (version suffix removed) that run on the provider and feed results back.
     server_tools: Tuple[str, ...] = ()
+    #: tool-type namespaces whose every member runs on the provider: OpenRouter's server tools (`openrouter:*`),
+    #: which any codec's body can declare on an OpenRouter route.
+    server_tool_prefixes: Tuple[str, ...] = ("openrouter:",)
     #: the output-ceiling fields, in the order `write_ceiling` writes the first.
     ceiling_fields: Tuple[str, ...] = ()
     #: whether a request may lack a ceiling (written in at `default_output`); Anthropic requires `max_tokens`.
@@ -198,7 +203,7 @@ class Codec:
             if _field_unbounded(obj, f):
                 found.append(f)
         for tool in self._tools(obj):
-            if tool in self.server_tools and tool not in found:
+            if (tool in self.server_tools or tool.startswith(self.server_tool_prefixes)) and tool not in found:
                 found.append(tool)
         for t in self._block_types(obj):
             if t in self.unbounded_blocks and t not in found:
@@ -758,8 +763,9 @@ class OpenAIChat(_OpenAI):
     # `ChatCompletionToolMessageParam`), so a tool output holds no image position.
     image_paths = ((("messages", EACH, "content", EACH), ("image_url",)),)
     unbounded_blocks = ("file", "input_audio")
-    # `web_search_options` (search models) and OpenRouter's `plugins` add content the estimate cannot see.
-    unbounded_fields = ("web_search_options", "plugins")
+    # `web_search_options` (search models), OpenRouter's `plugins`, and `max_tool_calls` (server-side tool calls)
+    # add content the estimate cannot see.
+    unbounded_fields = ("web_search_options", "plugins", "max_tool_calls")
     server_tools = ()
     ceiling_fields = ("max_completion_tokens", "max_tokens")
 
@@ -822,8 +828,9 @@ class OpenAIResponses(_OpenAI):
         (("prompt", "variables", VALUES), ("input_image",)),
     )
     unbounded_blocks = ("input_file",)
-    # server-held state the estimate cannot see, and OpenRouter's `plugins`.
-    unbounded_fields = ("previous_response_id", "conversation", "plugins")
+    # server-held state the estimate cannot see, OpenRouter's `plugins`, and `max_tool_calls` (server-side tool
+    # calls).
+    unbounded_fields = ("previous_response_id", "conversation", "plugins", "max_tool_calls")
     server_tools = ("web_search", "web_search_preview", "file_search", "code_interpreter", "computer_use_preview",
                     "mcp", "image_generation")
     ceiling_fields = ("max_output_tokens",)
