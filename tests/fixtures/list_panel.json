@@ -29,6 +29,7 @@
  "facets": [
   "age_days",
   "attention",
+  "band_age",
   "band_carried",
   "band_later_words",
   "band_number",

@@ -56,7 +56,7 @@ BAND_POINTER = "answer it in Decisions (levain band)"
 BOARD_POINTER = "the agents' ready queue (levain board)"
 LIST_FACETS = SPORE_FACETS | frozenset({
     "surface", "fires", "overdue", "target", "attention", "list_pointer", "band_number", "board_rank", "board_tier",
-    "source", "repo", "held_until", "band_section", "band_carried", "band_later_words",
+    "source", "repo", "held_until", "band_section", "band_carried", "band_age", "band_later_words",
 })
 SURFACES = ("band", "board", "spore", "talk", "drop")
 
@@ -165,7 +165,25 @@ def _stored(rid: str, text: str, kind: str, domain: str, nxt: str | None, pointe
             "tier": tier}
 
 
-def _board_part(store_dir: Any, question_store: Any, today: date) -> _Part:
+def _age_text(instant: Any, now: datetime) -> str | None:
+    """How long since ``instant`` as the terminal footer writes it: minutes under an hour, hours under a day, else days and hours.
+    None when the instant is unusable or still ahead."""
+    if not isinstance(instant, str) or not instant or len(instant) > 40:
+        return None
+    try:
+        t = datetime.fromisoformat(instant[:-1] + "+00:00" if instant.endswith("Z") else instant)
+    except ValueError:
+        return None
+    if t.tzinfo is None:
+        t = t.astimezone()
+    secs = (now - t).total_seconds()
+    if secs < 0:
+        return None
+    h = int(secs // 3600)
+    return f"{h // 24}d{h % 24}h" if h >= 24 else f"{h}h" if h else f"{int(secs // 60)}m"
+
+
+def _board_part(store_dir: Any, question_store: Any, today: date, now: datetime) -> _Part:
     """The band's open items and the coordinator's ready column, as read-only rows. ``board.build`` never raises; what it could
     not read is named."""
     out = _Part()
@@ -189,6 +207,11 @@ def _board_part(store_dir: Any, question_store: Any, today: date) -> _Part:
         filed = opened_day(card.get("filed_at"))
         if filed and filed <= today:
             facets["age_days"] = (today - filed).days
+        # the age a band row shows is the clock flow's footer reads (the row's refile instant when the host sends one, else its
+        # add instant), in the footer's own form, never a whole-day count
+        age = _age_text(card.get("since") or card.get("filed_at"), now)
+        if age:
+            facets["band_age"] = age
         later = card.get("later")
         if isinstance(later, str) and parse_date(later):
             facets["held_until"] = later[:10]
@@ -226,7 +249,7 @@ def list_reader(source: SubstrateSource, ck: Cockpit) -> Callable[[ReadContext],
 
     def read(ctx: ReadContext) -> Result:
         sp = _spore_part(source, ctx, seen)
-        bd = _board_part(_dispatch_dir(ck.consent_reader), ck.question_store, ctx.today)
+        bd = _board_part(_dispatch_dir(ck.consent_reader), ck.question_store, ctx.today, ctx.now)
         rows = [*bd.rows, *sp.rows]
         skipped = [*sp.skipped, *bd.skipped]
         if sp.fault:

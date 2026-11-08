@@ -86,6 +86,9 @@ def _band_cards(question_store: Any) -> tuple[list[dict[str, Any]], str | None]:
                 carried = getattr(q, "carried", None)
                 if isinstance(carried, bool):      # a real bool only, and only beside a section it qualifies
                     card["carried"] = carried
+            since = getattr(q, "section_since", "")
+            if isinstance(since, str) and since:      # the host's own age clock for this row, when it sends one
+                card["since"] = since
         cards.append(card)
     return cards, None
 

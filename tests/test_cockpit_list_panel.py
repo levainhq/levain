@@ -414,3 +414,23 @@ def test_listpanel_r1_the_text_cockpit_draws_desk_owes_and_later_as_the_footer_d
     _band_with(monkeypatch, rig, **fields)
     out = lines()
     assert heading in out and "Ship the sweep fix tonight?" in out, out         # the row is not silently dropped
+
+
+# --- 531 round 6 (levain 75, key 1108-41): the age is the clock flow's footer reads --------------------------------------
+
+
+def _iso(delta_hours: float) -> str:
+    return (NOW + timedelta(hours=delta_hours)).astimezone().isoformat()
+
+
+def test_listpanel_r6_a_band_rows_age_reads_the_refile_clock_in_the_footers_form(rig: Rig, monkeypatch: pytest.MonkeyPatch) -> None:
+    """A row added 2 h ago and refiled 30 h ago is carried; its age is the footer's `1d6h` (the refile clock), not a whole-day
+    count from the add time."""
+    _band_with(monkeypatch, rig, section="desk", carried=True, filed_at=_iso(-2), section_since=_iso(-30))
+    row = {r["id"]: r for r in rig.panel()["rows"]}[f"band:{rig.q.id}"]
+    assert row["facets"]["band_age"] == "1d6h", row["facets"]
+    # no refile clock sent: the add time is the clock, in the same form
+    _band_with(monkeypatch, rig, section="you", filed_at=_iso(-3), section_since="")
+    assert {r["id"]: r for r in rig.panel()["rows"]}[f"band:{rig.q.id}"]["facets"]["band_age"] == "3h"
+    _band_with(monkeypatch, rig, section="you", filed_at=_iso(-0.5), section_since="")
+    assert {r["id"]: r for r in rig.panel()["rows"]}[f"band:{rig.q.id}"]["facets"]["band_age"] == "30m"

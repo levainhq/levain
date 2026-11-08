@@ -194,6 +194,7 @@
       later_words: typeof f.band_later_words === "string" && f.band_later_words ? f.band_later_words : null,
       band_section: f.band_section === "desk" || f.band_section === "you" ? f.band_section : null,
       carried: f.band_carried === true,
+      band_age: typeof f.band_age === "string" && f.band_age ? f.band_age : null,
       repo: typeof f.repo === "string" && f.repo ? f.repo : null, board_tier: typeof f.board_tier === "string" && f.board_tier ? f.board_tier : null,
     }, t, hidden && hidden.has(row.id) ? { text_locked: HIDDEN_TEXT } : {});
   }

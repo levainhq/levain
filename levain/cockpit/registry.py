@@ -181,6 +181,7 @@ FACETS: dict[str, tuple[str, Callable[[Any], bool]]] = {
     # a band row's host section ("you" / "desk": the desk owes the latter), whether it is carried, and its LATER day's words
     "band_section": ("enum", _enum("you", "desk")),
     "band_carried": ("bool", _is_bool),
+    "band_age": ("str", _is_str),                # a band row's age in the footer's form ("1d6h"), from the host's refile clock
     "band_later_words": ("Mon..Sun, optionally followed by MM-DD", _is_later_words),
     "board_rank": ("int|null", _opt(_is_int)),
     "board_tier": ("str|null", _opt(_is_str)),
