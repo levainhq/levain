@@ -178,6 +178,10 @@ FACETS: dict[str, tuple[str, Callable[[Any], bool]]] = {
     "attention": ("str|null", _opt(_is_str)),    # `talk` on a talk seed; an agenda's ping word
     "list_pointer": ("str", _is_str),            # where a read-only band/board row is acted on
     "band_number": ("int|null", _opt(_is_int)),  # a band row's allocated number
+    # a band row's host section ("you" / "desk": the desk owes the latter), whether it is carried, and its LATER day's words
+    "band_section": ("enum", _enum("you", "desk")),
+    "band_carried": ("bool", _is_bool),
+    "band_later_words": ("Mon..Sun, optionally followed by MM-DD", _is_later_words),
     "board_rank": ("int|null", _opt(_is_int)),
     "board_tier": ("str|null", _opt(_is_str)),
 }
@@ -422,7 +426,12 @@ register_ordering(
 
 def _list_group(row: RowIn, today: date) -> str:
     s = row.facets.get("surface")
-    if s in ("band", "board", "talk"):
+    if s == "band":
+        # a row that comes back on a later day is not due, whoever owes it; then the desk's own rows; the rest is needs-you
+        if row.facets.get("held_until"):
+            return "later"
+        return "desk" if row.facets.get("band_section") == "desk" else "band"
+    if s in ("board", "talk"):
         return s
     if row.facets.get("overdue") is True:
         return "overdue"
@@ -453,9 +462,10 @@ def _list_key(row: RowIn, today: date) -> tuple:
 register_ordering(
     Ordering(
         "spore.list", _list_key, _list_group,
-        (("band", "Needs you (answer it in Decisions)"), ("overdue", "Overdue"), ("today", "Today"),
+        (("band", "Needs you (answer it in Decisions)"), ("desk", "Desk owes (the desk is on these; nothing for you)"),
+         ("later", "Later"), ("overdue", "Overdue"), ("today", "Today"),
          ("board", "Ready for agents"), ("talk", "To talk through"), ("also", "Also pending")),
-        frozenset({"today", "overdue"}),
+        frozenset({"today", "overdue"}), frozenset({"desk", "later"}),
     ),
     builtin=True,
 )

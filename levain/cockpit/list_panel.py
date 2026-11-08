@@ -56,7 +56,7 @@ BAND_POINTER = "answer it in Decisions (levain band)"
 BOARD_POINTER = "the agents' ready queue (levain board)"
 LIST_FACETS = SPORE_FACETS | frozenset({
     "surface", "fires", "overdue", "target", "attention", "list_pointer", "band_number", "board_rank", "board_tier",
-    "source", "repo", "held_until",
+    "source", "repo", "held_until", "band_section", "band_carried", "band_later_words",
 })
 SURFACES = ("band", "board", "spore", "talk", "drop")
 
@@ -192,6 +192,13 @@ def _board_part(store_dir: Any, question_store: Any, today: date) -> _Part:
         later = card.get("later")
         if isinstance(later, str) and parse_date(later):
             facets["held_until"] = later[:10]
+        if card.get("section") in ("you", "desk"):
+            facets["band_section"] = card["section"]
+        if isinstance(card.get("carried"), bool):
+            facets["band_carried"] = card["carried"]
+        words = card.get("later_words")
+        if "held_until" in facets and isinstance(words, str) and words:
+            facets["band_later_words"] = words
         if card.get("unreadable"):
             out.skipped.append((1, "a band item that could not be read"))
         blocks = card.get("blocks")

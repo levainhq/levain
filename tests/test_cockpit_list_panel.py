@@ -121,7 +121,7 @@ def test_the_three_stores_are_one_panel_titled_list_and_each_row_names_its_surfa
     assert sorted(by_surface["talk"]) == sorted(f"spore:{rig.ids[k]}" for k in ("talk_old", "talk_new"))
     assert sorted(by_surface["drop"]) == sorted(f"spore:{rig.ids[k]}" for k in ("drop_late", "drop_soon"))
     assert f"spore:{rig.ids['loop']}" not in {r["id"] for r in p["rows"]}            # Open loops stays machine-side
-    assert [g["id"] for g in p["groups"]] == ["band", "overdue", "today", "board", "talk", "also"]
+    assert [g["id"] for g in p["groups"]] == ["band", "desk", "later", "overdue", "today", "board", "talk", "also"]
     assert p["note"] == list_panel.LIST_NOTE
 
 
@@ -321,3 +321,63 @@ def test_the_frozen_fixture_is_what_the_live_panel_produces(rig: Rig) -> None:
         FIXTURE.write_text(json.dumps(live, indent=1, sort_keys=True, ensure_ascii=False) + "\n", encoding="utf-8")
     frozen = json.loads(FIXTURE.read_text(encoding="utf-8"))
     assert live == frozen
+
+
+# --- 531 round 4 (levain 73, key 1108-37): the host's section and a LATER day reach the List, and sort its band rows ---------
+
+
+def _band_with(monkeypatch: pytest.MonkeyPatch, rig: Rig, **fields: Any) -> None:
+    """The band as a host store reads it: the one question carries the host's own section / carried / snoozed_until / dated."""
+    from dataclasses import replace
+
+    real = band_view._read
+
+    def read(store: Any) -> Any:
+        items, numbers, closed = real(store)
+        return [(ref, replace(q, **fields) if q is not None else q) for ref, q in items], numbers, closed
+
+    monkeypatch.setattr(band_view, "_read", read)
+
+
+def test_r1_a_desk_section_row_carries_its_section_and_sorts_under_desk_owes(rig: Rig, monkeypatch: pytest.MonkeyPatch) -> None:
+    _band_with(monkeypatch, rig, section="desk", carried=True)
+    row = rig.rows()[f"band:{rig.q.id}"]
+    assert row["facets"]["band_section"] == "desk" and row["facets"]["band_carried"] is True, row["facets"]
+    assert row["group"] == "desk", row["group"]
+    assert "desk" in {g["id"] for g in rig.panel()["groups"]}
+
+
+def test_r1_a_you_section_row_is_needs_you_and_a_store_with_no_section_draws_no_facet(rig: Rig, monkeypatch: pytest.MonkeyPatch) -> None:
+    plain = rig.rows()[f"band:{rig.q.id}"]
+    assert "band_section" not in plain["facets"] and "band_carried" not in plain["facets"] and plain["group"] == "band", plain
+    _band_with(monkeypatch, rig, section="you")
+    row = rig.rows()[f"band:{rig.q.id}"]
+    assert row["facets"]["band_section"] == "you" and row["group"] == "band", row
+
+
+def test_r1_a_section_that_is_not_you_or_desk_and_a_carried_that_is_not_a_bool_are_dropped(rig: Rig, monkeypatch: pytest.MonkeyPatch) -> None:
+    _band_with(monkeypatch, rig, section="elsewhere", carried="false")
+    f = rig.rows()[f"band:{rig.q.id}"]["facets"]
+    assert "band_section" not in f and "band_carried" not in f, f
+    _band_with(monkeypatch, rig, section="desk", carried="false")
+    f = rig.rows()[f"band:{rig.q.id}"]["facets"]
+    assert f["band_section"] == "desk" and "band_carried" not in f, f
+
+
+def test_r2_a_snoozed_or_dated_row_sorts_under_later_with_its_day_words_and_is_not_counted(rig: Rig, monkeypatch: pytest.MonkeyPatch) -> None:
+    before = rig.panel()["count"]
+    day = (TODAY + timedelta(days=3)).isoformat()
+    _band_with(monkeypatch, rig, snoozed_until=day)
+    p = rig.panel()
+    row = {r["id"]: r for r in p["rows"]}[f"band:{rig.q.id}"]
+    assert row["facets"]["held_until"] == day and row["group"] == "later", row
+    assert row["facets"]["band_later_words"], row["facets"]
+    assert p["count"] == before - 1, (before, p["count"])       # a LATER row is not due: the header does not count it
+    _band_with(monkeypatch, rig, dated=day, section="desk")     # a dated desk row is LATER too, not desk owes
+    assert {r["id"]: r for r in rig.panel()["rows"]}[f"band:{rig.q.id}"]["group"] == "later"
+
+
+def test_r2_a_desk_owes_row_is_not_counted_either(rig: Rig, monkeypatch: pytest.MonkeyPatch) -> None:
+    before = rig.panel()["count"]
+    _band_with(monkeypatch, rig, section="desk")
+    assert rig.panel()["count"] == before - 1
