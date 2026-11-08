@@ -1,7 +1,8 @@
 """``levain spores germinate``: an agenda spore that has come due is put in front of the operator (TS-2).
 
-Deterministic, no model call. For each DUE agenda (open, disposition ``agenda``, no ``germinated`` stamp, ``next``
-parses and is on or before the install's local day; an agenda with no ``next`` is never due) it does, in order:
+Deterministic, no model call. For each DUE agenda (open, disposition ``agenda``, no ``germinated`` stamp, and ``next``
+due: a date-only ``next`` is due on or before the install's local day; a TIMED ``next`` (``YYYY-MM-DDTHH:MM``, local)
+is due from that minute; an agenda with no ``next`` is never due) it does, in order:
 
 1. adopt an open question whose ``q-…`` id the spore's text or notes name (file nothing; ref = that id);
 2. ``band``: file ONE band row through ``QuestionStore.file_once``, no ping;
@@ -10,9 +11,10 @@ parses and is on or before the install's local day; an agenda with no ``next`` i
    (``ping_failed`` in the result, non-zero exit); only a ping that went out is followed by the stamp. A crash between
    the ping and the stamp therefore pings again on the re-run (at-least-once: a lost nudge is the failure this exists
    to prevent), still into the ONE row;
-4. ``board:<repo>``: a coordinator drop (``outbox_id`` derived from the spore, words always checked against
+4. ``board:<repo>`` / ``desk``: a coordinator drop (``outbox_id`` derived from the spore, words always checked against
    the spore as it is now), or, with no coordinator store that can take a drop (``coordinator_present``), the band
-   filing with the reason in ``blocks``;
+   filing with the reason in ``blocks``. ``desk`` files the spore's words verbatim and uncut (a spore too long for a
+   drop is an error for that spore, never a truncation);
 5. stamp ``germinated={on, target, ref}`` and then compost the spore, each as a compare-and-set against the spore as
    it was read (its version and ``agenda`` disposition), so a spore edited while this ran is left open, reported under
    ``skipped``, and filed again from its new words on the next run.
@@ -20,7 +22,7 @@ parses and is on or before the install's local day; an agenda with no ``next`` i
 One bad spore never stops the others: its error is recorded under ``errors`` and the run goes on; the CLI prints every
 outcome that did complete and exits non-zero when any spore errored. A missing ``.levain/memory.spores.json`` is
 refused with a reason (exit 2), never reported as "nothing due". A run holds a per-install lock (``--dry-run`` does
-not), so two overlapping runs (cron plus a hand run) take turns.
+not), so two overlapping runs (cron plus a hand run, the 06:10 run plus a minute ``--timed`` run) take turns.
 
 The dedupe key is the spore's immutable ``origin_key``, never its id: the question store is per USER while ``spore-NNN``
 ids are per INSTALL, so an id key would let install B's due ``spore-004`` adopt install A's held row and compost with no
@@ -31,7 +33,7 @@ Known edges (closed under the reachability line, TS-2 L3): ``board:<repo>`` does
 drop's ``Source`` takes only an absolute repo path, a ``refs/heads/`` ref and a full commit id, none of which a repo
 NAME determines, and the words stay his verbatim; the repo is recorded in the spore's ``germinated`` stamp (target)
 only. A drop has no field for the spore's ``created`` or ``next`` either (``sent_at`` is the sender's clock stamp, not an
-authorship date, and a bare date is not a moment), so neither is carried. A board spore edited AFTER its drop was
+authorship date, and a bare date is not a moment), so neither is carried. A board/desk spore edited AFTER its drop was
 filed raises ``DropConflict`` on every run (his new words are never silently dropped, and the old drop is never
 re-labelled), until he resolves it by hand. A band row already filed keeps its first ``what`` text if the spore is
 edited before the stamp. A nudge whose ping can never succeed (no channel) stays open and errors each run; the band row
@@ -53,11 +55,13 @@ from datetime import date, datetime
 from pathlib import Path
 from typing import Any, Callable, Iterator
 
+from levain.spores import _parse_when, is_timed
+
 __all__ = ["GerminateRefused", "KEY_PREFIX", "Outcome", "add_parsers", "germinate", "is_due", "outbox_id_for",
            "run_germinate"]
 
 KEY_PREFIX = "levain-germinate:"
-TARGET_BAND, TARGET_NUDGE, TARGET_BOARD = "band", "nudge", "board"
+TARGET_BAND, TARGET_NUDGE, TARGET_BOARD, TARGET_DESK = "band", "nudge", "board", "desk"
 _QID = re.compile(r"\bq-[0-9a-f]{24}\b")
 _TITLE_MAX = 160
 
@@ -70,8 +74,8 @@ class GerminateRefused(RuntimeError):
 class Outcome:
     spore_id: str
     origin_key: str
-    target: str          # band | nudge | board:<repo> as the spore asked
-    via: str             # what actually happened: adopted | band | nudge | board | band-fallback | finished
+    target: str          # band | nudge | desk | board:<repo> as the spore asked
+    via: str             # what actually happened: adopted | band | nudge | board | desk | band-fallback | finished
     ref: str             # the q-… id or the drop id
     filed: bool          # this run created the row or drop
     pinged: bool
@@ -103,21 +107,29 @@ def _is_agenda(item: dict[str, Any]) -> bool:
     return isinstance(d, str) and d.strip().casefold() == "agenda"
 
 
-def is_due(item: dict[str, Any], today: date) -> bool:
-    """SD-4: agenda, open (the caller lists open spores), no ``germinated``, ``next`` parses and is not after today."""
+def is_due(item: dict[str, Any], today: date, now: datetime | None = None) -> bool:
+    """SD-4: agenda, open (the caller lists open spores), no ``germinated``, and ``next`` due: a TIMED ``next`` from that
+    minute (a malformed timed value is never due and never read as a date), a date-only ``next`` on or before today."""
     if not _is_agenda(item) or item.get("germinated"):
         return False
-    nxt = _day(item.get("next"))
+    raw = item.get("next")
+    if is_timed(raw):
+        when = _parse_when(raw)
+        return when is not None and (now or datetime.now()) >= when
+    nxt = _day(raw)
     return nxt is not None and nxt <= today
 
 
 def _target_of(item: dict[str, Any]) -> tuple[str, str | None]:
-    """``(target, repo)``: ``band`` (default and the fallback for an unknown value), ``nudge``, ``board:<repo>``. The keyword is matched without regard to case; the repo keeps its own."""
+    """``(target, repo)``: ``band`` (default and the fallback for an unknown value), ``nudge``, ``desk``,
+    ``board:<repo>``. The keyword is matched without regard to case; the repo keeps its own."""
     raw = item.get("target")
     t = raw.strip() if isinstance(raw, str) else ""
     low = t.casefold()
     if low == TARGET_NUDGE:
         return TARGET_NUDGE, None
+    if low == TARGET_DESK:
+        return TARGET_DESK, None
     if low.startswith(TARGET_BOARD + ":") and t[len(TARGET_BOARD) + 1:].strip():
         repo = t[len(TARGET_BOARD) + 1:].strip()
         return f"{TARGET_BOARD}:{repo}", repo
@@ -165,23 +177,23 @@ def _run_lock(spores_json: Path, dry_run: bool) -> Iterator[None]:
 
 
 def germinate(spores_json: Path | str, queue_dir: Path | str, *, install: Path | str, agent: str = "claude_code",
-              today: date | None = None, dry_run: bool = False,
+              today: date | None = None, now: datetime | None = None, dry_run: bool = False, timed_only: bool = False,
               ping: Callable[..., bool] | None = None) -> dict[str, Any]:
-    """Germinate every due agenda in ``spores_json`` .
+    """Germinate every due agenda in ``spores_json`` (``timed_only``: only those whose ``next`` carries a time).
     Returns ``{"today", "due": [...], "finish": [...], "errors": [...], "skipped": [...]}``; ``due`` and ``finish``
     hold :class:`Outcome` dicts. ``dry_run`` writes nothing (it files nothing, pings nothing, and creates no store).
-    ``ping`` is the notify seam (default
+    ``now`` is the local naive clock for a timed ``next`` (default: the host's). ``ping`` is the notify seam (default
     :func:`levain.consent.band._send_ping`, read at call time). Raises :class:`GerminateRefused` with no spores file."""
     spores_json = Path(spores_json)
     if not spores_json.is_file():
         raise GerminateRefused(f"{spores_json} does not exist: this is not a Levain install with a spore store "
                                "(check --path); nothing was read or written")
     with _run_lock(spores_json, dry_run):
-        return _germinate(spores_json, Path(queue_dir), Path(install), agent, today, dry_run, ping)
+        return _germinate(spores_json, Path(queue_dir), Path(install), agent, today, now, dry_run, timed_only, ping)
 
 
-def _germinate(spores_json: Path, qdir: Path, install: Path, agent: str, today: date | None,
-               dry_run: bool, ping: Callable[..., bool] | None) -> dict[str, Any]:
+def _germinate(spores_json: Path, qdir: Path, install: Path, agent: str, today: date | None, now: datetime | None,
+               dry_run: bool, timed_only: bool, ping: Callable[..., bool] | None) -> dict[str, Any]:
     from anneal_memory.spores import SporeError, spore_version
 
     from levain.consent import band
@@ -189,11 +201,12 @@ def _germinate(spores_json: Path, qdir: Path, install: Path, agent: str, today: 
     from levain.coordinator.store import WORDS_MAX, CoordStore
     from levain.spores import guarded_spore_store
 
-    today = today or datetime.now().astimezone().date()
+    now = now or datetime.now()
+    today = today or now.date()
     result: dict[str, Any] = {"today": today.isoformat(), "due": [], "finish": [], "errors": [], "skipped": []}
     store = guarded_spore_store(spores_json)
     open_items = store.list_open(today=today)
-    due = [s for s in open_items if is_due(s, today)]
+    due = [s for s in open_items if is_due(s, today, now) and (not timed_only or is_timed(s.get("next")))]
     finish = [s for s in open_items if _is_agenda(s) and s.get("germinated")]
     # a dry run on a machine with no band yet must not create one
     questions = None if dry_run and not (qdir / DB_NAME).exists() else QuestionStore(qdir)
@@ -231,11 +244,11 @@ def _germinate(spores_json: Path, qdir: Path, install: Path, agent: str, today: 
             adopted = _adopt(item, open_ids)
             filed = pinged = False
             ping_failed = ""
-            drop_target = target.startswith(TARGET_BOARD + ":")
+            drop_target = target == TARGET_DESK or target.startswith(TARGET_BOARD + ":")
             if adopted is not None:
                 via, ref = "adopted", adopted
             elif drop_target and has_board:
-                via = "board"
+                via = TARGET_DESK if target == TARGET_DESK else "board"
                 outbox = outbox_id_for(okey)
                 if dry_run:
                     ref = ""
@@ -243,7 +256,7 @@ def _germinate(spores_json: Path, qdir: Path, install: Path, agent: str, today: 
                     # always sent with the spore's CURRENT words: a stored drop under this id holding other words raises
                     # DropConflict (his new words are never lost to an old drop's ref)
                     text = item.get("text") or ""
-                    words = text.strip()[:WORDS_MAX]
+                    words = text if target == TARGET_DESK else text.strip()[:WORDS_MAX]
                     drop, filed = coord.accept_drop(words, surface="cli", outbox_id=outbox)
                     ref = drop.drop_id
             else:
@@ -254,6 +267,8 @@ def _germinate(spores_json: Path, qdir: Path, install: Path, agent: str, today: 
                               f"{nxt.isoformat() if nxt else today.isoformat()}; it waits on you")
                     if repo:
                         blocks += f" (board {repo}: no board here, so it is on the band)"
+                    elif target == TARGET_DESK:
+                        blocks += " (desk: no coordinator here, so it is on the band)"
                     q, filed = questions.file_once(
                         agent=agent, key=KEY_PREFIX + okey,
                         what=f"Due {(nxt or today).strftime('%m-%d')}: {title} ({sid})",
@@ -306,7 +321,8 @@ def run_germinate(args: argparse.Namespace, out: Any = None) -> int:
     out = out if out is not None else sys.stdout
     try:
         install, spores, qdir = _paths(args)
-        res = germinate(spores, qdir, install=install, agent=args.agent, dry_run=args.dry_run)
+        res = germinate(spores, qdir, install=install, agent=args.agent, dry_run=args.dry_run,
+                        timed_only=getattr(args, "timed", False))
     except GerminateRefused as exc:
         print(f"levain: spores germinate refused: {exc}", file=sys.stderr)
         return 2
@@ -336,8 +352,8 @@ def add_parsers(subparsers: argparse._SubParsersAction) -> None:
     p.set_defaults(func=lambda a: (p.print_help(), 2)[1])
     sub = p.add_subparsers(dest="spores_cmd")
     g = sub.add_parser("germinate", allow_abbrev=False,
-                       help="Put every due agenda in front of the operator (band row, nudge or board drop).",
-                       description="Each open agenda spore whose date has come (and not "
+                       help="Put every due agenda in front of the operator (band row, nudge, desk or board drop).",
+                       description="Each open agenda spore whose date (or, for a timed next, minute) has come (and not "
                                    "yet germinated) is filed once as the spore's target says, stamped, and composted. "
                                    "Deterministic; no model call. Safe to run again: a re-run files nothing twice.")
     g.add_argument("--path", type=Path, default=Path.cwd(), help="Install directory (default: cwd).")
@@ -346,5 +362,8 @@ def add_parsers(subparsers: argparse._SubParsersAction) -> None:
     g.add_argument("--agent", choices=("claude_code", "codex"), default="claude_code",
                    help="The band's name for this install's harness.")
     g.add_argument("--dry-run", action="store_true", help="List the due set and write nothing.")
+    g.add_argument("--timed", action="store_true",
+                   help="File only agendas whose next carries a time (YYYY-MM-DDTHH:MM) and is now due, any target; "
+                        "the same lock and stamp as a plain run, so the two are idempotent together.")
     g.add_argument("--json", action="store_true", dest="as_json", help="Print the result as JSON.")
     g.set_defaults(func=run_germinate)
