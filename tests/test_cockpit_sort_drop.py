@@ -468,6 +468,8 @@ def test_a_non_string_edit_target_does_not_take_the_title_down():
     from levain.cockpit.providers import plain_edit_title
 
     assert plain_edit_title("list_intake", None, "device:ab12") == "added a line, from a signed device"  # type: ignore[arg-type]
+    # a truthy non-string target too (L3 r2: codex + deepseek), not only None
+    assert plain_edit_title("list_intake", 7, "device:ab12") == "added a line, from a signed device"  # type: ignore[arg-type]
 
 
 def test_the_store_assigned_fields_are_the_row_the_store_emits():

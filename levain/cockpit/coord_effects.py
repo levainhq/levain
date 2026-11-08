@@ -13,11 +13,11 @@ browser-token path does; only a read (``snapshot``) never makes one. ``snapshot`
 private ``_drop`` on a read-only connection because the public ``drop_by_outbox`` opens the store for writing and so
 would create it.
 
-Known edges (closed as design, not code): the coordinator directory is resolved when the drop is written, not bound
+Known edges (closed as design, not code). The coordinator directory is resolved when the drop is written, not bound
 into the signed effect, so a pending signed under one LEVAIN_HOME and decided (or recovered) after a restart under
 another, with the same ledger root, writes to the second directory (the directory comes from the process
-environment, fixed for a server's life); and the broker's local-filesystem check covers the spore and episode
-stores, not the coordinator directory (resolved per call).
+environment, fixed for a server's life). The broker's local-filesystem check covers the spore and episode stores,
+not the coordinator directory (resolved per call).
 """
 
 from __future__ import annotations

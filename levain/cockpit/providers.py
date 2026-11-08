@@ -815,9 +815,10 @@ def _edit_origin(credential: Any) -> str:
 def plain_edit_title(verb: str, target: str, credential: Any) -> str:
     """A broker fire as a sentence a person reads: ``resolved item spore-017, from the browser``."""
     verb = verb if isinstance(verb, str) else ""     # a journal row's verb is a string; a malformed one must not take the panel down
+    target = target if isinstance(target, str) else ""     # likewise for a malformed target
     phrase = _EDIT_PHRASES.get(verb) or verb.replace("_", " ")
     # a sort's drop reads as an aside to the line it was typed as: "added a line, sent to the desk to sort"
-    said = (f"{phrase}, {target}" if isinstance(target, str) and target.startswith("sent to ") else " ".join(x for x in (phrase, target) if x))
+    said = (f"{phrase}, {target}" if target.startswith("sent to ") else " ".join(x for x in (phrase, target) if x))
     return ", ".join(x for x in (said, _edit_origin(credential)) if x)
 
 
