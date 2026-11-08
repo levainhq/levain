@@ -389,7 +389,7 @@ def _handle_verb(
             return replace(model, status="⚠ capture not saved — $EDITOR is missing or exited non-zero")
         if not text.strip():
             return replace(model, status="nothing captured")
-        label = "kept a note" if disposition == "note" else "dropped a Tray seed"
+        label = "kept a note" if disposition == "note" else "dropped a List seed"
         return _apply(model, source, build_seed_req(text, disposition), label)
 
     if kind == "spore_reclassify":  # change a forming Tray item's type (locks at metabolize)
@@ -842,10 +842,10 @@ _HELP_LINES = [
     "    config / sections   e            edit a Class-A input ($EDITOR): State / world.md",
     "    Open Loops          t e s p d a  touch · edit · schedule · park (un-park on a parked",
     "                                     loop) · descend · ascend",
-    "    Tray (inbox)        n e c m s d  new-dump · edit · re(c)lassify · metabolize→loop ·",
+    "    List (inbox)        n e c m s d  new-dump · edit · re(c)lassify · metabolize→loop ·",
     "                                     schedule · dismiss",
     "    Episodes / Edits    x · u        tombstone an episode · undo a Class-A file edit",
-    "    n (new-dump) works on an EMPTY Tray too — it's a panel-level capture.",
+    "    n (new-dump) works on an EMPTY List too — it's a panel-level capture.",
     "",
     "  Class-C is dim (consolidated cognition — glass, read-only);",
     "  Class-A/B is bold (operator inputs — metal, steerable).",
