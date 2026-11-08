@@ -282,3 +282,55 @@ def test_the_sort_fire_needs_a_coordinator_store():
     with pytest.raises(EditError) as e:
         _intake_fire(None, {"line": "x"}, {}, False)  # type: ignore[arg-type]
     assert e.value.http_status == 501
+
+
+def test_a_keyed_sort_resent_after_a_lost_reply_writes_one_drop(home):
+    from levain.coordinator.store import CoordStore
+
+    d = home / "dispatch"
+    tgt = {"dispatch_dir": d, "credential": "browser", "idempotency_key": "intake-1"}
+    first = _intake_fire(None, {"line": "the sticky note"}, tgt, False)  # type: ignore[arg-type]
+    again = _intake_fire(None, {"line": "the sticky note"}, tgt, False)  # type: ignore[arg-type]
+    assert again["drop_id"] == first["drop_id"] and (first["replay"], again["replay"]) == (False, True)
+    assert [x.words for x in CoordStore(d).drops()] == ["the sticky note"]
+    # the same key with other words is a conflict, never a second drop; another credential's key is its own
+    with pytest.raises(EditError) as e:
+        _intake_fire(None, {"line": "other words"}, tgt, False)  # type: ignore[arg-type]
+    assert e.value.code == "idempotency_conflict"
+    other = _intake_fire(None, {"line": "the sticky note"}, {**tgt, "credential": "phone"}, False)  # type: ignore[arg-type]
+    assert other["drop_id"] != first["drop_id"]
+
+
+class _Raise:
+    """A standing policy that raises the named verbs to a tier (the Protocol's one method)."""
+
+    def __init__(self, **floors: str) -> None:
+        self.floors = floors
+
+    def apply(self, verb: str, tier: str) -> str:
+        return self.floors.get(verb, tier)
+
+
+def test_a_raise_of_spore_seed_governs_a_drop_and_a_talk_never_a_sort():
+    """codex L3 r1 HIGH: list_intake plants spore_seed's effect, so spore_seed's standing raise is not stepped around."""
+    spec = VerbRegistry().get(INTAKE_VERB)
+    today = NOW_LOCAL.date()
+    pol = _Raise(spore_seed="T3")
+    assert [spec.tier({"line": l}, None, "verified", today, policy=pol) for l in ("@+1h x", "? y", "z")] == \
+        ["T3", "T3", "C1"]
+    assert spec.rendered_tier(None, "verified", today, policy=pol) == "T3"
+    assert spec.head("sign", policy=pol)["tier"] == "T3"
+    # its own raise still governs every kind
+    assert spec.tier({"line": "z"}, None, "verified", today, policy=_Raise(list_intake="T2")) == "T2"
+    assert spec.idempotent and spec.policy_also is not None
+
+
+def test_a_drop_decided_inside_its_own_minute_still_builds_and_a_committed_receipt_never_says_not_written(broker):
+    out = _issue(broker, "@+1m x", intent="sign")
+    target = json.loads(out["record"])["target"]
+    broker._test_now[0] = NOW_UTC + timedelta(minutes=1, seconds=30)      # inside the drop's own minute
+    built = broker._build_intake({"line": "@+1m x"}, target, out["pending_id"], at_issue=False)
+    assert built.effects[0].changes["next"] == target["intake"]["when"]
+    got = broker._intake_receipt({"target": target}, "cp" + "ee" * 16, "COMMITTED")   # no row under that key
+    assert got["receipt"]["id"] is None and got["receipt_line"].endswith(", written")
+    assert "not written" not in got["receipt_line"]

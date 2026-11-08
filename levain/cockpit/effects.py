@@ -741,7 +741,10 @@ INTAKE_VERB = "list_intake"
 # them as a coordinator drop from surface ``cli``), so it is signed. A talk seed is a spore agents read (the talk
 # queue), the exposure every ``spore_seed`` is T2 for, so it is signed too: a
 # ``?`` prefix must not be a way around spore_seed's floor. A sort is the room composer's own write (a coordinator drop
-# from the cockpit surface, "your words, kept verbatim, never authority"), C1 as that is. Pinned by the tests
+# from the cockpit surface, "your words, kept verbatim, never authority"), C1 as that is. "Signed" is T2's gesture in a
+# governed install; a REPORTED install fires a token's T2 as reported (``gesture_for``), as it does every spore_seed,
+# which is that install class's declared trade. A standing raise of spore_seed governs a drop and a talk too
+# (``verbs._intake_policy_also``). Pinned by the tests
 INTAKE_TIERS = {"drop": "T2", "talk": "T2", "sort": "C1"}
 
 

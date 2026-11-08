@@ -880,9 +880,14 @@ class Broker:
                 raise ValueError("the record's target carries no intake reading")
             reading = dict(reading)
             if reading["kind"] == "drop":
-                due = datetime.strptime(str(reading.get("when")), "%Y-%m-%dT%H:%M")
-                if due <= self._now().astimezone().replace(tzinfo=None, second=0, microsecond=0):
-                    raise ValueError(f"the drop's minute ({reading['when']}) passed before it was signed")
+                when = reading.get("when")
+                if not isinstance(when, str):
+                    raise ValueError("the record's drop reading carries no minute")
+                due = datetime.strptime(when, "%Y-%m-%dT%H:%M")
+                # strictly past: a drop decided inside its own minute is due now and germinates at once (an
+                # ``@+1m`` issued at hh:mm:59 and decided a second later is not refused)
+                if due < self._now().astimezone().replace(tzinfo=None, second=0, microsecond=0):
+                    raise ValueError(f"the drop's minute ({when}) passed before it was signed")
         seed = intake_seed_params(reading)
         ok = create_origin_key(pid, 0)
         snap = es.snapshot(spore_resource_key(ok))
@@ -909,8 +914,10 @@ class Broker:
         if sid is None:
             what = (f"scheduled drop fires {datetime.strptime(out['fires'], '%Y-%m-%dT%H:%M'):%a %m-%d %H:%M}"
                     if out["kind"] == "drop" else "talk")
-            line = {"WAITING": f"{what}, awaiting your signature", "applying": f"{what}, being written"}.get(
-                state, f"{what}: not written ({state.lower()})")
+            # a committed op whose row cannot be read now (a transient fault, or resolved since) WAS written: never
+            # "not written", which would invite a second, duplicate line
+            line = {"WAITING": f"{what}, awaiting your signature", "applying": f"{what}, being written",
+                    "COMMITTED": f"{what}, written"}.get(state, f"{what}: not written ({state.lower()})")
         return {"receipt": out, "receipt_line": line}
 
     def _build_tombstone(self, params: Mapping[str, Any], target: Mapping[str, Any], pid: str,
