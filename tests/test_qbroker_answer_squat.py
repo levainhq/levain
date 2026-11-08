@@ -416,3 +416,26 @@ def test_rows_requires_a_signers_argument(L, broker):
     with pytest.raises(TypeError, match="signers"):
         operator.rows(L / "queue", now=LATER)
     assert [r.answered for r in operator.rows(L / "queue", now=LATER, signers=None)] == [False]
+
+
+# --- prel3fix L3 r2 (pf1r3): a verified answer linked back is "in place"; an fsync EIO never loses the aside path ------
+
+def test_a_swapped_signed_answer_linked_back_on_the_last_try_is_reported_not_a_squat_refusal(L, broker, keys, answers,
+                                                                                            monkeypatch):
+    rid = filed(broker)
+    write_answer(L, rid, keys["operator"], decision="deny")
+    first = (answers / f"{rid}.json").read_bytes()
+    real, calls = operator._signed_answer, []
+
+    def stale_once(row, path, *a):
+        calls.append(path)
+        return False if len(calls) == 1 else real(row, path, *a)
+
+    monkeypatch.setattr(operator, "_signed_answer", stale_once)
+    monkeypatch.setattr(operator, "_SQUAT_TRIES", 1)             # the swap is met on the final (only) attempt
+    payload, sig = rbase.signed(L, rid, keys["operator"])
+    with pytest.raises(operator.OperatorError, match="already has an answer row"):
+        operator.write_answer(L / "queue", rid, payload, sig, rbase.snapshot(L), now=LATER)
+    assert (answers / f"{rid}.json").read_bytes() == first
+    assert sorted(p.name for p in answers.iterdir()) == [f"{rid}.json"]
+

@@ -282,7 +282,7 @@ def _clear_squat(store: QueueStore, receipts: Receipts, row: Mapping[str, Any], 
     whatever is there is renamed aside and False is returned, for the caller to link its own answer again. What the
     rename moved is judged again from its own fd, never assumed to be the thing judged at the name (a swap in
     between, or a freed inode reused, makes them differ while the name or the (dev, ino) look the same); should it
-    be a signed answer, it is linked back.
+    be a signed answer, it is linked back and True is returned (a verified answer is in place).
     Should the link-back fail (the name taken again, or any other ``OSError`` but the quarantine file gone),
     :class:`OperatorError` names the quarantine file that holds it. An answer signed by a key in the current
     snapshot is never left in quarantine unreported.
@@ -322,4 +322,5 @@ def _clear_squat_os(store: QueueStore, receipts: Receipts, row: Mapping[str, Any
         except FileNotFoundError:
             pass
         fsync_dir(store.answers)
+        return True                              # a verified answer is in place: the caller writes none of its own
     return False
