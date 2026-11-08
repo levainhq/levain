@@ -41,8 +41,10 @@ of the reference implementation's; keep them identical.
 
 from __future__ import annotations
 
+import re
 import threading
 from collections.abc import Mapping
+from datetime import datetime
 from typing import Any
 
 __all__ = [
@@ -69,6 +71,12 @@ __all__ = [
     "is_tray",
     "is_note",
     "bucket_of",
+    "GERMINATE_ATTENTIONS",
+    "check_steering",
+    "is_talk_seed",
+    "is_timed",
+    "valid_next",
+    "valid_target",
 ]
 
 LOOP_DISPOSITION = "loop"
@@ -255,3 +263,73 @@ def bucket_of(item: Mapping[str, Any]) -> str:
     if d in TRAY_DISPOSITIONS or d in KEEP_DISPOSITIONS:   # legacy handoff (in TRAY_DISPOSITIONS) and legacy note both render in the Tray
         return BUCKET_TRAY
     return BUCKET_LOOP
+
+
+# --- THE LIST contract (task_surfaces_1107.md, np-7c5c8752 (a)): a timed ``next``, the ``desk`` target, talk seeds ----
+GERMINATE_TARGETS = ("band", "nudge", "desk")           # plus ``board:<repo>``
+GERMINATE_ATTENTIONS = ("none", "talk")                 # what an AGENDA's ``attention`` may be
+_WHEN = re.compile(r"(\d{4}-\d{2}-\d{2})(?:T(\d{2}):(\d{2}))?")
+
+
+def _parse_when(value: Any) -> datetime | None:
+    """``next`` as a local naive datetime: exactly ``YYYY-MM-DD`` (midnight) or ``YYYY-MM-DDTHH:MM`` (local, 24 h, no
+    zone, real calendar date and clock). Anything else, a hand-edited ``'2026-11-07 note'`` included, is None: every
+    DUE test calls this (or :func:`is_timed` first), never a date-prefix read, which would take a timed value as midnight."""
+    if not isinstance(value, str):
+        return None
+    m = _WHEN.fullmatch(value)
+    if m is None:
+        return None
+    try:
+        return datetime.strptime(value if m.group(2) else value + "T00:00", "%Y-%m-%dT%H:%M")
+    except ValueError:
+        return None
+
+
+def is_timed(value: Any) -> bool:
+    """True when ``next`` carries a time of day (the ``T`` shape), valid or not: a malformed timed value is never read as a date."""
+    return isinstance(value, str) and re.fullmatch(r"\d{4}-\d{2}-\d{2}T.*", value) is not None
+
+
+def valid_next(value: Any) -> bool:
+    """The strict write shape for ``next``: one of the two shapes above, nothing else."""
+    return _parse_when(value) is not None
+
+
+def valid_target(value: Any) -> bool:
+    """A germinate target: ``band``, ``nudge``, ``desk`` or ``board:<repo>`` (a non-empty repo)."""
+    if not isinstance(value, str):
+        return False
+    if value in GERMINATE_TARGETS:
+        return True
+    return value.startswith("board:") and bool(value[len("board:"):].strip())
+
+
+def is_talk_seed(item: Mapping[str, Any]) -> bool:
+    """An open ``seed`` that carries ``attention: talk``: a thing to talk through with the operator (the talk queue).
+    Such a seed does not go stale silently. Levain's own spore code has no TTL expiry or resurface step of its own
+    (anneal's ``list_open`` ranks and ``germination_tier`` classifies; nothing in levain expires or resurfaces a seed),
+    so this predicate is the contract hook for a caller that adds one."""
+    d = item.get("disposition")
+    return (isinstance(d, str) and d.strip().casefold() == "seed"
+            and isinstance(item.get("attention"), str) and item["attention"].strip() == "talk")
+
+
+def check_steering(disposition: Any, target: Any, attention: Any) -> str | None:
+    """Why a write may not set ``target`` / ``attention`` on this disposition, or None when it may. ``target`` and
+    ``attention`` steer how an AGENDA germinates, with ONE exception: a seed may carry ``attention: talk`` and only talk."""
+    d = disposition.strip().casefold() if isinstance(disposition, str) else ""
+    if target is not None and not valid_target(target):
+        return f"target must be band, nudge, desk or board:<repo> (got {target!r})"
+    if attention is not None and attention not in GERMINATE_ATTENTIONS:
+        return f"attention must be one of {', '.join(GERMINATE_ATTENTIONS)} (got {attention!r})"
+    if d == "seed" and target is None and attention == "talk":
+        return None
+    if (target is not None or attention is not None) and d != "agenda":
+        return ("target and attention steer how an AGENDA germinates; this spore is not one "
+                "(the one exception: a seed may carry attention talk)")
+    if attention not in (None, "none") and target == "desk":
+        return "attention pings a band row, and a desk target files a drop, none; drop attention or use target band or nudge"
+    if attention not in (None, "none") and isinstance(target, str) and target.startswith("board:"):
+        return "attention pings a band row, and a board: target files none; drop attention or change the target"
+    return None
