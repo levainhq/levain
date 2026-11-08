@@ -2264,7 +2264,7 @@
     // later ones it names in its control, the focus view's with them). Held rows are never in it, nor in a surface chip: they have
     // their own "held" chip. So the header, the "all" chip and the control's numbers follow from each other.
     const listAll = () => (list || []).filter((s) => !cardHides(s));
-    const heldChosen = () => isList && listSurface === "held" && !!heldLine;
+    const heldChosen = () => isList && !inCard && listSurface === "held" && !!heldLine;   // the card names its held rows in its control, never draws them
     const listNow = () => (heldChosen() ? "held" : isList && listAll().some((s) => s.surface === listSurface) ? listSurface : "");
     const inSurface = (s) => !listNow() || listNow() === "held" || s.surface === listNow();
     if (isList && !inCard) p.dataset.listTotal = String(listAll().length);   // the focus view's header counts what its "all" chip counts
@@ -2291,7 +2291,7 @@
         note.appendChild(go);
       },
       controls: (bar, redraw) => {
-        if (isList) bar.after(chipRow = buildSurfaceChips(listAll(), listNow, (v) => { listSurface = v; redraw(); }, heldLine ? heldLine.count : 0));
+        if (isList) bar.after(chipRow = buildSurfaceChips(listAll(), listNow, (v) => { listSurface = v; redraw(); }, heldLine && !inCard ? heldLine.count : 0));
         if (heldLine && !isList) {
           const line = el("div", "ext-note held-line");
           // the earliest surface date among the held rows: "1 held back until Dec 3"

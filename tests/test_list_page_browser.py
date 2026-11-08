@@ -493,6 +493,7 @@ def test_r4_the_card_holds_due_rows_and_one_control_and_the_focus_view_every_gro
     assert num(focus["chips"], "all") == num(card["chips"], "all") + (desk - carried) + later, (card, focus)
     assert len(focus["desk"]) == desk - carried and len(focus["later"]) == later, focus
     assert num(card["chips"], "spores") == num(focus["chips"], "spores"), (card["chips"], focus["chips"])    # live spores only, in both
+    assert num(card["chips"], "held") is None, card                                                         # the card draws no held rows: its control names them
     assert num(focus["chips"], "held") == int(re.search(r"(\d+) held", card["more"][0]).group(1)), (card, focus)
 
 
