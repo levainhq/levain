@@ -57,6 +57,7 @@ def _check(few: dict, many: dict) -> None:
     assert many["nodes"] == 80 and few["nodes"] == 4, (few, many)
     cap = min(0.72 * many["vh"], MAX_REM * REM) + 2
     assert many["box"] <= cap, many                           # the box stops at its fixed height
+    assert many["box"] >= cap - 4, many                     # and it IS that tall: a revert to 60vh / 28rem fails (cap carries +2)
     assert many["inner"] > many["box"], many                  # and the rest of the graph is inside it, scrolled
     assert many["oy"] in ("auto", "scroll"), many
     assert many["doc"] - few["doc"] <= cap, (few, many)       # eighty nodes grew the page by no more than the box's own height

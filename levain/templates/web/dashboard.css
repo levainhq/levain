@@ -1971,13 +1971,16 @@ body.ke[data-mode="board"] .ck-zgrid [data-ck-panel="episodes"] { order: 5; }
 }
 /* Desktop: the Board's cards sit three to a row whatever data-cols says (one stack or two: a stack that empties or fills never
    brings the single full-width column back). The two stacks dissolve into the grid so their cards flow left to right; a thin dashed
-   (empty) card has no data-ck-pair and keeps its full row; a lone last card keeps its own cell, it does not stretch. */
+   (empty) card or a fold bar (ck-dash, ck-fold) keeps its full row even inside a stack; a lone last card keeps its own cell, it does not stretch. */
 @media (min-width: 1100px) {
   body.ke[data-mode="board"] .ck-zgrid.ck-twocol:is([data-cols="1"], [data-cols="2"]) { grid-template-columns: repeat(3, minmax(0, 1fr)); }
   body.ke[data-mode="board"] .ck-zgrid.ck-twocol:is([data-cols="1"], [data-cols="2"]) > .ck-col:not(.ck-col-off) { display: contents; }
-  body.ke[data-mode="board"] .ck-zgrid.ck-twocol:is([data-cols="1"], [data-cols="2"]) > .ck-col > .panel,
+  body.ke[data-mode="board"] .ck-zgrid.ck-twocol:is([data-cols="1"], [data-cols="2"]) > .ck-col > .panel:not(.ck-fold):not(.ck-dash),
   body.ke[data-mode="board"] .ck-zgrid.ck-twocol:is([data-cols="1"], [data-cols="2"]) > .panel[data-ck-pair] { grid-column: auto; }
   body.ke[data-mode="board"] .ck-zgrid.ck-twocol:is([data-cols="1"], [data-cols="2"]) > .panel[data-ck-pair] { height: var(--card-medium); max-height: var(--card-medium); }
+  /* the stack rule above (grid-column: auto on a stack's card) outranks the fold / dash full-row rule, so a fold bar or a dashed empty
+     card inside a dissolved stack is told its row again here */
+  body.ke[data-mode="board"] .ck-zgrid.ck-twocol:is([data-cols="1"], [data-cols="2"]) > .ck-col > .panel:is(.ck-fold, .ck-dash) { grid-column: 1 / -1; }
 }
 /* the order inside a stack is the DOM's (dashboard_core.js ckArrange: Tray over Now, Open loops until a saved layout says otherwise) */
 
