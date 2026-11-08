@@ -100,7 +100,7 @@ def test_accept_encoding_q_case_and_wildcard():
     assert not a(None) and not a("gzip;q=abc")
 
 
-def test_concurrent_first_requests_compress_once(monkeypatch):
+def test_concurrent_first_requests_share_one_cached_entry(monkeypatch):
     import levain.web_server as ws
 
     calls = []
@@ -113,7 +113,54 @@ def test_concurrent_first_requests_compress_once(monkeypatch):
 
     monkeypatch.setattr(ws.gzip, "compress", slow)
     body = b"x" * 5000 + b"unique-cardgz-body"
-    ts = [threading.Thread(target=ws._static_entry, args=(body,)) for _ in range(12)]
+    results = []
+    ts = [threading.Thread(target=lambda: results.append(ws._static_entry(body))) for _ in range(12)]
     [t.start() for t in ts]
     [t.join() for t in ts]
-    assert len(calls) == 1
+    assert len(results) == 12 and len(set(results)) == 1
+    assert 1 <= len(calls) <= 12
+    before = len(calls)
+    assert ws._static_entry(body) == results[0] and len(calls) == before
+
+
+def test_conditional_matches_only_the_served_representation(tmp_path):
+    with _serving(tmp_path) as port:
+        _, hp, plain = _get(port, "/sign.js")
+        _, hg, _ = _get(port, "/sign.js", {"Accept-Encoding": "gzip"})
+        st, h, body = _get(port, "/sign.js", {"Accept-Encoding": "gzip", "If-None-Match": hp["etag"]})
+        assert st == 200 and h["etag"] == hg["etag"] and gzip.decompress(body) == plain
+        st, h, body = _get(port, "/sign.js", {"If-None-Match": hg["etag"]})
+        assert st == 200 and h["etag"] == hp["etag"] and body == plain
+        st, _, body = _get(port, "/sign.js", {"Accept-Encoding": "gzip", "If-None-Match": hg["etag"]})
+        assert st == 304 and body == b""
+
+
+def test_slow_compression_does_not_block_a_cache_hit(monkeypatch):
+    import levain.web_server as ws
+
+    a = b"a" * 4000 + b"cardgz-a-body"
+    b = b"b" * 4000 + b"cardgz-b-body"
+    ws._static_entry(a)
+    started, release = threading.Event(), threading.Event()
+    real = ws.gzip.compress
+
+    def gated(data, **kw):
+        if data is b:
+            started.set()
+            assert release.wait(10)
+        return real(data, **kw)
+
+    monkeypatch.setattr(ws.gzip, "compress", gated)
+    tb = threading.Thread(target=ws._static_entry, args=(b,))
+    tb.start()
+    try:
+        assert started.wait(10)
+        out = []
+        ta = threading.Thread(target=lambda: out.append(ws._static_entry(a)))
+        ta.start()
+        ta.join(timeout=5)
+        assert not ta.is_alive() and out
+    finally:
+        release.set()
+        tb.join(timeout=10)
+    assert ws._static_entry(b)[2] == real(b, compresslevel=9, mtime=0)

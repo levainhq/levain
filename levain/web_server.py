@@ -1539,19 +1539,24 @@ def _accepts_gzip(header: str | None) -> bool:
 
 
 def _static_entry(body: bytes) -> tuple[str, str, bytes]:
-    """``(identity etag, gzip etag, gzip of the bytes)``, computed once per body; concurrent first requests wait on the
-    one compression instead of each running it."""
+    """``(identity etag, gzip etag, gzip of the bytes)``, cached per body. The hash and compression run outside the
+    lock, so a large uncached body never blocks a cache hit for another; two cold racers on the same body may both
+    compress it (identical output), and the first insert wins."""
     with _STATIC_CACHE_LOCK:
         hit = _STATIC_CACHE.get(id(body))
         if hit is not None and hit[0] is body:
             return hit[1], hit[2], hit[3]
-        digest = hashlib.sha256(body).hexdigest()[:32]
-        etag, gz_etag = '"' + digest + '"', '"' + digest + '-gz"'
-        gz = gzip.compress(body, compresslevel=9, mtime=0)
+    digest = hashlib.sha256(body).hexdigest()[:32]
+    etag, gz_etag = '"' + digest + '"', '"' + digest + '-gz"'
+    gz = gzip.compress(body, compresslevel=9, mtime=0)
+    with _STATIC_CACHE_LOCK:
+        hit = _STATIC_CACHE.get(id(body))
+        if hit is not None and hit[0] is body:
+            return hit[1], hit[2], hit[3]
         if len(_STATIC_CACHE) >= _STATIC_CACHE_MAX:
             _STATIC_CACHE.clear()
         _STATIC_CACHE[id(body)] = (body, etag, gz_etag, gz)
-        return etag, gz_etag, gz
+    return etag, gz_etag, gz
 
 
 def _etag_matches(if_none_match: str | None, *etags: str) -> bool:
@@ -2245,7 +2250,7 @@ class _Handler(GuardedHandler):
         use_gz = _accepts_gzip(self.headers.get("Accept-Encoding"))
         served = gz_etag if use_gz else etag
         vary = ("Vary", "Accept-Encoding")
-        if _etag_matches(self.headers.get("If-None-Match"), etag, gz_etag):
+        if _etag_matches(self.headers.get("If-None-Match"), served):
             self.send_response(304)
             self.send_header("ETag", served)
             self.send_header(*vary)
