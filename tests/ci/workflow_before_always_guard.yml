@@ -1,0 +1,506 @@
+name: test
+
+# Minimal CI: the full pytest suite on Ubuntu. Tests that need macOS sandbox-exec,
+# a live Ollama, or the Linux image (LEVAIN_REQUIRE_LINUX_LIVE) skip themselves
+# where those are absent; a skip is not a pass, so read the skip count in the log.
+# The `test` job runs the suite in shards (tests/ci/shard.py computes the partition); the workflow stays
+# named `test` because the release gate reads a completed success of that workflow on the exact sha.
+
+# land/** is the land waiter's candidate ref: the push whose verdict decides a landing. seat/** stays until a real
+# landing has gone through land/**; then a seat's own push stops running the suite and workflow_dispatch asks for a run.
+# The schedule is the nightly rerun of main HEAD, the same-sha check that replaces the duplicate run a main push was.
+on:
+  push:
+    branches: [main, "seat/**", "land/**"]
+    tags: ["v*"]
+  pull_request:
+    branches: [main]
+  schedule:
+    - cron: "17 6 * * *"
+  workflow_dispatch:
+
+# The nightly is found by its event (`schedule`) and named so a reader of the run list sees it; every other event keeps
+# the name GitHub would have given it (commit message, PR title, workflow name).
+run-name: ${{ github.event_name == 'schedule' && 'nightly full run of main' || github.event.head_commit.message || github.event.pull_request.title || github.workflow }}
+
+concurrency:
+  # A workflow_dispatch run gets a group of its own (its run id), so it neither cancels the push run whose
+  # verdict the release gate reads (3e2aef8d, 11-05) nor is cancelled by the next dispatch; a push or PR run still
+  # cancels the superseded run of the same ref. A scheduled run is grouped like a dispatch: a main push must not cancel
+  # the nightly (a cancelled nightly is a missing flake check), nor the nightly a main push.
+  # A push to main is grouped by its sha and never cancels: each main sha's run is a verdict the release gate may read,
+  # so a newer main push must not cancel it. land/** and seat/** pushes and PRs keep cancelling the superseded run of the ref.
+  group: ${{ github.workflow }}-${{ github.ref }}-${{ (github.event_name == 'workflow_dispatch' || github.event_name == 'schedule') && github.run_id || (github.event_name == 'push' && github.ref == 'refs/heads/main') && github.sha || 'ci' }}
+  cancel-in-progress: ${{ !(github.event_name == 'push' && github.ref == 'refs/heads/main') }}
+
+env:
+  # The one place the shard count is written. The `plan` job emits the matrix's shard list from it, and each
+  # shard job partitions its own collection with it.
+  # 4 shards: the 3.12 job ran ~55-67 min unsharded, so four shards of ~15-17 min leave headroom under the cap
+  # while the per-job install (~1 min) stays small. Rebalance from the per-shard durations in a run's job list.
+  # 6 shards (11-03): on the bundle7 sha two of four shards ran past the 45-minute cap (shards 0 and 3 took 18-19
+  # minutes), because the weight is a count of `def test_` lines and the new files hold few, slow tests.
+  TEST_SHARDS: "6"
+
+jobs:
+  gate:
+    # A push to main lands a sha the land waiter already tested on its land/** candidate, so the heavy jobs skip when
+    # tests/ci/skip_lookup.py finds a green run of this sha on another ref. It fails closed (see that file): any doubt
+    # runs everything. Only a plain push to main can skip; tags, manual runs, the nightly and PRs always run.
+    name: look up a verifying run
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    # A gate only has a verdict to look up on a push to main; every other run has nothing to skip, so it does not queue.
+    if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
+    # least privilege: read the run list, and check out the one script
+    permissions:
+      actions: read
+      contents: read
+    outputs:
+      skip: ${{ steps.lookup.outputs.skip }}
+      ref: ${{ steps.lookup.outputs.ref }}
+      run_id: ${{ steps.lookup.outputs.run_id }}
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Look for a green run of this sha on another ref
+        id: lookup
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: python3 tests/ci/skip_lookup.py
+
+  verified:
+    # Present only when the heavy jobs were skipped. Its NAME carries the verdict ("verified on <ref> run <id>") so a
+    # reader of the job list, such as the land waiter's main follow, sees it without reading a log.
+    name: verified on ${{ needs.gate.outputs.ref }} run ${{ needs.gate.outputs.run_id }}
+    needs: gate
+    if: ${{ needs.gate.result == 'success' && needs.gate.outputs.skip == 'true' }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - env:
+          # a branch name is an API string: it reaches the shell as a variable, never spliced into the command text
+          VERIFIED_REF: ${{ needs.gate.outputs.ref }}
+          VERIFIED_RUN: ${{ needs.gate.outputs.run_id }}
+        run: echo "verified on $VERIFIED_REF run $VERIFIED_RUN"
+
+  plan:
+    # Emits the shard list [0..TEST_SHARDS-1] the `test` matrix runs. It does not collect: each shard job collects
+    # under its own Python and picks its own files (see that job's last step), so a file one Python collects and
+    # another does not is still in that Python's shards.
+    name: plan test shards
+    needs: gate
+    # The gate exists only on a main push, so on every other run it is skipped and these jobs run; a failed, errored or
+    # cancelled gate runs them too (fail closed: any doubt is a test). Only a gate that succeeded and said skip skips them.
+    if: ${{ always() && !cancelled() && !(needs.gate.result == 'success' && needs.gate.outputs.skip == 'true') }}
+    # Pinned because ubuntu-latest moved to ubuntu-26.04, whose sudo/bash/python differ; revisit when the tests are made to pass on it.
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    outputs:
+      shards: ${{ steps.plan.outputs.shards }}
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+
+      - name: Emit the shard list
+        id: plan
+        run: python tests/ci/shard.py shards --shards "$TEST_SHARDS"
+
+  test:
+    name: pytest (Python ${{ matrix.python-version }}, shard ${{ matrix.shard }})
+    needs: plan
+    # Pinned because ubuntu-latest moved to ubuntu-26.04, whose sudo/bash/python differ; revisit when the tests are made to pass on it.
+    runs-on: ubuntu-24.04
+    # History: the unsharded suite outgrew 40 min (10-21) and then 60 min (10-22; run 39881613545's 3.12 job was
+    # cancelled at the cap at 96% with no failure), so it was split into shards. A hang still ends at this cap.
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.12", "3.13"]
+        shard: ${{ fromJSON(needs.plan.outputs.shards) }}
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v6
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: pip
+          cache-dependency-path: pyproject.toml
+
+      - name: Make the runner's container-daemon socket directory readable
+        # The Linux floor refuses a crown jewel this user cannot stat (a hardlink could reach it;
+        # the refusal tells the operator to make it readable or remove it from the floor). The
+        # runner image ships a rootful podman whose /run/podman is root-only, so every floor test
+        # would refuse on a host the tests do not model. This applies the refusal's own remedy.
+        run: sudo chmod o+rx /run/podman || true
+
+      - name: Install package with dev and openhands extras
+        # hatchling is a build dependency the packaging tests ask for directly; the openhands
+        # extra is imported by the floor tests (tests/test_floor_project_memory.py).
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e ".[dev,openhands]" hatchling
+
+      - name: Install h11 for the runner's /usr/bin/python3
+        # tests/test_routemaps.py runs keys under /usr/bin/python3 too (the root-py param) and fails under CI when that
+        # interpreter cannot import h11, so the root run cannot quietly become a skip. pip, not apt, so the version is
+        # the floor root vendors (root_tree.H11_MIN) and not whatever the distro packages.
+        run: sudo /usr/bin/python3 -m pip install --break-system-packages "$(python tests/ci/root_closure.py h11-spec)"
+
+      - name: Run pytest shard ${{ matrix.shard }} of ${{ env.TEST_SHARDS }}
+        # Collect under THIS Python with the repo's real config, then pick this shard's files: shard.py fails on no
+        # node ids, a file in no shard or two, an empty shard. Each command's exit is checked (bash -e, pipefail),
+        # and the files go to pytest as one quoted array, so no path is word-split or globbed and an empty list
+        # fails here instead of running the whole suite.
+        # basetemp sits outside $HOME on purpose: runner.temp is under /home/runner, and tests/test_hermetic_home.py
+        # fails any scratch home that lives under the real one (CI 2026-10-31, shard 0 on 1356d3df)
+        env:
+          # one scale for every wait the tests make (a shared runner is slower than a laptop): see tests/_waits.py
+          LEVAIN_TEST_WAIT_SCALE: "2"
+        run: |
+          set -o pipefail
+          pytest --collect-only -q > "$RUNNER_TEMP/nodes.txt"
+          python tests/ci/shard.py pick --shards "$TEST_SHARDS" --shard "${{ matrix.shard }}" < "$RUNNER_TEMP/nodes.txt" > "$RUNNER_TEMP/files.txt"
+          mapfile -t files < "$RUNNER_TEMP/files.txt"
+          test "${#files[@]}" -gt 0 || { echo "shard ${{ matrix.shard }} has no files"; exit 1; }
+          # --durations=25 prints the 25 slowest tests into the log, a measurement the shard weights lack (the -q progress parse ignores it)
+          pytest -q --durations=25 --basetemp=/tmp/levain-pt "${files[@]}"
+
+      - name: Keep what the page showed at a failed wait
+        # the page driver writes timeout-step-<n>.png / .txt beside its steps file, under pytest's basetemp; reading them is how a
+        # lost-event failure is told from a slow one
+        if: failure()
+        # action pinned to the commit its v7.0.2 tag named on 2026-10-31 (gh api repos/actions/upload-artifact/git/ref/tags/v7.0.2)
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
+        with:
+          name: page-timeouts-pytest-py${{ matrix.python-version }}-shard${{ matrix.shard }}
+          path: |
+            /tmp/levain-pt/**/timeout-step-*.png
+            /tmp/levain-pt/**/timeout-step-*.txt
+          if-no-files-found: ignore
+
+  root-py39:
+    # The code root runs is executed by `ROOT_PYTHON` (levain/slot/root_tree.py): /usr/bin/python3, which is 3.9.6 on
+    # macOS, while the `test` matrix is 3.12 / 3.13. This job runs that code on 3.9. tests/ci/root_closure.py derives
+    # the set from every dynamic-execution site (its DYNAMIC_SITES table, held to the source by a test) at run time: (i) byte-compile and import the import-time closure,
+    # (ii) run the test files that import only that closure. The package is not installed (it needs a newer Python):
+    # the files import from the checkout, and --noconftest keeps the repo conftest, which is written for 3.12+, out.
+    name: root-run code (Python 3.9)
+    needs: gate
+    # The gate exists only on a main push, so on every other run it is skipped and these jobs run; a failed, errored or
+    # cancelled gate runs them too (fail closed: any doubt is a test). Only a gate that succeeded and said skip skips them.
+    if: ${{ always() && !cancelled() && !(needs.gate.result == 'success' && needs.gate.outputs.skip == 'true') }}
+    # Pinned because ubuntu-latest moved to ubuntu-26.04, whose sudo/bash/python differ; revisit when the tests are made to pass on it.
+    runs-on: ubuntu-24.04
+    # The closure tests step took 14 min on green main and 13 min 7 s on the run the 15 min cap cancelled (run 41522235194):
+    # the closure's test set grows with every landing, so the cap sits at twice the measured time, not at the time.
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Set up Python 3.9
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.9"
+          cache: pip
+          cache-dependency-path: pyproject.toml
+
+      - name: Install h11 at or above the floor root vendors
+        # root_tree stages h11 beside the levain package, so the root tree imports it; the closure's import-check
+        # needs it as much as the tests do.
+        run: python -m pip install --upgrade pip pytest "$(python tests/ci/root_closure.py h11-spec)"
+
+      - name: Install h11 for the runner's /usr/bin/python3
+        # The keys process tests (tests/test_broker_keys_process.py, tests/test_control_keys_attach.py) also run keys
+        # under /usr/bin/python3, the interpreter the root run names (ROOT_PYTHON), and b2_keys_rig.require_h11 fails
+        # under CI when it cannot import h11. Same step, same floor, as the `test` job.
+        run: sudo /usr/bin/python3 -m pip install --break-system-packages "$(python tests/ci/root_closure.py h11-spec)"
+
+      - name: Byte-compile the root-run import closure
+        run: python tests/ci/root_closure.py compile
+
+      - name: Import each import-time closure module
+        run: python tests/ci/root_closure.py import-check
+
+      - name: Run the tests that exercise only that closure
+        run: |
+          set -o pipefail
+          python tests/ci/root_closure.py tests > "$RUNNER_TEMP/root_tests.txt"
+          mapfile -t files < "$RUNNER_TEMP/root_tests.txt"
+          test "${#files[@]}" -gt 0 || { echo "the closure selected no test files"; exit 1; }
+          echo "${#files[@]} test files"
+          PYTHONPATH="$PWD" pytest --noconftest -q -p no:cacheprovider --rootdir="$PWD" "${files[@]}"
+
+  linux-live:
+    # The bwrap floor RUN, not read as data. GitHub's ubuntu runners refuse unprivileged user
+    # namespaces through AppArmor by default, so the `linux_live` tests skip in the job above.
+    # This job lifts that restriction on the runner VM itself, which is the documented remedy the
+    # refusal names, and then requires the live tests to run (LEVAIN_REQUIRE_LINUX_LIVE=1 fails a
+    # skip). It runs the floor test files only.
+    name: bwrap floor live (Python 3.12)
+    needs: gate
+    # The gate exists only on a main push, so on every other run it is skipped and these jobs run; a failed, errored or
+    # cancelled gate runs them too (fail closed: any doubt is a test). Only a gate that succeeded and said skip skips them.
+    if: ${{ always() && !cancelled() && !(needs.gate.result == 'success' && needs.gate.outputs.skip == 'true') }}
+    # Pinned because ubuntu-latest moved to ubuntu-26.04, whose sudo/bash/python differ; revisit when the tests are made to pass on it.
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: pyproject.toml
+
+      - name: Install bubblewrap and allow it a user namespace
+        run: |
+          sudo timeout 300 apt-get -o Acquire::Retries=3 update -q || true
+          sudo timeout 300 apt-get -o Acquire::Retries=3 install -y -q bubblewrap
+          sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0 || true
+          bwrap --bind / / --proc /proc --dev /dev --unshare-pid /bin/true && echo "bwrap ok"
+          # Each command runs in a cgroup leaf of the runner user's systemd user manager; a runner has no
+          # login session, so linger starts that manager (what `sudo levain setup-isolation` does).
+          sudo loginctl enable-linger "$(id -un)"
+          for i in $(seq 1 50); do test -d "/sys/fs/cgroup/user.slice/user-$(id -u).slice/user@$(id -u).service" && test -S "/run/user/$(id -u)/bus" && break; sleep 0.2; done
+          XDG_RUNTIME_DIR="/run/user/$(id -u)" systemd-run --user --scope --quiet --collect /bin/true && echo "user scope ok"
+
+      - name: Make the runner's container-daemon socket directory readable
+        run: sudo chmod o+rx /run/podman || true
+
+      - name: Install package
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e ".[dev,openhands]" hatchling
+
+      - name: Run the live floor tests
+        env:
+          LEVAIN_REQUIRE_LINUX_LIVE: "1"
+        run: >
+          pytest -q -rs tests/test_firing_confinement.py tests/test_jewel_recheck.py
+          tests/test_nlink_floor.py tests/test_masks_last.py tests/test_floor_project_memory.py
+          tests/test_floor_spellings.py tests/test_floor_cloud_creds.py tests/test_floor_process_view.py
+          tests/test_hands_spawn.py::test_the_operator_floor_kills_its_leaf_when_levain_dies
+          tests/test_runtime_view.py tests/test_floor_autonomic_store.py tests/test_landlock_live.py tests/test_landlock.py
+
+  browser:
+    # The cockpit browser tests RUN, not skipped. They carry a skipif (`needs_browser`) whose default Chrome
+    # is the macOS app bundle, so in the `test` job every one of them skips. Here Chrome is installed at a
+    # pinned version and CHROME points at it. Selection is by file (every test file that names
+    # `needs_browser`), because the mark is a skipif and not a registered marker, so `-m` cannot pick it.
+    # The job fails if that selection is empty, if nothing was collected, or if ANY test skips.
+    # One job ran every file in series and was within a few minutes of its 40 minute limit (35m42s on 10-29, then
+    # over it once the sign-attempt tests joined), so the files are dealt round-robin into three shards: each
+    # shard keeps the same rules (selection by file, nothing collected fails, any skip fails).
+    name: cockpit browser tests (Python 3.13, shard ${{ matrix.shard }})
+    needs: gate
+    # The gate exists only on a main push, so on every other run it is skipped and these jobs run; a failed, errored or
+    # cancelled gate runs them too (fail closed: any doubt is a test). Only a gate that succeeded and said skip skips them.
+    if: ${{ always() && !cancelled() && !(needs.gate.result == 'success' && needs.gate.outputs.skip == 'true') }}
+    # Pinned because ubuntu-latest moved to ubuntu-26.04, whose sudo/bash/python differ; revisit when the tests are made to pass on it.
+    runs-on: ubuntu-24.04
+    timeout-minutes: 40
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [0, 1, 2]
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.13"
+          cache: pip
+          cache-dependency-path: pyproject.toml
+
+      - name: Set up node
+        uses: actions/setup-node@v6
+        with:
+          node-version: "22"
+
+      - name: Install Chrome
+        id: chrome
+        # third-party action pinned to the commit its v2.2.0 tag named on 2026-10-22; Chrome pinned to the build the
+        # first run of this job resolved from `stable`, so an unchanged commit tests against the same browser
+        uses: browser-actions/setup-chrome@48ad923757ca74d66703209fe939badbdf80f2f4
+        with:
+          chrome-version: "156.0.8078.47"
+
+      - name: Let Chrome use its sandbox
+        # The runner's AppArmor refuses the unprivileged user namespace Chrome's sandbox needs, and the
+        # page driver's flags (tests/chrome_flags.json) do not pass --no-sandbox. This lifts the
+        # restriction on the throwaway runner VM, the same remedy the linux-live job applies for bwrap.
+        run: sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+
+      - name: Install package
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e ".[dev,openhands]" hatchling
+
+      - name: Run the browser tests
+        # basetemp outside $HOME, as in the pytest job above (tests/test_hermetic_home.py)
+        env:
+          CHROME: ${{ steps.chrome.outputs.chrome-path }}
+          LEVAIN_TEST_WAIT_SCALE: "2"      # one scale for every wait the tests and the page driver make (tests/_waits.py)
+        run: |
+          echo "Chrome: $CHROME"
+          "$CHROME" --version
+          node --version
+          all=$(grep -l needs_browser tests/*.py | sort)
+          test -n "$all" || { echo "no test file names needs_browser"; exit 1; }
+          files=$(echo "$all" | awk -v k=${{ matrix.shard }} '(NR-1)%3==k')
+          echo "shard ${{ matrix.shard }} of 3:"
+          echo "$files"
+          test -n "$files" || { echo "shard ${{ matrix.shard }} holds no test file"; exit 1; }
+          set -o pipefail
+          pytest -q -rs --basetemp=/tmp/levain-pt $files 2>&1 | tee browser.log
+          # ANY skip is a failure here, whatever its reason: the whole point of this job is that these tests run
+          if grep -q -E "^SKIPPED|[0-9]+ skipped" browser.log; then
+            echo "a test skipped in the browser job (reasons above, from -rs)"
+            exit 1
+          fi
+
+      - name: Keep what the page showed at a failed wait
+        # the page driver writes timeout-step-<n>.png / .txt beside its steps file, under pytest's basetemp; reading them is how a
+        # lost-event failure is told from a slow one
+        if: failure()
+        # action pinned to the commit its v7.0.2 tag named on 2026-10-31 (gh api repos/actions/upload-artifact/git/ref/tags/v7.0.2)
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
+        with:
+          name: page-timeouts-browser-shard${{ matrix.shard }}
+          path: |
+            /tmp/levain-pt/**/timeout-step-*.png
+            /tmp/levain-pt/**/timeout-step-*.txt
+          if-no-files-found: ignore
+
+  isolation:
+    # `levain setup-isolation` for real: create the hands user, check the uid gate, undo. Only on
+    # throwaway runners (passwordless sudo); this is the only place the Linux setup is exercised.
+    name: setup-isolation e2e (${{ matrix.os }})
+    needs: gate
+    # The gate exists only on a main push, so on every other run it is skipped and these jobs run; a failed, errored or
+    # cancelled gate runs them too (fail closed: any doubt is a test). Only a gate that succeeded and said skip skips them.
+    if: ${{ always() && !cancelled() && !(needs.gate.result == 'success' && needs.gate.outputs.skip == 'true') }}
+    # Pinned because ubuntu-latest moved to ubuntu-26.04, whose sudo/bash/python differ; revisit when the tests are made to pass on it.
+    runs-on: ${{ matrix.os == 'ubuntu-latest' && 'ubuntu-24.04' || matrix.os }}
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: pyproject.toml
+
+      - name: Install package
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e .
+
+      - name: Install the ACL tools (Linux)
+        if: runner.os == 'Linux'
+        run: command -v setfacl || (sudo apt-get update && sudo apt-get install -y acl)
+
+      - name: Set up, check and undo isolation
+        run: bash tests/ci/isolation_e2e.sh
+
+  chat-egress-srt:
+    # The CH-D2 bump gate: the srt-marked chat-egress tests RUN against the srt that `levain chat setup` installs
+    # (`npm ci --ignore-scripts` of the shipped lockfile), on both OSes the product runs on: srt's macOS (seatbelt)
+    # and Linux (bubblewrap) paths are different code. The `test` job skips these tests (no node, no srt there).
+    # The job fails if any test of the marker skips, whatever the reason: a gate that skips is not a gate.
+    # Deselected, and not part of this gate: chat_egress_network (conftest skips it whenever CI is set) and
+    # chat_egress_slow (the minutes-long git dumps, skipped in CI unless CHD2_SLOW=1).
+    name: chat egress srt (${{ matrix.os }})
+    needs: gate
+    # The gate exists only on a main push, so on every other run it is skipped and these jobs run; a failed, errored or
+    # cancelled gate runs them too (fail closed: any doubt is a test). Only a gate that succeeded and said skip skips them.
+    if: ${{ always() && !cancelled() && !(needs.gate.result == 'success' && needs.gate.outputs.skip == 'true') }}
+    # Pinned because ubuntu-latest moved to ubuntu-26.04, whose sudo/bash/python differ; revisit when the tests are made to pass on it.
+    runs-on: ${{ matrix.os == 'ubuntu-latest' && 'ubuntu-24.04' || matrix.os }}
+    timeout-minutes: 40
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-latest, ubuntu-latest]
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: pyproject.toml
+
+      - name: Set up node
+        uses: actions/setup-node@v6
+        with:
+          node-version: "26"
+
+      - name: Install srt's OS dependencies (Linux)
+        # bubblewrap, socat and ripgrep are the Linux list in srt's README
+        # (https://github.com/anthropic-experimental/sandbox-runtime, "Dependencies for srt"); the same page says
+        # Ubuntu 24.04+ must lift kernel.apparmor_restrict_unprivileged_userns, which strips capabilities from a
+        # user namespace. Lifted on the throwaway runner VM, the remedy the linux-live and browser jobs apply.
+        if: runner.os == 'Linux'
+        run: |
+          sudo timeout 300 apt-get -o Acquire::Retries=3 update -q || true
+          sudo timeout 300 apt-get -o Acquire::Retries=3 install -y -q bubblewrap socat ripgrep
+          sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+          bwrap --version
+          command -v socat
+          socat -V >/dev/null
+          rg --version
+
+      - name: Install srt's OS dependencies (macOS)
+        # macOS sandboxes with the OS's built-in tool; the same README lists ripgrep for the deny-path scan.
+        if: runner.os == 'macOS'
+        run: |
+          brew install ripgrep
+          rg --version
+
+      - name: Install package
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e ".[dev,openhands]" hatchling
+
+      - name: Install uv
+        # tests/chat_egress/composed/test_k1_corpus.py runs a real `uv` client through the egress rig; without uv the
+        # case skips and the zero-skips step below fails the job. Pinned to an exact version.
+        run: python -m pip install uv==0.13.5
+
+      - name: Install srt the way users do
+        # `levain chat setup` is the entry users run: the Node floor check, then `npm ci --ignore-scripts` of the
+        # shipped lock into $LEVAIN_HOME/chat-node, the vendor check and the stamp.
+        run: |
+          echo "LEVAIN_HOME=$RUNNER_TEMP/levain-home" >> "$GITHUB_ENV"
+          LEVAIN_HOME="$RUNNER_TEMP/levain-home" levain chat setup
+          echo "CHD2_SRT_DIST=$RUNNER_TEMP/levain-home/chat-node/node_modules/@anthropic-ai/sandbox-runtime" >> "$GITHUB_ENV"
+
+      - name: Run the srt-marked tests
+        run: |
+          node --version
+          pytest -q -rs -m "chat_egress_srt and not chat_egress_network and not chat_egress_slow" \
+            --junitxml="$RUNNER_TEMP/chat-egress-srt.xml" tests/chat_egress
+
+      - name: Assert the marker ran with zero skips
+        # always(): a skip does not fail pytest, so this is the step that fails it; on a pytest failure it still
+        # prints the counts. A missing junit file (pytest never wrote one) fails here too.
+        if: always()
+        run: python tests/ci/junit_no_skips.py "$RUNNER_TEMP/chat-egress-srt.xml"

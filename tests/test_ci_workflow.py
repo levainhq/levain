@@ -104,37 +104,52 @@ def evaluate_job_if(cond, results, outputs, event, ref, cancelled=False):
     return value
 
 
-def _needs(name):
-    needs = JOBS[name].get("needs") or []
+def _needs(name, jobs=None):
+    needs = (jobs or JOBS)[name].get("needs") or []
     return [needs] if isinstance(needs, str) else list(needs)
 
 
-def _topological():
+def _ancestors(name, jobs=None):
+    """Every job `name` depends on, directly or through other jobs' `needs`."""
+    found, stack = set(), list(_needs(name, jobs))
+    while stack:
+        d = stack.pop()
+        if d not in found:
+            found.add(d)
+            stack.extend(_needs(d, jobs))
+    return found
+
+
+def _topological(jobs=None):
     order, seen = [], set()
 
     def visit(n):
         if n in seen:
             return
         seen.add(n)
-        for d in _needs(n):
+        for d in _needs(n, jobs):
             visit(d)
         order.append(n)
 
-    for n in JOBS:
+    for n in jobs or JOBS:
         visit(n)
     return order
 
 
-def simulate(event, ref, gate_outcome=None, skip="", cancelled=False):
+def simulate(event, ref, gate_outcome=None, skip="", cancelled=False, jobs=None):
     """Propagate job results through `needs` in topological order. A job whose condition holds RUNS and succeeds (the
     suite is assumed green: this tests whether the job runs, not whether the code passes). The gate's outcome is only
-    consulted when its own `if` lets it run. Returns {job: 'success' | 'skipped' | gate_outcome}."""
+    consulted when its own `if` lets it run. Returns {job: 'success' | 'skipped' | gate_outcome}.
+    The implicit success() of a job whose `if` has no status function looks at EVERY ancestor in its needs chain, not
+    only its direct needs: run 42524643315 skipped the pytest matrix while its direct need (`plan`) succeeded, because
+    `plan`'s own need (`gate`) was skipped."""
+    jobs = jobs or JOBS
     results, outputs = {}, {}
-    for n in _topological():
-        cond = JOBS[n].get("if")
+    for n in _topological(jobs):
+        cond = jobs[n].get("if")
         expr = cond or ""
         has_status_fn = bool(STATUS_FN.search(expr))
-        implicit = has_status_fn or (not cancelled and all(results[d] == "success" for d in _needs(n)))
+        implicit = has_status_fn or (not cancelled and all(results[d] == "success" for d in _ancestors(n, jobs)))
         runs = implicit and evaluate_job_if(cond, results, outputs, event, ref, cancelled)
         if not runs:
             results[n] = "skipped"
@@ -203,6 +218,30 @@ def test_the_simulation_detects_a_job_that_would_inherit_the_skip():
         assert simulate("push", "refs/heads/seat/x")["plan"] == "skipped"
     finally:
         JOBS["plan"]["if"] = saved
+
+
+def _fixture_jobs(name):
+    return yaml.safe_load((Path(__file__).resolve().parent / "ci" / name).read_text())["jobs"]
+
+
+def _suite_skipped_on_seat_push(jobs):
+    results = simulate("push", "refs/heads/seat/x", jobs=jobs)
+    return [n for n in jobs if n not in NO_TESTS and results[n] != "success"]
+
+
+def test_the_workflow_as_run_in_42524643315_is_caught():
+    # The `test` job needed `plan` (success) but `plan` needed the skipped `gate`, so the matrix was skipped.
+    assert _suite_skipped_on_seat_push(_fixture_jobs("workflow_before_always_guard.yml")) == ["test"]
+
+
+def test_the_workflow_with_the_always_guard_on_test_is_clean():
+    assert _suite_skipped_on_seat_push(_fixture_jobs("workflow_with_always_guard.yml")) == []
+
+
+def test_a_plan_refactored_to_drop_always_is_caught():
+    jobs = yaml.safe_load(yaml.safe_dump(_fixture_jobs("workflow_with_always_guard.yml")))
+    jobs["plan"]["if"] = "${{ needs.gate.result != 'success' || needs.gate.outputs.skip != 'true' }}"
+    assert "plan" in _suite_skipped_on_seat_push(jobs)
 
 
 def test_a_main_push_neither_cancels_nor_is_cancelled_by_another_main_push():
