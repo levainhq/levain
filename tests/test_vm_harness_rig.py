@@ -101,3 +101,17 @@ def test_the_rig_patch_wires_both_fixes(tmp_path):
     out = tmp_path / "up"
     rig_stage.stage_rig_files(work / "rig", out, CANON_FILE.read_bytes())
     assert (out / "fire_fakeclaude.c").read_bytes() == CANON_FILE.read_bytes()
+
+
+def test_stage_into_a_reused_dir_drops_files_an_earlier_revision_left(tmp_path):
+    # revert: the clearing loop at the top of rig_stage.stage_rig_files (a helper removed from the rig would still ship)
+    canon_bytes = CANON_FILE.read_bytes()
+    up = tmp_path / "up"
+    up.mkdir()
+    (up / "removed_helper.sh").write_text("echo old\n")
+    (up / "g_vm.py").write_text("x = 0   # an older revision\n")
+    (up / "link_helper").symlink_to(up / "removed_helper.sh")
+    out = rig_stage.stage_rig_files(_fake_rig(tmp_path), up, canon_bytes)
+    assert {p.name for p in out} == {"g_vm.py", "fire_fakeclaude.c", "rig_seed.py"}
+    assert not (up / "removed_helper.sh").exists() and not (up / "link_helper").is_symlink()
+    assert (up / "g_vm.py").read_text() == "x = 1\n"

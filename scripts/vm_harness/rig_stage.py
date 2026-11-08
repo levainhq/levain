@@ -30,6 +30,9 @@ def stage_rig_files(rig_dir: Path, dest: Path, canonical: bytes) -> list[Path]:
     """Copy the rig's files into ``dest`` (not ``__*``, never a stale ``fire_fakeclaude.c``), then write the canonical C
     source and ``rig_seed.py``. Returns the staged paths, sorted; verified by :func:`check_staged` before returning."""
     dest.mkdir(parents=True, exist_ok=True)
+    for old in dest.iterdir():     # a reused dir keeps nothing from an earlier revision: only this call's files ship
+        if not old.name.startswith("__") and (old.is_symlink() or old.is_file()):
+            old.unlink()
     for p in sorted(Path(rig_dir).iterdir()):
         if p.name.startswith("__") or p.name in (FAKE_NAME, SEED_NAME) or not p.is_file():
             continue

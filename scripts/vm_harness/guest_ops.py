@@ -74,7 +74,8 @@ def _slot_states() -> list[tuple[str, object]]:
     out = []
     for p in sorted(glob.glob(f"{SLOTS}/*/state")):
         d = p.split("/")[-2]
-        st = parse_slot_state(open(p, "rb").read())
+        with open(p, "rb") as f:
+            st = parse_slot_state(f.read())
         if st.slot.tag != d:
             raise ValueError(f"{p} names slot {st.slot.tag}")
         out.append((d, st))
