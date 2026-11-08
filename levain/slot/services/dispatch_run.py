@@ -1257,6 +1257,10 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             try:
                 brokered = (server.brokered, _bind(Path(a.socket).parent / BROKERED_SOCKET_NAME))
             except Refused:
+                # `socket-path-not-ours`: something not ours (not a socket, or another uid's) sits at the brokered
+                # path inside the run server's own directory. That is an unsafe install, not a busy port, so the whole
+                # service refuses (fail closed, EX_CONFIG) rather than serve run.sock beside it; ON taking OFF down is
+                # accepted on this one path (PRE-W L3 r1)
                 raise
             except OSError as exc:
                 # ON never takes OFF's server down (PRE-W L2): the passthrough socket serves alone, as with the
