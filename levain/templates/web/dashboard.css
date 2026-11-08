@@ -935,8 +935,10 @@
   /* OPAQUE to its own bottom edge (matches the .modal card-top var(--card-2)) so scrolled
      rows pass cleanly UNDER the pinned bar — a translucent tail let the first episode
      bleed through (the operator's visual gate + L2 MED-2). Matches the grid bar's opaque rule. */
-  .modal-body .ep-search { position: sticky; top: 0; z-index: 2; margin: 0 0 var(--sp-3);
-    padding: var(--sp-2) 0 var(--sp-4); background: var(--card-2); }
+  .modal-body .ep-search { position: sticky; top: calc(var(--sp-1) * -1); z-index: 2; margin: calc(var(--sp-1) * -1) 0 var(--sp-3);
+    padding: calc(var(--sp-2) + var(--sp-1)) 0 var(--sp-4); background: var(--card-2); }
+  /* the body pads its content edge, and a sticky bar pins at that edge: the bar reaches up over the padding so no row
+     scrolls visibly in the strip above it (the padding it gives back keeps the field where it was) */
   .modal-body .ep-search-input { flex-basis: 280px; font-size: var(--fs-lead); padding: var(--sp-3) var(--sp-4); }
   .modal-body .ep-search-status { font-size: var(--fs-micro); }
 
@@ -2615,6 +2617,8 @@ body.ke [data-ck-panel="tray"] .row .verb-actions > .verb-btn:not(.verb-more) { 
 /* the "N more" foot of a work list that folds its lower rows (dashboard_core.js foldRows) */
 body.ke .panel > .more-foot { align-self: center; flex: none; margin: 0 0 var(--sp-4); padding: var(--sp-1) var(--sp-5); border: 0; background: none; color: var(--label); font: var(--fw-medium) var(--fs-meta)/1.4 var(--sans); text-decoration: underline; text-underline-offset: 3px; cursor: pointer; }
 body.ke .panel > .more-foot:hover, body.ke .panel > .more-foot:focus-visible { color: var(--text); }
+/* the List card's one control is a touch target at every width (a landscape phone, an iPad), not only under 720px */
+body.ke [data-ck-panel="tray"] .more-foot[data-list-more] { min-height: var(--hit-min); display: inline-flex; align-items: center; justify-content: center; }
 /* the Crystallized panel's "Read all" starts where its content does */
 body.ke .ck-zgrid .ck-mem-crys > .more-foot { padding-inline: var(--sp-6); margin-bottom: var(--sp-4); }
 

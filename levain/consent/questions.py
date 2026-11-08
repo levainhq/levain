@@ -162,6 +162,9 @@ class Question:
     # open long enough to also list under "you". Both are the host's data, passed through: levain never classifies or ages a row
     section: str = ""
     carried: bool = False
+    # the instant (an ISO timestamp with a zone, as ``filed_at``) the row last entered its section: the host's refile clock, which
+    # its own age and its ``carried`` flag run from. "" = the host sends none and the age counts from ``filed_at``. Passed through
+    section_since: str = ""
     # the day the operator deferred this question to (``YYYY-MM-DD``, local; the newest ``question_snoozes`` row of a
     # native store, flow's ``snoozed_until`` field of a host's), and a host row's own date (flow's ``dated``; a native
     # question has none). Neither closes, renumbers or re-versions the question: the band reads them through

@@ -75,6 +75,20 @@ def _band_cards(question_store: Any) -> tuple[list[dict[str, Any]], str | None]:
             lat = band_view.later_of(question_store, q, numbers.get(ref))
             if lat is not None:       # a snoozed question: one collapsed LATER card, no blocks (row 131)
                 card.update(later=lat[0], later_label=_text(lat[1]), blocks="")
+                words = band_view.later_facets(question_store, q)
+                if words is not None:
+                    card["later_words"] = words[1]
+            # the host's own band section and carried flag, passed through as data (levain never classifies a row); a
+            # store with none (the kernel's own, an older host) sets nothing, and the row is a needs-you row as before
+            section = getattr(q, "section", "")
+            if section in ("you", "desk"):
+                card["section"] = section
+                carried = getattr(q, "carried", None)
+                if isinstance(carried, bool):      # a real bool only, and only beside a section it qualifies
+                    card["carried"] = carried
+            since = getattr(q, "section_since", "")
+            if isinstance(since, str) and since:      # the host's own age clock for this row, when it sends one
+                card["since"] = since
         cards.append(card)
     return cards, None
 

@@ -8,6 +8,7 @@ surface chips filter the rows; Open loops is off the default Board tab and on Bu
 from __future__ import annotations
 
 import json
+import re
 import os
 from pathlib import Path
 from typing import Any
@@ -273,13 +274,16 @@ _MQ_SPY = ("(function(){const o=window.matchMedia.bind(window);window.__mqAdds=0
            "m.addEventListener=function(t,f,c){window.__mqAdds++;return a(t,f,c);};}return m;};})()")
 
 _LISTFIX_PROBE = f"""(() => {{
-  const T = {TRAY}; const rows = [];
-  for (const row of T.querySelectorAll('.sp-results .row')) {{
+  const T = document.querySelector('#levain-modal .modal-body') || {TRAY}; const rows = [];
+  const grab = () => {{ for (const row of T.querySelectorAll('.sp-results .row')) {{
     const clause = row.querySelector('.clause');
     const meta = row.querySelector('.list-meta') || row;
     rows.push({{t: (clause ? clause.textContent : '').slice(0, 24), surface: row.dataset.surface || '',
       pills: [...meta.querySelectorAll('.k7-repo')].map(p => p.textContent), all: row.querySelectorAll('.k7-repo').length}});
-  }}
+  }} }};
+  grab();                                                   // the rows under "all", then the held ones under their own chip
+  const held = T.querySelector('.list-surface-chip[data-surface="held"]');
+  if (held) {{ held.click(); grab(); }}
   return JSON.stringify({{rows}});
 }})()"""
 
@@ -309,7 +313,11 @@ def test_listfix2_one_pill_one_listener_and_known_origins_only(tmp_path: Path) -
             {"until": f"window.LevainSky && window.LevainSky.repos().includes('levain') && {TRAY} && "
                       f"[...{TRAY}.querySelectorAll('.sp-results .row')].some(r => (r.querySelector('.clause')||{{}}).textContent "
                       f"&& r.querySelector('.clause').textContent.startsWith('levain:') && r.querySelector('.k7-repo')) && 1"},
+            # held rows are listed in the focus view only (the card names them in its one control): read the rows there
+            {"eval": f"{TRAY}.querySelector('.pexpand').click(); 1"},
+            {"until": "document.querySelector('#levain-modal .list-surface-chip[data-surface=\"held\"]') && 1"},
             {"eval": _LISTFIX_PROBE},
+            {"eval": "document.querySelector('#levain-modal .modal-close').click(); 1"},
             {"eval": "JSON.stringify({adds: window.__mqAdds})"},
             # rebuild the List the way the page does on a refresh: the tab coming back
             *[{"eval": "document.dispatchEvent(new Event('visibilitychange')); 1"} for _ in range(6)],
@@ -344,3 +352,302 @@ def test_listfix2_one_pill_one_listener_and_known_origins_only(tmp_path: Path) -
     assert vals[3]["ph"].startswith("@mon 9am call · "), vals[3]                 # narrow at 390
     assert vals[4]["ph"].startswith("@mon 9am call X  ·  "), vals[4]               # wide again after the width change
     assert not bad, bad
+
+
+# --- listpanel (levain 73, key 1108-37): the focus view's sticky filter bar is solid; the panel's held toggle shows the held rows ---
+
+_BAR_PROBE = """(() => {
+  const mb = document.querySelector('#levain-modal .modal-body');
+  const bar = mb && mb.querySelector('.ep-search');
+  if (!bar) return JSON.stringify({err: 'no bar'});
+  const cs = getComputedStyle(bar);
+  // a colour with an alpha channel names it after a "/" (oklch, color-mix) or as the 4th rgba part; none named is opaque
+  const m = /(?:\\/\\s*|rgba\\([^,)]*,[^,)]*,[^,)]*,\\s*)([0-9.]+%?)/.exec(cs.backgroundColor);
+  const alpha = m ? (m[1].endsWith('%') ? parseFloat(m[1]) / 100 : parseFloat(m[1])) : 1;
+  return JSON.stringify({bg: cs.backgroundColor, alpha,
+    pos: cs.position, bottom: cs.borderBottomWidth, scrolled: mb.scrollTop, max: mb.scrollHeight - mb.clientHeight,
+    gap: bar.getBoundingClientRect().top - mb.getBoundingClientRect().top, pad: getComputedStyle(mb).paddingTop});
+})()"""
+
+
+@needs_browser
+def test_listpanel_141_the_focus_views_sticky_filter_bar_is_opaque(tmp_path: Path) -> None:
+    root, src, _ids = _install(tmp_path)
+    _seed_more(root)
+    _seed_phone(root)
+    shots = Path(os.environ.get("LEVAIN_LIST_SHOTS") or tmp_path)
+    shots.mkdir(parents=True, exist_ok=True)
+    with _serve(src, write_token=TOKEN, surface_tokens={"browser": TOKEN}, install_class="reported") as (url, _httpd):
+        out = _drive(tmp_path, f"{url}/", [
+            {"emulate": {"w": 390, "h": 844, "dpr": 3, "mobile": True}},
+            *_reload(),
+            {"until": f"{TRAY} && {TRAY}.querySelectorAll('.sp-results .row[data-surface=band]').length > 1 && 1"},
+            {"eval": f"{TRAY}.querySelector('.pexpand').click(); 1"},
+            {"until": "document.querySelector('#levain-modal .modal-body .sp-results .row') && 1"},
+            {"eval": "new Promise(r => setTimeout(() => r(1), 900))"},       # the dialog's fade settles before anything is read or shot
+            {"eval": "(() => { const mb = document.querySelector('#levain-modal .modal-body'); mb.scrollTop = Math.floor((mb.scrollHeight - mb.clientHeight) / 2); return 1; })()"},
+            {"eval": _BAR_PROBE},
+            {"shot": str(shots / "listpanel_141_after.png")},
+        ])
+    got = json.loads(next(x for x in out["values"] if isinstance(x, str) and x.startswith("{") and "pos" in x or isinstance(x, str) and "err" in x))
+    assert "err" not in got, got
+    assert got["pos"] == "sticky", got
+    assert got["max"] > 0 and got["scrolled"] > 0, got                 # rows really pass under the bar
+    assert got["alpha"] == 1 and got["bg"] != "rgba(0, 0, 0, 0)" and got["bg"] != "transparent", got
+    assert got["gap"] <= 0.5, got                                      # and it pins flush: no strip above it where a row shows
+
+
+# --- 531 round 4 (levain 73, key 1108-37): desk-owed and LATER rows have their own groups; the card has ONE control ------------
+
+
+def _host_band(monkeypatch: Any, *, all_desk: bool = False) -> None:
+    """The band as flow's adapter fills it: a "desk:" row is the desk's (section desk; "desk: carried" is one open > 24h, flow's
+    `carried`), a "levain: TUE" row comes back on a later day, every other row is the operator's (section you)."""
+    from dataclasses import replace
+    from datetime import date, timedelta
+
+    from levain import band_view
+
+    real = band_view._read
+    later = (date.today() + timedelta(days=3)).isoformat()
+
+    def read(store: Any) -> Any:
+        items, numbers, closed = real(store)
+        out = []
+        for ref, q in items:
+            if q is not None:
+                what = str(q.what)
+                q = replace(q, section="desk" if all_desk or what.startswith("desk:") else "you", carried=what.startswith("desk: carried") and not all_desk,
+                            snoozed_until=later if what.startswith(("levain: TUE", "desk: carried")) else None)   # a carried desk row with a date is still due now
+            out.append((ref, q))
+        return out, numbers, closed
+
+    monkeypatch.setattr(band_view, "_read", read)
+
+
+_CARD_PROBE = f"""(() => {{
+  const T = {TRAY};
+  const rows = [...T.querySelectorAll('.sp-results .row')].filter(r => r.style.display !== 'none' && r.getClientRects().length);
+  const text = (r) => (r.querySelector('.clause') || {{}}).textContent || '';
+  const foot = [...T.querySelectorAll('.more-foot, .held-toggle, .held-line, .xmore')].filter(n => !n.hidden && n.getClientRects().length);
+  return JSON.stringify({{shown: rows.map(text), more: foot.map(n => n.className + ' | ' + n.textContent.trim()),
+    heldToggles: T.querySelectorAll('[data-held-toggle]').length,
+    chips: [...T.querySelectorAll('.list-surface-chip')].map(c => c.textContent),
+    head: (T.querySelector('.ck-count') || {{}}).textContent}});
+}})()"""
+
+_FOCUS_PROBE = """(() => {
+  const mb = document.querySelector('#levain-modal .modal-body');
+  const heads = [...mb.querySelectorAll('.grp-head')].map(h => h.textContent.trim());
+  const group = (title) => { const h = [...mb.querySelectorAll('.grp-head')].find(x => x.textContent.trim().startsWith(title));
+    const col = h && h.parentElement; return col ? [...col.querySelectorAll('.row .clause')].map(c => c.textContent.slice(0, 20)) : null; };
+  return JSON.stringify({heads, desk: group('Desk owes'), later: group('Later'), needs: group('Needs you'),
+    held: [...mb.querySelectorAll('.row[data-held="1"]')].length, toggles: mb.querySelectorAll('[data-held-toggle], .held-toggle').length,
+    chips: [...mb.querySelectorAll('.list-surface-chip')].map(c => c.textContent),
+    title: document.querySelector('#levain-modal-title').textContent});
+})()"""
+
+
+_BAND_CHIP_PROBE = """(() => {
+  const mb = document.querySelector('#levain-modal .modal-body');
+  const chip = mb.querySelector('.list-surface-chip[data-surface="band"]');
+  const rows = [...mb.querySelectorAll('.sp-results .row')].filter(r => r.getClientRects().length);
+  return JSON.stringify({count: parseInt(chip.textContent.trim().split(' ').pop(), 10), rows: rows.length,
+    texts: rows.map(r => ((r.querySelector('.clause') || {}).textContent || '').slice(0, 20)),
+    heads: [...mb.querySelectorAll('.grp-head')].map(h => h.textContent.trim())});
+})()"""
+
+
+@needs_browser
+def test_r4_the_card_holds_due_rows_and_one_control_and_the_focus_view_every_group(tmp_path: Path, monkeypatch: Any) -> None:
+    root, src, _ids = _install(tmp_path)
+    _seed_more(root)
+    _seed_phone(root)
+    from levain.consent.questions import QuestionStore
+    QuestionStore(default_queue_dir()).file(agent="claude_code", agent_session_id="s9", what="One look on your iPhone once the List is fixed.",
+                                            options=[("ship", "Ship it"), ("hold", "Hold")], rec="hold", blocks="his look", cwd="/w/levain")
+    QuestionStore(default_queue_dir()).file(agent="claude_code", agent_session_id="s8", what="desk: carried Launch the TAOSERV upgrade seat before Monday 20:00.",
+                                            options=[("ship", "Ship it"), ("hold", "Hold")], rec="hold", blocks="the upgrade", cwd="/w/taoserv")
+    _host_band(monkeypatch)
+    with _serve(src, write_token=TOKEN, surface_tokens={"browser": TOKEN}, install_class="reported") as (url, _httpd):
+        out = _drive(tmp_path, f"{url}/", [
+            {"emulate": {"w": 390, "h": 844, "dpr": 3, "mobile": True}},
+            {"eval": "localStorage.removeItem('levain.tray.showHeld'); 1"},
+            *_reload(),
+            {"until": f"{TRAY} && {TRAY}.querySelectorAll('.sp-results .row[data-surface=band]').length > 0 && 1"},
+            {"eval": "new Promise(r => setTimeout(() => r(1), 900))"},
+            {"eval": _CARD_PROBE},
+            {"eval": f"{TRAY}.querySelector('[data-list-more]') ? ({TRAY}.querySelector('[data-list-more]').click(), 1) : 0"},
+            {"until": "document.querySelector('#levain-modal .modal-body .sp-results .row') && 1"},
+            {"eval": "new Promise(r => setTimeout(() => r(1), 900))"},
+            {"eval": _FOCUS_PROBE},
+            {"eval": "document.querySelector('#levain-modal .list-surface-chip[data-surface=\"band\"]').click(); 1"},
+            {"eval": "new Promise(r => setTimeout(() => r(1), 500))"},
+            {"eval": _BAND_CHIP_PROBE},
+        ])
+    vals = [json.loads(x) for x in out["values"] if isinstance(x, str) and x.startswith("{")]
+    card, focus, band = vals[0], vals[1], vals[2]
+    # the band chip's number is the number of rows its tap shows: no desk-owes or later rows, no carried copy
+    assert band["rows"] == band["count"] and band["rows"] > 0, band
+    assert not any(t.startswith(("desk: Write", "levain: TUE")) for t in band["texts"]), band
+    assert not any(h.startswith(("Desk owes", "Later")) for h in band["heads"]), band
+    assert not any((t.startswith("desk:") and not t.startswith("desk: carried")) or t.startswith("levain: TUE") for t in card["shown"]), card   # not the operator's, not due
+    assert any(t.startswith("desk: carried") for t in card["shown"]), card      # a CARRIED desk row is needs-you, as flow's footer lists it
+    assert len(card["more"]) == 1 and card["heldToggles"] == 0, card                                    # ONE control, no held toggle
+    assert "desk owes 2" in card["more"][0] and "later 1" in card["more"][0] and "held" in card["more"][0], card
+    assert focus["desk"] and focus["desk"][0].startswith("desk:"), focus                                 # the desk's row under its heading
+    assert focus["later"] and focus["later"][0].startswith("levain: TUE"), focus                         # the later row under LATER
+    assert focus["needs"] and not any(t.startswith(("levain: TUE", "desk: Write")) for t in focus["needs"]), focus
+    assert any(t.startswith("desk: carried") for t in focus["needs"]), focus                             # the carried one is under Needs you
+    assert focus["held"] == 0 and focus["toggles"] == 0, focus                                           # held rows are in no group and no "all": their own chip
+    # ONE rule for "all": each view's header and its "all" chip agree, the focus view's follows from the card's (+ the desk's and the
+    # later rows the card names in its control), and held rows stand apart in their own chip
+    num = lambda chips, word: next((int(c.rsplit(" ", 1)[1]) for c in chips if c.startswith(word + " ")), None)
+    assert card["head"] and int(card["head"]) == num(card["chips"], "all"), card
+    assert focus["title"].endswith(f"({num(focus['chips'], 'all')})"), focus
+    desk, later = (int(re.search(rf"{w} (\d+)", card["more"][0]).group(1)) for w in ("desk owes", "later"))
+    carried = 1       # the carried desk row is in the card's "all" already (it is needs-you) and in the control's desk owes
+    assert num(focus["chips"], "all") == num(card["chips"], "all") + (desk - carried) + later, (card, focus)
+    # the control's "desk owes N" is the rows a person sees under Desk owes: the carried row is listed there too, as the footer prints it
+    assert len(focus["desk"]) == desk and len(focus["later"]) == later, focus
+    assert any(t.startswith("desk: carried") for t in focus["desk"]), focus
+    assert num(card["chips"], "spores") == num(focus["chips"], "spores"), (card["chips"], focus["chips"])    # live spores only, in both
+    assert num(card["chips"], "held") is None, card                                                         # the card draws no held rows: its control names them
+    assert num(focus["chips"], "held") == int(re.search(r"(\d+) held", card["more"][0]).group(1)), (card, focus)
+
+
+# --- 531 r4 round 5 (levain 74, key 1108-39): L1+L2 fixes -----------------------------------------------------------------------
+
+_CTL_PROBE = f"""(() => {{
+  const T = {TRAY}; const c = T.querySelector('[data-list-more]');
+  const tags = [...T.querySelectorAll('.sp-results .row')].filter(r => /desk: carried/.test(r.textContent)).map(r => !!r.querySelector('.list-desk-owed') && !/back /.test(r.textContent));
+  return JSON.stringify({{h: c ? c.getBoundingClientRect().height : 0, label: c ? c.getAttribute('aria-label') : null, tags,
+    empty: [...T.querySelectorAll('.sp-results .empty')].map(n => n.textContent)}});
+}})()"""
+
+
+def _carried_install(tmp_path: Path, monkeypatch: Any, *, all_desk: bool = False, spores: bool = True) -> Any:
+    root, src, ids = _install(tmp_path)
+    _seed_more(root)
+    from levain.consent.questions import QuestionStore
+    qs = QuestionStore(default_queue_dir())
+    qs.file(agent="claude_code", agent_session_id="s7", what="One look on your iPhone once the List is fixed.",
+            options=[("ship", "Ship it"), ("hold", "Hold")], rec="hold", blocks="his look", cwd="/w/levain")
+    qs.file(agent="claude_code", agent_session_id="s8", what="desk: carried Launch the TAOSERV upgrade seat before Monday 20:00.",
+            options=[("ship", "Ship it"), ("hold", "Hold")], rec="hold", blocks="the upgrade", cwd="/w/taoserv")
+    qs.file(agent="claude_code", agent_session_id="s6", what="levain: TUE 11-10: read the release essay draft 2.",
+            options=[("ship", "Ship it"), ("hold", "Hold")], rec="hold", blocks="the essay", cwd="/w/levain")
+    qs.file(agent="claude_code", agent_session_id="s9", what="desk: Write the BJE plan.",
+            options=[("ship", "Ship it"), ("hold", "Hold")], rec="hold", blocks="the plan", cwd="/w/bje")
+    if not spores:       # nothing but band rows is left on the card
+        store = SporeStore(root / ".levain" / "memory.spores.json")
+        for sp in store.list_open():
+            store.update(sp["id"], disposition="loop")
+        for key in ("seed", "held", "note"):
+            if store.get(ids[key]):
+                store.update(ids[key], disposition="loop")
+    _host_band(monkeypatch, all_desk=all_desk)
+    return src
+
+
+@needs_browser
+def test_listpanel_r5_the_control_is_44px_at_every_width_has_its_label_and_closing_returns_focus_to_it(tmp_path: Path, monkeypatch: Any) -> None:
+    src = _carried_install(tmp_path, monkeypatch)
+    focus_is_control = "document.activeElement && document.activeElement.hasAttribute('data-list-more')"
+    with _serve(src, write_token=TOKEN, surface_tokens={"browser": TOKEN}, install_class="reported") as (url, _httpd):
+        out = _drive(tmp_path, f"{url}/", [
+            {"emulate": {"w": 1024, "h": 800, "dpr": 1, "mobile": False}},
+            *_reload(),
+            {"until": f"{TRAY} && {TRAY}.querySelector('[data-list-more]') && 1"},
+            {"eval": "new Promise(r => setTimeout(() => r(1), 700))"},
+            {"eval": _CTL_PROBE},
+            {"eval": f"{TRAY}.querySelector('[data-list-more]').click(); 1"},
+            {"until": "document.querySelector('#levain-modal .modal-body .sp-results .row') && 1"},
+            {"eval": "JSON.stringify([...document.querySelectorAll('#levain-modal .grp-head')].map(h => [h.textContent.trim().slice(0, 12), h.getAttribute('role'), h.getAttribute('aria-level')]))"},
+            {"eval": "document.querySelector('#levain-modal .modal-close').click(); new Promise(r => setTimeout(() => r(1), 400))"},
+            {"eval": f"!!({focus_is_control})"},
+        ])
+    wide = json.loads(out["values"][-6])
+    assert wide["h"] >= 44, wide                                                   # a touch target on a tablet / landscape phone too
+    assert wide["label"] and "desk owes 2" in wide["label"] and "open the full list" in wide["label"], wide
+    assert wide["tags"] == [True], wide                                            # the carried row is tagged desk-owed, as the footer tags it
+    heads = json.loads(out["values"][-3])
+    assert heads and all(h[1] == "heading" and h[2] == "3" for h in heads), heads
+    assert {h[0] for h in heads} >= {"Needs you (a", "Desk owes (t", "Later"}, heads
+    assert out["values"][-1] is True, out["values"]                                # focus is back on the control that opened the view
+
+
+@needs_browser
+def test_listpanel_r5_a_card_with_only_desk_and_later_rows_says_nothing_is_due_and_a_search_finds_them_in_the_full_list(tmp_path: Path, monkeypatch: Any) -> None:
+    src = _carried_install(tmp_path, monkeypatch, all_desk=True, spores=False)
+    type_q = lambda q: (f"(() => {{ const i = {TRAY}.querySelector('.ep-search-input'); i.value = {json.dumps(q)}; "
+                        "i.dispatchEvent(new Event('input', {bubbles: true})); return 1; })()")
+    with _serve(src, write_token=TOKEN, surface_tokens={"browser": TOKEN}, install_class="reported") as (url, _httpd):
+        out = _drive(tmp_path, f"{url}/", [
+            {"emulate": {"w": 390, "h": 844, "dpr": 3, "mobile": True}},
+            *_reload(),
+            {"until": f"{TRAY} && {TRAY}.querySelector('[data-list-more]') && 1"},
+            {"eval": "new Promise(r => setTimeout(() => r(1), 700))"},
+            {"eval": _CTL_PROBE},
+            {"eval": type_q("BJE")},
+            {"eval": f"[{TRAY}.querySelector('.sp-results .empty').textContent, !!{TRAY}.querySelector('[data-held-show-matches]')]"},
+            {"eval": f"{TRAY}.querySelector('[data-held-show-matches]').click(); 1"},
+            {"until": "document.querySelector('#levain-modal .modal-body .sp-results .row') && 1"},
+            {"eval": "[...document.querySelectorAll('#levain-modal .sp-results .row .clause')].map(c => c.textContent.slice(0, 18))"},
+        ])
+    card = json.loads(out["values"][-6])
+    assert card["empty"] == ["Nothing due for you."], card                         # never "Nothing yet. Drop a line ..." over the control
+    assert card["h"] > 0, card                                                     # the control is still there
+    note, hint = out["values"][-4]
+    assert "no items match" in note and "in the full list" in note and hint is True, (note, hint)
+    assert any(t.startswith("desk: Write the BJ") for t in out["values"][-1]), out["values"][-1]
+
+
+@needs_browser
+def test_lpr3_one_carried_desk_row_only_is_counted_in_the_control_and_listed_under_desk_owes(tmp_path: Path, monkeypatch: Any) -> None:
+    """A carried desk row is needs-you on the card and counted as ONE desk owes in the control; the focus view lists it under Desk owes
+    too, so the number a person reads is the rows they can see there."""
+    root, src, ids = _install(tmp_path)
+    store = SporeStore(root / ".levain" / "memory.spores.json")
+    for sp in store.list_open():
+        store.update(sp["id"], disposition="loop")
+    from levain.consent.questions import QuestionStore
+    QuestionStore(default_queue_dir()).file(agent="claude_code", agent_session_id="s8", what="desk: carried Launch the TAOSERV upgrade seat.",
+                                            options=[("ship", "Ship it"), ("hold", "Hold")], rec="hold", blocks="the upgrade", cwd="/w/taoserv")
+    _host_band(monkeypatch)
+    with _serve(src, write_token=TOKEN, surface_tokens={"browser": TOKEN}, install_class="reported") as (url, _httpd):
+        out = _drive(tmp_path, f"{url}/", [
+            {"emulate": {"w": 390, "h": 844, "dpr": 2, "mobile": True}},
+            *_reload(),
+            {"until": f"{TRAY} && {TRAY}.querySelector('[data-list-more]') && 1"},
+            {"eval": "new Promise(r => setTimeout(() => r(1), 700))"},
+            {"eval": f"{TRAY}.querySelector('[data-list-more]').textContent"},
+            {"eval": f"{TRAY}.querySelector('[data-list-more]').click(); 1"},
+            {"until": "document.querySelector('#levain-modal .modal-body .sp-results .row') && 1"},
+            {"eval": "new Promise(r => setTimeout(() => r(1), 700))"},
+            {"eval": _FOCUS_PROBE},
+        ])
+    control = next(x for x in out["values"] if isinstance(x, str) and "desk owes" in x)
+    focus = json.loads(next(x for x in out["values"] if isinstance(x, str) and x.startswith('{"heads"')))
+    assert "desk owes 1" in control, control
+    assert focus["desk"] and len(focus["desk"]) == 1 and focus["desk"][0].startswith("desk: carried"), focus
+    assert focus["needs"] and focus["needs"][0].startswith("desk: carried"), focus        # and it is still under Needs you
+
+
+@needs_browser
+def test_lpr3_the_cards_one_control_is_drawn_once_and_not_redrawn_by_its_own_layout(tmp_path: Path, monkeypatch: Any) -> None:
+    """L3 r1 (gemini-2, checked): drawing the control changes the panel's children; nothing observing the board may fold the card again for it,
+    or the button would be replaced on every pass. The same node is still there after the page has been idle."""
+    src = _carried_install(tmp_path, monkeypatch)
+    with _serve(src, write_token=TOKEN, surface_tokens={"browser": TOKEN}, install_class="reported") as (url, _httpd):
+        out = _drive(tmp_path, f"{url}/", [
+            {"emulate": {"w": 390, "h": 844, "dpr": 2, "mobile": True}},
+            *_reload(),
+            {"until": f"{TRAY} && {TRAY}.querySelector('[data-list-more]') && 1"},
+            {"eval": f"window.__m = {TRAY}.querySelector('[data-list-more]'); window.__n = 0; "
+                     f"new MutationObserver((r) => {{ window.__n += r.length; }}).observe({TRAY}, {{childList: true}}); 1"},
+            {"eval": "new Promise(r => setTimeout(() => r(1), 2500))"},
+            {"eval": f"JSON.stringify({{same: window.__m === {TRAY}.querySelector('[data-list-more]'), n: window.__n, count: {TRAY}.querySelectorAll('[data-list-more]').length}})"},
+        ])
+    got = json.loads(out["values"][-1])
+    assert got == {"same": True, "n": 0, "count": 1}, got
