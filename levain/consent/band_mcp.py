@@ -17,6 +17,7 @@ import argparse
 import json
 import os
 import sys
+from pathlib import Path
 from typing import Any
 
 from levain.consent import band
@@ -49,6 +50,17 @@ TOOL: dict[str, Any] = {
             "open": {"type": "boolean",
                      "description": "true files an OPEN question: no options and no rec, answered only in the "
                                     "operator's own words. Default false."},
+            "on": {"type": "string",
+                   "description": "YYYY-MM-DD, after today. Use when you are NOT stopped yet because the date has not "
+                                  "come: no question is filed, ONE agenda spore is written and it reaches the "
+                                  "operator on that date (give what and blocks only; no options, rec or open). Today "
+                                  "or past is refused."},
+            "path": {"type": "string",
+                     "description": "With on: a directory inside the Levain install to file in (default: this "
+                                    "server's working directory)."},
+            "attention": {"type": "string", "enum": ["talk", "none"],
+                          "description": "With on: talk pings the operator on that date; none (default) is a quiet "
+                                         "band row."},
         },
         "required": ["what", "blocks"],
         "additionalProperties": False,
@@ -88,6 +100,12 @@ def _arguments(raw: Any) -> tuple[str, list[tuple[str, str]], str, str, bool]:
     if not isinstance(raw, dict):
         raise _RpcError(INVALID_PARAMS, "arguments must be an object")
     is_open = raw.get("open", False)
+    if raw.get("on") is not None:
+        # an ask with a date files no question: whatever else is given is refused in _ask, not shape-checked here
+        for k in ("what", "blocks"):
+            if not isinstance(raw.get(k), str):
+                raise _RpcError(INVALID_PARAMS, f"{k} must be a string")
+        return raw["what"], [], "", raw["blocks"], False
     if not isinstance(is_open, bool):
         raise _RpcError(INVALID_PARAMS, "open must be true or false")
     need = ("what", "blocks") if is_open else ("what", "options", "rec", "blocks")
@@ -125,8 +143,32 @@ def _meta_session(params: dict[str, Any]) -> str | None:
     return None
 
 
+def _ask_on(raw: dict[str, Any]) -> dict[str, Any]:
+    """``ask`` with ``on`` (TS-11): one agenda spore, no question (:func:`band.file_agenda`)."""
+    on, attention, path = raw["on"], raw.get("attention"), raw.get("path")
+    # `0 == False`, so "not given" is decided by identity: absent, None, false, [] and ""
+    extra = [k for k in ("options", "rec", "open")
+             if k in raw and raw[k] is not None and raw[k] is not False and not (raw[k] == [] or raw[k] == "")]
+    if (not isinstance(on, str) or not (attention is None or isinstance(attention, str))
+            or not (path is None or isinstance(path, str))):
+        raise _RpcError(INVALID_PARAMS, "on, attention and path must be strings")
+    if extra:
+        text = (f"levain ask: refused, nothing was filed: on files no question, so give no {', '.join(extra)}")
+        return {"content": [{"type": "text", "text": text}], "isError": True}
+    item, text = band.file_agenda(raw["what"], raw["blocks"], on, attention,
+                                  start=None if path is None else Path(path))
+    return {"content": [{"type": "text", "text": text}], "isError": item is None}
+
+
 def _ask(agent: str, params: dict[str, Any]) -> dict[str, Any]:
-    what, options, rec, blocks, is_open = _arguments(params.get("arguments"))
+    raw = params.get("arguments")
+    if isinstance(raw, dict) and raw.get("on") is None and (raw.get("attention") is not None
+                                                           or raw.get("path") is not None):
+        return {"content": [{"type": "text", "text": "levain ask: refused, nothing was filed: --attention and --path go "
+                                                     "with --on (attention goes with on)"}], "isError": True}
+    what, options, rec, blocks, is_open = _arguments(raw)
+    if raw.get("on") is not None:
+        return _ask_on(raw)
     session, source = _meta_session(params), _META_SOURCE
     if session is None:
         env = os.environ
