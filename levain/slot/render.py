@@ -46,7 +46,7 @@ from levain.contracts import canon
 from levain.broker import norm as broker_norm
 from levain.broker import policy as broker_policy
 from levain.firing.hands import HostOS
-from levain.sandbox_keys import REPO_CREDENTIAL_SETTINGS, repo_env_rule, LOOSENING_NONEMPTY as _LOOSENING_NONEMPTY, LOOSENING_TRUE as _LOOSENING_TRUE
+from levain.sandbox_keys import repo_env_rule, repo_settings_rule, LOOSENING_NONEMPTY as _LOOSENING_NONEMPTY, LOOSENING_TRUE as _LOOSENING_TRUE
 from levain.slot import Refused
 from levain.slot.bwrap import LEVAIN_BWRAP
 from levain.slot.ids import SlotId, loopback_alias
@@ -1028,8 +1028,8 @@ def repo_loosening_refusals(docs: Mapping[str, Any]) -> list[Refused]:
     ``repo-settings-malformed``),
     and a ``disableAllHooks`` that is anything but ``false`` (L2 M6; DECISION: a non-boolean is refused too, as
     its meaning to CC is unmeasured), and an ``env`` naming the queue's vars, a :data:`PROXY_ENV` name, or a name
-    ``levain.sandbox_keys.repo_env_rule`` refuses by family (PRE-L3 4-1, pf4r2), and a top-level
-    ``apiKeyHelper`` / ``awsCredentialExport`` / ``awsAuthRefresh`` key. A
+    ``levain.sandbox_keys.repo_env_rule`` refuses by family (PRE-L3 4-1, pf4r2), and a top-level key
+    ``levain.sandbox_keys.repo_settings_rule`` refuses (a ``*Helper``, ``*AuthRefresh`` or ``*CredentialExport``). A
     document that is not an object is refused ``repo-settings-malformed``.
     Hooks, permissions and every other key launch (plan §2c 3: the repo's settings are its own).
 
@@ -1045,10 +1045,11 @@ def repo_loosening_refusals(docs: Mapping[str, Any]) -> list[Refused]:
             continue
         if "disableAllHooks" in doc and doc["disableAllHooks"] is not False:
             out.append(_refused("loosening", "disableAllHooks", f"{path}: not false"))
-        # A key that runs a command to produce the API credential moves the billing identity as an env name does.
-        for key in REPO_CREDENTIAL_SETTINGS:
-            if key in doc:
-                out.append(_refused("loosening", key, f"{path}: {key} supplies the run's credential"))
+        # A key that runs a command to produce the API credential moves the billing identity as an env name does;
+        # refused by key pattern (pf4r2), the rule in the detail.
+        for key in sorted((k for k in doc if repo_settings_rule(k)), key=str):
+            out.append(_refused("loosening", str(key),
+                                f"{path}: {key} supplies the run's credential ({repo_settings_rule(key)})"))
         env = doc.get("env", {})
         if not isinstance(env, Mapping):
             out.append(Refused("repo-settings-malformed", f"{path}: env"))

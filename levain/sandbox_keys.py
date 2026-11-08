@@ -11,7 +11,7 @@ them. Each entry is a key path inside ``sandbox``.
 """
 from __future__ import annotations
 
-__all__ = ["repo_env_rule", "REPO_CREDENTIAL_SETTINGS", "LOOSENING_NONEMPTY", "LOOSENING_TRUE"]
+__all__ = ["repo_env_rule", "repo_settings_rule", "LOOSENING_NONEMPTY", "LOOSENING_TRUE"]
 
 #: Keys that must not be ``true``.
 LOOSENING_TRUE = (("allowUnsandboxedCommands",), ("enableWeakerNestedSandbox",),
@@ -69,6 +69,18 @@ def repo_env_rule(name: object) -> str | None:
     return None
 
 
-#: Claude Code settings keys that supply a credential by running a command (the vendor's settings reference lists
-#: each with scope "Any file"); a repo's settings layer naming one is refused, whatever its value.
-REPO_CREDENTIAL_SETTINGS = ("apiKeyHelper", "awsCredentialExport", "awsAuthRefresh")
+#: pf4r2 R2: the endings (compared case-insensitively) of a Claude Code settings key that runs a command to supply a
+#: credential or request headers; the vendor's settings reference documents ``apiKeyHelper``, ``otelHeadersHelper``,
+#: ``awsAuthRefresh``, ``gcpAuthRefresh`` and ``awsCredentialExport`` so, each with scope "Any file". A repo's
+#: settings layer naming such a key is refused, whatever its value; a later provider's sibling is refused by default.
+REPO_SETTINGS_SUFFIXES = ("helper", "authrefresh", "credentialexport")
+
+
+def repo_settings_rule(key: object) -> str | None:
+    """The rule that refuses top-level settings key ``key`` in a repo layer, as text for the refusal's detail
+    (``suffix helper``), or None when it may be set."""
+    k = str(key).casefold()
+    for s in REPO_SETTINGS_SUFFIXES:
+        if k.endswith(s):
+            return "suffix " + s
+    return None

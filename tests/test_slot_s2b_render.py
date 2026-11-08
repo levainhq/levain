@@ -742,15 +742,38 @@ def test_the_credential_name_lists_are_refused_by_the_repo_env_rule():
 
 
 def test_repo_settings_credential_helper_keys_refused():
-    """PRE-L3 fix4 (L1 MED-2, L2 MED-2): a repo settings KEY that supplies a credential by command is refused at the
-    repo layer like the env names, whatever its value."""
+    """PRE-L3 fix4 (L1 MED-2, L2 MED-2), pf4r2 R2 (codex MED): a repo settings KEY that runs a command to supply a
+    credential or request headers is refused at the repo layer, by key pattern (case-insensitive), whatever its
+    value: a ``*Helper``, a ``*AuthRefresh`` or a ``*CredentialExport``."""
     from levain import sandbox_keys as sk
-    assert set(sk.REPO_CREDENTIAL_SETTINGS) == {"apiKeyHelper", "awsCredentialExport", "awsAuthRefresh"}
-    for key in sk.REPO_CREDENTIAL_SETTINGS:
+    cases = {"apiKeyHelper": "suffix helper", "otelHeadersHelper": "suffix helper",
+             "awsAuthRefresh": "suffix authrefresh", "gcpAuthRefresh": "suffix authrefresh",
+             "azureAuthRefresh": "suffix authrefresh",                      # invented: the family, not the list
+             "awsCredentialExport": "suffix credentialexport", "gcpCredentialExport": "suffix credentialexport",
+             "APIKEYHELPER": "suffix helper", "GcpAuthRefresh": "suffix authrefresh"}
+    for key, rule in cases.items():
+        assert sk.repo_settings_rule(key) == rule, key
         for path in (".claude/settings.json", ".claude/settings.local.json"):
             got = rd.repo_loosening_refusals({path: {key: "/bin/sh -c x"}})
             assert [x.name for x in got] == ["loosening:" + rd.wire_name(key)], key
-            assert key in got[0].detail and path in got[0].detail
+            assert key in got[0].detail and path in got[0].detail and rule in got[0].detail
+    for key in ("hooks", "statusLine", "model", "permissions", "forceLoginMethod", "helperText"):
+        assert sk.repo_settings_rule(key) is None, key
+    assert rd.repo_loosening_refusals({".claude/settings.json": {"hooks": {}, "statusLine": {}}}) == []
+
+
+def test_repo_settings_rule_over_the_vendor_reference():
+    """pf4r2 R2: every top-level settings key the vendor's settings reference lets a repo file set (scope ``Any
+    file``, ``Project`` or ``Local``; the index fetched on the date the fixture names) gets the verdict recorded for
+    it. Refused: the keys documented as running a command that supplies a credential or headers."""
+    from levain import sandbox_keys as sk
+    table = json.loads((REPO / "tests/fixtures/claude_code_settings_1108.json").read_text())
+    assert table["fetched"] == "2026-11-08"
+    assert table["source"].startswith("https://code.claude.com/docs/en/settings-reference")
+    got = {k: ("refused" if sk.repo_settings_rule(k) else "allowed") for k in table["verdicts"]}
+    assert got == table["verdicts"]
+    assert sorted(k for k, v in table["verdicts"].items() if v == "refused") == [
+        "apiKeyHelper", "awsAuthRefresh", "awsCredentialExport", "gcpAuthRefresh", "otelHeadersHelper"]
 
 
 def test_supervisor_has_no_second_fold():
