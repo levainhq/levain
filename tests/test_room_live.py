@@ -200,3 +200,39 @@ def test_forget_and_launch_bound():
     assert len(held) == room_live.LAUNCH_MAX and ids[-1] in held
     for i in ids:
         room_live.forget(i)
+
+
+# ---- a REAL capture (haiku, --include-partial-messages, one turn; trimmed and anonymised) --------------------------------
+def test_real_capture_replays_one_agent_text_and_live_grows_then_clears():
+    from pathlib import Path
+    lines = (Path(__file__).parent / "fixtures" / "room_partial_real.jsonl").read_text().splitlines()
+    frames = [json.loads(x) for x in lines]
+    assert not any(f["type"] == "system" for f in frames)
+    s, t = make()
+    t.feed(init())
+    s.read(None)
+    streamed, seen_live, agent_texts, thinking_whole = "", [], [], 0
+    for f in frames:
+        t.feed(f)
+        batch = s.read(None)
+        agent_texts = texts(batch)           # read(None) returns every event so far
+        snap = room_live.snapshot(LID)
+        if f["type"] == "stream_event":
+            d = f["event"].get("delta") or {}
+            if d.get("type") == "text_delta":
+                streamed += d["text"]
+                assert snap is not None and snap["text"] == streamed
+                seen_live.append(len(snap["text"]))
+            elif f["event"]["type"] != "content_block_start":
+                pass
+        if f["type"] == "assistant":
+            blocks = f["message"]["content"]
+            if blocks[0]["type"] == "thinking":
+                thinking_whole += 1
+                assert snap is None and agent_texts == []        # thinking made no live text and no agent_text
+            else:
+                assert snap is None                              # the whole text frame cleared live
+    assert thinking_whole == 1 and len(seen_live) > 10 and seen_live == sorted(seen_live)
+    assert len(set(seen_live)) > 10                              # it grew across the deltas
+    assert len(agent_texts) == 1 and agent_texts[0] == streamed and streamed
+    assert room_live.snapshot(LID) is None
