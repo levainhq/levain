@@ -125,7 +125,8 @@ def signed_withhold(signed: SignedRole, link: SignedLink) -> tuple[str, ...]:
     uids pass one). Raises :class:`SignedRoleRefused` at the first broken link: no link (``link``), an agent that is
     not the link's (``link-agent``), the spec's hash (``spec-hash``), a pinned role that is not the one the link
     names (``link-role``), the role text's hash (``role-hash``), a text that is not its canonical form, or a withhold
-    that is not a list of strings."""
+    that is not a list of strings, not one :func:`levain.agents.role._withhold` would register (over the bound, a
+    duplicate, outside the pattern grammar) or not in its stored sorted order (``withhold``)."""
     if type(link) is not SignedLink:
         raise SignedRoleRefused("link", "no verified link names the role")
     if signed.agent_id != link.agent_id:
@@ -148,7 +149,18 @@ def signed_withhold(signed: SignedRole, link: SignedLink) -> tuple[str, ...]:
     withhold: Any = ceiling.get("withhold", []) if type(ceiling) is dict else []
     if type(withhold) is not list or any(type(p) is not str for p in withhold):
         raise SignedRoleRefused("withhold", "the role's ceiling.withhold is not a list of patterns")
-    return tuple(sorted(withhold))
+    # the registration rule at the point of use (codex L3 batch4b LOW): a hand-authored signed role is held to what
+    # `role._withhold` lets a role register (the bound, the pattern grammar, no duplicates) and to its stored, sorted
+    # form, so a duplicate never compares equal to a normalised launch and the manifest match stays bounded
+    from levain.agents.role import RoleError, _withhold     # role imports this module: resolved at the call
+    try:
+        canon = _withhold(withhold)
+    except RoleError as exc:
+        raise SignedRoleRefused("withhold", f"the role's ceiling.withhold is not one a role can register: "
+                                            f"{str(exc)[:200]}") from None
+    if canon != withhold:
+        raise SignedRoleRefused("withhold", "the role's ceiling.withhold is not in its stored (sorted) order")
+    return tuple(canon)
 
 
 def withhold_problem(signed: tuple[str, ...], launched: tuple[str, ...]) -> tuple[str, str] | None:
@@ -157,6 +169,10 @@ def withhold_problem(signed: tuple[str, ...], launched: tuple[str, ...]) -> tupl
     the snapshot would carry a path the role withholds); a pattern the role never declared is ``withhold-mismatch``
     (more withheld than he signed is not loosening, but it is not the snapshot his signature names, and the digest the
     run records would no longer follow from the role)."""
+    if tuple(sorted(set(signed))) != tuple(signed):
+        # the signed side is compared as its canonical tuple (sorted, each pattern once: what signed_withhold returns);
+        # anything else is not a withhold a signature can name (codex L3 batch4b LOW)
+        return "withhold-mismatch", "the signed withhold is not in its canonical form (sorted, each pattern once)"
     have, want = set(launched), set(signed)
     if want - have:
         return "withhold-loosened", f"{len(want - have)} of the signed role's withhold patterns are not in the snapshot's"

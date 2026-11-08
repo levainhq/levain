@@ -93,6 +93,57 @@ def test_every_exempt_path_is_in_deny_write_and_in_the_file_tool_deny_rules(rig)
     assert p.settings["sandbox"]["filesystem"]["allowWrite"] == [str(lane), str(rig[0] / "ret")]
 
 
+@pytest.mark.parametrize("spelling", ["Activation", "ACTIVATION"])
+def test_a_case_variant_activation_is_vetted_and_denied_like_activation(rig, spelling):
+    """codex L3 batch4b MED 5: the push judge folds case, so the launch must too. Seen red on the old tree: a tracked
+    ``pkg/a/Activation/`` launched unvetted with no write denial, and its later commit was refused at the push."""
+    lane = rig[0] / "lane"
+    rel = f"pkg/a/{spelling}"
+    sha = commit(lane, {**TREE, f"{rel}/x.md": "x\n"})
+    p = build(rig, base_sha=sha)
+    assert str(lane / rel) in p.settings["sandbox"]["filesystem"]["denyWrite"]
+    for tool in sp.FILE_TOOLS:
+        assert f"{tool}({rel}/**)" in p.settings["permissions"]["deny"]
+
+
+@pytest.mark.parametrize("spelling", ["Activation", "ACTIVATION"])
+def test_an_untracked_case_variant_activation_refuses(rig, spelling):
+    lane = rig[0] / "lane"
+    sha = commit(lane, TREE)
+    (lane / "pkg" / "other" / spelling).mkdir(parents=True)
+    (lane / "pkg" / "other" / spelling / "x.py").write_text("x\n")
+    with pytest.raises(sp.SeatRefusal, match=rf"pkg/other/{spelling} \(not exempt: git does not track it"):
+        build(rig, base_sha=sha)
+
+
+@pytest.mark.parametrize("planted", [("dir", "pkg/.Claude"), ("dir", "pkg/.CODEX"), ("file", "pkg/.MCP.json")])
+def test_a_case_variant_protected_name_refuses(rig, planted):
+    kind, rel = planted
+    lane = rig[0] / "lane"
+    sha = commit(lane, TREE)
+    if kind == "dir":
+        (lane / rel).mkdir(parents=True)
+    else:
+        (lane / rel).write_text("{}\n")
+    with pytest.raises(sp.SeatRefusal, match="agent-config target"):
+        build(rig, base_sha=sha)
+
+
+def test_the_base_is_read_by_the_trusted_git_never_an_ambient_path_one(rig, monkeypatch):
+    """codex L3 batch4b MED 2: a ``git`` first on the launcher's PATH (a direnv'd repo ``bin``) never answers the
+    proof. Seen red on the old tree: the planted git ran and its fake listing was trusted."""
+    lane = rig[0] / "lane"
+    sha = commit(lane, TREE)
+    fake = rig[0].parent / "fakebin"
+    fake.mkdir()
+    marker = rig[0].parent / "fake-git.fired"
+    (fake / "git").write_text(f"#!/bin/sh\ntouch {marker}\nexit 0\n")
+    (fake / "git").chmod(0o755)
+    monkeypatch.setenv("PATH", f"{fake}:{os.environ['PATH']}")
+    got = sp.tracked_at_base(lane, sha, [ACT])
+    assert f"{ACT}/posture.md" in got and not marker.exists()
+
+
 def test_without_a_base_a_tracked_activation_still_refuses(rig):
     lane = rig[0] / "lane"
     commit(lane, TREE)
@@ -304,7 +355,13 @@ def test_a_base_read_that_cannot_run_or_times_out_refuses_in_words(rig, monkeypa
     with pytest.raises(sp.SeatRefusal, match="did not finish"):
         sp.tracked_at_base(lane, sha, [ACT])
     monkeypatch.setattr(sp, "_GIT_TIMEOUT", 60)
-    monkeypatch.setenv("PATH", str(rig[0] / "no-such-bin"))
+    # git cannot run: no trusted git qualifies (the read no longer looks git up on PATH, codex L3 batch4b MED 2)
+    from levain.consent import push
+    monkeypatch.setattr(push, "GIT_CANDIDATES", (str(rig[0] / "no-such-bin" / "git"),))
+    with pytest.raises(sp.SeatRefusal, match="cannot be read from the clone"):
+        sp.tracked_at_base(lane, sha, [ACT])
+    # and a trusted git that cannot be executed is refused in the same words
+    monkeypatch.setattr(push, "git_bin", lambda: str(rig[0] / "no-such-bin" / "git"))
     with pytest.raises(sp.SeatRefusal, match="cannot be read from the clone"):
         sp.tracked_at_base(lane, sha, [ACT])
 

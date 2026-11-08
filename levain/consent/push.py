@@ -79,6 +79,7 @@ import json
 import os
 import re
 import shutil
+import signal
 import stat
 import subprocess
 import time
@@ -113,6 +114,16 @@ MIRROR_CONFIG = "[core]\n\trepositoryformatversion = 0\n\tfilemode = true\n\tbar
 # the local ref the agent's branch tip is fetched into, inside the mirror
 SRC_REF = "refs/levain/src"
 ZERO_SHA = "0" * 40
+
+# The named refusals of a push run under a hook's deadline (``execute(deadline=)``; codex L3 batch4b MED 1). Before
+# the intent line each is a refusal and nothing was pushed; the push itself stopped at the deadline is recorded as
+# an unknown outcome carrying :data:`_LATE_RAN`.
+_LATE_START = "the hook's deadline passed before git could run"
+_LATE_RAN = "the hook's deadline passed while git ran; git was stopped"
+_LATE_LOCK = "the hook's deadline passed while waiting for the repository's push lock: nothing is pushed"
+_LATE_PUSH = "too little of the hook's deadline is left to start the push: nothing is pushed"
+# the fewest seconds a deadline must leave when the push starts
+PUSH_FLOOR = 2.0
 
 _SCHEME = re.compile(r"^([A-Za-z][A-Za-z0-9+.-]*)://")
 _TRANSPORT = re.compile(r"^[A-Za-z][A-Za-z0-9+.-]*::")
@@ -460,14 +471,14 @@ def _walk_objects(objs: str) -> None:
                 raise PushRefused(f"the repository is a partial clone ({e.path}); a partial clone is not pushed")
 
 
-def _config_problem(gitdir: str) -> str | None:
+def _config_problem(gitdir: str, deadline: float | None = None) -> str | None:
     """Why the repository's own config refuses (a partial clone, SHA-256), read as a file: nothing in it runs."""
     for name in ("config", "config.worktree"):
         f = os.path.join(gitdir, name)
         if not os.path.lexists(f):
             continue
         r = _git(["git", "config", "--file", f, "--includes", "-z", "--get-regexp",
-                  r"^(extensions\.(partialclone|objectformat)|remote\..*\.promisor)$"], timeout=30)
+                  r"^(extensions\.(partialclone|objectformat)|remote\..*\.promisor)$"], timeout=30, deadline=deadline)
         if r.returncode not in (0, 1):
             return f"could not read {f}: {r.stderr.strip()[-200:]}"
         for item in r.stdout.split("\0"):
@@ -482,7 +493,7 @@ def _config_problem(gitdir: str) -> str | None:
     return None
 
 
-def _repo_topology(repo_path: str | os.PathLike) -> tuple[str, tuple]:
+def _repo_topology(repo_path: str | os.PathLike, *, deadline: float | None = None) -> tuple[str, tuple]:
     """(realpath, identity) of a repository levain will read, or :class:`PushRefused`. The identity is the
     (device, inode) of the repository, its ``.git`` and its ``.git/objects``, so a second call can tell a
     swap."""
@@ -504,7 +515,7 @@ def _repo_topology(repo_path: str | os.PathLike) -> tuple[str, tuple]:
             raise PushRefused(f"the object store borrows objects (objects/info/{alt}); levain reads only the "
                               "repository's own objects")
     _walk_objects(objs)
-    if problem := _config_problem(gitdir):
+    if problem := _config_problem(gitdir, deadline):
         raise PushRefused(problem)
     ident = tuple((s.st_dev, s.st_ino) for s in (os.lstat(real), os.lstat(gitdir), ost))
     return real, ident
@@ -558,18 +569,72 @@ def _private_dir(path: Path) -> None:
         os.chmod(path, 0o700)
 
 
-def _git(argv: list[str], *, timeout: int = 600, protocols: str = "",
-         git: str | None = None) -> subprocess.CompletedProcess:
+def _git(argv: list[str], *, timeout: float = 600, protocols: str = "",
+         git: str | None = None, deadline: float | None = None) -> subprocess.CompletedProcess:
     """Run ``argv`` (``argv[0]`` is ``"git"``) as ``git`` (default :func:`git_bin`), in
     :func:`git_env` with ``protocols`` the only transports allowed, from ``/``. Output is decoded as UTF-8 with
-    ``errors="replace"``: a remote hook's bytes never raise."""
+    ``errors="replace"``: a remote hook's bytes never raise.
+
+    With ``deadline`` (``time.monotonic()`` seconds: a hook's own ceiling), git runs as the leader of its own
+    process group, its timeout is ``min(timeout, the time left)``, and on that timeout (or any exception while it
+    runs) the whole group is killed and git is reaped before :class:`PushRefused` (:data:`_LATE_RAN`) is raised: no
+    git child outlives the hook that started it. A deadline already passed refuses (:data:`_LATE_START`) without
+    running git."""
     if argv[0] != "git":
         raise ValueError("levain runs only git here")
-    return subprocess.run([git or git_bin(), *argv[1:]], env=git_env(protocols), cwd="/", stdin=subprocess.DEVNULL,
-                          capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=timeout)
+    cmd = [git or git_bin(), *argv[1:]]
+    if deadline is None:
+        return subprocess.run(cmd, env=git_env(protocols), cwd="/", stdin=subprocess.DEVNULL,
+                              capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=timeout)
+    left = deadline - time.monotonic()
+    if left <= 0:
+        raise PushRefused(_LATE_START)
+    proc = subprocess.Popen(cmd, env=git_env(protocols), cwd="/", stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                            stderr=subprocess.PIPE, text=True, encoding="utf-8", errors="replace",
+                            start_new_session=True)
+    try:
+        out, err = proc.communicate(timeout=min(timeout, left))
+    except subprocess.TimeoutExpired:
+        _stop_group(proc)
+        raise PushRefused(_LATE_RAN) from None
+    except BaseException:
+        _stop_group(proc)
+        raise
+    return subprocess.CompletedProcess(cmd, proc.returncode, out, err)
 
 
-def _mirror(levain_home: Path, grant_id: str, key: str) -> Path:
+def _stop_group(proc: subprocess.Popen) -> None:
+    """Kill ``proc``'s process group (git and the transport helpers it started) and reap ``proc``."""
+    try:
+        os.killpg(proc.pid, signal.SIGKILL)
+    except (ProcessLookupError, PermissionError):
+        pass
+    try:
+        proc.kill()
+    except ProcessLookupError:
+        pass
+    proc.wait()
+    for stream in (proc.stdout, proc.stderr):
+        if stream is not None:
+            stream.close()
+
+
+def _lock(fd: int, deadline: float | None) -> None:
+    """The per-repo lock: blocking without a deadline; with one, polled until it passes, then refused."""
+    if deadline is None:
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        return
+    while True:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            return
+        except BlockingIOError:
+            if time.monotonic() >= deadline:
+                raise PushRefused(_LATE_LOCK) from None
+            time.sleep(0.05)
+
+
+def _mirror(levain_home: Path, grant_id: str, key: str, deadline: float | None = None) -> Path:
     """The levain-owned bare mirror for this grant and repository, (re)written: 0700, levain's own config, no
     hooks directory. Keyed by repository as well as grant: the lock is per repository, so two repositories under
     one grant must not share the mirror's ``refs/levain/src``."""
@@ -580,7 +645,7 @@ def _mirror(levain_home: Path, grant_id: str, key: str) -> Path:
     _private_dir(root / grant_id)
     m = root / grant_id / f"{key}.git"
     if not os.path.lexists(m):
-        r = _git(["git", "init", "--quiet", "--bare", "--template=", str(m)])
+        r = _git(["git", "init", "--quiet", "--bare", "--template=", str(m)], deadline=deadline)
         if r.returncode:
             raise PushRefused(f"could not create the mirror: {r.stderr.strip()}")
     _private_dir(m)
@@ -599,11 +664,11 @@ def _mirror(levain_home: Path, grant_id: str, key: str) -> Path:
     return m
 
 
-def _rewrites(mirror: Path, remote: str) -> list[str]:
+def _rewrites(mirror: Path, remote: str, deadline: float | None = None) -> list[str]:
     """Every ``url.<base>.insteadOf`` / ``pushInsteadOf`` in the effective config whose prefix matches
     ``remote`` (compared case-insensitively, which over-matches and so refuses more, never less)."""
     r = _git(["git", f"--git-dir={mirror}", "config", "--includes", "--get-regexp",
-              r"^url\..*\.(insteadof|pushinsteadof)$"], timeout=60)
+              r"^url\..*\.(insteadof|pushinsteadof)$"], timeout=60, deadline=deadline)
     if r.returncode not in (0, 1):
         raise PushRefused(f"could not read the effective git config: {r.stderr.strip()}")
     hits = []
@@ -686,7 +751,7 @@ def _record(home: Path, key: str, result: PushResult, real: str,
 def execute(grant: dict[str, Any], *, repo_path: str | os.PathLike, remote: str, branch: str,
             levain_home: str | os.PathLike, refusal: Refusal,
             receipt: Callable[[dict[str, Any]], Any], expect_sha: str | None = None,
-            tip_check: Callable[..., "str | None"] | None = None) -> PushResult:
+            tip_check: Callable[..., "str | None"] | None = None, deadline: float | None = None) -> PushResult:
     """Push ``branch`` of the repository at ``repo_path`` to ``remote`` under a grant (§3 steps 1-4).
 
     ``grant`` is the grant the caller found before the lock; its ``id`` names the mirror. Under the per-repo lock
@@ -700,6 +765,11 @@ def execute(grant: dict[str, Any], *, repo_path: str | os.PathLike, remote: str,
     under the lock as ``tip_check(mirror=<the mirror>, new=<the fetched tip>, path=<repo realpath>)`` after the tip is
     pinned in the mirror and before the intent line; a returned string, or any exception it raises, refuses the push
     (the seat egress judges the lane's commits from the mirror's objects this way, never from the working tree).
+    With ``deadline`` (``time.monotonic()`` seconds: the calling hook's own ceiling, codex L3 batch4b MED 1), every git
+    call is capped by the time left and its process group killed and reaped at the deadline (:func:`_git`), the lock is
+    polled until the deadline instead of waited on, and a push with less than :data:`PUSH_FLOOR` seconds left is
+    refused before the intent line; each is a :class:`PushRefused` naming the deadline. A push stopped at the deadline
+    after the intent line is a :class:`PushOutcomeUnknown` whose detail names it.
 
     Raises :class:`PushRefused` for anything levain refuses before the push; an ``OSError`` or
     ``subprocess.SubprocessError`` (a git that timed out or could not run, the lock or the intent line that
@@ -721,7 +791,7 @@ def execute(grant: dict[str, Any], *, repo_path: str | os.PathLike, remote: str,
     gid = grant.get("id") if isinstance(grant, dict) else None
     if not isinstance(gid, str):
         raise PushRefused("the grant carries no id")
-    real, ident = _repo_topology(repo_path)
+    real, ident = _repo_topology(repo_path, deadline=deadline)
     home = Path(os.path.abspath(os.fspath(levain_home)))
     if not os.path.isdir(home):
         raise PushRefused(f"levain home {home} is not a directory")
@@ -729,7 +799,7 @@ def execute(grant: dict[str, Any], *, repo_path: str | os.PathLike, remote: str,
     _private_dir(home / "push")
     lock_fd = os.open(home / "push" / f"{key}.lock", os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, 0o600)
     try:
-        fcntl.flock(lock_fd, fcntl.LOCK_EX)
+        _lock(lock_fd, deadline)
         # step 1: the fresh judgment, under the lock
         verdict = refusal(path=real, remote=canon, branch=branch)
         if isinstance(verdict, str):
@@ -741,10 +811,10 @@ def execute(grant: dict[str, Any], *, repo_path: str | os.PathLike, remote: str,
         if found_id != gid:
             raise PushRefused(f"the covering grant is now {found_id}, not {gid}; ask again")
         # step 2: the tip, fetched out of the agent's repo into levain's mirror
-        mirror = _mirror(home, gid, key)
+        mirror = _mirror(home, gid, key, deadline)
         # the topology again, immediately before git reads the repository: the same directories, or refuse
         try:
-            again = _repo_topology(real)
+            again = _repo_topology(real, deadline=deadline)
         except PushRefused as exc:
             raise PushRefused(f"{real} changed while waiting for the lock: {exc}") from None
         if again != (real, ident):
@@ -752,10 +822,12 @@ def execute(grant: dict[str, Any], *, repo_path: str | os.PathLike, remote: str,
                               "store is at that path now)")
         f = _git(["git", f"--git-dir={mirror}", "-c", "core.hooksPath=/dev/null", "-c", "protocol.ext.allow=never",
                   "-c", "protocol.fd.allow=never", "fetch", "--quiet", "--no-tags", "--no-write-fetch-head",
-                  "--no-recurse-submodules", real, f"+refs/heads/{branch}:{SRC_REF}"], protocols="file")
+                  "--no-recurse-submodules", real, f"+refs/heads/{branch}:{SRC_REF}"], protocols="file",
+                 deadline=deadline)
         if f.returncode:
             raise PushRefused(f"could not read branch {branch} from {real}: {f.stderr.strip()[-400:]}")
-        rp = _git(["git", f"--git-dir={mirror}", "rev-parse", "--verify", "--quiet", f"{SRC_REF}^{{commit}}"])
+        rp = _git(["git", f"--git-dir={mirror}", "rev-parse", "--verify", "--quiet", f"{SRC_REF}^{{commit}}"],
+                  deadline=deadline)
         new = rp.stdout.strip()
         if rp.returncode or not _SHA.match(new):
             raise PushRefused(f"branch {branch} of {real} is not a commit")
@@ -764,7 +836,7 @@ def execute(grant: dict[str, Any], *, repo_path: str | os.PathLike, remote: str,
                               "allowed")
         # the private ref names the verified commit itself (a branch naming a tag object would push the tag)
         u = _git(["git", f"--git-dir={mirror}", "-c", "core.hooksPath=/dev/null", "update-ref", "--no-deref",
-                  SRC_REF, new])
+                  SRC_REF, new], deadline=deadline)
         if u.returncode:
             raise PushRefused(f"could not pin the mirror's ref to {new}: {u.stderr.strip()[-200:]}")
         if tip_check is not None:
@@ -775,7 +847,7 @@ def execute(grant: dict[str, Any], *, repo_path: str | os.PathLike, remote: str,
             if why is not None:
                 raise PushRefused(str(why))
         # step 3: the pin must mean the destination
-        if hits := _rewrites(mirror, canon):
+        if hits := _rewrites(mirror, canon, deadline):
             raise PushRefused(f"the git config rewrites the pinned remote ({hits[0]}); a pin must mean the "
                               "destination")
         # everything the push needs is resolved BEFORE the intent line: after it, nothing refuses
@@ -783,10 +855,12 @@ def execute(grant: dict[str, Any], *, repo_path: str | os.PathLike, remote: str,
         argv = push_argv(mirror, canon, branch)
         proto = push_protocol(canon)
         base = {"grant_id": gid, "grant_seq": seq, "remote": canon, "branch": branch, "repo": real, "new_sha": new}
+        if deadline is not None and deadline - time.monotonic() < PUSH_FLOOR:
+            raise PushRefused(_LATE_PUSH)
         _journal(home, key, {"state": "intent", "at": time.time(), **base})
         # from here on the remote may change: every path reaches the receipt
         try:
-            p = _git(argv, protocols=proto, git=gb)
+            p = _git(argv, protocols=proto, git=gb, deadline=deadline)
         except BaseException as exc:  # noqa: BLE001 - after the intent line any failure is an unknown outcome
             result = PushResult(ok=False, status="unknown", grant_id=gid, grant_seq=seq, remote=canon,
                                 branch=branch, old_sha=None, new_sha=new, exit=-1,

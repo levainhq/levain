@@ -68,6 +68,41 @@ def test_a_withhold_that_is_not_a_list_of_strings_is_refused_even_under_a_valid_
     assert exc.value.name == "withhold"
 
 
+def _forged(withhold):
+    """A hand-authored signed role carrying ``withhold`` verbatim, with both ends of the chain consistent."""
+    bad = copy.deepcopy(ROLE)
+    bad["ceiling"]["withhold"] = withhold
+    rh = SR.hashlib.sha256(SR.ROLE_HASH_PREFIX + _canonical(bad).encode()).hexdigest()
+    spec = {"role": {"name": "scribe", "role_hash": rh}}
+    return SR.SignedRole(AGENT, _canonical(spec), _canonical(bad)), SR.SignedLink(AGENT, SP.spec_hash(AGENT, spec), rh)
+
+
+@pytest.mark.parametrize("withhold", [
+    ["docs/**", "docs/**"],                                   # a duplicate: compared as a set it equalled ("docs/**",)
+    [f"p{i:03d}/**" for i in range(R.WITHHOLD_MAX + 1)],     # over the registration bound
+    ["", "docs/**"],                                          # outside the pattern grammar
+    ["z/**", "a/**"],                                         # not the stored (sorted) form a registered role carries
+], ids=["duplicate", "over-bound", "bad-grammar", "unsorted"])
+def test_a_hand_authored_withhold_no_role_could_register_is_refused(withhold):
+    """codex L3 batch4b LOW: the point of use holds the signed withhold to role._withhold's rule. Seen red on the old
+    tree: each derived a withhold (the duplicate one as ('docs/**', 'docs/**'), equal as a set to a normalised launch)."""
+    signed, link = _forged(withhold)
+    with pytest.raises(SR.SignedRoleRefused) as exc:
+        SR.signed_withhold(signed, link)
+    assert exc.value.name == "withhold"
+
+
+def test_a_registered_withhold_still_derives_in_its_stored_form():
+    signed, link = _forged(["a/**", "docs/**"])
+    assert SR.signed_withhold(signed, link) == ("a/**", "docs/**")
+
+
+def test_withhold_problem_compares_the_signed_side_as_its_canonical_tuple():
+    assert SR.withhold_problem(("a", "a"), ("a",))[0] == "withhold-mismatch"
+    assert SR.withhold_problem(("b", "a"), ("a", "b"))[0] == "withhold-mismatch"
+    assert SR.withhold_problem(("a", "b"), ("b", "a")) is None
+
+
 # --- L3 W2 r1 HIGH (codex): the role the withhold comes from is the role the verified link NAMES ------------------------------
 
 LOCKED = copy.deepcopy(ROLE)

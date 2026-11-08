@@ -19,6 +19,7 @@ import shlex
 import stat
 import sys
 import tempfile
+import unicodedata
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Mapping, Sequence
@@ -208,7 +209,15 @@ _CANDIDATE_CAP = 256
 #: negation and comment at a component's start). An exempt path holding one refuses instead of being escaped (L3 r1 #5).
 _GLOB_CHARS = frozenset("*?[]{}\\")
 _GLOB_LEAD = ("!", "#")
-_PROTECTED_FOLDED = frozenset(n.casefold() for n in PROTECTED_NAMES)
+def _fold(name: str) -> str:
+    """A name as APFS compares it (normalisation- and case-insensitively), the fold the push judge uses
+    (``levain.seat_push._activation_paths``): ``Activation`` and ``ACTIVATION`` are ``activation`` (codex L3 batch4b
+    MED 5)."""
+    return unicodedata.normalize("NFC", name).casefold()
+
+
+_PROTECTED_FOLDED = frozenset(_fold(n) for n in PROTECTED_NAMES)
+_EXEMPT_FOLDED = frozenset(_fold(n) for n in TRACKED_EXEMPT_NAMES)
 
 
 def _read_capped(proc, deadline: float) -> bytes:
@@ -248,10 +257,16 @@ def tracked_at_base(clone: Path, base_sha: str, paths: Sequence[str] | None = No
         return {}
     import subprocess
     import time
-    env = {"PATH": os.environ.get("PATH", "/usr/bin:/bin"), "HOME": os.environ.get("HOME", ""),
+    from levain.consent import push
+    # git by the push code's trusted absolute path and PATH, never an ambient PATH lookup (codex L3 batch4b MED 2)
+    try:
+        git = push.git_bin()
+    except push.PushRefused as exc:
+        raise SeatRefusal(f"the base {base_sha[:12]} cannot be read from the clone: {exc}") from None
+    env = {"PATH": push.TRUSTED_PATH, "HOME": os.environ.get("HOME", ""),
            "GIT_CONFIG_GLOBAL": "/dev/null", "GIT_CONFIG_NOSYSTEM": "1", "GIT_TERMINAL_PROMPT": "0", "LC_ALL": "C",
            "GIT_NO_LAZY_FETCH": "1", "GIT_LITERAL_PATHSPECS": "1", "GIT_NO_REPLACE_OBJECTS": "1"}
-    argv = ["git", "--no-replace-objects", f"--git-dir={clone / '.git'}", "-c", "core.hooksPath=/dev/null",
+    argv = [git, "--no-replace-objects", f"--git-dir={clone / '.git'}", "-c", "core.hooksPath=/dev/null",
             "ls-tree", "-r", "-z", "--full-tree", f"{base_sha}^{{commit}}"]
     if paths:
         argv += ["--", *paths]
@@ -353,7 +368,7 @@ def _exempt_problem(root: Path, top: Path, tracked: Mapping[str, tuple[str, str]
                 seen += 1
                 if seen > _WALK_CAP:
                     return "it is too large to vet"
-                if name.casefold() in _PROTECTED_FOLDED:
+                if _fold(name) in _PROTECTED_FOLDED:
                     return f"{shown} is a protected name inside it"
                 st = os.stat(name, dir_fd=dir_fd, follow_symlinks=False)
                 if stat.S_ISLNK(st.st_mode):
@@ -405,12 +420,13 @@ def _contains_agent_config(root: Path, *, git_dir_ok: bool, base_sha: str | None
         for d in dirnames:
             if d == ".git" and git_dir_ok and here == root:
                 continue                               # judged once, after the walk (L3 r2 #5)
-            if d in TRACKED_EXEMPT_NAMES and base_sha is not None and here != root:
+            # names fold as APFS and the push judge fold them (_fold): `Activation` is vetted and denied as `activation`
+            if _fold(d) in _EXEMPT_FOLDED and base_sha is not None and here != root:
                 candidates.append(here / d)            # judged below, after the walk; never descended here
                 if len(candidates) > _CANDIDATE_CAP:
                     found.append(f"{root} holds more than {_CANDIDATE_CAP} activation directories to vet")
                     return found
-            elif d in PROTECTED_NAMES:
+            elif _fold(d) in _PROTECTED_FOLDED:
                 found.append(str(here / d))
             elif os.path.islink(here / d):
                 links.append(here / d)
@@ -420,7 +436,7 @@ def _contains_agent_config(root: Path, *, git_dir_ok: bool, base_sha: str | None
         for f in filenames:
             if f == ".git" and git_dir_ok and here == root:
                 continue                               # a file, broken link or link to a file: judged once, below
-            if f in PROTECTED_NAMES:
+            if _fold(f) in _PROTECTED_FOLDED:
                 found.append(str(here / f))
             elif os.path.islink(here / f):
                 links.append(here / f)

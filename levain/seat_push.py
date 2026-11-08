@@ -495,7 +495,7 @@ def run_hook(event: str, stdin_text: str, *, clone: Path | str, key_dir: Path | 
         try:
             result = push.execute({"id": grant["id"]}, repo_path=clone_real, remote=grant["push_remote"],
                                   branch=branch, levain_home=home, refusal=refusal, receipt=receipt,
-                                  tip_check=tc)
+                                  tip_check=tc, deadline=hook_deadline)
         except push.PushRecordIncomplete as exc:              # git reported; only levain's own record is short
             _log(home, {**base, "outcome": "record-incomplete", "detail": str(exc)[:400]})
             result = exc.result

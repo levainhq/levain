@@ -186,6 +186,9 @@ def _p1(ev: Mapping[str, Any]) -> Check:
 
 
 def _p1b(ev: Mapping[str, Any]) -> Check:
+    """P1b passes on exactly one MCP server named :data:`GH_SERVER_NAME`, so a planted ``.mcp.json`` that declares a
+    server of that same name is not told apart here: ``--strict-mcp-config`` on the launch is what blocks it (only the
+    profile's own ``--mcp-config`` is read), and P0's exact-tools check covers part of it."""
     name = "P1b inert target"
     if not _is_map(ev):
         return _inconclusive(name, "no evidence")

@@ -176,9 +176,42 @@ def test_the_hook_deadline_bounds_the_judge(eg, monkeypatch):
     (clone / "README.md").write_text("changed\n")
     commit_all(clone)
     monkeypatch.setattr(sp, "_HOOK_RESERVE", sp.SESSION_END_TIMEOUT)    # SessionEnd leaves the judge nothing
+    # the push's own git calls now share the hook deadline too (codex L3 batch4b MED 1), so with nothing left the push
+    # refuses at its first git call, before the judge is reached
+    from levain.consent import push
+    assert eg.hook(clone, event="SessionEnd") == (0, "")
+    assert eg.remote_ref("refs/heads/seat/lane-t") is None
+    assert eg.log()[-1]["detail"] == push._LATE_START
+    # the judge's own bound, isolated: the push runs unbounded, and the judge still stops at the hook's deadline
+    real = push.execute
+
+    def unbounded(*a, deadline=None, **k):
+        return real(*a, **k)
+    monkeypatch.setattr(push, "execute", unbounded)
     assert eg.hook(clone, event="SessionEnd") == (0, "")
     assert eg.remote_ref("refs/heads/seat/lane-t") is None
     assert "could not be judged in time" in eg.log()[-1]["detail"]
+
+
+def test_the_hook_deadline_bounds_the_push_itself(eg, monkeypatch):
+    """codex L3 batch4b MED 1: the hook hands its deadline to push.execute, so a destination that stalls the push is
+    stopped inside the hook's ceiling and logged as an unknown outcome naming the deadline, never left running after
+    the hook. Seen red on the old tree: run_hook passed no deadline and the push kept _git's 600 s timeout."""
+    import time
+    from levain.consent import push
+    clone, _ = act_lane(eg)
+    (clone / "README.md").write_text("changed\n")
+    commit_all(clone)
+    stall = eg.remote / "hooks" / "pre-receive"
+    stall.write_text("#!/bin/sh\nexec sleep 60\n")
+    stall.chmod(0o755)
+    monkeypatch.setattr(sp, "STOP_TIMEOUT", sp._HOOK_RESERVE + 5)
+    start = time.monotonic()
+    assert eg.hook(clone) == (0, "")
+    assert time.monotonic() - start < sp._HOOK_RESERVE + 5
+    assert eg.remote_ref("refs/heads/seat/lane-t") is None
+    last = eg.log()[-1]
+    assert last["outcome"] == "unknown" and push._LATE_RAN in last["detail"]
 
 
 def test_a_lane_commit_touching_only_ordinary_files_still_pushes(eg):
