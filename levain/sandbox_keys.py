@@ -11,7 +11,7 @@ them. Each entry is a key path inside ``sandbox``.
 """
 from __future__ import annotations
 
-__all__ = ["CLAUDE_CREDENTIAL_ENV", "LOOSENING_NONEMPTY", "LOOSENING_TRUE"]
+__all__ = ["CLAUDE_CREDENTIAL_ENV", "REPO_CREDENTIAL_SETTINGS", "LOOSENING_NONEMPTY", "LOOSENING_TRUE"]
 
 #: Keys that must not be ``true``.
 LOOSENING_TRUE = (("allowUnsandboxedCommands",), ("enableWeakerNestedSandbox",),
@@ -38,3 +38,6 @@ CLAUDE_CREDENTIAL_ENV = frozenset({
     "CLAUDE_CODE_USE_BEDROCK", "CLAUDE_CODE_USE_VERTEX", "CLAUDE_CODE_USE_FOUNDRY",
     "CLAUDE_CONFIG_DIR",
 })
+#: Claude Code settings keys that supply a credential by running a command (the vendor's settings reference lists
+#: each with scope "Any file"); a repo's settings layer naming one is refused, whatever its value.
+REPO_CREDENTIAL_SETTINGS = ("apiKeyHelper", "awsCredentialExport", "awsAuthRefresh")

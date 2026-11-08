@@ -671,6 +671,18 @@ def test_the_credential_name_lists_are_pinned_to_the_shared_set():
     assert kept <= sk.CLAUDE_CREDENTIAL_ENV
 
 
+def test_repo_settings_credential_helper_keys_refused():
+    """PRE-L3 fix4 (L1 MED-2, L2 MED-2): a repo settings KEY that supplies a credential by command is refused at the
+    repo layer like the env names, whatever its value."""
+    from levain import sandbox_keys as sk
+    assert set(sk.REPO_CREDENTIAL_SETTINGS) == {"apiKeyHelper", "awsCredentialExport", "awsAuthRefresh"}
+    for key in sk.REPO_CREDENTIAL_SETTINGS:
+        for path in (".claude/settings.json", ".claude/settings.local.json"):
+            got = rd.repo_loosening_refusals({path: {key: "/bin/sh -c x"}})
+            assert [x.name for x in got] == ["loosening:" + rd.wire_name(key)], key
+            assert key in got[0].detail and path in got[0].detail
+
+
 def test_levain_repo_settings_pass():
     """The negative control. ``.claude/settings.json`` is absent from this repo, so the control is (a) a hooks-only
     settings file and (b) the Claude Code settings template Levain ships (hooks + permissions)."""

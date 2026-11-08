@@ -46,7 +46,7 @@ from levain.contracts import canon
 from levain.broker import norm as broker_norm
 from levain.broker import policy as broker_policy
 from levain.firing.hands import HostOS
-from levain.sandbox_keys import CLAUDE_CREDENTIAL_ENV, LOOSENING_NONEMPTY as _LOOSENING_NONEMPTY, LOOSENING_TRUE as _LOOSENING_TRUE
+from levain.sandbox_keys import CLAUDE_CREDENTIAL_ENV, REPO_CREDENTIAL_SETTINGS, LOOSENING_NONEMPTY as _LOOSENING_NONEMPTY, LOOSENING_TRUE as _LOOSENING_TRUE
 from levain.slot import Refused
 from levain.slot.bwrap import LEVAIN_BWRAP
 from levain.slot.ids import SlotId, loopback_alias
@@ -1031,7 +1031,8 @@ def repo_loosening_refusals(docs: Mapping[str, Any]) -> list[Refused]:
     ``repo-settings-malformed``),
     and a ``disableAllHooks`` that is anything but ``false`` (L2 M6; DECISION: a non-boolean is refused too, as
     its meaning to CC is unmeasured), and an ``env`` naming the queue's vars, a :data:`PROXY_ENV` name, one of
-    ``levain.sandbox_keys.CLAUDE_CREDENTIAL_ENV`` or any ``*_BASE_URL`` (PRE-L3 4-1). A
+    ``levain.sandbox_keys.CLAUDE_CREDENTIAL_ENV`` or any ``*_BASE_URL`` (PRE-L3 4-1), and a top-level
+    ``apiKeyHelper`` / ``awsCredentialExport`` / ``awsAuthRefresh`` key. A
     document that is not an object is refused ``repo-settings-malformed``.
     Hooks, permissions and every other key launch (plan §2c 3: the repo's settings are its own).
 
@@ -1047,6 +1048,10 @@ def repo_loosening_refusals(docs: Mapping[str, Any]) -> list[Refused]:
             continue
         if "disableAllHooks" in doc and doc["disableAllHooks"] is not False:
             out.append(_refused("loosening", "disableAllHooks", f"{path}: not false"))
+        # A key that runs a command to produce the API credential moves the billing identity as an env name does.
+        for key in REPO_CREDENTIAL_SETTINGS:
+            if key in doc:
+                out.append(_refused("loosening", key, f"{path}: {key} supplies the run's credential"))
         env = doc.get("env", {})
         if not isinstance(env, Mapping):
             out.append(Refused("repo-settings-malformed", f"{path}: env"))
