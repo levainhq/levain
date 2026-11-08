@@ -163,3 +163,47 @@ def test_a_zero_delta_move_pins_nothing_and_a_cancel_recentres(tmp_path, monkeyp
     out = _go(tmp_path, monkeypatch, [{"eval": move}, _mark()])
     (m,) = _states(out)
     assert m["stored"] is None and m["h"] == "" and m["mh"] == "", m
+
+
+# --- 531 round 7 (levain 76, lpr3): L3 r1 on the grip ---------------------------------------------------------------------------------------
+
+
+def _pointer(kind: str, dy: int) -> str:
+    """One pointer event at (the grip's start y + dy) on whichever grip is in the page now; window.__g keeps the start so a repaint between events does not move it."""
+    return ("(() => { const g = %s; if (!window.__g) { const r = g.getBoundingClientRect(); window.__g = {x: r.left + r.width / 2, y: r.top + r.height / 2}; } "
+            "g.dispatchEvent(new PointerEvent('%s', {bubbles: true, pointerId: 7, button: 0, clientX: window.__g.x, clientY: window.__g.y + %d})); "
+            "if ('%s' === 'pointerup') window.__g = null; return 1; })()") % (GRIP, kind, dy, kind)
+
+
+@needs_browser
+def test_a_repaint_in_mid_drag_hands_the_drag_to_the_new_grip(tmp_path, monkeypatch):
+    """L3 r1 (codex, MED): the poll repainted the graph while the grip was held; the new lens had no drag, so the move was lost and nothing was stored."""
+    out = _go(tmp_path, monkeypatch, [_mark(), {"eval": _pointer("pointerdown", 0)}, {"eval": _pointer("pointermove", -100)},
+                                      {"eval": _paint(_many(80), "agents")}, WAIT,
+                                      {"eval": _pointer("pointermove", -150)}, {"eval": _pointer("pointerup", -150)}, WAIT, _mark()])
+    d, a = _states(out)
+    assert abs(a["box"] - (d["box"] - 150)) <= 2 and a["stored"] == str(round(a["box"])), (d, a)       # the whole drag, across the repaint
+    assert a["h"] != "" and a["mh"] == "none", a
+
+
+@needs_browser
+def test_a_drag_ended_by_a_cancel_after_a_repaint_leaves_a_working_grip(tmp_path, monkeypatch):
+    out = _go(tmp_path, monkeypatch, [_mark(), {"eval": _pointer("pointerdown", 0)}, {"eval": _pointer("pointermove", -100)},
+                                      {"eval": _paint(_many(80), "agents")}, WAIT, {"eval": _pointer("pointercancel", -100)}, WAIT, _mark(),
+                                      {"eval": _drag(-120)}, WAIT, _mark()])
+    d, c, a = _states(out)
+    assert c["stored"] is None and abs(c["box"] - d["box"]) <= 2, (d, c)                                 # a cancel reverts the half-applied preview
+    assert abs(a["box"] - (d["box"] - 120)) <= 2 and a["stored"] == str(round(a["box"])), (d, a)       # and the grip drags again
+
+
+@needs_browser
+def test_a_rebuild_at_a_new_width_keeps_the_canvas_on_the_svg_after_the_reader_scrolled(tmp_path, monkeypatch):
+    """L3 r1 (codex, MED): the rebuilt svg had no centring margin while the canvas kept the last build's top, so the particles ran off their edges."""
+    _root, src = _sessions_fixture(tmp_path, monkeypatch)
+    wheel = "%s.dispatchEvent(new WheelEvent('wheel', {bubbles: true})); 1" % ST
+    out = _run(tmp_path, src, [*PRIME, {"eval": "localStorage.setItem('%s', '700'); 1" % KEY}, {"eval": _paint(_many(1), "agents")}, WAIT, _mark(),
+                               {"eval": wheel}, {"eval": "%s.style.maxWidth = '700px'; 1" % ST}, WAIT, {"eval": "%s.style.maxWidth = '900px'; 1" % ST}, WAIT, _mark()],
+               first=DESKTOP)
+    before, after = _states(out)
+    assert before["cv"] and all(abs(v) <= 2 for v in before["cv"].values()), before
+    assert after["cv"] and all(abs(v) <= 2 for v in after["cv"].values()), after

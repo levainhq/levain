@@ -1326,7 +1326,8 @@
   let pinned = null;                                                      // the fallback pin (no agent page in the page): {id, x, y, dx, dy} in stage px
   let kbFocus = null;                                                     // the control the keyboard focus sits on ("n:<node id>", or "b:hub" / "b:node:<node id>" for a need badge (the owner is typed, so a node whose id is "hub" is not the desk)), kept across a redraw
   let stageScroll = { top: 0, left: 0 };                                   // the graph box's scroll, kept across a rebuild of the lens (a live repaint replaces the stage)
-  let lastStage = null;                                                    // the stage the last build drew: its scroll is read the moment a rebuild starts, so a scroll whose event has not fired yet is not lost
+  let gripDrag = null;                                                     // the grip drag in progress, {y, h, id, moved, lastH, captured, grip}: module-wide, so a repaint in mid-drag hands it to the new grip
+  let lastStage = null;                                                  // the stage the last build drew: its scroll is read the moment a rebuild starts, so a scroll whose event has not fired yet is not lost
   // the Agents graph's own height, per device: the stage keeps its CSS default (max-height min(72vh, 36rem)) until the person drags the grip
   const GRAPH_H_KEY = "levain_cockpit_graph_height";
   const GRAPH_MIN_REM = 12, GRAPH_MAX_VH = 0.9, GRIP_STEP = 24;
@@ -1382,42 +1383,70 @@
       grip.setAttribute("aria-valuemin", String(Math.round(Math.min(GRAPH_MIN_REM * remPx(), vmax)))); grip.setAttribute("aria-valuemax", String(Math.round(vmax)));
     };
     const setGraphH = (h, persist) => { stage.style.height = h + "px"; stage.style.maxHeight = "none"; grip.setAttribute("aria-valuenow", String(Math.round(h))); if (persist) keepGraphH(h); centreGraph(); };
-    let dragFrom = null, needCentre = !!gripHeight();
+    let needCentre = !!gripHeight();
     for (const t of ["wheel", "touchmove", "pointerdown"]) stage.addEventListener(t, () => { centreOn = false; }, { passive: true });   // the reader's own scroll ends the centring (a rebuild's own scroll clamp is not theirs)
+    // the drag in progress is module-wide (gripDrag) and belongs to ONE grip at a time: a live repaint builds a new lens mid-drag, and the new grip
+    // adopts the drag (adoptDrag) while the old grip's handlers, no longer its owner, ignore every event
+    const mine = (ev) => !!gripDrag && gripDrag.grip === grip && ev.pointerId === gripDrag.id;
+    const dropCapture = (id) => { try { if (grip.hasPointerCapture && grip.hasPointerCapture(id)) grip.releasePointerCapture(id); } catch (_) { /* no capture to give back */ } };
     grip.addEventListener("pointerdown", (ev) => {
       if (ev.button > 0) return;
       ev.preventDefault();
-      if (dragFrom) return;                                              // a second finger does not take the drag over
-      dragFrom = { y: ev.clientY, h: stage.getBoundingClientRect().height, id: ev.pointerId, moved: false };
+      if (gripDrag && gripDrag.grip.isConnected) return;                 // a second finger does not take the drag over (a drag whose grip left the page is dead)
+      gripDrag = { y: ev.clientY, h: stage.getBoundingClientRect().height, id: ev.pointerId, moved: false, lastH: 0, captured: false, grip };
       try { grip.focus({ preventScroll: true }); } catch (_) { /* the arrow keys then need a Tab first */ }
-      try { grip.setPointerCapture(ev.pointerId); } catch (_) { /* a synthetic pointer has no capture: the move still arrives */ }
+      try { grip.setPointerCapture(ev.pointerId); gripDrag.captured = true; } catch (_) { /* a synthetic pointer has no capture: the move still arrives */ }
       grip.classList.add("tv-grip-on");
     });
     grip.addEventListener("pointermove", (ev) => {
-      if (!dragFrom || ev.pointerId !== dragFrom.id) return;
-      if (ev.clientY === dragFrom.y && !dragFrom.moved) return;          // a zero-delta or sideways move previews nothing (it would pin the box with nothing to persist)
-      dragFrom.moved = true;
-      setGraphH(clampGraphH(dragFrom.h + ev.clientY - dragFrom.y), false);
+      if (!mine(ev)) return;
+      if (ev.clientY === gripDrag.y && !gripDrag.moved) return;          // a zero-delta or sideways move previews nothing (it would pin the box with nothing to persist)
+      gripDrag.moved = true;
+      gripDrag.lastH = clampGraphH(gripDrag.h + ev.clientY - gripDrag.y);
+      setGraphH(gripDrag.lastH, false);
     });
     const endDrag = (ev) => {
-      if (!dragFrom || ev.pointerId !== dragFrom.id) return;
-      const h = clampGraphH(dragFrom.h + ev.clientY - dragFrom.y), moved = dragFrom.moved;
-      dragFrom = null; grip.classList.remove("tv-grip-on");
+      if (!mine(ev)) return;
+      const h = clampGraphH(gripDrag.h + ev.clientY - gripDrag.y), moved = gripDrag.moved, id = gripDrag.id;
+      gripDrag = null; grip.classList.remove("tv-grip-on"); dropCapture(id);
       if (moved) setGraphH(h, true);                                     // a click with no movement pins nothing
     };
     grip.addEventListener("pointerup", endDrag);
-    grip.addEventListener("pointercancel", (ev) => {                       // a cancelled drag is reverted to the stored (or default) height, never left half-applied
-      if (!dragFrom || ev.pointerId !== dragFrom.id) return;
-      dragFrom = null; grip.classList.remove("tv-grip-on"); applyGraphH(); if (needCentre || centreOn) centreGraph();
+    const cancelDrag = (ev) => {                                         // a cancelled drag is reverted to the stored (or default) height, never left half-applied
+      if (!mine(ev)) return;
+      const id = gripDrag.id;
+      gripDrag = null; grip.classList.remove("tv-grip-on"); dropCapture(id); applyGraphH(); if (needCentre || centreOn) centreGraph();
+    };
+    grip.addEventListener("pointercancel", cancelDrag);
+    // the browser took the capture back with the drag still open (the element left the page, or the pointer went somewhere no event reaches us): the drag
+    // ends where it was, kept if it had moved, so the grip is never left inert behind a drag nobody can finish
+    grip.addEventListener("lostpointercapture", (ev) => {
+      if (!mine(ev) || !gripDrag.captured || !grip.isConnected) return;
+      const d = gripDrag;
+      gripDrag = null; grip.classList.remove("tv-grip-on");
+      if (d.moved) setGraphH(d.lastH, true); else applyGraphH();
     });
-    grip.addEventListener("dblclick", () => { dragFrom = null; clearGraphH(); applyGraphH(); centreGraph(); });
+    // a repaint in mid-drag: this (new) grip takes the drag over once it is in the page. A drag whose pointer is gone ends where it was.
+    const adoptDrag = () => {
+      const d = gripDrag;
+      if (!d || d.grip === grip || !grip.isConnected) return;
+      d.grip = grip;
+      let held = false;
+      try { grip.setPointerCapture(d.id); held = true; } catch (_) { /* a synthetic pointer has none */ }
+      if (d.captured && !held) { gripDrag = null; if (d.moved) setGraphH(d.lastH, true); else applyGraphH(); return; }
+      d.captured = held;
+      grip.classList.add("tv-grip-on");
+      if (d.moved) setGraphH(d.lastH, false);
+    };
+    if (gripDrag && typeof root.requestAnimationFrame === "function") root.requestAnimationFrame(adoptDrag);
+    grip.addEventListener("dblclick", () => { gripDrag = null; clearGraphH(); applyGraphH(); centreGraph(); });
     grip.addEventListener("keydown", (ev) => {
       const d = ev.key === "ArrowUp" ? -GRIP_STEP : ev.key === "ArrowDown" ? GRIP_STEP : 0;
       if (!d) return;
       ev.preventDefault();
       setGraphH(clampGraphH(stage.getBoundingClientRect().height + d), true);
     });
-    const onWinResize = () => { if (!stage.isConnected) { root.removeEventListener("resize", onWinResize); return; } if (!dragFrom) { applyGraphH(); if (needCentre || centreOn) centreGraph(); } };
+    const onWinResize = () => { if (!stage.isConnected) { root.removeEventListener("resize", onWinResize); return; } if (!gripDrag) { applyGraphH(); if (needCentre || centreOn) centreGraph(); } };
     if (typeof root.addEventListener === "function") {
       root.addEventListener("resize", onWinResize);
       resizeOff = () => root.removeEventListener("resize", onWinResize);     // release() takes it off at the next repaint
@@ -1451,6 +1480,13 @@
     };
     let reanchorPin = null;                                               // set once the card helpers exist: re-seats a pinned card on its node after every layout
     const mctx = document.createElement("canvas").getContext ? document.createElement("canvas").getContext("2d") : null;
+    // every rebuild seats BOTH the svg's margin and the canvas's top: a rebuilt svg starts with no margin, and the canvas keeps the last build's offset
+    const seatMargin = () => {
+      if (!svgNode) return;
+      const ch = stage.isConnected ? stage.clientHeight : 0, sh = svgNode.getBoundingClientRect().height;
+      const m = ch && sh < ch - 2 ? Math.round((ch - sh) / 2) : 0;
+      svgNode.style.marginTop = m ? m + "px" : ""; canvas.style.top = m ? m + "px" : "";
+    };
     const build = (W) => {
       const cs = root.getComputedStyle(stage);
       const fonts = { l1: "600 12px " + (cs.getPropertyValue("--round").trim() || "sans-serif"), l2: "500 11px " + (cs.getPropertyValue("--mono").trim() || "monospace"),
@@ -1484,6 +1520,7 @@
       const cssW = phone ? Math.round(LW * scale) : Math.round(W), cssH = Math.round(L.H * scale), dpr = Math.min(2, root.devicePixelRatio || 1);
       canvas.width = Math.max(1, Math.round(cssW * dpr)); canvas.height = Math.max(1, Math.round(cssH * dpr));
       canvas.style.width = cssW + "px"; canvas.style.height = cssH + "px";
+      seatMargin();
       if (ticker) { root.clearInterval(ticker); ticker = null; }
       if (g.tickers.length && !(opts && opts.still)) {          // a frame from the ledger is still: its durations are computed at T and do not advance
         const t0 = (root.performance && root.performance.now ? root.performance.now() : Date.now());
