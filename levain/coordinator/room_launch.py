@@ -108,6 +108,7 @@ from levain.coordinator.claude_session import (ROOM_DENIED_TOOLS, ROOM_MCP_SERVE
                                                open_probe, room_argv, room_door_tools, room_hook_command, room_settings_json)
 from levain.coordinator.driver import LivenessEvidence, NotSent, SendCommand
 from levain.coordinator import room_readguard
+from levain.coordinator import room_live
 from levain.coordinator.room_host import HOSTCMD_ENV, HostCommands, door_tools as host_door_tools
 from levain.coordinator.room_mcp import LAUNCH_ENV
 from levain.coordinator.store import CoordError
@@ -689,7 +690,8 @@ class RoomLauncher:
                                       "written for this launch; nothing was spawned")
             with open(stderr_path, "ab") as errf:
                 proc = self._spawn(argv, cwd=self._setting.cwd, env=env, stderr=errf)
-            session = RoomSession(PipeTransport(proc), conn=self._next_conn(), session_id=sid)
+            session = RoomSession(PipeTransport(proc), conn=self._next_conn(), session_id=sid,
+                                  live=room_live.Sink(launch_id))
             self._live[launch_id] = _Live(launch_id, session, proc, workdir, room_thread=room_thread, session_id=sid,
                                           resumed=resume is not None, resume_failed=resume_failed)
             self._svc.activate(launch_id, "probing", "room spawned" if resume_failed is None else _one_line(
@@ -890,6 +892,7 @@ class RoomLauncher:
 
     def _end(self, launch_id: str, cause: str, *, note: Optional[str] = None, nonce: Optional[str] = None) -> None:
         held = self._live.pop(launch_id, None)
+        room_live.forget(launch_id)                      # the ephemeral streamed text ends with its launch
         if held is not None:
             group = _leads_own_group(held.proc)          # asked while the leader is unreaped: it names the group
             try:

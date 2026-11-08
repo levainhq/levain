@@ -409,10 +409,14 @@ class ClaudeSession:
     harness: ClassVar[str] = "claude"
 
     def __init__(self, transport: Transport, *, conn: int = 1, session_id: str = "", read_wait: float = 0.0,
-                 interrupt_wait: float = 5.0, clock: Callable[[], float] = time.monotonic) -> None:
+                 interrupt_wait: float = 5.0, clock: Callable[[], float] = time.monotonic,
+                 live: Any = None) -> None:
         if not isinstance(conn, int) or isinstance(conn, bool) or not 0 <= conn <= CONN_MAX:
             raise NotLive("position space exhausted: conn is outside its width")
         self._t = transport
+        # ``live``: an optional ephemeral sink (``room_live.Sink``: ``delta(turn, text)`` / ``clear()``) for the text
+        # deltas a ``--include-partial-messages`` child streams. None: stream_event frames are ignored, as before.
+        self._live = live
         self._conn = conn
         self._session_id = session_id
         self._read_wait = read_wait
@@ -487,7 +491,8 @@ class ClaudeSession:
         if self._eof_seen or not getattr(self._t, "eof", False):
             return
         self._eof_seen = True
-        rc = getattr(self._t, "returncode", None)
+        self._live_clear()
+        rc =getattr(self._t, "returncode", None)
         why = getattr(self._t, "error", None) or "the child's output ended"
         self._emit("error", f"transport:{self._conn}", turn_id=self._open,
                    body=f"{why}; returncode {rc if isinstance(rc, int) else 'unknown'}"[:300])
@@ -543,8 +548,12 @@ class ClaudeSession:
             self._on_init(frame, uid)
         elif kind == "system" and sub in ("hook_started", "hook_response"):
             self._on_hook(frame, uid, sub)
+        elif kind == "stream_event":
+            self._on_stream_event(frame)
         elif kind == "assistant":
             self._recent.append(frame)
+            if frame.get("parent_tool_use_id") is None:
+                self._live_clear()          # the whole frame is the record; the streamed copy of it ends here
             self._on_assistant(frame, uid)
         elif kind == "user":
             self._recent.append(frame)
@@ -565,6 +574,35 @@ class ClaudeSession:
         elif kind == "system" and sub == "permission_denied":
             self._recent.append(frame)
         # every other line (rate_limit_event, hook_progress, status, stream deltas) is no event
+
+    def _live_clear(self) -> None:
+        if self._live is not None:
+            try:
+                self._live.clear()
+            except Exception:  # noqa: BLE001 - the live copy is a convenience; it never fails an ingest
+                pass
+
+    def _on_stream_event(self, frame: Mapping[str, Any]) -> None:
+        """A ``--include-partial-messages`` frame: ``{"type": "stream_event", "event": {<Messages-API stream event>}}``.
+        Only the main agent's ``content_block_delta`` / ``text_delta`` text is kept, in the ephemeral live sink; a
+        ``message_start`` or a text ``content_block_start`` starts a fresh buffer. No event is emitted and nothing is
+        recorded, and every other event or shape (thinking, input_json, ping, a sub-agent's) is ignored."""
+        if self._live is None or frame.get("parent_tool_use_id") is not None:
+            return
+        ev = frame.get("event")
+        if not isinstance(ev, Mapping):
+            return
+        et = ev.get("type")
+        try:
+            if et == "message_start" or (et == "content_block_start" and isinstance(ev.get("content_block"), Mapping)
+                                         and ev["content_block"].get("type") == "text"):
+                self._live.clear()
+            elif et == "content_block_delta":
+                d = ev.get("delta")
+                if isinstance(d, Mapping) and d.get("type") == "text_delta" and isinstance(d.get("text"), str):
+                    self._live.delta(self._open, d["text"])
+        except Exception:  # noqa: BLE001 - the live copy never fails an ingest
+            pass
 
     def _on_init(self, frame: Mapping[str, Any], uid: str) -> None:
         self._init = {k: frame[k] for k in _INIT_KEEP if k in frame}
@@ -629,6 +667,7 @@ class ClaudeSession:
         if frame.get("is_error") is True:
             parts.append("is_error")
         self._emit("turn_ended", uid, turn_id=tid, body=" ".join(parts))
+        self._live_clear()
         self._open = None
         self._calls.clear()
 
@@ -932,6 +971,7 @@ class ClaudeSession:
         try:
             self._t.close()
         finally:
+            self._live_clear()
             self._close_done.set()
 
     # --- accounting the launcher and tests read ----------------------------------------------------------------------
@@ -1098,7 +1138,8 @@ def room_argv(*, mcp_config: str | os.PathLike[str], settings: str | os.PathLike
     for name, p in (("mcp_config", mcp_config), ("settings", settings)):
         if not os.path.isabs(str(p)):
             raise ValueError(f"{name} must be an absolute path")
-    argv = [claude_bin, "-p", "--input-format", "stream-json", "--output-format", "stream-json", "--verbose"]
+    argv = [claude_bin, "-p", "--input-format", "stream-json", "--output-format", "stream-json", "--verbose",
+            "--include-partial-messages"]
     if model:
         argv += ["--model", model]
     argv += ["--tools", ",".join(ROOM_TOOLS),
