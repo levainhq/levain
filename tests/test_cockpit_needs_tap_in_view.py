@@ -31,35 +31,50 @@ def test_tapped_row_detail_opens_in_view_and_close_restores_place(tmp_path: Path
     _file_many(tmp_path, monkeypatch)
     _root, src, _ids = _install(tmp_path)
     last = f"{ROWS}[{ROWS}.length - 1]"
-    probe = ("JSON.stringify((() => { const m = document.querySelector('#levain-modal .modal') || document.querySelector('#levain-modal');"
+    probe = ("JSON.stringify((() => { const o = document.getElementById('levain-modal'); const m = o && o.querySelector('.modal');"
              " const r = m ? m.getBoundingClientRect() : null; const a = document.activeElement;"
-             " return {open: !!m, top: r && r.top, bottom: r && r.bottom, ih: innerHeight, sy: scrollY,"
-             " focusIn: !!(m && a && m.contains(a)), pos: m && getComputedStyle(document.getElementById('levain-modal')).position}; })())")
-    after = ("JSON.stringify({sy: scrollY, open: !!document.getElementById('levain-modal'), tag: document.activeElement && document.activeElement.className,"
+             " const fr = a && a.getBoundingClientRect ? a.getBoundingClientRect() : null;"
+             " return {open: !!m, top: r && r.top, bottom: r && r.bottom, w: r && r.width, h: r && r.height, ih: innerHeight, sy: scrollY,"
+             " focusIn: !!(m && a && m.contains(a)),"
+             " focusInView: !!(fr && fr.width > 0 && fr.height > 0 && fr.top >= 0 && fr.bottom <= innerHeight + 1),"
+             " pos: o && getComputedStyle(o).position}; })())")
+    after = ("JSON.stringify({sy: scrollY, modalGone: !document.getElementById('levain-modal'), anyModal: !!document.querySelector('#levain-modal, .modal-overlay'),"
+             " tag: document.activeElement && document.activeElement.className,"
+             " locked: document.body.classList.contains('needs-locked'), bodyPos: document.body.style.position, bodyTop: document.body.style.top,"
              f" onLast: document.activeElement === {last}, ih: innerHeight, rowTop: {last}.getBoundingClientRect().top}})")
+    record_press = ("(() => { document.addEventListener('click', (e) => { if (e.isTrusted && e.target.closest && e.target.closest('.needs-row'))"
+                    " window.__pressY = scrollY; }, true); return 1; })()")
+    steps = [{"emulate": PHONE}, {"until": "!!document.querySelector('#ck-needs .needs-more-row') && 1", "ms": 20000},
+             {"eval": "document.querySelector('#ck-needs .needs-more-row').click(); 1"},   # the list folds past a few rows: open it
+             {"until": READY, "ms": 20000},
+             {"eval": "new Promise(r => setTimeout(() => r(1), 600))"},
+             {"eval": record_press},    # scrollY at the trusted press itself, after every settle: the place the reader had
+             {"eval": f"(() => {{ {last}.scrollIntoView({{block: 'center'}}); {last}.focus(); return scrollY; }})()"},
+             {"eval": "new Promise(r => setTimeout(() => r(1), 300))"},
+             {"tap": last},
+             {"until": "document.getElementById('levain-modal')"},
+             {"eval": "new Promise(r => setTimeout(() => r(1), 800))"},
+             {"eval": probe},
+             {"eval": "(() => { window.scrollTo(0, 0); return 1; })()"},   # a locked body that jumps (iOS), as the page behind the view
+             {"key": "Escape", "vk": 27},    # a trusted key to the element holding focus inside the view
+             {"eval": "new Promise(r => setTimeout(() => r(1), 400))"},
+             {"eval": after}, {"eval": "window.__pressY"}]
+    # the driver collects a value per step except emulate and key: map each step to its slot in "values"
+    slot = [sum(1 for t in steps[:n] if "emulate" not in t and "key" not in t) for n in range(len(steps))]
+    i_probe, i_after, i_press = (slot[steps.index({"eval": x})] for x in (probe, after, steps[-1]["eval"]))
     with _serve(src, surface_tokens={"browser": "T"}, install_class="reported") as (url, _httpd):
-        vals = _drive(tmp_path, f"{url}/#write_token=T", [{"emulate": PHONE}, {"until": "!!document.querySelector('#ck-needs .needs-more-row') && 1", "ms": 20000},
-            {"eval": "document.querySelector('#ck-needs .needs-more-row').click(); 1"},   # the list folds past a few rows: open it
-            {"until": READY, "ms": 20000},
-            {"eval": "new Promise(r => setTimeout(() => r(1), 600))"},
-            {"eval": f"(() => {{ {last}.scrollIntoView({{block: 'center'}}); window.__sy0 = scrollY; {last}.focus(); return scrollY; }})()"},
-            {"eval": "new Promise(r => setTimeout(() => r(1), 300))"},
-            {"tap": last},
-            {"until": "document.getElementById('levain-modal')"},
-            {"eval": "new Promise(r => setTimeout(() => r(1), 800))"},
-            {"eval": probe},
-            {"eval": "(() => { window.scrollTo(0, 0); return 1; })()"},   # a locked body that jumps (iOS), as the page behind the view
-            {"eval": "(() => { document.querySelector('#levain-modal').dispatchEvent(new KeyboardEvent('keydown', {key: 'Escape', bubbles: true})); return 1; })()"},
-            {"eval": "new Promise(r => setTimeout(() => r(1), 400))"},
-            {"eval": after}, {"eval": "window.__sy0"}])["values"]
-    objs = [json.loads(v) for v in vals if isinstance(v, str) and v.startswith("{")]
-    opened = next(o for o in objs if "focusIn" in o)
-    closed = next(o for o in objs if "onLast" in o)
-    sy0 = vals[-1]            # scrollY just before the tap (the page is locked at open, so the open-time reading is not the place)
+        vals = _drive(tmp_path, f"{url}/#write_token=T", steps)["values"]
+    opened = json.loads(vals[i_probe])
+    closed = json.loads(vals[i_after])
+    sy0 = vals[i_press]       # scrollY at the trusted press (the page is locked at open, so the open-time reading is not the place)
     print("MEASURED", opened, closed, sy0)
+    assert isinstance(sy0, (int, float)) and sy0 > 300, sy0                          # a long list scrolled well away from the top
     assert opened["open"], opened
+    assert opened["w"] > 0 and opened["h"] > 0, opened
     assert opened["pos"] == "fixed", opened
     assert opened["top"] >= 0 and opened["bottom"] <= opened["ih"] + 1, opened      # the detail is on screen
-    assert opened["focusIn"], opened                                                 # focus moved into it
+    assert opened["focusIn"] and opened["focusInView"], opened                       # focus moved into it, and it is in view
+    assert closed["modalGone"] and not closed["anyModal"], closed                    # the view is gone
+    assert not closed["locked"] and closed["bodyPos"] != "fixed" and closed["bodyTop"] == "", closed   # the body lock is cleared
     assert abs(closed["sy"] - sy0) <= 4, (closed, sy0)                               # the page is where it was
     assert closed["onLast"], closed                                                  # focus returned to the tapped row
