@@ -438,3 +438,80 @@ def test_store_write_holds_the_write_lock_so_add_role_is_serialised(tmp_path):
                 other.execute("BEGIN IMMEDIATE")
         finally:
             other.close()
+
+
+# --- ceiling.withhold (levain 1107, W2: the signed role declares what its workspace snapshot withholds) -----------------------
+
+def test_ceiling_withhold_is_stored_sorted_and_moves_the_role_hash():
+    base = role_hash(ROLE)
+    r = copy.deepcopy(ROLE)
+    r["ceiling"]["withhold"] = ["secrets/**", "docs/**"]
+    assert parse_role(r)["ceiling"]["withhold"] == ["docs/**", "secrets/**"]
+    assert role_hash(r) != base
+    r2 = copy.deepcopy(ROLE)
+    r2["ceiling"]["withhold"] = ["docs/**", "secrets/**"]
+    assert role_hash(r2) == role_hash(r)                       # one spelling of a set is one hash
+    from levain.agents.role import role_withhold
+    assert role_withhold(r) == ("docs/**", "secrets/**") and role_withhold(ROLE) == ()
+
+
+def test_a_role_without_withhold_hashes_exactly_as_before():
+    # the field is absent from the canonical form, so every role registered before W2 keeps its hash (pinned value)
+    assert role_hash(ROLE) == hashlib.sha256(b"levain-rolespec/1\n" + _canonical(parse_role(ROLE)).encode()).hexdigest()
+    assert "withhold" not in canonical_role(ROLE)
+
+
+@pytest.mark.parametrize("bad,why", [
+    ("docs/**", "must be a list"), ([1], "must be a string"), (["docs/**", "docs/**"], "twice"),
+    ([""], "ceiling.withhold[0]"), (["/abs"], "ceiling.withhold[0]"), ([f"p{i}" for i in range(257)], "more than 256"),
+])
+def test_a_malformed_withhold_is_refused_naming_the_field(bad, why):
+    r = copy.deepcopy(ROLE)
+    r["ceiling"]["withhold"] = bad
+    with pytest.raises(RoleError, match="ceiling.withhold") as exc:
+        parse_role(r)
+    assert why in str(exc.value)
+
+
+def test_withhold_never_reaches_the_envelope_narrowing():
+    from levain.agents.role import envelope_ceiling
+    from levain.coordinator.envelopes import narrow_scope
+    r = copy.deepcopy(ROLE)
+    r["ceiling"]["withhold"] = ["docs/**"]
+    ceiling = instance_ceiling(r)
+    scope = {"where": [{"repo": "r", "paths": ["a/"]}], "lands": [], "pushes": [], "publishes": []}
+    with pytest.raises(Exception, match="withhold"):            # the raw ceiling is refused by narrow_scope ...
+        narrow_scope(scope, ceiling)
+    assert narrow_scope(scope, envelope_ceiling(ceiling))["where"] == [{"repo": "r", "paths": ["a/"]}]   # ... this view is not
+    assert "withhold" not in envelope_ceiling(ceiling) and ceiling["withhold"] == ["docs/**"]
+
+
+def test_a_role_too_long_to_travel_as_signed_role_evidence_is_refused_at_registration(tmp_path):
+    """L3 W2 r1 MED (codex): a valid role whose canonical text is over SIGNED_TEXT_MAX was registrable, and every
+    workspace launch of an agent pinning it was then a standing signed-role-unavailable. Refused at the source now."""
+    from levain.agents.signed_role import SIGNED_TEXT_MAX
+    store = open_agent_store(tmp_path / "store")
+    big = copy.deepcopy(ROLE)
+    big["ceiling"]["lands"] = [f"{i:02d}" + "x" * 1022 for i in range(70)]       # 70 x 1 KiB: a valid ceiling
+    assert len(canonical_role(big).encode()) > SIGNED_TEXT_MAX                 # parse_role accepts it
+    with pytest.raises(RoleError) as exc:                # revert: the SIGNED_TEXT_MAX check in add_role
+        add_role(store, big)
+    assert str(exc.value) == (f"the role's canonical text is over {SIGNED_TEXT_MAX} bytes, the most a launch can carry "
+                              "as signed-role evidence: shorten it")
+    fits = copy.deepcopy(ROLE)
+    fits["ceiling"]["lands"] = big["ceiling"]["lands"][:60]
+    assert len(canonical_role(fits).encode()) <= SIGNED_TEXT_MAX
+    assert add_role(store, fits)[3] is True
+
+
+def test_the_role_bound_is_the_byte_length_at_exactly_the_limit(tmp_path, monkeypatch):
+    from levain.agents import role as R
+    store = open_agent_store(tmp_path / "store")
+    n = len(canonical_role(ROLE).encode())
+    monkeypatch.setattr(R, "SIGNED_TEXT_MAX", n)
+    assert add_role(store, ROLE)[3] is True                                     # exactly the limit registers
+    monkeypatch.setattr(R, "SIGNED_TEXT_MAX", n - 1)                           # revert `>` to `>=`: the line above fails
+    other = copy.deepcopy(ROLE)
+    other["model"] = "n"                                                        # same length, new content
+    with pytest.raises(RoleError):
+        add_role(store, other)

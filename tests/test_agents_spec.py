@@ -470,3 +470,18 @@ def test_the_agent_verb_reports_an_unattached_dream_as_a_fact_and_a_corrupt_atta
     conn.close()
     assert main([*d, "agent"]) == 1
     assert "impostor" in capsys.readouterr().err
+
+
+def test_a_spec_too_long_to_travel_as_signed_role_evidence_is_refused_at_registration(store, monkeypatch):
+    """L3 W2 r1 MED (codex): the spec text rides beside the role's as evidence; one that could never travel is refused
+    when it is registered, never at each launch."""
+    from levain.agents import spec as SPm
+    s = spec("job_push_check")
+    n = len(_canonical(finalize_spec(s, ZONE)).encode())
+    monkeypatch.setattr(SPm, "SIGNED_TEXT_MAX", n - 1)
+    with pytest.raises(SpecError) as exc:                # revert: the SIGNED_TEXT_MAX check in _register_in
+        register_spec(store, s, ZONE)
+    assert str(exc.value) == (f"the spec's canonical text is over {n - 1} bytes, the most a launch can carry as "
+                              "signed-role evidence: shorten it")
+    monkeypatch.setattr(SPm, "SIGNED_TEXT_MAX", n)
+    assert register_spec(store, s, ZONE)[3] is True                            # exactly the limit registers

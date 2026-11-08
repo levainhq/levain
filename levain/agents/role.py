@@ -10,6 +10,11 @@ required and ``kind`` optional:
 - ``ceiling``   a closed mapping, any of ``where`` (list of ``{"repo": str, "paths": [str]}``) and ``lands`` /
                 ``pushes`` / ``publishes`` (lists of str): the envelope vocabulary (A0 §3.2). A0 names no shape for
                 a role's ceiling; this is the decision, kept to what the link's ``capabilities`` already speak.
+                ``withhold`` (list of str, levain 1107 W2, Phill np-b978efbc (a)) is NOT envelope vocabulary: it is the
+                workspace snapshot's withhold patterns (:func:`levain.dispatch.policy.match` grammar), a role can only
+                WITHHOLD more. It sits in the signed role, so the role_hash pins it and his signature on the agent
+                link covers it; a role without it hashes exactly as before (an absent key is not written). The
+                coordinator's envelope narrowing never sees it (:func:`envelope_ceiling`).
 - ``model``     str; non-empty for a session executor.
 - ``harness``   ``claude`` | ``codex`` for a session executor, ``""`` for any other executor (D1 R-D1).
 - ``executor``  ``session`` | ``dream``.
@@ -52,10 +57,10 @@ from levain.authority import _canonical
 
 __all__ = ["RoleError", "ROLE_FIELDS", "ROLE_OPTIONAL_FIELDS", "ROLE_KINDS",
            "DEFAULT_KIND", "ROLE_NAME", "parse_role", "parse_role_text", "canonical_role", "role_hash",
-           "instance_ceiling", "spawn_namespace", "add_role", "get_role", "latest_version",
+           "instance_ceiling", "envelope_ceiling", "role_withhold", "spawn_namespace", "add_role", "get_role", "latest_version",
            "role_by_hash"]
 
-ROLE_HASH_PREFIX = b"levain-rolespec/1\n"
+from levain.agents.signed_role import ROLE_HASH_PREFIX, SIGNED_TEXT_MAX   # noqa: E402  (one home: the run server re-derives this hash)
 ROLE_NAME = re.compile(r"[a-z][a-z0-9-]{0,47}")
 ROLE_FIELDS = ("name", "brief", "ceiling", "model", "harness", "executor")  # the REQUIRED fields, not all allowed ones
 ROLE_OPTIONAL_FIELDS = ("kind",)
@@ -65,6 +70,7 @@ EXECUTORS = ("session", "dream")
 HARNESSES = ("claude", "codex")
 SLOT_TYPES = ("str", "int", "path")
 CEILING_LISTS = ("lands", "pushes", "publishes")
+WITHHOLD_MAX = 256       # the snapshot's own bound (levain.dispatch.snapshot._WITHHOLD_MAX)
 MAX_VERSION = 2**63 - 1  # SQLite's INTEGER ceiling
 
 
@@ -132,10 +138,12 @@ def _brief(value: Any) -> dict[str, Any]:
 
 
 def _ceiling(value: Any) -> dict[str, Any]:
-    ceiling = _exact(value, ("where",) + CEILING_LISTS, "ceiling", required=False)
+    ceiling = _exact(value, ("where", "withhold") + CEILING_LISTS, "ceiling", required=False)
     out: dict[str, Any] = {}
     for key, val in ceiling.items():
-        if key == "where":
+        if key == "withhold":
+            out[key] = _withhold(val)
+        elif key == "where":
             if not isinstance(val, list):
                 raise RoleError("ceiling.where must be a list")
             out[key] = []
@@ -146,6 +154,23 @@ def _ceiling(value: Any) -> dict[str, Any]:
         else:
             out[key] = _str_list(val, f"ceiling.{key}")
     return out
+
+
+def _withhold(value: Any) -> list[str]:
+    """``ceiling.withhold``: a list of snapshot withhold patterns, each in the pattern grammar the snapshot builder
+    enforces (so a role that registers is a role the stager can use), no duplicates, at most :data:`WITHHOLD_MAX`. Stored
+    sorted: one spelling of a set is one role_hash."""
+    from levain.dispatch.policy import _pattern_problem
+    items = _str_list(value, "ceiling.withhold")
+    if len(items) > WITHHOLD_MAX:
+        raise RoleError(f"ceiling.withhold holds more than {WITHHOLD_MAX} patterns")
+    for i, p in enumerate(items):
+        problem = _pattern_problem(p)
+        if problem is not None:
+            raise RoleError(f"ceiling.withhold[{i}]: {problem}")
+    if len(set(items)) != len(items):
+        raise RoleError("ceiling.withhold lists a pattern twice")
+    return sorted(items)
 
 
 def _kind(value: Any) -> str:
@@ -225,6 +250,17 @@ def instance_ceiling(role: dict[str, Any]) -> dict[str, Any]:
     return copy.deepcopy(parse_role(role)["ceiling"])
 
 
+def envelope_ceiling(ceiling: dict[str, Any]) -> dict[str, Any]:
+    """``ceiling`` without the keys that are not envelope vocabulary (``withhold``): what the coordinator's envelope
+    narrowing is handed. A new non-envelope ceiling key is dropped HERE, once, and never reaches ``narrow_scope``."""
+    return {k: v for k, v in ceiling.items() if k != "withhold"}
+
+
+def role_withhold(role: dict[str, Any]) -> tuple[str, ...]:
+    """The signed role's snapshot withhold patterns (sorted; empty when the role declares none)."""
+    return tuple(parse_role(role)["ceiling"].get("withhold", ()))
+
+
 def spawn_namespace(name: str) -> str:
     name = _str(name, "name")
     if not ROLE_NAME.fullmatch(name):
@@ -264,6 +300,11 @@ def add_role(store: AgentStore, role: dict[str, Any]) -> tuple[str, str, int, bo
     returned as it is (``created`` False); new content under a known name takes the next version."""
     role = parse_role(role)
     text = _canonical(role)
+    if len(text.encode("utf-8")) > SIGNED_TEXT_MAX:
+        # a launch that stages a workspace carries this text as signed-role evidence (levain.agents.signed_role): a role
+        # that could never travel is refused HERE, not at every launch of every agent that pins it (L3 W2 r1 MED)
+        raise RoleError(f"the role's canonical text is over {SIGNED_TEXT_MAX} bytes, the most a launch can carry as "
+                        "signed-role evidence: shorten it")
     digest = role_hash(role)
     with store.write() as conn:
         row = conn.execute("SELECT name, version, spec FROM agent_roles WHERE role_hash = ?", (digest,)).fetchone()

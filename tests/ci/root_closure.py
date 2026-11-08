@@ -445,12 +445,19 @@ LAZY_SITES = {
     'levain/agents/session_client.py::DispatchSessionLauncher.build_workspace::from levain.dispatch import stager': 'operator',
     # operator: ``build_launcher`` runs only in the operator's process (the controller, an agent session or the session client); the dispatch run server only imports the module
     'levain/agents/session_client.py::build_launcher::from levain.agents.session_wire import read_install': 'operator',
+    # operator: ``build_workspace`` re-derives the signed role's withhold before the snapshot is cut (levain 1107, W2); it runs only in the fire, the operator's uid
+    'levain/agents/session_client.py::DispatchSessionLauncher.build_workspace::from levain.agents.signed_role import SignedRoleRefused, signed_withhold': 'operator',
+    # operator: ``signed_role_of`` reads the agent store for the spec and role texts a workspace LAUNCH carries; the fire only, the run server never calls it
+    'levain/agents/session_client.py::signed_role_of::from levain.agents import role as _role, spec as _spec': 'operator',
+    'levain/agents/session_client.py::signed_role_of::from levain.authority import _canonical': 'operator',
+    # operator: ``_withhold`` validates a role file's ceiling.withhold at registration (the operator's CLI); the run server never parses a role file
+    'levain/agents/role.py::_withhold::from levain.dispatch.policy import _pattern_problem': 'operator',
     # operator: ``default_run_socket`` runs only in the operator's process (the controller, an agent session or the session client); the dispatch run server only imports the module
     'levain/agents/session_client.py::default_run_socket::from levain.slot import layout': 'operator',
-    # operator: ``link_proof`` runs only in the operator's process (the controller, an agent session or the session client); the dispatch run server only imports the module
-    'levain/agents/session_client.py::link_proof::from levain import authority as _auth': 'operator',
-    # operator: ``link_proof`` runs only in the operator's process (the controller, an agent session or the session client); the dispatch run server only imports the module
-    'levain/agents/session_client.py::link_proof::from levain.agent_authority import AgentAuthority': 'operator',
+    # operator: ``_standing_link`` runs only under ``link_proof`` and ``signed_link_of``, in the operator's process (the controller, an agent session or the session client); the dispatch run server only imports the module
+    'levain/agents/session_client.py::_standing_link::from levain import authority as _auth': 'operator',
+    # operator: ``_standing_link`` runs only under ``link_proof`` and ``signed_link_of``, in the operator's process (the controller, an agent session or the session client); the dispatch run server only imports the module
+    'levain/agents/session_client.py::_standing_link::from levain.agent_authority import AgentAuthority': 'operator',
     # operator: ``link_proof`` runs only in the operator's process (the controller, an agent session or the session client); the dispatch run server only imports the module
     'levain/agents/session_client.py::link_proof::from levain.cockpit.firejournal import DB_NAME': 'operator',
     # operator: ``register_specs`` (and ``_register_in`` under it) is called only by ``levain agents register`` (``levain/agents/cli.py``), the operator's process; the dispatch run server only imports the module

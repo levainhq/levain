@@ -114,6 +114,7 @@ from levain.agents.authority_replica import AuthorityReplica, ReplicaRefused, Re
 from levain.agents.accounting import ActionExposure, StopResult
 from levain.agents.session_launcher import LauncherRefused, RealLauncher, SessionIndex
 from levain.slot import Refused
+from levain.agents.signed_role import SignedLink, SignedRoleRefused, signed_withhold
 from levain.slot import workspace as WS
 from levain.slot.layout import RUN, STORE, dispatch_store_dir
 
@@ -151,9 +152,11 @@ def verify_point_of_use(proof: C.LinkProof, exposure: Optional[ActionExposure], 
                         replay: Callable[[], Any], now: Callable[[], datetime],
                         bar_of: Callable[[str], tuple[bool, int]],
                         verify_sig: Optional[Callable[..., bool]] = None, rejudge: bool = False,
-                        billing: str) -> None:
+                        billing: str) -> Any:
     """The run server's whole authority check for one fire. Raises :class:`LauncherRefused` (standing, or transient for
-    a ledger or store that cannot be read); returns None when the fire may go on.
+    a ledger or store that cannot be read); returns the link's grant, as THIS replay holds it, when the fire may go on
+    (a LAUNCH that stages a workspace derives the signed role's withhold against its ``agent_id`` and ``role_hash``:
+    :meth:`RunServer._signed_withhold`).
 
     The ruling (Q1 = (a), Phill 11-04): the operator's enrolled signature over the agent's LINK, which names the spec
     hash, is what authorises a fire. There is no per-occurrence signature (none exists when he signs). So, at the point
@@ -232,9 +235,10 @@ def verify_point_of_use(proof: C.LinkProof, exposure: Optional[ActionExposure], 
             raise LauncherRefused("exposure-over-link", "an api_key run carries no action exposure")
         if not grant["budget_run_usd_micros"] > 0:
             raise LauncherRefused("link-run-budget-zero", "the link signs no dollars for a run")
-        return
+        return grant
     if exposure is None or exposure.tunnel_bytes is None or exposure.actions > calls or exposure.tunnel_bytes > tunnel:
         raise LauncherRefused("exposure-over-link", "the requested exposure is not inside the link's per-run budgets")
+    return grant
 
 
 def _row_is_the_ledgers(state: Any, row: C.LinkRow, want_seq: int, verify_sig: Callable[..., bool]) -> None:
@@ -278,10 +282,10 @@ class FrameClaims:
 def replica_verifier(replica: AuthorityReplica, *,
                      now: Callable[[], datetime] = lambda: datetime.now(timezone.utc),
                      verify_sig: Optional[Callable[..., bool]] = None
-                     ) -> Callable[[C.LinkProof, Optional[ActionExposure], Optional[FrameClaims]], None]:
+                     ) -> Callable[[C.LinkProof, Optional[ActionExposure], Optional[FrameClaims]], Any]:
     """The production ``verify`` of :class:`RunServer`: :func:`verify_point_of_use` over THIS server's replica, with
     the ledger head and the bar taken from the frame. No second authority, no operator-home read."""
-    def verify(proof: C.LinkProof, exposure: Optional[ActionExposure], claims: Optional[FrameClaims]) -> None:
+    def verify(proof: C.LinkProof, exposure: Optional[ActionExposure], claims: Optional[FrameClaims]) -> Any:
         if claims is None:
             raise LauncherRefused("ledger-head-missing", "the frame names no ledger head")
         # The claimed head must be HELD by the replica (its row at that seq, same hash), not be its exact head: another
@@ -313,8 +317,8 @@ def replica_verifier(replica: AuthorityReplica, *,
             raise LauncherRefused("ledger-behind", "the replica moved during the check", reason_class="transient")
         if held != digest:                  # the replica holds that seq (append-only, verified): another chain
             raise LauncherRefused("ledger-fork", "the claimed head is not on the replica's chain")
-        verify_point_of_use(proof, exposure, replay=lambda: state, now=now, bar_of=lambda agent: (barred, closed),
-                            verify_sig=verify_sig, rejudge=claims.rejudge, billing="subscription")
+        return verify_point_of_use(proof, exposure, replay=lambda: state, now=now, bar_of=lambda agent: (barred, closed),
+                                   verify_sig=verify_sig, rejudge=claims.rejudge, billing="subscription")
     return verify
 
 
@@ -516,7 +520,7 @@ class RunServer:
     ``verify`` as :class:`FrameClaims`; without one the frames carry neither and ``verify`` gets ``None``."""
 
     def __init__(self, launcher: RealLauncher, *,
-                 verify: Callable[[C.LinkProof, Optional[ActionExposure], Optional[FrameClaims]], None],
+                 verify: Callable[[C.LinkProof, Optional[ActionExposure], Optional[FrameClaims]], Any],
                  pool_free: Callable[[], bool], peer_ok: Callable[[socket.socket], bool],
                  holder_idle_s: float = HOLDER_IDLE_S, max_connections: int = MAX_CONNECTIONS,
                  max_holders: int = MAX_HOLDERS, replica: Optional[AuthorityReplica] = None,
@@ -615,8 +619,8 @@ class RunServer:
             try:
                 claims = self._claims(req, bar=True)
                 launch, proof = C.launch_from_wire({k: v for k, v in req.items() if k not in ("ledger_head", "bar")})
-                self._verify(proof, launch.exposure, claims)
-                launch = self._workspace_of(launch, owner)
+                grant = self._verify(proof, launch.exposure, claims)
+                launch = self._workspace_of(launch, owner, proof, grant)
                 self._pool()
                 holder = self._spawn(launch, proof, claims)
             finally:
@@ -698,7 +702,7 @@ class RunServer:
         key, part, offset, raw = C.ws_chunk_from_wire(req)
         return C.ok_answer(rid, received=self._uploads.chunk(self._key(key), owner, part, offset, raw))
 
-    def _workspace_of(self, launch: Any, owner: Optional[WS.UploadOwner]) -> Any:
+    def _workspace_of(self, launch: Any, owner: Optional[WS.UploadOwner], proof: Any = None, grant: Any = None) -> Any:
         """The LAUNCH's workspace judgment, after the authority check and before the pool check or any mint: the launch
         itself when it names none and no upload exists; the launch with its member's ``manifest_digest`` filled by the
         server's own derivation when the upload verifies; else ``session_refused:workspace``. Only a standing refusal of
@@ -712,7 +716,7 @@ class RunServer:
                     return launch
                 raise WS.WorkspaceRefused("unavailable", "this server stages no workspace")
             ws = self._uploads.verify(launch.session_key, owner if owner is not None else WS.UploadOwner(),
-                                      launch.workspace)
+                                      launch.workspace, signed_withhold=lambda: self._signed_withhold(proof, grant))
         except WS.WorkspaceRefused as exc:
             _log.warning("workspace refused for %s: %s", launch.session_key, exc.cause)
             refuse = getattr(self.launcher, "refuse_key", None)
@@ -720,6 +724,24 @@ class RunServer:
                 refuse(launch.session_key, WS.WORKSPACE_REFUSAL, occurrence_id=launch.occurrence_id)
             raise
         return launch if ws is None else dataclasses.replace(launch, workspace=ws)
+
+    @staticmethod
+    def _signed_withhold(proof: Any, grant: Any) -> tuple:
+        """The withhold the SIGNED role declares (levain 1107, W2), for a launch that names a workspace: re-derived from
+        the proof's role evidence against the link's ``agent_id``, ``spec_hash`` and ``role_hash`` as ``grant`` (the
+        grant the point-of-use check just judged, from THIS server's replay) names them
+        (:func:`levain.agents.signed_role.signed_withhold`); a spec that pins another role than the link names derives
+        nothing (L3 W2 r1 HIGH, codex). Called by :meth:`WorkspaceUploads.verify` inside its judgment, only for a
+        member with this connection's upload: a proof that carries no evidence, or evidence that does not derive the
+        signed role, is ``session_refused:workspace``, standing (the bytes will not become the signed role's by waiting),
+        and tombstones the key like every other standing refusal of the upload (L3 W2 r1 LOW, complement)."""
+        signed = getattr(proof, "signed", None)
+        if signed is None:
+            raise WS.WorkspaceRefused("signed-role-missing", "the proof carries no role evidence for the workspace")
+        try:
+            return signed_withhold(signed, SignedLink.of_grant(grant))
+        except SignedRoleRefused as exc:
+            raise WS.WorkspaceRefused(f"signed-role-{exc.name}", exc.detail) from None
 
     @staticmethod
     def _key(v: object) -> str:
