@@ -1397,6 +1397,18 @@
     vcBusy = false;
     if (final) vcDone = true;
   }
+  // After the first read the spend would freeze at that moment, so a focus or a return to the tab reads voice.json again and
+  // repaints from the answer. A failed or odd answer leaves what is on screen as it was.
+  let vcAgain = false;
+  async function voiceReread() {
+    if (!vcDone || !vcState || vcAgain || document.hidden) return;
+    vcAgain = true;
+    try {
+      const res = await api("GET", "/cockpit/voice.json", undefined, READ_TIMEOUT_MS);
+      if (res && res.status === 200 && res.data && Array.isArray(res.data.providers)) { vcState = res.data; paintVoice(); }
+    } catch (_) { /* keep the last good read */ }
+    vcAgain = false;
+  }
   function vcRow(label, control, help) {
     const r = el("div", "dev-row vc-row");
     const lab = el("label", "vc-lab", label);
@@ -1573,8 +1585,8 @@
     readPresence();
     // The cockpit stores its token a moment after load when the link carried one; look again, then keep a slow pulse.
     setTimeout(() => { refresh(); readPresence(); voiceProbe(); }, 2500);
-    window.addEventListener("focus", voiceProbe);
-    document.addEventListener("visibilitychange", () => { if (!document.hidden) voiceProbe(); });
+    window.addEventListener("focus", () => { voiceProbe(); voiceReread(); });
+    document.addEventListener("visibilitychange", () => { if (!document.hidden) { voiceProbe(); voiceReread(); } });
     // The Follow line is the server's one derivation, re-read while the page is visible so a second cockpit (a phone's) never
     // keeps a state the laptop's already left: on a short pulse, when the tab comes back, and when the window gains focus.
     const reread = () => { if (!document.hidden && !prGone && !prBusy) readPresence(); };

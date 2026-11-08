@@ -175,3 +175,23 @@ def test_with_the_ledger_unreadable_the_caps_stay_the_spent_figures_go_and_one_n
     assert "spent" not in got["caps"][0].lower() and "null" not in got["all"] and "?" not in got["all"], got
     assert got["gone"] == ["Spend unavailable: the ledger can't be read."], got
     assert got["rows"] == ["—"], got
+
+
+@needs_browser
+def test_focus_and_visibility_re_read_the_spend_after_the_first_read(tmp_path, monkeypatch):
+    b = _body(tmp_path, monkeypatch, {"deepgram": ["stt", "tts"]})
+    later = json.loads(json.dumps(b))
+    for r in later["providers"]:
+        if r["spend"]:
+            r["spend"]["day_est_usd"] = "9.99"
+    swap = "window.__later = %s; const real = window.fetch; window.fetch = (u, o) => new URL(String(u), location.href).pathname === '/cockpit/voice.json' ? Promise.resolve(new Response(JSON.stringify(window.__later), { status: 200, headers: { 'Content-Type': 'application/json' } })) : real(u, o); 1" % json.dumps(later)
+    (tmp_path / "two").mkdir()
+    v = _run(tmp_path / "two", monkeypatch, [
+        {"until": READY_BLOCK, "ms": 20000},
+        {"eval": "document.querySelector('.vc-panel').textContent.indexOf('9.99')"},
+        {"eval": "(() => { " + swap + "; })()"},
+        {"eval": "(() => { window.dispatchEvent(new Event('focus')); return 1; })()"},
+        {"until": "document.querySelector('.vc-panel').textContent.indexOf('$9.99') >= 0", "ms": 8000},
+        {"eval": "document.querySelectorAll('.vc-spend').length"},
+    ], b)
+    assert v[1] == -1 and v[5] == 2, v
