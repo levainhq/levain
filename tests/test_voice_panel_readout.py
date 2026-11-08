@@ -155,3 +155,23 @@ def test_the_panel_shows_a_not_offered_providers_spend_as_the_other_row(tmp_path
     ], b)
     got = json.loads(v[1])
     assert len(got) == 1 and "Other providers (not shown above)" in got[0] and "1 call" in got[0], got
+
+
+@needs_browser
+def test_with_the_ledger_unreadable_the_caps_stay_the_spent_figures_go_and_one_note_says_why(tmp_path, monkeypatch):
+    b = _body(tmp_path, monkeypatch, {"deepgram": ["stt", "tts"]})
+    bad = dict(b, meter="unreadable", spend_other=None, providers=[dict(r, spend=None) for r in b["providers"]],
+               caps=dict(b["caps"], spent_day_est=None, spent_month_est=None, month_start=None, day_start=None))
+    (tmp_path / "two").mkdir()
+    v = _run(tmp_path / "two", monkeypatch, [
+        {"until": READY_BLOCK, "ms": 20000},
+        {"eval": "JSON.stringify({caps: [...document.querySelectorAll('.vc-caps')].map((r) => r.textContent),"
+                 " gone: [...document.querySelectorAll('.vc-spend-gone')].map((r) => r.textContent),"
+                 " rows: [...document.querySelectorAll('.vc-spend-val')].map((r) => r.textContent),"
+                 " all: document.querySelector('.vc-panel').textContent})"},
+    ], bad)
+    got = json.loads(v[1])
+    assert len(got["caps"]) == 1 and "$" + b["caps"]["day_usd"] in got["caps"][0] and "$" + b["caps"]["month_usd"] in got["caps"][0], got
+    assert "spent" not in got["caps"][0].lower() and "null" not in got["all"] and "?" not in got["all"], got
+    assert got["gone"] == ["Spend unavailable: the ledger can't be read."], got
+    assert got["rows"] == ["—"], got

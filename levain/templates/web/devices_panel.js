@@ -1500,10 +1500,13 @@
     // keys and the estimated spend: read only
     const keys = vcState.providers.map((p) => p.name + ": " + (p.key === "set" ? "key set" : "no key")).join(" · ");
     vcBody.appendChild(el("p", "dev-note vc-keys", "Keys: " + keys + ". Revoke a key beside its grant."));
-    const caps = vcState.caps, n = (v) => (v === null || v === undefined ? "?" : v);
-    if (caps && caps.spent_month_est !== null && caps.spent_month_est !== undefined) {
-      vcBody.appendChild(el("p", "dev-note vc-caps", "Estimated spend: $" + n(caps.spent_day_est) + " today of a $" + n(caps.day_usd) +
-        " cap, $" + caps.spent_month_est + " this month of $" + n(caps.month_usd) + ". An estimate; the provider's bill is the truth."));
+    const caps = vcState.caps, has = (v) => v !== null && v !== undefined;
+    if (caps && has(caps.spent_month_est) && has(caps.spent_day_est) && has(caps.day_usd) && has(caps.month_usd)) {
+      vcBody.appendChild(el("p", "dev-note vc-caps", "Estimated spend: $" + caps.spent_day_est + " today of a $" + caps.day_usd +
+        " cap, $" + caps.spent_month_est + " this month of $" + caps.month_usd + ". An estimate; the provider's bill is the truth."));
+    } else if (caps && has(caps.day_usd) && has(caps.month_usd)) {
+      // the ledger cannot be read: the caps are still true, the spent figures are left out (the one note below says why)
+      vcBody.appendChild(el("p", "dev-note vc-caps", "Spend caps: $" + caps.day_usd + " a day, $" + caps.month_usd + " a month."));
     }
     // Dictation and per-provider spend: read only, all from voice.json (the server names the dictation provider; this page never picks one).
     const cap1 = (s) => s.charAt(0).toUpperCase() + s.slice(1), dict = vcState.mic_in;
