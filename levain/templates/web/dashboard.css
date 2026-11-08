@@ -3687,3 +3687,15 @@ body.ke .row:has(> .clause.clampable) > .list-meta:not(.clause):not(.clause-togg
 .list-meta > * { font-size: var(--fs-meta); }
 .list-meta > .sid { font-size: var(--fs-micro); }
 body.ke [data-ck-panel="tray"] .row > .list-meta > [data-ck-tag][data-ck-tag-state="overdue"] { color: var(--bad); font-weight: var(--fw-semibold); }
+
+/* The List on a phone (levain 72, lane listmobile): every fact in a row's meta line wraps inside the card (an id or a path breaks
+   anywhere), the origin pill is a plain inline item that leads the line, and the two foot controls read as two controls. */
+.list-meta > * { min-width: 0; max-width: 100%; overflow-wrap: anywhere; }
+.list-meta > .list-support { flex: 1 1 100%; white-space: normal; line-height: var(--lh-list); }
+.list-meta > .k7-repo { flex: none; }
+@media (max-width: 720px) {
+  body.ke [data-ck-panel="tray"] .held-line { justify-content: flex-start; flex-wrap: wrap; margin: var(--sp-4) 0 var(--sp-3); padding: var(--sp-3) 0 0;
+    border-top: 1px solid var(--hair); text-align: left; }
+  body.ke [data-ck-panel="tray"] .panel > .more-foot, body.ke [data-ck-panel="tray"] > .more-foot { align-self: stretch; margin: 0 var(--sp-6) var(--sp-4);
+    min-height: var(--hit-min); border: 1px solid var(--hair-2); border-radius: var(--r-md); text-decoration: none; }
+}

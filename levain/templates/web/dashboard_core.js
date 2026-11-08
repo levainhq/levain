@@ -2062,6 +2062,14 @@
     // the spore id is the common reference handle (how flow tracks + you name it,
     // e.g. "compost spore-049") — show it leading so the row is addressable; the TUI
     // shows the same id trailing (tui.render_panel_lines).
+    // A List row's pill names THAT ROW'S OWN origin: its repo, or the lowercase "<origin>:" its text leads with ("desk: ...",
+    // "levain: ..."). Never the store the row sits in (the pointer already says that) and never a repo its words merely mention;
+    // a row with no origin wears no pill. It leads the meta line, inline, so it wraps with the rest of it.
+    if (s.surface) {
+      const lead = /^([a-z][a-z0-9_-]{1,23}):\s/.exec(String(s.text || ""));
+      const origin = (typeof s.repo === "string" && s.repo) || (!foreign && typeof s.domain === "string" && s.domain) || (lead ? lead[1] : "");
+      if (origin) { const pill = el("span", "k7-repo", String(origin)); pill.dataset.repoFacet = String(origin); pill.dataset.originPill = "1"; host.appendChild(pill); }
+    }
     if (s.id && !foreign) { host.appendChild(el("span", "sid", s.id)); row.dataset.spore = String(s.id); }   // the Work lens finds a loop's row by this
     // Tray badges the disposition (a legacy note badges "note"); Open Loops the tier (a parked loop badges "parked").
     let badge;
@@ -2079,7 +2087,6 @@
       if (s.support && !s.text_locked) host.appendChild(el("span", "muted list-support", s.support));
       if (s.list_pointer) host.appendChild(tagEl("muted list-pointer", s.list_pointer));
       if (s.surface === "board") {
-        if (s.repo) host.appendChild(tagEl("muted", s.repo));
         if (s.board_tier) host.appendChild(tagEl("muted", s.board_tier));
       }
       if (Number.isInteger(s.age_days) && s.age_days >= 0) host.appendChild(el("span", "muted", s.age_days + " d"));
@@ -2141,7 +2148,7 @@
     const bar = el("div", "ep-search");
     const input = el("input", "ep-search-input");
     input.type = "search";
-    input.placeholder = "filter " + noun + " by text or spore-id…";
+    narrowPlaceholder(input, "filter " + noun + " by text or spore-id…", "filter by text or id…");
     input.setAttribute("aria-label", "filter " + kind + " by text or spore id");
     const status = el("span", "ep-search-status", "");
     bar.append(input, status);
@@ -2389,6 +2396,13 @@
       n.textContent = r ? r.text : "";
     }
   }
+  // A placeholder that must fit its box: the full words on a wide screen, a shorter line on a phone (re-chosen when the width crosses).
+  function narrowPlaceholder(input, wide, narrow) {
+    const mq = typeof window.matchMedia === "function" ? window.matchMedia("(max-width: 720px)") : null;
+    const set = () => { input.placeholder = mq && mq.matches ? narrow : wide; };
+    set();
+    if (mq && mq.addEventListener) mq.addEventListener("change", set);
+  }
   function buildListIntake() {
     const box = el("div", "tray-dump list-intake");
     const row = el("div", "list-intake-row");
@@ -2397,7 +2411,7 @@
     noContactFill(input);
     input.setAttribute("enterkeyhint", "send");      // overrides the helper's default: this box sends on Enter
     input.setAttribute("aria-label", "add a line to the List");
-    input.placeholder = "@mon 9am call X  ·  ? talk about Y  ·  or a plain line";
+    narrowPlaceholder(input, "@mon 9am call X  ·  ? talk about Y  ·  or a plain line", "@mon 9am call X · ? talk Y");
     input.value = intakeKept.draft;
     input.maxLength = 500;
     const go = el("button", "tray-dump-btn list-intake-btn", "add");
