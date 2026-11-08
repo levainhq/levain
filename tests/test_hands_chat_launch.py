@@ -114,7 +114,8 @@ def test_a_server_revoked_after_an_earlier_prepare_is_absent_from_both_files_at_
     if vendor == "claude":
         assert seen["argv"][-4:] == ["claude", "--strict-mcp-config", "--mcp-config", hml.claude_launch_path(rig.h)]
     else:
-        assert seen["argv"][-1] == "codex" and f"CODEX_HOME={rig.hands_home}/.codex" in seen["argv"]
+        assert seen["argv"][-5:] == ["codex", "--disable", "plugins", "--disable", "remote_plugin"]
+        assert f"CODEX_HOME={rig.hands_home}/.codex" in seen["argv"]
     assert seen["cwd"] == str(rig.h.workspace)
     assert_released(rig)
 
@@ -169,6 +170,65 @@ def test_a_refusal_before_the_start_starts_no_vendor_and_releases_both_locks(rig
     assert str(info.value).endswith("no chat was started")
     assert fake.started == [] and "spawn" not in [e for e, _ in rig.events]
     assert_released(rig)
+
+
+def _during_commit(monkeypatch, act):
+    """``act()`` once, while prepare commits the launch files: after the registry was read, before the start."""
+    real = hands_login.conf_commit
+    done = []
+
+    def commit(h, v, d, n, t, **k):
+        out = real(h, v, d, n, t, **k)
+        if not done:
+            done.append(1)
+            act()
+        return out
+    monkeypatch.setattr(hands_login, "conf_commit", commit)
+    return done
+
+
+@pytest.mark.parametrize("vendor", ["claude", "codex"])
+def test_a_revoke_appended_while_the_files_are_written_refuses_the_start(rig, monkeypatch, vendor):
+    # L3 r3 G5 (codex HIGH): a revoke is an authority-log append that takes no hands lock, so it can land after the
+    # launch read the registry; the launcher wrote alpha and started the vendor anyway
+    a = rig.register("alpha", callback_port=49601)
+    rig.register("beta", callback_port=49602)
+    done = _during_commit(monkeypatch, lambda: rig.ck.link({"op": "revoke_grant", "grant_id": a["id"]}))
+    fake = FakeVendor(rig)
+    with pytest.raises(hc.HandsChatRefused, match=f"entry {a['id']} was revoked or ran out") as info:
+        launch(rig, vendor, spawn=fake)
+    assert done and str(info.value).endswith("no chat was started")
+    assert fake.started == [] and "spawn" not in [e for e, _ in rig.events]
+    assert_released(rig)
+    assert launch(rig, vendor, spawn=fake) == 0                  # the next launch writes the files without alpha
+    assert set(fake.started[0]["claude"]) == {"beta"} and set(fake.started[0]["codex"]) == {"beta"}
+
+
+def test_an_entry_that_runs_out_while_the_files_are_written_refuses_the_start(rig, monkeypatch):
+    from datetime import datetime as real_dt, timedelta
+    a = rig.register("alpha", callback_port=49601)
+    late = []
+
+    class Clock(real_dt):
+        @classmethod
+        def now(cls, tz=None):
+            t = real_dt.now(tz)
+            return t + timedelta(days=40) if late else t      # past every 30-day lease once the commit ran
+    monkeypatch.setattr(hml, "datetime", Clock)
+    _during_commit(monkeypatch, lambda: late.append(1))
+    fake = FakeVendor(rig)
+    with pytest.raises(hc.HandsChatRefused, match=f"entry {a['id']} was revoked or ran out"):
+        launch(rig, spawn=fake)
+    assert fake.started == []
+    assert_released(rig)
+
+
+def test_an_entry_registered_after_the_read_does_not_refuse_the_start(rig, monkeypatch):
+    rig.register("alpha", callback_port=49601)
+    _during_commit(monkeypatch, lambda: rig.register("beta", callback_port=49602))
+    fake = FakeVendor(rig)
+    assert launch(rig, spawn=fake) == 0
+    assert set(fake.started[0]["claude"]) == {"alpha"}           # the files only lack beta until the next launch
 
 
 def test_an_open_session_refuses_the_launch_and_its_locks_are_left_to_it(rig):
@@ -376,6 +436,51 @@ def test_an_interrupt_inside_the_spawn_still_sweeps_the_hands_user(rig):
         launch(rig, spawn=interrupted)
     assert [e for e, _ in rig.events] == ["sweep", "prepare", "spawn", "sweep"]
     assert rig.events[-1] == ("sweep", (True, True))
+    assert_released(rig)
+
+
+class SignalledInSpawn(BlockingVendor):
+    """A start that forks the child and then takes a stop signal before it returns (L3 r3 G3, codex HIGH): the child
+    exists, so the cleanup must hold its handle and stop it."""
+
+    def __init__(self, rig, signum):
+        super().__init__(rig, lambda: None)
+        self.signum = signum
+
+    def __call__(self, argv, cwd):
+        child = super().__call__(argv, cwd)          # the fork happened: a child is running
+        _deliver(self.signum)()                      # the stop signal lands before Popen returns
+        return child
+
+
+@pytest.mark.parametrize("signum", [signal.SIGTERM, signal.SIGHUP])
+def test_a_signal_inside_the_spawn_stops_the_child_it_forked_then_exits(rig, signum):
+    rig.register("alpha", callback_port=49601)
+    before = {s: signal.getsignal(s) for s in (signal.SIGTERM, signal.SIGHUP, signal.SIGINT)}
+    fake = SignalledInSpawn(rig, signum)
+    with pytest.raises(SystemExit) as info:
+        launch(rig, spawn=fake)
+    assert info.value.code == 128 + signum
+    assert fake.terminated == 1                      # the old tree raised inside the spawn: proc None, never stopped
+    assert fake.waited == 1                          # the stop's wait, not the chat's: the chat wait never began
+    assert [e for e, _ in rig.events] == ["sweep", "prepare", "spawn", "sweep"]
+    assert {s: signal.getsignal(s) for s in before} == before
+    assert_released(rig)
+
+
+def test_a_signal_after_the_spawn_returned_and_before_the_store_is_still_deferred(rig, monkeypatch):
+    rig.register("alpha", callback_port=49601)
+    fake = BlockingVendor(rig, lambda: None)
+    real = hc._Signals.raise_pending
+
+    def late(self):
+        _deliver(signal.SIGTERM)()                   # the handler still defers until raise_pending ends the deferral
+        assert self.pending == signal.SIGTERM
+        real(self)
+    monkeypatch.setattr(hc._Signals, "raise_pending", late)
+    with pytest.raises(SystemExit) as info:
+        launch(rig, spawn=fake)
+    assert info.value.code == 128 + signal.SIGTERM and fake.terminated == 1
     assert_released(rig)
 
 

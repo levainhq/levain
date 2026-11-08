@@ -12,7 +12,8 @@ hands vendor chat, and it keeps the order the 1107-26 frame set:
    between the prepare and the start (the files are the hands account's own).
 3. :func:`levain.firing.hands_mcp_login.prepare_launch` with ``held=True``: both launch files rewritten from the LIVE
    registry, so a server revoked since the last prepare is absent from both.
-4. only when that returned: the vendor, from :func:`~levain.firing.hands_mcp_login.claude_chat_argv` (which passes
+4. only when that returned, and a re-read of the authority log still holds every entry the files carry (a revoke is
+   a log append that takes no hands lock, :func:`~levain.firing.hands_mcp_login.launch_still_live`): the vendor, from :func:`~levain.firing.hands_mcp_login.claude_chat_argv` (which passes
    ``--strict-mcp-config``) or :func:`~levain.firing.hands_mcp_login.codex_chat_argv`.
 
 A refusal or a failure at any step before the start (a lock, the stop, the prepare, the spawn itself) starts nothing,
@@ -28,7 +29,8 @@ taken, a SIGTERM or SIGHUP ends in an orderly stop (the child terminated, the ha
 then re-raised as an exit with ``128 + signal``), with processes left after the chat making the command exit non-zero.
 
 What this does not close: a revoke that lands while a chat is running does not reach it (the vendor read its file at
-start, and a stdio server is already running). See the frame's last section and its Known edges.
+start, and a stdio server is already running), and nor does one in the moment between step 4's re-read and the
+start. See the frame's last section and its Known edges.
 """
 from __future__ import annotations
 
@@ -166,6 +168,8 @@ class _Signals:
 
     def __init__(self) -> None:
         self.stopping = False
+        self.deferring = False
+        self.pending: int | None = None
         self.before: dict[int, object] = {}
         for s in (*_STOP_SIGNALS, signal.SIGINT):
             self.before[s] = signal.getsignal(s)
@@ -173,9 +177,37 @@ class _Signals:
             signal.signal(s, self._on_stop)
 
     def _on_stop(self, signum: int, frame: object) -> None:
-        if not self.stopping:
+        if self.stopping:
+            return
+        if self.deferring:              # inside the spawn: recorded, raised once the child handle is held
+            if self.pending is None:
+                self.pending = signum
+            return
+        self.stopping = True
+        raise SystemExit(128 + signum)
+
+    def spawn(self, start: Spawn, argv: list[str], cwd: str) -> _Proc:
+        """``start(argv, cwd)`` with the stop signals deferred until it returned (L3 r3 G3, codex HIGH): a SIGTERM
+        that landed after ``Popen`` forked sudo but before it returned left the cleanup with no child handle, so the
+        launcher could exit while sudo went on to start the vendor. The signal is recorded here and the caller raises
+        it (:meth:`raise_pending`) only after it has stored the returned handle, so the cleanup can stop the child.
+        Deferred in the handler, never by ``pthread_sigmask``: a blocked mask is inherited across fork and exec, so
+        sudo and the vendor would start with the stop signals blocked. A spawn that itself fails raises its own error,
+        and the cleanup's sweep still runs. On a return the deferral stays on until :meth:`raise_pending`, so a signal
+        between this return and the caller's store of the handle is deferred too."""
+        self.deferring = True
+        try:
+            return start(argv, cwd)
+        except BaseException:
+            self.deferring = False
+            raise
+
+    def raise_pending(self) -> None:
+        """End the deferral :meth:`spawn` began and raise the stop signal it recorded, if one came."""
+        self.deferring = False
+        if self.pending is not None and not self.stopping:
             self.stopping = True
-            raise SystemExit(128 + signum)
+            raise SystemExit(128 + self.pending)
 
     def _ignore(self, signum: int, frame: object) -> None:
         pass
@@ -241,12 +273,16 @@ def launch_hands_chat(entity_dir: Path | str, vendor: str, cockpit_root: Path | 
                 raise HandsChatRefused(f"the hands workspace holds a project layer the vendor would read ({layer}), "
                                        "which can name MCP servers the registry does not hold; remove it")
             argv = chat_argv(hands, vendor)
+            moved = hml.launch_still_live(res)          # L3 r3 G5: a revoke takes no hands lock; the last read
+            if moved is not None:
+                raise HandsChatRefused(moved)
             for gid, why in res.skipped:
                 emit(f"hands chat: registry entry {gid} not rendered ({why})")
             emit(f"hands chat: {vendor} as {hands.user} with {len(res.names)} registered MCP server(s)"
                  + (f" ({', '.join(res.names)})" if res.names else ""))
             attempted = True
-            proc = start(argv, str(hands.workspace))
+            proc = sigs.spawn(start, argv, str(hands.workspace))
+            sigs.raise_pending()        # only now: ``proc`` is held, so the cleanup stops the child
         except HandsChatRefused as exc:
             raise HandsChatRefused(f"{exc}; no chat was started") from None
         except (hml.HandsMcpError, hl.HandsLoginError, WsGitError, OSError, subprocess.SubprocessError) as exc:

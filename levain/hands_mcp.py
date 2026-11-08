@@ -10,7 +10,8 @@ renders to the same bytes. What writes the launch files from the live entries (M
 both renderers), signs a server in (M3) and audits drift (M4) are other modules.
 
 The entry is signed into the authority log in plaintext, so it carries no secret: not in argv, not in a url's query
-(by name or by value) or path, and not as the value of an env name that says it holds one; the rules run again at
+(by name, by value, or as a credential-shaped query name) or path, and not as an env value (under a name that says
+it holds one, or shaped like a token under any name); the rules run again at
 every render, so an entry signed before a rule existed is not written into a launch file. A server's credential lives in the hands account's own
 environment or its own login (M3's sign-in).
 
@@ -199,9 +200,11 @@ def _loopback(host: str) -> bool:
 def registration_problems(entry: Mapping[str, Any], *, home: str) -> list[str]:
     """Every registration-time refusal for ``entry`` (a shape-valid entry; ``home`` the operator's home directory),
     empty when it passes. stdio: the command passes :func:`command_problems`; no argument carries a credential, nor
-    does one follow a secret-named flag; no env name says it holds a credential while carrying a value, and none
-    changes what the server's loader or interpreter runs. remote: a well-formed https url, or a loopback one, with no
-    userinfo, no fragment and no secret-named query value. The server's env is the entry's own, never inherited."""
+    does one follow a secret-named flag; no env name says it holds a credential while carrying a value, no env value
+    is shaped like one (:func:`_env_value_secret`), and no env name changes what the server's loader or interpreter
+    runs. remote: a well-formed https url, or a loopback one, with no userinfo, no fragment, no secret-named query
+    value, no credential-shaped query name or value, and no credential-shaped path segment. The server's env is the
+    entry's own, never inherited."""
     problems: list[str] = []
     if entry["name"] in RESERVED_NAMES:
         problems.append(f"the name {entry['name']!r} is one Levain writes itself")
@@ -216,7 +219,7 @@ def registration_problems(entry: Mapping[str, Any], *, home: str) -> list[str]:
         for k, v in sorted(entry["env"].items()):
             if _LOADER_ENV.fullmatch(k):
                 problems.append(f"the env name {k!r} changes what the server's loader or interpreter runs")
-            elif v and (_SECRET_NAME.search(k) or _SECRET_VALUE.search(v)):
+            elif v and (_SECRET_NAME.search(k) or _env_value_secret(v)):
                 problems.append(f"the env name {k!r} says it holds a credential, or its value is shaped like one, "
                                 f"and the entry is signed in plaintext: {_NO_SECRET}")
     else:
@@ -257,7 +260,9 @@ def _url_problems(url: str) -> list[str]:
     if parts.fragment:
         problems.append("a remote url carries no fragment")
     for k, v in query:
-        if v and _SECRET_NAME.search(k):
+        if _secret_value(k):                           # L3 r3 G2 (codex MED): ``?<token>`` is a key with no value
+            problems.append(f"a url query name is shaped like a credential: {_NO_SECRET}")
+        elif v and _SECRET_NAME.search(k):
             problems.append(f"the url query name {k[:60]!r} says it holds a credential: {_NO_SECRET}")
         elif v and _secret_value(v):                   # L3 r1 (codex HIGH): a token under an innocent name
             problems.append(f"the value of the url query name {k[:60]!r} is shaped like a credential: {_NO_SECRET}")
@@ -271,6 +276,17 @@ def _url_problems(url: str) -> list[str]:
 def _secret_value(v: str) -> bool:
     """A value of a known token spelling, or a bare run of 40+ token characters (the argv rules, on a value alone)."""
     return bool(_SECRET_VALUE.search(v) or _LONG_RUN.search(v))
+
+
+def _env_value_secret(v: str) -> bool:
+    """An env value of a known token spelling or a bare run of 40+ token characters (L3 r3 G1, codex HIGH: a token
+    under an innocent name, ``VALUE=<token>``, was let through). An absolute path is judged segment by segment, as a
+    url path is, because ``_LONG_RUN``'s class holds ``/`` and any path of 40 characters would match whole."""
+    if _SECRET_VALUE.search(v):
+        return True
+    if v.startswith("/"):
+        return any(seg and _secret_value(seg) for seg in v.split("/"))
+    return bool(_LONG_RUN.search(v))
 
 
 # ---------------------------------------------------------------------------------------------------------------

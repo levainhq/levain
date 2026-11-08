@@ -560,9 +560,37 @@ def test_a_token_shaped_env_value_is_refused_under_a_non_secret_key(value):
     assert _said(problems, "hands account's own environment"), problems
 
 
-def test_a_plain_long_env_value_is_not_guessed_at():
-    assert hm.registration_problems(_entry(env={"DATA_DIR": "/var/lib/x/" + "a" * 60, "MODE": "A" * 44}),
-                                    home=HOME) == []
+def test_a_plain_env_value_and_a_long_path_of_short_segments_stay_allowed():
+    # M1C let any long env value through; L3 r3 G1 refuses a bare 40+ run (below), so what stays allowed is named here
+    assert hm.registration_problems(_entry(env={"DATA_DIR": "/usr/local/share/my-mcp-server/data/files/and/more",
+                                                "MODE": "debug", "ROOT": "/srv/shared"}), home=HOME) == []
+
+
+_TOKEN40 = "Zx9" + "q" * 34 + "W2k"          # 40 token characters, no known vendor prefix
+
+
+@pytest.mark.parametrize("value", [_TOKEN40, "A" * 44, "abc:" + _TOKEN40, "/var/lib/x/" + "a" * 60])
+def test_a_bare_long_token_env_value_is_refused_under_an_innocent_name(value):
+    # L3 r3 G1 (codex HIGH): env values were judged by the vendor spellings only, not the 40+ run rule the url uses
+    problems = hm.registration_problems(_entry(env={"VALUE": value}), home=HOME)
+    assert _said(problems, "hands account's own environment"), problems
+
+
+def test_a_legacy_signed_entry_with_a_long_token_env_value_is_not_rendered():
+    legacy = _entry(env={"VALUE": _TOKEN40})                 # its own digest: only the newer rule refuses it
+    for render in (hm.render_codex_toml, hm.render_claude_json, hm.codex_toml, hm.claude_servers):
+        with pytest.raises(hm.HandsMcpRefused, match="own environment"):
+            render([legacy])
+    assert hm.live_entries({legacy["id"]: legacy}, NOW) == ([], [(legacy["id"], "rules")])
+
+
+@pytest.mark.parametrize("url", ["https://example.test/mcp?" + _TOKEN40, "https://example.test/mcp?" + _TOKEN40 + "=",
+                                 "https://example.test/mcp?team=core&" + _TOKEN40])
+def test_a_credential_shaped_url_query_name_with_no_value_is_refused(url):
+    # L3 r3 G2 (codex MED): `?<token>` parses as a key with an empty value, and every query check was gated on a value
+    entry = _entry(name="r", transport="remote", command="", url=url, callback_port=49300)
+    assert _said(hm.registration_problems(entry, home=HOME), "query name is shaped like a credential")
+    assert hm.live_entries({entry["id"]: entry}, NOW) == ([], [(entry["id"], "rules")])
 
 
 @pytest.mark.parametrize("flag", ["--no-auth", "--no-token", "--without-password", "--no-api-key"])

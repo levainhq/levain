@@ -277,7 +277,18 @@ def test_the_claude_chat_argv_reads_only_the_launch_file_under_the_hands_prefix(
         argv[-5:] == ["claude", "--strict-mcp-config", "--mcp-config", f"{rig.hands_home}/.claude/{hml.CLAUDE_LAUNCH_FILE}", "-p"]
     assert f"CLAUDE_CONFIG_DIR={rig.hands_home}/.claude" in argv
     cargv = hml.codex_chat_argv(rig.h)
-    assert f"CODEX_HOME={rig.hands_home}/.codex" in cargv and cargv[-1] == "codex"
+    assert f"CODEX_HOME={rig.hands_home}/.codex" in cargv
+    assert cargv[-5:] == ["codex", "--disable", "plugins", "--disable", "remote_plugin"]
+
+
+def test_the_codex_chat_disables_plugin_loading_after_the_vendor_and_before_any_extra(rig, monkeypatch):
+    # L3 r3 G4 (codex HIGH): a plugin under CODEX_HOME can carry an mcp.json the registry does not hold, and the
+    # config merge only sees mcp_servers; codex's own `--disable <feature>` turns plugin loading off for the chat
+    monkeypatch.setattr(hands_login, "_launch_prefix", _REAL_PREFIX)
+    argv = hml.codex_chat_argv(rig.h, "resume")
+    at = argv.index("codex")
+    assert argv[at:] == ["codex", "--disable", "plugins", "--disable", "remote_plugin", "resume"]
+    assert set(hml.CODEX_DISABLED_FEATURES) == {"plugins", "remote_plugin"}
 
 
 def test_the_verb_parses_and_reports_what_it_rendered(rig, capsys):

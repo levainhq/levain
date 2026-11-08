@@ -585,7 +585,8 @@ def doctor_rows(install: Path) -> list[tuple[str, bool, str, str | None, bool]]:
 # Every read and write is made BY the hands user through the config-home helper (:func:`hl.conf_read`,
 # :func:`hl.conf_stage`, :func:`hl.conf_commit`): no link is followed, a new file has an unpredictable name and is
 # created exclusively, and both files are staged before either is renamed in. The registry is read UNDER the hands
-# lock, so a revocation lands either before the read or after the write, never between.
+# lock, which orders launchers and prepares against each other; a revoke (an authority-log append) takes no hands
+# lock, so the launcher re-reads the log just before the start (:func:`launch_still_live`, L3 r3 G5).
 #
 # The launcher is :func:`levain.firing.hands_chat.launch_hands_chat` (``levain hands launch``): it takes the entity's
 # session and one-session locks, calls ``prepare_launch(..., held=True)`` and starts the argv only when it returned; no
@@ -602,9 +603,32 @@ class LaunchFiles:
     whether each file's bytes changed."""
 
     def __init__(self, claude_path: str, codex_path: str, names: list[str], skipped: list[tuple[str, str]],
-                 changed: dict[str, bool]) -> None:
+                 changed: dict[str, bool], *, ids: list[str] | None = None,
+                 cockpit_root: Path | str | None = None) -> None:
         self.claude_path, self.codex_path, self.names, self.skipped, self.changed = (
             claude_path, codex_path, names, skipped, changed)
+        self.ids = list(ids or [])                      # the rendered entries' ids, for :func:`launch_still_live`
+        self.cockpit_root = cockpit_root
+
+
+def launch_still_live(res: LaunchFiles, now: datetime | None = None) -> str | None:
+    """Why the files :func:`prepare_launch` just wrote are no longer the live registry, or None (L3 r3 G5, codex
+    HIGH): an entry they hold was revoked, or ran out, after the registry was read. A revoke is an authority-log append
+    that takes no hands lock, so the hands lock cannot order it against a launch; this re-reads the log at the last
+    boundary before the vendor starts. It narrows the window to this read and the exec, it does not close it: a revoke
+    after it lands as one during the chat does (the frame's Known edges). An entry registered since is not a reason
+    (the files only lack it)."""
+    if not res.ids:
+        return None
+    try:
+        live, _ = load_registry(res.cockpit_root, now)
+    except (HandsMcpError, OSError) as exc:
+        return f"the authority log could not be read again before the start ({exc})"
+    gone = sorted(set(res.ids) - {e["id"] for e in live})
+    if gone:
+        return (f"registry entry {gone[0]} was revoked or ran out after the launch files were written; "
+                "launch again to write them from the registry")
+    return None
 
 
 def claude_launch_path(hands: HandsIdentity) -> str:
@@ -618,9 +642,19 @@ def claude_chat_argv(hands: HandsIdentity, *extra: str) -> list[str]:
             claude_launch_path(hands), *extra]
 
 
+#: Codex features switched off for every hands chat (L3 r3 G4, codex HIGH): an installed or remote plugin can carry an
+#: ``mcp.json`` that Codex loads beside the registry's servers, and :func:`merge_codex_config` sees only
+#: ``mcp_servers``. ``--disable <feature>`` is codex-cli 0.162.1's own flag ("Equivalent to
+#: ``-c features.<name>=false``"); measured with a scratch ``CODEX_HOME`` whose config.toml enables both, ``codex
+#: --disable plugins --disable remote_plugin features list`` reports both false (the command line beats the file).
+CODEX_DISABLED_FEATURES = ("plugins", "remote_plugin")
+
+
 def codex_chat_argv(hands: HandsIdentity, *extra: str) -> list[str]:
-    """The hands account's Codex chat: the hands prefix with ``CODEX_HOME``, whose ``config.toml`` carries the tables."""
-    return [*hl._launch_prefix(hands, "codex"), "codex", *extra]
+    """The hands account's Codex chat: the hands prefix with ``CODEX_HOME``, whose ``config.toml`` carries the tables,
+    and plugin loading off (:data:`CODEX_DISABLED_FEATURES`)."""
+    off = [a for f in CODEX_DISABLED_FEATURES for a in ("--disable", f)]
+    return [*hl._launch_prefix(hands, "codex"), "codex", *off, *extra]
 
 
 def render_launch(entries: list[dict[str, Any]]) -> tuple[str, str]:
@@ -750,14 +784,16 @@ def prepare_launch(hands: HandsIdentity, entity_dir: Path | str, cockpit_root: P
     out: dict[str, Any] = {}
 
     def work() -> None:
-        # the registry under the lock (L3 r1): a revocation lands before this read or after the write, never between
+        # the registry under the lock (L3 r1): it orders this against other launchers and prepares, NOT against a
+        # revoke, which is an authority-log append that takes no hands lock (L3 r3 G5); the launcher re-reads the
+        # log at its last boundary (:func:`launch_still_live`)
         try:
             live, skipped = load_registry(root, now)
         except (HandsMcpError, OSError) as exc:        # an unreadable log is no registry: nothing is rendered over it
             raise HandsMcpRefused(f"{exc}; nothing was changed") from None
         claude_body, tables = render_launch(live)
         names = {e["name"] for e in live}
-        out.update(names=sorted(names), skipped=skipped)
+        out.update(names=sorted(names), skipped=skipped, ids=sorted(e["id"] for e in live))
         try:
             # judge everything first, changing nothing: both config homes, then both files through the helper (which
             # follows no link), then the merge; only then is a directory made or a file staged
@@ -806,7 +842,8 @@ def prepare_launch(hands: HandsIdentity, entity_dir: Path | str, cockpit_root: P
         raise HandsMcpRefused(str(exc)) from None
     except OSError as exc:                              # the lock itself (work() reports its own)
         raise HandsMcpRefused(f"the hands lock could not be taken ({exc}); nothing was changed") from None
-    return LaunchFiles(claude_path, codex_path, out["names"], out["skipped"], changed)
+    return LaunchFiles(claude_path, codex_path, out["names"], out["skipped"], changed, ids=out["ids"],
+                       cockpit_root=root)
 
 
 def cmd_prepare(entity_dir: Path | str, cockpit_root: Path | str | None = None) -> int:
