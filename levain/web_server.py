@@ -3501,7 +3501,8 @@ class _Handler(GuardedHandler):
         another surface paired (``relay`` and the like; L3 r1 codex HIGH: any surface may mint a pairing offer) does not.
         ``box`` is his on the same footing as ``browser``: both need his account on the laptop (the journal's file
         permissions; the per-launch page token served on loopback). Any fault reading the lineage is False: a lineage
-        that cannot be read grants nothing."""
+        that cannot be read grants nothing. Known edge (L3 r1 codex): a device a surface named ``box`` paired before
+        ``make_server`` reserved the name reads as box-rooted; no shipped caller ever named a surface ``box``."""
         if device == _COORD_DEVICE:
             return True
         if not isinstance(device, str) or device.startswith("surface:"):

@@ -225,3 +225,11 @@ def test_a_device_the_laptops_cockpit_pair_paired_may_set_launches(world, tmp_pa
         _rdev, relay_tok = _pair(port, token=RELAY, label="relay-made")
         st, got, _ = _call(port, "GET", "/cockpit/coord/drops.json", token=relay_tok)
         assert st == 200 and got["coord_may_launch"] is False, (st, got)
+        # a relay cannot name its own minter: the offer's minter is the caller's credential, a body key is refused
+        st, off, _ = _call(port, "POST", "/cockpit/pair/offer", {"label": "x", "minted_by": BOX_MINTER}, token=RELAY)
+        assert st == 400 and off["error"] == "bad_request", (st, off)
+        # revoking the box device takes its child's grant with it (L3 r1 complement LOW)
+        httpd.broker.active_db().revoke_devices([cl["device_id"]], by=BOX_MINTER, now=datetime.now(timezone.utc))
+        for t in (cl["token"], kid_tok):
+            st, got, _ = _call(port, "GET", "/cockpit/coord/drops.json", token=t)
+            assert not (st == 200 and got.get("coord_may_launch") is True), (st, got)
