@@ -80,6 +80,7 @@ OUTCOME_WINDOW = timedelta(days=7)     # the decisions panel's outcomes reach ba
 OUTCOMES_LIMIT = 50                    # and show at most this many, newest first
 # per-device pairing (PAIR REV 3 RQ-1): its own constants, nothing borrowed from webpush's pairing
 PAIRED_PREFIX = "paired-"              # a paired device's credential name is PAIRED_PREFIX + its id (RP-1)
+BOX_MINTER = "box"                     # the minter name of the laptop's own `levain cockpit pair` (straight to the journal)
 _ROOT_HOPS = 64                        # pairing_root walks at most this many paired_by links
 OFFER_TTL = timedelta(minutes=10)      # a pairing offer's life
 OFFERS_LIVE = 3                        # live offers at once; a new one past this voids the oldest

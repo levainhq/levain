@@ -98,7 +98,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any, Iterable
 
 from levain.cockpit.broker import Broker, BrokerError, Lifecycle
-from levain.cockpit.firejournal import OFFER_TTL, PAIRED_PREFIX, REVOKE_MODES, DeviceRevoked, FamilyChanged, PairingError
+from levain.cockpit.firejournal import BOX_MINTER, OFFER_TTL, PAIRED_PREFIX, REVOKE_MODES, DeviceRevoked, FamilyChanged, PairingError
 from levain.cockpit.shortcode import SHORT_MAX_FAILURES, SHORT_PAIRING_TTL
 from levain.cockpit.anneal_effects import (
     EPISODES,
@@ -872,10 +872,11 @@ _COORD_SHEET = "/sign/drop"
 # runs as its own id ("d-" + hex, never the name below), and only the cockpit page's own surface token ("browser") runs as this
 # one name, "this cockpit's page"; another surface runs as "surface:<name>" (L3 r2: a fixed label let any surface's token
 # run as the cockpit). Who may add a launch grant is _Handler._coord_may_launch: the cockpit page, and a paired device
-# whose pairing chain starts at the cockpit page (Phill 2026-11-08, row 460), never another surface's token or its devices.
+# whose pairing chain starts at the cockpit page or the laptop's `levain cockpit pair` (Phill 2026-11-08, row 460),
+# never another surface's token or its devices.
 _COORD_DEVICE = "cockpit"          # == levain.coordinator.phone.COCKPIT_DEVICE
 # the pairing roots a launch-grant device may start from (row 460): the cockpit page and the laptop's `cockpit pair`
-_LAUNCH_ROOTS = frozenset({"browser", "box"})
+_LAUNCH_ROOTS = frozenset({"browser", BOX_MINTER})
 
 
 def _coord_route(route: str) -> "str | None":
@@ -5639,6 +5640,10 @@ def make_server(
         if name.startswith(PAIRED_PREFIX):
             # PAIR RQ-6: a paired device's credential is named paired-<id>; a surface may never hold that namespace
             raise ValueError(f"refusing surface token {name!r}: the {PAIRED_PREFIX!r} prefix names paired devices")
+        if name == BOX_MINTER:
+            # the laptop's own `levain cockpit pair` mints as this name, and a device rooted there may set a launch
+            # grant (_LAUNCH_ROOTS): a surface holding it would mint launch-capable devices over HTTP
+            raise ValueError(f"refusing surface token {name!r}: {BOX_MINTER!r} names the laptop's own pairing")
         if not _HEADER_SAFE_TOKEN.fullmatch(tok):
             # a token travels in a request header and the page stores what this rule admits
             raise ValueError(f"refusing surface token {name!r}: printable ASCII without spaces only")

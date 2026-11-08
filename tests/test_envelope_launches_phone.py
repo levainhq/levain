@@ -201,6 +201,8 @@ def test_a_device_the_laptops_cockpit_pair_paired_may_set_launches(world, tmp_pa
     a relay-rooted one still does not."""
     from datetime import datetime, timezone
 
+    from levain.cockpit.firejournal import BOX_MINTER
+
     _root, src, _ids = _install(tmp_path_factory.mktemp("coord-box"))
     with _serve(src, surface_tokens={"browser": T, "relay": RELAY}) as (port, httpd):
         signer = SimpleNamespace(keys=phone_for(world)._keys)
@@ -208,10 +210,10 @@ def test_a_device_the_laptops_cockpit_pair_paired_may_set_launches(world, tmp_pa
         sheet.phone = coord_for(world)
         httpd.coord_sheet = sheet
         _pair(port)                                   # starts the journal, as the page's first pairing does
-        code = httpd.broker.active_db().mint_offer(label="iphone", minted_by="box", now=datetime.now(timezone.utc))
+        code = httpd.broker.active_db().mint_offer(label="iphone", minted_by=BOX_MINTER, now=datetime.now(timezone.utc))   # what `levain cockpit pair` mints as
         st, cl, _ = _call(port, "POST", "/cockpit/pair/claim", {"code": code})
         assert st == 200, cl
-        assert httpd.broker.active_db().pairing_root(cl["device_id"]) == "box"
+        assert httpd.broker.active_db().pairing_root(cl["device_id"]) == BOX_MINTER
         st, got, _ = _call(port, "GET", "/cockpit/coord/drops.json", token=cl["token"])
         assert st == 200 and got["coord_may_launch"] is True, (st, got)
         st, out, _ = _post_review(world, port, sheet, cl["token"], "ph-" + "9" * 32, _launch_spec(world))
