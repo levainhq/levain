@@ -45,6 +45,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any, Callable, Literal
 
 from levain.cockpit.authority import bound, current
+from levain.cockpit.effects import INTAKE_TIERS, INTAKE_VERB, intake_kind_of
 from levain.cockpit.engine import DECISIONS_ID, NOTE_VERB, QUESTION_VERB, VALUE_ABSENT
 from levain.cockpit.external import ID_PREFIX as EXTERNAL_PREFIX
 from levain.cockpit.registry import NOTE_ROW_PREFIX, QUESTION_ROW_PREFIX, parse_date
@@ -839,6 +840,44 @@ def _band_fire(scope: "WriteScope", params: dict[str, Any], target: dict[str, An
             "delivery": "started" if done.answered else "none"}
 
 
+def _intake_tier(params: dict[str, Any], row: dict[str, Any] | None, prov: str, today: date) -> Tier:
+    """The List intake's tier by the line's kind (``effects.INTAKE_TIERS``), read from its prefix: a scheduled drop
+    and a talk seed are T2 (signed), a plain line to sort is C1. A line that is not a string is T2 (refused later)."""
+    return INTAKE_TIERS.get(intake_kind_of(params.get("line")) or "", "T2")  # type: ignore[return-value]
+
+
+def _intake_fire(scope: "WriteScope", params: dict[str, Any], target: dict[str, Any], confirm: bool) -> dict[str, Any]:
+    """The C1 half of ``list_intake``: a plain line (``sort``) stored verbatim as a coordinator drop from the cockpit
+    surface, the room composer's own write (``room.post_room_drop``), for the desk to sort. A drop or a talk never
+    reaches here (T2: the broker). The receipt is ``levain.intake.receipt``'s three-line shape."""
+    from levain import intake
+    from levain.cockpit.providers import _dispatch_dir
+    from levain.coordinator.store import CoordError, CoordStore, StoreAbsent
+
+    line = params.get("line")
+    if set(params) != {"line"} or not isinstance(line, str):
+        raise EditError("bad_request", 400, "an intake is exactly {line}, a string")
+    try:
+        parsed = intake.parse_intake(line, datetime.now())
+    except intake.IntakeRefused as exc:
+        raise EditError("intake_refused", 422, str(exc)) from None
+    if parsed["kind"] != "sort":       # the tier said sort; a line read otherwise is never written here
+        raise EditError("bad_request", 400, f"a {parsed['kind']} intake is signed, never a direct write")
+    directory = target.get("dispatch_dir") or _dispatch_dir(target.get("consent_reader"))
+    if directory is None:
+        raise EditError("not_built", 501, "this cockpit names no coordinator store, so there is no desk to sort it")
+    try:
+        drop, _created = CoordStore(Path(directory)).accept_drop(parsed["text"], surface="cockpit")
+    except StoreAbsent as exc:
+        raise EditError("not_built", 501, f"the coordinator store is absent: {exc}") from None
+    except CoordError as exc:
+        raise EditError("drop_refused", 409, str(exc)) from None
+    except (OSError, sqlite3.Error) as exc:
+        raise EditError("source_unavailable", 503, f"the coordinator store cannot take a drop now: {exc}") from None
+    line_out, rec = intake.receipt(parsed)
+    return {"ok": True, "state": "COMMITTED", "receipt": rec, "receipt_line": line_out, "drop_id": drop.drop_id}
+
+
 def _resolve_kinds(direction: str) -> Callable[[dict[str, Any]], dict[str, list[Any]]]:
     """The ``spore_kind`` values anneal takes for this row's type, so a renderer offers only those."""
     def options(row: dict[str, Any]) -> dict[str, list[Any]]:
@@ -877,9 +916,14 @@ KERNEL_VERBS: tuple[VerbSpec, ...] = (
              reversible=False, fire=_spore_fire("spore_ascend"), legacy_kind="spore_ascend", device_ok=True,
              applies_to=_SPORE_ROW, options=_resolve_kinds("ascend")),
     VerbSpec("spore_seed", "capture", "adds a new item that agents will read", "create",
-             fields=("text", "type", "disposition"), floor="T2", tier_fn=_const("T2"),
+             # next/target/attention: THE LIST's scheduled drop and talk seed (task_surfaces_1107.md); a target
+             # wakes an agent with these words, so a create stays T2 whatever it carries
+             fields=("text", "type", "disposition", "next", "target", "attention"), floor="T2", tier_fn=_const("T2"),
              fire=_unbuilt_fire("spore_seed fires through the broker (K2b)"), legacy_kind="spore_seed",
              device_ok=True),
+    VerbSpec(INTAKE_VERB, "add", "adds one line to the List: '@<when> words' schedules a drop that wakes the desk "
+             "at that minute, '? words' queues a talk, anything else goes to the desk to sort", "create",
+             fields=("line",), floor="T2", tier_fn=_intake_tier, fire=_intake_fire, device_ok=True),
     VerbSpec("episode_tombstone", "tombstone", "deletes an episode (memory's graduation evidence)", "row",
              floor="T2", tier_fn=_const("T2"), confirm_required=True, reversible=False,
              fire=_unbuilt_fire("episode_tombstone fires through the broker (K2b)"),

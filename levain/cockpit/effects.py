@@ -697,12 +697,74 @@ def _ce_seed(params: Mapping[str, Any], pre: Mapping[str, Any] | None, *, origin
                                "disposition": _norm(disposition)}
     if params.get("domain"):
         changes["domain"] = _norm_update_field("domain", params["domain"])
+    changes.update(_seed_steering(params, changes["disposition"]))
     projection = {f: _stored_authority(changes, f) for f in SPORE_AUTHORITY_FIELDS}
     # a create sets EVERY authority field, an empty domain included, so it labels all of them (flow §4.5
     # invariant 5 makes the row's label its weakest field's: an unlabelled empty field would hold a row this
     # fire wrote whole at unverified). label_fields still labels only a field the store holds as projected
     writes = SPORE_AUTHORITY_FIELDS
     return Effect(spore_resource_key(origin_key), SPORES, {"absent": True}, changes, projection, writes, ())
+
+
+# THE LIST (task_surfaces_1107.md): the three optional fields a create may carry. ``next`` is stored exactly as
+# given, a timed minute never cut to its date; ``target``/``attention`` steer how an agenda germinates (a seed may
+# carry ``attention: talk`` and nothing else). Each is refused when it does not read, never coerced
+SEED_STEERING_FIELDS = ("next", "target", "attention")
+
+
+def _seed_steering(params: Mapping[str, Any], disposition: str) -> dict[str, Any]:
+    from levain.spores import check_steering, valid_next
+
+    out: dict[str, Any] = {}
+    nxt = params.get("next")
+    if nxt is not None:
+        if not valid_next(nxt):
+            raise ValueError(f"next must be YYYY-MM-DD or YYYY-MM-DDTHH:MM, a real date and clock (got {nxt!r})")
+        out["next"] = nxt
+    target, attention = params.get("target"), params.get("attention")
+    why = check_steering(disposition, target, attention)
+    if why is not None:
+        raise ValueError(why)
+    if target is not None:
+        out["target"] = target
+    if attention is not None:
+        out["attention"] = attention
+    return out
+
+
+# --- THE LIST's one-line intake (task_surfaces_1107.md "intake grammar") ------------------------------------------
+# One panel verb, ``{line}``: the server reads the line with ``levain.intake.parse_intake`` (the browser holds no
+# grammar). A ``drop`` and a ``talk`` become a ``spore_seed`` effect (below) through the broker; a ``sort`` is a
+# coordinator drop (``verbs._intake_fire``), never a spore.
+INTAKE_VERB = "list_intake"
+# the tier of each kind. A drop wakes the desk at its minute with the line's words as the operator's (germinate files
+# them as a coordinator drop from surface ``cli``), so it is signed. A talk seed is a spore agents read (the talk
+# queue), the exposure every ``spore_seed`` is T2 for, so it is signed too: a
+# ``?`` prefix must not be a way around spore_seed's floor. A sort is the room composer's own write (a coordinator drop
+# from the cockpit surface, "your words, kept verbatim, never authority"), C1 as that is. Pinned by the tests
+INTAKE_TIERS = {"drop": "T2", "talk": "T2", "sort": "C1"}
+
+
+def intake_kind_of(line: Any) -> str | None:
+    """The kind a line asks for, read from its prefix alone (the tier needs no clock): ``drop`` for ``@``, ``talk``
+    for ``?``, ``sort`` otherwise; None for a line that is not a string (refused, at the highest tier)."""
+    if not isinstance(line, str):
+        return None
+    s = line.strip()
+    return "drop" if s.startswith("@") else "talk" if s.startswith("?") else "sort"
+
+
+def intake_seed_params(parsed: Mapping[str, Any]) -> dict[str, Any]:
+    """The ``spore_seed`` params a parsed ``drop`` or ``talk`` plants. A drop is an agenda for the desk at the
+    resolved minute, stored whole (``YYYY-MM-DDTHH:MM``, never cut to a date); a talk is a seed with ``attention:
+    talk`` and no target. The words are the operator's, verbatim (``_ce_seed`` strips the ends only)."""
+    kind = parsed.get("kind")
+    if kind == "drop":
+        return {"type": "task", "text": parsed["text"], "disposition": "agenda", "target": "desk",
+                "next": parsed["when"]}
+    if kind == "talk":
+        return {"type": "thought", "text": parsed["text"], "disposition": "seed", "attention": "talk"}
+    raise ValueError(f"a {kind!r} intake plants no spore")
 
 
 def _ce_update(params: Mapping[str, Any], pre: Mapping[str, Any] | None, *, origin_key: str | None,
