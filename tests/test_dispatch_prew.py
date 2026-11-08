@@ -312,3 +312,169 @@ def test_main_reads_the_setting_before_it_builds_and_binds_the_brokered_socket_o
     assert src.count("_bind(") == 2 and "BROKERED_SOCKET_NAME" in src
 
 
+
+
+# --- the two run servers share ONE holder registry (L2 HIGH-1, MED-1, MED-2; L1 W1) ---------------------------------------
+#
+# Passthrough (run.sock) and brokered (run-brokered.sock) share one SessionIndex and one replica, so a key's live holder,
+# its END job, its stripe and the SYNC re-judge must be shared too: a revoke SYNCed on either socket ENDs a session of
+# either, an END on either marks the real holder ending, and USAGE never reads a brokered record as a passthrough $0.
+
+class Pair:
+    """Both servers of one process over socketpairs, built as ``build_server`` builds them (one index, one replica, one
+    holder registry), with the S4 fakes behind each launcher. ``shared=False`` gives each server its own registry: the
+    shape before the fix, which each test below must fail against."""
+
+    def __init__(self, rig, tmp_path, *, shared=True):
+        from tests.test_agents_authority_replica import _replica
+        from tests.test_agents_session_launcher import FakeControl, FakeRuntime, FakeSources
+        from levain.agents import session_launcher as L
+        self.rig = rig
+        self.replica = _replica(tmp_path, "srv")
+        self.control, self.runtime = FakeControl(), FakeRuntime()
+        self.control.script["ROUTE-RESOLVE"] = lambda f: {"route": "glm", "routemap_generation": 1,
+                                                          "route_policy_digest": "sha256:" + "a" * 64}
+        index = L.SessionIndex(tmp_path / "idx")
+        pt = L.RealLauncher(self.control, self.runtime, FakeSources(), index)
+        br = L.RealLauncher(self.control, self.runtime, FakeSources(), index, auth="brokered", spend=lambda run: 4242)
+        kw = {"pool_free": lambda: True, "peer_ok": lambda s: True, "holder_idle_s": 20, "replica": self.replica}
+        reg = {"registry": DR.HolderRegistry()} if shared else {}
+        self.pt = DR.RunServer(pt, verify=DR.replica_verifier(self.replica, now=rig.now), **kw, **reg)
+        self.br = DR.RunServer(br, verify=DR.replica_verifier(self.replica, now=rig.now, billing="api_key"), **kw, **reg)
+        self.index = index
+        self.threads, self.n = [], 0
+
+    def conn(self, server):
+        import socket
+        import threading
+        a, b = socket.socketpair()
+        a.settimeout(20)
+        t = threading.Thread(target=server.handle, args=(b,), daemon=True)
+        t.start()
+        self.threads.append(t)
+        return a
+
+    def call(self, sock, op, **fields):
+        from levain.agents import session_client as C
+        self.n += 1
+        sock.sendall(C.encode_run_frame({"p": C.PROTOCOL, "op": op, "id": self.n, **fields}))
+        return C.read_run_frame(sock)
+
+    def head(self):
+        src = self.rig.authority.replay()
+        return {"seq": src.seq, "hash": src.head_hash}
+
+    def sync(self, server):
+        import dataclasses
+        from tests.test_agents_authority_replica import _source
+        sock = self.conn(server)
+        try:
+            rows = [r for r in _source(self.rig) if r.seq > self.replica.head()[0]]
+            return self.call(sock, "SYNC", rows=[dataclasses.asdict(r) for r in rows])
+        finally:
+            sock.close()
+
+    def launch_brokered(self, sock, oid, key):
+        from levain.agents import session as S
+        from levain.agents import session_client as C
+        proof = C.link_proof(self.rig.store, self.rig.world.root, oid, now=self.rig.now())
+        figure = self.rig.authority.replay().policy.grants[proof.link_id]["budget_run_usd_micros"]
+        launch = S.SessionLaunch(oid, key, "claude", "sonnet", "b", "brokered", None, None, figure)
+        return self.call(sock, "LAUNCH", **C.launch_to_wire(launch, proof), ledger_head=self.head(),
+                         bar={"open": False, "closed_revoke_seq": 0})
+
+    def state(self, key):
+        return (self.index.get(key) or {}).get("state")
+
+    def close(self):
+        for t in self.threads:
+            t.join(10)
+
+
+@pytest.fixture
+def lrig(tmp_path):
+    import shutil
+    if shutil.which("ssh-keygen") is None:
+        pytest.skip("needs ssh-keygen")
+    from tests.test_agents_launch import Rig
+    return Rig(tmp_path)
+
+
+@pytest.fixture
+def pair(lrig, tmp_path):
+    p = Pair(lrig, tmp_path)
+    yield p
+    p.close()
+
+
+KEY_B = "s-00000000000000c1"
+
+
+def _until(pred, seconds=10.0):
+    import time
+    end = time.monotonic() + seconds
+    while time.monotonic() < end:
+        if pred():
+            return True
+        time.sleep(0.01)
+    return pred()
+
+
+def _brokered_live(pair, *, release=True):
+    from tests.test_agents_session_launch import _occurrence
+    oid = _occurrence(pair.rig, billing="api_key", micros=1_000_000)
+    assert pair.sync(pair.br)["ok"] is True
+    sock = pair.conn(pair.br)
+    ans = pair.launch_brokered(sock, oid, KEY_B)
+    assert ans["ok"] is True, ans
+    if release:
+        rel = pair.call(sock, "RELEASE", ledger_head=pair.head(), bar={"open": False, "closed_revoke_seq": 0})
+        assert rel["ok"] is True, rel
+    return oid, sock
+
+
+def test_a_revoke_synced_on_the_passthrough_socket_ends_a_brokered_session(pair):
+    """L2 HIGH-1: the replica is one authority log; the re-judge must cover every live holder of the pair, each judged
+    by its own server's verify (the brokered one by the api_key verifier)."""
+    from tests.test_authority_agent_link import revoke_agent
+    oid, sock = _brokered_live(pair)
+    assert pair.runtime.ended == []
+    pair.rig.world.link(revoke_agent(pair.rig.row(oid)["agent_id"], pair.rig.sid), "laptop")
+    assert pair.sync(pair.pt)["ok"] is True
+    assert _until(lambda: pair.state(KEY_B) == "ended"), "a revoke SYNCed on run.sock left the brokered session running"
+    assert pair.runtime.ended == ["sess-1"]
+    sock.close()
+
+
+def test_an_end_on_the_passthrough_socket_marks_the_brokered_holder_ending_and_its_release_refuses(pair):
+    """L2 MED-2: an END on run.sock for a key the brokered server holds marks that holder ``ending`` before its job
+    starts, so a RELEASE racing on the brokered socket refuses instead of starting the child."""
+    _oid, sock = _brokered_live(pair, release=False)
+    end_sock = pair.conn(pair.pt)
+    got = pair.call(end_sock, "END", session_key=KEY_B, deadline_ms=5000)
+    end_sock.close()
+    assert got["ok"] is True and got["terminated"] is True, got
+    rel = pair.call(sock, "RELEASE", ledger_head=pair.head(), bar={"open": False, "closed_revoke_seq": 0})
+    assert (rel["ok"], rel.get("refused")) == (False, "session-ended"), rel
+    assert pair.runtime.children[0].released is False
+    sock.close()
+
+
+def test_usage_of_a_brokered_key_asked_on_the_passthrough_socket_is_the_caps_never_zero(pair):
+    """L2 MED-1 = L1 W1: the record carries the auth it was launched under; the passthrough launcher reading a brokered
+    record answers the fail-closed caps by name, not a zero-dollar settle. Its own socket reads its spend."""
+    _oid, sock = _brokered_live(pair)
+    end_sock = pair.conn(pair.br)
+    assert pair.call(end_sock, "END", session_key=KEY_B, deadline_ms=5000)["terminated"] is True
+    end_sock.close()
+    assert pair.index.get(KEY_B)["auth"] == "brokered"
+    ask = pair.conn(pair.pt)
+    cross = pair.call(ask, "USAGE", session_key=KEY_B)["usage"]
+    ask.close()
+    assert cross["usd_micros"] is None and cross["source"] == "session:auth-mismatch", cross
+    ask = pair.conn(pair.br)
+    own = pair.call(ask, "USAGE", session_key=KEY_B)["usage"]
+    ask.close()
+    assert (own["usd_micros"], own["source"]) == (4242, "session:brokered"), own
+    sock.close()
+

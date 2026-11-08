@@ -450,8 +450,9 @@ class _Holder:
     It leaves ``_live`` only when an END for its key is PROVEN."""
 
     def __init__(self, key: str, proof: C.LinkProof, exposure: Optional[ActionExposure],
-                 claims: Optional[FrameClaims] = None) -> None:
+                 claims: Optional[FrameClaims] = None, owner: "Optional[RunServer]" = None) -> None:
         self.key, self.proof, self.exposure, self.claims = key, proof, exposure, claims
+        self.owner = owner              # the server whose LAUNCH spawned it: its verify re-judges it, its permit is held
         self.child: Any = None
         self.ready = threading.Event()
         self.aborted = False
@@ -539,12 +540,36 @@ class _EndJob:
         self.result = StopResult(False, "END in progress")
 
 
+class HolderRegistry:
+    """The per-key state the run servers of ONE process share (PRE-W L2 HIGH-1, MED-2): the live holders, the END jobs,
+    the END stripes and the SYNC re-judge flags, all guarded by ``mu``. The passthrough and brokered servers share one
+    session index and one replica, so a key is one session whichever socket it was launched on: a SYNC on either socket
+    re-judges every live holder (each by its own server's verify), an END on either finds the real holder and marks it
+    ``ending``, and a key's teardowns serialise on one stripe. Lock order: a holder's ``lock``, then a stripe, then the
+    index's per-key lock; ``mu`` is a leaf (nothing that blocks is taken under it). Each server keeps its own connection
+    and holder permits and its own ``_closing``, which is read and written only under ``mu``."""
+
+    def __init__(self) -> None:
+        self.mu = threading.Condition(threading.Lock())
+        self.live: dict[str, _Holder] = {}
+        self.jobs: dict[str, _EndJob] = {}
+        self.stripes = tuple(threading.RLock() for _ in range(_END_STRIPES))
+        self.rejudge_running = False        # one SYNC re-judge worker at a time; a SYNC during a pass asks for one more
+        self.rejudge_again = False
+        self.servers: list["RunServer"] = []
+
+    def all_closing(self) -> bool:
+        """Every server on this registry has begun its shutdown (call under ``mu``)."""
+        return all(s._closing for s in self.servers)
+
+
 class RunServer:
     """The protocol and the per-key END jobs; the socket loop is :func:`serve`. ``verify(proof, exposure)`` raises
     :class:`LauncherRefused` (production: :func:`verify_point_of_use` bound to this server's readers);
     ``pool_free()`` is whether a free egress slot exists; ``peer_ok(sock)`` is the peer-uid check. With a ``replica``
     (production) ``SYNC`` feeds it and LAUNCH/RELEASE must carry ``ledger_head`` (LAUNCH also ``bar``), passed to
-    ``verify`` as :class:`FrameClaims`; without one the frames carry neither and ``verify`` gets ``None``."""
+    ``verify`` as :class:`FrameClaims`; without one the frames carry neither and ``verify`` gets ``None``. Servers that
+    share a session index share a :class:`HolderRegistry` (``registry``); without one a server makes its own."""
 
     #: PRE-W: the brokered server :func:`build_server` built beside this passthrough one (setting ON), else None
     brokered: "Optional[RunServer]" = None
@@ -554,22 +579,31 @@ class RunServer:
                  pool_free: Callable[[], bool], peer_ok: Callable[[socket.socket], bool],
                  holder_idle_s: float = HOLDER_IDLE_S, max_connections: int = MAX_CONNECTIONS,
                  max_holders: int = MAX_HOLDERS, replica: Optional[AuthorityReplica] = None,
-                 uploads: Optional[WS.WorkspaceUploads] = None) -> None:
+                 uploads: Optional[WS.WorkspaceUploads] = None, registry: Optional[HolderRegistry] = None) -> None:
         if not 0 < max_holders < max_connections:
             raise ValueError("holders must be capped below the connection cap (USAGE and END need a permit)")
         self.launcher, self._verify, self._pool_free, self._peer_ok = launcher, verify, pool_free, peer_ok
         self._replica = replica
         self._uploads = uploads           # None: this server stages no workspace (a LAUNCH naming one is refused)
         self._idle = holder_idle_s
-        self._mu = threading.Condition(threading.Lock())
-        self._jobs: dict[str, _EndJob] = {}
+        self._reg = registry if registry is not None else HolderRegistry()
+        self._mu = self._reg.mu
+        self._jobs = self._reg.jobs
+        self._stripes = self._reg.stripes
+        self._live = self._reg.live
         self._slots = threading.BoundedSemaphore(max_connections)
         self._holder_slots = threading.BoundedSemaphore(max_holders)
-        self._stripes = tuple(threading.RLock() for _ in range(_END_STRIPES))
-        self._live: dict[str, _Holder] = {}
         self._closing = False
-        self._rejudge_running = False       # one SYNC re-judge worker at a time; a SYNC during a pass asks for one more
-        self._rejudge_again = False
+        with self._mu:
+            self._reg.servers.append(self)
+
+    @property
+    def _rejudge_running(self) -> bool:
+        return self._reg.rejudge_running
+
+    @property
+    def _rejudge_again(self) -> bool:
+        return self._reg.rejudge_again
 
     # -- connection ------------------------------------------------------------------------------------------------------
 
@@ -854,14 +888,16 @@ class RunServer:
         its rows. Never raises, never waits: the SYNC's answer is not delayed, except in one case. When the worker
         thread cannot be started (thread exhaustion), the pass runs HERE, on the SYNC's own thread, before it answers
         (L3 r1: a swallowed start lost a committed revoke on a quiet box). A delayed answer is the price of never losing a
-        pass; a pending flag waiting for a next SYNC that may never come was the alternative, and it can lose one."""
+        pass; a pending flag waiting for a next SYNC that may never come was the alternative, and it can lose one.
+        The worker and its flags are the registry's: one pass covers the live holders of every server sharing it."""
+        reg = self._reg
         with self._mu:
-            if self._closing:
+            if reg.all_closing():
                 return
-            self._rejudge_again = True
-            if self._rejudge_running:
+            reg.rejudge_again = True
+            if reg.rejudge_running:
                 return
-            self._rejudge_running = True
+            reg.rejudge_running = True
         try:
             threading.Thread(target=self._rejudge_loop, daemon=True).start()
         except Exception:  # noqa: BLE001
@@ -871,25 +907,28 @@ class RunServer:
     def _rejudge_loop(self) -> None:
         """Passes until no SYNC asked for another. Every exit clears ``_rejudge_running``, and the exception exit
         re-checks ``_rejudge_again`` (a SYNC that landed during the pass) and asks for a fresh worker, so a raise loses no
-        queued pass (L3 r1). Each holder is judged in its own ``try``: one holder that raises skips no other."""
+        queued pass (L3 r1). Each holder is judged in its own ``try``: one holder that raises skips no other. Each holder
+        is judged by the server that spawned it (``owner``); a holder whose server is shutting down is left to that
+        shutdown."""
+        reg = self._reg
         try:
             while True:
                 with self._mu:
-                    if not self._rejudge_again or self._closing:
-                        self._rejudge_again = False
-                        self._rejudge_running = False
+                    if not reg.rejudge_again or reg.all_closing():
+                        reg.rejudge_again = False
+                        reg.rejudge_running = False
                         return
-                    self._rejudge_again = False
-                    holders = list(self._live.values())
+                    reg.rejudge_again = False
+                    holders = [h for h in self._live.values() if not (h.owner or self)._closing]
                 for h in holders:
                     try:
-                        self._rejudge(h)
+                        (h.owner or self)._rejudge(h)
                     except Exception as exc:  # noqa: BLE001
                         _log.warning("SYNC re-judge of %s raised (%s)", h.key, type(exc).__name__)
         except BaseException:  # noqa: BLE001 - the flag must come back, whatever raised
             with self._mu:
-                self._rejudge_running = False
-                again = self._rejudge_again and not self._closing
+                reg.rejudge_running = False
+                again = reg.rejudge_again and not reg.all_closing()
             _log.warning("a SYNC re-judge pass raised")
             if again:
                 self._rejudge_soon()
@@ -952,11 +991,11 @@ class RunServer:
         with self._mu:
             if self._closing:
                 raise LauncherRefused("server-stopping", "the run server is stopping", reason_class="transient")
-            if key in self._live:
+            if key in self._live:       # the registry's: a key held on the sibling socket is held here too
                 raise LauncherRefused("session-key-already-used", "this server already holds a session under this key")
             if not self._holder_slots.acquire(blocking=False):
                 raise LauncherRefused("no-holder-capacity", "every holder slot is taken", reason_class="transient")
-            holder = self._live[key] = _Holder(key, proof, launch.exposure, claims)
+            holder = self._live[key] = _Holder(key, proof, launch.exposure, claims, owner=self)
         try:
             child = self.launcher.spawn(launch)
         except BaseException:
@@ -1003,7 +1042,7 @@ class RunServer:
                     except Exception:  # noqa: BLE001 - the END below is the proof
                         _log.warning("a holder's ABORT raised")
                     h.job = self._start_end(h.key)
-                    self._holder_slots.release()      # the connection's permit; the _live entry outlives it
+                    (h.owner or self)._holder_slots.release()   # the spawning connection's permit; _live outlives it
                     self._forget_if_proven(h.key, h.job)
                 job = h.job
             job.done.wait(max(0.0, wait_s))
@@ -1046,7 +1085,8 @@ class RunServer:
         try:
             with self._mu:
                 self._closing = True                 # no holder registers after this, so the snapshot is complete
-                holders = list(self._live.values())
+                # this server's own holders: a sibling sharing the registry ENDs its own in its shutdown
+                holders = [h for h in self._live.values() if (h.owner or self) is self]
             threads = [threading.Thread(target=self._shutdown_one, args=(h, end_at), daemon=True) for h in holders]
             for t in threads:
                 t.start()
@@ -1248,7 +1288,8 @@ def build_server(host: str, store: Path, control_sock: Path, operator_uid: int, 
     its WHOLE share, the fail-closed rule), behind its own ``replica_verifier(replica, billing="api_key")``, served by
     :func:`main` on its own socket (:data:`BROKERED_SOCKET_NAME`). The two share the runtime, the usage sources, the
     session index (one record directory, keyed by attempt id), the ONE replica (two replica objects on one directory
-    would contend on its append lock) and the ONE uploads (a second sweep would delete the first's staging). Both
+    would contend on its append lock), the ONE uploads (a second sweep would delete the first's staging) and the ONE
+    :class:`HolderRegistry` (a key is one session whichever socket launched it, so SYNC and END reach it from either). Both
     servers come from the one ``RunServer(`` call below with ``replica=replica`` (the claims=None ruling's pin). The
     client's ``build_launcher`` handing an ``api_key`` occurrence a brokered client is NOT wired yet, so no real fire
     reaches the brokered socket. Never mutate a shared launcher's ``auth`` per request: concurrent launches and later
@@ -1282,8 +1323,9 @@ def build_server(host: str, store: Path, control_sock: Path, operator_uid: int, 
                                        launcher.index, auth="brokered",
                                        spend=lineage_spend_reader(store / "lineage" / SINK)),
                           replica_verifier(replica, billing="api_key")))
+    registry = HolderRegistry()         # one session index, so one set of holders, END jobs, stripes and re-judge
     servers = [RunServer(ln, verify=verify, pool_free=pool_free, peer_ok=lambda s: peer_uid(s) == operator_uid,
-                         replica=replica, uploads=uploads) for ln, verify in launchers]
+                         replica=replica, uploads=uploads, registry=registry) for ln, verify in launchers]
     if brokered:
         servers[0].brokered = servers[1]
     return servers[0]
