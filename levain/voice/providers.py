@@ -98,12 +98,11 @@ ALLOWED_HOSTS = frozenset(HOSTS.values())
 
 OPENAI_TTS_MODEL = "tts-1"                      # DATA: announced to shut down 2027-01-06 (module docstring)
 OPENAI_STT_MODEL = "gpt-4o-mini-transcribe"
-# Live (streamed) dictation sends a different model than the batch POST above. This ONE table is read by the adapters (the
-# model they send), by the stream-open route (the model the ledger reserves and settles) and by the meter's price check, so
-# a stream cannot be sent as one model and priced as another. Past: openai's adapter sent gpt-live-transcribe while the
-# ledger reserved gpt-4o-mini-transcribe ($0.003 / min against $0.017 / min, 2026-11-07, https://developers.openai.com/api/docs/pricing).
-# The VALUE is the LEDGER model. Deepgram's wire model stays "nova-3" (DEEPGRAM_STT_MODEL below), but its live WebSocket
-# bills at its own streaming rate, so the ledger row is "nova-3-stream" (https://deepgram.com/pricing, read 2026-11-08).
+# Live (streamed) dictation: the LEDGER model each provider's stream is reserved, settled and priced under. It is not
+# always the model sent on the wire. Deepgram's live socket sends the same model as its pre-recorded POST ("nova-3",
+# DEEPGRAM_STT_MODEL below) but Deepgram bills it at a separate streaming rate, so its ledger key is "nova-3-stream"
+# (https://deepgram.com/pricing, read 2026-11-08). Past: a stream sent as gpt-live-transcribe was reserved as gpt-4o-mini-transcribe ($0.003 / min against
+# $0.017 / min, 2026-11-07, https://developers.openai.com/api/docs/pricing).
 STREAM_STT_MODELS = {"openai": "gpt-live-transcribe", "deepgram": "nova-3-stream"}
 OPENAI_DEFAULT_VOICE = "nova"
 DEEPGRAM_TTS_MODEL = "aura-2"                   # the priced family (levain.voice.meter.DEFAULT_PRICES)

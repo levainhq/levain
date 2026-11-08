@@ -30,7 +30,9 @@ sequenced intake of PCM16 16 kHz mono chunks, a provider-stream object that forw
    ceiling) outlives the end for the stop-time WAV fallback and is handed out once by :meth:`StreamSession.take_audio`.
    A dropped session hands out nothing more, even to a caller that already held it, and its contents are cleared
    under its lock, never under a caller mid-read. The owner's close answers ``provider_failed`` (collected, settled)
-   when the provider close did not finish cleanly, so the text it would have given is never taken as final.
+   when the provider close did not finish cleanly, so the text it would have given is never taken as final. While a
+   revoke's worker is still closing the provider the session keeps its live slot: the owner's close waits for it,
+   bounded, and past the bound answers ``provider_failed`` uncollected; the worker collects it when it is done.
 5. Nothing spoken and no key leaves through a log line or an exception: lines carry event names, exception TYPE names
    and seconds only, and every :class:`StreamRefused` is raised outside any ``except`` block, from a frame that holds
    no key and no provider text, so it chains nothing.
@@ -80,6 +82,8 @@ MAX_SESSIONS = 4
 MAX_UNSETTLED = 64             # settles waiting for a retry; at this many, new opens are refused until it drains
 OPEN_WAIT_S = 10.0             # how long shutdown waits for opens in progress (on other threads) to end their reservation
 REVOKE_CLOSE_WAIT_S = 0.5      # how long a revoke waits for the provider close before it is answered (the rest runs on)
+REVOKE_COLLECT_WAIT_S = 4.0    # how long an owner's close waits for a revoke's unfinished provider close (under the
+                               # page's own close deadline, so the answer still reaches it)
 SID_BYTES = 24
 
 # Fixed words: the code is the contract, the words are what the route may show. Nothing here carries a value from outside.
@@ -212,6 +216,14 @@ class StreamSession:
         self._depth = 0                           # how deep the holder of the lock is (it is an RLock)
         self._dropped = False                     # the registry let go: nothing more is handed out
         self._discard_pending = False             # dropped while held: the holder clears it on its way out
+        # A revoke's worker closes the provider after the lock is let go; until it has finished the session still holds
+        # its live slot, so an owner's close must not collect it (L3 4c r2, codex MED). ``_handoff`` orders the
+        # worker's finish against a close that stopped waiting: whichever comes second collects, exactly once.
+        self._revoke_pending = False
+        self._finished = threading.Event()        # set once the close, settle and registry handoff have all run
+        self._handoff = threading.Lock()
+        self._collect_wanted = False              # an owner's close gave up waiting: the worker collects when done
+        self._collected = False
 
     @contextmanager
     def _held(self, blocking: bool = True) -> Iterator[bool]:
@@ -274,13 +286,15 @@ class StreamSession:
         short-lived worker that this call waits for at most ``wait`` seconds: a provider close can take ~10 s (its
         drain), and the chunk that found the revoke must be answered before the page's chunk deadline, or the page
         never learns it was a revoke (L3 4c r1, deepseek #1). The worker is not a daemon, so the settle is not lost to an
-        exiting process; it holds the live slot until it has settled (the socket is still closing). ``revoked`` is an
-        end reason only: the chunk that found the revoke is answered with the open path's own fixed words
+        exiting process; the session holds its live slot until the worker has settled (the socket is still closing),
+        and an owner's close in that time waits for it, bounded, and never collects it early (:meth:`close`).
+        ``revoked`` is an end reason only: the chunk that found the revoke is answered with the open path's own fixed words
         (:func:`levain.cockpit.voice.stream_chunk`), so it has none here."""
         with self._held():
             if self._closed:
                 return
             self._mark_ended("revoked")
+            self._revoke_pending = True     # set in the same locked step, so a close that sees it ended sees this too
         # daemon set explicitly: a thread inherits it from its creator, whatever kind of thread called this
         worker = threading.Thread(target=self._finish_end, args=("revoked", True), name="levain-voice-revoke-close",
                                   daemon=False)
@@ -294,6 +308,7 @@ class StreamSession:
         if started:
             worker.join(wait)
         else:
+            # Known edge, left inline on purpose: with no thread to be had, a hung provider close delays this answer.
             self._finish_end("revoked", True)
 
     def _limit(self, now: float) -> str:
@@ -417,23 +432,46 @@ class StreamSession:
 
         Raises ``provider_failed`` (the session is still collected and its meter settled) when the provider close did
         not finish cleanly: ``close()`` raised, or the adapter reports failed after it (OpenAI's final commit timed
-        out, Deepgram sent no closing metadata), or it is still running (a revoke's worker). The text is then partial,
-        and a non-2xx is what sends the page to its own recording instead (L3 4c r1, codex F2). Raises
-        ``unknown_session`` when the registry already let go of the session (its text is gone, never an empty
-        success; codex F3)."""
+        out, Deepgram sent no closing metadata). The text is then partial, and a non-2xx is what sends the page to its
+        own recording instead (L3 4c r1, codex F2). Raises ``unknown_session`` when the registry already let go of the
+        session (its text is gone, never an empty success; codex F3).
+
+        A revoke's worker may still be closing the provider. Then this waits for it, at most
+        :data:`REVOKE_COLLECT_WAIT_S`, outside the lock, and answers as above once it has finished. Past the wait it
+        raises ``provider_failed`` WITHOUT collecting: the session still holds its socket and its reservation, so it
+        keeps its live slot, and the worker collects it when it is done (L3 4c r2, codex MED). Collected once either
+        way."""
+        with self._held():
+            if not self._dropped and not self._closed:
+                self._end("closed", retain=False)     # collected next, so never counted among the retained ended
+            pending = self._revoke_pending and not self._dropped
+        if pending and not self._finished.wait(REVOKE_COLLECT_WAIT_S):
+            with self._handoff:
+                unfinished = not self._finished.is_set()
+                if unfinished:
+                    self._collect_wanted = True       # the worker sees this under _handoff when it finishes
+            if unfinished:
+                raise StreamRefused("provider_failed")
         with self._held():
             if self._dropped:
                 code, final = "unknown_session", ""
             else:
-                if not self._closed:
-                    self._end("closed", retain=False)     # collected next, so never counted among the retained ended
                 final = self._final
                 code = "" if self._close_ok is True else "provider_failed"
         if code != "unknown_session":
-            self._on_collect(self.sid)
+            self._collect_once()
         if code:
             raise StreamRefused(code)
         return final
+
+    def _collect_once(self) -> None:
+        """Hand the session to the registry's collect, at most once (an owner's close, or a revoke's worker for a close
+        that stopped waiting)."""
+        with self._handoff:
+            if self._collected:
+                return
+            self._collected = True
+        self._on_collect(self.sid)
 
     def _end_if_expired(self) -> bool:
         """End with the limit's reason if, checked under the lock, the session is live and past a limit. A session
@@ -469,7 +507,8 @@ class StreamSession:
     def _finish_end(self, reason: str, retain: bool) -> None:
         """Close the provider stream (recording whether it finished cleanly), then settle in a ``finally``. Run under
         the lock by :meth:`_end`, or by :meth:`end_revoked`'s worker without it: once :meth:`_mark_ended` has run no
-        other call uses the provider object, so it is still used from one thread at a time."""
+        other call uses the provider object, so it is still used from one thread at a time. The worker writes the
+        final text and ``_close_ok`` without the lock; :meth:`close` reads them only after ``_finished`` is set."""
         ok = False
         try:
             failed = ""
@@ -491,12 +530,19 @@ class StreamSession:
             if failed:
                 _log.warning("voice stream: the provider stream failed on close (%s)", failed)
         finally:
-            self._close_ok = ok
-            self._partial = ""
-            self._settle()
-            if retain:
-                self._on_end(self.sid)
-            _log.info("voice stream: ended (%s) after %d s", reason, seconds_for(self._bytes))
+            try:
+                self._close_ok = ok
+                self._partial = ""
+                self._settle()
+                if retain:
+                    self._on_end(self.sid)        # before any collect: a collected sid is never re-registered
+                _log.info("voice stream: ended (%s) after %d s", reason, seconds_for(self._bytes))
+            finally:
+                with self._handoff:
+                    self._finished.set()
+                    collect = self._collect_wanted
+                if collect:
+                    self._collect_once()
 
     def _settle(self) -> None:
         seconds = seconds_for(self._bytes)

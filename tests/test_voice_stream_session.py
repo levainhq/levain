@@ -1011,3 +1011,107 @@ def test_a_revoke_answers_without_waiting_for_a_slow_provider_close_and_still_se
     [row] = rig.rows()
     assert (row.status, row.units) == ("ok", 1)
     assert rig.streams[0].closed == 1
+
+
+# --- L3 batch4c r2: an owner's close while a revoke's worker is still closing the provider --------------------------
+
+def _count_collects(session):
+    calls = []
+    inner = session._on_collect
+
+    def counted(sid):
+        calls.append(sid)
+        inner(sid)
+
+    session._on_collect = counted
+    return calls
+
+
+def _wait_for(pred, timeout=5.0):
+    import time as _time
+    end = _time.monotonic() + timeout
+    while _time.monotonic() < end:
+        if pred():
+            return True
+        _time.sleep(0.02)
+    return pred()
+
+
+def test_a_close_during_a_pending_revoke_close_keeps_the_session_counted(tmp_path, monkeypatch):
+    """codex r2 MED. The page posts close right after the revoked chunk while the worker still holds the provider
+    socket and the reservation. Red with: close() collecting at once (the registry let go, so an open past the cap ran)."""
+    monkeypatch.setattr(ss, "REVOKE_COLLECT_WAIT_S", 0.2, raising=False)
+    rig = Rig(tmp_path, max_sessions=1)
+    gate = threading.Event()
+    s = rig.open(stream=SlowClose(gate))
+    s.feed(0, PCM_1S)
+    s.end_revoked(wait=0.0)
+    calls = _count_collects(s)
+    with refused("provider_failed"):
+        s.close()                                                 # the bound ran out: unfinished, so no text
+    assert calls == []                                            # ... and not collected
+    assert len(rig.registry) == 1                                 # the closing session still holds its live slot
+    with refused("too_many_sessions"):
+        rig.open()
+    assert rig.rows()[0].status == "reserved"
+    gate.set()
+    assert _wait_for(lambda: s._finished.is_set())
+    assert calls == [s.sid]                                       # the worker collected it, once
+    assert len(rig.registry) == 0
+    assert s.sid not in rig.registry._sessions and s.sid not in rig.registry._ended_at
+    [row] = rig.rows()
+    assert (row.status, row.units) == ("ok", 1)
+    rig.open().close()                                            # the slot is free again
+
+
+def test_a_close_that_outwaits_the_revoke_close_answers_normally_and_collects_once(tmp_path, monkeypatch):
+    """deepseek r2 MED (collect then a later _on_end). The worker finishes inside close()'s bounded wait: close answers
+    as a normal close would (clean here, so the text), collects once, and no sid is left behind. Red with: close()
+    refusing provider_failed whenever the worker had not finished when close() was called."""
+    monkeypatch.setattr(ss, "REVOKE_COLLECT_WAIT_S", 5.0, raising=False)
+    rig = Rig(tmp_path, max_sessions=1)
+    gate = threading.Event()
+    s = rig.open(stream=SlowClose(gate))
+    s.feed(0, PCM_1S)
+    s.end_revoked(wait=0.0)
+    calls = _count_collects(s)
+    threading.Timer(0.2, gate.set).start()
+    assert s.close() == "hello world"
+    assert s.close() == "hello world"                             # idempotent, and still one collect
+    assert calls == [s.sid]
+    assert s.sid not in rig.registry._sessions and s.sid not in rig.registry._ended_at
+    assert len(rig.registry) == 0
+    [row] = rig.rows()
+    assert (row.status, row.units) == ("ok", 1)
+
+
+def test_a_close_that_outwaits_an_unclean_revoke_close_refuses_and_collects_once(tmp_path, monkeypatch):
+    monkeypatch.setattr(ss, "REVOKE_COLLECT_WAIT_S", 5.0, raising=False)
+    rig = Rig(tmp_path, max_sessions=1)
+    gate = threading.Event()
+    s = rig.open(stream=SlowClose(gate, fail_close=True))
+    s.feed(0, PCM_1S)
+    s.end_revoked(wait=0.0)
+    calls = _count_collects(s)
+    threading.Timer(0.2, gate.set).start()
+    with refused("provider_failed"):
+        s.close()
+    assert calls == [s.sid]
+    assert len(rig.registry) == 0
+    assert s.sid not in rig.registry._ended_at
+
+
+def test_an_ordinary_close_is_unchanged_by_the_revoke_wait(tmp_path, monkeypatch):
+    """Control: no revoke, so close() never waits on a worker and collects once, as before."""
+    import time as _time
+    monkeypatch.setattr(ss, "REVOKE_COLLECT_WAIT_S", 5.0, raising=False)
+    rig = Rig(tmp_path, max_sessions=1)
+    s = rig.open()
+    s.feed(0, PCM_1S)
+    calls = _count_collects(s)
+    t0 = _time.monotonic()
+    assert s.close() == "hello world"
+    assert _time.monotonic() - t0 < 1.0
+    assert calls == [s.sid]
+    assert len(rig.registry) == 0
+    rig.open().close()
