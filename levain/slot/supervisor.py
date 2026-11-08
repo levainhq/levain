@@ -1464,8 +1464,9 @@ class Supervisor:
             finally:
                 if self._reset_untaken and not self._output_failed:     # a failed stdout's line already said it
                     # The run's last line: whatever else he missed, this is the one that leaves his shell wrong.
-                    self.say("your terminal did not take the reset of the reporting modes the session turned on "
-                             "(mouse, focus or paste reports may still be on): run `reset`")
+                    self.say("your terminal did not take the reset of the terminal modes the session set (mouse, "
+                             "focus or paste reports, cursor keys, the alternate screen, kitty keyboard flags or "
+                             "modifyOtherKeys may still be on): run `reset`")
                 self._release_held()
 
     def _leased(self, clone: Path, branch: str, blob: bytes) -> int:
@@ -1987,7 +1988,7 @@ class Supervisor:
                 os.set_blocking(stdout, was_blocking)
             if out_err is not None:
                 self._output_failed = True
-                also = (", and the reset of the reporting modes the session turned on did not reach it"
+                also = (", and the reset of the terminal modes the session set did not reach it"
                         if self._reset_untaken else "")
                 self.say(f"your terminal refused the session's output ({out_err.strerror or out_err}){also}: "
                          f"ending the session")
