@@ -68,10 +68,40 @@ def sign_queue_dir(environ: Mapping[str, str]) -> Path | None:
     try:
         from levain.consent.queue import queue_dir_for
 
-        data = json.loads((queue_dir_for(environ) / "claude_code.json").read_text(encoding="utf-8"))
-        return absolute(data.get(SETTINGS_KEY)) if isinstance(data, dict) else None
+        qdir = queue_dir_for(environ)
+        try:
+            data = json.loads((qdir / "claude_code.json").read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            data = None
+        named = absolute(data.get(SETTINGS_KEY)) if isinstance(data, dict) else None
+        if named is not None:
+            return named
+        # Nothing names a queue (a standard install: init writes no ``sign_queue_dir``). A cockpit serving the hook
+        # queue itself (``levain serve --sign-queue-dir <that queue>``) has published its origin in it, which is
+        # the owner saying this queue is the one it signs: derive from that, never from a guessed path.
+        from levain.consent.cockpit_origin import read_origin
+
+        return qdir if read_origin(qdir) is not None else None
     except Exception:  # noqa: BLE001 - no readable settings: no card
         return None
+
+
+def sign_queue_hint(environ: Mapping[str, str]) -> str:
+    """Why :func:`sign_queue_dir` is not usable and the exact fix, for a refusal: the named directory that is missing
+    (and the flag that overrides it), or the hook queue to pass when nothing is named."""
+    try:
+        from levain.consent.queue import queue_dir_for
+
+        qdir = queue_dir_for(environ)
+    except Exception:  # noqa: BLE001
+        return "pass --sign-queue-dir DIR (the directory `levain serve --sign-queue-dir` was started with)"
+    found = sign_queue_dir(environ)
+    if found is not None and not found.is_dir():
+        return (f"the named signing queue {found} does not exist (from {ENV_QUEUE} or sign_queue_dir in "
+                f"{qdir / 'claude_code.json'}): fix that value, or pass --sign-queue-dir DIR")
+    return (f"pass --sign-queue-dir DIR (the directory `levain serve --sign-queue-dir` was started with; on a "
+            f"standard install that is {qdir}), or set {ENV_QUEUE}, or add \"{SETTINGS_KEY}\": \"<DIR>\" to "
+            f"{qdir / 'claude_code.json'}")
 
 
 def nonce_of(store_id: str, session: str, stamp: str) -> str:

@@ -1269,9 +1269,10 @@ def _sign_queue(args: argparse.Namespace) -> Path:
             raise InputRefused("--sign-queue-dir must be an absolute path")
         return got
     found = sign_queue_dir(os.environ)
-    if found is None:
-        raise InputRefused("no signing queue is named: pass --sign-queue-dir (the cockpit Signer's queue), or set "
-                           "LEVAIN_SIGN_QUEUE_DIR")
+    if found is None or not found.is_dir():
+        from levain.consent.answer_countersign import sign_queue_hint
+
+        raise InputRefused(f"no usable signing queue: {sign_queue_hint(os.environ)}")
     return found
 
 
