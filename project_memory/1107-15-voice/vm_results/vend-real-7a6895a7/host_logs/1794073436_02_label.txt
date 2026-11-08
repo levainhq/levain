@@ -1,3 +1,0 @@
-$ /usr/bin/ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR -o PreferredAuthentications=password,keyboard-interactive -o PubkeyAuthentication=no -o ConnectTimeout=15 admin@192.168.64.42 sudo -n /usr/local/bin/python3.13 -I /tmp/fire/g_vm.py label X1c
-rc=0
-label X1c start 2026-11-07 17:43:56

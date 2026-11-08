@@ -1,3 +1,0 @@
-$ /Users/phillipclapham/.local/bin/tart ip vend-real-7a6895a7 --wait 60
-rc=0
-192.168.64.42
