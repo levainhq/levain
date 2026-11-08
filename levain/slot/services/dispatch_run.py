@@ -1283,9 +1283,24 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         serve(server, listener, stop)
     finally:
         stop.set()
-        server.shutdown(SHUTDOWN_BUDGET_S)       # END every live session first: daemon handlers never clean up at exit
+        # END every live session first: daemon handlers never clean up at exit. Both servers shut down AT ONCE against
+        # one absolute deadline, so the pair returns within one SHUTDOWN_BUDGET_S (a unit's stop timeout is sized for
+        # one service's shutdown, not two back to back; PRE-W L3 r1)
+        end_at = time.monotonic() + SHUTDOWN_BUDGET_S
+        down = None
         if brokered is not None:
-            brokered[0].shutdown(SHUTDOWN_BUDGET_S)
+            side_server = brokered[0]
+            down = threading.Thread(target=lambda: side_server.shutdown(max(0.0, end_at - time.monotonic())),
+                                    name="brokered-down", daemon=True)
+            try:
+                down.start()
+            except RuntimeError:
+                down = None                      # no thread to spare: it runs after, in what is left of the budget
+        server.shutdown(max(0.0, end_at - time.monotonic()))
+        if down is not None:
+            down.join(max(0.0, end_at - time.monotonic()))
+        elif brokered is not None:
+            brokered[0].shutdown(max(0.0, end_at - time.monotonic()))
         listener.close()
         if brokered is not None:
             brokered[1].close()

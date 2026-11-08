@@ -870,3 +870,35 @@ def test_a_routemap_reply_whose_generation_only_equals_the_asked_one_fails_close
     ok = {"generation": 1, "routes": {}, "digests": {}}
     assert FR.SupervisorFacts(_OnePort(ok)).routemap(1) is not None
     assert FR.SupervisorFacts(_OnePort({**ok, "generation": gen})).routemap(1) is None
+
+
+# --- L3 r1 (prewr2): both servers' shutdown fits ONE budget (complement LOW) -----------------------------------------
+
+def test_main_on_shuts_both_servers_down_within_one_budget(tmp_path, monkeypatch):
+    """Each server's shutdown takes its whole budget here (sessions that never prove): the two together must still
+    return within ONE ``SHUTDOWN_BUDGET_S``, not two back to back (a unit's stop timeout is sized for one)."""
+    import time
+    budget = 0.6
+    monkeypatch.setattr(DR, "SHUTDOWN_BUDGET_S", budget)
+    rig = _MainRig(tmp_path, monkeypatch, "brokered")
+
+    def slow(server):
+        def shutdown(b):
+            server.shut.append(b)
+            time.sleep(max(0.0, b))
+        return shutdown
+    real_build = DR.build_server
+
+    def build(*a, **kw):
+        s = real_build(*a, **kw)
+        s.shutdown, s.brokered.shutdown = slow(s), slow(s.brokered)
+        return s
+    monkeypatch.setattr(DR, "build_server", build)
+    t0 = time.monotonic()
+    assert rig.run() == 0
+    took = time.monotonic() - t0
+    assert rig.server.shut and rig.server.brokered.shut
+    # each had (nearly) the whole budget, never a share of it or more than it ...
+    assert all(0.5 * budget < b <= budget for b in rig.server.shut + rig.server.brokered.shut)
+    # ... and the two ran at once
+    assert took < 1.5 * budget, f"both shutdowns took {took:.2f}s against one budget of {budget}s"
