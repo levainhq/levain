@@ -9691,6 +9691,16 @@ for (const type of ["touchstart", "wheel", "pointerdown", "click", "keydown"]) d
     nd.appendChild(note);
     return nd;
   }
+  // a prompt notice (the agent's own dialog waits; no hold, so no sheet): say plainly what it is, and offer nothing to press
+  function ncDialogBox(it) {
+    const dg = it.dialog;
+    if (!dg || typeof dg !== "object") return null;
+    const who = typeof dg.agent === "string" && dg.agent ? dg.agent : "An agent";
+    const nd = el("div", "nc-dialogbox");
+    nd.appendChild(el("p", "nc-dialoghead", "Left to the seat's own dialog"));
+    nd.appendChild(el("p", "nc-note", who + " asked in its own dialog. Levain did not hold it, so there was nothing to answer here: if it is still open, answer it in that seat's dialog at the laptop."));
+    return nd;
+  }
   function ncTokenNote(it) {
     return it.origin === "token" ? el("p", "nc-note nc-tokennote", "Posted by notify token " + (it.token_name || "") + ": every link shows its full address.") : null;
   }
@@ -9815,6 +9825,8 @@ for (const type of ["touchstart", "wheel", "pointerdown", "click", "keydown"]) d
     if (typeof it.image_url === "string" && /^\/[^/\\]/.test(it.image_url)) { const im = el("img", "nc-img"); im.src = it.image_url; im.alt = ""; d.appendChild(im); }
     const sheetBox = ncSheetBox(it);      // an approval's way to its sign sheet, above the words
     if (sheetBox) d.appendChild(sheetBox);
+    const dialogBox = ncDialogBox(it);
+    if (dialogBox) d.appendChild(dialogBox);
     if (it.body) d.appendChild(ncBody(it.body));
     for (const x of [ncNeedsBox(it), ncTokenNote(it)]) if (x) d.appendChild(x);
     const dv = ncDelivery(it.delivery);
