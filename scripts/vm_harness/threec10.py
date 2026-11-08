@@ -90,7 +90,8 @@ INSTALL_SCRIPT = ('set -e; d="$1/keys/cred"; n="$2"; umask 077; '
 #: in-progress update, a partial of ours, a planted link) is left in place and answered ``cred-foreign-new``, which the harness
 #: reports as a cleanup problem. Never ``<cred>.json``. The temp copy of the credential is removed on every exit by the trap,
 #: including a ``set -e`` failure. Known edge: another writer's byte-identical ``.json.new`` reads as ours (cmp, then rm).
-REMOVE_NEW_SCRIPT = ('set -e; f="$1/keys/cred/$2.json.new"; e=$(mktemp); trap \'rm -f "$e"\' EXIT HUP INT TERM; cat > "$e"; '
+REMOVE_NEW_SCRIPT = ('set -e; f="$1/keys/cred/$2.json.new"; e=$(mktemp); trap \'rm -f "$e"\' EXIT; trap "exit 129" HUP; trap "exit 130" INT; '
+                     'trap "exit 143" TERM; cat > "$e"; '
                      'if [ ! -e "$f" ] && [ ! -L "$f" ]; then echo "cred-removed-new $2"; '
                      'elif [ ! -L "$f" ] && [ -f "$f" ] && cmp -s "$e" "$f"; then rm -f "$f"; echo "cred-removed-new $2"; '
                      'else echo "cred-foreign-new $2"; fi')
