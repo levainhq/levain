@@ -909,3 +909,15 @@ def test_a_well_formed_kitty_sequence_passes(data, undo) -> None:
     f = TermFilter()
     assert f.feed(data) == data
     assert f.reset() == undo
+
+
+# --- prel3fix L3 r1 A3: the push cap leaves the operator's entries room on the smallest stack sourced ---------------
+
+def test_a_slot_passes_at_most_four_kitty_pushes_per_screen() -> None:
+    # kitty keeps 8 entries per screen ("main_key_encoding_flags[8]" in kitty/screen.h) and evicts the oldest on a
+    # push past them; the protocol names no size. Four leaves the operator half of that stack.
+    push = b"\x1b[>1u"
+    f = TermFilter()
+    assert f.feed(push * 5) == push * 4
+    assert f.feed(b"\x1b[?1049h" + push * 5) == b"\x1b[?1049h" + push * 4
+    assert f.reset() == b"\x1b[<4u\x1b[?1049l\x1b[<4u"

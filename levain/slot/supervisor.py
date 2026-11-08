@@ -107,7 +107,9 @@ _OSC_MAX = 8192       # DECISION: an OSC payload past this is discarded to its t
 _ESC_I_MAX = 8
 #: DECISION: the kitty keyboard pushes the filter passes per screen. A terminal's stack is bounded and a push onto a
 #: full one evicts its OLDEST entry, which is the operator's own; a slot needs only a few, so pushes past this drop.
-_KITTY_PUSH_MAX = 16
+#: The protocol names no size ("Terminals should limit the size of the stack as appropriate"); kitty's is 8 entries
+#: per screen ("main_key_encoding_flags[8]" in kitty/screen.h), so 4 leaves the operator half of it.
+_KITTY_PUSH_MAX = 4
 
 
 class TermFilter:
