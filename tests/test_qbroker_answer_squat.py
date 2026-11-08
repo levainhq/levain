@@ -213,3 +213,29 @@ def test_any_other_os_error_clearing_the_name_is_an_operator_error(L, broker, ke
     payload, sig = rbase.signed(L, victim, keys["operator"])
     with pytest.raises(operator.OperatorError, match="could not be cleared"):
         operator.write_answer(L / "queue", victim, payload, sig, rbase.snapshot(L), now=LATER)
+
+
+def test_a_swapped_signed_answer_that_cannot_be_linked_back_is_reported_with_its_quarantine_path(L, broker, keys,
+                                                                                                answers, monkeypatch):
+    rid = filed(broker)
+    write_answer(L, rid, keys["operator"], decision="deny")      # another writer's signed answer
+    first = (answers / f"{rid}.json").read_bytes()
+    real_judge, real_rename, calls = operator._signed_answer, os.rename, []
+
+    def stale_once(row, path, *a):
+        calls.append(path)
+        return (False, (0, 0)) if len(calls) == 1 else real_judge(row, path, *a)
+
+    def retaken(src, dst):
+        real_rename(src, dst)
+        if str(src).endswith(f"{rid}.json"):
+            (answers / f"{rid}.json").write_bytes(b"again")     # the name taken before the link-back
+
+    monkeypatch.setattr(operator, "_signed_answer", stale_once)
+    monkeypatch.setattr(operator.os, "rename", retaken)
+    payload, sig = rbase.signed(L, rid, keys["operator"])
+    with pytest.raises(operator.OperatorError) as got:
+        operator.write_answer(L / "queue", rid, payload, sig, rbase.snapshot(L), now=LATER)
+    parked = [p for p in answers.iterdir() if p.name.startswith(f".quarantine-{rid}-")]
+    assert len(parked) == 1 and parked[0].read_bytes() == first
+    assert str(parked[0]) in str(got.value)

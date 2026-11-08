@@ -262,7 +262,9 @@ def _clear_squat(store: QueueStore, row: Mapping[str, Any], request_id: str, pat
                  signers: SignersSnapshot | None, now: datetime, ssh_keygen: Path | str | None) -> bool:
     """True when ``path`` holds a signed answer (left in place). Otherwise whatever is there is renamed aside and
     False is returned, for the caller to link its own answer again. Should the thing renamed turn out not to be the
-    thing judged (swapped in between) and be a signed answer, it is linked back, never lost.
+    thing judged (swapped in between) and be a signed answer, it is linked back; should the name be taken again
+    before it can be, :class:`OperatorError` names the quarantine file that holds it. A signed answer is never left
+    in quarantine unreported.
 
     ``answers/`` has no sticky bit, so the member that squatted can delete or rename the quarantine file once it
     exists: a quarantine file gone is a name cleared, never an error. Any other ``OSError`` is :class:`OperatorError`,
@@ -298,7 +300,8 @@ def _clear_squat_os(store: QueueStore, row: Mapping[str, Any], request_id: str, 
         try:
             os.link(aside, path, follow_symlinks=False)
         except FileExistsError:
-            return False
+            raise OperatorError(f"request {request_id}'s answer name was taken again before the signed answer moved "
+                                f"aside could be linked back: it is at {aside}") from None
         except FileNotFoundError:
             return False
         try:
