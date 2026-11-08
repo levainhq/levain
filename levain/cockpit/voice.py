@@ -47,10 +47,12 @@ from pathlib import Path
 from typing import Any, NamedTuple
 
 from levain.authority import voice_key_for
+from levain.cockpit import card_script
 from levain.cockpit import room as cockpit_room
 from levain.voice import custody
 from levain.voice import meter as vmeter
 from levain.voice import providers as vprov
+from levain.voice import stream_session
 from levain.voice.text import reply_text, speakable
 
 _log = logging.getLogger(__name__)
@@ -59,6 +61,20 @@ VOICE_JSON = "/cockpit/voice.json"
 SPEAK_PATH = "/cockpit/voice/speak"
 TRANSCRIBE_PATH = "/cockpit/voice/transcribe"
 VOICE_PATHS = (SPEAK_PATH, TRANSCRIBE_PATH)
+# live dictation (cockpit mic S3): three POSTs carved out beside the two above, behind the same premium-dictation switch
+STREAM_OPEN = "/cockpit/voice/stream/open"
+STREAM_CHUNK = "/cockpit/voice/stream/chunk"
+STREAM_CLOSE = "/cockpit/voice/stream/close"
+STREAM_PATHS = (STREAM_OPEN, STREAM_CHUNK, STREAM_CLOSE)
+# the providers a live dictation open may select; openai was taken out because its stream was once sent under a model name
+# the ledger did not price, so the cap could be passed several times over
+STREAM_PROVIDERS = ("deepgram",)
+STREAM_MAX_SESSIONS = 1                 # one live dictation at a time (the registry's cap)
+STREAM_CHUNK_MAX = stream_session.MAX_CHUNK_BYTES
+STREAM_BODY_DEADLINE_S = 10.0           # a 250 ms chunk is 8000 bytes: a body that takes longer than this is stalled
+STREAM_CHUNK_TYPE = "application/octet-stream"
+STREAM_SID_MAX = 128
+STREAM_CHUNK_INFLIGHT = 2               # chunk bodies read at once (the server's voice_chunk_gate); the page sends one at a time
 VOICE_INFLIGHT = 2                      # voice POSTs in flight at once (the server's voice_gate), apart from request_gate
 SPEAK_MAX = 4 * 1024                    # a speak body is a few ids and numbers; the words come from the record
 UPLOAD_MAX = 4 * 1024 * 1024            # the transcribe body cap, checked on the declared length before a byte is read
@@ -73,6 +89,9 @@ SPEAK_KEYS = frozenset({"room_thread_id", "reply_gseq", "chunk", "provider", "vo
 # The settings block's premium test: no room, no reply. The words are THIS constant (the page sends none), so the route
 # still never speaks a sentence the page chose.
 SAMPLE_KEYS = frozenset({"sample", "provider", "voice", "speed"})
+# V1-7: a Needs-you card read aloud. The page names the card (``question:<n>``); the words are card_script's, built from the
+# filed question, never from the body.
+CARD_KEYS = frozenset({"card_id", "chunk", "provider", "voice", "speed"})
 SAMPLE_WORDS = "This is how your room will sound."
 LAST_READ_STATES = frozenset({"keychain_unreadable", "unusable", "refused", "authority_unreadable"})
 
@@ -151,6 +170,8 @@ WORDS = {
     # premium dictation is hidden for Levain 1.0 (Phill 11-05): the transcribe route answers this, in these words only,
     # whether or not a key exists, until the server is started with the switch (``levain serve --premium-stt``)
     "premium_stt_off": "Premium dictation is not offered in this version.",
+    "no_stream": "{p} does not offer live dictation.",
+    "stream_media_type": "Send each audio chunk as application/octet-stream.",
     "bad_json": "The request is not valid JSON.",
     "bad_keys": "A speak request names room_thread_id, reply_gseq, chunk, provider, voice and speed, and nothing else.",
     "bad_provider": "That is not a voice provider.",
@@ -158,12 +179,16 @@ WORDS = {
     "no_dictation": "{p} reads aloud only; it does not offer dictation.",
     "bad_reply": "reply_gseq names the reply by its number.",
     "bad_chunk": "chunk is a whole number, 0 or more.",
+    "bad_card": "card_id names the card as question:<number>.",
+    "no_card": "That card is not here.",
+    "card_nothing": "That card has nothing to read aloud.",
     "bad_voice": "That voice is not offered for {p}.",
     "bad_speed": "That speed is outside what {p} accepts.",
     "bad_query": "Name the provider, and only the provider, in the query.",
     "bad_room": "The request names the room thread the page shows (room_thread_id).",
     "no_room": "No conversation is recorded.",
     "room_rotated": "This conversation was replaced; nothing more is read from it.",
+    "card_unreadable": "The card record could not be read.",
     "room_unreadable": "The room record could not be read.",
     "not_a_reply": "That reply is not finished, or is not in this conversation.",
     "nothing_to_read": "That reply has nothing to read aloud.",
@@ -307,7 +332,27 @@ def serve_voice(data_root: Path | str, meter: vmeter.Meter, *, last_read: Mutabl
         body["meter"] = "unreadable"
         body["caps"] = {"month_usd": _usd(caps.month_micros), "day_usd": _usd(caps.day_micros),
                         "spent_month_est": None, "spent_day_est": None, "month_start": None, "day_start": None}
+    chosen = stream_provider(rows) if premium_stt else None
+    if chosen is not None:
+        body["stream"] = True
+        body["stream_provider"] = chosen
     return body
+
+
+def stream_provider(rows: list[dict[str, Any]]) -> str | None:
+    """The provider the page sends for live dictation: the FIRST row that holds a key with ``stt`` among its uses AND
+    has a stream adapter (:data:`STREAM_PROVIDERS`); None when no row qualifies. The server names it (the page sends
+    this name, not its own first-row guess), so a keyed provider with no adapter listed before a qualifying one never
+    hides dictation. The row's ``uses`` already leave ``stt`` out unless premium dictation is on."""
+    for row in rows:
+        if row.get("key") == "set" and "stt" in row.get("uses", ()) and row.get("name") in STREAM_PROVIDERS:
+            return row["name"]
+    return None
+
+
+def stream_offered(rows: list[dict[str, Any]]) -> bool:
+    """Whether some row qualifies for live dictation (see :func:`stream_provider`)."""
+    return stream_provider(rows) is not None
 
 
 # --- the shared tail: reserve, read the key, call, settle or release ---------------------------------------------------
@@ -320,12 +365,12 @@ def _refuse_check(check: vmeter.Check, provider: str) -> Answer:
     return refusal(503, "voice_unpriced", "voice_unpriced", provider=provider, fallback=True)
 
 
-def _key_refusal(code: str, provider: str, use: str) -> Answer:
+def _key_refusal(code: str, provider: str, use: str, **extra: Any) -> Answer:
     if code == "use_not_granted":
         return refusal(409, "no_key" if use == "tts" else "no_stt_key", "no_tts_key" if use == "tts" else "no_stt_key",
-                       provider=provider, fallback=True)
+                       provider=provider, fallback=True, **extra)
     status, error, words = KEY_FAILURES.get(code, KEY_FAILURES["not_set"])
-    return refusal(status, error, words, provider=provider, fallback=True)
+    return refusal(status, error, words, provider=provider, fallback=True, **extra)
 
 
 def _end(meter: vmeter.Meter, reservation_id: int, release: bool) -> None:
@@ -483,7 +528,8 @@ def _parse_speak(raw: bytes) -> tuple[dict[str, Any] | None, Answer | None]:
     except (ValueError, UnicodeDecodeError):
         return None, refusal(400, "bad_json", "bad_json")
     sample = isinstance(req, dict) and set(req) == SAMPLE_KEYS and req["sample"] is True
-    if not sample and (not isinstance(req, dict) or set(req) != SPEAK_KEYS):
+    card = isinstance(req, dict) and set(req) == CARD_KEYS
+    if not sample and not card and (not isinstance(req, dict) or set(req) != SPEAK_KEYS):
         return None, refusal(400, "bad_request", "bad_keys")
     provider = req["provider"]
     if isinstance(provider, str) and provider in UNSUPPORTED:
@@ -496,7 +542,10 @@ def _parse_speak(raw: bytes) -> tuple[dict[str, Any] | None, Answer | None]:
     if sample:
         req = {**req, "chunk": 0}
     else:
-        if isinstance(req["reply_gseq"], bool) or not isinstance(req["reply_gseq"], int):
+        if card:
+            if not isinstance(req["card_id"], str) or not card_script.CARD_ID.fullmatch(req["card_id"]):
+                return None, refusal(400, "bad_request", "bad_card")
+        elif isinstance(req["reply_gseq"], bool) or not isinstance(req["reply_gseq"], int):
             return None, refusal(400, "bad_request", "bad_reply")
         chunk = req["chunk"]
         if isinstance(chunk, bool) or not isinstance(chunk, int) or chunk < 0:
@@ -511,8 +560,11 @@ def _parse_speak(raw: bytes) -> tuple[dict[str, Any] | None, Answer | None]:
 
 def speak(data_root: Path | str, service: Any, raw: bytes, *, directory: Path | str,
           revoke_queue: Path | str | None, meter: vmeter.Meter, transport: vprov.Transport,
-          read_key: Callable[..., Any], last_read: MutableMapping[str, str | None]) -> Answer:
-    """``POST /cockpit/voice/speak``: chunk ``chunk`` of the room reply that ended at ``reply_gseq``, as mp3. The words
+          read_key: Callable[..., Any], last_read: MutableMapping[str, str | None],
+          question_store: Any = None) -> Answer:
+    """``POST /cockpit/voice/speak``: chunk ``chunk`` of the room reply that ended at ``reply_gseq``, as mp3. A body naming
+    ``card_id`` (``question:<n>``) instead reads that filed question as the card script (V1-7, ``question_store``: the words
+    are :mod:`card_script`'s over the filed question). The words
     are only the record's (``reply_text`` over the open room's stream, then ``speakable``); a body naming any other key
     is refused. ``directory`` is the store directory the room is read from; ``revoke_queue`` the grant routes' queue
     (:func:`revoke_refusal`). Both keyword-only, like :func:`transcribe`'s: two paths never swap by position."""
@@ -523,7 +575,8 @@ def speak(data_root: Path | str, service: Any, raw: bytes, *, directory: Path | 
     if req.get("sample") is True:
         chunks = [SAMPLE_WORDS]
     else:
-        chunks, refused = _reply_chunks(directory, service, req)
+        chunks, refused = (_card_chunks(question_store, req) if "card_id" in req
+                           else _reply_chunks(directory, service, req))
         if refused is not None or chunks is None:
             return refused or internal_answer()
     words = chunks[req["chunk"]]
@@ -560,6 +613,25 @@ def _reply_chunks(directory: Path | str, service: Any, req: dict[str, Any]) -> t
     chunks = speakable(text)
     if not chunks:
         return None, refusal(404, "nothing_to_read", "nothing_to_read")
+    if not req["chunk"] < len(chunks):
+        return None, refusal(404, "no_such_chunk", "no_such_chunk", chunks=len(chunks))
+    return chunks, None
+
+
+def _card_chunks(store: Any, req: dict[str, Any]) -> tuple[list[str] | None, Answer | None]:
+    """The speakable chunks of the filed question ``req["card_id"]`` names, or the refusal. The words are the record's."""
+    m = card_script.CARD_ID.fullmatch(req["card_id"])
+    if store is None or m is None:
+        return None, refusal(404, "not_found", "no_card")
+    try:
+        q = store.get(int(m.group(1)))
+    except Exception:            # noqa: BLE001 - a store that cannot be read is fixed words, never its detail
+        return None, refusal(500, "internal", "card_unreadable")
+    if q is None:
+        return None, refusal(404, "not_found", "no_card")
+    chunks = speakable(card_script.question_script(q))
+    if not chunks:
+        return None, refusal(404, "nothing_to_read", "card_nothing")
     if not req["chunk"] < len(chunks):
         return None, refusal(404, "no_such_chunk", "no_such_chunk", chunks=len(chunks))
     return chunks, None
@@ -608,4 +680,173 @@ def transcribe(data_root: Path | str, query: str, content_type: str, audio: byte
     del audio
     if refused is not None:
         return refused
+    return _json(200, {"text": text if isinstance(text, str) else ""})
+
+
+# --- live dictation (cockpit mic S3) ------------------------------------------------------------------------------------
+# What a stream refusal is answered with. The code is stream_session's (its WORDS are the only text); the status is this
+# table's. tests/test_cockpit_voice_stream_routes.py pins it row by row.
+STREAM_STATUS = {
+    "bad_sequence": 409, "bad_chunk": 400, "too_fast": 429, "ceiling": 409, "idle_timeout": 409, "closed": 409,
+    "unknown_session": 404, "too_many_sessions": 503, "provider_failed": 502, "meter_unavailable": 503,
+    "settle_backlog": 503, "month_cap": 402, "day_cap": 402, "unpriced": 503, "stopping": 503, "internal": 500,
+}
+
+
+def stream_refusal(code: str, key_code: str = "", *, provider: str = "",
+                   last_read: MutableMapping[str, str | None] | None = None) -> Answer:
+    """A stream refusal in fixed words. ``key_unavailable`` is answered as ``transcribe`` answers a key that cannot be
+    read (custody's own code decides the status and words)."""
+    if code == "key_unavailable":
+        if last_read is not None and provider:
+            last_read[provider] = key_code if key_code in LAST_READ_STATES else None
+        if key_code in KEY_FAILURES or key_code == "use_not_granted":
+            return _key_refusal(key_code, provider, "stt")
+        return internal_answer()
+    words = stream_session.WORDS.get(code)
+    if words is None:
+        return internal_answer()
+    return _json(STREAM_STATUS.get(code, 500), {"error": code, "message": words, "fallback": "on_device"})
+
+
+def _stream_query(query: str, names: tuple[str, ...]) -> dict[str, str] | None:
+    """The query as ``{name: value}`` when it holds exactly ``names``, each once; else None."""
+    try:
+        pairs = urllib.parse.parse_qsl(query, keep_blank_values=True, strict_parsing=True)
+    except ValueError:
+        return None
+    got = dict(pairs)
+    if len(pairs) != len(names) or set(got) != set(names):
+        return None
+    return got
+
+
+def _stream_sid(got: dict[str, str]) -> str | None:
+    sid = got.get("sid", "")
+    return sid if 0 < len(sid) <= STREAM_SID_MAX else None
+
+
+def stream_open(registry: stream_session.StreamRegistry, data_root: Path | str, query: str, owner: str, *,
+                revoke_queue: Path | str | None, read_key: Callable[..., Any],
+                factory: stream_session.StreamFactory, last_read: MutableMapping[str, str | None]) -> Answer:
+    """``POST /cockpit/voice/stream/open?provider=``: ``{"sid": ...}``. The revoke-reach check runs before anything is
+    reserved or read; the registry reserves the ceiling, reads the key once and builds the provider stream."""
+    provider, refused = _query_provider(query)
+    if refused is not None or provider is None:
+        return refused or internal_answer()
+    if provider not in STREAM_PROVIDERS:
+        return refusal(409, "no_stream", "no_stream", provider=provider)
+    reach = revoke_refusal(revoke_queue, data_root)
+    if reach is not None:
+        return refusal(503, reach, reach, fallback=True)
+    code, key_code, session = "", "", None
+    try:
+        session = registry.open(owner, provider, PROVIDERS[provider].stt_model, data_root=data_root,
+                                read_key=read_key, factory=factory)
+    except stream_session.StreamRefused as exc:
+        code, key_code = exc.code, exc.key_code
+    if session is None:
+        return stream_refusal(code or "internal", key_code, provider=provider, last_read=last_read)
+    last_read[provider] = None
+    return _json(200, {"sid": session.sid})
+
+
+def stream_chunk_precheck(registry: stream_session.StreamRegistry, query: str, owner: str) -> Answer | None:
+    """The chunk refusals that need no body, in :func:`stream_chunk`'s order (a bad query or sid, a malformed seq, an
+    unknown or foreign sid), answered before the route reads a byte of it; None when the chunk may be read.
+    :func:`stream_chunk` checks all of it again."""
+    got = _stream_query(query, ("sid", "seq"))
+    sid = _stream_sid(got) if got is not None else None
+    if got is None or sid is None:
+        return stream_refusal("unknown_session")
+    raw_seq = got["seq"]
+    if not (raw_seq.isascii() and raw_seq.isdigit() and len(raw_seq) <= 9):
+        return stream_refusal("bad_sequence")
+    try:
+        registry.get(sid, owner)
+    except stream_session.StreamRefused as exc:
+        return stream_refusal(exc.code or "internal")
+    return None
+
+
+# How often a live session re-asks whether a revoke still reaches its key and the key is still granted, in seconds of
+# SESSION time (the chunk that finds it due does the check; chunks in between do not touch the authority log). The check
+# is two fresh replays of the log (_stream_revoked); measured on this repo's rig in
+# tests/test_cockpit_voice_stream_routes.py::test_one_revoke_check_costs_little_enough_for_the_cadence. 2 s plus one
+# 250 ms chunk puts the end of a revoked session under 3 s.
+STREAM_REVOKE_RECHECK_S = 2.0
+
+
+def _stream_revoked(provider: str, data_root: Path | str, revoke_queue: Path | str | None) -> Answer | None:
+    """None while the session may go on; else the refusal, marked ``revoked`` so the page stops for good. The checks are
+    the open path's, minus the secret: the voice key record for ``provider`` still lists ``stt`` (a revoked key or
+    grant is gone from a fresh replay; the log failing to replay is a refusal too, as at open), and some revoke still
+    reaches it (:func:`revoke_refusal`). The key itself is not read."""
+    key_code = ""
+    try:
+        record = voice_key_for(custody.authority_for(data_root)().policy.grants, provider)
+        if record is None:
+            key_code = "not_set"
+        elif "stt" not in record["uses"]:
+            key_code = "use_not_granted"
+    except Exception as exc:     # noqa: BLE001 - a log that could not be replayed fails closed, in its own words
+        _log.warning("voice stream: the key record could not be checked (%s); the dictation ends", type(exc).__name__)
+        key_code = "authority_unreadable"
+    if key_code:
+        return _key_refusal(key_code, provider, "stt", revoked=True)
+    reach = revoke_refusal(revoke_queue, data_root)
+    if reach is not None:
+        return refusal(503, reach, reach, fallback=True, revoked=True)
+    return None
+
+
+def stream_chunk(registry: stream_session.StreamRegistry, query: str, owner: str, pcm: bytes, *,
+                 data_root: Path | str, revoke_queue: Path | str | None) -> Answer:
+    """``POST /cockpit/voice/stream/chunk?sid=&seq=``: ``{"seq", "partial", "final"}`` for the next PCM chunk.
+
+    Every :data:`STREAM_REVOKE_RECHECK_S` seconds of session time the chunk first re-asks the open path's revoke
+    question (:func:`_stream_revoked`). A revoked key, grant or revoke path ends the session through its normal end (the
+    provider stream closed, the meter settled) and the chunk is answered with the open path's fixed words plus
+    ``"revoked": true``; its audio is never sent."""
+    got = _stream_query(query, ("sid", "seq"))
+    sid = _stream_sid(got) if got is not None else None
+    if got is None or sid is None:
+        return stream_refusal("unknown_session")
+    raw_seq = got["seq"]
+    if not (raw_seq.isascii() and raw_seq.isdigit() and len(raw_seq) <= 9):
+        return stream_refusal("bad_sequence")
+    seq = int(raw_seq)
+    code, update = "", None
+    try:
+        session = registry.get(sid, owner)
+        if session.revoke_check_due(STREAM_REVOKE_RECHECK_S):
+            try:
+                stopped = _stream_revoked(session.provider, data_root, revoke_queue)
+            except BaseException:
+                session.revoke_check_failed()
+                raise
+            if stopped is not None:
+                session.end_revoked()
+                return stopped
+        update = session.feed(seq, pcm)
+    except stream_session.StreamRefused as exc:
+        code = exc.code
+    if update is None:
+        return stream_refusal(code or "internal")
+    return _json(200, {"seq": seq, "partial": update.partial, "final": update.final})
+
+
+def stream_close(registry: stream_session.StreamRegistry, query: str, owner: str) -> Answer:
+    """``POST /cockpit/voice/stream/close?sid=``: ``{"text": ...}``, the session's final text; it is collected."""
+    got = _stream_query(query, ("sid",))
+    sid = _stream_sid(got) if got is not None else None
+    if got is None or sid is None:
+        return stream_refusal("unknown_session")
+    code, text = "", None
+    try:
+        text = registry.get(sid, owner).close()
+    except stream_session.StreamRefused as exc:
+        code = exc.code
+    if text is None:
+        return stream_refusal(code or "internal")
     return _json(200, {"text": text if isinstance(text, str) else ""})

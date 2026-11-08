@@ -205,6 +205,16 @@ def test_a_call_is_priced_at_no_less_than_one_unit(tmp_path):
     assert chk.allowed and chk.estimate_micros == 50 and meter.ledger()[0].cost_micros == 50
 
 
+def test_settle_actual_on_a_zero_unit_reservation_keeps_the_one_unit_it_was_priced_at(tmp_path):
+    meter, _ = make(tmp_path)
+    chk = meter.reserve("deepgram", "stt", "nova-3", 0)                           # priced at one unit by reserve
+    reserved = meter.ledger()[0].cost_micros
+    assert reserved == DEFAULT_PRICES.find("deepgram", "stt", "nova-3").cost(1) > 0
+    assert meter.settle_actual(chk.reservation_id, 5)
+    [row] = meter.ledger()
+    assert (row.status, row.units, row.cost_micros) == ("ok", 1, reserved)       # never a free call, never above
+
+
 def test_the_clock_is_read_while_the_write_lock_is_held(tmp_path):
     path, held = tmp_path / "voice.db", []
 
