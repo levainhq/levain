@@ -949,3 +949,10 @@ def test_3ca2_max_tool_calls_null_is_disabled():
         got = _go(cname, body, EO, dispatch=True)
         assert not isinstance(got, str) and got[1] == ()
 
+
+def test_3ca1_a_stored_prompt_is_unbounded_and_null_disables_it():
+    # 3ca-1 (complement + codex): a stored prompt is a server-held template the estimate cannot see
+    assert _go("openai-responses", '{"model":"m1","input":"x","prompt":{"id":"p"}}', EO,
+               dispatch=True) == "body-unbounded:prompt"
+    got = _go("openai-responses", '{"model":"m1","input":"x","prompt":null}', EO, dispatch=True)
+    assert not isinstance(got, str) and got[1] == ()
