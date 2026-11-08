@@ -515,7 +515,7 @@
   const TABS_OF_ID = tableOf({
     // Open loops is machine-side (Phill 11-07: the Tray BECOMES the List, Open loops stays machine-side): off the default Board tab, on Build
     tray: "morning board", loops: "build", episodes: "board", "team-status": "board",
-    edits: "build", jobs: "build", sessions: "morning board", "coord-morning": "morning board", "review-queue": "morning board", topology: "build", health: "memory",
+    edits: "build", jobs: "build", sessions: "morning board", "coord-morning": "morning board", "review-queue": "morning board", topology: "build", agents: "build", health: "memory",
     graph: "memory", wraps: "memory", crystals: "memory"
   });
   const TABS_OF_REGION = tableOf({ brief: "morning", widgets: "morning board", hero: ALL_TABS, operate: "board", mind: "memory", identity: "memory", team: "board" });
