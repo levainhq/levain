@@ -10,6 +10,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import shutil
 import sys
 import threading
 from pathlib import Path
@@ -17,6 +18,7 @@ from pathlib import Path
 import pytest
 from anneal_memory import Store
 
+from tests._shared_chrome import _session_chrome, chrome_skip_reason
 from tests._ke_dom import NODE, run_node
 
 pytestmark = pytest.mark.skipif(NODE is None, reason="node is not installed")
@@ -140,8 +142,8 @@ Date.now = real;
         assert "the wrap READING" in t and "the wrap at the stamp" in t, t
 
 
-CHROME = os.environ.get("CHROME") or "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"
-needs_browser = pytest.mark.skipif(not Path(CHROME).exists(), reason="Chrome is not installed")
+CHROME = _session_chrome()
+needs_browser = pytest.mark.skipif(chrome_skip_reason() is not None or shutil.which("node") is None, reason="needs Chrome and node")
 
 
 @needs_browser

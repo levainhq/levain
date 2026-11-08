@@ -100,7 +100,20 @@ def _pick_chrome(given: str, *, explicit: bool = False, flags_file: Path = CHROM
 def _session_chrome() -> str:
     """The Chrome the session starts: ``CHROME`` when set (explicit), else the shell if installed, else the default Chrome."""
     named = os.environ.get("CHROME")
+    if named:
+        named = shutil.which(named) or named   # a command name resolves; a path that resolves to nothing stays as typed and FAILS at launch
     return _pick_chrome(named or DEFAULT_CHROME, explicit=bool(named))
+
+
+def chrome_skip_reason() -> str | None:
+    """None when a browser test should run, else why it skips. An explicit ``CHROME`` never skips: one that names nothing
+    must FAIL the test at launch, not fall back to another browser or pass by skipping (CI sets CHROME on purpose)."""
+    if os.environ.get("CHROME"):
+        return None
+    for cand in (DEFAULT_CHROME, shutil.which("google-chrome"), shutil.which("chromium"), shutil.which("chromium-browser")):
+        if cand and Path(cand).exists():
+            return None
+    return "Chrome is not installed"
 
 
 PING = Path(__file__).with_name("_cdp_ping.mjs")

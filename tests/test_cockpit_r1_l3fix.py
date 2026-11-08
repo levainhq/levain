@@ -10,7 +10,7 @@ from levain.cockpit.effects import DownstreamEffect
 from levain.writes import ActionVerb
 from tests._inbox_fake import FakeInbox
 from tests._chrome_flags import CHROME_SAFE_FLAGS
-from tests._shared_chrome import _session_chrome
+from tests._shared_chrome import _session_chrome, chrome_skip_reason
 from tests._page_drive_run import run as run_driver
 from tests.test_cockpit_k2a import _get, _install, _post, _serve
 from tests.test_cockpit_r1_write import INBOX_PANELS, _inbox_panel
@@ -75,7 +75,7 @@ from datetime import datetime, timezone
 import pytest
 
 CHROME = _session_chrome()   # chrome-headless-shell when installed (no keychain), else the CHROME env or the default Chrome
-needs_browser = pytest.mark.skipif(not Path(CHROME).exists(), reason="Chrome is not installed")
+needs_browser = pytest.mark.skipif(chrome_skip_reason() is not None, reason="Chrome is not installed")
 
 
 def _dump(url: str) -> str:

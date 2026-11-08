@@ -2,7 +2,6 @@
 from __future__ import annotations
 
 import json
-import os
 import shutil
 import subprocess
 import sys
@@ -13,9 +12,10 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).parent))
 import _page_drive_run  # noqa: E402
+from tests._shared_chrome import _session_chrome, chrome_skip_reason  # noqa: E402
 
-CHROME = os.environ.get("CHROME") or "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"
-needs_browser = pytest.mark.skipif(not Path(CHROME).exists() or not shutil.which("node"), reason="needs Chrome and node")
+CHROME = _session_chrome()
+needs_browser = pytest.mark.skipif(chrome_skip_reason() is not None or not shutil.which("node"), reason="needs Chrome and node")
 DRIVER = str(Path(__file__).parent / "_page_drive.mjs")
 
 

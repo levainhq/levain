@@ -5,7 +5,6 @@ where no Chrome is installed (the screenshots are saved by ``tests/sky_replay/ru
 from __future__ import annotations
 
 import json
-import os
 import shutil
 import subprocess
 from pathlib import Path
@@ -13,15 +12,15 @@ from pathlib import Path
 import pytest
 
 from tests._page_drive_run import run as run_driver
+from tests._shared_chrome import _session_chrome, chrome_skip_reason
 
 ROOT = Path(__file__).resolve().parents[1]
 SKY = ROOT / "levain" / "templates" / "web" / "sky.js"
 REPLAY = ROOT / "tests" / "sky_replay"
 NODE = shutil.which("node")
-CHROME = next((p for p in (os.environ.get("CHROME") or "", "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
-                           shutil.which("google-chrome") or "", shutil.which("chromium") or "") if p and Path(p).exists()), None)
+CHROME = _session_chrome()
 
-needs_browser = pytest.mark.skipif(NODE is None or CHROME is None, reason="node or headless Chrome not installed")
+needs_browser = pytest.mark.skipif(NODE is None or chrome_skip_reason() is not None, reason="node or headless Chrome not installed")
 
 
 def _model(events: list[dict], opts: dict) -> dict:
