@@ -97,23 +97,33 @@ def _pick_chrome(given: str, *, explicit: bool = False, flags_file: Path = CHROM
     return given
 
 
+LINUX_CHROMES = ("google-chrome", "google-chrome-stable", "chromium", "chromium-browser")
+
+
 def _session_chrome() -> str:
-    """The Chrome the session starts: ``CHROME`` when set (explicit), else the shell if installed, else the default Chrome."""
+    """THE resolver for which Chrome runs (the launch and the skip check both read it, nothing else decides): ``CHROME`` when
+    set (explicit), else the shell if installed, else the platform's Chrome (the app bundle on macOS; on Linux the first of
+    ``LINUX_CHROMES`` on PATH, the app-bundle path when none is, which then names nothing and skips)."""
     named = os.environ.get("CHROME")
     if named:
         named = shutil.which(named) or named   # a command name resolves; a path that resolves to nothing stays as typed and FAILS at launch
+    elif platform.system() == "Linux":
+        named_linux = next((found for found in map(shutil.which, LINUX_CHROMES) if found), None)
+        if named_linux:
+            return _pick_chrome(named_linux)
     return _pick_chrome(named or DEFAULT_CHROME, explicit=bool(named))
 
 
 def chrome_skip_reason() -> str | None:
-    """None when a browser test should run, else why it skips. An explicit ``CHROME`` never skips: one that names nothing
-    must FAIL the test at launch, not fall back to another browser or pass by skipping (CI sets CHROME on purpose)."""
+    """None when a browser test should run, else why it skips; derived only from ``_session_chrome()``. An explicit ``CHROME``
+    never skips: one that names nothing must FAIL the test at launch, not fall back to another browser or pass by skipping
+    (CI sets CHROME on purpose)."""
     if os.environ.get("CHROME"):
         return None
-    for cand in (DEFAULT_CHROME, shutil.which("google-chrome"), shutil.which("chromium"), shutil.which("chromium-browser")):
-        if cand and Path(cand).exists():
-            return None
-    return "Chrome is not installed"
+    chrome = _session_chrome()
+    if Path(chrome).is_file() and os.access(chrome, os.X_OK):
+        return None
+    return f"Chrome is not installed (resolved to {chrome})"
 
 
 PING = Path(__file__).with_name("_cdp_ping.mjs")
