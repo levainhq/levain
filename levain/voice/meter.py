@@ -485,12 +485,6 @@ class Meter:
             failed = type(exc).__name__
         raise MeterError(f"the voice ledger could not be read: {failed}")
 
-    def spent_by_provider_if_present(self) -> dict[str, dict[str, tuple[int, int]]]:
-        """Counted calls per provider and period, read-only and creating nothing: ``{provider: {"day": (calls, micros),
-        "month": (calls, micros)}}``. Same rows and periods as :meth:`spent_if_present` (reserved and ok, never released);
-        a missing ledger is ``{}``. An estimate like every figure here. See :meth:`snapshot_if_present`."""
-        return self.snapshot_if_present()[1]
-
     def snapshot_if_present(self) -> tuple[Spend, dict[str, dict[str, tuple[int, int]]]]:
         """The totals AND the per-provider rows from ONE clock read and ONE statement, so the two always agree: the totals
         are the sum of the rows. Read-only, creates nothing (a missing ledger is zero and ``{}``); a symlink, a path that cannot be
