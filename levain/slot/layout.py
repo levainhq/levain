@@ -282,6 +282,24 @@ def _mode_no_follow(path: str, mode: int, kind: Literal["dir", "file"]) -> tuple
     return True, ""
 
 
+def _refuse_link(path: str) -> tuple[bool, str]:
+    """The row's path must not be a symlink; says so, with the path, when it is."""
+    if os.path.islink(path):
+        return False, f"{path} is a symlink; remove it, then run again"
+    return True, ""
+
+
+def _mode_is(path: str, mode: int) -> bool:
+    """Read-only: whether ``path`` (itself, never a link's target) already has ``mode``."""
+    import stat
+
+    try:
+        st = os.lstat(path)
+    except OSError:
+        return False
+    return stat.S_ISLNK(st.st_mode) is False and stat.S_IMODE(st.st_mode) == mode
+
+
 def row_steps(host: HostOS, rows: Iterable[Row]) -> list[Step]:
     """Make each row, then own it and set its mode. A service account owns the parent of some rows, so it can put a
     symlink where a row goes: a link already there is refused before anything is made, and each act after that is
@@ -291,7 +309,8 @@ def row_steps(host: HostOS, rows: Iterable[Row]) -> list[Step]:
     steps: list[Step] = []
     for r in rows:
         p = str(r.path)
-        steps.append(Step(f"refuse a link at {p}", (t["test"], "!", "-L", p)))
+        steps.append(Step(f"refuse a link at {p}", call=lambda p=p: _refuse_link(p),
+                          probe=lambda p=p: os.path.islink(p)))
         if r.kind == "dir":
             steps.append(Step(f"create {p}", (t["mkdir"], p), skip_if=(t["test"], "-d", p)))
         else:
@@ -307,7 +326,8 @@ def row_steps(host: HostOS, rows: Iterable[Row]) -> list[Step]:
             steps.append(Step(f"set {p} to {r.mode:04o}", (t["chmod"], "-h", f"{r.mode:04o}", p)))
         else:
             steps.append(Step(f"set {p} to {r.mode:04o}",
-                              call=lambda p=p, m=r.mode, k=r.kind: _mode_no_follow(p, m, k)))
+                              call=lambda p=p, m=r.mode, k=r.kind: _mode_no_follow(p, m, k),
+                              probe=lambda p=p, m=r.mode: not _mode_is(p, m)))
     return steps
 
 

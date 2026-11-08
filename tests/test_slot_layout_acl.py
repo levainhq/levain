@@ -31,10 +31,14 @@ def _ls(path) -> str:
 
 
 def _run(steps) -> None:
-    """The plan's argv steps as this uid runs them (a ``write`` step's file is made by the caller first, so its
+    """The plan's argv and call steps as this uid runs them (a ``write`` step's file is made by the caller first, so its
     ``skip_if`` skips it)."""
     for s in steps:
         if s.skip_if and subprocess.run(list(s.skip_if), capture_output=True).returncode == 0:
+            continue
+        if s.call is not None:                                # the link refusal and the Linux mode step
+            ok, why = s.call()
+            assert ok, why
             continue
         assert s.argv, s
         subprocess.run(list(s.argv), check=True, capture_output=True)
@@ -92,3 +96,20 @@ def test_no_linux_row_names_an_acl_step(monkeypatch):
     for r in _all_rows("linux"):
         argvs = [s.argv for s in LY.row_steps("linux", [r]) if s.argv]
         assert not [a for a in argvs if "-N" in a or "setfacl" in a[0]], argvs
+
+
+@darwin_only
+def test_plan_only_reads_an_extended_acl_as_something_to_do(tmp_path):
+    """PREL3 fix2 r1: the ``-N`` step reads ACT while an ACL is on the row and ``----`` once it is cleared."""
+    from levain.slot.install_helper import _act
+
+    p = tmp_path / "d"
+    p.mkdir()
+    owner, group = _me()
+    steps = LY.row_steps("darwin", [LY.Row(p, owner, group, 0o750, "dir")])
+    acl_step = next(s for s in steps if s.why.startswith("no extended ACL"))
+    assert not _act(acl_step)
+    subprocess.run(["/bin/chmod", "+a", ACL, str(p)], check=True)
+    assert _act(acl_step)
+    _run(steps)
+    assert not _act(acl_step)

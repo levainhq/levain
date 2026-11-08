@@ -1798,7 +1798,8 @@ def plan_repair(cmd: InstallCommand, facts: HostFacts, rf: RepairFacts, *,
 
 def _act(step: Step, *, run: Callable[..., object] = subprocess.run) -> bool:
     """Whether ``step`` would act on this host, read without acting (the staged-tree launcher's ``--plan-only``):
-    a ``skip_if`` probe that exits 0 means no; a ``chown``/``chmod`` whose path already has that owner/mode means no;
+    a ``skip_if`` probe that exits 0 means no; a ``chown``/``chmod`` (``-h`` or not; ``-N`` reads the ACL) whose path already has that owner/mode means no;
+    a ``call`` step answers through its read-only ``probe``;
     a ``write`` whose file already holds that text at that mode means no; anything else would act."""
     import grp
     import pwd
@@ -1818,20 +1819,46 @@ def _act(step: Step, *, run: Callable[..., object] = subprocess.run) -> bool:
                             and fh.read() == text.encode("utf-8"))
         except OSError:
             return True
-    argv = step.argv
-    if len(argv) == 3 and argv[0].endswith(("/chown", "/chmod")):
+    if step.probe is not None:
         try:
-            st = os.lstat(argv[2])
+            return step.probe()
         except OSError:
             return True
+    argv = step.argv
+    if argv and argv[0].endswith(("/chown", "/chmod")):
+        args = [a for a in argv[1:] if a != "-h"]      # -h only makes the tool act on a link itself; lstat reads the same
+        if len(args) != 2:
+            return True
+        try:
+            st = os.lstat(args[1])
+        except OSError:
+            return True
+        if args[0] == "-N":
+            return _has_acl(args[1], run)
         if argv[0].endswith("/chmod"):
-            return stat.S_IMODE(st.st_mode) != int(argv[1], 8)
-        owner, _, group = argv[1].partition(":")
+            try:
+                return stat.S_IMODE(st.st_mode) != int(args[0], 8)
+            except ValueError:
+                return True
+        owner, _, group = args[0].partition(":")
         try:
             return (pwd.getpwuid(st.st_uid).pw_name, grp.getgrgid(st.st_gid).gr_name) != (owner, group)
         except KeyError:
             return True
     return True
+
+
+def _has_acl(path: str, run: Callable[..., object]) -> bool:
+    """Whether ``path`` itself (a link is not followed) carries an extended ACL, read with ``ls -lde``: an ACL entry is
+    a line after the first that reads `` N: ...``. Unreadable means it would act."""
+    try:
+        r = run(["/bin/ls", "-lde", path], capture_output=True, text=True, cwd="/", env=child_env())
+    except OSError:
+        return True
+    if getattr(r, "returncode", 1) != 0:
+        return True
+    return any(ln.strip()[:1].isdigit() and ":" in ln.strip().split(" ", 1)[0]
+               for ln in str(getattr(r, "stdout", "")).splitlines()[1:])
 
 
 def plan_only_report(plan: InstallPlan, err: TextIO, *, act: Callable[[Step], bool] = _act) -> str | None:

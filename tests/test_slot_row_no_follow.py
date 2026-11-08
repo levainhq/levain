@@ -9,14 +9,22 @@ import os
 import pwd
 import stat
 import subprocess
+import sys
 from pathlib import Path
 
 import pytest
 
+from levain.firing import hands
 from levain.slot import layout
+from levain.slot.install_helper import _act
 from levain.slot.layout import Row
 
-HOSTS = ("linux", "darwin")
+#: The darwin param runs the real BSD tools (``/usr/sbin/chown``, ``chmod -h -N``), so it runs only on macOS; the CI test
+#: job is ubuntu. The linux param runs wherever its tools exist.
+HOSTS = (
+    "linux",
+    pytest.param("darwin", marks=pytest.mark.skipif(sys.platform != "darwin", reason="runs the macOS tools")),
+)
 ME = pwd.getpwuid(os.getuid()).pw_name
 MY_GROUP = grp.getgrgid(os.getgid()).gr_name
 
@@ -94,3 +102,36 @@ def test_the_wrong_kind_at_a_row_path_is_refused(tmp_path, host):
     os.chmod(p, 0o600)
     stopped = _run(layout.row_steps(host, [Row(p, ME, MY_GROUP, 0o755, "dir")]))
     assert stopped and stat.S_IMODE(os.stat(p).st_mode) == 0o600
+
+
+@pytest.mark.parametrize("kind", ["dir", "file"])
+@pytest.mark.parametrize("host", HOSTS)
+def test_plan_only_reports_a_converged_row_as_nothing_to_do(tmp_path, host, kind):
+    """PREL3 fix2 r1 L1-F1/L2-M1: ``--plan-only`` reads each step it would run; the row steps' shapes (``chown -h``,
+    ``chmod -h``, ``chmod -h -N``, the Linux mode call, the link refusal) must read ``----`` on a made row."""
+    p = tmp_path / "row"
+    mode = 0o2750 if kind == "dir" else 0o640
+    steps = layout.row_steps(host, [Row(p, ME, MY_GROUP, mode, kind)])
+    assert any(_act(s) for s in steps), "an unmade row has something to do"
+    assert _run(steps) == []
+    acting = [s.why for s in steps if _act(s)]
+    assert acting == [], f"a converged row still reports ACT: {acting}"
+    os.chmod(p, 0o700)
+    assert [s.why for s in steps if _act(s)] == [f"set {p} to {mode:04o}"], "a wrong mode is the one thing to do"
+
+
+@pytest.mark.parametrize("host", HOSTS)
+def test_plan_only_reports_a_planted_link_as_acting(tmp_path, host):
+    _, link = _planted(tmp_path, "dir")
+    steps = layout.row_steps(host, [Row(link, ME, MY_GROUP, 0o755, "dir")])
+    assert [s.why for s in steps if _act(s)][:1] == [f"refuse a link at {link}"]
+
+
+@pytest.mark.parametrize("host", HOSTS)
+def test_the_refusal_names_the_path_and_says_it_is_a_symlink(tmp_path, host):
+    _, link = _planted(tmp_path, "dir")
+    out: list[str] = []
+    plan = hands.Plan(host, "op", "h", 1, tmp_path, tmp_path, tuple(layout.row_steps(host, [Row(link, ME, MY_GROUP, 0o755, "dir")])))
+    assert hands.run_plan(plan, dry_run=False, emit=out.append) == 1
+    failed = [ln for ln in out if "FAILED:" in ln]
+    assert failed and str(link) in failed[0] and "is a symlink" in failed[0], out
