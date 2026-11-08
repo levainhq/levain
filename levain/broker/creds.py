@@ -308,7 +308,7 @@ async def fresh(lifecycle: object, store: CredStore, name: str) -> Credential:
         fut = lifecycle.want(cred)
         if fut is not None:
             try:
-                await asyncio.wait_for(asyncio.shield(fut), REFRESH_DEADLINE_S)
+                await asyncio.wait_for(asyncio.shield(fut), lifecycle.wait_left(fut))
             except asyncio.TimeoutError:
                 pass   # the refresh runs on; this exchange uses what the file holds now
             cred = store.observe(name)
@@ -633,9 +633,10 @@ def remove(dir_fd: int, name: str, *, wait: bool = True, lock_timeout_s: float =
 # --- the refresh (design 1.8, kind oauth2-refresh) -------------------------------------------------------------------
 
 REFRESH_AHEAD_S = 60.0     # a refresh is wanted when the access token expires within this (proactive)
-#: the refresh POST's total bound (the semaphore wait, the connect, the answer), and how long `fresh` waits for a
-#: refresh before using the token it has: the connect and TLS have their own bound, the answer gets as long again.
-#: Below REFRESH_AHEAD_S, so a want started inside that window falls through to a token still valid.
+#: how long `fresh` waits for a refresh, from that refresh's start, before using the token it has (the connect and
+#: TLS have their own bound, the answer gets as long again). It never cuts the POST: once sent, the answer is read
+#: under upstream's bounds and committed (L2-M1). Below REFRESH_AHEAD_S, so a want started inside that window falls
+#: through to a token still valid.
 REFRESH_DEADLINE_S = 2 * upstream.CONNECT_TIMEOUT_S
 GATE_MIN_S = 30.0          # at most one attempt per this, from the start of the last attempt (DECISION, r2 W8)
 GATE_MAX_S = 900.0         # the failure backoff, 30 s x 2^(failures - 1), is at most this (15 min)
@@ -793,6 +794,8 @@ class CredWriter:
         #: the single-flight table: (name, rev) -> the future of the refresh in flight for that rev (a stalled refresh
         #: of one rev never holds the operator's next one)
         self._inflight: Dict[Tuple[str, str], "asyncio.Future"] = {}
+        #: each in-flight refresh's future -> its start (monotonic): `fresh` waits at most REFRESH_DEADLINE_S from it
+        self._started: Dict["asyncio.Future", float] = {}
         #: the one gate per credential, holding the `rev` it is for
         self._gates: Dict[str, _Gate] = {}
         self._refresh_sem: Optional[asyncio.Semaphore] = None
@@ -847,6 +850,7 @@ class CredWriter:
         loop = asyncio.get_running_loop()
         fut = loop.create_future()
         self._inflight[key] = fut
+        self._started[fut] = now
         task = loop.create_task(self._refresh(cred, g, fut))
         self._refresh_tasks.add(task)
         # a task cancelled before its first step never runs `_refresh`'s `finally`; this runs for every task
@@ -858,9 +862,18 @@ class CredWriter:
         this refresh's, drops the task, and resolves the future ("cancelled" when nothing resolved it)."""
         if self._inflight.get(key) is fut:
             del self._inflight[key]
+        self._started.pop(fut, None)
         self._refresh_tasks.discard(task)
         if not fut.done():
             fut.set_result("cancelled")
+
+    def wait_left(self, fut: "asyncio.Future") -> float:
+        """How long `fresh` may still wait on the refresh `fut`: REFRESH_DEADLINE_S from that refresh's START, so an
+        exchange joining a refresh already past it is served at once (the POST itself runs on past the deadline)."""
+        start = self._started.get(fut)
+        if start is None:
+            return 0.0
+        return max(0.0, REFRESH_DEADLINE_S - (self.seams.monotonic() - start))
 
     def _commit_ended(self, job: "asyncio.Task") -> None:
         self._commit_jobs.discard(job)
@@ -868,7 +881,8 @@ class CredWriter:
             job.exception()   # retrieved: a failure after the refresh was cancelled is not "never retrieved"
 
     async def _post_bounded(self, cred: Credential) -> "upstream.RefreshResponse":
-        """`_post` under the refresh semaphore; the caller bounds the whole of it, the wait for a slot included."""
+        """`_post` under the refresh semaphore. The slot wait is bounded by the holders' own upstream bounds; the
+        caller does not cut it (a POST once sent must be read to its end, L2-M1)."""
         if self._refresh_sem is None:
             self._refresh_sem = asyncio.Semaphore(REFRESH_CONNS)   # made inside the running loop (3.9 binds it)
         async with self._refresh_sem:
@@ -887,7 +901,10 @@ class CredWriter:
             if held is not None:
                 fields, rev = held[1], held[2]
             else:
-                response = await asyncio.wait_for(self._post_bounded(cred), REFRESH_DEADLINE_S)
+                # NOT bounded by REFRESH_DEADLINE_S: once sent, the endpoint may have rotated (spent) the refresh
+                # token, so the answer is read to its end under upstream's own bounds (connect CONNECT_TIMEOUT_S, the
+                # head HEAD_TIMEOUT_S, each body read IDLE_S, the body REFRESH_BODY_CAP) and committed (L2-M1)
+                response = await self._post_bounded(cred)
                 try:
                     fields = _refreshed(cred, response, self.seams.clock())
                 except RefreshRejected as e:

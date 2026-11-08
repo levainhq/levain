@@ -1008,12 +1008,13 @@ def test_through_keys_a_token_expiring_during_the_body_read_is_refused_before_th
 # --- prel3 L3 3b (1108-34-handoff/l3_prel3_3b.txt): each test is its finding's own failure --------------------------
 
 def test_3b6_a_stalled_token_endpoint_falls_through_to_the_unexpired_token(env, monkeypatch):
-    """3b-6: a token endpoint that never answers must not hold an exchange while the access token is still valid. The
-    refresh ends by its own deadline (a failure on the gate, no transport left open) and the exchange gets the old
-    token."""
+    """3b-6: a token endpoint that never answers must not hold an exchange while the access token is still valid: the
+    exchange gets the old token at REFRESH_DEADLINE_S. The refresh itself is not cut there (L2-M1: the POST was sent);
+    it ends by upstream's head bound (a failure on the gate, no transport left open)."""
     ep, d, store, cert, mp = env
     _write(d, _fields(int(time.time()) + 30))   # inside the ahead window: a refresh is wanted, the token still valid
     monkeypatch.setattr(C, "REFRESH_DEADLINE_S", 0.3, raising=False)
+    monkeypatch.setattr(upstream, "HEAD_TIMEOUT_S", 0.8)
 
     async def go():
         await _serve(ep, cert, mp)
@@ -1053,6 +1054,68 @@ def test_3b6_a_stalled_token_endpoint_falls_through_to_the_unexpired_token(env, 
 def test_3b6_the_deadline_leaves_the_token_unexpired_inside_the_ahead_window():
     # a want starts at the latest REFRESH_AHEAD_S before expiry; falling through at the deadline must still find it valid
     assert 0 < C.REFRESH_DEADLINE_S < C.REFRESH_AHEAD_S
+
+
+def test_m1_a_rotated_token_answered_after_the_deadline_lands_and_the_spent_token_is_never_posted(env, monkeypatch):
+    """L2-M1: the POST was sent, so the endpoint may have rotated (and spent) the refresh token. `fresh` stops waiting
+    at REFRESH_DEADLINE_S and serves the old unexpired token, but the POST is not cancelled: its late answer commits,
+    and the next want finds a fresh token instead of POSTing the spent one (RFC 9700 reuse detection)."""
+    ep, d, store, cert, mp = env
+    clk = Clock()
+    _write(d, _fields(int(clk.wall()) + 30))   # inside the ahead window, still valid
+    monkeypatch.setattr(C, "REFRESH_DEADLINE_S", 0.3, raising=False)
+
+    async def go():
+        await _serve(ep, cert, mp)
+        ep.hold = asyncio.Event()
+        w, s = _writer(d, clk), store()
+        c1 = await asyncio.wait_for(C.fresh(w, s, NAME), 3.0)
+        await asyncio.sleep(0.3)   # past the deadline; the endpoint has the request and answers now
+        ep.hold.set()
+        await asyncio.wait_for(_settle(w), 5.0)
+        clk.t = C.GATE_MAX_S + 1   # past any backoff, and past the old token's expiry
+        try:
+            c2 = await asyncio.wait_for(C.fresh(w, s, NAME), 5.0)
+        except Refused:
+            c2 = None
+        await _settle(w)
+        ep.server.close()
+        w.close()
+        return c1, c2
+    c1, c2 = run(go())
+    assert c1.secret == "old-access"
+    sent = [b for b in ep.bodies if b"refresh_token=old-refresh" in b]
+    assert len(sent) == 1, "the spent refresh token was POSTed again"
+    assert ep.calls == 1
+    assert _file(d)["refresh"]["refresh_token"] == "new-refresh-1"
+    assert c2 is not None and c2.secret == "new-access-1"
+
+
+def test_m1_a_second_waiter_on_a_stalled_refresh_waits_only_what_is_left_of_the_deadline(env, monkeypatch):
+    """L2-M1 consequence: the POST now outlives REFRESH_DEADLINE_S, so `fresh` bounds its wait from the refresh's
+    START: an exchange that joins a refresh already past its deadline is served at once, not held a fresh deadline."""
+    ep, d, store, cert, mp = env
+    _write(d, _fields(int(time.time()) + 30))
+    monkeypatch.setattr(C, "REFRESH_DEADLINE_S", 0.5, raising=False)
+
+    async def go():
+        await _serve(ep, cert, mp)
+        ep.hold = asyncio.Event()
+        w, s = _writer(d), store()
+        try:
+            await asyncio.wait_for(C.fresh(w, s, NAME), 3.0)
+            t0 = time.monotonic()
+            c = await asyncio.wait_for(C.fresh(w, s, NAME), 3.0)
+            took = time.monotonic() - t0
+        finally:
+            ep.hold.set()
+            await _settle(w)
+            ep.server.close()
+            w.close()
+        return c, took
+    c, took = run(go())
+    assert c.secret == "old-access"
+    assert took < 0.2, f"a joining exchange waited {took:.2f} s on a refresh already past its deadline"
 
 
 def _flaky_commit(w: C.CredWriter, broken):
