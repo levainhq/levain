@@ -6,6 +6,8 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
+import pytest
+
 from tests.test_band_pages import PHONE
 from tests.test_cockpit_flip_parity import _drive, needs_browser
 from tests.test_cockpit_sign_card import QRID, STRIP_FACET, TOK, _Rig, needs_ssh
@@ -198,3 +200,115 @@ def test_a_refused_settle_after_the_sheet_signed_does_not_reopen_the_card(tmp_pa
     got = json.loads(out["values"][-1])
     assert got["note"].startswith("signed (a)"), got
     assert got["live"] == 0, got
+
+
+# --- head rulings (key 1108-42, lane scr2) -------------------------------------------------------------------------------
+
+def _tell(rid: str, choice: str = "a", sha: str | None = None, source: str | None = None) -> str:
+    """A "signed" message on the cockpit window; `source` is a window expression (default: the open frame's)."""
+    extra = f", sha256: '{sha}'" if sha else ""
+    return (f"(window.dispatchEvent(new MessageEvent('message', {{data: {{levainSheet: 'signed', id: '{rid}', choice: '{choice}'{extra}}}, "
+            f"origin: location.origin, source: {source or FRAME + '.contentWindow'}}})), 1)")
+
+
+def _up(*steps: dict) -> list[dict]:
+    return [PHONE, {"until": STRIP_FACET + " && 1", "ms": 30000}, *steps]
+
+
+@needs_browser
+@needs_ssh
+def test_a_consent_sheet_signed_with_a_cards_id_does_not_mark_the_card(tmp_path: Path, monkeypatch) -> None:
+    rig = _Rig(tmp_path, monkeypatch)
+    with rig.serving():
+        out = _drive(tmp_path, f"{rig.origin}/#write_token={TOK}", [
+            PHONE, rig.authenticator(),
+            {"until": STRIP_FACET + " && 1", "ms": 30000},
+            {"eval": f"(window.LevainSignSheet.openConsent('{QRID}'), 1)"},
+            {"until": f"!!{FRAME} && 1", "ms": 5000},
+            {"eval": _tell(QRID)},
+            {"eval": ALL_CONTROLS},
+        ])
+    got = json.loads(out["values"][-1])
+    assert not got["note"].startswith("signed"), got
+    assert got["live"] > 0, got
+
+
+@needs_browser
+@needs_ssh
+def test_a_signed_message_after_the_sheet_closed_still_marks_its_card(tmp_path: Path, monkeypatch) -> None:
+    rig = _Rig(tmp_path, monkeypatch)
+    with rig.serving():
+        out = _drive(tmp_path, f"{rig.origin}/#write_token={TOK}", [
+            PHONE, rig.authenticator(),
+            {"until": STRIP_FACET + " && 1", "ms": 30000},
+            {"tap": OPEN_SHEET},
+            {"until": SHEET_UP, "ms": 30000},
+            {"eval": f"(window.__w = {FRAME}.contentWindow, 1)"},
+            {"eval": CLOSE_SHEET},
+            {"eval": f"!{FRAME}"},
+            {"eval": _tell(QRID, source="window.__w")},
+            {"eval": ALL_CONTROLS},
+        ])
+    assert out["values"][-3] is True, out["values"]
+    got = json.loads(out["values"][-1])
+    assert got["note"].startswith("signed (a)"), got
+    assert got["live"] == 0, got
+
+
+@needs_browser
+@needs_ssh
+def test_a_signed_message_from_a_stranger_window_after_the_close_decides_nothing(tmp_path: Path, monkeypatch) -> None:
+    rig = _Rig(tmp_path, monkeypatch)
+    with rig.serving():
+        out = _drive(tmp_path, f"{rig.origin}/#write_token={TOK}", [
+            PHONE, rig.authenticator(),
+            {"until": STRIP_FACET + " && 1", "ms": 30000},
+            {"tap": OPEN_SHEET},
+            {"until": SHEET_UP, "ms": 30000},
+            {"eval": CLOSE_SHEET},
+            {"eval": _tell(QRID, source="window")},
+            {"eval": ALL_CONTROLS},
+        ])
+    got = json.loads(out["values"][-1])
+    assert not got["note"].startswith("signed"), got
+    assert got["live"] > 0, got
+
+
+@needs_browser
+@needs_ssh
+def test_a_new_version_of_a_signed_request_is_not_shown_as_signed(tmp_path: Path, monkeypatch) -> None:
+    """The sheet signed one version (its sha256 in the message); the listing names the same id at another: a card built next is live."""
+    rig = _Rig(tmp_path, monkeypatch)
+    with rig.serving():
+        out = _drive(tmp_path, f"{rig.origin}/#write_token={TOK}", [
+            PHONE, rig.authenticator(),
+            {"until": STRIP_FACET + " && 1", "ms": 30000},
+            {"tap": OPEN_SHEET},
+            {"until": SHEET_UP, "ms": 30000},
+            {"eval": CLOSE_FOCUS},
+            {"eval": _tell(QRID, sha="e" * 64)},
+            {"eval": CLOSE_SHEET},
+            {"until": STRIP_FACET + " && 1", "ms": 30000},
+            {"eval": ALL_CONTROLS},
+        ])
+    got = json.loads(out["values"][-1])
+    assert not got["note"].startswith("signed"), got
+    assert got["live"] > 0, got
+
+
+@pytest.mark.parametrize("choice", ["abcd1234", "*"])
+@needs_browser
+@needs_ssh
+def test_the_card_shows_the_longest_real_choice_and_a_write_in(tmp_path: Path, monkeypatch, choice: str) -> None:
+    """Option keys are [a-z0-9]{1,8} on the server and a write-in signs under "*": both reach the card's note."""
+    rig = _Rig(tmp_path, monkeypatch)
+    with rig.serving():
+        out = _drive(tmp_path, f"{rig.origin}/#write_token={TOK}", [
+            PHONE, rig.authenticator(),
+            {"until": STRIP_FACET + " && 1", "ms": 30000},
+            {"tap": OPEN_SHEET},
+            {"until": SHEET_UP, "ms": 30000},
+            {"eval": _tell(QRID, choice=choice)},
+            {"eval": ALL_CONTROLS},
+        ])
+    assert json.loads(out["values"][-1])["note"].startswith(f"signed ({choice})"), (choice, out["values"])
