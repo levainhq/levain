@@ -70,7 +70,7 @@ INIT_JS = """(() => {
       const body = {coord_drops: [], coord_note: null, coord_repos: __REPOS__, coord_store_id: later && 'storeAfter' in CFG ? CFG.storeAfter : CFG.store,
                     coord_store_read: true, coord_signers: ['SHA256:abcdefabcdefabcdefabcdef'], coord_signer_note: null, origin: location.origin,
                     rp_id: location.hostname, credentials: {},
-                    coord_may_launch: 'mayLaunch' in CFG ? CFG.mayLaunch : sheet};   // the server's one cockpit test (CoordPhone.may_launch)
+                    coord_may_launch: 'mayLaunch' in CFG ? CFG.mayLaunch : sheet};   // the server's one cockpit test (web_server _coord_may_launch)
       if (later && CFG.holdList) return new Promise((r) => top.__heldList.push(() => r(reply(200, body))));
       return json(body);
     }

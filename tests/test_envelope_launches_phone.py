@@ -9,7 +9,7 @@ from types import SimpleNamespace
 import pytest
 
 from levain.coordinator import envelope as env
-from levain.coordinator.phone import COCKPIT_DEVICE, CoordRefused, may_launch
+from levain.coordinator.phone import COCKPIT_DEVICE, CoordRefused
 from levain.web_server import CoordSheet
 from tests.test_cockpit_k2a import _install
 from tests.test_cockpit_pairing_http import T, _call, _pair, _serve
@@ -17,6 +17,9 @@ from tests.test_coordinator_phone import coord_for, review
 from tests.test_dispatch_phone import ORIGIN, RP, phone_for, repo, world  # noqa: F401  (fixtures)
 
 pytestmark = pytest.mark.skipif(shutil.which("ssh-keygen") is None, reason="needs ssh-keygen")
+
+
+RELAY = "pairing-relay-token-" + "r" * 20
 
 
 def _launch_spec(world, **over):
@@ -35,19 +38,17 @@ def test_the_cockpit_composer_may_ask_for_launches(world):
 
 
 def test_a_paired_devices_cockpit_may_ask_for_launches(world):
-    """Row 460 (a): his cockpit on his phone runs as its paired device id and may add the grant its passkey signs."""
+    """Row 460 (a): his cockpit on his phone runs as its paired device id; when the door says it may launch (its pairing
+    chain starts at the cockpit page), it adds the grant its passkey signs. Without the door's word a paired id is refused."""
     cp = coord_for(world)
-    ok = review(world, cp, "launch for me", "ph-" + "d" * 32, _launch_spec(world))
+    with pytest.raises(CoordRefused, match="sets only"):
+        review(world, cp, "launch for me", "ph-" + "9" * 32, _launch_spec(world))
+    ok = cp.step("envelope-review", {"words": "launch for me", "outbox_id": "ph-" + "d" * 32, "spec": _launch_spec(world),
+                                     "signer_fp": world["phone"].fp, "store_id": cp.listing()["coord_store_id"]},
+                 device="d-" + "0" * 12, may_launch=True)
     assert env.parse_body(ok["body_text"])["launches"] == _launch_spec(world)["launches"]
     ok = review(world, cp, "no launches", "ph-" + "f" * 32, {k: v for k, v in _launch_spec(world).items() if k != "launches"})
     assert "launches" not in env.parse_body(ok["body_text"])
-
-
-@pytest.mark.parametrize("device, ok", [(COCKPIT_DEVICE, True), ("d-0a1b2c", True), ("d-" + "f" * 12, True),
-                                        ("surface:relay", False), ("surface:browser", False), ("d-", False),
-                                        ("d-XYZ", False), ("cockpit ", False), ("", False), (None, False), (7, False)])
-def test_may_launch_is_the_cockpit_page_or_a_paired_device_and_nothing_else(device, ok):
-    assert may_launch(device) is ok
 
 
 def test_another_surfaces_token_cannot_set_launches_and_is_told_the_toggle_off_still_starts_the_desk(world):
@@ -115,12 +116,12 @@ def test_the_cockpit_key_refusal_names_the_cockpit_and_lists_launches():
 def test_only_the_cockpit_pages_own_token_runs_as_the_cockpit(cred, device):
     """L3 r2 MED: every non-paired surface token ran as "cockpit", so any surface could set the launch grant; and a
     bare paired prefix reached CoordPhone as "". Only ``browser`` is the cockpit; a bare prefix is refused here; a
-    paired device runs as its own id, which may_launch takes (row 460) and another surface's never."""
+    paired device runs as its own id (whether it may launch is the door's lineage test, below)."""
     from levain import web_server
 
     fake = SimpleNamespace(_credential=lambda *, required=None: cred)
     assert web_server._Handler._coord_device(fake) == device
-    if device is not None and not may_launch(device):
+    if device is not None and device != COCKPIT_DEVICE:
         from levain.coordinator.phone import CoordPhone
         from levain.coordinator.store import CoordError
 
@@ -135,9 +136,9 @@ def test_only_the_cockpit_pages_own_token_runs_as_the_cockpit(cred, device):
 def served_sheet(world, tmp_path_factory):
     """A real pairing serve (its own install) whose coord sheet is the phone fixtures' real CoordPhone and store."""
     _root, src, _ids = _install(tmp_path_factory.mktemp("coord-pair"))
-    with _serve(src) as (port, httpd):
+    with _serve(src, surface_tokens={"browser": T, "relay": RELAY}) as (port, httpd):
         signer = SimpleNamespace(keys=phone_for(world)._keys)
-        sheet = CoordSheet(world["qdir"], RP, ORIGIN, signer)
+        sheet = CoordSheet(world["qdir"], RP, ORIGIN, signer)   # surface tokens: browser (T) and relay (RELAY)
         sheet.phone = coord_for(world)                 # the very CoordPhone the phone tests drive (same keys and store)
         httpd.coord_sheet = sheet
         yield port, sheet
@@ -169,3 +170,26 @@ def test_a_paired_phone_token_and_the_cockpit_token_both_set_launches_on_the_coc
     st, out, _ = _post_review(world, port, sheet, paired, "ph-" + "c" * 32, no_launch)
     assert st == 200 and "launches" not in env.parse_body(out["body_text"]), out
     assert sheet.phone._reviews[out["review_id"]]["device"] == device
+
+
+def test_a_device_another_surface_paired_cannot_set_launches_nor_its_children(world, served_sheet):
+    """L3 r1 codex HIGH: any surface token may mint a pairing offer, so the paired-id shape alone let `relay` self-pair
+    and set the grant. The door now asks the pairing chain: only a chain that starts at the cockpit page qualifies."""
+    port, sheet = served_sheet
+    relay_dev, relay_tok = _pair(port, token=RELAY, label="relay-made")
+    st, got, _ = _call(port, "GET", "/cockpit/coord/drops.json", token=relay_tok)
+    assert st == 200 and got["coord_may_launch"] is False, (st, got)
+    st, out, _ = _post_review(world, port, sheet, relay_tok, "ph-" + "7" * 32, _launch_spec(world))
+    assert (st, out["error"]) == (422, "refused") and "sets only" in out["message"], (st, out)
+    child_dev, child_tok = _pair(port, token=relay_tok, label="relay-child", proxied=True)
+    st, got, _ = _call(port, "GET", "/cockpit/coord/drops.json", token=child_tok)
+    assert st == 200 and got["coord_may_launch"] is False, (st, got)
+    # a device his cockpit paired, and one that device paired in turn, both qualify
+    dev, tok = _pair(port)
+    kid, kid_tok = _pair(port, token=tok, label="ipad-child", proxied=True)
+    for t in (tok, kid_tok):
+        st, got, _ = _call(port, "GET", "/cockpit/coord/drops.json", token=t)
+        assert st == 200 and got["coord_may_launch"] is True, (st, got)
+    # the surface token itself still cannot
+    st, got, _ = _call(port, "GET", "/cockpit/coord/drops.json", token=RELAY)
+    assert st == 200 and got["coord_may_launch"] is False, (st, got)

@@ -80,6 +80,7 @@ OUTCOME_WINDOW = timedelta(days=7)     # the decisions panel's outcomes reach ba
 OUTCOMES_LIMIT = 50                    # and show at most this many, newest first
 # per-device pairing (PAIR REV 3 RQ-1): its own constants, nothing borrowed from webpush's pairing
 PAIRED_PREFIX = "paired-"              # a paired device's credential name is PAIRED_PREFIX + its id (RP-1)
+_ROOT_HOPS = 64                        # pairing_root walks at most this many paired_by links
 OFFER_TTL = timedelta(minutes=10)      # a pairing offer's life
 OFFERS_LIVE = 3                        # live offers at once; a new one past this voids the oldest
 LAST_SEEN_EVERY = timedelta(minutes=1)  # a device's last_seen is stamped at most this often (fail-soft)
@@ -1292,6 +1293,26 @@ class CockpitDB:
             family = _family_closure(conn, roots)
             revoked = _revoke_members(conn, family, by=by, stamp=stamp)
         return revoked
+
+    def pairing_root(self, device_id: str) -> "str | None":
+        """The surface credential a paired device's pairing chain starts from: walk ``paired_by`` up through
+        ``paired-<id>`` parents to the first name that is not a paired device's (``browser``, ``relay``, ...). None when
+        any link is missing or revoked, or the chain does not end within ``_ROOT_HOPS`` links (a loop included): a
+        lineage that cannot be read is no lineage. A read."""
+        _check_device_id(device_id)
+        with self.read() as conn:
+            cur = device_id
+            for _ in range(_ROOT_HOPS):
+                row = conn.execute("SELECT paired_by, revoked_at FROM paired_devices WHERE id = ?", (cur,)).fetchone()
+                if row is None or row["revoked_at"] is not None:
+                    return None
+                parent = row["paired_by"]
+                if not isinstance(parent, str) or not parent:
+                    return None
+                if not parent.startswith(PAIRED_PREFIX):
+                    return parent
+                cur = parent[len(PAIRED_PREFIX):]
+            return None
 
     def revoke_preview(self, device_id: str) -> dict[str, Any]:
         """The set a family revoke of ``device_id`` would take right now: ``{target, family: [{id, label, paired_by,

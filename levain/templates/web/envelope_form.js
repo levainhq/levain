@@ -22,7 +22,7 @@
 // The page passes:
 //   o.words        the textarea of the person's words (the page owns it); o.wordsGroup: draw it inside a "Your words" group here
 //   o.left, o.right  where the groups go (the same element for one column)
-//   o.launches     the server's coord_may_launch for this request's credential (CoordPhone.may_launch): draws the
+//   o.launches     the server's coord_may_launch for this request's credential (web_server _coord_may_launch): draws the
 //                  off-by-default "Launch seats" toggle only where the server would take it
 //   o.repos        the known folders; setRepos() takes a later listing
 //   o.review({words, spec})  a promise of {ok, status, body}, the server's reading (body.view, body.stop_at); o.why(reply): its refusal in words

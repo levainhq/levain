@@ -82,7 +82,6 @@ overwrite the other's change; the page says "one tab at a time" there. iOS Safar
 from __future__ import annotations
 
 import base64
-import re
 import secrets
 import sqlite3
 import threading
@@ -94,7 +93,7 @@ from typing import Any
 from levain.coordinator.store import SURFACES
 
 __all__ = ["REVIEWS_KEPT", "REVIEW_CLEARED_SHOWN", "REVIEW_OPEN_SHOWN", "REVIEW_TTL", "CoordPhone",
-           "CoordRefused", "may_launch"]
+           "CoordRefused"]
 
 # the drops a listing shows, newest first, are those of these surfaces: every surface the store records. A drop typed
 # at a terminal is his words as much as one sent from the phone or the cockpit, so no surface is left out of his thread
@@ -117,22 +116,11 @@ REVIEW_TTL = timedelta(minutes=15)
 REVIEWS_KEPT = 32
 # what the phone sheet may set in an envelope (pushes and publishes stay the laptop's: a push's url is resolved there)
 _SPEC_KEYS = frozenset({"where", "lands", "budget", "stop"})
-# the cockpit's own device id (web_server's _COORD_DEVICE)
+# the cockpit's own device id (web_server's _COORD_DEVICE). Who may add a launch grant is the DOOR's answer, passed in as
+# ``may_launch`` (web_server's _coord_may_launch: the cockpit page, or a paired device whose pairing chain starts at the
+# cockpit page; Phill 2026-11-08, row 460); a caller that passes none gets it for the cockpit device alone
 COCKPIT_DEVICE = "cockpit"
 _COCKPIT_SPEC_KEYS = _SPEC_KEYS | {"launches"}
-_PAIRED_DEVICE = re.compile(r"d-[0-9a-f]{1,64}")     # a paired device's id (firejournal mints "d-" + hex)
-
-
-def may_launch(device: Any) -> bool:
-    """Whether a step running as ``device`` may add a launch grant: THE one cockpit test, read by the server's spec check
-    and handed to the page (``coord_may_launch``) so the toggle is drawn exactly where it is taken. True for the cockpit
-    page's own token and for a paired device's (his cockpit opened on his phone: Phill's ruling of 2026-11-08, row 460);
-    false for any other surface's token and for no credential. The authority itself is the envelope's passkey: a review
-    names an enrolled passkey covering the envelope's floor (:meth:`CoordPhone._key`) before its spec is read, and the
-    store verifies that passkey's signature, so a paired device with no enrolled passkey of its own signs nothing."""
-    return device == COCKPIT_DEVICE or (isinstance(device, str) and _PAIRED_DEVICE.fullmatch(device) is not None)
-
-
 class CoordRefused(Exception):
     """A refusal a coordinator route answers with: an HTTP status, an error word and the words the page shows."""
 
@@ -358,14 +346,15 @@ class CoordPhone:
                 "waiting_unreadable": len(w["unresolved"]), "review_open": c["review_total"], "errors": c["errors"]}
 
     # --- the routes --------------------------------------------------------------------------------------------------
-    def step(self, action: str, req: Any, *, device: str | None) -> dict[str, Any]:
+    def step(self, action: str, req: Any, *, device: str | None, may_launch: bool | None = None) -> dict[str, Any]:
         """``drop`` {words, outbox_id, sent_at, store_id[, envelope]} -> the drop delivered (or the stored one, on a
         resend); ``envelope-review`` {words, outbox_id, spec, signer_fp, store_id} -> the body to sign, kept under a
         review id; ``envelope-challenge`` {review_id} -> its payload, signed_at now, and the WebAuthn challenge; the
         ``draft-*`` actions (:data:`levain.coordinator.draft_sign.DRAFT_ACTIONS`, the sign flow of a draft envelope)
         are :func:`levain.coordinator.draft_sign.handle`'s, whose module docstring names each request and reply; a
         draft that moved is 409 ``draft_stale``. ``device`` is the
-        paired device the request's token belongs to (None for any other credential: refused). Raises
+        paired device the request's token belongs to (None for any other credential: refused); ``may_launch`` whether
+        this request may add a launch grant (None: the cockpit device only). Raises
         :class:`CoordRefused`: 400 a malformed request, 403 no paired device, 409 an outbox id already used otherwise or
         another store's item, 422 a refusal, 503 a fault on this machine (nothing written)."""
         from levain.authority import AuthorityError, VerifierUnavailable
@@ -392,7 +381,7 @@ class CoordPhone:
 
                 return draft_sign.handle(self, action, req, device)
             if action == "envelope-review":
-                return self._review(req, device)
+                return self._review(req, device, may_launch)
             if action == "envelope-challenge":
                 return self._challenge(req, device)
             return self._drop(req)
@@ -415,11 +404,11 @@ class CoordPhone:
             raise CoordRefused(503, "unavailable", f"the coordinator store cannot answer now ({type(exc).__name__}: "
                                                    f"{str(exc)[:200]}): {not_done}") from None
 
-    def _spec(self, spec: Any, device: str | None = None) -> dict[str, Any]:
+    def _spec(self, spec: Any, device: str | None = None, may_launch: bool | None = None) -> dict[str, Any]:
         """The sheet's spec as the CLI builder takes it: where (absolute repos), lands always named and inferred."""
         from levain.coordinator.store import CoordError
 
-        cockpit = may_launch(device)
+        cockpit = (device == COCKPIT_DEVICE) if may_launch is None else may_launch is True
         allowed = _COCKPIT_SPEC_KEYS if cockpit else _SPEC_KEYS
         if not isinstance(spec, dict) or not set(spec) <= allowed:
             hint = "" if cockpit or not isinstance(spec, dict) or "launches" not in spec else (
@@ -455,7 +444,7 @@ class CoordPhone:
             out["launches"] = launches
         return out
 
-    def _review(self, req: dict[str, Any], device: str) -> dict[str, Any]:
+    def _review(self, req: dict[str, Any], device: str, may_launch: bool | None = None) -> dict[str, Any]:
         from levain.contracts.canon import canonical
         from levain.coordinator import cli as ccli
         from levain.coordinator import envelope as env
@@ -477,7 +466,7 @@ class CoordPhone:
             # a resend returns the stored drop as it was, so an envelope signed now would never be read
             raise CoordRefused(409, "conflict", f"this drop is already delivered as {sent.drop_id}; nothing new is "
                                                 "signed for it")
-        body = ccli._spec_body(self._spec(req["spec"], device), words, Source(), store)
+        body = ccli._spec_body(self._spec(req["spec"], device, may_launch), words, Source(), store)
         text = canonical(body)
         body = store.check_body(text)          # a body the store can only refuse is never put to the passkey
         review_id = "rv-" + secrets.token_hex(16)
