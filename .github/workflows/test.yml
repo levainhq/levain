@@ -174,7 +174,8 @@ jobs:
           mapfile -t files < "$RUNNER_TEMP/files.txt"
           test "${#files[@]}" -gt 0 || { echo "shard ${{ matrix.shard }} has no files"; exit 1; }
           # --durations=25 prints the 25 slowest tests into the log, a measurement the shard weights lack (the -q progress parse ignores it)
-          pytest -q --durations=25 --basetemp=/tmp/levain-pt "${files[@]}"
+          # -n auto: one pytest-xdist worker per runner core; the collection above stays serial
+          pytest -n auto -q --durations=25 --basetemp=/tmp/levain-pt "${files[@]}"
 
       - name: Keep what the page showed at a failed wait
         # the page driver writes timeout-step-<n>.png / .txt beside its steps file, under pytest's basetemp; reading them is how a
@@ -218,7 +219,7 @@ jobs:
       - name: Install h11 at or above the floor root vendors
         # root_tree stages h11 beside the levain package, so the root tree imports it; the closure's import-check
         # needs it as much as the tests do.
-        run: python -m pip install --upgrade pip pytest "$(python tests/ci/root_closure.py h11-spec)"
+        run: python -m pip install --upgrade pip pytest pytest-xdist "$(python tests/ci/root_closure.py h11-spec)"
 
       - name: Install h11 for the runner's /usr/bin/python3
         # The keys process tests (tests/test_broker_keys_process.py, tests/test_control_keys_attach.py) also run keys
@@ -239,7 +240,7 @@ jobs:
           mapfile -t files < "$RUNNER_TEMP/root_tests.txt"
           test "${#files[@]}" -gt 0 || { echo "the closure selected no test files"; exit 1; }
           echo "${#files[@]} test files"
-          PYTHONPATH="$PWD" pytest --noconftest -q -p no:cacheprovider --rootdir="$PWD" "${files[@]}"
+          PYTHONPATH="$PWD" pytest -n auto --noconftest -q -p no:cacheprovider --rootdir="$PWD" "${files[@]}"
 
   linux-live:
     # The bwrap floor RUN, not read as data. GitHub's ubuntu runners refuse unprivileged user
@@ -365,7 +366,7 @@ jobs:
           echo "$files"
           test -n "$files" || { echo "shard ${{ matrix.shard }} holds no test file"; exit 1; }
           set -o pipefail
-          pytest -q -rs --basetemp=/tmp/levain-pt $files 2>&1 | tee browser.log
+          pytest -n auto -q -rs --basetemp=/tmp/levain-pt $files 2>&1 | tee browser.log
           # ANY skip is a failure here, whatever its reason: the whole point of this job is that these tests run
           if grep -q -E "^SKIPPED|[0-9]+ skipped" browser.log; then
             echo "a test skipped in the browser job (reasons above, from -rs)"
