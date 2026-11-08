@@ -63,7 +63,7 @@ HANDOFF_FRESH_DAYS = 7
 SPORE_ROW_VERBS = ("spore_touch", "spore_descend", "spore_surface_at", "spore_update",
                    "spore_set_disposition", "spore_ascend")
 SPORE_STORED = ("id", "text", "disposition", "tier", "type", "domain", "next", "pointer", "salience", "seen",
-                "origin_key")
+                "origin_key", "target", "attention")
 # seen alone never stales a write (a touch that clears an elapsed next does); origin_key is store-assigned
 # once and names the label resource, so it is carried, not versioned
 SPORE_VERSION_EXCLUDED = ("seen", "origin_key")

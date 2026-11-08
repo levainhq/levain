@@ -45,6 +45,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any, Callable, Literal
 
 from levain.cockpit.authority import bound, current
+from levain.cockpit.effects import INTAKE_TIERS, INTAKE_VERB, intake_kind_of
 from levain.cockpit.engine import DECISIONS_ID, NOTE_VERB, QUESTION_VERB, VALUE_ABSENT
 from levain.cockpit.external import ID_PREFIX as EXTERNAL_PREFIX
 from levain.cockpit.registry import NOTE_ROW_PREFIX, QUESTION_ROW_PREFIX, parse_date
@@ -182,14 +183,23 @@ class VerbSpec:
     # server's compose_signer filed), adding the one param SIGN_PARAM; the verb's own handler or effect verifies it. A
     # signed verb is at-most-once whatever ``idempotent`` says (_at_most_once)
     sign: bool = False
+    # the other verbs whose standing policy also governs these params (``params -> names``): a verb that writes another
+    # verb's effect answers to that verb's raise too, so a raise is never stepped around by a second door. ``list_intake``
+    # names ``spore_seed`` for a drop or a talk (both plant a spore_seed effect); None for every other verb
+    policy_also: Callable[[dict[str, Any]], tuple[str, ...]] | None = None
 
     # ``policy`` is the request's standing policy (``RequestAuthority.policy``, trust-tiering DESIGN
     # §3.4, §4.1): it may raise a tier, never lower one
 
+    def _policy_raised(self, policy: "TierPolicy", base: Tier, params: dict[str, Any]) -> Tier:
+        for other in (self.policy_also(params) if self.policy_also is not None else ()):
+            base = _raised(policy, other, base)
+        return _raised(policy, self.name, base)
+
     def tier(self, params: dict[str, Any], row: dict[str, Any] | None, provenance: str, today: date, *,
              policy: "TierPolicy") -> Tier:
         base: Tier = "T2" if self.tier_fn is None else self.tier_fn(params, row, provenance, today)
-        return _raised(policy, self.name, base)
+        return self._policy_raised(policy, base, params)
 
     def rendered_tier(self, row: dict[str, Any] | None, provenance: str, today: date, *,
                       policy: "TierPolicy") -> Tier:
@@ -199,10 +209,10 @@ class VerbSpec:
             base = self.row_tier(row, provenance, today)
         else:
             base = self.floor
-        return _raised(policy, self.name, base)
+        return self._policy_raised(policy, base, {})
 
     def head(self, gesture: str, *, policy: "TierPolicy") -> dict[str, Any]:
-        return {"label": self.label, "tier": _raised(policy, self.name, self.floor if self.tier_fn else "T2"),
+        return {"label": self.label, "tier": self._policy_raised(policy, self.floor if self.tier_fn else "T2", {}),
                 "confirm": self.confirm_required, "idempotent": self.idempotent, "job": self.job,
                 "reversible": self.reversible, "fields": list(self.fields or ()), "sign": self.sign,
                 "effect": self.effect, "gesture": gesture, "route": self.route}
@@ -839,6 +849,67 @@ def _band_fire(scope: "WriteScope", params: dict[str, Any], target: dict[str, An
             "delivery": "started" if done.answered else "none"}
 
 
+def _intake_tier(params: dict[str, Any], row: dict[str, Any] | None, prov: str, today: date) -> Tier:
+    """The List intake's tier by the line's kind (``effects.INTAKE_TIERS``), read from its prefix: a scheduled drop
+    and a talk seed are T2 (signed), a plain line to sort is C1. A line that is not a string is T2 (refused later)."""
+    return INTAKE_TIERS.get(intake_kind_of(params.get("line")) or "", "T2")  # type: ignore[return-value]
+
+
+def _intake_policy_also(params: dict[str, Any]) -> tuple[str, ...]:
+    """A drop or a talk plants a ``spore_seed`` effect, so a standing raise of ``spore_seed`` governs it too; a sort
+    plants none. With no line (the rendered tier, the manifest head) the answer is the one that governs most."""
+    return () if intake_kind_of(params.get("line")) == "sort" else ("spore_seed",)
+
+
+def _intake_outbox_id(credential: str, key: str) -> str:
+    """The coordinator outbox id a keyed sort writes under: one per (credential, key), in the store's id shape."""
+    import hashlib
+
+    return "li" + hashlib.sha256(f"{credential}\0{key}".encode("utf-8")).hexdigest()[:40]
+
+
+def _intake_fire(scope: "WriteScope", params: dict[str, Any], target: dict[str, Any], confirm: bool) -> dict[str, Any]:
+    """The C1 half of ``list_intake``: a plain line (``sort``) stored verbatim as a coordinator drop from the cockpit
+    surface, the room composer's own write (``room.post_room_drop``), for the desk to sort. A drop or a talk never
+    reaches here (T2: the broker). The receipt is ``levain.intake.receipt``'s three-line shape."""
+    from levain import intake
+    from levain.cockpit.providers import _dispatch_dir
+    from levain.coordinator.store import CoordError, CoordStore, DropConflict, StoreAbsent
+    from levain.dispatch import DispatchError
+
+    line = params.get("line")
+    if set(params) != {"line"} or not isinstance(line, str):
+        raise EditError("bad_request", 400, "an intake is exactly {line}, a string")
+    try:
+        parsed = intake.parse_intake(line, datetime.now())
+    except intake.IntakeRefused as exc:
+        raise EditError("intake_refused", 422, str(exc)) from None
+    if parsed["kind"] != "sort":       # the tier said sort; a line read otherwise is never written here
+        raise EditError("bad_request", 400, f"a {parsed['kind']} intake is signed, never a direct write")
+    directory = target.get("dispatch_dir") or _dispatch_dir(target.get("consent_reader"))
+    if directory is None:
+        raise EditError("not_built", 501, "this cockpit names no coordinator store, so there is no desk to sort it")
+    key = target.get("idempotency_key")
+    if not isinstance(key, str) or not key:
+        # the room composer's contract too (a drop carries its outbox id): a resend after a lost reply must name
+        # the same drop, so an unkeyed sort, which a retry would write twice, is refused before anything is written
+        raise EditError("bad_request", 400, "a plain line carries an idempotency_key (a resend names the same drop)")
+    outbox = _intake_outbox_id(str(target.get("credential") or ""), key)
+    try:
+        drop, created = CoordStore(Path(directory)).accept_drop(parsed["text"], surface="cockpit", outbox_id=outbox)
+    except StoreAbsent as exc:
+        raise EditError("not_built", 501, f"the coordinator store is absent: {exc}") from None
+    except DropConflict as exc:
+        raise EditError("idempotency_conflict", 409, f"this idempotency key sent other words: {exc}") from None
+    except CoordError as exc:
+        raise EditError("drop_refused", 409, str(exc)) from None
+    except (OSError, sqlite3.Error, DispatchError) as exc:
+        raise EditError("source_unavailable", 503, f"the coordinator store cannot take a drop now: {exc}") from None
+    line_out, rec = intake.receipt(parsed)
+    return {"ok": True, "state": "COMMITTED", "receipt": rec, "receipt_line": line_out, "drop_id": drop.drop_id,
+            "replay": not created}
+
+
 def _resolve_kinds(direction: str) -> Callable[[dict[str, Any]], dict[str, list[Any]]]:
     """The ``spore_kind`` values anneal takes for this row's type, so a renderer offers only those."""
     def options(row: dict[str, Any]) -> dict[str, list[Any]]:
@@ -877,9 +948,17 @@ KERNEL_VERBS: tuple[VerbSpec, ...] = (
              reversible=False, fire=_spore_fire("spore_ascend"), legacy_kind="spore_ascend", device_ok=True,
              applies_to=_SPORE_ROW, options=_resolve_kinds("ascend")),
     VerbSpec("spore_seed", "capture", "adds a new item that agents will read", "create",
-             fields=("text", "type", "disposition"), floor="T2", tier_fn=_const("T2"),
+             # next/target/attention: THE LIST's scheduled drop and talk seed (task_surfaces_1107.md); a target
+             # wakes an agent with these words, so a create stays T2 whatever it carries
+             fields=("text", "type", "disposition", "next", "target", "attention"), floor="T2", tier_fn=_const("T2"),
              fire=_unbuilt_fire("spore_seed fires through the broker (K2b)"), legacy_kind="spore_seed",
              device_ok=True),
+    VerbSpec(INTAKE_VERB, "add", "adds one line to the List: '@<when> words' schedules a drop that wakes the desk "
+             "at that minute, '? words' queues a talk, anything else goes to the desk to sort", "create",
+             fields=("line",), floor="T2", tier_fn=_intake_tier, fire=_intake_fire, device_ok=True,
+             # at-most-once: a sort's key names its coordinator drop's outbox id, so a resend after a lost reply
+             # writes nothing (a drop and a talk are broker pendings, keyed as every pending is)
+             idempotent=True, policy_also=_intake_policy_also),
     VerbSpec("episode_tombstone", "tombstone", "deletes an episode (memory's graduation evidence)", "row",
              floor="T2", tier_fn=_const("T2"), confirm_required=True, reversible=False,
              fire=_unbuilt_fire("episode_tombstone fires through the broker (K2b)"),
@@ -1373,6 +1452,8 @@ def _dispatch(registry: VerbRegistry, cockpit: "Cockpit", scope: "WriteScope | N
                               "questions": cockpit.question_store, "notes": getattr(cockpit, "note_store", None),
                               # the credential's name: the viewer a band answer binds to (``cockpit:<name>``)
                               "credential": str(credential.get("name") or ""),
+                              # an at-most-once kernel fire's key (the List's sort names its coordinator drop by it)
+                              "idempotency_key": req.get("idempotency_key"),
                               # whether the request came from a paired device, asked of that device's store (a review
                               # verb writes only for one), and where the coordinator store is (the directory the review
                               # panel reads)

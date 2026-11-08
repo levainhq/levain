@@ -962,6 +962,15 @@ class TestTrayWriteKinds:
         assert rec["kind"] == "spore_seed" and rec["source"] == f"spore:{sid}"
         assert rec["undoable"] is False  # verb-mediated, not file-undoable
 
+    @pytest.mark.parametrize("extra", [{"target": "desk", "disposition": "agenda"}, {"next": "2026-11-09T09:00"},
+                                       {"attention": "talk"}])
+    def test_seed_here_refuses_the_list_fields(self, install: Path, extra: dict) -> None:
+        # THE LIST's create fields are the cockpit's, signed through the broker; this legacy write takes none
+        with pytest.raises(EditError) as e:
+            apply_edit(_scope(install), {"kind": "spore_seed", "text": "x", **extra})
+        assert e.value.code == "bad_verb_arg"
+        assert not (install / ".levain" / "memory.spores.json").is_file()
+
     def test_seed_is_non_destructive_no_confirm_needed(self, install: Path) -> None:
         # creation never asks for confirm (unlike descend/ascend/tombstone)
         res = apply_edit(_scope(install), {"kind": "spore_seed", "text": "x"})
