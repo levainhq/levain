@@ -3592,8 +3592,15 @@ def _check_cockpit_key_files(install: Path, *, key_dirs: list[Path] | None = Non
     sign authority records with it. An install enrolled before custody checks existed (2026-10-12) can hold one; the
     enrol door refuses it today. Doctor FINDS it and never blocks signing (the owner's re-key needs this very key
     to sign the new key's enrolment). The key dirs (default: the default key dir) are searched by ``.pub`` file
-    only; the private file is opened for its cipher header only, so no passphrase is needed. A key whose file is
-    not found locally gives no row. Nothing here can abort doctor."""
+    only (a regular, non-symlink file under 16 KiB); EVERY private file beside a matching ``.pub`` is read for its
+    cipher header only (no passphrase; a regular file, 64 KiB cap) and counts only when its embedded public key IS
+    the enrolled one; any unencrypted match fails. A key whose file is not found locally gives no row. Nothing
+    here can abort doctor.
+
+    Known edges (closed, not built against): a non-ed25519 key enrolled ``touch-id`` is skipped (a touch-id
+    key that is not a software ed25519 one is a Secure Enclave / hardware key: there is no plain file to find); a legacy PEM or
+    unreadable private file is skipped, not called unencrypted (it cannot be proved plain); the broad ``except``
+    makes a dead check a WARN row, as its sibling cockpit rows do."""
     try:
         return _cockpit_key_file_rows(install, key_dirs)
     except Exception as exc:  # noqa: BLE001 - a doctor check reports, it never crashes the run
@@ -3601,6 +3608,7 @@ def _check_cockpit_key_files(install: Path, *, key_dirs: list[Path] | None = Non
 
 
 def _cockpit_key_file_rows(install: Path, key_dirs: list[Path] | None) -> list[CheckResult]:
+    import base64
     from datetime import datetime, timezone
 
     from levain.authority import LAPTOP, anchor_path
@@ -3626,49 +3634,86 @@ def _cockpit_key_file_rows(install: Path, key_dirs: list[Path] | None) -> list[C
     if auth.authority is None or auth.authority_error is not None:
         return []
     dirs = key_dirs if key_dirs is not None else [custody.default_key_dir()]
-    pubs: dict[str, Path] = {}                        # "<type> <base64>" -> the private file beside its .pub
+    pubs: dict[str, list[Path]] = {}                  # "<type> <base64>" -> EVERY private file beside a matching .pub
     for d in dirs:
         try:
             entries = sorted(Path(d).expanduser().glob("*.pub"))
         except OSError:
             continue
         for pub in entries:
+            text = _read_regular(pub, _PUB_MAX, follow=False)
+            if text is None or len(pub.name) <= len(".pub"):
+                continue
             try:
-                fields = pub.read_text(encoding="utf-8").split()
-            except (OSError, UnicodeDecodeError):
+                fields = text.decode("utf-8").split()
+            except UnicodeDecodeError:
                 continue
             if len(fields) >= 2:
-                pubs.setdefault(" ".join(fields[:2]), pub.with_name(pub.name[:-4]))
+                cands = pubs.setdefault(" ".join(fields[:2]), [])
+                private = pub.with_name(pub.name[:-4])
+                if private not in cands:
+                    cands.append(private)
     rows: list[CheckResult] = []
     found = 0
     for key in auth.authority.keys.values():
         if not key.active or key.key_class != LAPTOP:
             continue
-        private = pubs.get(" ".join(key.public_key.split()[:2]))
-        if private is None or not private.is_file():
-            continue
-        found += 1
         software = key.public_key.split()[0] == "ssh-ed25519"
         if key.custody not in (custody.PASSPHRASE, custody.TOUCH_ID) or (key.custody == custody.TOUCH_ID
                                                                            and not software):
             continue                                  # nothing in the key file says it is a plain file
-        if custody.is_encrypted_file(private):
+        want = key.public_key.split()[1]
+        checked = 0
+        plain: list[Path] = []
+        for private in pubs.get(" ".join(key.public_key.split()[:2]), []):
+            try:
+                if not stat.S_ISREG(os.stat(private).st_mode):
+                    continue                          # a FIFO, a device, a directory: never opened
+            except OSError:
+                continue
+            header = custody._private_header(private)  # bounded (64 KiB), the unencrypted header only
+            if header is None or base64.b64encode(header[1]).decode("ascii") != want:
+                continue                              # not an OpenSSH key, or a DIFFERENT key beside this .pub
+            checked += 1
+            if header[0] == "none":
+                plain.append(private)
+        found += 1 if checked else 0
+        if not plain:
             continue
+        q_install = shlex.quote(str(install))
         rows.append(CheckResult(
             "cockpit key custody", False,
             f"laptop-presence key {key.fingerprint} is enrolled as custody {key.custody!r}, but its key file "
-            f"{private} is an UNENCRYPTED private key: any process running as you can sign with it",
+            f"{', '.join(map(str, plain))} is an UNENCRYPTED private key: any process running as you can sign "
+            "with it",
             "Re-key it; this key is still needed to sign the new key's enrolment, so levain does not block it. "
-            "`levain cockpit key create` (Touch ID where available), then `levain cockpit enroll <new key.pub> "
-            f"--class {LAPTOP} --signing-key {private}`, then `levain cockpit revoke {key.fingerprint} "
-            "--signing-key <the new key>`. A plain revoke: --compromised-since would void every record this key "
-            "signed, which includes the phone passkey enrolments."))
+            f"`levain cockpit key create` (Touch ID where available), then `levain cockpit enroll <new key.pub> "
+            f"--class {LAPTOP} --signing-key {shlex.quote(str(plain[0]))} --path {q_install}`, then "
+            f"`levain cockpit revoke {shlex.quote(key.fingerprint)} --signing-key <the new key> --path {q_install}`. "
+            "A plain revoke: --compromised-since would void every record this key signed, which includes the "
+            "phone passkey enrolments."))
     if rows:
         return rows
     if found:
         return [CheckResult("cockpit key custody", True,
                             f"{found} local laptop-presence key file(s) match their declared custody")]
     return []
+
+
+_PUB_MAX = 16 * 1024
+
+
+def _read_regular(path: Path, limit: int, *, follow: bool) -> bytes | None:
+    """At most ``limit`` bytes of ``path`` when it is a regular file (a symlink only when ``follow``), else None.
+    A FIFO or device is never opened: it could block or never end."""
+    try:
+        st = os.stat(path) if follow else os.lstat(path)
+        if not stat.S_ISREG(st.st_mode) or st.st_size > limit:
+            return None
+        with open(path, "rb") as fh:
+            return fh.read(limit + 1)[:limit]
+    except OSError:
+        return None
 
 
 #: What each refusal of the install helper's ``enrol-authority-signer`` / ``remove-authority-signer`` means, in the
