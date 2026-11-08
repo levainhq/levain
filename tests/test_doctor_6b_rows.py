@@ -268,7 +268,8 @@ def test_a_quarantined_held_session_names_its_reason_and_the_restart_lines(tmp_p
     assert f"{SESSION} at tree, quarantined after 3 tries: var-folders-residue" in row.detail
     assert "while the reaper retries" not in row.detail                # every held session here is quarantined
     assert "has stopped retrying" in row.hint and f"`{stop}` then `{start}`" in row.hint
-    assert "repair" not in row.hint                                    # the restart is the way back, not a verb
+    # the restart is the way back, not a verb (the log words may name `repair --source` as what creates a missing log)
+    assert "repair" not in row.hint.replace(doctor._reaper_log_here(), "")
 
 
 @pytest.mark.parametrize("rec,tail", [
@@ -586,11 +587,13 @@ def test_the_reaper_log_the_rows_name_is_the_file_its_plist_writes_to():
 
 def test_the_darwin_reaper_log_words_say_when_the_file_is_not_there_yet(tmp_path: Path):
     """L3 v2fix r1: a Mac installed before the plist kept a log has no file at the path; the words say it is not created
-    until `sudo levain setup-isolation` is re-run, and say nothing of the kind once the file exists."""
+    until `install-helper repair --source <tree>` is run (the measured remedy), and say nothing of the kind once the file exists."""
     from levain.slot import units
     real = str(units.launchd_log_path(units.by_name("reaper")))
     absent = doctor.reaper_log_where("darwin", exists=lambda p: False)
-    assert real in absent and "not created until `sudo levain setup-isolation` is re-run" in absent
+    assert real in absent and "not created until `sudo " in absent and " repair --source " in absent
+    assert "setup-isolation" not in absent                                   # measured: it does not create the log
+    assert "`h11` must sit beside that folder" in absent
     present = doctor.reaper_log_where("darwin", exists=lambda p: p == real)
     assert real in present and "not created" not in present
     assert "not created" not in doctor.reaper_log_where("linux", exists=lambda p: False)
@@ -605,3 +608,17 @@ def test_the_quarantine_hint_and_the_held_hint_name_where_the_reaper_logs(tmp_pa
     where = doctor.reaper_log_where("darwin" if sys.platform == "darwin" else "linux")
     assert f"The reaper's {where} names the entry" in row.hint            # the quarantine half
     assert f"its {where} says why" in row.hint                              # the retrying half
+
+
+def test_the_reaper_log_hint_names_a_verb_the_helper_parser_accepts():
+    """Row 81 residue (real macOS VM): the hint named `setup-isolation`, which does not create the log. The remedy verb in
+    the text is parsed back out and must be a verb of the install-helper grammar that takes `--source`."""
+    import re
+    from levain.slot import grammar, layout
+    text = doctor.reaper_log_where("darwin", exists=lambda p: False)
+    m = re.search(r"`(sudo \S+) (\S+) --source (\S+)`", text)
+    assert m, text
+    assert m.group(1) + " " + m.group(2) == layout.repair_line("darwin")
+    assert m.group(2) in grammar.VERBS
+    cmd = grammar.parse_install_argv([m.group(2), "--source", m.group(3).strip("'")])   # the real parser takes it
+    assert cmd.verb == "repair" and cmd.source == m.group(3).strip("'")
