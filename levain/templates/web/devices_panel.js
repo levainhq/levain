@@ -1512,7 +1512,19 @@
     if (focusId && !coarse) { const f = document.getElementById(focusId); if (f) f.focus(); }
   }
 
+  // W5a: a paired device whose browser holds the notification permission has /sw.js registered at page load, so a push's
+  // tap (which opens the subject's card) never waits for the Devices panel's Turn on. Registers only; it asks for no
+  // permission and subscribes to nothing. Nothing is done when a registration already exists.
+  async function registerWorkerAtBoot() {
+    try {
+      if (!PUSH_OK || Notification.permission !== "granted" || window.localStorage.getItem(PAIRED_MARK_KEY) !== "1") return;
+      if (await registration()) return;
+      await navigator.serviceWorker.register("/sw.js", { scope: "/" });
+    } catch (_) { /* a browser that refuses leaves Turn on as it was */ }
+  }
+
   function start() {
+    registerWorkerAtBoot();
     build();
     voiceProbe();
     refresh();
