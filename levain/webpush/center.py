@@ -181,9 +181,14 @@ def _request(queue_dir: Path | None, request_id: str, item: str | None) -> tuple
         req = sign.read_request(Path(queue_dir), request_id)
         if req.refused is not None:
             return "unknown", None
-        if req.namespace != FLOW_NEEDS_STORE:
+        from levain.contracts.namespaces import LEVAIN_SIGN_REQUESTS
+
+        if req.namespace == FLOW_NEEDS_STORE:
+            named = _signed_fields(req.message).get("item")
+        elif req.namespace in LEVAIN_SIGN_REQUESTS and req.requester == "levain":
+            named = request_id         # levain's own request has no flow item: its ping names the request itself
+        else:
             return "unverified", None
-        named = _signed_fields(req.message).get("item")
         if item is not None and named != item:
             return "unverified", None
         if sign.state_of(Path(queue_dir), request_id) != "open":

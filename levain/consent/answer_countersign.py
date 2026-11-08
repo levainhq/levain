@@ -26,8 +26,8 @@ from urllib.parse import urlsplit
 
 from levain.contracts.namespaces import ANSWER_COUNTERSIGN_NAMESPACE as NS, LEVAIN_SIGN_REQUESTS
 
-__all__ = ["CARD_TITLE", "CARD_TTL_S", "CardResult", "Verdict", "build_card", "file_card", "nonce_of",
-           "sign_queue_dir", "verdict", "badge_words"]
+__all__ = ["CARD_TITLE", "CARD_TTL_S", "CardResult", "SignQueue", "Verdict", "build_card", "file_card", "nonce_of",
+           "resolve_sign_queue", "sign_queue_dir", "sign_queue_hint", "verdict", "badge_words"]
 
 CARD_TTL_S = 24 * 3600
 CARD_TITLE = "Countersign your terminal answer"
@@ -53,25 +53,96 @@ class Verdict:
     signed_at: str | None = None
 
 
-def sign_queue_dir(environ: Mapping[str, str]) -> Path | None:
-    """The cockpit Signer's queue dir: ``$LEVAIN_SIGN_QUEUE_DIR``, else the ``sign_queue_dir`` key of the hook
-    queue's ``claude_code.json``, else None (no card). Absolute paths only: a relative one is never resolved, since
-    the hook runs in a project's directory."""
-    def absolute(value: Any) -> Path | None:
-        if isinstance(value, str) and value and "\x00" not in value and Path(value).is_absolute():
-            return Path(value)
-        return None
+@dataclass(frozen=True)
+class SignQueue:
+    """What :func:`resolve_sign_queue` found. ``path``: the queue, or None (no card). ``hook_queue``: the hook queue
+    whose ``claude_code.json`` was consulted (None when it could not be located). ``why``: when ``path`` is None
+    because a source was present but unusable, what was wrong with it, naming the file and the bad value."""
+    path: Path | None
+    hook_queue: Path | None = None
+    why: str | None = None
 
-    got = absolute(environ.get(ENV_QUEUE))
-    if got is not None:
-        return got
+
+def _absolute(value: Any) -> Path | None:
+    if isinstance(value, str) and value and "\x00" not in value and Path(value).is_absolute():
+        return Path(value)
+    return None
+
+
+def resolve_sign_queue(environ: Mapping[str, str]) -> SignQueue:
+    """The cockpit Signer's queue dir, and why there is none. In order: ``$LEVAIN_SIGN_QUEUE_DIR`` when set and
+    non-empty (an absolute path, else no queue and ``why`` names it); else
+    the hook queue's ``claude_code.json``. When that file is present it must be readable, a JSON object, and any
+    ``sign_queue_dir`` key in it an absolute path string: otherwise no queue (``why`` names the file and the value),
+    never a guess past a broken setting. The key's value is taken as named (whether it is a directory is the
+    caller's check). Only when the file is absent, or is an object with no such key, is the queue derived: the hook
+    queue itself, when it is a directory that a cockpit serves or has served, i.e. it holds a published cockpit
+    origin or its sign-request directory exists (so a request filed there is still found after that cockpit stops).
+    A stale origin after a crash still counts: a request filed then waits for the next serve on that queue.
+    Relative paths are never resolved, since the hook runs in a project's directory."""
+    raw_env = environ.get(ENV_QUEUE)
+    if raw_env:   # an empty value counts as unset; a named one that is not absolute is refused, never passed over
+        got = _absolute(raw_env)
+        if got is None:
+            return SignQueue(None, None, f"${ENV_QUEUE} is {raw_env[:_TITLE_CUT]!r}, not an absolute directory path")
+        return SignQueue(got)
     try:
         from levain.consent.queue import queue_dir_for
 
-        data = json.loads((queue_dir_for(environ) / "claude_code.json").read_text(encoding="utf-8"))
-        return absolute(data.get(SETTINGS_KEY)) if isinstance(data, dict) else None
+        qdir = queue_dir_for(environ)
+    except Exception:  # noqa: BLE001 - no hook queue to read settings from: no card
+        return SignQueue(None)
+    try:
+        settings = qdir / "claude_code.json"
+        try:
+            raw = settings.read_text(encoding="utf-8")
+        except FileNotFoundError:
+            data: Any = {}
+        except (OSError, ValueError) as exc:
+            return SignQueue(None, qdir, f"{settings} cannot be read ({type(exc).__name__})")
+        else:
+            try:
+                data = json.loads(raw)
+            except (ValueError, RecursionError):
+                return SignQueue(None, qdir, f"{settings} is not valid JSON")
+            if not isinstance(data, dict):
+                return SignQueue(None, qdir, f"{settings} is not a JSON object")
+        if SETTINGS_KEY in data:
+            named = _absolute(data[SETTINGS_KEY])
+            if named is None:
+                bad = repr(data[SETTINGS_KEY])[:_TITLE_CUT]
+                return SignQueue(None, qdir, f"{SETTINGS_KEY} in {settings} is {bad}, not an absolute directory path")
+            return SignQueue(named, qdir)
+        from levain.consent.cockpit_origin import read_origin
+        from levain.consent.sign import sign_dir
+
+        if qdir.is_dir() and (read_origin(qdir) is not None or sign_dir(qdir).is_dir()):
+            return SignQueue(qdir, qdir)
+        return SignQueue(None, qdir)
     except Exception:  # noqa: BLE001 - no readable settings: no card
-        return None
+        return SignQueue(None, qdir)
+
+
+def sign_queue_dir(environ: Mapping[str, str]) -> Path | None:
+    """:func:`resolve_sign_queue`'s ``path``: the cockpit Signer's queue dir, or None (no card)."""
+    return resolve_sign_queue(environ).path
+
+
+def sign_queue_hint(found: SignQueue) -> str:
+    """Why ``found`` (one :func:`resolve_sign_queue` result) is not usable and the exact fix, for a refusal: the bad
+    setting, the named path that is missing or not a directory, or the hook queue to pass when nothing is named."""
+    flag = "pass --sign-queue-dir DIR"
+    if found.why is not None:
+        return f"{found.why}: fix that value, or {flag}"
+    qdir = found.hook_queue
+    where = (f"{ENV_QUEUE} or {SETTINGS_KEY} in {qdir / 'claude_code.json'}" if qdir is not None else ENV_QUEUE)
+    if found.path is not None and not found.path.is_dir():
+        state = "is not a directory" if found.path.exists() else "does not exist"
+        return f"the named signing queue {found.path} {state} (from {where}): fix that value, or {flag}"
+    if qdir is None:
+        return f"{flag} (the directory `levain serve --sign-queue-dir` was started with)"
+    return (f"{flag} (the directory `levain serve --sign-queue-dir` was started with; on a standard install that "
+            f"is {qdir}), or set {ENV_QUEUE}, or add \"{SETTINGS_KEY}\": \"<DIR>\" to {qdir / 'claude_code.json'}")
 
 
 def nonce_of(store_id: str, session: str, stamp: str) -> str:
@@ -155,8 +226,7 @@ def _file_card(store: Any, card: Mapping[str, Any] | None, recorded: Sequence[An
     if not webpush.live(qdir):
         return CardResult(False, "no phone is subscribed to the signing queue", rid)
     body = str(card["typed"])[:_TITLE_CUT]
-    if not sender.spawn(qdir, kind="question", ref=entries[0].item, title=CARD_TITLE, body=body,
-                        url=deep_link(origin, rid)):
+    if not sender.spawn_sign_request(qdir, rid, title=CARD_TITLE, body=body, url=deep_link(origin, rid)):
         return CardResult(False, "the push could not be started", rid)
     return CardResult(True, None, rid)
 
