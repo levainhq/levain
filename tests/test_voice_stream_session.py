@@ -333,7 +333,8 @@ def test_failed_provider_close_still_settles(tmp_path):
     rig = Rig(tmp_path)
     s = rig.open(stream=FakeStream(fail_close=True))
     s.feed(0, PCM_1S)
-    assert s.close() == ""
+    with refused("provider_failed"):          # was `== ""`: a close that did not finish now refuses (L3 4c r1 F2)
+        s.close()
     assert rig.rows()[0].status == "ok"
 
 
@@ -655,7 +656,9 @@ def test_an_ended_session_is_dropped_after_the_retention_time(rig):
     rig.clock.t += ss.ENDED_RETAIN_S + 1
     with refused("unknown_session"):
         rig.registry.get(s.sid, "owner-a")
-    assert s.take_audio() == b"" and s.mailbox().final == ""       # dropped: its audio and text go with it
+    assert s.take_audio() == b"" and s._final == ""               # dropped: its audio and text go with it
+    with refused("unknown_session"):                               # was `mailbox().final == ""` (L3 4c r1 F3)
+        s.mailbox()
 
 
 def test_retained_ended_sessions_are_capped_oldest_first(tmp_path):
@@ -878,3 +881,133 @@ def test_an_owner_with_a_lone_surrogate_is_compared_not_crashed(rig):
     for other in ("owner-\udc81", "owner-?", "owner-a", None, 7):
         with refused("unknown_session"):
             rig.registry.get(s.sid, other)
+
+
+# --- L3 batch4c r1 fixes ----------------------------------------------------------------------------------------------
+
+class ClosePollFails(FakeStream):
+    """close() returns text, but the adapter reports failed afterwards (OpenAI's final commit timed out; Deepgram sent no
+    closing metadata): both real adapters say so through poll().failed."""
+
+    def poll(self) -> StreamUpdate:
+        return StreamUpdate(partial=self.partial, final="", failed=bool(self.closed))
+
+
+def test_a_provider_close_that_did_not_finish_refuses_and_still_settles(tmp_path):
+    """codex F2. Red with: `_end` not reading the post-close poll (close() returns the partial text)."""
+    rig = Rig(tmp_path)
+    s = rig.open(stream=ClosePollFails())
+    s.feed(0, PCM_1S)
+    with refused("provider_failed"):
+        s.close()
+    [row] = rig.rows()
+    assert (row.status, row.units) == ("ok", 1)
+    with refused("unknown_session"):
+        rig.registry.get(s.sid, "owner-a")                         # collected all the same
+
+
+def test_a_provider_close_that_raises_refuses_and_still_settles(tmp_path):
+    rig = Rig(tmp_path)
+    s = rig.open(stream=FakeStream(fail_close=True))
+    s.feed(0, PCM_1S)
+    with refused("provider_failed"):
+        s.close()
+    assert rig.rows()[0].status == "ok"
+
+
+def test_an_auto_ended_session_whose_close_failed_refuses_its_owners_close(rig):
+    s = rig.open(stream=ClosePollFails())
+    s.feed(0, PCM_1S)
+    rig.clock.t += ss.IDLE_TIMEOUT_S + 1
+    assert rig.registry.reap() == 1
+    with refused("provider_failed"):
+        s.close()
+
+
+def test_a_clean_close_still_returns_the_text(rig):
+    s = rig.open()
+    s.feed(0, PCM_1S)
+    assert s.close() == "hello world"
+
+
+def _two_ended(tmp_path):
+    """max_sessions=1: A ends (retained), then B ends and evicts A."""
+    rig = Rig(tmp_path, max_sessions=1)
+    a = rig.open()
+    a.feed(0, PCM_1S)
+    rig.clock.t += ss.IDLE_TIMEOUT_S + 1
+    assert rig.registry.reap() == 1
+    return rig, a
+
+
+def test_an_evicted_session_is_not_collected_as_an_empty_success(tmp_path):
+    """codex F3. A's owner got A from the registry; B's end evicts A before A.close() runs. Red with: close() on a
+    dropped session returning '' (a 200 with empty text, the page sends nothing and skips recovery)."""
+    rig, a = _two_ended(tmp_path)
+    b = rig.open()
+    b.feed(0, PCM_1S)
+    rig.clock.t += ss.IDLE_TIMEOUT_S + 1
+    assert rig.registry.reap() == 1                               # B ends; A is evicted
+    with refused("unknown_session"):
+        a.close()
+    assert a.take_audio() == b""
+
+
+def test_an_evicted_session_held_by_a_caller_is_not_cleared_under_it(tmp_path):
+    """codex F3. A caller holds A's lock (a close in flight) while B's end evicts A: A's text and audio are not cleared
+    under it, and are cleared once it lets go. Red with: `_discard` rebinding without the session lock."""
+    rig, a = _two_ended(tmp_path)
+    b = rig.open()
+    b.feed(0, PCM_1S)
+    held, release, seen = threading.Event(), threading.Event(), {}
+
+    def in_flight():
+        with a._lock:
+            held.set()
+            release.wait(5)
+            seen["final"], seen["audio"] = a._final, len(a._buffer)
+
+    t = threading.Thread(target=in_flight)
+    t.start()
+    assert held.wait(5)
+    rig.clock.t += ss.IDLE_TIMEOUT_S + 1
+    assert rig.registry.reap() == 1                               # B ends and evicts A while A is held
+    release.set()
+    t.join(5)
+    assert seen == {"final": "hello world", "audio": len(PCM_1S)}
+    assert a.take_audio() == b""                                  # dropped: nothing is handed out ...
+    assert a._final == "" and len(a._buffer) == 0                 # ... and the next holder clears it on its way out
+
+
+class SlowClose(FakeStream):
+    def __init__(self, gate: threading.Event, **kw) -> None:
+        super().__init__(**kw)
+        self.gate = gate
+
+    def close(self) -> str:
+        self.gate.wait(3.0)
+        return super().close()
+
+
+def test_a_revoke_answers_without_waiting_for_a_slow_provider_close_and_still_settles(tmp_path):
+    """complement F4 (deepseek #1). Red with: end_revoked closing the provider inline (it returns after the 3 s close)."""
+    import time as _time
+    rig = Rig(tmp_path)
+    gate = threading.Event()
+    s = rig.open(stream=SlowClose(gate))
+    s.feed(0, PCM_1S)
+    t0 = _time.monotonic()
+    s.end_revoked()
+    took = _time.monotonic() - t0
+    assert s.closed and s.end_reason == "revoked"
+    assert took < 1.5, took
+    with refused("closed"):
+        s.feed(1, PCM_1S)                                         # ended at once: no more audio goes
+    gate.set()
+    for _ in range(100):
+        if rig.rows()[0].status == "ok":
+            break
+        _time.sleep(0.05)
+    [row] = rig.rows()
+    assert (row.status, row.units) == ("ok", 1)
+    assert rig.streams[0].closed == 1

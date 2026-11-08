@@ -17,7 +17,9 @@ sequenced intake of PCM16 16 kHz mono chunks, a provider-stream object that forw
    (``settle_backlog``): a ledger that cannot record spend stops new spend.
 2. The key never becomes an attribute of anything the page can name. :meth:`StreamRegistry.open` reads it once through
    ``custody.read_key`` (the path ``transcribe`` uses), hands the :class:`~levain.voice.custody.Secret` to the provider
-   factory and drops it; the session holds the provider-stream, not the key.
+   factory and drops it; the session holds the provider-stream, not the key. It does hold the key's RECORD (id and
+   uses, public, read in the same replay as the key: ``Secret.record``), so the revoke recheck asks for that exact
+   record, and a replaced key ends a stream opened with the old one.
 3. A session is addressable only by the owner that opened it, by an unguessable id; a wrong owner and an unknown id get
    the same refusal, so the id space is no oracle. The registry has a hard cap on live sessions; an open in progress
    holds a slot from before the meter is asked until the session is published or refused.
@@ -26,6 +28,9 @@ sequenced intake of PCM16 16 kHz mono chunks, a provider-stream object that forw
    why it ended. Ended sessions hold no live slot; at most ``max_sessions`` of them are kept (the oldest goes first), and
    shutdown drops them all. A dropped session's audio and text are dropped with it. The audio buffer (bounded at the
    ceiling) outlives the end for the stop-time WAV fallback and is handed out once by :meth:`StreamSession.take_audio`.
+   A dropped session hands out nothing more, even to a caller that already held it, and its contents are cleared
+   under its lock, never under a caller mid-read. The owner's close answers ``provider_failed`` (collected, settled)
+   when the provider close did not finish cleanly, so the text it would have given is never taken as final.
 5. Nothing spoken and no key leaves through a log line or an exception: lines carry event names, exception TYPE names
    and seconds only, and every :class:`StreamRefused` is raised outside any ``except`` block, from a frame that holds
    no key and no provider text, so it chains nothing.
@@ -33,7 +38,9 @@ sequenced intake of PCM16 16 kHz mono chunks, a provider-stream object that forw
    stream and gives its reservation back.
 
 Known edge: provider calls (send, poll, close) run under the session's lock, so chunks reach the provider in sequence
-order and the provider object is never used from two threads at once; a slow provider call therefore delays another
+order and the provider object is never used from two threads at once. The one exception is a revoke's close, which runs
+on its own worker after the session was marked ended under the lock, so no other call reaches the provider by then
+(:meth:`StreamSession.end_revoked`). A slow provider call therefore delays another
 call on the SAME session (a mailbox read waits behind a send). Reap (and so every open, which reaps first) only tries
 each session's lock and skips a busy one, which is mid-call and so not idle, so a hung provider call on one session
 never blocks an open. Shutdown does wait for each live session's lock, since it must end every one. Shutdown does not
@@ -50,8 +57,9 @@ import math
 import secrets
 import threading
 import time
+from contextlib import contextmanager
 from dataclasses import dataclass
-from typing import Any, Callable, Protocol
+from typing import Any, Callable, Iterator, Protocol
 
 from levain.voice import custody
 from levain.voice import meter as vmeter
@@ -71,6 +79,7 @@ ENDED_RETAIN_S = 60.0
 MAX_SESSIONS = 4
 MAX_UNSETTLED = 64             # settles waiting for a retry; at this many, new opens are refused until it drains
 OPEN_WAIT_S = 10.0             # how long shutdown waits for opens in progress (on other threads) to end their reservation
+REVOKE_CLOSE_WAIT_S = 0.5      # how long a revoke waits for the provider close before it is answered (the rest runs on)
 SID_BYTES = 24
 
 # Fixed words: the code is the contract, the words are what the route may show. Nothing here carries a value from outside.
@@ -170,8 +179,12 @@ class StreamSession:
     def __init__(self, sid: str, owner: str, provider: str, meter: vmeter.Meter, reservation_id: int,
                  stream: ProviderStream, *, clock: Callable[[], float], idle_timeout: float, max_age: float,
                  on_end: Callable[[str], None], on_collect: Callable[[str], None],
-                 on_unsettled: Callable[[int, int], None]) -> None:
+                 on_unsettled: Callable[[int, int], None],
+                 key_record: tuple[str, frozenset[str]] | None = None) -> None:
         self.sid = sid
+        # (record_id, uses) of the voice key record the key was read for, in the same replay (custody.Secret.record):
+        # public, never the key. The revoke recheck requires THIS record, so a replace ends the stream (L3 4c r1 codex F1)
+        self.key_record = key_record
         self._owner = _owner_bytes(owner) or b""
         self.provider = provider
         self._meter = meter
@@ -195,6 +208,28 @@ class StreamSession:
         self._end_reason = ""
         self._revoke_prev = self._opened
         self._revoke_checked = self._opened       # session time of the last revoke-reach check (the open path ran one)
+        self._close_ok: bool | None = None        # the provider close finished cleanly; None until it has run
+        self._depth = 0                           # how deep the holder of the lock is (it is an RLock)
+        self._dropped = False                     # the registry let go: nothing more is handed out
+        self._discard_pending = False             # dropped while held: the holder clears it on its way out
+
+    @contextmanager
+    def _held(self, blocking: bool = True) -> Iterator[bool]:
+        """The session lock, yielding whether it was taken. The outermost holder clears a session the registry dropped
+        while it held the lock (:meth:`_discard`), on its way out, so nothing is cleared under a caller mid-read."""
+        if not self._lock.acquire(blocking):
+            yield False
+            return
+        self._depth += 1
+        try:
+            yield True
+        finally:
+            self._depth -= 1
+            try:
+                if self._depth == 0 and self._discard_pending:
+                    self._clear()
+            finally:
+                self._lock.release()
 
     # --- ownership --------------------------------------------------------------------------------------------------
     def owned_by(self, owner: object) -> bool:
@@ -218,7 +253,7 @@ class StreamSession:
         """True (and the clock is restarted) when this live session has gone ``interval`` seconds of session time without a
         revoke-reach check. The route calls it once per chunk and does the check only when it says True, so the authority
         log is replayed on a cadence, not per chunk."""
-        with self._lock:
+        with self._held():
             if self._closed:
                 return False
             now = self._clock()
@@ -230,14 +265,36 @@ class StreamSession:
 
     def revoke_check_failed(self) -> None:
         """The check ``revoke_check_due`` announced raised before it finished: put the clock back so the next chunk looks again."""
-        with self._lock:
+        with self._held():
             self._revoke_checked = self._revoke_prev
 
-    def end_revoked(self) -> None:
-        """End the session because the key or its grant was revoked: the provider stream is closed and the meter settled
-        through the one normal end path. Idempotent. ``revoked`` is an end reason only: the chunk that found the revoke is
-        answered with the open path's own fixed words (:func:`levain.cockpit.voice.stream_chunk`), so it has none here."""
-        self._end_now("revoked")
+    def end_revoked(self, wait: float = REVOKE_CLOSE_WAIT_S) -> None:
+        """End the session because the key or its grant was revoked. Idempotent. The session is ended AT ONCE under its
+        lock (no later chunk or read reaches the provider), and the provider close plus the meter settle run on a
+        short-lived worker that this call waits for at most ``wait`` seconds: a provider close can take ~10 s (its
+        drain), and the chunk that found the revoke must be answered before the page's chunk deadline, or the page
+        never learns it was a revoke (L3 4c r1, deepseek #1). The worker is not a daemon, so the settle is not lost to an
+        exiting process; it holds the live slot until it has settled (the socket is still closing). ``revoked`` is an
+        end reason only: the chunk that found the revoke is answered with the open path's own fixed words
+        (:func:`levain.cockpit.voice.stream_chunk`), so it has none here."""
+        with self._held():
+            if self._closed:
+                return
+            self._mark_ended("revoked")
+        # daemon set explicitly: a thread inherits it from its creator, whatever kind of thread called this
+        worker = threading.Thread(target=self._finish_end, args=("revoked", True), name="levain-voice-revoke-close",
+                                  daemon=False)
+        started = False
+        try:
+            worker.start()
+            started = True
+        except Exception as exc:     # noqa: BLE001 - no thread to be had: close here rather than leave it open
+            _log.warning("voice stream: the revoke close could not start a worker (%s); closing inline",
+                         type(exc).__name__)
+        if started:
+            worker.join(wait)
+        else:
+            self._finish_end("revoked", True)
 
     def _limit(self, now: float) -> str:
         """The time limit this session has passed at ``now``, else ''."""
@@ -251,7 +308,7 @@ class StreamSession:
     def feed(self, seq: int, pcm: bytes) -> StreamUpdate:
         """Accept chunk ``seq`` (strictly 0, 1, 2, ...). A gap, a repeat or a replay refuses and ends nothing but the
         chunk; a limit breach (rate, ceiling, age, idle, provider failure) ends the session, settling the meter."""
-        with self._lock:
+        with self._held():
             code, update = self._feed(seq, pcm)
         if update is None:
             raise StreamRefused(code)
@@ -320,24 +377,29 @@ class StreamSession:
 
     def mailbox(self) -> StreamUpdate:
         """The newest partial and the final text; once ended, the final text and the reason it ended."""
-        with self._lock:
-            if self._closed:
+        with self._held():
+            if self._dropped:            # the registry let go: what it held is no longer handed out
+                code, update = "unknown_session", None
+            elif self._closed:
                 return StreamUpdate(partial="", final=self._final, ended=self._end_reason)
-            code = self._limit(self._clock())
-            if code:
-                self._end(code)
-                update = None
             else:
-                update = self._poll()
-                code = "provider_failed"
+                code = self._limit(self._clock())
+                if code:
+                    self._end(code)
+                    update = None
+                else:
+                    update = self._poll()
+                    code = "provider_failed"
         if update is None:
             raise StreamRefused(code)
         return update
 
     def take_audio(self) -> bytes:
         """The audio accepted so far (bounded at the ceiling), for the stop-time fallback. While live it is a copy;
-        after the end it is handed out once and then dropped."""
-        with self._lock:
+        after the end it is handed out once and then dropped (and never after the registry let go of the session)."""
+        with self._held():
+            if self._dropped:
+                return b""
             data = bytes(self._buffer)
             if self._closed:
                 self._buffer = bytearray()
@@ -345,59 +407,91 @@ class StreamSession:
 
     def expired(self) -> bool:
         """True when the session is live and past its idle or age limit (a read; :meth:`StreamRegistry.reap` ends)."""
-        with self._lock:
+        with self._held():
             return not self._closed and bool(self._limit(self._clock()))
 
     # --- end --------------------------------------------------------------------------------------------------------
     def close(self) -> str:
         """End the session if it is live, return the final text (empty when the provider gave none), and stop it
-        being addressable through the registry (the owner has collected it). Idempotent."""
-        with self._lock:
-            if not self._closed:
-                self._end("closed", retain=False)     # collected next, so never counted among the retained ended
-            final = self._final
-        self._on_collect(self.sid)
+        being addressable through the registry (the owner has collected it). Idempotent.
+
+        Raises ``provider_failed`` (the session is still collected and its meter settled) when the provider close did
+        not finish cleanly: ``close()`` raised, or the adapter reports failed after it (OpenAI's final commit timed
+        out, Deepgram sent no closing metadata), or it is still running (a revoke's worker). The text is then partial,
+        and a non-2xx is what sends the page to its own recording instead (L3 4c r1, codex F2). Raises
+        ``unknown_session`` when the registry already let go of the session (its text is gone, never an empty
+        success; codex F3)."""
+        with self._held():
+            if self._dropped:
+                code, final = "unknown_session", ""
+            else:
+                if not self._closed:
+                    self._end("closed", retain=False)     # collected next, so never counted among the retained ended
+                final = self._final
+                code = "" if self._close_ok is True else "provider_failed"
+        if code != "unknown_session":
+            self._on_collect(self.sid)
+        if code:
+            raise StreamRefused(code)
         return final
 
     def _end_if_expired(self) -> bool:
         """End with the limit's reason if, checked under the lock, the session is live and past a limit. A session
         whose lock is held is mid-call, so not idle: it is skipped, never waited for."""
-        if not self._lock.acquire(blocking=False):
-            return False
-        try:
-            if self._closed:
+        with self._held(blocking=False) as got:
+            if not got or self._closed:
                 return False
             code = self._limit(self._clock())
             if not code:
                 return False
             self._end(code)
             return True
-        finally:
-            self._lock.release()
 
     def _end_now(self, reason: str) -> None:
-        with self._lock:
+        with self._held():
             self._end(reason)
 
     def _end(self, reason: str, *, retain: bool = True) -> None:
-        """Close the provider stream, then settle the meter in a ``finally``: every exit path ends the reservation,
-        once. ``retain`` False (the owner is collecting it) skips the registry's retained-ended list. Caller holds
-        the lock."""
+        """End now, close the provider stream, then settle the meter in a ``finally``: every exit path ends the
+        reservation, once. ``retain`` False (the owner is collecting it) skips the registry's retained-ended list.
+        Caller holds the lock."""
         if self._closed:
             return
+        self._mark_ended(reason)
+        self._finish_end(reason, retain)
+
+    def _mark_ended(self, reason: str) -> None:
+        """The session is over from here: no chunk, read or reap reaches the provider again. Caller holds the lock."""
         self._closed = True
         self._end_reason = reason
+        self._partial = ""
+
+    def _finish_end(self, reason: str, retain: bool) -> None:
+        """Close the provider stream (recording whether it finished cleanly), then settle in a ``finally``. Run under
+        the lock by :meth:`_end`, or by :meth:`end_revoked`'s worker without it: once :meth:`_mark_ended` has run no
+        other call uses the provider object, so it is still used from one thread at a time."""
+        ok = False
         try:
             failed = ""
             try:
                 text = self._stream.close()
                 if isinstance(text, str) and text:
                     self._final = text
+                # both adapters report an unfinished close (a final commit that timed out, no closing metadata, a
+                # reader that failed while draining) through poll().failed after close() returned
+                up = self._stream.poll()
+                if not _valid_update(up):
+                    failed = "malformed"
+                elif up.failed:
+                    failed = "reported"
+                else:
+                    ok = True
             except Exception as exc:     # noqa: BLE001 - a provider that fails to close never blocks the settle
                 failed = type(exc).__name__
             if failed:
                 _log.warning("voice stream: the provider stream failed on close (%s)", failed)
         finally:
+            self._close_ok = ok
             self._partial = ""
             self._settle()
             if retain:
@@ -417,8 +511,21 @@ class StreamSession:
         self._on_unsettled(self._reservation, seconds)
 
     def _discard(self) -> None:
-        """Drop the audio and the text (the registry let go of an ended session). No lock: these are single attribute
-        rebinds, and taking this session's lock here could deadlock against another session ending."""
+        """The registry let go of this session: drop its audio and text. It is marked dropped first, so nothing more is
+        handed out (close and mailbox refuse ``unknown_session``, take_audio gives nothing). The contents are cleared
+        only by whoever holds the lock, and never under a holder: the lock is only TRIED here (another session's end
+        calls this while holding its own lock, so waiting here could deadlock two ends), and a holder (a close or read
+        in flight, which may still return what it read) clears it on its way out (:meth:`_held`). Known edge: a holder
+        that let go between its check and this try leaves the contents to the garbage collector; they are never handed
+        out."""
+        self._dropped = True
+        self._discard_pending = True
+        with self._held(blocking=False):
+            pass          # taken: its exit clears it, unless a holder further up this thread's stack still holds it
+
+    def _clear(self) -> None:
+        """Caller holds the lock."""
+        self._discard_pending = False
         self._buffer = bytearray()
         self._final = ""
         self._partial = ""
@@ -517,6 +624,8 @@ class StreamRegistry:
                 _log.warning("voice stream: the key reader failed (%s); nothing was sent", type(exc).__name__)
             if not isinstance(secret, custody.Secret):
                 return None, "key_unavailable", key_code or "unexpected"
+            # the record the key was read for, from the same replay: the session is bound to it (public, not the key)
+            key_record = secret.record
 
             failed = ""
             try:
@@ -538,7 +647,8 @@ class StreamRegistry:
                 sid = secrets.token_urlsafe(SID_BYTES)
                 session = StreamSession(sid, owner, provider, self._meter, reservation, stream, clock=self._clock,
                                         idle_timeout=self._idle, max_age=self._max_age, on_end=self._ended,
-                                        on_collect=self._collect, on_unsettled=self._add_unsettled)
+                                        on_collect=self._collect, on_unsettled=self._add_unsettled,
+                                        key_record=key_record)
             except Exception as exc:     # noqa: BLE001
                 failed = type(exc).__name__
             if failed:

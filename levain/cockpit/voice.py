@@ -46,7 +46,7 @@ from datetime import date, datetime, timezone
 from pathlib import Path
 from typing import Any, NamedTuple
 
-from levain.authority import voice_key_for
+from levain.authority import voice_key_for, voice_key_record
 from levain.cockpit import card_script
 from levain.cockpit import room as cockpit_room
 from levain.voice import custody
@@ -778,17 +778,22 @@ def stream_chunk_precheck(registry: stream_session.StreamRegistry, query: str, o
 STREAM_REVOKE_RECHECK_S = 2.0
 
 
-def _stream_revoked(provider: str, data_root: Path | str, revoke_queue: Path | str | None) -> Answer | None:
+def _stream_revoked(provider: str, data_root: Path | str, revoke_queue: Path | str | None, *,
+                    bound: tuple[str, frozenset[str]] | None) -> Answer | None:
     """None while the session may go on; else the refusal, marked ``revoked`` so the page stops for good. The checks are
-    the open path's, minus the secret: the voice key record for ``provider`` still lists ``stt`` (a revoked key or
-    grant is gone from a fresh replay; the log failing to replay is a refusal too, as at open), and some revoke still
+    the open path's, minus the secret, against the EXACT record the session's key was read for (``bound``, the
+    session's ``key_record``: its id and uses, from the open's own replay): a fresh replay still holds that record id as
+    this provider's voice key, with the same uses and ``stt`` among them (a revoke removes it; a replace is a new id, so
+    a provider socket authenticated with the old key never passes as "some key is set", L3 4c r1 codex F1; a session
+    with no bound record fails closed; the log failing to replay is a refusal too, as at open), and some revoke still
     reaches it (:func:`revoke_refusal`). The key itself is not read."""
     key_code = ""
     try:
-        record = voice_key_for(custody.authority_for(data_root)().policy.grants, provider)
-        if record is None:
+        grants = custody.authority_for(data_root)().policy.grants
+        record = grants.get(bound[0]) if bound is not None else None
+        if record is None or not voice_key_record(record) or record.get("provider") != provider:
             key_code = "not_set"
-        elif "stt" not in record["uses"]:
+        elif frozenset(record["uses"]) != bound[1] or "stt" not in bound[1]:
             key_code = "use_not_granted"
     except Exception as exc:     # noqa: BLE001 - a log that could not be replayed fails closed, in its own words
         _log.warning("voice stream: the key record could not be checked (%s); the dictation ends", type(exc).__name__)
@@ -822,7 +827,7 @@ def stream_chunk(registry: stream_session.StreamRegistry, query: str, owner: str
         session = registry.get(sid, owner)
         if session.revoke_check_due(STREAM_REVOKE_RECHECK_S):
             try:
-                stopped = _stream_revoked(session.provider, data_root, revoke_queue)
+                stopped = _stream_revoked(session.provider, data_root, revoke_queue, bound=session.key_record)
             except BaseException:
                 session.revoke_check_failed()
                 raise
@@ -838,7 +843,9 @@ def stream_chunk(registry: stream_session.StreamRegistry, query: str, owner: str
 
 
 def stream_close(registry: stream_session.StreamRegistry, query: str, owner: str) -> Answer:
-    """``POST /cockpit/voice/stream/close?sid=``: ``{"text": ...}``, the session's final text; it is collected."""
+    """``POST /cockpit/voice/stream/close?sid=``: ``{"text": ...}``, the session's final text; it is collected. A
+    provider close that did not finish cleanly is a 502 ``provider_failed`` (still collected, still settled), so the
+    page recovers from its own recording instead of taking partial text as final."""
     got = _stream_query(query, ("sid",))
     sid = _stream_sid(got) if got is not None else None
     if got is None or sid is None:

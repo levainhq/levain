@@ -819,11 +819,98 @@ def test_one_revoke_check_costs_little_enough_for_the_cadence(rig):
     """MEASURED: one `_stream_revoked` (two fresh log replays) on the rig's signed log. The cadence is 2 s of session
     time; a check must be a small fraction of that or a chunk holds its connection. The bound is 0.5 s (the measured
     cost is in RETURN_micrevoke.md). Red with: a check slower than that."""
-    keyed(rig)
-    cockpit_voice._stream_revoked("deepgram", rig.data_root, rig.qdir)         # warm
+    record = rig.add_key(provider="deepgram", uses=("stt", "tts"), source="levain-voice-deepgram-s3")
+    bound = (record["id"], frozenset(record["uses"]))          # the session's key_record (L3 4c r1 F1)
+    cockpit_voice._stream_revoked("deepgram", rig.data_root, rig.qdir, bound=bound)         # warm
     t0 = time.perf_counter()
     for _ in range(5):
-        assert cockpit_voice._stream_revoked("deepgram", rig.data_root, rig.qdir) is None
+        assert cockpit_voice._stream_revoked("deepgram", rig.data_root, rig.qdir, bound=bound) is None
     per = (time.perf_counter() - t0) / 5
     print(f"revoke check: {per * 1000:.1f} ms")
     assert per < 0.5 and cockpit_voice.STREAM_REVOKE_RECHECK_S + 0.25 < 3.0
+
+
+# --- L3 batch4c r1 fixes: the exact key binding (codex F1) and a close that did not finish (codex F2) ----------------------
+
+def replace_key(rig, provider="deepgram", uses=("stt", "tts"), source="levain-voice-deepgram-s3-new") -> dict:
+    from levain.chat_egress.key_setup import KeychainItems
+    from levain.chat_egress.keys import KeychainStore
+    from levain.voice import custody as voice_custody
+    record, _warning = voice_custody.add_key(
+        rig.data_root, provider=provider, uses=uses, account="levain-voice", value=voice_custody.Secret(VALUE),
+        source=source, confirm=lambda preview: True, writer=voice_custody.SecurityStdinWriter(rig.sec.path),
+        items=KeychainItems(rig.sec.path), store=KeychainStore(rig.sec.path), replace=True, **rig.ck.kw())
+    return record
+
+
+def test_a_key_replaced_mid_dictation_ends_the_stream_opened_with_the_old_one(rig):
+    """The stream opened with record A; A is replaced by B (one `loosen`: A gone, B live for the same provider and
+    uses). The next due check must end the session: the provider socket is still authenticated with A's revoked key.
+    Red with: `_stream_revoked` looking up the provider's live record (`voice_key_for`) instead of the record id bound
+    at open (chunk 200, the stream keeps going)."""
+    old = rig.add_key(provider="deepgram", uses=("stt", "tts"), source="levain-voice-deepgram-s3")
+    with served(rig) as (port, httpd):
+        factory = fx(httpd)
+        clock = stream_with_clock(httpd)
+        sid = open_session(port)[1]["sid"]
+        clock.t += 0.25
+        assert chunk(port, sid, 0)[0] == 200
+        new = replace_key(rig)
+        assert new["id"] != old["id"]
+        clock.t += cockpit_voice.STREAM_REVOKE_RECHECK_S
+        status, _h, body = chunk(port, sid, 1)
+        got = js(body)
+        assert (status, got.get("error"), got.get("revoked")) == (409, "no_key", True), got
+        assert len(factory.streams[0].sent) == 1 and factory.streams[0].closed == 1
+        no_leak(body.decode())
+    assert "reserved" not in statuses(rig)
+
+
+def test_a_key_whose_uses_changed_mid_dictation_ends_the_stream(rig):
+    """Same record id is the binding AND its uses set: a replace that keeps `stt` but changes the set still ends it
+    (a new record id). Red with: the bound uses not compared."""
+    rig.add_key(provider="deepgram", uses=("stt", "tts"), source="levain-voice-deepgram-s3")
+    with served(rig) as (port, httpd):
+        fx(httpd)
+        clock = stream_with_clock(httpd)
+        sid = open_session(port)[1]["sid"]
+        replace_key(rig, uses=("stt",))
+        clock.t += cockpit_voice.STREAM_REVOKE_RECHECK_S + 0.01
+        status, _h, body = chunk(port, sid, 0)
+        assert (status, js(body).get("revoked")) == (409, True), body
+
+
+class CloseFailsStream(FakeStream):
+    """A provider whose close returns words but did not finish: the final commit timed out / no closing metadata, so the
+    adapter's `poll().failed` is true after close (as both real adapters report it)."""
+
+    def __init__(self, secret_value: str) -> None:
+        super().__init__(secret_value)
+        self.failed_after_close = True
+
+    def poll(self) -> stream_session.StreamUpdate:
+        up = super().poll()
+        return stream_session.StreamUpdate(partial=up.partial, final=up.final,
+                                           failed=bool(self.closed) and self.failed_after_close)
+
+
+def test_a_close_the_provider_did_not_finish_is_a_non_2xx_so_the_page_recovers(rig):
+    """Red with: `_end` ignoring the adapter's post-close failure (close answers 200 with the partial text, the page
+    skips its WAV recovery). The meter is settled all the same."""
+    keyed(rig)
+    with served(rig) as (port, httpd):
+        streams = []
+
+        def factory(secret):
+            s = CloseFailsStream(secret.reveal())
+            streams.append(s)
+            return s
+        httpd.voice_stream_factory = factory
+        sid = open_session(port)[1]["sid"]
+        assert chunk(port, sid, 0)[0] == 200
+        status, _h, body = post(port, f"{CLOSE}?sid={sid}")
+        assert (status, js(body)["error"]) == (502, "provider_failed"), body
+        assert "text" not in js(body)
+        assert streams[0].closed == 1
+        assert statuses(rig) == ["ok"] and rig.rows()[0].units == 1
+        assert post(port, f"{CLOSE}?sid={sid}")[0] == 404                 # collected all the same
