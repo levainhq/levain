@@ -1498,3 +1498,36 @@ class TestListPagePins:
             if r["facets"]["surface"] in ("band", "board"):
                 assert r["actions"] == [] if "actions" in r else True, r["id"]
         assert panel["note"]
+
+
+class TestListPagePinsRound2:
+    """Review findings (levain 64 L3 round 1) pinned as strings; each fails against the pre-fix source."""
+    WEB = Path(__file__).resolve().parent.parent / "levain" / "templates" / "web"
+
+    def _js(self, name: str) -> str:
+        return (self.WEB / name).read_text()
+
+    def test_the_list_is_marked_by_the_panels_intake_action_never_by_its_rows(self) -> None:
+        view, core = self._js("cockpit_view.js"), self._js("dashboard_core.js")
+        assert 'a.verb === "list_intake"' in view and "view.tray_is_list = true" in view
+        assert "view.tray_is_list === true" in core
+        assert "some((s) => s && s.surface)" not in core                      # the old row-content inference is gone
+
+    def test_a_band_or_board_row_keeps_its_title_and_shows_the_body_beside_it(self) -> None:
+        view, core = self._js("cockpit_view.js"), self._js("dashboard_core.js")
+        assert "row.title || row.body" in view and "support:" in view
+        assert 'el("span", "muted list-support", s.support)' in core
+
+    def test_the_surface_filter_reaches_the_held_rows(self) -> None:
+        core = self._js("dashboard_core.js")
+        assert "held.filter(inSurface)" in core and core.count("held.filter(inSurface)") == 2
+
+    def test_a_write_in_flight_never_clobbers_the_draft_typed_since(self) -> None:
+        core = self._js("dashboard_core.js")
+        assert "if (intakeKept.draft === line) intakeKept.draft = \"\"" in core
+        assert "if (!intakeKept.draft) intakeKept.draft = line" in core
+
+    def test_the_surface_and_pointer_chips_are_styled_as_the_meta_cells_children(self) -> None:
+        css = self._js("dashboard.css")
+        assert ".row > .list-meta > .list-surface" in css and ".row > .list-meta > .list-pointer" in css
+        assert ".row > .list-surface" not in css.replace(".row > .list-meta > .list-surface", "")

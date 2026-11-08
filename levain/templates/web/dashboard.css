@@ -3643,9 +3643,9 @@ a.nc-pick.is-rec:hover { border-color: var(--text); }
 .list-receipt:empty { display: none; }
 body.ke .list-receipt { grid-column: auto; grid-row: auto; font-size: var(--fs-meta); overflow-wrap: anywhere; }
 body.ke .tray-dump.list-intake .edit-msg:empty { display: none; }
-[data-ck-panel="tray"] .row > .list-surface { text-transform: none; }
+[data-ck-panel="tray"] .row > .list-meta > .list-surface { text-transform: none; }
 [data-ck-panel="tray"] .row[data-surface="band"], [data-ck-panel="tray"] .row[data-surface="board"] { opacity: .88; }
-[data-ck-panel="tray"] .row > .list-pointer { font-style: italic; }
+[data-ck-panel="tray"] .row > .list-meta > .list-pointer { font-style: italic; }
 @media (max-width: 720px) {
   .list-intake-input { font-size: var(--fs-title); }   /* 16px+: iOS Safari does not zoom the page on focus */
   .list-surfaces .rc-chip { min-height: var(--hit-min); padding-inline: var(--sp-4); }

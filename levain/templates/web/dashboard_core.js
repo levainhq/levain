@@ -2076,6 +2076,7 @@
     if (host !== row) row.appendChild(host);
     if (foreign) {
       // read-only by construction: band rows point at the Decisions panel, board rows at the agents' queue; no verbs below
+      if (s.support) host.appendChild(el("span", "muted list-support", s.support));
       if (s.list_pointer) host.appendChild(tagEl("muted list-pointer", s.list_pointer));
       if (s.surface === "board") {
         if (s.repo) host.appendChild(tagEl("muted", s.repo));
@@ -2152,6 +2153,7 @@
       const picked = opts && opts.pick ? opts.pick(all) : all;
       const base = opts && opts.extra ? picked.concat(opts.extra()) : picked;   // rows listed apart, filtered with the rest
       const hit = (s) => String(s.text == null ? "" : s.text).toLowerCase().includes(q) ||
+                         String(s.support || "").toLowerCase().includes(q) ||
                          String(s.id || "").toLowerCase().includes(q);
       const rows = q ? base.filter(hit) : base;
       results.replaceChildren();
@@ -2193,12 +2195,13 @@
     const viewOf = () => (views.some((v) => v.id === trayView) ? trayView : "");
     const heldLine = held.length && view.tray_held_line && typeof view.tray_held_line === "object" ? view.tray_held_line : null;
     // the List: rows that carry a `surface` get the surface filter (the kernel names the stores; the page only filters by them)
-    const isList = entry.kind === "tray" && (list || []).some((s) => s && s.surface);
+    const isList = entry.kind === "tray" && view.tray_is_list === true;   // the panel offers list_intake: a marker, never the rows' contents
     const listNow = () => (isList && (list || []).some((s) => s.surface === listSurface) ? listSurface : "");
+    const inSurface = (s) => !listNow() || s.surface === listNow();
     const opts = views.length || heldLine || isList ? {
       empty: emptyMsg,
-      extra: () => (heldLine && trayHeldShown ? held : []),
-      unlisted: () => (heldLine && !trayHeldShown ? held : []),
+      extra: () => (heldLine && trayHeldShown ? held.filter(inSurface) : []),
+      unlisted: () => (heldLine && !trayHeldShown ? held.filter(inSurface) : []),
       hintShow: (note, n) => {
         note.appendChild(document.createTextNode(" — " + n + (n === 1 ? " held row matches — " : " held rows match — ")));
         const go = el("button", "held-toggle");
@@ -2342,7 +2345,7 @@
     // writable. A read-only port (mesh) shows the List but offers no box (NO-THEATER). A panel that sends no `surface` on its
     // rows is the old Tray and keeps its dump box.
     if (isVerbPanel(entry)) {
-      const isList = (view.tray || []).some((s) => s && s.surface);
+      const isList = view.tray_is_list === true;
       mountCaptureBox(p, isList ? buildListIntake() : buildTrayDump(view.entity_name || "the assistant"));
     }
     return p;
@@ -2418,13 +2421,13 @@
         // the server's sentence, verbatim; a state it did not word still says so
         const text = typeof d.receipt_line === "string" && d.receipt_line ? d.receipt_line
           : d.state === "WAITING" ? "waiting for your signature" : "added";
-        intakeKept.draft = "";
+        if (intakeKept.draft === line) intakeKept.draft = "";   // what he typed since stays his
         intakeKept.receipt = { text, cls: d.state === "WAITING" || d.state === "applying" ? "preview" : "ok" };
         // the page was re-read inside the write: the box on screen is a new one holding the sent line, so clear every box
         for (const n of document.querySelectorAll(".list-intake-input")) if (n.value.trim() === line) n.value = "";
       } else {
         // the page was already re-read for some refusals (stale, not_built): the unsent line is kept in the new box
-        intakeKept.draft = line;
+        if (!intakeKept.draft) intakeKept.draft = line;   // keep what he has typed since; restore the unsent line only into an empty box
         intakeKept.receipt = { text: (res && (res.detail || res.message || res.error)) || "failed", cls: "err" };
       }
       go.disabled = false;
