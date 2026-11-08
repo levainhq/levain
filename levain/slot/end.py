@@ -2686,7 +2686,7 @@ class Reserve:
 
     def refill(self, free_bytes: Callable[[], int], *, floor: int = V5_FLOOR_BYTES) -> bool:
         """Back to ``size`` with written zeros when free space is above ``floor``; returns whether it
-        is full."""
+        is full. Each write is capped at ``free_bytes() - floor``, so a refill never crosses the floor."""
         if self.current() >= self.size:
             return True
         if free_bytes() <= floor:
@@ -2700,7 +2700,10 @@ class Reserve:
             zeros = bytes(_CHUNK)
             try:
                 while cur < self.size:
-                    n = min(_CHUNK, self.size - cur)
+                    # never write past the floor: a refill that starves the host would make the next pass BRAKE
+                    n = min(_CHUNK, self.size - cur, free_bytes() - floor)
+                    if n <= 0:
+                        break
                     write_all(fd, zeros[:n])
                     cur += n
             except OSError as e:

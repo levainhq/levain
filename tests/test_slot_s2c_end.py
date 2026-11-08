@@ -1021,6 +1021,24 @@ def test_keep_shape_check(tmp_path):
 # --- the reserve -----------------------------------------------------------------------------------
 
 
+def test_reserve_refill_never_crosses_the_floor(tmp_path, monkeypatch):
+    """5c-1: free space just above the floor must stay at or above it; the refill caps each write at the headroom."""
+    floor = 8 << 30
+    mib = 1 << 20
+    free = {"n": floor + mib + mib // 2}                  # 1.5 MiB of headroom over the floor
+    real = end_mod.write_all
+
+    def spend(fd, data):
+        real(fd, data)
+        free["n"] -= len(data)
+    monkeypatch.setattr(end_mod, "write_all", spend)
+    r = Reserve(tmp_path / "reserve", size=4 * mib)
+    assert r.refill(lambda: free["n"], floor=floor) is False
+    assert free["n"] >= floor and r.current() == mib + mib // 2
+
+
+
+
 def test_reserve_releases_on_enospc(tmp_path, world, monkeypatch):
     r = Reserve(tmp_path / "reserve", size=8 * 1024)
     assert r.refill(lambda: 10 << 30) is True
