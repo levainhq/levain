@@ -88,11 +88,21 @@ class KeychainWriteFailed(KeyError_):
 
 class Secret:
     """A key value in transit. Its repr, str and pickle are closed, so a log line, a traceback's locals dump or an
-    f-string cannot carry it; the one way out is :meth:`reveal`, called by a writer and a comparison only."""
-    __slots__ = ("_value",)
+    f-string cannot carry it; the one way out is :meth:`reveal`, called by a writer and a comparison only.
 
-    def __init__(self, value: str) -> None:
+    ``record`` is public, never secret: ``(record_id, uses)`` of the voice key record the value was read for, set by
+    :func:`read_key` from the SAME replay that named the item it read (None for a value not read through it). A holder
+    that outlives the read (a live dictation stream) binds to that exact record, so a replace (a new record id for the
+    same provider) or a change of uses ends it instead of passing as "a key is still set"."""
+    __slots__ = ("_value", "_record")
+
+    def __init__(self, value: str, record: tuple[str, frozenset[str]] | None = None) -> None:
         object.__setattr__(self, "_value", value)
+        object.__setattr__(self, "_record", record)
+
+    @property
+    def record(self) -> tuple[str, frozenset[str]] | None:
+        return self._record
 
     def __setattr__(self, name: str, value: object) -> None:
         raise AttributeError("a Secret does not change")
@@ -192,11 +202,12 @@ def default_source(provider: str, record_id: str) -> str:
     return f"levain-voice-{provider}-{record_id}"
 
 
-def _read_item(store: Any, source: str, account: str) -> Secret | None:
+def _read_item(store: Any, source: str, account: str,
+               record: tuple[str, frozenset[str]] | None = None) -> Secret | None:
     """The item's value, wrapped before any name holds it, or None. Nothing escapes from here: a store's exception is
     dropped inside the handler, so no raise of the caller's carries it (or its frames) as ``__context__``."""
     try:
-        return Secret(store.read(source, account))
+        return Secret(store.read(source, account), record)
     except Exception:                       # noqa: BLE001 - a store's own words may carry anything
         return None
 
@@ -209,7 +220,8 @@ def read_key(provider: str, use: str, *, authority: AuthoritySource, store: Any 
     verifies on every call; any other callable, a subclass included, is a TypeError, so no caller can hand in a kept
     snapshot), finds the provider's one voice key, checks ``use`` against its ``uses`` and only then reads the item it
     names from ``store`` (default: the login keychain through :class:`KeychainStore`). Nothing is held between
-    calls, so a revoke stops the next read and a record that is gone reads nothing."""
+    calls, so a revoke stops the next read and a record that is gone reads nothing. The Secret carries the record it
+    was read for (:attr:`Secret.record`: id and uses, from this same replay)."""
     if type(authority) is not AuthoritySource:
         raise TypeError(f"read_key takes an AuthoritySource, not {type(authority).__name__}")
     try:
@@ -222,7 +234,7 @@ def read_key(provider: str, use: str, *, authority: AuthoritySource, store: Any 
     if use not in record["uses"]:
         raise VoiceKeyUnavailable("use_not_granted", f"the {provider} key is not set for {use}")
     keychain = KeychainStore(checked_security()) if store is None else store
-    held = _read_item(keychain, record["source"], record["account"])
+    held = _read_item(keychain, record["source"], record["account"], (record["id"], frozenset(record["uses"])))
     if held is None:
         raise VoiceKeyUnavailable("keychain_unreadable", "the key could not be read from the keychain")
     if not held.well_formed():
