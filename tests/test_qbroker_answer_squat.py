@@ -157,3 +157,59 @@ def test_a_name_retaken_after_every_move_ends_in_a_refusal_not_a_loop(L, broker,
         operator.write_answer(L / "queue", victim, payload, sig, rbase.snapshot(L), now=LATER)
     assert (answers / f"{victim}.json").read_bytes() == b"again"
     assert len([p for p in answers.iterdir() if p.name.startswith(".quarantine-")]) == operator._SQUAT_TRIES
+
+
+# --- prel3fix r1 F1/F2: the quarantine file is the squatter's to delete, and a parked signed answer is never silent ---
+
+def test_a_quarantine_file_deleted_after_the_move_leaves_the_name_free_for_the_signed_answer(L, broker, keys, answers,
+                                                                                            monkeypatch):
+    victim = filed(broker, cap="cap-a2")
+    squat(L, keys, answers, victim, "junk")
+    real = os.rename
+
+    def then_deleted(src, dst):
+        real(src, dst)
+        if str(src).endswith(f"{victim}.json"):
+            os.unlink(dst)                               # the member removes the file it caused to exist
+
+    monkeypatch.setattr(operator.os, "rename", then_deleted)
+    payload, sig = rbase.signed(L, victim, keys["operator"])
+    path = operator.write_answer(L / "queue", victim, payload, sig, rbase.snapshot(L), now=LATER)
+    assert path == answers / f"{victim}.json"
+    assert sorted(p.name for p in answers.iterdir()) == [f"{victim}.json"]
+    assert ask(broker, victim, cap="cap-a2")["decision"] == "allow"
+
+
+def test_a_swapped_signed_answer_that_vanishes_before_it_is_linked_back_frees_the_name(L, broker, keys, answers,
+                                                                                      monkeypatch):
+    rid = filed(broker)
+    write_answer(L, rid, keys["operator"], decision="deny")
+    real_judge, real_link, calls = operator._signed_answer, os.link, []
+
+    def stale_once(row, path, *a):
+        calls.append(path)
+        return (False, (0, 0)) if len(calls) == 1 else real_judge(row, path, *a)
+
+    def vanished(src, dst, **kw):
+        if ".quarantine-" in str(src):
+            os.unlink(src)
+        return real_link(src, dst, **kw)
+
+    monkeypatch.setattr(operator, "_signed_answer", stale_once)
+    monkeypatch.setattr(operator.os, "link", vanished)
+    payload, sig = rbase.signed(L, rid, keys["operator"])
+    path = operator.write_answer(L / "queue", rid, payload, sig, rbase.snapshot(L), now=LATER)
+    assert sorted(p.name for p in answers.iterdir()) == [path.name]
+
+
+def test_any_other_os_error_clearing_the_name_is_an_operator_error(L, broker, keys, answers, monkeypatch):
+    victim = filed(broker, cap="cap-a2")
+    squat(L, keys, answers, victim, "junk")
+
+    def denied(src, dst):
+        raise PermissionError(13, "Permission denied")
+
+    monkeypatch.setattr(operator.os, "rename", denied)
+    payload, sig = rbase.signed(L, victim, keys["operator"])
+    with pytest.raises(operator.OperatorError, match="could not be cleared"):
+        operator.write_answer(L / "queue", victim, payload, sig, rbase.snapshot(L), now=LATER)

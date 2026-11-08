@@ -262,7 +262,19 @@ def _clear_squat(store: QueueStore, row: Mapping[str, Any], request_id: str, pat
                  signers: SignersSnapshot | None, now: datetime, ssh_keygen: Path | str | None) -> bool:
     """True when ``path`` holds a signed answer (left in place). Otherwise whatever is there is renamed aside and
     False is returned, for the caller to link its own answer again. Should the thing renamed turn out not to be the
-    thing judged (swapped in between) and be a signed answer, it is linked back, never lost."""
+    thing judged (swapped in between) and be a signed answer, it is linked back, never lost.
+
+    ``answers/`` has no sticky bit, so the member that squatted can delete or rename the quarantine file once it
+    exists: a quarantine file gone is a name cleared, never an error. Any other ``OSError`` is :class:`OperatorError`,
+    the one failure the cockpit and phone writers handle."""
+    try:
+        return _clear_squat_os(store, row, request_id, path, signers, now, ssh_keygen)
+    except OSError as exc:
+        raise OperatorError(f"request {request_id}'s answer name could not be cleared ({exc})") from None
+
+
+def _clear_squat_os(store: QueueStore, row: Mapping[str, Any], request_id: str, path: Path,
+                    signers: SignersSnapshot | None, now: datetime, ssh_keygen: Path | str | None) -> bool:
     try:
         before = os.lstat(path)
     except FileNotFoundError:
@@ -278,12 +290,20 @@ def _clear_squat(store: QueueStore, row: Mapping[str, Any], request_id: str, pat
     except FileNotFoundError:
         return False
     fsync_dir(store.answers)
-    moved = os.lstat(aside)
+    try:
+        moved = os.lstat(aside)
+    except FileNotFoundError:
+        return False
     if (moved.st_dev, moved.st_ino) != judged and _signed_answer(row, aside, signers, now, ssh_keygen)[0]:
         try:
             os.link(aside, path, follow_symlinks=False)
         except FileExistsError:
             return False
-        os.unlink(aside)
+        except FileNotFoundError:
+            return False
+        try:
+            os.unlink(aside)
+        except FileNotFoundError:
+            pass
         fsync_dir(store.answers)
     return False
