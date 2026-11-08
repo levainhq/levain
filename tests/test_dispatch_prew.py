@@ -168,10 +168,20 @@ def test_a_passthrough_verifier_run_records_and_the_contrast_escalates(world):
     assert [r.model["backend_identity"] for r in recs] == ["passthrough:claude"] * 2
     assert {r.model["identity_source"] for r in recs} == {J.PASSTHROUGH_SOURCE}
     assert [r.model["answered"] for r in recs] == ["label-a", "label-b"]
-    assert "route map" in world.contrast(job)
+    assert "only a human can vouch" in world.contrast(job)
 
 
-@pytest.mark.parametrize("over", [{"job_id": "dj-other"}, {"run_index": 5}, {"kind": "planner"}, {"vendor": ""},
+def test_the_contrast_names_a_passthrough_record_as_passthrough_not_as_from_before_f9a(world):
+    """L1 N1: the gate escalates every non-routemap record; the operator-facing reason must say why for THIS record. A
+    passthrough run's backend is the vendor's, so only a human can vouch; it is not a record from before F9a."""
+    job, _ = world.file()
+    job = world.verify_routed(job.id, [(_pt, says("label-a")), (_pt, says("label-b"))], routemap=None)
+    why = world.contrast(job)
+    assert why is not None and "passthrough" in why and "before F9a" not in why, why
+    assert "only a human can vouch" in why
+
+
+@pytest.mark.parametrize("over",[{"job_id": "dj-other"}, {"run_index": 5}, {"kind": "planner"}, {"vendor": ""},
                                   {"model_requested": "other-model"}])
 def test_a_passthrough_ticket_that_is_not_this_runs_is_unresolved(world, over):
     job, _ = world.file()

@@ -735,6 +735,10 @@ def _contrast_problem(records: Sequence[ArtifactRecord], template: ResolvedTempl
             return f"run {r.run}'s recorded verifier kind is {r.verifier.get('kind')!r}, not black-box"
         if r.verifier.get("result") != "pass":
             return f"run {r.run} was not verified (result {r.verifier.get('result')!r})"
+        if r.model.get("identity_source") == "passthrough":
+            # the dispatch job store's passthrough identity source: the reason names it (L1 N1, PRE-W)
+            return (f"run {r.run} is a subscription (passthrough) run: its backend is the vendor's, so only a human "
+                    "can vouch that the runs' backends differ")
         if r.model.get("identity_source") != "routemap":
             return (f"run {r.run}'s backend identity was not read from the gateway's route map (a record from before "
                     "F9a); only a human can vouch that the runs' backends differ")
