@@ -149,9 +149,7 @@ def test_a_band_that_cannot_be_read_is_named_and_the_other_half_still_runs(band,
 
 
 def test_cli_list_shows_the_sign_and_the_waiting_line_and_a_second_list_adds_nothing(band, cq):
-    # a short cwd: the waiting line cuts the SIGN text at 160 chars, cwd first, so a long pytest basetemp (macOS
-    # /private/var/folders/...) pushed the command off the line; the cwd is not what this test is about
-    req = _file(cq, band, cwd="/work/repo")
+    req = _file(cq, band)
     out = io.StringIO()
     assert run_coord(_args(band, "list", all=False, feed=None), out) == 0
     text = out.getvalue()
@@ -161,6 +159,17 @@ def test_cli_list_shows_the_sign_and_the_waiting_line_and_a_second_list_adds_not
     assert run_coord(_args(band, "list", all=False, feed=None), out) == 0
     assert out.getvalue() == text and band.c.rows("SELECT COUNT(*) FROM replies") == n
     assert req.id in [r["ref_id"] for r in _waiting(band)["threads"][band.thread.thread_id]]
+
+
+def test_a_long_cwd_never_pushes_the_command_off_the_waiting_line(band, cq):
+    """The SIGN text is cut at 160 chars on the waiting line; the command is what the operator decides on, so it comes
+    first and the cwd (after it) is what the cut eats."""
+    cmd = "git push origin main"
+    _file(cq, band, cwd="/" + "d" * 149)
+    deliver.deliver(band.store)
+    sign = [ln for ln in deliver.waiting_lines(_waiting(band)) if "SIGN:" in ln]
+    assert len(sign) == 1 and cmd in sign[0], sign
+    assert sign[0].index(cmd) < sign[0].index("(in /ddd"), sign
 
 
 def test_cli_clear_reopen_and_feeds(band):

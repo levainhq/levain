@@ -159,7 +159,7 @@ def deliver(store: CoordStore, *, queue_dir: Path | str | None = None) -> Delive
     for kind, row, thread in todo:
         try:
             if kind == "sign":
-                text = f"{row.agent} asks to run {row.tool_name} in {row.cwd}: {row.display}"[:_TEXT]
+                text = f"{row.agent} asks to run {row.tool_name}: {row.display} (in {row.cwd})"[:_TEXT]
                 reply_id, new = review.push_sign(store, thread, row.id, text, rec=review.NO_REC)
                 out.signs.append((row.id, reply_id, new))
             else:
