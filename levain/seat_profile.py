@@ -23,13 +23,25 @@ from pathlib import Path
 from typing import Any, Mapping, Sequence
 
 from levain import host_guard as hg
+from levain import seat_gh
 from levain.authority import SEAT_EGRESS_KIND, SEAT_LEASE_KIND
 from levain.host_guard import (CC_SEAT_TOOLS, PROTECTED_NAMES, SEAT_SOURCE_ARGS, HostRefusal)
 
 __all__ = ["SeatRefusal", "SeatProfile", "seat_deny_write", "seat_permission_deny", "build_seat_profile",
-           "CANARY_DIRNAME", "FILE_TOOLS", "SEAT_LEASE_KIND"]
+           "CANARY_DIRNAME", "FILE_TOOLS", "SEAT_LEASE_KIND", "GH_SERVER_NAME", "GH_TOOL_ALLOW", "gh_mcp_config",
+           "real_levain_home"]
 
 CANARY_DIRNAME = "levain-seat-canary"
+#: The one MCP server a seat loads (PATHZERO Z2b): it holds the GitHub read tokens host-side and has two fixed verbs.
+GH_SERVER_NAME = "levain_gh"
+GH_TOOL_ALLOW = (f"mcp__{GH_SERVER_NAME}__gh_read", f"mcp__{GH_SERVER_NAME}__git_fetch")
+
+
+def gh_mcp_config(python: str, levain_home: Path | str) -> dict[str, Any]:
+    """The seat's ``--mcp-config``: exactly the ``levain_gh`` stdio server and no other. Its arguments carry the levain
+    home (so it finds the token directory) and no secret; ``-EP`` keeps the PYTHON* variables and the cwd off its path."""
+    return {"mcpServers": {GH_SERVER_NAME: {"type": "stdio", "command": python,
+                                            "args": ["-EP", "-B", "-m", "levain.seat_gh_mcp", "--home", str(levain_home)]}}}
 #: All four file tools are named in every deny, so a later re-admission inherits it. Measured 11-06 on 2.1.319: an
 #: ``Edit(...)`` rule refuses the Write tool and a ``Write(...)`` rule alone did NOT, so the Edit rules carry the deny.
 FILE_TOOLS = ("Edit", "Write", "MultiEdit", "NotebookEdit")
@@ -41,6 +53,13 @@ def _git_rule_path(prefix: str, sub: str) -> str:
     return f"{prefix}/{sub}" if sub in _GIT_DENY_FILES else f"{prefix}/{sub}/**"
 _WALK_CAP = 200_000
 _HOOK_TIMEOUT = 30
+
+
+def real_levain_home(environ: Mapping[str, str]) -> Path:
+    """The levain home ``environ`` names (``$LEVAIN_HOME``, else ``~/.levain``), absolute: the one
+    ``levain seat gh-token set`` writes under. Never a temp directory."""
+    from levain.consent.queue import queue_dir_for
+    return queue_dir_for(environ).parent
 
 
 class SeatRefusal(HostRefusal):
@@ -66,7 +85,8 @@ def _abs_rule(tool: str, path: str) -> str:
     return f"{tool}(//{path.lstrip('/')})"
 
 
-def seat_permission_deny(roots: Sequence[Path], key_dir: Path) -> list[str]:
+def seat_permission_deny(roots: Sequence[Path], key_dir: Path,
+                         gh_dir: Path | Sequence[Path] | None = None) -> list[str]:
     """``permissions.deny``: all four file tools on every protected pattern of every root, and the Read tool on the
     launcher key directory. The first root (the clone, the working directory) also gets the cwd-relative spellings,
     which are the ones measured to fire after symlink resolution. ``.git`` is denied only at the paths that run code or
@@ -90,6 +110,9 @@ def seat_permission_deny(roots: Sequence[Path], key_dir: Path) -> list[str]:
                 rules += [f"{tool}({_git_rule_path('.git', sub)})" for sub in _GIT_DENY]
                 rules += [f"{tool}(.mcp.json)", f"{tool}(*/**/.git)"]
     rules.append(_abs_rule("Read", f"{key_dir}/**"))
+    gh_dirs = [] if gh_dir is None else [gh_dir] if isinstance(gh_dir, (str, os.PathLike)) else list(gh_dir)
+    for d in gh_dirs:                           # the read-token directory (Z2b): one more member of the same deny
+        rules.append(_abs_rule("Read", f"{d}/**"))
     return rules
 
 
@@ -186,7 +209,7 @@ def _contains_agent_config(root: Path, *, git_dir_ok: bool) -> list[str]:
     return found
 
 
-def _roots_problems(clone: Path, return_dir: Path, key_dir: Path) -> list[str]:
+def _roots_problems(clone: Path, return_dir: Path, key_dir: Path, gh_dirs: Sequence[Path] = ()) -> list[str]:
     problems: list[str] = []
     for what, p in (("the clone", clone), ("the RETURN directory", return_dir)):
         if os.path.islink(p) or not p.is_dir():
@@ -196,6 +219,8 @@ def _roots_problems(clone: Path, return_dir: Path, key_dir: Path) -> list[str]:
     for what, p in (("the clone", clone), ("the RETURN directory", return_dir)):
         if hg.is_within(key_dir, p) or hg.is_within(p, key_dir):
             problems.append(f"{what} overlaps the launcher key directory")
+        if any(hg.is_within(g, p) or hg.is_within(p, g) for g in gh_dirs):
+            problems.append(f"{what} overlaps the read-token directory")
         if hg.is_within(p, Path.home() / ".claude"):
             problems.append(f"{what} is inside ~/.claude")
     return problems
@@ -263,6 +288,8 @@ def build_seat_profile(clone: Path, return_dir: Path, *, claude_bin: str, python
     ``allowedDomains`` is the grant's ``allowed_domains`` and the profile carries the lane-branch ``Stop`` /
     ``SessionEnd`` push hook (``cockpit_root`` and ``levain_home`` are what the hook reads, both required); with None
     both are exactly what they were before Z2a (empty domains, no such hook). A grant never reaches a canary profile.
+    A lease launch needs ``levain_home`` with or without a grant (Z2b: the real read-token directory is denied and the
+    ``levain_gh`` server reads it); the canary's server gets a home of its own, and the real directory is denied there too.
     The domains are frozen at launch: a revoke stops the push at once, the network only at the seat's relaunch (the
     KNOWN EDGE at the ``allowedDomains`` line). ``tools`` is the seat's ``--tools`` set (default ``CC_SEAT_TOOLS``; a
     subset when a failed canary named a fallback, PATHZERO Z5)."""
@@ -274,7 +301,17 @@ def build_seat_profile(clone: Path, return_dir: Path, *, claude_bin: str, python
     if not tools or len(set(tools)) != len(tools) or any(t not in CC_SEAT_TOOLS for t in tools):
         problems.append(f"the tool set {tools!r} must be a non-empty subset of the admitted seat tools, with no repeats")
     problems += _egress_problems(clone, lease, egress, cockpit_root, levain_home)
-    problems += _roots_problems(clone, return_dir, key_dir)
+    # The read-token directory (Z2b, L3 z2b r1 HIGH): the REAL one, ``<levain home>/seat_gh`` as ``environ`` names the
+    # levain home, is denied in EVERY profile, with or without an egress grant and in the canary's too: the seat's Bash
+    # runs as the same user and would otherwise read the 0600 token. A lease launch must name the levain home (the MCP
+    # server reads its tokens there); only the canary's lease-free profile points its server at a home of its own.
+    real_home = _real(real_levain_home(environ))
+    if lease is not None and levain_home is None:
+        problems.append("a lease launch needs the levain home (its read-token directory is denied to the seat and the "
+                        "levain_gh server reads it)")
+    gh_home = _real(levain_home) if levain_home is not None else _canary_prefix(environ) / "levain-home"
+    gh_dirs = list(dict.fromkeys([gh_home / seat_gh.TOKEN_DIR, real_home / seat_gh.TOKEN_DIR]))
+    problems += _roots_problems(clone, return_dir, key_dir, gh_dirs)
     if not problems:
         problems += [f"{t} is an agent-config target inside a seat root" for t in
                      _contains_agent_config(clone, git_dir_ok=True) + _contains_agent_config(return_dir, git_dir_ok=False)]
@@ -298,7 +335,7 @@ def build_seat_profile(clone: Path, return_dir: Path, *, claude_bin: str, python
         "disabled": False,
         "allowWrite": [str(r) for r in roots],
         "denyWrite": seat_deny_write(clone, git=True) + seat_deny_write(return_dir, git=False),
-        "denyRead": [str(key_dir)],
+        "denyRead": [str(key_dir), *map(str, gh_dirs)],
     }
     py = shlex.quote(python)
     from levain import observe   # constants only
@@ -322,7 +359,8 @@ def build_seat_profile(clone: Path, return_dir: Path, *, claude_bin: str, python
     settings = {
         "sandbox": sandbox,
         "permissions": {"defaultMode": "acceptEdits", "additionalDirectories": [str(return_dir)],
-                        "deny": seat_permission_deny(roots, key_dir)},
+                        "allow": list(GH_TOOL_ALLOW),
+                        "deny": seat_permission_deny(roots, key_dir, gh_dirs)},
         "includeGitInstructions": False,
         "autoMemoryEnabled": False,
         "hooks": hooks,
@@ -335,4 +373,4 @@ def build_seat_profile(clone: Path, return_dir: Path, *, claude_bin: str, python
         raise SeatRefusal("; ".join(problems))
     env = {**hg.host_env(environ, roots=roots), "CLAUDE_CODE_DISABLE_GIT_INSTRUCTIONS": "1"}
     return SeatProfile(clone=clone, return_dir=return_dir, roots=roots, claude_bin=claude_bin, settings=settings,
-                       mcp_config={"mcpServers": {}}, env=env, tools=tools)
+                       mcp_config=gh_mcp_config(python, gh_home), env=env, tools=tools)

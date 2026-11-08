@@ -276,3 +276,35 @@ def test_levain_seat_canary_passes_its_own_flags_through(monkeypatch):
     assert cli.main(["seat", "canary", "--claude-bin", "/x/claude", "--swap-attempts", "3"]) == 0
     assert cli.main(["seat", "canary", "-h"]) == 0
     assert seen == [["--claude-bin", "/x/claude", "--swap-attempts", "3"], ["-h"]]
+
+
+def test_a_launch_with_no_egress_grant_denies_the_real_token_directory_and_points_levain_gh_at_the_real_home(
+        rig, monkeypatch):
+    """L3 z2b r1 HIGH. Revert: ``prepare_launch`` passing ``levain_home`` only under an egress grant (the MCP config
+    then names the canary home under $TMPDIR and the real ``seat_gh`` is not denied), or the ``real_home`` member of
+    ``gh_dirs`` in ``build_seat_profile``."""
+    home = rig.tmp / "real-levain-home"
+    home.mkdir()
+    monkeypatch.setenv("LEVAIN_HOME", str(home))
+    rig.sign_lease()
+    plan = rig.launch()
+    real_gh = str(Path(os.path.realpath(home)) / "seat_gh")
+    s = plan.profile.settings
+    assert real_gh in s["sandbox"]["filesystem"]["denyRead"]
+    assert f"Read(//{real_gh.lstrip('/')}/**)" in s["permissions"]["deny"]
+    args = plan.profile.mcp_config["mcpServers"]["levain_gh"]["args"]
+    assert args[args.index("--home") + 1] == str(Path(os.path.realpath(home)))
+    assert not any("levain-seat-canary" in d for d in s["sandbox"]["filesystem"]["denyRead"])
+
+
+def test_a_lease_profile_without_the_levain_home_refuses(rig):
+    """Revert: the ``lease is not None and levain_home is None`` problem in ``build_seat_profile``."""
+    from levain import seat_profile as sp
+    lane, ret = rig.tmp / "lanes" / "x", rig.tmp / "returns" / "x"
+    (lane / ".git").mkdir(parents=True)
+    ret.mkdir(parents=True)
+    lease = {"kind": sp.SEAT_LEASE_KIND, "agent": "claude_code", "lanes_parent": str(rig.tmp / "lanes"),
+             "returns_parent": str(rig.tmp / "returns")}
+    with pytest.raises(SeatRefusal, match="needs the levain home"):
+        sp.build_seat_profile(lane, ret, claude_bin=rig.claude, python=sys.executable, lease=lease,
+                              key_dir=rig.key_dir, managed=())
