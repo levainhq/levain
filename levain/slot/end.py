@@ -297,6 +297,9 @@ UNREAD_ANSWERS = frozenset({"staging-missing", "staging-not-regular", LINK_UNREA
 HASH_ONLY_CAP = (1 << 63) - 1
 
 _CHUNK = 1 << 20
+# a refill stops this far above the floor: extent and journal metadata are charged beyond the zeros written, and a
+# free-space reading can lag the writes, so landing exactly on the floor would still tip the next pass into BRAKE
+_REFILL_MARGIN = 4 << 20
 _LINK_TMP = b".levain-link."
 _O_NEW = os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC
 _O_ENTRY = os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_NOCTTY | os.O_CLOEXEC
@@ -2686,7 +2689,10 @@ class Reserve:
 
     def refill(self, free_bytes: Callable[[], int], *, floor: int = V5_FLOOR_BYTES) -> bool:
         """Back to ``size`` with written zeros when free space is above ``floor``; returns whether it
-        is full. Each write is capped at ``free_bytes() - floor``, so a refill never crosses the floor."""
+        is full. The headroom (``free_bytes() - floor - _REFILL_MARGIN``) is read once at entry and each write is
+        subtracted from it; a fresh reading only shrinks it. So the refill writes at most the entry headroom even when
+        the filesystem's free-space reading lags the writes, and stops sooner when the reading drops faster. What it
+        does not guarantee: space taken by other writers after entry, or by metadata beyond the margin."""
         if self.current() >= self.size:
             return True
         if free_bytes() <= floor:
@@ -2698,14 +2704,17 @@ class Reserve:
             cur = os.fstat(fd).st_size
             os.lseek(fd, cur, os.SEEK_SET)
             zeros = bytes(_CHUNK)
+            head = free_bytes() - floor - _REFILL_MARGIN
             try:
                 while cur < self.size:
                     # never write past the floor: a refill that starves the host would make the next pass BRAKE
-                    n = min(_CHUNK, self.size - cur, free_bytes() - floor)
+                    head = min(head, free_bytes() - floor - _REFILL_MARGIN)    # a reading may shrink it, never grow it
+                    n = min(_CHUNK, self.size - cur, head)
                     if n <= 0:
                         break
                     write_all(fd, zeros[:n])
                     cur += n
+                    head -= n
             except OSError as e:
                 if e.errno != errno.ENOSPC:
                     raise

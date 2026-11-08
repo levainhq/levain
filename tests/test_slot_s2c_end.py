@@ -1025,18 +1025,27 @@ def test_reserve_refill_never_crosses_the_floor(tmp_path, monkeypatch):
     """5c-1: free space just above the floor must stay at or above it; the refill caps each write at the headroom."""
     floor = 8 << 30
     mib = 1 << 20
-    free = {"n": floor + mib + mib // 2}                  # 1.5 MiB of headroom over the floor
+    free = {"n": floor + end_mod._REFILL_MARGIN + 2 * mib + mib // 2}     # 2.5 MiB of headroom past the margin
     real = end_mod.write_all
 
     def spend(fd, data):
         real(fd, data)
         free["n"] -= len(data)
     monkeypatch.setattr(end_mod, "write_all", spend)
-    r = Reserve(tmp_path / "reserve", size=4 * mib)
+    r = Reserve(tmp_path / "reserve", size=8 * mib)
     assert r.refill(lambda: free["n"], floor=floor) is False
-    assert free["n"] >= floor and r.current() == mib + mib // 2
+    assert free["n"] >= floor + end_mod._REFILL_MARGIN and r.current() == 2 * mib + mib // 2
 
 
+def test_reserve_refill_stops_at_the_entry_headroom_when_free_space_lags(tmp_path):
+    """5c-1 r1 (L1-W1, L2-LOW-1): a free-space reading that does NOT drop as bytes are written (APFS, btrfs, NFS) must not
+    let the refill write the whole reserve past the floor: the headroom read at entry bounds it."""
+    floor = 8 << 30
+    mib = 1 << 20
+    frozen = floor + end_mod._REFILL_MARGIN + 3 * mib
+    r = Reserve(tmp_path / "reserve", size=16 * mib)
+    assert r.refill(lambda: frozen, floor=floor) is False
+    assert r.current() == 3 * mib
 
 
 def test_reserve_releases_on_enospc(tmp_path, world, monkeypatch):
