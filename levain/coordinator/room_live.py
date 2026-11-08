@@ -32,41 +32,37 @@ LIVE_MAX = 16 * 1024
 LAUNCH_MAX = 8
 
 # [seat] ended launch ids remembered so a delta already in flight when the launch ended cannot re-create its buffer
-# (L3 stream r1 codex + complement MED); launch ids are never reused, so this only needs to outlive the pump's last read
-ENDED_MAX = 64
+# (L3 stream r1 codex + complement MED); launch ids are never reused, so this only needs to outlive the pump's last read;
+# edge: past 4096 ended launches in one process the oldest tombstone goes, and a delta still in flight for it could re-create a buffer
+ENDED_MAX = 4096
 
 _LOCK = threading.Lock()
 _BUF: dict[str, dict[str, Any]] = {}      # launch_id -> {"turn", "text", "bytes", "seq"}; text "" = nothing live
-_SEQ: dict[str, int] = {}                 # launch_id -> last seq handed out; survives a clear AND an eviction
+_SEQ = 0                                 # ONE process-wide counter: every change takes the next number, so no seq ever goes back
 _ENDED: dict[str, None] = {}              # launch ids :func:`forget` ended, oldest first (an ordered set)
 
 
 def _entry(launch_id: str) -> Optional[dict[str, Any]]:
     """The launch's buffer, made most recent; None for an ended launch (it is never re-created). Past
     :data:`LAUNCH_MAX` the oldest buffer with NO live text is dropped first; an open buffer (mid-reply) goes only when
-    every other one is open too (L3 stream r1 gemini MED). ``_SEQ`` is kept on an eviction, so a re-created buffer's
-    ``seq`` still only grows."""
+    every other one is open too (L3 stream r1 gemini MED). ``seq`` comes from the one global
+    counter ``_SEQ``, so a re-created buffer's ``seq`` still only grows."""
     if launch_id in _ENDED:
         return None
     e = _BUF.pop(launch_id, None)          # re-insert last: dict order is the recency order
     if e is None:
-        e = {"turn": "", "text": "", "bytes": 0, "seq": _SEQ.get(launch_id, 0)}
+        e = {"turn": "", "text": "", "bytes": 0, "seq": 0}
     _BUF[launch_id] = e
     while len(_BUF) > LAUNCH_MAX:
         idle = [k for k, v in _BUF.items() if k != launch_id and not v["text"]]
         _BUF.pop(idle[0] if idle else next(iter(_BUF)))
-    # a counter outlives its buffer only to keep seq rising; bound the ones whose buffer is gone
-    while len(_SEQ) > 4 * LAUNCH_MAX:
-        gone = next((k for k in _SEQ if k not in _BUF), None)
-        if gone is None:
-            break
-        _SEQ.pop(gone)
     return e
 
 
-def _bump(launch_id: str, e: dict[str, Any]) -> None:
-    e["seq"] += 1
-    _SEQ[launch_id] = e["seq"]
+def _bump(e: dict[str, Any]) -> None:
+    global _SEQ
+    _SEQ += 1
+    e["seq"] = _SEQ
 
 
 class Sink:
@@ -100,7 +96,7 @@ class Sink:
                 return
             e["turn"] = turn or ""
             e["text"] += piece
-            _bump(self.launch_id, e)
+            _bump(e)
 
     def clear(self) -> None:
         clear(self.launch_id)
@@ -113,16 +109,15 @@ def clear(launch_id: str) -> None:
         if e is None or not e["text"]:
             return
         e["text"], e["bytes"] = "", 0
-        _bump(launch_id, e)
+        _bump(e)
 
 
 def forget(launch_id: str) -> None:
-    """The launch is over: drop its buffer and its counter, for good. A delta that arrives after this (the pump had
+    """The launch is over: drop its buffer, for good. A delta that arrives after this (the pump had
     already polled it when the launch ended) is refused under the same lock, so an ended launch never shows text again,
     whatever order ``forget`` and the session's close run in."""
     with _LOCK:
         _BUF.pop(launch_id, None)
-        _SEQ.pop(launch_id, None)
         _ENDED.pop(launch_id, None)
         _ENDED[launch_id] = None
         while len(_ENDED) > ENDED_MAX:
@@ -133,7 +128,6 @@ def _purge(launch_id: str) -> None:
     """Every trace of ``launch_id``, its end included. Tests only (they reuse one id); production never reuses an id."""
     with _LOCK:
         _BUF.pop(launch_id, None)
-        _SEQ.pop(launch_id, None)
         _ENDED.pop(launch_id, None)
 
 

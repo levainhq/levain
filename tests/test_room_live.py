@@ -250,7 +250,7 @@ def test_a_delta_in_flight_at_teardown_never_resurrects_an_ended_launch():
     s._ingest(json.dumps(delta("late")))     # the delta the pump polled before the end
     assert room_live.snapshot(LID) is None and LID not in room_live._BUF
     room_live.Sink(LID).delta("t", "direct")  # a write straight to the sink is refused alike
-    assert room_live.snapshot(LID) is None and LID not in room_live._BUF and LID not in room_live._SEQ
+    assert room_live.snapshot(LID) is None and LID not in room_live._BUF
 
 
 def test_a_character_split_at_the_cap_ends_the_buffer_as_a_pure_head():
@@ -281,7 +281,7 @@ def test_an_open_buffer_outlives_newer_launches_and_seq_never_goes_back():
         # now evict the active one deliberately: every other buffer is open too
         seq = room_live.snapshot(LID)["seq"]
         active.clear()
-        seq = room_live._SEQ[LID]
+        seq = room_live._SEQ
         for i in others:
             room_live.Sink(i).delta("t", "y")
         assert LID not in room_live._BUF
@@ -290,3 +290,25 @@ def test_an_open_buffer_outlives_newer_launches_and_seq_never_goes_back():
     finally:
         for i in others:
             room_live._purge(i)
+
+
+def test_seq_never_goes_back_after_an_evicted_launch_is_written_late():
+    """codex L3 r2 MED: evict a launch, churn many others, then a late delta for it: seq still rises (one global counter)."""
+    others = [f"churn-{i}" for i in range(room_live.LAUNCH_MAX * 6)]
+    room_live.Sink(LID).delta("t", "a")
+    first = room_live.snapshot(LID)["seq"]
+    room_live.clear(LID)                     # idle, so churn evicts it
+    try:
+        for i in others:
+            room_live.Sink(i).delta("t", "x")
+            room_live.clear(i)
+        assert LID not in room_live._BUF
+        room_live.Sink(LID).delta("t", "b")
+        assert room_live.snapshot(LID)["seq"] > first
+    finally:
+        for i in others:
+            room_live._purge(i)
+
+
+def test_ended_tombstones_hold_thousands():
+    assert room_live.ENDED_MAX == 4096
