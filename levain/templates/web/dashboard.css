@@ -2431,7 +2431,7 @@ body.ke .panel[data-ck-panel="loops"] .row[data-spore] { scroll-margin-top: calc
 }
 /* the Agents lens: the graph as the F12 mock draws it. The SVG carries every node, ring, edge and face; a canvas under it carries only the particle streams. */
 .tv-agents { display: flex; flex-direction: column; gap: var(--sp-5); min-width: 0; }
-.tv-stage { position: relative; min-width: 0; max-height: min(72vh, 36rem); overflow-x: hidden; overflow-y: auto; background: var(--base); border: 1px solid var(--hair); border-radius: var(--r-md); }
+.tv-stage { position: relative; min-width: 0; max-height: min(72vh, 36rem); overflow-x: hidden; overflow-y: auto; scrollbar-gutter: stable; background: var(--base); border: 1px solid var(--hair); border-radius: var(--r-md); }
 .tv-graph { position: relative; z-index: 1; display: block; width: 100%; height: auto; }
 /* the height grip: a thin full-width bar over the stage's bottom edge (the stage scrolls, so the bar is its sibling, pulled up by the flex gap) */
 .tv-grip { position: relative; z-index: 3; height: 10px; margin-top: calc(-1 * var(--sp-5) - 7px); cursor: ns-resize; touch-action: none; display: flex; align-items: center; justify-content: center; }

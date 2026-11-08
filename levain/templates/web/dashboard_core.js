@@ -2440,7 +2440,7 @@
     noContactFill(input);
     input.setAttribute("enterkeyhint", "send");      // overrides the helper's default: this box sends on Enter
     input.setAttribute("aria-label", "add a line to the List");
-    narrowPlaceholder(input, "@mon 9am call X  ·  ? talk about Y  ·  or a plain line", "@mon 9am call X · ? talk Y");
+    narrowPlaceholder(input, "@mon 9am call X  ·  ? talk about Y  ·  or a plain line", "@mon 9am call · ? talk Y");
     input.value = intakeKept.draft;
     input.maxLength = 500;
     const go = el("button", "tray-dump-btn list-intake-btn", "add");

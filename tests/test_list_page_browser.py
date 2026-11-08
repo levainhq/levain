@@ -320,7 +320,7 @@ def test_listfix2_one_pill_one_listener_and_known_origins_only(tmp_path: Path) -
             {"until": f"{ph}.startsWith('@mon 9am call X  ') && 1"},
             {"eval": f"JSON.stringify({{ph: {ph}}})"},
             {"emulate": {"w": 390, "h": 844, "dpr": 3, "mobile": True}},
-            {"until": f"{ph} === '@mon 9am call X · ? talk Y' && 1"},
+            {"until": f"{ph} === '@mon 9am call · ? talk Y' && 1"},
         ])
     vals = [json.loads(x) for x in out["values"] if isinstance(x, str) and x.startswith("{")]
     rows = vals[0]["rows"]
@@ -341,6 +341,6 @@ def test_listfix2_one_pill_one_listener_and_known_origins_only(tmp_path: Path) -
         bad.append(f"B: expected exactly one media listener after the first build, got {first}")
     if after != first:
         bad.append(f"B: the media listener count grew {first} -> {after}")        # B: no listener per rebuild
-    assert vals[3]["ph"].startswith("@mon 9am call X · "), vals[3]                 # narrow at 390
+    assert vals[3]["ph"].startswith("@mon 9am call · "), vals[3]                 # narrow at 390
     assert vals[4]["ph"].startswith("@mon 9am call X  ·  "), vals[4]               # wide again after the width change
     assert not bad, bad
