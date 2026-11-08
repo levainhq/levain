@@ -10,7 +10,7 @@ import shlex
 import shutil
 import subprocess
 import sys
-from datetime import timedelta
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import pytest
@@ -382,7 +382,10 @@ def test_every_seat_hook_keeps_the_user_site_on_the_import_path(eg, tmp_path):
 
 def test_the_hook_command_runs_as_a_process_and_pushes(eg):
     """The exact command the profile carries, run through a shell with the Stop payload on stdin. (`-EP` ignores
-    PYTHONPATH and the installed levain is not this tree, so the one flag differs here: RESIDUE for the VM run.)"""
+    PYTHONPATH and the installed levain is not this tree, so the one flag differs here: RESIDUE for the VM run.)
+    The hook process reads the REAL clock, so the lease is signed at the real now: from the rig's fixed T0 a 14-day lease
+    lapsed in real time on 2026-11-08 12:00 UTC and this test went red on every branch (a time bomb)."""
+    eg.rig.world.clock.now = max(eg.rig.world.clock.now, datetime.now(timezone.utc))
     eg.rig.sign_lease()
     eg.sign()
     plan, clone = eg.lane()
