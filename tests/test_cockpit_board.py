@@ -455,3 +455,56 @@ def test_a_1000_character_title_cannot_push_a_cards_drop_past_the_drop_routes_ca
     words = _harness_run()["longTitleWords"]
     assert len(words) >= 1000 and len(words) <= 2 * board.TEXT_MAX + 100
     assert check_words(words) == words and len(words) < WORDS_MAX
+
+
+def test_a_snoozed_question_is_one_later_card_not_an_actionable_one(filled):
+    """Row 131: ONE predicate (band_view.later_of) marks a snoozed question LATER on the board card, with the payload."""
+    from datetime import datetime, timedelta
+
+    from levain import band_view
+    from levain.consent.questions import local_today
+    qs = QuestionStore(filled)
+    _file(qs, what="Due question")
+    snz = _file(qs, what="Snoozed question", agent_session_id="sess-2")
+    day = (datetime.fromisoformat(local_today(datetime.now().astimezone())) + timedelta(days=2)).date().isoformat()
+    qs.snooze(snz.id, until=day, channel="cli", via="cli")
+    payload = band_view.band_payload(qs, "test")                 # numbers the rows (the board read numbers nothing)
+    out = board.build(filled, qs)
+    col = next(c for c in out["columns"] if c["category"] == "needs-you")
+    by = {c["title"]: c for c in col["cards"]}
+    assert "later" not in by["Due question"]
+    lat = by["Snoozed question"]
+    assert lat["later"] == day and lat["later_label"].endswith(day[5:]) and lat["blocks"] == ""
+    assert lat["band"] is True                                   # still an open, numbered band card (answerable by number)
+    item = next(i for i in payload["items"] if i["what"] == "Snoozed question")
+    assert item["later"] == day and item["later_label"] == lat["later_label"] and item["options"] == []
+
+
+@pytest.mark.skipif(shutil.which("node") is None, reason="node is not installed")
+def test_later_cards_keep_their_drop_and_are_recognised_only_as_band_cards_with_a_real_day():
+    """L3 later round: a LATER card keeps 'Drop about this card' in both bodies; `later` is read only for band === true with
+    an ISO day; the label is bounded; the filter finds `later` and the day."""
+    r = _harness_run()["laterCards"]
+    assert r["later"] == ["2026-11-09", "", "", "2026-11-09"]
+    assert r["labelLen"] == 80
+    assert r["groupedDrops"] == ["band:a", "band:b", "band:c", "band:d"] and r["colDrops"] == r["groupedDrops"]
+    assert r["found"] == 2
+
+
+def test_a_malformed_snooze_is_due_on_every_surface_and_a_foreign_row_agrees_with_the_board(filled):
+    """L3 later round: one fail-open path (`_later_pair`); a foreign store's future snooze is LATER in the payload too."""
+    from datetime import datetime, timedelta
+    from types import SimpleNamespace
+
+    from levain import band_view
+    from levain.consent.questions import local_today
+    q = SimpleNamespace(snoozed_until=object(), dated=None)
+    assert band_view._later_pair(q, 1, "2026-11-07") is None
+    day = (datetime.fromisoformat(local_today(datetime.now().astimezone())) + timedelta(days=3)).date().isoformat()
+    ok = SimpleNamespace(snoozed_until=day, dated=None)
+    assert band_view._later_pair(ok, 4, local_today(datetime.now().astimezone())) == band_view.later_of(
+        SimpleNamespace(), ok, 4)
+    qs = QuestionStore(filled)
+    _file(qs, what="Bad", agent_session_id="s1")
+    item = band_view._question_item(next(iter(band_view._read(qs)[0]))[1], 1, None, True, "2026-11-07")[1]
+    assert "later" not in item

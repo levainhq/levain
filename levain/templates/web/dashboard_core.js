@@ -4842,6 +4842,13 @@
     for (const it of items) {
       if (!it || typeof it !== "object") continue;
       const authority = it.kind === "authority";
+      if (typeof it.later === "string" && it.later) {     // snoozed (row 131): one collapsed LATER line, number kept, no answer controls
+        const lrow = el("div", "row consent-row band-row band-later");
+        lrow.setAttribute("data-band-row", String(it.n));
+        lrow.appendChild(el("span", "ext-meta", "LATER " + (typeof it.later_label === "string" && it.later_label ? it.later_label : String(it.n) + " " + it.later) + " · " + (typeof it.what === "string" ? it.what.slice(0, 80) : "")));
+        kids.push(lrow);
+        continue;
+      }
       const row = el("div", "row consent-row band-row" + (authority ? "" : " ext-accent"));
       row.setAttribute("data-band-row", String(it.n));
       const head = el("div", "consent-head");

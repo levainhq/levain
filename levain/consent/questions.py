@@ -20,8 +20,12 @@ module: a stored answer is what was written, delivered as written. Stated as kno
   - delivery is at most once per claim; a claimer that dies between its claim and the agent reading the text loses
     it (a lease with no settle stays ``unconfirmed``, visible, never re-sent: the resume may have run).
 
-Tables are append-only beside each other: a question, its one answer, its one delivery claim and the resume steps
-of that claim are rows written once, never updated or deleted (SQL triggers refuse both, and an INSERT OR REPLACE
+The operator may DEFER an open question to a later local day (:meth:`QuestionStore.snooze`, row 134): at most
+:data:`SNOOZE_MAX_DAYS` days ahead, one appended ``question_snoozes`` row per act, the newest winning. A snooze never
+closes, renumbers or re-versions the question; the band folds it into its LATER line until the day comes.
+
+Tables are append-only beside each other: a question, its one answer, its one delivery claim, the resume steps
+of that claim and its snoozes are rows written once, never updated or deleted (SQL triggers refuse both, and an INSERT OR REPLACE
 that would drop a row without a delete trigger); the guard is against a buggy writer, since there is no authority
 to protect.
 
@@ -46,7 +50,7 @@ import time
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
@@ -57,7 +61,8 @@ from levain.cockpit.consent import ConsentError, utc_stamp
 from levain.consent.queue import default_queue_dir
 from levain.consent.record import AGENTS
 
-__all__ = ["ANSWER_CHANNELS", "DB_NAME", "FORMAT", "Answer", "Link", "Question", "QuestionStore", "QuestionStoreError"]
+__all__ = ["ANSWER_CHANNELS", "DB_NAME", "FORMAT", "SNOOZE_MAX_DAYS", "SNOOZE_VIAS", "Answer", "Link", "Question",
+           "QuestionStore", "QuestionStoreError", "Snooze", "local_today", "snooze_refusal", "valid_date"]
 
 DB_NAME = "questions.db"
 FORMAT = "levain-questions/1"
@@ -73,6 +78,13 @@ _LABEL_MAX = 600
 _BLOCKS_MAX = 6000
 _TEXT_MAX = 4000
 _N_MAX = 2 ** 63 - 1                     # SQLite's INTEGER
+# A band row may be deferred only inside a tight window (flow's task_surfaces_1107.md, the shared spec): of the 1,706
+# needs-phill rows Phill answered, none lived past 3 days and the median life was 5.5 minutes. A row that has to wait
+# longer is not a band row: it is a dated agenda, and the refusal says so. Flow's own `needs_phill.py snooze` has no cap.
+SNOOZE_MAX_DAYS = 3
+# who set a snooze, as ``answer_context.via`` records an answer's surface
+SNOOZE_VIAS: tuple[str, ...] = ("seat", "cli", "cockpit", "phone")
+_DATE = re.compile(r"[0-9]{4}-[0-9]{2}-[0-9]{2}")
 # how long the hook's read and its claim together wait on a lock another writer holds, by the wall clock: past it
 # the answers wait for the session's next hook, so a stuck writer never holds a tool call up (the gate's own hold is
 # not this). One deadline, not SQLite's busy_timeout per step: that counts the sleeps it asked for, not time passed
@@ -150,6 +162,12 @@ class Question:
     # open long enough to also list under "you". Both are the host's data, passed through: levain never classifies or ages a row
     section: str = ""
     carried: bool = False
+    # the day the operator deferred this question to (``YYYY-MM-DD``, local; the newest ``question_snoozes`` row of a
+    # native store, flow's ``snoozed_until`` field of a host's), and a host row's own date (flow's ``dated``; a native
+    # question has none). Neither closes, renumbers or re-versions the question: the band reads them through
+    # :func:`levain.band_view._later_date` to fold a row that comes back on a later day into its LATER line
+    snoozed_until: str | None = None
+    dated: str | None = None
 
     @property
     def open_ended(self) -> bool:
@@ -175,12 +193,44 @@ class Link:
     queue_id: str
 
 
+@dataclass(frozen=True)
+class Snooze:
+    """One deferral the operator set on an open question (:meth:`QuestionStore.snooze`): ``until`` the local day it
+    comes back (``None``: brought back now), who set it (``channel`` as an answer's, ``via`` as ``answer_context``'s),
+    his words if any. The newest one of a question is its snooze."""
+    seq: int
+    question_id: str
+    until: str | None
+    channel: str
+    via: str
+    note: str | None
+    set_at: str
+
+
 def _append_only(table: str, message: str) -> tuple[str, str]:
     return (f"CREATE TRIGGER IF NOT EXISTS {table}_frozen BEFORE UPDATE ON {table} "
             f"BEGIN SELECT RAISE(ABORT, '{message}'); END",
             f"CREATE TRIGGER IF NOT EXISTS {table}_kept BEFORE DELETE ON {table} "
             f"BEGIN SELECT RAISE(ABORT, '{message}'); END")
 
+
+# The operator's deferrals of an open question, one row per act, never rewritten: the NEWEST row of a question is its
+# snooze (``until`` NULL = he brought it back early). A snooze never closes a question, renumbers it or answers it. Its
+# own statements, run again by every snooze write: a store set up before this table gets it on its first snooze, and a
+# reader of such a store reads every question as unsnoozed (:func:`_select`).
+_SNOOZE_SCHEMA = (
+    "CREATE TABLE IF NOT EXISTS question_snoozes (seq INTEGER PRIMARY KEY AUTOINCREMENT, "
+    "question_id TEXT NOT NULL REFERENCES questions(id), "
+    "until TEXT CHECK (until IS NULL OR (length(until) = 10 AND until GLOB "
+    "'[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]')), "
+    "channel TEXT NOT NULL CHECK (channel IN ('cli','phone','cockpit')), "
+    "via TEXT NOT NULL CHECK (via IN ('seat','cli','cockpit','phone')), note TEXT, set_at TEXT NOT NULL)",
+    "CREATE INDEX IF NOT EXISTS question_snoozes_question ON question_snoozes (question_id, seq)",
+    *_append_only("question_snoozes", "question snoozes are append-only"),
+    "CREATE TRIGGER IF NOT EXISTS question_snoozes_no_replace BEFORE INSERT ON question_snoozes "
+    "WHEN EXISTS (SELECT 1 FROM question_snoozes WHERE seq = NEW.seq) "
+    "BEGIN SELECT RAISE(ABORT, 'a snooze is never replaced'); END",
+)
 
 _SCHEMA = (
     "CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)",
@@ -230,16 +280,25 @@ _SCHEMA = (
     "CREATE TRIGGER IF NOT EXISTS answer_resume_steps_no_replace BEFORE INSERT ON answer_resume_steps "
     "WHEN EXISTS (SELECT 1 FROM answer_resume_steps WHERE seq = NEW.seq) "
     "BEGIN SELECT RAISE(ABORT, 'a resume step is never replaced'); END",
+    *_SNOOZE_SCHEMA,
 )
 
 _Q_COLS = "q.n, q.id, q.agent, q.agent_session_id, q.what, q.options, q.rec, q.blocks, q.cwd, q.filed_at"
 _A_COLS = "a.question_id, a.kind, a.value, a.channel, a.answered_at"
 _L_COLS = "l.option, l.kind, l.request_id, l.queue_id"
-_SELECT = (f"SELECT {_Q_COLS}, {_A_COLS}, {_L_COLS} FROM questions q LEFT JOIN answers a ON a.question_id = q.id "
-           "LEFT JOIN question_links l ON l.question_id = q.id")
-# the same, for a store set up before ``question_links`` existed (read-only readers never add it)
-_SELECT_UNLINKED = (f"SELECT {_Q_COLS}, {_A_COLS}, NULL, NULL, NULL, NULL FROM questions q "
-                    "LEFT JOIN answers a ON a.question_id = q.id")
+# the newest snooze of the question (its ``until``, NULL when he brought it back or never deferred it)
+_S_COL = ("(SELECT s.until FROM question_snoozes s WHERE s.question_id = q.id ORDER BY s.seq DESC LIMIT 1)")
+
+
+def _select_of(linked: bool, snoozes: bool) -> str:
+    """The question query: with its links and its newest snooze, or NULLs in their place for a store set up before
+    ``question_links`` / ``question_snoozes`` existed (read-only readers never add either)."""
+    return (f"SELECT {_Q_COLS}, {_A_COLS}, {_L_COLS if linked else 'NULL, NULL, NULL, NULL'}, "
+            f"{_S_COL if snoozes else 'NULL'} FROM questions q LEFT JOIN answers a ON a.question_id = q.id"
+            + (" LEFT JOIN question_links l ON l.question_id = q.id" if linked else ""))
+
+
+_SELECTS = {(linked, snoozes): _select_of(linked, snoozes) for linked in (True, False) for snoozes in (True, False)}
 # the latest resume step of an answered question ``q`` (NULL when it is unclaimed or a hook claimed it)
 _LAST_STEP = ("(SELECT e.outcome FROM answer_resume_steps e WHERE e.question_id = q.id ORDER BY e.seq DESC LIMIT 1)")
 # an answer whose text has not reached its session: never claimed, or claimed for a resume that failed
@@ -248,10 +307,57 @@ _DELIVERABLE = ("(NOT EXISTS (SELECT 1 FROM answer_deliveries d WHERE d.question
 
 
 def _select(conn: sqlite3.Connection) -> str:
-    """The question query for this store: with its links, or with none when its ``question_links`` table was never
-    set up (a store only a levain before Q-3 wrote, read by a reader that never writes)."""
-    have = conn.execute("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'question_links'").fetchone()
-    return _SELECT if have is not None else _SELECT_UNLINKED
+    """The question query for this store: with its links and snoozes, or with none of either whose table was never
+    set up (a store only an older levain wrote, read by a reader that never writes)."""
+    have = {r[0] for r in conn.execute("SELECT name FROM sqlite_master WHERE type = 'table' AND name IN "
+                                       "('question_links', 'question_snoozes')")}
+    return _SELECTS[("question_links" in have, "question_snoozes" in have)]
+
+
+def valid_date(text: Any) -> bool:
+    """A calendar date written ``YYYY-MM-DD`` exactly (flow's ``needs_phill.valid_date``)."""
+    if not isinstance(text, str) or _DATE.fullmatch(text) is None:
+        return False
+    try:
+        date.fromisoformat(text)
+    except ValueError:
+        return False
+    return True
+
+
+def local_today(now: datetime) -> str:
+    """The operator's LOCAL date of the aware instant ``now``, ``YYYY-MM-DD``: the day a snooze and the band's LATER
+    line are judged against (flow's footer: ``date.fromtimestamp(ts)``, the machine's local date)."""
+    return now.astimezone().date().isoformat()
+
+
+def later_date(row: Any, today: str) -> str | None:
+    """The day a band row comes back, when that day is after ``today`` (local ``YYYY-MM-DD``): its ``snoozed_until``
+    if that is a valid date after today, else its ``dated`` if that is, else ``None`` (the row is due: no date, a past
+    or today's date, a stray non-date value). ``row`` is a :class:`Question` (or any object with those attributes) or a
+    mapping (flow's needs-phill row). Flow's ``needs_phill._later_date``, the one predicate every surface reads: a
+    row it dates is still open, numbered and answerable by that number."""
+    for key in ("snoozed_until", "dated"):
+        v = row.get(key) if isinstance(row, dict) else getattr(row, key, None)
+        if isinstance(v, str) and valid_date(v) and v > today:
+            return v
+    return None
+
+
+def snooze_refusal(until: Any, today: str) -> str | None:
+    """Why a snooze to ``until`` is refused on local day ``today``, or ``None`` when it may be set: a real date, after
+    today, at most :data:`SNOOZE_MAX_DAYS` days ahead."""
+    if not valid_date(until):
+        return f"a snooze ends on a date written YYYY-MM-DD: {until!r} is not one"
+    if until <= today:
+        return (f"a snooze ends on a future date: {until} is not after today ({today}); to bring the row back now, "
+                "unsnooze it")
+    latest = (date.fromisoformat(today) + timedelta(days=SNOOZE_MAX_DAYS)).isoformat()
+    if until > latest:
+        return (f"a snooze is at most {SNOOZE_MAX_DAYS} days (until {latest} at the latest): a row that has to wait "
+                f"until {until} is not a band row; answer it in words (say when to ask again) and keep the date as "
+                "a dated agenda")
+    return None
 
 
 def _now_utc(clock: Callable[[], datetime]) -> datetime:
@@ -492,7 +598,8 @@ class QuestionStore:
         options = tuple((o["key"], o["label"]) for o in json.loads(row[5]))
         answer = None if row[10] is None else Answer(row[10], row[11], row[12], row[13], row[14])
         link = None if row[15] is None else Link(row[15], row[16], row[17], row[18])
-        return Question(row[0], row[1], row[2], row[3], row[4], options, row[6], row[7], row[8], row[9], answer, link)
+        return Question(row[0], row[1], row[2], row[3], row[4], options, row[6], row[7], row[8], row[9], answer, link,
+                        snoozed_until=row[19] if len(row) > 19 else None)
 
     @staticmethod
     def _by_ref(conn: sqlite3.Connection, ref: Any) -> Question | None:
@@ -741,6 +848,60 @@ class QuestionStore:
                 conn.execute("RELEASE answer_entry")
                 out.append(Answer(q.id, kind, value, channel, stamp))
         return out
+
+    # --- deferring -----------------------------------------------------------------------------------
+    def snooze(self, ref: Any, *, until: str | None, channel: str, via: str, note: str | None = None) -> Snooze:
+        """Defer an open question to the local day ``until`` (``YYYY-MM-DD``, after today and at most
+        :data:`SNOOZE_MAX_DAYS` days ahead), or bring a deferred one back now (``until=None``), as one appended
+        ``question_snoozes`` row: the newest row of a question wins. The question stays OPEN: its number, its version
+        and its answer path are untouched, and the band lists it on its LATER line until the day comes. Refused, with
+        nothing written: no such question, one already answered, a date outside the window, and bringing back a
+        question that is not deferred. ``ref`` as :meth:`get` (an id or the question's own ``#n``, never a band
+        number: the band resolves its numbers itself). Nothing here authorises anything."""
+        if channel not in ANSWER_CHANNELS:
+            raise ConsentError(f"channel must be one of {', '.join(ANSWER_CHANNELS)}: {channel!r}")
+        if via not in SNOOZE_VIAS:
+            raise ConsentError(f"via must be one of {', '.join(SNOOZE_VIAS)}: {via!r}")
+        if note is not None and (not isinstance(note, str) or len(note) > _TEXT_MAX or "\x00" in note):
+            raise ConsentError(f"note must be at most {_TEXT_MAX} characters with no NUL")
+        with self._write() as conn:
+            for stmt in _SNOOZE_SCHEMA:       # a store set up before snoozes existed gets the table here
+                conn.execute(stmt)
+            q = self._by_ref(conn, ref)
+            if q is None:
+                raise ConsentError(f"no such question: {ref!r}")
+            if q.answer is not None:
+                raise ConsentError(f"question #{q.n} was already answered at {q.answer.answered_at}: there is nothing "
+                                   "to snooze")
+            now = _now_utc(self._clock)
+            today = local_today(now)
+            if until is None:
+                if not (isinstance(q.snoozed_until, str) and q.snoozed_until > today):
+                    raise ConsentError(f"question #{q.n} is not snoozed: it is already due")
+            else:
+                why = snooze_refusal(until, today)
+                if why is not None:
+                    raise ConsentError(why)
+            stamp = utc_stamp(now)
+            cur = conn.execute("INSERT INTO question_snoozes (question_id, until, channel, via, note, set_at) "
+                               "VALUES (?, ?, ?, ?, ?, ?)", (q.id, until, channel, via, note, stamp))
+            seq = cur.lastrowid
+        assert seq is not None
+        return Snooze(seq, q.id, until, channel, via, note, stamp)
+
+    def snoozes(self, ref: Any) -> list[Snooze]:
+        """Every snooze row of a question, oldest first (its history; the newest is its snooze). Empty for no store,
+        no such question, or a store with no snoozes table."""
+        with self._peek() as conn:
+            if conn is None or "question_snoozes" not in {r[0] for r in conn.execute(
+                    "SELECT name FROM sqlite_master WHERE type = 'table'")}:
+                return []
+            q = self._by_ref(conn, ref)
+            if q is None:
+                return []
+            rows = conn.execute("SELECT seq, question_id, until, channel, via, note, set_at FROM question_snoozes "
+                                "WHERE question_id = ? ORDER BY seq", (q.id,)).fetchall()
+        return [Snooze(*r) for r in rows]
 
     # --- delivery ------------------------------------------------------------------------------------
     def claim_answers_for(self, agent: str, agent_session_id: str) -> list[Question]:

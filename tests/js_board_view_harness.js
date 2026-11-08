@@ -93,6 +93,30 @@ function dropHere() {
   load();
   return { absent: a[0], true: t[0], false: f[0], falseCols: f[1] };
 }
+// LATER cards (row 131): recognised only for band cards with an ISO day; keep their drop button; label bounded.
+function laterCards() {
+  globalThis.LevainDashboard = { composeDrop: () => true };
+  load();
+  const V = globalThis.LevainBoardView;
+  const mk = (id, extra) => Object.assign({ id, title: "T " + id, band: true, number: 3 }, extra);
+  const body = { queue: "ok", columns: [{ category: "needs-you", cards: [
+    mk("band:a", { later: "2026-11-09", later_label: "3 Mon 11-09" }),
+    mk("band:b", { band: false, later: "yes" }),
+    mk("band:c", { later: "not a date" }),
+    mk("band:d", { later: "2026-11-09", later_label: "x".repeat(500) })] }] };
+  const model = V.boardModel(body);
+  const cards = model.columns.find((c) => c.category === "needs-you").cards;
+  const g = node("div"), c = node("div");
+  V.renderGrouped(doc, g, model);
+  V.renderBoard(doc, c, model);
+  const drops = (r) => walk(r).filter((n) => n.className === "bd-drop").map((n) => n.dataset.dropAbout).sort();
+  const out = { later: cards.map((k) => k.later), labelLen: cards[3].laterLabel.length, groupedDrops: drops(g), colDrops: drops(c),
+    found: V.filterModel(model, "later 11-09").shown };
+  delete globalThis.LevainDashboard;
+  load();
+  return out;
+}
+const laterOut = laterCards();
 const hereOut = dropHere();
 const longTitleWords = globalThis.LevainBoardView.dropWords({ id: "i".repeat(1000), title: "t".repeat(1000) });
 load();
@@ -110,5 +134,6 @@ function emptyWords(V, extra) {
 out.emptyWords = { ok: emptyWords(V, {}), queue: emptyWords(V, { queue: "unreadable", unreadable: ["coordinator"] }), band: emptyWords(V, { unreadable: ["band"] }), seats: emptyWords(V, { unreadable: ["seats"] }), noKey: emptyWords(V, { unreadable: undefined, queue: "mystery" }) };
 out.drop = dropButtons();
 out.dropHere = hereOut;
+out.laterCards = laterOut;
 out.longTitleWords = longTitleWords;
 console.log(JSON.stringify(out));
