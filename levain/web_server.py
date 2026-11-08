@@ -5267,11 +5267,7 @@ def _build_broker(source: SubstrateSource, install_class: str | None,
     def coord_dir() -> Any:
         # the directory the C1 sort path writes (verbs._intake_fire): the consent reader is attached after the server
         # is built, so it is read on each call, and a call before that resolves as a server with none does
-        try:
-            reader = getattr(httpd, "consent_reader", None)
-        except NameError:
-            reader = None
-        return _dispatch_dir(reader)
+        return _dispatch_dir(getattr(httpd, "consent_reader", None))
 
     return Broker(scope.ledger_root / "cockpit",
                   stores={SPORES: SporeEffectStore(spores), EPISODES: EpisodeEffectStore(episodes),

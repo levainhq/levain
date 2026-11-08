@@ -280,7 +280,7 @@ def test_the_receipt_says_in_the_operators_words_why_a_sort_was_not_sent(world):
     rec = {"target": {"intake": {"kind": "sort", "text": "x"}}}
     line = lambda st: world.b._intake_receipt(rec, PID, st)["receipt_line"]   # noqa: E731
     assert line("COMMITTED_INCOMPLETE") == "not sent to the desk: the desk's store refused it"
-    assert line("STALE") == "not sent to the desk: it changed before you signed"
+    assert line("STALE") == "not sent to the desk: another drop already holds its place"
     for other in ("REFUSED", "EXPIRED", "CANCELLED"):
         assert line(other) == "not sent to the desk"
     for st in ("COMMITTED_INCOMPLETE", "STALE", "REFUSED"):
@@ -346,7 +346,7 @@ def test_a_sort_whose_key_is_already_taken_before_the_decision_ends_stale_and_wr
     done = w.b.submit(out["pending_id"], w.phone.sign(out["record"].encode()))
     assert done["state"] == "STALE", done
     assert [d.words for d in _drops(w.qdir)] == ["somebody else's words"]
-    assert done["receipt_line"] == "not sent to the desk: it changed before you signed"
+    assert done["receipt_line"] == "not sent to the desk: another drop already holds its place"
 
 
 def test_a_crash_between_the_write_and_its_record_recovers_to_exactly_one_drop(world):
@@ -374,3 +374,105 @@ def test_a_crash_between_the_write_and_its_record_recovers_to_exactly_one_drop(w
     assert _sql(w, "SELECT status FROM effects WHERE operation_id = ?", out["pending_id"]) == [("APPLIED",)]
     (drop,) = _drops(w.qdir)
     assert drop.words == WORDS and drop.outbox_id == create_origin_key(out["pending_id"], 0)
+
+
+# --- the fix lane's pins (L3 r1 on 41bfeff6) ----------------------------------------------------------------------
+
+def test_the_server_built_broker_writes_a_signed_sort_into_the_consent_readers_directory(home, monkeypatch):
+    """``web_server._build_broker``'s ``coord_dir`` closure, driven end to end: the consent reader is attached AFTER
+    the broker is built (as ``make_server`` does) and the sort lands in its directory."""
+    from levain import web_server
+
+    spores = home / "spores.json"
+    SporeStore(spores).add(type="task", text="a loop", origin_key="k.loop")
+    anneal = SimpleNamespace(spores_json=spores, episodic_db=home / "episodes.db", continuity_md=home / "other.md")
+    source = SimpleNamespace(write_scope=SimpleNamespace(ledger_root=home / "ledger", anneal=anneal))
+    (home / "ledger").mkdir(mode=0o700)
+    httpd = SimpleNamespace(verb_registry=None, get_cockpit=lambda: None)         # no consent_reader yet
+    monkeypatch.setattr(web_server, "retier", lambda *a, **k: "C1")
+    b = web_server._build_broker(source, "reported", httpd)
+    assert b is not None
+    qdir = home / "dispatch"
+    qdir.mkdir(mode=0o700)
+    httpd.consent_reader = SimpleNamespace(directory=qdir)                         # attached after, as the server does
+    b.start()
+    try:
+        keys = home / "keys"
+        keys.mkdir(mode=0o700)
+        laptop = RealKey(keys, "laptop")
+        enrol_any(b.db, laptop, "laptop-presence")
+        phone = SoftPasskey()
+        enrol(b.db, phone, "display-phone", by=laptop, custody="passkey")          # type: ignore[arg-type]
+        cred = {"class": "device", "fingerprint": phone.fingerprint, "transport": "paired-a"}
+        out = b.issue(verb=INTAKE_VERB, params={"line": WORDS}, target={"kind": "create", "panel_id": "tray"},
+                      tier="C1", credential=cred, intent="sign")
+        done = b.submit(out["pending_id"], phone.sign(out["record"].encode()))
+        assert (done["state"], done["decision_kind"]) == ("COMMITTED", "ALLOWED")
+        (drop,) = _drops(qdir)
+        assert (drop.words, drop.surface) == (WORDS, "cockpit")
+    finally:
+        b.stop()
+
+
+def test_a_registered_store_without_a_directory_is_the_same_typed_501(home):
+    spores = home / "spores.json"
+    SporeStore(spores).add(type="task", text="a loop", origin_key="k.loop")
+    bare = SimpleNamespace(name=COORDINATOR)               # registered under "coordinator", no directory()
+    b = Broker(home / "data", stores={"spores": SporeEffectStore(spores),
+                                      COORDINATOR: CoordDropEffectStore(lambda: None)},
+               store_paths=[spores], install_class="reported")      # registration needs a real adapter; swapped below
+    b.start()
+    try:
+        for cs in (bare, SimpleNamespace(name=COORDINATOR, directory=lambda: None)):
+            b.stores[COORDINATOR] = cs                      # type: ignore[assignment]
+            with pytest.raises(BrokerError) as e:
+                b.issue(verb=INTAKE_VERB, params={"line": "plain words"}, target={"kind": "create", "panel_id": "tray"},
+                        tier="C1", credential={"class": "device", "fingerprint": "SHA256:" + "B" * 43,
+                                               "transport": "run"}, intent="sign")
+            assert (e.value.code, e.value.status) == ("not_built", 501)
+    finally:
+        b.stop()
+
+
+def test_a_coordinator_store_that_cannot_be_read_at_issue_is_a_503_not_a_500(world, monkeypatch):
+    from levain.cockpit.effects import TransientApplyFault
+
+    w = world
+
+    def locked(self, resource_key):
+        raise TransientApplyFault("OperationalError", "database is locked")
+
+    monkeypatch.setattr(CoordDropEffectStore, "snapshot", locked)
+    with pytest.raises(BrokerError) as e:
+        _issue(w)
+    assert (e.value.code, e.value.status) == ("source_unavailable", 503)
+    assert _drops(w.qdir) == []
+
+
+def test_a_fault_reading_the_drop_row_is_transient_like_the_open(home, monkeypatch):
+    from levain.coordinator.store import CoordError
+    from levain.cockpit.effects import TransientApplyFault
+
+    d = home / "d"
+    CoordStore(d).accept_drop("words", surface="cockpit", outbox_id=create_origin_key(PID, 0))
+
+    def boom(self, conn, drop_id):
+        raise CoordError("the row would not read")
+
+    monkeypatch.setattr(CoordStore, "_drop", boom)
+    with pytest.raises(TransientApplyFault):
+        CoordDropEffectStore(lambda: d).snapshot(drop_resource_key(create_origin_key(PID, 0)))
+
+
+def test_a_non_string_edit_target_does_not_take_the_title_down():
+    from levain.cockpit.providers import plain_edit_title
+
+    assert plain_edit_title("list_intake", None, "device:ab12") == "added a line, from a signed device"  # type: ignore[arg-type]
+
+
+def test_the_store_assigned_fields_are_the_row_the_store_emits():
+    from levain.cockpit.coord_effects import DROP_FIELDS, DROP_STORE_ASSIGNED
+
+    drop = SimpleNamespace(words="w", drop_id="d", outbox_id="o", surface="cockpit", words_sha256="s")
+    emitted = set(CoordDropEffectStore._row(drop)) - set(DROP_FIELDS)
+    assert emitted == set(DROP_STORE_ASSIGNED)

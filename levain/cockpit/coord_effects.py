@@ -12,6 +12,12 @@ Known edge: a coordinator directory or store that is missing is created by the w
 browser-token path does; only a read (``snapshot``) never makes one. ``snapshot`` reads the drop through the store's
 private ``_drop`` on a read-only connection because the public ``drop_by_outbox`` opens the store for writing and so
 would create it.
+
+Known edges (closed as design, not code): the coordinator directory is resolved when the drop is written, not bound
+into the signed effect, so a pending signed under one LEVAIN_HOME and decided (or recovered) after a restart under
+another, with the same ledger root, writes to the second directory (the directory comes from the process
+environment, fixed for a server's life); and the broker's local-filesystem check covers the spore and episode
+stores, not the coordinator directory (resolved per call).
 """
 
 from __future__ import annotations
@@ -37,7 +43,7 @@ COORD_DROP_VERB = "coordinator_drop"
 DROP_KEY_PREFIX = "drop:"
 DROP_FIELDS = ("text",)
 # the store fills these at write; none sits in the effect's ``changes``
-DROP_STORE_ASSIGNED = ("drop_id", "origin_key", "outbox_id", "surface")
+DROP_STORE_ASSIGNED = ("drop_id", "outbox_id", "surface", "sha")
 
 
 def drop_resource_key(origin_key: str) -> str:
@@ -118,7 +124,7 @@ class CoordDropEffectStore:
         try:
             found = conn.execute("SELECT drop_id FROM drops WHERE outbox_id = ?", (key,)).fetchone()
             drop = None if found is None else store._drop(conn, found[0])
-        except (sqlite3.Error, OSError) as exc:
+        except (CoordError, OSError, sqlite3.Error, DispatchError) as exc:
             raise TransientApplyFault.of(exc) from exc
         finally:
             conn.close()

@@ -872,7 +872,10 @@ class Broker:
                 raise BrokerError("intake_refused", 422, str(exc)) from None
             if parsed["kind"] == "sort":
                 cs = self.stores.get(COORDINATOR)
-                if cs is None or cs.directory() is None:
+                # ``directory`` is not part of the EffectStore protocol: a store without it, or one that names none,
+                # is the same typed 501
+                directory = getattr(cs, "directory", None)
+                if cs is None or not callable(directory) or directory() is None:
                     raise BrokerError("not_built", 501, "this cockpit names no coordinator store, so there is no "
                                                         "desk to sort it")
                 reading = {"kind": "sort", "text": parsed["text"]}
@@ -889,6 +892,8 @@ class Broker:
             if cs is None:
                 raise BrokerError("not_built", 501, "no coordinator store is registered with the broker")
             ok = create_origin_key(pid, 0)
+            # a locked store faults TransientApplyFault: issue() turns it into the 503 source_unavailable, as for any
+            # source read (and a decision leaves the signed pending unspent)
             eff = COORD_CANONICAL[COORD_DROP_VERB]({"text": reading["text"]}, cs.snapshot(drop_resource_key(ok)).row,
                                                    origin_key=ok)
             return _Built({"kind": "create", "panel_id": target.get("panel_id"), "intake": {
@@ -935,7 +940,7 @@ class Broker:
                 line = {"WAITING": "to be sent to the desk to sort, awaiting your signature",
                         "applying": "being sent to the desk to sort",
                         "COMMITTED_INCOMPLETE": "not sent to the desk: the desk's store refused it",
-                        "STALE": "not sent to the desk: it changed before you signed"}.get(
+                        "STALE": "not sent to the desk: another drop already holds its place"}.get(
                             state, "not sent to the desk")
             return {"receipt": out, "receipt_line": line, **({"drop_id": drop_id} if drop_id else {})}
         if state == "COMMITTED":
