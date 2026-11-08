@@ -759,7 +759,9 @@ class Broker:
             held = dict(self._pending.get(who.session, {}))
         # pending = unexpired, not granted, and no VERIFIED answer: any levain-queue member can create a file at an
         # answer name, so a file that is not the operator's signed answer for that request frees no place
-        settled = {i for i, exp in held.items() if exp <= now or self._granted(i) or self._answer_settles(i)}
+        settled = {i for i, exp in held.items() if exp <= now or self._granted(i)}
+        if not granted:
+            self._settle_answered(who.session, [i for i in held if i not in settled], settled)
         key = _quota_key(who.session, who.run)
         with self._mutex:
             mine = self._pending.setdefault(who.session, {})
@@ -787,9 +789,27 @@ class Broker:
         # a linked row's receipts are written by _file, after any grant row
         return None if linked else "request-exists"
 
-    def _answer_settles(self, request_id: str) -> bool:
+    def _settle_answered(self, session: str, open_ids: list[str], settled: set[str]) -> None:
+        """Add to ``settled`` held rows of ``open_ids`` whose answer verifies, only while the session is at its cap
+        and only until one place is free: the verification is the expensive part, and the files it reads are the
+        agent's to rewrite, so a filing pays for no more of it than its answer needs. Refusals log one line per
+        kind, never one per row."""
+        need = len(open_ids) - self._pending_cap + 1
+        refused: dict[str, list[tuple[str, str]]] = {}
+        for request_id in open_ids:
+            if need <= 0:
+                break
+            if self._answer_settles(request_id, refused):
+                settled.add(request_id)
+                need -= 1
+        for kind, hits in refused.items():
+            log.warning("qbroker: filing for session %s: %d held answer(s) %s, their rows stay pending (first: %s): %s",
+                        session, len(hits), kind, hits[0][1], ", ".join(i for i, _ in hits))
+
+    def _answer_settles(self, request_id: str, refused: dict[str, list[tuple[str, str]]]) -> bool:
         """Whether ``request_id`` holds an answer :meth:`_answered` accepts (its decision is recorded as a poll would
-        record it). Anything else, a check that fails included, keeps the row in the pending cap: the stricter side."""
+        record it). Anything else, a check that fails included, keeps the row in the pending cap: the stricter side.
+        Why an answer was refused goes into ``refused``, by kind, for the caller to log."""
         try:
             if not self._store.has_answer(request_id):
                 return False
@@ -797,9 +817,9 @@ class Broker:
             request = stored_request(row, self._store.queue_id, request_id)
             if request is None:
                 return False
-            decision, _ = self._answered(row, request, self._clock())
-        except Exception:
-            log.exception("qbroker: the answer for %s could not be checked; its row stays pending", request_id)
+            decision, _ = self._answered(row, request, self._clock(), refused=refused)
+        except Exception as exc:
+            refused.setdefault("could not be checked", []).append((request_id, f"{type(exc).__name__}: {exc}"))
             return False
         return decision is not None
 
@@ -1078,15 +1098,22 @@ class Broker:
                     return request_id
         return None
 
-    def _answered(self, row: Mapping[str, Any], request: ExternalGateRequest,
-                  now: datetime) -> tuple[str | None, bool]:
+    def _answered(self, row: Mapping[str, Any], request: ExternalGateRequest, now: datetime, *,
+                  refused: dict[str, list[tuple[str, str]]] | None = None) -> tuple[str | None, bool]:
         """``(decision, False)`` for a verified answer row, ``(None, False)`` when there is none, ``(None, True)``
-        when the row there is not authority (the reason is logged)."""
+        when the row there is not authority (the reason is logged, or collected by kind into ``refused``)."""
         request_id = request.id
+
+        def note(kind: str, why: Any) -> None:
+            if refused is None:
+                log.warning("qbroker: %s for %s: %s", kind, request_id, why)
+            else:
+                refused.setdefault(kind, []).append((request_id, str(why)))
+
         try:
             got = self._store.read_answer_stamped(request_id)
         except (ValueError, OSError) as exc:
-            log.warning("qbroker: answer row for %s refused: %s", request_id, exc)
+            note("answer row refused", exc)
             return None, True
         if got is None:
             return None, False
@@ -1094,7 +1121,7 @@ class Broker:
         try:
             snapshot = self._signers.current()
         except Exception as exc:                      # a snapshot that cannot be read verifies nothing
-            log.warning("qbroker: signers snapshot unreadable for %s: %s", request_id, exc)
+            note("signers snapshot unreadable", exc)
             return None, True
         with self._mutex:
             hit = self._verdicts.get(request_id)
@@ -1103,7 +1130,7 @@ class Broker:
         if hit is not None and hit[0] == identity and hit[1] is snapshot:
             decision = hit[2]
         else:
-            decision = self._verdict(row, request, answer, snapshot, now)
+            decision = self._verdict(row, request, answer, snapshot, now, note)
             with self._mutex:
                 self._verdicts[request_id] = (identity, snapshot, decision)
                 self._verdicts.move_to_end(request_id)
@@ -1112,7 +1139,7 @@ class Broker:
         return decision, decision is None
 
     def _verdict(self, row: Mapping[str, Any], request: ExternalGateRequest, answer: Mapping[str, Any],
-                 snapshot: SignersSnapshot | None, now: datetime) -> str | None:
+                 snapshot: SignersSnapshot | None, now: datetime, note: Any) -> str | None:
         """The verified decision ``answer`` carries, recorded in the broker's receipts (or recorded there already),
         or ``None`` when it is not authority."""
         request_id = request.id
@@ -1124,6 +1151,6 @@ class Broker:
             why = self._receipts.decided(request, payload["decision"], payload["signer_fp"],
                                          payload["receipts_head"], utc_stamp(now))
         if why is not None:
-            log.warning("qbroker: answer for %s refused: %s", request_id, why)
+            note("answer refused", why)
             return None
         return payload["decision"]

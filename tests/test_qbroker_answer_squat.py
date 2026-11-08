@@ -257,3 +257,50 @@ def test_a_signed_answer_lists_its_row_as_answered_only_against_a_signers_snapsh
     listed = {r.request_id: r for r in operator.rows(L / "queue", now=LATER, signers=rbase.snapshot(L))}
     assert (listed[rid].state, listed[rid].answered) == ("pending", True)
     assert [r.answered for r in operator.rows(L / "queue", now=LATER)] == [False]   # no snapshot: nothing verifies
+
+
+# --- prel3fix r1 F4: the cap test runs first; held answers are verified lazily, and refusals log once per kind ---------
+
+def spy_checks(broker, monkeypatch):
+    real, seen = broker._answer_settles, []
+
+    def spy(request_id, *a, **kw):
+        seen.append(request_id)
+        return real(request_id, *a, **kw)
+
+    monkeypatch.setattr(broker, "_answer_settles", spy)
+    return seen
+
+
+def test_a_session_under_its_cap_verifies_no_held_answer(L, broker, keys, answers, monkeypatch):
+    rids = [filed(broker, fields=hook_fields(f"p{i}")) for i in range(PENDING_PER_SESSION - 1)]
+    for rid in rids:
+        squat(L, keys, answers, rid, "junk")
+    seen = spy_checks(broker, monkeypatch)
+    assert req(broker, fields=hook_fields("over"))["ok"] is True
+    assert seen == []
+
+
+def test_verification_stops_as_soon_as_one_place_is_free(L, broker, keys, answers, monkeypatch):
+    rids = [filed(broker, fields=hook_fields(f"p{i}")) for i in range(PENDING_PER_SESSION)]
+    write_answer(L, rids[0], keys["operator"])
+    for rid in rids[1:]:
+        squat(L, keys, answers, rid, "junk")
+    seen = spy_checks(broker, monkeypatch)
+    assert req(broker, fields=hook_fields("over"))["ok"] is True
+    assert seen == [rids[0]]
+
+
+def test_a_session_at_its_cap_with_junk_is_busy_and_logs_one_line_per_refusal_kind(L, broker, keys, answers,
+                                                                                  monkeypatch, caplog):
+    rids = [filed(broker, fields=hook_fields(f"p{i}")) for i in range(PENDING_PER_SESSION)]
+    for rid in rids:
+        squat(L, keys, answers, rid, "junk")
+    seen = spy_checks(broker, monkeypatch)
+    caplog.clear()
+    with caplog.at_level("WARNING", logger="levain.qbroker"):
+        got = req(broker, fields=hook_fields("over"))
+    assert got["ok"] is False and got["refused"] == "queue-busy", got
+    assert sorted(seen) == sorted(rids)                  # every held row had to be checked to know the cap is full
+    lines = [r for r in caplog.records if r.name == "levain.qbroker"]
+    assert len(lines) == 1 and all(rid in lines[0].getMessage() for rid in rids), [r.getMessage() for r in lines]
