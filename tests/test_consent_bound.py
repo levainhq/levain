@@ -263,7 +263,7 @@ def test_shell_tools_are_the_authority_list():
     assert bound.SHELL_TOOLS is authority.CONSENT_SHELL_TOOLS
 
 
-@pytest.mark.parametrize("tool", ["PowerShell", "Bash", "exec_command"])
+@pytest.mark.parametrize("tool", ["PowerShell", "Bash", "exec_command", "shell", "shell_command", "local_shell"])
 def test_every_consent_shell_tool_reads_touched(tool):
     rec = classify("codex", "PostToolUse", tool, {"chars": "x"}, "sandbox_apply: Operation not permitted\n",
                    bound_active=True)
