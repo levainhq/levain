@@ -128,6 +128,9 @@ FACETS: dict[str, tuple[str, Callable[[Any], bool]]] = {
     # the host's band section for a question ("you" / "desk") and whether a desk row also lists under "you"; passed through as data
     "question_section": ("enum", _enum("you", "desk")),
     "question_carried": ("bool", _is_bool),
+    # an open question snoozed past today (band_view.later_of): the day (YYYY-MM-DD) and its words ("Mon", "Tue 11-10")
+    "question_later": ("str", _is_str),
+    "question_later_words": ("str", _is_str),
     # an agent's note (levain.consent.notes): its number and whether it was dismissed; its words are never a facet
     "note_n": ("int", _is_int),
     "note_state": ("enum", _enum("open", "dismissed")),

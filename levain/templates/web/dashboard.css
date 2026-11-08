@@ -3624,3 +3624,5 @@ a.nc-pick.is-rec:hover { border-color: var(--text); }
 .vc-check { width: 24px; height: 24px; }
 .voice-ctl { display: inline-flex; align-items: center; gap: var(--sp-3); }
 .voice-btn { min-height: var(--hit-min, 44px); }
+.needs-later { display: flex; flex-direction: column; gap: 2px; padding: 4px 2px; }
+.needs-later-line { display: flex; gap: 6px; align-items: baseline; }
