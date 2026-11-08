@@ -1511,7 +1511,7 @@ def _install_file(path: Path, content: str, mode: int, *, validate: tuple[str, .
     installed tree, like ``sshd -t``); if it fails the file is removed again. A drop-in that fails
     validation is never left installed: a broken sudoers.d file breaks sudo for the whole machine.
     Durable once it returns: the temp file is synced before the rename and the directory after it, so a
-    power cut leaves the old file or the whole new one (records such as the operator's go through here)."""
+    power cut leaves the old file or the whole new one."""
     path.parent.mkdir(parents=True, exist_ok=True)
     # Same directory, so the final rename is atomic and never crosses filesystems; the ".tmp" suffix
     # makes sudo ignore the file while it is being validated (sudoers.d skips names with a ".").
