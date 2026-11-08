@@ -1121,6 +1121,50 @@ def open_spores(timeout: float = 2.0) -> list[dict]:
         return [s for s in data if isinstance(s, dict) and _is_loop(s)]
     return []
 
+_WHEN_RE = re.compile(r"(\d{4}-\d{2}-\d{2})(?:T(\d{2}:\d{2}))?")
+
+
+def due_agendas(spores: list, now: datetime | None = None) -> list[dict]:
+    """Open AGENDA spores that have come due and are not yet germinated (TS-3): a date-only `next` on or before
+    today, a timed `next` (YYYY-MM-DDTHH:MM, local) from that minute; no `next`, a malformed one or a stamped
+    `germinated` is never due. Mirrors levain.germinate.is_due (this file is stranger-side and imports nothing of it)."""
+    now = now or datetime.now()
+    due = []
+    for s in spores:
+        if not isinstance(s, dict) or str(s.get("disposition") or "").strip().casefold() != "agenda":
+            continue
+        if s.get("germinated"):
+            continue
+        raw = s.get("next")
+        m = _WHEN_RE.fullmatch(raw) if isinstance(raw, str) else None
+        if m is None:
+            continue
+        try:
+            when = datetime.strptime(m.group(1) + "T" + (m.group(2) or "00:00"), "%Y-%m-%dT%H:%M")
+        except ValueError:
+            continue
+        if now >= when:
+            due.append(s)
+    return due
+
+
+def open_agendas(timeout: float = 2.0) -> list[dict]:
+    """Every open spore as anneal lists it, unfiltered (open_spores drops the agenda disposition by design)."""
+    data = _anneal_json(["spore", "list", "--json"], timeout, validator=lambda d: isinstance(d, list))
+    return [s for s in data if isinstance(s, dict)] if isinstance(data, list) else []
+
+
+def start_germinate(agent: str = "claude_code") -> bool:
+    """Spawn `levain spores germinate` detached for THIS install (no wait, no stdio). False on any failure."""
+    try:
+        subprocess.Popen([sys.executable, "-P", "-m", "levain", "spores", "germinate",
+                          "--path", str(install_root()), "--agent", agent],
+                         stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                         start_new_session=True, close_fds=True)
+        return True
+    except Exception:
+        return False
+
 
 # Tokens of 3+ word-chars; common words that would create false collisions are
 # dropped so a >=2-token overlap means genuine content kinship, not "the"/"and".
