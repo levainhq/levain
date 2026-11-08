@@ -450,3 +450,27 @@ def test_lpr3_a_list_holding_only_desk_or_later_rows_draws_them_in_the_text_cock
     _band_with(monkeypatch, r, **fields)
     out = "\n".join(t for _s, t in render_lines(snapshot(r.ck), now=NOW))
     assert heading in out and "Ship the sweep fix tonight?" in out, out
+
+
+def test_lpr3_later_rows_sort_by_return_date_then_band_number_as_the_footer_does(rig: Rig, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Band #1 returns Dec 1 and #2 returns Nov 9: #2 is listed first; the same date falls back to the band number."""
+    from dataclasses import replace
+
+    q2 = rig.qs.file(agent="claude_code", agent_session_id="sess-2", what="Second question?",
+                     options=[("a", "A"), ("b", "B")], rec="a", blocks="x", cwd="/w/levain")
+    real = band_view._read
+    days = {rig.q.id: "2026-12-01", q2.id: "2026-11-09"}
+
+    def read(store: Any) -> Any:
+        items, numbers, closed = real(store)
+        return [(ref, replace(q, snoozed_until=days[q.id]) if q is not None and q.id in days else q) for ref, q in items], {rig.q.id: 1, q2.id: 2}, closed
+
+    monkeypatch.setattr(band_view, "_read", read)
+    p = rig.panel()
+    later = [r for r in p["rows"] if r["group"] == "later"]
+    nums = {r["id"]: r["facets"].get("band_number") for r in later}
+    assert [r["id"] for r in later] == [f"band:{q2.id}", f"band:{rig.q.id}"], (nums, [r["facets"].get("held_until") for r in later])
+    assert nums[f"band:{rig.q.id}"] < nums[f"band:{q2.id}"], nums           # the band number alone would have said the opposite
+    days[q2.id] = "2026-12-01"                                              # one date: the band number decides
+    later = [r for r in rig.panel()["rows"] if r["group"] == "later"]
+    assert [r["id"] for r in later] == [f"band:{rig.q.id}", f"band:{q2.id}"]

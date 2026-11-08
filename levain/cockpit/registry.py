@@ -450,7 +450,9 @@ def _list_key(row: RowIn, today: date) -> tuple:
     f = row.facets
     s = f.get("surface")
     if s == "band":
-        return (_int_or_big(f.get("band_number")), row.id)
+        # a LATER row comes back on its date: the footer lists them by return day, then band number
+        back = parse_date(f.get("held_until")) if f.get("band_section") != "desk" else None
+        return (back.toordinal() if back else 0, _int_or_big(f.get("band_number")), row.id)
     if s == "board":
         return (_int_or_big(f.get("board_rank")), row.id)
     if s == "talk":                         # oldest first; a talk with no known age goes last
