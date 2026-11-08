@@ -2070,7 +2070,7 @@
       const lead = /^([a-z][a-z0-9_-]{1,23}):\s/.exec(String(s.text || ""));
       // the lead word is an origin only when it is a repo this page already knows (the sky's registry) or "desk" / "flow":
       // "note: call Alice" and "re: invoice" lead with a word, not an origin
-      const leadOrigin = lead && knownOrigin(lead[1]) ? lead[1] : "";
+      const leadOrigin = lead ? knownOrigin(lead[1]) : "";
       const origin = (typeof s.repo === "string" && s.repo) || (!foreign && typeof s.domain === "string" && s.domain) || leadOrigin;
       originDrawn = !!origin;
       if (origin) { const pill = el("span", "k7-repo", String(origin)); pill.dataset.repoFacet = String(origin); pill.dataset.originPill = "1"; host.appendChild(pill); }
@@ -2405,6 +2405,7 @@
   // ONE media listener for every such input, registered once: an input opts in by data-ph-wide / data-ph-narrow, and the
   // listener sets every opted-in input still in the document (a rebuilt List leaves its old inputs out of it).
   let phListening = false;
+  let phMq = null;   // held at module scope so the browser cannot collect the list and stop delivering "change"
   function phNarrow() { try { return typeof window.matchMedia === "function" && window.matchMedia("(max-width: 720px)").matches; } catch (e) { return false; } }
   function setPlaceholders() {
     const narrow = phNarrow();
@@ -2415,17 +2416,21 @@
     input.setAttribute("data-ph-narrow", narrow);
     input.placeholder = phNarrow() ? narrow : wide;
     if (!phListening && typeof window.matchMedia === "function") {
-      phListening = true;
-      try { const mq = window.matchMedia("(max-width: 720px)"); if (mq.addEventListener) mq.addEventListener("change", setPlaceholders); } catch (e) { /* the placeholder then keeps its first choice */ }
+      try {
+        phMq = window.matchMedia("(max-width: 720px)");
+        if (phMq && typeof phMq.addEventListener === "function") { phMq.addEventListener("change", setPlaceholders); phListening = true; }   // only once it is registered
+      } catch (e) { /* the placeholder keeps its first choice; a later call may try again */ }
     }
   }
-  // an origin a List row's lead word may name: a repo the sky's registry knows, or "desk" / "flow"
+  // an origin a List row's lead word may name: a repo the sky's registry knows, or "desk" / "flow".
+  // Returns the canonical name (the registry's own spelling), or "" when the word is no origin.
   function knownOrigin(word) {
     const w = String(word).toLowerCase();
-    if (w === "desk" || w === "flow") return true;
+    if (w === "desk" || w === "flow") return w;
     const sky = window.LevainSky;
     const names = sky && typeof sky.repos === "function" ? sky.repos() : [];
-    return names.some((n) => String(n).toLowerCase() === w);
+    const hit = names.find((n) => String(n).toLowerCase() === w);
+    return hit === undefined ? "" : String(hit);
   }
   function buildListIntake() {
     const box = el("div", "tray-dump list-intake");

@@ -305,6 +305,10 @@ def test_listfix2_one_pill_one_listener_and_known_origins_only(tmp_path: Path) -
             {"eval": "localStorage.setItem('levain.tray.showHeld', '1'); 1"},
             *_reload(),
             {"until": f"{TRAY} && {TRAY}.querySelectorAll('.sp-results .row[data-surface=band]').length > 1 && 1"},
+            # the registry must know "levain" and that row must have drawn its pill before the probe reads it
+            {"until": f"window.LevainSky && window.LevainSky.repos().includes('levain') && {TRAY} && "
+                      f"[...{TRAY}.querySelectorAll('.sp-results .row')].some(r => (r.querySelector('.clause')||{{}}).textContent "
+                      f"&& r.querySelector('.clause').textContent.startsWith('levain:') && r.querySelector('.k7-repo')) && 1"},
             {"eval": _LISTFIX_PROBE},
             {"eval": "JSON.stringify({adds: window.__mqAdds})"},
             # rebuild the List the way the page does on a refresh: the tab coming back
@@ -333,6 +337,8 @@ def test_listfix2_one_pill_one_listener_and_known_origins_only(tmp_path: Path) -
         if got != [lead]:
             bad.append(f"C: '{lead}:' should show {lead}, got {got}")
     first, after = vals[1]["adds"], vals[2]["adds"]
+    if first != 1:
+        bad.append(f"B: expected exactly one media listener after the first build, got {first}")
     if after != first:
         bad.append(f"B: the media listener count grew {first} -> {after}")        # B: no listener per rebuild
     assert vals[3]["ph"].startswith("@mon 9am call X · "), vals[3]                 # narrow at 390
