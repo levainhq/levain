@@ -50,6 +50,10 @@ INFRASTRUCTURE: frozenset[str] = frozenset({
     # the room's relay (a message of his handed to the desk): a claim and its outcome, append-only, no gseq, so by the rule
     # that classified proposal_events they are bookkeeping; the desk thread a sent relay reaches is counted in its own tables
     "room_relay_claims", "room_relay_outcomes",
+    # the board store (row 156): a worker's attach facts and the refusals of a report that could not be validated. Each takes
+    # a gseq in its own transaction, but a fact about who works on an item is read by the Work lens, not counted as
+    # something that happened since the operator left; promoting either to COUNTED is the head's call
+    "worker_attach", "report_refusals",
 })
 
 _DISPATCH = ("ordered by dispatch's own transitions; the open brief does not report dispatch jobs (the board and the "

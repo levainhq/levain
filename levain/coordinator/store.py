@@ -493,7 +493,13 @@ class CoordStore:
     _SCHEMA: tuple[str, ...] = SCHEMA
 
     def __init__(self, directory: Path | str | None = None, *,
-                 clock: Callable[[], datetime] = lambda: datetime.now(timezone.utc)) -> None:
+                 clock: Callable[[], datetime] = lambda: datetime.now(timezone.utc),
+                 role: str = "coordinator") -> None:
+        # ``role="service"`` (the board store's applier, :mod:`levain.coordinator.work_attach`) records facts only: every
+        # write that is not its own is refused in :meth:`_write`, the one door each of them goes through
+        if role not in ("coordinator", "service"):
+            raise CoordError(f"a store's role is coordinator or service, not {str(role)[:20]!r}")
+        self.role = role
         # the file, its format marker, its store_id and its directory rule are the dispatch store's: one owner
         self._jobs = JobStore(directory, clock=clock)
         self.directory = self._jobs.directory
@@ -518,13 +524,14 @@ class CoordStore:
         from levain.coordinator.seam_handoffs import SEAM_HANDOFF_SCHEMA
         from levain.coordinator.seam_open import OPEN_SCHEMA
         from levain.coordinator.teamdrafts import DRAFT_SCHEMA
+        from levain.coordinator.work_attach import WORK_SCHEMA
         from levain.coordinator.work_delta import OPERATOR_VIEWS_SCHEMA
 
         # the lease is checked by every opener's coordinator writes, so its tables are every opener's; C13's lifecycle
         # tables (ready items + their journal) are additive, IF NOT EXISTS, like every statement here
         return (*(SCHEMA if base else self._SCHEMA), *LEASE_SCHEMA, *DRAFT_SCHEMA, *REVIEW_SCHEMA, *FIRST_READER_SCHEMA,
                 *((*LIFECYCLE_SCHEMA, *OPERATOR_VIEWS_SCHEMA, *SEAM_SCHEMA, *SEAM_HANDOFF_SCHEMA, *OPEN_SCHEMA,
-                  *INTAKE_SCHEMA, *MISSION_SCHEMA)
+                  *INTAKE_SCHEMA, *MISSION_SCHEMA, *WORK_SCHEMA)
                 if lifecycle else ()))
 
     def _connect(self, *, create: bool = True) -> sqlite3.Connection:
@@ -584,7 +591,9 @@ class CoordStore:
                 ensure_foreign_clear(conn)
                 _all_gseq(conn)
                 from levain.coordinator.lease import migrate_settings
+                from levain.coordinator.ready import migrate_item_facts
                 migrate_settings(conn)
+                migrate_item_facts(conn)
                 if rebuilt:
                     what = " and ".join(rebuilt)
                     broken = _dangling_after(conn, rebuilt)
@@ -753,6 +762,12 @@ class CoordStore:
         write moved (a thread's state, a detach, a beat of either kind). A write that rolls back reconciles nothing."""
         if by != "coordinator" and token is not None:
             raise CoordError("a lease token is the coordinator's; your own writes carry none")
+        # THE ROLE SPLIT (ruled 11-08): a service-role store records facts, never decides. Every decide-class write
+        # (a ready add/move/correct, a thread's state, a lease claim, a review clear) goes through here under its own
+        # ``by``, so the check is at the point of use, before the lease is looked at
+        if self.role == "service" and by != "service":
+            raise CoordError("the service records facts only: a write that decides (assign, move, close, claim) is "
+                             "the coordinator's, and no state was written")
         with write_transaction(lambda: self._connect(create=create)) as conn:
             if not create and not self._schema_current(conn, base=True):
                 raise StoreAbsent(f"{self.path} does not hold the coordinator's current tables")
