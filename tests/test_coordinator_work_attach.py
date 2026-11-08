@@ -149,3 +149,41 @@ def test_apply_is_idempotent_and_defers_on_an_unreadable_listing(board, coord):
     assert later.applied == ["r-sess"] and counts()[0] == [(before[0][0][0] + 1,)]
     assert [r[0] for r in _rows(board, "SELECT kind FROM worker_attach WHERE worker = 'wa2a' ORDER BY seq")] == [
         "attach", "progress"]
+
+
+# ------------------------------------------------------------------------------------------------ L1/L2 round 1 (r156fA)
+def test_f1_the_service_role_refuses_by_what_a_write_does_not_by_its_label(board, coord):
+    from levain.coordinator.store import Part
+    store, token, _ = coord
+    d = store.accept_drop("a thread on the board store", surface="cli")[0]
+    t = store.split(d.drop_id, [Part("work", "x")], by="operator")[0]
+    svc = CoordStore(board, role="service")
+    with pytest.raises(CoordError):
+        svc.set_state(t.thread_id, "closed", by="service")
+    # the store's own close, labelled the service, through the service's own door: refused by what it writes
+    with pytest.raises(CoordError, match="service records facts only"):
+        with svc._write("service", None, create=False) as (conn, now):
+            svc._close(conn, t.thread_id, "closed by a bookkeeping pass", "service", now)
+    with pytest.raises(CoordError, match="service records facts only"):
+        with svc._write("service", None, create=False) as (conn, now):
+            conn.execute("DELETE FROM gseq")
+    assert store.thread(t.thread_id).state == "open"
+
+
+def test_f2_a_service_row_after_a_version_gap_is_refused(board, coord):
+    store, token, _ = coord
+    c = sqlite3.connect(board / "dispatch.db")
+    try:
+        c.execute("DROP TRIGGER ready_journal_next")      # a hand-edited store: the one way a version gap is built
+        for ver in (2, 3):                       # the journal moves on twice; the item's version 2 is never written
+            g = c.execute("INSERT INTO gseq (at) VALUES ('x')").lastrowid
+            c.execute("INSERT INTO ready_journal (id, ver, gseq, ts, iso, at, repo, from_status, to_status, "
+                      "from_category, to_category, who, why, source, applied_by, lease_token) VALUES ('levain:a', ?, ?, "
+                      "0, 'x', 'x', 'levain', 'ready', 'ready', 'ready', 'ready', 'service', 'gap', 'correction', NULL, "
+                      "?)", (ver, g, token))
+        with pytest.raises(sqlite3.IntegrityError, match="service records facts only"):
+            c.execute("INSERT INTO ready_items (id, ver, repo, title, status, category, tier, done_line, depends_on, "
+                      "rank, set_by, set_at) VALUES ('levain:a', 3, 'levain', 'retitled past a gap', 'ready', 'ready', "
+                      "NULL, NULL, '[]', 1, 'service', 'x')")
+    finally:
+        c.close()

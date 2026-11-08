@@ -222,6 +222,33 @@ SEAM_SCHEMA: tuple[str, ...] = (
 )
 
 
+# The service role's writes (row 156 L2 F1): the fact tables, the item and journal rows a landed sha writes (the ready
+# triggers refuse a service row that changes anything else), its own lease rows and the store-wide sequence. Only
+# ``sessions_seen`` is ever updated (its last sighting moves forward). Everything else, and every delete or schema
+# change, is refused.
+_SERVICE_INSERTS = frozenset({"worker_attach", "report_refusals", "sessions_seen", "ready_items", "ready_journal",
+                              "lease_events", "gseq"})
+_SERVICE_UPDATES = frozenset({"sessions_seen"})
+_SERVICE_NEVER = frozenset(getattr(sqlite3, name) for name in (
+    "SQLITE_DELETE", "SQLITE_CREATE_INDEX", "SQLITE_CREATE_TABLE", "SQLITE_CREATE_TEMP_INDEX",
+    "SQLITE_CREATE_TEMP_TABLE", "SQLITE_CREATE_TEMP_TRIGGER", "SQLITE_CREATE_TEMP_VIEW", "SQLITE_CREATE_TRIGGER",
+    "SQLITE_CREATE_VIEW", "SQLITE_DROP_INDEX", "SQLITE_DROP_TABLE", "SQLITE_DROP_TEMP_INDEX", "SQLITE_DROP_TEMP_TABLE",
+    "SQLITE_DROP_TEMP_TRIGGER", "SQLITE_DROP_TEMP_VIEW", "SQLITE_DROP_TRIGGER", "SQLITE_DROP_VIEW", "SQLITE_ATTACH",
+    "SQLITE_DETACH", "SQLITE_ALTER_TABLE", "SQLITE_REINDEX", "SQLITE_CREATE_VTABLE", "SQLITE_DROP_VTABLE")
+    if hasattr(sqlite3, name))
+
+
+def _service_authorizer(action: int, arg1: str | None, _arg2: str | None, database: str | None,
+                        _source: str | None) -> int:
+    if action == sqlite3.SQLITE_INSERT:
+        ok = arg1 in _SERVICE_INSERTS and database == "main"
+    elif action == sqlite3.SQLITE_UPDATE:
+        ok = arg1 in _SERVICE_UPDATES and database == "main"
+    else:
+        ok = action not in _SERVICE_NEVER
+    return sqlite3.SQLITE_OK if ok else sqlite3.SQLITE_DENY
+
+
 def next_gseq(conn: sqlite3.Connection, now: str) -> int:
     """The next number of the store-wide sequence, taken inside the caller's writing transaction."""
     return conn.execute("INSERT INTO gseq (at) VALUES (?)", (now,)).lastrowid
@@ -777,7 +804,19 @@ class CoordStore:
 
                 # the write and its record commit together: a write that rolls back leaves no "it wrote" behind
                 record_write(conn, now, fence(conn, now, token))
-            yield conn, now
+            if self.role != "service":
+                yield conn, now
+            else:
+                # the role split keyed on WHAT a statement writes, not on the ``by`` it was called with (row 156 L2
+                # F1): SQLite asks before it prepares each statement, so any write but a fact's is refused
+                conn.set_authorizer(_service_authorizer)
+                try:
+                    yield conn, now
+                except sqlite3.DatabaseError as exc:
+                    if "not authorized" not in str(exc):
+                        raise
+                    raise CoordError("the service records facts only: that statement writes something a fact never "
+                                     "does, and no state was written") from exc
         self._keep_awake()
 
     def _keep_awake(self) -> None:

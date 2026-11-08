@@ -144,7 +144,9 @@ LIFECYCLE_SCHEMA: tuple[str, ...] = (
     "OR NEW.from_status IS NOT NEW.to_status) "
     "BEGIN SELECT RAISE(ABORT, 'the service records facts only: it never adds or moves an item'); END",
     "CREATE TRIGGER IF NOT EXISTS ready_items_service_facts BEFORE INSERT ON ready_items WHEN NEW.set_by = 'service' "
-    "AND (NEW.ver = 1 OR EXISTS (SELECT 1 FROM ready_items p WHERE p.id = NEW.id AND p.ver = NEW.ver - 1 AND "
+    # a missing previous version (a gap) refuses too: there is nothing to compare the row with (row 156 L2 F2)
+    "AND (NEW.ver = 1 OR NOT EXISTS (SELECT 1 FROM ready_items p WHERE p.id = NEW.id AND p.ver = NEW.ver - 1) "
+    "OR EXISTS (SELECT 1 FROM ready_items p WHERE p.id = NEW.id AND p.ver = NEW.ver - 1 AND "
     "(p.repo IS NOT NEW.repo OR p.title IS NOT NEW.title OR p.status IS NOT NEW.status OR p.category IS NOT "
     "NEW.category OR p.tier IS NOT NEW.tier OR p.done_line IS NOT NEW.done_line OR p.depends_on IS NOT NEW.depends_on "
     "OR p.rank IS NOT NEW.rank OR p.hold IS NOT NEW.hold OR p.residue IS NOT NEW.residue OR p.ref IS NOT NEW.ref))) "
