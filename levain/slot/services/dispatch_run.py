@@ -1114,20 +1114,28 @@ class RunServer:
         """T7: the key's one END job, started if there is none or the last one finished UNPROVEN (a retry, never
         concurrent with another). A PROVEN job is kept for good and answers every repeat; past :data:`_JOBS_KEEP` jobs
         only finished unproven ones are dropped. A job whose thread cannot start is finished UNPROVEN on the spot, so it
-        never reads as in flight for good and the next END (or SYNC re-judge) starts a fresh one (L3 r1)."""
+        never reads as in flight for good and the next END (or SYNC re-judge) starts a fresh one (L3 r1).
+
+        The job is published under the shared ``mu`` and its thread started after ``mu`` is released: ``Thread.start``
+        can block, and ``mu`` is shared by both servers' END, SYNC re-judge and shutdown (PRE-W L3 r1, codex MED). A
+        caller that joins the published job before its thread runs waits on ``done`` like any other joiner; a start
+        failure finishes the published job under ``mu``, so every waiter on the key wakes with the failure."""
+        fresh: Optional[_EndJob] = None
         with self._mu:
             job = self._jobs.get(key)
             if job is None or (job.done.is_set() and job.result.terminated is not True):
-                job = self._jobs[key] = _EndJob()
-                try:
-                    threading.Thread(target=self._run_end, args=(key, job), daemon=True).start()
-                except Exception:  # noqa: BLE001
-                    job.result = StopResult(False, "END could not start; nothing assumed ended")
-                    job.done.set()
+                job = fresh = self._jobs[key] = _EndJob()
             if len(self._jobs) > _JOBS_KEEP:
                 for k in [k for k, j in self._jobs.items()
                           if k != key and j.done.is_set() and j.result.terminated is not True]:
                     del self._jobs[k]
+        if fresh is not None:
+            try:
+                threading.Thread(target=self._run_end, args=(key, fresh), daemon=True).start()
+            except Exception:  # noqa: BLE001
+                with self._mu:
+                    fresh.result = StopResult(False, "END could not start; nothing assumed ended")
+                    fresh.done.set()
         return job
 
     def _end(self, key: str, deadline_s: float) -> StopResult:

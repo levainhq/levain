@@ -648,3 +648,85 @@ def test_usage_of_a_brokered_key_asked_on_the_passthrough_socket_is_the_caps_nev
     assert (own["usd_micros"], own["source"]) == (4242, "session:brokered"), own
     sock.close()
 
+
+
+# --- L3 r1 (prewr2): the END job's thread starts outside the shared registry lock (codex MED) -------------------------
+
+class _EndLauncher:
+    """A launcher whose ``stop`` proves every END (all an END job calls)."""
+
+    def __init__(self):
+        self.stopped = []
+
+    def stop(self, key, deadline):
+        from levain.agents.accounting import StopResult
+        self.stopped.append(key)
+        return StopResult(True, "ended")
+
+
+def _end_server():
+    return DR.RunServer(_EndLauncher(), verify=lambda *a: None, pool_free=lambda: True, peer_ok=lambda s: True,
+                        registry=DR.HolderRegistry())
+
+
+def _patch_end_thread_start(monkeypatch, on_start):
+    """Route the start of an END job's thread (target ``_run_end``) through ``on_start(key, real_start)``; every other
+    thread starts as usual."""
+    import threading
+    real = threading.Thread
+
+    class Gated(real):
+        def __init__(self, *a, target=None, args=(), **kw):
+            super().__init__(*a, target=target, args=args, **kw)
+            self._gated_key = args[0] if getattr(target, "__name__", "") == "_run_end" else None
+
+        def start(self):
+            if self._gated_key is None:
+                return super().start()
+            return on_start(self._gated_key, super().start)
+    monkeypatch.setattr(threading, "Thread", Gated)
+
+
+def test_an_end_whose_thread_cannot_start_answers_the_failure_and_the_key_is_not_wedged(monkeypatch):
+    """A Thread.start that raises: the END caller gets the unproven failure by name, and a later END on the key starts
+    a fresh job that proves."""
+    srv = _end_server()
+
+    def boom(key, start):
+        raise RuntimeError("can't start new thread")
+    _patch_end_thread_start(monkeypatch, boom)
+    got = srv._end("s-k1", 2.0)
+    assert (got.terminated, got.detail) == (False, "END could not start; nothing assumed ended"), got
+    monkeypatch.undo()
+    again = srv._end("s-k1", 5.0)
+    assert again.terminated is True, again
+    assert srv.launcher.stopped == ["s-k1"]
+
+
+def test_a_slow_end_thread_start_does_not_hold_the_registry_lock(monkeypatch):
+    """codex MED: a stalled Thread.start for one key's END must not stall another key's END (or SYNC, or shutdown)
+    behind the shared ``mu``."""
+    import threading
+    gate, entered = threading.Event(), threading.Event()
+
+    def slow(key, start):
+        if key == "s-k1":
+            entered.set()
+            gate.wait(10)
+        return start()
+    _patch_end_thread_start(monkeypatch, slow)
+    srv = _end_server()
+    first: list = []
+    t = threading.Thread(target=lambda: first.append(srv._end("s-k1", 10.0)), daemon=True)
+    t.start()
+    try:
+        assert entered.wait(5)
+        other: list = []
+        u = threading.Thread(target=lambda: other.append(srv._end("s-k2", 2.0)), daemon=True)
+        u.start()
+        u.join(3)
+        assert other and other[0].terminated is True, "another key's END waited on a stalled END thread start"
+    finally:
+        gate.set()
+        t.join(10)
+    assert first and first[0].terminated is True
