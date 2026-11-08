@@ -740,6 +740,9 @@ class Step:
     call: Callable[[], tuple[bool, str]] | None = None
     skip_if: tuple[str, ...] = ()
     allow_fail: bool = False
+    #: Read-only: whether this step would act on this host. Only a step with no ``argv`` shape a reader can
+    #: recognise (a ``call`` step) sets it; the staged-tree launcher's ``--plan-only`` is its one reader.
+    probe: Callable[[], bool] | None = None
 
 
 @dataclass(frozen=True)
@@ -1224,7 +1227,15 @@ def _ensure_line(path: Path, line: str, *, present: bool, create: bool = False) 
     tmp = path.with_name(path.name + ".levain-tmp")
     tmp.write_text("".join(f"{ln}\n" for ln in wanted), encoding="utf-8")
     os.chmod(tmp, mode)
+    try:
+        _sync_file(tmp)
+    except OSError as e:
+        return False, f"{path}: not changed, the new list could not be synced: {e.strerror or e}"
     os.replace(tmp, path)
+    try:
+        _sync_dir(path.parent)
+    except OSError as e:
+        return False, f"{path}: changed, but its directory could not be synced: {e.strerror or e}"
     return True, ""
 
 
@@ -1495,13 +1506,36 @@ def run_plan(plan: Plan, *, dry_run: bool, emit: Callable[[str], None] = print) 
 
 
 def _durable_sync(fd: int) -> None:
-    """Force ``fd``'s data to the drive: on macOS ``fsync`` stops at the drive's cache and ``F_FULLFSYNC`` does not."""
+    """Force ``fd``'s data to the drive: on macOS ``fsync`` stops at the drive's cache and ``F_FULLFSYNC`` does not;
+    where a filesystem refuses ``F_FULLFSYNC`` (SMB, NFS, some FUSE mounts) it falls back to ``fsync``, the rule
+    ``levain.broker.creds.full_fsync`` states. Any other error propagates. The ONE sync every hands write uses."""
     if sys.platform == "darwin":
         import fcntl
 
-        fcntl.fcntl(fd, fcntl.F_FULLFSYNC)
-    else:
-        os.fsync(fd)
+        try:
+            fcntl.fcntl(fd, fcntl.F_FULLFSYNC)
+            return
+        except OSError:
+            pass
+    os.fsync(fd)
+
+
+def _sync_file(path: str | Path) -> None:
+    """:func:`_durable_sync` on the file at ``path``, opened without following a link."""
+    fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC)
+    try:
+        _durable_sync(fd)
+    finally:
+        os.close(fd)
+
+
+def _sync_dir(path: str | Path) -> None:
+    """:func:`_durable_sync` on the directory at ``path``: a rename into it is durable only after this."""
+    fd = os.open(path, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC)
+    try:
+        _durable_sync(fd)
+    finally:
+        os.close(fd)
 
 
 def _install_file(path: Path, content: str, mode: int, *, validate: tuple[str, ...],
@@ -1511,7 +1545,10 @@ def _install_file(path: Path, content: str, mode: int, *, validate: tuple[str, .
     installed tree, like ``sshd -t``); if it fails the file is removed again. A drop-in that fails
     validation is never left installed: a broken sudoers.d file breaks sudo for the whole machine.
     Durable once it returns: the temp file is synced before the rename and the directory after it, so a
-    power cut leaves the old file or the whole new one."""
+    power cut leaves the old file or the whole new one. A sync that fails fails the STEP with its reason
+    (never an exception out of the plan). A directory sync that fails still runs ``check``: the file is
+    installed either way, so it is judged, and the step then reports the directory as unsynced; a re-run
+    installs the same file again and converges."""
     path.parent.mkdir(parents=True, exist_ok=True)
     # Same directory, so the final rename is atomic and never crosses filesystems; the ".tmp" suffix
     # makes sudo ignore the file while it is being validated (sudoers.d skips names with a ".").
@@ -1526,28 +1563,26 @@ def _install_file(path: Path, content: str, mode: int, *, validate: tuple[str, .
                 return False, (r.stderr or r.stdout).strip()
         os.chown(tmp, 0, 0)
         # Synced after its mode and owner are set, so the new file arrives whole with both.
-        sfd = os.open(tmp, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC)
         try:
-            _durable_sync(sfd)
-        finally:
-            os.close(sfd)
+            _sync_file(tmp)
+        except OSError as e:
+            return False, f"{path}: not installed, its new content could not be synced: {e.strerror or e}"
         os.replace(tmp, path)
     finally:
         if os.path.exists(tmp):
             os.unlink(tmp)
+    unsynced = ""
     try:
-        dfd = os.open(path.parent, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC)
-        try:
-            _durable_sync(dfd)
-        finally:
-            os.close(dfd)
+        _sync_dir(path.parent)
     except OSError as e:
-        return False, f"{path}: moved into place, but its directory could not be synced: {e.strerror or e}"
+        unsynced = f"{path}: moved into place, but its directory could not be synced: {e.strerror or e}"
     if check is not None:
         ok, why = check()
         if not ok:
             path.unlink(missing_ok=True)
             return False, why
+    if unsynced:
+        return False, unsynced
     return True, ""
 
 
@@ -1587,8 +1622,11 @@ def record_hands(entity_dir: Path, values: dict | None, *, owner_uid: int, owner
         try:
             with os.fdopen(wfd, "w", encoding="utf-8") as fh:
                 fh.write(json.dumps(data, indent=2) + "\n")
+                fh.flush()
                 os.fchown(fh.fileno(), owner_uid, owner_gid)
+                _durable_sync(fh.fileno())
             os.replace(tmp, "confinement.json", src_dir_fd=dfd, dst_dir_fd=dfd)
+            _durable_sync(dfd)
         except BaseException:
             try:
                 os.unlink(tmp, dir_fd=dfd)

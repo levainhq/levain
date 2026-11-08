@@ -6,6 +6,7 @@ needs root and none starts a sandbox. The real setup/undo runs on Linux and macO
 """
 from __future__ import annotations
 
+import errno
 import json
 import os
 import stat
@@ -1076,3 +1077,89 @@ def test_an_installed_file_is_synced_before_its_rename_and_its_directory_after(t
     assert ok, why
     assert target.read_text() == "content\n"
     assert seen == [("file", False), ("dir", True)], seen
+
+
+# --- PREL3 fix2 r1: one durability helper for every hands write -------------------------------------------------------
+
+
+def _spy_sync(monkeypatch, target: Path, seen: list) -> None:
+    def spy(fd: int) -> None:
+        kind = "dir" if stat.S_ISDIR(os.fstat(fd).st_mode) else "file"
+        seen.append((kind, target.exists()))
+
+    monkeypatch.setattr(hands, "_durable_sync", spy)
+
+
+def test_ensure_line_is_synced_before_its_rename_and_its_directory_after(tmp_path: Path, monkeypatch) -> None:
+    """L1-F3/L2-S1: the retired-ids and deny lists are the record that stops an id being reissued; same class as 1a-11."""
+    f = tmp_path / "retired"
+    seen: list = []
+    _spy_sync(monkeypatch, f, seen)
+    assert hands._ensure_line(f, "7", present=True, create=True) == (True, "")
+    assert f.read_text() == "7\n"
+    assert seen == [("file", False), ("dir", True)], seen
+
+
+def test_ensure_line_reports_a_sync_failure_and_keeps_the_old_list(tmp_path: Path, monkeypatch) -> None:
+    f = tmp_path / "retired"
+    f.write_text("1\n")
+    monkeypatch.setattr(hands, "_durable_sync", lambda fd: (_ for _ in ()).throw(OSError(5, "I/O error")))
+    ok, why = hands._ensure_line(f, "7", present=True)
+    assert not ok and "could not be synced" in why
+    assert f.read_text() == "1\n"
+
+
+def test_record_hands_is_synced_before_its_rename_and_its_directory_after(tmp_path: Path, monkeypatch) -> None:
+    ent = tmp_path / "ent"
+    (ent / ".levain").mkdir(parents=True)
+    target = ent / ".levain" / "confinement.json"
+    seen: list = []
+    _spy_sync(monkeypatch, target, seen)
+    hands.record_hands(ent, {"hands_user": "h"}, owner_uid=os.getuid(), owner_gid=os.getgid())
+    assert json.loads(target.read_text()) == {"hands_user": "h"}
+    assert seen == [("file", False), ("dir", True)], seen
+
+
+def test_durable_sync_falls_back_to_fsync_where_full_fsync_is_refused(tmp_path: Path, monkeypatch) -> None:
+    import fcntl
+
+    calls: list[str] = []
+
+    def refuse(fd, op, *a):
+        raise OSError(errno.ENOTSUP, "not supported")
+
+    monkeypatch.setattr(hands.sys, "platform", "darwin")
+    monkeypatch.setattr(fcntl, "F_FULLFSYNC", 51, raising=False)
+    monkeypatch.setattr(fcntl, "fcntl", refuse)
+    monkeypatch.setattr(hands.os, "fsync", lambda fd: calls.append("fsync"))
+    with open(tmp_path / "f", "w") as fh:
+        hands._durable_sync(fh.fileno())
+    assert calls == ["fsync"]
+
+
+def test_a_file_sync_failure_fails_the_step_with_a_reason_not_a_traceback(tmp_path: Path, monkeypatch) -> None:
+    """L1-F4/L2-L2: ``run_plan``'s write branch has no try, so a raise out of ``_install_file`` is a crash mid-plan."""
+    target = tmp_path / "d" / "f"
+    monkeypatch.setattr(hands.os, "chown", lambda *a, **kw: None)
+    monkeypatch.setattr(hands, "_durable_sync", lambda fd: (_ for _ in ()).throw(OSError(5, "I/O error")))
+    ok, why = hands._install_file(target, "x\n", 0o644, validate=())
+    assert not ok and "could not be synced" in why and not target.exists()
+    assert not list(target.parent.glob("*.tmp")), "no temp file is left"
+
+
+def test_a_directory_sync_failure_still_runs_check_and_a_failed_check_removes_the_file(tmp_path: Path, monkeypatch) -> None:
+    """L1-F4/L2-L4: the file is installed either way, so it is checked; a failing check removes it as before."""
+    target = tmp_path / "f"
+    monkeypatch.setattr(hands.os, "chown", lambda *a, **kw: None)
+
+    def sync(fd: int) -> None:
+        if stat.S_ISDIR(os.fstat(fd).st_mode):
+            raise OSError(5, "I/O error")
+
+    monkeypatch.setattr(hands, "_durable_sync", sync)
+    ran: list[int] = []
+    ok, why = hands._install_file(target, "x\n", 0o644, validate=(), check=lambda: (ran.append(1) or True, ""))
+    assert ran == [1] and not ok and "directory could not be synced" in why and target.exists()
+    ran.clear()
+    ok, why = hands._install_file(target, "y\n", 0o644, validate=(), check=lambda: (ran.append(1) or False, "bad config"))
+    assert ran == [1] and (ok, why) == (False, "bad config") and not target.exists()
