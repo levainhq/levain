@@ -149,6 +149,16 @@ FACETS: dict[str, tuple[str, Callable[[Any], bool]]] = {
     "agent_kind": ("enum", _enum("job", "role", "unreadable")),
     "session_view": ("object", lambda v: isinstance(v, dict)),   # K7: what the Build tab's session row draws (the provider's own measures, no full cwd)
     "session_activity": ("enum", _enum("active", "quiet")),   # Q7a: how recently a session's hook last fired (the provider's measure)
+    # THE LIST (levain.cockpit.list_panel): one view over band + board + spores, each row labelled with its surface
+    "surface": ("enum", _enum("band", "board", "spore", "talk", "drop")),
+    "fires": ("timed|null", _opt(_is_str)),      # a timed `next` (YYYY-MM-DDTHH:MM, local); null for a date-only or no `next`
+    "overdue": ("bool", _is_bool),               # a timed next whose minute has passed, or a date-only next before today
+    "target": ("str|null", _opt(_is_str)),       # an agenda's germinate target (desk, band, nudge, board:<repo>)
+    "attention": ("str|null", _opt(_is_str)),    # `talk` on a talk seed; an agenda's ping word
+    "list_pointer": ("str", _is_str),            # where a read-only band/board row is acted on
+    "band_number": ("int|null", _opt(_is_int)),  # a band row's allocated number
+    "board_rank": ("int|null", _opt(_is_int)),
+    "board_tier": ("str|null", _opt(_is_str)),
 }
 
 
@@ -371,6 +381,50 @@ register_ordering(
     Ordering(
         "spore.tray", _tray_order_key, _tray_group,
         (("overdue", "Overdue"), ("today", "Today"), ("also", "Also pending")),   # overdue leads: what is late is read first
+        frozenset({"today", "overdue"}),
+    ),
+    builtin=True,
+)
+
+
+# --- THE LIST: band, then what is late and due, then the agents' ready queue, then talks, then the rest -----------------
+
+
+def _list_group(row: RowIn, today: date) -> str:
+    s = row.facets.get("surface")
+    if s in ("band", "board", "talk"):
+        return s
+    if row.facets.get("overdue") is True:
+        return "overdue"
+    return _tray_group(row, today)
+
+
+def _int_or_big(v: Any) -> int:
+    return v if _is_int(v) else 1 << 40
+
+
+def _list_key(row: RowIn, today: date) -> tuple:
+    f = row.facets
+    s = f.get("surface")
+    if s == "band":
+        return (_int_or_big(f.get("band_number")), row.id)
+    if s == "board":
+        return (_int_or_big(f.get("board_rank")), row.id)
+    if s == "talk":                         # oldest first; a talk with no known age goes last
+        age = f.get("age_days")
+        return (0, -age, row.id) if _is_int(age) else (1, 0, row.id)
+    d = parse_date(f.get("due"))
+    fires = f.get("fires") if isinstance(f.get("fires"), str) else ""
+    if f.get("overdue") is True:            # the earliest instant first
+        return ((d or today).toordinal(), fires) + _tray_key(row, today)
+    return (0 if d else 1, fires) + _tray_key(row, today)
+
+
+register_ordering(
+    Ordering(
+        "spore.list", _list_key, _list_group,
+        (("band", "Needs you (answer it in Decisions)"), ("overdue", "Overdue"), ("today", "Today"),
+         ("board", "Ready for agents"), ("talk", "To talk through"), ("also", "Also pending")),
         frozenset({"today", "overdue"}),
     ),
     builtin=True,

@@ -291,8 +291,19 @@ def _handoff_expired(s: Any, today: date) -> bool:
     return bool(s.disposition == "handoff" and not parse_date(s.next) and seen and (today - seen).days > HANDOFF_FRESH_DAYS)
 
 
+def next_date(value: Any) -> date | None:
+    """The DATE a spore's ``next`` names: a timed value reads through ``spores._parse_when`` (never a date-prefix read, which
+    would take a malformed timed value as a day), a date-only one as it always has."""
+    from levain import spores
+
+    if spores.is_timed(value):
+        when = spores._parse_when(value)
+        return when.date() if when is not None else None
+    return parse_date(value)
+
+
 def _spore_row(s: Any, today: date, *, held: bool = False) -> RowIn:
-    due = parse_date(s.next)
+    due = next_date(s.next)
     expired = _handoff_expired(s, today)
     facets: dict[str, Any] = {
         "disposition": s.disposition, "domain": s.domain, "tier": s.tier, "salience": s.salience,
@@ -312,7 +323,8 @@ def _spore_row(s: Any, today: date, *, held: bool = False) -> RowIn:
 
 def spore_stored(s: OpenSpore) -> dict[str, Any]:
     """A spore row's stored record: what its version covers (``SPORE_VERSION_FIELDS``)."""
-    return {f: getattr(s, f) for f in SPORE_STORED}
+    # getattr with a default: SPORE_STORED may name a steering field (target, attention) the OpenSpore does not carry yet
+    return {f: getattr(s, f, None) for f in SPORE_STORED}
 
 
 def spore_label_key(stored: Mapping[str, Any]) -> LabelKey | None:
@@ -352,8 +364,8 @@ def spore_view_version(spore: Any) -> str:
 
 # a fresh install has no spore store until something is dropped: each panel says what fills it
 SPORE_EMPTY = {
-    "tray": "Nothing yet. Drop a thought in the box above and {entity} sorts it.",
-    "loops": "Nothing yet. What stays open after {entity} sorts the Tray is listed here.",
+    "tray": "Nothing yet. Drop a line in the box above and {entity} sorts it.",
+    "loops": "Nothing yet. What stays open after {entity} sorts the List is listed here.",
 }
 # what the Tray's capture box says when the install has no name for its entity (dashboard_core.js ``buildTrayDump`` says the same)
 SPORE_EMPTY_ENTITY = "the assistant"
@@ -366,9 +378,9 @@ def spore_empty(bucket: str, entity: Any) -> str:
 
 
 def _where_to_begin(source: SubstrateSource) -> Callable[[ReadContext], Result]:
-    """The Morning card's "Where to begin": read from the install's own Tray and Open loops, never set by anything else. What is late
+    """The Morning card's "Where to begin": read from the install's own List and Open loops, never set by anything else. What is late
     leads (earliest first), then what is due today or a handoff still inside its claim, then the hottest open loop. With nothing in
-    either it says so and names the two real ways to fill it: a thought dropped in the Tray, and ``levain state``."""
+    either it says so and names the two real ways to fill it: a thought dropped on the List, and ``levain state``."""
     def clip(text: Any) -> str:
         t = " ".join(str(text).split())
         return t if len(t) <= TOP_MAX_BEGIN else t[:TOP_MAX_BEGIN - 1] + "…"
@@ -381,7 +393,7 @@ def _where_to_begin(source: SubstrateSource) -> Callable[[ReadContext], Result]:
         today = ctx.today
         late, due = [], []
         for s in v.tray:
-            d = parse_date(s.next)
+            d = next_date(s.next)
             if d and d > today:
                 continue                                    # held until its surface date
             if d and d < today:
@@ -398,10 +410,10 @@ def _where_to_begin(source: SubstrateSource) -> Callable[[ReadContext], Result]:
         if loops:
             lines.append({"label": "loop", "text": clip(loops[0].text)})
         if not lines:
-            return Read(value={"headline": "Nothing set for today yet", "title": "Where to begin", "source": "from the Tray and Open loops",
-                               "lines": [{"label": "set", "text": "Drop a thought in the Tray, or say what you are on with `levain state \"...\"`."}]})
+            return Read(value={"headline": "Nothing set for today yet", "title": "Where to begin", "source": "from the List and Open loops",
+                               "lines": [{"label": "set", "text": "Drop a thought on the List, or say what you are on with `levain state \"...\"`."}]})
         value: dict[str, Any] = {"headline": "", "lines": lines, "title": "Where to begin",
-                                 "source": "from the Tray and Open loops"}
+                                 "source": "from the List and Open loops"}
         if loops:
             # the open loops, hottest first, for the card's Threads column: the page groups them by the repo each one names (the
             # same reading the row tags use), because only the page knows the sky's repos. Capped: the column shows few.
@@ -466,7 +478,7 @@ def _spore_provider(
         rows = []
         held_rows = []
         for s in items:
-            if apply_hold and bucket == "tray" and (d := parse_date(s.next)) and d > ctx.today:
+            if apply_hold and bucket == "tray" and (d := next_date(s.next)) and d > ctx.today:
                 filtered += 1           # surface date not reached: held on purpose, not unreadable
                 held_rows.append(_spore_row(s, ctx.today, held=True))
                 continue
@@ -1654,8 +1666,11 @@ def build_default_cockpit(
     # 3-column grid whose cards flow in rank order, `now` first: Now, Tray, Open loops (row a, tall) / [Inbox, Fleet,
     # Stream: downstream-only] / Recent episodes, Recent edits. Ranks leave gaps so a downstream's
     # Inbox, Fleet and Stream slot in 16-39, between Open loops and Recent episodes without renumbering the kernel's.
+    # THE LIST takes the Tray's place (id `tray`, a code name): a view over band + board + spores, levain.cockpit.list_panel
+    from levain.cockpit.list_panel import register_list
+
+    register_list(ck, source, spore_common)
     for pid, title, bucket, prio, order, rank, views, size in (
-        ("tray", "Tray", "tray", "gate", "spore.tray", 10, TRAY_VIEWS, "tall"),
         ("loops", "Open loops", "loops", "feed", "spore.loops", 15, (), "tall"),
     ):
         ck.register(ProviderSpec(
