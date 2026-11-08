@@ -1419,7 +1419,7 @@
   function paintBriefCard(host, b) {
     const head = el("div", "brief-head");
     // levain's own card is named for what it holds: the Tray's next items (the data's "Where to begin" would read twice beside flow's plan card)
-    head.appendChild(el("h3", "", b.title === "Where to begin" ? "Next from the Tray" : b.title));
+    head.appendChild(el("h3", "", b.title === "Where to begin" ? "Next from the List" : b.title));
     head.appendChild(el("span", "sp"));
     const hasThreads = Array.isArray(b.threads) && groupThreads(b.threads).length > 0;
     // where the card has a lower heading (the loops column) the "from ..." caption sits under it, not floating in the head
