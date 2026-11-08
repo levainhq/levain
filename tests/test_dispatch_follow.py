@@ -102,7 +102,8 @@ class Dispatch:
             raise Crash(where)
 
     def follower(self) -> F.EventFollower:
-        return F.EventFollower.at(self.store, self.rig.path, self.resolve, read_deadline=0.5, fault=self.fault)
+        return F.EventFollower.at(self.store, self.rig.path, self.resolve, read_deadline=0.5, fault=self.fault,
+                                  routemap=tvr.routemap)
 
 
 def setup_verifier(store, repo, rig, *, refused=None):  # noqa: F811
@@ -319,7 +320,7 @@ def test_a_byte_copy_of_another_tickets_stored_envelope_stops_the_follower_unack
     d.raw, d.digest = tvr.envelope(a_run)
     store.record_verification(a_run, envelope=d.raw, event=tvr.event(a_run, at="2026-10-25T00:00:00Z",
                                                                       verifier_report_digest=d.digest),
-                              repo=str(repo[0]), tree=base_tree(repo), model=model(0))
+                              repo=str(repo[0]), tree=base_tree(repo), model=model(0), routemap=tvr.routemap)
     assert served.vattach(ticket)["ok"]
     cas(served, R.ALLOCATED, R.RENDERING, SESSION_V)
     assert root(served, "REVOKE", session=SESSION_V)["ok"]
@@ -471,7 +472,7 @@ def test_a_close_while_an_event_is_handled_connects_no_ack_and_ends_cancelled(st
         return CC.ControlClient(served.path)
 
     f = F.EventFollower(store, lambda after, jid: CC.follow_events(served.path, after, jid, read_deadline=0.5),
-                        connect, resolve)
+                        connect, resolve, routemap=tvr.routemap)
     assert f.step().outcome == CC.CANCELLED
     assert connects == [] and not acked(served) and f._ack_client is None
     assert [r.run for r in store.run_records(d.job.id)] == [0]
@@ -1096,4 +1097,40 @@ def test_an_artifact_event_with_neither_or_both_outcome_fields_stops_the_followe
     with pytest.raises(F.FollowStopped) as e:
         f._handle(CC.Event(seq, "artifact", body))
     assert e.value.name == "event-shape"
+    f.close()
+
+
+# --- F9a: the production call site reads the backend identity from the route map, or fails the run closed ----------
+
+def test_a_follower_with_no_route_map_records_no_label_and_fails_the_run_closed(store, repo, served):  # noqa: F811
+    """The follower is record_verification's production caller (follow_run.main wires no map reader yet): with no
+    route map it records nothing the resolve's model claims; the run fails backend-unresolved and the job is
+    terminal, so no contrast can pass on a label."""
+    from levain.dispatch import jobs as J
+
+    d = setup_verifier(store, repo, served)
+    f = F.EventFollower.at(store, served.path, d.resolve, read_deadline=0.5)
+    assert f.step().outcome == CC.DEADLINE
+    job = store.get(d.job.id)
+    assert (job.state, job.history[-1].cause, job.history[-1].evidence) == ("failed", "verifier_refused",
+                                                                           J.BACKEND_UNRESOLVED)
+    assert store.run_records(d.job.id) == []
+    f.close()
+
+
+def test_a_follower_records_the_route_maps_backend_not_the_resolves_label(store, repo, served):  # noqa: F811
+    d = setup_verifier(store, repo, served)
+    plain = d.resolve
+
+    def forged(ev):
+        call = plain(ev)
+        return None if call is None else dataclasses.replace(
+            call, model={"requested": "glm-5", "answered": "label-x", "backend_identity": "backend-forged"})
+
+    d.resolve = forged
+    f = d.follower()
+    assert f.step().outcome == CC.DEADLINE
+    [rec] = store.run_records(d.job.id)
+    assert rec.model == {"requested": "glm-5", "answered": "label-x", "backend_identity": "backend-0",
+                         "identity_source": "routemap"}
     f.close()

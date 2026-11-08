@@ -116,7 +116,8 @@ class GitFault(DispatchError):
 class ArtifactRecord:
     """One verified RUN, as the control service records it from the supervisor pipe (never an executor). The
     verifier driver writes real ones; until then tests construct them. ``verifier`` is ``{id, hash, kind, result}``
-    (``kind`` the supervisor's DECLARED kind), ``model`` is ``{requested, answered, backend_identity}``."""
+    (``kind`` the supervisor's DECLARED kind), ``model`` is ``{requested, answered, backend_identity}`` and, when the identity was read from the
+    gateway's route map (F9a, the only source the landing contrast trusts), ``identity_source: "routemap"``."""
     job_id: str
     run: int
     contract_digest: str
@@ -139,8 +140,11 @@ class ArtifactRecord:
                 return f"the record's {name} is a full object id"
         if not isinstance(self.verifier, Mapping) or set(self.verifier) != {"id", "hash", "kind", "result"}:
             return "the record's verifier is exactly id, hash, kind, result"
-        if not isinstance(self.model, Mapping) or set(self.model) != {"requested", "answered", "backend_identity"}:
-            return "the record's model is exactly requested, answered, backend_identity"
+        # identity_source (F9a) is absent from a record written before the route map was read; such a record stays
+        # readable and the contrast escalates on it
+        if not isinstance(self.model, Mapping) or set(self.model) - {"identity_source"} != {
+                "requested", "answered", "backend_identity"}:
+            return "the record's model is exactly requested, answered, backend_identity (and identity_source)"
         if not all(isinstance(v, str) and v and len(v) <= FIELD_MAX
                    for v in (*self.verifier.values(), *self.model.values())):
             return f"every verifier and model field is 1 to {FIELD_MAX} characters of text"
@@ -731,6 +735,9 @@ def _contrast_problem(records: Sequence[ArtifactRecord], template: ResolvedTempl
             return f"run {r.run}'s recorded verifier kind is {r.verifier.get('kind')!r}, not black-box"
         if r.verifier.get("result") != "pass":
             return f"run {r.run} was not verified (result {r.verifier.get('result')!r})"
+        if r.model.get("identity_source") != "routemap":
+            return (f"run {r.run}'s backend identity was not read from the gateway's route map (a record from before "
+                    "F9a); only a human can vouch that the runs' backends differ")
     identities = [r.model.get("backend_identity") for r in records]
     if len(set(identities)) != len(identities):
         return "two runs answered from the same backend identity; a contrast needs distinct ones"

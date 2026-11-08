@@ -100,7 +100,12 @@ class ReportRefused(DispatchError):
 @dataclass(frozen=True)
 class VerifierRun:
     """What the supervisor minted for ONE verifier session of ONE run of a job: ``verifier`` is the resolved entry
-    (:data:`VERIFIER_KEYS`), ``steps`` the ticket's ``verifier_steps``. Not persisted here; the writer's argument."""
+    (:data:`VERIFIER_KEYS`), ``steps`` the ticket's ``verifier_steps``. ``ticket`` is the VERIFIER ticket, which
+    carries no route (``levain.slot.tickets.check_facts`` forbids one); ``run_ticket`` is the facts of the run's own
+    EXECUTOR ticket as the supervisor minted it (``kind``, ``job_id``, ``run_index``, ``route``,
+    ``routemap_generation``, ``route_policy_digest``, ``model_requested``), the one source the run record's backend
+    identity is read from (F9a; ``None``: the run's identity is unresolved). Not persisted here; the writer's
+    argument."""
     job_id: str
     run: int
     session: str
@@ -109,6 +114,7 @@ class VerifierRun:
     steps: Sequence[Mapping[str, Any]]
     driver_input_digest: str
     input_bundle_digest: str
+    run_ticket: Mapping[str, Any] | None = None
 
 
 @dataclass(frozen=True)

@@ -173,6 +173,9 @@ ENTRY_REFUSED = "verifier-entry"
 # record is written for that run, so the consumer's contrast finds the run missing and escalates; a guessed or
 # placeholder identity could instead pair with a real one and pass as "distinct"
 BACKEND_UNRESOLVED = "backend-unresolved"
+# a run record's ``model.identity_source`` when its ``backend_identity`` was read from the gateway's route map (F9a);
+# the landing contrast trusts no other source (a record without it predates F9a, so a human vouches for it)
+IDENTITY_SOURCE = "routemap"
 _STORE_ID = re.compile(r"[0-9a-f]{32}")
 
 STATES = ("filed", "signed", "queued", "running", "verifying", "verified", "recommended", "authorised", "adopted",
@@ -678,21 +681,54 @@ def _refuse_repeat(conn: sqlite3.Connection, job: Job, run: int, ticket: str, re
         raise TransitionRefused(f"job {job.id} is {job.state}; only a verifying job records its verifier")
 
 
-def resolve_backend_identity(routes: Any, route_facts: Any, requested: Any) -> str | None:
+def resolve_backend_identity(routes: Any, ticket: Any) -> str | None:
     """The backend identity of the route a run used, read from the GATEWAY'S OWN route map (F9a), never from the
-    model or provider label an answer carries. ``routes`` is the :class:`levain.slot.routemaps.Checked` the run's
-    ticket was minted against, ``route_facts`` the ticket's ``{route, routemap_generation}``, ``requested`` the model
-    the run asked for. ``None`` when anything does not line up: no map, a generation other than the ticket's (the map
-    moved since the mint, so the entry is not the one the run used), a route not in the map, or a model the route does
-    not carry. Never a guess."""
-    if routes is None or not isinstance(route_facts, Mapping) or not isinstance(requested, str):
+    model or provider label an answer carries. ``routes`` is the :class:`levain.slot.routemaps.Checked` of the run
+    ticket's generation, ``ticket`` the facts of the run's own executor ticket as minted (``route``,
+    ``routemap_generation``, ``route_policy_digest``, ``model_requested``). ``None`` when anything does not line up:
+    no map or one not shaped as a checked map, a generation other than the ticket's (the map moved since the mint,
+    so the entry is not the one the run used), a route not in the map or whose policy digest is not the ticket's, or
+    a model the route does not carry. Never a guess, and never raises on a malformed map."""
+    if not isinstance(ticket, Mapping):
         return None
-    if route_facts.get("routemap_generation") != getattr(routes, "generation", None):
+    gen, route = ticket.get("routemap_generation"), ticket.get("route")
+    digest, requested = ticket.get("route_policy_digest"), ticket.get("model_requested")
+    if type(gen) is not int or not all(isinstance(v, str) and v for v in (route, digest, requested)):
         return None
-    route = route_facts.get("route")
-    entry = routes.routes.get(route) if isinstance(route, str) else None
-    backend = entry.backends.get(requested) if entry is not None else None
+    if type(getattr(routes, "generation", None)) is not int or routes.generation != gen:
+        return None
+    entries, digests = getattr(routes, "routes", None), getattr(routes, "digests", None)
+    if not isinstance(entries, Mapping) or not isinstance(digests, Mapping) or digests.get(route) != digest:
+        return None
+    backends = getattr(entries.get(route), "backends", None)
+    backend = backends.get(requested) if isinstance(backends, Mapping) else None
     return backend if isinstance(backend, str) and backend else None
+
+
+def _routed_model(run: VerifierRun, model: Any, routemap: Callable[[int], Any] | None) -> dict[str, Any] | None:
+    """The model a run's record keeps (F9a), or ``None`` (unresolved): ``requested`` and the route are the run's OWN
+    executor ticket's (``run.run_ticket``, minted by the supervisor for this job and run), the backend identity the
+    route map's entry for them (``routemap`` asked for the ticket's generation), ``identity_source`` says so, and only
+    ``answered`` is the caller's. A ``requested`` the caller gives must be the ticket's; a ``backend_identity`` it
+    gives is never read."""
+    ticket = run.run_ticket
+    if routemap is None or not isinstance(ticket, Mapping) or not isinstance(model, Mapping):
+        return None
+    if (ticket.get("kind") != "executor" or ticket.get("job_id") != run.job_id
+            or type(ticket.get("run_index")) is not int or ticket.get("run_index") != run.run):
+        return None
+    requested, gen = ticket.get("model_requested"), ticket.get("routemap_generation")
+    if "requested" in model and model["requested"] != requested:
+        return None
+    if type(gen) is not int:
+        return None
+    identity = resolve_backend_identity(routemap(gen), ticket)
+    if identity is None:
+        return None
+    out: dict[str, Any] = {"requested": requested, "backend_identity": identity, "identity_source": IDENTITY_SOURCE}
+    if "answered" in model:
+        out["answered"] = model["answered"]
+    return out
 
 
 def _stored_record(job_id: str, run: Any, text: Any, digest: Any) -> ArtifactRecord:
@@ -1525,20 +1561,22 @@ class JobStore:
         return out
 
     def record_verification(self, run: VerifierRun, *, envelope: bytes | None, event: Mapping[str, Any], repo: str,
-                            tree: str, model: Mapping[str, str], routes: Any = None,
-                            route_facts: Mapping[str, Any] | None = None) -> Job:
+                            tree: str, model: Mapping[str, str],
+                            routemap: Callable[[int], Any] | None = None) -> Job:
         """Record the end of run ``run.run``'s verifier session on its verifying job. ``event`` is the session's
         terminal ``state`` event (``session``, ``ticket``, ``at`` and one of ``verifier_report_digest`` /
         ``verifier_report_refused``), ``envelope`` the report envelope file's bytes (``None`` when none was read),
-        ``tree`` the run's artifact tree, ``model`` the run's ``{requested, answered, backend_identity}``.
+        ``tree`` the run's artifact tree, ``model`` the run's ``{answered}`` (a ``requested`` beside it must be the
+        run ticket's; a ``backend_identity`` beside it is never read).
 
-        F9a: given ``route_facts`` (the run ticket's ``{route, routemap_generation}``) the record's
-        ``backend_identity`` is DERIVED by :func:`resolve_backend_identity` from ``routes`` (the route map the ticket
-        was minted against) and any ``backend_identity`` the caller put in ``model`` is overwritten, so a response's
-        label never reaches it. A route that resolves to no backend fails the job ``verifier_refused``,
-        :data:`BACKEND_UNRESOLVED`, writes no run record, and the landing contrast then escalates on the missing run.
-        Without ``route_facts`` the caller's ``model`` is recorded as given (the pre-F9a path, kept for callers that
-        have no route map).
+        F9a, FAIL CLOSED: the record's ``model`` is built by :func:`_routed_model`: ``requested``, the route and the
+        route-map generation are the run's own executor ticket's (``run.run_ticket``, which must be this job's and this
+        run's), the ``backend_identity`` is :func:`resolve_backend_identity`'s read of ``routemap(generation)`` (the
+        gateway's route map of the ticket's generation), and ``identity_source`` is :data:`IDENTITY_SOURCE`. No
+        ``routemap``, no ticket facts, a caller ``requested`` other than the ticket's, or a route that names no backend
+        fails the job ``verifier_refused``, :data:`BACKEND_UNRESOLVED`, writes no run record, and the landing contrast
+        then escalates on the missing run. A map that moved since the mint is unresolved too: that is terminal for the
+        job (the operator files again), never a retry with a guessed entry.
 
         A refused event, a minted run that is not a contract entry and its steps (:data:`ENTRY_REFUSED`), a minted
         verifier entry that is not the template's (:data:`NOT_THE_TEMPLATES`), both checked before anything is
@@ -1586,13 +1624,12 @@ class JobStore:
                 report = check_envelope(envelope, expected=run, event_digest=report_digest)
             except ReportRefused as exc:
                 name = exc.name
-            if name is None and route_facts is not None:
-                identity = resolve_backend_identity(routes, route_facts,
-                                                    model.get("requested") if isinstance(model, Mapping) else None)
-                if identity is None:
+            if name is None:
+                routed = _routed_model(run, model, routemap)
+                if routed is None:
                     name = BACKEND_UNRESOLVED
                 else:
-                    model = {**model, "backend_identity": identity}
+                    model = routed
         record: ArtifactRecord | None = None
         if name is None:
             verified_at = _verified_at(event["at"])

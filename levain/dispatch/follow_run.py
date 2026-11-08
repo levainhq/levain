@@ -166,7 +166,7 @@ def _parser(host: str) -> argparse.ArgumentParser:
 
 
 def main(argv: Optional[Sequence[str]] = None, *, resolve: Callable[[Mapping[str, Any]], Optional[VerifierCall]]
-         = no_minted_runs) -> int:
+         = no_minted_runs, routemap: Optional[Callable[[int], Any]] = None) -> int:
     if os.geteuid() == 0:
         print("levain dispatch follower: refusing to run as root (it runs as _levain_dispatch)", file=sys.stderr)
         return EX_USAGE
@@ -185,7 +185,9 @@ def main(argv: Optional[Sequence[str]] = None, *, resolve: Callable[[Mapping[str
         return EX_INSTANCE_HELD
     try:
         jobs.event_cursor()                             # opens the database under the lock: a broken store ends here
-        runner = FollowRunner(EventFollower.at(jobs, a.socket, resolve, export_dir=a.export_dir))
+        # no reader of the gateway's route map is wired here yet (3c-10): without one every run's backend identity
+        # is unresolved and fails closed, never a label (F9a)
+        runner = FollowRunner(EventFollower.at(jobs, a.socket, resolve, export_dir=a.export_dir, routemap=routemap))
         requested: list[int] = []
         old: dict[int, Any] = {}
         failed: list[BaseException] = []

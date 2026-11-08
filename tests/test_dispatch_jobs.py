@@ -1017,6 +1017,7 @@ def verify(store, repo, job, run=0, *, verdicts=("pass", "pass"), entry=None, ra
     if raw is None:
         raw, digest = tvr.envelope(r, tvr.body(verdicts))
         ev = ev or tvr.event(r, at=VERIFIED_AT, verifier_report_digest=digest)
+    kw.setdefault("routemap", tvr.routemap)
     return store.record_verification(r, envelope=raw, event=ev or tvr.event(r, at=VERIFIED_AT), repo=str(repo[0]),
                                      tree=kw.pop("tree", base_tree(repo)), model=kw.pop("model", model(run)), **kw)
 
@@ -1042,7 +1043,7 @@ def test_every_run_passing_verifies_the_job_and_the_records_read_back(store, rep
     for r in recs:
         assert r.verifier == {"id": "pytest-bb", "hash": tvr.ENTRY["verifier_artifact_digest"], "kind": "black-box",
                               "result": "pass"}
-        assert r.verified_at == VERIFIED_AT and r.model == model(r.run)
+        assert r.verified_at == VERIFIED_AT and r.model == {**model(r.run), "identity_source": "routemap"}
         assert artifact_problem(str(repo[0]), done, r) is None
         assert git(repo[0], "rev-parse", staged_ref(job.id, r.run)) == r.staged_commit
     conn = sqlite3.connect(store.path)
