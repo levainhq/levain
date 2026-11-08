@@ -389,6 +389,17 @@ def policy_limits_path(host: HostOS) -> Path:
 POLICY_DISPATCH_CEILING = "dispatch_ceiling"
 
 
+#: ``L/policy/dispatch_auth``'s name (PRE-W): the run server's brokered setting,
+#: :func:`levain.slot.services.dispatch_run.read_dispatch_auth`.
+POLICY_DISPATCH_AUTH = "dispatch_auth"
+
+
+def policy_dispatch_auth_path(host: HostOS) -> Path:
+    """``L/policy/dispatch_auth`` (PRE-W): root's file, whose whole content ``brokered`` turns the run server's
+    brokered launcher ON. Absent is OFF, the default; setup writes nothing here."""
+    return STORE[host] / "policy" / POLICY_DISPATCH_AUTH
+
+
 def policy_dispatch_ceiling_path(host: HostOS) -> Path:
     """``L/policy/dispatch_ceiling`` (``levain-dispatch-ceiling/1`` or ``/2``): the operator's bound on dispatch, root
     0644, written only by the install helper's ``set-ceiling``, read by CONTROL's ticket store, removed by ``undo``.

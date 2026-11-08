@@ -546,6 +546,9 @@ class RunServer:
     (production) ``SYNC`` feeds it and LAUNCH/RELEASE must carry ``ledger_head`` (LAUNCH also ``bar``), passed to
     ``verify`` as :class:`FrameClaims`; without one the frames carry neither and ``verify`` gets ``None``."""
 
+    #: PRE-W: the brokered server :func:`build_server` built beside this passthrough one (setting ON), else None
+    brokered: "Optional[RunServer]" = None
+
     def __init__(self, launcher: RealLauncher, *,
                  verify: Callable[[C.LinkProof, Optional[ActionExposure], Optional[FrameClaims]], Any],
                  pool_free: Callable[[], bool], peer_ok: Callable[[socket.socket], bool],
@@ -1168,6 +1171,9 @@ def _parser(host: str) -> argparse.ArgumentParser:
     ap.add_argument("--store-dir", default=str(STORE[host]), help="L: the store root (gw logs, queue, dispatch)")
     ap.add_argument("--operator-record", default=None)
     ap.add_argument("--operator-uid", type=int, default=None)
+    from levain.slot.layout import policy_dispatch_auth_path
+    ap.add_argument("--auth-setting", default=str(policy_dispatch_auth_path(host)),
+                    help="PRE-W: root's brokered setting (absent: OFF, the passthrough server only)")
     return ap
 
 
@@ -1192,8 +1198,15 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         from levain.slot.layout import operator_record_path
         from levain.slot.services.control import _operator_uid
         op_uid = a.operator_uid if a.operator_uid is not None else _operator_uid(Path(a.operator_record or operator_record_path(host)))
-        server = build_server(host, Path(a.store_dir), Path(a.control), op_uid)
+        # PRE-W, DEFAULT OFF: root's setting adds the brokered server on its own socket; OFF serves exactly as before
+        auth, why = read_dispatch_auth(a.auth_setting)
+        if why is not None:
+            print(f"levain dispatch-run: brokered launcher off: {why}", file=sys.stderr, flush=True)
+        server = build_server(host, Path(a.store_dir), Path(a.control), op_uid, brokered=auth == "brokered")
         listener = _bind(Path(a.socket))
+        brokered = None
+        if server.brokered is not None:
+            brokered = (server.brokered, _bind(Path(a.socket).parent / BROKERED_SOCKET_NAME))
     except Refused as exc:
         # Setup starts this unit before it writes the operator record, its LAST act (§23): on a fresh host the first
         # start finds none. EX_TEMPFAIL is restarted (Restart=always / KeepAlive); EX_CONFIG would leave it down.
@@ -1205,25 +1218,41 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     stop = threading.Event()
     for sig in (signal.SIGTERM, signal.SIGINT):
         signal.signal(sig, lambda *_: stop.set())
+    side = None
+    if brokered is not None:
+        side = threading.Thread(target=serve, args=(brokered[0], brokered[1], stop), name="brokered", daemon=True)
+        side.start()
     try:
         serve(server, listener, stop)
     finally:
+        stop.set()
         server.shutdown(SHUTDOWN_BUDGET_S)       # END every live session first: daemon handlers never clean up at exit
+        if brokered is not None:
+            brokered[0].shutdown(SHUTDOWN_BUDGET_S)
         listener.close()
+        if brokered is not None:
+            brokered[1].close()
+            if side is not None:
+                side.join(1.0)
         close = getattr(server.launcher.runtime, "close", None)
         if close is not None:
             close()
     return 0
 
 
-def build_server(host: str, store: Path, control_sock: Path, operator_uid: int) -> RunServer:
-    """PRE-W (L3 wave3 r1, codex HIGH 1; by design, this branch keeps the brokered path unreachable): this builds the
-    PASSTHROUGH server only. Wiring API-key (brokered) sessions must add a separately constructed brokered launcher,
-    ``RealLauncher(..., auth="brokered", spend=lineage_spend_reader(<sink>, <keys' completeness proof>))``, behind its
-    own verifier, ``replica_verifier(replica, billing="api_key")``, chosen from a trusted billing decision (a separate
-    server or socket per billing, or a dispatch on the verified link's billing), and the client's ``build_launcher``
-    must hand an ``api_key`` occurrence a brokered client. Never mutate a shared launcher's ``auth`` per request:
-    concurrent launches and later USAGE reads of the same launcher would race on it.
+def build_server(host: str, store: Path, control_sock: Path, operator_uid: int, *, brokered: bool = False) -> RunServer:
+    """The PASSTHROUGH server (L3 wave3 r1, codex HIGH 1). With ``brokered`` (PRE-W: root's setting ON,
+    :func:`read_dispatch_auth`; default OFF) it also builds, as the returned server's ``brokered``, a BROKERED server: a
+    separately constructed ``RealLauncher(auth="brokered")`` whose usage is ``spend=lineage_spend_reader(L/lineage/
+    lineage.jsonl)`` with no completeness proof (none exists yet: every read is None, so every brokered run settles at
+    its WHOLE share, the fail-closed rule), behind its own ``replica_verifier(replica, billing="api_key")``, served by
+    :func:`main` on its own socket (:data:`BROKERED_SOCKET_NAME`). The two share the runtime, the usage sources, the
+    session index (one record directory, keyed by attempt id), the ONE replica (two replica objects on one directory
+    would contend on its append lock) and the ONE uploads (a second sweep would delete the first's staging). Both
+    servers come from the one ``RunServer(`` call below with ``replica=replica`` (the claims=None ruling's pin). The
+    client's ``build_launcher`` handing an ``api_key`` occurrence a brokered client is NOT wired yet, so no real fire
+    reaches the brokered socket. Never mutate a shared launcher's ``auth`` per request: concurrent launches and later
+    USAGE reads would race on it.
 
     The production wiring: the real ports behind :class:`RealLauncher`, and the authority REPLICA at
     ``<store>/dispatch/authority`` behind :func:`replica_verifier`. Nothing of the operator's home is read or named: the operator's
@@ -1245,8 +1274,54 @@ def build_server(host: str, store: Path, control_sock: Path, operator_uid: int) 
         ans = pool.call("POOL")
         return type(ans.get("egress_free")) is int and ans["egress_free"] > 0
 
-    return RunServer(launcher, verify=replica_verifier(replica), pool_free=pool_free,
-                     peer_ok=lambda s: peer_uid(s) == operator_uid, replica=replica, uploads=uploads)
+    launchers = [(launcher, replica_verifier(replica))]
+    if brokered:
+        from levain.slot.dispatch_usage import lineage_spend_reader
+        from levain.slot.lineage import SINK
+        launchers.append((RealLauncher(DispatchControlPort(control_sock), launcher.runtime, launcher.sources,
+                                       launcher.index, auth="brokered",
+                                       spend=lineage_spend_reader(store / "lineage" / SINK)),
+                          replica_verifier(replica, billing="api_key")))
+    servers = [RunServer(ln, verify=verify, pool_free=pool_free, peer_ok=lambda s: peer_uid(s) == operator_uid,
+                         replica=replica, uploads=uploads) for ln, verify in launchers]
+    if brokered:
+        servers[0].brokered = servers[1]
+    return servers[0]
+
+
+#: PRE-W: the whole content of ``L/policy/dispatch_auth`` that turns the brokered launcher ON
+DISPATCH_AUTH_ON = b"brokered\n"
+#: PRE-W: the brokered server's socket, beside the passthrough one (``run.sock``): the billing decision is which
+#: socket a fire reached, never a per-request change of a shared launcher
+BROKERED_SOCKET_NAME = "run-brokered.sock"
+
+
+def read_dispatch_auth(path: "Path | str", owner: int = 0) -> tuple[str, Optional[str]]:
+    """``(auth, why)`` of the run server's brokered setting (PRE-W, DEFAULT OFF): ``("brokered", None)`` only when
+    ``path`` is a regular file (not a link) owned by ``owner`` (root), writable by nobody else, whose whole content is
+    :data:`DISPATCH_AUTH_ON`. Absent is ``("passthrough", None)``, OFF. Anything else reads OFF too, with ``why`` the
+    reason (the doctor shows it): OFF is the passthrough server that runs without the setting. Never raises."""
+    import stat as _stat
+    try:
+        fd = os.open(str(path), os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC)
+    except FileNotFoundError:
+        return "passthrough", None
+    except OSError as exc:
+        return "passthrough", f"the setting cannot be read ({exc.strerror or type(exc).__name__})"
+    try:
+        st = os.fstat(fd)
+        if not _stat.S_ISREG(st.st_mode):
+            return "passthrough", "the setting is not a regular file"
+        if st.st_uid != owner or st.st_mode & 0o022:
+            return "passthrough", "the setting is not root's alone (another account owns it or can write it)"
+        data = os.read(fd, len(DISPATCH_AUTH_ON) + 1)
+    except OSError as exc:
+        return "passthrough", f"the setting cannot be read ({exc.strerror or type(exc).__name__})"
+    finally:
+        os.close(fd)
+    if data != DISPATCH_AUTH_ON:
+        return "passthrough", "the setting's content is not exactly 'brokered'"
+    return "brokered", None
 
 
 def service_row():
@@ -1259,7 +1334,7 @@ def service_row():
 
 
 __all__ = ["ACCOUNT", "NAME", "FrameClaims", "RunServer", "replica_verifier", "service_row", "agent_store_bar", "bound_usage_sources", "build_server", "main", "serve",
-           "verify_point_of_use"]
+           "verify_point_of_use", "BROKERED_SOCKET_NAME", "DISPATCH_AUTH_ON", "read_dispatch_auth"]
 
 
 if __name__ == "__main__":

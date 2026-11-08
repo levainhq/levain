@@ -92,7 +92,7 @@ PEER_VERBS: Mapping[str, frozenset[str]] = {
     "qbroker": frozenset({"QUEUE-RESOLVE"}),
     "keys": frozenset({"TOKEN-RESOLVE", "KEYS-ATTACH", "FRONT-LOST", "SPEND-OVERRUN", "SESSIONS", "LINEAGE-APPEND"}),
     "dispatch": frozenset({"LEASE-OPEN", "ROUTE-SUBMIT", "ROUTE-RESOLVE", "RUN-TICKET-MINT", "RUN-TICKET-CANCEL",
-                           "RUN-TICKET-STATUS",
+                           "RUN-TICKET-STATUS", "RUN-TICKET-FACTS", "ROUTEMAP-ACTIVE",
                            "POOL", "CONFIG-SUBMIT", "SESSION-EVENTS", "ARTIFACT-ACK"}),
     "foreign": frozenset(),
 }
@@ -131,6 +131,9 @@ _ARGS: Mapping[str, tuple[frozenset[str], frozenset[str]]] = {
     "RUN-TICKET-CANCEL": (frozenset({"ticket"}),) * 2,
     "RUN-TICKET-STATUS": (frozenset({"attempt_id"}),) * 2,
     "ROUTE-RESOLVE": (frozenset({"model"}),) * 2,             # dispatch wave 3 (S-B2): read-only, the brokered mint's route facts
+    # PRE-W: read-only, the F9a follower's supervisor readers (a run's executor ticket facts; the active route map)
+    "RUN-TICKET-FACTS": (frozenset({"job_id", "run_index"}),) * 2,
+    "ROUTEMAP-ACTIVE": (frozenset(), frozenset()),
 }
 
 #: DECISION: how long a mint waits for keys to serve CONTROL's route-map head on the current attachment (an
@@ -2705,6 +2708,29 @@ class Control:
             route = serving[0]
             return {"route": route, "routemap_generation": active.generation,
                     "route_policy_digest": active.digests[route]}
+
+    def _op_run_ticket_facts(self, conn: Conn, args: dict) -> dict[str, object]:
+        """``RUN-TICKET-FACTS {job_id, run_index}`` -> ``{facts}`` (PRE-W): the facts of the one executor ticket of that
+        job and run that ran, from THIS journal (:meth:`levain.slot.tickets.TicketStore.executor_facts`; refused
+        ``ticket-unknown`` / ``ticket-ambiguous``). Read-only, CONTROL's own record echoed back: the F9a follower's
+        ``ticket_for``, so a verifier run's backend identity is the supervisor's mint and never what a ``resolve``
+        says."""
+        job_id = T._text(args["job_id"], "job_id", T._NAME)
+        run_index = T._uint(args["run_index"], "run_index")
+        return {"facts": self._ticket_store().executor_facts(job_id, run_index)}
+
+    def _op_routemap_active(self, conn: Conn, args: dict) -> dict[str, object]:
+        """``ROUTEMAP-ACTIVE`` -> ``{generation, routes: {id: {backends}}, digests}`` (PRE-W): the ACTIVE dispatch
+        generation's routes as their backends and policy digests, read under the activation lock; none active is
+        ``no-routemap``. Read-only, CONTROL's own record: the F9a follower's ``routemap`` (a run whose ticket names
+        another generation resolves nothing: the map moved since its mint)."""
+        with self._activation:
+            active = self.routes.active() if self.routes is not None else None
+            if active is None:
+                raise Refused("no-routemap", "no route-map generation is active")
+            return {"generation": active.generation,
+                    "routes": {rid: {"backends": dict(entry.backends)} for rid, entry in active.routes.items()},
+                    "digests": dict(active.digests)}
 
     def _op_run_ticket_cancel(self, conn: Conn, args: dict) -> dict[str, object]:
         """``RUN-TICKET-CANCEL {ticket}`` -> ``{}``: an UNBOUND ticket only (``ticket-bound`` once a lease bound it)."""

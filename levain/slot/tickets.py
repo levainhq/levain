@@ -1023,6 +1023,23 @@ class TicketStore:
                 out["session"] = t.session
             return out
 
+    def executor_facts(self, job_id: str, run_index: int) -> Dict[str, object]:
+        """PRE-W (F9a's supervisor reader, ``RUN-TICKET-FACTS``): the facts, as minted and journaled, of the ONE
+        executor ticket for ``(job_id, run_index)`` that was bound to a session (a cancelled or expired ticket never
+        ran, so it is not counted). None is ``ticket-unknown``; more than one is ``ticket-ambiguous`` (refused, never
+        chosen). Read-only: nothing is appended. A ticket the start compaction dropped (a closed one past its mint's
+        UTC day) is unknown."""
+        with self.lock:
+            self._live()
+            found = [t for t in self._by_ticket.values()
+                     if t.session is not None and t.facts.get("kind") == "executor"
+                     and t.facts.get("job_id") == job_id and t.facts.get("run_index") == run_index]
+            if not found:
+                raise Refused("ticket-unknown", "no executor ticket of that job and run was bound to a session")
+            if len(found) > 1:
+                raise Refused("ticket-ambiguous", "more than one executor ticket of that job and run ran")
+            return dict(found[0].facts)
+
     def counts(self) -> Dict[str, int]:
         """The rebuilt counts (doctor / tests): open tickets and the current UTC day's mints."""
         with self.lock:
