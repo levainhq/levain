@@ -5,35 +5,43 @@ from __future__ import annotations
 
 import json
 import sqlite3
+from contextlib import closing
 from datetime import datetime, timezone
 from pathlib import Path
 
 from levain.cockpit import voice as cv
 from levain.voice import meter as vm
-from tests.test_voice_player_browser import READY_BLOCK, _run
+from tests.test_pair_card_w1b import needs_browser
+from tests.test_voice_player_browser import READY_BLOCK, _fixture, _run
+
+NOW = datetime(2026, 11, 8, 17, 0, tzinfo=timezone.utc)          # one frozen moment, shared by the seed and the meter
 
 
 def _rec(uses):
     return {"id": "vk-x", "uses": uses}
 
 
-def _seed(path: Path) -> vm.Meter:
-    meter = vm.Meter(path)
+def _seed(path: Path, extra=()) -> vm.Meter:
+    """The scratch ledger holds exactly these rows after every call (a second call replaces, never adds), the connection is
+    closed, and the meter's clock is NOW, the moment the rows are stamped with."""
+    meter = vm.Meter(path, clock=lambda: NOW)
     meter.spent()                                        # creates the schema in the scratch file
-    now = datetime.now(timezone.utc).strftime(vm._STAMP)
+    now = NOW.strftime(vm._STAMP)
     rows = [("deepgram", "stt", "nova-3-stream", 9, 1155), ("inworld", "tts", "inworld-tts-2-flash", 184, 2760),
-            ("inworld", "tts", "inworld-tts-2-flash", 160, 2400)]
-    with sqlite3.connect(path) as c:
-        for p, u, m, n, cost in rows:
-            c.execute("INSERT INTO calls (at, provider, use, model, units, cost_micros, status) VALUES (?,?,?,?,?,?,'ok')",
-                      (now, p, u, m, n, cost))
+            ("inworld", "tts", "inworld-tts-2-flash", 160, 2400), *extra]
+    with closing(sqlite3.connect(path)) as c:
+        with c:
+            c.execute("DELETE FROM calls")
+            for p, u, m, n, cost in rows:
+                c.execute("INSERT INTO calls (at, provider, use, model, units, cost_micros, status) VALUES (?,?,?,?,?,?,'ok')",
+                          (now, p, u, m, n, cost))
     return meter
 
 
-def _body(tmp_path, monkeypatch, keys, setting=None):
+def _body(tmp_path, monkeypatch, keys, setting=None, extra=()):
     monkeypatch.setattr(cv, "_grants_for", lambda root: ({"g": 1}, "ok"))
     monkeypatch.setattr(cv, "voice_key_for", lambda grants, name: _rec(keys[name]) if name in keys else None)
-    meter = _seed(tmp_path / "voice.db")
+    meter = _seed(tmp_path / "voice.db", extra)
     assert "levain-sign" not in str(meter.path) and "state/bridge" not in str(meter.path)
     return cv.serve_voice(tmp_path, meter, last_read={}, premium_stt=setting)
 
@@ -53,6 +61,7 @@ def test_dictation_off_says_why(tmp_path, monkeypatch):
     assert _body(tmp_path, monkeypatch, {"deepgram": ["stt"]}, setting=False)["mic_in"] == {"on": False, "reason": "turned_off"}
 
 
+@needs_browser
 def test_the_panel_shows_dictation_spend_and_console_links(tmp_path, monkeypatch):
     b = _body(tmp_path, monkeypatch, {"deepgram": ["stt", "tts"], "inworld": ["tts"]})
     v = _run(tmp_path, monkeypatch, [
@@ -121,6 +130,7 @@ def test_no_stream_key_and_no_key_at_all_read_differently(tmp_path, monkeypatch)
     assert _body(tmp_path, monkeypatch, {}, setting=True)["mic_in"] == {"on": False, "reason": "no_stt_key"}
 
 
+@needs_browser
 def test_the_panel_says_when_spend_cannot_be_read_and_shows_the_other_row(tmp_path, monkeypatch):
     b = _body(tmp_path, monkeypatch, {"deepgram": ["stt", "tts"]})
     bad = dict(b, meter="unreadable", authority="ok", spend_other=None,
