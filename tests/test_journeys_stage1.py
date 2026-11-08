@@ -90,6 +90,8 @@ def test_j1_a_band_answer_is_signed_in_the_sheet_with_a_passkey_and_the_cockpit_
     rig = _Rig(tmp_path, monkeypatch)
     _scratch(tmp_path, rig.qdir, rig.allowed)
     version = rig.signer.row(QRID, [rig.pk.key.fingerprint])["sha256"][:16]
+    signed_file = rig.qdir / "sign" / f"{QRID}.signed.json"
+    assert not signed_file.exists()                                          # nothing signed yet: any record after the run is this run's
     with rig.serving():
         out = _drive(tmp_path, f"{rig.origin}/#write_token={TOK}", [
             DESKTOP, rig.authenticator(),
@@ -112,10 +114,11 @@ def test_j1_a_band_answer_is_signed_in_the_sheet_with_a_passkey_and_the_cockpit_
     assert str(v[7]).startswith("signed (a)"), v                             # what he reads at the end
     assert v[8] == f"/sign/{QRID}#v={version}", v                            # the card's listed version rode the link
     assert json.loads(v[-1]) == {"modal": True, "strip": True}, v           # he is back on the cockpit's card (the desk's reader, not the page, closes it)
+    assert signed_file.exists()                                              # the record THIS run wrote (it was absent before the tap): signing did something
     assert rig.verifies(QRID)                                                # cross-check: ssh-keygen accepts the signature
-    signed = json.loads((rig.qdir / "sign" / f"{QRID}.signed.json").read_text())
+    signed = json.loads(signed_file.read_text())
     assert signed["signer_fp"] == rig.pk.key.fingerprint and signed["namespace"] == "flow-needs-phill", signed   # his passkey signed it
-    assert '"choice":"a"' in (rig.qdir / "sign" / f"{QRID}.signed.json").read_text().replace(" ", "") or "choice" in str(signed), signed
+    assert signed["choice"] == "a" and "Ship it tonight" in signed["signed_message"], signed   # the option he tapped is the one signed
 
 
 # --- 2. the NEEDS band at phone width, a tap on an option answers it -------------------------------------------------------------
