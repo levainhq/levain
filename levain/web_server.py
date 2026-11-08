@@ -874,6 +874,8 @@ _COORD_SHEET = "/sign/drop"
 # run as the cockpit). Who may add a launch grant is _Handler._coord_may_launch: the cockpit page, and a paired device
 # whose pairing chain starts at the cockpit page (Phill 2026-11-08, row 460), never another surface's token or its devices.
 _COORD_DEVICE = "cockpit"          # == levain.coordinator.phone.COCKPIT_DEVICE
+# the pairing roots a launch-grant device may start from (row 460): the cockpit page and the laptop's `cockpit pair`
+_LAUNCH_ROOTS = frozenset({"browser", "box"})
 
 
 def _coord_route(route: str) -> "str | None":
@@ -3492,10 +3494,13 @@ class _Handler(GuardedHandler):
     def _coord_may_launch(self, device: "str | None") -> bool:
         """THE one cockpit test for a launch grant (Phill 2026-11-08, row 460), read by the drop listing
         (``coord_may_launch``, so the page draws the toggle exactly where it is taken) and handed to the spec check: the
-        cockpit page's own token, or a paired device whose pairing chain starts at that token
-        (:meth:`~levain.cockpit.firejournal.CockpitDB.pairing_root` == ``browser``), so his cockpit on his phone
-        qualifies and a device another surface paired (L3 r1 codex HIGH: any surface may mint a pairing offer) does not.
-        Any fault reading the lineage is False: a lineage that cannot be read grants nothing."""
+        cockpit page's own token, or a paired device whose pairing chain starts at one of :data:`_LAUNCH_ROOTS`
+        (:meth:`~levain.cockpit.firejournal.CockpitDB.pairing_root`): the cockpit page (``browser``) or the laptop's own
+        ``levain cockpit pair`` (``box``), so his cockpit on his phone qualifies however he paired it, and a device
+        another surface paired (``relay`` and the like; L3 r1 codex HIGH: any surface may mint a pairing offer) does not.
+        ``box`` is his on the same footing as ``browser``: both need his account on the laptop (the journal's file
+        permissions; the per-launch page token served on loopback). Any fault reading the lineage is False: a lineage
+        that cannot be read grants nothing."""
         if device == _COORD_DEVICE:
             return True
         if not isinstance(device, str) or device.startswith("surface:"):
@@ -3503,7 +3508,7 @@ class _Handler(GuardedHandler):
         broker = self.server.broker
         try:
             db = broker.active_db() if broker is not None else None
-            return db is not None and db.pairing_root(device) == "browser"
+            return db is not None and db.pairing_root(device) in _LAUNCH_ROOTS
         except _CredentialUnavailable:
             raise
         except Exception:  # noqa: BLE001 - fail closed
