@@ -252,6 +252,29 @@ def test_setup_resumes_intent_groups(host):
     assert err.name == "install-interrupted"
 
 
+@pytest.mark.parametrize("host", HOSTS)
+def test_setup_resumes_an_account_killed_between_its_group_and_its_user(host):
+    """PREL3 1a-10: setup killed after a slot account's own group was made and before its user: the journal names
+    that group, so a re-run resumes the account rather than refusing it as someone else's."""
+    first, j, made = _interrupted_setup(host)
+    s0 = j.accounts["_levain_s0"]
+    names, used = frozenset(made) | {"_levain_s0"}, frozenset(made.values()) | {s0}
+    again = _plan(host, existing_names=names, used_ids=used, intent=j, host_ids=made,
+                  account_group_ids={"_levain_s0": s0})
+    assert dict(again.allocation.ids) == dict(j.accounts) and "_levain_s0" in again.kept
+    # the group step skips (present), the user step runs at the journaled id
+    s0_steps = [s for s in again.steps if s.argv and "_levain_s0" in s.argv]
+    assert s0_steps, "the resumed account's steps are planned"
+    # the same-name group at another gid is not the one the journal made
+    err = _refusal(_plan, host, existing_names=names, used_ids=used | {s0 - 1}, intent=j, host_ids=made,
+                   account_group_ids={"_levain_s0": s0 - 1})
+    assert err.name == "account-exists" and "_levain_s0" in err.detail
+    # the group is ours but another account holds the journaled uid: refused
+    err = _refusal(_plan, host, existing_names=names | {"mallory"}, used_ids=used, intent=j, host_ids=made,
+                   account_group_ids={"_levain_s0": s0}, user_ids={"mallory": s0})
+    assert err.name == "account-exists" and "_levain_s0" in err.detail
+
+
 # --- replenish reads the journal -----------------------------------------------------------------------
 
 

@@ -127,6 +127,9 @@ class HostFacts:
     #: Every user on the host, name -> uid, whatever its label: undo reads whether a recorded account is absent and
     #: whether another account holds its uid (L3 r2 codex HIGH).
     user_ids: Mapping[str, int] = field(default_factory=dict)
+    #: For each account the journal lists that is absent as a user while a group of its name is present, the gid
+    #: that group holds: an account setup made its own group for and was stopped before its user (PREL3 1a-10).
+    account_group_ids: Mapping[str, int] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -548,7 +551,8 @@ def _reuse(facts: HostFacts, slots: int, verifier_slots: int) -> _Reuse:
 def _journal_presence(facts: HostFacts) -> tuple[dict[str, int], list[str]]:
     """CONTRACT §25: (the journal's names present on the host at their journaled id, which are Levain's;
     the names that refuse as ``account-exists``: present at another id, or absent while their id is in
-    use by something else)."""
+    use by something else). A journaled account whose user is absent but whose own group is present at its
+    journaled id, with no other user at that uid, is a run stopped between the two: Levain's, resumed."""
     assert facts.intent is not None
     ours: dict[str, int] = {}
     foreign: list[str] = []
@@ -558,6 +562,17 @@ def _journal_presence(facts: HostFacts) -> tuple[dict[str, int], list[str]]:
             ours[name] = i
         elif have is not None:
             foreign.append(f"{name} (journaled at {i}, present at {have})")
+        elif name in facts.account_group_ids:
+            # Its own group is made first and its user second, so a run stopped between them leaves the group alone.
+            # At the journaled id, with no other user holding that uid, it is the one this journal made: resumed.
+            g = facts.account_group_ids[name]
+            holder = next((u for u, uid in facts.user_ids.items() if uid == i), None)
+            if g != i:
+                foreign.append(f"{name} (journaled at {i}, its group present at {g})")
+            elif holder is not None:
+                foreign.append(f"{name} (journaled uid {i} is held by {holder})")
+            else:
+                ours[name] = i
         elif i in facts.used_ids:
             foreign.append(f"{name} (journaled id {i} is in use)")
     return ours, foreign
@@ -2140,6 +2155,9 @@ def _gather_held(cmd: InstallCommand, host: HostOS, caller_uid: int, d: Director
     if journal is not None:
         host_ids.update((n, d.users[n]) for n in journal.accounts if n in d.users)
         host_ids.update((g, d.groups[g]) for g in journal.groups if g in d.groups)
+        group_only = {n: d.groups[n] for n in journal.accounts if n not in d.users and n in d.groups}
+    else:
+        group_only = {}
     leased = q.live() if q is not None else live_lease_sessions(L / "sessions")
     facts = HostFacts(
         host=host, caller_uid=caller_uid, caller_name=user_name(caller_uid),
@@ -2148,7 +2166,7 @@ def _gather_held(cmd: InstallCommand, host: HostOS, caller_uid: int, d: Director
         used_ids=frozenset(d.users.values()) | frozenset(d.groups.values()),
         existing_names=frozenset(d.users) | frozenset(d.groups), retired=read_retired_ids(retired_path),
         levain_tombstones=tombs, levain_live=live, intent=journal, host_ids=host_ids, install_shape=shape,
-        user_ids=dict(d.users))
+        user_ids=dict(d.users), account_group_ids=group_only)
     if cmd.verb == "repair":
         repair = _repair_facts(cmd, host, d, accounts, _drop_retired_slots(in_service or {}, tombs), skips=skips,
                                operator_uid=int(orec["uid"]) if orec is not None else None)
