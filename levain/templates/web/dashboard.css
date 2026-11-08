@@ -3028,14 +3028,18 @@ body.rv-on .ck-phonetabs button[data-phone-jump="room"] { color: var(--text); ba
     overflow-x: auto; overscroll-behavior-x: contain; scrollbar-width: none;
   }
   body.ke .ck-phonetabs::-webkit-scrollbar { display: none; }
+  /* the scrollbar is hidden, so the edge a tab continues past fades out: the cue that more is there to scroll to */
+  body.ke .ck-phonetabs.ck-more-right { -webkit-mask-image: linear-gradient(to right, #000 calc(100% - 28px), transparent); mask-image: linear-gradient(to right, #000 calc(100% - 28px), transparent); }
+  body.ke .ck-phonetabs.ck-more-left { -webkit-mask-image: linear-gradient(to left, #000 calc(100% - 28px), transparent); mask-image: linear-gradient(to left, #000 calc(100% - 28px), transparent); }
+  body.ke .ck-phonetabs.ck-more-left.ck-more-right { -webkit-mask-image: linear-gradient(to right, transparent, #000 28px, #000 calc(100% - 28px), transparent); mask-image: linear-gradient(to right, transparent, #000 28px, #000 calc(100% - 28px), transparent); }
   body.ke .ck-phonetabs button {
-    flex: 1 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; min-height: var(--hit-min); padding: 0 var(--sp-2); white-space: nowrap;
+    flex: 0 0 auto; min-width: auto; min-height: var(--hit-min); padding: 0 var(--sp-3); white-space: nowrap;
     background: none; border: 0; border-radius: var(--r-md); color: var(--label); cursor: pointer;
     font: var(--fw-semibold) var(--fs-meta) var(--round);
   }
   body.ke .skycol { margin-top: var(--sec); }   /* the sky now follows the needs strip, not the band: the one section space between them */
   body.ke .ck-phonetabs button:active { background: var(--card-2); color: var(--text); }
-  /* the five tabs share the strip's width and shrink with it (a wider fallback font or a badge never cuts the strip at its edge): a label too long for its share ends in an ellipsis */
+  /* each tab keeps its whole label and the strip scrolls sideways when the labels outrun its width: a label is never cut to an ellipsis */
   @media (max-width: 360px) { body.ke .ck-phonetabs { padding: 0 var(--sp-2); } body.ke .ck-phonetabs button { padding: 0 var(--sp-1); } }
   /* the Decisions view's rows (the open request, a standing grant, the drop): the command takes the row's width and its button
      the line under it at a thumb's height, in place of a button squeezing a wrapped command into a sliver beside it */
