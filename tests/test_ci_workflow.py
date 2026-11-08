@@ -1,12 +1,31 @@
 """The shape of .github/workflows/test.yml that the main-push skip gate depends on."""
+import itertools
+import re
 from pathlib import Path
 
+import pytest
 import yaml
 
 WF = yaml.safe_load((Path(__file__).resolve().parent.parent / ".github" / "workflows" / "test.yml").read_text())
 JOBS = WF["jobs"]
-HEAVY_IF_TERMS = ("always()", "!cancelled()", "needs.gate.result == 'skipped'", "needs.gate.result == 'success'",
-                  "needs.gate.outputs.skip != 'true'")
+HEAVY_IF = ("${{ always() && !cancelled() && "
+            "!(needs.gate.result == 'success' && needs.gate.outputs.skip == 'true') }}")
+
+
+def evaluate(cond, gate_result, skip, cancelled=False):
+    """Evaluate a `${{ ... }}` condition of exactly the shape the heavy jobs use: the functions always() and
+    !cancelled(), string comparisons on needs.gate.result / needs.gate.outputs.skip, && || ! and parentheses.
+    Anything else raises, so a new shape cannot slip past this table unevaluated."""
+    m = re.fullmatch(r"\$\{\{ (.*) \}\}", cond)
+    assert m, cond
+    expr = m.group(1)
+    expr = expr.replace("!cancelled()", "(not CANCELLED)").replace("always()", "True")
+    expr = expr.replace("needs.gate.result", "RESULT").replace("needs.gate.outputs.skip", "SKIP")
+    expr = expr.replace("&&", " and ").replace("||", " or ")
+    expr = re.sub(r"!(?!=)", " not ", expr)
+    leftover = re.sub(r"\b(True|and|or|not|RESULT|SKIP|CANCELLED)\b|'[a-z]*'|==|!=|[()\s]", "", expr)
+    assert leftover == "", (cond, leftover)
+    return bool(eval(expr, {"__builtins__": {}}, {"RESULT": gate_result, "SKIP": skip, "CANCELLED": cancelled}))
 
 
 def test_the_gate_runs_only_for_a_main_push():
@@ -14,20 +33,42 @@ def test_the_gate_runs_only_for_a_main_push():
     assert "github.event_name == 'push'" in cond and "refs/heads/main" in cond
 
 
-def test_every_heavy_job_runs_when_the_gate_was_skipped_or_failed():
-    heavy = [n for n, j in JOBS.items() if j.get("needs") == "gate" and n != "verified"]
-    assert len(heavy) >= 6
-    for name in heavy:
-        cond = JOBS[name]["if"]
-        for term in HEAVY_IF_TERMS:
-            assert term in cond, (name, term)
-        # a failed gate is neither skipped nor a success-with-skip: the clause must not admit only those two by `failure`
-        assert "needs.gate.result == 'failure'" not in cond, name
+def _heavy():
+    return [n for n, j in JOBS.items() if j.get("needs") == "gate" and n != "verified"]
+
+
+# (gate result, skip output, heavy job runs?). The skip output is "" when the gate did not run or failed before writing.
+HEAVY_TABLE = [
+    ("success", "true", False),    # the gate looked up a verifying run and said skip: the only case that skips
+    ("success", "false", True),    # the gate found no verdict: run
+    ("success", "", True),         # a success that wrote no skip output is not a skip: run
+    ("failure", "", True),         # a failed gate (fail closed): run
+    ("failure", "true", True),     # a failed gate never skips, whatever its output holds
+    ("skipped", "", True),         # a non-main run has no gate: run
+]
+
+
+def test_there_are_heavy_jobs():
+    assert len(_heavy()) >= 6
+
+
+@pytest.mark.parametrize("name", _heavy())
+def test_every_heavy_job_skips_only_when_the_gate_succeeded_and_said_skip(name):
+    cond = JOBS[name]["if"]
+    assert cond == HEAVY_IF, name
+    for result, skip, runs in HEAVY_TABLE:
+        assert evaluate(cond, result, skip) is runs, (name, result, skip)
+    # a cancelled workflow runs nothing, whatever the gate said
+    for result, skip in itertools.product(("success", "failure", "skipped", "cancelled"), ("true", "false", "")):
+        assert evaluate(cond, result, skip, cancelled=True) is False, (name, result, skip)
+    # a cancelled gate while the workflow is still live is not a verdict: run
+    assert evaluate(cond, "cancelled", "", cancelled=False) is True, name
 
 
 def test_the_verified_job_needs_a_successful_gate_that_said_skip():
     cond = JOBS["verified"]["if"]
-    assert "needs.gate.result == 'success'" in cond and "needs.gate.outputs.skip == 'true'" in cond
+    for result, skip, runs in HEAVY_TABLE:
+        assert evaluate(cond, result, skip) is (not runs), (result, skip)
 
 
 def test_a_main_push_neither_cancels_nor_is_cancelled_by_another_main_push():
