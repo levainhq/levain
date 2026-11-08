@@ -35,3 +35,11 @@ def test_a_main_push_neither_cancels_nor_is_cancelled_by_another_main_push():
     assert "github.sha" in c["group"] and "refs/heads/main" in c["group"]
     assert "refs/heads/main" in str(c["cancel-in-progress"])  # the flag is an expression that is false for a main push
     assert c["cancel-in-progress"] is not True
+
+
+def test_no_run_line_expands_a_branch_name_or_an_api_string():
+    for name, job in JOBS.items():
+        for step in job.get("steps", []):
+            run = step.get("run", "")
+            for bad in ("github.ref_name", "github.head_ref", "github.event.", "needs.gate.outputs", "steps.lookup.outputs"):
+                assert bad not in run, (name, bad)

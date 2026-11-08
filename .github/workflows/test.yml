@@ -78,7 +78,11 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 5
     steps:
-      - run: echo "verified on ${{ needs.gate.outputs.ref }} run ${{ needs.gate.outputs.run_id }}"
+      - env:
+          # a branch name is an API string: it reaches the shell as a variable, never spliced into the command text
+          VERIFIED_REF: ${{ needs.gate.outputs.ref }}
+          VERIFIED_RUN: ${{ needs.gate.outputs.run_id }}
+        run: echo "verified on $VERIFIED_REF run $VERIFIED_RUN"
 
   plan:
     # Emits the shard list [0..TEST_SHARDS-1] the `test` matrix runs. It does not collect: each shard job collects
