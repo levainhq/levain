@@ -77,3 +77,28 @@ def test_retained_leased_slot_whose_scrub_lost_the_pool_try_is_scrubbed_again(tm
     assert (after.state, after.session, after.rev) == ("reusable", None, held.rev + 1)
     assert s in report["scrubbed"]
     assert H.parse_slot_state_of((E0.slot_dir(w.L) / "state").read_bytes(), E0) == after
+
+
+def test_reaper_refill_at_floor_plus_one_creates_no_reserve_file(tmp_path):
+    """Free space inside the margin above the floor: the reaper's refill must not make the reserve, not even empty,
+    since taking its lock opens it with a create."""
+    from dataclasses import replace
+
+    from levain.slot import end as E
+    from levain.slot import reaper as RP
+
+    w, la, table = _world(tmp_path)
+    floor = 8 << 30
+    seams = replace(w.seams, free_bytes=lambda fd: floor + 1)
+    rp = RP.Reaper(seams, tuning=RP.Tuning(reserve_bytes=4096, floor_bytes=floor))
+    store = H.Store(seams)
+    try:
+        assert not os.path.lexists(w.L / "reserve")
+        assert rp._refill(store) is False
+        assert not os.path.lexists(w.L / "reserve")
+        seams = replace(w.seams, free_bytes=lambda fd: floor + E._REFILL_MARGIN)
+        rp = RP.Reaper(seams, tuning=RP.Tuning(reserve_bytes=4096, floor_bytes=floor))
+        assert rp._refill(store) is False
+        assert not os.path.lexists(w.L / "reserve")
+    finally:
+        os.close(store.fd)

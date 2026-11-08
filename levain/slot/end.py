@@ -2687,6 +2687,12 @@ class Reserve:
                 if e.errno != errno.ENOSPC or self.release_step() == 0:
                     raise
 
+    def refill_headroom(self, free_bytes: Callable[[], int], *, floor: int = V5_FLOOR_BYTES) -> int:
+        """Bytes a refill may write: free space less the floor and :data:`_REFILL_MARGIN`. At or below zero nothing may be
+        opened or created for the reserve, since the file's own metadata is charged to the host too. The one place the
+        arithmetic lives, for :meth:`refill` and the reaper's lock."""
+        return free_bytes() - floor - _REFILL_MARGIN
+
     def refill(self, free_bytes: Callable[[], int], *, floor: int = V5_FLOOR_BYTES) -> bool:
         """Back to ``size`` with written zeros when free space is above ``floor``; returns whether it
         is full. The headroom (``free_bytes() - floor - _REFILL_MARGIN``) is read once at entry and each write is
@@ -2695,8 +2701,8 @@ class Reserve:
         does not guarantee: space taken by other writers after entry, or by metadata beyond the margin."""
         if self.current() >= self.size:
             return True
-        start = free_bytes() - floor - _REFILL_MARGIN
-        if start <= 0:     # the file's own metadata is charged to the host too, so nothing is opened or created here
+        start = self.refill_headroom(free_bytes, floor=floor)
+        if start <= 0:     # nothing is opened or created here
             return False
         created = not os.path.lexists(self.path)
         fd = os.open(self.path, os.O_WRONLY | os.O_CREAT | os.O_NOFOLLOW | os.O_CLOEXEC, 0o600)
@@ -2705,11 +2711,11 @@ class Reserve:
             cur = os.fstat(fd).st_size
             os.lseek(fd, cur, os.SEEK_SET)
             zeros = bytes(_CHUNK)
-            head = min(start, free_bytes() - floor - _REFILL_MARGIN)
+            head = min(start, self.refill_headroom(free_bytes, floor=floor))
             try:
                 while cur < self.size:
                     # never write past the floor: a refill that starves the host would make the next pass BRAKE
-                    head = min(head, free_bytes() - floor - _REFILL_MARGIN)    # a reading may shrink it, never grow it
+                    head = min(head, self.refill_headroom(free_bytes, floor=floor))    # a reading may shrink it, never grow it
                     n = min(_CHUNK, self.size - cur, head)
                     if n <= 0:
                         break
