@@ -182,3 +182,24 @@ def test_the_zone_is_hidden_at_first_paint_and_shown_only_once_the_manifest_says
         ])
     before, after = out["values"][-4], out["values"][-1]
     assert before is True and after is False, out["values"]      # hidden while the manifest is unread, shown once it says on
+
+
+@needs_browser
+@pytest.mark.parametrize("answer", [
+    "new Response('boom', {status: 500})",
+    "new Response(JSON.stringify({panels: {}}), {status: 200, headers: {'Content-Type': 'application/json'}})",
+], ids=["manifest-500", "manifest-without-transport"])
+def test_a_failed_or_transport_less_manifest_read_still_shows_the_zone_on_a_threads_on_server(tmp_path, answer):
+    # only an explicit threads:false hides the zone; the server 404s every thread write when threads are off, so showing is safe
+    fail = (f"localStorage.setItem('levain_write_token', {json.dumps(TOKEN)}); "
+            "const real = window.fetch.bind(window); "
+            "window.fetch = (u, ...a) => { const s = String(u && u.url || u); "
+            f"if (s.includes('/cockpit/manifest.json')) return Promise.resolve({answer}); return real(u, ...a); }};")
+    _root, src, _ids = _install(tmp_path)
+    with _serve(src, write_token=TOKEN) as (base, _h):
+        out = _drive(tmp_path, base + "/", [
+            {"init": fail},
+            {"until": "document.querySelector('[data-zone=threads]') && document.body.dataset.threadsRead === '1'"},
+            {"eval": "document.querySelector('[data-zone=threads]').hidden"},
+        ])
+    assert out["values"][-1] is False, out["values"]
