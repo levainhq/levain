@@ -1113,6 +1113,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--no-premium-stt",
         action="store_false",
         dest="premium_stt",
+        default=None,
         help="Turn premium dictation off for this server even when a speech-to-text key is configured.",
     )
     web_p.set_defaults(func=_cmd_serve)

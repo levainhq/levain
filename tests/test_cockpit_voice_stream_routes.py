@@ -93,7 +93,7 @@ def statuses(rig):
 # --- the flag on voice.json ----------------------------------------------------------------------------------------------
 
 def test_voice_json_carries_stream_true_only_for_a_keyed_deepgram_stt_with_premium_stt_on(rig):
-    """Red with: the `if premium_stt and stream_offered(rows)` line in serve_voice dropped or inverted (the key then shows
+    """Red with: the `chosen = stream_provider(rows) if premium_stt else None` line in serve_voice dropped or inverted (the key then shows
     wrong in one of the four cases), or stream_offered ignoring `key == "set"` / `"stt" in uses`."""
     with served(rig) as (port, _h):
         assert "stream" not in js(call(port, "GET", cockpit_voice.VOICE_JSON)[2])          # no key at all
@@ -182,7 +182,7 @@ def test_open_builds_each_providers_factory_with_the_key_reaching_only_it(rig, m
 # --- premium_stt off -----------------------------------------------------------------------------------------------------
 
 def test_off_is_404_on_all_three_before_any_read_even_with_a_key(rig):
-    """Nothing is reserved, read or built. Red with: the `if not srv.premium_stt` refusal in _voice_stream_answer dropped
+    """Nothing is reserved, read or built. Red with: the OPEN gate and the forced-off refusal in _voice_stream_answer dropped
     (the routes then open a session) or moved after the length / registry lines (a body or meter is touched)."""
     keyed(rig)
     with served(rig, premium_stt=False) as (port, httpd):
@@ -914,3 +914,47 @@ def test_a_close_the_provider_did_not_finish_is_a_non_2xx_so_the_page_recovers(r
         assert streams[0].closed == 1
         assert statuses(rig) == ["ok"] and rig.rows()[0].units == 1
         assert post(port, f"{CLOSE}?sid={sid}")[0] == 404                 # collected all the same
+
+
+# --- AUTO premium_stt: the switch gates OPEN only (levain 72 sttfix R1/R2) ------------------------------------------------
+
+def test_auto_a_key_revoked_mid_stream_still_answers_revoked_and_close_settles(rig):
+    """The AUTO decision gates stream OPEN only. A session exists only because open passed; when its only stt key is revoked
+    mid-dictation the next due chunk answers the revoked refusal (`revoked: true`, the page stops for good), the provider
+    stream is closed and the meter settled, and close still returns the collected text. Red with: `premium_stt_on` called
+    again for chunk or close in `_voice_stream_answer` (the chunk and close answer a bare 404 `premium_stt_off`, no
+    `revoked`, nothing ended or settled)."""
+    record = rig.add_key(provider="deepgram", uses=("stt", "tts"), source="levain-voice-deepgram-s3")
+    with served(rig, premium_stt=None) as (port, httpd):
+        factory = fx(httpd)
+        clock = stream_with_clock(httpd)
+        sid = open_session(port)[1]["sid"]
+        for seq in range(2):
+            clock.t += 0.25
+            assert chunk(port, sid, seq)[0] == 200
+        revoke_key(rig, record)
+        clock.t += cockpit_voice.STREAM_REVOKE_RECHECK_S
+        status, _h, body = chunk(port, sid, 2)
+        got = js(body)
+        assert (status, got["error"], got["revoked"]) == (409, "no_key", True), got
+        assert factory.streams[0].closed == 1 and statuses(rig) == ["ok"]
+        status, _h, body = post(port, f"{CLOSE}?sid={sid}")
+        assert (status, js(body)["text"]) == (200, FINAL), (status, body)
+    assert "reserved" not in statuses(rig)
+
+
+def test_auto_open_with_the_authority_log_unreadable_says_so_not_that_a_key_is_needed(rig, monkeypatch):
+    """AUTO with a log that cannot be replayed refuses open (still closed) in the existing `authority_unreadable` words
+    and 503, never "needs a speech-to-text key". Red with: the gate answering `premium_stt_off` for an unreadable log."""
+    keyed(rig)
+    with served(rig, premium_stt=None) as (port, httpd):
+        factory = fx(httpd)
+
+        def boom(_root):
+            raise OSError("log gone")
+        monkeypatch.setattr(cockpit_voice.custody, "authority_for", boom)
+        status, body = open_session(port)
+        assert (status, body["error"], body["message"]) == (
+            503, "authority_unreadable", cockpit_voice.WORDS["authority_unreadable"]), body
+        assert factory.streams == []
+    assert rig.rows() == []

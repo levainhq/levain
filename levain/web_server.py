@@ -3939,11 +3939,10 @@ class _Handler(GuardedHandler):
             self._reject(403, "forbidden", cockpit_voice.WORDS["no_owner"])
             return None
         speak = route == cockpit_voice.SPEAK_PATH
-        if not speak and not cockpit_voice.premium_stt_on(srv.premium_stt, srv.broker.data_root):
+        if not speak and not self._premium_stt_gate():
             # premium dictation off (forced off, or no key lists stt): one fixed answer before the content type, the length, the voice
             # slot, the body, the meter and the key are looked at, so it says nothing of whether a key exists. _reject
             # closes the connection, so an audio body is not left on the socket to be read as the next request
-            self._reject(404, "not_found", cockpit_voice.WORDS["premium_stt_off"])
             return None
         if speak:
             if self._refuse_non_json():
@@ -3985,10 +3984,28 @@ class _Handler(GuardedHandler):
         finally:
             srv.voice_gate.release()
 
+    def _premium_stt_gate(self) -> bool:
+        """The premium-dictation switch for ONE request (transcribe and stream open): True when on. Off answers 404 in the
+        fixed ``premium_stt_off`` words; AUTO with an authority log that could not be replayed answers 503
+        ``authority_unreadable`` in its own words (the fault is the log, not a missing key). Either way it has already
+        rejected when it returns False."""
+        srv = self.server
+        state = cockpit_voice.premium_stt_state(srv.premium_stt, srv.broker.data_root)
+        if state == "on":
+            return True
+        if state == "unreadable":
+            self._reject(503, "authority_unreadable", cockpit_voice.WORDS["authority_unreadable"])
+        else:
+            self._reject(404, "not_found", cockpit_voice.WORDS["premium_stt_off"])
+        return False
+
     def _voice_stream_answer(self, route: str) -> "cockpit_voice.Answer | None":
         """The live-dictation POST gates, in transcribe's order (a room host and a broker, a surface token on every bind, a
         named owner, then the premium-dictation switch: off is a 404 in fixed words before a length, a body, the meter or
-        a key is looked at). Open and close carry no body (a declared length of 0); a chunk is ``application/octet-stream``
+        a key is looked at). The switch (the AUTO decision from key presence) gates OPEN only: a session exists only
+        because open passed, so chunk and close never replay the log for it; a key revoked mid-stream is the session's
+        own ``_stream_revoked`` check (the next due chunk answers ``revoked: true``), and close still settles and returns
+        the collected text. Only a forced-off server (``premium_stt is False``) refuses chunk and close. Open and close carry no body (a declared length of 0); a chunk is ``application/octet-stream``
         of at most :data:`cockpit_voice.STREAM_CHUNK_MAX` bytes: its sid, owner and seq are checked before the body is read,
         then the read takes a ``voice_chunk_gate`` slot without waiting (503 past it) and runs under a short deadline.
         Chunks bypass ``voice_gate`` (cheap, bounded, owned by a session the registry already capped at one); open runs
@@ -4006,7 +4023,10 @@ class _Handler(GuardedHandler):
         if owner is None:
             self._reject(403, "forbidden", cockpit_voice.WORDS["no_owner"])
             return None
-        if not cockpit_voice.premium_stt_on(srv.premium_stt, srv.broker.data_root):
+        if route == cockpit_voice.STREAM_OPEN:
+            if not self._premium_stt_gate():      # the AUTO decision gates OPEN only (see the docstring)
+                return None
+        elif srv.premium_stt is False:            # forced off: no session can exist; no log replay on chunk or close
             self._reject(404, "not_found", cockpit_voice.WORDS["premium_stt_off"])
             return None
         chunk = route == cockpit_voice.STREAM_CHUNK
@@ -5314,6 +5334,13 @@ def make_server(
     ``OSError`` if the bind fails (e.g. the port is in use) — the caller decides
     how to report it. Separated from ``run_web_server`` so tests can drive a real
     bound server without the resolve/existence/print/browser/serve_forever wrapper.
+
+    ``premium_stt`` is the premium-dictation switch: ``True`` forces it on, ``False`` forces it off, and anything else
+    (the default ``None``, and any non-bool such as ``1`` or ``"yes"``) is AUTO, decided per request from key presence
+    (:func:`levain.cockpit.voice.premium_stt_on`): on while a provider with a speech-to-text model holds a key whose uses
+    list ``stt``, so a key added or revoked takes effect on the next request with no restart. An embedder that never
+    wants dictation passes ``False``. An AUTO server whose authority log cannot be replayed refuses in the
+    ``authority_unreadable`` words.
 
     ``extra_assets`` / ``extra_json`` are the READ-ONLY extension point a downstream
     control plane uses to register additional GET views that ride this server's

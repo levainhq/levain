@@ -313,14 +313,25 @@ def _stt_keyed(grants: Any) -> bool:
     return False
 
 
+def premium_stt_state(setting: Any, data_root: Path | str) -> str:
+    """``"on"``, ``"off"`` or ``"unreadable"`` for THIS request. ``setting`` is the server's switch: a literal ``True``
+    forces it on, a literal ``False`` forces it off, anything else (None, a truthy string) is AUTO: on while some provider
+    that has a speech-to-text model holds a key listing ``stt``, read from the authority log now, so a key added or
+    revoked after the server started takes effect on the next request. ``"unreadable"`` is AUTO with a log that could not
+    be replayed (fail closed, said in its own words, never as "needs a key"). Key presence only; no secret is read."""
+    if setting is True:
+        return "on"
+    if setting is False:
+        return "off"
+    grants, status = _grants_for(data_root)
+    if status != "ok":
+        return "unreadable"
+    return "on" if _stt_keyed(grants) else "off"
+
+
 def premium_stt_on(setting: Any, data_root: Path | str) -> bool:
-    """Whether premium dictation is on for THIS request. ``setting`` is the server's switch: a literal ``True`` forces it
-    on, a literal ``False`` forces it off, anything else (None, a truthy string) is AUTO: on while some provider that
-    has a speech-to-text model holds a key listing ``stt``, read from the authority log now, so a key added or revoked
-    after the server started takes effect on the next request. Key presence only; no secret is read."""
-    if setting is True or setting is False:
-        return setting
-    return _stt_keyed(_grants_for(data_root)[0])
+    """Whether premium dictation is on for THIS request (:func:`premium_stt_state` is ``"on"``)."""
+    return premium_stt_state(setting, data_root) == "on"
 
 
 def serve_voice(data_root: Path | str, meter: vmeter.Meter, *, last_read: MutableMapping[str, str | None],
