@@ -1223,6 +1223,12 @@ def _ensure_line(path: Path, line: str, *, present: bool, create: bool = False) 
         mode = path.stat().st_mode & 0o7777
     wanted = [ln for ln in current if ln.strip() != line] + ([line] if present else [])
     if wanted == current:
+        if path.exists():
+            # An earlier run may have renamed this in and then failed to sync the directory: make it durable now.
+            try:
+                _sync_dir(path.parent)
+            except OSError as e:
+                return False, f"{path}: already so, but its directory could not be synced: {e.strerror or e}"
         return True, "already so"
     tmp = path.with_name(path.name + ".levain-tmp")
     tmp.write_text("".join(f"{ln}\n" for ln in wanted), encoding="utf-8")
@@ -1230,6 +1236,7 @@ def _ensure_line(path: Path, line: str, *, present: bool, create: bool = False) 
     try:
         _sync_file(tmp)
     except OSError as e:
+        tmp.unlink(missing_ok=True)
         return False, f"{path}: not changed, the new list could not be synced: {e.strerror or e}"
     os.replace(tmp, path)
     try:
@@ -1505,18 +1512,23 @@ def run_plan(plan: Plan, *, dry_run: bool, emit: Callable[[str], None] = print) 
     return 0
 
 
+# What a filesystem answers when it does not implement F_FULLFSYNC (SMB, NFS, FUSE): not-supported, invalid, no-tty.
+_FULLFSYNC_UNSUPPORTED = frozenset({errno.ENOTSUP, errno.EOPNOTSUPP, errno.EINVAL, errno.ENOTTY})
+
+
 def _durable_sync(fd: int) -> None:
     """Force ``fd``'s data to the drive: on macOS ``fsync`` stops at the drive's cache and ``F_FULLFSYNC`` does not;
-    where a filesystem refuses ``F_FULLFSYNC`` (SMB, NFS, some FUSE mounts) it falls back to ``fsync``, the rule
-    ``levain.broker.creds.full_fsync`` states. Any other error propagates. The ONE sync every hands write uses."""
+    where a filesystem does not implement ``F_FULLFSYNC`` (SMB, NFS, some FUSE mounts: ``_FULLFSYNC_UNSUPPORTED``) it
+    falls back to ``fsync``. Any other error (EIO and the rest) propagates as a failed sync. The ONE sync every hands write uses."""
     if sys.platform == "darwin":
         import fcntl
 
         try:
             fcntl.fcntl(fd, fcntl.F_FULLFSYNC)
             return
-        except OSError:
-            pass
+        except OSError as exc:
+            if exc.errno not in _FULLFSYNC_UNSUPPORTED:
+                raise                                   # EIO and the rest: the data may not be on the drive
     os.fsync(fd)
 
 
@@ -1591,6 +1603,35 @@ def _install_file(path: Path, content: str, mode: int, *, validate: tuple[str, .
 RECORD_KEYS = ("hands_user", "hands_uid", "hands_workspace", "hands_egress_ports")
 
 
+def sync_record(entity_dir: Path) -> None:
+    """Sync an already-installed ``confinement.json`` and its directory, no-follow. ``record_hands`` renames before it
+    syncs the directory, so a failed sync leaves the record installed but not durable; a rerun calls this first.
+    HandsSetupError if it cannot."""
+    levain_dir = Path(entity_dir) / ".levain"
+    try:
+        dfd = os.open(levain_dir, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC)
+    except FileNotFoundError:
+        return
+    except OSError as exc:
+        raise HandsSetupError(f"refusing to sync in {levain_dir}: {exc.strerror} (a symlink?)") from None
+    try:
+        try:
+            fd = os.open("confinement.json", os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC, dir_fd=dfd)
+        except FileNotFoundError:
+            fd = None
+        if fd is not None:
+            try:
+                _durable_sync(fd)
+            finally:
+                os.close(fd)
+        _durable_sync(dfd)
+    except OSError as exc:
+        raise HandsSetupError(f"{levain_dir}/confinement.json could not be synced: {exc.strerror or exc}; "
+                              "run it again") from None
+    finally:
+        os.close(dfd)
+
+
 def record_hands(entity_dir: Path, values: dict | None, *, owner_uid: int, owner_gid: int) -> Path:
     """Set (or, with ``None``, remove) the hands keys in ``<entity>/.levain/confinement.json``,
     keeping every other key, owned by the operator. Root does this inside a tree the operator
@@ -1627,6 +1668,13 @@ def record_hands(entity_dir: Path, values: dict | None, *, owner_uid: int, owner
                 _durable_sync(fh.fileno())
             os.replace(tmp, "confinement.json", src_dir_fd=dfd, dst_dir_fd=dfd)
             _durable_sync(dfd)
+        except OSError as exc:
+            try:
+                os.unlink(tmp, dir_fd=dfd)
+            except OSError:
+                pass
+            raise HandsSetupError(f"{levain_dir}/confinement.json could not be written and synced: "
+                                  f"{exc.strerror or exc}; run it again") from None
         except BaseException:
             try:
                 os.unlink(tmp, dir_fd=dfd)
@@ -1797,6 +1845,7 @@ def cmd_setup_isolation(path: Path | str, *, undo: bool, dry_run: bool, reenable
             operator = os.environ.get("SUDO_USER") or pwd.getpwuid(os.getuid()).pw_name
         else:
             operator = invoking_operator()
+            sync_record(entity_dir)
         op = pwd.getpwnam(operator)
     except (HandsSetupError, IsolationError, ConfinementError) as exc:
         print(f"setup-isolation: {exc}")
@@ -1905,7 +1954,11 @@ def cmd_setup_isolation(path: Path | str, *, undo: bool, dry_run: bool, reenable
         if leftovers:
             print("setup-isolation: undo did not finish: " + "; ".join(leftovers) + " still present.")
             return 1
-        record_hands(entity_dir, None, owner_uid=op.pw_uid, owner_gid=op.pw_gid)
+        try:
+            record_hands(entity_dir, None, owner_uid=op.pw_uid, owner_gid=op.pw_gid)
+        except (HandsSetupError, OSError) as exc:
+            print(f"setup-isolation: undo is done but its record was not written ({exc}); run it again.")
+            return 1
         print(f"Done. The hands user {hands} is retired: its account stays, disabled (no login, no password, no "
               "sudo rule, no home), so its id can never be given to another account. To give this entity hands "
               "again later: sudo levain setup-isolation --reenable")
@@ -1988,10 +2041,15 @@ def cmd_setup_isolation(path: Path | str, *, undo: bool, dry_run: bool, reenable
         return rc
     if dry_run:
         return 0
-    record_hands(entity_dir, {"hands_user": plan.hands_user, "hands_uid": hands_id,
-                              "hands_workspace": str(plan.workspace),
-                              **({"hands_egress_ports": list(ports)} if host == "linux" else {})},
-                 owner_uid=op.pw_uid, owner_gid=op.pw_gid)
+    try:
+        record_hands(entity_dir, {"hands_user": plan.hands_user, "hands_uid": hands_id,
+                                  "hands_workspace": str(plan.workspace),
+                                  **({"hands_egress_ports": list(ports)} if host == "linux" else {})},
+                     owner_uid=op.pw_uid, owner_gid=op.pw_gid)
+    except (HandsSetupError, OSError) as exc:
+        print(f"setup-isolation: the account was made but its record was not written ({exc}); "
+              f"run `sudo levain setup-isolation --undo --path {entity_dir}` then again.")
+        return 1
     print(f"Done. The hands user {plan.hands_user} exists; its workspace is {plan.workspace}.")
     if not sshd_reads_dropins():
         print("Note: sshd here does not read sshd_config.d, so remote login was not refused for the "
