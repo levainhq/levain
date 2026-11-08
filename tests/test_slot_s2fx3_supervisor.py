@@ -879,3 +879,33 @@ def test_kitty_entries_are_charged_to_the_screen_the_terminal_is_on(data, passed
     assert f.feed(data) == passed
     assert f.reset() == undo
     assert f.reset() == b""
+
+
+# --- prel3fix L3 r1 A2: kitty keyboard sequences pass only in the protocol's own grammar ------------------------------
+
+@pytest.mark.parametrize("data", [
+    b"\x1b[>1;2u",                 # codex-2: a push takes one optional flags parameter
+    b"\x1b[>1:2u", b"\x1b[>1$u",   # a sub-parameter, an intermediate
+    b"\x1b[=5;9u",                 # codex-2: a set's mode is 1, 2 or 3
+    b"\x1b[=5;1;2u", b"\x1b[=5;u", b"\x1b[=;1u", b"\x1b[=u", b"\x1b[=5:1u",
+    b"\x1b[<1;2u", b"\x1b[<1:2u",
+])
+def test_a_malformed_kitty_sequence_is_dropped_and_records_nothing(data) -> None:
+    f = TermFilter()
+    assert f.feed(b"\x1b[>1u" + data) == b"\x1b[>1u"
+    assert f.reset() == b"\x1b[<1u"
+    g = TermFilter()
+    assert g.feed(data) == b""
+    assert g.reset() == b""
+
+
+@pytest.mark.parametrize("data, undo", [
+    (b"\x1b[>u", b"\x1b[<1u"),     # a push with its flags omitted (zero)
+    (b"\x1b[>31u", b"\x1b[<1u"),
+    (b"\x1b[=5u", b"\x1b[=0u"),    # a set with its mode omitted (1)
+    (b"\x1b[=5;1u", b"\x1b[=0u"), (b"\x1b[=5;2u", b"\x1b[=0u"), (b"\x1b[=5;3u", b"\x1b[=0u"),
+])
+def test_a_well_formed_kitty_sequence_passes(data, undo) -> None:
+    f = TermFilter()
+    assert f.feed(data) == data
+    assert f.reset() == undo

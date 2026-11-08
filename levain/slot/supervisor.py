@@ -339,6 +339,8 @@ class TermFilter:
                         self._modes.add(int(p))
         elif final == b"u" and prefix in (b">", b"<", b"="):
             # the kitty keyboard protocol: push (``CSI > flags u``), pop (``CSI < n u``), set (``CSI = flags ; mode u``)
+            if not _kitty_grammar(prefix, params):
+                return b""                              # a terminal may ignore it: never passed, never counted
             if self._screen == _SCREEN_UNKNOWN:
                 return b""                              # which stack it would reach is not known: not passed
             screen = self._screen != 0
@@ -348,11 +350,7 @@ class TermFilter:
                     return b""
                 self._kitty_pushes[screen] += 1
             elif prefix == b"<":
-                # the protocol's count defaults to 1 when omitted; an explicit 0 is read as none by some terminals
-                # and as the default by others, so it is dropped, and so is anything but a plain count
                 n = params[0]
-                if len(params) > 1 or not (n == b"" or n.isdigit()) or n.isdigit() and int(n) == 0:
-                    return b""
                 want = int(n) if n else 1
                 if want > pushes:
                     # a pop past the slot's own pushes would pop the operator's entries: clipped to the slot's
@@ -421,6 +419,17 @@ class TermFilter:
             self._st = _STR_ESC
         elif cp in (CAN, SUB):
             self._ground()
+
+
+def _kitty_grammar(prefix: bytes, params: list) -> bool:
+    """Whether a kitty keyboard ``CSI <prefix> params u`` is in the protocol's grammar: a push takes zero or one
+    decimal flags; a pop zero or one count, never 0 (some terminals read 0 as none, others as the default 1); a set
+    decimal flags and at most one mode, 1, 2 or 3."""
+    if prefix == b">":
+        return len(params) == 1 and (params[0] == b"" or params[0].isdigit())
+    if prefix == b"<":
+        return len(params) == 1 and (params[0] == b"" or params[0].isdigit() and int(params[0]) > 0)
+    return params[0].isdigit() and (len(params) == 1 or len(params) == 2 and params[1] in (b"1", b"2", b"3"))
 
 
 def _csi_shape(body: bytes) -> bool:
