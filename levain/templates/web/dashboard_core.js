@@ -7638,9 +7638,9 @@
     return "ends in " + Math.round(mins / 1440) + " days";
   }
   const ENVELOPE_ID = /^ev-[0-9a-f]{32}$/;
-  // the states a revoke is offered for, as levain.coordinator.envelope_revoke.REVOCABLE names them
+  // the states a revoke is offered for (an ended envelope is counted, not drawn)
   const ENVELOPE_REVOCABLE = ["live", "live-unknown", "unreadable"];
-  // the WHOLE signed text, field by field, as levain.coordinator.envelope_revoke.revoke_message writes it: a line with a
+  // the WHOLE signed text, field by field: a line with a
   // field more, a field less or a field changed, another envelope's id, or another namespace is never put to the passkey
   const ENVELOPE_LINE = /^levain-envelope-revoke\/1\nstore: [0-9a-f]{32}\nenvelope: (ev-[0-9a-f]{32})\nat: [0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}\.[0-9]{6}Z\nnonce: [0-9a-f]{32}\n$/;
   function envelopeLineOk(body, id) {
