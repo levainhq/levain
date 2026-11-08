@@ -32,6 +32,21 @@ def _is_int(v: Any) -> bool:
     return isinstance(v, int) and not isinstance(v, bool)
 
 
+def _is_iso_day(v: Any) -> bool:
+    """A real calendar day written ``YYYY-MM-DD`` (it round-trips through ``date.fromisoformat``)."""
+    if not isinstance(v, str):
+        return False
+    try:
+        return date.fromisoformat(v).isoformat() == v
+    except ValueError:
+        return False
+
+
+def _is_later_words(v: Any) -> bool:
+    """A LATER day's words (``Sun``, ``Tue 11-10``): a printable string of 1..40 characters."""
+    return isinstance(v, str) and 1 <= len(v) <= 40 and v.isprintable()
+
+
 def _is_bool(v: Any) -> bool:
     return isinstance(v, bool)
 
@@ -129,8 +144,8 @@ FACETS: dict[str, tuple[str, Callable[[Any], bool]]] = {
     "question_section": ("enum", _enum("you", "desk")),
     "question_carried": ("bool", _is_bool),
     # an open question snoozed past today (band_view.later_of): the day (YYYY-MM-DD) and its words ("Mon", "Tue 11-10")
-    "question_later": ("str", _is_str),
-    "question_later_words": ("str", _is_str),
+    "question_later": ("YYYY-MM-DD calendar date", _is_iso_day),
+    "question_later_words": ("printable string of 1..40 chars", _is_later_words),
     # an agent's note (levain.consent.notes): its number and whether it was dismissed; its words are never a facet
     "note_n": ("int", _is_int),
     "note_state": ("enum", _enum("open", "dismissed")),

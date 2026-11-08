@@ -562,7 +562,9 @@ def _sign_facet(facets: dict[str, Any], item: Any) -> None:
 
 def _question_rows_in(store: Any, now: datetime) -> tuple[list[RowIn], int]:
     """The question store's open questions, and those answered in the last day, as rows (with the count of open
-    ones left out past the cap). A queue with no ``questions.db`` lists nothing and creates nothing."""
+    ones left out past the cap). A queue with no ``questions.db`` lists nothing and creates nothing. Known edge (reachability
+    line): the cap is applied before the later/due split, so a band of more than ``PENDING_CAP`` open rows could show later ones
+    in place of due ones; no real band holds that many."""
     from levain.consent.listing import PENDING_CAP
 
     open_ = store.open_questions()

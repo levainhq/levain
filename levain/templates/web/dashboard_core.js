@@ -4684,6 +4684,13 @@
       const n = cardBandNum(row.dataset.questionN);
       if (tag) { tag.textContent = n === undefined ? "" : String(n); tag.hidden = n === undefined; }
     }
+    // the LATER lines keep flow's order: soonest day, then band number (known only once the band is read)
+    for (const sec of document.querySelectorAll(".needs-later")) {
+      const rows = Array.from(sec.children).filter((r) => r.dataset && r.dataset.laterDay);
+      const key = (r) => { const b = cardBandNum(r.dataset.questionN); return Number(b === undefined ? r.dataset.questionN : b); };
+      const sorted = rows.slice().sort((a, b) => (a.dataset.laterDay < b.dataset.laterDay ? -1 : a.dataset.laterDay > b.dataset.laterDay ? 1 : key(a) - key(b)));
+      if (sorted.some((r, i) => r !== rows[i])) for (const r of sorted) sec.appendChild(r);
+    }
   }
   function bandSlot() {
     const slot = el("div", "band-slot");
@@ -6008,7 +6015,7 @@
       if (!ln || typeof ln !== "object") continue;
       if (ln.consent && ln.consent.state === "pending") consents.push({ kind: "consent", c: ln.consent });
       // a question the desk alone owes (section desk, not carried over to him) is the Decisions card's "Desk owes" tab, not his strip
-      else if (ln.question && ln.question.state === "open" && ln.question.later) continue;     // dated past today: a LATER line (needsLaterItems), not a waiting item
+      else if (ln.question && ln.question.state === "open" && needsLaterDay(ln.question)) continue;     // dated past today: a LATER line (needsLaterItems), not a waiting item
       else if (ln.question && ln.question.state === "open") { if (!(ln.question.section === "desk" && !ln.question.carried)) questions.push({ kind: "question", q: ln.question }); }
       else if (ln.question && ln.question.state === "answered" && decidedRecently(ln.question.decidedAge, ln.question.decidedAt)) {
         answered.push({ kind: "question", q: ln.question, answered: true });
@@ -6022,20 +6029,36 @@
     const byQ = new Map(answered.map((it) => [it.q, it]));
     return questions.concat(consents, Array.from(keep).map((q) => byQ.get(q)));
   }
+  // the page's local day as "YYYY-MM-DD", from the clock the age timer reads (the server's)
+  function needsLocalDay(ms) {
+    const d = new Date(ms), p = (v) => (v < 10 ? "0" : "") + v;
+    return d.getFullYear() + "-" + p(d.getMonth() + 1) + "-" + p(d.getDate());
+  }
+  // The day a question is LATER until: its facet while that day is still after the page's today, else "" (due). The server builds the
+  // facet per request with its own now; this is the backstop for a view that outlives midnight. A clock that cannot be read is due.
+  function needsLaterDay(q) {
+    const d = q && typeof q.later === "string" ? q.later : "";
+    return /^\d{4}-\d{2}-\d{2}$/.test(d) && d > needsLocalDay(needsNow()) ? d : "";
+  }
   // the open questions dated past today (row 131's one predicate, served as the question_later facet): drawn as one collapsed LATER
-  // line each at the end of the strip, never counted, no answer controls. Soonest day first, then band number.
-  function needsLaterItems(lines) {
+  // line each at the end of the strip, never counted, no answer controls. Soonest day first, then band number. `scope` "desk" is the
+  // Desk owes tab's own (section desk, carried or not); anything else is Needs you's (every row but one the desk alone owes).
+  function needsLaterItems(lines, scope) {
     const out = [];
     for (const ln of Array.isArray(lines) ? lines : []) {
       const q = ln && ln.question;
-      if (q && q.state === "open" && q.later && !(q.section === "desk" && !q.carried)) out.push({ kind: "question", q: q, later: q.later });
+      const day = q && q.state === "open" ? needsLaterDay(q) : "";
+      if (!day) continue;
+      if (scope === "desk" ? q.section === "desk" : !(q.section === "desk" && !q.carried)) out.push({ kind: "question", q: q, later: day });
     }
-    return out.sort((a, b) => (a.later < b.later ? -1 : a.later > b.later ? 1 : 0));
+    const bk = (it) => { const b = cardBandNum(it.q.n); return Number(b === undefined ? it.q.n : b); };
+    return out.sort((a, b) => (a.later < b.later ? -1 : a.later > b.later ? 1 : bk(a) - bk(b)));
   }
   function needsLaterLine(it) {
     const row = el("div", "needs-later-line band-later");
     row.dataset.needsLater = String(it.q.n);
     row.dataset.questionN = String(it.q.n);
+    row.dataset.laterDay = it.later;
     const bn = cardBandNum(it.q.n);
     const tag = el("b", "band-num needs-later-band", bn === undefined ? "" : String(bn));
     tag.hidden = bn === undefined;
@@ -6464,7 +6487,7 @@
   function deskOwesItems(lines) {
     const out = [];
     for (const ln of Array.isArray(lines) ? lines : []) {
-      if (ln && ln.question && ln.question.state === "open" && ln.question.section === "desk") out.push({ kind: "question", q: ln.question });
+      if (ln && ln.question && ln.question.state === "open" && ln.question.section === "desk" && !needsLaterDay(ln.question)) out.push({ kind: "question", q: ln.question });
     }
     return out;
   }
@@ -6598,17 +6621,17 @@
     needsViewRef = view;
     const lines = ((view.extra_panels || {}).decisions || {}).lines;
     const all = needsItems(lines);
-    const laterRows = needsLaterItems(lines);
+    const laterYou = needsLaterItems(lines, "you"), laterDesk = needsLaterItems(lines, "desk");
     const desk = deskOwesItems(lines);
     const items = needsWaiting(all), settled = all.filter((it) => it.answered);
     ncNeedsCount(items.length);               // the strip's Needs you count and the app-icon badge: the waiting items, nothing else
     syncAppBadge(view, items.length);
-    if (!all.length && !desk.length && !laterRows.length) { clearNeeds(host); return; }
+    if (!all.length && !desk.length && !laterYou.length && !laterDesk.length) { clearNeeds(host); return; }
     // the same set of waiting items leaves the strip as it is: a card with half-typed words, an open "details" and a running
     // countdown is not rebuilt under the reader by a refetch that changed nothing about what waits. The layout, the tab and the
     // fold are part of what is drawn, so a change of one is a new signature (a plain re-render, no network).
     const prefs = needsPrefs(view);
-    const sig = all.map(needsKey).join("\n") + "\nD:" + desk.map(needsKey).join(",") + "\nL:" + laterRows.map((it) => it.q.n + "@" + it.later).join(",") + "\nP:" + prefs.layout + "|" + prefs.tab + "|" + (needsMoreOpen ? 1 : 0) + "|" + (prefs.sw ? 1 : 0);
+    const sig = all.map(needsKey).join("\n") + "\nD:" + desk.map(needsKey).join(",") + "\nL:" + laterYou.map((it) => it.q.n + "@" + it.later + "@" + (it.q.laterWords || "")).join(",") + "\nLD:" + laterDesk.map((it) => it.q.n + "@" + it.later + "@" + (it.q.laterWords || "")).join(",") + "\nP:" + prefs.layout + "|" + prefs.tab + "|" + (needsMoreOpen ? 1 : 0) + "|" + (prefs.sw ? 1 : 0);
     if (host.dataset.sig === sig && !host.hidden) return;
     // the answered cards are drawn under a quiet label of their own; with nothing waiting that is all the strip holds
     // folded by default (Phill 11-02): a count under a label you click to open; the cards stay in the page, hidden, so the
@@ -6635,9 +6658,11 @@
       sec.append(toggle, body);
       return sec;
     };
-    const laterSection = () => { const sec = el("div", "needs-later"); for (const it of laterRows) sec.appendChild(needsLaterLine(it)); return sec; };
-    if (!items.length && !desk.length) {
-      host.replaceChildren(...(settled.length ? [answeredSection()] : []), ...(laterRows.length ? [laterSection()] : []));
+    const laterSection = (rows) => { const sec = el("div", "needs-later"); for (const it of rows) sec.appendChild(needsLaterLine(it)); return sec; };
+    // each tab draws its own LATER lines: a "you" row never sits in the Desk owes tab, nor a desk one in Needs you
+    const laterShown = prefs.tab === "desk" ? laterDesk : laterYou;
+    if (!items.length && !desk.length && !laterYou.length && !laterDesk.length) {
+      host.replaceChildren(...(settled.length ? [answeredSection()] : []));
       delete host.dataset.waiting;
       host.hidden = false;
       host.dataset.sig = sig;
@@ -6717,13 +6742,13 @@
     grid.setAttribute("role", "tabpanel");
     drawNeedsList(grid, prefs.tab === "desk" ? desk : items, prefs, rowOf);
     const kids = [head, needsBar(items), grid];   // the bar is CSS-hidden on Board and is the only Needs surface on Build and Memory, whichever tab is picked
-    if (laterRows.length) kids.push(laterSection());
+    if (laterShown.length) kids.push(laterSection(laterShown));
     if (settled.length) kids.push(answeredSection());
     host.replaceChildren(...kids);
     host.hidden = false;
     // the cards lead with their band number: the band read gives it (the Decisions panel's own slot may not be drawn on this tab)
     // (no band transport on a read-only manifest surface: the cards then draw without numbers)
-    if (typeof bandRead === "function" && items.some((it) => it.kind === "question")) {
+    if (typeof bandRead === "function" && (items.some((it) => it.kind === "question") || laterYou.length || laterDesk.length)) {
       const seq = ++cardBandSeq;
       let p = null;
       try { p = bandFetch(false); } catch (e) { p = null; }

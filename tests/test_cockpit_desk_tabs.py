@@ -133,3 +133,111 @@ def test_engine_rows_carry_the_later_facets_from_the_one_predicate(tmp_path: Pat
     assert f[str(c.n)]["question_later_words"] == f"{wd[t2.weekday()]} {t2.strftime('%m-%d')}"
     for facets in f.values():
         validate_facets(facets)
+
+
+# ---- LATER strip, fix round 1 (L3 r1 of e54b9ee1) ----
+
+READY_ANY = "!!document.getElementById('ck-needs')"
+
+
+def _later_home(tmp_path: Path, monkeypatch, specs: list[tuple[str, int]], desk: tuple[str, ...] = ()) -> list:
+    """A question store holding only the given questions, each snoozed `days` ahead; questions whose `what` is in `desk` read
+    as section desk, not carried (the kernel's store has no section, so the read is wrapped)."""
+    from datetime import datetime, timedelta
+
+    from levain.consent.questions import QuestionStore, local_today
+    home = tmp_path / "levain_home"
+    monkeypatch.setenv("LEVAIN_HOME", str(home))
+    (home / "consent").mkdir(parents=True, mode=0o700)
+    qs = QuestionStore(home / "consent")
+    out = []
+    for i, (what, days) in enumerate(specs):
+        q = qs.file(agent="claude_code", agent_session_id=f"s{i}", what=what, options=[("a", "Yes"), ("b", "No")], rec="a", blocks="b", cwd="/w")
+        day = (datetime.fromisoformat(local_today(datetime.now().astimezone())) + timedelta(days=days)).date().isoformat()
+        qs.snooze(q.id, until=day, channel="cli", via="cli")
+        out.append(q)
+    orig = QuestionStore.open_questions
+
+    def open_questions(self, *a, **kw):
+        return [dataclasses.replace(q, section="desk", carried=False) if q.what in desk else q for q in orig(self, *a, **kw)]
+    monkeypatch.setattr(QuestionStore, "open_questions", open_questions)
+    return out
+
+
+@needs_browser
+def test_a_dated_desk_question_is_a_desk_later_line_and_the_head_stays(tmp_path: Path, monkeypatch) -> None:
+    """F1 + F2 + F3: a dated desk question is no actionable card and no count on Desk owes; each tab draws only its own LATER
+    lines; a strip of LATER rows alone keeps its head (tabs); the LATER lines carry their band number."""
+    _later_home(tmp_path, monkeypatch, [("You later", 3), ("Desk later", 2)], desk=("Desk later",))
+    _root, src, _ids = _install(tmp_path)
+    lines = "Array.from(document.querySelectorAll('#ck-needs .needs-later-line'))"
+    probe = ("(() => JSON.stringify({"
+             " tabs: Array.from(document.querySelectorAll('#ck-needs [data-needs-tab]')).map(e => e.textContent),"
+             f" later: {lines}.map(e => e.dataset.questionN),"
+             f" bands: {lines}.map(e => e.querySelector('.needs-later-band').textContent),"
+             " rows: document.querySelectorAll('#ck-needs .needs-row').length,"
+             " empty: (document.querySelector('#ck-needs .needs-empty') || {}).textContent}))()")
+    ready = f"{lines}.length === 1 && {lines}.every(e => e.querySelector('.needs-later-band').textContent !== '')"
+    with _serve(src, surface_tokens={"browser": "T"}, install_class="reported") as (url, _httpd):
+        vals = _drive(tmp_path, f"{url}/#write_token=T", [
+            {"until": READY_ANY, "ms": 20000}, {"until": ready, "ms": 20000}, {"eval": probe},
+            {"eval": "document.querySelector('#ck-needs [data-needs-tab=desk]').click()"},
+            {"until": f"document.querySelector('#ck-needs [data-needs-tab=desk]').classList.contains('is-on') && {ready}", "ms": 20000},
+            {"eval": probe}])["values"]
+    got = [json.loads(v) for v in vals if isinstance(v, str) and v.startswith("{")]
+    you, dsk = got[0], got[-1]
+    assert you["tabs"] == ["Needs you (0)", "Desk owes (0)"] and you["later"] == ["1"] and you["rows"] == 0, you
+    assert dsk["later"] == ["2"] and dsk["rows"] == 0 and dsk["empty"] == "The desk owes you nothing right now.", dsk
+    assert all(b for b in you["bands"] + dsk["bands"]), (you, dsk)
+
+
+@needs_browser
+def test_equal_day_later_lines_follow_the_band_number(tmp_path: Path, monkeypatch) -> None:
+    """F3: two lines of the same day are ordered by their band number, not by the order the rows came."""
+    from levain.band_view import number_for_ping
+    from levain.consent.questions import QuestionStore
+    a, b = _later_home(tmp_path, monkeypatch, [("First filed", 3), ("Second filed", 3)])
+    qs = QuestionStore(tmp_path / "levain_home" / "consent")
+    assert number_for_ping(qs, b.id) is not None and number_for_ping(qs, a.id) is not None     # the second-filed takes the lower number
+    _root, src, _ids = _install(tmp_path)
+    lines = "Array.from(document.querySelectorAll('#ck-needs .needs-later-line'))"
+    ready = f"{lines}.length === 2 && {lines}.every(e => e.querySelector('.needs-later-band').textContent !== '')"
+    with _serve(src, surface_tokens={"browser": "T"}, install_class="reported") as (url, _httpd):
+        vals = _drive(tmp_path, f"{url}/#write_token=T", [{"until": READY_ANY, "ms": 20000}, {"until": ready, "ms": 20000},
+                      {"eval": f"JSON.stringify({lines}.map(e => [e.dataset.questionN, e.querySelector('.needs-later-band').textContent]))"}])["values"]
+    got = json.loads(vals[-1])
+    assert [n for n, _b in got] == [str(b.n), str(a.n)] and int(got[0][1]) < int(got[1][1]), got
+
+
+@needs_browser
+def test_the_page_clock_decides_whether_a_later_row_is_still_later(tmp_path: Path, monkeypatch) -> None:
+    """F5: a row is LATER only while its day is after the page's today (the server clock the page uses)."""
+    _file(tmp_path, monkeypatch)
+    _root, src, _ids = _install(tmp_path)
+    lines = [_ql(1, section="you", later="2026-11-10", laterWords="Tue 11-10"), _ql(2, section="you", later="2026-11-20", laterWords="Fri 11-20")]
+    probe = ("(() => { const K = window.LevainCockpitKinds; const ids = () => window.LevainNeeds.items(" + json.dumps(lines) + ").map(x => x.q.id);"
+             " const at = (y, m, d) => { K.serverNow = () => new Date(y, m - 1, d, 12).getTime(); return ids(); };"
+             " return JSON.stringify({before: at(2026, 11, 1), on: at(2026, 11, 10), past: at(2026, 11, 12)}); })()")
+    with _serve(src, surface_tokens={"browser": "T"}, install_class="reported") as (url, _httpd):
+        vals = _drive(tmp_path, f"{url}/#write_token=T", [{"until": READY, "ms": 20000}, {"eval": probe}])["values"]
+    got = json.loads(vals[-1])
+    assert got == {"before": [], "on": ["question:1"], "past": ["question:1"]}, got
+
+
+def test_the_strip_signature_carries_the_later_words() -> None:
+    """F4: the words flip at midnight ("Tue 11-10" -> "Tue") with the same day, so the signature must hold them."""
+    src = (HERE.parent / "levain" / "templates" / "web" / "dashboard_core.js").read_text(encoding="utf-8")
+    sig = next(ln for ln in src.splitlines() if ln.lstrip().startswith("const sig = all.map(needsKey)"))
+    assert sig.count("laterWords") == 2, sig         # the Needs you lines and the Desk owes lines
+
+
+def test_the_later_facets_are_a_real_day_and_bounded_words() -> None:
+    """F6: question_later is a real calendar day, question_later_words 1..40 printable characters."""
+    from levain.cockpit.registry import FacetValueError
+    validate_facets({"question_later": "2026-11-10", "question_later_words": "Tue 11-10"})
+    for bad in ("2026-99-99", "2026-11-31", "11-10-2026", "2026-1-5", "", " 2026-11-10", "2026-11-10\n", 20261110):
+        with pytest.raises(FacetValueError):
+            validate_facets({"question_later": bad})
+    for bad in ("", "x" * 41, "Tue\n11-10", "\x00", 5):
+        with pytest.raises(FacetValueError):
+            validate_facets({"question_later_words": bad})
