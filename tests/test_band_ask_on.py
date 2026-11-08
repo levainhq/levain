@@ -85,10 +85,18 @@ def test_bad_date_options_and_no_install_are_refused(tmp_path, inst, monkeypatch
     assert rc == 2 and "no Levain install" in text
 
 
-def test_timed_future_is_refused_by_the_anneal_write_path(tmp_path, inst):
+def test_timed_future_is_accepted(tmp_path, inst):
     when = (datetime.now() + timedelta(days=2)).strftime("%Y-%m-%dT09:00")
     rc, text, _ = _ask(tmp_path, "--on", when)
-    assert rc == 2 and "cannot be stored yet" in text and f"--on {when[:10]}" in text
+    assert rc == 0, text
+    [s] = _spores(inst)
+    assert (s["disposition"], s["next"], s["target"]) == ("agenda", when, "band")
+
+
+def test_garbage_on_is_refused_naming_both_forms(tmp_path, inst):
+    for bad in ("tomorrow", "2026-13-40", "2026-11-09T25:00", "2026-11-09 09:00"):
+        rc, text, _ = _ask(tmp_path, "--on", bad)
+        assert rc == 2 and "YYYY-MM-DD or YYYY-MM-DDTHH:MM" in text, (bad, text)
     assert _spores(inst) == []
 
 
@@ -138,15 +146,10 @@ def test_file_agenda_with_none_what_or_blocks_is_a_clear_refusal(inst):
     assert _spores(inst) == []
 
 
-def test_timed_is_refused_before_the_store_is_called(tmp_path, inst, monkeypatch):
-    def boom(*a, **k):
-        raise AssertionError("the store must not be reached")
-    monkeypatch.setattr(band, "_store_add", boom, raising=False)
-    import levain.spores as sp
-    monkeypatch.setattr(sp, "guarded_spore_store", boom)
-    when = (datetime.now() + timedelta(days=2)).strftime("%Y-%m-%dT09:00")
+def test_timed_past_is_refused(tmp_path, inst):
+    when = (datetime.now() - timedelta(hours=2)).strftime("%Y-%m-%dT%H:%M")
     item, text = band.file_agenda("w", "b", when)
-    assert item is None and "cannot be stored yet" in text
+    assert item is None and "not in the future" in text
 
 
 def test_corrupt_spore_store_is_a_clean_refusal(tmp_path, inst):

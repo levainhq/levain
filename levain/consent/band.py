@@ -703,8 +703,7 @@ def file_agenda(what: str, blocks: str, on: str, attention: str | None = None, *
     walking up to the innermost ``.levain`` directory): ``next=on``, ``target`` ``band`` (``nudge`` with
     ``attention: talk``), ``attention``. ``levain spores germinate`` files it on its date. Returns ``(spore, text)``;
     the spore is ``None`` when refused, with the reason. ``on`` is ``YYYY-MM-DD`` (after today) or
-    ``YYYY-MM-DDTHH:MM`` (after now); the timed shape is Levain's List contract but anneal 1.0.3's store write path
-    (``_validate_date``) accepts date-only, so a timed value is refused with that reason until anneal takes it."""
+    ``YYYY-MM-DDTHH:MM`` (after now); anneal 1.0.4's store write path takes a timed ``next`` (TS-64), so both shapes are filed."""
     import hashlib
     from datetime import datetime
 
@@ -736,11 +735,6 @@ def file_agenda(what: str, blocks: str, on: str, attention: str | None = None, *
     why = check_steering("agenda", target, attention)
     if why:
         return refuse(why)
-    if is_timed(on):
-        # decided here, before the store: anneal 1.0.3's write path takes date-only next (no string-matching its refusal)
-        return refuse(f"the time of day in --on {on} cannot be stored yet: anneal 1.0.3's store accepts "
-                      "date-only next (the List contract's timed shape needs anneal to accept it); "
-                      f"use --on {on[:10]}")
     here = (start or Path.cwd()).resolve()
     spores = _find_install(here)
     if spores is None:
