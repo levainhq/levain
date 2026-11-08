@@ -894,7 +894,8 @@ class CredWriter:
     async def _refresh(self, cred: Credential, gate: _Gate, fut: "asyncio.Future") -> None:
         """The detached refresh: the POST (or the gate's `held` fields, when a prior refresh's commits all failed), the
         new object, the commit (`_land`). A refused answer that carried a rotated refresh token commits that token
-        alone and still counts as a failure, the gate now holding the committed `rev`. Any other failure counts on
+        alone and still counts as a failure, the gate now holding the committed `rev`. Held fields that land keep the
+        gate's failures and backoff (only a POST that succeeded resets them). Any other failure counts on
         the gate and leaves the old file. A DISCARD (the operator's act landed) is neither, except after a refused
         answer, which still counts (on a gate the operator's new `rev` has already left). The `finally` resolves the
         future with the outcome; the task's done-callback repeats the cleanup for a task cancelled before its first
@@ -923,7 +924,9 @@ class CredWriter:
                     gate.rev = out.rev   # the file is this refresh's: the next attempt must find this gate and its hold
                 raise refused
             result = out.result
-            if out.result == COMMITTED:
+            if out.result == COMMITTED and held is not None:
+                gate.rev = out.rev   # no POST succeeded: the gate keeps its failures and backoff (L2-L2)
+            elif out.result == COMMITTED:
                 gate.succeeded(out.rev)
             else:
                 _note(logging.INFO, "levain gw-keys: credential %s refresh discarded (changed meanwhile)", cred.name)

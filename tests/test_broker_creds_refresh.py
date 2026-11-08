@@ -1210,6 +1210,41 @@ def test_3b7_a_rotated_token_whose_commits_all_failed_lands_before_the_next_post
     assert c.secret == "new-access-1"
 
 
+def test_l2l2_a_held_fields_commit_does_not_reset_the_backoff(env):
+    """L2-L2/L1-F4: a refused answer (the access token unusable) whose rotated refresh token could not be committed is
+    held; when the next attempt lands the held fields, no POST has succeeded, so the gate's failure count and backoff
+    stay (only a successful POST resets them)."""
+    ep, d, store, cert, mp = env
+    clk = Clock()
+    _write(d, _fields(int(clk.wall()) - 5))
+    ep.mode = "big-token"
+    down = [True]
+
+    async def go():
+        await _serve(ep, cert, mp)
+        w, s = _writer(d, clk), store()
+        _flaky_commit(w, lambda n: down[0])
+        with pytest.raises(Refused):
+            await C.fresh(w, s, NAME)
+        await _settle(w)
+        before = w._gates[NAME].failures
+        down[0] = False
+        clk.t = C.GATE_MAX_S + 1
+        with pytest.raises(Refused):   # the held fields carry the old, expired access token
+            await C.fresh(w, s, NAME)
+        await _settle(w)
+        g = w._gates[NAME]
+        same_gate = g.rev == s.observe(NAME).rev
+        w.close()
+        return before, g.failures, same_gate
+    before, failures, same_gate = run(go())
+    assert same_gate, "the held commit's rev left its gate (the next want would open a fresh one)"
+    assert ep.calls == 1
+    assert _file(d)["refresh"]["refresh_token"] == "new-refresh-1"
+    assert before == 1
+    assert failures == before, "a held-fields commit reset the failure backoff"
+
+
 def test_3b7_after_a_kept_rotation_a_failed_commit_is_still_held_on_the_same_gate(env):
     """3b-7: the rotated token alone landed (the access token was refused); the next refresh rotates again and every
     commit fails. That attempt's fields stay held on the credential's gate, so the attempt after commits them with no
