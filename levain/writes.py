@@ -96,8 +96,9 @@ from levain.spores import (  # the operator-I/O disposition vocabulary (anneal s
     NON_COGNITION_DISPOSITIONS,
     RETIRED_HANDOFF_MSG,
     RETIRED_KEEP_NOTE_MSG,
+    RETIRED_DISPOSITIONS,
     TRAY_WRITE_DISPOSITIONS,
-    VALID_DISPOSITIONS,
+    WRITE_DISPOSITIONS,
     RetiredDisposition,
     retired_message,
     guarded_spore_store,
@@ -2023,10 +2024,11 @@ def _apply_spore_set_disposition(
 
     spore_id = _require_str(req, "spore_id")
     disposition = req.get("disposition")
-    if disposition not in VALID_DISPOSITIONS and retired_message(disposition) is None:
+    # exact names only: a retired name reaches the echo-or-refuse check below, any other spelling stops here
+    if disposition not in WRITE_DISPOSITIONS and disposition not in RETIRED_DISPOSITIONS:
         raise EditError(
             "bad_verb_arg", 422,
-            f"disposition must be one of {list(VALID_DISPOSITIONS)} (got {disposition!r})",
+            f"disposition must be one of {list(WRITE_DISPOSITIONS)} (got {disposition!r})",
         )
     # Optional surface_at — the "remind me" tickler: promote a note to a Tray seed AND schedule
     # its resurface in ONE atomic op. Two sequential GUI commits is impossible — a successful

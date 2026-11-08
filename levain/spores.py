@@ -59,6 +59,8 @@ __all__ = [
     "RETIRED_DISPOSITIONS",
     "NON_COGNITION_DISPOSITIONS",
     "VALID_DISPOSITIONS",
+    "WRITE_DISPOSITIONS",
+    "stored_disposition",
     "PARKED_TIER",
     "BUCKET_LOOP",
     "BUCKET_TRAY",
@@ -74,7 +76,7 @@ TRAY_DISPOSITIONS = ("seed", "handoff", "agenda")   # operator INBOX — the REA
 TRAY_WRITE_DISPOSITIONS = ("seed", "agenda")        # the Tray values a NEW write may take
 # RETIRED (TS-1): legacy rows still carry these. They stay in the READ sets (a legacy handoff
 # or Keep note still renders, descends, and re-dispositions to seed/agenda) but are OUT of the
-# WRITE set (VALID_DISPOSITIONS): a new handoff or Keep note is refused at the write seam.
+# WRITE set (WRITE_DISPOSITIONS): a new handoff or Keep note is refused at the write seam.
 RETIRED_DISPOSITIONS = ("handoff", "note")
 KEEP_DISPOSITIONS = ("note",)                        # legacy operator REFERENCE — read-only vocabulary
 # Everything the operator authored as I/O — all excluded from the entity's OWN cognition.
@@ -82,7 +84,10 @@ KEEP_DISPOSITIONS = ("note",)                        # legacy operator REFERENCE
 # flood every legacy note and handoff into the agent's collision surface. The order is the
 # hook copies' tuple order (drift contract: byte-equal to ``_NON_COGNITION_DISPOSITIONS``).
 NON_COGNITION_DISPOSITIONS = ("seed", "handoff", "agenda", "note")
-VALID_DISPOSITIONS = (LOOP_DISPOSITION,) + TRAY_WRITE_DISPOSITIONS   # the WRITE set
+# Two sets, two names. VALID: every value a row may HOLD (the read set; byte-equal to the embedder's
+# ``VALID_DISPOSITIONS``, a drift-contract tuple). WRITE: every value a write may SET.
+VALID_DISPOSITIONS = (LOOP_DISPOSITION,) + NON_COGNITION_DISPOSITIONS
+WRITE_DISPOSITIONS = (LOOP_DISPOSITION,) + TRAY_WRITE_DISPOSITIONS
 
 RETIRED_HANDOFF_MSG = (
     "handoff is retired: ask the operator with `levain ask` (or `--on <date>` for later), "
@@ -95,25 +100,57 @@ RETIRED_KEEP_NOTE_MSG = (
 
 
 class RetiredDisposition(ValueError):
-    """A write tried to CREATE a retired disposition (handoff / Keep note)."""
+    """A write tried to SET a disposition outside the write set: a retired handoff / Keep note (any
+    spelling anneal would persist as one), or a value nothing reads."""
+
+
+def stored_disposition(value: Any) -> Any:
+    """``value`` as anneal will persist it (``normalize_spore_field``: controls and trailing
+    whitespace removed, NFC). A non-string is returned unchanged; anneal refuses it itself."""
+    if not isinstance(value, str):
+        return value
+    from anneal_memory.spores import normalize_spore_field
+
+    return normalize_spore_field(value)
 
 
 def retired_message(value: Any) -> str | None:
-    """The refusal text for a retired disposition value, else None."""
-    if value == "handoff":
+    """The refusal text for a retired disposition value, in any spelling or case, else None."""
+    stored = stored_disposition(value)
+    key = stored.casefold() if isinstance(stored, str) else None
+    if key == "handoff":
         return RETIRED_HANDOFF_MSG
-    if value == "note":
+    if key == "note":
         return RETIRED_KEEP_NOTE_MSG
     return None
 
 
 def refuse_retired_disposition(value: Any, current: Any = None) -> None:
-    """TS-1, the ONE refusal every writer shares. A retired value is refused unless it is NOT a
-    change (``current`` already holds it: an echo, or a crash-after-apply retry whose write already
-    landed). An undo that RESTORES a retired value is a change, so it is refused (known edge)."""
+    """TS-1, the write seams' early refusal (a clean 422 before the store is touched). A retired value
+    is refused unless ``current`` already holds its persisted form. ``current`` here is an unlocked
+    read, so this is never the authority: the store guard is (:func:`guarded_spore_store`), and it
+    passes an echo only on a CAS. An undo that RESTORES a retired value is a change, so it is refused."""
     msg = retired_message(value)
-    if msg is not None and value != current:
+    if msg is not None and stored_disposition(value) != current:
         raise RetiredDisposition(msg)
+
+
+def _refuse_unwritable(value: Any, cas: Any) -> None:
+    """THE store rule, one bound for every writer. The disposition is judged as anneal will PERSIST
+    it, against the write set (an allow-list, so no spelling of a retired or unknown value slips
+    through). A value outside the set passes only as a provable non-change: ``cas`` (the call's own
+    ``expect_disposition``, which anneal compares under its lock before writing) equals it. There is
+    no fallback read: without that CAS it is refused."""
+    if not isinstance(value, str):
+        return   # absent / an explicit _UNSET / None (a clear); a non-str anneal refuses itself
+    stored = stored_disposition(value)
+    if not stored or stored in WRITE_DISPOSITIONS:
+        return   # "" / whitespace is a clear, as anneal stores it
+    if isinstance(cas, str) and cas == stored:
+        return
+    raise RetiredDisposition(
+        retired_message(stored)
+        or f"disposition must be one of {list(WRITE_DISPOSITIONS)} (got {value!r})")
 
 
 _GUARDED: Any = None
@@ -121,10 +158,12 @@ _GUARDED_LOCK = threading.Lock()   # anneal is imported lazily (this module stay
 
 
 def guarded_spore_store(path: Any) -> Any:
-    """An anneal ``SporeStore`` that refuses to CREATE a retired disposition through ``add``,
-    ``update`` or ``apply`` (a planned cockpit effect that deserialized after an upgrade included),
-    so no writer (``apply_edit``, the cockpit effects, a CLI, a migration) can route around the
-    retirement. Legacy rows still read; a write that leaves a retired value unchanged passes."""
+    """An anneal ``SporeStore`` that will not SET a disposition outside ``WRITE_DISPOSITIONS``
+    through ``add``, ``update`` or ``apply`` (a planned cockpit effect that deserialized after an
+    upgrade included), so no writer (``apply_edit``, the cockpit effects, a CLI, a migration) can
+    route around the retirement. Legacy rows still read. An update that leaves a legacy value
+    unchanged must say so with ``expect_disposition`` equal to it; a retried ``add`` of a key that
+    already exists returns that row, as anneal's own ``add`` does."""
     global _GUARDED
     with _GUARDED_LOCK:
         if _GUARDED is None:
@@ -136,33 +175,45 @@ def _build_guarded_class() -> Any:
     from anneal_memory.spores import ApplyRefused, SporeStore
 
     class GuardedSporeStore(SporeStore):  # type: ignore[misc]
-        def add(self, *a: Any, **kw: Any) -> Any:
-            refuse_retired_disposition(kw.get("disposition"))
-            return super().add(*a, **kw)
+        # keyword-only, as anneal's own add/update are: a positional disposition cannot exist
+        def add(self, **kw: Any) -> Any:
+            try:
+                _refuse_unwritable(kw.get("disposition"), None)   # a create has no prior value to echo
+            except RetiredDisposition:
+                key = kw.get("origin_key")
+                # anneal's add is idempotent by key: a retry of a create that already landed returns
+                # that row. Nothing is written here, and a keyed row never leaves the store's record
+                existing = self.get_by_origin_key(key) if key is not None else None
+                if existing is not None:
+                    return existing
+                raise
+            return super().add(**kw)
 
-        def update(self, spore_id: str, *a: Any, **kw: Any) -> Any:
-            d = kw.get("disposition")
-            if retired_message(d) is not None:
-                if "expect_disposition" in kw:
-                    # anneal CAS-checks this INSIDE its transaction, so the stored value IS this
-                    # one when the write lands: no unlocked read, no TOCTOU
-                    cur_d = kw["expect_disposition"]
-                else:
-                    # known edge: no CAS sent, so this read is outside the store lock
-                    cur_d = (self.get(spore_id) or {}).get("disposition")
-                refuse_retired_disposition(d, cur_d)
-            return super().update(spore_id, *a, **kw)
+        def update(self, spore_id: str, **kw: Any) -> Any:
+            _refuse_unwritable(kw.get("disposition"), kw.get("expect_disposition"))
+            return super().update(spore_id, **kw)
 
         def apply(self, effect: Any) -> Any:
-            d = dict(getattr(effect, "args", None) or {}).get("disposition")
-            if getattr(effect, "op", None) in ("add", "update") and retired_message(d) is not None:
-                cur = self.get_by_origin_key(effect.origin_key)
-                try:
-                    if effect.op == "add" and cur is not None:
-                        return super().apply(effect)   # the create already landed: anneal reports ALREADY
-                    refuse_retired_disposition(d, (cur or {}).get("disposition"))
-                except RetiredDisposition as exc:
-                    raise ApplyRefused(str(exc)) from exc
+            op = getattr(effect, "op", None)
+            if op not in ("add", "update"):
+                return super().apply(effect)
+            try:
+                args = dict(getattr(effect, "args", None) or {})
+                # only an update takes expect_disposition (anneal refuses it on an add)
+                _refuse_unwritable(args.get("disposition"), args.get("expect_disposition") if op == "update" else None)
+            except RetiredDisposition as exc:
+                if op == "add":
+                    try:
+                        landed = self.get_by_origin_key(effect.origin_key) is not None
+                    except (ValueError, TypeError) as key_exc:
+                        raise ApplyRefused(str(key_exc)) from key_exc
+                    if landed:
+                        # the create already landed; a keyed row stays in the store (open, resolved
+                        # or the deleted registry), so anneal reports ALREADY and never creates
+                        return super().apply(effect)
+                raise ApplyRefused(str(exc)) from exc
+            except (ValueError, TypeError) as exc:   # malformed args: the base store's contract
+                raise ApplyRefused(str(exc)) from exc
             return super().apply(effect)
 
     return GuardedSporeStore

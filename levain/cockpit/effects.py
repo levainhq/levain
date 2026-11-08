@@ -504,7 +504,12 @@ class SporeEffectStore:
         stray = sorted(set(changes) - set(SPORE_UPDATE_FIELDS))
         if not changes or stray:
             raise PermanentApplyRefusal(f"an update changes {list(SPORE_UPDATE_FIELDS)} only (got {sorted(changes)})")
-        return SporeApply(op="update", origin_key=key, args=dict(changes), postcondition=dict(changes), **guard)
+        args = dict(changes)
+        if changes.get("disposition") and "disposition" not in effect.writes:
+            # an echo of the stored disposition: say so as a CAS, so anneal proves it under its lock
+            # (the guarded store passes an echo of a legacy handoff/note on nothing else)
+            args["expect_disposition"] = changes["disposition"]
+        return SporeApply(op="update", origin_key=key, args=args, postcondition=dict(changes), **guard)
 
     def apply_unit(self, unit: ApplyUnit) -> UnitApplyResult:
         from anneal_memory.spores import ApplyRefused, PostconditionFailed, SporeError
@@ -544,10 +549,10 @@ def _norm(value: Any) -> str:
 def _norm_disposition(value: Any, current: Any = None) -> str | None:
     """``current``: the stored disposition. A retired value is refused only as a CHANGE: an echo of a
     legacy row's own retired value leaves it as it was. Any other invalid value (None included) is
-    refused as not one of the valid dispositions."""
+    refused as not one of the write set (``WRITE_DISPOSITIONS``)."""
     from levain.spores import (
         LOOP_DISPOSITION,
-        VALID_DISPOSITIONS,
+        WRITE_DISPOSITIONS,
         RetiredDisposition,
         refuse_retired_disposition,
         retired_message,
@@ -557,8 +562,8 @@ def _norm_disposition(value: Any, current: Any = None) -> str | None:
         refuse_retired_disposition(value, current)
     except RetiredDisposition as exc:
         raise ValueError(str(exc)) from exc
-    if value not in VALID_DISPOSITIONS and not (value == current and retired_message(value) is not None):
-        raise ValueError(f"disposition must be one of {list(VALID_DISPOSITIONS)} (got {value!r})")
+    if value not in WRITE_DISPOSITIONS and not (value == current and retired_message(value) is not None):
+        raise ValueError(f"disposition must be one of {list(WRITE_DISPOSITIONS)} (got {value!r})")
     return None if value == LOOP_DISPOSITION else _norm(value)
 
 
