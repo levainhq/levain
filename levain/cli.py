@@ -1100,11 +1100,20 @@ def build_parser() -> argparse.ArgumentParser:
             "search result can reach a search provider's query log."
         ),
     )
-    web_p.add_argument(
+    stt_g = web_p.add_mutually_exclusive_group()
+    stt_g.add_argument(
         "--premium-stt",
         action="store_true",
         dest="premium_stt",
-        help=argparse.SUPPRESS,      # premium dictation is hidden for Levain 1.0: not listed, and off unless named
+        default=None,
+        help=("Force premium dictation (paid speech-to-text with your own key) on. Without either flag it is on "
+              "whenever a speech-to-text key is configured."),
+    )
+    stt_g.add_argument(
+        "--no-premium-stt",
+        action="store_false",
+        dest="premium_stt",
+        help="Turn premium dictation off for this server even when a speech-to-text key is configured.",
     )
     web_p.set_defaults(func=_cmd_serve)
 

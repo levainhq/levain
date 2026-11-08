@@ -1926,9 +1926,10 @@ class _LevainHTTPServer(ThreadingHTTPServer):
     voice_transport: "Any" = None
     voice_last_read: "dict[str, str | None] | None" = None
     voice_meter: "Any" = None
-    # premium dictation (the transcribe route) is OFF unless the server was built with ``premium_stt=True`` (``levain
-    # serve --premium-stt``); off, the route refuses before it reads a key, a meter row or a body byte
-    premium_stt: bool = False
+    # premium dictation (the transcribe route and the live stream routes): ``True`` forces it on, ``False`` off, ``None`` is
+    # AUTO, decided per request by levain.cockpit.voice.premium_stt_on (on while a provider with a stt model holds a key
+    # that lists ``stt``); off, the route refuses before it reads a key, a meter row or a body byte
+    premium_stt: "bool | None" = None
     # live dictation (cockpit mic S3), only with premium_stt: the registry of streams, built on the first stream request
     # under voice_stream_lock, and the reaper thread that ends idle ones every voice_reap_interval seconds. A test sets
     # voice_stream_factory (a fake provider stream; None is the Deepgram adapter) and voice_stream_kwargs (the registry's
@@ -3879,7 +3880,7 @@ class _Handler(GuardedHandler):
         try:
             body = cockpit_voice.serve_voice(srv.broker.data_root, self._voice_meter(directory),
                                              last_read=srv.voice_last_read if srv.voice_last_read is not None else {},
-                                             premium_stt=srv.premium_stt)
+                                             premium_stt=srv.premium_stt)   # the setting itself: serve_voice resolves AUTO
         except _CredentialUnavailable:   # RU-5: only the outer catch answers it
             raise
         except Exception as exc:  # noqa: BLE001 - fixed words; the log names the type only
@@ -3938,8 +3939,8 @@ class _Handler(GuardedHandler):
             self._reject(403, "forbidden", cockpit_voice.WORDS["no_owner"])
             return None
         speak = route == cockpit_voice.SPEAK_PATH
-        if not speak and not srv.premium_stt:
-            # premium dictation is hidden for Levain 1.0: one fixed answer before the content type, the length, the voice
+        if not speak and not cockpit_voice.premium_stt_on(srv.premium_stt, srv.broker.data_root):
+            # premium dictation off (forced off, or no key lists stt): one fixed answer before the content type, the length, the voice
             # slot, the body, the meter and the key are looked at, so it says nothing of whether a key exists. _reject
             # closes the connection, so an audio body is not left on the socket to be read as the next request
             self._reject(404, "not_found", cockpit_voice.WORDS["premium_stt_off"])
@@ -4005,7 +4006,7 @@ class _Handler(GuardedHandler):
         if owner is None:
             self._reject(403, "forbidden", cockpit_voice.WORDS["no_owner"])
             return None
-        if not srv.premium_stt:
+        if not cockpit_voice.premium_stt_on(srv.premium_stt, srv.broker.data_root):
             self._reject(404, "not_found", cockpit_voice.WORDS["premium_stt_off"])
             return None
         chunk = route == cockpit_voice.STREAM_CHUNK
@@ -5304,7 +5305,7 @@ def make_server(
     chat_service: "ChatService | None" = None,
     room_host: "cockpit_room.RoomHost | None" = None,
     room_serve: "Any" = None,
-    premium_stt: bool = False,
+    premium_stt: "bool | None" = None,
 ) -> _LevainHTTPServer:
     """Build a configured, bound (but not-yet-serving) web server over a substrate.
 
@@ -5784,7 +5785,7 @@ def make_server(
     httpd.voice_last_read = {}
     httpd.voice_stream_lock = threading.Lock()
     httpd.voice_chunk_gate = threading.BoundedSemaphore(cockpit_voice.STREAM_CHUNK_INFLIGHT)
-    httpd.premium_stt = premium_stt is True       # off unless the caller says True outright
+    httpd.premium_stt = premium_stt if isinstance(premium_stt, bool) else None     # True/False force; anything else is AUTO
     from levain.webpush.presence_tokens import RateLimit as _PresenceRate
 
     httpd.presence_rate = _PresenceRate()     # tap-token writes per minute, counted in this process
@@ -5936,7 +5937,7 @@ def run_web_server(
     sign_queue_dir: "Path | None" = None,
     sign_host: str | None = None,
     room: "Path | None" = None,
-    premium_stt: bool = False,
+    premium_stt: "bool | None" = None,
 ) -> int:
     """``levain serve`` entry point — serve the substrate dashboard on localhost.
 
@@ -6052,8 +6053,8 @@ def run_web_server(
     sign_kw: dict[str, Any] = {} if signer is None else {"signer": signer, "extra_hosts": frozenset({sign_host})}
     if room_serve is not None:
         sign_kw["room_serve"] = room_serve
-    if premium_stt is True:
-        sign_kw["premium_stt"] = True    # hidden for 1.0 (levain.cockpit.voice): only a literal True turns the route on
+    if isinstance(premium_stt, bool):
+        sign_kw["premium_stt"] = premium_stt    # a bool forces the switch; anything else leaves AUTO (levain.cockpit.voice.premium_stt_on)
     try:
         # the Desk panel's verbs exactly when the watcher below runs beside this server
         httpd = make_server(source, host=host, port=port, chat_host=chat_host, install_class=install_class,

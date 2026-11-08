@@ -230,12 +230,12 @@ def _clock_before_the_openai_cutoff(monkeypatch):
 
 @contextmanager
 def served(rig: Rig, *, room: bool = True, signer_q: Path | None = None, signer_on: bool = True,
-           mesh: bool = False, premium_stt: bool = True):
+           mesh: bool = False, premium_stt: "bool | None" = True):
     """``levain serve`` over the rig. By default with a Signer over the consent reader's own queue, as a real install
     runs it, so the phone's grant routes are served (a voice route reads no key without them). ``signer_q`` names
     another queue; ``signer_on=False`` serves no Signer at all. ``premium_stt`` is the server's premium-dictation
     switch (``make_server(premium_stt=)``, off in the product): this fixture turns it ON so every transcribe test below
-    runs the route as it was built; the tests of the hidden default pass ``premium_stt=False``."""
+    runs the route as it was built; the tests of the forced-off and AUTO settings pass ``premium_stt=False``."""
     port = _free_port()
     signer = None
     if signer_q is None and signer_on:
@@ -1748,41 +1748,90 @@ def test_t_gate_the_too_long_sentence_names_the_size_cap_that_is_enforced_not_a_
 
 # --- 12. HIDDEN-STT: premium dictation is off for Levain 1.0 (Phill 11-05) -------------------------------------------------
 
-OFF_WORDS = "Premium dictation is not offered in this version."
+OFF_WORDS = "Premium dictation needs a speech-to-text key (or it was turned off for this server)."
 
 
-def test_hidestt_the_switch_is_off_unless_named_true_and_the_flag_is_hidden(tmp_path, monkeypatch, capsys):
-    """The default is off in the class, in ``make_server`` and on the CLI, only ``True`` turns it on, and ``--premium-stt``
-    is parsed but absent from ``levain serve --help``.
-    Red with: any default turned to True, ``premium_stt is True`` loosened to a truthiness test (the string case), or the
-    flag's ``help=argparse.SUPPRESS`` removed."""
+def test_hidestt_the_switch_is_auto_unless_named_a_bool_and_the_cli_has_both_flags(tmp_path, monkeypatch, capsys):
+    """The default is None (auto) in the class, in ``make_server`` and on the CLI; ``--premium-stt`` forces it on,
+    ``--no-premium-stt`` forces it off, and the help says so.
+    Red with: any default turned back to a bool, either flag missing, or the flags left out of ``levain serve --help``."""
     import inspect
 
     import levain.web_server as ws
     from levain.cli import main
 
-    assert ws._LevainHTTPServer.premium_stt is False
-    assert inspect.signature(make_server).parameters["premium_stt"].default is False
-    assert inspect.signature(ws.run_web_server).parameters["premium_stt"].default is False
+    assert ws._LevainHTTPServer.premium_stt is None
+    assert inspect.signature(make_server).parameters["premium_stt"].default is None
+    assert inspect.signature(ws.run_web_server).parameters["premium_stt"].default is None
     got: dict = {}
     monkeypatch.setattr(ws, "run_web_server", lambda path, **k: got.update(k) or 0)
-    assert main(["serve", "--path", str(tmp_path)]) == 0 and got["premium_stt"] is False
+    assert main(["serve", "--path", str(tmp_path)]) == 0 and got["premium_stt"] is None
     got.clear()
     assert main(["serve", "--path", str(tmp_path), "--premium-stt"]) == 0 and got["premium_stt"] is True
+    got.clear()
+    assert main(["serve", "--path", str(tmp_path), "--no-premium-stt"]) == 0 and got["premium_stt"] is False
+    with pytest.raises(SystemExit):
+        main(["serve", "--path", str(tmp_path), "--premium-stt", "--no-premium-stt"])
+    capsys.readouterr()
     with pytest.raises(SystemExit):
         main(["serve", "--help"])
-    assert "--premium-stt" not in capsys.readouterr().out
+    assert "--no-premium-stt" in capsys.readouterr().out
 
 
-def test_hidestt_a_truthy_non_true_value_does_not_turn_it_on(rig):
-    """``make_server(premium_stt="yes")`` is off: the route answers the fixed refusal.
-    Red with: ``httpd.premium_stt = premium_stt is True`` loosened to ``bool(premium_stt)``."""
-    rig.add_key()
+def test_hidestt_a_truthy_non_bool_value_is_auto_and_forces_nothing(rig):
+    """``make_server(premium_stt="yes")`` is AUTO: with no stt key the route answers the fixed refusal, with one it serves.
+    Red with: ``premium_stt is True`` loosened to ``bool(premium_stt)`` (the no-key request is then served as forced on)."""
     with served(rig, premium_stt="yes") as (port, httpd):      # type: ignore[arg-type]
-        assert httpd.premium_stt is False
+        assert httpd.premium_stt is None
         status, _h, body = transcribe(port)
     assert (status, js(body)["message"]) == (404, OFF_WORDS)
     assert rig.transport.seen == [] and rig.rows() == []
+
+
+def test_auto_is_on_with_an_stt_keyed_provider_and_off_without_one(rig):
+    """AUTO (``premium_stt=None``): no key, or a key whose uses leave out ``stt``, is off (404 ``premium_stt_off``,
+    ``voice.json`` says false and lists no stt); an stt-keyed provider turns it on (``premium_stt`` true, stt listed).
+    Red with: AUTO resolving to a constant (always off, or always on)."""
+    with served(rig, premium_stt=None) as (port, _httpd):
+        voice = js(call(port, "GET", VOICE_JSON)[2])
+        status, _h, body = transcribe(port)
+    assert voice["premium_stt"] is False and (status, js(body)["message"]) == (404, OFF_WORDS)
+    rig.add_key(uses=("tts",))
+    with served(rig, premium_stt=None) as (port, _httpd):
+        assert js(call(port, "GET", VOICE_JSON)[2])["premium_stt"] is False
+        assert transcribe(port)[0] == 404
+    assert rig.transport.seen == []
+
+
+def test_auto_follows_a_stt_key_added_after_the_server_started(rig):
+    """AUTO is decided per request: a server with no stt key refuses, the key is added with the server running, and the
+    next request is served with no restart. Red with: the switch resolved once at ``make_server``."""
+    with served(rig, premium_stt=None) as (port, _httpd):
+        assert transcribe(port)[0] == 404
+        assert js(call(port, "GET", VOICE_JSON)[2])["premium_stt"] is False
+        rig.add_key()
+        voice = js(call(port, "GET", VOICE_JSON)[2])
+        assert voice["premium_stt"] is True
+        assert next(p for p in voice["providers"] if p["name"] == "openai")["uses"] == ["stt", "tts"]
+        status, _h, body = transcribe(port)
+    assert status != 404 or js(body)["message"] != OFF_WORDS
+
+
+def test_false_forces_off_even_with_a_key_and_true_forces_on_without_one(rig):
+    """Red with: a key making AUTO win over an explicit False, or an explicit True consulting the keys."""
+    rig.add_key()
+    with served(rig, premium_stt=False) as (port, _httpd):
+        assert js(call(port, "GET", VOICE_JSON)[2])["premium_stt"] is False
+        status, _h, body = transcribe(port)
+    assert (status, js(body)["message"]) == (404, OFF_WORDS)
+    assert rig.transport.seen == []
+
+
+def test_true_forces_on_with_no_key(rig):
+    with served(rig, premium_stt=True) as (port, _httpd):
+        assert js(call(port, "GET", VOICE_JSON)[2])["premium_stt"] is True
+        status, _h, body = transcribe(port)
+    assert js(body).get("message") != OFF_WORDS
 
 
 def test_hidestt_off_the_transcribe_route_refuses_in_fixed_words_before_anything_is_read(rig, monkeypatch):
