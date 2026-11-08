@@ -6029,16 +6029,12 @@
     const byQ = new Map(answered.map((it) => [it.q, it]));
     return questions.concat(consents, Array.from(keep).map((q) => byQ.get(q)));
   }
-  // the page's local day as "YYYY-MM-DD", from the clock the age timer reads (the server's)
-  function needsLocalDay(ms) {
-    const d = new Date(ms), p = (v) => (v < 10 ? "0" : "") + v;
-    return d.getFullYear() + "-" + p(d.getMonth() + 1) + "-" + p(d.getDate());
-  }
-  // The day a question is LATER until: its facet while that day is still after the page's today, else "" (due). The server builds the
-  // facet per request with its own now; this is the backstop for a view that outlives midnight. A clock that cannot be read is due.
+  // The day a question is LATER until: its question_later facet, else "" (due). The server alone judges the day, in the install's
+  // zone, per request (band_view.later_of), and the panel's etag covers that zone's date, so a view refreshes when midnight passes
+  // there. The page never re-judges it with its own clock: a phone in another zone would disagree with flow (L3 r2).
   function needsLaterDay(q) {
     const d = q && typeof q.later === "string" ? q.later : "";
-    return /^\d{4}-\d{2}-\d{2}$/.test(d) && d > needsLocalDay(needsNow()) ? d : "";
+    return /^\d{4}-\d{2}-\d{2}$/.test(d) ? d : "";
   }
   // the open questions dated past today (row 131's one predicate, served as the question_later facet): drawn as one collapsed LATER
   // line each at the end of the strip, never counted, no answer controls. Soonest day first, then band number. `scope` "desk" is the

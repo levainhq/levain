@@ -42,9 +42,12 @@ def _is_iso_day(v: Any) -> bool:
         return False
 
 
+_LATER_WORDS = re.compile(r"(Mon|Tue|Wed|Thu|Fri|Sat|Sun)( (0[1-9]|1[0-2])-(0[1-9]|[12][0-9]|3[01]))?")
+
+
 def _is_later_words(v: Any) -> bool:
-    """A LATER day's words (``Sun``, ``Tue 11-10``): a printable string of 1..40 characters."""
-    return isinstance(v, str) and 1 <= len(v) <= 40 and v.isprintable()
+    """A LATER day's words, exactly as :func:`levain.band_view.later_words` writes them: ``Sun`` or ``Tue 11-10``."""
+    return isinstance(v, str) and _LATER_WORDS.fullmatch(v) is not None
 
 
 def _is_bool(v: Any) -> bool:

@@ -210,18 +210,20 @@ def test_equal_day_later_lines_follow_the_band_number(tmp_path: Path, monkeypatc
 
 
 @needs_browser
-def test_the_page_clock_decides_whether_a_later_row_is_still_later(tmp_path: Path, monkeypatch) -> None:
-    """F5: a row is LATER only while its day is after the page's today (the server clock the page uses)."""
+def test_the_page_never_rejudges_the_day_with_its_own_clock(tmp_path: Path, monkeypatch) -> None:
+    """L3 r2 (codex, complement): the page's clock is not the install's zone, so a phone elsewhere would disagree with flow. A
+    row is LATER exactly while the server sends the facet, whatever the page's clock says; the etag's install-zone date
+    refreshes the view at midnight."""
     _file(tmp_path, monkeypatch)
     _root, src, _ids = _install(tmp_path)
-    lines = [_ql(1, section="you", later="2026-11-10", laterWords="Tue 11-10"), _ql(2, section="you", later="2026-11-20", laterWords="Fri 11-20")]
+    lines = [_ql(1, section="you", later="2026-11-10", laterWords="Tue 11-10")]
     probe = ("(() => { const K = window.LevainCockpitKinds; const ids = () => window.LevainNeeds.items(" + json.dumps(lines) + ").map(x => x.q.id);"
              " const at = (y, m, d) => { K.serverNow = () => new Date(y, m - 1, d, 12).getTime(); return ids(); };"
-             " return JSON.stringify({before: at(2026, 11, 1), on: at(2026, 11, 10), past: at(2026, 11, 12)}); })()")
+             " return JSON.stringify({before: at(2026, 11, 1), past: at(2026, 11, 12)}); })()")
     with _serve(src, surface_tokens={"browser": "T"}, install_class="reported") as (url, _httpd):
         vals = _drive(tmp_path, f"{url}/#write_token=T", [{"until": READY, "ms": 20000}, {"eval": probe}])["values"]
     got = json.loads(vals[-1])
-    assert got == {"before": [], "on": ["question:1"], "past": ["question:1"]}, got
+    assert got == {"before": [], "past": []}, got
 
 
 def test_the_strip_signature_carries_the_later_words() -> None:
@@ -232,12 +234,14 @@ def test_the_strip_signature_carries_the_later_words() -> None:
 
 
 def test_the_later_facets_are_a_real_day_and_bounded_words() -> None:
-    """F6: question_later is a real calendar day, question_later_words 1..40 printable characters."""
+    """F6: question_later is a real calendar day, question_later_words exactly the shape band_view.later_words writes."""
     from levain.cockpit.registry import FacetValueError
     validate_facets({"question_later": "2026-11-10", "question_later_words": "Tue 11-10"})
     for bad in ("2026-99-99", "2026-11-31", "11-10-2026", "2026-1-5", "", " 2026-11-10", "2026-11-10\n", 20261110):
         with pytest.raises(FacetValueError):
             validate_facets({"question_later": bad})
-    for bad in ("", "x" * 41, "Tue\n11-10", "\x00", 5):
+    for good in ("Mon", "Sun", "Tue 11-10", "Sat 01-03"):
+        validate_facets({"question_later_words": good})
+    for bad in ("", "x" * 41, "Tue\n11-10", "\x00", 5, "not a weekday", "Tue 13-01", "tue", "Tue 11-10 "):
         with pytest.raises(FacetValueError):
             validate_facets({"question_later_words": bad})
