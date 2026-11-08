@@ -66,3 +66,54 @@ def test_api_and_html_responses_keep_no_store(tmp_path):
             assert h["cache-control"] != "no-cache" and "etag" not in h, (path, st, h)
             assert "content-encoding" not in h, path
             assert "no-store" in h["cache-control"], (path, st, h)
+
+
+def test_gzip_and_identity_carry_distinct_strong_etags(tmp_path):
+    with _serving(tmp_path) as port:
+        _, hp, _ = _get(port, "/sign.js")
+        _, hg, _ = _get(port, "/sign.js", {"Accept-Encoding": "gzip"})
+        assert hp["etag"] != hg["etag"] and hg["etag"].endswith('-gz"') and not hg["etag"].startswith("W/")
+        st, h2, body = _get(port, "/sign.js", {"Accept-Encoding": "gzip", "If-None-Match": hg["etag"]})
+        assert st == 304 and body == b"" and h2["etag"] == hg["etag"] and h2["vary"] == "Accept-Encoding"
+        st, h3, _ = _get(port, "/sign.js", {"If-None-Match": hp["etag"]})
+        assert st == 304 and h3["etag"] == hp["etag"]
+
+
+def test_every_js_css_content_type_is_compressible():
+    from levain.web_server import _ASSETS, _compressible
+
+    emitted = {ct for path, (_, ct) in _ASSETS.items() if path.endswith((".js", ".css"))}
+    assert emitted and all(_compressible(ct) for ct in emitted), emitted
+    for ct in ("application/javascript", "Application/JavaScript; charset=utf-8", "TEXT/CSS", "text/javascript"):
+        assert _compressible(ct), ct
+    for ct in ("text/html; charset=utf-8", "application/json", "text/plain"):
+        assert not _compressible(ct), ct
+
+
+def test_accept_encoding_q_case_and_wildcard():
+    from levain.web_server import _accepts_gzip as a
+
+    assert not a("gzip;Q=0, identity") and not a("GZIP; Q=0.0")
+    assert a("gzip;Q=0.5") and a("gzip") and a("x-gzip")
+    assert a("*") and a("*;q=1, identity;q=0") and not a("*;q=0") and not a("identity")
+    assert not a("gzip;q=0, *;q=1") and a("gzip;q=1, *;q=0")
+    assert not a(None) and not a("gzip;q=abc")
+
+
+def test_concurrent_first_requests_compress_once(monkeypatch):
+    import levain.web_server as ws
+
+    calls = []
+    real = ws.gzip.compress
+
+    def slow(data, **kw):
+        calls.append(1)
+        threading.Event().wait(0.05)
+        return real(data, **kw)
+
+    monkeypatch.setattr(ws.gzip, "compress", slow)
+    body = b"x" * 5000 + b"unique-cardgz-body"
+    ts = [threading.Thread(target=ws._static_entry, args=(body,)) for _ in range(12)]
+    [t.start() for t in ts]
+    [t.join() for t in ts]
+    assert len(calls) == 1

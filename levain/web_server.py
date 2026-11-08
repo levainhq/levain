@@ -1502,47 +1502,64 @@ _SHELL_ASSET_EXT = (".js", ".css")
 # ``no-cache`` so a repeat load revalidates to a 304 instead of re-downloading (the consent card pulled ~538 KB uncompressed
 # under ``no-store`` on every load). The bytes are immutable for a server's life, so the compressed body and the ETag are
 # computed once per body; the entry keeps a reference to the body so its ``id`` cannot be reused.
-_STATIC_CACHE: dict[int, tuple[bytes, str, bytes]] = {}
+_STATIC_CACHE: dict[int, tuple[bytes, str, str, bytes]] = {}
 _STATIC_CACHE_LOCK = threading.Lock()
 _STATIC_CACHE_MAX = 256
-_COMPRESSIBLE_TYPES = ("text/css", "text/javascript")
+_COMPRESSIBLE_TYPES = frozenset({"text/css", "text/javascript", "application/javascript"})
 STATIC_CACHE_CONTROL = "no-cache"
 
 
+def _compressible(content_type: str) -> bool:
+    """The media type (parameters such as charset ignored, case-insensitive) is a CSS/JS one the server can emit."""
+    return content_type.partition(";")[0].strip().lower() in _COMPRESSIBLE_TYPES
+
+
+def _coding_q(params: str) -> float:
+    """The qvalue of one Accept-Encoding member; no ``q`` is 1, a malformed one is 0 (identity is the safe answer)."""
+    m = re.search(r"(?:^|;)\s*q\s*=\s*([^;\s]*)", params, re.IGNORECASE)
+    if m is None:
+        return 1.0
+    try:
+        return float(m.group(1))
+    except ValueError:
+        return 0.0
+
+
 def _accepts_gzip(header: str | None) -> bool:
+    """RFC 9110 12.5.3: an explicit ``gzip`` (or ``x-gzip``) entry decides; otherwise ``*`` with q>0 allows it."""
+    star: float | None = None
     for part in (header or "").split(","):
         name, _, params = part.strip().partition(";")
-        if name.strip().lower() not in ("gzip", "x-gzip"):
-            continue
-        q = re.search(r"(?:^|;)\s*q\s*=\s*([0-9.]+)", ";" + params)
-        try:
-            return q is None or float(q.group(1)) > 0
-        except ValueError:
-            return False
-    return False
+        name = name.strip().lower()
+        if name in ("gzip", "x-gzip"):
+            return _coding_q(params) > 0
+        if name == "*":
+            star = _coding_q(params)
+    return star is not None and star > 0
 
 
-def _static_entry(body: bytes) -> tuple[str, bytes]:
-    """``(etag of the identity bytes, gzip of them)``, computed once per body."""
+def _static_entry(body: bytes) -> tuple[str, str, bytes]:
+    """``(identity etag, gzip etag, gzip of the bytes)``, computed once per body; concurrent first requests wait on the
+    one compression instead of each running it."""
     with _STATIC_CACHE_LOCK:
         hit = _STATIC_CACHE.get(id(body))
         if hit is not None and hit[0] is body:
-            return hit[1], hit[2]
-    etag = '"' + hashlib.sha256(body).hexdigest()[:32] + '"'
-    gz = gzip.compress(body, compresslevel=9, mtime=0)
-    with _STATIC_CACHE_LOCK:
+            return hit[1], hit[2], hit[3]
+        digest = hashlib.sha256(body).hexdigest()[:32]
+        etag, gz_etag = '"' + digest + '"', '"' + digest + '-gz"'
+        gz = gzip.compress(body, compresslevel=9, mtime=0)
         if len(_STATIC_CACHE) >= _STATIC_CACHE_MAX:
             _STATIC_CACHE.clear()
-        _STATIC_CACHE[id(body)] = (body, etag, gz)
-    return etag, gz
+        _STATIC_CACHE[id(body)] = (body, etag, gz_etag, gz)
+        return etag, gz_etag, gz
 
 
-def _etag_matches(if_none_match: str | None, etag: str) -> bool:
+def _etag_matches(if_none_match: str | None, *etags: str) -> bool:
     if not if_none_match:
         return False
     if if_none_match.strip() == "*":
         return True
-    return any(t.strip().removeprefix("W/") == etag for t in if_none_match.split(","))
+    return any(t.strip().removeprefix("W/") in etags for t in if_none_match.split(","))
 
 
 def _asset_digest(data: bytes) -> str:
@@ -2221,21 +2238,23 @@ class _Handler(GuardedHandler):
     def _send_static(self, body: bytes, content_type: str, *, head: bool) -> None:
         """A static .css/.js asset: strong ETag + ``no-cache`` (revalidate, 304 on a match) and gzip when the client
         accepts it. Anything else (HTML shells, JSON) goes through ``_send`` and keeps its own cache policy."""
-        if not content_type.startswith(_COMPRESSIBLE_TYPES):
+        if not _compressible(content_type):
             self._send(body, content_type, head=head)
             return
-        etag, gz = _static_entry(body)
+        etag, gz_etag, gz = _static_entry(body)
+        use_gz = _accepts_gzip(self.headers.get("Accept-Encoding"))
+        served = gz_etag if use_gz else etag
         vary = ("Vary", "Accept-Encoding")
-        if _etag_matches(self.headers.get("If-None-Match"), etag):
+        if _etag_matches(self.headers.get("If-None-Match"), etag, gz_etag):
             self.send_response(304)
-            self.send_header("ETag", etag)
+            self.send_header("ETag", served)
             self.send_header(*vary)
             self._cache_control = STATIC_CACHE_CONTROL
             self.end_headers()
             self._cache_control = None
             return
-        hdrs = [("ETag", etag), vary]
-        if _accepts_gzip(self.headers.get("Accept-Encoding")):
+        hdrs = [("ETag", served), vary]
+        if use_gz:
             body = gz
             hdrs.append(("Content-Encoding", "gzip"))
         self._send(body, content_type, head=head, headers=hdrs, cache_control=STATIC_CACHE_CONTROL)
