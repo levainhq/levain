@@ -1,0 +1,11 @@
+0 total 32
+-rw-r--r--  1 _levain_dispatch  wheel   45 Nov  7 20:12:35 2026 drv8x1.final.json
+-rw-r--r--  1 root              wheel    0 Nov  7 20:12:04 2026 drv8x1.journaled
+-rw-r--r--  1 _levain_dispatch  wheel   57 Nov  7 20:12:03 2026 drv8x1.prepared.json
+-rw-r--r--  1 _levain_dispatch  wheel   63 Nov  7 20:12:05 2026 drv8x1.released.json
+-rw-r--r--  1 _levain_dispatch  wheel   63 Nov  7 20:12:05 2026 drv8x1.spawned.json
+drwxr-xr-x  5 _levain_dispatch  wheel  160 Nov  7 20:11:44 2026 repo
+ 
+0 {"session": "s-f1da8b840ac1b2cc", "t": 1794082323.31314}
+{"poll": 0, "session": "s-f1da8b840ac1b2cc"}
+ 
