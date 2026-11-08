@@ -257,6 +257,7 @@ def register_list(ck: Cockpit, source: SubstrateSource, spore_common: dict[str, 
     ck.register(ProviderSpec(
         LIST_PANEL_ID, "triage-list", LIST_TITLE, "gate", list_reader(source, ck), region="operate", rank=10, size="tall",
         order="spore.list", views=TRAY_VIEWS, rowset=LIST_ROWSET, read_one=list_read_one(source),
-        label_key=lambda stored: _prov.spore_label_key(stored),   # looked up at call time: a test (or a downstream) may replace it note=LIST_NOTE,
+        label_key=lambda stored: _prov.spore_label_key(stored),   # looked up at call time: a test (or a downstream) may replace it
+        note=LIST_NOTE,
         empty=spore_empty("tray", _configured_entity_name(source)), absent_is_empty=True,
         verbs=LIST_VERBS, facets=LIST_FACETS, **common))
