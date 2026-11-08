@@ -200,7 +200,11 @@ def classify(agent: str, event: str, tool_name: Any, tool_input: Any, tool_respo
         # write_stdin input) may have run outside it, where an EPERM is the OS's and not the bound's: neither touched
         # nor none can be claimed
         if isinstance(tool_name, str) and tool_name.lower() == "write_stdin":
-            return _unknown()     # it may feed a terminal launched outside the sandbox; the launch is not on this call
+            # it may feed a terminal launched outside the sandbox, so an EPERM text here may be the OS's; any other
+            # text reads as every shell call does
+            seen = _scan_text(agent, event, tool_response, error)
+            if seen is not None and _EPERM.search(seen[:MAX_SCAN_CHARS]):
+                return _unknown()
         if shell and agent == "codex" and isinstance(tool_input, Mapping) \
                 and tool_input.get(_CODEX_ESCALATION_KEY) == _CODEX_ESCALATED:
             return _unknown()

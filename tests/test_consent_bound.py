@@ -247,6 +247,15 @@ def test_write_stdin_eperm_reads_unknown(tool):
     assert rec.denials == 0
 
 
+def test_write_stdin_ordinary_reads_its_normal_class():
+    """L2-MED-1 r2: only the EPERM text reads unknown; a proxy refusal or a clean write keeps the class a shell call gets."""
+    rec = classify("codex", "PostToolUse", "write_stdin", {"chars": "x"}, "CONNECT tunnel failed, response 403\n",
+                   bound_active=True)
+    assert rec.bound == "touched" and rec.denials == 1
+    clean = classify("codex", "PostToolUse", "write_stdin", {"chars": "x"}, "ok\n", bound_active=True)
+    assert clean.bound == classify("codex", "PostToolUse", "Bash", {"chars": "x"}, "ok\n", bound_active=True).bound
+
+
 def test_shell_tools_are_the_authority_list():
     """6b-1: one source for the shell-tool names, so bound cannot drift from the consent authority again."""
     from levain import authority
