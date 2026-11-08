@@ -1,9 +1,0 @@
-$ /usr/bin/ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR -o PreferredAuthentications=password,keyboard-interactive -o PubkeyAuthentication=no -o ConnectTimeout=15 admin@192.168.64.42 /usr/local/bin/python3.13 -I /tmp/fire/pty_drive.py --steps /tmp/fire/codex_steps.json --log /private/tmp/vend_out/X1c/transcript.bin --total-timeout 560 -- /usr/local/bin/python3.13 -I /tmp/fire/levain_cli.py session claude --repo /Users/admin/vend-repo --auth passthrough
-rc=0
-[pty_drive 17:44:11] step 1: sent 1 bytes
-[pty_drive 17:44:19] step 3: sent 178 bytes
-[pty_drive 17:44:20] step 5: sent 1 bytes
-[pty_drive 17:44:53] step 7: sent 1 bytes
-[pty_drive 17:45:18] step 9: sent 5 bytes
-[pty_drive 17:45:19] step 11: sent 1 bytes
-[pty_drive 17:45:21] exit status 0
