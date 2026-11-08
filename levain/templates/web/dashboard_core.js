@@ -3709,6 +3709,7 @@
       const isTA = f.kind === "textarea";
       const node = el(isTA ? "textarea" : "input", "tray-dump-ta");
       if (isTA) { node.rows = 1; node.addEventListener("input", () => growToText(node)); } else node.type = "text";
+      noContactFill(node);
       if (f.placeholder) node.placeholder = String(f.placeholder);
       if (f.label) node.setAttribute("aria-label", String(f.label));
       box.appendChild(node);
@@ -4625,6 +4626,7 @@
     const words = el("textarea", "question-words");
     words.rows = 2;
     words.maxLength = 4000;
+    noContactFill(words);
     words.placeholder = b.open_ended ? "your answer, in your own words" : card ? "or your own words" : "or answer in your own words";
     if (questionDrafts.has(q.id)) { words.value = questionDrafts.get(q.id); questionDrafts.delete(q.id); }
     const sendWords = el("button", "undo-btn question-send", "send words");
@@ -4640,6 +4642,17 @@
     }
     parts.push(wrap, words, sendWords, msg);
     slot.replaceChildren(...parts);
+  }
+  // iOS keyboards take a free-text box for a contact field when the card around it reads like mail (Phill 11-07, an
+  // email-sourced card). These boxes hold prose, never a name or address, so say so to the keyboard and password managers.
+  function noContactFill(node) {
+    node.setAttribute("autocomplete", "off");
+    node.setAttribute("autocapitalize", "sentences");
+    node.setAttribute("inputmode", "text");
+    node.setAttribute("enterkeyhint", "enter");
+    node.setAttribute("data-form-type", "other");
+    node.setAttribute("data-lpignore", "true");
+    node.setAttribute("data-1p-ignore", "true");
   }
   // The NEEDS YOU band (Q17-ALL S5b), drawn at the head of the Decisions panel: each open item under its band number, one
   // shorthand box ("15b", "1a 2b") and a tap on an option sending "<n><letter>". Reading the band shows it to this credential
