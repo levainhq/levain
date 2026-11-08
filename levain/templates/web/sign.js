@@ -562,11 +562,11 @@
       whom(rp, keysFor(choice), held, acts, !consent && !dispatch).then((k) => (k ? ceremony(r, rp, k, choice, words) : "unsigned"))
         .catch(() => "unsigned")
         .then((done) => {
-          if (done === "signed") { busy = false; ended(); acts.replaceChildren(); acts.hidden = true; tell("signed"); return; }
+          if (done === "signed") { busy = false; ended(); acts.replaceChildren(); acts.hidden = true; tell("signed", { choice: choice, sha256: r.sha256 }); return; }
           if (done === "unsure") {
             relabel("Not confirmed");
             return settle(r, () => { relabel("Not signed"); busy = false; lock(false); },
-                          () => { busy = false; acts.replaceChildren(); acts.hidden = true; tell("signed"); }).then(ended);
+                          (said) => { busy = false; acts.replaceChildren(); acts.hidden = true; tell("signed", { choice: said || choice, sha256: r.sha256 }); }).then(ended);
           }
           relabel("Not signed");
           ended();
@@ -706,7 +706,7 @@
         if (a.line) signing(a.line, "server", "Signed"); else relabel("Signed");
         $("sheet").dataset.state = "signed";
         showOutcome(st.body.choice, a.line);
-        return signedNow();
+        return signedNow(typeof st.body.choice === "string" && st.body.choice ? st.body.choice : undefined);
       }
       if (state === "refused") {
         unsureAttempt = null;

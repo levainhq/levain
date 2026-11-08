@@ -5299,6 +5299,8 @@
   // card's, and one drawn afresh after its request left the listing): each is told every answer and drops itself once its
   // facet is off the page, so a facet drawn later never takes the ask away from one still shown
   const signPending = new Map();
+  const signDecidedSha = new Map();   // request id -> the sha256 of the version the sheet signed ("" when the sheet did not say)
+  const signDecided = new Map();      // request id -> the note text of a request the sign sheet signed: every card of it, drawn now or later, is dead
   const signSettledIds = new Set();   // request ids whose signNotes entry is a settled outcome (signed or refused), shown even once the request is gone
   function signSettledSaid(st) {
     if (st.state === "signed") {
@@ -5419,6 +5421,16 @@
       .then((a) => (a.ok && a.body && typeof a.body.state === "string" ? a.body : { state: "", why: signWhy(a) }));
   }
   const signNewAttempt = () => signB64u(crypto.getRandomValues(new Uint8Array(18)));
+  // a decided request stays decided only while the listing names it at the version the sheet signed: one the listing no longer
+  // has is dropped, and one it lists at another sha256 is a new version of the request, shown live
+  function signDecidedPrune(requests) {
+    for (const id of [...signDecided.keys()]) {
+      const r = requests.find((x) => x && x.id === id);
+      const sha = signDecidedSha.get(id) || "";
+      if (!r) { signDecided.delete(id); signDecidedSha.delete(id); continue; }
+      if (sha && r.sha256 !== sha) { signDecided.delete(id); signDecidedSha.delete(id); signSettledIds.delete(id); signNotes.delete(id); }
+    }
+  }
   // the listing: {requests, signers, origin, note} or {error}. One read serves every card drawn within a second or two;
   // `fresh` reads again (after a ceremony, and before a compose)
   function signListing(fresh) {
@@ -5433,7 +5445,10 @@
                              () => ({ error: "the sign requests could not be read" }));
     }, () => ({ error: "the sign requests could not be read (network)" }));
     signListed = { at: Date.now(), got: got };
-    got.then((b) => { if (b.error && signListed && signListed.got === got) signListed = null; });
+    got.then((b) => {
+      if (b.error && signListed && signListed.got === got) signListed = null;
+      if (!b.error) signDecidedPrune(b.requests);
+    });
     return got;
   }
   // ONE request by its id, whatever the listing's cap: {request, signers, origin, note}, {request: null} when it is not
@@ -5668,7 +5683,7 @@
         // answered here: its signed line stays until the row itself leaves; else it was answered, denied or expired elsewhere
         return show(kept && (kept[1] === "ok" || signSettledIds.has(id)) ? kept[0] : "this sign request is no longer open; the card updates on the next read", kept && kept[1]);
       }
-      if (kept && kept[2] !== (r.sha256 || "")) signNotes.delete(id);
+      if (kept && kept[2] !== (r.sha256 || "") && !signDecided.has(id)) signNotes.delete(id);
       if (r.refused) return show("not signable: " + r.refused, "bad");
       // the focus view's needs-phill card (card_format.js, the sheet's rule and builders): drawn in place of the question's
       // title, blocks and REC lines (`head`), the signed text whole one tap away above the buttons, Detail after them
@@ -5712,6 +5727,7 @@
         if (ask !== false) signAskPending(id);
       };
       const settleShow = (st) => {
+        if (signDecided.has(id)) return;     // the sheet signed it: no later word about an older attempt gives the card back
         if (st.state === "signed") {
           signWriteIns.delete(id);
           say("signed" + (typeof st.choice === "string" && st.choice ? " (" + st.choice + ")" : "")
@@ -5842,6 +5858,7 @@
         for (const x of acts.querySelectorAll("input")) x.readOnly = x.disabled = true;
         settleHere();
       }
+      if (signDecided.has(id)) signCardDead(wrap, signDecided.get(id));     // decided before this card's controls existed
       if (options.length) {
         const lines = el("div", "sign-lines ext-meta", "an option signs the request's message with its line appended:");
         for (const o of options) lines.appendChild(el("div", "sign-line", String(o.line)));
@@ -5865,6 +5882,9 @@
   const SIGN_RELOAD_MS = 1500;
   const SIGN_RELOAD_LATE_MS = 8000;     // a second read after a close forced past a sheet that never answered
   let signSheetInerted = [];      // what openSignSheet made inert (and closeSignSheet gives back): never what was already
+  let signSheetOpen = null;       // {kind, id}: what the open sheet was opened for, given by the caller that opened it; only a plain sign sheet's "signed" message decides a card, and only for its own id
+  const SIGN_SIGNED_GRACE_MS = 30000;   // a plain sign sheet closed this recently may still have its "signed" message arrive
+  let signSheetRecent = [];       // {id, win, until}: the plain sign sheets closed within that grace, with the window each one's frame had
   let signSheetLease = false;     // the sheet holds a `signBusy` count
   let signSheetAsk = null;        // the pending close request's timer
   let signSheetWatch = null;      // the MutationObserver that makes a node added to the body while open inert
@@ -5880,17 +5900,18 @@
   // `version`: the listing's sha256 the card showed (the sheet draws a pick only on it); `choice`: an option to preselect
   function openSignSheet(id, version, choice) {
     if (typeof id !== "string" || !/^[A-Za-z0-9_-]{8,64}$/.test(id)) return null;
-    return openSheet("/sign/" + encodeURIComponent(id), version, choice, "sign request");
+    return openSheet("/sign/" + encodeURIComponent(id), version, choice, "sign request", undefined, { kind: "sign", id: id });
   }
   // OS-2: the same sheet over a consent request (/sign/consent/<id>), answered or ruled there with a passkey
   function openConsentSheet(id, version, choice) {
     if (typeof id !== "string" || !/^[A-Za-z0-9._:-]{1,160}$/.test(id)) return null;
-    return openSheet("/sign/consent/" + encodeURIComponent(id), version, choice, "consent request");
+    return openSheet("/sign/consent/" + encodeURIComponent(id), version, choice, "consent request", undefined, { kind: "consent", id: id });
   }
   // `heading`: the modal's title when it should not be `what` (which names the frame for assistive tech)
-  function openSheet(path, version, choice, what, heading) {
+  function openSheet(path, version, choice, what, heading, ident) {
     closeSignSheet();
     if (signBusy) return null;
+    signSheetOpen = ident && typeof ident.kind === "string" ? { kind: ident.kind, id: String(ident.id) } : null;
     signBusy++;
     signSheetLease = true;
     try {
@@ -5962,6 +5983,12 @@
     clearTimeout(signSheetAsk);
     signSheetAsk = null;
     const veil = document.getElementById(SIGN_SHEET_ID);
+    const closing = document.getElementById(SIGN_SHEET_ID + "-frame");
+    const now = Date.now();
+    signSheetRecent = signSheetRecent.filter((e) => e.until > now);
+    if (signSheetOpen && signSheetOpen.kind === "sign" && closing && closing.contentWindow) {
+      signSheetRecent.push({ id: signSheetOpen.id, win: closing.contentWindow, until: now + SIGN_SIGNED_GRACE_MS });
+    }
     if (signSheetWatch) { signSheetWatch.disconnect(); signSheetWatch = null; }
     for (const n of signSheetInerted) n.inert = false;
     signSheetInerted = [];
@@ -5970,6 +5997,7 @@
     if (veil) veil.remove();
     if (!document.getElementById("levain-modal")) document.body.classList.remove("modal-open");
     if (signSheetLease) { signSheetLease = false; signBusy--; }
+    signSheetOpen = null;
   }
   // one pending board read; `latch`: a second read follows, for a sheet closed while its signature may have been landing
   function signBoardTick() {
@@ -5985,14 +6013,54 @@
     clearTimeout(signBoardTimer);
     signBoardTimer = setTimeout(signBoardTick, SIGN_RELOAD_MS);
   }
+  // A card of a signed request: its note says what was signed and every control on it is dead, whatever draws it
+  function signCardDead(wrap, text) {
+    const note = wrap.querySelector(".sign-note");
+    if (note) { note.textContent = text; note.className = "sign-note ext-meta sign-ok"; }
+    for (const c of wrap.querySelectorAll("button, input, textarea, select, [contenteditable]")) {
+      c.disabled = true;
+      if ("readOnly" in c) c.readOnly = true;
+      if (c.isContentEditable) c.setAttribute("contenteditable", "false");
+    }
+  }
+  // The sheet signed request `id`: the card behind it is decided now, not at the next redraw (the strip keeps a card whose item
+  // did not change, so the board read alone never reaches it). The decision is kept by id, so a card whose controls are built
+  // after this message (a facet still reading, a redraw on the cached listing) comes out decided too.
+  // the server's option key grammar (a sign request's option keys are [a-z0-9]{1,8}) plus the key a write-in signs under, "*"
+  const SIGN_CHOICE_RE = /^(?:[a-z0-9]{1,8}|\*)$/;
+  function signSheetSigned(id, choice, sha) {
+    if (typeof id !== "string" || !/^[A-Za-z0-9_-]{8,64}$/.test(id)) return;
+    const text = "signed" + (typeof choice === "string" && SIGN_CHOICE_RE.test(choice) ? " (" + choice + ")" : "");
+    signDecidedSha.set(id, typeof sha === "string" && /^[0-9a-f]{16,64}$/.test(sha) ? sha : "");
+    signNotes.set(id, [text, "ok", ""]);
+    signSettledIds.add(id);
+    signDecided.set(id, text);
+    signPending.delete(id);
+    signWriteIns.delete(id);
+    signListed = null;
+    for (const wrap of document.querySelectorAll(".sign-facet[data-sign-request]")) {
+      if (wrap.dataset.signRequest === id) signCardDead(wrap, text);
+    }
+  }
   window.addEventListener("message", (ev) => {
+    if (ev.origin !== window.location.origin) return;
     const frame = document.getElementById(SIGN_SHEET_ID + "-frame");
-    if (!frame || ev.source !== frame.contentWindow || ev.origin !== window.location.origin) return;
     const what = ev.data && typeof ev.data === "object" ? ev.data.levainSheet : null;
+    if (!frame || ev.source !== frame.contentWindow) {
+      // a plain sign sheet closed a moment ago, its signature landing after the close: taken only from that sheet's own frame
+      // window (a frame already gone sends nothing that can be told from any other; the board read settles that card)
+      if (what === "signed" && ev.source) {
+        const now = Date.now();
+        const late = signSheetRecent.find((e) => e.win === ev.source && e.until > now && e.id === ev.data.id);
+        if (late) { signSheetSigned(late.id, ev.data.choice, ev.data.sha256); rereadBoard(); }
+      }
+      return;
+    }
     if (what === "ack") { clearTimeout(signSheetAsk); signSheetAsk = null; }
     else if (what === "close") { closeSignSheet(); dispatchStale(); }
     else if (what === "signed" || what === "reload") {
       // the sheet's line stays on it until it is closed; the board under it reads again, and the dispatch jobs with it
+      if (what === "signed" && signSheetOpen && signSheetOpen.kind === "sign" && ev.data.id === signSheetOpen.id) signSheetSigned(ev.data.id, ev.data.choice, ev.data.sha256);
       dispatchStale();
       rereadBoard();
       // the server accepted the drop the sheet filed: the box lets go of the words only if it holds exactly those words
@@ -7820,7 +7888,7 @@
   // OS-2: the sheet over a dispatch job (/sign/dispatch/<job>), signed, cancelled or authorised there with a passkey
   function openDispatchSheet(id, version, choice) {
     if (typeof id !== "string" || !/^dj-[0-9a-f]{32}$/.test(id)) return null;
-    return openSheet("/sign/dispatch/" + encodeURIComponent(id), version, choice, "dispatch job");
+    return openSheet("/sign/dispatch/" + encodeURIComponent(id), version, choice, "dispatch job", undefined, { kind: "dispatch", id: id });
   }
   // OS-2: the sheet over a coordinator drop (/sign/drop): words, and optionally an envelope the passkey signs there
   function openDropSheet(words) {
@@ -7828,7 +7896,7 @@
     // the sheet reads them once and removes them
     // (set after openSheet, which closes any sheet first and so clears the key; the frame loads later than this returns;
     // closeSignSheet and an edit of the box clear it again, so a sheet that never reads it leaves nothing behind)
-    const got = openSheet("/sign/drop", "", "", "desk drop", "Add an envelope");
+    const got = openSheet("/sign/drop", "", "", "desk drop", "Add an envelope", { kind: "drop", id: "" });
     if (got && typeof words === "string" && words) { try { window.sessionStorage.setItem(DROP_PREFILL_KEY, words); } catch (e) { /* the sheet opens empty */ } }
     return got;
   }
