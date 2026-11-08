@@ -365,6 +365,16 @@ def deliver(qdir: Path, store: PushStore, ping_id: int, *, kind: str, ref: str |
     return results
 
 
+def spawn_sign_request(queue_dir: Path | str, rid: str, *, title: str, body: str, url: str) -> bool:
+    """Start the ping for one of levain's OWN sign requests (``rid``, filed by ``sign.file_levain_request``). It is filed as
+    a needs ping (kind ``attention``, ref the request id) whose data names the request (``sign_id``), so the notification
+    center reads the request and draws its "Sign your answer" button, the same card a flow band row's ping gets
+    (:func:`levain.webpush.center.needs_item`). A ``question`` ping with a bare request id as its ref names no request, so
+    the center drew only its text (Phill's first dispatch config run, 11-08). True when the child started."""
+    return spawn(queue_dir, kind="attention", ref=rid, title=title, body=body, url=url,
+                 data={"v": 1, "kind": "decision", "id": rid, "repo": "levain", "what": body, "sign_id": rid})
+
+
 def spawn(queue_dir: Path | str, *, kind: str, ref: str | None, title: str, body: str, url: str = "/",
           command: bool | None = None, push: bool = True, hold: str | None = None,
           data: dict[str, Any] | None = None) -> bool:
