@@ -454,24 +454,30 @@ for (const s of steps) {
   } else if (s.sw !== undefined) {
     // the service worker of the page's origin: a target of its own, listed by the browser at /json beside the pages
     const origin = await evaluate("location.origin");
-    let target = null;
-    for (;;) {
+    // discovery and the connection retry together until the step's deadline: the browser can stop an idle worker between listing it and
+    // the socket opening, and a listed target that is gone is not the end of the step while time remains
+    let sws = null; let lastWhy = "no running service worker listed";
+    while (!sws) {
       try {
         const list = await (await fetch(`http://127.0.0.1:${sharedPort || port}/json`, { signal: AbortSignal.timeout(3000) })).json();
-        target = list.find((x) => x.type === "service_worker" && String(x.url).startsWith(origin + "/") && /\/sw\.js$/.test(x.url) && x.webSocketDebuggerUrl) || null;
-      } catch {}
-      if (target || Date.now() >= deadline) break;
+        const target = list.find((x) => x.type === "service_worker" && String(x.url).startsWith(origin + "/") && /\/sw\.js$/.test(x.url) && x.webSocketDebuggerUrl) || null;
+        if (target) sws = await within(openSocket(target.webSocketDebuggerUrl, "the service worker"), Math.min(Math.max(deadline - Date.now(), 1000), 15000), "the service worker websocket");
+      } catch (err) { lastWhy = String(err && err.message || err); }
+      if (sws || Date.now() >= deadline) break;
       await sleep(150);
     }
-    if (!target) {
-      console.error(`step ${steps.indexOf(s)}: sw found no running service worker for ${origin} within ${waitMs}ms`);
+    if (!sws) {
+      console.error(`step ${steps.indexOf(s)}: sw found no reachable service worker for ${origin} within ${waitMs}ms (${lastWhy})`);
       await shotOnTimeout(steps.indexOf(s));
       done(1); await sleep(10000);
     }
-    const sws = await within(openSocket(target.webSocketDebuggerUrl, "the service worker"), 15000, "the service worker websocket");
     try {
       const answer = await new Promise((res, rej) => {
-        const timer = setTimeout(() => rej(new Error(`no answer from the service worker within ${waitMs}ms`)), Math.max(deadline - Date.now(), 1000));
+        // a fresh budget for the answer (never the sliver the discovery left), and a socket that closes or errors mid-evaluate fails the step at once
+        const timer = setTimeout(() => rej(new Error(`no answer from the service worker within ${waitMs}ms`)), Math.max(deadline - Date.now(), 5000));
+        const gone = () => { clearTimeout(timer); rej(new Error("service worker closed")); };
+        sws.addEventListener("close", gone);
+        sws.addEventListener("error", gone);
         sws.addEventListener("message", (m) => { const d = JSON.parse(m.data); if (d.id === 1) { clearTimeout(timer); res(d); } });
         sws.send(JSON.stringify({ id: 1, method: "Runtime.evaluate", params: { expression: s.sw, awaitPromise: true, returnByValue: true } }));
       });
