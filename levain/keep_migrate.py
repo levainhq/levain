@@ -45,6 +45,14 @@ Safety rules (L3 1107-63):
   original is left exactly as it is (never resurrected).
 * ``revert`` re-adds an original under a revert key and records its id before touching the
   destination; a re-run finds the key and never re-adds or re-writes it.
+* Every keyed spore this module plants (a destination seed / agenda, a restored original) is created
+  WITH its verbatim notes / created / seen in one store transaction (:func:`_add_verbatim`), so no
+  keyed row ever exists half-made, and a keyed row found on a retry is left exactly as found (an
+  edit made to it after a crash is never re-written; apply names it in ``Report.kept``).
+* ``revert`` marks an item ``reverted`` only when it finished. A destination edited mid-revert (the
+  compare-and-set refused) or an original no longer in the store (never re-added, and its destination
+  kept so its content stays) leaves the item ``revert_blocked``, named in the report, and a later
+  ``revert`` retries it.
 
 Known edges (the reachability line: no real caller reaches these, or they cost no data):
 
@@ -59,6 +67,13 @@ Known edges (the reachability line: no real caller reaches these, or they cost n
 * An episode destination whose plan body was edited between a crash and the retry is refused by
   anneal (``OriginKeyConflict``) rather than written twice; restore the body or re-plan.
 * The doctor line says "1 handoffs": it is the frame's exact string.
+* :func:`_add_verbatim` calls anneal's private ``_prepare_add`` / ``_find_by_origin_key`` /
+  ``_add_locked`` (anneal 1.0.3's own ``add``, split so the verbatim fields commit with the create);
+  an anneal that renames them fails loudly (AttributeError), never silently.
+* A ``revert_blocked`` destination retried by a later ``revert`` is composted as it then stands
+  (the operator's second revert is the act); a compost is not a delete, so the edit stays readable.
+* An original removed outside the plan keeps its item ``revert_blocked`` on every revert until the
+  operator settles it by hand (the destination holds the content).
 """
 
 from __future__ import annotations
@@ -113,6 +128,8 @@ STATE_APPLIED = "applied"
 STATE_REVERTED = "reverted"
 STATE_STALE = "stale"                       # the row changed (or vanished) since the plan: left alone, reported
 STATE_CONFLICT = "conflict"                 # as stale, but a destination exists: kept on record, revert removes it
+STATE_REVERT_BLOCKED = "revert_blocked"     # revert could not finish it (destination edited mid-revert, original
+#                                             gone): never `reverted`, `revert_from` keeps its prior state, retried
 
 DEST_EPISODE = "episode"
 DEST_SPORE = "spore"
@@ -454,19 +471,38 @@ def _find_row(store: Any, item: Mapping[str, Any]) -> dict[str, Any] | None:
     return store.get(sid) if sid else None
 
 
-def _restore_row_fields(store: Any, spore_id: str, row: Mapping[str, Any]) -> None:
-    """Put the original's notes / created / seen back VERBATIM (anneal's ``add`` mints fresh ones and a
-    note added through ``update`` is re-stamped). One locked transaction, so a reader never sees half."""
-    with store._transaction() as data:           # noqa: SLF001 - no public setter for verbatim notes
-        for it in data["spores"]:
-            if it.get("id") == spore_id:
-                it["notes"] = list(_notes(row))
-                if isinstance(row.get("created"), str):
-                    it["created"] = row["created"]
-                if isinstance(row.get("seen"), str):
-                    it["seen"] = row["seen"]
-                return
-    raise KeepMigrateError(f"spore {spore_id} vanished while restoring its fields")
+def _add_verbatim(store: Any, *, origin_key: str, row: Mapping[str, Any], text: str,
+                  disposition: str, next_: str | None, guard: bool) -> tuple[dict[str, Any], bool]:
+    """``(spore, created)``: plant ``row``'s content under ``origin_key`` WITH its notes / created /
+    seen verbatim, in ONE locked transaction (anneal's ``add`` mints fresh notes and dates, and a note
+    added through ``update`` is re-stamped). There is no moment a keyed row exists without its
+    verbatim fields, so a keyed row found on a retry is always complete, and it is returned untouched
+    (``created`` False): whatever anyone did to it since is theirs and is never re-written.
+
+    This is anneal's own ``add`` (``_prepare_add`` before the lock, the keyed lookup and
+    ``_add_locked`` inside it) with the three fields set before the commit. ``guard`` applies the
+    retired-disposition guard the guarded store's ``add`` would (revert alone restores a retired
+    one, through anneal's plain store)."""
+    if guard:
+        from levain.spores import _refuse_unwritable
+
+        _refuse_unwritable(disposition)
+    fields = store._prepare_add(                  # noqa: SLF001 - see the docstring
+        type=row.get("type", "thought"), text=text, domain=row.get("domain") or "",
+        tier=row.get("tier") or "warm", salience=int(row.get("salience") or 0), next=next_,
+        pointer=row.get("pointer"), disposition=disposition, target=row.get("target") or None,
+        attention=row.get("attention") or None, germinated=row.get("germinated") or None)
+    with store._transaction() as data:            # noqa: SLF001
+        existing = store._find_by_origin_key(data, origin_key)   # noqa: SLF001
+        if existing is not None:
+            return dict(existing), False
+        item = store._add_locked(data, fields, origin_key)      # noqa: SLF001
+        item["notes"] = list(_notes(row))
+        if isinstance(row.get("created"), str):
+            item["created"] = row["created"]
+        if isinstance(row.get("seen"), str):
+            item["seen"] = row["seen"]
+        return dict(item), True
 
 
 def _episode_store(doc: Mapping[str, Any], episodic_db: Path | str | None) -> Path:
@@ -503,7 +539,10 @@ def _validate_dest(item: Mapping[str, Any]) -> None:
         raise KeepMigrateError(f"item {item.get('index')}: unknown destination kind {k!r}")
 
 
-def _write_destination(item: dict[str, Any], plan_id: str, spores: Any, db: Path | None) -> dict[str, Any]:
+def _write_destination(item: dict[str, Any], plan_id: str, spores: Any, db: Path | None
+                       ) -> tuple[dict[str, Any], dict[str, Any] | None]:
+    """``(result, found)``: the destination's record, and the keyed spore a crashed run had already
+    written (None when this call made it, and for an episode)."""
     d = item["destination"]
     key = _dest_key(plan_id, item)
     if d["kind"] == DEST_EPISODE:
@@ -516,18 +555,10 @@ def _write_destination(item: dict[str, Any], plan_id: str, spores: Any, db: Path
                 metadata={"tags": list(d.get("tags") or EPISODE_TAGS), "plan": plan_id,
                           "spore": item.get("spore_id")},
                 origin_key=key)
-        return {"kind": DEST_EPISODE, "id": ep.id, "origin_key": key}
-    row = item["row"]
-    made = spores.add(
-        type=row.get("type", "thought"), text=item["text"], domain=row.get("domain") or "",
-        tier=row.get("tier") or "warm", salience=int(row.get("salience") or 0),
-        next=d.get("next") or None, pointer=row.get("pointer"), disposition=d["disposition"],
-        target=row.get("target") or None, attention=row.get("attention") or None,
-        germinated=row.get("germinated") or None, origin_key=key)
-    # notes / created / seen verbatim, always (a note-less row keeps its age too). anneal's keyed add
-    # returned the earlier seed on a retry, and re-writing the same values onto it is a no-op.
-    _restore_row_fields(spores, made["id"], row)
-    return {"kind": DEST_SPORE, "id": made["id"], "origin_key": key}
+        return {"kind": DEST_EPISODE, "id": ep.id, "origin_key": key}, None
+    made, created = _add_verbatim(spores, origin_key=key, row=item["row"], text=item["text"],
+                                  disposition=d["disposition"], next_=d.get("next") or None, guard=True)
+    return {"kind": DEST_SPORE, "id": made["id"], "origin_key": key}, (None if created else made)
 
 
 def _marker_notes_out(row: Mapping[str, Any], plan_id: str) -> dict[str, Any]:
@@ -607,6 +638,8 @@ class Report:
     applied: list[int] = field(default_factory=list)
     reverted: list[int] = field(default_factory=list)
     skipped: list[tuple[int, str]] = field(default_factory=list)   # (index, reason): left as they were
+    kept: list[tuple[int, str]] = field(default_factory=list)      # (index, reason): applied, but a row
+    # a crashed run wrote was found edited since and left exactly as found
 
 
 def apply(plan_path: Path | str, *, episodic_db: Path | str | None = None,
@@ -665,7 +698,10 @@ def apply(plan_path: Path | str, *, episodic_db: Path | str | None = None,
             if _content_version(row, plan_id) != _content_version(it["row"], plan_id):
                 leave(it, "edited since the plan was made; re-run the dry run")
                 continue
-            result = _write_destination(it, plan_id, spores, db)
+            result, found = _write_destination(it, plan_id, spores, db)
+            if found is not None and (_notes(found) != _notes(it["row"]) or found.get("status") != "open"):
+                rep.kept.append((idx, f"destination spore {found['id']} was changed after a crashed run "
+                                      "wrote it; left exactly as found"))
             if fault:
                 fault("after_destination", it)
             it["result"] = result
@@ -698,8 +734,9 @@ def revert(plan_path: Path | str, *, episodic_db: Path | str | None = None,
 
     A ``conflict`` item (destination written, original changed) and a ``pending`` / ``stale`` one whose
     destination is found by its key (a crash before the record) get their destination removed and
-    their original left exactly as it is. An original resolved by someone other than this plan is
-    never resurrected. Held under the plan lock throughout."""
+    their original left exactly as it is. An original resolved by someone other than this plan, or no
+    longer in the store, is never resurrected. An item revert cannot finish goes ``revert_blocked``
+    (never ``reverted``) and is retried next time. Held under the plan lock throughout."""
     from anneal_memory.spores import SporeError, SporeStore, spore_version
     from levain.spores import guarded_spore_store
 
@@ -709,7 +746,7 @@ def revert(plan_path: Path | str, *, episodic_db: Path | str | None = None,
         plan_id = doc["plan_id"]
         spores_json = Path(doc["spores_json"])
         restore_states = (STATE_APPLIED, STATE_DEST)
-        if _needs_episodes(doc, restore_states + (STATE_CONFLICT,)):
+        if _needs_episodes(doc, restore_states + (STATE_CONFLICT, STATE_REVERT_BLOCKED)):
             db: Path | None = _episode_store(doc, episodic_db)
         elif _needs_episodes(doc, (STATE_PENDING, STATE_STALE)):
             try:                               # only a probe for an unrecorded crash-time write
@@ -721,37 +758,44 @@ def revert(plan_path: Path | str, *, episodic_db: Path | str | None = None,
         plain = SporeStore(spores_json)         # ONLY for restoring a retired disposition (see module doc)
         guarded = guarded_spore_store(spores_json)
         rep = Report(pp)
+
+        def block(it: dict[str, Any], base: str, why: str) -> None:
+            it["state"] = STATE_REVERT_BLOCKED  # never `reverted`: a later --revert retries it
+            it["revert_from"] = base
+            _atomic_write(pp, doc)
+            rep.skipped.append((it["index"], why + "; a later --revert retries it"))
+
         for it in doc["items"]:
             idx = it["index"]
             if it["state"] == STATE_REVERTED:
                 continue
+            # a blocked item is retried as the state it was blocked from
+            base = ((it.get("revert_from") or STATE_DEST) if it["state"] == STATE_REVERT_BLOCKED
+                    else it["state"])
             res = _locate_destination(it, plan_id, guarded, db)
-            restore = it["state"] in restore_states
+            restore = base in restore_states
             if not restore and res is None:
                 rep.skipped.append((idx, f"state {it['state']}: nothing was applied"))
                 continue
             if restore:
                 rev_key = _revert_key(plan_id, it)
                 again = plain.get_by_origin_key(rev_key)
-                if again is not None:          # a re-run after a crash: restored already, left as it is
+                if again is not None:          # restored already (created whole, see _add_verbatim): left as it is
                     it["restored_id"] = again["id"]
                 else:
                     orig = _find_row(plain, it)
-                    ours = (orig is None or it["state"] == STATE_APPLIED or _composted_by_us(orig, plan_id))
-                    if orig is not None and orig.get("status") == "open":
+                    if orig is None:           # removed outside this plan: never assumed ours, never resurrected
+                        block(it, base, "the original is no longer in the store (removed outside this plan); "
+                                        "not re-added, and its destination is kept so its content stays")
+                        continue
+                    if orig.get("status") == "open":
                         pass                   # never composted (a crash before the compost)
-                    elif not ours:
+                    elif not (base == STATE_APPLIED or _composted_by_us(orig, plan_id)):
                         rep.skipped.append((idx, "the original was resolved outside this plan; not re-added"))
                     else:
-                        row = it["row"]
-                        made = plain.add(
-                            type=row.get("type", "thought"), text=it["text"], domain=row.get("domain") or "",
-                            tier=row.get("tier") or "warm", salience=int(row.get("salience") or 0),
-                            next=row.get("next") or None, pointer=row.get("pointer"),
-                            disposition=it["disposition"], target=row.get("target"),
-                            attention=row.get("attention"), germinated=row.get("germinated"),
-                            origin_key=rev_key)
-                        _restore_row_fields(plain, made["id"], row)
+                        made, _ = _add_verbatim(plain, origin_key=rev_key, row=it["row"], text=it["text"],
+                                                disposition=it["disposition"],
+                                                next_=it["row"].get("next") or None, guard=False)
                         it["restored_id"] = made["id"]
                 _atomic_write(pp, doc)         # the restore is on record before the destination goes
             if fault:
@@ -772,8 +816,10 @@ def revert(plan_path: Path | str, *, episodic_db: Path | str | None = None,
                         guarded.descend(dest["id"], kind="composted",
                                         expected_version=spore_version(cur), today=today)
                     except SporeError:
-                        rep.skipped.append((idx, f"destination {dest['id']} changed during the revert; left open"))
+                        block(it, base, f"destination {dest['id']} changed during the revert; left open")
+                        continue
             it["state"] = STATE_REVERTED
+            it.pop("revert_from", None)
             _atomic_write(pp, doc)
             rep.reverted.append(idx)
         _atomic_write(pp, doc)

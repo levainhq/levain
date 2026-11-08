@@ -382,6 +382,130 @@ def test_crash_on_a_spore_destination_retries_once(env: Env, stage: str):
     assert env.open_set() == original
 
 
+def test_a_note_added_to_a_crashed_destination_survives_the_retry(env: Env):
+    # (A1, L3 1107-63 r2) a retry must never re-write the verbatim fields over a destination row
+    # someone edited after the crash
+    p = _plan(env)
+    idx = _index_of(p, "pick up the Liz thread")
+
+    def fault(s, item):
+        if s == "after_destination" and item["index"] == idx:
+            raise Boom
+
+    with pytest.raises(Boom):
+        km.apply(p, episodic_db=env.db, fault=fault)
+    seed = next(r for r in env.plain().list_open()
+                if r["text"] == "pick up the Liz thread" and r.get("disposition") == "seed")
+    env.plain().update(seed["id"], add_note="added to the seed after the crash")
+    rep = km.apply(p, episodic_db=env.db)
+    assert idx in rep.applied
+    liz = _open_row(env, "pick up the Liz thread")
+    assert liz["id"] == seed["id"]
+    assert any("added to the seed after the crash" in n for n in liz["notes"])
+    assert any(i == idx for i, _ in rep.kept)                          # reported, not silent
+
+
+def _crash_on_the_save_after(monkeypatch, prefix: str) -> None:
+    """Raise Boom at the first spore-store save AFTER the save that first committed a row keyed
+    under ``prefix`` (a process dying right after anneal's keyed add commits)."""
+    from anneal_memory.spores import SporeStore
+
+    real = SporeStore._save
+    st = {"armed": False, "fired": False}
+
+    def save(self, data):
+        if st["armed"] and not st["fired"]:
+            st["fired"] = True
+            raise Boom
+        real(self, data)
+        if any(str(r.get("origin_key") or "").startswith(prefix) for r in data.get("spores", [])):
+            st["armed"] = True
+
+    monkeypatch.setattr(SporeStore, "_save", save)
+
+
+def test_a_crash_right_after_the_restore_add_loses_no_notes(env: Env, monkeypatch):
+    # (A2, L3 1107-63 r2) the restored original never exists without its verbatim notes / age
+    original = env.open_set()
+    p = _plan(env)
+    km.apply(p, episodic_db=env.db)
+    with monkeypatch.context() as m:
+        _crash_on_the_save_after(m, km._REVERT_PREFIX)
+        with pytest.raises(Boom):
+            km.revert(p, episodic_db=env.db)
+    km.revert(p, episodic_db=env.db)
+    assert env.open_set() == original                                   # notes verbatim, none doubled
+
+
+def _edit_destination_on_read(monkeypatch, env: Env, text: str) -> list:
+    """The guarded store's ``get`` of the destination seed returns it, then an edit lands (once)."""
+    import levain.spores as ls
+
+    real = ls.guarded_spore_store
+    hits: list = []
+
+    def wrapped(path):
+        store = real(path)
+        get = store.get
+
+        def get_then_edit(sid):
+            row = get(sid)
+            if row is not None and row.get("text") == text and row.get("disposition") == "seed" \
+                    and row.get("status") == "open" and not hits:
+                hits.append(sid)
+                env.plain().update(sid, add_note="edited mid-revert")
+            return row
+
+        store.get = get_then_edit
+        return store
+
+    monkeypatch.setattr(ls, "guarded_spore_store", wrapped)
+    return hits
+
+
+def test_a_destination_edited_mid_revert_is_retried_not_marked_reverted(env: Env, monkeypatch):
+    # (B1, L3 1107-63 r2) the CAS refusal leaves the item retryable, never `reverted`
+    p = _plan(env)
+    idx = _index_of(p, "pick up the Liz thread")
+    km.apply(p, episodic_db=env.db)
+    with monkeypatch.context() as m:
+        hits = _edit_destination_on_read(m, env, "pick up the Liz thread")
+        rep = km.revert(p, episodic_db=env.db)
+    assert hits
+    assert idx not in rep.reverted and any(i == idx for i, _ in rep.skipped)
+    assert km.load_plan(p)["items"][idx]["state"] == km.STATE_REVERT_BLOCKED
+    assert [r for r in env.plain().list_open() if r["text"] == "pick up the Liz thread"
+            and r.get("disposition") == "seed"]                        # the destination is still open
+    again = km.revert(p, episodic_db=env.db)                            # a later revert retries it
+    assert idx in again.reverted
+    liz = [r for r in env.plain().list_open() if r["text"] == "pick up the Liz thread"]
+    assert len(liz) == 1 and liz[0]["disposition"] == "handoff"        # one open copy: the original
+    assert km.load_plan(p)["items"][idx]["state"] == km.STATE_REVERTED
+
+
+def test_an_original_deleted_outside_the_plan_is_not_resurrected(env: Env):
+    # (B2, L3 1107-63 r2) a missing original is never silently "ours": not re-added, destination kept
+    p = _plan(env)
+    idx = _index_of(p, "pick up the Liz thread")
+
+    def fault(s, item):
+        if s == "after_record" and item["index"] == idx:
+            raise Boom
+
+    with pytest.raises(Boom):
+        km.apply(p, episodic_db=env.db, fault=fault)
+    s = env.plain()
+    from anneal_memory.spores import spore_version
+
+    orig = next(r for r in s.list_open() if r["text"] == "pick up the Liz thread" and r["disposition"] == "handoff")
+    s.delete(orig["id"], expected_version=spore_version(orig))
+    rep = km.revert(p, episodic_db=env.db)
+    assert idx not in rep.reverted and any(i == idx for i, _ in rep.skipped)
+    liz = [r for r in env.plain().list_open() if r["text"] == "pick up the Liz thread"]
+    assert len(liz) == 1 and liz[0]["disposition"] == "seed"           # not resurrected; the copy is kept
+    assert km.load_plan(p)["items"][idx]["state"] == km.STATE_REVERT_BLOCKED
+
+
 def test_the_guard_still_refuses_a_new_retired_write(env: Env):
     from levain.spores import RetiredDisposition, guarded_spore_store
 
