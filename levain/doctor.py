@@ -3600,7 +3600,10 @@ def _check_cockpit_key_files(install: Path, *, key_dirs: list[Path] | None = Non
     Known edges (closed, not built against): a non-ed25519 key enrolled ``touch-id`` is skipped (a touch-id
     key that is not a software ed25519 one is a Secure Enclave / hardware key: there is no plain file to find); a legacy PEM or
     unreadable private file is skipped, not called unencrypted (it cannot be proved plain); the broad ``except``
-    makes a dead check a WARN row, as its sibling cockpit rows do."""
+    makes a dead check a WARN row, as its sibling cockpit rows do; a symlinked ``.pub`` is not followed, so the
+    private file beside it gives no row; a file swapped for a FIFO between the ``lstat`` and the open can block the
+    read (only a process that can already write the key directory can do it); a journal path holding ``?`` or ``#``
+    is read as SQLite URI syntax."""
     try:
         return _cockpit_key_file_rows(install, key_dirs)
     except Exception as exc:  # noqa: BLE001 - a doctor check reports, it never crashes the run
