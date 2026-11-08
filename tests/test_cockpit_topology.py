@@ -186,7 +186,8 @@ MALFORMED = [
 ]
 
 
-@pytest.mark.parametrize("path,val,needle", MALFORMED, ids=[f"{m[0]}={m[1]!r}"[:60] for m in MALFORMED])
+@pytest.mark.parametrize("path,val,needle", MALFORMED, ids=[f"{m[0]}={'<deleted>' if m[1] is _DEL else repr(m[1])}"[:60] for m in MALFORMED])
+# (the id of a deleted field names it, not the sentinel's repr: that repr holds a memory address, which differs per process, and pytest-xdist refuses a run whose workers collect different ids)
 def test_each_malformed_field_is_refused_by_name(path, val, needle):
     v = copy.deepcopy(_good())
     _set(path, val)(v)
