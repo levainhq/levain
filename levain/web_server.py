@@ -2452,7 +2452,7 @@ class _Handler(GuardedHandler):
                                "owner_key": self._owner_key_accepted()}
         if self.server.room_host is not None:
             out["room"] = {"read": cockpit_room.ROOM_PATH, "cursor": "gseq", "after": True, "thread": True,
-                           "wait_max_s": cockpit_room.WAIT_MAX_S}
+                           "wait_max_s": cockpit_room.WAIT_MAX_S, "live": True}
         return out
 
     def _writes_need_credential(self) -> bool:
@@ -3819,7 +3819,7 @@ class _Handler(GuardedHandler):
             else:
                 status, payload = 200, cockpit_room.apply_cursor(
                     {"room_thread": None, "launch_id": None, "composer": None, "model": None, "gap": False,
-                     "stream": [], "proposals": []}, after, thread)
+                     "stream": [], "proposals": [], "live": None}, after, thread)
         else:
             if not self.server.request_gate.acquire(blocking=False):
                 self._send(b"busy\n", "text/plain; charset=utf-8", status=503, head=head)
@@ -3827,6 +3827,7 @@ class _Handler(GuardedHandler):
             try:
                 after, _thread = cockpit_room.parse_cursor(query)
                 wait = cockpit_room.parse_wait(query, after)
+                live_seq = cockpit_room.parse_live_seq(query)
             except cockpit_room.CursorError as e:
                 self.server.request_gate.release()
                 self._send(cockpit_room.encode({"error": "bad_request", "message": str(e)}),
@@ -3840,7 +3841,7 @@ class _Handler(GuardedHandler):
             finally:
                 self.server.request_gate.release()
             if wait is not None and status == 200 and not head:
-                waited = self._room_wait(path, directory, query, wait, (status, payload))
+                waited = self._room_wait(path, directory, query, wait, (status, payload), live_seq)
                 if waited is None:      # the credential ended, or the peer went: the one token 403
                     self._gated_read_403("the room record needs", head=head)
                     return
@@ -3850,7 +3851,8 @@ class _Handler(GuardedHandler):
                    cache_control="private, no-store")
 
     def _room_wait(self, path: str, directory: Any, query: str, wait: int,
-                   first: "tuple[int, dict[str, Any]]") -> "tuple[int, dict[str, Any]] | None":
+                   first: "tuple[int, dict[str, Any]]",
+                   live_seq: "int | None" = None) -> "tuple[int, dict[str, Any]] | None":
         """The long-poll half of ``_serve_room`` (``first`` is the read the request gate already admitted). The wait holds
         NO ``request_gate`` or read slot: each tick re-reads under a non-blocking ``request_gate`` slot of its own (a busy
         gate skips the tick), and the wait itself is counted by ``room_waiters`` (cap ``cockpit_room.WAITERS_MAX``, past it a 503
@@ -3881,7 +3883,8 @@ class _Handler(GuardedHandler):
             return read()
 
         try:
-            return cockpit_room.wait_for_news(one, wait, allowed=allowed, alive=self._peer_open, stop=srv.stream_stop)
+            return cockpit_room.wait_for_news(one, wait, allowed=allowed, alive=self._peer_open, stop=srv.stream_stop,
+                                           live_seq=live_seq)
         finally:
             srv.room_waiter_gate.release()
 

@@ -193,6 +193,6 @@ def test_the_manifest_names_the_room_only_with_a_room_host_and_its_etag_moves(tm
     with_room, etag_a = manifest(chat_service=w.svc, room_host=w.host)
     without, etag_b = manifest()
     assert with_room["transport"]["room"] == {"read": GET, "cursor": "gseq", "after": True, "thread": True,
-                                              "wait_max_s": WAIT_MAX}
+                                              "wait_max_s": WAIT_MAX, "live": True}
     assert "room" not in without["transport"]
     assert etag_a and etag_b and etag_a != etag_b
