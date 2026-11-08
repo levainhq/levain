@@ -51,10 +51,11 @@ TOOL: dict[str, Any] = {
                      "description": "true files an OPEN question: no options and no rec, answered only in the "
                                     "operator's own words. Default false."},
             "on": {"type": "string",
-                   "description": "YYYY-MM-DD, after today. Use when you are NOT stopped yet because the date has not "
+                   "description": "YYYY-MM-DD (after today) or YYYY-MM-DDTHH:MM (after now, local time; a time later "
+                                  "today works). Use when you are NOT stopped yet because the date has not "
                                   "come: no question is filed, ONE agenda spore is written and it reaches the "
-                                  "operator on that date (give what and blocks only; no options, rec or open). Today "
-                                  "or past is refused."},
+                                  "operator on that date (give what and blocks only; no options, rec or open). A "
+                                  "bare date of today or earlier, or a time already past, is refused."},
             "path": {"type": "string",
                      "description": "With on: a directory inside the Levain install to file in (default: this "
                                     "server's working directory)."},

@@ -918,7 +918,8 @@ def add_parsers(subparsers: argparse._SubParsersAction) -> None:
     a.add_argument("--branch", default=None, help="With --would-push: the branch, as `levain push` takes it.")
     a.add_argument("--on", default=None, metavar="DATE",
                    help="Not stopped yet because the date has not come: file NO question; write one agenda spore that "
-                        "reaches the operator on DATE (YYYY-MM-DD, after today). A question you are stopped on now "
+                        "reaches the operator on DATE (YYYY-MM-DD after today, or YYYY-MM-DDTHH:MM after now, "
+                        "local time, so a time later today works). A question you are stopped on now "
                         "is filed without --on.")
     a.add_argument("--path", type=Path, default=None,
                    help="With --on: a directory inside the Levain install to file in (default: the current directory).")
