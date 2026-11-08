@@ -46,7 +46,7 @@ from levain.contracts import canon
 from levain.broker import norm as broker_norm
 from levain.broker import policy as broker_policy
 from levain.firing.hands import HostOS
-from levain.sandbox_keys import LOOSENING_NONEMPTY as _LOOSENING_NONEMPTY, LOOSENING_TRUE as _LOOSENING_TRUE
+from levain.sandbox_keys import CLAUDE_CREDENTIAL_ENV, LOOSENING_NONEMPTY as _LOOSENING_NONEMPTY, LOOSENING_TRUE as _LOOSENING_TRUE
 from levain.slot import Refused
 from levain.slot.bwrap import LEVAIN_BWRAP
 from levain.slot.ids import SlotId, loopback_alias
@@ -112,8 +112,8 @@ ROUTE_TYPES = ("egress", "brokered", "subscription_passthrough")   # §4.1
 #: cannot get past the OS wall (DESIGN §1.3), but every fetch would then fail with no cause shown.
 PROXY_ENV = frozenset(n for b in ("HTTPS_PROXY", "HTTP_PROXY", "NO_PROXY", "ALL_PROXY") for n in (b, b.lower()))
 #: PRE-L3 4-1: the names a repo's ``.claude/settings*.json`` ``env`` may not set (with any ``*_BASE_URL``): Claude
-#: Code's, as those are the files :func:`repo_loosening_refusals` is given.
-_REPO_BILLING_ENV = ABSENT_ENV["claude"] | PASSTHROUGH_ABSENT_ENV["claude"]
+#: Code's, as those are the files :func:`repo_loosening_refusals` is given. The set's one home is ``sandbox_keys``.
+_REPO_BILLING_ENV = CLAUDE_CREDENTIAL_ENV
 #: wfetch RULINGS Q3: Codex's server-side search mode until Phill rules (fail closed: the front cannot see it).
 CODEX_WEB_SEARCH = "disabled"
 #: The Codex launch's ``-c`` overrides (``start.vendor_argv``), the layer above every config file, so ``web_search``
@@ -1030,8 +1030,8 @@ def repo_loosening_refusals(docs: Mapping[str, Any]) -> list[Refused]:
     layers the flag layer cannot pin; a ``sandbox.network`` or ``sandbox.filesystem`` that is not an object is
     ``repo-settings-malformed``),
     and a ``disableAllHooks`` that is anything but ``false`` (L2 M6; DECISION: a non-boolean is refused too, as
-    its meaning to CC is unmeasured), and an ``env`` naming the queue's vars, a :data:`PROXY_ENV` name, one of Claude
-    Code's :data:`ABSENT_ENV` / :data:`PASSTHROUGH_ABSENT_ENV` names or any ``*_BASE_URL`` (PRE-L3 4-1). A
+    its meaning to CC is unmeasured), and an ``env`` naming the queue's vars, a :data:`PROXY_ENV` name, one of
+    ``levain.sandbox_keys.CLAUDE_CREDENTIAL_ENV`` or any ``*_BASE_URL`` (PRE-L3 4-1). A
     document that is not an object is refused ``repo-settings-malformed``.
     Hooks, permissions and every other key launch (plan §2c 3: the repo's settings are its own).
 

@@ -639,6 +639,38 @@ def test_repo_settings_env_moving_the_billing_identity_refused():
                                                    "BASE_URL": "z"}}}) == []
 
 
+def test_repo_settings_env_every_credential_or_endpoint_name_refused():
+    """PRE-L3 fix4 (L1 MED-1, L2 MED-1/MED-3/LOW-1): one shared set names every Claude env var that moves a slot's
+    credential, billing identity or endpoint; a repo settings ``env`` naming any of them is refused by name."""
+    from levain import sandbox_keys as sk
+    f = ".claude/settings.json"
+    for name in ("CLAUDE_CODE_OAUTH_TOKEN", "CLAUDE_CODE_USE_BEDROCK", "CLAUDE_CODE_USE_VERTEX",
+                 "CLAUDE_CODE_USE_FOUNDRY", "AWS_BEARER_TOKEN_BEDROCK", "ANTHROPIC_CUSTOM_HEADERS",
+                 "CLAUDE_CONFIG_DIR", "ANTHROPIC_FOUNDRY_API_KEY", "CLAUDE_CODE_OAUTH_REFRESH_TOKEN",
+                 "ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_BASE_URL"):
+        assert name in sk.CLAUDE_CREDENTIAL_ENV, name
+        got = rd.repo_loosening_refusals({f: {"env": {name: "x"}}})
+        assert [x.name for x in got] == ["loosening:" + rd.wire_name("env." + name)], name
+        assert name in got[0].detail
+
+
+def test_the_credential_name_lists_are_pinned_to_the_shared_set():
+    """The repo-env refusal reads the shared set itself; the render's absent-env lists and the two carry lists
+    (a room child's kept names, a resumed session's carried names) are subsets of it, so a name added to one list
+    that moves a credential must be added to the shared set or this fails."""
+    from levain import sandbox_keys as sk
+    from levain.consent import delivery as dv
+    from levain.coordinator import room_launch as rl
+    assert rd._REPO_BILLING_ENV >= sk.CLAUDE_CREDENTIAL_ENV
+    for v in ("claude",):
+        assert rd.ABSENT_ENV[v] <= sk.CLAUDE_CREDENTIAL_ENV
+        assert rd.PASSTHROUGH_ABSENT_ENV[v] <= sk.CLAUDE_CREDENTIAL_ENV
+    claude_carried = {n for n in dv._AGENT_AUTH if not n.startswith(("OPENAI_", "CODEX_"))}
+    assert claude_carried <= sk.CLAUDE_CREDENTIAL_ENV
+    kept = {n for n in rl.ENV_KEEP if n.startswith("CLAUDE_")}
+    assert kept <= sk.CLAUDE_CREDENTIAL_ENV
+
+
 def test_levain_repo_settings_pass():
     """The negative control. ``.claude/settings.json`` is absent from this repo, so the control is (a) a hooks-only
     settings file and (b) the Claude Code settings template Levain ships (hooks + permissions)."""

@@ -11,7 +11,7 @@ them. Each entry is a key path inside ``sandbox``.
 """
 from __future__ import annotations
 
-__all__ = ["LOOSENING_NONEMPTY", "LOOSENING_TRUE"]
+__all__ = ["CLAUDE_CREDENTIAL_ENV", "LOOSENING_NONEMPTY", "LOOSENING_TRUE"]
 
 #: Keys that must not be ``true``.
 LOOSENING_TRUE = (("allowUnsandboxedCommands",), ("enableWeakerNestedSandbox",),
@@ -22,3 +22,19 @@ LOOSENING_TRUE = (("allowUnsandboxedCommands",), ("enableWeakerNestedSandbox",),
 LOOSENING_NONEMPTY = (("excludedCommands",), ("filesystem", "allowWrite"), ("filesystem", "allowRead"),
                       ("network", "allowUnixSockets"), ("network", "allowedDomains"),
                       ("network", "allowMachLookup"))
+
+#: Every Claude Code env var that moves a slot's credential, billing identity or endpoint, in one place; a repo's
+#: own settings ``env`` naming any of them is refused.
+#: Each name is one the vendor's env-var reference carries (``https://code.claude.com/docs/en/env-vars``): a key
+#: or bearer (``ANTHROPIC_API_KEY``, ``ANTHROPIC_AUTH_TOKEN``, ``ANTHROPIC_FOUNDRY_API_KEY``,
+#: ``AWS_BEARER_TOKEN_BEDROCK``), a subscription login (``CLAUDE_CODE_OAUTH_TOKEN`` and its refresh token), a provider
+#: switch (``CLAUDE_CODE_USE_BEDROCK`` / ``_VERTEX`` / ``_FOUNDRY``), extra request headers
+#: (``ANTHROPIC_CUSTOM_HEADERS``), the endpoint (``ANTHROPIC_BASE_URL``) and the config dir credentials are read from
+#: (``CLAUDE_CONFIG_DIR``).
+CLAUDE_CREDENTIAL_ENV = frozenset({
+    "ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_BASE_URL", "ANTHROPIC_CUSTOM_HEADERS",
+    "ANTHROPIC_FOUNDRY_API_KEY", "AWS_BEARER_TOKEN_BEDROCK",
+    "CLAUDE_CODE_OAUTH_TOKEN", "CLAUDE_CODE_OAUTH_REFRESH_TOKEN",
+    "CLAUDE_CODE_USE_BEDROCK", "CLAUDE_CODE_USE_VERTEX", "CLAUDE_CODE_USE_FOUNDRY",
+    "CLAUDE_CONFIG_DIR",
+})
