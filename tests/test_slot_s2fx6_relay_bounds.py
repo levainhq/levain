@@ -176,7 +176,7 @@ def test_reset_advice_is_folded_into_the_failure_line_when_stdout_failed(tmp_pat
     err = r.stderr()
     assert "run `reset`" not in err
     fail = [x for x in err.splitlines() if "your terminal refused the session's output" in x]
-    assert len(fail) == 1 and "the reset of the reporting modes the session turned on did not reach it" in fail[0]
+    assert len(fail) == 1 and "the reset of the terminal modes the session set did not reach it" in fail[0]
 
 
 # --- r4-5: the held lines' fd path never overtakes what the stderr wrapper still buffers ------------------------------

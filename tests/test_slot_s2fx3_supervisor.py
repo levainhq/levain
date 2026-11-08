@@ -386,7 +386,7 @@ def test_filter_tracks_reporting_modes_it_passed() -> None:
     f = TermFilter()
     data = b"\x1b[?1000;1006h\x1b[?1004h\x1b[?2004h\x1b[?25l\x1b[?1049h\x1b[?2004l"
     assert f.feed(data) == data              # they pass
-    assert f.reset() == b"\x1b[?1000;1004;1006l"
+    assert f.reset() == b"\x1b[?1049l\x1b[?1000;1004;1006l"   # the alternate screen is left first
     assert f.reset() == b""
     assert TermFilter().reset() == b""
     g = TermFilter()
@@ -395,6 +395,56 @@ def test_filter_tracks_reporting_modes_it_passed() -> None:
     h = TermFilter()
     h.feed(b"\x1b[6n\x1b[?1000$p")           # a dropped sequence sets nothing
     assert h.reset() == b""
+
+
+# --- PREL3 2b-5: the other modes the slot's output can set are undone at the end too ----------------------------------
+
+@pytest.mark.parametrize("set_, undo", [
+    (b"\x1b[?1049h", b"\x1b[?1049l"),
+    (b"\x1b[?1047h", b"\x1b[?1047l"),
+    (b"\x1b[?47h", b"\x1b[?47l"),
+    (b"\x1b[?1h", b"\x1b[?1l"),                       # application cursor keys
+    (b"\x1b[?1r", b"\x1b[?1l"),                       # XTRESTORE may set it
+    (b"\x1b[>1u", b"\x1b[<1u"),                       # one kitty push: one pop, nothing more
+    (b"\x1b[>1u\x1b[>3u\x1b[<u\x1b[>8u", b"\x1b[<2u"),  # pushes net of pops
+    (b"\x1b[=5u", b"\x1b[=0u"),                       # a set in place: the current flags zeroed
+    (b"\x1b[=5;1u\x1b[>1u", b"\x1b[<1u\x1b[=0u"),
+    (b"\x1b[>4;2m", b"\x1b[>4m"),                     # modifyOtherKeys
+    (b"\x1b[>1;3m\x1b[>4;1m", b"\x1b[>1m\x1b[>4m"),
+])
+def test_reset_undoes_each_mode_the_slot_set(set_, undo) -> None:
+    f = TermFilter()
+    assert f.feed(set_) == set_                # it passes
+    assert f.reset() == undo
+    assert f.reset() == b""
+
+
+@pytest.mark.parametrize("data", [
+    b"\x1b[?1049h\x1b[?1049l", b"\x1b[?1h\x1b[?1l", b"\x1b[>1u\x1b[<1u",
+    b"\x1b[>4;2m\x1b[>4m", b"\x1b[>4;2m\x1b[>1;2m\x1b[>m", b"\x1b[?u", b"\x1b[?25l\x1b[?7h\x1b[u",
+])
+def test_reset_emits_nothing_for_a_mode_the_slot_undid_itself_or_never_set(data) -> None:
+    f = TermFilter()
+    f.feed(data)
+    assert f.reset() == b""
+
+
+def test_kitty_entries_pushed_on_the_alternate_screen_are_popped_there_before_it_is_left() -> None:
+    f = TermFilter()
+    f.feed(b"\x1b[>1u\x1b[?1049h\x1b[>3u\x1b[>3u\x1b[?1000h")
+    assert f.reset() == b"\x1b[<2u\x1b[?1049l\x1b[<1u\x1b[?1000l"
+
+
+def test_kitty_entries_left_on_an_alternate_screen_the_slot_already_left_are_reached_by_entering_it() -> None:
+    f = TermFilter()
+    f.feed(b"\x1b[?1049h\x1b[>1u\x1b[?1049l")
+    assert f.reset() == b"\x1b[?47h\x1b[<1u\x1b[?47l"      # the non-clearing pair: 1049h would clear that screen
+
+
+def test_the_alternate_screen_is_left_once_by_the_mode_that_entered_it_from_main() -> None:
+    f = TermFilter()
+    f.feed(b"\x1b[?47h\x1b[?1049h\x1b[?1h\x1b[>4;2m")
+    assert f.reset() == b"\x1b[?47l\x1b[?1l\x1b[>4m"
 
 
 def test_supervisor_resets_passed_modes_when_the_session_ends(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -748,3 +798,126 @@ def test_render_blob_names_a_bad_route_by_the_grammar_not_as_the_identity() -> N
     assert e.value.name == "git-identity-invalid"
     blob = json.loads(SV.render_blob("claude", "brokered", ["anthropic"], ident, "repo"))
     assert blob["git_identity"] == ident and blob["repo_label"] == "repo"
+
+
+# --- prel3fix r1: kitty sets on the slot's own entry, pops beyond its pushes, and 1049l without its 1049h -----------
+
+@pytest.mark.parametrize("data, undo", [
+    (b"\x1b[>1u\x1b[=5u", b"\x1b[<1u"),               # a set on the slot's own pushed entry: the pop undoes it
+    (b"\x1b[>1u\x1b[=5;2u\x1b[>3u\x1b[=1u", b"\x1b[<2u"),
+    (b"\x1b[?1049h\x1b[>1u\x1b[=5u", b"\x1b[<1u\x1b[?1049l"),
+    (b"\x1b[>1u\x1b[<1u\x1b[=5u", b"\x1b[=0u"),       # its pushes already popped: the set is on an entry it may not own
+])
+def test_a_kitty_set_is_undone_by_zeroing_only_when_the_slot_had_nothing_pushed(data, undo) -> None:
+    f = TermFilter()
+    f.feed(data)
+    assert f.reset() == undo
+
+
+@pytest.mark.parametrize("data, passed, undo", [
+    # a pop beyond the slot's own pushes would pop the operator's entries on the real terminal: clipped to them
+    (b"\x1b[>1u\x1b[<5u", b"\x1b[>1u\x1b[<1u", b""),
+    (b"\x1b[>1u\x1b[>2u\x1b[<9u", b"\x1b[>1u\x1b[>2u\x1b[<2u", b""),
+    (b"\x1b[<u", b"", b""),                            # no pushes: dropped
+    (b"\x1b[<3u", b"", b""),
+    (b"\x1b[>1u\x1b[<u", b"\x1b[>1u\x1b[<u", b""),    # within the pushes: passed as written
+    (b"\x1b[>1u\x1b[<0u", b"\x1b[>1u", b"\x1b[<1u"),  # a pop of 0: terminals differ on it, dropped
+    (b"\x1b[?1049h\x1b[>1u\x1b[?1049l\x1b[<1u", b"\x1b[?1049h\x1b[>1u\x1b[?1049l", b"\x1b[?47h\x1b[<1u\x1b[?47l"),
+])
+def test_the_filter_never_passes_a_kitty_pop_beyond_the_slots_own_pushes(data, passed, undo) -> None:
+    f = TermFilter()
+    assert f.feed(data) == passed
+    assert f.reset() == undo
+
+
+def test_kitty_pushes_past_the_cap_are_dropped_and_so_are_their_pops() -> None:
+    from levain.slot.supervisor import _KITTY_PUSH_MAX
+    f = TermFilter()
+    push = b"\x1b[>1u"
+    assert f.feed(push * (_KITTY_PUSH_MAX + 3)) == push * _KITTY_PUSH_MAX
+    assert f.feed(b"\x1b[<" + str(_KITTY_PUSH_MAX + 3).encode() + b"u") == b"\x1b[<" + str(_KITTY_PUSH_MAX).encode() + b"u"
+    assert f.reset() == b""
+    g = TermFilter()
+    g.feed(push * (_KITTY_PUSH_MAX + 1))
+    assert g.reset() == b"\x1b[<" + str(_KITTY_PUSH_MAX).encode() + b"u"
+
+
+@pytest.mark.parametrize("data, undo", [
+    (b"\x1b[?47h\x1b[>1u", b"\x1b[<1u\x1b[?47l"),     # left the way it was entered: no 1049l without its 1049h
+    (b"\x1b[?1047h\x1b[>1u\x1b[=5u", b"\x1b[<1u\x1b[?1047l"),
+])
+def test_kitty_entries_on_an_alternate_screen_the_slot_is_still_on_leave_only_the_modes_it_set(data, undo) -> None:
+    f = TermFilter()
+    f.feed(data)
+    assert f.reset() == undo
+
+
+# --- prel3fix L3 r1 A1: the screen the terminal is on is one state, and kitty entries are charged to it ---------------
+
+@pytest.mark.parametrize("data, passed, undo", [
+    # codex-1: 1047l returns the terminal to the main screen, so the second push lands on the main stack
+    (b"\x1b[?1049h\x1b[>1u\x1b[?1047l\x1b[>2u", b"\x1b[?1049h\x1b[>1u\x1b[?1047l\x1b[>2u",
+     b"\x1b[?47h\x1b[<1u\x1b[?47l\x1b[<1u"),
+    # complement-2: 47h while on the alternate screen, then 1049l: the terminal is back on main
+    (b"\x1b[?1049h\x1b[?47h\x1b[?1049l\x1b[>1u", b"\x1b[?1049h\x1b[?47h\x1b[?1049l\x1b[>1u", b"\x1b[<1u"),
+    # complement-2: after XTRESTORE of an alternate-screen mode the screen is unknown: a kitty push is not passed,
+    # and teardown visits both stacks, landing on main
+    (b"\x1b[?1049h\x1b[>1u\x1b[?1049l\x1b[?1049r\x1b[>2u", b"\x1b[?1049h\x1b[>1u\x1b[?1049l\x1b[?1049r",
+     b"\x1b[?47h\x1b[<1u\x1b[?47l"),
+    (b"\x1b[>1u\x1b[?47r", b"\x1b[>1u\x1b[?47r", b"\x1b[?47l\x1b[<1u"),
+    (b"\x1b[>1u\x1b[?1049r\x1b[<1u\x1b[=5u", b"\x1b[>1u\x1b[?1049r", b"\x1b[?47l\x1b[<1u"),
+    # an unknown screen is known again after the next alternate-screen DECSET or DECRST
+    (b"\x1b[?1049r\x1b[?1049l\x1b[>1u", b"\x1b[?1049r\x1b[?1049l\x1b[>1u", b"\x1b[<1u"),
+    (b"\x1b[?1049r\x1b[?1049h\x1b[>1u", b"\x1b[?1049r\x1b[?1049h\x1b[>1u", b"\x1b[<1u\x1b[?1049l"),
+    # codex-6: the alternate stack is revisited with the non-clearing 47 pair, never 1049 (which clears that screen)
+    (b"\x1b[?47h\x1b[>1u\x1b[?47l", b"\x1b[?47h\x1b[>1u\x1b[?47l", b"\x1b[?47h\x1b[<1u\x1b[?47l"),
+    # left by the mode that entered it from main: 1049l restores the cursor 1049h saved there
+    (b"\x1b[?1049h\x1b[?47h\x1b[>1u", b"\x1b[?1049h\x1b[?47h\x1b[>1u", b"\x1b[<1u\x1b[?1049l"),
+])
+def test_kitty_entries_are_charged_to_the_screen_the_terminal_is_on(data, passed, undo) -> None:
+    f = TermFilter()
+    assert f.feed(data) == passed
+    assert f.reset() == undo
+    assert f.reset() == b""
+
+
+# --- prel3fix L3 r1 A2: kitty keyboard sequences pass only in the protocol's own grammar ------------------------------
+
+@pytest.mark.parametrize("data", [
+    b"\x1b[>1;2u",                 # codex-2: a push takes one optional flags parameter
+    b"\x1b[>1:2u", b"\x1b[>1$u",   # a sub-parameter, an intermediate
+    b"\x1b[=5;9u",                 # codex-2: a set's mode is 1, 2 or 3
+    b"\x1b[=5;1;2u", b"\x1b[=5;u", b"\x1b[=;1u", b"\x1b[=u", b"\x1b[=5:1u",
+    b"\x1b[<1;2u", b"\x1b[<1:2u",
+])
+def test_a_malformed_kitty_sequence_is_dropped_and_records_nothing(data) -> None:
+    f = TermFilter()
+    assert f.feed(b"\x1b[>1u" + data) == b"\x1b[>1u"
+    assert f.reset() == b"\x1b[<1u"
+    g = TermFilter()
+    assert g.feed(data) == b""
+    assert g.reset() == b""
+
+
+@pytest.mark.parametrize("data, undo", [
+    (b"\x1b[>u", b"\x1b[<1u"),     # a push with its flags omitted (zero)
+    (b"\x1b[>31u", b"\x1b[<1u"),
+    (b"\x1b[=5u", b"\x1b[=0u"),    # a set with its mode omitted (1)
+    (b"\x1b[=5;1u", b"\x1b[=0u"), (b"\x1b[=5;2u", b"\x1b[=0u"), (b"\x1b[=5;3u", b"\x1b[=0u"),
+])
+def test_a_well_formed_kitty_sequence_passes(data, undo) -> None:
+    f = TermFilter()
+    assert f.feed(data) == data
+    assert f.reset() == undo
+
+
+# --- prel3fix L3 r1 A3: the push cap leaves the operator's entries room on the smallest stack sourced ---------------
+
+def test_a_slot_passes_at_most_four_kitty_pushes_per_screen() -> None:
+    # kitty keeps 8 entries per screen ("main_key_encoding_flags[8]" in kitty/screen.h) and evicts the oldest on a
+    # push past them; the protocol names no size. Four leaves the operator half of that stack.
+    push = b"\x1b[>1u"
+    f = TermFilter()
+    assert f.feed(push * 5) == push * 4
+    assert f.feed(b"\x1b[?1049h" + push * 5) == b"\x1b[?1049h" + push * 4
+    assert f.reset() == b"\x1b[<4u\x1b[?1049l\x1b[<4u"
