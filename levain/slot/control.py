@@ -2721,16 +2721,17 @@ class Control:
 
     def _op_routemap_active(self, conn: Conn, args: dict) -> dict[str, object]:
         """``ROUTEMAP-ACTIVE`` -> ``{generation, routes: {id: {backends}}, digests}`` (PRE-W): the ACTIVE dispatch
-        generation's routes as their backends and policy digests, read under the activation lock; none active is
-        ``no-routemap``. Read-only, CONTROL's own record: the F9a follower's ``routemap`` (a run whose ticket names
-        another generation resolves nothing: the map moved since its mint)."""
-        with self._activation:
-            active = self.routes.active() if self.routes is not None else None
-            if active is None:
-                raise Refused("no-routemap", "no route-map generation is active")
-            return {"generation": active.generation,
-                    "routes": {rid: {"backends": dict(entry.backends)} for rid, entry in active.routes.items()},
-                    "digests": dict(active.digests)}
+        generation's routes as their backends and policy digests; none active is ``no-routemap``. Read-only, CONTROL's
+        own record: the F9a follower's ``routemap`` (a run whose ticket names another generation resolves nothing: the
+        map moved since its mint). NOT under the activation lock (PRE-W L2 LOW-1): ROUTE-SUBMIT holds that lock across
+        its keys RELOAD, and a verification queued behind it times out into a terminal failure. ``active()`` hands back
+        one reference to an activated map, which is never changed in place, so the read is one consistent generation."""
+        active = self.routes.active() if self.routes is not None else None
+        if active is None:
+            raise Refused("no-routemap", "no route-map generation is active")
+        return {"generation": active.generation,
+                "routes": {rid: {"backends": dict(entry.backends)} for rid, entry in active.routes.items()},
+                "digests": dict(active.digests)}
 
     def _op_run_ticket_cancel(self, conn: Conn, args: dict) -> dict[str, object]:
         """``RUN-TICKET-CANCEL {ticket}`` -> ``{}``: an UNBOUND ticket only (``ticket-bound`` once a lease bound it)."""

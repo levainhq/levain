@@ -230,6 +230,30 @@ def test_routemap_active_answers_the_active_generation(rig):
     assert ans["digests"] == {"glm": GLM_DIGEST} and RM.policy_digest is not None
 
 
+def test_routemap_active_does_not_wait_on_a_held_activation_lock(rig):
+    """L2 LOW-1: ROUTE-SUBMIT holds the activation lock across its keys RELOAD; a verification's read overlapping it
+    must not queue behind it (a CONTROL timeout there fails the verified job terminally). The read takes one reference."""
+    import threading
+    held, release, answers = threading.Event(), threading.Event(), []
+
+    def hold():
+        with rig.control._activation:
+            held.set()
+            release.wait(10)
+    holder = threading.Thread(target=hold, daemon=True)
+    holder.start()
+    assert held.wait(5)
+    asker = threading.Thread(target=lambda: answers.append(rig.ask("ROUTEMAP-ACTIVE")), daemon=True)
+    asker.start()
+    asker.join(2.0)
+    waited = asker.is_alive()
+    release.set()
+    holder.join(5)
+    asker.join(5)
+    assert not waited, "ROUTEMAP-ACTIVE queued behind the held activation lock"
+    assert answers and answers[0]["ok"] is True and answers[0]["generation"] == 1
+
+
 def test_the_supervisor_readers_over_the_real_handler_resolve_a_bound_ticket(rig):
     """The whole production path but the socket: SupervisorFacts asks the real CONTROL handler as the dispatch peer."""
     from tests.test_tickets import ticket_of
