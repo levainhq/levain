@@ -258,11 +258,25 @@ def test_a_plain_line_is_a_cockpit_drop_for_the_desk_to_sort(home):
     from levain.coordinator.store import CoordStore
 
     d = home / "dispatch"
-    out = _intake_fire(None, {"line": "  look at the sticky note  "}, {"dispatch_dir": d}, False)  # type: ignore[arg-type]
+    out = _intake_fire(None, {"line": "  look at the sticky note  "},  # type: ignore[arg-type]
+                       {"dispatch_dir": d, "credential": "browser", "idempotency_key": "k-1"}, False)
     assert out["receipt"] == {"kind": "sort", "id": None, "fires": None, "text": "look at the sticky note"}
     assert out["receipt_line"] == "sent to the desk to sort"
     drop = CoordStore(d).drop(out["drop_id"])
     assert (drop.surface, drop.words) == ("cockpit", out["receipt"]["text"])
+
+
+def test_an_unkeyed_sort_is_refused_before_anything_is_written(home):
+    """codex L3 r2: a retry of an unkeyed sort would write the drop twice, so the key is required (as the room's
+    composer requires its outbox id)."""
+    from levain.coordinator.store import CoordStore
+
+    d = home / "dispatch"
+    for tgt in ({"dispatch_dir": d}, {"dispatch_dir": d, "idempotency_key": ""}):
+        with pytest.raises(EditError) as e:
+            _intake_fire(None, {"line": "words"}, tgt, False)  # type: ignore[arg-type]
+        assert (e.value.code, e.value.http_status) == ("bad_request", 400)
+    assert not d.exists() or CoordStore(d).drops() == []
 
 
 @pytest.mark.parametrize("params,code,status", [

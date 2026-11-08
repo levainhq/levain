@@ -890,7 +890,11 @@ def _intake_fire(scope: "WriteScope", params: dict[str, Any], target: dict[str, 
     if directory is None:
         raise EditError("not_built", 501, "this cockpit names no coordinator store, so there is no desk to sort it")
     key = target.get("idempotency_key")
-    outbox = _intake_outbox_id(str(target.get("credential") or ""), key) if isinstance(key, str) and key else None
+    if not isinstance(key, str) or not key:
+        # the room composer's contract too (a drop carries its outbox id): a resend after a lost reply must name
+        # the same drop, so an unkeyed sort, which a retry would write twice, is refused before anything is written
+        raise EditError("bad_request", 400, "a plain line carries an idempotency_key (a resend names the same drop)")
+    outbox = _intake_outbox_id(str(target.get("credential") or ""), key)
     try:
         drop, created = CoordStore(Path(directory)).accept_drop(parsed["text"], surface="cockpit", outbox_id=outbox)
     except StoreAbsent as exc:

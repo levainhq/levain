@@ -1944,13 +1944,13 @@ def _apply_spore_seed(
     # THE LIST's three create fields (a timed next, a germinate target, attention) are the cockpit's, signed through
     # the broker's spore_seed effect (cockpit/effects._ce_seed); this legacy write never takes them, so a desk drop
     # can never be planted on a bearer token here
-    steering = sorted(f for f in ("next", "target", "attention") if f in req)
-    if steering:
-        raise EditError("bad_verb_arg", 422, f"a capture here takes no {steering}: a scheduled drop or a talk seed "
-                                             "is added from the cockpit's List, where it is signed")
     text = _require_str(req, "text").strip()
     if not text:
         raise EditError("bad_verb_arg", 422, "a capture needs non-empty text")
+    steering = sorted(f for f in ("next", "target", "attention") if req.get(f) is not None)
+    if steering:
+        raise EditError("bad_verb_arg", 422, f"a capture here takes no {steering}: a scheduled drop or a talk seed "
+                                             "is added from the cockpit's List, where it is signed")
     if len(text.encode("utf-8")) > MAX_SPORE_TEXT_BYTES:
         raise EditError("too_large", 413,
                         f"spore text exceeds the {MAX_SPORE_TEXT_BYTES}-byte cap")
