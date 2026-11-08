@@ -30,7 +30,7 @@ def test_1500_item_log_burst_has_no_503_and_p95_under_one_second(tmp_path: Path,
         if i >= OPEN:
             store.answer(q.n, option="a", channel="phone")
     _root, src, _ids = _install(tmp_path)
-    paths = ["/cockpit/panel/decisions.json", "/cockpit/panel/now.json", "/cockpit/manifest.json"]
+    paths = ["/cockpit/panel/decisions.json", "/cockpit/panel/tray.json", "/cockpit/manifest.json"]
     results: list[tuple[int, float]] = []
     lock = threading.Lock()
     with _serve(src, install_class="reported") as (url, _httpd):
