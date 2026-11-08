@@ -200,7 +200,7 @@ def test_rows_lists_pend_rows_only_labelled_by_control_with_the_hooks_fields_as_
     assert dict(got[c].claims) == {"agent": "claude_code", "agent_session_id": "cc-1", "cwd": "/w",
                                    "display": 'Bash {"command": "ls"}'}
     # rows sort by (received_at, id) and these share received_at: the id order is the seal's, so read c by id
-    later = {r.request_id: r.state for r in operator.rows(L / "queue", now=NOW + timedelta(minutes=5))}
+    later = {r.request_id: r.state for r in operator.rows(L / "queue", now=NOW + timedelta(minutes=5), signers=snapshot(L))}
     assert later[c] == "expired"
 
 
@@ -256,11 +256,11 @@ def test_the_operator_side_writes_nothing_but_answers(tmp_path):
     for d in ("requests", "answers"):
         (q / d).mkdir(parents=True)
     with pytest.raises(FileNotFoundError):
-        operator.rows(q)
+        operator.rows(q, signers=None)
     assert sorted(p.name for p in q.rglob("*")) == ["answers", "requests"]
     QueueStore(q)                                        # the broker makes the queue id; still no receipts log
     with pytest.raises(FileNotFoundError):
-        operator.rows(q)
+        operator.rows(q, signers=None)
     assert not (q / DB_NAME).exists() and not (q / "requests" / DB_NAME).exists()
 
 
@@ -291,7 +291,7 @@ def test_the_log_lives_in_requests_at_0640_when_the_queue_root_is_not_writable(L
         assert b._receipts.path == q / "requests" / DB_NAME
         assert stat.S_IMODE(os.stat(b._receipts.path).st_mode) == 0o640
         assert states(L, rid) == ["pending"]
-        assert [r.request_id for r in operator.rows(q, now=LATER)] == [rid]
+        assert [r.request_id for r in operator.rows(q, now=LATER, signers=snapshot(L))] == [rid]
     finally:
         os.chmod(q, 0o755)
 
@@ -360,7 +360,7 @@ def test_a_repeat_decision_is_checked_against_the_head_it_carries(L, broker, key
 def test_the_operator_never_treats_a_missing_receipt_as_pending(L, broker, keys, monkeypatch):
     rid = unfiled(broker, monkeypatch)
     filed(broker, fields=hook_fields("e2"))
-    listed = {r.request_id: r for r in operator.rows(L / "queue", now=LATER)}
+    listed = {r.request_id: r for r in operator.rows(L / "queue", now=LATER, signers=snapshot(L))}
     assert (listed[rid].state, listed[rid].settled) == ("filing", False)
     with pytest.raises(operator.OperatorError, match="no filing receipt"):
         operator.answer_payload(L / "queue", rid, "allow", keys["operator"].fp, now=LATER)
@@ -395,7 +395,7 @@ def test_an_unreadable_log_is_an_operator_error(L, broker):
     path = L / "queue" / "requests" / DB_NAME
     path.unlink()
     path.touch()
-    for call in (lambda: operator.rows(L / "queue", now=LATER),
+    for call in (lambda: operator.rows(L / "queue", now=LATER, signers=snapshot(L)),
                  lambda: operator.answer_payload(L / "queue", rid, "allow", "SHA256:x", now=LATER)):
         with pytest.raises(operator.OperatorError, match="cannot be read"):
             call()
@@ -420,7 +420,7 @@ def test_rows_skips_a_row_whose_broker_metadata_is_malformed(L, broker, field, v
     row[field] = value
     path.unlink()
     path.write_bytes(canonical_bytes(row))
-    assert [r.request_id for r in operator.rows(L / "queue", now=LATER)] == [good]
+    assert [r.request_id for r in operator.rows(L / "queue", now=LATER, signers=snapshot(L))] == [good]
 
 
 def malformed(L, rid, field, value):

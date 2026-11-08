@@ -114,7 +114,7 @@ def _pending(receipts: Receipts, request: record.ExternalGateRequest, stamp: str
         raise OperatorError(f"request {request.id} is already {state}")
 
 
-def rows(root: Path | str, *, now: datetime | None = None, signers: SignersSnapshot | None = None,
+def rows(root: Path | str, *, signers: SignersSnapshot | None, now: datetime | None = None,
          ssh_keygen: Path | str | None = None) -> list[Listed]:
     """Every request row in the broker's queue at ``root`` (``L/queue``), oldest first.
 
@@ -122,8 +122,8 @@ def rows(root: Path | str, *, now: datetime | None = None, signers: SignersSnaps
     writer and the broker make, :func:`~levain.qbroker.broker.answer_row_refusal`) over a head the receipts hold
     now, reaching the request's filing (:meth:`~levain.qbroker.receipts.Receipts.head_refusal`, as the broker's
     ``Receipts.decided`` requires): any ``levain-queue`` member can
-    create a file at an answer's name, so a file being there says nothing. With no snapshot nothing verifies, and
-    every row lists as unanswered."""
+    create a file at an answer's name, so a file being there says nothing. ``signers`` has no default, so no caller
+    gets that by omission: ``None`` (no snapshot) verifies nothing, and every row lists as unanswered."""
     store, receipts = _open(root)
     recorded = _recorded(receipts)
     when = _now(now)

@@ -256,7 +256,7 @@ def test_a_signed_answer_lists_its_row_as_answered_only_against_a_signers_snapsh
     write_answer(L, rid, keys["operator"])               # signed, not yet polled: the row still reads pending
     listed = {r.request_id: r for r in operator.rows(L / "queue", now=LATER, signers=rbase.snapshot(L))}
     assert (listed[rid].state, listed[rid].answered) == ("pending", True)
-    assert [r.answered for r in operator.rows(L / "queue", now=LATER)] == [False]   # no snapshot: nothing verifies
+    assert [r.answered for r in operator.rows(L / "queue", now=LATER, signers=None)] == [False]   # none verifies
 
 
 # --- prel3fix r1 F4: the cap test runs first; held answers are verified lazily, and refusals log once per kind ---------
@@ -407,3 +407,12 @@ def test_any_other_os_error_linking_a_signed_answer_back_names_its_quarantine_fi
     parked = [p for p in answers.iterdir() if p.name.startswith(f".quarantine-{rid}-")]
     assert len(parked) == 1 and parked[0].read_bytes() == first
     assert str(parked[0]) in str(got.value)
+
+
+# --- prel3fix L3 r1 B4: rows() is never called without saying which signers verify -----------------------------------
+
+def test_rows_requires_a_signers_argument(L, broker):
+    filed(broker)
+    with pytest.raises(TypeError, match="signers"):
+        operator.rows(L / "queue", now=LATER)
+    assert [r.answered for r in operator.rows(L / "queue", now=LATER, signers=None)] == [False]
