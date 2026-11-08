@@ -616,8 +616,7 @@ _INT64_MAX = 2**63 - 1
 def _tail_lines(fd: int, off: int) -> List[bytes]:
     """The log's lines from byte ``off`` on. A tail that starts mid-file reads one byte early: that byte says whether
     the tail begins on a record boundary, so a complete first line is kept and only a partial fragment is dropped."""
-    if off:
-        os.lseek(fd, off - 1, os.SEEK_SET)
+    os.lseek(fd, max(off - 1, 0), os.SEEK_SET)   # always seek: a reused fd may sit past byte 0
     chunks: List[bytes] = []
     left = _PASSTHROUGH_TAIL_BYTES + 1 + (1 if off else 0)
     while left > 0:

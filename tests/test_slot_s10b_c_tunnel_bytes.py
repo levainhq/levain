@@ -653,3 +653,16 @@ def test_tail_lines_offset_zero_keeps_line_one(tmp_path):
 def test_tail_lines_offset_one(tmp_path):
     assert _lines(_windowed(tmp_path, b"\n"))[0] == _FIRST
     assert _FIRST not in _lines(_windowed(tmp_path, b"x"))
+
+
+def test_session_total_is_stable_on_a_reused_fd(tmp_path):
+    p = tmp_path / "front.log"
+    p.write_text(_rec("S", 7))
+    fd = os.open(p, os.O_RDONLY)
+    try:
+        first = H._session_total_and_reason(fd, "S")
+        second = H._session_total_and_reason(fd, "S")
+    finally:
+        os.close(fd)
+    assert first == (7, "ok")
+    assert second == first
