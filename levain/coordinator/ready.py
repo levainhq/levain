@@ -142,7 +142,8 @@ LIFECYCLE_SCHEMA: tuple[str, ...] = (
     "CREATE TRIGGER IF NOT EXISTS ready_journal_service_facts BEFORE INSERT ON ready_journal WHEN NEW.who = 'service' "
     "AND (NEW.source != 'correction' OR NEW.ver = 1 OR NEW.from_category IS NOT NEW.to_category "
     "OR NEW.from_status IS NOT NEW.to_status) "
-    "BEGIN SELECT RAISE(ABORT, 'the service records facts only: it never adds or moves an item'); END",
+    "BEGIN SELECT RAISE(ABORT, 'the service records facts only: it never adds or moves an item (who service names the service alone; "
+    "a coordinator writes under another name)'); END",
     "CREATE TRIGGER IF NOT EXISTS ready_items_service_facts BEFORE INSERT ON ready_items WHEN NEW.set_by = 'service' "
     # a missing previous version (a gap) refuses too: there is nothing to compare the row with (row 156 L2 F2)
     "AND (NEW.ver = 1 OR NOT EXISTS (SELECT 1 FROM ready_items p WHERE p.id = NEW.id AND p.ver = NEW.ver - 1) "
@@ -151,7 +152,7 @@ LIFECYCLE_SCHEMA: tuple[str, ...] = (
     "NEW.category OR p.tier IS NOT NEW.tier OR p.done_line IS NOT NEW.done_line OR p.depends_on IS NOT NEW.depends_on "
     "OR p.rank IS NOT NEW.rank OR p.hold IS NOT NEW.hold OR p.residue IS NOT NEW.residue OR p.ref IS NOT NEW.ref))) "
     "BEGIN SELECT RAISE(ABORT, 'the service records facts only: it changes the landed sha and branch of an item, "
-    "nothing else'); END",
+    "nothing else (who service names the service alone; a coordinator writes under another name)'); END",
 )
 
 

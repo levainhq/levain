@@ -311,3 +311,9 @@ def test_l1_a_refusal_that_cannot_be_recorded_is_a_fault_and_the_pass_goes_on(bo
     got = work_attach.apply_reports(svc, stoken, live_sessions=frozenset())
     assert got.applied == ["r-ok"] and got.refused == [] and [r for r, _ in got.faults] == ["r-bad"]
     assert _rows(board, "SELECT count(*) FROM report_refusals") == [(0,)]
+
+
+def test_l1_a_coordinator_writing_as_who_service_is_told_the_name_is_reserved(board, coord):
+    store, token, _ = coord
+    with pytest.raises((CoordError, sqlite3.IntegrityError), match="names the service alone"):
+        ready.add(store, token, "levain:c", repo="levain", title="c", who="service", why="x")
