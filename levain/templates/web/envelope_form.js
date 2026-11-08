@@ -268,7 +268,7 @@
     onto.addEventListener("input", () => changed());
 
     // ---- launching seats: a signed standing grant, OFF by default, offered only where the page passes o.launches (the
-    // cockpit's own modal; the phone's sheet never sets it, and the server refuses the key from any device but the cockpit) ----
+    // server's coord_may_launch for this credential, the same test its review applies to the launches key) ----
     const gLaunch = o.launches ? group("env-launch", "Launching seats", "Off: the desk asks you before it starts a seat. On: it may start up to this many seats in the folder above, until the hard stop, without asking again.") : null;
     let launchOn = null, launchCount = null;
     if (gLaunch) {

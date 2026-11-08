@@ -869,7 +869,7 @@ _COORD_SHEET = "/sign/drop"
 # The phone's coordinator routes take a drop from a PAIRED DEVICE only (its token's device id is handed to CoordPhone.step,
 # which binds a kept envelope review to it). The cockpit's gate takes a surface token OR a paired device's token, so the
 # device a step runs as is read from the request's AUTHENTICATED credential (_coord_device), never fixed: a paired device
-# runs as its own id ("d-" + hex, never this name), and only the cockpit page's own surface token ("browser") runs as this
+# runs as its own id ("d-" + hex, never the name below), and only the cockpit page's own surface token ("browser") runs as this
 # one name, "this cockpit's page"; another surface runs as "surface:<name>" (L3 r2: a fixed label let any surface's token
 # run as the cockpit). Who may add a launch grant is levain.coordinator.phone.may_launch over that device: the cockpit
 # page and a paired device's cockpit (Phill 2026-11-08, row 460), never another surface's token.
