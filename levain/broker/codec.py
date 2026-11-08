@@ -44,6 +44,9 @@ def _tool_name(t: Any) -> Optional[str]:
 #:   `previous_response_id` and `conversation` (OpenAI Responses): `string or null`; `null` is no prior state.
 #:   `prompt` (OpenAI Responses): a stored prompt template held by the provider; `null` is none.
 #:   `max_tool_calls` (OpenAI, OpenRouter): how many server-side tool calls the provider may run; `null` is unset.
+#:   `compaction` (Anthropic, on-demand): the summary call's billed tokens are only in `usage.iterations` (the top
+#:   level reads 0), https://platform.claude.com/docs/en/build-with-claude/compaction-on-demand; `null` is none.
+#:   [read by lane prel3fix3r1, 2026-11-08]
 _DISABLED_BY = {
     "web_search_options": (),
     "plugins": ("[]",),
@@ -52,6 +55,7 @@ _DISABLED_BY = {
     "conversation": ("null",),
     "prompt": ("null",),
     "max_tool_calls": ("null",),
+    "compaction": ("null",),
 }
 
 
@@ -193,6 +197,12 @@ class Codec:
         # OpenRouter prices the request at the model that ran; the hold and the settle price `model` only
         if "route" in obj or ("models" in obj and obj["models"] != [model]):
             raise norm.Refused("model-not-allowed", "a fallback list or route may run another model")
+        # OpenRouter's Anthropic-style endpoint: `fallbacks`, "Fallback models to try if the primary model fails or
+        # refuses, in order" (openrouter.ai/docs/api/api-reference/anthropic-messages/create-a-message.md, read
+        # 2026-11-08). Admitted only when it names no other model.
+        fb = obj.get("fallbacks")
+        if fb is not None and not (isinstance(fb, list) and all(m == model for m in fb)):
+            raise norm.Refused("model-not-allowed", "a fallback list may run another model")
         price = prices[model]
         found = self._unbounded(obj, price)
         if found and dispatch:
@@ -204,6 +214,7 @@ class Codec:
         for f in self.unbounded_fields:
             if _field_unbounded(obj, f):
                 found.append(f)
+        found.extend(f for f in self._unbounded_shapes(obj) if f not in found)
         for tool in self._tools(obj):
             if (tool in self.server_tools or tool.startswith(self.server_tool_prefixes)) and tool not in found:
                 found.append(tool)
@@ -211,6 +222,10 @@ class Codec:
             if t in self.unbounded_blocks and t not in found:
                 found.append(t)
         return tuple(found)
+
+    def _unbounded_shapes(self, obj: Mapping[str, Any]) -> List[str]:
+        """Top-level fields unbounded only for some of their values, which `_DISABLED_BY`'s spellings cannot name."""
+        return []
 
     def _tools(self, obj: Mapping[str, Any]) -> List[str]:
         tools = obj.get("tools")
@@ -692,11 +707,27 @@ class AnthropicMessages(Codec):
     )
     # document blocks (PDF, text, URL-fetched) and files a container fetches are content the estimate cannot see.
     unbounded_blocks = ("document", "container_upload")
-    # the MCP connector feeds remote tool results back.
-    unbounded_fields = ("mcp_servers",)
+    # the MCP connector feeds remote tool results back; OpenRouter's Anthropic-style endpoint takes `plugins` (web,
+    # web-fetch, file-parser: openrouter.ai/docs/api/api-reference/anthropic-messages/create-a-message.md); an
+    # on-demand `compaction` call reports its billed tokens only in `usage.iterations` [read 2026-11-08].
+    unbounded_fields = ("mcp_servers", "plugins", "compaction")
     server_tools = ("web_search", "web_fetch", "code_execution")
     ceiling_fields = ("max_tokens",)
     writes_ceiling = False
+
+    def _unbounded_shapes(self, obj: Mapping[str, Any]) -> List[str]:
+        """`context_management` holding a compaction edit (`compact_*`): threshold compaction "requires an additional
+        sampling step, which contributes to rate limits and billing", and the top-level usage leaves it out
+        (https://platform.claude.com/docs/en/build-with-claude/compaction-threshold, read 2026-11-08). Context
+        editing alone (clearing tool uses or thinking) adds no sampling step and stays bounded. A malformed object is
+        the provider's to refuse."""
+        cm = obj.get("context_management")
+        edits = cm.get("edits") if isinstance(cm, dict) else None
+        if isinstance(edits, list) and any(
+                isinstance(e, dict) and isinstance(e.get("type"), str) and e["type"].startswith("compact")
+                for e in edits):
+            return ["context_management"]
+        return []
 
     def _empty_image(self, d: Dict[str, Any]) -> Dict[str, Any]:
         src = d.get("source")
