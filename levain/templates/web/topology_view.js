@@ -1324,8 +1324,10 @@
   let pinned = null;                                                      // the fallback pin (no agent page in the page): {id, x, y, dx, dy} in stage px
   let kbFocus = null;                                                     // the control the keyboard focus sits on ("n:<node id>", or "b:hub" / "b:node:<node id>" for a need badge (the owner is typed, so a node whose id is "hub" is not the desk)), kept across a redraw
   let stageScroll = { top: 0, left: 0 };                                   // the graph box's scroll, kept across a rebuild of the lens (a live repaint replaces the stage)
+  let lastStage = null;                                                    // the stage the last build drew: its scroll is read the moment a rebuild starts, so a scroll whose event has not fired yet is not lost
   function agentsLens(v, opts) {
     release();
+    if (lastStage && lastStage.isConnected) stageScroll = { top: lastStage.scrollTop, left: lastStage.scrollLeft };
     const wrap = el("div", "tv-agents");
     // what the desk's mark last showed: undefined = it just arrived, a number = the count it had (a rebuild at the same data replays nothing)
     const still = !!(opts && opts.still);
@@ -1340,6 +1342,7 @@
     tip.hidden = true;
     tip.setAttribute("aria-hidden", "true");
     wrap.appendChild(stage);
+    lastStage = stage;
     stage.addEventListener("scroll", () => { if (stage.isConnected) stageScroll = { top: stage.scrollTop, left: stage.scrollLeft }; });
     const restoreScroll = () => {
       if (!stage.isConnected) return;
