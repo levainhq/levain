@@ -158,3 +158,15 @@ def test_cli_import_status_exits_1_and_writes_nothing_without_the_live_lease(tmp
     code, _, _ = _cli(qdir, capsys, str(path))
     assert code == 1
     assert ready.journal(store) == []
+
+
+def test_a_row_the_store_refuses_goes_to_unparsed_and_the_import_goes_on(board, tmp_path):
+    # row 3 fits the row shape but its title is blank, which the ready API refuses; rows 1, 2 and 4 still import
+    store, token = board
+    path = _file(tmp_path, [_row(1, "First item"), _row(2, "Second item"), _row(3, " "), _row(4, "Fourth item")])
+    got = status_import.import_status(store, token, path)
+    assert got.added == ["levain:row-1", "levain:row-2", "levain:row-4"] and got.unparsed == [3]
+    # a correction the store refuses is the same: the row is named, the rest stand
+    path2 = _file(tmp_path, [_row(1, "First item"), _row(2, "Second​ item"), _row(4, "Fourth item")])
+    again = status_import.import_status(store, token, path2)
+    assert again.unparsed == [2] and again.unchanged == ["levain:row-1", "levain:row-4"] and again.corrected == []

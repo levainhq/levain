@@ -137,3 +137,53 @@ def test_a_failed_spawn_leaves_no_attach_and_no_launch(board, coord, registry, m
                           agent_store=registry, item="levain:a")
     assert _rows(board, "SELECT count(*) FROM worker_attach") == [(0,)]
     assert _rows(board, "SELECT count(*) FROM launches") == before
+
+
+# --- F14: every board verb's default store is the board store, never the consent directory ---------------------------
+def test_import_status_spawn_item_and_report_default_to_the_same_board_store(tmp_path, monkeypatch, capsys,
+                                                                             registry):  # noqa: F811
+    from levain.consent.queue import queue_dir_for
+
+    home = tmp_path / "home"
+    monkeypatch.setenv("LEVAIN_HOME", str(home))
+    monkeypatch.delenv("CLAUDE_CODE_SESSION_ID", raising=False)
+    consent = queue_dir_for({"LEVAIN_HOME": str(home)})
+    board = work_attach.board_store_dir()
+    assert board == (home / "board").resolve() and board != consent
+    board.mkdir(parents=True, mode=0o700)
+    store = CoordStore(board)
+    token = store.coord_take()
+    status = tmp_path / "status.md"
+    status.write_text("# head\n\n## LANE MENU\n\n1. **First item** (tier: sonnet) DONE: it works.\n")
+    code = main(["coord", "import-status", str(status), "--token", str(token)])
+    capsys.readouterr()
+    assert code == 0
+    assert _rows(board, "SELECT DISTINCT id FROM ready_items") == [("levain:row-1",)]
+    _d, t = a_thread(store)
+    f = tmp_path / "role.json"
+    f.write_text(json.dumps(role()))
+    wdir = tmp_path / "worker-repo"
+    wdir.mkdir()
+    code = main(["coord", "spawn", "--thread", t.thread_id, "--inline", str(f), "--cwd", str(wdir), "--slot",
+                 "topic=x", "--item", "levain:row-1", "--token", str(token), "--agent-store-dir",
+                 str(tmp_path / "autonomic"), "--json"])
+    launch_id = json.loads(capsys.readouterr().out)["launch_id"]
+    assert code == 0
+    # the launch and its attach are in the board store, in one write
+    assert _rows(board, "SELECT launch_id FROM launches WHERE role = 'worker'") == [(launch_id,)]
+    assert _rows(board, "SELECT item_id, launch_id FROM worker_attach") == [("levain:row-1", launch_id)]
+    code = main(["coord", "report", "levain:row-1", "--worker", launch_id, "--kind", "launch", "--event", "progress",
+                 "--launch", launch_id, "--report-id", "r-default", "--json"])
+    assert code == 0 and json.loads(capsys.readouterr().out)["store"] == str(board)
+    assert (board / "reports.db").exists()
+    assert not consent.exists()                     # no verb made or wrote the consent directory
+
+
+# --- F18: a missing board directory in `report` is a one-line exit 2 ---------------------------------------------------
+def test_report_without_a_board_directory_exits_2_with_one_line(tmp_path, capsys):
+    missing = tmp_path / "no-board"
+    code = main(["coord", "report", "levain:a", "--worker", "w", "--event", "attach", "--board-store", str(missing)])
+    cap = capsys.readouterr()
+    assert code == 2 and cap.out == ""
+    assert len(cap.err.strip().splitlines()) == 1 and "no board store directory" in cap.err
+    assert not missing.exists()
