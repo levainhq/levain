@@ -639,7 +639,7 @@ def _tail_lines(fd: int, off: int) -> List[bytes]:
 def read_passthrough_total(log_path: object) -> Optional[int]:
     """The front's cumulative passthrough byte total, read from its tunnel log: the ``passthrough_total`` of the LAST
     line that is a JSON object with ``event`` ``tunnel`` and an int (not a bool) ``passthrough_total`` in
-    ``0 .. 2**63-1``. Only the last 1 MiB of a regular file is read (the first, partial line of a tail is dropped);
+    ``0 .. 2**63-1``. Only the last 1 MiB of a regular file is read (the tail's first line is dropped only when it is a partial fragment, i.e. the byte before the window is not a newline);
     lines split on ``\\n`` alone. Torn, non-JSON and other-event lines are skipped; a tunnel still open at the front's
     death has no line and counts nowhere. ``None`` when the path is missing, unreadable, a symlink or not a regular
     file (a FIFO never blocks), or holds no such line. Never raises."""
@@ -697,7 +697,7 @@ def _read_session_total_fd(fd: int, session: str) -> Optional[int]:
     its first, and the front closes a tunnel whose open record did not land (``Front._log`` answers False) before
     any of its bytes move. The one empty line allowed is the last (the newline after the final record).
 
-    Same tail as :func:`read_passthrough_total`: the last 1 MiB (the first, partial line dropped). That window is a
+    Same tail as :func:`read_passthrough_total`: the last 1 MiB (the first line dropped only when it is a partial fragment, i.e. the byte before the window is not a newline). That window is a
     cap: a session whose records began before it (a long session, or a reused slot's other sessions filling the log
     since) reads None, reason ``tail-window`` (:func:`_session_total_and_reason`), the over-debit side. The log is
     written by the front's lower uid: the tail is parsed with stdlib ``json`` (``RecursionError`` caught), nothing

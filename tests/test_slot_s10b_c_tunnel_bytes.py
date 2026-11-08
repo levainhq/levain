@@ -596,3 +596,60 @@ def test_a_complete_first_record_at_an_exact_tail_boundary_is_kept(tmp_path):
 def test_a_partial_first_fragment_is_still_dropped(tmp_path):
     log, _head = _boundary_log(tmp_path, shift=1)
     assert H.read_session_total(log, "A") is None
+
+
+def test_a_partial_first_fragment_is_dropped_with_the_exact_reason(tmp_path):
+    log, _head = _boundary_log(tmp_path, shift=1)
+    fd = os.open(log, os.O_RDONLY)
+    try:
+        assert H._session_total_and_reason(fd, "A") == (None, "tail-window")
+    finally:
+        os.close(fd)
+
+
+_FIRST = b'{"event":"tunnel","passthrough_total":999}'
+
+
+def _windowed(tmp_path, prefix, first=_FIRST):
+    """A file whose last _PASSTHROUGH_TAIL_BYTES bytes are `first` + newline + non-JSON padding, after `prefix`."""
+    n = H._PASSTHROUGH_TAIL_BYTES - len(first) - 1
+    p = tmp_path / "w.log"
+    p.write_bytes(prefix + first + b"\n" + b"z" * n)
+    assert p.stat().st_size - len(prefix) == H._PASSTHROUGH_TAIL_BYTES
+    return p
+
+
+def _lines(path):
+    fd = os.open(path, os.O_RDONLY)
+    try:
+        off = max(0, os.fstat(fd).st_size - H._PASSTHROUGH_TAIL_BYTES)
+        return H._tail_lines(fd, off)
+    finally:
+        os.close(fd)
+
+
+def test_tail_lines_keeps_line_one_after_a_newline(tmp_path):
+    assert _lines(_windowed(tmp_path, b"junk\n"))[0] == _FIRST
+
+
+def test_tail_lines_drops_line_one_after_a_non_newline(tmp_path):
+    lines = _lines(_windowed(tmp_path, b"junk"))
+    assert _FIRST not in lines
+    assert lines[0].startswith(b"z")
+
+
+def test_a_json_fragment_with_a_wrong_total_is_dropped(tmp_path):
+    p = _windowed(tmp_path, b"x")
+    assert H.read_passthrough_total(p) is None
+    assert H.read_passthrough_total(_windowed(tmp_path, b"x\n")) == 999
+
+
+def test_tail_lines_offset_zero_keeps_line_one(tmp_path):
+    p = _windowed(tmp_path, b"")
+    assert _lines(p)[0] == _FIRST
+    assert H.read_passthrough_total(p) == 999
+
+
+def test_tail_lines_offset_one(tmp_path):
+    assert _lines(_windowed(tmp_path, b"\n"))[0] == _FIRST
+    assert _FIRST not in _lines(_windowed(tmp_path, b"x"))
