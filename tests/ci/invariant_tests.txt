@@ -1,7 +1,8 @@
 # The whole-tree invariant tests: each asserts something about EVERY file of the source tree (no module but X calls Y,
 # every call site names Z, a table is in exactly one class, every verb the README lists exists), so each can go red from
-# a change in a file the author never opened. They run before a push (`pytest -m invariant`, scripts/hooks/pre-push), so
-# that red is found on the laptop and not in a CI slot.
+# a change in a file the author never opened. The marker exists so a future pre-push hook can run just this tier
+# (`pytest -m invariant`) and find that red on the laptop and not in a CI slot; no such hook runs it, because the tier
+# is over a pre-push time budget.
 #
 # Membership is derived, not remembered: (1) every test function that scans the tree (rglob over the package, os.walk,
 # git ls-files), found by walking each test module's AST through its helpers, minus the behavioural tests that only glob a

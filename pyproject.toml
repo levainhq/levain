@@ -209,5 +209,5 @@ levain = ["**/__pycache__/*", "**/*.pyc", "**/*.pyo"]
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 addopts = "-ra --strict-markers"
-# `invariant`: the whole-tree invariant tests listed in tests/ci/invariant_tests.txt; `pytest -m invariant` is the pre-push tier.
+# `invariant`: the whole-tree invariant tests listed in tests/ci/invariant_tests.txt; `pytest -m invariant` selects them (the marker was cut for a future pre-push hook; none runs it).
 markers = ["invariant: asserts something about every file of the source tree (listed in tests/ci/invariant_tests.txt)"]

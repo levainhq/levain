@@ -1,5 +1,5 @@
 """tests/ci/invariant_tests.txt: the `invariant` marker covers exactly the listed whole-tree tests, and the listed
-ones exist (a rename must not silently drop a test out of the pre-push tier)."""
+ones exist (a rename must not silently drop a test out of the `invariant` tier)."""
 import subprocess
 import sys
 from pathlib import Path
@@ -28,3 +28,10 @@ def test_the_marker_selects_exactly_the_listed_tests_and_the_named_failures_are_
     # one collection pass over just the listed files keeps this fast; a listed id that no longer exists is missing here
     selected = _collect("-m", "invariant", *sorted({i.split("::", 1)[0] for i in listed}))
     assert selected == listed, (sorted(listed - selected), sorted(selected - listed))
+
+
+def test_no_header_claims_a_pre_push_hook_runs_the_tier():
+    for rel in ("tests/ci/invariant_tests.txt", "pyproject.toml"):
+        text = (ROOT / rel).read_text(encoding="utf-8")
+        assert "scripts/hooks/pre-push" not in text, rel
+        assert "is the pre-push tier" not in text, rel
