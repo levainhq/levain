@@ -256,7 +256,9 @@ def test_a_store_set_up_before_snoozes_reads_unsnoozed_and_gets_the_table_on_its
 
 
 # --- answers by number unchanged -----------------------------------------------------------------------------------
-def test_a_snoozed_row_answers_by_its_number(store, qdir, capsys):
+def test_a_snoozed_row_answers_by_its_number(store, qdir, capsys, clock, monkeypatch):
+    # run_band opens its own store: pin it to the test clock, or "tomorrow" follows the wall clock (it failed on 11-08)
+    monkeypatch.setattr(band_view, "QuestionStore", lambda d: QuestionStore(d, clock=clock))
     ask(store, "first?")
     q2 = ask(store, "second?")
     band_view.run_band(argparse.Namespace(queue_dir=qdir))

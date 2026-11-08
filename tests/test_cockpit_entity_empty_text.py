@@ -19,13 +19,14 @@ OLD = "Sage"      # the name the fixture install and the old fixed text carried
 
 
 def _install(tmp_path: Path, *, store: bool, config: bool) -> SubstrateSource:
-    """An install whose entity is NAME, with a Tray and Open loops that hold nothing (a Keep note only, or no store at all)."""
+    """An install whose entity is NAME, with a Tray and Open loops that hold nothing (a store whose only spore is done, or no store at all; a legacy note now renders in the Tray)."""
     root = _make_levain_install(tmp_path)
     (root / "seed" / "origin.md").write_text(f"# Who You Are — {NAME}\n\nYou are {NAME}.\n", encoding="utf-8")
     if config:
         (root / ".levain" / "config.json").write_text(json.dumps({"entity_name": NAME}), encoding="utf-8")
     if store:
-        SporeStore(root / ".levain" / "memory.spores.json").add(type="task", text="a keep note", disposition="note")
+        st = SporeStore(root / ".levain" / "memory.spores.json")     # a store file that holds nothing live: one spore, already descended
+        st.descend(st.add(type="task", text="a done item", disposition="seed")["id"], kind="done")
     return SubstrateSource.local(root)
 
 
