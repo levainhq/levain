@@ -44,7 +44,6 @@ import tempfile
 import termios
 import time
 import tty
-import unicodedata
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import IO, Any, Callable, Collection, Dict, List, Mapping, Optional, Sequence, Tuple
@@ -673,12 +672,6 @@ def operator_clone(repo: Path, branch: str, dest: Path, *, git: str = "git",
                      refusal="clone-failed"))
 
 
-def _fold(name: str) -> str:
-    # DECISION: a case- and normalization-insensitive store (APFS by default) checks `.Claude/Settings.json` out
-    # where CC reads `.claude/settings.json`, so every spelling that folds to a settings name is checked.
-    return unicodedata.normalize("NFD", name).casefold()
-
-
 def _ls_tree(clone: Path, treeish: str, *, git: str, run: Callable[..., subprocess.CompletedProcess]
              ) -> List[Tuple[bytes, bytes, bytes, str]]:
     p = _git(["-C", str(clone), "ls-tree", "-z", treeish], git=git, run=run, refusal="repo-settings-malformed")
@@ -706,6 +699,7 @@ def repo_layer_docs(clone: Path, *, git: str = "git",
     name -> JSON value, for every tree entry whose name folds to ``.claude`` / ``settings.json`` / ``settings.local.json``. Refused ``repo-settings-malformed`` when
     such an entry is a link or a submodule (CC would read through it), is over :data:`SETTINGS_CAP`, is not JSON, or
     repeats a key (DECISION: two values for one key is refused, not resolved), or nests too deep to parse."""
+    from levain.slot.render import fold_name as _fold   # the one fold, imported where it is used
     want = {_fold(Path(n).name): n for n in REPO_SETTINGS}
     docs: Dict[str, Any] = {}
     for mode, typ, sha, name in _ls_tree(clone, treeish, git=git, run=run):
