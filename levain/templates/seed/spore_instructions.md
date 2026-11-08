@@ -66,21 +66,26 @@ When you re-engage a spore, `spore_touch` it — that resets its germination clo
 
 When in doubt, ask: *does this close?* If yes, it's a spore. If it only accretes, it's memory.
 
-## The Tray and the Keep — your operator's own I/O
+## The band, spores and memory — where an intention goes
 
-Everything above is *your* prospective memory — open loops that flow into your cognition (salience, and the collision surface that brings the right one back when it's relevant). A spore can also carry a **disposition** that re-routes it to your *operator's* I/O instead of yours. These are deliberately kept OUT of your cognition surfaces — they are the human's inbox and reference shelf, not your open loops — and they split on one question: *does the item resolve, or persist?*
+Everything above is *your* prospective memory: open loops that flow into your cognition. Your operator's side of the work has its own surfaces, and they split on one question: *what is the item waiting on?* The model is three places: the band, spores and memory.
 
-**The Tray — your operator's session inbox (resolves).** Items the operator hands you, surfaced once at the start of each session, then worked off:
+**The band — what the machine is stopped on that only the operator can give.** A band row is a question, a choice or a signature you cannot do without them. File one with `levain ask` (the band MCP tool `ask` does the same) and keep working. Every row names what waits on the answer (`--blocks`): that is the stopped test. If you can do the next step yourself, it is not a band row, it is work. If nothing is stopped yet because the date has not come, it is not a band row either; it is a dated spore (below). The band is for what is waiting now, not for what will wait later.
 
-- **seed** — a freeform capture the operator dropped for you to **sort**. This is the default for anything they dump. Your job: read it and route it — metabolize it into a real object (promote it to an open `loop` so it joins your cognition, or `ascend` it into a project / episode / a Keep note) — or, if it's actually a handoff or an agenda item, re-disposition it. A raw dump stays a `seed` until you've sorted it.
-- **handoff** — "pick this up next session" / "remember this for later." You consume it at the next session-start, act on it, then resolve it.
-- **agenda** — "something to talk about, not ready to track yet." Discussed, then it resolves or promotes to a `seed`.
+**Spores — intentions that are not live yet.** Two kinds the operator reaches you with:
 
-**The Keep — your operator's durable reference (persists).**
+- **seed** — undated, and allowed to go stale. A freeform capture the operator dropped for you to **sort**; the default for anything they dump. Read it and route it: promote it to an open `loop` so it joins your cognition, `ascend` it into a project or an episode, or let it rest. A seed that nobody wants any more is composted (`descend`), not carried.
+- **agenda** — dated, or set off by a date: something for a day, not for now. It sits in the Tray with its date and stays out of your cognition surfaces until you sort it. Give it the date in `next` on your spore tools (the cockpit calls the same field `surface_at`). Treat an agenda with no date as a seed.
 
-- **note** — a durable, agent-queryable reference the operator authored (a command they keep forgetting, a pointer, a standing list). It is NOT an open loop: it never germinates, never nags, never ascends. You **recall** it when the current work collides with it — the same collision surface that brings open loops back to you — so you can hand them "that command" without being asked to go look. A note persists until the operator removes it (`descend`); to repurpose one, remove it and author a fresh loop.
+There is no `handoff` disposition for new items: "pick this up next session" is a seed, a dated agenda, or, if the machine is stopped on the operator, a band row. And there is no Keep. Reference is memory, not a task:
 
-**The capture contract — the human dumps; you sort.** This is the load-bearing rule. Your operator's whole mental model is "the Tray is where I drop things for you." They do NOT learn the seed / handoff / agenda / note vocabulary — *you* carry it. Disposition is something **you infer and assign**, never something the human has to get right. So a fresh dump is a `seed` by default (already excluded from your cognition, so a raw dump can never pollute your salience before you've looked at it), and you do the sorting at the next session-start. Keep the freeform door wide: it should always be zero-friction for them to just dump, and yours to make sense of.
+- a **fact** that stays true goes in your continuity under `## Durable Facts` (if your store has that section; otherwise as a `finding` episode), written with the cue words that would bring it back;
+- a **ruling** (the operator decided something) is a `decision` episode with their words, the date and the premise;
+- a trap with a match condition (a thing that must fire when the condition is met) is not a note, and a Levain install ships no mechanism that fires on a match condition. Record it as a `finding` episode that states the condition, and tell the operator that nothing will fire it until they add a mechanical trigger or hook of their own.
+
+Old `handoff` and `note` items from earlier installs still appear, in the Tray (`spore_list` and the cockpit's Tray panel show them badged `handoff` or `note`). Resolve one with `spore_descend` (done) or `spore_ascend` (it grew), or from the cockpit started with `levain serve --write`; you just do not create new ones.
+
+**The capture contract: the human dumps; you sort.** This is the load-bearing rule. Your operator's mental model is "I drop things for you." They do NOT learn the seed / agenda vocabulary; *you* carry it. Disposition is something you infer and assign, never something the human has to get right. A fresh dump is a `seed` by default (already outside your cognition surfaces, so a raw dump cannot pollute your salience before you have looked at it), and you do the sorting. Keep the freeform door wide.
 
 ---
 
