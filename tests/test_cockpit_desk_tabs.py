@@ -253,6 +253,7 @@ REAL_LATER = [
     ("TALK: trans-allies-ohio: Mon 11-09 before 20:00: send Jeanne the upgrade notice on Signal, then take the pre-2404 Linode snapshot. Draft and steps are in RUNBOOK 5.", 1),
     ("DECISION: flow: Friction day + prompts-logger session (also Levain C9 one-real-day run, C7 closed-lid test), moved to Mon 11-09 (469c). Start it?", 1),
     ("levain: TUE 11-10: read Levain 1.0's release essay draft 2 and fill its 17 [[PHILL]] slots; it ships with 1.0. Your word 14:59: (a)", 2),
+    ("TALK: flow: Tue 11-10: open https://example.com/" + "a-very-long-path-segment-with-no-spaces-" * 6 + "end then report", 1),
 ]
 LATER_PROBE = """(() => { const rows = Array.from(document.querySelectorAll('#ck-needs .needs-later-line'));
   const lines = (e) => Math.round(e.getBoundingClientRect().height / parseFloat(getComputedStyle(e).lineHeight || 16));
@@ -274,15 +275,17 @@ def test_later_on_a_phone_is_one_header_and_aligned_rows(tmp_path: Path, monkeyp
                           {"eval": "new Promise(r => setTimeout(r, 300)).then(() => 1)"}, {"shot": str(Path(shots) / n), "full": False}] if shots else [])
     if shots:
         Path(shots).mkdir(parents=True, exist_ok=True)
-    ready = "document.querySelectorAll('#ck-needs .needs-later-line').length === 3 && Array.from(document.querySelectorAll('#ck-needs .needs-later-title')).every(e => e.textContent)"
+    ready = "document.querySelectorAll('#ck-needs .needs-later-line').length === 4 && Array.from(document.querySelectorAll('#ck-needs .needs-later-title')).every(e => e.textContent)"
     with _serve(src, surface_tokens={"browser": "T"}, install_class="reported") as (url, _httpd):
         vals = _drive(tmp_path, f"{url}/#write_token=T", [
             {"emulate": {"w": 390, "h": 844, "dpr": 2, "mobile": True}}, {"until": READY_ANY, "ms": 20000}, {"until": ready, "ms": 20000},
             {"eval": LATER_PROBE}, *shot("narrow.png", 390),
             {"emulate": {"w": 1440, "h": 900, "dpr": 1}}, {"until": ready, "ms": 20000}, *shot("wide.png", 1440)])["values"]
     g = json.loads(next(v for v in vals if isinstance(v, str) and v.startswith('{"marks"')))
-    assert g["marks"] == 0 and g["n"] == 3 and g["head"] and g["head"].lower().startswith("later") and g["head"].endswith("3"), g
+    assert g["marks"] == 0 and g["n"] == 4 and g["head"] and g["head"].lower().startswith("later") and g["head"].endswith("4"), g
     assert g["oneLine"] and g["docW"] <= g["winW"], g                       # the number and the day never wrap, and the page does not scroll sideways
     assert len(set(g["lefts"])) == 1, g                                    # the headline column lines up across rows
     for t in g["titles"]:                                                  # a cut is on a word boundary, never inside "[[PHILL]]"
         assert not t.rstrip("…").endswith("[[PHI") and ("[[" not in t or "]]" in t), t
+    long = next(t for t in g["titles"] if t.endswith("open…"))          # a headline whose only early space precedes a long URL cuts at that space, never mid-token
+    assert "-spa" not in long and len(long) <= 161, long

@@ -1395,7 +1395,8 @@
     });
     grip.addEventListener("pointermove", (ev) => {
       if (!dragFrom || ev.pointerId !== dragFrom.id) return;
-      if (ev.clientY !== dragFrom.y) dragFrom.moved = true;
+      if (ev.clientY === dragFrom.y && !dragFrom.moved) return;          // a zero-delta or sideways move previews nothing (it would pin the box with nothing to persist)
+      dragFrom.moved = true;
       setGraphH(clampGraphH(dragFrom.h + ev.clientY - dragFrom.y), false);
     });
     const endDrag = (ev) => {
@@ -1407,7 +1408,7 @@
     grip.addEventListener("pointerup", endDrag);
     grip.addEventListener("pointercancel", (ev) => {                       // a cancelled drag is reverted to the stored (or default) height, never left half-applied
       if (!dragFrom || ev.pointerId !== dragFrom.id) return;
-      dragFrom = null; grip.classList.remove("tv-grip-on"); applyGraphH();
+      dragFrom = null; grip.classList.remove("tv-grip-on"); applyGraphH(); if (needCentre || centreOn) centreGraph();
     });
     grip.addEventListener("dblclick", () => { dragFrom = null; clearGraphH(); applyGraphH(); centreGraph(); });
     grip.addEventListener("keydown", (ev) => {
@@ -1416,7 +1417,7 @@
       ev.preventDefault();
       setGraphH(clampGraphH(stage.getBoundingClientRect().height + d), true);
     });
-    const onWinResize = () => { if (!stage.isConnected) { root.removeEventListener("resize", onWinResize); return; } if (!dragFrom) { applyGraphH(); centreGraph(); } };
+    const onWinResize = () => { if (!stage.isConnected) { root.removeEventListener("resize", onWinResize); return; } if (!dragFrom) { applyGraphH(); if (needCentre || centreOn) centreGraph(); } };
     if (typeof root.addEventListener === "function") {
       root.addEventListener("resize", onWinResize);
       resizeOff = () => root.removeEventListener("resize", onWinResize);     // release() takes it off at the next repaint

@@ -152,3 +152,14 @@ def test_repaints_do_not_stack_resize_listeners(tmp_path, monkeypatch):
                                       WAIT, {"eval": "JSON.stringify({kind: 'st', n: window.__rs})"}])
     (m,) = _states(out)
     assert m["n"] <= 1, m
+
+
+@needs_browser
+def test_a_zero_delta_move_pins_nothing_and_a_cancel_recentres(tmp_path, monkeypatch):
+    """L3 r2 (MED): a pointermove with no Y change previewed a height that endDrag then neither stored nor cleared."""
+    move = ("(() => { const g = %s, r = g.getBoundingClientRect(), x = r.left + 5, y = r.top + 5; "
+            "const e = (t, xx) => g.dispatchEvent(new PointerEvent(t, {bubbles: true, pointerId: 7, button: 0, clientX: xx, clientY: y})); "
+            "e('pointerdown', x); e('pointermove', x + 30); e('pointerup', x + 30); return 1; })()") % GRIP
+    out = _go(tmp_path, monkeypatch, [{"eval": move}, _mark()])
+    (m,) = _states(out)
+    assert m["stored"] is None and m["h"] == "" and m["mh"] == "", m

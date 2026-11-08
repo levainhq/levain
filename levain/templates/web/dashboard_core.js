@@ -6231,7 +6231,7 @@
     t = String(t);
     if (t.length <= 160) return t;
     const c = t.slice(0, 160), i = c.lastIndexOf(" ");
-    return (i > 80 ? c.slice(0, i) : c).replace(/[\s,;:]+$/, "") + "\u2026";
+    return (i > 0 ? c.slice(0, i) : c).replace(/[\s,;:]+$/, "") + "\u2026";   // the last space anywhere before the limit; a headline with none keeps its one token to the limit
   }
   function needsLaterLine(it) {
     const row = el("div", "needs-later-line band-later");
