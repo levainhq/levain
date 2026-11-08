@@ -467,13 +467,15 @@ def _dispatch_label(job: Any) -> str:
     return _wire(f"dispatch · {job.contract.template.template_id}")
 
 
-def _questions_at(store: Any, at: datetime | None) -> list[Any]:
-    """The questions an agent waits on. Live: the store's open questions. At a past instant T: every question filed
+def _questions_at(store: Any, at: datetime | None, now: datetime | None = None) -> list[Any]:
+    """The questions an agent waits on. Live: the store's open questions, less those snoozed past today
+    (band_view.later_facets, the one LATER predicate; a fault there is due, so the question stays). At a past instant T: every question filed
     at or before T and not answered by T (the store keeps both stamps and never deletes), oldest first; raises
     ``LookupError`` when the store cannot answer for T (no ``recent`` read, or more than ``QUESTIONS_SCAN`` questions,
     so an older one answered after T would not be seen)."""
     if at is None:
-        return list(store.open_questions())
+        from levain.band_view import later_facets
+        return [q for q in store.open_questions() if later_facets(store, q, now) is None]
     recent = getattr(store, "recent", None)
     if recent is None:
         raise LookupError("this question store lists no answered questions")
@@ -723,7 +725,7 @@ def topology_reader(*, install_root: Path | None,
             blind("questions", "no question store is attached to this cockpit")
         else:
             try:
-                open_qs = _questions_at(store, at)
+                open_qs = _questions_at(store, at, ctx.now)
                 for q in open_qs:
                     waiting_card.setdefault((q.agent, q.agent_session_id), f"{QUESTION_ROW_PREFIX}{q.n}")
             except LookupError as exc:

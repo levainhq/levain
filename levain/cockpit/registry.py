@@ -327,7 +327,10 @@ def _queue_group(row: RowIn, today: date) -> str:
     if row.id.startswith(NOTE_ROW_PREFIX):
         return "notes" if row.facets.get("note_state") == "open" else "resolved"
     if row.id.startswith(QUESTION_ROW_PREFIX):
-        return "needs_input" if row.facets.get("question_state") == "open" else "resolved"
+        if row.facets.get("question_state") != "open":
+            return "resolved"
+        # an open question snoozed past today (band_view.later_of, served as question_later) waits on no one today: not counted
+        return "later" if _is_iso_day(row.facets.get("question_later")) else "needs_input"
     if row.id.startswith(CONSENT_ROW_PREFIX):
         # an undecided request waits on the operator's late ruling, as a pending one waits on his answer
         return "needs_input" if row.facets.get("consent_state") in ("pending", "undecided") else "resolved"
@@ -344,6 +347,8 @@ def _queue_key(row: RowIn, today: date) -> tuple:
         if row.id.startswith(QUESTION_ROW_PREFIX):     # a question never expires: after the requests, oldest first
             return (0, 1, str(row.facets.get("at") or ""), row.id)
         return (0, 0, str(row.facets.get("expires_at") or ""), row.id)
+    if _queue_group(row, today) == "later":            # snoozed: soonest day first, then oldest
+        return (0, str(row.facets.get("question_later")), str(row.facets.get("at") or ""), row.id)
     if _queue_group(row, today) == "notes":            # an open note: oldest first
         return (0, str(row.facets.get("at") or ""), row.id)
     if _queue_group(row, today) in ("open", "waiting"):
@@ -407,9 +412,9 @@ register_ordering(
     Ordering(
         "decision.queue", _queue_key, _queue_group,
         (("needs_input", "Agents waiting on you"), ("open", "Waiting on you"), ("waiting", "Waiting on a signature"),
-         ("notes", "Notes for you"), ("resolved", "Resolved"), ("outcomes", "Outcomes")),
+         ("notes", "Notes for you"), ("later", "Later"), ("resolved", "Resolved"), ("outcomes", "Outcomes")),
         # a note waits on nothing: it never counts as a decision waiting on him
-        uncounted=frozenset({"notes", "resolved", "outcomes"}),
+        uncounted=frozenset({"notes", "later", "resolved", "outcomes"}),
     ),
     builtin=True,
 )
