@@ -5299,6 +5299,7 @@
   // card's, and one drawn afresh after its request left the listing): each is told every answer and drops itself once its
   // facet is off the page, so a facet drawn later never takes the ask away from one still shown
   const signPending = new Map();
+  const signDecided = new Map();      // request id -> the note text of a request the sign sheet signed: every card of it, drawn now or later, is dead
   const signSettledIds = new Set();   // request ids whose signNotes entry is a settled outcome (signed or refused), shown even once the request is gone
   function signSettledSaid(st) {
     if (st.state === "signed") {
@@ -5668,7 +5669,7 @@
         // answered here: its signed line stays until the row itself leaves; else it was answered, denied or expired elsewhere
         return show(kept && (kept[1] === "ok" || signSettledIds.has(id)) ? kept[0] : "this sign request is no longer open; the card updates on the next read", kept && kept[1]);
       }
-      if (kept && kept[2] !== (r.sha256 || "")) signNotes.delete(id);
+      if (kept && kept[2] !== (r.sha256 || "") && !signDecided.has(id)) signNotes.delete(id);
       if (r.refused) return show("not signable: " + r.refused, "bad");
       // the focus view's needs-phill card (card_format.js, the sheet's rule and builders): drawn in place of the question's
       // title, blocks and REC lines (`head`), the signed text whole one tap away above the buttons, Detail after them
@@ -5712,6 +5713,7 @@
         if (ask !== false) signAskPending(id);
       };
       const settleShow = (st) => {
+        if (signDecided.has(id)) return;     // the sheet signed it: no later word about an older attempt gives the card back
         if (st.state === "signed") {
           signWriteIns.delete(id);
           say("signed" + (typeof st.choice === "string" && st.choice ? " (" + st.choice + ")" : "")
@@ -5842,6 +5844,7 @@
         for (const x of acts.querySelectorAll("input")) x.readOnly = x.disabled = true;
         settleHere();
       }
+      if (signDecided.has(id)) signCardDead(wrap, signDecided.get(id));     // decided before this card's controls existed
       if (options.length) {
         const lines = el("div", "sign-lines ext-meta", "an option signs the request's message with its line appended:");
         for (const o of options) lines.appendChild(el("div", "sign-line", String(o.line)));
@@ -5865,6 +5868,7 @@
   const SIGN_RELOAD_MS = 1500;
   const SIGN_RELOAD_LATE_MS = 8000;     // a second read after a close forced past a sheet that never answered
   let signSheetInerted = [];      // what openSignSheet made inert (and closeSignSheet gives back): never what was already
+  let signSheetFor = null;        // the request id the open sheet was opened for: a "signed" message names only that one
   let signSheetLease = false;     // the sheet holds a `signBusy` count
   let signSheetAsk = null;        // the pending close request's timer
   let signSheetWatch = null;      // the MutationObserver that makes a node added to the body while open inert
@@ -5891,6 +5895,7 @@
   function openSheet(path, version, choice, what, heading) {
     closeSignSheet();
     if (signBusy) return null;
+    try { signSheetFor = decodeURIComponent(path.split("/").pop()); } catch (e) { signSheetFor = null; }
     signBusy++;
     signSheetLease = true;
     try {
@@ -5970,6 +5975,7 @@
     if (veil) veil.remove();
     if (!document.getElementById("levain-modal")) document.body.classList.remove("modal-open");
     if (signSheetLease) { signSheetLease = false; signBusy--; }
+    signSheetFor = null;
   }
   // one pending board read; `latch`: a second read follows, for a sheet closed while its signature may have been landing
   function signBoardTick() {
@@ -5985,19 +5991,30 @@
     clearTimeout(signBoardTimer);
     signBoardTimer = setTimeout(signBoardTick, SIGN_RELOAD_MS);
   }
+  // A card of a signed request: its note says what was signed and every control on it is dead, whatever draws it
+  function signCardDead(wrap, text) {
+    const note = wrap.querySelector(".sign-note");
+    if (note) { note.textContent = text; note.className = "sign-note ext-meta sign-ok"; }
+    for (const c of wrap.querySelectorAll("button, input, textarea, select, [contenteditable]")) {
+      c.disabled = true;
+      if ("readOnly" in c) c.readOnly = true;
+      if (c.isContentEditable) c.setAttribute("contenteditable", "false");
+    }
+  }
   // The sheet signed request `id`: the card behind it is decided now, not at the next redraw (the strip keeps a card whose item
-  // did not change, so the board read alone never reaches it). Its note says what was signed and nothing on it can sign again.
+  // did not change, so the board read alone never reaches it). The decision is kept by id, so a card whose controls are built
+  // after this message (a facet still reading, a redraw on the cached listing) comes out decided too.
   function signSheetSigned(id, choice) {
     if (typeof id !== "string" || !/^[A-Za-z0-9_-]{8,64}$/.test(id)) return;
     const text = "signed" + (typeof choice === "string" && /^[a-z0-9]{1,8}$/.test(choice) ? " (" + choice + ")" : "");
     signNotes.set(id, [text, "ok", ""]);
     signSettledIds.add(id);
+    signDecided.set(id, text);
+    signPending.delete(id);
     signWriteIns.delete(id);
+    signListed = null;
     for (const wrap of document.querySelectorAll(".sign-facet[data-sign-request]")) {
-      if (wrap.dataset.signRequest !== id) continue;
-      const note = wrap.querySelector(".sign-note");
-      if (note) { note.textContent = text; note.className = "sign-note ext-meta sign-ok"; }
-      for (const c of wrap.querySelectorAll("button, input")) { c.disabled = true; if ("readOnly" in c) c.readOnly = true; }
+      if (wrap.dataset.signRequest === id) signCardDead(wrap, text);
     }
   }
   window.addEventListener("message", (ev) => {
@@ -6008,7 +6025,7 @@
     else if (what === "close") { closeSignSheet(); dispatchStale(); }
     else if (what === "signed" || what === "reload") {
       // the sheet's line stays on it until it is closed; the board under it reads again, and the dispatch jobs with it
-      if (what === "signed") signSheetSigned(ev.data.id, ev.data.choice);
+      if (what === "signed" && ev.data.id === signSheetFor) signSheetSigned(ev.data.id, ev.data.choice);
       dispatchStale();
       rereadBoard();
       // the server accepted the drop the sheet filed: the box lets go of the words only if it holds exactly those words

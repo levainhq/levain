@@ -566,7 +566,7 @@
           if (done === "unsure") {
             relabel("Not confirmed");
             return settle(r, () => { relabel("Not signed"); busy = false; lock(false); },
-                          () => { busy = false; acts.replaceChildren(); acts.hidden = true; tell("signed", { choice: choice }); }).then(ended);
+                          (said) => { busy = false; acts.replaceChildren(); acts.hidden = true; tell("signed", { choice: said || choice }); }).then(ended);
           }
           relabel("Not signed");
           ended();
@@ -706,7 +706,7 @@
         if (a.line) signing(a.line, "server", "Signed"); else relabel("Signed");
         $("sheet").dataset.state = "signed";
         showOutcome(st.body.choice, a.line);
-        return signedNow();
+        return signedNow(typeof st.body.choice === "string" && st.body.choice ? st.body.choice : undefined);
       }
       if (state === "refused") {
         unsureAttempt = null;
