@@ -202,13 +202,19 @@ def _later_date(row: Any, today: str) -> str | None:
 _WEEKDAYS = ("Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun")
 
 
-def _later_label(n: int, day: str, today: str) -> str:
-    """``343 Sun`` for tomorrow, ``373 Tue 11-10`` for any later day (flow's ``_later_label``)."""
+def later_words(day: str, today: str) -> str:
+    """``Sun`` for tomorrow, ``Tue 11-10`` for any later day: the one home of the LATER day format (flow's
+    ``_later_label`` without the number)."""
     d = datetime.fromisoformat(day).date()
     wd = _WEEKDAYS[d.weekday()]          # fixed English: strftime('%a') follows the process locale
     if (d - datetime.fromisoformat(today).date()).days == 1:
-        return f"{n} {wd}"
-    return f"{n} {wd} {d.strftime('%m-%d')}"
+        return wd
+    return f"{wd} {d.strftime('%m-%d')}"
+
+
+def _later_label(n: int, day: str, today: str) -> str:
+    """``343 Sun`` for tomorrow, ``373 Tue 11-10`` for any later day (flow's ``_later_label``)."""
+    return f"{n} {later_words(day, today)}"
 
 
 def _later_line(items: list[tuple[int, str]], today: str) -> str:
@@ -240,6 +246,19 @@ def later_of(store: Any, q: Any, n: int | None = None, now: datetime | None = No
     except Exception:  # noqa: BLE001
         return None
     return _later_pair(q, n, today)
+
+
+def later_facets(store: Any, q: Any, now: datetime | None = None) -> tuple[str, str] | None:
+    """``(day, words)`` for an open question snoozed past the store's local day (``words`` as :func:`later_words`), else
+    ``None``. Runs :func:`later_of`, the one predicate; any fault is due, never hidden (the cockpit Needs strip's facets)."""
+    try:
+        today = _today_of(store, now)               # one day for the test and the words, never two reads across midnight
+        got = _later_pair(q, None, today)
+        if got is None:
+            return None
+        return got[0], later_words(got[0], today)
+    except Exception:  # noqa: BLE001
+        return None
 
 
 def _today_of(store: Any, now: datetime | None) -> str:

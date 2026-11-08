@@ -353,6 +353,8 @@
                             offered: (Array.isArray(r.actions) ? r.actions : []).some((a) => a && a.verb === "question_answer" && a.gesture === "direct"),
                             section: f.question_section === "you" || f.question_section === "desk" ? f.question_section : "",
                             carried: f.question_carried === true,
+                            later: typeof f.question_later === "string" && /^\d{4}-\d{2}-\d{2}$/.test(f.question_later) ? f.question_later : "",
+                            laterWords: typeof f.question_later === "string" && /^\d{4}-\d{2}-\d{2}$/.test(f.question_later) && typeof f.question_later_words === "string" && f.question_later_words.length <= 40 ? f.question_later_words : "",
                             sign: signOf(f) };
         }
         // a coordinator review item: its state, whether it is "yours to clear", and the one verb the kernel offers on it

@@ -32,6 +32,24 @@ def _is_int(v: Any) -> bool:
     return isinstance(v, int) and not isinstance(v, bool)
 
 
+def _is_iso_day(v: Any) -> bool:
+    """A real calendar day written ``YYYY-MM-DD`` (it round-trips through ``date.fromisoformat``)."""
+    if not isinstance(v, str):
+        return False
+    try:
+        return date.fromisoformat(v).isoformat() == v
+    except ValueError:
+        return False
+
+
+_LATER_WORDS = re.compile(r"(Mon|Tue|Wed|Thu|Fri|Sat|Sun)( (0[1-9]|1[0-2])-(0[1-9]|[12][0-9]|3[01]))?")
+
+
+def _is_later_words(v: Any) -> bool:
+    """A LATER day's words, exactly as :func:`levain.band_view.later_words` writes them: ``Sun`` or ``Tue 11-10``."""
+    return isinstance(v, str) and _LATER_WORDS.fullmatch(v) is not None
+
+
 def _is_bool(v: Any) -> bool:
     return isinstance(v, bool)
 
@@ -128,6 +146,9 @@ FACETS: dict[str, tuple[str, Callable[[Any], bool]]] = {
     # the host's band section for a question ("you" / "desk") and whether a desk row also lists under "you"; passed through as data
     "question_section": ("enum", _enum("you", "desk")),
     "question_carried": ("bool", _is_bool),
+    # an open question snoozed past today (band_view.later_of): the day (YYYY-MM-DD) and its words ("Mon", "Tue 11-10")
+    "question_later": ("YYYY-MM-DD calendar date", _is_iso_day),
+    "question_later_words": ("Mon..Sun, optionally followed by MM-DD", _is_later_words),
     # an agent's note (levain.consent.notes): its number and whether it was dismissed; its words are never a facet
     "note_n": ("int", _is_int),
     "note_state": ("enum", _enum("open", "dismissed")),
@@ -306,7 +327,13 @@ def _queue_group(row: RowIn, today: date) -> str:
     if row.id.startswith(NOTE_ROW_PREFIX):
         return "notes" if row.facets.get("note_state") == "open" else "resolved"
     if row.id.startswith(QUESTION_ROW_PREFIX):
-        return "needs_input" if row.facets.get("question_state") == "open" else "resolved"
+        if row.facets.get("question_state") != "open":
+            return "resolved"
+        # an open question snoozed past today (band_view.later_of, served as question_later) waits on no one today: not counted.
+        # The day is compared against ``today`` too, so a row kept past the midnight its snooze ends at counts again instead
+        # of hiding a due question.
+        later = row.facets.get("question_later")
+        return "later" if _is_iso_day(later) and str(later) > today.isoformat() else "needs_input"
     if row.id.startswith(CONSENT_ROW_PREFIX):
         # an undecided request waits on the operator's late ruling, as a pending one waits on his answer
         return "needs_input" if row.facets.get("consent_state") in ("pending", "undecided") else "resolved"
@@ -319,13 +346,16 @@ def _queue_group(row: RowIn, today: date) -> str:
 
 def _queue_key(row: RowIn, today: date) -> tuple:
     # open and waiting: dated first (a pending's due is its expiry date); history: newest first
-    if _queue_group(row, today) == "needs_input":      # an agent is blocked on it: soonest expiry first
+    g = _queue_group(row, today)
+    if g == "needs_input":      # an agent is blocked on it: soonest expiry first
         if row.id.startswith(QUESTION_ROW_PREFIX):     # a question never expires: after the requests, oldest first
             return (0, 1, str(row.facets.get("at") or ""), row.id)
         return (0, 0, str(row.facets.get("expires_at") or ""), row.id)
-    if _queue_group(row, today) == "notes":            # an open note: oldest first
+    if g == "later":            # snoozed: soonest day first, then oldest
+        return (0, str(row.facets.get("question_later")), str(row.facets.get("at") or ""), row.id)
+    if g == "notes":            # an open note: oldest first
         return (0, str(row.facets.get("at") or ""), row.id)
-    if _queue_group(row, today) in ("open", "waiting"):
+    if g in ("open", "waiting"):
         return _decision_key(row, today)
     if row.id.startswith((CONSENT_ROW_PREFIX, QUESTION_ROW_PREFIX, NOTE_ROW_PREFIX)):   # a decided consent, answered question or dismissed note: newest first (`at` is the filing)
         at = str(row.facets.get("decided_at") or row.facets.get("at") or "")
@@ -386,9 +416,9 @@ register_ordering(
     Ordering(
         "decision.queue", _queue_key, _queue_group,
         (("needs_input", "Agents waiting on you"), ("open", "Waiting on you"), ("waiting", "Waiting on a signature"),
-         ("notes", "Notes for you"), ("resolved", "Resolved"), ("outcomes", "Outcomes")),
+         ("notes", "Notes for you"), ("later", "Later"), ("resolved", "Resolved"), ("outcomes", "Outcomes")),
         # a note waits on nothing: it never counts as a decision waiting on him
-        uncounted=frozenset({"notes", "resolved", "outcomes"}),
+        uncounted=frozenset({"notes", "later", "resolved", "outcomes"}),
     ),
     builtin=True,
 )
