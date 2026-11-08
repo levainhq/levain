@@ -33,7 +33,8 @@ from levain.autonomic.durable_sqlite import BUSY_WAIT_S, open_durable
 from levain.coordinator.store import _OID, CoordError, CoordStore, _append_only, _in, next_gseq
 
 __all__ = ["ApplyResult", "EVENTS", "REFUSAL_REASONS", "REPORT_SCHEMA", "WORKER_KINDS", "WORK_SCHEMA", "apply_reports",
-           "board_store_dir", "enqueue_report", "live_session_ids", "reports_path"]
+           "attach_launch", "board_store_dir", "enqueue_report", "live_session_ids", "queue_report",
+           "reports_path"]
 
 EVENTS = ("attach", "progress", "blocked", "landed", "ended")
 WORKER_KINDS = ("seat", "lane", "launch")
@@ -180,6 +181,34 @@ class ApplyResult:
     applied: list[str] = field(default_factory=list)                       # report ids copied into worker_attach
     refused: list[tuple[str, str]] = field(default_factory=list)           # (report id, reason) written to report_refusals
     deferred: list[str] = field(default_factory=list)                      # left queued: the live listing was unreadable
+
+
+def queue_report(directory: Path | str, *, report_id: str | None = None, **fields: Any) -> tuple[str, bool]:
+    """The seat's door: check one report's fields the way the applier will, then queue it (:func:`enqueue_report`).
+    Returns ``(report_id, queued)``; ``queued`` is False when ``report_id`` was already in the queue (a resend). A
+    malformed field is a :class:`CoordError` and queues nothing. Whether the item exists and the worker is a real launch
+    is the applier's to judge, against the store: this never opens ``dispatch.db``. No ``report_id`` mints one."""
+    rid = report_id if report_id is not None else "rp-" + os.urandom(16).hex()
+    try:
+        checked = _check({"report_id": rid, **fields})
+    except ValueError as exc:
+        raise CoordError(f"report not queued: {exc}") from None
+    return rid, enqueue_report(directory, **{k: v for k, v in checked.items()})
+
+
+def attach_launch(conn: sqlite3.Connection, now: str, token: int, launch_id: str, item_id: str) -> str:
+    """Record, in the caller's transaction, that the launch ``launch_id`` works on ``item_id``: one ``attach`` row, the
+    launch as its own worker, written by the coordinator under ``token``. Returns the attach id. An item this store does
+    not hold is a :class:`CoordError` (the caller's transaction then rolls back, launch and all)."""
+    ver = conn.execute("SELECT MAX(ver) FROM ready_items WHERE id = ?", (item_id,)).fetchone()[0]
+    if ver is None:
+        raise CoordError(f"{item_id} is not a ready item in this store; nothing was asked for")
+    attach_id = "wa-" + os.urandom(16).hex()
+    conn.execute("INSERT INTO worker_attach (gseq, attach_id, item_id, item_ver, kind, worker, worker_kind, launch_id, "
+                 "harness_session_id, report_id, why, at, applied_at, lease_token, by) "
+                 "VALUES (?, ?, ?, ?, 'attach', ?, 'launch', ?, NULL, NULL, 'asked for by coord spawn', ?, ?, ?, "
+                 "'coordinator')", (next_gseq(conn, now), attach_id, item_id, ver, launch_id, launch_id, now, now, token))
+    return attach_id
 
 
 def _text(value: Any, name: str, high: int, *, required: bool = False) -> str | None:

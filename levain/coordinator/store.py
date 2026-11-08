@@ -1185,12 +1185,19 @@ class CoordStore:
             return lease.claim_spawn(conn, now, launch_id, pid)
 
     def launch_request(self, token: int, *, harness: str, role: str = "worker", threads: Sequence[str] = (),
-                       model: str | None = None, cwd: str | None = None, role_ref: str | None = None) -> Any:
-        from levain.coordinator import lease
+                       model: str | None = None, cwd: str | None = None, role_ref: str | None = None,
+                       attach_item: str | None = None) -> Any:
+        """Ask for a launch under ``token``. ``attach_item`` also records the launch as the worker on that ready item
+        (:func:`levain.coordinator.work_attach.attach_launch`), in this same transaction: an item this store does not
+        hold refuses the whole request and leaves no launch."""
+        from levain.coordinator import lease, work_attach
 
         with self._write() as (conn, now):
-            return lease.request_launch(conn, now, token, harness=harness, role=role, threads=threads, model=model,
-                                        cwd=cwd, role_ref=role_ref)
+            ln = lease.request_launch(conn, now, token, harness=harness, role=role, threads=threads, model=model,
+                                      cwd=cwd, role_ref=role_ref)
+            if attach_item is not None:
+                work_attach.attach_launch(conn, now, token, ln.launch_id, attach_item)
+            return ln
 
     def launch_activate(self, launch_id: str, *, harness_session_id: str, argv_sha256: str | None = None) -> Any:
         from levain.coordinator import lease

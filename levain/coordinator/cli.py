@@ -1405,6 +1405,8 @@ def run_coord(args: argparse.Namespace, out: Any = None) -> int:
 def _run_coord(args: argparse.Namespace, out: Any) -> int:
     cmd = args.coord_cmd
     try:
+        if cmd == "report":          # a seat's verb: it opens no coordinator store and holds no lease
+            return _coord_report(args, out)
         store = _store(args)
         if cmd == "take":
             hold = None
@@ -1785,6 +1787,26 @@ def _coord_ready(args: argparse.Namespace, out: Any, store: EnvelopeStore) -> in
 _SLOTS_FILE_MAX = 64 * 1024
 
 
+def _coord_report(args: argparse.Namespace, out: Any) -> int:
+    """``levain coord report ITEM --worker W --event E [...]`` (row 156): a seat reports a fact about its work on a ready
+    item. It appends to the board store's ``reports.db`` queue (:func:`levain.coordinator.work_attach.queue_report`) and
+    never opens ``dispatch.db`` or takes a token; the watcher's applier copies it into ``worker_attach`` or refuses it
+    with a record. The session comes from ``--session`` or the harness's own environment."""
+    from levain.coordinator import work_attach
+
+    directory = args.board_store.expanduser() if args.board_store is not None else work_attach.board_store_dir()
+    session = args.session or os.environ.get("CLAUDE_CODE_SESSION_ID") or None
+    at = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    rid, queued = work_attach.queue_report(
+        directory, report_id=args.report_id, item_id=args.item, worker=args.worker, worker_kind=args.kind,
+        event=args.event, at=at, launch_id=args.launch, harness_session_id=session, sha=args.sha, branch=args.branch,
+        why=args.why)
+    words = (f"queued report {rid} for {args.item}; it is applied when the board store's watcher next runs"
+             if queued else f"report {rid} was already queued; nothing was added")
+    _emit(out, args.json, {"report_id": rid, "queued": queued, "item": args.item, "store": str(directory)}, words)
+    return 0
+
+
 def _coord_spawn(args: argparse.Namespace, out: Any, store: EnvelopeStore) -> int:
     """``levain coord spawn --thread T (--role @spawn/NAME | --inline FILE) --cwd DIR --token N`` (P3): the lease holder
     asks for one worker on a WORK thread (:func:`levain.agents.instantiate.spawn_worker`). The store derives the depth,
@@ -1827,7 +1849,8 @@ def _coord_spawn(args: argparse.Namespace, out: Any, store: EnvelopeStore) -> in
     except AgentStoreRefused as exc:
         raise CoordError(f"the role registry cannot be opened ({exc})") from None
     ln = instantiate.spawn_worker(store, args.token, thread_id=args.thread, cwd=cwd, ref=args.role, inline=inline,
-                                  slots=slots, agent_store=agents, parent_launch=args.parent, done=args.done)
+                                  slots=slots, agent_store=agents, parent_launch=args.parent, done=args.done,
+                                  item=args.item)
     rec = instantiate.verified_record(ln.role_ref)
     _emit(out, args.json, {"launch_id": ln.launch_id, "state": ln.state, "spawn": rec["spawn"],
                            "inline": rec["inline"], "depth": rec["depth"], "thread": args.thread, "cwd": cwd,
@@ -1990,6 +2013,18 @@ def review_modes() -> tuple[str, ...]:
     from levain.coordinator import review
 
     return review.MODES
+
+
+def _report_kinds() -> tuple[str, ...]:
+    from levain.coordinator import work_attach
+
+    return work_attach.WORKER_KINDS
+
+
+def _report_events() -> tuple[str, ...]:
+    from levain.coordinator import work_attach
+
+    return work_attach.EVENTS
 
 
 def _spawn_caps() -> tuple[int, int]:
@@ -2260,9 +2295,33 @@ def add_parsers(subparsers: argparse._SubParsersAction) -> None:
     csp.add_argument("--done", default=None, metavar="LINE", help="The ready item's DONE: line (the worker's win).")
     csp.add_argument("--parent", default=None, metavar="LAUNCH_ID",
                      help="The active spawned worker asking for this one.")
+    csp.add_argument("--item", default=None, metavar="ITEM_ID",
+                     help="The ready item this worker is for: the attach is recorded with the request, or neither is.")
     csp.add_argument("--agent-store-dir", dest="agent_store_dir", type=Path, default=None, metavar="DIR",
                      help="The role registry's store (default: this Levain home's).")
     csp.add_argument("--token", type=int, required=True, help="Your coordinator lease token.")
+    crt = c_sub.add_parser(
+        "report", help="Report a fact about your work on a ready item (queued; no token, no lease).",
+        description="Appends one report to the board store's queue and returns. It never writes the board itself: the "
+                    "watcher's applier copies it into the worker-attach record, or refuses it (an unknown item, a worker "
+                    "that is not a real launch) and leaves a refusal record the desk reads. Resending the same "
+                    "--report-id queues nothing twice and says so. Your session id comes from the environment.")
+    crt.add_argument("item", metavar="ITEM", help="The ready item's id.")
+    crt.add_argument("--worker", required=True, help="Who you are: a seat or lane name, or a launch id.")
+    crt.add_argument("--kind", choices=_report_kinds(), default="seat", help="What kind of worker (default seat).")
+    crt.add_argument("--event", required=True, choices=_report_events(), help="The fact you report.")
+    crt.add_argument("--launch", default=None, metavar="LAUNCH_ID", help="Your Levain launch id, if you are one.")
+    crt.add_argument("--session", default=None, metavar="ID",
+                     help="Your harness session id (default: CLAUDE_CODE_SESSION_ID from the environment).")
+    crt.add_argument("--sha", default=None, metavar="OID", help="With --event landed: the full commit id.")
+    crt.add_argument("--branch", default=None, help="With --event landed: the branch it landed on.")
+    crt.add_argument("--why", default=None, metavar="LINE", help="One line of detail.")
+    crt.add_argument("--report-id", dest="report_id", default=None, metavar="ID",
+                     help="Your own id for this report; pass the same one to resend it safely (default: a fresh one).")
+    crt.add_argument("--board-store", dest="board_store", type=Path, default=None, metavar="DIR",
+                     help="The board store directory (default: <levain home>/board).")
+    crt.add_argument("--json", action="store_true", help="Machine-readable output.")
+    crt.set_defaults(func=run_coord)
     caw = c_sub.add_parser(
         "away", help="Read a drop as the operator's word that he is away: set away ON (never off).",
         description="Sets away ON for both agents through `levain consent away on`'s own path, so every SIGN waits "
@@ -2397,7 +2456,7 @@ def add_parsers(subparsers: argparse._SubParsersAction) -> None:
         common(p)
         p.set_defaults(func=run_coord)
     # the coordinator's own verbs (its brief names these); the operator's verbs are declared beside them, never left out
-    door_ok(cs, cr, cb, cc, cq, can, ces, cmo, caw, csp, cbu, clg, crp, ccl, cop, chs, chw)
+    door_ok(crt, cs, cr, cb, cc, cq, can, ces, cmo, caw, csp, cbu, clg, crp, ccl, cop, chs, chw)
     not_door(ct, cw, ca, cl, cwa)
     not_door(rvl, rvc, rvo, rvf)
 
