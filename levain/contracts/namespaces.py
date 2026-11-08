@@ -68,6 +68,9 @@ REGISTRY: dict[str, tuple[str, str, str]] = {
                                "the operator's phone passkey approving one dispatch configuration item (by the "
                                "SHA-256 of its exact bytes) before the laptop trust-root key signs it; never a "
                                "configuration signature"),
+    "levain-envelope-revoke": ("shipped", "levain/coordinator/envelope_revoke.py",
+                               "the operator's phone passkey ending one coordinator envelope, over a message naming the "
+                               "store, the envelope, the time and a nonce (levain-envelope-revoke/1); only narrows"),
     "levain-terminal-answer": ("shipped", "levain/consent/terminal_sign.py",
                                "the laptop Touch ID key's signature over a band answer typed at the terminal "
                                "(TERMSIGN; message format levain-terminal-answer/1)"),
