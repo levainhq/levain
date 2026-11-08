@@ -278,9 +278,10 @@ def _clear_squat(store: QueueStore, receipts: Receipts, row: Mapping[str, Any], 
     """True when ``path`` holds a signed answer (left in place). Otherwise whatever is there is renamed aside and
     False is returned, for the caller to link its own answer again. What the rename moved is judged again from its
     own fd, never assumed to be the thing judged at the name (a swap in between, or a freed inode reused, makes
-    them differ while the name or the (dev, ino) look the same); should it be a signed answer, it is linked back; should the name be taken again
-    before it can be, :class:`OperatorError` names the quarantine file that holds it. A signed answer is never left
-    in quarantine unreported.
+    them differ while the name or the (dev, ino) look the same); should it be a signed answer, it is linked back.
+    Should the link-back fail (the name taken again, or any other ``OSError`` but the quarantine file gone),
+    :class:`OperatorError` names the quarantine file that holds it. A signed answer is never left in quarantine
+    unreported.
 
     ``answers/`` has no sticky bit, so the member that squatted can delete or rename the quarantine file once it
     exists: a quarantine file gone is a name cleared, never an error. Any other ``OSError`` is :class:`OperatorError`,
@@ -309,6 +310,9 @@ def _clear_squat_os(store: QueueStore, receipts: Receipts, row: Mapping[str, Any
                                 f"aside could be linked back: it is at {aside}") from None
         except FileNotFoundError:
             return False
+        except OSError as exc:
+            raise OperatorError(f"request {request_id}'s signed answer moved aside could not be linked back ({exc}): "
+                                f"it is at {aside}") from None
         try:
             os.unlink(aside)
         except FileNotFoundError:

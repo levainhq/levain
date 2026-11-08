@@ -379,3 +379,31 @@ def test_a_signed_answer_over_a_head_not_in_the_receipts_neither_lists_as_answer
     operator.write_answer(L / "queue", rid, payload, sig, rbase.snapshot(L), now=LATER)
     assert ask(broker, rid)["decision"] == "allow"
     assert len([p for p in answers.iterdir() if p.name.startswith(f".quarantine-{rid}-")]) == 1
+
+
+# --- prel3fix L3 r1 B3: any other OSError at the link-back names the quarantine file ---------------------------------
+
+def test_any_other_os_error_linking_a_signed_answer_back_names_its_quarantine_file(L, broker, keys, answers,
+                                                                                  monkeypatch):
+    rid = filed(broker)
+    write_answer(L, rid, keys["operator"], decision="deny")      # another writer's signed answer
+    first = (answers / f"{rid}.json").read_bytes()
+    real_judge, real_link, calls = operator._signed_answer, os.link, []
+
+    def stale_once(row, path, *a):
+        calls.append(path)
+        return False if len(calls) == 1 else real_judge(row, path, *a)
+
+    def denied(src, dst, **kw):
+        if ".quarantine-" in str(src):
+            raise PermissionError(1, "Operation not permitted")  # complement-3: EPERM, not the two handled
+        return real_link(src, dst, **kw)
+
+    monkeypatch.setattr(operator, "_signed_answer", stale_once)
+    monkeypatch.setattr(operator.os, "link", denied)
+    payload, sig = rbase.signed(L, rid, keys["operator"])
+    with pytest.raises(operator.OperatorError) as got:
+        operator.write_answer(L / "queue", rid, payload, sig, rbase.snapshot(L), now=LATER)
+    parked = [p for p in answers.iterdir() if p.name.startswith(f".quarantine-{rid}-")]
+    assert len(parked) == 1 and parked[0].read_bytes() == first
+    assert str(parked[0]) in str(got.value)
