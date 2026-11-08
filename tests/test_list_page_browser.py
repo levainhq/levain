@@ -273,7 +273,7 @@ _MQ_SPY = ("(function(){const o=window.matchMedia.bind(window);window.__mqAdds=0
            "m.addEventListener=function(t,f,c){window.__mqAdds++;return a(t,f,c);};}return m;};})()")
 
 _LISTFIX_PROBE = f"""(() => {{
-  const T = {TRAY}; const rows = [];
+  const T = document.querySelector('#levain-modal .modal-body') || {TRAY}; const rows = [];
   for (const row of T.querySelectorAll('.sp-results .row')) {{
     const clause = row.querySelector('.clause');
     const meta = row.querySelector('.list-meta') || row;
@@ -309,7 +309,11 @@ def test_listfix2_one_pill_one_listener_and_known_origins_only(tmp_path: Path) -
             {"until": f"window.LevainSky && window.LevainSky.repos().includes('levain') && {TRAY} && "
                       f"[...{TRAY}.querySelectorAll('.sp-results .row')].some(r => (r.querySelector('.clause')||{{}}).textContent "
                       f"&& r.querySelector('.clause').textContent.startsWith('levain:') && r.querySelector('.k7-repo')) && 1"},
+            # held rows are listed in the focus view only (the card names them in its one control): read the rows there
+            {"eval": f"{TRAY}.querySelector('.pexpand').click(); 1"},
+            {"until": "document.querySelector('#levain-modal .modal-body .sp-results .row[data-held=\"1\"]') && 1"},
             {"eval": _LISTFIX_PROBE},
+            {"eval": "document.querySelector('#levain-modal .modal-close').click(); 1"},
             {"eval": "JSON.stringify({adds: window.__mqAdds})"},
             # rebuild the List the way the page does on a refresh: the tab coming back
             *[{"eval": "document.dispatchEvent(new Event('visibilitychange')); 1"} for _ in range(6)],
@@ -387,3 +391,85 @@ def test_listpanel_141_the_focus_views_sticky_filter_bar_is_opaque(tmp_path: Pat
     assert got["max"] > 0 and got["scrolled"] > 0, got                 # rows really pass under the bar
     assert got["alpha"] == 1 and got["bg"] != "rgba(0, 0, 0, 0)" and got["bg"] != "transparent", got
     assert got["gap"] <= 0.5, got                                      # and it pins flush: no strip above it where a row shows
+
+
+# --- 531 round 4 (levain 73, key 1108-37): desk-owed and LATER rows have their own groups; the card has ONE control ------------
+
+
+def _host_band(monkeypatch: Any) -> None:
+    """The band as flow's adapter fills it: a "desk:" row is the desk's (section desk), a "levain: TUE" row comes back on a later day,
+    every other row is the operator's (section you)."""
+    from dataclasses import replace
+    from datetime import date, timedelta
+
+    from levain import band_view
+
+    real = band_view._read
+    later = (date.today() + timedelta(days=3)).isoformat()
+
+    def read(store: Any) -> Any:
+        items, numbers, closed = real(store)
+        out = []
+        for ref, q in items:
+            if q is not None:
+                what = str(q.what)
+                q = replace(q, section="desk" if what.startswith("desk:") else "you", carried=False,
+                            snoozed_until=later if what.startswith("levain: TUE") else None)
+            out.append((ref, q))
+        return out, numbers, closed
+
+    monkeypatch.setattr(band_view, "_read", read)
+
+
+_CARD_PROBE = f"""(() => {{
+  const T = {TRAY};
+  const rows = [...T.querySelectorAll('.sp-results .row')].filter(r => r.style.display !== 'none' && r.getClientRects().length);
+  const text = (r) => (r.querySelector('.clause') || {{}}).textContent || '';
+  const foot = [...T.querySelectorAll('.more-foot, .held-toggle, .held-line, .xmore')].filter(n => !n.hidden && n.getClientRects().length);
+  return JSON.stringify({{shown: rows.map(text), more: foot.map(n => n.className + ' | ' + n.textContent.trim()),
+    heldToggles: T.querySelectorAll('[data-held-toggle]').length}});
+}})()"""
+
+_FOCUS_PROBE = """(() => {
+  const mb = document.querySelector('#levain-modal .modal-body');
+  const heads = [...mb.querySelectorAll('.grp-head')].map(h => h.textContent.trim());
+  const group = (title) => { const h = [...mb.querySelectorAll('.grp-head')].find(x => x.textContent.trim().startsWith(title));
+    const col = h && h.parentElement; return col ? [...col.querySelectorAll('.row .clause')].map(c => c.textContent.slice(0, 20)) : null; };
+  return JSON.stringify({heads, desk: group('Desk owes'), later: group('Later'), needs: group('Needs you'),
+    held: [...mb.querySelectorAll('.row[data-held="1"]')].length, toggles: mb.querySelectorAll('[data-held-toggle], .held-toggle').length,
+    chips: [...mb.querySelectorAll('.list-surface-chip')].map(c => c.textContent)});
+})()"""
+
+
+@needs_browser
+def test_r4_the_card_holds_due_rows_and_one_control_and_the_focus_view_every_group(tmp_path: Path, monkeypatch: Any) -> None:
+    root, src, _ids = _install(tmp_path)
+    _seed_more(root)
+    _seed_phone(root)
+    from levain.consent.questions import QuestionStore
+    QuestionStore(default_queue_dir()).file(agent="claude_code", agent_session_id="s9", what="One look on your iPhone once the List is fixed.",
+                                            options=[("ship", "Ship it"), ("hold", "Hold")], rec="hold", blocks="his look", cwd="/w/levain")
+    _host_band(monkeypatch)
+    with _serve(src, write_token=TOKEN, surface_tokens={"browser": TOKEN}, install_class="reported") as (url, _httpd):
+        out = _drive(tmp_path, f"{url}/", [
+            {"emulate": {"w": 390, "h": 844, "dpr": 3, "mobile": True}},
+            {"eval": "localStorage.removeItem('levain.tray.showHeld'); 1"},
+            *_reload(),
+            {"until": f"{TRAY} && {TRAY}.querySelectorAll('.sp-results .row[data-surface=band]').length > 0 && 1"},
+            {"eval": "new Promise(r => setTimeout(() => r(1), 900))"},
+            {"eval": _CARD_PROBE},
+            {"eval": f"{TRAY}.querySelector('[data-list-more]') ? ({TRAY}.querySelector('[data-list-more]').click(), 1) : 0"},
+            {"until": "document.querySelector('#levain-modal .modal-body .sp-results .row') && 1"},
+            {"eval": "new Promise(r => setTimeout(() => r(1), 900))"},
+            {"eval": _FOCUS_PROBE},
+        ])
+    vals = [json.loads(x) for x in out["values"] if isinstance(x, str) and x.startswith("{")]
+    card, focus = vals[0], vals[1]
+    assert not any(t.startswith("desk:") or t.startswith("levain: TUE") for t in card["shown"]), card   # not the operator's, not due
+    assert len(card["more"]) == 1 and card["heldToggles"] == 0, card                                    # ONE control, no held toggle
+    assert "desk owes 1" in card["more"][0] and "later 1" in card["more"][0] and "held" in card["more"][0], card
+    assert focus["desk"] and focus["desk"][0].startswith("desk:"), focus                                 # the desk's row under its heading
+    assert focus["later"] and focus["later"][0].startswith("levain: TUE"), focus                         # the later row under LATER
+    assert focus["needs"] and not any(t.startswith(("desk:", "levain: TUE")) for t in focus["needs"]), focus
+    assert focus["held"] > 0 and focus["toggles"] == 0, focus                                            # held spores listed, no toggle
+    assert "Held until their surface date" in focus["heads"], focus

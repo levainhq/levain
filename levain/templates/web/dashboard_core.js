@@ -444,10 +444,33 @@
     const place = body.scrollTop;
     try { return foldRowsAt(body, panel); } finally { if (body.scrollTop !== place) body.scrollTop = place; }
   }
+  // The List card's one control: what the card folds, then what it leaves to the focus view ("26 more · desk owes 5 · later 3 ·
+  // 18 held", only the non-zero parts), and it opens the focus view.
+  function listApart(panel) {
+    try {
+      const a = JSON.parse(panel.dataset.listApart || "null");
+      return a && (a.desk > 0 || a.later > 0 || a.held > 0) ? a : null;
+    } catch (e) { return null; }
+  }
+  function listMore(panel, hidden, a) {
+    const parts = [];
+    if (hidden > 0) parts.push(hidden + " more");
+    if (a.desk > 0) parts.push("desk owes " + a.desk);
+    if (a.later > 0) parts.push("later " + a.later);
+    if (a.held > 0) parts.push(a.held + " held");
+    const more = el("button", "more-foot", parts.join(" · "));
+    more.type = "button";
+    more.dataset.listMore = "1";
+    more.setAttribute("aria-label", parts.join(", ") + ": open the full list");
+    more.addEventListener("click", () => { const x = panel.querySelector(".pexpand"); if (x) x.click(); });
+    panel.appendChild(more);
+    return hidden > 0;
+  }
   function foldRowsAt(body, panel) {
     for (const n of body.querySelectorAll("[data-folded]")) { n.style.display = ""; delete n.dataset.folded; }
     const old = panel.querySelector(":scope > .more-foot:not([data-readall])"); if (old) old.remove();   // the "Read all" foot is memFoot's: removing it here made memFoot re-add it, a childList change that re-ran this, without end
-    if (!(body.scrollHeight > body.clientHeight + 1)) return false;
+    const apartNow = listApart(panel);
+    if (!(body.scrollHeight > body.clientHeight + 1)) return apartNow ? listMore(panel, 0, apartNow) : false;
     const top = body.getBoundingClientRect().top;
     const heldLine = body.querySelector(":scope > .held-line, .held-line");
     const limit = body.clientHeight - 34 - (heldLine ? heldLine.offsetHeight : 0);   // room kept for the link and the held-back line
@@ -481,11 +504,12 @@
         if (nextRow < 0 || (nextHead >= 0 && i + 1 + nextHead < nextRow)) { list[i].style.display = "none"; list[i].dataset.folded = "1"; }
       }
     }
-    if (!hidden) return false;
+    if (!hidden) return apartNow ? listMore(panel, 0, apartNow) : false;
     // a list that has more rows than it first draws ends in its own "show all N" link; once the card folds, two links to the same rest would
     // disagree on the count, so the card keeps one: the foot, saying how many the focus view holds
     const xm = body.querySelector(".xmore"), total = xm ? parseInt((/\d+/.exec(xm.textContent) || [])[0], 10) : NaN;
     if (xm) { xm.style.display = "none"; xm.dataset.folded = "1"; }
+    if (apartNow) return listMore(panel, hidden, apartNow);
     const more = el("button", "more-foot", Number.isFinite(total) && total > hidden ? "Read all " + total : hidden + " more");
     more.type = "button";
     more.setAttribute("aria-label", (Number.isFinite(total) && total > hidden ? "Read all " + total + " rows" : hidden + " more rows") + ": open the full list");
@@ -1575,7 +1599,7 @@
       case "graph": return renderGraph(entry, view);
       case "crystals": return renderCrystals(entry, view);
       case "spores": return renderSpores(entry, view);
-      case "tray": return renderTray(entry, view);
+      case "tray": return renderTray(entry, view, opts);
       case "episodes": return renderEpisodes(entry, view, opts);
       case "wraps": return renderWraps(entry, view);
       case "section": return renderSection(entry, (view.sections || [])[entry.ref]);
@@ -2090,6 +2114,7 @@
     if (foreign) {
       // read-only by construction: band rows point at the Decisions panel, board rows at the agents' queue; no verbs below
       if (s.support && !s.text_locked) host.appendChild(el("span", "muted list-support", s.support));
+      if (s.later_words) host.appendChild(tagEl("muted", "back " + s.later_words));
       if (s.list_pointer) host.appendChild(tagEl("muted list-pointer", s.list_pointer));
       if (s.surface === "board") {
         if (s.board_tier) host.appendChild(tagEl("muted", s.board_tier));
@@ -2190,7 +2215,7 @@
   // The three spore projections share one renderer — same read/verb contract, different
   // source list + badge axis + empty copy. All three read their fault from the single
   // `open_spores` error key (the dashboard does ONE spore read that fills all three).
-  function renderSporeProjection(entry, view, list, emptyMsg, badgeField) {
+  function renderSporeProjection(entry, view, list, emptyMsg, badgeField, ropts) {
     const p = panel(entry);
     // Both projections (Open Loops / Tray) come from ONE dashboard spore read,
     // whose fault is recorded under the single "open_spores" key — so every projection
@@ -2208,14 +2233,21 @@
     const heldLine = held.length && view.tray_held_line && typeof view.tray_held_line === "object" ? view.tray_held_line : null;
     // the List: rows that carry a `surface` get the surface filter (the kernel names the stores; the page only filters by them)
     const isList = entry.kind === "tray" && view.tray_is_list === true;   // the panel offers list_intake: a marker, never the rows' contents
+    // The List's card holds what is due for the operator and what else fits; everything else it holds (the desk's rows, the rows
+    // that come back on a later day, the rows held until their date) is listed in the focus view, under its own heading, and the
+    // card names them in ONE control that opens it. So the card draws neither a held row nor a held toggle.
+    const inCard = isList && !(ropts && ropts.modal);
+    const apart = (s) => s.group === "desk" || s.group === "later";
+    const cardHides = (s) => inCard && apart(s);
+    const heldShown = isList ? !inCard : trayHeldShown;
     // held rows count when they are shown: a surface only held rows carry still gets its chip and stays selectable
-    const listAll = () => (list || []).concat(heldLine && trayHeldShown ? held : []);
+    const listAll = () => (list || []).filter((s) => !cardHides(s)).concat(heldLine && heldShown ? held : []);
     const listNow = () => (isList && listAll().some((s) => s.surface === listSurface) ? listSurface : "");
     const inSurface = (s) => !listNow() || s.surface === listNow();
     const opts = views.length || heldLine || isList ? {
       empty: emptyMsg,
-      extra: () => (heldLine && trayHeldShown ? held.filter(inSurface) : []),
-      unlisted: () => (heldLine && !trayHeldShown ? held.filter(inSurface) : []),
+      extra: () => (heldLine && heldShown ? held.filter(inSurface) : []),
+      unlisted: () => (heldLine && !heldShown && !isList ? held.filter(inSurface) : []),
       hintShow: (note, n) => {
         note.appendChild(document.createTextNode(" — " + n + (n === 1 ? " held row matches — " : " held rows match — ")));
         const go = el("button", "held-toggle");
@@ -2227,7 +2259,7 @@
       },
       controls: (bar, redraw) => {
         if (isList) bar.after(buildSurfaceChips(listAll(), listNow, (v) => { listSurface = v; redraw(); }));
-        if (heldLine) {
+        if (heldLine && !isList) {
           const line = el("div", "ext-note held-line");
           // the earliest surface date among the held rows: "1 held back until Dec 3"
           const nexts = held.map((h) => String(h.next || "")).filter((d) => /^\d{4}-\d{2}-\d{2}/.test(d)).sort();
@@ -2262,7 +2294,7 @@
         bar.appendChild(sel);
       },
       pick: (rows) => {
-        const all = listNow() ? rows.filter((s) => s.surface === listNow()) : rows;
+        const all = (listNow() ? rows.filter((s) => s.surface === listNow()) : rows).filter((s) => !cardHides(s));
         const ids = views.length && viewOf() ? view.tray_view_rows[viewOf()] : null;
         if (!Array.isArray(ids)) return all;
         const byId = new Map(all.map((s) => [s.id, Object.assign({}, s, { age_shown: true })]));
@@ -2272,6 +2304,11 @@
           .concat(all.filter((s) => !named.has(s.id)).map((s) => byId.get(s.id)));
       },
     } : undefined;
+    if (inCard) {
+      // what the card leaves to the focus view, for its one control (foldRowsAt words it)
+      const n = (g) => (list || []).filter((s) => s.group === g).length;
+      p.dataset.listApart = JSON.stringify({ desk: n("desk"), later: n("later"), held: heldLine ? heldLine.count : 0 });
+    }
     mountSporeFilter(p, list || [], "items", entry.kind, (rows, results) => {
       let lastGroup = null;
       let heldHead = false;
@@ -2352,9 +2389,9 @@
     else p.insertBefore(box, p.firstChild);
   }
 
-  function renderTray(entry, view) {
+  function renderTray(entry, view, opts) {
     const p = renderSporeProjection(entry, view, view.tray,
-      "Nothing yet. Drop a line in the box above and " + (view.entity_name || "the assistant") + " sorts it.", "disposition");
+      "Nothing yet. Drop a line in the box above and " + (view.entity_name || "the assistant") + " sorts it.", "disposition", opts);
     // The intake box is the primary capture affordance (the List's one line) — mounted under the title when
     // writable. A read-only port (mesh) shows the List but offers no box (NO-THEATER). A panel that sends no `surface` on its
     // rows is the old Tray and keeps its dump box.
@@ -2373,7 +2410,9 @@
     row.setAttribute("role", "group");
     row.setAttribute("aria-label", "filter the List by where a row comes from");
     const counts = new Map();
-    for (const s of list) if (s && s.surface) counts.set(s.surface, (counts.get(s.surface) || 0) + 1);
+    // the band chip counts the rows due for the operator, as the panel's header does: the desk's rows and the later ones sit
+    // under their own headings, outside it
+    for (const s of list) if (s && s.surface && !(s.surface === "band" && (s.group === "desk" || s.group === "later"))) counts.set(s.surface, (counts.get(s.surface) || 0) + 1);
     const chips = [];
     const mk = (value, label) => {
       const c = el("button", "rc-chip list-surface-chip", label);

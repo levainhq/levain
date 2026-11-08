@@ -191,6 +191,7 @@
       deliver_to: typeof f.target === "string" && f.target ? f.target : null,
       attention: typeof f.attention === "string" && f.attention ? f.attention : null,
       list_pointer: typeof f.list_pointer === "string" && f.list_pointer ? f.list_pointer : null,
+      later_words: typeof f.band_later_words === "string" && f.band_later_words ? f.band_later_words : null,
       repo: typeof f.repo === "string" && f.repo ? f.repo : null, board_tier: typeof f.board_tier === "string" && f.board_tier ? f.board_tier : null,
     }, t, hidden && hidden.has(row.id) ? { text_locked: HIDDEN_TEXT } : {});
   }

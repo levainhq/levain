@@ -427,10 +427,11 @@ register_ordering(
 def _list_group(row: RowIn, today: date) -> str:
     s = row.facets.get("surface")
     if s == "band":
-        # a row that comes back on a later day is not due, whoever owes it; then the desk's own rows; the rest is needs-you
-        if row.facets.get("held_until"):
-            return "later"
-        return "desk" if row.facets.get("band_section") == "desk" else "band"
+        # the desk's own rows are the desk's whether or not they carry a date (flow's footer files them under DESK OWES); a row of
+        # the operator's that comes back on a later day is LATER; the rest is needs-you
+        if row.facets.get("band_section") == "desk":
+            return "desk"
+        return "later" if row.facets.get("held_until") else "band"
     if s in ("board", "talk"):
         return s
     if row.facets.get("overdue") is True:

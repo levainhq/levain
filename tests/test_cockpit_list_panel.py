@@ -373,8 +373,10 @@ def test_r2_a_snoozed_or_dated_row_sorts_under_later_with_its_day_words_and_is_n
     assert row["facets"]["held_until"] == day and row["group"] == "later", row
     assert row["facets"]["band_later_words"], row["facets"]
     assert p["count"] == before - 1, (before, p["count"])       # a LATER row is not due: the header does not count it
-    _band_with(monkeypatch, rig, dated=day, section="desk")     # a dated desk row is LATER too, not desk owes
+    _band_with(monkeypatch, rig, dated=day, section="you")      # a dated row of the operator's is LATER too
     assert {r["id"]: r for r in rig.panel()["rows"]}[f"band:{rig.q.id}"]["group"] == "later"
+    _band_with(monkeypatch, rig, dated=day, section="desk")     # a dated DESK row stays desk owes, as flow's footer files it
+    assert {r["id"]: r for r in rig.panel()["rows"]}[f"band:{rig.q.id}"]["group"] == "desk"
 
 
 def test_r2_a_desk_owes_row_is_not_counted_either(rig: Rig, monkeypatch: pytest.MonkeyPatch) -> None:
