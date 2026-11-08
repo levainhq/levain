@@ -57,6 +57,7 @@ by ``test_a_recorded_exit_is_never_downgraded_by_a_later_abort_or_terminate``).
 from __future__ import annotations
 
 import base64
+import dataclasses
 import binascii
 import logging
 import re
@@ -77,10 +78,11 @@ from levain.agents import controller as _ctl
 from levain.agents.accounting import ActionExposure, StopResult, Usage
 from levain.agents.session import S1_DISPATCH, WORKSPACE_REFUSED, SessionLaunch, Workspace
 from levain.agents.session_launcher import LauncherRefused
+from levain.agents.signed_role import SIGNED_TEXT_MAX, SignedLink, SignedRole
 from levain.contracts import ContractError, canon
 
 __all__ = ["PROTOCOL", "RUN_FRAME_MAX", "LAUNCHER_NAME", "WAIT_SLICE_S", "WireError", "ProofUnavailable", "LinkRow",
-           "LinkProof", "encode_run_frame", "read_run_frame", "check_run_request", "ok_answer", "refused_answer",
+           "LinkProof", "SignedRole", "SignedLink", "signed_role_of", "signed_link_of", "encode_run_frame", "read_run_frame", "check_run_request", "ok_answer", "refused_answer",
            "launch_to_wire", "launch_from_wire", "usage_to_wire", "usage_from_wire", "link_proof",
            "WS_CHUNK_BYTES", "WS_PARTS", "WsBegin", "ws_begin_to_wire", "ws_begin_from_wire", "ws_chunk_frames",
            "ws_chunk_from_wire",
@@ -247,6 +249,10 @@ class LinkProof:
     store_id: str
     born: LinkRow
     current: LinkRow
+    #: levain 1107 (W2): the spec and role texts the link's ``spec_hash`` pins, for a launch that stages a workspace (the
+    #: server re-derives the role's withhold from them, ``levain.agents.signed_role``). None: the proof carries none,
+    #: which a launch with a workspace is refused for; it travels on the wire only when set.
+    signed: SignedRole | None = None
 
 
 _ROW_KEYS = ("seq", "prev_hash", "record", "signer_fp", "signature")
@@ -256,6 +262,8 @@ _LAUNCH_KEYS = ("occurrence_id", "session_key", "harness", "model", "brief", "au
 _LAUNCH_OPTIONAL = ("workspace",)
 _WORKSPACE_KEYS = ("repo", "head", "withhold")
 _PROOF_KEYS = ("occurrence_id", "spec_hash", "link_id", "store_id", "born", "current")
+_PROOF_OPTIONAL = ("signed",)
+_SIGNED_KEYS = ("agent_id", "spec", "role")
 
 
 def _row_to_wire(r: LinkRow) -> dict[str, object]:
@@ -281,10 +289,11 @@ def launch_to_wire(launch: SessionLaunch, proof: LinkProof) -> dict[str, object]
     ws = launch.workspace
     if ws is not None:         # the manifest digest is the server's own derivation and never travels (Workspace)
         body["workspace"] = {"repo": ws.repo, "head": ws.head, "withhold": list(ws.withhold)}
-    return {"launch": body,
-            "proof": {"occurrence_id": proof.occurrence_id, "spec_hash": proof.spec_hash, "link_id": proof.link_id,
-                      "store_id": proof.store_id, "born": _row_to_wire(proof.born),
-                      "current": _row_to_wire(proof.current)}}
+    wire_proof = {"occurrence_id": proof.occurrence_id, "spec_hash": proof.spec_hash, "link_id": proof.link_id,
+                  "store_id": proof.store_id, "born": _row_to_wire(proof.born), "current": _row_to_wire(proof.current)}
+    if proof.signed is not None:
+        wire_proof["signed"] = {"agent_id": proof.signed.agent_id, "spec": proof.signed.spec, "role": proof.signed.role}
+    return {"launch": body, "proof": wire_proof}
 
 
 def launch_from_wire(request: Mapping[str, object]) -> tuple[SessionLaunch, LinkProof]:
@@ -315,12 +324,21 @@ def launch_from_wire(request: Mapping[str, object]) -> tuple[SessionLaunch, Link
                            _str(lo["harness"], "harness", max_len=64), _str(lo["model"], "model", max_len=256),
                            _str(lo["brief"], "brief", max_len=RUN_FRAME_MAX), _str(lo["auth"], "auth", max_len=32),
                            exposure, workspace)
-    po = _exact(body["proof"], _PROOF_KEYS, "proof")
+    po = _exact(body["proof"], _PROOF_KEYS, "proof", optional=_PROOF_OPTIONAL)
+    signed = None
+    if "signed" in po:
+        so = _exact(po["signed"], _SIGNED_KEYS, "proof.signed")
+        try:
+            signed = SignedRole(_str(so["agent_id"], "signed.agent_id", max_len=64),
+                                _str(so["spec"], "signed.spec", max_len=SIGNED_TEXT_MAX),
+                                _str(so["role"], "signed.role", max_len=SIGNED_TEXT_MAX))
+        except ValueError as exc:
+            raise WireError(str(exc)) from None
     proof = LinkProof(_str(po["occurrence_id"], "proof.occurrence_id", max_len=128),
                       _str(po["spec_hash"], "proof.spec_hash", max_len=128),
                       _str(po["link_id"], "proof.link_id", max_len=128),
                       _str(po["store_id"], "proof.store_id", max_len=128),
-                      _row_from_wire(po["born"], "proof.born"), _row_from_wire(po["current"], "proof.current"))
+                      _row_from_wire(po["born"], "proof.born"), _row_from_wire(po["current"], "proof.current"), signed)
     if proof.occurrence_id != launch.occurrence_id:
         raise WireError("the proof names another occurrence than the launch")
     return launch, proof
@@ -421,9 +439,42 @@ def link_proof(store: Any, cockpit_root: Path | str, occurrence_id: str, *, now:
     current rows read from the cockpit authority log at ``cockpit_root`` after a verified replay
     (:class:`levain.agent_authority.AgentAuthority`); ``now`` (an aware datetime, default the real clock) is a test seam. Raises :class:`ProofUnavailable` for a row with no link, a link
     that is not an agent link of this occurrence's agent and spec hash, or a log that does not read."""
+    from levain.cockpit.firejournal import DB_NAME
+    spec_hash, link_id, store_id, born, current, _grant = _standing_link(store, cockpit_root, occurrence_id, now)
+    rows: dict[int, LinkRow] = {}
+    try:
+        db = sqlite3.connect("file:" + quote(str(Path(cockpit_root) / DB_NAME), safe="/") + "?mode=ro", uri=True,
+                             timeout=5.0)
+        try:
+            for seq in {born, current}:
+                got = db.execute("SELECT seq, prev_hash, record, signer_fp, signature FROM authority_log"
+                                 " WHERE seq = ?", (seq,)).fetchone()
+                if got is None or not all(type(c) is str for c in got[1:]):
+                    raise ProofUnavailable(f"log row {seq} is absent or not text", standing=False)
+                rows[seq] = LinkRow(*got)
+        finally:
+            db.close()
+    except sqlite3.Error as exc:
+        raise ProofUnavailable(f"the authority log rows do not read ({type(exc).__name__})", standing=False) from None
+    return LinkProof(occurrence_id, spec_hash, link_id, store_id, rows[born], rows[current])
+
+
+def signed_link_of(store: Any, cockpit_root: Path | str, occurrence_id: str, *, now: Any = None) -> SignedLink:
+    """The :class:`SignedLink` (``agent_id``, ``spec_hash``, ``role_hash``) of the standing link ``occurrence_id``
+    launched under, from the same verified replay :func:`link_proof` reads: what the operator-uid half derives the
+    signed role's withhold against (L3 W2 r1 HIGH). Raises :class:`ProofUnavailable` as :func:`link_proof` does."""
+    _spec_hash, _link_id, _sid, _born, _current, grant = _standing_link(store, cockpit_root, occurrence_id, now)
+    try:
+        return SignedLink(grant["agent_id"], grant["spec_hash"], grant["role_hash"])
+    except (KeyError, TypeError, ValueError):
+        raise ProofUnavailable("the link names no role", standing=True) from None
+
+
+def _standing_link(store: Any, cockpit_root: Path | str, occurrence_id: str, now: Any) -> tuple:
+    """``(spec_hash, link_id, store_id, born_seq, current_seq, grant)`` of the standing agent link ``occurrence_id``
+    launched under, after a verified replay of the log at ``cockpit_root`` (:func:`link_proof`'s checks)."""
     from levain import authority as _auth
     from levain.agent_authority import AgentAuthority
-    from levain.cockpit.firejournal import DB_NAME
     try:
         with store.read() as conn:
             row = conn.execute("SELECT agent_id, spec_hash, link_id FROM agent_occurrences WHERE occurrence_id = ?",
@@ -451,22 +502,31 @@ def link_proof(store: Any, cockpit_root: Path | str, occurrence_id: str, *, now:
     from datetime import datetime, timezone
     if not _auth.agent_link_arms(state, link_id, now=now or datetime.now(timezone.utc)):
         raise ProofUnavailable("the link is expired or was revoked", standing=True)
-    rows: dict[int, LinkRow] = {}
+    return spec_hash, link_id, sid[0], born, current, grant
+
+
+def signed_role_of(store: Any, occurrence_id: str) -> SignedRole:
+    """The spec and role texts an occurrence launched under, each through its full row check (the spec re-hashes to the
+    occurrence's ``spec_hash``; the role to the hash the spec pins), as the :class:`SignedRole` the run server re-derives
+    the role's withhold from. Raises :class:`ProofUnavailable` (standing: a stored text that fails its check does not
+    heal by waiting) when either is unreadable."""
+    from levain.agents import role as _role, spec as _spec
+    from levain.authority import _canonical
     try:
-        db = sqlite3.connect("file:" + quote(str(Path(cockpit_root) / DB_NAME), safe="/") + "?mode=ro", uri=True,
-                             timeout=5.0)
-        try:
-            for seq in {born, current}:
-                got = db.execute("SELECT seq, prev_hash, record, signer_fp, signature FROM authority_log"
-                                 " WHERE seq = ?", (seq,)).fetchone()
-                if got is None or not all(type(c) is str for c in got[1:]):
-                    raise ProofUnavailable(f"log row {seq} is absent or not text", standing=False)
-                rows[seq] = LinkRow(*got)
-        finally:
-            db.close()
-    except sqlite3.Error as exc:
-        raise ProofUnavailable(f"the authority log rows do not read ({type(exc).__name__})", standing=False) from None
-    return LinkProof(occurrence_id, spec_hash, link_id, sid[0], rows[born], rows[current])
+        signed = _spec.occurrence_spec(store, occurrence_id)
+        with store.read() as conn:
+            row = conn.execute("SELECT agent_id FROM agent_occurrences WHERE occurrence_id = ?",
+                               (occurrence_id,)).fetchone()
+        role = _role.role_by_hash(store, signed["role"]["role_hash"])
+        if row is None or role is None:
+            raise ProofUnavailable("the occurrence's role is not in the agent store", standing=True)
+        return SignedRole(row[0], _canonical(signed), _role.canonical_role(role))
+    except ProofUnavailable:
+        raise
+    except (_spec.SpecError, _role.RoleError, ValueError) as exc:
+        raise ProofUnavailable(f"the signed spec or role does not read ({type(exc).__name__})", standing=True) from None
+    except Exception as exc:  # noqa: BLE001 - a store that does not read proves nothing, and may read next time
+        raise ProofUnavailable(f"the agent store does not read ({type(exc).__name__})", standing=False) from None
 
 
 # --- the authority feed: what the fire SYNCs to the server's replica -----------------------------------------------------
@@ -831,9 +891,13 @@ class DispatchSessionLauncher:
     auth = "passthrough"
 
     def __init__(self, connect: Callable[[], socket.socket], proof_of: Callable[[str], LinkProof],
-                 feed: AuthorityFeed | None = None) -> None:
+                 feed: AuthorityFeed | None = None,
+                 signed_of: Callable[[str], SignedRole] | None = None,
+                 link_of: Callable[[str], SignedLink] | None = None) -> None:
         self._connect = connect
         self._proof_of = proof_of
+        self._signed_of = signed_of   # None: this client can prove no signed role, so it stages no workspace (W2)
+        self._link_of = link_of       # None: no verified link names the role, so it stages no workspace (W2 r1 HIGH)
         self._feed = feed           # None: a server without a replica (its frames carry no ledger_head or bar)
 
     def _claims(self, conn: _Conn, occurrence_id: str, *, bar: bool) -> dict[str, object]:
@@ -868,9 +932,22 @@ class DispatchSessionLauncher:
         ws = launch.workspace
         if ws is None:
             return None
+        from levain.agents.signed_role import SignedRoleRefused, signed_withhold
         from levain.dispatch import stager
         try:
-            return stager.build_upload(ws)
+            signed = self._signed(launch)
+            if self._link_of is None:
+                raise ProofUnavailable("this client holds no signed-link source", standing=True)
+            link = self._link_of(launch.occurrence_id)
+            # the operator-uid half of "refuse on loosening" (np-c9e8a60b (a)): the withhold this snapshot is cut under is
+            # the one the SIGNED role declares, derived from the role's own hash chain against the role the verified link
+            # names (its agent_id and role_hash, not only its spec_hash: L3 W2 r1 HIGH), here and again by the server
+            want = signed_withhold(signed, link)
+        except (ProofUnavailable, SignedRoleRefused) as exc:
+            name = exc.name if isinstance(exc, SignedRoleRefused) else "signed-role-unavailable"
+            raise WorkspaceNotSent(WORKSPACE_REFUSED, f"{name}: {exc}"[:_DETAIL_MAX]) from None
+        try:
+            return stager.build_upload(ws, signed_withhold=want)
         except stager.StageRefused as exc:
             detail = f"{exc.name}: {exc.detail}"[:_DETAIL_MAX]
             if exc.transient:
@@ -879,6 +956,11 @@ class DispatchSessionLauncher:
         except Exception as exc:  # noqa: BLE001 - a sender that broke authorises nothing; the cause is the type only
             _log.warning("the workspace for %s could not be built: %s", launch.session_key, type(exc).__name__)
             raise WorkspaceNotSent(WORKSPACE_REFUSED, f"stage-failed: {type(exc).__name__}") from None
+
+    def _signed(self, launch: SessionLaunch) -> SignedRole:
+        if self._signed_of is None:
+            raise ProofUnavailable("this client holds no signed-role source", standing=True)
+        return self._signed_of(launch.occurrence_id)
 
     def stage_workspace(self, conn: _Conn, launch: SessionLaunch, upload: Any = None) -> None:
         """Upload the launch's workspace snapshot on ``conn``, ahead of LAUNCH on the same connection (levain 34, W1).
@@ -919,6 +1001,12 @@ class DispatchSessionLauncher:
         except ProofUnavailable as exc:
             raise LauncherRefused("link-proof-unavailable", str(exc),
                                   reason_class="standing" if exc.standing else "transient") from None
+        if launch.workspace is not None:     # the signed role rides only a launch that stages a workspace
+            try:
+                proof = dataclasses.replace(proof, signed=self._signed(launch))
+            except ProofUnavailable as exc:
+                raise LauncherRefused("link-proof-unavailable", str(exc),
+                                      reason_class="standing" if exc.standing else "transient") from None
         body = launch_to_wire(launch, proof)
         try:
             # worst-case claims (the largest seq and hash the wire admits), so a body that passes here cannot overflow
@@ -1034,4 +1122,6 @@ def build_launcher(store: Any) -> DispatchSessionLauncher:
     install = read_install(store.directory)
     return DispatchSessionLauncher(unix_connector(default_run_socket()),
                                    lambda occ: link_proof(store, install.cockpit_root, occ),
-                                   AuthorityFeed(store, install.cockpit_root))
+                                   AuthorityFeed(store, install.cockpit_root),
+                                   lambda occ: signed_role_of(store, occ),
+                                   lambda occ: signed_link_of(store, install.cockpit_root, occ))

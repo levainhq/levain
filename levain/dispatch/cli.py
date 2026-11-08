@@ -48,8 +48,13 @@ CONFIGURATION is the operator's too (``levain dispatch config``, the F3 store :m
 ``init`` pins the operator's laptop key as the store's trust root, ``sign`` turns a body file into the next signed
 item (the registry judges the body first, and a body it refuses is refused before any key is touched; the item is
 shown, kind, generation, store, prev and a diff against the active body of its kind, before the touch), ``accept``
-takes an item signed elsewhere, and ``show`` reads the active configuration back. ``init``, ``sign`` and ``accept``
-are refused to an agent, as ``sign`` is; ``show`` is open. :func:`resolvers` reads the template registry and the
+takes an item signed elsewhere, and ``show`` reads the active configuration back. ``request`` and ``accept-approved``
+are the phone path (:mod:`levain.dispatch.phone_config`): ``request`` keeps the next item's bytes and files a phone
+approval request over their hash, and ``accept-approved`` verifies that passkey approval, then has the pinned laptop
+key sign those exact bytes (the touch is the question; the trust root and ``accept`` are unchanged) and judges the
+approval again after the touch, before the store is given the item. Every ``config`` verb but ``show`` (``init``,
+``trust``, ``request``, ``sign``, ``accept``, ``accept-approved``) is refused to an agent, as ``sign`` is; ``show`` is
+open. :func:`resolvers` reads the template registry and the
 provider policy from that store, in one verified read, so a filing resolves through what the operator signed; with
 no store, ``file`` refuses (every contract would be R2, which is never dispatched), and a store that cannot be
 trusted is exit 3 with nothing filed. Under a detected agent, ``file`` refuses ``--data-root`` and ``--dispatch-dir``:
@@ -983,7 +988,8 @@ def _config_fault_not_done(cmd: str, directory: Path) -> str:
                 "it with `levain dispatch config show`")
     if cmd == "trust":
         return "whether root pinned the route trust is not known: run `levain dispatch config trust` again"
-    return f"nothing was {'signed' if cmd == 'sign' else 'accepted'}; the store was not given an item"
+    return (f"nothing was {'filed' if cmd == 'request' else 'signed' if cmd in ('sign', 'accept-approved') else 'accepted'}; "
+            "the store was not given an item")
 
 
 def _sudo_routes_trust(data: bytes, *, replace: bool = False) -> tuple[int, str, str]:
@@ -1079,6 +1085,99 @@ def _trust_line(pin: dict[str, Any]) -> str:
             "dispatch routes are refused until it is. Run `levain dispatch config trust`.")
 
 
+def _config_request(args: argparse.Namespace, d: Path, view_out: Any, emit: Callable[[Any, str], None]) -> int:
+    """``config request``: build the next item of ``kind`` exactly as ``config sign`` would, show it, keep its bytes
+    and file the phone approval request over their hash. Signs nothing and writes nothing to the store."""
+    from levain.dispatch import phone_config as pc
+
+    body = _read_body(args.body)
+    store = _control(args, d)
+    items, top, head = _verified(store)
+    problem = dregistry.body_refusal(args.kind, body, items)
+    if problem is not None:
+        raise dctl.ConfigRefused(f"{args.kind}: {problem}; no request was filed")
+    sid = store.store_id()
+    raw = dctl.item_bytes(args.kind, top + 1, body, datetime.now(timezone.utc), prev=head, store_id=sid)
+    dctl.parse_item(raw)
+    lines, change = _item_view(args.kind, top + 1, sid, sid, head, body, items.get(args.kind))
+    print("\n".join(lines), file=view_out, flush=True)
+    queue = _sign_queue(args)
+    summary = _kind_summary(args.kind, dctl.parse_item(raw), {**items})[1]
+    from levain.consent.sign import SignRefused
+
+    try:
+        rid = pc.file_request(d, queue, raw, change=change, summary=summary)
+    except (ValueError, OSError, SignRefused) as exc:
+        raise dctl.ConfigRefused(f"the approval request could not be filed: {exc}; nothing was filed or kept") \
+            from None
+    why = pc.push_request(queue, rid)
+    emit({"request_id": rid, "generation": top + 1, "kind": args.kind, "pushed": why is None, "push_note": why},
+         f"levain dispatch config: approval request {rid} filed for {args.kind} generation {top + 1} "
+         f"({change}). {'It is on your phone.' if why is None else 'No push (' + str(why) + '): open the cockpit sign page.'} "
+         f"After you approve it there, run `levain dispatch config accept-approved {rid} --signing-key <your laptop "
+         "key>`. Nothing is signed or accepted yet.")
+    return EXIT_OK
+
+
+def _config_accept_approved(args: argparse.Namespace, d: Path, view_out: Any,
+                            emit: Callable[[Any, str], None]) -> int:
+    """``config accept-approved``: verify the phone's approval of a kept item, then sign those exact bytes with the
+    pinned trust-root laptop key (the touch is the question; no y/N, the item printed in full above it), verify the
+    approval AGAIN after the touch (fresh clock, fresh authority replay: a passkey revoked or an approval expired
+    while the touch waited refuses, the signature discarded) and hand the bytes to the unchanged store accept. The
+    kept item is locked from the first read to the accept, so a second run on it is refused before any touch."""
+    from levain.dispatch import phone_config as pc
+
+    store = _control(args, d)
+    queue = _sign_queue(args)
+    keys = _phone_keys(args, d)
+    approval = pc.read_approval(queue, args.request_id, keys=keys)
+    with pc.claimed(d, approval.item_sha256) as raw:
+        parsed = dctl.parse_item(raw)
+        sid = store.store_id()
+        if (parsed.store_id, parsed.kind, parsed.generation, parsed.prev) != (
+                approval.store_id, approval.kind, approval.generation, approval.prev) or parsed.store_id != sid:
+            raise dctl.ConfigRefused("the kept item is not the item (store, kind, generation, prev) the phone "
+                                     "approved; nothing was signed")
+        items, top, head = _verified(store)
+        if (top, head) != (parsed.generation - 1, parsed.prev):
+            raise InputRefused(f"the store is at generation {top}, not {parsed.generation - 1}, since the request "
+                               "was filed: the approval is stale; nothing was signed, file a new request")
+        lines, _change = _item_view(parsed.kind, parsed.generation, parsed.store_id, sid, parsed.prev, parsed.body,
+                                    items.get(parsed.kind))
+        # the item in full, before the signer exists: there is no path to the touch that skips it
+        print("\n".join(lines), file=view_out, flush=True)
+        signer_fp, sign = _signer(args, dctl.CONFIG_NAMESPACE, "config accept-approved")
+        root = store.trust_root()
+        if signer_fp != root:
+            raise InputRefused(f"--signing-key is {signer_fp}, which is not the pinned trust root ({root}): only "
+                               "the root's signature is accepted. Nothing was signed")
+        _head_unmoved(store, top, head, "before the touch", "signed")
+        try:
+            signature = _sign_bytes(sign, raw)
+        except SignerUnavailable as exc:
+            raise _NotDone(exc, _sign_fault_not_done(store, top, head)) from exc
+        # the point of use: the touch can wait up to the signer's timeout, so the approval is judged again now
+        discarded = "the laptop signature was discarded and nothing was accepted"
+        try:
+            again = pc.read_approval(queue, approval.request_id, keys=keys, not_done=discarded)
+        except dctl.ControlStateUnavailable as exc:
+            raise _NotDone(exc, f"{discarded}; generation is still {top}") from exc
+        if again != approval:
+            raise dctl.ConfigRefused(f"the phone approval changed while the touch waited; {discarded}")
+        try:
+            accepted = _accept_guarded(store, raw, signature, top)
+        except dctl.ConfigRefused as exc:
+            raise dctl.ConfigRefused(f"signed but not accepted: {exc}; this signature cannot be used, file a new "
+                                     "request") from None
+        pc.remove_pending(d, approval.item_sha256)
+    emit({"kind": accepted.kind, "generation": accepted.generation, "digest": accepted.digest,
+          "approved_by": approval.signer_fp, "request_id": approval.request_id},
+         f"levain dispatch config: accepted generation {accepted.generation} ({accepted.kind}), {accepted.digest}, "
+         f"approved on the phone ({approval.signer_fp}) and signed by the trust root.")
+    return EXIT_OK
+
+
 def _change_config(args: argparse.Namespace, cmd: str, d: Path, out: Any, emit: Callable[[Any, str], None]) -> int:
     """``config init|trust|sign|accept``; a fault after an item reached the store is a :class:`_NotDone` already."""
     if cmd == "init":
@@ -1099,6 +1198,10 @@ def _change_config(args: argparse.Namespace, cmd: str, d: Path, out: Any, emit: 
               "route_trust": pin}, f"levain dispatch config: {_trust_line(pin)}")
         return EXIT_OK if pin["pinned"] else EXIT_REFUSED
     view_out = sys.stderr if args.json else out
+    if cmd == "request":
+        return _config_request(args, d, view_out, emit)
+    if cmd == "accept-approved":
+        return _config_accept_approved(args, d, view_out, emit)
     if cmd == "sign":
         body = _read_body(args.body)
         store = _control(args, d)
@@ -1153,6 +1256,47 @@ def _change_config(args: argparse.Namespace, cmd: str, d: Path, out: Any, emit: 
     emit({"kind": accepted.kind, "generation": accepted.generation, "digest": accepted.digest},
          f"levain dispatch config: accepted generation {accepted.generation} ({accepted.kind}), {accepted.digest}.")
     return EXIT_OK
+
+
+def _sign_queue(args: argparse.Namespace) -> Path:
+    """The cockpit Signer's queue directory a phone approval is filed in and read from: ``--sign-queue-dir``, else
+    ``$LEVAIN_SIGN_QUEUE_DIR`` or the hook queue's ``sign_queue_dir`` (as the band's sign cards find it)."""
+    from levain.consent.answer_countersign import sign_queue_dir
+
+    if args.sign_queue_dir is not None:
+        got = args.sign_queue_dir.expanduser()
+        if not got.is_absolute():
+            raise InputRefused("--sign-queue-dir must be an absolute path")
+        return got
+    found = sign_queue_dir(os.environ)
+    if found is None:
+        raise InputRefused("no signing queue is named: pass --sign-queue-dir (the cockpit Signer's queue), or set "
+                           "LEVAIN_SIGN_QUEUE_DIR")
+    return found
+
+
+def _phone_keys(args: argparse.Namespace, d: Path) -> Callable[[str], dict[str, Any]]:
+    """``keys(rp_id)``: the active passkeys on site ``rp_id``, read from a fresh replay of the SAME authority log the
+    control store is verified against (so a passkey enrolled in some other cockpit approves nothing here) on every
+    call. The site is the approval message's own signed ``rp`` line, fixed from the queue cockpit's published origin
+    when the request was filed (:func:`levain.dispatch.phone_config.queue_rp`), not read from the cockpit now: a
+    cockpit stopped between the phone tap and the laptop touch withdraws its origin, and the approval still reads
+    back, bound to the site it was filed for."""
+    import sqlite3
+
+    from levain.authority import AuthorityError
+    from levain.consent.answering import passkey_keys
+    from levain.consent.sign import SignRefused
+
+    source = _authority_source(d, args.data_root)
+
+    def keys(rp_id: str) -> dict[str, Any]:
+        try:
+            return {k.fingerprint: k for k in passkey_keys(source(), rp_id)}
+        except (AuthorityError, OSError, sqlite3.Error) as exc:
+            raise SignRefused(f"the cockpit's keys cannot be read now: {exc}", 503) from None
+
+    return keys
 
 
 def _run(args: argparse.Namespace, out: Any) -> int:
@@ -1448,5 +1592,22 @@ def add_parsers(subparsers: argparse._SubParsersAction) -> None:
     ca.add_argument("signature", help="Its SSHSIG signature, as a file.")
     data_root(ca)
     yes(ca)
-    for p in (f, sh, ls, sg, cn, rc, au, ld, ci, cs, ct, cg, ca):
+    qd = lambda p: p.add_argument(  # noqa: E731
+        "--sign-queue-dir", dest="sign_queue_dir", type=Path, default=None,
+        help="The cockpit Signer's queue directory (default: $LEVAIN_SIGN_QUEUE_DIR, or the hook queue's "
+             "sign_queue_dir).")
+    cr = csub.add_parser("request", help="File the next item of a kind for approval on your phone (signs nothing).")
+    cr.add_argument("kind", choices=dctl.KINDS)
+    cr.add_argument("body", help="The item's body as a JSON file, or - for stdin.")
+    qd(cr)
+    data_root(cr)
+    cp = csub.add_parser("accept-approved",
+                         help="After the phone approved a request: sign that item with the laptop trust-root key "
+                              "(a touch, no question) and accept it.")
+    cp.add_argument("request_id", help="The approval request's id, as `config request` printed it.")
+    cp.add_argument("--signing-key", dest="signing_key", type=Path, default=None,
+                    help="The pinned trust-root laptop key (its private key file, or the .pub of a key an agent holds).")
+    qd(cp)
+    data_root(cp)
+    for p in (f, sh, ls, sg, cn, rc, au, ld, ci, cs, ct, cg, ca, cr, cp):
         common(p)

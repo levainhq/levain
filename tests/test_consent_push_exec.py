@@ -731,8 +731,8 @@ def _after_the_check(monkeypatch, plant):
     fetch: the agent writes into its repo once levain has looked."""
     real, calls = push._repo_topology, []
 
-    def hooked(path):
-        out = real(path)
+    def hooked(path, **kw):
+        out = real(path, **kw)
         calls.append(path)
         if len(calls) == 2:
             plant()
@@ -893,3 +893,76 @@ def test_expect_sha_refuses_a_branch_moved_after_the_allow(world):
         push.execute(world.grant, repo_path=world.proj, remote=world.url, branch="claude/x", levain_home=world.lhome,
                      refusal=moved_then_judged, receipt=world.receipts.append, expect_sha=allowed)
     assert world.remote_sha("refs/heads/claude/x") is None and world.receipts == []
+
+
+# --- the hook's deadline bounds every git call (codex L3 batch4b MED 1) ------------------------------------------
+
+def _gone(pid: int, within: float = 5.0) -> bool:
+    end = time.monotonic() + within
+    while time.monotonic() < end:
+        try:
+            os.kill(pid, 0)
+        except ProcessLookupError:
+            return True
+        time.sleep(0.05)
+    return False
+
+
+def test_a_push_stalled_past_the_deadline_is_stopped_reaped_and_recorded(world):
+    """A destination hook that stalls the push: under a deadline git's whole process group is killed at the deadline
+    (the hook's own sleep with it), and the outcome is recorded unknown with the deadline named. Seen red on the old
+    tree: ``execute`` took no deadline, and every ``_git`` kept its 600 s timeout, so this push outlived any hook."""
+    pidfile = world.marks / "stall.pid"
+    hook = world.remote / "hooks" / "pre-receive"
+    hook.write_text(f"#!/bin/sh\necho $$ > {pidfile}\nexec sleep 60\n")
+    hook.chmod(0o755)
+    start = time.monotonic()
+    with pytest.raises(push.PushOutcomeUnknown) as ei:
+        push.execute(world.grant, repo_path=world.proj, remote=world.url, branch="claude/x", levain_home=world.lhome,
+                     refusal=world.refusal, receipt=world.receipts.append, deadline=start + 4)
+    assert time.monotonic() - start < 10
+    assert push._LATE_RAN in ei.value.result.detail and ei.value.result.status == "unknown"
+    assert [r["status"] for r in world.receipts] == ["unknown"]
+    key = push.repo_key(str(world.proj))
+    lines = [json.loads(x) for x in (world.lhome / "push" / f"{key}.journal.jsonl").read_text().splitlines()]
+    assert [(x["state"], x.get("status")) for x in lines] == [("intent", None), ("done", "unknown")]
+    assert _gone(int(pidfile.read_text().strip())), "the stalled hook outlived the deadline"
+    assert world.remote_sha("refs/heads/claude/x") is None
+
+
+def test_a_held_lock_refuses_at_the_deadline_with_nothing_journalled(world):
+    import fcntl
+    key = push.repo_key(str(world.proj))
+    push._private_dir(world.lhome / "push")
+    fd = os.open(world.lhome / "push" / f"{key}.lock", os.O_RDWR | os.O_CREAT, 0o600)
+    fcntl.flock(fd, fcntl.LOCK_EX)
+    try:
+        start = time.monotonic()
+        with pytest.raises(push.PushRefused, match="waiting for the repository's push lock"):
+            push.execute(world.grant, repo_path=world.proj, remote=world.url, branch="claude/x",
+                         levain_home=world.lhome, refusal=world.refusal, receipt=world.receipts.append,
+                         deadline=start + 1)
+        assert time.monotonic() - start < 5
+    finally:
+        os.close(fd)
+    assert world.receipts == [] and not (world.lhome / "push" / f"{key}.journal.jsonl").exists()
+
+
+def test_too_little_time_left_refuses_before_the_intent_line(world, monkeypatch):
+    monkeypatch.setattr(push, "PUSH_FLOOR", 10_000.0)
+    with pytest.raises(push.PushRefused, match="too little of the hook's deadline"):
+        push.execute(world.grant, repo_path=world.proj, remote=world.url, branch="claude/x", levain_home=world.lhome,
+                     refusal=world.refusal, receipt=world.receipts.append, deadline=time.monotonic() + 60)
+    key = push.repo_key(str(world.proj))
+    assert world.receipts == [] and not (world.lhome / "push" / f"{key}.journal.jsonl").exists()
+    assert world.remote_sha("refs/heads/claude/x") is None
+
+
+def test_a_git_call_is_capped_by_the_deadline_and_a_passed_one_never_runs(world):
+    start = time.monotonic()
+    with pytest.raises(push.PushRefused, match="while git ran; git was stopped"):
+        push._git(["git", "-c", "alias.stall=!sleep 60", "stall"], deadline=start + 1)
+    assert time.monotonic() - start < 5
+    with pytest.raises(push.PushRefused, match="before git could run"):
+        push._git(["git", "--version"], deadline=time.monotonic() - 1)
+    assert push._git(["git", "--version"], deadline=time.monotonic() + 30).returncode == 0

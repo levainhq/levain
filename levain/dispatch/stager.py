@@ -17,8 +17,11 @@ which the server cannot, and it shells out to git and the policy store as the op
   commit's bundle and read back into memory. The temp directory is removed whatever happens, before this returns.
   Every refusal is a :class:`StageRefused`, raised before the caller has sent a byte.
 
-W1 stages with an EMPTY withhold (a role-declared ``withhold`` is W2); the NEVER list and the scan stay authoritative
-HERE, where the repo is readable: the server verifies hash identity and the repo layer, and does not repeat either.
+The snapshot's withhold is the SIGNED role's ``ceiling.withhold`` (levain 1107, W2; ``levain.agents.signed_role``): the
+caller derives it from the role's hash chain and passes it as ``signed_withhold``; a workspace member that carries any
+other (fewer patterns: ``withhold-loosened``; others: ``withhold-mismatch``) is refused before git is touched. The
+NEVER list and the scan stay authoritative HERE, where the repo is readable and a role can only withhold more: the
+server verifies hash identity, the signed withhold and the repo layer, and does not repeat the scan.
 """
 from __future__ import annotations
 
@@ -29,6 +32,7 @@ import tempfile
 from dataclasses import dataclass
 
 from levain.agents.session import Workspace, branch_problem
+from levain.agents.signed_role import withhold_problem
 from levain.dispatch import DispatchError
 from levain.dispatch import readset as RS
 from levain.dispatch import snapshot as SN
@@ -125,16 +129,20 @@ def _remove_tree(root: str) -> None:
             _log.error("the workspace temp %s is still there", root)
 
 
-def build_upload(ws: Workspace, *, policy: ProviderPolicy | None = None, tmp_parent: str | None = None) -> Upload:
+def build_upload(ws: Workspace, *, signed_withhold: tuple[str, ...] = (), policy: ProviderPolicy | None = None,
+                 tmp_parent: str | None = None) -> Upload:
     """The upload for ``ws`` (module docstring), or :class:`StageRefused`. ``policy`` is the provider policy whose NEVER
     list applies (default: the operator's active one, :func:`_control_policy`); ``tmp_parent`` is where the private
-    temp directory is made (default: the system temp). The temp directory is gone when this returns or raises."""
+    temp directory is made (default: the system temp). ``signed_withhold`` is the signed role's withhold (default none:
+    a caller that forgot it stages only a member that withholds nothing, and is refused otherwise). The temp directory is
+    gone when this returns or raises."""
     if type(ws) is not Workspace:
         raise StageRefused("workspace-member", "not a workspace member")
     if SN._SHA1.fullmatch(ws.head) is None:                      # Workspace checks it too: this is the bytes' own gate
         raise StageRefused("workspace-head", "the head is not a 40-hex commit sha")
-    if ws.withhold and not WS.W1_WITHHOLD_ALLOWED:
-        raise StageRefused("withhold-not-in-w1", "W1 stages a snapshot with an empty withhold")
+    bad = withhold_problem(tuple(sorted(signed_withhold)), tuple(sorted(ws.withhold)))
+    if bad is not None:
+        raise StageRefused(*bad)
     wrapped = never_policy(policy if policy is not None else _control_policy())
     root = os.path.realpath(tempfile.mkdtemp(prefix="levain-ws-", dir=tmp_parent))      # 0700, ours
     try:
@@ -145,12 +153,14 @@ def build_upload(ws: Workspace, *, policy: ProviderPolicy | None = None, tmp_par
 
 def _build_in(ws: Workspace, policy: ProviderPolicy, root: str) -> Upload:
     try:
-        rs, man = SN.build_snapshot(ws.repo, os.path.join(root, "snapshot"), [], policy=policy, provider=PROVIDER,
+        rs, man = SN.build_snapshot(ws.repo, os.path.join(root, "snapshot"), list(ws.withhold), policy=policy, provider=PROVIDER,
                                     head=ws.head)
     except SN.SnapshotRefused as exc:
         raise StageRefused(exc.name, exc.detail) from None
     if man.head != ws.head:
         raise StageRefused("workspace-head", "the snapshot was cut from another commit than the launch names")
+    if man.withhold != tuple(sorted(ws.withhold)):
+        raise StageRefused("withhold-mismatch", "the snapshot was cut under another withhold than the launch names")
     carried = WS.refused_name_carried(man.entries)
     if carried is not None:
         raise StageRefused(*carried)
