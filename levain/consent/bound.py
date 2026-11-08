@@ -31,6 +31,7 @@ from dataclasses import dataclass
 from typing import Any
 from urllib.parse import urlsplit
 
+from levain.authority import CONSENT_SHELL_TOOLS
 from levain.consent.contained import SANDBOX_ESCAPE_KEY
 
 __all__ = ["AGENT_SENTENCE", "BOUNDS", "CLASSES", "MAX_DENIALS", "MAX_SCAN_CHARS", "BoundRecord",
@@ -40,8 +41,9 @@ BOUNDS: tuple[str, ...] = ("none", "clean", "touched", "unknown")
 CLASSES: tuple[str, ...] = ("write_outside_roots", "agent_config", "network", "process_info", "other")
 MAX_DENIALS = 999
 MAX_SCAN_CHARS = 1_000_000
-# the tools whose `command` is a shell line
-SHELL_TOOLS = frozenset({"Bash", "shell", "exec_command", "shell_command", "local_shell"})
+# the tools whose `command` is a shell line: the consent authority's own list (one source, lowercase, compared
+# case-insensitively), so the two cannot drift
+SHELL_TOOLS = CONSENT_SHELL_TOOLS
 PATCH_TOOL = "apply_patch"     # Codex only
 FETCH_TOOL = "WebFetch"        # Claude Code only
 _TOOL_EVENTS = ("PostToolUse", "PostToolUseFailure")
@@ -184,7 +186,7 @@ def classify(agent: str, event: str, tool_name: Any, tool_input: Any, tool_respo
     try:
         if bound_active is False:
             return _none()
-        shell = isinstance(tool_name, str) and tool_name in SHELL_TOOLS
+        shell = isinstance(tool_name, str) and tool_name.lower() in SHELL_TOOLS
         patch = tool_name == PATCH_TOOL and agent == "codex"
         fetch = tool_name == FETCH_TOOL and agent == "claude_code"
         if not (shell or patch or fetch):
@@ -225,6 +227,6 @@ def classify_payload(agent: str, payload: Any, *, bound_active: bool | None) -> 
 def agent_sentence(record: BoundRecord, tool_name: Any) -> str | None:
     """The one fixed sentence for the agent after a masked shell denial; no path, no command, only a count and class
     names. A WebFetch refusal is already visible to the agent as an error, so it gets none."""
-    if record.bound != "touched" or not isinstance(tool_name, str) or tool_name not in SHELL_TOOLS:
+    if record.bound != "touched" or not isinstance(tool_name, str) or tool_name.lower() not in SHELL_TOOLS:
         return None
     return AGENT_SENTENCE.format(n=record.denials, classes=", ".join(record.classes))
