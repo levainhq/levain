@@ -9,8 +9,8 @@ Field mapping (the worker-attach design, section 5):
 * ``title``: the row's bold span, cut at its first sentence, at most 120 characters.
 * ``done_line``: the text after the row's ``DONE:`` marker, cut at its first sentence, at most 1000 characters.
 * ``tier``: the first ``(tier: <name>`` after the title, when it names a known tier.
-* ``hold``: a prose hold. A row whose title or lead (the text before its first bracketed note) says ``HELD`` or
-  ``ON HOLD`` gets the sentence that says it. The item stays in its category; the reader derives "held" from the
+* ``hold``: a prose hold. A row whose title or lead (the text before its first bracketed note) says ``held`` or
+  ``on hold`` (any case, whole words) gets the sentence that says it. The item stays in its category; the reader derives "held" from the
   field.
 * ``residue``: the band row ids (``np-xxxxxxxx``) the lead names, in order.
 * ``ref``: ``STATUS_1_0.md#<n>@<blob sha>``, the sha being git's blob hash of the row's own line, so it changes
@@ -45,7 +45,7 @@ _SECTION = re.compile(r"## LANE MENU\b")
 _TIER = re.compile(r"\(tier: (\w+)")
 _TIER_NOTE = re.compile(r"^\s*\(tier:[^)]*\)\s*")
 _BAND = re.compile(r"\bnp-[0-9a-f]{8}\b")
-_HOLD = re.compile(r"\b(?:HELD|ON HOLD)\b(?!\s+(?:BACK|BRANCHES)\b)")
+_HOLD = re.compile(r"\b(?:held|on hold)\b(?!\s+(?:back|branches)\b)", re.IGNORECASE)
 _DONE_WORDS = re.compile(r"(?:ON MAIN|LANDED|RELEASED|DONE)\b")
 _DONE_MARK = re.compile(r"\bDONE: ")
 _BOUNDARY = re.compile(r"[.!?](?=\s+[A-Z`*(\[])|[.!?]$")

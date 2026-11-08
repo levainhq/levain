@@ -1457,6 +1457,8 @@ def _run_coord(args: argparse.Namespace, out: Any) -> int:
             return _coord_review(args, out, store)
         if cmd == "ready":
             return _coord_ready(args, out, store)
+        if cmd == "import-status":
+            return _coord_import_status(args, out, store)
         if cmd == "launch":
             from levain.coordinator.launch import launch_session
 
@@ -1779,6 +1781,30 @@ def _coord_ready(args: argparse.Namespace, out: Any, store: EnvelopeStore) -> in
         return 2
     _emit(out, args.json, {"journal_id": f"{rec['id']}@{ver}", "record": rec},
           f"{verb}: {rec['id']} {rec['from_category'] or '-'} -> {rec['to_category']}; journal {rec['id']}@{ver}")
+    return 0
+
+
+def _coord_import_status(args: argparse.Namespace, out: Any, store: EnvelopeStore) -> int:
+    """``levain coord import-status PATH [--repo R]``: read a status file's lane rows into the ready queue. It is the
+    coordinator's write, fenced by the live lease token; without it nothing is read or written and the exit is 1.
+    One line per bucket, with its count and ids."""
+    from levain.coordinator import status_import
+
+    held = None if _no_store(store) else store.coord_lease()
+    if held is None or not held.live or held.token != args.token:
+        print("levain coord import-status: the coordinator lease is not held by this token (levain coord status "
+              "shows the live one); nothing was read or written", file=sys.stderr)
+        return 1
+    try:
+        got = status_import.import_status(store, args.token, args.path, repo=args.repo)
+    except _REFUSED as exc:
+        print(f"levain coord import-status: {exc}", file=sys.stderr)
+        return 2
+    buckets = {"added": got.added, "corrected": got.corrected, "unchanged": got.unchanged, "absent": got.absent,
+               "unparsed": got.unparsed}
+    _emit(out, args.json, buckets,
+          "\n".join(f"{name}: {len(ids)}" + (f" ({', '.join(str(i) for i in ids)})" if ids else "")
+                    for name, ids in buckets.items()))
     return 0
 
 
@@ -2346,6 +2372,17 @@ def add_parsers(subparsers: argparse._SubParsersAction) -> None:
             rdw.add_argument("--repo", required=True, help="The item's repo (fixed at add).")
         ready_leaves.append(rdw)
         door_ok(rdw)      # add, move and correct are the coordinator's write: refused without the live lease token
+    cis = c_sub.add_parser(
+        "import-status", help="Read a status file's lane rows into the ready queue (the coordinator's write).",
+        description="Adds new rows, corrects changed ones and leaves the rest; a second run of an unchanged file "
+                    "writes nothing. Needs --token (the live lease's). Prints one line per bucket: added, corrected, "
+                    "unchanged, absent (in the queue, not in the file) and unparsed (row numbers).")
+    cis.add_argument("path", type=Path, metavar="PATH")
+    cis.add_argument("--repo", default="levain", help="The repo the rows belong to.")
+    cis.add_argument("--token", type=int, default=None, help="The live coordinator lease's token (required).")
+    common(cis)
+    cis.set_defaults(func=run_coord)
+    door_ok(cis)
     chn = c_sub.add_parser("handoff", help="Read the handoffs coordinators left.")
     chn_sub = chn.add_subparsers(dest="handoff_cmd", required=True)
     chs = chn_sub.add_parser("show", help="The latest handoff, or the one named.",

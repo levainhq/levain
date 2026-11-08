@@ -110,3 +110,50 @@ def test_the_section_bounds_the_parse_a_done_title_enters_done_and_a_coordinator
     assert items["levain:row-10"]["declared_category"] == "running" and items["levain:row-10"]["done_line"] == "new finish."
     gone = status_import.import_status(store, token, _file(tmp_path, [_row(9, "DONE 2026-11-08 the shipped thing")]))
     assert gone.absent == ["levain:row-10"]
+
+
+def test_hold_matches_held_and_on_hold_in_any_case_as_whole_words_outside_the_history(board, tmp_path):
+    store, token = board
+    rows = [_row(5, "Lower thing", lead=" this one is held by Phill until Monday."),
+            _row(6, "Upheld thing", lead=" the earlier ruling was upheld and withheld nothing; beholden to none."),
+            _row(7, "Quiet thing", lead=" a plain lead."),
+            _row(8, "Mixed thing", lead=" it is on hold for the plan.")]
+    rows[2] = rows[2].replace("[re-derived", "[re-derived HELD then freed;")
+    status_import.import_status(store, token, _file(tmp_path, rows))
+    assert ready.item_facts(store, "levain:row-5")["hold"] == "this one is held by Phill until Monday."
+    assert ready.item_facts(store, "levain:row-6")["hold"] is None
+    assert ready.item_facts(store, "levain:row-7")["hold"] is None
+    assert ready.item_facts(store, "levain:row-8")["hold"] == "it is on hold for the plan."
+
+
+def _cli(qdir, capsys, *argv):
+    from levain.cli import main
+    code = main(["coord", "import-status", *argv, "--queue-dir", str(qdir)])
+    cap = capsys.readouterr()
+    return code, cap.out, cap.err
+
+
+def test_cli_import_status_prints_a_line_per_bucket_and_a_rerun_adds_nothing(tmp_path, capsys):
+    qdir = tmp_path / "q"
+    qdir.mkdir(mode=0o700)
+    token = CoordStore(qdir).coord_take()
+    path = _file(tmp_path, [_row(1, "First item"), _row(2, "Second item")])
+    code, out, err = _cli(qdir, capsys, str(path), "--token", str(token))
+    assert (code, err) == (0, "")
+    assert out.splitlines() == ["added: 2 (levain:row-1, levain:row-2)", "corrected: 0", "unchanged: 0", "absent: 0",
+                                "unparsed: 0"]
+    code, out, _ = _cli(qdir, capsys, str(path), "--token", str(token))
+    assert code == 0 and out.splitlines()[0] == "added: 0" and "unchanged: 2 (levain:row-1, levain:row-2)" in out
+
+
+def test_cli_import_status_exits_1_and_writes_nothing_without_the_live_lease(tmp_path, capsys):
+    qdir = tmp_path / "q"
+    qdir.mkdir(mode=0o700)
+    store = CoordStore(qdir)
+    token = store.coord_take()
+    path = _file(tmp_path, [_row(1, "First item")])
+    code, out, err = _cli(qdir, capsys, str(path), "--token", str(token + 1))
+    assert (code, out) == (1, "") and "not held" in err
+    code, _, _ = _cli(qdir, capsys, str(path))
+    assert code == 1
+    assert ready.journal(store) == []
