@@ -491,7 +491,9 @@ def test_r4_the_card_holds_due_rows_and_one_control_and_the_focus_view_every_gro
     desk, later = (int(re.search(rf"{w} (\d+)", card["more"][0]).group(1)) for w in ("desk owes", "later"))
     carried = 1       # the carried desk row is in the card's "all" already (it is needs-you) and in the control's desk owes
     assert num(focus["chips"], "all") == num(card["chips"], "all") + (desk - carried) + later, (card, focus)
-    assert len(focus["desk"]) == desk - carried and len(focus["later"]) == later, focus
+    # the control's "desk owes N" is the rows a person sees under Desk owes: the carried row is listed there too, as the footer prints it
+    assert len(focus["desk"]) == desk and len(focus["later"]) == later, focus
+    assert any(t.startswith("desk: carried") for t in focus["desk"]), focus
     assert num(card["chips"], "spores") == num(focus["chips"], "spores"), (card["chips"], focus["chips"])    # live spores only, in both
     assert num(card["chips"], "held") is None, card                                                         # the card draws no held rows: its control names them
     assert num(focus["chips"], "held") == int(re.search(r"(\d+) held", card["more"][0]).group(1)), (card, focus)
@@ -582,3 +584,34 @@ def test_listpanel_r5_a_card_with_only_desk_and_later_rows_says_nothing_is_due_a
     note, hint = out["values"][-4]
     assert "no items match" in note and "in the full list" in note and hint is True, (note, hint)
     assert any(t.startswith("desk: Write the BJ") for t in out["values"][-1]), out["values"][-1]
+
+
+@needs_browser
+def test_lpr3_one_carried_desk_row_only_is_counted_in_the_control_and_listed_under_desk_owes(tmp_path: Path, monkeypatch: Any) -> None:
+    """A carried desk row is needs-you on the card and counted as ONE desk owes in the control; the focus view lists it under Desk owes
+    too, so the number a person reads is the rows they can see there."""
+    root, src, ids = _install(tmp_path)
+    store = SporeStore(root / ".levain" / "memory.spores.json")
+    for sp in store.list_open():
+        store.update(sp["id"], disposition="loop")
+    from levain.consent.questions import QuestionStore
+    QuestionStore(default_queue_dir()).file(agent="claude_code", agent_session_id="s8", what="desk: carried Launch the TAOSERV upgrade seat.",
+                                            options=[("ship", "Ship it"), ("hold", "Hold")], rec="hold", blocks="the upgrade", cwd="/w/taoserv")
+    _host_band(monkeypatch)
+    with _serve(src, write_token=TOKEN, surface_tokens={"browser": TOKEN}, install_class="reported") as (url, _httpd):
+        out = _drive(tmp_path, f"{url}/", [
+            {"emulate": {"w": 390, "h": 844, "dpr": 2, "mobile": True}},
+            *_reload(),
+            {"until": f"{TRAY} && {TRAY}.querySelector('[data-list-more]') && 1"},
+            {"eval": "new Promise(r => setTimeout(() => r(1), 700))"},
+            {"eval": f"{TRAY}.querySelector('[data-list-more]').textContent"},
+            {"eval": f"{TRAY}.querySelector('[data-list-more]').click(); 1"},
+            {"until": "document.querySelector('#levain-modal .modal-body .sp-results .row') && 1"},
+            {"eval": "new Promise(r => setTimeout(() => r(1), 700))"},
+            {"eval": _FOCUS_PROBE},
+        ])
+    control = next(x for x in out["values"] if isinstance(x, str) and "desk owes" in x)
+    focus = json.loads(next(x for x in out["values"] if isinstance(x, str) and x.startswith('{"heads"')))
+    assert "desk owes 1" in control, control
+    assert focus["desk"] and len(focus["desk"]) == 1 and focus["desk"][0].startswith("desk: carried"), focus
+    assert focus["needs"] and focus["needs"][0].startswith("desk: carried"), focus        # and it is still under Needs you

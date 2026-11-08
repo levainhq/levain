@@ -2229,6 +2229,8 @@
     h.setAttribute("aria-level", "3");
     return h;
   }
+  // the heading the kernel gives the List's desk group; a carried desk row's second listing wears it when no desk row sent it
+  const DESK_OWES_TITLE = "Desk owes (the desk is on these; nothing for you)";
   function renderSporeProjection(entry, view, list, emptyMsg, badgeField, ropts) {
     const p = panel(entry);
     // Both projections (Open Loops / Tray) come from ONE dashboard spore read,
@@ -2264,6 +2266,13 @@
     // later ones it names in its control, the focus view's with them). Held rows are never in it, nor in a surface chip: they have
     // their own "held" chip. So the header, the "all" chip and the control's numbers follow from each other.
     const listAll = () => (list || []).filter((s) => !cardHides(s));
+    const withCarriedDesk = (rows) => {
+      const copies = rows.filter((s) => s.group === "band" && s.band_section === "desk" && s.carried)
+        .map((s) => Object.assign({}, s, { group: "desk", group_title: DESK_OWES_TITLE }));
+      if (!copies.length) return rows;
+      const at = rows.findIndex((s) => s.group !== "band");     // Desk owes follows Needs you, ahead of the rows already in it
+      return at < 0 ? rows.concat(copies) : rows.slice(0, at).concat(copies, rows.slice(at));
+    };
     const heldChosen = () => isList && !inCard && listSurface === "held" && !!heldLine;   // the card names its held rows in its control, never draws them
     const listNow = () => (heldChosen() ? "held" : isList && listAll().some((s) => s.surface === listSurface) ? listSurface : "");
     const inSurface = (s) => !listNow() || listNow() === "held" || s.surface === listNow();
@@ -2327,8 +2336,11 @@
         bar.appendChild(sel);
       },
       pick: (rows) => {
-        const all = (listNow() === "held" ? [] : listNow() ? rows.filter((s) => s.surface === listNow()) : rows).filter((s) => !cardHides(s));
+        const base = (listNow() === "held" ? [] : listNow() ? rows.filter((s) => s.surface === listNow()) : rows).filter((s) => !cardHides(s));
         const ids = views.length && viewOf() ? view.tray_view_rows[viewOf()] : null;
+        // the focus view draws a carried desk row under Needs you AND under Desk owes, as flow's footer prints it, so the control's
+        // "desk owes N" is the number of rows a person can see under that heading (a chosen view is ungrouped: no copy there)
+        const all = isList && !inCard && !Array.isArray(ids) ? withCarriedDesk(base) : base;
         if (!Array.isArray(ids)) return all;
         const byId = new Map(all.map((s) => [s.id, Object.assign({}, s, { age_shown: true })]));
         // a row the view did not name still shows, after the named ones
