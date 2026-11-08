@@ -298,6 +298,12 @@ _SIGN_ONE_SUFFIX = ".json"
 # beside a Signer: without one every path here is 404, and the page's revoke button copies the terminal line.
 _GRANT_LIST_PATH = "/cockpit/grant/list.json"
 _GRANT_PREFIX = "/cockpit/grant/"
+# The envelopes' passkey revoke (board row 153), the same ceremony over the coordinator store the Signer's queue names
+# (levain.coordinator.envelope_revoke.EnvelopeRevoke, built by make_server from the Signer, never from the consent
+# reader's directory): GET /cockpit/envelope/list.json and POST /cockpit/envelope/<id>/{revoke-challenge,revoke}, behind
+# the grant routes' gate exactly, and served only beside a Signer.
+_ENVELOPE_LIST_PATH = "/cockpit/envelope/list.json"
+_ENVELOPE_PREFIX = "/cockpit/envelope/"
 # ONESURFACE OS-1: the sign sheet, GET /sign/<id> (a sign request id), a static shell whose one script is /sign.js; what
 # it shows and signs are the routes above. Served only beside a Signer. It alone may be framed, and only by its own
 # origin (the cockpit's overlay, Q2): the one policy http_guards stamps, with frame-ancestors 'self' in place of 'none'.
@@ -1968,6 +1974,8 @@ class _LevainHTTPServer(ThreadingHTTPServer):
     # the grants' passkey revoke (PLAN M17 "9a"), built by make_server from that Signer once it is pinned; None serves no
     # grant route
     grant_phone: "GrantPhone | None" = None
+    # the envelopes' passkey revoke (board row 153), built beside the Signer from its own queue; None serves no route
+    envelope_revoke: "Any" = None
     # the consent family's answer and ruling (OS-2), built by make_server over the Signer's queue whenever a Signer
     # serves; read through `consent_sheet`, which serves it only while the consent reader's queue is that same queue
     _consent_sheet: "ConsentSheet | None" = None
@@ -3434,6 +3442,51 @@ class _Handler(GuardedHandler):
         self._send(json.dumps(payload).encode("utf-8"), "application/json; charset=utf-8", status=status, head=head,
                    headers=hdrs, cache_control="private, no-store")
 
+    def _serve_envelope_list(self, *, head: bool) -> None:
+        """``GET /cockpit/envelope/list.json``: :meth:`EnvelopeRevoke.listing` plus ``origin``, behind the grant listing's
+        gate exactly. Without a Signer, 404."""
+        env = self.server.envelope_revoke
+        hdrs = [("Vary", _WRITE_TOKEN_HEADER)]
+        if env is None:
+            self._send(json.dumps({"error": "not_found", "message": "no such route"}).encode("utf-8"),
+                       "application/json; charset=utf-8", status=404, head=head)
+            return
+        if not self._sign_read_admitted(head=head, what="the envelopes"):
+            return
+        try:
+            payload, status = {**env.listing(), "origin": self.server.signer_page_origin}, 200
+            signer = self.server.signer
+            if signer is not None:
+                try:
+                    payload["credentials"] = signer.key_facts(sorted(
+                        fp for fp in (payload.get("signers") or []) if isinstance(fp, str)))
+                except _CredentialUnavailable:   # RU-5: only the outer catch answers it
+                    raise
+                except Exception as exc:  # noqa: BLE001 - display only: it never costs the listing
+                    _log.warning("the envelopes' key facts were not read: %s: %s", type(exc).__name__, exc)
+                    payload["credentials"] = {}
+        except _CredentialUnavailable:   # RU-5: only the outer catch answers it
+            raise
+        except Exception as exc:  # noqa: BLE001 - listing() says its own faults; anything else is an answer too
+            status, payload = 500, _store_fault("envelope", exc)
+        finally:
+            self.server.request_gate.release()
+        self._send(json.dumps(payload).encode("utf-8"), "application/json; charset=utf-8", status=status, head=head,
+                   headers=hdrs, cache_control="private, no-store")
+
+    def _envelope_post(self, envelope_id: str, action: str, req: Any) -> "tuple[dict[str, Any], int]":
+        """``POST /cockpit/envelope/<id>/<action>``: the EnvelopeRevoke's own reply, or its refusal as
+        ``{error, message}`` with the refusal's status."""
+        from levain.consent.grant_phone import GrantRefused
+
+        env = self.server.envelope_revoke
+        if env is None:     # the route is not served without one; an explicit check survives `python -O`
+            return {"error": "not_found", "message": "no such route"}, 404
+        try:
+            return env.step(envelope_id, action, req), 200
+        except GrantRefused as exc:
+            return {"error": exc.error, "message": exc.message}, exc.status
+
     def _grant_post(self, grant_id: str, action: str, req: Any) -> "tuple[dict[str, Any], int]":
         """``POST /cockpit/grant/<id>/<action>``: the GrantPhone's own reply, or its refusal as ``{error, message}``
         with the refusal's status (the phone port's words)."""
@@ -4635,6 +4688,9 @@ class _Handler(GuardedHandler):
         if path == _GRANT_LIST_PATH:      # the grants' revoke listing rides that gate exactly (PLAN M17 "9a")
             self._serve_grant_list(head=head)
             return
+        if path == _ENVELOPE_LIST_PATH:   # the envelopes' revoke listing, the same gate (board row 153)
+            self._serve_envelope_list(head=head)
+            return
         if path == _PAIR_LIST:            # PAIR RP-4: an AUTHED pair route, a token on every bind
             self._serve_pair_list(head=head)
             return
@@ -5058,6 +5114,8 @@ class _Handler(GuardedHandler):
         compose = route == _SIGN_COMPOSE and (self.server.signer is not None or self.server.compose_signer is not None)
         # and the grants' passkey revoke (PLAN M17 "9a"): the same ceremony class, the same gate
         grant = grant_route(route, _GRANT_PREFIX) if self.server.grant_phone is not None else None
+        # and the envelopes' passkey revoke (board row 153): the same
+        envelope = grant_route(route, _ENVELOPE_PREFIX) if self.server.envelope_revoke is not None else None
         # and the consent family's answer and ruling (OS-2): the same ceremony class, the same gate
         consent = _consent_sign_route(route) if self.server.consent_sheet is not None else None
         # and the dispatch family's sign, cancel and authorise (OS-2): the same ceremony class, the same gate
@@ -5079,7 +5137,7 @@ class _Handler(GuardedHandler):
         if push:
             if not self._push_gate_ok(route):
                 return self._token_403("credential_required")
-        elif (sign is not None or compose or grant is not None or consent is not None or dispatch is not None
+        elif (sign is not None or compose or grant is not None or envelope is not None or consent is not None or dispatch is not None
                 or coord is not None or key_line or desk or thread is not None or room is not None) and not self._off_box_token_valid():
             return self._token_403("credential_required")
         if self._write_token_required() and not (self._push_gate_ok(route) if push else self._off_box_token_valid()):
@@ -5095,6 +5153,7 @@ class _Handler(GuardedHandler):
         # it already covers /action with no change here.
         is_chat = route in _CHAT_POST_ROUTES and self.server.chat_host is not None
         if (not _is_write_route(route) and not is_chat and sign is None and not compose and grant is None
+                and envelope is None
                 and consent is None and dispatch is None and coord is None and not push and not key_line
                 and not desk and thread is None and room is None):
             return self._reject(404, "not_found", "no such route")
@@ -5183,6 +5242,16 @@ class _Handler(GuardedHandler):
                 # the phone's grant ceremony (the passkey's signature is the authority): no read-only refusal applies
                 try:
                     payload, status = self._grant_post(grant[0], grant[1], req)
+                except _CredentialUnavailable:   # RU-5: only the outer catch answers it
+                    raise
+                except Exception as exc:  # noqa: BLE001 — never leak a traceback to the client
+                    payload, status = {"error": "internal", "message": type(exc).__name__}, 500
+                self._send_json(payload, status)
+                return
+            if envelope is not None:
+                # the envelope revoke's ceremony (the passkey's signature, verified here, is the authority)
+                try:
+                    payload, status = self._envelope_post(envelope[0], envelope[1], req)
                 except _CredentialUnavailable:   # RU-5: only the outer catch answers it
                     raise
                 except Exception as exc:  # noqa: BLE001 — never leak a traceback to the client
@@ -6084,6 +6153,11 @@ def make_server(
             # jobs a card lists are read from that store, so no second queue can disagree with it
             httpd.dispatch_sheet = DispatchSheet(sign_queue, signer.rp_id, signer.page_origin, signer)
             httpd.coord_sheet = CoordSheet(sign_queue, signer.rp_id, signer.page_origin, signer)   # and the drop family
+            # and the envelope revoke (row 153) over that same queue's store: where the drops' signed envelopes are
+            # written, whatever the consent reader names (flow's bridge swaps the reader for one with no directory)
+            from levain.coordinator.envelope_revoke import EnvelopeRevoke
+
+            httpd.envelope_revoke = EnvelopeRevoke(sign_queue, signer.rp_id, signer.page_origin, signer.keys)
             # only when the grant cards this page shows come from that same queue (/cockpit/consent/grants.json reads
             # the consent reader's): two queues could name two cockpits whose grants share ids and instances, and a
             # button on one card must never revoke the other's. Different queues: no grant route, the button copies.
