@@ -91,6 +91,23 @@ def _store(args: argparse.Namespace) -> EnvelopeStore:
     return EnvelopeStore(d)
 
 
+def _board_store(args: argparse.Namespace) -> EnvelopeStore:
+    """The store a board verb opens (``coord import-status``, ``coord spawn --item``): ``--queue-dir`` when given, else
+    :func:`levain.coordinator.work_attach.board_store_dir`, the directory ``coord report`` queues into. Never the
+    consent directory by default: board rows do not go into the live ``dispatch.db``."""
+    from levain.coordinator import work_attach
+
+    d = args.queue_dir.expanduser() if args.queue_dir is not None else work_attach.board_store_dir()
+    return EnvelopeStore(d)
+
+
+def _opens_board(args: argparse.Namespace) -> bool:
+    """True for the verbs whose default store is the board store. A spawn with ``--item`` writes its launch and the
+    item's attach in one transaction, so the launch is in the board store too."""
+    cmd = args.coord_cmd
+    return cmd == "import-status" or (cmd == "spawn" and getattr(args, "item", None) is not None)
+
+
 NO_STORE = "no coordinator store here"
 
 
@@ -1407,7 +1424,7 @@ def _run_coord(args: argparse.Namespace, out: Any) -> int:
     try:
         if cmd == "report":          # a seat's verb: it opens no coordinator store and holds no lease
             return _coord_report(args, out)
-        store = _store(args)
+        store = _board_store(args) if _opens_board(args) else _store(args)
         if cmd == "take":
             hold = None
             if args.hold is not None:
@@ -1823,10 +1840,15 @@ def _coord_report(args: argparse.Namespace, out: Any) -> int:
     directory = args.board_store.expanduser() if args.board_store is not None else work_attach.board_store_dir()
     session = args.session or os.environ.get("CLAUDE_CODE_SESSION_ID") or None
     at = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
-    rid, queued = work_attach.queue_report(
-        directory, report_id=args.report_id, item_id=args.item, worker=args.worker, worker_kind=args.kind,
-        event=args.event, at=at, launch_id=args.launch, harness_session_id=session, sha=args.sha, branch=args.branch,
-        why=args.why)
+    try:
+        rid, queued = work_attach.queue_report(
+            directory, report_id=args.report_id, item_id=args.item, worker=args.worker, worker_kind=args.kind,
+            event=args.event, at=at, launch_id=args.launch, harness_session_id=session, sha=args.sha,
+            branch=args.branch, why=args.why)
+    except _REFUSED as exc:
+        # a malformed field or no board directory: one line, exit 2, nothing queued
+        print(f"levain coord report: {' '.join(str(exc).split())}", file=sys.stderr)
+        return 2
     words = (f"queued report {rid} for {args.item}; it is applied when the board store's watcher next runs"
              if queued else f"report {rid} was already queued; nothing was added")
     _emit(out, args.json, {"report_id": rid, "queued": queued, "item": args.item, "store": str(directory)}, words)
@@ -2322,7 +2344,9 @@ def add_parsers(subparsers: argparse._SubParsersAction) -> None:
     csp.add_argument("--parent", default=None, metavar="LAUNCH_ID",
                      help="The active spawned worker asking for this one.")
     csp.add_argument("--item", default=None, metavar="ITEM_ID",
-                     help="The ready item this worker is for: the attach is recorded with the request, or neither is.")
+                     help="The ready item this worker is for: the attach is recorded with the request, or neither is. "
+                          "With it the store is <levain home>/board unless --queue-dir names one, so the launch is "
+                          "asked for there too.")
     csp.add_argument("--agent-store-dir", dest="agent_store_dir", type=Path, default=None, metavar="DIR",
                      help="The role registry's store (default: this Levain home's).")
     csp.add_argument("--token", type=int, required=True, help="Your coordinator lease token.")
@@ -2435,7 +2459,9 @@ def add_parsers(subparsers: argparse._SubParsersAction) -> None:
         "import-status", help="Read a status file's lane rows into the ready queue (the coordinator's write).",
         description="Adds new rows, corrects changed ones and leaves the rest; a second run of an unchanged file "
                     "writes nothing. Needs --token (the live lease's). Prints one line per bucket: added, corrected, "
-                    "unchanged, absent (in the queue, not in the file) and unparsed (row numbers).")
+                    "unchanged, absent (in the queue, not in the file) and unparsed (row numbers: the row shape did "
+                    "not fit, or the store refused the row). The store is <levain home>/board, the board store "
+                    "`coord report` queues into, unless --queue-dir names one; never the consent directory by default.")
     cis.add_argument("path", type=Path, metavar="PATH")
     cis.add_argument("--repo", default="levain", help="The repo the rows belong to.")
     cis.add_argument("--token", type=int, default=None, help="The live coordinator lease's token (required).")

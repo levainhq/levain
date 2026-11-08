@@ -20,7 +20,16 @@ Idempotent: a row whose imported fields already read so writes nothing; a change
 importer owns the text fields only. It never moves an existing item between categories and never reorders it (a
 decision of the coordinator is not undone by a re-import); a new item enters ``ready``, or ``done`` when its title
 leads with a landed word. A row gone from the file is left in the store and named in the result. The importer's id
-map is a parameter (``id_for``); the default is ``levain:row-<n>``.
+map is a parameter (``id_for``); the default is ``levain:row-<n>``. A row the store refuses (a blank title, a hidden
+character) goes into ``unparsed`` by its number and the rest still import.
+
+Known edges (accepted as designed, row 156 round 1):
+
+* A re-import writes the file's ``tier``, ``hold``, ``title`` and ``done_line`` over the store's: the status file is
+  the source for those fields, and a coordinator changes them through the file. Category and rank are never touched.
+* The default ids are row numbers, used on that board as permanent ids; a renumbered file renames nothing.
+* A NEW item enters ``done`` by a title word; an existing item never moves on a re-import.
+* A lease lost part-way through reads as every later row refused, so those rows are named in ``unparsed``.
 """
 from __future__ import annotations
 
@@ -70,7 +79,7 @@ class ImportResult:
     corrected: list[str] = field(default_factory=list)
     unchanged: list[str] = field(default_factory=list)
     absent: list[str] = field(default_factory=list)      # in the store from an earlier import, not in this file
-    unparsed: list[int] = field(default_factory=list)    # numbered lines in the section the row shape did not fit
+    unparsed: list[int] = field(default_factory=list)    # numbered lines the row shape did not fit or the store refused
 
 
 def blob_sha(data: bytes) -> str:
@@ -159,33 +168,43 @@ def _stored(store: CoordStore, repo: str) -> dict[str, dict]:
     return {i["id"]: i for i in ready.list_ready(store, all=True, repo=repo)["items"] if i["repo"] == repo}
 
 
+def _import_row(store: CoordStore, token: int, row: Row, have: dict | None, *, who: str, repo: str) -> str:
+    """Write one row (an add, a correction or nothing) and return its bucket name. Raises the store's CoordError."""
+    why = f"import of {row.ref}"
+    if have is None:
+        ready.add(store, token, row.id, repo=repo, title=row.title, who=who, why=why, to=row.category, tier=row.tier,
+                  done_line=row.done_line, rank=row.n, hold=row.hold, residue=row.residue, ref=row.ref)
+        return "added"
+    facts = ready.item_facts(store, row.id)
+    want = {"title": row.title, "done_line": row.done_line, "tier": row.tier, "hold": row.hold,
+            "residue": row.residue, "ref": row.ref}
+    now = {"title": have["title"], "done_line": have["done_line"], "tier": have["tier"], "hold": facts["hold"],
+           "residue": facts["residue"], "ref": facts["ref"]}
+    if want == now:
+        return "unchanged"
+    ready.correct(store, token, row.id, to=have["declared_category"], who=who, why=why, **want)
+    return "corrected"
+
+
 def import_status(store: CoordStore, token: int, path: str | Path, *, who: str = "status-import",
                   id_for: Callable[[int], str] = default_id, repo: str = "levain") -> ImportResult:
     """Import the numbered lane-menu rows of the status file at ``path`` into ``store`` under the coordinator
     lease ``token``. Returns what was added, corrected, left unchanged and left behind. Idempotent (see the module
-    docstring)."""
+    docstring). A row the store refuses goes into ``unparsed`` by its number and the import goes on, so the result is
+    always returned once the file is read."""
     data = Path(path).read_bytes()
     rows, unparsed = parse_rows(data.decode("utf-8"), id_for=id_for)
     out = ImportResult(unparsed=unparsed)
     stored = _stored(store, repo)
     for row in rows:
-        why = f"import of {row.ref}"
-        if row.id not in stored:
-            ready.add(store, token, row.id, repo=repo, title=row.title, who=who, why=why, to=row.category, tier=row.tier,
-                      done_line=row.done_line, rank=row.n, hold=row.hold, residue=row.residue, ref=row.ref)
-            out.added.append(row.id)
+        try:
+            bucket = _import_row(store, token, row, stored.get(row.id), who=who, repo=repo)
+        except CoordError:
+            # a row the store refuses (a blank title, a hidden character) is named by its number; the rest still import
+            out.unparsed.append(row.n)
             continue
-        have = stored[row.id]
-        facts = ready.item_facts(store, row.id)
-        want = {"title": row.title, "done_line": row.done_line, "tier": row.tier, "hold": row.hold,
-                "residue": row.residue, "ref": row.ref}
-        now = {"title": have["title"], "done_line": have["done_line"], "tier": have["tier"], "hold": facts["hold"],
-               "residue": facts["residue"], "ref": facts["ref"]}
-        if want == now:
-            out.unchanged.append(row.id)
-            continue
-        ready.correct(store, token, row.id, to=have["declared_category"], who=who, why=why, **want)
-        out.corrected.append(row.id)
+        getattr(out, bucket).append(row.id)
+    out.unparsed.sort()
     mine = {row.id for row in rows}
     out.absent = sorted(i for i in stored if i not in mine
                         and str(ready.item_facts(store, i)["ref"] or "").startswith(f"{REF_NAME}#"))
