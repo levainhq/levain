@@ -43,20 +43,24 @@ from levain.coordinator.store import CoordError, CoordStore
 __all__ = ["Delivery", "FEEDS_LOCK", "deliver", "faults", "pass_line", "run", "run_exclusive", "waiting_lines"]
 
 _TEXT = 500
-_NAME_KEPT = 80      # the most of an agent or tool name a SIGN text keeps
-_CWD_KEPT = 120     # the most of a cwd a SIGN text keeps (its tail: the folder nearest the command)
+_NAME_KEPT = 120     # the most of an agent or tool name a SIGN text keeps (a tool name is mcp__<server>__<tool> at most)
+_COMMAND_KEPT = 120  # the command always keeps at least this much: a cwd is cut only past what this leaves
 
 
 def _sign_text(agent: str, tool: str, display: str, cwd: str) -> str:
     """A SIGN reply's text, at most ``_TEXT`` characters: the command first (a waiting line cuts the text short, and the
     command is what is decided on), then the cwd, which a long command never pushes out (L3 codex MED: the same long
-    command run in two folders must not read alike). Each part is cut on its own, with an ellipsis. Known edge: a SIGN
-    filed before this wording keeps its old text (replies are append-only and a re-run finds it by request id)."""
-    where = cwd if len(cwd) <= _CWD_KEPT else "\u2026" + cwd[-(_CWD_KEPT - 1):]
-    head, tail = f"{agent[:_NAME_KEPT]} asks to run {tool[:_NAME_KEPT]}: ", f" (in {where})"   # bounded: head + tail < _TEXT
-    room = max(0, _TEXT - len(head) - len(tail))
+    command run in two folders must not read alike). The cwd is kept whole whenever it fits beside ``_COMMAND_KEPT``
+    characters of command; only a longer one keeps its tail. Known edges: two cwds over ~250 characters sharing that
+    tail, or two tool names sharing their first ``_NAME_KEPT`` characters, read alike; a SIGN filed before this wording
+    keeps its old text (replies are append-only and a re-run finds it by request id)."""
+    head = f"{agent[:_NAME_KEPT]} asks to run {tool[:_NAME_KEPT]}: "
+    cwd_room = _TEXT - len(head) - len(" (in )") - _COMMAND_KEPT
+    where = cwd if len(cwd) <= cwd_room else "\u2026" + cwd[-(cwd_room - 1):]
+    tail = f" (in {where})"
+    room = _TEXT - len(head) - len(tail)          # >= _COMMAND_KEPT by construction
     what = display if len(display) <= room else display[:room - 1] + "\u2026"
-    return (head + what + tail)[:_TEXT]
+    return head + what + tail
 
 
 @dataclass

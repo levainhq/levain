@@ -632,3 +632,12 @@ def test_an_absurd_tool_name_cannot_crowd_out_the_cwd():
     """L3 r2 codex MED / gemini LOW: a 473-char tool name made head + tail exceed _TEXT and the cut ate "/a)"."""
     a, b = (deliver._sign_text("codex", "T" * 473, "ls", cwd) for cwd in ("/a", "/b"))
     assert a != b and a.endswith("(in /a)") and len(a) <= deliver._TEXT
+
+
+def test_a_cwd_that_fits_is_kept_whole_and_every_part_stays_in_bounds():
+    """L3 r3 MEDs: a fixed 120-char cwd tail made /mnt/vol1/... and /mnt/vol2/... read alike though both fit."""
+    c1, c2 = ("/mnt/vol%d/" % i + "x" * 200 + "/repo" for i in (1, 2))
+    a, b = (deliver._sign_text("seat", "Bash", "git push origin main", c) for c in (c1, c2))
+    assert a != b and a.endswith(f"(in {c1})") and len(a) <= deliver._TEXT
+    worst = deliver._sign_text("a" * 999, "t" * 999, "d" * 9999, "/" + "c" * 9999)
+    assert len(worst) <= deliver._TEXT and worst.count("d") >= deliver._COMMAND_KEPT - 1 and worst.endswith("c)")
