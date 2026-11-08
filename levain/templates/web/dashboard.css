@@ -935,8 +935,10 @@
   /* OPAQUE to its own bottom edge (matches the .modal card-top var(--card-2)) so scrolled
      rows pass cleanly UNDER the pinned bar — a translucent tail let the first episode
      bleed through (the operator's visual gate + L2 MED-2). Matches the grid bar's opaque rule. */
-  .modal-body .ep-search { position: sticky; top: 0; z-index: 2; margin: 0 0 var(--sp-3);
-    padding: var(--sp-2) 0 var(--sp-4); background: var(--card-2); }
+  .modal-body .ep-search { position: sticky; top: calc(var(--sp-1) * -1); z-index: 2; margin: calc(var(--sp-1) * -1) 0 var(--sp-3);
+    padding: calc(var(--sp-2) + var(--sp-1)) 0 var(--sp-4); background: var(--card-2); }
+  /* the body pads its content edge, and a sticky bar pins at that edge: the bar reaches up over the padding so no row
+     scrolls visibly in the strip above it (the padding it gives back keeps the field where it was) */
   .modal-body .ep-search-input { flex-basis: 280px; font-size: var(--fs-lead); padding: var(--sp-3) var(--sp-4); }
   .modal-body .ep-search-status { font-size: var(--fs-micro); }
 

@@ -344,3 +344,46 @@ def test_listfix2_one_pill_one_listener_and_known_origins_only(tmp_path: Path) -
     assert vals[3]["ph"].startswith("@mon 9am call X · "), vals[3]                 # narrow at 390
     assert vals[4]["ph"].startswith("@mon 9am call X  ·  "), vals[4]               # wide again after the width change
     assert not bad, bad
+
+
+# --- listpanel (levain 73, key 1108-37): the focus view's sticky filter bar is solid; the panel's held toggle shows the held rows ---
+
+_BAR_PROBE = """(() => {
+  const mb = document.querySelector('#levain-modal .modal-body');
+  const bar = mb && mb.querySelector('.ep-search');
+  if (!bar) return JSON.stringify({err: 'no bar'});
+  const cs = getComputedStyle(bar);
+  // a colour with an alpha channel names it after a "/" (oklch, color-mix) or as the 4th rgba part; none named is opaque
+  const m = /(?:\\/\\s*|rgba\\([^,)]*,[^,)]*,[^,)]*,\\s*)([0-9.]+%?)/.exec(cs.backgroundColor);
+  const alpha = m ? (m[1].endsWith('%') ? parseFloat(m[1]) / 100 : parseFloat(m[1])) : 1;
+  return JSON.stringify({bg: cs.backgroundColor, alpha,
+    pos: cs.position, bottom: cs.borderBottomWidth, scrolled: mb.scrollTop, max: mb.scrollHeight - mb.clientHeight,
+    gap: bar.getBoundingClientRect().top - mb.getBoundingClientRect().top, pad: getComputedStyle(mb).paddingTop});
+})()"""
+
+
+@needs_browser
+def test_listpanel_141_the_focus_views_sticky_filter_bar_is_opaque(tmp_path: Path) -> None:
+    root, src, _ids = _install(tmp_path)
+    _seed_more(root)
+    _seed_phone(root)
+    shots = Path(os.environ.get("LEVAIN_LIST_SHOTS") or tmp_path)
+    shots.mkdir(parents=True, exist_ok=True)
+    with _serve(src, write_token=TOKEN, surface_tokens={"browser": TOKEN}, install_class="reported") as (url, _httpd):
+        out = _drive(tmp_path, f"{url}/", [
+            {"emulate": {"w": 390, "h": 844, "dpr": 3, "mobile": True}},
+            *_reload(),
+            {"until": f"{TRAY} && {TRAY}.querySelectorAll('.sp-results .row[data-surface=band]').length > 1 && 1"},
+            {"eval": f"{TRAY}.querySelector('.pexpand').click(); 1"},
+            {"until": "document.querySelector('#levain-modal .modal-body .sp-results .row') && 1"},
+            {"eval": "new Promise(r => setTimeout(() => r(1), 900))"},       # the dialog's fade settles before anything is read or shot
+            {"eval": "(() => { const mb = document.querySelector('#levain-modal .modal-body'); mb.scrollTop = Math.floor((mb.scrollHeight - mb.clientHeight) / 2); return 1; })()"},
+            {"eval": _BAR_PROBE},
+            {"shot": str(shots / "listpanel_141_after.png")},
+        ])
+    got = json.loads(next(x for x in out["values"] if isinstance(x, str) and x.startswith("{") and "pos" in x or isinstance(x, str) and "err" in x))
+    assert "err" not in got, got
+    assert got["pos"] == "sticky", got
+    assert got["max"] > 0 and got["scrolled"] > 0, got                 # rows really pass under the bar
+    assert got["alpha"] == 1 and got["bg"] != "rgba(0, 0, 0, 0)" and got["bg"] != "transparent", got
+    assert got["gap"] <= 0.5, got                                      # and it pins flush: no strip above it where a row shows
