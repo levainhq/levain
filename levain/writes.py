@@ -2024,7 +2024,8 @@ def _apply_spore_set_disposition(
 
     spore_id = _require_str(req, "spore_id")
     disposition = req.get("disposition")
-    # exact names only: a retired name reaches the echo-or-refuse check below, any other spelling stops here
+    # exact names only: a retired name reaches the echo-or-refuse check below (an echo is then left
+    # out of the write), any other spelling stops here
     if disposition not in WRITE_DISPOSITIONS and disposition not in RETIRED_DISPOSITIONS:
         raise EditError(
             "bad_verb_arg", 422,
@@ -2121,6 +2122,10 @@ def _apply_spore_set_disposition(
         "disposition": anneal_disposition,
         "expect_disposition": prior_raw if snapshot is _NO_CAS else snapshot,
     }
+    if disposition in RETIRED_DISPOSITIONS:
+        # past the refusal above, a retired name here is the row's own value: leave it out of the
+        # write (the store refuses every retired value it is handed); the CAS still pins it
+        del update_kwargs["disposition"]
     if set_next:
         update_kwargs["next"] = next_value  # None ⇒ clear (incl. the →note force-clear); a date ⇒ set — SAME atomic write
     try:

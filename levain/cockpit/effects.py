@@ -473,7 +473,8 @@ class SporeEffectStore:
         """The ``SporeApply`` for one concrete effect: the op from its shape, ``args`` from its
         ``changes``, and the postcondition leaves anneal requires (add/update: the fields in
         ``args``; descend: ``status`` + ``resolution.kind``; ascend: those + ``resolution.ref``;
-        delete: none)."""
+        delete: none). An update leaves out a disposition it does not change; ``None`` when that leaves
+        nothing to write."""
         from anneal_memory.spores import SporeApply
 
         key = _origin_key_of(effect.resource_key)
@@ -504,12 +505,13 @@ class SporeEffectStore:
         stray = sorted(set(changes) - set(SPORE_UPDATE_FIELDS))
         if not changes or stray:
             raise PermanentApplyRefusal(f"an update changes {list(SPORE_UPDATE_FIELDS)} only (got {sorted(changes)})")
-        args = dict(changes)
-        if changes.get("disposition") and "disposition" not in effect.writes:
-            # an echo of the stored disposition: say so as a CAS, so anneal proves it under its lock
-            # (the guarded store passes an echo of a legacy handoff/note on nothing else)
-            args["expect_disposition"] = changes["disposition"]
-        return SporeApply(op="update", origin_key=key, args=args, postcondition=dict(changes), **guard)
+        if "disposition" in changes and "disposition" not in effect.writes:
+            # the disposition the row already holds is not written (the guarded store refuses a legacy
+            # handoff/note it is handed, unchanged or not); expected_version still pins the row
+            del changes["disposition"]
+            if not changes:
+                return None   # writes nothing: apply_unit answers it as anneal would
+        return SporeApply(op="update", origin_key=key, args=dict(changes), postcondition=dict(changes), **guard)
 
     def apply_unit(self, unit: ApplyUnit) -> UnitApplyResult:
         from anneal_memory.spores import ApplyRefused, PostconditionFailed, SporeError
@@ -522,6 +524,13 @@ class SporeEffectStore:
         # makes the file); for any other effect a missing file is a definite absence
         if not effect.is_create and (not self.path.parent.is_dir() or not self.path.exists()):
             raise StoreGone(f"{self.path} is absent")
+        if spore_apply is None:
+            # an update whose one field, the disposition, is the row's own: nothing to write. anneal's
+            # answer to such an effect: ALREADY while the row still holds it, else the row changed
+            row = self.snapshot(effect.resource_key).row
+            if row is not None and _stored_authority(row, "disposition") == _stored_authority(effect.changes, "disposition"):
+                return UnitApplyResult(ApplyOutcome.ALREADY, (MemberApply(row.get("id"), row),))
+            return UnitApplyResult(ApplyOutcome.PRECONDITION_LOST, (MemberApply(None if row is None else row.get("id"), row),))
         try:
             res = self._store.apply(spore_apply)
         except (PostconditionFailed, ApplyRefused) as exc:
@@ -548,21 +557,23 @@ def _norm(value: Any) -> str:
 
 def _norm_disposition(value: Any, current: Any = None) -> str | None:
     """``current``: the stored disposition. A retired value is refused only as a CHANGE: an echo of a
-    legacy row's own retired value leaves it as it was. Any other invalid value (None included) is
-    refused as not one of the write set (``WRITE_DISPOSITIONS``)."""
+    legacy row's own retired value (in any spelling anneal persists as it) is accepted, and
+    ``SporeEffectStore.spore_apply`` leaves it out of the write. Any other invalid value (None
+    included) is refused as not one of the write set (``WRITE_DISPOSITIONS``)."""
     from levain.spores import (
         LOOP_DISPOSITION,
         WRITE_DISPOSITIONS,
         RetiredDisposition,
         refuse_retired_disposition,
         retired_message,
+        stored_disposition,
     )
 
     try:
         refuse_retired_disposition(value, current)
     except RetiredDisposition as exc:
         raise ValueError(str(exc)) from exc
-    if value not in WRITE_DISPOSITIONS and not (value == current and retired_message(value) is not None):
+    if value not in WRITE_DISPOSITIONS and not (stored_disposition(value) == current and retired_message(value) is not None):
         raise ValueError(f"disposition must be one of {list(WRITE_DISPOSITIONS)} (got {value!r})")
     return None if value == LOOP_DISPOSITION else _norm(value)
 

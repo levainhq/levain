@@ -90,8 +90,8 @@ VALID_DISPOSITIONS = (LOOP_DISPOSITION,) + NON_COGNITION_DISPOSITIONS
 WRITE_DISPOSITIONS = (LOOP_DISPOSITION,) + TRAY_WRITE_DISPOSITIONS
 
 RETIRED_HANDOFF_MSG = (
-    "handoff is retired: ask the operator with `levain ask` (or `--on <date>` for later), "
-    "or put the work on the board"
+    "handoff is retired: ask the operator now with `levain ask`, "
+    "or record a seed, or an agenda with a date, in the Tray"
 )
 RETIRED_KEEP_NOTE_MSG = (
     "the Keep is retired: a fact or command goes to memory (Durable Facts), "
@@ -127,27 +127,24 @@ def retired_message(value: Any) -> str | None:
 
 def refuse_retired_disposition(value: Any, current: Any = None) -> None:
     """TS-1, the write seams' early refusal (a clean 422 before the store is touched). A retired value
-    is refused unless ``current`` already holds its persisted form. ``current`` here is an unlocked
-    read, so this is never the authority: the store guard is (:func:`guarded_spore_store`), and it
-    passes an echo only on a CAS. An undo that RESTORES a retired value is a change, so it is refused."""
+    is refused unless ``current`` already holds its persisted form: an echo, which the seam must then
+    DROP from its write (the store guard, :func:`guarded_spore_store`, refuses every retired value it is
+    handed). An undo that RESTORES a retired value is a change, so it is refused."""
     msg = retired_message(value)
     if msg is not None and stored_disposition(value) != current:
         raise RetiredDisposition(msg)
 
 
-def _refuse_unwritable(value: Any, cas: Any) -> None:
-    """THE store rule, one bound for every writer. The disposition is judged as anneal will PERSIST
-    it, against the write set (an allow-list, so no spelling of a retired or unknown value slips
-    through). A value outside the set passes only as a provable non-change: ``cas`` (the call's own
-    ``expect_disposition``, which anneal compares under its lock before writing) equals it. There is
-    no fallback read: without that CAS it is refused."""
+def _refuse_unwritable(value: Any) -> None:
+    """THE store rule, one bound for every writer: a disposition a write NAMES is judged as anneal will
+    persist it, against the write set (an allow-list, so no spelling of a retired or unknown value slips
+    through). Anything else is refused, always: there is no echo. A caller that leaves a legacy row's
+    disposition as it is omits the field."""
     if not isinstance(value, str):
         return   # absent / an explicit _UNSET / None (a clear); a non-str anneal refuses itself
     stored = stored_disposition(value)
     if not stored or stored in WRITE_DISPOSITIONS:
         return   # "" / whitespace is a clear, as anneal stores it
-    if isinstance(cas, str) and cas == stored:
-        return
     raise RetiredDisposition(
         retired_message(stored)
         or f"disposition must be one of {list(WRITE_DISPOSITIONS)} (got {value!r})")
@@ -161,9 +158,8 @@ def guarded_spore_store(path: Any) -> Any:
     """An anneal ``SporeStore`` that will not SET a disposition outside ``WRITE_DISPOSITIONS``
     through ``add``, ``update`` or ``apply`` (a planned cockpit effect that deserialized after an
     upgrade included), so no writer (``apply_edit``, the cockpit effects, a CLI, a migration) can
-    route around the retirement. Legacy rows still read. An update that leaves a legacy value
-    unchanged must say so with ``expect_disposition`` equal to it; a retried ``add`` of a key that
-    already exists returns that row, as anneal's own ``add`` does."""
+    route around the retirement. Legacy rows still read, and an update that does not name
+    ``disposition`` edits one freely."""
     global _GUARDED
     with _GUARDED_LOCK:
         if _GUARDED is None:
@@ -177,43 +173,19 @@ def _build_guarded_class() -> Any:
     class GuardedSporeStore(SporeStore):  # type: ignore[misc]
         # keyword-only, as anneal's own add/update are: a positional disposition cannot exist
         def add(self, **kw: Any) -> Any:
-            try:
-                _refuse_unwritable(kw.get("disposition"), None)   # a create has no prior value to echo
-            except RetiredDisposition:
-                key = kw.get("origin_key")
-                # anneal's add is idempotent by key: a retry of a create that already landed returns
-                # that row. Nothing is written here, and a keyed row never leaves the store's record
-                existing = self.get_by_origin_key(key) if key is not None else None
-                if existing is not None:
-                    return existing
-                raise
+            _refuse_unwritable(kw.get("disposition"))
             return super().add(**kw)
 
         def update(self, spore_id: str, **kw: Any) -> Any:
-            _refuse_unwritable(kw.get("disposition"), kw.get("expect_disposition"))
+            _refuse_unwritable(kw.get("disposition"))
             return super().update(spore_id, **kw)
 
         def apply(self, effect: Any) -> Any:
-            op = getattr(effect, "op", None)
-            if op not in ("add", "update"):
-                return super().apply(effect)
-            try:
-                args = dict(getattr(effect, "args", None) or {})
-                # only an update takes expect_disposition (anneal refuses it on an add)
-                _refuse_unwritable(args.get("disposition"), args.get("expect_disposition") if op == "update" else None)
-            except RetiredDisposition as exc:
-                if op == "add":
-                    try:
-                        landed = self.get_by_origin_key(effect.origin_key) is not None
-                    except (ValueError, TypeError) as key_exc:
-                        raise ApplyRefused(str(key_exc)) from key_exc
-                    if landed:
-                        # the create already landed; a keyed row stays in the store (open, resolved
-                        # or the deleted registry), so anneal reports ALREADY and never creates
-                        return super().apply(effect)
-                raise ApplyRefused(str(exc)) from exc
-            except (ValueError, TypeError) as exc:   # malformed args: the base store's contract
-                raise ApplyRefused(str(exc)) from exc
+            if getattr(effect, "op", None) in ("add", "update"):
+                try:
+                    _refuse_unwritable(dict(getattr(effect, "args", None) or {}).get("disposition"))
+                except (ValueError, TypeError) as exc:   # RetiredDisposition, or malformed args: the base contract
+                    raise ApplyRefused(str(exc)) from exc
             return super().apply(effect)
 
     return GuardedSporeStore
