@@ -22,7 +22,8 @@
 // The page passes:
 //   o.words        the textarea of the person's words (the page owns it); o.wordsGroup: draw it inside a "Your words" group here
 //   o.left, o.right  where the groups go (the same element for one column)
-//   o.launches     true only on the cockpit's own modal: draws the off-by-default "Launch seats" toggle (never on the phone)
+//   o.launches     the server's coord_may_launch for this request's credential (web_server _coord_may_launch): draws the
+//                  off-by-default "Launch seats" toggle only where the server would take it
 //   o.repos        the known folders; setRepos() takes a later listing
 //   o.review({words, spec})  a promise of {ok, status, body}, the server's reading (body.view, body.stop_at); o.why(reply): its refusal in words
 //   o.storeId()    the store identity the page holds now, or null on a fresh install; o.refreshStore(): a promise, the page re-reads it
@@ -49,7 +50,7 @@
     long:     { label: "Long",     stop: "24h", hours: 8, tool_calls: 2500, tokens: 25000000 },
   };
   // the launch grant's bounds (levain/coordinator/envelope.py's LAUNCH_DEFAULT and LAUNCH_MAX): a bigger count is refused there
-  const LAUNCH_DEFAULT = 2, LAUNCH_MAX = 4;
+  const LAUNCH_DEFAULT = 2, LAUNCH_MAX = 12;
   const STOPS = ["1h", "2h", "4h", "8h", "12h", "24h"];
   // the server's bounds on each budget count (levain/coordinator/envelope.py's BUDGET_MAX): a bigger number is refused there, so it is not asked for here
   const BUDGET_MAX = { tool_calls: 100000, tokens: 1000000000, hours: 24 };
@@ -267,7 +268,7 @@
     onto.addEventListener("input", () => changed());
 
     // ---- launching seats: a signed standing grant, OFF by default, offered only where the page passes o.launches (the
-    // cockpit's own modal; the phone's sheet never sets it, and the server refuses the key from any device but the cockpit) ----
+    // server's coord_may_launch for this credential, the same test its review applies to the launches key) ----
     const gLaunch = o.launches ? group("env-launch", "Launching seats", "Off: the desk asks you before it starts a seat. On: it may start up to this many seats in the folder above, until the hard stop, without asking again.") : null;
     let launchOn = null, launchCount = null;
     if (gLaunch) {

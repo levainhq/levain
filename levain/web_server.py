@@ -869,10 +869,11 @@ _COORD_SHEET = "/sign/drop"
 # The phone's coordinator routes take a drop from a PAIRED DEVICE only (its token's device id is handed to CoordPhone.step,
 # which binds a kept envelope review to it). The cockpit's gate takes a surface token OR a paired device's token, so the
 # device a step runs as is read from the request's AUTHENTICATED credential (_coord_device), never fixed: a paired device
-# runs as its own id ("d-" + hex, never this name), and only the cockpit page's own surface token ("browser") runs as this
-# one name, "this cockpit's page"; another surface runs as "surface:<name>" (L3 r1: a fixed label let a paired phone set
-# the launch grant only the cockpit may; L3 r2: so could any other surface's token).
-_COORD_DEVICE = "cockpit"          # == levain.coordinator.phone.COCKPIT_DEVICE (the one device that may add a launch grant)
+# runs as its own id ("d-" + hex, never the name below), and only the cockpit page's own surface token ("browser") runs as this
+# one name, "this cockpit's page"; another surface runs as "surface:<name>" (L3 r2: a fixed label let any surface's token
+# run as the cockpit). Who may add a launch grant is _Handler._coord_may_launch: the cockpit page, and a paired device
+# whose pairing chain starts at the cockpit page (Phill 2026-11-08, row 460), never another surface's token or its devices.
+_COORD_DEVICE = "cockpit"          # == levain.coordinator.phone.COCKPIT_DEVICE
 
 
 def _coord_route(route: str) -> "str | None":
@@ -921,7 +922,7 @@ class CoordSheet:
         return (f"an envelope signature verifies only when signed on https://{self.rp_id} (no port), and this cockpit is "
                 f"served on {self.page_origin}: sign it on that page or from the terminal")
 
-    def step(self, action: str, req: Any, *, device: "str | None") -> "dict[str, Any]":
+    def step(self, action: str, req: Any, *, device: "str | None", may_launch: bool = False) -> "dict[str, Any]":
         """``POST /cockpit/coord/<action>``: :meth:`CoordPhone.step`'s reply (a challenge's also carries ``line``, the exact
         text signed). ``device`` is the authenticated device the request runs as (the handler's ``_coord_device``).
         :class:`levain.coordinator.phone.CoordRefused` with the phone port's status, word and words."""
@@ -940,7 +941,7 @@ class CoordSheet:
                 raise CoordRefused(503, "closing", "the cockpit is shutting down; nothing was delivered")
             self._running += 1
         try:
-            out = self.phone.step(action, req, device=device)
+            out = self.phone.step(action, req, device=device, may_launch=may_launch)
         finally:
             with self._gate:
                 self._running -= 1
@@ -3430,7 +3431,7 @@ class _Handler(GuardedHandler):
     def _serve_coord_sheet(self, *, head: bool) -> None:
         """``GET /cockpit/coord/drops.json`` (OS-2): the drop sheet's read, ``{coord_drops, coord_store_id, coord_repos,
         coord_signers, coord_note, ..., credentials, origin, rp_id}`` (:meth:`CoordSheet.listing`), behind the sign listing's
-        gate exactly. Without a coord sheet, 404 ``not_found``."""
+        gate exactly, plus ``coord_may_launch`` for this request's credential. Without a coord sheet, 404 ``not_found``."""
         sheet = self.server.coord_sheet
         hdrs = [("Vary", _WRITE_TOKEN_HEADER)]
         if sheet is None:
@@ -3446,6 +3447,9 @@ class _Handler(GuardedHandler):
             except Exception:  # noqa: BLE001 - display facts only
                 credentials = {}
             payload.update(credentials=credentials, origin=self.server.signer_page_origin, rp_id=sheet.rp_id)
+            # the one cockpit test, for THIS request's credential: the page draws the launch toggle exactly where the
+            # envelope-review would take it
+            payload["coord_may_launch"] = self._coord_may_launch(self._coord_device())
             status = 200
         except _CredentialUnavailable:   # RU-5: only the outer catch answers it
             raise
@@ -3465,15 +3469,16 @@ class _Handler(GuardedHandler):
         if sheet is None:      # the route is not served without one; an explicit check survives `python -O`
             return {"error": "not_found", "message": "no such route"}, 404
         try:
-            return sheet.step(action, req, device=self._coord_device()), 200
+            device = self._coord_device()
+            return sheet.step(action, req, device=device, may_launch=self._coord_may_launch(device)), 200
         except CoordRefused as exc:
             return {"error": exc.error, "message": exc.message}, exc.status
 
     def _coord_device(self) -> "str | None":
         """The device a coord step runs as, from the credential verified in ``_credential`` (never anything the client
         says): a paired device's own id; ``_COORD_DEVICE`` for the cockpit page's own surface token (``browser``) and
-        for no other; ``surface:<name>`` for any other surface's token, a device that is not the cockpit and so never
-        sets a launch grant. None (CoordPhone refuses it, 403) for a request with no credential (``_credential``
+        for no other; ``surface:<name>`` for any other surface's token, which never sets a launch grant
+        (:meth:`_coord_may_launch`). None (CoordPhone refuses it, 403) for a request with no credential (``_credential``
         answers class ``none``; where one cannot be read now it raises ``_CredentialUnavailable``, the outer 503) and
         for a paired name with no id after the prefix."""
         cred = self._credential(required=True)
@@ -3483,6 +3488,26 @@ class _Handler(GuardedHandler):
         if name.startswith(PAIRED_PREFIX):
             return name[len(PAIRED_PREFIX):] or None
         return _COORD_DEVICE if name == "browser" else f"surface:{name}"
+
+    def _coord_may_launch(self, device: "str | None") -> bool:
+        """THE one cockpit test for a launch grant (Phill 2026-11-08, row 460), read by the drop listing
+        (``coord_may_launch``, so the page draws the toggle exactly where it is taken) and handed to the spec check: the
+        cockpit page's own token, or a paired device whose pairing chain starts at that token
+        (:meth:`~levain.cockpit.firejournal.CockpitDB.pairing_root` == ``browser``), so his cockpit on his phone
+        qualifies and a device another surface paired (L3 r1 codex HIGH: any surface may mint a pairing offer) does not.
+        Any fault reading the lineage is False: a lineage that cannot be read grants nothing."""
+        if device == _COORD_DEVICE:
+            return True
+        if not isinstance(device, str) or device.startswith("surface:"):
+            return False
+        broker = self.server.broker
+        try:
+            db = broker.active_db() if broker is not None else None
+            return db is not None and db.pairing_root(device) == "browser"
+        except _CredentialUnavailable:
+            raise
+        except Exception:  # noqa: BLE001 - fail closed
+            return False
 
     def _key_line_post(self, req: Any) -> "tuple[dict[str, Any], int]":
         """``POST /cockpit/passkey/key-line`` (OS-2): :meth:`levain.phone_server._PhoneServer.key_line` itself, run over

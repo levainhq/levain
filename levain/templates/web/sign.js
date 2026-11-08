@@ -1021,7 +1021,7 @@
     const refuseOther = () => { moved = MOVED; form.stop(MOVED); };
     // the fields, the spec and the review are the shared form's (envelope_form.js); this page passes how a review is asked for
     const form = window.LevainEnvelopeForm.create({
-      words: words, wordsGroup: true, launches: embedded, left: colL, right: colR, lockRoots: [grid], repos: got.coord_repos, sign: sign, signWhy: signWhy, why: why,
+      words: words, wordsGroup: true, launches: got.coord_may_launch === true, left: colL, right: colR, lockRoots: [grid], repos: got.coord_repos, sign: sign, signWhy: signWhy, why: why,
       storeId: () => storeId,
       // asked only after a review sent with no store id: a store identity the page already holds is never replaced
       refreshStore: () => readDrops().then((g) => {
