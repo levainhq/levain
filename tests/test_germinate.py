@@ -431,3 +431,30 @@ def test_a_leading_blank_line_does_not_empty_the_title_and_the_target_word_ignor
     assert o["via"] == "nudge" and len(pings) == 1
     (q,) = _rows(qdir)
     assert q.what == f"Due 11-05: renew the domain ({s['id']})"
+
+
+def _keyless_store(root):
+    path = _spores(root)
+    sid = _add(root, "keyless one")["id"]
+    doc = json.loads(path.read_text())
+    for row in doc["spores"]:
+        row.pop("origin_key", None)
+    path.write_text(json.dumps(doc))
+    return path, sid
+
+
+def test_a_dry_run_and_the_doctor_leave_a_keyless_store_untouched(tmp_path, qdir, capsys):
+    import os
+
+    from levain import doctor
+
+    root = _install(tmp_path)
+    path, sid = _keyless_store(root)
+    before, mtime = path.read_bytes(), os.stat(path).st_mtime_ns
+    names = {p.name for p in path.parent.iterdir()}
+    rc = main(["spores", "germinate", "--dry-run", "--json", "--path", str(root), "--queue-dir", str(qdir)])
+    assert rc == 0
+    assert [o["spore_id"] for o in json.loads(capsys.readouterr().out)["due"]] == [sid]
+    doctor._check_overdue_agenda(root, today=date.today() + timedelta(days=30))
+    assert path.read_bytes() == before and os.stat(path).st_mtime_ns == mtime
+    assert {p.name for p in path.parent.iterdir()} == names      # no .lock file

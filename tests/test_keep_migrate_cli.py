@@ -143,3 +143,33 @@ def test_doctor_row_reports_an_unreadable_store_as_a_warning(tmp_path: Path):
     (tmp_path / ".levain" / "memory.spores.json").write_text("{not json")
     rows = doctor._check_keep_migration(tmp_path)
     assert len(rows) == 1 and rows[0].ok and rows[0].warn and "could not be read" in rows[0].detail
+
+
+def _clone_install(install: Path, name: str) -> Path:
+    from anneal_memory import Store
+    from anneal_memory.spores import SporeStore
+
+    other = install.parent / name
+    lv = other / ".levain"
+    lv.mkdir(parents=True)
+    with Store(str(lv / "memory.db")):
+        pass
+    SporeStore(lv / "memory.spores.json").add(type="thought", text="gotcha: other box note", disposition="note")
+    return other
+
+
+def test_apply_and_revert_refuse_a_plan_made_for_another_install(install: Path, capsys):
+    assert main(["spores", "keep-migrate", "--path", str(install)]) == 0
+    plan = _plans(install)[0]
+    other = _clone_install(install, "install_b")
+    a_spores = (install / ".levain" / "memory.spores.json").read_bytes()
+    b_spores = (other / ".levain" / "memory.spores.json").read_bytes()
+    capsys.readouterr()
+    for verb in ("--apply", "--revert"):
+        assert main(["spores", "keep-migrate", verb, str(plan), "--path", str(other)]) == 1
+        err = capsys.readouterr().err
+        assert "another install" in err and str(install) in err and str(other) in err
+    assert (install / ".levain" / "memory.spores.json").read_bytes() == a_spores
+    assert (other / ".levain" / "memory.spores.json").read_bytes() == b_spores
+    # the matching install still applies
+    assert main(["spores", "keep-migrate", "--apply", str(plan), "--path", str(install)]) == 0

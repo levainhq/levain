@@ -333,3 +333,20 @@ def check_steering(disposition: Any, target: Any, attention: Any) -> str | None:
     if attention not in (None, "none") and isinstance(target, str) and target.startswith("board:"):
         return "attention pings a band row, and a board: target files none; drop attention or change the target"
     return None
+
+
+def list_open_readonly(path: Any, *, today: Any = None) -> list[dict[str, Any]]:
+    """anneal's ``list_open`` WITHOUT its write: ``list_open`` backfills a missing ``origin_key`` and saves the store
+    (and takes a ``.lock`` file), which a diagnostic or a dry run must never do. This reads the document, ranks it
+    as ``list_open`` does, and gives a keyless row a TEMPORARY in-memory key (display only, never persisted)."""
+    import uuid
+
+    store = guarded_spore_store(path)
+    data = store._load()   # noqa: SLF001 - the non-mutating read; `_load_keyed` is the one that saves
+    items = [dict(s) for s in data.get("spores", []) if isinstance(s, dict)]
+    for it in items:
+        k = it.get("origin_key")
+        if not isinstance(k, str) or not k:
+            it["origin_key"] = "tmp-" + uuid.uuid4().hex
+    now = datetime.now() if today is None else None
+    return store._rank(items, today, now)   # noqa: SLF001

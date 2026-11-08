@@ -3871,7 +3871,7 @@ def _check_overdue_agenda(install: Path, today: Any = None) -> list[CheckResult]
     from datetime import date as _date
 
     from levain.germinate import _is_agenda
-    from levain.spores import _parse_when, guarded_spore_store
+    from levain.spores import _parse_when, list_open_readonly
 
     spores = install / ".levain" / "memory.spores.json"
     if not spores.is_file():
@@ -3879,7 +3879,7 @@ def _check_overdue_agenda(install: Path, today: Any = None) -> list[CheckResult]
     day = today.date() if hasattr(today, "date") else (today or _date.today())
     name = "spores: overdue-agenda"
     try:
-        items = guarded_spore_store(spores).list_open(today=day)
+        items = list_open_readonly(spores, today=day)
     except Exception as e:  # noqa: BLE001 - a doctor check reports, it never crashes the run
         return [CheckResult(name, False, f"could not read .levain/memory.spores.json ({type(e).__name__}: {e})",
                             "The spore store is unreadable; restore it from a backup or git.")]

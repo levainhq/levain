@@ -212,10 +212,7 @@ def test_one_malformed_spore_is_skipped_not_the_row(tmp_path, monkeypatch):
     (root / ".levain" / "memory.spores.json").write_text("{}")
     good = {"id": "spore-001", "disposition": "agenda", "next": "2026-11-05"}
 
-    class _S:
-        def list_open(self, today=None):
-            return [object(), good]
-    monkeypatch.setattr("levain.spores.guarded_spore_store", lambda p: _S())
+    monkeypatch.setattr("levain.spores.list_open_readonly", lambda p, today=None: [object(), good])
     rows = doctor._check_overdue_agenda(root, today=TODAY)
     assert len(rows) == 1 and rows[0].ok and "spore-001" in rows[0].detail
 

@@ -2154,6 +2154,18 @@ def _cmd_spores_keep_migrate(args: argparse.Namespace) -> int:
                 print(f"  [{it['index']}] {it['disposition']} -> {d.get('kind')} {label}: {str(it['text'])[:70]}")
             print(f"Nothing was changed. Apply with: levain spores keep-migrate --apply {out}")
             return 0
+        doc = km.load_plan(act)
+        rec_sp, rec_ep = doc.get("spores_json"), doc.get("episodic_db")
+        wrong = []
+        if rec_sp is not None and Path(str(rec_sp)).expanduser().resolve() != paths.spores_json.resolve():
+            wrong.append(f"spore store {rec_sp} (--path install: {paths.spores_json})")
+        if rec_ep is not None and Path(str(rec_ep)).expanduser().resolve() != db.resolve():
+            wrong.append(f"episode store {rec_ep} (--path install: {db})")
+        if wrong:
+            print("levain spores keep-migrate: this plan was made for another install: its recorded "
+                  + " and ".join(wrong) + ". Nothing was changed; run it with --path of the install that made "
+                  "the plan.", file=sys.stderr)
+            return 1
         fn = km.apply if args.apply is not None else km.revert
         rep = fn(act, episodic_db=db)
     except km.KeepMigrateError as exc:

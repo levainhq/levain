@@ -207,7 +207,11 @@ def _germinate(spores_json: Path, qdir: Path, install: Path, agent: str, today: 
     today = today or now.date()
     result: dict[str, Any] = {"today": today.isoformat(), "due": [], "finish": [], "errors": [], "skipped": []}
     store = guarded_spore_store(spores_json)
-    open_items = store.list_open(today=today)
+    if dry_run:     # a dry run writes nothing: no origin_key backfill, no lock file (a keyless row gets a temporary key)
+        from levain.spores import list_open_readonly
+        open_items = list_open_readonly(spores_json, today=today)
+    else:
+        open_items = store.list_open(today=today)
     due = [s for s in open_items if is_due(s, today, now) and (not timed_only or is_timed(s.get("next")))]
     finish = [s for s in open_items if _is_agenda(s) and s.get("germinated")]
     # a dry run on a machine with no band yet must not create one
