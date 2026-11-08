@@ -154,18 +154,34 @@ def test_two_starts_within_a_minute_spawn_once(agent, monkeypatch, capsys, tmp_p
     mod = _load(agent)
     s1, c1 = _run(mod, monkeypatch, capsys, [_agenda(_PAST)], tmp_path)
     s2, c2 = _run(mod, monkeypatch, capsys, [_agenda(_PAST)], tmp_path)
-    assert len(s1) == 1 and s2 == [] and "[germinate]" not in c2
+    assert len(s1) == 1 and s2 == []
+    assert "already started" in c2 and "did not start" not in c2
 
 
 @pytest.mark.parametrize("agent", ["claude_code", "codex"])
-def test_popen_raising_prints_a_failure_line(agent, monkeypatch, capsys, tmp_path):
+def test_popen_raising_prints_a_failure_line_and_leaves_no_marker(agent, monkeypatch, capsys, tmp_path):
     mod = _load(agent)
 
     def boom(*a, **k):
         raise OSError("no exec")
+    spawned, ctx = _run(mod, monkeypatch, capsys, [_agenda(_PAST)], tmp_path)   # wires everything, one ok spawn
+    (tmp_path / ".levain" / ".germinate-spawn").unlink()
     monkeypatch.setattr(mod.hook.subprocess, "Popen", boom)
-    h = mod.hook
-    assert h.start_germinate("x") == "failed"
+    capsys.readouterr()
+    monkeypatch.setattr("sys.stdin", io.StringIO(json.dumps({"source": "startup"})))
+    assert mod.main() == 0
+    out = capsys.readouterr().out
+    assert "did not start" in out and "germination started" not in out
+    assert not (tmp_path / ".levain" / ".germinate-spawn").exists()
+
+
+@pytest.mark.parametrize("agent", ["claude_code", "codex"])
+def test_a_failed_start_does_not_poison_the_next_one(agent, monkeypatch, capsys, tmp_path):
+    mod = _load(agent)
+    s1, c1 = _run(mod, monkeypatch, capsys, [_agenda(_PAST)], tmp_path, rc=1)
+    assert "did not start" in c1 and not (tmp_path / ".levain" / ".germinate-spawn").exists()
+    s2, c2 = _run(mod, monkeypatch, capsys, [_agenda(_PAST)], tmp_path)
+    assert len(s2) == 1 and "germination started" in c2   # retried, not busy
 
 
 # hook and doctor agree on what a valid next/agenda is: same table through both

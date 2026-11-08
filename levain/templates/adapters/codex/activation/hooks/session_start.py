@@ -191,6 +191,8 @@ def main() -> int:
                         sections.append(f"[germinate] {n} agenda{plural} came due; germination started")
                     elif st == 'failed':
                         sections.append(f"[germinate] {n} agenda{plural} came due but germination did not start: run `levain spores germinate`")
+                    elif st == 'busy':
+                        sections.append(f"[germinate] {n} agenda{plural} came due; germination was already started within the last minute")
             except Exception:
                 pass
 
