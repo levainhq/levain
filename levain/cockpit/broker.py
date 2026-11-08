@@ -64,6 +64,7 @@ from levain.cockpit.anneal_effects import (
 )
 from levain.cockpit.consent import ConsentError, build_record, encode, parse_stamp, utc_stamp, value_sha256
 from levain.cockpit.effects import (
+    INTAKE_VERB,
     SPORE_AUTHORITY_FIELDS,
     SPORE_CANONICAL,
     SPORES,
@@ -777,6 +778,8 @@ class Broker:
                 return self._build_downstream(verb, params, target, pid)
             if verb in SPORE_CANONICAL:
                 return self._build_spore(verb, params, target, pid, at_issue=at_issue)
+            if verb == INTAKE_VERB:
+                return self._build_intake(params, target, pid, at_issue=at_issue)
             if verb == TOMBSTONE_VERB:
                 return self._build_tombstone(params, target, pid, at_issue=at_issue)
             if verb == SECTION_VERB:
@@ -843,6 +846,79 @@ class Broker:
         pre = None if snap.row is None else {f: _stored_authority(snap.row, f) for f in SPORE_AUTHORITY_FIELDS}
         return _Built({"kind": "row", "panel_id": target.get("panel_id"), "row_id": target.get("row_id"),
                        "origin_key": ok}, [eff], [pre])
+
+    def _build_intake(self, params: Mapping[str, Any], target: Mapping[str, Any], pid: str,
+                      *, at_issue: bool) -> _Built:
+        """THE LIST's intake line as one spore create (``effects.intake_seed_params``). The line is read ONCE, at
+        issue, on the broker's clock (local time), and the reading rides in the recorded target (``intake``), so the
+        decision rebuilds the same effect from it, never from a second read of the line (a ``+2h`` read a minute later
+        is another minute). The reading is in the signed bytes twice: the target's ``intake`` and the effect's
+        ``changes`` (``next``, ``target: desk``). A drop whose minute passed before the decision no longer builds (the
+        op ends STALE): it is typed again, never fired late. A ``sort`` line plants no spore, so the broker refuses it
+        (it is C1 on a token; a device's C1 would be a signed pending, which a coordinator drop has none of)."""
+        from levain import intake
+        from levain.cockpit.effects import intake_seed_params
+
+        es = self._spores()
+        if at_issue:
+            line = params.get("line")
+            if set(params) != {"line"} or not isinstance(line, str):
+                raise BrokerError("bad_request", 400, "an intake is exactly {line}, a string")
+            try:
+                parsed = intake.parse_intake(line, self._now().astimezone().replace(tzinfo=None))
+            except intake.IntakeRefused as exc:
+                raise BrokerError("intake_refused", 422, str(exc)) from None
+            if parsed["kind"] == "sort":
+                raise BrokerError("not_built", 501, "a plain line goes to the desk as a drop, which a signed device "
+                                                    "pending cannot carry yet: send it from the laptop's cockpit or "
+                                                    "the room's composer")
+            reading = {"kind": parsed["kind"], "text": parsed["text"], "when": parsed.get("when")}
+        else:
+            reading = target.get("intake")
+            if not isinstance(reading, Mapping) or reading.get("kind") not in ("drop", "talk") \
+                    or not isinstance(reading.get("text"), str):
+                raise ValueError("the record's target carries no intake reading")
+            reading = dict(reading)
+            if reading["kind"] == "drop":
+                when = reading.get("when")
+                if not isinstance(when, str):
+                    raise ValueError("the record's drop reading carries no minute")
+                due = datetime.strptime(when, "%Y-%m-%dT%H:%M")
+                # strictly past: a drop decided inside its own minute is due now and germinates at once (an
+                # ``@+1m`` issued at hh:mm:59 and decided a second later is not refused)
+                if due < self._now().astimezone().replace(tzinfo=None, second=0, microsecond=0):
+                    raise ValueError(f"the drop's minute ({when}) passed before it was signed")
+        seed = intake_seed_params(reading)
+        ok = create_origin_key(pid, 0)
+        snap = es.snapshot(spore_resource_key(ok))
+        eff = canonical_effect("spore_seed", seed, snap.row, origin_key=ok, version_of=es.version_of)
+        return _Built({"kind": "create", "panel_id": target.get("panel_id"), "intake": reading}, [eff], [None])
+
+    def _intake_receipt(self, rec: Mapping[str, Any], pid: str, state: str) -> dict[str, Any]:
+        """The receipt a ``list_intake`` result carries (``levain.intake.receipt``'s shape, ``{kind, id, fires,
+        text}``) and its one line. ``id`` is the planted spore's, known only once the op committed; before that the
+        line says what is still owed (the signature, the write) and claims no fire."""
+        from levain import intake
+
+        reading = (rec.get("target") or {}).get("intake")
+        if not isinstance(reading, Mapping):
+            return {}
+        sid = None
+        if state == "COMMITTED":
+            try:
+                row = self._spores().snapshot(spore_resource_key(create_origin_key(pid, 0))).row
+                sid = None if row is None else row.get("id")
+            except (BrokerError, TransientApplyFault):
+                sid = None
+        line, out = intake.receipt(dict(reading), id=sid)
+        if sid is None:
+            what = (f"scheduled drop fires {datetime.strptime(out['fires'], '%Y-%m-%dT%H:%M'):%a %m-%d %H:%M}"
+                    if out["kind"] == "drop" else "talk")
+            # a committed op whose row cannot be read now (a transient fault, or resolved since) WAS written: never
+            # "not written", which would invite a second, duplicate line
+            line = {"WAITING": f"{what}, awaiting your signature", "applying": f"{what}, being written",
+                    "COMMITTED": f"{what}, written"}.get(state, f"{what}: not written ({state.lower()})")
+        return {"receipt": out, "receipt_line": line}
 
     def _build_tombstone(self, params: Mapping[str, Any], target: Mapping[str, Any], pid: str,
                          *, at_issue: bool) -> _Built:
@@ -1415,6 +1491,8 @@ class Broker:
         if state == "WAITING":
             out["record"] = view.record_bytes.decode("utf-8")
             out["expires_at"] = view.record.get("expires_at")
+        if view.record.get("verb") == INTAKE_VERB:
+            out.update(self._intake_receipt(view.record, pid, state))
         return out
 
     @staticmethod

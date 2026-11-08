@@ -167,15 +167,31 @@
     return [];
   }
 
+  // the stores a List row can come from (the `surface` facet): the kernel names them, the page only labels and filters by them
+  const LIST_SURFACES = ["band", "board", "spore", "talk", "drop"];
   const HIDDEN_TEXT = "contains hidden characters; edit with the CLI";
+  // a band or board row keeps its title as the primary clause (the body is what it blocks / its state, shown beside it); every other row reads body-first
+  function rowTextOf(row, f) {
+    const foreign = f.surface === "band" || f.surface === "board";
+    return foreign ? (row.title || row.body) : (row.body || row.title);
+  }
   function sporeOf(pid, row, groupTitles, hidden, today) {
     const f = row.facets || {};
     const t = targetOf(pid, row);
     return Object.assign({
       id: bare(row.id), age: ageOf(row), age_days: Number.isInteger(f.age_days) ? f.age_days : null, type: f.spore_type || "task", tier: f.tier, salience: f.salience, domain: f.domain,
-      disposition: f.disposition, text: row.body || row.title, next: f.due || null, held: f.held === true, today: typeof today === "string" ? today : null,
+      disposition: f.disposition, text: rowTextOf(row, f),
+      support: LIST_SURFACES.indexOf(f.surface) >= 0 && (f.surface === "band" || f.surface === "board") && row.title && row.body && row.title !== row.body ? row.body : null, next: f.due || null, held: f.held === true, today: typeof today === "string" ? today : null,
       descend_kinds: kindsOf(t.actions, "spore_descend"), ascend_kinds: kindsOf(t.actions, "spore_ascend"),
       group_title: row.group ? (groupTitles.get(row.group) || row.group) : null, group: row.group || null,
+      // the List's facets (a panel that sends no `surface` is the old Tray and draws as before): which store the row comes from
+      // and what the kernel computed about it. The page reads these, never derives them (no date maths on `fires`, no grammar).
+      surface: LIST_SURFACES.indexOf(f.surface) >= 0 ? f.surface : null,
+      fires: typeof f.fires === "string" && f.fires ? f.fires : null, overdue: f.overdue === true,
+      deliver_to: typeof f.target === "string" && f.target ? f.target : null,
+      attention: typeof f.attention === "string" && f.attention ? f.attention : null,
+      list_pointer: typeof f.list_pointer === "string" && f.list_pointer ? f.list_pointer : null,
+      repo: typeof f.repo === "string" && f.repo ? f.repo : null, board_tier: typeof f.board_tier === "string" && f.board_tier ? f.board_tier : null,
     }, t, hidden && hidden.has(row.id) ? { text_locked: HIDDEN_TEXT } : {});
   }
 
@@ -497,7 +513,8 @@
   // rather than an inherited function.
   const tableOf = (o) => Object.assign(Object.create(null), o);
   const TABS_OF_ID = tableOf({
-    tray: "morning board", loops: "board build", episodes: "board", "team-status": "board",
+    // Open loops is machine-side (Phill 11-07: the Tray BECOMES the List, Open loops stays machine-side): off the default Board tab, on Build
+    tray: "morning board", loops: "build", episodes: "board", "team-status": "board",
     edits: "build", jobs: "build", sessions: "morning board", "coord-morning": "morning board", "review-queue": "morning board", topology: "build", health: "memory",
     graph: "memory", wraps: "memory", crystals: "memory"
   });
@@ -768,6 +785,8 @@
       const pActions = Array.isArray(panel.actions) ? panel.actions.filter((a) => isObj(a) && typeof a.verb === "string") : [];
       const heldRows = nat === "tray" && Array.isArray(panel.held) ? panel.held : [];
       const rowsAct = rows.concat(heldRows).some((r) => r && Array.isArray(r.actions) && r.actions.length);
+      // the List's stable marker: the panel itself offers the intake action (never inferred from what its rows carry)
+      if (nat === "tray" && pActions.some((a) => a.verb === "list_intake")) view.tray_is_list = true;
       if (pActions.length) {
         const pv = isObj(panel.value) && typeof panel.value.value_version === "string" ? panel.value.value_version : null;
         view.targets.panels[pid] = { actions: pActions, panel_version: pv };
@@ -1402,7 +1421,7 @@
   function paintBriefCard(host, b) {
     const head = el("div", "brief-head");
     // levain's own card is named for what it holds: the Tray's next items (the data's "Where to begin" would read twice beside flow's plan card)
-    head.appendChild(el("h3", "", b.title === "Where to begin" ? "Next from the Tray" : b.title));
+    head.appendChild(el("h3", "", b.title === "Where to begin" ? "Next from the List" : b.title));
     head.appendChild(el("span", "sp"));
     const hasThreads = Array.isArray(b.threads) && groupThreads(b.threads).length > 0;
     // where the card has a lower heading (the loops column) the "from ..." caption sits under it, not floating in the head

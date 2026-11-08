@@ -65,7 +65,7 @@ def test_the_page_draws_a_parked_loop_in_open_loops_marked_and_a_legacy_note_in_
             assert not any(t.strip().lower().startswith("keep") for t in titles), (width, titles)
             assert parked and "parked" in parked["tags"], (width, parked)                 # the visible marker
             assert "reactivate" in parked["verbs"] and "park" not in parked["verbs"], (width, parked)
-            assert note and "note" in note["tags"], (width, note)                         # the legacy badge
+            assert note and note["tags"] == ["spore"], (width, note)                      # still listed, in the List, as a spore row; the note badge is gone with the Keep
 
 
 def test_the_removed_keep_ordering_id_still_resolves_to_the_loops_ordering() -> None:

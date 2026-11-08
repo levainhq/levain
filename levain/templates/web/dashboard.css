@@ -3626,3 +3626,38 @@ a.nc-pick.is-rec:hover { border-color: var(--text); }
 .voice-btn { min-height: var(--hit-min, 44px); }
 .needs-later { display: flex; flex-direction: column; gap: 2px; padding: 4px 2px; }
 .needs-later-line { display: flex; gap: 6px; align-items: baseline; }
+
+/* The List (the Tray's wire id `tray` stays): the surface chips, the one-line intake box and its receipt. */
+.list-surfaces { display: flex; flex-wrap: wrap; gap: var(--sp-2); margin: 0 0 var(--sp-3); }
+.list-surfaces .rc-chip { min-height: var(--ctl-md); }
+.list-intake { gap: var(--sp-2); }
+.list-intake-row { display: flex; align-items: center; gap: var(--sp-3); min-width: 0; }
+.list-intake-input {
+  flex: 1 1 auto; min-width: 0; box-sizing: border-box; min-height: var(--hit-min);
+  font: var(--fw-regular) var(--fs-body)/var(--lh-list) var(--sans); color: var(--text); background: none;
+  border: 0; outline: none; padding: 0; scroll-margin-block: var(--sp-8, 32px);
+}
+.list-intake-input::placeholder { color: var(--meta); }
+.list-intake-input:focus { outline: 1px solid var(--hair-2); outline-offset: 4px; border-radius: var(--r-sm); }
+.list-intake-btn { margin-left: 0; flex: none; min-height: var(--hit-min); min-width: var(--hit-min); }
+.list-receipt.ok { color: var(--text); }
+.list-receipt.ok::before { content: "\2713 "; color: var(--operate); }
+.list-receipt:empty { display: none; }
+body.ke .list-receipt { grid-column: auto; grid-row: auto; font-size: var(--fs-meta); overflow-wrap: anywhere; }
+body.ke .tray-dump.list-intake .edit-msg:empty { display: none; }
+[data-ck-panel="tray"] .row > .list-meta > .list-surface { text-transform: none; }
+[data-ck-panel="tray"] .row[data-surface="band"], [data-ck-panel="tray"] .row[data-surface="board"] { opacity: .88; }
+[data-ck-panel="tray"] .row > .list-meta > .list-pointer { font-style: italic; }
+@media (max-width: 720px) {
+  .list-intake-input { font-size: var(--fs-title); }   /* 16px+: iOS Safari does not zoom the page on focus */
+  .list-surfaces .rc-chip { min-height: var(--hit-min); padding-inline: var(--sp-4); }
+}
+/* a List row's meta line is one cell that wraps: the row grid's four meta columns hold fewer facts than a drop row carries */
+body.ke .row:has(> .clause.clampable) > .list-meta:not(.clause):not(.clause-toggle):not(.ck-rowaddr):not(.verb-actions) {
+  grid-column: 1 / 6; grid-row: 3; display: flex; flex-wrap: wrap; align-items: center; gap: 0 var(--sp-3);
+  overflow: visible; text-overflow: clip; white-space: normal; margin-right: var(--sp-3); line-height: var(--ctl-row); min-height: var(--ctl-row);
+}
+.list-meta { display: flex; flex-wrap: wrap; align-items: baseline; gap: 0 var(--sp-3); min-width: 0; }
+.list-meta > * { font-size: var(--fs-meta); }
+.list-meta > .sid { font-size: var(--fs-micro); }
+body.ke [data-ck-panel="tray"] .row > .list-meta > [data-ck-tag][data-ck-tag-state="overdue"] { color: var(--bad); font-weight: var(--fw-semibold); }

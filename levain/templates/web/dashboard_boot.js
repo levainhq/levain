@@ -580,6 +580,9 @@
     bad_kind: "This page and the server disagree about that request. Reload and try again.",
     confirm_required: "That needs a confirmation. Try again and confirm it.",
     bad_request: "That request was not understood. Reload and try again.",
+    intake_refused: "That line was not understood. Nothing was added.",
+    source_unavailable: "The store behind that is unavailable right now. Nothing was added.",
+    drop_refused: "The desk's store refused that line. Nothing was added.",
     bad_signature: "That signature was not accepted. Sign again.",
     sign_required: "That is sent only after your passkey signs it; nothing was sent. Send it again.",
     credential_required: "Saving needs the write token for this page. Open the page from the link that carries it."
@@ -604,7 +607,9 @@
     // `detail` is the server's own words for why, only for the semantic refusal of a band answer (it names the item it
     // refused); any other fault (a 503, a 5xx) shows the fixed line, never the server's raw text
     return { ok: false, error: code, message: text, status: r.status,
-             detail: code === "answer_refused" && r.status === 422 && typeof d.message === "string" ? d.message : "" };
+             // an intake refusal's reason is the parser's own sentence ("that time has passed"): the box shows it, since
+             // the grammar lives on the server only
+             detail: (code === "answer_refused" || code === "intake_refused") && r.status === 422 && typeof d.message === "string" ? d.message : "" };
   }
 
   // One write per fingerprint at a time: a second identical submit while the first is still asking, firing or
@@ -707,7 +712,8 @@
 
   function panelActionFor(verb, req) {
     // every capture, a note included, is the Tray's create; the disposition rides in params
-    const want = verb === "spore_seed" ? "tray" : null;
+    // the List's panel keeps its wire id `tray`; its create (spore_seed) and its intake box (list_intake) are both offered there
+    const want = verb === "spore_seed" || verb === "list_intake" ? "tray" : null;
     for (const pid of Object.keys(live.panels)) {
       if (want && pid !== want) continue;
       const a = live.panels[pid].actions.find((x) => x && x.verb === verb);
