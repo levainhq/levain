@@ -1325,6 +1325,18 @@
   let kbFocus = null;                                                     // the control the keyboard focus sits on ("n:<node id>", or "b:hub" / "b:node:<node id>" for a need badge (the owner is typed, so a node whose id is "hub" is not the desk)), kept across a redraw
   let stageScroll = { top: 0, left: 0 };                                   // the graph box's scroll, kept across a rebuild of the lens (a live repaint replaces the stage)
   let lastStage = null;                                                    // the stage the last build drew: its scroll is read the moment a rebuild starts, so a scroll whose event has not fired yet is not lost
+  // the Agents graph's own height, per device: the stage keeps its CSS default (max-height min(72vh, 36rem)) until the person drags the grip
+  const GRAPH_H_KEY = "levain_cockpit_graph_height";
+  const GRAPH_MIN_REM = 12, GRAPH_MAX_VH = 0.9, GRIP_STEP = 24;
+  function remPx() { try { return parseFloat(root.getComputedStyle(root.document.documentElement).fontSize) || 16; } catch (_) { return 16; } }
+  function clampGraphH(h) {
+    const vh = root.innerHeight || 800, min = GRAPH_MIN_REM * remPx();
+    return Math.round(Math.max(min, Math.min(vh * GRAPH_MAX_VH, h)));
+  }
+  function storedGraphH() { try { const n = parseFloat(root.localStorage.getItem(GRAPH_H_KEY)); return n > 0 ? n : 0; } catch (_) { return 0; } }
+  function keepGraphH(h) { try { root.localStorage.setItem(GRAPH_H_KEY, String(Math.round(h))); } catch (_) { /* the page still resized */ } }
+  function clearGraphH() { try { root.localStorage.removeItem(GRAPH_H_KEY); } catch (_) { /* nothing stored to clear */ } }
+
   function agentsLens(v, opts) {
     release();
     if (lastStage && lastStage.isConnected) stageScroll = { top: lastStage.scrollTop, left: lastStage.scrollLeft };
@@ -1342,6 +1354,47 @@
     tip.hidden = true;
     tip.setAttribute("aria-hidden", "true");
     wrap.appendChild(stage);
+    const grip = el("div", "tv-grip");                                    // a full-width bar under the stage: drag (or Arrow keys) sets the box's own fixed height, double-click gives the default back
+    grip.tabIndex = 0;
+    grip.setAttribute("role", "separator");
+    grip.setAttribute("aria-orientation", "horizontal");
+    grip.setAttribute("aria-label", "Graph height. Drag, or use the up and down arrow keys. Double-click resets.");
+    grip.title = "Drag to set the graph height. Double-click for the default.";
+    wrap.appendChild(grip);
+    const gripHeight = () => { const h = storedGraphH(); return h ? clampGraphH(h) : 0; };
+    const applyGraphH = () => {                                          // a stored height is an explicit height that replaces max-height; the phone and the default have none
+      const h = stage.classList.contains("tv-phone") ? 0 : gripHeight();
+      stage.style.height = h ? h + "px" : "";
+      stage.style.maxHeight = h ? "none" : "";
+      grip.setAttribute("aria-valuenow", String(Math.round(h || stage.getBoundingClientRect().height)));
+    };
+    const setGraphH = (h, persist) => { stage.style.height = h + "px"; stage.style.maxHeight = "none"; grip.setAttribute("aria-valuenow", String(Math.round(h))); if (persist) keepGraphH(h); };
+    let dragFrom = null;
+    grip.addEventListener("pointerdown", (ev) => {
+      if (ev.button > 0) return;
+      ev.preventDefault();
+      dragFrom = { y: ev.clientY, h: stage.getBoundingClientRect().height };
+      try { grip.setPointerCapture(ev.pointerId); } catch (_) { /* a synthetic pointer has no capture: the move still arrives */ }
+      grip.classList.add("tv-grip-on");
+    });
+    grip.addEventListener("pointermove", (ev) => { if (dragFrom) setGraphH(clampGraphH(dragFrom.h + ev.clientY - dragFrom.y), false); });
+    const endDrag = (ev) => {
+      if (!dragFrom) return;
+      const h = clampGraphH(dragFrom.h + ev.clientY - dragFrom.y);
+      dragFrom = null; grip.classList.remove("tv-grip-on");
+      setGraphH(h, true);
+    };
+    grip.addEventListener("pointerup", endDrag);
+    grip.addEventListener("pointercancel", () => { dragFrom = null; grip.classList.remove("tv-grip-on"); });
+    grip.addEventListener("dblclick", () => { dragFrom = null; clearGraphH(); applyGraphH(); });
+    grip.addEventListener("keydown", (ev) => {
+      const d = ev.key === "ArrowUp" ? -GRIP_STEP : ev.key === "ArrowDown" ? GRIP_STEP : 0;
+      if (!d) return;
+      ev.preventDefault();
+      setGraphH(clampGraphH(stage.getBoundingClientRect().height + d), true);
+    });
+    const onWinResize = () => { if (!stage.isConnected) { root.removeEventListener("resize", onWinResize); return; } applyGraphH(); };
+    if (typeof root.addEventListener === "function") root.addEventListener("resize", onWinResize);
     lastStage = stage;
     stage.addEventListener("scroll", () => { if (stage.isConnected) stageScroll = { top: stage.scrollTop, left: stage.scrollLeft }; });
     const restoreScroll = () => {
@@ -1381,6 +1434,7 @@
       LW = phone ? MIN_LW : Math.max(MIN_LW, Math.round(W));
       scale = phone ? PHONE_SCALE : Math.min(1, W / LW);
       stage.classList.toggle("tv-phone", phone);
+      grip.hidden = phone; applyGraphH();
       ensureGraphCss();
       const L = layoutGraph(v, LW, measure);
       assignSeats(L);
