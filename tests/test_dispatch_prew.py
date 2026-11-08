@@ -852,3 +852,21 @@ def test_a_brokered_spawn_whose_start_fails_reads_zero_on_its_own_socket(tmp_pat
     rec = br.index.get(lz.session_key)
     assert (rec["state"], rec["auth"]) == ("undone", "brokered"), rec
     assert br.usage(lz.session_key).source == "session:not-started"
+
+
+# --- L3 r1 (prewr2): ROUTEMAP-ACTIVE's generation must be an int, not equal-to-one (codex LOW) ---------------------------
+
+class _OnePort:
+    def __init__(self, answer):
+        self.answer = answer
+
+    def call(self, op, **kw):
+        return self.answer
+
+
+@pytest.mark.parametrize("gen", [True, 1.0])
+def test_a_routemap_reply_whose_generation_only_equals_the_asked_one_fails_closed(gen):
+    """``True == 1`` and ``1.0 == 1``: a wrong-shaped reply is None (unresolved), never an active map."""
+    ok = {"generation": 1, "routes": {}, "digests": {}}
+    assert FR.SupervisorFacts(_OnePort(ok)).routemap(1) is not None
+    assert FR.SupervisorFacts(_OnePort({**ok, "generation": gen})).routemap(1) is None

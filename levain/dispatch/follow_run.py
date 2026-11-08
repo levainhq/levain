@@ -177,7 +177,9 @@ class SupervisorFacts:
     def routemap(self, generation: int) -> Optional[_ActiveMap]:
         try:
             ans = self._port.call("ROUTEMAP-ACTIVE")
-            if not isinstance(ans, Mapping) or ans.get("generation") != generation or type(generation) is not int:
+            # an int on both sides before the compare: `True == 1` and `1.0 == 1`, a wrong-shaped reply (PRE-W L3 r1)
+            if not isinstance(ans, Mapping) or type(generation) is not int or type(ans.get("generation")) is not int \
+                    or ans["generation"] != generation:
                 return None
             routes, digests = ans.get("routes"), ans.get("digests")
             if not isinstance(routes, Mapping) or not isinstance(digests, Mapping) \
