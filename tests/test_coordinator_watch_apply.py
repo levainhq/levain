@@ -102,6 +102,7 @@ def test_watch_once_applies_beside_its_own_work_and_is_unchanged_without_reports
     monkeypatch.setenv("LEVAIN_HOME", str(home))
     monkeypatch.setattr(launch, "_harness", lambda: (None, {}))
     consent = CoordStore(home / "consent")
+    consent.coord_status()                                  # makes the consent store
     before = launch.watch_once(consent)
     assert not (home / "board").exists()                    # nothing queued: no board store is made or opened
     board = home / "board"

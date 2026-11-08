@@ -1302,6 +1302,7 @@ def watch_once(store: CoordStore) -> list[str]:
             _note_stopped(store)                                   # never raises
             lines.extend(release_held_pings(store.directory))      # never raises
             lines.extend(_sweep_slots(store))                      # never raises
+            lines.extend(_apply_board_reports())                   # never raises
     return lines
 
 
@@ -1941,3 +1942,14 @@ def watch(store: CoordStore, *, every: float, emit: Callable[[str], None] = prin
         done += 1
         if passes is None or done < passes:
             time.sleep(every)
+
+
+def _apply_board_reports() -> list[str]:
+    """The watch's board pass (:func:`levain.coordinator.work_attach.watch_apply`): queued worker reports are applied as
+    the ``service``, facts only. Silent, and a no-op, when the board store has no queue. Never raises."""
+    try:
+        from levain.coordinator import work_attach
+
+        return work_attach.watch_apply()
+    except Exception as exc:    # noqa: BLE001 - the watch's pass goes on whatever this does
+        return [f"board reports: not applied this pass ({exc})"]

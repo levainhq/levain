@@ -32,7 +32,7 @@ from typing import Any
 from levain.autonomic.durable_sqlite import BUSY_WAIT_S, open_durable
 from levain.coordinator.store import _OID, CoordError, CoordStore, _append_only, _in, next_gseq
 
-__all__ = ["ApplyResult", "EVENTS", "REFUSAL_REASONS", "REPORT_SCHEMA", "WORKER_KINDS", "WORK_SCHEMA", "apply_reports",
+__all__ = ["ApplyResult", "watch_apply", "EVENTS", "REFUSAL_REASONS", "REPORT_SCHEMA", "WORKER_KINDS", "WORK_SCHEMA", "apply_reports",
            "attach_launch", "board_store_dir", "enqueue_report", "live_session_ids", "queue_report",
            "reports_path"]
 
@@ -358,3 +358,59 @@ def apply_reports(store: CoordStore, token: Any, *, live_sessions: Collection[st
                 _refuse(conn, now, by, rid, raw.get("item_id"), raw.get("worker"), reason, detail)
                 result.refused.append((rid, reason))
     return result
+
+
+# ------------------------------------------------------------------------------------------------ the watch's pass
+def _unapplied(store: CoordStore) -> int:
+    """How many queued reports have neither a ``worker_attach`` row nor a refusal yet; nothing written."""
+    from levain.autonomic.durable_sqlite import read_transaction
+
+    queued = {str(r["report_id"])[:100] for r in _queued(store.directory)}
+    if not queued:
+        return 0
+    with read_transaction(lambda: store._connect(create=False)) as conn:
+        done = {r[0] for r in conn.execute("SELECT report_id FROM worker_attach WHERE report_id IS NOT NULL")}
+        done |= {r[0] for r in conn.execute("SELECT report_id FROM report_refusals")}
+    return len(queued - done)
+
+
+def watch_apply(board: Path | str | None = None, *, sessions: Any = None) -> list[str]:
+    """The ``levain coord watch`` pass over the board store: apply the queued reports as the ``service``, facts only.
+
+    Nothing happens, and no line is returned, when the board has no ``dispatch.db`` or no report is waiting. A live
+    lease (a coordinator's, or the operator's) is never taken from its holder: the pass applies nothing and says so in
+    one line, and the reports wait for the next pass. With no live lease the pass claims it as holder ``service``,
+    reads the live session listing once (``sessions(store)``, default :func:`live_session_ids`), applies, and
+    releases the lease in a ``finally``, so a coordinator that wakes meanwhile is refused only for the length of one
+    apply. The service role refuses every write that decides (:meth:`CoordStore._write`), so the only things this
+    pass can write are ``worker_attach``, ``report_refusals``, the item's landed sha and branch, and its own lease
+    rows. A fault is a line, never a raise: the watch goes on."""
+    from levain.coordinator import lease as _lease
+
+    directory = Path(board) if board is not None else board_store_dir()
+    if not (directory / "dispatch.db").exists() or not reports_path(directory).exists():
+        return []
+    try:
+        store = CoordStore(directory, role="service")
+        waiting = _unapplied(store)
+        if not waiting:
+            return []
+        plural = "report" if waiting == 1 else "reports"
+        with store._write("service", None, create=False) as (conn, now):
+            held = _lease._lapse_if_past(conn, now)
+            if held is not None:
+                return [f"{waiting} {plural} waiting: the board's lease is held by {held.holder} until {held.until}; "
+                        f"applied nothing this pass"]
+            token = _lease._event(conn, now, "claim", "service", token=None,
+                                  until=_lease._plus(now, _lease.LEASE_TTL), cause="watch apply", by="service")
+        try:
+            live = (sessions or live_session_ids)(store)
+            got = apply_reports(store, token, live_sessions=live)
+        finally:
+            with store._write("service", None, create=False) as (conn, now):
+                _lease._event(conn, now, "release", "service", token=token, until=None, cause="watch apply done",
+                              by="service")
+        return [f"board reports: applied {len(got.applied)}, refused {len(got.refused)}, deferred {len(got.deferred)}"
+                + "".join(f"; {rid} refused: {why}" for rid, why in got.refused)]
+    except (CoordError, sqlite3.Error, OSError) as exc:
+        return [f"board reports: not applied this pass ({exc})"]
