@@ -562,11 +562,11 @@
       whom(rp, keysFor(choice), held, acts, !consent && !dispatch).then((k) => (k ? ceremony(r, rp, k, choice, words) : "unsigned"))
         .catch(() => "unsigned")
         .then((done) => {
-          if (done === "signed") { busy = false; ended(); acts.replaceChildren(); acts.hidden = true; tell("signed"); return; }
+          if (done === "signed") { busy = false; ended(); acts.replaceChildren(); acts.hidden = true; tell("signed", { choice: choice }); return; }
           if (done === "unsure") {
             relabel("Not confirmed");
             return settle(r, () => { relabel("Not signed"); busy = false; lock(false); },
-                          () => { busy = false; acts.replaceChildren(); acts.hidden = true; tell("signed"); }).then(ended);
+                          () => { busy = false; acts.replaceChildren(); acts.hidden = true; tell("signed", { choice: choice }); }).then(ended);
           }
           relabel("Not signed");
           ended();

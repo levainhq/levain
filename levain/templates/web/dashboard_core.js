@@ -5985,6 +5985,21 @@
     clearTimeout(signBoardTimer);
     signBoardTimer = setTimeout(signBoardTick, SIGN_RELOAD_MS);
   }
+  // The sheet signed request `id`: the card behind it is decided now, not at the next redraw (the strip keeps a card whose item
+  // did not change, so the board read alone never reaches it). Its note says what was signed and nothing on it can sign again.
+  function signSheetSigned(id, choice) {
+    if (typeof id !== "string" || !/^[A-Za-z0-9_-]{8,64}$/.test(id)) return;
+    const text = "signed" + (typeof choice === "string" && /^[a-z0-9]{1,8}$/.test(choice) ? " (" + choice + ")" : "");
+    signNotes.set(id, [text, "ok", ""]);
+    signSettledIds.add(id);
+    signWriteIns.delete(id);
+    for (const wrap of document.querySelectorAll(".sign-facet[data-sign-request]")) {
+      if (wrap.dataset.signRequest !== id) continue;
+      const note = wrap.querySelector(".sign-note");
+      if (note) { note.textContent = text; note.className = "sign-note ext-meta sign-ok"; }
+      for (const c of wrap.querySelectorAll("button, input")) { c.disabled = true; if ("readOnly" in c) c.readOnly = true; }
+    }
+  }
   window.addEventListener("message", (ev) => {
     const frame = document.getElementById(SIGN_SHEET_ID + "-frame");
     if (!frame || ev.source !== frame.contentWindow || ev.origin !== window.location.origin) return;
@@ -5993,6 +6008,7 @@
     else if (what === "close") { closeSignSheet(); dispatchStale(); }
     else if (what === "signed" || what === "reload") {
       // the sheet's line stays on it until it is closed; the board under it reads again, and the dispatch jobs with it
+      if (what === "signed") signSheetSigned(ev.data.id, ev.data.choice);
       dispatchStale();
       rereadBoard();
       // the server accepted the drop the sheet filed: the box lets go of the words only if it holds exactly those words
