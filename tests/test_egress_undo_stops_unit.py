@@ -129,3 +129,68 @@ def test_a_host_without_systemd_has_nothing_to_stop_or_reload(systemd, present, 
 def test_daemon_reload_still_fails_closed_where_systemd_runs(systemd):
     systemd(reload=(1, "Failed to reload daemon: Access denied"))
     assert hands._systemd_reloaded() == (False, "Failed to reload daemon: Access denied")
+
+
+# L3 batch4a r1 (codex C1): a host where systemd is PID 1 but systemctl cannot be found may still hold a loaded
+# RemainAfterExit unit (the stranded 1107-26 state). Only systemd not running proves no unit can be loaded.
+def test_systemd_running_without_systemctl_fails_the_stop_and_the_reload(systemd):
+    fake = systemd(present=False, running=True)
+    ok, why = hands._egress_unit_stopped(USER)
+    assert not ok and "systemctl" in why
+    ok, why = hands._systemd_reloaded()
+    assert not ok and "systemctl" in why
+    assert fake.calls == []
+
+
+# L3 batch4a r1 (all four lineages, C3): a wedged D-Bus must not hang root undo; every systemctl call is bounded
+# and a hang fails the step with a named reason.
+class _Hangs(_Systemd):
+    def __init__(self, hang: str, **answers):
+        super().__init__(**answers)
+        self.hang = hang
+        self.timeouts: list[object] = []
+
+    def __call__(self, argv, **kw):
+        self.timeouts.append(kw.get("timeout"))
+        if list(argv)[1] == self.hang:
+            self.calls.append(list(argv))
+            raise subprocess.TimeoutExpired(list(argv), kw.get("timeout"))
+        return super().__call__(argv, **kw)
+
+
+@pytest.mark.parametrize("hang", ["stop", "is-active"])
+def test_a_hung_systemctl_fails_the_stop_with_a_named_reason(systemd, monkeypatch, hang):
+    systemd()
+    fake = _Hangs(hang)
+    monkeypatch.setattr(hands.subprocess, "run", fake)
+    ok, why = hands._egress_unit_stopped(USER)
+    assert not ok and "timed out" in why and hang in why
+    assert fake.timeouts and all(t == hands.SYSTEMCTL_TIMEOUT for t in fake.timeouts)
+
+
+def test_a_hung_daemon_reload_fails_with_a_named_reason(systemd, monkeypatch):
+    systemd()
+    fake = _Hangs("daemon-reload")
+    monkeypatch.setattr(hands.subprocess, "run", fake)
+    ok, why = hands._systemd_reloaded()
+    assert not ok and "timed out" in why
+    assert fake.timeouts == [hands.SYSTEMCTL_TIMEOUT]
+
+
+def test_an_unrunnable_systemctl_fails_the_stop(systemd, monkeypatch):
+    systemd()
+
+    def broken(argv, **kw):
+        raise PermissionError(13, "Permission denied", argv[0])
+    monkeypatch.setattr(hands.subprocess, "run", broken)
+    ok, why = hands._egress_unit_stopped(USER)
+    assert not ok and "Permission denied" in why
+
+
+# L3 batch4a r1 (gemini C2, refuted): systemd 255 (Ubuntu 24.04) answers is-active for a unit that is not loaded
+# with "inactive" (exit 3); "unknown" comes from older systemd or an unreadable state. Only inactive/failed proves
+# the unit down, so "unknown" still fails the step (fail-closed) even after a "not loaded" stop.
+def test_an_unknown_is_active_answer_is_not_proof_even_after_not_loaded(systemd):
+    systemd(stop=(5, f"Failed to stop {UNIT}: Unit {UNIT} not loaded."), active=(4, "unknown\n"))
+    ok, why = hands._egress_unit_stopped(USER)
+    assert not ok and "is-active: unknown" in why

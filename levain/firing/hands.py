@@ -554,30 +554,58 @@ def _subid_nss_problem(hands_user: str) -> str | None:
     return None
 
 
+#: Seconds any one ``systemctl`` call in the undo may take. A wedged D-Bus or systemd job otherwise blocks root
+#: undo forever; past this the step fails with a named reason (fail-closed: the unit file is not removed).
+SYSTEMCTL_TIMEOUT = 30
+
+
 def _no_systemd_here() -> str | None:
-    """Why no unit of ours can be loaded on this host, or None when systemd runs here. Setup refuses
-    both cases (:func:`egress_unavailable`), so a host like this never had the boundary's unit."""
-    if not os.path.isabs(_abs("systemctl")):
-        return "no systemctl here, so no boundary unit can be loaded"
+    """Why no unit of ours can be loaded on this host, or None when systemd runs here. Only systemd not
+    running as init proves that: a host where it runs but systemctl cannot be found may still hold a loaded
+    unit (see :func:`_systemctl_missing`). Setup refuses both (:func:`egress_unavailable`)."""
     if not os.path.isdir("/run/systemd/system"):
         return "systemd is not running as init here, so no boundary unit can be loaded"
     return None
 
 
+def _systemctl_missing() -> str | None:
+    """Why systemd runs here but its unit state cannot be asked, or None. Callers fail the step on it."""
+    if not os.path.isabs(_abs("systemctl")):
+        return "systemd is running here but no systemctl was found, so the boundary unit cannot be confirmed down"
+    return None
+
+
+def _systemctl(*args: str) -> subprocess.CompletedProcess[str] | str:
+    """Run ``systemctl args`` bounded by :data:`SYSTEMCTL_TIMEOUT`; the result, or why it could not answer."""
+    try:
+        return subprocess.run([_abs("systemctl"), *args], capture_output=True, text=True, cwd="/",
+                              env={**child_env(), "LC_ALL": "C"}, timeout=SYSTEMCTL_TIMEOUT)
+    except subprocess.TimeoutExpired:
+        return f"systemctl {' '.join(args)} timed out after {SYSTEMCTL_TIMEOUT}s"
+    except OSError as exc:
+        return f"systemctl {' '.join(args)} could not be run ({exc})"
+
+
 def _egress_unit_stopped(hands_user: str) -> tuple[bool, str]:
     """Stop the boundary's unit and check it is not active. Only systemd saying the unit is not loaded
-    counts as already stopped; any other stop failure (D-Bus, permission, timeout) fails the step, so
-    undo never reports the boundary gone while its unit is still active."""
+    counts as already stopped; any other stop failure (D-Bus, permission, a call past
+    :data:`SYSTEMCTL_TIMEOUT`) fails the step, so undo never reports the boundary gone while its unit is still
+    active."""
     if why := _no_systemd_here():
         return True, why
-    systemctl, unit = _abs("systemctl"), egress_unit_name(hands_user)
-    env = {**child_env(), "LC_ALL": "C"}
-    r = subprocess.run([systemctl, "stop", unit], capture_output=True, text=True, cwd="/", env=env)
+    if why := _systemctl_missing():
+        return False, why
+    unit = egress_unit_name(hands_user)
+    r = _systemctl("stop", unit)
+    if isinstance(r, str):
+        return False, r
     said = (r.stderr or r.stdout).strip()
     if r.returncode != 0 and "not loaded" not in said:
         return False, said or f"systemctl stop {unit}: exit {r.returncode}"
     # is-active prints the state and exits 0 only for "active"; an unknown unit prints "inactive".
-    a = subprocess.run([systemctl, "is-active", unit], capture_output=True, text=True, cwd="/", env=env)
+    a = _systemctl("is-active", unit)
+    if isinstance(a, str):
+        return False, f"{unit} is not confirmed stopped after the stop ({a})"
     state = a.stdout.strip()
     if state not in ("inactive", "failed"):
         # Anything but a plain inactive answer (active, activating, or is-active itself failing with no state)
@@ -589,7 +617,12 @@ def _egress_unit_stopped(hands_user: str) -> tuple[bool, str]:
 def _systemd_reloaded() -> tuple[bool, str]:
     if why := _no_systemd_here():
         return True, why
-    return _run_ok((_abs("systemctl"), "daemon-reload"))
+    if why := _systemctl_missing():
+        return False, why
+    r = _systemctl("daemon-reload")
+    if isinstance(r, str):
+        return False, r
+    return r.returncode == 0, (r.stderr or r.stdout).strip()
 
 
 def egress_undo_steps(hands_user: str) -> list[Step]:
