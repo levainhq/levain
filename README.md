@@ -591,6 +591,7 @@ Every top-level `levain` verb, each with the one line `levain --help` gives it. 
 | `levain update` | Update the known-good version set together (anneal + schema + migrations) and refresh the activation tree and adapter files after an upgrade. |
 | `levain messaging` | Show or change the Claude Code cross-session messaging choice of an install. |
 | `levain adopt-answers` | Make your hand-edited seed files the interview record (.levain/answers.json). |
+| `levain spores` | Spore-store maintenance (the Keep migration). |
 | `levain setup-isolation` | Create a dedicated unprivileged user for an entity's bash (one-time, needs sudo). |
 | `levain hands` | Sign the entity's own user in to Claude Code or Codex (its own login, never a copy of yours). |
 | `levain ws-git` | Run git in the entity's workspace as the entity's user, with hooks and the like off. |
@@ -624,7 +625,7 @@ Operator-class developers: the people who already feel session-amnesia as a real
 
 ## What it's built on
 
-Levain layers on [`anneal-memory`](https://pypi.org/project/anneal-memory/) (pinned `>=1.0.3,<2`). The division of labor is the whole idea: **anneal-memory is the substrate; Levain is the harness that fires it.** anneal-memory deliberately can't reach into your session. A memory library that hooked every prompt would forfeit the neutrality that lets it run under any harness. So on its own it gives you the stores and manual recall; Levain wires the hooks that surface the right memory automatically. Clean dependency direction, both on PyPI: Levain depends on anneal-memory, never the reverse.
+Levain layers on [`anneal-memory`](https://pypi.org/project/anneal-memory/) (pinned `>=1.0.3,<1.1`). The division of labor is the whole idea: **anneal-memory is the substrate; Levain is the harness that fires it.** anneal-memory deliberately can't reach into your session. A memory library that hooked every prompt would forfeit the neutrality that lets it run under any harness. So on its own it gives you the stores and manual recall; Levain wires the hooks that surface the right memory automatically. Clean dependency direction, both on PyPI: Levain depends on anneal-memory, never the reverse.
 
 ## Build on it
 
