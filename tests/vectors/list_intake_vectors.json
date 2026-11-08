@@ -1,0 +1,199 @@
+{
+ "_about": "THE LIST intake grammar vectors (flow tests/list_intake_vectors.json, vendored by levain with its sha). `now` is local; a case with `refuse` must raise; the grammar is task_surfaces_1107.md THE LIST.",
+ "now": "2026-11-08T12:00",
+ "cases": [
+  {
+   "line": "@09:00 call the lab",
+   "expect": {
+    "kind": "drop",
+    "when": "2026-11-09T09:00",
+    "text": "call the lab"
+   }
+  },
+  {
+   "line": "@14:30 call the lab",
+   "expect": {
+    "kind": "drop",
+    "when": "2026-11-08T14:30",
+    "text": "call the lab"
+   }
+  },
+  {
+   "line": "@9pm stretch",
+   "expect": {
+    "kind": "drop",
+    "when": "2026-11-08T21:00",
+    "text": "stretch"
+   }
+  },
+  {
+   "line": "@tomorrow check backups",
+   "expect": {
+    "kind": "drop",
+    "when": "2026-11-09T09:00",
+    "text": "check backups"
+   }
+  },
+  {
+   "line": "@tomorrow 7:15am check backups",
+   "expect": {
+    "kind": "drop",
+    "when": "2026-11-09T07:15",
+    "text": "check backups"
+   }
+  },
+  {
+   "line": "@tomorrow 5:30 pm dentist",
+   "expect": {
+    "kind": "drop",
+    "when": "2026-11-09T17:30",
+    "text": "dentist"
+   }
+  },
+  {
+   "line": "@tomorrow 3 things to do",
+   "expect": {
+    "kind": "drop",
+    "when": "2026-11-09T09:00",
+    "text": "3 things to do"
+   }
+  },
+  {
+   "line": "@mon 14:30 standup",
+   "expect": {
+    "kind": "drop",
+    "when": "2026-11-09T14:30",
+    "text": "standup"
+   }
+  },
+  {
+   "line": "@sun 18:00 x",
+   "expect": {
+    "kind": "drop",
+    "when": "2026-11-08T18:00",
+    "text": "x"
+   }
+  },
+  {
+   "line": "@sunday x",
+   "expect": {
+    "kind": "drop",
+    "when": "2026-11-15T09:00",
+    "text": "x"
+   }
+  },
+  {
+   "line": "@11-20 19:30 ship it",
+   "expect": {
+    "kind": "drop",
+    "when": "2026-11-20T19:30",
+    "text": "ship it"
+   }
+  },
+  {
+   "line": "@2027-01-02 ship it",
+   "expect": {
+    "kind": "drop",
+    "when": "2027-01-02T09:00",
+    "text": "ship it"
+   }
+  },
+  {
+   "line": "@+90m eat",
+   "expect": {
+    "kind": "drop",
+    "when": "2026-11-08T13:30",
+    "text": "eat"
+   }
+  },
+  {
+   "line": "@+2h eat",
+   "expect": {
+    "kind": "drop",
+    "when": "2026-11-08T14:00",
+    "text": "eat"
+   }
+  },
+  {
+   "line": "@+2d eat",
+   "expect": {
+    "kind": "drop",
+    "when": "2026-11-10T12:00",
+    "text": "eat"
+   }
+  },
+  {
+   "line": "? what is flow's future",
+   "expect": {
+    "kind": "talk",
+    "text": "what is flow's future"
+   }
+  },
+  {
+   "line": "buy milk",
+   "expect": {
+    "kind": "sort",
+    "text": "buy milk"
+   }
+  },
+  {
+   "line": "  email Tim @9am  ",
+   "expect": {
+    "kind": "sort",
+    "text": "email Tim @9am"
+   }
+  },
+  {
+   "line": "",
+   "refuse": true
+  },
+  {
+   "line": "@ words",
+   "refuse": true
+  },
+  {
+   "line": "@blorp words",
+   "refuse": true
+  },
+  {
+   "line": "@11-31 words",
+   "refuse": true
+  },
+  {
+   "line": "@09:00",
+   "refuse": true
+  },
+  {
+   "line": "@?",
+   "refuse": true
+  },
+  {
+   "line": "?",
+   "refuse": true
+  },
+  {
+   "line": "@+0m now",
+   "refuse": true
+  },
+  {
+   "line": "@2026-11-01 old",
+   "refuse": true
+  },
+  {
+   "line": "@tomorrow 25:00 x",
+   "refuse": true
+  },
+  {
+   "line": "@tomorrow 9:60 x",
+   "refuse": true
+  },
+  {
+   "line": "@tomorrow 13pm x",
+   "refuse": true
+  },
+  {
+   "line": "@09:00pm",
+   "refuse": true
+  }
+ ]
+}
