@@ -28,10 +28,42 @@ Frame names (FRAME.md TS-4) against this tree: ``descend(kind="composted")``, ``
 disposition vocab match anneal 1.0.3 / ``levain.spores`` exactly. There is no existing "write an
 observation episode" helper to reuse beyond the raw ``anneal_memory.Store.record`` used by
 ``levain.dashboard._record_state_episode``; that is what this module calls.
+
+Safety rules (L3 1107-63):
+
+* ``apply`` and ``revert`` hold an exclusive ``flock`` on ``<plan>.lock`` for the whole run and load
+  the plan under it, so two runs on one plan cannot interleave (a second is refused, nothing written).
+  A plan name is reserved with ``O_CREAT|O_EXCL``, so a planner never replaces an earlier plan.
+* Staleness compares the WHOLE row (anneal's ``spore_version``: every field but ``seen`` and
+  ``origin_key``, so ``next``, ``target``, tier, ... all count), with this plan's own marker note set
+  aside so a resumed apply still matches. The marker update and the compost are compare-and-set on
+  that version (``expected_version``) inside anneal's lock: an edit landing after the compare makes
+  the compost refuse instead of composting newer content.
+* An item whose destination exists (recorded, or found by its key after a crash before the record)
+  but whose original can no longer be composted (edited, vanished, resolved by someone else) goes to
+  ``conflict``, never ``stale``: its destination stays on record and ``revert`` removes it, and the
+  original is left exactly as it is (never resurrected).
+* ``revert`` re-adds an original under a revert key and records its id before touching the
+  destination; a re-run finds the key and never re-adds or re-writes it.
+
+Known edges (the reachability line: no real caller reaches these, or they cost no data):
+
+* ``_INTENT`` reads the first line only: an intention on a later line classifies as an observation,
+  which loses nothing.
+* :func:`resolve_destination` needs ``episodic_db`` passed to resolve an episode (a test/report helper).
+* ``plan`` does not infer ``episodic_db`` from the spores path; ``apply`` refuses cleanly without it.
+* A planner killed between reserving the name and writing leaves an empty ``keep-<ts>.json`` that
+  ``load_plan`` refuses by name; delete it.
+* A compare-and-set that refuses after the marker note landed leaves that note on the (still open)
+  original; it is text only.
+* An episode destination whose plan body was edited between a crash and the retry is refused by
+  anneal (``OriginKeyConflict``) rather than written twice; restore the body or re-plan.
+* The doctor line says "1 handoffs": it is the frame's exact string.
 """
 
 from __future__ import annotations
 
+import contextlib
 import hashlib
 import json
 import os
@@ -40,7 +72,12 @@ import tempfile
 from dataclasses import dataclass, field
 from datetime import date, datetime, timezone
 from pathlib import Path
-from typing import Any, Callable, Mapping, Sequence
+from typing import Any, Callable, Iterator, Mapping, Sequence
+
+try:
+    import fcntl
+except ImportError:                              # pragma: no cover - Windows: guarded writes are refused anyway
+    fcntl = None  # type: ignore[assignment]
 
 __all__ = [
     "KeepMigrateError",
@@ -75,6 +112,7 @@ STATE_DEST = "destination_written"
 STATE_APPLIED = "applied"
 STATE_REVERTED = "reverted"
 STATE_STALE = "stale"                       # the row changed (or vanished) since the plan: left alone, reported
+STATE_CONFLICT = "conflict"                 # as stale, but a destination exists: kept on record, revert removes it
 
 DEST_EPISODE = "episode"
 DEST_SPORE = "spore"
@@ -243,6 +281,17 @@ def _atomic_write(path: Path, doc: Mapping[str, Any]) -> None:
             f.flush()
             os.fsync(f.fileno())
         os.replace(tmp, path)
+        try:                                     # the rename itself durable before the next store write
+            dfd = os.open(str(path.parent), os.O_RDONLY)
+        except OSError:
+            dfd = None
+        if dfd is not None:
+            try:
+                os.fsync(dfd)
+            except OSError:
+                pass
+            finally:
+                os.close(dfd)
     except BaseException:
         try:
             os.unlink(tmp)
@@ -291,7 +340,8 @@ def plan(spores_json: Path | str, *, migrations_dir: Path | str, episodic_db: Pa
         okey = row.get("origin_key") if isinstance(row.get("origin_key"), str) and row.get("origin_key") else None
         ov = (overrides or {}).get(okey or "") or (overrides or {}).get(str(row.get("id")))
         if ov:
-            dest, why = dict(ov), str(ov.get("why") or "destination set by override")
+            dest = {k: v for k, v in dict(ov).items() if k != "why"}
+            why = str(ov.get("why") or "destination set by override")
         item: dict[str, Any] = {
             "index": len(items),
             "spore_id": row.get("id"),
@@ -307,25 +357,71 @@ def plan(spores_json: Path | str, *, migrations_dir: Path | str, episodic_db: Pa
             "result": None,
         }
         if dest.get("kind") == DEST_EPISODE:
-            item["destination"]["body"] = dest.get("body") or _episode_body(item, dest["episode_type"])
+            etype = dest.get("episode_type")
+            if etype not in EPISODE_TYPES:     # an override's shape, judged before it is used
+                raise KeepMigrateError(f"item {item['index']}: an episode destination needs episode_type "
+                                       f"{EPISODE_TYPES} (got {etype!r})")
+            item["destination"]["body"] = dest.get("body") or _episode_body(item, etype)
             item["destination"]["tags"] = list(dest.get("tags") or (
-                EPISODE_TAGS if dest["episode_type"] == "observation" else DECISION_TAGS))
+                EPISODE_TAGS if etype == "observation" else DECISION_TAGS))
+        _validate_dest(item)                   # a plan that cannot be applied is never written
         items.append(item)
-    out = Path(migrations_dir) / f"keep-{stamp}.json"
-    n = 1
-    while out.exists():                        # never overwrite an earlier plan
-        n += 1
-        out = Path(migrations_dir) / f"keep-{stamp}-{n}.json"
+    counts = {"items": len(items), "notes": 0, "handoffs": 0, "agendas": 0}
+    for i in items:                            # from the items themselves: no second read to drift
+        d = i["disposition"]
+        counts["notes" if d == "note" else "handoffs" if d == "handoff" else "agendas"] += 1
+    out = _reserve_plan_path(Path(migrations_dir), stamp)
     _atomic_write(out, {
         "kind": PLAN_KIND, "schema": PLAN_SCHEMA, "plan_id": out.stem,
         "created": (now or datetime.now(timezone.utc)).isoformat(timespec="seconds"),
         "spores_json": str(spores_json),
         "episodic_db": str(episodic_db) if episodic_db is not None else None,
         "options": {"handoff_to": handoff_to, "agenda_date": agenda_date},
-        "counts": {"items": len(items), **pending_counts(spores_json)},
+        "counts": counts,
         "items": items,
     })
     return out
+
+
+def _reserve_plan_path(migrations_dir: Path, stamp: str) -> Path:
+    """``keep-<stamp>[-n].json``, claimed with ``O_CREAT|O_EXCL`` so two planners in one second never
+    share (and so replace) a name; the caller's atomic write then fills the reserved file."""
+    migrations_dir.mkdir(parents=True, exist_ok=True)
+    n = 1
+    while True:
+        out = migrations_dir / (f"keep-{stamp}.json" if n == 1 else f"keep-{stamp}-{n}.json")
+        try:
+            fd = os.open(str(out), os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o644)
+        except FileExistsError:
+            n += 1
+            continue
+        os.close(fd)
+        return out
+
+
+@contextlib.contextmanager
+def _plan_lock(plan_path: Path) -> Iterator[None]:
+    """An exclusive, non-blocking ``flock`` on ``<plan>.lock`` for one apply / revert run. The lock
+    file is never unlinked (unlinking a lock file races a waiter onto a different inode)."""
+    if fcntl is None:
+        raise KeepMigrateError("keep-migrate apply/revert needs a POSIX file lock (fcntl); none here")
+    lock = plan_path.with_name(plan_path.name + ".lock")
+    try:
+        fd = os.open(str(lock), os.O_CREAT | os.O_RDWR, 0o644)
+    except OSError as exc:
+        raise KeepMigrateError(f"cannot open the plan lock {lock}: {exc}") from exc
+    try:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError as exc:
+            raise KeepMigrateError(
+                f"another keep-migrate apply/revert holds {plan_path}; nothing was changed") from exc
+        try:
+            yield
+        finally:
+            fcntl.flock(fd, fcntl.LOCK_UN)
+    finally:
+        os.close(fd)
 
 
 # ---------------------------------------------------------------- apply / revert
@@ -426,10 +522,65 @@ def _write_destination(item: dict[str, Any], plan_id: str, spores: Any, db: Path
         type=row.get("type", "thought"), text=item["text"], domain=row.get("domain") or "",
         tier=row.get("tier") or "warm", salience=int(row.get("salience") or 0),
         next=d.get("next") or None, pointer=row.get("pointer"), disposition=d["disposition"],
-        origin_key=key)
-    if not made.get("notes") and _notes(row):    # a fresh seed; a retry that found it leaves it alone
-        _restore_row_fields(spores, made["id"], row)
+        target=row.get("target") or None, attention=row.get("attention") or None,
+        germinated=row.get("germinated") or None, origin_key=key)
+    # notes / created / seen verbatim, always (a note-less row keeps its age too). anneal's keyed add
+    # returned the earlier seed on a retry, and re-writing the same values onto it is a no-op.
+    _restore_row_fields(spores, made["id"], row)
     return {"kind": DEST_SPORE, "id": made["id"], "origin_key": key}
+
+
+def _marker_notes_out(row: Mapping[str, Any], plan_id: str) -> dict[str, Any]:
+    """``row`` without this plan's own marker note (a resumed apply added it), a missing and an
+    emptied ``notes`` alike."""
+    out = dict(row)
+    notes = [n for n in _notes(row) if not (NOTE_MARK in n and plan_id in n)]
+    if notes:
+        out["notes"] = notes
+    else:
+        out.pop("notes", None)
+    return out
+
+
+def _content_version(row: Mapping[str, Any], plan_id: str) -> str:
+    """anneal's whole-row version (every field the destination depends on, ``next`` included; ``seen``
+    and ``origin_key`` excluded by anneal), this plan's marker note set aside."""
+    from anneal_memory.spores import spore_version
+
+    return spore_version(_marker_notes_out(row, plan_id))     # type: ignore[arg-type]
+
+
+def _marked(row: Mapping[str, Any], plan_id: str) -> bool:
+    return any(NOTE_MARK in n and plan_id in n for n in _notes(row))
+
+
+def _composted_by_us(row: Mapping[str, Any], plan_id: str) -> bool:
+    res = row.get("resolution")
+    return (row.get("status") != "open" and isinstance(res, Mapping) and res.get("kind") == "composted"
+            and _marked(row, plan_id))
+
+
+def _locate_destination(item: Mapping[str, Any], plan_id: str, spores: Any, db: Path | None
+                        ) -> dict[str, Any] | None:
+    """The destination this item wrote: the recorded result, else a lookup by its deterministic key
+    (a crash after the write, before the record). None when none was written (or it is unreadable
+    because the episode store is absent)."""
+    if item.get("result") and item["result"].get("id"):
+        return dict(item["result"])
+    kind = (item.get("destination") or {}).get("kind")
+    key = _dest_key(plan_id, item)
+    if kind == DEST_EPISODE:
+        if db is None:
+            return None
+        from anneal_memory import Store
+
+        with Store(str(db)) as st:
+            ep = st.get_by_origin_key(key)
+        return {"kind": DEST_EPISODE, "id": ep.id, "origin_key": key} if ep is not None else None
+    if kind == DEST_SPORE:
+        sp = spores.get_by_origin_key(key)
+        return {"kind": DEST_SPORE, "id": sp["id"], "origin_key": key} if sp is not None else None
+    return None
 
 
 def resolve_destination(result: Mapping[str, Any] | None, *, spores_json: Path | str,
@@ -462,110 +613,168 @@ def apply(plan_path: Path | str, *, episodic_db: Path | str | None = None,
           fault: Fault | None = None, today: date | None = None) -> Report:
     """``--apply <plan>``. Idempotent and resumable: an item already applied is skipped, one whose
     destination is written but whose original is still open resumes at the compost. ``fault`` is a
-    test seam, called as ``fault(stage, item)`` at ``after_destination`` and ``after_record``."""
+    test seam, called as ``fault(stage, item)`` at ``after_destination`` and ``after_record``.
+
+    Held under the plan lock throughout (a second run on the same plan is refused). An item whose
+    original changed since the plan is left alone: ``stale`` if nothing was written for it,
+    ``conflict`` (destination kept on record for ``revert``) if its destination already exists."""
+    from anneal_memory.spores import SporeError, spore_version
     from levain.spores import guarded_spore_store
 
-    pp = Path(plan_path)
-    doc = load_plan(pp)
-    spores_json = Path(doc["spores_json"])
-    plan_id = doc["plan_id"]
-    rep = Report(pp)
-    for it in doc["items"]:
-        if it["state"] in (STATE_PENDING, STATE_DEST, STATE_STALE):
-            _validate_dest(it)                 # every item judged before the first write
-    db = _episode_store(doc, episodic_db) if _needs_episodes(doc, (STATE_PENDING, STATE_DEST, STATE_STALE)) else None
-    spores = guarded_spore_store(spores_json)
-    for it in doc["items"]:
-        idx = it["index"]
-        if it["state"] in (STATE_APPLIED, STATE_REVERTED):
-            continue
-        row = _find_row(spores, it)
-        if row is None:
-            it["state"] = STATE_STALE
-            rep.skipped.append((idx, "the item is no longer in the store"))
-            continue
-        if row.get("status") != "open":
-            if it["state"] == STATE_DEST:      # crashed after the compost, before the state flip
-                it["state"] = STATE_APPLIED
-                rep.applied.append(idx)
+    pp = Path(plan_path).resolve()
+    with _plan_lock(pp):
+        doc = load_plan(pp)                    # read under the lock: never a copy another run is rewriting
+        spores_json = Path(doc["spores_json"])
+        plan_id = doc["plan_id"]
+        rep = Report(pp)
+        live = (STATE_PENDING, STATE_DEST, STATE_STALE)
+        for it in doc["items"]:
+            if it["state"] in live:
+                _validate_dest(it)             # every item judged before the first write
+        db = _episode_store(doc, episodic_db) if _needs_episodes(doc, live) else None
+        spores = guarded_spore_store(spores_json)
+
+        def leave(it: dict[str, Any], why: str) -> None:
+            found = _locate_destination(it, plan_id, spores, db)
+            if found is not None:
+                it["result"] = found
+                it["state"] = STATE_CONFLICT
+                why += (f"; its destination ({found['kind']} {found['id']}) is kept on record and "
+                        "--revert removes it")
             else:
                 it["state"] = STATE_STALE
-                rep.skipped.append((idx, "already resolved since the plan was made"))
-            continue
-        own = [n for n in _notes(row) if NOTE_MARK not in n]       # a resumed apply has added its own marker
-        if row.get("text") != it["text"] or _disp(row) != it["disposition"] or own != it["notes"]:
-            it["state"] = STATE_STALE
-            rep.skipped.append((idx, "edited since the plan was made; re-run the dry run"))
-            continue
-        result = _write_destination(it, plan_id, spores, db)
-        if fault:
-            fault("after_destination", it)
-        it["result"] = result
-        it["state"] = STATE_DEST
-        _atomic_write(pp, doc)                 # the destination id is on disk BEFORE the original goes
-        if fault:
-            fault("after_record", it)
-        marker = f"{NOTE_MARK}{pp}"
-        if not any(marker in n for n in _notes(row)):
-            spores.update(row["id"], add_note=f"migrated out of the Keep by {marker}", today=today)
-        spores.descend(row["id"], kind="composted", expect_disposition=it["disposition"], today=today)
-        it["state"] = STATE_APPLIED
+            _atomic_write(pp, doc)
+            rep.skipped.append((it["index"], why))
+
+        for it in doc["items"]:
+            idx = it["index"]
+            if it["state"] not in live:
+                continue
+            row = _find_row(spores, it)
+            if row is None:
+                leave(it, "the item is no longer in the store")
+                continue
+            if row.get("status") != "open":
+                if it["state"] == STATE_DEST and _composted_by_us(row, plan_id):
+                    it["state"] = STATE_APPLIED    # crashed after the compost, before the state flip
+                    _atomic_write(pp, doc)
+                    rep.applied.append(idx)
+                else:
+                    leave(it, "already resolved since the plan was made")
+                continue
+            if _content_version(row, plan_id) != _content_version(it["row"], plan_id):
+                leave(it, "edited since the plan was made; re-run the dry run")
+                continue
+            result = _write_destination(it, plan_id, spores, db)
+            if fault:
+                fault("after_destination", it)
+            it["result"] = result
+            it["state"] = STATE_DEST
+            _atomic_write(pp, doc)             # the destination id is on disk BEFORE the original goes
+            if fault:
+                fault("after_record", it)
+            marker = f"{NOTE_MARK}{pp}"
+            try:                               # compare-and-set on the version just compared
+                cur = row
+                if not _marked(row, plan_id):
+                    cur = spores.update(row["id"], add_note=f"migrated out of the Keep by {marker}",
+                                        expected_version=spore_version(row), today=today)
+                spores.descend(row["id"], kind="composted", expect_disposition=it["disposition"],
+                               expected_version=spore_version(cur), today=today)
+            except SporeError:
+                leave(it, "changed while being applied; the original is left as it now is")
+                continue
+            it["state"] = STATE_APPLIED
+            _atomic_write(pp, doc)
+            rep.applied.append(idx)
         _atomic_write(pp, doc)
-        rep.applied.append(idx)
-    _atomic_write(pp, doc)
-    return rep
+        return rep
 
 
 def revert(plan_path: Path | str, *, episodic_db: Path | str | None = None,
            fault: Fault | None = None, today: date | None = None) -> Report:
     """``--revert <plan>``. Per applied (or half-applied) item: re-add the original (same text, notes,
-    disposition), THEN remove what the apply made (tombstone the episode / compost the seed)."""
-    from anneal_memory.spores import SporeStore
+    disposition), THEN remove what the apply made (tombstone the episode / compost the seed).
+
+    A ``conflict`` item (destination written, original changed) and a ``pending`` / ``stale`` one whose
+    destination is found by its key (a crash before the record) get their destination removed and
+    their original left exactly as it is. An original resolved by someone other than this plan is
+    never resurrected. Held under the plan lock throughout."""
+    from anneal_memory.spores import SporeError, SporeStore, spore_version
     from levain.spores import guarded_spore_store
 
-    pp = Path(plan_path)
-    doc = load_plan(pp)
-    plan_id = doc["plan_id"]
-    spores_json = Path(doc["spores_json"])
-    todo = (STATE_APPLIED, STATE_DEST)
-    db = _episode_store(doc, episodic_db) if _needs_episodes(doc, todo) else None
-    plain = SporeStore(spores_json)             # ONLY for restoring a retired disposition (see module doc)
-    guarded = guarded_spore_store(spores_json)
-    rep = Report(pp)
-    for it in doc["items"]:
-        idx = it["index"]
-        if it["state"] not in todo:
-            if it["state"] != STATE_REVERTED:
+    pp = Path(plan_path).resolve()
+    with _plan_lock(pp):
+        doc = load_plan(pp)
+        plan_id = doc["plan_id"]
+        spores_json = Path(doc["spores_json"])
+        restore_states = (STATE_APPLIED, STATE_DEST)
+        if _needs_episodes(doc, restore_states + (STATE_CONFLICT,)):
+            db: Path | None = _episode_store(doc, episodic_db)
+        elif _needs_episodes(doc, (STATE_PENDING, STATE_STALE)):
+            try:                               # only a probe for an unrecorded crash-time write
+                db = _episode_store(doc, episodic_db)
+            except KeepMigrateError:
+                db = None
+        else:
+            db = None
+        plain = SporeStore(spores_json)         # ONLY for restoring a retired disposition (see module doc)
+        guarded = guarded_spore_store(spores_json)
+        rep = Report(pp)
+        for it in doc["items"]:
+            idx = it["index"]
+            if it["state"] == STATE_REVERTED:
+                continue
+            res = _locate_destination(it, plan_id, guarded, db)
+            restore = it["state"] in restore_states
+            if not restore and res is None:
                 rep.skipped.append((idx, f"state {it['state']}: nothing was applied"))
-            continue
-        orig = _find_row(plain, it)
-        if orig is None or orig.get("status") != "open":
-            row = it["row"]
-            made = plain.add(
-                type=row.get("type", "thought"), text=it["text"], domain=row.get("domain") or "",
-                tier=row.get("tier") or "warm", salience=int(row.get("salience") or 0),
-                next=row.get("next") or None, pointer=row.get("pointer"),
-                disposition=it["disposition"], target=row.get("target"), attention=row.get("attention"),
-                germinated=row.get("germinated"), origin_key=_revert_key(plan_id, it))
-            _restore_row_fields(plain, made["id"], row)
-            it["restored_id"] = made["id"]
-        if fault:
-            fault("after_restore", it)
-        res = it.get("result") or {}
-        if res.get("kind") == DEST_EPISODE and res.get("id"):
-            from anneal_memory import Store
+                continue
+            if restore:
+                rev_key = _revert_key(plan_id, it)
+                again = plain.get_by_origin_key(rev_key)
+                if again is not None:          # a re-run after a crash: restored already, left as it is
+                    it["restored_id"] = again["id"]
+                else:
+                    orig = _find_row(plain, it)
+                    ours = (orig is None or it["state"] == STATE_APPLIED or _composted_by_us(orig, plan_id))
+                    if orig is not None and orig.get("status") == "open":
+                        pass                   # never composted (a crash before the compost)
+                    elif not ours:
+                        rep.skipped.append((idx, "the original was resolved outside this plan; not re-added"))
+                    else:
+                        row = it["row"]
+                        made = plain.add(
+                            type=row.get("type", "thought"), text=it["text"], domain=row.get("domain") or "",
+                            tier=row.get("tier") or "warm", salience=int(row.get("salience") or 0),
+                            next=row.get("next") or None, pointer=row.get("pointer"),
+                            disposition=it["disposition"], target=row.get("target"),
+                            attention=row.get("attention"), germinated=row.get("germinated"),
+                            origin_key=rev_key)
+                        _restore_row_fields(plain, made["id"], row)
+                        it["restored_id"] = made["id"]
+                _atomic_write(pp, doc)         # the restore is on record before the destination goes
+            if fault:
+                fault("after_restore", it)
+            if res is not None and res.get("kind") == DEST_EPISODE:
+                from anneal_memory import Store
 
-            assert db is not None
-            with Store(str(db)) as st:
-                if st.get(res["id"]) is not None:
-                    st.delete(res["id"])
-        elif res.get("kind") == DEST_SPORE and res.get("id"):
-            dest = guarded.get(res["id"])
-            if dest is not None and dest.get("status") == "open":
-                guarded.update(dest["id"], add_note=f"reverted by {NOTE_MARK}{pp}", today=today)
-                guarded.descend(dest["id"], kind="composted", today=today)
-        it["state"] = STATE_REVERTED
+                assert db is not None
+                with Store(str(db)) as st:
+                    if st.get(res["id"]) is not None:
+                        st.delete(res["id"])
+            elif res is not None and res.get("kind") == DEST_SPORE:
+                dest = guarded.get(res["id"])
+                if dest is not None and dest.get("status") == "open":
+                    try:                       # compare-and-set: an edit landing mid-revert is not composted
+                        cur = guarded.update(dest["id"], add_note=f"reverted by {NOTE_MARK}{pp}",
+                                             expected_version=spore_version(dest), today=today)
+                        guarded.descend(dest["id"], kind="composted",
+                                        expected_version=spore_version(cur), today=today)
+                    except SporeError:
+                        rep.skipped.append((idx, f"destination {dest['id']} changed during the revert; left open"))
+            it["state"] = STATE_REVERTED
+            _atomic_write(pp, doc)
+            rep.reverted.append(idx)
         _atomic_write(pp, doc)
-        rep.reverted.append(idx)
-    _atomic_write(pp, doc)
-    return rep
+        return rep

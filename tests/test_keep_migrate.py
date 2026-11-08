@@ -213,6 +213,175 @@ def test_apply_without_the_episode_store_changes_nothing(env: Env):
     assert _sha(env.spores) == before
 
 
+class Boom(RuntimeError):
+    pass
+
+
+def _index_of(plan_path: Path, text: str) -> int:
+    return next(i["index"] for i in km.load_plan(plan_path)["items"] if i["text"] == text)
+
+
+def _open_row(env: Env, text: str) -> dict:
+    return next(r for r in env.plain().list_open() if r["text"] == text)
+
+
+def test_revert_crash_after_restore_restores_once(env: Env):
+    # (1) a crash between the restore and the state flip; the re-run must not re-add the original
+    original = env.open_set()
+    p = _plan(env)
+    km.apply(p, episodic_db=env.db)
+
+    def fault(s, item):
+        if s == "after_restore" and item["index"] == 0:
+            raise Boom
+
+    with pytest.raises(Boom):
+        km.revert(p, episodic_db=env.db, fault=fault)
+    text0 = km.load_plan(p)["items"][0]["text"]
+    env.plain().update(_open_row(env, text0)["id"], add_note="touched after the crash")
+    km.revert(p, episodic_db=env.db)
+    rows = [r for r in env.plain().list_open() if r["text"] == text0]
+    assert len(rows) == 1                                               # no doubled original
+    assert any("touched after the crash" in n for n in rows[0]["notes"])   # the restore is not re-run over it
+    assert env.episodes() == []
+    assert len(env.open_set()) == len(original)
+
+
+@pytest.mark.parametrize("stage", ["after_destination", "after_record"])
+def test_a_destination_written_before_an_edit_is_removed_by_revert(env: Env, stage: str):
+    # (2) crash with the destination written, the original edited, re-apply: no orphan destination
+    p = _plan(env)
+    idx = _index_of(p, "decided: the pace floor is 4")
+
+    def fault(s, item):
+        if s == stage and item["index"] == idx:
+            raise Boom
+
+    with pytest.raises(Boom):
+        km.apply(p, episodic_db=env.db, fault=fault)
+    s = env.plain()
+    s.update(_open_row(env, "decided: the pace floor is 4")["id"], text="decided: the pace floor is 5")
+    rep = km.apply(p, episodic_db=env.db)
+    assert idx in [i for i, _ in rep.skipped]
+    item = km.load_plan(p)["items"][idx]
+    assert item["result"] and item["result"]["kind"] == "episode"      # the destination stays on record
+    km.revert(p, episodic_db=env.db)
+    assert env.episodes() == []                                         # nothing orphaned
+    floors = [r for r in env.open_set() if r[0].startswith("decided: the pace floor")]
+    assert len(floors) == 1 and floors[0][0] == "decided: the pace floor is 5" and floors[0][2] == "note"
+
+
+def test_scheduling_an_undated_agenda_after_the_plan_makes_it_stale(env: Env):
+    # (3) every field the destination depends on is compared, `next` included
+    p = _plan(env)
+    s = env.plain()
+    s.update(_open_row(env, "an undated agenda")["id"], next="2030-06-01")
+    rep = km.apply(p, episodic_db=env.db)
+    assert any("edited since" in why for _, why in rep.skipped)
+    assert _open_row(env, "an undated agenda")["disposition"] == "agenda"
+    assert _open_row(env, "an undated agenda")["next"] == "2030-06-01"
+    assert not [r for r in env.plain().list_open()
+                if r["text"] == "an undated agenda" and r.get("disposition") == "seed"]
+
+
+def test_an_edit_between_the_compare_and_the_compost_is_not_composted(env: Env):
+    # (3) the compare-then-compost is a compare-and-set: an edit landing after the compare survives
+    p = _plan(env)
+    idx = _index_of(p, "purple")
+
+    def fault(s, item):
+        if s == "after_record" and item["index"] == idx:
+            row = _open_row(env, "purple")
+            env.plain().update(row["id"], text="purple, edited mid-apply")
+
+    rep = km.apply(p, episodic_db=env.db, fault=fault)
+    assert idx not in rep.applied
+    assert any(r[0] == "purple, edited mid-apply" and r[2] == "note" for r in env.open_set())
+    km.revert(p, episodic_db=env.db)
+    assert not [e for e in env.episodes() if "purple" in e.content]
+
+
+def test_a_second_apply_while_one_runs_is_refused(env: Env):
+    # (4) a plan-level lock: two applies cannot interleave
+    p = _plan(env)
+    inner: list = []
+
+    def fault(s, item):
+        if s == "after_record" and item["index"] == 0 and not inner:
+            try:
+                km.apply(p, episodic_db=env.db)
+                inner.append("ran")
+            except km.KeepMigrateError as exc:
+                inner.append(exc)
+
+    km.apply(p, episodic_db=env.db, fault=fault)
+    assert isinstance(inner[0], km.KeepMigrateError)
+    assert all(i["state"] == km.STATE_APPLIED for i in km.load_plan(p)["items"])
+
+
+def test_plan_name_allocation_never_overwrites(env: Env, monkeypatch):
+    # (4) the name is reserved atomically: a racing planner that saw the name free cannot clobber it
+    from datetime import datetime, timezone
+
+    now = datetime(2026, 11, 7, 12, 0, 0, tzinfo=timezone.utc)
+    first = _plan(env, now=now)
+    first_bytes = first.read_bytes()
+    monkeypatch.setattr(km.Path, "exists", lambda self: False)          # both planners saw it free
+    second = _plan(env, now=now)
+    assert second != first and first.read_bytes() == first_bytes
+
+
+def test_an_episode_override_without_a_type_is_a_clean_error(env: Env):
+    # (5) KeepMigrateError, not KeyError
+    row = next(r for r in env.plain().list_open() if r["text"] == "purple")
+    with pytest.raises(km.KeepMigrateError):
+        _plan(env, overrides={row["origin_key"]: {"kind": "episode"}})
+
+
+def test_spore_destinations_carry_the_agenda_fields_and_the_age(env: Env):
+    # (6) target / attention / germinated ride over; so do created / seen when the row has no notes
+    s = env.plain()
+    h = s.add(type="task", text="a targeted handoff", disposition="handoff", target="alice",
+              attention="high", germinated={"on": "2026-10-01"})
+    doc = json.loads(env.spores.read_text())
+    for r in doc["spores"]:
+        if r["text"] == "an undated agenda":
+            r["created"] = "2025-01-02"
+    env.spores.write_text(json.dumps(doc, indent=1))
+    p = _plan(env)
+    km.apply(p, episodic_db=env.db)
+    seed = _open_row(env, "a targeted handoff")
+    assert seed["disposition"] == "seed" and seed["id"] != h["id"]
+    assert seed.get("target") == "alice" and seed.get("attention") == "high" \
+        and seed.get("germinated") == {"on": "2026-10-01"}
+    assert _open_row(env, "an undated agenda")["created"] == "2025-01-02"
+
+
+@pytest.mark.parametrize("stage", ["after_destination", "after_record"])
+def test_crash_on_a_spore_destination_retries_once(env: Env, stage: str):
+    # (7) the spore-destination crash-retry path: each seed lands exactly once, notes once
+    original = env.open_set()
+    p = _plan(env)
+    idx = _index_of(p, "pick up the Liz thread")
+
+    def fault(s, item):
+        if s == stage and item["index"] == idx:
+            raise Boom
+
+    with pytest.raises(Boom):
+        km.apply(p, episodic_db=env.db, fault=fault)
+    rep = km.apply(p, episodic_db=env.db)
+    assert idx in rep.applied
+    liz = [r for r in env.plain().list_open() if r["text"] == "pick up the Liz thread"]
+    assert len(liz) == 1 and liz[0]["disposition"] == "seed"
+    assert liz[0]["notes"] == km.load_plan(p)["items"][idx]["notes"]
+    seeds = [r for r in env.plain().list_open() if r.get("disposition") == "seed"]
+    assert sorted(r["text"] for r in seeds) == sorted(
+        ["a live seed", "remember to renew the domain", "pick up the Liz thread", "an undated agenda"])
+    km.revert(p, episodic_db=env.db)
+    assert env.open_set() == original
+
+
 def test_the_guard_still_refuses_a_new_retired_write(env: Env):
     from levain.spores import RetiredDisposition, guarded_spore_store
 
