@@ -195,3 +195,11 @@ def test_focus_and_visibility_re_read_the_spend_after_the_first_read(tmp_path, m
         {"eval": "document.querySelectorAll('.vc-spend').length"},
     ], b)
     assert v[1] == -1 and v[5] == 2, v
+
+
+def test_no_stream_key_needs_a_keyed_provider_whose_grant_includes_stt(tmp_path, monkeypatch):
+    monkeypatch.setattr(cv, "STREAM_PROVIDERS", ("openai",))
+    # an stt-capable provider keyed for tts only is not a key that can stream, and not a key that can transcribe either
+    assert _body(tmp_path, monkeypatch, {"deepgram": ["tts"]}, setting=True)["mic_in"] == {"on": False, "reason": "no_stt_key"}
+    assert _body(tmp_path, monkeypatch, {"deepgram": ["tts"], "inworld": ["tts"]}, setting=True)["mic_in"] == {"on": False, "reason": "no_stt_key"}
+    assert _body(tmp_path, monkeypatch, {"deepgram": ["stt", "tts"]}, setting=True)["mic_in"] == {"on": False, "reason": "no_stream_key"}
