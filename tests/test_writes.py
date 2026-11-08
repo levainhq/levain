@@ -796,6 +796,12 @@ def _add_spore(install: Path, *, stype: str = "task", text: str = "ship 2b-ii", 
     return str(s["id"])
 
 
+def _legacy_seed(install: Path, text: str, disposition: str) -> str:
+    """A pre-TS-1 row: a retired handoff / Keep note can no longer be WRITTEN through the seam, so a
+    legacy row is planted straight in the store (what an install carries from before the retirement)."""
+    return _add_spore(install, stype="thought", text=text, disposition=disposition)
+
+
 def _spore_store(install: Path):
     from anneal_memory.spores import SporeStore
 
@@ -856,8 +862,7 @@ class TestSporeVerbs:
     # -- descend has NO server gate, so the client snapshot is the only guard — a direct mismatch
     # -- IS the test (no need to fake a concurrent flip; the stale snapshot is the stale state).
     def test_descend_expect_disposition_match_composts(self, install: Path) -> None:
-        nid = apply_edit(_scope(install), {
-            "kind": "spore_seed", "text": "ref", "disposition": "note"})["spore_id"]
+        nid = _legacy_seed(install, "ref", "note")
         res = apply_edit(_scope(install), {
             "kind": "spore_descend", "spore_id": nid, "spore_kind": "composted",
             "confirm": True, "expect_disposition": "note"})  # snapshot matches → removes
@@ -889,8 +894,7 @@ class TestSporeVerbs:
     def test_descend_without_expect_disposition_skips_cas(self, install: Path) -> None:
         # back-compat: a caller that doesn't render-snapshot (omits the key) gets no CAS — the flow
         # CLI, which is already single-flock-atomic, descends through anneal without the param.
-        nid = apply_edit(_scope(install), {
-            "kind": "spore_seed", "text": "ref", "disposition": "note"})["spore_id"]
+        nid = _legacy_seed(install, "ref", "note")
         res = apply_edit(_scope(install), {
             "kind": "spore_descend", "spore_id": nid, "spore_kind": "composted", "confirm": True})
         assert res["ok"]
@@ -983,9 +987,9 @@ class TestTrayWriteKinds:
     def test_seed_allows_an_explicit_tray_disposition(self, install: Path) -> None:
         res = apply_edit(_scope(install), {
             "kind": "spore_seed", "text": "pick up the modal work next session",
-            "disposition": "handoff",
+            "disposition": "agenda",
         })
-        assert _spore_store(install).get(res["spore_id"])["disposition"] == "handoff"
+        assert _spore_store(install).get(res["spore_id"])["disposition"] == "agenda"
 
     def test_seed_refuses_a_loop_disposition(self, install: Path) -> None:
         # you don't 'dump' a cognition loop — that's the normal add path, not the Tray
@@ -1003,16 +1007,6 @@ class TestTrayWriteKinds:
         with pytest.raises(EditError) as ei:
             apply_edit(_scope(install), {"kind": "spore_seed", "text": "x" * (MAX_SPORE_TEXT_BYTES + 1)})
         assert ei.value.code == "too_large" and ei.value.http_status == 413
-
-    def test_seed_creates_a_keep_note(self, install: Path) -> None:
-        # the Keep durable-reference half: disposition=note → cognition-excluded, bucket Keep
-        from levain.spores import BUCKET_KEEP, bucket_of, is_loop
-        res = apply_edit(_scope(install), {
-            "kind": "spore_seed", "text": "docker: levain-vps init", "disposition": "note",
-        })
-        sp = _spore_store(install).get(res["spore_id"])
-        assert sp["disposition"] == "note"
-        assert not is_loop(sp) and bucket_of(sp) == BUCKET_KEEP
 
     def test_seed_defaults_to_thought_type(self, install: Path) -> None:
         sid = apply_edit(_scope(install), {"kind": "spore_seed", "text": "untyped dump"})["spore_id"]
@@ -1059,10 +1053,10 @@ class TestTrayWriteKinds:
         assert "disposition" not in spore  # key-free → back in cognition
 
     def test_set_disposition_reroute_within_tray_needs_no_confirm(self, install: Path) -> None:
-        # seed → handoff is inbox shuffling, not a cognition demotion → no confirm
+        # seed → agenda is inbox shuffling, not a cognition demotion → no confirm
         sid = apply_edit(_scope(install), {"kind": "spore_seed", "text": "x"})["spore_id"]
         res = apply_edit(_scope(install), {
-            "kind": "spore_set_disposition", "spore_id": sid, "disposition": "handoff",
+            "kind": "spore_set_disposition", "spore_id": sid, "disposition": "agenda",
         })
         assert res["ok"]
         assert any(s["id"] == sid for s in _spore_store(install).list_open())
@@ -1089,17 +1083,6 @@ class TestTrayWriteKinds:
         rec = recent_edits(install / ".levain")[0]
         assert rec["prior_disposition"] == "loop" and rec["disposition"] == "seed"
 
-    def test_set_disposition_demote_live_loop_to_note_requires_confirm(self, install: Path) -> None:
-        # M1: loop→note is the same silent-cognition-loss as loop→Tray (a note is even
-        # stickier — durable + resolve-exempt), so the confirm gate covers NON_COGNITION,
-        # not just TRAY.
-        sid = _add_spore(install, tier="hot")
-        with pytest.raises(EditError) as ei:
-            apply_edit(_scope(install), {
-                "kind": "spore_set_disposition", "spore_id": sid, "disposition": "note"})
-        assert ei.value.code == "confirm_required" and ei.value.http_status == 409
-        assert "disposition" not in _spore_store(install).get(sid)  # loop untouched
-
     def test_set_disposition_parked_loop_to_tray_now_requires_confirm(self, install: Path) -> None:
         # C (codex L3 MED, reproduced `warm seed`): the confirm gate previously EXEMPTED
         # parked loops (tier != "parked"). But the CAS at the write guards `disposition`, NOT
@@ -1122,9 +1105,7 @@ class TestTrayWriteKinds:
 
     # -- A: the KEEP-NOTE PROMOTE lifecycle — a note CAN be re-routed OUT (relaxed 2026-06-23) --
     def _seed_note(self, install: Path) -> str:
-        return apply_edit(_scope(install), {
-            "kind": "spore_seed", "text": "docker: levain init", "disposition": "note",
-        })["spore_id"]
+        return _legacy_seed(install, "docker: levain init", "note")
 
     def test_set_disposition_note_to_loop_promotes(self, install: Path) -> None:
         # note→loop ACTIVATES a note into a key-free cognition loop (was refused as note-terminal
@@ -1166,14 +1147,6 @@ class TestTrayWriteKinds:
             "ref": "projects/x", "confirm": True})
         assert res["ok"]
 
-    def test_set_disposition_note_to_note_is_a_noop(self, install: Path) -> None:
-        # note→note: a harmless same-state write (the relaxed verb still accepts it).
-        sid = self._seed_note(install)
-        res = apply_edit(_scope(install), {
-            "kind": "spore_set_disposition", "spore_id": sid, "disposition": "note"})
-        assert res["ok"]
-        assert _spore_store(install).get(sid)["disposition"] == "note"
-
     def test_set_disposition_promote_note_needs_no_confirm(self, install: Path) -> None:
         # The confirm gate fires ONLY on demoting a LIVE loop into operator-I/O. A note is not a
         # loop (is_loop False), so promoting it OUT lands WITHOUT a confirm (no EditError raised).
@@ -1203,49 +1176,6 @@ class TestTrayWriteKinds:
         apply_edit(_scope(install), {
             "kind": "spore_set_disposition", "spore_id": sid, "disposition": "agenda"})
         assert _spore_store(install).get(sid)["next"] == "2026-07-01"  # alarm preserved
-
-    def test_set_disposition_date_on_note_destination_refused(self, install: Path) -> None:
-        # L1 2026-06-23: a Keep note has no temporal dimension. Setting a date while the
-        # destination STAYS a note is refused (fail-loud) — it would write an inert `next` no Keep
-        # renderer reads; "remind me" PROMOTES it to the Tray instead. Fail-closed: untouched.
-        sid = self._seed_note(install)
-        with pytest.raises(EditError) as ei:
-            apply_edit(_scope(install), {
-                "kind": "spore_set_disposition", "spore_id": sid,
-                "disposition": "note", "surface_at": "2026-07-01"})
-        assert ei.value.code == "bad_verb_arg" and "schedule" in str(ei.value)
-        sp = _spore_store(install).get(sid)
-        assert sp["disposition"] == "note" and sp.get("next") is None  # untouched, no inert next
-
-    def test_set_disposition_clear_surface_at_on_note_allowed(self, install: Path) -> None:
-        # the guard refuses SETTING a date on a note, but CLEARING (null/'') is harmless cleanup.
-        sid = self._seed_note(install)
-        res = apply_edit(_scope(install), {
-            "kind": "spore_set_disposition", "spore_id": sid,
-            "disposition": "note", "surface_at": ""})
-        assert res["ok"]
-        assert _spore_store(install).get(sid)["disposition"] == "note"
-
-    def test_set_disposition_routing_a_dated_seed_into_note_force_clears_next(self, install: Path) -> None:
-        # codex L3 MED + complement L3 HIGH: routing a DATED item into a note must CLEAR the carried
-        # `next` (no explicit surface_at given) — else the note holds an inert date and a later
-        # note→Tray promote would hide it until that date (silent loss from both surfaces).
-        sid = _add_spore(install, disposition="seed", next="2026-07-01")
-        res = apply_edit(_scope(install), {
-            "kind": "spore_set_disposition", "spore_id": sid, "disposition": "note"})
-        assert res["ok"]
-        sp = _spore_store(install).get(sid)
-        assert sp["disposition"] == "note" and sp.get("next") is None  # carried date force-cleared
-
-    def test_set_disposition_demote_dated_loop_into_note_clears_next_with_confirm(self, install: Path) -> None:
-        # the demote variant (loop→note is confirm-gated): with confirm, the carried alarm is also
-        # force-cleared — the note ends up with no `next`, no later silent resurface.
-        sid = _add_spore(install, disposition=None, tier="hot", next="2026-07-01")  # a live, scheduled loop
-        res = apply_edit(_scope(install), {
-            "kind": "spore_set_disposition", "spore_id": sid, "disposition": "note", "confirm": True})
-        assert res["ok"]
-        sp = _spore_store(install).get(sid)
-        assert sp["disposition"] == "note" and sp.get("next") is None
 
     def test_ascend_toctou_concurrent_flip_to_note_fails_closed(self, install: Path, monkeypatch) -> None:
         # codex L3 HIGH 2026-06-23 CLOSED: the note-ascend guard reads the disposition in a SEPARATE
@@ -1318,9 +1248,7 @@ class TestTrayWriteKinds:
         # it) — the CAS in anneal's update must reject, so no write lands on stale state.
         from anneal_memory.spores import SporeStore
 
-        sid = apply_edit(_scope(install), {
-            "kind": "spore_seed", "text": "x", "disposition": "handoff",
-        })["spore_id"]
+        sid = _legacy_seed(install, "x", "handoff")
         real_get = SporeStore.get
 
         def stale_get(self, sid_):  # returns disposition="seed" though the store has "handoff"
@@ -1466,8 +1394,7 @@ class TestSporeUpdate:
     def test_note_cannot_ascend(self, install: Path) -> None:
         # H2: a note is durable reference, NOT a prospective loop that became memory — ascend
         # is refused (descend/remove is the only resolution path for reference).
-        nid = apply_edit(_scope(install), {
-            "kind": "spore_seed", "text": "ref", "disposition": "note"})["spore_id"]
+        nid = _legacy_seed(install, "ref", "note")
         with pytest.raises(EditError) as ei:
             apply_edit(_scope(install), {
                 "kind": "spore_ascend", "spore_id": nid, "spore_kind": "pattern",
@@ -1479,8 +1406,7 @@ class TestSporeUpdate:
         # spore-174: rendered as a loop, re-routed to a Keep note before the click. The snapshot is the
         # client's: the answer is stale (re-read), not not_ascendable (which would leave the old row up).
         sid = _add_spore(install)
-        apply_edit(_scope(install), {"kind": "spore_set_disposition", "spore_id": sid,
-                                     "disposition": "note", "confirm": True})
+        _spore_store(install).update(sid, disposition="note")   # a legacy note (the seam no longer writes one)
         with pytest.raises(EditError) as ei:
             apply_edit(_scope(install), {
                 "kind": "spore_ascend", "spore_id": sid, "spore_kind": "pattern",
@@ -1525,8 +1451,7 @@ class TestSporeUpdate:
         assert not any(r["id"] in (a, b) for r in _spore_store(install).list_open())
 
     def test_note_rendered_as_a_note_still_answers_not_ascendable_with_a_snapshot(self, install: Path) -> None:
-        nid = apply_edit(_scope(install), {
-            "kind": "spore_seed", "text": "ref", "disposition": "note"})["spore_id"]
+        nid = _legacy_seed(install, "ref", "note")
         with pytest.raises(EditError) as ei:
             apply_edit(_scope(install), {
                 "kind": "spore_ascend", "spore_id": nid, "spore_kind": "pattern",
@@ -1536,7 +1461,7 @@ class TestSporeUpdate:
     def test_set_disposition_stale_snapshot_beats_confirm_required(self, install: Path) -> None:
         # rendered as a Keep note, activated to a loop elsewhere: "-> tray" used to answer confirm_required
         # (never a re-read). It is stale, and nothing is written.
-        sid = apply_edit(_scope(install), {"kind": "spore_seed", "text": "n", "disposition": "note"})["spore_id"]
+        sid = _legacy_seed(install, "n", "note")
         apply_edit(_scope(install), {"kind": "spore_set_disposition", "spore_id": sid, "disposition": "loop"})
         with pytest.raises(EditError) as ei:
             apply_edit(_scope(install), {"kind": "spore_set_disposition", "spore_id": sid,
@@ -1561,8 +1486,7 @@ class TestSporeUpdate:
 
     def test_note_can_be_removed_via_descend(self, install: Path) -> None:
         # the legitimate resolution for reference: remove = descend composted.
-        nid = apply_edit(_scope(install), {
-            "kind": "spore_seed", "text": "ref", "disposition": "note"})["spore_id"]
+        nid = _legacy_seed(install, "ref", "note")
         res = apply_edit(_scope(install), {
             "kind": "spore_descend", "spore_id": nid, "spore_kind": "composted", "confirm": True})
         assert res["ok"]
@@ -1576,8 +1500,7 @@ class TestSporeUpdate:
         assert _spore_store(install).get(sid)["type"] == "thought"  # untouched
 
     def test_reclassify_locked_on_a_note(self, install: Path) -> None:
-        sid = apply_edit(_scope(install), {
-            "kind": "spore_seed", "text": "ref", "disposition": "note"})["spore_id"]
+        sid = _legacy_seed(install, "ref", "note")
         with pytest.raises(EditError) as ei:
             apply_edit(_scope(install), {"kind": "spore_update", "spore_id": sid, "type": "task"})
         assert ei.value.code == "type_locked" and ei.value.http_status == 409
@@ -1613,10 +1536,10 @@ class TestSporeUpdate:
         apply_edit(_scope(install), {"kind": "spore_update", "spore_id": sid, "tier": "warm"})
         assert _spore_store(install).get(sid)["tier"] == "warm"
 
-    def test_park_pins_an_open_loop_to_keep_without_resolving(self, install: Path) -> None:
+    def test_park_pins_an_open_loop_without_resolving(self, install: Path) -> None:
         # The "park" verb = spore_update{tier:parked} (the mirror of un-park). The loop must
         # stay OPEN — park is pause-not-resolve (that's why it is NOT a compost/descend kind);
-        # bucket_of then routes the parked-tier OPEN loop into Keep [Phill 2026-06-19].
+        # bucket_of keeps the parked-tier OPEN loop in Open loops, marked parked [TS-5a].
         sid = _add_spore(install, tier="warm")
         apply_edit(_scope(install), {"kind": "spore_update", "spore_id": sid, "tier": "parked"})
         rec = _spore_store(install).get(sid)
@@ -1662,8 +1585,7 @@ class TestSporeUpdate:
     def test_text_only_ignores_a_mismatched_expect_disposition(self, install: Path) -> None:
         # a text edit is disposition-INDEPENDENT → even a mismatched snapshot must NOT CAS-reject;
         # only the tier path threads the snapshot (the type path CASes its own server-read value).
-        sid = apply_edit(_scope(install), {
-            "kind": "spore_seed", "text": "x", "disposition": "handoff"})["spore_id"]
+        sid = _legacy_seed(install, "x", "handoff")
         res = apply_edit(_scope(install), {
             "kind": "spore_update", "spore_id": sid, "text": "edited",
             "expect_disposition": "seed"})  # mismatched, but text-only → ignored, no CAS
@@ -1697,8 +1619,7 @@ class TestSporeUpdate:
     def test_descend_audit_records_resolved_disposition(self, install: Path) -> None:
         # L1 #5: the forensic trail records WHICH disposition was resolved (the snapshot, normalized
         # None→'loop'), mirroring set_disposition's prior_disposition.
-        nid = apply_edit(_scope(install), {
-            "kind": "spore_seed", "text": "ref", "disposition": "note"})["spore_id"]
+        nid = _legacy_seed(install, "ref", "note")
         apply_edit(_scope(install), {
             "kind": "spore_descend", "spore_id": nid, "spore_kind": "composted",
             "confirm": True, "expect_disposition": "note"})
@@ -1708,8 +1629,7 @@ class TestSporeUpdate:
         # a text-only edit is disposition-independent → it must NOT be CAS-rejected when the
         # disposition changed concurrently (only the reclassify gate carries the CAS).
         from anneal_memory.spores import SporeStore
-        sid = apply_edit(_scope(install), {
-            "kind": "spore_seed", "text": "x", "disposition": "handoff"})["spore_id"]
+        sid = _legacy_seed(install, "x", "handoff")
         real_get = SporeStore.get
 
         def stale_get(self, sid_):  # stale seed view; real is handoff

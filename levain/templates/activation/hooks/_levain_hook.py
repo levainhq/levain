@@ -1092,6 +1092,8 @@ def pack_drift() -> str | None:
 # taxonomy carries the vocab. This hook is a STANDALONE template (stdlib only, no levain import
 # on a stranger install), so it carries its own copy; keep it byte-identical. (levain's test
 # suite asserts this copy == levain.spores.)
+# "handoff" and "note" are RETIRED (TS-1: no new ones are written) but legacy rows carry them, so they STAY here:
+# is_loop fails open on an unknown value, and dropping them would flood the collision surface.
 _NON_COGNITION_DISPOSITIONS = ("seed", "handoff", "agenda", "note")
 
 

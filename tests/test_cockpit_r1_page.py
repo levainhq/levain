@@ -364,10 +364,10 @@ cases.send_inbox_501_shows_the_server_text = async () => {
   ok(env.posts[1].body.idempotency_key !== "ignored-key", "the page mints its own key");
 };
 
-// the Tray offers the create; the Keep is empty and offers nothing itself
-function withTrayAndKeep(env) {
+// the Tray offers the create (there is no Keep panel any more, TS-5a)
+function withTray(env) {
   const head = (id) => ({ id, kind: "triage-list", title: id, status: "ok", as_of: "2026-10-11T12:00:00+00:00" });
-  for (const id of ["tray", "keep"]) {
+  for (const id of ["tray"]) {
     env.fx.manifest.panels[id] = head(id);
     env.fx.manifest.regions.zones[0].panels.push(id);
     env.fx.panels[id] = Object.assign(head(id), { rows: [], actions: [] });
@@ -376,25 +376,22 @@ function withTrayAndKeep(env) {
   env.fx.manifest.verbs.spore_seed = { label: "capture", tier: "C1", confirm: false, idempotent: false, fields: ["text", "type", "disposition"], effect: "adds a seed", gesture: "direct" };
 }
 
-cases.a_note_capture_posts_the_trays_create_with_the_disposition = async () => {
+cases.a_seed_capture_posts_the_trays_create_with_the_disposition = async () => {
   const env = makeEnv();
-  withTrayAndKeep(env);
+  withTray(env);
   await env.start();
-  const r = await env.opts().commit({ kind: "spore_seed", text: "keep this", disposition: "note" });
-  ok(r.ok === true, "the note capture landed");
+  const r = await env.opts().commit({ kind: "spore_seed", text: "drop this", disposition: "seed" });
+  ok(r.ok === true, "the seed capture landed");
   const b = env.posts[0].body;
-  ok(b.verb === "spore_seed" && b.panel_id === "tray" && b.params.disposition === "note" && b.params.text === "keep this", "the tray's create, disposition in params");
-  const keep = env.view().layout.find((e) => e.id === "keep");
-  ok(keep && keep.edit_class === "B", "an empty Keep shows its capture box while the Tray offers the create");
+  ok(b.verb === "spore_seed" && b.panel_id === "tray" && b.params.disposition === "seed" && b.params.text === "drop this", "the tray's create, disposition in params");
 };
 
-cases.without_a_tray_create_the_keep_has_no_capture_box = async () => {
+cases.the_board_draws_no_keep_card_even_when_the_manifest_still_names_one = async () => {
   const env = makeEnv();
-  withTrayAndKeep(env);
-  env.fx.panels.tray.actions = [];
+  withTray(env);
   await env.start();
-  const keep = env.view().layout.find((e) => e.id === "keep");
-  ok(keep && keep.edit_class !== "B", "no create offered, no capture box");
+  ok(!env.view().layout.some((e) => e.id === "keep" || e.kind === "keep"), "no Keep card in the layout");
+  ok(Array.isArray(env.view().tray) && env.view().keep === undefined, "the view carries a tray list and no keep list");
 };
 
 cases.a_5xx_cancel_answer_keeps_its_envelope_and_a_4xx_clears_it = async () => {
@@ -420,15 +417,6 @@ cases.a_declined_token_prompt_stays_quiet_on_refresh_and_a_passive_load_never_as
   ok(asked === 1, "a passive refresh after a decline does not ask again");
   await env.opts().commit({ kind: "spore_touch", spore_id: "spore-1" });
   ok(asked === 2, "a write gesture asks for the token");
-};
-
-cases.the_keep_capture_box_needs_a_postable_tray_create = async () => {
-  const env = makeEnv();
-  withTrayAndKeep(env);
-  env.fx.panels.tray.actions[0].gesture = "laptop-only";
-  await env.start();
-  const keep = env.view().layout.find((e) => e.id === "keep");
-  ok(keep && keep.edit_class !== "B", "a laptop-only create gives the Keep no capture box");
 };
 
 cases.an_undefined_param_is_dropped_and_never_throws = async () => {

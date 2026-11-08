@@ -425,6 +425,14 @@ def _stored_authority(row: Mapping[str, Any], f: str) -> Any:
     return row.get(f)
 
 
+_NO_CAS = object()
+
+
+def _keeps_disposition(effect: Effect) -> bool:
+    """An update that names the disposition the row already holds (an echo: not in ``writes``)."""
+    return "disposition" in effect.changes and "disposition" not in effect.writes
+
+
 class SporeEffectStore:
     """The ``EffectStore`` over an anneal ``SporeStore`` (§4.1.2's anneal mapping). Versions are the
     cockpit's own row version (``providers.spore_row_version``), which anneal recomputes under its
@@ -436,14 +444,15 @@ class SporeEffectStore:
 
     def __init__(self, path: str | os.PathLike[str],
                  version_of: Callable[[Mapping[str, Any]], str] | None = None) -> None:
-        from anneal_memory.spores import SporeStore
         from levain.cockpit.providers import SPORE_VERSION_FIELDS, spore_row_version
 
         self.path = Path(path)
         self.version_fields = tuple(SPORE_VERSION_FIELDS)
         # resolved here, before any store lock: the callback anneal runs under its lock imports nothing
         self.version_of = version_of or spore_row_version
-        self._store = SporeStore(self.path)
+        from levain.spores import guarded_spore_store
+
+        self._store = guarded_spore_store(self.path)
 
     # -- reads --
 
@@ -472,7 +481,9 @@ class SporeEffectStore:
         """The ``SporeApply`` for one concrete effect: the op from its shape, ``args`` from its
         ``changes``, and the postcondition leaves anneal requires (add/update: the fields in
         ``args``; descend: ``status`` + ``resolution.kind``; ascend: those + ``resolution.ref``;
-        delete: none)."""
+        delete: none). An update does not write a disposition it does not change: it carries it as
+        ``expect_disposition`` (anneal's CAS), out of the postcondition. ``None`` when that leaves
+        nothing to write (only ``apply_unit`` calls this; it answers that case itself)."""
         from anneal_memory.spores import SporeApply
 
         key = _origin_key_of(effect.resource_key)
@@ -503,7 +514,16 @@ class SporeEffectStore:
         stray = sorted(set(changes) - set(SPORE_UPDATE_FIELDS))
         if not changes or stray:
             raise PermanentApplyRefusal(f"an update changes {list(SPORE_UPDATE_FIELDS)} only (got {sorted(changes)})")
-        return SporeApply(op="update", origin_key=key, args=dict(changes), postcondition=dict(changes), **guard)
+        args: dict[str, Any] = {}
+        if _keeps_disposition(effect):
+            # the disposition the row already holds is not WRITTEN (the guarded store refuses a legacy
+            # handoff/note it is handed, unchanged or not); it rides as anneal's own CAS, a compare on
+            # the row inside the transaction that writes nothing. It is the stored form (an absent key
+            # for a plain loop), and it is out of the postcondition (anneal: no leaf names a CAS).
+            args["expect_disposition"] = changes.pop("disposition")
+            if not changes:
+                return None   # writes nothing: apply_unit answers it, version and CAS both checked
+        return SporeApply(op="update", origin_key=key, args={**changes, **args}, postcondition=dict(changes), **guard)
 
     def apply_unit(self, unit: ApplyUnit) -> UnitApplyResult:
         from anneal_memory.spores import ApplyRefused, PostconditionFailed, SporeError
@@ -516,6 +536,17 @@ class SporeEffectStore:
         # makes the file); for any other effect a missing file is a definite absence
         if not effect.is_create and (not self.path.parent.is_dir() or not self.path.exists()):
             raise StoreGone(f"{self.path} is absent")
+        if spore_apply is None:
+            # an update whose one field, the disposition, is the row's own: nothing to write, so nothing
+            # anneal can be handed. Both guards are checked here, on one read of the store: ALREADY only
+            # while the row is open, at the signed version, and still holds that disposition (the CAS,
+            # compared raw as anneal compares it); anything else means the row moved.
+            row = self.snapshot(effect.resource_key).row
+            if (row is not None and row.get("status") != "resolved"
+                    and self.version_of(copy.deepcopy(row)) == effect.expect.get("version")
+                    and row.get("disposition") == effect.changes.get("disposition")):
+                return UnitApplyResult(ApplyOutcome.ALREADY, (MemberApply(row.get("id"), row),))
+            return UnitApplyResult(ApplyOutcome.PRECONDITION_LOST, (MemberApply(None if row is None else row.get("id"), row),))
         try:
             res = self._store.apply(spore_apply)
         except (PostconditionFailed, ApplyRefused) as exc:
@@ -526,6 +557,13 @@ class SporeEffectStore:
                    "precondition_lost": ApplyOutcome.PRECONDITION_LOST}.get(res.outcome)
         if outcome is None:
             raise TransientApplyFault("ValueError", f"anneal apply outcome {res.outcome!r}")
+        cas = dict(spore_apply.args).get("expect_disposition", _NO_CAS)
+        if (outcome is ApplyOutcome.ALREADY and cas is not _NO_CAS
+                and (res.spore is None or res.spore.get("disposition") != cas)):
+            # anneal answers ALREADY from the written leaves before it reads its CAS, so a kept
+            # disposition that is no longer the row's is checked here, on the row anneal read under
+            # its lock (``res.spore``): the leaves match, the row the effect was signed on does not
+            outcome = ApplyOutcome.PRECONDITION_LOST
         return UnitApplyResult(outcome, (MemberApply(res.spore_id, res.spore),))
 
 
@@ -540,11 +578,26 @@ def _norm(value: Any) -> str:
     return normalize_spore_field(value)
 
 
-def _norm_disposition(value: Any) -> str | None:
-    from levain.spores import LOOP_DISPOSITION, VALID_DISPOSITIONS
+def _norm_disposition(value: Any, current: Any = None) -> str | None:
+    """``current``: the stored disposition. A retired value is refused only as a CHANGE: an echo of a
+    legacy row's own retired value (in any spelling anneal persists as it) is accepted, and
+    ``SporeEffectStore.spore_apply`` leaves it out of the write. Any other invalid value (None
+    included) is refused as not one of the write set (``WRITE_DISPOSITIONS``)."""
+    from levain.spores import (
+        LOOP_DISPOSITION,
+        WRITE_DISPOSITIONS,
+        RetiredDisposition,
+        refuse_retired_disposition,
+        retired_message,
+        stored_disposition,
+    )
 
-    if value not in VALID_DISPOSITIONS:
-        raise ValueError(f"disposition must be one of {list(VALID_DISPOSITIONS)} (got {value!r})")
+    try:
+        refuse_retired_disposition(value, current)
+    except RetiredDisposition as exc:
+        raise ValueError(str(exc)) from exc
+    if value not in WRITE_DISPOSITIONS and not (stored_disposition(value) == current and retired_message(value) is not None):
+        raise ValueError(f"disposition must be one of {list(WRITE_DISPOSITIONS)} (got {value!r})")
     return None if value == LOOP_DISPOSITION else _norm(value)
 
 
@@ -560,7 +613,7 @@ def _norm_date(value: Any) -> str | None:
     return value
 
 
-def _norm_update_field(f: str, value: Any) -> Any:
+def _norm_update_field(f: str, value: Any, pre: Mapping[str, Any] | None = None) -> Any:
     from anneal_memory.spores import VALID_TIERS, VALID_TYPES
 
     if f == "text":
@@ -575,7 +628,7 @@ def _norm_update_field(f: str, value: Any) -> Any:
     if f == "disposition":
         if value is None:
             return None
-        return _norm_disposition(value)
+        return _norm_disposition(value, (pre or {}).get("disposition"))
     if f == "type":
         if value not in VALID_TYPES:
             raise ValueError(f"type must be one of {list(VALID_TYPES)} (got {value!r})")
@@ -618,7 +671,7 @@ def _existing_effect(pre: Mapping[str, Any], changes: dict[str, Any], version_of
 def _ce_seed(params: Mapping[str, Any], pre: Mapping[str, Any] | None, *, origin_key: str | None,
              version_of: Callable[..., str]) -> Effect:
     from anneal_memory.spores import VALID_TYPES
-    from levain.spores import NON_COGNITION_DISPOSITIONS
+    from levain.spores import TRAY_WRITE_DISPOSITIONS
 
     if pre is not None:
         raise ValueError("a create's origin_key is already in use")
@@ -628,8 +681,14 @@ def _ce_seed(params: Mapping[str, Any], pre: Mapping[str, Any] | None, *, origin
     if stype not in VALID_TYPES:
         raise ValueError(f"type must be one of {list(VALID_TYPES)} (got {stype!r})")
     disposition = params.get("disposition", "seed")
-    if disposition not in NON_COGNITION_DISPOSITIONS:
-        raise ValueError(f"a captured item's disposition must be one of {list(NON_COGNITION_DISPOSITIONS)}")
+    from levain.spores import RetiredDisposition, refuse_retired_disposition
+
+    try:
+        refuse_retired_disposition(disposition)
+    except RetiredDisposition as exc:
+        raise ValueError(str(exc)) from exc
+    if disposition not in TRAY_WRITE_DISPOSITIONS:
+        raise ValueError(f"a captured item's disposition must be one of {list(TRAY_WRITE_DISPOSITIONS)}")
     changes: dict[str, Any] = {"type": stype, "text": _norm_update_field("text", params.get("text")),
                                "disposition": _norm(disposition)}
     if params.get("domain"):
@@ -656,21 +715,17 @@ def _ce_update(params: Mapping[str, Any], pre: Mapping[str, Any] | None, *, orig
         # only while an item is forming in the Tray
         if not is_tray(pre):
             raise ValueError("type is only reclassifiable while an item is forming in the Tray")
-    return _existing_effect(pre, {f: _norm_update_field(f, params[f]) for f in params}, version_of)
+    return _existing_effect(pre, {f: _norm_update_field(f, params[f], pre) for f in params}, version_of)
 
 
 def _ce_set_disposition(params: Mapping[str, Any], pre: Mapping[str, Any] | None, *,
                         origin_key: str | None, version_of: Callable[..., str]) -> Effect:
     pre = _require_open(pre)
     disposition = params.get("disposition")
-    changes: dict[str, Any] = {"disposition": _norm_disposition(disposition)}
+    changes: dict[str, Any] = {"disposition": _norm_disposition(disposition, pre.get("disposition"))}
     surface_at = _norm_date(params.get("surface_at")) if "surface_at" in params else None
-    # a Keep note carries no surface date, so a move into Keep clears it
-    if disposition == "note":
-        if surface_at is not None:
-            raise ValueError("a Keep note doesn't resurface on a schedule")
-        changes["next"] = None
-    elif "surface_at" in params:
+    # a move into the Keep is refused above (``_norm_disposition``): the Keep is retired
+    if "surface_at" in params:
         changes["next"] = surface_at
     return _existing_effect(pre, changes, version_of)
 
@@ -711,12 +766,15 @@ def _ce_resolve(direction: str) -> Callable[..., Effect]:
 
 def _ce_undo_edit(params: Mapping[str, Any], pre: Mapping[str, Any] | None, *, origin_key: str | None,
                   version_of: Callable[..., str]) -> Effect:
-    """``params["restore"]``: the field values the reversed edit replaced."""
+    """``params["restore"]``: the field values the reversed edit replaced. Known edge: an undo that
+    restores a RETIRED disposition (a legacy handoff/note the edit had re-dispositioned) is refused,
+    since the current row no longer holds it, so it is a CHANGE into a retired value. No UI builds
+    ``spore_undo_edit`` for a disposition."""
     pre = _require_open(pre)
     restore = params.get("restore")
     if not isinstance(restore, Mapping) or not restore:
         raise ValueError("an undo restores at least one field")
-    return _existing_effect(pre, {f: _norm_update_field(f, v) for f, v in restore.items()}, version_of)
+    return _existing_effect(pre, {f: _norm_update_field(f, v, pre) for f, v in restore.items()}, version_of)
 
 
 def _ce_undo_seed(params: Mapping[str, Any], pre: Mapping[str, Any] | None, *, origin_key: str | None,

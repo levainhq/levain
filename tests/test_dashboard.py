@@ -354,17 +354,21 @@ class TestSporeProjections:
             self._row(id="s2", text="fresh dump", disposition="seed"),
             self._row(id="s3", type="question", text="handoff", disposition="handoff"),
             self._row(id="s4", type="idea", text="agenda", disposition="agenda"),
-            self._row(id="s5", tier="parked", text="kept reference"),
+            self._row(id="s5", tier="parked", text="parked loop"),
             self._row(id="s6", tier="parked", text="parked seed", disposition="seed"),
+            self._row(id="s7", type="thought", text="legacy note", disposition="note"),
         ])
         v = build_substrate_view(AnnealPaths.from_db(db), max_spores=1000)
-        assert [s.id for s in v.open_spores] == ["s1"]
-        # disposition WINS over the parked tier: s6 (parked seed) is an un-triaged Tray
-        # item, not Keep — keeping the render boundary identical to the cognition-exclude.
-        assert {s.id for s in v.tray} == {"s2", "s3", "s4", "s6"}
-        assert [s.id for s in v.keep] == ["s5"]
+        # TS-5a: a parked loop stays in Open loops (its tier is the parked marker) ...
+        assert {s.id for s in v.open_spores} == {"s1", "s5"}
+        assert next(s for s in v.open_spores if s.id == "s5").tier == "parked"
+        # ... disposition WINS over the parked tier: s6 (parked seed) is an un-triaged Tray
+        # item, and a legacy note (s7) is shown in the Tray, never dropped.
+        assert {s.id for s in v.tray} == {"s2", "s3", "s4", "s6", "s7"}
+        assert next(s for s in v.tray if s.id == "s7").disposition == "note"
+        assert not hasattr(v, "keep")
         # TOTAL partition — every spore lands in exactly one bucket, nothing lost.
-        assert len(v.open_spores) + len(v.tray) + len(v.keep) == 6
+        assert len(v.open_spores) + len(v.tray) == 7
 
     def test_disposition_defaults_to_loop(self, tmp_path: Path) -> None:
         db = tmp_path / "memory.db"
@@ -382,7 +386,7 @@ class TestSporeProjections:
                     [self._row(id="s1", tier="hot", text="typo", disposition="sed")])
         v = build_substrate_view(AnnealPaths.from_db(db))
         assert [s.id for s in v.open_spores] == ["s1"]
-        assert v.tray == [] and v.keep == []
+        assert v.tray == []
 
     def test_each_bucket_capped_independently(self, tmp_path: Path) -> None:
         db = tmp_path / "memory.db"
@@ -390,22 +394,32 @@ class TestSporeProjections:
         for i in range(4):
             rows.append(self._row(id=f"loop{i}", tier="hot", text=f"loop {i}"))
             rows.append(self._row(id=f"seed{i}", text=f"seed {i}", disposition="seed"))
-            rows.append(self._row(id=f"keep{i}", tier="parked", text=f"keep {i}"))
+            rows.append(self._row(id=f"note{i}", text=f"note {i}", disposition="note"))
         self._write(tmp_path / "memory.spores.json", rows)
         v = build_substrate_view(AnnealPaths.from_db(db), max_spores=2)
-        assert len(v.open_spores) == 2 and len(v.tray) == 2 and len(v.keep) == 2
+        assert len(v.open_spores) == 2 and len(v.tray) == 2
 
-    def test_keep_not_starved_by_loop_heavy_store(self, tmp_path: Path) -> None:
-        # Parked (Keep) items rank LAST (parked sorts after hot/warm/cold); a flat
-        # [:max_spores] on the ranked list would drop them. Bucketing the FULL list keeps
-        # Keep alive even when active loops exceed the cap.
+    def test_tray_not_starved_by_loop_heavy_store(self, tmp_path: Path) -> None:
+        # Bucketing the FULL ranked list (not a pre-sliced head) keeps inbox rows alive when
+        # loops ahead of them in the rank exceed the cap; each bucket takes its own top N.
         db = tmp_path / "memory.db"
         rows = [self._row(id=f"loop{i}", tier="hot", text=f"loop {i}") for i in range(60)]
-        rows.append(self._row(id="kept", tier="parked", text="must survive"))
+        rows.append(self._row(id="dump", text="must survive", disposition="seed"))
         self._write(tmp_path / "memory.spores.json", rows)
         v = build_substrate_view(AnnealPaths.from_db(db))  # default max_spores=50
         assert len(v.open_spores) == 50
-        assert [s.id for s in v.keep] == ["kept"]
+        assert [s.id for s in v.tray] == ["dump"]
+
+    def test_parked_loops_not_starved_by_a_busy_install(self, tmp_path: Path) -> None:
+        # TS-5a L3 HIGH: parked sorts LAST in the rank, so a shared Open-loops cap dropped every
+        # parked loop once max_spores live loops existed. Parked loops keep their own cap.
+        db = tmp_path / "memory.db"
+        rows = [self._row(id=f"loop{i}", tier="hot", text=f"loop {i}") for i in range(60)]
+        rows.append(self._row(id="parked1", tier="parked", text="dormant"))
+        self._write(tmp_path / "memory.spores.json", rows)
+        v = build_substrate_view(AnnealPaths.from_db(db))  # default max_spores=50
+        assert len([s for s in v.open_spores if s.tier != "parked"]) == 50
+        assert [s.id for s in v.open_spores if s.tier == "parked"] == ["parked1"]
 
     def test_resolved_status_drift_row_is_skipped(self, tmp_path: Path) -> None:
         # A status=resolved row left in the `spores` array is store drift (anneal MOVES
@@ -418,7 +432,7 @@ class TestSporeProjections:
         ])
         v = build_substrate_view(AnnealPaths.from_db(db), max_spores=1000)
         all_ids = ([s.id for s in v.open_spores]
-                   + [s.id for s in v.tray] + [s.id for s in v.keep])
+                   + [s.id for s in v.tray])
         assert all_ids == ["s1"]  # the drift row excluded from EVERY bucket
 
     def test_non_str_next_is_coerced_not_crashed(self, tmp_path: Path) -> None:
@@ -430,22 +444,25 @@ class TestSporeProjections:
         v = build_substrate_view(AnnealPaths.from_db(db))
         assert v.open_spores[0].next == "20260626"
 
-    def test_to_dict_and_render_text_carry_tray_and_keep(self, tmp_path: Path) -> None:
+    def test_to_dict_and_render_text_carry_tray_and_parked(self, tmp_path: Path) -> None:
         from levain.dashboard import render_text
 
         db = tmp_path / "memory.db"
         self._write(tmp_path / "memory.spores.json", [
             self._row(id="s1", tier="hot", text="live loop"),
             self._row(id="s2", text="a fresh dump", disposition="seed"),
-            self._row(id="s5", tier="parked", text="kept reference"),
+            self._row(id="s5", tier="parked", text="parked loop"),
+            self._row(id="s6", type="thought", text="legacy note", disposition="note"),
         ])
         v = build_substrate_view(AnnealPaths.from_db(db))
         d = v.to_dict()
-        assert [s["id"] for s in d["tray"]] == ["s2"]
-        assert [s["id"] for s in d["keep"]] == ["s5"]
+        assert [s["id"] for s in d["tray"]] == ["s2", "s6"]
+        assert "keep" not in d
+        assert {s["id"] for s in d["open_spores"]} == {"s1", "s5"}
         text = render_text(v)
-        assert "Tray (1)" in text and "[seed] a fresh dump" in text
-        assert "Keep (1)" in text and "kept reference" in text
+        assert "Tray (2)" in text and "[seed] a fresh dump" in text and "[note] legacy note" in text
+        assert "Open loops (2)" in text and "[parked] parked loop" in text
+        assert "Keep" not in text
 
 
 # --- CLI surface: run_dashboard / render_text ------------------------------
@@ -708,8 +725,9 @@ class TestSlice15Surfaces:
         v = SubstrateSource.local(root).build()
         layout = v.layout()
         kinds = [e["kind"] for e in layout]
+        assert "keep" not in kinds   # TS-5a: no Keep panel in the layout
         # every panel kind is represented
-        for k in ("config", "spores", "tray", "keep", "episodes", "edits", "health",
+        for k in ("config", "spores", "tray", "episodes", "edits", "health",
                   "graph", "crystals", "section", "wraps"):
             assert k in kinds
         # zones appear in IA order: identity → operate → mind (no interleaving)
@@ -734,8 +752,8 @@ class TestSlice15Surfaces:
         by_kind = {e["kind"]: e for e in layout}
         assert by_kind["spores"]["edit_class"] == "B"
         assert by_kind["episodes"]["edit_class"] == "B"
-        # Tray + Keep (Slice 3b): now Class B in the Operate zone (dump/triage/park verbs).
-        for k in ("tray", "keep"):
+        # Tray (Slice 3b): now Class B in the Operate zone (dump/triage/park verbs).
+        for k in ("tray",):
             assert by_kind[k]["edit_class"] == "B" and by_kind[k]["zone"] == "operate"
         # consolidated cognition is read-only Class C
         assert by_kind["health"]["edit_class"] == "C"

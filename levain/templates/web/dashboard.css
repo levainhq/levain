@@ -716,7 +716,7 @@
 
   /* ── TRAY + KEEP (Slice 3b) — the capture boxes + per-row edit affordances ──
      The capture-UX: the Tray dump (label-above + type dropdown) is the human's freeform
-     drop (a `seed` is born); the Keep add-note authors durable reference. Per-row verbs
+     drop (a `seed` is born). Per-row verbs
      (edit/reclassify/metabolize/schedule/dismiss · note edit/remove · loop reactivate)
      share the metal/glass operate-zone language of the lifecycle verbs above. */
   .tray-dump {
@@ -1643,9 +1643,9 @@ html {
 html { --stripe-memory: var(--hue-2); --stripe-decisions: var(--hue-1); --stripe-work: var(--hue-3); }
 html :is([data-ck-panel="memory_glance"], [data-ck-panel="health"], [data-ck-panel="doctor"], [data-ck-panel="crystals"], [data-ck-panel="graph"], [data-ck-panel="episodes"], [data-ck-panel="wraps"], [data-ck-panel^="section:"], [data-ck-panel^="config:"])::before { background: var(--stripe-memory); }
 html :is([data-ck-panel="decisions"], [data-ck-panel="edits"])::before { background: var(--stripe-decisions); }
-html :is([data-ck-panel="sessions"], [data-ck-panel="topology"], [data-ck-panel="tray"], [data-ck-panel="loops"], [data-ck-panel="keep"], [data-ck-panel="jobs"], [data-ck-panel="ext:inbox"])::before { background: var(--stripe-work); }
+html :is([data-ck-panel="sessions"], [data-ck-panel="topology"], [data-ck-panel="tray"], [data-ck-panel="loops"], [data-ck-panel="jobs"], [data-ck-panel="ext:inbox"])::before { background: var(--stripe-work); }
 html :is(.ck-card.w, .ck-zgrid .panel:not(.ck-dash), .ck-mem-row > .panel:not(.ck-dash)):is([data-ck-panel="memory_glance"], [data-ck-panel="health"], [data-ck-panel="doctor"], [data-ck-panel="crystals"], [data-ck-panel="graph"], [data-ck-panel="episodes"],
-  [data-ck-panel="decisions"], [data-ck-panel="edits"], [data-ck-panel="sessions"], [data-ck-panel="topology"], [data-ck-panel="tray"], [data-ck-panel="loops"], [data-ck-panel="keep"], [data-ck-panel="jobs"], [data-ck-panel="ext:inbox"], [data-ck-panel^="section:"]):not(.ck-mem-nest)::before {
+  [data-ck-panel="decisions"], [data-ck-panel="edits"], [data-ck-panel="sessions"], [data-ck-panel="topology"], [data-ck-panel="tray"], [data-ck-panel="loops"], [data-ck-panel="jobs"], [data-ck-panel="ext:inbox"], [data-ck-panel^="section:"]):not(.ck-mem-nest)::before {
   content: ""; position: absolute; inset: 0 0 auto 0; height: 2px; pointer-events: none; z-index: 1; }
 html :is(.ck-card.w, .ck-zgrid .panel):is([data-ck-panel]) { position: relative; }
 /* a card alone in a column takes the column's width even when empty (the empty rule above sets align-self: start for the grid) */
@@ -1957,7 +1957,7 @@ body.ke[data-mode="memory"] .ck-zgrid [data-ck-panel="graph"], body.ke[data-mode
 body.ke[data-mode="memory"] .ck-zgrid .ck-mem-row > [data-ck-panel="graph"], body.ke[data-mode="memory"] .ck-zgrid .ck-mem-row > [data-ck-panel="wraps"] { align-self: stretch; }   /* beside Crystallized patterns the pair is one height */
 body.ke .ck-zgrid[data-ck-zone="identity"] { align-items: stretch; }
 body.ke .ck-zgrid[data-ck-zone="identity"] .panel:last-child:nth-child(odd) { grid-column: 1 / -1; }
-/* the Board: two independent stacks. Left: Tray, Now. Right: Open loops, Keep. Each is as tall as its own cards. */
+/* the Board: two independent stacks. Left: Tray, Now. Right: Open loops. Each is as tall as its own cards. */
 body.ke[data-mode="board"] .ck-zgrid.ck-twocol > .ck-col { display: flex; flex-direction: column; gap: var(--gap); min-width: 0; align-self: start; }
 body.ke[data-mode="board"] .ck-zgrid.ck-twocol > .ck-col.ck-col-off { display: none; }
 body.ke[data-mode="board"] .ck-zgrid.ck-twocol[data-cols="1"] { grid-template-columns: minmax(0, 1fr); }
@@ -1969,7 +1969,7 @@ body.ke[data-mode="board"] .ck-zgrid [data-ck-panel="episodes"] { order: 5; }
   body.ke[data-mode="board"] .ck-zgrid.ck-twocol > .panel[data-ck-pair="l"], body.ke[data-mode="board"] .ck-zgrid.ck-twocol > .panel[data-ck-pair="r"] { grid-column: auto; height: var(--card-medium); max-height: var(--card-medium); }
   body.ke[data-mode="board"] .ck-zgrid.ck-twocol > .panel[data-ck-pair="solo"] { grid-column: 1 / -1; }
 }
-/* the order inside a stack is the DOM's (dashboard_core.js ckArrange: Tray over Now, Open loops over Keep until a saved layout says otherwise) */
+/* the order inside a stack is the DOM's (dashboard_core.js ckArrange: Tray over Now, Open loops until a saved layout says otherwise) */
 
 /* K7: the Build tab. Sessions is a large card of its own (cockpit_view.js paintBuildSessions into #k7-sessions); Results sits left and
    Recent edits over Open loops right. The headings are Build's own: the Work zone's heading is shown here only. */
@@ -2086,7 +2086,7 @@ body.ke .ck-zgrid .panel.ck-is-empty:not(.ck-dash) .pbody { padding-bottom: var(
 .ck-count { font: var(--fw-semibold) var(--fs-meta)/1 var(--round); color: var(--label); background: var(--card-2); border-radius: var(--r-pill); padding: var(--sp-1) var(--sp-3); align-self: center; }
 .ck-count[hidden] { display: none; }
 
-/* a compose box (Tray, Keep) is one row until it is used: the field and its button; the sort choice and the room to write open when it
+/* a compose box (Tray) is one row until it is used: the field and its button; the sort choice and the room to write open when it
    is focused or holds text. The button keeps its place, so a click that opens the box still lands on it. */
 body.ke .tray-dump:not(.text-editor):not(.action-bare) { display: grid; grid-template-columns: minmax(0, 1fr) auto; align-items: start; gap: var(--sp-2) var(--sp-3); padding: var(--sp-2) var(--sp-2) var(--sp-2) var(--sp-4); }
 body.ke .tray-dump:not(.text-editor):not(.action-bare) .tray-dump-ta { grid-column: 1; grid-row: 1; height: 28px; min-height: 28px; max-height: 28px; padding: var(--sp-2) 0; overflow: hidden; resize: none; line-height: 1.4; white-space: nowrap; }
@@ -2593,11 +2593,11 @@ body.ke .panel > .more-foot:hover, body.ke .panel > .more-foot:focus-visible { c
 body.ke .ck-zgrid .ck-mem-crys > .more-foot { padding-inline: var(--sp-6); margin-bottom: var(--sp-4); }
 
 /* Board work lists: the repo chip sits in the meta line (the mock), its held-back line closes the list (every long panel keeps its filter box: Phill 10-11) */
-body.ke [data-ck-panel="tray"] .row > .k7-repo, body.ke [data-ck-panel="loops"] .row > .k7-repo, body.ke [data-ck-panel="keep"] .row > .k7-repo { display: inline-block; }
+body.ke [data-ck-panel="tray"] .row > .k7-repo, body.ke [data-ck-panel="loops"] .row > .k7-repo { display: inline-block; }
 body.ke [data-ck-panel="tray"] .held-line { justify-content: center; padding: var(--sp-3) 0 var(--sp-4); font-size: var(--fs-meta); }
 body.ke [data-ck-panel="tray"] .held-toggle { text-decoration: underline; text-underline-offset: 3px; }
-/* the Board's work lists show their rows whole before they fold: room for a full Tray, Now, Open loops and Keep */
-body.ke[data-mode="board"] .ck-zgrid .panel:is([data-ck-panel="tray"], [data-ck-panel="loops"], [data-ck-panel="keep"]) { max-height: 700px; }
+/* the Board's work lists show their rows whole before they fold: room for a full Tray and Open loops */
+body.ke[data-mode="board"] .ck-zgrid .panel:is([data-ck-panel="tray"], [data-ck-panel="loops"]) { max-height: 700px; }
 /* the taller Board stack's last card ends the two stacks together (dashboard_core.js balanceStacks sets the cap) */
 body.ke[data-mode="board"] .ck-zgrid.ck-twocol > .ck-col > .panel[data-stack-cap] { max-height: var(--stack-cap); }
 .grp-col { display: contents; }

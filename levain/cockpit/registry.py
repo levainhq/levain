@@ -275,11 +275,6 @@ def _loops_key(row: RowIn, today: date) -> tuple:
     return (_TIER_ORDER.get(f.get("tier"), 9), -_salience(row), -_seen_ordinal(row), row.id)
 
 
-def _keep_key(row: RowIn, today: date) -> tuple:
-    f = row.facets
-    return (_TIER_ORDER.get(f.get("tier"), 9), -_salience(row), -_seen_ordinal(row), row.id)
-
-
 def _time_desc_key(row: RowIn, today: date) -> tuple:
     # newest first: invert the timestamp string character-wise so the key is plain-ascending.
     # a row with no timestamp cannot be placed in time: it goes last, never first
@@ -381,7 +376,9 @@ register_ordering(
     builtin=True,
 )
 register_ordering(Ordering("spore.loops", _loops_key), builtin=True)
-register_ordering(Ordering("spore.keep", _keep_key), builtin=True)
+# the removed Keep panel's ordering id (TS-5a): its key was identical to the loops key, so a downstream manifest that still
+# names it keeps registering and sorting the same way (an unknown ordering id refuses the whole registration)
+register_ordering(Ordering("spore.keep", _loops_key), builtin=True)
 register_ordering(Ordering("spore.age", _age_key), builtin=True)   # the Tray's "by age" view
 register_ordering(Ordering("time.desc", _time_desc_key), builtin=True)
 register_ordering(Ordering("decision.dated", _decision_key), builtin=True)

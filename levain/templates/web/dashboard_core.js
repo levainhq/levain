@@ -151,7 +151,7 @@
   // re-renders (a verb fires → the board rebuilds → you stay in your filter) and into the
   // focus modal. Empty = show all. Matches spore text OR spore-id.
   let openLoopsQuery = "";
-  const sporeQueries = Object.create(null);  // Tray / Keep filter queries, keyed by panel kind
+  const sporeQueries = Object.create(null);  // Tray / Open loops filter queries, keyed by panel kind
   // The Tray's chosen view ("" = the kernel's own order, else a view id) and the Episodes agent filter
   // ("" = all). Both are display choices that survive a refresh re-render in the same page.
   let trayView = "";
@@ -419,7 +419,7 @@
   // reflow), short panels render at natural height (no wasted space, no scrollbar).
   // Replaces the clamp+fade+click-to-expand model (Slice 1.5): bounded overview +
   // details-on-demand (the search box + the Slice-2 modal).
-  const CLAMP_KINDS = new Set(["config", "section", "episodes", "wraps", "crystals", "spores", "tray", "keep", "external", "edits"]);
+  const CLAMP_KINDS = new Set(["config", "section", "episodes", "wraps", "crystals", "spores", "tray", "external", "edits"]);
 
   // Measure whether a bounded body overflows its cap; set the overflow SCENT (.has-overflow)
   // AND a keyboard scroll affordance accordingly. RE-RUNNABLE — clears the state when content
@@ -429,7 +429,7 @@
   // The work lists draw whole rows and say how many they leave out: a list that does not fit its card folds the rows below the fold
   // (display none, never a half row) and ends in an "N more" link that opens the panel's focus view. Re-runnable: a redraw, a filter
   // or a resize unfolds first and measures again.
-  const FOLD_PANELS = ["tray", "loops", "keep", "episodes", "inbox", "roster", "stream", "flow-episodes", "flow-spores"];
+  const FOLD_PANELS = ["tray", "loops", "episodes", "inbox", "roster", "stream", "flow-episodes", "flow-spores"];
   // what a folding list is made of: its rows (a work row, a roster row, a log line) and the headings that group them
   const FOLD_ROW = ".row, .rrow, .lrow", FOLD_HEAD = ".grp-head, .grp-h";
   function foldRows(body) {
@@ -1003,13 +1003,13 @@
     h2.after(pill);
   }
 
-  // The Board is two independent stacks, not rows that pair: Tray down the left, Open loops and Keep down the right, each as
+  // The Board is two independent stacks, not rows that pair: Tray down the left, Open loops down the right, each as
   // tall as its own cards, so the shorter card of a pair never leaves a hole. Other tabs lay the same cards out as plain grid items
   // (the stacks are display: contents there). Only a zone that holds both sides is stacked; a card the table does not name stays a
   // direct, full-width child.
-  const CK_STACK_SIDE = Object.assign(Object.create(null), { tray: 0, loops: 1, keep: 1 });
+  const CK_STACK_SIDE = Object.assign(Object.create(null), { tray: 0, loops: 1 });
   // Top to bottom inside a side when nothing is saved (the CSS used to draw this with `order`, which would override a saved order).
-  const CK_STACK_RANK = Object.assign(Object.create(null), { tray: 0, loops: 0, keep: 1 });
+  const CK_STACK_RANK = Object.assign(Object.create(null), { tray: 0, loops: 0 });
   // ---- K5: collapse and reorder the cards of a zone, saved per browser (cockpit_view.js holds the storage). Reorder is within a zone and,
   // on the Board's two stacks, within a side. The Memory and Identity zones are composed by composeMemory (their own rows and sections),
   // so the layout does not reach them; the now band, sky, widgets, brief and Needs-you strip are not zone cards and have no controls.
@@ -1286,7 +1286,7 @@
   // sentence, the fix), never a card with a body gap. An empty provider is an external panel with no rows, or one row that is the
   // provider's own report (a `no_` state key; its words are never read). Team without a ledger and an Inbox with no source
   // are the cases. A compose box stays reachable: the line carries its action ("Send"), which opens the box under the line.
-  // A card of the page's own (Tray, Keep, Identity) keeps its card: its box is its content. An empty list card folds in
+  // A card of the page's own (Tray, Identity) keeps its card: its box is its content. An empty list card folds in
   // markEmptyCards (cockpit_view.js). Idempotent: it toggles classes and adds the action once, so the observer that calls it again
   // cannot loop.
   function emptyProvider(p) {
@@ -1572,7 +1572,6 @@
       case "crystals": return renderCrystals(entry, view);
       case "spores": return renderSpores(entry, view);
       case "tray": return renderTray(entry, view);
-      case "keep": return renderKeep(entry, view);
       case "episodes": return renderEpisodes(entry, view, opts);
       case "wraps": return renderWraps(entry, view);
       case "section": return renderSection(entry, (view.sections || [])[entry.ref]);
@@ -1924,10 +1923,10 @@
     return clause;
   }
 
-  // One spore row, shared by the three projections (Open Loops / Tray / Keep). The
+  // One spore row, shared by the two projections (Open Loops / Tray). The
   // leading chip is the panel's salient axis: Tray badges the `disposition` (the
-  // operator-I/O class — seed/handoff/agenda), Open Loops + Keep badge the `tier`. `verbs`
-  // rides only on a Class-B panel (Open Loops in 3a; Tray + Keep render read-only until 3b
+  // operator-I/O class — seed/handoff/agenda), Open Loops badges the `tier` (a parked loop badges "parked"). `verbs`
+  // rides only on a Class-B panel (Open Loops in 3a; Tray renders read-only until 3b
   // turns on the governed dump/sort/park verbs — edit_class "" → isVerbPanel false → none).
   // The ONE place a verb-bearing row takes its verbs: every row kind (spore, episode, pending cancel) passes through
   // here. On the KE page the verbs are clipped until the row is hovered or has focus, so the row itself must be
@@ -2043,11 +2042,9 @@
     // e.g. "compost spore-049") — show it leading so the row is addressable; the TUI
     // shows the same id trailing (tui.render_panel_lines).
     if (s.id) { row.appendChild(el("span", "sid", s.id)); row.dataset.spore = String(s.id); }   // the Work lens finds a loop's row by this
-    // Tray badges the disposition; Open Loops the tier; Keep is mixed — a note badges
-    // "note" (reference), a pinned-dormant loop badges its tier ("parked").
+    // Tray badges the disposition (a legacy note badges "note"); Open Loops the tier (a parked loop badges "parked").
     let badge;
     if (badgeField === "disposition") badge = s.disposition;
-    else if (badgeField === "keep") badge = s.disposition === "note" ? "note" : s.tier;
     else badge = s.tier;
     if (badge) row.appendChild(tagEl("tier", badge));
     appendClause(row, s.text);  // FULL text + per-item expand (no truncation, no edit data-loss)
@@ -2069,7 +2066,7 @@
         row.appendChild(tagEl("muted", late === 0 ? "due today" : "due " + shortDate(s.next)));
       }
     }
-    if (panelKind !== "tray" && panelKind !== "keep" && s.tier) row.dataset.heat = String(s.tier);   // Open loops: a stripe per heat
+    if (panelKind !== "tray" && s.tier) row.dataset.heat = String(s.tier);   // Open loops: a stripe per heat
     if (s.age_shown && s.age) row.appendChild(el("span", "muted", s.age));
     // Build's Open loops draw "open N d" and the repo chip under the title (cockpit.css hides both elsewhere)
     // the integer the kernel sends (the spore's own created date), never the badge words parsed back
@@ -2079,7 +2076,7 @@
     return row;
   }
 
-  // The filter bar the spore panels share (Open Loops / Tray / Keep): CLIENT-side over the
+  // The filter bar the spore panels share (Open Loops / Tray): CLIENT-side over the
   // loaded list, text (case-insensitive substring) OR spore-id. The query persists per panel
   // kind in `sporeQueries`, so a verb that rebuilds the board leaves you in your filter.
   // FILTER-EXTRACT-START (a node test lifts this block)
@@ -2130,10 +2127,10 @@
   // `open_spores` error key (the dashboard does ONE spore read that fills all three).
   function renderSporeProjection(entry, view, list, emptyMsg, badgeField) {
     const p = panel(entry);
-    // All three projections (Open Loops / Tray / Keep) come from ONE dashboard spore read,
+    // Both projections (Open Loops / Tray) come from ONE dashboard spore read,
     // whose fault is recorded under the single "open_spores" key — so every projection
     // reads its error from there BY DESIGN (not a copy-paste slip). If a future split gives
-    // Tray/Keep their own source, give each its own error key here. [complement L3 LOW]
+    // Tray its own source, give each its own error key here. [complement L3 LOW]
     const err = tierErr(view, "open_spores");
     if (err) { p.appendChild(el("p", "err", "unavailable — " + err)); return p; }
     // the Tray's rows held until their surface date: listed only when the viewer asks, under the due rows
@@ -2287,16 +2284,6 @@
     // The dump box is the primary capture affordance — mounted under the title when
     // writable. A read-only port (mesh) shows the Tray but offers no dump (NO-THEATER).
     if (isVerbPanel(entry)) mountCaptureBox(p, buildTrayDump(view.entity_name || "the assistant"));
-    return p;
-  }
-
-  // Keep — durable reference: authored notes + pinned-dormant loops, lifted out of Open
-  // Loops and exempt from the dormancy→compost prompt. Slice 3b: an add-note box on top
-  // (when writable), then the list badged per-item (note → "note", parked loop → "parked").
-  function renderKeep(entry, view) {
-    const p = renderSporeProjection(entry, view, view.keep,
-      "Nothing yet. Add a note above to keep something handy.", "keep");
-    if (isVerbPanel(entry)) mountCaptureBox(p, buildKeepNote());
     return p;
   }
 
@@ -2987,8 +2974,7 @@
   // title, when the gesture is one a browser cannot perform. A legacy row lists none and is untouched.
   const BUTTON_VERB = { touch: "spore_touch", edit: "spore_update", reclassify: "spore_update", park: "spore_update",
     reactivate: "spore_update", schedule: "spore_surface_at", Snooze: "spore_surface_at", Resolve: "spore_descend", metabolize: "spore_set_disposition",
-    "→ tray": "spore_set_disposition", activate: "spore_set_disposition", "remind me": "spore_set_disposition",
-    dismiss: "spore_descend", remove: "spore_descend", compost: "spore_descend", promote: "spore_ascend",
+    dismiss: "spore_descend", compost: "spore_descend", promote: "spore_ascend",
     tombstone: "episode_tombstone" };
 
   // a row tag (a disposition, a tier, a type, hashtags, a due date): plain meta text; the page's CSS decides how it
@@ -3057,7 +3043,8 @@
     // first-class — the item isn't ready for the lifecycle verbs yet. Then the route levers.
     if (panelKind === "tray") {
       wrap.appendChild(editBtn(wrap, s));
-      wrap.appendChild(verbBtn("reclassify", "change the type — it's still forming", () =>
+      // a legacy note (the Keep is gone) is not forming: its type is fixed, so no reclassify
+      if (s.disposition !== "note") wrap.appendChild(verbBtn("reclassify", "change the type — it's still forming", () =>
         openReclassify(wrap, s)));
       // metabolize — promote into cognition as a live loop (Tray->loop is never the
       // silent-loss direction, so no confirm); the type LOCKS at this boundary.
@@ -3077,58 +3064,6 @@
       return gateByActions(wrap, s.actions);
     }
 
-    // KEEP — durable reference, NOT loop-lifecycle. Always editable. A NOTE gets the promote
-    // lifecycle (→ tray / activate / remind me); a pinned-dormant LOOP reactivates (un-park).
-    // Both end with remove.
-    if (panelKind === "keep") {
-      wrap.appendChild(editBtn(wrap, s));
-      if (s.disposition === "note") {
-        // The KEEP-NOTE PROMOTE lifecycle (2026-06-23): a deferred someday/maybe note re-enters
-        // the flow without delete+recreate (lineage preserved). A pure reference note simply
-        // never gets promoted — reference-vs-someday stays emergent (no taxonomy split). Each is
-        // a GAIN into cognition / a lateral move into the Tray (never the silent-loss demote), so
-        // no confirm. A note can't ascend directly — `activate` to a loop first, then the loop's
-        // own `promote` (ascend) is what reaches memory: a deliberate two-step.
-        // "→ tray" promotes to a generic `seed` (NOT handoff/agenda) by DESIGN — the operator
-        // triages a promoted note to the inbox, then re-classifies it there. The server + CLI
-        // allow note→{handoff,agenda} too; the GUI deliberately offers the one triage entry, not
-        // every governed transition (L2 2026-06-23, intentional narrowing — "human dumps, AI sorts").
-        wrap.appendChild(verbBtn("→ tray", "promote to the Tray inbox — surfaces for triage at next session", async (ev) => {
-          const b = ev.currentTarget; b.disabled = true;
-          const res = await commit({ kind: "spore_set_disposition", spore_id: s.id, disposition: "seed",
-          expect_disposition: s.disposition });
-          if (res && res.ok) return;  // re-rendered
-          b.disabled = false;
-          verbErr(wrap, res);
-        }));
-        wrap.appendChild(verbBtn("activate", "metabolize into a live cognition loop", async (ev) => {
-          const b = ev.currentTarget; b.disabled = true;
-          const res = await commit({ kind: "spore_set_disposition", spore_id: s.id, disposition: "loop",
-          expect_disposition: s.disposition });
-          if (res && res.ok) return;  // re-rendered
-          b.disabled = false;
-          verbErr(wrap, res);
-        }));
-        wrap.appendChild(verbBtn("remind me", "resurface in the Tray on a future date", () => openRemindForm(wrap, s)));
-      } else {
-        wrap.appendChild(verbBtn("reactivate", "un-park → back into active cognition", async (ev) => {
-          const b = ev.currentTarget; b.disabled = true;
-          // spore-173: the note-vs-parked-loop route was read off the rendered snapshot → CAS it,
-          // so a concurrent re-route to a note fails closed instead of tier=warm-ing a note and
-          // falsely reporting "reactivated". (Server normalizes 'loop'→key-absent for the compare.)
-          const res = await commit({ kind: "spore_update", spore_id: s.id, tier: "warm",
-                                     expect_disposition: s.disposition });
-          if (res && res.ok) return;  // re-rendered
-          b.disabled = false;
-          verbErr(wrap, res);
-        }));
-      }
-      if (Array.isArray(s.descend_kinds) && s.descend_kinds.length) {
-        wrap.appendChild(verbBtn("remove", "delete this from Keep", () => openRemoveConfirm(wrap, s)));
-      }
-      return gateByActions(wrap, s.actions);
-    }
-
     // OPEN LOOPS — the entity's live cognition: the lifecycle verbs (+ edit + schedule).
     wrap.appendChild(verbBtn("touch", "mark seen — reset its clock", async (ev) => {
       const b = ev.currentTarget; b.disabled = true;
@@ -3139,20 +3074,31 @@
     }));
     wrap.appendChild(editBtn(wrap, s));
     wrap.appendChild(verbBtn("schedule", "resurface on a future date", () => openSurfaceForm(wrap, s)));
-    // park — pin to Keep: hide from active cognition but the loop stays OPEN (exempt from the
-    // dormancy→compost prompt), resurfaceable. The exact inverse of Keep's "reactivate"; a tier
-    // change (spore_update{tier:parked}) → bucket_of routes it to Keep. NON-destructive (the loop
-    // isn't resolved — that's why this is NOT a compost/descend kind), so no confirm.
-    wrap.appendChild(verbBtn("park", "pin to Keep — hide from cognition, stays open (un-park to restore)", async (ev) => {
-      const b = ev.currentTarget; b.disabled = true;
-      // spore-173: park is offered only on a loop (this Open-Loops branch) → CAS the snapshot so a
-      // concurrent re-route before the write fails closed instead of tier-parking a now-note.
-      const res = await commit({ kind: "spore_update", spore_id: s.id, tier: "parked",
-                                 expect_disposition: s.disposition });
-      if (res && res.ok) return;  // re-rendered
-      b.disabled = false;
-      verbErr(wrap, res);
-    }));
+    // park — pin dormant: hide from active cognition but the loop stays OPEN (exempt from the
+    // dormancy→compost prompt), resurfaceable, and shown HERE with a parked marker (the Keep panel is gone).
+    // A parked row offers the inverse, "reactivate" (un-park, back to warm). A tier change
+    // (spore_update{tier}), NON-destructive (the loop isn't resolved), so no confirm.
+    // spore-173: both are offered only on a loop (this Open-Loops branch) → CAS the snapshot so a
+    // concurrent re-route before the write fails closed instead of tiering a now-note.
+    if (s.tier === "parked") {
+      wrap.appendChild(verbBtn("reactivate", "un-park → back into active cognition", async (ev) => {
+        const b = ev.currentTarget; b.disabled = true;
+        const res = await commit({ kind: "spore_update", spore_id: s.id, tier: "warm",
+                                   expect_disposition: s.disposition });
+        if (res && res.ok) return;  // re-rendered
+        b.disabled = false;
+        verbErr(wrap, res);
+      }));
+    } else {
+      wrap.appendChild(verbBtn("park", "pin dormant — hide from cognition, stays open (reactivate to restore)", async (ev) => {
+        const b = ev.currentTarget; b.disabled = true;
+        const res = await commit({ kind: "spore_update", spore_id: s.id, tier: "parked",
+                                   expect_disposition: s.disposition });
+        if (res && res.ok) return;  // re-rendered
+        b.disabled = false;
+        verbErr(wrap, res);
+      }));
+    }
     // compost (descend) / promote (ascend) — destructive; kind comes from the
     // spore's own type taxonomy (server-emitted, so the UI can't offer an invalid kind).
     if (Array.isArray(s.descend_kinds) && s.descend_kinds.length) {
@@ -3310,42 +3256,9 @@
     }, (f) => ({ kind: "spore_update", spore_id: s.id, type: f.sel.value }), "reclassify", false);
   }
 
-  // Remove confirm — compost a Keep item (a note/reference or a parked loop). Prefer the
-  // universal 'composted' kind; fall back to the spore's first descend kind. Remove is remove
-  // (one confirm, no kind picker).
-  function openRemoveConfirm(host, s) {
-    const kinds = Array.isArray(s.descend_kinds) ? s.descend_kinds : [];
-    const kind = kinds.indexOf("composted") >= 0 ? "composted" : kinds[0];
-    openRowForm(host, () => ({ nodes: [], focus: null }),
-      (_f, msg) => {
-        if (!kind) { msg.className = "edit-msg err"; msg.textContent = "no remove path"; return null; }
-        // spore-173: CAS the rendered snapshot — a concurrent promote of this Keep item to a live
-        // loop during the confirm fails closed instead of composting the now-live loop.
-        return { kind: "spore_descend", spore_id: s.id, spore_kind: kind, confirm: true,
-                 expect_disposition: s.disposition };
-      }, "confirm remove", true);
-  }
-
-  // "remind me" — promote a Keep note to a Tray seed AND schedule its resurface, ATOMICALLY:
-  // one spore_set_disposition carrying surface_at. Two sequential commits is impossible — a
-  // successful commit re-renders and the form's DOM is gone — so the schedule rides the promote
-  // server-side (one transaction, one CAS). The note leaves Keep for the Tray, hidden until the
-  // date, then surfaces for triage; lineage preserved (same spore).
-  function openRemindForm(host, s) {
-    openRowForm(host, () => {
-      const input = el("input", "verb-date");
-      input.type = "date";
-      return { nodes: [input], focus: input, input };
-    }, (f, msg) => {
-      if (!f.input.value) { msg.className = "edit-msg err"; msg.textContent = "pick a date"; return null; }
-      return { kind: "spore_set_disposition", spore_id: s.id, disposition: "seed", surface_at: f.input.value,
-               expect_disposition: s.disposition };
-    }, "remind me", false);
-  }
-
   // A freeform capture box. `submit` builds the request from the typed text. Used by the
-  // Tray dump (with a type dropdown) and the Keep add-note. No own label — it mounts right
-  // under the panel's title (Tray (X) / Keep (X)), like the content of every other panel;
+  // Tray dump (with a type dropdown). No own label — it mounts right
+  // under the panel's title (Tray (X)), like the content of every other panel;
   // the placeholder carries the purpose hint.
   function buildCaptureBox(placeholder, btnLabel, emptyMsg, withType, buildReq, sortEntity) {
     const box = el("div", "tray-dump");
@@ -3399,15 +3312,6 @@
         if (type) req.type = type;  // omit → server default (thought + AI routes)
         return req;
       }, entity);
-  }
-
-  // The Keep ADD-NOTE — authored durable reference (the Docker-commands case): a `note`,
-  // cognition-excluded + resolve-exempt. No type (reference never resolves).
-  function buildKeepNote() {
-    return buildCaptureBox(
-      "Add a note or a command",
-      "keep", "nothing to keep", false,
-      (text) => ({ kind: "spore_seed", text, disposition: "note" }));
   }
 
   // The destructive resolve form: a kind <select> (+ a ref <input> for ascend) and a
@@ -4120,7 +4024,7 @@
     // Governed compose affordance: mount it when the surface is writable (commitAction injected)
     // AND the panel declares an `action` whose verb is in the server's registered action_verbs.
     // Mounted under the head (mountCaptureBox) so it sits on top + the expand-to-modal transplants
-    // it — like the Tray dump / Keep add-note. Mounted EARLY so it shows even on an empty panel
+    // it — like the Tray dump. Mounted EARLY so it shows even on an empty panel
     // (compose the first message). Double-gated + NO THEATER: a read-only serve registers no verbs
     // → action_verbs is absent → no box, even if the panel still declares an action.
     const act = data.action;
@@ -8671,7 +8575,7 @@
   // rebuilds to show saved state (that's the call-site split that avoids breaking save).
   //   - an edit-of-existing (`.edit-ta` State/config, `.verb-edit-ta` spore text) is
   //     dirty once its value diverges from the `data-orig` stamped at open;
-  //   - a capture/free-text box (`.tray-dump-ta` Tray dump / Keep add-note; `.verb-ref`
+  //   - a capture/free-text box (`.tray-dump-ta` Tray dump; `.verb-ref`
   //     the ascend "what it became" ref — both always-empty at open, never prefilled) is
   //     dirty while it holds any non-whitespace text.
   // DECIDED exclusions (not blind spots — L1 review):

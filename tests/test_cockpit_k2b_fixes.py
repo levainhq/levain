@@ -283,7 +283,7 @@ def test_a_replay_of_an_applying_op_wakes_the_thread(home, spores):
         _move(b, spores, intent="reported", idempotency_key="r1")
         woke = {"n": 0}
         b.wake = lambda: woke.__setitem__("n", woke["n"] + 1)  # type: ignore[method-assign]
-        out = b.replay(verb="spore_set_disposition", params={"disposition": "note"}, intent="reported",
+        out = b.replay(verb="spore_set_disposition", params={"disposition": "agenda"}, intent="reported",
                        credential=BROWSER, idempotency_key="r1",
                        target={"kind": "row", "panel_id": "tray", "row_id": held_row_id(spores)})
         assert out is not None and out["state"] == "applying" and woke["n"] == 1
@@ -295,7 +295,7 @@ def test_dispatch_decides_gestures_under_the_brokers_own_install_class(tmp_path)
     from tests.test_cockpit_k2a import _get, _install, _post, _serve
 
     root, src, ids = _install(tmp_path)
-    body = {"verb": "spore_set_disposition", "panel_id": "tray", "params": {"disposition": "note"},
+    body = {"verb": "spore_set_disposition", "panel_id": "tray", "params": {"disposition": "agenda"},
             "dry_run": True}
     for declared, gesture in ((None, "sign"), ("reported", "direct-reported")):
         with _serve(src, surface_tokens={"browser": "T"}, install_class=declared) as (url, httpd):
@@ -331,7 +331,7 @@ def test_the_cap_receipt_reaches_the_http_body(tmp_path):
     with _serve(src, surface_tokens={"browser": "T"}, install_class="reported") as (url, httpd):
         rows = _get(f"{url}/cockpit/panel/tray.json", token="T")["rows"]
         r = next(x for x in rows if x["id"] == f"spore:{ids['seed']}")
-        at = {"verb": "spore_set_disposition", "panel_id": "tray", "params": {"disposition": "note"},
+        at = {"verb": "spore_set_disposition", "panel_id": "tray", "params": {"disposition": "agenda"},
               "row_id": r["id"], "row_version": r["version"]}
         for i in range(8):
             assert _post(f"{url}/cockpit/verb", {**at, "idempotency_key": f"h{i}"}, token="T")[0] == 200
@@ -384,7 +384,7 @@ def _key_bound_to_target(broker: Broker, spores: Path, _target: Any) -> None:
     first = _move(broker, spores, "k.seed", intent="reported", idempotency_key="same")
     assert first["state"] == "COMMITTED"
     other = _target(spores, "k.seed2")
-    e = _refused_code(broker.replay, verb="spore_set_disposition", params={"disposition": "note"},
+    e = _refused_code(broker.replay, verb="spore_set_disposition", params={"disposition": "agenda"},
                       intent="reported", credential=BROWSER, idempotency_key="same", target=other)
     assert e == "idempotency_conflict"
     # the journal's issue (the crash window: a key whose pending was issued and never decided)
@@ -393,7 +393,7 @@ def _key_bound_to_target(broker: Broker, spores: Path, _target: Any) -> None:
     assert _refused_code(_move, broker, spores, "k.seed2", idempotency_key="held") == "idempotency_conflict"
     assert SporeStore(spores).get_by_origin_key("k.seed2")["disposition"] == "seed"
     # the same row again is still a replay, though its version moved with the fire
-    again = broker.replay(verb="spore_set_disposition", params={"disposition": "note"}, intent="reported",
+    again = broker.replay(verb="spore_set_disposition", params={"disposition": "agenda"}, intent="reported",
                           credential=BROWSER, idempotency_key="same", target=_target(spores, "k.seed"))
     assert again is not None and again["pending_id"] == first["pending_id"] and again["replay"] is True
 
@@ -416,7 +416,7 @@ def test_a_read_past_the_ttl_answers_expired_and_hands_out_no_record(home, spore
         now[0] += timedelta(minutes=16)
         out = b.outcome(held["pending_id"])
         assert (out["state"], out["reason"], "record" in out) == ("EXPIRED", "expired", False), out
-        again = b.replay(verb="spore_set_disposition", params={"disposition": "note"}, intent=None,
+        again = b.replay(verb="spore_set_disposition", params={"disposition": "agenda"}, intent=None,
                          credential=BROWSER, idempotency_key="sig",
                          target={"kind": "row", "panel_id": "tray", "row_id": held_row_id(spores)})
         assert again is not None and again["state"] == "EXPIRED" and "record" not in again
@@ -535,21 +535,21 @@ def test_a_reported_pending_whose_request_died_resumes_on_replay_even_after_its_
 
         dead = new_pending_id()
         with b._admitted() as db:
-            built = b._build(db, "spore_set_disposition", {"disposition": "note"}, tgt, dead, at_issue=True)
+            built = b._build(db, "spore_set_disposition", {"disposition": "agenda"}, tgt, dead, at_issue=True)
             from datetime import timedelta
             n = b._now()
             raw = b._record(pid=dead, verb="spore_set_disposition", intent="reported", built=built,
-                            params={"disposition": "note"}, tier="T2", fence=b.capture().fence,
+                            params={"disposition": "agenda"}, tier="T2", fence=b.capture().fence,
                             issued_at=utc(n), expires_at=utc(n + timedelta(minutes=15)))
             db.issue(record_bytes=raw, principal="token:browser:1", idempotency_key="died", now=n,
                      cap_exempt=True)
         SporeStore(spores).update(SporeStore(spores).get_by_origin_key("k.seed")["id"], text="moved meanwhile")
         signed = _move(b, spores, "k.loop", idempotency_key="h")
         assert signed["state"] == "WAITING"
-        assert _refused_code(b.issue, verb="spore_set_disposition", params={"disposition": "note"},
+        assert _refused_code(b.issue, verb="spore_set_disposition", params={"disposition": "agenda"},
                              target=_target(spores, "k.loop"), tier="T2", credential=BROWSER,
                              idempotency_key="h", harness="other") == "idempotency_conflict"
-        out = b.issue(verb="spore_set_disposition", params={"disposition": "note"}, target=tgt, tier="T2",
+        out = b.issue(verb="spore_set_disposition", params={"disposition": "agenda"}, target=tgt, tier="T2",
                       credential=BROWSER, intent="reported", idempotency_key="died")
         assert (out["pending_id"], out["state"], out["replay"]) == (dead, "STALE", True), out
         assert SporeStore(spores).get_by_origin_key("k.seed")["disposition"] == "seed"
@@ -569,7 +569,7 @@ def test_a_replay_with_a_non_string_row_id_is_a_bad_request(tmp_path):
     from tests.test_cockpit_k2a import _get
 
     _root, src, ids = _install(tmp_path)
-    body = {"verb": "spore_set_disposition", "panel_id": "tray", "params": {"disposition": "note"},
+    body = {"verb": "spore_set_disposition", "panel_id": "tray", "params": {"disposition": "agenda"},
             "intent": "reported", "idempotency_key": "k", "tier_seen": "T2", "gesture_seen": "direct-reported"}
     with _serve(src, surface_tokens={"browser": "T"}, install_class="reported") as (url, _httpd):
         row = next(r for r in _get(f"{url}/cockpit/panel/tray.json", token="T")["rows"]
@@ -607,14 +607,14 @@ def test_a_dry_run_never_resumes_a_pending_a_dead_request_left(tmp_path):
         tgt = {"kind": "row", "panel_id": "tray", "row_id": row["id"], "row_version": row["version"]}
         dead = new_pending_id()
         with b._admitted() as db:
-            built = b._build(db, "spore_set_disposition", {"disposition": "note"}, tgt, dead, at_issue=True)
+            built = b._build(db, "spore_set_disposition", {"disposition": "agenda"}, tgt, dead, at_issue=True)
             n = b._now()
             raw = b._record(pid=dead, verb="spore_set_disposition", intent="reported", built=built,
-                            params={"disposition": "note"}, tier="T2", fence=b.capture().fence,
+                            params={"disposition": "agenda"}, tier="T2", fence=b.capture().fence,
                             issued_at=utc(n), expires_at=utc(n + timedelta(minutes=15)))
             db.issue(record_bytes=raw, principal="token:browser:1", idempotency_key="died", now=n, cap_exempt=True)
         status, out = _post(f"{url}/cockpit/verb", {"verb": "spore_set_disposition", "panel_id": "tray",
-                                                    "params": {"disposition": "note"}, "row_id": row["id"],
+                                                    "params": {"disposition": "agenda"}, "row_id": row["id"],
                                                     "row_version": row["version"], "intent": "reported",
                                                     "idempotency_key": "died", "dry_run": True}, token="T")
         assert (status, out.get("dry_run")) == (200, True), out

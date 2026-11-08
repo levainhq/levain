@@ -45,8 +45,10 @@ def memory_glance_reader(view: Callable[[Any], Any]) -> Callable[[Any], Result]:
         if "open_spores" in v.errors:
             out["note"] = "open spores unreadable"
         else:
-            numbers.append({"label": "open spores", "value": len(v.tray) + len(v.open_spores), "unit": None})
-            top = (v.tray or v.open_spores or [None])[0]
+            # a parked loop is dormant by design (TS-5a: it shows in Open loops, marked): not live cognition
+            live = [s for s in v.open_spores if s.tier != "parked"]
+            numbers.append({"label": "open spores", "value": len(v.tray) + len(live), "unit": None})
+            top = (v.tray or live or [None])[0]
             if top is not None:
                 text = " ".join(str(top.text).split())
                 out["top"] = text if len(text) <= TOP_MAX else text[:TOP_MAX - 1] + "…"

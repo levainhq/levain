@@ -101,7 +101,8 @@ are not rank-contiguous). Regions are content: they are hashed into the manifest
 
 ### Kernel default layout
 
-`build_default_cockpit` places: `brief` the state line; `widgets` Health; `operate` (rank order) Tray 10 and Open loops 15 (both `tall`), Recent episodes 40, Keep 50, Recent edits 60, Recent jobs 70 (`medium`);
+`build_default_cockpit` places: `brief` the state line; `widgets` Health; `operate` (rank order)
+Tray 10 and Open loops 15 (both `tall`), Recent episodes 40, Recent edits 60 (no Keep card: a parked loop is an Open loops row marked parked, a legacy `note` row shows in the Tray), Recent jobs 70 (`medium`);
 `mind` the Neocortex tabs card (one tab per continuity heading, ranked in heading order from 0, span 2, `tall`), Crystallized patterns 100
 (`tall`) and the Cognition card (graph 200 and projection history 210, `tabs="Cognition"`, `short`). Ranks 16-39 of
 `operate` are left for an embedder's Inbox, Fleet and Stream; a rank outside the kernel's bands is the embedder's.

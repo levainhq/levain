@@ -868,7 +868,7 @@ KERNEL_VERBS: tuple[VerbSpec, ...] = (
              fields=("text", "domain", "tier", "type"), floor="C1", tier_fn=_update_tier,
              row_tier=_const("C1"), escalates=_update_escalates,
              fire=_spore_fire("spore_update"), legacy_kind="spore_update", device_ok=True, applies_to=_SPORE_ROW),
-    VerbSpec("spore_set_disposition", "move", "moves the item to another list (Tray, Keep, loops)", "row",
+    VerbSpec("spore_set_disposition", "move", "moves the item to another list (Tray, loops)", "row",
              fields=("disposition", "surface_at"), floor="T2", tier_fn=_const("T2"),
              fire=_spore_fire("spore_set_disposition"), legacy_kind="spore_set_disposition", device_ok=True,
              applies_to=_SPORE_ROW),
@@ -1561,7 +1561,7 @@ def _require_confirm(verb: VerbSpec, req: dict[str, Any]) -> None:
         raise _refuse("confirm_required", 409, f"{verb.name!r} requires confirm:true")
 
 
-_ROW_KEYS = {"spore_id": ("spore:", ("tray", "loops", "keep")), "edit_id": ("edit:", ("edits",)),
+_ROW_KEYS = {"spore_id": ("spore:", ("tray", "loops")), "edit_id": ("edit:", ("edits",)),
              "episode_id": ("episode:", ("episodes",))}
 
 

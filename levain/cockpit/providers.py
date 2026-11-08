@@ -342,14 +342,18 @@ def spore_row_version(raw: Mapping[str, Any]) -> str:
     """The ``version`` the spore panels render for this stored spore, from anneal's raw dict. A
     spore write passes it to anneal as ``version_of``, so the compare runs inside anneal's write
     transaction against exactly what the operator was shown (§4.4)."""
-    return row_version_of(spore_stored(open_spore_from(raw)), SPORE_VERSION_FIELDS, SPORE_VERSION_EXCLUDED)
+    return spore_view_version(open_spore_from(raw))
+
+
+def spore_view_version(spore: Any) -> str:
+    """The same ``version`` from a spore already built for the view (an ``OpenSpore``): what the TUI binds a tier write to."""
+    return row_version_of(spore_stored(spore), SPORE_VERSION_FIELDS, SPORE_VERSION_EXCLUDED)
 
 
 # a fresh install has no spore store until something is dropped: each panel says what fills it
 SPORE_EMPTY = {
     "tray": "Nothing yet. Drop a thought in the box above and {entity} sorts it.",
     "loops": "Nothing yet. What stays open after {entity} sorts the Tray is listed here.",
-    "keep": "Nothing yet. Add a note above to keep something handy.",
 }
 # what the Tray's capture box says when the install has no name for its entity (dashboard_core.js ``buildTrayDump`` says the same)
 SPORE_EMPTY_ENTITY = "the assistant"
@@ -386,7 +390,8 @@ def _where_to_begin(source: SubstrateSource) -> Callable[[ReadContext], Result]:
                 due.append(s)
         late.sort(key=lambda t: t[0])
         first = [s for _d, s in late] + due
-        loops = sorted(v.open_spores, key=lambda s: {"hot": 0, "warm": 1, "cold": 2, "parked": 3}.get(s.tier, 9))
+        # a parked loop is dormant by design (TS-5a: it shows in Open loops, marked): never a place to begin
+        loops = sorted((s for s in v.open_spores if s.tier != "parked"), key=lambda s: {"hot": 0, "warm": 1, "cold": 2, "parked": 3}.get(s.tier, 9))
         lines: list[dict[str, str]] = []
         for i, s in enumerate(first[:3]):
             lines.append({"label": ("first", "then", "after that")[i], "text": clip(s.text)})
@@ -456,7 +461,7 @@ def _spore_provider(
             return bad
         if not path.exists():           # removed while the view was being built
             return Absent(f"no spore store at {path}")
-        items = {"tray": view.tray, "loops": view.open_spores, "keep": view.keep}[bucket]
+        items = {"tray": view.tray, "loops": view.open_spores}[bucket]
         filtered = 0
         rows = []
         held_rows = []
@@ -1647,12 +1652,11 @@ def build_default_cockpit(
                              region="brief", rank=5, empty="Nothing set for today yet.", edit_class=CLASS_C))
     # mock-e's default layout (design 1011, "mock-e: what it decides"). The WORK zone (`operate`) is a
     # 3-column grid whose cards flow in rank order, `now` first: Now, Tray, Open loops (row a, tall) / [Inbox, Fleet,
-    # Stream: downstream-only] / Recent episodes, Keep, Recent edits. Ranks leave gaps so a downstream's
+    # Stream: downstream-only] / Recent episodes, Recent edits. Ranks leave gaps so a downstream's
     # Inbox, Fleet and Stream slot in 16-39, between Open loops and Recent episodes without renumbering the kernel's.
     for pid, title, bucket, prio, order, rank, views, size in (
         ("tray", "Tray", "tray", "gate", "spore.tray", 10, TRAY_VIEWS, "tall"),
         ("loops", "Open loops", "loops", "feed", "spore.loops", 15, (), "tall"),
-        ("keep", "Keep", "keep", "feed", "spore.keep", 50, (), "medium"),
     ):
         ck.register(ProviderSpec(
             pid, "triage-list", title, prio, _spore_provider(source, bucket), region="operate", rank=rank, size=size,
@@ -1720,7 +1724,7 @@ def build_default_cockpit(
             v = _view(source, ctx)
             if "open_spores" in v.errors or "store" in v.errors:
                 raise RuntimeError("the spore store did not read")
-            return list(v.open_spores)
+            return [s for s in v.open_spores if s.tier != "parked"]   # a parked loop is dormant (TS-5a)
 
         def hub_label(ctx: ReadContext) -> str:
             try:

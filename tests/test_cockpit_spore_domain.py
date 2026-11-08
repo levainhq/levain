@@ -63,7 +63,9 @@ def test_the_legacy_spore_update_refuses_a_domain_rather_than_dropping_it(rig_br
 
 
 def _keep_row(rig):
-    return next((p, r) for p in ("keep", "loops") for r in (rig.ck.panel(p)["rows"] or []))
+    # a legacy note (shown in the Tray since the Keep left) or a loop: a row whose type is not Tray-plastic
+    return next((p, r) for p in ("tray", "loops") for r in (rig.ck.panel(p)["rows"] or [])
+                if r["facets"]["disposition"] != "seed")
 
 
 def test_the_broker_refuses_a_type_change_outside_the_tray(rig_broker) -> None:
