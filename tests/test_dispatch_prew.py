@@ -179,6 +179,24 @@ def test_a_passthrough_ticket_that_is_not_this_runs_is_unresolved(world, over):
     assert (job.state, job.history[-1].evidence) == ("failed", J.BACKEND_UNRESOLVED)
 
 
+def _pt_unnamed(jid, run):
+    """A passthrough executor ticket that names no model (``model_requested`` is optional on one)."""
+    t = _pt(jid, run)
+    del t["model_requested"]
+    return t
+
+
+@pytest.mark.parametrize("caller", [says("x", requested="caller-model"), {"answered": "x", "backend_identity": "x"}])
+def test_a_passthrough_ticket_naming_no_model_records_no_requested_from_the_caller(world, caller):
+    """L2 LOW-2: ``requested`` is the ticket's or nothing; the caller's report never supplies it. The record's shape
+    holds exactly ``requested``, ``answered``, ``backend_identity``, so a run whose ticket names no model records
+    nothing and is unresolved (fails closed), whatever the caller said."""
+    job, _ = world.file()
+    job = world.verify_routed(job.id, [(_pt_unnamed, caller)], routemap=None)
+    assert (job.state, job.history[-1].evidence) == ("failed", J.BACKEND_UNRESOLVED)
+    assert world.jstore.run_records(job.id) == []
+
+
 # --- the CONTROL verbs (real handler) -------------------------------------------------------------------------------
 
 @pytest.fixture

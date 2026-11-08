@@ -753,7 +753,9 @@ def _routed_model(run: VerifierRun, model: Any,
     run's executor ticket), the backend identity the route map's entry for them, ``identity_source`` says so, and
     only ``answered`` is the caller's. A ``requested`` the caller gives must be the ticket's; a ``backend_identity``
     it gives is never read. A PASSTHROUGH ticket (PRE-W) keeps ``passthrough:<vendor>`` from the ticket and
-    :data:`PASSTHROUGH_SOURCE`, its ``requested`` the ticket's (the caller's when the ticket names none)."""
+    :data:`PASSTHROUGH_SOURCE`, its ``requested`` the ticket's; a passthrough ticket that names no model (its
+    ``model_requested`` is optional) is unresolved, as the record holds a ``requested`` and the caller's report never
+    supplies it (PRE-W L2 LOW-2)."""
     if facts is None or not isinstance(model, Mapping):
         return None
     ticket, routes = facts
@@ -762,7 +764,7 @@ def _routed_model(run: VerifierRun, model: Any,
         return None
     if ticket.get("auth") == "passthrough":
         vendor = ticket.get("vendor")
-        requested = ticket.get("model_requested", model.get("requested"))
+        requested = ticket.get("model_requested")
         if not (isinstance(vendor, str) and vendor and isinstance(requested, str) and requested):
             return None
         if "requested" in model and model["requested"] != requested:
