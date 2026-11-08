@@ -4282,8 +4282,12 @@
       const audit = row.querySelector(".consent-audit");
       if (audit) audit.textContent = egress ? egress.label : sv(b.audit);
     }
+    // The terminal copy lines were the Q6a answer route while the cockpit was read-only; a passkey answer (Q6b) replaced them.
+    // Each stays unless the sheet offers that same answer here (a passkey never signs a T3 allow, so its choices are deny only).
+    const sheetOffers = (k) => b.sheet === true && Array.isArray(b.sheet_choices) && b.sheet_choices.includes(k);
     if (pending) {
       for (const [label, cmd] of [["allow", sv(b.answer_allow)], ["deny", sv(b.answer_deny)]]) {
+        if (sheetOffers(label)) continue;
         if (!cmd) continue;
         const line = el("div", "consent-cmd");
         const code = el("code", "consent-code", cmd);
