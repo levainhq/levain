@@ -142,6 +142,10 @@ PROVIDERS: dict[str, ProviderData] = {
                              "Every call opts out of Deepgram's model-improvement programme (mip_opt_out). Retention "
                              "periods are not stated on Deepgram's pages."),
 }
+# Where to add credit, per provider (a read-only link on the panel). [checked 2026-11-08: Deepgram's console root loads; Inworld's
+# docs name its Billing page as where the balance shows and credits are added.] No balance is read: the Deepgram balances
+# endpoint needs a project id, and no Inworld balance endpoint was found in its docs on that date.
+CONSOLE_URLS = {"deepgram": "https://console.deepgram.com", "inworld": "https://platform.inworld.ai/billing"}
 # a record kind exists for these (authority.VOICE_KEY_PROVIDERS) but no adapter does
 UNSUPPORTED = {"elevenlabs": "ElevenLabs"}
 
@@ -343,8 +347,11 @@ def serve_voice(data_root: Path | str, meter: vmeter.Meter, *, last_read: Mutabl
     the ledger. ``premium_stt`` is the server's setting (True, False, or None for AUTO; see :func:`premium_stt_on`),
     resolved here against the same replay the rows come from: off, no provider lists ``stt`` among its uses and its
     retention words leave transcription out, so a page has nothing to offer a dictation control from; the body says
-    ``"premium_stt": false``."""
+    ``"premium_stt": false``. The panel's readout adds ``mic_in`` (the provider the server picked for dictation, or why
+    none), per row ``console_url`` and ``spend`` (set for a provider that holds a key or has counted spend this month, the rows the page draws), and ``spend_other`` (counted spend from providers the page has no row for).
+    The totals in ``caps`` and every ``spend`` come from ONE read of the ledger, so the rows add up to the totals."""
     grants, authority = _grants_for(data_root)
+    premium_stt_setting = premium_stt
     premium_stt = premium_stt if premium_stt is True or premium_stt is False else _stt_keyed(grants)
     rows = []
     for name, data in offered().items():
@@ -360,16 +367,38 @@ def serve_voice(data_root: Path | str, meter: vmeter.Meter, *, last_read: Mutabl
                      "speed": [data.speed_min, data.speed_max],
                      "retention": data.retention if premium_stt or not data.retention_speech
                      else data.retention_speech})
+    try:
+        spend, by_provider = meter.snapshot_if_present()      # ONE read, ONE clock: totals are the sum of the rows
+    except vmeter.MeterError:
+        spend, by_provider = None, None
+    for row in rows:
+        row["console_url"] = CONSOLE_URLS.get(row["name"])
+        got = (by_provider or {}).get(row["name"], {})
+        spent = any(got.get(period, (0, 0)) != (0, 0) for period in ("day", "month"))
+        # a row is drawn for a provider that holds a key or has counted spend; its ``spend`` is set exactly then (None when
+        # the ledger cannot be read, where the keyed rows are still drawn)
+        if by_provider is not None and (row["key"] == "set" or spent):
+            (dn, dm), (mn, mm) = got.get("day", (0, 0)), got.get("month", (0, 0))
+            row["spend"] = {"day_calls": dn, "day_est_usd": _usd(dm), "month_calls": mn, "month_est_usd": _usd(mm)}
+        else:
+            row["spend"] = None
+    # counted spend from providers the page has no row for at all (not offered): it counts toward the caps, so the page says so
+    body_other = None
+    if by_provider is not None:
+        rest = [v for name, v in by_provider.items() if name not in {row["name"] for row in rows}]
+        dn, dm = sum(v["day"][0] for v in rest), sum(v["day"][1] for v in rest)
+        mn, mm = sum(v["month"][0] for v in rest), sum(v["month"][1] for v in rest)
+        if mn or dn or mm or dm:
+            body_other = {"day_calls": dn, "day_est_usd": _usd(dm), "month_calls": mn, "month_est_usd": _usd(mm)}
     caps = meter.caps
     body: dict[str, Any] = {"providers": rows, "prices_as_of": meter.prices.as_of, "estimate": True,
-                            "authority": authority, "premium_stt": bool(premium_stt)}
-    try:
-        spend = meter.spent_if_present()
+                            "authority": authority, "premium_stt": bool(premium_stt), "spend_other": body_other}
+    if spend is not None:
         body["meter"] = "ok"
         body["caps"] = {"month_usd": _usd(caps.month_micros), "day_usd": _usd(caps.day_micros),
                         "spent_month_est": _usd(spend.month_micros), "spent_day_est": _usd(spend.day_micros),
                         "month_start": spend.month_start, "day_start": spend.day_start}
-    except vmeter.MeterError:
+    else:
         body["meter"] = "unreadable"
         body["caps"] = {"month_usd": _usd(caps.month_micros), "day_usd": _usd(caps.day_micros),
                         "spent_month_est": None, "spent_day_est": None, "month_start": None, "day_start": None}
@@ -377,6 +406,17 @@ def serve_voice(data_root: Path | str, meter: vmeter.Meter, *, last_read: Mutabl
     if chosen is not None:
         body["stream"] = True
         body["stream_provider"] = chosen
+    # the dictation readout: what the server itself picked (never re-derived by the page), or why there is none
+    if chosen is not None:
+        body["mic_in"] = {"on": True, "provider": chosen, "model": vprov.STREAM_STT_MODELS.get(chosen, "")}
+    elif premium_stt_setting is False:
+        body["mic_in"] = {"on": False, "reason": "turned_off"}
+    elif authority != "ok":
+        body["mic_in"] = {"on": False, "reason": "unreadable"}
+    elif any(r["key"] == "set" and "stt" in r["uses"] for r in rows):
+        body["mic_in"] = {"on": False, "reason": "no_stream_key"}
+    else:
+        body["mic_in"] = {"on": False, "reason": "no_stt_key"}
     return body
 
 
