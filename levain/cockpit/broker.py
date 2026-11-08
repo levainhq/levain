@@ -933,8 +933,10 @@ class Broker:
             line, out = intake.receipt(dict(reading))
             if state != "COMMITTED":
                 line = {"WAITING": "to be sent to the desk to sort, awaiting your signature",
-                        "applying": "being sent to the desk to sort"}.get(
-                            state, f"not sent to the desk ({state.lower()})")
+                        "applying": "being sent to the desk to sort",
+                        "COMMITTED_INCOMPLETE": "not sent to the desk: the desk's store refused it",
+                        "STALE": "not sent to the desk: it changed before you signed"}.get(
+                            state, "not sent to the desk")
             return {"receipt": out, "receipt_line": line, **({"drop_id": drop_id} if drop_id else {})}
         if state == "COMMITTED":
             try:

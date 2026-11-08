@@ -245,3 +245,132 @@ def test_a_malformed_body_is_still_refused(world):
                   tier="C1", credential=w.dev, intent="sign")
     assert e.value.status == 400
     assert intake.receipt({"kind": "sort", "text": "x"})[0] == "sent to the desk to sort"
+
+
+# --- the fix lane's pins (L1/L2 on 5ba2ea10) ---------------------------------------------------------------------
+
+def _sql(w: SimpleNamespace, sql: str, *args: Any) -> list[tuple]:
+    import sqlite3
+
+    conn = sqlite3.connect(w.b.data_root / "cockpit.db")
+    try:
+        conn.commit()
+        return conn.execute(sql, args).fetchall()
+    finally:
+        conn.close()
+
+
+@pytest.mark.parametrize("name,line", [("over length", "x" * 20_001), ("NUL", "a\x00b"),
+                                       ("lone surrogate", "a\ud800b")])
+def test_a_line_the_store_would_refuse_is_refused_at_issue_before_any_signature(world, name, line):
+    w = world
+    with pytest.raises(BrokerError) as e:
+        _issue(w, line)
+    assert (e.value.code, e.value.status) == ("refused", 409)
+    assert _drops(w.qdir) == [] and _sql(w, "SELECT COUNT(*) FROM pendings") == [(0,)]
+    with pytest.raises(ValueError):
+        coordinator_drop_effect({"text": line}, None, origin_key=create_origin_key(PID, 0))
+
+
+def test_a_line_at_the_limit_still_issues(world):
+    assert _issue(world, "x" * 20_000)["state"] == "WAITING"
+
+
+def test_the_receipt_says_in_the_operators_words_why_a_sort_was_not_sent(world):
+    rec = {"target": {"intake": {"kind": "sort", "text": "x"}}}
+    line = lambda st: world.b._intake_receipt(rec, PID, st)["receipt_line"]   # noqa: E731
+    assert line("COMMITTED_INCOMPLETE") == "not sent to the desk: the desk's store refused it"
+    assert line("STALE") == "not sent to the desk: it changed before you signed"
+    for other in ("REFUSED", "EXPIRED", "CANCELLED"):
+        assert line(other) == "not sent to the desk"
+    for st in ("COMMITTED_INCOMPLETE", "STALE", "REFUSED"):
+        assert st.lower() not in line(st)
+
+
+def test_recent_edits_read_a_sort_as_a_line_sent_to_the_desk():
+    from levain.cockpit.providers import _edit_target, plain_edit_title
+
+    assert plain_edit_title("list_intake", _edit_target(drop_resource_key("ck.ab.0")), "device:ab12") == \
+        "added a line, sent to the desk to sort, from a signed device"
+    assert plain_edit_title("list_intake", _edit_target("spore:spore-017"), "token:browser:1") == \
+        "added a line item spore-017, from the browser"
+
+
+def test_a_coordinator_directory_that_is_not_0700_is_refused_not_retried(home):
+    from levain.cockpit.effects import PermanentApplyRefusal
+
+    d = home / "open"
+    d.mkdir(mode=0o700)
+    d.chmod(0o755)
+    st = CoordDropEffectStore(lambda: d)
+    eff = coordinator_drop_effect({"text": WORDS}, None, origin_key=create_origin_key(PID, 0))
+    unit = ApplyUnit(COORDINATOR, (0,), (eff,))
+    with pytest.raises(PermanentApplyRefusal):
+        st.apply_unit(unit)
+    res = settle(unit, st, {})
+    assert (res.status, res.reason) == (EffectStatus.UNAPPLIED, "refused")
+
+
+def test_a_pending_whose_stored_reading_was_altered_is_refused_and_writes_nothing(world):
+    """The reading and the signed effect must agree: a stored record whose intake text differs from its own effect
+    (signed as it stands) rebuilds to a different record with every ``expect`` equal, which the journal classes REFUSED
+    "normaliser" (not STALE: nothing moved, the record is inconsistent). Nothing is written."""
+    import sqlite3
+
+    from levain.cockpit.consent import encode, record_sha256
+
+    w = world
+    out = _issue(w)
+    rec = json.loads(out["record"])
+    rec["target"]["intake"]["text"] = "other words than the signed effect"
+    raw = encode(rec)
+    conn = sqlite3.connect(w.b.data_root / "cockpit.db")
+    try:
+        conn.execute("DROP TRIGGER pendings_authority_immutable")
+        conn.execute("UPDATE pendings SET record = ?, record_sha256 = ? WHERE pending_id = ?",
+                     (raw, record_sha256(raw), out["pending_id"]))
+        conn.commit()
+    finally:
+        conn.close()
+    done = w.b.submit(out["pending_id"], w.phone.sign(raw))
+    assert done["state"] == "REFUSED", done
+    assert _sql(w, "SELECT reason FROM pendings WHERE pending_id = ?", out["pending_id"]) == [("normaliser",)]
+    assert _drops(w.qdir) == [] and done["receipt_line"] == "not sent to the desk"
+
+
+def test_a_sort_whose_key_is_already_taken_before_the_decision_ends_stale_and_writes_nothing_more(world):
+    w = world
+    out = _issue(w)
+    CoordStore(w.qdir).accept_drop("somebody else's words", surface="cockpit",
+                                   outbox_id=create_origin_key(out["pending_id"], 0))
+    done = w.b.submit(out["pending_id"], w.phone.sign(out["record"].encode()))
+    assert done["state"] == "STALE", done
+    assert [d.words for d in _drops(w.qdir)] == ["somebody else's words"]
+    assert done["receipt_line"] == "not sent to the desk: it changed before you signed"
+
+
+def test_a_crash_between_the_write_and_its_record_recovers_to_exactly_one_drop(world):
+    w = world
+    out = _issue(w)
+    armed = [True]
+    real = w.b._kp
+
+    def crash(name: str) -> None:
+        if armed[0] and name == "applied:0":
+            raise RuntimeError("the process died between the write and its record")
+        real(name)
+
+    w.b._kp = crash                                   # type: ignore[method-assign]
+    try:
+        w.b.submit(out["pending_id"], w.phone.sign(out["record"].encode()))
+    except Exception:                                 # noqa: BLE001 - the simulated death
+        pass
+    assert len(_drops(w.qdir)) == 1                                           # written ...
+    assert _sql(w, "SELECT state FROM pendings WHERE pending_id = ?", out["pending_id"]) == [("DECIDED",)]
+    assert _sql(w, "SELECT status FROM effects WHERE operation_id = ?", out["pending_id"]) == [("PLANNED",)]  # ... unrecorded
+    armed[0] = False
+    w.b.recover()
+    assert _sql(w, "SELECT state FROM pendings WHERE pending_id = ?", out["pending_id"]) == [("COMMITTED",)]
+    assert _sql(w, "SELECT status FROM effects WHERE operation_id = ?", out["pending_id"]) == [("APPLIED",)]
+    (drop,) = _drops(w.qdir)
+    assert drop.words == WORDS and drop.outbox_id == create_origin_key(out["pending_id"], 0)

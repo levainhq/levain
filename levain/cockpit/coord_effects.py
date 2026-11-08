@@ -7,6 +7,11 @@ the coordinator store, from the ``cockpit`` surface, keyed by the pending's crea
 the ``coordinator`` store: the signed record carries the words verbatim, the decision rebuilds the same effect and
 compares, and a recovery after a crash between the write and its record finds the drop under its key (``ALREADY``)
 and writes nothing twice.
+
+Known edge: a coordinator directory or store that is missing is created by the write (``accept_drop`` makes it), as the
+browser-token path does; only a read (``snapshot``) never makes one. ``snapshot`` reads the drop through the store's
+private ``_drop`` on a read-only connection because the public ``drop_by_outbox`` opens the store for writing and so
+would create it.
 """
 
 from __future__ import annotations
@@ -52,6 +57,12 @@ def coordinator_drop_effect(params: Mapping[str, Any], pre: Mapping[str, Any] | 
     params, a ``pre`` (a create has no earlier object) or a missing origin key."""
     if set(params) != {"text"} or not isinstance(params.get("text"), str) or not params["text"]:
         raise ValueError("a coordinator drop is exactly {text}, a non-empty string")
+    from levain.coordinator.store import CoordError, check_words
+
+    try:
+        check_words(params["text"])        # the store's own word check: refused here, before any signature
+    except CoordError as exc:
+        raise ValueError(str(exc)) from exc
     if pre is not None:
         raise ValueError("a create's origin_key is already in use")
     if not origin_key:
@@ -126,6 +137,7 @@ class CoordDropEffectStore:
     def apply_unit(self, unit: ApplyUnit) -> UnitApplyResult:
         from levain.coordinator.store import CoordError, CoordStore, DropConflict, StoreAbsent
         from levain.dispatch import DispatchError
+        from levain.dispatch.jobs import JobStoreError
 
         (effect,) = unit.effects
         if not effect.is_create or set(effect.changes) != {"text"} or not isinstance(effect.changes["text"], str):
@@ -142,6 +154,9 @@ class CoordDropEffectStore:
             # the key is this pending's, so other words under it are no retry of ours: refused, nothing written
             raise PermanentApplyRefusal(str(exc)) from exc
         except CoordError as exc:
+            raise PermanentApplyRefusal(str(exc)) from exc
+        except JobStoreError as exc:
+            # a directory that is not 0700 / not ours does not mend by itself: refused, not retried forever
             raise PermanentApplyRefusal(str(exc)) from exc
         except (OSError, sqlite3.Error, DispatchError) as exc:
             raise TransientApplyFault.of(exc) from exc
