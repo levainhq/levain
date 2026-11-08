@@ -1121,6 +1121,89 @@ def open_spores(timeout: float = 2.0) -> list[dict]:
         return [s for s in data if isinstance(s, dict) and _is_loop(s)]
     return []
 
+_WHEN_RE = re.compile(r"(\d{4}-\d{2}-\d{2})(?:T(\d{2}:\d{2}))?")
+
+
+def due_agendas(spores: list, now: datetime | None = None) -> list[dict]:
+    """Open AGENDA spores that have come due and are not yet germinated (TS-3): a date-only `next` on or before
+    today, a timed `next` (YYYY-MM-DDTHH:MM, local) from that minute; no `next`, a malformed one or a stamped
+    `germinated` is never due. Mirrors levain.germinate.is_due (this file is stranger-side and imports nothing of it)."""
+    now = now or datetime.now()
+    due = []
+    for s in spores:
+        if not isinstance(s, dict) or str(s.get("disposition") or "").strip().casefold() != "agenda":
+            continue
+        if s.get("germinated"):
+            continue
+        raw = s.get("next")
+        m = _WHEN_RE.fullmatch(raw) if isinstance(raw, str) else None
+        if m is None:
+            continue
+        try:
+            when = datetime.strptime(m.group(1) + "T" + (m.group(2) or "00:00"), "%Y-%m-%dT%H:%M")
+        except ValueError:
+            continue
+        if now >= when:
+            due.append(s)
+    return due
+
+
+def open_agendas(timeout: float = 2.0) -> list[dict]:
+    """Every open spore as anneal lists it, unfiltered (open_spores drops the agenda disposition by design)."""
+    data = _anneal_json(["spore", "list", "--json"], timeout, validator=lambda d: isinstance(d, list))
+    return [s for s in data if isinstance(s, dict)] if isinstance(data, list) else []
+
+
+def start_germinate(agent: str = "claude_code") -> str:
+    """Spawn `levain spores germinate` detached for THIS install. Returns "started" (the child was alive after a short
+    grace, or exited 0), "busy" (another start spawned one within the last minute: germinate is idempotent by origin_key,
+    this only spares a pile of redundant children) or "failed" (Popen raised, or the child died non-zero at once, e.g.
+    no `levain` for this interpreter). Known edges, closed: the child's own later failure is the doctor row's to report;
+    a due agenda reaches the first turn only if the child files its band row before UserPromptSubmit (the next prompt
+    renders it otherwise)."""
+    root = install_root()
+    marker = Path(root) / ".levain" / ".germinate-spawn"
+
+    def _drop():
+        try:
+            marker.unlink()
+        except OSError:
+            pass
+
+    try:
+        age = time.time() - marker.stat().st_mtime
+        if 0 <= age < 60:
+            return "busy"
+    except OSError:
+        pass
+    argv = [sys.executable] + (["-P"] if sys.version_info >= (3, 11) else []) + [
+        "-m", "levain", "spores", "germinate", "--path", str(root), "--agent", agent]
+    try:
+        proc = subprocess.Popen(argv, cwd=str(root), stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                                stderr=subprocess.DEVNULL, start_new_session=True, close_fds=True)
+    except Exception:
+        _drop()
+        return "failed"
+    # The marker means "a child is (or just was) running OK": written only once the spawn exists, removed on any
+    # failure so the next start retries. It is written after Popen, so two near-simultaneous starts may both spawn;
+    # that is fine, germinate is idempotent by origin_key and a lost race costs one redundant child.
+    try:
+        marker.parent.mkdir(parents=True, exist_ok=True)
+        marker.write_text(str(proc.pid) if hasattr(proc, "pid") else "")
+    except OSError:
+        pass
+    try:
+        rc = proc.wait(timeout=0.4)
+    except subprocess.TimeoutExpired:
+        return "started"
+    except Exception:
+        _drop()
+        return "failed"
+    if rc == 0:
+        return "started"
+    _drop()
+    return "failed"
+
 
 # Tokens of 3+ word-chars; common words that would create false collisions are
 # dropped so a >=2-token overlap means genuine content kinship, not "the"/"and".

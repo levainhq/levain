@@ -181,6 +181,22 @@ def main() -> int:
                 pass
 
             try:
+                # Agenda germination (TS-3): a dated agenda that has come due is put in front of him by a detached,
+                # fail-soft `levain spores germinate`; spawned ONLY when one is due, one spawn per session start.
+                n = len(hook.due_agendas(hook.open_agendas()))
+                if n:
+                    st = hook.start_germinate('codex')
+                    plural = 's' if n != 1 else ''
+                    if st == 'started':
+                        sections.append(f"[germinate] {n} agenda{plural} came due; germination started")
+                    elif st == 'failed':
+                        sections.append(f"[germinate] {n} agenda{plural} came due but germination did not start: run `levain spores germinate`")
+                    elif st == 'busy':
+                        sections.append(f"[germinate] {n} agenda{plural} came due; germination was already started within the last minute")
+            except Exception:
+                pass
+
+            try:
                 # Compatibility drift — a once-per-fresh-session nudge if the version
                 # SET fell out of sync (anneal changed underneath the install, or
                 # unreviewed migration proposals exist). Cheap + fail-silent; the

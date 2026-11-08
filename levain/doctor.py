@@ -162,6 +162,7 @@ def _run_doctor(path: Path, invoke: bool = False, repin_hooks: bool = False) -> 
     core.extend(_guarded("terminal key", _check_terminal_key))
     core.extend(_check_continuity_headroom(install))
     core.extend(_guarded("keep", lambda: _check_keep_migration(install)))
+    core.extend(_guarded("overdue agenda", lambda: _check_overdue_agenda(install)))
     core.extend(_check_compat_set(install))
     core.extend(_check_consent_hooks(install))
     core.extend(_guarded("consent ping reach", lambda: _check_consent_ping_reach(install)))
@@ -3861,6 +3862,42 @@ def _check_keep_migration(install: Path) -> list[CheckResult]:
         return []
     return [CheckResult("keep", True, line.removeprefix("keep: "), "Run `levain spores keep-migrate` for a dry run.",
                         warn=True)]
+
+
+def _check_overdue_agenda(install: Path, today: Any = None) -> list[CheckResult]:
+    """``spores: overdue-agenda`` (TS-3): an open agenda whose ``next`` day is before today and that was never
+    germinated is a defect (the session-start, 06:10 and minute runs all missed it). Report only, no gate: a warning
+    row, never a failure. Silent with no spores file, no agenda or none overdue."""
+    from datetime import date as _date
+
+    from levain.germinate import _is_agenda
+    from levain.spores import _parse_when, guarded_spore_store
+
+    spores = install / ".levain" / "memory.spores.json"
+    if not spores.is_file():
+        return []
+    day = today.date() if hasattr(today, "date") else (today or _date.today())
+    name = "spores: overdue-agenda"
+    try:
+        items = guarded_spore_store(spores).list_open(today=day)
+    except Exception as e:  # noqa: BLE001 - a doctor check reports, it never crashes the run
+        return [CheckResult(name, False, f"could not read .levain/memory.spores.json ({type(e).__name__}: {e})",
+                            "The spore store is unreadable; restore it from a backup or git.")]
+    late = []
+    for s in items:
+        try:   # one malformed spore is skipped, never the row (known edge, closed: a stamped-but-uncomposed agenda is the 06:10 run's)
+            if not _is_agenda(s) or s.get("germinated"):
+                continue
+            when = _parse_when(s.get("next"))
+            if when is not None and when.date() < day:
+                late.append(s)
+        except Exception:  # noqa: BLE001
+            continue
+    if not late:
+        return []
+    ids = ", ".join(f"{s.get('id', '?')} (next {s.get('next')})" for s in late[:5]) + (" ..." if len(late) > 5 else "")
+    return [CheckResult(name, True, f"{len(late)} agenda{'s' if len(late) != 1 else ''} past its date and not germinated: {ids}",
+                        "Run `levain spores germinate --path <install>`; if it was already run, read its errors.", warn=True)]
 
 
 def _check_compat_set(install: Path) -> list[CheckResult]:
