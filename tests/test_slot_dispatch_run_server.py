@@ -1458,8 +1458,9 @@ def test_a_brokered_launcher_behind_a_verifier_that_answers_no_share_refuses(rig
     with pytest.raises(L.LauncherRefused) as exc:
         env.client().spawn(S.SessionLaunch(oid, "s-00000000000000b3", "claude", "sonnet", "b", "brokered", None, None,
                                            1_000_000))
-    # REVERT: the `dataclasses.replace(launch, usd_micros=share)` stamp in RunServer._priced (it mints the fire's figure)
-    assert exc.value.name == "no-dollar-share" and env.control.minted == {}
+    # REVERT: `if launch.usd_micros != share` back to `share is not None and ...` (the reason would read no-dollar-share,
+    # as if the fire sent none); dropping the test as well would mint the fire's figure
+    assert exc.value.name == "dollars-not-the-links-share" and env.control.minted == {}
 
 
 # --- finding 1 of the wave-3 RETURN: a brokered run's share is exactly what the fire's window was debited --------------------

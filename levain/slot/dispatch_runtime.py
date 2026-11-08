@@ -134,7 +134,8 @@ def _safe(data: bytes, limit: int = 400) -> str:
 class HelperSlotRuntime:
     """The :class:`SlotRuntime`. ``helper`` is the argv prefix the verbs follow (default ``sudo -n <runtime helper>``;
     tests run a fake script there). ``routes`` is the render blob's route list, or a callable that answers it (default:
-    the base map's egress routes plus the one Claude passthrough route). ``workspace`` is S10w's seam: called with the
+    the base map's egress routes plus the one Claude passthrough route); a BROKERED start ignores it and names its
+    ticket's minted routes (``SlotStart.routes``). ``workspace`` is S10w's seam: called with the
     request and the staging dir after the brief and before ``render``."""
 
     def __init__(self, *, host: "str | None" = None, helper: "Sequence[str] | None" = None,
@@ -239,7 +240,13 @@ class HelperSlotRuntime:
         :data:`HOOKS` (port item 4): a launcher that asks for fewer is refused here, not left to the server."""
         if set(req.hooks) != set(HOOKS):
             raise LauncherRefused("hooks-incomplete", ",".join(sorted(set(req.hooks) ^ set(HOOKS))))
-        if self._routes is None:
+        if req.auth == "brokered":
+            # the ticket's own routes, exactly as minted (L3 wave3 r1, codex HIGH 2): the base map's brokered route is
+            # not the dispatch-map route CONTROL resolved, and render refuses any blob whose routes are not the ticket's
+            if not req.routes:
+                raise LauncherRefused("brokered-start-without-route", "a brokered start names its ticket's routes")
+            routes = req.routes
+        elif self._routes is None:
             routes = pick_routes(read_base_map(layout.base_routes_path(self.host)), req.harness, req.auth,
                                  egress=False)   # the ticket lists none by default (11-02); render refuses extras
         else:

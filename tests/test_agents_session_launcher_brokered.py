@@ -277,8 +277,8 @@ def test_the_lineage_sum_is_the_runs_rows_only(tmp_path):
     p = _sink(tmp_path, [_row(RUN, cost=100), _row(other, cost=9_999), _row(RUN, cost=250), _row(RUN, "no", None, 40),
                          _row(RUN, "uncertain", None, 70), _row(RUN, "uncertain", 90, 60), _row(RUN, "yes", None, 11)])
     # 100 + 250 + 0 (released) + 70 (uncertain, hold) + 90 (uncertain, max(cost, hold)) + 11 (cost unsaid: the hold)
-    assert DU.lineage_spend(p, RUN) == 521
-    assert DU.lineage_spend_reader(p)(other) == 9_999
+    assert DU.lineage_spend(p, RUN, final_rows=6) == 521
+    assert DU.lineage_spend_reader(p, final_rows=lambda run_id: 1)(other) == 9_999
 
 
 @pytest.mark.parametrize("why,rows,tail", [
@@ -292,27 +292,31 @@ def test_the_lineage_sum_is_the_runs_rows_only(tmp_path):
     ("a missing hold", [_row(RUN, hold=None)], b"\n"),
 ])
 def test_a_sink_that_cannot_be_read_whole_is_none(tmp_path, why, rows, tail):
-    assert DU.lineage_spend(_sink(tmp_path, rows, tail), RUN) is None, why
+    # the proof matches the run's rows in each case (one when none), so only the named fault makes it None
+    proof = sum(1 for r in rows if r.get("run_id") == RUN) or 1
+    assert DU.lineage_spend(_sink(tmp_path, rows, tail), RUN, final_rows=proof) is None, why
 
 
 def test_a_sink_that_is_not_json_or_has_nan_or_is_missing_or_a_link_is_none(tmp_path):
     p = tmp_path / "l.jsonl"
     p.write_bytes(b"not json\n")
-    assert DU.lineage_spend(p, RUN) is None
+    assert DU.lineage_spend(p, RUN, final_rows=1) is None
     p.write_bytes(json.dumps(_row(RUN)).replace("100", "NaN").encode() + b"\n")
-    assert DU.lineage_spend(p, RUN) is None
-    assert DU.lineage_spend(tmp_path / "absent", RUN) is None
+    assert DU.lineage_spend(p, RUN, final_rows=1) is None
+    assert DU.lineage_spend(tmp_path / "absent", RUN, final_rows=1) is None
     good = _sink(tmp_path, [_row(RUN)])
+    assert DU.lineage_spend(good, RUN, final_rows=1) == 100       # the control: the same sink reads with its proof
     link = tmp_path / "link"
     os.symlink(good, link)
-    assert DU.lineage_spend(link, RUN) is None                    # REVERT: O_NOFOLLOW
-    assert DU.lineage_spend(good, "") is None and DU.lineage_spend(good, None) is None and DU.lineage_spend(7, RUN) is None
+    assert DU.lineage_spend(link, RUN, final_rows=1) is None      # REVERT: O_NOFOLLOW
+    assert DU.lineage_spend(good, "", final_rows=1) is None and DU.lineage_spend(good, None, final_rows=1) is None
+    assert DU.lineage_spend(7, RUN, final_rows=1) is None
 
 
 def test_an_over_long_line_is_none(tmp_path):
     p = tmp_path / "l.jsonl"
     p.write_bytes(json.dumps(_row(RUN, pad="x" * DU._LINE_MAX)).encode() + b"\n")
-    assert DU.lineage_spend(p, RUN) is None
+    assert DU.lineage_spend(p, RUN, final_rows=1) is None
 
 
 # --- the real CONTROL: ROUTE-RESOLVE and the priced mint ------------------------------------------------------------
@@ -441,3 +445,115 @@ def test_a_replay_of_the_same_attempt_answers_the_same_ticket(real, tmp_path):
                     route_policy_digest=line["facts"]["route_policy_digest"], model_requested=MODEL,
                     brief_digest=line["facts"]["brief_digest"])
     assert again["run_id"] == line["run_id"]
+
+
+# --- L3 wave3 r1: codex HIGH 2, the minted route reaches render ----------------------------------------------------------
+
+def _render_runtime(tmp_path, monkeypatch):
+    """A HelperSlotRuntime whose base map is setup's own default merge (it holds the base-map brokered route
+    ``anthropic``), as tests/test_slot_1105_routes_cross.py builds it."""
+    from levain.contracts import canon
+    from levain.slot import dispatch_runtime as DR
+    from levain.slot import vendor_routes as VR
+    merged, _ids, _notes = VR.merge(None)
+    path = tmp_path / "base.json"
+    path.write_bytes(canon.canonical_bytes(merged))
+    monkeypatch.setattr(DR.layout, "base_routes_path", lambda host: path)
+    return DR.HelperSlotRuntime(host="darwin", helper=("true",), store=tmp_path / "store",
+                                control_socket=tmp_path / "c.sock")
+
+
+def _check_at_render(tmp_path, monkeypatch, req, ticket_facts):
+    from levain.slot import render as R
+    from levain.slot.runtime_grammar import parse_stdin
+    blob = parse_stdin("render", _render_runtime(tmp_path, monkeypatch)._render_blob(req))
+    R.check_ticket(blob, "dispatch", "egress", "tkt", ticket_facts, "brokered")
+    return blob
+
+
+def test_a_brokered_start_renders_the_route_its_ticket_was_minted_with(tmp_path, monkeypatch):
+    ln, control, runtime = bbuild(tmp_path)
+    ln.spawn(blaunch())
+    minted = control.calls[1][1]
+    assert minted["route"] == "glm"
+    # REVERT: the brokered branch of `_render_blob` (it picks the base map's own brokered route, `anthropic`, and
+    # render refuses ticket-routes-mismatch against the ticket's `glm`)
+    blob = _check_at_render(tmp_path, monkeypatch, runtime.starts[0], minted)
+    assert list(blob.routes) == ["glm"]
+
+
+def test_after_a_stale_route_retry_the_start_carries_the_refreshed_route_not_the_first(tmp_path, monkeypatch):
+    answers = iter([resolver(1, route_id="glm")(None), resolver(2, "sha256:" + "b" * 64, route_id="glm-b")(None)])
+
+    def mint(f):
+        if f["routemap_generation"] == 1:
+            raise Refused("ticket-field:routemap_generation", "the active generation is 2")
+        return {"ticket": "t" * 43, "run_id": RUN}
+
+    ln, control, runtime = bbuild(tmp_path, **{"ROUTE-RESOLVE": lambda f: next(answers), "RUN-TICKET-MINT": mint})
+    ln.spawn(blaunch())
+    effective = control.calls[3][1]
+    assert effective["route"] == "glm-b"
+    # REVERT: spawn deriving the routes from `facts` (the first, refused resolve) in place of the `minted` facts
+    # `_mint` answers (the pre-retry `glm` would reach render and be refused ticket-routes-mismatch)
+    assert tuple(runtime.starts[0].routes) == ("glm-b",)
+    _check_at_render(tmp_path, monkeypatch, runtime.starts[0], effective)
+
+
+def test_a_brokered_start_with_no_route_is_refused_before_anything_is_allocated(tmp_path, monkeypatch):
+    req = L.SlotStart("tkt", RUN, KEY, "claude", MODEL, "b", "sha256:" + "0" * 64, L.HOOKS, None, "brokered")
+    with pytest.raises(L.LauncherRefused) as e:
+        _render_runtime(tmp_path, monkeypatch)._render_blob(req)
+    assert e.value.name == "brokered-start-without-route"
+
+
+# --- L3 wave3 r1: complement MED 1, keys lagging an activation is transient ----------------------------------------------
+
+def test_a_mint_refused_keys_unavailable_is_transient_and_the_next_spawn_retakes_it(real, tmp_path):
+    two, sig = real.st.signed(item(2))
+    RM_submit(real, two, sig)                     # generation 2 active; keys still states generation 1
+    to = ToControl(real)
+    runtime = FakeRuntime()
+    ln = L.RealLauncher(to, runtime, FakeSources(), L.SessionIndex(tmp_path / "idx"), auth="brokered")
+    with pytest.raises(L.LauncherRefused) as e:
+        ln.spawn(blaunch())
+    assert e.value.name == "mint-refused:keys-unavailable"
+    # REVERT: `keys-unavailable` in `_TRANSIENT` (a momentary keys lag would tombstone the occurrence for good)
+    assert e.value.reason_class == "transient" and ln.index.get(KEY)["reason_class"] == "transient"
+    real.attach({"generation": 2, "item_sha256": sha(two)})      # keys catches up
+    ln.spawn(blaunch())
+    assert ln.index.get(KEY)["state"] == "started" and len(runtime.starts) == 1
+
+
+# --- L3 wave3 r1: codex HIGH 3 + complement MED 2, no spend without a completeness proof ------------------------------
+
+def test_a_partially_delivered_lineage_never_settles_low(tmp_path):
+    # the run made two calls (100 and 900); keys' sender has delivered only the first when END is proven
+    p = _sink(tmp_path, [_row(RUN, cost=100, hold=100)])
+    # REVERT: returning the sum without the completeness proof (it settles at 100 and releases 900 for good)
+    assert DU.lineage_spend(p, RUN) is None
+    assert DU.lineage_spend_reader(p)(RUN) is None
+    assert DU.lineage_spend(p, RUN, final_rows=2) is None              # the proof says two; the sink holds one
+    ln, _, _ = bbuild(tmp_path / "ln", spend=DU.lineage_spend_reader(p))
+    _ended(ln)
+    assert ln.usage(KEY).usd_micros is None                            # the whole reservation, never 100
+    p2 = _sink(tmp_path / "ln", [_row(RUN, cost=100, hold=100), _row(RUN, cost=900, hold=900)])
+    assert DU.lineage_spend(p2, RUN, final_rows=2) == 1_000
+    assert DU.lineage_spend_reader(p2, final_rows=lambda run_id: 2)(RUN) == 1_000
+
+
+@pytest.mark.parametrize("proof", [None, -1, True, 1.5, "2", 3])
+def test_a_completeness_proof_that_is_absent_odd_or_does_not_match_is_none(tmp_path, proof):
+    p = _sink(tmp_path, [_row(RUN), _row(RUN)])
+    assert DU.lineage_spend(p, RUN, final_rows=proof) is None
+
+
+def test_a_proof_of_no_rows_with_no_rows_is_zero_and_a_raising_proof_is_none(tmp_path):
+    p = _sink(tmp_path, [_row("r-fedcba9876543210")])
+    assert DU.lineage_spend(p, RUN, final_rows=0) == 0
+    assert DU.lineage_spend(p, RUN) is None
+
+    def boom(run_id):
+        raise OSError("keys gone")
+
+    assert DU.lineage_spend_reader(p, final_rows=boom)(RUN) is None

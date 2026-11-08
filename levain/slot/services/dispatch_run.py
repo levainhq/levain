@@ -735,15 +735,17 @@ class RunServer:
         (:func:`signed_share`), which the ticket is minted with. The fire's own ``usd_micros`` (the dollars its
         reservation took from the window) never prices the run: it must EQUAL that figure, or the launch is refused
         ``dollars-not-the-links-share`` before anything is minted, so a keys cap is never above what the window was
-        debited (S-B1 admits an exposure below the figure: wave-3 RETURN finding 1). A grant that holds no figure stamps
-        None, so the launcher refuses ``no-dollar-share``. A passthrough launch carries no dollars
+        debited (S-B1 admits an exposure below the figure: wave-3 RETURN finding 1). A grant that holds no figure and a fire
+        that sent none stamp None, so the launcher refuses ``no-dollar-share``; a fire's figure against a grant that
+        holds none is ``dollars-not-the-links-share``. A passthrough launch carries no dollars
         (``dollars-on-a-passthrough-launch``) and is otherwise returned as it came."""
         if getattr(self.launcher, "auth", None) != "brokered":
             if launch.usd_micros is not None:
                 raise LauncherRefused("dollars-on-a-passthrough-launch", "a passthrough run reserves no dollars")
             return launch
         share = signed_share(grant)
-        if share is not None and launch.usd_micros != share:
+        # a fire's figure against a grant that signs none is refused by THIS name too (L3 r1 deepseek LOW 1)
+        if launch.usd_micros != share:
             raise LauncherRefused("dollars-not-the-links-share",
                                   "the fire's reserved dollars are not the link's signed per-run figure")
         return dataclasses.replace(launch, usd_micros=share)
@@ -1215,7 +1217,15 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
 
 
 def build_server(host: str, store: Path, control_sock: Path, operator_uid: int) -> RunServer:
-    """The production wiring: the real ports behind :class:`RealLauncher`, and the authority REPLICA at
+    """PRE-W (L3 wave3 r1, codex HIGH 1; by design, this branch keeps the brokered path unreachable): this builds the
+    PASSTHROUGH server only. Wiring API-key (brokered) sessions must add a separately constructed brokered launcher,
+    ``RealLauncher(..., auth="brokered", spend=lineage_spend_reader(<sink>, <keys' completeness proof>))``, behind its
+    own verifier, ``replica_verifier(replica, billing="api_key")``, chosen from a trusted billing decision (a separate
+    server or socket per billing, or a dispatch on the verified link's billing), and the client's ``build_launcher``
+    must hand an ``api_key`` occurrence a brokered client. Never mutate a shared launcher's ``auth`` per request:
+    concurrent launches and later USAGE reads of the same launcher would race on it.
+
+    The production wiring: the real ports behind :class:`RealLauncher`, and the authority REPLICA at
     ``<store>/dispatch/authority`` behind :func:`replica_verifier`. Nothing of the operator's home is read or named: the operator's
     authority reaches the replica only through SYNC."""
     from levain.qbroker.peercred import peer_uid

@@ -92,17 +92,31 @@ def _micros(v: object) -> Optional[int]:
     return v if type(v) is int and 0 <= v <= _INT_MAX else None
 
 
-def lineage_spend(path: object, run_id: str) -> Optional[int]:
+def lineage_spend(path: object, run_id: str, final_rows: object = None) -> Optional[int]:
     """The micro-dollars a run spent, summed from CONTROL's lineage sink (`L/lineage/lineage.jsonl`, `/3` rows) by
-    ``run_id``. The dispatch uid reads it by group (the sink's own docstring, H6-4). Per row of the run: ``settled``
-    ``yes`` is its ``cost_microdollars`` (the hold when the cost is unsaid), ``uncertain`` is the larger of the cost and
-    the hold (a call that may have been charged), ``no`` is 0 (released or refused). Fail-closed: None, so the caller
-    settles at the whole reservation, when the sink cannot be opened or read whole, any line is torn, over-long, not
-    JSON or not a row, ANY quarantine row exists (it names no run, so it may be this one's), a row of the run carries a
-    figure that is not a micro-dollar count, or the run has NO row (a run that called nothing and a sink that lags the
-    run read alike, and the second must not read as zero)."""
+    ``run_id``, and ONLY with a proof that the sink holds every row of the run (L3 wave3 r1, codex HIGH 3).
+
+    The completeness proof is ``final_rows``: the number of distinct lineage records keys built for the run, answered
+    only once keys holds the run final (no open hold, no refusal window still open). The sum is returned only when the
+    run's rows in the sink number exactly that. keys delivers rows asynchronously (its outbox, paced envelopes), so
+    S1 END proving the group gone says nothing about delivery: a sink holding the first of two calls (100 of 100 + 900)
+    would otherwise settle at 100 and release the rest for good. Neither keys nor CONTROL produces such a proof today
+    (no terminal row per run, no finalized-count query, and a row is sent only at a resolution, so an exchange still
+    open leaves no trace in the sink), so with ``final_rows`` None this answers None ALWAYS, and a brokered run settles
+    at its whole reservation. What keys must add before a brokered run can settle below its reservation: a per-run
+    final count (or terminal record) acknowledged only after every resolution of the run is durably in the sink.
+
+    Per row of the run: ``settled`` ``yes`` is its ``cost_microdollars`` (the hold when the cost is unsaid),
+    ``uncertain`` the larger of the cost and the hold (a call that may have been charged), ``no`` 0 (released or
+    refused). The dispatch uid reads the sink by group (the sink's own docstring, H6-4). Fail-closed: None, so the caller
+    settles at the whole reservation, when the proof is absent, not a count, or not the run's row count; when the sink
+    cannot be opened or read whole, any line is torn, over-long, not JSON or not a row; when ANY quarantine row exists
+    (it names no run, so it may be this one's); or when a row of the run carries a figure that is not a micro-dollar
+    count. A proof of 0 with no row of the run is 0."""
     if type(run_id) is not str or not run_id or not isinstance(path, (str, os.PathLike)):
         return None
+    if type(final_rows) is not int or final_rows < 0:
+        return None                # completeness unproven: never a number
     total, matched = 0, 0
     try:
         fd = os.open(os.fspath(path), os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC)
@@ -145,9 +159,20 @@ def lineage_spend(path: object, run_id: str) -> Optional[int]:
     finally:
         if fd != -1:
             os.close(fd)
-    return total if matched and total <= _INT_MAX else None
+    return total if matched == final_rows and total <= _INT_MAX else None
 
 
-def lineage_spend_reader(path: object) -> Callable[[str], Optional[int]]:
-    """:func:`lineage_spend` bound to the sink at ``path``: the ``spend`` a brokered ``RealLauncher`` is built with."""
-    return lambda run_id: lineage_spend(path, run_id)
+def lineage_spend_reader(path: object, final_rows: Optional[Callable[[str], Any]] = None
+                         ) -> Callable[[str], Optional[int]]:
+    """:func:`lineage_spend` bound to the sink at ``path`` and to ``final_rows(run_id)``, keys' completeness proof for
+    the run (no such source exists yet: without one every read is None, the whole reservation): the ``spend`` a
+    brokered ``RealLauncher`` is built with. A proof source that raises is None."""
+    def read(run_id: str) -> Optional[int]:
+        if final_rows is None:
+            return None
+        try:
+            proof = final_rows(run_id)
+        except Exception:  # noqa: BLE001 - an unreadable proof is no proof
+            return None
+        return lineage_spend(path, run_id, proof)
+    return read
