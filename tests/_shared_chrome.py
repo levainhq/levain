@@ -98,9 +98,28 @@ def _pick_chrome(given: str, *, explicit: bool = False, flags_file: Path = CHROM
 
 
 def _session_chrome() -> str:
-    """The Chrome the session starts: ``CHROME`` when set (explicit), else the shell if installed, else the default Chrome."""
+    """THE resolver for which Chrome runs (the launch and the skip check both read it, nothing else decides): ``CHROME`` when
+    set (explicit), else the shell if installed, else the macOS app bundle. There is NO PATH lookup: off macOS with ``CHROME``
+    unset this names nothing usable (CI's plain ``test`` shards rely on every browser test skipping; only the ``browser`` job
+    installs a pinned Chrome and sets ``CHROME``)."""
     named = os.environ.get("CHROME")
+    if named:
+        named = shutil.which(named) or named   # a command name resolves; a path that resolves to nothing stays as typed and FAILS at launch
     return _pick_chrome(named or DEFAULT_CHROME, explicit=bool(named))
+
+
+def chrome_skip_reason() -> str | None:
+    """None when a browser test should run, else why it skips; derived only from ``_session_chrome()``. An explicit ``CHROME``
+    never skips: one that names nothing must FAIL the test at launch, not fall back to another browser or pass by skipping
+    (CI sets CHROME on purpose)."""
+    if os.environ.get("CHROME"):
+        return None
+    if platform.system() != "Darwin":
+        return "CHROME is unset off macOS (only the browser job sets it)"
+    chrome = _session_chrome()
+    if Path(chrome).is_file() and os.access(chrome, os.X_OK):
+        return None
+    return f"Chrome is not installed (resolved to {chrome})"
 
 
 PING = Path(__file__).with_name("_cdp_ping.mjs")

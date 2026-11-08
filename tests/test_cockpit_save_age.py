@@ -10,6 +10,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import shutil
 import sys
 import threading
 from pathlib import Path
@@ -17,6 +18,7 @@ from pathlib import Path
 import pytest
 from anneal_memory import Store
 
+from tests._shared_chrome import _session_chrome, chrome_skip_reason
 from tests._ke_dom import NODE, run_node
 
 pytestmark = pytest.mark.skipif(NODE is None, reason="node is not installed")
@@ -140,10 +142,11 @@ Date.now = real;
         assert "the wrap READING" in t and "the wrap at the stamp" in t, t
 
 
-CHROME = "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"
+CHROME = _session_chrome()
+needs_browser = pytest.mark.skipif(chrome_skip_reason() is not None or shutil.which("node") is None, reason="needs Chrome and node")
 
 
-@pytest.mark.skipif(not Path(CHROME).exists(), reason="Chrome is not installed")
+@needs_browser
 def test_the_default_cockpits_health_panel_shows_an_age_that_moves_in_a_real_page(tmp_path: Path) -> None:
     """K1/K2 on the real path: the default cockpit's own Health panel, in headless Chrome, opened in its focus view."""
     from levain.web_server import make_server
@@ -224,7 +227,7 @@ def _drive_default_cockpit(tmp_path: Path, steps: list, query: str = "?source=ma
     return json.loads(r.stdout)["values"]
 
 
-@pytest.mark.skipif(not Path(CHROME).exists(), reason="Chrome is not installed")
+@needs_browser
 def test_the_age_timer_runs_for_the_pages_life_and_ticks_only_what_is_attached(tmp_path: Path) -> None:
     """K10a on a real DOM: a subtree not yet attached is not ticked (the browser never returns it), the same subtree
     attached is, and the timer is armed still after a tick that found no age at all."""
@@ -249,7 +252,7 @@ def test_the_age_timer_runs_for_the_pages_life_and_ticks_only_what_is_attached(t
     assert got["armedAfterEmptyTick"] is True, got
 
 
-@pytest.mark.skipif(not Path(CHROME).exists(), reason="Chrome is not installed")
+@needs_browser
 def test_the_native_health_panels_last_save_is_an_age_that_ticks(tmp_path: Path) -> None:
     """K10c: the native Health card (the legacy /substrate.json page) draws its "last save" through the shared age node (a stamp the page keeps current),
     not once as "Nh ago" text."""

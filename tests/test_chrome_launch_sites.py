@@ -7,6 +7,7 @@ site names that file (Python: ``CHROME_SAFE_FLAGS``) instead of typing them, so 
 without this test failing."""
 from __future__ import annotations
 
+import functools
 import json
 import os
 import platform
@@ -236,10 +237,45 @@ def test_the_python_selector_survives_an_unknown_account_and_a_malformed_root(tm
 def test_the_session_chrome_reads_full_chrome_and_a_named_chrome_when_it_starts(monkeypatch):
     monkeypatch.delenv("CHROME", raising=False)
     monkeypatch.setenv("LEVAIN_FULL_CHROME", "1")
+    monkeypatch.setattr(_shared_chrome.platform, "system", lambda: "Darwin")
     assert _shared_chrome._session_chrome() == _shared_chrome.DEFAULT_CHROME
     monkeypatch.delenv("LEVAIN_FULL_CHROME")
     monkeypatch.setenv("CHROME", "/opt/named/chrome")
     assert _shared_chrome._session_chrome() == "/opt/named/chrome"
+
+
+def _fake_exe(path: Path) -> str:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text("#!/bin/sh\n")
+    path.chmod(0o755)
+    return str(path)
+
+
+def test_linux_with_chrome_unset_skips_even_with_chromium_on_path(tmp_path, monkeypatch):
+    """Linux, CHROME unset, chromium on PATH: SKIPS (CI's plain shards rely on it) and the launch is not the PATH binary."""
+    chromium = _fake_exe(tmp_path / "bin" / "chromium")
+    monkeypatch.delenv("CHROME", raising=False)
+    monkeypatch.setattr(_shared_chrome.platform, "system", lambda: "Linux")
+    monkeypatch.setattr(_shared_chrome.shutil, "which", lambda n: chromium if n == "chromium" else None)
+    monkeypatch.setattr(_shared_chrome, "DEFAULT_CHROME", str(tmp_path / "absent" / "Google Chrome"))
+    assert _shared_chrome._session_chrome() != chromium
+    assert "CHROME is unset" in _shared_chrome.chrome_skip_reason()
+
+
+def test_the_skip_check_follows_the_resolver_to_a_cached_headless_shell(tmp_path, monkeypatch):
+    """macOS, no app bundle, only a cached chrome-headless-shell: the resolver finds it, so the check must not skip."""
+    shell = _fake_exe(tmp_path / "root" / "mac_arm-156.0.1" / "chrome-headless-shell-mac-arm64" / "chrome-headless-shell")
+    monkeypatch.delenv("CHROME", raising=False)
+    monkeypatch.delenv("LEVAIN_FULL_CHROME", raising=False)
+    monkeypatch.setattr(_shared_chrome.platform, "system", lambda: "Darwin")
+    monkeypatch.setattr(_shared_chrome.platform, "machine", lambda: "arm64")
+    monkeypatch.setattr(_shared_chrome, "DEFAULT_CHROME", str(tmp_path / "absent" / "Google Chrome"))
+    flags = tmp_path / "flags.json"
+    flags.write_text(json.dumps({"flags": [], "headless_shell_root": str(tmp_path / "root")}))
+    monkeypatch.setattr(_shared_chrome, "CHROME_FLAGS_FILE", flags)
+    monkeypatch.setattr(_shared_chrome, "_pick_chrome", functools.partial(_shared_chrome._pick_chrome, flags_file=flags))
+    assert _shared_chrome._session_chrome() == shell
+    assert _shared_chrome.chrome_skip_reason() is None
 
 
 def test_the_drivers_name_the_flags_file_and_the_launcher_spreads_it():
