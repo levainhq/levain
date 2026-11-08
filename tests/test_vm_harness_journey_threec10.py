@@ -41,6 +41,7 @@ class World:
         self.doctor_exc = doctor_exc
         self.doctor_calls = 0
         self.fetches = []
+        self.new_removed = 0
 
     # guest(argv, timeout): capture's wrapper first
     def guest(self, argv, timeout=60):
@@ -101,6 +102,11 @@ class World:
         if script == T.REMOVE_SCRIPT:
             self.files.pop(name, None)
             return f"cred-removed {name}\n"
+        if script == T.REMOVE_NEW_SCRIPT:
+            self.new_removed += 1
+            return f"cred-removed-new {name}\n"
+        if script == T.VERIFY_SCRIPT:
+            return (f"cred-present {name}.json\n" if argv[8] == "all" and name in self.files else f"cred-absent {name}\n")
         raise AssertionError(script)
 
     def fetch(self, url, headers, timeout):
@@ -290,8 +296,11 @@ def test_a_failed_removal_is_said_loudly(tmp_path):
     ev = tmp_path / "ev"
     ev.mkdir()
     ticks = iter(range(10_000))
-    T.run_3c10(w.guest, w.stdin_run, ev, cfg(), fetch=w.fetch, sleep=lambda s: None, clock=lambda: float(next(ticks)))
-    assert "NOT removed" in (ev / "steps.log").read_text()
+    status, _s, path = T.run_3c10(w.guest, w.stdin_run, ev, cfg(), fetch=w.fetch, sleep=lambda s: None,
+                                  clock=lambda: float(next(ticks)))
+    assert "NOT confirmed removed" in (ev / "steps.log").read_text()
+    assert status == "INCOMPLETE" and "CLEANUP:" in path.read_text() and "RESULT: PASS" not in path.read_text()
+    assert T.main.__code__ and {"PASS": 0}.get(status, 3) != 0
 
 
 def test_nothing_is_installed_so_nothing_is_removed_when_no_key_is_given(tmp_path):
@@ -342,7 +351,7 @@ def test_a_small_lineage_total_against_an_unmoved_provider_is_not_an_agreement(t
     assert t3.raw.startswith("NOMOVE") and t3.status == "FAIL" and status == "FAIL"
 
 
-def test_a_transport_failure_after_the_write_still_removes_the_credential(tmp_path):
+def test_a_transport_failure_after_the_write_leaves_the_file_and_says_so(tmp_path):
     w = World()
     orig = w.stdin_run
 
@@ -354,8 +363,12 @@ def test_a_transport_failure_after_the_write_still_removes_the_credential(tmp_pa
 
     w.stdin_run = run
     _w, ev, (status, steps, _p) = go(tmp_path, w)
-    assert by_id(steps)["T1"].status == "FAIL" and w.files == {}
-    assert "removed" in (ev / "steps.log").read_text()
+    s = by_id(steps)
+    assert s["T1"].status == "ERROR" and status == "INCOMPLETE" and "UNCERTAIN" in s["T1"].detail
+    assert CRED in w.files and w.new_removed == 1                         # <cred>.json is NEVER removed on an uncertain install
+    assert [s[i].status for i in ("T2", "T3", "T4", "T5", "T6")] == ["UNBOUND"] * 5
+    assert all(a[4] != T.REMOVE_SCRIPT for a in w.argvs if len(a) > 4)
+    assert "RESULT: INCOMPLETE" in _p.read_text() and "check it by hand" in _p.read_text()
     assert ".json.new" in T.REMOVE_SCRIPT
 
 
@@ -417,3 +430,191 @@ def test_an_overall_word_for_a_timeout_is_incomplete_and_names_it(tmp_path):
     t2 = by_id(steps)["T2"]
     assert t2.status == "ERROR" and "TimeoutExpired" in t2.detail and status == "INCOMPLETE"
     assert "RESULT: INCOMPLETE" in path.read_text() and w.files == {}
+
+
+# ---- L3 round 1 fixes -------------------------------------------------------------------------------------------------
+
+def test_a_removal_that_returns_ok_but_leaves_the_file_is_not_a_pass(tmp_path):
+    w = World()
+    orig = w.stdin_run
+    w.stdin_run = lambda argv, text, timeout=60: ("cred-removed or-key\n" if argv[4] == T.REMOVE_SCRIPT else orig(argv, text, timeout))
+    _w, ev, (status, steps, path) = go(tmp_path, w)
+    assert status == "INCOMPLETE" and CRED in w.files and "STILL on the guest" in path.read_text()
+
+
+def test_a_removal_timeout_is_not_a_pass(tmp_path):
+    w = World()
+    orig = w.stdin_run
+
+    def run(argv, text, timeout=60):
+        if argv[4] == T.REMOVE_SCRIPT:
+            raise subprocess.TimeoutExpired(["ssh"], 60)
+        return orig(argv, text, timeout)
+
+    w.stdin_run = run
+    _w, ev, (status, steps, path) = go(tmp_path, w)
+    assert status == "INCOMPLETE" and "TimeoutExpired" in path.read_text()
+
+
+def test_a_clean_run_says_cleanup_ok(tmp_path):
+    _w, _ev, (status, _s, path) = go(tmp_path)
+    assert status == "PASS" and "CLEANUP: ok" in path.read_text()
+
+
+def test_an_ambiguous_t1_never_lets_t5_replace_or_delete_his_file(tmp_path):
+    """His or-key.json exists; T1's reply is lost (the script in fact refused). T5 must not run in replace mode."""
+    w = World(preexisting={CRED: "HIS"})
+    orig = w.stdin_run
+
+    def run(argv, text, timeout=60):
+        out = orig(argv, text, timeout)
+        if argv[4] == T.INSTALL_SCRIPT:
+            raise GuestError(255, "ssh dropped before the answer")
+        return out
+
+    w.stdin_run = run
+    _w, ev, (status, steps, path) = go(tmp_path, w)
+    assert w.files == {CRED: "HIS"}                                         # never overwritten, never deleted
+    assert not any(a[4] == T.REMOVE_SCRIPT for a in w.argvs if len(a) > 4)
+    assert [a[8] for a in w.argvs if len(a) > 8 and a[4] == T.INSTALL_SCRIPT] == ["new"]   # T5 never ran
+    assert status == "INCOMPLETE" and by_id(steps)["T5"].status == "UNBOUND"
+
+
+def test_t5_replaces_only_after_a_confirmed_t1(tmp_path):
+    w, _ev, (status, _s, _p) = go(tmp_path)
+    modes = [a[8] for a in w.argvs if len(a) > 8 and a[4] == T.INSTALL_SCRIPT]
+    assert modes == ["new", "replace"] and status == "PASS"
+
+
+def test_an_install_that_prints_nothing_is_uncertain_not_ours(tmp_path):
+    w = World(preexisting={CRED: "HIS"})
+    w.stdin_run = lambda argv, text, timeout=60: "" if argv[4] == T.INSTALL_SCRIPT else World.stdin_run(w, argv, text, timeout)
+    _w, _ev, (status, steps, _p) = go(tmp_path, w)
+    assert w.files == {CRED: "HIS"} and status == "INCOMPLETE" and by_id(steps)["T1"].status == "ERROR"
+
+
+def test_the_verify_script_reports_what_is_on_disk(tmp_path):
+    r, d = _sh(tmp_path, T.VERIFY_SCRIPT, "k", "all", "")
+    assert r.stdout.strip() == "cred-absent k"
+    (d / "k.json").write_text("x")
+    r, d = _sh(tmp_path, T.VERIFY_SCRIPT, "k", "all", "")
+    assert r.stdout.startswith("cred-present k.json")
+    r, d = _sh(tmp_path, T.VERIFY_SCRIPT, "k", "new", "")                  # "new" ignores <cred>.json
+    assert r.stdout.strip() == "cred-absent k"
+    (d / "k.json.new").write_text("x")
+    r, d = _sh(tmp_path, T.VERIFY_SCRIPT, "k", "new", "")
+    assert r.stdout.startswith("cred-present k.json.new")
+    r, d = _sh(tmp_path, T.REMOVE_NEW_SCRIPT, "k", None, "")
+    assert (d / "k.json").exists() and not (d / "k.json.new").exists()      # removes the twin only
+
+
+def test_the_stdin_runner_follows_the_selected_transport_not_the_profile(tmp_path, monkeypatch):
+    from scripts.vm_harness import vm_run
+    vm = "vend-test"
+    monkeypatch.setattr(vm_run, "agent_answers", lambda *a, **k: False)
+    guest, _spawn = vm_run.make_transport(vm, LINUX, tmp_path)
+    assert guest.kind == "ssh" and LINUX.transport == "tart_exec" and LINUX.ssh_fallback
+    calls = []
+
+    def fake_run(cmd, **kw):
+        calls.append(cmd)
+        return subprocess.CompletedProcess(cmd, 0, stdout="10.0.0.5\n" if "ip" in cmd else "out", stderr="")
+
+    monkeypatch.setattr(RB.subprocess, "run", fake_run)
+    run = RB.make_stdin_runner(vm, LINUX, tmp_path, guest.kind)
+    assert run(["/bin/true"], "stdin", 5) == "out" and run(["/bin/true"], "stdin", 5) == "out"
+    assert calls[-1][0] == vm_run.SSH and "exec" not in calls[-1]
+    assert sum(1 for c in calls if "ip" in c) == 1                          # the address is resolved once
+    # and with the agent answering, the same profile gets tart exec
+    monkeypatch.setattr(vm_run, "agent_answers", lambda *a, **k: True)
+    g2, _ = vm_run.make_transport(vm, LINUX, tmp_path)
+    assert g2.kind == "tart_exec"
+    RB.make_stdin_runner(vm, LINUX, tmp_path, g2.kind)(["/bin/true"], "x", 5)
+    assert calls[-1][1] == "exec" and "-i" in calls[-1]
+    with pytest.raises(RB.RunbookError):
+        RB.make_stdin_runner(vm, LINUX, tmp_path, "carrier-pigeon")
+
+
+def test_an_empty_tart_ip_is_a_guest_error_not_an_index_error(tmp_path, monkeypatch):
+    monkeypatch.setattr(RB.subprocess, "run", lambda cmd, **kw: subprocess.CompletedProcess(cmd, 0, stdout="\n", stderr=""))
+    run = RB.make_stdin_runner("vend-test", DARWIN, tmp_path, "ssh")
+    with pytest.raises(GuestError):
+        run(["x"], "", 5)
+
+
+@pytest.mark.parametrize("bad", [float("inf"), float("nan"), -1.0])
+def test_a_non_finite_or_negative_tolerance_refuses_before_any_evidence(tmp_path, bad):
+    ev = tmp_path / "ev"
+    ev.mkdir()
+    with pytest.raises(RB.RunbookError, match="tolerance"):
+        T.run_3c10(lambda *a, **k: "", lambda *a: "", ev, cfg(tolerance_pct=bad))
+    assert list(ev.iterdir()) == []
+
+
+def test_a_non_finite_provider_usage_is_an_error_not_a_crash(tmp_path):
+    with pytest.raises(T.FetchError):
+        T.usage_microdollars(lambda u, h, t: (200, b'{"data":{"usage":NaN}}'), "k")
+    with pytest.raises(T.FetchError):
+        T.usage_microdollars(lambda u, h, t: (200, b'{"data":{"usage":Infinity}}'), "k")
+    w = World()
+    w.fetch = lambda url, headers, timeout: (200, b'{"data":{"usage":NaN}}')
+    _w, ev, (status, steps, path) = go(tmp_path, w)
+    assert by_id(steps)["T3"].status == "ERROR" and status == "INCOMPLETE" and path.exists() and w.files == {}
+
+
+def test_a_provider_timeout_is_error_not_fail(tmp_path):
+    w = World()
+
+    def boom(url, headers, timeout):
+        raise T.FetchError("the provider could not be reached: TimeoutError")
+
+    w.fetch = boom
+    _w, ev, (status, steps, path) = go(tmp_path, w)
+    assert by_id(steps)["T3"].status == "ERROR" and status == "INCOMPLETE"
+
+
+def test_a_boolean_cost_or_overrun_is_not_a_number(tmp_path):
+    w = World()
+    orig = w.dispatch
+
+    def d(inner):
+        if inner == ["fire", "overrun"]:
+            w.rows.append({"overrun": False, "run_id": "r-x"})
+            return ["stopped"], 3
+        return orig(inner)
+
+    w.dispatch = d
+    _w, ev, (status, steps, _p) = go(tmp_path, w)
+    assert by_id(steps)["T4"].status == "FAIL" and by_id(steps)["T4"].raw.startswith("no-overrun-row")
+    w2 = World()
+    w2.lineage_charge = True
+    (tmp_path / "b").mkdir()
+    _w, _ev, (status, steps, _p) = go(tmp_path / "b", w2)
+    assert by_id(steps)["T3"].raw.startswith("NOCALL")
+
+
+def test_the_cleanup_line_is_scrubbed(tmp_path):
+    w = World()
+    orig = w.stdin_run
+
+    def run(argv, text, timeout=60):
+        if argv[4] == T.REMOVE_SCRIPT:
+            raise GuestError(1, f"stderr echoed {LIMITED}")
+        return orig(argv, text, timeout)
+
+    w.stdin_run = run
+    _w, ev, (status, _s, path) = go(tmp_path, w)
+    assert LIMITED not in (ev / "steps.log").read_text() and LIMITED not in path.read_text()
+
+
+def test_a_second_run_claiming_the_same_dir_is_a_runbook_error(tmp_path, monkeypatch):
+    ev = RB.Evidence(tmp_path)
+    (tmp_path / "EXPECTED.txt").write_text("raced in")
+    with pytest.raises(RB.RunbookError, match="claimed"):
+        ev.write_expected("x")
+
+
+def test_a_write_that_makes_no_progress_raises_instead_of_looping(tmp_path, monkeypatch):
+    monkeypatch.setattr(RB.os, "write", lambda fd, data: 0)
+    with pytest.raises(OSError, match="no progress"):
+        RB._write_durable(tmp_path / "f", "abc")

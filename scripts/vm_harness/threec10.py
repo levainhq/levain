@@ -23,12 +23,23 @@ small the lineage total); T4 ``overrun-row`` = a NEW lineage row appeared during
 (it does not prove the session was killed, only that the sink recorded an overrun). T1/T5 install refuse an existing credential
 and an empty one (``cred-refused``; the run ends REFUSED, exit 2). A step that timed out or lost its transport mid-run is ERROR
 (no verdict observed): the run ends INCOMPLETE (exit 3).
-The credential file is removed on the way out whatever happens. A step whose input is missing (a key not in the environment, no
+The credential file is removed on the way out, and the removal is a GRADED result: a removal that times out, exits nonzero
+or whose absence cannot be confirmed afterwards makes the run at least INCOMPLETE (exit nonzero) and RESULT.txt names it. An
+install whose result is AMBIGUOUS (a transport error after the script may have run) never authorises replacing or deleting
+``<cred>.json``: only ``<cred>.json.new`` is cleaned, T5 is not attempted, and the run is INCOMPLETE with the reason. Only the
+script's own ``cred-installed`` line makes the file ours to replace and remove. A step whose input is missing (a key not in the environment, no
 ``--call``) is UNBOUND and the run ends INCOMPLETE, never PASS.
 
 ASSUMED, not verified against a live account (the sitting is the first time): OpenRouter's ``GET /api/v1/key`` answers ``data.usage``
 (USD, a float) beside ``limit`` / ``limit_remaining``; the guest operator can run ``levain doctor`` under ``sudo -n``; ``keys`` reads
 a replaced credential file on its next exchange. A first-run mismatch there is a harness finding, not a product one.
+Known edges (found by L3 round 1, deliberately not built):
+  * the credential is written as root with ``cat >`` / ``chown``; a symlink planted at ``<cred>.json.new`` by the ``_levain_keys``
+    service user (levain's own service user, on our own clone) would be followed. No credential-install verb exists to reuse.
+  * the lineage sink and the provider key are read by row count / usage delta: a second session or a second harness using the
+    same key or store during a run can offset T3 or fake T4. A VM clone runs one harness at a time.
+  * ``urllib`` copies the Authorization header across a redirect; openrouter.ai does not redirect ``GET /api/v1/key``.
+  * T2 right after T1 reads ``keys``' reload on its next exchange (assumed above); T3 stops polling at the first usage move.
 R4 section 6 residue NOT scripted here (read, not run): whether 1.5 s is enough for a real limit read (D1 replaced that verb with
 keys' own refresher), usage per codec (`include_usage`, `usage.cost` vs the class price, `cache_write_tokens`), a 429 retry storm at
 its holds, a Responses stream over the 1 MiB event cap, the 32 MiB parse timing and the 64 KiB chunk bound over real TLS.
@@ -37,6 +48,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import os
 import re
 import secrets
@@ -73,6 +85,11 @@ INSTALL_SCRIPT = ('set -e; d="$1/keys/cred"; n="$2"; umask 077; '
                   'if [ ! -s "$d/$n.json.new" ]; then rm -f "$d/$n.json.new"; echo "cred-refused $n: empty credential"; exit 0; fi; '
                   'chown ' + KEYS_USER + ':' + KEYS_USER + ' "$d/$n.json.new"; mv "$d/$n.json.new" "$d/$n.json"; '
                   'echo "cred-installed $n"')
+#: Remove ONLY the half-written file: what an uncertain install leaves behind that is surely ours. Never ``<cred>.json``.
+REMOVE_NEW_SCRIPT = 'set -e; rm -f "$1/keys/cred/$2.json.new"; echo "cred-removed-new $2"'
+#: ``$3`` is ``all`` (the credential and its half-written twin) or ``new`` (the twin only); prints ``cred-absent`` or ``cred-present``.
+VERIFY_SCRIPT = ('d="$1/keys/cred"; if [ "$3" = all ] && [ -e "$d/$2.json" ]; then echo "cred-present $2.json"; exit 0; fi; '
+                 'if [ -e "$d/$2.json.new" ]; then echo "cred-present $2.json.new"; exit 0; fi; echo "cred-absent $2"')
 REMOVE_SCRIPT = 'set -e; rm -f "$1/keys/cred/$2.json" "$1/keys/cred/$2.json.new"; echo "cred-removed $2"'
 
 #: (id, name, rc, pattern with <cred>, line selector): the verdicts, one each, fixed before any run.
@@ -89,11 +106,16 @@ EXPECTED: tuple[tuple[str, str, int | None, str, str | None], ...] = (
      r"bounds the invoice.*", r"invoice ceiling \(<cred>"),
 )
 
+class FetchError(RunbookError):
+    """The provider's answer could not be had or is not a number: no verdict was observed (a step ERROR, never a FAIL)."""
+
+
 Fetch = Callable[[str, Mapping[str, str], float], "tuple[int, bytes]"]
 
 
 def default_fetch(url: str, headers: Mapping[str, str], timeout: float) -> tuple[int, bytes]:
     """The one place this script reaches a real provider: a GET of the key's status with the key. Only a real run uses it."""
+    import http.client
     import urllib.error
     import urllib.request
     if not url.startswith("https://" + OPENROUTER_HOST + "/"):
@@ -104,6 +126,8 @@ def default_fetch(url: str, headers: Mapping[str, str], timeout: float) -> tuple
             return r.status, r.read(64 * 1024)
     except urllib.error.HTTPError as e:
         return e.code, e.read(64 * 1024)
+    except (urllib.error.URLError, TimeoutError, http.client.HTTPException) as e:
+        raise FetchError(f"the provider could not be reached: {type(e).__name__}: {e}") from None
 
 
 def usage_microdollars(fetch: Fetch, key: str, timeout: float = 15) -> int:
@@ -117,6 +141,8 @@ def usage_microdollars(fetch: Fetch, key: str, timeout: float = 15) -> int:
         raise RunbookError("the provider's key status has no data.usage") from None
     if isinstance(usage, bool) or not isinstance(usage, (int, float)) or usage < 0:
         raise RunbookError(f"the provider's data.usage is not an amount: {usage!r}")
+    if not math.isfinite(usage):
+        raise FetchError(f"the provider's data.usage is not finite: {usage!r}")
     return round(usage * 1_000_000)
 
 
@@ -184,6 +210,8 @@ def run_3c10(guest, stdin_run, evidence_dir, cfg: Config, *, fetch: Fetch = defa
         raise RunbookError(f"credential name {cfg.cred!r} is not [a-z0-9-]{{1,48}}")
     for sid, _n, _rc, pat, sel in EXPECTED:
         Verdict(_rc, pat).check()
+    if not (math.isfinite(cfg.tolerance_pct) and cfg.tolerance_pct >= 0):
+        raise RunbookError(f"--tolerance-pct must be a finite number >= 0, not {cfg.tolerance_pct!r}")
     ev = Evidence(evidence_dir)
 
     def scrub(text: str) -> str:
@@ -211,36 +239,51 @@ def run_3c10(guest, stdin_run, evidence_dir, cfg: Config, *, fetch: Fetch = defa
         ok, raw = judge(lines, rc, v, sel)
         done(sid, "PASS" if ok else "FAIL", raw, detail if ok else (detail + f" rc={rc}").strip())
 
-    installed = False
+    #: ``none`` (nothing of ours is on the guest), ``confirmed`` (the script's own ``cred-installed`` line was seen: the file
+    #: is ours to replace and to remove), ``uncertain`` (the script may have run and its answer was lost: ``<cred>.json`` is
+    #: NEVER replaced or removed, only the ``.json.new`` twin).
+    state = "none"
+    uncertain_why = ""
     refused = False
+    cleanup_problems: list[str] = []
 
     def install(sid: str, which: str) -> bool:
-        nonlocal installed, refused
+        nonlocal state, refused, uncertain_why
         key = keys.get(which)
         if refused:
             unbound(sid, "an earlier install was refused; nothing more is installed")
             return False
+        if state == "uncertain":
+            unbound(sid, "an earlier install's result is uncertain: not touching the credential file")
+            return False
         if not key:
             unbound(sid, f"the {which} key is not in the environment")
             return False
-        mode = "replace" if installed else "new"     # replace only the sitting's own file; never one that was already there
+        mode = "replace" if state == "confirmed" else "new"   # replace only a file whose install was CONFIRMED to be ours
         argv = ("sudo", "-n", "/bin/sh", "-c", INSTALL_SCRIPT, "sh", cfg.profile.store, cfg.cred, mode)
-        prior = installed
-        installed = True          # BEFORE the call: a transport failure after the write must still reach the cleanup
+        attempted_from = state
         try:
             out = stdin_run(argv, credential_json(cfg.cred, key), 60)
-        except (GuestError, OSError) as e:
-            done(sid, "FAIL", detail=f"transport: {e}")
-            return False
-        except subprocess.SubprocessError as e:
-            done(sid, "ERROR", detail=f"{type(e).__name__}: {e}")
+        except (GuestError, OSError, subprocess.SubprocessError) as e:
+            why = f"{sid}: no answer from the install script ({type(e).__name__}: {e})"
+            if attempted_from == "confirmed":
+                done(sid, "ERROR", detail=f"transport: {e}; the file there is the sitting's own either way")
+            else:
+                state, uncertain_why = "uncertain", why
+                done(sid, "ERROR", detail=f"transport: {e}; install result UNCERTAIN, {cfg.cred}.json will not be touched")
             return False
         lines = out.splitlines()
         refusal = next((ln for ln in lines if ln.startswith("cred-refused ")), None)
         if refusal:
-            installed = prior     # nothing of ours was written: do not remove a file that was there before
-            refused = True
+            refused = True        # nothing of ours was written: a file that was there is never removed
             done(sid, "REFUSED", detail=refusal)
+            return False
+        if f"cred-installed {cfg.cred}" in lines:
+            state = "confirmed"
+        else:
+            if attempted_from != "confirmed":
+                state, uncertain_why = "uncertain", f"{sid}: the install script printed neither cred-installed nor cred-refused"
+            done(sid, "ERROR", raw=lines[-1] if lines else "", detail="no cred-installed line: install result UNCERTAIN")
             return False
         judged(sid, lines, 0)
         return results[sid].status == "PASS"
@@ -272,13 +315,16 @@ def run_3c10(guest, stdin_run, evidence_dir, cfg: Config, *, fetch: Fetch = defa
                     break
                 sleep(cfg.settle_poll_s)
             new = lineage_rows(guest, cfg.profile)[before_rows:]
+        except FetchError as e:
+            done(sid, "ERROR", detail=f"{type(e).__name__}: {e}")
+            return
         except (GuestError, RunbookError, OSError) as e:
             done(sid, "FAIL", detail=f"{type(e).__name__}: {e}")
             return
         except subprocess.SubprocessError as e:
             done(sid, "ERROR", detail=f"{type(e).__name__}: {e}")
             return
-        settled = [r for r in new if isinstance(r.get("cost_microdollars"), int) and r.get("model_answered") is not None]
+        settled = [r for r in new if type(r.get("cost_microdollars")) is int and r.get("model_answered") is not None]
         lin = sum(r["cost_microdollars"] for r in settled)
         prov = u1 - u0
         tol = max(cfg.tolerance_pct / 100.0 * prov, cfg.tolerance_floor_microdollars)
@@ -302,10 +348,38 @@ def run_3c10(guest, stdin_run, evidence_dir, cfg: Config, *, fetch: Fetch = defa
         except subprocess.SubprocessError as e:
             done(sid, "ERROR", detail=f"{type(e).__name__}: {e}")
             return
-        hits = [r for r in new if isinstance(r.get("overrun"), int)]
+        hits = [r for r in new if type(r.get("overrun")) is int]
         raw = (f"overrun-row run_id={hits[0].get('run_id')} overrun={hits[0]['overrun']} settled={hits[0].get('settled')} "
                f"call_rc={rc}" if hits else f"no-overrun-row rows={len(new)} call_rc={rc}")
         judged(sid, [raw], 0)
+
+    def cleanup() -> list[str]:
+        """Remove what is surely ours and CONFIRM it is gone. Returns the problems (empty: clean)."""
+        if state == "none":
+            return []
+        confirmed = state == "confirmed"
+        script, label, vmode = (REMOVE_SCRIPT, "removed", "all") if confirmed else (REMOVE_NEW_SCRIPT, "removed-new", "new")
+        base = ("sudo", "-n", "/bin/sh", "-c")
+        tail = ("sh", cfg.profile.store, cfg.cred)
+        problems: list[str] = []
+        if not confirmed:
+            problems.append(f"{uncertain_why}; {cfg.profile.store}/keys/cred/{cfg.cred}.json may be the sitting's credential or "
+                            f"one of his: check it by hand, it was NOT touched")
+        try:
+            out = stdin_run(base + (script,) + tail, "", 60)
+            if f"cred-{label} {cfg.cred}" not in out.splitlines():
+                problems.append(f"removal of {cfg.cred} printed no cred-{label} line")
+            seen = stdin_run(base + (VERIFY_SCRIPT,) + tail + (vmode,), "", 60)
+            if f"cred-absent {cfg.cred}" not in seen.splitlines():
+                problems.append(f"{cfg.cred} is STILL on the guest after removal ({seen.strip()[:80]})")
+        except (GuestError, OSError, subprocess.SubprocessError) as e:
+            problems.append(f"credential {cfg.cred} NOT confirmed removed ({type(e).__name__}: {e}); remove "
+                            f"{cfg.profile.store}/keys/cred/{cfg.cred}.json* by hand")
+        for p in problems:
+            ev.log(scrub("cleanup: " + p))
+        if not problems:
+            ev.log(f"cleanup: credential {cfg.cred} removed and confirmed absent")
+        return problems
 
     try:
         if install("T1", "limited"):
@@ -320,22 +394,20 @@ def run_3c10(guest, stdin_run, evidence_dir, cfg: Config, *, fetch: Fetch = defa
                 unbound("T4", "no --overrun-call: a run whose real usage exceeds its share is the sitting's to name")
         else:
             for sid in ("T2", "T3", "T4"):
-                unbound(sid, "T1 did not install the limited key")
+                unbound(sid, f"T1 did not pass (install state: {state})")
         if install("T5", "unlimited"):
             doctor("T6")
         else:
             unbound("T6", "T5 did not install the unlimited key")
     finally:
-        if installed:
-            try:
-                stdin_run(("sudo", "-n", "/bin/sh", "-c", REMOVE_SCRIPT, "sh", cfg.profile.store, cfg.cred), "", 60)
-                ev.log(f"cleanup: credential {cfg.cred} removed")
-            except (GuestError, OSError, subprocess.SubprocessError) as e:
-                ev.log(f"cleanup: credential {cfg.cred} NOT removed ({e}); remove {cfg.profile.store}/keys/cred/{cfg.cred}.json by hand")
+        cleanup_problems += cleanup()
     ordered = [results[sid] for sid, *_ in EXPECTED]
     status = overall([r.status for r in ordered])
+    if cleanup_problems and status == "PASS":
+        status = "INCOMPLETE"     # a live credential left behind never sits beside a PASS
     body = [f"RESULT: {status}", f"3c-10, os={cfg.profile.name}, expected-table sha256 {digest} (EXPECTED.txt, written before the first step)"]
     body += [r.line() for r in ordered]
+    body += [scrub(f"CLEANUP: {p}") for p in cleanup_problems] or ["CLEANUP: ok"]
     path = ev.write_result("\n".join(body) + "\n")
     return status, ordered, path
 
@@ -370,7 +442,8 @@ def main(argv: Sequence[str]) -> int:
             print(f"threec10: refusing: {e}", file=sys.stderr)
             return 2
         try:
-            status, _steps, path = run_3c10(guest, make_stdin_runner(a.vm, profile, Path(td)), a.evidence, cfg)
+            stdin_run = make_stdin_runner(a.vm, profile, Path(td), guest.kind)     # the transport make_transport SELECTED
+            status, _steps, path = run_3c10(guest, stdin_run, a.evidence, cfg)
         except RunbookError as e:
             print(f"threec10: refusing: {e}", file=sys.stderr)
             return 2

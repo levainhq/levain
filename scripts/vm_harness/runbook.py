@@ -119,7 +119,10 @@ def _write_durable(path: Path, text: str, *, append: bool = False, exclusive: bo
     try:
         data = text.encode()
         while data:
-            data = data[os.write(fd, data):]
+            n = os.write(fd, data)
+            if n <= 0:
+                raise OSError("short write: os.write made no progress")
+            data = data[n:]
         os.fsync(fd)
     finally:
         os.close(fd)
@@ -138,7 +141,10 @@ class Evidence:
 
     def write_expected(self, text: str) -> str:
         self.digest = hashlib.sha256(text.encode()).hexdigest()
-        _write_durable(self.dir / "EXPECTED.txt", text + f"\nsha256: {self.digest}\n", exclusive=True)
+        try:
+            _write_durable(self.dir / "EXPECTED.txt", text + f"\nsha256: {self.digest}\n", exclusive=True)
+        except FileExistsError:
+            raise RunbookError(f"evidence dir {self.dir} was claimed by another run") from None
         return self.digest
 
     def log(self, line: str) -> None:
@@ -167,15 +173,18 @@ def overall(statuses: Sequence[str], omitted: Sequence[str] = ()) -> str:
 
 # ---- the stdin transport (a secret never goes in an argv) ----------------------------------------------------------
 
-def make_stdin_runner(vm: str, profile, askpass_dir: Path) -> StdinRunner:
-    """``run(argv, stdin_text, timeout) -> stdout`` to the guest, the profile's own transport, stdin piped. An ssh profile
-    sends one quoted command (as ``vm_run.make_ssh`` does); a ``tart_exec`` profile uses ``tart exec -i``. A nonzero exit
-    raises ``GuestError`` with the stderr tail, never the stdin."""
+def make_stdin_runner(vm: str, profile, askpass_dir: Path, transport: str) -> StdinRunner:
+    """``run(argv, stdin_text, timeout) -> stdout`` to the guest over ``transport``, the one ``vm_run.make_transport`` ACTUALLY
+    selected (``guest.kind``: ``"ssh"`` or ``"tart_exec"``, so a linux profile whose guest agent did not answer gets ssh, as
+    its ``guest`` does), never the static profile. ssh sends one quoted command (as ``vm_run.make_ssh`` does); ``tart_exec``
+    uses ``tart exec -i``. A nonzero exit raises ``GuestError`` with the stderr tail, never the stdin."""
     from scripts.vm_harness import vm_run
     from scripts.vm_harness.driver import GuestError
 
     vm_run._clone_guard(vm)
-    if profile.transport == "tart_exec":
+    if transport not in ("ssh", "tart_exec"):
+        raise RunbookError(f"unknown transport {transport!r}")
+    if transport == "tart_exec":
         def run(argv, text, timeout=120):
             r = subprocess.run(vm_run.tart_exec_argv(vm, argv, stdin=True), input=text, capture_output=True, text=True,
                                timeout=timeout)
@@ -188,9 +197,17 @@ def make_stdin_runner(vm: str, profile, askpass_dir: Path) -> StdinRunner:
     os.chmod(askpass, 0o700)
     env = dict(os.environ, SSH_ASKPASS=str(askpass), SSH_ASKPASS_REQUIRE="force", DISPLAY="x")
 
+    cached: list[str] = []
+
     def run(argv, text, timeout=120):
-        ip = subprocess.run([vm_run.TART, "ip", vm, "--wait", "60"], capture_output=True, text=True, timeout=90,
-                            check=True).stdout.strip().splitlines()[-1]
+        from scripts.vm_harness.driver import GuestError
+        if not cached:
+            out = subprocess.run([vm_run.TART, "ip", vm, "--wait", "60"], capture_output=True, text=True, timeout=90,
+                                 check=True).stdout.strip().splitlines()
+            if not out:
+                raise GuestError(1, f"tart ip {vm} printed nothing")
+            cached.append(out[-1])
+        ip = cached[0]
         r = subprocess.run([vm_run.SSH, *vm_run.SSH_OPTS, f"{profile.ssh_user}@{ip}", shlex.join(str(a) for a in argv)],
                            input=text, capture_output=True, text=True, timeout=timeout, env=env)
         if r.returncode:
