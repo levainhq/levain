@@ -74,8 +74,8 @@ def register(subparsers) -> None:
                             "recorded beside the word). Which words an agent may set: presence.SEAT_WORDS and "
                             "COORDINATOR_WORDS. (Use --said=\"-text\" if the quote starts with a dash.)")
         w.add_argument("--drop", default=None, metavar="DROP_ID",
-                       help="The coordinator only: the drop that holds the words quoted by --said (a drop reaches the "
-                            "coordinator in its brief file, not as a prompt, so it is the evidence for the quote).")
+                       help="The desk only: the drop that holds the words quoted by --said (a drop reaches the "
+                            "desk in its brief file, not as a prompt, so it is the evidence for the quote).")
         w.set_defaults(func=_word, word=word)
 
     def ending(sp: argparse.ArgumentParser) -> None:
@@ -87,12 +87,12 @@ def register(subparsers) -> None:
 
     dv = common(sub.add_parser(
         "devices", help="Whether pings reach your devices: on, off, or follow where you are (operator only).",
-        description="Devices on: pings reach your phone and cockpit. Off: they wait for the desk. Follow (the standing default): "
-                    "they reach your devices once you have not typed a message to a desk session for `--after` (default 10 min; input at this Mac never counts), or when "
+        description="Devices on: pings reach your phone and cockpit. Off: they wait for you at the laptop. Follow (the standing default): "
+                    "they reach your devices once you have not typed a message into a session at the laptop for `--after` (default 10 min; input at this Mac never counts), or when "
                     "you are on a remote terminal. With neither --for nor --until-input the setting becomes your standing "
                     "default; with one of them it holds only that long and your standing default returns."))
     dv.add_argument("mode", choices=("on", "off", "follow"))
-    dv.add_argument("--after", default=None, metavar="DUR", help="With follow: how long without a message you typed to a desk session counts as away (30m, 15, 1h; 1 minute to 24 h).")
+    dv.add_argument("--after", default=None, metavar="DUR", help="With follow: how long without a message you typed into a session at the laptop counts as away (30m, 15, 1h; 1 minute to 24 h).")
     ending(dv)
     dv.set_defaults(func=_devices)
     lt = common(sub.add_parser(
@@ -253,7 +253,7 @@ def _settings(args: argparse.Namespace, what: str, **fields) -> int:
 
 def _devices(args: argparse.Namespace) -> int:
     if args.after is not None and args.mode != "follow":
-        print("levain ping devices: --after is how long without a message you typed to a desk session counts as away; it goes with `follow`")
+        print("levain ping devices: --after is how long without a message you typed into a session at the laptop counts as away; it goes with `follow`")
         return 2
     return _settings(args, "devices", devices=args.mode, follow_after=args.after)
 

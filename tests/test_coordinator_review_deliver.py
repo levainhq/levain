@@ -116,7 +116,7 @@ def test_a_question_the_coordinator_holds_or_answered_is_not_pushed(band):
     known = band.ask("answered as a KNOW?")
     band.answer(known)
     assert deliver.deliver(band.store).answers == [] and _replies(band) == []
-    # the held ping's own release files the ANSWER (escalated by the coordinator), and the pass then reaches that record
+    # the held ping's own release files the ANSWER (escalated by the desk), and the pass then reaches that record
     fr.escalate(band.store, held.id, "his call", token=band.token)
     got = deliver.deliver(band.store)
     assert [(r, n) for r, _rp, n in got.answers] == [(held.id, False)] and got.created == 0

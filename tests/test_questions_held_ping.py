@@ -124,7 +124,7 @@ def test_an_escalated_question_pings_at_once(desk):
     q, _ = desk.ask()
     fr.escalate(desk.store, q.id, "outside its envelope", token=tok)
     assert band.release_held_pings(desk.dir) == [f"question #{q.n} (escalated): the operator was pinged"]
-    assert "The coordinator escalated it to you." in desk.sent[0]
+    assert "The desk escalated it to you." in desk.sent[0]
     desk.later(minutes=10)
     assert band.release_held_pings(desk.dir) == [] and len(desk.sent) == 1
 

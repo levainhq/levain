@@ -281,11 +281,11 @@ def coordinator_discoverer(directory: Callable[[], Path | str | None], *,
         from levain.cockpit import coordinator_status
 
         return [
-            ProviderSpec(coordinator_status.COORD_STATUS_ID, "list", "Coordinator", "gate",
+            ProviderSpec(coordinator_status.COORD_STATUS_ID, "list", "Desk", "gate",
                          coordinator_status.status_reader(directory, clock), region="operate", rank=20,
                          order="legacy.source", version_fields=("*",), size="medium", span=1,
                          verbs=coordinator_status.COORD_VERBS),
-            ProviderSpec(MORNING_ID, "list", "Coordinator morning card", "gate", morning_read, region="operate",
+            ProviderSpec(MORNING_ID, "list", "Desk morning card", "gate", morning_read, region="operate",
                          rank=21, order="legacy.source", version_fields=("*",), size="medium", span=1,
                          empty="Nothing waits after the night."),
             ProviderSpec(REVIEW_ID, "list", "Review queue", "gate", review_read, region="operate", rank=22,

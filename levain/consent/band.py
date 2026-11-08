@@ -285,8 +285,8 @@ def release_held_pings(directory: Path | str) -> list[str]:
     minutes = int(UNREAD_AFTER.total_seconds() // 60)
     lines = []
     for q, cause in due:
-        extra = ("\nThe coordinator escalated it to you." if cause == "escalated" else
-                 f"\nThe coordinator has not read it in {minutes} minutes; it waits on you.")
+        extra = ("\nThe desk escalated it to you." if cause == "escalated" else
+                 f"\nThe desk has not read it in {minutes} minutes; it waits on you.")
         # an escalation is the coordinator putting the row in front of him (attention); an unread release is not
         pinged = _send_ping(q.agent, q, Path(directory), extra, "attention" if cause == "escalated" else "question")
         lines.append(f"question #{q.n} ({cause}): the operator was {'pinged' if pinged else 'NOT pinged'}")
@@ -636,7 +636,7 @@ def file_question(agent: str, session: str, what: str, options: list[tuple[str, 
 # episode stands, and a later stop is a new item. Closing takes the base, so every episode's open item closes.
 # An answer here records only: the panel's Start, Stop and Hold are what act, so the one option is an acknowledgement
 COORDINATOR_STOPPED_KEY = "levain-coordinator-stopped"
-_STOPPED_OPTIONS = (("seen", "Seen: I will press Stop or Hold on the cockpit's Coordinator panel"),)
+_STOPPED_OPTIONS = (("seen", "Seen: I will press Stop or Hold on the cockpit's Desk panel"),)
 
 
 def file_coordinator_stopped(qdir: Path | str, agent: str, why: str, episode: str,
@@ -653,10 +653,10 @@ def file_coordinator_stopped(qdir: Path | str, agent: str, why: str, episode: st
         text = _plain_line(why)
         q, filed = QuestionStore(qdir).file_once(
             agent=agent, key=f"{COORDINATOR_STOPPED_KEY}:{episode}",
-            what="The coordinator stopped after three deaths in a row; nothing launches until you act on the "
-                 "Coordinator panel.",
+            what="The desk stopped after three deaths in a row; nothing launches until you act on the "
+                 "Desk panel.",
             options=list(_STOPPED_OPTIONS), rec="seen",
-            blocks=f"every new coordinator launch, until you press Stop or Hold on the cockpit's Coordinator "
+            blocks=f"every new coordinator launch, until you press Stop or Hold on the cockpit's Desk "
                    f"panel (an answer here only records). {text}"[:300],
             cwd=os.path.abspath(str(qdir)), held_by=ANSWER_CHANNELS)
         if not filed:
@@ -679,7 +679,7 @@ def close_coordinator_stopped(qdir: Path | str, verb: str) -> list[Question]:
     items closed. Never raises: the verb that called it has already changed the coordinator."""
     try:
         return QuestionStore(qdir).close_open(
-            COORDINATOR_STOPPED_KEY, text=f"{verb} pressed on the cockpit's Coordinator panel", channel="cockpit")
+            COORDINATOR_STOPPED_KEY, text=f"{verb} pressed on the cockpit's Desk panel", channel="cockpit")
     except Exception:  # noqa: BLE001 - see the docstring
         return []
 

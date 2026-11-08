@@ -53,6 +53,7 @@ from __future__ import annotations
 import errno
 import json
 import os
+import shlex
 import platform
 import pwd
 import re
@@ -554,15 +555,91 @@ def _subid_nss_problem(hands_user: str) -> str | None:
     return None
 
 
+#: Seconds any one ``systemctl`` call in the undo may take. A wedged D-Bus or systemd job otherwise blocks root
+#: undo forever; past this the step fails with a named reason (fail-closed: the unit file is not removed).
+SYSTEMCTL_TIMEOUT = 30
+
+
+def _no_systemd_here() -> str | None:
+    """Why no unit of ours can be loaded on this host, or None when systemd runs here. Only systemd not
+    running as init proves that: a host where it runs but systemctl cannot be found may still hold a loaded
+    unit (see :func:`_systemctl_missing`). Setup refuses both (:func:`egress_unavailable`)."""
+    if not os.path.isdir("/run/systemd/system"):
+        return "systemd is not running as init here, so no boundary unit can be loaded"
+    return None
+
+
+def _systemctl_missing() -> str | None:
+    """Why systemd runs here but its unit state cannot be asked, or None. Callers fail the step on it."""
+    if not os.path.isabs(_abs("systemctl")):
+        return "systemd is running here but no systemctl was found, so the boundary unit cannot be confirmed down"
+    return None
+
+
+def _systemctl(*args: str) -> subprocess.CompletedProcess[str] | str:
+    """Run ``systemctl args`` bounded by :data:`SYSTEMCTL_TIMEOUT`; the result, or why it could not answer."""
+    try:
+        return subprocess.run([_abs("systemctl"), *args], capture_output=True, text=True, cwd="/",
+                              env={**child_env(), "LC_ALL": "C"}, timeout=SYSTEMCTL_TIMEOUT)
+    except subprocess.TimeoutExpired:
+        return f"systemctl {' '.join(args)} timed out after {SYSTEMCTL_TIMEOUT}s"
+    except OSError as exc:
+        return f"systemctl {' '.join(args)} could not be run ({exc})"
+
+
+def _egress_unit_stopped(hands_user: str) -> tuple[bool, str]:
+    """Stop the boundary's unit and check it is not active. Only systemd saying the unit is not loaded
+    counts as already stopped; any other stop failure (D-Bus, permission, a call past
+    :data:`SYSTEMCTL_TIMEOUT`) fails the step, so undo never reports the boundary gone while its unit is still
+    active."""
+    if why := _no_systemd_here():
+        return True, why
+    if why := _systemctl_missing():
+        return False, why
+    unit = egress_unit_name(hands_user)
+    r = _systemctl("stop", unit)
+    if isinstance(r, str):
+        return False, r
+    said = (r.stderr or r.stdout).strip()
+    if r.returncode != 0 and "not loaded" not in said:
+        return False, said or f"systemctl stop {unit}: exit {r.returncode}"
+    # is-active prints the state and exits 0 only for "active"; an unknown unit prints "inactive".
+    a = _systemctl("is-active", unit)
+    if isinstance(a, str):
+        return False, f"{unit} is not confirmed stopped after the stop ({a})"
+    state = a.stdout.strip()
+    if state not in ("inactive", "failed"):
+        # Anything but a plain inactive answer (active, activating, or is-active itself failing with no state)
+        # is not proof the boundary is down.
+        return False, f"{unit} is not confirmed stopped after the stop (is-active: {state or (a.stderr or '').strip() or 'no answer'})"
+    return True, "" if r.returncode == 0 else f"{unit} is not loaded"
+
+
+def _systemd_reloaded() -> tuple[bool, str]:
+    if why := _no_systemd_here():
+        return True, why
+    if why := _systemctl_missing():
+        return False, why
+    r = _systemctl("daemon-reload")
+    if isinstance(r, str):
+        return False, r
+    return r.returncode == 0, (r.stderr or r.stdout).strip()
+
+
 def egress_undo_steps(hands_user: str) -> list[Step]:
     """Remove the boundary. Run only after every hands process is stopped, so nothing of the hands
     user runs with its network open."""
     systemctl, unit, unit_path = _abs("systemctl"), egress_unit_name(hands_user), egress_unit_path(hands_user)
     return [
+        # The unit is RemainAfterExit, so a bare disable left it loaded and active with no file (1107-26 guest). The
+        # stop is not gated on the file: a re-run over that stranded state must still stop it. Not loaded is fine;
+        # any other stop failure stops the undo before the file goes.
+        Step(f"stop the network boundary unit (systemctl stop {unit}, then check it is not active)",
+             call=lambda: _egress_unit_stopped(hands_user)),
         Step("stop loading the network boundary at boot", (systemctl, "disable", unit),
              skip_if=(_abs("test"), "!", "-e", str(unit_path))),
         Step("remove its systemd unit", ("/bin/rm", "-f", str(unit_path))),
-        Step("tell systemd", (systemctl, "daemon-reload")),
+        Step("tell systemd (systemctl daemon-reload)", call=_systemd_reloaded),
         Step("remove its ruleset file", ("/bin/rm", "-f", str(egress_rules_path(hands_user)))),
         Step("remove the boundary's table", call=lambda: _egress_table_absent(hands_user)),
         Step("retire and remove the group network git ran with", call=lambda: _net_group_retired_and_gone(hands_user)),
@@ -1042,6 +1119,23 @@ def _owned_by(path: Path, uid: int | None) -> bool:
         return True
 
 
+def keep_work_clone_argv(repo: str, destination: str) -> list[str]:
+    """The argv that copies a retired entity's repository out to a destination its operator owns. Two
+    ``safe.directory`` entries: the repository, which git 2.56 checks, and its ``.git``, which the upload-pack
+    child of a local clone checks on git 2.43 (Ubuntu 24.04), where the repository entry alone ends
+    ``detected dubious ownership in repository at '<repo>/.git'``. Each git ignores the entry it does not
+    check. ``--`` ends the options before the two paths. ``tests/ci/isolation_e2e.sh`` runs this same flag set
+    (pinned by tests/test_keep_work_clone.py)."""
+    return ["git", "-c", f"safe.directory={repo}", "-c", f"safe.directory={repo}/.git", "-c", "core.hooksPath=/dev/null",
+            "clone", "--no-local", "--", repo, destination]
+
+
+def keep_work_clone_command(repo: str, destination: str) -> str:
+    """:func:`keep_work_clone_argv` as one line for a shell: every word quoted, because the repository's name is the
+    entity's to choose and the operator pastes this line."""
+    return shlex.join(keep_work_clone_argv(repo, destination))
+
+
 def _git_dir_shaped(path: Path) -> bool:
     return (path / "HEAD").is_file() and (path / "objects").is_dir() and (path / "refs").is_dir()
 
@@ -1091,9 +1185,8 @@ def _readable_and_sanitised(tree: Path, operator_gid: int, *, owner_uid: int | N
     if repos:
         first = repos[0]
         return True, ("the entity's repositories keep its retired id as owner, with no hooks and only basic "
-                      "settings; no git (yours or root's) will use them directly. To keep the work: git -c "
-                      "safe.directory="
-                      f"{first} -c core.hooksPath=/dev/null clone --no-local {first} <destination>   "
+                      "settings; no git (yours or root's) will use them directly. To keep the work: "
+                      f"{keep_work_clone_command(first, '<destination>')}   "
                       f"(repositories: {', '.join(repos)})")
     return True, ""
 

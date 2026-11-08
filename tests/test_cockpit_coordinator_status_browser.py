@@ -69,7 +69,7 @@ def _build(state: str, qdir: Path) -> None:
 
 
 READ = ("(() => { const p = " + PANEL + "; if (!p) return null;"
-        " const txt = p.innerText; if (!/Coordinator:/.test(txt)) return null;"
+        " const txt = p.innerText; if (!/Desk:/.test(txt)) return null;"
         " const r = p.getBoundingClientRect();"
         " const rows = [...p.querySelectorAll('li, .row, .ck-row, tr')].map(x => x.innerText.trim()).filter(Boolean);"
         " return {text: txt, rows, clipped: p.scrollWidth > p.clientWidth + 1, w: Math.round(r.width), h: Math.round(r.height)}; })()")
@@ -94,7 +94,7 @@ def test_the_panel_draws_each_wake_state_in_a_real_browser_and_posts_nothing(sta
     text = seen["text"]
     if shots:
         (Path(shots) / f"{state}.txt").write_text(text + "\n\n--- rows ---\n" + "\n".join(seen["rows"]) + f"\n\n{seen['w']}x{seen['h']} posts={out['posts']}\n")
-    assert text.count("Coordinator: " + state + ": ") == 1, text      # the wake word, then the store's own why
+    assert text.count("Desk: " + state + ": ") == 1, text      # the wake word, then the store's own why
     for bad in ("undefined", "None", "null", "[object", "{", "Traceback"):
         assert bad not in text, (bad, text)
     assert not seen["clipped"], seen

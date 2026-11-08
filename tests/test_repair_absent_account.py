@@ -176,3 +176,86 @@ def test_not_set_up_refuses_before_the_source_is_resolved(tmp_path: Path, monkey
     with pytest.raises(Refused) as e:
         IH._repair_facts(cmd, "linux", IH.Directory(users={}, groups={}), {}, {}, operator_uid=None)
     assert e.value.name == "not-set-up" and seen == []
+
+
+# --- retired slot dirs that undo left behind (S7 END rerun, 1107-15) ------------------------------------------
+
+def _tombs(*slots: SlotId) -> dict[str, int]:
+    return {n: 3000 + k for k, n in enumerate(n for s in slots for n in s.accounts)}
+
+
+def test_a_slot_dir_whose_accounts_are_all_retired_is_not_in_service() -> None:
+    """undo leaves the dir (no state file, so it reads in service) and tombstones its accounts; repair must not count
+    it. Revert the `all(n in tombs ...)` filter in `_drop_retired_slots` and this goes red."""
+    got = IH._drop_retired_slots({"egress": (0, 1, 12), "none": (0, 3)},
+                                 _tombs(SlotId("egress", 0), SlotId("egress", 1), SlotId("none", 0)))
+    assert got == {"egress": (12,), "none": (3,)}
+
+
+@pytest.mark.parametrize("tomb_only", [["_levain_s5"], ["_levain_gw5"], []])
+def test_a_half_retired_or_unlabelled_slot_stays_in_service(tomb_only) -> None:
+    """Mutation check: replacing `all` with `any`, or skipping by dir name, turns this red. Live-labelled, absent or
+    half-retired accounts keep the slot in service so `account-missing` still refuses it."""
+    got = IH._drop_retired_slots({"egress": (5,)}, {n: 3000 for n in tomb_only})
+    assert got == {"egress": (5,)}
+
+
+def test_the_gather_drops_retired_slots_but_refuses_a_live_one(tmp_path: Path) -> None:
+    """End to end through the plan: with the retired slot dropped the plan builds; the same rf with that slot's
+    accounts absent from both live and retired (hand-deleted) still refuses."""
+    facts, rf = _host(tmp_path, "linux")
+    rf_old = IH.RepairFacts(**{**rf.__dict__, "egress": (*rf.egress, 7)})
+    with pytest.raises(Refused) as e:
+        _plan(facts, rf_old)                                    # slot 7 in service, no accounts: refuses
+    assert e.value.name == "account-missing"
+    kept = IH._drop_retired_slots({"egress": rf_old.egress}, _tombs(SlotId("egress", 7)))
+    _plan(facts, IH.RepairFacts(**{**rf.__dict__, "egress": kept["egress"]}))
+
+
+def test_a_slot_with_no_accounts_is_never_read_as_retired() -> None:
+    """Revert: the bool(accts) guard in _drop_retired_slots (all([]) is True: an account-less slot was dropped from repair)."""
+    from unittest import mock
+
+    from levain.slot import install_helper as IH
+
+    class _NoAccounts:
+        accounts = ()
+
+    with mock.patch.object(IH, "SlotId", lambda cls, i: _NoAccounts()):
+        assert IH._drop_retired_slots({"claude": (0,)}, {}) == {"claude": (0,)}
+
+
+def test_gather_held_hands_repair_the_slots_without_the_retired_dir(tmp_path: Path, monkeypatch) -> None:
+    """The wiring: `_gather_held` passes `_drop_retired_slots(in_service, tombs)` to `_repair_facts`. A retired slot dir
+    (both accounts carry the retired label, read from the directory) is not held; a live one is. Revert the
+    `_drop_retired_slots(...)` call at the `_repair_facts` call site and this goes red."""
+    from levain.slot.accounts import SLOT_MARKER, SLOT_RETIRED_MARKER
+
+    class _Store:
+        def __init__(self, rs) -> None: ...
+        def read(self, *a, **kw): return None
+        def close(self) -> None: ...
+
+    monkeypatch.setattr(IH.RH, "Store", _Store)
+    monkeypatch.setattr(IH.RH, "configured_slots", lambda store: {})
+    monkeypatch.setattr(IH, "_operator_of", lambda store: {"uid": OP_UID})
+    monkeypatch.setattr(IH, "slots_in_service", lambda store: {"egress": (0, 1), "none": (0,)})
+    monkeypatch.setattr(IH, "parse_pool_config", lambda raw: None)
+    monkeypatch.setattr(IH, "parse_install_skips", lambda raw: ())
+    seen: dict = {}
+
+    def fake_repair_facts(cmd, host, d, accounts, in_service, **kw):
+        seen["in_service"] = in_service
+        return "repair-facts"
+
+    monkeypatch.setattr(IH, "_repair_facts", fake_repair_facts)
+    retired, live = SLOT_RETIRED_MARKER["linux"], SLOT_MARKER
+    names = {"_levain_s0": retired, "_levain_gw0": retired, "_levain_s1": live, "_levain_gw1": live,
+             "_levain_v0": live, "_levain_c0": live}
+    d = IH.Directory(users={n: 3000 + k for k, n in enumerate(names)}, groups={}, user_labels=names)
+    L = tmp_path / "levain"
+    L.mkdir()
+    got = IH._gather_held(parse_install_argv(["repair"]), "linux", 0, d, object(), L, None,
+                          state_dir=tmp_path, user_name=lambda uid: None)
+    assert got.repair == "repair-facts"
+    assert seen["in_service"] == {"egress": (1,), "none": (0,)}

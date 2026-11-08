@@ -121,6 +121,13 @@ NAME = "dispatch_run"
 ACCOUNT = "_levain_dispatch"
 EX_USAGE = 64
 EX_TEMPFAIL = 75
+#: What a `no-free-slot` tells the operator. The gate is CONTROL's `POOL` count (`egress_free`, tickets.pool_free): the
+#: credential-free egress slots the mirror shows, less those other open dispatches already hold, less the EGRESS_RESERVE
+#: the operator keeps; it must leave at least one. A slot holding a credential or baseline (the marked one included) is
+#: not credential-free, so it never counts. The marked slot itself is a separate check (`no-dispatch-credential`).
+_NO_FREE_SLOT_DETAIL = ("no dispatch slot is free: after the slot kept for the operator and the slots other dispatches "
+                        "are using or have asked for, no spare slot is left that holds no credential and no baseline "
+                        "(a slot with either never counts as spare). Wait for a running dispatch to finish, or add a spare slot")
 EX_CONFIG = 78
 EX_WRONG_USER = 77
 #: [judged] a holder connection that sends nothing for this long is read as gone (EOF): the session is ENDed.
@@ -867,7 +874,7 @@ class RunServer:
         except Exception:  # noqa: BLE001
             raise LauncherRefused("control-down", "CONTROL's pool cannot be read", reason_class="transient") from None
         if not free:
-            raise LauncherRefused("no-free-slot", "no dispatch slot is free", reason_class="transient")
+            raise LauncherRefused("no-free-slot", _NO_FREE_SLOT_DETAIL, reason_class="transient")
 
     # -- holders -----------------------------------------------------------------------------------------------------
 
