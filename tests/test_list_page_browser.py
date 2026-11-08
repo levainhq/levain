@@ -414,7 +414,7 @@ def _host_band(monkeypatch: Any, *, all_desk: bool = False) -> None:
             if q is not None:
                 what = str(q.what)
                 q = replace(q, section="desk" if all_desk or what.startswith("desk:") else "you", carried=what.startswith("desk: carried") and not all_desk,
-                            snoozed_until=later if what.startswith("levain: TUE") else None)
+                            snoozed_until=later if what.startswith(("levain: TUE", "desk: carried")) else None)   # a carried desk row with a date is still due now
             out.append((ref, q))
         return out, numbers, closed
 
@@ -483,7 +483,7 @@ def test_r4_the_card_holds_due_rows_and_one_control_and_the_focus_view_every_gro
 
 _CTL_PROBE = f"""(() => {{
   const T = {TRAY}; const c = T.querySelector('[data-list-more]');
-  const tags = [...T.querySelectorAll('.sp-results .row')].filter(r => /desk: carried/.test(r.textContent)).map(r => !!r.querySelector('.list-desk-owed'));
+  const tags = [...T.querySelectorAll('.sp-results .row')].filter(r => /desk: carried/.test(r.textContent)).map(r => !!r.querySelector('.list-desk-owed') && !/back /.test(r.textContent));
   return JSON.stringify({{h: c ? c.getBoundingClientRect().height : 0, label: c ? c.getAttribute('aria-label') : null, tags,
     empty: [...T.querySelectorAll('.sp-results .empty')].map(n => n.textContent)}});
 }})()"""
