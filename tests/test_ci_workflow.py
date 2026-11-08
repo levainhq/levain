@@ -71,6 +71,38 @@ def test_the_verified_job_needs_a_successful_gate_that_said_skip():
         assert evaluate(cond, result, skip) is (not runs), (result, skip)
 
 
+def _transitive_needs(name):
+    seen, todo = set(), [name]
+    while todo:
+        needs = JOBS[todo.pop()].get("needs") or []
+        for n in ([needs] if isinstance(needs, str) else needs):
+            if n not in seen:
+                seen.add(n)
+                todo.append(n)
+    return seen
+
+
+def _can_be_skipped(name):
+    return "if" in JOBS[name]
+
+
+# `verified` runs no tests: it exists only when the gate skipped them, so a skipped gate must skip it.
+NO_TESTS = {"verified"}
+
+
+@pytest.mark.parametrize("name", [n for n in JOBS if n not in NO_TESTS])
+def test_a_job_downstream_of_a_skippable_job_carries_always(name):
+    # Without always() the implicit success() sees a skipped ancestor (the gate, skipped on every non-main push)
+    # and skips the job, so a seat/** or land/** run goes green without the suite (run 42524643315).
+    if any(_can_be_skipped(n) for n in _transitive_needs(name)):
+        assert "always()" in str(JOBS[name].get("if", "")), name
+
+
+def test_the_test_matrix_runs_when_the_plan_succeeded():
+    cond = JOBS["test"]["if"]
+    assert "always()" in cond and "!cancelled()" in cond and "needs.plan.result == 'success'" in cond
+
+
 def test_a_main_push_neither_cancels_nor_is_cancelled_by_another_main_push():
     c = WF["concurrency"]
     assert "github.sha" in c["group"] and "refs/heads/main" in c["group"]
