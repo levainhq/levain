@@ -22,6 +22,10 @@ MAIN = "main"
 # Event names of runs that count as "this sha was tested": a push or a manual run on a ref other than main. A
 # scheduled run is main by construction, and a pull request run is not a verdict on the ref that gets landed.
 VERIFYING_EVENTS = ("push", "workflow_dispatch")
+# A run's head_branch carries the bare ref name for a branch AND for a tag (a v1.0 tag run says "v1.0"), so a tag
+# cannot be told from a branch by that field. Only a ref under these prefixes counts as the landing verdict (the land
+# waiter's candidate, a seat's own branch); a tag's run, main's own run and any other branch's run never do.
+LANDING_REFS = ("land/", "seat/")
 PAGE = 100
 
 
@@ -40,7 +44,7 @@ def decide(event, ref_type, ref_name, run_id, runs_reply):
             return no
         for r in runs:
             if (r["conclusion"] == "success" and r["status"] == "completed" and r["event"] in VERIFYING_EVENTS
-                    and r["head_branch"] != MAIN and not r["head_branch"].startswith("refs/tags/")
+                    and r["head_branch"].startswith(LANDING_REFS)
                     and str(r["id"]) != str(run_id)):
                 return True, str(r["head_branch"]), str(r["id"])
     except (KeyError, TypeError, AttributeError):

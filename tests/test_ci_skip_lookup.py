@@ -39,7 +39,9 @@ def test_a_seat_branch_or_a_manual_run_counts_as_the_verdict():
     reply(run(1, "land/k", event="pull_request")),        # a PR run is not the landed ref's verdict
     reply(run(1, "land/k", event="schedule")),
     reply(run(999, "land/k")),                            # this very run
-    reply(run(1, "refs/tags/v1")),
+    reply(run(1, "v1.0")),                                # a tag run carries the bare tag in head_branch
+    reply(run(1, "v1.0", event="workflow_dispatch")),
+    reply(run(1, "feature/x")),                           # only a land/ or seat/ ref is a landing verdict
 ], ids=lambda r: "")
 def test_no_clear_verdict_runs_the_suite(rep):
     assert decide(rep)[0] is False
