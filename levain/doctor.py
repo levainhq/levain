@@ -3857,7 +3857,7 @@ def _check_overdue_agenda(install: Path, today: Any = None) -> list[CheckResult]
     spores = install / ".levain" / "memory.spores.json"
     if not spores.is_file():
         return []
-    day = today or _date.today()
+    day = today.date() if hasattr(today, "date") else (today or _date.today())
     name = "spores: overdue-agenda"
     try:
         items = guarded_spore_store(spores).list_open(today=day)
@@ -3866,11 +3866,14 @@ def _check_overdue_agenda(install: Path, today: Any = None) -> list[CheckResult]
                             "The spore store is unreadable; restore it from a backup or git.")]
     late = []
     for s in items:
-        if not _is_agenda(s) or s.get("germinated"):
+        try:   # one malformed spore is skipped, never the row (known edge, closed: a stamped-but-uncomposed agenda is the 06:10 run's)
+            if not _is_agenda(s) or s.get("germinated"):
+                continue
+            when = _parse_when(s.get("next"))
+            if when is not None and when.date() < day:
+                late.append(s)
+        except Exception:  # noqa: BLE001
             continue
-        when = _parse_when(s.get("next"))
-        if when is not None and when.date() < day:
-            late.append(s)
     if not late:
         return []
     ids = ", ".join(f"{s.get('id', '?')} (next {s.get('next')})" for s in late[:5]) + (" ..." if len(late) > 5 else "")

@@ -1142,16 +1142,39 @@ def open_agendas(timeout: float = 2.0) -> list[dict]:
     return [s for s in data if isinstance(s, dict)] if isinstance(data, list) else []
 
 
-def start_germinate(agent: str = "claude_code") -> bool:
-    """Spawn `levain spores germinate` detached for THIS install (no wait, no stdio). False on any failure."""
+def start_germinate(agent: str = "codex") -> str:
+    """Spawn `levain spores germinate` detached for THIS install. Returns "started" (the child was alive after a short
+    grace, or exited 0), "busy" (another start spawned one within the last minute: germinate is idempotent by origin_key,
+    this only spares a pile of redundant children) or "failed" (Popen raised, or the child died non-zero at once, e.g.
+    no `levain` for this interpreter). Known edges, closed: the child's own later failure is the doctor row's to report;
+    a due agenda reaches the first turn only if the child files its band row before UserPromptSubmit (the next prompt
+    renders it otherwise)."""
+    root = install_root()
+    marker = Path(root) / ".levain" / ".germinate-spawn"
     try:
-        subprocess.Popen([sys.executable, "-P", "-m", "levain", "spores", "germinate",
-                          "--path", str(install_root()), "--agent", agent],
-                         stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-                         start_new_session=True, close_fds=True)
-        return True
+        try:
+            if time.time() - marker.stat().st_mtime < 60:
+                return "busy"
+        except OSError:
+            pass
+        marker.parent.mkdir(parents=True, exist_ok=True)
+        marker.write_text(str(os.getpid()))   # last-writer-wins marker; a lost race only costs one extra idempotent child
+    except OSError:
+        pass
+    argv = [sys.executable] + (["-P"] if sys.version_info >= (3, 11) else []) + [
+        "-m", "levain", "spores", "germinate", "--path", str(root), "--agent", agent]
+    try:
+        proc = subprocess.Popen(argv, cwd=str(root), stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                                stderr=subprocess.DEVNULL, start_new_session=True, close_fds=True)
     except Exception:
-        return False
+        return "failed"
+    try:
+        rc = proc.wait(timeout=0.4)
+    except subprocess.TimeoutExpired:
+        return "started"
+    except Exception:
+        return "started"
+    return "started" if rc == 0 else "failed"
 
 
 # Tokens of 3+ word-chars; common words that would create false collisions are
