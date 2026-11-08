@@ -98,7 +98,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any, Iterable
 
 from levain.cockpit.broker import Broker, BrokerError, Lifecycle
-from levain.cockpit.firejournal import OFFER_TTL, PAIRED_PREFIX, REVOKE_MODES, DeviceRevoked, FamilyChanged, PairingError
+from levain.cockpit.firejournal import BOX_MINTER, OFFER_TTL, PAIRED_PREFIX, REVOKE_MODES, DeviceRevoked, FamilyChanged, PairingError
 from levain.cockpit.shortcode import SHORT_MAX_FAILURES, SHORT_PAIRING_TTL
 from levain.cockpit.anneal_effects import (
     EPISODES,
@@ -872,8 +872,11 @@ _COORD_SHEET = "/sign/drop"
 # runs as its own id ("d-" + hex, never the name below), and only the cockpit page's own surface token ("browser") runs as this
 # one name, "this cockpit's page"; another surface runs as "surface:<name>" (L3 r2: a fixed label let any surface's token
 # run as the cockpit). Who may add a launch grant is _Handler._coord_may_launch: the cockpit page, and a paired device
-# whose pairing chain starts at the cockpit page (Phill 2026-11-08, row 460), never another surface's token or its devices.
+# whose pairing chain starts at the cockpit page or the laptop's `levain cockpit pair` (Phill 2026-11-08, row 460),
+# never another surface's token or its devices.
 _COORD_DEVICE = "cockpit"          # == levain.coordinator.phone.COCKPIT_DEVICE
+# the pairing roots a launch-grant device may start from (row 460): the cockpit page and the laptop's `cockpit pair`
+_LAUNCH_ROOTS = frozenset({"browser", BOX_MINTER})
 
 
 def _coord_route(route: str) -> "str | None":
@@ -3494,10 +3497,14 @@ class _Handler(GuardedHandler):
     def _coord_may_launch(self, device: "str | None") -> bool:
         """THE one cockpit test for a launch grant (Phill 2026-11-08, row 460), read by the drop listing
         (``coord_may_launch``, so the page draws the toggle exactly where it is taken) and handed to the spec check: the
-        cockpit page's own token, or a paired device whose pairing chain starts at that token
-        (:meth:`~levain.cockpit.firejournal.CockpitDB.pairing_root` == ``browser``), so his cockpit on his phone
-        qualifies and a device another surface paired (L3 r1 codex HIGH: any surface may mint a pairing offer) does not.
-        Any fault reading the lineage is False: a lineage that cannot be read grants nothing."""
+        cockpit page's own token, or a paired device whose pairing chain starts at one of :data:`_LAUNCH_ROOTS`
+        (:meth:`~levain.cockpit.firejournal.CockpitDB.pairing_root`): the cockpit page (``browser``) or the laptop's own
+        ``levain cockpit pair`` (``box``), so his cockpit on his phone qualifies however he paired it, and a device
+        another surface paired (``relay`` and the like; L3 r1 codex HIGH: any surface may mint a pairing offer) does not.
+        ``box`` is his on the same footing as ``browser``: both need his account on the laptop (the journal's file
+        permissions; the per-launch page token served on loopback). Any fault reading the lineage is False: a lineage
+        that cannot be read grants nothing. Known edge (L3 r1 codex): a device a surface named ``box`` paired before
+        ``make_server`` reserved the name reads as box-rooted; no shipped caller ever named a surface ``box``."""
         if device == _COORD_DEVICE:
             return True
         if not isinstance(device, str) or device.startswith("surface:"):
@@ -3505,7 +3512,7 @@ class _Handler(GuardedHandler):
         broker = self.server.broker
         try:
             db = broker.active_db() if broker is not None else None
-            return db is not None and db.pairing_root(device) == "browser"
+            return db is not None and db.pairing_root(device) in _LAUNCH_ROOTS
         except _CredentialUnavailable:
             raise
         except Exception:  # noqa: BLE001 - fail closed
@@ -5645,6 +5652,10 @@ def make_server(
         if name.startswith(PAIRED_PREFIX):
             # PAIR RQ-6: a paired device's credential is named paired-<id>; a surface may never hold that namespace
             raise ValueError(f"refusing surface token {name!r}: the {PAIRED_PREFIX!r} prefix names paired devices")
+        if name == BOX_MINTER:
+            # the laptop's own `levain cockpit pair` mints as this name, and a device rooted there may set a launch
+            # grant (_LAUNCH_ROOTS): a surface holding it would mint launch-capable devices over HTTP
+            raise ValueError(f"refusing surface token {name!r}: {BOX_MINTER!r} names the laptop's own pairing")
         if not _HEADER_SAFE_TOKEN.fullmatch(tok):
             # a token travels in a request header and the page stores what this rule admits
             raise ValueError(f"refusing surface token {name!r}: printable ASCII without spaces only")
