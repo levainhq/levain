@@ -2076,7 +2076,7 @@
     if (host !== row) row.appendChild(host);
     if (foreign) {
       // read-only by construction: band rows point at the Decisions panel, board rows at the agents' queue; no verbs below
-      if (s.support) host.appendChild(el("span", "muted list-support", s.support));
+      if (s.support && !s.text_locked) host.appendChild(el("span", "muted list-support", s.support));
       if (s.list_pointer) host.appendChild(tagEl("muted list-pointer", s.list_pointer));
       if (s.surface === "board") {
         if (s.repo) host.appendChild(tagEl("muted", s.repo));
@@ -2196,7 +2196,9 @@
     const heldLine = held.length && view.tray_held_line && typeof view.tray_held_line === "object" ? view.tray_held_line : null;
     // the List: rows that carry a `surface` get the surface filter (the kernel names the stores; the page only filters by them)
     const isList = entry.kind === "tray" && view.tray_is_list === true;   // the panel offers list_intake: a marker, never the rows' contents
-    const listNow = () => (isList && (list || []).some((s) => s.surface === listSurface) ? listSurface : "");
+    // held rows count when they are shown: a surface only held rows carry still gets its chip and stays selectable
+    const listAll = () => (list || []).concat(heldLine && trayHeldShown ? held : []);
+    const listNow = () => (isList && listAll().some((s) => s.surface === listSurface) ? listSurface : "");
     const inSurface = (s) => !listNow() || s.surface === listNow();
     const opts = views.length || heldLine || isList ? {
       empty: emptyMsg,
@@ -2212,7 +2214,7 @@
         note.appendChild(go);
       },
       controls: (bar, redraw) => {
-        if (isList) bar.after(buildSurfaceChips(list, listNow, (v) => { listSurface = v; redraw(); }));
+        if (isList) bar.after(buildSurfaceChips(listAll(), listNow, (v) => { listSurface = v; redraw(); }));
         if (heldLine) {
           const line = el("div", "ext-note held-line");
           // the earliest surface date among the held rows: "1 held back until Dec 3"
@@ -2416,19 +2418,26 @@
       let res;
       try { res = await commit({ kind: "list_intake", line }); } catch (e) { res = { ok: false, message: "the request failed" }; }
       busy = false;
-      if (res && res.ok) {
+      // ok:true is transport; the write landed only on COMMITTED/done (or pends on WAITING/applying). Any other state is a failure.
+      const st = res && res.ok ? ((res.data || {}).state || "done") : "";
+      const landed = st === "COMMITTED" || st === "done";
+      const pending = st === "WAITING" || st === "applying";
+      if (res && res.ok && (landed || pending)) {
         const d = res.data || {};
         // the server's sentence, verbatim; a state it did not word still says so
         const text = typeof d.receipt_line === "string" && d.receipt_line ? d.receipt_line
           : d.state === "WAITING" ? "waiting for your signature" : "added";
-        if (intakeKept.draft === line) intakeKept.draft = "";   // what he typed since stays his
-        intakeKept.receipt = { text, cls: d.state === "WAITING" || d.state === "applying" ? "preview" : "ok" };
+        if (intakeKept.draft.trim() === line) intakeKept.draft = "";   // what he typed since stays his
+        intakeKept.receipt = { text, cls: pending ? "preview" : "ok" };
         // the page was re-read inside the write: the box on screen is a new one holding the sent line, so clear every box
         for (const n of document.querySelectorAll(".list-intake-input")) if (n.value.trim() === line) n.value = "";
       } else {
         // the page was already re-read for some refusals (stale, not_built): the unsent line is kept in the new box
         if (!intakeKept.draft) intakeKept.draft = line;   // keep what he has typed since; restore the unsent line only into an empty box
-        intakeKept.receipt = { text: (res && (res.detail || res.message || res.error)) || "failed", cls: "err" };
+        const d = (res && res.data) || {};
+        const why = res && res.ok ? ((typeof d.receipt_line === "string" && d.receipt_line) || "not written (" + st + ")")
+          : (res && (res.detail || res.message || res.error)) || "failed";
+        intakeKept.receipt = { text: why, cls: "err" };
       }
       go.disabled = false;
       paintIntakeReceipts();

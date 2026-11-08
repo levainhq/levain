@@ -1475,6 +1475,18 @@ class TestListPagePins:
             assert tell not in box, tell
         assert "list_intake" in self._js("dashboard_boot.js").split("function panelActionFor")[1].split("async function manifestCommit")[0]
 
+    def test_the_intake_counts_only_a_landed_state_as_sent_and_trims_the_draft(self) -> None:
+        core = self._js("dashboard_core.js")
+        box = self._fn(core, "function buildListIntake()", "    return box;\n  }")
+        # ok:true is transport: REFUSED / EXPIRED / CANCELLED / STALE / COMMITTED_INCOMPLETE must take the failure path
+        assert 'st === "COMMITTED" || st === "done"' in box and 'st === "WAITING" || st === "applying"' in box
+        assert "res.ok && (landed || pending)" in box and '"not written ("' in box
+        assert "intakeKept.draft.trim() === line" in box and "intakeKept.draft === line" not in box
+        # support obeys text_locked like the primary text; held rows shown count for the chips and the filter
+        assert "s.support && !s.text_locked" in core
+        assert "const listAll = () =>" in core and "buildSurfaceChips(listAll()," in core
+        assert "listAll().some((s) => s.surface === listSurface)" in core
+
     def test_a_refusals_reason_reaches_the_box_and_501_503_have_words(self) -> None:
         boot = self._js("dashboard_boot.js")
         assert 'code === "intake_refused"' in boot
