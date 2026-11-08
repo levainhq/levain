@@ -85,3 +85,10 @@ def test_an_api_error_or_a_missing_variable_runs_the_suite(tmp_path):
         raise OSError("api down")
     assert outputs(tmp_path, ENV, boom)["skip"] == "false"
     assert outputs(tmp_path, {k: v for k, v in ENV.items() if k != "GITHUB_TOKEN"}, lambda *a: reply(run(11)))["skip"] == "false"
+
+
+def test_a_write_failure_on_the_output_file_exits_nonzero_and_says_the_suite_runs(tmp_path, capsys):
+    env = {**ENV, "GITHUB_OUTPUT": str(tmp_path / "no-such-dir" / "out")}
+    assert skip_lookup.main(env, lambda *a: reply(run(11, "land/k"))) != 0
+    err = capsys.readouterr().err
+    assert "could not write" in err and "full suite runs" in err

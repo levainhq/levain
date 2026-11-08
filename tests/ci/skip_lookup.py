@@ -84,10 +84,17 @@ def main(environ=None, fetcher=fetch):
         skip, ref, vid = False, "", ""
     if skip:
         print(f"verified on {ref} run {vid}")
-        _write(["skip=true", f"ref={ref}", f"run_id={vid}"], environ)
+        lines = ["skip=true", f"ref={ref}", f"run_id={vid}"]
     else:
         print("no verifying run: the full suite runs")
-        _write(["skip=false", "ref=", "run_id="], environ)
+        lines = ["skip=false", "ref=", "run_id="]
+    try:
+        _write(lines, environ)
+    except Exception as e:  # noqa: BLE001 - an output nobody can read is no verdict
+        # Exit non-zero: the gate job fails, and a failed gate runs every heavy job (the workflow's `if:`), so this fails closed.
+        print(f"skip lookup could not write its outputs ({type(e).__name__}: {e}); the gate fails, so the full suite runs",
+              file=sys.stderr)
+        return 1
     return 0
 
 
