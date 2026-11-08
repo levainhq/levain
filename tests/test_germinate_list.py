@@ -180,6 +180,34 @@ def test_a_desk_spore_too_long_for_a_drop_is_an_error_not_a_truncation(tmp_path,
     assert _drops(qdir) == 0
 
 
+def test_a_board_spore_too_long_for_a_drop_is_an_error_not_a_truncation(tmp_path, qdir):
+    root = _install(tmp_path)
+    s = _add(root, "y" * (WORDS_MAX + 1), target="board:levain")
+    _make_board(qdir, tmp_path)
+    res = _run(root, qdir, _at(9, 0))
+    assert res["due"] == [] and "at most" in res["errors"][0]["error"] and s["id"] in _open_ids(root)
+    assert _drops(qdir) == 0
+
+
+def test_a_stamped_spore_edited_before_the_finish_compost_is_skipped_not_composted(tmp_path, qdir, monkeypatch):
+    root = _install(tmp_path)
+    s = _add(root, "write the notes")
+    cls = type(guarded_spore_store(_spores(root)))
+    real = cls.descend
+    monkeypatch.setattr(cls, "descend", lambda self, *a, **k: (_ for _ in ()).throw(RuntimeError("crash")))
+    _run(root, qdir, _at(9, 0))
+    assert SporeStore(_spores(root)).get(s["id"])["germinated"]
+
+    def edit_then_descend(self, *a, **k):
+        guarded_spore_store(_spores(root)).update(s["id"], text="publish the hotfix instead")
+        return real(self, *a, **k)
+
+    monkeypatch.setattr(cls, "descend", edit_then_descend)
+    res = _run(root, qdir, _at(9, 0))
+    assert res["finish"] == [] and res["errors"] == [] and [x["spore_id"] for x in res["skipped"]] == [s["id"]]
+    assert s["id"] in _open_ids(root)
+
+
 # --- (c) germinate --timed ------------------------------------------------------------------------------------------
 def test_timed_files_only_timed_agendas_now_due_any_target(tmp_path, qdir, pings):
     root = _install(tmp_path)
@@ -229,6 +257,8 @@ def test_a_seed_may_carry_attention_talk_and_only_talk():
     assert sp.check_steering("seed", None, "ping")
     assert sp.check_steering("loop", None, "talk") and sp.check_steering(None, None, "talk")
     assert sp.check_steering("seed", None, None) is None
+    assert sp.check_steering("agenda", "desk", "talk") and sp.check_steering("agenda", "desk", "ping")
+    assert sp.check_steering("agenda", "band", "talk") is None
 
 
 def test_an_agenda_keeps_its_steering(tmp_path):

@@ -41,6 +41,8 @@ is still there. Two due spores naming the same open ``q-…`` both adopt it. ``-
 anneal's ``list_open``, which backfills a missing ``origin_key`` on a legacy file. The default ``--agent`` is
 ``claude_code`` (a Codex install passes ``--agent codex``). An empty-text spore cannot exist (anneal refuses it). The
 band row's ``Due MM-DD`` carries no year.
+
+Also a known edge: the per-install run lock uses ``fcntl`` (macOS/Linux only; levain does not target Windows).
 """
 from __future__ import annotations
 
@@ -198,7 +200,7 @@ def _germinate(spores_json: Path, qdir: Path, install: Path, agent: str, today: 
 
     from levain.consent import band
     from levain.consent.questions import ANSWER_CHANNELS, DB_NAME, QuestionStore
-    from levain.coordinator.store import WORDS_MAX, CoordStore
+    from levain.coordinator.store import CoordStore
     from levain.spores import guarded_spore_store
 
     now = now or datetime.now()
@@ -227,7 +229,15 @@ def _germinate(spores_json: Path, qdir: Path, install: Path, agent: str, today: 
             out = Outcome(str(sid), str(okey or ""), str(stamp.get("target") or item.get("target") or ""),
                           "finished", str(stamp.get("ref") or ""), False, False, False)
             if not dry_run:
-                store.descend(sid, kind="composted", expect_disposition="agenda", today=today)
+                try:
+                    store.descend(sid, kind="composted", expect_disposition="agenda",
+                                  expected_version=spore_version(item), today=today)
+                except SporeError as exc:
+                    if "changed since read" not in str(exc) and "disposition changed" not in str(exc):
+                        raise
+                    result["skipped"].append({"spore_id": sid, "origin_key": okey, "ref": str(stamp.get("ref") or ""),
+                                              "reason": f"changed while finishing ({exc}); left open"})
+                    continue
                 out = Outcome(**{**out.__dict__, "done": True})
             result["finish"].append(out.as_dict())
         except Exception as exc:  # noqa: BLE001 - one bad spore never stops the others
@@ -256,7 +266,7 @@ def _germinate(spores_json: Path, qdir: Path, install: Path, agent: str, today: 
                     # always sent with the spore's CURRENT words: a stored drop under this id holding other words raises
                     # DropConflict (his new words are never lost to an old drop's ref)
                     text = item.get("text") or ""
-                    words = text if target == TARGET_DESK else text.strip()[:WORDS_MAX]
+                    words = text  # verbatim and uncut: too long for a drop is an error for this spore, never a truncation
                     drop, filed = coord.accept_drop(words, surface="cli", outbox_id=outbox)
                     ref = drop.drop_id
             else:

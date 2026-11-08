@@ -328,6 +328,8 @@ def check_steering(disposition: Any, target: Any, attention: Any) -> str | None:
     if (target is not None or attention is not None) and d != "agenda":
         return ("target and attention steer how an AGENDA germinates; this spore is not one "
                 "(the one exception: a seed may carry attention talk)")
+    if attention not in (None, "none") and target == "desk":
+        return "attention pings a band row, and a desk target files a drop, none; drop attention or use target band or nudge"
     if attention not in (None, "none") and isinstance(target, str) and target.startswith("board:"):
         return "attention pings a band row, and a board: target files none; drop attention or change the target"
     return None
