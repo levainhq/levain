@@ -296,17 +296,21 @@ def _now(lifecycle: object) -> float:
 async def fresh(lifecycle: object, store: CredStore, name: str) -> Credential:
     """Before an exchange goes upstream: the credential `name`, observed. A refresh-kind credential whose access token
     expires within REFRESH_AHEAD_S wants a refresh (proactive); when `lifecycle` is the real writer and the want
-    starts or joins one, the exchange waits for it SHIELDED (cancelling the exchange never cancels the refresh), then
-    observes the file again. An access token that has expired by then is `credential-unavailable`, never sent; a
-    still-valid one is used while the gate is shut or the refresh failed. Any other `lifecycle` (the in-process
-    stand-in) refreshes nothing."""
+    starts or joins one, the exchange waits for it SHIELDED (cancelling the exchange never cancels the refresh), at
+    most REFRESH_DEADLINE_S, then observes the file again. An access token that has expired by then is
+    `credential-unavailable`, never sent; a still-valid one is used while the gate is shut, the refresh failed, or it
+    has not finished in time (a stalled token endpoint never holds an exchange a valid token can serve). Any other
+    `lifecycle` (the in-process stand-in) refreshes nothing."""
     cred = store.observe(name)
     if cred.kind != "oauth2-refresh" or cred.expires_at - _now(lifecycle) >= REFRESH_AHEAD_S:
         return cred
     if isinstance(lifecycle, CredWriter):
         fut = lifecycle.want(cred)
         if fut is not None:
-            await asyncio.shield(fut)
+            try:
+                await asyncio.wait_for(asyncio.shield(fut), REFRESH_DEADLINE_S)
+            except asyncio.TimeoutError:
+                pass   # the refresh runs on; this exchange uses what the file holds now
             cred = store.observe(name)
     unexpired(lifecycle, cred)
     return cred
@@ -629,6 +633,10 @@ def remove(dir_fd: int, name: str, *, wait: bool = True, lock_timeout_s: float =
 # --- the refresh (design 1.8, kind oauth2-refresh) -------------------------------------------------------------------
 
 REFRESH_AHEAD_S = 60.0     # a refresh is wanted when the access token expires within this (proactive)
+#: the refresh POST's total bound (the semaphore wait, the connect, the answer), and how long `fresh` waits for a
+#: refresh before using the token it has: the connect and TLS have their own bound, the answer gets as long again.
+#: Below REFRESH_AHEAD_S, so a want started inside that window falls through to a token still valid.
+REFRESH_DEADLINE_S = 2 * upstream.CONNECT_TIMEOUT_S
 GATE_MIN_S = 30.0          # at most one attempt per this, from the start of the last attempt (DECISION, r2 W8)
 GATE_MAX_S = 900.0         # the failure backoff, 30 s x 2^(failures - 1), is at most this (15 min)
 TOKEN_PORT = 443           # `token_url` is `https://<host>/...` with `<host>` an A-label of `hosts`: no port in it
@@ -843,6 +851,13 @@ class CredWriter:
         if not job.cancelled():
             job.exception()   # retrieved: a failure after the refresh was cancelled is not "never retrieved"
 
+    async def _post_bounded(self, cred: Credential) -> "upstream.RefreshResponse":
+        """`_post` under the refresh semaphore; the caller bounds the whole of it, the wait for a slot included."""
+        if self._refresh_sem is None:
+            self._refresh_sem = asyncio.Semaphore(REFRESH_CONNS)   # made inside the running loop (3.9 binds it)
+        async with self._refresh_sem:
+            return await _post(cred)
+
     async def _refresh(self, cred: Credential, gate: _Gate, fut: "asyncio.Future") -> None:
         """The detached refresh: the POST, the new object, the commit on the writer thread awaited SHIELDED (the job
         runs to its end whatever happens to this task; it is held in `_commit_jobs`) with the generation compare, its
@@ -851,10 +866,7 @@ class CredWriter:
         task's done-callback repeats the cleanup for a task cancelled before its first step."""
         result = "cancelled"
         try:
-            if self._refresh_sem is None:
-                self._refresh_sem = asyncio.Semaphore(REFRESH_CONNS)   # made inside the running loop (3.9 binds it)
-            async with self._refresh_sem:
-                response = await _post(cred)
+            response = await asyncio.wait_for(self._post_bounded(cred), REFRESH_DEADLINE_S)
             fields = _refreshed(cred, response, self.seams.clock())
             gate.own = rev = new_rev()   # no await between this and the submit below
             job = asyncio.ensure_future(self.commit(cred.name, fields, expect_rev=cred.rev, rev=rev))

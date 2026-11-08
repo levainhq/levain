@@ -1001,3 +1001,53 @@ def test_through_keys_a_token_expiring_during_the_body_read_is_refused_before_th
     assert b"".join(t for t, _ in frames) == b"AF", frames
     assert b"credential-unavailable" in frames[1][1]
     assert connects == [] and up.writes == []
+
+
+# --- prel3 L3 3b (1108-34-handoff/l3_prel3_3b.txt): each test is its finding's own failure --------------------------
+
+def test_3b6_a_stalled_token_endpoint_falls_through_to_the_unexpired_token(env, monkeypatch):
+    """3b-6: a token endpoint that never answers must not hold an exchange while the access token is still valid. The
+    refresh ends by its own deadline (a failure on the gate, no transport left open) and the exchange gets the old
+    token."""
+    ep, d, store, cert, mp = env
+    _write(d, _fields(int(time.time()) + 30))   # inside the ahead window: a refresh is wanted, the token still valid
+    monkeypatch.setattr(C, "REFRESH_DEADLINE_S", 0.3, raising=False)
+
+    async def go():
+        await _serve(ep, cert, mp)
+        ep.hold = asyncio.Event()   # never set while measured: the endpoint stalls
+        w, s = _writer(d), store()
+        await asyncio.sleep(0)
+        gc.collect()
+        base = count_open_fds()
+        try:
+            t0 = time.monotonic()
+            try:
+                c = await asyncio.wait_for(C.fresh(w, s, NAME), 3.0)
+            except asyncio.TimeoutError:
+                c = None
+            took = time.monotonic() - t0
+            try:
+                await asyncio.wait_for(_settle(w), 3.0)
+                ended = True
+            except asyncio.TimeoutError:
+                ended = False
+            await asyncio.sleep(0.05)
+            after = count_open_fds()
+            failures = w._gates[NAME].failures
+        finally:
+            ep.hold.set()
+            await _settle(w)
+            ep.server.close()
+            w.close()
+        return c, took, ended, base, after, failures
+    c, took, ended, base, after, failures = run(go())
+    assert c is not None and c.secret == "old-access", "fresh blocked on a stalled endpoint past any sane bound"
+    assert took < 2.0
+    assert ended and failures == 1
+    assert after == base
+
+
+def test_3b6_the_deadline_leaves_the_token_unexpired_inside_the_ahead_window():
+    # a want starts at the latest REFRESH_AHEAD_S before expiry; falling through at the deadline must still find it valid
+    assert 0 < C.REFRESH_DEADLINE_S < C.REFRESH_AHEAD_S
