@@ -2247,11 +2247,6 @@
             trayHeldShown = !trayHeldShown; saveHeldShown();
             heldMounts.add(mine);   // a Tray attached after the prune ran still redraws itself
             for (const m of [...heldMounts]) { if (m.tog.isConnected) m.sync(); else heldMounts.delete(m); }
-            // The card draws only the first rows that fit, and held rows come after the due ones, so on the card itself
-            // "show" would change a label and nothing else. The rows live in the focus view: open it there.
-            const card = tog.closest(".panel[data-ck-panel]");
-            const grow = trayHeldShown && card && !card.closest(".modal") ? card.querySelector(".pexpand") : null;
-            if (grow) grow.click();
           });
           line.appendChild(tog);
           p.appendChild(line);   // at the foot of the list, as the mock draws it
