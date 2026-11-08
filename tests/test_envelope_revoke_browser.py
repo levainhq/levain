@@ -299,3 +299,26 @@ def test_a_revoke_said_over_a_failed_refill_is_said_once(world, tmp_path) -> Non
     values = [v for v in out["values"] if not (isinstance(v, dict) and "shot" in v)]
     assert values[-1] is False, values
     assert any(isinstance(v, str) and v.startswith("Revoked ") for v in values), values
+
+
+_FAIL_GRANTS = ("(() => { const f = window.fetch.bind(window);"
+                " window.fetch = (u, o) => String(u).includes('/cockpit/consent/grants.json')"
+                " ? Promise.resolve(new Response('{}', {status: 500})) : f(u, o); return 1; })()")
+
+
+@needs_browser
+def test_a_failed_grants_read_still_marks_its_slot_filled_so_the_jump_lands(world, tmp_path) -> None:
+    """L3 r2 (codex, complement, deepseek): the grants read answering null while the envelope read answers must not leave
+    the grants slot unfilled, or the phone Grants-tab jump waits on it and lands nowhere."""
+    _seed(world.qdir)
+    port = _free_port()
+    pk, src, signer = _served(world, tmp_path, port)
+    with _serve_on(port, src, surface_tokens={"browser": "T"}, install_class="reported", signer=signer) as httpd:
+        httpd.envelope_revoke = _Recording(httpd.envelope_revoke, pk.key.fingerprint)
+        out = _drive(tmp_path, f"http://localhost:{port}/#write_token=T", [
+            NARROW, {"until": TILE}, {"eval": _FAIL_GRANTS},
+            {"eval": "document.querySelector('[data-phone-jump=grants]').click(); 1"},
+            {"until": _LANDED},
+            {"eval": "document.querySelector('#levain-modal .grant-slot').dataset.filled"},
+        ])
+    assert out["values"][-1] == "1", out["values"]

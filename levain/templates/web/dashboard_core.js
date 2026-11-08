@@ -7576,8 +7576,9 @@
   function grantFill(slot) {
     const n = ++grantFillSeq;
     Promise.all([grantFetch(), grantSignList()]).then(([b, signList]) => {
-      if (!b || n !== grantFillSeq) return;
-      slot.dataset.filled = "1";     // the grants' read answered and was read: the phone jump may fall back to the envelopes
+      if (n !== grantFillSeq) return;
+      slot.dataset.filled = "1";     // the grants' read has answered, with grants or without: the phone jump may fall back to the envelopes
+      if (!b) return;
       // sort is stable: the server's order holds among grants with and among grants without a refused call
       const rows = b.grants.slice().sort((x, y) => (grantRefused(y) ? 1 : 0) - (grantRefused(x) ? 1 : 0));
       const note = typeof b.note === "string" ? b.note : "";
@@ -7596,7 +7597,7 @@
       slot.replaceChildren(head, ...said, ...(note ? [el("div", "consent-note ext-meta", note)] : []),
                            ...(why ? [el("div", "consent-note ext-meta grant-why", why)] : []),
                            ...rows.map((g) => grantCard(g, inert, signList)));
-    }).catch(() => {});
+    }).catch(() => { if (n === grantFillSeq) slot.dataset.filled = "1"; });
   }
   // Board row 153: the envelopes beside the grants, each live one ended with a passkey, the grant revoke's own ceremony
   // (levain.coordinator.envelope_revoke.EnvelopeRevoke). /cockpit/envelope/list.json lists the envelopes and the passkeys
