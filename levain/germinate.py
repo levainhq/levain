@@ -357,10 +357,20 @@ def run_germinate(args: argparse.Namespace, out: Any = None) -> int:
     return rc
 
 
+def spores_verbs(subparsers: argparse._SubParsersAction) -> argparse._SubParsersAction:
+    """The one ``levain spores`` parser's verb table, created on first use. Germinate and keep-migrate both live
+    under ``spores``; whichever registers first makes the parser, the other adds its verb to it."""
+    p = subparsers.choices.get("spores")
+    if p is None:
+        p = subparsers.add_parser("spores", help="Spore verbs for an install (germinate, keep-migrate).",
+                                  description="Verbs for the install's spore store.", allow_abbrev=False)
+        p.set_defaults(func=lambda a: (p.print_help(), 2)[1])
+        p._levain_verbs = p.add_subparsers(dest="spores_cmd", metavar="<verb>", required=True)
+    return p._levain_verbs
+
+
 def add_parsers(subparsers: argparse._SubParsersAction) -> None:
-    p = subparsers.add_parser("spores", help="Spore verbs for an install (germinate).", allow_abbrev=False)
-    p.set_defaults(func=lambda a: (p.print_help(), 2)[1])
-    sub = p.add_subparsers(dest="spores_cmd")
+    sub = spores_verbs(subparsers)
     g = sub.add_parser("germinate", allow_abbrev=False,
                        help="Put every due agenda in front of the operator (band row, nudge, desk or board drop).",
                        description="Each open agenda spore whose date (or, for a timed next, minute) has come (and not "

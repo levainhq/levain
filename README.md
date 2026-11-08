@@ -591,7 +591,7 @@ Every top-level `levain` verb, each with the one line `levain --help` gives it. 
 | `levain update` | Update the known-good version set together (anneal + schema + migrations) and refresh the activation tree and adapter files after an upgrade. |
 | `levain messaging` | Show or change the Claude Code cross-session messaging choice of an install. |
 | `levain adopt-answers` | Make your hand-edited seed files the interview record (.levain/answers.json). |
-| `levain spores` | Spore-store maintenance (the Keep migration). |
+| `levain spores` | Spore verbs: germinate, keep-migrate (the Keep migration). |
 | `levain setup-isolation` | Create a dedicated unprivileged user for an entity's bash (one-time, needs sudo). |
 | `levain hands` | Sign the entity's own user in to Claude Code or Codex (its own login, never a copy of yours). |
 | `levain ws-git` | Run git in the entity's workspace as the entity's user, with hooks and the like off. |

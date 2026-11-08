@@ -1440,12 +1440,9 @@ def build_parser() -> argparse.ArgumentParser:
     )
     adopt_p.set_defaults(func=_cmd_adopt_answers)
 
-    spores_p = subparsers.add_parser(
-        "spores",
-        help="Spore-store maintenance (the Keep migration).",
-        description="Maintenance verbs for the install's spore store.",
-    )
-    spores_sub = spores_p.add_subparsers(dest="spores_cmd", metavar="<verb>", required=True)
+    from levain.germinate import spores_verbs as _spores_verbs
+
+    spores_sub = _spores_verbs(subparsers)
     km_p = spores_sub.add_parser(
         "keep-migrate",
         help="Move the retired Keep (notes, handoffs) into episodes and seeds: dry run, apply, revert.",
