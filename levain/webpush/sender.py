@@ -370,9 +370,13 @@ def spawn_sign_request(queue_dir: Path | str, rid: str, *, title: str, body: str
     a needs ping (kind ``attention``, ref the request id) whose data names the request (``sign_id``), so the notification
     center reads the request and draws its "Sign your answer" button, the same card a flow band row's ping gets
     (:func:`levain.webpush.center.needs_item`). A ``question`` ping with a bare request id as its ref names no request, so
-    the center drew only its text (Phill's first dispatch config run, 11-08). True when the child started."""
+    the center drew only its text (Phill's first dispatch config run, 11-08). The kind is ``attention`` on purpose: an
+    approval reaches him through quiet and sleep, and the ping serves only levain's own sign requests, so its ``repo`` is
+    ``levain``. ``what`` is the body, or the title when the body is blank: the center drops data whose ``what`` is blank,
+    and with it the Sign button. True when the child started."""
+    what = body.strip() or title
     return spawn(queue_dir, kind="attention", ref=rid, title=title, body=body, url=url,
-                 data={"v": 1, "kind": "decision", "id": rid, "repo": "levain", "what": body, "sign_id": rid})
+                 data={"v": 1, "kind": "decision", "id": rid, "repo": "levain", "what": what, "sign_id": rid})
 
 
 def spawn(queue_dir: Path | str, *, kind: str, ref: str | None, title: str, body: str, url: str = "/",
