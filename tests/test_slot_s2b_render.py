@@ -634,9 +634,9 @@ def test_repo_settings_env_moving_the_billing_identity_refused():
         assert [x.name for x in got] == ["loosening:" + rd.wire_name("env." + name)], name
     e = refused(rd.refuse_repo_loosening, {f: {"env": {"ANTHROPIC_AUTH_TOKEN": "t"}}})
     assert refusal_line(e) == '{"ok":false,"refused":"loosening:env-anthropic-auth-token"}\n'
-    # controls: a name that only contains the suffix, and harmless toggles, still launch (an ANTHROPIC_ model id
-    # no longer does: the whole ANTHROPIC_ family is refused, pf4r2 R1)
-    assert rd.repo_loosening_refusals({f: {"env": {"MY_BASE_URL_NOTE": "x", "BASE_URL": "z",
+    # controls: a name that only contains the suffix, a model id and harmless toggles still launch (a bare BASE_URL
+    # no longer does: the _URL suffix refuses it, pf4r3)
+    assert rd.repo_loosening_refusals({f: {"env": {"MY_BASE_URL_NOTE": "x", "ANTHROPIC_MODEL": "z",
                                                    "CLAUDE_CODE_MAX_OUTPUT_TOKENS": "8000",
                                                    "DISABLE_TELEMETRY": "1"}}}) == []
 
@@ -645,47 +645,38 @@ def _env_refusal(name: str):
     return rd.repo_loosening_refusals({".claude/settings.json": {"env": {name: "x"}}})
 
 
-def test_repo_env_refused_by_family_not_by_list():
-    """pf4r2 R1 (L3 r1 codex HIGH, complement MED, gemini MED): a repo settings ``env`` name is refused by family, so a
-    vendor variable added later in a covered family is refused by default. Each name below is either one the vendor's
-    reference added after the exact list was written or one invented for this test; each is refused once, by name,
-    with the rule that caught it in the detail."""
+def test_repo_env_vendor_namespace_is_default_deny():
+    """pf4r3 (L3 r2 codex OPEN + MED): inside the vendor's namespace (every name its env-var reference documents, and
+    any name starting ``CLAUDE_``, ``ANTHROPIC_``, ``BETA_``, ``OTEL_``, ``DISABLE_`` or ``MCP_``, and the runtime's TLS
+    and options names) a repo settings ``env`` name is refused unless the allowlist names it; outside it, the provider
+    prefixes and the credential or endpoint suffixes are refused and every other name launches. A deny list of name
+    families missed vendor names each round while refusing harmless ones; the allowlist inverts that."""
     from levain import sandbox_keys as sk
+    deny = "not on the repo env allowlist"
     cases = {
-        # a provider family prefix
-        "ANTHROPIC_AWS_API_KEY": "prefix ANTHROPIC_", "ANTHROPIC_AWS_WORKSPACE_ID": "prefix ANTHROPIC_",
-        "ANTHROPIC_PROFILE": "prefix ANTHROPIC_", "ANTHROPIC_FOUNDRY_AUTH_TOKEN": "prefix ANTHROPIC_",
-        "ANTHROPIC_UNIX_SOCKET": "prefix ANTHROPIC_", "ANTHROPIC_NOT_YET_INVENTED": "prefix ANTHROPIC_",
-        "AWS_ACCESS_KEY_ID": "prefix AWS_", "AWS_PROFILE": "prefix AWS_", "AWS_SESSION_TOKEN": "prefix AWS_",
-        "GOOGLE_APPLICATION_CREDENTIALS": "prefix GOOGLE_", "GCLOUD_PROJECT": "prefix GCLOUD_",
-        "CLOUDSDK_CORE_PROJECT": "prefix CLOUDSDK_", "CLOUD_ML_REGION": "prefix CLOUD_ML_",
-        "AZURE_CLIENT_ID": "prefix AZURE_", "OPENAI_ORG_ID": "prefix OPENAI_", "VERTEX_REGION_X": "prefix VERTEX_",
-        "BEDROCK_ANYTHING": "prefix BEDROCK_",
-        # a credential or endpoint suffix, on any stem
-        "NEWVENDOR_BASE_URL": "suffix _BASE_URL", "NEWVENDOR_API_KEY": "suffix _API_KEY",
-        "NEWVENDOR_AUTH_TOKEN": "suffix _AUTH_TOKEN", "NEWVENDOR_ACCESS_TOKEN": "suffix _ACCESS_TOKEN",
-        "NEWVENDOR_REFRESH_TOKEN": "suffix _REFRESH_TOKEN", "MCP_CLIENT_SECRET": "suffix _SECRET",
-        "NEWVENDOR_SECRET_KEY": "suffix _SECRET_KEY", "NEWVENDOR_CREDENTIALS": "suffix _CREDENTIALS",
-        "NEWVENDOR_PROFILE": "suffix _PROFILE",
-        # a provider switch
-        "CLAUDE_CODE_USE_ANTHROPIC_AWS": "prefix CLAUDE_CODE_USE_", "CLAUDE_CODE_USE_MANTLE": "prefix CLAUDE_CODE_USE_",
-        "CLAUDE_CODE_USE_NEXTCLOUD": "prefix CLAUDE_CODE_USE_",
-        # a credential, TLS-identity, transport or provider word under CLAUDE_CODE_
-        "CLAUDE_CODE_OAUTH_TOKEN": "CLAUDE_CODE_ with AUTH", "CLAUDE_CODE_OAUTH_SCOPES": "CLAUDE_CODE_ with AUTH",
-        "CLAUDE_CODE_SKIP_VERTEX_AUTH": "CLAUDE_CODE_ with AUTH", "CLAUDE_CODE_CLIENT_CERT": "CLAUDE_CODE_ with CERT",
-        "CLAUDE_CODE_CERT_STORE": "CLAUDE_CODE_ with CERT", "CLAUDE_CODE_CLIENT_KEY": "CLAUDE_CODE_ with CLIENT_KEY",
-        "CLAUDE_CODE_DISABLE_MTLS_RELOAD_ON_STALE_CONNECTION": "CLAUDE_CODE_ with MTLS",
-        "CLAUDE_CODE_UNIX_SOCKET": "CLAUDE_CODE_ with UNIX_SOCKET",
-        "CLAUDE_CODE_PROVIDER_MANAGED_BY_HOST": "CLAUDE_CODE_ with PROVIDER",
-        "CLAUDE_CODE_PROXY_RESOLVES_HOSTS": "CLAUDE_CODE_ with PROXY",
-        "CLAUDE_CODE_PROCESS_WRAPPER": "CLAUDE_CODE_ with WRAPPER", "CLAUDE_CODE_SKIP_AWS_CRED_CACHE": "CLAUDE_CODE_ with CRED",
-        "CLAUDE_CODE_AWS_CHAIN_RESOLVE_TIMEOUT_MS": "CLAUDE_CODE_ with AWS",
-        "CLAUDE_CODE_GCP_SOMETHING": "CLAUDE_CODE_ with GCP",
-        # exact names: the config dir, the request body, and TLS trust or the runtime's own options
-        "CLAUDE_CONFIG_DIR": "name CLAUDE_CONFIG_DIR", "CLAUDE_CODE_EXTRA_BODY": "name CLAUDE_CODE_EXTRA_BODY",
-        "NODE_EXTRA_CA_CERTS": "name NODE_EXTRA_CA_CERTS", "NODE_TLS_REJECT_UNAUTHORIZED": "name NODE_TLS_REJECT_UNAUTHORIZED",
-        "NODE_OPTIONS": "name NODE_OPTIONS", "SSL_CERT_FILE": "name SSL_CERT_FILE", "SSL_CERT_DIR": "name SSL_CERT_DIR",
-        "REQUESTS_CA_BUNDLE": "name REQUESTS_CA_BUNDLE",
+        # L3 r2 codex: a messaging socket, its token, a tracing endpoint
+        "CLAUDE_CODE_MESSAGING_SOCKET": deny, "CLAUDE_CODE_MESSAGING_TOKEN": deny, "BETA_TRACING_ENDPOINT": deny,
+        # invented: a vendor name the reference does not have yet
+        "CLAUDE_CODE_NEW_THING_2027": deny, "ANTHROPIC_NEW_ROUTE": deny, "MCP_NEW_ROUTE": deny,
+        "OTEL_EXPORTER_OTLP_ENDPOINT": deny, "DISABLE_NEW_GUARD": deny, "BETA_NEW_THING": deny,
+        # credentials, endpoints, provider switches, tenants, TLS, config and code loading
+        "ANTHROPIC_API_KEY": deny, "ANTHROPIC_AWS_WORKSPACE_ID": deny, "ANTHROPIC_BETAS": deny,
+        "CLAUDE_CODE_USE_BEDROCK": deny, "CLAUDE_CODE_OAUTH_TOKEN": deny, "CLAUDE_CODE_CERT_STORE": deny,
+        "CLAUDE_CONFIG_DIR": deny, "CLAUDE_CODE_PLUGIN_DIRS": deny, "CLAUDE_ENV_FILE": deny,
+        "CLAUDE_CODE_SHELL_PREFIX": deny, "NODE_OPTIONS": deny, "NODE_EXTRA_CA_CERTS": deny,
+        "NODE_TLS_REJECT_UNAUTHORIZED": deny, "SSL_CERT_FILE": deny, "SSL_CERT_DIR": deny, "REQUESTS_CA_BUNDLE": deny,
+        # names Claude Code sets for its own subprocesses, which the consent band reads to know the session
+        "CLAUDE_CODE_SESSION_ID": deny, "CLAUDECODE": deny, "CLAUDE_PID": deny, "CLAUDE_CODE_ENTRYPOINT": deny,
+        # a hook-off mode, a safety prompt removed, a tool added, and names levain renders for the slot
+        "CLAUDE_CODE_SAFE_MODE": deny, "CLAUDE_CODE_DISABLE_DANGEROUS_RM_TIMEOUT": deny,
+        "CLAUDE_CODE_USE_POWERSHELL_TOOL": deny, "DISABLE_AUTOUPDATER": deny,
+        "CLAUDE_CODE_DISABLE_BACKGROUND_TASKS": deny,
+        # outside the namespace: a provider prefix, or a credential or endpoint suffix on any stem
+        "AWS_PROFILE": "prefix AWS_", "GOOGLE_APPLICATION_CREDENTIALS": "prefix GOOGLE_",
+        "VERTEX_REGION_NEXT_MODEL": "prefix VERTEX_", "OPENAI_ORG_ID": "prefix OPENAI_",
+        "MYAPP_API_KEY": "suffix _API_KEY", "MYAPP_ENDPOINT": "suffix _ENDPOINT", "MYAPP_TOKEN": "suffix _TOKEN",
+        "MYAPP_SOCKET": "suffix _SOCKET", "MYAPP_URL": "suffix _URL", "MYAPP_SECRET": "suffix _SECRET",
+        "MYAPP_PROFILE": "suffix _PROFILE",
     }
     for name, rule in cases.items():
         assert sk.repo_env_rule(name) == rule, name
@@ -694,37 +685,133 @@ def test_repo_env_refused_by_family_not_by_list():
             # the name as _refused caps it (refusal_line's 64)
             assert [x.name for x in got] == [rd._refused("loosening", "env." + spelled, "").name], spelled
             assert spelled in got[0].detail and rule in got[0].detail, got[0].detail
-    # codex's AWS bypass, whole: every name refused, none by accident of another
+    # codex's r1 AWS bypass, whole: every name refused, once
     doc = {"env": {"CLAUDE_CODE_USE_ANTHROPIC_AWS": "1", "ANTHROPIC_AWS_API_KEY": "repo-key",
                    "ANTHROPIC_AWS_WORKSPACE_ID": "repo-workspace"}}
     assert sorted(x.name for x in rd.repo_loosening_refusals({".claude/settings.json": doc})) == [
         "loosening:env-anthropic-aws-api-key", "loosening:env-anthropic-aws-workspace-id",
         "loosening:env-claude-code-use-anthropic-aws"]
-    # harmless toggles and near-misses launch
-    for name in ("CLAUDE_CODE_MAX_OUTPUT_TOKENS", "DISABLE_TELEMETRY", "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC",
-                 "MAX_THINKING_TOKENS", "BASH_DEFAULT_TIMEOUT_MS", "MY_BASE_URL_NOTE", "BASE_URL", "API_KEY_NOTE",
-                 "CLAUDE_CODE_AUTO_COMPACT_WINDOW", "CLAUDE_CODE_SUBAGENT_MODEL"):
+    # model choice, caps, timeouts, off switches, and a project's own names launch
+    for name in ("ANTHROPIC_MODEL", "ANTHROPIC_DEFAULT_OPUS_MODEL", "ANTHROPIC_DEFAULT_HAIKU_MODEL",
+                 "ANTHROPIC_SMALL_FAST_MODEL", "CLAUDE_CODE_SUBAGENT_MODEL", "CLAUDE_CODE_EFFORT_LEVEL",
+                 "CLAUDE_CODE_MAX_OUTPUT_TOKENS", "MAX_THINKING_TOKENS", "BASH_DEFAULT_TIMEOUT_MS",
+                 "DISABLE_TELEMETRY", "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC", "CLAUDE_CODE_AUTO_COMPACT_WINDOW",
+                 "DEBUG", "MYAPP_MODE", "APP_ENV", "MY_BASE_URL_NOTE", "API_KEY_NOTE", "anthropic_model"):
         assert sk.repo_env_rule(name) is None, name
         assert _env_refusal(name) == [], name
     # the proxy names keep their own refusal, once
     assert [x.name for x in _env_refusal("HTTPS_PROXY")] == ["loosening:env-https-proxy"]
+    assert [x.name for x in _env_refusal("https_proxy")] == ["loosening:env-https-proxy"]
+
+
+#: Words whose presence in a variable's doc row would put it outside the allowlist's ground (an endpoint, a credential,
+#: an identity, TLS trust, telemetry headers, code loading, the sandbox or permission profile).
+_ENV_DOC_FORBIDDEN = ("url", "endpoint", "host", "socket", "token", "key", "auth", "login", "credential", "cert",
+                      "proxy", "provider", "account", "org", "workspace", "project", "tenant", "header", "helper",
+                      "wrapper", "dir", "path", "plugin", "sandbox", "permission")
+#: Allowlisted names whose doc row carries one of those words only incidentally (a mention of a provider the
+#: variable does not select, a "project settings" scope note, output "tokens"), with the words; each is justified
+#: by name in the pf4r3 RETURN. A row gaining a word fails until it is judged again.
+_ENV_DOC_JUSTIFIED = {
+    "ANTHROPIC_DEFAULT_FABLE_MODEL": ('provider',),
+    "API_FORCE_IDLE_TIMEOUT": ('provider',),
+    "API_TIMEOUT_MS": ('header', 'proxy'),
+    "CLAUDE_AX_PREPARK_MS": ('project',),
+    "CLAUDE_AX_SCREEN_READER": ('project',),
+    "CLAUDE_AX_STARTUP_QUIET_MS": ('project',),
+    "CLAUDE_CODE_ALWAYS_ENABLE_EFFORT": ('provider',),
+    "CLAUDE_CODE_ATTRIBUTION_HEADER": ('credential', 'provider', 'token', 'url'),
+    "CLAUDE_CODE_AUTO_COMPACT_WINDOW": ('token',),
+    "CLAUDE_CODE_BASH_EDIT_DIFF": ('permission',),
+    "CLAUDE_CODE_CONNECT_TIMEOUT_MS": ('header',),
+    "CLAUDE_CODE_DISABLE_ARTIFACT": ('key',),
+    "CLAUDE_CODE_DISABLE_ATTACHMENTS": ('project',),
+    "CLAUDE_CODE_DISABLE_BUNDLED_SKILLS": ('plugin',),
+    "CLAUDE_CODE_DISABLE_CFC_PROMPT": ('host',),
+    "CLAUDE_CODE_DISABLE_CLAUDE_MDS": ('project',),
+    "CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS": ('header', 'proxy'),
+    "CLAUDE_CODE_DISABLE_FILE_MENTIONS": ('path', 'project'),
+    "CLAUDE_CODE_DISABLE_MODEL_ACCESS_FALLBACK": ('account',),
+    "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC": ('plugin',),
+    "CLAUDE_CODE_DISABLE_NONSTREAMING_FALLBACK": ('proxy',),
+    "CLAUDE_CODE_DISABLE_OFFICIAL_MARKETPLACE_AUTOINSTALL": ('plugin',),
+    "CLAUDE_CODE_DISABLE_THINKING": ('provider',),
+    "CLAUDE_CODE_ENABLE_AUTO_MODE": ('provider',),
+    "CLAUDE_CODE_ENABLE_FINE_GRAINED_TOOL_STREAMING": ('proxy',),
+    "CLAUDE_CODE_ENABLE_PROMPT_SUGGESTION": ('account',),
+    "CLAUDE_CODE_FILE_READ_MAX_OUTPUT_TOKENS": ('token',),
+    "CLAUDE_CODE_GZIP_REQUEST_BODIES": ('proxy',),
+    "CLAUDE_CODE_HIDE_CWD": ('path',),
+    "CLAUDE_CODE_IDLE_COMPACT_MIN_TOKENS": ('token',),
+    "CLAUDE_CODE_MAX_OUTPUT_TOKENS": ('token',),
+    "CLAUDE_CODE_MAX_RETRIES": ('key',),
+    "CLAUDE_CODE_PLUGIN_GIT_TIMEOUT_MS": ('plugin',),
+    "CLAUDE_CODE_PROMPT_CACHE_TTL": ('helper',),
+    "CLAUDE_CODE_SCRIPT_CAPS": ('key',),
+    "CLAUDE_CODE_USER_DIALOG_TIMEOUT_MS": ('host', 'permission', 'project'),
+    "CLAUDE_CODE_WEBFETCH_CACHE_TTL_MS": ('url',),
+    "CLAUDE_ENABLE_STREAM_WATCHDOG": ('provider',),
+    "CLAUDE_STREAM_IDLE_TIMEOUT_MS": ('proxy',),
+    "DEBUG": ('path',),
+    "DISABLE_FEEDBACK_COMMAND": ('path',),
+    "DISABLE_INSTALL_GITHUB_APP_COMMAND": ('provider',),
+    "DISABLE_INTERLEAVED_THINKING": ('header', 'provider'),
+    "DISABLE_LOGIN_COMMAND": ('key', 'login'),
+    "DISABLE_TELEMETRY": ('path',),
+    "ENABLE_PROMPT_CACHING_1H": ('key',),
+    "FORCE_HYPERLINK": ('url',),
+    "IS_DEMO": ('header',),
+    "MAX_MCP_OUTPUT_TOKENS": ('token',),
+    "MAX_THINKING_TOKENS": ('provider', 'token'),
+    "MCP_DISCOVERY_CACHE": ('account',),
+}
+
+
+def _env_doc_words(row: str) -> tuple:
+    import re
+    prose = re.sub(r"\]\([^)]*\)", "]", row).lower()          # link targets are not the variable's meaning
+    return tuple(sorted(w for w in _ENV_DOC_FORBIDDEN if re.search(r"\b" + w + r"s?\b", prose)))
 
 
 def test_repo_env_rule_over_the_vendor_reference():
-    """pf4r2 R1: every variable in the vendor's env-var reference (the table, fetched on the date the fixture names)
-    gets the verdict recorded for it. A refused one changes the endpoint, provider, credential, identity, tenant or
-    TLS trust, or sits in a family that does; an allowed one is a toggle or limit. The fixture is the review record:
-    a new variable in the reference is judged by adding its row."""
+    """pf4r3: every variable in the vendor's env-var reference (the fixture: the table's names and doc rows, fetched on
+    the date it names) gets a verdict, and the recorded verdicts are the rule's. The allowlist is drawn from it: a name
+    is on it only if its doc row changes no endpoint, provider, credential, identity, TLS trust, telemetry destination
+    or headers, code loading or sandbox profile, and no allowlisted row names a forbidden word unless judged."""
     from levain import sandbox_keys as sk
+    from levain.claude_code_env_names import FETCHED, VENDOR_ENV_NAMES
     table = json.loads((REPO / "tests/fixtures/claude_code_env_vars_1108.json").read_text())
-    assert table["fetched"] == "2026-11-08" and table["source"].startswith("https://code.claude.com/docs/en/env-vars")
-    got = {n: ("refused" if sk.repo_env_rule(n) else "allowed") for n in table["verdicts"]}
+    assert table["fetched"] == FETCHED == "2026-11-08"
+    assert table["source"].startswith("https://code.claude.com/docs/en/env-vars")
+    assert set(table["verdicts"]) == set(table["rows"]) == VENDOR_ENV_NAMES
+    got = {n: ("refused" if sk.repo_env_rule(n) else "allowed") for n in VENDOR_ENV_NAMES}
     assert got == table["verdicts"]
-    for must in ("ANTHROPIC_AWS_API_KEY", "ANTHROPIC_FOUNDRY_AUTH_TOKEN", "ANTHROPIC_PROFILE", "CLAUDE_CODE_USE_MANTLE",
-                 "CLAUDE_CODE_CLIENT_CERT", "CLAUDE_CODE_CERT_STORE", "CLAUDE_CODE_PROVIDER_MANAGED_BY_HOST"):
+    allowed = {n for n, v in got.items() if v == "allowed"}
+    assert allowed == set(sk.REPO_ENV_ALLOW)
+    assert all(sk.repo_env_rule(n) == "not on the repo env allowlist" for n in VENDOR_ENV_NAMES - allowed)
+    words = {n: _env_doc_words(table["rows"][n]) for n in sorted(allowed)}
+    assert {n: w for n, w in words.items() if w} == _ENV_DOC_JUSTIFIED
+    for must in ("CLAUDE_CODE_MESSAGING_SOCKET", "CLAUDE_CODE_MESSAGING_TOKEN", "BETA_TRACING_ENDPOINT",
+                 "ANTHROPIC_AWS_API_KEY", "ANTHROPIC_FOUNDRY_AUTH_TOKEN", "ANTHROPIC_PROFILE", "CLAUDE_CODE_USE_MANTLE",
+                 "CLAUDE_CODE_CLIENT_CERT", "CLAUDE_CODE_CERT_STORE", "CLAUDE_CODE_PROVIDER_MANAGED_BY_HOST",
+                 "HTTPS_PROXY", "CLAUDE_CODE_IDE_HOST_OVERRIDE", "CLAUDE_CODE_GATEWAY_HINT_HEADERS"):
         assert table["verdicts"][must] == "refused", must
-    for must in ("CLAUDE_CODE_MAX_OUTPUT_TOKENS", "DISABLE_TELEMETRY", "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC"):
+    for must in ("ANTHROPIC_MODEL", "ANTHROPIC_DEFAULT_SONNET_MODEL", "CLAUDE_CODE_MAX_OUTPUT_TOKENS",
+                 "DISABLE_TELEMETRY", "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC", "DEBUG"):
         assert table["verdicts"][must] == "allowed", must
+
+
+def test_vendor_env_names_module_is_stdlib_data():
+    """pf4r3: the runtime reads the vendor's names from a module under ``levain/`` that imports nothing (it runs in the
+    3.9 run server, beside ``levain.sandbox_keys``), never from ``tests/``."""
+    import ast
+    from levain import claude_code_env_names as cen
+    from levain import sandbox_keys as sk
+    tree = ast.parse(pathlib.Path(cen.__file__).read_text())
+    imports = [n for n in ast.walk(tree) if isinstance(n, (ast.Import, ast.ImportFrom))]
+    assert [(i.module, [a.name for a in i.names]) for i in imports] == [("__future__", ["annotations"])]
+    assert "tests/" not in pathlib.Path(sk.__file__).read_text()
+    assert not hasattr(sk, "REPO_ENV_SWITCH_PREFIX") and not hasattr(sk, "REPO_ENV_CLAUDE_WORDS")
 
 
 def test_the_credential_name_lists_are_refused_by_the_repo_env_rule():

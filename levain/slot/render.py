@@ -1028,7 +1028,8 @@ def repo_loosening_refusals(docs: Mapping[str, Any]) -> list[Refused]:
     ``repo-settings-malformed``),
     and a ``disableAllHooks`` that is anything but ``false`` (L2 M6; DECISION: a non-boolean is refused too, as
     its meaning to CC is unmeasured), and an ``env`` naming the queue's vars, a :data:`PROXY_ENV` name, or a name
-    ``levain.sandbox_keys.repo_env_rule`` refuses by family (PRE-L3 4-1, pf4r2), and a top-level key
+    ``levain.sandbox_keys.repo_env_rule`` refuses (PRE-L3 4-1; pf4r3: default deny inside the vendor's namespace,
+    provider prefixes and credential or endpoint suffixes outside it), and a top-level key
     ``levain.sandbox_keys.repo_settings_rule`` refuses (a ``*Helper``, ``*AuthRefresh`` or ``*CredentialExport``). A
     document that is not an object is refused ``repo-settings-malformed``.
     Hooks, permissions and every other key launch (plan §2c 3: the repo's settings are its own).
@@ -1062,10 +1063,12 @@ def repo_loosening_refusals(docs: Mapping[str, Any]) -> list[Refused]:
                 out.append(_refused("loosening", f"env.{name}", f"{path}: {name} is set by levain only"))
             # PRE-L3 4-1: a key or bearer token Claude Code prefers to the stored login moves the bill of an unattended
             # run (or stops it at the "use this API key?" prompt), and an endpoint, provider switch, tenant or TLS
-            # trust moves where its traffic goes and who pays; refused by name family (pf4r2), the rule in the detail.
-            for name in sorted((n for n in env if n not in PROXY_ENV and repo_env_rule(n)), key=str):
+            # trust moves where its traffic goes and who pays; a vendor name off the allowlist is refused (pf4r3), the
+            # rule in the detail. The queue and proxy names above keep their own refusal, once.
+            for name in sorted((n for n in env if n not in PROXY_ENV and n not in (QUEUE_CAP_ENV, QUEUE_SOCKET_ENV)
+                                and repo_env_rule(n)), key=str):
                 out.append(_refused("loosening", f"env.{name}",
-                                    f"{path}: {name} moves the run's billing identity ({repo_env_rule(name)})"))
+                                    f"{path}: {name} is not a repo's to set ({repo_env_rule(name)})"))
         sb = doc.get("sandbox", {})
         if not isinstance(sb, Mapping):
             out.append(Refused("repo-settings-malformed", f"{path}: sandbox"))
