@@ -730,3 +730,56 @@ def test_a_slow_end_thread_start_does_not_hold_the_registry_lock(monkeypatch):
         gate.set()
         t.join(10)
     assert first and first[0].terminated is True
+
+
+# --- L3 r1 (prewr2): an executor ticket that ran outlives the start compaction (codex MED, complement LOW-MED) ----------
+
+def _ran_and_released(rig, attempt, session, index):
+    """``attempt``'s executor ticket bound to ``session`` on an egress slot lease, then RELEASED by a SLOT-SYNC that
+    reports the lease over: a closed ticket that ran."""
+    from tests.test_tickets import ticket_of
+    one = ticket_of(rig.mint(attempt))
+    rig.tickets.bind(one, session, ("egress", index, 1))
+    assert rig.tickets.release_ended({("egress", index): (2, "reusable")}) == [session]
+    assert rig.ask("RUN-TICKET-STATUS", attempt_id=attempt)["state"] == "released"
+    return one
+
+
+def test_a_released_executor_ticket_still_resolves_after_a_compaction_past_its_day(rig):
+    """A follower down past the UTC midnight after the mint, CONTROL restarted (the start compaction ran): the run's
+    executor facts are still CONTROL's to answer, so the terminal event resolves instead of failing
+    backend-unresolved."""
+    from tests.test_tickets import DAY
+    _ran_and_released(rig, "a-1", "s-" + "a" * 16, 0)
+    before = rig.ask("RUN-TICKET-FACTS", job_id="job-1", run_index=0)
+    assert before["ok"] is True, before
+    rig.clock.t += DAY
+    rig.restart()                                         # the compaction writes the journal ...
+    rig.restart()                                         # ... and this start reads only what it kept
+    after = rig.ask("RUN-TICKET-FACTS", job_id="job-1", run_index=0)
+    assert after == before, after
+    assert rig.ask("RUN-TICKET-STATUS", attempt_id="a-1")["state"] == "released"
+    rig.clock.t += 30 * DAY
+    rig.restart()                                         # and again: the kept line survives its own compaction
+    assert rig.ask("RUN-TICKET-FACTS", job_id="job-1", run_index=0) == before
+
+
+def test_two_executor_tickets_of_one_run_stay_ambiguous_after_a_compaction(rig):
+    from tests.test_tickets import DAY
+    _ran_and_released(rig, "a-1", "s-" + "a" * 16, 0)
+    _ran_and_released(rig, "a-2", "s-" + "b" * 16, 1)
+    rig.clock.t += DAY
+    rig.restart()                                         # the compaction writes the journal ...
+    rig.restart()                                         # ... and this start reads only what it kept
+    assert rig.ask("RUN-TICKET-FACTS", job_id="job-1", run_index=0)["refused"] == "ticket-ambiguous"
+
+
+def test_a_cancelled_executor_ticket_is_still_compacted_to_its_tombstone(rig):
+    """Only a ticket that RAN keeps its mint line; one that never bound is a tombstone past its day, as before."""
+    from tests.test_tickets import DAY, ticket_of
+    one = ticket_of(rig.mint("a-1"))
+    assert rig.ask("RUN-TICKET-CANCEL", ticket=one)["ok"] is True
+    rig.clock.t += DAY
+    rig.restart()
+    assert [x["op"] for x in rig.lines()] == ["tombstone"]
+    assert rig.ask("RUN-TICKET-FACTS", job_id="job-1", run_index=0)["refused"] == "ticket-unknown"
