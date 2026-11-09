@@ -1464,6 +1464,7 @@ def test_caller_denies_is_case_insensitive_for_ssh_convenience_allow(
     assert f'(allow file-read* (literal "{canonical}"))' not in profile
 
 
+@pytest.mark.static_guard
 def test_every_production_caller_of_build_policy_declares_the_cred_floor() -> None:
     """SOURCE-LEVEL invariant: no shipped code may call ``build_policy`` without saying what the
     SECURITY floors are — both ``deny_standard_creds`` AND ``deny_localhost_outbound``.

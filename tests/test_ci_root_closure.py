@@ -3,6 +3,11 @@ import importlib.util
 import sys
 from pathlib import Path
 
+import pytest
+
+# static guard: reads source text and the AST of this checkout, so it runs on one Python (3.12) only; see pyproject markers
+pytestmark = pytest.mark.static_guard
+
 _PATH = Path(__file__).resolve().parent / "ci" / "root_closure.py"
 _spec = importlib.util.spec_from_file_location("root_closure_under_test", _PATH)
 rc = importlib.util.module_from_spec(_spec)
