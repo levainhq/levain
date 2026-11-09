@@ -1,0 +1,509 @@
+{
+ "model": "gpt-5.1-codex",
+ "stream": true,
+ "input": [
+  {
+   "type": "message",
+   "id": "msg_00000000-0000-0000-0000-000000000000",
+   "role": "developer",
+   "content": [
+    {
+     "type": "input_text",
+     "text": "x"
+    }
+   ]
+  },
+  {
+   "type": "message",
+   "id": "msg_00000000-0000-0000-0000-000000000000",
+   "role": "developer",
+   "content": [
+    {
+     "type": "input_text",
+     "text": "x"
+    },
+    {
+     "type": "input_text",
+     "text": "x"
+    }
+   ]
+  },
+  {
+   "type": "message",
+   "id": "msg_00000000-0000-0000-0000-000000000000",
+   "role": "user",
+   "content": [
+    {
+     "type": "input_text",
+     "text": "x"
+    }
+   ]
+  },
+  {
+   "type": "message",
+   "id": "msg_00000000-0000-0000-0000-000000000000",
+   "role": "user",
+   "content": [
+    {
+     "type": "input_text",
+     "text": "x"
+    }
+   ]
+  }
+ ],
+ "tools": [
+  {
+   "type": "function",
+   "name": "exec_command",
+   "description": "x",
+   "strict": false,
+   "parameters": {
+    "type": "object",
+    "properties": {
+     "cmd": {
+      "type": "string",
+      "description": "x"
+     },
+     "justification": {
+      "type": "string",
+      "description": "x"
+     },
+     "login": {
+      "type": "boolean",
+      "description": "x"
+     },
+     "max_output_tokens": {
+      "type": "number",
+      "description": "x"
+     },
+     "prefix_rule": {
+      "type": "array",
+      "description": "x",
+      "items": {
+       "type": "string"
+      }
+     },
+     "sandbox_permissions": {
+      "type": "string",
+      "description": "x",
+      "enum": [
+       "use_default",
+       "require_escalated"
+      ]
+     },
+     "shell": {
+      "type": "string",
+      "description": "x"
+     },
+     "tty": {
+      "type": "boolean",
+      "description": "x"
+     },
+     "workdir": {
+      "type": "string",
+      "description": "x"
+     },
+     "yield_time_ms": {
+      "type": "number",
+      "description": "x"
+     }
+    },
+    "required": [
+     "cmd"
+    ],
+    "additionalProperties": false
+   }
+  },
+  {
+   "type": "function",
+   "name": "write_stdin",
+   "description": "x",
+   "strict": false,
+   "parameters": {
+    "type": "object",
+    "properties": {
+     "chars": {
+      "type": "string",
+      "description": "x"
+     },
+     "max_output_tokens": {
+      "type": "number",
+      "description": "x"
+     },
+     "session_id": {
+      "type": "number",
+      "description": "x"
+     },
+     "yield_time_ms": {
+      "type": "number",
+      "description": "x"
+     }
+    },
+    "required": [
+     "session_id"
+    ],
+    "additionalProperties": false
+   }
+  },
+  {
+   "type": "function",
+   "name": "request_user_input",
+   "description": "x",
+   "strict": false,
+   "parameters": {
+    "type": "object",
+    "properties": {
+     "questions": {
+      "type": "array",
+      "description": "x",
+      "items": {
+       "type": "object",
+       "properties": {
+        "header": {
+         "type": "string",
+         "description": "x"
+        },
+        "id": {
+         "type": "string",
+         "description": "x"
+        },
+        "options": {
+         "type": "array",
+         "description": "x",
+         "items": {
+          "type": "object",
+          "properties": {
+           "description": {
+            "type": "string",
+            "description": "x"
+           },
+           "label": {
+            "type": "string",
+            "description": "x"
+           }
+          },
+          "required": [
+           "label",
+           "description"
+          ],
+          "additionalProperties": false
+         }
+        },
+        "question": {
+         "type": "string",
+         "description": "x"
+        }
+       },
+       "required": [
+        "id",
+        "header",
+        "question",
+        "options"
+       ],
+       "additionalProperties": false
+      }
+     }
+    },
+    "required": [
+     "questions"
+    ],
+    "additionalProperties": false
+   }
+  },
+  {
+   "type": "function",
+   "name": "view_image",
+   "description": "x",
+   "strict": false,
+   "parameters": {
+    "type": "object",
+    "properties": {
+     "path": {
+      "type": "string",
+      "description": "x"
+     }
+    },
+    "required": [
+     "path"
+    ],
+    "additionalProperties": false
+   }
+  },
+  {
+   "type": "namespace",
+   "name": "multi_agent_v1",
+   "description": "x",
+   "tools": [
+    {
+     "type": "function",
+     "name": "close_agent",
+     "description": "x",
+     "strict": false,
+     "parameters": {
+      "type": "object",
+      "properties": {
+       "target": {
+        "type": "string",
+        "description": "x"
+       }
+      },
+      "required": [
+       "target"
+      ],
+      "additionalProperties": false
+     }
+    },
+    {
+     "type": "function",
+     "name": "resume_agent",
+     "description": "x",
+     "strict": false,
+     "parameters": {
+      "type": "object",
+      "properties": {
+       "id": {
+        "type": "string",
+        "description": "x"
+       }
+      },
+      "required": [
+       "id"
+      ],
+      "additionalProperties": false
+     }
+    },
+    {
+     "type": "function",
+     "name": "send_input",
+     "description": "x",
+     "strict": false,
+     "parameters": {
+      "type": "object",
+      "properties": {
+       "interrupt": {
+        "type": "boolean",
+        "description": "x"
+       },
+       "items": {
+        "type": "array",
+        "description": "x",
+        "items": {
+         "type": "object",
+         "properties": {
+          "audio_url": {
+           "type": "string",
+           "description": "x"
+          },
+          "image_url": {
+           "type": "string",
+           "description": "x"
+          },
+          "name": {
+           "type": "string",
+           "description": "x"
+          },
+          "path": {
+           "type": "string",
+           "description": "x"
+          },
+          "text": {
+           "type": "string",
+           "description": "x"
+          },
+          "type": {
+           "type": "string",
+           "description": "x"
+          }
+         },
+         "additionalProperties": false
+        }
+       },
+       "message": {
+        "type": "string",
+        "description": "x"
+       },
+       "target": {
+        "type": "string",
+        "description": "x"
+       }
+      },
+      "required": [
+       "target"
+      ],
+      "additionalProperties": false
+     }
+    },
+    {
+     "type": "function",
+     "name": "spawn_agent",
+     "description": "x",
+     "strict": false,
+     "parameters": {
+      "type": "object",
+      "properties": {
+       "fork_context": {
+        "type": "boolean",
+        "description": "x"
+       },
+       "items": {
+        "type": "array",
+        "description": "x",
+        "items": {
+         "type": "object",
+         "properties": {
+          "audio_url": {
+           "type": "string",
+           "description": "x"
+          },
+          "image_url": {
+           "type": "string",
+           "description": "x"
+          },
+          "name": {
+           "type": "string",
+           "description": "x"
+          },
+          "path": {
+           "type": "string",
+           "description": "x"
+          },
+          "text": {
+           "type": "string",
+           "description": "x"
+          },
+          "type": {
+           "type": "string",
+           "description": "x"
+          }
+         },
+         "additionalProperties": false
+        }
+       },
+       "message": {
+        "type": "string",
+        "description": "x"
+       },
+       "model": {
+        "type": "string",
+        "description": "x"
+       },
+       "reasoning_effort": {
+        "type": "string",
+        "description": "x"
+       }
+      },
+      "additionalProperties": false
+     }
+    },
+    {
+     "type": "function",
+     "name": "wait_agent",
+     "description": "x",
+     "strict": false,
+     "parameters": {
+      "type": "object",
+      "properties": {
+       "targets": {
+        "type": "array",
+        "description": "x",
+        "items": {
+         "type": "string"
+        }
+       },
+       "timeout_ms": {
+        "type": "number",
+        "description": "x"
+       }
+      },
+      "required": [
+       "targets"
+      ],
+      "additionalProperties": false
+     }
+    }
+   ]
+  },
+  {
+   "type": "function",
+   "name": "get_goal",
+   "description": "x",
+   "strict": false,
+   "parameters": {
+    "type": "object",
+    "properties": {},
+    "required": [],
+    "additionalProperties": false
+   }
+  },
+  {
+   "type": "function",
+   "name": "create_goal",
+   "description": "x",
+   "strict": false,
+   "parameters": {
+    "type": "object",
+    "properties": {
+     "objective": {
+      "type": "string",
+      "description": "x"
+     },
+     "token_budget": {
+      "type": "integer",
+      "description": "x"
+     }
+    },
+    "required": [
+     "objective"
+    ],
+    "additionalProperties": false
+   }
+  },
+  {
+   "type": "function",
+   "name": "update_goal",
+   "description": "x",
+   "strict": false,
+   "parameters": {
+    "type": "object",
+    "properties": {
+     "status": {
+      "type": "string",
+      "description": "x",
+      "enum": [
+       "complete",
+       "blocked",
+       "paused"
+      ]
+     }
+    },
+    "required": [
+     "status"
+    ],
+    "additionalProperties": false
+   }
+  },
+  {
+   "type": "web_search",
+   "external_web_access": false
+  }
+ ],
+ "tool_choice": "auto",
+ "parallel_tool_calls": true,
+ "reasoning": {
+  "summary": "auto"
+ },
+ "store": false,
+ "include": [
+  "reasoning.encrypted_content"
+ ],
+ "prompt_cache_key": "00000000-0000-0000-0000-000000000000",
+ "client_metadata": {
+  "x-codex-turn-metadata": "x",
+  "thread_id": "00000000-0000-0000-0000-000000000000",
+  "turn_id": "00000000-0000-0000-0000-000000000000",
+  "x-codex-installation-id": "00000000-0000-0000-0000-000000000000",
+  "root_turn_id": "00000000-0000-0000-0000-000000000000",
+  "session_id": "00000000-0000-0000-0000-000000000000",
+  "x-codex-window-id": "00000000-0000-0000-0000-000000000000:0"
+ }
+}

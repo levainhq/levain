@@ -67,6 +67,12 @@ def _field_unbounded(obj: Mapping[str, Any], field: str) -> bool:
     return field in obj and not any(_disables(d, obj[field]) for d in _DISABLED_BY[field])
 
 
+def _wire_what(name: str, fallback: str) -> str:
+    """A refusal's `:<what>` suffix: the client's own name when it fits the wire grammar (`norm.what_ok`), else
+    `fallback`. A client may send any string as a field name; `status_of` refuses a suffix it cannot match."""
+    return name if norm.what_ok(name) else fallback
+
+
 def _refuse_json(detail: str) -> norm.Refused:
     return norm.Refused("body-json", detail)
 
@@ -155,6 +161,19 @@ class Codec:
     #: tool-type namespaces whose every member runs on the provider: OpenRouter's server tools (`openrouter:*`),
     #: which any codec's body can declare on an OpenRouter route.
     server_tool_prefixes: Tuple[str, ...] = ("openrouter:",)
+    #: DISPATCH ALLOWLIST (row 150): the top-level fields a dispatch route admits. A field outside it is
+    #: `body-unlisted:<field>`, never judged by default: a field a vendor ships after this list was written is a
+    #: refusal, not unmetered spend. It holds every field this codec's own code reads, every `unbounded_fields` entry
+    #: (the value check decides those) and each field a reader judged bounded. An interactive route does not read it.
+    dispatch_fields: Tuple[str, ...] = ()
+    #: fields a vendor publishes that nobody has judged yet: NOT admitted (a dispatch route refuses them
+    #: `body-unlisted`), recorded so `scripts/vendor_field_diff.py` reports only what is new since the last triage.
+    #: A field moves out of here into `dispatch_fields` (judged bounded) or `unbounded_fields` (judged unbounded).
+    unjudged_fields: Tuple[str, ...] = ()
+    #: DISPATCH ALLOWLIST, tool types: the client-run `tools[].type`s (version suffix removed) a dispatch route
+    #: admits, beside an entry with no `type`. A server tool (`server_tools`, `server_tool_prefixes`) is never here:
+    #: it is `body-unbounded`, a known cost, not an unjudged type.
+    dispatch_tool_types: Tuple[str, ...] = ()
     #: the output-ceiling fields, in the order `write_ceiling` writes the first.
     ceiling_fields: Tuple[str, ...] = ()
     #: whether a request may lack a ceiling (written in at `default_output`); Anthropic requires `max_tokens`.
@@ -186,7 +205,8 @@ class Codec:
               model_requested: Optional[str] = None) -> Checked:
         """The model has a price entry (else `model-not-allowed`); a ticketed run's `model` is its ticket's
         `model_requested` (else `model-not-allowed`); no `route`, and no `models` but exactly `[model]` (else
-        `model-not-allowed`); then the unboundable shapes: a dispatch route refuses them
+        `model-not-allowed`); on a dispatch route, a top-level field or a tool type the codec has not judged is
+        `body-unlisted:<name>` (403); then the unboundable shapes: a dispatch route refuses them
         `body-unbounded:<what>` (403), an interactive one returns them as `unproven`."""
         model = obj.get("model")
         if not isinstance(model, str) or not prices or model not in prices:
@@ -204,10 +224,34 @@ class Codec:
         if fb is not None and not (isinstance(fb, list) and all(m == model for m in fb)):
             raise norm.Refused("model-not-allowed", "a fallback list may run another model")
         price = prices[model]
+        if dispatch:
+            self._refuse_unlisted(obj)
         found = self._unbounded(obj, price)
         if found and dispatch:
             raise norm.Refused(f"body-unbounded:{found[0]}", "content the estimate cannot see")
         return Checked(model, price, found)
+
+    def _refuse_unlisted(self, obj: Mapping[str, Any]) -> None:
+        """The dispatch allowlist: the first top-level field outside `dispatch_fields`, then the first tool type
+        outside `dispatch_tool_types` (a server tool is left to `_unbounded`, which names it `body-unbounded`).
+        The suffix is the name when it fits the wire grammar, else a fixed word."""
+        for f in obj:
+            if f not in self.dispatch_fields:
+                raise norm.Refused("body-unlisted:" + _wire_what(f, "field"), "a field levain has not judged; "
+                                   "dispatch admits only judged fields")
+        tools = obj.get("tools")
+        if not isinstance(tools, list):
+            return
+        for t in tools:
+            if not isinstance(t, dict) or "type" not in t:
+                continue    # a client tool carries no `type`; a non-object is the provider's to refuse
+            name = _tool_name(t)
+            if name is None:
+                raise norm.Refused("body-unlisted:tool", "a tool type levain has not judged")
+            if name in self.dispatch_tool_types or name in self.server_tools or name.startswith(self.server_tool_prefixes):
+                continue
+            raise norm.Refused("body-unlisted:" + _wire_what(name, "tool"), "a tool type levain has not judged; "
+                               "dispatch admits only judged tool types")
 
     def _unbounded(self, obj: Mapping[str, Any], price: Price) -> Tuple[str, ...]:
         found: List[str] = []
@@ -714,6 +758,31 @@ class AnthropicMessages(Codec):
     server_tools = ("web_search", "web_fetch", "code_execution")
     ceiling_fields = ("max_tokens",)
     writes_ceiling = False
+    # [judged by lane r150, 2026-11-09, from the SDK's request TypedDict at tag v2.7.0 (anthropics/anthropic-sdk-python,
+    # `src/anthropic/types/beta/message_create_params.py`), OpenRouter's `MessagesRequest` (openrouter.ai/openapi.json),
+    # and the body a real Claude Code sent a local listener (`tests/fixtures/client_bodies/claude_code_*`)]
+    dispatch_fields = (
+        # the codec's own reads: the model, the ceiling, the stream flag, the tool list, the content the estimate walks
+        "model", "max_tokens", "stream", "messages", "system", "tools",
+        # value-checked fields (`unbounded_fields`, `_unbounded_shapes`): listed so the value check decides them
+        "mcp_servers", "plugins", "compaction", "context_management",
+        # bounded by the written ceiling or by the priced-at-highest-tier rule: sampling and output shape; thinking
+        # tokens are inside `max_tokens`; `service_tier`, `speed`, `inference_geo` change a tier or region, priced high
+        "temperature", "top_p", "top_k", "stop_sequences", "tool_choice", "thinking", "output_config", "output_format",
+        "service_tier", "speed", "inference_geo",
+        # request labels and prompt-cache hints, no billed content of their own
+        "metadata", "cache_control", "diagnostics", "user", "user_profile_id", "workspace_id",
+        # OpenRouter's Messages endpoint: routing identity and observability, `models` / `route` / `fallbacks`
+        # checked by `check` before this list is read
+        "models", "route", "fallbacks", "provider", "session_id", "trace",
+    )
+    # client-run: Anthropic's `computer`, `bash`, `text_editor` and `memory` tools and a `custom` one are run by the
+    # caller; a typeless entry (Claude Code sends every tool so) is admitted by `_refuse_unlisted`
+    dispatch_tool_types = ("custom", "bash", "text_editor", "computer", "memory")
+    # unmeasured (board row 151 names `container`); `betas` is a header in the SDK; the rest are OpenRouter's server-tool
+    # loop and safety controls, and a refusal credit token
+    unjudged_fields = ("container", "thread", "fallback_credit_token", "betas", "safeguards", "deferred_tools",
+                       "stop_server_tools_when")
 
     def _unbounded_shapes(self, obj: Mapping[str, Any]) -> List[str]:
         """`context_management` holding a compaction edit (`compact_*`): threshold compaction "requires an additional
@@ -801,6 +870,27 @@ class OpenAIChat(_OpenAI):
     unbounded_fields = ("web_search_options", "plugins", "max_tool_calls")
     server_tools = ()
     ceiling_fields = ("max_completion_tokens", "max_tokens")
+    # [judged by lane r150, 2026-11-09, from `CreateChatCompletionRequest` (github.com/openai/openai-openapi,
+    # openapi.yaml) and OpenRouter's `ChatRequest` (openrouter.ai/openapi.json)]
+    dispatch_fields = (
+        "model", "messages", "stream", "stream_options", "tools", "n", "max_completion_tokens", "max_tokens",
+        # value-checked (`unbounded_fields`)
+        "web_search_options", "plugins", "max_tool_calls",
+        # sampling and output shape, inside the written ceiling; reasoning tokens bill as output
+        "temperature", "top_p", "top_k", "min_p", "top_a", "repetition_penalty", "frequency_penalty",
+        "presence_penalty", "logit_bias", "logprobs", "top_logprobs", "seed", "stop", "tool_choice",
+        "parallel_tool_calls", "function_call", "functions", "response_format", "reasoning_effort", "reasoning",
+        "verbosity", "service_tier",
+        # labels and cache hints
+        "store", "metadata", "user", "safety_identifier", "prompt_cache_key", "prompt_cache_retention", "cache_control",
+        # OpenRouter routing identity and observability, `models` / `route` checked by `check` before this list
+        "models", "route", "provider", "session_id", "trace",
+    )
+    dispatch_tool_types = ("function", "custom")
+    # unmeasured (board row 151: `modalities`, `audio`); a predicted output's rejected tokens bill as output beyond what
+    # the ceiling plainly bounds; the rest are OpenRouter's debug, image and server-tool-loop controls
+    unjudged_fields = ("audio", "modalities", "moderation", "prediction", "prompt_cache_options", "image_config",
+                       "debug", "deferred_tools", "stop_server_tools_when")
 
     def write_stream_usage(self, obj: Dict[str, Any]) -> bool:
         """A `stream: true` body with no `stream_options.include_usage` key gets `include_usage: true` written in
@@ -867,6 +957,31 @@ class OpenAIResponses(_OpenAI):
     server_tools = ("web_search", "web_search_preview", "file_search", "code_interpreter", "computer_use_preview",
                     "mcp", "image_generation")
     ceiling_fields = ("max_output_tokens",)
+    # [judged by lane r150, 2026-11-09, from `CreateResponse` (github.com/openai/openai-openapi, openapi.yaml),
+    # OpenRouter's `ResponsesRequest` (openrouter.ai/openapi.json), and the body a real Codex (`codex exec`) sent a
+    # local listener (`tests/fixtures/client_bodies/codex_*`); `client_metadata` is Codex's own label object, in
+    # neither schema]
+    dispatch_fields = (
+        "model", "input", "instructions", "stream", "stream_options", "tools", "max_output_tokens",
+        # value-checked (`unbounded_fields`)
+        "previous_response_id", "conversation", "prompt", "plugins", "max_tool_calls",
+        # sampling and output shape, inside the written ceiling; reasoning tokens bill as output; `include` selects
+        # extra output fields; `truncation` only shortens the input
+        "temperature", "top_p", "top_k", "top_logprobs", "frequency_penalty", "presence_penalty", "stop", "text",
+        "reasoning", "include", "tool_choice", "parallel_tool_calls", "truncation", "service_tier",
+        # labels and cache hints
+        "store", "metadata", "user", "safety_identifier", "prompt_cache_key", "prompt_cache_retention",
+        "cache_control", "client_metadata",
+        # OpenRouter routing identity and observability, `models` / `route` checked by `check` before this list
+        "models", "route", "provider", "session_id", "trace",
+    )
+    # client-run: a `function` or `custom` tool, `local_shell` and `apply_patch` (the model emits the call, the
+    # caller runs it), and `namespace` (a group of function tools; Codex declares one, seen in a real capture)
+    dispatch_tool_types = ("function", "custom", "namespace", "local_shell", "apply_patch")
+    # unmeasured (board row 151: `context_management`, `background`, `moderation`, `modalities`); the rest are
+    # OpenAI access programs and image options, and OpenRouter's debug, image and server-tool-loop controls
+    unjudged_fields = ("background", "context_management", "moderation", "modalities", "access_programs", "image",
+                       "prompt_cache_options", "image_config", "debug", "deferred_tools", "stop_server_tools_when")
 
     # Usage: a non-stream body's `usage`; a stream's `response.completed` `response.usage`, and
     # `response.incomplete`'s (the call that stopped at its ceiling ends with that event, not `completed`)

@@ -471,6 +471,23 @@ def test_refused_window_closes_on_its_timer_and_interactive_refusals_write_none(
                    ("body-unbounded", 1, "body-unbounded:document")], got
 
 
+def test_a_body_unlisted_refusal_writes_one_refused_line_through_the_window(monkeypatch):
+    # row 150: a dispatch request's unlisted field is one `refused` line, reason `body-unlisted` (the ledger's reason
+    # grammar is the name without its suffix), the row keeping the whole name; a field name outside the wire grammar
+    # is the fixed suffix `field`
+    async def go(d):
+        async with KeysWorld(d, monkeypatch, refused_row_s=0.5) as w:
+            w.k._note_refusal("s1", RUN, "body-unlisted:zz_new_vendor_field")
+            w.k._note_refusal("s1", RUN, "body-unlisted:field")
+            w.k.flush_refusals()
+            await until(lambda: len([o for o in w.lines() if o["kind"] == "refused"]) == 2, 5)
+            return w.lines()
+
+    lines = run_go(go)
+    got = sorted((o["reason"], o["meta"]["lineage"]["refused"]) for o in lines if o["kind"] == "refused")
+    assert got == [("body-unlisted", "body-unlisted:field"), ("body-unlisted", "body-unlisted:zz_new_vendor_field")], got
+
+
 def test_lineage_outbox_full_refuses_ticketed(monkeypatch):
     # H6-11: at LINEAGE_OUTBOX_MAX a ticketed `Q` is `keys-unavailable` with no hold; an interactive session is
     # unaffected; once acks drain the outbox, the ticketed `Q` is admitted again

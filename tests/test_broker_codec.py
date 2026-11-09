@@ -224,9 +224,11 @@ def test_forwarded_body_is_the_compact_serialization():
 
 def test_refused_names_on_the_wire():
     from levain.broker import gwwire
-    for name in ("body-json", "body-unbounded:document", "body-unbounded:websocket"):
+    for name in ("body-json", "body-unbounded:document", "body-unbounded:websocket", "body-unlisted:field",
+                 "body-unlisted:compaction"):
         assert gwwire.decode(b"F", gwwire.encode(b"F", {"refused": name})[5:]) == {"refused": name}
-    for bad in ("body-unbounded:", "body-unbounded:Bad", "body-json:x", "model-not-allowed:x"):
+    for bad in ("body-unbounded:", "body-unbounded:Bad", "body-json:x", "model-not-allowed:x", "body-unlisted:",
+                "body-unlisted:X-Foo"):
         assert not norm.is_name(bad)
 
 

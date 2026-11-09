@@ -23,7 +23,7 @@ STATUS = {
     "upstream-error": 502, "upstream-timeout": 504, "keys-unavailable": 503,
     "upstream-redirect": 502,
     "credential-unavailable": 503,
-    "body-json": 400, "body-unbounded": 403, "body-timeout": 408,
+    "body-json": 400, "body-unbounded": 403, "body-unlisted": 403, "body-timeout": 408,
 }
 #: P7-A §3.2: the largest passthrough limits a session file may carry, meant as ONE bound for the file's writer and its
 #: reader, so what one writes the other loads. 2**53 bytes is the
@@ -32,8 +32,13 @@ STATUS = {
 PT_CAP_MAX = 2 ** 53
 PT_DEADLINE_MAX = 10 ** 12
 #: the names that carry a `:<what>` suffix on the wire (R4 §1.6: `body-unbounded:document`); the status is the prefix's.
-PARAMETERISED = ("body-unbounded",)
+PARAMETERISED = ("body-unbounded", "body-unlisted")
 _WHAT = re.compile(r"[a-z][a-z0-9_]{0,47}\Z")
+
+
+def what_ok(what: str) -> bool:
+    """Whether `what` can be a parameterised name's suffix. A suffix built from a client's string must pass this."""
+    return _WHAT.match(what) is not None
 
 
 def status_of(name: str) -> int:
