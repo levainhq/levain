@@ -9316,9 +9316,10 @@
   // it holds text or took a key within the idle window, so a box merely left focused never freezes the board.
   const FOCUS_REBUILT = "#board, #levain-modal, #ck-hero, #ck-brief, #ck-widgets, #ck-needs, #ck-notes";
   const FOCUS_IDLE_MS = 10000;
-  let lastFieldInput = 0;
-  if (typeof document !== "undefined" && document.addEventListener) {
-    const stamp = () => { lastFieldInput = Date.now(); };
+  // recency is kept per element: typing in one field (the chat, an earlier box) says nothing about a different field focused later
+  const fieldInputAt = typeof WeakMap !== "undefined" ? new WeakMap() : null;
+  if (fieldInputAt && typeof document !== "undefined" && document.addEventListener) {
+    const stamp = (e) => { if (e && e.target && typeof e.target === "object") fieldInputAt.set(e.target, Date.now()); };
     document.addEventListener("input", stamp, true);
     document.addEventListener("keydown", stamp, true);
     document.addEventListener("change", stamp, true);
@@ -9332,7 +9333,8 @@
     else if (a.isContentEditable) text = true;
     else if (tag !== "SELECT") return false;
     if (text && String(a.isContentEditable ? a.textContent : a.value || "").trim() !== "") return true;
-    return Date.now() - lastFieldInput < FOCUS_IDLE_MS;
+    const at = fieldInputAt ? fieldInputAt.get(a) : 0;
+    return !!at && Date.now() - at < FOCUS_IDLE_MS;
   }
   // what holds a passive re-read off: an unsaved edit, or a field the person is in
   function editHoldsRefresh() { return hasUnsavedEdit() || focusHoldsRefresh(); }

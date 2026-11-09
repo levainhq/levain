@@ -108,13 +108,32 @@ def test_typing_in_a_panel_modal_survives_a_reread(tmp_path: Path) -> None:
 @needs_browser
 def test_an_idle_empty_focused_field_does_not_freeze_the_board(tmp_path: Path) -> None:
     root, src, steps = _start(tmp_path, False, INPUT)
-    steps += [{"eval": f"{INPUT}.focus(); 1"}, {"until": REDRAWN}, {"eval": "JSON.stringify({r: window.__redraws})"}]
-    assert json.loads(_run_steps(tmp_path, root, src, steps)[-1])["r"] > 0
+    # the counter is reset AFTER the focus step, so a redraw that landed before the focus cannot satisfy the wait
+    steps += [{"eval": f"{INPUT}.focus(); window.__redraws = 0; JSON.stringify({{on: document.activeElement === {INPUT}}})"},
+              {"until": REDRAWN}, {"eval": "JSON.stringify({r: window.__redraws})"}]
+    vals = _run_steps(tmp_path, root, src, steps)
+    assert json.loads(vals[-3])["on"], vals[-3]
+    assert json.loads(vals[-1])["r"] > 0
+
+
+@needs_browser
+def test_typing_elsewhere_does_not_hold_a_fresh_empty_board_field(tmp_path: Path) -> None:
+    # recency is per element: keys typed in a field the draw does not rebuild never defer a read for a different empty field
+    root, src, steps = _start(tmp_path, False, INPUT)
+    steps += [{"eval": "const i = document.createElement('input'); i.id = 'elsewhere'; document.body.appendChild(i); i.focus(); 1"},
+              *({"key": "a"} for _ in range(3)),
+              {"eval": f"{INPUT}.focus(); window.__redraws = 0; window.__t0 = Date.now(); JSON.stringify({{on: document.activeElement === {INPUT}}})"},
+              {"until": REDRAWN}, {"eval": "JSON.stringify({r: window.__redraws, ms: Date.now() - window.__t0})"}]
+    vals = _run_steps(tmp_path, root, src, steps)
+    assert json.loads(vals[-3])["on"], vals[-3]
+    got = json.loads(vals[-1])
+    assert got["r"] > 0 and got["ms"] < 5000, got   # a held read would wait out the whole idle window
 
 
 @needs_browser
 def test_a_field_outside_the_redrawn_regions_never_blocks(tmp_path: Path) -> None:
     root, src, steps = _start(tmp_path, False, INPUT)
+    # the fixture serves no chat page, so a plain body input stands in for the chat input (the same: outside every rebuilt region)
     out = "document.getElementById('outside-field')"
     steps += [{"eval": "const i = document.createElement('input'); i.id = 'outside-field'; document.body.appendChild(i); i.focus(); 1"},
               *({"key": "a"} for _ in range(10)), {"until": REDRAWN},
