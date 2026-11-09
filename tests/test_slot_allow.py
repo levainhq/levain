@@ -187,7 +187,7 @@ def test_a_signed_yes_carries_and_the_evidence_is_stored_and_re_verified(rig, qd
     assert entry["message"].startswith("levain-terminal-answer/1\n") and entry["sig"].startswith("-----BEGIN SSH")
     assert SA.carried(allow, rig.judge, rig.sid) == (["Bash(npm test *)"], [])
     # the other row is unanswered and stays pending
-    assert [r for r in SA._pending(qdir).values()] == [
+    assert [{k: v for k, v in r.items() if k != "key"} for r in SA._pending(qdir).values()] == [
         {"rule": "WebSearch", "session": "S1", "question_id": rig.file("WebSearch")["A slot session asked to always allow: WebSearch"].id}]
 
 
@@ -238,15 +238,16 @@ def test_a_key_the_authority_log_does_not_hold_active_as_a_laptop_key_does_not_c
                          (lambda k: rig.authority.keys.clear(), "not an active key")):
         keep = dict(rig.authority.keys)
         change(rig.authority.keys.get(rig.laptop.fp, SimpleNamespace()))
-        assert SA.apply_answered(qdir, allow, store=rig.qs, judge=rig.judge) == []
-        assert text in SA.not_carried(qdir, store=rig.qs, judge=rig.judge)[0][1]
+        assert text in SA.not_carried(qdir, store=rig.qs, judge=rig.judge)[0][1]     # judged as the launch will
         rig.authority.keys.update(keep)
         rig.authority.keys[rig.laptop.fp].active = True
         rig.authority.keys[rig.laptop.fp].key_class = LAPTOP
-    # an authority that cannot be read carries nothing and does not raise
+    # an authority that cannot be read carries nothing and does not raise; the refused yes is named after the launch
     boom = SA.Judge(authority=lambda: (_ for _ in ()).throw(OSError("log")))
-    assert SA.apply_answered(qdir, allow, store=rig.qs, judge=boom) == []
     assert "authority log cannot be read" in SA.not_carried(qdir, store=rig.qs, judge=boom)[0][1]
+    assert SA.apply_answered(qdir, allow, store=rig.qs, judge=boom) == []
+    assert "authority log cannot be read" in SA.not_carried(qdir, store=rig.qs, judge=rig.judge)[0][1]
+    assert SA.rules_of(allow) == []
 
 
 def _carried_one(rig, qdir, rule="Bash(npm test *)"):
@@ -740,3 +741,147 @@ def test_the_list_shows_hours_under_a_day(rig, qdir, capsys):
     SA.run(SimpleNamespace(queue_dir=qdir, slot_allow_verb="list"))
     out = capsys.readouterr().out
     assert re.search(r"\b[45] hours left", out) and "0 days left" not in out
+
+
+# --- the offer lifecycle (head ruling R2): one pending record per rule, resolved by question id ---------------------
+
+def _save(rig, qdir, rule, session):
+    """A slot END that saved ``rule``: what :func:`slot_allow.offer` files."""
+    return SA.offer(qdir, qdir / SA.FILE_NAME, session, [rule], rig.judge, store=rig.qs)
+
+
+def test_a_no_then_a_later_save_files_one_new_open_row(rig, qdir):
+    allow = qdir / SA.FILE_NAME
+    assert _save(rig, qdir, "WebSearch", "S1") == ["WebSearch"]
+    (q,) = _rows(rig, "WebSearch")
+    rig.qs.answer(q.id, option="no", channel="cli")
+    assert SA.apply_answered(qdir, allow, store=rig.qs, judge=rig.judge) == []
+    assert _save(rig, qdir, "WebSearch", "S2") == ["WebSearch"]          # "No: keep asking" asks at the next save
+    rows = _rows(rig, "WebSearch")
+    assert len(rows) == 1 and rows[0].id != q.id
+    assert _save(rig, qdir, "WebSearch", "S3") == []                     # one open row per rule, never two
+    assert len(_rows(rig, "WebSearch")) == 1
+
+
+def test_an_unsigned_yes_drops_its_pending_record_and_a_later_save_files_a_new_row(rig, qdir):
+    allow = qdir / SA.FILE_NAME
+    _save(rig, qdir, "WebSearch", "S1")
+    (q,) = _rows(rig, "WebSearch")
+    rig.yes(q, signed=False)
+    assert _save(rig, qdir, "WebSearch", "S2") == []                     # a yes waiting for its launch is not re-asked
+    refused = []
+    assert SA.apply_answered(qdir, allow, store=rig.qs, judge=rig.judge, refused=refused) == []
+    assert refused == [("WebSearch", "answered unsigned")]
+    assert SA._pending(qdir) == {}
+    assert SA.not_carried(qdir, store=rig.qs, judge=rig.judge) == [("WebSearch", "answered unsigned")]
+    assert _save(rig, qdir, "WebSearch", "S3") == ["WebSearch"]          # re-offered once per save
+    (row,) = _rows(rig, "WebSearch")
+    assert row.id != q.id
+    assert SA.not_carried(qdir, store=rig.qs, judge=rig.judge) == []     # the new row replaces the refusal
+    rig.yes(row)
+    assert SA.apply_answered(qdir, allow, store=rig.qs, judge=rig.judge) == ["WebSearch"]
+
+
+def test_a_pending_row_with_600_questions_filed_after_it_is_still_resolved(rig, qdir):
+    allow = qdir / SA.FILE_NAME
+    _save(rig, qdir, "WebSearch", "S1")
+    (q,) = _rows(rig, "WebSearch")
+    for i in range(600):
+        rig.qs.file(agent="codex", agent_session_id=f"s{i}", what=f"other {i}", options=[("a", "A"), ("b", "B")],
+                    rec="a", blocks="nothing", cwd=str(qdir))
+    rig.yes(q)
+    assert SA.apply_answered(qdir, allow, store=rig.qs, judge=rig.judge) == ["WebSearch"]
+    assert SA.carried(allow, rig.judge, rig.sid)[0] == ["WebSearch"]
+
+
+def test_an_answer_landing_mid_apply_raises_nothing_and_the_rules_are_carried(rig, qdir, monkeypatch):
+    allow = qdir / SA.FILE_NAME
+    _save(rig, qdir, "WebSearch", "S1")
+    _save(rig, qdir, "Bash(make *)", "S1")
+    (a,) = _rows(rig, "WebSearch")
+    (b,) = _rows(rig, "Bash(make *)")
+    rig.yes(a)
+    landed = []
+
+    def landing(fn):
+        def wrapped(*args, **kw):
+            got = fn(*args, **kw)
+            if not landed:
+                landed.append(True)
+                rig.yes(b)                                   # the operator answers while the apply runs
+            return got
+        return wrapped
+
+    monkeypatch.setattr(rig.qs, "get", landing(rig.qs.get))
+    monkeypatch.setattr(rig.qs, "recent", landing(rig.qs.recent))
+    added = SA.apply_answered(qdir, allow, store=rig.qs, judge=rig.judge)
+    assert "WebSearch" in added
+    SA.apply_answered(qdir, allow, store=rig.qs, judge=rig.judge)
+    assert sorted(SA.carried(allow, rig.judge, rig.sid)[0]) == ["Bash(make *)", "WebSearch"]
+
+
+def test_undo_of_a_sanitized_entry_copied_into_rules_reports_not_carried_and_files_a_fresh_row(rig, qdir):
+    allow = _carried_one(rig, qdir, "WebSearch")
+    SA.revoke(allow, "WebSearch", confirm=True)
+    doc = json.loads(allow.read_text())
+    doc["rules"] = [{k: v for k, v in doc["revoked"][0].items() if k != "revoked_at"}]
+    allow.write_text(json.dumps(doc))
+    said = SA.undo(allow, "WebSearch", store=rig.qs, judge=rig.judge)
+    assert "carried already" not in said and "re-offered on the band" in said
+    (row,) = _rows(rig, "WebSearch")
+    assert row.answer is None
+    assert SA.carried(allow, rig.judge, rig.sid)[0] == []                # undo restored nothing
+    rig.yes(row)
+    assert SA.apply_answered(qdir, allow, store=rig.qs, judge=rig.judge) == ["WebSearch"]
+    assert SA.carried(allow, rig.judge, rig.sid)[0] == ["WebSearch"]
+
+
+def test_undo_of_a_rule_carried_by_a_later_signed_yes_says_so_and_files_nothing(rig, qdir):
+    allow = _carried_one(rig, qdir, "WebSearch")
+    SA.revoke(allow, "WebSearch", confirm=True)
+    SA.undo(allow, "WebSearch", store=rig.qs, judge=rig.judge)
+    (row,) = _rows(rig, "WebSearch")
+    rig.yes(row)
+    assert SA.apply_answered(qdir, allow, store=rig.qs, judge=rig.judge) == ["WebSearch"]
+    SA.revoke(allow, "WebSearch", confirm=True)
+    assert _save(rig, qdir, "WebSearch", "S4") == ["WebSearch"]
+    (row,) = _rows(rig, "WebSearch")
+    rig.yes(row)
+    assert SA.apply_answered(qdir, allow, store=rig.qs, judge=rig.judge) == ["WebSearch"]
+    doc = json.loads(allow.read_text())
+    doc["revoked"] = [{"rule": "WebSearch", "session": "S1", "revoked_at": "2026-01-01T00:00:00Z"}]
+    allow.write_text(json.dumps(doc))
+    said = SA.undo(allow, "WebSearch", store=rig.qs, judge=rig.judge)
+    assert "carried already" in said and _rows(rig, "WebSearch") == []
+
+
+def test_the_lock_re_enters_through_a_symlinked_spelling_of_the_directory(qdir, tmp_path):
+    import threading
+
+    link = tmp_path / "consent-link"
+    link.symlink_to(qdir)
+    done = []
+
+    def nested():
+        with SA._locked(qdir):
+            with SA._locked(link):
+                done.append(True)
+
+    t = threading.Thread(target=nested, daemon=True)
+    t.start()
+    t.join(3)
+    assert done == [True]
+
+
+def test_a_stale_tmp_file_from_a_crashed_writer_is_replaced(qdir):
+    stale = qdir / f".{SA.FILE_NAME}.{os.getpid()}.tmp"
+    stale.write_text("left by a crash")
+    SA._save(qdir / SA.FILE_NAME, SA._empty())
+    assert SA.load(qdir / SA.FILE_NAME)["rules"] == [] and not stale.exists()
+
+
+def test_a_pending_file_of_the_keyed_format_holds_nothing_back(rig, qdir):
+    (qdir / SA.PENDING_NAME).write_text(json.dumps({"format": "levain-slot-allow-pending/1", "rows": {
+        "slot-allow:0": {"rule": "WebSearch", "session": "S0", "question_id": "q-gone"}}}))
+    assert SA.apply_answered(qdir, qdir / SA.FILE_NAME, store=rig.qs, judge=rig.judge) == []
+    assert _save(rig, qdir, "WebSearch", "S1") == ["WebSearch"]
