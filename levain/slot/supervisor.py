@@ -6,9 +6,12 @@ It holds two things the slot must never reach: the LEASE (the CONTROL connection
 
 1. the repo layer, before any lease or staging write: ``--repo`` is a git work tree the operator owns on a named
    branch; :func:`operator_clone` makes the §2c 5 clone (tracked files only, no shared inode, remotes and their
-   credentials stripped) into a private temp dir; :func:`repo_layer_docs` reads its ``.claude/settings.json`` +
-   ``.claude/settings.local.json`` from the commit and :func:`levain.slot.render.repo_loosening_refusals` refuses by
-   key name. The slot clones exactly the bundle made from THIS clone, so what was checked is what launches.
+   credentials stripped) into a private temp dir, and the slot clones exactly the bundle made from THIS clone. The
+   settings that launch are read separately: :func:`worktree_layer_docs` reads the checkout's
+   ``.claude/settings.json`` + ``.claude/settings.local.json`` as they are on disk,
+   :func:`levain.slot.render.repo_loosening_refusals` refuses by key name, and
+   :func:`levain.slot.render.freeze_repo_settings` reduces them to the layer render freezes into the root-owned
+   ``--settings`` file (the session reads no settings source live, so the clone's own copies never act).
 2. the render blob's inputs (base-map routes, the operator's git identity), so a launch that cannot render is refused
    before it takes a slot.
 3. ``LEASE-OPEN`` (§3.1 1), then the runtime helper through sudo: ``prepare`` (stdin ``{lease_nonce}``), the bundle
@@ -672,6 +675,14 @@ def operator_clone(repo: Path, branch: str, dest: Path, *, git: str = "git",
                      refusal="clone-failed"))
 
 
+def _fold(name: str) -> str:
+    # a case- and normalization-insensitive store (APFS by default) checks `.Claude/Settings.json` out where CC would
+    # read `.claude/settings.json`: such a spelling is found by its folded name and named, never parsed. The one fold
+    # is render's (PRE-L3 4-2), imported where it is used.
+    from levain.slot.render import fold_name
+    return fold_name(name)
+
+
 def _ls_tree(clone: Path, treeish: str, *, git: str, run: Callable[..., subprocess.CompletedProcess]
              ) -> List[Tuple[bytes, bytes, bytes, str]]:
     p = _git(["-C", str(clone), "ls-tree", "-z", treeish], git=git, run=run, refusal="repo-settings-malformed")
@@ -694,23 +705,36 @@ def _no_dup(pairs: List[Tuple[str, Any]]) -> Dict[str, Any]:
 
 def repo_layer_docs(clone: Path, *, git: str = "git",
                     run: Callable[..., subprocess.CompletedProcess] = subprocess.run,
-                    treeish: str = "HEAD") -> Dict[str, Any]:
+                    treeish: str = "HEAD", ignored: Optional[List[str]] = None) -> Dict[str, Any]:
     """The clone's committed settings layers at ``treeish`` (the clone's HEAD unless named), parsed: repo-relative
-    name -> JSON value, for every tree entry whose name folds to ``.claude`` / ``settings.json`` / ``settings.local.json``. Refused ``repo-settings-malformed`` when
-    such an entry is a link or a submodule (CC would read through it), is over :data:`SETTINGS_CAP`, is not JSON, or
-    repeats a key (DECISION: two values for one key is refused, not resolved), or nests too deep to parse."""
-    from levain.slot.render import fold_name as _fold   # the one fold, imported where it is used
-    want = {_fold(Path(n).name): n for n in REPO_SETTINGS}
+    name -> JSON value, for the entries named exactly ``.claude/settings.json`` and ``.claude/settings.local.json``.
+    A name that only folds to one of those (``.Claude/Settings.json``) is never parsed: it is appended to ``ignored``
+    (when given), since no settings source is read live in a slot (``--setting-sources ""``), so such a file has no
+    effect there. Refused ``repo-settings-malformed`` when an exact entry is a link or a submodule, is over
+    :data:`SETTINGS_CAP`, is not JSON, or repeats a key (DECISION: two values for one key is refused, not resolved),
+    or nests too deep to parse."""
+    names = {Path(n).name for n in REPO_SETTINGS}
+    folded = {_fold(n) for n in names}
     docs: Dict[str, Any] = {}
     for mode, typ, sha, name in _ls_tree(clone, treeish, git=git, run=run):
         if _fold(name) != _fold(".claude"):
             continue
+        if name != ".claude":
+            if ignored is not None:
+                ignored.extend([name] if typ != b"tree" else
+                               [f"{name}/{n2}" for _m, _t, _s, n2 in _ls_tree(clone, sha.decode(), git=git, run=run)
+                                if _fold(n2) in folded])
+            continue
         if typ != b"tree":
             raise Refused("repo-settings-malformed", f"{name}: not a directory ({mode.decode()})")
         for m2, t2, s2, n2 in _ls_tree(clone, sha.decode(), git=git, run=run):
-            if _fold(n2) not in want:
+            if _fold(n2) not in folded:
                 continue
             path = f"{name}/{n2}"
+            if n2 not in names:
+                if ignored is not None:
+                    ignored.append(path)
+                continue
             if t2 != b"blob" or m2 not in _REGULAR:
                 raise Refused("repo-settings-malformed", f"{path}: not a regular file ({m2.decode()})")
             size = _out(_git(["-C", str(clone), "cat-file", "-s", s2.decode()], git=git, run=run,
@@ -723,6 +747,65 @@ def repo_layer_docs(clone: Path, *, git: str = "git",
                 docs[path] = json.loads(blob.decode("utf-8"), object_pairs_hook=_no_dup)
             except (UnicodeDecodeError, ValueError, RecursionError):   # nesting past the parser's depth: untrusted
                 raise Refused("repo-settings-malformed", f"{path}: not JSON") from None
+    return docs
+
+
+def worktree_layer_docs(top: Path, ignored: Optional[List[str]] = None) -> Dict[str, Any]:
+    """The settings layers of the operator's checkout ``top`` AS THEY ARE ON DISK (row 161 ruling 3): repo-relative
+    name -> JSON value for ``.claude/settings.json`` and ``.claude/settings.local.json``, committed or not, so the
+    operator's own "always allow" rules (Claude Code writes them to the usually gitignored local file) are frozen into
+    the next launch. Exact names only, compared against the directory's own listing: a name that only folds to one
+    (``.Claude``, ``Settings.json``) is appended to ``ignored`` and never read. The same refusals as
+    :func:`repo_layer_docs`, ``repo-settings-malformed``: ``.claude`` or a settings file that is a link or not a
+    directory / regular file, a file over :data:`SETTINGS_CAP`, not JSON, a repeated key, nesting too deep. Each file is
+    opened without following a link and checked on the open descriptor."""
+    import stat as st
+
+    names = {Path(n).name for n in REPO_SETTINGS}
+    folded = {_fold(n) for n in names}
+    try:
+        top_names = os.listdir(top)
+    except OSError as e:
+        raise Refused("repo-settings-malformed", f"{top}: {e.strerror}") from None
+    docs: Dict[str, Any] = {}
+    for d in sorted(n for n in top_names if _fold(n) == _fold(".claude")):
+        dpath = Path(top) / d
+        dst = os.lstat(dpath)
+        if d != ".claude":
+            if ignored is not None:
+                ignored.extend([d] if not st.S_ISDIR(dst.st_mode) else
+                               [f"{d}/{n}" for n in sorted(os.listdir(dpath)) if _fold(n) in folded])
+            continue
+        if not st.S_ISDIR(dst.st_mode):
+            raise Refused("repo-settings-malformed", f"{d}: not a directory")
+        for n in sorted(os.listdir(dpath)):
+            if _fold(n) not in folded:
+                continue
+            rel = f"{d}/{n}"
+            if n not in names:
+                if ignored is not None:
+                    ignored.append(rel)
+                continue
+            try:
+                fd = os.open(dpath / n, os.O_RDONLY | os.O_NOFOLLOW | getattr(os, "O_NONBLOCK", 0))
+            except OSError:
+                raise Refused("repo-settings-malformed", f"{rel}: not a regular file") from None
+            try:
+                fst = os.fstat(fd)
+                if not st.S_ISREG(fst.st_mode):
+                    raise Refused("repo-settings-malformed", f"{rel}: not a regular file")
+                if fst.st_size > SETTINGS_CAP:
+                    raise Refused("repo-settings-malformed", f"{rel}: over {SETTINGS_CAP} bytes")
+                with os.fdopen(os.dup(fd), "rb") as f:
+                    data = f.read(SETTINGS_CAP + 1)
+            finally:
+                os.close(fd)
+            if len(data) > SETTINGS_CAP:
+                raise Refused("repo-settings-malformed", f"{rel}: over {SETTINGS_CAP} bytes")
+            try:
+                docs[rel] = json.loads(data.decode("utf-8"), object_pairs_hook=_no_dup)
+            except (UnicodeDecodeError, ValueError, RecursionError):
+                raise Refused("repo-settings-malformed", f"{rel}: not JSON") from None
     return docs
 
 
@@ -1465,9 +1548,15 @@ class Supervisor:
             commit = operator_clone(top, branch, clone, git=self.s.git, run=self.s.run)
             from levain.slot.render import freeze_repo_settings
 
-            docs = repo_layer_docs(clone, git=self.s.git, run=self.s.run)
+            # Row 161 ruling 3: the settings that launch are the checkout's as they are on disk (the clone has no
+            # work tree, and no settings source is read live in the slot, so the clone's copies never act there).
+            ignored: List[str] = []
+            docs = worktree_layer_docs(top, ignored)
             check_repo_layer(docs)
             frozen = freeze_repo_settings(docs)
+            self.say("repo settings read from the checkout: " + (", ".join(sorted(docs)) or "none"))
+            if ignored:
+                self.say("repo settings files not read (not the exact name): " + ", ".join(ignored))
             if frozen.dropped_env:
                 self.say("repo settings env dropped (names only; none is on the allowlist): "
                          + ", ".join(frozen.dropped_env))
