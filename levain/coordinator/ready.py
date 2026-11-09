@@ -33,6 +33,9 @@ a consistent snapshot and needs no coordinator. No UI and no CLI verb here: thos
 with provenance source ``plan`` (SCHEMA section 5: "the coordinator store once C13 exists"); a store item shadows a
 plan row or spore of the same id; ``status`` equals the category (v1) and the writer takes no separate status; a write
 that changes nothing is refused; an item's repo is fixed at ``add``. Stdlib only.
+
+Known edge (row 156 L3 C5): the current-state read looks up each item's prose hold with its own queries, so a list
+costs a query pair per item, which a board the size of one status file's lane menu bears.
 """
 from __future__ import annotations
 
