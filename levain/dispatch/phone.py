@@ -269,12 +269,13 @@ class DispatchPhone:
         from levain.authority import AuthorityError
         from levain.consent.sign import SignRefused
         from levain.dispatch import DispatchError
+        from levain.dispatch.adopt import agent_config_paths
 
         if job.state != "recommended":
             return None
         # bound before the try: every failure below returns this card with its problem set, onto and run kept
         card: dict[str, Any] = {"onto": None, "run": None, "tier": None, "changes": [], "change_overflow": 0,
-                                "files": 0, "changed_lines": None, "signers": [], "note": "", "problem": None}
+                                "files": 0, "changed_lines": None, "agent_config": [], "signers": [], "note": "", "problem": None}
         try:
             store = self._store()
             proposal = None if store is None else self._proposal(store, job)
@@ -286,7 +287,8 @@ class DispatchPhone:
                         "binary": c.binary, "gitlink": c.non_blob} for c in changes.entries]
             card.update({"tier": tier, "staged": record.staged_commit, "base": record.base,
                          "changes": entries[:CHANGE_CAP], "change_overflow": max(len(entries) - CHANGE_CAP, 0),
-                         "files": len(entries), "changed_lines": changes.changed_lines})
+                         "files": len(entries), "changed_lines": changes.changed_lines,
+                         "agent_config": agent_config_paths(changes.paths)})
             card["signers"] = self._covering(tier)
             if not card["signers"]:
                 card["note"] = (f"needs your laptop key: no passkey enrolled for {self.rp_id} covers {tier} "

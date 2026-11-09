@@ -74,7 +74,7 @@ __all__ = [
     "MAX_TOTAL_BYTES", "ArtifactRecord", "Change", "ChangeSet", "Envelope", "Floor", "GitFault", "Landing",
     "artifact_digest",
     "artifact_problem",
-    "authorise_message", "authorise_payload", "authorise_payload_for", "authorise_refusal", "branch_problem",
+    "agent_config_paths", "authorise_message", "authorise_payload", "authorise_payload_for", "authorise_refusal", "branch_problem",
     "change_set",
     "criteria_failure", "floor", "land", "revalidation_problem", "stage_commit", "staged_ref", "sweep_staged",
 ]
@@ -323,6 +323,18 @@ class ChangeSet:
     @property
     def staged_bytes(self) -> int:
         return sum(c.new_size for c in self.entries if c.status != "D")
+
+
+def agent_config_paths(paths: Iterable[str]) -> list[str]:
+    """The changed paths that sit in an agent-config home the slot's settings freeze and launch read: a path whose
+    first component folds (NFD + casefold, as the freeze folds it) to one of :data:`levain.slot.render.REPO_DISCOVERY`,
+    which holds the ``.claude`` the freeze reads :data:`levain.slot.supervisor.REPO_SETTINGS` from. Sorted, no
+    duplicates. Adopt shows these as their own labelled item; it never blocks on them."""
+    from levain.slot.render import REPO_DISCOVERY
+    from levain.slot.supervisor import REPO_SETTINGS, _fold
+
+    homes = {_fold(n) for n in REPO_DISCOVERY} | {_fold(Path(n).parts[0]) for n in REPO_SETTINGS}
+    return sorted({p for p in paths if _fold(p.split("/", 1)[0]) in homes})
 
 
 def _absent(mode: str, sha: str) -> bool:

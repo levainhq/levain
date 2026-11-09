@@ -778,6 +778,10 @@ class DispatchSheet:
         over = card.get("change_overflow") if card is not None else 0
         over = over if isinstance(over, int) and over > 0 else 0
         if card is not None and card.get("onto"):
+            cfg = [str(x) for x in (card.get("agent_config") or [])]
+            if cfg:
+                lines += ["", f"AGENT SETTINGS CHANGED ({len(cfg)}): these paths set how an agent session behaves in "
+                              "this checkout; read them before you authorise.", *[f"  {x}" for x in cfg]]
             lines += ["", f"Authorise run {card.get('run')} onto {card.get('onto')} · tier {card.get('tier')} · "
                           f"{card.get('files')} file(s), {card.get('changed_lines')} changed line(s)"
                           + (f" · staged {card.get('staged')} on {card.get('base')}" if card.get("staged") else ""),

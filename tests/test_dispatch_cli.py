@@ -1038,3 +1038,27 @@ def test_a_dash_leading_capability_is_never_minted_and_an_old_one_parses_with_eq
     assert code == 2 and f"that capability is not job {job.id}'s" in out + err, (out, err)
     code, out, _ = run(capsys, "recommend", job.id, f"--capability={cap}", "--dispatch-dir", str(lw.ddir))
     assert code == 0, out
+
+
+def test_authorise_names_a_changed_agent_settings_path_before_the_diff(capsys, lw):
+    job, _cap = lw.verified({"src/b.py": b"b = 3\n", ".claude/settings.json": b"{}\n"})
+    code, out, _ = run(capsys, *_authorise_argv(lw, job.id, "--yes", run_="1"))
+    assert "AGENT SETTINGS CHANGED (1)" in out and "\n    .claude/settings.json\n" in out, out
+    assert out.index("AGENT SETTINGS CHANGED") < out.index("the change the floor judges"), out
+    assert "A  .claude/settings.json" in out          # the ordinary diff still lists it
+
+
+def test_authorise_without_an_agent_settings_change_shows_no_such_item(capsys, lw):
+    job, _cap = lw.verified({"src/b.py": b"b = 3\nc = 3\n"})
+    code, out, _ = run(capsys, *_authorise_argv(lw, job.id, "--yes", run_="1"))
+    assert "AGENT SETTINGS" not in out and "the change the floor judges" in out, out
+
+
+def test_agent_config_paths_follow_the_homes_the_slot_reads():
+    from levain.dispatch.adopt import agent_config_paths
+
+    got = agent_config_paths(["src/a.py", ".Claude/hooks/x.sh", ".claude/settings.json", "CLAUDE.md", ".mcp.json",
+                              ".codex/config.toml", "docs/CLAUDE.md", "AGENTS.md", ".agents/s.md"])
+    assert got == [".Claude/hooks/x.sh", ".agents/s.md", ".claude/settings.json", ".codex/config.toml",
+                   ".mcp.json", "AGENTS.md", "CLAUDE.md"]
+    assert agent_config_paths(["src/a.py", "README.md"]) == []

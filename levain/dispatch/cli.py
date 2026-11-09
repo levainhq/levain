@@ -423,7 +423,14 @@ def _change_view(store: JobStore, job: Job, run: int) -> tuple[list[str], list[s
     tier = dadopt._tier(_landing_tier(store.directory), job.repo, changes.paths)
     if tier is None:
         raise DispatchError("the landing tier could not be read; nothing was signed")
-    lines = [f"  the change the floor judges, run {run} (staged {record.staged_commit}, base {record.base}):"]
+    lines: list[str] = []
+    agent_cfg = dadopt.agent_config_paths(changes.paths)
+    if agent_cfg:
+        lines.append(f"  AGENT SETTINGS CHANGED ({len(agent_cfg)}): these paths set how a Claude Code or Codex "
+                     "session behaves in this checkout (hooks, permissions, instructions, tool servers); read them "
+                     "before you authorise:")
+        lines += [f"    {p}" for p in agent_cfg]
+    lines.append(f"  the change the floor judges, run {run} (staged {record.staged_commit}, base {record.base}):")
     for c in changes.entries:
         what = ("gitlink" if c.non_blob else "binary" if c.binary
                 else f"+{c.added} -{c.deleted}" + (" (new file)" if c.status == "A" else
@@ -435,6 +442,8 @@ def _change_view(store: JobStore, job: Job, run: int) -> tuple[list[str], list[s
                f"  change    {len(changes.entries)} file{'s' if len(changes.entries) != 1 else ''}, "
                + (f"{counted} changed lines" if counted is not None else "binary or gitlink entries")
                + f", landing tier {tier}"]
+    if agent_cfg:
+        summary.append(f"  AGENT SETTINGS CHANGED  {len(agent_cfg)} path{'s' if len(agent_cfg) != 1 else ''}, listed above")
     return [_safe(line) for line in lines], [_safe(line) for line in summary]
 
 
