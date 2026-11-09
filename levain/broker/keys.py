@@ -294,6 +294,10 @@ LINEAGE_ENVELOPE_BYTES = 48 * 1024
 #: H6-10: one refusal window per (session, reason) of a TICKETED session: its count kept in memory, ONE `refused` line
 #: written at its close (kill -9 loses at most one window's counts per (session, reason): a known edge, no money)
 REFUSED_ROW_S = 60.0
+#: DECISION (r1 F1, bound): the open refusal windows keys keeps at once. A parameterised name's `:<what>` can be the
+#: client's own field or tool name, so past this a NEW window folds into `(session, <the name without :<what>>)`: the
+#: reason and the count survive, the client-chosen suffix mints no window and no timer
+REFUSAL_WINDOWS_MAX = 1024
 #: DECISION: the wait before an envelope CONTROL refused, or did not answer, is sent again (the attach backoff's cap)
 LINEAGE_RETRY_S = 5.0
 
@@ -1117,6 +1121,7 @@ class Keys:
         #: CONTROL refused and the last FAILURE note (`lineage_status`)
         self.lineage_outbox_max = LINEAGE_OUTBOX_MAX
         self.refused_row_s = REFUSED_ROW_S
+        self.refusal_windows_max = REFUSAL_WINDOWS_MAX
         self.lineage_retry_s = LINEAGE_RETRY_S
         self._refusals: Dict[Tuple[str, str], list] = {}
         self._lineage_wake: Optional[asyncio.Event] = None
@@ -1795,10 +1800,13 @@ class Keys:
     def _note_refusal(self, session: str, run: Optional[dict], name: str) -> None:
         """One refusal of a TICKETED `Q` made before any hold (so no hold row records it): counted in its (session,
         reason) window (H6-10), whose ONE `refused` line is written at its close, `refused_row_s` after its first
-        refusal. An interactive session's refusal writes none (Q9)."""
+        refusal. An interactive session's refusal writes none (Q9). With `refusal_windows_max` windows open, a name
+        with no window of its own is counted in its session's window for the bare reason (r1 F1)."""
         if run is None or self.ledger is None or self.closing:
             return
         key = (session, name)
+        if key not in self._refusals and len(self._refusals) >= self.refusal_windows_max:
+            key = (session, name.partition(":")[0])
         w = self._refusals.get(key)
         if w is None:
             w = self._refusals[key] = [time.time(), 0, run, None]
