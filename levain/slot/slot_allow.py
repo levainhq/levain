@@ -25,6 +25,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence, Tuple
 
+from levain import unshowable
+
 FORMAT = "levain-slot-allow/1"
 FILE_NAME = "slot-allow.json"
 PENDING_NAME = "slot-allow-pending.json"
@@ -51,6 +53,8 @@ class AllowRefused(ValueError):
 def shape_ok(rule: Any) -> bool:
     """Whether ``rule`` is a shape the dialog writes."""
     if type(rule) is not str or len(rule) > RULE_MAX:
+        return False
+    if unshowable.first_hidden(rule) is not None:       # a rule that renders other than its bytes is a lie on the band
         return False
     if rule == "WebSearch" or _WEBFETCH.fullmatch(rule):
         return True

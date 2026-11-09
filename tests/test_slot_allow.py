@@ -43,6 +43,15 @@ def test_only_dialog_shapes_are_offered_and_the_rest_named():
     assert dropped == ["Bash(*)", "Bash", "Read(./x)", "Bash(a\nb)"]
 
 
+def test_a_rule_with_a_hidden_character_is_not_a_shape_and_never_offered():
+    for rule in ("Bash(npm test \u202e*)", "Bash(npm\u200b test *)", "Bash(n\u2066pm *)", "WebFetch(domain:a\u200bb.com)",
+                 "WebSearch\u200b"):
+        assert not SA.shape_ok(rule), repr(rule)
+    assert SA.shape_ok("Bash(npm test *)")
+    kept, dropped = SA.parse_local_allow(local("Bash(npm test *)", "Bash(npm test \u202e*)"))
+    assert kept == ["Bash(npm test *)"] and len(dropped) == 1
+
+
 def test_a_duplicate_key_or_wrong_shape_is_refused_whole():
     with pytest.raises(SA.AllowRefused):
         SA.parse_local_allow(b'{"permissions": {"allow": ["WebSearch"]}, "permissions": {}}')
