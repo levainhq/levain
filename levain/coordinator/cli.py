@@ -2496,7 +2496,7 @@ def add_parsers(subparsers: argparse._SubParsersAction) -> None:
                     "`coord report` queues into, unless --queue-dir names one; never the consent directory by default.")
     cis.add_argument("path", type=Path, metavar="PATH")
     cis.add_argument("--repo", default="levain", help="The repo the rows belong to.")
-    cis.add_argument("--token", type=int, default=None, help="The live coordinator lease's token (required).")
+    cis.add_argument("--token", type=int, required=True, help="The live coordinator lease's token.")
     common(cis)
     cis.set_defaults(func=run_coord)
     door_ok(cis)

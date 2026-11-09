@@ -137,9 +137,11 @@ def test_item_facts_round_trip_and_an_old_store_migrates(tmp_path, monkeypatch):
         with store._write("coordinator", token, create=False) as (conn, now):
             ready.record_landed(conn, now, token, "levain:old", "abc", "main", by="coordinator", why="x")
     ln = store.launch_request(token, harness="claude", role="coordinator")
-    _report(old_dir, "r-att", item_id="levain:old", worker=ln.launch_id, launch_id=ln.launch_id)
+    assert store.launch_activate(ln.launch_id, harness_session_id="sess-L")[1] is None   # a landed needs it (R3-B)
+    _report(old_dir, "r-att", item_id="levain:old", worker=ln.launch_id, launch_id=ln.launch_id,
+            harness_session_id="sess-L")
     _report(old_dir, "r-land", item_id="levain:old", worker=ln.launch_id, launch_id=ln.launch_id, event="landed",
-            sha=SHA, branch="seat/x")
+            sha=SHA, branch="seat/x", harness_session_id="sess-L")
     svc, stoken = _svc(old_dir, store, token)
     got = work_attach.apply_reports(svc, stoken, live_sessions=frozenset())
     assert got.applied == ["r-att", "r-land"] and got.refused == []
@@ -152,9 +154,12 @@ def test_item_facts_round_trip_and_an_old_store_migrates(tmp_path, monkeypatch):
 # (d) apply_reports is idempotent on report_id; an unreadable listing defers a session-only report, never refuses it
 def test_apply_is_idempotent_and_defers_on_an_unreadable_listing(board, coord):
     store, token, launch_id = coord
-    _report(board, "r1", worker=launch_id, launch_id=launch_id)
-    _report(board, "r2", event="progress", worker=launch_id, launch_id=launch_id, why="halfway")
-    _report(board, "r-gone", item_id="levain:nowhere", worker=launch_id, launch_id=launch_id)
+    assert store.launch_activate(launch_id, harness_session_id="sess-L")[1] is None     # a progress needs it (R3-B)
+    _report(board, "r1", worker=launch_id, launch_id=launch_id, harness_session_id="sess-L")
+    _report(board, "r2", event="progress", worker=launch_id, launch_id=launch_id, why="halfway",
+            harness_session_id="sess-L")
+    _report(board, "r-gone", item_id="levain:nowhere", worker=launch_id, launch_id=launch_id,
+            harness_session_id="sess-L")
     _report(board, "r-sess", worker="other", harness_session_id="s-1", item_id="levain:b")
     ready.add(store, token, "levain:b", repo="levain", title="item b", who="desk", why="seed", to="ready")
     svc, token = _svc(board, store, token)
@@ -290,7 +295,8 @@ def test_l1_an_empty_report_id_is_refused_at_the_door_and_a_planted_one_never_we
     with pytest.raises(CoordError, match="report_id"):
         work_attach.queue_report(board, report_id="", item_id="levain:a", worker="w", worker_kind="seat",
                                  event="attach", at=_now())
-    _report(board, "r-1", worker=launch_id, launch_id=launch_id)
+    assert store.launch_activate(launch_id, harness_session_id="sess-L")[1] is None     # a progress needs it (R3-B)
+    _report(board, "r-1", worker=launch_id, launch_id=launch_id, harness_session_id="sess-L")
     q = sqlite3.connect(board / "reports.db")                  # a seat-writable file: plant what the door refuses
     try:
         q.execute("INSERT INTO reports (report_id, item_id, worker, worker_kind, event, at) VALUES "
@@ -300,7 +306,7 @@ def test_l1_an_empty_report_id_is_refused_at_the_door_and_a_planted_one_never_we
         q.commit()
     finally:
         q.close()
-    _report(board, "r-4", worker=launch_id, launch_id=launch_id, event="progress")
+    _report(board, "r-4", worker=launch_id, launch_id=launch_id, event="progress", harness_session_id="sess-L")
     svc, stoken = _svc(board, store, token)
     got = work_attach.apply_reports(svc, stoken, live_sessions=frozenset())
     assert got.applied == ["r-1", "r-4"] and got.faults == []

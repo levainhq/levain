@@ -121,10 +121,12 @@ def test_spawn_item_records_the_attach_with_the_launch(board, coord, registry): 
                            slots={"topic": "x"}, agent_store=registry, item="levain:a")
     assert _rows(board, "SELECT item_id, kind, worker, worker_kind, launch_id, by, lease_token FROM worker_attach") == [
         ("levain:a", "attach", ln.launch_id, "launch", ln.launch_id, "coordinator", token)]
-    # the launch is a real worker for the item: its own progress report applies
+    # the launch, once running in its session, is a real worker for the item: its own progress report applies (a
+    # pending one is refused: row 156 L3 R3-B)
+    assert store.launch_activate(ln.launch_id, harness_session_id="sess-W")[1] is None
     work_attach.enqueue_report(board, report_id="r-prog", item_id="levain:a", worker=ln.launch_id,
                                worker_kind="launch", event="progress", at="2026-11-08T12:00:00Z",
-                               launch_id=ln.launch_id)
+                               launch_id=ln.launch_id, harness_session_id="sess-W")
     svc, stoken = _svc(board, store, token)
     got = work_attach.apply_reports(svc, stoken, live_sessions=frozenset())
     assert got.applied == ["r-prog"]

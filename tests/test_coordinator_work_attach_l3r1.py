@@ -244,10 +244,13 @@ def test_x6_watch_once_passes_its_every_and_every_is_checked_in_both_modes(tmp_p
 def test_x7_a_pass_reads_only_the_reports_not_yet_applied_or_refused(clocked):
     board, clock, store, token = clocked
     ln = store.launch_request(token, harness="claude", role="coordinator")
+    assert store.launch_activate(ln.launch_id, harness_session_id="sess-L")[1] is None   # a progress needs it (R3-B)
     _free(store, token)
-    _q(board, "r-1", clock.iso(), worker=ln.launch_id, launch_id=ln.launch_id)
-    _q(board, "r-2", clock.iso(), worker=ln.launch_id, launch_id=ln.launch_id, event="progress")
-    _q(board, "r-gone", clock.iso(), item_id="levain:nowhere", worker=ln.launch_id, launch_id=ln.launch_id)
+    _q(board, "r-1", clock.iso(), worker=ln.launch_id, launch_id=ln.launch_id, harness_session_id="sess-L")
+    _q(board, "r-2", clock.iso(), worker=ln.launch_id, launch_id=ln.launch_id, event="progress",
+       harness_session_id="sess-L")
+    _q(board, "r-gone", clock.iso(), item_id="levain:nowhere", worker=ln.launch_id, launch_id=ln.launch_id,
+       harness_session_id="sess-L")
     _q(board, "r-wait", clock.iso(), worker="seat-w", harness_session_id="sess-w", item_id="levain:b")
     q = sqlite3.connect(board / "reports.db")                  # a row the door refuses, refused as bad-seq-<seq>
     try:

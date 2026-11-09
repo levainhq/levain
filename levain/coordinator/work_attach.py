@@ -24,7 +24,7 @@ holds, never on the worker name a report carries:
   launch's: its ``worker`` must be the launch's recorded worker (the worker of the launch's attach, else the launch id),
   and, once the launch's ``active`` row records its session, the report must come from that session; else it is
   refused ``worker-mismatch``. It is recorded as that launch, kind ``launch``, whatever kind it names. An ``attach``
-  also needs the launch pending or active.
+  also needs the launch pending or active; every other event needs it active with its session recorded (L3 R3-B).
 * Any other report rests on its session (a flow seat). The FIRST accepted attach binds worker and session while that
   attach holds its item: a later report naming that worker from another session, or that session under another name,
   is refused ``worker-mismatch``. Its later events keep the kind its attach was recorded with (else ``kind-mismatch``),
@@ -169,9 +169,29 @@ _REPORT_COLS = ("report_id", "item_id", "worker", "worker_kind", "event", "launc
 def board_store_dir(environ: Mapping[str, str] | None = None) -> Path:
     """``<levain home>/board``: the board store's directory, derived from the Levain home the way the consent directory
     is (``$LEVAIN_HOME`` if set, else ``~/.levain``), and never the consent directory itself."""
+    return live_consent_dir(environ).parent / "board"
+
+
+def live_consent_dir(environ: Mapping[str, str] | None = None) -> Path:
+    """``<levain home>/consent``, the live consent store's directory, as :func:`board_store_dir` derives the home."""
     from levain.consent.queue import queue_dir_for
 
-    return queue_dir_for(os.environ if environ is None else environ).parent / "board"
+    return queue_dir_for(os.environ if environ is None else environ)
+
+
+def is_live_consent(directory: Path | str, environ: Mapping[str, str] | None = None) -> bool:
+    """True when ``directory`` resolves to the live consent store's directory: never a board, whatever it holds."""
+    return os.path.realpath(directory) == os.path.realpath(live_consent_dir(environ))
+
+
+def watch_board(watched: Path | str, environ: Mapping[str, str] | None = None) -> Path:
+    """The board a ``coord watch`` over the store in ``watched`` applies reports in (row 156 L3 R3-A), named positively:
+    the home's board (:func:`board_store_dir`) when ``watched`` is the live consent store (the default watch, or its
+    ``--queue-dir`` spelled out), else ``watched`` itself, the directory the watch was started with. Nothing about the
+    directory's contents decides it, so a queue file planted in the consent store never makes it a board."""
+    if is_live_consent(watched, environ):
+        return board_store_dir(environ)
+    return Path(os.path.realpath(watched))
 
 
 def reports_path(directory: Path | str) -> Path:
@@ -196,6 +216,9 @@ def enqueue_report(directory: Path | str, *, report_id: str, item_id: str, worke
     d = Path(directory)
     if not d.is_dir():
         raise CoordError(f"no board store directory at {d}; no report was queued")
+    if is_live_consent(d):
+        raise CoordError(f"{d} is the live consent store, never a board; no report was queued (the board is "
+                         f"{board_store_dir()})")
     conn = open_durable(reports_path(d))
     try:
         conn.execute("BEGIN IMMEDIATE")
@@ -507,6 +530,13 @@ def _evidence(conn: sqlite3.Connection, now: str, r: Mapping[str, Any], live: Co
             raise _Refused("worker-mismatch", f"launch {ln.launch_id} reports as {expect}, not as {r['worker']}")
         if r["event"] == "attach" and ln.state not in ("pending", "active"):
             raise _Refused("worker-not-a-launch", f"launch {ln.launch_id} is {ln.state}; an attach needs one that runs")
+        # every other event needs the launch running in a recorded session it came from (row 156 L3 R3-B): a launch
+        # that never activated has no session to check a report against
+        if r["event"] != "attach" and (ln.state != "active" or ln.harness_session_id is None):
+            raise _Refused("worker-not-a-launch", f"launch {ln.launch_id} is {ln.state} with "
+                                                  f"{'a' if ln.harness_session_id else 'no'} recorded session; a "
+                                                  f"{r['event']} report needs an active launch reporting from its "
+                                                  "own session")
         return "real", ln
     if sid is None:
         raise _Refused("worker-not-a-launch", "the report names no launch of this store and no session")
@@ -713,6 +743,8 @@ def watch_apply(board: Path | str | None = None, *, sessions: Any = None, every:
     from levain.coordinator import lease as _lease
 
     directory = Path(board) if board is not None else board_store_dir()
+    if is_live_consent(directory):
+        return [f"board reports: not applied, {directory} is the live consent store and never a board"]
     if not (directory / "dispatch.db").exists() or not reports_path(directory).exists():
         return []
     try:

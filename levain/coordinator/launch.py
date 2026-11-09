@@ -1283,7 +1283,8 @@ def watch_once(store: CoordStore, *, every: float | None = None) -> list[str]:
       (g) the launch slots (P6-3b, :func:`levain.coordinator.launch_slots.sweep`): the slot of every launch that is over
           is released and the lease of every other is renewed, on every pass, after (f).
       (h) the board's queued worker reports are applied as the ``service`` (:func:`_apply_board_reports`), on every
-          pass, after (g): the board beside THIS store's directory, never another home's. ``every`` is the watch's
+          pass, after (g): the home's board when THIS store is the live consent store, else THIS store's own
+          directory; never the live consent store, never another home's. ``every`` is the watch's
           pass interval (the board judges a report's session against it).
 
     Any other row in the list is never read further. When the list cannot be read, (b)-(d) do nothing: an unread list
@@ -1949,20 +1950,15 @@ def watch(store: CoordStore, *, every: float, emit: Callable[[str], None] = prin
 
 def _apply_board_reports(store: CoordStore | None = None, every: float | None = None) -> list[str]:
     """The watch's board pass (:func:`levain.coordinator.work_attach.watch_apply`): queued worker reports are applied as
-    the ``service``, facts only. The board is the watched store's own directory when that is a board store (its
-    ``reports.db`` exists, whatever the directory is called: row 156 L3 X2), else ``board`` beside it (``<levain
-    home>/board`` for the default ``<levain home>/consent``, the scratch home's own for a scratch store), so a watch
-    never reaches a home it was not given (row 156 L2 F15). Silent, and a no-op, when that board has no queue. Never
-    raises."""
+    the ``service``, facts only, in the board :func:`levain.coordinator.work_attach.watch_board` names for the watched
+    store's directory: ``<levain home>/board`` when that directory is the live consent store, else the directory the
+    watch was started with (``--queue-dir``). Never the live consent store, and never a directory beside the watched
+    one, so a watch never reaches a home it was not given (row 156 L2 F15, L3 R3-A). Silent, and a no-op, when that
+    board has no queue. Never raises."""
     try:
         from levain.coordinator import work_attach
 
-        if store is None:
-            board = None
-        elif work_attach.reports_path(store.directory).exists():
-            board = Path(store.directory)
-        else:
-            board = Path(store.directory).parent / "board"
+        board = None if store is None else work_attach.watch_board(store.directory)
         return work_attach.watch_apply(board, every=work_attach.PASS_INTERVAL_S if every is None else every)
     except Exception as exc:    # noqa: BLE001 - the watch's pass goes on whatever this does
         return [f"board reports: not applied this pass ({exc})"]

@@ -155,8 +155,9 @@ def test_cli_import_status_exits_1_and_writes_nothing_without_the_live_lease(tmp
     path = _file(tmp_path, [_row(1, "First item")])
     code, out, err = _cli(qdir, capsys, str(path), "--token", str(token + 1))
     assert (code, out) == (1, "") and "not held" in err
-    code, _, _ = _cli(qdir, capsys, str(path))
-    assert code == 1
+    with pytest.raises(SystemExit) as no_token:                  # --token is required (row 156 L3 R3-C)
+        _cli(qdir, capsys, str(path))
+    assert no_token.value.code == 2
     assert ready.journal(store) == []
 
 
