@@ -306,7 +306,6 @@ def test_listfix2_one_pill_one_listener_and_known_origins_only(tmp_path: Path) -
         out = _drive(tmp_path, f"{url}/", [
             {"emulate": {"w": 390, "h": 844, "dpr": 3, "mobile": True}},
             {"init": _MQ_SPY},
-            {"eval": "localStorage.setItem('levain.tray.showHeld', '1'); 1"},
             *_reload(),
             {"until": f"{TRAY} && {TRAY}.querySelectorAll('.sp-results .row[data-surface=band]').length > 1 && 1"},
             # the registry must know "levain" and that row must have drawn its pill before the probe reads it
@@ -429,9 +428,8 @@ _CARD_PROBE = f"""(() => {{
   const T = {TRAY};
   const rows = [...T.querySelectorAll('.sp-results .row')].filter(r => r.style.display !== 'none' && r.getClientRects().length);
   const text = (r) => (r.querySelector('.clause') || {{}}).textContent || '';
-  const foot = [...T.querySelectorAll('.more-foot, .held-toggle, .held-line, .xmore')].filter(n => !n.hidden && n.getClientRects().length);
+  const foot = [...T.querySelectorAll('.more-foot, .xmore')].filter(n => !n.hidden && n.getClientRects().length);
   return JSON.stringify({{shown: rows.map(text), more: foot.map(n => n.className + ' | ' + n.textContent.trim()),
-    heldToggles: T.querySelectorAll('[data-held-toggle]').length,
     chips: [...T.querySelectorAll('.list-surface-chip')].map(c => c.textContent),
     head: (T.querySelector('.ck-count') || {{}}).textContent}});
 }})()"""
@@ -442,7 +440,6 @@ _FOCUS_PROBE = """(() => {
   const group = (title) => { const h = [...mb.querySelectorAll('.grp-head')].find(x => x.textContent.trim().startsWith(title));
     const col = h && h.parentElement; return col ? [...col.querySelectorAll('.row .clause')].map(c => c.textContent.slice(0, 20)) : null; };
   return JSON.stringify({heads, desk: group('Desk owes'), later: group('Later'), needs: group('Needs you'),
-    held: [...mb.querySelectorAll('.row[data-held="1"]')].length, toggles: mb.querySelectorAll('[data-held-toggle], .held-toggle').length,
     chips: [...mb.querySelectorAll('.list-surface-chip')].map(c => c.textContent),
     title: document.querySelector('#levain-modal-title').textContent});
 })()"""
@@ -472,7 +469,6 @@ def test_r4_the_card_holds_due_rows_and_one_control_and_the_focus_view_every_gro
     with _serve(src, write_token=TOKEN, surface_tokens={"browser": TOKEN}, install_class="reported") as (url, _httpd):
         out = _drive(tmp_path, f"{url}/", [
             {"emulate": {"w": 390, "h": 844, "dpr": 3, "mobile": True}},
-            {"eval": "localStorage.removeItem('levain.tray.showHeld'); 1"},
             *_reload(),
             {"until": f"{TRAY} && {TRAY}.querySelectorAll('.sp-results .row[data-surface=band]').length > 0 && 1"},
             {"eval": "new Promise(r => setTimeout(() => r(1), 900))"},
@@ -493,13 +489,12 @@ def test_r4_the_card_holds_due_rows_and_one_control_and_the_focus_view_every_gro
     assert not any(h.startswith(("Desk owes", "Later")) for h in band["heads"]), band
     assert not any((t.startswith("desk:") and not t.startswith("desk: carried")) or t.startswith("levain: TUE") for t in card["shown"]), card   # not the operator's, not due
     assert any(t.startswith("desk: carried") for t in card["shown"]), card      # a CARRIED desk row is needs-you, as flow's footer lists it
-    assert len(card["more"]) == 1 and card["heldToggles"] == 0, card                                    # ONE control, no held toggle
+    assert len(card["more"]) == 1, card                                                                  # ONE control
     assert "desk owes 2" in card["more"][0] and "later 2" in card["more"][0] and "held" not in card["more"][0], card   # the band's later row and the dated seed: one word
     assert focus["desk"] and focus["desk"][0].startswith("desk:"), focus                                 # the desk's row under its heading
     assert focus["later"] and focus["later"][0].startswith("levain: TUE"), focus                         # the later row under LATER
     assert focus["needs"] and not any(t.startswith(("levain: TUE", "desk: Write")) for t in focus["needs"]), focus
     assert any(t.startswith("desk: carried") for t in focus["needs"]), focus                             # the carried one is under Needs you
-    assert focus["held"] == 0 and focus["toggles"] == 0, focus                                           # held rows are in no group and no "all": their own chip
     # ONE rule for "all": each view's header and its "all" chip agree, the focus view's follows from the card's (+ the desk's and the
     # later rows the card names in its control), and held rows stand apart in their own chip
     num = lambda chips, word: next((int(c.rsplit(" ", 1)[1]) for c in chips if c.startswith(word + " ")), None)
@@ -590,8 +585,8 @@ def test_listpanel_r5_a_card_with_only_desk_and_later_rows_says_nothing_is_due_a
             {"eval": "new Promise(r => setTimeout(() => r(1), 700))"},
             {"eval": _CTL_PROBE},
             {"eval": type_q("BJE")},
-            {"eval": f"[{TRAY}.querySelector('.sp-results .empty').textContent, !!{TRAY}.querySelector('[data-held-show-matches]')]"},
-            {"eval": f"{TRAY}.querySelector('[data-held-show-matches]').click(); 1"},
+            {"eval": f"[{TRAY}.querySelector('.sp-results .empty').textContent, !!{TRAY}.querySelector('[data-list-open-matches]')]"},
+            {"eval": f"{TRAY}.querySelector('[data-list-open-matches]').click(); 1"},
             {"until": "document.querySelector('#levain-modal .modal-body .sp-results .row') && 1"},
             {"eval": "[...document.querySelectorAll('#levain-modal .sp-results .row .clause')].map(c => c.textContent.slice(0, 18))"},
         ])

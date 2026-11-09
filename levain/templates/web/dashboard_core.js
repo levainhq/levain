@@ -161,13 +161,6 @@
   // The List's time filter ("" = every time-state, else now | later | someday | done): it cuts across the type chips above.
   let listTime = "";
   const intakeKept = { receipt: null, draft: "" };   // receipt: { text, cls } | null
-  // Whether the Tray lists the rows held until their surface date. Per viewer and per browser: it is a display
-  // choice, so it lives in localStorage (which may be absent or throw) and never on the server. Default hidden.
-  const HELD_KEY = "levain.tray.showHeld";
-  let trayHeldShown = false;
-  try { trayHeldShown = window.localStorage.getItem(HELD_KEY) === "1"; } catch (e) { trayHeldShown = false; }
-  const heldMounts = new Set();   // each mounted Tray's toggle and its redraw
-  const saveHeldShown = () => { try { window.localStorage.setItem(HELD_KEY, trayHeldShown ? "1" : "0"); } catch (e) { /* the choice then lasts this page only */ } };
   const MONTHS = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
   // "2026-10-22" -> "Oct 22", from the digits alone (a Date would shift the day by the zone)
   const surfaceLabel = (due) => {
@@ -478,8 +471,7 @@
     const apartNow = listApart(panel);
     if (!(body.scrollHeight > body.clientHeight + 1)) return apartNow ? listMore(panel, 0, apartNow) : false;
     const top = body.getBoundingClientRect().top;
-    const heldLine = body.querySelector(":scope > .held-line, .held-line");
-    const limit = body.clientHeight - 34 - (heldLine ? heldLine.offsetHeight : 0);   // room kept for the link and the held-back line
+    const limit = body.clientHeight - 34;   // room kept for the link
     const isRow = (n) => n.matches(FOLD_ROW), isHead = (n) => n.matches(FOLD_HEAD);
     const items = Array.prototype.filter.call(body.querySelectorAll(FOLD_ROW + ", " + FOLD_HEAD), (n) => !n.parentElement.closest(FOLD_ROW));
     // where bands sit side by side (Morning's Tray: Overdue | Today) each column has its own fold, since a column that overflows says
@@ -2138,7 +2130,7 @@
       host.appendChild(tagEl("muted", "done " + (s.done_kind ? s.done_kind + " " : "") + shortDate(s.done_on || "")));
       return row;
     }
-    if (s.surface && !s.held) {
+    if (s.surface) {
       // the kernel computed `overdue` and `fires`; this only says so
       if (s.wake_line) {
         const wk = tagEl("muted", s.wake_line);
@@ -2157,12 +2149,7 @@
       if (verbs && s.id) appendRowVerbs(row, buildSporeVerbs(s, panelKind), panelKind === "tray" ? ["Resolve", "Snooze"] : null, panelKind === "tray" ? 2 : 0);
       return row;
     }
-    if (s.held) {
-      row.dataset.held = "1";
-      const sf = tagEl("muted", "surfaces " + surfaceLabel(s.next));
-      sf.setAttribute("data-ck-tag-state", "held");
-      host.appendChild(sf);
-    } else if (s.next) {
+    if (s.next) {
       // a late row says how late ("overdue 4 d") and keeps its date ("due 10-17"); a row due today says so
       const late = daysLate(s.next, s.today);
       if (late > 0) {
@@ -2252,33 +2239,28 @@
     // Tray its own source, give each its own error key here. [complement L3 LOW]
     const err = tierErr(view, "open_spores");
     if (err) { p.appendChild(el("p", "err", "unavailable — " + err)); return p; }
-    // the Tray's rows held until their surface date: listed only when the viewer asks, under the due rows
-    const held = entry.kind === "tray" && Array.isArray(view.tray_held) ? view.tray_held : [];
-    if ((!list || list.length === 0) && held.length === 0) { p.appendChild(el("p", "empty", emptyMsg)); return p; }
+    if (!list || list.length === 0) { p.appendChild(el("p", "empty", emptyMsg)); return p; }
     const verbs = isVerbPanel(entry);
     // the Tray's views: the kernel names each ordering and sends the row ids in it; this only picks one
     const views = entry.kind === "tray" && Array.isArray(view.tray_views) && view.tray_view_rows ? view.tray_views : [];
     const viewOf = () => (views.some((v) => v.id === trayView) ? trayView : "");
-    const heldLine = held.length && view.tray_held_line && typeof view.tray_held_line === "object" ? view.tray_held_line : null;
     // the List: rows that carry a `surface` get the surface filter (the kernel names the stores; the page only filters by them)
     const isList = entry.kind === "tray" && view.tray_is_list === true;   // the panel offers list_intake: a marker, never the rows' contents
     // The List's card holds what is due for the operator and what else fits; everything else it holds (the desk's rows, the rows
-    // that come back on a later day, the rows held until their date) is listed in the focus view, under its own heading, and the
-    // card names them in ONE control that opens it. So the card draws neither a held row nor a held toggle.
+    // that come back on a later day) is listed in the focus view, under its own heading, and the
+    // card names them in ONE control that opens it.
     const inCard = isList && !(ropts && ropts.modal);
     const apart = (s) => s.group === "desk" || s.group === "later" || s.group === "done";
     const cardHides = (s) => inCard && apart(s);
-    // read live: the plain Tray's toggle flips trayHeldShown and redraws without rebuilding this closure
-    const heldShownNow = () => (isList ? !inCard : trayHeldShown);
     // what the card leaves to the focus view, counted as flow's footer counts it: DESK OWES is every desk row, a carried one too
     // (it is also listed under Needs you); LATER the rows that come back on a later day
     const apartCount = { desk: (list || []).filter((s) => s.band_section === "desk").length,
-                         later: (list || []).filter((s) => s.group === "later").length + (heldLine ? heldLine.count : 0),
+                         later: (list || []).filter((s) => s.group === "later").length,
                          done: (list || []).filter((s) => s.group === "done").length };
     const cardHasApart = inCard && (apartCount.desk > 0 || apartCount.later > 0 || apartCount.done > 0);
     // ONE rule for "all", in the card and the focus view: the rows in this view's own list (the card's without the desk's and the
-    // later ones it names in its control, the focus view's with them). Held rows are never in it, nor in a surface chip: they have
-    // their own "held" chip. So the header, the "all" chip and the control's numbers follow from each other.
+    // later ones it names in its control, the focus view's with them). So the header, the "all" chip and the control's numbers
+    // follow from each other.
     const listAll = () => (list || []).filter((s) => !cardHides(s));
     const withCarriedDesk = (rows) => {
       const copies = rows.filter((s) => s.group === "band" && s.band_section === "desk" && s.carried)
@@ -2287,75 +2269,43 @@
       const at = rows.findIndex((s) => s.group !== "band");     // Desk owes follows Needs you, ahead of the rows already in it
       return at < 0 ? rows.concat(copies) : rows.slice(0, at).concat(copies, rows.slice(at));
     };
-    const heldChosen = () => isList && !inCard && listSurface === "held" && !!heldLine;   // the card names its held rows in its control, never draws them
     // the time-state a row is in, as the kernel computed it; the focus view's time chips filter by it, across the type chips
     const timeOf = (s) => s.time_state || "now";
     const timeNow = () => (isList && !inCard && LIST_TIMES.indexOf(listTime) >= 0 ? listTime : "");
     const inTime = (s) => !timeNow() || timeOf(s) === timeNow();
-    const listNow = () => (heldChosen() ? "held" : isList && listAll().some((s) => s.surface === listSurface) ? listSurface : "");
-    const inSurface = (s) => !listNow() || listNow() === "held" || s.surface === listNow();
+    const listNow = () => (isList && listAll().some((s) => s.surface === listSurface) ? listSurface : "");
+    const inSurface = (s) => !listNow() || s.surface === listNow();
     if (isList && !inCard) p.dataset.listTotal = String(listAll().length);   // the focus view's header counts what its "all" chip counts
     let chipRow = null;     // the chips' row, drawn by controls(); the panel's own element is empty once the focus view moves its body
-    const opts = views.length || heldLine || isList ? {
-      // a card whose due rows are all done still holds the desk's, the later and the held ones: it says nothing is due, not that it is empty
+    const opts = views.length || isList ? {
+      // a card whose due rows are all done still holds the desk's and the later ones: it says nothing is due, not that it is empty
       empty: cardHasApart ? "Nothing due for you." : emptyMsg,
-      extra: () => (isList ? (heldChosen() ? held : []) : heldLine && heldShownNow() ? held.filter(inSurface) : []),
       // the card's search also reads what the card leaves to the focus view, so a match there is told, never "no items match"
-      unlisted: () => (inCard ? (list || []).filter(cardHides).concat(heldLine ? held : []).filter(inSurface)
-                              : (heldLine && !isList && !heldShownNow() ? held.filter(inSurface) : isList && heldLine && !heldChosen() ? held.filter(inSurface) : [])),
+      unlisted: () => (inCard ? (list || []).filter(cardHides).filter(inSurface) : []),
       hintShow: (note, n) => {
-        note.appendChild(document.createTextNode(inCard ? " — " + n + (n === 1 ? " row matches in the full list — " : " rows match in the full list — ")
-                                                        : " — " + n + (n === 1 ? " held row matches — " : " held rows match — ")));
-        const go = el("button", "held-toggle");
+        note.appendChild(document.createTextNode(" — " + n + (n === 1 ? " row matches in the full list — " : " rows match in the full list — ")));
+        const go = el("button", "list-open-match");
         go.type = "button";
-        go.dataset.heldShowMatches = "1";
-        go.textContent = inCard ? "open it" : "show";
-        go.addEventListener("click", () => {
-          if (inCard) { const m = p.querySelector("[data-list-more]"); if (m) m.click(); return; }
-          if (isList) { const c = chipRow && chipRow.querySelector('[data-surface="held"]'); if (c) c.click(); return; }
-          const t = p.querySelector("[data-held-toggle]"); if (t) t.click();
-        });
+        go.dataset.listOpenMatches = "1";
+        go.textContent = "open it";
+        go.addEventListener("click", () => { const m = p.querySelector("[data-list-more]"); if (m) m.click(); });
         note.appendChild(go);
       },
       controls: (bar, redraw) => {
         if (isList) {
           const chooseSurface = (v) => { listSurface = v; redraw(); };
-          chipRow = buildSurfaceChips(listAll().filter(inTime), listNow, chooseSurface, 0, !!timeNow());
+          chipRow = buildSurfaceChips(listAll().filter(inTime), listNow, chooseSurface, !!timeNow());
           bar.after(chipRow);
           if (!inCard) {
             // the time chips; choosing one recounts the type chips beside it, so a chip's number stays the rows its tap shows
             const timeRow = buildTimeChips(listAll(), timeNow, (v) => {
               listTime = v;
-              const fresh = buildSurfaceChips(listAll().filter(inTime), listNow, chooseSurface, 0, !!timeNow());
+              const fresh = buildSurfaceChips(listAll().filter(inTime), listNow, chooseSurface, !!timeNow());
               chipRow.replaceWith(fresh); chipRow = fresh;
               redraw();
             });
             chipRow.before(timeRow);
           }
-        }
-        if (heldLine && !isList) {
-          const line = el("div", "ext-note held-line");
-          // the earliest surface date among the held rows: "1 held back until Dec 3"
-          const nexts = held.map((h) => String(h.next || "")).filter((d) => /^\d{4}-\d{2}-\d{2}/.test(d)).sort();
-          line.appendChild(el("span", null, nexts.length ? heldLine.count + " held back until " + surfaceLabel(nexts[0]) + " "
-            : heldLine.count + " held back — " + heldLine.reason + " "));
-          const tog = el("button", "held-toggle");
-          tog.type = "button";
-          tog.dataset.heldToggle = "1";
-          const label = () => { tog.textContent = trayHeldShown ? "hide" : "show"; tog.setAttribute("aria-expanded", trayHeldShown ? "true" : "false"); };
-          label();
-          // one state, every mounted Tray (the board's and the focus modal's) redraws on a change
-          const mine = { tog, sync: () => { label(); redraw(); } };
-          heldMounts.add(mine);
-          // drop the mounts a re-render replaced; after this task, so a Tray built but not yet attached stays
-          setTimeout(() => { for (const m of [...heldMounts]) if (!m.tog.isConnected) heldMounts.delete(m); }, 0);
-          tog.addEventListener("click", () => {
-            trayHeldShown = !trayHeldShown; saveHeldShown();
-            heldMounts.add(mine);   // a Tray attached after the prune ran still redraws itself
-            for (const m of [...heldMounts]) { if (m.tog.isConnected) m.sync(); else heldMounts.delete(m); }
-          });
-          line.appendChild(tog);
-          p.appendChild(line);   // at the foot of the list, as the mock draws it
         }
         if (!views.length) return;
         const sel = el("select", "tray-dump-type");
@@ -2368,7 +2318,7 @@
         bar.appendChild(sel);
       },
       pick: (rows) => {
-        const base = (listNow() === "held" ? [] : listNow() ? rows.filter((s) => s.surface === listNow() && inSurfaceChip(s, !!timeNow())) : rows).filter((s) => !cardHides(s)).filter(inTime);
+        const base = (listNow() ? rows.filter((s) => s.surface === listNow() && inSurfaceChip(s, !!timeNow())) : rows).filter((s) => !cardHides(s)).filter(inTime);
         const ids = views.length && viewOf() ? view.tray_view_rows[viewOf()] : null;
         // the focus view draws a carried desk row under Needs you AND under Desk owes, as flow's footer prints it, so the control's
         // "desk owes N" is the number of rows a person can see under that heading (a chosen view is ungrouped: no copy there)
@@ -2387,15 +2337,13 @@
     }
     mountSporeFilter(p, list || [], "items", entry.kind, (rows, results) => {
       let lastGroup = null;
-      let heldHead = false;
       let lastBucket = null;
       let box = results;
       for (const s of rows) {
-        if (s.held && !heldHead) { heldHead = true; box = results; results.appendChild(headingEl("Later")); }
         // a manifest source brings the kernel's own bands (Today / Overdue / Also pending), in its order;
         // a chosen view is ungrouped
         const g = s.group || null;
-        if (s.group_title && g !== lastGroup && !viewOf() && !s.held) {
+        if (s.group_title && g !== lastGroup && !viewOf()) {
           // each band is a column of its own where the page is wide (Morning's Tray: Overdue | Today); `display: contents` elsewhere
           box = entry.kind === "tray" ? results.appendChild(el("div", "grp-col")) : results;
           box.appendChild(headingEl(s.group_title));
@@ -2522,7 +2470,7 @@
     sync(current());
     return row;
   }
-  function buildSurfaceChips(list, current, choose, heldCount, timed) {
+  function buildSurfaceChips(list, current, choose, timed) {
     const row = el("div", "list-surfaces");
     row.setAttribute("role", "group");
     row.setAttribute("aria-label", "filter the List by where a row comes from");
@@ -3521,7 +3469,7 @@
     clearBtn.addEventListener("click", () => submit(""));  // explicit clear: key present, value ""
   }
 
-  // Shared inline-form scaffold for the per-row verbs (edit / reclassify / remove): hide the
+  // Shared inline-form scaffold for the per-row verbs: hide the
   // trigger buttons, mount a form, wire cancel + Escape (stopPropagation so it doesn't nuke an
   // enclosing focus-modal), and run `onConfirm` which returns the commit request (or null to
   // validate-fail with `msg`). One form per row at a time.
@@ -7079,7 +7027,7 @@
     if (host.dataset.sig === sig && !host.hidden) return;
     // the answered cards are drawn under a quiet label of their own; with nothing waiting that is all the strip holds
     // folded by default (Phill 11-02): a count under a label you click to open; the cards stay in the page, hidden, so the
-    // strip's signature and the settled-card tick are unchanged. Per viewer and per browser, like the Tray's held toggle.
+    // strip's signature and the settled-card tick are unchanged. Per viewer and per browser.
     const answeredSection = () => {
       const sec = el("div", "needs-answered");
       const toggle = el("button", "needs-answered-toggle");
