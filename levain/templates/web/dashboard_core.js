@@ -9361,10 +9361,54 @@
   }
   // A reload (the tab coming back, the refresh button, a stream reload) re-renders the whole board: emptying it
   // clamps the page's scroll to the top, so the reader's place is put back once the board is drawn again.
+  // A draw that is allowed while a text field in a redrawn region has focus (an idle field, an empty one) replaces that field:
+  // the keyboard would fall to <body>. So the field is known before the draw by the keys the page already finds rows by
+  // (the region id; data-ck-panel / data-panel-id, data-row-key / data-keep-key, data-question-n, data-id, data-drop-key; the field's own id),
+  // and its rebuilt twin takes the focus, the selection and the scroll back. A field with no twin is gone by design.
+  const FIELD_KEYS = ["data-ck-panel", "data-panel-id", "data-row-key", "data-keep-key", "data-question-n", "data-id", "data-drop-key"];
+  const isTextField = (a) => !!a && a.tagName && (a.tagName === "TEXTAREA" ||
+    (a.tagName === "INPUT" && !/^(button|submit|reset|checkbox|radio|file|image|range|color)$/i.test(a.type || "")));
+  const cssq = (s) => (window.CSS && CSS.escape ? CSS.escape(s) : String(s).replace(/[^\w-]/g, "\\$&"));
+  function captureField() {
+    const a = document.activeElement;
+    if (!isTextField(a) || !a.closest) return null;
+    const region = a.closest(FOCUS_REBUILT);
+    if (!region || !region.id) return null;
+    let sel = "";
+    if (a.id) sel = "#" + cssq(a.id);
+    else {
+      const path = [];
+      for (let n = a.parentElement; n && n !== region; n = n.parentElement) {
+        for (const k of FIELD_KEYS) {
+          const v = n.getAttribute && n.getAttribute(k);
+          if (v !== null && v !== undefined && v !== "") { path.unshift("[" + k + "=\"" + String(v).replace(/["\\]/g, "\\$&") + "\"]"); break; }
+        }
+      }
+      const cls = (a.className && typeof a.className === "string" ? a.className.trim().split(/\s+/) : []).map((c) => "." + cssq(c)).join("");
+      const tail = a.tagName.toLowerCase() + cls;
+      const scope = "#" + cssq(region.id) + (path.length ? " " + path.join(" ") : "");
+      const same = Array.from(region.querySelectorAll(path.length ? path.join(" ") + " " + tail : tail));
+      sel = scope + " " + tail;
+      return { sel, nth: same.indexOf(a), region: region.id, value: a.value, ss: a.selectionStart, se: a.selectionEnd, st: a.scrollTop, el: a };
+    }
+    return { sel, nth: 0, region: region.id, value: a.value, ss: a.selectionStart, se: a.selectionEnd, st: a.scrollTop, el: a };
+  }
+  function restoreField(f) {
+    if (!f || document.activeElement === f.el && f.el.isConnected) return;
+    let t = null;
+    try { const all = document.querySelectorAll(f.sel); t = all[Math.max(0, f.nth)] || (f.nth < 0 ? all[0] : null) || null; } catch (e) { t = null; }
+    if (!t || !isTextField(t)) return;
+    if (t.value === "" && f.value) t.value = f.value;
+    t.focus({ preventScroll: true });
+    try { if (f.ss !== null && f.ss !== undefined) t.setSelectionRange(f.ss, f.se); } catch (e) { /* a type with no selection */ }
+    if (f.st) t.scrollTop = f.st;
+  }
   function renderKeepingPlace(view, opts) {
     const y = window.scrollY || 0;
+    const field = captureField();
     try { return render(view, opts); }
     finally {
+      restoreField(field);
       if (y > 0 && window.scrollY !== y) window.scrollTo(window.scrollX, y);
       ckScheduleRefresh();   // what the draw left on screen (the tab, the jobs) decides which moves are live
     }

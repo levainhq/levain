@@ -176,3 +176,49 @@ def test_a_blur_during_a_press_does_not_redraw_under_the_click(tmp_path: Path) -
               {"until": REDRAWN}]
     vals = _run_steps(tmp_path, root, src, steps, churn=False)
     assert json.loads(vals[-3])["r"] == 0, vals
+
+
+IS_BOX = "document.activeElement.classList.contains('list-intake-input')"
+
+
+def _idle_then_type(tmp_path: Path, box: str, open_modal: bool) -> dict:
+    root, src, steps = _start(tmp_path, open_modal, box)
+    # the field is focused and empty; the draw is allowed once the idle window has passed, and then replaces it
+    steps += [{"eval": f"{box}.focus(); window.__redraws = 0; window.__t0 = Date.now(); 1"},
+              {"until": "Date.now() - window.__t0 > 11000 && window.__redraws > 0 && 1"},
+              *({"key": "a"} for _ in range(10)),
+              {"eval": f"JSON.stringify({{kept: {IS_BOX}, len: {box}.value.length, same: document.activeElement === {box}}})"}]
+    return json.loads(_run_steps(tmp_path, root, src, steps)[-1])
+
+
+@needs_browser
+def test_an_idle_empty_board_field_takes_its_keys_after_a_redraw(tmp_path: Path) -> None:
+    got = _idle_then_type(tmp_path, INPUT, open_modal=False)
+    assert got == {"kept": True, "len": 10, "same": True}, got
+
+
+@needs_browser
+def test_an_idle_empty_modal_field_takes_its_keys_after_a_redraw(tmp_path: Path) -> None:
+    got = _idle_then_type(tmp_path, MODAL_INPUT, open_modal=True)
+    assert got == {"kept": True, "len": 10, "same": True}, got
+
+
+def _selection_kept(tmp_path: Path, box: str, open_modal: bool) -> dict:
+    root, src, steps = _start(tmp_path, open_modal, box)
+    steps += [{"eval": f"const b = {box}; b.focus(); b.value = 'hello world'; b.setSelectionRange(3, 7); window.__old = b; 1"},
+              {"eval": "window.LevainDashboard.redraw(); 1"},
+              {"eval": f"JSON.stringify({{rebuilt: window.__old !== {box}, kept: {IS_BOX}, v: {box}.value, "
+                       f"s: {box}.selectionStart, e: {box}.selectionEnd}})"}]
+    return json.loads(_run_steps(tmp_path, root, src, steps, churn=False)[-1])
+
+
+@needs_browser
+def test_selection_mid_text_survives_a_board_redraw(tmp_path: Path) -> None:
+    got = _selection_kept(tmp_path, INPUT, open_modal=False)
+    assert got == {"rebuilt": True, "kept": True, "v": "hello world", "s": 3, "e": 7}, got
+
+
+@needs_browser
+def test_selection_mid_text_survives_a_modal_redraw(tmp_path: Path) -> None:
+    got = _selection_kept(tmp_path, MODAL_INPUT, open_modal=True)
+    assert got == {"rebuilt": True, "kept": True, "v": "hello world", "s": 3, "e": 7}, got
