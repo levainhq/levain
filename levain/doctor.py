@@ -1219,8 +1219,11 @@ def _check_slot_alarms(*, host: str | None = None, store: Path | None = None, no
     """The ``slot alarms`` row (row 166): what slot hooks reported through the queue broker's ALARM verb in the last
     :data:`SLOT_ALARM_WINDOW`, read from ``L/queue/requests/alarms.jsonl`` with the operator's own reader
     (:func:`levain.qbroker.operator.alarms`). WARN with the count and the latest when there are any (a slot session
-    tried something its hook blocked, such as changing its own settings); a plain line when there are none. No row
-    before the isolation install. ``now``: a test's seam."""
+    tried something its hook blocked, such as changing its own settings); a plain line when there are none. A slot past
+    its record budget adds "at least N more suppressed" (from the summary records the log carries for each
+    slot). A log this user may not read (not in ``levain-queue``) and a queue with no ``requests/`` yet are each
+    said in a plain line, never as "none". No row before the isolation install (no ``L/queue``). Known edge: a broker
+    that predates the ALARM verb refuses it, so its slots' alarms never reach this row. ``now``: a test's seam."""
     from datetime import datetime, timezone
 
     from levain.cockpit.consent import parse_stamp
@@ -1231,27 +1234,44 @@ def _check_slot_alarms(*, host: str | None = None, store: Path | None = None, no
     if host is None:
         host = "darwin" if sys.platform == "darwin" else "linux"
     store = store if store is not None else layout.STORE.get(host)
-    if store is None or not (store / "queue" / "requests").is_dir():
+    if store is None or not (store / "queue").is_dir():
         return []
+    if not (store / "queue" / "requests").is_dir():
+        return [CheckResult(name, True, "no alarm log exists yet (the queue broker has not made L/queue/requests)")]
     log_path = store / "queue" / "requests" / "alarms.jsonl"
     now = now if now is not None else datetime.now(timezone.utc)
     try:
-        recent = []
+        recent, suppressed = [], {}
         for rec in operator.alarms(store / "queue"):
             try:
                 at = parse_stamp(rec.get("at"))
             except Exception:  # noqa: BLE001 - a record without a readable time is shown, never dropped
                 at = now
-            if now - at <= SLOT_ALARM_WINDOW:
+            if now - at > SLOT_ALARM_WINDOW:
+                continue
+            if "suppressed" in rec:
+                suppressed[str(rec.get("slot"))] = rec["suppressed"]
+            else:
                 recent.append(rec)
+    except operator.OperatorError as exc:
+        if isinstance(exc.__cause__, PermissionError):
+            return [CheckResult(name, True, f"not readable by this user: add the operator to the levain-queue group "
+                                            f"to read {log_path}")]
+        return [CheckResult(name, True, f"could not be read (OperatorError: {exc})", f"Look at {log_path}.",
+                            warn=True)]
     except Exception as exc:  # noqa: BLE001 - a row that cannot be built is said, never a crash
         return [CheckResult(name, True, f"could not be read ({type(exc).__name__}: {exc})",
                             f"Look at {log_path}.", warn=True)]
-    if not recent:
+    more = sum(n for n in suppressed.values() if isinstance(n, int))
+    if not recent and not more:
         return [CheckResult(name, True, "none in the last 24 hours")]
-    last = recent[-1]
-    detail = (f"{len(recent)} in the last 24 hours; latest {last.get('at')}: {last.get('kind')} from session "
-              f"{last.get('session')} ({last.get('reason')})")
+    detail = f"{len(recent)} in the last 24 hours"
+    if recent:
+        last = recent[-1]
+        detail += (f"; latest {last.get('at')}: {last.get('kind')} from session {last.get('session')} "
+                   f"({last.get('reason')})")
+    if more:
+        detail += f"; at least {more} more suppressed"
     return [CheckResult(name, True, detail,
                         f"A slot session's hook blocked something and reported it. Every record is in {log_path}.",
                         warn=True)]

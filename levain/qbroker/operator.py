@@ -50,8 +50,8 @@ from levain.qbroker.broker import (ALARM_FORMAT, RUN_CALLS_KIND, RUN_DEADLINE_KI
 from levain.qbroker.receipts import Receipts, ReceiptsError
 from levain.qbroker.seam import answer_refusal
 from levain.qbroker.signers import SignersSnapshot
-from levain.qbroker.store import (ALARM_LOG, ANSWER_ROW_FORMAT, ROW_MAX, QueueStore, _parsed, _read_untrusted,
-                                  fsync_dir,
+from levain.qbroker.store import (ALARM_LOG, ALARM_LOG_MAX, ANSWER_ROW_FORMAT, ROW_MAX, QueueStore, _parsed,
+                                  _read_untrusted, fsync_dir,
                                   valid_request_id)
 
 __all__ = ["CLAIM_KEYS", "Listed", "OperatorError", "alarms", "answer_payload", "rows", "run_state", "write_answer"]
@@ -341,13 +341,14 @@ def _clear_squat_os(store: QueueStore, receipts: Receipts, row: Mapping[str, Any
 def alarms(root: Path | str) -> list[dict[str, Any]]:
     """Every alarm the broker recorded (the ALARM verb, :mod:`levain.qbroker.broker`), oldest first: the rolled log
     ``alarms.jsonl.1`` then ``alarms.jsonl``, a line that is not an alarm record skipped. Read-only. A queue that cannot
-    be opened, or a log that is there and unreadable (not a regular file, over its bound), is :class:`OperatorError`."""
+    be opened, or a log that is there and unreadable (not a regular file, over its bound), is :class:`OperatorError`,
+    raised from the error underneath (a :class:`PermissionError` when this user is not in ``levain-queue``)."""
     out: list[dict[str, Any]] = []
     try:
         store = QueueStore(root, create=False)
-        blobs = [_read_untrusted(store.requests / name) for name in (ALARM_LOG + ".1", ALARM_LOG)]
+        blobs = [_read_untrusted(store.requests / name, ALARM_LOG_MAX) for name in (ALARM_LOG + ".1", ALARM_LOG)]
     except (ValueError, OSError) as exc:
-        raise OperatorError(f"the slot alarms cannot be read ({exc})") from None
+        raise OperatorError(f"the slot alarms cannot be read ({exc})") from exc
     for data in blobs:
         for line in (data or b"").splitlines():
             try:
