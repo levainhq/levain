@@ -2269,21 +2269,38 @@
       const at = rows.findIndex((s) => s.group !== "band");     // Desk owes follows Needs you, ahead of the rows already in it
       return at < 0 ? rows.concat(copies) : rows.slice(0, at).concat(copies, rows.slice(at));
     };
-    // the rows the "all" tap draws: the focus view lists a carried desk row twice, so the "all" and time chips count through this too
-    const drawn = (rows) => (isList && !inCard ? withCarriedDesk(rows) : rows);
     // the time-state a row is in, as the kernel computed it; the focus view's time chips filter by it, across the type chips
     const timeOf = (s) => s.time_state || "now";
+    // the chosen named ordering: the ids the kernel sent for it, or null
+    const viewIds = () => { const ids = views.length && viewOf() ? view.tray_view_rows[viewOf()] : null; return Array.isArray(ids) ? ids : null; };
+    // THE rows of the List for a state, and the only place they are chosen: the projection (a carried desk row listed twice in the
+    // focus view, once in a chosen view, which is ungrouped), then the chosen view's order, then the type, then the time. The body
+    // draws rowsFor(state) and every chip's number is rowsFor(state with that chip).length, so a number is the rows its tap draws.
+    const rowsFor = (st) => {
+      let rows = listAll();
+      if (isList && !inCard && !st.view) rows = withCarriedDesk(rows);
+      if (st.view) {
+        const byId = new Map(rows.map((s) => [s.id, Object.assign({}, s, { age_shown: true })]));
+        const named = new Set(st.view);
+        rows = st.view.filter((id) => byId.has(id)).map((id) => byId.get(id))
+          .concat(rows.filter((s) => !named.has(s.id)).map((s) => byId.get(s.id)));
+      }
+      if (st.surface) rows = rows.filter((s) => s.surface === st.surface && inSurfaceChip(s));
+      if (st.time) rows = rows.filter((s) => timeOf(s) === st.time);
+      return rows;
+    };
     const timeNow = () => (isList && !inCard && LIST_TIMES.indexOf(listTime) >= 0 ? listTime : "");
-    const inTime = (s) => !timeNow() || timeOf(s) === timeNow();
-    const listNow = () => (isList && listAll().filter(inTime).some((s) => s.surface === listSurface) ? listSurface : "");
-    const inSurface = (s) => !listNow() || s.surface === listNow();
-    if (isList && !inCard) p.dataset.listTotal = String(drawn(listAll()).length);   // the focus view's header counts what its "all" chip counts
+    // a type chosen earlier that the chosen time and view have no rows in is no choice at all
+    const listNow = () => (isList && rowsFor({ surface: listSurface, time: timeNow(), view: viewIds() }).length > 0 ? listSurface : "");
+    const stateNow = () => ({ surface: listNow(), time: timeNow(), view: viewIds() });
+    if (isList && !inCard) p.dataset.listTotal = String(rowsFor({ surface: "", time: "", view: null }).length);   // the focus view's header is the unfiltered List
+    let rebuildChips = null;   // a chosen view changes every chip's number: the chips are rebuilt with it
     let chipRow = null;     // the chips' row, drawn by controls(); the panel's own element is empty once the focus view moves its body
     const opts = views.length || isList ? {
       // a card whose due rows are all done still holds the desk's and the later ones: it says nothing is due, not that it is empty
       empty: cardHasApart ? "Nothing due for you." : emptyMsg,
       // the card's search also reads what the card leaves to the focus view, so a match there is told, never "no items match"
-      unlisted: () => (inCard ? (list || []).filter(cardHides).filter(inSurface) : []),
+      unlisted: () => (inCard ? (list || []).filter(cardHides).filter((s) => !listNow() || s.surface === listNow()) : []),
       hintShow: (note, n) => {
         note.appendChild(document.createTextNode(" — " + n + (n === 1 ? " row matches in the full list — " : " rows match in the full list — ")));
         const go = el("button", "list-open-match");
@@ -2295,19 +2312,26 @@
       },
       controls: (bar, redraw) => {
         if (isList) {
-          // every count reads drawn(listAll()) and then filters by time and surface, the same projection the tap draws
+          // every number reads rowsFor, with the chip's own value in place of the one chosen
           let timeRow = null;
           const build = () => {
-            const fresh = buildSurfaceChips(drawn(listAll()).filter(inTime), listNow, chooseSurface, inCard ? "" : "Type");
+            const was = document.activeElement;
+            const at = was && was.dataset && ((chipRow && was.closest(".list-surfaces") === chipRow) || (timeRow && was.closest(".list-times") === timeRow))
+              ? (was.dataset.surface !== undefined ? ["surface", was.dataset.surface] : was.dataset.time !== undefined ? ["time", was.dataset.time] : null) : null;
+            const st = stateNow();
+            const fresh = buildSurfaceChips((k) => rowsFor({ surface: k, time: st.time, view: st.view }), listNow, chooseSurface, inCard ? "" : "Type");
             if (chipRow) chipRow.replaceWith(fresh); else bar.after(fresh);
             chipRow = fresh;
             if (!inCard) {
-              const t = buildTimeChips(drawn(listAll()).filter(inSurface), timeNow, (v) => { listTime = v; build(); redraw(); });
+              const t = buildTimeChips((k) => rowsFor({ surface: st.surface, time: k, view: st.view }), timeNow, (v) => { listTime = v; build(); redraw(); });
               if (timeRow) timeRow.replaceWith(t); else chipRow.before(t);
               timeRow = t;
             }
+            // the chips are rebuilt after a tap: the same chip, rebuilt, takes the keyboard focus back
+            if (at) { const again = (at[0] === "surface" ? chipRow : timeRow) && (at[0] === "surface" ? chipRow : timeRow).querySelector("[data-" + at[0] + "=\"" + at[1] + "\"]"); if (again) again.focus(); }
           };
           const chooseSurface = (v) => { listSurface = v; build(); redraw(); };
+          rebuildChips = build;
           build();
         }
         if (!views.length) return;
@@ -2317,22 +2341,10 @@
         sel.appendChild(Object.assign(el("option", null, orderWord), { value: "" }));
         for (const v of views) sel.appendChild(Object.assign(el("option", null, v.title), { value: v.id }));
         sel.value = viewOf();
-        sel.addEventListener("change", () => { trayView = sel.value; redraw(); });
+        sel.addEventListener("change", () => { trayView = sel.value; if (rebuildChips) rebuildChips(); redraw(); });
         bar.appendChild(sel);
       },
-      pick: (rows) => {
-        const base = (listNow() ? rows.filter((s) => s.surface === listNow() && inSurfaceChip(s)) : rows).filter((s) => !cardHides(s)).filter(inTime);
-        const ids = views.length && viewOf() ? view.tray_view_rows[viewOf()] : null;
-        // the focus view draws a carried desk row under Needs you AND under Desk owes, as flow's footer prints it, so the control's
-        // "desk owes N" is the number of rows a person can see under that heading (a chosen view is ungrouped: no copy there)
-        const all = !Array.isArray(ids) ? drawn(base) : base;
-        if (!Array.isArray(ids)) return all;
-        const byId = new Map(all.map((s) => [s.id, Object.assign({}, s, { age_shown: true })]));
-        // a row the view did not name still shows, after the named ones
-        const named = new Set(ids);
-        return ids.filter((id) => byId.has(id)).map((id) => byId.get(id))
-          .concat(all.filter((s) => !named.has(s.id)).map((s) => byId.get(s.id)));
-      },
+      pick: () => rowsFor(stateNow()),
     } : undefined;
     if (inCard) {
       // what the card leaves to the focus view, for its one control (foldRowsAt words it)
@@ -2452,46 +2464,44 @@
   // beside them keep cutting across the time-states.
   const LIST_TIMES = ["now", "later", "someday", "done"];
   const WAKE_BUCKETS = { tomorrow: "Tomorrow", week: "Next 7 days", later: "Later dates" };
-  function buildTimeChips(list, current, choose) {
+  // rowsFor(k) is the rows the tap on the chip k draws; a chip says how many.
+  function buildTimeChips(rowsFor, current, choose) {
     const row = el("div", "list-times");
     row.setAttribute("role", "group");
     row.setAttribute("aria-label", "filter the List by when a row comes due");
     row.appendChild(el("span", "list-chips-label", "When"));
-    const counts = new Map();
-    for (const s of list) counts.set(s.time_state || "now", (counts.get(s.time_state || "now") || 0) + 1);
     const chips = [];
     const sync = (now) => { for (const c of chips) c.setAttribute("aria-pressed", c.dataset.time === now ? "true" : "false"); };
     for (const k of LIST_TIMES) {
-      if (!counts.has(k) && k !== current()) continue;
-      const c = el("button", "rc-chip list-time-chip", k.charAt(0).toUpperCase() + k.slice(1) + " " + (counts.get(k) || 0));
+      const n = rowsFor(k).length;
+      if (n === 0 && k !== current()) continue;
+      const c = el("button", "rc-chip list-time-chip", k.charAt(0).toUpperCase() + k.slice(1) + " " + n);
       c.type = "button";
       c.dataset.time = k;
-      c.addEventListener("click", () => { const v = current() === k ? "" : k; choose(v); sync(v); });
+      c.addEventListener("click", () => choose(current() === k ? "" : k));
       chips.push(c);
       row.appendChild(c);
     }
     sync(current());
     return row;
   }
-  function buildSurfaceChips(list, current, choose, label) {
+  function buildSurfaceChips(rowsFor, current, choose, label) {
     const row = el("div", "list-surfaces");
     row.setAttribute("role", "group");
     row.setAttribute("aria-label", "filter the List by where a row comes from");
-    const counts = new Map();
     if (label) row.appendChild(el("span", "list-chips-label", label));
-    for (const s of list) if (inSurfaceChip(s)) counts.set(s.surface, (counts.get(s.surface) || 0) + 1);
     const chips = [];
-    const mk = (value, label) => {
-      const c = el("button", "rc-chip list-surface-chip", label);
+    const mk = (value, word, n) => {
+      const c = el("button", "rc-chip list-surface-chip", word + " " + n);
       c.type = "button";
       c.dataset.surface = value;
-      c.addEventListener("click", () => { choose(value); sync(value); });
+      c.addEventListener("click", () => choose(value));
       chips.push(c);
       row.appendChild(c);
     };
     const sync = (now) => { for (const c of chips) c.setAttribute("aria-pressed", c.dataset.surface === now ? "true" : "false"); };
-    mk("", "all " + list.length);   // the caller passes the projected rows, so this is the rows the "all" tap draws
-    for (const k of Object.keys(SURFACE_WORDS)) if (counts.has(k)) mk(k, SURFACE_WORDS[k] + " " + counts.get(k));
+    mk("", "all", rowsFor("").length);
+    for (const k of Object.keys(SURFACE_WORDS)) { const n = rowsFor(k).length; if (n > 0) mk(k, SURFACE_WORDS[k], n); }
     sync(current());
     return row;
   }

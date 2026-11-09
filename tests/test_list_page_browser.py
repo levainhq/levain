@@ -812,7 +812,8 @@ _TIME_UNDER_SURFACE = f"""(async () => {{
   const shown = () => [...mb.querySelectorAll('.sp-results .row')].filter(r => r.getClientRects().length).length;
   const out = [];
   for (const k of [...mb.querySelectorAll('.list-surface-chip')].map((c) => c.dataset.surface).filter((x) => x)) {{
-    mb.querySelector('.list-surface-chip[data-surface="' + k + '"]').click(); await sleep(80);
+    const surf = mb.querySelector('.list-surface-chip[data-surface="' + k + '"]'); if (!surf) continue;
+    surf.click(); await sleep(80);
     for (const t of ['now', 'later', 'someday', 'done']) {{
       const chip = mb.querySelector('.list-time-chip[data-time="' + t + '"]');
       if (!chip) continue;
@@ -821,7 +822,8 @@ _TIME_UNDER_SURFACE = f"""(async () => {{
       const again = mb.querySelector('.list-time-chip[data-time="' + t + '"]');
       if (again) again.click(); await sleep(60);
     }}
-    mb.querySelector('.list-surface-chip[data-surface=""]').click(); await sleep(60);
+    const on = mb.querySelector('.list-time-chip[aria-pressed="true"]'); if (on) {{ on.click(); await sleep(60); }}
+    const allChip = mb.querySelector('.list-surface-chip[data-surface=""]'); if (allChip) {{ allChip.click(); await sleep(60); }}
   }}
   return JSON.stringify(out);
 }})()"""
@@ -848,6 +850,95 @@ def test_with_a_type_chip_chosen_each_time_chip_is_the_rows_its_tap_draws(tmp_pa
     got = json.loads(out["values"][-1])
     assert got and any(k == "band" for k, _t, _n, _s in got), got
     assert all(n == shown for _k, _t, n, shown in got), got                                 # a time chip is the rows its tap draws, a type chip chosen
+
+
+_EVERY_STATE_SWEEP = f"""(async () => {{
+  const mb = {_FOCUS}; const sleep = (ms) => new Promise(r => setTimeout(r, ms));
+  const num = (c) => parseInt(c.textContent.trim().split(' ').pop(), 10);
+  const shown = () => [...mb.querySelectorAll('.sp-results .row')].filter(r => r.getClientRects().length).length;
+  const sel = mb.querySelector('select.tray-dump-type');
+  const views = sel ? [...sel.options].map((o) => o.value) : [''];
+  const out = []; const set = async (v) => {{ if (!sel) return; sel.value = v; sel.dispatchEvent(new Event('change', {{bubbles: true}})); await sleep(80); }};
+  const clearTime = async () => {{ const on = mb.querySelector('.list-time-chip[aria-pressed="true"]'); if (on) {{ on.click(); await sleep(60); }} }};
+  const clearSurface = async () => {{ const a = mb.querySelector('.list-surface-chip[data-surface=""]'); if (a) {{ a.click(); await sleep(60); }} }};
+  for (const v of views) {{
+    await set(v);
+    for (const t of ['', 'now', 'later', 'someday', 'done']) {{
+      await clearTime(); await clearSurface();
+      if (t) {{ const w = mb.querySelector('.list-time-chip[data-time="' + t + '"]'); if (!w) continue; w.click(); await sleep(80); }}
+      for (const c of [...mb.querySelectorAll('.list-surface-chip')]) {{
+        const k = c.dataset.surface; const n = num(c); c.click(); await sleep(70);
+        out.push({{view: v, time: t, surface: k, n, shown: shown()}});
+      }}
+      await clearSurface();
+    }}
+    await clearTime();
+    for (const c of [...mb.querySelectorAll('.list-time-chip')]) {{
+      const k = c.dataset.time; const n = num(c); c.click(); await sleep(70);
+      out.push({{view: v, time: k, surface: '*', n, shown: shown()}});
+      const again = mb.querySelector('.list-time-chip[data-time="' + k + '"]'); if (again) again.click(); await sleep(60);
+    }}
+  }}
+  return JSON.stringify({{views, out}});
+}})()"""
+
+
+@needs_browser
+def test_every_chip_in_every_state_is_the_rows_its_tap_draws_in_a_named_view_too(tmp_path: Path, monkeypatch: Any) -> None:
+    root, src, _ids = _install(tmp_path)
+    _seed_more(root)
+    _seed_phone(root)
+    _seed_time(root)
+    from levain.consent.questions import QuestionStore
+    QuestionStore(default_queue_dir()).file(agent="claude_code", agent_session_id="s8", what="desk: carried Launch the TAOSERV upgrade seat.",
+                                            options=[("ship", "Ship it"), ("hold", "Hold")], rec="hold", blocks="the upgrade", cwd="/w/taoserv")
+    _host_band(monkeypatch)    # a carried band row: a named view draws it once, the unnamed focus view twice
+    with _serve(src, write_token=TOKEN, surface_tokens={"browser": TOKEN}, install_class="reported") as (url, _httpd):
+        out = _drive(tmp_path, f"{url}/", [
+            {"emulate": {"w": 1280, "h": 1000, "dpr": 1}},
+            *_reload(),
+            {"until": f"{TRAY} && {TRAY}.querySelector('[data-list-more]') && 1"},
+            *_open_focus(),
+            {"eval": _EVERY_STATE_SWEEP},
+        ])
+    got = json.loads(out["values"][-1])
+    assert len([v for v in got["views"] if v]) >= 1, got                                    # a named view is in the sweep
+    bad = [r for r in got["out"] if r["n"] != r["shown"]]
+    assert not bad, bad
+    assert any(r["view"] and r["surface"] == "band" for r in got["out"]), got               # the carried band row's chip was tapped inside a view
+
+
+_KEYBOARD_FOCUS = f"""(async () => {{
+  const mb = {_FOCUS}; const sleep = (ms) => new Promise(r => setTimeout(r, ms));
+  const out = [];
+  const same = (a) => !!a && a.dataset && (a.dataset.surface !== undefined ? '[data-surface="' + a.dataset.surface + '"]' : '[data-time="' + a.dataset.time + '"]');
+  for (const sel of ['.list-surface-chip[data-surface="band"]', '.list-time-chip[data-time="now"]', '.list-surface-chip[data-surface=""]']) {{
+    const c = mb.querySelector(sel); if (!c) {{ out.push([sel, 'absent']); continue; }}
+    c.focus(); c.click(); await sleep(100);
+    const a = document.activeElement;
+    out.push([sel, a && a.matches ? a.matches(sel) : false, !!(a && mb.contains(a)), a === c]);
+  }}
+  return JSON.stringify(out);
+}})()"""
+
+
+@needs_browser
+def test_a_chip_tap_leaves_keyboard_focus_on_the_replacement_chip(tmp_path: Path, monkeypatch: Any) -> None:
+    root, src, _ids = _install(tmp_path)
+    _seed_more(root)
+    _seed_phone(root)
+    _seed_time(root)
+    _host_band(monkeypatch)
+    with _serve(src, write_token=TOKEN, surface_tokens={"browser": TOKEN}, install_class="reported") as (url, _httpd):
+        out = _drive(tmp_path, f"{url}/", [
+            {"emulate": {"w": 1280, "h": 1000, "dpr": 1}},
+            *_reload(),
+            {"until": f"{TRAY} && {TRAY}.querySelector('[data-list-more]') && 1"},
+            *_open_focus(),
+            {"eval": _KEYBOARD_FOCUS},
+        ])
+    got = json.loads(out["values"][-1])
+    assert got and all(r[1] is True and r[2] is True and r[3] is False for r in got), got     # the same chip, rebuilt, still holds focus
 
 
 @needs_browser
