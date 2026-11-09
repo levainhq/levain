@@ -909,3 +909,60 @@ def test_expired_ticket_no_longer_references_its_generation(rig):
     _base_with(rig.st, "glm")
     assert _resolved(k, {"routes": ["glm"]}, "glm") == "api.z.ai"
     assert rig.ask("RUN-TICKET-CANCEL", ticket=one)["refused"] == "attempt-closed"
+
+
+# ---- the retention horizon on a ran executor ticket's mint line -------------------------------------------------------
+
+def _ran_and_released(rig, attempt: str, session: str, idx: int, **kw) -> str:
+    """An executor ticket minted, bound with a slot and released by a sync that reports its lease reusable."""
+    one = ticket_of(rig.mint(attempt, **kw))
+    rig.tickets.bind(one, session, ("egress", idx, 1))
+    assert rig.tickets.release_ended({("egress", idx): (1, "reusable")}) == [session]
+    return one
+
+
+def _mint_attempts(rig) -> set:
+    return {x["attempt_id"] for x in rig.lines() if x["op"] == "mint"}
+
+
+def test_compaction_drops_a_ran_executor_mint_line_past_the_horizon_and_keeps_its_tombstone(rig):
+    old = _ran_and_released(rig, "a-old", "s-" + "a" * 16, 0, run_index=0)
+    rig.clock.t += T.RAN_FACTS_HORIZON_S + 1                                # past the horizon
+    rig.restart()
+    assert "a-old" not in _mint_attempts(rig)                               # the facts aged out ...
+    assert [x for x in rig.lines() if x["op"] == "tombstone"][0]["ticket"] == old   # ... the replay guard did not
+    assert refused(rig.mint("a-old", run_index=0)) == "attempt-closed"
+    assert rig.ask("RUN-TICKET-FACTS", job_id="job-1", run_index=0)["refused"] == "ticket-unknown"
+
+
+def test_compaction_keeps_a_ran_executor_mint_line_inside_the_horizon(rig):
+    _ran_and_released(rig, "a-in", "s-" + "a" * 16, 0, run_index=0)
+    rig.clock.t += T.RAN_FACTS_HORIZON_S - 60                               # still inside it
+    rig.restart()
+    assert "a-in" in _mint_attempts(rig)
+    assert rig.ask("RUN-TICKET-FACTS", job_id="job-1", run_index=0)["ok"] is True
+
+
+def test_compaction_keeps_the_mint_line_of_a_still_bound_ticket_past_the_horizon(rig):
+    one = ticket_of(rig.mint("a-live", run_index=0))
+    rig.tickets.bind(one, "s-" + "a" * 16, ("egress", 0, 1))               # bound, never released: still live
+    rig.clock.t += 10 * T.RAN_FACTS_HORIZON_S
+    rig.restart()
+    assert "a-live" in _mint_attempts(rig)
+    assert rig.ask("RUN-TICKET-STATUS", attempt_id="a-live")["state"] == "bound"
+
+
+def test_the_horizon_is_the_unused_lifetime_plus_the_margin_and_a_ticket_deadline_widens_it():
+    assert T.RAN_FACTS_HORIZON_S == T.TICKET_UNUSED_S + T.RAN_FACTS_MARGIN_S
+    plain = T.Ticket("t", "a", "d", {"kind": "executor"}, 0, "2026-01-01")
+    wide = T.Ticket("t", "a", "d", {"kind": "executor", "deadline_s": 90 * 86400}, 0, "2026-01-01")
+    assert T.TicketStore._facts_horizon_s(plain) == T.RAN_FACTS_HORIZON_S
+    assert T.TicketStore._facts_horizon_s(wide) == T.RAN_FACTS_HORIZON_S + 90 * 86400
+
+
+def test_journal_max_still_binds_after_the_horizon(rig, monkeypatch):
+    _ran_and_released(rig, "a-in", "s-" + "a" * 16, 0, run_index=0)
+    monkeypatch.setattr(T, "JOURNAL_MAX", 16)
+    with pytest.raises(Refused) as e:
+        rig.restart()
+    assert e.value.name == "journal-inconsistent"
