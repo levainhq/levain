@@ -224,11 +224,12 @@ SEAM_SCHEMA: tuple[str, ...] = (
 
 # The service role's writes (row 156 L2 F1): the fact tables, the item and journal rows a landed sha writes (the ready
 # triggers refuse a service row that changes anything else), its own lease rows and the store-wide sequence. Only
-# ``sessions_seen`` is ever updated (its last sighting moves forward). Everything else, and every delete or schema
-# change, is refused.
+# ``sessions_seen`` is ever updated (its last sighting moves forward) or deleted from (a long-unseen session pruned,
+# row 156 L3 C4). Everything else, and every other delete or schema change, is refused.
 _SERVICE_INSERTS = frozenset({"worker_attach", "report_refusals", "sessions_seen", "ready_items", "ready_journal",
                               "lease_events", "gseq"})
 _SERVICE_UPDATES = frozenset({"sessions_seen"})
+_SERVICE_DELETES = frozenset({"sessions_seen"})
 _SERVICE_NEVER = frozenset(getattr(sqlite3, name) for name in (
     "SQLITE_DELETE", "SQLITE_CREATE_INDEX", "SQLITE_CREATE_TABLE", "SQLITE_CREATE_TEMP_INDEX",
     "SQLITE_CREATE_TEMP_TABLE", "SQLITE_CREATE_TEMP_TRIGGER", "SQLITE_CREATE_TEMP_VIEW", "SQLITE_CREATE_TRIGGER",
@@ -244,6 +245,8 @@ def _service_authorizer(action: int, arg1: str | None, _arg2: str | None, databa
         ok = arg1 in _SERVICE_INSERTS and database == "main"
     elif action == sqlite3.SQLITE_UPDATE:
         ok = arg1 in _SERVICE_UPDATES and database == "main"
+    elif action == sqlite3.SQLITE_DELETE:
+        ok = arg1 in _SERVICE_DELETES and database == "main"
     else:
         ok = action not in _SERVICE_NEVER
     return sqlite3.SQLITE_OK if ok else sqlite3.SQLITE_DENY
@@ -619,8 +622,10 @@ class CoordStore:
                 _all_gseq(conn)
                 from levain.coordinator.lease import migrate_settings
                 from levain.coordinator.ready import migrate_item_facts
+                from levain.coordinator.work_attach import migrate_seen
                 migrate_settings(conn)
                 migrate_item_facts(conn)
+                migrate_seen(conn)
                 if rebuilt:
                     what = " and ".join(rebuilt)
                     broken = _dangling_after(conn, rebuilt)
