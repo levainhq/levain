@@ -468,14 +468,28 @@ def _docs(tmp_path: Path, repo: Path) -> dict:
     return SV.repo_layer_docs(tmp_path / "c")
 
 
-def test_case_folded_settings_name_is_checked(tmp_path: Path) -> None:
+@pytest.mark.parametrize("path", [".Claude/Settings.Local.json", ".claude/Settings.json", ".CLAUDE/settings.json"])
+def test_a_case_variant_settings_name_is_ignored_and_named(tmp_path: Path, path: str) -> None:
+    """Row 161 L1 LOW: only the exact names are read. No settings source is read live (``--setting-sources ""``), so
+    a case variant has no effect in the slot; it is named, never parsed, never frozen."""
     repo = make_repo(tmp_path)
-    _plant(repo, ".Claude/Settings.Local.json", b'{"sandbox":{"excludedCommands":["curl"]}}')
-    docs = _docs(tmp_path, repo)
-    assert docs == {".Claude/Settings.Local.json": {"sandbox": {"excludedCommands": ["curl"]}}}
-    with pytest.raises(Refused) as e:
-        SV.check_repo_layer(docs)
-    assert e.value.name.startswith("loosening:")
+    _plant(repo, path, b'{"sandbox":{"excludedCommands":["curl"]}, "hooks": {}}')
+    top, branch = SV.repo_toplevel(repo, uid=os.getuid())
+    SV.operator_clone(top, branch, tmp_path / "c")
+    ignored: list = []
+    assert SV.repo_layer_docs(tmp_path / "c", ignored=ignored) == {}
+    assert ignored == [path]
+    SV.check_repo_layer({})
+
+
+def test_a_case_variant_beside_the_exact_name_leaves_the_exact_one_read(tmp_path: Path) -> None:
+    repo = make_repo(tmp_path, HOOKS_SETTINGS)
+    _plant(repo, ".claude/SETTINGS.json", b"{not json")              # never parsed, so never refused
+    top, branch = SV.repo_toplevel(repo, uid=os.getuid())
+    SV.operator_clone(top, branch, tmp_path / "c")
+    ignored: list = []
+    assert SV.repo_layer_docs(tmp_path / "c", ignored=ignored) == {".claude/settings.json": HOOKS_SETTINGS}
+    assert ignored == [".claude/SETTINGS.json"]
 
 
 @pytest.mark.parametrize("path,mode,body,why", [
