@@ -1402,7 +1402,15 @@ def _push_static() -> frozenset[str]:
     return STATIC_PATHS
 
 
-def _push_notice(queue: Path, ping_id: int, kind: str, ref: str, title: str, body: str) -> None:
+def _host_badge(queue: Path, store: Any) -> Any:
+    """The badge a push from THIS process carries: the count of the question store this server serves (recorded for the child
+    processes that have no store, :func:`levain.webpush.needs.open_needs_count`); a server with none leaves the badge out."""
+    from levain.webpush import needs, sender
+
+    return sender.OMITTED if store is None else needs.badge_value(queue, store)
+
+
+def _push_notice(queue: Path, ping_id: int, kind: str, ref: str, title: str, body: str, question_store: Any = None) -> None:
     """Push one recorded notice to the live subscriptions, off the request thread (a push service can take most of
     :data:`levain.webpush.sender.WALL_BUDGET`, and the poster is a script that should not wait on it). A failure here is
     in the ping's delivery rows, never the poster's reply."""
@@ -1410,12 +1418,13 @@ def _push_notice(queue: Path, ping_id: int, kind: str, ref: str, title: str, bod
         from levain.webpush import notify, sender
         from levain.webpush.store import PushStore
 
-        sender.deliver(queue, PushStore(queue), ping_id, kind=kind, ref=ref, title=title, body=body, url=notify.NOTICES_URL)
+        sender.deliver(queue, PushStore(queue), ping_id, kind=kind, ref=ref, title=title, body=body, url=notify.NOTICES_URL,
+                       badge=_host_badge(queue, question_store))
     except Exception:  # noqa: BLE001 - the notice is recorded; its push is best effort
         pass
 
 
-def _deliver_notice(queue: Path, adm: Any) -> "dict[str, Any]":
+def _deliver_notice(queue: Path, adm: Any, question_store: Any = None) -> "dict[str, Any]":
     """Act on an admitted notice: store it, then do what the operator's presence record says (the same ``decide`` a
     seat's ping meets, through :func:`levain.webpush.notify.decide_now`). ``pushed``: the ping is recorded and sent to
     the phones; ``held``: it waits in the held queue for the existing flush; ``recorded`` (low): stored only. The ping's
@@ -1434,12 +1443,13 @@ def _deliver_notice(queue: Path, adm: Any) -> "dict[str, Any]":
                                                   adm.priority, adm.token, decision, hold=hold)
     if decision == "pushed":
         try:
-            threading.Thread(target=_push_notice, args=(queue, ping_id, adm.kind, ref, adm.display, adm.body),
+            threading.Thread(target=_push_notice, args=(queue, ping_id, adm.kind, ref, adm.display, adm.body, question_store),
                              daemon=True, name="levain-notice-push").start()
         except RuntimeError:  # no thread to be had: the notice is stored, and its push is best effort
             _log.warning("notify: the push thread for a stored notice did not start")
     if decision != "recorded":
         try:      # a mute that ended since the last event lets other held pings through now, as a presence write does
+            _host_badge(queue, question_store)       # the flush child reads the count recorded here
             held.flush_if_due(queue)
         except Exception:  # noqa: BLE001 - a failed flush never fails the post
             pass
@@ -3116,6 +3126,7 @@ class _Handler(GuardedHandler):
         try:     # a write can make held pings due (a widened mute, devices on, back): start their push now, outside the lock
             from levain.webpush import held
 
+            _host_badge(queue, getattr(self.server, "question_store", None))      # the flush child reads the count recorded here
             held.flush_if_due(queue, throttle=False)
         except Exception:  # noqa: BLE001 - a failed flush never fails the set; the next gate call flushes
             pass
@@ -3167,7 +3178,7 @@ class _Handler(GuardedHandler):
             if raw and not (len(raw) <= 9 and raw.isascii() and raw.isdigit()):    # an over-long digit string never reaches int()
                 return {"ok": False, "error": "bad_request", "message": "limit is a whole number"}, 400
             doc = center.list_items(store, limit=int(raw) if raw else center.PAGE, before=q.get("before", [None])[0])
-            n = needs.open_needs_count(queue)
+            n = needs.open_needs_count(queue, getattr(self.server, "question_store", None))
             return (doc if n is None else {**doc, "needs_count": n}), 200
         except center.CenterError as exc:
             return {"ok": False, "error": exc.code, "message": str(exc)}, exc.status
@@ -3309,7 +3320,7 @@ class _Handler(GuardedHandler):
                 return self._send_json({"error": "notify_unavailable", "message": "notices cannot be taken right now; "
                                         "nothing was stored, try again later"}, 503)
             try:
-                out = _deliver_notice(queue, adm)
+                out = _deliver_notice(queue, adm, getattr(self.server, "question_store", None))
             except Exception as exc:  # noqa: BLE001 - never leak a traceback to the client
                 _log.warning("notify: an admitted notice was not stored: %s: %s", type(exc).__name__, exc)
                 return self._send_json({"error": "not_stored", "message": "the notice was not stored; try again"}, 503)
@@ -3327,7 +3338,8 @@ class _Handler(GuardedHandler):
         from levain.webpush import sender
 
         sent = sender.send(self.server.signer.queue_dir, kind="test", ref=name, title="Levain test ping",
-                           body="Pings are on for this device. It asks nothing of you.", device=name)
+                           body="Pings are on for this device. It asks nothing of you.", device=name,
+                           badge=_host_badge(self.server.signer.queue_dir, getattr(self.server, "question_store", None)))
         return {"deliveries": [{"subscription": sid, "status": status} for sid, status in sent]}, 200
 
     def _push_handle(self, route: str, raw: bytes, device_id: str) -> "tuple[int, bytes, str]":
@@ -6225,6 +6237,16 @@ def make_server(
                 httpd.server_close()
             raise
         httpd.room_serve = room_serve        # server_close stops it
+    if signer is not None and httpd.question_store is not None:
+        # after the last fallible step: a record left by a server that then failed to start would go stale and, a host
+        # record having existed, silence every later push's badge. A host install records its count before it serves
+        # (children that have no store read it, never the native one) and keeps it fresh while idle; the keeper waits
+        # one interval before its first refresh and ends with the server's stop event
+        from levain.webpush import needs
+
+        needs.open_needs_count(signer.queue_dir, httpd.question_store)
+        threading.Thread(target=needs.keep_recorded, args=(signer.queue_dir, httpd.question_store, httpd.stream_stop),
+                         name="needs-count-keeper", daemon=True).start()
     return httpd
 
 

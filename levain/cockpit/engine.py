@@ -3596,6 +3596,12 @@ def _terms_match(texts: list[str], q: str) -> bool:
     return all(t in hay for t in _fold(q).split())
 
 
+def _board_visible(cards: Any) -> list[Any]:
+    from levain.cockpit import board
+
+    return board.visible_cards(cards)
+
+
 def _compact_value(kind: str, value: Any) -> Any:
     if value is None:
         return None
@@ -3613,5 +3619,5 @@ def _compact_value(kind: str, value: Any) -> Any:
     if kind == "board":
         # the same reduction: per-column counts and the queue's own state (never the cards), the full value one link away
         return {"queue": value.get("queue"), "note": value.get("note"), "unreadable": list(value.get("unreadable") or []),
-                "columns": [{"category": c.get("category"), "count": len(c.get("cards") or [])} for c in value.get("columns") or []]}
+                "columns": [{"category": c.get("category"), "count": len(_board_visible(c.get("cards")))} for c in value.get("columns") or []]}
     return value

@@ -2118,7 +2118,7 @@
     if (foreign) {
       // read-only by construction: band rows point at the Decisions panel, board rows at the agents' queue; no verbs below
       if (s.support && !s.text_locked) host.appendChild(el("span", "muted list-support", s.support));
-      if (s.later_words && s.group === "later") host.appendChild(tagEl("muted", "back " + s.later_words));   // a carried desk row is due now (needs you), never "back Mon"
+      if (s.later_words && s.group === "later") host.appendChild(tagEl("muted later-tag", "back " + s.later_words));   // a carried desk row is due now (needs you), never "back Mon"
       // a desk row the desk has carried past its day is listed under Needs you, tagged as flow's footer tags it
       if (s.band_section === "desk" && s.carried) host.appendChild(tagEl("muted list-desk-owed", "desk-owed"));
       if (s.list_pointer) host.appendChild(tagEl("muted list-pointer", s.list_pointer));
@@ -5095,7 +5095,10 @@
       if (typeof it.later === "string" && it.later) {     // snoozed (row 131): one collapsed LATER line, number kept, no answer controls
         const lrow = el("div", "row consent-row band-row band-later");
         lrow.setAttribute("data-band-row", String(it.n));
-        lrow.appendChild(el("span", "ext-meta", "LATER " + (typeof it.later_label === "string" && it.later_label ? it.later_label : String(it.n) + " " + it.later) + " · " + (typeof it.what === "string" ? it.what.slice(0, 80) : "")));
+        const lline = el("span", "ext-meta", "");      // the words wrap around the LATER tag; the tag itself stays on one line
+        lline.append(el("span", "later-tag", "LATER " + (typeof it.later_label === "string" && it.later_label ? it.later_label : String(it.n) + " " + it.later)),
+                     " · " + (typeof it.what === "string" ? it.what.slice(0, 80) : ""));
+        lrow.appendChild(lline);
         kids.push(lrow);
         continue;
       }

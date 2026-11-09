@@ -24,6 +24,19 @@ NO_QUEUE = "no queue yet"
 _WHAT_MAX = 300
 
 
+def is_desk_owed(card: Mapping[str, Any]) -> bool:
+    """A band card the desk alone owes (the band's one rule, :func:`levain.band_view.desk_owed`): not the operator's. Only a band
+    card: any other card may carry a ``section`` of its own (the board validator keeps extra keys) and is never hidden by it."""
+    from levain import band_view
+
+    return card.get("band") is True and band_view.desk_owed(card.get("section"), card.get("carried"))
+
+
+def visible_cards(cards: Any) -> list[Any]:
+    """The cards a board draws and counts: every card but one the desk alone owes. A non-mapping card stays (never hidden)."""
+    return [k for k in cards or [] if not (isinstance(k, Mapping) and is_desk_owed(k))]
+
+
 def _last_records(records: Any) -> dict[str, Mapping[str, Any]]:
     """The newest journal record per item id (store order is the journal's order)."""
     out: dict[str, Mapping[str, Any]] = {}
