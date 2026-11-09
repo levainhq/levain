@@ -1200,7 +1200,7 @@ def test_a_watch_pass_that_raises_anything_is_reported_and_the_next_runs(store, 
     monkeypatch.setattr(cl.time, "sleep", lambda s: None)
     calls = []
 
-    def once(s):
+    def once(s, **_kw):
         calls.append(1)
         if len(calls) == 1:
             raise JobStoreError("dispatch.db said no")
@@ -1212,7 +1212,7 @@ def test_a_watch_pass_that_raises_anything_is_reported_and_the_next_runs(store, 
     assert len(calls) == 2 and out[-1] == "fine"
     assert out[0].startswith("watch pass faulted (JobStoreError: dispatch.db said no)")
 
-    def interrupted(s):
+    def interrupted(s, **_kw):
         raise KeyboardInterrupt
 
     monkeypatch.setattr(cl, "watch_once", interrupted)

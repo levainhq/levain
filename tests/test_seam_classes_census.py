@@ -27,6 +27,7 @@ from levain.coordinator.seam_handoffs import SEAM_HANDOFF_SCHEMA
 from levain.coordinator.seam_open import OPEN_SCHEMA
 from levain.coordinator.store import GSEQ_TABLES, SCHEMA, SEAM_SCHEMA
 from levain.coordinator.teamdrafts import DRAFT_SCHEMA
+from levain.coordinator.work_attach import WORK_SCHEMA
 from levain.coordinator.work_delta import OPERATOR_VIEWS_SCHEMA
 from levain.dispatch.jobs import _SCHEMA as JOB_SCHEMA
 
@@ -73,7 +74,7 @@ def test_the_classes_do_not_overlap() -> None:
 def test_every_table_of_the_maximal_database_is_in_exactly_one_class(maximal: Path) -> None:
     tables = _tables(maximal)
     assert "sqlite_sequence" in tables and sc.EXEMPT["sqlite_sequence"] == "SQLite's own"
-    assert len(tables) == 75 and len(set(tables)) == 75           # the census's 54, SQLite's, S0, S1, S2b's five, P3, S5, CH-H2's three, the room's four, H1-1's two (envelope_drafts, envelope_draft_withdrawals: each row takes a gseq, so COUNTED), the room relay's two (room_relay_claims, room_relay_outcomes: no gseq, so INFRASTRUCTURE)
+    assert len(tables) == 78 and len(set(tables)) == 78           # the census's 54, SQLite's, S0, S1, S2b's five, P3, S5, CH-H2's three, the room's four, H1-1's two (envelope_drafts, envelope_draft_withdrawals: each row takes a gseq, so COUNTED), the room relay's two (room_relay_claims, room_relay_outcomes: no gseq, so INFRASTRUCTURE), the board store's two (worker_attach, report_refusals: INFRASTRUCTURE, a decision recorded in seam_classes) and its sessions_seen (the service's sightings, INFRASTRUCTURE)
     # `_r4` is the transient name of the review events' rebuild: gone by commit, so a finished store holds none
     assert not [t for t in tables if t.endswith("_r4")]
     known = sc.COUNTED | sc.INFRASTRUCTURE | set(sc.EXEMPT)
@@ -144,6 +145,7 @@ _DISPATCH_DB_LISTS = {
     "review.FOREIGN_CLEAR_TRIGGER": (FOREIGN_CLEAR_TRIGGER,),
     "first_reader.FIRST_READER_SCHEMA": FIRST_READER_SCHEMA, "ready.LIFECYCLE_SCHEMA": LIFECYCLE_SCHEMA,
     "work_delta.OPERATOR_VIEWS_SCHEMA": OPERATOR_VIEWS_SCHEMA, "store.SEAM_SCHEMA": SEAM_SCHEMA,
+    "work_attach.WORK_SCHEMA": WORK_SCHEMA,
     "seam_handoffs.SEAM_HANDOFF_SCHEMA": SEAM_HANDOFF_SCHEMA, "seam_open.OPEN_SCHEMA": OPEN_SCHEMA, "intake.INTAKE_SCHEMA": INTAKE_SCHEMA,
     "envelopes.ENVELOPE_SCHEMA": ENVELOPE_SCHEMA, "chat.CHAT_SCHEMA": CHAT_SCHEMA,
     "chat_egress.EGRESS_SCHEMA": EGRESS_SCHEMA,
@@ -165,10 +167,10 @@ def test_the_name_scan_reads_every_statement_and_catches_a_seeded_duplicate() ->
         "dispatch.jobs._SCHEMA": (57, 57), "store.SCHEMA": (28, 28), "lease.LEASE_SCHEMA": (33, 33),
         "teamdrafts.DRAFT_SCHEMA": (9, 9), "review.REVIEW_SCHEMA": (15, 15),
         "review.FOREIGN_CLEAR_TRIGGER": (1, 1),
-        "first_reader.FIRST_READER_SCHEMA": (16, 16), "ready.LIFECYCLE_SCHEMA": (10, 10),
+        "first_reader.FIRST_READER_SCHEMA": (16, 16), "ready.LIFECYCLE_SCHEMA": (12, 12),
         "work_delta.OPERATOR_VIEWS_SCHEMA": (4, 4), "store.SEAM_SCHEMA": (4, 4),
         "seam_handoffs.SEAM_HANDOFF_SCHEMA": (8, 8), "seam_open.OPEN_SCHEMA": (21, 21),
-        "intake.INTAKE_SCHEMA": (4, 4),
+        "intake.INTAKE_SCHEMA": (4, 4), "work_attach.WORK_SCHEMA": (14, 14),
         "envelopes.ENVELOPE_SCHEMA": (12, 12), "chat.CHAT_SCHEMA": (52, 52), "chat_egress.EGRESS_SCHEMA": (6, 6)}
     # IF NOT EXISTS hides a second declaration from the database: the scan must see it in the source
     assert _declared(("CREATE TABLE IF NOT EXISTS replies (a)", "CREATE UNIQUE INDEX IF NOT EXISTS i ON t (a)",

@@ -91,6 +91,145 @@ def _store(args: argparse.Namespace) -> EnvelopeStore:
     return EnvelopeStore(d)
 
 
+def _board_store(args: argparse.Namespace) -> EnvelopeStore:
+    """The store a board verb opens (``coord import-status``, ``coord spawn --item``): ``--queue-dir`` when given, else
+    :func:`levain.coordinator.work_attach.board_store_dir`, the directory ``coord report`` queues into. Never the
+    consent directory by default: board rows do not go into the live ``dispatch.db``."""
+    from levain.coordinator import work_attach
+
+    d = args.queue_dir.expanduser() if args.queue_dir is not None else work_attach.board_store_dir()
+    return EnvelopeStore(d)
+
+
+# the verbs that act on the coordinator itself (its lease, launches, setting, seams and ready queue): each opens the
+# store its coordinator is in (:func:`_coordinator_dir`), so one coordinator's whole family stays in one dispatch.db
+_FOLLOWS_COORDINATOR = frozenset({"take", "release", "beat", "claim", "wake", "launch", "agent", "status", "ready",
+                                  "watch", "close", "open", "handoff"})
+
+
+def _opens_board(args: argparse.Namespace) -> bool:
+    """True for the verbs that act on board rows only: the board importers, and a spawn with ``--item`` (its launch and
+    the item's attach are one transaction, so the launch is in the board store too)."""
+    cmd = args.coord_cmd
+    return cmd in ("import-status", "apply-reports") or (cmd == "spawn" and getattr(args, "item", None) is not None)
+
+
+def _handle(args: argparse.Namespace) -> tuple[str, Any] | None:
+    """The coordinator handle a verb was given, if any: its lease token, or the launch it names."""
+    token = getattr(args, "token", None)
+    if token is not None:
+        return "token", token
+    launch_id = getattr(args, "launch", None) if args.coord_cmd == "claim" else getattr(args, "launch_id", None)
+    if args.coord_cmd in ("claim", "launch") and launch_id is not None:
+        return "launch", launch_id
+    return None
+
+
+def _probe(directory: Path, handle: tuple[str, Any] | None) -> tuple[bool, bool, bool | None] | None:
+    """What a store directory holds, read without making or migrating anything: None when no coordinator was ever in
+    it (a store a drop made is not one), else ``(holds the handle, the handle is its standing lease, a coordinator is
+    live there)``. Live means a live lease, or a coordinator launch pending or active. A store in an older format
+    cannot be read: its live is None (unknown), never False; a store whose coordinator tables predate this format is
+    present the same way (never dropped as empty)."""
+    from levain.coordinator import lease
+    from levain.coordinator.store import StoreAbsent
+
+    store = EnvelopeStore(directory)
+    holds = store.holds_coordinator()
+    if holds is False:
+        return None
+    if holds is None:                   # the tables that would say predate this format: present, live unknown
+        return False, False, None
+    try:
+        conn = store.open_readonly()
+    except StoreAbsent:
+        return False, False, None
+    try:
+        now = store._stamp()
+        held = lease.lease(conn, now)
+        live = bool(held is not None and held.live) or bool(
+            lease._in_state(conn, "pending", "coordinator") or lease._in_state(conn, "active", "coordinator"))
+        holds = standing = False
+        if handle is not None and handle[0] == "token":
+            holds = conn.execute("SELECT 1 FROM lease_events WHERE kind = 'claim' AND seq = ?",
+                                 (handle[1],)).fetchone() is not None
+            standing = held is not None and held.token == handle[1]
+        elif handle is not None:
+            holds = standing = conn.execute("SELECT 1 FROM launches WHERE launch_id = ?",
+                                            (handle[1],)).fetchone() is not None
+        return holds, standing, live
+    finally:
+        conn.close()
+
+
+def _coordinator_dir(args: argparse.Namespace) -> Path:
+    """The directory of the store a coordinator verb's coordinator is in, when no ``--queue-dir`` names one. Of the
+    consent directory and ``<levain home>/board``: the one holding the token or launch the verb names; else the one
+    holding a coordinator store; when both hold one, the one where a coordinator is live. When that still leaves both,
+    the verb is refused and told to name one. When neither holds a coordinator store yet, ``take`` makes the board's,
+    and every other verb uses the consent directory (where ``levain serve`` watches the drops)."""
+    from levain.coordinator import work_attach
+
+    consent, board = work_attach.live_consent_dir(), work_attach.board_store_dir()
+    handle = _handle(args)
+    found = {d: _probe(d, handle) for d in (consent, board)}
+    if handle is not None:
+        holding = [d for d, p in found.items() if p is not None and p[0]]
+        if len(holding) == 2:
+            standing = [d for d in holding if found[d][1]]
+            if len(standing) != 1:
+                raise CoordError(f"{handle[0]} {handle[1]} is in both {consent} and {board}; name its store with "
+                                 "--queue-dir")
+            holding = standing
+        if holding:                     # one: two were narrowed to the standing one or refused above
+            return holding[0]
+    present = [d for d, p in found.items() if p is not None]
+    if not present:
+        return board if args.coord_cmd == "take" else consent
+    if len(present) == 2:
+        unknown = [d for d in present if found[d][2] is None]
+        live = [d for d in present if found[d][2]]
+        if unknown or len(live) != 1:
+            why = ("it is unknown whether one is live in " + " or ".join(str(d) for d in unknown)
+                   + " (an older format a writer has not brought current)" if unknown
+                   else "a coordinator is live in both" if live else "none is live")
+            raise CoordError(f"a coordinator store is in both {consent} and {board}, and {why}: name the one you "
+                             "mean with --queue-dir")
+        present = live
+    return present[0]
+
+
+def _coord_store(args: argparse.Namespace) -> EnvelopeStore:
+    """The store ``levain coord <verb>`` opens: ``--queue-dir`` when given; the board for the board's own verbs; the
+    coordinator's own store (:func:`_coordinator_dir`) for the verbs that act on a coordinator; the consent directory
+    for the rest."""
+    if args.queue_dir is not None:
+        return _store(args)
+    if _opens_board(args):
+        return _board_store(args)
+    if args.coord_cmd in _FOLLOWS_COORDINATOR:
+        return EnvelopeStore(_coordinator_dir(args))
+    return _store(args)
+
+
+def _again_to(store: EnvelopeStore, *, named: bool = False) -> str:
+    """The ``--queue-dir`` a follow-up coordinator command needs to reach ``store`` again: none when a bare one opens
+    that same store now, else this store's own (always when ``named``: the command was pointed at it)."""
+    if not named:
+        try:
+            bare = _coordinator_dir(argparse.Namespace(coord_cmd="status", token=None))
+        except _REFUSED:
+            bare = None
+        if bare is not None and os.path.realpath(bare) == os.path.realpath(store.directory):
+            return ""
+    return f" --queue-dir {shlex.quote(str(store.directory))}"
+
+
+def _again(args: argparse.Namespace, store: EnvelopeStore) -> str:
+    """:func:`_again_to` for a coord verb's own store: named when it was given ``--queue-dir`` or is a board verb."""
+    return _again_to(store, named=args.queue_dir is not None or _opens_board(args))
+
+
 NO_STORE = "no coordinator store here"
 
 
@@ -225,16 +364,18 @@ def _launch_woken(store: EnvelopeStore, drop: Drop) -> None:
     except _REFUSED as exc:
         print(f"coordinator launch {launch_id}: not started ({exc})", file=sys.stderr)
         return
-    print(_outcome_text(got), file=sys.stderr)
+    print(_outcome_text(got, _again_to(store)), file=sys.stderr)
 
 
-def _outcome_text(got: Any) -> str:
+def _outcome_text(got: Any, again: str = "") -> str:
+    """How a launch went; ``again`` is the ``--queue-dir`` the follow-up commands need to reach its store."""
     if got.started:
         return f"coordinator launch {got.launch_id} started: {got.attach}"
     text = f"coordinator launch {got.launch_id}: not started: {got.refusal}"
     if got.remedy:
         text += (f"\nrun this once and accept the trust prompt:\n  {got.remedy}\nthen the next drop starts a "
-                 "coordinator, or levain coord wake starts one, once the wait levain coord status shows is over")
+                 f"coordinator, or levain coord wake{again} starts one, once the wait levain coord status{again} "
+                 "shows is over")
     return text
 
 
@@ -1405,7 +1546,9 @@ def run_coord(args: argparse.Namespace, out: Any = None) -> int:
 def _run_coord(args: argparse.Namespace, out: Any) -> int:
     cmd = args.coord_cmd
     try:
-        store = _store(args)
+        if cmd == "report":          # a seat's verb: it opens no coordinator store and holds no lease
+            return _coord_report(args, out)
+        store = _coord_store(args)
         if cmd == "take":
             hold = None
             if args.hold is not None:
@@ -1457,6 +1600,10 @@ def _run_coord(args: argparse.Namespace, out: Any) -> int:
             return _coord_review(args, out, store)
         if cmd == "ready":
             return _coord_ready(args, out, store)
+        if cmd == "import-status":
+            return _coord_import_status(args, out, store)
+        if cmd == "apply-reports":
+            return _coord_apply_reports(args, out, store)
         if cmd == "launch":
             from levain.coordinator.launch import launch_session
 
@@ -1464,14 +1611,15 @@ def _run_coord(args: argparse.Namespace, out: Any) -> int:
             if launch_id is None:
                 pending = store.pending_coordinator()
                 if pending is None:
-                    raise CoordError("no coordinator launch is pending (levain coord status says why; "
-                                     "levain coord wake asks for one)")
+                    again = _again(args, store)
+                    raise CoordError(f"no coordinator launch is pending (levain coord status{again} says why; "
+                                     f"levain coord wake{again} asks for one)")
                 launch_id = pending.launch_id
             got = launch_session(store, launch_id)
             _emit(out, args.json, {"launch_id": got.launch_id, "started": got.started, "attach": got.attach,
                                    "refusal": got.refusal, "remedy": got.remedy,
                                    "harness_session_id": got.harness_session_id},
-                  got.attach if got.started else _outcome_text(got))
+                  got.attach if got.started else _outcome_text(got, _again(args, store)))
             return 0 if got.started else 1
         if cmd == "wake":
             # a pending launch has a starter wherever it is written: the wake starts the one it wrote, as a drop does
@@ -1493,23 +1641,25 @@ def _run_coord(args: argparse.Namespace, out: Any) -> int:
                     st["why"] = line
                     _emit(out, args.json, st, f"no launch asked for: {line}")
                     return 1
-                _emit(out, args.json, st, f"{line}\n{_outcome_text(got)}")
+                _emit(out, args.json, st, f"{line}\n{_outcome_text(got, _again(args, store))}")
                 return 0 if got.started else 1
             st = store.coord_status()
             st["started"] = None if got is None else {"started": got.started, "attach": got.attach,
                                                       "refusal": got.refusal, "remedy": got.remedy}
-            _emit(out, args.json, st, (f"asked for coordinator launch {ln.launch_id}\n{_outcome_text(got)}"
-                                       if ln is not None else f"no launch asked for: {st['why']}"))
+            text = (f"asked for coordinator launch {ln.launch_id}\n{_outcome_text(got, _again(args, store))}"
+                    if ln is not None else f"no launch asked for: {st['why']}")
+            _emit(out, args.json, st, text)
             return 0 if got is None or got.started else 1
         if cmd == "watch":
             from levain.coordinator.launch import migrate_setting, watch, watch_once
 
-            if args.once:
-                lines = migrate_setting(store) + watch_once(store)
-                _emit(out, args.json, {"lines": lines}, "\n".join(lines) or "nothing to do")
-                return 0
             if args.every < 1:
                 raise CoordError("--every is at least 1 second")
+            if args.once:
+                # the pass judges a report's session against the interval it was given (row 156 L3 X6)
+                lines = migrate_setting(store) + watch_once(store, every=args.every)
+                _emit(out, args.json, {"lines": lines}, "\n".join(lines) or "nothing to do")
+                return 0
             try:
                 watch(store, every=args.every, emit=lambda line: print(line, file=out, flush=True))
             except KeyboardInterrupt:
@@ -1782,7 +1932,120 @@ def _coord_ready(args: argparse.Namespace, out: Any, store: EnvelopeStore) -> in
     return 0
 
 
+def _coord_import_status(args: argparse.Namespace, out: Any, store: EnvelopeStore) -> int:
+    """``levain coord import-status PATH [--repo R]``: read a status file's lane rows into the ready queue. It is the
+    coordinator's write, fenced by the live lease token; without it nothing is read or written and the exit is 1.
+    One line per bucket, with its count and ids."""
+    from levain.coordinator import status_import
+
+    held = None if _no_store(store) else store.coord_lease()
+    if held is None or not held.live or held.token != args.token:
+        print(f"levain coord import-status: the coordinator lease is not held by this token (levain coord status"
+              f"{_again(args, store)} shows the live one); nothing was read or written", file=sys.stderr)
+        return 1
+    try:
+        got = status_import.import_status(store, args.token, args.path, repo=args.repo)
+    except _REFUSED as exc:
+        print(f"levain coord import-status: {exc}", file=sys.stderr)
+        return 2
+    buckets = {"added": got.added, "corrected": got.corrected, "unchanged": got.unchanged, "absent": got.absent,
+               "unparsed": got.unparsed}
+    text = "\n".join(f"{name}: {len(ids)}" + (f" ({', '.join(str(i) for i in ids)})" if ids else "")
+                     for name, ids in buckets.items())
+    reports = _apply_queue(args, store)             # the holder's own pass over the board's queue (row 162)
+    if reports:
+        text += "\n" + "\n".join(reports)
+    _emit(out, args.json, {**buckets, "reports": reports}, text)
+    return 0
+
+
+def _apply_queue(args: argparse.Namespace, store: EnvelopeStore) -> list[str]:
+    """The lease holder's pass over the board's queued worker reports (row 162): applied as the coordinator, facts only,
+    through the validator the watch's pass uses. A caller that is not the live lease holder (no token, another token,
+    no live lease) gets ``[]`` and nothing is read from the queue. Never raises: a fault is one line, and the verb it
+    rides on keeps its own result."""
+    from levain.coordinator import work_attach
+
+    try:
+        token = getattr(args, "token", None)
+        held = None if _no_store(store) else store.coord_lease()
+        if token is None or held is None or not held.live or held.token != token:
+            return []
+        return work_attach.coordinator_apply(store, token)
+    except Exception as exc:    # noqa: BLE001 - the verb this rides on has already done its work
+        return [f"board reports: not applied ({exc})"]
+
+
+def _coord_apply_reports(args: argparse.Namespace, out: Any, store: EnvelopeStore) -> int:
+    """``levain coord apply-reports --token N``: the lease holder applies the board's queued worker reports itself, as
+    the coordinator, facts only (:func:`levain.coordinator.work_attach.coordinator_apply`). Without the live lease token
+    nothing is read or written and the exit is 1. Prints the pass's line, or says none was waiting. Any fault of the
+    pass, and a store that is the live consent store, is one line on stderr and the exit is 2."""
+    from levain.coordinator import work_attach
+
+    if work_attach.is_live_consent(Path(store.directory)):
+        print(f"levain coord apply-reports: not applied, {store.directory} is the live consent store and never a "
+              "board", file=sys.stderr)
+        return 2
+    held = None if _no_store(store) else store.coord_lease()
+    if held is None or not held.live or held.token != args.token:
+        print(f"levain coord apply-reports: the coordinator lease is not held by this token (levain coord status"
+              f"{_again(args, store)} shows the live one); nothing was applied", file=sys.stderr)
+        return 1
+    try:
+        lines = work_attach.coordinator_apply(store, args.token)
+    except Exception as exc:    # noqa: BLE001 - every fault of the pass is one line, never a traceback
+        print(f"levain coord apply-reports: {exc}", file=sys.stderr)
+        return 2
+    _emit(out, args.json, {"lines": lines}, "\n".join(lines) if lines else "no report is waiting")
+    return 0
+
+
 _SLOTS_FILE_MAX = 64 * 1024
+
+
+def _coord_report(args: argparse.Namespace, out: Any) -> int:
+    """``levain coord report ITEM --worker W --event E [...]`` (row 156): a seat reports a fact about its work on a ready
+    item. It appends to the board store's ``reports.db`` queue (:func:`levain.coordinator.work_attach.queue_report`) and
+    never opens ``dispatch.db`` or takes a token; the watcher's applier copies it into ``worker_attach`` or refuses it
+    with a record. The session comes from ``--session`` or the harness's own environment."""
+    from levain.coordinator import work_attach
+
+    directory = args.board_store.expanduser() if args.board_store is not None else work_attach.board_store_dir()
+    session = args.session or os.environ.get("CLAUDE_CODE_SESSION_ID") or None
+    at = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    try:
+        rid, queued = work_attach.queue_report(
+            directory, report_id=args.report_id, item_id=args.item, worker=args.worker, worker_kind=args.kind,
+            event=args.event, at=at, launch_id=args.launch, harness_session_id=session, sha=args.sha,
+            branch=args.branch, why=args.why)
+    except _REFUSED as exc:
+        # a malformed field or no board directory: one line, exit 2, nothing queued
+        print(f"levain coord report: {' '.join(str(exc).split())}", file=sys.stderr)
+        return 2
+    words = work_attach.report_line(directory, rid, queued)
+    _emit(out, args.json, {"report_id": rid, "queued": queued, "item": args.item, "store": str(directory)}, words)
+    return 0
+
+
+def _coord_reports(args: argparse.Namespace, out: Any = None) -> int:
+    """``levain coord reports REPORT_ID`` (row 156 L2 F16): what became of one report, read-only (queued, applied,
+    refused with its reason, or unknown). Opens no store for writing and takes no token. Exit 1 when the id is unknown."""
+    from levain.coordinator import work_attach
+
+    out = out or sys.stdout
+    directory = args.board_store.expanduser() if args.board_store is not None else work_attach.board_store_dir()
+    try:
+        st = work_attach.report_status(directory, args.report_id)
+    except (CoordError, sqlite3.Error, OSError) as exc:
+        print(f"levain coord reports: {exc}", file=sys.stderr)
+        return 2
+    words = {"queued": "queued; the next `levain coord watch` pass applies or refuses it",
+             "applied": f"applied ({st['kind']}, {st['attach_id']})",
+             "refused": f"refused ({st['reason']}: {st['detail']})",
+             "unknown": f"not in the queue at {directory}"}[st["state"]]
+    _emit(out, args.json, st, f"report {args.report_id}: {words}")
+    return 1 if st["state"] == "unknown" else 0
 
 
 def _coord_spawn(args: argparse.Namespace, out: Any, store: EnvelopeStore) -> int:
@@ -1827,14 +2090,16 @@ def _coord_spawn(args: argparse.Namespace, out: Any, store: EnvelopeStore) -> in
     except AgentStoreRefused as exc:
         raise CoordError(f"the role registry cannot be opened ({exc})") from None
     ln = instantiate.spawn_worker(store, args.token, thread_id=args.thread, cwd=cwd, ref=args.role, inline=inline,
-                                  slots=slots, agent_store=agents, parent_launch=args.parent, done=args.done)
+                                  slots=slots, agent_store=agents, parent_launch=args.parent, done=args.done,
+                                  item=args.item)
     rec = instantiate.verified_record(ln.role_ref)
+    again = _again(args, store)
     _emit(out, args.json, {"launch_id": ln.launch_id, "state": ln.state, "spawn": rec["spawn"],
                            "inline": rec["inline"], "depth": rec["depth"], "thread": args.thread, "cwd": cwd,
                            "envelope_id": rec["envelope_id"], "scope": rec["scope"]},
           f"asked for worker launch {ln.launch_id} ({rec['spawn']}{', inline' if rec['inline'] else ''}, depth "
-          f"{rec['depth']}) on thread {args.thread} in {cwd}: {ln.state} until {ln.until}; `levain coord watch` or "
-          f"`levain coord launch {ln.launch_id}` starts it")
+          f"{rec['depth']}) on thread {args.thread} in {cwd}: {ln.state} until {ln.until}; "
+          f"`levain coord watch{again}` or `levain coord launch {ln.launch_id}{again}` starts it")
     return 0
 
 
@@ -1992,6 +2257,18 @@ def review_modes() -> tuple[str, ...]:
     return review.MODES
 
 
+def _report_kinds() -> tuple[str, ...]:
+    from levain.coordinator import work_attach
+
+    return work_attach.WORKER_KINDS
+
+
+def _report_events() -> tuple[str, ...]:
+    from levain.coordinator import work_attach
+
+    return work_attach.EVENTS
+
+
 def _spawn_caps() -> tuple[int, int]:
     from levain.coordinator import lease
 
@@ -2001,7 +2278,11 @@ def _spawn_caps() -> tuple[int, int]:
 def add_parsers(subparsers: argparse._SubParsersAction) -> None:
     from levain.coordinator import seam_handoffs as _seam_handoffs
 
-    qdir_help = "The consent directory holding dispatch.db (default: the consent queue's)."
+    qdir_help = ("The directory holding dispatch.db. Default: a coord verb that acts on a coordinator (its lease, "
+                 "launches, setting, seams or ready queue) opens the store that coordinator is in, the consent "
+                 "directory or <levain home>/board, and refuses when both hold one it cannot choose between; a bare "
+                 "take on a home with neither makes the board's. The board's own verbs open the board; every other "
+                 "verb opens the consent directory.")
 
     def common(p: argparse.ArgumentParser) -> None:
         p.add_argument("--queue-dir", dest="queue_dir", type=Path, default=None, help=qdir_help)
@@ -2183,7 +2464,8 @@ def add_parsers(subparsers: argparse._SubParsersAction) -> None:
         description="Each pass starts every pending launch nobody started (a drop from the phone or the cockpit), "
                     "ends a launch whose Claude Code session is no longer listed, beats the lease of the coordinator "
                     "whose session is listed, not done and writing as coordinator, and stops a session whose launch "
-                    "is over. Only sessions Levain started.")
+                    "is over. Only sessions Levain started. A bare `coord watch` watches the store its coordinator is "
+                    "in (see --queue-dir), chosen once as it starts; --queue-dir names the store to watch.")
     cwa.add_argument("--every", type=float, default=30.0, metavar="S", help="Seconds between passes (default 30).")
     cwa.add_argument("--once", action="store_true", help="One pass, then exit.")
     band_root = ("The cockpit data root whose authority log re-verifies the asking session's envelope (default: the one "
@@ -2247,7 +2529,8 @@ def add_parsers(subparsers: argparse._SubParsersAction) -> None:
                     "only spawner, and what binds is your lease and the cap of "
                     f"{_spawn_caps()[1]} asked for or running at once. `levain coord watch` or "
                     "`levain coord launch LAUNCH_ID` starts it, `levain coord status` lists it, and "
-                    "`levain coord handoff worker LAUNCH_ID` reads its final message once its turn is done.")
+                    "`levain coord handoff worker LAUNCH_ID` reads its final message once its turn is done. "
+                    "A launch made in the board store is started by `coord watch --queue-dir <levain home>/board`.")
     csp.add_argument("--thread", required=True, metavar="THREAD", help="The WORK thread the worker holds.")
     who = csp.add_mutually_exclusive_group(required=True)
     who.add_argument("--role", default=None, metavar="@spawn/NAME", help="A registered role.")
@@ -2260,9 +2543,44 @@ def add_parsers(subparsers: argparse._SubParsersAction) -> None:
     csp.add_argument("--done", default=None, metavar="LINE", help="The ready item's DONE: line (the worker's win).")
     csp.add_argument("--parent", default=None, metavar="LAUNCH_ID",
                      help="The active spawned worker asking for this one.")
+    csp.add_argument("--item", default=None, metavar="ITEM_ID",
+                     help="The ready item this worker is for: the attach is recorded with the request, or neither is. "
+                          "With it the store is <levain home>/board unless --queue-dir names one, so the launch is "
+                          "asked for there too.")
     csp.add_argument("--agent-store-dir", dest="agent_store_dir", type=Path, default=None, metavar="DIR",
                      help="The role registry's store (default: this Levain home's).")
     csp.add_argument("--token", type=int, required=True, help="Your coordinator lease token.")
+    crt = c_sub.add_parser(
+        "report", help="Report a fact about your work on a ready item (queued; no token, no lease).",
+        description="Appends one report to the board store's queue and returns. It never writes the board itself: the "
+                    "watcher's applier copies it into the worker-attach record, or refuses it (an unknown item, a worker "
+                    "that is not a real launch) and leaves a refusal record the desk reads. Resending the same "
+                    "--report-id queues nothing twice and says so. Your session id comes from the environment.")
+    crt.add_argument("item", metavar="ITEM", help="The ready item's id.")
+    crt.add_argument("--worker", required=True, help="Who you are: a seat or lane name, or a launch id.")
+    crt.add_argument("--kind", choices=_report_kinds(), default="seat", help="What kind of worker (default seat).")
+    crt.add_argument("--event", required=True, choices=_report_events(), help="The fact you report.")
+    crt.add_argument("--launch", default=None, metavar="LAUNCH_ID", help="Your Levain launch id, if you are one.")
+    crt.add_argument("--session", default=None, metavar="ID",
+                     help="Your harness session id (default: CLAUDE_CODE_SESSION_ID from the environment).")
+    crt.add_argument("--sha", default=None, metavar="OID", help="With --event landed: the full commit id.")
+    crt.add_argument("--branch", default=None, help="With --event landed: the branch it landed on.")
+    crt.add_argument("--why", default=None, metavar="LINE", help="One line of detail.")
+    crt.add_argument("--report-id", dest="report_id", default=None, metavar="ID",
+                     help="Your own id for this report; pass the same one to resend it safely (default: a fresh one).")
+    crt.add_argument("--board-store", dest="board_store", type=Path, default=None, metavar="DIR",
+                     help="The board store directory (default: <levain home>/board).")
+    crt.add_argument("--json", action="store_true", help="Machine-readable output.")
+    crt.set_defaults(func=run_coord)
+    crs = c_sub.add_parser(
+        "reports", help="What became of a report you queued: queued, applied, or refused and why (read-only).",
+        description="Reads the board store's queue and its records for one report id. Writes nothing; no token.")
+    crs.add_argument("report_id", metavar="REPORT_ID", help="The id `levain coord report` printed.")
+    crs.add_argument("--board-store", dest="board_store", type=Path, default=None, metavar="DIR",
+                     help="The board store directory (default: <levain home>/board).")
+    crs.add_argument("--json", action="store_true", help="Machine-readable output.")
+    crs.set_defaults(func=_coord_reports)
+    door_ok(crs)
     caw = c_sub.add_parser(
         "away", help="Read a drop as the operator's word that he is away: set away ON (never off).",
         description="Sets away ON for both agents through `levain consent away on`'s own path, so every SIGN waits "
@@ -2346,6 +2664,29 @@ def add_parsers(subparsers: argparse._SubParsersAction) -> None:
             rdw.add_argument("--repo", required=True, help="The item's repo (fixed at add).")
         ready_leaves.append(rdw)
         door_ok(rdw)      # add, move and correct are the coordinator's write: refused without the live lease token
+    cis = c_sub.add_parser(
+        "import-status", help="Read a status file's lane rows into the ready queue (the coordinator's write).",
+        description="Adds new rows, corrects changed ones and leaves the rest; a second run of an unchanged file "
+                    "writes nothing. Needs --token (the live lease's). Prints one line per bucket: added, corrected, "
+                    "unchanged, absent (in the queue, not in the file) and unparsed (row numbers: the row shape did "
+                    "not fit, or the store refused the row). The store is <levain home>/board, the board store "
+                    "`coord report` queues into, unless --queue-dir names one; never the consent directory by default.")
+    cis.add_argument("path", type=Path, metavar="PATH")
+    cis.add_argument("--repo", default="levain", help="The repo the rows belong to.")
+    cis.add_argument("--token", type=int, required=True, help="The live coordinator lease's token.")
+    common(cis)
+    cis.set_defaults(func=run_coord)
+    door_ok(cis)
+    car = c_sub.add_parser(
+        "apply-reports", help="Apply the board's queued worker reports as the lease holder (facts only).",
+        description="While a coordinator holds the board lease the watch's service pass is skipped, so the holder "
+                    "applies the queue itself: each queued report is judged by the validator the watch uses and is "
+                    "applied, deferred or refused with a record. Needs --token (the live lease's); the lease is kept. "
+                    "The store is <levain home>/board unless --queue-dir names one.")
+    car.add_argument("--token", type=int, required=True, help="The live coordinator lease's token.")
+    common(car)
+    car.set_defaults(func=run_coord)
+    door_ok(car)
     chn = c_sub.add_parser("handoff", help="Read the handoffs coordinators left.")
     chn_sub = chn.add_subparsers(dest="handoff_cmd", required=True)
     chs = chn_sub.add_parser("show", help="The latest handoff, or the one named.",
@@ -2397,7 +2738,7 @@ def add_parsers(subparsers: argparse._SubParsersAction) -> None:
         common(p)
         p.set_defaults(func=run_coord)
     # the coordinator's own verbs (its brief names these); the operator's verbs are declared beside them, never left out
-    door_ok(cs, cr, cb, cc, cq, can, ces, cmo, caw, csp, cbu, clg, crp, ccl, cop, chs, chw)
+    door_ok(crt, cs, cr, cb, cc, cq, can, ces, cmo, caw, csp, cbu, clg, crp, ccl, cop, chs, chw)
     not_door(ct, cw, ca, cl, cwa)
     not_door(rvl, rvc, rvo, rvf)
 
