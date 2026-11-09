@@ -183,7 +183,8 @@ dev = ["pytest>=7.4", "pytest-xdist>=3.5","mcp>=1.27,<2", "h11>=0.16.0", "pyyaml
 # Not published metadata: scripts/ci_install_locked.sh exports this group so the build backend comes from the
 # hash-checked lock and the editable install can run with --no-build-isolation. Keep it in step with [build-system].
 [dependency-groups]
-build = ["setuptools>=77"]
+# hatchling and wheel ride beside setuptools so a source-only dependency built with --no-build-isolation finds the common backends from the lock.
+build = ["setuptools>=77", "hatchling", "wheel"]
 
 [project.scripts]
 levain = "levain.launch:main"

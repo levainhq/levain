@@ -22,10 +22,13 @@ import shutil
 import subprocess
 import sys
 import tempfile
-import tomllib
 from pathlib import Path
 
-SMOKE = "import levain, openhands.sdk"
+try:
+    import tomllib
+except ModuleNotFoundError:  # Python 3.9 and 3.10: the backport the py39 pin file carries
+    import tomli as tomllib
+
 COPIED = ("pyproject.toml", "uv.lock", "README.md", "LICENSE", "NOTICE")
 
 
@@ -76,13 +79,30 @@ def run_capture(cmd: list[str], cwd: Path | None = None, env: dict | None = None
     return proc.wait(), lines
 
 
+def smoke_for(extras: list[str]) -> str:
+    """The import smoke: levain always, openhands.sdk only when the openhands extra was installed."""
+    return "import levain" + (", openhands.sdk" if "openhands" in extras else "")
+
+
+def suite_env(venv: Path, base: dict, wait_scale: str = "2") -> dict:
+    """The environment the suite runs in: the scratch venv's bin first on PATH and VIRTUAL_ENV set, so console scripts
+    and subprocess pythons resolve to the upgraded install, not the runner's."""
+    return {**base, "PATH": f"{venv / 'bin'}{os.pathsep}{base.get('PATH', '')}", "VIRTUAL_ENV": str(venv),
+            "LEVAIN_TEST_WAIT_SCALE": base.get("LEVAIN_TEST_WAIT_SCALE", wait_scale)}
+
+
 def failed_tests(lines: list[str], limit: int = 20) -> list[str]:
-    """The node ids from pytest's short summary (`FAILED path::name - reason`, `ERROR path::name`), first `limit`."""
+    """The ids from pytest's short summary, first `limit`: `FAILED path::name - reason` and `ERROR path::name` give the
+    node id; a collection error `ERROR path - reason` gives `path - reason`, so an import broken by an upgrade is named."""
     ids: list[str] = []
     for line in lines:
         head, _, rest = line.partition(" ")
-        if head in ("FAILED", "ERROR") and "::" in rest:
+        if head not in ("FAILED", "ERROR"):
+            continue
+        if "::" in rest:
             ids.append(rest.split(" - ")[0].strip())
+        elif head == "ERROR" and rest.strip().startswith(("tests/", "/")) and " - " in rest:
+            ids.append(rest.strip())
     return ids[:limit]
 
 
@@ -96,12 +116,12 @@ def main(argv: list[str] | None = None) -> int:
     args = ap.parse_args(argv)
     repo = Path(args.repo).resolve()
     work = Path(tempfile.mkdtemp(prefix="dep-drift-"))
+    if args.keep:
+        print(f"scratch kept: {work}")  # before the run, so the DEP_DRIFT line stays last
     try:
         return _drift(repo, work, args)
     finally:
-        if args.keep:
-            print(f"scratch kept: {work}")
-        else:
+        if not args.keep:
             shutil.rmtree(work, ignore_errors=True)
 
 
@@ -128,19 +148,19 @@ def _drift(repo: Path, work: Path, args) -> int:
         return 1
     # The same install path every test run uses, pointed at the re-resolved lock: the venv's python and pip come
     # first on PATH, LOCK_DIR names the scratch copy that holds the upgraded uv.lock, and the project installs from repo.
-    install_env = {**os.environ, "PATH": f"{venv / 'bin'}{os.pathsep}{os.environ.get('PATH', '')}",
-                   "LOCK_DIR": str(lockdir), "RUNNER_TEMP": str(work), "VIRTUAL_ENV": str(venv)}
+    install_env = {**suite_env(venv, dict(os.environ)), "LOCK_DIR": str(lockdir), "RUNNER_TEMP": str(work)}
     extras = [e for e in args.extras.split(",") if e]
     if run([str(repo / "scripts" / "ci_install_locked.sh"), *extras], cwd=repo, env=install_env) != 0:
         print(result_line("install_failed", "install", changed))
         return 1
-    if run([str(py), "-c", SMOKE]) != 0:
-        print(result_line("red", "smoke", changed, smoke=SMOKE))
+    smoke = smoke_for(extras)
+    if run([str(py), "-c", smoke]) != 0:
+        print(result_line("red", "smoke", changed, smoke=smoke))
         return 1
     if args.no_suite:
         print(result_line("green", "smoke", changed))
         return 0
-    env = {**os.environ, "LEVAIN_TEST_WAIT_SCALE": os.environ.get("LEVAIN_TEST_WAIT_SCALE", "2")}
+    env = suite_env(venv, dict(os.environ))
     code, out = run_capture([str(py), "-m", "pytest", "-n", "auto", "-q", "-p", "no:cacheprovider", "--rootdir", str(repo),
                              "--basetemp", str(work / "pt"), str(repo / "tests")], cwd=repo, env=env)
     print(result_line("green" if code == 0 else "red", "suite", changed, pytest_exit=code, failed_tests=failed_tests(out)))
