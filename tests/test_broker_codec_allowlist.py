@@ -314,3 +314,89 @@ def test_every_client_body_fixture_has_a_provenance_entry():
     assert names == {k for k in prov if not k.startswith("_")}
     for k in names:
         assert {"client", "version", "captured", "how"} <= set(prov[k]), k
+
+
+# --- r1 F2: a `tools` that is not a list ---------------------------------------------------------------------------
+
+@pytest.mark.parametrize("c", [AM, OC, OR], ids=lambda c: c.name)
+@pytest.mark.parametrize("tools", [{"type": "web_search"}, "web_search", 1, None], ids=["obj", "str", "int", "null"])
+def test_a_tools_that_is_not_a_list_is_refused_on_dispatch(c, tools):
+    # the tool-type allowlist reads a list; a `tools` of any other shape judges nothing, so dispatch refuses it
+    assert _check(c, _body(c, tools=tools), dispatch=True) == "body-unlisted:tools"
+    assert not isinstance(_check(c, _body(c, tools=tools), dispatch=False), str)
+
+
+def test_a_non_object_entry_inside_a_tools_list_stays_the_providers_to_refuse():
+    assert not isinstance(_check(OR, _body(OR, tools=["web_search", 1]), dispatch=True), str)
+
+
+# --- r1 F3: a tool definition declared inside the content, not in `tools[]` ----------------------------------------
+# D150b A2's reproduced rows: every one was admitted on dispatch before this round.
+
+def _responses_item(item):
+    return _body(OR, input=[{"role": "user", "content": "hi"}, item])
+
+
+def _anthropic_block(block):
+    return _body(AM, messages=[{"role": "user", "content": [{"type": "text", "text": "hi"}, block]}])
+
+
+def _addition(definition):
+    return {"type": "tool_addition", "tool": {"type": "tool_definition", "definition": definition}}
+
+
+@pytest.mark.parametrize("item,name", [
+    ({"type": "additional_tools", "role": "developer", "tools": [{"type": "web_search"}]}, "body-unbounded:web_search"),
+    ({"type": "additional_tools", "tools": [{"type": "function", "name": "f"}, {"type": "mcp", "server_label": "s"}]},
+     "body-unbounded:mcp"),
+    ({"type": "additional_tools", "tools": [{"type": "quantum_tool"}]}, "body-unlisted:quantum_tool"),
+    ({"type": "tool_search_output", "call_id": "c", "tools": [{"type": "file_search"}]}, "body-unbounded:file_search"),
+    ({"type": "tool_search_output", "call_id": "c", "tools": [{"type": "quantum_tool"}]}, "body-unlisted:quantum_tool"),
+    ({"type": "additional_tools", "tools": {"type": "web_search"}}, "body-unlisted:tools"),
+], ids=["additional-ws", "additional-mcp", "additional-unlisted", "search-output-fs", "search-output-unlisted",
+        "additional-not-a-list"])
+def test_a_responses_inline_tool_goes_through_the_tool_allowlist(item, name):
+    body = _responses_item(item)
+    assert _check(OR, body, dispatch=True) == name
+    interactive = _check(OR, body, dispatch=False)
+    assert not isinstance(interactive, str)
+    if name.startswith("body-unbounded:"):
+        assert name.partition(":")[2] in interactive.unproven     # the same naming the interactive route marks
+
+
+@pytest.mark.parametrize("definition,name", [
+    ({"type": "web_search_20250305", "name": "web_search"}, "body-unbounded:web_search"),
+    ({"type": "code_execution_20250522", "name": "code_execution"}, "body-unbounded:code_execution"),
+    ({"type": "mcp_toolset", "mcp_server_name": "x"}, "body-unlisted:mcp_toolset"),
+    ({"type": "quantum_tool_20260101", "name": "q"}, "body-unlisted:quantum_tool"),
+], ids=["ws", "ce", "mcp-toolset", "unlisted"])
+def test_an_anthropic_inline_tool_definition_goes_through_the_tool_allowlist(definition, name):
+    body = _anthropic_block(_addition(definition))
+    assert _check(AM, body, dispatch=True) == name
+    assert not isinstance(_check(AM, body, dispatch=False), str)
+
+
+def test_an_anthropic_compaction_blocks_tool_changes_go_through_the_tool_allowlist():
+    block = {"type": "compaction", "content": "x",
+             "tool_changes": [{"type": "tool_removal", "tool": {"type": "tool_reference", "name": "a"}},
+                              _addition({"type": "web_fetch_20250910", "name": "web_fetch"})]}
+    assert _check(AM, _anthropic_block(block), dispatch=True) == "body-unbounded:web_fetch"
+
+
+@pytest.mark.parametrize("c,body", [
+    (OR, _responses_item({"type": "additional_tools", "tools": [{"type": "function", "name": "f"},
+                                                                 {"type": "custom", "name": "c"}]})),
+    (OR, _responses_item({"type": "tool_search_output", "call_id": "c", "tools": [{"type": "function", "name": "f"}]})),
+    (AM, _anthropic_block(_addition({"name": "Read", "input_schema": {"type": "object"}}))),
+    (AM, _anthropic_block(_addition({"type": "custom", "name": "c", "input_schema": {"type": "object"}}))),
+    (AM, _anthropic_block({"type": "tool_addition", "tool": {"type": "tool_reference", "name": "Read"}})),
+], ids=["or-additional-client", "or-search-output-client", "am-typeless", "am-custom", "am-reference"])
+def test_a_client_run_inline_tool_is_admitted_on_dispatch(c, body):
+    got = _check(c, body, dispatch=True)
+    assert not isinstance(got, str), got
+
+
+def test_a_tool_definition_in_a_tool_input_is_not_read_as_a_declaration():
+    # a `tool_use.input` is the client's JSON, not a declaration position
+    block = {"type": "tool_use", "id": "t", "name": "f", "input": _addition({"type": "web_search_20250305"})}
+    assert not isinstance(_check(AM, _anthropic_block(block), dispatch=True), str)

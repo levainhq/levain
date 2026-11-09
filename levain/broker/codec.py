@@ -242,26 +242,43 @@ class Codec:
         return Checked(model, price, found)
 
     def _refuse_unlisted(self, obj: Mapping[str, Any]) -> None:
-        """The dispatch allowlist: the first top-level field outside `dispatch_fields`, then the first tool type
-        outside `dispatch_tool_types` (a server tool is left to `_unbounded`, which names it `body-unbounded`).
-        The suffix is the name when it fits the wire grammar, else a fixed word."""
+        """The dispatch allowlist: the first top-level field outside `dispatch_fields`, then every tool definition the
+        body declares (`_tool_lists`: `tools[]` and the codec's inline positions) through `_refuse_tool`. A tool list
+        that is not a list judges nothing, so it is refused. The suffix is the name when it fits the wire grammar,
+        else a fixed word."""
         for f in obj:
             if f not in self.dispatch_fields:
                 raise norm.Refused("body-unlisted:" + _wire_what(f, "field"), "a field levain has not judged; "
                                    "dispatch admits only judged fields")
-        tools = obj.get("tools")
-        if not isinstance(tools, list):
+        for tools in self._tool_lists(obj):
+            if not isinstance(tools, list):
+                raise norm.Refused("body-unlisted:tools", "a tool list that is not a list; dispatch judges each tool")
+            for t in tools:
+                self._refuse_tool(t)
+
+    def _refuse_tool(self, t: Any) -> None:
+        """One tool definition against `dispatch_tool_types`, wherever the body declared it. A server tool is left to
+        `_unbounded`, which names it `body-unbounded`."""
+        if not isinstance(t, dict) or "type" not in t:
+            return    # a client tool carries no `type`; a non-object is the provider's to refuse
+        name = _tool_name(t)
+        if name is None:
+            raise norm.Refused("body-unlisted:tool", "a tool type levain has not judged")
+        if name in self.dispatch_tool_types or name in self.server_tools or name.startswith(self.server_tool_prefixes):
             return
-        for t in tools:
-            if not isinstance(t, dict) or "type" not in t:
-                continue    # a client tool carries no `type`; a non-object is the provider's to refuse
-            name = _tool_name(t)
-            if name is None:
-                raise norm.Refused("body-unlisted:tool", "a tool type levain has not judged")
-            if name in self.dispatch_tool_types or name in self.server_tools or name.startswith(self.server_tool_prefixes):
-                continue
-            raise norm.Refused("body-unlisted:" + _wire_what(name, "tool"), "a tool type levain has not judged; "
-                               "dispatch admits only judged tool types")
+        raise norm.Refused("body-unlisted:" + _wire_what(name, "tool"), "a tool type levain has not judged; "
+                           "dispatch admits only judged tool types")
+
+    def _tool_lists(self, obj: Mapping[str, Any]) -> List[Any]:
+        """Every tool list the body declares, each as the client sent it: top-level `tools` when present, then the
+        codec's inline positions (`_inline_tool_lists`). The tool allowlist and the server-tool naming both read it."""
+        out: List[Any] = [obj["tools"]] if "tools" in obj else []
+        out.extend(self._inline_tool_lists(obj))
+        return out
+
+    def _inline_tool_lists(self, obj: Mapping[str, Any]) -> List[Any]:
+        """Tool lists a codec's provider documents inside the content (a tool declared mid-conversation)."""
+        return []
 
     def _unbounded(self, obj: Mapping[str, Any], price: Price) -> Tuple[str, ...]:
         found: List[str] = []
@@ -282,10 +299,9 @@ class Codec:
         return []
 
     def _tools(self, obj: Mapping[str, Any]) -> List[str]:
-        tools = obj.get("tools")
-        if not isinstance(tools, list):
-            return []
-        return [n for n in map(_tool_name, tools) if n is not None]
+        """The type names of every tool the body declares (`_tool_lists`), version suffix removed."""
+        return [n for tools in self._tool_lists(obj) if isinstance(tools, list)
+                for n in map(_tool_name, tools) if n is not None]
 
     def _block_types(self, obj: Any) -> List[str]:
         """Every `type` string of every object anywhere in the body (a block can nest: a tool result holds blocks)."""
@@ -808,6 +824,31 @@ class AnthropicMessages(Codec):
             return ["context_management"]
         return []
 
+    def _inline_tool_lists(self, obj: Mapping[str, Any]) -> List[Any]:
+        """A tool declared mid-conversation: a `messages[].content[]` `tool_addition` block whose `tool` is a
+        `tool_definition` holds a full tool entry in `definition`, and a `compaction` block's `tool_changes[]` holds
+        such additions (the SDK's beta content-block params). A `tool_reference` names a tool already declared."""
+        out: List[Any] = []
+        messages = obj.get("messages")
+        for m in messages if isinstance(messages, list) else ():
+            content = m.get("content") if isinstance(m, dict) else None
+            for b in content if isinstance(content, list) else ():
+                if not isinstance(b, dict):
+                    continue
+                if b.get("type") == "tool_addition":
+                    out.extend(self._definition(b))
+                elif b.get("type") == "compaction" and isinstance(b.get("tool_changes"), list):
+                    out.extend(d for c in b["tool_changes"]
+                               if isinstance(c, dict) and c.get("type") == "tool_addition" for d in self._definition(c))
+        return out
+
+    @staticmethod
+    def _definition(addition: Mapping[str, Any]) -> List[Any]:
+        tool = addition.get("tool")
+        if isinstance(tool, dict) and tool.get("type") == "tool_definition":
+            return [[tool.get("definition")]]
+        return []
+
     def _empty_image(self, d: Dict[str, Any]) -> Dict[str, Any]:
         src = d.get("source")
         if isinstance(src, dict) and "data" in src:
@@ -994,6 +1035,13 @@ class OpenAIResponses(_OpenAI):
     # OpenAI access programs and image options, and OpenRouter's debug, image and server-tool-loop controls
     unjudged_fields = ("background", "context_management", "moderation", "modalities", "access_programs", "image",
                        "prompt_cache_options", "image_config", "debug", "deferred_tools", "stop_server_tools_when")
+
+    def _inline_tool_lists(self, obj: Mapping[str, Any]) -> List[Any]:
+        """A tool declared mid-input: the `tools` of an `additional_tools` or a `tool_search_output` item in `input[]`
+        (`ResponseInputItemParam`)."""
+        items = obj.get("input")
+        return [i["tools"] for i in (items if isinstance(items, list) else ())
+                if isinstance(i, dict) and i.get("type") in ("additional_tools", "tool_search_output") and "tools" in i]
 
     # Usage: a non-stream body's `usage`; a stream's `response.completed` `response.usage`, and
     # `response.incomplete`'s (the call that stopped at its ceiling ends with that event, not `completed`)
