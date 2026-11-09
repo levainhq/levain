@@ -60,6 +60,10 @@ _FAKE = textwrap.dedent('''\
         if mode in ("ctl_exit", "ctl_exit_empty_leak"):
             sys.stderr.write("ctl boom\\n")
             sys.exit(3)
+        if mode == "ctl_exit_orphan":
+            child = subprocess.Popen(["sleep", "60"])
+            open(os.path.join(side, "child.pid"), "w").write(str(child.pid))
+            sys.exit(3)
         if mode in ("ctl_api_first", "ctl_api_first_leak"):
             api()
             time.sleep(0.5)
@@ -280,6 +284,60 @@ def test_teardown_waits_a_short_fixed_time_for_each_leader(tmp_path, monkeypatch
 def test_a_hung_probe_stops_within_its_timeout_plus_its_stated_overrun(tmp_path):
     r, took = _run(tmp_path, "hang_empty", timeout=1.5)
     assert r.verdict == "inconclusive" and took <= 1.5 + ssc.OVERRUN + 0.5, (r, took)
+
+
+def test_a_stderr_pipe_that_never_runs_dry_cannot_hold_the_probe_past_its_timeout(tmp_path, monkeypatch):
+    procs: list = []
+    real_popen = subprocess.Popen
+
+    class Recording(real_popen):  # type: ignore[misc, valid-type]
+        def __init__(self, *a, **kw):
+            super().__init__(*a, **kw)
+            procs.append(self)
+    monkeypatch.setattr(ssc.subprocess, "Popen", Recording)
+    real_read = os.read
+    give_up = time.monotonic() + 1.5 + ssc.OVERRUN + 3.0  # past this the pipe runs dry, so a hang still ends
+
+    def read(fd, n):
+        if time.monotonic() < give_up and any(p.stderr is not None and not p.stderr.closed and
+                                              p.stderr.fileno() == fd for p in procs):
+            return b"x" * n
+        return real_read(fd, n)
+    monkeypatch.setattr(ssc.os, "read", read)
+    r, took = _run(tmp_path, "hang_empty", timeout=1.5)
+    assert r.verdict == "inconclusive" and took <= 1.5 + ssc.OVERRUN + 0.5, (r, took)
+
+
+def test_a_leader_reaped_early_is_never_signalled_by_number_and_its_grandchild_still_dies(tmp_path, monkeypatch):
+    procs: list = []
+    real_popen = subprocess.Popen
+
+    class Recording(real_popen):  # type: ignore[misc, valid-type]
+        def __init__(self, *a, **kw):
+            super().__init__(*a, **kw)
+            procs.append(self)
+    monkeypatch.setattr(ssc.subprocess, "Popen", Recording)
+    signalled = []
+    real_killpg = os.killpg
+
+    def killpg(pgid, sig):
+        leader = [p for p in procs if p.pid == pgid]
+        signalled.append((pgid, leader[0].returncode if leader else "no leader"))
+        real_killpg(pgid, sig)
+    monkeypatch.setattr(ssc.os, "killpg", killpg)
+    r, _ = _run(tmp_path, "ctl_exit_orphan")
+    assert r.verdict == "inconclusive", r
+    assert signalled and all(code is None for _pgid, code in signalled), signalled
+    pid = int((tmp_path / "side" / "child.pid").read_text())
+    deadline = time.monotonic() + 3
+    alive = True
+    while alive and time.monotonic() < deadline:
+        try:
+            os.kill(pid, 0)
+            time.sleep(0.05)
+        except ProcessLookupError:
+            alive = False
+    assert not alive, (r, pid)
 
 
 def _row(tmp_path, version, verdict="held"):

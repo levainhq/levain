@@ -29,6 +29,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from levain.host_guard import SEAT_SOURCE_ARGS
+from levain.slot.probe import exited_unreaped
 
 __all__ = ["OVERRUN", "ProbeResult", "run_probe"]
 
@@ -39,6 +40,8 @@ _POLL = 0.02  # the loop's longest sleep: a socket or stderr event wakes it soon
 _ORDER_MARGIN = 0.05  # the control's marker must precede its model request by more than this (above _POLL)
 _SETTLE = 0.5  # the bounded wait before a held verdict, and before an early inconclusive return
 _REAP_WAIT = 0.5  # after SIGKILL, how long one run's teardown waits for its leader to be reaped
+_ERR_CHUNK = 65536  # one stderr read
+_FINAL_READS = 4  # the stderr reads after the group is killed, so a reject's last line reaches the detail
 OVERRUN = _SETTLE + 2 * _REAP_WAIT  # how far past ``timeout`` the probe can run: one settle plus both teardowns
 
 _LEAKED_DETAIL = '--setting-sources "" still loaded the project settings (its hook fired)'
@@ -85,6 +88,7 @@ class _Run:
         self.marker_seen: float | None = None  # the first poll that found the marker (monotonic)
         self.proc: subprocess.Popen[bytes] | None = None
         self._stopped = False
+        self._killed = False
         self.listener = socket.create_server(("127.0.0.1", 0))
         self.listener.setblocking(False)
         port = self.listener.getsockname()[1]
@@ -138,14 +142,16 @@ class _Run:
         if not data or len(self.heads[conn]) >= _LINE_CAP:
             self._unregister(conn)
 
-    def _drain_err(self) -> None:
-        """Move what the stderr pipe holds into the bounded tail: the LAST ``_STDERR_CAP`` bytes are kept."""
+    def _drain_err(self, reads: int = 1) -> None:
+        """Move up to ``reads`` chunks of the stderr pipe into the bounded tail: the LAST ``_STDERR_CAP`` bytes are
+        kept. Bounded per call, so a pipe that never runs dry cannot keep the judge from its deadline; the selector
+        reports what is left on the next poll."""
         if not self.err_open or self.proc is None or self.proc.stderr is None:
             return
         fd = self.proc.stderr.fileno()
-        while True:
+        for _ in range(reads):
             try:
-                chunk = os.read(fd, 65536)
+                chunk = os.read(fd, _ERR_CHUNK)
             except (BlockingIOError, InterruptedError):
                 return
             except OSError:
@@ -180,31 +186,43 @@ class _Run:
             return False
         return stamped + _ORDER_MARGIN < self.post_wall
 
-    def exited(self) -> int | None:
-        return self.proc.poll() if self.proc is not None else None
+    def exited(self) -> bool:
+        """True once the leader has exited. It is not reaped here: it stays a zombie until ``_kill``, so its pid, which
+        is the group's id, cannot be reused before the group is signalled."""
+        if self.proc is None:
+            return False
+        return self.proc.returncode is not None or exited_unreaped(self.proc.pid, 0.0)
 
     def why_exited(self) -> str:
-        self._drain_err()
+        self._kill()
+        self._drain_err(_FINAL_READS)
         err = self.err_tail.decode("utf-8", "replace").strip()
         code = self.proc.returncode if self.proc is not None else None
         return f"exited {code}" + (f": {err}" if err else " with no stderr")
 
+    def _kill(self) -> None:
+        """Kill the run's process group once, then reap its leader within a short fixed wait. Only this method reaps,
+        and it signals first, so the group is never signalled by a number whose leader was already reaped."""
+        if self._killed or self.proc is None:
+            return
+        self._killed = True
+        try:
+            os.killpg(self.proc.pid, signal.SIGKILL)
+        except (ProcessLookupError, PermissionError):
+            pass
+        try:
+            self.proc.wait(timeout=_REAP_WAIT)
+        except (OSError, subprocess.SubprocessError):
+            pass
+
     def stop(self) -> None:
-        """Kill the run's process group once, reap its leader within a short fixed wait, close its sockets and pipe.
-        Idempotent: a second call never signals a pid that was already reaped."""
+        """Kill the run's process group (once, via ``_kill``), close its sockets and pipe. Idempotent."""
         if self._stopped:
             return
         self._stopped = True
         if self.proc is not None:
-            try:
-                os.killpg(self.proc.pid, signal.SIGKILL)
-            except (ProcessLookupError, PermissionError):
-                pass
-            try:
-                self.proc.wait(timeout=_REAP_WAIT)
-            except (OSError, subprocess.SubprocessError):
-                pass
-            self._drain_err()
+            self._kill()
+            self._drain_err(_FINAL_READS)
             if self.err_open and self.proc.stderr is not None:
                 self._unregister(self.proc.stderr)
                 self.proc.stderr.close()
@@ -233,7 +251,7 @@ def _settle(sel: selectors.BaseSelector, ctl: _Run, empty: _Run, *, until_empty_
         _pump(sel, (ctl, empty), min(_POLL, max(0.0, end - time.monotonic())))
         if empty.marker_seen is not None:
             return
-        if until_empty_acts and (empty.post_mono is not None or empty.exited() is not None):
+        if until_empty_acts and (empty.post_mono is not None or empty.exited()):
             return
 
 
@@ -255,7 +273,7 @@ def _judge(ctl: _Run, empty: _Run, sel: selectors.BaseSelector, timeout: float) 
             if not ctl_ok:
                 return early("the control's project hook did not fire clearly before its model request, so the order "
                              "this probe relies on does not hold on this version")
-        if ctl_ok is None and ctl.exited() is not None:
+        if ctl_ok is None and ctl.exited():
             return early(f"the control run {ctl.why_exited()}")
         if empty.post_mono is not None:
             if ctl_ok:
@@ -265,7 +283,7 @@ def _judge(ctl: _Run, empty: _Run, sel: selectors.BaseSelector, timeout: float) 
                 return ProbeResult("held", f"the control fired its project hook before its POST {_MODEL_PATH}; "
                                    f"the empty-list run sent its POST {_MODEL_PATH} with no hook, in "
                                    f"{time.monotonic() - t0:.1f}s")
-        elif empty.exited() is not None:
+        elif empty.exited():
             return ProbeResult("inconclusive", (f'the --setting-sources "" run {empty.why_exited()} before its '
                                                 "model request")[:400])
         if time.monotonic() - t0 > timeout:
