@@ -354,3 +354,38 @@ def test_poisoned_does_not_report_an_effect_its_owner_is_committing(j, monkeypat
     owner.join(10)
     monkeypatch.undo()
     assert j.peek("r1", "send").status is EffectStatus.REPLAYED and j.poisoned() == []
+
+
+def _journal_fullfsync_raising(monkeypatch, code: int) -> list:
+    import errno
+    from levain.autonomic import journal as J
+
+    plain: list = []
+    monkeypatch.setattr(J.fcntl, "F_FULLFSYNC", 51, raising=False)
+
+    def fake_fcntl(fd, op, *a):
+        raise OSError(code, os.strerror(code))
+
+    monkeypatch.setattr(J.fcntl, "fcntl", fake_fcntl)
+    monkeypatch.setattr(J.os, "fsync", lambda fd: plain.append(fd))
+    return plain
+
+
+def test_durable_fsync_propagates_eio_and_does_not_fall_back(monkeypatch):
+    import errno
+    from levain.autonomic import journal as J
+
+    plain = _journal_fullfsync_raising(monkeypatch, errno.EIO)
+    with pytest.raises(OSError) as ei:
+        J.durable_fsync(7)
+    assert ei.value.errno == errno.EIO
+    assert plain == []
+
+
+def test_durable_fsync_falls_back_when_the_filesystem_has_no_fullfsync(monkeypatch):
+    import errno
+    from levain.autonomic import journal as J
+
+    plain = _journal_fullfsync_raising(monkeypatch, errno.ENOTSUP)
+    J.durable_fsync(7)
+    assert plain == [7]

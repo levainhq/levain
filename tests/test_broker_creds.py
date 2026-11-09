@@ -657,3 +657,32 @@ def test_p7_the_sweep_matches_exactly_the_generated_temp_names(cred_dir):
     _commit_now(cred_dir, _fields())
     assert not ours.exists()
     assert all((cred_dir / n).exists() for n in never_ours)
+
+
+def _fullfsync_raising(monkeypatch, code: int) -> list:
+    """Darwin's path with `F_FULLFSYNC` answering `code`; the list records plain `os.fsync` calls."""
+    plain: list = []
+    monkeypatch.setattr(C.sys, "platform", "darwin")
+    monkeypatch.setattr(C.fcntl, "F_FULLFSYNC", 51, raising=False)
+
+    def fake_fcntl(fd, op, *a):
+        raise OSError(code, os.strerror(code))
+
+    monkeypatch.setattr(C.fcntl, "fcntl", fake_fcntl)
+    monkeypatch.setattr(C.os, "fsync", lambda fd: plain.append(fd))
+    return plain
+
+
+def test_full_fsync_propagates_eio_and_does_not_fall_back(monkeypatch):
+    plain = _fullfsync_raising(monkeypatch, errno.EIO)
+    with pytest.raises(OSError) as ei:
+        C.full_fsync(7)
+    assert ei.value.errno == errno.EIO
+    assert plain == []
+
+
+@pytest.mark.parametrize("code", [errno.ENOTSUP, errno.EOPNOTSUPP, errno.EINVAL, errno.ENOTTY])
+def test_full_fsync_falls_back_to_fsync_when_the_filesystem_has_no_fullfsync(monkeypatch, code):
+    plain = _fullfsync_raising(monkeypatch, code)
+    C.full_fsync(7)
+    assert plain == [7]

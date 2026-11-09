@@ -63,6 +63,7 @@ leases are files in the same directory. Stdlib only.
 from __future__ import annotations
 
 import enum
+import errno
 import fcntl
 import hashlib
 import json
@@ -290,8 +291,10 @@ def durable_fsync(fd: int) -> None:
         try:
             fcntl.fcntl(fd, full)
             return
-        except OSError:
-            pass   # a filesystem without it (some network mounts): fall back to fsync
+        except OSError as e:
+            # a filesystem without it (some network mounts) falls back to fsync; any other error (EIO) is a failed flush
+            if e.errno not in (errno.ENOTSUP, errno.EOPNOTSUPP, errno.EINVAL, errno.ENOTTY):
+                raise
     os.fsync(fd)
 
 

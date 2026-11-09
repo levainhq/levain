@@ -379,15 +379,22 @@ class Outcome:
         return f"Outcome({self.result}, rev={self.rev!r}, durable={self.durable})"
 
 
+#: The errnos that mean the filesystem has no `F_FULLFSYNC`; any other error (EIO above all) is a failed flush.
+_FULLSYNC_UNSUPPORTED = frozenset({errno.ENOTSUP, errno.EOPNOTSUPP, errno.EINVAL, errno.ENOTTY})
+
+
 def full_fsync(fd: int) -> None:
-    """`F_FULLFSYNC` on macOS (a plain fsync there does not reach the medium), and `os.fsync` if that raises (some
-    filesystems refuse it: SMB, NFS, some FUSE mounts); `os.fsync` elsewhere. One rule for a file and a directory."""
+    """`F_FULLFSYNC` on macOS (a plain fsync there does not reach the medium), and `os.fsync` only when that fcntl
+    answers ENOTSUP, EOPNOTSUPP, EINVAL or ENOTTY (a filesystem without it: SMB, NFS, some FUSE mounts); any other
+    error, EIO included, propagates, so a failing disk never reads as a durable write. `os.fsync` elsewhere. One rule
+    for a file and a directory."""
     if sys.platform == "darwin":
         try:
             fcntl.fcntl(fd, fcntl.F_FULLFSYNC)
             return
-        except OSError:
-            pass
+        except OSError as e:
+            if e.errno not in _FULLSYNC_UNSUPPORTED:
+                raise
     os.fsync(fd)
 
 
