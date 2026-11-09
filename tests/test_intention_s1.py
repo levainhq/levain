@@ -287,3 +287,17 @@ def test_r2g_an_empty_or_none_path_falls_back(tmp_path: Path, monkeypatch) -> No
         ns = argparse.Namespace(queue_dir=qdir, number="1", until="2026-11-10", path=path, note=None)
         rc = band_view.run_band_snooze(ns)       # no row 1: a refusal, never a TypeError
         assert rc != 0
+
+
+# --- merge with List item 1: Done never duplicates a band intention --------------------------------------------------------
+
+
+def test_m1_an_answered_intention_is_one_done_row_and_never_its_band_row_too(rig: Rig) -> None:
+    sid = _stamped_agenda(rig)
+    assert f"band:{rig.q.id}" in rig.rows() and f"done:{sid}" not in rig.rows()      # ringing: the band row only
+    rig.qs.answer(rig.q.id, option="ship", channel="cli")
+    res = g.germinate(rig.root / ".levain" / "memory.spores.json", rig.qdir, install=rig.root, today=GTODAY)
+    assert [o["spore_id"] for o in res["finish"]] == [sid], res
+    ids = set(rig.rows())
+    assert f"done:{sid}" in ids
+    assert f"band:{rig.q.id}" not in ids and f"spore:{sid}" not in ids
