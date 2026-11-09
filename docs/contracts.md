@@ -333,9 +333,11 @@ the envelope's `where` repos, `count` is a whole number from 1 to 4 (the default
   only way to say "no grant".
 - **It is not an effect.** `launches` is not in the lists a role ceiling narrows by, and the ceiling checks refuse it; a role's
   scope cut from an envelope never carries it, and neither does a seat lease.
-- **Who may set it.** The cockpit's own "Add an envelope" modal, with a toggle that is off by default. A paired phone cannot, on
-  its own sheet or on the cockpit's routes: the server decides by the credential the request was authenticated with (a paired
-  device's token runs as that device), never by anything the page sends.
+- **Who may set it.** The "Add an envelope" window, with a toggle that is off by default, signed with an enrolled passkey. The
+  server decides by the credential the request was authenticated with (a paired device's token runs as that device), never by
+  anything the page sends: the cockpit page and any device paired from it (directly or through another device it paired) may;
+  another surface's token, and any device that surface paired, may not. The rule is `_Handler._coord_may_launch` in
+  `levain/web_server.py`, and the sheet learns the answer as `coord_may_launch` on `GET /cockpit/coord/drops.json`.
 - **Never carried forward.** The desk counts launches per envelope, so a grant copied into a successor would start counting
   again. `levain envelope extend` leaves the head's grant out, and its card shows it removed. A conversation draft never
   carries one either: a renewal or replacement drops it (its card shows it removed), and a draft that names `launches` is
