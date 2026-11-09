@@ -1497,7 +1497,12 @@ class TestListPagePins:
         row = self._fn(core, "  function sporeRow(", "  // The filter bar the spore panels share")
         foreign = row[row.index("if (foreign) {"):]
         foreign = foreign[:foreign.index("return row;")]
-        assert "buildSporeVerbs" not in foreign and "appendRowVerbs" not in foreign 
+        # no spore verb, ever; the one thing a band row may draw is the four intention controls, and only when the row carries
+        # an intention the kernel offered them on
+        assert "buildSporeVerbs" not in foreign
+        calls = [ln for ln in foreign.splitlines() if "appendRowVerbs(" in ln]
+        assert all("buildIntentionVerbs(" in ln and "if (intend)" in ln for ln in calls), calls
+        assert 'const intend = s.surface === "band" && s.intention && s.row_id && hasIntentionControls(s.actions);' in foreign
 
     def test_the_frozen_payload_offers_band_and_board_rows_no_verb_and_the_panel_offers_the_intake(self) -> None:
         import json
