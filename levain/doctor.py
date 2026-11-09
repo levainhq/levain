@@ -180,6 +180,7 @@ def _run_doctor(path: Path, invoke: bool = False, repin_hooks: bool = False) -> 
     core.extend(_guarded(_BROKERED, lambda: _check_brokered_launcher(install)))
     core.extend(_check_slot_services())
     core.extend(_guarded("agent fence", lambda: _check_agent_fence(install=path)))
+    core.extend(_guarded("queue answers", _check_queue_answers))
     for r in core:
         _emit(r)
     print(spend_cap_note())
@@ -2473,6 +2474,49 @@ def _check_agent_fence(*, host: str | None = None, store: Path | None = None, ru
                             "runs as you and names this install's store and cockpit root.")]
     return [CheckResult(name, True, f"running (store {show(val['store'])}, authority seq {val['seq']}). Dispatch "
                         "sessions are checked on every tool call.")]
+
+
+def _check_queue_answers(*, host: str | None = None, store: Path | None = None, uid: int | None = None,
+                         lstat: Any = None, qbroker_gid: Any = None) -> list[CheckResult]:
+    """The ``queue answers`` row: the directory the operator's answers are written in must be the operator's, in the
+    queue broker's group, mode 2750 (0750 without setgid), so no other principal can create a file there. An install
+    set up before that shape has the queue group and a group-write bit: it works, and dispatch (a member of that
+    group) could still create a file at an answer's name, so the row warns and never fails. Read as the operator.
+    No row before the isolation install. ``lstat``/``qbroker_gid``/``uid``: a test's seams."""
+    name = "queue answers"
+    if not hasattr(os, "getuid"):
+        return []
+    import grp
+    import stat as st_mod
+
+    from levain.slot import layout
+
+    if host is None:
+        host = "darwin" if sys.platform == "darwin" else "linux"
+    store = store if store is not None else layout.STORE.get(host)
+    if store is None or not (store / "policy").is_dir():
+        return []
+    me = os.getuid() if uid is None else uid
+    if me == 0:
+        return [CheckResult(name, True, "not read: run as root, and the directory is the operator's to check",
+                            "Run `levain doctor` as the operator to see it.", neutral=True)]
+    path = store / "queue" / "answers"
+    try:
+        st = (lstat or os.lstat)(path)
+    except OSError as exc:
+        return [CheckResult(name, False, f"{path} cannot be read ({type(exc).__name__}); the queue broker has no "
+                            "place to find the operator's answers", "Run `levain upgrade`.")]
+    try:
+        gid = (qbroker_gid or (lambda: grp.getgrnam("_levain_qbroker").gr_gid))()
+    except KeyError:
+        return [CheckResult(name, False, "there is no _levain_qbroker group, so no queue broker can read the "
+                            "operator's answers", f"Run `{layout.repair_line(host)}`.")]
+    if (st_mod.S_ISDIR(st.st_mode) and st.st_uid == me and st.st_gid == gid
+            and st_mod.S_IMODE(st.st_mode) in (0o2750, 0o750)):
+        return [CheckResult(name, True, "only you can write the queue's answers; the queue broker reads them")]
+    return [CheckResult(name, True, f"{path} is not owner you, group _levain_qbroker, 2750: dispatch can still create "
+                        "files in the queue's answers directory (an answer is only ever trusted by its signature)",
+                        "Run `levain upgrade`.", warn=True)]
 
 
 def _check_host_awake() -> list[CheckResult]:
