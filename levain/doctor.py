@@ -2477,12 +2477,12 @@ def _check_agent_fence(*, host: str | None = None, store: Path | None = None, ru
 
 
 def _check_queue_answers(*, host: str | None = None, store: Path | None = None, uid: int | None = None,
-                         lstat: Any = None, qbroker_gid: Any = None) -> list[CheckResult]:
+                         lstat: Any = None, qbroker_gid: Any = None, legacy_gid: Any = None) -> list[CheckResult]:
     """The ``queue answers`` row: the directory the operator's answers are written in must be the operator's, in the
-    queue broker's group, mode 2750 (0750 without setgid), so no other principal can create a file there. An install
-    set up before that shape has the queue group and a group-write bit: it works, and dispatch (a member of that
-    group) could still create a file at an answer's name, so the row warns and never fails. Read as the operator.
-    No row before the isolation install. ``lstat``/``qbroker_gid``/``uid``: a test's seams."""
+    queue broker's group, mode 2750 (0750 only on macOS, where a new file takes the directory's group), so no other
+    principal can create a file there. Exactly the old shape (the operator's, group levain-queue, mode 2770) works
+    and warns; any other shape fails. The mode bits do not show an ACL, and none is read. Read as the operator.
+    No row before the isolation install. ``lstat``/``qbroker_gid``/``legacy_gid``/``uid``: a test's seams."""
     name = "queue answers"
     if not hasattr(os, "getuid"):
         return []
@@ -2511,12 +2511,25 @@ def _check_queue_answers(*, host: str | None = None, store: Path | None = None, 
     except KeyError:
         return [CheckResult(name, False, "there is no _levain_qbroker group, so no queue broker can read the "
                             "operator's answers", f"Run `{layout.repair_line(host)}`.")]
-    if (st_mod.S_ISDIR(st.st_mode) and st.st_uid == me and st.st_gid == gid
-            and st_mod.S_IMODE(st.st_mode) in (0o2750, 0o750)):
-        return [CheckResult(name, True, "only you can write the queue's answers; the queue broker reads them")]
-    return [CheckResult(name, True, f"{path} is not owner you, group _levain_qbroker, 2750: dispatch can still create "
-                        "files in the queue's answers directory (an answer is only ever trusted by its signature)",
-                        "Run `levain upgrade`.", warn=True)]
+    try:
+        legacy = (legacy_gid or (lambda: grp.getgrnam("levain-queue").gr_gid))()
+    except KeyError:
+        legacy = None
+    mode = st_mod.S_IMODE(st.st_mode)
+    # A new file takes the directory's group only where the directory is setgid (Linux) or always (BSD semantics).
+    target_modes = (0o2750, 0o750) if host == "darwin" else (0o2750,)
+    isdir = st_mod.S_ISDIR(st.st_mode)
+    if isdir and st.st_uid == me and st.st_gid == gid and mode in target_modes:
+        return [CheckResult(name, True, "only you can write the queue's answers; the queue broker reads them (ACLs "
+                            "on the directory were not read; the repair clears them with chmod -N)")]
+    if isdir and st.st_uid == me and legacy is not None and st.st_gid == legacy and mode == 0o2770:
+        return [CheckResult(name, True, f"{path} is in the old shape (group levain-queue, 2770): it works, but dispatch "
+                            "can still create files in the queue's answers directory (an answer is only ever trusted "
+                            "by its signature)", "Run `levain upgrade`.", warn=True)]
+    return [CheckResult(name, False, f"{path} is not owner you, group _levain_qbroker, mode "
+                        f"{'2750 (or 0750)' if host == 'darwin' else '2750'}, and not the old shape either: the queue "
+                        "broker may not be able to read your answers, or another principal can write them",
+                        "Run `levain upgrade`.")]
 
 
 def _check_host_awake() -> list[CheckResult]:
