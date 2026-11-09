@@ -171,6 +171,9 @@ class Question:
     # :func:`levain.band_view._later_date` to fold a row that comes back on a later day into its LATER line
     snoozed_until: str | None = None
     dated: str | None = None
+    # the spore id of the open intention this row rings (an open agenda whose stamp names the row), projected by the host at
+    # read time and never stored here. None = a machine-filed row, which keeps its answer options
+    intention: str | None = None
 
     @property
     def open_ended(self) -> bool:
@@ -183,6 +186,23 @@ def open_ended_of(q: Any) -> bool:
     """:attr:`Question.open_ended` for any question-shaped object, a foreign store's own type of the older shape
     (no ``open_ended``) included: there the same rule, no options."""
     return bool(getattr(q, "open_ended", not q.options))
+
+
+INTENTION_ACTIONS = ("snooze", "edit", "done", "clear")
+INTENTION_ID = re.compile(r"spore-[0-9A-Za-z_-]{1,56}")
+
+
+def valid_intention_id(value: Any) -> bool:
+    return isinstance(value, str) and INTENTION_ID.fullmatch(value) is not None
+
+
+def intention_of(store: Any, q: Any) -> str | None:
+    """The spore id of the open intention ``q`` rings, only when ``store`` can act on it (a host with no callable
+    ``intention_act`` offers no controls, so the row stays a plain answerable one) and ``q`` is still open."""
+    if not callable(getattr(store, "intention_act", None)) or getattr(q, "answer", None) is not None:
+        return None
+    got = getattr(q, "intention", None)
+    return got if valid_intention_id(got) else None
 
 
 @dataclass(frozen=True)

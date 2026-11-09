@@ -29,7 +29,7 @@ from typing import Any, Callable
 from levain import spores
 from levain.cockpit import board as cockpit_board
 from levain.cockpit.display_safe import visible
-from levain.cockpit.engine import Cockpit, ProviderSpec, ReadContext
+from levain.cockpit.engine import INTENTION_VERBS, Cockpit, ProviderSpec, ReadContext
 from levain.cockpit import providers as _prov
 from levain.cockpit.providers import (
     SPORE_FACETS,
@@ -50,13 +50,13 @@ from levain.dashboard import SubstrateSource
 LIST_PANEL_ID = "tray"          # the wire id (a code name); the operator-facing title is "List"
 LIST_TITLE = "List"
 LIST_ROWSET = "spore:tray"
-LIST_VERBS = SPORE_ROW_VERBS + ("spore_seed", "list_intake")      # a verb the registry does not know yet is simply not offered
+LIST_VERBS = SPORE_ROW_VERBS + ("spore_seed", "list_intake", *INTENTION_VERBS)      # a verb the registry does not know yet is simply not offered
 LIST_NOTE = "Band rows are what only you can answer: answer them in Decisions. Board rows are the agents' ready queue."
 BAND_POINTER = "answer it in Decisions (levain band)"
 BOARD_POINTER = "the agents' ready queue (levain board)"
 LIST_FACETS = SPORE_FACETS | frozenset({
     "surface", "fires", "overdue", "target", "attention", "list_pointer", "band_number", "board_rank", "board_tier",
-    "source", "repo", "held_until", "band_section", "band_carried", "band_age", "band_later_words",
+    "source", "repo", "held_until", "intention", "band_section", "band_carried", "band_age", "band_later_words",
 })
 SURFACES = ("band", "board", "spore", "talk", "drop")
 
@@ -188,6 +188,42 @@ def _age_text(instant: Any, now: datetime) -> str | None:
     return f"{h // 24}d{h % 24}h" if h >= 24 else f"{h}h" if h else f"{int(secs // 60)}m"
 
 
+def _band_row(card: dict[str, Any], today: date, now: datetime) -> RowIn:
+    """One needs-you card as a read-only band row."""
+    ref = str(card.get("id", ""))
+    title = visible(str(card.get("title") or "")) or "(no text)"
+    facets: dict[str, Any] = {"surface": "band", "list_pointer": BAND_POINTER,
+                              "band_number": card.get("number") if isinstance(card.get("number"), int)
+                              and not isinstance(card.get("number"), bool) else None}
+    src = card.get("source")
+    if isinstance(src, str) and src:
+        facets["source"] = visible(src)
+    filed = opened_day(card.get("filed_at"))
+    if filed and filed <= today:
+        facets["age_days"] = (today - filed).days
+    # the age a band row shows is the clock flow's footer reads (the row's refile instant when the host sends one, else its
+    # add instant), in the footer's own form, never a whole-day count
+    age = _age_text(card.get("since") or card.get("filed_at"), now)
+    if age:
+        facets["band_age"] = age
+    later = card.get("later")
+    if isinstance(later, str) and parse_date(later):
+        facets["held_until"] = later[:10]
+    if isinstance(card.get("intention"), str):
+        facets["intention"] = card["intention"]
+    if card.get("section") in ("you", "desk"):
+        facets["band_section"] = card["section"]
+    if isinstance(card.get("carried"), bool):
+        facets["band_carried"] = card["carried"]
+    words = card.get("later_words")
+    if "held_until" in facets and isinstance(words, str) and words:
+        facets["band_later_words"] = words
+    blocks = card.get("blocks")
+    return RowIn(
+        id=ref, title=title, body=visible(blocks) if isinstance(blocks, str) and blocks else None, facets=facets,
+        stored=_stored(ref, title, "band", facets.get("source", ""), facets.get("held_until"), BAND_POINTER))
+
+
 def _board_part(store_dir: Any, question_store: Any, today: date, now: datetime) -> _Part:
     """The band's open items and the coordinator's ready column, as read-only rows. ``board.build`` never raises; what it could
     not read is named."""
@@ -201,38 +237,9 @@ def _board_part(store_dir: Any, question_store: Any, today: date, now: datetime)
     if others:
         out.skipped.append((1, f"the agents' board could not be fully read ({', '.join(others)})"))
     for card in cols.get("needs-you", ()):
-        ref = str(card.get("id", ""))
-        title = visible(str(card.get("title") or "")) or "(no text)"
-        facets: dict[str, Any] = {"surface": "band", "list_pointer": BAND_POINTER,
-                                  "band_number": card.get("number") if isinstance(card.get("number"), int)
-                                  and not isinstance(card.get("number"), bool) else None}
-        src = card.get("source")
-        if isinstance(src, str) and src:
-            facets["source"] = visible(src)
-        filed = opened_day(card.get("filed_at"))
-        if filed and filed <= today:
-            facets["age_days"] = (today - filed).days
-        # the age a band row shows is the clock flow's footer reads (the row's refile instant when the host sends one, else its
-        # add instant), in the footer's own form, never a whole-day count
-        age = _age_text(card.get("since") or card.get("filed_at"), now)
-        if age:
-            facets["band_age"] = age
-        later = card.get("later")
-        if isinstance(later, str) and parse_date(later):
-            facets["held_until"] = later[:10]
-        if card.get("section") in ("you", "desk"):
-            facets["band_section"] = card["section"]
-        if isinstance(card.get("carried"), bool):
-            facets["band_carried"] = card["carried"]
-        words = card.get("later_words")
-        if "held_until" in facets and isinstance(words, str) and words:
-            facets["band_later_words"] = words
         if card.get("unreadable"):
             out.skipped.append((1, "a band item that could not be read"))
-        blocks = card.get("blocks")
-        out.rows.append(RowIn(
-            id=ref, title=title, body=visible(blocks) if isinstance(blocks, str) and blocks else None, facets=facets,
-            stored=_stored(ref, title, "band", facets.get("source", ""), facets.get("held_until"), BAND_POINTER)))
+        out.rows.append(_band_row(card, today, now))
     for card in cols.get("ready", ()):
         rid = f"board:{card.get('id')}"
         title = visible(str(card.get("title") or "")) or "(no title)"
@@ -268,11 +275,21 @@ def list_reader(source: SubstrateSource, ck: Cockpit) -> Callable[[ReadContext],
     return read
 
 
-def list_read_one(source: SubstrateSource) -> Callable[[ReadContext, str], Result]:
-    """One row from the SOURCE, for a write. Only a ``spore:`` row is ever a write target; a band or board row is read-only."""
+def list_read_one(source: SubstrateSource, ck: Cockpit | None = None) -> Callable[[ReadContext, str], Result]:
+    """One row from the SOURCE, for a write. A ``spore:`` row is a write target; so is a ``band:`` row that rings an intention
+    (its version is the row's own, read from the host's band now, so an act on a row that has since moved or closed is stale).
+    Any other band row and every board row is read-only."""
     seen = [False]
 
     def read_one(ctx: ReadContext, row_id: str) -> Result:
+        if row_id.startswith("band:") and ck is not None and ck.question_store is not None:
+            cards, bad = cockpit_board._band_cards(ck.question_store)
+            if bad:
+                return Fault("the needs-you band could not be read")
+            for card in cards:
+                if card.get("id") == row_id and isinstance(card.get("intention"), str):
+                    return Read(rows=(_band_row(card, ctx.today, ctx.now),))
+            return Absent(f"row {row_id!r} is gone or rings no intention: it is a read-only List row")
         if not row_id.startswith("spore:"):
             return Absent(f"row {row_id!r} is a read-only List row; it has no write")
         part = _spore_part(source, ctx, seen, apply_hold=False)
@@ -292,7 +309,7 @@ def register_list(ck: Cockpit, source: SubstrateSource, spore_common: dict[str, 
     common = {k: v for k, v in spore_common.items() if k != "facets"}
     ck.register(ProviderSpec(
         LIST_PANEL_ID, "triage-list", LIST_TITLE, "gate", list_reader(source, ck), region="operate", rank=10, size="tall",
-        order="spore.list", views=TRAY_VIEWS, rowset=LIST_ROWSET, read_one=list_read_one(source),
+        order="spore.list", views=TRAY_VIEWS, rowset=LIST_ROWSET, read_one=list_read_one(source, ck),
         label_key=lambda stored: _prov.spore_label_key(stored),   # looked up at call time: a test (or a downstream) may replace it
         note=LIST_NOTE,
         empty=spore_empty("tray", _configured_entity_name(source)), absent_is_empty=True,

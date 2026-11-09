@@ -43,6 +43,7 @@
   "handoff_expired",
   "held",
   "held_until",
+  "intention",
   "last_seen",
   "list_pointer",
   "overdue",

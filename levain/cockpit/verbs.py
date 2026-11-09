@@ -46,7 +46,7 @@ from typing import TYPE_CHECKING, Any, Callable, Literal
 
 from levain.cockpit.authority import bound, current
 from levain.cockpit.effects import INTAKE_TIERS, INTAKE_VERB, intake_kind_of
-from levain.cockpit.engine import DECISIONS_ID, NOTE_VERB, QUESTION_VERB, VALUE_ABSENT
+from levain.cockpit.engine import DECISIONS_ID, INTENTION_VERBS, NOTE_VERB, QUESTION_VERB, VALUE_ABSENT
 from levain.cockpit.external import ID_PREFIX as EXTERNAL_PREFIX
 from levain.cockpit.registry import NOTE_ROW_PREFIX, QUESTION_ROW_PREFIX, parse_date
 from levain.cockpit.results import Absent, Fault, Read
@@ -378,6 +378,14 @@ _OPEN_QUESTION_ROW = lambda r: (str(r.get("id", "")).startswith("question:")   #
                                 and _facet(r, "question_state") == "open")
 
 
+# a row that rings an open intention and whose host can act on it: a decisions question row carrying the kernel's
+# ``question_intention`` facet, or a List band row carrying ``intention`` (the facet is set only when the host offers
+# ``intention_act``, so an older host's rows never match)
+_INTENTION_ROW = lambda r: ((str(r.get("id", "")).startswith("question:")   # noqa: E731
+                             and _facet(r, "question_state") == "open" and _facet(r, "question_intention") is not None)
+                            or (str(r.get("id", "")).startswith("band:") and _facet(r, "intention") is not None))
+
+
 # the kernel's agent-text rows on the composed decisions panel: (row-id prefix, the facet only the kernel writes, the
 # one verb the row offers). Each pair binds BOTH ways: the row offers only its verb, and the verb fires only on it
 _KERNEL_ROW_VERBS = ((QUESTION_ROW_PREFIX, "question_n", QUESTION_VERB), (NOTE_ROW_PREFIX, "note_n", NOTE_VERB))
@@ -393,9 +401,12 @@ def _applies_to_row(verb: "VerbSpec", panel_id: str, row: dict[str, Any]) -> boo
     rid = str(row.get("id", ""))
     for prefix, facet, owner in _KERNEL_ROW_VERBS:
         kernel_row = panel_id == DECISIONS_ID and rid.startswith(prefix)
-        if kernel_row and verb.name != owner:
+        # a question row that rings an intention is offered the four intention verbs in place of the answer
+        owners = INTENTION_VERBS if (kernel_row and prefix == QUESTION_ROW_PREFIX
+                                     and _facet(row, "question_intention") is not None) else (owner,)
+        if kernel_row and verb.name not in owners:
             return False
-        if verb.name == owner and not (kernel_row and _facet(row, facet) is not None):
+        if verb.name == owner and not (kernel_row and owners == (owner,) and _facet(row, facet) is not None):
             return False
     return verb.applies_to is None or bool(verb.applies_to(row))
 
@@ -814,6 +825,58 @@ def _question_fire(scope: "WriteScope", params: dict[str, Any], target: dict[str
     return {"answered": n, "delivery": "started"}
 
 
+_REFUSED_AS_STALE = ("already", "gone", "not open", "closed", "resolved", "no longer", "moved")
+
+
+def _intention_fire(action: str) -> Callable[..., dict[str, Any]]:
+    """Act on the intention a band row rings (snooze, edit, done, clear) through the host's one ``intention_act``: the host
+    owns the spore, the row and its log, so this writes nothing itself and the host's own lock order holds. Channel
+    ``cockpit``. C1: it authorises nothing. The host's refusal comes back in its own words, 409 when the row has moved."""
+    from levain.consent.questions import QuestionStoreError
+
+    def fire(scope: "WriteScope", params: dict[str, Any], target: dict[str, Any], confirm: bool) -> dict[str, Any]:
+        store = target.get("questions")
+        act = getattr(store, "intention_act", None)
+        if not callable(act):
+            raise EditError("not_built", 501, "this cockpit's band cannot act on an intention")
+        allowed = {"snooze": {"until"}, "edit": {"text"}}.get(action, set())
+        if set(params) != allowed:
+            raise EditError("bad_request", 400, f"{action} takes exactly {sorted(allowed) or 'no parameters'}")
+        kwargs: dict[str, Any] = {}
+        if action == "snooze":
+            until = params["until"]
+            if not isinstance(until, str) or not until:
+                raise EditError("bad_request", 400, "snooze needs a date (YYYY-MM-DD or YYYY-MM-DDTHH:MM)")
+            from levain.writes import _validate_surface_at
+
+            kwargs["until"] = _validate_surface_at(until)
+        elif action == "edit":
+            text = params["text"]
+            if not isinstance(text, str) or not text.strip():
+                raise EditError("bad_request", 400, "the text cannot be empty")
+            kwargs["text"] = text
+        row = target["row"]
+        rid = str(row.get("id", ""))
+        try:
+            if rid.startswith("band:"):
+                ref = rid[len("band:"):]
+            else:
+                q = store.get(_facet(row, "question_n"))
+                if q is None or q.answer is not None:     # the version check ran on the row; this is the race behind it
+                    raise EditError("stale", 409, f"question #{_facet(row, 'question_n')} was answered or is gone")
+                ref = q.id
+            words = act(ref, action, channel="cockpit", **kwargs)
+        except EditError:
+            raise
+        except (QuestionStoreError, OSError, sqlite3.Error) as exc:
+            raise EditError("source_unavailable", 503, f"the band cannot act now: {exc}") from None
+        except Exception as exc:  # noqa: BLE001 - the host's refusal, whatever its class (a ConsentError is the contract): its words
+            stale = any(w in str(exc) for w in _REFUSED_AS_STALE)
+            raise EditError("stale" if stale else "bad_request", 409 if stale else 400, str(exc)[:300]) from None
+        return {"intention": action, "ref": ref, "said": words if isinstance(words, str) else ""}
+    return fire
+
+
 def _band_fire(scope: "WriteScope", params: dict[str, Any], target: dict[str, Any], confirm: bool) -> dict[str, Any]:
     """Answer the NEEDS YOU band by its shorthand (Q17-ALL S5a): ``{text, store_id, view_id}``, recorded once per
     item, unsigned, channel ``cockpit``, viewer ``cockpit:<credential>``, only while that view is still the viewer's
@@ -972,6 +1035,18 @@ KERNEL_VERBS: tuple[VerbSpec, ...] = (
     VerbSpec("question_answer", "answer", "records your answer to an agent's question and sends it to the agent "
              "(it authorises nothing)", "row", fields=("option", "text"), floor="C1", tier_fn=_const("C1"),
              reversible=False, fire=_question_fire, applies_to=_OPEN_QUESTION_ROW),
+    VerbSpec("intention_snooze", "Snooze", "moves the reminder behind this row to a later day: the row leaves the band now and "
+             "comes back as a new row on that day", "row", fields=("until",), floor="C1", tier_fn=_const("C1"),
+             reversible=False, fire=_intention_fire("snooze"), applies_to=_INTENTION_ROW),
+    VerbSpec("intention_edit", "Edit", "changes the words of the reminder behind this row", "row", fields=("text",),
+             floor="C1", tier_fn=_const("C1"), reversible=False, fire=_intention_fire("edit"),
+             applies_to=_INTENTION_ROW),
+    VerbSpec("intention_done", "Done", "marks the reminder behind this row done: the row closes and the reminder is finished",
+             "row", floor="C1", tier_fn=_const("C1"), reversible=False, fire=_intention_fire("done"),
+             applies_to=_INTENTION_ROW),
+    VerbSpec("intention_clear", "Clear", "drops the reminder behind this row: the row closes and the reminder is dropped",
+             "row", floor="C1", tier_fn=_const("C1"), confirm_required=True, reversible=False,
+             fire=_intention_fire("clear"), applies_to=_INTENTION_ROW),
     VerbSpec("band_answer", "answer", "records your shorthand answers to the NEEDS YOU band and sends them to the "
              "agents (it authorises nothing)", "create", fields=("text", "store_id", "view_id"), floor="C1",
              tier_fn=_const("C1"), reversible=False, fire=_band_fire),
