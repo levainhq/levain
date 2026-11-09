@@ -46,9 +46,12 @@
     if (!n) {
       n = makeStatus(doc, id);
       scope.appendChild(n);
-      root.setTimeout(function () { n.textContent = text; }, 60);
+      // the node waits a moment before its first text; a later change in that moment replaces the waiting text, never races it
+      n.dataset.pending = text;
+      root.setTimeout(function () { if (n.dataset.pending !== undefined) { n.textContent = n.dataset.pending; delete n.dataset.pending; } }, 60);
       return;
     }
+    if (n.dataset.pending !== undefined) { n.dataset.pending = text; return; }
     n.textContent = text;
   }
   function ready() {

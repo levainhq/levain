@@ -272,6 +272,21 @@ def test_the_status_node_exists_empty_before_any_change_and_a_dialogs_control_is
 
 
 @needs_browser
+def test_two_changes_inside_a_new_dialogs_first_moment_leave_the_later_one_said(tmp_path, qdir) -> None:
+    """Red with: the dialog node's delayed first text captured at creation, so a change inside that moment is said and then
+    overwritten by the older text."""
+    v = _run(tmp_path, qdir, [
+        _phone(430), _set(_room("t1", *A)), _to_room(),
+        {"until": "window.LevainVoiceIcons && 1"},
+        {"eval": "(() => { const d = document.createElement('div'); d.setAttribute('role', 'dialog'); d.setAttribute('aria-modal', 'true'); d.id = '__dlg2';"
+                 " const b = document.createElement('button'); d.appendChild(b); document.body.appendChild(d);"
+                 " window.LevainVoiceIcons.set(b, 'mic'); window.LevainVoiceIcons.set(b, 'mic-stop'); window.LevainVoiceIcons.set(b, 'mic'); return 1; })()"},
+        {"eval": "new Promise((r) => setTimeout(() => r(document.querySelector('#__dlg2 #levain-voice-status-dialog').textContent), 300))"},
+    ], init_extra=_fake())
+    assert v[-1] == "Stopped", v[-1]
+
+
+@needs_browser
 def test_a_repaint_in_the_same_state_keeps_the_drawn_icon_and_the_button(tmp_path, qdir) -> None:
     """Red with: the `same` test of voice_icons.js set() removed (every repaint builds a new svg: the node differs)."""
     v = _run(tmp_path, qdir, [
