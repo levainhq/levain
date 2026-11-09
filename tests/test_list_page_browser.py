@@ -483,10 +483,10 @@ def test_r4_the_card_holds_due_rows_and_one_control_and_the_focus_view_every_gro
         ])
     vals = [json.loads(x) for x in out["values"] if isinstance(x, str) and x.startswith("{")]
     card, focus, band = vals[0], vals[1], vals[2]
-    # the band chip's number is the number of rows its tap shows, the desk's and the later band rows included, no carried copy
+    # the band chip's number is the number of rows its tap shows, the desk's and the later band rows included, and the carried row drawn under both of its headings
     assert band["rows"] == band["count"] and band["rows"] > 0, band
     assert any(t.startswith("desk: Write") for t in band["texts"]) and any(t.startswith("levain: TUE") for t in band["texts"]), band
-    assert sum(t.startswith("desk: carried") for t in band["texts"]) == 1, band
+    assert sum(t.startswith("desk: carried") for t in band["texts"]) == 2, band
     assert not any((t.startswith("desk:") and not t.startswith("desk: carried")) or t.startswith("levain: TUE") for t in card["shown"]), card   # not the operator's, not due
     assert any(t.startswith("desk: carried") for t in card["shown"]), card      # a CARRIED desk row is needs-you, as flow's footer lists it
     assert len(card["more"]) == 1, card                                                                  # ONE control
@@ -798,8 +798,7 @@ def test_the_type_chips_add_up_to_all_in_every_time_state_and_each_count_is_the_
     sweep = json.loads(out["values"][-1])["sweep"]
     assert [s["t"] for s in sweep] == ["", "now", "later", "someday", "done"], sweep
     for s in sweep:
-        copies = 1 if s["t"] in ("", "now") else 0                                          # the carried desk row's second drawing, a now row
-        assert sum(n for _k, n, _shown in s["per"]) + copies == s["all"], s                 # the type chips sum to all, less that copy
+        assert sum(n for _k, n, _shown in s["per"]) == s["all"], s                          # the type chips sum to all, exactly
         assert all(n == shown for _k, n, shown in s["per"]), s                              # each count is the rows its tap shows
         assert s["shownAll"] == s["all"], s
         if s["timeCount"] is not None:
@@ -807,8 +806,52 @@ def test_the_type_chips_add_up_to_all_in_every_time_state_and_each_count_is_the_
     assert any(k == "band" and n >= 2 for k, n, _s in sweep[0]["per"]), sweep[0]           # the band chip counts the desk's and the later band rows too
 
 
+_TIME_UNDER_SURFACE = f"""(async () => {{
+  const mb = {_FOCUS}; const sleep = (ms) => new Promise(r => setTimeout(r, ms));
+  const num = (c) => parseInt(c.textContent.trim().split(' ').pop(), 10);
+  const shown = () => [...mb.querySelectorAll('.sp-results .row')].filter(r => r.getClientRects().length).length;
+  const out = [];
+  for (const k of [...mb.querySelectorAll('.list-surface-chip')].map((c) => c.dataset.surface).filter((x) => x)) {{
+    mb.querySelector('.list-surface-chip[data-surface="' + k + '"]').click(); await sleep(80);
+    for (const t of ['now', 'later', 'someday', 'done']) {{
+      const chip = mb.querySelector('.list-time-chip[data-time="' + t + '"]');
+      if (!chip) continue;
+      const n = num(chip); chip.click(); await sleep(80);
+      out.push([k, t, n, shown()]);
+      const again = mb.querySelector('.list-time-chip[data-time="' + t + '"]');
+      if (again) again.click(); await sleep(60);
+    }}
+    mb.querySelector('.list-surface-chip[data-surface=""]').click(); await sleep(60);
+  }}
+  return JSON.stringify(out);
+}})()"""
+
+
 @needs_browser
-def test_a_type_choice_with_no_chip_in_the_chosen_time_state_falls_back_to_all(tmp_path: Path, monkeypatch: Any) -> None:
+def test_with_a_type_chip_chosen_each_time_chip_is_the_rows_its_tap_draws(tmp_path: Path, monkeypatch: Any) -> None:
+    root, src, _ids = _install(tmp_path)
+    _seed_more(root)
+    _seed_phone(root)
+    _seed_time(root)
+    from levain.consent.questions import QuestionStore
+    QuestionStore(default_queue_dir()).file(agent="claude_code", agent_session_id="s8", what="desk: carried Launch the TAOSERV upgrade seat.",
+                                            options=[("ship", "Ship it"), ("hold", "Hold")], rec="hold", blocks="the upgrade", cwd="/w/taoserv")
+    _host_band(monkeypatch)    # a carried desk row: drawn under Needs you and again under Desk owes, both of the band type
+    with _serve(src, write_token=TOKEN, surface_tokens={"browser": TOKEN}, install_class="reported") as (url, _httpd):
+        out = _drive(tmp_path, f"{url}/", [
+            {"emulate": {"w": 1280, "h": 1000, "dpr": 1}},
+            *_reload(),
+            {"until": f"{TRAY} && {TRAY}.querySelector('[data-list-more]') && 1"},
+            *_open_focus(),
+            {"eval": _TIME_UNDER_SURFACE},
+        ])
+    got = json.loads(out["values"][-1])
+    assert got and any(k == "band" for k, _t, _n, _s in got), got
+    assert all(n == shown for _k, _t, n, shown in got), got                                 # a time chip is the rows its tap draws, a type chip chosen
+
+
+@needs_browser
+def test_a_time_state_the_chosen_type_has_no_rows_in_offers_no_chip(tmp_path: Path, monkeypatch: Any) -> None:
     root, src, _ids = _install(tmp_path)
     _seed_more(root)
     _seed_phone(root)
@@ -820,13 +863,17 @@ def test_a_type_choice_with_no_chip_in_the_chosen_time_state_falls_back_to_all(t
             *_reload(),
             {"until": f"{TRAY} && {TRAY}.querySelector('[data-list-more]') && 1"},
             *_open_focus(),
-            {"eval": f"{_chip('time', 'now')}.click(); {_chip('surface', 'talk')}.click(); {_chip('time', 'done')}.click(); 1"},
+            {"eval": f"{_chip('time', 'now')}.click(); {_chip('surface', 'talk')}.click(); 1"},
+            {"eval": f"JSON.stringify({{doneUnderTalk: !!{_chip('time', 'done')}}})"},
+            {"eval": f"{_chip('surface', '')}.click(); {_chip('time', 'done')}.click(); 1"},
             {"eval": f"JSON.stringify({{rows: {_FOCUS_ROWS}.filter(r => r.getClientRects().length).length, "
                      f"done: parseInt({_chip('time', 'done')}.textContent.trim().split(' ').pop(), 10), "
                      f"talk: !!{_chip('surface', 'talk')}, pressed: [...{_FOCUS}.querySelectorAll('.list-surface-chip[aria-pressed=\"true\"]')].map(c => c.textContent)}})"},
         ])
+    under = json.loads([v for v in out["values"] if isinstance(v, str) and "doneUnderTalk" in v][0])
+    assert under["doneUnderTalk"] is False, under              # under a chosen type, a time-state it has no rows in has no chip to tap
     got = json.loads(out["values"][-1])
-    assert got["talk"] is False and got["rows"] == got["done"] and got["rows"] > 0, got       # no talk rows are Done: the choice falls back to all
+    assert got["talk"] is False and got["rows"] == got["done"] and got["rows"] > 0, got       # no talk rows are Done: the type chip is gone, all shows
     assert got["pressed"] and got["pressed"][0].startswith("all "), got
 
 

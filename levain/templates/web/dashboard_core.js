@@ -2295,19 +2295,20 @@
       },
       controls: (bar, redraw) => {
         if (isList) {
-          const chooseSurface = (v) => { listSurface = v; redraw(); };
-          chipRow = buildSurfaceChips(listAll().filter(inTime), listNow, chooseSurface, inCard ? "" : "Type", drawn);
-          bar.after(chipRow);
-          if (!inCard) {
-            // the time chips; choosing one recounts the type chips beside it, so a chip's number stays the rows its tap shows
-            const timeRow = buildTimeChips(drawn(listAll()), timeNow, (v) => {
-              listTime = v;
-              const fresh = buildSurfaceChips(listAll().filter(inTime), listNow, chooseSurface, inCard ? "" : "Type", drawn);
-              chipRow.replaceWith(fresh); chipRow = fresh;
-              redraw();
-            });
-            chipRow.before(timeRow);
-          }
+          // every count reads drawn(listAll()) and then filters by time and surface, the same projection the tap draws
+          let timeRow = null;
+          const build = () => {
+            const fresh = buildSurfaceChips(drawn(listAll()).filter(inTime), listNow, chooseSurface, inCard ? "" : "Type");
+            if (chipRow) chipRow.replaceWith(fresh); else bar.after(fresh);
+            chipRow = fresh;
+            if (!inCard) {
+              const t = buildTimeChips(drawn(listAll()).filter(inSurface), timeNow, (v) => { listTime = v; build(); redraw(); });
+              if (timeRow) timeRow.replaceWith(t); else chipRow.before(t);
+              timeRow = t;
+            }
+          };
+          const chooseSurface = (v) => { listSurface = v; build(); redraw(); };
+          build();
         }
         if (!views.length) return;
         const sel = el("select", "tray-dump-type");
@@ -2324,7 +2325,7 @@
         const ids = views.length && viewOf() ? view.tray_view_rows[viewOf()] : null;
         // the focus view draws a carried desk row under Needs you AND under Desk owes, as flow's footer prints it, so the control's
         // "desk owes N" is the number of rows a person can see under that heading (a chosen view is ungrouped: no copy there)
-        const all = !Array.isArray(ids) && !listNow() ? drawn(base) : base;
+        const all = !Array.isArray(ids) ? drawn(base) : base;
         if (!Array.isArray(ids)) return all;
         const byId = new Map(all.map((s) => [s.id, Object.assign({}, s, { age_shown: true })]));
         // a row the view did not name still shows, after the named ones
@@ -2472,7 +2473,7 @@
     sync(current());
     return row;
   }
-  function buildSurfaceChips(list, current, choose, label, project) {
+  function buildSurfaceChips(list, current, choose, label) {
     const row = el("div", "list-surfaces");
     row.setAttribute("role", "group");
     row.setAttribute("aria-label", "filter the List by where a row comes from");
@@ -2489,7 +2490,7 @@
       row.appendChild(c);
     };
     const sync = (now) => { for (const c of chips) c.setAttribute("aria-pressed", c.dataset.surface === now ? "true" : "false"); };
-    mk("", "all " + (project ? project(list) : list).length);   // the rows the "all" tap draws, a carried copy included
+    mk("", "all " + list.length);   // the caller passes the projected rows, so this is the rows the "all" tap draws
     for (const k of Object.keys(SURFACE_WORDS)) if (counts.has(k)) mk(k, SURFACE_WORDS[k] + " " + counts.get(k));
     sync(current());
     return row;

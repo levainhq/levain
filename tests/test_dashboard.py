@@ -1484,7 +1484,7 @@ class TestListPagePins:
         assert "intakeKept.draft.trim() === line" in box and "intakeKept.draft === line" not in box
         # support obeys text_locked like the primary text; the time chip narrows what the type chips count and the filter reads
         assert "s.support && !s.text_locked" in core
-        assert "const listAll = () =>" in core and "buildSurfaceChips(listAll().filter(inTime)," in core
+        assert "const listAll = () =>" in core and "buildSurfaceChips(drawn(listAll()).filter(inTime)," in core
         assert "listAll().filter(inTime).some((s) => s.surface === listSurface)" in core
 
     def test_a_refusals_reason_reaches_the_box_and_501_503_have_words(self) -> None:
