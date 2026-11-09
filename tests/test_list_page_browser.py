@@ -1108,3 +1108,43 @@ def test_r5_a_focused_chip_with_no_replacement_hands_focus_to_the_first_chip_of_
         ])
     got = json.loads(out["values"][-1])
     assert got["inRow"] is True and got["first"] is True, got
+
+
+@needs_browser
+def test_r6_a_time_chosen_in_the_focus_view_leaves_the_card_footer_counting_what_its_tap_draws(tmp_path: Path, monkeypatch: Any) -> None:
+    root, src, _ids = _install(tmp_path)
+    _seed_more(root)
+    _seed_phone(root)
+    _seed_time(root)
+    from levain.consent.questions import QuestionStore
+    QuestionStore(default_queue_dir()).file(agent="claude_code", agent_session_id="s8", what="desk: carried Launch the TAOSERV upgrade seat.",
+                                            options=[("ship", "Ship it"), ("hold", "Hold")], rec="hold", blocks="the upgrade", cwd="/w/taoserv")
+    _host_band(monkeypatch)
+    close = {"eval": "(() => { const x = document.querySelector('#levain-modal .modal-close'); if (x) x.click(); return 1; })()"}
+    settle = {"eval": "new Promise(r => setTimeout(() => r(1), 600))"}
+    steps: list[dict[str, Any]] = []
+    for time in ("later", "someday", "done", "now"):
+        steps += [
+            *_open_focus(),
+            {"eval": f"(() => {{ const c = {_chip('time', time)}; if (c) c.click(); return 1; }})()"},
+            {"eval": "new Promise(r => setTimeout(() => r(1), 400))"},
+            close, settle,
+            {"eval": _CARD_FOOT},                                  # what the card says after the time was chosen in the focus view
+            *_open_focus(),
+            {"eval": _FOCUS_GROUPS},                               # what its tap then draws
+            close, settle,
+        ]
+    with _serve(src, write_token=TOKEN, surface_tokens={"browser": TOKEN}, install_class="reported") as (url, _httpd):
+        out = _drive(tmp_path, f"{url}/", [
+            {"emulate": {"w": 1280, "h": 1000, "dpr": 1}},
+            *_reload(),
+            {"until": f"{TRAY} && {TRAY}.querySelector('[data-list-more]') && 1"},
+            *steps,
+        ])
+    seen = [json.loads(x) for x in out["values"] if isinstance(x, str) and x.startswith('{"kind"')]
+    foots = [s for s in seen if s["kind"] == "foot"]
+    focuses = [s for s in seen if s["kind"] == "focus"]
+    assert len(foots) == 4 and len(focuses) == 4, seen
+    assert len({(f["desk"], f["later"], f["done"]) for f in focuses}) > 1, seen          # the time choice changed what the focus view draws
+    for foot, focus in zip(foots, focuses):
+        assert (foot["desk"], foot["later"], foot["done"]) == (focus["desk"], focus["later"], focus["done"]), (foot, focus)

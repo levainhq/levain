@@ -160,6 +160,9 @@
   let listSurface = "";
   // The List's time filter ("" = every time-state, else now | later | someday | done): it cuts across the type chips above.
   let listTime = "";
+  // the List card's way to draw again from the state it shares with the focus view; closing that view calls it, so what the card
+  // says is what its control opens
+  let listCardRedraw = null;
   const intakeKept = { receipt: null, draft: "" };   // receipt: { text, cls } | null
   const MONTHS = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
   // "2026-10-22" -> "Oct 22", from the digits alone (a Date would shift the day by the zone)
@@ -2346,6 +2349,7 @@
           };
           const chooseSurface = (v) => { listSurface = v; build(); redraw(); };
           rebuildChips = build;
+          if (inCard) listCardRedraw = () => { if (document.body.contains(p)) { build(); redraw(); } };
           build();
         }
         if (!views.length) return;
@@ -9170,6 +9174,7 @@
     pruneModalKinds();
     document.body.classList.remove("modal-open");
     unlockNeedsScroll();
+    if (listCardRedraw) listCardRedraw();
     modalKey = null;
     modalCustom = null;
     modalGlance = false;
