@@ -6213,6 +6213,14 @@ def make_server(
 
         httpd.published_origin = (signer.queue_dir, signer.page_origin)
         write_origin(signer.queue_dir, signer.page_origin)
+        if httpd.question_store is not None:
+            # a host install records its count before it serves (children that have no store read it, never the native one)
+            # and keeps it fresh while idle; the thread ends with the server's stop event
+            from levain.webpush import needs
+
+            needs.open_needs_count(signer.queue_dir, httpd.question_store)
+            threading.Thread(target=needs.keep_recorded, args=(signer.queue_dir, httpd.question_store, httpd.stream_stop),
+                             name="needs-count-keeper", daemon=True).start()
     # The names this server serves, beside its cockpit.db, for `levain cockpit policy raise` to check a
     # downstream verb against (levain.cockpit.verbs.SERVED_VERBS_NAME). Written last, so a server refused
     # above records nothing. Unwritable, an earlier server's record is removed so the raise of a downstream

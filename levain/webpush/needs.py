@@ -21,7 +21,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-__all__ = ["BADGE_MAX", "COUNT_FILE", "COUNT_FRESH_S", "open_needs_count", "badge_value", "recorded_count", "resolved_badge"]
+__all__ = ["BADGE_MAX", "COUNT_FILE", "COUNT_FRESH_S", "open_needs_count", "badge_value", "recorded_count", "resolved_badge", "keep_recorded", "KEEP_EVERY_S"]
 
 log = logging.getLogger(__name__)
 # a store that could not be read: the answer is unknown. Anything else is a defect, logged loudly and still unknown (a push never fails on it)
@@ -30,6 +30,7 @@ _READ_FAULTS = (sqlite3.Error, OSError, ValueError)
 BADGE_MAX = 99      # payload room is tight and a badge past two digits says nothing more; the page shows the exact count
 COUNT_FILE = "needs-count.json"    # in the queue dir: the count the serving process last read from its own question store
 COUNT_FRESH_S = 120                # a recorded count older than this is not believed
+KEEP_EVERY_S = 45.0                # how often a serving process re-reads its store and re-records, well inside the freshness
 
 
 def open_needs_count(queue_dir: "Path | str", question_source: Any = None) -> "int | None":
@@ -108,6 +109,8 @@ def _read_record(queue_dir: "Path | str", now: "float | None") -> "tuple[bool, i
         return False, None
     except OSError:
         return (True, None) if path.exists() else (False, None)
+    except ValueError:       # bytes that are not text (UnicodeError is one): the file is there, so a host install, count unknown
+        return True, None
     try:
         doc = json.loads(raw)
         n, at = doc["n"], doc["at"]
@@ -117,6 +120,19 @@ def _read_record(queue_dir: "Path | str", now: "float | None") -> "tuple[bool, i
         return True, (min(n, BADGE_MAX) if 0 <= age <= COUNT_FRESH_S else None)
     except (ValueError, KeyError, TypeError):
         return True, None
+
+
+def keep_recorded(queue_dir: "Path | str", question_source: Any, stop: Any, *, every: "float | None" = None) -> None:
+    """Record the host's count now, then again every ``every`` seconds (default :data:`KEEP_EVERY_S`) until the
+    ``threading.Event`` ``stop`` is set, so an idle server's record never ages out and a child's push still carries it.
+    A failed read is logged and the loop goes on."""
+    while True:
+        try:
+            open_needs_count(queue_dir, question_source)
+        except Exception:  # noqa: BLE001 - the keeper outlives a bad read
+            log.exception("needs count: the recorded count could not be refreshed")
+        if stop.wait(KEEP_EVERY_S if every is None else every):
+            return
 
 
 def recorded_count(queue_dir: "Path | str", *, now: "float | None" = None) -> "int | None":
