@@ -72,6 +72,8 @@ WORDS = {
 }
 
 _TOKEN = re.compile(r"^[!#$%&'*+\-.^_`|~0-9A-Za-z]+$")
+# the 101 headers _validate reads: a repeat of one of these is refused; any other header may repeat (Set-Cookie does, RFC 6265)
+_READ_HEADERS = frozenset({"upgrade", "connection", "sec-websocket-accept", "sec-websocket-extensions", "sec-websocket-protocol"})
 _OWNED = frozenset({"host", "upgrade", "connection", "content-length", "transfer-encoding"})
 
 
@@ -538,7 +540,7 @@ def _validate(head: bytes, key: str) -> None:
         if not sep or not _TOKEN.match(name):
             raise WsError("handshake")
         low = name.lower()
-        if low in seen:
+        if low in _READ_HEADERS and low in seen:     # an ambiguous answer to a header this check reads; any other may repeat
             raise WsError("handshake")
         seen[low] = value.strip()
     if seen.get("upgrade", "").lower() != "websocket":

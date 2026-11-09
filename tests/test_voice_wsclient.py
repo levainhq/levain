@@ -231,6 +231,27 @@ def test_extension_or_protocol_refused(serve):
         dial(srv)
 
 
+def test_repeated_unread_headers_are_accepted(serve):
+    # OpenAI's realtime edge answered its 101 with two Set-Cookie lines (Diogenes, 11-09, measured against the live
+    # endpoint); a refused repeat made every OpenAI streaming open fail. Vary repeats on Deepgram's 401 the same way.
+    def script(p):
+        p.handshake(extra="Set-Cookie: a=1; Path=/\r\nSet-Cookie: b=2; Path=/\r\nVary: Origin\r\nVary: Accept-Encoding\r\n")
+        p.send(1, b'{"type": "error"}')
+
+    c = dial(serve(script))
+    assert c.recv() == ("text", '{"type": "error"}')
+    c.close(wait=0.1)
+
+
+@pytest.mark.parametrize("dup", ["Sec-WebSocket-Accept: {k}", "Upgrade: websocket", "Connection: Upgrade",
+                                 "Sec-WebSocket-Extensions: x", "Sec-WebSocket-Protocol: x"])
+def test_repeated_read_header_refused(serve, dup):
+    srv = serve(lambda p: p.handshake(extra=dup.format(k=p.accept_key()) + "\r\n"))
+    with pytest.raises(ws.WsError) as e:
+        dial(srv)
+    assert e.value.code == "handshake"
+
+
 def test_missing_upgrade_headers_refused(serve):
     def script(p):
         p.raw(f"HTTP/1.1 101 x\r\nSec-WebSocket-Accept: {p.accept_key()}\r\n\r\n".encode())
