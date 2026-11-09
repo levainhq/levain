@@ -303,7 +303,7 @@ def test_main_takes_neither_the_agent_store_nor_the_cockpit_root_and_opens_nothi
                  "--socket", str(tmp_path / "r.sock")])
     assert rc == D.EX_CONFIG
     store, ctl, uid, a, k = seen["args"]
-    assert (uid, a, k) == (501, (), {}) and home_calls == []
+    assert (uid, a, k) == (501, (), {"brokered": False}) and home_calls == []   # a non-brokered start names brokered=False
     home = Path.home()
     assert not [p for p in opened if p.startswith(str(home / ".levain"))]
     assert not [x for x in (str(store), str(ctl), *sys.argv) if "/.levain/autonomic" in x]
