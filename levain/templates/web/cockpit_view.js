@@ -195,6 +195,7 @@
       band_section: f.band_section === "desk" || f.band_section === "you" ? f.band_section : null,
       carried: f.band_carried === true,
       band_age: typeof f.band_age === "string" && f.band_age ? f.band_age : null,
+      intention: typeof f.intention === "string" && f.intention ? f.intention : null,
       repo: typeof f.repo === "string" && f.repo ? f.repo : null, board_tier: typeof f.board_tier === "string" && f.board_tier ? f.board_tier : null,
     }, t, hidden && hidden.has(row.id) ? { text_locked: HIDDEN_TEXT } : {});
   }
@@ -375,7 +376,10 @@
                             carried: f.question_carried === true,
                             later: typeof f.question_later === "string" && /^\d{4}-\d{2}-\d{2}$/.test(f.question_later) ? f.question_later : "",
                             laterWords: typeof f.question_later === "string" && /^\d{4}-\d{2}-\d{2}$/.test(f.question_later) && typeof f.question_later_words === "string" && f.question_later_words.length <= 40 ? f.question_later_words : "",
-                            sign: signOf(f) };
+                            sign: signOf(f),
+                            // the spore a row rings, and only the actions the kernel offered on it: the four controls draw from these
+                            intention: typeof f.question_intention === "string" && f.question_intention ? f.question_intention : "",
+                            intentionActions: (Array.isArray(r.actions) ? r.actions : []).filter((a) => a && typeof a.verb === "string" && a.verb.indexOf("intention_") === 0) };
         }
         // a coordinator review item: its state, whether it is "yours to clear", and the one verb the kernel offers on it
         // here (review_clear on a plain open item, review_reopen on a cleared one), drawn as a button on the row

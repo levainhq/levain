@@ -2121,12 +2121,15 @@
       if (s.later_words && s.group === "later") host.appendChild(tagEl("muted", "back " + s.later_words));   // a carried desk row is due now (needs you), never "back Mon"
       // a desk row the desk has carried past its day is listed under Needs you, tagged as flow's footer tags it
       if (s.band_section === "desk" && s.carried) host.appendChild(tagEl("muted list-desk-owed", "desk-owed"));
-      if (s.list_pointer) host.appendChild(tagEl("muted list-pointer", s.list_pointer));
+      // a band row that rings an intention is acted on right here (the four controls); any other points at Decisions
+      const intend = s.surface === "band" && s.intention && s.row_id && hasIntentionControls(s.actions);
+      if (s.list_pointer && !intend) host.appendChild(tagEl("muted list-pointer", s.list_pointer));
       if (s.surface === "board") {
         if (s.board_tier) host.appendChild(tagEl("muted", s.board_tier));
       }
       if (s.band_age) host.appendChild(el("span", "muted", s.band_age));       // the footer's clock and form, never whole days from the add
       else if (s.surface !== "band" && Number.isInteger(s.age_days) && s.age_days >= 0) host.appendChild(el("span", "muted", s.age_days + " d"));
+      if (intend) appendRowVerbs(row, buildIntentionVerbs(s.row_id, s.actions, s.text), ["Done", "Snooze"], 2);
       return row;
     }
     if (s.surface && !s.held) {
@@ -3418,7 +3421,9 @@
 
   // The schedule form: a date input + confirm -> spore_surface_at (clear = explicit empty).
   // Mirrors openResolveForm's hide-triggers / one-form-at-a-time / Escape-cancel shape.
-  function openSurfaceForm(host, s) {
+  // `opts` (the intention snooze): {label, post(value)}: the same date picker, a different button word, no "clear" (a snooze always
+  // names a day), and the pick is posted through `post` instead of the spore write.
+  function openSurfaceForm(host, s, opts) {
     if (host.querySelector(".verb-form")) return;
     const stale = host.querySelector(".edit-msg"); if (stale) stale.remove();
     const triggers = Array.prototype.slice.call(host.querySelectorAll(".verb-btn"));
@@ -3426,13 +3431,13 @@
     const form = el("span", "verb-form");
     const input = el("input", "verb-date");
     input.type = "date";
-    if (s.next) input.value = s.next;  // prefill an existing alarm
-    const go = el("button", "verb-confirm", "schedule");
+    if (s.next && !opts) input.value = s.next;  // prefill an existing alarm
+    const go = el("button", "verb-confirm", opts && opts.label ? opts.label : "schedule");
     const clearBtn = el("button", "verb-cancel", "clear");
     const cancel = el("button", "verb-cancel", "cancel");
     go.type = "button"; clearBtn.type = "button"; cancel.type = "button";
     const msg = el("span", "edit-msg", "");
-    form.append(input, go, clearBtn, cancel, msg);
+    form.append(input, go, ...(opts ? [] : [clearBtn]), cancel, msg);
     host.appendChild(form);
     input.focus();
     const close = () => { form.remove(); triggers.forEach((b) => (b.style.display = "")); };
@@ -3445,16 +3450,66 @@
     const submit = async (value) => {
       go.disabled = true; clearBtn.disabled = true; cancel.disabled = true;
       msg.className = "edit-msg busy"; msg.textContent = "…";
-      const res = await commit({ kind: "spore_surface_at", spore_id: s.id, surface_at: value });
+      const res = opts && opts.post ? await opts.post(value) : await commit({ kind: "spore_surface_at", spore_id: s.id, surface_at: value });
       if (res && res.ok) return;  // re-rendered
       showFail(msg, res, "failed");
       go.disabled = false; clearBtn.disabled = false; cancel.disabled = false;
     };
     go.addEventListener("click", () => {
-      if (!input.value) { msg.className = "edit-msg err"; msg.textContent = "pick a date (or clear)"; return; }
+      if (!input.value) { msg.className = "edit-msg err"; msg.textContent = opts ? "pick a day" : "pick a date (or clear)"; return; }
       submit(input.value);
     });
     clearBtn.addEventListener("click", () => submit(""));  // explicit clear: key present, value ""
+  }
+
+  // The four controls of a row that rings an intention (a reminder the desk or a schedule filed into the band): the same labels on
+  // the Decisions card and on the List's band row. Each posts the row's own offered action through the page's one write
+  // transport; the row is re-read after, so a snoozed, done or cleared one leaves. Done asks nothing; Clear asks once.
+  const INTENTION_CONTROLS = [["Snooze", "intention_snooze", "move it to a later day"], ["Edit", "intention_edit", "change its words"],
+    ["Done", "intention_done", "mark it done"], ["Clear", "intention_clear", "drop it for good"]];
+  function intentionPost(rowId, verb, confirm) {
+    return (req) => {
+      const T = window.LevainCockpitTransport;
+      if (!T || typeof T.rowVerb !== "function") return Promise.resolve({ ok: false, message: "this page cannot send that" });
+      return T.rowVerb(rowId, verb, req || {}, confirm === true);
+    };
+  }
+  function hasIntentionControls(actions) {
+    return Array.isArray(actions) && actions.some((a) => a && INTENTION_CONTROLS.some((c) => c[1] === a.verb));
+  }
+  function buildIntentionVerbs(rowId, actions, text) {
+    const wrap = el("span", "verb-actions intention-actions");
+    for (const [label, verb, title] of INTENTION_CONTROLS) {
+      const btn = verbBtn(label, title, async (ev) => {
+        if (verb === "intention_snooze") { openSurfaceForm(wrap, { next: null }, { label: "snooze", post: (v) => intentionPost(rowId, verb)({ until: v }) }); return; }
+        if (verb === "intention_edit") {
+          openRowForm(wrap, () => {
+            const ta = el("textarea", "verb-edit-ta");
+            ta.value = typeof text === "string" ? text : "";
+            ta.rows = Math.min(16, Math.max(3, ta.value.split("\n").length, Math.ceil(ta.value.length / 56)));
+            ta.dataset.orig = ta.value;
+            return { nodes: [ta], focus: ta, ta };
+          }, (f, msg) => {
+            if (!f.ta.value.trim()) { msg.className = "edit-msg err"; msg.textContent = "text can't be empty"; return null; }
+            return { text: f.ta.value };
+          }, "save", false, intentionPost(rowId, verb));
+          return;
+        }
+        if (verb === "intention_clear") {
+          openRowForm(wrap, () => ({ nodes: [el("span", "muted", "Drop this reminder for good?")], focus: null }),
+            () => ({}), "Clear", true, intentionPost(rowId, verb, true));
+          return;
+        }
+        const b = ev.currentTarget; b.disabled = true;
+        const res = await intentionPost(rowId, verb)({});
+        if (res && res.ok) return;  // the page re-reads and redraws without this row
+        b.disabled = false;
+        verbErr(wrap, res);
+      });
+      btn.dataset.verb = verb;
+      wrap.appendChild(btn);
+    }
+    return gateByActions(wrap, actions);
   }
 
   // Shared inline-form scaffold for the per-row verbs (edit / reclassify / remove): hide the
@@ -3472,7 +3527,8 @@
     document.dispatchEvent(new CustomEvent("levain:editor-closed"));
   }
 
-  function openRowForm(host, buildFields, onConfirm, confirmLabel, danger) {
+  // `post` (the intention verbs): sends the request instead of the legacy write
+  function openRowForm(host, buildFields, onConfirm, confirmLabel, danger, post) {
     if (host.querySelector(".verb-form")) return;
     const stale = host.querySelector(".edit-msg"); if (stale) stale.remove();
     const triggers = Array.prototype.slice.call(host.querySelectorAll(".verb-btn"));
@@ -3498,7 +3554,7 @@
       if (!req) return;  // onConfirm set a validation message
       go.disabled = true; cancel.disabled = true;
       msg.className = "edit-msg busy"; msg.textContent = "…";
-      const res = await commit(req);
+      const res = await (post || commit)(req);
       if (res && res.ok) return;  // re-rendered
       showFail(msg, res, "failed");
       if (res && res.error === "stale") { retireStaleForm(form); return; }
@@ -4895,6 +4951,20 @@
     if (a) {
       parts.push(el("div", "consent-note ext-meta", answerLine(a, options)));
       slot.replaceChildren(...parts);
+      return;
+    }
+    if (open && q.intention && hasIntentionControls(q.intentionActions)) {
+      // a row that rings an intention is acted on by its four controls, in place of any answer box or signature
+      const wrap = buildIntentionVerbs(q.id, q.intentionActions, sv(b.what));
+      if (card) {
+        const bottom = el("div", "needs-actions needs-qa needs-intention");
+        bottom.appendChild(wrap);
+        slot.replaceChildren(...parts);
+        card.appendChild(bottom);
+      } else {
+        parts.push(wrap);
+        slot.replaceChildren(...parts);
+      }
       return;
     }
     if (open && q.sign) {
