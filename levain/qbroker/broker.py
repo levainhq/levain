@@ -31,12 +31,18 @@ No verb accepts an answer, a grant answer or a row from a hook. Every other op i
 THE ALARM VERB (row 166). ``ALARM {cap, kind, reason}`` is how a slot hook leaves a record on the operator's side (the
 ConfigChange guard, :func:`levain.slot.hook_run.config_guard`, after it blocks). The frame holds exactly those keys:
 ``kind`` one of :data:`ALARM_KINDS`, ``reason`` a printable string of 1 to :data:`ALARM_REASON_MAX` characters; any
-other shape is ``frame-malformed``. The cap resolves first: a frame whose cap does not resolve is refused and spends
-nothing of the slot's alarm budget (one broker-log line per slot per :data:`ALARM_DEDUPE_WINDOW` says so). The record
+other shape is ``frame-malformed``. A cap that has resolved on this slot's ALARM before (the slot's last
+:data:`ALARM_KNOWN_CAPS` such caps) resolves first and is charged only on a dedupe miss, so bad-cap frames can never
+drain the real hook's tokens; any other cap first takes one token from the slot's unseen-cap bucket (its own, at
+:data:`ALARM_RATE` and :data:`ALARM_BURST`), so the CONTROL round trips that unseen caps cause are bounded by it, and
+joins those caps when it resolves. A frame whose
+cap does not resolve is refused (one broker-log line per slot per :data:`ALARM_DEDUPE_WINDOW` says so). Known edge: a
+slot that floods bad caps before its first real alarm can get that alarm refused ``rate-limited``; the config change
+is still blocked and the slot's stderr says so. The record
 names the session CONTROL resolved (and its run's id), never a session the hook claims, and is appended to
 ``requests/alarms.jsonl`` (:meth:`QueueStore.append_alarm`), which ``levain doctor``'s ``slot alarms`` row reads. The
-same (session, kind, reason) within :data:`ALARM_DEDUPE_WINDOW` is acknowledged, not written again, and spends no
-token; any other alarm takes one from the slot's own bucket (:data:`ALARM_RATE`, :data:`ALARM_BURST`; past it
+same (session, kind, reason) within :data:`ALARM_DEDUPE_WINDOW` is acknowledged, not written again, and spends no write
+token; any other alarm takes one from the slot's own write bucket (:data:`ALARM_RATE`, :data:`ALARM_BURST`; past it
 ``rate-limited``). A slot writes at most :data:`ALARM_SLOT_BUDGET` records per :data:`ALARM_BUDGET_WINDOW`; past that
 an alarm is acknowledged and counted, and the count is written as one summary record (``suppressed``, no ``kind``)
 each time it doubles, so one slot can never roll another slot's records, nor its own first ones, out of the log.
@@ -156,7 +162,7 @@ from levain.qbroker.store import ANSWER_ROW_FORMAT, REQUEST_ROW_FORMAT, QueueSto
 from levain.slot import limits_doc
 
 __all__ = ["ALARM_BUDGET_WINDOW", "ALARM_BURST", "ALARM_DEDUPE_WINDOW", "ALARM_FORMAT", "ALARM_KINDS", "ALARM_RATE",
-           "ALARM_REASON_MAX", "ALARM_SLOT_BUDGET",
+           "ALARM_KNOWN_CAPS", "ALARM_REASON_MAX", "ALARM_SLOT_BUDGET",
            "ANSWER_BURST", "ANSWER_RATE", "CAP_MAX", "GATE_BURST", "GATE_RATE",
            "KINDS", "PENDING_PER_SESSION", "QUOTA_PER_RUN",
            "RECEIVED_SKEW", "RESOLVE_TTL", "RUN_CALLS_KIND", "RUN_DEADLINE_KIND", "RUN_KEYS", "RUN_OPTIONAL_KEYS",
@@ -251,6 +257,8 @@ ALARM_RATE = 0.2
 ALARM_BURST = 5
 ALARM_DEDUPE_WINDOW = 600.0
 ALARM_DEDUPE_MAX = 256
+# how many caps that resolved on a slot's ALARM it remembers (oldest out): those resolve before any token is charged
+ALARM_KNOWN_CAPS = 4
 # how many records one slot may write per ALARM_BUDGET_WINDOW seconds: past it an alarm is counted, not written, and
 # the count is written as a summary line each time it doubles
 ALARM_SLOT_BUDGET = 8
@@ -486,12 +494,15 @@ class Broker:
         # read and the count (Broker._gate)
         self._root_locks: dict[str, threading.Lock] = {}
         self._alarm_buckets: dict[int, tuple[float, float]] = {}  # slot -> (tokens, at): ALARM's own
+        self._alarm_unseen_buckets: dict[int, tuple[float, float]] = {}  # the same, paid by a cap before it resolves
         # (session, kind, reason) -> when it was last recorded; held across the append so a repeat never writes twice
         self._alarm_lock = threading.Lock()
         self._alarm_seen: OrderedDict[tuple[str, str, str], float] = OrderedDict()
         # slot -> [window start, records written, alarms suppressed, the count that writes the next summary]
         self._alarm_budget: dict[int, list[Any]] = {}
         self._alarm_unresolved_logged: dict[int, float] = {}  # slot -> when its last failed resolve was logged
+        # slot -> the cap digests that resolved on its ALARM, oldest first (at most ALARM_KNOWN_CAPS)
+        self._alarm_caps: dict[int, OrderedDict[str, None]] = {}
         started = clock()
         now = utc_stamp(started)
         filed = []
@@ -933,6 +944,13 @@ class Broker:
         if set(message) != _ALARM_KEYS or kind not in ALARM_KINDS or not isinstance(reason, str) \
                 or not 0 < len(reason) <= ALARM_REASON_MAX or not reason.isprintable():
             return wire.refusal(rid, "frame-malformed")
+        digest = cap_digest(message.get("cap"))
+        with self._alarm_lock:
+            known = digest is not None and digest in self._alarm_caps.get(slot, ())
+        # an unseen cap pays before it can cost a CONTROL round trip (a malformed one never reaches CONTROL)
+        charged = not known and digest is not None
+        if charged and not self._take_alarm_token(slot, unseen=True):
+            return wire.refusal(rid, "rate-limited")
         who = self._resolve(slot, message.get("cap"))
         if isinstance(who, str):
             now = self._monotonic()
@@ -944,6 +962,11 @@ class Broker:
             return wire.refusal(rid, who)
         key, now = (who.session, kind, reason), self._monotonic()
         with self._alarm_lock:
+            caps = self._alarm_caps.setdefault(slot, OrderedDict())
+            caps[digest] = None
+            caps.move_to_end(digest)
+            while len(caps) > ALARM_KNOWN_CAPS:
+                caps.popitem(last=False)
             seen = self._alarm_seen.get(key)
             if seen is not None and now - seen < ALARM_DEDUPE_WINDOW:
                 return wire.answer(rid)
@@ -975,15 +998,17 @@ class Broker:
         log.warning("qbroker: slot %d session %s raised a %s alarm", slot, who.session, kind)
         return wire.answer(rid)
 
-    def _take_alarm_token(self, slot: int) -> bool:
+    def _take_alarm_token(self, slot: int, *, unseen: bool = False) -> bool:
+        """One token from the slot's ALARM write bucket, or (``unseen``) its unseen-cap bucket."""
         now = self._monotonic()
+        buckets = self._alarm_unseen_buckets if unseen else self._alarm_buckets
         with self._mutex:
-            tokens, at = self._alarm_buckets.get(slot, (float(ALARM_BURST), now))
+            tokens, at = buckets.get(slot, (float(ALARM_BURST), now))
             tokens = min(float(ALARM_BURST), tokens + (now - at) * ALARM_RATE)
             if tokens < 1.0:
-                self._alarm_buckets[slot] = (tokens, now)
+                buckets[slot] = (tokens, now)
                 return False
-            self._alarm_buckets[slot] = (tokens - 1.0, now)
+            buckets[slot] = (tokens - 1.0, now)
             return True
 
     def _gate(self, slot: int, rid: int, message: Mapping[str, Any]) -> dict[str, Any]:
