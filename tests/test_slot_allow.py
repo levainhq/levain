@@ -128,7 +128,7 @@ class Rig:
         rule = rule or q.what.split(": ", 1)[1]
         entry = ts.Entry(item or q.id, bv.subject_version(q), asked or SA.asked_text(rule), "information",
                          answer=answer or SA.yes_text(rule))
-        at = at or datetime.now(timezone.utc) - timedelta(seconds=5)
+        at = at or self.qs._clock() - timedelta(seconds=5)
         sid = sid or self.sid
         if desk:
             return ts.build_desk_message(store=f"levain-questions:{sid}", install=sid, surface="cockpit",
@@ -471,3 +471,78 @@ def test_a_rule_cannot_be_stored_without_its_signed_answer(qdir):
     with pytest.raises(SA.AllowRefused):
         SA.append(qdir / SA.FILE_NAME, "WebSearch", "S1", {})
     assert not (qdir / SA.FILE_NAME).exists()
+
+
+def _at_day(rig, days_ago):
+    """Run the store's clock ``days_ago`` days back: answers made now are stamped then, and so is what they sign."""
+    rig.qs._clock = lambda: datetime.now(timezone.utc) - timedelta(days=days_ago)
+
+
+def test_a_rule_is_a_30_day_lease_and_a_lapsed_one_does_not_reach_a_launch(rig, qdir, capsys):
+    _at_day(rig, 10)
+    allow = _carried_one(rig, qdir)
+    (entry,) = SA.load(allow)["rules"]
+    now = datetime.now(timezone.utc)
+    assert entry["expires_at"] == utc_stamp(SA.lease_end(entry)) and 19 <= (SA.lease_end(entry) - now).days + 1 <= 20
+    assert SA.carried(allow, rig.judge, rig.sid, now=now)[0] == ["Bash(npm test *)"]
+    ok, bad = SA.carried(allow, rig.judge, rig.sid, now=now + timedelta(days=21))
+    assert ok == [] and "lease lapsed" in bad[0][1]
+    # the end cannot be moved by editing the file: it is derived from the signed message
+    doc = json.loads(allow.read_text())
+    doc["rules"][0]["expires_at"] = utc_stamp(now + timedelta(days=400))
+    allow.write_text(json.dumps(doc))
+    assert SA.carried(allow, rig.judge, rig.sid, now=now)[0] == []
+    doc["rules"][0]["expires_at"] = entry["expires_at"]
+    allow.write_text(json.dumps(doc))
+
+
+def test_a_lapsed_rule_is_named_on_the_launch_and_the_list_shows_days_left(rig, qdir, capsys):
+    _at_day(rig, 40)
+    allow = _carried_one(rig, qdir)
+    seams = sup.Seams(host="linux", helper=("x",), client_factory=lambda p: None, control_socket=Path("/x"),
+                      store=Path("/x"), base_map=Path("/x"), allow_dir=qdir, allow_judge=rig.judge)
+    said = []
+    s = sup.Supervisor.__new__(sup.Supervisor)
+    s.s, s.say = seams, said.append
+    out = s._with_slot_allow(Frozen({}, (), ()))
+    assert "permissions" not in out.settings
+    assert any("not carried: Bash(npm test *)" in m and "lease lapsed" in m for m in said)
+    # the lapse filed its renewal row on the band
+    assert any("renews it" in q.blocks for q in rig.qs.open_questions())
+    SA.run(SimpleNamespace(queue_dir=qdir, slot_allow_verb="list"))
+    assert "lapsed" in capsys.readouterr().out
+    _at_day(rig, 5)
+    SA.revoke(allow, "Bash(npm test *)", confirm=True)
+    _carried_one(rig, qdir, "WebSearch")
+    SA.run(SimpleNamespace(queue_dir=qdir, slot_allow_verb="list"))
+    text = capsys.readouterr().out
+    assert "WebSearch" in text and ("24 days left" in text or "25 days left" in text)
+
+
+def test_the_reminder_files_once_and_a_signed_renewal_resets_the_lease(rig, qdir):
+    _at_day(rig, 28)
+    allow = _carried_one(rig, qdir)
+    assert SA.remind(qdir, allow, store=rig.qs) == ["Bash(npm test *)"]          # 2 days left: one renewal row
+    assert SA.remind(qdir, allow, store=rig.qs) == []                            # filed once for this lease
+    young = rig.qs._clock
+    _at_day(rig, 0)
+    rows = [q for q in rig.qs.open_questions() if q.what == SA.asked_text("Bash(npm test *)")]
+    assert len(rows) == 1 and "renews it" in rows[0].blocks
+    old_end = SA.lease_end(SA.load(allow)["rules"][0])
+    rig.yes(rows[0])
+    assert SA.apply_answered(qdir, allow, store=rig.qs, judge=rig.judge) == ["Bash(npm test *)"]
+    (entry,) = SA.load(allow)["rules"]
+    new_end = SA.lease_end(entry)
+    assert new_end - old_end > timedelta(days=27)
+    now = datetime.now(timezone.utc)
+    assert SA.carried(allow, rig.judge, rig.sid, now=now + timedelta(days=29))[0] == ["Bash(npm test *)"]
+    assert SA.carried(allow, rig.judge, rig.sid, now=now + timedelta(days=31))[0] == []
+    # the new lease is not due: no second reminder, and the old lease's row is not refiled
+    assert SA.remind(qdir, allow, store=rig.qs) == []
+    assert young is not None
+
+
+def test_a_rule_with_more_than_three_days_left_files_no_reminder(rig, qdir):
+    _at_day(rig, 10)
+    allow = _carried_one(rig, qdir)
+    assert SA.remind(qdir, allow, store=rig.qs) == []

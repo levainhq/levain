@@ -1679,6 +1679,10 @@ class Supervisor:
 
             judge = self.s.allow_judge or slot_allow.default_judge(qdir)
             slot_allow.apply_answered(qdir, path, judge=judge)
+            try:
+                slot_allow.remind(qdir, path)
+            except Exception:   # noqa: BLE001 - a reminder never stops a launch
+                pass
             rules, skipped = slot_allow.carried(path, judge, slot_allow.store_id_of(QuestionStore(qdir)))
         except slot_allow.AllowRefused as e:
             self.say(f"slot allow rules not read ({e}): this session asks for everything the repo does not allow")
