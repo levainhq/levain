@@ -382,23 +382,39 @@ def failed(err: str) -> bool:
     return err.startswith(hook_run.REPO_FAILED) and err.endswith("\n") and err.count("\n") == 1
 
 
-@pytest.mark.parametrize("script,what", [
-    ("cat >/dev/null\necho '" + json.dumps({"decision": "block"}) + "'\nexit 1\n", "exit 1"),
-    ("cat >/dev/null\nexit 3\n", "exit 3"),
-    ("cat >/dev/null\nkill -9 $$\n", "signal 9"),
-    ("cat >/dev/null\nyes deny | head -c 3000000\n", "output"),
+@pytest.mark.parametrize("event", ["PreToolUse", "PermissionRequest"])
+@pytest.mark.parametrize("script", [
+    "cat >/dev/null\nexit 1\n",
+    "cat >/dev/null\necho 'lint failed' >&2\nexit 1\n",
+    "cat >/dev/null\necho '" + json.dumps({"decision": "block"}) + "'\nexit 1\n",
+    "cat >/dev/null\nexit 3\n",
+    "cat >/dev/null\nkill -9 $$\n",
+    "cat >/dev/null\nno-such-command-anywhere\n",
 ])
-def test_a_repo_hook_that_fails_denies(tmp_path, script, what):
-    """r161f2 (C2): a repo hook that fails is a deny with the fixed reason, never no decision."""
-    code, out, err = run_filter(tmp_path, "PreToolUse", script)
-    assert (code, out) == (hook_run.REFUSED_EXIT, "") and failed(err) and what in err
+def test_a_repo_hooks_own_exit_but_0_or_2_is_no_decision(tmp_path, event, script):
+    """r161f3 (head ruling 1): an exit but 0 or 2 is the repo command's own non-blocking error, as Claude Code reads
+    it natively: no decision, nothing passed on, the JSON it printed included."""
+    assert run_filter(tmp_path, event, script) == (0, "", "")
 
 
-def test_a_repo_command_that_cannot_start_denies(tmp_path):
+def test_the_repo_commands_output_past_the_bound_denies(tmp_path):
+    """r161f2 (K1), kept under r161f3: the output bound is the filter's own guard, so passing it denies."""
+    code, out, err = run_filter(tmp_path, "PreToolUse", "cat >/dev/null\nyes deny | head -c 3000000\n")
+    assert (code, out) == (hook_run.REFUSED_EXIT, "") and failed(err) and "output" in err
+
+
+def test_a_repo_command_that_cannot_start_denies(tmp_path, monkeypatch):
+    """The shell the command runs under cannot be started: the filter's own failure, so a deny."""
+    monkeypatch.setattr(hook_run, "REPO_SHELL", str(tmp_path / "no-such-shell"))
     err = io.StringIO()
-    code = hook_run.repo_filter("levain_repo_filter", ["PreToolUse", "5", str(tmp_path / "no-such-hook")],
+    code = hook_run.repo_filter("levain_repo_filter", ["PreToolUse", "5", "true"],
                                 stdin=io.BytesIO(b"{}"), stdout=io.StringIO(), stderr=err)
-    assert code == hook_run.REFUSED_EXIT and failed(err.getvalue())
+    assert code == hook_run.REFUSED_EXIT and failed(err.getvalue()) and "could not start" in err.getvalue()
+
+
+def test_a_filter_failure_names_the_filter():
+    """r161f3 (head ruling 1): the fixed reason of a filter-layer failure names Levain's filter."""
+    assert "filter" in hook_run.REPO_FAILED.lower() and "levain" in hook_run.REPO_FAILED.lower()
 
 
 def test_a_payload_past_the_bound_denies():
