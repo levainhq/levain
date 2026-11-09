@@ -150,3 +150,36 @@ def test_a_state_change_swaps_the_icon_and_the_accessible_name_not_words(tmp_pat
     ], init_extra=_fake())
     assert json.loads(v[-4]) == ["Stop mic", "true", "mic-stop", "", 1], v[-4]
     assert json.loads(v[-1]) == ["Mic", "false", "mic", "", 1], v[-1]
+
+
+SIGN_ROW = """(() => {
+  const r = (n) => { const b = n.getBoundingClientRect(); return {t: Math.round(b.top), b: Math.round(b.bottom), l: Math.round(b.left), r: Math.round(b.right)}; };
+  const q = (s) => document.querySelector('#levain-modal .sign-actions ' + s);
+  const acts = document.querySelector('#levain-modal .sign-actions');
+  return JSON.stringify({acts: r(acts), box: r(q('.sign-write-in')), mics: [...acts.querySelectorAll('.card-mic')].filter((b) => !b.hidden).map(r),
+    words: r(q('.sign-words')), sheet: r(q('.sign-sheet-open')), sw: document.documentElement.scrollWidth, vw: document.documentElement.clientWidth});
+})()"""
+
+
+@needs_browser
+@pytest.mark.parametrize("width", WIDTHS)
+def test_a_signed_cards_write_in_row_spans_the_card_and_sign_and_sheet_share_the_next_row(tmp_path, monkeypatch, width) -> None:
+    """Red with: the `.voice-in-row` grid-column rule in dashboard.css removed (the box is squeezed into one half-column cell),
+    or the `sign-words` class dropped from the sign button in dashboard_core.js (the sheet button fills a row alone)."""
+    from tests.test_cockpit_sign_card import DESKTOP, STRIP_FACET, TOK, _Rig  # noqa: F401
+    rig = _Rig(tmp_path, monkeypatch)
+    with rig.serving() as (_url, _h):
+        out = _drive(tmp_path, f"{rig.origin}/#write_token={TOK}", [
+            _phone(width), rig.authenticator(), {"init": _fake()},
+            {"until": STRIP_FACET + " && document.querySelector('#levain-modal .sign-actions .card-mic') && 1", "ms": 30000},
+            {"eval": SIGN_ROW},
+        ])
+    row = json.loads(out["values"][-1])
+    acts, box, words, sheet = row["acts"], row["box"], row["words"], row["sheet"]
+    assert len(row["mics"]) == 2, row
+    assert box["r"] - box["l"] >= (acts["r"] - acts["l"]) * 0.45, row                   # the box keeps real width
+    for m in row["mics"]:                                                              # the mic icons share the box's row
+        assert abs(m["t"] - box["t"]) <= 12 and m["l"] >= box["r"] - 1, row
+    assert abs(words["t"] - sheet["t"]) <= 2 and words["r"] <= sheet["l"], row         # sign my words | open the sheet, one row
+    assert words["t"] >= box["b"] - 1, row                                             # under the box row, not beside it
+    assert row["sw"] <= row["vw"], row

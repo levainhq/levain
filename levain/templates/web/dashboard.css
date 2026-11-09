@@ -3692,6 +3692,11 @@ a.nc-pick.is-rec:hover { border-color: var(--text); }
 .voice-row > .question-send { flex: 0 1 auto; min-width: 0; margin-left: 0; }
 .voice-in-row { display: flex; flex-wrap: nowrap; align-items: flex-end; gap: var(--sp-2); flex: 1 1 100%; width: 100%; min-width: 0; }
 body .voice-in-row > :is(.sheet-write-in, .sign-write-in, textarea) { flex: 1 1 0; width: auto; min-width: 0; }
+/* the sign card's action grid is two columns: the write-in row (box + mic icons) takes both, then "sign my words" and "open the sheet" sit side by side; a lone option or a lone sheet button before/after a spanning row takes both instead of leaving half a row empty */
+body.ke .needs-card .sign-actions > .voice-in-row { grid-column: 1 / -1; }
+body.ke .needs-card .sign-actions > .sign-option:nth-child(odd):has(+ .voice-in-row, + .sign-write-in) { grid-column: 1 / -1; }
+body.ke .needs-card .sign-actions > .sign-sheet-open { width: 100%; min-width: 0; box-sizing: border-box; }
+body.ke .needs-card .sign-actions > .sign-sheet-open:last-child:nth-child(odd):not(.sign-words + .sign-sheet-open) { grid-column: 1 / -1; }
 /* LATER: one header (label + count, like Just answered), then a grid of number | day | headline; the row wrappers dissolve so the columns line up across rows */
 .needs-later { display: grid; grid-template-columns: max-content max-content minmax(0, 1fr); column-gap: var(--sp-3); row-gap: var(--sp-2); align-items: baseline; padding: 4px 2px; }
 .needs-later-head { grid-column: 1 / -1; display: flex; align-items: center; gap: var(--sp-2); }

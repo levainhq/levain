@@ -6231,7 +6231,7 @@
         if (draft && draft.sha256 !== (r.sha256 || "")) signWriteIns.delete(id);   // typed on a replaced version
         box.value = signWriteIns.has(id) ? signWriteIns.get(id).words : "";
         box.addEventListener("input", () => signWriteIns.set(id, { sha256: r.sha256 || "", words: box.value }));
-        const b = el("button", "undo-btn question-option sign-option", "(" + String(wi.key) + ") sign my words");
+        const b = el("button", "undo-btn question-option sign-option sign-words", "(" + String(wi.key) + ") sign my words");
         b.type = "button";
         // the streaming Mic and on-device Dictate on the write-in (board row 140); a tap that signs the words waits for the mic to end
         const wmic = window.LevainMic && typeof window.LevainMic.attach === "function" ? window.LevainMic.attach(box, { cls: "undo-btn", note: (t) => say(t) }) : null;
