@@ -38,7 +38,9 @@ def open_needs_count(queue_dir: "Path | str") -> "int | None":
         store = QuestionStore(queue_dir)
         # an open question snoozed past today is not counted, as on the strip (band_view.later_facets, the one LATER
         # predicate; a fault there is due, so the question still counts)
-        total += sum(1 for q in store.open_questions() if later_facets(store, q) is None)
+        # nor is a row the desk alone owes (section desk, not carried over to him): the strip's rule (dashboard_core needsItems)
+        total += sum(1 for q in store.open_questions()
+                     if later_facets(store, q) is None and not (q.section == "desk" and not q.carried))
     except Exception:  # noqa: BLE001 - likewise
         failed = True
     # a half that could not be read makes the count unknown, never a smaller number: a partial count could lower a real badge (6 -> 2)

@@ -37,7 +37,9 @@
         var c = cols[name] || { cards: [] };
         return {
           category: name,
-          cards: (c.cards || []).map(function (k) {
+          // a band row the desk alone owes (section desk, not carried over to him) is not his: left out as the Needs strip leaves
+          // it out (dashboard_core needsItems) and the app badge does (webpush/needs.py). Both read the host's own two fields
+          cards: (c.cards || []).filter(function (k) { return !(k.band === true && k.section === "desk" && !k.carried); }).map(function (k) {
             return {
               id: String(k.id), title: k.title == null ? "" : String(k.title), repo: k.repo || "",
               tier: k.tier || "", held: k.held_reason || "", number: k.number == null ? null : k.number,
