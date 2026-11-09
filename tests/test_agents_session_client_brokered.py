@@ -316,3 +316,18 @@ def test_a_brokered_launch_never_falls_back_to_run_sock(lrig, pair):
     with pytest.raises(L.LauncherRefused):
         client.spawn(api_launch(lrig, oid, KEY_B)[0])
     assert wire.opens == {"passthrough": 0, "brokered": 0}
+
+
+# --- r1 D: the launch's auth must be the reservation's billing's, not merely one the launcher serves -------------------
+
+def test_an_api_key_reservation_is_never_launched_with_the_passthrough_auth_on_a_two_auth_launcher():
+    from tests.test_agents_session_launch import API, ROLE, SUBRES
+
+    class Both:
+        route, auth, auths = S.S1_DISPATCH, "passthrough", frozenset({"passthrough", "brokered"})
+
+    assert S.launch_refusal(ROLE, API, Both(), None, usd_micros=100_000, auth="passthrough") \
+        == "ticket-auth-not-the-links-billing"
+    assert S.launch_refusal(ROLE, SUBRES, Both(), EXP, usd_micros=0, auth="brokered") \
+        == "ticket-auth-not-the-links-billing"
+    assert S.launch_refusal(ROLE, API, Both(), None, usd_micros=100_000, auth="brokered") is None

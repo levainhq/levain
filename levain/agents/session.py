@@ -336,10 +336,12 @@ def _auths_of(launcher: Any) -> frozenset[str]:
 
 
 def launch_refusal(role: Mapping[str, Any], reserved: Reserved | None, launcher: Any,
-                   exposure: ActionExposure | None, *, usd_micros: Any) -> str | None:
+                   exposure: ActionExposure | None, *, usd_micros: Any, auth: Any) -> str | None:
     """The reason this run may not start, or None. Order is the check order; the first failing check is the answer.
     ``usd_micros`` is the dollar exposure the caller's executor states; it must equal the reserved dollars (0 on a
-    subscription), so no billing figure the run carries is the caller's own."""
+    subscription), so no billing figure the run carries is the caller's own. ``auth`` is the auth the launch will
+    carry (the socket it reaches): it must be the reservation's billing's, and one the launcher serves, so an api_key
+    reservation is never launched passthrough by a launcher that serves both."""
     if role.get("executor") != "session":
         return "role-not-session"
     if role.get("harness") != "claude":
@@ -356,7 +358,7 @@ def launch_refusal(role: Mapping[str, Any], reserved: Reserved | None, launcher:
         return "launcher-not-wired" if isinstance(launcher, UnwiredLauncher) else "route-not-s1-dispatch"
     if reserved.billing not in AUTH_FOR_BILLING:
         return "unknown-billing"
-    if AUTH_FOR_BILLING[reserved.billing] not in _auths_of(launcher):
+    if auth != AUTH_FOR_BILLING[reserved.billing] or auth not in _auths_of(launcher):
         return "ticket-auth-not-the-links-billing"
     if reserved.billing == "subscription":
         if exposure is None or reserved.exposure is None:
@@ -499,7 +501,9 @@ def run_session(sup: Any, store: AgentStore, occurrence_id: str, launch_epoch: i
     unstarted = SessionExecutor(launcher, session_key=row[3])
     unstarted.spawn_attempted = row[3] is not None
     reserved = reserved_terms(store, occurrence_id)
-    why = launch_refusal(role, reserved, launcher, exposure, usd_micros=max_exposure_usd_micros)
+    # the auth the launch carries, checked by launch_refusal against the reservation's billing and the launcher
+    auth = None if reserved is None else AUTH_FOR_BILLING.get(reserved.billing)
+    why = launch_refusal(role, reserved, launcher, exposure, usd_micros=max_exposure_usd_micros, auth=auth)
     if why is None:
         try:
             executor = SessionExecutor(launcher, max_exposure_usd_micros=max_exposure_usd_micros,
@@ -524,7 +528,7 @@ def run_session(sup: Any, store: AgentStore, occurrence_id: str, launch_epoch: i
     # an api_key run states the dollars its reservation took (launch_refusal proved them the executor's own), so a
     # brokered run server can refuse a share above what the window was debited; a subscription run states none
     launch = SessionLaunch(occurrence_id, session_key, role["harness"], role["model"], brief,
-                           AUTH_FOR_BILLING[reserved.billing], exposure, workspace,
+                           auth, exposure, workspace,
                            reserved.usd_micros if reserved.billing == "api_key" else None)
     # what the fire records of its workspace: the setting it resolved and the commit that gave
     ws_record: dict[str, Any] = {} if workspace is None else {
