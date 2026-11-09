@@ -169,6 +169,18 @@ NOT_THE_TEMPLATES = "verifier-not-the-template's"
 # the verifier_refused evidence when the minted run is not a contract entry and its steps (the envelope check's own
 # refusal name, so one cause reads the same from either place)
 ENTRY_REFUSED = "verifier-entry"
+# the verifier_refused evidence when the run's route facts name no backend in the gateway's own route map (F9a): no
+# record is written for that run, so the consumer's contrast finds the run missing and escalates; a guessed or
+# placeholder identity could instead pair with a real one and pass as "distinct"
+BACKEND_UNRESOLVED = "backend-unresolved"
+# a run record's ``model.identity_source`` when its ``backend_identity`` was read from the gateway's route map (F9a);
+# the landing contrast trusts no other source (a record without it predates F9a, so a human vouches for it)
+IDENTITY_SOURCE = "routemap"
+# a run record's ``model.identity_source`` when the run's OWN executor ticket (the supervisor's) is a passthrough
+# ticket (PRE-W): its backend is the vendor's subscription through the base map's one passthrough route, which no
+# dispatch route map names, so the identity is ``passthrough:<vendor>`` from the ticket. The run records; the landing
+# contrast escalates it (only ``routemap`` is trusted to tell backends apart)
+PASSTHROUGH_SOURCE = "passthrough"
 _STORE_ID = re.compile(r"[0-9a-f]{32}")
 
 STATES = ("filed", "signed", "queued", "running", "verifying", "verified", "recommended", "authorised", "adopted",
@@ -672,6 +684,108 @@ def _refuse_repeat(conn: sqlite3.Connection, job: Job, run: int, ticket: str, re
         raise RecordConflict(f"ticket {ticket[:64]} already failed job {job.id} with another outcome")
     if job.state != "verifying":
         raise TransitionRefused(f"job {job.id} is {job.state}; only a verifying job records its verifier")
+
+
+def resolve_backend_identity(routes: Any, ticket: Any) -> str | None:
+    """The backend identity of the route a run used, read from the GATEWAY'S OWN route map (F9a), never from the
+    model or provider label an answer carries. ``routes`` is the :class:`levain.slot.routemaps.Checked` of the run
+    ticket's generation, ``ticket`` the facts of the run's own executor ticket as minted (``route``,
+    ``routemap_generation``, ``route_policy_digest``, ``model_requested``). ``None`` when anything does not line up:
+    no map or one not shaped as a checked map, a generation other than the ticket's (the map moved since the mint,
+    so the entry is not the one the run used), a route not in the map or whose policy digest is not the ticket's, or
+    a model the route does not carry. Never a guess, and never raises on a malformed map."""
+    if not isinstance(ticket, Mapping):
+        return None
+    gen, route = ticket.get("routemap_generation"), ticket.get("route")
+    digest, requested = ticket.get("route_policy_digest"), ticket.get("model_requested")
+    if type(gen) is not int or not all(isinstance(v, str) and v for v in (route, digest, requested)):
+        return None
+    if type(getattr(routes, "generation", None)) is not int or routes.generation != gen:
+        return None
+    entries, digests = getattr(routes, "routes", None), getattr(routes, "digests", None)
+    if not isinstance(entries, Mapping) or not isinstance(digests, Mapping) or digests.get(route) != digest:
+        return None
+    backends = getattr(entries.get(route), "backends", None)
+    backend = backends.get(requested) if isinstance(backends, Mapping) else None
+    return backend if isinstance(backend, str) and backend else None
+
+
+#: ``ticket_for(job_id, run_index)``: the facts of that run's EXECUTOR ticket as the supervisor minted it (``kind``,
+#: ``job_id``, ``run_index``, ``route``, ``routemap_generation``, ``route_policy_digest``, ``model_requested``), read
+#: from the supervisor's own record by the wiring that owns the CONTROL store, never from a follower's ``resolve``;
+#: ``None`` when there is none (F9a)
+TicketFor = Callable[[str, int], "Mapping[str, Any] | None"]
+
+
+def _supervisor_facts(run: Any, routemap: Callable[[int], Any] | None,
+                      ticket_for: TicketFor | None) -> tuple[dict[str, Any], Any] | None:
+    """``(ticket, routes)``: the run's executor ticket as ``ticket_for(run.job_id, run.run)`` answers it (one copy) and,
+    for a ticket that is not passthrough, ``routemap(<its generation>)``; ``routes`` is None for a passthrough ticket.
+    ``None`` when either reader is missing or answers nothing usable. PRE-W (head ruling, levain 72): this is the ONLY
+    place the two supervisor reads happen, and :meth:`JobStore.record_verification` calls it BEFORE any store
+    transaction opens, so no write lock is held across the supervisor's round trip. A reader that raises (the
+    supervisor unreachable, a broken reply) is ``None`` too: the run is unresolved, logged, and nothing propagates into
+    the follower."""
+    if ticket_for is None:
+        return None
+    try:
+        ticket = ticket_for(run.job_id, run.run)
+        if not isinstance(ticket, Mapping):
+            return None
+        ticket = dict(ticket)                          # one read: every check and the map lookup see the same
+        if ticket.get("auth") == "passthrough":
+            return ticket, None
+        gen = ticket.get("routemap_generation")
+        if routemap is None or type(gen) is not int:
+            return None
+        return ticket, routemap(gen)
+    except Exception as exc:  # noqa: BLE001 - an unreadable supervisor resolves nothing (fail closed)
+        log.warning("the supervisor's ticket or route map for run %r of job %r could not be read (%s); the run's "
+                    "backend identity is unresolved", getattr(run, "run", None), getattr(run, "job_id", None),
+                    type(exc).__name__)
+        return None
+
+
+def _routed_model(run: VerifierRun, model: Any,
+                  facts: tuple[dict[str, Any], Any] | None) -> dict[str, Any] | None:
+    """The model a run's record keeps (F9a), or ``None`` (unresolved), from ``facts`` as :func:`_supervisor_facts`
+    read them: ``requested`` and the route are the run's OWN executor ticket's (which must be this job's and this
+    run's executor ticket), the backend identity the route map's entry for them, ``identity_source`` says so, and
+    only ``answered`` is the caller's. A ``requested`` the caller gives must be the ticket's; a ``backend_identity``
+    it gives is never read. A PASSTHROUGH ticket (PRE-W) keeps ``passthrough:<vendor>`` from the ticket and
+    :data:`PASSTHROUGH_SOURCE`, its ``requested`` the ticket's; a passthrough ticket that names no model (its
+    ``model_requested`` is optional) is unresolved, as the record holds a ``requested`` and the caller's report never
+    supplies it (PRE-W L2 LOW-2)."""
+    if facts is None or not isinstance(model, Mapping):
+        return None
+    ticket, routes = facts
+    if (ticket.get("kind") != "executor" or ticket.get("job_id") != run.job_id
+            or type(ticket.get("run_index")) is not int or ticket.get("run_index") != run.run):
+        return None
+    if ticket.get("auth") == "passthrough":
+        vendor = ticket.get("vendor")
+        requested = ticket.get("model_requested")
+        if not (isinstance(vendor, str) and vendor and isinstance(requested, str) and requested):
+            return None
+        if "requested" in model and model["requested"] != requested:
+            return None
+        out: dict[str, Any] = {"requested": requested, "backend_identity": f"passthrough:{vendor}",
+                               "identity_source": PASSTHROUGH_SOURCE}
+        if "answered" in model:
+            out["answered"] = model["answered"]
+        return out
+    requested, gen = ticket.get("model_requested"), ticket.get("routemap_generation")
+    if "requested" in model and model["requested"] != requested:
+        return None
+    if type(gen) is not int:
+        return None
+    identity = resolve_backend_identity(routes, ticket)
+    if identity is None:
+        return None
+    out = {"requested": requested, "backend_identity": identity, "identity_source": IDENTITY_SOURCE}
+    if "answered" in model:
+        out["answered"] = model["answered"]
+    return out
 
 
 def _stored_record(job_id: str, run: Any, text: Any, digest: Any) -> ArtifactRecord:
@@ -1504,11 +1618,28 @@ class JobStore:
         return out
 
     def record_verification(self, run: VerifierRun, *, envelope: bytes | None, event: Mapping[str, Any], repo: str,
-                            tree: str, model: Mapping[str, str]) -> Job:
+                            tree: str, model: Mapping[str, str],
+                            routemap: Callable[[int], Any] | None = None,
+                            ticket_for: TicketFor | None = None) -> Job:
         """Record the end of run ``run.run``'s verifier session on its verifying job. ``event`` is the session's
         terminal ``state`` event (``session``, ``ticket``, ``at`` and one of ``verifier_report_digest`` /
         ``verifier_report_refused``), ``envelope`` the report envelope file's bytes (``None`` when none was read),
-        ``tree`` the run's artifact tree, ``model`` the run's ``{requested, answered, backend_identity}``.
+        ``tree`` the run's artifact tree, ``model`` the run's ``{answered}`` (a ``requested`` beside it must be the
+        run ticket's; a ``backend_identity`` beside it is never read).
+
+        F9a, FAIL CLOSED: the record's ``model`` is built by :func:`_routed_model`: ``requested``, the route and the
+        route-map generation are the run's own executor ticket's, read by ``ticket_for(run.job_id, run.run)`` (the
+        supervisor's mint, :data:`TicketFor`; ``run`` carries no ticket facts, so whoever builds the VerifierRun, a
+        follower's ``resolve`` included, cannot supply them), whose answer must be this job's and this run's executor ticket, the ``backend_identity`` is
+        :func:`resolve_backend_identity`'s read of ``routemap(generation)`` (the gateway's route map of the ticket's
+        generation), and ``identity_source`` is :data:`IDENTITY_SOURCE`. No ``routemap``, no ``ticket_for``, no
+        ticket facts or another run's, a caller ``requested`` other than the ticket's, or a route that names no backend
+        fails the job ``verifier_refused``, :data:`BACKEND_UNRESOLVED`, writes no run record, and the landing contrast
+        then escalates on the missing run. A map that moved since the mint is unresolved too: that is terminal for the
+        job (the operator files again), never a retry with a guessed entry. Both reads run once, before any store
+        transaction opens (:func:`_supervisor_facts`), and a reader that raises is unresolved, never raised. A
+        PASSTHROUGH executor ticket records ``passthrough:<vendor>`` under :data:`PASSTHROUGH_SOURCE`, which the
+        landing contrast escalates to a human.
 
         A refused event, a minted run that is not a contract entry and its steps (:data:`ENTRY_REFUSED`), a minted
         verifier entry that is not the template's (:data:`NOT_THE_TEMPLATES`), both checked before anything is
@@ -1530,6 +1661,9 @@ class JobStore:
         if not isinstance(run, VerifierRun):
             raise DispatchError("run must be the VerifierRun the supervisor minted")
         refused, report_digest = _terminal_event(event, run)
+        # PRE-W (head ruling, levain 72): the supervisor's ticket and route map are read HERE, before any store
+        # transaction opens (both are immutable minted facts); a refused event needs neither
+        facts = _supervisor_facts(run, routemap, ticket_for) if refused is None else None
         with self._swept() as (conn, _stamp):
             job = self._must_load(conn, run.job_id)
             _refuse_repeat(conn, job, run.run, run.ticket, refused, report_digest)
@@ -1556,6 +1690,12 @@ class JobStore:
                 report = check_envelope(envelope, expected=run, event_digest=report_digest)
             except ReportRefused as exc:
                 name = exc.name
+            if name is None:
+                routed = _routed_model(run, model, facts)
+                if routed is None:
+                    name = BACKEND_UNRESOLVED
+                else:
+                    model = routed
         record: ArtifactRecord | None = None
         if name is None:
             verified_at = _verified_at(event["at"])

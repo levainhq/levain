@@ -252,6 +252,52 @@ def test_setup_resumes_intent_groups(host):
     assert err.name == "install-interrupted"
 
 
+@pytest.mark.parametrize("host", HOSTS)
+def test_setup_resumes_an_account_killed_between_its_group_and_its_user(host):
+    """PREL3 1a-10: setup killed after a slot account's own group was made and before its user: the journal names
+    that group, so a re-run resumes the account rather than refusing it as someone else's."""
+    first, j, made = _interrupted_setup(host)
+    s0 = j.accounts["_levain_s0"]
+    names, used = frozenset(made) | {"_levain_s0"}, frozenset(made.values()) | {s0}
+    again = _plan(host, existing_names=names, used_ids=used, intent=j, host_ids=made,
+                  account_group_ids={"_levain_s0": s0})
+    assert dict(again.allocation.ids) == dict(j.accounts) and "_levain_s0" in again.kept
+    # the group step skips (present), the user step runs at the journaled id
+    if host == "linux":
+        group = [s for s in again.steps if s.why == "create _levain_s0's own primary group"]
+        user = [s for s in again.steps if s.argv and s.argv[0].endswith("/useradd") and s.argv[-1] == "_levain_s0"]
+        assert [g.skip_if[1:] for g in group] == [("group", "_levain_s0")], "the group step skips when present"
+        assert len(user) == 1 and user[0].argv[user[0].argv.index("--uid") + 1] == str(s0), "the user is made at s0"
+        assert user[0].skip_if[1:] == ("passwd", "_levain_s0")
+    else:
+        uid = [s for s in again.steps if s.argv and s.argv[-3:] == ("/Users/_levain_s0", "UniqueID", str(s0))]
+        assert len(uid) == 1, "the user is made at the journaled id"
+    # the same-name group at another gid is not the one the journal made
+    err = _refusal(_plan, host, existing_names=names, used_ids=used | {s0 - 1}, intent=j, host_ids=made,
+                   account_group_ids={"_levain_s0": s0 - 1})
+    assert err.name == "account-exists" and "_levain_s0" in err.detail
+    # the group is ours but another account holds the journaled uid: refused
+    err = _refusal(_plan, host, existing_names=names | {"mallory"}, used_ids=used, intent=j, host_ids=made,
+                   account_group_ids={"_levain_s0": s0}, user_ids={"mallory": s0})
+    assert err.name == "account-exists" and "_levain_s0" in err.detail
+
+
+@pytest.mark.parametrize("host", HOSTS)
+def test_undo_over_an_account_with_its_group_and_no_user(host):
+    """PREL3 1a-10: the same group-only account under undo is treated as ours: its uid is retired (never reissued) and
+    its group is not deleted. (Whether a tombstone act runs is decided at run time from the live user: none exists.)"""
+    first, j, made = _interrupted_setup(host)
+    s0 = j.accounts["_levain_s0"]
+    labelled = {n: made[n] for n in SINGLETONS}
+    shared = {} if host == "linux" else {g: made[g] for g in SHARED_GROUPS}
+    names = frozenset(made) | {"_levain_s0"}
+    undo = plan_undo(parse_install_argv(["undo"]),
+                     _set_up(host, intent=j, host_ids=made, existing_names=names, account_group_ids={"_levain_s0": s0}),
+                     accounts=labelled, shared_groups=shared)
+    assert s0 in undo.retired_after, "its uid is retired so it is never reissued"
+    assert not any(s.why.startswith("delete the group") and "_levain_s0" in s.why for s in undo.steps)
+
+
 # --- replenish reads the journal -----------------------------------------------------------------------
 
 

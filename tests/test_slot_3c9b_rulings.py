@@ -25,7 +25,9 @@ def test_r_control_is_setgid_levain_control(host):
     if host == "linux":    # the boot-time copy keeps the setgid bit
         assert f"d {row.path} 2750 _levain_control levain-control -" in layout.tmpfiles_text(host, (), "op")
     steps = layout.row_steps(host, [row])
-    assert steps[-1].argv[-2:] == ("2750", str(row.path))   # the mode last, so no chown clears it
+    assert steps[-1].why == f"set {row.path} to 2750"       # the mode last, so no chown clears it
+    if host == "darwin":
+        assert steps[-1].argv[-2:] == ("2750", str(row.path))
 
 
 def test_a_socket_bound_in_a_setgid_dir_takes_the_dirs_group(tmp_path):

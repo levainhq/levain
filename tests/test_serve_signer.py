@@ -206,11 +206,11 @@ def test_the_signer_make_server_is_given(tmp_path: Path, monkeypatch: pytest.Mon
         assert httpd.dispatch_sheet.elsewhere() is None
 
 
-@pytest.mark.parametrize("value,expected", [(True, True), (False, False), ("false", False), ("yes", False), (1, False), (None, False)])
-def test_premium_dictation_is_on_only_for_a_literal_true_through_run_web_server(
-        tmp_path: Path, monkeypatch: pytest.MonkeyPatch, value: Any, expected: bool) -> None:
+@pytest.mark.parametrize("value,expected", [(True, True), (False, False), ("false", None), ("yes", None), (1, None), (None, None)])
+def test_premium_dictation_is_forced_only_by_a_literal_bool_through_run_web_server(
+        tmp_path: Path, monkeypatch: pytest.MonkeyPatch, value: Any, expected: "bool | None") -> None:
     """L3 r1 on hidestt (codex MED, deepseek MED): a truthy string from a config or an environment read must not turn
-    premium dictation on. Red with ``if premium_stt:`` in ``run_web_server``: "false" and "yes" came out True."""
+    premium dictation on or off: only a literal bool forces the switch, anything else is AUTO (None). Red with ``if premium_stt:`` in ``run_web_server``: "false" and "yes" came out True."""
     root = _install(tmp_path)[0]
     with _running(root, monkeypatch, write=True, premium_stt=value) as (httpd, _seen, _rc):
         assert httpd.premium_stt is expected

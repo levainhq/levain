@@ -450,8 +450,9 @@ class _Holder:
     It leaves ``_live`` only when an END for its key is PROVEN."""
 
     def __init__(self, key: str, proof: C.LinkProof, exposure: Optional[ActionExposure],
-                 claims: Optional[FrameClaims] = None) -> None:
+                 claims: Optional[FrameClaims] = None, owner: "Optional[RunServer]" = None) -> None:
         self.key, self.proof, self.exposure, self.claims = key, proof, exposure, claims
+        self.owner = owner              # the server whose LAUNCH spawned it: its verify re-judges it, its permit is held
         self.child: Any = None
         self.ready = threading.Event()
         self.aborted = False
@@ -539,34 +540,70 @@ class _EndJob:
         self.result = StopResult(False, "END in progress")
 
 
+class HolderRegistry:
+    """The per-key state the run servers of ONE process share (PRE-W L2 HIGH-1, MED-2): the live holders, the END jobs,
+    the END stripes and the SYNC re-judge flags, all guarded by ``mu``. The passthrough and brokered servers share one
+    session index and one replica, so a key is one session whichever socket it was launched on: a SYNC on either socket
+    re-judges every live holder (each by its own server's verify), an END on either finds the real holder and marks it
+    ``ending``, and a key's teardowns serialise on one stripe. Lock order: a holder's ``lock``, then a stripe, then the
+    index's per-key lock; ``mu`` is a leaf (nothing that blocks is taken under it). Each server keeps its own connection
+    and holder permits and its own ``_closing``, which is read and written only under ``mu``."""
+
+    def __init__(self) -> None:
+        self.mu = threading.Condition(threading.Lock())
+        self.live: dict[str, _Holder] = {}
+        self.jobs: dict[str, _EndJob] = {}
+        self.stripes = tuple(threading.RLock() for _ in range(_END_STRIPES))
+        self.rejudge_running = False        # one SYNC re-judge worker at a time; a SYNC during a pass asks for one more
+        self.rejudge_again = False
+        self.servers: list["RunServer"] = []
+
+    def all_closing(self) -> bool:
+        """Every server on this registry has begun its shutdown (call under ``mu``)."""
+        return all(s._closing for s in self.servers)
+
+
 class RunServer:
     """The protocol and the per-key END jobs; the socket loop is :func:`serve`. ``verify(proof, exposure)`` raises
     :class:`LauncherRefused` (production: :func:`verify_point_of_use` bound to this server's readers);
     ``pool_free()`` is whether a free egress slot exists; ``peer_ok(sock)`` is the peer-uid check. With a ``replica``
     (production) ``SYNC`` feeds it and LAUNCH/RELEASE must carry ``ledger_head`` (LAUNCH also ``bar``), passed to
-    ``verify`` as :class:`FrameClaims`; without one the frames carry neither and ``verify`` gets ``None``."""
+    ``verify`` as :class:`FrameClaims`; without one the frames carry neither and ``verify`` gets ``None``. Servers that
+    share a session index share a :class:`HolderRegistry` (``registry``); without one a server makes its own."""
+
+    #: PRE-W: the brokered server :func:`build_server` built beside this passthrough one (setting ON), else None
+    brokered: "Optional[RunServer]" = None
 
     def __init__(self, launcher: RealLauncher, *,
                  verify: Callable[[C.LinkProof, Optional[ActionExposure], Optional[FrameClaims]], Any],
                  pool_free: Callable[[], bool], peer_ok: Callable[[socket.socket], bool],
                  holder_idle_s: float = HOLDER_IDLE_S, max_connections: int = MAX_CONNECTIONS,
                  max_holders: int = MAX_HOLDERS, replica: Optional[AuthorityReplica] = None,
-                 uploads: Optional[WS.WorkspaceUploads] = None) -> None:
+                 uploads: Optional[WS.WorkspaceUploads] = None, registry: Optional[HolderRegistry] = None) -> None:
         if not 0 < max_holders < max_connections:
             raise ValueError("holders must be capped below the connection cap (USAGE and END need a permit)")
         self.launcher, self._verify, self._pool_free, self._peer_ok = launcher, verify, pool_free, peer_ok
         self._replica = replica
         self._uploads = uploads           # None: this server stages no workspace (a LAUNCH naming one is refused)
         self._idle = holder_idle_s
-        self._mu = threading.Condition(threading.Lock())
-        self._jobs: dict[str, _EndJob] = {}
+        self._reg = registry if registry is not None else HolderRegistry()
+        self._mu = self._reg.mu
+        self._jobs = self._reg.jobs
+        self._stripes = self._reg.stripes
+        self._live = self._reg.live
         self._slots = threading.BoundedSemaphore(max_connections)
         self._holder_slots = threading.BoundedSemaphore(max_holders)
-        self._stripes = tuple(threading.RLock() for _ in range(_END_STRIPES))
-        self._live: dict[str, _Holder] = {}
         self._closing = False
-        self._rejudge_running = False       # one SYNC re-judge worker at a time; a SYNC during a pass asks for one more
-        self._rejudge_again = False
+        with self._mu:
+            self._reg.servers.append(self)
+
+    @property
+    def _rejudge_running(self) -> bool:
+        return self._reg.rejudge_running
+
+    @property
+    def _rejudge_again(self) -> bool:
+        return self._reg.rejudge_again
 
     # -- connection ------------------------------------------------------------------------------------------------------
 
@@ -851,14 +888,16 @@ class RunServer:
         its rows. Never raises, never waits: the SYNC's answer is not delayed, except in one case. When the worker
         thread cannot be started (thread exhaustion), the pass runs HERE, on the SYNC's own thread, before it answers
         (L3 r1: a swallowed start lost a committed revoke on a quiet box). A delayed answer is the price of never losing a
-        pass; a pending flag waiting for a next SYNC that may never come was the alternative, and it can lose one."""
+        pass; a pending flag waiting for a next SYNC that may never come was the alternative, and it can lose one.
+        The worker and its flags are the registry's: one pass covers the live holders of every server sharing it."""
+        reg = self._reg
         with self._mu:
-            if self._closing:
+            if reg.all_closing():
                 return
-            self._rejudge_again = True
-            if self._rejudge_running:
+            reg.rejudge_again = True
+            if reg.rejudge_running:
                 return
-            self._rejudge_running = True
+            reg.rejudge_running = True
         try:
             threading.Thread(target=self._rejudge_loop, daemon=True).start()
         except Exception:  # noqa: BLE001
@@ -868,25 +907,28 @@ class RunServer:
     def _rejudge_loop(self) -> None:
         """Passes until no SYNC asked for another. Every exit clears ``_rejudge_running``, and the exception exit
         re-checks ``_rejudge_again`` (a SYNC that landed during the pass) and asks for a fresh worker, so a raise loses no
-        queued pass (L3 r1). Each holder is judged in its own ``try``: one holder that raises skips no other."""
+        queued pass (L3 r1). Each holder is judged in its own ``try``: one holder that raises skips no other. Each holder
+        is judged by the server that spawned it (``owner``); a holder whose server is shutting down is left to that
+        shutdown."""
+        reg = self._reg
         try:
             while True:
                 with self._mu:
-                    if not self._rejudge_again or self._closing:
-                        self._rejudge_again = False
-                        self._rejudge_running = False
+                    if not reg.rejudge_again or reg.all_closing():
+                        reg.rejudge_again = False
+                        reg.rejudge_running = False
                         return
-                    self._rejudge_again = False
-                    holders = list(self._live.values())
+                    reg.rejudge_again = False
+                    holders = [h for h in self._live.values() if not (h.owner or self)._closing]
                 for h in holders:
                     try:
-                        self._rejudge(h)
+                        (h.owner or self)._rejudge(h)
                     except Exception as exc:  # noqa: BLE001
                         _log.warning("SYNC re-judge of %s raised (%s)", h.key, type(exc).__name__)
         except BaseException:  # noqa: BLE001 - the flag must come back, whatever raised
             with self._mu:
-                self._rejudge_running = False
-                again = self._rejudge_again and not self._closing
+                reg.rejudge_running = False
+                again = reg.rejudge_again and not reg.all_closing()
             _log.warning("a SYNC re-judge pass raised")
             if again:
                 self._rejudge_soon()
@@ -949,11 +991,11 @@ class RunServer:
         with self._mu:
             if self._closing:
                 raise LauncherRefused("server-stopping", "the run server is stopping", reason_class="transient")
-            if key in self._live:
+            if key in self._live:       # the registry's: a key held on the sibling socket is held here too
                 raise LauncherRefused("session-key-already-used", "this server already holds a session under this key")
             if not self._holder_slots.acquire(blocking=False):
                 raise LauncherRefused("no-holder-capacity", "every holder slot is taken", reason_class="transient")
-            holder = self._live[key] = _Holder(key, proof, launch.exposure, claims)
+            holder = self._live[key] = _Holder(key, proof, launch.exposure, claims, owner=self)
         try:
             child = self.launcher.spawn(launch)
         except BaseException:
@@ -1000,7 +1042,7 @@ class RunServer:
                     except Exception:  # noqa: BLE001 - the END below is the proof
                         _log.warning("a holder's ABORT raised")
                     h.job = self._start_end(h.key)
-                    self._holder_slots.release()      # the connection's permit; the _live entry outlives it
+                    (h.owner or self)._holder_slots.release()   # the spawning connection's permit; _live outlives it
                     self._forget_if_proven(h.key, h.job)
                 job = h.job
             job.done.wait(max(0.0, wait_s))
@@ -1043,7 +1085,8 @@ class RunServer:
         try:
             with self._mu:
                 self._closing = True                 # no holder registers after this, so the snapshot is complete
-                holders = list(self._live.values())
+                # this server's own holders: a sibling sharing the registry ENDs its own in its shutdown
+                holders = [h for h in self._live.values() if (h.owner or self) is self]
             threads = [threading.Thread(target=self._shutdown_one, args=(h, end_at), daemon=True) for h in holders]
             for t in threads:
                 t.start()
@@ -1071,20 +1114,28 @@ class RunServer:
         """T7: the key's one END job, started if there is none or the last one finished UNPROVEN (a retry, never
         concurrent with another). A PROVEN job is kept for good and answers every repeat; past :data:`_JOBS_KEEP` jobs
         only finished unproven ones are dropped. A job whose thread cannot start is finished UNPROVEN on the spot, so it
-        never reads as in flight for good and the next END (or SYNC re-judge) starts a fresh one (L3 r1)."""
+        never reads as in flight for good and the next END (or SYNC re-judge) starts a fresh one (L3 r1).
+
+        The job is published under the shared ``mu`` and its thread started after ``mu`` is released: ``Thread.start``
+        can block, and ``mu`` is shared by both servers' END, SYNC re-judge and shutdown (PRE-W L3 r1, codex MED). A
+        caller that joins the published job before its thread runs waits on ``done`` like any other joiner; a start
+        failure finishes the published job under ``mu``, so every waiter on the key wakes with the failure."""
+        fresh: Optional[_EndJob] = None
         with self._mu:
             job = self._jobs.get(key)
             if job is None or (job.done.is_set() and job.result.terminated is not True):
-                job = self._jobs[key] = _EndJob()
-                try:
-                    threading.Thread(target=self._run_end, args=(key, job), daemon=True).start()
-                except Exception:  # noqa: BLE001
-                    job.result = StopResult(False, "END could not start; nothing assumed ended")
-                    job.done.set()
+                job = fresh = self._jobs[key] = _EndJob()
             if len(self._jobs) > _JOBS_KEEP:
                 for k in [k for k, j in self._jobs.items()
                           if k != key and j.done.is_set() and j.result.terminated is not True]:
                     del self._jobs[k]
+        if fresh is not None:
+            try:
+                threading.Thread(target=self._run_end, args=(key, fresh), daemon=True).start()
+            except Exception:  # noqa: BLE001
+                with self._mu:
+                    fresh.result = StopResult(False, "END could not start; nothing assumed ended")
+                    fresh.done.set()
         return job
 
     def _end(self, key: str, deadline_s: float) -> StopResult:
@@ -1168,6 +1219,9 @@ def _parser(host: str) -> argparse.ArgumentParser:
     ap.add_argument("--store-dir", default=str(STORE[host]), help="L: the store root (gw logs, queue, dispatch)")
     ap.add_argument("--operator-record", default=None)
     ap.add_argument("--operator-uid", type=int, default=None)
+    from levain.slot.layout import policy_dispatch_auth_path
+    ap.add_argument("--auth-setting", default=str(policy_dispatch_auth_path(host)),
+                    help="PRE-W: root's brokered setting (absent: OFF, the passthrough server only)")
     return ap
 
 
@@ -1192,8 +1246,28 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         from levain.slot.layout import operator_record_path
         from levain.slot.services.control import _operator_uid
         op_uid = a.operator_uid if a.operator_uid is not None else _operator_uid(Path(a.operator_record or operator_record_path(host)))
-        server = build_server(host, Path(a.store_dir), Path(a.control), op_uid)
+        # PRE-W, DEFAULT OFF: root's setting adds the brokered server on its own socket; OFF serves exactly as before
+        auth, why = read_dispatch_auth(a.auth_setting)
+        if why is not None:
+            print(f"levain dispatch-run: brokered launcher off: {why}", file=sys.stderr, flush=True)
+        server = build_server(host, Path(a.store_dir), Path(a.control), op_uid, brokered=auth == "brokered")
         listener = _bind(Path(a.socket))
+        brokered = None
+        if server.brokered is not None:
+            try:
+                brokered = (server.brokered, _bind(Path(a.socket).parent / BROKERED_SOCKET_NAME))
+            except Refused:
+                # `socket-path-not-ours`: something not ours (not a socket, or another uid's) sits at the brokered
+                # path inside the run server's own directory. That is an unsafe install, not a busy port, so the whole
+                # service refuses (fail closed, EX_CONFIG) rather than serve run.sock beside it; ON taking OFF down is
+                # accepted on this one path (PRE-W L3 r1)
+                raise
+            except OSError as exc:
+                # ON never takes OFF's server down (PRE-W L2): the passthrough socket serves alone, as with the
+                # setting OFF; the unserved brokered server is marked stopping so nothing waits on it
+                print(f"levain dispatch-run: brokered socket not bound ({type(exc).__name__}: {exc}); serving the "
+                      "passthrough socket only", file=sys.stderr, flush=True)
+                server.brokered.shutdown(0.0)
     except Refused as exc:
         # Setup starts this unit before it writes the operator record, its LAST act (§23): on a fresh host the first
         # start finds none. EX_TEMPFAIL is restarted (Restart=always / KeepAlive); EX_CONFIG would leave it down.
@@ -1205,25 +1279,57 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     stop = threading.Event()
     for sig in (signal.SIGTERM, signal.SIGINT):
         signal.signal(sig, lambda *_: stop.set())
+    side = None
+    if brokered is not None:
+        side = threading.Thread(target=serve, args=(brokered[0], brokered[1], stop), name="brokered", daemon=True)
+        side.start()
     try:
         serve(server, listener, stop)
     finally:
-        server.shutdown(SHUTDOWN_BUDGET_S)       # END every live session first: daemon handlers never clean up at exit
+        stop.set()
+        # END every live session first: daemon handlers never clean up at exit. Both servers shut down AT ONCE against
+        # one absolute deadline, so the pair returns within one SHUTDOWN_BUDGET_S (a unit's stop timeout is sized for
+        # one service's shutdown, not two back to back; PRE-W L3 r1)
+        end_at = time.monotonic() + SHUTDOWN_BUDGET_S
+        down = None
+        if brokered is not None:
+            side_server = brokered[0]
+            down = threading.Thread(target=lambda: side_server.shutdown(max(0.0, end_at - time.monotonic())),
+                                    name="brokered-down", daemon=True)
+            try:
+                down.start()
+            except RuntimeError:
+                down = None                      # no thread to spare: it runs after, in what is left of the budget
+        server.shutdown(max(0.0, end_at - time.monotonic()))
+        if down is not None:
+            down.join(max(0.0, end_at - time.monotonic()))
+        elif brokered is not None:
+            brokered[0].shutdown(max(0.0, end_at - time.monotonic()))
         listener.close()
+        if brokered is not None:
+            brokered[1].close()
+            if side is not None:
+                side.join(1.0)
         close = getattr(server.launcher.runtime, "close", None)
         if close is not None:
             close()
     return 0
 
 
-def build_server(host: str, store: Path, control_sock: Path, operator_uid: int) -> RunServer:
-    """PRE-W (L3 wave3 r1, codex HIGH 1; by design, this branch keeps the brokered path unreachable): this builds the
-    PASSTHROUGH server only. Wiring API-key (brokered) sessions must add a separately constructed brokered launcher,
-    ``RealLauncher(..., auth="brokered", spend=lineage_spend_reader(<sink>, <keys' completeness proof>))``, behind its
-    own verifier, ``replica_verifier(replica, billing="api_key")``, chosen from a trusted billing decision (a separate
-    server or socket per billing, or a dispatch on the verified link's billing), and the client's ``build_launcher``
-    must hand an ``api_key`` occurrence a brokered client. Never mutate a shared launcher's ``auth`` per request:
-    concurrent launches and later USAGE reads of the same launcher would race on it.
+def build_server(host: str, store: Path, control_sock: Path, operator_uid: int, *, brokered: bool = False) -> RunServer:
+    """The PASSTHROUGH server (L3 wave3 r1, codex HIGH 1). With ``brokered`` (PRE-W: root's setting ON,
+    :func:`read_dispatch_auth`; default OFF) it also builds, as the returned server's ``brokered``, a BROKERED server: a
+    separately constructed ``RealLauncher(auth="brokered")`` whose usage is ``spend=lineage_spend_reader(L/lineage/
+    lineage.jsonl)`` with no completeness proof (none exists yet: every read is None, so every brokered run settles at
+    its WHOLE share, the fail-closed rule), behind its own ``replica_verifier(replica, billing="api_key")``, served by
+    :func:`main` on its own socket (:data:`BROKERED_SOCKET_NAME`). The two share the runtime, the usage sources, the
+    session index (one record directory, keyed by attempt id), the ONE replica (two replica objects on one directory
+    would contend on its append lock), the ONE uploads (a second sweep would delete the first's staging) and the ONE
+    :class:`HolderRegistry` (a key is one session whichever socket launched it, so SYNC and END reach it from either). Both
+    servers come from the one ``RunServer(`` call below with ``replica=replica`` (the claims=None ruling's pin). The
+    client's ``build_launcher`` handing an ``api_key`` occurrence a brokered client is NOT wired yet, so no real fire
+    reaches the brokered socket. Never mutate a shared launcher's ``auth`` per request: concurrent launches and later
+    USAGE reads would race on it.
 
     The production wiring: the real ports behind :class:`RealLauncher`, and the authority REPLICA at
     ``<store>/dispatch/authority`` behind :func:`replica_verifier`. Nothing of the operator's home is read or named: the operator's
@@ -1245,8 +1351,55 @@ def build_server(host: str, store: Path, control_sock: Path, operator_uid: int) 
         ans = pool.call("POOL")
         return type(ans.get("egress_free")) is int and ans["egress_free"] > 0
 
-    return RunServer(launcher, verify=replica_verifier(replica), pool_free=pool_free,
-                     peer_ok=lambda s: peer_uid(s) == operator_uid, replica=replica, uploads=uploads)
+    launchers = [(launcher, replica_verifier(replica))]
+    if brokered:
+        from levain.slot.dispatch_usage import lineage_spend_reader
+        from levain.slot.lineage import SINK
+        launchers.append((RealLauncher(DispatchControlPort(control_sock), launcher.runtime, launcher.sources,
+                                       launcher.index, auth="brokered",
+                                       spend=lineage_spend_reader(store / "lineage" / SINK)),
+                          replica_verifier(replica, billing="api_key")))
+    registry = HolderRegistry()         # one session index, so one set of holders, END jobs, stripes and re-judge
+    servers = [RunServer(ln, verify=verify, pool_free=pool_free, peer_ok=lambda s: peer_uid(s) == operator_uid,
+                         replica=replica, uploads=uploads, registry=registry) for ln, verify in launchers]
+    if brokered:
+        servers[0].brokered = servers[1]
+    return servers[0]
+
+
+#: PRE-W: the whole content of ``L/policy/dispatch_auth`` that turns the brokered launcher ON
+DISPATCH_AUTH_ON = b"brokered\n"
+#: PRE-W: the brokered server's socket, beside the passthrough one (``run.sock``): the billing decision is which
+#: socket a fire reached, never a per-request change of a shared launcher
+BROKERED_SOCKET_NAME = "run-brokered.sock"
+
+
+def read_dispatch_auth(path: "Path | str", owner: int = 0) -> tuple[str, Optional[str]]:
+    """``(auth, why)`` of the run server's brokered setting (PRE-W, DEFAULT OFF): ``("brokered", None)`` only when
+    ``path`` is a regular file (not a link) owned by ``owner`` (root), writable by nobody else, whose whole content is
+    :data:`DISPATCH_AUTH_ON`. Absent is ``("passthrough", None)``, OFF. Anything else reads OFF too, with ``why`` the
+    reason (the doctor shows it): OFF is the passthrough server that runs without the setting. Never raises."""
+    import stat as _stat
+    try:
+        fd = os.open(str(path), os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC)
+    except FileNotFoundError:
+        return "passthrough", None
+    except OSError as exc:
+        return "passthrough", f"the setting cannot be read ({exc.strerror or type(exc).__name__})"
+    try:
+        st = os.fstat(fd)
+        if not _stat.S_ISREG(st.st_mode):
+            return "passthrough", "the setting is not a regular file"
+        if st.st_uid != owner or st.st_mode & 0o022:
+            return "passthrough", "the setting is not root's alone (another account owns it or can write it)"
+        data = os.read(fd, len(DISPATCH_AUTH_ON) + 1)
+    except OSError as exc:
+        return "passthrough", f"the setting cannot be read ({exc.strerror or type(exc).__name__})"
+    finally:
+        os.close(fd)
+    if data != DISPATCH_AUTH_ON:
+        return "passthrough", "the setting's content is not exactly 'brokered'"
+    return "brokered", None
 
 
 def service_row():
@@ -1259,7 +1412,7 @@ def service_row():
 
 
 __all__ = ["ACCOUNT", "NAME", "FrameClaims", "RunServer", "replica_verifier", "service_row", "agent_store_bar", "bound_usage_sources", "build_server", "main", "serve",
-           "verify_point_of_use"]
+           "verify_point_of_use", "BROKERED_SOCKET_NAME", "DISPATCH_AUTH_ON", "read_dispatch_auth"]
 
 
 if __name__ == "__main__":

@@ -89,6 +89,12 @@ class GrantPhone:
         self._held: dict[str, tuple[Any, str, float]] = {}
         self._lock = threading.Lock()
 
+    # what a revoke here ends, why a localhost passkey cannot sign one, and the laptop's own door: a subclass that
+    # revokes something else names its own, so a note never sends the operator to the wrong command
+    _THING = "a grant"
+    _WHY_HTTPS = "the authority log takes a passkey's revoke only from an https page"
+    _LAPTOP = "levain consent grant revoke"
+
     def _signers(self) -> tuple[dict[str, Any], str]:
         """The passkeys that may revoke here, by fingerprint, and a note when there are none."""
         from levain.authority import AuthorityError
@@ -96,20 +102,20 @@ class GrantPhone:
         from levain.consent.sign import SignRefused
 
         if self.rp_id == "localhost":
-            return {}, ("a passkey made on localhost cannot revoke a grant (the authority log takes a passkey's revoke "
-                        "only from an https page): revoke from the laptop (levain consent grant revoke)")
+            return {}, (f"a passkey made on localhost cannot revoke {self._THING} ({self._WHY_HTTPS}): revoke from "
+                        f"the laptop ({self._LAPTOP})")
         if self.page_origin is not None:
             problem = page_origin_problem(self.rp_id, self.page_origin)
             if problem is not None:
                 # to_sshsig refuses every assertion against such a pin, so none is asked for
-                return {}, f"{problem}: revoke from the phone page or the laptop (levain consent grant revoke)"
+                return {}, f"{problem}: revoke from the phone page or the laptop ({self._LAPTOP})"
         try:
             keys = self._keys()
         except (SignRefused, AuthorityError, OSError, sqlite3.Error) as exc:
             return {}, str(exc)
         if not keys:
             return {}, (f"no passkey is enrolled for {self.rp_id} in the cockpit the consent hook names: revoke from "
-                        "the laptop (levain consent grant revoke)")
+                        f"the laptop ({self._LAPTOP})")
         return keys, ""
 
     def listing(self) -> dict[str, Any]:

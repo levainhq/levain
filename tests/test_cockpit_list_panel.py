@@ -53,7 +53,7 @@ class Rig:
         self.ids: dict[str, str] = {}
         if spores:
             self._spores()
-        self.qs = QuestionStore(self.qdir)
+        self.qs = QuestionStore(self.qdir, clock=lambda: NOW)   # the store files rows on the same pinned clock as the cockpit
         if band:
             self.q = self.qs.file(agent="claude_code", agent_session_id="sess-1", what="Ship the sweep fix tonight?",
                                   options=[("ship", "Ship it"), ("hold", "Hold")], rec="hold",
@@ -121,7 +121,7 @@ def test_the_three_stores_are_one_panel_titled_list_and_each_row_names_its_surfa
     assert sorted(by_surface["talk"]) == sorted(f"spore:{rig.ids[k]}" for k in ("talk_old", "talk_new"))
     assert sorted(by_surface["drop"]) == sorted(f"spore:{rig.ids[k]}" for k in ("drop_late", "drop_soon"))
     assert f"spore:{rig.ids['loop']}" not in {r["id"] for r in p["rows"]}            # Open loops stays machine-side
-    assert [g["id"] for g in p["groups"]] == ["band", "overdue", "today", "board", "talk", "also"]
+    assert [g["id"] for g in p["groups"]] == ["band", "desk", "later", "overdue", "today", "board", "talk", "also"]
     assert p["note"] == list_panel.LIST_NOTE
 
 
@@ -321,3 +321,156 @@ def test_the_frozen_fixture_is_what_the_live_panel_produces(rig: Rig) -> None:
         FIXTURE.write_text(json.dumps(live, indent=1, sort_keys=True, ensure_ascii=False) + "\n", encoding="utf-8")
     frozen = json.loads(FIXTURE.read_text(encoding="utf-8"))
     assert live == frozen
+
+
+# --- 531 round 4 (levain 73, key 1108-37): the host's section and a LATER day reach the List, and sort its band rows ---------
+
+
+def _band_with(monkeypatch: pytest.MonkeyPatch, rig: Rig, **fields: Any) -> None:
+    """The band as a host store reads it: the one question carries the host's own section / carried / snoozed_until / dated."""
+    from dataclasses import replace
+
+    real = band_view._read
+
+    def read(store: Any) -> Any:
+        items, numbers, closed = real(store)
+        return [(ref, replace(q, **fields) if q is not None else q) for ref, q in items], numbers, closed
+
+    monkeypatch.setattr(band_view, "_read", read)
+
+
+def test_r1_a_desk_section_row_carries_its_section_and_sorts_under_desk_owes(rig: Rig, monkeypatch: pytest.MonkeyPatch) -> None:
+    before = rig.panel()["count"]
+    _band_with(monkeypatch, rig, section="desk", carried=False)
+    row = rig.rows()[f"band:{rig.q.id}"]
+    assert row["facets"]["band_section"] == "desk" and row["facets"]["band_carried"] is False, row["facets"]
+    assert row["group"] == "desk", row["group"]
+    assert "desk" in {g["id"] for g in rig.panel()["groups"]}
+    assert rig.panel()["count"] == before - 1       # a desk row not yet carried is not the operator's: the header does not count it
+
+
+def test_listpanel_r1_a_carried_desk_row_is_needs_you_and_counted_as_flows_footer_does(rig: Rig, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Flow's build_footer: a desk row open > 24h is `carried`, listed under NEEDS YOU (tagged desk-owed) AND under DESK OWES, never LATER."""
+    before = rig.panel()["count"]
+    _band_with(monkeypatch, rig, section="desk", carried=True)
+    p = rig.panel()
+    row = {r["id"]: r for r in p["rows"]}[f"band:{rig.q.id}"]
+    assert row["facets"]["band_section"] == "desk" and row["facets"]["band_carried"] is True, row["facets"]
+    assert row["group"] == "band", row["group"]
+    assert p["count"] == before, (before, p["count"])      # counted in the header, as the footer's NEEDS YOU counts it
+    day = (TODAY + timedelta(days=3)).isoformat()
+    _band_with(monkeypatch, rig, section="desk", carried=True, snoozed_until=day)    # carried is never LATER in flow
+    assert {r["id"]: r for r in rig.panel()["rows"]}[f"band:{rig.q.id}"]["group"] == "band"
+
+
+def test_r1_a_you_section_row_is_needs_you_and_a_store_with_no_section_draws_no_facet(rig: Rig, monkeypatch: pytest.MonkeyPatch) -> None:
+    plain = rig.rows()[f"band:{rig.q.id}"]
+    assert "band_section" not in plain["facets"] and "band_carried" not in plain["facets"] and plain["group"] == "band", plain
+    _band_with(monkeypatch, rig, section="you")
+    row = rig.rows()[f"band:{rig.q.id}"]
+    assert row["facets"]["band_section"] == "you" and row["group"] == "band", row
+
+
+def test_r1_a_section_that_is_not_you_or_desk_and_a_carried_that_is_not_a_bool_are_dropped(rig: Rig, monkeypatch: pytest.MonkeyPatch) -> None:
+    _band_with(monkeypatch, rig, section="elsewhere", carried="false")
+    f = rig.rows()[f"band:{rig.q.id}"]["facets"]
+    assert "band_section" not in f and "band_carried" not in f, f
+    _band_with(monkeypatch, rig, section="desk", carried="false")
+    f = rig.rows()[f"band:{rig.q.id}"]["facets"]
+    assert f["band_section"] == "desk" and "band_carried" not in f, f
+
+
+def test_r2_a_snoozed_or_dated_row_sorts_under_later_with_its_day_words_and_is_not_counted(rig: Rig, monkeypatch: pytest.MonkeyPatch) -> None:
+    before = rig.panel()["count"]
+    day = (TODAY + timedelta(days=3)).isoformat()
+    _band_with(monkeypatch, rig, snoozed_until=day)
+    p = rig.panel()
+    row = {r["id"]: r for r in p["rows"]}[f"band:{rig.q.id}"]
+    assert row["facets"]["held_until"] == day and row["group"] == "later", row
+    assert row["facets"]["band_later_words"], row["facets"]
+    assert p["count"] == before - 1, (before, p["count"])       # a LATER row is not due: the header does not count it
+    _band_with(monkeypatch, rig, dated=day, section="you")      # a dated row of the operator's is LATER too
+    assert {r["id"]: r for r in rig.panel()["rows"]}[f"band:{rig.q.id}"]["group"] == "later"
+    _band_with(monkeypatch, rig, dated=day, section="desk")     # a dated DESK row stays desk owes, as flow's footer files it
+    assert {r["id"]: r for r in rig.panel()["rows"]}[f"band:{rig.q.id}"]["group"] == "desk"
+
+
+def test_r2_a_desk_owes_row_is_not_counted_either(rig: Rig, monkeypatch: pytest.MonkeyPatch) -> None:
+    before = rig.panel()["count"]
+    _band_with(monkeypatch, rig, section="desk")
+    assert rig.panel()["count"] == before - 1
+
+
+@pytest.mark.parametrize("fields,heading", [({"section": "desk", "carried": False}, "Desk owes"),
+                                            ({"snoozed_until": (TODAY + timedelta(days=3)).isoformat()}, "Later")])
+def test_listpanel_r1_the_text_cockpit_draws_desk_owes_and_later_as_the_footer_does(rig: Rig, monkeypatch: pytest.MonkeyPatch,
+                                                                                  fields: dict, heading: str) -> None:
+    from levain.cockpit.text import render_lines, snapshot
+
+    def lines() -> str:
+        return "\n".join(t for _s, t in render_lines(snapshot(rig.ck), now=NOW))
+
+    assert heading not in lines()
+    _band_with(monkeypatch, rig, **fields)
+    out = lines()
+    assert heading in out and "Ship the sweep fix tonight?" in out, out         # the row is not silently dropped
+
+
+# --- 531 round 6 (levain 75, key 1108-41): the age is the clock flow's footer reads --------------------------------------
+
+
+def _iso(delta_hours: float) -> str:
+    return (NOW + timedelta(hours=delta_hours)).astimezone().isoformat()
+
+
+def test_listpanel_r6_a_band_rows_age_reads_the_refile_clock_in_the_footers_form(rig: Rig, monkeypatch: pytest.MonkeyPatch) -> None:
+    """A row added 2 h ago and refiled 30 h ago is carried; its age is the footer's `1d6h` (the refile clock), not a whole-day
+    count from the add time."""
+    _band_with(monkeypatch, rig, section="desk", carried=True, filed_at=_iso(-2), section_since=_iso(-30))
+    row = {r["id"]: r for r in rig.panel()["rows"]}[f"band:{rig.q.id}"]
+    assert row["facets"]["band_age"] == "1d6h", row["facets"]
+    # no refile clock sent: the add time is the clock, in the same form
+    _band_with(monkeypatch, rig, section="you", filed_at=_iso(-3), section_since="")
+    assert {r["id"]: r for r in rig.panel()["rows"]}[f"band:{rig.q.id}"]["facets"]["band_age"] == "3h"
+    _band_with(monkeypatch, rig, section="you", filed_at=_iso(-0.5), section_since="")
+    assert {r["id"]: r for r in rig.panel()["rows"]}[f"band:{rig.q.id}"]["facets"]["band_age"] == "30m"
+
+
+# --- 531 round 7 (levain 76, lpr3): L3 r1 fixes --------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("fields,heading", [({"section": "desk", "carried": False}, "Desk owes"),
+                                            ({"snoozed_until": (TODAY + timedelta(days=3)).isoformat()}, "Later")])
+def test_lpr3_a_list_holding_only_desk_or_later_rows_draws_them_in_the_text_cockpit(tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+                                                                                  fields: dict, heading: str) -> None:
+    """Both groups are uncounted, so a List with nothing else is classified empty; the text view must still draw its rows."""
+    from levain.cockpit.text import render_lines, snapshot
+
+    r = Rig(tmp_path, spores=False, board=False)
+    _band_with(monkeypatch, r, **fields)
+    out = "\n".join(t for _s, t in render_lines(snapshot(r.ck), now=NOW))
+    assert heading in out and "Ship the sweep fix tonight?" in out, out
+
+
+def test_lpr3_later_rows_sort_by_return_date_then_band_number_as_the_footer_does(rig: Rig, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Band #1 returns Dec 1 and #2 returns Nov 9: #2 is listed first; the same date falls back to the band number."""
+    from dataclasses import replace
+
+    q2 = rig.qs.file(agent="claude_code", agent_session_id="sess-2", what="Second question?",
+                     options=[("a", "A"), ("b", "B")], rec="a", blocks="x", cwd="/w/levain")
+    real = band_view._read
+    days = {rig.q.id: "2026-12-01", q2.id: "2026-11-09"}
+
+    def read(store: Any) -> Any:
+        items, numbers, closed = real(store)
+        return [(ref, replace(q, snoozed_until=days[q.id]) if q is not None and q.id in days else q) for ref, q in items], {rig.q.id: 1, q2.id: 2}, closed
+
+    monkeypatch.setattr(band_view, "_read", read)
+    p = rig.panel()
+    later = [r for r in p["rows"] if r["group"] == "later"]
+    nums = {r["id"]: r["facets"].get("band_number") for r in later}
+    assert [r["id"] for r in later] == [f"band:{q2.id}", f"band:{rig.q.id}"], (nums, [r["facets"].get("held_until") for r in later])
+    assert nums[f"band:{rig.q.id}"] < nums[f"band:{q2.id}"], nums           # the band number alone would have said the opposite
+    days[q2.id] = "2026-12-01"                                              # one date: the band number decides
+    later = [r for r in rig.panel()["rows"] if r["group"] == "later"]
+    assert [r["id"] for r in later] == [f"band:{rig.q.id}", f"band:{q2.id}"]

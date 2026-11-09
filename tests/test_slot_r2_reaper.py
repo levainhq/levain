@@ -77,3 +77,55 @@ def test_retained_leased_slot_whose_scrub_lost_the_pool_try_is_scrubbed_again(tm
     assert (after.state, after.session, after.rev) == ("reusable", None, held.rev + 1)
     assert s in report["scrubbed"]
     assert H.parse_slot_state_of((E0.slot_dir(w.L) / "state").read_bytes(), E0) == after
+
+
+def test_reaper_refill_at_floor_plus_one_creates_no_reserve_file(tmp_path):
+    """Free space inside the margin above the floor: the reaper's refill must not make the reserve, not even empty,
+    since taking its lock opens it with a create."""
+    from dataclasses import replace
+
+    from levain.slot import end as E
+    from levain.slot import reaper as RP
+
+    w, la, table = _world(tmp_path)
+    floor = 8 << 30
+    seams = replace(w.seams, free_bytes=lambda fd: floor + 1)
+    rp = RP.Reaper(seams, tuning=RP.Tuning(reserve_bytes=4096, floor_bytes=floor))
+    store = H.Store(seams)
+    try:
+        assert not os.path.lexists(w.L / "reserve")
+        assert rp._refill(store) is False
+        assert not os.path.lexists(w.L / "reserve")
+        seams = replace(w.seams, free_bytes=lambda fd: floor + E._REFILL_MARGIN)
+        rp = RP.Reaper(seams, tuning=RP.Tuning(reserve_bytes=4096, floor_bytes=floor))
+        assert rp._refill(store) is False
+        assert not os.path.lexists(w.L / "reserve")
+    finally:
+        os.close(store.fd)
+
+
+def test_reaper_refill_below_margin_with_a_partial_reserve_still_reports_a_busy_lock(tmp_path):
+    """An existing, partly filled reserve inside the margin: the lock opens it without a create, so a release holding
+    it still reads as busy (None), never as below-floor."""
+    import fcntl
+    from dataclasses import replace
+
+    from levain.slot import reaper as RP
+
+    w, la, table = _world(tmp_path)
+    floor = 8 << 30
+    seams = replace(w.seams, free_bytes=lambda fd: floor + 1)
+    rp = RP.Reaper(seams, tuning=RP.Tuning(reserve_bytes=4096, floor_bytes=floor))
+    store = H.Store(seams)
+    path = w.L / "reserve"
+    path.write_bytes(b"\0" * 100)
+    holder = os.open(path, os.O_WRONLY)
+    try:
+        fcntl.flock(holder, fcntl.LOCK_EX)
+        assert rp._refill(store) is None
+        fcntl.flock(holder, fcntl.LOCK_UN)
+        assert rp._refill(store) is False
+        assert path.stat().st_size == 100
+    finally:
+        os.close(holder)
+        os.close(store.fd)

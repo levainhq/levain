@@ -547,7 +547,7 @@ class TestOrderingAndGroups:
         by_group = {r["id"]: r["group"] for r in p["rows"]}
         # spore-004 is the fixture's legacy note: shown in the Tray (the Keep is gone), undated -> "also"
         assert by_group == {"spore:spore-003": "today", "spore:spore-002": "overdue", "spore:spore-004": "also"}
-        assert [g["id"] for g in p["groups"]] == ["band", "overdue", "today", "board", "talk", "also"]   # THE LIST's groups
+        assert [g["id"] for g in p["groups"]] == ["band", "desk", "later", "overdue", "today", "board", "talk", "also"]   # THE LIST's groups
         assert [r["group"] for r in p["rows"]] == ["overdue", "today", "also"]  # group order leads
         assert all(r["band"] == "now" for r in p["rows"] if r["group"] != "also")
 

@@ -35,6 +35,7 @@ import hashlib
 import json
 import os
 import re
+import unicodedata
 from dataclasses import dataclass, field
 from pathlib import PurePosixPath
 from typing import Any, Iterable, Mapping
@@ -45,7 +46,7 @@ from levain.contracts import canon
 from levain.broker import norm as broker_norm
 from levain.broker import policy as broker_policy
 from levain.firing.hands import HostOS
-from levain.sandbox_keys import LOOSENING_NONEMPTY as _LOOSENING_NONEMPTY, LOOSENING_TRUE as _LOOSENING_TRUE
+from levain.sandbox_keys import repo_env_rule, repo_settings_rule, LOOSENING_NONEMPTY as _LOOSENING_NONEMPTY, LOOSENING_TRUE as _LOOSENING_TRUE
 from levain.slot import Refused
 from levain.slot.bwrap import LEVAIN_BWRAP
 from levain.slot.ids import SlotId, loopback_alias
@@ -1026,7 +1027,10 @@ def repo_loosening_refusals(docs: Mapping[str, Any]) -> list[Refused]:
     layers the flag layer cannot pin; a ``sandbox.network`` or ``sandbox.filesystem`` that is not an object is
     ``repo-settings-malformed``),
     and a ``disableAllHooks`` that is anything but ``false`` (L2 M6; DECISION: a non-boolean is refused too, as
-    its meaning to CC is unmeasured), and an ``env`` naming the queue's vars or a :data:`PROXY_ENV` name. A
+    its meaning to CC is unmeasured), and an ``env`` naming the queue's vars, a :data:`PROXY_ENV` name, or a name
+    ``levain.sandbox_keys.repo_env_rule`` refuses (PRE-L3 4-1; pf4r3: default deny inside the vendor's namespace,
+    provider prefixes and credential or endpoint suffixes outside it), and a top-level key
+    ``levain.sandbox_keys.repo_settings_rule`` refuses (a ``*Helper``, ``*AuthRefresh`` or ``*CredentialExport``). A
     document that is not an object is refused ``repo-settings-malformed``.
     Hooks, permissions and every other key launch (plan §2c 3: the repo's settings are its own).
 
@@ -1042,6 +1046,11 @@ def repo_loosening_refusals(docs: Mapping[str, Any]) -> list[Refused]:
             continue
         if "disableAllHooks" in doc and doc["disableAllHooks"] is not False:
             out.append(_refused("loosening", "disableAllHooks", f"{path}: not false"))
+        # A key that runs a command to produce the API credential moves the billing identity as an env name does;
+        # refused by key pattern (pf4r2), the rule in the detail.
+        for key in sorted((k for k in doc if repo_settings_rule(k)), key=str):
+            out.append(_refused("loosening", str(key),
+                                f"{path}: {key} supplies the run's credential ({repo_settings_rule(key)})"))
         env = doc.get("env", {})
         if not isinstance(env, Mapping):
             out.append(Refused("repo-settings-malformed", f"{path}: env"))
@@ -1052,6 +1061,14 @@ def repo_loosening_refusals(docs: Mapping[str, Any]) -> list[Refused]:
                 out.append(_refused("loosening", f"env.{name}", f"{path}: the queue's env is set by levain only"))
             for name in sorted(n for n in env if n in PROXY_ENV):
                 out.append(_refused("loosening", f"env.{name}", f"{path}: {name} is set by levain only"))
+            # PRE-L3 4-1: a key or bearer token Claude Code prefers to the stored login moves the bill of an unattended
+            # run (or stops it at the "use this API key?" prompt), and an endpoint, provider switch, tenant or TLS
+            # trust moves where its traffic goes and who pays; a vendor name off the allowlist is refused (pf4r3), the
+            # rule in the detail. The queue and proxy names above keep their own refusal, once.
+            for name in sorted((n for n in env if n not in PROXY_ENV and n not in (QUEUE_CAP_ENV, QUEUE_SOCKET_ENV)
+                                and repo_env_rule(n)), key=str):
+                out.append(_refused("loosening", f"env.{name}",
+                                    f"{path}: {name} is not a repo's to set ({repo_env_rule(name)})"))
         sb = doc.get("sandbox", {})
         if not isinstance(sb, Mapping):
             out.append(Refused("repo-settings-malformed", f"{path}: sandbox"))
@@ -1107,11 +1124,20 @@ DISCOVERY: Mapping[str, tuple[str, ...]] = {
 REPO_DISCOVERY = (".claude", ".codex", "CLAUDE.md", "AGENTS.md", ".mcp.json", ".agents")
 
 
+def fold_name(name: str) -> str:
+    """The one fold for a config-surface file name: a case- and normalization-insensitive store (APFS, the Mac slots'
+    default) resolves the vendor's ``open("settings.json")`` to a planted ``Settings.JSON`` or an NFD spelling, so a
+    name check compares folded names (PRE-L3 4-2). Unicode's canonical caseless form: NFD again after the casefold,
+    whose output need not be NFD (pf4r2)."""
+    return unicodedata.normalize("NFD", unicodedata.normalize("NFD", name).casefold())
+
+
 def _norm(entry: str) -> str:
-    return entry.strip("/")
+    return fold_name(entry.strip("/"))
 
 
 def _present(listing: Iterable[str], name: str) -> bool:
+    name = fold_name(name)
     return any(e == name or e.startswith(name + "/") for e in (_norm(x) for x in listing))
 
 
@@ -1129,7 +1155,9 @@ def discovery_refusals(listings: Mapping[str, Iterable[str]], *, codex_config: b
                 continue
             if root == "codex" and name == "config.toml" and codex_config is not None \
                     and rendered_codex_config is not None and codex_config == rendered_codex_config \
-                    and "config.toml" in (_norm(e) for e in listing):
+                    and [e for e in listing if _present([e], name)] == ["config.toml"]:
+                # the exemption is the rendered file under its exact name, alone: a second spelling that folds to it
+                # (Linux keeps both) or a folded-only spelling is not the file render made
                 continue
             out.append(_refused("planted-discovery", f"{root}-{name}", f"{root}: {name}"))
     return out
@@ -1197,5 +1225,6 @@ __all__ = [
     "render_importer_profile", "render_verifier_profile",
     "render", "render_from_stdin", "expected_effective_cc",
     "expected_effective_codex", "readback_refusals", "refuse_readback", "repo_loosening_refusals",
-    "refuse_repo_loosening", "discovery_refusals", "refuse_discovery", "repo_discovery_names", "parse_driver_input",
+    "refuse_repo_loosening", "fold_name", "discovery_refusals", "refuse_discovery", "repo_discovery_names",
+    "parse_driver_input",
 ]

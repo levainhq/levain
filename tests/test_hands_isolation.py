@@ -6,8 +6,10 @@ needs root and none starts a sandbox. The real setup/undo runs on Linux and macO
 """
 from __future__ import annotations
 
+import errno
 import json
 import os
+import stat
 import shutil
 import subprocess
 from pathlib import Path
@@ -1057,3 +1059,242 @@ def test_a_linux_repair_does_not_need_setfacl(tmp_path: Path, monkeypatch, capsy
     monkeypatch.setattr(hands.subprocess, "run", lambda argv, **kw: subprocess.CompletedProcess(argv, 0, "", ""))
     assert hands.cmd_setup_isolation(ed, undo=False, dry_run=False) == 0
     assert agent_dirs and "refusing" not in capsys.readouterr().out
+
+
+def test_an_installed_file_is_synced_before_its_rename_and_its_directory_after(tmp_path: Path, monkeypatch) -> None:
+    """PREL3 1a-11/1a-12/1b-23: the operator record and undo's retired ids go through ``_install_file``, so it must be
+    durable at power loss. Not reproducible as a power cut: a spy records each sync, and what was on disk at it."""
+    target = tmp_path / "policy" / "operator"
+    seen: list[tuple[str, bool]] = []
+
+    def spy(fd: int) -> None:
+        kind = "dir" if stat.S_ISDIR(os.fstat(fd).st_mode) else "file"
+        seen.append((kind, target.exists()))
+
+    monkeypatch.setattr(hands, "_durable_sync", spy)
+    monkeypatch.setattr(hands.os, "chown", lambda *a, **kw: None)     # root's chown: this test is not root
+    ok, why = hands._install_file(target, "content\n", 0o644, validate=())
+    assert ok, why
+    assert target.read_text() == "content\n"
+    assert seen == [("file", False), ("dir", True)], seen
+
+
+# --- PREL3 fix2 r1: one durability helper for every hands write -------------------------------------------------------
+
+
+def _spy_sync(monkeypatch, target: Path, seen: list) -> None:
+    def spy(fd: int) -> None:
+        kind = "dir" if stat.S_ISDIR(os.fstat(fd).st_mode) else "file"
+        seen.append((kind, target.exists()))
+
+    monkeypatch.setattr(hands, "_durable_sync", spy)
+
+
+def test_ensure_line_is_synced_before_its_rename_and_its_directory_after(tmp_path: Path, monkeypatch) -> None:
+    """L1-F3/L2-S1: the retired-ids and deny lists are the record that stops an id being reissued; same class as 1a-11."""
+    f = tmp_path / "retired"
+    seen: list = []
+    _spy_sync(monkeypatch, f, seen)
+    assert hands._ensure_line(f, "7", present=True, create=True) == (True, "")
+    assert f.read_text() == "7\n"
+    assert seen == [("file", False), ("dir", True)], seen
+
+
+def test_ensure_line_reports_a_sync_failure_and_keeps_the_old_list(tmp_path: Path, monkeypatch) -> None:
+    f = tmp_path / "retired"
+    f.write_text("1\n")
+    monkeypatch.setattr(hands, "_durable_sync", lambda fd: (_ for _ in ()).throw(OSError(5, "I/O error")))
+    ok, why = hands._ensure_line(f, "7", present=True)
+    assert not ok and "could not be synced" in why
+    assert f.read_text() == "1\n"
+
+
+def test_record_hands_is_synced_before_its_rename_and_its_directory_after(tmp_path: Path, monkeypatch) -> None:
+    ent = tmp_path / "ent"
+    (ent / ".levain").mkdir(parents=True)
+    target = ent / ".levain" / "confinement.json"
+    seen: list = []
+    _spy_sync(monkeypatch, target, seen)
+    hands.record_hands(ent, {"hands_user": "h"}, owner_uid=os.getuid(), owner_gid=os.getgid())
+    assert json.loads(target.read_text()) == {"hands_user": "h"}
+    assert seen == [("file", False), ("dir", True)], seen
+
+
+def test_durable_sync_falls_back_to_fsync_where_full_fsync_is_refused(tmp_path: Path, monkeypatch) -> None:
+    import fcntl
+
+    calls: list[str] = []
+
+    def refuse(fd, op, *a):
+        raise OSError(errno.ENOTSUP, "not supported")
+
+    monkeypatch.setattr(hands.sys, "platform", "darwin")
+    monkeypatch.setattr(fcntl, "F_FULLFSYNC", 51, raising=False)
+    monkeypatch.setattr(fcntl, "fcntl", refuse)
+    monkeypatch.setattr(hands.os, "fsync", lambda fd: calls.append("fsync"))
+    with open(tmp_path / "f", "w") as fh:
+        hands._durable_sync(fh.fileno())
+    assert calls == ["fsync"]
+
+
+def test_a_file_sync_failure_fails_the_step_with_a_reason_not_a_traceback(tmp_path: Path, monkeypatch) -> None:
+    """L1-F4/L2-L2: ``run_plan``'s write branch has no try, so a raise out of ``_install_file`` is a crash mid-plan."""
+    target = tmp_path / "d" / "f"
+    monkeypatch.setattr(hands.os, "chown", lambda *a, **kw: None)
+    monkeypatch.setattr(hands, "_durable_sync", lambda fd: (_ for _ in ()).throw(OSError(5, "I/O error")))
+    ok, why = hands._install_file(target, "x\n", 0o644, validate=())
+    assert not ok and "could not be synced" in why and not target.exists()
+    assert not list(target.parent.glob("*.tmp")), "no temp file is left"
+
+
+def test_a_directory_sync_failure_still_runs_check_and_a_failed_check_removes_the_file(tmp_path: Path, monkeypatch) -> None:
+    """L1-F4/L2-L4: the file is installed either way, so it is checked; a failing check removes it as before."""
+    target = tmp_path / "f"
+    monkeypatch.setattr(hands.os, "chown", lambda *a, **kw: None)
+
+    def sync(fd: int) -> None:
+        if stat.S_ISDIR(os.fstat(fd).st_mode):
+            raise OSError(5, "I/O error")
+
+    monkeypatch.setattr(hands, "_durable_sync", sync)
+    ran: list[int] = []
+    ok, why = hands._install_file(target, "x\n", 0o644, validate=(), check=lambda: (ran.append(1) or True, ""))
+    assert ran == [1] and not ok and "directory could not be synced" in why and target.exists()
+    ran.clear()
+    ok, why = hands._install_file(target, "y\n", 0o644, validate=(), check=lambda: (ran.append(1) or False, "bad config"))
+    assert ran == [1] and (ok, why) == (False, "bad config") and not target.exists()
+
+
+# --- PREL3 fix2 r2 ----------------------------------------------------------------------------------------------------
+
+
+def test_a_file_row_create_never_writes_through_a_dangling_link_planted_after_the_refusal(tmp_path: Path, monkeypatch) -> None:
+    """r1 complement MED: ``_install_file`` makes a ``mkstemp`` file (O_CREAT|O_EXCL, a fresh random name) and
+    ``os.replace``s it onto the path; rename never follows the final component, so a dangling link there is replaced,
+    not written through. The target the link named is never created."""
+    elsewhere = tmp_path / "elsewhere"
+    link = tmp_path / "row"
+    link.symlink_to(elsewhere)                                   # dangling: `test -e` is false for it
+    monkeypatch.setattr(hands.os, "chown", lambda *a, **kw: None)
+    ok, why = hands._install_file(link, "", 0o600, validate=())
+    assert ok, why
+    assert not elsewhere.exists()
+    assert not link.is_symlink() and link.is_file()
+
+
+def test_ensure_line_already_present_still_syncs_the_directory(tmp_path: Path, monkeypatch) -> None:
+    f = tmp_path / "retired"
+    f.write_text("7\n")
+    seen: list = []
+    _spy_sync(monkeypatch, f, seen)
+    assert hands._ensure_line(f, "7", present=True) == (True, "already so")
+    assert seen == [("dir", True)], seen
+
+
+def test_ensure_line_already_present_fails_the_step_when_the_directory_will_not_sync(tmp_path: Path, monkeypatch) -> None:
+    f = tmp_path / "retired"
+    f.write_text("7\n")
+    monkeypatch.setattr(hands, "_durable_sync", lambda fd: (_ for _ in ()).throw(OSError(errno.EIO, "I/O error")))
+    ok, why = hands._ensure_line(f, "7", present=True)
+    assert not ok and "could not be synced" in why
+
+
+def _spy_full_fsync(monkeypatch, err: int) -> list:
+    import fcntl
+
+    calls: list = []
+
+    def refuse(fd, op, *a):
+        raise OSError(err, os.strerror(err))
+
+    monkeypatch.setattr(hands.sys, "platform", "darwin")
+    monkeypatch.setattr(fcntl, "F_FULLFSYNC", 51, raising=False)
+    monkeypatch.setattr(fcntl, "fcntl", refuse)
+    monkeypatch.setattr(hands.os, "fsync", lambda fd: calls.append("fsync"))
+    return calls
+
+
+def test_durable_sync_propagates_a_real_io_error_from_full_fsync(tmp_path: Path, monkeypatch) -> None:
+    calls = _spy_full_fsync(monkeypatch, errno.EIO)
+    with open(tmp_path / "f", "w") as fh, pytest.raises(OSError) as ei:
+        hands._durable_sync(fh.fileno())
+    assert ei.value.errno == errno.EIO and calls == []
+
+
+@pytest.mark.parametrize("err", [errno.ENOTSUP, errno.EOPNOTSUPP, errno.EINVAL, errno.ENOTTY])
+def test_durable_sync_falls_back_for_each_unsupported_operation_errno(tmp_path: Path, monkeypatch, err) -> None:
+    calls = _spy_full_fsync(monkeypatch, err)
+    with open(tmp_path / "f", "w") as fh:
+        hands._durable_sync(fh.fileno())
+    assert calls == ["fsync"]
+
+
+def test_ensure_line_removes_its_temp_file_when_the_file_sync_fails(tmp_path: Path, monkeypatch) -> None:
+    f = tmp_path / "retired"
+    f.write_text("1\n")
+    monkeypatch.setattr(hands, "_durable_sync", lambda fd: (_ for _ in ()).throw(OSError(errno.EIO, "I/O error")))
+    ok, _why = hands._ensure_line(f, "7", present=True)
+    assert not ok
+    assert sorted(p.name for p in tmp_path.iterdir()) == ["retired"]
+
+
+def test_record_hands_turns_a_sync_failure_into_a_setup_error(tmp_path: Path, monkeypatch) -> None:
+    ent = tmp_path / "ent"
+    (ent / ".levain").mkdir(parents=True)
+    monkeypatch.setattr(hands, "_durable_sync", lambda fd: (_ for _ in ()).throw(OSError(errno.EIO, "I/O error")))
+    with pytest.raises(HandsSetupError, match="synced"):
+        hands.record_hands(ent, {"hands_user": "h"}, owner_uid=os.getuid(), owner_gid=os.getgid())
+
+
+def _linux_repair_rig(tmp_path: Path, monkeypatch):
+    ed = _entity(tmp_path)
+    (ed / ".levain" / "confinement.json").write_text(json.dumps(_record(ed)))
+    monkeypatch.setattr(hands, "linux_tool_missing", lambda: None)
+    monkeypatch.setattr(hands, "invoking_operator", lambda: os.environ.get("USER") or "root")
+    me = hands.pwd.getpwuid(os.getuid())
+    monkeypatch.setattr(hands.pwd, "getpwnam", lambda n: me if n != hands_user_name(ed) else
+                        hands.pwd.struct_passwd((n, "*", 499, 499, "", "/nonexistent", "/bin/false")))
+    monkeypatch.setattr(hands, "host_os", lambda: "linux")
+    monkeypatch.setattr(hands, "egress_unavailable", lambda: None)
+    agent_dirs: list = []
+    monkeypatch.setattr(hands, "_make_agent_dirs", lambda ws, uid, gid: agent_dirs.append((ws, uid)) or (True, ""))
+    monkeypatch.setattr(hands, "_group_exists", lambda n: False)
+    monkeypatch.setattr(hands, "_egress_dirs", lambda: (True, ""))
+    monkeypatch.setattr(hands, "user_record_is_ours", lambda n, h: True)
+    monkeypatch.setattr(hands, "used_ids", lambda h: set(range(901, 1000)))
+    monkeypatch.setattr(hands, "retired_ids", lambda h: set())
+    monkeypatch.setattr(hands, "_install_file", lambda path, *a, **kw: (True, ""))
+    monkeypatch.setattr(hands.subprocess, "run", lambda argv, **kw: subprocess.CompletedProcess(argv, 0, "", ""))
+    return ed, agent_dirs
+
+
+def test_a_rerun_syncs_an_already_installed_record_before_going_on(tmp_path: Path, monkeypatch) -> None:
+    """r1 codex MED: the record is replaced before its directory sync, so a failed sync leaves it installed."""
+    ed, agent_dirs = _linux_repair_rig(tmp_path, monkeypatch)
+    seen: list = []
+    _spy_sync(monkeypatch, ed / ".levain" / "confinement.json", seen)
+    assert hands.cmd_setup_isolation(ed, undo=False, dry_run=False) == 0
+    assert ("file", True) in seen and ("dir", True) in seen, seen
+
+
+def test_a_rerun_stops_with_the_reason_when_the_installed_record_will_not_sync(tmp_path: Path, monkeypatch, capsys) -> None:
+    ed, agent_dirs = _linux_repair_rig(tmp_path, monkeypatch)
+    monkeypatch.setattr(hands, "_durable_sync", lambda fd: (_ for _ in ()).throw(OSError(errno.EIO, "I/O error")))
+    assert hands.cmd_setup_isolation(ed, undo=False, dry_run=False) == 1
+    assert "synced" in capsys.readouterr().out and not agent_dirs
+
+
+def test_a_setup_whose_record_cannot_be_synced_is_a_clean_failure_not_a_traceback(tmp_path: Path, monkeypatch, capsys) -> None:
+    ed, _ = _linux_repair_rig(tmp_path, monkeypatch)
+    (ed / ".levain" / "confinement.json").write_text("{}")
+    monkeypatch.setattr(hands, "plan_setup", lambda *a, **kw: hands.Plan("linux", "x", "h", 501, ed, ed))
+    monkeypatch.setattr(hands, "choose_id", lambda *a, **kw: 501)
+    monkeypatch.setattr(hands, "_user_exists", lambda n: False)
+    monkeypatch.setattr(hands, "shared_root_problem", lambda h: None)
+    monkeypatch.setattr(hands, "git_refuses_foreign_gitdir", lambda o: True)
+    monkeypatch.setattr(hands, "operator_git_identity", lambda o: None)
+    monkeypatch.setattr(hands, "sshd_reads_dropins", lambda: False)
+    monkeypatch.setattr(hands, "existing_deny_lists", lambda h: [])
+    monkeypatch.setattr(hands, "record_hands", lambda *a, **kw: (_ for _ in ()).throw(HandsSetupError("could not be synced")))
+    assert hands.cmd_setup_isolation(ed, undo=False, dry_run=False) == 1
+    assert "could not be synced" in capsys.readouterr().out

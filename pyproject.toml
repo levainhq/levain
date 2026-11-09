@@ -173,7 +173,8 @@ app = ["mcp>=1.27,<2"]
 # mcp 2, while the app server needs mcp 1's `mcp.server.fastmcp`. Without it, installing
 # [openhands] and [app] one after the other left one of them broken, in either order, with no
 # warning from pip or uv (measured 2026-10-02, macOS + Linux, pip + uv).
-openhands = ["openhands-sdk==1.26.0", "openhands-tools==1.26.0", "mcp>=1.27,<2"]
+# agent-client-protocol: openhands-sdk 1.26.0 imports `acp.helpers`, which its 1.0.0 removed (ModuleNotFoundError, 11-08).
+openhands = ["openhands-sdk==1.26.0", "openhands-tools==1.26.0", "agent-client-protocol<1", "mcp>=1.27,<2"]
 # The S1 gateway's HTTP parser (`levain.broker.front`): h11, strict and sans-IO; 0.16.0 is the release that
 # fixes CVE-2025-43859, its one advisory. Only an isolation install runs the gateway.
 isolation = ["h11>=0.16.0"]
@@ -210,4 +211,7 @@ levain = ["**/__pycache__/*", "**/*.pyc", "**/*.pyo"]
 testpaths = ["tests"]
 addopts = "-ra --strict-markers"
 # `invariant`: the whole-tree invariant tests listed in tests/ci/invariant_tests.txt; `pytest -m invariant` selects them (the marker was cut for a future pre-push hook; none runs it).
-markers = ["invariant: asserts something about every file of the source tree (listed in tests/ci/invariant_tests.txt)"]
+markers = [
+    "journey: a stage-1 golden journey (tests/test_journeys_stage1.py): one real operator act driven end to end in the shared Chrome",
+    "invariant: asserts something about every file of the source tree (listed in tests/ci/invariant_tests.txt)",
+]

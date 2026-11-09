@@ -60,6 +60,7 @@ from levain.dispatch import readset as RS
 from levain.dispatch import snapshot as SN
 from levain.dispatch.policy import path_text_problem
 from levain.slot import stage, write_all
+from levain.slot.render import fold_name as _fold   # the one config-surface name fold (PRE-L3 4-2)
 
 __all__ = ["BUNDLE_MAX_BYTES", "DISPATCH_REFUSED_NAMES", "MANIFEST_MAX_BYTES", "MAX_UPLOADS", "UploadOwner",
            "WORKSPACE_REFUSAL", "WorkspaceRefused", "WorkspaceUploads", "manifest_from_bytes",
@@ -106,11 +107,6 @@ class WorkspaceRefused(LauncherRefused):
 #: ``readset-git-failed`` stays standing: a clone that fails on a damaged pack and one that fails on a full disk are
 #: the same answer from git (known edge).
 _TRANSIENT_READSET = frozenset({"readset-git-unavailable", "readset-workdir", "readset-handoff-raced"})
-
-
-def _fold(name: str) -> str:
-    # the same fold the settings check uses (supervisor._fold): a case- and normalization-insensitive store
-    return unicodedata.normalize("NFD", name).casefold()
 
 
 def refused_name_carried(entries) -> "Optional[tuple[str, str]]":

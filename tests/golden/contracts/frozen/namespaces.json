@@ -114,6 +114,11 @@
    "owner": "levain/dispatch/phone_config.py"
   },
   {
+   "namespace": "levain-envelope-revoke",
+   "status": "shipped",
+   "owner": "levain/coordinator/envelope_revoke.py"
+  },
+  {
    "namespace": "levain-terminal-answer",
    "status": "shipped",
    "owner": "levain/consent/terminal_sign.py"

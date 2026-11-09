@@ -97,9 +97,9 @@ function makeEnv(over) {
   }
   const win = { LevainCockpitView: View, localStorage, sessionStorage, location: { search: "?source=manifest", hash: "", pathname: "/" },
     crypto: { randomUUID: () => "key-" + (++n) }, prompt: over.prompt ? () => over.prompt(env) : () => "",
-    LevainDashboard: { render: (view, opts) => renders.push({ view, opts }), hasUnsavedEdit: () => false, jobsActive: () => false } };
+    LevainDashboard: { render: (view, opts) => renders.push({ view, opts }), hasUnsavedEdit: () => false, jobsActive: () => false }, dispatchEvent() {} };
   env.listeners = {};
-  const doc = { getElementById: () => null, addEventListener(t, f) { (env.listeners[t] = env.listeners[t] || []).push(f); }, querySelectorAll: (q) => (env.rows && q === "[data-row-key]" ? env.rows : []), createElement: () => ({ className: "", textContent: "" }), visibilityState: "visible" };
+  const doc = { getElementById: () => null, addEventListener(t, f) { (env.listeners[t] = env.listeners[t] || []).push(f); }, querySelectorAll: (q) => (env.rows && q === "[data-row-key]" ? env.rows : []), createElement: () => ({ className: "", textContent: "" }), visibilityState: "visible", body: { dataset: {} } };
   env.start = async () => {
     new Function("window", "document", "location", "history", "fetch", "console", bootSrc)(win, doc, win.location, { replaceState() {} }, fetchFn, console);
     await new Promise((r) => setTimeout(r, 30));

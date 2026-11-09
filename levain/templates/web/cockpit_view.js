@@ -191,6 +191,10 @@
       deliver_to: typeof f.target === "string" && f.target ? f.target : null,
       attention: typeof f.attention === "string" && f.attention ? f.attention : null,
       list_pointer: typeof f.list_pointer === "string" && f.list_pointer ? f.list_pointer : null,
+      later_words: typeof f.band_later_words === "string" && f.band_later_words ? f.band_later_words : null,
+      band_section: f.band_section === "desk" || f.band_section === "you" ? f.band_section : null,
+      carried: f.band_carried === true,
+      band_age: typeof f.band_age === "string" && f.band_age ? f.band_age : null,
       repo: typeof f.repo === "string" && f.repo ? f.repo : null, board_tier: typeof f.board_tier === "string" && f.board_tier ? f.board_tier : null,
     }, t, hidden && hidden.has(row.id) ? { text_locked: HIDDEN_TEXT } : {});
   }
@@ -2185,6 +2189,7 @@
     for (const row of document.querySelectorAll(".ck-zgrid .row")) {
       const clause = row.querySelector(":scope > .clause");
       if (!clause) continue;
+      if (row.dataset.surface) continue;   // a List row names its own origin (a pill the page drew); its words never choose one
       const home = tagHome(row, clause);
       if (home.inMeta && row.querySelector(":scope > .k7-repo")) continue;   // a chip already names the repo (Build's loops)
       // decided again on every pass, on the row's words without its own tag: a repo noted later can be the longer name

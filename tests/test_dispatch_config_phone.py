@@ -625,3 +625,45 @@ def test_a_sync_failure_after_publishing_leaves_no_item(ddir, signq, monkeypatch
 def test_the_sign_fault_helper_the_accept_path_calls_exists():
     """gemini (verify, refuted): ``_sign_fault_not_done`` is defined in the dispatch CLI."""
     assert callable(dcli._sign_fault_not_done)
+
+
+# --- the Notifications entry opens the card (Phill's first run, 11-08: only a text line, no way in) ----------------------
+
+def test_the_push_is_a_needs_ping_naming_the_request_so_the_entry_offers_the_sign_card(capsys, ddir, root, keys, signq,
+                                                                                       tmp_path, pushes, no_touch):
+    """Reproduced: the push was kind ``question`` with the bare request id as ref, which the center cannot read as a sign
+    request, so its Notifications entry had no Sign action. Now the ping carries the request (data ``sign_id``): the entry's
+    needs card is OPEN on that request (the cockpit draws "Sign your answer" -> /sign/<id> from exactly this), and the
+    push's own link is the deep link."""
+    from levain.webpush import center
+    from levain.webpush.store import PushStore
+
+    init(capsys, ddir, root, keys)
+    code, out, _ = request(capsys, ddir, root, signq, tmp_path)
+    assert code == 0, out
+    rid = rid_of(signq)
+    [p] = pushes
+    assert p["kind"] == "attention" and p["ref"] == rid and p["url"] == f"{ORIGIN}/sign/{rid}", p
+    store = PushStore(signq)
+    store.add_ping(p["kind"], p["ref"], p["title"], p["body"], data=p["data"])
+    [item] = center.list_items(store)["items"]
+    n = item["needs"]
+    assert item["source"] == "needs" and n["sign_id"] == rid and n["sign_state"] == "open" and n["sign_v"], item
+    assert n["options"] == [] and item["title"] == p["body"], item
+    # a request that is no longer open (signed/denied/withdrawn) is not offered
+    sign_dir(signq).joinpath(f"{rid}.json").unlink()
+    [again] = center.list_items(store)["items"]
+    assert again["needs"]["sign_state"] == "unknown", again
+
+
+def test_the_widened_reader_ties_only_the_request_to_its_own_ref(capsys, ddir, root, keys, signq, tmp_path, pushes,
+                                                                 no_touch):
+    """A levain-namespace request is read as an item's only when the ping's ref IS the request id; another ref is
+    unverified, and a flow-store ref still needs the flow ``item:`` line."""
+    from levain.webpush import center
+
+    init(capsys, ddir, root, keys)
+    assert request(capsys, ddir, root, signq, tmp_path)[0] == 0
+    rid = rid_of(signq)
+    assert center._request(signq, rid, rid)[0] == "open"
+    assert center._request(signq, rid, "np-7121be43")[0] == "unverified"

@@ -298,6 +298,12 @@ _SIGN_ONE_SUFFIX = ".json"
 # beside a Signer: without one every path here is 404, and the page's revoke button copies the terminal line.
 _GRANT_LIST_PATH = "/cockpit/grant/list.json"
 _GRANT_PREFIX = "/cockpit/grant/"
+# The envelopes' passkey revoke (board row 153), the same ceremony over the coordinator store the Signer's queue names
+# (levain.coordinator.envelope_revoke.EnvelopeRevoke, built by make_server from the Signer, never from the consent
+# reader's directory): GET /cockpit/envelope/list.json and POST /cockpit/envelope/<id>/{revoke-challenge,revoke}, behind
+# the grant routes' gate exactly, and served only beside a Signer.
+_ENVELOPE_LIST_PATH = "/cockpit/envelope/list.json"
+_ENVELOPE_PREFIX = "/cockpit/envelope/"
 # ONESURFACE OS-1: the sign sheet, GET /sign/<id> (a sign request id), a static shell whose one script is /sign.js; what
 # it shows and signs are the routes above. Served only beside a Signer. It alone may be framed, and only by its own
 # origin (the cockpit's overlay, Q2): the one policy http_guards stamps, with frame-ancestors 'self' in place of 'none'.
@@ -1461,12 +1467,12 @@ _RESERVED_PATHS: frozenset[str] = frozenset(_ASSETS) | {
     cockpit_board.BOARD_PATH, _DISPATCH_LIST, _KEY_LINE_ROUTE, _DESK_ANSWER_ROUTE, _DESK_TEXT_ROUTE,
     cockpit_voice.VOICE_JSON, *cockpit_voice.VOICE_PATHS, *cockpit_voice.STREAM_PATHS,
     _PAIR_OFFER, _PAIR_REVOKE, _PAIR_REVOKE_PREVIEW, _PAIR_LIST, _PAIR_CLAIM,
-    _NOTIFY_PATH,
+    _NOTIFY_PATH, _ENVELOPE_LIST_PATH,
 } | frozenset(_CHAT_GET_ROUTES) | frozenset(_CHAT_POST_ROUTES) | _push_static()
 # Prefixes no downstream extra route may live under (the consent body route is one path per request id).
 _RESERVED_PREFIXES: tuple[str, ...] = (_CONSENT_BODY_PREFIX, _SESSION_LOG_PREFIX, _QUESTION_BODY_PREFIX, _SIGN_PREFIX,
                                        _GRANT_PREFIX, _SHEET_PREFIX, _COORD_PREFIX, _PUSH_PREFIX,
-                                       cockpit_threads.THREAD_PREFIX, cockpit_room.ROOM_PREFIX, _NOTE_BODY_PREFIX, _DISPATCH_PREFIX, _PENDING_PREFIX)
+                                       cockpit_threads.THREAD_PREFIX, cockpit_room.ROOM_PREFIX, _NOTE_BODY_PREFIX, _DISPATCH_PREFIX, _PENDING_PREFIX, _ENVELOPE_PREFIX)
 
 
 def load_web_asset(filename: str) -> str:
@@ -1690,6 +1696,7 @@ def build_substrate_json(
     *,
     write_token_required: bool = False,
     extra_verbs: "Mapping[str, ActionVerb] | None" = None,
+    threads: bool = True,
 ) -> bytes:
     """The ``/substrate.json`` body: a fresh read-only ``SubstrateView`` snapshot.
 
@@ -1724,6 +1731,8 @@ def build_substrate_json(
     if "write_token_required" in payload:
         raise RuntimeError("to_dict() collided with transport `write_token_required`")
     payload["write_token_required"] = write_token_required
+    if not threads:
+        payload["threads"] = False     # make_server(threads=False): the legacy /?source=substrate page reads it too (absent by default)
     # Inline external panels (the read-only extra-PANEL seam): a per-request provider returns
     # full panel descriptors+data; split each into a layout entry (kind:"external") + its data
     # under payload["extra_panels"][id], so the frontend renders them inline among the substrate
@@ -1965,6 +1974,8 @@ class _LevainHTTPServer(ThreadingHTTPServer):
     # the grants' passkey revoke (PLAN M17 "9a"), built by make_server from that Signer once it is pinned; None serves no
     # grant route
     grant_phone: "GrantPhone | None" = None
+    # the envelopes' passkey revoke (board row 153), built beside the Signer from its own queue; None serves no route
+    envelope_revoke: "Any" = None
     # the consent family's answer and ruling (OS-2), built by make_server over the Signer's queue whenever a Signer
     # serves; read through `consent_sheet`, which serves it only while the consent reader's queue is that same queue
     _consent_sheet: "ConsentSheet | None" = None
@@ -1985,6 +1996,8 @@ class _LevainHTTPServer(ThreadingHTTPServer):
         self._consent_sheet = sheet
     # whether the cockpit draws levain's own Work board when no provider brings one (make_server's work_board)
     work_board: bool = True
+    # whether the Build tab's Threads zone is offered (make_server's threads): False answers its two routes 404 and the manifest says so
+    threads: bool = True
     # the ChatService the work thread's Stop acts through; None serves none of it
     chat_service: "ChatService | None" = None
     # the room's host (RM-F): its ChatService, CoordStore and the launcher's verbs; None serves no room write route
@@ -1999,9 +2012,10 @@ class _LevainHTTPServer(ThreadingHTTPServer):
     voice_transport: "Any" = None
     voice_last_read: "dict[str, str | None] | None" = None
     voice_meter: "Any" = None
-    # premium dictation (the transcribe route) is OFF unless the server was built with ``premium_stt=True`` (``levain
-    # serve --premium-stt``); off, the route refuses before it reads a key, a meter row or a body byte
-    premium_stt: bool = False
+    # premium dictation (the transcribe route and the live stream routes): ``True`` forces it on, ``False`` off, ``None`` is
+    # AUTO, decided per request by levain.cockpit.voice.premium_stt_on (on while a provider with a stt model holds a key
+    # that lists ``stt``); off, the route refuses before it reads a key, a meter row or a body byte
+    premium_stt: "bool | None" = None
     # live dictation (cockpit mic S3), only with premium_stt: the registry of streams, built on the first stream request
     # under voice_stream_lock, and the reaper thread that ends idle ones every voice_reap_interval seconds. A test sets
     # voice_stream_factory (a fake provider stream; None is the Deepgram adapter) and voice_stream_kwargs (the registry's
@@ -2543,7 +2557,8 @@ class _Handler(GuardedHandler):
 
     def _transport(self) -> dict[str, Any]:
         """The manifest's ``transport``: the same flags ``/substrate.json`` carries, and ``room`` (where the room is read
-        and how: its cursor, thread and long-poll bound) only on a server that mounts a room."""
+        and how: its cursor, thread and long-poll bound) only on a server that mounts a room
+        (``_manifest_transport`` adds ``threads``)."""
         out: dict[str, Any] = {"writable": self.server.levain_source.write_scope is not None,
                                "write_token_required": self._write_token_required() or self._writes_need_credential(),
                                "owner_key": self._owner_key_accepted()}
@@ -3427,6 +3442,51 @@ class _Handler(GuardedHandler):
         self._send(json.dumps(payload).encode("utf-8"), "application/json; charset=utf-8", status=status, head=head,
                    headers=hdrs, cache_control="private, no-store")
 
+    def _serve_envelope_list(self, *, head: bool) -> None:
+        """``GET /cockpit/envelope/list.json``: :meth:`EnvelopeRevoke.listing` plus ``origin``, behind the grant listing's
+        gate exactly. Without a Signer, 404."""
+        env = self.server.envelope_revoke
+        hdrs = [("Vary", _WRITE_TOKEN_HEADER)]
+        if env is None:
+            self._send(json.dumps({"error": "not_found", "message": "no such route"}).encode("utf-8"),
+                       "application/json; charset=utf-8", status=404, head=head)
+            return
+        if not self._sign_read_admitted(head=head, what="the envelopes"):
+            return
+        try:
+            payload, status = {**env.listing(), "origin": self.server.signer_page_origin}, 200
+            signer = self.server.signer
+            if signer is not None:
+                try:
+                    payload["credentials"] = signer.key_facts(sorted(
+                        fp for fp in (payload.get("signers") or []) if isinstance(fp, str)))
+                except _CredentialUnavailable:   # RU-5: only the outer catch answers it
+                    raise
+                except Exception as exc:  # noqa: BLE001 - display only: it never costs the listing
+                    _log.warning("the envelopes' key facts were not read: %s: %s", type(exc).__name__, exc)
+                    payload["credentials"] = {}
+        except _CredentialUnavailable:   # RU-5: only the outer catch answers it
+            raise
+        except Exception as exc:  # noqa: BLE001 - listing() says its own faults; anything else is an answer too
+            status, payload = 500, _store_fault("envelope", exc)
+        finally:
+            self.server.request_gate.release()
+        self._send(json.dumps(payload).encode("utf-8"), "application/json; charset=utf-8", status=status, head=head,
+                   headers=hdrs, cache_control="private, no-store")
+
+    def _envelope_post(self, envelope_id: str, action: str, req: Any) -> "tuple[dict[str, Any], int]":
+        """``POST /cockpit/envelope/<id>/<action>``: the EnvelopeRevoke's own reply, or its refusal as
+        ``{error, message}`` with the refusal's status."""
+        from levain.consent.grant_phone import GrantRefused
+
+        env = self.server.envelope_revoke
+        if env is None:     # the route is not served without one; an explicit check survives `python -O`
+            return {"error": "not_found", "message": "no such route"}, 404
+        try:
+            return env.step(envelope_id, action, req), 200
+        except GrantRefused as exc:
+            return {"error": exc.error, "message": exc.message}, exc.status
+
     def _grant_post(self, grant_id: str, action: str, req: Any) -> "tuple[dict[str, Any], int]":
         """``POST /cockpit/grant/<id>/<action>``: the GrantPhone's own reply, or its refusal as ``{error, message}``
         with the refusal's status (the phone port's words)."""
@@ -4062,7 +4122,7 @@ class _Handler(GuardedHandler):
         try:
             body = cockpit_voice.serve_voice(srv.broker.data_root, self._voice_meter(directory),
                                              last_read=srv.voice_last_read if srv.voice_last_read is not None else {},
-                                             premium_stt=srv.premium_stt)
+                                             premium_stt=srv.premium_stt)   # the setting itself: serve_voice resolves AUTO
         except _CredentialUnavailable:   # RU-5: only the outer catch answers it
             raise
         except Exception as exc:  # noqa: BLE001 - fixed words; the log names the type only
@@ -4121,11 +4181,10 @@ class _Handler(GuardedHandler):
             self._reject(403, "forbidden", cockpit_voice.WORDS["no_owner"])
             return None
         speak = route == cockpit_voice.SPEAK_PATH
-        if not speak and not srv.premium_stt:
-            # premium dictation is hidden for Levain 1.0: one fixed answer before the content type, the length, the voice
+        if not speak and not self._premium_stt_gate():
+            # premium dictation off (forced off, or no key lists stt): one fixed answer before the content type, the length, the voice
             # slot, the body, the meter and the key are looked at, so it says nothing of whether a key exists. _reject
             # closes the connection, so an audio body is not left on the socket to be read as the next request
-            self._reject(404, "not_found", cockpit_voice.WORDS["premium_stt_off"])
             return None
         if speak:
             if self._refuse_non_json():
@@ -4167,12 +4226,31 @@ class _Handler(GuardedHandler):
         finally:
             srv.voice_gate.release()
 
+    def _premium_stt_gate(self) -> bool:
+        """The premium-dictation switch for ONE request (transcribe and stream open): True when on. Off answers 404 in the
+        fixed ``premium_stt_off`` words; AUTO with an authority log that could not be replayed answers 503
+        ``authority_unreadable`` in its own words (the fault is the log, not a missing key). Either way it has already
+        rejected when it returns False."""
+        srv = self.server
+        state = cockpit_voice.premium_stt_state(srv.premium_stt, srv.broker.data_root)
+        if state == "on":
+            return True
+        if state == "unreadable":
+            self._reject(503, "authority_unreadable", cockpit_voice.WORDS["authority_unreadable"])
+        else:
+            self._reject(404, "not_found", cockpit_voice.WORDS["premium_stt_off"])
+        return False
+
     def _voice_stream_answer(self, route: str) -> "cockpit_voice.Answer | None":
         """The live-dictation POST gates, in transcribe's order (a room host and a broker, a surface token on every bind, a
         named owner, then the premium-dictation switch: off is a 404 in fixed words before a length, a body, the meter or
-        a key is looked at). Open and close carry no body (a declared length of 0); a chunk is ``application/octet-stream``
-        of at most :data:`cockpit_voice.STREAM_CHUNK_MAX` bytes: its sid, owner and seq are checked before the body is read,
-        then the read takes a ``voice_chunk_gate`` slot without waiting (503 past it) and runs under a short deadline.
+        a key is looked at). The switch (the AUTO decision from key presence) gates OPEN only: a session exists only
+        because open passed, so chunk and close never replay the log for it; a key revoked mid-stream is the session's
+        own ``_stream_revoked`` check (the next due chunk answers ``revoked: true``), and close still settles and returns
+        the collected text. Only a forced-off server (``premium_stt is False``) refuses chunk and close. Open and close
+        carry no body (a declared length of 0); a chunk is ``application/octet-stream`` of at most
+        :data:`cockpit_voice.STREAM_CHUNK_MAX` bytes: its sid, owner and seq are checked before the body is read, then
+        the read takes a ``voice_chunk_gate`` slot without waiting (503 past it) and runs under a short deadline.
         Chunks bypass ``voice_gate`` (cheap, bounded, owned by a session the registry already capped at one); open runs
         the revoke check and the key read in :func:`cockpit_voice.stream_open`. Every request first reaps (the server's
         timer is the other reaper). After server_close every stream route is 503 ``stopping``."""
@@ -4188,7 +4266,10 @@ class _Handler(GuardedHandler):
         if owner is None:
             self._reject(403, "forbidden", cockpit_voice.WORDS["no_owner"])
             return None
-        if not srv.premium_stt:
+        if route == cockpit_voice.STREAM_OPEN:
+            if not self._premium_stt_gate():      # the AUTO decision gates OPEN only (see the docstring)
+                return None
+        elif srv.premium_stt is False:            # forced off: no session can exist; no log replay on chunk or close
             self._reject(404, "not_found", cockpit_voice.WORDS["premium_stt_off"])
             return None
         chunk = route == cockpit_voice.STREAM_CHUNK
@@ -4248,6 +4329,17 @@ class _Handler(GuardedHandler):
                 read_key=voice_custody.read_key, factory=srv.voice_stream_factory or factories.get(query_provider, _no_factory),
                 last_read=srv.voice_last_read if srv.voice_last_read is not None else {})
         return cockpit_voice.stream_close(registry, query, owner)
+
+    def _manifest_transport(self) -> dict[str, Any]:
+        """The manifest's ``transport`` plus ``threads: false`` when the server offers no Threads zone (absent otherwise)."""
+        out = dict(self._transport())     # a copy: never mutate what _transport() hands back
+        if not self.server.threads:
+            out["threads"] = False
+        return out
+
+    def _send_threads_off(self, head: bool) -> None:
+        self._send(cockpit_threads.encode({"error": "not_found", "message": "no threads here"}),
+                   "application/json; charset=utf-8", status=404, head=head, cache_control="private, no-store")
 
     def _serve_threads(self, path: str, *, head: bool) -> None:
         """``GET /cockpit/threads.json`` and ``GET /cockpit/thread/<th-id>.json`` (CH-U1a): the coordinator's threads and
@@ -4596,6 +4688,9 @@ class _Handler(GuardedHandler):
         if path == _GRANT_LIST_PATH:      # the grants' revoke listing rides that gate exactly (PLAN M17 "9a")
             self._serve_grant_list(head=head)
             return
+        if path == _ENVELOPE_LIST_PATH:   # the envelopes' revoke listing, the same gate (board row 153)
+            self._serve_envelope_list(head=head)
+            return
         if path == _PAIR_LIST:            # PAIR RP-4: an AUTHED pair route, a token on every bind
             self._serve_pair_list(head=head)
             return
@@ -4660,6 +4755,9 @@ class _Handler(GuardedHandler):
             self._serve_voice(head=head)
             return
         if cockpit_threads.is_threads_path(path):
+            if not self.server.threads:
+                self._send_threads_off(head)
+                return
             self._serve_threads(path, head=head)
             return
         if path == cockpit_board.BOARD_PATH:
@@ -4692,7 +4790,7 @@ class _Handler(GuardedHandler):
                 try:
                     status, body, hdrs = handle_cockpit_get(
                         self._cockpit(), self.path, credential=self._credential(),
-                        if_none_match=self.headers.get("If-None-Match"), transport=self._transport(),
+                        if_none_match=self.headers.get("If-None-Match"), transport=self._manifest_transport(),
                     )
                 except _CredentialUnavailable:   # RU-5: only the outer catch answers it
                     raise
@@ -4722,7 +4820,7 @@ class _Handler(GuardedHandler):
                 body = build_substrate_json(
                     self.server.levain_source, self.server.extra_panels,
                     write_token_required=self._write_token_required() or self._writes_need_credential(),
-                    extra_verbs=self.server.extra_verbs)
+                    extra_verbs=self.server.extra_verbs, threads=self.server.threads)
             except _CredentialUnavailable:   # RU-5: only the outer catch answers it
                 raise
             except Exception as exc:  # noqa: BLE001 — never 500 on a runtime fault
@@ -4738,6 +4836,7 @@ class _Handler(GuardedHandler):
                     "writable": self.server.levain_source.write_scope is not None,
                     "write_token_required": self._write_token_required() or self._writes_need_credential(),
                     "errors": {"server": f"{type(exc).__name__}: {exc}"},
+                    **({} if self.server.threads else {"threads": False}),
                 }).encode("utf-8")
             finally:
                 self.server.request_gate.release()
@@ -4765,6 +4864,7 @@ class _Handler(GuardedHandler):
                     "episodes": [],
                     "count": 0,
                     "errors": {"server": f"{type(exc).__name__}: {exc}"},
+                    **({} if self.server.threads else {"threads": False}),
                 }).encode("utf-8")
             finally:
                 self.server.request_gate.release()
@@ -5014,6 +5114,8 @@ class _Handler(GuardedHandler):
         compose = route == _SIGN_COMPOSE and (self.server.signer is not None or self.server.compose_signer is not None)
         # and the grants' passkey revoke (PLAN M17 "9a"): the same ceremony class, the same gate
         grant = grant_route(route, _GRANT_PREFIX) if self.server.grant_phone is not None else None
+        # and the envelopes' passkey revoke (board row 153): the same
+        envelope = grant_route(route, _ENVELOPE_PREFIX) if self.server.envelope_revoke is not None else None
         # and the consent family's answer and ruling (OS-2): the same ceremony class, the same gate
         consent = _consent_sign_route(route) if self.server.consent_sheet is not None else None
         # and the dispatch family's sign, cancel and authorise (OS-2): the same ceremony class, the same gate
@@ -5026,7 +5128,8 @@ class _Handler(GuardedHandler):
         desk = (route in (_DESK_ANSWER_ROUTE, _DESK_TEXT_ROUTE)
                 and getattr(self.server, "question_store", None) is not None)
         # and the thread view's write routes (CH-U1b): the same gate; served only beside a ChatService
-        thread = cockpit_threads.post_route(route) if self.server.chat_service is not None else None
+        thread = (cockpit_threads.post_route(route)
+                  if self.server.chat_service is not None and self.server.threads else None)   # threads=False: its writes are unknown routes too
         # and the room's write routes (RM-F): the same gate; served only beside a room host
         room = cockpit_room.post_route(route) if self.server.room_host is not None else None
         # and web push (OS-4): a token on every bind
@@ -5034,7 +5137,7 @@ class _Handler(GuardedHandler):
         if push:
             if not self._push_gate_ok(route):
                 return self._token_403("credential_required")
-        elif (sign is not None or compose or grant is not None or consent is not None or dispatch is not None
+        elif (sign is not None or compose or grant is not None or envelope is not None or consent is not None or dispatch is not None
                 or coord is not None or key_line or desk or thread is not None or room is not None) and not self._off_box_token_valid():
             return self._token_403("credential_required")
         if self._write_token_required() and not (self._push_gate_ok(route) if push else self._off_box_token_valid()):
@@ -5050,6 +5153,7 @@ class _Handler(GuardedHandler):
         # it already covers /action with no change here.
         is_chat = route in _CHAT_POST_ROUTES and self.server.chat_host is not None
         if (not _is_write_route(route) and not is_chat and sign is None and not compose and grant is None
+                and envelope is None
                 and consent is None and dispatch is None and coord is None and not push and not key_line
                 and not desk and thread is None and room is None):
             return self._reject(404, "not_found", "no such route")
@@ -5138,6 +5242,16 @@ class _Handler(GuardedHandler):
                 # the phone's grant ceremony (the passkey's signature is the authority): no read-only refusal applies
                 try:
                     payload, status = self._grant_post(grant[0], grant[1], req)
+                except _CredentialUnavailable:   # RU-5: only the outer catch answers it
+                    raise
+                except Exception as exc:  # noqa: BLE001 — never leak a traceback to the client
+                    payload, status = {"error": "internal", "message": type(exc).__name__}, 500
+                self._send_json(payload, status)
+                return
+            if envelope is not None:
+                # the envelope revoke's ceremony (the passkey's signature, verified here, is the authority)
+                try:
+                    payload, status = self._envelope_post(envelope[0], envelope[1], req)
                 except _CredentialUnavailable:   # RU-5: only the outer catch answers it
                     raise
                 except Exception as exc:  # noqa: BLE001 — never leak a traceback to the client
@@ -5487,7 +5601,8 @@ def make_server(
     chat_service: "ChatService | None" = None,
     room_host: "cockpit_room.RoomHost | None" = None,
     room_serve: "Any" = None,
-    premium_stt: bool = False,
+    premium_stt: "bool | None" = None,
+    threads: bool = True,
 ) -> _LevainHTTPServer:
     """Build a configured, bound (but not-yet-serving) web server over a substrate.
 
@@ -5496,6 +5611,13 @@ def make_server(
     ``OSError`` if the bind fails (e.g. the port is in use) — the caller decides
     how to report it. Separated from ``run_web_server`` so tests can drive a real
     bound server without the resolve/existence/print/browser/serve_forever wrapper.
+
+    ``premium_stt`` is the premium-dictation switch: ``True`` forces it on, ``False`` forces it off, and anything else
+    (the default ``None``, and any non-bool such as ``1`` or ``"yes"``) is AUTO, decided per request from key presence
+    (:func:`levain.cockpit.voice.premium_stt_on`): on while a provider with a speech-to-text model holds a key whose uses
+    list ``stt``, so a key added or revoked takes effect on the next request with no restart. An embedder that never
+    wants dictation passes ``False``. An AUTO server whose authority log cannot be replayed refuses in the
+    ``authority_unreadable`` words.
 
     ``extra_assets`` / ``extra_json`` are the READ-ONLY extension point a downstream
     control plane uses to register additional GET views that ride this server's
@@ -5527,6 +5649,9 @@ def make_server(
 
     ``work_board=False`` draws no Work board of levain's own: an embedder with no board of its own gets none (a board a
     provider registers still draws; the built-in is only the default when none does).
+
+    ``threads=False`` offers no Threads zone: ``GET /cockpit/threads.json`` and ``/cockpit/thread/<id>.json`` answer 404 and
+    the manifest's ``transport`` carries ``threads: false`` (absent by default), which the page reads to draw no zone.
 
     ``coordinator_verbs`` says a coordinator watcher runs beside this server: only then, over a write scope, are the
     Desk panel's Start / Stop / Hold registered (a caller's verb or effect under one of their names is then a
@@ -5885,6 +6010,7 @@ def make_server(
     # until every refusal below has passed and the Signer is pinned.
     httpd.cockpit = cockpit
     httpd.work_board = work_board
+    httpd.threads = threads is not False
     httpd.chat_service = chat_service
     httpd.room_host = room_host
     httpd.room_serve = None         # set only once the RoomServe has started, at the very end
@@ -5971,7 +6097,7 @@ def make_server(
     httpd.voice_last_read = {}
     httpd.voice_stream_lock = threading.Lock()
     httpd.voice_chunk_gate = threading.BoundedSemaphore(cockpit_voice.STREAM_CHUNK_INFLIGHT)
-    httpd.premium_stt = premium_stt is True       # off unless the caller says True outright
+    httpd.premium_stt = premium_stt if isinstance(premium_stt, bool) else None     # True/False force; anything else is AUTO
     from levain.webpush.presence_tokens import RateLimit as _PresenceRate
 
     httpd.presence_rate = _PresenceRate()     # tap-token writes per minute, counted in this process
@@ -6027,6 +6153,11 @@ def make_server(
             # jobs a card lists are read from that store, so no second queue can disagree with it
             httpd.dispatch_sheet = DispatchSheet(sign_queue, signer.rp_id, signer.page_origin, signer)
             httpd.coord_sheet = CoordSheet(sign_queue, signer.rp_id, signer.page_origin, signer)   # and the drop family
+            # and the envelope revoke (row 153) over that same queue's store: where the drops' signed envelopes are
+            # written, whatever the consent reader names (flow's bridge swaps the reader for one with no directory)
+            from levain.coordinator.envelope_revoke import EnvelopeRevoke
+
+            httpd.envelope_revoke = EnvelopeRevoke(sign_queue, signer.rp_id, signer.page_origin, signer.keys)
             # only when the grant cards this page shows come from that same queue (/cockpit/consent/grants.json reads
             # the consent reader's): two queues could name two cockpits whose grants share ids and instances, and a
             # button on one card must never revoke the other's. Different queues: no grant route, the button copies.
@@ -6123,7 +6254,7 @@ def run_web_server(
     sign_queue_dir: "Path | None" = None,
     sign_host: str | None = None,
     room: "Path | None" = None,
-    premium_stt: bool = False,
+    premium_stt: "bool | None" = None,
 ) -> int:
     """``levain serve`` entry point — serve the substrate dashboard on localhost.
 
@@ -6239,8 +6370,8 @@ def run_web_server(
     sign_kw: dict[str, Any] = {} if signer is None else {"signer": signer, "extra_hosts": frozenset({sign_host})}
     if room_serve is not None:
         sign_kw["room_serve"] = room_serve
-    if premium_stt is True:
-        sign_kw["premium_stt"] = True    # hidden for 1.0 (levain.cockpit.voice): only a literal True turns the route on
+    if isinstance(premium_stt, bool):
+        sign_kw["premium_stt"] = premium_stt    # a bool forces the switch; anything else leaves AUTO (levain.cockpit.voice.premium_stt_on)
     try:
         # the Desk panel's verbs exactly when the watcher below runs beside this server
         httpd = make_server(source, host=host, port=port, chat_host=chat_host, install_class=install_class,

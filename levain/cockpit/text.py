@@ -100,6 +100,9 @@ def _panel_lines(head: dict[str, Any], panel: dict[str, Any] | None, now: dateti
     if head.get("note"):
         out.append((NOTE, _fit(f"  {visible(head['note'])}", width)))
     searched = bool(panel.get("search_error") or panel.get("match_label"))
+    if status == "empty" and head.get("id") == "tray" and not searched \
+            and any(r.get("group") in LIST_APART for r in panel.get("rows") or []):
+        status = "ok"           # the List's DESK OWES / LATER rows are uncounted, so a List of only those reads empty: draw them
     if status == "empty":
         if not searched:
             out.append((DIM, _fit(f"  {visible(head.get('empty') or 'Nothing here.')}", width)))
@@ -242,11 +245,16 @@ _VALUE_TEXT = {"line": _t_line, "status-dots": _t_status_dots, "ambient": _t_amb
                "log": _t_log}
 
 
+LIST_APART = frozenset({"desk", "later"})      # the List's groups the footer prints though the header does not count them
+
+
 def _rows(head: dict[str, Any], panel: dict[str, Any], width: int, top_n: int) -> list[tuple[str, str]]:
     out: list[tuple[str, str]] = []
     group_counts = {g["id"]: g for g in head.get("groups") or []}
-    # the queue only: an uncounted group (a panel's history, K2b-3b §3) is not drawn here
-    rows = [r for r in panel.get("rows") or [] if not (group_counts.get(r.get("group")) or {}).get("uncounted")]
+    # the queue only: an uncounted group (a panel's history, K2b-3b §3) is not drawn here. The List's DESK OWES and LATER groups
+    # are uncounted too but are the operator's to see (flow's footer prints both), so the List draws them under their headings
+    keep = LIST_APART if head.get("id") == "tray" else frozenset()
+    rows = [r for r in panel.get("rows") or [] if r.get("group") in keep or not (group_counts.get(r.get("group")) or {}).get("uncounted")]
     drawn: dict[Any, int] = {}
     current: Any = object()
     for r in rows:

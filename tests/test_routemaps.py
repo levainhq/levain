@@ -582,12 +582,17 @@ def test_dispatch_dir_setgid_keys_group(st):
     for host in ("darwin", "linux"):
         row = next(r for r in layout.base_store_rows(host, "op") if r.path == layout.STORE[host] / "routes" / "dispatch")
         assert (row.owner, row.group, row.mode) == ("_levain_control", "_levain_keys", 0o2750), row
-        steps = [s.argv for s in layout.row_steps(host, [row]) if s.argv]
+        all_steps = layout.row_steps(host, [row])
+        steps = [s.argv for s in all_steps if s.argv]
         chown = [a for a in steps if a[0].endswith("chown")]
-        chmod = [a for a in steps if a[0].endswith("chmod") and a[1] != "-N"]    # -N: the macOS ACL clear
-        assert chown == [(chown[0][0], "_levain_control:_levain_keys", str(row.path))], steps
-        assert chmod == [(chmod[0][0], "2750", str(row.path))], steps
-        assert steps.index(chown[0]) < steps.index(chmod[0])   # the mode (setgid) set after the chown
+        assert chown == [(chown[0][0], "-h", "_levain_control:_levain_keys", str(row.path))], steps
+        # the mode (setgid) set last, after the chown: macOS chmod -h; Linux a no-follow descriptor (PREL3 1b-7)
+        assert all_steps[-1].why == f"set {row.path} to 2750"
+        if host == "darwin":
+            assert all_steps[-1].argv == ("/bin/chmod", "-h", "2750", str(row.path)), steps
+        else:
+            assert all_steps[-1].call is not None and not all_steps[-1].argv
+        assert all_steps.index(next(s for s in all_steps if s.argv[:1] and s.argv[0].endswith("chown"))) < len(all_steps) - 1
     # the directory contract on a real directory: the row's mode applied, then a file CONTROL writes takes its gid
     os.chown(st.dispatch, -1, os.getgid())           # a group this writer is in (/tmp's may not be), so setgid holds
     os.chmod(st.dispatch, row.mode)

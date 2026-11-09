@@ -297,6 +297,9 @@ UNREAD_ANSWERS = frozenset({"staging-missing", "staging-not-regular", LINK_UNREA
 HASH_ONLY_CAP = (1 << 63) - 1
 
 _CHUNK = 1 << 20
+# a refill stops this far above the floor: extent and journal metadata are charged beyond the zeros written, and a
+# free-space reading can lag the writes, so landing exactly on the floor would still tip the next pass into BRAKE
+_REFILL_MARGIN = 4 << 20
 _LINK_TMP = b".levain-link."
 _O_NEW = os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC
 _O_ENTRY = os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_NOCTTY | os.O_CLOEXEC
@@ -2684,12 +2687,22 @@ class Reserve:
                 if e.errno != errno.ENOSPC or self.release_step() == 0:
                     raise
 
+    def refill_headroom(self, free_bytes: Callable[[], int], *, floor: int = V5_FLOOR_BYTES) -> int:
+        """Bytes a refill may write: free space less the floor and :data:`_REFILL_MARGIN`. At or below zero nothing may be
+        opened or created for the reserve, since the file's own metadata is charged to the host too. The one place the
+        arithmetic lives, for :meth:`refill` and the reaper's lock."""
+        return free_bytes() - floor - _REFILL_MARGIN
+
     def refill(self, free_bytes: Callable[[], int], *, floor: int = V5_FLOOR_BYTES) -> bool:
         """Back to ``size`` with written zeros when free space is above ``floor``; returns whether it
-        is full."""
+        is full. The headroom (``free_bytes() - floor - _REFILL_MARGIN``) is read once at entry and each write is
+        subtracted from it; a fresh reading only shrinks it. So the refill writes at most the entry headroom even when
+        the filesystem's free-space reading lags the writes, and stops sooner when the reading drops faster. What it
+        does not guarantee: space taken by other writers after entry, or by metadata beyond the margin."""
         if self.current() >= self.size:
             return True
-        if free_bytes() <= floor:
+        start = self.refill_headroom(free_bytes, floor=floor)
+        if start <= 0:     # nothing is opened or created here
             return False
         created = not os.path.lexists(self.path)
         fd = os.open(self.path, os.O_WRONLY | os.O_CREAT | os.O_NOFOLLOW | os.O_CLOEXEC, 0o600)
@@ -2698,11 +2711,17 @@ class Reserve:
             cur = os.fstat(fd).st_size
             os.lseek(fd, cur, os.SEEK_SET)
             zeros = bytes(_CHUNK)
+            head = min(start, self.refill_headroom(free_bytes, floor=floor))
             try:
                 while cur < self.size:
-                    n = min(_CHUNK, self.size - cur)
+                    # never write past the floor: a refill that starves the host would make the next pass BRAKE
+                    head = min(head, self.refill_headroom(free_bytes, floor=floor))    # a reading may shrink it, never grow it
+                    n = min(_CHUNK, self.size - cur, head)
+                    if n <= 0:
+                        break
                     write_all(fd, zeros[:n])
                     cur += n
+                    head -= n
             except OSError as e:
                 if e.errno != errno.ENOSPC:
                     raise

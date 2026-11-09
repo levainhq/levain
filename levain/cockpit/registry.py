@@ -178,6 +178,11 @@ FACETS: dict[str, tuple[str, Callable[[Any], bool]]] = {
     "attention": ("str|null", _opt(_is_str)),    # `talk` on a talk seed; an agenda's ping word
     "list_pointer": ("str", _is_str),            # where a read-only band/board row is acted on
     "band_number": ("int|null", _opt(_is_int)),  # a band row's allocated number
+    # a band row's host section ("you" / "desk": the desk owes the latter), whether it is carried, and its LATER day's words
+    "band_section": ("enum", _enum("you", "desk")),
+    "band_carried": ("bool", _is_bool),
+    "band_age": ("str", _is_str),                # a band row's age in the footer's form ("1d6h"), from the host's refile clock
+    "band_later_words": ("Mon..Sun, optionally followed by MM-DD", _is_later_words),
     "board_rank": ("int|null", _opt(_is_int)),
     "board_tier": ("str|null", _opt(_is_str)),
 }
@@ -422,7 +427,15 @@ register_ordering(
 
 def _list_group(row: RowIn, today: date) -> str:
     s = row.facets.get("surface")
-    if s in ("band", "board", "talk"):
+    if s == "band":
+        # the desk's own rows are the desk's whether or not they carry a date (flow's footer files them under DESK OWES); a row of
+        # the operator's that comes back on a later day is LATER; the rest is needs-you. A desk row the desk has carried past
+        # its day (open > 24h, `band_carried`) is ALSO needs-you, as flow's footer lists it (tagged desk-owed) and never LATER;
+        # the page counts it under DESK OWES from `band_section`, which it keeps
+        if row.facets.get("band_section") == "desk":
+            return "band" if row.facets.get("band_carried") is True else "desk"
+        return "later" if row.facets.get("held_until") else "band"
+    if s in ("board", "talk"):
         return s
     if row.facets.get("overdue") is True:
         return "overdue"
@@ -437,7 +450,9 @@ def _list_key(row: RowIn, today: date) -> tuple:
     f = row.facets
     s = f.get("surface")
     if s == "band":
-        return (_int_or_big(f.get("band_number")), row.id)
+        # a LATER row comes back on its date: the footer lists them by return day, then band number
+        back = parse_date(f.get("held_until")) if f.get("band_section") != "desk" else None
+        return (back.toordinal() if back else 0, _int_or_big(f.get("band_number")), row.id)
     if s == "board":
         return (_int_or_big(f.get("board_rank")), row.id)
     if s == "talk":                         # oldest first; a talk with no known age goes last
@@ -453,9 +468,10 @@ def _list_key(row: RowIn, today: date) -> tuple:
 register_ordering(
     Ordering(
         "spore.list", _list_key, _list_group,
-        (("band", "Needs you (answer it in Decisions)"), ("overdue", "Overdue"), ("today", "Today"),
+        (("band", "Needs you (answer it in Decisions)"), ("desk", "Desk owes (the desk is on these; nothing for you)"),
+         ("later", "Later"), ("overdue", "Overdue"), ("today", "Today"),
          ("board", "Ready for agents"), ("talk", "To talk through"), ("also", "Also pending")),
-        frozenset({"today", "overdue"}),
+        frozenset({"today", "overdue"}), frozenset({"desk", "later"}),
     ),
     builtin=True,
 )

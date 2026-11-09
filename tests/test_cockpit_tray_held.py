@@ -163,7 +163,7 @@ WAIT = f"{TRAY} && {TRAY}.querySelector('.sp-results') && 1"
 OLD_ROWS_TEXT = f"{ALL_ROWS}.map(r => r.textContent)"
 
 
-def _served(tmp_path: Path, *, keep_seed: bool = True):
+def _served(tmp_path: Path, *, keep_seed: bool = True, plain: bool = False):   # plain: see PLAIN below
     """A served install on the real clock: the page reads today from the server, so the held dates are
     relative to it (the rig's fixed day would put them in the past)."""
     _root, src, ids = _install(tmp_path)
@@ -184,15 +184,116 @@ def _served(tmp_path: Path, *, keep_seed: bool = True):
     return real, served
 
 
+# The plain Tray is a panel that does not offer list_intake (the page marks the List by that action alone). The init script, run on
+# every load, renames the verb in every cockpit read, so the page draws the Tray with its held toggle, not the List.
+PLAIN = {"init": "(() => { const f = window.fetch; window.fetch = async (...a) => { const r = await f(...a);"
+                 " if (!/cockpit/.test(String(a[0] && a[0].url || a[0]))) return r;"
+                 " const t = (await r.text()).split('\"list_intake\"').join('\"list_intake_off\"');"
+                 " return new Response(t, {status: r.status, headers: r.headers}); }; })()"}
+
+
 def _label(d: date) -> str:
     return d.strftime("%b ") + str(d.day)
 
 
+# The List's card names what it leaves out in ONE control and the focus view lists the held rows under their own heading, with no
+# toggle (levain 73, 531 round 4: this replaces the held toggle these tests used to drive).
+MORE = f"{TRAY}.querySelector('[data-list-more]')"
+FOCUS = "document.querySelector('#levain-modal .modal-body')"
+FOCUS_HELD = f"[...{FOCUS}.querySelectorAll('.row[data-held]')]"
+
+def _open_focus() -> list[dict[str, Any]]:
+    return [{"eval": f"{MORE}.click(); 1"},
+            {"until": f"{FOCUS} && {FOCUS}.querySelector('.sp-results') && 1"}]
+
+
+HELD_CHIP = f"{FOCUS}.querySelector('.list-surface-chip[data-surface=\"held\"]')"
+
+
+def _open_held() -> list[dict[str, Any]]:
+    """The focus view lists held rows under their own chip only (levain 75): never inside "all" or a surface's chip."""
+    return [*_open_focus(), {"eval": f"{FOCUS_HELD}.length"}, {"eval": f"{HELD_CHIP}.click(); 1"},
+            {"until": f"{FOCUS_HELD}.length > 0 && 1"}]
+
+
 @needs_browser
-def test_the_page_hides_the_held_rows_by_default_and_a_toggle_shows_them(tmp_path: Path) -> None:
+def test_the_card_hides_the_held_rows_and_names_them_in_one_control_and_the_focus_view_lists_them(tmp_path: Path) -> None:
     real, served = _served(tmp_path)
     with served as url:
         out = _drive(tmp_path, f"{url}/", [
+            {"until": f"{WAIT} && {MORE} && 1"},
+            {"eval": f"[{HELD_ROWS}.length, {ALL_ROWS}.length, {MORE}.textContent.trim(), {TOGGLE} === null]"},
+            *_open_held(),
+            {"eval": f"[{FOCUS_HELD}.length, {FOCUS}.querySelectorAll('[data-held-toggle]').length]"},
+            {"eval": f"{FOCUS_HELD}.map(r => r.textContent)"},
+        ])
+    v = out["values"]
+    assert v[1] == [0, 2, "2 held", True], v
+    assert v[4] == 0, v                      # not inside "all"
+    assert v[7] == [2, 0], v
+    assert f"surfaces {_label(real + timedelta(days=3))}" in v[8][0] and "a sooner held seed" in v[8][0], v
+    assert f"surfaces {_label(real + timedelta(days=10))}" in v[8][1] and "a later held seed" in v[8][1], v
+
+
+@needs_browser
+def test_a_held_row_in_the_focus_view_carries_the_same_verbs_as_a_due_row(tmp_path: Path) -> None:
+    _real, served = _served(tmp_path)
+    names = "[...%s.querySelectorAll('button')].map(b => b.textContent.trim().toLowerCase()).sort().join(',')"
+    due_rows = f"[...{FOCUS}.querySelectorAll('.sp-results .row')].find(r => !r.dataset.held)"
+    with served as url:
+        out = _drive(tmp_path, f"{url}/", [
+            {"until": f"{WAIT} && {MORE} && 1"},
+            *_open_held(),
+            {"eval": names % f"{FOCUS_HELD}[0]"},
+            {"eval": f"{HELD_CHIP}.parentElement.querySelector('[data-surface=\"\"]').click(); 1"},
+            {"eval": names % due_rows},
+        ])
+    held, due = out["values"][-3], out["values"][-1]
+    assert held and held == due, out
+
+
+@needs_browser
+def test_a_list_with_only_held_rows_still_offers_them(tmp_path: Path) -> None:
+    _real, served = _served(tmp_path, keep_seed=False)
+    with served as url:
+        out = _drive(tmp_path, f"{url}/", [
+            {"until": f"{WAIT} && {MORE} && 1"},
+            {"eval": f"[{MORE}.textContent.trim(), {ALL_ROWS}.length, {TRAY}.textContent.includes('nothing waiting')]"},
+            *_open_held(),
+            {"eval": f"{FOCUS_HELD}.length"},
+        ])
+    assert out["values"][1][0] == "2 held" and out["values"][1][1] == 0 and out["values"][-1] == 2, out
+
+
+@needs_browser
+def test_the_focus_views_filter_covers_the_held_rows(tmp_path: Path) -> None:
+    _real, served = _served(tmp_path)
+    q = (f"(() => {{ const i = {FOCUS}.querySelector('.ep-search-input'); i.value = 'sooner'; "
+         "i.dispatchEvent(new Event('input', {bubbles: true})); return 1; })()")
+    with served as url:
+        out = _drive(tmp_path, f"{url}/", [
+            {"until": f"{WAIT} && {MORE} && 1"},
+            *_open_focus(),
+            {"eval": q},
+            {"eval": f"[{FOCUS}.querySelectorAll('.sp-results .row').length, {FOCUS_HELD}.length, !!{FOCUS}.querySelector('[data-held-show-matches]')]"},
+            {"eval": f"{FOCUS}.querySelector('[data-held-show-matches]').click(); 1"},
+            {"eval": f"[{FOCUS}.querySelectorAll('.sp-results .row').length, {FOCUS_HELD}.length]"},
+        ])
+    # "all" holds no held rows: the search tells of the held match and its button opens the held chip, which lists exactly that row
+    assert out["values"][-3] == [0, 0, True] and out["values"][-1] == [1, 1], out
+
+
+# --- the plain Tray (a panel that offers no list_intake: a read-only credential) keeps its held toggle ------------------------
+# The List card replaced the toggle with one control (levain 73); the toggle code is live for every other Tray, so it keeps its tests
+# (default hidden + toggle, persistence, blocked storage, the show hint, a read with no held rows, the focus modal).
+
+
+@needs_browser
+def test_the_page_hides_the_held_rows_by_default_and_a_toggle_shows_them_on_the_plain_tray(tmp_path: Path) -> None:
+    real, served = _served(tmp_path, plain=True)
+    with served as url:
+        out = _drive(tmp_path, f"{url}/", [
+            PLAIN,
             {"until": WAIT},
             {"eval": f"[{HELD_ROWS}.length, {ALL_ROWS}.length, {TOGGLE} && {TOGGLE}.textContent, {TRAY}.textContent.includes('2 held back')]"},
             {"eval": f"{TOGGLE}.click(); 1"},
@@ -209,10 +310,11 @@ def test_the_page_hides_the_held_rows_by_default_and_a_toggle_shows_them(tmp_pat
 
 
 @needs_browser
-def test_the_choice_survives_a_reload_and_the_filter_covers_held_rows_while_shown(tmp_path: Path) -> None:
-    _real, served = _served(tmp_path)
+def test_the_choice_survives_a_reload_and_the_filter_covers_held_rows_while_shown_on_the_plain_tray(tmp_path: Path) -> None:
+    _real, served = _served(tmp_path, plain=True)
     with served as url:
         out = _drive(tmp_path, f"{url}/", [
+            PLAIN,
             {"until": WAIT},
             {"eval": f"{TOGGLE}.click(); 1"},
             {"eval": "location.reload(); 1"},
@@ -228,10 +330,11 @@ def test_the_choice_survives_a_reload_and_the_filter_covers_held_rows_while_show
 
 
 @needs_browser
-def test_a_blocked_local_storage_leaves_the_toggle_working_for_the_page(tmp_path: Path) -> None:
-    _real, served = _served(tmp_path)
+def test_a_blocked_local_storage_leaves_the_toggle_working_for_the_page_on_the_plain_tray(tmp_path: Path) -> None:
+    _real, served = _served(tmp_path, plain=True)
     with served as url:
         out = _drive(tmp_path, f"{url}/", [
+            PLAIN,
             {"until": WAIT},
             {"eval": "Storage.prototype.setItem = function () { throw new Error('blocked'); }; 1"},
             {"eval": f"{TOGGLE}.click(); {HELD_ROWS}.length"},
@@ -240,39 +343,13 @@ def test_a_blocked_local_storage_leaves_the_toggle_working_for_the_page(tmp_path
 
 
 @needs_browser
-def test_a_held_row_on_the_page_carries_the_same_verbs_as_a_due_row(tmp_path: Path) -> None:
-    _real, served = _served(tmp_path)
-    names = "[...%s.querySelectorAll('button')].map(b => b.textContent.trim().toLowerCase()).sort().join(',')"
-    with served as url:
-        out = _drive(tmp_path, f"{url}/", [
-            {"until": WAIT},
-            {"eval": f"{TOGGLE}.click(); 1"},
-            {"eval": names % f"{HELD_ROWS}[0]"},
-            {"eval": names % f"{ALL_ROWS}.find(r => !r.dataset.held)"},
-        ])
-    held, due = out["values"][2], out["values"][3]
-    assert held and held == due, out
-
-
-@needs_browser
-def test_a_tray_with_only_held_rows_still_offers_them(tmp_path: Path) -> None:
-    _real, served = _served(tmp_path, keep_seed=False)
-    with served as url:
-        out = _drive(tmp_path, f"{url}/", [
-            {"until": WAIT},
-            {"eval": f"[{TOGGLE} && 1, {ALL_ROWS}.length, {TRAY}.textContent.includes('nothing waiting')]"},
-            {"eval": f"{TOGGLE}.click(); {HELD_ROWS}.length"},
-        ])
-    assert out["values"][1][0] == 1 and out["values"][2] == 2, out
-
-
-@needs_browser
-def test_a_filter_matching_only_hidden_held_rows_says_so_and_offers_to_show_them(tmp_path: Path) -> None:
-    _real, served = _served(tmp_path)
+def test_a_filter_matching_only_hidden_held_rows_says_so_and_offers_to_show_them_on_the_plain_tray(tmp_path: Path) -> None:
+    _real, served = _served(tmp_path, plain=True)
     type_q = (f"(() => {{ const i = {TRAY}.querySelector('.ep-search-input'); i.value = 'sooner'; "
               "i.dispatchEvent(new Event('input', {bubbles: true})); return 1; })()")
     with served as url:
         out = _drive(tmp_path, f"{url}/", [
+            PLAIN,
             {"until": WAIT},
             {"eval": type_q},
             {"eval": f"[{TRAY}.querySelector('.sp-results .empty').textContent, {ALL_ROWS}.length]"},
@@ -289,15 +366,16 @@ def _filter(q: str) -> str:
 
 
 @needs_browser
-def test_a_read_with_no_held_rows_does_not_forget_that_they_are_shown(tmp_path: Path) -> None:
+def test_a_read_with_no_held_rows_does_not_forget_that_they_are_shown_on_the_plain_tray(tmp_path: Path) -> None:
     """A read that carries no held rows (a compact read, a filter matching none) must leave the stored choice alone."""
-    _real, served = _served(tmp_path)
+    _real, served = _served(tmp_path, plain=True)
     strip = ("window.__fetch = window.fetch; window.fetch = async (...a) => { const r = await window.__fetch(...a); "
              "if (!/panel\\/tray/.test(String(a[0] && a[0].url || a[0]))) return r; const j = await r.json(); "
              "delete j.held; j.filtered = []; return new Response(JSON.stringify(j), {status: r.status, headers: r.headers}); }; 1")
     pause = "new Promise(r => setTimeout(() => r(1), 800))"
     with served as url:
         out = _drive(tmp_path, f"{url}/", [
+            PLAIN,
             {"until": WAIT},
             {"eval": f"{TOGGLE}.click(); {HELD_ROWS}.length"},
             {"eval": strip},
@@ -314,11 +392,12 @@ def test_a_read_with_no_held_rows_does_not_forget_that_they_are_shown(tmp_path: 
 
 
 @needs_browser
-def test_toggling_in_the_focus_modal_redraws_the_board_tray_too(tmp_path: Path) -> None:
-    _real, served = _served(tmp_path)
+def test_toggling_in_the_focus_modal_redraws_the_board_tray_too_on_the_plain_tray(tmp_path: Path) -> None:
+    _real, served = _served(tmp_path, plain=True)
     modal_toggle = "document.querySelector('#levain-modal [data-held-toggle]')"
     with served as url:
         out = _drive(tmp_path, f"{url}/", [
+            PLAIN,
             {"until": WAIT},
             {"eval": f"{TRAY}.querySelector('.pexpand').click(); 1"},
             {"until": f"{modal_toggle} && 1"},
