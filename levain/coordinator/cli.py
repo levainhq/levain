@@ -105,7 +105,7 @@ def _opens_board(args: argparse.Namespace) -> bool:
     """True for the verbs whose default store is the board store. A spawn with ``--item`` writes its launch and the
     item's attach in one transaction, so the launch is in the board store too."""
     cmd = args.coord_cmd
-    return cmd == "import-status" or (cmd == "spawn" and getattr(args, "item", None) is not None)
+    return cmd in ("import-status", "apply-reports") or (cmd == "spawn" and getattr(args, "item", None) is not None)
 
 
 NO_STORE = "no coordinator store here"
@@ -1478,6 +1478,8 @@ def _run_coord(args: argparse.Namespace, out: Any) -> int:
             return _coord_ready(args, out, store)
         if cmd == "import-status":
             return _coord_import_status(args, out, store)
+        if cmd == "apply-reports":
+            return _coord_apply_reports(args, out, store)
         if cmd == "launch":
             from levain.coordinator.launch import launch_session
 
@@ -1822,9 +1824,45 @@ def _coord_import_status(args: argparse.Namespace, out: Any, store: EnvelopeStor
         return 2
     buckets = {"added": got.added, "corrected": got.corrected, "unchanged": got.unchanged, "absent": got.absent,
                "unparsed": got.unparsed}
-    _emit(out, args.json, buckets,
-          "\n".join(f"{name}: {len(ids)}" + (f" ({', '.join(str(i) for i in ids)})" if ids else "")
-                    for name, ids in buckets.items()))
+    text = "\n".join(f"{name}: {len(ids)}" + (f" ({', '.join(str(i) for i in ids)})" if ids else "")
+                     for name, ids in buckets.items())
+    reports = _apply_queue(args, store)             # the holder's own pass over the board's queue (row 162)
+    if reports:
+        buckets = {**buckets, "reports": reports}
+        text += "\n" + "\n".join(reports)
+    _emit(out, args.json, buckets, text)
+    return 0
+
+
+def _apply_queue(args: argparse.Namespace, store: EnvelopeStore) -> list[str]:
+    """The lease holder's pass over the board's queued worker reports (row 162): applied as the coordinator, facts only,
+    through the validator the watch's pass uses. Never raises: a fault is one line, and the verb it rides on keeps its
+    own result."""
+    from levain.coordinator import work_attach
+
+    try:
+        return work_attach.coordinator_apply(store, args.token)
+    except Exception as exc:    # noqa: BLE001 - the verb this rides on has already done its work
+        return [f"board reports: not applied ({exc})"]
+
+
+def _coord_apply_reports(args: argparse.Namespace, out: Any, store: EnvelopeStore) -> int:
+    """``levain coord apply-reports --token N``: the lease holder applies the board's queued worker reports itself, as
+    the coordinator, facts only (:func:`levain.coordinator.work_attach.coordinator_apply`). Without the live lease token
+    nothing is read or written and the exit is 1. Prints the pass's line, or says none was waiting."""
+    from levain.coordinator import work_attach
+
+    held = None if _no_store(store) else store.coord_lease()
+    if held is None or not held.live or held.token != args.token:
+        print("levain coord apply-reports: the coordinator lease is not held by this token (levain coord status "
+              "shows the live one); nothing was applied", file=sys.stderr)
+        return 1
+    try:
+        lines = work_attach.coordinator_apply(store, args.token)
+    except _REFUSED as exc:
+        print(f"levain coord apply-reports: {exc}", file=sys.stderr)
+        return 2
+    _emit(out, args.json, {"lines": lines}, "\n".join(lines) if lines else "no report is waiting")
     return 0
 
 
@@ -2500,6 +2538,16 @@ def add_parsers(subparsers: argparse._SubParsersAction) -> None:
     common(cis)
     cis.set_defaults(func=run_coord)
     door_ok(cis)
+    car = c_sub.add_parser(
+        "apply-reports", help="Apply the board's queued worker reports as the lease holder (facts only).",
+        description="While a coordinator holds the board lease the watch's service pass is skipped, so the holder "
+                    "applies the queue itself: each queued report is judged by the validator the watch uses and is "
+                    "applied, deferred or refused with a record. Needs --token (the live lease's); the lease is kept. "
+                    "The store is <levain home>/board unless --queue-dir names one.")
+    car.add_argument("--token", type=int, required=True, help="The live coordinator lease's token.")
+    common(car)
+    car.set_defaults(func=run_coord)
+    door_ok(car)
     chn = c_sub.add_parser("handoff", help="Read the handoffs coordinators left.")
     chn_sub = chn.add_subparsers(dest="handoff_cmd", required=True)
     chs = chn_sub.add_parser("show", help="The latest handoff, or the one named.",

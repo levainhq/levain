@@ -51,9 +51,10 @@ Known edges (ruled, one line each):
   ``worker-not-a-launch``; within it, a seat that attached while no watch ran is accepted.
 * A session attach that stopped holding (its session long unseen) and whose session is seen again holds again; its
   worker's reports still apply to the attach it opened.
-* No coordinator verb applies the board's queue: while a coordinator or the operator holds the board lease the service
-  skips its pass and the reports wait for the lease to end (the coordinator role of :func:`apply_reports` is there for a
-  holder to call; no per-wake hook of the coordinator calls it).
+* While a coordinator or the operator holds the board lease the service skips its pass; the holder applies the queue
+  itself with :func:`coordinator_apply` (``levain coord apply-reports --token N``, and at the end of ``coord
+  import-status``), as the coordinator, facts only, through the same judging. A holder that runs neither leaves the
+  reports waiting for its lease to end.
 * A stale lease of someone other than the service is left for its holder or a coordinator to lapse: the service's pass
   is skipped until then.
 """
@@ -72,7 +73,7 @@ from levain.cockpit.consent import utc_stamp
 from levain.coordinator.store import _OID, CoordError, CoordStore, _append_only, _in, next_gseq
 
 __all__ = ["ApplyResult", "watch_apply", "DEFER_DEADLINE", "EVENTS", "FUTURE_SKEW", "GRACE_PASSES", "PASS_INTERVAL_S",
-           "REFUSAL_REASONS", "SEEN_KEEP", "migrate_seen",
+           "REFUSAL_REASONS", "SEEN_KEEP", "coordinator_apply", "migrate_seen",
            "REPORT_SCHEMA", "WORKER_KINDS", "WORK_SCHEMA", "apply_reports", "attach_launch", "board_store_dir",
            "enqueue_report", "live_session_ids", "queue_report", "report_line", "report_status", "reports_path"]
 
@@ -772,11 +773,37 @@ def watch_apply(board: Path | str | None = None, *, sessions: Any = None, every:
         finally:
             with store._write("service", None, create=False) as (conn, now):
                 _lease.service_release(conn, now, token, cause="watch apply done")
-        return [f"board reports: applied {len(got.applied)}, refused {len(got.refused)}, deferred {len(got.deferred)}"
-                + "".join(f"; {rid} refused: {why}" for rid, why in got.refused)
-                + "".join(f"; {rid} not recorded: {why}" for rid, why in got.faults)]
+        return [_applied_line(got)]
     except Exception as exc:    # noqa: BLE001 - the watch's pass goes on whatever this does
         return [f"board reports: not applied this pass ({exc})"]
+
+
+def _applied_line(got: ApplyResult) -> str:
+    return (f"board reports: applied {len(got.applied)}, refused {len(got.refused)}, deferred {len(got.deferred)}"
+            + "".join(f"; {rid} refused: {why}" for rid, why in got.refused)
+            + "".join(f"; {rid} not recorded: {why}" for rid, why in got.faults))
+
+
+def coordinator_apply(store: CoordStore, token: Any, *, sessions: Any = None,
+                      every: float = PASS_INTERVAL_S) -> list[str]:
+    """The coordinator's own pass over the board's queue (row 162): while a coordinator holds the board lease the
+    service's pass is skipped (:func:`watch_apply`), so the holder applies the queued reports itself, as the
+    ``coordinator`` with its own live ``token``, through :func:`apply_reports`: the same judging, the same facts only,
+    the same refusals with a record. The lease is neither taken nor released here. Returns ``[]`` when no report is
+    queued, else one line. Raises :class:`CoordError` when ``token`` is not the live lease; a directory that is the
+    live consent store is never a board (one line, nothing applied)."""
+    directory = Path(store.directory)
+    if is_live_consent(directory):
+        return [f"board reports: not applied, {directory} is the live consent store and never a board"]
+    if store.role != "coordinator":
+        raise CoordError("the coordinator's pass runs on a coordinator-role store")
+    if not (directory / "dispatch.db").exists() or not reports_path(directory).exists() or not _unresolved(directory):
+        return []
+    held = store.coord_lease()
+    if held is None or not held.live or held.token != token:
+        raise CoordError("the coordinator lease is not held by this token; no report was applied")
+    live = (sessions or live_session_ids)(store)
+    return [_applied_line(apply_reports(store, token, live_sessions=live, every=every))]
 
 
 # ------------------------------------------------------------------------------------------------ a report's outcome
