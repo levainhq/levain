@@ -2118,7 +2118,7 @@
     if (foreign) {
       // read-only by construction: band rows point at the Decisions panel, board rows at the agents' queue; no verbs below
       if (s.support && !s.text_locked) host.appendChild(el("span", "muted list-support", s.support));
-      if (s.later_words && s.group === "later") host.appendChild(tagEl("muted", "back " + s.later_words));   // a carried desk row is due now (needs you), never "back Mon"
+      if (s.later_words && s.group === "later") host.appendChild(tagEl("muted later-tag", "back " + s.later_words));   // a carried desk row is due now (needs you), never "back Mon"
       // a desk row the desk has carried past its day is listed under Needs you, tagged as flow's footer tags it
       if (s.band_section === "desk" && s.carried) host.appendChild(tagEl("muted list-desk-owed", "desk-owed"));
       if (s.list_pointer) host.appendChild(tagEl("muted list-pointer", s.list_pointer));
