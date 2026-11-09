@@ -2694,15 +2694,7 @@ class Control:
             raise Refused("bad-value", "model")
         with self._activation:
             active = self.routes.active() if self.routes is not None else None
-            if active is None:
-                raise Refused("no-brokered-route", "no route-map generation is active")
-            serving = sorted(rid for rid, entry in active.routes.items()
-                             if entry.policy.type == "brokered" and model in entry.backends)
-            if not serving:
-                raise Refused("no-brokered-route", "no brokered route of the active dispatch map serves this model")
-            if len(serving) > 1:
-                raise Refused("route-ambiguous", "more than one brokered route of the active dispatch map serves this model")
-            route = serving[0]
+            route = routemaps.brokered_route_for(active, model)
             return {"route": route, "routemap_generation": active.generation,
                     "route_policy_digest": active.digests[route]}
 

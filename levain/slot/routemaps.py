@@ -399,6 +399,21 @@ def _nothing(_point: str) -> None:
     return None
 
 
+def brokered_route_for(active: Optional[Checked], model: str) -> str:
+    """The id of the ONE brokered route of ``active`` whose backends hold ``model``: the rule of CONTROL's
+    ``ROUTE-RESOLVE``, kept here so the mint's resolve and a read-only look judge a model the same way. Raises
+    :class:`Refused` ``no-brokered-route`` (no map active, or no route serves the model) or ``route-ambiguous``."""
+    if active is None:
+        raise Refused("no-brokered-route", "no route-map generation is active")
+    serving = sorted(rid for rid, entry in active.routes.items()
+                     if entry.policy.type == "brokered" and model in entry.backends)
+    if not serving:
+        raise Refused("no-brokered-route", "no brokered route of the active dispatch map serves this model")
+    if len(serving) > 1:
+        raise Refused("route-ambiguous", "more than one brokered route of the active dispatch map serves this model")
+    return serving[0]
+
+
 class ControlRoutes:
     """CONTROL's route maps over `routes_dir` (`L/routes`). `fault(point)` is the fault-gate tests' seam, called at
     each of `FAULT_POINTS` during an activation; `verify` replaces the SSHSIG verifier (tests use the real one)."""
@@ -437,6 +452,19 @@ class ControlRoutes:
     def _write(self, path: Path, data: bytes) -> None:
         write_durably(path, data, mode=0o640, fsync=self._fsync)
 
+    def verified_head(self) -> Tuple[Optional[Dict[str, object]], Optional[Checked]]:
+        """The head and its generation, read and verified exactly as the start pass does, WRITING NOTHING: ``(None, None)``
+        before the first map; a head that does not verify raises :class:`Refused` (``routemap-head-unverifiable`` or the
+        item's own refusal). The one reader both the start pass and a read-only look (the doctor) share."""
+        head = self._read_head()
+        if head is None:
+            return None, None
+        trust = read_trust(self.dir)
+        if head["store_id"] != trust.store_id:
+            raise Refused("routemap-head-unverifiable", "the head names another store")
+        return head, _load_generation(self.dir, head["generation"], head["item_sha256"], trust,
+                                      base_route_ids(self.dir), self._verify)
+
     def start_pass(self) -> None:
         """r3 §2.3 "CONTROL's start pass", in this order (an assertion): (1) read the head and verify its files
         exactly as ROUTE-SUBMIT does; a head that does not verify leaves every dispatch route refused and a doctor
@@ -447,13 +475,7 @@ class ControlRoutes:
         with self.lock:
             self._active = None
             try:
-                head = self._read_head()
-                if head is not None:
-                    trust = read_trust(self.dir)
-                    if head["store_id"] != trust.store_id:
-                        raise Refused("routemap-head-unverifiable", "the head names another store")
-                    checked = _load_generation(self.dir, head["generation"], head["item_sha256"], trust,
-                                               base_route_ids(self.dir), self._verify)
+                head, checked = self.verified_head()
             except Refused as e:
                 self.problem = "routemap-head-unverifiable"
                 self.problem_detail = f"{e.name}: {e.detail}"

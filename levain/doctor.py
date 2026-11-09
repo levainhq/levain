@@ -177,6 +177,7 @@ def _run_doctor(path: Path, invoke: bool = False, repin_hooks: bool = False) -> 
     core.extend(_check_slot_homes())
     core.extend(_check_slot_limits())
     core.extend(_check_slot_keys())
+    core.extend(_guarded("brokered links", lambda: _check_brokered_links(install)))
     core.extend(_check_slot_services())
     core.extend(_guarded("agent fence", lambda: _check_agent_fence(install=path)))
     for r in core:
@@ -1800,6 +1801,151 @@ def _guarded(name: str, build: Any) -> list[CheckResult]:
         return [CheckResult(name, False, f"could not be built ({type(exc).__name__}: {exc})",
                             "This is a defect in `levain doctor`; report it.")]
     return out if isinstance(out, list) else [out]
+
+
+@dataclass(frozen=True)
+class _ApiKeyLink:
+    """One standing api_key agent link as the brokered rows judge it: its id, the per-run dollars it signed
+    (micro-dollars) and the model of the role it pins (``None`` when the role could not be read)."""
+    link_id: str
+    run_micros: int
+    model: str | None
+
+
+def _read_api_key_links(install: Path, *, host: str, now: Any = None) -> list[_ApiKeyLink]:
+    """Every unexpired, unrevoked ``api_key`` agent link of the install's authority log, read-only (the replay the
+    authority-signers row makes), each with the model of the role its ``role_hash`` pins in the agent store. An
+    install with no cockpit journal has none. Raises on a log or store that cannot be read: the caller says so."""
+    from datetime import datetime, timezone
+
+    from levain import authority as auth
+    from levain.agents import role as _role
+    from levain.agents.store import open_agent_store_view
+    from levain.cockpit.firejournal import DB_NAME
+    from levain.graduation_policy import AuthorityCoverage
+    from levain.slot import root_tree
+
+    root = install / ".levain" / "cockpit"
+    if not (root / DB_NAME).is_file():
+        return []
+    signers = root_tree.authority_signers_path(host)   # type: ignore[arg-type]
+    try:
+        state = AuthorityCoverage(root, allowed_signers=signers, store_id="doctor").replay(check_anchor=False)
+    except auth.NotInitialised:
+        return []
+    when = now if now is not None else datetime.now(timezone.utc)
+    found = []
+    for gid, grant in sorted(state.policy.grants.items()):
+        if (not auth.agent_link(grant) or auth.agent_link_terms(grant)[0] != "api_key"
+                or not auth.agent_link_arms(state, gid, now=when)):
+            continue
+        found.append((gid, grant["budget_run_usd_micros"], grant["role_hash"]))
+    if not found:
+        return []
+    view = open_agent_store_view()
+    out = []
+    with view.read() as conn:
+        for gid, micros, role_hash in found:
+            row = conn.execute("SELECT name, version, spec FROM agent_roles WHERE role_hash = ?", (role_hash,)).fetchone()
+            model: str | None = None
+            if row is not None:
+                try:
+                    model = _role._check_row(row[0], role_hash, row[1], row[2]).get("model") or None
+                except _role.RoleError:
+                    model = None
+            out.append(_ApiKeyLink(gid, micros, model))
+    return out
+
+
+def _read_run_ceiling(store: Path, owner: int = 0) -> int:
+    """The signed per-run dollar ceiling CONTROL's mint holds a share to: ``max_reserved_microdollars_per_run`` of
+    ``L/policy/dispatch_ceiling``, read by the mint's own reader (``levain.slot.tickets.read_ceiling``)."""
+    from levain.slot import tickets as T
+
+    return T.read_ceiling(store / "policy" / "dispatch_ceiling", owner).max_reserved_microdollars_per_run
+
+
+def _read_active_routes(store: Path) -> Any:
+    """The active dispatch route map (``routemaps.Checked``) as CONTROL's start pass would load it, WRITING NOTHING;
+    ``None`` before the first map. A head that does not verify raises ``Refused``."""
+    from levain.slot import routemaps
+
+    return routemaps.ControlRoutes(store / "routes").verified_head()[1]
+
+
+def _dollars_text(micros: int) -> str:
+    return f"${micros / 1_000_000:.2f}" if micros % 10_000 == 0 else f"${micros / 1_000_000:.6f}".rstrip("0")
+
+
+def _check_brokered_links(install: Path, *, host: str | None = None, store: Path | None = None,
+                          links: Any = None, ceiling: Any = None, routes: Any = None,
+                          ceiling_owner: int = 0) -> list[CheckResult]:
+    """One row per standing api_key agent link: its signed per-run dollars against the ceiling CONTROL's mint holds a
+    share to (a link above it is refused ``ticket-ceiling:max_reserved_microdollars_per_run`` at every fire), and
+    whether the active route map serves its model by one brokered route (the rule of ``ROUTE-RESOLVE``,
+    ``routemaps.brokered_route_for``). Reads only. A read that fails is a WARN row naming it, never a crash.
+    ``links``/``ceiling``/``routes``/``ceiling_owner``: a test's seams (each a zero-argument callable standing for its reader)."""
+    from levain.slot import Refused, layout, routemaps
+
+    name = "brokered links"
+    if host is None:
+        host = "darwin" if sys.platform == "darwin" else "linux"
+    store = store if store is not None else layout.STORE.get(host)
+    try:
+        found = (links or (lambda: _read_api_key_links(install, host=host)))()
+    except Exception as exc:  # noqa: BLE001 - an unreadable log or store is a row, never a crash
+        return [CheckResult(name, True, f"the standing api_key links could not be read ({type(exc).__name__}: {exc}), "
+                            "so their per-run dollars and models were not checked",
+                            "The cockpit authority row says whether the authority log is readable.", warn=True)]
+    if not found:
+        return [CheckResult(name, True, "no standing api_key agent link, so no brokered per-run figure or model to check",
+                            neutral=True)]
+    if store is None:
+        return [CheckResult(name, True, f"{len(found)} standing api_key link(s), but this host has no isolation store "
+                            "to read the ceiling and route map from", warn=True)]
+    limit: int | None = None
+    limit_why = ""
+    try:
+        limit = (ceiling or (lambda: _read_run_ceiling(store, ceiling_owner)))()
+    except Exception as exc:  # noqa: BLE001
+        limit_why = f"{type(exc).__name__}: {getattr(exc, 'name', '') or exc}"
+    active: Any = None
+    routes_why = ""
+    try:
+        active = (routes or (lambda: _read_active_routes(store)))()
+    except Exception as exc:  # noqa: BLE001
+        routes_why = f"{type(exc).__name__}: {getattr(exc, 'name', '') or exc}"
+    rows: list[CheckResult] = []
+    for link in found:
+        label = f"{name} ({link.link_id})"
+        if limit is None:
+            rows.append(CheckResult(label, True, f"per-run {_dollars_text(link.run_micros)}; the ceiling could not be "
+                                    f"read ({limit_why}), so it was not compared",
+                                    "`levain dispatch` set-ceiling signs it; the slot install's ceiling row says why it "
+                                    "is unreadable.", warn=True))
+        elif link.run_micros > limit:
+            rows.append(CheckResult(label, False, f"per-run {_dollars_text(link.run_micros)} vs ceiling "
+                                    f"{_dollars_text(limit)}: every fire would be refused at the mint",
+                                    "Raise the dispatch ceiling, or revoke the link and sign one at or under it."))
+        else:
+            rows.append(CheckResult(label, True, f"per-run {_dollars_text(link.run_micros)} vs ceiling "
+                                    f"{_dollars_text(limit)}"))
+        if link.model is None:
+            rows.append(CheckResult(f"{label} route", True, "the model of the role this link pins could not be read, so "
+                                    "its route was not checked", warn=True))
+        elif routes_why:
+            rows.append(CheckResult(f"{label} route", True, f"the active route map could not be read ({routes_why}), "
+                                    f"so a route for {link.model} was not checked", warn=True))
+        else:
+            try:
+                route = routemaps.brokered_route_for(active, link.model)
+            except Refused as exc:
+                rows.append(CheckResult(f"{label} route", False, f"no brokered route for model {link.model} "
+                                        f"({exc.name}): every fire would be refused", "Sign a dispatch route map with "
+                                        "exactly one brokered route that serves the model."))
+            else:
+                rows.append(CheckResult(f"{label} route", True, f"model {link.model} is served by brokered route {route}"))
+    return rows
 
 
 def _check_slot_keys(*, host: str | None = None, store: Path | None = None, running: Any = None,
