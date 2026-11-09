@@ -1133,6 +1133,9 @@ class Seams:
     allow_dir: Optional[Path] = None
     #: the bytes of the ended session's ``.claude/settings.local.json`` from root's retained tree (None = none read)
     retained_allow: Optional[Callable[[str], Optional[bytes]]] = None
+    #: row 165: what a signed yes to a slot rule is judged by (:class:`slot_allow.Judge`); None = the cockpit's authority
+    #: log and signing queue as the consent directory names them
+    allow_judge: Optional[Any] = None
 
     def __post_init__(self) -> None:
         if self.helper is None:
@@ -1670,17 +1673,24 @@ class Supervisor:
 
         from levain.slot import slot_allow
 
+        qdir = Path(self.s.allow_dir)                                          # type: ignore[arg-type]
         try:
-            slot_allow.apply_answered(Path(self.s.allow_dir), path)           # type: ignore[arg-type]
-            rules = slot_allow.rules_of(path)
+            from levain.consent.questions import QuestionStore
+
+            judge = self.s.allow_judge or slot_allow.default_judge(qdir)
+            slot_allow.apply_answered(qdir, path, judge=judge)
+            rules, skipped = slot_allow.carried(path, judge, slot_allow.store_id_of(QuestionStore(qdir)))
         except slot_allow.AllowRefused as e:
             self.say(f"slot allow rules not read ({e}): this session asks for everything the repo does not allow")
             return frozen
         except Exception as e:   # noqa: BLE001 - the rules are a convenience: the launch goes on without them
             self.say(f"slot allow rules not read ({type(e).__name__})")
             return frozen
+        for rule, why in skipped:
+            self.say(f"slot allow rule not carried: {rule} ({why})")
         if rules:
-            self.say(f"slot allow rules read from {path} (slot sessions only): {len(rules)}")
+            self.say(f"slot allow rules read from {path} (slot sessions only, each re-verified against the authority "
+                     f"log): {len(rules)}")
         return dataclasses.replace(frozen, settings=slot_allow.merge_into_frozen(frozen.settings, rules))
 
     def _read_allow(self, session: str) -> Optional[bytes]:
