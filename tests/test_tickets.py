@@ -911,7 +911,13 @@ def test_expired_ticket_no_longer_references_its_generation(rig):
     assert rig.ask("RUN-TICKET-CANCEL", ticket=one)["refused"] == "attempt-closed"
 
 
-# ---- the retention horizon on a ran executor ticket's mint line -------------------------------------------------------
+
+# ---- the retention margin on a released run's mint line (row 158; L3 r1: codex HIGH 1 + HIGH 2) ----------------------
+
+S_A, S_B, S_C = "s-" + "a" * 16, "s-" + "b" * 16, "s-" + "c" * 16
+#: past the margin counted from a release, and past the mint-age horizon round 1 counted from the mint
+PAST = T.RAN_FACTS_MARGIN_S + T.TICKET_UNUSED_S + 1
+
 
 def _ran_and_released(rig, attempt: str, session: str, idx: int, **kw) -> str:
     """An executor ticket minted, bound with a slot and released by a sync that reports its lease reusable."""
@@ -925,45 +931,112 @@ def _mint_attempts(rig) -> set:
     return {x["attempt_id"] for x in rig.lines() if x["op"] == "mint"}
 
 
-def test_compaction_drops_a_ran_executor_mint_line_past_the_horizon_and_keeps_its_tombstone(rig):
-    old = _ran_and_released(rig, "a-old", "s-" + "a" * 16, 0, run_index=0)
-    rig.clock.t += T.RAN_FACTS_HORIZON_S + 1                                # past the horizon
+def _aged_out(rig) -> None:
+    """A restart (its compaction records the close), the margin passes, then two restarts: the first drops the mint
+    line, the second rebuilds a store that never held its facts in memory."""
     rig.restart()
+    rig.clock.t += PAST
+    rig.restart()
+    rig.restart()
+
+
+def test_compaction_drops_a_released_run_mint_line_past_the_margin_and_keeps_its_tombstone(rig):
+    old = _ran_and_released(rig, "a-old", S_A, 0)
+    _aged_out(rig)
     assert "a-old" not in _mint_attempts(rig)                               # the facts aged out ...
-    rig.restart()                                                           # (this process still holds them in memory)
-    assert [x for x in rig.lines() if x["op"] == "tombstone"][0]["ticket"] == old   # ... the replay guard did not
+    [tomb] = [x for x in rig.lines() if x["op"] == "tombstone"]
+    assert tomb["ticket"] == old and tomb["state"] == "released"            # ... the replay guard did not
     assert rig.ask("RUN-TICKET-FACTS", job_id="job-1", run_index=0)["refused"] == "ticket-unknown"
-    assert refused(rig.mint("a-old", run_index=0)) == "attempt-closed"
+    assert refused(rig.mint("a-old")) == "attempt-closed"
 
 
-def test_compaction_keeps_a_ran_executor_mint_line_inside_the_horizon(rig):
-    _ran_and_released(rig, "a-in", "s-" + "a" * 16, 0, run_index=0)
-    rig.clock.t += T.RAN_FACTS_HORIZON_S - 60                               # still inside it
+def test_compaction_keeps_a_released_run_mint_line_inside_the_margin(rig):
+    _ran_and_released(rig, "a-in", S_A, 0)
+    rig.restart()
+    rig.clock.t += T.RAN_FACTS_MARGIN_S - 60                                # still inside it
+    rig.restart()
     rig.restart()
     assert "a-in" in _mint_attempts(rig)
     assert rig.ask("RUN-TICKET-FACTS", job_id="job-1", run_index=0)["ok"] is True
 
 
-def test_compaction_keeps_the_mint_line_of_a_still_bound_ticket_past_the_horizon(rig):
-    one = ticket_of(rig.mint("a-live", run_index=0))
-    rig.tickets.bind(one, "s-" + "a" * 16, ("egress", 0, 1))               # bound, never released: still live
-    rig.clock.t += 10 * T.RAN_FACTS_HORIZON_S
+def test_the_margin_is_strict_at_its_boundary(rig):
+    _ran_and_released(rig, "a-edge", S_A, 0)
+    rig.restart()                                                           # the close recorded at this clock
+    rig.clock.t += T.RAN_FACTS_MARGIN_S
+    rig.restart()
+    assert "a-edge" not in _mint_attempts(rig)
+
+
+def test_the_margin_runs_from_the_release_not_from_the_mint(rig):
+    # codex HIGH 1: a brokered run carries no deadline_s, so it may stay bound past any mint-age horizon; its facts
+    # must outlive its release by the margin, however long it ran
+    one = ticket_of(rig.mint("a-long"))
+    rig.tickets.bind(one, S_A, ("egress", 0, 1))
+    rig.clock.t += PAST                                                     # bound longer than the margin
+    assert rig.tickets.release_ended({("egress", 0): (1, "reusable")}) == [S_A]
+    rig.restart()
+    rig.restart()
+    assert rig.ask("RUN-TICKET-FACTS", job_id="job-1", run_index=0)["ok"] is True
+    rig.clock.t += T.RAN_FACTS_MARGIN_S - 60
+    rig.restart()
+    rig.restart()
+    assert rig.ask("RUN-TICKET-FACTS", job_id="job-1", run_index=0)["ok"] is True
+    rig.clock.t += 120
+    rig.restart()
+    rig.restart()
+    assert rig.ask("RUN-TICKET-FACTS", job_id="job-1", run_index=0)["refused"] == "ticket-unknown"
+
+
+def test_an_aged_out_run_still_makes_a_later_run_of_its_key_ambiguous(rig):
+    # codex HIGH 2: the run's facts age out, its (job_id, run_index) does not: a second run of the same key is still
+    # refused ticket-ambiguous, never answered with the second run's facts
+    _ran_and_released(rig, "a-one", S_A, 0)
+    _aged_out(rig)
+    assert "a-one" not in _mint_attempts(rig)
+    _ran_and_released(rig, "a-two", S_B, 1)
+    _ran_and_released(rig, "a-three", S_C, 2, run_index=1)                 # another run of the job: its own answer
+    rig.restart()
+    rig.restart()
+    assert rig.ask("RUN-TICKET-FACTS", job_id="job-1", run_index=0)["refused"] == "ticket-ambiguous"
+    assert rig.ask("RUN-TICKET-FACTS", job_id="job-1", run_index=1)["ok"] is True
+    rig.clock.t += PAST                                                     # every line aged out: still refused
+    rig.restart()
+    rig.restart()
+    assert _mint_attempts(rig) == set()
+    assert rig.ask("RUN-TICKET-FACTS", job_id="job-1", run_index=0)["refused"] == "ticket-ambiguous"
+    assert rig.ask("RUN-TICKET-FACTS", job_id="job-1", run_index=1)["refused"] == "ticket-unknown"
+
+
+def test_a_tombstone_whose_run_key_differs_from_its_mint_line_refuses_the_start(rig):
+    _ran_and_released(rig, "a-k", S_A, 0)
+    rig.restart()
+    rig.control.stop()
+    lines = rig.lines()
+    for x in lines:
+        if x["op"] == "tombstone":
+            x["run_index"] = 5
+    (rig.sdir / T.JOURNAL).write_bytes(b"".join(canon.canonical_bytes(x) + b"\n" for x in lines))
+    with pytest.raises(Refused) as e:
+        rig.restart()
+    assert e.value.name == "journal-inconsistent"
+
+
+def test_compaction_keeps_the_mint_line_of_a_still_bound_ticket_past_the_margin(rig):
+    one = ticket_of(rig.mint("a-live"))
+    rig.tickets.bind(one, S_A, ("egress", 0, 1))                            # bound, never released: still live
+    rig.clock.t += 10 * PAST
     rig.tickets.start()                                                     # no has_session: every binding stands
     assert "a-live" in _mint_attempts(rig)
     assert rig.ask("RUN-TICKET-STATUS", attempt_id="a-live")["state"] == "bound"
 
 
-def test_the_horizon_is_the_unused_lifetime_plus_the_margin_and_a_ticket_deadline_widens_it():
-    assert T.RAN_FACTS_HORIZON_S == T.TICKET_UNUSED_S + T.RAN_FACTS_MARGIN_S
-    plain = T.Ticket("t", "a", "d", {"kind": "executor"}, 0, "2026-01-01")
-    wide = T.Ticket("t", "a", "d", {"kind": "executor", "deadline_s": 90 * 86400}, 0, "2026-01-01")
-    assert T.TicketStore._facts_horizon_s(plain) == T.RAN_FACTS_HORIZON_S
-    assert T.TicketStore._facts_horizon_s(wide) == T.RAN_FACTS_HORIZON_S + 90 * 86400
-
-
-def test_journal_max_still_binds_after_the_horizon(rig, monkeypatch):
-    _ran_and_released(rig, "a-in", "s-" + "a" * 16, 0, run_index=0)
-    monkeypatch.setattr(T, "JOURNAL_MAX", 16)
+def test_journal_max_still_binds_after_the_margin(rig, monkeypatch):
+    _ran_and_released(rig, "a-in", S_A, 0)
+    _aged_out(rig)
+    data = (rig.sdir / T.JOURNAL).read_bytes()
+    assert data and "a-in" not in _mint_attempts(rig)                       # only the tombstone is left ...
+    monkeypatch.setattr(T, "JOURNAL_MAX", len(data) - 1)                    # ... and it still counts against the bound
     with pytest.raises(Refused) as e:
         rig.restart()
     assert e.value.name == "journal-inconsistent"
