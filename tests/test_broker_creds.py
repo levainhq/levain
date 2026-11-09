@@ -657,3 +657,68 @@ def test_p7_the_sweep_matches_exactly_the_generated_temp_names(cred_dir):
     _commit_now(cred_dir, _fields())
     assert not ours.exists()
     assert all((cred_dir / n).exists() for n in never_ours)
+
+
+def _fullfsync_raising(monkeypatch, code: int) -> list:
+    """Darwin's path with `F_FULLFSYNC` answering `code`; the list records plain `os.fsync` calls."""
+    plain: list = []
+    monkeypatch.setattr(C.sys, "platform", "darwin")
+    monkeypatch.setattr(C.fcntl, "F_FULLFSYNC", 51, raising=False)
+
+    def fake_fcntl(fd, op, *a):
+        raise OSError(code, os.strerror(code))
+
+    monkeypatch.setattr(C.fcntl, "fcntl", fake_fcntl)
+    monkeypatch.setattr(C.os, "fsync", lambda fd: plain.append(fd))
+    return plain
+
+
+def test_full_fsync_propagates_eio_and_does_not_fall_back(monkeypatch):
+    plain = _fullfsync_raising(monkeypatch, errno.EIO)
+    with pytest.raises(OSError) as ei:
+        C.full_fsync(7)
+    assert ei.value.errno == errno.EIO
+    assert plain == []
+
+
+@pytest.mark.parametrize("code", [errno.ENOTSUP, errno.EOPNOTSUPP, errno.EINVAL, errno.ENOTTY, errno.ENOSYS,
+                                  errno.ENODEV])
+def test_full_fsync_falls_back_to_fsync_when_the_filesystem_has_no_fullfsync(monkeypatch, code):
+    plain = _fullfsync_raising(monkeypatch, code)
+    C.full_fsync(7)
+    assert plain == [7]
+
+
+def test_commit_with_eio_from_the_real_flush_is_commit_failed_and_leaves_the_old_file(cred_dir, monkeypatch):
+    first = _commit_now(cred_dir, _fields("sk-old"))
+    _fullfsync_raising(monkeypatch, errno.EIO)
+    with pytest.raises(C.CommitFailed):
+        _commit_now(cred_dir, _fields("sk-new"))
+    monkeypatch.undo()
+    assert C.parse((cred_dir / f"{NAME}.json").read_bytes(), NAME).rev == first.rev
+    assert sorted(p.name for p in cred_dir.iterdir()) == [".lock", f"{NAME}.json"]
+
+
+def test_commit_with_eio_only_from_the_directory_flush_is_committed_not_durable(cred_dir, monkeypatch):
+    calls = []
+
+    def one_file_then_eio(fd):
+        calls.append(fd)
+        if len(calls) > 1:
+            raise OSError(errno.EIO, "EIO")
+
+    out = _commit_now(cred_dir, _fields("sk-new"), seams=C.WriteSeams(fsync_file=one_file_then_eio,
+                                                                      fsync_dir=_eio))
+    assert (out.result, out.durable) == (C.COMMITTED, False)
+
+
+def test_remove_with_eio_from_the_real_directory_flush_is_removed_not_durable(cred_dir, monkeypatch):
+    _commit_now(cred_dir, _fields())
+    fd = _dir_fd(cred_dir)
+    try:
+        _fullfsync_raising(monkeypatch, errno.EIO)
+        out = C.remove(fd, NAME)
+    finally:
+        monkeypatch.undo()
+        os.close(fd)
+    assert (out.result, out.durable) == (C.REMOVED, False)
