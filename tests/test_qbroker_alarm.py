@@ -8,6 +8,8 @@ from __future__ import annotations
 
 import io
 import json
+import logging
+import math
 import os
 from datetime import timedelta
 
@@ -18,7 +20,8 @@ from levain.consent import broker_client
 from levain.consent.broker_client import BrokerClient, BrokerError
 from levain.qbroker import broker as qbroker
 from levain.qbroker import operator
-from levain.qbroker.store import ALARM_LOG, ROW_MAX, QueueStore
+from levain.contracts.canon import canonical_bytes
+from levain.qbroker.store import ALARM_LOG, ALARM_LOG_MAX, QueueStore
 from levain.slot import hook_run
 import tests.test_qbroker as base
 from tests.test_qbroker import NOW, connect, listen, make_broker
@@ -86,19 +89,94 @@ def test_a_flood_of_distinct_alarms_is_capped_by_the_slots_bucket(L, resolver, c
     assert len(records(L)) == qbroker.ALARM_BURST + 1
 
 
-def test_the_alarm_log_stays_bounded_on_disk(L, resolver, clock):
-    mono = {"t": 1000.0}
-    b = make_broker(L, resolver, clock, monotonic=lambda: mono["t"])
-    reason = "x" * qbroker.ALARM_REASON_MAX
-    for i in range(600):
-        mono["t"] += 1.0 / qbroker.ALARM_RATE
-        assert alarm(b, reason=reason[:-6] + "%06d" % i)["ok"] is True
+def test_the_alarm_log_stays_bounded_on_disk(L):
+    store = QueueStore(L / "queue")
+    reason = "\U0001F600" * qbroker.ALARM_REASON_MAX
+    line = len(canonical_bytes(_record(reason, 0))) + 1
+    for i in range(2 * ALARM_LOG_MAX // line + 50):
+        store.append_alarm(_record(reason, i))
     req = L / "queue" / "requests"
-    assert (req / ALARM_LOG).stat().st_size <= ROW_MAX
-    assert (req / (ALARM_LOG + ".1")).stat().st_size <= ROW_MAX
+    assert (req / ALARM_LOG).stat().st_size <= ALARM_LOG_MAX
+    assert (req / (ALARM_LOG + ".1")).stat().st_size <= ALARM_LOG_MAX
     assert not (req / (ALARM_LOG + ".2")).exists()
     kept = records(L)
-    assert kept and kept[-1]["reason"].endswith("%06d" % 599)
+    assert kept and kept[-1]["n"] == i
+
+
+def _record(reason, n, session="s-" + "f" * 62):
+    return {"format": qbroker.ALARM_FORMAT, "at": "2026-11-09T00:00:00Z", "slot": {"class": "egress", "index": 32},
+            "session": session, "run_id": "r" * 64, "kind": "config-change", "reason": reason, "n": n}
+
+
+def test_every_slots_budget_fits_the_log_at_the_largest_record():
+    from levain.slot.grammar import MAX_SLOTS
+    biggest = len(canonical_bytes(_record("\U0001F600" * qbroker.ALARM_REASON_MAX, 10**6))) + 1
+    summary = len(canonical_bytes({"format": qbroker.ALARM_FORMAT, "at": "2026-11-09T00:00:00Z",
+                                   "slot": {"class": "egress", "index": 32}, "session": "s-" + "f" * 62,
+                                   "suppressed": 10**9})) + 1
+    most_suppressed = qbroker.ALARM_RATE * qbroker.ALARM_BUDGET_WINDOW + qbroker.ALARM_BURST
+    summaries = int(math.log2(most_suppressed)) + 1                # one at each doubling of the count
+    per_slot = qbroker.ALARM_SLOT_BUDGET * biggest + summaries * summary
+    # the newest ALARM_LOG_MAX - biggest bytes always survive a roll
+    assert MAX_SLOTS * per_slot <= ALARM_LOG_MAX - biggest
+
+
+def test_bad_cap_frames_never_spend_the_real_alarms_tokens(L, broker, caplog):
+    caplog.set_level(logging.WARNING, logger="levain.qbroker")
+    for i in range(50):
+        assert alarm(broker, cap=f"bad-{i}")["refused"] == "cap-unknown"
+    assert alarm(broker)["ok"] is True
+    assert len(records(L)) == 1
+    assert sum("could not be resolved" in r.getMessage() for r in caplog.records) == 1
+
+
+def test_a_repeated_alarm_spends_no_token(L, resolver, clock):
+    b = make_broker(L, resolver, clock, monotonic=lambda: 1000.0)
+    for _ in range(20):
+        assert alarm(b)["ok"] is True
+    for i in range(qbroker.ALARM_BURST - 1):
+        assert alarm(b, reason=f"r{i}")["ok"] is True
+    assert len(records(L)) == qbroker.ALARM_BURST
+
+
+def test_one_slots_flood_never_evicts_another_slots_alarm_nor_its_own_first(L, resolver, clock):
+    mono = {"t": 1000.0}
+    b = make_broker(L, resolver, clock, monotonic=lambda: mono["t"])
+    assert alarm(b, reason="first")["ok"] is True
+    pad = "x" * (qbroker.ALARM_REASON_MAX - 6)
+    flood = 600
+    for i in range(flood):
+        mono["t"] += 1.0 / qbroker.ALARM_RATE
+        assert alarm(b, reason=pad + "%06d" % i)["ok"] is True
+    assert alarm(b, slot=2, cap="cap-two", reason="second slot")["ok"] is True
+    got = records(L)
+    reasons = [r.get("reason") for r in got]
+    assert "first" in reasons and "second slot" in reasons
+    assert len([r for r in got if r.get("session") == "sess-a" and "reason" in r]) == qbroker.ALARM_SLOT_BUDGET
+    suppressed = 1 + flood - qbroker.ALARM_SLOT_BUDGET
+    shown = 1 << int(math.log2(suppressed))                      # the last doubling the log carries
+    assert [r["suppressed"] for r in got if "suppressed" in r][-1] == shown
+    [row] = doctor._check_slot_alarms(store=L, now=clock["fn"]())
+    assert row.warn and f"at least {shown} more suppressed" in row.detail
+
+
+def test_doctor_says_when_the_alarm_log_is_not_readable_by_this_user(L, broker, clock):
+    alarm(broker)
+    log_path = L / "queue" / "requests" / ALARM_LOG
+    log_path.chmod(0)
+    try:
+        [row] = doctor._check_slot_alarms(store=L, now=clock["fn"]())
+    finally:
+        log_path.chmod(0o640)
+    assert row.ok and not row.warn
+    assert "not readable by this user" in row.detail and "levain-queue" in row.detail
+    assert "Look at" not in (row.hint or "")
+
+
+def test_doctor_says_there_is_no_alarm_log_when_the_broker_never_made_one(tmp_path):
+    (tmp_path / "queue").mkdir()
+    [row] = doctor._check_slot_alarms(store=tmp_path, now=NOW)
+    assert not row.warn and "no alarm log exists yet" in row.detail and "none in the last" not in row.detail
 
 
 @pytest.mark.parametrize("over", [
@@ -183,7 +261,7 @@ def test_a_config_change_whose_alarm_cannot_be_sent_is_still_blocked_and_says_so
 
 def test_the_alarms_wait_ends_well_inside_the_hooks_own_timeout():
     from levain.slot.hook_templates import CONFIG_TIMEOUT
-    assert broker_client.IO_TIMEOUT <= hook_run.ALARM_TIMEOUT < CONFIG_TIMEOUT / 2
+    assert hook_run.ALARM_TIMEOUT < CONFIG_TIMEOUT / 2
 
 
 def test_outside_a_slot_the_guard_sends_no_alarm(monkeypatch):
