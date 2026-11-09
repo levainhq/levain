@@ -32,28 +32,29 @@ def test_default_seams_pass_render_check_facts(monkeypatch):
     ctx = types.SimpleNamespace(seams=H.Seams(host="darwin"), env={}, store=None)
     got = H.render_facts(ctx, alloc, blob)
     rd.check_facts(blob, got)
-    assert set(got.hook_templates) == BOTH | {"levain_config"}     # the ConfigChange alarm rides every Claude session
+    assert set(got.hook_templates) == BOTH | {"levain_config", "levain_repo_filter"}   # both ride every Claude session
 
 
 def test_a_blob_naming_no_hook_gets_none_and_an_explicit_empty_seam_is_still_missing():
     blob, _ = egress(hooks=BOTH)
-    assert set(H.hook_templates_for(H.Seams(host="linux"), egress()[0])) == {"levain_config"}
+    assert set(H.hook_templates_for(H.Seams(host="linux"), egress()[0])) == {"levain_config", "levain_repo_filter"}
     assert H.hook_templates_for(H.Seams(host="linux", hook_templates={}), blob) == {}
 
 
 @pytest.mark.parametrize("host", ["darwin", "linux"])
 def test_templates_shape(host):
     t = hook_templates(host)
-    assert {k: v.event for k, v in t.items()} == EVENTS == {"levain_gate": "PreToolUse",
-                                                           "levain_queue": "PermissionRequest",
-                                                           "levain_config": "ConfigChange"}
+    assert {k: v.event for k, v in t.items() if k != "levain_repo_filter"} == EVENTS == {
+        "levain_gate": "PreToolUse", "levain_queue": "PermissionRequest", "levain_config": "ConfigChange"}
     for name, tpl in t.items():
         assert tpl.matcher is None                      # every tool: a matcher can only make the gate look at less
         text = tpl.body.decode()
         assert text.startswith("#!%s %s\n" % (ROOT_PYTHON[host], PY_FLAGS))
-        assert "run(%r)" % name in text and "code = 2\n" in text and text.endswith("sys.exit(code)\n")
+        call = "run(%r, sys.argv[1:])" % name if name == "levain_repo_filter" else "run(%r)" % name
+        assert call in text and "code = 2\n" in text and text.endswith("sys.exit(code)\n")
         assert tpl.timeout == (30 if name == "levain_config" else 870)
         assert ("import config_guard as run" in text) == (name == "levain_config")
+        assert ("import repo_filter as run" in text) == (name == "levain_repo_filter")
 
 
 def test_the_rendered_settings_wire_both_hooks():
