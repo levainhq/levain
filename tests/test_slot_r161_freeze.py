@@ -474,9 +474,16 @@ def test_a_filter_that_is_stopped_kills_the_repo_command_and_denies(tmp_path, si
     root = os.path.dirname(os.path.dirname(os.path.abspath(hook_run.__file__)))
     code = ("import io,sys; sys.path.insert(0, %r); from levain.slot import hook_run as H; "
             "sys.exit(H.repo_filter('f', ['PreToolUse', '30', sys.argv[1]], stdin=io.BytesIO(b'{}')))" % root)
-    p = subprocess.Popen([sys.executable, "-c", code, f"/bin/sleep 2; touch {shlex.quote(str(marker))}"],
+    ready = tmp_path / "ready"
+    # the repo command runs only after the filter has installed its stop handlers, so its touching `ready` is the
+    # readiness signal: the stop never lands on a filter that has no handler yet
+    p = subprocess.Popen([sys.executable, "-c", code,
+                          f"touch {shlex.quote(str(ready))}; /bin/sleep 2; touch {shlex.quote(str(marker))}"],
                          stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-    time.sleep(1)
+    deadline = time.monotonic() + 10
+    while not ready.exists() and time.monotonic() < deadline:
+        time.sleep(0.02)
+    assert ready.exists()
     p.send_signal(getattr(signal, sig))
     _o, e = p.communicate(timeout=10)
     assert p.returncode == hook_run.REFUSED_EXIT and failed(e.decode())
