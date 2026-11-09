@@ -315,6 +315,7 @@ LAZY_SITES = {
     'levain/dispatch/contract.py::git_env::from levain.launch import child_env': 'root',
     # root: the read set's ingest (``_verify_in``) runs in the dispatch run server for a workspace upload (``levain.slot.workspace``, levain 34, W1); each of these is a step of it
     'levain/dispatch/readset.py::_layer_check::from levain.slot import Refused': 'root',
+    'levain/dispatch/readset.py::_layer_check::from levain.slot.render import freeze_repo_settings': 'root',
     'levain/dispatch/readset.py::_layer_check::from levain.slot.supervisor import check_repo_layer, repo_layer_docs': 'root',
     'levain/dispatch/readset.py::_limits::from levain.slot.stage import BUNDLE_CAP, STAGE_DEADLINE_S': 'root',
     'levain/dispatch/readset.py::_write_attributes::from levain.slot import write_all': 'root',
@@ -509,6 +510,8 @@ LAZY_SITES = {
     'levain/slot/supervisor.py::Seams.__post_init__::from levain.slot.control_client import ControlClient': 'operator',
     # operator: ``Supervisor._confirm_identity`` is the interactive supervisor's own code, the operator uid's process; the dispatch run server imports the module for its names
     'levain/slot/supervisor.py::Supervisor._confirm_identity::from levain.slot.identity import BASELINE_WRITTEN, NOT_A_CHECK': 'operator',
+    # operator: ``Supervisor.run`` is the interactive supervisor's own code, the operator uid's process; the dispatch run server imports the module for its names
+    'levain/slot/supervisor.py::Supervisor.run::from levain.slot.render import freeze_repo_settings': 'operator',
     # operator: ``Supervisor._leased`` is the interactive supervisor's own code, the operator uid's process; the dispatch run server imports the module for its names
     'levain/slot/supervisor.py::Supervisor._leased::from levain.slot.stage import make_bundle': 'operator',
     # root: ``_git`` runs the repo-layer check's git, and the dispatch run server runs that check on a workspace snapshot (``readset._layer_check`` <- ``workspace``, levain 34, W1); its target is already a closure member
