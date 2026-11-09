@@ -673,6 +673,8 @@ def test_repo_env_vendor_namespace_is_default_deny():
         "CLAUDE_CODE_DISABLE_BACKGROUND_TASKS": deny,
         # L3 r3 complement: the auto-mode permission classifier's model, and prompt text sent to Claude on resume
         "CLAUDE_CODE_AUTO_MODE_MODEL": deny, "CLAUDE_CODE_RESUME_PROMPT": deny,
+        # row 168: the vendor's permission-modes page names this variable as choosing the classifier model too
+        "ANTHROPIC_DEFAULT_SONNET_MODEL": deny,
         # outside the namespace: a provider prefix, or a credential or endpoint suffix on any stem
         "AWS_PROFILE": "prefix AWS_", "GOOGLE_APPLICATION_CREDENTIALS": "prefix GOOGLE_",
         "VERTEX_REGION_NEXT_MODEL": "prefix VERTEX_", "OPENAI_ORG_ID": "prefix OPENAI_",
@@ -798,9 +800,10 @@ def test_repo_env_rule_over_the_vendor_reference():
                  "CLAUDE_CODE_CLIENT_CERT", "CLAUDE_CODE_CERT_STORE", "CLAUDE_CODE_PROVIDER_MANAGED_BY_HOST",
                  "HTTPS_PROXY", "CLAUDE_CODE_IDE_HOST_OVERRIDE", "CLAUDE_CODE_GATEWAY_HINT_HEADERS"):
         assert table["verdicts"][must] == "refused", must
-    for must in ("ANTHROPIC_MODEL", "ANTHROPIC_DEFAULT_SONNET_MODEL", "CLAUDE_CODE_MAX_OUTPUT_TOKENS",
+    for must in ("ANTHROPIC_MODEL", "CLAUDE_CODE_MAX_OUTPUT_TOKENS",
                  "DISABLE_TELEMETRY", "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC", "DEBUG"):
         assert table["verdicts"][must] == "allowed", must
+    assert table["verdicts"]["ANTHROPIC_DEFAULT_SONNET_MODEL"] == "refused"
 
 
 def test_vendor_env_names_module_is_stdlib_data():
