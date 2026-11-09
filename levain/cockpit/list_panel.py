@@ -135,7 +135,10 @@ def _wake_facets(day: date, today: date, surface: str, target: Any, disposition:
             "wake_line": f"wakes {band_view.later_words(wake_day, today.isoformat())} \u2192 {_lands(surface, target, disposition)}"}
 
 
-def _spore_part(source: SubstrateSource, ctx: ReadContext, seen: list[bool], *, apply_hold: bool = True) -> _Part:
+def _spore_part(source: SubstrateSource, ctx: ReadContext, seen: list[bool], *, apply_hold: bool = True,
+                ringing: frozenset[str] = frozenset()) -> _Part:
+    """``ringing`` = the band rows the band read returned: an open agenda whose stamp names one of them is that row's
+    intention, drawn once, as the band row, so its spore row is left out. A write still finds it (``list_read_one`` passes none)."""
     out = _Part()
     path = source.anneal.spores_json
     if not path.exists():
@@ -165,6 +168,8 @@ def _spore_part(source: SubstrateSource, ctx: ReadContext, seen: list[bool], *, 
     later: list[RowIn] = []
     for s in items:
         raw = steer.get(s.id, {})
+        if ringing and spores.ringing_ref(raw, ringing):
+            continue
         surface = _surface(raw, s.disposition) if raw else "spore"
         d = next_date(s.next)
         target = raw.get("target") if isinstance(raw.get("target"), str) else None
@@ -336,8 +341,9 @@ def list_reader(source: SubstrateSource, ck: Cockpit) -> Callable[[ReadContext],
     seen = [False]       # the spore store has existed on a read: a later absence is named, never silent
 
     def read(ctx: ReadContext) -> Result:
-        sp = _spore_part(source, ctx, seen)
         bd = _board_part(_dispatch_dir(ck.consent_reader), ck.question_store, ctx.today, ctx.now)
+        ringing = frozenset(r.id[len("band:"):] for r in bd.rows if r.id.startswith("band:"))
+        sp = _spore_part(source, ctx, seen, ringing=ringing)
         dn = _done_part(source, ctx) if not sp.fault else _Part()
         rows = [*bd.rows, *sp.rows]
         skipped = [*sp.skipped, *bd.skipped, *dn.skipped]
