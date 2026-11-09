@@ -46,6 +46,10 @@ token; any other alarm takes one from the slot's own write bucket (:data:`ALARM_
 ``rate-limited``). A slot writes at most :data:`ALARM_SLOT_BUDGET` records per :data:`ALARM_BUDGET_WINDOW`; past that
 an alarm is acknowledged and counted, and the count is written as one summary record (``suppressed``, no ``kind``)
 each time it doubles, so one slot can never roll another slot's records, nor its own first ones, out of the log.
+The broker log gets one line per record written, never one per suppressed alarm. Each slot keeps its own dedupe
+stamps (:data:`ALARM_DEDUPE_MAX`, derived from its bucket), so no traffic of other slots can evict a live one. The
+dedupe stamp and the budget are kept only after the append succeeds: an append that fails is ``broker-error``, and
+its retry is written as if it were the first (it has spent only the write token).
 The answer is a bare ``{"id", "ok": true}``: an ALARM files no request, writes no row, receipt or grant, and changes
 no answer of any other verb. Known edge: the dedupe stamps and budgets live in the broker's memory, so a broker
 restart starts them over.
@@ -132,6 +136,7 @@ from __future__ import annotations
 
 import hashlib
 import logging
+import math
 import os
 import posixpath
 import re
@@ -256,7 +261,9 @@ ALARM_REASON_MAX = 400
 ALARM_RATE = 0.2
 ALARM_BURST = 5
 ALARM_DEDUPE_WINDOW = 600.0
-ALARM_DEDUPE_MAX = 256
+# one slot's dedupe stamps: every stamp costs a write token, so this is the most a slot can stamp within one window
+# and a live stamp is never evicted (only expired ones are purged)
+ALARM_DEDUPE_MAX = math.ceil(ALARM_BURST + ALARM_RATE * ALARM_DEDUPE_WINDOW)
 # how many caps that resolved on a slot's ALARM it remembers (oldest out): those resolve before any token is charged
 ALARM_KNOWN_CAPS = 4
 # how many records one slot may write per ALARM_BUDGET_WINDOW seconds: past it an alarm is counted, not written, and
@@ -495,9 +502,10 @@ class Broker:
         self._root_locks: dict[str, threading.Lock] = {}
         self._alarm_buckets: dict[int, tuple[float, float]] = {}  # slot -> (tokens, at): ALARM's own
         self._alarm_unseen_buckets: dict[int, tuple[float, float]] = {}  # the same, paid by a cap before it resolves
-        # (session, kind, reason) -> when it was last recorded; held across the append so a repeat never writes twice
+        # slot -> (session, kind, reason) -> when it was last recorded, oldest first; held across the append so a
+        # repeat never writes twice
         self._alarm_lock = threading.Lock()
-        self._alarm_seen: OrderedDict[tuple[str, str, str], float] = OrderedDict()
+        self._alarm_seen: dict[int, OrderedDict[tuple[str, str, str], float]] = {}
         # slot -> [window start, records written, alarms suppressed, the count that writes the next summary]
         self._alarm_budget: dict[int, list[Any]] = {}
         self._alarm_unresolved_logged: dict[int, float] = {}  # slot -> when its last failed resolve was logged
@@ -967,14 +975,16 @@ class Broker:
             caps.move_to_end(digest)
             while len(caps) > ALARM_KNOWN_CAPS:
                 caps.popitem(last=False)
-            seen = self._alarm_seen.get(key)
-            if seen is not None and now - seen < ALARM_DEDUPE_WINDOW:
+            seen_map = self._alarm_seen.setdefault(slot, OrderedDict())
+            while seen_map and now - next(iter(seen_map.values())) >= ALARM_DEDUPE_WINDOW:
+                seen_map.popitem(last=False)
+            if key in seen_map:
                 return wire.answer(rid)
             if not self._take_alarm_token(slot):
                 return wire.refusal(rid, "rate-limited")
+            # the budget is worked on a copy and kept only once the append (if any) succeeded, with the stamp
             budget = self._alarm_budget.get(slot)
-            if budget is None or now - budget[0] >= ALARM_BUDGET_WINDOW:
-                budget = self._alarm_budget[slot] = [now, 0, 0, 1]
+            budget = [now, 0, 0, 1] if budget is None or now - budget[0] >= ALARM_BUDGET_WINDOW else list(budget)
             record: dict[str, Any] = {"format": ALARM_FORMAT, "at": utc_stamp(self._clock()), "slot": slot_ref(slot),
                                       "session": who.session}
             if budget[1] < ALARM_SLOT_BUDGET:
@@ -991,11 +1001,14 @@ class Broker:
                     budget[3] *= 2
             if write:
                 self._store.append_alarm(record)
-            self._alarm_seen[key] = now
-            self._alarm_seen.move_to_end(key)
-            while len(self._alarm_seen) > ALARM_DEDUPE_MAX:
-                self._alarm_seen.popitem(last=False)
-        log.warning("qbroker: slot %d session %s raised a %s alarm", slot, who.session, kind)
+            self._alarm_budget[slot] = budget
+            seen_map[key] = now
+            while len(seen_map) > ALARM_DEDUPE_MAX:
+                seen_map.popitem(last=False)
+        if write and "suppressed" in record:
+            log.warning("qbroker: slot %d is past its alarm budget, %d suppressed", slot, record["suppressed"])
+        elif write:
+            log.warning("qbroker: slot %d session %s raised a %s alarm", slot, who.session, kind)
         return wire.answer(rid)
 
     def _take_alarm_token(self, slot: int, *, unseen: bool = False) -> bool:
