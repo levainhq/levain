@@ -136,12 +136,15 @@ class HelperSlotRuntime:
     tests run a fake script there). ``routes`` is the render blob's route list, or a callable that answers it (default:
     the base map's egress routes plus the one Claude passthrough route); a BROKERED start ignores it and names its
     ticket's minted routes (``SlotStart.routes``). ``workspace`` is S10w's seam: called with the
-    request and the staging dir after the brief and before ``render``."""
+    request and the staging dir after the brief and before ``render``. ``repo_settings`` answers the request's frozen
+    repo settings layers (the verified snapshot's, None for none), which the render blob carries as its
+    ``repo_settings``."""
 
     def __init__(self, *, host: "str | None" = None, helper: "Sequence[str] | None" = None,
                  control_socket: "Path | None" = None, store: "Path | None" = None,
                  routes: "Sequence[str] | Callable[[SlotStart], Sequence[str]] | None" = None,
                  workspace: "Callable[[SlotStart, Path], None] | None" = None,
+                 repo_settings: "Callable[[SlotStart], Mapping[str, Any] | None] | None" = None,
                  client_factory: Callable[..., Any] = ControlClient, env: "Mapping[str, str] | None" = None,
                  deadlines: "Mapping[str, float] | None" = None, kill_grace_s: float = KILL_GRACE_S,
                  git: str = "git") -> None:
@@ -150,6 +153,7 @@ class HelperSlotRuntime:
         self._socket = layout.RUN[self.host] / "control" / "control.sock" if control_socket is None else control_socket
         self._store = layout.STORE[self.host] if store is None else Path(store)
         self._routes, self._workspace, self._factory = routes, workspace, client_factory
+        self._repo_settings = repo_settings
         self._env, self._kill_grace = env, kill_grace_s
         self._deadlines = dict(HELPER_DEADLINE_S if deadlines is None else deadlines)
         self._git = git
@@ -237,7 +241,8 @@ class HelperSlotRuntime:
 
     def _render_blob(self, req: SlotStart) -> bytes:
         """The §5.3 blob, checked by the helper's own grammar BEFORE anything is allocated. It must name every hook of
-        :data:`HOOKS` (port item 4): a launcher that asks for fewer is refused here, not left to the server."""
+        :data:`HOOKS` (port item 4): a launcher that asks for fewer is refused here, not left to the server. It carries
+        the request's frozen repo settings layers (``repo_settings``) when there are any."""
         if set(req.hooks) != set(HOOKS):
             raise LauncherRefused("hooks-incomplete", ",".join(sorted(set(req.hooks) ^ set(HOOKS))))
         if req.auth == "brokered":
@@ -251,8 +256,12 @@ class HelperSlotRuntime:
                                  egress=False)   # the ticket lists none by default (11-02); render refuses extras
         else:
             routes = self._routes(req) if callable(self._routes) else self._routes
-        data = canon.canonical_bytes({"format": RENDER_FORMAT, "vendor": req.harness, "routes": list(routes),
-                                      "model": req.model, "hooks": list(req.hooks)})
+        blob = {"format": RENDER_FORMAT, "vendor": req.harness, "routes": list(routes), "model": req.model,
+                "hooks": list(req.hooks)}
+        settings = self._repo_settings(req) if self._repo_settings is not None else None
+        if settings:
+            blob["repo_settings"] = dict(settings)
+        data = canon.canonical_bytes(blob)
         parse_stdin("render", data)
         return data
 
