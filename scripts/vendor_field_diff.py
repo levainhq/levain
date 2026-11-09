@@ -16,6 +16,9 @@ Sources (Anthropic is pinned to a tag; bump `ANTHROPIC_SDK_TAG` per release, nev
   openrouter-*                    openrouter.ai/openapi.json
   anthropic-messages              anthropic-sdk-python `types/beta/message_create_params.py` TypedDict
 A field the vendor removed stays on a codec's list (old clients still send it); this script never reports a removal.
+
+Exit status: 0 nothing untriaged, 1 untriaged fields found, 2 the check could not run (a fetch failure, a missing or
+unparseable snapshot, a request schema or class not found, an unresolved `$ref`), with one line on stderr saying why.
 """
 from __future__ import annotations
 
@@ -44,9 +47,19 @@ SOURCES: Dict[str, Tuple[str, str, str]] = {
 }
 
 
+class CheckFailed(Exception):
+    """The diff could not be computed: its message is the one line `main` prints."""
+
+
 def schema_fields(doc: Mapping[str, Any], name: str) -> Set[str]:
-    """The property names of `components.schemas.<name>`, following `allOf` and `$ref` (an object schema)."""
-    schemas = doc["components"]["schemas"]
+    """The property names of `components.schemas.<name>`, following `allOf` and `$ref` (an object schema). A `$ref`
+    that names no schema raises `CheckFailed`: a field behind it would be silently missed."""
+    try:
+        schemas = doc["components"]["schemas"]
+    except (KeyError, TypeError):
+        raise CheckFailed("no components.schemas in the schema document") from None
+    if not isinstance(schemas, dict) or name not in schemas:
+        raise CheckFailed("schema %s not found" % name)
     out: Set[str] = set()
     seen: Set[str] = set()
 
@@ -56,7 +69,9 @@ def schema_fields(doc: Mapping[str, Any], name: str) -> Set[str]:
         ref = node.get("$ref")
         if isinstance(ref, str):
             key = ref.rsplit("/", 1)[-1]
-            if key not in seen and key in schemas:
+            if key not in schemas:
+                raise CheckFailed("unresolved $ref %s (under %s)" % (ref, name))
+            if key not in seen:
                 seen.add(key)
                 walk(schemas[key])
             # no return: OpenAPI 3.1 lets a `$ref` carry sibling `properties` / `allOf`
@@ -72,11 +87,26 @@ def schema_fields(doc: Mapping[str, Any], name: str) -> Set[str]:
 
 
 def typeddict_fields(source: str, cls: str) -> Set[str]:
-    """The annotated names of class `cls` in a Python source (the SDK's request TypedDict)."""
-    for node in ast.parse(source).body:
-        if isinstance(node, ast.ClassDef) and node.name == cls:
-            return {n.target.id for n in node.body if isinstance(n, ast.AnnAssign) and isinstance(n.target, ast.Name)}
-    raise KeyError(cls)
+    """The annotated names of class `cls` in a Python source (the SDK's request TypedDict), with those of every base
+    class defined in the same source, recursively: a field the SDK moves into a base is still a field."""
+    classes = {node.name: node for node in ast.parse(source).body if isinstance(node, ast.ClassDef)}
+    if cls not in classes:
+        raise CheckFailed("class %s not found" % cls)
+    out: Set[str] = set()
+    seen: Set[str] = set()
+
+    def walk(name: str) -> None:
+        if name in seen:
+            return
+        seen.add(name)
+        node = classes[name]
+        out.update(n.target.id for n in node.body if isinstance(n, ast.AnnAssign) and isinstance(n.target, ast.Name))
+        for base in node.bases:
+            if isinstance(base, ast.Name) and base.id in classes:
+                walk(base.id)
+
+    walk(cls)
+    return out
 
 
 #: fields every SDK adds on top of the TypedDict base (`stream` is a Literal overload, not a base field)
@@ -84,13 +114,26 @@ _ANTHROPIC_EXTRA = {"stream"}
 
 
 def vendor_fields(source: str, raw: bytes) -> Set[str]:
+    """The vendor's request fields for `source`; a snapshot that does not parse raises `CheckFailed`."""
     fname, name, _ = SOURCES[source]
     if fname.endswith(".py"):
-        return typeddict_fields(raw.decode("utf-8"), name) | _ANTHROPIC_EXTRA
+        try:
+            text = raw.decode("utf-8")
+            return typeddict_fields(text, name) | _ANTHROPIC_EXTRA
+        except (SyntaxError, ValueError) as e:
+            raise CheckFailed("%s did not parse (%s)" % (fname, type(e).__name__)) from None
     if fname.endswith(".yaml"):
         import yaml   # a dev dependency of this script only
-        return schema_fields(yaml.safe_load(raw), name)
-    return schema_fields(json.loads(raw), name)
+        try:
+            doc = yaml.safe_load(raw)
+        except yaml.YAMLError as e:
+            raise CheckFailed("%s did not parse (%s)" % (fname, type(e).__name__)) from None
+    else:
+        try:
+            doc = json.loads(raw)
+        except ValueError as e:
+            raise CheckFailed("%s did not parse (%s)" % (fname, type(e).__name__)) from None
+    return schema_fields(doc, name)
 
 
 def untriaged(source: str, raw: bytes, codecs: Optional[Mapping[str, Any]] = None) -> List[str]:
@@ -125,13 +168,25 @@ def main(argv: Optional[Iterable[str]] = None) -> int:
     cache: Dict[str, bytes] = {}
     total = 0
     for source, (fname, _name, codec) in SOURCES.items():
-        if fname not in cache:
-            if args.snapshots:
-                with open("%s/%s" % (args.snapshots.rstrip("/"), fname), "rb") as f:
-                    cache[fname] = f.read()
-            else:
-                cache[fname] = _fetch(_url(source))
-        found = untriaged(source, cache[fname])
+        try:
+            if fname not in cache:
+                if args.snapshots:
+                    path = "%s/%s" % (args.snapshots.rstrip("/"), fname)
+                    try:
+                        with open(path, "rb") as f:
+                            cache[fname] = f.read()
+                    except OSError as e:
+                        raise CheckFailed("snapshot %s not read (%s)" % (path, e.strerror or type(e).__name__))
+                else:
+                    url = _url(source)
+                    try:
+                        cache[fname] = _fetch(url)
+                    except OSError as e:   # urllib's URLError and HTTPError are OSErrors
+                        raise CheckFailed("fetch of %s failed (%s)" % (url, e))
+            found = untriaged(source, cache[fname])
+        except CheckFailed as e:
+            print("vendor_field_diff: could not run: %s: %s" % (source, e), file=sys.stderr)
+            return 2
         total += len(found)
         print("%s (vs %s): %s" % (source, codec, ", ".join(found) if found else "nothing untriaged"))
     return 1 if total else 0

@@ -125,3 +125,79 @@ def test_properties_and_allof_beside_a_ref_are_walked_too():
                 "allOf": [{"$ref": "#/components/schemas/Other"}, {"properties": {"d": {}}}]},
     }}}
     assert vfd.schema_fields(doc, "Req") == {"a", "b", "c", "d"}
+
+
+# --- r1 F4: a field moved to an inherited TypedDict ----------------------------------------------------------------
+
+def test_typeddict_fields_union_every_local_base():
+    src = (
+        "from typing_extensions import TypedDict, Required\n"
+        "class Root(TypedDict, total=False):\n    a: int\n"
+        "class Mixin(TypedDict, total=False):\n    m: int\n"
+        "class Mid(Root, total=False):\n    b: Required[str]\n"
+        "class Req(Mid, Mixin):\n    c: int\n    def f(self): pass\n"
+    )
+    assert vfd.typeddict_fields(src, "Req") == {"a", "b", "c", "m"}
+    assert vfd.typeddict_fields(src, "Mid") == {"a", "b"}
+
+
+def test_a_field_moved_into_a_base_class_is_still_reported(tmp_path, capsys):
+    src = _raw("anthropic_message_create_params.py").decode() + (
+        "\nclass ZzBase(TypedDict, total=False):\n    zz_moved: int\n"
+        "\nclass MessageCreateParamsBase(ZzBase):\n    model: str\n")
+    (tmp_path / "anthropic_message_create_params.py").write_text(src)
+    for name in ("openai.yaml", "openrouter.json"):
+        (tmp_path / name).write_bytes(_raw(name))
+    assert vfd.main(["--snapshots", str(tmp_path)]) == 1
+    assert "anthropic-messages (vs anthropic-messages): zz_moved" in capsys.readouterr().out
+
+
+# --- r1 F5: a check that could not run exits 2, never 1 ------------------------------------------------------------
+
+def _snapdir(tmp_path, **replace):
+    for name in ("openai.yaml", "openrouter.json", "anthropic_message_create_params.py"):
+        data = replace.get(name.replace(".", "_"), _raw(name))
+        if data is not None:
+            (tmp_path / name).write_bytes(data)
+    return str(tmp_path)
+
+
+def _one_line(capsys):
+    err = capsys.readouterr().err
+    assert len(err.strip().splitlines()) == 1, err
+    return err
+
+
+def test_a_fetch_failure_exits_two_with_one_line(monkeypatch, capsys):
+    def down(url):
+        raise OSError("connection refused")
+    monkeypatch.setattr(vfd, "_fetch", down)
+    assert vfd.main([]) == 2
+    assert "could not run" in _one_line(capsys)
+
+
+def test_a_missing_snapshot_exits_two_with_one_line(tmp_path, capsys):
+    assert vfd.main(["--snapshots", _snapdir(tmp_path, openrouter_json=None)]) == 2
+    assert "openrouter.json" in _one_line(capsys)
+
+
+def test_an_unresolved_ref_exits_two_with_one_line(tmp_path, capsys):
+    orr = json.loads(_raw("openrouter.json"))
+    orr["components"]["schemas"]["ChatRequest"] = {"$ref": "#/components/schemas/ZzGone"}
+    assert vfd.main(["--snapshots", _snapdir(tmp_path, openrouter_json=json.dumps(orr).encode())]) == 2
+    assert "ZzGone" in _one_line(capsys)
+
+
+def test_a_missing_request_schema_or_class_exits_two(tmp_path, capsys):
+    orr = json.loads(_raw("openrouter.json"))
+    del orr["components"]["schemas"]["MessagesRequest"]
+    assert vfd.main(["--snapshots", _snapdir(tmp_path, openrouter_json=json.dumps(orr).encode())]) == 2
+    assert "MessagesRequest" in _one_line(capsys)
+    src = _raw("anthropic_message_create_params.py").replace(b"class MessageCreateParamsBase", b"class Renamed")
+    assert vfd.main(["--snapshots", _snapdir(tmp_path, anthropic_message_create_params_py=src)]) == 2
+    assert "MessageCreateParamsBase" in _one_line(capsys)
+
+
+def test_an_unparseable_snapshot_exits_two(tmp_path, capsys):
+    assert vfd.main(["--snapshots", _snapdir(tmp_path, openrouter_json=b"{not json")]) == 2
+    _one_line(capsys)
