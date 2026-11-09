@@ -52,8 +52,10 @@ import shlex
 import shutil
 import signal
 import socket
+import stat
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 import uuid
@@ -81,7 +83,7 @@ STARTING_GRACE = 120.0          # seconds a freshly started run may have no lock
 FINAL_STATES = ("passed", "red", "partial")
 REQUIRED_PLATFORMS = ("macos", "linux")
 KEPT_LOG_TTL = 14 * 86400       # seconds a dead run's logs and status file survive the sweep (its working subdirs go at once)
-BWRAP_PYTHON = "3.12"           # the CI bwrap job runs 3.12, whatever the linux leg's own interpreter is
+BWRAP_PYTHON = LINUX_PYTHON     # the CI bwrap job runs 3.12: the same distro interpreter (uv's "3.12" can resolve to a standalone build with no pidfd_open)
 RUN_ID_RE = re.compile(r"\d{8}T\d{6}Z-[0-9a-f]{8}-[0-9a-f]{4}")
 BWRAP_TARGETS = [
     "tests/test_firing_confinement.py", "tests/test_jewel_recheck.py", "tests/test_nlink_floor.py",
@@ -399,19 +401,52 @@ def terminate_children(grace: float = 3.0) -> None:
         _kill_group(p, grace)
 
 
-def _set_umask() -> None:
-    os.umask(RUNNER_UMASK)
+def _with_umask(cmd: list[str]) -> list[str]:
+    """The command under the runner's umask.  A shell sets it and execs, so no Python code runs between fork and exec
+    (preexec_fn is unsafe in a process that spawns from several threads)."""
+    return ["/bin/sh", "-c", f'umask {RUNNER_UMASK:03o}; exec "$@"', "sh", *cmd]
 
 
-def short_tmp(run_id: str) -> Path:
-    """The short per-run directory pytest's basetemps live in (derived from the run id, so a sweep can find it)."""
-    return Path(SHORT_TMP_ROOT) / ("lv-" + hashlib.sha256(run_id.encode()).hexdigest()[:8])
+SHORT_TMP_RECORD = "short_tmp"   # the run dir's file naming the run's private short tmp dir
+
+
+def make_short_tmp(run: Path) -> Path:
+    """A fresh, exclusive, random, 0700 dir under SHORT_TMP_ROOT, its path recorded in the run dir so teardown and the
+    sweep remove exactly that dir (a predictable name could be pre-created or symlinked by anyone)."""
+    d = Path(tempfile.mkdtemp(prefix="lv-", dir=SHORT_TMP_ROOT))
+    run.mkdir(parents=True, exist_ok=True)
+    (run / SHORT_TMP_RECORD).write_text(str(d) + "\n", encoding="utf-8")
+    return d
+
+
+def recorded_short_tmp(run: Path) -> Path | None:
+    try:
+        txt = (run / SHORT_TMP_RECORD).read_text(encoding="utf-8").strip()
+    except OSError:
+        return None
+    return Path(txt) if txt else None
+
+
+def remove_short_tmp(d: Path | None) -> bool:
+    """Remove a recorded short tmp dir, but only if it is what we made: a real dir (not a symlink) directly under
+    SHORT_TMP_ROOT, named lv-*, owned by this user.  Anything else is left alone."""
+    if d is None:
+        return False
+    try:
+        st = os.lstat(d)
+    except OSError:
+        return False
+    if (not stat.S_ISDIR(st.st_mode) or st.st_uid != os.getuid() or not d.name.startswith("lv-")
+            or d.parent != Path(SHORT_TMP_ROOT)):
+        return False
+    shutil.rmtree(d, ignore_errors=True)
+    return True
 
 
 def _spawn(cmd: list[str], *, cwd, env, stdout, stdin=subprocess.DEVNULL) -> subprocess.Popen:
     """Every child gets its own session so one kill reaches its whole group (xdist workers, browsers, mounts' helpers)."""
-    p = subprocess.Popen(cmd, cwd=str(cwd) if cwd else None, env=env, stdin=stdin, stdout=stdout,
-                         stderr=subprocess.STDOUT, start_new_session=True, preexec_fn=_set_umask)
+    p = subprocess.Popen(_with_umask(cmd), cwd=str(cwd) if cwd else None, env=env, stdin=stdin, stdout=stdout,
+                         stderr=subprocess.STDOUT, start_new_session=True)
     with _CHILD_LOCK:
         _CHILDREN.add(p)
     return p
@@ -571,7 +606,8 @@ def reap_run(run: Path, repo: Path, tools: Tools, *, keep_files: bool = False, g
     sweep of an earlier dead run) deletes the dir.  Nothing is deleted while an image is still mounted under it."""
     summary: dict = {"run": str(run), "killed": [], "ejected": [], "worktrees": [], "left_mounted": [], "removed": False}
     me = os.getpid()
-    st = [short_tmp(run.name)] if RUN_ID_RE.fullmatch(run.name) else []
+    rec = recorded_short_tmp(run)
+    st = [rec] if rec is not None else []
     pids = [pid for pid, cmd in tools.ps() if pid != me and _cmd_touches_run(cmd, run, *st)]
     for pid in pids:
         tools.kill(pid, signal.SIGTERM)
@@ -600,8 +636,7 @@ def reap_run(run: Path, repo: Path, tools: Tools, *, keep_files: bool = False, g
                 tools.git(repo, "worktree", "remove", "--force", wt)
                 summary["worktrees"].append(wt)
     tools.git(repo, "worktree", "prune")
-    for d in st:
-        shutil.rmtree(d, ignore_errors=True)
+    remove_short_tmp(rec)
     if run.exists():
         if keep_files:
             for child in run.iterdir():
@@ -959,7 +994,7 @@ class Ctx:
         self.touched: set[str] = set()
         self.base_sha = ""
         self.h11_site: Path | None = None
-        self.tmp = short_tmp(run_id)
+        self.tmp: Path | None = None
 
     def progress(self, phase: str) -> None:
         if self.status is not None:
@@ -968,8 +1003,7 @@ class Ctx:
     def prepare(self) -> None:
         for d in (self.run / "home", self.run / "tmp"):
             d.mkdir(parents=True, exist_ok=True)
-        self.tmp.mkdir(mode=0o700, parents=True, exist_ok=True)
-        os.chmod(self.tmp, 0o700)
+        self.tmp = make_short_tmp(self.run)
         # the land base is read once, here, as a sha: every classification and baseline of this leg uses this one value
         self.base_sha = git(self.repo, "rev-parse", "--verify", f"{MAIN_REF}^{{commit}}", check=False).stdout.strip()
         base = self.base_sha or MAIN_REF
@@ -993,7 +1027,7 @@ class Ctx:
         for n in self.names:
             remove_worktree(self.repo, self.run, n)
         shutil.rmtree(self.run / "venv39", ignore_errors=True)
-        shutil.rmtree(self.tmp, ignore_errors=True)
+        remove_short_tmp(self.tmp)
         git(self.repo, "worktree", "prune", check=False)
 
 
@@ -1214,7 +1248,10 @@ def plan_linux(ctx: Ctx, python: str, workers: int, timeout: float) -> tuple[lis
     if missing:
         jobs.append(failed_job(bw_name, "host not provisioned: " + "; ".join(missing)))
     else:
+        bw_bad = preflight_python(BWRAP_PYTHON)
         try:
+            if bw_bad:
+                raise RuntimeError(bw_bad)
             bsrc, bpy = ctx.make("src_bwrap", ctx.sha, BWRAP_PYTHON)
         except RuntimeError as e:
             jobs.append(failed_job(bw_name, f"environment: {e}"))
@@ -1383,7 +1420,7 @@ def run_leg_remote(repo: Path, sha: str, run: Path, run_id: str, ledger: Ledger,
     base = git(repo, "rev-parse", "--verify", f"{main_ref}^{{commit}}").stdout.strip()
 
     try:
-        step("shipping the bundle", ssh + [f"mkdir -p {q(rrun)}/xfer && cat > {q(rrun)}/xfer/sha.bundle"], stdin=bundle)
+        step("shipping the bundle", ssh + [f"umask 022 && mkdir -p {q(rrun)}/xfer && cat > {q(rrun)}/xfer/sha.bundle"], stdin=bundle)
         step("shipping the runner", ["scp", "-q", *SSH_OPTS, str(script), f"{host}:{rrun}/verify.py"])
         remote = (f"umask 022 && cd {q(rrun)} && git init -q xfer/repo && "
                   f"git -C xfer/repo fetch -q ../sha.bundle +{ref}:{ref} +{main_ref}:{main_ref} && "

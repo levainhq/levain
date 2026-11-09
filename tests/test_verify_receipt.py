@@ -646,7 +646,7 @@ def test_remote_leg_command_lines_and_ledger_filing(repo, tmp_path):
                                 sh=_stub_sh(r, sha, leg, jt, cmds), script=ROOT / "scripts" / "verify.py")
     c = [x[0] for x in cmds]
     ssh_pre = ["ssh", "-o", "BatchMode=yes", "-o", "ServerAliveInterval=30", "-o", "ServerAliveCountMax=10", "argushub"]
-    assert c[0][:-1] == ssh_pre and c[0][-1] == f"mkdir -p {rrun}/xfer && cat > {rrun}/xfer/sha.bundle"
+    assert c[0][:-1] == ssh_pre and c[0][-1] == f"umask 022 && mkdir -p {rrun}/xfer && cat > {rrun}/xfer/sha.bundle"
     assert cmds[0][1] == run / "linux" / "sha.bundle"
     assert c[1][0] == "scp" and c[1][-2:] == [str(ROOT / "scripts" / "verify.py"), f"argushub:{rrun}/verify.py"]
     run_cmd = c[2][-1]
@@ -944,6 +944,7 @@ class JobHarness:
         self.bsrc = tmp_path / "bsrc"
         self.led = verify.Ledger(tmp_path / "ledger.jsonl")
         self.ctx = verify.Ctx(tmp_path, "s" * 40, self.run, "rid", self.led, None, "mac", self.run / "v.log")
+        self.ctx.tmp = tmp_path / "short"
         self.ctx.base_sha, self.ctx.touched = "b" * 40, set()
         self.msgs = dict(main=main_msg, base=base_msg)
         self.rerun, self.cmds = rerun, []
@@ -1272,10 +1273,10 @@ def test_v12_a_host_missing_a_capability_fails_the_bwrap_job_as_not_provisioned(
 def test_v12_the_bwrap_job_runs_on_312_like_ci_when_the_host_is_ready(tmp_path, monkeypatch):
     made, ran = _plan_linux_stubs(tmp_path, monkeypatch, [])
     jobs, _, _ = verify.plan_linux(_prov_ctx(tmp_path / "p"), verify.LINUX_PYTHON, 4, 60)
-    assert ("src_bwrap", "3.12") in made and ("src_at_sha", verify.LINUX_PYTHON) in made
+    assert ("src_bwrap", verify.LINUX_PYTHON) in made and ("src_at_sha", verify.LINUX_PYTHON) in made
     bw = next(k for k in ran if k["name"].startswith("bwrap-floor-live"))
     assert bw["name"] == "bwrap-floor-live-py312" and bw["required_run"] and bw["env"]["LEVAIN_REQUIRE_LINUX_LIVE"] == "1"
-    assert bw["base_python"] == "3.12" and bw["env"]["CI"] == "1" and "PYTHONPATH" not in bw["env"]
+    assert bw["base_python"] == verify.LINUX_PYTHON and bw["env"]["CI"] == "1" and "PYTHONPATH" not in bw["env"]
 
 
 # ---------------------------------------------------------------- L3 r1 fix round
@@ -1485,7 +1486,8 @@ def test_rf2_pytest_basetemp_is_a_short_private_tmp_dir_removed_at_teardown(tmp_
     monkeypatch.setattr(verify, "_run", lambda cmd, **k: seen.append(cmd) or 0)
     ctx.prepare()
     try:
-        assert ctx.tmp.parent == Path(verify.SHORT_TMP_ROOT) and ctx.tmp.name.startswith("lv-") and len(ctx.tmp.name) == 11
+        assert ctx.tmp.parent == Path(verify.SHORT_TMP_ROOT) and ctx.tmp.name.startswith("lv-") and len(ctx.tmp.name) < 20
+        assert verify.recorded_short_tmp(ctx.run) == ctx.tmp
         assert (ctx.tmp.stat().st_mode & 0o777) == 0o700
         with pytest.raises(RuntimeError):                      # the stubbed pytest wrote no junit
             verify.run_job(ctx, name="pytest-full-py312", py=Path("/v/bin/python"), cwd=tmp_path, env={}, targets=["tests"],
@@ -1503,8 +1505,7 @@ def test_rf2_the_sweep_reaps_the_short_tmp_dir_of_a_dead_run(tmp_path):
     rid = "20261109T000000Z-" + "a" * 8 + "-" + "b" * 4
     run = tmp_path / rid
     run.mkdir()
-    st = verify.short_tmp(rid)
-    st.mkdir(mode=0o700, parents=True, exist_ok=True)
+    st = verify.make_short_tmp(run)
     (st / "pt-x").mkdir()
     cmd = f"python -m pytest --basetemp={st}/pt-x tests"
     assert verify._cmd_touches_run(cmd, run, st) and not verify._cmd_touches_run(cmd, run)
@@ -1538,3 +1539,68 @@ def test_rf3_the_leg_records_the_interpreter_path(tmp_path, monkeypatch):
     monkeypatch.setattr(verify, "host_fingerprint", lambda: {})
     leg = verify.run_leg_local(tmp_path, SHA40, tmp_path, "rid", None, None, leg="linux", python=verify.LINUX_PYTHON, workers=1, timeout=1)
     assert leg["python_path"] == "/usr/bin/python3.12" and leg["python"] == "3.12.3"
+
+
+# ---------------------------------------------------------------- fix round 2: private tmp, bwrap interpreter, umask wrapper
+
+def test_r2_t1_a_planted_predictable_path_is_never_adopted_and_a_foreign_record_is_refused(tmp_path):
+    import hashlib as _h
+    rid = "20261109T000000Z-" + "a" * 8 + "-" + "b" * 4
+    planted = Path(verify.SHORT_TMP_ROOT) / ("lv-" + _h.sha256(rid.encode()).hexdigest()[:8])
+    target = tmp_path / "victim"
+    target.mkdir()
+    target.chmod(0o755)
+    planted.symlink_to(target)
+    d = None
+    try:
+        d = verify.make_short_tmp(tmp_path / rid)
+        assert d != planted and not d.is_symlink() and (d.stat().st_mode & 0o777) == 0o700
+        assert (target.stat().st_mode & 0o777) == 0o755            # the planted symlink's target was never chmod-ed
+        assert verify.recorded_short_tmp(tmp_path / rid) == d
+        assert verify.remove_short_tmp(planted) is False and target.exists()   # a symlink is refused at removal
+        assert verify.remove_short_tmp(tmp_path / "victim") is False           # not under the tmp root
+        assert verify.remove_short_tmp(Path(verify.SHORT_TMP_ROOT) / "not-lv-x") is False
+        assert verify.remove_short_tmp(d) is True and not d.exists()
+    finally:
+        planted.unlink()
+        if d is not None and d.exists():
+            shutil.rmtree(d, ignore_errors=True)
+
+
+def test_r2_t1_a_run_without_a_record_reaps_nothing_in_tmp(tmp_path):
+    assert verify.recorded_short_tmp(tmp_path) is None and verify.remove_short_tmp(None) is False
+
+
+def test_r2_t2_a_bwrap_interpreter_that_fails_the_preflight_builds_nothing(tmp_path, monkeypatch):
+    made, ran = _plan_linux_stubs(tmp_path, monkeypatch, [])
+    calls = []
+    monkeypatch.setattr(verify, "preflight_python", lambda py: calls.append(py) or (None if len(calls) == 1 else "interpreter x has no os.pidfd_open"))
+    jobs, _, _ = verify.plan_linux(_prov_ctx(tmp_path / "p"), verify.LINUX_PYTHON, 4, 60)
+    bw = next(j for j in jobs if j["name"].startswith("bwrap-floor-live"))
+    assert "pidfd_open" in bw["setup_failed"] and not any(n == "src_bwrap" for n, _ in made)
+    assert verify.BWRAP_PYTHON == verify.LINUX_PYTHON
+
+
+def test_r2_t3_the_umask_is_set_by_a_shell_wrapper_not_a_preexec_fn(tmp_path):
+    assert verify._with_umask(["a", "b c"])[-3:] == ["sh", "a", "b c"] and verify._with_umask(["a"])[:2] == ["/bin/sh", "-c"]
+    assert not hasattr(verify, "_set_umask")
+    old = os.umask(0o002)
+    try:
+        log = tmp_path / "log"
+        rc = verify._run([sys.executable, "-c", "import os,sys;print(oct(os.umask(0)), sys.argv[1:])", "x y"], cwd=tmp_path,
+                         env={"PATH": os.environ["PATH"]}, log=log)
+    finally:
+        os.umask(old)
+    assert rc == 0 and "0o22 ['x y']" in log.read_text()
+
+
+def test_r2_t4_the_remote_mkdir_runs_after_umask_022(repo, tmp_path):
+    r, sha = repo
+    run = tmp_path / "run"
+    run.mkdir()
+    rrun, leg, jt = _remote_fixture(tmp_path, sha=sha)
+    cmds = []
+    verify.run_leg_remote(r, sha, run, RUN_ID, verify.Ledger(tmp_path / "l.jsonl"), None,
+                          sh=_stub_sh(r, sha, leg, jt, cmds), script=ROOT / "scripts" / "verify.py")
+    mk = [x[0][-1] for x in cmds if "mkdir -p" in x[0][-1]]
+    assert mk and all(c.startswith("umask 022 && mkdir -p") for c in mk)
