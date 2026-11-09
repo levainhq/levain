@@ -485,7 +485,8 @@ def test_10b_the_snapshot_builder_installs_only_into_the_dest_dir_it_made():
 def test_11_the_kind_matrix_of_vendor_argv_is_unchanged_but_for_the_executor():
     prefix = VENDOR_PREFIX["linux"]
     s = "s-00000000000000a1"
-    today = (f"{prefix}/bin/claude", "--settings", f"{STORE['linux']}/live/{s}/root/settings.json")
+    today = (f"{prefix}/bin/claude", "--settings", f"{STORE['linux']}/live/{s}/root/settings.json",
+             "--setting-sources", "")
     for kind, tk in (("interactive", None), ("login", None), ("planner", "planner"), ("dispatch", "planner")):
         assert SS.vendor_argv("linux", "claude", s, kind=kind, ticket_kind=tk) == today, kind
     assert SS.vendor_argv("linux", "claude", s) == today                               # the old three-argument call
@@ -498,7 +499,7 @@ def test_11_the_kind_matrix_of_vendor_argv_is_unchanged_but_for_the_executor():
     # the executor on claude: the print-mode exec, token for token (also the premise of the pin below)
     S = f"{STORE['linux']}/live/{s}"
     assert SS.vendor_argv("linux", "claude", s, kind="dispatch", ticket_kind="executor") == (
-        f"{prefix}/bin/claude", "-p", "--settings", f"{S}/root/settings.json", "--setting-sources", "user",
+        f"{prefix}/bin/claude", "-p", "--settings", f"{S}/root/settings.json", "--setting-sources", "",
         "--strict-mcp-config", "--append-system-prompt-file", f"{S}/in/brief.md", "--output-format", "stream-json",
         "--verbose", "Execute the task in your system prompt.")
     assert SS.EXECUTOR_PROMPT == "Execute the task in your system prompt."
@@ -537,7 +538,7 @@ def test_12_the_pin_the_brief_reaches_the_vendor_by_file_and_by_no_other_channel
     # (a) the vendor argv, token for token
     assert tuple(vend["spec"]["argv"]) == (
         f"{VENDOR_PREFIX['linux']}/bin/claude", "-p", "--settings", f"{S}/root/settings.json", "--setting-sources",
-        "user", "--strict-mcp-config", "--append-system-prompt-file", f"{S}/in/brief.md", "--output-format",
+        "", "--strict-mcp-config", "--append-system-prompt-file", f"{S}/in/brief.md", "--output-format",
         "stream-json", "--verbose", "Execute the task in your system prompt.")
     # (b) the sentinel is in none of the channels
     for rec in rig.la.spawns:
