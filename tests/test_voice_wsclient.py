@@ -243,13 +243,31 @@ def test_repeated_unread_headers_are_accepted(serve):
     c.close(wait=0.1)
 
 
-@pytest.mark.parametrize("dup", ["Sec-WebSocket-Accept: {k}", "Upgrade: websocket", "Connection: Upgrade",
-                                 "Sec-WebSocket-Extensions: x", "Sec-WebSocket-Protocol: x"])
-def test_repeated_read_header_refused(serve, dup):
+@pytest.mark.parametrize("dup", ["Sec-WebSocket-Accept: {k}", "Upgrade: websocket"])
+def test_repeated_singleton_header_refused(serve, dup):
+    # handshake() already sends one of each, so `extra` makes it two
     srv = serve(lambda p: p.handshake(extra=dup.format(k=p.accept_key()) + "\r\n"))
     with pytest.raises(ws.WsError) as e:
         dial(srv)
     assert e.value.code == "handshake"
+
+
+@pytest.mark.parametrize("first, second, ok", [("keep-alive", "Upgrade", True), ("Upgrade", "keep-alive", True),
+                                               ("keep-alive", "close", False)])
+def test_connection_split_across_lines_is_one_list(serve, first, second, ok):
+    def script(p):
+        p.raw((f"HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: {first}\r\nConnection: {second}\r\n"
+               f"Sec-WebSocket-Accept: {p.accept_key()}\r\n\r\n").encode())
+        p.send(1, b"hi")
+
+    if ok:
+        c = dial(serve(script))
+        assert c.recv() == ("text", "hi")
+        c.close(wait=0.1)
+    else:
+        with pytest.raises(ws.WsError) as e:
+            dial(serve(script))
+        assert e.value.code == "handshake"
 
 
 def test_missing_upgrade_headers_refused(serve):

@@ -72,8 +72,9 @@ WORDS = {
 }
 
 _TOKEN = re.compile(r"^[!#$%&'*+\-.^_`|~0-9A-Za-z]+$")
-# the 101 headers _validate reads: a repeat of one of these is refused; any other header may repeat (Set-Cookie does, RFC 6265)
-_READ_HEADERS = frozenset({"upgrade", "connection", "sec-websocket-accept", "sec-websocket-extensions", "sec-websocket-protocol"})
+# 101 headers whose value _validate compares for equality: a repeat is ambiguous and refused. Connection is a list and is joined;
+# Sec-WebSocket-Extensions/-Protocol are refused on presence; any other header may repeat (OpenAI sends two Set-Cookie, 11-09).
+_SINGLETON_HEADERS = frozenset({"upgrade", "sec-websocket-accept"})
 _OWNED = frozenset({"host", "upgrade", "connection", "content-length", "transfer-encoding"})
 
 
@@ -540,9 +541,12 @@ def _validate(head: bytes, key: str) -> None:
         if not sep or not _TOKEN.match(name):
             raise WsError("handshake")
         low = name.lower()
-        if low in _READ_HEADERS and low in seen:     # an ambiguous answer to a header this check reads; any other may repeat
+        if low in _SINGLETON_HEADERS and low in seen:     # two answers to a value compared below: ambiguous, refused
             raise WsError("handshake")
-        seen[low] = value.strip()
+        if low == "connection" and low in seen:       # a comma list may be split across lines (RFC 7230 3.2.2): join it
+            seen[low] = seen[low] + ", " + value.strip()
+        else:
+            seen[low] = value.strip()
     if seen.get("upgrade", "").lower() != "websocket":
         raise WsError("handshake")
     if "upgrade" not in [t.strip().lower() for t in seen.get("connection", "").split(",")]:
