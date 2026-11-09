@@ -189,6 +189,72 @@ def test_doctor_says_there_is_no_alarm_log_when_the_broker_never_made_one(tmp_pa
     assert not row.warn and "no alarm log exists yet" in row.detail and "none in the last" not in row.detail
 
 
+def test_other_slots_legal_traffic_never_evicts_a_live_dedupe_stamp(L, resolver, clock):
+    from tests.test_qbroker import Resolved
+    resolver.add(3, "cap-three", Resolved(session="sess-3", kind="interactive", run=None))
+    mono = {"t": 1000.0}
+    b = make_broker(L, resolver, clock, monotonic=lambda: mono["t"])
+    slots = ((1, "cap-a"), (2, "cap-two"), (3, "cap-three"))
+    for slot, cap in slots:
+        for i in range(qbroker.ALARM_BURST):
+            assert alarm(b, slot=slot, cap=cap, reason=f"s{slot}-b{i}")["ok"] is True
+    rounds = int(0.75 * qbroker.ALARM_DEDUPE_WINDOW * qbroker.ALARM_RATE)
+    for r in range(rounds):                                          # every slot inside its own bucket
+        mono["t"] += 1.0 / qbroker.ALARM_RATE
+        for slot, cap in slots:
+            assert alarm(b, slot=slot, cap=cap, reason=f"s{slot}-r{r}")["ok"] is True
+    assert mono["t"] - 1000.0 < qbroker.ALARM_DEDUPE_WINDOW
+    before = len(records(L))
+    assert alarm(b, reason="s1-b0")["ok"] is True                    # still in its window: deduped
+    assert len(records(L)) == before
+
+
+def test_past_the_budget_the_broker_log_gets_a_line_per_record_not_per_alarm(L, resolver, clock, caplog):
+    caplog.set_level(logging.WARNING, logger="levain.qbroker")
+    mono = {"t": 1000.0}
+    b = make_broker(L, resolver, clock, monotonic=lambda: mono["t"])
+    for i in range(qbroker.ALARM_SLOT_BUDGET + 40):
+        mono["t"] += 1.0 / qbroker.ALARM_RATE
+        assert alarm(b, reason=f"r{i}")["ok"] is True
+    lines = [r for r in caplog.records if r.getMessage().startswith("qbroker: slot 1")]
+    assert len(lines) == len(records(L)) < qbroker.ALARM_SLOT_BUDGET + 40
+
+
+def test_an_alarm_whose_append_failed_is_written_by_its_retry_and_charges_no_budget(L, resolver, clock, monkeypatch):
+    mono = {"t": 1000.0}
+    b = make_broker(L, resolver, clock, monotonic=lambda: mono["t"])
+    real, fails = b._store.append_alarm, {"n": 1}
+
+    def flaky(record):
+        if fails["n"]:
+            fails["n"] -= 1
+            raise OSError("disk full")
+        real(record)
+    monkeypatch.setattr(b._store, "append_alarm", flaky)
+    assert alarm(b, reason="first")["refused"] == "broker-error"
+    assert records(L) == []
+    assert alarm(b, reason="first")["ok"] is True                  # the retry is not deduped away
+    assert [r.get("reason") for r in records(L)] == ["first"]
+    for i in range(qbroker.ALARM_SLOT_BUDGET - 1):
+        mono["t"] += 1.0 / qbroker.ALARM_RATE
+        assert alarm(b, reason=f"r{i}")["ok"] is True
+    assert len([r for r in records(L) if "reason" in r]) == qbroker.ALARM_SLOT_BUDGET
+
+
+def test_doctor_says_when_the_queue_is_not_searchable_by_this_user(L, broker, clock):
+    alarm(broker)
+    queue = L / "queue"
+    mode = queue.stat().st_mode & 0o777
+    queue.chmod(0o600)
+    try:
+        [row] = doctor._check_slot_alarms(store=L, now=clock["fn"]())
+    finally:
+        queue.chmod(mode)
+    assert row.ok and not row.warn
+    assert "not readable by this user" in row.detail and "levain-queue" in row.detail
+    assert "no alarm log exists yet" not in row.detail
+
+
 @pytest.mark.parametrize("over", [
     {"grant": {}}, {"decision": "allow"}, {"request": {}}, {"session": "sess-b"}, {"payload": "x"},
     {"kind": "anything"}, {"kind": None}, {"reason": None}, {"reason": ""}, {"reason": 7},
