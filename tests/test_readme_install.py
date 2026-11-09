@@ -118,7 +118,7 @@ def test_the_readme_makes_no_claim_about_the_package_index_releases():
 
 
 def test_contributing_gives_the_literal_ci_install_line():
-    ci_lines = [l.strip().removeprefix("run: ") for l in WORKFLOW.splitlines() if "pip install -e" in l]
+    ci_lines = [l.strip() for l in WORKFLOW.splitlines() if l.strip().startswith("scripts/ci_install_locked.sh")]
     literal = next(l for l in ci_lines if "openhands" in l)
     assert literal in CONTRIBUTING, (literal, CONTRIBUTING)
     assert "test extras" not in CONTRIBUTING
