@@ -190,6 +190,11 @@ openhands = ["openhands-sdk==1.26.0", "openhands-tools==1.26.0", "agent-client-p
 isolation = ["h11>=0.16.0"]
 dev = ["pytest>=7.4", "pytest-xdist>=3.5","mcp>=1.27,<2", "h11>=0.16.0", "pyyaml>=6"]
 
+# Not published metadata: scripts/ci_install_locked.sh exports this group so the build backend comes from the
+# hash-checked lock and the editable install can run with --no-build-isolation. Keep it in step with [build-system].
+[dependency-groups]
+build = ["setuptools>=77"]
+
 [project.scripts]
 levain = "levain.launch:main"
 
