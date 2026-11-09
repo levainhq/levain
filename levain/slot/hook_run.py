@@ -104,16 +104,26 @@ def _field(event: Any, key: str) -> str:
     return "".join(c if c.isprintable() else " " for c in v[:_FIELD_MAX]) if isinstance(v, str) else "?"
 
 
-def config_guard(name: str, *, stdin: Optional[TextIO] = None, stderr: Optional[TextIO] = None) -> int:
+#: the most the ConfigChange guard waits on the broker for its alarm's ack (well inside the hook's own timeout)
+ALARM_TIMEOUT = 5.0
+
+
+def config_guard(name: str, *, stdin: Optional[TextIO] = None, stderr: Optional[TextIO] = None,
+                 environ: Optional[Mapping[str, str]] = None) -> int:
     """The ``ConfigChange`` hook: every settings change Claude Code sees in a running slot session is BLOCKED (exit
     :data:`REFUSED_EXIT`: the running session does not take it up) and named in one stderr line. It blocks only the
     running session's reload: the file on disk keeps the change (measured), so an "always allow" Claude Code writes to
     ``settings.local.json`` is still there for the next launch to read. A frozen session reads no settings file live,
-    so the block costs nothing but the alarm. Nothing is filed: from a slot the consent directory resolves under the
-    slot's own home (measured), where no operator reader looks. The payload is never trusted (it may be empty, not
-    JSON, or not an object), and nothing it holds can make this return 0."""
+    so the block costs nothing but the alarm. Nothing is filed slot-side: from a slot the consent directory resolves
+    under the slot's own home (measured), where no operator reader looks. In a slot (``environ``, default
+    ``os.environ``, names the broker socket) the same words go to the broker as one ``ALARM`` (row 166), which records
+    it on the operator's side; an alarm that cannot be sent adds one stderr line saying so. The payload is never
+    trusted (it may be empty, not JSON, or not an object), and nothing it holds, nor anything the broker answers, can
+    make this return 0."""
     import json
 
+    err: Any = None
+    what = "source=? file_path=?"
     try:
         err = stderr if stderr is not None else sys.stderr
         raw = (stdin if stdin is not None else sys.stdin).read(CONFIG_PAYLOAD_MAX)
@@ -121,11 +131,24 @@ def config_guard(name: str, *, stdin: Optional[TextIO] = None, stderr: Optional[
             event = json.loads(raw)
         except ValueError:
             event = None
-        err.write("levain hook %s: blocked a settings change (source=%s file_path=%s)\n"
-                  % (name, _field(event, "source"), _field(event, "file_path")))
+        what = "source=%s file_path=%s" % (_field(event, "source"), _field(event, "file_path"))
+        err.write("levain hook %s: blocked a settings change (%s)\n" % (name, what))
         err.flush()
     except BaseException:  # noqa: BLE001 - whatever failed, the change stays blocked
         pass
+    try:
+        env = os.environ if environ is None else environ
+        from levain.consent.broker_client import BrokerClient, in_slot
+        if in_slot(env):
+            BrokerClient.from_env(env, timeout=ALARM_TIMEOUT).alarm("config-change", what)
+    except BaseException as exc:  # noqa: BLE001 - an alarm that is not recorded never unblocks the change
+        why = getattr(exc, "name", None)
+        try:
+            err.write("levain hook %s: alarm not recorded (%s)\n"
+                      % (name, why[:80] if isinstance(why, str) and why else type(exc).__name__))
+            err.flush()
+        except BaseException:  # noqa: BLE001
+            pass
     return REFUSED_EXIT
 
 
@@ -335,4 +358,4 @@ def repo_filter(name: str, argv: Sequence[str], *, stdin: Optional[BinaryIO] = N
 
 
 __all__ = ["ADAPTER_MODULE", "REFUSED_EXIT", "REPO_DENY_DEFAULT", "REPO_FAILED", "REPO_FILTERED_EVENTS",
-           "REPO_TIMEOUT_MAX", "config_guard", "refuse", "repo_filter", "run"]
+           "REPO_TIMEOUT_MAX", "ALARM_TIMEOUT", "config_guard", "refuse", "repo_filter", "run"]

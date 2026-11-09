@@ -22,7 +22,8 @@ from typing import Any
 from levain.contracts import ContractError
 from levain.contracts.canon import canonical_bytes, parse
 
-__all__ = ["ANSWER_ROW_FORMAT", "GRANT_ROW_FORMAT", "REQUEST_ROW_FORMAT", "ROW_MAX", "QueueStore", "fsync_dir",
+__all__ = ["ALARM_LOG", "ALARM_LOG_MAX", "ANSWER_ROW_FORMAT", "GRANT_ROW_FORMAT", "REQUEST_ROW_FORMAT", "ROW_MAX",
+           "QueueStore", "fsync_dir",
            "replace_file", "valid_request_id"]
 
 REQUEST_ROW_FORMAT = "levain-queue-request/1"
@@ -34,6 +35,10 @@ _GRANT_PREFIX = "grant-"
 ROW_MAX = 64 * 1024
 ROW_MODE = 0o640
 _QUEUE_ID = "queue-id"
+# the operator-side record of a slot hook's ALARM: one canonical JSON
+# line per alarm, in the directory only the broker writes; past ALARM_LOG_MAX it rolls to "<name>.1"
+ALARM_LOG = "alarms.jsonl"
+ALARM_LOG_MAX = ROW_MAX
 # levain.autonomic.pending.seal_pending_id's shape: pend-<received_at stamp>-<16 hex>
 _REQUEST_ID = re.compile(r"pend-[0-9A-Za-z:.+-]{1,40}-[0-9a-f]{16}")
 
@@ -237,6 +242,35 @@ class QueueStore:
         except FileNotFoundError:
             return False
         return True
+
+    def append_alarm(self, record: dict[str, Any]) -> None:
+        """One line (the canonical JSON of ``record``) appended to ``requests/`` :data:`ALARM_LOG`, fsynced, mode
+        0640. A log this line would take past :data:`ALARM_LOG_MAX` is first renamed to ``<log>.1`` (replacing the
+        older one), so the two files bound the disk. The caller serialises appends (one writer: the broker)."""
+        line = canonical_bytes(record) + b"\n"
+        if len(line) > ALARM_LOG_MAX:
+            raise ValueError("an alarm record larger than the log")
+        path = self.requests / ALARM_LOG
+        flags = os.O_WRONLY | os.O_APPEND | os.O_CREAT | os.O_NOFOLLOW
+        fd = os.open(path, flags, ROW_MODE)
+        try:
+            st = os.fstat(fd)
+            if not stat.S_ISREG(st.st_mode):
+                raise ValueError(f"{path.name} is not a regular file")
+            if st.st_size + len(line) > ALARM_LOG_MAX:
+                os.close(fd)
+                fd = -1
+                os.replace(path, self.requests / (ALARM_LOG + ".1"))
+                fd = os.open(path, flags | os.O_EXCL, ROW_MODE)
+            os.fchmod(fd, ROW_MODE)
+            view = memoryview(line)
+            while view:
+                view = view[os.write(fd, view):]
+            os.fsync(fd)
+        finally:
+            if fd >= 0:
+                os.close(fd)
+        _fsync_dir(self.requests)
 
     def rows(self) -> list[dict[str, Any]]:
         """Every readable request row (the quota's count at start); an unreadable one is skipped."""

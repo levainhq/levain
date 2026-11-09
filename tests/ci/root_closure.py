@@ -194,6 +194,8 @@ LAZY_SITES = {
     'levain/slot/hook_run.py::_load_adapter::from levain.consent.adapters import claude_code': 'operator',
     # operator: same slot hook process; ``in_slot`` of the broker client
     'levain/slot/hook_run.py::run::from levain.consent.broker_client import in_slot': 'operator',
+    # operator: same slot hook process; the ConfigChange guard's ALARM to the broker
+    'levain/slot/hook_run.py::config_guard::from levain.consent.broker_client import BrokerClient, in_slot': 'operator',
     'levain/slot/runtime_helper.py::_front_interlock::from levain.slot import start as SS': 'root',
     # root: render builds the front's policy file and reads it with the front's own parser (3b-8a)
     'levain/slot/runtime_helper.py::front_policy_bytes::from levain.broker import front as FR': 'root',
