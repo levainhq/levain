@@ -1124,6 +1124,12 @@ class Keys:
         #: r1 F1: refusal-window records not written because the outbox was at its bound
         self.lineage_dropped = 0
         self.lineage_failure: Optional[str] = None
+        #: the run-final bookkeeping (W3-3b): the sessions each run's resolved tokens name, the runs each session
+        #: holds, and the runs whose sessions are all gone, waiting for the ledger to call them ready. Memory only:
+        #: a restart is an attachment EOF, so no run survives it, and the restart sweep rebuilds `_finalizing`.
+        self._run_sessions: Dict[str, Set[str]] = {}
+        self._session_runs: Dict[str, Set[str]] = {}
+        self._finalizing: Set[str] = set()
         if ledger is not None:
             ledger.on_outbox = self._lineage_due
         #: the dispatch route maps (S1 3c-4): keys' own head and every generation it verified; `main()` loads them
@@ -1216,6 +1222,14 @@ class Keys:
         and the sockets not yet served, then raises."""
         self._in_loop()
         self._starting = asyncio.Event()
+        if self.ledger is not None:
+            # the restart sweep: a run the durable lines name with no count had its sessions revoked at the EOF that
+            # a restart is, so it is closed; its open holds were booked `uncertain {restart}` at replay
+            try:
+                self._finalizing.update(self.ledger.open_runs())
+            except ledger.LedgerUnavailable:
+                pass
+            self._try_finalize()
         plan = [(s, self._on_conn) for s in socks] + ([(admin, self._on_admin)] if admin is not None else [])
         made = 0
         try:
@@ -1420,6 +1434,7 @@ class Keys:
         reg = self.by_session.get(session)
         victims = self._detach(reg, revoke=True) if reg is not None else []
         self.budget_stopped.discard(session)
+        self._run_leave(session)
         return reg is not None, victims
 
     # -- the attachment (§4.5; 3c design r3 §2.1 (e); R4 §1.4) --
@@ -1536,6 +1551,7 @@ class Keys:
                 self.admin_epoch += 1
                 adm, self.admin = self.admin, None
                 victims = self._detach_all()
+                self._runs_all_closed()   # CONTROL revokes every session registered on this attachment at its EOF
         for fut in att.pending.values():
             if not fut.done():
                 fut.set_result(None)
@@ -1766,6 +1782,7 @@ class Keys:
                                                                                            type(e).__name__))
                     await asyncio.sleep(self.lineage_retry_s)
                     continue
+                self._try_finalize()   # a run whose last row just got its durable ack may be complete now
                 if quarantined:
                     self._lineage_trouble("CONTROL quarantined %d record(s) (%s)" % (
                         len(quarantined), ",".join(sorted(set(quarantined.values())))))
@@ -1790,7 +1807,71 @@ class Keys:
         return {"outbox": led.outbox_size if led is not None else 0, "outbox_max": self.lineage_outbox_max,
                 "quarantined": len(led.quarantined) if led is not None else 0,
                 "envelopes_refused": self.lineage_envelopes_refused, "dropped": self.lineage_dropped,
-                "failure": self.lineage_failure}
+                "finalizing": len(self._finalizing), "failure": self.lineage_failure}
+
+    # -- the run's count (W3-3b: the completeness proof a brokered run settles on) --
+
+    def _run_join(self, session: str, run_id: str) -> None:
+        """A token of `session` resolved to `run_id` (under state_lock, on the loop): the run has a live session, and
+        the ledger is told it is a run keys knows (the record a run with no hold and no row is finalized on)."""
+        self._run_sessions.setdefault(run_id, set()).add(session)
+        self._session_runs.setdefault(session, set()).add(run_id)
+        self._finalizing.discard(run_id)
+        if self.ledger is not None:
+            try:
+                self.ledger.note_run(run_id)
+            except Exception as e:
+                _note(logging.WARNING, "levain gw-keys: a run was not noted to the ledger (%s)", type(e).__name__)
+
+    def _run_leave(self, session: str) -> None:
+        """`session` is dropped (DROP-SESSION, registered or not, or the reconcile's drop): every run left with no
+        session is closed."""
+        for run_id in sorted(self._session_runs.pop(session, ())):
+            live = self._run_sessions.get(run_id)
+            if live is None:
+                continue
+            live.discard(session)
+            if not live:
+                del self._run_sessions[run_id]
+                self._run_closed(run_id)
+
+    def _runs_all_closed(self) -> None:
+        """The attachment ended: every session registered on it is revoked by CONTROL, so every run is closed."""
+        self._session_runs.clear()
+        for run_id in sorted(self._run_sessions):
+            del self._run_sessions[run_id]
+            self._run_closed(run_id)
+
+    def _run_closed(self, run_id: str) -> None:
+        """A run's last session is gone: its open refusal windows are flushed now (their rows are the run's, and the
+        count must come after them), then it waits in `_finalizing` for the ledger to find it ready."""
+        for key in [k for k, w in self._refusals.items() if w[2]["run_id"] == run_id]:
+            self._refused_close(key)
+        self._finalizing.add(run_id)
+        self._try_finalize()
+
+    def _try_finalize(self) -> None:
+        """Asks the ledger for the run-final line of every closed run it finds ready (on the loop). The line enters the
+        outbox and rides the existing sender. A run that is not ready waits for the next trigger (an ack, a drop, the
+        start); one with a live session again, already counted, or unknown to the ledger leaves the set."""
+        led = self.ledger
+        if led is None or self.closing:
+            return
+        for run_id in sorted(self._finalizing):
+            if run_id in self._run_sessions:
+                self._finalizing.discard(run_id)
+                continue
+            try:
+                if led.run_finalized(run_id) or not led.run_known(run_id):
+                    self._finalizing.discard(run_id)
+                elif led.run_ready(run_id):
+                    led.run_final(run_id)
+                    self._finalizing.discard(run_id)
+            except ledger.LedgerUnavailable:
+                return   # the ledger writes nothing now: the run settles at its reservation, and stays counted
+            except Exception as e:
+                self._finalizing.discard(run_id)
+                _note(logging.WARNING, "levain gw-keys: a run-final was not written (%s)", type(e).__name__)
 
     def _note_refusal(self, session: str, run: Optional[dict], name: str) -> None:
         """One refusal of a TICKETED `Q` made before any hold (so no hold row records it): counted in its (session,
@@ -1830,6 +1911,10 @@ class Keys:
             # the ledger's reason grammar is the refusal's name without its `:<what>` (`body-unbounded:document`);
             # the row keeps the whole name
             led.refused(session, run["route"], name.partition(":")[0], count, {"lineage": row}, run_id=run["run_id"])
+        except ledger.RunFinalized:
+            self.lineage_dropped += 1   # the run's count is already written: no row of it can follow
+            _note(logging.WARNING, "levain gw-keys: a refusal window's line came after its run's count; %d %s lost",
+                  count, name)
         except Exception as e:
             # any failure, not only the ledger's own two (r1 complement LOW 5): this runs from a timer callback and
             # from `flush_refusals`' loop over every window, which must reach the rest
@@ -3117,6 +3202,9 @@ class Keys:
             return self.ledger.admit(scope, cap, bound, price_ref=price_ref, meta=meta)
         except ledger.Refused as e:
             raise norm.Refused(e.name, e.detail) from None
+        except ledger.RunFinalized as e:
+            self.lineage_dropped += 1   # a `Q` after the run's count, answered as at a full outbox (r1 F1)
+            raise norm.Refused("keys-unavailable", e.detail) from None
         except ledger.LedgerUnavailable as e:
             raise norm.Refused("keys-unavailable", e.detail) from None
         except ledger.LedgerMisuse as e:
@@ -3235,6 +3323,9 @@ class Keys:
                 if digest in self.dropped:
                     return {"refused": "token-revoked"}
                 self.cache[digest] = res[1]
+                run = res[1]["claims"].get("run")
+                if run is not None:
+                    self._run_join(res[1]["session"], run["run_id"])
             return {"answer": res[1]}
         if not front_binding(hit, reg):
             return {"refused": "front-mismatch"}

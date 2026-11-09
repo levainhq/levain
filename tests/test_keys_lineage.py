@@ -908,3 +908,136 @@ def test_an_unsent_holds_ledger_built_row_says_no_call(tmp_path, end):
     (tmp_path / "s").mkdir()
     _res2, (_t2, sent_payload) = _ledger_built(tmp_path / "s", sent=True, end=end)
     assert sent_payload["model_answered"] == "unknown" and sent_payload["provider_answered"] == "unknown"
+
+
+# ---- the run-final record (W3-3b): keys asks the ledger for a run's count once the run is closed and drained -----------
+
+def _hold_of(led: L.Ledger, amount: int, rid: str = RUN["run_id"]):
+    """One ticketed run hold of `amount` (the scope's cap is the run's reservation)."""
+    base = K.lineage_base(RUN, "2026-10-24T12:00:00Z", amount, False)
+    from tests.ledger_support import Owner
+    return Owner(led, amount=amount, cap=RUN["reserved_microdollars"], scope=("run", rid), meta={"lineage_base": base})
+
+
+async def _settle(o) -> None:
+    await o.start()
+    await o.hold.durable()
+    o.hold.send_gate()
+    o.hold.mark_sent()
+    o.hold.settle(o.amount, {"lineage": good_row(hold_microdollars=o.amount)})
+
+
+def _finals(rows: List[dict]) -> List[dict]:
+    return [r for r in rows if r.get("format") == LN.FINAL_FORMAT]
+
+
+def test_a_drop_with_a_call_in_flight_waits_for_it_then_the_final_counts_both():
+    # the design's own case (the docstring of `lineage_spend`): two calls of 100 and 900, DROP-SESSION while the 900 is
+    # in flight. No final until the 900 resolves and every row is acked; then ONE final with both rows.
+    rid = RUN["run_id"]
+
+    async def fn(ctl, k, led, spy):
+        k._run_join("s1", rid)
+        a, b = _hold_of(led, 100), _hold_of(led, 900)
+        await _settle(a)
+        await a.finish()
+        await b.start()
+        await b.hold.durable()
+        b.hold.send_gate()
+        b.hold.mark_sent()                                       # the 900 is in flight
+        k._run_leave("s1")                                       # DROP-SESSION: the run's last session is gone
+        await until(lambda: len(ctl.rows()) == 1, 20, "the first row reached the sink")
+        await asyncio.sleep(0.3)
+        assert _finals(ctl.rows()) == [] and not led.run_finalized(rid)
+        assert k._finalizing == {rid} and k.lineage_status()["finalizing"] == 1
+        b.hold.settle(900, {"lineage": good_row(hold_microdollars=900)})
+        await b.finish()
+        await until(lambda: len(_finals(ctl.rows())) == 1, 20, "the final reached the sink")
+        await until(lambda: led.outbox_size == 0, 20, "the final was acked")
+        return ctl.rows(), k.lineage_status()
+
+    rows, status = delivery(fn)
+    final = _finals(rows)[0]
+    data = [r for r in rows if r["format"] == LN.FORMAT]
+    assert (final["rows"], final["quarantined"], final["run_id"]) == (2, 0, rid) and len(data) == 2
+    assert final["triples_digest"] == L.triples_digest([r["source"] for r in data])
+    assert rows[-1] is final or rows.index(final) == len(rows) - 1      # after every row of the run, in the sink
+    assert status["finalizing"] == 0 and LN.check_record({k: v for k, v in final.items() if k != "seq"}) is None
+
+
+def test_an_open_refusal_window_is_flushed_at_the_drop_and_a_late_row_is_counted_not_written():
+    rid = RUN["run_id"]
+
+    async def fn(ctl, k, led, spy):
+        k._run_join("s1", rid)
+        k._note_refusal("s1", dict(RUN), "keys-unavailable")
+        k._note_refusal("s1", dict(RUN), "keys-unavailable")
+        assert len(k._refusals) == 1                              # the window is open (its timer is 60 s)
+        k._run_leave("s1")
+        assert k._refusals == {}                                  # flushed NOW, before the count
+        await until(lambda: len(_finals(ctl.rows())) == 1, 20, "the final reached the sink")
+        # a refusal of the finished run opens a window; its line is refused by the fence and COUNTED
+        before = k.lineage_dropped
+        k._note_refusal("s1", dict(RUN), "keys-unavailable")
+        k.flush_refusals()
+        return ctl.rows(), before, k.lineage_dropped
+
+    rows, before, after = delivery(fn)
+    refused = [r for r in rows if r["format"] == LN.FORMAT]
+    assert len(refused) == 1 and refused[0]["count"] == 2 and refused[0]["refused"] == "keys-unavailable"
+    final = _finals(rows)[0]
+    assert (final["rows"], final["quarantined"]) == (1, 0) and rows.index(final) == 1
+    assert after == before + 1
+
+
+def test_a_reconcile_drop_and_an_attachment_eof_each_finalize():
+    rid, rid2 = RUN["run_id"], "r-fedcba9876543210"
+
+    async def fn(ctl, k, led, spy):
+        # the reconcile's drop of a session's digest is `_drop_locked` on that session
+        k._run_join("s1", rid)
+        k._run_join("s2", rid)
+        async with k.state_lock:
+            k._drop_locked("s1")
+        assert k._run_sessions == {rid: {"s2"}} and not led.run_finalized(rid)    # one session left: still live
+        async with k.state_lock:
+            k._drop_locked("s2")
+        await until(lambda: led.run_finalized(rid), 10, "the reconcile drop finalized the run")
+        # an attachment EOF: CONTROL revokes every session on it, so keys finalizes every run it still holds
+        k._run_join("s3", rid2)
+        await asyncio.get_running_loop().run_in_executor(None, ctl.stop)
+        await until(lambda: led.run_finalized(rid2), 20, "the EOF finalized the run")
+        return led.run_finalized(rid), k._run_sessions
+
+    done, live = delivery(fn)
+    assert done and live == {}
+
+
+def test_a_restart_sweep_finalizes_a_run_the_durable_lines_name(tmp_path):
+    # a keys restart is an attachment EOF: a run with rows and no count is closed when the new keys starts
+    path = str(tmp_path / "ledger.jsonl")
+    rid = RUN["run_id"]
+
+    async def first():
+        led = keys_ledger(path)
+        a = _hold_of(led, 100)
+        await _settle(a)
+        await a.finish()
+        await led.aclose(5)
+
+    asyncio.run(first())
+
+    async def second():
+        led = keys_ledger(path)
+        k = K.Keys(ledger=led)
+        k._in_loop()
+        await led.ack([t for t, _ in led.unacked()])             # the first run's rows were already sent: ack them
+        assert led.open_runs() == [rid] and not led.run_finalized(rid)
+        await k.start([])                                        # no sockets: the sweep alone
+        done = led.run_finalized(rid)
+        status = k.lineage_status()
+        await led.aclose(5)
+        return done, status
+
+    done, status = asyncio.run(second())
+    assert done and status["finalizing"] == 0

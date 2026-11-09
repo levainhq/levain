@@ -111,7 +111,8 @@ async def sync_run(w: R6.World, n: int) -> str:
 
 def one_row_each(w: R6.World) -> dict:
     """Exactly one row at CONTROL for every ticketed exchange in keys' ledger, none quarantined (invariant 3)."""
-    by = w.rows_by_triple()
+    # a run-final row (W3-3b) is keys' count of a run, not an exchange's row: it is not one of the exchanges here
+    by = {t: v for t, v in w.rows_by_triple().items() if v[0].get("format") != "levain-dispatch-run-final/1"}
     tt = ticketed_triples(w.ledger())
     assert sorted(by) == sorted(tt), (sorted(by), tt)
     assert all(len(v) == 1 for v in by.values()), {k: len(v) for k, v in by.items()}
@@ -207,7 +208,8 @@ def test_lineage_crash_keys_after_the_ack_line_is_durable(py):
     (k_lines, k_recv), received, rows, rc = go(fn)
     r = ticketed_triples(k_lines)[0]
     assert acked_triples(k_lines) == [r] and k_recv == [r]
-    assert Counter(received)[r] == 1 and len(received) == 2 and rc == 0
+    # r once, the sync run's row, and the restart sweep's run-final for r's run (W3-3b): three triples, each once
+    assert Counter(received)[r] == 1 and len(received) == 3 and len(set(received)) == 3 and rc == 0
 
 
 @pytest.mark.parametrize("loss", ["sigkill", "power-cut"])

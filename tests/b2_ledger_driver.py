@@ -20,6 +20,9 @@ Modes (`gate` modes block a writer-thread primitive; `scenario` is the hold scri
   ack-w2         (3c-6a) a ticketed hold settled with its payload durable, then `ack` of its triple with the writer
                  blocked after `os.write`, before the flush, of the `lineage-acked` line
   ack-w1-torn    (3c-6a) the same, with HALF the `lineage-acked` line written, then block
+  final-w1       (W3-3b) two settled holds of one run, acked durably, then `run_final` with the writer blocked before
+                 the `os.write` of the `run-final` line
+  final-w2       (W3-3b) the same, blocked after the `os.write`, before the flush
 """
 from __future__ import annotations
 
@@ -68,7 +71,7 @@ gate = Gate()
 
 def install(mode: str) -> None:
     real_write, real_flush = L._os_write, L._flush
-    mode = {"ack-w2": "w2", "ack-w1-torn": "w1-torn"}.get(mode, mode)
+    mode = {"ack-w2": "w2", "ack-w1-torn": "w1-torn", "final-w1": "w1", "final-w2": "w2"}.get(mode, mode)
 
     if mode in ("w1", "w1-torn"):
         def os_write(fd, data):
@@ -161,6 +164,23 @@ async def run(mode: str, path: str, arg: str) -> None:
         fut = led.ack([triple])
         fut.add_done_callback(lambda f: ev(at="ack-counted"))
         ev(at="ack-queued")
+    elif mode in ("final-w1", "final-w2"):
+        # W3-3b: two settled holds of one run, both acked durably, then the run's count queued with the writer blocked
+        # before the batch's `os.write` (final-w1) or after it, before the flush (final-w2)
+        rid = "r-0123456789abcdef"
+        for _ in range(2):
+            h = led.admit(("run", rid), CAP, bound, "r", {"lineage_base": {"run_id": rid}})
+            await h.durable()
+            h.send_gate()
+            h.mark_sent()
+            h.settle(AMOUNT, {"lineage": {"run_id": rid, "settled": "yes"}})
+            await settle_resolved(h)
+        got = [t for t, _ in led.unacked()]
+        await led.ack(got)
+        ev(at="acked", triples=[list(t) for t in got])
+        gate.arm()
+        led.run_final(rid)
+        ev(at="final-queued")
     elif mode == "prelude-only":
         ev(at="gate", mode=mode)
     elif mode in ("w1", "w1-torn", "w2", "w3"):
