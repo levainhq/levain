@@ -311,9 +311,10 @@ def test_a_reply_that_finishes_while_the_new_conversation_is_pending_is_not_read
 
 @needs_browser
 def test_a_falsy_voice_button_leaving_the_room_does_not_break_the_poll(tmp_path, qdir) -> None:
-    """Red with: `if (b)` removed from voiceBtn (the null is cached) or `if (!w) return;` removed from voiceSync (the reply
-    leaving the room throws and the room reads "could not be read"). Only the crash is asserted: the drawn rows are not rebuilt,
-    so a late control for A cannot be observed."""
+    """Red only with BOTH `if (b)` removed from voiceBtn (the null is cached) and `if (!w) return;` removed from voiceSync (the
+    reply leaving the room throws and the room reads "could not be read"). Either line alone leaves it green: they guard the
+    same null, and voiceBtn is the only writer, so `if (!w) return;` cannot fire while `if (b)` holds. Only the crash is
+    asserted: the drawn rows are not rebuilt, so a late control for A cannot be observed."""
     b = _room("t1", *A, _op(4, "again"), _item(5, "vendor_agent_text", "B reply"), _item(6, "vendor_turn_ended"))
     v = _run(tmp_path, qdir, [
         {"eval": "window.__b = LevainVoice.button; LevainVoice.button = (r) => (r.gseq === 3 ? null : window.__b(r)); 1"},
