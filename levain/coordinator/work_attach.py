@@ -30,8 +30,8 @@ holds, never on the worker name a report carries:
   is refused ``worker-mismatch``. Its later events keep the kind its attach was recorded with (else ``kind-mismatch``),
   and it never names the kind ``launch``. The session is real when its observed interval (``sessions_seen``, written
   by the service on every pass whose listing it could read, from its first sighting to its last, this pass's listing
-  (:func:`live_session_ids`) counting as a sighting now) reaches the report's ``at`` within :data:`GRACE_PASSES` pass
-  intervals either side: a seat whose last act is ``landed`` or ``ended`` and which then exits is still judged on what
+  (:func:`live_session_ids`) counting as a sighting now) reaches the report's ``at``: its last sighting within :data:`GRACE_PASSES` pass
+  intervals after it, its first no more than :data:`DEFER_DEADLINE` later: a seat whose last act is ``landed`` or ``ended`` and which then exits is still judged on what
   was true when it spoke. An unreadable listing defers such a report, and one deferred past :data:`DEFER_DEADLINE`
   after its ``at`` is refused ``no-evidence-timeout``.
 * An ``attach`` on an item another worker holds is refused ``held-by-other``: only a coordinator reassigns. Holding is
@@ -47,8 +47,8 @@ Known edges (ruled, one line each):
 * A seat-chosen ``--report-id`` is the seat's own; one that repeats another seat's id is queued once (L2 F17).
 * A worker name is bound to the session of its open attach: once that attach has ended, or no longer holds its item,
   an attach from a new session rebinds the name.
-* A report written more than :data:`GRACE_PASSES` pass intervals before the service first saw its session (no watch ran when the seat
-  spoke) is refused ``worker-not-a-launch``: the session's observed interval does not reach it.
+* A report written more than :data:`DEFER_DEADLINE` before the service first saw its session is refused
+  ``worker-not-a-launch``; within it, a seat that attached while no watch ran is accepted.
 * A session attach that stopped holding (its session long unseen) and whose session is seen again holds again; its
   worker's reports still apply to the attach it opened.
 * No coordinator verb applies the board's queue: while a coordinator or the operator holds the board lease the service
@@ -522,14 +522,15 @@ def _evidence(conn: sqlite3.Connection, now: str, r: Mapping[str, Any], live: Co
     if other is not None:
         raise _Refused("worker-mismatch", f"session {sid} attached as {other[0]}, not as {r['worker']}")
     # the session's observed interval, this pass's listing counting as a sighting now (L3 X3), must reach the report's
-    # time within the grace (L3 C1)
+    # time: its last sighting within the grace (L3 C1), its first sighting no later than the evidence deadline after
+    # it (a seat that attached while no watch ran is normal use)
     at, clock = _when(r["at"]), _when(now)
     grace = timedelta(seconds=GRACE_PASSES * every)
     seen = conn.execute("SELECT first_seen, last_seen FROM sessions_seen WHERE session_id = ?", (sid,)).fetchone()
     first, last = (_when(seen[0]), _when(seen[1])) if seen is not None else (None, None)
     if live is not None and sid in live:
         first, last = min(first or clock, clock), max(last or clock, clock)
-    if first is not None and last is not None and first <= at + grace and last >= at - grace:
+    if first is not None and last is not None and first <= at + DEFER_DEADLINE and last >= at - grace:
         return "real", None
     if live is None:
         if clock - at > DEFER_DEADLINE:

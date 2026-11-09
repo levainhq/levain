@@ -153,15 +153,39 @@ def test_x3_a_future_dated_report_is_refused(clocked):
     assert got.refused == [("r-future", "malformed-report")] and got.applied == []
 
 
-def test_x3_a_report_backdated_before_the_session_was_first_seen_is_refused_and_a_normal_one_applies(clocked):
+def test_x3_a_report_written_before_the_first_sighting_within_the_deadline_is_accepted(clocked):
+    """A seat that attached while no watch ran is normal use: first sighting up to the evidence deadline after."""
     board, clock, store, token = clocked
     _free(store, token)
     _seen(board, clock, "sess-a")
     clock.advance(minutes=1)
-    _q(board, "r-back", clock.iso(minutes=-20), harness_session_id="sess-a")
+    _q(board, "r-early", clock.iso(minutes=-20), harness_session_id="sess-a")
+    got = _apply(board, clock, frozenset({"sess-a"}))
+    assert got.applied == ["r-early"] and got.refused == []
+
+
+def test_x3_a_report_older_than_the_deadline_before_the_first_sighting_is_refused(clocked):
+    board, clock, store, token = clocked
+    _free(store, token)
+    _seen(board, clock, "sess-a")
+    clock.advance(minutes=1)
+    _q(board, "r-back", clock.iso(minutes=-45), harness_session_id="sess-a")
     _q(board, "r-now", clock.iso(), harness_session_id="sess-a")
     got = _apply(board, clock, frozenset({"sess-a"}))
     assert got.refused == [("r-back", "worker-not-a-launch")] and got.applied == ["r-now"]
+
+
+def test_x3_the_boundary_is_exactly_the_deadline(clocked):
+    board, clock, store, token = clocked
+    _free(store, token)
+    _seen(board, clock, "sess-a")
+    first = clock.now
+    d = work_attach.DEFER_DEADLINE
+    _q(board, "r-edge", (first - d).isoformat(), harness_session_id="sess-a")
+    _q(board, "r-over", (first - d - timedelta(seconds=1)).isoformat(), harness_session_id="sess-a",
+       event="progress")
+    got = _apply(board, clock, frozenset({"sess-a"}))
+    assert got.applied == ["r-edge"] and got.refused == [("r-over", "worker-not-a-launch")]
 
 
 # ------------------------------------------------------------------------------------------------ X4
