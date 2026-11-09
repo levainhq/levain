@@ -109,6 +109,11 @@ async def sync_run(w: R6.World, n: int) -> str:
     return run.run_id
 
 
+def exchange_rows(w: R6.World) -> list:
+    """The sink's rows that are an exchange's, not a run's final count (W3-3b: keys writes one per closed run)."""
+    return [r for r in w.rows() if r.get("format") != "levain-dispatch-run-final/1"]
+
+
 def one_row_each(w: R6.World) -> dict:
     """Exactly one row at CONTROL for every ticketed exchange in keys' ledger, none quarantined (invariant 3)."""
     # a run-final row (W3-3b) is keys' count of a run, not an exchange's row: it is not one of the exchanges here
@@ -287,7 +292,7 @@ def test_keys_restart_keeps_ledger_lineage_invariant_3(py):
             await asyncio.gather(*held, return_exceptions=True)
             w.up.release.set()
             await w.start_keys()
-            await aio_until(lambda: len(w.rows()) == 3, 20, "three rows")
+            await aio_until(lambda: len(exchange_rows(w)) == 3, 20, "three exchange rows")
             await sync_run(w, 1)
             return before, open(w.ledger_path, "rb").read(), w.ledger(), list(w.received), one_row_each(w), \
                 w.stop_keys()
