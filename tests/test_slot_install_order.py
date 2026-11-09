@@ -247,7 +247,7 @@ def test_undo_leaves_no_shared_gid_on_store(host):
     plan = _plan(host, 3, 1)
     named = {r.path for r in plan.rows if r.group in SHARED_GROUPS}
     L = STORE[host]
-    assert {L / "export/operator", L / "export/dispatch", L / "queue/requests", L / "queue/answers",
+    assert {L / "export/operator", L / "export/dispatch", L / "queue/requests",
             L / "contracts", L / "lineage"} <= named
     undo = _undo(host, dict(plan.allocation.ids))
     root_grp = "wheel" if host == "darwin" else "root"

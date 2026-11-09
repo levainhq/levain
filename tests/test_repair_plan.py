@@ -216,6 +216,17 @@ def test_repair_plans_from_pre_change_host(tmp_path: Path) -> None:
     assert tree(tmp_path / "id2", empty=True) != base
 
 
+def test_repair_reapplies_the_answers_row_owner_before_mode(tmp_path: Path) -> None:
+    """An install whose answers directory is still in the queue group is migrated by the row pass: the chown to the
+    broker's group lands before the mode step, and the mode is 2750 (macOS clears the ACL between the two)."""
+    facts, rf = _pre_change(tmp_path)
+    steps = _plan(facts, rf).steps
+    mine = [s for s in steps if s.argv and s.argv[-1].endswith("/queue/answers")]
+    kinds = [(Path(s.argv[0]).name, s.argv[1:-1]) for s in mine]
+    assert kinds == [("mkdir", ()), ("chown", ("-h", f"{OP}:_levain_qbroker")), ("chmod", ("-h", "-N")),
+                     ("chmod", ("-h", "2750"))], kinds
+
+
 def test_repair_completion_is_the_txn(tmp_path: Path) -> None:
     gen = "gen-" + "1" * 16
     shape = G.InstallShape(generation=gen, levain="1.0", h11="0.16.0", completed_txn=TXN_A, started_after={},
