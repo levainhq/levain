@@ -7,7 +7,7 @@
 non-zero exit, raised before the next act: nothing after the refusing check acts.
 
 Verbs built here: ``prepare``, ``render``, ``resume``, ``status``, ``adopt-open``, ``adopt-verify``, ``discard`` and
-``restore`` (session 5's);
+``restore`` (session 5's) and ``read-allow`` (row 165: one fixed file of the operator's own retained clone);
 ``start`` and ``teardown`` dispatch to :mod:`levain.slot.start`, ``probe`` (V13) to :mod:`levain.slot.probe`. Every other verb (derive: ``VERBS`` less
 ``VERB_HANDLERS``) answers ``verb-unbuilt:<verb>``. A ticketed (``_levain_dispatch``) ``prepare`` takes its slot by
 §3.5 Pool's point-of-use rules and writes ``ATTACH``'s ``ticket_facts`` into alloc before it returns (S1 3c-7).
@@ -3870,10 +3870,103 @@ def restore(ctx: Ctx, req: RuntimeRequest, blob: None) -> Dict[str, object]:
     return _store_verb(ctx, req, SV.restore)
 
 
+#: ``read-allow``: the one file a slot's "don't ask again" dialog writes, inside the retained clone.
+ALLOW_PATH = ("tree", "repo", ".claude")
+ALLOW_NAME = "settings.local.json"
+ALLOW_CAP = 64 * 1024
+
+
+def _allow_dir(store_fd: int, session: str) -> Optional[int]:
+    """An fd on ``retained/<session>/tree/repo/.claude`` reached one component at a time, none followed; ``None`` when a
+    component is absent. A component that is a link or not a directory is ``allow-unreadable``: the walk is of
+    slot-written names, so nothing on it is trusted and nothing is written."""
+    cur = os.dup(store_fd)
+    try:
+        for part in ("retained", session, *ALLOW_PATH):
+            try:
+                nxt = os.open(part, _O_DIR, dir_fd=cur)
+            except FileNotFoundError:
+                os.close(cur)
+                return None
+            except OSError as e:
+                if e.errno in (errno.ELOOP, errno.ENOTDIR, errno.EMLINK):
+                    raise Refused("allow-unreadable", f"{part} is not a directory") from None
+                raise
+            os.close(cur)
+            cur = nxt
+        return cur
+    except BaseException:
+        try:
+            os.close(cur)
+        except OSError:
+            pass
+        raise
+
+
+def read_allow(ctx: Ctx, req: RuntimeRequest, blob: None) -> Dict[str, object]:
+    """``read-allow <session>`` (operator only): the bytes of ``.claude/settings.local.json`` from the caller's OWN
+    RETAINED session's clone, so the supervisor can offer the rules the slot's dialog saved. No path and no name come
+    from the caller. The caller is bound as every lease-free verb binds it (``no-session`` for another's session); the
+    session must be RETAINED by root's facts (``not-retained:trash``, ``not-retained:absent``). The file must be
+    regular, with one link, within :data:`ALLOW_CAP`; anything else is ``allow-unreadable``, never content. Answers
+    ``{present: false}`` when the file or a directory above it is absent, else ``{present: true, b64}``."""
+    from levain.slot import store_verbs as SV
+
+    assert req.session is not None
+    try:
+        a = read_alloc(ctx, req.session)
+    except ContractError as e:
+        raise Refused("no-session", req.session) from e
+    facts = SV.facts_from_alloc(a, ctx.seams.L)
+    sv = SV.StoreSeams(cas=lambda target, fields: None, owner_ok=ctx.seams.trusted)
+    if os.path.lexists(facts.trash):
+        raise Refused("not-retained:trash", a.session)
+    if not SV.retained_whole(facts, sv):
+        raise Refused("not-retained:absent", a.session)
+    dfd = _allow_dir(ctx.store.fd, a.session)
+    if dfd is None:
+        return {"present": False}
+    try:
+        try:
+            before = os.stat(ALLOW_NAME, dir_fd=dfd, follow_symlinks=False)
+        except FileNotFoundError:
+            return {"present": False}
+        if not stat.S_ISREG(before.st_mode):
+            raise Refused("allow-unreadable", f"{ALLOW_NAME} is not a regular file")
+        try:
+            fd = os.open(ALLOW_NAME, _O_READ, dir_fd=dfd)
+        except OSError as e:
+            if e.errno in (errno.ELOOP, errno.EMLINK, errno.ENXIO):
+                raise Refused("allow-unreadable", f"{ALLOW_NAME} is a link or not a file") from None
+            raise
+        try:
+            st = os.fstat(fd)
+            if not stat.S_ISREG(st.st_mode) or (st.st_dev, st.st_ino) != (before.st_dev, before.st_ino):
+                raise Refused("allow-unreadable", f"{ALLOW_NAME} changed while opening")
+            if st.st_nlink != 1:
+                raise Refused("allow-unreadable", f"{ALLOW_NAME} has {st.st_nlink} links")
+            if st.st_size > ALLOW_CAP:
+                raise Refused("allow-unreadable", f"{ALLOW_NAME} is over {ALLOW_CAP} bytes")
+            out = bytearray()
+            while len(out) <= ALLOW_CAP:
+                chunk = os.read(fd, min(65536, ALLOW_CAP + 1 - len(out)))
+                if not chunk:
+                    break
+                out += chunk
+            if len(out) > ALLOW_CAP:
+                raise Refused("allow-unreadable", f"{ALLOW_NAME} is over {ALLOW_CAP} bytes")
+        finally:
+            os.close(fd)
+    finally:
+        os.close(dfd)
+    return {"present": True, "b64": base64.b64encode(bytes(out)).decode("ascii")}
+
+
 VERB_HANDLERS: Dict[str, Callable[[Ctx, RuntimeRequest, object], Dict[str, object]]] = {
     "prepare": prepare, "render": render, "resume": resume, "status": status,
     "start": _start, "teardown": _teardown, "adopt-open": adopt_open, "adopt-verify": adopt_verify,
     "discard": discard, "restore": restore, "probe": _probe, "confirm-identity": _confirm_identity,
+    "read-allow": read_allow,
 }
 
 
