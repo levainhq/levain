@@ -269,28 +269,47 @@ def file_rows(qdir: Path, session: str, rules: Sequence[str], store: Any = None)
     return filed
 
 
+def _answered(qdir: Path, pend: Mapping[str, Any], store: Any) -> Dict[str, Any]:
+    from levain.consent.questions import QuestionStore
+
+    qs = store or QuestionStore(qdir)
+    by_key = {q.agent_session_id: q for q in qs.recent(500) if q.agent_session_id.startswith(KEY_PREFIX)}
+    return {key: by_key[key].answer for key in pend if key in by_key}
+
+
 def apply_answered(qdir: Path, allow_file: Path, store: Any = None, now: Callable[[], str] = _now) -> List[str]:
-    """Carry every rule whose row a person answered ``yes`` into ``allow_file``; a ``no`` drops the pending note.
-    A row not yet answered is left. Returns the rules added."""
-    from levain.consent.questions import ANSWER_CHANNELS, QuestionStore
+    """Carry every rule whose row a person answered ``yes`` AND signed into ``allow_file``; a ``no`` drops the pending
+    note. A rule widens what a slot may do, so it is authority: a yes whose ``signed`` is not True stays pending and
+    writes nothing (``unsigned_yes`` names it). A row not yet answered is left. Returns the rules added."""
+    from levain.consent.questions import ANSWER_CHANNELS
 
     pend = _pending(qdir)
     if not pend:
         return []
-    qs = store or QuestionStore(qdir)
-    by_key = {q.agent_session_id: q for q in qs.recent(500) if q.agent_session_id.startswith(KEY_PREFIX)}
+    answers = _answered(qdir, pend, store)
     added: List[str] = []
     for key in sorted(pend):
-        q = by_key.get(key)
-        a = None if q is None else q.answer
+        a = answers.get(key)
         if a is None or a.channel not in ANSWER_CHANNELS:
             continue
         if a.kind == "option" and a.value == YES:
+            if a.signed is not True:
+                continue
             if append(allow_file, pend[key]["rule"], str(pend[key].get("session", "?")), now):
                 added.append(pend[key]["rule"])
         del pend[key]
     _save_pending(qdir, pend)
     return added
+
+
+def unsigned_yes(qdir: Path, store: Any = None) -> List[str]:
+    """The rules a person answered ``yes`` that are not carried because the answer is not signed."""
+    from levain.consent.questions import ANSWER_CHANNELS
+
+    pend = _pending(qdir)
+    return [pend[k]["rule"] for k, a in sorted(_answered(qdir, pend, store).items())
+            if a is not None and a.channel in ANSWER_CHANNELS and a.kind == "option" and a.value == YES
+            and a.signed is not True]
 
 
 # --- the launch ---------------------------------------------------------------------------------------------------
@@ -339,7 +358,13 @@ def run(args: Any, out: Any = None) -> int:
             doc = load(path)
             for r in doc["rules"]:
                 out.write(f"{r['rule']}\t(session {r.get('session', '?')}, signed {r.get('signed_at', '?')})\n")
-            if not doc["rules"]:
+            try:
+                waiting = unsigned_yes(qdir)
+            except Exception:   # noqa: BLE001 - the listing of carried rules does not depend on the band
+                waiting = []
+            for rule in waiting:
+                out.write(f"{rule}\t(answered unsigned: sign it to carry it)\n")
+            if not doc["rules"] and not waiting:
                 out.write("no slot allow rules\n")
             return 0
         if verb == "revoke":
@@ -357,4 +382,4 @@ def run(args: Any, out: Any = None) -> int:
 
 
 __all__ = ["AGENT", "AllowRefused", "FILE_NAME", "FORMAT", "NO", "YES", "append", "apply_answered", "file_rows", "load",
-           "merge_into_frozen", "parse_local_allow", "read_regular", "register", "revoke", "run", "rules_of", "shape_ok", "undo"]
+           "merge_into_frozen", "parse_local_allow", "read_regular", "register", "revoke", "run", "rules_of", "shape_ok", "undo", "unsigned_yes"]
