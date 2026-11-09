@@ -1261,18 +1261,21 @@ def _change_config(args: argparse.Namespace, cmd: str, d: Path, out: Any, emit: 
 def _sign_queue(args: argparse.Namespace) -> Path:
     """The cockpit Signer's queue directory a phone approval is filed in and read from: ``--sign-queue-dir``, else
     ``$LEVAIN_SIGN_QUEUE_DIR`` or the hook queue's ``sign_queue_dir`` (as the band's sign cards find it)."""
-    from levain.consent.answer_countersign import sign_queue_dir
+    from levain.consent.answer_countersign import SignQueue, resolve_sign_queue, sign_queue_hint
 
     if args.sign_queue_dir is not None:
         got = args.sign_queue_dir.expanduser()
         if not got.is_absolute():
             raise InputRefused("--sign-queue-dir must be an absolute path")
+        if not got.is_dir():
+            state = "is not a directory" if got.exists() else "does not exist"
+            raise InputRefused(f"--sign-queue-dir {got} {state}: pass the directory `levain serve --sign-queue-dir` "
+                               "was started with")
         return got
-    found = sign_queue_dir(os.environ)
-    if found is None:
-        raise InputRefused("no signing queue is named: pass --sign-queue-dir (the cockpit Signer's queue), or set "
-                           "LEVAIN_SIGN_QUEUE_DIR")
-    return found
+    found: SignQueue = resolve_sign_queue(os.environ)
+    if found.path is None or not found.path.is_dir():
+        raise InputRefused(f"no usable signing queue: {sign_queue_hint(found)}")
+    return found.path
 
 
 def _phone_keys(args: argparse.Namespace, d: Path) -> Callable[[str], dict[str, Any]]:

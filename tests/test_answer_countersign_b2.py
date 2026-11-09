@@ -206,3 +206,41 @@ def test_a_local_signed_line_files_no_card_and_reads_as_before(monkeypatch, stor
         assert c.execute("SELECT COUNT(*) FROM answer_countersign").fetchone() == (0,)
     assert ac.verdict(store, qs[0].id, sign_queue=signq).state == "no-card"
     assert band_view._remote_badge(store, qs[0].id) == ""                      # a signed row reads no remote badge
+
+
+# --- signpush L3 rulings S1/S3 (11-08): the card's push opens a Sign button in the center ------------------------
+
+def test_s3_the_cards_push_is_a_sign_request_ping_the_center_draws_open(monkeypatch, store, env, keydir, signq, pushes):
+    """S3: answer_countersign's push goes through sender.spawn_sign_request (the real one: only spawn is recorded),
+    with ref == data.sign_id == the filed request id; stored as `send` stores it, the center lists that entry with an
+    OPEN sign state (the Sign button), not text-only."""
+    from levain.webpush import center
+    from levain.webpush.store import PushStore
+
+    via: list[str] = []
+    real = sender.spawn_sign_request
+    monkeypatch.setattr(sender, "spawn_sign_request", lambda q, rid, **kw: via.append(rid) or real(q, rid, **kw))
+    seen(store, env, 1)
+    remote_line(monkeypatch, store, env, keydir, "1a", signq)
+    [path] = cards(signq)
+    rid = path.stem
+    assert via == [rid]
+    [p] = pushes
+    assert p["kind"] == "attention" and p["ref"] == rid and p["data"]["sign_id"] == rid and p["data"]["id"] == rid, p
+    ps = PushStore(signq)
+    ps.add_ping(p["kind"], p["ref"], p["title"], p["body"], data=p["data"])
+    [item] = center.list_items(ps)["items"]
+    n = item["needs"]
+    assert item["source"] == "needs" and n["sign_id"] == rid and n["sign_state"] == "open" and n["sign_v"], item
+
+
+@pytest.mark.parametrize("body", ["", "   \n"])
+def test_s1_a_blank_body_still_names_the_request_so_the_button_stays(monkeypatch, signq, pushes, body):
+    """S1: a blank ``what`` makes the center drop the ping's data, and with it the Sign button: the title stands in."""
+    from levain.webpush import center
+
+    rid = "lv-0123456789abcdef"
+    assert sender.spawn_sign_request(signq, rid, title=ac.CARD_TITLE, body=body, url=f"{ORIGIN}/sign/{rid}")
+    [p] = pushes
+    assert p["data"]["what"] == ac.CARD_TITLE
+    assert center.needs_data(__import__("json").dumps(p["data"]), rid) is not None

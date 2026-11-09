@@ -7,10 +7,11 @@ the caps and the estimated spend), ``POST /cockpit/voice/speak`` (one chunk of a
 returns the ``voice.json`` body as a dict; ``levain.web_server`` runs the gates (design section 2) and writes the
 answer.
 
-Premium dictation (the transcribe route, and the ``stt`` use in ``voice.json``) is OFF in Levain 1.0 (Phill 11-05): the
-server refuses the transcribe POST with :data:`WORDS` ``premium_stt_off`` before it reads a key, reserves a meter row or
-reads a body byte, unless it was started with the hidden ``--premium-stt`` switch of ``levain serve``. The code below is kept whole
-for a later release; the switch is the only thing that gates it.
+Premium dictation (the transcribe route, the live stream routes, and the ``stt`` use in ``voice.json``) is ON when a
+provider that has a speech-to-text model holds a key listing ``stt`` among its uses, and OFF when no such key exists
+(Phill 11-08). Otherwise the server refuses the transcribe POST with :data:`WORDS` ``premium_stt_off`` before it reads a
+key, reserves a meter row or reads a body byte. ``levain serve --premium-stt`` forces it on and ``--no-premium-stt`` off;
+:func:`premium_stt_on` is the one place that decides, per request.
 
 The call sequence is the design's section 3 and its order is the point:
 
@@ -61,14 +62,14 @@ VOICE_JSON = "/cockpit/voice.json"
 SPEAK_PATH = "/cockpit/voice/speak"
 TRANSCRIBE_PATH = "/cockpit/voice/transcribe"
 VOICE_PATHS = (SPEAK_PATH, TRANSCRIBE_PATH)
-# live dictation (cockpit mic S3): three POSTs carved out beside the two above, behind the same premium-dictation switch
+# live dictation (cockpit mic S3): three POSTs carved out beside the two above, behind the same premium-dictation decision
 STREAM_OPEN = "/cockpit/voice/stream/open"
 STREAM_CHUNK = "/cockpit/voice/stream/chunk"
 STREAM_CLOSE = "/cockpit/voice/stream/close"
 STREAM_PATHS = (STREAM_OPEN, STREAM_CHUNK, STREAM_CLOSE)
 # the providers a live dictation open may select; each must have a row in vprov.STREAM_STT_MODELS (the model sent and the
 # model reserved) and a price row for it. Past: openai was once out because its stream was sent under a model name the
-# ledger did not price. Still behind premium_stt, off by default.
+# ledger did not price. Served only while premium dictation is on (:func:`premium_stt_on`).
 STREAM_PROVIDERS = ("openai", "deepgram")
 STREAM_MAX_SESSIONS = 1                 # one live dictation at a time (the registry's cap)
 STREAM_CHUNK_MAX = stream_session.MAX_CHUNK_BYTES
@@ -141,6 +142,10 @@ PROVIDERS: dict[str, ProviderData] = {
                              "Every call opts out of Deepgram's model-improvement programme (mip_opt_out). Retention "
                              "periods are not stated on Deepgram's pages."),
 }
+# Where to add credit, per provider (a read-only link on the panel). [checked 2026-11-08: Deepgram's console root loads; Inworld's
+# docs name its Billing page as where the balance shows and credits are added.] No balance is read: the Deepgram balances
+# endpoint needs a project id, and no Inworld balance endpoint was found in its docs on that date.
+CONSOLE_URLS = {"deepgram": "https://console.deepgram.com", "inworld": "https://platform.inworld.ai/billing"}
 # a record kind exists for these (authority.VOICE_KEY_PROVIDERS) but no adapter does
 UNSUPPORTED = {"elevenlabs": "ElevenLabs"}
 
@@ -168,9 +173,9 @@ WORDS = {
     "body_timeout": "The request did not arrive in time; try again.",
     "unsupported_media_type": "Send the recording as audio/webm, audio/mp4, audio/mpeg or audio/wav.",
     "not_found": "Premium voice is not served here.",
-    # premium dictation is hidden for Levain 1.0 (Phill 11-05): the transcribe route answers this, in these words only,
-    # whether or not a key exists, until the server is started with the switch (``levain serve --premium-stt``)
-    "premium_stt_off": "Premium dictation is not offered in this version.",
+    # premium dictation is off: forced off (``levain serve --no-premium-stt``) or no key lists ``stt``. One sentence true
+    # for both, so a refusal says nothing of which
+    "premium_stt_off": "Premium dictation needs a speech-to-text key (or it was turned off for this server).",
     "no_stream": "{p} does not offer live dictation.",
     "stream_media_type": "Send each audio chunk as application/octet-stream.",
     "bad_json": "The request is not valid JSON.",
@@ -292,20 +297,62 @@ def base_type(content_type: str | None) -> str:
 
 # --- the read ---------------------------------------------------------------------------------------------------------
 
+def _grants_for(data_root: Path | str) -> tuple[Any, str]:
+    """The voice-key grants from ONE verified replay of the authority log, and ``"ok"`` / ``"unreadable"``. Presence
+    metadata only: the keychain is never read here."""
+    try:
+        return custody.authority_for(data_root)().policy.grants, "ok"
+    except Exception:       # noqa: BLE001 - any failure is "the log could not be verified now", said, not raised
+        return {}, "unreadable"
+
+
+def _stt_keyed(grants: Any) -> bool:
+    """True when a served provider with a speech-to-text model holds a key whose uses list ``stt``."""
+    if not grants:
+        return False
+    for name, data in offered().items():
+        record = voice_key_for(grants, name) if data.stt_model else None
+        if record is not None and "stt" in record["uses"]:
+            return True
+    return False
+
+
+def premium_stt_state(setting: Any, data_root: Path | str) -> str:
+    """``"on"``, ``"off"`` or ``"unreadable"`` for THIS request. ``setting`` is the server's switch: a literal ``True``
+    forces it on, a literal ``False`` forces it off, anything else (None, a truthy string) is AUTO: on while some provider
+    that has a speech-to-text model holds a key listing ``stt``, read from the authority log now, so a key added or
+    revoked after the server started takes effect on the next request. ``"unreadable"`` is AUTO with a log that could not
+    be replayed (fail closed, said in its own words, never as "needs a key"). Key presence only; no secret is read."""
+    if setting is True:
+        return "on"
+    if setting is False:
+        return "off"
+    grants, status = _grants_for(data_root)
+    if status != "ok":
+        return "unreadable"
+    return "on" if _stt_keyed(grants) else "off"
+
+
+def premium_stt_on(setting: Any, data_root: Path | str) -> bool:
+    """Whether premium dictation is on for THIS request (:func:`premium_stt_state` is ``"on"``)."""
+    return premium_stt_state(setting, data_root) == "on"
+
+
 def serve_voice(data_root: Path | str, meter: vmeter.Meter, *, last_read: MutableMapping[str, str | None],
-                premium_stt: bool = False) -> dict[str, Any]:
+                premium_stt: Any = None) -> dict[str, Any]:
     """The body of ``GET /cockpit/voice.json``. Whether a provider has a key comes from ONE verified replay of the
     authority log at ``data_root``; the keychain is never read here (Q-D3), so a page's poll never reaches it. Only a
     record's id and uses are shown (no keychain names, no part of a value). ``last_read`` is the outcome of this
     process's last key read or provider call per provider, kept in memory only. The spend is read without creating
-    the ledger. ``premium_stt`` is the server's switch (default off): off, no provider lists ``stt`` among its uses and
-    its retention words leave transcription out, so a page has nothing to offer a dictation control from; the body
-    says ``"premium_stt": false``."""
-    try:
-        grants = custody.authority_for(data_root)().policy.grants
-        authority = "ok"
-    except Exception:       # noqa: BLE001 - any failure is "the log could not be verified now", said, not raised
-        grants, authority = {}, "unreadable"
+    the ledger. ``premium_stt`` is the server's setting (True, False, or None for AUTO; see :func:`premium_stt_on`),
+    resolved here against the same replay the rows come from: off, no provider lists ``stt`` among its uses and its
+    retention words leave transcription out, so a page has nothing to offer a dictation control from; the body says
+    ``"premium_stt": false``. The panel's readout adds ``mic_in`` (the provider the server picked for dictation, or why
+    none), per row ``console_url`` and ``spend`` (set for a provider that holds a key or has counted spend this month, the rows the page draws), and ``spend_other`` (counted spend from providers the page has no row for).
+    The totals in ``caps`` and every ``spend`` come from ONE read of the ledger, so the rows add up to the totals."""
+    grants, authority = _grants_for(data_root)
+    premium_stt_setting = premium_stt
+    premium_stt = premium_stt if premium_stt is True or premium_stt is False else _stt_keyed(grants)
     rows = []
     for name, data in offered().items():
         record = voice_key_for(grants, name) if grants else None
@@ -320,16 +367,38 @@ def serve_voice(data_root: Path | str, meter: vmeter.Meter, *, last_read: Mutabl
                      "speed": [data.speed_min, data.speed_max],
                      "retention": data.retention if premium_stt or not data.retention_speech
                      else data.retention_speech})
+    try:
+        spend, by_provider = meter.snapshot_if_present()      # ONE read, ONE clock: totals are the sum of the rows
+    except vmeter.MeterError:
+        spend, by_provider = None, None
+    for row in rows:
+        row["console_url"] = CONSOLE_URLS.get(row["name"])
+        got = (by_provider or {}).get(row["name"], {})
+        spent = any(got.get(period, (0, 0)) != (0, 0) for period in ("day", "month"))
+        # a row is drawn for a provider that holds a key or has counted spend; its ``spend`` is set exactly then (None when
+        # the ledger cannot be read, where the keyed rows are still drawn)
+        if by_provider is not None and (row["key"] == "set" or spent):
+            (dn, dm), (mn, mm) = got.get("day", (0, 0)), got.get("month", (0, 0))
+            row["spend"] = {"day_calls": dn, "day_est_usd": _usd(dm), "month_calls": mn, "month_est_usd": _usd(mm)}
+        else:
+            row["spend"] = None
+    # counted spend from providers the page has no row for at all (not offered): it counts toward the caps, so the page says so
+    body_other = None
+    if by_provider is not None:
+        rest = [v for name, v in by_provider.items() if name not in {row["name"] for row in rows}]
+        dn, dm = sum(v["day"][0] for v in rest), sum(v["day"][1] for v in rest)
+        mn, mm = sum(v["month"][0] for v in rest), sum(v["month"][1] for v in rest)
+        if mn or dn or mm or dm:
+            body_other = {"day_calls": dn, "day_est_usd": _usd(dm), "month_calls": mn, "month_est_usd": _usd(mm)}
     caps = meter.caps
     body: dict[str, Any] = {"providers": rows, "prices_as_of": meter.prices.as_of, "estimate": True,
-                            "authority": authority, "premium_stt": bool(premium_stt)}
-    try:
-        spend = meter.spent_if_present()
+                            "authority": authority, "premium_stt": bool(premium_stt), "spend_other": body_other}
+    if spend is not None:
         body["meter"] = "ok"
         body["caps"] = {"month_usd": _usd(caps.month_micros), "day_usd": _usd(caps.day_micros),
                         "spent_month_est": _usd(spend.month_micros), "spent_day_est": _usd(spend.day_micros),
                         "month_start": spend.month_start, "day_start": spend.day_start}
-    except vmeter.MeterError:
+    else:
         body["meter"] = "unreadable"
         body["caps"] = {"month_usd": _usd(caps.month_micros), "day_usd": _usd(caps.day_micros),
                         "spent_month_est": None, "spent_day_est": None, "month_start": None, "day_start": None}
@@ -337,6 +406,17 @@ def serve_voice(data_root: Path | str, meter: vmeter.Meter, *, last_read: Mutabl
     if chosen is not None:
         body["stream"] = True
         body["stream_provider"] = chosen
+    # the dictation readout: what the server itself picked (never re-derived by the page), or why there is none
+    if chosen is not None:
+        body["mic_in"] = {"on": True, "provider": chosen, "model": vprov.STREAM_STT_MODELS.get(chosen, "")}
+    elif premium_stt_setting is False:
+        body["mic_in"] = {"on": False, "reason": "turned_off"}
+    elif authority != "ok":
+        body["mic_in"] = {"on": False, "reason": "unreadable"}
+    elif any(r["key"] == "set" and "stt" in r["uses"] for r in rows):
+        body["mic_in"] = {"on": False, "reason": "no_stream_key"}
+    else:
+        body["mic_in"] = {"on": False, "reason": "no_stt_key"}
     return body
 
 

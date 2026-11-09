@@ -230,12 +230,13 @@ def _clock_before_the_openai_cutoff(monkeypatch):
 
 @contextmanager
 def served(rig: Rig, *, room: bool = True, signer_q: Path | None = None, signer_on: bool = True,
-           mesh: bool = False, premium_stt: bool = True):
+           mesh: bool = False, premium_stt: "bool | None" = True):
     """``levain serve`` over the rig. By default with a Signer over the consent reader's own queue, as a real install
     runs it, so the phone's grant routes are served (a voice route reads no key without them). ``signer_q`` names
     another queue; ``signer_on=False`` serves no Signer at all. ``premium_stt`` is the server's premium-dictation
-    switch (``make_server(premium_stt=)``, off in the product): this fixture turns it ON so every transcribe test below
-    runs the route as it was built; the tests of the hidden default pass ``premium_stt=False``."""
+    switch (``make_server(premium_stt=)``, AUTO from key presence in the product): this fixture forces it ON so every
+    transcribe test below runs the route as it was built; the forced-off tests pass ``premium_stt=False`` and the AUTO
+    tests pass ``premium_stt=None``."""
     port = _free_port()
     signer = None
     if signer_q is None and signer_on:
@@ -1746,52 +1747,105 @@ def test_t_gate_the_too_long_sentence_names_the_size_cap_that_is_enforced_not_a_
     assert isinstance(cockpit_voice.UPLOAD_MAX, int) and cockpit_voice.UPLOAD_MAX == 4 * 1024 * 1024
 
 
-# --- 12. HIDDEN-STT: premium dictation is off for Levain 1.0 (Phill 11-05) -------------------------------------------------
+# --- 12. PREMIUM-STT: the switch is AUTO from key presence; True and False force it (Phill 11-05, 11-08 524 a) ----------
 
-OFF_WORDS = "Premium dictation is not offered in this version."
+OFF_WORDS = "Premium dictation needs a speech-to-text key (or it was turned off for this server)."
 
 
-def test_hidestt_the_switch_is_off_unless_named_true_and_the_flag_is_hidden(tmp_path, monkeypatch, capsys):
-    """The default is off in the class, in ``make_server`` and on the CLI, only ``True`` turns it on, and ``--premium-stt``
-    is parsed but absent from ``levain serve --help``.
-    Red with: any default turned to True, ``premium_stt is True`` loosened to a truthiness test (the string case), or the
-    flag's ``help=argparse.SUPPRESS`` removed."""
+def test_premium_stt_the_switch_is_auto_unless_named_a_bool_and_the_cli_has_both_flags(tmp_path, monkeypatch, capsys):
+    """The default is None (auto) in the class, in ``make_server`` and on the CLI; ``--premium-stt`` forces it on,
+    ``--no-premium-stt`` forces it off, and the help says so.
+    Red with: any default turned back to a bool, either flag missing, or the flags left out of ``levain serve --help``."""
     import inspect
 
     import levain.web_server as ws
     from levain.cli import main
 
-    assert ws._LevainHTTPServer.premium_stt is False
-    assert inspect.signature(make_server).parameters["premium_stt"].default is False
-    assert inspect.signature(ws.run_web_server).parameters["premium_stt"].default is False
+    assert ws._LevainHTTPServer.premium_stt is None
+    assert inspect.signature(make_server).parameters["premium_stt"].default is None
+    assert inspect.signature(ws.run_web_server).parameters["premium_stt"].default is None
     got: dict = {}
     monkeypatch.setattr(ws, "run_web_server", lambda path, **k: got.update(k) or 0)
-    assert main(["serve", "--path", str(tmp_path)]) == 0 and got["premium_stt"] is False
+    assert main(["serve", "--path", str(tmp_path)]) == 0 and got["premium_stt"] is None
     got.clear()
     assert main(["serve", "--path", str(tmp_path), "--premium-stt"]) == 0 and got["premium_stt"] is True
+    got.clear()
+    assert main(["serve", "--path", str(tmp_path), "--no-premium-stt"]) == 0 and got["premium_stt"] is False
+    with pytest.raises(SystemExit):
+        main(["serve", "--path", str(tmp_path), "--premium-stt", "--no-premium-stt"])
+    capsys.readouterr()
     with pytest.raises(SystemExit):
         main(["serve", "--help"])
-    assert "--premium-stt" not in capsys.readouterr().out
+    assert "--no-premium-stt" in capsys.readouterr().out
 
 
-def test_hidestt_a_truthy_non_true_value_does_not_turn_it_on(rig):
-    """``make_server(premium_stt="yes")`` is off: the route answers the fixed refusal.
-    Red with: ``httpd.premium_stt = premium_stt is True`` loosened to ``bool(premium_stt)``."""
-    rig.add_key()
+def test_premium_stt_a_truthy_non_bool_value_is_auto_and_forces_nothing(rig):
+    """``make_server(premium_stt="yes")`` is AUTO: with no stt key the route answers the fixed refusal, with one it serves.
+    Red with: ``premium_stt is True`` loosened to ``bool(premium_stt)`` (the no-key request is then served as forced on)."""
     with served(rig, premium_stt="yes") as (port, httpd):      # type: ignore[arg-type]
-        assert httpd.premium_stt is False
+        assert httpd.premium_stt is None
         status, _h, body = transcribe(port)
     assert (status, js(body)["message"]) == (404, OFF_WORDS)
     assert rig.transport.seen == [] and rig.rows() == []
 
 
-def test_hidestt_off_the_transcribe_route_refuses_in_fixed_words_before_anything_is_read(rig, monkeypatch):
+def test_auto_is_on_with_an_stt_keyed_provider_and_off_without_one(rig):
+    """AUTO (``premium_stt=None``): no key, or a key whose uses leave out ``stt``, is off (404 ``premium_stt_off``,
+    ``voice.json`` says false and lists no stt); an stt-keyed provider turns it on (``premium_stt`` true, stt listed).
+    Red with: AUTO resolving to a constant (always off, or always on)."""
+    with served(rig, premium_stt=None) as (port, _httpd):
+        voice = js(call(port, "GET", VOICE_JSON)[2])
+        status, _h, body = transcribe(port)
+    assert voice["premium_stt"] is False and (status, js(body)["message"]) == (404, OFF_WORDS)
+    rig.add_key(uses=("tts",))
+    with served(rig, premium_stt=None) as (port, _httpd):
+        assert js(call(port, "GET", VOICE_JSON)[2])["premium_stt"] is False
+        assert transcribe(port)[0] == 404
+    assert rig.transport.seen == []
+
+
+def test_auto_follows_a_stt_key_added_after_the_server_started(rig):
+    """AUTO is decided per request: a server with no stt key refuses, the key is added with the server running, and the
+    next request is served with no restart. Red with: the switch resolved once at ``make_server``."""
+    with served(rig, premium_stt=None) as (port, _httpd):
+        assert transcribe(port)[0] == 404
+        assert js(call(port, "GET", VOICE_JSON)[2])["premium_stt"] is False
+        rig.add_key()
+        voice = js(call(port, "GET", VOICE_JSON)[2])
+        assert voice["premium_stt"] is True
+        assert next(p for p in voice["providers"] if p["name"] == "openai")["uses"] == ["stt", "tts"]
+        status, _h, body = transcribe(port)
+    assert status != 404 or js(body)["message"] != OFF_WORDS
+
+
+def test_false_forces_off_even_with_a_key(rig):
+    """Red with: a key making AUTO win over an explicit False."""
+    rig.add_key()
+    with served(rig, premium_stt=False) as (port, _httpd):
+        assert js(call(port, "GET", VOICE_JSON)[2])["premium_stt"] is False
+        status, _h, body = transcribe(port)
+    assert (status, js(body)["message"]) == (404, OFF_WORDS)
+    assert rig.transport.seen == []
+
+
+def test_true_forces_on_with_no_key(rig):
+    """With no key at all, True still opens the gate: the request reaches the key read and is refused there as a missing
+    key (409 no_key), not as the off words. Red with: an explicit True consulting the keys (404 premium_stt_off)."""
+    with served(rig, premium_stt=True) as (port, _httpd):
+        assert js(call(port, "GET", VOICE_JSON)[2])["premium_stt"] is True
+        status, _h, body = transcribe(port)
+    assert (status, js(body)["error"]) == (409, "no_key")
+    assert js(body)["message"] != OFF_WORDS
+    assert rig.transport.seen == []
+
+
+def test_premium_stt_off_the_transcribe_route_refuses_in_fixed_words_before_anything_is_read(rig, monkeypatch):
     """With the switch off the transcribe POST answers one 404 in the fixed words, the connection closed, BEFORE the
     content type, the length, the voice slot, the body, the meter and the key are looked at: no key is read, no
     ledger exists, no provider is called, and the answer is the same with a key set and with none. A request that sends
     no body at all, a non-audio type and an over-size length get the same answer (the switch precedes those gates).
     Speak is untouched.
-    Red with: the ``not srv.premium_stt`` guard removed from ``_voice_answer`` (a 200 with a key, a 409 with none,
+    Red with: the ``_premium_stt_gate`` call removed from ``_voice_answer`` (a 200 with a key, a 409 with none,
     a 415/413 for the wrong type or size), or moved after ``_read_body``/``_call`` (the body is read or the key is read)."""
     read = []
     real = custody.read_key
@@ -1826,7 +1880,7 @@ def test_hidestt_off_the_transcribe_route_refuses_in_fixed_words_before_anything
     assert len(rig.transport.seen) == 1
 
 
-def test_hidestt_off_the_listing_offers_no_dictation_and_on_it_does(rig):
+def test_premium_stt_off_the_listing_offers_no_dictation_and_on_it_does(rig):
     """The page reads ``voice.json`` to decide what to offer: off, no provider lists ``stt`` among its uses, the body
     says ``premium_stt: false`` and the retention words leave transcription out; on, it is as it was.
     Red with: the ``u != "stt" or (premium_stt and data.stt_model)`` filter dropped (stt listed while off), or the retention choice dropped."""
@@ -1911,7 +1965,7 @@ def test_another_providers_key_is_never_used_for_inworld(rig):
 
 
 def test_inworld_is_speech_only_a_transcribe_naming_it_is_refused_before_any_key_or_meter_row(rig, monkeypatch):
-    """Premium dictation is off in the product; with the hidden switch on, Inworld still has no dictation to offer. The record
+    """With premium dictation on, Inworld still has no dictation to offer. The record
     names ``stt`` as one signed by a build without custody's per-provider uses would (custody refuses it now).
     Red with: the ``stt_model`` check dropped from ``_query_provider``."""
     monkeypatch.setattr(custody, "PROVIDER_USES", {})
@@ -1982,3 +2036,30 @@ def test_an_inworld_call_is_metered_in_utf16_code_units_so_an_emoji_reserves_two
     assert status == 200
     (row,) = rig.rows()
     assert (row.units, row.cost_micros) == (5, 15 * 5), (row.units, row.cost_micros)       # H i space = 3, the emoji = 2
+
+
+def test_auto_transcribe_with_the_authority_log_unreadable_says_so_not_that_a_key_is_needed(rig, monkeypatch):
+    """AUTO with a log that cannot be replayed: the transcribe POST answers 503 `authority_unreadable` in that error's own
+    words (the log is the fault, not a missing key); nothing is read or sent. Red with: the gate answering `premium_stt_off`."""
+    rig.add_key()
+
+    def unreadable(_root):
+        raise RuntimeError("the log does not replay")
+
+    with served(rig, premium_stt=None) as (port, _httpd):
+        monkeypatch.setattr(custody, "authority_for", unreadable)
+        status, _h, body = transcribe(port)
+    assert (status, js(body)["error"], js(body)["message"]) == (
+        503, "authority_unreadable", cockpit_voice.WORDS["authority_unreadable"])
+    assert rig.transport.seen == [] and rig.rows() == []
+
+
+def test_both_premium_stt_flags_default_to_none_whatever_their_order():
+    """Each of ``--premium-stt`` and ``--no-premium-stt`` carries its own ``default=None``, so reordering the two
+    ``add_argument`` calls cannot turn the unflagged default into True. Red with: either default dropped."""
+    from levain.cli import build_parser
+
+    parser = build_parser()
+    sub = next(a for a in parser._actions if a.__class__.__name__ == "_SubParsersAction").choices["serve"]
+    defaults = {a.option_strings[0]: a.default for a in sub._actions if a.dest == "premium_stt"}
+    assert defaults == {"--premium-stt": None, "--no-premium-stt": None}

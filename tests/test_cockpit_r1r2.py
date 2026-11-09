@@ -633,11 +633,11 @@ function mk(t) { return { tagName: t, className: "", children: [], attrs: {}, li
   closest() { return null; } }; }
 const el = (t, c, x) => { const n = mk(t); if (c) n.className = c; if (x != null) n.textContent = x; return n; };
 const sporeQueries = {};
-const f = new Function("el", "sporeQueries", "measureOverflow", "measureClauses", block + "\nreturn mountSporeFilter;");
+const f = new Function("el", "sporeQueries", "measureOverflow", "measureClauses", "narrowPlaceholder", block + "\nreturn mountSporeFilter;");
 const rowsOf = (panel) => panel.children[1].children.filter((c) => c.className === "row").length;
 const ROWS = [1, 2, 3, 4, 5].map((i) => ({ id: "spore-" + i, text: i === 4 ? "Kettle bell" : "item " + i }));
 for (const kind of ["tray", "spores"]) {
-  const mount = f(el, sporeQueries, () => {}, () => {});
+  const mount = f(el, sporeQueries, () => {}, () => {}, () => {});
   const p = mk("div");
   mount(p, ROWS, "items", kind, (rows, results) => rows.forEach((s) => results.appendChild(el("div", "row", s.id))));
   const input = p.children[0].children[0];

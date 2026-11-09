@@ -9,7 +9,7 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
-from tests.test_cockpit_narrow_layout_rig import NEEDS, TOK, FullRig, drive_touch, needs_browser, needs_ssh
+from tests.test_cockpit_narrow_layout_rig import NEEDS, TOK, FullRig, drive_touch, drop_tap, needs_browser, needs_ssh
 from tests.test_envelope_sheet import FD, SIGN_ON, _in, _tag, make_init
 from tests.test_msgslot_hero import BOX, READY, TXT, _tagged, _type
 
@@ -43,7 +43,7 @@ def _state(t: str) -> dict:
 
 def _run(tmp_path: Path, monkeypatch, status: int, signed: bool) -> dict:
     init = make_init() + ";" + SERVER.replace("__STATUS__", str(status))
-    send = ([{"eval": "document.querySelector('#ck-drop [data-coord-drop=envelope]').click(); 1"},
+    send = ([drop_tap("envelope"),
              {"until": _in(FD, "return !!d.getElementById('drop-review') && /ev-test/.test(d.getElementById('drop-review').textContent);"), "ms": 30000},
              SIGN_ON, {"tap": f"{FD}.querySelector('#drop-sign')"},
              {"until": _in(FD, "return /delivered|Not sure|not delivered/.test(d.getElementById('sheet-note').textContent);"), "ms": 20000},
@@ -51,7 +51,7 @@ def _run(tmp_path: Path, monkeypatch, status: int, signed: bool) -> dict:
              {"eval": "(document.getElementById('levain-sign-sheet-frame') ? 1 : 0)"},
              {"eval": _in(FD, "const c = d.getElementById('sheet-close'); if (c) c.click(); return 1;")},
              {"eval": "new Promise((r) => setTimeout(() => r(1), 1500))"}] if signed
-            else [{"eval": "document.querySelector('#ck-drop [data-coord-drop=send]').click(); new Promise((r) => setTimeout(() => r(1), 1500))"}])
+            else [drop_tap("send"), {"eval": "new Promise((r) => setTimeout(() => r(1), 1500))"}])
     steps = [{"emulate": {"w": 430, "h": 932, "dpr": 3, "mobile": True}}, {"touch": True}, {"init": init}, {"until": NEEDS, "ms": 30000},
              {"until": READY, "ms": 30000}, _type(WORDS), *send, *HOME, _state("home"),
              {"eval": "location.reload(); 1"}, {"eval": "new Promise((r) => setTimeout(() => r(1), 2500))"}, {"until": READY, "ms": 30000}, _state("reload")]
@@ -61,7 +61,7 @@ def _run(tmp_path: Path, monkeypatch, status: int, signed: bool) -> dict:
 
 
 OTHER = "words typed only in the sheet"
-OPEN_SHEET = [{"eval": "document.querySelector('#ck-drop [data-coord-drop=envelope]').click(); 1"},
+OPEN_SHEET = [drop_tap("envelope"),
               {"until": _in(FD, "return !!d.getElementById('drop-review') && /ev-test/.test(d.getElementById('drop-review').textContent);"), "ms": 30000}]
 DELIVERED = [SIGN_ON, {"tap": f"{FD}.querySelector('#drop-sign')"},
              {"until": _in(FD, "return /delivered|Not sure|not delivered/.test(d.getElementById('sheet-note').textContent);"), "ms": 20000},

@@ -29,7 +29,11 @@
  "facets": [
   "age_days",
   "attention",
+  "band_age",
+  "band_carried",
+  "band_later_words",
   "band_number",
+  "band_section",
   "board_rank",
   "board_tier",
   "disposition",
@@ -62,6 +66,18 @@
    "count": 1,
    "id": "band",
    "title": "Needs you (answer it in Decisions)"
+  },
+  {
+   "count": 0,
+   "id": "desk",
+   "title": "Desk owes (the desk is on these; nothing for you)",
+   "uncounted": true
+  },
+  {
+   "count": 0,
+   "id": "later",
+   "title": "Later",
+   "uncounted": true
   },
   {
    "count": 2,
@@ -268,6 +284,7 @@
    "emphasis": "none",
    "facets": {
     "age_days": 0,
+    "band_age": "0m",
     "band_number": null,
     "list_pointer": "answer it in Decisions (levain band)",
     "source": "levain · claude_code",

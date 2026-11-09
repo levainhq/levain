@@ -1532,7 +1532,11 @@ class TestListPagePinsRound2:
 
     def test_the_surface_filter_reaches_the_held_rows(self) -> None:
         core = self._js("dashboard_core.js")
-        assert "held.filter(inSurface)" in core and core.count("held.filter(inSurface)") == 2
+        # three reach points: the card's extra rows, and the unlisted hint in both of its branches
+        assert core.count("held.filter(inSurface)") == 3
+        assert "heldShownNow() ? held.filter(inSurface) : []" in core
+        assert "!heldShownNow() ? held.filter(inSurface)" in core
+        assert "!heldChosen() ? held.filter(inSurface)" in core
 
     def test_a_write_in_flight_never_clobbers_the_draft_typed_since(self) -> None:
         core = self._js("dashboard_core.js")

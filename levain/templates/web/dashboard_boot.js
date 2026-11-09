@@ -860,12 +860,30 @@
 
 
   let heldNext = null;
+  // the server offers no Threads zone (make_server(threads=False)): the zone's boot reads this. Both data sources call it.
+  function markThreadsOff() {
+    if (document.body.dataset.threads === "off") return;
+    document.body.dataset.threads = "off";
+    window.dispatchEvent(new Event("levain:threads-off"));
+  }
+
+  // the zone stays hidden until a read says threads are on (no flash before the manifest lands): both data sources call it
+  function markThreadsRead() {
+    if (document.body.dataset.threadsRead === "1") return;
+    document.body.dataset.threadsRead = "1";
+    window.dispatchEvent(new Event("levain:threads-off"));   // the zone's sync listens on this one event
+  }
+
   async function loadManifestView(passive) {
     const usedToken = storedToken();      // the credential this read goes out with: a decline drops that one, never a newer one
-    let manifest = await authedReadJson("/cockpit/manifest.json");   // settles the token: panels do not re-prompt
+    let manifest;
+    try { manifest = await authedReadJson("/cockpit/manifest.json"); }   // settles the token: panels do not re-prompt
+    catch (e) { markThreadsRead(); throw e; }     // a failed read does not say threads are off: only an explicit threads:false hides the zone
     // A writable install that wants a token and read the manifest without one (a loopback read needs none)
     // would draw every action refused. Ask for the token now, then read again as that credential.
     const cred = manifest && manifest.credential;
+    if (manifest && manifest.transport && manifest.transport.threads === false) markThreadsOff();
+    else markThreadsRead();     // a transport-less manifest is no "off" either (the server 404s every thread write when threads are off)
     if (manifest && manifest.transport && typeof manifest.transport.owner_key === "boolean") tokenAuth = manifest.transport.owner_key ? "owner" : "pair";
     const wantsToken = !!(manifest && manifest.transport && manifest.transport.write_token_required === true
       && cred && cred.class === "none");
@@ -1004,6 +1022,7 @@
       // Track whether THIS surface demands the write token so commit()'s writeHeaders attaches it.
       // True on any writable surface (K2a), false on a read-only one.
       writeTokenRequired = view.write_token_required === true;
+      if (view.threads === false) markThreadsOff(); else markThreadsRead();
       // Gate the write transport on the substrate being writable (NO THEATER): a
       // read-only source (no install root → POST /edit 422s) renders with no edit
       // affordances at all, matching the server. An older payload without
@@ -1123,8 +1142,10 @@
   }
 
   function sync() {
-    const want = !!token() && document.body.dataset.mode === "build" && document.visibilityState !== "hidden";
-    section.hidden = !token();
+    const off = document.body.dataset.threads === "off";
+    const read = document.body.dataset.threadsRead === "1";
+    const want = !off && read && !!token() && document.body.dataset.mode === "build" && document.visibilityState !== "hidden";
+    section.hidden = off || !read || !token();
     if (want && !view) {
       host.replaceChildren();
       const T = window.LevainCockpitTransport;
@@ -1172,6 +1193,7 @@
     }, true);
     document.addEventListener("visibilitychange", sync);
     window.addEventListener("storage", (e) => { if (e.key === WRITE_TOKEN_KEY) sync(); });
+    window.addEventListener("levain:threads-off", sync);
     window.addEventListener("levain:write-token-change", sync);   // the same page's own set / remove (dashboard_boot's token handling)
     sync();
   }
