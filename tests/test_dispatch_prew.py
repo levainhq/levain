@@ -10,7 +10,9 @@
   anything else, or a file that is not root's alone, is OFF with its reason."""
 from __future__ import annotations
 
+import errno
 import os
+import socket
 import sqlite3
 
 import pytest
@@ -945,3 +947,38 @@ def test_main_on_shuts_both_servers_down_within_one_budget(tmp_path, monkeypatch
     assert all(0.5 * budget < b <= budget for b in rig.server.shut + rig.server.brokered.shut)
     # ... and the two ran at once
     assert took < 1.5 * budget, f"both shutdowns took {took:.2f}s against one budget of {budget}s"
+
+
+# --- w3client r1 C: an accept error never leaves one listener dead while the other lives -----------------------------
+
+class _ScriptedListener:
+    def __init__(self, script, stop):
+        self.script, self.stop, self.accepts = list(script), stop, 0
+
+    def settimeout(self, _t):
+        pass
+
+    def accept(self):
+        self.accepts += 1
+        step = self.script.pop(0) if self.script else None
+        if step is None:
+            self.stop.set()
+            raise socket.timeout()
+        raise step
+
+
+@pytest.mark.parametrize("err", [errno.EMFILE, errno.ENFILE, errno.ECONNABORTED, errno.EINTR])
+def test_serve_retries_a_recoverable_accept_error(err):
+    import threading
+    stop = threading.Event()
+    lst = _ScriptedListener([OSError(err, "recoverable")], stop)
+    DR.serve(object(), lst, stop)
+    assert lst.accepts == 2                     # it accepted again after the error, and left only on the stop
+
+
+def test_serve_sets_the_shared_stop_on_an_unrecoverable_accept_error():
+    import threading
+    stop = threading.Event()
+    lst = _ScriptedListener([OSError(errno.EBADF, "bad listener")], stop)
+    DR.serve(object(), lst, stop)
+    assert lst.accepts == 1 and stop.is_set()   # the process exits, and the service manager starts it again

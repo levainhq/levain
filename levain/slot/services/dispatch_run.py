@@ -87,6 +87,7 @@ from __future__ import annotations
 
 import argparse
 import dataclasses
+import errno
 import hashlib
 import logging
 import os
@@ -1204,14 +1205,29 @@ class RunServer:
 
 # --- the process --------------------------------------------------------------------------------------------------------
 
+#: accept errors a listener lives through (out of descriptors, a peer that went before its accept, a signal): the
+#: loop waits this long and accepts again
+_ACCEPT_RETRY = frozenset({errno.EMFILE, errno.ENFILE, errno.ECONNABORTED, errno.EINTR, errno.ENOBUFS, errno.ENOMEM})
+_ACCEPT_BACKOFF_S = 0.1
+
+
 def serve(server: RunServer, listener: socket.socket, stop: threading.Event) -> None:
+    """Accept until ``stop``. A recoverable accept error is waited out; any other sets ``stop``, so the process (both
+    listeners) exits and the service manager starts it again, never one socket dead beside a live one (L3 w3client
+    r1, codex MED 3)."""
     listener.settimeout(0.5)
     while not stop.is_set():
         try:
             conn, _ = listener.accept()
         except socket.timeout:
             continue
-        except OSError:
+        except OSError as exc:
+            if exc.errno in _ACCEPT_RETRY:
+                stop.wait(_ACCEPT_BACKOFF_S)
+                continue
+            print(f"levain dispatch-run: accept failed ({type(exc).__name__}: {exc}); stopping for a restart",
+                  file=sys.stderr, flush=True)
+            stop.set()
             return
         threading.Thread(target=server.handle, args=(conn,), daemon=True).start()
 
