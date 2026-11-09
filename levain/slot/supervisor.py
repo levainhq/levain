@@ -1683,16 +1683,45 @@ class Supervisor:
             self.say(f"slot allow rules read from {path} (slot sessions only): {len(rules)}")
         return dataclasses.replace(frozen, settings=slot_allow.merge_into_frozen(frozen.settings, rules))
 
+    def _read_allow(self, session: str) -> Optional[bytes]:
+        """The ended session's ``.claude/settings.local.json`` bytes: the test seam when one is named, else root's
+        ``read-allow`` verb. A root tree that predates the verb is said once and reads as no file."""
+        if self.s.retained_allow is not None:
+            return self.s.retained_allow(session)
+        import base64
+        import binascii
+
+        from levain.slot.slot_allow import AllowRefused
+
+        try:
+            out = self.helper("read-allow", session, stdin=None, stoppable=False)
+        except Refused as e:
+            if e.name == "unknown-verb" or e.name.startswith("verb-unbuilt"):
+                if not getattr(self, "_allow_old_root_said", False):
+                    self._allow_old_root_said = True
+                    self.say("slot allow rules not read: the root tree predates read-allow; `levain upgrade` adds it")
+                return None
+            raise AllowRefused(f"root refused read-allow: {e.name}") from None
+        if out.get("present") is not True:
+            return None
+        b64 = out.get("b64")
+        if type(b64) is not str:
+            raise AllowRefused("read-allow answered without its bytes")
+        try:
+            return base64.b64decode(b64, validate=True)
+        except (binascii.Error, ValueError):
+            raise AllowRefused("read-allow answered bytes that are not base64") from None
+
     def _file_allow_rows(self, session: str) -> None:
         """Row 165, at END: the rules the slot's dialog saved go on the band, one row per rule. Said, never raised:
         teardown already finished."""
         path = self._allow_file()
-        if path is None or self.s.retained_allow is None:
+        if path is None:
             return
         from levain.slot import slot_allow
 
         try:
-            raw = self.s.retained_allow(session)
+            raw = self._read_allow(session)
             if raw is None:
                 return
             kept, dropped = slot_allow.parse_local_allow(raw)
