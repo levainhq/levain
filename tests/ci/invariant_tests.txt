@@ -1,0 +1,64 @@
+# The whole-tree invariant tests: each asserts something about EVERY file of the source tree (no module but X calls Y,
+# every call site names Z, a table is in exactly one class, every verb the README lists exists), so each can go red from
+# a change in a file the author never opened. The marker exists so a future pre-push hook can run just this tier
+# (`pytest -m invariant`) and find that red on the laptop and not in a CI slot; no such hook runs it, because the tier
+# is over a pre-push time budget.
+#
+# Membership is derived, not remembered: (1) every test function that scans the tree (rglob over the package, os.walk,
+# git ls-files), found by walking each test module's AST through its helpers, minus the behavioural tests that only glob a
+# scratch directory; (2) every whole-tree test named in a failed `test` run among the last 40 on the day this was cut.
+# tests/conftest.py applies the marker to the node ids below (function level; a parametrized test is marked whole);
+# tests/test_ci_invariant_marker.py holds the list to the collected tests and holds the named failures in it.
+# One node id per line, `file::Class::function`.
+tests/test_agents_operator.py::test_the_only_modules_that_name_the_attachment_table_are_the_schema_and_the_registry
+tests/test_agents_spawn.py::test_the_envelope_authority_callers_are_exactly_the_status_lines_and_the_label
+tests/test_agents_supervise_fire.py::test_only_the_supervisor_calls_the_agent_journal_effect_path
+tests/test_agents_v2_only.py::test_no_module_outside_schema3_opens_a_3_store
+tests/test_authority_agent_signing.py::test_no_caller_of_the_agent_link_prepare_outside_signing_py
+tests/test_autonomic_leaf.py::test_every_module_imports_only_the_allowlist_and_itself
+tests/test_autonomic_upkeep3.py::test_no_module_writes_a_manual_pending_without_its_lease
+tests/test_broker_capability_ast.py::test_broker_capability_ast
+tests/test_broker_keys_ledger.py::test_unmetered_is_gone
+tests/test_cockpit_authority_s3a2.py::test_every_appender_is_the_short_lived_cli_path
+tests/test_cockpit_authority_s3a2.py::test_no_snapshot_is_built_outside_capture_and_append
+tests/test_cockpit_authority_s3a2.py::test_the_appender_guard_sees_a_planted_second_caller_of_setup_key
+tests/test_cockpit_authority_s3a2.py::test_the_appender_guard_sees_an_append_off_its_per_act_connection
+tests/test_cockpit_authority_s3a2.py::test_the_handed_append_guard_sees_an_append_off_the_handed_connection
+tests/test_cockpit_pass2.py::test_the_page_carries_no_author_repo_or_client_name
+tests/test_cockpit_standing_policy.py::test_only_the_request_authority_reaches_the_genesis_policy
+tests/test_cockpit_voice_routes.py::test_t_disk_and_t_upload_nothing_holds_the_audio_or_the_transcript_and_units_are_estimated
+tests/test_compat_integration.py::test_am_wrap_generated_inline_end_state_is_structurally_guarded
+tests/test_compat_integration.py::test_seed_templates_carry_the_reconciled_guidance
+tests/test_consent_codex_adapter.py::test_every_shell_name_the_hook_templates_know_is_a_shell_tool_to_consent
+tests/test_consent_h4_readers.py::test_core_reads_no_process_environment
+tests/test_consent_hints.py::test_no_decision_path_imports_the_hints
+tests/test_contracts_ed25519.py::test_cryptography_is_imported_only_by_ed25519_py
+tests/test_contracts_namespaces.py::test_every_literal_namespace_in_the_package_is_registered
+tests/test_contracts_receipt_checkpoint.py::test_no_package_code_builds_the_provisional_receipt_production
+tests/test_coordinator_chat_echoes.py::test_no_module_reads_chat_echoes_to_write_outbox
+tests/test_firing_confinement.py::test_every_production_caller_of_build_policy_declares_the_cred_floor
+tests/test_floor_autonomic_store.py::test_every_levain_home_reader_is_named_for_the_fallback
+tests/test_http_guards.py::test_no_handler_reads_a_request_body_with_a_bare_rfile_read
+tests/test_launch.py::test_every_child_levain_starts_is_given_an_explicit_environment
+tests/test_launch.py::test_no_child_environment_is_built_from_a_copy_of_os_environ
+tests/test_naming_desk.py::test_cockpit_visible_strings_say_desk_for_the_seat
+tests/test_naming_desk.py::test_docs_say_laptop_for_presence
+tests/test_operator_git_isolation.py::test_no_operator_git_call_names_a_session_clone
+tests/test_presence_remote.py::test_the_readme_says_levain_ships_no_remote_activity_reporter_until_one_exists
+tests/test_push_card_w5a.py::test_no_webpush_source_or_worker_names_band_answer
+tests/test_readme_commands.py::test_every_listed_verb_is_named_in_all_commands
+tests/test_root_py39_floor.py::test_every_root_side_module_imports_on_the_floor_interpreter
+tests/test_root_py39_floor.py::test_no_post_39_construct_on_the_root_side
+tests/test_seam_classes_census.py::test_every_insert_into_a_gseq_table_names_gseq
+tests/test_seam_classes_census.py::test_every_table_of_the_maximal_database_is_in_exactly_one_class
+tests/test_seam_classes_census.py::test_no_insert_into_a_gseq_table_hides_its_column_list_or_lives_outside_the_coordinator
+tests/test_slot_dispatch_run_build_server_pin.py::test_the_real_tree_has_one_constructor_and_it_passes_a_replica
+tests/test_slot_layout_trust.py::test_every_dir_the_helper_opens_trusted_is_roots_by_its_row
+tests/test_slot_layout_trust.py::test_every_dir_the_helper_opens_trusted_passes_its_own_row
+tests/test_slot_layout_trust.py::test_the_root_predicate_is_every_root_rows_own_shape
+tests/test_slot_p71s8b_dispatch_exec.py::test_10_np1_premise_adopt_and_review_are_the_only_writers_to_the_operators_repo
+tests/test_slot_p71s8b_dispatch_exec.py::test_12_the_pin_the_brief_reaches_the_vendor_by_file_and_by_no_other_channel
+tests/test_slot_sudo_abs.py::test_no_file_in_levain_spells_sudo_itself_outside_the_home
+tests/test_state_episode.py::test_every_write_state_call_in_the_package_names_its_store
+tests/test_team_ledger_api.py::test_no_caller_reaches_a_private_ledger_member
+tests/test_w1b_retirements.py::test_no_emitted_link_carries_a_secret
