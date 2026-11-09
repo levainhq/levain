@@ -272,7 +272,7 @@ const vm = require("vm"), fs = require("fs");
 const log = [];
 const el = () => { const e = { children: [], cls: new Set(), isConnected: false, hidden: false, textContent: "", attrs: {}, on: {},
   appendChild(c) { this.children.push(c); return c; }, setAttribute(k, v) { this.attrs[k] = v; }, addEventListener(t, f) { this.on[t] = f; },
-  classList: { toggle() {} } }; return e; };
+  classList: { toggle() {}, add(c) { log.push("cls:" + c); } } }; return e; };
 let listeners = new Set(), playing = false, unlockedFlag = %(unlocked)s;
 const V = { settings: () => ({ notify: %(notify)s }), isUnlocked: () => unlockedFlag, unlock() { log.push("unlock"); }, noteFor: () => "",
   play(r) { log.push("play"); playing = true; return new Promise((res) => { V._done = () => { playing = false; res(); }; }); },
@@ -359,3 +359,12 @@ def test_an_answered_card_mounts_no_speaker() -> None:
     body = src[start:src.index("function clearNeeds", start)]
     assert "const settled = q.state === \"answered\";" in body
     assert "CV && !b.error && !settled ? CV.speaker(" in body, body
+
+
+def test_a_card_button_without_the_icon_helper_keeps_the_padded_words_pill_and_is_named() -> None:
+    """A cached voice.js with no `face` leaves card_voice.js drawing words itself. Red with: the `voice-words` class (or the
+    aria-label) dropped from that fallback in card_voice.js (the words touch the pill's edges, no accessible name)."""
+    got = _run_vm("""
+      const w = CV.speaker("question:2", body); await tick(5);
+      log.push("name:" + (w.children[0].attrs["aria-label"] || ""));""", notify=False)
+    assert "cls:voice-words" in got["log"] and any(x.startswith("name:") and len(x) > 5 for x in got["log"]), got

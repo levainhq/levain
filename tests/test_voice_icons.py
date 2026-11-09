@@ -202,7 +202,7 @@ def test_every_kind_announces_its_state_in_one_polite_status_node_and_the_first_
         {"eval": "(() => { window.__b = document.createElement('button'); document.body.appendChild(window.__b); const V = window.LevainVoiceIcons;"
                  " const say = () => { const n = document.getElementById('levain-voice-status'); return n ? n.textContent : null; };"
                  " const out = [];"
-                 " V.set(window.__b, 'dictate'); out.push(say());"                      # first draw: nothing said
+                 " V.set(window.__b, 'dictate'); out.push(say());"                      # first draw: nothing said (the node is already there, empty)
                  " V.set(window.__b, 'dictate-stop'); out.push(say());"
                  " V.set(window.__b, 'dictate'); out.push(say());"
                  " V.set(window.__b, 'mic'); V.set(window.__b, 'mic-stop'); out.push(say());"
@@ -215,7 +215,7 @@ def test_every_kind_announces_its_state_in_one_polite_status_node_and_the_first_
                  " return JSON.stringify(out); })()"},
     ], init_extra=_fake())
     got = json.loads(v[-1])
-    assert got[:8] == [None, "Dictating", "Stopped", "Mic on", "Stopped", "Playing", "Playing", "Stopped"], got
+    assert got[:8] == ["", "Dictating", "Stopped", "Mic on", "Stopped", "Playing", "Playing", "Stopped"], got
     assert got[8] == [1, "status", "polite"], got
 
 
@@ -249,3 +249,38 @@ def test_without_the_icon_module_the_voice_words_are_named_and_sit_in_a_padded_p
     for cls, left, right, height in json.loads(out["values"][-1]):
         assert left != "0px" and right != "0px", (cls, left, right)     # the words do not touch the pill's edges
         assert height <= 60, (cls, height)                              # a single line, not a wrapped tall pill
+
+
+@needs_browser
+def test_the_status_node_exists_empty_before_any_change_and_a_dialogs_control_is_announced_inside_the_dialog(tmp_path, qdir) -> None:
+    """Red with: the `ready()` call of voice_icons.js removed (no node until the first change, which a screen reader drops), or
+    `announce` writing to the body node for a control inside an aria-modal dialog (outside the dialog's tree)."""
+    v = _run(tmp_path, qdir, [
+        _phone(430), _set(_room("t1", *A)), _to_room(),
+        {"until": "window.LevainVoiceIcons && 1"},
+        {"eval": "(() => { const n = document.getElementById('levain-voice-status');"
+                 " return JSON.stringify([!!n, n ? n.textContent : null, n ? n.parentNode === document.body : null]); })()"},
+        {"eval": "(() => { const d = document.createElement('div'); d.setAttribute('role', 'dialog'); d.setAttribute('aria-modal', 'true'); d.id = '__dlg';"
+                 " const b = document.createElement('button'); d.appendChild(b); document.body.appendChild(d);"
+                 " window.LevainVoiceIcons.set(b, 'mic'); window.LevainVoiceIcons.set(b, 'mic-stop'); window.__dlgbtn = b; return 1; })()"},
+        {"until": "document.querySelector('#__dlg #levain-voice-status-dialog') && document.querySelector('#__dlg #levain-voice-status-dialog').textContent === 'Mic on'", "ms": 5000},
+        {"eval": "(() => { const b = window.__dlgbtn; window.LevainVoiceIcons.set(b, 'mic'); const n = document.querySelector('#__dlg #levain-voice-status-dialog');"
+                 " return JSON.stringify([n.textContent, document.getElementById('levain-voice-status').textContent]); })()"},
+    ], init_extra=_fake())
+    assert json.loads(v[-4]) == [True, "", True], v[-4]
+    assert json.loads(v[-1]) == ["Stopped", ""], v[-1]       # the dialog's control spoke in the dialog; the page's node stayed quiet
+
+
+@needs_browser
+def test_a_repaint_in_the_same_state_keeps_the_drawn_icon_and_the_button(tmp_path, qdir) -> None:
+    """Red with: the `same` test of voice_icons.js set() removed (every repaint builds a new svg: the node differs)."""
+    v = _run(tmp_path, qdir, [
+        _phone(430), _set(_room("t1", *A)), _to_room(),
+        {"until": "window.LevainVoiceIcons && 1"},
+        {"eval": "(() => { const V = window.LevainVoiceIcons, b = document.createElement('button'); document.body.appendChild(b);"
+                 " V.set(b, 'play'); const first = b.querySelector('svg'); V.set(b, 'play'); const kept = b.querySelector('svg') === first;"
+                 " V.set(b, 'play', 'Tap to hear this card'); const relabel = b.querySelector('svg') !== first && b.getAttribute('aria-label') === 'Tap to hear this card';"
+                 " const second = b.querySelector('svg'); V.set(b, 'stop'); const moved = b.querySelector('svg') !== second && b.querySelectorAll('svg').length === 1;"
+                 " return JSON.stringify([kept, relabel, moved]); })()"},
+    ], init_extra=_fake())
+    assert json.loads(v[-1]) == [True, True, True], v[-1]

@@ -26,17 +26,36 @@
   };
   var STATUS_ID = "levain-voice-status";
 
-  // One polite status node per page, visually hidden, that says what a control just did.
-  function announce(doc, text) {
-    var n = doc.getElementById(STATUS_ID);
+  var HIDE = "position:absolute;width:1px;height:1px;margin:-1px;padding:0;overflow:hidden;clip:rect(0 0 0 0);white-space:nowrap;border:0";
+  function makeStatus(doc, id) {
+    var n = doc.createElement("div");
+    n.id = id; n.className = "voice-status"; n.setAttribute("role", "status"); n.setAttribute("aria-live", "polite");
+    n.style.cssText = HIDE;
+    return n;
+  }
+  // A polite status node, visually hidden, that says what a control just did. A screen reader announces a change to a live region that
+  // was already in the page, so the page's node is made empty as this file loads. A control inside an open modal dialog gets a node
+  // inside that dialog (a sibling outside it is not read while the dialog is open); that one is made on first use, so its text is
+  // set a moment after it is added.
+  function announce(doc, text, btn) {
+    var dlg = btn && btn.closest ? btn.closest('[aria-modal="true"]') : null;
+    var scope = dlg || doc.body;
+    if (!scope) return;
+    var id = dlg ? STATUS_ID + "-dialog" : STATUS_ID;
+    var n = dlg ? dlg.querySelector("#" + id) : doc.getElementById(id);
     if (!n) {
-      if (!doc.body) return;
-      n = doc.createElement("div");
-      n.id = STATUS_ID; n.className = "voice-status"; n.setAttribute("role", "status"); n.setAttribute("aria-live", "polite");
-      n.style.cssText = "position:absolute;width:1px;height:1px;margin:-1px;padding:0;overflow:hidden;clip:rect(0 0 0 0);white-space:nowrap;border:0";
-      doc.body.appendChild(n);
+      n = makeStatus(doc, id);
+      scope.appendChild(n);
+      root.setTimeout(function () { n.textContent = text; }, 60);
+      return;
     }
     n.textContent = text;
+  }
+  function ready() {
+    var d = root.document;
+    if (!d) return;
+    var add = function () { if (d.body && !d.getElementById(STATUS_ID)) d.body.appendChild(makeStatus(d, STATUS_ID)); };
+    if (d.body) add(); else d.addEventListener("DOMContentLoaded", add);
   }
 
   function svg(doc, shape) {
@@ -60,16 +79,18 @@
     var k = KINDS[kind];
     if (!k) throw new Error("voice_icons: unknown kind " + kind);
     var words = label || k.label, before = btn.getAttribute("data-voice-icon");
-    btn.replaceChildren(svg(btn.ownerDocument, k.shape));
+    var same = before === kind && btn.getAttribute("aria-label") === words && btn.querySelector("svg");
+    if (!same) btn.replaceChildren(svg(btn.ownerDocument, k.shape));      // a repaint of the same state keeps the drawn icon
     btn.setAttribute("aria-label", words);
     btn.setAttribute("title", title || words);
     btn.setAttribute("data-voice-icon", kind);
     btn.classList.remove("voice-words");
-    if (before && before !== kind) announce(btn.ownerDocument, k.said);
+    if (before && before !== kind) announce(btn.ownerDocument, k.said, btn);
     return btn;
   }
 
   var api = { set: set, KINDS: Object.keys(KINDS) };
   root.LevainVoiceIcons = api;
+  ready();
   if (typeof module === "object" && module.exports) module.exports = api;
 })(typeof window !== "undefined" ? window : globalThis);

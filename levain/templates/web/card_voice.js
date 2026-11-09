@@ -100,7 +100,7 @@
       if (wrap.isConnected) attached = true;
       else if (attached) { gone(); return; }
       const state = mine ? "stop" : (large ? "tap" : "play");
-      if (typeof V.face === "function") V.face(b, state, WORDS.tap); else b.textContent = WORDS[state];
+      if (typeof V.face === "function") V.face(b, state, WORDS.tap); else { b.textContent = WORDS[state]; b.classList.add("voice-words"); b.setAttribute("aria-label", WORDS[state]); b.setAttribute("title", WORDS[state]); }
       wrap.classList.toggle("card-voice-large", large && !mine);
       const m = V.noteFor(reply) || "";
       note.textContent = m; note.hidden = !m;
