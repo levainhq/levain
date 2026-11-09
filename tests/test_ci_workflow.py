@@ -281,25 +281,47 @@ def test_the_pytest_check_names_the_land_gate_reads_are_unchanged():
     assert JOBS["test"]["name"] == "pytest (Python ${{ matrix.python-version }}, shard ${{ matrix.shard }})"
 
 
-def _python_list(ref):
-    """What the `test` matrix's python-version expression yields for a ref: the expression is
-    fromJSON(startsWith(github.ref, 'refs/heads/seat/') && '[one]' || '[both]')."""
+COND = ("github.event_name == 'workflow_dispatch' && github.ref != 'refs/heads/main' && "
+        "!startsWith(github.ref, 'refs/heads/land/')")
+
+
+def _python_list(event, ref):
+    """What the `test` matrix's python-version expression yields: fromJSON(COND && '[one]' || '[both]')."""
     import json
     expr = JOBS["test"]["strategy"]["matrix"]["python-version"]
-    m = re.fullmatch(r"\$\{\{ fromJSON\(startsWith\(github\.ref, 'refs/heads/seat/'\) && '(\[.*?\])' \|\| '(\[.*?\])'\) \}\}", expr)
-    assert m, expr
-    return json.loads(m.group(1) if ref.startswith("refs/heads/seat/") else m.group(2))
+    m = re.fullmatch(r"\$\{\{ fromJSON\((.*?) && '(\[.*?\])' \|\| '(\[.*?\])'\) \}\}", expr)
+    assert m and m.group(1) == COND, expr
+    one = event == "workflow_dispatch" and ref != "refs/heads/main" and not ref.startswith("refs/heads/land/")
+    return json.loads(m.group(2) if one else m.group(3))
 
 
-@pytest.mark.parametrize("ref,want", [
-    ("refs/heads/seat/1108-47-ciB", ["3.12"]),
-    ("refs/heads/main", ["3.12", "3.13"]),
-    ("refs/heads/land/x", ["3.12", "3.13"]),
-    ("refs/tags/v1.0", ["3.12", "3.13"]),
-    ("refs/pull/1/merge", ["3.12", "3.13"]),
+@pytest.mark.parametrize("event,ref,want", [
+    ("workflow_dispatch", "refs/heads/seat/1108-47-ciB", ["3.12"]),
+    ("workflow_dispatch", "refs/heads/anything", ["3.12"]),
+    ("workflow_dispatch", "refs/heads/main", ["3.12", "3.13"]),
+    ("workflow_dispatch", "refs/heads/land/x", ["3.12", "3.13"]),
+    ("push", "refs/heads/main", ["3.12", "3.13"]),
+    ("push", "refs/heads/land/x", ["3.12", "3.13"]),
+    ("push", "refs/tags/v1.0", ["3.12", "3.13"]),
+    ("pull_request", "refs/pull/1/merge", ["3.12", "3.13"]),
+    ("schedule", "refs/heads/main", ["3.12", "3.13"]),
 ])
-def test_only_a_seat_ref_runs_one_python(ref, want):
-    assert _python_list(ref) == want
+def test_only_a_dispatch_off_main_and_land_runs_one_python(event, ref, want):
+    assert _python_list(event, ref) == want
+
+
+def test_a_seat_push_triggers_no_suite_and_land_and_main_do():
+    assert WF[True]["push"]["branches"] == ["main", "land/**"]
+    assert "workflow_dispatch" in WF[True]
+    x = yaml.safe_load((Path(__file__).resolve().parent.parent / ".github" / "workflows" / "contracts-xcheck.yml").read_text())
+    assert x[True]["push"]["branches"] == ["main"]
+    assert "workflow_dispatch" in x[True]
+
+
+def test_the_browser_job_follows_the_same_condition():
+    assert COND in JOBS["browser"]["name"]
+    setup = next(st for st in JOBS["browser"]["steps"] if st.get("uses", "").startswith("actions/setup-python"))
+    assert COND in setup["with"]["python-version"]
 
 
 def test_the_3_13_pytest_jobs_deselect_the_static_guard_marker_and_3_12_does_not():
