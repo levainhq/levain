@@ -489,6 +489,21 @@ def test_a_body_unlisted_refusal_writes_one_refused_line_through_the_window(monk
     assert got == [("body-unlisted", "body-unlisted:field"), ("body-unlisted", "body-unlisted:zz_new_vendor_field")], got
 
 
+def test_new_sessions_past_twice_the_window_cap_are_dropped_not_opened(monkeypatch):
+    # r2 codex F1: the fold key is per session, so each new session opened a folded window of its own past the cap.
+    # Past twice the cap, a refusal that needs a new window is counted as dropped; the open windows stay bounded.
+    async def go(d):
+        async with KeysWorld(d, monkeypatch, refused_row_s=3600.0, refusal_windows_max=2) as w:
+            for i in range(12):
+                w.k._note_refusal("s%d" % i, RUN, "body-unlisted:zz_%d" % i)
+            n, dropped = len(w.k._refusals), w.k.lineage_dropped
+            w.k.flush_refusals()
+            return n, dropped
+
+    n, dropped = run_go(go)
+    assert n == 4 and dropped == 8, (n, dropped)
+
+
 def test_client_chosen_refusal_names_past_the_window_cap_fold_into_the_bare_reason(monkeypatch):
     # r1 F1 (bound): a ticketed client naming a new unknown field per request opened a window, and a timer, per name.
     # Past `refusal_windows_max` a new name folds into the window keyed by its reason without the `:<what>`, so the

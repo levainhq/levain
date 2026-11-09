@@ -1801,13 +1801,18 @@ class Keys:
         """One refusal of a TICKETED `Q` made before any hold (so no hold row records it): counted in its (session,
         reason) window (H6-10), whose ONE `refused` line is written at its close, `refused_row_s` after its first
         refusal. An interactive session's refusal writes none (Q9). With `refusal_windows_max` windows open, a name
-        with no window of its own is counted in its session's window for the bare reason (r1 F1)."""
+        with no window of its own is counted in its session's window for the bare reason (r1 F1). Past twice the cap a
+        refusal that would open a window is counted as dropped instead (r2 codex F1: the fold key is per session, so the
+        fold alone did not bound the windows); refusals carry no money, the same as an outbox-full drop."""
         if run is None or self.ledger is None or self.closing:
             return
         key = (session, name)
         if key not in self._refusals and len(self._refusals) >= self.refusal_windows_max:
             key = (session, name.partition(":")[0])
         w = self._refusals.get(key)
+        if w is None and len(self._refusals) >= 2 * self.refusal_windows_max:
+            self.lineage_dropped += 1
+            return
         if w is None:
             w = self._refusals[key] = [time.time(), 0, run, None]
             w[3] = asyncio.get_running_loop().call_later(self.refused_row_s, self._refused_close, key)
