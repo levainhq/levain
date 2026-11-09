@@ -149,18 +149,17 @@ def _ceiling_value(field: str, v: Any) -> int:
 class Position:
     """One row of a codec's content-position table: a place the provider's reference documents content blocks.
     `path` is the `_strip_path` grammar and ends at the block (or at the list of them); `admit` is every block `type`
-    a dispatch route admits there; `images` are the admit types the estimate counts as an image there (a subset);
-    `opaque` are the admit types that carry content the estimate sees only as bytes (a subset)."""
+    a dispatch route admits there; `images` are the admit types the estimate counts as an image there (a subset)."""
     path: Tuple[Any, ...]
     admit: Tuple[str, ...]
     images: Tuple[str, ...] = ()
-    opaque: Tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
 class Checked:
     """`check`'s answer: the model, its price, and the unboundable content an interactive route admits as
-    `"bound": "unproven"` (R4 §1.6). Empty `unproven` = a bounded call."""
+    `"bound": "unproven"` (R4 §1.6), including each known-cost block the position walk finds at a content position
+    (named by its type, or `audio` for a held audio reference). Empty `unproven` = a bounded call."""
     model: str
     price: Price
     unproven: Tuple[str, ...]
@@ -230,9 +229,13 @@ class Codec:
               model_requested: Optional[str] = None) -> Checked:
         """The model has a price entry (else `model-not-allowed`); a ticketed run's `model` is its ticket's
         `model_requested` (else `model-not-allowed`); no `route`, and no `models` but exactly `[model]` (else
-        `model-not-allowed`); on a dispatch route, a top-level field, a tool type or a content block the codec has
-        not judged is `body-unlisted:<name>` (403); then the unboundable shapes: a dispatch route refuses them
-        `body-unbounded:<what>` (403), an interactive one returns them as `unproven`."""
+        `model-not-allowed`); on a dispatch route, a top-level field or a tool type the codec has not judged is
+        `body-unlisted:<name>` (403); then the unboundable shapes: a dispatch route refuses them
+        `body-unbounded:<what>` (403), an interactive one returns them as `unproven`. The unboundable shapes include
+        a known-cost block at a position of `content_positions` (`known_unbounded_blocks`, a server-run tool search
+        call, a held audio reference), so an interactive route marks those `unproven` too. Last, on a dispatch
+        route, the first content block in body order that its position does not admit is `body-unlisted:<type>`
+        (403): a known cost anywhere in the body is named before an unjudged block."""
         model = obj.get("model")
         if not isinstance(model, str) or not prices or model not in prices:
             raise norm.Refused("model-not-allowed", "no price entry for the model")
@@ -882,14 +885,14 @@ class AnthropicMessages(Codec):
     # The documented content positions of the SDK's request types, and the blocks a dispatch route admits at each: the
     # system text blocks, a message's content, a `tool_result` block's own content, and a `search_result`'s. An image
     # is counted at `image_tokens` whatever its source (base64, url or file). A block outside a position's list is
-    # refused there. `thinking` and `redacted_thinking` carry opaque encrypted content the estimate counts by bytes;
-    # that is UNMEASURED, so they are admitted and marked `opaque`.
+    # refused there. `thinking` and `redacted_thinking` carry opaque encrypted content: they are admitted by bytes,
+    # UNMEASURED (no measured call yet shows their billed input fits inside their bytes). Nothing marks them.
     _RESULT_BLOCKS = ("text", "image", "search_result", "tool_reference")
     content_positions = (
         Position(("system", EACH), ("text",)),
         Position(("messages", EACH, "content", EACH),
                  ("text", "image", "tool_use", "tool_result", "search_result", "tool_addition", "tool_removal",
-                  "thinking", "redacted_thinking"), ("image",), ("thinking", "redacted_thinking")),
+                  "thinking", "redacted_thinking"), ("image",)),
         Position(("messages", EACH, "content", EACH, _Is(("tool_result",)), "content", EACH),
                  _RESULT_BLOCKS, ("image",)),
         Position(("messages", EACH, "content", EACH, _Is(("tool_result",)), "content", EACH,
@@ -1144,13 +1147,15 @@ class OpenAIResponses(_OpenAI):
     # ResponseInputImage or ResponseInputFile]"). `instructions` is "string or null": no image position.
     # The same positions carry the dispatch allowlist: an `input[]` item (a typeless one with a `role` is a message,
     # one without is a reference to a stored item), then each item's content or output. `reasoning` carries opaque
-    # encrypted content the estimate counts by bytes; that is UNMEASURED, so it is admitted and marked `opaque`.
+    # encrypted content: it is admitted by bytes, UNMEASURED (no measured call yet shows its billed input fits inside
+    # its bytes). Nothing marks it. The `computer_call_output` row is never reached on a dispatch route (the item is
+    # refused at `input[]`); it stays because the interactive estimate counts its screenshot.
     content_positions = (
         Position(("input", EACH),
                  ("message", "function_call", "function_call_output", "custom_tool_call", "custom_tool_call_output",
                   "local_shell_call", "local_shell_call_output", "shell_call", "shell_call_output",
                   "apply_patch_call", "apply_patch_call_output", "configuration_update", "reasoning",
-                  "tool_search_call", "additional_tools", "tool_search_output"), (), ("reasoning",)),
+                  "tool_search_call", "additional_tools", "tool_search_output")),
         Position(("input", EACH, "content", EACH),
                  ("input_text", "output_text", "refusal", "reasoning_text", "input_image"), ("input_image",)),
         Position(("input", EACH, _Is(("function_call_output", "custom_tool_call_output")), "output", EACH),

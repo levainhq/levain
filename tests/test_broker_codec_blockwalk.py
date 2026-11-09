@@ -6,6 +6,7 @@ count reads, so the walk and the estimate cannot name different positions.
 """
 from __future__ import annotations
 
+import dataclasses
 import json
 import os
 import sys
@@ -68,7 +69,10 @@ def test_a_block_outside_the_allowlist_is_refused_on_dispatch(c, body, name):
     (OR, _or({"id": "msg_1"}), "item_reference"),
     (OR, _or({"type": "compaction_trigger"}), "compaction_trigger"),
     (AM, _am({"type": "advisor_tool_result", "tool_use_id": "a"}), "advisor_tool_result"),
-], ids=["resp-item-ref", "resp-typeless-ref", "resp-compaction-trigger", "am-advisor"])
+    (OR, _or({"type": "tool_search_call", "execution": "server", "arguments": {}}), "tool_search_call"),
+    (OC, _body(OC, messages=[{"role": "assistant", "content": "x", "audio": {"id": "audio_1"}}]), "audio"),
+], ids=["resp-item-ref", "resp-typeless-ref", "resp-compaction-trigger", "am-advisor", "resp-search-call-server",
+        "chat-audio-ref"])
 def test_an_interactive_route_marks_the_known_cost_block_unproven(c, body, mark):
     got = _check(c, body, dispatch=False)
     assert mark in got.unproven
@@ -165,6 +169,22 @@ def test_a_content_that_is_a_string_judges_no_block():
     assert not isinstance(_check(AM, _body(AM, system="s"), dispatch=True), str)
 
 
+@pytest.mark.parametrize("c,body", [
+    (OR, _body(OR, input=["Hello world"])),
+    (OR, _or({"type": "function_call_output", "call_id": "c", "output": ["error output"]})),
+    (AM, _am("hello")),
+    (AM, _body(AM, system=["prompt"])),
+], ids=["resp-string-item", "resp-string-output-part", "am-string-content-part", "am-string-system-part"])
+def test_a_bare_string_inside_a_block_list_is_refused_as_the_provider_would(c, body):
+    # the vendors' request types admit a string for the whole field, never a string inside the list
+    assert _check(c, body, dispatch=True) == "body-unlisted:block"
+
+
+def test_a_string_function_output_judges_no_block():
+    assert not isinstance(_check(OR, _or({"type": "function_call_output", "call_id": "c", "output": "42"}),
+                                 dispatch=True), str)
+
+
 def test_a_typeless_responses_item_with_a_role_is_a_message_and_one_without_is_a_reference():
     assert not isinstance(_check(OR, _body(OR, input=[{"role": "user", "content": "x"}]), dispatch=True), str)
     assert _check(OR, _body(OR, input=[{"content": "x"}]), dispatch=True) == "body-unbounded:item_reference"
@@ -227,7 +247,6 @@ def test_an_image_type_is_counted_only_where_the_table_admits_it(c):
     assert any(p.images for p in c.content_positions)
     for p in c.content_positions:
         assert set(p.images) <= set(p.admit), p
-        assert set(p.opaque) <= set(p.admit), p
     # take one image type off the table and the estimate stops counting it there: the same row serves both
     fake = type(c)()
     rows = [p for p in c.content_positions if p.images]
@@ -254,10 +273,18 @@ def test_every_refusal_name_the_walk_can_emit_has_a_status(c):
         assert norm.is_name(name) and norm.status_of(name) == 403, name
 
 
-def test_the_opaque_blocks_are_the_unmeasured_ones():
-    assert {t for p in AM.content_positions for t in p.opaque} == {"thinking", "redacted_thinking"}
-    assert {t for p in OR.content_positions for t in p.opaque} == {"reasoning"}
-    assert not any(p.opaque for p in OC.content_positions)
+@pytest.mark.parametrize("c,body", [
+    (AM, _am({"type": "thinking", "thinking": "t", "signature": "sig"}, {"type": "redacted_thinking", "data": "d"},
+             role="assistant")),
+    (OR, _or({"type": "reasoning", "id": "rs", "summary": [], "encrypted_content": "enc"})),
+], ids=["am-thinking", "resp-reasoning"])
+def test_the_opaque_blocks_are_admitted_by_bytes_and_marked_by_nothing(c, body):
+    # UNMEASURED: no measured call yet shows their billed input fits inside their bytes; the table carries no mark
+    assert "opaque" not in {f.name for f in dataclasses.fields(codec.Position)}
+    for dispatch in (True, False):
+        got = _check(c, body, dispatch=dispatch)
+        assert not isinstance(got, str), got
+        assert got.unproven == ()
 
 
 # --- the captured client bodies stay admitted ---------------------------------------------------------------------
