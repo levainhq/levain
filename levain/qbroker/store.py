@@ -4,10 +4,11 @@
 0640, then hard-linked to its name (never replacing an existing row: a second writer finds the first one's row)
 and the directory fsynced. ``requests/grant-<request_id>.json`` is the broker's own allow for a request the
 signed dispatch contract's typed grant covers (:data:`GRANT_ROW_FORMAT`, W2C_DESIGN §4), written the same way beside
-the request row: in the directory only the broker writes, never in ``answers/``, which any member of
-``levain-queue`` (dispatch, the suspect principal, included) can create files in. ``requests/queue-id`` holds the queue's random id, made once. ``answers/<id>.json`` is
-written by the operator's cockpit / phone server; any member of ``levain-queue`` can create a file there, so the
-broker reads it as untrusted bytes (no symlink, a regular file, bounded) and trusts only its signature.
+the request row: in the directory only the broker writes, never in ``answers/``, which only the operator writes.
+``requests/queue-id`` holds the queue's random id, made once. ``answers/<id>.json`` is written by the operator's
+cockpit / phone server. On an install set up before that directory was the operator's alone, a member of the queue
+group (dispatch, the suspect principal, included) could create a file there and one planted then can still be there,
+so the broker reads it as untrusted bytes (no symlink, a regular file, bounded) and trusts only its signature.
 Stdlib only.
 """
 from __future__ import annotations

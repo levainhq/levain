@@ -107,11 +107,12 @@ def base_store_rows(host: HostOS, operator: str) -> list[Row]:
         Row(L / "export" / "dispatch", "root", "levain-dispatch-export", 0o750),
         # §2.1 gives no row for L/queue/ itself; root 0755 so the members of its two children reach them.
         _root(host, L / "queue", 0o755),
-        # Both setgid: on Linux a new file takes its creator's primary group, so without it a row (the broker's
-        # requests and receipts DB; an answer the cockpit / phone server writes) reaches levain-queue's members only
-        # if its writer's primary group happens to be levain-queue.
+        # Both setgid, so a new file takes the directory's group on Linux (it takes its creator's primary group
+        # otherwise). requests/: the broker writes, the queue group reads. answers/: the operator writes and the
+        # broker reads by its own primary group; no other principal can create a file there, dispatch included
+        # (it is in the queue group, which has no access here).
         Row(L / "queue" / "requests", "_levain_qbroker", "levain-queue", 0o2750),
-        Row(L / "queue" / "answers", operator, "levain-queue", 0o2770),
+        Row(L / "queue" / "answers", operator, "_levain_qbroker", 0o2750),
         # §26 S1-b: dispatch publishes each contract the operator signed here; setgid, so every file takes
         # levain-queue and the broker (a member) reads it; slots are not members.
         Row(L / "contracts", "_levain_dispatch", "levain-queue", 0o2750),
