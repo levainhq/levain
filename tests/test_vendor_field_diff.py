@@ -263,6 +263,35 @@ def test_a_missing_or_unparseable_beta_snapshot_exits_two_with_one_line(tmp_path
     _one_line(capsys)
 
 
+def test_an_empty_token_from_a_trailing_comma_is_not_a_beta():
+    assert vfd.captured_betas(_captured_raw(["claude-code-20250219,", ",effort-2025-11-24, ,"])) == \
+        {"claude-code-20250219", "effort-2025-11-24"}
+    assert vfd.untriaged_betas(_raw("anthropic_beta_param.py"), _captured_raw(["claude-code-20250219,"])) == []
+
+
+_ANNOTATED = b'''from typing import Annotated, Union
+from typing_extensions import Literal, TypeAlias
+
+AnthropicBetaParam: TypeAlias = Annotated[
+    Union[str, Literal["claude-code-20250219", "effort-2025-11-24"]],
+    "a beta name, see the docs",
+]
+'''
+
+
+def test_only_the_literal_elements_are_beta_names():
+    assert vfd.beta_names(_ANNOTATED) == {"claude-code-20250219", "effort-2025-11-24"}
+    one = _ANNOTATED.replace(b'"claude-code-20250219", "effort-2025-11-24"', b'"effort-2025-11-24"')
+    assert vfd.beta_names(one) == {"effort-2025-11-24"}
+
+
+@pytest.mark.parametrize("value", [b'Literal["a-1", 2]', b'Literal["a-1", X]', b"str"])
+def test_an_unexpected_literal_shape_cannot_run(value):
+    py = b"AnthropicBetaParam: TypeAlias = Union[str, %s]\n" % value
+    with pytest.raises(vfd.CheckFailed):
+        vfd.beta_names(py)
+
+
 def test_unparseable_captured_headers_exit_two():
     with pytest.raises(vfd.CheckFailed):
         vfd.untriaged_betas(_raw("anthropic_beta_param.py"), b"{not json")

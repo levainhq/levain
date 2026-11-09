@@ -284,22 +284,23 @@ class Codec:
             self._refuse_blocks(obj)
         return Checked(model, price, found)
 
-    def check_betas(self, headers: Sequence[Tuple[str, str]], *, dispatch: bool) -> None:
+    def check_betas(self, headers: Sequence[Sequence[str]], *, dispatch: bool) -> None:
         """The dispatch beta allowlist: every comma-separated token of every `anthropic-beta` pair in `headers` (the
         header may repeat; the provider reads each one) must be in `dispatch_betas`, else `beta-unlisted:<token>`
-        (403), the first in header order. A token is compared as sent after its surrounding spaces are removed; an
-        empty one is refused too. An interactive route reads nothing here (its session cap bounds it)."""
+        (403), the first in header order. A token is compared as sent after its surrounding spaces and tabs (HTTP's
+        optional whitespace) are removed, and no other character; an empty one is refused too. An interactive route reads nothing here (its session cap bounds it)."""
         if not dispatch:
             return
         for name, value in headers:
             if name.lower() != "anthropic-beta":
                 continue
             for raw in value.split(","):
-                tok = raw.strip()
+                tok = raw.strip(" \t")
                 if tok not in self.dispatch_betas:
                     raise norm.Refused("beta-unlisted:" + _beta_what(tok),
                                        "an anthropic-beta value levain has not judged; dispatch admits only judged "
-                                       "betas (or set CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS=1 in the client)")
+                                       "betas: remove that beta, or for a pre-release beta set "
+                                       "CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS=1 in the client")
 
     def _refuse_unlisted(self, obj: Mapping[str, Any]) -> None:
         """The dispatch allowlist: the first top-level field outside `dispatch_fields`, then every tool definition the
@@ -980,9 +981,11 @@ class AnthropicMessages(Codec):
     # [judged by lane r177, 2026-11-09, from the SDK's beta-name literal at tag v2.7.0 (`src/anthropic/types/
     # anthropic_beta_param.py`), the headers a real Claude Code sent a local listener
     # (`tests/fixtures/client_bodies/claude_code_anthropic_beta_headers.json`) and Anthropic's beta-headers page.
+    # `claude-code-20250219`, `effort-2025-11-24`, `per-turn-control-2026-07-01`, `advanced-tool-use-2025-11-20` and
+    # `oauth-2025-04-20` are judged from the capture alone: the SDK literal does not carry them.
     # A beta is listed when it has no billed effect, when its body half is judged by the field and block lists above
-    # (so the beta alone unlocks nothing new), or when it only changes a price the route's price row already
-    # states at its highest rate.]
+    # (so the beta alone unlocks nothing new), or when it only changes a price `policy.Price` requires each row to
+    # state at its highest rate (every shipped row in vendor_prices.py does).]
     dispatch_betas = (
         # client identity, thinking and effort and output shape, inside the ceiling
         "claude-code-20250219", "interleaved-thinking-2025-05-14", "effort-2025-11-24", "per-turn-control-2026-07-01",
@@ -991,6 +994,10 @@ class AnthropicMessages(Codec):
         # body halves judged: context editing, tool references and inline definitions, file images, a refused document
         "context-management-2025-06-27", "mid-conversation-tool-changes-2026-07-01", "advanced-tool-use-2025-11-20",
         "files-api-2025-04-14", "pdfs-2024-09-25",
+        # the body half is judged: a tool_addition's definition goes through the tool-type allowlist
+        # (`_inline_tool_lists`); an advisor tool type is not in `dispatch_tool_types` and `advisor_tool_result` is a
+        # refused block, so the header alone unlocks nothing
+        "inline-tools-2026-09-15", "advisor-tool-2026-03-01",
         # price rule: a longer cache write, a larger context, a faster tier, a larger output ceiling
         "extended-cache-ttl-2025-04-11", "context-1m-2025-08-07", "fast-mode-2026-02-01",
         "output-128k-2025-02-19", "output-300k-2026-03-24",
@@ -1000,12 +1007,13 @@ class AnthropicMessages(Codec):
         "prompt-caching-2024-07-31", "model-context-window-exceeded-2025-08-26", "dev-full-thinking-2025-05-14",
         "cache-diagnosis-2026-04-07", "user-profiles-2026-03-24", "user-profiles-2026-08-18",
         "user-profiles-2026-09-04",
+        # authentication: the client logged in with OAuth, no billed effect
+        "oauth-2025-04-20",
     )
     # judged unbounded: a server-run tool or loop, another model, server-held state, server compaction
     unbounded_betas = (
         "mcp-client-2025-04-04", "mcp-client-2025-11-20", "mcp-client-2026-09-15", "code-execution-2025-05-22",
-        "skills-2025-10-02", "advisor-tool-2026-03-01", "inline-tools-2026-09-15", "compact-2026-01-12",
-        "compact-2026-09-04", "server-side-fallback-2026-06-01", "server-side-fallback-2026-07-01",
+        "skills-2025-10-02", "compact-2026-01-12", "compact-2026-09-04", "server-side-fallback-2026-06-01", "server-side-fallback-2026-07-01",
         "fallback-credit-2026-06-01", "fallback-credit-2026-07-01", "message-threads-2026-08-12",
     )
     # published with no page a reader could judge from

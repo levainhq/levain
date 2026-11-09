@@ -19,8 +19,8 @@ Sources (Anthropic is pinned to a tag; bump `ANTHROPIC_SDK_TAG` per release, nev
                                   `anthropic-beta` values a real client sent (CAPTURED_BETAS, read from the repo)
 A field the vendor removed stays on a codec's list (old clients still send it); this script never reports a removal.
 The beta section prints each beta name the SDK literal or the captured headers carry that is on none of the codec's
-beta lists (`dispatch_betas`, `unbounded_betas`, `unjudged_betas`, `other_route_betas`). The release checklist reads
-"the diff printed no untriaged beta": a printed beta is judged and moved onto one of the four lists.
+beta lists (`dispatch_betas`, `unbounded_betas`, `unjudged_betas`, `other_route_betas`). Before a release, every
+printed beta is judged and moved onto one of the four lists.
 
 Exit status: 0 nothing untriaged, 1 untriaged fields found, 2 the check could not run (a fetch failure, a missing or
 unparseable snapshot, a request schema or class not found, an unresolved `$ref`), with one line on stderr saying why.
@@ -161,8 +161,9 @@ def untriaged(source: str, raw: bytes, codecs: Optional[Mapping[str, Any]] = Non
 
 
 def beta_names(raw: bytes) -> Set[str]:
-    """The beta names of the SDK's `AnthropicBetaParam`: every string constant inside its `Literal[...]`. A snapshot
-    that does not parse, or holds no such alias, raises `CheckFailed`."""
+    """The beta names of the SDK's `AnthropicBetaParam`: the elements of each `Literal[...]` subscript in it, and no
+    other string (an `Annotated` note is not a name). A snapshot that does not parse, holds no such alias or no
+    `Literal`, or a `Literal` element that is not a string, raises `CheckFailed`."""
     try:
         tree = ast.parse(raw.decode("utf-8"))
     except (SyntaxError, ValueError) as e:
@@ -170,7 +171,18 @@ def beta_names(raw: bytes) -> Set[str]:
     for node in tree.body:
         if isinstance(node, ast.AnnAssign) and isinstance(node.target, ast.Name) \
                 and node.target.id == "AnthropicBetaParam" and node.value is not None:
-            out = {n.value for n in ast.walk(node.value) if isinstance(n, ast.Constant) and isinstance(n.value, str)}
+            out: Set[str] = set()
+            for n in ast.walk(node.value):
+                if not (isinstance(n, ast.Subscript) and (
+                        (isinstance(n.value, ast.Name) and n.value.id == "Literal")
+                        or (isinstance(n.value, ast.Attribute) and n.value.attr == "Literal"))):
+                    continue
+                elts = n.slice.elts if isinstance(n.slice, ast.Tuple) else [n.slice]
+                for e in elts:
+                    if not (isinstance(e, ast.Constant) and isinstance(e.value, str)):
+                        raise CheckFailed("AnthropicBetaParam in %s has a Literal element that is not a string"
+                                          % BETA_SNAPSHOT)
+                    out.add(e.value)
             if out:
                 return out
     raise CheckFailed("AnthropicBetaParam not found in %s" % BETA_SNAPSHOT)
@@ -178,11 +190,12 @@ def beta_names(raw: bytes) -> Set[str]:
 
 def captured_betas(raw: bytes) -> Set[str]:
     """The beta names in the captured `anthropic-beta` header values (`{"requests": [<value>, ...]}`), split on commas
-    and stripped, as `Codec.check_betas` reads them."""
+    and stripped of spaces and tabs, as `Codec.check_betas` reads them; an empty token (a trailing comma) is not a
+    name."""
     try:
         doc = json.loads(raw)
         values = doc["requests"]
-        return {t.strip() for v in values for t in v.split(",")}
+        return {t.strip(" \t") for v in values for t in v.split(",") if t.strip(" \t")}
     except (ValueError, KeyError, TypeError, AttributeError):
         raise CheckFailed("the captured anthropic-beta headers did not parse") from None
 

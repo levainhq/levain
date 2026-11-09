@@ -41,17 +41,47 @@ def test_each_captured_claude_code_beta_set_is_admitted_on_dispatch(value):
     AM.check_betas([("anthropic-beta", value)], dispatch=True)
 
 
-def test_the_captured_sets_hold_nine_distinct_betas_all_listed():
+def test_the_captured_sets_are_all_listed():
     names = {t for v in _captured() for t in v.split(",")}
-    assert len(names) == 9 and names <= set(AM.dispatch_betas)
+    assert names and names <= set(AM.dispatch_betas)
+
+
+def test_the_whole_captured_set_passes_on_dispatch_in_one_request():
+    # every captured value as a repeated header, as one request could carry them
+    AM.check_betas([("anthropic-beta", v) for v in _captured()], dispatch=True)
+    assert {"inline-tools-2026-09-15", "advisor-tool-2026-03-01", "oauth-2025-04-20"} <= \
+        {t for v in _captured() for t in v.split(",")}   # the default and OAuth sets are in the fixture
+
+
+# --- the body half of a listed beta: the header unlocks nothing the body lists refuse ---------------------------------
+
+def _header_then_body(beta, body):
+    from tests.test_broker_codec_allowlist import _check
+    AM.check_betas([("anthropic-beta", beta)], dispatch=True)
+    return _check(AM, body, dispatch=True)
+
+
+def test_an_advisor_tool_is_refused_on_dispatch_with_the_advisor_beta_present():
+    from tests.test_broker_codec_allowlist import _body
+    # the SDK's `BetaAdvisorTool20260301Param` (anthropic-sdk-python v2.7.0): type `advisor_20260301`, name `advisor`
+    body = _body(AM, tools=[{"type": "advisor_20260301", "name": "advisor", "model": "claude-opus-4-6"}])
+    assert _header_then_body("claude-code-20250219,advisor-tool-2026-03-01", body) == "body-unlisted:advisor"
+
+
+def test_an_inline_tool_of_an_unlisted_type_is_refused_on_dispatch_with_the_inline_tools_beta_present():
+    from tests.test_broker_codec_allowlist import _anthropic_block, _addition
+    body = _anthropic_block(_addition({"type": "quantum_tool_20260101", "name": "q"}))
+    assert _header_then_body("claude-code-20250219,inline-tools-2026-09-15", body) == "body-unlisted:quantum_tool"
+    body = _anthropic_block(_addition({"type": "advisor_20260301", "name": "advisor"}))
+    assert _header_then_body("inline-tools-2026-09-15,advisor-tool-2026-03-01", body) == "body-unlisted:advisor"
 
 
 # --- the probe rows: refused on dispatch, admitted interactive -------------------------------------------------------
 
 @pytest.mark.parametrize("beta,what", [
     ("mcp-client-2025-11-20", "mcp_client_2025_11_20"),
-    ("advisor-tool-2026-03-01", "advisor_tool_2026_03_01"),
-    ("inline-tools-2026-09-15", "inline_tools_2026_09_15"),
+    ("skills-2025-10-02", "skills_2025_10_02"),
+    ("compact-2026-01-12", "compact_2026_01_12"),
     ("dreaming-2026-04-21", "dreaming_2026_04_21"),
 ])
 def test_an_unlisted_beta_is_refused_on_dispatch_and_admitted_interactive(beta, what):
@@ -64,8 +94,15 @@ def test_an_unlisted_beta_is_refused_on_dispatch_and_admitted_interactive(beta, 
 def test_one_bad_token_in_a_comma_separated_value_refuses_the_whole_header():
     e = _refused([("anthropic-beta", "claude-code-20250219,mcp-client-2025-11-20,effort-2025-11-24")])
     assert e.name == "beta-unlisted:mcp_client_2025_11_20"
-    e = _refused([("anthropic-beta", "claude-code-20250219, advisor-tool-2026-03-01")])   # a space after the comma
-    assert e.name == "beta-unlisted:advisor_tool_2026_03_01"
+    e = _refused([("anthropic-beta", "claude-code-20250219, skills-2025-10-02")])   # a space after the comma
+    assert e.name == "beta-unlisted:skills_2025_10_02"
+
+
+def test_spaces_and_tabs_around_a_token_are_removed_and_no_other_whitespace_is():
+    AM.check_betas([("anthropic-beta", "\tclaude-code-20250219 ,\t effort-2025-11-24\t")], dispatch=True)
+    for pad in ("\x0b", "\x0c", "\u00a0", "\n"):
+        e = _refused([("anthropic-beta", "claude-code-20250219," + pad + "effort-2025-11-24")])
+        assert e.name.startswith("beta-unlisted:"), pad
 
 
 def test_a_repeated_header_is_read_in_every_pair():
@@ -186,8 +223,8 @@ def test_a_dispatch_request_with_the_captured_betas_is_admitted_and_held(monkeyp
 
 def test_a_widening_pattern_on_the_keys_path_still_refuses_an_unlisted_beta(monkeypatch):
     from tests.test_broker_keys_upstream import _run
-    out = _run(lambda d: _exchange_with(d, monkeypatch, ["advisor-tool-2026-03-01"], _beta_pol(".*")))
-    assert json.loads(out["frames"][-1][1])["refused"] == "beta-unlisted:advisor_tool_2026_03_01", out["frames"]
+    out = _run(lambda d: _exchange_with(d, monkeypatch, ["skills-2025-10-02"], _beta_pol(".*")))
+    assert json.loads(out["frames"][-1][1])["refused"] == "beta-unlisted:skills_2025_10_02", out["frames"]
 
 
 def test_a_repeated_header_on_the_keys_path_is_refused_on_the_second(monkeypatch):
