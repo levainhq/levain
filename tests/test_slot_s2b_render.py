@@ -1130,3 +1130,14 @@ def test_repo_settings_proxy_env_of_the_wrong_shape_is_malformed():
     for env in (["HTTPS_PROXY"], "HTTPS_PROXY=x", None, 1):
         got = rd.repo_loosening_refusals({".claude/settings.json": {"env": env}})
         assert [x.name for x in got] == ["repo-settings-malformed"], env
+
+
+def test_loader_env_names_in_a_repo_env_are_refused_by_name():
+    names = ["LD_PRELOAD", "LD_LIBRARY_PATH", "LD_AUDIT", "LD_TRACE_LOADED_OBJECTS", "LD_ORIGIN_PATH", "LD_PROFILE",
+             "DYLD_INSERT_LIBRARIES", "DYLD_LIBRARY_PATH", "DYLD_FRAMEWORK_PATH", "DYLD_FALLBACK_LIBRARY_PATH"]
+    for f in (".claude/settings.json", ".claude/settings.local.json"):
+        for n in names:
+            got = rd.repo_loosening_refusals({f: {"env": {n: "/x/y.so", "FOO": "1"}}})
+            assert [e.name for e in got] == ["loosening:" + rd.wire_name("env." + n)], n
+            assert f in got[0].detail and n in got[0].detail
+    assert rd.repo_loosening_refusals({".claude/settings.json": {"env": {"FOO": "1", "LDFLAGS": "-O2"}}}) == []

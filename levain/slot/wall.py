@@ -1510,6 +1510,21 @@ def drop_and_assert(uid: int, gid: int, groups: Iterable[int], *, nproc: Optiona
             raise Refused("drop-assert", f"RLIMIT_NPROC is {c.getrlimit(resource.RLIMIT_NPROC)}, want {(lim, lim)}")
 
 
+#: Dynamic-loader env prefixes. glibc's ld.so honours ``LD_PRELOAD``, ``LD_LIBRARY_PATH``, ``LD_AUDIT`` and
+#: ``LD_ORIGIN_PATH`` (each loads or redirects code in a non-setuid binary); ``LD_TRACE_LOADED_OBJECTS`` makes the
+#: loader list the libraries and exit 0 without running the program, which a gate hook would read as an allow;
+#: ``LD_PROFILE`` and ``LD_PROFILE_OUTPUT`` load a profiling library. musl honours ``LD_LIBRARY_PATH`` and
+#: ``LD_PRELOAD``. macOS dyld honours the whole ``DYLD_`` family (``DYLD_INSERT_LIBRARIES``, ``DYLD_LIBRARY_PATH``,
+#: ``DYLD_FRAMEWORK_PATH``, ``DYLD_FALLBACK_*``). The class is closed by prefix, not by a list of the names known
+#: today: a loader that grows a name is covered, and no legitimate session env starts with either.
+LOADER_ENV_PREFIXES = ("LD_", "DYLD_")
+
+
+def is_loader_env(name: str) -> bool:
+    """True for a dynamic-loader env name (:data:`LOADER_ENV_PREFIXES`)."""
+    return name.startswith(LOADER_ENV_PREFIXES)
+
+
 def parse_env(data: bytes) -> dict:
     """The rendered env file (§3.4), R-M2's shape: UTF-8, one ``KEY=VALUE`` per LF-terminated line, the value
     everything after the first ``=``, no quoting. No CR, no NUL, no blank line, no repeated key. Errors name
@@ -1597,6 +1612,9 @@ def stage_main(spec_fd: int = SPEC_FD, os_calls: Optional[OsCalls] = None, *, er
             if k in env:
                 raise Refused("env-conflict", f"{k} is the rendered env's")
             env[k] = v
+        # Defence in depth: the interpreter of a hook (``-IS`` ignores PYTHON*) still runs through the dynamic
+        # loader, so no loader name reaches the vendor's env whatever put it in the file or the extras.
+        env = {k: v for k, v in env.items() if not is_loader_env(k)}
         argv = list(spec.argv)
         if spec.profile is not None:
             if sys.platform != "darwin":
