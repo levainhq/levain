@@ -930,9 +930,10 @@ def test_compaction_drops_a_ran_executor_mint_line_past_the_horizon_and_keeps_it
     rig.clock.t += T.RAN_FACTS_HORIZON_S + 1                                # past the horizon
     rig.restart()
     assert "a-old" not in _mint_attempts(rig)                               # the facts aged out ...
+    rig.restart()                                                           # (this process still holds them in memory)
     assert [x for x in rig.lines() if x["op"] == "tombstone"][0]["ticket"] == old   # ... the replay guard did not
-    assert refused(rig.mint("a-old", run_index=0)) == "attempt-closed"
     assert rig.ask("RUN-TICKET-FACTS", job_id="job-1", run_index=0)["refused"] == "ticket-unknown"
+    assert refused(rig.mint("a-old", run_index=0)) == "attempt-closed"
 
 
 def test_compaction_keeps_a_ran_executor_mint_line_inside_the_horizon(rig):
@@ -947,7 +948,7 @@ def test_compaction_keeps_the_mint_line_of_a_still_bound_ticket_past_the_horizon
     one = ticket_of(rig.mint("a-live", run_index=0))
     rig.tickets.bind(one, "s-" + "a" * 16, ("egress", 0, 1))               # bound, never released: still live
     rig.clock.t += 10 * T.RAN_FACTS_HORIZON_S
-    rig.restart()
+    rig.tickets.start()                                                     # no has_session: every binding stands
     assert "a-live" in _mint_attempts(rig)
     assert rig.ask("RUN-TICKET-STATUS", attempt_id="a-live")["state"] == "bound"
 

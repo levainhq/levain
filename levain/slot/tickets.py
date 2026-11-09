@@ -89,8 +89,16 @@ CEILING_FORMAT_2 = "levain-dispatch-ceiling/2"
 CEILING_KEYS_2 = CEILING_KEYS | {"max_calls_per_run", "max_tunnel_bytes_per_run", "max_deadline_s"}
 #: CONTRACT V16: an unbound ticket's lifetime.
 TICKET_UNUSED_S = 15 * 60
+#: DECISION: how long past a ran executor ticket's own lifetime its mint line is kept for ``RUN-TICKET-FACTS``: the
+#: margin for a follower to reach the run's terminal event after the run ended. Seven days is a decision, not a
+#: derivation: nothing in CONTROL bounds a brokered run's length or a follower's lag.
+RAN_FACTS_MARGIN_S = 7 * 86400
+#: the horizon past a ran executor ticket's mint after which the compaction drops its mint line (its tombstone stays):
+#: the ticket's unused lifetime (a run binds at most that long after the mint) plus :data:`RAN_FACTS_MARGIN_S`.
+RAN_FACTS_HORIZON_S = TICKET_UNUSED_S + RAN_FACTS_MARGIN_S
 #: DECISION: the largest journal CONTROL reads at its start (the compaction keeps it to the open tickets, one day's
-#: mints, one small tombstone per lifetime attempt and the mint line of every executor ticket that ran, which
+#: mints, one small tombstone per lifetime attempt and the mint line of each executor ticket that ran inside
+#: :data:`RAN_FACTS_HORIZON_S`, which
 #: `RUN-TICKET-FACTS` answers from); past it the start is refused, never half-read.
 JOURNAL_MAX = 64 * 1024 * 1024
 CEILING_MAX = 4096
@@ -692,6 +700,7 @@ class TicketStore:
 
     def _compacted(self) -> bytes:
         today = _day(self._clock())
+        now_ms = self._now_ms()
         out: List[bytes] = []
         for attempt in sorted(self._by_attempt):
             t = self._by_attempt[attempt]
@@ -701,21 +710,31 @@ class TicketStore:
                 if t.session is not None:
                     tomb["session"] = t.session
                 out.append(canon.canonical_bytes(tomb))
-            if t.state in OPEN or (t.day == today and t.facts) or self._ran_executor(t):
+            if t.state in OPEN or (t.day == today and t.facts) or self._ran_executor(t, now_ms):
                 out.append(canon.canonical_bytes(self._mint_line(t)))
             if t.state == BOUND:
                 out.append(canon.canonical_bytes(self._bind_line(t)))
         return b"".join(line + b"\n" for line in out)
 
     @staticmethod
-    def _ran_executor(t: Ticket) -> bool:
-        """An executor ticket that was bound to a session (it ran), whatever its state and day: the compaction keeps
-        its mint line beside its tombstone, so ``RUN-TICKET-FACTS`` answers for its run after any number of CONTROL
-        restarts. CONTROL does not see when the run's job ends, and a follower may reach the run's terminal event days
-        later (PRE-W L3 r1, codex MED): dropping the facts then fails a run that ran as ``backend-unresolved``.
-        Keeping every such ticket's facts also keeps the ambiguity check whole. A cancelled or expired ticket (never
-        bound) is a tombstone only, as before."""
-        return t.session is not None and bool(t.facts) and t.facts.get("kind") == "executor"
+    def _facts_horizon_s(t: Ticket) -> int:
+        """How long after its mint a ran executor ticket's mint line is kept: :data:`RAN_FACTS_HORIZON_S`, widened by
+        the ticket's own ``deadline_s`` fact when it carries one (a passthrough run may legitimately last that long)."""
+        deadline = t.facts.get("deadline_s")
+        return RAN_FACTS_HORIZON_S + (deadline if type(deadline) is int and deadline > 0 else 0)
+
+    @staticmethod
+    def _ran_executor(t: Ticket, now_ms: int) -> bool:
+        """An executor ticket that was bound to a session (it ran), within its retention horizon: the compaction keeps
+        its mint line beside its tombstone, so ``RUN-TICKET-FACTS`` answers for its run after any CONTROL restart. CONTROL
+        does not see when the run's job ends, and a follower may reach the run's terminal event days later (PRE-W L3
+        r1, codex MED), so the line outlives its mint's day, for :meth:`_facts_horizon_s`. Past that the line is dropped
+        and only the tombstone stays, which is all replay protection reads; a ticket still OPEN (bound, not released) is
+        kept by the compaction whatever its age, so a live ticket never loses its facts. A cancelled or expired ticket
+        (never bound) is a tombstone only."""
+        if t.session is None or not t.facts or t.facts.get("kind") != "executor":
+            return False
+        return now_ms - t.minted_ms < TicketStore._facts_horizon_s(t) * 1000
 
     def _compact(self) -> None:
         data = self._compacted()
@@ -1040,7 +1059,7 @@ class TicketStore:
         executor ticket for ``(job_id, run_index)`` that was bound to a session (a cancelled or expired ticket never
         ran, so it is not counted). None is ``ticket-unknown``; more than one is ``ticket-ambiguous`` (refused, never
         chosen). Read-only: nothing is appended. The start compaction keeps every executor ticket that ran
-        (:meth:`_ran_executor`), so a run's facts outlive its mint's UTC day and any restart."""
+        (:meth:`_ran_executor`), so a run's facts outlive its mint's UTC day and any restart, until the retention horizon."""
         with self.lock:
             self._live()
             found = [t for t in self._by_ticket.values()
