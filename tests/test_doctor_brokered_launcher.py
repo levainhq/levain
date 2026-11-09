@@ -1,6 +1,6 @@
-"""PRE-W: the brokered launcher's doctor row (design 1105-49 §4): per-run share vs the root ceiling, and no brokered
-route for a model. Green, amber (cannot tell), red (a standing mint refusal seen before the first fire). OFF, the
-default, shows no row and never changes the exit code."""
+"""The brokered launcher's doctor row (design 1105-49 §4): per-run share vs the root ceiling, and no brokered
+route for a model. Green, amber (cannot tell), red (a standing mint refusal seen before the first fire). OFF (the
+opt-out, or a setting that was refused) never changes the exit code."""
 from __future__ import annotations
 
 import pytest
@@ -20,8 +20,9 @@ def state(r):
     return "red" if not r.ok else "amber" if r.warn else "neutral" if r.neutral else "green"
 
 
-def test_off_is_no_row():
-    assert rows(setting=OFF) == []
+def test_the_opt_out_is_one_neutral_row_naming_it():
+    (r,) = rows(setting=OFF)
+    assert state(r) == "neutral" and r.ok and "opted out" in r.detail and "passthrough" in r.detail
 
 
 def test_a_refused_setting_is_amber_never_on():

@@ -571,7 +571,7 @@ class RunServer:
     ``verify`` as :class:`FrameClaims`; without one the frames carry neither and ``verify`` gets ``None``. Servers that
     share a session index share a :class:`HolderRegistry` (``registry``); without one a server makes its own."""
 
-    #: PRE-W: the brokered server :func:`build_server` built beside this passthrough one (setting ON), else None
+    #: the brokered server :func:`build_server` built beside this passthrough one (setting not opted out), else None
     brokered: "Optional[RunServer]" = None
 
     def __init__(self, launcher: RealLauncher, *,
@@ -1221,7 +1221,7 @@ def _parser(host: str) -> argparse.ArgumentParser:
     ap.add_argument("--operator-uid", type=int, default=None)
     from levain.slot.layout import policy_dispatch_auth_path
     ap.add_argument("--auth-setting", default=str(policy_dispatch_auth_path(host)),
-                    help="PRE-W: root's brokered setting (absent: OFF, the passthrough server only)")
+                    help="root's brokered setting (absent: ON, the brokered server serves beside the passthrough one; 'passthrough' opts out)")
     return ap
 
 
@@ -1246,7 +1246,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         from levain.slot.layout import operator_record_path
         from levain.slot.services.control import _operator_uid
         op_uid = a.operator_uid if a.operator_uid is not None else _operator_uid(Path(a.operator_record or operator_record_path(host)))
-        # PRE-W, DEFAULT OFF: root's setting adds the brokered server on its own socket; OFF serves exactly as before
+        # the brokered server is ON unless root's setting opts out; it serves on its own socket beside run.sock
         auth, why = read_dispatch_auth(a.auth_setting)
         if why is not None:
             print(f"levain dispatch-run: brokered launcher off: {why}", file=sys.stderr, flush=True)
@@ -1317,8 +1317,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
 
 
 def build_server(host: str, store: Path, control_sock: Path, operator_uid: int, *, brokered: bool = False) -> RunServer:
-    """The PASSTHROUGH server (L3 wave3 r1, codex HIGH 1). With ``brokered`` (PRE-W: root's setting ON,
-    :func:`read_dispatch_auth`; default OFF) it also builds, as the returned server's ``brokered``, a BROKERED server: a
+    """The PASSTHROUGH server (L3 wave3 r1, codex HIGH 1). With ``brokered`` (:func:`read_dispatch_auth`: ON unless
+    root's setting opts out; the parameter itself defaults False, so a caller that names none builds the one server) it
+    also builds, as the returned server's ``brokered``, a BROKERED server: a
     separately constructed ``RealLauncher(auth="brokered")`` whose usage is ``spend=lineage_spend_reader(L/lineage/
     lineage.jsonl)`` with no completeness proof (none exists yet: every read is None, so every brokered run settles at
     its WHOLE share, the fail-closed rule), behind its own ``replica_verifier(replica, billing="api_key")``, served by
@@ -1327,8 +1328,8 @@ def build_server(host: str, store: Path, control_sock: Path, operator_uid: int, 
     would contend on its append lock), the ONE uploads (a second sweep would delete the first's staging) and the ONE
     :class:`HolderRegistry` (a key is one session whichever socket launched it, so SYNC and END reach it from either). Both
     servers come from the one ``RunServer(`` call below with ``replica=replica`` (the claims=None ruling's pin). The
-    client's ``build_launcher`` handing an ``api_key`` occurrence a brokered client is NOT wired yet, so no real fire
-    reaches the brokered socket. Never mutate a shared launcher's ``auth`` per request: concurrent launches and later
+    client's ``build_launcher`` sends an ``api_key`` occurrence to the brokered socket and a subscription one to
+    ``run.sock``; nothing falls back from one to the other. Never mutate a shared launcher's ``auth`` per request: concurrent launches and later
     USAGE reads would race on it.
 
     The production wiring: the real ports behind :class:`RealLauncher`, and the authority REPLICA at
@@ -1367,23 +1368,28 @@ def build_server(host: str, store: Path, control_sock: Path, operator_uid: int, 
     return servers[0]
 
 
-#: PRE-W: the whole content of ``L/policy/dispatch_auth`` that turns the brokered launcher ON
+#: the whole content of ``L/policy/dispatch_auth`` that turns the brokered launcher ON (an install that opted in
+#: before the default flipped keeps it)
 DISPATCH_AUTH_ON = b"brokered\n"
-#: PRE-W: the brokered server's socket, beside the passthrough one (``run.sock``): the billing decision is which
-#: socket a fire reached, never a per-request change of a shared launcher
-BROKERED_SOCKET_NAME = "run-brokered.sock"
+#: the whole content of ``L/policy/dispatch_auth`` that opts OUT: the passthrough server serves alone
+DISPATCH_AUTH_OFF = b"passthrough\n"
+#: the brokered server's socket, beside the passthrough one (``run.sock``): the billing decision is which
+#: socket a fire reached, never a per-request change of a shared launcher. The client names it too, so it lives there.
+BROKERED_SOCKET_NAME = C.BROKERED_SOCKET_NAME
 
 
 def read_dispatch_auth(path: "Path | str", owner: int = 0) -> tuple[str, Optional[str]]:
-    """``(auth, why)`` of the run server's brokered setting (PRE-W, DEFAULT OFF): ``("brokered", None)`` only when
-    ``path`` is a regular file (not a link) owned by ``owner`` (root), writable by nobody else, whose whole content is
-    :data:`DISPATCH_AUTH_ON`. Absent is ``("passthrough", None)``, OFF. Anything else reads OFF too, with ``why`` the
-    reason (the doctor shows it): OFF is the passthrough server that runs without the setting. Never raises."""
+    """``(auth, why)`` of the run server's brokered setting. The brokered server is ON by default: ``("brokered",
+    None)`` when ``path`` is absent, or is a regular file (not a link) owned by ``owner`` (root), writable by nobody
+    else, whose whole content is :data:`DISPATCH_AUTH_ON`. ``("passthrough", None)`` is the explicit opt-out: the same
+    file, whose whole content is :data:`DISPATCH_AUTH_OFF`. Anything else (unreadable, another owner or mode, other
+    content) is ``("passthrough", why)``, OFF with the reason (the doctor shows it): a setting someone tried to write
+    and got wrong is not read as the default. Never raises."""
     import stat as _stat
     try:
         fd = os.open(str(path), os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC)
     except FileNotFoundError:
-        return "passthrough", None
+        return "brokered", None
     except OSError as exc:
         return "passthrough", f"the setting cannot be read ({exc.strerror or type(exc).__name__})"
     try:
@@ -1392,14 +1398,16 @@ def read_dispatch_auth(path: "Path | str", owner: int = 0) -> tuple[str, Optiona
             return "passthrough", "the setting is not a regular file"
         if st.st_uid != owner or st.st_mode & 0o022:
             return "passthrough", "the setting is not root's alone (another account owns it or can write it)"
-        data = os.read(fd, len(DISPATCH_AUTH_ON) + 1)
+        data = os.read(fd, max(len(DISPATCH_AUTH_ON), len(DISPATCH_AUTH_OFF)) + 1)
     except OSError as exc:
         return "passthrough", f"the setting cannot be read ({exc.strerror or type(exc).__name__})"
     finally:
         os.close(fd)
-    if data != DISPATCH_AUTH_ON:
-        return "passthrough", "the setting's content is not exactly 'brokered'"
-    return "brokered", None
+    if data == DISPATCH_AUTH_ON:
+        return "brokered", None
+    if data == DISPATCH_AUTH_OFF:
+        return "passthrough", None
+    return "passthrough", "the setting's content is neither exactly 'brokered' nor exactly 'passthrough'"
 
 
 def service_row():
@@ -1412,7 +1420,7 @@ def service_row():
 
 
 __all__ = ["ACCOUNT", "NAME", "FrameClaims", "RunServer", "replica_verifier", "service_row", "agent_store_bar", "bound_usage_sources", "build_server", "main", "serve",
-           "verify_point_of_use", "BROKERED_SOCKET_NAME", "DISPATCH_AUTH_ON", "read_dispatch_auth"]
+           "verify_point_of_use", "BROKERED_SOCKET_NAME", "DISPATCH_AUTH_ON", "DISPATCH_AUTH_OFF", "read_dispatch_auth"]
 
 
 if __name__ == "__main__":

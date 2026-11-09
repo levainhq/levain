@@ -441,14 +441,14 @@ def policy_limits_path(host: HostOS) -> Path:
 POLICY_DISPATCH_CEILING = "dispatch_ceiling"
 
 
-#: ``L/policy/dispatch_auth``'s name (PRE-W): the run server's brokered setting,
+#: ``L/policy/dispatch_auth``'s name: the run server's brokered setting (absent is ON; ``passthrough`` opts out),
 #: :func:`levain.slot.services.dispatch_run.read_dispatch_auth`.
 POLICY_DISPATCH_AUTH = "dispatch_auth"
 
 
 def policy_dispatch_auth_path(host: HostOS) -> Path:
-    """``L/policy/dispatch_auth`` (PRE-W): root's file, whose whole content ``brokered`` turns the run server's
-    brokered launcher ON. Absent is OFF, the default; setup writes nothing here."""
+    """``L/policy/dispatch_auth``: root's file. Absent, or whole content ``brokered``, the run server's brokered
+    launcher is ON; whole content ``passthrough`` opts out. Setup writes nothing here."""
     return STORE[host] / "policy" / POLICY_DISPATCH_AUTH
 
 
