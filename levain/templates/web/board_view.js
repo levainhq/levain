@@ -24,7 +24,7 @@
 
   // The one rule for a card the desk alone owes (the host's section desk, not carried over to him): not his, so not drawn and not
   // counted. The same rule as levain.band_view.desk_owed, which the app badge and the compact board counts apply.
-  function isDeskOwed(k) { return !!k && k.section === "desk" && !k.carried; }
+  function isDeskOwed(k) { return !!k && k.band === true && k.section === "desk" && !k.carried; }
   function visibleCards(cards) { return (cards || []).filter(function (k) { return !isDeskOwed(k); }); }
 
   function boardModel(body) {

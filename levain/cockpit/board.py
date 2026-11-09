@@ -25,10 +25,11 @@ _WHAT_MAX = 300
 
 
 def is_desk_owed(card: Mapping[str, Any]) -> bool:
-    """A board card the desk alone owes (the band's one rule, :func:`levain.band_view.desk_owed`): not the operator's."""
+    """A band card the desk alone owes (the band's one rule, :func:`levain.band_view.desk_owed`): not the operator's. Only a band
+    card: any other card may carry a ``section`` of its own (the board validator keeps extra keys) and is never hidden by it."""
     from levain import band_view
 
-    return band_view.desk_owed(card.get("section"), card.get("carried"))
+    return card.get("band") is True and band_view.desk_owed(card.get("section"), card.get("carried"))
 
 
 def visible_cards(cards: Any) -> list[Any]:

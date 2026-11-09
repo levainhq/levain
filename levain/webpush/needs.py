@@ -11,19 +11,25 @@ for a caller with no page (the push sender, the unread-count route). A notice ne
 """
 from __future__ import annotations
 
+import json
 import logging
+import os
+import secrets
 import sqlite3
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-__all__ = ["BADGE_MAX", "open_needs_count", "badge_value"]
+__all__ = ["BADGE_MAX", "COUNT_FILE", "COUNT_FRESH_S", "open_needs_count", "badge_value", "recorded_count", "resolved_badge"]
 
 log = logging.getLogger(__name__)
 # a store that could not be read: the answer is unknown. Anything else is a defect, logged loudly and still unknown (a push never fails on it)
 _READ_FAULTS = (sqlite3.Error, OSError, ValueError)
 
 BADGE_MAX = 99      # payload room is tight and a badge past two digits says nothing more; the page shows the exact count
+COUNT_FILE = "needs-count.json"    # in the queue dir: the count the serving process last read from its own question store
+COUNT_FRESH_S = 120                # a recorded count older than this is not believed
 
 
 def open_needs_count(queue_dir: "Path | str", question_source: Any = None) -> "int | None":
@@ -61,7 +67,57 @@ def open_needs_count(queue_dir: "Path | str", question_source: Any = None) -> "i
         log.exception("needs count: the question store failed unexpectedly; the count is unknown")
         failed = True
     # a half that could not be read makes the count unknown, never a smaller number: a partial count could lower a real badge (6 -> 2)
-    return None if failed else total
+    result = None if failed else total
+    if question_source is not None:       # only the process holding the host's store knows its count: it says so for the others
+        _record(queue_dir, result)
+    return result
+
+
+def _record(queue_dir: "Path | str", n: "int | None") -> None:
+    """Keep the host's count where a process without its store can read it (:func:`recorded_count`); an unknown count removes
+    the record, so a stale number is never read as current. Never raises: a count that cannot be kept is the other side's native read."""
+    path = Path(queue_dir) / COUNT_FILE
+    tmp = None
+    try:
+        if n is None:
+            path.unlink(missing_ok=True)
+            return
+        if not path.parent.is_dir():
+            return
+        tmp = path.with_name(f".{path.name}.{secrets.token_hex(6)}.tmp")
+        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0), 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            fh.write(json.dumps({"n": n, "at": time.time()}) + "\n")
+        os.replace(tmp, path)
+        tmp = None
+    except OSError:
+        pass
+    finally:
+        if tmp is not None:
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
+
+
+def recorded_count(queue_dir: "Path | str", *, now: "float | None" = None) -> "int | None":
+    """The host's count its serving process recorded within :data:`COUNT_FRESH_S`, clipped to :data:`BADGE_MAX`; None when
+    there is no record, it is old or from the future, or it is off its shape."""
+    try:
+        doc = json.loads((Path(queue_dir) / COUNT_FILE).read_text(encoding="utf-8"))
+        n, at = doc["n"], doc["at"]
+        if type(n) is not int or n < 0 or isinstance(at, bool) or not isinstance(at, (int, float)):
+            return None
+        age = (time.time() if now is None else now) - at
+        return min(n, BADGE_MAX) if 0 <= age <= COUNT_FRESH_S else None
+    except (OSError, ValueError, KeyError, TypeError):
+        return None
+
+
+def resolved_badge(queue_dir: "Path | str") -> "int | None":
+    """The badge for a push whose caller did not say: the serving process's recorded count, else the native store's."""
+    n = recorded_count(queue_dir)
+    return n if n is not None else badge_value(queue_dir)
 
 
 def badge_value(queue_dir: "Path | str", question_source: Any = None) -> "int | None":

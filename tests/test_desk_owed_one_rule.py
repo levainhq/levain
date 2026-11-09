@@ -95,3 +95,27 @@ def test_the_board_touch_summary_line_counts_the_cards_the_board_draws(tmp_path)
     r = subprocess.run(["node", "-e", driver, str(ROOT / "levain/templates/web/board_view.js"), str(ROOT / "levain/templates/web/cockpit_view.js")],
                        input=json.dumps(snapshot(ck)), capture_output=True, text=True, check=True, timeout=60)
     assert "3 cards" in r.stdout and "needs-you 3" in r.stdout, r.stdout[:2000]
+
+
+NONBAND_SCRIPT = """
+const fs = require("fs"), vm = require("vm");
+globalThis.window = globalThis;
+vm.runInThisContext(fs.readFileSync(process.argv[2], "utf8"));
+const V = window.LevainBoardView;
+const cards = [{ id: "n1", title: "t", section: "desk" }, { id: "n2", title: "t", section: "desk", band: false },
+               { id: "b1", title: "t", band: true, section: "desk" }];
+console.log(JSON.stringify({ owed: cards.map((k) => V.isDeskOwed(k)), visible: V.visibleCards(cards).map((k) => k.id) }));
+"""
+
+
+def test_a_card_that_is_not_a_band_row_is_never_hidden_by_a_section(tmp_path):
+    """The engine's board validator keeps extra keys, so any card may carry ``section``: only a band row is the desk's to owe."""
+    cards = [{"id": "n1", "section": "desk"}, {"id": "n2", "section": "desk", "band": False},
+             {"id": "b1", "band": True, "section": "desk"}]
+    assert [board.is_desk_owed(c) for c in cards] == [False, False, True]
+    assert [c["id"] for c in board.visible_cards(cards)] == ["n1", "n2"]
+    s = tmp_path / "probe.js"
+    s.write_text(NONBAND_SCRIPT)
+    r = subprocess.run(["node", str(s), str(ROOT / "levain/templates/web/board_view.js")], capture_output=True, text=True,
+                       timeout=60, check=True)
+    assert json.loads(r.stdout) == {"owed": [False, False, True], "visible": ["n1", "n2"]}
