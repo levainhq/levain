@@ -158,6 +158,8 @@
   // The List's surface filter ("" = all, else band | board | spore | talk | drop) and the intake box's kept state: the receipt
   // line under the box and an unsent line. A landed write re-reads the page and rebuilds the box, so both live here, not in the DOM.
   let listSurface = "";
+  // The List's time filter ("" = every time-state, else now | later | someday | done): it cuts across the type chips above.
+  let listTime = "";
   const intakeKept = { receipt: null, draft: "" };   // receipt: { text, cls } | null
   // Whether the Tray lists the rows held until their surface date. Per viewer and per browser: it is a display
   // choice, so it lives in localStorage (which may be absent or throw) and never on the server. Default hidden.
@@ -449,7 +451,7 @@
   function listApart(panel) {
     try {
       const a = JSON.parse(panel.dataset.listApart || "null");
-      return a && (a.desk > 0 || a.later > 0 || a.held > 0) ? a : null;
+      return a && (a.desk > 0 || a.later > 0 || a.done > 0) ? a : null;
     } catch (e) { return null; }
   }
   function listMore(panel, hidden, a) {
@@ -457,7 +459,7 @@
     if (hidden > 0) parts.push(hidden + " more");
     if (a.desk > 0) parts.push("desk owes " + a.desk);
     if (a.later > 0) parts.push("later " + a.later);
-    if (a.held > 0) parts.push(a.held + " held");
+    if (a.done > 0) parts.push("done " + a.done);
     const more = el("button", "more-foot", parts.join(" · "));
     more.type = "button";
     more.dataset.listMore = "1";
@@ -2087,6 +2089,7 @@
     // fixed meta columns, and a drop row carries more than four small facts
     const host = s.surface ? el("span", "list-meta") : row;
     if (s.surface) row.dataset.surface = s.surface;
+    if (s.surface && s.time_state) row.dataset.timeState = s.time_state;
     // the spore id is the common reference handle (how flow tracks + you name it,
     // e.g. "compost spore-049") — show it leading so the row is addressable; the TUI
     // shows the same id trailing (tui.render_panel_lines).
@@ -2118,7 +2121,8 @@
     if (foreign) {
       // read-only by construction: band rows point at the Decisions panel, board rows at the agents' queue; no verbs below
       if (s.support && !s.text_locked) host.appendChild(el("span", "muted list-support", s.support));
-      if (s.later_words && s.group === "later") host.appendChild(tagEl("muted", "back " + s.later_words));   // a carried desk row is due now (needs you), never "back Mon"
+      if (s.wake_line && s.group === "later") host.appendChild(tagEl("muted", s.wake_line));
+      else if (s.later_words && s.group === "later") host.appendChild(tagEl("muted", "back " + s.later_words));   // a carried desk row is due now (needs you), never "back Mon"
       // a desk row the desk has carried past its day is listed under Needs you, tagged as flow's footer tags it
       if (s.band_section === "desk" && s.carried) host.appendChild(tagEl("muted list-desk-owed", "desk-owed"));
       if (s.list_pointer) host.appendChild(tagEl("muted list-pointer", s.list_pointer));
@@ -2129,15 +2133,24 @@
       else if (s.surface !== "band" && Number.isInteger(s.age_days) && s.age_days >= 0) host.appendChild(el("span", "muted", s.age_days + " d"));
       return row;
     }
+    if (s.surface && s.time_state === "done") {
+      // resolved in the last week: read-only, the day and how it closed
+      host.appendChild(tagEl("muted", "done " + (s.done_kind ? s.done_kind + " " : "") + shortDate(s.done_on || "")));
+      return row;
+    }
     if (s.surface && !s.held) {
       // the kernel computed `overdue` and `fires`; this only says so
-      if (s.overdue) {
+      if (s.wake_line) {
+        const wk = tagEl("muted", s.wake_line);
+        wk.setAttribute("data-ck-tag-state", "later");
+        host.appendChild(wk);
+      } else if (s.overdue) {
         row.dataset.band = "overdue";
         const od = tagEl("muted", "overdue");
         od.setAttribute("data-ck-tag-state", "overdue");
         host.appendChild(od);
       }
-      if (s.next && !s.fires) host.appendChild(tagEl("muted", "due " + shortDate(s.next)));
+      if (!s.wake_line && s.next && !s.fires) host.appendChild(tagEl("muted", "due " + shortDate(s.next)));
       if (s.surface === "talk" && Number.isInteger(s.age_days) && s.age_days >= 0) host.appendChild(tagEl("muted", s.age_days + " d old"));
       if (s.deliver_to && s.surface === "drop") host.appendChild(tagEl("muted", "to " + s.deliver_to));
       if (s.age_shown && s.age) host.appendChild(el("span", "muted", s.age));
@@ -2253,15 +2266,16 @@
     // that come back on a later day, the rows held until their date) is listed in the focus view, under its own heading, and the
     // card names them in ONE control that opens it. So the card draws neither a held row nor a held toggle.
     const inCard = isList && !(ropts && ropts.modal);
-    const apart = (s) => s.group === "desk" || s.group === "later";
+    const apart = (s) => s.group === "desk" || s.group === "later" || s.group === "done";
     const cardHides = (s) => inCard && apart(s);
     // read live: the plain Tray's toggle flips trayHeldShown and redraws without rebuilding this closure
     const heldShownNow = () => (isList ? !inCard : trayHeldShown);
     // what the card leaves to the focus view, counted as flow's footer counts it: DESK OWES is every desk row, a carried one too
     // (it is also listed under Needs you); LATER the rows that come back on a later day
     const apartCount = { desk: (list || []).filter((s) => s.band_section === "desk").length,
-                         later: (list || []).filter((s) => s.group === "later").length, held: heldLine ? heldLine.count : 0 };
-    const cardHasApart = inCard && (apartCount.desk > 0 || apartCount.later > 0 || apartCount.held > 0);
+                         later: (list || []).filter((s) => s.group === "later").length + (heldLine ? heldLine.count : 0),
+                         done: (list || []).filter((s) => s.group === "done").length };
+    const cardHasApart = inCard && (apartCount.desk > 0 || apartCount.later > 0 || apartCount.done > 0);
     // ONE rule for "all", in the card and the focus view: the rows in this view's own list (the card's without the desk's and the
     // later ones it names in its control, the focus view's with them). Held rows are never in it, nor in a surface chip: they have
     // their own "held" chip. So the header, the "all" chip and the control's numbers follow from each other.
@@ -2274,6 +2288,10 @@
       return at < 0 ? rows.concat(copies) : rows.slice(0, at).concat(copies, rows.slice(at));
     };
     const heldChosen = () => isList && !inCard && listSurface === "held" && !!heldLine;   // the card names its held rows in its control, never draws them
+    // the time-state a row is in, as the kernel computed it; the focus view's time chips filter by it, across the type chips
+    const timeOf = (s) => s.time_state || "now";
+    const timeNow = () => (isList && !inCard && LIST_TIMES.indexOf(listTime) >= 0 ? listTime : "");
+    const inTime = (s) => !timeNow() || timeOf(s) === timeNow();
     const listNow = () => (heldChosen() ? "held" : isList && listAll().some((s) => s.surface === listSurface) ? listSurface : "");
     const inSurface = (s) => !listNow() || listNow() === "held" || s.surface === listNow();
     if (isList && !inCard) p.dataset.listTotal = String(listAll().length);   // the focus view's header counts what its "all" chip counts
@@ -2300,7 +2318,21 @@
         note.appendChild(go);
       },
       controls: (bar, redraw) => {
-        if (isList) bar.after(chipRow = buildSurfaceChips(listAll(), listNow, (v) => { listSurface = v; redraw(); }, heldLine && !inCard ? heldLine.count : 0));
+        if (isList) {
+          const chooseSurface = (v) => { listSurface = v; redraw(); };
+          chipRow = buildSurfaceChips(listAll().filter(inTime), listNow, chooseSurface, 0, !!timeNow());
+          bar.after(chipRow);
+          if (!inCard) {
+            // the time chips; choosing one recounts the type chips beside it, so a chip's number stays the rows its tap shows
+            const timeRow = buildTimeChips(listAll(), timeNow, (v) => {
+              listTime = v;
+              const fresh = buildSurfaceChips(listAll().filter(inTime), listNow, chooseSurface, 0, !!timeNow());
+              chipRow.replaceWith(fresh); chipRow = fresh;
+              redraw();
+            });
+            chipRow.before(timeRow);
+          }
+        }
         if (heldLine && !isList) {
           const line = el("div", "ext-note held-line");
           // the earliest surface date among the held rows: "1 held back until Dec 3"
@@ -2336,7 +2368,7 @@
         bar.appendChild(sel);
       },
       pick: (rows) => {
-        const base = (listNow() === "held" ? [] : listNow() ? rows.filter((s) => s.surface === listNow() && inSurfaceChip(s)) : rows).filter((s) => !cardHides(s));
+        const base = (listNow() === "held" ? [] : listNow() ? rows.filter((s) => s.surface === listNow() && inSurfaceChip(s, !!timeNow())) : rows).filter((s) => !cardHides(s)).filter(inTime);
         const ids = views.length && viewOf() ? view.tray_view_rows[viewOf()] : null;
         // the focus view draws a carried desk row under Needs you AND under Desk owes, as flow's footer prints it, so the control's
         // "desk owes N" is the number of rows a person can see under that heading (a chosen view is ungrouped: no copy there)
@@ -2356,9 +2388,10 @@
     mountSporeFilter(p, list || [], "items", entry.kind, (rows, results) => {
       let lastGroup = null;
       let heldHead = false;
+      let lastBucket = null;
       let box = results;
       for (const s of rows) {
-        if (s.held && !heldHead) { heldHead = true; box = results; results.appendChild(headingEl("Held until their surface date")); }
+        if (s.held && !heldHead) { heldHead = true; box = results; results.appendChild(headingEl("Later")); }
         // a manifest source brings the kernel's own bands (Today / Overdue / Also pending), in its order;
         // a chosen view is ungrouped
         const g = s.group || null;
@@ -2366,6 +2399,16 @@
           // each band is a column of its own where the page is wide (Morning's Tray: Overdue | Today); `display: contents` elsewhere
           box = entry.kind === "tray" ? results.appendChild(el("div", "grp-col")) : results;
           box.appendChild(headingEl(s.group_title));
+          lastBucket = null;
+        }
+        // LATER groups its rows by the day they wake (the kernel's bucket; its rows are already in wake order)
+        if (g === "later" && s.wake_bucket && s.wake_bucket !== lastBucket && !viewOf()) {
+          lastBucket = s.wake_bucket;
+          const sub = el("div", "grp-sub", WAKE_BUCKETS[s.wake_bucket] || s.wake_bucket);
+          sub.dataset.wakeBucket = s.wake_bucket;
+          sub.setAttribute("role", "heading");
+          sub.setAttribute("aria-level", "4");
+          box.appendChild(sub);
         }
         lastGroup = g;
         box.appendChild(sporeRow(s, verbs, badgeField, entry.kind));
@@ -2451,17 +2494,42 @@
   const SURFACE_WORDS = { band: "band", board: "board", spore: "spores", talk: "talk", drop: "drops" };
   // ONE rule for which rows a surface chip stands for: the chip's count and the rows the focus view draws under it both use it, so
   // a number on a chip is the number of rows its tap shows. The band's chip excludes the desk's rows and the later ones.
-  function inSurfaceChip(s) {
-    return !!(s && s.surface) && !(s.surface === "band" && (s.group === "desk" || s.group === "later"));
+  // With a time chip chosen the band's chip counts every band row in that time-state (a Later filter is the later rows).
+  function inSurfaceChip(s, timed) {
+    return !!(s && s.surface) && (!!timed || !(s.surface === "band" && (s.group === "desk" || s.group === "later")));
   }
-  function buildSurfaceChips(list, current, choose, heldCount) {
+  // The List's time chips: now / later / someday / done, each with its count; a second tap clears the choice. The type chips
+  // beside them keep cutting across the time-states.
+  const LIST_TIMES = ["now", "later", "someday", "done"];
+  const WAKE_BUCKETS = { tomorrow: "Tomorrow", week: "This week", later: "Later dates" };
+  function buildTimeChips(list, current, choose) {
+    const row = el("div", "list-times");
+    row.setAttribute("role", "group");
+    row.setAttribute("aria-label", "filter the List by when a row comes due");
+    const counts = new Map();
+    for (const s of list) counts.set(s.time_state || "now", (counts.get(s.time_state || "now") || 0) + 1);
+    const chips = [];
+    const sync = (now) => { for (const c of chips) c.setAttribute("aria-pressed", c.dataset.time === now ? "true" : "false"); };
+    for (const k of LIST_TIMES) {
+      if (!counts.has(k) && k !== current()) continue;
+      const c = el("button", "rc-chip list-time-chip", k.charAt(0).toUpperCase() + k.slice(1) + " " + (counts.get(k) || 0));
+      c.type = "button";
+      c.dataset.time = k;
+      c.addEventListener("click", () => { const v = current() === k ? "" : k; choose(v); sync(v); });
+      chips.push(c);
+      row.appendChild(c);
+    }
+    sync(current());
+    return row;
+  }
+  function buildSurfaceChips(list, current, choose, heldCount, timed) {
     const row = el("div", "list-surfaces");
     row.setAttribute("role", "group");
     row.setAttribute("aria-label", "filter the List by where a row comes from");
     const counts = new Map();
     // the band chip counts the rows due for the operator, as the panel's header does: the desk's rows and the later ones sit
     // under their own headings, outside it
-    for (const s of list) if (inSurfaceChip(s)) counts.set(s.surface, (counts.get(s.surface) || 0) + 1);
+    for (const s of list) if (inSurfaceChip(s, timed)) counts.set(s.surface, (counts.get(s.surface) || 0) + 1);
     const chips = [];
     const mk = (value, label) => {
       const c = el("button", "rc-chip list-surface-chip", label);
@@ -2474,7 +2542,6 @@
     const sync = (now) => { for (const c of chips) c.setAttribute("aria-pressed", c.dataset.surface === now ? "true" : "false"); };
     mk("", "all " + list.length);
     for (const k of Object.keys(SURFACE_WORDS)) if (counts.has(k)) mk(k, SURFACE_WORDS[k] + " " + counts.get(k));
-    if (heldCount > 0) mk("held", "held " + heldCount);     // its own chip: held rows are never folded into "all" or a surface's number
     sync(current());
     return row;
   }
@@ -3276,7 +3343,7 @@
   // The cockpit verb each spore button fires. On a manifest row (one that lists its `actions`) a button
   // is kept only when the kernel offered that verb on the row, and is disabled, with the gesture as its
   // title, when the gesture is one a browser cannot perform. A legacy row lists none and is untouched.
-  const BUTTON_VERB = { touch: "spore_touch", edit: "spore_update", reclassify: "spore_update", park: "spore_update",
+  const BUTTON_VERB = { touch: "spore_touch", edit: "spore_update", park: "spore_update",
     reactivate: "spore_update", schedule: "spore_surface_at", Snooze: "spore_surface_at", Resolve: "spore_descend", metabolize: "spore_set_disposition",
     dismiss: "spore_descend", compost: "spore_descend", promote: "spore_ascend",
     tombstone: "episode_tombstone" };
@@ -3343,13 +3410,10 @@
   function buildSporeVerbs(s, panelKind) {
     const wrap = el("span", "verb-actions");
 
-    // A TRAY item (the forming workbench): edit + reclassify (plastic WHILE forming) are
+    // A TRAY item (the forming workbench): edit is
     // first-class — the item isn't ready for the lifecycle verbs yet. Then the route levers.
     if (panelKind === "tray") {
       wrap.appendChild(editBtn(wrap, s));
-      // a legacy note (the Keep is gone) is not forming: its type is fixed, so no reclassify
-      if (s.disposition !== "note") wrap.appendChild(verbBtn("reclassify", "change the type — it's still forming", () =>
-        openReclassify(wrap, s)));
       // metabolize — promote into cognition as a live loop (Tray->loop is never the
       // silent-loss direction, so no confirm); the type LOCKS at this boundary.
       wrap.appendChild(verbBtn("metabolize", "promote into cognition as a live loop", async (ev) => {
@@ -3549,19 +3613,8 @@
     }, "save", false);
   }
 
-  // Inline reclassify — change a forming Tray item's type (spore_update{type}; the server
-  // gates it to forming items, locks at metabolize).
-  function openReclassify(host, s) {
-    openRowForm(host, () => {
-      const sel = el("select", "verb-kind");
-      for (const t of ["task", "question", "thought"]) { const o = el("option", null, t); o.value = t; sel.appendChild(o); }
-      if (s.type) sel.value = s.type;
-      return { nodes: [sel], focus: sel, sel };
-    }, (f) => ({ kind: "spore_update", spore_id: s.id, type: f.sel.value }), "reclassify", false);
-  }
-
   // A freeform capture box. `submit` builds the request from the typed text. Used by the
-  // Tray dump (with a type dropdown). No own label — it mounts right
+  // Tray dump (no type is asked for). No own label — it mounts right
   // under the panel's title (Tray (X)), like the content of every other panel;
   // the placeholder carries the purpose hint.
   function buildCaptureBox(placeholder, btnLabel, emptyMsg, withType, buildReq, sortEntity) {
@@ -3570,18 +3623,7 @@
     ta.placeholder = placeholder; ta.title = "⌘/Ctrl+Enter sends"; ta.rows = 2;
     box.appendChild(ta);
     const controls = el("div", "tray-dump-controls");
-    let sel = null;
-    if (withType) {
-      // "let <entity> sort" omits type → the server defaults (thought + AI routes it). The
-      // operator classifies only when they want to; the AI/default is the fallback. The
-      // entity name is install-specific (flow / Chip / …), so derive it — never hardcode.
-      sel = el("select", "tray-dump-type");
-      for (const [val, lbl] of [["", `let ${sortEntity} sort`], ["task", "task"],
-                                ["question", "question"], ["thought", "thought"]]) {
-        const o = el("option", null, lbl); o.value = val; sel.appendChild(o);
-      }
-      controls.appendChild(sel);
-    }
+    // no type is asked for: the server defaults it and the entity sorts the line (the dump is "let <entity> sort")
     const go = el("button", "tray-dump-btn", btnLabel);
     go.type = "button";
     const msg = el("span", "edit-msg", "");
@@ -3590,7 +3632,7 @@
       if (!text) { msg.className = "edit-msg err"; msg.textContent = emptyMsg; return; }
       go.disabled = true;
       msg.className = "edit-msg busy"; msg.textContent = "…";
-      const res = await commit(buildReq(text, sel && sel.value));
+      const res = await commit(buildReq(text));
       if (res && res.ok) return;  // re-rendered → fresh panel carrying the new item
       go.disabled = false;
       showFail(msg, res, "failed");
@@ -3606,16 +3648,12 @@
   }
 
   // The Tray DUMP — the operator's primary capture (a `seed` is born, held out of
-  // cognition until triaged). The type dropdown lets them classify; default = let flow sort.
+  // cognition until triaged). The entity sorts it: no type is asked for.
   function buildTrayDump(entity) {
     return buildCaptureBox(
       `Drop anything. ${entity} sorts it.`,
-      "drop", "nothing to drop", true,
-      (text, type) => {
-        const req = { kind: "spore_seed", text };
-        if (type) req.type = type;  // omit → server default (thought + AI routes)
-        return req;
-      }, entity);
+      "drop", "nothing to drop", false,
+      (text) => ({ kind: "spore_seed", text }), entity);
   }
 
   // The destructive resolve form: a kind <select> (+ a ref <input> for ascend) and a

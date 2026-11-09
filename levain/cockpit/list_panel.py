@@ -17,16 +17,17 @@ this one constant plus the places in the PLAN 1d list.
 
 Reading rules: a timed ``next`` is read through ``spores._parse_when`` only (a date-prefix read would take 09:00 as midnight);
 a timed value is overdue when ``now >= that minute``, a date-only one when it is before today; a spore whose date has not come
-stays HELD exactly as before (a talk seed is never held). A source that cannot be read is named in the panel's ``skipped`` line
+is LATER, whatever its source (a talk seed too). A source that cannot be read is named in the panel's ``skipped`` line
 (status ``partial``) and never shown as an empty list; with nothing else to show it is a Fault."""
 
 from __future__ import annotations
 
+import json
 from dataclasses import dataclass, field, replace
-from datetime import date, datetime
+from datetime import date, datetime, timedelta, timezone
 from typing import Any, Callable
 
-from levain import spores
+from levain import band_view, spores
 from levain.cockpit import board as cockpit_board
 from levain.cockpit.display_safe import visible
 from levain.cockpit.engine import Cockpit, ProviderSpec, ReadContext
@@ -57,15 +58,17 @@ BOARD_POINTER = "the agents' ready queue (levain board)"
 LIST_FACETS = SPORE_FACETS | frozenset({
     "surface", "fires", "overdue", "target", "attention", "list_pointer", "band_number", "board_rank", "board_tier",
     "source", "repo", "held_until", "band_section", "band_carried", "band_age", "band_later_words",
+    "time_state", "wake_day", "wake_bucket", "wake_line", "done_on", "done_kind",
 })
 SURFACES = ("band", "board", "spore", "talk", "drop")
+DONE_DAYS = 7                     # a resolved or composted row stays in Done this long
+DONE_PREFIX = "done:"             # a Done row's id: never a ``spore:`` id, so no spore verb applies to it
 
 
 @dataclass
 class _Part:
     rows: list[RowIn] = field(default_factory=list)
-    held: list[RowIn] = field(default_factory=list)
-    held_total: int = 0         # held rows before the display cap: the count the panel names
+    later: list[RowIn] = field(default_factory=list)
     skipped: list[tuple[int, str]] = field(default_factory=list)
     fault: str | None = None
     entity: Any = None
@@ -104,6 +107,33 @@ def _surface(raw: dict[str, Any], disposition: str) -> str:
     return "spore"
 
 
+def _wake(day: date, today: date) -> tuple[str, str]:
+    """``(wake_day, wake_bucket)`` for a wake that is after ``today``: the ISO day, and tomorrow / this week / later dates."""
+    n = (day - today).days
+    return day.isoformat(), "tomorrow" if n <= 1 else "week" if n <= 7 else "later"
+
+
+def _lands(surface: str, target: Any) -> str:
+    """Where a row lands when it wakes, in the words the List prints (``band``, ``board · levain``, ``talk``)."""
+    if surface == "band" or surface == "talk":
+        return surface
+    if surface == "drop" and isinstance(target, str):
+        t = target.strip()
+        low = t.lower()
+        if low == "desk":
+            return "desk"
+        if low.startswith("board:") and t[6:]:
+            return "board · " + t[6:]
+        return "band"           # band and nudge both file a band row; an unknown word falls back to the band (germinate's rule)
+    return "list"               # a dated seed comes back to the List itself
+
+
+def _wake_facets(day: date, today: date, surface: str, target: Any) -> dict[str, Any]:
+    wake_day, bucket = _wake(day, today)
+    return {"time_state": "later", "wake_day": wake_day, "wake_bucket": bucket,
+            "wake_line": f"wakes {band_view.later_words(wake_day, today.isoformat())} \u2192 {_lands(surface, target)}"}
+
+
 def _spore_part(source: SubstrateSource, ctx: ReadContext, seen: list[bool], *, apply_hold: bool = True) -> _Part:
     out = _Part()
     path = source.anneal.spores_json
@@ -131,28 +161,33 @@ def _spore_part(source: SubstrateSource, ctx: ReadContext, seen: list[bool], *, 
     now = ctx.now.astimezone().replace(tzinfo=None)
     items = view.tray
     rows: list[RowIn] = []
-    held: list[RowIn] = []
+    later: list[RowIn] = []
     for s in items:
         raw = steer.get(s.id, {})
         surface = _surface(raw, s.disposition) if raw else "spore"
         d = next_date(s.next)
-        is_held = apply_hold and surface != "talk" and bool(d and d > ctx.today)
-        base = _spore_row(s, ctx.today, held=is_held)
+        target = raw.get("target") if isinstance(raw.get("target"), str) else None
+        is_later = bool(d and d > ctx.today)
+        base = _spore_row(s, ctx.today)
         fires, overdue = _timing(s.next, now, ctx.today)
-        extra: dict[str, Any] = {"surface": surface, "fires": fires, "overdue": overdue,
-                                 "target": raw.get("target") if isinstance(raw.get("target"), str) else None,
+        extra: dict[str, Any] = {"surface": surface, "fires": fires, "overdue": overdue, "target": target,
                                  "attention": raw.get("attention") if isinstance(raw.get("attention"), str) else None}
+        if is_later:
+            extra.update(_wake_facets(d, ctx.today, surface, target))
+        elif surface == "spore" and s.disposition == "seed" and not d:
+            extra["time_state"] = "someday"          # an undated seed: held for no day
+        else:
+            extra["time_state"] = "now"
         row = replace(base, facets={**base.facets, **extra}, emphasis="accent" if overdue else base.emphasis)
-        (held if is_held else rows).append(row)
+        (later if apply_hold and is_later else rows).append(row)
     over = max(0, len(rows) - _prov.SPORE_CAP) if apply_hold else 0
-    over_held = max(0, len(held) - _prov.SPORE_CAP)
+    over_later = max(0, len(later) - _prov.SPORE_CAP)
     out.rows = rows[:_prov.SPORE_CAP] if apply_hold else rows
-    out.held = held[:_prov.SPORE_CAP]
-    out.held_total = len(held)
+    out.later = later[:_prov.SPORE_CAP]
     if over:
         out.skipped.append((over, f"over the display cap of {_prov.SPORE_CAP}"))
-    if over_held:
-        out.skipped.append((over_held, f"held rows over the display cap of {_prov.SPORE_CAP}"))
+    if over_later:
+        out.skipped.append((over_later, f"later rows over the display cap of {_prov.SPORE_CAP}"))
     if len(items) >= _prov.VIEW_SPORE_LIMIT:
         out.skipped.append((1, f"the substrate view stopped at {_prov.VIEW_SPORE_LIMIT} rows; at least this many more exist"))
     return out
@@ -215,6 +250,9 @@ def _board_part(store_dir: Any, question_store: Any, today: date, now: datetime)
         later = card.get("later")
         if isinstance(later, str) and parse_date(later):
             facets["held_until"] = later[:10]
+            if card.get("section") != "desk" and parse_date(later) > today:
+                facets.update(_wake_facets(parse_date(later), today, "band", None))
+        facets.setdefault("time_state", "now")
         if card.get("section") in ("you", "desk"):
             facets["band_section"] = card["section"]
         if isinstance(card.get("carried"), bool):
@@ -232,7 +270,7 @@ def _board_part(store_dir: Any, question_store: Any, today: date, now: datetime)
         rid = f"board:{card.get('id')}"
         title = visible(str(card.get("title") or "")) or "(no title)"
         repo = card.get("repo") if isinstance(card.get("repo"), str) and card.get("repo") else None
-        facets = {"surface": "board", "list_pointer": BOARD_POINTER,
+        facets = {"surface": "board", "list_pointer": BOARD_POINTER, "time_state": "now",
                   "board_rank": card.get("rank") if isinstance(card.get("rank"), int) and not isinstance(card.get("rank"), bool) else None,
                   "board_tier": card.get("tier") if isinstance(card.get("tier"), str) else None}
         if repo:
@@ -244,21 +282,62 @@ def _board_part(store_dir: Any, question_store: Any, today: date, now: datetime)
     return out
 
 
+def _done_part(source: SubstrateSource, ctx: ReadContext) -> _Part:
+    """The rows resolved or composted in the last ``DONE_DAYS`` days, newest first, read-only (id ``done:<spore id>``). The store
+    is read as a document: anneal has no listing of its resolved set, and a read must never write."""
+    out = _Part()
+    path = source.anneal.spores_json
+    if not path.exists():
+        return out
+    try:
+        data = json.loads(path.read_text("utf-8"))
+        resolved = data.get("resolved") if isinstance(data, dict) else None
+    except (OSError, ValueError) as exc:
+        out.skipped.append((1, f"the resolved rows could not be read ({type(exc).__name__})"))
+        return out
+    cutoff = ctx.now.astimezone(timezone.utc) - timedelta(days=DONE_DAYS)
+    found: list[tuple[datetime, dict[str, Any]]] = []
+    for r in resolved if isinstance(resolved, list) else []:
+        res = r.get("resolution") if isinstance(r, dict) else None
+        at = res.get("at") if isinstance(res, dict) else None
+        try:
+            when = datetime.fromisoformat(at.replace("Z", "+00:00")) if isinstance(at, str) else None
+        except ValueError:
+            when = None
+        if when is None or not isinstance(r.get("id"), str) or not isinstance(r.get("text"), str):
+            continue
+        if when.tzinfo is None:
+            when = when.replace(tzinfo=timezone.utc)
+        if when >= cutoff:
+            found.append((when, r))
+    found.sort(key=lambda p: p[0], reverse=True)
+    for when, r in found[:_prov.SPORE_CAP]:
+        rid = DONE_PREFIX + r["id"]
+        text = visible(r["text"]) or "(no text)"
+        surface = _surface(r, spores.disposition_of(r))
+        kind = str(r["resolution"].get("kind") or "")
+        facets: dict[str, Any] = {"surface": surface, "time_state": "done",
+                                  "done_on": when.astimezone().date().isoformat(), "done_kind": visible(kind)}
+        out.rows.append(RowIn(id=rid, title=text, body=text, facets=facets,
+                              stored=_stored(rid, text, "done", str(r.get("domain") or ""), None, "")))
+    return out
+
+
 def list_reader(source: SubstrateSource, ck: Cockpit) -> Callable[[ReadContext], Result]:
     seen = [False]       # the spore store has existed on a read: a later absence is named, never silent
 
     def read(ctx: ReadContext) -> Result:
         sp = _spore_part(source, ctx, seen)
         bd = _board_part(_dispatch_dir(ck.consent_reader), ck.question_store, ctx.today, ctx.now)
+        dn = _done_part(source, ctx) if not sp.fault else _Part()
         rows = [*bd.rows, *sp.rows]
-        skipped = [*sp.skipped, *bd.skipped]
+        skipped = [*sp.skipped, *bd.skipped, *dn.skipped]
         if sp.fault:
-            if not rows and not sp.held:
+            if not rows and not sp.later:
                 return Fault(sp.fault)           # nothing else to show: a fault, never an empty look
             skipped.append((1, sp.fault))
-        held = sp.held
-        return Read(rows=tuple([*rows, *held]), filtered=((sp.held_total, "surface date not reached"),) if sp.held_total else (),
-                    skipped=tuple(skipped), note=LIST_NOTE, empty=spore_empty("tray", sp.entity))
+        return Read(rows=tuple([*rows, *sp.later, *dn.rows]), skipped=tuple(skipped), note=LIST_NOTE,
+                    empty=spore_empty("tray", sp.entity))
     return read
 
 
@@ -272,7 +351,7 @@ def list_read_one(source: SubstrateSource) -> Callable[[ReadContext, str], Resul
         part = _spore_part(source, ctx, seen, apply_hold=False)
         if part.fault:
             return Fault(part.fault)
-        for r in (*part.rows, *part.held):
+        for r in (*part.rows, *part.later):
             if r.id == row_id:
                 return Read(rows=(r,))
         if part.skipped:

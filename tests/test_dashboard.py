@@ -1482,9 +1482,9 @@ class TestListPagePins:
         assert 'st === "COMMITTED" || st === "done"' in box and 'st === "WAITING" || st === "applying"' in box
         assert "res.ok && (landed || pending)" in box and '"not written ("' in box
         assert "intakeKept.draft.trim() === line" in box and "intakeKept.draft === line" not in box
-        # support obeys text_locked like the primary text; held rows shown count for the chips and the filter
+        # support obeys text_locked like the primary text; the time chip narrows what the type chips count and the filter reads
         assert "s.support && !s.text_locked" in core
-        assert "const listAll = () =>" in core and "buildSurfaceChips(listAll()," in core
+        assert "const listAll = () =>" in core and "buildSurfaceChips(listAll().filter(inTime)," in core
         assert "listAll().some((s) => s.surface === listSurface)" in core
 
     def test_a_refusals_reason_reaches_the_box_and_501_503_have_words(self) -> None:

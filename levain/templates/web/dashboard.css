@@ -3669,8 +3669,9 @@ a.nc-pick.is-rec:hover { border-color: var(--text); }
 .needs-later-line .needs-later-band[hidden] { display: block; visibility: hidden; }   /* an unnumbered row keeps its column, so the rest still line up */
 
 /* The List (the Tray's wire id `tray` stays): the surface chips, the one-line intake box and its receipt. */
-.list-surfaces { display: flex; flex-wrap: wrap; gap: var(--sp-2); margin: 0 0 var(--sp-3); }
-.list-surfaces .rc-chip { min-height: var(--ctl-md); }
+.list-surfaces, .list-times { display: flex; flex-wrap: wrap; gap: var(--sp-2); margin: 0 0 var(--sp-3); }
+.list-surfaces .rc-chip, .list-times .rc-chip { min-height: var(--ctl-md); }
+[data-ck-panel="tray"] .grp-sub { color: var(--faint); font: var(--fw-semibold) var(--fs-micro)/1.6 var(--round); margin: var(--sp-3) 0 var(--sp-1); }
 .list-intake { gap: var(--sp-2); }
 .list-intake-row { display: flex; align-items: center; gap: var(--sp-3); min-width: 0; }
 .list-intake-input {
@@ -3691,7 +3692,7 @@ body.ke .tray-dump.list-intake .edit-msg:empty { display: none; }
 [data-ck-panel="tray"] .row > .list-meta > .list-pointer { font-style: italic; }
 @media (max-width: 720px) {
   .list-intake-input { font-size: var(--fs-title); }   /* 16px+: iOS Safari does not zoom the page on focus */
-  .list-surfaces .rc-chip { min-height: var(--hit-min); padding-inline: var(--sp-4); }
+  .list-surfaces .rc-chip, .list-times .rc-chip { min-height: var(--hit-min); padding-inline: var(--sp-4); }
 }
 /* a List row's meta line is one cell that wraps: the row grid's four meta columns hold fewer facts than a drop row carries */
 body.ke .row:has(> .clause.clampable) > .list-meta:not(.clause):not(.clause-toggle):not(.ck-rowaddr):not(.verb-actions) {

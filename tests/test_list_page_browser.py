@@ -281,8 +281,8 @@ _LISTFIX_PROBE = f"""(() => {{
     rows.push({{t: (clause ? clause.textContent : '').slice(0, 24), surface: row.dataset.surface || '',
       pills: [...meta.querySelectorAll('.k7-repo')].map(p => p.textContent), all: row.querySelectorAll('.k7-repo').length}});
   }} }};
-  grab();                                                   // the rows under "all", then the held ones under their own chip
-  const held = T.querySelector('.list-surface-chip[data-surface="held"]');
+  grab();                                                   // the rows under "all", then the later ones under their own time chip
+  const held = T.querySelector('.list-time-chip[data-time="later"]');
   if (held) {{ held.click(); grab(); }}
   return JSON.stringify({{rows}});
 }})()"""
@@ -313,9 +313,9 @@ def test_listfix2_one_pill_one_listener_and_known_origins_only(tmp_path: Path) -
             {"until": f"window.LevainSky && window.LevainSky.repos().includes('levain') && {TRAY} && "
                       f"[...{TRAY}.querySelectorAll('.sp-results .row')].some(r => (r.querySelector('.clause')||{{}}).textContent "
                       f"&& r.querySelector('.clause').textContent.startsWith('levain:') && r.querySelector('.k7-repo')) && 1"},
-            # held rows are listed in the focus view only (the card names them in its one control): read the rows there
+            # later rows are listed in the focus view only (the card names them in its one control): read the rows there
             {"eval": f"{TRAY}.querySelector('.pexpand').click(); 1"},
-            {"until": "document.querySelector('#levain-modal .list-surface-chip[data-surface=\"held\"]') && 1"},
+            {"until": "document.querySelector('#levain-modal .list-time-chip[data-time=\"later\"]') && 1"},
             {"eval": _LISTFIX_PROBE},
             {"eval": "document.querySelector('#levain-modal .modal-close').click(); 1"},
             {"eval": "JSON.stringify({adds: window.__mqAdds})"},
@@ -494,7 +494,7 @@ def test_r4_the_card_holds_due_rows_and_one_control_and_the_focus_view_every_gro
     assert not any((t.startswith("desk:") and not t.startswith("desk: carried")) or t.startswith("levain: TUE") for t in card["shown"]), card   # not the operator's, not due
     assert any(t.startswith("desk: carried") for t in card["shown"]), card      # a CARRIED desk row is needs-you, as flow's footer lists it
     assert len(card["more"]) == 1 and card["heldToggles"] == 0, card                                    # ONE control, no held toggle
-    assert "desk owes 2" in card["more"][0] and "later 1" in card["more"][0] and "held" in card["more"][0], card
+    assert "desk owes 2" in card["more"][0] and "later 2" in card["more"][0] and "held" not in card["more"][0], card   # the band's later row and the dated seed: one word
     assert focus["desk"] and focus["desk"][0].startswith("desk:"), focus                                 # the desk's row under its heading
     assert focus["later"] and focus["later"][0].startswith("levain: TUE"), focus                         # the later row under LATER
     assert focus["needs"] and not any(t.startswith(("levain: TUE", "desk: Write")) for t in focus["needs"]), focus
@@ -511,9 +511,9 @@ def test_r4_the_card_holds_due_rows_and_one_control_and_the_focus_view_every_gro
     # the control's "desk owes N" is the rows a person sees under Desk owes: the carried row is listed there too, as the footer prints it
     assert len(focus["desk"]) == desk and len(focus["later"]) == later, focus
     assert any(t.startswith("desk: carried") for t in focus["desk"]), focus
-    assert num(card["chips"], "spores") == num(focus["chips"], "spores"), (card["chips"], focus["chips"])    # live spores only, in both
-    assert num(card["chips"], "held") is None, card                                                         # the card draws no held rows: its control names them
-    assert num(focus["chips"], "held") == int(re.search(r"(\d+) held", card["more"][0]).group(1)), (card, focus)
+    # the type chips cut across the time-states: the focus view's spores chip also holds the dated seed the card leaves to its control
+    assert num(card["chips"], "spores") + 1 == num(focus["chips"], "spores"), (card["chips"], focus["chips"])
+    assert num(card["chips"], "held") is None and num(focus["chips"], "held") is None, (card, focus)        # no held chip: Later is a time-state
 
 
 # --- 531 r4 round 5 (levain 74, key 1108-39): L1+L2 fixes -----------------------------------------------------------------------
@@ -651,3 +651,106 @@ def test_lpr3_the_cards_one_control_is_drawn_once_and_not_redrawn_by_its_own_lay
         ])
     got = json.loads(out["values"][-1])
     assert got == {"same": True, "n": 0, "count": 1}, got
+
+
+# --- the List goes time-first (plan 1109): Now / Later / Someday / Done, the type a tag on every row and a filter across them --------
+
+
+def _seed_time(root: Path) -> None:
+    """One row of each time-state a page must draw: a dated board drop, a dated talk, a dated band-bound drop, one resolved row."""
+    from datetime import date, datetime, timedelta, timezone
+
+    st = SporeStore(root / ".levain" / "memory.spores.json")
+    d = date.today()
+    st.add(type="task", text="draft the BOBS note for the board", disposition="agenda", target="board:levain",
+           next=(d + timedelta(days=9)).isoformat() + "T09:00")
+    st.add(type="task", text="talk about the dryer", disposition="seed", attention="talk", next=(d + timedelta(days=2)).isoformat())
+    st.add(type="task", text="send Jeanne the invoice", disposition="agenda", target="band", next=(d + timedelta(days=1)).isoformat())
+    done = st.add(type="task", text="water the plants", disposition="seed")["id"]
+    st.descend(done, kind="done", now=datetime.now(timezone.utc) - timedelta(days=2))
+
+
+_FOCUS = "document.querySelector('#levain-modal .modal-body')"
+_FOCUS_ROWS = f"[...{_FOCUS}.querySelectorAll('.sp-results .row')]"
+
+
+def _chip(kind: str, value: str) -> str:
+    return f"{_FOCUS}.querySelector('.list-{kind}-chip[data-{kind}=\"{value}\"]')"
+
+
+def _open_focus() -> list[dict[str, Any]]:
+    return [{"eval": f"{TRAY}.querySelector('.pexpand').click(); 1"},
+            {"until": f"{_FOCUS} && {_FOCUS}.querySelector('.sp-results .row') && 1"},
+            {"eval": "new Promise(r => setTimeout(() => r(1), 900))"}]            # the dialog's fade settles
+
+
+@needs_browser
+def test_the_list_is_time_first_with_a_type_tag_on_every_row_and_the_type_chips_cut_across(tmp_path: Path) -> None:
+    root, src, _ids = _install(tmp_path)
+    _seed_more(root)
+    _seed_phone(root)
+    _seed_time(root)
+    shots = Path(os.environ.get("LEVAIN_LIST_SHOTS") or tmp_path)
+    shots.mkdir(parents=True, exist_ok=True)
+    rows_of = (f"{_FOCUS_ROWS}.map(r => ({{t: r.dataset.timeState || '', s: r.dataset.surface || '', tag: !!r.querySelector('.list-surface'), "
+               "verbs: r.querySelectorAll('.verb-btn').length, line: ((r.querySelector('[data-ck-tag-state=\"later\"]') || {}).textContent || '')}))")
+    with _serve(src, write_token=TOKEN, surface_tokens={"browser": TOKEN}, install_class="reported") as (url, _httpd):
+        out = _drive(tmp_path, f"{url}/", [
+            {"emulate": {"w": 1280, "h": 1000, "dpr": 1}},
+            *_reload(),
+            {"until": f"{TRAY} && {TRAY}.querySelectorAll('.sp-results .row[data-surface=band]').length > 1 && 1"},
+            *_open_focus(),
+            {"shot": str(shots / "focus_time_first_1280.png")},
+            {"eval": f"JSON.stringify({{rows: {rows_of}, chips: [...{_FOCUS}.querySelectorAll('.list-time-chip')].map(c => c.textContent)}})"},
+            {"eval": f"{_chip('time', 'later')}.click(); 1"},
+            {"eval": f"JSON.stringify({{later: {rows_of}, subs: [...{_FOCUS}.querySelectorAll('.grp-sub')].map(h => h.textContent)}})"},
+            {"eval": f"{_chip('surface', 'talk')}.click(); 1"},               # a type chip cuts across the time-state
+            {"eval": f"JSON.stringify({{talk_later: {rows_of}}})"},
+            {"eval": f"{_chip('time', 'later')}.click(); {_chip('surface', '')}.click(); {_chip('time', 'done')}.click(); 1"},
+            {"eval": f"JSON.stringify({{done: {rows_of}}})"},
+            {"emulate": {"w": 390, "h": 844, "dpr": 2, "mobile": True}},
+            {"eval": "new Promise(r => setTimeout(() => r(1), 900))"},
+            {"shot": str(shots / "focus_time_first_390.png")},
+        ])
+    vals = {k: v for x in out["values"] if isinstance(x, str) and x.startswith("{") for k, v in json.loads(x).items()}
+    allrows = vals["rows"]
+    assert allrows and all(r["tag"] and r["s"] for r in allrows), allrows            # a type tag on every row, in the focus view
+    assert [c.split(" ")[0] for c in vals["chips"]] == ["Now", "Later", "Someday", "Done"], vals["chips"]
+    later = vals["later"]
+    assert later and all(r["t"] == "later" for r in later), later                    # the chip narrows to Later, whatever the source
+    assert {r["s"] for r in later} == {"drop", "talk", "spore"}, later               # a drop, a talk and a plain dated seed
+    assert all(r["line"].startswith("wakes ") and "→" in r["line"] for r in later), later
+    assert vals["subs"] == ["Tomorrow", "This week", "Later dates"], vals["subs"]
+    assert vals["talk_later"] and all(r["s"] == "talk" and r["t"] == "later" for r in vals["talk_later"]), vals["talk_later"]
+    done = vals["done"]
+    assert len(done) == 1 and done[0]["t"] == "done" and done[0]["verbs"] == 0, done     # read-only: no verb on a closed row
+
+
+@needs_browser
+def test_a_snooze_moves_the_row_to_later_at_once_with_its_wake_line(tmp_path: Path) -> None:
+    from datetime import date, timedelta
+
+    root, src, _ids = _install(tmp_path)
+    _seed_more(root)
+    day = (date.today() + timedelta(days=4)).isoformat()
+    row = f"[...{TRAY}.querySelectorAll('.sp-results .row')].find(r => (r.querySelector('.clause') || {{}}).textContent === 'call the dentist')"
+    with _serve(src, write_token=TOKEN, surface_tokens={"browser": TOKEN}, install_class="reported") as (url, _httpd):
+        out = _drive(tmp_path, f"{url}/", [
+            {"emulate": {"w": 1280, "h": 1000, "dpr": 1}},
+            *_reload(),
+            {"until": f"{TRAY} && {row} && 1"},
+            {"eval": f"JSON.stringify({{before: {row}.dataset.timeState}})"},
+            {"eval": f"{row}.querySelector('.verb-btn[data-verb=\"spore_surface_at\"]').click(); 1"},
+            {"eval": f"(() => {{ const i = {row}.querySelector('.verb-date'); i.value = {json.dumps(day)}; "
+                     f"i.dispatchEvent(new Event('input', {{bubbles: true}})); {row}.querySelector('.verb-confirm').click(); return 1; }})()"},
+            # the write re-reads the page: the row has left the card (the card holds what is due) with no wait for a poll
+            {"until": f"!({row}) && 1"},
+            *_open_focus(),
+            {"eval": f"{_chip('time', 'later')}.click(); 1"},
+            {"eval": f"JSON.stringify({_FOCUS_ROWS}.map(r => ({{text: (r.querySelector('.clause') || {{}}).textContent, t: r.dataset.timeState, "
+                     "line: ((r.querySelector('[data-ck-tag-state=\"later\"]') || {}).textContent || '')})))"},
+        ])
+    moved = json.loads(out["values"][-1])
+    assert next(json.loads(x) for x in out["values"] if isinstance(x, str) and x.startswith('{"before"'))["before"] == "now"
+    mine = next(r for r in moved if r["text"] == "call the dentist")
+    assert mine["t"] == "later" and mine["line"].startswith("wakes ") and mine["line"].endswith("→ desk"), mine

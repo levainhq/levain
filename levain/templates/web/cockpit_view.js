@@ -195,6 +195,12 @@
       band_section: f.band_section === "desk" || f.band_section === "you" ? f.band_section : null,
       carried: f.band_carried === true,
       band_age: typeof f.band_age === "string" && f.band_age ? f.band_age : null,
+      // the List's time-state, as the kernel computed it: the page draws these and derives none of them
+      time_state: ["now", "later", "someday", "done"].indexOf(f.time_state) >= 0 ? f.time_state : null,
+      wake_line: typeof f.wake_line === "string" && f.wake_line ? f.wake_line : null,
+      wake_bucket: ["tomorrow", "week", "later"].indexOf(f.wake_bucket) >= 0 ? f.wake_bucket : null,
+      done_on: typeof f.done_on === "string" && f.done_on ? f.done_on : null,
+      done_kind: typeof f.done_kind === "string" && f.done_kind ? f.done_kind : null,
       repo: typeof f.repo === "string" && f.repo ? f.repo : null, board_tier: typeof f.board_tier === "string" && f.board_tier ? f.board_tier : null,
     }, t, hidden && hidden.has(row.id) ? { text_locked: HIDDEN_TEXT } : {});
   }

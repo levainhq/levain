@@ -43,7 +43,7 @@ def test_at_most_three_verbs_show_and_the_rest_sit_in_the_overflow_menu(tmp_path
         rowfs: getComputedStyle({ROW}.querySelector('.clause')).fontSize, menuHidden: v.querySelector('.verb-menu').hidden}}; }})()"""}])
     got = vals[1]
     assert got["vis"] == ["Snooze", "Resolve", "···"]      # DOM order; CSS draws Resolve first, got
-    assert got["menu"] == ["edit", "reclassify", "metabolize"], got
+    assert got["menu"] == ["edit", "metabolize"], got            # no reclassify: the type is the entity's to sort
     # a copy of each inline verb waits in the menu for a narrow row (container query); it shows nowhere on a wide one
     assert got["dups"] == ["Resolve:none", "Snooze:none"], got
     assert (got["haspopup"], got["expanded"], got["menuHidden"]) == ("menu", "false", True), got
@@ -62,7 +62,7 @@ def test_the_overflow_menu_opens_and_closes_by_keyboard(tmp_path: Path) -> None:
                  "return [v.querySelector('.verb-more').getAttribute('aria-expanded'), v.querySelector('.verb-menu').hidden, document.activeElement.textContent]; })()"},
     ])
     assert vals[1] == ["true", False, "edit"], vals
-    assert vals[2] == "reclassify", vals
+    assert vals[2] == "metabolize", vals
     assert vals[3] == ["false", True, "···"], vals
 
 

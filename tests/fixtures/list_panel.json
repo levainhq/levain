@@ -38,6 +38,8 @@
   "board_tier",
   "disposition",
   "domain",
+  "done_kind",
+  "done_on",
   "due",
   "fires",
   "handoff_expired",
@@ -53,14 +55,13 @@
   "spore_type",
   "surface",
   "target",
-  "tier"
+  "tier",
+  "time_state",
+  "wake_bucket",
+  "wake_day",
+  "wake_line"
  ],
- "filtered": [
-  {
-   "count": 1,
-   "reason": "surface date not reached"
-  }
- ],
+ "filtered": [],
  "groups": [
   {
    "count": 1,
@@ -74,7 +75,7 @@
    "uncounted": true
   },
   {
-   "count": 0,
+   "count": 1,
    "id": "later",
    "title": "Later",
    "uncounted": true
@@ -100,12 +101,59 @@
    "title": "To talk through"
   },
   {
-   "count": 1,
+   "count": 0,
    "id": "also",
    "title": "Also pending"
+  },
+  {
+   "count": 1,
+   "id": "someday",
+   "title": "Someday"
+  },
+  {
+   "count": 0,
+   "id": "done",
+   "title": "Done, last 7 days",
+   "uncounted": true
   }
  ],
- "held": [
+ "id": "tray",
+ "kind": "list",
+ "next": null,
+ "note": "Band rows are what only you can answer: answer them in Decisions. Board rows are the agents' ready queue.",
+ "order": "spore.list",
+ "priority": "gate",
+ "rank": 10,
+ "refresh_every_s": null,
+ "rows": [
+  {
+   "actions": [],
+   "badges": [
+    {
+     "kind": "age_days",
+     "value": 0
+    }
+   ],
+   "band": "later",
+   "body": "the nightly sweep stays red",
+   "emphasis": "none",
+   "facets": {
+    "age_days": 0,
+    "band_age": "0m",
+    "band_number": null,
+    "list_pointer": "answer it in Decisions (levain band)",
+    "source": "levain · claude_code",
+    "surface": "band",
+    "time_state": "now"
+   },
+   "group": "band",
+   "id": "band:q-0001",
+   "provenance": null,
+   "text_hidden": false,
+   "title": "Ship the sweep fix tonight?",
+   "truncated": false,
+   "version": "<version>"
+  },
   {
    "actions": [
     {
@@ -243,7 +291,6 @@
     "due": "2026-11-10",
     "fires": "2026-11-10T09:00",
     "handoff_expired": false,
-    "held": true,
     "last_seen": "2026-11-08",
     "overdue": false,
     "overdue_days": 0,
@@ -251,50 +298,17 @@
     "spore_type": "task",
     "surface": "drop",
     "target": "desk",
-    "tier": "warm"
+    "tier": "warm",
+    "time_state": "later",
+    "wake_bucket": "week",
+    "wake_day": "2026-11-10",
+    "wake_line": "wakes Tue 11-10 → desk"
    },
-   "group": "also",
+   "group": "later",
    "id": "spore:spore-006",
    "provenance": null,
    "text_hidden": false,
    "title": "renew the domain",
-   "truncated": false,
-   "version": "<version>"
-  }
- ],
- "id": "tray",
- "kind": "list",
- "next": null,
- "note": "Band rows are what only you can answer: answer them in Decisions. Board rows are the agents' ready queue.",
- "order": "spore.list",
- "priority": "gate",
- "rank": 10,
- "refresh_every_s": null,
- "rows": [
-  {
-   "actions": [],
-   "badges": [
-    {
-     "kind": "age_days",
-     "value": 0
-    }
-   ],
-   "band": "later",
-   "body": "the nightly sweep stays red",
-   "emphasis": "none",
-   "facets": {
-    "age_days": 0,
-    "band_age": "0m",
-    "band_number": null,
-    "list_pointer": "answer it in Decisions (levain band)",
-    "source": "levain · claude_code",
-    "surface": "band"
-   },
-   "group": "band",
-   "id": "band:q-0001",
-   "provenance": null,
-   "text_hidden": false,
-   "title": "Ship the sweep fix tonight?",
    "truncated": false,
    "version": "<version>"
   },
@@ -434,7 +448,8 @@
     "spore_type": "task",
     "surface": "spore",
     "target": null,
-    "tier": "warm"
+    "tier": "warm",
+    "time_state": "now"
    },
    "group": "overdue",
    "id": "spore:spore-007",
@@ -576,7 +591,8 @@
     "spore_type": "task",
     "surface": "drop",
     "target": "desk",
-    "tier": "warm"
+    "tier": "warm",
+    "time_state": "now"
    },
    "group": "overdue",
    "id": "spore:spore-004",
@@ -718,7 +734,8 @@
     "spore_type": "task",
     "surface": "drop",
     "target": "desk",
-    "tier": "warm"
+    "tier": "warm",
+    "time_state": "now"
    },
    "group": "today",
    "id": "spore:spore-005",
@@ -739,7 +756,8 @@
     "board_tier": "sonnet",
     "list_pointer": "the agents' ready queue (levain board)",
     "repo": "levain",
-    "surface": "board"
+    "surface": "board",
+    "time_state": "now"
    },
    "group": "board",
    "id": "board:levain:a",
@@ -760,7 +778,8 @@
     "board_tier": "opus",
     "list_pointer": "the agents' ready queue (levain board)",
     "repo": "levain",
-    "surface": "board"
+    "surface": "board",
+    "time_state": "now"
    },
    "group": "board",
    "id": "board:levain:b",
@@ -897,7 +916,8 @@
     "spore_type": "task",
     "surface": "talk",
     "target": null,
-    "tier": "warm"
+    "tier": "warm",
+    "time_state": "now"
    },
    "group": "talk",
    "id": "spore:spore-002",
@@ -1034,7 +1054,8 @@
     "spore_type": "task",
     "surface": "talk",
     "target": null,
-    "tier": "warm"
+    "tier": "warm",
+    "time_state": "now"
    },
    "group": "talk",
    "id": "spore:spore-003",
@@ -1171,9 +1192,10 @@
     "spore_type": "task",
     "surface": "spore",
     "target": null,
-    "tier": "warm"
+    "tier": "warm",
+    "time_state": "someday"
    },
-   "group": "also",
+   "group": "someday",
    "id": "spore:spore-001",
    "provenance": null,
    "text_hidden": false,
@@ -1208,6 +1230,7 @@
    "spore:spore-005",
    "band:q-0001",
    "spore:spore-001",
+   "spore:spore-006",
    "board:levain:a",
    "board:levain:b"
   ]
