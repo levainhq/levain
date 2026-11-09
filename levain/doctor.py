@@ -5301,12 +5301,16 @@ def _check_seat_profile(*, claude_bin: str | None = None, python: str | None = N
             shutil.rmtree(base, ignore_errors=True)
 
 
+_SETTING_SOURCES_PROBE_TIMEOUT = 20.0  # the whole probe's bound inside a doctor run
+
+
 def _check_setting_sources(*, claude_bin: str | None = None, version: str | None = ...,
                            probe: Any = None) -> list[CheckResult]:
     """The ``setting-sources`` row: terminal seats rely on ``--setting-sources ""`` loading nothing, a value the vendor
     does not document, measured on one version. On that version the row is a plain OK and nothing is launched; on any
     other it re-runs the no-model probe (:mod:`levain.setting_sources_canary`): a hold is a WARN telling the operator
-    the version differs from the measured one, a leak FAILS, an inconclusive probe WARNs."""
+    the version differs from the measured one, a leak FAILS, an inconclusive probe WARNs. An unreadable version is not
+    the measured one, so it runs the probe too and keeps the unreadable-version warning beside its verdict."""
     from levain import setting_sources_canary as ssc
     from levain.consent.canary import agent_version
     from levain.host_guard import SETTING_SOURCES_MEASURED_VERSION as measured_t
@@ -5320,19 +5324,22 @@ def _check_setting_sources(*, claude_bin: str | None = None, version: str | None
     if version is ...:
         version = agent_version("claude_code", binary=claude, timeout=10.0)
     parsed = parse_cc_version(version or "")
-    if parsed is None:
-        return [CheckResult(name, True, f"Claude Code's version is not readable; the empty source list was measured on "
-                            f"{measured} only", "Run `claude --version`.", warn=True)]
-    seen = ".".join(map(str, parsed))
     if parsed == measured_t:
         return [CheckResult(name, True, f'`--setting-sources ""` loads no project settings (measured on {measured}, the '
                             "installed version)")]
-    res = (probe or ssc.run_probe)(claude)
-    where = f"Claude Code {seen}; the empty source list was measured on {measured}"
-    if res.verdict == "held":
-        return [CheckResult(name, True, f"{where}; the probe re-run holds ({res.detail})",
-                            f"Set SETTING_SOURCES_MEASURED_VERSION in levain/host_guard.py to {seen} once reviewed.",
-                            warn=True)]
+    res = probe(claude) if probe is not None else ssc.run_probe(claude, timeout=_SETTING_SOURCES_PROBE_TIMEOUT)
+    if parsed is None:
+        where = f"Claude Code's version is not readable; the empty source list was measured on {measured} only"
+        if res.verdict == "held":
+            return [CheckResult(name, True, f"{where}; the probe re-run holds ({res.detail})",
+                                "Run `claude --version`.", warn=True)]
+    else:
+        seen = ".".join(map(str, parsed))
+        where = f"Claude Code {seen}; the empty source list was measured on {measured}"
+        if res.verdict == "held":
+            return [CheckResult(name, True, f"{where}; the probe re-run holds ({res.detail})",
+                                f"Set SETTING_SOURCES_MEASURED_VERSION in levain/host_guard.py to {seen} once "
+                                "reviewed.", warn=True)]
     if res.verdict == "leaked":
         return [CheckResult(name, False, f"{where}; the probe re-run FAILED: {res.detail}",
                             "Terminal seats on this Claude Code load project settings. Pin an older Claude Code or fix "
