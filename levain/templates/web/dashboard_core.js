@@ -2252,12 +2252,10 @@
     const inCard = isList && !(ropts && ropts.modal);
     const apart = (s) => s.group === "desk" || s.group === "later" || s.group === "done";
     const cardHides = (s) => inCard && apart(s);
-    // what the card leaves to the focus view, counted as flow's footer counts it: DESK OWES is every desk row, a carried one too
-    // (it is also listed under Needs you); LATER the rows that come back on a later day
-    const apartCount = { desk: (list || []).filter((s) => s.band_section === "desk").length,
-                         later: (list || []).filter((s) => s.group === "later").length,
-                         done: (list || []).filter((s) => s.group === "done").length };
-    const cardHasApart = inCard && (apartCount.desk > 0 || apartCount.later > 0 || apartCount.done > 0);
+    // what the card leaves to the focus view, counted the way the focus view draws it for the state now chosen (the type and time
+    // chosen carry over to it); a function of that state, read again on every rebuild
+    let apartCount = { desk: 0, later: 0, done: 0 };
+    const cardHasApart = inCard && (list || []).some(apart);
     // ONE rule for "all", in the card and the focus view: the rows in this view's own list (the card's without the desk's and the
     // later ones it names in its control, the focus view's with them). So the header, the "all" chip and the control's numbers
     // follow from each other.
@@ -2276,9 +2274,10 @@
     // THE rows of the List for a state, and the only place they are chosen: the projection (a carried desk row listed twice in the
     // focus view, once in a chosen view, which is ungrouped), then the chosen view's order, then the type, then the time. The body
     // draws rowsFor(state) and every chip's number is rowsFor(state with that chip).length, so a number is the rows its tap draws.
-    const rowsFor = (st) => {
-      let rows = listAll();
-      if (isList && !inCard && !st.view) rows = withCarriedDesk(rows);
+    // focus: the rows of the focus view for that state, asked from the card (the card counts what its one control opens)
+    const rowsFor = (st, focus) => {
+      let rows = focus ? (list || []) : listAll();
+      if (isList && (focus || !inCard) && !st.view) rows = withCarriedDesk(rows);
       if (st.view) {
         const byId = new Map(rows.map((s) => [s.id, Object.assign({}, s, { age_shown: true })]));
         const named = new Set(st.view);
@@ -2293,6 +2292,15 @@
     // a type chosen earlier that the chosen time and view have no rows in is no choice at all
     const listNow = () => (isList && rowsFor({ surface: listSurface, time: timeNow(), view: viewIds() }).length > 0 ? listSurface : "");
     const stateNow = () => ({ surface: listNow(), time: timeNow(), view: viewIds() });
+    const countApart = () => {
+      const st = { surface: listSurface, time: LIST_TIMES.indexOf(listTime) >= 0 ? listTime : "", view: viewIds() };
+      let rows = rowsFor(st, true);
+      if (!rows.length && st.surface) rows = rowsFor(Object.assign({}, st, { surface: "" }), true);     // the focus view drops a type that has no rows
+      const n = (g) => rows.filter((s) => s.group === g).length;
+      apartCount = { desk: n("desk"), later: n("later"), done: n("done") };
+      if (inCard) p.dataset.listApart = JSON.stringify(apartCount);
+    };
+    countApart();
     if (isList && !inCard) p.dataset.listTotal = String(rowsFor({ surface: "", time: "", view: null }).length);   // the focus view's header is the unfiltered List
     let rebuildChips = null;   // a chosen view changes every chip's number: the chips are rebuilt with it
     let chipRow = null;     // the chips' row, drawn by controls(); the panel's own element is empty once the focus view moves its body
@@ -2318,6 +2326,7 @@
             const was = document.activeElement;
             const at = was && was.dataset && ((chipRow && was.closest(".list-surfaces") === chipRow) || (timeRow && was.closest(".list-times") === timeRow))
               ? (was.dataset.surface !== undefined ? ["surface", was.dataset.surface] : was.dataset.time !== undefined ? ["time", was.dataset.time] : null) : null;
+            countApart();
             const st = stateNow();
             const fresh = buildSurfaceChips((k) => rowsFor({ surface: k, time: st.time, view: st.view }), listNow, chooseSurface, inCard ? "" : "Type");
             if (chipRow) chipRow.replaceWith(fresh); else bar.after(fresh);
@@ -2328,7 +2337,12 @@
               timeRow = t;
             }
             // the chips are rebuilt after a tap: the same chip, rebuilt, takes the keyboard focus back
-            if (at) { const again = (at[0] === "surface" ? chipRow : timeRow) && (at[0] === "surface" ? chipRow : timeRow).querySelector("[data-" + at[0] + "=\"" + at[1] + "\"]"); if (again) again.focus(); }
+            if (at) {
+              const row = at[0] === "surface" ? chipRow : timeRow;
+              // a chip with no replacement (its count fell to none) hands the focus to the row's first chip
+              const again = row && (row.querySelector("[data-" + at[0] + "=\"" + at[1] + "\"]") || row.querySelector("button"));
+              if (again) again.focus();
+            }
           };
           const chooseSurface = (v) => { listSurface = v; build(); redraw(); };
           rebuildChips = build;
@@ -2346,10 +2360,6 @@
       },
       pick: () => rowsFor(stateNow()),
     } : undefined;
-    if (inCard) {
-      // what the card leaves to the focus view, for its one control (foldRowsAt words it)
-      p.dataset.listApart = JSON.stringify(apartCount);
-    }
     mountSporeFilter(p, list || [], "items", entry.kind, (rows, results) => {
       let lastGroup = null;
       let lastBucket = null;

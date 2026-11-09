@@ -873,6 +873,19 @@ _EVERY_STATE_SWEEP = f"""(async () => {{
       await clearSurface();
     }}
     await clearTime();
+    for (const sk of [...mb.querySelectorAll('.list-surface-chip')].map((c) => c.dataset.surface).filter((x) => x)) {{
+      await clearTime(); await clearSurface();
+      const sc = mb.querySelector('.list-surface-chip[data-surface="' + sk + '"]'); if (!sc) continue;
+      sc.click(); await sleep(70);
+      for (const tk of [...mb.querySelectorAll('.list-time-chip')].map((c) => c.dataset.time)) {{
+        const tc = mb.querySelector('.list-time-chip[data-time="' + tk + '"]'); if (!tc) continue;
+        const n = num(tc); tc.click(); await sleep(70);
+        out.push({{view: v, time: tk, surface: sk, n, shown: shown(), under: true}});
+        const back = mb.querySelector('.list-time-chip[aria-pressed="true"]'); if (back) {{ back.click(); await sleep(60); }}
+      }}
+      await clearTime(); await clearSurface();
+    }}
+    await clearTime();
     for (const c of [...mb.querySelectorAll('.list-time-chip')]) {{
       const k = c.dataset.time; const n = num(c); c.click(); await sleep(70);
       out.push({{view: v, time: k, surface: '*', n, shown: shown()}});
@@ -906,6 +919,7 @@ def test_every_chip_in_every_state_is_the_rows_its_tap_draws_in_a_named_view_too
     bad = [r for r in got["out"] if r["n"] != r["shown"]]
     assert not bad, bad
     assert any(r["view"] and r["surface"] == "band" for r in got["out"]), got               # the carried band row's chip was tapped inside a view
+    assert any(r.get("under") and r["view"] for r in got["out"]) and any(r.get("under") and not r["view"] for r in got["out"]), got   # a time chip tapped under each chosen type, in a view and out
 
 
 _KEYBOARD_FOCUS = f"""(async () => {{
@@ -1016,3 +1030,81 @@ def test_a_done_row_says_its_kind_once_and_a_later_drop_says_where_it_lands_once
     assert re.search(r"\bdone \d\d-\d\d", done) and "done done" not in done, vals["done"]
     later = [m for m in vals["later"] if "board" in m]
     assert later and all("wakes " in m and "to board" not in m for m in later), vals["later"]
+
+
+_CARD_FOOT = f"""(() => {{
+  const f = {TRAY}.querySelector('[data-list-more]'); const t = f ? f.textContent : '';
+  const n = (w) => {{ const m = new RegExp(w + ' (\\\\d+)').exec(t); return m ? parseInt(m[1], 10) : 0; }};
+  return JSON.stringify({{kind: 'foot', text: t, desk: n('desk owes'), later: n('later'), done: n('done')}});
+}})()"""
+
+_FOCUS_GROUPS = f"""(() => {{
+  const mb = {_FOCUS};
+  const group = (title) => {{ const h = [...mb.querySelectorAll('.grp-head')].find(x => x.textContent.trim().toLowerCase().startsWith(title));
+    const col = h && h.parentElement; return col ? col.querySelectorAll('.row').length : 0; }};
+  return JSON.stringify({{kind: 'focus', desk: group('desk owes'), later: group('later'), done: group('done')}});
+}})()"""
+
+
+@needs_browser
+def test_r5_with_a_type_chosen_on_the_card_each_footer_number_is_the_rows_its_tap_draws(tmp_path: Path, monkeypatch: Any) -> None:
+    root, src, _ids = _install(tmp_path)
+    _seed_more(root)
+    _seed_phone(root)
+    _seed_time(root)
+    from levain.consent.questions import QuestionStore
+    QuestionStore(default_queue_dir()).file(agent="claude_code", agent_session_id="s8", what="desk: carried Launch the TAOSERV upgrade seat.",
+                                            options=[("ship", "Ship it"), ("hold", "Hold")], rec="hold", blocks="the upgrade", cwd="/w/taoserv")
+    _host_band(monkeypatch)
+    steps: list[dict[str, Any]] = []
+    for surface in ("band", "spores", "talk"):
+        steps += [
+            {"eval": f"(() => {{ const c = {TRAY}.querySelector('.list-surface-chip[data-surface=\"{surface}\"]'); if (c) c.click(); return 1; }})()"},
+            {"eval": "new Promise(r => setTimeout(() => r(1), 700))"},
+            {"eval": _CARD_FOOT},
+            {"eval": f"(() => {{ const f = {TRAY}.querySelector('[data-list-more]'); if (f) f.click(); return 1; }})()"},
+            {"eval": "new Promise(r => setTimeout(() => r(1), 900))"},
+            {"eval": _FOCUS_GROUPS},
+            {"eval": "(() => { const x = document.querySelector('#levain-modal .modal-close'); if (x) x.click(); return 1; })()"},
+            {"eval": "new Promise(r => setTimeout(() => r(1), 500))"},
+        ]
+    with _serve(src, write_token=TOKEN, surface_tokens={"browser": TOKEN}, install_class="reported") as (url, _httpd):
+        out = _drive(tmp_path, f"{url}/", [
+            {"emulate": {"w": 1280, "h": 1000, "dpr": 1}},
+            *_reload(),
+            {"until": f"{TRAY} && {TRAY}.querySelector('[data-list-more]') && 1"},
+            *steps,
+        ])
+    seen = [json.loads(x) for x in out["values"] if isinstance(x, str) and x.startswith('{"kind"')]
+    foots = [s for s in seen if s["kind"] == "foot"]
+    focuses = [s for s in seen if s["kind"] == "focus"]
+    assert foots and len(foots) == len(focuses) and any(f["desk"] or f["later"] or f["done"] for f in foots), seen   # a chosen type with something apart was tapped
+    for foot, focus in zip(foots, focuses):
+        assert (foot["desk"], foot["later"], foot["done"]) == (focus["desk"], focus["later"], focus["done"]), (foot, focus)
+
+
+@needs_browser
+def test_r5_a_focused_chip_with_no_replacement_hands_focus_to_the_first_chip_of_its_row(tmp_path: Path, monkeypatch: Any) -> None:
+    root, src, _ids = _install(tmp_path)
+    _seed_more(root)
+    _seed_phone(root)
+    _seed_time(root)
+    _host_band(monkeypatch)
+    probe = f"""(async () => {{
+      const mb = {_FOCUS}; const sleep = (ms) => new Promise(r => setTimeout(r, ms));
+      const c = mb.querySelector('.list-surface-chip[data-surface="band"]'); c.focus();
+      c.dataset.surface = 'gone';        // a chip whose rebuilt row has no chip of its name
+      c.click(); await sleep(120);
+      const a = document.activeElement;
+      return JSON.stringify({{inRow: !!(a && a.closest && a.closest('.list-surfaces')), first: a === mb.querySelector('.list-surfaces button'), tag: a && a.tagName}});
+    }})()"""
+    with _serve(src, write_token=TOKEN, surface_tokens={"browser": TOKEN}, install_class="reported") as (url, _httpd):
+        out = _drive(tmp_path, f"{url}/", [
+            {"emulate": {"w": 1280, "h": 1000, "dpr": 1}},
+            *_reload(),
+            {"until": f"{TRAY} && {TRAY}.querySelector('[data-list-more]') && 1"},
+            *_open_focus(),
+            {"eval": probe},
+        ])
+    got = json.loads(out["values"][-1])
+    assert got["inRow"] is True and got["first"] is True, got

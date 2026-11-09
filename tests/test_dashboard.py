@@ -1485,7 +1485,7 @@ class TestListPagePins:
         # support obeys text_locked like the primary text; the time chip narrows what the type chips count and the filter reads
         assert "s.support && !s.text_locked" in core
         # ONE function chooses the List's rows: the body draws it and every chip's number is its length, so no other filter of the list exists
-        assert "const listAll = () =>" in core and "const rowsFor = (st) =>" in core and "pick: () => rowsFor(stateNow())" in core
+        assert "const listAll = () =>" in core and "const rowsFor = (st, focus) =>" in core and "pick: () => rowsFor(stateNow())" in core
         assert "buildSurfaceChips((k) => rowsFor({" in core and "buildTimeChips((k) => rowsFor({" in core
         assert core.count("withCarriedDesk(") == 1 and "const drawn =" not in core and "inTime" not in core    # the projection is applied in rowsFor alone
         assert core.count("listAll()") == 1 and "Map(" not in core[core.index("function buildTimeChips("):core.index("// The List's INTAKE box")]
