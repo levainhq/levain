@@ -17,8 +17,11 @@ from __future__ import annotations
 
 import json
 import os
+import time
 from collections.abc import Mapping
 from typing import Any, Callable, Optional
+
+from levain.broker.ledger import triples_digest
 
 __all__ = ["DispatchUsageSources", "lineage_spend", "lineage_spend_reader"]
 
@@ -78,12 +81,23 @@ class DispatchUsageSources:
             return None
 
 
-# --- a brokered run's spend (dispatch wave 3, S-B3) ---------------------------------------------------------------------
+# --- a brokered run's spend (dispatch wave 3, S-B3; the run-final proof, W3-3b) -----------------------------------------
 
-#: the lineage sink's format and the longest line read (a `/3` row is under 2 KiB; a longer line is no row)
+#: the lineage sink's row formats and the longest line read (a row is under 2 KiB; a longer line is no row)
 _LINEAGE_FORMAT = "levain-dispatch-lineage/3"
+_FINAL_FORMAT = "levain-dispatch-run-final/1"
 _LINE_MAX = 65536
 _INT_MAX = 2**63 - 1
+#: [judged] how long the one USAGE read waits for keys' run final. The settle reads once (a proof that lands after it is
+#: worth nothing), and the client's USAGE request gives up at its connect timeout of ten seconds, so the wait sits well
+#: under that; the normal path is a handful of fsyncs, tens of milliseconds, and the wait covers a keys that learns of
+#: the drop late. At the deadline the answer is None: the whole reservation.
+FINAL_WAIT_S = 6.0
+_POLL_S = 0.2
+
+
+class _Torn(Exception):
+    """The sink ends in a line not yet whole (an append in flight): read again."""
 
 
 def _no_constant(name: str) -> None:
@@ -94,32 +108,10 @@ def _micros(v: object) -> Optional[int]:
     return v if type(v) is int and 0 <= v <= _INT_MAX else None
 
 
-def lineage_spend(path: object, run_id: str, final_rows: object = None) -> Optional[int]:
-    """The micro-dollars a run spent, summed from CONTROL's lineage sink (`L/lineage/lineage.jsonl`, `/3` rows) by
-    ``run_id``, and ONLY with a proof that the sink holds every row of the run (L3 wave3 r1, codex HIGH 3).
-
-    The completeness proof is ``final_rows``: the number of distinct lineage records keys built for the run, answered
-    only once keys holds the run final (no open hold, no refusal window still open). The sum is returned only when the
-    run's rows in the sink number exactly that. keys delivers rows asynchronously (its outbox, paced envelopes), so
-    S1 END proving the group gone says nothing about delivery: a sink holding the first of two calls (100 of 100 + 900)
-    would otherwise settle at 100 and release the rest for good. Neither keys nor CONTROL produces such a proof today
-    (no terminal row per run, no finalized-count query, and a row is sent only at a resolution, so an exchange still
-    open leaves no trace in the sink), so with ``final_rows`` None this answers None ALWAYS, and a brokered run settles
-    at its whole reservation. What keys must add before a brokered run can settle below its reservation: a per-run
-    final count (or terminal record) acknowledged only after every resolution of the run is durably in the sink.
-
-    Per row of the run: ``settled`` ``yes`` is its ``cost_microdollars`` (the hold when the cost is unsaid),
-    ``uncertain`` the larger of the cost and the hold (a call that may have been charged), ``no`` 0 (released or
-    refused). The dispatch uid reads the sink by group (the sink's own docstring, H6-4). Fail-closed: None, so the caller
-    settles at the whole reservation, when the proof is absent, not a count, or not the run's row count; when the sink
-    cannot be opened or read whole, any line is torn, over-long, not JSON or not a row; when ANY quarantine row exists
-    (it names no run, so it may be this one's); or when a row of the run carries a figure that is not a micro-dollar
-    count. A proof of 0 with no row of the run is 0."""
-    if type(run_id) is not str or not run_id or not isinstance(path, (str, os.PathLike)):
-        return None
-    if type(final_rows) is not int or final_rows < 0:
-        return None                # completeness unproven: never a number
-    total, matched = 0, 0
+def _read_sink(path: object, run_id: str, *, torn_is_final: bool = True) -> Optional[int]:
+    """One whole read of the sink. The sum, None when the proof fails, or raises :class:`_Torn` when
+    ``torn_is_final`` is False and the tail is not a whole line."""
+    total, matched, triples, finals = 0, 0, [], []
     try:
         fd = os.open(os.fspath(path), os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC)
     except OSError:
@@ -131,16 +123,27 @@ def lineage_spend(path: object, run_id: str, final_rows: object = None) -> Optio
                 raw = fh.readline(_LINE_MAX + 1)
                 if not raw:
                     break
-                if len(raw) > _LINE_MAX or not raw.endswith(b"\n"):
-                    return None            # over-long, or a torn tail (an append in flight, or a crash): never a row
+                if len(raw) > _LINE_MAX:
+                    return None
+                if not raw.endswith(b"\n"):
+                    if torn_is_final:
+                        return None            # a torn tail (an append in flight, or a crash): never a row
+                    raise _Torn()
                 try:
                     row = json.loads(raw.decode("utf-8"), parse_constant=_no_constant)
                 except (ValueError, RecursionError):
                     return None
-                if not isinstance(row, dict) or row.get("format") != _LINEAGE_FORMAT:
+                # every decision here keys on `format`, never on a key's presence: a run-final row's `quarantined`
+                # is a COUNT, a `/3` row's `quarantined` is the quarantine marker
+                fmt = row.get("format") if isinstance(row, dict) else None
+                if fmt == _FINAL_FORMAT:
+                    if row.get("run_id") == run_id:
+                        finals.append(row)
+                    continue
+                if fmt != _LINEAGE_FORMAT:
                     return None
                 if "quarantined" in row:
-                    return None
+                    continue                   # a quarantine row names no run: the final's own count attributes it
                 if row.get("run_id") != run_id:
                     continue
                 settled, hold, cost = row.get("settled"), _micros(row.get("hold_microdollars")), row.get("cost_microdollars")
@@ -154,6 +157,10 @@ def lineage_spend(path: object, run_id: str, final_rows: object = None) -> Optio
                     figure = 0
                 else:
                     return None
+                src = row.get("source")
+                if not isinstance(src, dict) or set(src) != {"ledger", "epoch", "ref"}:
+                    return None
+                triples.append(src)
                 total += figure
                 matched += 1
     except OSError:
@@ -161,20 +168,64 @@ def lineage_spend(path: object, run_id: str, final_rows: object = None) -> Optio
     finally:
         if fd != -1:
             os.close(fd)
-    return total if matched == final_rows and total <= _INT_MAX else None
-
-
-def lineage_spend_reader(path: object, final_rows: Optional[Callable[[str], Any]] = None
-                         ) -> Callable[[str], Optional[int]]:
-    """:func:`lineage_spend` bound to the sink at ``path`` and to ``final_rows(run_id)``, keys' completeness proof for
-    the run (no such source exists yet: without one every read is None, the whole reservation): the ``spend`` a
-    brokered ``RealLauncher`` is built with. A proof source that raises is None."""
-    def read(run_id: str) -> Optional[int]:
-        if final_rows is None:
+    if len(finals) != 1:
+        return None
+    fin = finals[0]
+    n, q, digest = fin.get("rows"), fin.get("quarantined"), fin.get("triples_digest")
+    if type(n) is not int or type(q) is not int or q != 0 or n != matched or type(digest) is not str:
+        return None
+    try:
+        if triples_digest(triples) != digest:
             return None
+    except (KeyError, TypeError, IndexError):
+        return None
+    return total if total <= _INT_MAX else None
+
+
+def lineage_spend(path: object, run_id: str) -> Optional[int]:
+    """The micro-dollars a run spent, summed from CONTROL's lineage sink (`L/lineage/lineage.jsonl`) by ``run_id``, and
+    ONLY on the run's final row: keys writes ``levain-dispatch-run-final/1`` once, after every resolution of the run
+    is durably in the sink, and it counts the run's rows and digests their source triples. The sum is returned only
+    when the sink holds exactly one final row for the run, its ``quarantined`` is 0, the run's rows number its ``rows``
+    and their source triples hash to its ``triples_digest`` (the ledger's one :func:`~levain.broker.ledger.
+    triples_digest`). A sink holding the first of two calls (100 of 100 + 900) therefore never settles at 100. Rows and
+    quarantine rows of OTHER runs do not matter to this one.
+
+    Per row of the run: ``settled`` ``yes`` is its ``cost_microdollars`` (the hold when the cost is unsaid),
+    ``uncertain`` the larger of the cost and the hold (a call that may have been charged), ``no`` 0 (released or
+    refused). The dispatch uid reads the sink by group (the sink's own docstring, H6-4). Fail-closed: None, so the
+    caller settles at the whole reservation, when there is no final or more than one, the final counts a quarantine, the
+    count or the digest differs, the sink cannot be opened or read whole, any line is torn, over-long, not JSON or of an
+    unknown format, or a row of the run carries a figure that is not a micro-dollar count.
+
+    Known edge: a run keys never noted (a keys restart between the run's last exchange and its drop leaves a run with no
+    hold and no row) gets no final and settles at its reservation: the safe direction."""
+    if type(run_id) is not str or not run_id or not isinstance(path, (str, os.PathLike)):
+        return None
+    return _read_sink(path, run_id)
+
+
+def lineage_spend_reader(path: object, *, wait_s: float = FINAL_WAIT_S, poll_s: float = _POLL_S,
+                         clock: Callable[[], float] = time.monotonic,
+                         sleep: Callable[[float], Any] = time.sleep) -> Callable[[str], Optional[int]]:
+    """:func:`lineage_spend` bound to the sink at ``path``: the ``spend`` a brokered ``RealLauncher`` is built with.
+    The settle reads once, so the read WAITS for the run final, up to ``wait_s`` (:data:`FINAL_WAIT_S`), polling every
+    ``poll_s``: a torn tail means read again, and at the deadline the answer is None. A reader that raises is None."""
+    def read(run_id: str) -> Optional[int]:
+        if type(run_id) is not str or not run_id or not isinstance(path, (str, os.PathLike)):
+            return None
+        deadline = clock() + max(0.0, float(wait_s))
         try:
-            proof = final_rows(run_id)
+            while True:
+                try:
+                    got = _read_sink(path, run_id, torn_is_final=False)
+                except _Torn:
+                    got = None
+                if got is not None:
+                    return got
+                if clock() >= deadline:
+                    return None
+                sleep(poll_s)
         except Exception:  # noqa: BLE001 - an unreadable proof is no proof
             return None
-        return lineage_spend(path, run_id, proof)
     return read

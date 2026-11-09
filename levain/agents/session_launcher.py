@@ -53,8 +53,8 @@ from the operator's signed link; it is never a fire's input), the three route fi
 an activation between the resolve and the mint is retried ONCE with a fresh resolve), and none of the passthrough caps
 ride. keys then books every call of the run under ``("run", run_id)`` against that share and stops the run past it.
 Usage is the run's spend: the injected ``spend(run_id)`` reader (production: :func:`levain.slot.dispatch_usage.
-lineage_spend`, the lineage sink summed by run id, and only with keys' proof that the sink holds every row of the run,
-a proof nothing produces yet, so today it is always None); a reader that is absent, or answers None, is
+lineage_spend_reader`, the lineage sink summed by run id, and only on keys' run-final row proving the sink holds every
+row of the run); a reader that is absent, or answers None, is
 ``usd_micros=None``, which ``accounting.settle`` debits as the WHOLE reservation. What no test here holds is in the module RETURN
 (``1107-15-voice/RETURN_wave3.md``): a real provider call through a real brokered slot.
 

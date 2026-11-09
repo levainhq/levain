@@ -1320,8 +1320,8 @@ def build_server(host: str, store: Path, control_sock: Path, operator_uid: int, 
     """The PASSTHROUGH server (L3 wave3 r1, codex HIGH 1). With ``brokered`` (PRE-W: root's setting ON,
     :func:`read_dispatch_auth`; default OFF) it also builds, as the returned server's ``brokered``, a BROKERED server: a
     separately constructed ``RealLauncher(auth="brokered")`` whose usage is ``spend=lineage_spend_reader(L/lineage/
-    lineage.jsonl)`` with no completeness proof (none exists yet: every read is None, so every brokered run settles at
-    its WHOLE share, the fail-closed rule), behind its own ``replica_verifier(replica, billing="api_key")``, served by
+    lineage.jsonl)``, which waits (bounded) for keys' run-final row and settles on it alone (a run with no final settles
+    at its WHOLE share, the fail-closed rule), behind its own ``replica_verifier(replica, billing="api_key")``, served by
     :func:`main` on its own socket (:data:`BROKERED_SOCKET_NAME`). The two share the runtime, the usage sources, the
     session index (one record directory, keyed by attempt id), the ONE replica (two replica objects on one directory
     would contend on its append lock), the ONE uploads (a second sweep would delete the first's staging) and the ONE
