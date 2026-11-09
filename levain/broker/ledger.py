@@ -1010,15 +1010,29 @@ class Ledger:
     def _submit(self, seq: int, data: bytes, hold: Optional[Hold], kind: str, *,
                 fut: Optional[asyncio.Future] = None, outbox: Optional[Tuple[Ref, dict]] = None) -> None:
         """Enqueue only. `_inflight_since` moves only when nothing was in flight. `fut` (a hold-less line's) resolves
-        when the line is durable; `outbox` enters the outbox then."""
-        if not self._lines:
-            self._inflight_since = time.monotonic()
-        self._lines[seq] = (hold, kind)
-        if fut is not None:
-            self._line_futs[seq] = fut
-        if outbox is not None:
-            self._pending_outbox[seq] = outbox
-        self._q.put((seq, data))
+        when the line is durable; `outbox` enters the outbox then. Failure-atomic: if any step raises, every entry this
+        call made is taken out again, `_inflight_since` is put back, `fut` fails, and the error propagates."""
+        since = self._inflight_since
+        try:
+            if not self._lines:
+                self._inflight_since = time.monotonic()
+            self._lines[seq] = (hold, kind)
+            if fut is not None:
+                self._line_futs[seq] = fut
+            if outbox is not None:
+                self._pending_outbox[seq] = outbox
+            self._q.put((seq, data))
+        except BaseException:
+            self._lines.pop(seq, None)
+            self._line_futs.pop(seq, None)
+            self._pending_outbox.pop(seq, None)
+            self._inflight_since = since
+            if fut is not None:
+                try:
+                    _set_unavailable(fut, "the line was not queued")
+                except Exception:
+                    pass
+            raise
 
     def admit(self, scope: Scope, cap: int, bound: BoundFn, price_ref: str, meta: Optional[dict] = None) -> Hold:
         """One synchronous section on the loop: no await. Raises `LedgerUnavailable`, `LedgerMisuse`, `Refused`

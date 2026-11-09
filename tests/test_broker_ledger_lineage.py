@@ -868,3 +868,61 @@ def test_a_run_final_whose_line_fails_takes_its_fence_down(tmp_path, monkeypatch
 
     assert asyncio.run(go()) == (True, False, False)
     assert _finals(path) == []
+
+
+class _QueueThatFails:
+    """The writer's queue with `put` failing while `fail` is set; `get` and `get_nowait` reach the real queue (the
+    writer thread is already blocked in the real one)."""
+
+    def __init__(self, real) -> None:
+        self.real, self.fail = real, True
+
+    def put(self, item) -> None:
+        if self.fail:
+            raise RuntimeError("the queue refused the line")
+        self.real.put(item)
+
+    def get(self, *a, **k):
+        return self.real.get(*a, **k)
+
+    def get_nowait(self):
+        return self.real.get_nowait()
+
+
+def test_a_line_that_cannot_be_queued_leaves_no_bookkeeping_behind(tmp_path, monkeypatch):
+    # codex K3x: a submit that raises after touching the in-flight maps rolls every entry back, so nothing eats the
+    # outbox bound, no fence goes up, and the same count queues cleanly on the next call
+    path = ledger_path(tmp_path)
+
+    async def go():
+        led = L.Ledger.open(path)
+        led.attach(asyncio.get_running_loop())
+        led.note_run(RID)
+        led.note_run(RID2)
+        q = _QueueThatFails(led._q)
+        monkeypatch.setattr(led, "_q", q)
+        with pytest.raises(RuntimeError):
+            led.run_final(RID)
+        failed = (dict(led._lines), dict(led._line_futs), dict(led._pending_outbox), led.outbox_committed,
+                  led.run_finalized(RID))
+        # an ack whose line cannot be queued leaves no triple pending, so a later ack of it is not skipped
+        q.fail = False
+        await led.run_final(RID2)
+        triple = led.unacked()[0][0]
+        q.fail = True
+        with pytest.raises(RuntimeError):
+            led.ack([triple])
+        await asyncio.sleep(0)
+        ack_pending = set(led._ack_pending)
+        q.fail = False
+        await led.ack([triple])
+        await led.run_final(RID)
+        out = (failed, ack_pending, led.run_finalized(RID), led.outbox_size, led.healthy)
+        await led.aclose(5)
+        return out
+
+    failed, ack_pending, done, size, healthy = asyncio.run(go())
+    assert failed == ({}, {}, {}, 0, False)
+    assert ack_pending == set()
+    assert (done, size, healthy) == (True, 1, True)
+    assert sorted(f["run_id"] for f in _finals(path)) == sorted([RID, RID2])
