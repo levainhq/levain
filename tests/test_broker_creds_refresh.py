@@ -957,6 +957,7 @@ def test_t7_expires_in_accepts_a_numeric_string_and_an_integral_float_and_is_cla
 
 # --- rule (c): EXACTLY ONE refresh_post caller (R76) ------------------------------------------------------------------
 
+@pytest.mark.static_guard
 def test_rule_c_passes_with_one_caller_and_fails_on_none_and_on_two():
     import importlib.util
     root = Path(__file__).resolve().parent.parent

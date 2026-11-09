@@ -469,6 +469,7 @@ def _pending_writers(root: Path) -> list[str]:
     return out
 
 
+@pytest.mark.static_guard
 def test_no_module_writes_a_manual_pending_without_its_lease():
     root = Path(__file__).resolve().parent.parent / "levain"
     assert _pending_writers(root) == [], (
@@ -476,6 +477,7 @@ def test_no_module_writes_a_manual_pending_without_its_lease():
         "(upkeep3._pending_owner_unknown) with it (levain project_memory 1027-19/RULINGS.md, R15-5 S3 O3)")
 
 
+@pytest.mark.static_guard
 def test_the_pending_tripwire_catches_a_writer(tmp_path):
     (tmp_path / "schema3.py").write_text('X = "update manual_pendings SET state = 1"\n'
                                          'Y = "INSERT OR IGNORE INTO manual_pendings (pending_id) VALUES (?)"\n'

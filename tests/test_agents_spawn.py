@@ -664,6 +664,7 @@ def _callers() -> set[tuple[str, str, str]]:
     return found
 
 
+@pytest.mark.static_guard
 def test_the_envelope_authority_callers_are_exactly_the_status_lines_and_the_label():
     got = _callers()
     names = {(f, a) for f, _fn, a in got}
@@ -672,6 +673,7 @@ def test_the_envelope_authority_callers_are_exactly_the_status_lines_and_the_lab
     assert {f for f, _fn, _a in got} == {f for f, _fn, _a in EXPECTED}
 
 
+@pytest.mark.static_guard
 @pytest.mark.parametrize("source", [
     "from levain.desk.envelopes import live_refusal\ndef f(s):\n    return live_refusal(s)\n",
     "def f(store):\n    x = store.live_refusal\n    return x()\n",

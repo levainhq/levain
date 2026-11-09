@@ -650,6 +650,7 @@ SNAPSHOT_BUILDERS = {
 }
 
 
+@pytest.mark.static_guard
 def test_no_snapshot_is_built_outside_capture_and_append():
     """DESIGN §3.4: ``RequestAuthority.capture`` is the only snapshot builder (``levain.authority.append``
     replays inside itself), so no reader can fall back to a second head."""
@@ -663,6 +664,7 @@ def test_no_snapshot_is_built_outside_capture_and_append():
     assert offenders == []
 
 
+@pytest.mark.static_guard
 def test_the_fence_sees_a_planted_snapshot_call(tmp_path):
     # the scan above is not vacuous: a reader that builds its own snapshot is found
     probe = tmp_path / "probe.py"
@@ -671,6 +673,7 @@ def test_the_fence_sees_a_planted_snapshot_call(tmp_path):
     assert sorted(_uses(probe, ("snapshot",))) == [("snapshot", "reader", 4), ("snapshot", "reader", 4)]
 
 
+@pytest.mark.static_guard
 def test_the_replica_verify_is_only_the_append_transactions_check():
     """SNAPSHOT_BUILDERS' ``authority_replica._verify`` entry, held to its reason: ``_verify`` is called only from
     ``_txn``, after that function's ``BEGIN IMMEDIATE`` and before its ``COMMIT``, and ``append`` returns a ``Head``
@@ -731,10 +734,12 @@ def _check_the_coverage_replay(path: Path) -> None:
                 f"_replay executes {ast.unparse(n)}"
 
 
+@pytest.mark.static_guard
 def test_the_coverage_replay_opens_read_only_and_writes_nothing():
     _check_the_coverage_replay(LEVAIN / "graduation_policy.py")
 
 
+@pytest.mark.static_guard
 @pytest.mark.parametrize("old, new, why", [
     ("?mode=ro", "?mode=rw", "mode=rw"),
     ('conn.execute("COMMIT")', 'conn.execute("DELETE FROM authority_log")', "_replay executes"),
@@ -847,6 +852,7 @@ def _check_handed_step(fn: ast.FunctionDef, param: str, acts: tuple[str, ...]) -
     assert built == [], f"{fn.name}: builds a connection itself at {built}"
 
 
+@pytest.mark.static_guard
 def test_the_handed_step_guard_sees_a_step_off_its_handed_connection(tmp_path):
     # the guard above is not vacuous: an append off another connection, a rebound parameter, or a connection the
     # step builds fails it
@@ -1026,6 +1032,7 @@ def _check_the_appenders(root: Path) -> None:
     assert kept == []
 
 
+@pytest.mark.static_guard
 def test_every_appender_is_the_short_lived_cli_path():
     """S3a-2 MUST (a): a long-lived process may append only by opening the journal by path for that one
     act, holding nothing across calls; any other long-lived appender goes through the broker or holds
@@ -1036,6 +1043,7 @@ def test_every_appender_is_the_short_lived_cli_path():
     _check_the_appenders(LEVAIN)
 
 
+@pytest.mark.static_guard
 def test_the_appender_guard_sees_a_planted_second_caller_of_setup_key(tmp_path):
     # the guard is not vacuous: a second caller of key_setup's acts (a long-lived surface, say) fails it
     root = tmp_path / "levain"
@@ -1051,6 +1059,7 @@ def test_the_appender_guard_sees_a_planted_second_caller_of_setup_key(tmp_path):
         planted.unlink()
 
 
+@pytest.mark.static_guard
 @pytest.mark.parametrize("rel, old, new, why", [
     ("cli.py", "            return append(conn, link,", "            return append(HELD, link,", "_signed_append:.* outside"),
     ("cli.py", "    db = _journal(_cockpit_root(args))\n", "    db = _JOURNAL\n", "_signed_append: db is not a journal"),
@@ -1068,6 +1077,7 @@ def test_the_appender_guard_sees_an_append_off_its_per_act_connection(tmp_path, 
         _check_the_appenders(root)
 
 
+@pytest.mark.static_guard
 def test_the_appender_guard_sees_a_second_appender_in_signing_or_a_new_module(tmp_path):
     # the signing entry is a NAMED allowance, not a general one: another function in signing.py that appends, or a
     # new module that does, fails the inventory; a second caller of _sign_op or a sign() inside a with fails its scope
@@ -1097,6 +1107,7 @@ def test_the_appender_guard_sees_a_second_appender_in_signing_or_a_new_module(tm
         _check_the_appenders(root)
 
 
+@pytest.mark.static_guard
 @pytest.mark.parametrize("old, new, why", [
     ("_auth.append(cockpit, link,", "_auth.append(_HELD, link,", "_r2:.* append off the handed cockpit"),
     ("    link = _auth.UnsignedLink(seq, prev, rec, fp)\n", "    link = _auth.UnsignedLink(seq, prev, rec, fp)\n    cockpit = conn\n",
@@ -1146,6 +1157,7 @@ def test_the_handed_append_guard_sees_an_append_off_the_handed_connection(tmp_pa
         _check_the_appenders(root)
 
 
+@pytest.mark.static_guard
 def test_the_fences_see_a_nested_module_call_and_a_module_import_of_keys():
     # each source is one the first scan (an asname-only module alias, a from-import of the act) missed
     nested = ast.parse("import levain.authority\ndef reader(conn):\n    return levain.authority.snapshot(conn)\n")

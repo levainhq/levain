@@ -38,6 +38,9 @@ from typing import Dict, Iterator, List, Optional, Tuple
 
 import pytest
 
+# static guard: an AST walk over this checkout's source, so it runs on one Python (3.12) only; see pyproject markers
+pytestmark = pytest.mark.static_guard
+
 from tests.broker_network_sites import NETWORK_SITES
 
 ROOT = Path(__file__).resolve().parents[1]
