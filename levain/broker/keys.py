@@ -3071,6 +3071,7 @@ class Keys:
         c = codec.CODECS[pol.body_codec]   # a priced route's codec is never `none` (`policy.parse_base_map`)
         obj = c.parse(raw.take())   # the raw bytes are unreferenced once parsed: only `data` below is kept
         dispatch = pol.max_session_microdollars is None
+        codec.guarded(c.check_betas, fwd, dispatch=dispatch)   # the header half of the dispatch allowlist (row 177)
         checked = codec.guarded(c.check, obj, pol.prices, dispatch=dispatch,
                                 model_requested=None if run is None else run["model_requested"])
         if dispatch and pol.upstream is not None and pol.upstream.host == codec.OPENROUTER_HOST:

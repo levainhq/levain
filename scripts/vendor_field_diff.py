@@ -15,7 +15,12 @@ Sources (Anthropic is pinned to a tag; bump `ANTHROPIC_SDK_TAG` per release, nev
   openai-chat, openai-responses   github.com/openai/openai-openapi  openapi.yaml
   openrouter-*                    openrouter.ai/openapi.json
   anthropic-messages              anthropic-sdk-python `types/beta/message_create_params.py` TypedDict
+  anthropic-betas                 anthropic-sdk-python `types/anthropic_beta_param.py` (the beta-name literal), plus the
+                                  `anthropic-beta` values a real client sent (CAPTURED_BETAS, read from the repo)
 A field the vendor removed stays on a codec's list (old clients still send it); this script never reports a removal.
+The beta section prints each beta name the SDK literal or the captured headers carry that is on none of the codec's
+beta lists (`dispatch_betas`, `unbounded_betas`, `unjudged_betas`, `other_route_betas`). The release checklist reads
+"the diff printed no untriaged beta": a printed beta is judged and moved onto one of the four lists.
 
 Exit status: 0 nothing untriaged, 1 untriaged fields found, 2 the check could not run (a fetch failure, a missing or
 unparseable snapshot, a request schema or class not found, an unresolved `$ref`), with one line on stderr saying why.
@@ -33,6 +38,13 @@ from typing import Any, Dict, Iterable, List, Mapping, Optional, Set, Tuple
 ANTHROPIC_SDK_TAG = "v2.7.0"
 ANTHROPIC_SDK_URL = ("https://raw.githubusercontent.com/anthropics/anthropic-sdk-python/%s/src/anthropic/types/beta/"
                      "message_create_params.py")
+ANTHROPIC_BETA_URL = ("https://raw.githubusercontent.com/anthropics/anthropic-sdk-python/%s/src/anthropic/types/"
+                      "anthropic_beta_param.py")
+#: the snapshot name of the beta-name literal, and the codec and fixture the beta section is diffed against
+BETA_SNAPSHOT = "anthropic_beta_param.py"
+BETA_CODEC = "anthropic-messages"
+CAPTURED_BETAS = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "tests", "fixtures",
+                              "client_bodies", "claude_code_anthropic_beta_headers.json")
 OPENAI_URL = "https://raw.githubusercontent.com/openai/openai-openapi/main/openapi.yaml"
 OPENROUTER_URL = "https://openrouter.ai/openapi.json"
 
@@ -148,6 +160,45 @@ def untriaged(source: str, raw: bytes, codecs: Optional[Mapping[str, Any]] = Non
     return sorted(vendor_fields(source, raw) - known)
 
 
+def beta_names(raw: bytes) -> Set[str]:
+    """The beta names of the SDK's `AnthropicBetaParam`: every string constant inside its `Literal[...]`. A snapshot
+    that does not parse, or holds no such alias, raises `CheckFailed`."""
+    try:
+        tree = ast.parse(raw.decode("utf-8"))
+    except (SyntaxError, ValueError) as e:
+        raise CheckFailed("%s did not parse (%s)" % (BETA_SNAPSHOT, type(e).__name__)) from None
+    for node in tree.body:
+        if isinstance(node, ast.AnnAssign) and isinstance(node.target, ast.Name) \
+                and node.target.id == "AnthropicBetaParam" and node.value is not None:
+            out = {n.value for n in ast.walk(node.value) if isinstance(n, ast.Constant) and isinstance(n.value, str)}
+            if out:
+                return out
+    raise CheckFailed("AnthropicBetaParam not found in %s" % BETA_SNAPSHOT)
+
+
+def captured_betas(raw: bytes) -> Set[str]:
+    """The beta names in the captured `anthropic-beta` header values (`{"requests": [<value>, ...]}`), split on commas
+    and stripped, as `Codec.check_betas` reads them."""
+    try:
+        doc = json.loads(raw)
+        values = doc["requests"]
+        return {t.strip() for v in values for t in v.split(",")}
+    except (ValueError, KeyError, TypeError, AttributeError):
+        raise CheckFailed("the captured anthropic-beta headers did not parse") from None
+
+
+def untriaged_betas(snapshot: bytes, captured: bytes, codecs: Optional[Mapping[str, Any]] = None) -> List[str]:
+    """The beta names in the SDK literal or the captured headers that the codec lists in none of `dispatch_betas`,
+    `unbounded_betas`, `unjudged_betas`, `other_route_betas`. A removal is never reported."""
+    if codecs is None:
+        sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))   # the repo root
+        from levain.broker.codec import CODECS
+        codecs = CODECS
+    c = codecs[BETA_CODEC]
+    known = set(c.dispatch_betas) | set(c.unbounded_betas) | set(c.unjudged_betas) | set(c.other_route_betas)
+    return sorted((beta_names(snapshot) | captured_betas(captured)) - known)
+
+
 def _url(source: str) -> str:
     fname = SOURCES[source][0]
     return OPENAI_URL if fname == "openai.yaml" else OPENROUTER_URL if fname == "openrouter.json" else \
@@ -189,6 +240,31 @@ def main(argv: Optional[Iterable[str]] = None) -> int:
             return 2
         total += len(found)
         print("%s (vs %s): %s" % (source, codec, ", ".join(found) if found else "nothing untriaged"))
+    try:
+        if args.snapshots:
+            path = "%s/%s" % (args.snapshots.rstrip("/"), BETA_SNAPSHOT)
+            try:
+                with open(path, "rb") as f:
+                    snap = f.read()
+            except OSError as e:
+                raise CheckFailed("snapshot %s not read (%s)" % (path, e.strerror or type(e).__name__))
+        else:
+            url = ANTHROPIC_BETA_URL % ANTHROPIC_SDK_TAG
+            try:
+                snap = _fetch(url)
+            except OSError as e:
+                raise CheckFailed("fetch of %s failed (%s)" % (url, e))
+        try:
+            with open(CAPTURED_BETAS, "rb") as f:
+                cap = f.read()
+        except OSError as e:
+            raise CheckFailed("captured betas %s not read (%s)" % (CAPTURED_BETAS, e.strerror or type(e).__name__))
+        found = untriaged_betas(snap, cap)
+    except CheckFailed as e:
+        print("vendor_field_diff: could not run: anthropic-betas: %s" % e, file=sys.stderr)
+        return 2
+    total += len(found)
+    print("anthropic-betas (vs %s): %s" % (BETA_CODEC, ", ".join(found) if found else "nothing untriaged"))
     return 1 if total else 0
 
 

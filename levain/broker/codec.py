@@ -16,7 +16,7 @@ import math
 import re
 from dataclasses import dataclass
 from decimal import ROUND_CEILING, Decimal
-from typing import Any, Callable, Dict, Iterator, List, Mapping, Optional, Tuple, TypeVar
+from typing import Any, Callable, Dict, Iterator, List, Mapping, Optional, Sequence, Tuple, TypeVar
 
 from levain.broker import norm, policy
 from levain.broker.policy import Price
@@ -79,6 +79,14 @@ def _unbounded_what(name: str) -> str:
     record with no status; any character outside it becomes `_`."""
     what = re.sub(r"[^a-z0-9_]", "_", name.lower())[:48]
     return what if norm.what_ok(what) else "shape"
+
+
+def _beta_what(token: str) -> str:
+    """The `:<what>` suffix of a `beta-unlisted` refusal: the token mapped as `_unbounded_what` maps a name (a hyphen
+    becomes `_`), and the fixed word `beta` when the mapped form is outside the wire grammar (a token that starts
+    with a digit, an empty one)."""
+    what = re.sub(r"[^a-z0-9_]", "_", token.lower())[:48]
+    return what if norm.what_ok(what) else "beta"
 
 
 def _refuse_json(detail: str) -> norm.Refused:
@@ -198,6 +206,19 @@ class Codec:
     #: admits, beside an entry with no `type`. A server tool (`server_tools`, `server_tool_prefixes`) is never here:
     #: it is `body-unbounded`, a known cost, not an unjudged type.
     dispatch_tool_types: Tuple[str, ...] = ()
+    #: DISPATCH ALLOWLIST, `anthropic-beta` tokens (row 177): the beta names a dispatch route admits, judged by levain
+    #: and shipped with it. A token outside it is `beta-unlisted:<token>` (`check_betas`), so a beta a vendor ships
+    #: after this list was written is a refusal, never an unjudged billed behaviour. The operator's signed header
+    #: pattern is applied beside it (`norm.check_headers`) and can only narrow it. Empty on a codec that never sees
+    #: the header. An interactive route does not read it.
+    dispatch_betas: Tuple[str, ...] = ()
+    #: beta names judged unbounded or otherwise refused on dispatch, recorded with the three lists below so
+    #: `scripts/vendor_field_diff.py` reports only what is new since the last triage. NOT admitted.
+    unbounded_betas: Tuple[str, ...] = ()
+    #: beta names a vendor publishes that nobody has judged yet: NOT admitted.
+    unjudged_betas: Tuple[str, ...] = ()
+    #: beta names that belong to another endpoint than a dispatch route's request path: NOT admitted.
+    other_route_betas: Tuple[str, ...] = ()
     #: the output-ceiling fields, in the order `write_ceiling` writes the first.
     ceiling_fields: Tuple[str, ...] = ()
     #: whether a request may lack a ceiling (written in at `default_output`); Anthropic requires `max_tokens`.
@@ -262,6 +283,23 @@ class Codec:
         if dispatch:
             self._refuse_blocks(obj)
         return Checked(model, price, found)
+
+    def check_betas(self, headers: Sequence[Tuple[str, str]], *, dispatch: bool) -> None:
+        """The dispatch beta allowlist: every comma-separated token of every `anthropic-beta` pair in `headers` (the
+        header may repeat; the provider reads each one) must be in `dispatch_betas`, else `beta-unlisted:<token>`
+        (403), the first in header order. A token is compared as sent after its surrounding spaces are removed; an
+        empty one is refused too. An interactive route reads nothing here (its session cap bounds it)."""
+        if not dispatch:
+            return
+        for name, value in headers:
+            if name.lower() != "anthropic-beta":
+                continue
+            for raw in value.split(","):
+                tok = raw.strip()
+                if tok not in self.dispatch_betas:
+                    raise norm.Refused("beta-unlisted:" + _beta_what(tok),
+                                       "an anthropic-beta value levain has not judged; dispatch admits only judged "
+                                       "betas (or set CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS=1 in the client)")
 
     def _refuse_unlisted(self, obj: Mapping[str, Any]) -> None:
         """The dispatch allowlist: the first top-level field outside `dispatch_fields`, then every tool definition the
@@ -939,6 +977,48 @@ class AnthropicMessages(Codec):
     # loop and safety controls, and a refusal credit token
     unjudged_fields = ("container", "thread", "fallback_credit_token", "betas", "safeguards", "deferred_tools",
                        "stop_server_tools_when")
+    # [judged by lane r177, 2026-11-09, from the SDK's beta-name literal at tag v2.7.0 (`src/anthropic/types/
+    # anthropic_beta_param.py`), the headers a real Claude Code sent a local listener
+    # (`tests/fixtures/client_bodies/claude_code_anthropic_beta_headers.json`) and Anthropic's beta-headers page.
+    # A beta is listed when it has no billed effect, when its body half is judged by the field and block lists above
+    # (so the beta alone unlocks nothing new), or when it only changes a price the route's price row already
+    # states at its highest rate.]
+    dispatch_betas = (
+        # client identity, thinking and effort and output shape, inside the ceiling
+        "claude-code-20250219", "interleaved-thinking-2025-05-14", "effort-2025-11-24", "per-turn-control-2026-07-01",
+        "mid-conversation-output-config-2026-07-01", "thinking-token-count-2026-05-13",
+        "structured-outputs-2025-11-13", "task-budgets-2026-03-13", "token-efficient-tools-2025-02-19",
+        # body halves judged: context editing, tool references and inline definitions, file images, a refused document
+        "context-management-2025-06-27", "mid-conversation-tool-changes-2026-07-01", "advanced-tool-use-2025-11-20",
+        "files-api-2025-04-14", "pdfs-2024-09-25",
+        # price rule: a longer cache write, a larger context, a faster tier, a larger output ceiling
+        "extended-cache-ttl-2025-04-11", "context-1m-2025-08-07", "fast-mode-2026-02-01",
+        "output-128k-2025-02-19", "output-300k-2026-03-24",
+        # a client-run tool whose results come back as counted content
+        "computer-use-2024-10-22", "computer-use-2025-01-24", "computer-use-2025-11-24",
+        # no billed effect, or a request label judged with the fields
+        "prompt-caching-2024-07-31", "model-context-window-exceeded-2025-08-26", "dev-full-thinking-2025-05-14",
+        "cache-diagnosis-2026-04-07", "user-profiles-2026-03-24", "user-profiles-2026-08-18",
+        "user-profiles-2026-09-04",
+    )
+    # judged unbounded: a server-run tool or loop, another model, server-held state, server compaction
+    unbounded_betas = (
+        "mcp-client-2025-04-04", "mcp-client-2025-11-20", "mcp-client-2026-09-15", "code-execution-2025-05-22",
+        "skills-2025-10-02", "advisor-tool-2026-03-01", "inline-tools-2026-09-15", "compact-2026-01-12",
+        "compact-2026-09-04", "server-side-fallback-2026-06-01", "server-side-fallback-2026-07-01",
+        "fallback-credit-2026-06-01", "fallback-credit-2026-07-01", "message-threads-2026-08-12",
+    )
+    # published with no page a reader could judge from
+    unjudged_betas = ("dreaming-2026-04-21", "thinking-binding-controls-2026-08-01",
+                      "thinking-display-updates-2026-08-18", "mid-conversation-system-clear-at-2026-08-21")
+    # belong to endpoints a dispatch route's request path does not reach
+    other_route_betas = (
+        "message-batches-2024-09-24", "token-counting-2024-11-01", "managed-agents-2026-04-01",
+        "agent-memory-2026-07-22", "mcp-tunnels-2026-06-22", "ce-user-management-2026-07-13",
+        "ce-plugins-2026-09-01", "spend-limit-reads-2026-09-26", "telemetry-destinations-2026-08-11",
+        "webhooks-2026-10-07", "admin-user-sign-out-2026-10-08", "analytics-usage-cost-2026-08-24",
+        "experimental-claude-tag-2026-10-21",
+    )
 
     def _unbounded_shapes(self, obj: Mapping[str, Any]) -> List[str]:
         """`context_management` holding a compaction edit (`compact_*`): threshold compaction "requires an additional
