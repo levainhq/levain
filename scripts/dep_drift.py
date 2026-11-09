@@ -8,7 +8,7 @@ modified): `uv lock --upgrade` re-resolves every package to its newest allowed r
 version changed against the committed lock are listed (old -> new), the upgraded lock is installed hash-checked into a
 fresh venv, an import smoke runs, then the suite runs. It prints one machine-readable line last:
 
-    DEP_DRIFT {"result": "green|red|resolve_failed|install_failed", "stage": ..., "changed": [...], ...}
+    DEP_DRIFT {"result": "green|red|resolve_failed|install_failed", "stage": ..., "changed": [...], ...}  (a suite run also carries failed_tests)
 
 and exits 0 on green, 1 on red/failed. The same logic backs .github/workflows/dep-drift.yml, which runs it on a schedule
 and files the issue; a laptop scheduled task can call it and read the last line.
@@ -65,6 +65,27 @@ def run(cmd: list[str], cwd: Path | None = None, env: dict | None = None) -> int
     return subprocess.call(cmd, cwd=cwd, env=env)
 
 
+def run_capture(cmd: list[str], cwd: Path | None = None, env: dict | None = None) -> tuple[int, list[str]]:
+    """Run a command, echo its output as it arrives, and return (exit code, the lines)."""
+    print("+ " + " ".join(cmd), flush=True)
+    lines: list[str] = []
+    proc = subprocess.Popen(cmd, cwd=cwd, env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+    for line in proc.stdout:
+        print(line, end="", flush=True)
+        lines.append(line.rstrip("\n"))
+    return proc.wait(), lines
+
+
+def failed_tests(lines: list[str], limit: int = 20) -> list[str]:
+    """The node ids from pytest's short summary (`FAILED path::name - reason`, `ERROR path::name`), first `limit`."""
+    ids: list[str] = []
+    for line in lines:
+        head, _, rest = line.partition(" ")
+        if head in ("FAILED", "ERROR") and "::" in rest:
+            ids.append(rest.split(" - ")[0].strip())
+    return ids[:limit]
+
+
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
     ap.add_argument("--repo", default=str(Path(__file__).resolve().parents[1]))
@@ -100,22 +121,19 @@ def _drift(repo: Path, work: Path, args) -> int:
     for row in changed:
         print("  " + format_change(row))
 
-    extras = [a for e in args.extras.split(",") if e for a in ("--extra", e)]
-    req = work / "req.txt"
-    if run(["uv", "export", "--frozen", "--no-emit-project", "--no-header", "--hashes", *extras, "-o", str(req)], cwd=lockdir) != 0:
-        print(result_line("resolve_failed", "export", changed))
-        return 1
     venv = work / "venv"
     py = venv / "bin" / "python"
-    steps = [
-        [args.python, "-m", "venv", str(venv)],
-        [str(py), "-m", "pip", "install", "--quiet", "--require-hashes", "--no-deps", "-r", str(req)],
-        [str(py), "-m", "pip", "install", "--quiet", "--no-deps", "-e", str(repo)],
-    ]
-    for cmd in steps:
-        if run(cmd) != 0:
-            print(result_line("install_failed", "install", changed))
-            return 1
+    if run([args.python, "-m", "venv", str(venv)]) != 0:
+        print(result_line("install_failed", "install", changed))
+        return 1
+    # The same install path every test run uses, pointed at the re-resolved lock: the venv's python and pip come
+    # first on PATH, LOCK_DIR names the scratch copy that holds the upgraded uv.lock, and the project installs from repo.
+    install_env = {**os.environ, "PATH": f"{venv / 'bin'}{os.pathsep}{os.environ.get('PATH', '')}",
+                   "LOCK_DIR": str(lockdir), "RUNNER_TEMP": str(work), "VIRTUAL_ENV": str(venv)}
+    extras = [e for e in args.extras.split(",") if e]
+    if run([str(repo / "scripts" / "ci_install_locked.sh"), *extras], cwd=repo, env=install_env) != 0:
+        print(result_line("install_failed", "install", changed))
+        return 1
     if run([str(py), "-c", SMOKE]) != 0:
         print(result_line("red", "smoke", changed, smoke=SMOKE))
         return 1
@@ -123,9 +141,9 @@ def _drift(repo: Path, work: Path, args) -> int:
         print(result_line("green", "smoke", changed))
         return 0
     env = {**os.environ, "LEVAIN_TEST_WAIT_SCALE": os.environ.get("LEVAIN_TEST_WAIT_SCALE", "2")}
-    code = run([str(py), "-m", "pytest", "-n", "auto", "-q", "-p", "no:cacheprovider", "--rootdir", str(repo),
-                "--basetemp", str(work / "pt"), str(repo / "tests")], cwd=repo, env=env)
-    print(result_line("green" if code == 0 else "red", "suite", changed, pytest_exit=code))
+    code, out = run_capture([str(py), "-m", "pytest", "-n", "auto", "-q", "-p", "no:cacheprovider", "--rootdir", str(repo),
+                             "--basetemp", str(work / "pt"), str(repo / "tests")], cwd=repo, env=env)
+    print(result_line("green" if code == 0 else "red", "suite", changed, pytest_exit=code, failed_tests=failed_tests(out)))
     return 0 if code == 0 else 1
 
 
