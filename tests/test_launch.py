@@ -204,7 +204,7 @@ _PASS_THROUGH = {
     ("levain/slot/wall.py", "trampoline_main", "execve", "os.environb if environ is None else environ"):
         "the macOS last hop, run by the Seatbelt launcher after the profile: its env IS the one the stage built "
         "explicitly, because the stage execs it with an explicit env",
-    ("levain/slot/hook_run.py", "repo_filter", "Popen", "os.environ if environ is None else environ"):
+    ("levain/slot/hook_run.py", "_run_repo", "Popen","os.environ if environ is None else environ"):
         "a slot's repo hook filter (row 161): Claude Code runs it under render's `/usr/bin/env -i` wrapper, so its env "
         "IS the one render computed (the rendered session env plus the fixed inherited names), and the repo command it "
         "runs gets that env",
