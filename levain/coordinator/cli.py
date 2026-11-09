@@ -102,10 +102,15 @@ def _board_store(args: argparse.Namespace) -> EnvelopeStore:
 
 
 def _opens_board(args: argparse.Namespace) -> bool:
-    """True for the verbs whose default store is the board store. A spawn with ``--item`` writes its launch and the
-    item's attach in one transaction, so the launch is in the board store too."""
+    """True for the verbs whose default store is the board store: the coordinator's lease verbs (take, release, beat),
+    its queue and status reads (ready, status), the watch pass and the board importers. A spawn with ``--item`` writes
+    its launch and the item's attach in one transaction, so the launch is in the board store too. Every other verb
+    (questions, answer, morning, claim, launch...) keeps the consent directory; ``--queue-dir`` names either store."""
     cmd = args.coord_cmd
-    return cmd in ("import-status", "apply-reports") or (cmd == "spawn" and getattr(args, "item", None) is not None)
+    return cmd in _BOARD_VERBS or (cmd == "spawn" and getattr(args, "item", None) is not None)
+
+
+_BOARD_VERBS = frozenset({"take", "release", "beat", "ready", "status", "watch", "import-status", "apply-reports"})
 
 
 NO_STORE = "no coordinator store here"
@@ -2151,7 +2156,8 @@ def _spawn_caps() -> tuple[int, int]:
 def add_parsers(subparsers: argparse._SubParsersAction) -> None:
     from levain.coordinator import seam_handoffs as _seam_handoffs
 
-    qdir_help = "The consent directory holding dispatch.db (default: the consent queue's)."
+    qdir_help = ("The directory holding dispatch.db (default: <levain home>/board for take, release, beat, ready, "
+                 "status and watch; the consent queue's for the other verbs).")
 
     def common(p: argparse.ArgumentParser) -> None:
         p.add_argument("--queue-dir", dest="queue_dir", type=Path, default=None, help=qdir_help)
@@ -2334,8 +2340,8 @@ def add_parsers(subparsers: argparse._SubParsersAction) -> None:
                     "ends a launch whose Claude Code session is no longer listed, beats the lease of the coordinator "
                     "whose session is listed, not done and writing as coordinator, and stops a session whose launch "
                     "is over. Only sessions Levain started. Launches made in the board store are started by "
-                    "`coord watch --queue-dir <levain home>/board`; the board's coordinator verbs take that "
-                    "--queue-dir explicitly.")
+                    "a bare `coord watch`, which watches the board store; --queue-dir names the consent "
+                    "directory instead.")
     cwa.add_argument("--every", type=float, default=30.0, metavar="S", help="Seconds between passes (default 30).")
     cwa.add_argument("--once", action="store_true", help="One pass, then exit.")
     band_root = ("The cockpit data root whose authority log re-verifies the asking session's envelope (default: the one "
