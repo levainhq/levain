@@ -139,6 +139,13 @@
 
   // A snoozed question is one collapsed line: its label (number and day), then the first words of the title.
   function laterWords(t) { t = String(t == null ? "" : t); return t.length > 60 ? t.slice(0, 57) + "..." : t; }
+  // the line's own words wrap around the LATER tag; the tag itself (LATER and its day) stays on one line
+  function laterTitle(doc, k) {
+    var t = el(doc, "div", "bd-title");
+    t.appendChild(el(doc, "span", "later-tag", "LATER: " + (k.laterLabel || k.later)));
+    t.appendChild(el(doc, "span", "", " " + laterWords(k.title)));
+    return t;
+  }
 
   // The needs-you column's one sentence: said by the grouped tab and the six columns alike, so the two cannot drift.
   function needsYouNote(model) { return "This column is the Needs you band. Answer there (`" + model.hint + "`)."; }
@@ -170,7 +177,7 @@
       col.cards.forEach(function (k) {
         var row = el(doc, "div", "bd-row" + (k.later ? " bd-later" : ""));
         row.dataset.id = k.id;
-        if (k.later) { row.appendChild(el(doc, "div", "bd-title", "LATER: " + (k.laterLabel || k.later) + " " + laterWords(k.title))); drawDrop(doc, row, k, model); wrap.appendChild(row); return; }
+        if (k.later) { row.appendChild(laterTitle(doc, k)); drawDrop(doc, row, k, model); wrap.appendChild(row); return; }
         row.appendChild(el(doc, "div", "bd-title", (k.number != null ? k.number + ". " : "") + (String(k.title == null ? "" : k.title).replace(/^\s*DESK OWES:\s*/i, "") || String(k.title == null ? "" : k.title))));
         var meta = [k.repo, k.tier, k.source, k.id].filter(Boolean).join(" · ");
         if (meta) row.appendChild(el(doc, "div", "bd-meta", meta));
@@ -203,7 +210,7 @@
       col.cards.forEach(function (k) {
         var card = el(doc, "article", "bd-card" + (k.later ? " bd-later" : ""));
         card.dataset.id = k.id;
-        if (k.later) { card.appendChild(el(doc, "div", "bd-title", "LATER: " + (k.laterLabel || k.later) + " " + laterWords(k.title))); drawDrop(doc, card, k, model); c.appendChild(card); return; }
+        if (k.later) { card.appendChild(laterTitle(doc, k)); drawDrop(doc, card, k, model); c.appendChild(card); return; }
         card.appendChild(el(doc, "div", "bd-title", (k.number != null ? k.number + ". " : "") + (String(k.title == null ? "" : k.title).replace(/^\s*DESK OWES:\s*/i, "") || String(k.title == null ? "" : k.title))));
         var meta = [k.repo, k.tier, k.source, k.id].filter(Boolean).join(" · ");
         if (meta) card.appendChild(el(doc, "div", "bd-meta", meta));

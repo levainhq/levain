@@ -5095,7 +5095,10 @@
       if (typeof it.later === "string" && it.later) {     // snoozed (row 131): one collapsed LATER line, number kept, no answer controls
         const lrow = el("div", "row consent-row band-row band-later");
         lrow.setAttribute("data-band-row", String(it.n));
-        lrow.appendChild(el("span", "ext-meta", "LATER " + (typeof it.later_label === "string" && it.later_label ? it.later_label : String(it.n) + " " + it.later) + " · " + (typeof it.what === "string" ? it.what.slice(0, 80) : "")));
+        const lline = el("span", "ext-meta", "");      // the words wrap around the LATER tag; the tag itself stays on one line
+        lline.append(el("span", "later-tag", "LATER " + (typeof it.later_label === "string" && it.later_label ? it.later_label : String(it.n) + " " + it.later)),
+                     " · " + (typeof it.what === "string" ? it.what.slice(0, 80) : ""));
+        lrow.appendChild(lline);
         kids.push(lrow);
         continue;
       }
