@@ -53,7 +53,7 @@ from levain.slot.ids import SlotId, loopback_alias
 from levain.slot.layout import RUN, STORE
 from levain.slot.runtime_grammar import AUTHS, KINDS, RenderBlob, parse_stdin
 from levain.slot.tickets import RENDERS_AS
-from levain.slot.wall import WallFacts
+from levain.slot.wall import WallFacts, is_loader_env
 
 VENDOR_PREFIX: Mapping[str, PurePosixPath] = {"darwin": PurePosixPath("/usr/local/lib/levain-vendor"),
                                               "linux": PurePosixPath("/usr/lib/levain-vendor")}   # §2.1
@@ -1030,10 +1030,11 @@ def repo_loosening_refusals(docs: Mapping[str, Any]) -> list[Refused]:
     layers the flag layer cannot pin; a ``sandbox.network`` or ``sandbox.filesystem`` that is not an object is
     ``repo-settings-malformed``),
     and a ``disableAllHooks`` that is anything but ``false`` (L2 M6; DECISION: a non-boolean is refused too, as
-    its meaning to CC is unmeasured), and an ``env`` naming the queue's vars, a :data:`PROXY_ENV` name, or a name
-    ``levain.sandbox_keys.repo_env_rule`` refuses (PRE-L3 4-1; pf4r3: default deny inside the vendor's namespace,
-    provider prefixes and credential or endpoint suffixes outside it), and a top-level key
-    ``levain.sandbox_keys.repo_settings_rule`` refuses (a ``*Helper``, ``*AuthRefresh`` or ``*CredentialExport``). A
+    its meaning to CC is unmeasured), and an ``env`` naming the queue's vars, a :data:`PROXY_ENV` name, a dynamic-loader
+    name (``LD_*``, ``DYLD_*``), or a name ``levain.sandbox_keys.repo_env_rule`` refuses (PRE-L3 4-1; pf4r3: default
+    deny inside the vendor's namespace, provider prefixes and credential or endpoint suffixes outside it), and a
+    top-level key ``levain.sandbox_keys.repo_settings_rule`` refuses (a ``*Helper``, ``*AuthRefresh`` or
+    ``*CredentialExport``). A
     document that is not an object is refused ``repo-settings-malformed``.
     Hooks, permissions and every other key launch (plan §2c 3: the repo's settings are its own).
 
@@ -1064,12 +1065,16 @@ def repo_loosening_refusals(docs: Mapping[str, Any]) -> list[Refused]:
                 out.append(_refused("loosening", f"env.{name}", f"{path}: the queue's env is set by levain only"))
             for name in sorted(n for n in env if n in PROXY_ENV):
                 out.append(_refused("loosening", f"env.{name}", f"{path}: {name} is set by levain only"))
+            # A dynamic-loader name would load a repo library into the gate hook's interpreter (a cloned repo is an
+            # untrusted author); the wall also scrubs these at exec, so this is the visible half.
+            for name in sorted(n for n in env if is_loader_env(n)):
+                out.append(_refused("loosening", f"env.{name}", f"{path}: {name} steers the dynamic loader"))
             # PRE-L3 4-1: a key or bearer token Claude Code prefers to the stored login moves the bill of an unattended
             # run (or stops it at the "use this API key?" prompt), and an endpoint, provider switch, tenant or TLS
             # trust moves where its traffic goes and who pays; a vendor name off the allowlist is refused (pf4r3), the
-            # rule in the detail. The queue and proxy names above keep their own refusal, once.
+            # rule in the detail. The queue, proxy and loader names above keep their own refusal, once.
             for name in sorted((n for n in env if n not in PROXY_ENV and n not in (QUEUE_CAP_ENV, QUEUE_SOCKET_ENV)
-                                and repo_env_rule(n)), key=str):
+                                and not is_loader_env(n) and repo_env_rule(n)), key=str):
                 out.append(_refused("loosening", f"env.{name}",
                                     f"{path}: {name} is not a repo's to set ({repo_env_rule(name)})"))
         sb = doc.get("sandbox", {})
