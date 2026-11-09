@@ -13,6 +13,7 @@ import os
 from pathlib import Path
 from typing import Any
 
+import pytest
 from anneal_memory.spores import SporeStore
 
 from levain.consent.queue import default_queue_dir
@@ -1148,3 +1149,97 @@ def test_r6_a_time_chosen_in_the_focus_view_leaves_the_card_footer_counting_what
     assert len({(f["desk"], f["later"], f["done"]) for f in focuses}) > 1, seen          # the time choice changed what the focus view draws
     for foot, focus in zip(foots, focuses):
         assert (foot["desk"], foot["later"], foot["done"]) == (focus["desk"], focus["later"], focus["done"]), (foot, focus)
+
+
+# --- board row 178 build 1: the "when?" form with a time, and who does it (derived from the target) -----------------------------
+
+def _seed_when(root: Path) -> dict[str, str]:
+    """Four DUE rows (a past day, so the card holds them): three plain seeds and the desk drop."""
+    store = SporeStore(root / ".levain" / "memory.spores.json")
+    ids = {k: store.add(type="task", text=f"when row {k}", disposition="seed", next="2020-01-01")["id"] for k in ("a", "b", "c")}
+    ids["drop"] = store.add(type="task", text="who row drop", disposition="agenda", target="desk", next="2020-01-07T09:00")["id"]
+    qdir = default_queue_dir()
+    qdir.mkdir(parents=True, exist_ok=True, mode=0o700)
+    CoordStore(qdir).coord_take()
+    return ids
+
+
+def _row_of(text: str) -> str:
+    return f"[...{TRAY}.querySelectorAll('.sp-results .row')].find(r => (r.querySelector('.clause') || {{}}).textContent === {json.dumps(text)})"
+
+
+def _open_when(text: str) -> str:
+    return f"{_row_of(text)}.querySelector('.verb-btn[data-verb=\"spore_surface_at\"]').click(); 1"
+
+
+@pytest.mark.parametrize("width,height,mobile", [(1280, 1000, False), (390, 844, True)])
+@needs_browser
+def test_when_form_writes_a_minute_from_a_quick_pick_or_a_date_and_time_and_the_who_control_sets_the_target(
+        tmp_path: Path, width: int, height: int, mobile: bool) -> None:
+    from datetime import date, timedelta
+
+    root, src, _ids = _install(tmp_path)
+    ids = _seed_when(root)
+    tomorrow = (date.today() + timedelta(days=1)).isoformat()
+    monday = date.today() + timedelta(days=((8 - ((date.today().weekday() + 1) % 7)) % 7) or 7)
+    day = (date.today() + timedelta(days=9)).isoformat()
+    emu = {"w": width, "h": height, "dpr": 2 if mobile else 1}
+    if mobile:
+        emu["mobile"] = True
+    with _serve(src, write_token=TOKEN, surface_tokens={"browser": TOKEN}, install_class="reported") as (url, _httpd):
+        out = _drive(tmp_path, f"{url}/", [
+            {"emulate": emu},
+            *_reload(),
+            {"until": f"{TRAY} && {_row_of('when row a')} && {_row_of('when row b')} && {_row_of('when row c')} && 1"},
+            # the form's own facts: picks, two inputs (no datetime-local), no who-chip on a seed, the who control with nothing chosen
+            {"eval": _open_when("when row a")},
+            {"eval": f"(() => {{ const f = {_row_of('when row a')}.querySelector('.when-form'); const b = f.getBoundingClientRect();"
+                     "const q = (s) => f.querySelector(s); return JSON.stringify({form: {picks: [...f.querySelectorAll('.when-pick')].map(x => x.dataset.pick),"
+                     "date: q('.verb-date').type, time: q('.verb-time').type, timeVal: q('.verb-time').value, dt: !!f.querySelector('input[type=datetime-local]'),"
+                     "pressed: [...f.querySelectorAll('.who-opt')].map(x => x.getAttribute('aria-pressed')), repoHidden: q('.who-repo').hidden,"
+                     "noScroll: document.documentElement.scrollWidth <= window.innerWidth + 1, inside: b.right <= window.innerWidth + 1,"
+                     "pickH: Math.min(...[...f.querySelectorAll('.when-pick')].map(x => x.getBoundingClientRect().height)),"
+                     "timeFs: parseFloat(getComputedStyle(q('.verb-time')).fontSize)}}); })()"},
+            {"shot": str(Path(os.environ.get("LEVAIN_LIST_SHOTS") or tmp_path) / f"when_form_{width}.png")},
+            # one tap writes: Tomorrow 09:00
+            {"eval": f"{_row_of('when row a')}.querySelector('.when-pick[data-pick=\"tomorrow\"]').click(); 1"},
+            {"until": f"!({_row_of('when row a')}) && 1"},
+            # a date and a time, then schedule
+            {"eval": _open_when("when row b")},
+            {"eval": f"(() => {{ const f = {_row_of('when row b')}.querySelector('.when-form'); const d = f.querySelector('.verb-date'); d.value = {json.dumps(day)};"
+                     "d.dispatchEvent(new Event('input', {bubbles: true})); const t = f.querySelector('.verb-time'); t.value = '17:45';"
+                     "t.dispatchEvent(new Event('input', {bubbles: true})); f.querySelector('.verb-confirm').click(); return 1; })()"},
+            {"until": f"!({_row_of('when row b')}) && 1"},
+            # a seed given a who (the machine, the desk) and a pick becomes a dated agenda on that target
+            {"eval": _open_when("when row c")},
+            {"eval": f"(() => {{ const f = {_row_of('when row c')}.querySelector('.when-form'); f.querySelector('.who-opt[data-who=\"the machine\"]').click();"
+                     "return JSON.stringify({repo: {shown: !f.querySelector('.who-repo').hidden, val: f.querySelector('.who-repo').value}}); })()"},
+            {"eval": f"{_row_of('when row c')}.querySelector('.when-pick[data-pick=\"monday\"]').click(); 1"},
+            {"until": f"!({_row_of('when row c')}) && 1"},
+            # the desk drop says who from its target, and the who verb hands it to you without touching its day
+            {"eval": f"JSON.stringify({{chip: (({_row_of('who row drop')}.querySelector('.list-who')) || {{}}).textContent || ''}})"},
+            {"eval": f"{_row_of('who row drop')}.querySelector('.verb-btn[data-verb=\"spore_retarget\"]').click(); 1"},
+            {"eval": f"(() => {{ const f = {_row_of('who row drop')}.querySelector('.who-form'); const on = f.querySelector('.who-opt[aria-pressed=\"true\"]').dataset.who;"
+                     "f.querySelector('.who-opt[data-who=\"you\"]').click(); f.querySelector('.verb-confirm').click(); return JSON.stringify({was: on}); })()"},
+            {"until": f"(() => {{ const r = {_row_of('who row drop')}; return !!r && r.querySelector('.list-who').textContent === 'you' && 1; }})()"},
+            {"eval": f"JSON.stringify({{chip2: {_row_of('who row drop')}.querySelector('.list-who').textContent}})"},
+        ])
+    vals = {k: v for x in out["values"] if isinstance(x, str) and x.startswith("{") for k, v in json.loads(x).items()}
+    form = vals["form"]
+    assert {"later", "tomorrow", "monday", "now"} <= set(form["picks"]), form
+    assert (form["date"], form["time"], form["timeVal"], form["dt"]) == ("date", "time", "09:00", False), form
+    assert form["pressed"] == ["false", "false"] and form["repoHidden"] is True, form
+    assert form["noScroll"] and form["inside"], form
+    if mobile:
+        assert form["pickH"] >= 44 and form["timeFs"] >= 16, form
+    assert vals["repo"] == {"shown": True, "val": "desk"}, vals["repo"]
+    assert vals["chip"] == "the machine" and vals["was"] == "the machine" and vals["chip2"] == "you", vals
+    store = SporeStore(root / ".levain" / "memory.spores.json")
+    a, b, c, drop = (store.get(ids[k]) for k in ("a", "b", "c", "drop"))
+    assert (a["next"], a["disposition"]) == (tomorrow + "T09:00", "seed") and "target" not in a, a
+    assert (b["next"], "target" in b) == (day + "T17:45", False), b
+    assert (c["disposition"], c["target"], c["next"]) == ("agenda", "desk", monday.isoformat() + "T09:00"), c
+    assert (drop["target"], drop["next"]) == ("band", "2020-01-07T09:00"), drop
+    posts = [(p["verb"], p["params"]) for p in _posts(out)]
+    assert ("spore_retarget", {"target": "desk", "surface_at": monday.isoformat() + "T09:00"}) in posts, posts
+    assert ("spore_retarget", {"target": "band"}) in posts, posts

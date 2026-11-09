@@ -939,6 +939,14 @@ KERNEL_VERBS: tuple[VerbSpec, ...] = (
              fields=("text", "domain", "tier", "type"), floor="C1", tier_fn=_update_tier,
              row_tier=_const("C1"), escalates=_update_escalates,
              fire=_spore_fire("spore_update"), legacy_kind="spore_update", device_ok=True, applies_to=_SPORE_ROW),
+    VerbSpec("spore_retarget", "who", "sets who acts when the item wakes: you (a band row) or the machine (the desk "
+             "or a board), a seed given one becomes a dated agenda", "row", fields=("target", "surface_at"), floor="T2",
+             tier_fn=_const("T2"),
+             # a target wakes an agent with these words, as a create that carries one does (spore_seed), so it is T2;
+             # it fires through the broker's effect, never a bearer-token write
+             fire=_unbuilt_fire("spore_retarget fires through the broker (a target wakes an agent: signed)"),
+             legacy_kind="spore_retarget", device_ok=True,
+             applies_to=lambda r: _SPORE_ROW(r) and str(_facet(r, "disposition") or "") in ("seed", "agenda")),
     VerbSpec("spore_set_disposition", "move", "moves the item to another list (Tray, loops)", "row",
              fields=("disposition", "surface_at"), floor="T2", tier_fn=_const("T2"),
              fire=_spore_fire("spore_set_disposition"), legacy_kind="spore_set_disposition", device_ok=True,

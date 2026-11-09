@@ -2146,10 +2146,13 @@
         host.appendChild(od);
       }
       if (!s.wake_line && s.next && !s.fires) host.appendChild(tagEl("muted", "due " + shortDate(s.next)));
+      // who does it, derived from the target; the cockpit never stores it
+      const exec = executorOf(rowTarget(s));
+      if (exec && s.disposition === "agenda") { const w = tagEl("muted list-who", exec); w.dataset.who = exec; w.title = "who does it, from its target"; host.appendChild(w); }
       if (s.surface === "talk" && Number.isInteger(s.age_days) && s.age_days >= 0) host.appendChild(tagEl("muted", s.age_days + " d old"));
       if (s.deliver_to && s.surface === "drop" && !s.wake_line) host.appendChild(tagEl("muted", "to " + s.deliver_to));
       if (s.age_shown && s.age) host.appendChild(el("span", "muted", s.age));
-      if (verbs && s.id) appendRowVerbs(row, buildSporeVerbs(s, panelKind), panelKind === "tray" ? ["Resolve", "Snooze"] : null, panelKind === "tray" ? 2 : 0);
+      if (verbs && s.id) appendRowVerbs(row, buildSporeVerbs(s, panelKind), panelKind === "tray" ? ["Resolve", "when?"] : null, panelKind === "tray" ? 2 : 0);
       return row;
     }
     if (s.next) {
@@ -2171,7 +2174,7 @@
     // the integer the kernel sends (the spore's own created date), never the badge words parsed back
     if (Number.isInteger(s.age_days) && s.age_days >= 0) host.appendChild(el("span", "k7-opend", "open " + s.age_days + " d"));
     if (s.domain && !originDrawn) { const rc = el("span", "k7-repo", String(s.domain)); rc.dataset.repoFacet = String(s.domain); host.appendChild(rc); }
-    if (verbs && s.id) appendRowVerbs(row, buildSporeVerbs(s, panelKind), panelKind === "tray" ? ["Resolve", "Snooze"] : null, panelKind === "tray" ? 2 : 0);
+    if (verbs && s.id) appendRowVerbs(row, buildSporeVerbs(s, panelKind), panelKind === "tray" ? ["Resolve", "when?"] : null, panelKind === "tray" ? 2 : 0);
     return row;
   }
 
@@ -3325,7 +3328,7 @@
   // is kept only when the kernel offered that verb on the row, and is disabled, with the gesture as its
   // title, when the gesture is one a browser cannot perform. A legacy row lists none and is untouched.
   const BUTTON_VERB = { touch: "spore_touch", edit: "spore_update", park: "spore_update",
-    reactivate: "spore_update", schedule: "spore_surface_at", Snooze: "spore_surface_at", Resolve: "spore_descend", metabolize: "spore_set_disposition",
+    reactivate: "spore_update", "when?": "spore_surface_at", who: "spore_retarget", Resolve: "spore_descend", metabolize: "spore_set_disposition",
     dismiss: "spore_descend", compost: "spore_descend", promote: "spore_ascend",
     tombstone: "episode_tombstone" };
 
@@ -3405,7 +3408,9 @@
         b.disabled = false;
         verbErr(wrap, res);
       }));
-      wrap.appendChild(verbBtn("Snooze", "resurface on a future date", () => openSurfaceForm(wrap, s)));
+      wrap.appendChild(verbBtn("when?", "when it comes back, and who does it", () => openSurfaceForm(wrap, s)));
+      // an agenda holds a target, so it has a who to change (a seed is given one through when?)
+      if (rowTarget(s)) wrap.appendChild(verbBtn("who", "who does it: you or the machine", () => openWhoForm(wrap, s)));
       if (Array.isArray(s.descend_kinds) && s.descend_kinds.length) {
         wrap.appendChild(verbBtn("Resolve", "resolve or compost this inbox item", () =>
           openResolveForm(wrap, "spore_descend", "dismiss", s, s.descend_kinds, false)));
@@ -3422,7 +3427,7 @@
       verbErr(wrap, res);
     }));
     wrap.appendChild(editBtn(wrap, s));
-    wrap.appendChild(verbBtn("schedule", "resurface on a future date", () => openSurfaceForm(wrap, s)));
+    wrap.appendChild(verbBtn("when?", "when it comes back, and who does it", () => openSurfaceForm(wrap, s)));
     // park — pin dormant: hide from active cognition but the loop stays OPEN (exempt from the
     // dormancy→compost prompt), resurfaceable, and shown HERE with a parked marker (the Keep panel is gone).
     // A parked row offers the inverse, "reactivate" (un-park, back to warm). A tier change
@@ -3461,23 +3466,111 @@
     return gateByActions(wrap, s.actions);
   }
 
-  // The schedule form: a date input + confirm -> spore_surface_at (clear = explicit empty).
+  // WHO acts when an agenda wakes is derived from its target and never stored: a band row or a nudge rings in the band (you),
+  // the desk and a board item are the machine's. Editing it sets `target` (spore_retarget), through the same words.
+  // the row's germinate target as the page holds it (the cockpit view names it deliver_to)
+  const rowTarget = (s) => (typeof s.deliver_to === "string" && s.deliver_to ? s.deliver_to : "");
+  function executorOf(target) {
+    if (target === "band" || target === "nudge") return "you";
+    if (target === "desk" || (typeof target === "string" && /^board:\S+$/.test(target))) return "the machine";
+    return "";
+  }
+  // a board target names a plain repo (the store's other reader takes nothing else)
+  const REPO_NAME = /^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$/;
+
+  // The who control: "you" / "the machine" (with "desk" or a repo name), preselected from the row's own target; a seed has none.
+  // value() is the target the control now names, null when nothing is chosen, or false when the machine's repo is not a name.
+  function whoControl(s) {
+    const cur = executorOf(rowTarget(s));
+    const box = el("span", "who-ctl");
+    const bYou = el("button", "verb-cancel who-opt", "you");
+    const bMachine = el("button", "verb-cancel who-opt", "the machine");
+    bYou.type = "button"; bMachine.type = "button";
+    bYou.dataset.who = "you"; bMachine.dataset.who = "the machine";
+    const repo = el("input", "verb-ref who-repo");
+    repo.type = "text"; repo.setAttribute("aria-label", "which: the desk, or a repo's board");
+    repo.placeholder = "desk, or a repo";
+    repo.value = typeof rowTarget(s) === "string" && rowTarget(s).startsWith("board:") ? rowTarget(s).slice(6) : (cur === "the machine" ? "desk" : "");
+    let chosen = cur;
+    const paint = () => {
+      for (const b of [bYou, bMachine]) b.setAttribute("aria-pressed", b.dataset.who === chosen ? "true" : "false");
+      repo.hidden = chosen !== "the machine";
+      if (chosen === "the machine" && !repo.value) repo.value = "desk";
+    };
+    bYou.addEventListener("click", () => { chosen = chosen === "you" ? "" : "you"; paint(); });
+    bMachine.addEventListener("click", () => { chosen = chosen === "the machine" ? "" : "the machine"; paint(); });
+    paint();
+    box.append(el("span", "muted who-label", "who does it"), bYou, bMachine, repo);
+    return {
+      node: box,
+      value: () => {
+        if (chosen === "you") return rowTarget(s) === "nudge" ? "nudge" : "band";   // a nudge is still the operator's, keep its ping
+        if (chosen !== "the machine") return null;
+        const r = repo.value.trim();
+        if (r === "desk") return "desk";
+        return REPO_NAME.test(r) ? "board:" + r : false;
+      },
+    };
+  }
+
+  // The local minute a picker writes: "YYYY-MM-DDTHH:MM", the browser's own clock and zone, no zone in the value.
+  const pad2 = (n) => String(n).padStart(2, "0");
+  const dayOf = (d) => d.getFullYear() + "-" + pad2(d.getMonth() + 1) + "-" + pad2(d.getDate());
+  const minuteOf = (d) => dayOf(d) + "T" + pad2(d.getHours()) + ":" + pad2(d.getMinutes());
+  // the quick picks, from a clock: later today (+3 h), tonight 20:00 (offered only while it is still ahead), tomorrow 09:00, next Monday 09:00
+  function whenPicks(now) {
+    const day = (n) => new Date(now.getFullYear(), now.getMonth(), now.getDate() + n);
+    const at = (d, h) => minuteOf(new Date(d.getFullYear(), d.getMonth(), d.getDate(), h, 0));
+    const picks = [{ key: "later", label: "Later today", value: minuteOf(new Date(now.getTime() + 3 * 3600000)) }];
+    if (now.getHours() < 20) picks.push({ key: "tonight", label: "Tonight 20:00", value: at(day(0), 20) });
+    picks.push({ key: "tomorrow", label: "Tomorrow 09:00", value: at(day(1), 9) });
+    picks.push({ key: "monday", label: "Next Mon 09:00", value: at(day(((8 - now.getDay()) % 7) || 7), 9) });
+    picks.push({ key: "now", label: "Now", value: minuteOf(now) });
+    return picks;
+  }
+
+  // The "when?" form on a spore row: quick picks (one tap writes), a date and a time input (two inputs, never datetime-local: a
+  // date-only pick stays one tap, and the phone's date and time wheels each open on their own), the who control, then
+  // schedule / clear / cancel. It writes `YYYY-MM-DDTHH:MM` through spore_surface_at; when the who control names a target the
+  // row does not hold, the same write goes through spore_retarget (a seed given a who becomes a dated agenda in that write).
   // Mirrors openResolveForm's hide-triggers / one-form-at-a-time / Escape-cancel shape.
   function openSurfaceForm(host, s) {
     if (host.querySelector(".verb-form")) return;
     const stale = host.querySelector(".edit-msg"); if (stale) stale.remove();
     const triggers = Array.prototype.slice.call(host.querySelectorAll(".verb-btn"));
     triggers.forEach((b) => (b.style.display = "none"));
-    const form = el("span", "verb-form");
+    const form = el("span", "verb-form when-form");
+    const picksBox = el("span", "when-picks");
+    // the who control only where the cockpit offers spore_retarget (a seed or an agenda): a loop is nobody's to hand off
+    const canWho = !Array.isArray(s.actions) || s.actions.some((x) => x && x.verb === "spore_retarget");
+    const who = canWho ? whoControl(s) : { node: null, value: () => null };
     const input = el("input", "verb-date");
     input.type = "date";
-    if (s.next) input.value = s.next;  // prefill an existing alarm
+    input.setAttribute("aria-label", "day");
+    const timeIn = el("input", "verb-time");
+    timeIn.type = "time"; timeIn.step = 60; timeIn.value = "09:00";
+    timeIn.setAttribute("aria-label", "time");
+    const m = /^(\d{4}-\d{2}-\d{2})(?:T(\d{2}:\d{2}))?$/.exec(String(s.fires || s.next || ""));
+    if (m) { input.value = m[1]; if (m[2]) timeIn.value = m[2]; }   // prefill an existing alarm
     const go = el("button", "verb-confirm", "schedule");
-    const clearBtn = el("button", "verb-cancel", "clear");
+    const clearBtn = el("button", "verb-cancel", "someday");
     const cancel = el("button", "verb-cancel", "cancel");
     go.type = "button"; clearBtn.type = "button"; cancel.type = "button";
+    clearBtn.title = "no day: leave it undated";
     const msg = el("span", "edit-msg", "");
-    form.append(input, go, clearBtn, cancel, msg);
+    const all = [go, clearBtn, cancel];
+    const picks = whenPicks(new Date()).map((p) => {
+      const b = el("button", "verb-cancel when-pick", p.label);
+      b.type = "button"; b.dataset.pick = p.key; b.dataset.value = p.value;
+      b.addEventListener("click", () => submit(p.value));
+      all.push(b);
+      return b;
+    });
+    picksBox.append(...picks);
+    // an agenda (it holds a target) is undated never: flow refuses one, so "someday" is for a seed with no who chosen
+    const agenda = rowTarget(s) !== "";
+    if (agenda) clearBtn.hidden = true;
+    form.append(picksBox, input, timeIn, ...(who.node ? [who.node] : []), go, clearBtn, cancel, msg);
     host.appendChild(form);
     input.focus();
     const close = () => { form.remove(); triggers.forEach((b) => (b.style.display = "")); };
@@ -3488,18 +3581,58 @@
       if (!go.disabled) close();
     });
     const submit = async (value) => {
-      go.disabled = true; clearBtn.disabled = true; cancel.disabled = true;
+      const t = who.value();
+      if (t === false) { msg.className = "edit-msg err"; msg.textContent = "the machine's repo is a plain name (letters, digits, . _ -), or desk"; return; }
+      const retarget = t !== null && t !== rowTarget(s);
+      if (retarget && value === "") { msg.className = "edit-msg err"; msg.textContent = "a task for you or the machine needs a day"; return; }
+      for (const b of all) b.disabled = true;
       msg.className = "edit-msg busy"; msg.textContent = "…";
-      const res = await commit({ kind: "spore_surface_at", spore_id: s.id, surface_at: value });
+      const res = await commit(retarget
+        ? { kind: "spore_retarget", spore_id: s.id, target: t, surface_at: value }
+        : { kind: "spore_surface_at", spore_id: s.id, surface_at: value });
       if (res && res.ok) return;  // re-rendered
       showFail(msg, res, "failed");
-      go.disabled = false; clearBtn.disabled = false; cancel.disabled = false;
+      for (const b of all) b.disabled = false;
     };
     go.addEventListener("click", () => {
-      if (!input.value) { msg.className = "edit-msg err"; msg.textContent = "pick a date (or clear)"; return; }
-      submit(input.value);
+      if (!input.value) { msg.className = "edit-msg err"; msg.textContent = "pick a day (or someday)"; return; }
+      submit(timeIn.value ? input.value + "T" + timeIn.value : input.value);
     });
     clearBtn.addEventListener("click", () => submit(""));  // explicit clear: key present, value ""
+  }
+
+  // The who form: a row that already holds a target changes hands without touching its day (spore_retarget{target}).
+  function openWhoForm(host, s) {
+    if (host.querySelector(".verb-form")) return;
+    const stale = host.querySelector(".edit-msg"); if (stale) stale.remove();
+    const triggers = Array.prototype.slice.call(host.querySelectorAll(".verb-btn"));
+    triggers.forEach((b) => (b.style.display = "none"));
+    const form = el("span", "verb-form who-form");
+    const who = whoControl(s);
+    const go = el("button", "verb-confirm", "set");
+    const cancel = el("button", "verb-cancel", "cancel");
+    go.type = "button"; cancel.type = "button";
+    const msg = el("span", "edit-msg", "");
+    form.append(who.node, go, cancel, msg);
+    host.appendChild(form);
+    const close = () => { form.remove(); triggers.forEach((b) => (b.style.display = "")); };
+    cancel.addEventListener("click", close);
+    form.addEventListener("keydown", (ev) => {
+      if (ev.key !== "Escape") return;
+      ev.preventDefault(); ev.stopPropagation();
+      if (!go.disabled) close();
+    });
+    go.addEventListener("click", async () => {
+      const t = who.value();
+      if (t === false) { msg.className = "edit-msg err"; msg.textContent = "the machine's repo is a plain name (letters, digits, . _ -), or desk"; return; }
+      if (t === null || t === rowTarget(s)) { msg.className = "edit-msg err"; msg.textContent = "pick who does it"; return; }
+      go.disabled = true; cancel.disabled = true;
+      msg.className = "edit-msg busy"; msg.textContent = "…";
+      const res = await commit({ kind: "spore_retarget", spore_id: s.id, target: t });
+      if (res && res.ok) return;  // re-rendered
+      showFail(msg, res, "failed");
+      go.disabled = false; cancel.disabled = false;
+    });
   }
 
   // Shared inline-form scaffold for the per-row verbs: hide the

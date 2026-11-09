@@ -396,7 +396,7 @@ SPORE_AUTHORITY_FIELDS = ("text", "domain", "disposition")
 # anneal fills these at write; none sits in a spore effect's ``changes``
 SPORE_STORE_ASSIGNED = ("id", "seen", "created", "origin_key", "notes", "resolution.on", "resolution.at")
 # the fields an update-shaped spore effect may change (anneal's update args, ``add_note`` excluded)
-SPORE_UPDATE_FIELDS = ("type", "tier", "next", "text", "salience", "domain", "pointer", "disposition")
+SPORE_UPDATE_FIELDS = ("type", "tier", "next", "text", "salience", "domain", "pointer", "disposition", "target")
 
 
 def create_origin_key(pending_id: str, idx: int) -> str:
@@ -787,6 +787,34 @@ def _ce_update(params: Mapping[str, Any], pre: Mapping[str, Any] | None, *, orig
     return _existing_effect(pre, {f: _norm_update_field(f, params[f], pre) for f in params}, version_of)
 
 
+def _ce_retarget(params: Mapping[str, Any], pre: Mapping[str, Any] | None, *, origin_key: str | None,
+                 version_of: Callable[..., str]) -> Effect:
+    """The List's "who does it": set an agenda's germinate ``target``. A seed given a target becomes an agenda in the same
+    write, which needs a date (``surface_at``, or the one the row already holds). Only a value flow's germinate also accepts
+    is written (the two halves read one store)."""
+    from levain.spores import check_steering, valid_next, valid_retarget
+
+    pre = _require_open(pre)
+    stray = sorted(set(params) - {"target", "surface_at"})
+    if stray or "target" not in params:
+        raise ValueError(f"spore_retarget sets target, and may carry surface_at (got {sorted(params)})")
+    target = params["target"]
+    if not valid_retarget(target):
+        raise ValueError(f"target must be band, nudge, desk or board:<repo> (got {target!r})")
+    disposition = str(pre.get("disposition") or "").strip().casefold()
+    if disposition not in ("seed", "agenda"):
+        raise ValueError("a target steers a seed or an agenda; this spore is neither")
+    changes: dict[str, Any] = {"target": target, "disposition": "agenda"}
+    if params.get("surface_at") not in (None, ""):
+        changes["next"] = _norm_date(params["surface_at"])
+    elif not valid_next(pre.get("next")):
+        raise ValueError("an agenda needs a date: give surface_at with the target")
+    why = check_steering("agenda", target, pre.get("attention"))
+    if why is not None:
+        raise ValueError(why)
+    return _existing_effect(pre, changes, version_of)
+
+
 def _ce_set_disposition(params: Mapping[str, Any], pre: Mapping[str, Any] | None, *,
                         origin_key: str | None, version_of: Callable[..., str]) -> Effect:
     pre = _require_open(pre)
@@ -861,6 +889,7 @@ SPORE_CANONICAL: dict[str, Callable[..., Effect]] = {
     "spore_update": _ce_update,
     "spore_set_disposition": _ce_set_disposition,
     "spore_surface_at": _ce_surface_at,
+    "spore_retarget": _ce_retarget,
     "spore_descend": _ce_resolve("descend"),
     "spore_ascend": _ce_resolve("ascend"),
     "spore_undo_edit": _ce_undo_edit,

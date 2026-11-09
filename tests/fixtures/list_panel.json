@@ -249,6 +249,17 @@
       "row_version": "b7648526792a336c"
      },
      "tier": "T2",
+     "verb": "spore_retarget"
+    },
+    {
+     "escalates": [],
+     "gesture": "direct-reported",
+     "target": {
+      "panel_id": "tray",
+      "row_id": "spore:spore-006",
+      "row_version": "b7648526792a336c"
+     },
+     "tier": "T2",
      "verb": "spore_set_disposition"
     },
     {
@@ -385,6 +396,17 @@
      },
      "tier": "C1",
      "verb": "spore_update"
+    },
+    {
+     "escalates": [],
+     "gesture": "direct-reported",
+     "target": {
+      "panel_id": "tray",
+      "row_id": "spore:spore-007",
+      "row_version": "90ddc166f6974118"
+     },
+     "tier": "T2",
+     "verb": "spore_retarget"
     },
     {
      "escalates": [],
@@ -542,6 +564,17 @@
       "row_version": "7fe61390483a5b6e"
      },
      "tier": "T2",
+     "verb": "spore_retarget"
+    },
+    {
+     "escalates": [],
+     "gesture": "direct-reported",
+     "target": {
+      "panel_id": "tray",
+      "row_id": "spore:spore-004",
+      "row_version": "7fe61390483a5b6e"
+     },
+     "tier": "T2",
      "verb": "spore_set_disposition"
     },
     {
@@ -675,6 +708,17 @@
      },
      "tier": "C1",
      "verb": "spore_update"
+    },
+    {
+     "escalates": [],
+     "gesture": "direct-reported",
+     "target": {
+      "panel_id": "tray",
+      "row_id": "spore:spore-005",
+      "row_version": "a762c4c419bf5373"
+     },
+     "tier": "T2",
+     "verb": "spore_retarget"
     },
     {
      "escalates": [],
@@ -872,6 +916,17 @@
       "row_version": "c6f6e97c6b9eb12f"
      },
      "tier": "T2",
+     "verb": "spore_retarget"
+    },
+    {
+     "escalates": [],
+     "gesture": "direct-reported",
+     "target": {
+      "panel_id": "tray",
+      "row_id": "spore:spore-002",
+      "row_version": "c6f6e97c6b9eb12f"
+     },
+     "tier": "T2",
      "verb": "spore_set_disposition"
     },
     {
@@ -1010,6 +1065,17 @@
       "row_version": "cc24659a4558cd3a"
      },
      "tier": "T2",
+     "verb": "spore_retarget"
+    },
+    {
+     "escalates": [],
+     "gesture": "direct-reported",
+     "target": {
+      "panel_id": "tray",
+      "row_id": "spore:spore-003",
+      "row_version": "cc24659a4558cd3a"
+     },
+     "tier": "T2",
      "verb": "spore_set_disposition"
     },
     {
@@ -1138,6 +1204,17 @@
      },
      "tier": "C1",
      "verb": "spore_update"
+    },
+    {
+     "escalates": [],
+     "gesture": "direct-reported",
+     "target": {
+      "panel_id": "tray",
+      "row_id": "spore:spore-001",
+      "row_version": "692ea443c43e0f8c"
+     },
+     "tier": "T2",
+     "verb": "spore_retarget"
     },
     {
      "escalates": [],

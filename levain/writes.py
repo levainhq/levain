@@ -736,6 +736,10 @@ def apply_edit(scope: WriteScope, req: dict[str, Any], *, now: str | None = None
             return _apply_spore_surface_at(scope, req, now, guard)
         if kind == "spore_update":
             return _apply_spore_update(scope, req, now, guard)
+        if kind == "spore_retarget":
+            # a target wakes an agent with the spore's words: it is signed through the cockpit broker's effect, as a
+            # capture that carries one is (``_apply_spore_seed``); this write never takes it on a bearer token
+            raise EditError("bad_verb_arg", 422, "a target is set from the cockpit's List, where it is signed")
         if kind == "episode_tombstone":
             return _apply_episode_tombstone(scope, req, now)
         if kind == "undo":
@@ -1593,7 +1597,7 @@ _VERB_KINDS = frozenset(
         "spore_touch", "spore_descend", "spore_ascend", "episode_tombstone",
         # Slice 3b — the operator-I/O write kinds (capture + disposition + schedule +
         # the forming-workbench metadata edit: text / reclassify-type / re-tier):
-        "spore_seed", "spore_set_disposition", "spore_surface_at", "spore_update",
+        "spore_seed", "spore_set_disposition", "spore_surface_at", "spore_update", "spore_retarget",
     }
 )
 

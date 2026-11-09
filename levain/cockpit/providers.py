@@ -60,7 +60,7 @@ EPISODE_LIMIT = 50
 HANDOFF_FRESH_DAYS = 7
 
 # the verbs a spore panel offers (design §4.2); anneal still refuses a verb the spore's type forbids
-SPORE_ROW_VERBS = ("spore_touch", "spore_descend", "spore_surface_at", "spore_update",
+SPORE_ROW_VERBS = ("spore_touch", "spore_descend", "spore_surface_at", "spore_update", "spore_retarget",
                    "spore_set_disposition", "spore_ascend")
 SPORE_STORED = ("id", "text", "disposition", "tier", "type", "domain", "next", "pointer", "salience", "seen",
                 "origin_key", "target", "attention")
@@ -763,7 +763,7 @@ def _tomb_gate(store: Any, origin_key: str, effect_id: Any, episode_id: str) -> 
 
 # what a broker fire reads as in Recent edits: a past-tense phrase per verb, then the thing it touched, then where it came from
 _EDIT_PHRASES = {
-    "spore_touch": "marked seen", "spore_descend": "resolved", "spore_surface_at": "rescheduled", "spore_update": "edited",
+    "spore_touch": "marked seen", "spore_descend": "resolved", "spore_surface_at": "rescheduled", "spore_retarget": "retargeted", "spore_update": "edited",
     "list_intake": "added a line", "spore_set_disposition": "moved", "spore_ascend": "promoted", "spore_seed": "added", "episode_tombstone": "deleted episode",
     "operator_state": "set the state line", "section_edit": "edited", "config": "edited", "entity_name": "renamed the entity",
     "undo": "undid an edit", "pending_cancel": "cancelled a pending change", "token_rotate": "rotated the surface token"}

@@ -783,9 +783,20 @@
     font: var(--fw-regular) var(--fs-meta)/var(--lh-list) var(--sans); color: var(--ink); background: var(--base);
     border: 1px solid var(--line-hot); border-radius: var(--r-sm); padding: var(--sp-2) var(--sp-3); outline: none;
   }
-  .verb-date:focus {
+  .verb-date:focus, .verb-time:focus {
     border-color: var(--label);
   }
+  .verb-time {
+    font: var(--fw-regular) var(--fs-meta)/var(--lh-list) var(--sans); color: var(--ink); background: var(--base);
+    border: 1px solid var(--line-hot); border-radius: var(--r-sm); padding: var(--sp-2) var(--sp-3); outline: none;
+  }
+  /* the "when?" form: quick picks on their own line, then the day and time, who does it, and the confirm row */
+  .when-form, .who-form { flex-direction: row; max-width: 100%; }
+  .when-picks { display: flex; flex-wrap: wrap; gap: var(--sp-2); flex: 1 1 100%; }
+  .who-ctl { display: inline-flex; flex-wrap: wrap; align-items: center; gap: var(--sp-2); }
+  .who-opt[aria-pressed="true"] { color: var(--ink); border-color: var(--label); background: var(--card-2); }
+  .who-repo { min-width: 0; width: 10rem; }
+  .who-repo[hidden] { display: none; }
 
   /* ── RESPONSIVE — the deck fits the hand ───────────────────────────────────
      The chassis was built mobile-first: the grid already reflows 1→2→3 columns
@@ -808,6 +819,8 @@
      max-width:1320px/auto-margin, so on a phone it's full-width minus this pad);
      the Unit name scales down once more. */
   @media (max-width: 760px) {
+    .when-pick, .who-opt, .verb-date, .verb-time, .who-repo { min-height: 44px; box-sizing: border-box; }
+    .verb-date, .verb-time, .who-repo { font-size: 16px; }
     body { padding: var(--sp-4) var(--sp-4) var(--sp-8); }
     .entity { font-size: var(--fs-lead); }
   }
@@ -834,6 +847,8 @@
     .undo-btn { padding: var(--sp-3) var(--sp-4); font-size: var(--fs-micro); }
     .edit-btn, .name-edit, .state-edit { padding: var(--sp-3) var(--sp-4); font-size: var(--fs-micro); }
     .verb-confirm, .verb-cancel { padding: var(--sp-3) var(--sp-4); }
+    .when-pick, .who-opt, .verb-date, .verb-time, .who-repo { min-height: 44px; box-sizing: border-box; }
+    .verb-date, .verb-time, .who-repo { font-size: 16px; }
     .scope-tb { padding: var(--sp-3) var(--sp-4); font-size: var(--fs-micro); }
     .scope-ch { padding: var(--sp-3) var(--sp-3); font-size: var(--fs-micro); }
     .tab { padding: var(--sp-4) var(--sp-5); }
