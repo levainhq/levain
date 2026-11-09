@@ -7,7 +7,8 @@ live lease token), never raw SQL, so the fence and the journal hold.
 Field mapping (the worker-attach design, section 5):
 
 * ``title``: the row's bold span, cut at its first sentence, at most 120 characters.
-* ``done_line``: the text after the row's ``DONE:`` marker, cut at its first sentence, at most 1000 characters.
+* ``done_line``: the text after the row's ``DONE:`` marker, cut at its first sentence, at most 1000 characters. A
+  ``DONE:`` inside a bracketed note is not the marker (row 156 L3 C6).
 * ``tier``: the first ``(tier: <name>`` after the title, when it names a known tier.
 * ``hold``: a prose hold. A row whose title or lead (the text before its first bracketed note) says ``HELD``
   (uppercase: the board's hold mark; a lowercase "held" is ordinary prose) or ``on hold`` (any case), as whole words, gets the sentence that says it. The item stays in its category; the reader derives "held" from the
@@ -115,6 +116,20 @@ def _lead(rest: str) -> str:
     return rest if at < 0 else rest[:at]
 
 
+def _outside_notes(rest: str) -> str:
+    """``rest`` with every closed bracketed note blanked to the same length (a nested one inside its outer note), so a
+    marker inside a note is never found and a position found still indexes ``rest``. A ``[`` that is never closed
+    blanks nothing: a stray bracket must not swallow the rest of the row."""
+    out, opens = list(rest), []
+    for i, ch in enumerate(rest):
+        if ch == "[":
+            opens.append(i)
+        elif ch == "]" and opens:
+            start = opens.pop()
+            out[start:i + 1] = " " * (i + 1 - start)
+    return "".join(out)
+
+
 def _hold(title: str, lead: str) -> str | None:
     for text in (title, lead):
         hit = _HOLD.search(_mask(text))
@@ -150,7 +165,7 @@ def parse_rows(text: str, *, id_for: Callable[[int], str] = default_id) -> tuple
         raw_title, rest = m.group(2), m.group(3)
         title = _sentence(raw_title, TITLE_MAX)
         lead = _lead(rest)
-        mark = _DONE_MARK.search(rest)
+        mark = _DONE_MARK.search(_outside_notes(rest))
         done = _sentence(rest[mark.end():], DONE_MAX) if mark else None
         tier = _TIER.search(rest)
         ids = list(dict.fromkeys(_BAND.findall(lead)))
@@ -193,7 +208,12 @@ def import_status(store: CoordStore, token: int, path: str | Path, *, who: str =
     docstring). A row the store refuses goes into ``unparsed`` by its number and the import goes on, so the result is
     always returned once the file is read."""
     data = Path(path).read_bytes()
-    rows, unparsed = parse_rows(data.decode("utf-8"), id_for=id_for)
+    try:
+        text = data.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        raise CoordError(f"{path} is not UTF-8 text ({exc.reason} at byte {exc.start}); nothing was "
+                         "imported") from None
+    rows, unparsed = parse_rows(text, id_for=id_for)
     out = ImportResult(unparsed=unparsed)
     stored = _stored(store, repo)
     for row in rows:

@@ -287,10 +287,12 @@ def test_c4_a_seen_session_still_cannot_be_deleted_while_recent(clocked):
 def test_c6_a_done_marker_inside_a_bracketed_note_is_not_the_done_line():
     text = ("## LANE MENU\n\n"
             "1. **One** (tier: sonnet) a lead [history: DONE: the wrong line.] DONE: the right line.\n"
-            "2. **Two** (tier: sonnet) a lead [history: DONE: only in a note.]\n")
+            "2. **Two** (tier: sonnet) a lead [history: DONE: only in a note.]\n"
+            # the real board's shape: DONE after the notes; a stray [ never closed swallows nothing
+            "3. **Three** (tier: sonnet) a [stray bracket, then [a note [nested]: DONE: no.] DONE: kept.\n")
     rows, unparsed = status_import.parse_rows(text)
     assert unparsed == []
-    assert [r.done_line for r in rows] == ["the right line.", None]
+    assert [r.done_line for r in rows] == ["the right line.", None, "kept."]
 
 
 # ------------------------------------------------------------------------------------------------ C3
