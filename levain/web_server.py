@@ -779,9 +779,16 @@ class DispatchSheet:
         over = over if isinstance(over, int) and over > 0 else 0
         if card is not None and card.get("onto"):
             cfg = [str(x) for x in (card.get("agent_config") or [])]
+            cfg_over = card.get("agent_config_overflow")
+            cfg_over = cfg_over if isinstance(cfg_over, int) and cfg_over > 0 else 0
+            if card.get("agent_config_problem"):
+                lines += ["", "AGENT SETTINGS CHECK UNAVAILABLE: read the changes below for agent-settings files "
+                              "before you authorise."]
             if cfg:
-                lines += ["", f"AGENT SETTINGS CHANGED ({len(cfg)}): these paths set how an agent session behaves in "
-                              "this checkout; read them before you authorise.", *[f"  {x}" for x in cfg]]
+                lines += ["", f"AGENT SETTINGS CHANGED ({len(cfg) + cfg_over}): these paths set how an agent session "
+                              "behaves in this checkout; read them before you authorise.", *[f"  {x}" for x in cfg]]
+                if cfg_over:
+                    lines.append(f"  (and {cfg_over} more)")
             lines += ["", f"Authorise run {card.get('run')} onto {card.get('onto')} · tier {card.get('tier')} · "
                           f"{card.get('files')} file(s), {card.get('changed_lines')} changed line(s)"
                           + (f" · staged {card.get('staged')} on {card.get('base')}" if card.get("staged") else ""),

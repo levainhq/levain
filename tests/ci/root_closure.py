@@ -335,6 +335,10 @@ LAZY_SITES = {
     'levain/dispatch/adopt.py::_human_refusal::from levain.consent.queue import AuthoritySource': 'operator',
     # operator: ``land`` is the operator's (``levain dispatch land``)
     'levain/dispatch/adopt.py::_human_refusal::from levain.dispatch.jobs import _replay': 'operator',
+    # operator: ``agent_config_paths`` <- ``dispatch/cli.py`` (the authorise view) and ``dispatch/phone.py`` (the card); the follower never calls it
+    'levain/dispatch/adopt.py::agent_config_paths::from levain.slot.render import REPO_DISCOVERY': 'operator',
+    # operator: same callers as the row above
+    'levain/dispatch/adopt.py::agent_config_paths::from levain.slot.supervisor import _fold': 'operator',
     # operator: ``authorise_refusal`` <- ``land`` (``dispatch/cli.py``) and ``JobStore.authorise``, neither run by the follower
     'levain/dispatch/adopt.py::authorise_refusal::from levain.consent.passkey import answer_signature_problem': 'operator',
     # operator: ``floor`` <- ``land`` <- ``dispatch/cli.py`` (``levain dispatch land``)

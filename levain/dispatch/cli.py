@@ -424,7 +424,10 @@ def _change_view(store: JobStore, job: Job, run: int) -> tuple[list[str], list[s
     if tier is None:
         raise DispatchError("the landing tier could not be read; nothing was signed")
     lines: list[str] = []
-    agent_cfg = dadopt.agent_config_paths(changes.paths)
+    agent_cfg, cfg_problem = dadopt.agent_config_check(changes.paths)
+    if cfg_problem is not None:
+        lines.append(f"  AGENT SETTINGS CHECK UNAVAILABLE ({cfg_problem}): read the paths below for agent-settings "
+                     "files before you authorise")
     if agent_cfg:
         lines.append(f"  AGENT SETTINGS CHANGED ({len(agent_cfg)}): these paths set how a Claude Code or Codex "
                      "session behaves in this checkout (hooks, permissions, instructions, tool servers); read them "

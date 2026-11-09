@@ -1048,6 +1048,19 @@ def test_authorise_names_a_changed_agent_settings_path_before_the_diff(capsys, l
     assert "A  .claude/settings.json" in out          # the ordinary diff still lists it
 
 
+def test_authorise_degrades_to_a_visible_line_when_the_agent_settings_check_fails(capsys, lw, monkeypatch):
+    from levain.dispatch import adopt
+
+    def boom(paths):
+        raise ImportError("no module named levain.slot.render")
+
+    monkeypatch.setattr(adopt, "agent_config_paths", boom)
+    job, _cap = lw.verified({"src/b.py": b"b = 3\n", ".claude/settings.json": b"{}\n"})
+    code, out, err = run(capsys, *_authorise_argv(lw, job.id, "--yes", run_="1"))
+    assert "AGENT SETTINGS CHECK UNAVAILABLE (ImportError: no module named levain.slot.render)" in out, (out, err)
+    assert "the change the floor judges" in out and "A  .claude/settings.json" in out, out
+
+
 def test_authorise_without_an_agent_settings_change_shows_no_such_item(capsys, lw):
     job, _cap = lw.verified({"src/b.py": b"b = 3\nc = 3\n"})
     code, out, _ = run(capsys, *_authorise_argv(lw, job.id, "--yes", run_="1"))
@@ -1058,7 +1071,18 @@ def test_agent_config_paths_follow_the_homes_the_slot_reads():
     from levain.dispatch.adopt import agent_config_paths
 
     got = agent_config_paths(["src/a.py", ".Claude/hooks/x.sh", ".claude/settings.json", "CLAUDE.md", ".mcp.json",
-                              ".codex/config.toml", "docs/CLAUDE.md", "AGENTS.md", ".agents/s.md"])
+                              ".codex/config.toml", "AGENTS.md", ".agents/s.md"])
     assert got == [".Claude/hooks/x.sh", ".agents/s.md", ".claude/settings.json", ".codex/config.toml",
                    ".mcp.json", "AGENTS.md", "CLAUDE.md"]
     assert agent_config_paths(["src/a.py", "README.md"]) == []
+
+
+def test_agent_config_paths_reach_the_nested_files_the_agents_load_from_a_subdirectory():
+    """Claude Code loads a subdirectory CLAUDE.md / CLAUDE.local.md and nested .claude rules once it works there; Codex
+    reads AGENTS.override.md / AGENTS.md in each directory down to where it runs. The root-only names stay root-only."""
+    from levain.dispatch.adopt import agent_config_paths
+
+    nested = ["docs/CLAUDE.md", "a/b/CLAUDE.local.md", "svc/AGENTS.md", "svc/x/Agents.Override.md",
+              "pkg/.claude/rules/r.md", "pkg/.Claude/skills/s/SKILL.md"]
+    assert agent_config_paths(nested + ["src/a.py", "docs/claude.txt", "pkg/.mcp.json", "pkg/.codex/c.toml",
+                                        "pkg/.agents/s.md"]) == sorted(nested)
