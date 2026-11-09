@@ -471,13 +471,29 @@ def test_main_with_no_setting_file_serves_both_sockets(tmp_path, monkeypatch):
     assert sorted(rig.served) == sorted([("passthrough", "run.sock"), ("brokered", DR.BROKERED_SOCKET_NAME)])
 
 
+_REAL_FSTAT = os.fstat
+
+
+def _fstat_owned_by_root(fd):
+    """The real fstat with the owner read as root. It is patched on the os module, so every reader in the process sees
+    it (a file read sizes its buffer from st_size): only st_uid is replaced, every other field is the real one."""
+    real = _REAL_FSTAT(fd)
+
+    class _Root:
+        st_uid = 0
+
+        def __getattr__(self, name):
+            return getattr(real, name)
+
+    return _Root()
+
+
 def test_main_with_the_opt_out_setting_serves_the_passthrough_socket_alone(tmp_path, monkeypatch):
     rig = _MainRig(tmp_path, monkeypatch, "passthrough", real_read=True)
     p = tmp_path / "dispatch_auth"
     p.write_bytes(DR.DISPATCH_AUTH_OFF)
     p.chmod(0o644)
-    monkeypatch.setattr(DR.os, "fstat", lambda fd, _f=os.fstat: type("S", (), {
-        "st_mode": _f(fd).st_mode, "st_uid": 0})())     # the file is root's for this read
+    monkeypatch.setattr(DR.os, "fstat", _fstat_owned_by_root)     # the file is root's for this read
     assert rig.run(p) == 0
     assert rig.events == ["build:False", "bind:run.sock"] and rig.served == [("passthrough", "run.sock")]
 
@@ -487,8 +503,7 @@ def test_main_with_a_malformed_setting_serves_passthrough_alone_and_says_why(tmp
     p = tmp_path / "dispatch_auth"
     p.write_bytes(b"on\n")
     p.chmod(0o644)
-    monkeypatch.setattr(DR.os, "fstat", lambda fd, _f=os.fstat: type("S", (), {
-        "st_mode": _f(fd).st_mode, "st_uid": 0})())
+    monkeypatch.setattr(DR.os, "fstat", _fstat_owned_by_root)
     assert rig.run(p) == 0
     assert rig.events == ["build:False", "bind:run.sock"]
     assert "brokered launcher off: the setting's content is neither" in capsys.readouterr().err
