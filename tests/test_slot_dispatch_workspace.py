@@ -867,3 +867,63 @@ def test_the_real_helper_runtime_stages_the_bundle_before_render_and_ends_the_se
     with pytest.raises(WS.WorkspaceRefused):
         rt2.start(dataclasses.replace(base, workspace=ws))
     assert not (h2.staging / "repo.bundle").exists() and "teardown" in h2.verbs() and "render" not in h2.verbs()
+
+
+DENY_SETTINGS = {"hooks": {"PreToolUse": [{"matcher": "Bash", "hooks": [{"type": "command", "command": "repo-deny"}]}]},
+                 "permissions": {"deny": ["Bash(rm *)"]}}
+
+
+def _verified(tmp_path, uploads, key, parts):
+    owner = WS.UploadOwner()
+    b = C.ws_begin_to_wire(key, parts.manifest_bytes, parts.bundle)
+    uploads.begin(key, owner, {"manifest": b["manifest_size"], "bundle": b["bundle_size"]},
+                  {"manifest": b["manifest_sha256"], "bundle": b["bundle_sha256"]})
+    for part, data in (("manifest", parts.manifest_bytes), ("bundle", parts.bundle)):
+        for off in range(0, len(data), C.WS_CHUNK_BYTES):
+            uploads.chunk(key, owner, part, off, data[off:off + C.WS_CHUNK_BYTES])
+    return uploads.verify(key, owner, parts.workspace(), signed_withhold=())
+
+
+def test_a_dispatch_snapshots_repo_settings_reach_the_render_blob_frozen(tmp_path):
+    """r161f2 (C1): the snapshot's own ``.claude/settings.json`` (a deny hook, a deny rule) reaches the render blob
+    as the frozen layer, as a checkout's does on the interactive path."""
+    import json
+    from levain.slot import dispatch_runtime as DR
+    from levain.slot import render as rd
+    from tests.test_slot_dispatch_runtime import FakeLease, Helper, req
+    parts = make_parts(tmp_path, {".claude/settings.json": json.dumps(DENY_SETTINGS), "src/a.py": "a\n"})
+    store = tmp_path / "store"
+    h = Helper(tmp_path, store)
+    uploads = WS.WorkspaceUploads(tmp_path / "scratch")
+    rt = DR.HelperSlotRuntime(host="darwin", helper=h.prefix, store=store, routes=("pypi", "pass-1"),
+                              client_factory=lambda _p: FakeLease(), kill_grace_s=0.5, workspace=uploads.stage,
+                              repo_settings=uploads.repo_settings)
+    base = req()
+    ws = _verified(tmp_path, uploads, base.session_key, parts)
+    handle = rt.start(dataclasses.replace(base, workspace=ws))
+    handle.child.abort()
+    (render,) = [c for c in h.calls() if c["argv"][0] == "render"]
+    blob = json.loads(render["stdin"])
+    assert blob["repo_settings"] == rd.freeze_repo_settings({".claude/settings.json": DENY_SETTINGS}).settings
+    assert blob["repo_settings"]["permissions"]["deny"] == ["Bash(rm *)"]
+    # a launch with no workspace, and a snapshot with no settings, carry no repo layer
+    assert uploads.repo_settings(base) is None
+    parts2 = make_parts(tmp_path)
+    key2 = "s-00000000000000e1"
+    ws2 = _verified(tmp_path, uploads, key2, parts2)
+    assert uploads.repo_settings(dataclasses.replace(base, session_key=key2, workspace=ws2)) is None
+
+
+def test_an_unverified_workspace_has_no_repo_settings_to_give(w, tmp_path):
+    parts = make_parts(tmp_path)
+    req = L.SlotStart("t", "r-0123456789abcdef", "s-00000000000000e2", "claude", "sonnet", "b", "sha256:" + "0" * 64,
+                      L.HOOKS, parts.workspace(manifest_digest=parts.manifest.digest()))
+    with pytest.raises(WS.WorkspaceRefused) as exc:
+        w.uploads.repo_settings(req)
+    assert exc.value.cause == "not-verified"
+
+
+def test_the_production_runtime_takes_its_repo_settings_from_the_uploads():
+    text = Path(D.__file__).read_text()
+    build = text[text.index("def build_server("):]
+    assert "workspace=uploads.stage" in build and "repo_settings=uploads.repo_settings" in build

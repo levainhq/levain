@@ -20,7 +20,9 @@ the server does with them. Two phases, one per side of the mint:
    (fsck on, rlimits, no hooks) and checks ``HEAD`` and ``refs/heads/readset`` are ``E``, no other ref, in-pack objects == ``N``, none
    loose, and the repo-layer settings check (:func:`levain.slot.render.repo_loosening_refusals` through
    ``supervisor.check_repo_layer``, the very function the interactive path binds): a snapshot whose
-   ``.claude/settings*.json`` loosens the sandbox is REFUSED, never stripped.
+   ``.claude/settings*.json`` loosens the sandbox is REFUSED, never stripped. The same step returns the snapshot's
+   settings layers frozen (``readset._layer_check``), and :meth:`WorkspaceUploads.repo_settings` hands them to the
+   runtime, whose render blob carries them as ``repo_settings``.
 2. **Stage, after the slot is prepared** (:meth:`WorkspaceUploads.stage`, the callable ``HelperSlotRuntime`` is given as
    ``workspace=``): the verified bytes go to ``staging/repo.bundle`` (``O_EXCL|O_NOFOLLOW``, 0600, ``full_fsync``, the
    prefix read back), and the file is removed again on any failure after it was created. The slot's own stage step
@@ -205,6 +207,7 @@ class _Verified:
     manifest_digest: str
     commit: str
     objects: int
+    repo_settings: dict = dataclasses.field(default_factory=dict)
 
 
 class _Upload:
@@ -364,14 +367,15 @@ class WorkspaceUploads:
         if version not in (2, 3) or count != objects:
             raise WorkspaceRefused("object-count", f"the pack holds {count} objects, the manifest derives {objects}")
         digest = manifest.digest()
-        self._clone_check(up.key, bundle, commit, objects, digest)
-        up.verified = _Verified(digest, commit, objects)
+        settings = self._clone_check(up.key, bundle, commit, objects, digest)
+        up.verified = _Verified(digest, commit, objects, settings)
         return digest
 
-    def _clone_check(self, key: str, bundle: bytes, commit: str, objects: int, digest: str) -> None:
+    def _clone_check(self, key: str, bundle: bytes, commit: str, objects: int, digest: str) -> dict:
         """The ingest, in a scratch clone: the bundle written to a private file, then the read set's own checks on it
         (:func:`readset._verify_in`: header compare, pack count, bounded fsck'd clone, refs, object count, the repo-layer
-        settings check), then the clone and the file removed. Whatever it raises is a refusal.
+        settings check), then the clone and the file removed. Returns the snapshot's frozen settings layers (the
+        verify's ``repo_settings``). Whatever it raises is a refusal.
 
         This does not go through ``readset.verify_derived``/``verify_readset``: those refuse where ``shutil.rmtree``
         takes no ``dir_fd`` (before 3.11), and this runs in the dispatch run server, a service under ROOT_PYTHON (3.9 on
@@ -389,7 +393,8 @@ class WorkspaceUploads:
             st = os.lstat(name, dir_fd=pfd)
             made = (st.st_dev, st.st_ino)
             cap, deadline_s = RS._limits()
-            RS._verify_in(pfd, digest, fd, parent, name, key, commit, objects, cap, deadline_s)
+            return dict(RS._verify_in(pfd, digest, fd, parent, name, key, commit, objects, cap,
+                                      deadline_s).repo_settings or {})
         finally:
             if made is not None:
                 _remove_workdir(pfd, parent, name, made)
@@ -424,6 +429,21 @@ class WorkspaceUploads:
             _log.warning("the workspace scratch sweep raised %s", type(exc).__name__)
 
     # -- phase 2: stage (after prepare) ----------------------------------------------------------------------------
+
+    def repo_settings(self, req: SlotStart) -> Optional[dict]:
+        """The ``HelperSlotRuntime(repo_settings=...)`` callable: the frozen settings layers of the snapshot this
+        server verified for ``req`` (a copy), or None for a request with no workspace or a snapshot with no settings.
+        The request's member must carry the digest the verify derived for THIS key, as :meth:`stage` requires; it
+        reads the upload and leaves it in the table for :meth:`stage`."""
+        ws = req.workspace
+        if ws is None:
+            return None
+        with self._mu:
+            up = self._ups.get(req.session_key)
+        if up is None or up.verified is None or ws.manifest_digest != up.verified.manifest_digest:
+            raise WorkspaceRefused("not-verified", "the launch's workspace was not verified by this server")
+        import copy
+        return copy.deepcopy(up.verified.repo_settings) or None
 
     def stage(self, req: SlotStart, staging: Path) -> None:
         """The ``HelperSlotRuntime(workspace=...)`` callable: write the verified bundle to ``staging/repo.bundle``. A
