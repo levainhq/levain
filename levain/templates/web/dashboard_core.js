@@ -9307,6 +9307,14 @@
       if (ta.closest(".text-editor")) continue;
       if (ta.value.trim() !== "") return true;
     }
+    // Any text field the person is IN counts, empty or not, tracked above or not: a rebuild removes the focused node, and
+    // the next keystroke goes nowhere. The deferred read flushes when focus leaves (the boot layer's focusout).
+    const a = document.activeElement;
+    if (a && a !== document.body) {
+      const tag = a.tagName;
+      if (tag === "TEXTAREA" || tag === "SELECT" || a.isContentEditable) return true;
+      if (tag === "INPUT" && !/^(button|submit|reset|checkbox|radio|file|image|range|color)$/i.test(a.type || "")) return true;
+    }
     return false;
   }
 

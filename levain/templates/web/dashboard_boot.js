@@ -439,6 +439,8 @@
   // timeout runs the check after that handler)
   document.addEventListener("click", function () { setTimeout(flushIfIdle, 0); }, true);
   document.addEventListener("keydown", function (ev) { if (ev.key === "Escape") setTimeout(flushIfIdle, 0); }, true);
+  // leaving a field lifts the focus block on a deferred read (the timeout lets focus settle on its next target first)
+  document.addEventListener("focusout", function () { setTimeout(flushIfIdle, 0); }, true);
   function flushIfIdle() { if (deferredReload && !inflight && !editInProgress()) flushDeferred(); }
 
   // An involuntary re-read rebuilds the whole board (+ modal) via replaceChildren and
