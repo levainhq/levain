@@ -59,7 +59,7 @@ def schema_fields(doc: Mapping[str, Any], name: str) -> Set[str]:
             if key not in seen and key in schemas:
                 seen.add(key)
                 walk(schemas[key])
-            return
+            # no return: OpenAPI 3.1 lets a `$ref` carry sibling `properties` / `allOf`
         props = node.get("properties")
         if isinstance(props, dict):
             out.update(props)

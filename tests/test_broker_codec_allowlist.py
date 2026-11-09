@@ -184,7 +184,7 @@ def test_client_run_tools_are_admitted_on_dispatch(c, tools):
     (AM, {"type": "code_execution_20250522", "name": "code_execution"}, "body-unbounded:code_execution"),
     (OR, {"type": "web_search_preview"}, "body-unbounded:web_search_preview"),
     (OR, {"type": "mcp", "server_label": "s"}, "body-unbounded:mcp"),
-    (OC, {"type": "openrouter:web_search"}, "body-unbounded:openrouter:web_search"),
+    (OC, {"type": "openrouter:web_search"}, "body-unbounded:openrouter_web_search"),
 ], ids=["am-ws", "am-ce", "or-wsp", "or-mcp", "oc-or"])
 def test_a_known_server_tool_keeps_the_unbounded_name(c, tool, name):
     got = _check(c, _body(c, tools=[tool]), dispatch=True)
@@ -254,3 +254,63 @@ def test_a_real_claude_code_body_passes_a_dispatch_route(monkeypatch):
     assert not (out["frames"][-1][0] == b"F" and "body-un" in json.loads(out["frames"][-1][1]).get("refused", "")), \
         out["frames"]
     assert [x for x in out["lines"] if x["kind"] == "reserved"]
+
+
+# --- F6: every refusal name a codec emits parses on the wire --------------------------------------------------------
+
+def _emitters(c):
+    """One body per thing the `body-unbounded` check can name, so each emitted name is tried."""
+    bodies = []
+    for f in c.unbounded_fields:
+        bodies.append(_body(c, **{f: {"x": 1} if f != "plugins" else [{"id": "web"}]}))
+    for t in tuple(c.server_tools) + ("openrouter:web_search", "openrouter:web-fetch", "openrouter:" + "x" * 80):
+        bodies.append(_body(c, tools=[{"type": t + "_20250101"}]))
+    for b in c.unbounded_blocks:
+        bodies.append(_body(c, **{"messages" if c is not OR else "input": [{"role": "user", "content": [{"type": b}]}]}))
+    if c is AM:
+        bodies.append(_body(c, context_management={"edits": [{"type": "compact_20260101"}]}))
+    return bodies
+
+
+@pytest.mark.parametrize("c", [AM, OC, OR], ids=lambda c: c.name)
+def test_every_body_unbounded_name_a_codec_emits_has_a_status(c):
+    seen = 0
+    for body in _emitters(c):
+        got = _check(c, body, dispatch=True)
+        assert isinstance(got, str) and got.startswith("body-unbounded:"), (body, got)
+        assert norm.is_name(got), got
+        assert norm.status_of(got) == 403
+        seen += 1
+    assert seen >= 4
+
+
+def test_the_openrouter_namespace_tool_is_named_with_an_underscore():
+    assert _check(OC, _body(OC, tools=[{"type": "openrouter:web_search"}]), dispatch=True) == \
+        "body-unbounded:openrouter_web_search"
+
+
+def test_the_unbounded_refusal_detail_tells_the_operator_to_turn_the_tool_off():
+    with pytest.raises(norm.Refused) as e:
+        OR.check(dict(_body(OR, tools=[{"type": "web_search"}]), model="m1"), PRICES, dispatch=True)
+    assert "turn it off in the client" in e.value.detail
+
+
+# --- F1/F5: the openai SDK's own wire shape, and the provenance sidecar -------------------------------------------
+
+@pytest.mark.parametrize("name,c", [("openai_sdk_chat_stream_tools.json", OC), ("openai_sdk_chat_openrouter_path.json", OC),
+                                    ("openai_sdk_responses_stream_tools.json", OR)])
+def test_an_openai_sdk_body_is_admitted_on_dispatch(name, c):
+    # the SDK's wire shape, not an agent client: no agent client for the Chat API is installed on this machine
+    obj = _fixture(name)
+    assert set(obj) <= set(c.dispatch_fields), set(obj) - set(c.dispatch_fields)
+    got = _check(c, obj, dispatch=True)
+    assert not isinstance(got, str), got
+    assert got.unproven == ()
+
+
+def test_every_client_body_fixture_has_a_provenance_entry():
+    prov = _fixture("PROVENANCE.json")
+    names = {n for n in os.listdir(FIX) if n.endswith(".json") and n != "PROVENANCE.json"}
+    assert names == {k for k in prov if not k.startswith("_")}
+    for k in names:
+        assert {"client", "version", "captured", "how"} <= set(prov[k]), k

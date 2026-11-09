@@ -3039,8 +3039,9 @@ class Keys:
                        ) -> Tuple[bytes, "h11.Connection", object, norm.Template, bytes,
                                   Tuple[codec.Codec, Price, Dict[str, str], str, bool], ledger.Hold]:
         """R4 §1.7 steps 4-5, ONE synchronous call (no `await` anywhere in it): the body codec's parse of the buffered
-        body, its `check` (the model has a price entry; on a dispatch-shaped route, one with no per-session cap, the
-        unboundable shapes are `body-unbounded:<what>`), the ceiling written in where absent and, beside it, a streamed
+        body, its `check` (the model has a price entry; on a dispatch-shaped route, one with no per-session cap, a field
+        or tool type the codec has not judged is `body-unlisted:<name>` and the unboundable shapes are
+        `body-unbounded:<what>`), the ceiling written in where absent and, beside it, a streamed
         request's usage asked for where the codec's provider sends it only when asked, the estimate, keys' own
         serialization (the bytes that go upstream; past `body_cap` it is `body-cap`, and `buf` is made to cover its
         length), the request head (`content-length` = that serialization's length, whatever framing the `Q`

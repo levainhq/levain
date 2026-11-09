@@ -73,6 +73,14 @@ def _wire_what(name: str, fallback: str) -> str:
     return name if norm.what_ok(name) else fallback
 
 
+def _unbounded_what(name: str) -> str:
+    """The `:<what>` suffix of a `body-unbounded` refusal. A found name can be a tool type with a namespace colon
+    (`openrouter:web_search`) or a hyphen, which the wire grammar (`norm.what_ok`) refuses, leaving the gateway's
+    record with no status; any character outside it becomes `_`."""
+    what = re.sub(r"[^a-z0-9_]", "_", name.lower())[:48]
+    return what if norm.what_ok(what) else "shape"
+
+
 def _refuse_json(detail: str) -> norm.Refused:
     return norm.Refused("body-json", detail)
 
@@ -228,7 +236,9 @@ class Codec:
             self._refuse_unlisted(obj)
         found = self._unbounded(obj, price)
         if found and dispatch:
-            raise norm.Refused(f"body-unbounded:{found[0]}", "content the estimate cannot see")
+            raise norm.Refused("body-unbounded:" + _unbounded_what(found[0]),
+                               "content the estimate cannot see (a server-side tool or option: turn it off in the "
+                               "client, e.g. Codex's `web_search`; a dispatch route admits none)")
         return Checked(model, price, found)
 
     def _refuse_unlisted(self, obj: Mapping[str, Any]) -> None:
@@ -959,8 +969,7 @@ class OpenAIResponses(_OpenAI):
     ceiling_fields = ("max_output_tokens",)
     # [judged by lane r150, 2026-11-09, from `CreateResponse` (github.com/openai/openai-openapi, openapi.yaml),
     # OpenRouter's `ResponsesRequest` (openrouter.ai/openapi.json), and the body a real Codex (`codex exec`) sent a
-    # local listener (`tests/fixtures/client_bodies/codex_*`); `client_metadata` is Codex's own label object, in
-    # neither schema]
+    # local listener (`tests/fixtures/client_bodies/codex_*`); `client_metadata` is in neither schema]
     dispatch_fields = (
         "model", "input", "instructions", "stream", "stream_options", "tools", "max_output_tokens",
         # value-checked (`unbounded_fields`)
@@ -971,7 +980,10 @@ class OpenAIResponses(_OpenAI):
         "reasoning", "include", "tool_choice", "parallel_tool_calls", "truncation", "service_tier",
         # labels and cache hints
         "store", "metadata", "user", "safety_identifier", "prompt_cache_key", "prompt_cache_retention",
-        "cache_control", "client_metadata",
+        "cache_control",
+        # `client_metadata` is outside OpenAI's CreateResponse schema: a client-side field seen in the Codex capture,
+        # a label object bounded by the body cap
+        "client_metadata",
         # OpenRouter routing identity and observability, `models` / `route` checked by `check` before this list
         "models", "route", "provider", "session_id", "trace",
     )

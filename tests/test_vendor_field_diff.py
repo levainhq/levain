@@ -114,3 +114,14 @@ def test_main_exits_one_and_names_an_untriaged_field(tmp_path, capsys):
     (tmp_path / "openrouter.json").write_text(json.dumps(orr))
     assert vfd.main(["--snapshots", str(tmp_path)]) == 1
     assert "openrouter-chat (vs openai-chat): zz_new" in capsys.readouterr().out
+
+
+def test_properties_and_allof_beside_a_ref_are_walked_too():
+    # OpenAPI 3.1 lets a `$ref` carry sibling keywords; a walk that returned at the `$ref` lost them
+    doc = {"components": {"schemas": {
+        "Base": {"properties": {"a": {}}},
+        "Other": {"properties": {"c": {}}},
+        "Req": {"$ref": "#/components/schemas/Base", "properties": {"b": {}},
+                "allOf": [{"$ref": "#/components/schemas/Other"}, {"properties": {"d": {}}}]},
+    }}}
+    assert vfd.schema_fields(doc, "Req") == {"a", "b", "c", "d"}
