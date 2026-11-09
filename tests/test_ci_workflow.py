@@ -210,14 +210,14 @@ def test_a_cancelled_workflow_runs_no_suite_job():
 
 def test_the_simulation_detects_a_job_that_would_inherit_the_skip():
     # A control: the same propagation must flag a job whose `if` has no status function, or the tests above prove nothing.
-    saved = JOBS["plan"]["if"]
-    try:
-        JOBS["plan"]["if"] = "${{ always() && needs.gate.result == 'success' }}"
-        assert simulate("push", "refs/heads/seat/x")["test"] == "skipped"
-        JOBS["plan"]["if"] = "${{ needs.gate.result != 'cancelled' }}"
-        assert simulate("push", "refs/heads/seat/x")["plan"] == "skipped"
-    finally:
-        JOBS["plan"]["if"] = saved
+    # `test` and `plan` both need the gate directly, so the control drops the status function from each in turn.
+    for job in ("test", "plan"):
+        saved = JOBS[job]["if"]
+        try:
+            JOBS[job]["if"] = "${{ needs.gate.result != 'cancelled' }}"
+            assert simulate("push", "refs/heads/seat/x")[job] == "skipped", job
+        finally:
+            JOBS[job]["if"] = saved
 
 
 def _fixture_jobs(name):
@@ -257,3 +257,59 @@ def test_no_run_line_expands_a_branch_name_or_an_api_string():
             run = step.get("run", "")
             for bad in ("github.ref_name", "github.head_ref", "github.event.", "needs.gate.outputs", "steps.lookup.outputs"):
                 assert bad not in run, (name, bad)
+
+
+# ---- CI speed (levain 78 ciB): static shard list, one Python off the landing refs, the check names ----------------
+
+def test_the_pytest_matrix_no_longer_waits_on_the_plan_job():
+    assert JOBS["test"]["needs"] == "gate"
+    assert JOBS["plan"]["name"] == "plan test shards"
+    assert not any("plan" in _needs(n) for n in JOBS)
+
+
+def test_the_static_shard_list_equals_the_planners_list():
+    import importlib.util
+    spec = importlib.util.spec_from_file_location("ci_shard_wf", Path(__file__).resolve().parent / "ci" / "shard.py")
+    shard = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(shard)
+    text = (Path(__file__).resolve().parent.parent / ".github" / "workflows" / "test.yml").read_text()
+    shard.check_static(text)
+    assert JOBS["test"]["strategy"]["matrix"]["shard"] == list(range(int(WF["env"]["TEST_SHARDS"])))
+
+
+def test_the_pytest_check_names_the_land_gate_reads_are_unchanged():
+    assert JOBS["test"]["name"] == "pytest (Python ${{ matrix.python-version }}, shard ${{ matrix.shard }})"
+
+
+def _python_list(ref):
+    """What the `test` matrix's python-version expression yields for a ref: the expression is
+    fromJSON(startsWith(github.ref, 'refs/heads/seat/') && '[one]' || '[both]')."""
+    import json
+    expr = JOBS["test"]["strategy"]["matrix"]["python-version"]
+    m = re.fullmatch(r"\$\{\{ fromJSON\(startsWith\(github\.ref, 'refs/heads/seat/'\) && '(\[.*?\])' \|\| '(\[.*?\])'\) \}\}", expr)
+    assert m, expr
+    return json.loads(m.group(1) if ref.startswith("refs/heads/seat/") else m.group(2))
+
+
+@pytest.mark.parametrize("ref,want", [
+    ("refs/heads/seat/1108-47-ciB", ["3.12"]),
+    ("refs/heads/main", ["3.12", "3.13"]),
+    ("refs/heads/land/x", ["3.12", "3.13"]),
+    ("refs/tags/v1.0", ["3.12", "3.13"]),
+    ("refs/pull/1/merge", ["3.12", "3.13"]),
+])
+def test_only_a_seat_ref_runs_one_python(ref, want):
+    assert _python_list(ref) == want
+
+
+def test_the_3_13_pytest_jobs_deselect_the_static_guard_marker_and_3_12_does_not():
+    run = next(st["run"] for st in JOBS["test"]["steps"] if "Run pytest shard" in st.get("name", ""))
+    assert 'if [ "${{ matrix.python-version }}" != "3.12" ]; then marker=(-m "not static_guard"); fi' in run
+    assert run.count('"${marker[@]}"') == 2  # the collection and the run use the same selection
+    assert "--durations=25" in run
+
+
+@pytest.mark.parametrize("job", ["browser", "root-py39"])
+def test_the_browser_and_root_run_jobs_print_durations(job):
+    runs = " ".join(st.get("run", "") for st in JOBS[job]["steps"])
+    assert "--durations=25" in runs
