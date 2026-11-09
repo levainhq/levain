@@ -197,11 +197,14 @@ class Ledger:
             os.fsync(f.fileno())
 
     def lines(self) -> list[dict]:
-        """Every record.  A torn LAST line (the writer died mid-line) is skipped with a warning; any other line that
-        does not parse fails closed, because a ledger with a hole in the middle is not a ledger."""
+        """Every record.  A torn LAST line (the writer died mid-line, so the file does not end in a newline) is skipped
+        with a warning; any other line that does not parse fails closed, a newline-terminated last line included: the
+        writer finished that line, so it is not torn, and a ledger with a bad record is not a ledger."""
         if not self.path.exists():
             return []
-        rows = [(i, ln) for i, ln in enumerate(self.path.read_text(encoding="utf-8").splitlines(), 1) if ln.strip()]
+        text = self.path.read_text(encoding="utf-8")
+        torn_tail = bool(text) and not text.endswith("\n")
+        rows = [(i, ln) for i, ln in enumerate(text.split("\n"), 1) if ln.strip()]
         out = []
         for k, (i, ln) in enumerate(rows):
             try:
@@ -209,7 +212,7 @@ class Ledger:
                 if not isinstance(rec, dict) or "type" not in rec:
                     raise ValueError("not a ledger record")
             except ValueError as e:
-                if k == len(rows) - 1:
+                if k == len(rows) - 1 and torn_tail:
                     print(f"verify: ledger {self.path}: skipping a torn last line (line {i})", file=sys.stderr)
                     continue
                 raise RuntimeError(f"ledger {self.path} line {i} is unreadable ({e}): failing closed") from e
@@ -335,9 +338,17 @@ def reverdict_receipt(receipt: dict, ledger: Ledger) -> dict:
     return new
 
 
-def write_receipt(receipt: dict, receipts_dir: Path) -> Path:
+def receipt_name(sha: str, run_id: str) -> str:
+    """One file per run: a later run of the same sha never overwrites an earlier run's receipt."""
+    if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]*", str(run_id)):
+        raise ValueError(f"unsafe run id for a receipt file name: {run_id!r}")
+    return f"vr_{sha[:12]}_{run_id}.json"
+
+
+def write_receipt(receipt: dict, receipts_dir: Path, path: Path | None = None) -> Path:
+    """Write atomically to the run's own file, or to `path` (a reverdict rewrites the file it read)."""
     receipts_dir.mkdir(parents=True, exist_ok=True)
-    p = receipts_dir / f"vr_{receipt['sha'][:12]}.json"
+    p = path or receipts_dir / receipt_name(receipt["sha"], receipt["run_id"])
     tmp = p.with_suffix(".tmp")
     tmp.write_text(json.dumps(receipt, indent=2, sort_keys=True) + "\n", encoding="utf-8")
     os.replace(tmp, p)
@@ -755,7 +766,7 @@ def failure_signature(text: str) -> tuple[str, str]:
 
 
 def _baseline_result(b) -> tuple[str, tuple[str, str] | None]:
-    """A baseline answer is 'red'|'green'|'absent', or {'state': 'red', 'sig': (type, line)}."""
+    """A baseline answer is 'red'|'green'|'absent', {'state': 'red', 'sig': (type, line)}, or {'state': 'unusable', 'why': ...}."""
     if isinstance(b, dict):
         sig = b.get("sig")
         return b.get("state", "absent"), (tuple(sig) if sig else None)
@@ -765,9 +776,10 @@ def _baseline_result(b) -> tuple[str, tuple[str, str] | None]:
 def classify(reds: list[dict], *, ledger: Ledger | None, run_id: str, sha: str, touched: set[str],
              rerun, baseline) -> list[dict]:
     """Deterministic classification, exactly the design page.  `rerun(nodeid) -> bool` is one serial run (True = pass);
-    `baseline(nodeids) -> dict[nodeid -> 'red'|'green'|'absent' | {'state': 'red', 'sig': (type, first line)}]` runs
-    them on a fresh checkout of the pinned land base, serially.  A red inherits only when the base fails the same way
-    (same exception type and first message line); a different failure on the sha is a regression.
+    `baseline(nodeids) -> dict[nodeid -> 'red'|'green'|'absent' | {'state': 'red', 'sig': (type, first line)} |
+    {'state': 'unusable', 'why': ...}]` runs them on a fresh checkout of the pinned land base, serially.  A red inherits
+    only when the base fails the same way (same exception type and first message line); a different failure on the sha,
+    or a baseline run that exited abnormally or disagrees with its own junit, is a regression.
     `ledger=None` (a remote leg: the laptop is the only ledger writer) classifies and files nothing; the laptop then
     runs `apply_ledger_to_leg` over the copied-back leg."""
     out: list[dict] = []
@@ -802,8 +814,13 @@ def classify(reds: list[dict], *, ledger: Ledger | None, run_id: str, sha: str, 
     if pending:
         base = baseline([p["nodeid"] for p in pending])
         for rec in pending:
-            b, bsig = _baseline_result(base.get(rec["nodeid"], "absent"))
-            if b == "red":
+            raw = base.get(rec["nodeid"], "absent")
+            b, bsig = _baseline_result(raw)
+            if b == "unusable":
+                rec.update({"class": "regression",
+                            "evidence": rec["evidence"] + f"; the {MAIN_REF} baseline run is not usable ({raw.get('why')}), "
+                                                          f"so nothing is inherited from it"})
+            elif b == "red":
                 mine = failure_signature(rec["text"])
                 if bsig is None:
                     rec.update({"class": "regression",
@@ -997,14 +1014,25 @@ def run_job(ctx: Ctx, *, name: str, py: Path, cwd: Path, env: dict, targets: lis
             bp_py, benv, bflags = base_cfg(bsrc, bpy)
         else:
             bp_py, benv, bflags = bpy, {**env, "PATH": f"{bpy.parent}:{CLEAN_PATH}"}, rerun_flags
-        _run(pytest_cmd(bp_py, *nids, *bflags, f"--junitxml={bj}", f"--basetemp={ctx.run / ('pt-main-' + name)}"),
-             cwd=bsrc, env=benv, log=ctx.log, timeout=1800)
+        brc = _run(pytest_cmd(bp_py, *nids, *bflags, f"--junitxml={bj}", f"--basetemp={ctx.run / ('pt-main-' + name)}"),
+                   cwd=bsrc, env=benv, log=ctx.log, timeout=1800)
+        binfo.update(sha=ctx.base_sha, rc=brc)
         if not bj.exists():
             return {}
         bparsed = parse_junit(bj, bsrc)
         red = {r["nodeid"]: r for r in bparsed["reds"]}
         seen = {_nodeid(tc.get("classname", ""), tc.get("name", ""), bsrc) for tc in ET.parse(str(bj)).iter("testcase")}
-        binfo.update(sha=ctx.base_sha, junit_sha256=sha256_file(bj), junit=str(bj))
+        binfo.update(junit_sha256=sha256_file(bj), junit=str(bj))
+        braw = bparsed["counts"]["failed"] + bparsed["counts"]["error"]
+        if brc not in (0, 1):
+            unusable = f"pytest exit {brc}"
+        elif (brc == 0) != (braw == 0):
+            unusable = f"pytest exit {brc} but its junit holds {braw} failed or errored"
+        else:
+            unusable = None
+        if unusable:
+            # an abnormal run can still hold a matching failure; it proves nothing about main, so nothing inherits from it
+            return {n: {"state": "unusable", "why": unusable} for n in nids}
         return {n: ({"state": "red", "sig": list(failure_signature(red[n]["text"]))} if n in red
                     else "green" if n in seen else "absent") for n in nids}
 
@@ -1061,6 +1089,11 @@ def host_probe(cmd: list[str], env: dict | None = None, timeout: float = 60) -> 
     return r.returncode, (r.stdout or "") + (r.stderr or "")
 
 
+def runtime_dir(uid: int | None = None) -> str:
+    """The user runtime dir (the user bus lives there) for `uid`, this process's by default."""
+    return f"/run/user/{os.getuid() if uid is None else uid}"
+
+
 def preflight_linux(probe=host_probe, *, which=shutil.which, exists=os.path.exists, access=os.access,
                     uid: int | None = None, user: str | None = None) -> list[str]:
     """The host capabilities the CI linux-live job provisions before it runs the bwrap floor tests.  Returns what is
@@ -1084,7 +1117,7 @@ def preflight_linux(probe=host_probe, *, which=shutil.which, exists=os.path.exis
     if rc != 0 or "Linger=yes" not in out:
         missing.append(f"loginctl linger is not enabled for {user}")
     rc, _ = probe(["systemd-run", "--user", "--scope", "--quiet", "--collect", "/bin/true"],
-                  env={**os.environ, "XDG_RUNTIME_DIR": f"/run/user/{uid}"})
+                  env={**os.environ, "XDG_RUNTIME_DIR": runtime_dir(uid)})
     if rc != 0:
         missing.append("systemd-run --user --scope does not work (no user manager or bus for this account)")
     if exists("/run/podman") and not access("/run/podman", os.R_OK | os.X_OK):
@@ -1110,6 +1143,12 @@ def plan_mac(ctx: Ctx, python: str, workers: int, timeout: float) -> tuple[list[
     return [job], diag, venv_version(py, env)
 
 
+def linux_job_names(python: str = LINUX_PYTHON) -> list[str]:
+    """The jobs `plan_linux` runs, by name, in order."""
+    return [f"pytest-full-py{_minor(python)}", f"bwrap-floor-live-py{_minor(BWRAP_PYTHON)}",
+            f"root-closure-py{_minor(CLOSURE_PYTHON)}"]
+
+
 def plan_linux(ctx: Ctx, python: str, workers: int, timeout: float) -> tuple[list[dict], list[dict], str]:
     """Three jobs, as CI runs them: the full suite without the static-guard files, the live floor tests on 3.12 where a
     skip fails (after a host preflight), and the root-run import closure on the oldest interpreter."""
@@ -1123,15 +1162,14 @@ def plan_linux(ctx: Ctx, python: str, workers: int, timeout: float) -> tuple[lis
     if why:
         return [failed_job("ci-parity", why)], [], venv_version(py, env)
     env["PYTHONPATH"] = str(site)
-    m = _minor(python)
+    full_name, bw_name, name39 = linux_job_names(python)
     not_static = ("-m", "not static_guard")
     jobs, diag = [], []
-    j, d = run_job(ctx, name=f"pytest-full-py{m}", py=py, cwd=src, env=env, targets=["tests"], junit_name="junit-linux.xml",
+    j, d = run_job(ctx, name=full_name, py=py, cwd=src, env=env, targets=["tests"], junit_name="junit-linux.xml",
                    workers=workers, timeout=timeout, flags=not_static, rerun_flags=not_static)
     jobs.append(j)
     diag += d
 
-    bw_name = f"bwrap-floor-live-py{_minor(BWRAP_PYTHON)}"
     ctx.progress(f"{bw_name}: host preflight")
     missing = preflight_linux()
     if missing:
@@ -1142,16 +1180,16 @@ def plan_linux(ctx: Ctx, python: str, workers: int, timeout: float) -> tuple[lis
         except RuntimeError as e:
             jobs.append(failed_job(bw_name, f"environment: {e}"))
         else:
-            benv = {**ctx.env, "PATH": f"{bpy.parent}:{CLEAN_PATH}", "LEVAIN_REQUIRE_LINUX_LIVE": "1"}
+            # the user bus the preflight probed is the one the job and its baseline must reach
+            live = {"LEVAIN_REQUIRE_LINUX_LIVE": "1", "XDG_RUNTIME_DIR": runtime_dir()}
+            benv = {**ctx.env, "PATH": f"{bpy.parent}:{CLEAN_PATH}", **live}
             j, d = run_job(ctx, name=bw_name, py=bpy, cwd=bsrc, env=benv, targets=list(BWRAP_TARGETS),
                            junit_name="junit-linux-floor.xml", workers=None, timeout=timeout, required_run=True,
                            base_python=BWRAP_PYTHON,
-                           base_cfg=lambda s2, p2: (p2, {**ctx.env, "PATH": f"{p2.parent}:{CLEAN_PATH}",
-                                                         "LEVAIN_REQUIRE_LINUX_LIVE": "1"}, ()))
+                           base_cfg=lambda s2, p2: (p2, {**ctx.env, "PATH": f"{p2.parent}:{CLEAN_PATH}", **live}, ()))
             jobs.append(j)
             diag += d
 
-    name39 = f"root-closure-py{_minor(CLOSURE_PYTHON)}"
     ctx.progress(f"{name39}: building the venv")
     uenv = {**ctx.env, "UV_PYTHON_PREFERENCE": "managed",
             "UV_CACHE_DIR": os.environ.get("UV_CACHE_DIR") or str(Path.home() / ".cache" / "uv")}
@@ -1234,11 +1272,19 @@ def remote_stop_cmd(host: str, run_id: str, remove_dir: bool) -> list[str]:
 def rederive_leg(leg: dict, sha: str) -> list[str]:
     """What the laptop can redo from the junit files it copied back, against what the remote leg JSON claims: the leg's
     sha, every job's counts and skip reasons, and the set of red nodeids.  Any disagreement is a string; none = [].
-    The junit paths in `leg` must already point at the local copies."""
+    The junit paths in `leg` must already point at the local copies.  The job set must be exactly the linux plan's (each
+    job once), or the plan's lone early setup failure: a leg that drops or adds a job never re-derives clean."""
     errs: list[str] = []
     if leg.get("sha") != sha:
         errs.append(f"the leg JSON records sha {leg.get('sha')!r}, the sha under test is {sha}")
-    for job in leg.get("jobs", []):
+    if leg.get("platform") != "linux":
+        errs.append(f"the leg JSON records platform {leg.get('platform')!r}, the remote leg is linux")
+    jobs = leg.get("jobs") if isinstance(leg.get("jobs"), list) else []
+    names = sorted(str(j.get("name")) for j in jobs)
+    early_setup_failure = len(jobs) == 1 and jobs[0].get("name") == "ci-parity" and jobs[0].get("setup_failed")
+    if names != sorted(linux_job_names()) and not early_setup_failure:
+        errs.append(f"the leg JSON holds jobs {names}, the linux leg runs exactly {sorted(linux_job_names())}")
+    for job in jobs:
         jr = job.get("junit")
         if not jr:
             if not job.get("setup_failed"):
@@ -1427,31 +1473,41 @@ def _workers(a, leg: str) -> int:
     return a.workers or WORKERS_MAC
 
 
-def _run_legs(a, top: Path, sha: str, run: Path, run_id: str, ledger: Ledger, status: Status) -> list[dict]:
-    """mac on this host and linux over ssh, at once when --leg both.  A leg that fails aborts the whole run: no half receipt."""
+def _run_legs(a, top: Path, sha: str, run: Path, run_id: str, ledger: Ledger, status: Status,
+              remote: dict | None = None) -> list[dict]:
+    """mac on this host and linux over ssh, at once when --leg both.  A leg that fails aborts the whole run: no half receipt.
+    A kill or failure anywhere while the remote thread lives (the mac leg, or the wait for the remote leg) stops the
+    remote run.  `remote` (the caller's) records started / done / stopped, so a kill that escapes this function can
+    still stop a remote run nobody stopped."""
+    remote = {} if remote is None else remote
     out: dict = {}
     t = None
-    if a.leg in ("linux", "both"):
-        def go() -> None:
-            try:
-                out["linux"] = run_leg_remote(top, sha, run, run_id, ledger, status, host=a.host,
-                                              workers=_workers(a, "linux"))
-            except BaseException as e:  # noqa: BLE001 - handed to the main thread
-                out["linux_err"] = e
-        t = threading.Thread(target=go, daemon=True)
-        t.start()
     try:
+        if a.leg in ("linux", "both"):
+            def go() -> None:
+                try:
+                    out["linux"] = run_leg_remote(top, sha, run, run_id, ledger, status, host=a.host,
+                                                  workers=_workers(a, "linux"))
+                except BaseException as e:  # noqa: BLE001 - handed to the main thread
+                    out["linux_err"] = e
+            th = threading.Thread(target=go, daemon=True)
+            remote["started"] = True
+            th.start()
+            t = th          # only a started thread is ever joined below
         if a.leg in ("mac", "both"):
             out["mac"] = run_leg_local(top, sha, run, run_id, ledger, status, leg="mac", python=a.python or MAC_PYTHON,
                                        workers=_workers(a, "mac"), timeout=a.pytest_timeout)
+        if t:
+            t.join()
+            # the remote leg ended on its own: it cleaned up after success and stopped itself after a failure
+            remote["done"] = True
     except BaseException:
         terminate_children()
-        if t:
+        if t and not remote.get("done"):
             t.join(30)
             stop_remote_run(a.host, run_id)
+            remote["stopped"] = True
         raise
-    if t:
-        t.join()
     if "linux_err" in out:
         raise out["linux_err"]
     return [out[k] for k in ("mac", "linux") if k in out]
@@ -1515,6 +1571,7 @@ def cmd_run(a) -> int:
     prev = install_signal_handlers()
     tools = Tools()
     leg_here = a.here
+    remote: dict = {}
     ledger = None if leg_here else Ledger(Path(a.ledger) if a.ledger else state / "ledger.jsonl")
     status.update(run_id=run_id, sha=sha, leg=a.leg, state="running", pid=os.getpid(), started=now(),
                   workers=_workers(a, "linux" if a.leg == "linux" else "mac"), here=bool(leg_here), log=str(run / "runner.log"))
@@ -1536,7 +1593,7 @@ def cmd_run(a) -> int:
             print(f"verify: leg written to {out}")
             return 0
         status.update(base_sha=fetch_base(top))
-        legs = _run_legs(a, top, sha, run, run_id, ledger, status)
+        legs = _run_legs(a, top, sha, run, run_id, ledger, status, remote=remote)
         diag = [d for leg in legs for d in leg.pop("_diag", [])]
         receipt = assemble_receipt(top, sha, run_id, legs)
         if not a.no_diagnosis:
@@ -1558,6 +1615,8 @@ def cmd_run(a) -> int:
     except Killed as k:
         for s in (signal.SIGTERM, signal.SIGINT):
             signal.signal(s, signal.SIG_IGN)
+        if remote.get("started") and not (remote.get("done") or remote.get("stopped")):
+            stop_remote_run(a.host, run_id)
         reap_run(run, top, tools, keep_files=True)
         status.update(state="killed", signal=int(k.signum))
         print(f"verify: killed by signal {int(k.signum)}; worktrees, venvs and mounted images cleaned", file=sys.stderr)
@@ -1604,10 +1663,26 @@ def cmd_start(a) -> int:
     return 0
 
 
+def named_run(state: Path, run_id: str) -> Path | None:
+    """The run dir a command-line run id names, or None: the id must be the generated format and its dir must sit
+    directly under <state>/runs once links are resolved."""
+    if not RUN_ID_RE.fullmatch(str(run_id or "")):
+        return None
+    runs = Path(state) / "runs"
+    p = runs / run_id
+    try:
+        real = p.resolve(strict=True)
+    except (OSError, RuntimeError):
+        return None
+    if real.parent != runs.resolve() or real.name != run_id or not real.is_dir():
+        return None
+    return p
+
+
 def cmd_status(a) -> int:
     runs = Path(a.state_dir) / "runs"
     if a.run:
-        run = runs / a.run
+        run = named_run(Path(a.state_dir), a.run)
     else:
         dirs = sorted(d for d in runs.iterdir() if d.is_dir()) if runs.is_dir() else []
         run = dirs[-1] if dirs else None
@@ -1649,19 +1724,27 @@ def cmd_ledger(a) -> int:
 def cmd_reverdict(a) -> int:
     """Recompute a finished run's verdict after board rows were attached, and rewrite its receipt."""
     state = Path(a.state_dir)
-    st = read_status(state / "runs" / a.run)
+    run = named_run(state, a.run)
+    if run is None:
+        print(f"verify: {a.run!r} names no run directly under {state / 'runs'}", file=sys.stderr)
+        return 2
+    st = read_status(run)
     if not st.get("receipt"):
         print(f"verify: run {a.run} has no receipt to re-judge", file=sys.stderr)
         return 2
     rp = Path(st["receipt"])
     led = Ledger(Path(a.ledger) if a.ledger else state / "ledger.jsonl")
     try:
-        new = reverdict_receipt(json.loads(rp.read_text(encoding="utf-8")), led)
+        old = json.loads(rp.read_text(encoding="utf-8"))
+        if not isinstance(old, dict) or old.get("run_id") != a.run:
+            raise ValueError(f"the receipt {rp} is not run {a.run}'s (its run_id is "
+                             f"{old.get('run_id') if isinstance(old, dict) else None!r}); nothing was re-judged")
+        new = reverdict_receipt(old, led)
     except (OSError, ValueError) as e:
         print(f"verify: {e}", file=sys.stderr)
         return 2
-    write_receipt(new, rp.parent)
-    Status(state / "runs" / a.run).update(state={"green": "passed", "partial": "partial"}.get(new["verdict"], "red"),
+    write_receipt(new, rp.parent, path=rp)
+    Status(run).update(state={"green": "passed", "partial": "partial"}.get(new["verdict"], "red"),
                                           verdict=new["verdict"])
     print(f"verify: {new['verdict'].upper()}  receipt {rp}")
     for w in new["verdict_why"]:
