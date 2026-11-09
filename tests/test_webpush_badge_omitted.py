@@ -54,17 +54,35 @@ def test_omitted_badge_without_a_record_counts_natively(tmp_path: Path, caught: 
     assert caught["badge"] == 0
 
 
-def test_a_stale_or_broken_record_is_not_believed(tmp_path: Path, caught: dict[str, Any]) -> None:
+def test_a_stale_or_broken_host_record_is_unknown_not_native(tmp_path: Path, caught: dict[str, Any]) -> None:
     f = tmp_path / needs.COUNT_FILE
     f.write_text(json.dumps({"n": 7, "at": time.time() - needs.COUNT_FRESH_S - 30}))
     _send(tmp_path)
-    assert caught["badge"] == 0
+    assert caught["badge"] is None                    # a host install: the phone keeps its badge, never the native 0
     f.write_text("{not json")
     _send(tmp_path)
-    assert caught["badge"] == 0
+    assert caught["badge"] is None
     f.write_text(json.dumps({"n": True, "at": time.time()}))
     _send(tmp_path)
-    assert caught["badge"] == 0
+    assert caught["badge"] is None
+
+
+def test_a_null_host_count_carries_no_badge(tmp_path: Path, caught: dict[str, Any]) -> None:
+    (tmp_path / needs.COUNT_FILE).write_text(json.dumps({"n": None, "at": time.time(), "host": True}))
+    _send(tmp_path)
+    assert caught["badge"] is None
+
+
+def test_a_fresh_host_count_is_used(tmp_path: Path, caught: dict[str, Any]) -> None:
+    (tmp_path / needs.COUNT_FILE).write_text(json.dumps({"n": 5, "at": time.time(), "host": True}))
+    _send(tmp_path)
+    assert caught["badge"] == 5
+
+
+def test_an_unreadable_record_that_exists_is_host_unknown(tmp_path: Path, caught: dict[str, Any]) -> None:
+    (tmp_path / needs.COUNT_FILE).mkdir()             # exists, cannot be read as a file
+    _send(tmp_path)
+    assert caught["badge"] is None
 
 
 def test_a_native_count_never_writes_the_record(tmp_path: Path) -> None:
@@ -72,7 +90,7 @@ def test_a_native_count_never_writes_the_record(tmp_path: Path) -> None:
     assert not (tmp_path / needs.COUNT_FILE).exists()
 
 
-def test_an_unknown_host_count_withdraws_the_record(tmp_path: Path) -> None:
+def test_an_unknown_host_count_is_recorded_as_unknown(tmp_path: Path) -> None:
     host = _Host(_rows(tmp_path))
     needs.open_needs_count(tmp_path, host)
     assert (tmp_path / needs.COUNT_FILE).exists()
@@ -82,7 +100,9 @@ def test_an_unknown_host_count_withdraws_the_record(tmp_path: Path) -> None:
             raise OSError("gone")
 
     assert needs.open_needs_count(tmp_path, Broken()) is None
-    assert not (tmp_path / needs.COUNT_FILE).exists()
+    doc = json.loads((tmp_path / needs.COUNT_FILE).read_text())
+    assert doc["n"] is None and doc["host"] is True    # present, so the install stays a host install
+    assert needs.resolved_badge(tmp_path) is None
 
 
 @pytest.mark.parametrize("bad", [True, False, -1, "5", 1.5, [3]])

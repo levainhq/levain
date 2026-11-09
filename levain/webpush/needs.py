@@ -74,20 +74,18 @@ def open_needs_count(queue_dir: "Path | str", question_source: Any = None) -> "i
 
 
 def _record(queue_dir: "Path | str", n: "int | None") -> None:
-    """Keep the host's count where a process without its store can read it (:func:`recorded_count`); an unknown count removes
-    the record, so a stale number is never read as current. Never raises: a count that cannot be kept is the other side's native read."""
+    """Keep the host's count where a process without its store can read it (:func:`recorded_count`). An unknown count is kept too
+    (``n`` null): the file's presence is what marks a host install, so an old or unknown record means unknown, never the native
+    store's different number. Never raises: a count that cannot be kept leaves the other side to its own read."""
     path = Path(queue_dir) / COUNT_FILE
     tmp = None
     try:
-        if n is None:
-            path.unlink(missing_ok=True)
-            return
         if not path.parent.is_dir():
             return
         tmp = path.with_name(f".{path.name}.{secrets.token_hex(6)}.tmp")
         fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0), 0o600)
         with os.fdopen(fd, "w", encoding="utf-8") as fh:
-            fh.write(json.dumps({"n": n, "at": time.time()}) + "\n")
+            fh.write(json.dumps({"n": n, "at": time.time(), "host": True}) + "\n")
         os.replace(tmp, path)
         tmp = None
     except OSError:
@@ -100,24 +98,40 @@ def _record(queue_dir: "Path | str", n: "int | None") -> None:
                 pass
 
 
-def recorded_count(queue_dir: "Path | str", *, now: "float | None" = None) -> "int | None":
-    """The host's count its serving process recorded within :data:`COUNT_FRESH_S`, clipped to :data:`BADGE_MAX`; None when
-    there is no record, it is old or from the future, or it is off its shape."""
+def _read_record(queue_dir: "Path | str", now: "float | None") -> "tuple[bool, int | None]":
+    """(is a host install, its fresh count or None). A record file that exists marks a host install even when it is old, null or
+    off its shape; one that cannot be read at all but exists is host-unknown, and no file is a plain install."""
+    path = Path(queue_dir) / COUNT_FILE
     try:
-        doc = json.loads((Path(queue_dir) / COUNT_FILE).read_text(encoding="utf-8"))
+        raw = path.read_text(encoding="utf-8")
+    except FileNotFoundError:
+        return False, None
+    except OSError:
+        return (True, None) if path.exists() else (False, None)
+    try:
+        doc = json.loads(raw)
         n, at = doc["n"], doc["at"]
         if type(n) is not int or n < 0 or isinstance(at, bool) or not isinstance(at, (int, float)):
-            return None
+            return True, None
         age = (time.time() if now is None else now) - at
-        return min(n, BADGE_MAX) if 0 <= age <= COUNT_FRESH_S else None
-    except (OSError, ValueError, KeyError, TypeError):
-        return None
+        return True, (min(n, BADGE_MAX) if 0 <= age <= COUNT_FRESH_S else None)
+    except (ValueError, KeyError, TypeError):
+        return True, None
+
+
+def recorded_count(queue_dir: "Path | str", *, now: "float | None" = None) -> "int | None":
+    """The host's count its serving process recorded within :data:`COUNT_FRESH_S`, clipped to :data:`BADGE_MAX`; None when
+    there is no record, it is old or from the future, it is null, or it is off its shape."""
+    return _read_record(queue_dir, now)[1]
 
 
 def resolved_badge(queue_dir: "Path | str") -> "int | None":
-    """The badge for a push whose caller did not say: the serving process's recorded count, else the native store's."""
-    n = recorded_count(queue_dir)
-    return n if n is not None else badge_value(queue_dir)
+    """The badge for a push whose caller did not say. A host install (it has ever recorded a count) answers with its fresh count,
+    else None (unknown: the push carries no badge and the phone keeps its own); only an install with no host record counts natively."""
+    host, n = _read_record(queue_dir, None)
+    if host:
+        return n
+    return badge_value(queue_dir)
 
 
 def badge_value(queue_dir: "Path | str", question_source: Any = None) -> "int | None":
