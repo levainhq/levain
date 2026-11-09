@@ -244,13 +244,15 @@ class Codec:
     def _refuse_unlisted(self, obj: Mapping[str, Any]) -> None:
         """The dispatch allowlist: the first top-level field outside `dispatch_fields`, then every tool definition the
         body declares (`_tool_lists`: `tools[]` and the codec's inline positions) through `_refuse_tool`. A tool list
-        that is not a list judges nothing, so it is refused. The suffix is the name when it fits the wire grammar,
+        that is not a list judges nothing, so it is refused; a `null` one is no tools, as the provider reads it. The suffix is the name when it fits the wire grammar,
         else a fixed word."""
         for f in obj:
             if f not in self.dispatch_fields:
                 raise norm.Refused("body-unlisted:" + _wire_what(f, "field"), "a field levain has not judged; "
                                    "dispatch admits only judged fields")
         for tools in self._tool_lists(obj):
+            if tools is None:
+                continue
             if not isinstance(tools, list):
                 raise norm.Refused("body-unlisted:tools", "a tool list that is not a list; dispatch judges each tool")
             for t in tools:

@@ -319,11 +319,17 @@ def test_every_client_body_fixture_has_a_provenance_entry():
 # --- r1 F2: a `tools` that is not a list ---------------------------------------------------------------------------
 
 @pytest.mark.parametrize("c", [AM, OC, OR], ids=lambda c: c.name)
-@pytest.mark.parametrize("tools", [{"type": "web_search"}, "web_search", 1, None], ids=["obj", "str", "int", "null"])
+@pytest.mark.parametrize("tools", [{"type": "web_search"}, "web_search", 1], ids=["obj", "str", "int"])
 def test_a_tools_that_is_not_a_list_is_refused_on_dispatch(c, tools):
     # the tool-type allowlist reads a list; a `tools` of any other shape judges nothing, so dispatch refuses it
     assert _check(c, _body(c, tools=tools), dispatch=True) == "body-unlisted:tools"
     assert not isinstance(_check(c, _body(c, tools=tools), dispatch=False), str)
+
+
+@pytest.mark.parametrize("c", [AM, OC, OR], ids=lambda c: c.name)
+def test_a_null_tools_is_no_tools_on_dispatch(c):
+    # generic clients send `"tools": null` for "no tools"; the provider reads it as absent, and so does dispatch
+    assert not isinstance(_check(c, _body(c, tools=None), dispatch=True), str)
 
 
 def test_a_non_object_entry_inside_a_tools_list_stays_the_providers_to_refuse():
