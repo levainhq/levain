@@ -3666,6 +3666,10 @@ a.nc-pick.is-rec:hover { border-color: var(--text); }
 /* The List (the Tray's wire id `tray` stays): the surface chips, the one-line intake box and its receipt. */
 .list-surfaces, .list-times { display: flex; flex-wrap: wrap; gap: var(--sp-2); margin: 0 0 var(--sp-3); }
 .list-surfaces .rc-chip, .list-times .rc-chip { min-height: var(--ctl-md); }
+.list-chips-label { flex: none; align-self: center; min-width: 3.4em; color: var(--faint); font: var(--fw-semibold) var(--fs-micro)/1.6 var(--round);
+  letter-spacing: var(--track-caps); text-transform: uppercase; }
+/* the two rows read as two questions: when (squared chips) and what kind (pills) */
+.list-times .rc-chip { border-radius: var(--r-sm); }
 [data-ck-panel="tray"] .grp-sub { color: var(--faint); font: var(--fw-semibold) var(--fs-micro)/1.6 var(--round); margin: var(--sp-3) 0 var(--sp-1); }
 .list-intake { gap: var(--sp-2); }
 .list-intake-row { display: flex; align-items: center; gap: var(--sp-3); min-width: 0; }

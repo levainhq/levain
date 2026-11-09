@@ -213,7 +213,7 @@ def test_the_card_hides_the_later_rows_and_names_them_in_one_control_and_the_foc
     rows = v[-2]
     assert len(rows) == 2 and "a sooner later seed" in rows[0] and "a farther later seed" in rows[1], v
     assert f"wakes " in rows[0] and "\u2192 list" in rows[0], v                # each says where it lands
-    assert v[-1] == ["This week", "Later dates"], v                            # grouped by the day it wakes
+    assert v[-1] == ["Next 7 days", "Later dates"], v                            # grouped by the day it wakes
 
 
 @needs_browser

@@ -2127,7 +2127,7 @@
     }
     if (s.surface && s.time_state === "done") {
       // resolved in the last week: read-only, the day and how it closed
-      host.appendChild(tagEl("muted", "done " + (s.done_kind ? s.done_kind + " " : "") + shortDate(s.done_on || "")));
+      host.appendChild(tagEl("muted", (s.done_kind || "done") + " " + shortDate(s.done_on || "")));
       return row;
     }
     if (s.surface) {
@@ -2144,7 +2144,7 @@
       }
       if (!s.wake_line && s.next && !s.fires) host.appendChild(tagEl("muted", "due " + shortDate(s.next)));
       if (s.surface === "talk" && Number.isInteger(s.age_days) && s.age_days >= 0) host.appendChild(tagEl("muted", s.age_days + " d old"));
-      if (s.deliver_to && s.surface === "drop") host.appendChild(tagEl("muted", "to " + s.deliver_to));
+      if (s.deliver_to && s.surface === "drop" && !s.wake_line) host.appendChild(tagEl("muted", "to " + s.deliver_to));
       if (s.age_shown && s.age) host.appendChild(el("span", "muted", s.age));
       if (verbs && s.id) appendRowVerbs(row, buildSporeVerbs(s, panelKind), panelKind === "tray" ? ["Resolve", "Snooze"] : null, panelKind === "tray" ? 2 : 0);
       return row;
@@ -2273,7 +2273,7 @@
     const timeOf = (s) => s.time_state || "now";
     const timeNow = () => (isList && !inCard && LIST_TIMES.indexOf(listTime) >= 0 ? listTime : "");
     const inTime = (s) => !timeNow() || timeOf(s) === timeNow();
-    const listNow = () => (isList && listAll().some((s) => s.surface === listSurface) ? listSurface : "");
+    const listNow = () => (isList && listAll().filter(inTime).some((s) => s.surface === listSurface) ? listSurface : "");
     const inSurface = (s) => !listNow() || s.surface === listNow();
     if (isList && !inCard) p.dataset.listTotal = String(listAll().length);   // the focus view's header counts what its "all" chip counts
     let chipRow = null;     // the chips' row, drawn by controls(); the panel's own element is empty once the focus view moves its body
@@ -2294,13 +2294,13 @@
       controls: (bar, redraw) => {
         if (isList) {
           const chooseSurface = (v) => { listSurface = v; redraw(); };
-          chipRow = buildSurfaceChips(listAll().filter(inTime), listNow, chooseSurface, !!timeNow());
+          chipRow = buildSurfaceChips(listAll().filter(inTime), listNow, chooseSurface, inCard ? "" : "Type");
           bar.after(chipRow);
           if (!inCard) {
             // the time chips; choosing one recounts the type chips beside it, so a chip's number stays the rows its tap shows
             const timeRow = buildTimeChips(listAll(), timeNow, (v) => {
               listTime = v;
-              const fresh = buildSurfaceChips(listAll().filter(inTime), listNow, chooseSurface, !!timeNow());
+              const fresh = buildSurfaceChips(listAll().filter(inTime), listNow, chooseSurface, inCard ? "" : "Type");
               chipRow.replaceWith(fresh); chipRow = fresh;
               redraw();
             });
@@ -2318,7 +2318,7 @@
         bar.appendChild(sel);
       },
       pick: (rows) => {
-        const base = (listNow() ? rows.filter((s) => s.surface === listNow() && inSurfaceChip(s, !!timeNow())) : rows).filter((s) => !cardHides(s)).filter(inTime);
+        const base = (listNow() ? rows.filter((s) => s.surface === listNow() && inSurfaceChip(s)) : rows).filter((s) => !cardHides(s)).filter(inTime);
         const ids = views.length && viewOf() ? view.tray_view_rows[viewOf()] : null;
         // the focus view draws a carried desk row under Needs you AND under Desk owes, as flow's footer prints it, so the control's
         // "desk owes N" is the number of rows a person can see under that heading (a chosen view is ungrouped: no copy there)
@@ -2441,19 +2441,19 @@
   // (`listSurface`); the rows and their order are the kernel's.
   const SURFACE_WORDS = { band: "band", board: "board", spore: "spores", talk: "talk", drop: "drops" };
   // ONE rule for which rows a surface chip stands for: the chip's count and the rows the focus view draws under it both use it, so
-  // a number on a chip is the number of rows its tap shows. The band's chip excludes the desk's rows and the later ones.
-  // With a time chip chosen the band's chip counts every band row in that time-state (a Later filter is the later rows).
-  function inSurfaceChip(s, timed) {
-    return !!(s && s.surface) && (!!timed || !(s.surface === "band" && (s.group === "desk" || s.group === "later")));
+  // a number on a chip is the number of rows its tap shows, and the type chips add up to "all" in every time-state.
+  function inSurfaceChip(s) {
+    return !!(s && s.surface);
   }
   // The List's time chips: now / later / someday / done, each with its count; a second tap clears the choice. The type chips
   // beside them keep cutting across the time-states.
   const LIST_TIMES = ["now", "later", "someday", "done"];
-  const WAKE_BUCKETS = { tomorrow: "Tomorrow", week: "This week", later: "Later dates" };
+  const WAKE_BUCKETS = { tomorrow: "Tomorrow", week: "Next 7 days", later: "Later dates" };
   function buildTimeChips(list, current, choose) {
     const row = el("div", "list-times");
     row.setAttribute("role", "group");
     row.setAttribute("aria-label", "filter the List by when a row comes due");
+    row.appendChild(el("span", "list-chips-label", "When"));
     const counts = new Map();
     for (const s of list) counts.set(s.time_state || "now", (counts.get(s.time_state || "now") || 0) + 1);
     const chips = [];
@@ -2470,14 +2470,13 @@
     sync(current());
     return row;
   }
-  function buildSurfaceChips(list, current, choose, timed) {
+  function buildSurfaceChips(list, current, choose, label) {
     const row = el("div", "list-surfaces");
     row.setAttribute("role", "group");
     row.setAttribute("aria-label", "filter the List by where a row comes from");
     const counts = new Map();
-    // the band chip counts the rows due for the operator, as the panel's header does: the desk's rows and the later ones sit
-    // under their own headings, outside it
-    for (const s of list) if (inSurfaceChip(s, timed)) counts.set(s.surface, (counts.get(s.surface) || 0) + 1);
+    if (label) row.appendChild(el("span", "list-chips-label", label));
+    for (const s of list) if (inSurfaceChip(s)) counts.set(s.surface, (counts.get(s.surface) || 0) + 1);
     const chips = [];
     const mk = (value, label) => {
       const c = el("button", "rc-chip list-surface-chip", label);
