@@ -21,10 +21,42 @@ ENTRY["verifier_artifact_digest"] = vr.artifact_digest(ENTRY)
 EXIT = {"exit": 0, "signal": None, "wall_s": 12, "timed_out": False, "truncated_bytes": 0, "lingering_killed": 0}
 
 
+#: the fixture gateway route map (F9a): generation 1, route ``rt-<n>`` carries ``glm-5`` on backend ``backend-<n>``, so
+#: run n's executor ticket (:func:`run_ticket`) resolves to a backend distinct from every other run's
+ROUTEMAP_GENERATION = 1
+POLICY_DIGEST = "sha256:" + "a" * 64
+
+
+def _routemap_fixture():
+    from levain.broker.policy import DispatchRoute
+    from levain.slot.routemaps import Checked
+
+    routes = {f"rt-{n}": DispatchRoute(policy=None, provider="p", backends={"glm-5": f"backend-{n}"},  # type: ignore[arg-type]
+                                       body_policy={}, retention_claim="c") for n in range(8)}
+    return Checked(generation=ROUTEMAP_GENERATION, item_sha256="e" * 64, store_id="s" * 32, routes=routes,
+                   digests={r: POLICY_DIGEST for r in routes})
+
+
+def routemap(generation):
+    """The fixture's ``routemap(generation)``: the gateway's checked map of that generation, else None."""
+    return _routemap_fixture() if generation == ROUTEMAP_GENERATION else None
+
+
+def run_ticket(job_id, run, *, route=None, model="glm-5") -> dict:
+    """Run ``run``'s executor ticket facts as the supervisor minted them, on route ``rt-<run>`` unless given."""
+    return {"kind": "executor", "job_id": job_id, "run_index": run, "route": route or f"rt-{run}",
+            "routemap_generation": ROUTEMAP_GENERATION, "route_policy_digest": POLICY_DIGEST, "model_requested": model}
+
+
 def vrun(job_id="dj-" + "0" * 32, run=0, entry=None) -> VerifierRun:
     return VerifierRun(job_id=job_id, run=run, session=f"v-{run}", ticket=f"t-{run}", verifier=entry or ENTRY,
                        steps=STEPS, driver_input_digest=ENTRY["driver_input_digest"],
                        input_bundle_digest="sha256:" + "e" * 64)
+
+
+def ticket_for(job_id, run):
+    """The fixture's supervisor-owned ``ticket_for(job_id, run_index)``: run ``run``'s executor ticket as minted."""
+    return run_ticket(job_id, run)
 
 
 def body(verdicts=("pass", "pass"), **over) -> dict:

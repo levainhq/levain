@@ -166,12 +166,12 @@ def test_nothing_in_the_agents_package_other_than_the_launcher_mints():
 
 # --- refusals first ---------------------------------------------------------------------------------------------------
 
-def test_the_api_key_branch_is_refused_by_name_before_anything_is_allocated(tmp_path):
-    assert not hasattr(L, "BROKERED_ROUTE_BUILT")               # no flag turns the API-key branch on
+def test_a_brokered_launch_without_a_dollar_share_is_refused_by_name_before_anything_is_allocated(tmp_path):
+    assert not hasattr(L, "BROKERED_ROUTE_BUILT")               # no flag turns anything on: the share is the launch's
     ln, control, runtime = build(tmp_path, auth="brokered")
     with pytest.raises(L.LauncherRefused) as e:
-        ln.spawn(launch(auth="brokered", exposure=None))
-    assert e.value.name == "brokered-route-not-built"
+        ln.spawn(launch(auth="brokered", exposure=None))        # no usd_micros: no share, so nothing is minted
+    assert e.value.name == "no-dollar-share"
     assert control.calls == [] and runtime.starts == []
     assert ln.usage(KEY) == zero()                       # nothing ran: zero, not the caps
 
@@ -532,10 +532,12 @@ def test_a_rerun_after_a_crash_reads_usage_under_the_key_the_first_attempt_recor
 
 def test_an_api_key_run_through_run_session_fails_with_the_named_reason_and_settles_at_zero(rig, tmp_path):
     oid = _occurrence(rig)                                      # billing api_key
-    ln, control, runtime = build(tmp_path, auth="brokered")
+    # the fire states its reserved dollars (finding 1), so the launcher gets as far as the route: none serves the model
+    ln, control, runtime = build(tmp_path, FakeControl(**{"ROUTE-RESOLVE": Refused("no-brokered-route")}),
+                                 auth="brokered")
     sup, report = _run(rig, oid, ln)
     assert report.state == "failed" and rig.row(oid)["reason"] == "session_spawn_failed"
-    assert control.calls == [] and runtime.starts == []
+    assert control.ops() == ["ROUTE-RESOLVE"] and runtime.starts == []
     res = _reservation(rig, oid)                                # an api_key run's dollars are the last column
     assert res[:2] == ("settled", "actual") and res[5] == 0
 
@@ -664,15 +666,8 @@ def test_l1_3_create_is_exclusive_and_leaves_no_temp(tmp_path):
     assert not list((tmp_path / "idx").glob(".*"))
 
 
-# L1-4: there is no flag that turns the API-key branch on; a brokered launcher never mints and never says passthrough
-
-def test_l1_4_no_flag_can_make_a_brokered_launcher_mint(tmp_path, monkeypatch):
-    monkeypatch.setattr(L, "BROKERED_ROUTE_BUILT", True, raising=False)
-    ln, control, runtime = build(tmp_path, auth="brokered")
-    with pytest.raises(L.LauncherRefused) as e:
-        ln.spawn(launch(auth="brokered"))
-    assert e.value.name == "brokered-route-not-built" and control.calls == [] and runtime.starts == []
-
+# L1-4: a brokered launcher never claims passthrough (its usage is its own); the brokered mint itself is pinned in
+# tests/test_agents_session_launcher_brokered.py
 
 def test_l1_4_a_brokered_launchers_usage_never_claims_passthrough(tmp_path):
     ln, _, _ = build(tmp_path, auth="brokered")
@@ -692,7 +687,7 @@ def test_l1_4_a_launcher_of_any_other_auth_is_refused_and_the_facts_carry_the_la
     assert sent["auth"] == "passthrough"
     ln2.auth = "brokered"                                        # _facts reads self.auth, never a literal
     with pytest.raises(L.LauncherRefused):
-        ln2._facts(launch(auth="brokered"))
+        ln2._facts(launch(auth="brokered", exposure=None))       # no resolvable route on the fake: refused, not a passthrough fact
 
 
 # L1-5: a malformed mint answer is settled through STATUS by attempt id; a raw error is a named refusal

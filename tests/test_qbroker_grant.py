@@ -80,6 +80,10 @@ def signer_entry(key, spaces, cls):
             "custody": "passphrase" if cls == "laptop-presence" else "unstated", "namespaces": spaces}
 
 
+def _signers(world):
+    return SignersSource(world["L"] / "policy", world["L"] / "routes" / "trust.pub").current()
+
+
 @pytest.fixture
 def world(tmp_path, keys):
     """A signed, published job; L/ with its snapshot; the worktree root (docs/ symlinked away)."""
@@ -555,7 +559,7 @@ def test_a_granted_request_has_its_own_receipt_and_reads_settled(world):
     assert face["authority_scope"]["grant"] == (f"contract-grant:{world['run']['contract_digest']} "
                                                 f"signer={world['keys']['phone'].fp}")
     assert "receipts_head" not in json.dumps(face) and "signed-answer" not in json.dumps(face)
-    listed = {r.request_id: r for r in qoperator.rows(world["L"] / "queue", now=world["clock"].now)}
+    listed = {r.request_id: r for r in qoperator.rows(world["L"] / "queue", now=world["clock"].now, signers=_signers(world))}
     assert listed[rid].state == "allowed" and listed[rid].settled
     with pytest.raises(qoperator.OperatorError, match="already allowed"):
         qoperator.answer_payload(world["L"] / "queue", rid, "deny", world["keys"]["laptop"].fp,
@@ -725,7 +729,7 @@ def test_s1_a_replay_waits_out_the_filing_in_flight_and_never_files_a_granted_re
     replay.join(1.0)
     try:
         assert replay.is_alive() and _receipts(world, rid) == []
-        listed = {r.request_id: r for r in qoperator.rows(world["L"] / "queue", now=world["clock"].now)}
+        listed = {r.request_id: r for r in qoperator.rows(world["L"] / "queue", now=world["clock"].now, signers=_signers(world))}
         assert listed[rid].state == "filing" and not listed[rid].settled
         _operator_answer(world, rid, "deny")
         assert "decision" not in ask(b, rid)
@@ -816,7 +820,7 @@ def test_s3_a_refused_grant_row_at_filing_files_plain_pending_and_is_logged(worl
     assert got["ok"] is True
     rid = got["request_id"]
     assert [s for s, _ in _receipts(world, rid)] == ["pending"]
-    listed = {r.request_id: r for r in qoperator.rows(world["L"] / "queue", now=world["clock"].now)}
+    listed = {r.request_id: r for r in qoperator.rows(world["L"] / "queue", now=world["clock"].now, signers=_signers(world))}
     assert listed[rid].state == "pending" and not listed[rid].settled
     assert f"grant row for {rid} refused, filed as no grant: " in caplog.text and why in caplog.text
 
@@ -869,7 +873,7 @@ def test_t1_a_replay_after_the_hold_ended_repairs_a_granted_request_from_its_gra
     assert b.handle(1, dict(msg, id=next(_ids)))["request_id"] == rid
     assert [s for s, _ in _receipts(world, rid)] == ["pending", "allowed"]
     assert "refused, filed as no grant" not in caplog.text
-    listed = {r.request_id: r for r in qoperator.rows(world["L"] / "queue", now=world["clock"].now)}
+    listed = {r.request_id: r for r in qoperator.rows(world["L"] / "queue", now=world["clock"].now, signers=_signers(world))}
     assert listed[rid].settled
     _operator_answer(world, rid, "deny")
     # past the hold ANSWER? answers expired for any request (a granted one too); the operator's deny never decides
@@ -895,5 +899,5 @@ def test_t2_a_grant_check_that_raises_is_a_refusal_and_the_broker_starts(world, 
     assert [s for s, _ in _receipts(world, rid)] == ["pending"]
     assert f"grant row for {rid} refused (its check raised)" in caplog.text
     assert "RuntimeError" in caplog.text
-    listed = {r.request_id: r for r in qoperator.rows(world["L"] / "queue", now=world["clock"].now)}
+    listed = {r.request_id: r for r in qoperator.rows(world["L"] / "queue", now=world["clock"].now, signers=_signers(world))}
     assert listed[rid].state == "pending" and not listed[rid].settled

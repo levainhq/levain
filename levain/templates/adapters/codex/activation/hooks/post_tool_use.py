@@ -31,7 +31,7 @@ except Exception:
 
 # The tools whose `command` is a shell line. Anything else carrying a `command` (Codex apply_patch puts
 # the whole patch there) is not summarised by it.
-_SHELL_TOOLS = frozenset({"Bash", "shell", "exec_command", "shell_command", "local_shell"})
+_SHELL_TOOLS = frozenset({"Bash", "PowerShell", "write_stdin", "shell", "exec_command", "shell_command", "local_shell"})
 _PATCH_HEADER = re.compile(r"^\*\*\* (?:Add|Update|Delete) File: (.+?)\s*$", re.MULTILINE)
 
 

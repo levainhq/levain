@@ -44,7 +44,6 @@ import tempfile
 import termios
 import time
 import tty
-import unicodedata
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import IO, Any, Callable, Collection, Dict, List, Mapping, Optional, Sequence, Tuple
@@ -93,11 +92,23 @@ _OSC_PASS = frozenset({0, 1, 2, 7, 8, 9, 133, 777})
 #: operator's own input, which the slot gets anyway), and every one passed is reset when the session ends
 #: (:meth:`TermFilter.reset`). DECISION: 9 (X10 mouse) is the same class as 1000-1006.
 _REPORTING_MODES = frozenset({9, 1000, 1001, 1002, 1003, 1004, 1005, 1006, 1015, 1016, 2004})
+#: DEC private modes that change what the operator's keys SEND (1, DECCKM: application cursor keys) or which screen
+#: he sees (47, 1047, 1049: the alternate screen). They pass and are reset when the session ends, like the above.
+_KEY_MODES = frozenset({1})
+_ALT_SCREEN_MODES = frozenset({47, 1047, 1049})
+_TRACKED_MODES = _REPORTING_MODES | _KEY_MODES
+#: the screen the terminal is on is not known (an XTRESTORE of an alternate-screen mode restores whatever was saved)
+_SCREEN_UNKNOWN = -1
 _OSC_COLOUR = frozenset({4, 104, *range(10, 20), *range(110, 120)})
 _ASCII_RUN = re.compile(rb"[\x00-\x04\x06-\x1a\x1c-\x7f]+")
 _CSI_MAX = 256        # DECISION: a CSI longer than this is no sequence a terminal answers; it is dropped whole
 _OSC_MAX = 8192       # DECISION: an OSC payload past this is discarded to its terminator, never buffered further
 _ESC_I_MAX = 8
+#: DECISION: the kitty keyboard pushes the filter passes per screen. A terminal's stack is bounded and a push onto a
+#: full one evicts its OLDEST entry, which is the operator's own; a slot needs only a few, so pushes past this drop.
+#: The protocol names no size ("Terminals should limit the size of the stack as appropriate"); kitty's is 8 entries
+#: per screen ("main_key_encoding_flags[8]" in kitty/screen.h), so 4 leaves the operator half of it.
+_KITTY_PUSH_MAX = 4
 
 
 class TermFilter:
@@ -113,7 +124,15 @@ class TermFilter:
         self._lo, self._hi = 0x80, 0xBF   # the range of the character's NEXT continuation byte
         self._taint = False          # the OSC being parsed is dropped at its terminator
         self._over = False           # the OSC payload passed _OSC_MAX: discard to the terminator
-        self._modes: set = set()     # _REPORTING_MODES the filter passed set and not since reset
+        self._modes: set = set()     # _TRACKED_MODES the filter passed set and not since reset
+        # the screen the terminal is on, one state for 47, 1047 and 1049 alike: 0 main; on the alternate screen, the
+        # mode that entered it from main (its DECRST leaves it the way it was entered); or _SCREEN_UNKNOWN
+        self._screen = 0
+        # per screen (False main, True alternate: the kitty keyboard protocol keeps one stack each): the pushes the
+        # filter passed and no pop since undid, and whether a set (``CSI = flags u``) changed the top entry
+        self._kitty_pushes = {False: 0, True: 0}
+        self._kitty_set = {False: False, True: False}
+        self._modkeys: set = set()   # XTMODKEYS resources (``CSI > Pp ; Pv m``) the filter passed set
 
     # -- the UTF-8 layer: whole code points, or one stray byte ------------------------------------------------------
 
@@ -139,11 +158,46 @@ class TermFilter:
         return bytes(out)
 
     def reset(self) -> bytes:
-        """The sequence that turns off every reporting mode this filter let the slot set (empty when none). Sent at
-        the session's end, after :meth:`flush`, so the operator's shell is never left sending mouse or focus
-        reports."""
-        modes, self._modes = sorted(self._modes), set()
-        return b"\x1b[?" + ";".join(map(str, modes)).encode("ascii") + b"l" if modes else b""
+        """The sequence that undoes every terminal mode this filter let the slot set (empty when none): reporting
+        modes, application cursor keys, the alternate screen, the kitty keyboard flags and XTMODKEYS. Sent at the
+        session's end, after :meth:`flush`, so the operator's shell is never left sending reports, reading keys in
+        another encoding, or on the slot's screen.
+
+        Order: the alternate screen's kitty entries are undone while on it, then the alternate screen is left, then
+        the main screen's entries are undone. The alternate screen is left by the DECRST of the mode that entered it
+        from main; a stack on an alternate screen the slot already left is reached with the non-clearing ``?47h`` /
+        ``?47l`` pair (1049 would clear that screen). With the screen unknown (an XTRESTORE of an alternate-screen
+        mode), the alternate stack is visited the same way and ``?47l`` lands on main before the main stack's pops
+        (the filter passes no kitty sequence while the screen is unknown, so every recorded entry is on a known
+        stack). Pops undo exactly the pushes the slot made (the filter passes no pop of
+        the slot's beyond them, and no push past :data:`_KITTY_PUSH_MAX`), so an entry the operator's own shell
+        pushed before the session survives; only when the slot SET flags in place with none of its own
+        pushes outstanding (which overwrites an entry it may not own) are the current flags zeroed (``CSI = 0 u``,
+        which acts with nothing pushed too). A set on an entry the slot pushed is undone by its pop."""
+        out = bytearray()
+        screen, self._screen = self._screen, 0
+        if screen not in (0, _SCREEN_UNKNOWN):
+            out += self._kitty_undo(True) + b"\x1b[?%dl" % screen
+        else:
+            visit = bool(self._kitty_pushes[True] or self._kitty_set[True])
+            if visit:
+                out += b"\x1b[?47h" + self._kitty_undo(True)   # the alternate stack is reached only from that screen
+            if visit or screen == _SCREEN_UNKNOWN:
+                out += b"\x1b[?47l"
+        out += self._kitty_undo(False)
+        modes = sorted(self._modes)
+        if modes:
+            out += b"\x1b[?" + ";".join(map(str, modes)).encode("ascii") + b"l"
+        for pp in sorted(self._modkeys):
+            out += b"\x1b[>" + str(pp).encode("ascii") + b"m"   # no value: the resource's initial setting
+        self._modes, self._modkeys = set(), set()
+        return bytes(out)
+
+    def _kitty_undo(self, screen: bool) -> bytes:
+        pushes, was_set = self._kitty_pushes[screen], self._kitty_set[screen]
+        self._kitty_pushes[screen], self._kitty_set[screen] = 0, False
+        out = b"\x1b[<" + str(pushes).encode("ascii") + b"u" if pushes else b""
+        return out + b"\x1b[=0u" if was_set else out
 
     def _byte(self, b: int, out: bytearray) -> None:
         if self._need:
@@ -253,8 +307,7 @@ class TermFilter:
             keep = self._st == _CSI and not _csi_is_report(seq)
             self._ground()
             if keep:
-                self._track_modes(seq)
-                out += seq
+                out += self._track_modes(seq)
             return
         if not 0x20 <= cp <= 0x3F:
             self._abort(cp, raw, out)
@@ -266,16 +319,60 @@ class TermFilter:
         if len(self._seq) > _CSI_MAX or not _csi_shape(body):
             self._st = _CSI_IGN                         # malformed: consumed to its final byte and dropped
 
-    def _track_modes(self, seq: bytes) -> None:
-        # DECSET / DECRST (``CSI ? Pm h|l``) and XTRESTORE (``CSI ? Pm r``, which may set any mode it restores).
-        if seq[2:3] != b"?" or seq[-1:] not in (b"h", b"l", b"r"):
-            return
-        for p in seq[3:-1].split(b";"):
-            if p.isdigit() and int(p) in _REPORTING_MODES:
-                if seq[-1:] == b"l":
-                    self._modes.discard(int(p))
+    def _track_modes(self, seq: bytes) -> bytes:
+        """Track the modes ``seq`` (a complete CSI that passes) sets, and return what of it reaches the terminal:
+        ``seq`` itself, except for the kitty pops and pushes that would reach entries the slot does not own."""
+        prefix, final, params = seq[2:3], seq[-1:], seq[3:-1].split(b";")
+        if prefix == b"?" and final in (b"h", b"l", b"r"):
+            # DECSET / DECRST (``CSI ? Pm h|l``) and XTRESTORE (``CSI ? Pm r``, which may set any mode it restores)
+            for p in params:
+                if p.isdigit() and int(p) in _ALT_SCREEN_MODES:
+                    if final == b"r":
+                        self._screen = _SCREEN_UNKNOWN
+                    elif final == b"l":
+                        self._screen = 0                # any of the three returns the terminal to main
+                    elif self._screen in (0, _SCREEN_UNKNOWN):
+                        self._screen = int(p)
+                elif p.isdigit() and int(p) in _TRACKED_MODES:
+                    if final == b"l":
+                        self._modes.discard(int(p))
+                    else:
+                        self._modes.add(int(p))
+        elif final == b"u" and prefix in (b">", b"<", b"="):
+            # the kitty keyboard protocol: push (``CSI > flags u``), pop (``CSI < n u``), set (``CSI = flags ; mode u``)
+            if not _kitty_grammar(prefix, params):
+                return b""                              # a terminal may ignore it: never passed, never counted
+            if self._screen == _SCREEN_UNKNOWN:
+                return b""                              # which stack it would reach is not known: not passed
+            screen = self._screen != 0
+            pushes = self._kitty_pushes[screen]
+            if prefix == b">":
+                if pushes >= _KITTY_PUSH_MAX:
+                    return b""
+                self._kitty_pushes[screen] += 1
+            elif prefix == b"<":
+                n = params[0]
+                want = int(n) if n else 1
+                if want > pushes:
+                    # a pop past the slot's own pushes would pop the operator's entries: clipped to the slot's
+                    if not pushes:
+                        return b""
+                    seq, want = b"\x1b[<" + str(pushes).encode("ascii") + b"u", pushes
+                self._kitty_pushes[screen] = pushes - want
+            elif not self._kitty_pushes[screen]:
+                # a set while the slot has pushes outstanding changes the slot's own entry, which the pop undoes;
+                # only with none is the entry it changes one the slot may not own
+                self._kitty_set[screen] = True
+        elif prefix == b">" and final == b"m":
+            # XTMODKEYS: ``CSI > Pp ; Pv m`` sets resource Pp, ``CSI > Pp m`` resets it, ``CSI > m`` resets all
+            if params == [b""]:
+                self._modkeys.clear()
+            elif params[0].isdigit():
+                if len(params) > 1:
+                    self._modkeys.add(int(params[0]))
                 else:
-                    self._modes.add(int(p))
+                    self._modkeys.discard(int(params[0]))
+        return seq
 
     def _osc(self, cp: int, raw: bytes, out: bytearray) -> None:
         if self._st == _OSC_ESC:
@@ -323,6 +420,17 @@ class TermFilter:
             self._st = _STR_ESC
         elif cp in (CAN, SUB):
             self._ground()
+
+
+def _kitty_grammar(prefix: bytes, params: list) -> bool:
+    """Whether a kitty keyboard ``CSI <prefix> params u`` is in the protocol's grammar: a push takes zero or one
+    decimal flags; a pop zero or one count, never 0 (some terminals read 0 as none, others as the default 1); a set
+    decimal flags and at most one mode, 1, 2 or 3."""
+    if prefix == b">":
+        return len(params) == 1 and (params[0] == b"" or params[0].isdigit())
+    if prefix == b"<":
+        return len(params) == 1 and (params[0] == b"" or params[0].isdigit() and int(params[0]) > 0)
+    return params[0].isdigit() and (len(params) == 1 or len(params) == 2 and params[1] in (b"1", b"2", b"3"))
 
 
 def _csi_shape(body: bytes) -> bool:
@@ -564,12 +672,6 @@ def operator_clone(repo: Path, branch: str, dest: Path, *, git: str = "git",
                      refusal="clone-failed"))
 
 
-def _fold(name: str) -> str:
-    # DECISION: a case- and normalization-insensitive store (APFS by default) checks `.Claude/Settings.json` out
-    # where CC reads `.claude/settings.json`, so every spelling that folds to a settings name is checked.
-    return unicodedata.normalize("NFD", name).casefold()
-
-
 def _ls_tree(clone: Path, treeish: str, *, git: str, run: Callable[..., subprocess.CompletedProcess]
              ) -> List[Tuple[bytes, bytes, bytes, str]]:
     p = _git(["-C", str(clone), "ls-tree", "-z", treeish], git=git, run=run, refusal="repo-settings-malformed")
@@ -597,6 +699,7 @@ def repo_layer_docs(clone: Path, *, git: str = "git",
     name -> JSON value, for every tree entry whose name folds to ``.claude`` / ``settings.json`` / ``settings.local.json``. Refused ``repo-settings-malformed`` when
     such an entry is a link or a submodule (CC would read through it), is over :data:`SETTINGS_CAP`, is not JSON, or
     repeats a key (DECISION: two values for one key is refused, not resolved), or nests too deep to parse."""
+    from levain.slot.render import fold_name as _fold   # the one fold, imported where it is used
     want = {_fold(Path(n).name): n for n in REPO_SETTINGS}
     docs: Dict[str, Any] = {}
     for mode, typ, sha, name in _ls_tree(clone, treeish, git=git, run=run):
@@ -1386,8 +1489,9 @@ class Supervisor:
             finally:
                 if self._reset_untaken and not self._output_failed:     # a failed stdout's line already said it
                     # The run's last line: whatever else he missed, this is the one that leaves his shell wrong.
-                    self.say("your terminal did not take the reset of the reporting modes the session turned on "
-                             "(mouse, focus or paste reports may still be on): run `reset`")
+                    self.say("your terminal did not take the reset of the terminal modes the session set (mouse, "
+                             "focus or paste reports, cursor keys, the alternate screen, kitty keyboard flags or "
+                             "modifyOtherKeys may still be on): run `reset`")
                 self._release_held()
 
     def _leased(self, clone: Path, branch: str, blob: bytes) -> int:
@@ -1909,7 +2013,7 @@ class Supervisor:
                 os.set_blocking(stdout, was_blocking)
             if out_err is not None:
                 self._output_failed = True
-                also = (", and the reset of the reporting modes the session turned on did not reach it"
+                also = (", and the reset of the terminal modes the session set did not reach it"
                         if self._reset_untaken else "")
                 self.say(f"your terminal refused the session's output ({out_err.strerror or out_err}){also}: "
                          f"ending the session")

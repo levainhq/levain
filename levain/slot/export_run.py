@@ -4,9 +4,10 @@ steps 10-11, §6.0; CONTRACT_EDITS E12, E20; cut: ``project_memory/1022-18/adopt
 Root classifies a run exactly ONCE (:func:`classify`), from its own observations (:class:`RunObservation`) and the
 result line read from fd 4 as DATA, in the total order of DESIGN §1 step 10: (1) memory (an unreadable Linux
 ``memory.events.local`` takes that slot as ``export-image-unavailable`` and ranks first), (2) the host volume short,
-(3) the strict-boolean ``enospc: true`` ONLY on a plain non-zero exit, (4) ``<role>-failed:<reason>``. SUCCESS is exit
-0, no root failure observation and a fully valid line with ``enospc`` false; every other outcome is a DENIAL that
-publishes nothing. :func:`publish_if_success` is the one call site that reads the answer: only SUCCESS reaches
+(3) the strict-boolean ``enospc: true`` ONLY on a plain non-zero exit, (4) ``<role>-failed:<reason>``. SUCCESS is a
+plain exit 0 with a fully valid line (``enospc`` false) and no memory observation; it is decided after (1) and before
+(2), so a plain zero-exit line wins over a host-short reading (that reading names a failed run only; the classify
+table pins it). Every other outcome is a DENIAL that publishes nothing. :func:`publish_if_success` is the one call site that reads the answer: only SUCCESS reaches
 :func:`check_outputs` and :func:`transact`, so an importer's ``out/`` pair left by a failed, killed or line-less run is
 never published (the 5b2 carry in CONTRACT_EDITS, head 1022+8).
 

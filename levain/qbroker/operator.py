@@ -18,7 +18,12 @@ them) and writes only ``answers/<request_id>.json``:
 - :func:`write_answer`: the signed answer row, for a ``pending`` request only, checked first with
   :func:`levain.qbroker.seam.answer_refusal` and the head against the receipts as they stand (reaching the request's
   filing receipt), then linked no-replace, mode 0640: an answer that fails any check is never written, since nothing
-  can replace it once it is there.
+  can replace it once it is there. Any ``levain-queue`` member can create a file at an answer's name, so a file
+  already there that is not a signed answer for that request is
+  renamed aside to ``answers/.quarantine-<request_id>-<random>.json``, a name no reader takes for an answer, and the
+  signed answer is linked in its place. One signed by a key in the current signer snapshot (over a head the receipts
+  hold) is never moved or replaced; one signed by a key no longer in that snapshot is not a valid answer (the broker
+  refuses it too), so it is cleared like any other file.
 
 A receipts log that cannot be read is :class:`OperatorError`.
 
@@ -26,6 +31,7 @@ Stdlib only.
 """
 from __future__ import annotations
 
+import os
 import time
 from collections.abc import Mapping
 from dataclasses import dataclass, field
@@ -38,11 +44,12 @@ from levain.consent import record
 from levain.contracts import ContractError
 from levain.contracts.canon import canonical_bytes, parse
 from levain.qbroker.broker import (RUN_CALLS_KIND, RUN_DEADLINE_KIND, RUN_STATE_FORMAT, _calls_ok, _deadline_ok,
-                                   run_state_path, stored_request)
+                                   answer_row_refusal, run_state_path, stored_request)
 from levain.qbroker.receipts import Receipts, ReceiptsError
 from levain.qbroker.seam import answer_refusal
 from levain.qbroker.signers import SignersSnapshot
-from levain.qbroker.store import ANSWER_ROW_FORMAT, ROW_MAX, QueueStore, _parsed, _read_untrusted, valid_request_id
+from levain.qbroker.store import (ANSWER_ROW_FORMAT, ROW_MAX, QueueStore, _parsed, _read_untrusted, fsync_dir,
+                                  valid_request_id)
 
 __all__ = ["CLAIM_KEYS", "Listed", "OperatorError", "answer_payload", "rows", "run_state", "write_answer"]
 
@@ -51,6 +58,9 @@ CLAIM_KEYS = ("agent", "agent_session_id", "cwd", "display")
 # the keys of a published run state (tests/test_qbroker_run_caps.py reads GATE's own through run_state)
 _RUN_STATE_KEYS = frozenset({"format", "run_id", "calls", "cap", "deadline", "tripped"})
 _SETTLED = frozenset({"allowed", "denied", "expired"})
+# how many times write_answer clears a squatted answer name before it gives up: another member recreating the file
+# between the move and the link each time is a fight the operator's writer does not loop on forever
+_SQUAT_TRIES = 4
 
 
 class OperatorError(Exception):
@@ -106,11 +116,20 @@ def _pending(receipts: Receipts, request: record.ExternalGateRequest, stamp: str
         raise OperatorError(f"request {request.id} is already {state}")
 
 
-def rows(root: Path | str, *, now: datetime | None = None) -> list[Listed]:
-    """Every request row in the broker's queue at ``root`` (``L/queue``), oldest first."""
+def rows(root: Path | str, *, signers: SignersSnapshot | None, now: datetime | None = None,
+         ssh_keygen: Path | str | None = None) -> list[Listed]:
+    """Every request row in the broker's queue at ``root`` (``L/queue``), oldest first.
+
+    ``answered`` is True only for an answer row that verifies for its request against ``signers`` (the check the
+    writer and the broker make, :func:`~levain.qbroker.broker.answer_row_refusal`) over a head the receipts hold
+    now, reaching the request's filing (:meth:`~levain.qbroker.receipts.Receipts.head_refusal`, as the broker's
+    ``Receipts.decided`` requires): any ``levain-queue`` member can
+    create a file at an answer's name, so a file being there says nothing. ``signers`` has no default, so no caller
+    gets that by omission: ``None`` (no snapshot) verifies nothing, and every row lists as unanswered."""
     store, receipts = _open(root)
     recorded = _recorded(receipts)
-    stamp = utc_stamp(_now(now))
+    when = _now(now)
+    stamp = utc_stamp(when)
     out = []
     for path in store.requests.iterdir():
         name = path.name
@@ -128,7 +147,9 @@ def rows(root: Path | str, *, now: datetime | None = None) -> list[Listed]:
             request_id=rid, session=row["session"], slot=dict(row["slot"]), kind=row.get("kind"),
             run=None if row.get("run") is None else dict(row["run"]), tier=request.tier, tool_name=request.tool_name,
             received_at=request.received_at, expires_at=request.expires_at,
-            state=_state(recorded.get(rid), request.expires_at, stamp), answered=store.has_answer(rid),
+            state=_state(recorded.get(rid), request.expires_at, stamp),
+            answered=signers is not None and store.has_answer(rid)
+            and _signed_answer(row, store.answers / f"{rid}.json", signers, when, ssh_keygen, receipts, rid),
             claims={k: getattr(request, k) for k in CLAIM_KEYS}))
     return sorted(out, key=lambda r: (r.received_at, r.request_id))
 
@@ -221,8 +242,94 @@ def write_answer(root: Path | str, request_id: str, payload: Mapping[str, Any], 
     if len(data) > ROW_MAX:
         raise OperatorError(f"the answer row is over {ROW_MAX} bytes")
     path = store.answers / f"{request_id}.json"
+    now = _now(now)
+    for _ in range(_SQUAT_TRIES):
+        try:
+            store._link_new(path, data)
+            return path
+        except FileExistsError:
+            pass
+        if _clear_squat(store, receipts, row, request_id, path, signers, now, ssh_keygen):
+            raise OperatorError(f"request {request_id} already has an answer row")
+    raise OperatorError(f"request {request_id}'s answer name was taken again each time it was cleared")
+
+
+def _signed_answer(row: Mapping[str, Any], path: Path, signers: SignersSnapshot | None, now: datetime,
+                   ssh_keygen: Path | str | None, receipts: Receipts, request_id: str) -> bool:
+    """Whether ``path`` holds a signed answer for ``request_id`` (whose request row is ``row``) that the broker could
+    accept: it verifies, and its ``receipts_head`` is a head of ``receipts`` now reaching the request's filing (an
+    answer over another branch's head is refused by ``Receipts.decided``). False for a symlink, a non-regular file,
+    an unreadable one, or none."""
     try:
-        store._link_new(path, data)
-    except FileExistsError:
-        raise OperatorError(f"request {request_id} already has an answer row") from None
-    return path
+        got = _read_untrusted(path)
+    except (ValueError, OSError):
+        return False
+    if got is None:
+        return False
+    try:
+        answer = _parsed(got)
+    except ValueError:
+        return False
+    if answer_row_refusal(row, answer, signers, now, ssh_keygen=ssh_keygen) is not None:
+        return False
+    return receipts.head_refusal(answer["payload"]["receipts_head"], request_id) is None
+
+
+def _clear_squat(store: QueueStore, receipts: Receipts, row: Mapping[str, Any], request_id: str, path: Path,
+                 signers: SignersSnapshot | None, now: datetime, ssh_keygen: Path | str | None) -> bool:
+    """True when ``path`` holds an answer signed by a key in the current snapshot ``signers`` (left in place); an
+    answer signed by a key no longer in it is no valid answer (the broker refuses it too) and is cleared. Otherwise
+    whatever is there is renamed aside and False is returned, for the caller to link its own answer again. What the
+    rename moved is judged again from its own fd, never assumed to be the thing judged at the name (a swap in
+    between, or a freed inode reused, makes them differ while the name or the (dev, ino) look the same); should it
+    be a signed answer, it is linked back and True is returned (a verified answer is in place).
+    Should the link-back fail (the name taken again, or any other ``OSError`` but the quarantine file gone),
+    :class:`OperatorError` names the quarantine file that holds it. An answer signed by a key in the current
+    snapshot is never left in quarantine unreported: an ``OSError`` syncing the directory after the rename is held
+    until ``aside`` is judged (a signed answer is linked back regardless) and then names ``aside``.
+
+    ``answers/`` has no sticky bit, so the member that squatted can delete or rename the quarantine file once it
+    exists: a quarantine file gone is a name cleared, never an error. Any other ``OSError`` is :class:`OperatorError`,
+    the one failure the cockpit and phone writers handle."""
+    try:
+        return _clear_squat_os(store, receipts, row, request_id, path, signers, now, ssh_keygen)
+    except OSError as exc:
+        raise OperatorError(f"request {request_id}'s answer name could not be cleared ({exc})") from None
+
+
+def _clear_squat_os(store: QueueStore, receipts: Receipts, row: Mapping[str, Any], request_id: str, path: Path,
+                    signers: SignersSnapshot | None, now: datetime, ssh_keygen: Path | str | None) -> bool:
+    if _signed_answer(row, path, signers, now, ssh_keygen, receipts, request_id):
+        return True
+    aside = store.answers / f".quarantine-{request_id}-{os.urandom(8).hex()}.json"
+    try:
+        os.rename(path, aside)
+    except FileNotFoundError:
+        return False
+    try:
+        fsync_dir(store.answers)
+    except OSError as exc:                       # the rename happened: judge ``aside`` first, never lose its path
+        unsynced: OSError | None = exc
+    else:
+        unsynced = None
+    if _signed_answer(row, aside, signers, now, ssh_keygen, receipts, request_id):
+        try:
+            os.link(aside, path, follow_symlinks=False)
+        except FileExistsError:
+            raise OperatorError(f"request {request_id}'s answer name was taken again before the signed answer moved "
+                                f"aside could be linked back: it is at {aside}") from None
+        except FileNotFoundError:
+            return False
+        except OSError as exc:
+            raise OperatorError(f"request {request_id}'s signed answer moved aside could not be linked back ({exc}): "
+                                f"it is at {aside}") from None
+        try:
+            os.unlink(aside)
+        except FileNotFoundError:
+            pass
+        fsync_dir(store.answers)
+        return True                              # a verified answer is in place: the caller writes none of its own
+    if unsynced is not None:
+        raise OperatorError(f"request {request_id}'s answer name could not be cleared ({unsynced}): "
+                            f"what was moved aside is at {aside}") from None
+    return False

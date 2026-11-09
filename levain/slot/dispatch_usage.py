@@ -15,10 +15,12 @@ settles a None at the caps, the safe side. Nothing here raises. The readers are 
 without a broker, a front or a root-owned store (the real ones are the S10d residue, U-A1)."""
 from __future__ import annotations
 
+import json
+import os
 from collections.abc import Mapping
 from typing import Any, Callable, Optional
 
-__all__ = ["DispatchUsageSources"]
+__all__ = ["DispatchUsageSources", "lineage_spend", "lineage_spend_reader"]
 
 
 def _count(v: object) -> Optional[int]:
@@ -74,3 +76,105 @@ class DispatchUsageSources:
             return _count(self._seconds_of(session))
         except Exception:  # noqa: BLE001
             return None
+
+
+# --- a brokered run's spend (dispatch wave 3, S-B3) ---------------------------------------------------------------------
+
+#: the lineage sink's format and the longest line read (a `/3` row is under 2 KiB; a longer line is no row)
+_LINEAGE_FORMAT = "levain-dispatch-lineage/3"
+_LINE_MAX = 65536
+_INT_MAX = 2**63 - 1
+
+
+def _no_constant(name: str) -> None:
+    raise ValueError(name)
+
+
+def _micros(v: object) -> Optional[int]:
+    return v if type(v) is int and 0 <= v <= _INT_MAX else None
+
+
+def lineage_spend(path: object, run_id: str, final_rows: object = None) -> Optional[int]:
+    """The micro-dollars a run spent, summed from CONTROL's lineage sink (`L/lineage/lineage.jsonl`, `/3` rows) by
+    ``run_id``, and ONLY with a proof that the sink holds every row of the run (L3 wave3 r1, codex HIGH 3).
+
+    The completeness proof is ``final_rows``: the number of distinct lineage records keys built for the run, answered
+    only once keys holds the run final (no open hold, no refusal window still open). The sum is returned only when the
+    run's rows in the sink number exactly that. keys delivers rows asynchronously (its outbox, paced envelopes), so
+    S1 END proving the group gone says nothing about delivery: a sink holding the first of two calls (100 of 100 + 900)
+    would otherwise settle at 100 and release the rest for good. Neither keys nor CONTROL produces such a proof today
+    (no terminal row per run, no finalized-count query, and a row is sent only at a resolution, so an exchange still
+    open leaves no trace in the sink), so with ``final_rows`` None this answers None ALWAYS, and a brokered run settles
+    at its whole reservation. What keys must add before a brokered run can settle below its reservation: a per-run
+    final count (or terminal record) acknowledged only after every resolution of the run is durably in the sink.
+
+    Per row of the run: ``settled`` ``yes`` is its ``cost_microdollars`` (the hold when the cost is unsaid),
+    ``uncertain`` the larger of the cost and the hold (a call that may have been charged), ``no`` 0 (released or
+    refused). The dispatch uid reads the sink by group (the sink's own docstring, H6-4). Fail-closed: None, so the caller
+    settles at the whole reservation, when the proof is absent, not a count, or not the run's row count; when the sink
+    cannot be opened or read whole, any line is torn, over-long, not JSON or not a row; when ANY quarantine row exists
+    (it names no run, so it may be this one's); or when a row of the run carries a figure that is not a micro-dollar
+    count. A proof of 0 with no row of the run is 0."""
+    if type(run_id) is not str or not run_id or not isinstance(path, (str, os.PathLike)):
+        return None
+    if type(final_rows) is not int or final_rows < 0:
+        return None                # completeness unproven: never a number
+    total, matched = 0, 0
+    try:
+        fd = os.open(os.fspath(path), os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC)
+    except OSError:
+        return None
+    try:
+        with os.fdopen(fd, "rb") as fh:
+            fd = -1
+            while True:
+                raw = fh.readline(_LINE_MAX + 1)
+                if not raw:
+                    break
+                if len(raw) > _LINE_MAX or not raw.endswith(b"\n"):
+                    return None            # over-long, or a torn tail (an append in flight, or a crash): never a row
+                try:
+                    row = json.loads(raw.decode("utf-8"), parse_constant=_no_constant)
+                except (ValueError, RecursionError):
+                    return None
+                if not isinstance(row, dict) or row.get("format") != _LINEAGE_FORMAT:
+                    return None
+                if "quarantined" in row:
+                    return None
+                if row.get("run_id") != run_id:
+                    continue
+                settled, hold, cost = row.get("settled"), _micros(row.get("hold_microdollars")), row.get("cost_microdollars")
+                if hold is None or (cost is not None and _micros(cost) is None):
+                    return None
+                if settled == "yes":
+                    figure = hold if cost is None else cost
+                elif settled == "uncertain":
+                    figure = hold if cost is None else max(hold, cost)
+                elif settled == "no":
+                    figure = 0
+                else:
+                    return None
+                total += figure
+                matched += 1
+    except OSError:
+        return None
+    finally:
+        if fd != -1:
+            os.close(fd)
+    return total if matched == final_rows and total <= _INT_MAX else None
+
+
+def lineage_spend_reader(path: object, final_rows: Optional[Callable[[str], Any]] = None
+                         ) -> Callable[[str], Optional[int]]:
+    """:func:`lineage_spend` bound to the sink at ``path`` and to ``final_rows(run_id)``, keys' completeness proof for
+    the run (no such source exists yet: without one every read is None, the whole reservation): the ``spend`` a
+    brokered ``RealLauncher`` is built with. A proof source that raises is None."""
+    def read(run_id: str) -> Optional[int]:
+        if final_rows is None:
+            return None
+        try:
+            proof = final_rows(run_id)
+        except Exception:  # noqa: BLE001 - an unreadable proof is no proof
+            return None
+        return lineage_spend(path, run_id, proof)
+    return read

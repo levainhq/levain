@@ -136,6 +136,67 @@ def no_minted_runs(_event: Mapping[str, Any]) -> Optional[VerifierCall]:
     return None
 
 
+#: the CONTROL verbs :class:`SupervisorFacts` asks, read-only, as the dispatch peer
+SUPERVISOR_OPS = frozenset({"RUN-TICKET-FACTS", "ROUTEMAP-ACTIVE"})
+
+
+class _ActiveMap:
+    """The active route map as ``ROUTEMAP-ACTIVE`` answers it, in the shape
+    :func:`levain.dispatch.jobs.resolve_backend_identity` reads (``generation``, ``routes[id].backends``, ``digests``)."""
+
+    class _Route:
+        def __init__(self, backends: Mapping[str, Any]) -> None:
+            self.backends = dict(backends)
+
+    def __init__(self, generation: int, routes: Mapping[str, Any], digests: Mapping[str, Any]) -> None:
+        self.generation = generation
+        self.routes = {rid: self._Route(r["backends"]) for rid, r in routes.items()}
+        self.digests = dict(digests)
+
+
+class SupervisorFacts:
+    """PRE-W: the F9a follower's two supervisor readers, over CONTROL's socket as the dispatch peer (``port`` is a
+    :class:`levain.slot.dispatch_runtime.DispatchControlPort` limited to :data:`SUPERVISOR_OPS`).
+    :meth:`ticket_for` is ``RUN-TICKET-FACTS`` (the run's executor ticket from CONTROL's own journal) and
+    :meth:`routemap` is ``ROUTEMAP-ACTIVE`` (the active generation; another generation is None). Nothing a follower's
+    ``resolve`` returns reaches either. Every refusal, an unreachable CONTROL and any reply of the wrong shape is None
+    (the run is unresolved: fail closed); neither method raises."""
+
+    def __init__(self, port: Any) -> None:
+        self._port = port
+
+    def ticket_for(self, job_id: str, run_index: int) -> Optional[Mapping[str, Any]]:
+        try:
+            ans = self._port.call("RUN-TICKET-FACTS", job_id=job_id, run_index=run_index)
+            facts = ans.get("facts") if isinstance(ans, Mapping) else None
+            return dict(facts) if isinstance(facts, Mapping) else None
+        except Exception as exc:  # noqa: BLE001 - unreachable or refused: unresolved, never a label
+            log.warning("RUN-TICKET-FACTS for run %r of job %r: %s", run_index, job_id, getattr(exc, "name", type(exc).__name__))
+            return None
+
+    def routemap(self, generation: int) -> Optional[_ActiveMap]:
+        try:
+            ans = self._port.call("ROUTEMAP-ACTIVE")
+            # an int on both sides before the compare: `True == 1` and `1.0 == 1`, a wrong-shaped reply (PRE-W L3 r1)
+            if not isinstance(ans, Mapping) or type(generation) is not int or type(ans.get("generation")) is not int \
+                    or ans["generation"] != generation:
+                return None
+            routes, digests = ans.get("routes"), ans.get("digests")
+            if not isinstance(routes, Mapping) or not isinstance(digests, Mapping) \
+                    or not all(isinstance(r, Mapping) and isinstance(r.get("backends"), Mapping) for r in routes.values()):
+                return None
+            return _ActiveMap(generation, routes, digests)
+        except Exception as exc:  # noqa: BLE001 - unreachable or refused: unresolved, never a label
+            log.warning("ROUTEMAP-ACTIVE: %s", getattr(exc, "name", type(exc).__name__))
+            return None
+
+
+def supervisor_facts(socket_path: "Path | str") -> SupervisorFacts:
+    """The production :class:`SupervisorFacts` on CONTROL's socket at ``socket_path``."""
+    from levain.slot.dispatch_runtime import DispatchControlPort
+    return SupervisorFacts(DispatchControlPort(socket_path, ops=SUPERVISOR_OPS))
+
+
 def take_instance_lock(store_dir: Path) -> Optional[int]:
     """The held ``<store_dir>/follow.lock`` fd (close-on-exec), or None when another runner holds it."""
     fd = os.open(str(store_dir / LOCK_NAME), os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW | os.O_CLOEXEC, 0o600)
@@ -166,7 +227,11 @@ def _parser(host: str) -> argparse.ArgumentParser:
 
 
 def main(argv: Optional[Sequence[str]] = None, *, resolve: Callable[[Mapping[str, Any]], Optional[VerifierCall]]
-         = no_minted_runs) -> int:
+         = no_minted_runs, routemap: Any = None, ticket_for: Any = None,
+         supervisor: Any = "socket") -> int:
+    """Run the follower until SIGTERM/SIGINT. ``routemap`` and ``ticket_for`` (F9a) default to the SUPERVISOR's own
+    readers on ``--socket`` (:func:`supervisor_facts`, PRE-W) when ``supervisor`` is ``"socket"``; ``supervisor=None``
+    wires none (every run unresolved), and an explicit reader replaces its default. Never anything ``resolve`` says."""
     if os.geteuid() == 0:
         print("levain dispatch follower: refusing to run as root (it runs as _levain_dispatch)", file=sys.stderr)
         return EX_USAGE
@@ -185,7 +250,14 @@ def main(argv: Optional[Sequence[str]] = None, *, resolve: Callable[[Mapping[str
         return EX_INSTANCE_HELD
     try:
         jobs.event_cursor()                             # opens the database under the lock: a broken store ends here
-        runner = FollowRunner(EventFollower.at(jobs, a.socket, resolve, export_dir=a.export_dir))
+        # F9a / PRE-W: the run's executor ticket and the route map come from CONTROL's own records over its socket
+        # (RUN-TICKET-FACTS, ROUTEMAP-ACTIVE), never from resolve; an unreachable CONTROL resolves nothing
+        if supervisor == "socket":
+            facts = supervisor_facts(a.socket)
+            routemap = facts.routemap if routemap is None else routemap
+            ticket_for = facts.ticket_for if ticket_for is None else ticket_for
+        runner = FollowRunner(EventFollower.at(jobs, a.socket, resolve, export_dir=a.export_dir, routemap=routemap,
+                                               ticket_for=ticket_for))
         requested: list[int] = []
         old: dict[int, Any] = {}
         failed: list[BaseException] = []
@@ -233,7 +305,7 @@ def _run_into(runner: FollowRunner, failed: list[BaseException]) -> None:
 
 
 __all__ = ["BACKOFF_FIRST_S", "BACKOFF_MAX_S", "EX_INSTANCE_HELD", "FollowRunner", "LASTING_S", "RETRYABLE", "main",
-           "no_minted_runs", "take_instance_lock"]
+           "no_minted_runs", "take_instance_lock", "SUPERVISOR_OPS", "SupervisorFacts", "supervisor_facts"]
 
 
 if __name__ == "__main__":

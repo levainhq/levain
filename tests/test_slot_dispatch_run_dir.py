@@ -42,7 +42,13 @@ def test_install_steps_chown_then_mode(host):
     p = str(row.path)
     assert any(a[0].endswith("mkdir") and a[-1] == p for a in argvs)
     chown = next(i for i, a in enumerate(argvs) if a[0].endswith("chown") and a[-2:] == ("_levain_dispatch:levain-control", p))
-    assert argvs[-1][0].endswith("chmod") and argvs[-1][-2:] == (f"{row.mode:04o}", p) and chown < len(argvs) - 1
+    assert argvs[chown][1] == "-h"                       # never follows a link at the row (PREL3 1b-7)
+    last = layout.row_steps(host, [row])[-1]                # the mode last, after the chown
+    assert last.why == f"set {p} to {row.mode:04o}"
+    if host == "darwin":
+        assert argvs[-1][0].endswith("chmod") and argvs[-1][-2:] == (f"{row.mode:04o}", p) and chown < len(argvs) - 1
+    else:
+        assert last.call is not None and not last.argv
 
 
 def test_tmpfiles_recreates_it_at_boot():

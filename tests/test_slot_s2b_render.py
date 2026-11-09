@@ -497,6 +497,33 @@ def test_planted_discovery_refused_by_name():
     assert len(rd.discovery_refusals(allp)) == sum(len(n) for n in rd.DISCOVERY.values())
 
 
+def test_planted_discovery_folds_case_and_unicode():
+    """PRE-L3 4-2 (complement MED): on a case- and normalization-insensitive store (APFS, the Mac slots) the vendor's
+    ``open("settings.json")`` resolves to a planted ``Settings.JSON``, so every spelling that folds to a §5.5 name is
+    refused, by the one fold the settings check and the dispatch workspace use (NFD, then casefold)."""
+    import unicodedata
+    for root, spelled, name in (("claude", "Settings.JSON", "settings.json"), ("claude", "claude.md", "CLAUDE.md"),
+                                ("claude", "SKILLS/x", "skills"), ("home", ".Config/Git", ".config/git"),
+                                ("codex", "Config.TOML", "config.toml")):
+        got = rd.discovery_refusals({root: [spelled]})
+        assert [e.name for e in got] == [f"planted-discovery:{rd.wire_name(root + '-' + name)}"], spelled
+    # an NFD-decomposed spelling folds to the same name as its NFC twin
+    nfd = unicodedata.normalize("NFD", "settings.json")
+    assert [e.name for e in rd.discovery_refusals({"claude": [nfd.upper()]})] == ["planted-discovery:claude-settings-json"]
+    assert rd.fold_name("Ｓ") == rd.fold_name("ｓ")
+    assert rd.fold_name("É") == rd.fold_name(unicodedata.normalize("NFD", "é"))
+    # the codex config.toml exemption holds only for the exact rendered spelling, alone
+    blob, facts = egress(vendor="codex")
+    mine = rd.render(blob, facts).file("config/codex/config.toml").data
+    assert rd.discovery_refusals({"codex": ["config.toml"]}, codex_config=mine, rendered_codex_config=mine) == []
+    for listing in (["Config.TOML"], ["config.toml", "CONFIG.toml"]):
+        assert [e.name for e in rd.discovery_refusals({"codex": listing}, codex_config=mine,
+                                                      rendered_codex_config=mine)] == \
+            ["planted-discovery:codex-config-toml"], listing
+    # the repo-level listing (adopt preview) folds the same way
+    assert rd.repo_discovery_names([".Claude/settings.json", "agents.md"]) == [".claude", "AGENTS.md"]
+
+
 def test_repo_level_names_not_refused_but_listed():
     repo = [".claude/settings.json", ".codex", "CLAUDE.md", "AGENTS.md", ".mcp.json", ".agents/x", "src"]
     assert rd.discovery_refusals({}) == []
@@ -584,6 +611,299 @@ def test_repo_settings_env_naming_a_proxy_var_refused():
         assert [x.name for x in got] == ["loosening:" + rd.wire_name("env." + name)], name
         assert f in got[0].detail
     assert rd.repo_loosening_refusals({f: {"env": {"PROXY_HOST": "x", "HTTPS_PROXYX": "y"}}}) == []
+
+
+def test_repo_settings_env_moving_the_billing_identity_refused():
+    """PRE-L3 4-1 (codex HIGH): a repo settings ``env`` naming a key or bearer token Claude Code prefers to the stored
+    login (:data:`ABSENT_ENV` / :data:`PASSTHROUGH_ABSENT_ENV`) moves the bill of an unattended run (or stops it at the
+    "use this API key?" prompt), and a ``*_BASE_URL`` moves where its traffic goes; each is refused by name."""
+    f = ".claude/settings.json"
+    # class 1: ABSENT_ENV (claude)
+    for name in rd.ABSENT_ENV["claude"]:
+        got = rd.repo_loosening_refusals({f: {"env": {name: "sk-x"}}})
+        assert [x.name for x in got] == ["loosening:" + rd.wire_name("env." + name)], name
+        assert f in got[0].detail
+    # class 2: PASSTHROUGH_ABSENT_ENV (claude), the bearer token included
+    assert "ANTHROPIC_AUTH_TOKEN" in rd.PASSTHROUGH_ABSENT_ENV["claude"]
+    for name in rd.PASSTHROUGH_ABSENT_ENV["claude"]:
+        got = rd.repo_loosening_refusals({".claude/settings.local.json": {"env": {name: "t"}}})
+        assert [x.name for x in got] == ["loosening:" + rd.wire_name("env." + name)], name
+    # class 3: any *_BASE_URL
+    for name in ("ANTHROPIC_BASE_URL", "ANTHROPIC_BEDROCK_BASE_URL", "OPENAI_BASE_URL"):
+        got = rd.repo_loosening_refusals({f: {"env": {name: "http://x"}}})
+        assert [x.name for x in got] == ["loosening:" + rd.wire_name("env." + name)], name
+    e = refused(rd.refuse_repo_loosening, {f: {"env": {"ANTHROPIC_AUTH_TOKEN": "t"}}})
+    assert refusal_line(e) == '{"ok":false,"refused":"loosening:env-anthropic-auth-token"}\n'
+    # controls: a name that only contains the suffix, a model id and harmless toggles still launch (a bare BASE_URL
+    # no longer does: the _URL suffix refuses it, pf4r3)
+    assert rd.repo_loosening_refusals({f: {"env": {"MY_BASE_URL_NOTE": "x", "ANTHROPIC_MODEL": "z",
+                                                   "CLAUDE_CODE_MAX_OUTPUT_TOKENS": "8000",
+                                                   "DISABLE_TELEMETRY": "1"}}}) == []
+
+
+def _env_refusal(name: str):
+    return rd.repo_loosening_refusals({".claude/settings.json": {"env": {name: "x"}}})
+
+
+def test_repo_env_vendor_namespace_is_default_deny():
+    """pf4r3 (L3 r2 codex OPEN + MED): inside the vendor's namespace (every name its env-var reference documents, and
+    any name starting ``CLAUDE_``, ``ANTHROPIC_``, ``BETA_``, ``OTEL_``, ``DISABLE_`` or ``MCP_``, and the runtime's TLS
+    and options names) a repo settings ``env`` name is refused unless the allowlist names it; outside it, the provider
+    prefixes and the credential or endpoint suffixes are refused and every other name launches. A deny list of name
+    families missed vendor names each round while refusing harmless ones; the allowlist inverts that."""
+    from levain import sandbox_keys as sk
+    deny = "not on the repo env allowlist"
+    cases = {
+        # L3 r2 codex: a messaging socket, its token, a tracing endpoint
+        "CLAUDE_CODE_MESSAGING_SOCKET": deny, "CLAUDE_CODE_MESSAGING_TOKEN": deny, "BETA_TRACING_ENDPOINT": deny,
+        # invented: a vendor name the reference does not have yet
+        "CLAUDE_CODE_NEW_THING_2027": deny, "ANTHROPIC_NEW_ROUTE": deny, "MCP_NEW_ROUTE": deny,
+        "OTEL_EXPORTER_OTLP_ENDPOINT": deny, "DISABLE_NEW_GUARD": deny, "BETA_NEW_THING": deny,
+        # credentials, endpoints, provider switches, tenants, TLS, config and code loading
+        "ANTHROPIC_API_KEY": deny, "ANTHROPIC_AWS_WORKSPACE_ID": deny, "ANTHROPIC_BETAS": deny,
+        "CLAUDE_CODE_USE_BEDROCK": deny, "CLAUDE_CODE_OAUTH_TOKEN": deny, "CLAUDE_CODE_CERT_STORE": deny,
+        "CLAUDE_CONFIG_DIR": deny, "CLAUDE_CODE_PLUGIN_DIRS": deny, "CLAUDE_ENV_FILE": deny,
+        "CLAUDE_CODE_SHELL_PREFIX": deny, "NODE_OPTIONS": deny, "NODE_EXTRA_CA_CERTS": deny,
+        "NODE_TLS_REJECT_UNAUTHORIZED": deny, "SSL_CERT_FILE": deny, "SSL_CERT_DIR": deny, "REQUESTS_CA_BUNDLE": deny,
+        # names Claude Code sets for its own subprocesses, which the consent band reads to know the session
+        "CLAUDE_CODE_SESSION_ID": deny, "CLAUDECODE": deny, "CLAUDE_PID": deny, "CLAUDE_CODE_ENTRYPOINT": deny,
+        # a hook-off mode, a safety prompt removed, a tool added, and names levain renders for the slot
+        "CLAUDE_CODE_SAFE_MODE": deny, "CLAUDE_CODE_DISABLE_DANGEROUS_RM_TIMEOUT": deny,
+        "CLAUDE_CODE_USE_POWERSHELL_TOOL": deny, "DISABLE_AUTOUPDATER": deny,
+        "CLAUDE_CODE_DISABLE_BACKGROUND_TASKS": deny,
+        # L3 r3 complement: the auto-mode permission classifier's model, and prompt text sent to Claude on resume
+        "CLAUDE_CODE_AUTO_MODE_MODEL": deny, "CLAUDE_CODE_RESUME_PROMPT": deny,
+        # outside the namespace: a provider prefix, or a credential or endpoint suffix on any stem
+        "AWS_PROFILE": "prefix AWS_", "GOOGLE_APPLICATION_CREDENTIALS": "prefix GOOGLE_",
+        "VERTEX_REGION_NEXT_MODEL": "prefix VERTEX_", "OPENAI_ORG_ID": "prefix OPENAI_",
+        "MYAPP_API_KEY": "suffix _API_KEY", "MYAPP_ENDPOINT": "suffix _ENDPOINT", "MYAPP_TOKEN": "suffix _TOKEN",
+        "MYAPP_SOCKET": "suffix _SOCKET", "MYAPP_URL": "suffix _URL", "MYAPP_SECRET": "suffix _SECRET",
+        "MYAPP_PROFILE": "suffix _PROFILE",
+    }
+    for name, rule in cases.items():
+        assert sk.repo_env_rule(name) == rule, name
+        for spelled in (name, name.lower()):          # compared upper-cased
+            got = _env_refusal(spelled)
+            # the name as _refused caps it (refusal_line's 64)
+            assert [x.name for x in got] == [rd._refused("loosening", "env." + spelled, "").name], spelled
+            assert spelled in got[0].detail and rule in got[0].detail, got[0].detail
+    # codex's r1 AWS bypass, whole: every name refused, once
+    doc = {"env": {"CLAUDE_CODE_USE_ANTHROPIC_AWS": "1", "ANTHROPIC_AWS_API_KEY": "repo-key",
+                   "ANTHROPIC_AWS_WORKSPACE_ID": "repo-workspace"}}
+    assert sorted(x.name for x in rd.repo_loosening_refusals({".claude/settings.json": doc})) == [
+        "loosening:env-anthropic-aws-api-key", "loosening:env-anthropic-aws-workspace-id",
+        "loosening:env-claude-code-use-anthropic-aws"]
+    # model choice, caps, timeouts, off switches, and a project's own names launch
+    for name in ("ANTHROPIC_MODEL", "ANTHROPIC_DEFAULT_OPUS_MODEL", "ANTHROPIC_DEFAULT_HAIKU_MODEL",
+                 "ANTHROPIC_SMALL_FAST_MODEL", "CLAUDE_CODE_SUBAGENT_MODEL", "CLAUDE_CODE_EFFORT_LEVEL",
+                 "CLAUDE_CODE_MAX_OUTPUT_TOKENS", "MAX_THINKING_TOKENS", "BASH_DEFAULT_TIMEOUT_MS",
+                 "DISABLE_TELEMETRY", "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC", "CLAUDE_CODE_AUTO_COMPACT_WINDOW",
+                 "DEBUG", "MYAPP_MODE", "APP_ENV", "MY_BASE_URL_NOTE", "API_KEY_NOTE", "anthropic_model"):
+        assert sk.repo_env_rule(name) is None, name
+        assert _env_refusal(name) == [], name
+    # the proxy names keep their own refusal, once
+    assert [x.name for x in _env_refusal("HTTPS_PROXY")] == ["loosening:env-https-proxy"]
+    assert [x.name for x in _env_refusal("https_proxy")] == ["loosening:env-https-proxy"]
+
+
+#: Words whose presence in a variable's doc row would put it outside the allowlist's ground (an endpoint, a credential,
+#: an identity, TLS trust, telemetry headers, code loading, the sandbox or permission profile).
+_ENV_DOC_FORBIDDEN = ("url", "endpoint", "host", "socket", "token", "key", "auth", "login", "credential", "cert",
+                      "proxy", "provider", "account", "org", "workspace", "project", "tenant", "header", "helper",
+                      "wrapper", "dir", "path", "plugin", "sandbox", "permission")
+#: Allowlisted names whose doc row carries one of those words only incidentally (a mention of a provider the
+#: variable does not select, a "project settings" scope note, output "tokens"), with the words; each is justified
+#: by name in the pf4r3 RETURN. A row gaining a word fails until it is judged again.
+_ENV_DOC_JUSTIFIED = {
+    "ANTHROPIC_DEFAULT_FABLE_MODEL": ('provider',),
+    "API_FORCE_IDLE_TIMEOUT": ('provider',),
+    "API_TIMEOUT_MS": ('header', 'proxy'),
+    "CLAUDE_AX_PREPARK_MS": ('project',),
+    "CLAUDE_AX_SCREEN_READER": ('project',),
+    "CLAUDE_AX_STARTUP_QUIET_MS": ('project',),
+    "CLAUDE_CODE_ALWAYS_ENABLE_EFFORT": ('provider',),
+    "CLAUDE_CODE_ATTRIBUTION_HEADER": ('credential', 'provider', 'token', 'url'),
+    "CLAUDE_CODE_AUTO_COMPACT_WINDOW": ('token',),
+    "CLAUDE_CODE_BASH_EDIT_DIFF": ('permission',),
+    "CLAUDE_CODE_CONNECT_TIMEOUT_MS": ('header',),
+    "CLAUDE_CODE_DISABLE_ARTIFACT": ('key',),
+    "CLAUDE_CODE_DISABLE_ATTACHMENTS": ('project',),
+    "CLAUDE_CODE_DISABLE_BUNDLED_SKILLS": ('plugin',),
+    "CLAUDE_CODE_DISABLE_CFC_PROMPT": ('host',),
+    "CLAUDE_CODE_DISABLE_CLAUDE_MDS": ('project',),
+    "CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS": ('header', 'proxy'),
+    "CLAUDE_CODE_DISABLE_FILE_MENTIONS": ('path', 'project'),
+    "CLAUDE_CODE_DISABLE_MODEL_ACCESS_FALLBACK": ('account',),
+    "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC": ('plugin',),
+    "CLAUDE_CODE_DISABLE_NONSTREAMING_FALLBACK": ('proxy',),
+    "CLAUDE_CODE_DISABLE_OFFICIAL_MARKETPLACE_AUTOINSTALL": ('plugin',),
+    "CLAUDE_CODE_DISABLE_THINKING": ('provider',),
+    "CLAUDE_CODE_ENABLE_AUTO_MODE": ('provider',),
+    "CLAUDE_CODE_ENABLE_FINE_GRAINED_TOOL_STREAMING": ('proxy',),
+    "CLAUDE_CODE_ENABLE_PROMPT_SUGGESTION": ('account',),
+    "CLAUDE_CODE_FILE_READ_MAX_OUTPUT_TOKENS": ('token',),
+    "CLAUDE_CODE_GZIP_REQUEST_BODIES": ('proxy',),
+    "CLAUDE_CODE_HIDE_CWD": ('path',),
+    "CLAUDE_CODE_IDLE_COMPACT_MIN_TOKENS": ('token',),
+    "CLAUDE_CODE_MAX_OUTPUT_TOKENS": ('token',),
+    "CLAUDE_CODE_MAX_RETRIES": ('key',),
+    "CLAUDE_CODE_PLUGIN_GIT_TIMEOUT_MS": ('plugin',),
+    "CLAUDE_CODE_PROMPT_CACHE_TTL": ('helper',),
+    "CLAUDE_CODE_SCRIPT_CAPS": ('key',),
+    "CLAUDE_CODE_USER_DIALOG_TIMEOUT_MS": ('host', 'permission', 'project'),
+    "CLAUDE_CODE_WEBFETCH_CACHE_TTL_MS": ('url',),
+    "CLAUDE_ENABLE_STREAM_WATCHDOG": ('provider',),
+    "CLAUDE_STREAM_IDLE_TIMEOUT_MS": ('proxy',),
+    "DEBUG": ('path',),
+    "DISABLE_FEEDBACK_COMMAND": ('path',),
+    "DISABLE_INSTALL_GITHUB_APP_COMMAND": ('provider',),
+    "DISABLE_INTERLEAVED_THINKING": ('header', 'provider'),
+    "DISABLE_LOGIN_COMMAND": ('key', 'login'),
+    "DISABLE_TELEMETRY": ('path',),
+    "ENABLE_PROMPT_CACHING_1H": ('key',),
+    "FORCE_HYPERLINK": ('url',),
+    "IS_DEMO": ('header',),
+    "MAX_MCP_OUTPUT_TOKENS": ('token',),
+    "MAX_THINKING_TOKENS": ('provider', 'token'),
+    "MCP_DISCOVERY_CACHE": ('account',),
+}
+
+
+def _env_doc_words(row: str) -> tuple:
+    import re
+    prose = re.sub(r"\]\([^)]*\)", "]", row).lower()          # link targets are not the variable's meaning
+    return tuple(sorted(w for w in _ENV_DOC_FORBIDDEN if re.search(r"\b" + w + r"s?\b", prose)))
+
+
+def test_repo_env_rule_over_the_vendor_reference():
+    """pf4r3: every variable in the vendor's env-var reference (the fixture: the table's names and doc rows, fetched on
+    the date it names) gets a verdict, and the recorded verdicts are the rule's. The allowlist is drawn from it: a name
+    is on it only if its doc row changes no endpoint, provider, credential, identity, TLS trust, telemetry destination
+    or headers, code loading or sandbox profile, and no allowlisted row names a forbidden word unless judged."""
+    from levain import sandbox_keys as sk
+    from levain.claude_code_env_names import FETCHED, VENDOR_ENV_NAMES
+    table = json.loads((REPO / "tests/fixtures/claude_code_env_vars_1108.json").read_text())
+    assert table["fetched"] == FETCHED == "2026-11-08"
+    assert table["source"].startswith("https://code.claude.com/docs/en/env-vars")
+    assert set(table["verdicts"]) == set(table["rows"]) == VENDOR_ENV_NAMES
+    got = {n: ("refused" if sk.repo_env_rule(n) else "allowed") for n in VENDOR_ENV_NAMES}
+    assert got == table["verdicts"]
+    allowed = {n for n, v in got.items() if v == "allowed"}
+    assert allowed == set(sk.REPO_ENV_ALLOW)
+    assert all(sk.repo_env_rule(n) == "not on the repo env allowlist" for n in VENDOR_ENV_NAMES - allowed)
+    words = {n: _env_doc_words(table["rows"][n]) for n in sorted(allowed)}
+    assert {n: w for n, w in words.items() if w} == _ENV_DOC_JUSTIFIED
+    for must in ("CLAUDE_CODE_MESSAGING_SOCKET", "CLAUDE_CODE_MESSAGING_TOKEN", "BETA_TRACING_ENDPOINT",
+                 "ANTHROPIC_AWS_API_KEY", "ANTHROPIC_FOUNDRY_AUTH_TOKEN", "ANTHROPIC_PROFILE", "CLAUDE_CODE_USE_MANTLE",
+                 "CLAUDE_CODE_CLIENT_CERT", "CLAUDE_CODE_CERT_STORE", "CLAUDE_CODE_PROVIDER_MANAGED_BY_HOST",
+                 "HTTPS_PROXY", "CLAUDE_CODE_IDE_HOST_OVERRIDE", "CLAUDE_CODE_GATEWAY_HINT_HEADERS"):
+        assert table["verdicts"][must] == "refused", must
+    for must in ("ANTHROPIC_MODEL", "ANTHROPIC_DEFAULT_SONNET_MODEL", "CLAUDE_CODE_MAX_OUTPUT_TOKENS",
+                 "DISABLE_TELEMETRY", "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC", "DEBUG"):
+        assert table["verdicts"][must] == "allowed", must
+
+
+def test_vendor_env_names_module_is_stdlib_data():
+    """pf4r3: the runtime reads the vendor's names from a module under ``levain/`` that imports nothing (it runs in the
+    3.9 run server, beside ``levain.sandbox_keys``), never from ``tests/``."""
+    import ast
+    from levain import claude_code_env_names as cen
+    from levain import sandbox_keys as sk
+    tree = ast.parse(pathlib.Path(cen.__file__).read_text())
+    imports = [n for n in ast.walk(tree) if isinstance(n, (ast.Import, ast.ImportFrom))]
+    assert [(i.module, [a.name for a in i.names]) for i in imports] == [("__future__", ["annotations"])]
+    assert "tests/" not in pathlib.Path(sk.__file__).read_text()
+    assert not hasattr(sk, "REPO_ENV_SWITCH_PREFIX") and not hasattr(sk, "REPO_ENV_CLAUDE_WORDS")
+
+
+def test_the_credential_name_lists_are_refused_by_the_repo_env_rule():
+    """The render's absent-env lists and the two carry lists (a room child's kept names, a resumed session's carried
+    names) each name only variables the repo-env rule refuses, so a name added to one of them that the rule lets
+    through fails here."""
+    from levain import sandbox_keys as sk
+    from levain.consent import delivery as dv
+    from levain.coordinator import room_launch as rl
+    assert not hasattr(rd, "_REPO_BILLING_ENV") and not hasattr(sk, "CLAUDE_CREDENTIAL_ENV")
+    names = set(dv._AGENT_AUTH) | {n for n in rl.ENV_KEEP if n.startswith("CLAUDE_")}
+    for v in ("claude",):
+        names |= rd.ABSENT_ENV[v] | rd.PASSTHROUGH_ABSENT_ENV[v]
+    assert names and all(sk.repo_env_rule(n) for n in names), sorted(n for n in names if not sk.repo_env_rule(n))
+
+
+def test_repo_settings_credential_helper_keys_refused():
+    """PRE-L3 fix4 (L1 MED-2, L2 MED-2), pf4r2 R2 (codex MED): a repo settings KEY that runs a command to supply a
+    credential or request headers is refused at the repo layer, by key pattern (case-insensitive), whatever its
+    value: a ``*Helper``, a ``*AuthRefresh`` or a ``*CredentialExport``."""
+    from levain import sandbox_keys as sk
+    cases = {"apiKeyHelper": "suffix helper", "otelHeadersHelper": "suffix helper",
+             "awsAuthRefresh": "suffix authrefresh", "gcpAuthRefresh": "suffix authrefresh",
+             "azureAuthRefresh": "suffix authrefresh",                      # invented: the family, not the list
+             "awsCredentialExport": "suffix credentialexport", "gcpCredentialExport": "suffix credentialexport",
+             "APIKEYHELPER": "suffix helper", "GcpAuthRefresh": "suffix authrefresh"}
+    for key, rule in cases.items():
+        assert sk.repo_settings_rule(key) == rule, key
+        for path in (".claude/settings.json", ".claude/settings.local.json"):
+            got = rd.repo_loosening_refusals({path: {key: "/bin/sh -c x"}})
+            assert [x.name for x in got] == ["loosening:" + rd.wire_name(key)], key
+            assert key in got[0].detail and path in got[0].detail and rule in got[0].detail
+    for key in ("hooks", "statusLine", "model", "permissions", "forceLoginMethod", "helperText"):
+        assert sk.repo_settings_rule(key) is None, key
+    assert rd.repo_loosening_refusals({".claude/settings.json": {"hooks": {}, "statusLine": {}}}) == []
+
+
+def test_repo_settings_rule_over_the_vendor_reference():
+    """pf4r2 R2: every top-level settings key the vendor's settings reference lets a repo file set (scope ``Any
+    file``, ``Project`` or ``Local``; the index fetched on the date the fixture names) gets the verdict recorded for
+    it. Refused: the keys documented as running a command that supplies a credential or headers."""
+    from levain import sandbox_keys as sk
+    table = json.loads((REPO / "tests/fixtures/claude_code_settings_1108.json").read_text())
+    assert table["fetched"] == "2026-11-08"
+    assert table["source"].startswith("https://code.claude.com/docs/en/settings-reference")
+    got = {k: ("refused" if sk.repo_settings_rule(k) else "allowed") for k in table["verdicts"]}
+    assert got == table["verdicts"]
+    assert sorted(k for k, v in table["verdicts"].items() if v == "refused") == [
+        "apiKeyHelper", "awsAuthRefresh", "awsCredentialExport", "gcpAuthRefresh", "otelHeadersHelper"]
+
+
+def test_supervisor_has_no_second_fold():
+    """PRE-L3 fix4 (L1 LOW-1): the settings reader folds names with render's ``fold_name``, not a copy of it; and
+    that fold treats case, unicode compatibility, decomposition and whitespace as ruled."""
+    import unicodedata
+    from levain.slot import supervisor as sv
+    assert not hasattr(sv, "_fold")
+    assert rd.fold_name("Settings.JSON") == rd.fold_name("settings.json")
+    assert rd.fold_name("ＣＬＡＵＤＥ.md") != rd.fold_name("claude.md")      # NFD, not NFKC: width forms stay distinct
+    assert rd.fold_name(unicodedata.normalize("NFD", "é")) == rd.fold_name("É")
+    assert rd.fold_name(" .claude") != rd.fold_name(".claude")              # whitespace is part of the name
+
+
+def test_fold_name_is_nfd_after_casefold():
+    """pf4r2 R3 (L3 r1 complement LOW): the fold is Unicode's canonical caseless form, NFD(casefold(NFD(x))), so its
+    output is NFD whatever casefold returns. Measured on 2026-11-08: under the Unicode tables of CPython 3.12
+    (15.0.0) and 3.9 (13.0.0) no single code point, and no pair of a case-changing character with a combining mark,
+    gives a non-NFD casefold of its NFD, so the outer NFD changes nothing today; it is the guard for a table where it
+    would. The characters below are the ones whose casefold expands or decomposes."""
+    import unicodedata
+    def canonical(x: str) -> str:
+        return unicodedata.normalize("NFD", unicodedata.normalize("NFD", x).casefold())
+    for c in ("ΐ", "ﬃ", "İ", "ᾷ", "ẞ", "ͅ", "ᾀ", "ŉ", "ǰ"):
+        assert rd.fold_name(c) == canonical(c), ascii(c)
+        assert unicodedata.is_normalized("NFD", rd.fold_name(c)), ascii(c)
+    assert rd.fold_name("ΐ") == "ΐ"     # the ruling's example, expanded and decomposed
+    assert rd.fold_name("ﬃ") == "ffi"                     # a ligature folds to three letters
+    for cp in range(0x10000):
+        if 0xD800 <= cp <= 0xDFFF:
+            continue
+        assert unicodedata.is_normalized("NFD", rd.fold_name(chr(cp))), hex(cp)
+
+
+def test_codex_config_toml_exemption_is_not_a_directory_entry():
+    """PRE-L3 fix4 (L1 LOW-3): a ``config.toml/`` entry (a directory marker) is not the rendered file."""
+    blob, facts = egress(vendor="codex")
+    mine = rd.render(blob, facts).file("config/codex/config.toml").data
+    assert [e.name for e in rd.discovery_refusals({"codex": ["config.toml/"]}, codex_config=mine,
+                                                  rendered_codex_config=mine)] == ["planted-discovery:codex-config-toml"]
+    assert rd.discovery_refusals({"codex": ["config.toml"]}, codex_config=mine, rendered_codex_config=mine) == []
 
 
 def test_levain_repo_settings_pass():
