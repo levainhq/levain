@@ -587,8 +587,9 @@ def workdir_name(attempt: str) -> str:
 @dataclass(frozen=True)
 class VerifiedReadSet:
     """What :func:`verify_readset` checked: the attempt, its workdir, ``P``'s identity (dev/ino), the commit ``E``,
-    the digest ``D`` and the object count ``N``, plus the resource limits the clone ran under. A record, not a
-    capability: any caller can construct one, so every sink re-checks it against the contract bytes."""
+    the digest ``D`` and the object count ``N``, plus the resource limits the clone ran under, and ``repo_settings``:
+    the commit's settings layers as :func:`_layer_check` froze them. A record, not a capability: any caller can
+    construct one, so every sink re-checks it against the contract bytes."""
     attempt: str
     workdir: str
     p_dev: int
@@ -597,6 +598,7 @@ class VerifiedReadSet:
     digest: str
     objects: int
     limits: tuple = ()
+    repo_settings: object = None
 
 
 #: The errors that mean a task exited while it was being counted; any other error makes the count untrustworthy.
@@ -775,14 +777,20 @@ def _layer_run(argv: list[str], **kw) -> subprocess.CompletedProcess:
         raise ReadSetRefused("readset-git-unavailable", f"git could not run ({type(exc).__name__})") from None
 
 
-def _layer_check(repo_dir: str, E: str) -> None:
+def _layer_check(repo_dir: str, E: str) -> dict:
+    """The repo-layer settings check on the commit ``E`` (a loosening is refused, never stripped); returns that
+    commit's settings layers as :func:`levain.slot.render.freeze_repo_settings` freezes them (its ``settings``, the part
+    a render blob carries), empty when the commit has no settings file."""
     from pathlib import Path
 
     from levain.slot import Refused
+    from levain.slot.render import freeze_repo_settings
     from levain.slot.supervisor import check_repo_layer, repo_layer_docs
 
     try:
-        check_repo_layer(repo_layer_docs(Path(repo_dir), treeish=E, run=_layer_run))
+        docs = repo_layer_docs(Path(repo_dir), treeish=E, run=_layer_run)
+        check_repo_layer(docs)
+        return dict(freeze_repo_settings(docs).settings)
     except Refused as exc:
         raise ReadSetRefused(exc.name, exc.detail) from None
 
@@ -949,12 +957,12 @@ def _verify_in(pfd: int, D: str, fd: int, parent: str, name: str, attempt: str, 
         if counts.get("in-pack") != str(N) or counts.get("count") != "0":
             raise ReadSetRefused("readset-surplus", f"in-pack {counts.get('in-pack')}, loose {counts.get('count')}; "
                                  f"the read set is {N}")
-        _layer_check(p, E)
+        settings = _layer_check(p, E)
         pst2 = os.lstat(p)
         if (pst2.st_dev, pst2.st_ino) != (pst.st_dev, pst.st_ino):
             raise ReadSetRefused("readset-git-failed", "the clone was replaced during the checks")
         return VerifiedReadSet(attempt=attempt, workdir=workdir, p_dev=pst.st_dev, p_ino=pst.st_ino, commit=E,
-                               digest=D, objects=N, limits=limits)
+                               digest=D, objects=N, limits=limits, repo_settings=settings)
     finally:
         _close_dir(wfd, workdir)
 
