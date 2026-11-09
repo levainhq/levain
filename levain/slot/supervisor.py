@@ -1678,7 +1678,11 @@ class Supervisor:
             from levain.consent.questions import QuestionStore
 
             judge = self.s.allow_judge or slot_allow.default_judge(qdir)
-            slot_allow.apply_answered(qdir, path, judge=judge)
+            refused: list = []
+            slot_allow.apply_answered(qdir, path, judge=judge, refused=refused)
+            for rule, why in refused:
+                self.say(f"slot allow rule answered yes, not carried: {rule} ({why}); the next time a slot saves it, "
+                         "it is asked again")
             try:
                 slot_allow.remind(qdir, path, judge=judge)
             except Exception:   # noqa: BLE001 - a reminder never stops a launch
