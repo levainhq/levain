@@ -175,6 +175,11 @@ NOBYTES = ActionExposure(actions=20, unit="tool_calls", seconds=3600, tunnel_byt
 SHORT = ActionExposure(actions=20, unit="tool_calls", seconds=1800, tunnel_bytes=5_000_000)
 
 
+def _auth(reserved):
+    """The auth run_session gives a launch for this reservation: its billing's."""
+    return None if reserved is None else S.AUTH_FOR_BILLING.get(reserved.billing)
+
+
 @pytest.mark.parametrize("role,reserved,launcher,exposure,why", [
     ({**ROLE, "executor": "dream"}, API, Stub(), None, "role-not-session"),
     ({**ROLE, "harness": "codex"}, API, Stub(), None, "harness-not-claude"),
@@ -203,7 +208,7 @@ SHORT = ActionExposure(actions=20, unit="tool_calls", seconds=1800, tunnel_bytes
 ])
 def test_every_refusal_names_its_reason(role, reserved, launcher, exposure, why):
     usd = reserved.usd_micros if reserved is not None else 0
-    assert S.launch_refusal(role, reserved, launcher, exposure, usd_micros=usd) == why
+    assert S.launch_refusal(role, reserved, launcher, exposure, usd_micros=usd, auth=_auth(reserved)) == why
 
 
 @pytest.mark.parametrize("reserved,launcher,exposure,usd", [
@@ -212,12 +217,13 @@ def test_every_refusal_names_its_reason(role, reserved, launcher, exposure, why)
     (SUBRES, Stub(auth="passthrough"), EXP, 5),              # a subscription reserved 0 dollars
 ])
 def test_the_executors_dollars_are_the_reserved_ones(reserved, launcher, exposure, usd):
-    assert S.launch_refusal(ROLE, reserved, launcher, exposure, usd_micros=usd) == "dollars-not-the-reserved-exposure"
+    assert S.launch_refusal(ROLE, reserved, launcher, exposure, usd_micros=usd,
+                            auth=_auth(reserved)) == "dollars-not-the-reserved-exposure"
 
 
 def test_the_two_clean_routes_pass_the_refusals():
-    assert S.launch_refusal(ROLE, API, Stub(), None, usd_micros=100_000) is None
-    assert S.launch_refusal(ROLE, SUBRES, Stub(auth="passthrough"), EXP, usd_micros=0) is None
+    assert S.launch_refusal(ROLE, API, Stub(), None, usd_micros=100_000, auth="brokered") is None
+    assert S.launch_refusal(ROLE, SUBRES, Stub(auth="passthrough"), EXP, usd_micros=0, auth="passthrough") is None
 
 
 def test_a_refused_run_spawns_nothing_ends_failed_and_frees_its_slot_and_reservation(rig):

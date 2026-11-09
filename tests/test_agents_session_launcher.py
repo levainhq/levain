@@ -554,7 +554,7 @@ def test_a_start_failure_through_run_session_frees_the_slot_and_settles_at_zero(
 
 def test_the_default_launcher_is_still_unwired():
     assert S.launch_refusal(ROLE, S.Reserved("api_key", None, 0, 3600, S._hash_or_none(ROLE)), S.UnwiredLauncher(),
-                            None, usd_micros=0) == "launcher-not-wired"
+                            None, usd_micros=0, auth="brokered") == "launcher-not-wired"
 
 
 

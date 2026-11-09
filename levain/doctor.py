@@ -1812,12 +1812,13 @@ def _micro_usd(v: int) -> str:
 
 def brokered_launcher_rows(setting: tuple[str, str | None], links: Any, ceiling: Any,
                            serving: Any = None) -> list[CheckResult]:
-    """PRE-W, design 1105-49 §4: the brokered launcher's rows. ``setting`` is
+    """The brokered launcher's rows (design 1105-49 §4). ``setting`` is
     :func:`levain.slot.services.dispatch_run.read_dispatch_auth`'s ``(auth, why)``; ``links()`` the standing api_key
     agent links as ``(link_id, per-run micro-dollars, model or None)``; ``ceiling()`` the root ceiling's
     ``max_reserved_microdollars_per_run``; ``serving(model)`` the brokered route serving ``model`` or None (no route).
-    A reader that raises is "cannot tell" (a warning, never a pass). OFF is no row (a setting present but refused is a
-    warning) and never fails. ON, per
+    A reader that raises is "cannot tell" (a warning, never a pass). OFF never fails: the explicit opt-out is a
+    neutral row naming it, a warning when api_key agent links stand (each will refuse every run) or cannot be read;
+    a setting present but refused is a warning with its reason. ON, per
     link: a share over the ceiling FAILS (every fire would refuse at mint), so does a model no brokered route serves;
     a model this run could not read is a warning (``ROUTE-RESOLVE`` judges it at the first fire)."""
     auth, why = setting
@@ -1825,15 +1826,27 @@ def brokered_launcher_rows(setting: tuple[str, str | None], links: Any, ceiling:
         if why is not None:
             return [CheckResult(_BROKERED, True, f"off: {why}",
                                 "The setting is L/policy/dispatch_auth: root's file whose whole content is "
-                                "'brokered'. Anything else is OFF.", warn=True)]
-        return []                     # OFF, the default: no row (most installs never turn it on)
+                                "'brokered' (on) or 'passthrough' (opt out). Anything else is OFF.", warn=True)]
+        opted = "off: opted out (L/policy/dispatch_auth holds 'passthrough')"
+        fix = "Delete the setting (or write 'brokered') to turn the brokered server on."
+        try:
+            n = len(list(links()))
+        except Exception as exc:  # noqa: BLE001 - cannot tell is a warning, never a pass
+            return [CheckResult(_BROKERED, True, f"{opted}; the api_key agent links cannot be read "
+                                f"({type(exc).__name__}), so whether any run will refuse is not known", fix, warn=True)]
+        if n:
+            # L3 w3client r1 (complement LOW 1): a standing link under the opt-out is an agent that cannot run
+            return [CheckResult(_BROKERED, True, f"{opted}; {n} standing API-key agent link{'s' if n != 1 else ''} "
+                                "will refuse every run (no brokered server serves)", fix, warn=True)]
+        return [CheckResult(_BROKERED, True, f"{opted}; an API-key agent's run refuses because no brokered server "
+                            "serves", fix, neutral=True)]
     try:
         standing = list(links())
     except Exception as exc:  # noqa: BLE001 - cannot tell is a warning, never a pass
         return [CheckResult(_BROKERED, True, f"on, but the api_key agent links cannot be read ({type(exc).__name__}); "
                             "their per-run figures are not checked", warn=True)]
     if not standing:
-        return [CheckResult(_BROKERED, True, "on: the brokered server listens, but operator fires are not routed to it yet; no standing api_key agent link")]
+        return [CheckResult(_BROKERED, True, "on: the brokered server serves an API-key agent's run on its own socket; no standing api_key agent link")]
     try:
         top = ceiling()
         if type(top) is not int:
@@ -1853,8 +1866,8 @@ def brokered_launcher_rows(setting: tuple[str, str | None], links: Any, ceiling:
                                     "Re-sign the link at or under the ceiling, or raise the ceiling (install helper "
                                     "set-ceiling)."))
             continue
-        said = (f"per-run {_micro_usd(share)} within the ceiling {_micro_usd(top)} (the brokered server listens; operator fires are "
-                "not routed to it yet)")
+        said = (f"per-run {_micro_usd(share)} within the ceiling {_micro_usd(top)} (the brokered server serves this "
+                "agent's runs)")
         if model is None or serving is None:
             rows.append(CheckResult(name, True, f"{said}; the role's model is not read here, so its route is "
                                     "judged at the first fire (ROUTE-RESOLVE)", warn=True))

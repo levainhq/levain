@@ -87,7 +87,9 @@ class Env:
 
     def client(self):
         r = self.rig
-        return C.DispatchSessionLauncher(self.connect, lambda occ: C.link_proof(r.store, r.world.root, occ, now=r.now()))
+        # this env serves ONE in-process server, whichever auth its launcher has: both sockets reach it
+        return C.DispatchSessionLauncher(self.connect, lambda occ: C.link_proof(r.store, r.world.root, occ, now=r.now()),
+                                         connect_brokered=self.connect, auth_of=C.session_auth_of(r.store))
 
     def drain(self):
         for t in self.threads:
@@ -1154,7 +1156,7 @@ def test_the_registered_launcher_answers_end_session_through_to_the_real_server(
     W.write_install(rig.store.directory, cockpit_root=rig.world.root, launcher=C.LAUNCHER_NAME)
     got = W.resolve_launcher(rig.store, W.read_install(rig.store.directory))
     assert callable(getattr(got, "end_session", None)) and isinstance(got, S.SessionEnder) and not hasattr(got, "stop")
-    got._connect = env.connect                       # the production socket path, swapped for the in-process server
+    got._connect = got._connect_brokered = env.connect   # the production socket paths, swapped for the in-process server
     oid, key = _session_row(rig)
     env.launcher.spawn(S.SessionLaunch(oid, key, "claude", "sonnet", "b", "passthrough", EXP))
     assert _executor(rig, oid, got, DEAD).stop(10).terminated is True
