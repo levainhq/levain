@@ -3908,7 +3908,9 @@ def read_allow(ctx: Ctx, req: RuntimeRequest, blob: None) -> Dict[str, object]:
     RETAINED session's clone, so the supervisor can offer the rules the slot's dialog saved. No path and no name come
     from the caller. The caller is bound as every lease-free verb binds it (``no-session`` for another's session); the
     session must be RETAINED by root's facts (``not-retained:trash``, ``not-retained:absent``). The file must be
-    regular, with one link, within :data:`ALLOW_CAP`; anything else is ``allow-unreadable``, never content. Answers
+    regular, with one link, within :data:`ALLOW_CAP`; anything else is ``allow-unreadable``, never content. A file
+    the session owner (:func:`session_owner_uid`, the uid the clone is the slot's under) does not own is
+    ``allow-not-slots``: a link to a file of anyone else's is never read. Answers
     ``{present: false}`` when the file or a directory above it is absent, else ``{present: true, b64}``."""
     from levain.slot import store_verbs as SV
 
@@ -3923,6 +3925,7 @@ def read_allow(ctx: Ctx, req: RuntimeRequest, blob: None) -> Dict[str, object]:
         raise Refused("not-retained:trash", a.session)
     if not SV.retained_whole(facts, sv):
         raise Refused("not-retained:absent", a.session)
+    owner = ctx.seams.chowned_uid(session_owner_uid(a))
     dfd = _allow_dir(ctx.store.fd, a.session)
     if dfd is None:
         return {"present": False}
@@ -3945,6 +3948,8 @@ def read_allow(ctx: Ctx, req: RuntimeRequest, blob: None) -> Dict[str, object]:
                 raise Refused("allow-unreadable", f"{ALLOW_NAME} changed while opening")
             if st.st_nlink != 1:
                 raise Refused("allow-unreadable", f"{ALLOW_NAME} has {st.st_nlink} links")
+            if st.st_uid != owner:
+                raise Refused("allow-not-slots", f"{ALLOW_NAME} is owned by uid {st.st_uid}, not the session's")
             if st.st_size > ALLOW_CAP:
                 raise Refused("allow-unreadable", f"{ALLOW_NAME} is over {ALLOW_CAP} bytes")
             out = bytearray()

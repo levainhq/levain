@@ -3,6 +3,7 @@ and nothing else. Driven through :func:`runtime_helper.main` on the scratch stor
 from __future__ import annotations
 
 import base64
+import dataclasses
 import os
 
 import pytest
@@ -16,9 +17,19 @@ from tests.test_slot_rootverbs_discard_restore import DISPATCH_UID, OTHER, S, ST
 RULES = b'{"permissions": {"allow": ["Bash(npm test *)"]}}'
 
 
+SLOT_UID = 3990
+
+
+def _as_slot(uid):
+    """The scratch store's files are the test user's: they stand for files the slot account owns."""
+    return os.getuid() if uid == SLOT_UID else uid
+
+
 @pytest.fixture
 def world(tmp_path):
-    return World(tmp_path)
+    w = World(tmp_path)
+    w.seams = dataclasses.replace(w.seams, chowned_uid=_as_slot)
+    return w
 
 
 def claude_dir(world, s=S):
@@ -137,3 +148,9 @@ def test_a_hard_linked_file_is_refused(world, tmp_path):
 def test_a_file_past_the_cap_is_refused(world):
     put(world, b" " * (RH.ALLOW_CAP + 1))
     refused(world, "allow-unreadable")
+
+
+def test_a_file_the_slot_account_does_not_own_is_refused(world):
+    put(world)
+    world.seams = dataclasses.replace(world.seams, chowned_uid=lambda uid: uid)   # the file is not the slot's
+    refused(world, "allow-not-slots")
