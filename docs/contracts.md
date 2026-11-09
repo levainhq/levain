@@ -325,7 +325,8 @@ a new tag. anneal reads `expect.levain` as the verdict and ignores `expect.upstr
 A thread envelope (`levain-thread-envelope/2`) names what a coordinator may do: `where`, then the effect lists `lands`, `pushes`
 and `publishes`. It may also carry one optional key, `launches`: a list of `{"repo": ..., "count": N}`, one entry per repo,
 that lets the flow desk start up to N seats in that repo without asking again, until the envelope's stop. The repo must be one of
-the envelope's `where` repos, `count` is a whole number from 1 to 4 (the default offered is 2), and a repo is named once.
+the envelope's `where` repos, `count` is a whole number from 1 to `LAUNCH_MAX` (the default offered is `LAUNCH_DEFAULT`; both in
+`levain/coordinator/envelope.py`), and a repo is named once.
 
 - **Absent means no grant.** The key is left out of the body unless it is named, so an envelope signed before it existed has the
   same bytes, digest and signature as it always did and still verifies. The format stays `/2`. An older levain refuses a body
@@ -335,8 +336,9 @@ the envelope's `where` repos, `count` is a whole number from 1 to 4 (the default
   scope cut from an envelope never carries it, and neither does a seat lease.
 - **Who may set it.** The "Add an envelope" window, with a toggle that is off by default, signed with an enrolled passkey. The
   server decides by the credential the request was authenticated with (a paired device's token runs as that device), never by
-  anything the page sends: the cockpit page and any device paired from it (directly or through another device it paired) may;
-  another surface's token, and any device that surface paired, may not. The rule is `_Handler._coord_may_launch` in
+  anything the page sends: the cockpit page, and any device whose pairing chain starts at the cockpit page or at the laptop's
+  `levain cockpit pair` (directly or through another device it paired), may; another surface's token, and any device that
+  surface paired, may not. The rule is `_Handler._coord_may_launch` in
   `levain/web_server.py`, and the sheet learns the answer as `coord_may_launch` on `GET /cockpit/coord/drops.json`.
 - **Never carried forward.** The desk counts launches per envelope, so a grant copied into a successor would start counting
   again. `levain envelope extend` leaves the head's grant out, and its card shows it removed. A conversation draft never
