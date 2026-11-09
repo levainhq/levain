@@ -20,8 +20,8 @@ def state(r):
     return "red" if not r.ok else "amber" if r.warn else "neutral" if r.neutral else "green"
 
 
-def test_the_opt_out_is_one_neutral_row_naming_it():
-    (r,) = rows(setting=OFF)
+def test_the_opt_out_with_no_api_key_link_is_one_neutral_row_naming_it():
+    (r,) = rows(setting=OFF, links=())
     assert state(r) == "neutral" and r.ok and "opted out" in r.detail and "passthrough" in r.detail
 
 
@@ -82,3 +82,16 @@ def test_each_link_gets_its_own_row():
 def test_the_row_is_wired_into_the_doctor_run():
     import inspect
     assert "_check_brokered_launcher(install)" in inspect.getsource(D._run_doctor)
+
+
+def test_the_opt_out_with_standing_api_key_links_warns_how_many_will_refuse():
+    (r,) = rows(setting=OFF, links=(LINK, ("al-" + "2" * 12, 1_000_000, None)))
+    assert state(r) == "amber" and r.ok and "opted out" in r.detail
+    assert "2 standing API-key agent links" in r.detail and "refuse every run" in r.detail
+
+
+def test_the_opt_out_whose_links_cannot_be_read_is_amber():
+    def broken():
+        raise OSError("unreadable")
+    (r,) = D.brokered_launcher_rows(OFF, broken, lambda: 5_000_000, None)
+    assert state(r) == "amber" and "opted out" in r.detail and "cannot be read" in r.detail
