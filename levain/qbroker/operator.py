@@ -18,7 +18,8 @@ them) and writes only ``answers/<request_id>.json``:
 - :func:`write_answer`: the signed answer row, for a ``pending`` request only, checked first with
   :func:`levain.qbroker.seam.answer_refusal` and the head against the receipts as they stand (reaching the request's
   filing receipt), then linked no-replace, mode 0640: an answer that fails any check is never written, since nothing
-  can replace it once it is there. Any ``levain-queue`` member can create a file at an answer's name, so a file
+  can replace it once it is there. Only the operator can create a file in ``answers/`` on an install set up with that
+  directory the operator's alone, but a file planted before it was, or a stale one, can be at an answer's name, so a file
   already there that is not a signed answer for that request is
   renamed aside to ``answers/.quarantine-<request_id>-<random>.json``, a name no reader takes for an answer, and the
   signed answer is linked in its place. One signed by a key in the current signer snapshot (over a head the receipts
@@ -126,8 +127,8 @@ def rows(root: Path | str, *, signers: SignersSnapshot | None, now: datetime | N
     ``answered`` is True only for an answer row that verifies for its request against ``signers`` (the check the
     writer and the broker make, :func:`~levain.qbroker.broker.answer_row_refusal`) over a head the receipts hold
     now, reaching the request's filing (:meth:`~levain.qbroker.receipts.Receipts.head_refusal`, as the broker's
-    ``Receipts.decided`` requires): any ``levain-queue`` member can
-    create a file at an answer's name, so a file being there says nothing. ``signers`` has no default, so no caller
+    ``Receipts.decided`` requires): a file planted before the directory was the
+    operator's alone can be at an answer's name, so a file being there says nothing. ``signers`` has no default, so no caller
     gets that by omission: ``None`` (no snapshot) verifies nothing, and every row lists as unanswered."""
     store, receipts = _open(root)
     recorded = _recorded(receipts)

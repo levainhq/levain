@@ -1,8 +1,9 @@
 """PREL3 2d-1: a file at an answer row's name settles nothing unless it verifies for that request.
 
-``answers/`` is setgid group-writable to ``levain-queue``, and the agent in a slot is a member: it can create a file at
-any request id's answer name (and read the request rows to learn the ids). Two attacks, run against the real store,
-broker and operator library with the directory at the mode setup gives it:
+On an install whose ``answers/`` is still setgid group-writable to the queue group, a member can create a file at any
+request id's answer name (and read the request rows to learn the ids). Two attacks, run against the real store,
+broker and operator library with the directory at that older mode, which is the exposure the reader and the writer
+still hold against:
 
 (a) junk at its own rows' answer names would clear them from the pending cap, so it could file past it;
 (b) junk at another session's answer name would make the operator's signed write fail, so that request expired.
@@ -31,7 +32,7 @@ LATER = rbase.LATER
 @pytest.fixture
 def answers(L):
     d = L / "queue" / "answers"
-    os.chmod(d, 0o2770)          # base_store_rows' mode for L/queue/answers: setgid, group-writable, no sticky bit
+    os.chmod(d, 0o2770)          # the older shape of L/queue/answers: setgid, group-writable, no sticky bit
     return d
 
 

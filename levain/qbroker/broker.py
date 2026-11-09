@@ -817,8 +817,8 @@ class Broker:
         neither checked against nor entered in the pending cap."""
         with self._mutex:
             held = dict(self._pending.get(who.session, {}))
-        # pending = unexpired, not granted, and no VERIFIED answer: any levain-queue member can create a file at an
-        # answer name, so a file that is not the operator's signed answer for that request frees no place
+        # pending = unexpired, not granted, and no VERIFIED answer: a file planted before answers/ was the operator's
+        # alone can sit at an answer name, so a file that is not the operator's signed answer frees no place
         settled = {i for i, exp in held.items() if exp <= now or self._granted(i)}
         if not granted:
             self._settle_answered(who.session, [i for i in held if i not in settled], settled)
