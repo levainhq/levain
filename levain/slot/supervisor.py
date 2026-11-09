@@ -1558,7 +1558,7 @@ class Supervisor:
             if ignored:
                 self.say("repo settings files not read (not the exact name): " + ", ".join(ignored))
             if frozen.dropped_env:
-                self.say("repo settings env dropped (names only; none is on the allowlist): "
+                self.say("repo settings env dropped (names only; no repo env is carried): "
                          + ", ".join(frozen.dropped_env))
             if frozen.dropped_other:
                 self.say("repo settings not carried into the session: " + ", ".join(frozen.dropped_other))
