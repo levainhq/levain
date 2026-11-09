@@ -1525,12 +1525,13 @@ def _run_coord(args: argparse.Namespace, out: Any) -> int:
         if cmd == "watch":
             from levain.coordinator.launch import migrate_setting, watch, watch_once
 
-            if args.once:
-                lines = migrate_setting(store) + watch_once(store)
-                _emit(out, args.json, {"lines": lines}, "\n".join(lines) or "nothing to do")
-                return 0
             if args.every < 1:
                 raise CoordError("--every is at least 1 second")
+            if args.once:
+                # the pass judges a report's session against the interval it was given (row 156 L3 X6)
+                lines = migrate_setting(store) + watch_once(store, every=args.every)
+                _emit(out, args.json, {"lines": lines}, "\n".join(lines) or "nothing to do")
+                return 0
             try:
                 watch(store, every=args.every, emit=lambda line: print(line, file=out, flush=True))
             except KeyboardInterrupt:
