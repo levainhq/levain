@@ -566,6 +566,51 @@ def test_the_reminder_files_once_and_a_signed_renewal_resets_the_lease(rig, qdir
     assert young is not None
 
 
+def _launch(rig, qdir):
+    """One slot launch's allow step (apply, remind, carry), as the supervisor runs it: ``(settings, said)``."""
+    seams = sup.Seams(host="linux", helper=("x",), client_factory=lambda p: None, control_socket=Path("/x"),
+                      store=Path("/x"), base_map=Path("/x"), allow_dir=qdir, allow_judge=rig.judge)
+    said = []
+    s = sup.Supervisor.__new__(sup.Supervisor)
+    s.s, s.say = seams, said.append
+    return s._with_slot_allow(Frozen({}, (), ())).settings, said
+
+
+def test_a_no_to_a_renewal_row_ends_the_rule_until_a_slot_saves_it_again(rig, qdir, capsys):
+    rule = "Bash(npm test *)"
+    _at_day(rig, 28)
+    allow = _carried_one(rig, qdir, rule)
+    _at_day(rig, 0)
+    _launch(rig, qdir)                                         # 2 days left: the launch files the renewal row
+    (q,) = _rows(rig, rule)
+    assert "renews it" in q.blocks
+    rig.qs.answer(q.id, option="no", channel="cli")
+    for _ in range(2):                                         # the next two launches: no row, nothing carried
+        settings, _said = _launch(rig, qdir)
+        assert _rows(rig, rule) == []
+        assert "permissions" not in settings
+    assert SA.rules_of(allow) == []
+    (gone,) = SA.load(allow)["revoked"]
+    assert gone["rule"] == rule and gone["reason"] == "renewal declined"
+    assert not any(k in gone for k in SA.EVIDENCE_KEYS)       # kept without its signed answer, as a revoke keeps it
+    assert SA.remind(qdir, allow, store=rig.qs, judge=rig.judge) == []
+    SA.run(SimpleNamespace(queue_dir=qdir, slot_allow_verb="list"))
+    assert f"{rule}\t(declined at renewal" in capsys.readouterr().out
+    # a later slot END that saves it again files exactly one fresh row
+    assert _save(rig, qdir, rule, "S9") == [rule]
+    rows = _rows(rig, rule)
+    assert len(rows) == 1 and rows[0].id != q.id and rows[0].answer is None
+    assert _save(rig, qdir, rule, "S10") == []
+    _launch(rig, qdir)
+    assert len(_rows(rig, rule)) == 1
+    # its yes carries it again, and the list stops calling it declined
+    rig.yes(rows[0])
+    settings, _said = _launch(rig, qdir)
+    assert settings["permissions"]["allow"] == [rule]
+    SA.run(SimpleNamespace(queue_dir=qdir, slot_allow_verb="list"))
+    assert "declined at renewal" not in capsys.readouterr().out
+
+
 def test_a_rule_with_more_than_three_days_left_files_no_reminder(rig, qdir):
     _at_day(rig, 10)
     allow = _carried_one(rig, qdir)
