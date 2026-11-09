@@ -68,4 +68,5 @@ jobs:
         env:
           LEVAIN_REQUIRE_XCHECK: "1"
           LEVAIN_XCHECK_EMIT: ${{ runner.temp }}/go_emitted.json
-        run: pytest -n auto -q -rs tests/test_contracts_*.py
+        # Serial: these tests read the one emit file above, so workers would share it.
+        run: pytest -q -rs tests/test_contracts_*.py

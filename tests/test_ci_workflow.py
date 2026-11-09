@@ -281,7 +281,8 @@ def test_the_pytest_check_names_the_land_gate_reads_are_unchanged():
     assert JOBS["test"]["name"] == "pytest (Python ${{ matrix.python-version }}, shard ${{ matrix.shard }})"
 
 
-COND = ("github.event_name == 'workflow_dispatch' && github.ref != 'refs/heads/main' && "
+COND = ("github.event_name == 'workflow_dispatch' && startsWith(github.ref, 'refs/heads/') && "
+        "github.ref != 'refs/heads/main' && github.ref != 'refs/heads/land' && "
         "!startsWith(github.ref, 'refs/heads/land/')")
 
 
@@ -291,7 +292,8 @@ def _python_list(event, ref):
     expr = JOBS["test"]["strategy"]["matrix"]["python-version"]
     m = re.fullmatch(r"\$\{\{ fromJSON\((.*?) && '(\[.*?\])' \|\| '(\[.*?\])'\) \}\}", expr)
     assert m and m.group(1) == COND, expr
-    one = event == "workflow_dispatch" and ref != "refs/heads/main" and not ref.startswith("refs/heads/land/")
+    one = (event == "workflow_dispatch" and ref.startswith("refs/heads/") and ref not in ("refs/heads/main", "refs/heads/land")
+           and not ref.startswith("refs/heads/land/"))
     return json.loads(m.group(2) if one else m.group(3))
 
 
@@ -300,6 +302,8 @@ def _python_list(event, ref):
     ("workflow_dispatch", "refs/heads/anything", ["3.12"]),
     ("workflow_dispatch", "refs/heads/main", ["3.12", "3.13"]),
     ("workflow_dispatch", "refs/heads/land/x", ["3.12", "3.13"]),
+    ("workflow_dispatch", "refs/heads/land", ["3.12", "3.13"]),
+    ("workflow_dispatch", "refs/tags/v1.0", ["3.12", "3.13"]),
     ("push", "refs/heads/main", ["3.12", "3.13"]),
     ("push", "refs/heads/land/x", ["3.12", "3.13"]),
     ("push", "refs/tags/v1.0", ["3.12", "3.13"]),
@@ -335,3 +339,9 @@ def test_the_3_13_pytest_jobs_deselect_the_static_guard_marker_and_3_12_does_not
 def test_the_browser_and_root_run_jobs_print_durations(job):
     runs = " ".join(st.get("run", "") for st in JOBS[job]["steps"])
     assert "--durations=25" in runs
+
+
+def test_the_xcheck_pytest_step_runs_serial_since_its_tests_share_one_emit_file():
+    x = yaml.safe_load((Path(__file__).resolve().parent.parent / ".github" / "workflows" / "contracts-xcheck.yml").read_text())
+    step = next(st for st in x["jobs"]["xcheck"]["steps"] if "LEVAIN_XCHECK_EMIT" in st.get("env", {}))
+    assert "-n " not in step["run"] and "xdist" not in step["run"], step["run"]
