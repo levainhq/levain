@@ -18,9 +18,10 @@ is due from that minute; an agenda with no ``next`` is never due) it does, in or
 5. stamp ``germinated={on, target, ref}`` as a compare-and-set against the spore as it was read (its version and ``agenda``
    disposition), so a spore edited while this ran is left open, reported under ``skipped``, and filed again from its new
    words on the next run. An agenda that filed or adopted a QUESTION (``adopted``, ``band``, ``nudge``, ``band-fallback``)
-   is then LEFT OPEN: its stamp names the row, the row rings in the band, and the operator's controls on that intention
-   move the spore and the row together. An agenda that handed a coordinator drop (``board``, ``desk``) is composted, as
-   before, with a second compare-and-set.
+   is then LEFT OPEN while that question is open: its stamp names the row, the row rings in the band, and the operator's
+   controls on that intention move the spore and the row together; once the question is ANSWERED the next run closes the
+   agenda (``done`` / ``answered`` / ``explored`` by its type). An agenda that handed a coordinator drop (``board``,
+   ``desk``) is composted, as before, with a second compare-and-set.
 
 One bad spore never stops the others: its error is recorded under ``errors`` and the run goes on; the CLI prints every
 outcome that did complete and exits non-zero when any spore errored. A missing ``.levain/memory.spores.json`` is
@@ -30,11 +31,10 @@ not), so two overlapping runs (cron plus a hand run, the 06:10 run plus a minute
 The dedupe key is the spore's immutable ``origin_key``, never its id: the question store is per USER while ``spore-NNN``
 ids are per INSTALL, so an id key would let install B's due ``spore-004`` adopt install A's held row and compost with no
 row of its own. Filing is idempotent (``file_once`` / the outbox id), so a crash between any two steps re-runs into the
-same one row; a drop spore stamped but not yet composted is finished on the next run (a stamp naming a question is the
-live intention and is never finished).
+same one row; a drop spore stamped but not yet composted is finished on the next run (a stamp naming a question is finished
+only once that question is answered).
 
-Known edges (closed under the reachability line, TS-2 L3): an open stamped agenda is invisible to the due test (it carries a
-stamp) and to the finish loop (its stamp names a question), so it stays until an operator act resolves it. ``board:<repo>`` does not carry the repo into the drop: a
+Known edges (closed under the reachability line, TS-2 L3): ``board:<repo>`` does not carry the repo into the drop: a
 drop's ``Source`` takes only an absolute repo path, a ``refs/heads/`` ref and a full commit id, none of which a repo
 NAME determines, and the words stay his verbatim; the repo is recorded in the spore's ``germinated`` stamp (target)
 only. A drop has no field for the spore's ``created`` or ``next`` either (``sent_at`` is the sender's clock stamp, not an
@@ -128,12 +128,6 @@ def is_due(item: dict[str, Any], today: date, now: datetime | None = None) -> bo
     return nxt is not None and nxt <= today
 
 
-def _rings(stamp: Any) -> bool:
-    """True for a stamp that names a QUESTION (a band row): that intention stays live. A coordinator drop's id starts ``dr-``."""
-    ref = stamp.get("ref") if isinstance(stamp, dict) else None
-    return isinstance(ref, str) and bool(ref) and not ref.startswith("dr-")
-
-
 def _target_of(item: dict[str, Any]) -> tuple[str, str | None]:
     """``(target, repo)``: ``band`` (default and the fallback for an unknown value), ``nudge``, ``desk``,
     ``board:<repo>``. The keyword is matched without regard to case; the repo keeps its own."""
@@ -213,7 +207,7 @@ def _germinate(spores_json: Path, qdir: Path, install: Path, agent: str, today: 
     from levain.consent import band
     from levain.consent.questions import ANSWER_CHANNELS, DB_NAME, QuestionStore
     from levain.coordinator.store import CoordStore
-    from levain.spores import guarded_spore_store
+    from levain.spores import answered_descend_kind, guarded_spore_store, ringing_ref
 
     now = now or datetime.now()
     today = today or now.date()
@@ -225,10 +219,28 @@ def _germinate(spores_json: Path, qdir: Path, install: Path, agent: str, today: 
     else:
         open_items = store.list_open(today=today)
     due = [s for s in open_items if is_due(s, today, now) and (not timed_only or is_timed(s.get("next")))]
-    finish = [s for s in open_items if _is_agenda(s) and s.get("germinated") and not _rings(s.get("germinated"))]
     # a dry run on a machine with no band yet must not create one
     questions = None if dry_run and not (qdir / DB_NAME).exists() else QuestionStore(qdir)
     open_ids = {q.id for q in questions.open_questions()} if questions is not None else set()
+
+    def _stamp_ref(s: dict[str, Any]) -> str:
+        st = s.get("germinated")
+        ref = st.get("ref") if isinstance(st, dict) else None
+        return ref if isinstance(ref, str) else ""
+
+    def _answered(ref: str) -> bool:
+        """The stamped question exists and carries an answer (a missing or unreadable one is not an answer)."""
+        try:
+            q = questions.get(ref) if questions is not None and ref else None
+        except Exception:  # noqa: BLE001
+            return False
+        return q is not None and q.answer is not None
+
+    # a stamped agenda is finished when its stamp names a coordinator drop (handed off, not a live row) or a question that has
+    # been ANSWERED (the intention is done); one whose question still rings stays open, and one whose question is missing waits
+    finish = [s for s in open_items if _is_agenda(s) and s.get("germinated")
+              and (_stamp_ref(s).startswith("dr-") or not _stamp_ref(s)
+                   or (ringing_ref(s, open_ids) is None and _answered(_stamp_ref(s))))]
     coord = CoordStore(qdir)
     ping = ping or band._send_ping
     has_board = coord.coordinator_present()
@@ -246,7 +258,10 @@ def _germinate(spores_json: Path, qdir: Path, install: Path, agent: str, today: 
                           "finished", str(stamp.get("ref") or ""), False, False, False)
             if not dry_run:
                 try:
-                    store.descend(sid, kind="composted", expect_disposition="agenda",
+                    # an answered question closes the intention as done by type; a handed-off drop composts, as before
+                    kind = "composted" if str(stamp.get("ref") or "").startswith("dr-") or not stamp.get("ref") \
+                        else answered_descend_kind(item.get("type"))
+                    store.descend(sid, kind=kind, expect_disposition="agenda",
                                   expected_version=spore_version(item), today=today)
                 except SporeError as exc:
                     if "changed since read" not in str(exc) and "disposition changed" not in str(exc):
@@ -367,7 +382,7 @@ def run_germinate(args: argparse.Namespace, out: Any = None) -> int:
         live = " (stamped, live)" if o["done"] and o["via"] in ("adopted", "band", "nudge", "band-fallback") else ""
         print(f"{verb} {o['spore_id']} ({o['target']}) via {o['via']}" + (f" -> {o['ref']}" if o["ref"] else "") + live, file=out)
     for o in res["finish"]:
-        print(f"{'would finish' if args.dry_run else 'finished'} {o['spore_id']} (stamped, now composted)", file=out)
+        print(f"{'would finish' if args.dry_run else 'finished'} {o['spore_id']} (stamped, now closed)", file=out)
     for s in res["skipped"]:
         print(f"skipped {s['spore_id']}: {s['reason']}", file=out)
     if not res["due"] and not res["finish"] and not res["errors"] and not res["skipped"]:

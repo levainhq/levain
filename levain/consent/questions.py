@@ -853,7 +853,8 @@ class QuestionStore:
         return out
 
     # --- deferring -----------------------------------------------------------------------------------
-    def snooze(self, ref: Any, *, until: str | None, channel: str, via: str, note: str | None = None) -> Snooze:
+    def snooze(self, ref: Any, *, until: str | None, channel: str, via: str, note: str | None = None,
+               spores_json: Path | str | None = None) -> Snooze:
         """Defer an open question to the local day ``until`` (``YYYY-MM-DD``, after today and at most
         :data:`SNOOZE_MAX_DAYS` days ahead), or bring a deferred one back now (``until=None``), as one appended
         ``question_snoozes`` row: the newest row of a question wins. The question stays OPEN: its number, its version
@@ -876,10 +877,16 @@ class QuestionStore:
             if q.answer is not None:
                 raise ConsentError(f"question #{q.n} was already answered at {q.answer.answered_at}: there is nothing "
                                    "to snooze")
-            if until is not None and q.cwd:
+            if until is not None:
                 from levain.spores import spore_ringing_question
 
-                sid = spore_ringing_question(Path(q.cwd) / ".levain" / "memory.spores.json", q.id)
+                # the spore store the INSTALL uses (the caller's), then, for a row filed from another install, the one under
+                # the question's own cwd
+                sid = None
+                for path in (spores_json, Path(q.cwd) / ".levain" / "memory.spores.json" if q.cwd else None):
+                    sid = spore_ringing_question(path, q.id) if path is not None else None
+                    if sid:
+                        break
                 if sid:
                     raise ConsentError(f"question #{q.n} is the ring of {sid}, an open agenda: snoozing the row would leave "
                                        f"the agenda stamped; snooze {sid} itself (spore_surface_at) so one date moves")

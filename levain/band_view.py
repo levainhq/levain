@@ -3443,7 +3443,10 @@ def run_band_snooze(args: argparse.Namespace) -> int:
     try:
         store = QuestionStore(args.queue_dir)
         qid = question_of_band_number(store, args.number)
-        got = store.snooze(qid, until=args.until, channel="cli", via="cli", note=getattr(args, "note", None))
+        install = getattr(args, "path", None)         # the install whose spore store the guard reads (default: this directory)
+        spores = Path(install).expanduser() / ".levain" / "memory.spores.json" if install is not None else None
+        got = store.snooze(qid, until=args.until, channel="cli", via="cli", note=getattr(args, "note", None),
+                           spores_json=spores)
     except Exception as exc:
         print(f"levain band {verb}: refused: {exc}; nothing was recorded", file=sys.stderr)
         return EXIT_REFUSED
@@ -3477,6 +3480,8 @@ def add_parser(subparsers: argparse._SubParsersAction) -> None:
     sz.add_argument("--note", default=None, help="Your words, kept with the snooze.")
     sz.add_argument("--queue-dir", dest="queue_dir", type=Path, default=argparse.SUPPRESS,
                     help="The consent directory holding questions.db.")
+    sz.add_argument("--path", type=Path, default=Path.cwd(),
+                    help="The install whose spore store is checked: a row an open agenda there rings is snoozed by its spore.")
     sz.set_defaults(func=run_band_snooze)
     us = sub.add_parser("unsnooze", help="Bring a snoozed band row back now: it is due again.")
     us.add_argument("number", type=_band_number_arg, help="The band number, as the band shows it.")

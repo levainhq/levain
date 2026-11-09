@@ -115,3 +115,87 @@ def test_s1_a_band_snooze_of_a_question_an_open_agenda_rings_is_refused_naming_t
     qs.snooze(plain.id, until="2026-11-10", channel="cli", via="cli")           # a machine-filed row snoozes as before
     sp.descend(sid, kind="composted")                                         # the agenda closed: its row is plain again
     qs.snooze(q.id, until="2026-11-10", channel="cli", via="cli")
+
+
+# --- L1 fix round -----------------------------------------------------------------------------------------------------
+
+
+def test_f2_one_predicate_a_drop_stamp_a_closed_row_and_a_missing_row_do_not_ring() -> None:
+    from levain.spores import ringing_ref
+
+    ag = {"disposition": "agenda", "status": "open", "germinated": {"ref": "q-1"}}
+    assert ringing_ref(ag, {"q-1"}) == "q-1"
+    assert ringing_ref(ag, {"q-2"}) is None                                   # its question is not open
+    assert ringing_ref({**ag, "germinated": {"ref": "dr-9"}}, {"dr-9"}) is None   # a coordinator drop is not a band row
+    assert ringing_ref({**ag, "status": "resolved"}, {"q-1"}) is None
+
+
+def test_f1a_a_spore_verb_on_an_agenda_whose_question_is_answered_is_not_refused(rig: Rig) -> None:
+    sid = _stamped_agenda(rig)
+    rig.qs.answer(rig.q.id, option="ship", channel="cli")
+    out = _fire(rig, f"spore:{sid}", "spore_surface_at", {"surface_at": "2026-12-01"})
+    assert out and rig.sp.get(sid)["next"] == "2026-12-01"
+
+
+def test_f1b_germinate_closes_an_agenda_whose_question_was_answered(tmp_path: Path) -> None:
+    root = tmp_path / "inst"
+    (root / ".levain").mkdir(parents=True)
+    spores = root / ".levain" / "memory.spores.json"
+    sp = guarded_spore_store(spores)
+    qdir = tmp_path / "q"
+    qdir.mkdir(mode=0o700)
+    qs = QuestionStore(qdir)
+    q, _ = qs.file_once(agent="claude_code", key="k-fin", what="Due: x", options=[("done", "Done")], rec="done",
+                        blocks="b", cwd=str(root), held_by=ANSWER_CHANNELS)
+    sid = sp.add(type="task", text="x", disposition="agenda", next="2026-11-01")["id"]
+    sp.update(sid, germinated={"on": "2026-11-07", "target": "band", "ref": q.id})
+    res = g.germinate(spores, qdir, install=root, today=GTODAY)
+    assert res["finish"] == [] and sp.get(sid)["status"] == "open"          # still ringing: left alone
+    qs.answer(q.id, option="done", channel="cli")
+    res = g.germinate(spores, qdir, install=root, today=GTODAY)
+    assert [o["spore_id"] for o in res["finish"]] == [sid] and res["errors"] == []
+    got = sp.get(sid)
+    assert got["status"] != "open" and got["resolution"]["kind"] == "done"
+
+
+def test_f3_the_tui_write_path_is_guarded_too(rig: Rig, monkeypatch) -> None:
+    from levain import writes
+
+    monkeypatch.setattr("levain.consent.queue.default_queue_dir", lambda: rig.qdir)
+    sid = _stamped_agenda(rig)
+    scope = rig.src.write_scope
+    for req in ({"kind": "spore_surface_at", "spore_id": sid, "surface_at": "2026-12-01"},
+                {"kind": "spore_touch", "spore_id": sid},
+                {"kind": "spore_update", "spore_id": sid, "text": "new words"}):
+        with pytest.raises(EditError) as exc:
+            writes.apply_edit(scope, req)
+        assert exc.value.http_status == 409, req
+    assert rig.sp.get(sid)["next"] == "2026-11-08"
+
+
+def test_f4_the_snooze_guard_reads_the_spore_store_it_is_given_not_the_questions_cwd(tmp_path: Path) -> None:
+    from levain.cockpit.consent import ConsentError
+
+    root = tmp_path / "inst"
+    (root / ".levain").mkdir(parents=True)
+    spores = root / ".levain" / "memory.spores.json"
+    sp = guarded_spore_store(spores)
+    qdir = tmp_path / "q"
+    qdir.mkdir(mode=0o700)
+    qs = QuestionStore(qdir)
+    q, _ = qs.file_once(agent="claude_code", key="k-f4", what="Due: x", options=[("done", "Done")], rec="done",
+                        blocks="b", cwd=str(tmp_path / "elsewhere"), held_by=ANSWER_CHANNELS)
+    sid = sp.add(type="task", text="x", disposition="agenda", next="2026-11-01")["id"]
+    sp.update(sid, germinated={"on": "2026-11-07", "target": "band", "ref": q.id})
+    with pytest.raises(ConsentError) as exc:
+        qs.snooze(q.id, until="2026-11-10", channel="cli", via="cli", spores_json=spores)
+    assert sid in str(exc.value)
+
+
+def test_f6_a_stamp_landing_after_the_read_stales_the_spore_row_version(rig: Rig) -> None:
+    from levain.cockpit.providers import spore_row_version
+
+    sid = rig.ids["agenda_old"]
+    before = spore_row_version(rig.sp.get(sid))
+    rig.sp.update(sid, germinated={"on": "2026-11-08", "target": "band", "ref": "q-x"}, today=TODAY)
+    assert spore_row_version(rig.sp.get(sid)) != before

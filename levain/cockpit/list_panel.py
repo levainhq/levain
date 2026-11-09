@@ -137,7 +137,7 @@ def _spore_part(source: SubstrateSource, ctx: ReadContext, seen: list[bool], *, 
     held: list[RowIn] = []
     for s in items:
         raw = steer.get(s.id, {})
-        if ringing and spores.ringing_ref(raw) in ringing:
+        if ringing and spores.ringing_ref(raw, ringing):
             continue
         surface = _surface(raw, s.disposition) if raw else "spore"
         d = next_date(s.next)
