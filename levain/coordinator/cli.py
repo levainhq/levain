@@ -1828,20 +1828,24 @@ def _coord_import_status(args: argparse.Namespace, out: Any, store: EnvelopeStor
                      for name, ids in buckets.items())
     reports = _apply_queue(args, store)             # the holder's own pass over the board's queue (row 162)
     if reports:
-        buckets = {**buckets, "reports": reports}
         text += "\n" + "\n".join(reports)
-    _emit(out, args.json, buckets, text)
+    _emit(out, args.json, {**buckets, "reports": reports}, text)
     return 0
 
 
 def _apply_queue(args: argparse.Namespace, store: EnvelopeStore) -> list[str]:
     """The lease holder's pass over the board's queued worker reports (row 162): applied as the coordinator, facts only,
-    through the validator the watch's pass uses. Never raises: a fault is one line, and the verb it rides on keeps its
-    own result."""
+    through the validator the watch's pass uses. A caller that is not the live lease holder (no token, another token,
+    no live lease) gets ``[]`` and nothing is read from the queue. Never raises: a fault is one line, and the verb it
+    rides on keeps its own result."""
     from levain.coordinator import work_attach
 
     try:
-        return work_attach.coordinator_apply(store, args.token)
+        token = getattr(args, "token", None)
+        held = None if _no_store(store) else store.coord_lease()
+        if token is None or held is None or not held.live or held.token != token:
+            return []
+        return work_attach.coordinator_apply(store, token)
     except Exception as exc:    # noqa: BLE001 - the verb this rides on has already done its work
         return [f"board reports: not applied ({exc})"]
 
@@ -1849,7 +1853,8 @@ def _apply_queue(args: argparse.Namespace, store: EnvelopeStore) -> list[str]:
 def _coord_apply_reports(args: argparse.Namespace, out: Any, store: EnvelopeStore) -> int:
     """``levain coord apply-reports --token N``: the lease holder applies the board's queued worker reports itself, as
     the coordinator, facts only (:func:`levain.coordinator.work_attach.coordinator_apply`). Without the live lease token
-    nothing is read or written and the exit is 1. Prints the pass's line, or says none was waiting."""
+    nothing is read or written and the exit is 1. Prints the pass's line, or says none was waiting. Any fault of the
+    pass, and a store that is the live consent store, is one line on stderr and the exit is 2."""
     from levain.coordinator import work_attach
 
     held = None if _no_store(store) else store.coord_lease()
@@ -1857,9 +1862,13 @@ def _coord_apply_reports(args: argparse.Namespace, out: Any, store: EnvelopeStor
         print("levain coord apply-reports: the coordinator lease is not held by this token (levain coord status "
               "shows the live one); nothing was applied", file=sys.stderr)
         return 1
+    if work_attach.is_live_consent(Path(store.directory)):
+        print(f"levain coord apply-reports: not applied, {store.directory} is the live consent store and never a "
+              "board", file=sys.stderr)
+        return 2
     try:
         lines = work_attach.coordinator_apply(store, args.token)
-    except _REFUSED as exc:
+    except Exception as exc:    # noqa: BLE001 - every fault of the pass is one line, never a traceback
         print(f"levain coord apply-reports: {exc}", file=sys.stderr)
         return 2
     _emit(out, args.json, {"lines": lines}, "\n".join(lines) if lines else "no report is waiting")

@@ -29,8 +29,8 @@ holds, never on the worker name a report carries:
   attach holds its item: a later report naming that worker from another session, or that session under another name,
   is refused ``worker-mismatch``. Its later events keep the kind its attach was recorded with (else ``kind-mismatch``),
   and it never names the kind ``launch``. The session is real when its observed interval (``sessions_seen``, written
-  by the service on every pass whose listing it could read, from its first sighting to its last, this pass's listing
-  (:func:`live_session_ids`) counting as a sighting now) reaches the report's ``at``: its last sighting within :data:`GRACE_PASSES` pass
+  by every service pass, and every coordinator pass with a report waiting, whose listing it could read, from its
+  first sighting to its last, this pass's listing (:func:`live_session_ids`) counting as a sighting now) reaches the report's ``at``: its last sighting within :data:`GRACE_PASSES` pass
   intervals after it, its first no more than :data:`DEFER_DEADLINE` later: a seat whose last act is ``landed`` or ``ended`` and which then exits is still judged on what
   was true when it spoke. An unreadable listing defers such a report, and one deferred past :data:`DEFER_DEADLINE`
   after its ``at`` is refused ``no-evidence-timeout``.
@@ -323,8 +323,8 @@ def live_session_ids(store: CoordStore) -> frozenset[str] | None:
 
 
 def _record_seen(conn: sqlite3.Connection, now: str, live: Collection[str], keep: Collection[str] = ()) -> None:
-    """The service's fact: each session in a listing it read was live at ``now`` (``sessions_seen``). In the same
-    write, a session last seen more than :data:`SEEN_KEEP` before ``now`` and before the table's newest sighting is
+    """A pass's fact, whichever role runs it: each session in a listing it read was live at ``now``
+    (``sessions_seen``). In the same write, a session last seen more than :data:`SEEN_KEEP` before ``now`` and before the table's newest sighting is
     pruned (L3 C4), unless a report still waiting names it (``keep``): that report is judged on the sighting."""
     for sid in live:
         if isinstance(sid, str) and 0 < len(sid) <= _FIELD_MAX:
@@ -647,8 +647,8 @@ def apply_reports(store: CoordStore, token: Any, *, live_sessions: Collection[st
     (:func:`levain.coordinator.ready.record_landed`) and nothing else about it.
 
     ``live_sessions``: the harness session ids the coordinator's own listing shows (:func:`live_session_ids`); the
-    service records them as seen now. None means the listing could not be read. ``every``: the watch's pass interval in
-    seconds (the module docstring says how both judge a report).
+    pass records them as seen now, as the service or the coordinator. None means the listing could not be read.
+    ``every``: the watch's pass interval in seconds (the module docstring says how both judge a report).
 
     A queued row whose id the refusal record cannot hold is judged under ``bad-seq-<seq>``; a row whose refusal still
     cannot be recorded is left queued and named in ``faults``, and the pass goes on."""
@@ -667,8 +667,10 @@ def apply_reports(store: CoordStore, token: Any, *, live_sessions: Collection[st
             held = lease(conn, now)
             if held is None or not held.live or held.holder != SERVICE_HOLDER or held.token != token:
                 raise CoordError(f"lease token {token} is not the live lease's service claim; no report was applied")
-            if live_sessions is not None:
-                _record_seen(conn, now, live_sessions, _waiting_sessions(queued))
+        # a sighting is a fact, recorded by whichever role applies: while a coordinator holds the lease the service
+        # skips its pass, and a seat that lands and exits is judged on what this pass saw (row 162 L3 r1)
+        if live_sessions is not None:
+            _record_seen(conn, now, live_sessions, _waiting_sessions(queued))
         seen: set[str] = set()
         deferred: set[str] = set()
         for raw in queued:
@@ -797,11 +799,12 @@ def coordinator_apply(store: CoordStore, token: Any, *, sessions: Any = None,
         return [f"board reports: not applied, {directory} is the live consent store and never a board"]
     if store.role != "coordinator":
         raise CoordError("the coordinator's pass runs on a coordinator-role store")
-    if not (directory / "dispatch.db").exists() or not reports_path(directory).exists() or not _unresolved(directory):
-        return []
-    held = store.coord_lease()
+    # the token is checked before the queue is looked at, so a wrong one is refused whether or not a report waits
+    held = store.coord_lease() if (directory / "dispatch.db").exists() else None
     if held is None or not held.live or held.token != token:
         raise CoordError("the coordinator lease is not held by this token; no report was applied")
+    if not reports_path(directory).exists() or not _unresolved(directory):
+        return []
     live = (sessions or live_session_ids)(store)
     return [_applied_line(apply_reports(store, token, live_sessions=live, every=every))]
 
