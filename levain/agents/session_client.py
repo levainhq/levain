@@ -76,7 +76,7 @@ from typing import Any
 
 from levain.agents import controller as _ctl
 from levain.agents.accounting import ActionExposure, StopResult, Usage
-from levain.agents.session import S1_DISPATCH, WORKSPACE_REFUSED, SessionLaunch, Workspace
+from levain.agents.session import AUTH_FOR_BILLING, S1_DISPATCH, WORKSPACE_REFUSED, SessionLaunch, Workspace
 from levain.agents.session_launcher import LauncherRefused
 from levain.agents.signed_role import SIGNED_TEXT_MAX, SignedLink, SignedRole
 from levain.contracts import ContractError, canon
@@ -86,7 +86,8 @@ __all__ = ["PROTOCOL", "RUN_FRAME_MAX", "LAUNCHER_NAME", "WAIT_SLICE_S", "WireEr
            "launch_to_wire", "launch_from_wire", "usage_to_wire", "usage_from_wire", "link_proof",
            "WS_CHUNK_BYTES", "WS_PARTS", "WsBegin", "ws_begin_to_wire", "ws_begin_from_wire", "ws_chunk_frames",
            "ws_chunk_from_wire",
-           "WorkspaceNotSent", "default_run_socket", "unix_connector", "DispatchSessionLauncher", "build_launcher",
+           "WorkspaceNotSent", "BrokeredServerAbsent", "BROKERED_SOCKET_NAME", "default_run_socket", "default_brokered_socket",
+           "session_auth_of", "unix_connector", "DispatchSessionLauncher", "build_launcher",
            "AuthorityFeed"]
 
 _log = logging.getLogger("levain.agents.session_client")
@@ -836,6 +837,35 @@ def default_run_socket() -> Path:
     return layout.RUN["darwin" if sys.platform == "darwin" else "linux"] / "dispatch" / "run.sock"
 
 
+#: the brokered run server's socket, in the same directory as ``run.sock``: the billing decision is which socket a
+#: launch reaches (the server module serves it under this name)
+BROKERED_SOCKET_NAME = "run-brokered.sock"
+
+
+def default_brokered_socket() -> Path:
+    """Where the brokered run server listens: :data:`BROKERED_SOCKET_NAME` beside :func:`default_run_socket`."""
+    return default_run_socket().parent / BROKERED_SOCKET_NAME
+
+
+class BrokeredServerAbsent(LauncherRefused):
+    """A brokered launch found no brokered run server: it is turned off (root's ``L/policy/dispatch_auth`` holds
+    ``passthrough``) or its service is down. Nothing was sent and the launch does not go to the other socket."""
+    nothing_sent = True
+
+
+def session_auth_of(store: Any) -> Callable[[str], str | None]:
+    """``auth_of(session_key)`` over the agent store: the auth the session's occurrence launched under, which is its
+    reservation's billing (a reservation with no billing is an api_key one, as :func:`levain.agents.session.reserved_terms`
+    reads it). None when the store holds no such session or a billing this client does not know: the caller reads
+    that as passthrough's."""
+    def auth_of(session_key: str) -> str | None:
+        with store.read() as conn:
+            row = conn.execute("SELECT r.billing FROM agent_occurrences o JOIN agent_reservations r"
+                               " ON r.occurrence_id = o.occurrence_id WHERE o.session_key = ?", (session_key,)).fetchone()
+        return None if row is None else AUTH_FOR_BILLING.get(row[0] or "api_key")
+    return auth_of
+
+
 def unix_connector(path: Path | str, *, timeout: float = _CONNECT_S) -> Callable[[], socket.socket]:
     def connect(within: float | None = None) -> socket.socket:
         sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
@@ -898,8 +928,17 @@ class DispatchSessionLauncher:
     def __init__(self, connect: Callable[[], socket.socket], proof_of: Callable[[str], LinkProof],
                  feed: AuthorityFeed | None = None,
                  signed_of: Callable[[str], SignedRole] | None = None,
-                 link_of: Callable[[str], SignedLink] | None = None) -> None:
-        self._connect = connect
+                 link_of: Callable[[str], SignedLink] | None = None,
+                 connect_brokered: Callable[[], socket.socket] | None = None,
+                 auth_of: Callable[[str], str | None] | None = None) -> None:
+        self._connect = connect     # the passthrough socket (``run.sock``)
+        # the brokered socket, and what says which socket a recorded session belongs to (its auth): both or neither.
+        # Without them this client serves passthrough alone, as every launcher class serves its one auth.
+        if (connect_brokered is None) != (auth_of is None):
+            raise ValueError("connect_brokered and auth_of come together")
+        self._connect_brokered = connect_brokered
+        self._auth_of = auth_of
+        self.auths = frozenset({"passthrough", "brokered"}) if connect_brokered is not None else frozenset({"passthrough"})
         self._proof_of = proof_of
         self._signed_of = signed_of   # None: this client can prove no signed role, so it stages no workspace (W2)
         self._link_of = link_of       # None: no verified link names the role, so it stages no workspace (W2 r1 HIGH)
@@ -1022,8 +1061,14 @@ class DispatchSessionLauncher:
         except WireError as exc:
             raise LauncherRefused("launch-frame-refused", str(exc)) from None
         try:
-            sock = self._connect()
+            sock = self._connector(launch.auth)()
+        except BrokeredServerAbsent:
+            raise
         except OSError as exc:
+            if launch.auth == "brokered":
+                raise BrokeredServerAbsent(
+                    "brokered-server-absent", "no brokered run server answers: it is turned off (L/policy/dispatch_auth "
+                    "holds 'passthrough') or its service is down", reason_class="transient") from None
             raise LauncherRefused("dispatch-unreachable", f"{type(exc).__name__}", reason_class="transient") from None
         conn = _Conn(sock)
         if self._feed is not None:
@@ -1060,8 +1105,26 @@ class DispatchSessionLauncher:
 
     # -- usage and end, keyed by the recorded session key -----------------------------------------------------------------
 
+    def _connector(self, auth: str) -> Callable[..., socket.socket]:
+        """The connector of ``auth``'s socket. Nothing here falls back from one socket to the other: an auth this
+        client does not serve (a brokered launch with no brokered socket configured) is a refusal."""
+        if auth == "passthrough":
+            return self._connect
+        if auth == "brokered" and self._connect_brokered is not None:
+            return self._connect_brokered
+        raise BrokeredServerAbsent("brokered-server-absent", "this client holds no brokered run server socket",
+                                   reason_class="standing")
+
+    def _connector_for_session(self, session_key: str) -> Callable[..., socket.socket]:
+        """The connector of the socket a recorded session was launched through: the auth the store recorded for the
+        key; a session the store records no auth for is passthrough's (as the server reads an index record with no
+        auth). One socket is chosen and never a second tried. With no ``auth_of`` this client serves passthrough alone."""
+        if self._auth_of is None:
+            return self._connect
+        return self._connector(self._auth_of(session_key) or "passthrough")
+
     def _short(self, op: str, expect: tuple[str, ...], timeout: float, **fields: object) -> dict:
-        sock = self._connect()
+        sock = self._connector_for_session(fields["session_key"])()
         conn = _Conn(sock)
         try:
             return conn.request(op, expect, timeout=timeout, **fields)
@@ -1092,8 +1155,8 @@ class DispatchSessionLauncher:
             # ONE absolute deadline, set before the connect: the connect, the read and the server's hold all draw on
             # it, and no answer margin extends it (the server is asked for a little less than is left)
             end = time.monotonic() + deadline
-            sock = self._connect(max(0.001, deadline)) if getattr(self._connect, "accepts_within", False) \
-                else self._connect()
+            connect = self._connector_for_session(session_key)
+            sock = connect(max(0.001, deadline)) if getattr(connect, "accepts_within", False) else connect()
             conn = _Conn(sock)
             try:
                 left = end - time.monotonic()
@@ -1122,11 +1185,13 @@ class DispatchSessionLauncher:
 
 def build_launcher(store: Any) -> DispatchSessionLauncher:
     """The builder ``session_wire`` registers under :data:`LAUNCHER_NAME`: the production client for ``store`` (its
-    proofs read the install's cockpit authority log; the socket is :func:`default_run_socket`)."""
+    proofs read the install's cockpit authority log; a passthrough run goes to :func:`default_run_socket`, a brokered
+    one to :func:`default_brokered_socket`, and a recorded session's usage and end to the one its store auth names)."""
     from levain.agents.session_wire import read_install
     install = read_install(store.directory)
     return DispatchSessionLauncher(unix_connector(default_run_socket()),
                                    lambda occ: link_proof(store, install.cockpit_root, occ),
                                    AuthorityFeed(store, install.cockpit_root),
                                    lambda occ: signed_role_of(store, occ),
-                                   lambda occ: signed_link_of(store, install.cockpit_root, occ))
+                                   lambda occ: signed_link_of(store, install.cockpit_root, occ),
+                                   unix_connector(default_brokered_socket()), session_auth_of(store))

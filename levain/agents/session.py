@@ -175,7 +175,9 @@ class SessionLaunch:
 class SessionLauncher(Protocol):
     """Starts a session GATED (the :class:`levain.agents.controller.GatedChild` shape: ``release``, ``abort`` and a
     ``process`` whose ``poll``, ``wait`` and ``terminate`` are a Popen's). ``route`` must be :data:`S1_DISPATCH`;
-    ``auth`` is the ticket's auth axis the launcher mints with. ``usage(session_key)`` is read once the session is
+    ``auth`` is the ticket's auth axis the launcher mints with. A launcher that can serve more than one has an
+    ``auths`` set (the production client serves both, each over its own socket); one without it serves exactly
+    ``{auth}``. :func:`launch_refusal` requires the link's auth to be in that set. ``usage(session_key)`` is read once the session is
     over and never raises.
 
     ``spawn`` is FAILURE-ATOMIC: one that raises has left nothing of its own live (no S1 session, no process,
@@ -327,6 +329,12 @@ def _hash_or_none(role: Mapping[str, Any]) -> str | None:
         return None
 
 
+def _auths_of(launcher: Any) -> frozenset[str]:
+    """Every auth ``launcher`` serves: its ``auths`` when it has one, else exactly its one ``auth``."""
+    auths = getattr(launcher, "auths", None)
+    return frozenset(auths) if auths is not None else frozenset({getattr(launcher, "auth", None)})
+
+
 def launch_refusal(role: Mapping[str, Any], reserved: Reserved | None, launcher: Any,
                    exposure: ActionExposure | None, *, usd_micros: Any) -> str | None:
     """The reason this run may not start, or None. Order is the check order; the first failing check is the answer.
@@ -348,7 +356,7 @@ def launch_refusal(role: Mapping[str, Any], reserved: Reserved | None, launcher:
         return "launcher-not-wired" if isinstance(launcher, UnwiredLauncher) else "route-not-s1-dispatch"
     if reserved.billing not in AUTH_FOR_BILLING:
         return "unknown-billing"
-    if getattr(launcher, "auth", None) != AUTH_FOR_BILLING[reserved.billing]:
+    if AUTH_FOR_BILLING[reserved.billing] not in _auths_of(launcher):
         return "ticket-auth-not-the-links-billing"
     if reserved.billing == "subscription":
         if exposure is None or reserved.exposure is None:
