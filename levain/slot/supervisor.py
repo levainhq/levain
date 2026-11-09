@@ -1680,7 +1680,7 @@ class Supervisor:
             judge = self.s.allow_judge or slot_allow.default_judge(qdir)
             slot_allow.apply_answered(qdir, path, judge=judge)
             try:
-                slot_allow.remind(qdir, path)
+                slot_allow.remind(qdir, path, judge=judge)
             except Exception:   # noqa: BLE001 - a reminder never stops a launch
                 pass
             rules, skipped = slot_allow.carried(path, judge, slot_allow.store_id_of(QuestionStore(qdir)))
@@ -1727,8 +1727,9 @@ class Supervisor:
             raise AllowRefused("read-allow answered bytes that are not base64") from None
 
     def _file_allow_rows(self, session: str) -> None:
-        """Row 165, at END: the rules the slot's dialog saved go on the band, one row per rule. Said, never raised:
-        teardown already finished."""
+        """Row 165, at END: the rules the slot's dialog saved go on the band, one row per rule, except a rule the
+        store carries now (:func:`slot_allow.offer`: a stored rule that no longer carries is offered again). Said,
+        never raised: teardown already finished."""
         path = self._allow_file()
         if path is None:
             return
@@ -1739,8 +1740,9 @@ class Supervisor:
             if raw is None:
                 return
             kept, dropped = slot_allow.parse_local_allow(raw)
-            known = set(slot_allow.rules_of(path))
-            new = slot_allow.file_rows(Path(self.s.allow_dir), session, [r for r in kept if r not in known])  # type: ignore[arg-type]
+            qdir = Path(self.s.allow_dir)                                                  # type: ignore[arg-type]
+            judge = self.s.allow_judge or slot_allow.default_judge(qdir)
+            new = slot_allow.offer(qdir, path, session, kept, judge)
         except slot_allow.AllowRefused as e:
             self.say(f"slot allow rules not read from session {session} ({e})")
             return
