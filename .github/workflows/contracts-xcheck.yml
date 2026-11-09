@@ -6,7 +6,7 @@ name: contracts-xcheck
 
 on:
   push:
-    branches: [main, "seat/**"]
+    branches: [main]
     tags: ["v*"]
   pull_request:
     branches: [main]
