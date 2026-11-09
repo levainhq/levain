@@ -2285,7 +2285,9 @@ def add_parsers(subparsers: argparse._SubParsersAction) -> None:
         description="Each pass starts every pending launch nobody started (a drop from the phone or the cockpit), "
                     "ends a launch whose Claude Code session is no longer listed, beats the lease of the coordinator "
                     "whose session is listed, not done and writing as coordinator, and stops a session whose launch "
-                    "is over. Only sessions Levain started.")
+                    "is over. Only sessions Levain started. Launches made in the board store are started by "
+                    "`coord watch --queue-dir <levain home>/board`; the board's coordinator verbs take that "
+                    "--queue-dir explicitly.")
     cwa.add_argument("--every", type=float, default=30.0, metavar="S", help="Seconds between passes (default 30).")
     cwa.add_argument("--once", action="store_true", help="One pass, then exit.")
     band_root = ("The cockpit data root whose authority log re-verifies the asking session's envelope (default: the one "
@@ -2349,7 +2351,8 @@ def add_parsers(subparsers: argparse._SubParsersAction) -> None:
                     "only spawner, and what binds is your lease and the cap of "
                     f"{_spawn_caps()[1]} asked for or running at once. `levain coord watch` or "
                     "`levain coord launch LAUNCH_ID` starts it, `levain coord status` lists it, and "
-                    "`levain coord handoff worker LAUNCH_ID` reads its final message once its turn is done.")
+                    "`levain coord handoff worker LAUNCH_ID` reads its final message once its turn is done. "
+                    "A launch made in the board store is started by `coord watch --queue-dir <levain home>/board`.")
     csp.add_argument("--thread", required=True, metavar="THREAD", help="The WORK thread the worker holds.")
     who = csp.add_mutually_exclusive_group(required=True)
     who.add_argument("--role", default=None, metavar="@spawn/NAME", help="A registered role.")
