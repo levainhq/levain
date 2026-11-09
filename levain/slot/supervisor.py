@@ -821,7 +821,7 @@ HOOKS_BY_AUTH: Mapping[str, Tuple[str, ...]] = {"brokered": (), "passthrough": (
 
 
 def render_blob(vendor: str, auth: str, routes: Sequence[str], identity: Optional[Mapping[str, str]],
-                label: Optional[str]) -> bytes:
+                label: Optional[str], repo_settings: Optional[Mapping[str, object]] = None) -> bytes:
     """The §5.3 blob as canonical bytes, checked by the helper's own grammar before it is sent. The operator's two
     inputs are each checked alone, so a refusal names its cause: a git identity the grammar refuses is
     ``git-identity-invalid``; a ``repo_label`` it refuses is dropped (DECISION: it is display only). The whole
@@ -843,6 +843,8 @@ def render_blob(vendor: str, auth: str, routes: Sequence[str], identity: Optiona
             blob["repo_label"] = label
         except Refused:
             pass
+    if repo_settings:
+        blob["repo_settings"] = dict(repo_settings)
     data = canon.canonical_bytes(blob)
     parse_stdin("render", data)
     return data
@@ -1461,12 +1463,22 @@ class Supervisor:
             tmp = Path(tempfile.mkdtemp(prefix="levain-session-", dir=self.s.tmp_parent))
             clone = tmp / "clone"
             commit = operator_clone(top, branch, clone, git=self.s.git, run=self.s.run)
-            check_repo_layer(repo_layer_docs(clone, git=self.s.git, run=self.s.run))
+            from levain.slot.render import freeze_repo_settings
+
+            docs = repo_layer_docs(clone, git=self.s.git, run=self.s.run)
+            check_repo_layer(docs)
+            frozen = freeze_repo_settings(docs)
+            if frozen.dropped_env:
+                self.say("repo settings env dropped (names only; none is on the allowlist): "
+                         + ", ".join(frozen.dropped_env))
+            if frozen.dropped_other:
+                self.say("repo settings not carried into the session: " + ", ".join(frozen.dropped_other))
             routes = pick_routes(read_base_map(self.s.base_map), self.req.vendor, self.req.auth)   # type: ignore[arg-type]
             identity = git_identity(top, git=self.s.git, run=self.s.run)
             if identity is None:
                 self.say("no git user.name / user.email for this repo: the session cannot commit as you")
-            blob = render_blob(self.req.vendor, self.req.auth, routes, identity, top.name)
+            blob = render_blob(self.req.vendor, self.req.auth, routes, identity, top.name,
+                               repo_settings=frozen.settings)
             self._check()
             self.say(f"{self.req.vendor} on {top} ({branch} at {commit[:12]})")
             return self._leased(clone, branch, blob)
