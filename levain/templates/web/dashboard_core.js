@@ -2353,7 +2353,10 @@
           };
           const chooseSurface = (v) => { listSurface = v; build(); redraw(); };
           rebuildChips = build;
-          if (inCard) listCardRedraw = () => { if (document.body.contains(p) && listChoice() !== drawnChoice) { build(); redraw(); } };
+          if (inCard) listCardRedraw = () => { if (document.body.contains(p) && listChoice() !== drawnChoice) {
+            // a draw that fails leaves the card unconfirmed, so the next close tries again
+            try { build(); redraw(); } catch (e) { drawnChoice = null; throw e; }
+          } };
           build();
         }
         if (!views.length) return;
