@@ -306,3 +306,33 @@ def test_the_committed_weights_deal_their_own_files_evenly():
     shards, loads = shard.partition(list(files), 6, lambda f: shard.weight(f, shard.ROOT, (files, 1.0)))
     shard.check(shards, list(files))
     assert max(loads) <= 1.10 * (sum(loads) / len(loads)), [round(x) for x in loads]
+
+
+# ---- the static shard list in the workflow --------------------------------------------------------------------
+
+WF_OK = 'env:\n  TEST_SHARDS: "3"\n  matrix:\n    shard: [0, 1, 2]  # static shard list\n'
+
+
+def test_check_static_accepts_a_list_equal_to_the_planners():
+    shard.check_static(WF_OK)
+
+
+@pytest.mark.parametrize("text", [
+    WF_OK.replace("[0, 1, 2]", "[0, 1]"),            # stale: fewer
+    WF_OK.replace("[0, 1, 2]", "[0, 1, 2, 3]"),      # stale: more
+    WF_OK.replace('"3"', '"4"'),                     # TEST_SHARDS moved, list did not
+    WF_OK.replace("  # static shard list", ""),      # the marker is gone
+    WF_OK + WF_OK,                                   # two lists
+])
+def test_check_static_fails_on_a_stale_or_missing_list(text):
+    with pytest.raises(ValueError):
+        shard.check_static(text)
+
+
+def test_check_static_cli_exit_codes(tmp_path):
+    good, bad = tmp_path / "good.yml", tmp_path / "bad.yml"
+    good.write_text(WF_OK)
+    bad.write_text(WF_OK.replace("[0, 1, 2]", "[0, 1]"))
+    assert _run("check-static", "--workflow", str(good)).returncode == 0
+    assert _run("check-static", "--workflow", str(bad)).returncode == 1
+    assert _run("check-static", "--workflow", str(tmp_path / "absent.yml")).returncode == 1
