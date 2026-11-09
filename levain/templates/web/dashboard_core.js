@@ -9307,16 +9307,35 @@
       if (ta.closest(".text-editor")) continue;
       if (ta.value.trim() !== "") return true;
     }
-    // Any text field the person is IN counts, empty or not, tracked above or not: a rebuild removes the focused node, and
-    // the next keystroke goes nowhere. The deferred read flushes when focus leaves (the boot layer's focusout).
-    const a = document.activeElement;
-    if (a && a !== document.body) {
-      const tag = a.tagName;
-      if (tag === "TEXTAREA" || tag === "SELECT" || a.isContentEditable) return true;
-      if (tag === "INPUT" && !/^(button|submit|reset|checkbox|radio|file|image|range|color)$/i.test(a.type || "")) return true;
-    }
     return false;
   }
+
+  // A focused text field also holds a passive RE-READ off (never a reorder or a Reset-layout, which keep the dirty-edit meaning
+  // above): the draw empties every region listed here, and a node removed from the page takes the keyboard with it. Only a field
+  // inside one of those regions counts (the drop box, the chat and the devices sit outside and survive the draw), and only while
+  // it holds text or took a key within the idle window, so a box merely left focused never freezes the board.
+  const FOCUS_REBUILT = "#board, #levain-modal, #ck-hero, #ck-brief, #ck-widgets, #ck-needs, #ck-notes";
+  const FOCUS_IDLE_MS = 10000;
+  let lastFieldInput = 0;
+  if (typeof document !== "undefined" && document.addEventListener) {
+    const stamp = () => { lastFieldInput = Date.now(); };
+    document.addEventListener("input", stamp, true);
+    document.addEventListener("keydown", stamp, true);
+    document.addEventListener("change", stamp, true);
+  }
+  function focusHoldsRefresh() {
+    const a = document.activeElement;
+    if (!a || a === document.body || !a.closest || !a.closest(FOCUS_REBUILT)) return false;
+    const tag = a.tagName;
+    let text = false;
+    if (tag === "TEXTAREA" || (tag === "INPUT" && !/^(button|submit|reset|checkbox|radio|file|image|range|color)$/i.test(a.type || ""))) text = true;
+    else if (a.isContentEditable) text = true;
+    else if (tag !== "SELECT") return false;
+    if (text && String(a.isContentEditable ? a.textContent : a.value || "").trim() !== "") return true;
+    return Date.now() - lastFieldInput < FOCUS_IDLE_MS;
+  }
+  // what holds a passive re-read off: an unsaved edit, or a field the person is in
+  function editHoldsRefresh() { return hasUnsavedEdit() || focusHoldsRefresh(); }
 
   // Export the entry points onto a namespace the surface shim calls. `jobsActive` lets the boot
   // layer DEFER a board reload while an async job is polling (a reload would detach the live result
@@ -10524,5 +10543,5 @@ for (const type of ["touchstart", "wheel", "pointerdown", "click", "keydown"]) d
   window.LevainAgentPage = { open: openAgentPage };
   window.LevainNeeds = { items: (lines) => needsWaiting(needsItems(lines)), name: needsName, summary: needsSummary, go: needsGo, history: openDecisionsHistory };
   window.LevainLoops = { find: loopFind, go: loopGo, why: () => loopWhy };
-  window.LevainDashboard = { render: renderKeepingPlace, redraw: ckRedraw, openCustom, composeDrop, adoptPanel, captureKept, settleKept, buildKept: () => buildKept, renderPanel: renderPanelSafe, measureClauses, measureOverflow, hasUnsavedEdit, dropBoxText, setDropBoxText, dropBoxIsOff, jobsActive: () => _activeJobs.size > 0, fitLineTile, lineTileCount: () => lineFits.size, noteBodyCount: () => noteBodies.size };
+  window.LevainDashboard = { render: renderKeepingPlace, redraw: ckRedraw, openCustom, composeDrop, adoptPanel, captureKept, settleKept, buildKept: () => buildKept, renderPanel: renderPanelSafe, measureClauses, measureOverflow, hasUnsavedEdit, editHoldsRefresh, dropBoxText, setDropBoxText, dropBoxIsOff, jobsActive: () => _activeJobs.size > 0, fitLineTile, lineTileCount: () => lineFits.size, noteBodyCount: () => noteBodies.size };
 })();
