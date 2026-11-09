@@ -242,12 +242,13 @@ def test_a_key_the_authority_log_does_not_hold_active_as_a_laptop_key_does_not_c
         rig.authority.keys.update(keep)
         rig.authority.keys[rig.laptop.fp].active = True
         rig.authority.keys[rig.laptop.fp].key_class = LAPTOP
-    # an authority that cannot be read carries nothing and does not raise; the refused yes is named after the launch
+    # an authority that cannot be read carries nothing and does not raise; the yes is kept, not refused
     boom = SA.Judge(authority=lambda: (_ for _ in ()).throw(OSError("log")))
     assert "authority log cannot be read" in SA.not_carried(qdir, store=rig.qs, judge=boom)[0][1]
     assert SA.apply_answered(qdir, allow, store=rig.qs, judge=boom) == []
-    assert "authority log cannot be read" in SA.not_carried(qdir, store=rig.qs, judge=rig.judge)[0][1]
-    assert SA.rules_of(allow) == []
+    assert SA.rules_of(allow) == [] and "WebSearch" in SA._pending(qdir)
+    assert SA.not_carried(qdir, store=rig.qs, judge=rig.judge) == []
+    assert SA.apply_answered(qdir, allow, store=rig.qs, judge=rig.judge) == ["WebSearch"]
 
 
 def _carried_one(rig, qdir, rule="Bash(npm test *)"):
@@ -1037,6 +1038,74 @@ def test_undo_from_the_verb_with_no_authority_log_raises_nothing_and_re_offers(r
     assert SA.run(SimpleNamespace(queue_dir=qdir, slot_allow_verb="undo", rule="WebSearch")) == 0
     assert "re-offered on the band" in capsys.readouterr().out
     assert len(_rows(rig, "WebSearch")) == 1
+
+
+def test_a_signed_yes_outlives_an_authority_log_that_cannot_be_read(rig, qdir):
+    log = rig.tmp / "authority.log"
+    away = rig.tmp / "authority.away"
+    log.write_text("the log")
+    rig.judge = SA.Judge(authority=lambda: (log.read_bytes(), rig.authority)[1], ctk=rig.judge.ctk)
+    allow = _carried_one(rig, qdir, "Bash(make *)")
+    SA.revoke(allow, "Bash(make *)", confirm=True)
+    _save(rig, qdir, "WebSearch", "S1")
+    (q,) = _rows(rig, "WebSearch")
+    rig.yes(q)
+    log.rename(away)                                   # the log cannot be read: no verdict on the yes
+    SA.undo(allow, "Bash(make *)", store=rig.qs, judge=rig.judge)
+    assert "WebSearch" in SA._pending(qdir)
+    SA.remind(qdir, allow, store=rig.qs, judge=rig.judge)
+    assert "WebSearch" in SA._pending(qdir)
+    SA.offer(qdir, allow, "S2", ["Bash(echo *)"], rig.judge, store=rig.qs)
+    assert "WebSearch" in SA._pending(qdir)
+    assert "authority log cannot be read" in dict(SA.not_carried(qdir, store=rig.qs, judge=rig.judge))["WebSearch"]
+    away.rename(log)
+    settings, _said = _launch(rig, qdir)
+    assert settings["permissions"]["allow"] == ["WebSearch"]
+    assert SA.rules_of(allow) == ["WebSearch"] and "WebSearch" not in SA._pending(qdir)
+
+
+def test_a_no_to_the_row_undo_files_for_a_rule_its_apply_restored_ends_the_rule(rig, qdir, monkeypatch):
+    rule = "Bash(npm test *)"
+    _at_day(rig, 28)
+    allow = _carried_one(rig, qdir, rule)
+    _at_day(rig, 0)
+    assert SA.remind(qdir, allow, store=rig.qs, judge=rig.judge) == [rule]       # the renewal row
+    (renewal,) = _rows(rig, rule)
+    SA.revoke(allow, rule, confirm=True)
+    rig.yes(renewal)                                   # a signed yes to the renewal row, after the revoke
+    readable = [True]
+
+    def authority():
+        if not readable[0]:
+            raise OSError("log")
+        return rig.authority
+    judge = SA.Judge(authority=authority, ctk=rig.judge.ctk)
+    real = SA.apply_answered
+
+    def then_unreadable(*a, **kw):
+        got = real(*a, **kw)
+        readable[0] = False                            # the log stops reading after undo's apply
+        return got
+    with monkeypatch.context() as m:
+        m.setattr(SA, "apply_answered", then_unreadable)
+        assert "re-offered on the band" in SA.undo(allow, rule, store=rig.qs, judge=judge)
+    assert SA.rules_of(allow) == [rule]                # the yes restored the stored rule
+    (row,) = _rows(rig, rule)
+    rig.qs.answer(row.id, option="no", channel="cli")
+    readable[0] = True
+    SA.apply_answered(qdir, allow, store=rig.qs, judge=judge)
+    assert SA.carried(allow, judge, rig.sid)[0] == []  # the no is not followed by the rule carrying
+    assert SA.rules_of(allow) == []
+    assert [r.get("reason") for r in SA.load(allow)["revoked"] if r["rule"] == rule] == [SA.DECLINED]
+    assert "No ends the rule" in row.blocks
+
+
+def test_a_record_whose_filing_was_cut_short_is_read_as_no_row_yet(rig, qdir):
+    rec = {"rule": "WebSearch", "session": "S1", "question_id": None, "key": "slot-allow:x"}
+    assert SA._question_of(rig.qs, rec) is None
+    (qdir / SA.PENDING_NAME).write_text(json.dumps({"format": SA.PENDING_FORMAT, "rows": {"WebSearch": rec},
+                                                    "refused": {}}))
+    assert SA.not_carried(qdir, store=rig.qs, judge=rig.judge) == []
 
 
 def test_a_slot_end_applies_an_answered_row_before_it_files(rig, qdir):
