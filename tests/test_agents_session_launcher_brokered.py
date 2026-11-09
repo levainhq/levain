@@ -660,3 +660,77 @@ def test_a_reader_that_breaks_is_none(tmp_path):
         raise OSError("clock gone")
 
     assert DU.lineage_spend_reader(_sink(tmp_path, [_row(RUN)]), wait_s=1.0, sleep=boom)(RUN) is None
+
+
+@pytest.mark.parametrize("why,rows", [
+    ("a final that counts a quarantine", _closed([_row(RUN)], quarantined=1)),
+    ("a final whose row count differs", (lambda r: [r, _final(RUN, [r], rows=2)])(_row(RUN))),
+    ("a final whose digest differs", _closed([_row(RUN)], triples_digest="sha256:" + "0" * 64)),
+    ("two finals", _closed([_row(RUN)]) + [_final(RUN, [_row(RUN)])]),
+    ("a foreign format", [{"format": "x", "run_id": RUN}]),
+    ("a row with an unknown settled word", [_row(RUN, settled="maybe")]),
+])
+def test_a_permanently_bad_proof_answers_none_at_once_without_waiting(tmp_path, why, rows):
+    w = _Wall()
+    p = _sink(tmp_path, rows)
+    assert DU.lineage_spend_reader(p, wait_s=6.0, poll_s=0.2, clock=w.clock, sleep=w.sleep)(RUN) is None, why
+    assert w.sleeps == 0, why                         # a proof that cannot mend by waiting is not waited on
+
+
+def test_a_malformed_line_answers_none_at_once(tmp_path):
+    p = tmp_path / "l.jsonl"
+    p.write_bytes(b"not json\n")
+    w = _Wall()
+    assert DU.lineage_spend_reader(p, wait_s=6.0, poll_s=0.2, clock=w.clock, sleep=w.sleep)(RUN) is None
+    assert w.sleeps == 0
+
+
+def test_a_poll_resumes_where_the_last_one_stopped(tmp_path):
+    rows = [_row(RUN, cost=100, hold=100), _row(RUN, cost=900, hold=900)]
+    p = _sink(tmp_path, rows[:1])
+    src = DU._SinkRead(p, RUN, torn_is_final=False)
+    assert src.step() == (DU._RETRY, None)
+    first_end = p.stat().st_size
+    assert src._offset == first_end                   # the whole first row is behind it
+    with open(p, "ab") as fh:
+        fh.write(json.dumps(rows[1]).encode() + b"\n" + json.dumps(_final(RUN, rows)).encode() + b"\n")
+    assert src.step() == (DU._DONE, 1_000)            # the first row was not read twice (the rows count would not match)
+
+
+def test_a_waiting_read_sees_a_late_proof_that_arrives_whole(tmp_path):
+    rows = [_row(RUN, cost=100, hold=100)]
+    p = _sink(tmp_path, rows)
+    w = _Wall(lambda n: p.write_bytes(p.read_bytes() + json.dumps(_final(RUN, rows)).encode() + b"\n") if n == 2 else None)
+    assert DU.lineage_spend_reader(p, wait_s=6.0, poll_s=0.2, clock=w.clock, sleep=w.sleep)(RUN) == 100
+    assert w.sleeps == 2
+
+
+def test_waits_beyond_the_waiter_cap_take_one_look_and_no_wait(tmp_path, monkeypatch):
+    monkeypatch.setattr(DU, "MAX_WAITERS", 1)
+    p = _sink(tmp_path, [_row(RUN)])
+    w = _Wall()
+    seen = {"slept": 0, "inner": None, "inner_slept": 0, "inside": False}
+
+    def sleep(s):
+        seen["slept"] += 1
+        if seen["inside"]:
+            seen["inner_slept"] += 1
+        elif seen["inner"] is None:
+            seen["inside"] = True
+            seen["inner"] = read(RUN)                 # a second read while the first one waits
+            seen["inside"] = False
+        w.sleep(s)
+
+    read = DU.lineage_spend_reader(p, wait_s=3.0, poll_s=1.0, clock=w.clock, sleep=sleep)
+    assert read(RUN) is None and seen["inner"] is None
+    assert seen["inner_slept"] == 0 and seen["slept"] == 3     # the outer waited its three polls; the inner took one look
+
+
+def test_a_failing_fdopen_closes_the_descriptor_once_and_lineage_spend_stays_none(tmp_path, monkeypatch):
+    p = _sink(tmp_path, _closed([_row(RUN)]))
+    closed = []
+    real_close = os.close
+    monkeypatch.setattr(DU.os, "fdopen", lambda *a, **k: (_ for _ in ()).throw(MemoryError("no")))
+    monkeypatch.setattr(DU.os, "close", lambda fd: (closed.append(fd), real_close(fd))[1])
+    assert DU.lineage_spend(p, RUN) is None           # never raises
+    assert len(closed) == 1
