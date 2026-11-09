@@ -41,7 +41,6 @@ for panel in ("loops", "tray"):
          f"{panel}.items[].id", f"{panel}.items[].title", f"{panel}.items[].body", f"{panel}.items[].truncated")
     _add(B, "map", f"{panel} row facets of the same name", True,
          *(f"{panel}.items[].{f}" for f in ("disposition", "domain", "tier", "age_days", "due", "overdue_days", "held_until")))
-_add(B, "map", "tray filtered: [{count, reason}]", True, "tray.held")
 
 # --- 6.2 Bridge /substrate.json ---------------------------------------------------------------------
 S = "substrate"

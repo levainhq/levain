@@ -501,8 +501,9 @@ def test_r4_the_card_holds_due_rows_and_one_control_and_the_focus_view_every_gro
     assert card["head"] and int(card["head"]) == num(card["chips"], "all"), card
     assert focus["title"].endswith(f"({num(focus['chips'], 'all')})"), focus
     desk, later = (int(re.search(rf"{w} (\d+)", card["more"][0]).group(1)) for w in ("desk owes", "later"))
-    carried = 1       # the carried desk row is in the card's "all" already (it is needs-you) and in the control's desk owes
-    assert num(focus["chips"], "all") == num(card["chips"], "all") + (desk - carried) + later, (card, focus)
+    # the carried desk row is in the card's "all" already (needs-you) and in the control's desk owes; the focus view draws it a second time
+    # under Desk owes, and its "all" counts the rows that tap draws, so that second drawing is in the number
+    assert num(focus["chips"], "all") == num(card["chips"], "all") + desk + later, (card, focus)
     # the control's "desk owes N" is the rows a person sees under Desk owes: the carried row is listed there too, as the footer prints it
     assert len(focus["desk"]) == desk and len(focus["later"]) == later, focus
     assert any(t.startswith("desk: carried") for t in focus["desk"]), focus
@@ -782,7 +783,10 @@ def test_the_type_chips_add_up_to_all_in_every_time_state_and_each_count_is_the_
     _seed_more(root)
     _seed_phone(root)
     _seed_time(root)
-    _host_band(monkeypatch)
+    from levain.consent.questions import QuestionStore
+    QuestionStore(default_queue_dir()).file(agent="claude_code", agent_session_id="s8", what="desk: carried Launch the TAOSERV upgrade seat.",
+                                            options=[("ship", "Ship it"), ("hold", "Hold")], rec="hold", blocks="the upgrade", cwd="/w/taoserv")
+    _host_band(monkeypatch)    # a carried desk row: the focus view draws it under Needs you and again under Desk owes
     with _serve(src, write_token=TOKEN, surface_tokens={"browser": TOKEN}, install_class="reported") as (url, _httpd):
         out = _drive(tmp_path, f"{url}/", [
             {"emulate": {"w": 1280, "h": 1000, "dpr": 1}},
@@ -794,7 +798,8 @@ def test_the_type_chips_add_up_to_all_in_every_time_state_and_each_count_is_the_
     sweep = json.loads(out["values"][-1])["sweep"]
     assert [s["t"] for s in sweep] == ["", "now", "later", "someday", "done"], sweep
     for s in sweep:
-        assert sum(n for _k, n, _shown in s["per"]) == s["all"], s                          # the type chips sum to all
+        copies = 1 if s["t"] in ("", "now") else 0                                          # the carried desk row's second drawing, a now row
+        assert sum(n for _k, n, _shown in s["per"]) + copies == s["all"], s                 # the type chips sum to all, less that copy
         assert all(n == shown for _k, n, shown in s["per"]), s                              # each count is the rows its tap shows
         assert s["shownAll"] == s["all"], s
         if s["timeCount"] is not None:

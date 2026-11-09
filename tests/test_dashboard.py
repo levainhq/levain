@@ -1485,7 +1485,7 @@ class TestListPagePins:
         # support obeys text_locked like the primary text; the time chip narrows what the type chips count and the filter reads
         assert "s.support && !s.text_locked" in core
         assert "const listAll = () =>" in core and "buildSurfaceChips(listAll().filter(inTime)," in core
-        assert "listAll().some((s) => s.surface === listSurface)" in core
+        assert "listAll().filter(inTime).some((s) => s.surface === listSurface)" in core
 
     def test_a_refusals_reason_reaches_the_box_and_501_503_have_words(self) -> None:
         boot = self._js("dashboard_boot.js")
@@ -1529,14 +1529,6 @@ class TestListPagePinsRound2:
         view, core = self._js("cockpit_view.js"), self._js("dashboard_core.js")
         assert "row.title || row.body" in view and "support:" in view
         assert 'el("span", "muted list-support", s.support)' in core
-
-    def test_the_surface_filter_reaches_the_held_rows(self) -> None:
-        core = self._js("dashboard_core.js")
-        # three reach points: the card's extra rows, and the unlisted hint in both of its branches
-        assert core.count("held.filter(inSurface)") == 3
-        assert "heldShownNow() ? held.filter(inSurface) : []" in core
-        assert "!heldShownNow() ? held.filter(inSurface)" in core
-        assert "!heldChosen() ? held.filter(inSurface)" in core
 
     def test_a_write_in_flight_never_clobbers_the_draft_typed_since(self) -> None:
         core = self._js("dashboard_core.js")

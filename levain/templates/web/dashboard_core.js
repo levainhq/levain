@@ -2269,13 +2269,15 @@
       const at = rows.findIndex((s) => s.group !== "band");     // Desk owes follows Needs you, ahead of the rows already in it
       return at < 0 ? rows.concat(copies) : rows.slice(0, at).concat(copies, rows.slice(at));
     };
+    // the rows the "all" tap draws: the focus view lists a carried desk row twice, so the "all" and time chips count through this too
+    const drawn = (rows) => (isList && !inCard ? withCarriedDesk(rows) : rows);
     // the time-state a row is in, as the kernel computed it; the focus view's time chips filter by it, across the type chips
     const timeOf = (s) => s.time_state || "now";
     const timeNow = () => (isList && !inCard && LIST_TIMES.indexOf(listTime) >= 0 ? listTime : "");
     const inTime = (s) => !timeNow() || timeOf(s) === timeNow();
     const listNow = () => (isList && listAll().filter(inTime).some((s) => s.surface === listSurface) ? listSurface : "");
     const inSurface = (s) => !listNow() || s.surface === listNow();
-    if (isList && !inCard) p.dataset.listTotal = String(listAll().length);   // the focus view's header counts what its "all" chip counts
+    if (isList && !inCard) p.dataset.listTotal = String(drawn(listAll()).length);   // the focus view's header counts what its "all" chip counts
     let chipRow = null;     // the chips' row, drawn by controls(); the panel's own element is empty once the focus view moves its body
     const opts = views.length || isList ? {
       // a card whose due rows are all done still holds the desk's and the later ones: it says nothing is due, not that it is empty
@@ -2294,13 +2296,13 @@
       controls: (bar, redraw) => {
         if (isList) {
           const chooseSurface = (v) => { listSurface = v; redraw(); };
-          chipRow = buildSurfaceChips(listAll().filter(inTime), listNow, chooseSurface, inCard ? "" : "Type");
+          chipRow = buildSurfaceChips(listAll().filter(inTime), listNow, chooseSurface, inCard ? "" : "Type", drawn);
           bar.after(chipRow);
           if (!inCard) {
             // the time chips; choosing one recounts the type chips beside it, so a chip's number stays the rows its tap shows
-            const timeRow = buildTimeChips(listAll(), timeNow, (v) => {
+            const timeRow = buildTimeChips(drawn(listAll()), timeNow, (v) => {
               listTime = v;
-              const fresh = buildSurfaceChips(listAll().filter(inTime), listNow, chooseSurface, inCard ? "" : "Type");
+              const fresh = buildSurfaceChips(listAll().filter(inTime), listNow, chooseSurface, inCard ? "" : "Type", drawn);
               chipRow.replaceWith(fresh); chipRow = fresh;
               redraw();
             });
@@ -2322,7 +2324,7 @@
         const ids = views.length && viewOf() ? view.tray_view_rows[viewOf()] : null;
         // the focus view draws a carried desk row under Needs you AND under Desk owes, as flow's footer prints it, so the control's
         // "desk owes N" is the number of rows a person can see under that heading (a chosen view is ungrouped: no copy there)
-        const all = isList && !inCard && !Array.isArray(ids) && !listNow() ? withCarriedDesk(base) : base;
+        const all = !Array.isArray(ids) && !listNow() ? drawn(base) : base;
         if (!Array.isArray(ids)) return all;
         const byId = new Map(all.map((s) => [s.id, Object.assign({}, s, { age_shown: true })]));
         // a row the view did not name still shows, after the named ones
@@ -2470,7 +2472,7 @@
     sync(current());
     return row;
   }
-  function buildSurfaceChips(list, current, choose, label) {
+  function buildSurfaceChips(list, current, choose, label, project) {
     const row = el("div", "list-surfaces");
     row.setAttribute("role", "group");
     row.setAttribute("aria-label", "filter the List by where a row comes from");
@@ -2487,7 +2489,7 @@
       row.appendChild(c);
     };
     const sync = (now) => { for (const c of chips) c.setAttribute("aria-pressed", c.dataset.surface === now ? "true" : "false"); };
-    mk("", "all " + list.length);
+    mk("", "all " + (project ? project(list) : list).length);   // the rows the "all" tap draws, a carried copy included
     for (const k of Object.keys(SURFACE_WORDS)) if (counts.has(k)) mk(k, SURFACE_WORDS[k] + " " + counts.get(k));
     sync(current());
     return row;
