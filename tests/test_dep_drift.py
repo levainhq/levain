@@ -1,5 +1,6 @@
 """scripts/dep_drift.py: parsing a uv.lock and diffing two of them, the part the nightly issue body is made from."""
 import importlib.util
+import os
 from pathlib import Path
 
 _SPEC = importlib.util.spec_from_file_location("dep_drift", Path(__file__).resolve().parents[1] / "scripts" / "dep_drift.py")
@@ -81,6 +82,24 @@ def test_failed_tests_reads_pytest_short_summary_ids():
         "1 failed, 1 error, 3 passed in 1.0s",
     ]
     assert dep_drift.failed_tests(out) == ["tests/test_a.py::test_one", "tests/test_b.py::test_two"]
+
+
+def test_failed_tests_names_a_collection_error():
+    out = ["ERROR tests/test_x.py - ModuleNotFoundError: No module named 'gone'", "ERROR something else entirely"]
+    assert dep_drift.failed_tests(out) == ["tests/test_x.py - ModuleNotFoundError: No module named 'gone'"]
+
+
+def test_the_suite_env_carries_the_scratch_venv_first_on_path_and_virtual_env():
+    env = dep_drift.suite_env(Path("/scratch/venv"), {"PATH": "/usr/bin", "HOME": "/h"})
+    assert env["PATH"].split(os.pathsep)[0] == "/scratch/venv/bin" and env["PATH"].endswith("/usr/bin")
+    assert env["VIRTUAL_ENV"] == "/scratch/venv" and env["HOME"] == "/h"
+    assert env["LEVAIN_TEST_WAIT_SCALE"] == "2"
+    assert dep_drift.suite_env(Path("/v"), {"LEVAIN_TEST_WAIT_SCALE": "5"})["LEVAIN_TEST_WAIT_SCALE"] == "5"
+
+
+def test_the_smoke_imports_openhands_only_when_that_extra_is_installed():
+    assert dep_drift.smoke_for(["dev", "openhands"]) == "import levain, openhands.sdk"
+    assert dep_drift.smoke_for(["dev"]) == "import levain"
 
 
 def test_failed_tests_is_bounded():

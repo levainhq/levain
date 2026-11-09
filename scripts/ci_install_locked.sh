@@ -10,7 +10,9 @@
 set -euo pipefail
 UV_VERSION="${UV_VERSION:-0.13.5}"
 PIP_VERSION="${PIP_VERSION:-26.3}"
-tmp="${RUNNER_TEMP:-${TMPDIR:-/tmp}}"
+# A private directory per run, removed on exit: two runs sharing RUNNER_TEMP or /tmp never overwrite each other's exports.
+tmp="$(mktemp -d "${RUNNER_TEMP:-${TMPDIR:-/tmp}}/levain-install.XXXXXX")"
+trap 'rm -rf "$tmp"' EXIT
 extras=()
 for e in "$@"; do extras+=(--extra "$e"); done
 python -m pip install "pip==${PIP_VERSION}" "uv==${UV_VERSION}"

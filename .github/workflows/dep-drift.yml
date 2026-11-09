@@ -85,8 +85,10 @@ jobs:
           if d["changed"]:
               print("Packages whose version changed against the committed uv.lock (old -> new):\n")
               print("\n".join("- " + c for c in d["changed"]))
-          else:
+          elif d.get("stage") == "suite":
               print("red with no version change: likely flaky test, not drift")
+          else:
+              print("no version change recorded; result: " + str(d.get("result")) + ", stage: " + str(d.get("stage")))
           failed = d.get("failed_tests") or []
           if failed:
               print("\nFailing tests:\n")

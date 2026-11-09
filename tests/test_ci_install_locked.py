@@ -6,10 +6,14 @@ import os
 import re
 import subprocess
 import sys
-import tomllib
 from pathlib import Path
 
 import pytest
+
+try:
+    import tomllib
+except ModuleNotFoundError:  # Python 3.9 and 3.10: the backport the py39 pin file carries
+    import tomli as tomllib
 
 ROOT = Path(__file__).resolve().parents[1]
 SCRIPT = ROOT / "scripts" / "ci_install_locked.sh"
@@ -63,6 +67,15 @@ def test_the_build_group_is_installed_hashed_before_the_rest_builds_without_isol
     # the editable install of the project itself also builds with the already-installed backend
     editable = [c for c in calls if c.endswith("-e .")]
     assert editable and "--no-build-isolation" in editable[0]
+
+
+@pytest.mark.skipif(not os.path.exists(BASH), reason="needs /bin/bash")
+def test_the_exports_go_to_a_private_directory_that_is_removed_on_exit(tmp_path):
+    proc, calls = _run(tmp_path, "dev")
+    assert proc.returncode == 0, proc.stderr
+    exports = [c for c in calls if " export " in c]
+    assert exports and all(f"{tmp_path}/levain-install." in c for c in exports)
+    assert [p.name for p in tmp_path.glob("levain-install.*")] == []
 
 
 @pytest.mark.skipif(not os.path.exists(BASH), reason="needs /bin/bash")
@@ -139,6 +152,18 @@ def test_drift_issue_title_has_no_date_and_one_open_label_is_the_dedupe_key():
     assert 'title="dependency drift red"' in DRIFT
     assert "gh issue list --state open --label dep-drift" in DRIFT
     assert "gh issue comment" in DRIFT and "gh issue close" in DRIFT
+
+
+def test_drift_calls_a_flake_only_at_the_suite_stage_and_names_result_and_stage_otherwise():
+    flaky = DRIFT.index("likely flaky test, not drift")
+    assert DRIFT.rindex('elif d.get("stage") == "suite":', 0, flaky) > DRIFT.rindex("if d[", 0, flaky)
+    assert 'str(d.get("result"))' in DRIFT and 'str(d.get("stage"))' in DRIFT
+
+
+def test_the_build_group_carries_the_common_backends_beside_setuptools():
+    build = tomllib.loads((ROOT / "pyproject.toml").read_text())["dependency-groups"]["build"]
+    assert {"hatchling", "wheel"} <= {re.split(r"[<>=!~ ]", b)[0] for b in build}
+    assert {"hatchling", "wheel"} <= set(_lock_versions())
 
 
 def test_drift_says_a_red_with_no_changed_package_is_likely_flaky():
