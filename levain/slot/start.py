@@ -186,7 +186,7 @@ def vendor_argv(host: str, vendor: str, session: str, *, kind: Optional[str] = N
 
     p71 S8 D4: for alloc ``kind`` ``dispatch`` whose ticket's kind (``ticket_kind``, from alloc's ``ticket_facts``)
     is ``executor``, on ``claude``, the print-mode exec: ``-p``, the project and local settings layers left out
-    (``--setting-sources user``), no MCP server (``--strict-mcp-config`` with no ``--mcp-config``), the brief as the
+    (every settings source left out, ``--setting-sources ""``), no MCP server (``--strict-mcp-config`` with no ``--mcp-config``), the brief as the
     system prompt's addition from ``<S>/in/brief.md``, and stream-json output (``--verbose`` is its requirement).
     Every token is a constant or derived from the session id; no brief byte is ever a token. No permission, tool or
     model flag: those live in the rendered layer. A ``dispatch`` session whose ticket facts are absent is refused
@@ -205,10 +205,10 @@ def vendor_argv(host: str, vendor: str, session: str, *, kind: Optional[str] = N
     if vendor == "claude":
         S = f"{STORE[host]}/live/{session}"
         if kind == "dispatch" and ticket_kind == "executor":
-            return (binary, "-p", "--settings", f"{S}/root/settings.json", "--setting-sources", "user",
+            return (binary, "-p", "--settings", f"{S}/root/settings.json", "--setting-sources", "",
                     "--strict-mcp-config", "--append-system-prompt-file", f"{S}/in/brief.md",
                     "--output-format", "stream-json", "--verbose", EXECUTOR_PROMPT)
-        return (binary, "--settings", f"{S}/root/settings.json")
+        return (binary, "--settings", f"{S}/root/settings.json", "--setting-sources", "")
     return (binary, *RD.CODEX_LAUNCH_ARGS)
 
 

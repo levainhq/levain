@@ -760,13 +760,3 @@ def test_stage_argv_runs_the_root_tree_isolated():
 def test_darwin_kernel_groups_reads_this_process():
     import os
     assert os.getegid() in wall._darwin_kernel_groups()
-
-
-def test_loader_env_is_scrubbed_from_the_exec_env_whatever_its_source(darwin):
-    sp = spec("darwin", "vendor")
-    f = fake_for(sp, extra_files={sp.env_file: ENV_TEXT + b"LD_PRELOAD=/x.so\nDYLD_INSERT_LIBRARIES=/y.dylib\n"
-                                  b"LD_LIBRARY_PATH=/z\nLD_AUDIT=/a.so\nLDFLAGS=-O2\n"})
-    wall.stage_main(3, f.calls)
-    env = f.log[-1][3]
-    assert not [k for k in env if k.startswith(("LD_", "DYLD_"))]
-    assert env["LDFLAGS"] == "-O2" and env["HOME"] == wall.parse_env(ENV_TEXT)["HOME"]

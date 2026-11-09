@@ -32,12 +32,12 @@ def test_default_seams_pass_render_check_facts(monkeypatch):
     ctx = types.SimpleNamespace(seams=H.Seams(host="darwin"), env={}, store=None)
     got = H.render_facts(ctx, alloc, blob)
     rd.check_facts(blob, got)
-    assert set(got.hook_templates) == BOTH
+    assert set(got.hook_templates) == BOTH | {"levain_config"}     # the ConfigChange alarm rides every Claude session
 
 
 def test_a_blob_naming_no_hook_gets_none_and_an_explicit_empty_seam_is_still_missing():
     blob, _ = egress(hooks=BOTH)
-    assert H.hook_templates_for(H.Seams(host="linux"), egress()[0]) == {}
+    assert set(H.hook_templates_for(H.Seams(host="linux"), egress()[0])) == {"levain_config"}
     assert H.hook_templates_for(H.Seams(host="linux", hook_templates={}), blob) == {}
 
 
@@ -45,20 +45,22 @@ def test_a_blob_naming_no_hook_gets_none_and_an_explicit_empty_seam_is_still_mis
 def test_templates_shape(host):
     t = hook_templates(host)
     assert {k: v.event for k, v in t.items()} == EVENTS == {"levain_gate": "PreToolUse",
-                                                           "levain_queue": "PermissionRequest"}
+                                                           "levain_queue": "PermissionRequest",
+                                                           "levain_config": "ConfigChange"}
     for name, tpl in t.items():
         assert tpl.matcher is None                      # every tool: a matcher can only make the gate look at less
         text = tpl.body.decode()
         assert text.startswith("#!%s %s\n" % (ROOT_PYTHON[host], PY_FLAGS))
         assert "run(%r)" % name in text and "code = 2\n" in text and text.endswith("sys.exit(code)\n")
-        assert tpl.timeout == 870
+        assert tpl.timeout == (30 if name == "levain_config" else 870)
+        assert ("import config_guard as run" in text) == (name == "levain_config")
 
 
 def test_the_rendered_settings_wire_both_hooks():
     blob, facts = egress(kind="dispatch", auth="passthrough", hooks=BOTH)
     facts = dataclasses.replace(facts, hook_templates=H.hook_templates_for(H.Seams(host="darwin"), blob))
     cfg = rd.render_cc_settings(blob, facts)
-    assert set(cfg["hooks"]) == {"PreToolUse", "PermissionRequest"}
+    assert set(cfg["hooks"]) == {"PreToolUse", "PermissionRequest", "ConfigChange"}
 
 
 def test_every_rendered_slot_hook_blocks_when_it_cannot_run_and_outlives_the_hold():
@@ -74,9 +76,11 @@ def test_every_rendered_slot_hook_blocks_when_it_cannot_run_and_outlives_the_hol
     facts = dataclasses.replace(facts, hook_templates=H.hook_templates_for(H.Seams(host="darwin"), blob))
     cfg = rd.render_cc_settings(blob, facts)
     handlers = [h for groups in cfg["hooks"].values() for g in groups for h in g["hooks"]]
-    assert len(handlers) == 2
+    assert len(handlers) == 3
     for h in handlers:
-        assert h["onFailure"] == "block" and h["timeout"] == HT.HOOK_TIMEOUT == cc.GATE_TIMEOUT
+        assert h["onFailure"] == "block"
+        assert h["timeout"] == (HT.CONFIG_TIMEOUT if h["command"].endswith("levain_config") else HT.HOOK_TIMEOUT)
+    assert HT.HOOK_TIMEOUT == cc.GATE_TIMEOUT
     # the slot gate's own worst case: GATE (6 tries, each IO-bounded, plus the backoff) then the hold
     from levain.consent import broker_client as bc
     gate_worst = (len(bc.GATE_BACKOFF) + 1) * bc.IO_TIMEOUT + sum(bc.GATE_BACKOFF)

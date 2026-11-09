@@ -19,13 +19,15 @@ from levain.slot.render import HookTemplate
 from levain.slot.root_tree import PY_FLAGS, ROOT_PYTHON, boot_path_code
 
 #: hook name -> the Claude Code event it is wired under
-EVENTS = {"levain_gate": "PreToolUse", "levain_queue": "PermissionRequest"}
+EVENTS = {"levain_gate": "PreToolUse", "levain_queue": "PermissionRequest", "levain_config": "ConfigChange"}
 
 #: Claude Code's ``timeout`` for both handlers: the consent adapter's ``GATE_TIMEOUT`` (its hold ceiling 840 s + its
 #: 30 s margin; equal by test, not imported: the adapter is not root-closure code). The slot gate holds
 #: ``DEFAULT_GATE_HOLD`` (300 s) after a bounded broker GATE, so it always answers inside this. render wires every slot
 #: hook with ``"onFailure": "block"``, so the timeout firing (a hang, not a hold) blocks the call, never lets it run.
 HOOK_TIMEOUT = 870
+#: the ConfigChange alarm answers at once (it reads one payload and writes one row)
+CONFIG_TIMEOUT = 30
 
 
 def body(host: str, name: str) -> bytes:
@@ -36,6 +38,7 @@ def body(host: str, name: str) -> bytes:
     ``onFailure``'s (render)."""
     if name not in EVENTS:
         raise ValueError("unknown hook %r" % (name,))
+    entry = "config_guard" if name == "levain_config" else "run"
     text = (
         "#!%s %s\n" % (ROOT_PYTHON[host], PY_FLAGS)
         + "# Levain slot hook %s. Written by render, root-owned. It FAILS CLOSED: an adapter that will not import\n" % name
@@ -45,7 +48,7 @@ def body(host: str, name: str) -> bytes:
         + "code = None\n"
         + "try:\n"
         + "    " + boot_path_code(host) + "\n"
-        + "    from levain.slot.hook_run import run\n"
+        + "    from levain.slot.hook_run import %s as run\n" % entry
         + "    why = 'hook-run-failed'\n"
         + "    code = run(%r)\n" % name
         + "    if type(code) is not int or code not in (0, %d):\n" % hook_run.REFUSED_EXIT
@@ -64,7 +67,9 @@ def body(host: str, name: str) -> bytes:
 
 
 def hook_templates(host: str) -> Dict[str, HookTemplate]:
-    return {name: HookTemplate(body(host, name), event, None, HOOK_TIMEOUT) for name, event in sorted(EVENTS.items())}
+    return {name: HookTemplate(body(host, name), event, None,
+                               CONFIG_TIMEOUT if name == "levain_config" else HOOK_TIMEOUT)
+            for name, event in sorted(EVENTS.items())}
 
 
-__all__ = ["EVENTS", "HOOK_TIMEOUT", "body", "hook_templates"]
+__all__ = ["CONFIG_TIMEOUT", "EVENTS", "HOOK_TIMEOUT", "body", "hook_templates"]
