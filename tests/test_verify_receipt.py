@@ -608,7 +608,7 @@ def _remote_fixture(tmp_path, junit_text=REMOTE_JUNIT, sha="a" * 40):
     reds = [{"nodeid": "tests/a.py::l", "class": "load", "evidence": "e1", "ledger_id": None},
             {"nodeid": "tests/a.py::i", "class": "inherited", "evidence": "e2", "ledger_id": None}]
     leg = {"platform": "linux", "sha": sha, "host": "argushub", "python": "3.13.1", "workers": 4, "max_load": 9.0, "load_reds": 1,
-           "jobs": [{"name": "pytest-full-py313", "rc": 1, "counts": dict(collected=2, passed=0, failed=2, error=0, skipped=0, xfailed=0),
+           "jobs": [{"name": "pytest-full-py312", "rc": 1, "counts": dict(collected=2, passed=0, failed=2, error=0, skipped=0, xfailed=0),
                      "junit": {"path": f"/home/u/{rrun}/junit-linux.xml", "sha256": hashlib.sha256(junit_text.encode()).hexdigest()},
                      "reds": reds},
                     verify.failed_job("bwrap-floor-live-py312", "host not provisioned: x"),
@@ -806,7 +806,7 @@ def _junit_leg(path, sha=SHA40):
     parsed = verify.parse_junit(path)
     jobs = [{"name": n, "rc": 1, "counts": dict(parsed["counts"]), "skips_by_reason": dict(parsed["skips_by_reason"]),
              "junit": {"path": str(path), "sha256": "x"}, "reds": [{"nodeid": r["nodeid"], "class": "load"} for r in parsed["reds"]]}
-            for n in ("pytest-full-py313", "bwrap-floor-live-py312", "root-closure-py39")]
+            for n in ("pytest-full-py312", "bwrap-floor-live-py312", "root-closure-py39")]
     return {"platform": "linux", "sha": sha, "jobs": jobs}
 
 
@@ -1135,6 +1135,7 @@ def test_v10_a_leg_that_cannot_provision_h11_fails_loud_naming_it(tmp_path, monk
     assert verify.provision_h11(ctx, Path("/venv/bin/python"), tmp_path, {})[0] is None
 
     monkeypatch.setattr(verify, "provision_h11", lambda *a, **k: (None, "h11 for /usr/bin/python3 not provisioned: test"))
+    monkeypatch.setattr(verify, "preflight_python", lambda *a, **k: None)
     monkeypatch.setattr(verify.Ctx, "prepare", lambda self: None)
     monkeypatch.setattr(verify.Ctx, "make", lambda self, name, sha, py, lock_src=None: (tmp_path / "src", tmp_path / "venv" / "bin" / "python"))
     monkeypatch.setattr(verify, "venv_version", lambda *a, **k: "3.12.1")
@@ -1242,6 +1243,7 @@ def _plan_linux_stubs(tmp_path, monkeypatch, missing):
     made, ran = [], []
     monkeypatch.setattr(verify, "provision_h11", lambda *a, **k: (tmp_path / "site", None))
     monkeypatch.setattr(verify, "preflight_linux", lambda *a, **k: list(missing))
+    monkeypatch.setattr(verify, "preflight_python", lambda *a, **k: None)
     monkeypatch.setattr(verify.Ctx, "prepare", lambda self: None)
 
     def make(self, name, sha, py, lock_src=None):
@@ -1261,7 +1263,7 @@ def test_v12_a_host_missing_a_capability_fails_the_bwrap_job_as_not_provisioned(
     jobs, _, _ = verify.plan_linux(_prov_ctx(tmp_path / "p"), verify.LINUX_PYTHON, 4, 60)
     bw = next(j for j in jobs if j["name"].startswith("bwrap-floor-live"))
     assert bw["setup_failed"].startswith("host not provisioned: loginctl linger is not enabled for u; /run/podman")
-    assert [k["name"] for k in ran] == ["pytest-full-py313", "root-closure-py39"]      # the bwrap job was not run
+    assert [k["name"] for k in ran] == ["pytest-full-py312", "root-closure-py39"]      # the bwrap job was not run
     assert not any(n == "src_bwrap" for n, _ in made)
     v, why = verify.verdict_of([{"platform": "linux", "jobs": jobs}])
     assert v == "red" and any("host not provisioned" in w for w in why) and not any(w.startswith("regression") for w in why)
@@ -1270,7 +1272,7 @@ def test_v12_a_host_missing_a_capability_fails_the_bwrap_job_as_not_provisioned(
 def test_v12_the_bwrap_job_runs_on_312_like_ci_when_the_host_is_ready(tmp_path, monkeypatch):
     made, ran = _plan_linux_stubs(tmp_path, monkeypatch, [])
     jobs, _, _ = verify.plan_linux(_prov_ctx(tmp_path / "p"), verify.LINUX_PYTHON, 4, 60)
-    assert ("src_bwrap", "3.12") in made and ("src_at_sha", "3.13") in made
+    assert ("src_bwrap", "3.12") in made and ("src_at_sha", verify.LINUX_PYTHON) in made
     bw = next(k for k in ran if k["name"].startswith("bwrap-floor-live"))
     assert bw["name"] == "bwrap-floor-live-py312" and bw["required_run"] and bw["env"]["LEVAIN_REQUIRE_LINUX_LIVE"] == "1"
     assert bw["base_python"] == "3.12" and bw["env"]["CI"] == "1" and "PYTHONPATH" not in bw["env"]
@@ -1278,7 +1280,7 @@ def test_v12_the_bwrap_job_runs_on_312_like_ci_when_the_host_is_ready(tmp_path, 
 
 # ---------------------------------------------------------------- L3 r1 fix round
 
-LINUX_JOBS = ["pytest-full-py313", "bwrap-floor-live-py312", "root-closure-py39"]
+LINUX_JOBS = ["pytest-full-py312", "bwrap-floor-live-py312", "root-closure-py39"]
 CLEAN_JUNIT = '<testsuites><testsuite><testcase classname="tests.a" name="ok"/></testsuite></testsuites>'
 
 
@@ -1451,3 +1453,88 @@ def test_r1_the_bwrap_job_and_its_baseline_get_the_runtime_dir_preflight_probed(
     want = f"/run/user/{os.getuid()}"
     assert bw["env"]["XDG_RUNTIME_DIR"] == want
     assert bw["base_cfg"](tmp_path / "bsrc", tmp_path / "bsrc" / "bin" / "python")[1]["XDG_RUNTIME_DIR"] == want
+
+
+# ---------------------------------------------------------------- linux leg CI parity: umask, short basetemp, interpreter
+
+def test_rf1_the_remote_command_runs_under_umask_022(repo, tmp_path):
+    r, sha = repo
+    run = tmp_path / "run"
+    run.mkdir()
+    rrun, leg, jt = _remote_fixture(tmp_path, sha=sha)
+    cmds = []
+    verify.run_leg_remote(r, sha, run, RUN_ID, verify.Ledger(tmp_path / "l.jsonl"), None,
+                          sh=_stub_sh(r, sha, leg, jt, cmds), script=ROOT / "scripts" / "verify.py")
+    assert [x[0][-1] for x in cmds if "verify.py run --here" in x[0][-1]][0].startswith(f"umask 022 && cd {rrun}")
+
+
+def test_rf1_a_child_runs_under_umask_022_whatever_the_host_umask(tmp_path):
+    old = os.umask(0o002)
+    try:
+        log = tmp_path / "log"
+        rc = verify._run([sys.executable, "-c", "import os;print(oct(os.umask(0)))"], cwd=tmp_path, env={"PATH": os.environ["PATH"]}, log=log)
+    finally:
+        os.umask(old)
+    assert rc == 0 and "0o22" in log.read_text()
+
+
+def test_rf2_pytest_basetemp_is_a_short_private_tmp_dir_removed_at_teardown(tmp_path, monkeypatch):
+    ctx = _prov_ctx(tmp_path)
+    monkeypatch.setattr(verify, "git", lambda *a, **k: types.SimpleNamespace(stdout="", returncode=0))
+    seen = []
+    monkeypatch.setattr(verify, "_run", lambda cmd, **k: seen.append(cmd) or 0)
+    ctx.prepare()
+    try:
+        assert ctx.tmp.parent == Path(verify.SHORT_TMP_ROOT) and ctx.tmp.name.startswith("lv-") and len(ctx.tmp.name) == 11
+        assert (ctx.tmp.stat().st_mode & 0o777) == 0o700
+        with pytest.raises(RuntimeError):                      # the stubbed pytest wrote no junit
+            verify.run_job(ctx, name="pytest-full-py312", py=Path("/v/bin/python"), cwd=tmp_path, env={}, targets=["tests"],
+                           junit_name="j.xml", workers=2, timeout=5)
+        bt = [a for a in seen[0] if a.startswith("--basetemp=")][0].split("=", 1)[1]
+        assert bt.startswith(str(ctx.tmp) + "/") and not bt.startswith(str(ctx.run))
+        # a socket path in the deepest fixture dir pytest makes stays under the AF_UNIX limit
+        assert len(bt + "/popen-gw3/test_" + "x" * 30 + "0/s.sock") < 107
+    finally:
+        ctx.teardown()
+    assert not ctx.tmp.exists()
+
+
+def test_rf2_the_sweep_reaps_the_short_tmp_dir_of_a_dead_run(tmp_path):
+    rid = "20261109T000000Z-" + "a" * 8 + "-" + "b" * 4
+    run = tmp_path / rid
+    run.mkdir()
+    st = verify.short_tmp(rid)
+    st.mkdir(mode=0o700, parents=True, exist_ok=True)
+    (st / "pt-x").mkdir()
+    cmd = f"python -m pytest --basetemp={st}/pt-x tests"
+    assert verify._cmd_touches_run(cmd, run, st) and not verify._cmd_touches_run(cmd, run)
+    class T(verify.Tools):
+        def ps(self): return []
+        def hdiutil_images(self): return []
+        def git(self, repo, *a): return types.SimpleNamespace(stdout="", returncode=0)
+    verify.reap_run(run, tmp_path, T(), say=lambda *a: None)
+    assert not st.exists()
+
+
+def test_rf3_an_interpreter_without_pidfd_open_is_refused_with_the_reason():
+    assert verify.preflight_python("/usr/bin/python3.12", lambda cmd: (0, "")) is None
+    why = verify.preflight_python("/x/python", lambda cmd: (3, ""))
+    assert "no os.pidfd_open" in why and "/x/python" in why
+    assert "cannot run" in verify.preflight_python("/nope", lambda cmd: (127, "no such file"))
+
+
+def test_rf3_the_linux_leg_defaults_to_the_distro_312_and_a_refused_interpreter_builds_nothing(tmp_path, monkeypatch):
+    assert verify.LINUX_PYTHON == "/usr/bin/python3.12" and verify.linux_job_names()[0] == "pytest-full-py312"
+    made, ran = _plan_linux_stubs(tmp_path, monkeypatch, [])
+    monkeypatch.setattr(verify, "preflight_python", lambda py: "interpreter x has no os.pidfd_open")
+    jobs, _, pyver = verify.plan_linux(_prov_ctx(tmp_path / "p"), verify.LINUX_PYTHON, 4, 60)
+    assert [j["name"] for j in jobs] == ["ci-parity"] and "pidfd_open" in jobs[0]["setup_failed"]
+    assert made == [] and ran == []
+
+
+def test_rf3_the_leg_records_the_interpreter_path(tmp_path, monkeypatch):
+    monkeypatch.setattr(verify, "plan_linux", lambda ctx, python, w, t: ([], [], "3.12.3"))
+    monkeypatch.setattr(verify.Ctx, "teardown", lambda self: None)
+    monkeypatch.setattr(verify, "host_fingerprint", lambda: {})
+    leg = verify.run_leg_local(tmp_path, SHA40, tmp_path, "rid", None, None, leg="linux", python=verify.LINUX_PYTHON, workers=1, timeout=1)
+    assert leg["python_path"] == "/usr/bin/python3.12" and leg["python"] == "3.12.3"
