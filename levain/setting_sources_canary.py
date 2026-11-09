@@ -7,14 +7,17 @@ and config dir (never the operator's), and its own local listener as the API add
 The evidence is positive, never an absence. The listener never answers; it reads each connection's request line. A
 connection alone proves nothing: the client sends a preflight before it runs any hook. The anchor is the first model
 request, a ``POST`` to ``/v1/messages``, which the client sends only after its SessionStart hooks. The control validates
-that order on this binary: its marker must already exist when its model request arrives. Only then does the empty-list
-run's model request without a marker read ``held``. A rejected flag, a crash, a run that never sends its model request,
-or a timeout is ``inconclusive``; the empty-list marker appearing at any moment is ``leaked``. Each run is killed as a
-whole process group."""
+that order on this binary from times, not from one sample: its marker must have been seen, and stamped, earlier than its
+model request's arrival by more than the poll interval. Only then does the empty-list run's model request without a
+marker read ``held``, and only after a short settle in which its marker is still absent. A rejected flag, a crash, a
+run that never sends its model request, or a timeout is ``inconclusive``; the empty-list marker appearing at any moment
+is ``leaked``. Every return, whatever its verdict, first kills both runs as whole process groups and then re-checks the
+empty-list marker, so a hook that lands during an early return still reads ``leaked``."""
 from __future__ import annotations
 
 import json
 import os
+import selectors
 import shlex
 import shutil
 import signal
@@ -27,11 +30,18 @@ from pathlib import Path
 
 from levain.host_guard import SEAT_SOURCE_ARGS
 
-__all__ = ["ProbeResult", "run_probe"]
+__all__ = ["OVERRUN", "ProbeResult", "run_probe"]
 
 _STDERR_CAP = 300
 _LINE_CAP = 4096
 _MODEL_PATH = "/v1/messages"
+_POLL = 0.02  # the loop's longest sleep: a socket or stderr event wakes it sooner
+_ORDER_MARGIN = 0.05  # the control's marker must precede its model request by more than this (above _POLL)
+_SETTLE = 0.5  # the bounded wait before a held verdict, and before an early inconclusive return
+_REAP_WAIT = 0.5  # after SIGKILL, how long one run's teardown waits for its leader to be reaped
+OVERRUN = _SETTLE + 2 * _REAP_WAIT  # how far past ``timeout`` the probe can run: one settle plus both teardowns
+
+_LEAKED_DETAIL = '--setting-sources "" still loaded the project settings (its hook fired)'
 
 
 def _is_model_request(head: bytes) -> bool:
@@ -52,10 +62,13 @@ class ProbeResult:
 
 
 class _Run:
-    """One ``claude -p`` run: its project, marker, listener, stderr file and process group."""
+    """One ``claude -p`` run: its project, marker, listener, bounded stderr tail and process group. Its listener, its
+    connections and its stderr pipe are registered on the probe's shared selector."""
 
-    def __init__(self, root: Path, name: str, binary: str, extra: tuple[str, ...]) -> None:
+    def __init__(self, root: Path, name: str, binary: str, extra: tuple[str, ...],
+                 sel: selectors.BaseSelector) -> None:
         self.name = name
+        self.sel = sel
         self.proj = root / name
         (self.proj / ".claude").mkdir(parents=True)
         self.marker = root / f"{name}.marker"
@@ -64,133 +77,229 @@ class _Run:
         (self.proj / ".claude" / "settings.json").write_text(json.dumps(hook))
         home = root / f"{name}-home"
         (home / "cfg").mkdir(parents=True)
+        self.heads: dict[socket.socket, bytes] = {}
+        self.err_tail = b""
+        self.err_open = False
+        self.post_mono: float | None = None  # when the model request's line was read (monotonic)
+        self.post_wall: float | None = None  # the same moment on the wall clock, for the marker's mtime
+        self.marker_seen: float | None = None  # the first poll that found the marker (monotonic)
+        self.proc: subprocess.Popen[bytes] | None = None
+        self._stopped = False
         self.listener = socket.create_server(("127.0.0.1", 0))
         self.listener.setblocking(False)
-        self.conns: list[socket.socket] = []
-        self.heads: list[bytes] = []
-        self.sent_model_request = False
-        self.err_path = root / f"{name}.stderr"
         port = self.listener.getsockname()[1]
         env = {"PATH": os.environ.get("PATH", ""), "HOME": str(home), "CLAUDE_CONFIG_DIR": str(home / "cfg"),
                "ANTHROPIC_API_KEY": "sk-ant-levain-probe-not-a-key", "ANTHROPIC_BASE_URL": f"http://127.0.0.1:{port}",
                "DISABLE_AUTOUPDATER": "1"}
         try:
-            with open(self.err_path, "wb") as err:
-                self.proc = subprocess.Popen([binary, "-p", "levain probe", *extra], cwd=self.proj, env=env,
-                                             stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=err,
-                                             start_new_session=True)
+            self.proc = subprocess.Popen([binary, "-p", "levain probe", *extra], cwd=self.proj, env=env,
+                                         stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
+                                         start_new_session=True)
+            assert self.proc.stderr is not None
+            os.set_blocking(self.proc.stderr.fileno(), False)
+            self.err_open = True
+            sel.register(self.listener, selectors.EVENT_READ, (self, "accept"))
+            sel.register(self.proc.stderr, selectors.EVENT_READ, (self, "err"))
         except BaseException:
-            self.listener.close()
+            self.stop()
             raise
 
-    def reached_model(self) -> bool:
-        """Accept new connections, read what each has sent so far, and report whether any of them carries the model
-        request. Never answers, so the client cannot reuse a connection for a second request."""
-        if self.sent_model_request:
-            return True
+    def handle(self, kind: str, obj: object) -> None:
+        if kind == "accept":
+            self._accept()
+        elif kind == "conn":
+            assert isinstance(obj, socket.socket)
+            self._read_conn(obj)
+        else:
+            self._drain_err()
+
+    def _accept(self) -> None:
         while True:
             try:
                 conn, _addr = self.listener.accept()
             except (BlockingIOError, InterruptedError):
-                break
+                return
             conn.setblocking(False)
-            self.conns.append(conn)
-            self.heads.append(b"")
-        for i, conn in enumerate(self.conns):
-            if len(self.heads[i]) >= _LINE_CAP:
-                continue
+            self.heads[conn] = b""
+            self.sel.register(conn, selectors.EVENT_READ, (self, "conn"))
+
+    def _read_conn(self, conn: socket.socket) -> None:
+        """Read what a connection has sent so far; the first complete model request line stamps its arrival. Never
+        answers, so the client cannot reuse a connection for a second request."""
+        try:
+            data = conn.recv(_LINE_CAP - len(self.heads[conn]))
+        except (BlockingIOError, InterruptedError):
+            return
+        except OSError:
+            data = b""
+        self.heads[conn] += data
+        if self.post_mono is None and _is_model_request(self.heads[conn]):
+            self.post_mono, self.post_wall = time.monotonic(), time.time()
+        if not data or len(self.heads[conn]) >= _LINE_CAP:
+            self._unregister(conn)
+
+    def _drain_err(self) -> None:
+        """Move what the stderr pipe holds into the bounded tail: the LAST ``_STDERR_CAP`` bytes are kept."""
+        if not self.err_open or self.proc is None or self.proc.stderr is None:
+            return
+        fd = self.proc.stderr.fileno()
+        while True:
             try:
-                data = conn.recv(_LINE_CAP - len(self.heads[i]))
+                chunk = os.read(fd, 65536)
+            except (BlockingIOError, InterruptedError):
+                return
             except OSError:
-                continue
-            self.heads[i] += data
-            if _is_model_request(self.heads[i]):
-                self.sent_model_request = True
-        return self.sent_model_request
+                chunk = b""
+            if not chunk:
+                self._unregister(self.proc.stderr)
+                self.proc.stderr.close()
+                self.err_open = False
+                return
+            self.err_tail = (self.err_tail + chunk)[-_STDERR_CAP:]
+
+    def _unregister(self, obj) -> None:
+        try:
+            self.sel.unregister(obj)
+        except (KeyError, ValueError):
+            pass
+
+    def observe(self) -> None:
+        if self.marker_seen is None and self.marker.exists():
+            self.marker_seen = time.monotonic()
+
+    def ordered(self) -> bool:
+        """The control's order holds: its marker was seen, and stamped, before its model request arrived, each by more
+        than the poll interval."""
+        if self.post_mono is None or self.post_wall is None or self.marker_seen is None:
+            return False
+        if self.marker_seen + _ORDER_MARGIN >= self.post_mono:
+            return False
+        try:
+            stamped = self.marker.stat().st_mtime
+        except OSError:
+            return False
+        return stamped + _ORDER_MARGIN < self.post_wall
 
     def exited(self) -> int | None:
-        return self.proc.poll()
-
-    def stderr_tail(self) -> str:
-        try:
-            raw = self.err_path.read_bytes()[:_STDERR_CAP]
-        except OSError:
-            return ""
-        return raw.decode("utf-8", "replace").strip()
+        return self.proc.poll() if self.proc is not None else None
 
     def why_exited(self) -> str:
-        err = self.stderr_tail()
-        return f"exited {self.proc.returncode}" + (f": {err}" if err else " with no stderr")
+        self._drain_err()
+        err = self.err_tail.decode("utf-8", "replace").strip()
+        code = self.proc.returncode if self.proc is not None else None
+        return f"exited {code}" + (f": {err}" if err else " with no stderr")
 
     def stop(self) -> None:
-        try:
-            os.killpg(self.proc.pid, signal.SIGKILL)
-        except (ProcessLookupError, PermissionError):
-            pass
-        try:
-            self.proc.wait(timeout=5)
-        except (OSError, subprocess.SubprocessError):
-            pass
-        for s in (*self.conns, self.listener):
+        """Kill the run's process group once, reap its leader within a short fixed wait, close its sockets and pipe.
+        Idempotent: a second call never signals a pid that was already reaped."""
+        if self._stopped:
+            return
+        self._stopped = True
+        if self.proc is not None:
+            try:
+                os.killpg(self.proc.pid, signal.SIGKILL)
+            except (ProcessLookupError, PermissionError):
+                pass
+            try:
+                self.proc.wait(timeout=_REAP_WAIT)
+            except (OSError, subprocess.SubprocessError):
+                pass
+            self._drain_err()
+            if self.err_open and self.proc.stderr is not None:
+                self._unregister(self.proc.stderr)
+                self.proc.stderr.close()
+                self.err_open = False
+        for s in (*self.heads, self.listener):
+            self._unregister(s)
             try:
                 s.close()
             except OSError:
                 pass
 
 
+def _pump(sel: selectors.BaseSelector, runs: tuple[_Run, ...], wait: float) -> None:
+    for key, _mask in sel.select(wait):
+        run, kind = key.data
+        run.handle(kind, key.fileobj)
+    for r in runs:
+        r.observe()
+
+
+def _settle(sel: selectors.BaseSelector, ctl: _Run, empty: _Run, *, until_empty_acts: bool) -> None:
+    """Keep polling for up to ``_SETTLE``; with ``until_empty_acts``, stop early once the empty-list run has sent its
+    model request or exited. Returns early as soon as the empty-list marker is seen."""
+    end = time.monotonic() + _SETTLE
+    while time.monotonic() < end:
+        _pump(sel, (ctl, empty), min(_POLL, max(0.0, end - time.monotonic())))
+        if empty.marker_seen is not None:
+            return
+        if until_empty_acts and (empty.post_mono is not None or empty.exited() is not None):
+            return
+
+
+def _judge(ctl: _Run, empty: _Run, sel: selectors.BaseSelector, timeout: float) -> ProbeResult:
+    t0 = time.monotonic()
+    ctl_ok: bool | None = None
+    leaked = ProbeResult("leaked", _LEAKED_DETAIL)
+
+    def early(detail: str) -> ProbeResult:
+        _settle(sel, ctl, empty, until_empty_acts=True)
+        return leaked if empty.marker_seen is not None else ProbeResult("inconclusive", detail[:400])
+
+    while True:
+        _pump(sel, (ctl, empty), _POLL)
+        if empty.marker_seen is not None:
+            return leaked
+        if ctl_ok is None and ctl.post_mono is not None:
+            ctl_ok = ctl.ordered()
+            if not ctl_ok:
+                return early("the control's project hook did not fire clearly before its model request, so the order "
+                             "this probe relies on does not hold on this version")
+        if ctl_ok is None and ctl.exited() is not None:
+            return early(f"the control run {ctl.why_exited()}")
+        if empty.post_mono is not None:
+            if ctl_ok:
+                _settle(sel, ctl, empty, until_empty_acts=False)
+                if empty.marker_seen is not None:
+                    return leaked
+                return ProbeResult("held", f"the control fired its project hook before its POST {_MODEL_PATH}; "
+                                   f"the empty-list run sent its POST {_MODEL_PATH} with no hook, in "
+                                   f"{time.monotonic() - t0:.1f}s")
+        elif empty.exited() is not None:
+            return ProbeResult("inconclusive", (f'the --setting-sources "" run {empty.why_exited()} before its '
+                                                "model request")[:400])
+        if time.monotonic() - t0 > timeout:
+            which = "the empty-list run never sent its model request" if ctl_ok else \
+                "the control run never fired its project hook and sent its model request"
+            return ProbeResult("inconclusive", f"{which} within {timeout:.0f}s, so the probe proves nothing")
+
+
 def run_probe(binary: str, *, timeout: float = 20.0) -> ProbeResult:
-    """``held``: the control fired its hook before sending its model request, and the empty-list run sent its model
-    request with no hook. ``leaked``: the empty-list run's hook fired, at any moment. ``inconclusive``: anything else, including a
-    rejected flag, a crash, an early control exit and the overall ``timeout``."""
+    """``held``: the control fired its hook clearly before sending its model request, and the empty-list run sent its
+    model request with no hook, still absent after a settle and after both runs are killed. ``leaked``: the empty-list
+    run's hook fired, at any moment up to that final check. ``inconclusive``: anything else, including a rejected flag,
+    a crash, an early control exit, a run that could not start and the overall ``timeout``. The whole call can run past
+    ``timeout`` by at most ``OVERRUN`` seconds plus scheduling slack."""
     root: Path | None = None
     runs: list[_Run] = []
+    sel: selectors.BaseSelector | None = None
+    leaked_at_end = False
     try:
+        sel = selectors.DefaultSelector()
         root = Path(tempfile.mkdtemp(prefix="levain-ssprobe-"))
-        ctl = _Run(root, "ctl", binary, ())
+        ctl = _Run(root, "ctl", binary, (), sel)
         runs.append(ctl)
-        empty = _Run(root, "empty", binary, SEAT_SOURCE_ARGS)
+        empty = _Run(root, "empty", binary, SEAT_SOURCE_ARGS, sel)
         runs.append(empty)
-        t0 = time.monotonic()
-        ctl_ok = False
-        while True:
-            if empty.marker.exists():
-                return ProbeResult("leaked", '--setting-sources "" still loaded the project settings (its hook fired)')
-            if not ctl_ok and ctl.reached_model():
-                if not ctl.marker.exists():
-                    return ProbeResult("inconclusive", "the control sent its model request before its project hook "
-                                       "fired, so the order this probe relies on does not hold on this version")
-                ctl_ok = True
-            if not ctl_ok and ctl.exited() is not None:
-                return ProbeResult("inconclusive", f"the control run {ctl.why_exited()}"[:400])
-            if empty.reached_model():
-                if ctl_ok:
-                    empty.stop()
-                    if empty.marker.exists():
-                        return ProbeResult("leaked", '--setting-sources "" still loaded the project settings (its hook '
-                                           "fired)")
-                    return ProbeResult("held", f"the control fired its project hook before its POST {_MODEL_PATH}; "
-                                       f"the empty-list run sent its POST {_MODEL_PATH} with no hook, in "
-                                       f"{time.monotonic() - t0:.1f}s")
-            elif empty.exited() is not None:
-                empty.stop()
-                if empty.marker.exists():
-                    return ProbeResult("leaked", '--setting-sources "" still loaded the project settings (its hook '
-                                       "fired)")
-                return ProbeResult("inconclusive", (f'the --setting-sources "" run {empty.why_exited()} before its '
-                                                    "model request")[:400])
-            if time.monotonic() - t0 > timeout:
-                empty.stop()
-                if empty.marker.exists():
-                    return ProbeResult("leaked", '--setting-sources "" still loaded the project settings (its hook '
-                                       "fired)")
-                which = "the empty-list run never sent its model request" if ctl_ok else \
-                    "the control run never fired its project hook and sent its model request"
-                return ProbeResult("inconclusive", f"{which} within {timeout:.0f}s, so the probe proves nothing")
-            time.sleep(0.05)
-    except OSError as exc:
-        return ProbeResult("inconclusive", f"the probe could not run: {exc}"[:200])
+        res = _judge(ctl, empty, sel, timeout)
+    except (OSError, ValueError, subprocess.SubprocessError) as exc:
+        res = ProbeResult("inconclusive", f"the probe could not run: {exc}"[:200])
     finally:
         for r in runs:
             r.stop()
+        leaked_at_end = len(runs) == 2 and runs[1].marker.exists()
+        if sel is not None:
+            sel.close()
         if root is not None:
             shutil.rmtree(root, ignore_errors=True)
+    return ProbeResult("leaked", _LEAKED_DETAIL) if leaked_at_end else res

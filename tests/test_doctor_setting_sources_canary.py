@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import os
 import stat
+import subprocess
 import sys
 import textwrap
 import time
@@ -42,8 +43,9 @@ _FAKE = textwrap.dedent('''\
     def api():
         send(b"POST /v1/messages?beta=true HTTP/1.1")
 
-    # the real binary's measured order: a HEAD preflight before any hook, the model request after the hooks
-    parse_fails = (role, mode) in (("empty", "reject"), ("ctl", "ctl_exit"))
+    # the real binary's measured order: a HEAD preflight before any hook, the model request well after the hooks
+    parse_fails = (role, mode) in (("empty", "reject"), ("empty", "noisy_reject"), ("ctl", "ctl_exit"),
+                                   ("ctl", "ctl_exit_empty_leak"))
     if not parse_fails:
         send(b"HEAD /api/hello HTTP/1.1")
         time.sleep(0.2)
@@ -55,20 +57,39 @@ _FAKE = textwrap.dedent('''\
     if role == "ctl":
         if mode in ("leak_only", "hang_empty_and_ctl"):
             time.sleep(60)
-        if mode == "ctl_exit":
+        if mode in ("ctl_exit", "ctl_exit_empty_leak"):
             sys.stderr.write("ctl boom\\n")
             sys.exit(3)
-        if mode == "ctl_api_first":
+        if mode in ("ctl_api_first", "ctl_api_first_leak"):
             api()
             time.sleep(0.5)
             hook()
             time.sleep(60)
         hook()
+        if mode != "ctl_tight":
+            time.sleep(0.2)
         api()
         time.sleep(60)
     if mode == "reject":
         sys.stderr.write("error: option '--setting-sources <sources>' argument missing\\n")
         sys.exit(2)
+    if mode == "noisy_reject":
+        for _ in range(200):
+            sys.stderr.write("banner " * 150 + "\\n")
+        sys.stderr.write("error: option '--setting-sources <sources>' argument missing\\n")
+        sys.exit(2)
+    if mode == "ctl_exit_empty_leak":
+        time.sleep(0.05)
+        hook()
+    if mode == "ctl_api_first_leak":
+        time.sleep(0.1)
+        hook()
+    if mode == "post_then_leak":
+        time.sleep(0.3)
+        api()
+        time.sleep(0.15)
+        hook()
+        time.sleep(60)
     if mode == "crash":
         time.sleep(0.3)
         sys.exit(1)
@@ -196,6 +217,71 @@ def test_a_temp_dir_failure_is_inconclusive(monkeypatch):
     assert r.verdict == "inconclusive" and "no space" in r.detail, r
 
 
+def test_a_leak_landing_just_after_the_control_exits_is_leaked_not_inconclusive(tmp_path):
+    r, _ = _run(tmp_path, "ctl_exit_empty_leak")
+    assert r.verdict == "leaked", r
+
+
+def test_a_leak_landing_just_after_a_misordered_control_is_leaked_not_inconclusive(tmp_path):
+    r, _ = _run(tmp_path, "ctl_api_first_leak")
+    assert r.verdict == "leaked", r
+
+
+def test_a_control_whose_hook_barely_precedes_its_request_does_not_validate_the_order(tmp_path):
+    r, _ = _run(tmp_path, "ctl_tight")
+    assert r.verdict == "inconclusive", r
+
+
+def test_a_hook_landing_just_after_the_empty_runs_request_is_leaked_not_held(tmp_path):
+    r, _ = _run(tmp_path, "post_then_leak")
+    assert r.verdict == "leaked", r
+
+
+def test_stderr_keeps_its_last_bytes_and_never_lands_on_disk(tmp_path, monkeypatch):
+    root = tmp_path / "probe-root"
+    root.mkdir()
+    monkeypatch.setattr(ssc.tempfile, "mkdtemp", lambda **_kw: str(root))
+    monkeypatch.setattr(ssc.shutil, "rmtree", lambda *_a, **_kw: None)
+    r, _ = _run(tmp_path, "noisy_reject")
+    assert r.verdict == "inconclusive" and "argument missing" in r.detail, r
+    big = [p for p in root.rglob("*") if p.is_file() and p.stat().st_size > 4096]
+    assert big == [], big
+
+
+def test_each_process_group_is_signalled_at_most_once(tmp_path, monkeypatch):
+    sent = []
+    real = os.killpg
+
+    def killpg(pid, sig):
+        sent.append(pid)
+        real(pid, sig)
+    monkeypatch.setattr(ssc.os, "killpg", killpg)
+    r, _ = _run(tmp_path, "held")
+    assert r.verdict == "held" and len(sent) == len(set(sent)) == 2, (r, sent)
+
+
+def test_a_binary_popen_rejects_is_inconclusive_never_a_crash(tmp_path):
+    r = ssc.run_probe(str(tmp_path / "cla\0ude"), timeout=1.0)
+    assert r.verdict == "inconclusive", r
+
+
+def test_teardown_waits_a_short_fixed_time_for_each_leader(tmp_path, monkeypatch):
+    waits = []
+    real = subprocess.Popen.wait
+
+    def wait(self, timeout=None):
+        waits.append(timeout)
+        return real(self, timeout)
+    monkeypatch.setattr(subprocess.Popen, "wait", wait)
+    r, _ = _run(tmp_path, "held")
+    assert r.verdict == "held" and waits and all(w is not None and w <= 1.0 for w in waits), (r, waits)
+
+
+def test_a_hung_probe_stops_within_its_timeout_plus_its_stated_overrun(tmp_path):
+    r, took = _run(tmp_path, "hang_empty", timeout=1.5)
+    assert r.verdict == "inconclusive" and took <= 1.5 + ssc.OVERRUN + 0.5, (r, took)
+
+
 def _row(tmp_path, version, verdict="held"):
     calls = []
 
@@ -252,6 +338,7 @@ def test_doctor_bounds_the_probe_by_passing_a_timeout(monkeypatch):
     monkeypatch.setattr(ssc, "run_probe", fake_probe)
     doctor._check_setting_sources(claude_bin="/x/claude", version="9.9.9")
     assert 0 < seen["timeout"] <= 10, seen
+    assert seen["timeout"] + ssc.OVERRUN <= doctor._SETTING_SOURCES_PROBE_BUDGET, seen
 
 
 def test_only_a_complete_post_to_the_model_endpoint_is_the_anchor():

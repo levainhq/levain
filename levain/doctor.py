@@ -5301,7 +5301,8 @@ def _check_seat_profile(*, claude_bin: str | None = None, python: str | None = N
             shutil.rmtree(base, ignore_errors=True)
 
 
-_SETTING_SOURCES_PROBE_TIMEOUT = 10.0  # the whole probe's bound inside a doctor run, beside the version read's own
+_SETTING_SOURCES_PROBE_BUDGET = 10.0  # the whole probe's bound inside a doctor run, teardown included, beside the
+# version read's own; the probe's judging timeout is this budget less the probe's own overrun
 
 
 def _check_setting_sources(*, claude_bin: str | None = None, version: str | None = ...,
@@ -5327,7 +5328,8 @@ def _check_setting_sources(*, claude_bin: str | None = None, version: str | None
     if parsed == measured_t:
         return [CheckResult(name, True, f'`--setting-sources ""` loads no project settings (measured on {measured}, the '
                             "installed version)")]
-    res = probe(claude) if probe is not None else ssc.run_probe(claude, timeout=_SETTING_SOURCES_PROBE_TIMEOUT)
+    res = probe(claude) if probe is not None else ssc.run_probe(
+        claude, timeout=_SETTING_SOURCES_PROBE_BUDGET - ssc.OVERRUN)
     if parsed is None:
         where = f"Claude Code's version is not readable; the empty source list was measured on {measured} only"
         if res.verdict == "held":
