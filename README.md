@@ -581,6 +581,7 @@ Every top-level `levain` verb, each with the one line `levain --help` gives it. 
 | `levain voice` | Premium voice: the provider key Levain holds for read-aloud. |
 | `levain push` | Push a branch only on the operator's signed yes (the gated push path). |
 | `levain seat` | Terminal seat roots: the signed 14-day lease, launch and stop of a lane's seat, the canary. |
+| `levain slot-allow` | List, revoke and re-offer the always-allow rules slot sessions carry (each needs your signed yes). |
 | `levain publish` | Publish a package to PyPI or npm only on the operator's signed yes (the gated path). |
 | `levain limits` | Show or set a session's budgets (tool calls, active hours, tokens, repeats), or extend a halted session. |
 | `levain ask` | Ask the operator a question and keep working (the question band). |
