@@ -175,6 +175,26 @@ def test_the_first_block_in_body_order_is_named():
     assert got == "body-unlisted:quantum_block"
 
 
+@pytest.mark.parametrize("body,name", [
+    # a block nested in an earlier block comes before that block's later sibling
+    (_am({"type": "tool_result", "tool_use_id": "t", "content": [{"type": "browser_state"}]}, {"type": "quantum_block"}),
+     "body-unlisted:browser_state"),
+    # two positions under two top-level keys: the key the body sends first is read first
+    ({"max_tokens": 10, "messages": [{"role": "user", "content": [{"type": "quantum_block"}]}],
+      "system": [{"type": "weird"}]}, "body-unlisted:quantum_block"),
+    ({"max_tokens": 10, "system": [{"type": "weird"}],
+      "messages": [{"role": "user", "content": [{"type": "quantum_block"}]}]}, "body-unlisted:weird"),
+], ids=["nested-before-sibling", "messages-then-system", "system-then-messages"])
+def test_the_first_block_in_body_order_is_named_across_positions(body, name):
+    assert _check(AM, body, dispatch=True) == name
+
+
+def test_an_unjudged_block_in_an_earlier_position_does_not_hide_a_later_known_cost():
+    body = {"max_tokens": 10, "system": [{"type": "bad_sys"}],
+            "messages": [{"role": "user", "content": [{"type": "advisor_tool_result", "tool_use_id": "a"}]}]}
+    assert _check(AM, body, dispatch=True) == "body-unbounded:advisor_tool_result"
+
+
 def test_a_known_cost_is_named_before_an_unjudged_block():
     # the denylist's names come first, as for a field or a tool: the operator is told what to turn off
     got = _check(AM, _am({"type": "quantum_block"}, {"type": "advisor_tool_result"}), dispatch=True)

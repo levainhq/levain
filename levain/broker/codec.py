@@ -308,29 +308,33 @@ class Codec:
             raise norm.Refused("body-unlisted:" + _wire_what(what, "block"), "a content block levain has not judged; "
                                "dispatch admits only judged blocks")
 
-    def _block_findings(self, obj: Mapping[str, Any]) -> Iterator[Tuple[str, str]]:
-        """Every block at a position of `content_positions` the table does not admit there, in body order, as
-        (`unbounded` or `unlisted`, the type). Only the table's positions are read: a block's own fields (a tool call's
-        input) are the client's JSON and are never entered."""
+    def _block_findings(self, obj: Mapping[str, Any]) -> List[Tuple[str, str]]:
+        """Every block at a position of `content_positions` the table does not admit there, as (`unbounded` or
+        `unlisted`, the type), in body order: the order the blocks appear in the body as sent, a block nested in an
+        earlier block before that block's later siblings, whichever positions they sit at. Only the table's positions
+        are read: a block's own fields (a tool call's input) are the client's JSON and are never entered."""
+        found: List[Tuple[Tuple[int, ...], str, str]] = []
         for p in self.content_positions:
             ends_in_list = bool(p.path) and p.path[-1] == EACH
-            for b in _walk_path(obj, p.path):
+            for at, b in _walk_path(obj, p.path):
                 if not isinstance(b, dict):
                     if ends_in_list:
-                        yield "unlisted", ""
+                        found.append((at, "unlisted", ""))
                     continue
                 t = self._block_type(b, p)
                 if t is None:
-                    yield "unlisted", ""
+                    found.append((at, "unlisted", ""))
                     continue
                 fault = self._block_fault(t, b)
                 if fault is None and t in p.admit:
                     continue
                 if fault == "unbounded" or t in self.unbounded_blocks or t in self.known_unbounded_blocks:
-                    yield "unbounded", t
+                    found.append((at, "unbounded", t))
                 else:
-                    yield "unlisted", t
-        yield from self._extra_findings(obj)
+                    found.append((at, "unlisted", t))
+        found.extend(self._extra_findings(obj))
+        found.sort(key=lambda f: f[0])
+        return [(kind, what) for _, kind, what in found]
 
     def _block_type(self, b: Mapping[str, Any], p: Position) -> Optional[str]:
         """The `type` of a block at `p`, None when it has no string one."""
@@ -341,8 +345,9 @@ class Codec:
         """A block of an admitted type that is not admitted in this form: `unbounded` or `unlisted`; None otherwise."""
         return None
 
-    def _extra_findings(self, obj: Mapping[str, Any]) -> Iterator[Tuple[str, str]]:
-        """Findings outside the table's block positions (a reference carried by a field of a message)."""
+    def _extra_findings(self, obj: Mapping[str, Any]) -> Iterator[Tuple[Tuple[int, ...], str, str]]:
+        """Findings outside the table's block positions (a reference carried by a field of a message), each as
+        (its place in the body, as `_walk_path` gives it; the kind; the type)."""
         return iter(())
 
     def _tool_lists(self, obj: Mapping[str, Any]) -> List[Any]:
@@ -520,26 +525,28 @@ class _Is:
     types: Tuple[str, ...]
 
 
-def _walk_path(v: Any, path: Tuple[Any, ...]) -> Iterator[Any]:
-    """Every value at the end of `path` (the `_strip_path` grammar), in body order. A step that does not match ends
-    that branch. The recursion is as deep as the path, never as deep as the body."""
+def _walk_path(v: Any, path: Tuple[Any, ...], at: Tuple[int, ...] = ()) -> Iterator[Tuple[Tuple[int, ...], Any]]:
+    """Every value at the end of `path` (the `_strip_path` grammar), as (its place in the body, the value). The place
+    is the index taken at each step (a list index, or a key's index among its object's keys as sent), so sorting
+    places from any paths over one body gives body order, a parent before what it holds. A step that does not match
+    ends that branch. The recursion is as deep as the path, never as deep as the body."""
     if not path:
-        yield v
+        yield at, v
         return
     step, rest = path[0], path[1:]
     if isinstance(step, _Is):
         if isinstance(v, dict) and v.get("type") in step.types:
-            yield from _walk_path(v, rest)
+            yield from _walk_path(v, rest, at)
     elif step == EACH:
         if isinstance(v, list):
-            for x in v:
-                yield from _walk_path(x, rest)
+            for i, x in enumerate(v):
+                yield from _walk_path(x, rest, at + (i,))
     elif step == VALUES:
         if isinstance(v, dict):
-            for x in v.values():
-                yield from _walk_path(x, rest)
+            for i, x in enumerate(v.values()):
+                yield from _walk_path(x, rest, at + (i,))
     elif isinstance(v, dict) and step in v:
-        yield from _walk_path(v[step], rest)
+        yield from _walk_path(v[step], rest, at + (list(v).index(step),))
 
 
 def _strip_path(v: Any, path: Tuple[Any, ...], types: Tuple[str, ...],
@@ -1076,14 +1083,12 @@ class OpenAIChat(_OpenAI):
     unjudged_fields = ("audio", "modalities", "moderation", "prediction", "prompt_cache_options", "image_config",
                        "debug", "deferred_tools", "stop_server_tools_when")
 
-    def _extra_findings(self, obj: Mapping[str, Any]) -> Iterator[Tuple[str, str]]:
+    def _extra_findings(self, obj: Mapping[str, Any]) -> Iterator[Tuple[Tuple[int, ...], str, str]]:
         """An assistant message's `audio` with an `id` names a previous audio response the provider holds: the
         server expands it into billed audio input the estimate cannot see."""
-        messages = obj.get("messages")
-        for m in messages if isinstance(messages, list) else ():
-            audio = m.get("audio") if isinstance(m, dict) else None
+        for at, audio in _walk_path(obj, ("messages", EACH, "audio")):
             if isinstance(audio, dict) and "id" in audio:
-                yield "unbounded", "audio"
+                yield at, "unbounded", "audio"
 
     def write_stream_usage(self, obj: Dict[str, Any]) -> bool:
         """A `stream: true` body with no `stream_options.include_usage` key gets `include_usage: true` written in
