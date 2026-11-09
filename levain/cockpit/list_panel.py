@@ -44,7 +44,7 @@ from levain.cockpit.providers import (
     next_date,
     spore_empty,
 )
-from levain.cockpit.registry import opened_day, parse_date
+from levain.cockpit.registry import DONE_DAYS, opened_day, parse_date
 from levain.cockpit.results import Absent, Fault, Read, Result, RowIn
 from levain.dashboard import SubstrateSource
 
@@ -61,7 +61,7 @@ LIST_FACETS = SPORE_FACETS | frozenset({
     "time_state", "wake_day", "wake_bucket", "wake_line", "done_on", "done_kind",
 })
 SURFACES = ("band", "board", "spore", "talk", "drop")
-DONE_DAYS = 7                     # a resolved or composted row stays in Done this long
+GERMINATED_REF = "germinated into"   # a resolution ref germinate writes when an agenda woke into a band row
 DONE_PREFIX = "done:"             # a Done row's id: never a ``spore:`` id, so no spore verb applies to it
 
 
@@ -113,8 +113,9 @@ def _wake(day: date, today: date) -> tuple[str, str]:
     return day.isoformat(), "tomorrow" if n <= 1 else "week" if n <= 7 else "later"
 
 
-def _lands(surface: str, target: Any) -> str:
-    """Where a row lands when it wakes, in the words the List prints (``band``, ``board · levain``, ``talk``)."""
+def _lands(surface: str, target: Any, disposition: str = "seed") -> str:
+    """Where a row lands when it wakes, in the words the List prints (``band``, ``board · levain``, ``talk``). Only a seed comes
+    back to the List; an agenda with no usable target is filed into the band when it germinates."""
     if surface == "band" or surface == "talk":
         return surface
     if surface == "drop" and isinstance(target, str):
@@ -125,13 +126,13 @@ def _lands(surface: str, target: Any) -> str:
         if low.startswith("board:") and t[6:]:
             return "board · " + t[6:]
         return "band"           # band and nudge both file a band row; an unknown word falls back to the band (germinate's rule)
-    return "list"               # a dated seed comes back to the List itself
+    return "band" if disposition == "agenda" else "list"
 
 
-def _wake_facets(day: date, today: date, surface: str, target: Any) -> dict[str, Any]:
+def _wake_facets(day: date, today: date, surface: str, target: Any, disposition: str = "seed") -> dict[str, Any]:
     wake_day, bucket = _wake(day, today)
     return {"time_state": "later", "wake_day": wake_day, "wake_bucket": bucket,
-            "wake_line": f"wakes {band_view.later_words(wake_day, today.isoformat())} \u2192 {_lands(surface, target)}"}
+            "wake_line": f"wakes {band_view.later_words(wake_day, today.isoformat())} \u2192 {_lands(surface, target, disposition)}"}
 
 
 def _spore_part(source: SubstrateSource, ctx: ReadContext, seen: list[bool], *, apply_hold: bool = True) -> _Part:
@@ -173,9 +174,9 @@ def _spore_part(source: SubstrateSource, ctx: ReadContext, seen: list[bool], *, 
         extra: dict[str, Any] = {"surface": surface, "fires": fires, "overdue": overdue, "target": target,
                                  "attention": raw.get("attention") if isinstance(raw.get("attention"), str) else None}
         if is_later:
-            extra.update(_wake_facets(d, ctx.today, surface, target))
-        elif surface == "spore" and s.disposition == "seed" and not d:
-            extra["time_state"] = "someday"          # an undated seed: held for no day
+            extra.update(_wake_facets(d, ctx.today, surface, target, s.disposition))
+        elif not d and ((surface == "spore" and s.disposition == "seed") or s.disposition == "agenda"):
+            extra["time_state"] = "someday"          # an undated seed or agenda: it is never due mechanically
         else:
             extra["time_state"] = "now"
         row = replace(base, facets={**base.facets, **extra}, emphasis="accent" if overdue else base.emphasis)
@@ -248,9 +249,9 @@ def _board_part(store_dir: Any, question_store: Any, today: date, now: datetime)
         if age:
             facets["band_age"] = age
         later = card.get("later")
-        if isinstance(later, str) and parse_date(later):
+        if isinstance(later, str) and parse_date(later) and parse_date(later) > today:
             facets["held_until"] = later[:10]
-            if card.get("section") != "desk" and parse_date(later) > today:
+            if card.get("section") != "desk":
                 facets.update(_wake_facets(parse_date(later), today, "band", None))
         facets.setdefault("time_state", "now")
         if card.get("section") in ("you", "desk"):
@@ -298,7 +299,9 @@ def _done_part(source: SubstrateSource, ctx: ReadContext) -> _Part:
     cutoff = ctx.now.astimezone(timezone.utc) - timedelta(days=DONE_DAYS)
     found: list[tuple[datetime, dict[str, Any]]] = []
     for r in resolved if isinstance(resolved, list) else []:
-        res = r.get("resolution") if isinstance(r, dict) else None
+        if not isinstance(r, dict):
+            continue
+        res = r.get("resolution")
         at = res.get("at") if isinstance(res, dict) else None
         try:
             when = datetime.fromisoformat(at.replace("Z", "+00:00")) if isinstance(at, str) else None
@@ -306,18 +309,24 @@ def _done_part(source: SubstrateSource, ctx: ReadContext) -> _Part:
             when = None
         if when is None or not isinstance(r.get("id"), str) or not isinstance(r.get("text"), str):
             continue
+        if str(res.get("ref") or "").startswith(GERMINATED_REF):
+            continue                # it woke into the band: the intention is waiting there, not finished
         if when.tzinfo is None:
             when = when.replace(tzinfo=timezone.utc)
         if when >= cutoff:
             found.append((when, r))
     found.sort(key=lambda p: p[0], reverse=True)
+    if len(found) > _prov.SPORE_CAP:
+        out.skipped.append((len(found) - _prov.SPORE_CAP,
+                            f"older Done rows not shown (the newest {_prov.SPORE_CAP} are)"))
+    zone = ctx.now.tzinfo
     for when, r in found[:_prov.SPORE_CAP]:
         rid = DONE_PREFIX + r["id"]
         text = visible(r["text"]) or "(no text)"
         surface = _surface(r, spores.disposition_of(r))
         kind = str(r["resolution"].get("kind") or "")
         facets: dict[str, Any] = {"surface": surface, "time_state": "done",
-                                  "done_on": when.astimezone().date().isoformat(), "done_kind": visible(kind)}
+                                  "done_on": when.astimezone(zone).date().isoformat(), "done_kind": visible(kind)}
         out.rows.append(RowIn(id=rid, title=text, body=text, facets=facets,
                               stored=_stored(rid, text, "done", str(r.get("domain") or ""), None, "")))
     return out
