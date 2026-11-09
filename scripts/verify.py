@@ -27,6 +27,11 @@ Kill safety: SIGTERM and SIGINT stop the run's process groups, remove its worktr
 under the run dir and clear its working subdirectories, keeping only the logs and status file.  A run that dies without
 that (SIGKILL, power) is reaped by the next run's start-of-run sweep, which only touches run dirs no live run holds.
 
+Linux-leg interpreter (11-09): the host's distro python3.12, not uv's standalone 3.13: that build has no
+os.pidfd_open, which the code under test uses, so a preflight refuses an interpreter lacking it.  CI's 3.13 linux axis
+is therefore NOT run here; CI covers it at land.  The runner also sets umask 022 on every command (as the CI runner has)
+and puts pytest's basetemp in a short per-run /tmp dir (0700, removed when the run ends, whatever its result).
+
 CI environment decision (reversed 11-09): the legs run with CI=1 and GITHUB_ACTIONS unset, because a test that reads CI
 turns a host-provisioning skip into a failure and the receipt must never read green where CI reads red.  What CI
 provisions for the tests (h11 for /usr/bin/python3) is provisioned inside the run dir, or the leg fails loud naming what
@@ -57,7 +62,9 @@ from pathlib import Path
 
 SCHEMA = "levain-test-receipt/1"
 MAC_PYTHON = "3.12.13"          # pinned full version; uv-managed so it is byte-identical wherever uv fetched it
-LINUX_PYTHON = "3.13"           # minor only: the full version is read back from the venv and recorded on the leg
+LINUX_PYTHON = "/usr/bin/python3.12"   # the host's distro interpreter; path and full version are recorded on the leg
+SHORT_TMP_ROOT = "/tmp"         # pytest basetemps live here: an AF_UNIX path is capped near 107 bytes, a run dir is too deep
+RUNNER_UMASK = 0o022            # CI's umask; a 0002 host makes group-writable fixtures the root helpers refuse
 CLOSURE_PYTHON = "3.9"
 WORKERS_MAC = 6
 WORKERS_LINUX = 4
@@ -392,10 +399,19 @@ def terminate_children(grace: float = 3.0) -> None:
         _kill_group(p, grace)
 
 
+def _set_umask() -> None:
+    os.umask(RUNNER_UMASK)
+
+
+def short_tmp(run_id: str) -> Path:
+    """The short per-run directory pytest's basetemps live in (derived from the run id, so a sweep can find it)."""
+    return Path(SHORT_TMP_ROOT) / ("lv-" + hashlib.sha256(run_id.encode()).hexdigest()[:8])
+
+
 def _spawn(cmd: list[str], *, cwd, env, stdout, stdin=subprocess.DEVNULL) -> subprocess.Popen:
     """Every child gets its own session so one kill reaches its whole group (xdist workers, browsers, mounts' helpers)."""
     p = subprocess.Popen(cmd, cwd=str(cwd) if cwd else None, env=env, stdin=stdin, stdout=stdout,
-                         stderr=subprocess.STDOUT, start_new_session=True)
+                         stderr=subprocess.STDOUT, start_new_session=True, preexec_fn=_set_umask)
     with _CHILD_LOCK:
         _CHILDREN.add(p)
     return p
@@ -537,10 +553,10 @@ class Tools:
             pass
 
 
-def _cmd_touches_run(cmd: str, run: Path) -> bool:
+def _cmd_touches_run(cmd: str, run: Path, *extra: Path) -> bool:
     """True when some argument is a path in a SUBDIRECTORY of the run dir (a venv, a worktree), or the value of a
     `--flag=` that points under the run dir (a basetemp).  A viewer of the run's top-level log never matches."""
-    for root in {str(run), os.path.realpath(run)}:
+    for root in {str(r) for r in (run, *extra)} | {os.path.realpath(r) for r in (run, *extra)}:
         for tok in cmd.split():
             is_flag = tok.startswith("--") and "=" in tok
             tok = tok.split("=", 1)[1] if is_flag else tok
@@ -555,12 +571,13 @@ def reap_run(run: Path, repo: Path, tools: Tools, *, keep_files: bool = False, g
     sweep of an earlier dead run) deletes the dir.  Nothing is deleted while an image is still mounted under it."""
     summary: dict = {"run": str(run), "killed": [], "ejected": [], "worktrees": [], "left_mounted": [], "removed": False}
     me = os.getpid()
-    pids = [pid for pid, cmd in tools.ps() if pid != me and _cmd_touches_run(cmd, run)]
+    st = [short_tmp(run.name)] if RUN_ID_RE.fullmatch(run.name) else []
+    pids = [pid for pid, cmd in tools.ps() if pid != me and _cmd_touches_run(cmd, run, *st)]
     for pid in pids:
         tools.kill(pid, signal.SIGTERM)
     if pids:
         time.sleep(grace)
-        alive = {pid for pid, cmd in tools.ps() if _cmd_touches_run(cmd, run)}
+        alive = {pid for pid, cmd in tools.ps() if _cmd_touches_run(cmd, run, *st)}
         for pid in pids:
             if pid in alive:
                 tools.kill(pid, signal.SIGKILL)
@@ -583,6 +600,8 @@ def reap_run(run: Path, repo: Path, tools: Tools, *, keep_files: bool = False, g
                 tools.git(repo, "worktree", "remove", "--force", wt)
                 summary["worktrees"].append(wt)
     tools.git(repo, "worktree", "prune")
+    for d in st:
+        shutil.rmtree(d, ignore_errors=True)
     if run.exists():
         if keep_files:
             for child in run.iterdir():
@@ -911,7 +930,9 @@ def lock_host(state: Path, _retry: bool = True):
 
 
 def _minor(python: str) -> str:
-    return "".join(python.split(".")[:2])
+    """'3.12.13' -> '312'; a path such as '/usr/bin/python3.12' -> '312'."""
+    m = re.search(r"(\d+)\.(\d+)", os.path.basename(python))
+    return "".join(m.groups()) if m else "".join(python.split(".")[:2])
 
 
 def venv_version(py: Path, env: dict) -> str:
@@ -938,6 +959,7 @@ class Ctx:
         self.touched: set[str] = set()
         self.base_sha = ""
         self.h11_site: Path | None = None
+        self.tmp = short_tmp(run_id)
 
     def progress(self, phase: str) -> None:
         if self.status is not None:
@@ -946,6 +968,8 @@ class Ctx:
     def prepare(self) -> None:
         for d in (self.run / "home", self.run / "tmp"):
             d.mkdir(parents=True, exist_ok=True)
+        self.tmp.mkdir(mode=0o700, parents=True, exist_ok=True)
+        os.chmod(self.tmp, 0o700)
         # the land base is read once, here, as a sha: every classification and baseline of this leg uses this one value
         self.base_sha = git(self.repo, "rev-parse", "--verify", f"{MAIN_REF}^{{commit}}", check=False).stdout.strip()
         base = self.base_sha or MAIN_REF
@@ -969,6 +993,7 @@ class Ctx:
         for n in self.names:
             remove_worktree(self.repo, self.run, n)
         shutil.rmtree(self.run / "venv39", ignore_errors=True)
+        shutil.rmtree(self.tmp, ignore_errors=True)
         git(self.repo, "worktree", "prune", check=False)
 
 
@@ -990,7 +1015,7 @@ def run_job(ctx: Ctx, *, name: str, py: Path, cwd: Path, env: dict, targets: lis
     junit = ctx.run / junit_name
     xd = ["-n", str(workers), "--dist", "loadfile"] if workers else []
     ctx.progress(f"{name}: pytest")
-    rc = _run(pytest_cmd(py, *xd, *flags, f"--junitxml={junit}", f"--basetemp={ctx.run / ('pt-' + name)}", *targets),
+    rc = _run(pytest_cmd(py, *xd, *flags, f"--junitxml={junit}", f"--basetemp={ctx.tmp / ('pt-' + name)}", *targets),
               cwd=cwd, env=env, log=ctx.log, timeout=timeout)
     if not junit.exists():
         raise RuntimeError(f"{name}: pytest produced no junit (exit {rc}); see {ctx.log}")
@@ -1001,7 +1026,7 @@ def run_job(ctx: Ctx, *, name: str, py: Path, cwd: Path, env: dict, targets: lis
     def rerun(nid: str) -> bool:
         n_rerun[0] += 1
         rj = ctx.run / f"junit-rerun-{name}-{n_rerun[0]}.xml"
-        rc2 = _run(pytest_cmd(py, nid, *rerun_flags, f"--junitxml={rj}", f"--basetemp={ctx.run / ('pt-%s-r%d' % (name, n_rerun[0]))}"),
+        rc2 = _run(pytest_cmd(py, nid, *rerun_flags, f"--junitxml={rj}", f"--basetemp={ctx.tmp / ('pt-%s-r%d' % (name, n_rerun[0]))}"),
                    cwd=cwd, env=env, log=ctx.log, timeout=900)
         ok = rc2 == 0 and rerun_passed(rj)
         rj.unlink(missing_ok=True)
@@ -1014,7 +1039,7 @@ def run_job(ctx: Ctx, *, name: str, py: Path, cwd: Path, env: dict, targets: lis
             bp_py, benv, bflags = base_cfg(bsrc, bpy)
         else:
             bp_py, benv, bflags = bpy, {**env, "PATH": f"{bpy.parent}:{CLEAN_PATH}"}, rerun_flags
-        brc = _run(pytest_cmd(bp_py, *nids, *bflags, f"--junitxml={bj}", f"--basetemp={ctx.run / ('pt-main-' + name)}"),
+        brc = _run(pytest_cmd(bp_py, *nids, *bflags, f"--junitxml={bj}", f"--basetemp={ctx.tmp / ('pt-main-' + name)}"),
                    cwd=bsrc, env=benv, log=ctx.log, timeout=1800)
         binfo.update(sha=ctx.base_sha, rc=brc)
         if not bj.exists():
@@ -1149,11 +1174,25 @@ def linux_job_names(python: str = LINUX_PYTHON) -> list[str]:
             f"root-closure-py{_minor(CLOSURE_PYTHON)}"]
 
 
+def preflight_python(python: str, probe=host_probe) -> str | None:
+    """None when `python` has os.pidfd_open (the code under test needs it), else the reason it cannot be the linux leg's."""
+    rc, out = probe([python, "-c", "import os,sys;sys.exit(0 if hasattr(os,'pidfd_open') else 3)"])
+    if rc == 0:
+        return None
+    if rc == 3:
+        return f"interpreter {python} has no os.pidfd_open (a python-build-standalone build?); the linux leg needs the distro python"
+    return f"interpreter {python} cannot run (exit {rc}): {out.strip()[-200:]}"
+
+
 def plan_linux(ctx: Ctx, python: str, workers: int, timeout: float) -> tuple[list[dict], list[dict], str]:
     """Three jobs, as CI runs them: the full suite without the static-guard files, the live floor tests on 3.12 where a
     skip fails (after a host preflight), and the root-run import closure on the oldest interpreter."""
     ctx.python = python
     ctx.prepare()
+    ctx.progress("interpreter preflight")
+    bad = preflight_python(python)
+    if bad:
+        return [failed_job("ci-parity", "interpreter preflight: " + bad)], [], "unknown"
     ctx.progress("building the environment")
     src, py = ctx.make("src_at_sha", ctx.sha, python)
     ctx.src = src
@@ -1239,7 +1278,7 @@ def run_leg_local(repo: Path, sha: str, run: Path, run_id: str, ledger: Ledger |
         max_load = sampler.finish()
         ctx.teardown()
     return {"platform": "macos" if leg == "mac" else "linux", "sha": sha, "base_sha": ctx.base_sha,
-            "host": socket.gethostname(), "python": pyver,
+            "host": socket.gethostname(), "python": pyver, "python_path": python,
             "host_fingerprint": host_fingerprint(), "started": started, "ended": now(),
             "duration_s": round(time.time() - t0, 1), "workers": workers, "max_load": max_load,
             "load_reds": sum(j.get("load_reds", 0) for j in jobs), "jobs": jobs, "_diag": diag}
@@ -1346,7 +1385,7 @@ def run_leg_remote(repo: Path, sha: str, run: Path, run_id: str, ledger: Ledger,
     try:
         step("shipping the bundle", ssh + [f"mkdir -p {q(rrun)}/xfer && cat > {q(rrun)}/xfer/sha.bundle"], stdin=bundle)
         step("shipping the runner", ["scp", "-q", *SSH_OPTS, str(script), f"{host}:{rrun}/verify.py"])
-        remote = (f"cd {q(rrun)} && git init -q xfer/repo && "
+        remote = (f"umask 022 && cd {q(rrun)} && git init -q xfer/repo && "
                   f"git -C xfer/repo fetch -q ../sha.bundle +{ref}:{ref} +{main_ref}:{main_ref} && "
                   f"python3 verify.py run --here --leg linux --sha {sha} --repo xfer/repo --run-id {run_id} "
                   f"--workers {int(workers)} --leg-json leg-linux.json --base-sha {base}")
