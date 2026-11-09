@@ -48,7 +48,8 @@ _FAKE = textwrap.dedent('''\
                                    ("ctl", "ctl_exit_empty_leak"))
     if not parse_fails:
         send(b"HEAD /api/hello HTTP/1.1")
-        time.sleep(0.2)
+        if mode != "ctl_exit_empty_leak":
+            time.sleep(0.2)
     if mode == "preflight_only":
         if role == "ctl":
             hook()
@@ -57,6 +58,11 @@ _FAKE = textwrap.dedent('''\
     if role == "ctl":
         if mode in ("leak_only", "hang_empty_and_ctl"):
             time.sleep(60)
+        if mode == "ctl_exit_empty_leak":
+            # exit only once the empty-list run is up, so its hook lands inside the settle however loaded the box is
+            gate = time.monotonic() + 10
+            while not os.path.exists(os.path.join(side, "home_empty")) and time.monotonic() < gate:
+                time.sleep(0.01)
         if mode in ("ctl_exit", "ctl_exit_empty_leak"):
             sys.stderr.write("ctl boom\\n")
             sys.exit(3)
@@ -83,7 +89,6 @@ _FAKE = textwrap.dedent('''\
         sys.stderr.write("error: option '--setting-sources <sources>' argument missing\\n")
         sys.exit(2)
     if mode == "ctl_exit_empty_leak":
-        time.sleep(0.05)
         hook()
     if mode == "ctl_api_first_leak":
         time.sleep(0.1)
