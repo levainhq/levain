@@ -345,7 +345,7 @@ def agent_config_paths(paths: Iterable[str]) -> list[str]:
     Every comparison folds as the slot's settings freeze folds (NFD + casefold). Sorted, no duplicates. Adopt shows
     these as their own labelled item; it never blocks on them."""
     from levain.slot.render import REPO_DISCOVERY
-    from levain.slot.supervisor import _fold
+    from levain.slot.render import fold_name as _fold
 
     nested = {_fold(n) for n in _NESTED_INSTRUCTION_FILES}
     anywhere = {_fold(".claude")}

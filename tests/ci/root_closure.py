@@ -338,7 +338,7 @@ LAZY_SITES = {
     # operator: ``agent_config_paths`` <- ``dispatch/cli.py`` (the authorise view) and ``dispatch/phone.py`` (the card); the follower never calls it
     'levain/dispatch/adopt.py::agent_config_paths::from levain.slot.render import REPO_DISCOVERY': 'operator',
     # operator: same callers as the row above
-    'levain/dispatch/adopt.py::agent_config_paths::from levain.slot.supervisor import _fold': 'operator',
+    'levain/dispatch/adopt.py::agent_config_paths::from levain.slot.render import fold_name as _fold': 'operator',
     # operator: ``authorise_refusal`` <- ``land`` (``dispatch/cli.py``) and ``JobStore.authorise``, neither run by the follower
     'levain/dispatch/adopt.py::authorise_refusal::from levain.consent.passkey import answer_signature_problem': 'operator',
     # operator: ``floor`` <- ``land`` <- ``dispatch/cli.py`` (``levain dispatch land``)
@@ -372,6 +372,7 @@ LAZY_SITES = {
     # operator: <- ``Cockpit._compose_decisions`` / ``Cockpit._consent_decision_one`` only; ``Cockpit(`` is constructed only in ``levain/cockpit/providers.py``
     'levain/cockpit/engine.py::_consent_rows_in::from levain.consent.listing import egress_state_of': 'operator',
     'levain/cockpit/engine.py::_egress_lookup_of::from levain.consent.listing import egress_reading': 'operator',
+    'levain/cockpit/engine.py::_board_visible::from levain.cockpit import board': 'operator',
     # operator: <- ``Cockpit._compose_decisions`` only; ``Cockpit(`` is constructed only in ``levain/cockpit/providers.py``
     'levain/cockpit/engine.py::_note_rows_in::from levain.consent.listing import PENDING_CAP': 'operator',
     # operator: the same function as the row below (``Cockpit._compose_decisions`` only)
