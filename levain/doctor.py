@@ -1236,10 +1236,19 @@ def _check_slot_alarms(*, host: str | None = None, store: Path | None = None, no
     store = store if store is not None else layout.STORE.get(host)
     if store is None or not (store / "queue").is_dir():
         return []
-    if not (store / "queue" / "requests").is_dir():
-        return [CheckResult(name, True, "no alarm log exists yet (the queue broker has not made L/queue/requests)")]
     log_path = store / "queue" / "requests" / "alarms.jsonl"
     now = now if now is not None else datetime.now(timezone.utc)
+    try:
+        # stat, never is_dir: a queue this user may not search must read as not readable, not as no log
+        (store / "queue" / "requests").stat()
+    except FileNotFoundError:
+        return [CheckResult(name, True, "no alarm log exists yet (the queue broker has not made L/queue/requests)")]
+    except PermissionError:
+        return [CheckResult(name, True, f"not readable by this user: add the operator to the levain-queue group "
+                                        f"to read {log_path}")]
+    except OSError as exc:
+        return [CheckResult(name, True, f"could not be read ({type(exc).__name__}: {exc})",
+                            f"Look at {log_path}.", warn=True)]
     try:
         recent, suppressed = [], {}
         for rec in operator.alarms(store / "queue"):
