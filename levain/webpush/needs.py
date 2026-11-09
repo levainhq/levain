@@ -123,16 +123,14 @@ def _read_record(queue_dir: "Path | str", now: "float | None") -> "tuple[bool, i
 
 
 def keep_recorded(queue_dir: "Path | str", question_source: Any, stop: Any, *, every: "float | None" = None) -> None:
-    """Record the host's count now, then again every ``every`` seconds (default :data:`KEEP_EVERY_S`) until the
-    ``threading.Event`` ``stop`` is set, so an idle server's record never ages out and a child's push still carries it.
-    A failed read is logged and the loop goes on."""
-    while True:
+    """Wait ``every`` seconds (default :data:`KEEP_EVERY_S`; the caller has just recorded), then record the host's count, and
+    again each interval until the ``threading.Event`` ``stop`` is set, so an idle server's record never ages out and a child's
+    push still carries it. A failed read is logged and the loop goes on."""
+    while not stop.wait(KEEP_EVERY_S if every is None else every):
         try:
             open_needs_count(queue_dir, question_source)
         except Exception:  # noqa: BLE001 - the keeper outlives a bad read
             log.exception("needs count: the recorded count could not be refreshed")
-        if stop.wait(KEEP_EVERY_S if every is None else every):
-            return
 
 
 def recorded_count(queue_dir: "Path | str", *, now: "float | None" = None) -> "int | None":
