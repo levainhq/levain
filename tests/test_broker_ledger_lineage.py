@@ -838,3 +838,33 @@ def test_the_digest_is_the_compact_ascii_json_of_the_sorted_triples():
     want = "sha256:" + hashlib.sha256(raw.encode("utf-8")).hexdigest()
     assert L.triples_digest([a, b]) == L.triples_digest([b, a]) == want
     assert L.triples_digest([{"ledger": a[0], "epoch": a[1], "ref": a[2]}, list(b)]) == want
+
+
+def test_a_run_final_whose_line_fails_takes_its_fence_down(tmp_path, monkeypatch):
+    # runfinal r1 (complement LOW 3, deepseek MED, gemini HIGH): the fence stands for a count that is queued or
+    # written, never for one whose line failed; the ledger is unhealthy then, so no line of the run can follow it
+    import errno
+    path = ledger_path(tmp_path)
+    real = L._write_all
+
+    def full_for_finals(fd, data):
+        if b'"kind":"run-final"' in data:
+            raise OSError(errno.ENOSPC, "no space")
+        return real(fd, data)
+
+    async def go():
+        led = L.Ledger.open(path)
+        led.attach(asyncio.get_running_loop())
+        led.note_run(RID)
+        monkeypatch.setattr(L, "_write_all", full_for_finals)
+        fut = led.run_final(RID)
+        queued = led.run_finalized(RID)
+        with pytest.raises(L.LedgerUnavailable):
+            await fut
+        await asyncio.sleep(0)
+        out = (queued, led.run_finalized(RID), led.healthy)
+        await led.aclose(5)
+        return out
+
+    assert asyncio.run(go()) == (True, False, False)
+    assert _finals(path) == []

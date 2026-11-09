@@ -744,6 +744,10 @@ class Ledger:
         self._known_runs: set = set()                               # runs keys named with `note_run` (memory only)
         #: called on the loop as `on_outbox(triple, payload)` when a payload line becomes durable (3c-6c's sender)
         self.on_outbox: Optional[Callable[[Ref, dict], None]] = None
+        #: called on the loop as `on_runs()` after anything `run_ready` reads may have moved toward ready: an ack line
+        #: counted, or a batch that resolved a hold. It runs from the ledger's own bookkeeping, never from the future
+        #: of whoever asked, so an asker that was cancelled never loses it.
+        self.on_runs: Optional[Callable[[], None]] = None
         self._inflight_since = 0.0
         self._in_bound = False
         self._bound_misused = False
@@ -1154,7 +1158,9 @@ class Ledger:
 
     def _durable(self, line_seqs: List[int]) -> None:
         """Posted by the writer after a batch's flush returned. Each line in its own try: one failing step strands
-        THAT hold only."""
+        THAT hold only. A batch that resolved a hold tells `on_runs` once, after its every line is applied (a line's
+        payload enters the outbox after its hold resolves, so a run is never read between the two)."""
+        resolved = False
         for s in line_seqs:
             ent = self._lines.pop(s, None)
             if ent is None:
@@ -1162,6 +1168,8 @@ class Ledger:
             hold, kind = ent
             fut = self._line_futs.pop(s, None)
             ob = self._pending_outbox.pop(s, None)
+            if hold is not None and kind != "reserved":
+                resolved = True
             if hold is not None:
                 try:
                     self._apply_durable(hold, kind)
@@ -1176,6 +1184,16 @@ class Ledger:
                 self._outbox_add(*ob)
             if fut is not None:
                 _set_result(fut)
+        if resolved:
+            self._runs_moved()
+
+    def _runs_moved(self) -> None:
+        fn = self.on_runs
+        if fn is not None:
+            try:
+                fn()
+            except Exception as e:
+                _note(logging.WARNING, "levain gw-keys: ledger run listener failed (%s)", type(e).__name__)
 
     def _outbox_add(self, triple: Ref, payload: dict) -> None:
         self._known.add(triple)
@@ -1392,7 +1410,8 @@ class Ledger:
     # -- the run's count -------------------------------------------------------------------------------------------
 
     def run_finalized(self, run_id: str) -> bool:
-        """True once the run's `run-final` line is queued (the fence is up) or was found at replay."""
+        """True once the run's `run-final` line is queued (the fence is up) or was found at replay; a queued line that
+        fails takes the fence down again (`_final_done`)."""
         self._check_read()
         return run_id in self._finals
 
@@ -1438,7 +1457,7 @@ class Ledger:
         `LedgerUnavailable`). Raises `LedgerMisuse` unless the run is ready and not already finalized, and
         `LedgerUnavailable` while the ledger is unhealthy or closing. A run the ledger holds no record of (no note,
         hold or row: :meth:`run_known`) is refused too, so nothing settles an unknown run at zero. The fence is up
-        from this call on."""
+        from this call on, once the line is queued, and comes down if the line fails (`_final_done`)."""
         self._check_loop()
         if type(run_id) is not str or not _RUN_ID_RE.fullmatch(run_id):
             raise LedgerMisuse("a malformed run_id")
@@ -1463,9 +1482,17 @@ class Ledger:
                         "at": at})
         fut = loop.create_future()
         fut.add_done_callback(_retrieve)
-        self._finals[run_id] = seq
         self._submit(seq, data, None, "run-final", fut=fut, outbox=((self.ledger_id, self.epoch, seq), payload))
+        self._finals[run_id] = seq     # the fence, once the line is queued
+        fut.add_done_callback(functools.partial(self._final_done, run_id, seq))
         return fut
+
+    def _final_done(self, run_id: str, seq: int, fut: "asyncio.Future") -> None:
+        """A run-final line that did not become durable takes its fence down: in memory the run is not finalized, so
+        `run_finalized` says so and keys keeps the run. The ledger is unhealthy or closing by then, so no line of the
+        run can follow; if the line's bytes did reach the file, the next replay finds the count."""
+        if (fut.cancelled() or fut.exception() is not None) and self._finals.get(run_id) == seq:
+            del self._finals[run_id]
 
     def unacked(self) -> List[Tuple[Ref, dict]]:
         """Every durable payload line with no durable ack, in ref order: `[(triple, payload)]`. A triple whose ack
@@ -1556,6 +1583,7 @@ class Ledger:
         self._quarantined.update(q)
         if not outer.done():
             outer.set_result(None)
+        self._runs_moved()    # whether or not `outer`'s awaiter is still there to see it
 
     # -- close ---------------------------------------------------------------------------------------------------
 
