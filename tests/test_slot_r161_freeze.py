@@ -212,7 +212,8 @@ def test_the_slot_launch_never_loads_a_settings_source():
 def test_a_config_change_hook_blocks_and_is_wired_for_claude_only():
     blob, facts, _ = frozen_blob("linux", templates={**GATE, **GUARD})
     got = rd.render_cc_settings(blob, facts)["hooks"]["ConfigChange"]
-    assert got[0]["hooks"][0]["command"] == f"{facts.S}/root/hooks/levain_config"
+    assert got[0]["hooks"][0]["command"] == rd.hook_command(blob, facts, "levain_config")
+    assert got[0]["hooks"][0]["command"].endswith(f"{facts.S}/root/hooks/levain_config")
     assert got[0]["hooks"][0]["onFailure"] == "block"
     r = rd.render(blob, facts)
     assert r.file("root/hooks/levain_config").data == GUARD["levain_config"].body
@@ -235,34 +236,34 @@ def test_the_production_templates_include_the_guard_for_a_claude_blob():
     assert rh.hook_templates_for(Seams, cblob) == {}
 
 
-def test_the_config_guard_blocks_every_change_and_records_one_alarm_line():
-    seen = []
+def test_the_config_guard_blocks_every_change_and_writes_one_alarm_line(tmp_path):
     err = io.StringIO()
     payload = json.dumps({"hook_event_name": "ConfigChange", "source": "local_settings",
                           "file_path": "/s/repo/.claude/settings.local.json", "session_id": "abc", "cwd": "/s/repo"})
-    code = hook_run.config_guard("levain_config", stdin=io.StringIO(payload), stderr=err, environ={"HOME": "/h"},
-                                 record=lambda environ, event: seen.append((environ, event)))
+    code = hook_run.config_guard("levain_config", stdin=io.StringIO(payload), stderr=err)
     assert code == hook_run.REFUSED_EXIT
     assert err.getvalue().count("\n") == 1
     assert "local_settings" in err.getvalue() and "/s/repo/.claude/settings.local.json" in err.getvalue()
-    assert [e["source"] for _, e in seen] == ["local_settings"]
     for junk in ("", "not json", "[]", "{" * 10):                    # whatever arrives, the change is blocked
-        seen.clear()
-        assert hook_run.config_guard("levain_config", stdin=io.StringIO(junk), stderr=io.StringIO(), environ={},
-                                     record=lambda environ, event: seen.append(event)) == hook_run.REFUSED_EXIT
-    assert hook_run.config_guard("levain_config", stdin=io.StringIO(payload), stderr=io.StringIO(), environ={},
-                                 record=lambda e, ev: 1 / 0) == hook_run.REFUSED_EXIT       # a record never unblocks
+        assert hook_run.config_guard("levain_config", stdin=io.StringIO(junk), stderr=io.StringIO()) \
+            == hook_run.REFUSED_EXIT
+
+    class Broken(io.StringIO):
+        def write(self, s):
+            raise OSError("gone")
+    assert hook_run.config_guard("levain_config", stdin=io.StringIO(payload), stderr=Broken()) == hook_run.REFUSED_EXIT
 
 
-def test_the_config_guard_files_the_alarm_in_the_gate_ledger(tmp_path):
-    from levain.consent.ledger import Ledger
-    event = {"hook_event_name": "ConfigChange", "source": "project_settings", "file_path": "/r/.claude/settings.json",
-             "session_id": "sess-1", "cwd": "/r"}
-    row_id = hook_run.file_config_alarm({"HOME": str(tmp_path)}, event)
-    assert row_id
-    call = Ledger(tmp_path / ".levain" / "consent").get(row_id)
-    assert (call.tool_name, call.phase, call.outcome) == ("ConfigChange:project_settings", "denied_by_gate", "refused")
-    assert call.cwd == "/r" and call.agent_session_id == "sess-1"
+def test_the_config_guard_files_no_row_in_the_slots_own_home(tmp_path, monkeypatch):
+    """L1 F6, measured (r161f1 run 3): the row the guard used to file went to ``<S>/.levain/consent``, the slot's own
+    HOME, which no operator reader reads. The guard keeps its stderr line and files nothing slot-side."""
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.delenv("LEVAIN_HOME", raising=False)
+    payload = json.dumps({"hook_event_name": "ConfigChange", "source": "project_settings", "file_path": "/r/x",
+                          "session_id": "s", "cwd": "/r"})
+    assert hook_run.config_guard("levain_config", stdin=io.StringIO(payload), stderr=io.StringIO()) \
+        == hook_run.REFUSED_EXIT
+    assert not (tmp_path / ".levain").exists() and not hasattr(hook_run, "file_config_alarm")
 
 
 # --- 5: the env -i wrapper, both hosts (L1 F1 / L2 LOW) ---------------------------------------------------------
