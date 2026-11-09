@@ -183,9 +183,11 @@ def test_the_hook_templates_the_helper_defaults_to_satisfy_check_facts(ptd, monk
     p = pipe(ptd, monkeypatch, tmp_path)
     assert p.w.seams.hook_templates is None                   # the production path: nothing injected
     blob, facts = _gates(p)
-    assert set(facts.hook_templates) == set(blob.hooks) == set(L.HOOKS)
+    assert set(facts.hook_templates) == set(blob.hooks) | {"levain_config"}     # the always-on ConfigChange alarm
+    assert set(blob.hooks) == set(L.HOOKS)
     assert {n: t.event for n, t in facts.hook_templates.items()} == {"levain_gate": "PreToolUse",
-                                                                     "levain_queue": "PermissionRequest"}
+                                                                     "levain_queue": "PermissionRequest",
+                                                                     "levain_config": "ConfigChange"}
     assert all(type(t.body) is bytes and t.body for t in facts.hook_templates.values())
 
 

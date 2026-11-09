@@ -25,7 +25,7 @@ import binascii
 import re
 import unicodedata
 from dataclasses import dataclass
-from typing import Collection, Mapping, Sequence, Union
+from typing import Any, Collection, Mapping, Sequence, Union
 
 from levain import unshowable
 from levain.contracts import ContractError
@@ -88,7 +88,11 @@ _HANDLE_RE = re.compile(r"[A-Za-z0-9_-]{43}", re.ASCII)
 
 RENDER_FORMAT = "levain-session-render/1"
 RENDER_KEYS = frozenset({"format", "vendor", "routes", "model", "git_identity", "hooks", "mcp",
-                         "allow_own_loopback", "repo_label", "verifier_steps", "driver"})
+                         "allow_own_loopback", "repo_label", "verifier_steps", "driver", "repo_settings"})
+#: The top-level keys of a repo's settings that travel in ``repo_settings`` (frozen into the root-owned layer at render),
+#: and the only permission lists among them. No ``env`` key: a repo's env never reaches the rendered layer.
+REPO_FROZEN_KEYS = ("hooks", "permissions", "enabledPlugins", "extraKnownMarketplaces")
+REPO_PERMISSION_LISTS = ("allow", "deny", "ask")
 #: DECISION: the keys every render needs; the rest are optional by their §5.3 rule.
 RENDER_REQUIRED = frozenset({"format", "vendor", "routes"})
 HOOKS = frozenset({"levain_gate", "levain_queue"})
@@ -167,6 +171,7 @@ class RenderBlob:
     repo_label: str | None = None
     verifier_steps: tuple[VerifierStep, ...] | None = None
     driver: str | None = None
+    repo_settings: Mapping[str, Any] | None = None
 
 
 SlotConfig = Mapping[str, Union[int, Collection[int]]]
@@ -419,6 +424,30 @@ def _prepare_input(obj: dict) -> PrepareInput:
     return PrepareInput(_handle(obj["lease_nonce"], "lease_nonce"), ticket)
 
 
+def _repo_settings(value: object) -> dict:
+    """The frozen repo layer: an object of :data:`REPO_FROZEN_KEYS` only, each of the shape render merges. Anything
+    else (an ``env``, a ``model``, a permission key that is not a list) is refused by name, so the helper takes
+    nothing from the operator-side process that it would not merge."""
+    if type(value) is not dict:
+        raise Refused("wrong-type", "repo_settings is an object")
+    _keys(value, frozenset(REPO_FROZEN_KEYS), frozenset(), "repo_settings")
+    hooks = value.get("hooks", {})
+    if type(hooks) is not dict or any(type(g) is not list or any(type(e) is not dict for e in g)
+                                      for g in hooks.values()):
+        raise Refused("wrong-type", "repo_settings.hooks: event -> list of objects")
+    perms = value.get("permissions", {})
+    if type(perms) is not dict:
+        raise Refused("wrong-type", "repo_settings.permissions is an object")
+    _keys(perms, frozenset(REPO_PERMISSION_LISTS), frozenset(), "repo_settings.permissions")
+    for k, v in perms.items():
+        if type(v) is not list or any(type(i) is not str for i in v):
+            raise Refused("wrong-type", f"repo_settings.permissions.{k}: a list of strings")
+    for k in ("enabledPlugins", "extraKnownMarketplaces"):
+        if k in value and type(value[k]) is not dict:
+            raise Refused("wrong-type", f"repo_settings.{k} is an object")
+    return value
+
+
 def _render_blob(obj: dict) -> RenderBlob:
     # §5.3: unknown key = refusal by name (``driver_input`` was REMOVED in c5, so it is unknown).
     _keys(obj, RENDER_KEYS, RENDER_REQUIRED, "render")
@@ -454,12 +483,14 @@ def _render_blob(obj: dict) -> RenderBlob:
     label = _display(obj["repo_label"], "repo_label") if "repo_label" in obj else None
     steps = _verifier_steps(obj["verifier_steps"]) if "verifier_steps" in obj else None
     driver = _str(obj["driver"], "driver", _TEMPLATE_RE) if "driver" in obj else None
+    repo_settings = _repo_settings(obj["repo_settings"]) if "repo_settings" in obj else None
     # §5.3 + §5.6: both are verifier-only. DECISION: they travel together (a driver with no steps, or
     # steps with no driver, describes no verifier session).
     if (steps is None) != (driver is None):
         raise Refused("verifier-keys-unpaired", "verifier_steps and driver travel together")
     return RenderBlob(vendor=vendor, routes=routes, model=model, git_identity=git, hooks=hooks, mcp=mcp,
-                      allow_own_loopback=loopback, repo_label=label, verifier_steps=steps, driver=driver)
+                      allow_own_loopback=loopback, repo_label=label, verifier_steps=steps, driver=driver,
+                      repo_settings=repo_settings)
 
 
 def parse_stdin(verb: str, raw_bytes: bytes) -> PrepareInput | RenderBlob | None:
@@ -548,7 +579,8 @@ def refusal_line(refused: Refused) -> str:
 
 __all__ = [
     "VERBS", "KINDS", "VENDORS", "AUTHS", "CALLERS", "OPERATOR", "DISPATCH", "LEASE_VERBS", "STDIN_VERBS",
-    "DISPATCH_FORBIDDEN", "KINDS_FOR_CALLER", "STDIN_MAX", "RENDER_FORMAT", "RENDER_KEYS",
+    "DISPATCH_FORBIDDEN", "KINDS_FOR_CALLER", "STDIN_MAX", "RENDER_FORMAT", "RENDER_KEYS", "REPO_FROZEN_KEYS",
+    "REPO_PERMISSION_LISTS",
     "RuntimeRequest", "PrepareInput", "RenderBlob", "GitIdentity", "VerifierStep",
     "parse_runtime_argv", "parse_stdin", "bind_stdin", "ok_line", "refusal_line",
 ]

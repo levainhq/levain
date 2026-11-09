@@ -305,7 +305,10 @@ def test_full_sequence_against_fake_helper(tmp_path: Path, monkeypatch: pytest.M
     assert v[1]["args"] == [SESSION] and v[2]["args"] == [SESSION] and v[3]["args"] == [SESSION]
     assert blob == {"format": "levain-session-render/1", "vendor": "claude", "routes": ["github", "pypi", "anthropic"],
                     "hooks": [], "git_identity": {"name": "Op Erator", "email": "op@example.com"},
-                    "repo_label": "repo"}
+                    "repo_label": "repo",
+                    "repo_settings": {"hooks": {"PreToolUse": [{"hooks": [{"command": "x", "type": "command"}],
+                                                                 "matcher": "Bash"}]},
+                                      "permissions": {"allow": ["Bash(ls:*)"]}}}
     assert v[1]["stdin"] == json.dumps(blob, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
     assert rig.calls[0] == ("connect", str(tmp_path / "control.sock"))
     assert rig.calls[-1] == ("close",)                      # the lease closes last, after teardown
