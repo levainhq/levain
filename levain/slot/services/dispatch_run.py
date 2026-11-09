@@ -1187,7 +1187,7 @@ def build_server(host: str, store: Path, control_sock: Path, operator_uid: int) 
     uploads.sweep()
     launcher = RealLauncher(DispatchControlPort(control_sock),
                             HelperSlotRuntime(host=host, control_socket=control_sock, store=store,
-                                              workspace=uploads.stage),
+                                              workspace=uploads.stage, repo_settings=uploads.repo_settings),
                             bound_usage_sources(queue_root=store / "queue", store=store, index_dir=index_dir),
                             SessionIndex(index_dir))
     pool = DispatchControlPort(control_sock, ops=frozenset({"POOL"}))
