@@ -318,6 +318,59 @@ def test_full_sequence_against_fake_helper(tmp_path: Path, monkeypatch: pytest.M
     assert "claude exited 3" in err
 
 
+def _render_blob(rig: "Rig") -> dict:
+    return json.loads([x for x in rig.verbs() if x["verb"] == "render"][0]["stdin"])
+
+
+def test_the_checkouts_working_tree_settings_are_frozen_uncommitted_ones_included(tmp_path: Path,
+                                                                                 monkeypatch: pytest.MonkeyPatch
+                                                                                 ) -> None:
+    """Row 161 L1 F3 (head ruling 3): the settings are read from the operator's checkout as it is on disk, so a
+    gitignored ``settings.local.json`` (where Claude Code writes an "always allow") and an uncommitted edit of
+    ``settings.json`` both reach the frozen layer, and the launch says which files it read."""
+    rig = Rig(tmp_path, monkeypatch)
+    (rig.repo / ".gitignore").write_text(".env\n.claude/settings.local.json\n")
+    (rig.repo / ".claude" / "settings.local.json").write_text(json.dumps({"permissions": {"allow": ["Bash(make)"]}}))
+    edited = dict(HOOKS_SETTINGS, permissions={"allow": ["Bash(ls:*)", "Bash(npm test)"]})
+    (rig.repo / ".claude" / "settings.json").write_text(json.dumps(edited))
+    assert rig.run() == 0
+    assert _render_blob(rig)["repo_settings"]["permissions"] == {"allow": ["Bash(ls:*)", "Bash(npm test)",
+                                                                           "Bash(make)"]}
+    assert "repo settings read from the checkout: .claude/settings.json, .claude/settings.local.json" in rig.stderr()
+
+
+def test_a_working_tree_settings_link_or_bad_json_refuses_the_launch(tmp_path: Path,
+                                                                     monkeypatch: pytest.MonkeyPatch) -> None:
+    for name, plant in (("link", lambda p: p.symlink_to("/etc/hosts")), ("json", lambda p: p.write_text("{nope")),
+                        ("dup", lambda p: p.write_text('{"a": 1, "a": 2}'))):
+        sub = tmp_path / name
+        sub.mkdir()
+        rig = Rig(sub, monkeypatch)
+        local = rig.repo / ".claude" / "settings.local.json"
+        plant(local)
+        assert rig.run() == 1
+        assert rig.verbs() == [] and rig.calls == []                      # refused before any lease or verb
+        assert "refused repo-settings-malformed: .claude/settings.local.json" in rig.stderr()
+
+
+def test_a_case_variant_in_the_working_tree_is_named_at_launch_and_not_read(tmp_path: Path,
+                                                                           monkeypatch: pytest.MonkeyPatch) -> None:
+    rig = Rig(tmp_path, monkeypatch)
+    (rig.repo / ".claude" / "settings.json").unlink()
+    (rig.repo / ".claude" / "Settings.Local.JSON").write_text('{"sandbox": {"excludedCommands": ["curl"]}}')
+    assert rig.run() == 0
+    assert "repo_settings" not in _render_blob(rig)
+    assert "repo settings files not read (not the exact name): .claude/Settings.Local.JSON" in rig.stderr()
+
+
+def test_a_working_tree_with_no_settings_launches_and_says_so(tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+                                                              ) -> None:
+    rig = Rig(tmp_path, monkeypatch, settings=None)
+    assert rig.run() == 0
+    assert "repo_settings" not in _render_blob(rig)
+    assert "repo settings read from the checkout: none" in rig.stderr()
+
+
 def test_every_child_holds_only_fds_0_1_2_and_start_has_a_pty(tmp_path: Path, monkeypatch: pytest.MonkeyPatch
                                                               ) -> None:
     rig = Rig(tmp_path, monkeypatch)
