@@ -341,7 +341,7 @@ STORE_DIRS = {
     "export/operator": ("R", "levain-export", 0o750),
     "export/dispatch": ("R", "levain-dispatch-export", 0o750),
     "queue/requests": ("_levain_qbroker", "levain-queue", 0o2750),
-    "queue/answers": ("OP", "levain-queue", 0o2770),
+    "queue/answers": ("OP", "_levain_qbroker", 0o2750),
     "contracts": ("_levain_dispatch", "levain-queue", 0o2750),
     "policy": ("R", "R", 0o755),
     # 3c-6 H6-4: setgid, so the sink CONTROL creates takes levain-lineage (CONTRACT §2.1 row)
