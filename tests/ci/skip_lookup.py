@@ -24,8 +24,8 @@ MAIN = "main"
 VERIFYING_EVENTS = ("push", "workflow_dispatch")
 # A run's head_branch carries the bare ref name for a branch AND for a tag (a v1.0 tag run says "v1.0"), so a tag
 # cannot be told from a branch by that field. Only a ref under these prefixes counts as the landing verdict (the land
-# waiter's candidate, a seat's own branch); a tag's run, main's own run and any other branch's run never do.
-LANDING_REFS = ("land/", "seat/")
+# waiter's candidate; a seat branch's dispatch runs one Python, so it is no verdict for main); a tag's run, main's own run and any other branch's run never do.
+LANDING_REFS = ("land/",)
 PAGE = 100
 
 
