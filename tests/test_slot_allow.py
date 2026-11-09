@@ -178,6 +178,71 @@ def test_end_files_rows_from_the_retained_file_and_names_the_dropped(qdir):
     assert not (qdir / SA.FILE_NAME).exists()          # filing writes no rule
 
 
+def _ending_supervisor(qdir, helper):
+    from levain.slot import Refused  # noqa: F401 - imported for the callers' helpers
+
+    seams = sup.Seams(host="linux", helper=("x",), client_factory=lambda p: None, control_socket=Path("/x"),
+                      store=Path("/x"), base_map=Path("/x"), allow_dir=qdir)
+    said = []
+    s = sup.Supervisor.__new__(sup.Supervisor)
+    s.s, s.say, s.helper = seams, said.append, helper
+    return s, said
+
+
+def test_end_reads_the_file_through_root_s_read_allow_and_files_rows(qdir):
+    import base64
+
+    calls = []
+
+    def helper(*args, **kw):
+        calls.append((args, kw.get("stdin", b"")))
+        return {"present": True, "b64": base64.b64encode(local("WebSearch", "Read(./x)")).decode()}
+
+    s, said = _ending_supervisor(qdir, helper)
+    s._file_allow_rows("S9")
+    assert calls == [(("read-allow", "S9"), None)]
+    assert len(QuestionStore(qdir).open_questions()) == 1
+    assert any("on your band" in m for m in said) and not (qdir / SA.FILE_NAME).exists()
+
+
+def test_no_file_filed_nothing_and_a_root_tree_without_the_verb_is_said_once(qdir):
+    from levain.slot import Refused
+
+    s, said = _ending_supervisor(qdir, lambda *a, **k: {"present": False})
+    s._file_allow_rows("S9")
+    assert said == [] and QuestionStore(qdir).open_questions() == []
+
+    def old(*a, **k):
+        raise Refused("unknown-verb", "read-allow")
+
+    s, said = _ending_supervisor(qdir, old)
+    s._file_allow_rows("S1")
+    s._file_allow_rows("S2")
+    assert said == ["slot allow rules not read: the root tree predates read-allow; `levain upgrade` adds it"]
+
+    def unbuilt(*a, **k):
+        raise Refused("verb-unbuilt:read-allow", "read-allow")
+
+    s, said = _ending_supervisor(qdir, unbuilt)
+    s._file_allow_rows("S1")
+    assert len(said) == 1 and "predates read-allow" in said[0]
+
+
+def test_a_refused_or_malformed_read_is_said_and_files_nothing(qdir):
+    from levain.slot import Refused
+
+    def refuse(*a, **k):
+        raise Refused("allow-unreadable", "settings.local.json has 2 links")
+
+    s, said = _ending_supervisor(qdir, refuse)
+    s._file_allow_rows("S9")
+    assert "allow-unreadable" in said[0] and QuestionStore(qdir).open_questions() == []
+    for bad in ({"present": True}, {"present": True, "b64": "!!not base64"}, {"present": True, "b64": 5}):
+        s, said = _ending_supervisor(qdir, lambda *a, _b=bad, **k: _b)
+        s._file_allow_rows("S9")
+        assert "not read" in said[0] and QuestionStore(qdir).open_questions() == []
+
+
 def test_revoke_needs_confirm_and_undo_restores(qdir):
     allow = qdir / SA.FILE_NAME
     SA.append(allow, "WebSearch", "S1")
