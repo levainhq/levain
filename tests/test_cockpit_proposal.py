@@ -418,13 +418,17 @@ def test_f7_the_cards_follow_the_live_requests_and_precede_the_resolved(tmp_path
             {"until": TILE}, {"eval": OPEN_DECISIONS},
             {"until": f"{_CARDS}.length === 1"},
             {"until": "document.querySelector('#levain-modal [data-band-slot][data-band-read=\"absent\"]')"},   # the band read has landed and been drawn
+            # the envelopes slot always draws its heading once its read answers, so wait for that fill: reading the
+            # headings before it lands made this list depend on which async read finished first
+            {"until": "document.querySelector('#levain-modal .envelope-slot[data-filled=\"1\"]')"},
             {"eval": heads},
             {"eval": "/could not be recorded/i.test(document.getElementById('levain-modal').innerText)"},
         ])
     # this scenario has a live request and no questions.db yet (np-cfffc0e1 a: an absent store draws nothing), so the band
-    # draws no heading and no "could not be recorded" line; the three cards keep their order. The other half, a store that
-    # exists but cannot record a view still drawing its line, is pinned in test_band_absent_store.
-    assert out["values"][-2] == ["agents waiting on you", "standing rule proposals", "resolved"]
+    # draws no heading and no "could not be recorded" line; the cards keep their order, with the envelopes section between
+    # the proposals and the resolved rows. The other half, a store that exists but cannot record a view still drawing its
+    # line, is pinned in test_band_absent_store.
+    assert out["values"][-2] == ["agents waiting on you", "standing rule proposals", "envelopes", "resolved"]
     assert out["values"][-1] is False
 
 

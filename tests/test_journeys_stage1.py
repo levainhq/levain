@@ -254,7 +254,7 @@ def test_j3_a_push_is_tapped_and_the_app_lands_on_the_pending_card(tmp_path: Pat
         assert decl["web_push"] == 8030 and decl["notification"]["navigate"] == "https://box.example" + payload["url"], decl
         assert decl["url"] == payload["url"], decl                           # the legacy members stay beside it
         via = _drive(tmp_path, f"http://localhost:{port}{decl['notification']['navigate'].removeprefix('https://box.example')}#write_token={PUSH_T}", [
-            PHONE, {"until": "document.querySelector('#levain-modal .needs-question') && 1", "ms": 30000},
+            PHONE, {"until": "document.querySelector('#levain-modal .needs-question .needs-q-title') && 1", "ms": 30000},   # the card shell draws first, its title once the body read lands
             {"eval": "document.querySelector('#levain-modal .needs-q-title').textContent"}])
         out = _phone_tap(tmp_path, f"http://localhost:{port}/#write_token={PUSH_T}", payload)
         quiet = _phone_tap(tmp_path, f"http://localhost:{port}/#write_token={PUSH_T}", payload, tap=False)
@@ -292,7 +292,7 @@ def _phone_tap(tmp_path: Path, url: str, payload: dict, *, tap: bool = True) -> 
             {"until": "navigator.serviceWorker.controller && 1", "ms": 20000},   # the page is under the worker, as the installed app is
             {"eval": "document.querySelector('#levain-modal') ? 'modal' : 'home'"},
             {"sw": worker, "ms": 40000},                                      # the real push handler, then the real notificationclick handler
-            *([{"until": "document.querySelector('#levain-modal .needs-question') && 1", "ms": 30000},
+            *([{"until": "document.querySelector('#levain-modal .needs-question .needs-q-title') && 1", "ms": 30000},
                {"eval": "document.querySelector('#levain-modal .needs-q-title').textContent"}] if tap else
               [{"eval": "new Promise(r => { const t0 = Date.now(); const id = setInterval(() => { const hit = !!document.querySelector('#levain-modal .needs-question');"
                         " if (hit || Date.now() - t0 > 3000) { clearInterval(id); r(hit ? 'landed' : 'still home'); } }, 50); })"}]),
