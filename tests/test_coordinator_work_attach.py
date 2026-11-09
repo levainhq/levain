@@ -249,6 +249,21 @@ def test_f4_a_seat_is_bound_to_the_session_of_its_first_attach(board, coord):
     assert _refusals(board) == dict(got.refused)
 
 
+def test_f4_the_session_binding_holds_only_while_the_workers_attach_is_open(board, coord):
+    store, token, _ = coord
+    svc, stoken = _svc(board, store, token)
+    live = frozenset({"sess-1", "sess-2"})
+    _report(board, "r-att1", worker="seat-w", harness_session_id="sess-1")
+    _report(board, "r-forged", worker="seat-w", harness_session_id="sess-2", event="progress")   # attach open: refused
+    got = work_attach.apply_reports(svc, stoken, live_sessions=live)
+    assert got.applied == ["r-att1"] and dict(got.refused) == {"r-forged": "worker-mismatch"}
+    _report(board, "r-end", worker="seat-w", harness_session_id="sess-1", event="ended")
+    _report(board, "r-att2", worker="seat-w", harness_session_id="sess-2")                      # ended: a new session rebinds
+    _report(board, "r-prog2", worker="seat-w", harness_session_id="sess-2", event="progress")
+    got = work_attach.apply_reports(svc, stoken, live_sessions=live)
+    assert got.applied == ["r-end", "r-att2", "r-prog2"] and got.refused == []
+
+
 def test_l1_service_apply_needs_the_services_own_claim(board, coord):
     store, token, launch_id = coord
     _report(board, "r-1", worker=launch_id, launch_id=launch_id)

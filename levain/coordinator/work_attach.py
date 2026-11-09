@@ -36,8 +36,8 @@ Known edges (ruled, one line each):
 
 * A ``landed`` sha is what the seat reported, checked only for its shape; landing truth is the land waiter's (L2 F5).
 * A seat-chosen ``--report-id`` is the seat's own; one that repeats another seat's id is queued once (L2 F17).
-* A worker name is bound to the session of its first attach for good: a rotated seat reusing the name reports under a
-  new one.
+* A worker name is bound to the session of its open attach: once that attach has ended, an attach from a new session
+  rebinds the name.
 * No coordinator verb applies the board's queue: while a coordinator or the operator holds the board lease the service
   skips its pass and the reports wait for the lease to end (the coordinator role of :func:`apply_reports` is there for a
   holder to call; no per-wake hook of the coordinator calls it).
@@ -384,7 +384,9 @@ def _evidence(conn: sqlite3.Connection, now: str, r: Mapping[str, Any], live: Co
     if sid is None:
         raise _Refused("worker-not-a-launch", "the report names no launch of this store and no session")
     bound = conn.execute("SELECT harness_session_id FROM worker_attach WHERE worker = ? AND kind = 'attach' AND "
-                         "harness_session_id IS NOT NULL ORDER BY seq LIMIT 1", (r["worker"],)).fetchone()
+                         "harness_session_id IS NOT NULL AND NOT EXISTS (SELECT 1 FROM worker_attach e WHERE "
+                         "e.attach_id = worker_attach.attach_id AND e.kind = 'ended') ORDER BY seq LIMIT 1",
+                         (r["worker"],)).fetchone()
     if bound is not None and bound[0] != sid:
         raise _Refused("worker-mismatch", f"{r['worker']} attached from another session; its reports come from that one")
     other = conn.execute("SELECT worker FROM worker_attach WHERE harness_session_id = ? AND kind = 'attach' AND "
