@@ -353,6 +353,11 @@ def answered_descend_kind(spore_type: Any) -> str:
     return {"task": "done", "question": "answered", "thought": "explored"}.get(str(spore_type), "composted")
 
 
+def dropped_descend_kind(spore_type: Any) -> str:
+    """The descend kind that says an intention was dropped, by the spore's type."""
+    return {"task": "dropped", "question": "mooted", "thought": "dropped"}.get(str(spore_type), "composted")
+
+
 def open_question_ids(questions: Any) -> frozenset[str]:
     """The ids of the open questions in ``questions`` (a ``QuestionStore``); a store that cannot be read has none."""
     try:
