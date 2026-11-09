@@ -90,8 +90,9 @@ RENDER_FORMAT = "levain-session-render/1"
 RENDER_KEYS = frozenset({"format", "vendor", "routes", "model", "git_identity", "hooks", "mcp",
                          "allow_own_loopback", "repo_label", "verifier_steps", "driver", "repo_settings"})
 #: The top-level keys of a repo's settings that travel in ``repo_settings`` (frozen into the root-owned layer at render),
-#: and the only permission lists among them. No ``env`` key: a repo's env never reaches the rendered layer.
-REPO_FROZEN_KEYS = ("hooks", "permissions", "enabledPlugins", "extraKnownMarketplaces")
+#: and the only permission lists among them. No ``env`` key: a repo's env never reaches the rendered layer; no plugin
+#: key: a repo's plugins are dropped at the freeze.
+REPO_FROZEN_KEYS = ("hooks", "permissions")
 REPO_PERMISSION_LISTS = ("allow", "deny", "ask")
 #: DECISION: the keys every render needs; the rest are optional by their §5.3 rule.
 RENDER_REQUIRED = frozenset({"format", "vendor", "routes"})
@@ -426,8 +427,8 @@ def _prepare_input(obj: dict) -> PrepareInput:
 
 def _repo_settings(value: object) -> dict:
     """The frozen repo layer: an object of :data:`REPO_FROZEN_KEYS` only, each of the shape render merges. Anything
-    else (an ``env``, a ``model``, a permission key that is not a list) is refused by name, so the helper takes
-    nothing from the operator-side process that it would not merge."""
+    else (an ``env``, a ``model``, a plugin key, a permission key that is not a list) is refused by name, so the helper
+    takes nothing from the operator-side process that it would not merge."""
     if type(value) is not dict:
         raise Refused("wrong-type", "repo_settings is an object")
     _keys(value, frozenset(REPO_FROZEN_KEYS), frozenset(), "repo_settings")
@@ -442,9 +443,6 @@ def _repo_settings(value: object) -> dict:
     for k, v in perms.items():
         if type(v) is not list or any(type(i) is not str for i in v):
             raise Refused("wrong-type", f"repo_settings.permissions.{k}: a list of strings")
-    for k in ("enabledPlugins", "extraKnownMarketplaces"):
-        if k in value and type(value[k]) is not dict:
-            raise Refused("wrong-type", f"repo_settings.{k} is an object")
     return value
 
 

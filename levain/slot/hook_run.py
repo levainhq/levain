@@ -1,7 +1,9 @@
-"""levain.slot.hook_run — what a slot's root-owned hook script runs (``levain_gate``, ``levain_queue``).
+"""levain.slot.hook_run — what a slot's root-owned hook scripts run: :func:`run` for the gate and the queue
+(``levain_gate``, ``levain_queue``), :func:`config_guard` for the ConfigChange alarm and :func:`repo_filter` for a repo's
+own hook on a gate event.
 
 The script :mod:`levain.slot.hook_templates` renders into ``<S>/root/hooks/<name>`` puts the import tree on
-``sys.path`` and calls :func:`run`. This module is stdlib only and 3.9-valid (the slot's hook runs under
+``sys.path`` and calls its entry. This module is stdlib only and 3.9-valid (the slot's hook runs under
 ``/usr/bin/python3``), and it holds the ONE decision the operator's own activation hook makes the other way:
 
 **FAIL CLOSED.** The operator's hook (``templates/activation/hooks/consent_claude_code.py``) exits 0 with no output
@@ -25,7 +27,7 @@ from __future__ import annotations
 import io
 import os
 import sys
-from typing import Any, Callable, Mapping, Optional, TextIO
+from typing import Any, BinaryIO, Callable, Mapping, Optional, Sequence, TextIO
 
 REFUSED_EXIT = 2
 
@@ -101,36 +103,16 @@ def _field(event: Any, key: str) -> str:
     return v[:_FIELD_MAX].replace("\n", " ") if isinstance(v, str) else "?"
 
 
-def file_config_alarm(environ: Mapping[str, str], event: Any) -> Optional[str]:
-    """Record one ConfigChange alarm in the gate's own ledger (:func:`levain.consent.ledger.gate_row`, the record every
-    gated call leaves): a denied-by-gate row for the tool ``ConfigChange:<source>`` whose input (kept as a digest, as every
-    ledger row's is) is the event's ``source`` and ``file_path``, in the consent directory ``environ`` names. Returns the row id; None on any failure, and never
-    raises."""
-    try:
-        from levain.consent.adapters.claude_code import AGENT
-        from levain.consent.ledger import gate_row
-        from levain.consent.queue import queue_dir_for
-
-        session = event.get("session_id") if isinstance(event, dict) else None
-        cwd = event.get("cwd") if isinstance(event, dict) else None
-        return gate_row(AGENT, queue_dir_for(environ), event if isinstance(event, dict) else {},
-                 session if isinstance(session, str) and session else "config-change",
-                 "ConfigChange:" + _field(event, "source")[:40], {"source": _field(event, "source"), "file_path": _field(event, "file_path")},
-                 cwd if isinstance(cwd, str) and cwd else "/", refused="config-change")
-    except BaseException:  # noqa: BLE001 - the alarm is a record; the block does not depend on it
-        return None
-
-
-def config_guard(name: str, *, stdin: Optional[TextIO] = None, stderr: Optional[TextIO] = None,
-                 environ: Optional[Mapping[str, str]] = None,
-                 record: Optional[Callable[[Mapping[str, str], Any], None]] = None) -> int:
-    """The ``ConfigChange`` hook: every settings change in a running slot session is BLOCKED (exit
-    :data:`REFUSED_EXIT`, which stops the change from taking effect) and one alarm line goes to stderr and to the gate
-    ledger. A frozen session reads no settings file live, so a change is either a mistake or a tamper; the payload
-    is never trusted (it may be empty, not JSON, or not an object), and nothing it holds can make this return 0."""
+def config_guard(name: str, *, stdin: Optional[TextIO] = None, stderr: Optional[TextIO] = None) -> int:
+    """The ``ConfigChange`` hook: every settings change Claude Code sees in a running slot session is BLOCKED (exit
+    :data:`REFUSED_EXIT`: the running session does not take it up) and named in one stderr line. It blocks only the
+    running session's reload: the file on disk keeps the change (measured), so an "always allow" Claude Code writes to
+    ``settings.local.json`` is still there for the next launch to read. A frozen session reads no settings file live,
+    so the block costs nothing but the alarm. Nothing is filed: from a slot the consent directory resolves under the
+    slot's own home (measured), where no operator reader looks. The payload is never trusted (it may be empty, not
+    JSON, or not an object), and nothing it holds can make this return 0."""
     import json
 
-    err: Any = None
     try:
         err = stderr if stderr is not None else sys.stderr
         raw = (stdin if stdin is not None else sys.stdin).read(CONFIG_PAYLOAD_MAX)
@@ -141,10 +123,121 @@ def config_guard(name: str, *, stdin: Optional[TextIO] = None, stderr: Optional[
         err.write("levain hook %s: blocked a settings change (source=%s file_path=%s)\n"
                   % (name, _field(event, "source"), _field(event, "file_path")))
         err.flush()
-        (record or file_config_alarm)(os.environ if environ is None else environ, event)
     except BaseException:  # noqa: BLE001 - whatever failed, the change stays blocked
         pass
     return REFUSED_EXIT
 
 
-__all__ = ["ADAPTER_MODULE", "REFUSED_EXIT", "config_guard", "file_config_alarm", "refuse", "run"]
+# --- the repo hook filter (row 161, L2 HIGH 1+2) ----------------------------------------------------------------------
+
+#: The Claude Code events on which a repo's own hook is carried only through :func:`repo_filter`: the events a slot's
+#: gate and queue answer, where a repo hook could otherwise answer allow, ask or defer, or rewrite the tool input after
+#: the gate decided on the original (``updatedInput``), or add a permission rule (``updatedPermissions``).
+REPO_FILTERED_EVENTS = ("PreToolUse", "PermissionRequest")
+#: the stdin the filter takes from Claude Code and hands to the repo command; a larger payload is no decision
+REPO_PAYLOAD_MAX = 8 * 1024 * 1024
+#: the repo command's stdout read for a decision, and its stderr kept for a deny's reason
+REPO_OUTPUT_MAX = 1024 * 1024
+REPO_REASON_MAX = 2000
+#: the longest repo command timeout the filter accepts
+REPO_TIMEOUT_MAX = 600
+#: a deny whose reason is absent or not a string
+REPO_DENY_DEFAULT = "denied by a hook in this repository's settings"
+#: the shell the repo command string runs under
+REPO_SHELL = "/bin/sh"
+
+
+def _repo_deny_reason(event: str, code: int, out: bytes, err: bytes) -> Optional[str]:
+    """The reason when the repo command's result is a deny, else None. A deny is exit 2 (its stderr is the reason), or
+    on exit 0 a JSON object that says deny: ``hookSpecificOutput.permissionDecision == "deny"`` (PreToolUse),
+    ``hookSpecificOutput.decision.behavior == "deny"`` (PermissionRequest), or ``decision == "block"`` (either).
+    Everything else, an allow, ask or defer and any ``updatedInput`` / ``updatedPermissions`` included, is None."""
+    import json
+
+    if code == REFUSED_EXIT:
+        return err.decode("utf-8", "replace").strip()
+    if code != 0:
+        return None         # Claude Code reads no JSON from a hook that exits anything but 0 or 2
+    try:
+        doc = json.loads(out.decode("utf-8"))
+    except (UnicodeDecodeError, ValueError, RecursionError):
+        return None
+    if not isinstance(doc, dict):
+        return None
+    hso = doc.get("hookSpecificOutput")
+    hso = hso if isinstance(hso, dict) else {}
+    if event == "PreToolUse" and hso.get("permissionDecision") == "deny":
+        why = hso.get("permissionDecisionReason")
+    elif event == "PermissionRequest" and isinstance(hso.get("decision"), dict) \
+            and hso["decision"].get("behavior") == "deny":
+        why = hso["decision"].get("message")
+    elif doc.get("decision") == "block":
+        why = doc.get("reason")
+    else:
+        return None
+    return why if isinstance(why, str) else ""
+
+
+def repo_filter(name: str, argv: Sequence[str], *, stdin: Optional[BinaryIO] = None,
+                stdout: Optional[TextIO] = None, stderr: Optional[TextIO] = None,
+                environ: Optional[Mapping[str, str]] = None) -> int:
+    """Run one repo hook command on a gate event and pass on ONLY a deny. ``argv`` is what render wires:
+    ``[event, timeout, command]``. The command runs under :data:`REPO_SHELL` with Claude Code's payload on its stdin,
+    this process's environment and working directory, in its own process group, killed at ``timeout`` seconds. A deny
+    (:func:`_repo_deny_reason`) is exit :data:`REFUSED_EXIT` with the reason alone on stderr: a deny on PreToolUse
+    (measured) and, as Claude Code documents exit 2, on PermissionRequest (not run). Any other result, a kill, a
+    timeout, a payload past :data:`REPO_PAYLOAD_MAX` or a
+    command that cannot start included, is exit 0 with nothing written: no decision, so the gate and the session's
+    mode decide. Nothing the repo command prints reaches Claude Code but a deny's reason. An ``argv`` render never
+    makes is a named refusal (exit 2), so a broken wiring denies rather than skips the repo's own check."""
+    import signal
+    import subprocess
+    import tempfile
+
+    err: Any = stderr if stderr is not None else sys.stderr
+    if len(argv) != 3 or argv[0] not in REPO_FILTERED_EVENTS or not argv[1].isdigit() \
+            or not 1 <= int(argv[1]) <= REPO_TIMEOUT_MAX or not argv[2]:
+        return refuse(name, "repo-filter-argv", "%d argument(s)" % len(argv), err)
+    event, timeout, command = argv[0], int(argv[1]), argv[2]
+    try:
+        payload = (stdin if stdin is not None else sys.stdin.buffer).read(REPO_PAYLOAD_MAX + 1)
+        if len(payload) > REPO_PAYLOAD_MAX:
+            return 0
+        with tempfile.TemporaryFile() as out_f, tempfile.TemporaryFile() as err_f, \
+                tempfile.TemporaryFile() as in_f:
+            in_f.write(payload)
+            in_f.seek(0)
+            # the filter itself runs under render's `env -i` wrapper, so its environment is the one render computed
+            # (the session's rendered env plus the fixed inherited names), and that is what the repo command gets
+            proc = subprocess.Popen([REPO_SHELL, "-c", command], stdin=in_f, stdout=out_f, stderr=err_f,
+                                    env=os.environ if environ is None else environ, start_new_session=True,
+                                    close_fds=True)
+            try:
+                code = proc.wait(timeout=timeout)
+            except subprocess.TimeoutExpired:
+                # still unreaped, so its group id is still its own: the command and every child it started
+                try:
+                    os.killpg(proc.pid, signal.SIGKILL)
+                except OSError:
+                    pass
+                proc.wait()
+                return 0
+            out_f.seek(0)
+            err_f.seek(0)
+            out = out_f.read(REPO_OUTPUT_MAX + 1)
+            why = _repo_deny_reason(event, code, out if len(out) <= REPO_OUTPUT_MAX else b"",
+                                    err_f.read(REPO_OUTPUT_MAX))
+    except Exception:  # noqa: BLE001 - the repo's check could not run: no decision, never an allow
+        return 0
+    if why is None:
+        return 0
+    try:
+        err.write((why[:REPO_REASON_MAX] or REPO_DENY_DEFAULT) + "\n")
+        err.flush()
+    except BaseException:  # noqa: BLE001 - a deny whose reason cannot be written is still a deny
+        pass
+    return REFUSED_EXIT
+
+
+__all__ = ["ADAPTER_MODULE", "REFUSED_EXIT", "REPO_DENY_DEFAULT", "REPO_FILTERED_EVENTS", "REPO_TIMEOUT_MAX",
+           "config_guard", "refuse", "repo_filter", "run"]

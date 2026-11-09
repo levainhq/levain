@@ -49,9 +49,10 @@ from levain.firing.hands import HostOS
 from levain.sandbox_keys import LOOSENING_NONEMPTY as _LOOSENING_NONEMPTY, LOOSENING_TRUE as _LOOSENING_TRUE
 from levain.slot import Refused
 from levain.slot.bwrap import LEVAIN_BWRAP
+from levain.slot.hook_run import REPO_FILTERED_EVENTS, REPO_TIMEOUT_MAX
 from levain.slot.ids import SlotId, loopback_alias
 from levain.slot.layout import RUN, STORE
-from levain.slot.runtime_grammar import (AUTHS, KINDS, REPO_FROZEN_KEYS, REPO_PERMISSION_LISTS, RenderBlob,
+from levain.slot.runtime_grammar import (AUTHS, KINDS, REPO_PERMISSION_LISTS, RenderBlob,
                                          parse_stdin)
 from levain.slot.tickets import RENDERS_AS
 from levain.slot.wall import WallFacts
@@ -337,7 +338,8 @@ def check_facts(blob: RenderBlob, facts: RenderFacts) -> None:
     names = set(blob.hooks)
     have = set(facts.hook_templates)
     if facts.vendor == "claude":
-        have.discard(CONFIG_GUARD)          # the always-on ConfigChange alarm: optional here, supplied by production
+        # wired whatever the blob names, so optional here: the ConfigChange alarm and the repo hook filter
+        have -= {CONFIG_GUARD, REPO_FILTER}
     if have != names:
         raise Refused("hook-template-missing", ",".join(sorted(names ^ have)))
     for name, t in facts.hook_templates.items():
@@ -631,6 +633,17 @@ REPO_ENV_ALLOW: frozenset = frozenset()
 #: session whose templates include it).
 CONFIG_GUARD = "levain_config"
 
+#: The root-owned filter a repo's own hook runs through on a gate event (:data:`REPO_FILTERED_EVENTS`,
+#: :func:`levain.slot.hook_run.repo_filter`): Claude Code is given the filter's command with the repo command as its
+#: argument, never the repo command itself, so nothing the repo command prints reaches Claude Code but a deny.
+REPO_FILTER = "levain_repo_filter"
+#: a filtered repo command that names no usable ``timeout`` gets this many seconds; a larger one is cut to the max
+REPO_HOOK_TIMEOUT_DEFAULT = 600
+REPO_HOOK_TIMEOUT_MAX = REPO_TIMEOUT_MAX
+#: the filter's own Claude Code ``timeout`` outlives the repo command's by this much, so a repo command that runs to
+#: its timeout is answered by the filter; only a filter that hangs past both meets ``onFailure: block``
+REPO_FILTER_MARGIN = 30
+
 #: The names a macOS hook command takes from Claude Code's own environment, by fixed name and never by pattern: the
 #: queue cap (minted at exec and never rendered, so it cannot be a render-time value) and the three variables Claude
 #: Code sets for its hooks. Each is absent from the hook's environment when absent from Claude Code's.
@@ -648,17 +661,39 @@ class Frozen:
     dropped_other: tuple
 
 
+def _filtered_groups(ev: str, groups: list, dropped: set) -> list:
+    """A gate event's repo groups reduced to what :func:`levain.slot.hook_run.repo_filter` can run: handlers of
+    ``type`` ``command`` with a non-empty string ``command``. Every other handler is dropped and named
+    ``hooks.<event>:<type>``; a group left with none is dropped whole."""
+    out = []
+    for g in groups:
+        handlers = g.get("hooks")
+        if not isinstance(handlers, list):
+            raise Refused("repo-settings-malformed", f"hooks.{ev}: a group's hooks is not a list")
+        keep = []
+        for h in handlers:
+            if isinstance(h, Mapping) and h.get("type") == "command" and isinstance(h.get("command"), str) \
+                    and h["command"]:
+                keep.append(dict(h))
+            else:
+                t = h.get("type") if isinstance(h, Mapping) else None
+                dropped.add(f"hooks.{ev}:{t[:40] if isinstance(t, str) else '?'}")
+        if keep:
+            out.append({**g, "hooks": keep})
+    return out
+
+
 def freeze_repo_settings(docs: Mapping[str, Any]) -> Frozen:
-    """The repo's committed settings layers (``docs``, as :func:`levain.slot.supervisor.repo_layer_docs` reads them:
-    ``.claude/settings.json`` then ``.claude/settings.local.json``, either optional) reduced to what the root-owned
-    layer carries: ``hooks`` (per event, the project file's groups then the local file's), the three ``permissions``
-    lists, and ``enabledPlugins`` / ``extraKnownMarketplaces`` (the local file wins a key). ``env`` goes through
-    :data:`REPO_ENV_ALLOW`. Any other key, and any other ``permissions`` key (``defaultMode``,
+    """The repo's settings layers (``docs``: ``.claude/settings.json`` then ``.claude/settings.local.json``, either
+    optional, as the supervisor reads them) reduced to what the root-owned layer carries: ``hooks`` (per event, the
+    project file's groups then the local file's; on a gate event only what :func:`_filtered_groups` keeps, since render
+    wires those through the filter) and the three ``permissions`` lists. ``env`` goes through :data:`REPO_ENV_ALLOW`.
+    Any other key (the plugin keys ``enabledPlugins`` / ``extraKnownMarketplaces`` among them: a plugin brings hooks,
+    MCP servers and agents from a source the freeze cannot pin) and any other ``permissions`` key (``defaultMode``,
     ``additionalDirectories``: in the flag layer they would take effect where in a project layer Claude Code ignores
-    them), is dropped and named. A value of the wrong shape is refused ``repo-settings-malformed``."""
+    them) is dropped and named. A value of the wrong shape is refused ``repo-settings-malformed``."""
     hooks: dict = {}
     perms: dict = {name: [] for name in REPO_PERMISSION_LISTS}
-    plug: dict = {k: {} for k in REPO_FROZEN_KEYS if k not in ("hooks", "permissions")}
     env_kept: dict = {}
     dropped_env: set = set()
     dropped_other: set = set()
@@ -679,7 +714,11 @@ def freeze_repo_settings(docs: Mapping[str, Any]) -> Frozen:
                     groups = v[ev]
                     if not isinstance(groups, list) or any(not isinstance(g, Mapping) for g in groups):
                         raise bad(path, f"hooks.{ev}")
-                    hooks.setdefault(ev, []).extend(dict(g) for g in groups)
+                    groups = [dict(g) for g in groups]
+                    if ev in REPO_FILTERED_EVENTS:
+                        groups = _filtered_groups(ev, groups, dropped_other)
+                    if groups:
+                        hooks.setdefault(ev, []).extend(groups)
             elif key == "permissions":
                 if not isinstance(v, Mapping):
                     raise bad(path, "permissions")
@@ -691,10 +730,6 @@ def freeze_repo_settings(docs: Mapping[str, Any]) -> Frozen:
                         perms[pk].extend(i for i in items if i not in perms[pk])
                     else:
                         dropped_other.add(f"permissions.{pk}")
-            elif key in plug:
-                if not isinstance(v, Mapping):
-                    raise bad(path, key)
-                plug[key].update(v)
             elif key == "env":
                 if not isinstance(v, Mapping):
                     raise bad(path, "env")
@@ -711,7 +746,6 @@ def freeze_repo_settings(docs: Mapping[str, Any]) -> Frozen:
     kept_perms = {k: v for k, v in perms.items() if v}
     if kept_perms:
         out["permissions"] = kept_perms
-    out.update({k: v for k, v in plug.items() if v})
     if env_kept:
         out["env"] = env_kept
     return Frozen(out, tuple(sorted(dropped_env)), tuple(sorted(dropped_other)))
@@ -723,14 +757,13 @@ def _hook_env(blob: RenderBlob, facts: RenderFacts) -> dict:
 
 
 def hook_command(blob: RenderBlob, facts: RenderFacts, name: str) -> str:
-    """The command Claude Code runs for the root-owned hook ``name``. Linux: the script's absolute path. macOS: the
-    script under ``/usr/bin/env -i`` with every variable of the session's rendered env as a fixed ``NAME=value``
-    argument, plus the :data:`HOOK_INHERIT` names by fixed name, so the hook's interpreter (``/usr/bin/python3`` is
-    the xcode-select shim, which honours ``DEVELOPER_DIR``) starts from an environment Levain computed, not one
-    anything else in the session could add a name to."""
+    """The command Claude Code runs for the root-owned hook ``name``, on both hosts: the script under
+    ``/usr/bin/env -i`` with every variable of the session's rendered env as a fixed ``NAME=value`` argument, plus the
+    :data:`HOOK_INHERIT` names by fixed name, so the hook's interpreter starts from an environment Levain computed,
+    not one anything else in the session could add a name to (a settings ``env``, a hook writing Claude Code's
+    ``CLAUDE_ENV_FILE``, a loader variable such as ``LD_PRELOAD`` or, on macOS, ``DEVELOPER_DIR``, which the
+    ``/usr/bin/python3`` xcode-select shim honours). The script's own interpreter line is unchanged."""
     path = f"{facts.S}/root/hooks/{name}"
-    if facts.host != "darwin":
-        return path
     parts = ["/usr/bin/env", "-i"]
     parts += [shlex.quote(f"{k}={v}") for k, v in sorted(_hook_env(blob, facts).items())]
     parts += ["${%s:+%s=\"$%s\"}" % (n, n, n) for n in HOOK_INHERIT]
@@ -793,31 +826,64 @@ def render_cc_settings(blob: RenderBlob, facts: RenderFacts) -> dict:
         out["hooks"] = events
     t = facts.hook_templates.get(CONFIG_GUARD) if facts.vendor == "claude" else None
     if t is not None:
-        # The alarm: every settings change in a running session is blocked and recorded (the watcher fires for the
-        # files `--setting-sources ""` leaves unread, too). Wired after the gate hooks, onFailure block like them.
+        # The alarm (the watcher fires for the files `--setting-sources ""` leaves unread, too). It is the first entry
+        # on its own event; a repo ConfigChange hook is appended after it, and a block (exit 2) from this one stands
+        # whatever the repo's answers. onFailure block, as every slot hook.
         handler = {"type": "command", "command": hook_command(blob, facts, CONFIG_GUARD), "onFailure": "block"}
         if t.timeout is not None:
             handler["timeout"] = t.timeout
         out.setdefault("hooks", {}).setdefault(t.event, []).append({"hooks": [handler]})
     if blob.repo_settings:
-        _merge_frozen(out, blob.repo_settings)
+        _merge_frozen(out, blob, facts)
     return out
 
 
-def _merge_frozen(out: dict, repo: Mapping[str, Any]) -> None:
-    """Merge the frozen repo layer into ``out`` AFTER Levain's own entries, which are never displaced: a repo hook
-    group is appended to its event's list (a hook that denies beats one that allows, measured, so a repo entry on a
-    gate's own event cannot open it), a repo permission item is appended to Levain's list, and a plugin key is the
-    repo's unless Levain set one. Levain's scalar pins (``disableBypassPermissionsMode``, ``defaultMode``,
-    ``disableAllHooks``) are not in the frozen layer, so nothing here can reach them."""
+def _repo_timeout(h: Mapping[str, Any]) -> int:
+    t = h.get("timeout")
+    if type(t) is not int or t < 1:
+        return REPO_HOOK_TIMEOUT_DEFAULT
+    return min(t, REPO_HOOK_TIMEOUT_MAX)
+
+
+def _filtered(blob: RenderBlob, facts: RenderFacts, ev: str, group: Mapping[str, Any]) -> dict | None:
+    """One repo group on a gate event as Claude Code gets it: each ``command`` handler replaced by the filter's
+    command (:data:`REPO_FILTER`) with the event, the repo command's bounded timeout and the repo command itself as
+    arguments, and no other key of the handler; the group's string ``matcher`` kept. None when nothing is left."""
+    handlers = []
+    for h in group.get("hooks") or ():
+        if not (isinstance(h, Mapping) and h.get("type") == "command" and isinstance(h.get("command"), str)
+                and h["command"]):
+            continue
+        t = _repo_timeout(h)
+        handlers.append({"type": "command", "onFailure": "block", "timeout": t + REPO_FILTER_MARGIN,
+                         "command": f"{hook_command(blob, facts, REPO_FILTER)} {ev} {t} {shlex.quote(h['command'])}"})
+    if not handlers:
+        return None
+    entry: dict[str, Any] = {"hooks": handlers}
+    if isinstance(group.get("matcher"), str):
+        entry["matcher"] = group["matcher"]
+    return entry
+
+
+def _merge_frozen(out: dict, blob: RenderBlob, facts: RenderFacts) -> None:
+    """Merge the frozen repo layer (``blob.repo_settings``) into ``out`` AFTER Levain's own entries, which are never
+    displaced. A repo hook group is appended to its event's list; on a gate event (:data:`REPO_FILTERED_EVENTS`) it
+    goes in only through the filter (:func:`_filtered`), and not at all when this session has no filter template, so
+    a repo hook there can deny but never allow, ask, defer or change the tool input or the permission rules (Claude
+    Code runs one event's hooks in parallel, so a repo hook's ``updatedInput`` would replace the input of a call the
+    gate decided on the original, measured). A repo permission item is appended to Levain's list. Levain's scalar pins
+    (``disableBypassPermissionsMode``, ``defaultMode``, ``disableAllHooks``) are not in the frozen layer, so nothing
+    here can reach them."""
+    repo = blob.repo_settings or {}
+    filtered = facts.vendor == "claude" and REPO_FILTER in facts.hook_templates
     for ev, groups in repo.get("hooks", {}).items():
-        out.setdefault("hooks", {}).setdefault(ev, []).extend(groups)
+        if ev in REPO_FILTERED_EVENTS:
+            groups = [e for e in (_filtered(blob, facts, ev, g) for g in groups) if e is not None] if filtered else []
+        if groups:
+            out.setdefault("hooks", {}).setdefault(ev, []).extend(groups)
     for k, items in repo.get("permissions", {}).items():
         have = out["permissions"].setdefault(k, [])
         have.extend(i for i in items if i not in have)
-    for k in ("enabledPlugins", "extraKnownMarketplaces"):
-        if k in repo:
-            out[k] = {**repo[k], **out.get(k, {})}
 
 
 #: identseed: the vendors whose gated sessions get the parked account block, and the only keys of it ever rendered (a
@@ -1075,8 +1141,8 @@ def render(blob: RenderBlob, facts: RenderFacts) -> Rendered:
         # §2.1: root : root 0644 whatever the class, so the slot can read it and no slot group can change it.
         files.append(RenderedFile(READSET_ATTRIBUTES_PATH, READSET_ATTRIBUTES, 0, 0, 0o644))
     wired = set(blob.hooks)
-    if facts.vendor == "claude" and CONFIG_GUARD in facts.hook_templates:
-        wired.add(CONFIG_GUARD)
+    if facts.vendor == "claude":
+        wired |= {CONFIG_GUARD, REPO_FILTER} & set(facts.hook_templates)
     for name in sorted(wired):
         files.append(RenderedFile(f"root/hooks/{name}", facts.hook_templates[name].body, 0, rgid, xmode))
     # The onboarding pre-seed is the session vendor's only: a Codex session's CLAUDE_CONFIG_DIR stays empty, and a
@@ -1178,13 +1244,14 @@ def repo_loosening_refusals(docs: Mapping[str, Any]) -> list[Refused]:
     layers the flag layer cannot pin; a ``sandbox.network`` or ``sandbox.filesystem`` that is not an object is
     ``repo-settings-malformed``),
     and a ``disableAllHooks`` that is anything but ``false`` (L2 M6; DECISION: a non-boolean is refused too, as
-    its meaning to CC is unmeasured), and an ``env`` naming the queue's vars or a :data:`PROXY_ENV` name (every other ``env`` name is dropped by
-    :func:`freeze_repo_settings`, never rendered). A
+    its meaning to CC is unmeasured), and an ``env`` naming the queue's vars or a :data:`PROXY_ENV` name. A
     document that is not an object is refused ``repo-settings-malformed``.
-    Hooks, permissions and every other key launch (plan §2c 3: the repo's settings are its own).
+    What is not refused here is not therefore carried: :func:`freeze_repo_settings` decides what reaches a slot session
+    (hooks, through the filter on a gate event, and the permission lists) and drops and names the rest, every other
+    ``env`` name included.
 
-    Run by the interactive supervisor on the clone it bundles, before the bundle is made (the slot clones exactly that
-    bundle), and by the dispatch run server on the snapshot it is sent (``levain.slot.workspace``, levain 34), never
+    Run by the interactive supervisor on the settings it freezes (the checkout's, as they are on disk) before any lease
+    or bundle, and by the dispatch run server on the snapshot it is sent (``levain.slot.workspace``, levain 34), never
     the root helper. It reads the key lists from ``levain.sandbox_keys``, not ``levain.host_guard``, so a 3.9 process
     can run it."""
     out: list[Refused] = []
@@ -1344,7 +1411,8 @@ __all__ = [
     "front_limit_fields", "VENDOR_PREFIX", "READSET_ATTRIBUTES", "READSET_ATTRIBUTES_PATH", "READSET_KINDS", "READSET_TEMPLATE",
     "HookTemplate", "RenderFacts", "RenderedFile", "Rendered", "Contains", "DISCOVERY",
     "REPO_DISCOVERY", "wire_name", "gwport_for", "own_loopback", "check_facts", "render_env", "secret_env_names",
-    "is_print_executor", "CONFIG_GUARD", "Frozen", "REPO_ENV_ALLOW", "freeze_repo_settings", "hook_command", "TOKEN_ENV", "ABSENT_ENV", "PASSTHROUGH_ABSENT_ENV", "PASSTHROUGH_TICKET_KEYS", "check_env_absent", "PROXY_ENV", "CODEX_WEB_SEARCH", "CODEX_LAUNCH_ARGS", "egress_hosts",
+    "is_print_executor", "CONFIG_GUARD", "Frozen", "REPO_ENV_ALLOW", "REPO_FILTER", "REPO_FILTER_MARGIN",
+    "REPO_HOOK_TIMEOUT_DEFAULT", "REPO_HOOK_TIMEOUT_MAX", "freeze_repo_settings", "hook_command", "TOKEN_ENV", "ABSENT_ENV", "PASSTHROUGH_ABSENT_ENV", "PASSTHROUGH_TICKET_KEYS", "check_env_absent", "PROXY_ENV", "CODEX_WEB_SEARCH", "CODEX_LAUNCH_ARGS", "egress_hosts",
     "env_text", "render_cc_settings", "render_cc_onboarding", "codex_config", "codex_toml", "gitconfig_text",
     "assert_no_syscall", "check_driver_template", "profile_lines", "read_driver_template", "render_profile",
     "render_importer_profile", "render_verifier_profile",
