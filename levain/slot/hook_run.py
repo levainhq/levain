@@ -135,23 +135,23 @@ def config_guard(name: str, *, stdin: Optional[TextIO] = None, stderr: Optional[
 #: gate and queue answer, where a repo hook could otherwise answer allow, ask or defer, or rewrite the tool input after
 #: the gate decided on the original (``updatedInput``), or add a permission rule (``updatedPermissions``).
 REPO_FILTERED_EVENTS = ("PreToolUse", "PermissionRequest")
-#: the stdin the filter takes from Claude Code and hands to the repo command; a larger payload is a repo hook failure
+#: the stdin the filter takes from Claude Code and hands to the repo command; a larger payload is a filter failure
 REPO_PAYLOAD_MAX = 8 * 1024 * 1024
-#: the most the filter reads of the repo command's stdout, and of its stderr; more on either is a repo hook failure
+#: the most the filter reads of the repo command's stdout, and of its stderr; more on either is a filter failure
 REPO_OUTPUT_MAX = 1024 * 1024
 REPO_REASON_MAX = 2000
 #: the longest repo command timeout the filter accepts
 REPO_TIMEOUT_MAX = 600
 #: a deny whose reason is absent or not a string
 REPO_DENY_DEFAULT = "denied by a hook in this repository's settings"
-#: the fixed start of the deny a repo hook FAILURE becomes (what failed follows it in parentheses)
-REPO_FAILED = "a hook in this repository's settings failed, so the call is denied"
+#: the fixed start of the deny a FILTER failure becomes (what failed follows it in parentheses)
+REPO_FAILED = "Levain's filter around a hook in this repository's settings failed, so the call is denied"
 #: the shell the repo command string runs under
 REPO_SHELL = "/bin/sh"
 #: what the filter waits, after it kills the repo command's group, for the command to be reaped
 REPO_REAP_GRACE = 5.0
 #: the signals by which the filter itself is stopped (Claude Code ending the hook, a hangup, an interrupt): each one
-#: kills the repo command's group and makes the filter's answer a repo hook failure
+#: kills the repo command's group and makes the filter's answer a filter failure
 _STOP_SIGNALS = ("SIGTERM", "SIGHUP", "SIGINT")
 
 
@@ -272,14 +272,18 @@ def repo_filter(name: str, argv: Sequence[str], *, stdin: Optional[BinaryIO] = N
                 environ: Optional[Mapping[str, str]] = None) -> int:
     """Run one repo hook command on a gate event and pass on ONLY a deny. ``argv`` is what render wires:
     ``[event, timeout, command]``. The command runs as :func:`_run_repo` runs it, with Claude Code's payload on its
-    stdin and this process's environment and working directory. Exit :data:`REFUSED_EXIT` with one line on stderr is
-    the answer for a deny (:func:`_repo_deny_reason`, its reason alone) and for a repo hook FAILURE (the fixed
-    :data:`REPO_FAILED` and what failed): an exit status but 0 or 2 (a signal included), a command that cannot start,
-    a timeout, a payload past :data:`REPO_PAYLOAD_MAX`, output past :data:`REPO_OUTPUT_MAX`, the filter stopped by a
-    signal, or the filter breaking. A deny on PreToolUse is measured; on PermissionRequest it is Claude Code's
-    documented exit 2 (not run). Every other answer of the command (an allow, ask or defer, a rewrite, text that is not
-    JSON) is exit 0 with nothing written: no decision, so the gate and the session's mode decide. Nothing the repo
-    command prints reaches Claude Code but a deny's reason. An ``argv`` render never makes is a named refusal."""
+    stdin and this process's environment and working directory.
+
+    The command's own exit status keeps the meaning Claude Code gives it natively: 2 is a deny, 0 is read for a deny
+    (:func:`_repo_deny_reason`), and any other status (a signal included, and the shell's own status for a command it
+    cannot find) is the command's non-blocking error: no decision. A FAILURE OF THE FILTER is a deny with the fixed
+    :data:`REPO_FAILED` and what failed: the shell cannot start, the command runs past its timeout, a payload past
+    :data:`REPO_PAYLOAD_MAX`, output past :data:`REPO_OUTPUT_MAX`, the filter stopped by a signal, or the filter
+    breaking. Either deny is exit :data:`REFUSED_EXIT` with one line on stderr. A deny on PreToolUse is measured; on
+    PermissionRequest it is Claude Code's documented exit 2 (not run). No decision (an allow, ask or defer, a rewrite,
+    text that is not JSON, a non-blocking error) is exit 0 with nothing written, so the gate and the session's mode
+    decide. Nothing the repo command prints reaches Claude Code but a deny's reason. An ``argv`` render never makes is
+    a named refusal."""
     import signal
 
     err: Any = stderr if stderr is not None else sys.stderr
@@ -305,9 +309,8 @@ def repo_filter(name: str, argv: Sequence[str], *, stdin: Optional[BinaryIO] = N
         if len(payload) > REPO_PAYLOAD_MAX:
             raise _RepoFailed("the call's payload is past the filter's bound")
         code, out, errb = _run_repo(command, payload, timeout, environ)
-        if code not in (0, REFUSED_EXIT):
-            raise _RepoFailed("signal %d" % -code if code < 0 else "exit %d" % code)
-        why = _repo_deny_reason(event, code, out, errb)
+        if code in (0, REFUSED_EXIT):      # any other status is the repo command's own non-blocking error
+            why = _repo_deny_reason(event, code, out, errb)
     except _RepoFailed as exc:
         failed = str(exc)
     except _Stopped as exc:
