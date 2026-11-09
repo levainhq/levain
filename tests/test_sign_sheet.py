@@ -56,8 +56,8 @@ def test_the_sheet_is_a_static_shell_whose_one_script_is_the_cockpits_own(sheet)
     status, hdrs, body = _raw(sheet["url"], SHEET)
     assert status == 200 and hdrs["content-type"].startswith("text/html")
     page = body.decode()
-    assert re.findall(r"<script\b[^>]*>", page) == ['<script src="/sw_open.js">', '<script src="/card_format.js">', '<script src="/envelope_form.js">', '<script src="/sign.js">']   # no inline script
-    assert re.search(r"<script src=\"/sw_open.js\">\s*</script>\s*<script src=\"/card_format.js\">\s*</script>\s*<script src=\"/envelope_form.js\">\s*</script>\s*<script src=\"/sign.js\">\s*</script>", page)
+    assert re.findall(r"<script\b[^>]*>", page) == ['<script src="/sw_open.js">', '<script src="/card_format.js">', '<script src="/envelope_form.js">', '<script src="/mic.js">', '<script src="/sign.js">']   # no inline script
+    assert re.search(r"<script src=\"/sw_open.js\">\s*</script>\s*<script src=\"/card_format.js\">\s*</script>\s*<script src=\"/envelope_form.js\">\s*</script>\s*<script src=\"/mic.js\">\s*</script>\s*<script src=\"/sign.js\">\s*</script>", page)
     assert TOK not in page and RID not in page          # no token, no request data: those come from the gated read
     status, hdrs, js = _raw(sheet["url"], "/sign.js")
     assert status == 200 and hdrs["content-type"].startswith("text/javascript") and b"/cockpit/sign/" in js
