@@ -28,6 +28,16 @@ grant whose receipts raise files that row ``pending`` too, never stopping the st
 Known edge: each ANSWER? past the hold opens the receipts once to read the state; the slot's rate bounds it.
 No verb accepts an answer, a grant answer or a row from a hook. Every other op is ``verb-not-allowed``.
 
+THE ALARM VERB (row 166). ``ALARM {cap, kind, reason}`` is how a slot hook leaves a record on the operator's side (the
+ConfigChange guard, :func:`levain.slot.hook_run.config_guard`, after it blocks). The frame holds exactly those keys:
+``kind`` one of :data:`ALARM_KINDS`, ``reason`` a printable string of 1 to :data:`ALARM_REASON_MAX` characters; any
+other shape is ``frame-malformed``. A slot takes from its own bucket (:data:`ALARM_RATE`, :data:`ALARM_BURST`; past it
+``rate-limited``) before the cap resolves. The record names the session CONTROL resolved (and its run's id), never a
+session the hook claims, and is appended to ``requests/alarms.jsonl`` (:meth:`QueueStore.append_alarm`), which
+``levain doctor``'s ``slot alarms`` row reads; the same (session, kind, reason) within :data:`ALARM_DEDUPE_WINDOW` is
+acknowledged and not written again. The answer is a bare ``{"id", "ok": true}``: an ALARM files no request, writes no
+row, receipt or grant, and changes no answer of any other verb.
+
 THE GATE VERB (F10 S2b-2). ``GATE {cap, agent, tool_name, input_digest, tool_use_id?}`` is asked by both adapters'
 slot gate on EVERY PreToolUse, before the call is classified, and answered ``{"gate": "halted", "request_id"}``,
 ``{"gate": "over-limit", "kind"}``, ``{"gate": "limits-failed", "reason"}`` (the limits gate itself failed) or
@@ -139,7 +149,8 @@ from levain.qbroker.signers import SignersSnapshot, SignersSource
 from levain.qbroker.store import ANSWER_ROW_FORMAT, REQUEST_ROW_FORMAT, QueueStore, replace_file, valid_request_id
 from levain.slot import limits_doc
 
-__all__ = ["ANSWER_BURST", "ANSWER_RATE", "CAP_MAX", "GATE_BURST", "GATE_RATE",
+__all__ = ["ALARM_BURST", "ALARM_DEDUPE_WINDOW", "ALARM_FORMAT", "ALARM_KINDS", "ALARM_RATE", "ALARM_REASON_MAX",
+           "ANSWER_BURST", "ANSWER_RATE", "CAP_MAX", "GATE_BURST", "GATE_RATE",
            "KINDS", "PENDING_PER_SESSION", "QUOTA_PER_RUN",
            "RECEIVED_SKEW", "RESOLVE_TTL", "RUN_CALLS_KIND", "RUN_DEADLINE_KIND", "RUN_KEYS", "RUN_OPTIONAL_KEYS",
            "RUN_STATE_FORMAT", "run_state_path", "FenceSource", "FenceUnavailable", "SLOT_CLASS", "Broker", "Resolved",
@@ -225,6 +236,16 @@ LimitsSource = Callable[[str, str], "Mapping[str, float]"]
 FenceSource = Callable[["Resolved"], "str | None"]
 # the counter's directory under requests/ (limits.db and its failure files)
 LIMITS_DIR = "limits"
+# THE ALARM VERB: what a slot hook may report, the longest reason, the per-slot bucket, and how long one
+# (session, kind, reason) is recorded once; a record is ALARM_FORMAT
+ALARM_KINDS = ("config-change",)
+ALARM_REASON_MAX = 400
+ALARM_RATE = 0.2
+ALARM_BURST = 5
+ALARM_DEDUPE_WINDOW = 600.0
+ALARM_DEDUPE_MAX = 256
+ALARM_FORMAT = "levain-queue-alarm/1"
+_ALARM_KEYS = frozenset({"v", "op", "id", "cap", "kind", "reason"})
 # the longest tool_use_id a GATE frame may carry (the counter keys a repeat by it; levain.consent.limits takes the same)
 TOOL_USE_ID_MAX = 256
 # GATE's limits-failed reason when that directory cannot be used (Broker._limits_dir)
@@ -453,6 +474,10 @@ class Broker:
         # counted root (consent_limits.session_root) -> the lock its limited GATEs run under, held across the limits
         # read and the count (Broker._gate)
         self._root_locks: dict[str, threading.Lock] = {}
+        self._alarm_buckets: dict[int, tuple[float, float]] = {}  # slot -> (tokens, at): ALARM's own
+        # (session, kind, reason) -> when it was last recorded; held across the append so a repeat never writes twice
+        self._alarm_lock = threading.Lock()
+        self._alarm_seen: OrderedDict[tuple[str, str, str], float] = OrderedDict()
         started = clock()
         now = utc_stamp(started)
         filed = []
@@ -559,6 +584,8 @@ class Broker:
                 return self._answer(slot, rid, message)
             if op == "GATE":
                 return self._gate(slot, rid, message)
+            if op == "ALARM":
+                return self._alarm(slot, rid, message)
         except Exception:   # noqa: BLE001 - one request's failure is its refusal, never the listener's
             log.exception("qbroker: %s on slot %d failed", op, slot)
             return wire.refusal(rid, "broker-error")
@@ -885,6 +912,45 @@ class Broker:
         if answer_bad:
             return wire.refusal(rid, "answer-refused")
         return wire.answer(rid, pending=True)
+
+    def _alarm(self, slot: int, rid: int, message: Mapping[str, Any]) -> dict[str, Any]:
+        """The ALARM verb (module docstring): one operator-side record, answered with a bare ack."""
+        kind, reason = message.get("kind"), message.get("reason")
+        if set(message) != _ALARM_KEYS or kind not in ALARM_KINDS or not isinstance(reason, str) \
+                or not 0 < len(reason) <= ALARM_REASON_MAX or not reason.isprintable():
+            return wire.refusal(rid, "frame-malformed")
+        if not self._take_alarm_token(slot):
+            return wire.refusal(rid, "rate-limited")
+        who = self._resolve(slot, message.get("cap"))
+        if isinstance(who, str):
+            return wire.refusal(rid, who)
+        key, now = (who.session, kind, reason), self._monotonic()
+        with self._alarm_lock:
+            seen = self._alarm_seen.get(key)
+            if seen is not None and now - seen < ALARM_DEDUPE_WINDOW:
+                return wire.answer(rid)
+            record: dict[str, Any] = {"format": ALARM_FORMAT, "at": utc_stamp(self._clock()), "slot": slot_ref(slot),
+                                      "session": who.session, "kind": kind, "reason": reason}
+            if who.run is not None:
+                record["run_id"] = who.run["run_id"]
+            self._store.append_alarm(record)
+            self._alarm_seen[key] = now
+            self._alarm_seen.move_to_end(key)
+            while len(self._alarm_seen) > ALARM_DEDUPE_MAX:
+                self._alarm_seen.popitem(last=False)
+        log.warning("qbroker: slot %d session %s raised a %s alarm", slot, who.session, kind)
+        return wire.answer(rid)
+
+    def _take_alarm_token(self, slot: int) -> bool:
+        now = self._monotonic()
+        with self._mutex:
+            tokens, at = self._alarm_buckets.get(slot, (float(ALARM_BURST), now))
+            tokens = min(float(ALARM_BURST), tokens + (now - at) * ALARM_RATE)
+            if tokens < 1.0:
+                self._alarm_buckets[slot] = (tokens, now)
+                return False
+            self._alarm_buckets[slot] = (tokens - 1.0, now)
+            return True
 
     def _gate(self, slot: int, rid: int, message: Mapping[str, Any]) -> dict[str, Any]:
         """The GATE verb (module docstring): halted, over-limit or go for the resolved session's next call."""

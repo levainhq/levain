@@ -25,6 +25,8 @@ them) and writes only ``answers/<request_id>.json``:
   hold) is never moved or replaced; one signed by a key no longer in that snapshot is not a valid answer (the broker
   refuses it too), so it is cleared like any other file.
 
+- :func:`alarms`: the records the broker's ALARM verb appended (a slot hook's report, row 166), oldest first.
+
 A receipts log that cannot be read is :class:`OperatorError`.
 
 Stdlib only.
@@ -43,15 +45,16 @@ from levain.cockpit.consent import ConsentError, utc_stamp
 from levain.consent import record
 from levain.contracts import ContractError
 from levain.contracts.canon import canonical_bytes, parse
-from levain.qbroker.broker import (RUN_CALLS_KIND, RUN_DEADLINE_KIND, RUN_STATE_FORMAT, _calls_ok, _deadline_ok,
-                                   answer_row_refusal, run_state_path, stored_request)
+from levain.qbroker.broker import (ALARM_FORMAT, RUN_CALLS_KIND, RUN_DEADLINE_KIND, RUN_STATE_FORMAT, _calls_ok,
+                                   _deadline_ok, answer_row_refusal, run_state_path, stored_request)
 from levain.qbroker.receipts import Receipts, ReceiptsError
 from levain.qbroker.seam import answer_refusal
 from levain.qbroker.signers import SignersSnapshot
-from levain.qbroker.store import (ANSWER_ROW_FORMAT, ROW_MAX, QueueStore, _parsed, _read_untrusted, fsync_dir,
+from levain.qbroker.store import (ALARM_LOG, ANSWER_ROW_FORMAT, ROW_MAX, QueueStore, _parsed, _read_untrusted,
+                                  fsync_dir,
                                   valid_request_id)
 
-__all__ = ["CLAIM_KEYS", "Listed", "OperatorError", "answer_payload", "rows", "run_state", "write_answer"]
+__all__ = ["CLAIM_KEYS", "Listed", "OperatorError", "alarms", "answer_payload", "rows", "run_state", "write_answer"]
 
 # the request fields only the hook vouches for
 CLAIM_KEYS = ("agent", "agent_session_id", "cwd", "display")
@@ -333,3 +336,24 @@ def _clear_squat_os(store: QueueStore, receipts: Receipts, row: Mapping[str, Any
         raise OperatorError(f"request {request_id}'s answer name could not be cleared ({unsynced}): "
                             f"what was moved aside is at {aside}") from None
     return False
+
+
+def alarms(root: Path | str) -> list[dict[str, Any]]:
+    """Every alarm the broker recorded (the ALARM verb, :mod:`levain.qbroker.broker`), oldest first: the rolled log
+    ``alarms.jsonl.1`` then ``alarms.jsonl``, a line that is not an alarm record skipped. Read-only. A queue that cannot
+    be opened, or a log that is there and unreadable (not a regular file, over its bound), is :class:`OperatorError`."""
+    out: list[dict[str, Any]] = []
+    try:
+        store = QueueStore(root, create=False)
+        blobs = [_read_untrusted(store.requests / name) for name in (ALARM_LOG + ".1", ALARM_LOG)]
+    except (ValueError, OSError) as exc:
+        raise OperatorError(f"the slot alarms cannot be read ({exc})") from None
+    for data in blobs:
+        for line in (data or b"").splitlines():
+            try:
+                rec = parse(line)
+            except ContractError:
+                continue
+            if isinstance(rec, dict) and rec.get("format") == ALARM_FORMAT:
+                out.append(rec)
+    return out

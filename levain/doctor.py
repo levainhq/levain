@@ -40,6 +40,7 @@ import sys
 import time
 import tomllib
 from dataclasses import dataclass
+from datetime import timedelta as _timedelta
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Callable, Sequence
 
@@ -179,6 +180,7 @@ def _run_doctor(path: Path, invoke: bool = False, repin_hooks: bool = False) -> 
     core.extend(_check_vendor_copies())
     core.extend(_check_slot_homes())
     core.extend(_check_slot_limits())
+    core.extend(_guarded("slot alarms", _check_slot_alarms))
     core.extend(_check_slot_keys())
     core.extend(_guarded(_BROKERED, lambda: _check_brokered_launcher(install)))
     core.extend(_check_slot_services())
@@ -1208,6 +1210,52 @@ def _check_slot_limits(*, host: str | None = None, store: Path | None = None, ow
                                 "Start the Levain queue broker unit (levain-qbroker on Linux, com.levain.qbroker on macOS).",
                                 warn=True)]
     return [CheckResult(name, True, detail)]
+
+
+#: how far back the ``slot alarms`` row looks: an older alarm stays in the log, not on the row
+SLOT_ALARM_WINDOW = _timedelta(hours=24)
+
+
+def _check_slot_alarms(*, host: str | None = None, store: Path | None = None, now: Any = None) -> list[CheckResult]:
+    """The ``slot alarms`` row (row 166): what slot hooks reported through the queue broker's ALARM verb in the last
+    :data:`SLOT_ALARM_WINDOW`, read from ``L/queue/requests/alarms.jsonl`` with the operator's own reader
+    (:func:`levain.qbroker.operator.alarms`). WARN with the count and the latest when there are any (a slot session
+    tried something its hook blocked, such as changing its own settings); a plain line when there are none. No row
+    before the isolation install. ``now``: a test's seam."""
+    from datetime import datetime, timezone
+
+    from levain.cockpit.consent import parse_stamp
+    from levain.qbroker import operator
+    from levain.slot import layout
+
+    name = "slot alarms"
+    if host is None:
+        host = "darwin" if sys.platform == "darwin" else "linux"
+    store = store if store is not None else layout.STORE.get(host)
+    if store is None or not (store / "queue" / "requests").is_dir():
+        return []
+    log_path = store / "queue" / "requests" / "alarms.jsonl"
+    now = now if now is not None else datetime.now(timezone.utc)
+    try:
+        recent = []
+        for rec in operator.alarms(store / "queue"):
+            try:
+                at = parse_stamp(rec.get("at"))
+            except Exception:  # noqa: BLE001 - a record without a readable time is shown, never dropped
+                at = now
+            if now - at <= SLOT_ALARM_WINDOW:
+                recent.append(rec)
+    except Exception as exc:  # noqa: BLE001 - a row that cannot be built is said, never a crash
+        return [CheckResult(name, True, f"could not be read ({type(exc).__name__}: {exc})",
+                            f"Look at {log_path}.", warn=True)]
+    if not recent:
+        return [CheckResult(name, True, "none in the last 24 hours")]
+    last = recent[-1]
+    detail = (f"{len(recent)} in the last 24 hours; latest {last.get('at')}: {last.get('kind')} from session "
+              f"{last.get('session')} ({last.get('reason')})")
+    return [CheckResult(name, True, detail,
+                        f"A slot session's hook blocked something and reported it. Every record is in {log_path}.",
+                        warn=True)]
 
 
 # --- 3c-9: the brokered-spend rows (route trust, keys, the spend ledger, the invoice ceiling) --------------------
