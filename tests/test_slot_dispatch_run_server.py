@@ -314,6 +314,37 @@ def test_an_end_is_served_while_idle_and_usage_callers_hold_every_general_permit
     env.drain()
 
 
+def test_silent_and_dripping_reserve_connections_do_not_starve_an_end(rig, tmp_path, monkeypatch):
+    """E1: an overflow connection must produce its whole first frame inside one absolute deadline, or it is closed and
+    its reserve permit freed, so idle or byte-dripping peers cannot hold every reserve slot against a real END."""
+    monkeypatch.setattr(D, "END_RESERVE_FIRST_FRAME_S", 0.3)
+    env = Env(rig, tmp_path, max_connections=2, max_holders=1, max_end_reserve=8)
+    fillers = []
+    for _ in range(2):                                              # every general permit is held
+        f = env.connect()
+        f.sendall(C.encode_run_frame({"p": C.PROTOCOL, "op": "USAGE", "id": 1, "session_key": "s-00000000000000ff"}))
+        assert C.read_run_frame(f)["ok"] is True
+        fillers.append(f)
+    silent = [env.connect() for _ in range(7)]                      # seven overflow connections that never speak
+    dripper = env.connect()                                         # the eighth sends a byte at a time, under the deadline each
+    for _ in range(3):                                              # the last drip lands after the deadline: closed on it
+        try:
+            dripper.sendall(b"\x00")
+        except OSError:
+            break
+        time.sleep(0.15)
+    time.sleep(0.2)
+    sock = env.connect()
+    sock.settimeout(10)
+    sock.sendall(C.encode_run_frame({"p": C.PROTOCOL, "op": "END", "id": 2, "session_key": "s-00000000000000ee",
+                                     "deadline_ms": 1000}))
+    ans = C.read_run_frame(sock)
+    assert ans is not None and ans.get("refused") is None and ans["id"] == 2
+    for s_ in [sock, *fillers, dripper, *silent]:
+        s_.close()
+    env.drain()
+
+
 def test_a_proven_end_is_never_evicted_and_never_rerun(rig, tmp_path, monkeypatch):
     """codex MED r1 :397: a proven END answers every repeat, however many other keys were ENDed since."""
     monkeypatch.setattr(D, "_JOBS_KEEP", 4)

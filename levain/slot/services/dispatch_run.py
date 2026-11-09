@@ -141,8 +141,9 @@ MAX_HOLDERS = 48
 #: [judged] connections past the general cap that may each carry ONE END and nothing else: an END is the way a session
 #: stops, so USAGE or idle callers filling the general pool must never leave it unservable
 MAX_END_RESERVE = 8
-#: [judged] how long an overflow connection may take to send its one frame before it is dropped
-END_RESERVE_READ_S = 5.0
+#: [judged] the absolute time an overflow connection has to deliver its whole first frame, counted from its permit
+#: and not per read or per byte: past it the connection is closed and the reserve permit freed
+END_RESERVE_FIRST_FRAME_S = 1.0
 #: [judged] how long a holder's own cleanup waits for its END job before its thread lets go (the job runs on)
 HOLDER_END_WAIT_S = 10.0
 #: [judged] how long a RELEASE refused at the point of use waits for its END job before it answers: under the client's
@@ -568,6 +569,21 @@ class HolderRegistry:
         return all(s._closing for s in self.servers)
 
 
+class _DeadlineSock:
+    """A read-only view of a socket whose every recv is bounded by what is left of ONE absolute deadline, so a peer that
+    drips bytes cannot stretch the time its first frame may take."""
+
+    def __init__(self, sock: socket.socket, deadline: float) -> None:
+        self._sock, self._deadline = sock, deadline
+
+    def recv(self, n: int) -> bytes:
+        left = self._deadline - time.monotonic()
+        if left <= 0:
+            raise socket.timeout("first-frame deadline")
+        self._sock.settimeout(left)
+        return self._sock.recv(n)
+
+
 class RunServer:
     """The protocol and the per-key END jobs; the socket loop is :func:`serve`. ``verify(proof, exposure)`` raises
     :class:`LauncherRefused` (production: :func:`verify_point_of_use` bound to this server's readers);
@@ -632,14 +648,16 @@ class RunServer:
                     return
             except Exception:  # noqa: BLE001 - a peer that cannot be identified is refused
                 return
-            sock.settimeout(END_RESERVE_READ_S if end_only else self._idle)
+            sock.settimeout(self._idle)
+            first_frame_by = time.monotonic() + END_RESERVE_FIRST_FRAME_S if end_only else None
             while True:
                 try:
-                    req = C.read_run_frame(sock)
+                    req = C.read_run_frame(_DeadlineSock(sock, first_frame_by) if first_frame_by else sock)
                 except (C.WireError, OSError):
                     return
                 if req is None:
                     return
+                sock.settimeout(self._idle)          # the reserve deadline bounded the read, not the answer
                 try:
                     rid, op = C.check_run_request(req)
                 except C.WireError as exc:
