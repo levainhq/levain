@@ -58,6 +58,7 @@ def test_every_verb_parses_for_the_operator():
         "confirm-identity": ["confirm-identity", S, "yes"], "adopt-open": ["adopt-open", S],
         "adopt-verify": ["adopt-verify", S, "--bundle-digest", "sha256:" + "0" * 64],
         "discard": ["discard", S], "restore": ["restore", S], "status": ["status", S], "probe": ["probe", S],
+        "read-allow": ["read-allow", S],
     }
     assert set(good) == set(rg.VERBS)
     for verb, a in good.items():
