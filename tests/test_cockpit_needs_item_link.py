@@ -97,9 +97,6 @@ def test_a_consent_card_is_named_by_its_exact_id_only() -> None:
     assert "indexOf" not in body and 'item + "-"' not in body, body
 
 
-# the harness's init step reloads the page once, which would drop the link: open the link after it
-GO_LINK = {"eval": "location.assign('/?view=needs&item=question:2#write_token=T'); 1"}
-
 def _jump_body() -> str:
     from tests._ke_dom import WEB
     js = (WEB / "dashboard_core.js").read_text(encoding="utf-8")
@@ -121,18 +118,25 @@ def test_the_link_keeps_nothing_across_a_reload() -> None:
     assert "levain_needs_item_pending" not in js and "needsPending" not in js and "NEEDS_PENDING" not in js
 
 
-SLOW_DECISIONS = """(() => { const f = window.fetch; window.fetch = async (...a) => {
-  if (String(a[0]).indexOf('/cockpit/panel/decisions.json') === 0) await new Promise((r) => setTimeout(r, 6000));
+# Decisions is held until the test releases it (no fixed delay: a press that lands on a loaded runner after a timer ran out tested nothing).
+HELD_DECISIONS = """(() => { const f = window.fetch; let release; const gate = new Promise((r) => { release = r; }); window.__releaseDecisions = release;
+  window.fetch = async (...a) => {
+  if (String(a[0]).indexOf('/cockpit/panel/decisions.json') === 0) await gate;
   return f.apply(window, a); }; })();"""
+# The harness's init step reloads the page once, which would drop the link, so the link is opened after it. That eval returns before the
+# link's document exists, and a press sent then lands on the old document, or on the new one before the page armed its jump (a press moves
+# the run counter, and the jump takes its own number after); so the test waits for the new document to be loaded.
+MARK_OLD = {"eval": "window.__oldDoc = true; location.assign('/?view=needs&item=question:2#write_token=T'); 1"}
+NEW_DOC = {"until": "document.readyState === 'complete' && window.__oldDoc === undefined && !!window.__releaseDecisions && 1", "ms": 40000}
 
 
 def _slow_decisions(tmp_path: Path, monkeypatch, press: bool) -> dict:
     _two_questions(tmp_path, monkeypatch)
     _root, src, _ids = _install(tmp_path)
-    steps = [{"init": SLOW_DECISIONS}, DESKTOP, GO_LINK]
+    steps = [{"init": HELD_DECISIONS}, DESKTOP, MARK_OLD, NEW_DOC]
     if press:
         steps.append({"tap": "document.querySelector('[data-theme-set=\"dark\"]')", "ms": 40000})
-    steps += [{"until": ROWS, "ms": 40000}, {"eval": "new Promise(r => setTimeout(() => r(1), 9000))"}, {"eval": READ}]
+    steps += [{"eval": "window.__releaseDecisions(); 1"}, {"until": ROWS, "ms": 40000}, {"eval": "new Promise(r => setTimeout(() => r(1), 9000))"}, {"eval": READ}]
     with _serve(src, surface_tokens={"browser": "T"}, install_class="reported") as (url, _httpd):
         out = _drive(tmp_path, f"{url}/#write_token=T", steps)["values"]
     return json.loads(out[-1])
