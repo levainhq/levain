@@ -36,9 +36,10 @@ ROW_MAX = 64 * 1024
 ROW_MODE = 0o640
 _QUEUE_ID = "queue-id"
 # the operator-side record of a slot hook's ALARM: one canonical JSON
-# line per alarm, in the directory only the broker writes; past ALARM_LOG_MAX it rolls to "<name>.1"
+# line per alarm, in the directory only the broker writes; past ALARM_LOG_MAX it rolls to "<name>.1". Large enough
+# that every slot's record budget, at the largest record, survives a roll
 ALARM_LOG = "alarms.jsonl"
-ALARM_LOG_MAX = ROW_MAX
+ALARM_LOG_MAX = 1 << 20
 # levain.autonomic.pending.seal_pending_id's shape: pend-<received_at stamp>-<16 hex>
 _REQUEST_ID = re.compile(r"pend-[0-9A-Za-z:.+-]{1,40}-[0-9a-f]{16}")
 
@@ -47,14 +48,14 @@ def valid_request_id(value: Any) -> bool:
     return isinstance(value, str) and _REQUEST_ID.fullmatch(value) is not None
 
 
-def _read_untrusted(path: Path) -> bytes | None:
-    """The bytes of a regular file of at most :data:`ROW_MAX`, or ``None`` when there is no file; ``ValueError``
-    for anything else at that name (a symlink, a FIFO, an oversize file)."""
-    got = _read_untrusted_stamped(path)
+def _read_untrusted(path: Path, limit: int = ROW_MAX) -> bytes | None:
+    """The bytes of a regular file of at most ``limit`` (default :data:`ROW_MAX`) bytes, or ``None`` when there is no
+    file; ``ValueError`` for anything else at that name (a symlink, a FIFO, an oversize file)."""
+    got = _read_untrusted_stamped(path, limit)
     return None if got is None else got[0]
 
 
-def _read_untrusted_stamped(path: Path) -> tuple[bytes, tuple[int, ...]] | None:
+def _read_untrusted_stamped(path: Path, limit: int = ROW_MAX) -> tuple[bytes, tuple[int, ...]] | None:
     """:func:`_read_untrusted`, with the file's identity (dev, ino, size, mtime, ctime) from the fd it was read on."""
     try:
         fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
@@ -66,12 +67,12 @@ def _read_untrusted_stamped(path: Path) -> tuple[bytes, tuple[int, ...]] | None:
         raise
     try:
         st = os.fstat(fd)
-        if not stat.S_ISREG(st.st_mode) or st.st_size > ROW_MAX:
-            raise ValueError(f"{path.name} is not a regular file of at most {ROW_MAX} bytes")
+        if not stat.S_ISREG(st.st_mode) or st.st_size > limit:
+            raise ValueError(f"{path.name} is not a regular file of at most {limit} bytes")
         with os.fdopen(fd, "rb", closefd=False) as fh:
-            data = fh.read(ROW_MAX + 1)
-        if len(data) > ROW_MAX:
-            raise ValueError(f"{path.name} grew past {ROW_MAX} bytes")
+            data = fh.read(limit + 1)
+        if len(data) > limit:
+            raise ValueError(f"{path.name} grew past {limit} bytes")
         return data, (st.st_dev, st.st_ino, st.st_size, st.st_mtime_ns, st.st_ctime_ns)
     finally:
         os.close(fd)

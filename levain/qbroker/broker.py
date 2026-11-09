@@ -31,12 +31,18 @@ No verb accepts an answer, a grant answer or a row from a hook. Every other op i
 THE ALARM VERB (row 166). ``ALARM {cap, kind, reason}`` is how a slot hook leaves a record on the operator's side (the
 ConfigChange guard, :func:`levain.slot.hook_run.config_guard`, after it blocks). The frame holds exactly those keys:
 ``kind`` one of :data:`ALARM_KINDS`, ``reason`` a printable string of 1 to :data:`ALARM_REASON_MAX` characters; any
-other shape is ``frame-malformed``. A slot takes from its own bucket (:data:`ALARM_RATE`, :data:`ALARM_BURST`; past it
-``rate-limited``) before the cap resolves. The record names the session CONTROL resolved (and its run's id), never a
-session the hook claims, and is appended to ``requests/alarms.jsonl`` (:meth:`QueueStore.append_alarm`), which
-``levain doctor``'s ``slot alarms`` row reads; the same (session, kind, reason) within :data:`ALARM_DEDUPE_WINDOW` is
-acknowledged and not written again. The answer is a bare ``{"id", "ok": true}``: an ALARM files no request, writes no
-row, receipt or grant, and changes no answer of any other verb.
+other shape is ``frame-malformed``. The cap resolves first: a frame whose cap does not resolve is refused and spends
+nothing of the slot's alarm budget (one broker-log line per slot per :data:`ALARM_DEDUPE_WINDOW` says so). The record
+names the session CONTROL resolved (and its run's id), never a session the hook claims, and is appended to
+``requests/alarms.jsonl`` (:meth:`QueueStore.append_alarm`), which ``levain doctor``'s ``slot alarms`` row reads. The
+same (session, kind, reason) within :data:`ALARM_DEDUPE_WINDOW` is acknowledged, not written again, and spends no
+token; any other alarm takes one from the slot's own bucket (:data:`ALARM_RATE`, :data:`ALARM_BURST`; past it
+``rate-limited``). A slot writes at most :data:`ALARM_SLOT_BUDGET` records per :data:`ALARM_BUDGET_WINDOW`; past that
+an alarm is acknowledged and counted, and the count is written as one summary record (``suppressed``, no ``kind``)
+each time it doubles, so one slot can never roll another slot's records, nor its own first ones, out of the log.
+The answer is a bare ``{"id", "ok": true}``: an ALARM files no request, writes no row, receipt or grant, and changes
+no answer of any other verb. Known edge: the dedupe stamps and budgets live in the broker's memory, so a broker
+restart starts them over.
 
 THE GATE VERB (F10 S2b-2). ``GATE {cap, agent, tool_name, input_digest, tool_use_id?}`` is asked by both adapters'
 slot gate on EVERY PreToolUse, before the call is classified, and answered ``{"gate": "halted", "request_id"}``,
@@ -149,7 +155,8 @@ from levain.qbroker.signers import SignersSnapshot, SignersSource
 from levain.qbroker.store import ANSWER_ROW_FORMAT, REQUEST_ROW_FORMAT, QueueStore, replace_file, valid_request_id
 from levain.slot import limits_doc
 
-__all__ = ["ALARM_BURST", "ALARM_DEDUPE_WINDOW", "ALARM_FORMAT", "ALARM_KINDS", "ALARM_RATE", "ALARM_REASON_MAX",
+__all__ = ["ALARM_BUDGET_WINDOW", "ALARM_BURST", "ALARM_DEDUPE_WINDOW", "ALARM_FORMAT", "ALARM_KINDS", "ALARM_RATE",
+           "ALARM_REASON_MAX", "ALARM_SLOT_BUDGET",
            "ANSWER_BURST", "ANSWER_RATE", "CAP_MAX", "GATE_BURST", "GATE_RATE",
            "KINDS", "PENDING_PER_SESSION", "QUOTA_PER_RUN",
            "RECEIVED_SKEW", "RESOLVE_TTL", "RUN_CALLS_KIND", "RUN_DEADLINE_KIND", "RUN_KEYS", "RUN_OPTIONAL_KEYS",
@@ -244,6 +251,10 @@ ALARM_RATE = 0.2
 ALARM_BURST = 5
 ALARM_DEDUPE_WINDOW = 600.0
 ALARM_DEDUPE_MAX = 256
+# how many records one slot may write per ALARM_BUDGET_WINDOW seconds: past it an alarm is counted, not written, and
+# the count is written as a summary line each time it doubles
+ALARM_SLOT_BUDGET = 8
+ALARM_BUDGET_WINDOW = 24 * 3600.0
 ALARM_FORMAT = "levain-queue-alarm/1"
 _ALARM_KEYS = frozenset({"v", "op", "id", "cap", "kind", "reason"})
 # the longest tool_use_id a GATE frame may carry (the counter keys a repeat by it; levain.consent.limits takes the same)
@@ -478,6 +489,9 @@ class Broker:
         # (session, kind, reason) -> when it was last recorded; held across the append so a repeat never writes twice
         self._alarm_lock = threading.Lock()
         self._alarm_seen: OrderedDict[tuple[str, str, str], float] = OrderedDict()
+        # slot -> [window start, records written, alarms suppressed, the count that writes the next summary]
+        self._alarm_budget: dict[int, list[Any]] = {}
+        self._alarm_unresolved_logged: dict[int, float] = {}  # slot -> when its last failed resolve was logged
         started = clock()
         now = utc_stamp(started)
         filed = []
@@ -919,21 +933,41 @@ class Broker:
         if set(message) != _ALARM_KEYS or kind not in ALARM_KINDS or not isinstance(reason, str) \
                 or not 0 < len(reason) <= ALARM_REASON_MAX or not reason.isprintable():
             return wire.refusal(rid, "frame-malformed")
-        if not self._take_alarm_token(slot):
-            return wire.refusal(rid, "rate-limited")
         who = self._resolve(slot, message.get("cap"))
         if isinstance(who, str):
+            now = self._monotonic()
+            with self._alarm_lock:
+                last = self._alarm_unresolved_logged.get(slot)
+                if last is None or now - last >= ALARM_DEDUPE_WINDOW:
+                    self._alarm_unresolved_logged[slot] = now
+                    log.warning("qbroker: an ALARM on slot %d could not be resolved (%s)", slot, who)
             return wire.refusal(rid, who)
         key, now = (who.session, kind, reason), self._monotonic()
         with self._alarm_lock:
             seen = self._alarm_seen.get(key)
             if seen is not None and now - seen < ALARM_DEDUPE_WINDOW:
                 return wire.answer(rid)
+            if not self._take_alarm_token(slot):
+                return wire.refusal(rid, "rate-limited")
+            budget = self._alarm_budget.get(slot)
+            if budget is None or now - budget[0] >= ALARM_BUDGET_WINDOW:
+                budget = self._alarm_budget[slot] = [now, 0, 0, 1]
             record: dict[str, Any] = {"format": ALARM_FORMAT, "at": utc_stamp(self._clock()), "slot": slot_ref(slot),
-                                      "session": who.session, "kind": kind, "reason": reason}
-            if who.run is not None:
-                record["run_id"] = who.run["run_id"]
-            self._store.append_alarm(record)
+                                      "session": who.session}
+            if budget[1] < ALARM_SLOT_BUDGET:
+                budget[1] += 1
+                record.update(kind=kind, reason=reason)
+                if who.run is not None:
+                    record["run_id"] = who.run["run_id"]
+                write = True
+            else:
+                budget[2] += 1
+                record["suppressed"] = budget[2]
+                write = budget[2] >= budget[3]
+                if write:
+                    budget[3] *= 2
+            if write:
+                self._store.append_alarm(record)
             self._alarm_seen[key] = now
             self._alarm_seen.move_to_end(key)
             while len(self._alarm_seen) > ALARM_DEDUPE_MAX:
