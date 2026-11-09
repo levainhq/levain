@@ -123,7 +123,7 @@ def test_empty_run_runner_mismatch_and_pytest_crash_are_red():
 def test_receipt_file_name_and_roundtrip(tmp_path):
     rec = verify.build_receipt("0123456789abcdef" * 2 + "01234567", "r", {"uv_lock_sha256": "h"}, "b", _both(), True)
     p = verify.write_receipt(rec, tmp_path / "receipts")
-    assert p.name == "vr_0123456789ab.json"
+    assert p.name == "vr_0123456789ab_r.json"
     assert json.loads(p.read_text()) == rec
 
 
@@ -269,6 +269,14 @@ def _args(r, state, *extra):
 
 def _only_run(state):
     return next((state / "runs").iterdir())
+
+
+def _one_receipt(receipts, sha):
+    """The one receipt in `receipts`, named for its sha and its run."""
+    found = sorted(receipts.glob(f"vr_{sha[:12]}_*.json"))
+    assert len(found) == 1, found
+    assert found[0].name == f"vr_{sha[:12]}_{json.loads(found[0].read_text())['run_id']}.json"
+    return found[0]
 
 
 # ---------------------------------------------------------------- state dir
@@ -550,10 +558,10 @@ def test_two_legs_merge_into_one_receipt_and_either_red_leg_makes_it_red(repo, t
         monkeypatch.setattr(verify, "run_leg_remote", lambda *a, **k: _full_leg("linux", 4, reds=linux_reds))
         state = tmp_path / f"state-{want}"
         assert verify.main(["run", "--sha", sha, "--leg", "both", *_args(r, state)]) == (0 if want == "green" else 1)
-        rec = json.loads((tmp_path / "receipts" / f"vr_{sha[:12]}.json").read_text())
+        rec = json.loads(_one_receipt(tmp_path / "receipts", sha).read_text())
         assert [l["platform"] for l in rec["legs"]] == ["macos", "linux"] and rec["verdict"] == want
         assert rec["runner_blob"] and "_diag" not in rec["legs"][0]
-        (tmp_path / "receipts" / f"vr_{sha[:12]}.json").unlink()
+        _one_receipt(tmp_path / "receipts", sha).unlink()
 
 
 def test_a_failed_leg_aborts_the_run_with_no_receipt(repo, tmp_path, monkeypatch, capsys):
@@ -602,7 +610,9 @@ def _remote_fixture(tmp_path, junit_text=REMOTE_JUNIT, sha="a" * 40):
     leg = {"platform": "linux", "sha": sha, "host": "argushub", "python": "3.13.1", "workers": 4, "max_load": 9.0, "load_reds": 1,
            "jobs": [{"name": "pytest-full-py313", "rc": 1, "counts": dict(collected=2, passed=0, failed=2, error=0, skipped=0, xfailed=0),
                      "junit": {"path": f"/home/u/{rrun}/junit-linux.xml", "sha256": hashlib.sha256(junit_text.encode()).hexdigest()},
-                     "reds": reds}],
+                     "reds": reds},
+                    verify.failed_job("bwrap-floor-live-py312", "host not provisioned: x"),
+                    verify.failed_job("root-closure-py39", "uv venv")],
            "_diag": [{"nodeid": "tests/a.py::l", "class": "load", "evidence": "e1", "text": "t1"},
                      {"nodeid": "tests/a.py::i", "class": "inherited", "evidence": "e2", "text": "t2"}]}
     return rrun, leg, junit_text
@@ -746,7 +756,7 @@ def test_a_diagnosis_is_recorded_on_the_receipt_and_never_changes_the_verdict(re
     state = tmp_path / "state"
     args = ["--repo", str(r), "--state-dir", str(state), "--receipts-dir", str(tmp_path / "receipts")]      # diagnosis ON
     assert verify.main(["run", "--sha", sha, *args]) == 1
-    rec = json.loads((tmp_path / "receipts" / f"vr_{sha[:12]}.json").read_text())
+    rec = json.loads(_one_receipt(tmp_path / "receipts", sha).read_text())
     assert rec["verdict"] == "red" and Path(rec["diagnosis"]).read_text().count("advice text") == 1
 
 
@@ -763,6 +773,7 @@ def test_host_lock_is_exclusive(tmp_path):
 # The bar: a receipt never reads green where CI would read red.
 
 SHA40 = "a" * 40
+RID = f"20261109T000000Z-{SHA40[:8]}-0001"
 
 
 # ---- V1: both legs or it is not green
@@ -785,7 +796,7 @@ def test_v1_a_single_leg_run_exits_nonzero_and_its_status_says_partial(repo, tmp
     state = tmp_path / "state"
     assert verify.main(["run", "--sha", sha, "--leg", "mac", *_args(r, state)]) == 1
     assert json.loads((_only_run(state) / "status.json").read_text())["state"] == "partial"
-    rec = json.loads((tmp_path / "receipts" / f"vr_{sha[:12]}.json").read_text())
+    rec = json.loads(_one_receipt(tmp_path / "receipts", sha).read_text())
     assert rec["verdict"] == "partial"
 
 
@@ -793,9 +804,10 @@ def test_v1_a_single_leg_run_exits_nonzero_and_its_status_says_partial(repo, tmp
 
 def _junit_leg(path, sha=SHA40):
     parsed = verify.parse_junit(path)
-    job = {"name": "j", "rc": 1, "counts": parsed["counts"], "skips_by_reason": parsed["skips_by_reason"],
-           "junit": {"path": str(path), "sha256": "x"}, "reds": [{"nodeid": r["nodeid"], "class": "load"} for r in parsed["reds"]]}
-    return {"platform": "linux", "sha": sha, "jobs": [job]}
+    jobs = [{"name": n, "rc": 1, "counts": dict(parsed["counts"]), "skips_by_reason": dict(parsed["skips_by_reason"]),
+             "junit": {"path": str(path), "sha256": "x"}, "reds": [{"nodeid": r["nodeid"], "class": "load"} for r in parsed["reds"]]}
+            for n in ("pytest-full-py313", "bwrap-floor-live-py312", "root-closure-py39")]
+    return {"platform": "linux", "sha": sha, "jobs": jobs}
 
 
 def test_v2_rederive_accepts_a_true_leg_and_names_each_lie(junit_run):
@@ -923,7 +935,9 @@ def test_v5_fetch_base_updates_the_pinned_ref_from_origin_and_fails_loud_when_it
 class JobHarness:
     """run_job with pytest faked at `_run`: it writes the junit each call would have written."""
 
-    def __init__(self, tmp_path, monkeypatch, *, main_msg="AssertionError: x", base_msg="AssertionError: x", rerun="fail"):
+    def __init__(self, tmp_path, monkeypatch, *, main_msg="AssertionError: x", base_msg="AssertionError: x", rerun="fail",
+                 base_rc=1):
+        self.base_rc = base_rc
         self.run = tmp_path / "run"
         for d in ("home", "tmp", "bsrc"):
             (self.run / d if d != "bsrc" else tmp_path / d).mkdir(parents=True, exist_ok=True)
@@ -948,7 +962,7 @@ class JobHarness:
         fail = lambda m: f'<failure message="{m}">tb</failure>'
         if "pt-main-" in base:
             Path(j).write_text(self._xml([("t", fail(self.msgs["base"]))]))
-            return 1
+            return self.base_rc
         if "-r" in base.rsplit("/", 1)[-1]:                       # a serial rerun of one nodeid
             if self.rerun == "skip":
                 Path(j).write_text(self._xml([("t", '<skipped type="pytest.skip" message="needs a keychain"/>')]))
@@ -968,7 +982,7 @@ def test_v5_the_job_records_the_baseline_sha_and_junit_hash_and_judges_sameness(
     job, _ = same.job()
     assert job["reds"][0]["class"] == "inherited"
     bj = same.run / "junit-main-pytest-full-py312.xml"
-    assert job["baseline"] == {"sha": "b" * 40, "junit_sha256": hashlib.sha256(bj.read_bytes()).hexdigest(), "junit": str(bj)}
+    assert job["baseline"] == {"sha": "b" * 40, "rc": 1, "junit_sha256": hashlib.sha256(bj.read_bytes()).hexdigest(), "junit": str(bj)}
     diff = JobHarness(tmp_path / "b", monkeypatch, base_msg="TimeoutError: other")
     job2, _ = diff.job()
     assert job2["reds"][0]["class"] == "regression" and job2["baseline"]["sha"] == "b" * 40
@@ -1179,15 +1193,15 @@ def test_v11_attach_row_cli_and_reverdict_turn_a_red_receipt_green(tmp_path, cap
     led = verify.Ledger(state / "ledger.jsonl")
     lid, _ = led.file("tests/a.py::t", "load", "r1", SHA40, "e")
     mac = _leg([{"nodeid": "tests/a.py::t", "class": "load", "evidence": "e", "ledger_id": lid, "board_row": None}])
-    receipt = verify.build_receipt(SHA40, "rid", {}, "blob", [mac, _leg([], platform="linux", rc=0)], True)
+    receipt = verify.build_receipt(SHA40, RID, {}, "blob", [mac, _leg([], platform="linux", rc=0)], True)
     assert receipt["verdict"] == "red"
     rpath = verify.write_receipt(receipt, tmp_path / "receipts")
-    run = state / "runs" / "rid"
+    run = state / "runs" / RID
     verify.Status(run).update(state="red", receipt=str(rpath), verdict="red")
-    assert verify.main(["reverdict", "--run", "rid", "--state-dir", str(state)]) == 1          # no row yet: still red
+    assert verify.main(["reverdict", "--run", RID, "--state-dir", str(state)]) == 1          # no row yet: still red
     assert verify.main(["ledger", "attach-row", "--id", "lg_nope", "--row", "r", "--state-dir", str(state)]) == 2
     assert verify.main(["ledger", "attach-row", "--id", lid, "--row", "1109-42", "--state-dir", str(state)]) == 0
-    assert verify.main(["reverdict", "--run", "rid", "--state-dir", str(state)]) == 0
+    assert verify.main(["reverdict", "--run", RID, "--state-dir", str(state)]) == 0
     new = json.loads(rpath.read_text())
     assert new["verdict"] == "green" and new["legs"][0]["jobs"][0]["reds"][0]["board_row"] == "1109-42"
     assert [x["to"] for x in new["reverdicts"]] == ["red", "green"]
@@ -1260,3 +1274,180 @@ def test_v12_the_bwrap_job_runs_on_312_like_ci_when_the_host_is_ready(tmp_path, 
     bw = next(k for k in ran if k["name"].startswith("bwrap-floor-live"))
     assert bw["name"] == "bwrap-floor-live-py312" and bw["required_run"] and bw["env"]["LEVAIN_REQUIRE_LINUX_LIVE"] == "1"
     assert bw["base_python"] == "3.12" and bw["env"]["CI"] == "1" and "PYTHONPATH" not in bw["env"]
+
+
+# ---------------------------------------------------------------- L3 r1 fix round
+
+LINUX_JOBS = ["pytest-full-py313", "bwrap-floor-live-py312", "root-closure-py39"]
+CLEAN_JUNIT = '<testsuites><testsuite><testcase classname="tests.a" name="ok"/></testsuite></testsuites>'
+
+
+def _clean_linux_leg(sha, names=LINUX_JOBS):
+    rrun = f"{verify.REMOTE_STATE}/runs/{RUN_ID}"
+    h = hashlib.sha256(CLEAN_JUNIT.encode()).hexdigest()
+    jobs = [{"name": n, "rc": 0, "required_run": False, "counts": dict(collected=1, passed=1, failed=0, error=0, skipped=0, xfailed=0),
+             "skips_by_reason": {}, "junit": {"path": f"/home/u/{rrun}/junit-{n}-{i}.xml", "sha256": h}, "reds": []}
+            for i, n in enumerate(names)]
+    return {"platform": "linux", "sha": sha, "host": "argushub", "python": "3.13.1", "workers": 4, "max_load": 1.0,
+            "load_reds": 0, "jobs": jobs, "_diag": []}
+
+
+def _xml_sh(leg):
+    def sh(cmd, *, log, stdin=None, timeout=None):
+        if cmd[0] == "scp" and cmd[-2].endswith("leg-linux.json"):
+            (Path(cmd[-1]) / "leg-linux.json").write_text(json.dumps(leg))
+        elif cmd[0] == "scp" and cmd[-2].endswith(".xml"):
+            (Path(cmd[-1]) / os.path.basename(cmd[-2])).write_text(CLEAN_JUNIT)
+        return 0
+    return sh
+
+
+def test_r1_v2_a_remote_leg_without_its_expected_job_set_is_never_green(repo, tmp_path):
+    r, sha = repo
+    mac = _leg([], rc=0)
+
+    def remote(i, leg):
+        run = tmp_path / f"run{i}"
+        run.mkdir()
+        return verify.run_leg_remote(r, sha, run, RUN_ID, verify.Ledger(tmp_path / f"l{i}.jsonl"), None, sh=_xml_sh(leg),
+                                     script=ROOT / "scripts" / "verify.py")
+
+    full = remote(0, _clean_linux_leg(sha))
+    assert full["integrity"] == [] and verify.verdict_of([mac, full])[0] == "green"
+    for i, names in enumerate(([], LINUX_JOBS[:1], LINUX_JOBS + LINUX_JOBS[:1], LINUX_JOBS[:2] + ["some-other-job"]), 1):
+        got = remote(i, _clean_linux_leg(sha, names))
+        v, why = verify.verdict_of([mac, got])
+        assert got["integrity"] and v == "red", (names, why)
+    unrun = _clean_linux_leg(sha)
+    unrun["jobs"][1] = verify.failed_job(LINUX_JOBS[1], "host not provisioned: x")   # a named setup failure is red by itself
+    got = remote(9, unrun)
+    assert got["integrity"] == [] and verify.verdict_of([mac, got])[0] == "red"
+
+
+def test_r1_v5_an_abnormal_or_self_contradicting_baseline_never_excuses_a_red(tmp_path, monkeypatch):
+    for base_rc in (2, 4, 0):                      # an interrupted or crashed run, and a pass that holds a failure
+        h = JobHarness(tmp_path / f"rc{base_rc}", monkeypatch, base_rc=base_rc)
+        job, _ = h.job()
+        red = job["reds"][0]
+        assert red["class"] == "regression" and red["ledger_id"] is None, (base_rc, red["class"], red["evidence"])
+        assert "baseline" in red["evidence"] and job["baseline"]["rc"] == base_rc
+    ok = JobHarness(tmp_path / "ok", monkeypatch)
+    job, _ = ok.job()
+    assert job["reds"][0]["class"] == "inherited" and job["baseline"]["rc"] == 1
+
+
+def test_r1_v7_a_newline_terminated_bad_last_record_fails_closed(tmp_path, capsys):
+    led = verify.Ledger(tmp_path / "ledger.jsonl")
+    led.file("tests/a.py::t", "flaky", "r1", "s1", "e")
+    good = led.path.read_text()
+    for tail in ("{not json\n", '{"no_type": 1}\n', '["x"]\n'):
+        led.path.write_text(good + tail)               # complete lines: the writer finished them, so they are not torn
+        with pytest.raises(RuntimeError, match="failing closed"):
+            led.lines()
+    led.path.write_text(good + '{"type": "sighting", "id": "lg_x", "ru')
+    assert [x["type"] for x in led.lines()] == ["entry"]
+    assert "torn last line" in capsys.readouterr().err
+
+
+def _kill_in_join(monkeypatch, tmp_path, leg):
+    stopped, released, mac_done = [], threading.Event(), threading.Event()
+    monkeypatch.setattr(verify, "stop_remote_run", lambda host, rid: stopped.append((host, rid)))
+    monkeypatch.setattr(verify, "terminate_children", lambda *a, **k: released.set())
+
+    def local(*a, **k):
+        mac_done.set()
+        return _full_leg("macos", 6)
+
+    def remote(*a, **k):
+        if leg == "both":
+            mac_done.wait(10)
+        time.sleep(0.3)                                # the main thread is now waiting on this thread
+        os.kill(os.getpid(), signal.SIGTERM)
+        released.wait(10)
+        return _full_leg("linux", 4)
+
+    monkeypatch.setattr(verify, "run_leg_local", local)
+    monkeypatch.setattr(verify, "run_leg_remote", remote)
+    return stopped, released
+
+
+@pytest.mark.parametrize("leg", ["linux", "both"])
+def test_r1_v8_a_kill_while_waiting_on_the_remote_leg_stops_the_remote_run(monkeypatch, tmp_path, leg):
+    stopped, released = _kill_in_join(monkeypatch, tmp_path, leg)
+    a = types.SimpleNamespace(leg=leg, host="argushub", here=False, workers=None, linux_workers=None, python=None, pytest_timeout=5.0)
+    prev = verify.install_signal_handlers()
+    try:
+        with pytest.raises(verify.Killed):
+            verify._run_legs(a, tmp_path, SHA40, tmp_path, RUN_ID, verify.Ledger(tmp_path / "l"), verify.Status(tmp_path))
+    finally:
+        verify.restore_signal_handlers(prev)
+        released.set()
+    assert stopped == [("argushub", RUN_ID)]
+
+
+def test_r1_v8_a_linux_run_killed_in_the_join_exits_killed_and_stops_the_remote_once(repo, tmp_path, monkeypatch):
+    r, sha = repo
+    monkeypatch.setattr(verify, "Tools", FakeTools)
+    stopped, released = _kill_in_join(monkeypatch, tmp_path, "linux")
+    state = tmp_path / "state"
+    try:
+        assert verify.main(["run", "--sha", sha, "--leg", "linux", *_args(r, state)]) == 128 + int(signal.SIGTERM)
+    finally:
+        released.set()
+    run = _only_run(state)
+    assert stopped == [("argushub", run.name)] and verify.read_status(run)["state"] == "killed"
+
+
+def test_r1_v8_a_kill_that_escapes_the_leg_runner_is_still_stopped_by_the_run(repo, tmp_path, monkeypatch):
+    r, sha = repo
+    stopped = []
+    monkeypatch.setattr(verify, "Tools", FakeTools)
+    monkeypatch.setattr(verify, "stop_remote_run", lambda host, rid: stopped.append((host, rid)))
+
+    def legs(*a, remote=None, **k):
+        remote["started"] = True                       # the remote leg is live and nothing below stopped it
+        raise verify.Killed(int(signal.SIGTERM))
+
+    monkeypatch.setattr(verify, "_run_legs", legs)
+    state = tmp_path / "state"
+    assert verify.main(["run", "--sha", sha, "--leg", "linux", *_args(r, state)]) == 128 + int(signal.SIGTERM)
+    assert stopped == [("argushub", _only_run(state).name)]
+
+
+def test_r1_v11_two_runs_of_one_sha_keep_two_receipts_and_reverdict_reads_only_its_own(tmp_path, capsys):
+    state = tmp_path / "state"
+    rid_a, rid_b = f"20261109T000000Z-{SHA40[:8]}-aaaa", f"20261109T000001Z-{SHA40[:8]}-bbbb"
+    led = verify.Ledger(state / "ledger.jsonl")
+    lid, _ = led.file("tests/a.py::t", "load", rid_a, SHA40, "e")
+    red_mac = _leg([{"nodeid": "tests/a.py::t", "class": "load", "evidence": "e", "ledger_id": lid, "board_row": None}])
+    pa = verify.write_receipt(verify.build_receipt(SHA40, rid_a, {}, "blob", [red_mac, _leg([], platform="linux", rc=0)], True),
+                              tmp_path / "receipts")
+    pb = verify.write_receipt(verify.build_receipt(SHA40, rid_b, {}, "blob", _both(), True), tmp_path / "receipts")
+    assert pa != pb and json.loads(pa.read_text())["run_id"] == rid_a and json.loads(pb.read_text())["run_id"] == rid_b
+    verify.Status(state / "runs" / rid_b).update(state="passed", receipt=str(pa), verdict="green")    # B's status names A's receipt
+    assert verify.main(["reverdict", "--run", rid_b, "--state-dir", str(state)]) == 2
+    assert "run_id" in capsys.readouterr().err
+    assert json.loads(pa.read_text())["verdict"] == "red" and "reverdicts" not in json.loads(pa.read_text())
+
+
+def test_r1_run_arguments_must_name_a_run_directly_under_runs(tmp_path, capsys):
+    state = tmp_path / "state"
+    (state / "runs").mkdir(parents=True)
+    outside = tmp_path / "outside"
+    rp = verify.write_receipt(verify.build_receipt(SHA40, "outside", {}, "blob", _both(), True), tmp_path / "rc")
+    verify.Status(outside).update(state="red", receipt=str(rp), verdict="red")
+    good_name = f"20261109T000000Z-{SHA40[:8]}-cccc"
+    (state / "runs" / good_name).symlink_to(outside, target_is_directory=True)        # a well-formed id that leaves runs/
+    for bad in (str(outside), "../../outside", "outside", good_name + "/..", good_name):
+        assert verify.main(["status", "--run", bad, "--state-dir", str(state)]) == 2, bad
+        assert verify.main(["reverdict", "--run", bad, "--state-dir", str(state)]) == 2, bad
+    assert "reverdicts" not in json.loads(rp.read_text())
+
+
+def test_r1_the_bwrap_job_and_its_baseline_get_the_runtime_dir_preflight_probed(tmp_path, monkeypatch):
+    made, ran = _plan_linux_stubs(tmp_path, monkeypatch, [])
+    verify.plan_linux(_prov_ctx(tmp_path / "p"), verify.LINUX_PYTHON, 4, 60)
+    bw = next(k for k in ran if k["name"].startswith("bwrap-floor-live"))
+    want = f"/run/user/{os.getuid()}"
+    assert bw["env"]["XDG_RUNTIME_DIR"] == want
+    assert bw["base_cfg"](tmp_path / "bsrc", tmp_path / "bsrc" / "bin" / "python")[1]["XDG_RUNTIME_DIR"] == want
