@@ -22,6 +22,19 @@ Writes act through a :class:`RoomHost` the mount was given, for an authenticated
   (his adopted quote or his edit), the room's summary only ever rides as the labelled note
   (:func:`levain.coordinator.room.commit`).
 
+**Live text (492 R3, ruling R-C).** Every read carries ``live``: ``{turn, text, seq}`` while the room's child is mid-reply
+(from :func:`levain.coordinator.room_live.snapshot` of ``launch_id``, an in-memory buffer), else ``null``. It is NEVER
+stored and never counted in ``next``. A long-poll client sends ``live_seq=<n>`` (the ``seq`` it last drew, ``0`` when it
+shows no live text; absent = never wake on live changes, R2 behaviour) and the wait ends when live moved: text newer than
+``n``, or live gone while ``n > 0`` (a turn end with no stored line). **Ordering edge:** when the whole assistant frame
+lands, live clears and the stored ``agent_text`` appears in ``stream`` with a new ``gseq``, so two consecutive reads may
+show the old ``live`` and then the stored line (or, between the clear and the store write, neither). The client drops
+``live`` when a stored ``agent_text`` item arrives whose ``launch_id`` equals the body's ``launch_id`` with a ``gseq``
+above the cursor it held when it first drew that ``live.turn``. Live ``turn`` (``t<conn>-<n>``, the child's turn id) and a
+stored item share NO id (an item carries ``ref`` ``<uuid>.<i>``, ``launch_id``, ``gseq``, no turn id); the smallest join
+is that rule, which needs no store field. If a turn streams several text blocks, each whole block retires the live text
+at once: the next block's deltas simply start a new ``live`` (same ``turn``, ``text`` from empty).
+
 Every write names the room THREAD the page drew (``room_thread_id``) where it names a conversation, and a thread that is
 not the open room is a 409 ``room_rotated`` with nothing written. A non-CoordError out of a send is answered by reading
 the outbox, never by a bare 500 and never by assuming the line was not written."""
@@ -30,6 +43,7 @@ from __future__ import annotations
 import json
 import re
 import sqlite3
+import urllib.parse
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -40,6 +54,7 @@ from levain.cockpit import threads
 from levain.cockpit.consent import utc_stamp
 from levain.coordinator import chat
 from levain.coordinator import room as coordroom
+from levain.coordinator import room_live
 from levain.coordinator.chat_lease import check_owner
 from levain.coordinator.room_launch import RoomLaunchError
 from levain.coordinator.room_serve import RoomServeError
@@ -51,6 +66,9 @@ ROOM_ACTIONS = ("send", "stop", "mark", "drop", "rotate", "open")
 PROPOSAL_ACTIONS = ("commit", "dismiss")
 READ_OWNER = "cockpit:room-read"        # a room composer ignores its owner (no lease); the read still needs a well-formed one
 PROPOSALS_MAX = 50
+WAIT_MAX_S = 25                         # the longest a cursor read may wait for a newer item (``wait=<seconds>``)
+WAIT_TICK_S = 0.5                       # how often a waiting read re-reads the record (and re-checks its credential)
+WAITERS_MAX = 8                         # waiting reads at once; the next one is a 503
 _THREAD_ID = re.compile(r"th-[0-9a-f]{32}")
 _MESSAGE_ID = re.compile(r"cm-[0-9a-f]{32}")
 _PROPOSAL_ID = re.compile(r"pr-[0-9a-f]{32}")
@@ -229,15 +247,148 @@ def room_read(directory: Path | str, service: Any = None) -> dict[str, Any]:
         conn.close()
 
 
+class CursorError(ValueError):
+    """A read's ``after``, ``wait`` or ``live_seq`` is not a whole number the read accepts."""
+
+
+# a gseq, a live seq or a wait in seconds never needs more digits than this; a longer run of digits is refused BEFORE
+# int(), which raises a plain ValueError past the interpreter's 4300-digit limit (L3 room r1 codex HIGH)
+_DIGITS_MAX = 20
+
+
+def _whole(raw: str, message: str) -> int:
+    """``raw`` as a non-negative int, or ``CursorError(message)``: ASCII digits only, at most :data:`_DIGITS_MAX`."""
+    if not (raw.isascii() and raw.isdigit()) or len(raw) > _DIGITS_MAX:
+        raise CursorError(message)
+    return int(raw)
+
+
+def parse_wait(query: str, after: int | None) -> int | None:
+    """The ``wait`` of a cursor read, in whole seconds ``1..WAIT_MAX_S``, or None when it is absent. A ``wait`` that is
+    not an integer in range raises ``CursorError``, and so does one without ``after``: a cold read has nothing to wait
+    past, and a 400 says so where an ignored parameter would hide a client that believes it is long-polling."""
+    values = urllib.parse.parse_qs(query, keep_blank_values=True)
+    if "wait" not in values:
+        return None
+    message = f"wait must be a whole number of seconds from 1 to {WAIT_MAX_S}"
+    wait = _whole(values["wait"][0], message)
+    if not 1 <= wait <= WAIT_MAX_S:
+        raise CursorError(message)
+    if after is None:
+        raise CursorError("wait needs after: only a cursor read can wait for a newer item")
+    return wait
+
+
+def parse_live_seq(query: str) -> int | None:
+    """``live_seq`` of a read: a non-negative integer (the live ``seq`` the client last saw), or None when absent."""
+    values = urllib.parse.parse_qs(query, keep_blank_values=True)
+    if "live_seq" not in values:
+        return None
+    return _whole(values["live_seq"][0], "live_seq must be a non-negative integer")
+
+
+def _live_moved(body: dict[str, Any], live_seq: int | None) -> bool:
+    if live_seq is None:
+        return False
+    live = body.get("live")
+    if isinstance(live, dict):
+        return isinstance(live.get("seq"), int) and live["seq"] > live_seq
+    return live_seq > 0
+
+
+def is_news(status: int, body: Mapping[str, Any], live_seq: int | None = None) -> bool:
+    """True when a read is an answer a long-poll returns at once: not a 200, a newer item, a ``reset``, or (with
+    ``live_seq``) live text that moved past it. The handler asks this of its first read BEFORE it takes a waiter slot,
+    so an answer already in hand is never turned into a 503 by a full waiter cap (L3 room r1 codex MED)."""
+    return status != 200 or bool(body.get("stream")) or bool(body.get("reset")) or _live_moved(dict(body), live_seq)
+
+
+def parse_cursor(query: str) -> tuple[int | None, str | None]:
+    """``(after, thread)`` from a read's query string: ``after`` is the last ``gseq`` the client holds (None for a cold
+    read), ``thread`` the ``room_thread`` that cursor was read from. A non-integer or negative ``after`` raises
+    ``CursorError``; any other parameter is ignored."""
+    values = urllib.parse.parse_qs(query, keep_blank_values=True)
+    after = None
+    if "after" in values:
+        raw = values["after"][0]
+        after = _whole(raw, "after must be a non-negative integer")
+    thread = values["thread"][0] if "thread" in values and values["thread"][0] else None
+    return after, thread
+
+
+def apply_cursor(body: dict[str, Any], after: int | None, thread: str | None) -> dict[str, Any]:
+    """``body`` with ``next`` (the newest ``gseq`` in what is returned, else the cursor held) and, for a cursor read,
+    ``stream`` cut to items newer than ``after`` (compared with ``>``: the filtered open-probe turn leaves gaps). A cursor
+    from another room thread, or held against no open room, gets the whole body and ``reset: true``. An item without a
+    ``gseq`` is only ever in a cold read."""
+    stream = body.get("stream") or []
+    if after is not None and thread is not None and thread != body.get("room_thread"):
+        body["reset"] = True
+        after = None
+    if after is not None:
+        stream = [i for i in stream if isinstance(i.get("gseq"), int) and i["gseq"] > after]
+        body["stream"] = stream
+    seqs = [i["gseq"] for i in stream if isinstance(i.get("gseq"), int)]
+    body["next"] = max(seqs) if seqs else after
+    return body
+
+
+def wait_for_news(read: Callable[[], "tuple[int, dict[str, Any]] | None"], wait: int, *,
+                  allowed: Callable[[bool], bool] | None = None, alive: Callable[[], bool] | None = None,
+                  stop: Any = None, tick: float | None = None,
+                  now: Callable[[], float] | None = None, live_seq: int | None = None) -> tuple[int, dict[str, Any]] | None:
+    """The long-poll: ``read()`` (a cursor read, ``(status, body)``) now and then on every tick until it holds a newer item,
+    says ``reset`` (the room rotated), is not a 200, or ``wait`` seconds have passed (the last read, an empty stream with
+    ``next`` the cursor held, is then the answer). ``read`` may return None for a tick it could not take a slot for: that
+    tick is skipped, never an answer. Before EACH re-read ``allowed(True)`` (the credential's own recheck) must hold, else
+    this returns None and the caller answers 403. A peer that went away (``alive`` False) is also None (nobody reads the
+    answer); with ``live_seq`` the wait also ends when ``body["live"]`` moved past it; a ``stop`` event set (the server is
+    shutting down) ends with the last body, before any further read. The FIRST ``read()`` must return a pair."""
+    import time
+    clock = now or time.monotonic
+    step = WAIT_TICK_S if tick is None else tick
+    deadline = clock() + wait
+    status, body = read()  # type: ignore[misc]   # the first read is the one the caller already admitted: a pair
+    while True:
+        if is_news(status, body, live_seq):
+            return status, body
+        if clock() >= deadline or (stop is not None and stop.wait(0)):
+            return status, body
+        if stop is not None:
+            if stop.wait(step):         # woken by shutdown: answer with what is in hand, no read against a closing server
+                return status, body
+        else:
+            time.sleep(step)
+        if alive is not None and not alive():
+            return None
+        if allowed is not None and not allowed(True):
+            return None
+        got = read()
+        if got is not None:
+            status, body = got
+
+
+def _live(body: Mapping[str, Any]) -> dict[str, Any] | None:
+    launch = body.get("launch_id")
+    if not isinstance(launch, str) or body.get("room_thread") is None:
+        return None
+    return room_live.snapshot(launch)
+
+
 def serve_room(path: str, *, directory: Path | str, service: Any = None,
-               view: Callable[[], Mapping[str, Any]] | None = None) -> tuple[int, dict[str, Any]]:
+               view: Callable[[], Mapping[str, Any]] | None = None, query: str = "") -> tuple[int, dict[str, Any]]:
     """``(status, body)`` for ``GET /cockpit/room.json``: a store that cannot be read is a 500 with a fixed sentence.
     ``view`` (the host's, when a serve holds the room) adds ``room_error``: the pump's or the launch's last error, or
     None, so a room that cannot start says why on the page instead of staying silent."""
     if path != ROOM_PATH:
         return 404, {"error": "not_found", "message": "no such room route"}
     try:
-        body = room_read(directory, service)
+        after, thread = parse_cursor(query)
+    except CursorError as e:
+        return 400, {"error": "bad_request", "message": str(e)}
+    try:
+        body = apply_cursor(room_read(directory, service), after, thread)
+        body["live"] = _live(body)
     except Exception:       # the boundary: whatever broke, the caller gets the fixed sentence and no detail
         return 500, {"error": "internal", "message": "the room record could not be read"}
     if view is not None:

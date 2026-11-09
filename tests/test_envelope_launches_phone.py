@@ -193,3 +193,43 @@ def test_a_device_another_surface_paired_cannot_set_launches_nor_its_children(wo
     # the surface token itself still cannot
     st, got, _ = _call(port, "GET", "/cockpit/coord/drops.json", token=RELAY)
     assert st == 200 and got["coord_may_launch"] is False, (st, got)
+
+
+def test_a_device_the_laptops_cockpit_pair_paired_may_set_launches(world, tmp_path_factory):
+    """Row 460, measured 11-08: every live device of his was paired by `levain cockpit pair` (paired_by 'box'), not
+    by the page, and the browser-only root hid the toggle from all of them. A box-rooted device, and its child, qualify;
+    a relay-rooted one still does not."""
+    from datetime import datetime, timezone
+
+    from levain.cockpit.firejournal import BOX_MINTER
+
+    _root, src, _ids = _install(tmp_path_factory.mktemp("coord-box"))
+    with _serve(src, surface_tokens={"browser": T, "relay": RELAY}) as (port, httpd):
+        signer = SimpleNamespace(keys=phone_for(world)._keys)
+        sheet = CoordSheet(world["qdir"], RP, ORIGIN, signer)
+        sheet.phone = coord_for(world)
+        httpd.coord_sheet = sheet
+        _pair(port)                                   # starts the journal, as the page's first pairing does
+        code = httpd.broker.active_db().mint_offer(label="iphone", minted_by=BOX_MINTER, now=datetime.now(timezone.utc))   # what `levain cockpit pair` mints as
+        st, cl, _ = _call(port, "POST", "/cockpit/pair/claim", {"code": code})
+        assert st == 200, cl
+        assert httpd.broker.active_db().pairing_root(cl["device_id"]) == BOX_MINTER
+        st, got, _ = _call(port, "GET", "/cockpit/coord/drops.json", token=cl["token"])
+        assert st == 200 and got["coord_may_launch"] is True, (st, got)
+        st, out, _ = _post_review(world, port, sheet, cl["token"], "ph-" + "9" * 32, _launch_spec(world))
+        assert st == 200, out
+        assert env.parse_body(out["body_text"])["launches"] == _launch_spec(world)["launches"]
+        _kid, kid_tok = _pair(port, token=cl["token"], label="box-child", proxied=True)
+        st, got, _ = _call(port, "GET", "/cockpit/coord/drops.json", token=kid_tok)
+        assert st == 200 and got["coord_may_launch"] is True, (st, got)
+        _rdev, relay_tok = _pair(port, token=RELAY, label="relay-made")
+        st, got, _ = _call(port, "GET", "/cockpit/coord/drops.json", token=relay_tok)
+        assert st == 200 and got["coord_may_launch"] is False, (st, got)
+        # a relay cannot name its own minter: the offer's minter is the caller's credential, a body key is refused
+        st, off, _ = _call(port, "POST", "/cockpit/pair/offer", {"label": "x", "minted_by": BOX_MINTER}, token=RELAY)
+        assert st == 400 and off["error"] == "bad_request", (st, off)
+        # revoking the box device takes its child's grant with it (L3 r1 complement LOW)
+        httpd.broker.active_db().revoke_devices([cl["device_id"]], by=BOX_MINTER, now=datetime.now(timezone.utc))
+        for t in (cl["token"], kid_tok):
+            st, got, _ = _call(port, "GET", "/cockpit/coord/drops.json", token=t)
+            assert not (st == 200 and got.get("coord_may_launch") is True), (st, got)

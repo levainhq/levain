@@ -12,8 +12,10 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).parent))
 import _page_drive_run  # noqa: E402
+from tests._shared_chrome import _session_chrome, chrome_skip_reason  # noqa: E402
 
-CHROME = "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"
+CHROME = _session_chrome()
+needs_browser = pytest.mark.skipif(chrome_skip_reason() is not None or not shutil.which("node"), reason="needs Chrome and node")
 DRIVER = str(Path(__file__).parent / "_page_drive.mjs")
 
 
@@ -34,7 +36,7 @@ def _survivors(before: set[str]) -> set[str]:
     return left
 
 
-@pytest.mark.skipif(not Path(CHROME).exists() or not shutil.which("node"), reason="needs Chrome and node")
+@needs_browser
 def test_shot_writes_png_and_a_raising_run_reaps_chrome(tmp_path):
     node = shutil.which("node")
     png = tmp_path / "s.png"
@@ -54,7 +56,7 @@ def test_shot_writes_png_and_a_raising_run_reaps_chrome(tmp_path):
     assert _survivors(before) == set()
 
 
-@pytest.mark.skipif(not Path(CHROME).exists() or not shutil.which("node"), reason="needs Chrome and node")
+@needs_browser
 def test_an_until_that_never_comes_true_fails_the_drive_unless_it_may_time_out(tmp_path):
     node = shutil.which("node")
     steps = tmp_path / "steps.json"
@@ -70,7 +72,7 @@ def test_an_until_that_never_comes_true_fails_the_drive_unless_it_may_time_out(t
     assert json.loads(r.stdout)["values"] == [{"timeout": "document.title === 'never'"}]
 
 
-@pytest.mark.skipif(not Path(CHROME).exists() or not shutil.which("node"), reason="needs Chrome and node")
+@needs_browser
 def test_an_until_that_errors_or_never_answers_fails_the_drive_inside_its_own_deadline(tmp_path):
     node = shutil.which("node")
     steps = tmp_path / "steps.json"
@@ -90,7 +92,7 @@ def test_an_until_that_errors_or_never_answers_fails_the_drive_inside_its_own_de
     assert took < 30, took
 
 
-@pytest.mark.skipif(not Path(CHROME).exists() or not shutil.which("node"), reason="needs Chrome and node")
+@needs_browser
 def test_a_posts_wait_that_comes_up_short_fails_the_drive_and_leaves_a_picture_of_the_page(tmp_path):
     node = shutil.which("node")
     steps = tmp_path / "steps.json"

@@ -12,13 +12,15 @@ from pathlib import Path
 import pytest
 
 from tests._page_drive_run import run as run_driver
+from tests._shared_chrome import _session_chrome, chrome_skip_reason
 
 ROOT = Path(__file__).resolve().parents[1]
 SKY = ROOT / "levain" / "templates" / "web" / "sky.js"
 REPLAY = ROOT / "tests" / "sky_replay"
 NODE = shutil.which("node")
-CHROME = next((p for p in ("/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
-                           shutil.which("google-chrome") or "", shutil.which("chromium") or "") if p and Path(p).exists()), None)
+CHROME = _session_chrome()
+
+needs_browser = pytest.mark.skipif(NODE is None or chrome_skip_reason() is not None, reason="node or headless Chrome not installed")
 
 
 def _model(events: list[dict], opts: dict) -> dict:
@@ -55,7 +57,7 @@ def test_pinned_rows_replace_the_busiest_and_a_single_repo_rows_are_event_types(
     assert s["single"] == "only" and [r["label"] for r in s["rows"]] == ["commits", "reviews", "memory", "decisions"]
 
 
-@pytest.mark.skipif(NODE is None or CHROME is None, reason="node or headless Chrome not installed")
+@needs_browser
 def test_frame_loop_stops_after_the_last_meteor_settles():
     run = run_driver([NODE, str(REPLAY / "run_cdp.mjs"), CHROME], timeout=120)
     assert run.returncode == 0, "run_cdp.mjs failed:\n" + run.stdout[-2000:] + "\n" + run.stderr[-2000:]

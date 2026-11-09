@@ -5,10 +5,19 @@ That sheet opens on the laptop, so an answer typed from a terminal the operator 
 `claude attach` must never raise it: nobody is there to touch it, and it would only time out. This page is the table of
 which surfaces the code recognises as remote, what a band answer typed on each one does, and what is left ungoverned.
 
-Every claim below carries the test that re-derives it (run from the repo root:
+Every claim below about the detector carries the test that re-derives it (run from the repo root:
 `python -m pytest tests/test_remote_detect_1105.py -q`) or a `[judged by ...]` tag naming who judged it against what.
+A claim about the operator's companion tooling, or one sourced to a file in the next paragraph, is as the operator
+reported it and cannot be re-run here.
 Measurements were taken on loopback with a scratch sshd and mosh and stubs, never on a phone:
 `[judged by levain 41, 2026-11-05, against project_memory/1105-31/RETURN_remotegov_m1.md]`.
+
+Two kinds of source named below are not in a clone of this repository. `project_memory/` files (`RETURN_remotegov_m1.md`,
+`L3_remotegov_r2.txt`) are ignored by git, as in [web-push.md](web-push.md): a tag that names one records who judged
+what and when, and it cannot be re-run from a clone. `termsign_hook.py`, `remote_stamp.py` and `peer_roster`
+are scripts in the operator's companion tooling (called "flow" below), which lives in a different repository. A
+path such as `scripts/termsign_hook.py` below is a path there, not in this clone. Levain's part is the detector and
+its tests; what that tooling does is stated here as the operator reported it, not as something this repo can check.
 
 ## The detector
 

@@ -38,6 +38,8 @@ def _default_read_total(path: object, session: str) -> Optional[int]:
 
 
 class DispatchUsageSources:
+    """The injected ``read_total`` takes two arguments, ``(path, session)``, and returns the session's final total."""
+
     def __init__(self, *, run_state: Callable[[str], Any], tunnel_log: Callable[[str], Any],
                  seconds_of: Callable[[str], Any],
                  read_total: Optional[Callable[[Any, str], Any]] = None) -> None:

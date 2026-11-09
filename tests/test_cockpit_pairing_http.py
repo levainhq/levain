@@ -402,6 +402,15 @@ def test_rq6_a_surface_token_name_in_the_paired_namespace_is_refused(src) -> Non
         make_server(src, host="127.0.0.1", port=0, surface_tokens={"browser": T, "paired-d-0123456789ab": "x" * 40})
 
 
+def test_a_surface_token_named_box_is_refused(src) -> None:
+    """`box` is the laptop's own `levain cockpit pair`, a launch-grant root (row 460): a surface holding the name would
+    mint launch-capable devices over HTTP."""
+    from levain.cockpit.firejournal import BOX_MINTER
+
+    with pytest.raises(ValueError, match="laptop's own pairing"):
+        make_server(src, host="127.0.0.1", port=0, surface_tokens={"browser": T, BOX_MINTER: "x" * 40})
+
+
 def test_rp7_rs5_box_side_pair_and_revoke_all(src, capsys) -> None:
     """RP-7 / RS-5: `levain cockpit pair` mints straight into the journal with minted_by 'box' and prints the link to
     the terminal; --revoke-all ends every paired device."""

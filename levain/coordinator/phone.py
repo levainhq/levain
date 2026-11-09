@@ -118,7 +118,8 @@ REVIEWS_KEPT = 32
 _SPEC_KEYS = frozenset({"where", "lands", "budget", "stop"})
 # the cockpit's own device id (web_server's _COORD_DEVICE). Who may add a launch grant is the DOOR's answer, passed in as
 # ``may_launch`` (web_server's _coord_may_launch: the cockpit page, or a paired device whose pairing chain starts at the
-# cockpit page; Phill 2026-11-08, row 460); a caller that passes none gets it for the cockpit device alone
+# cockpit page or the laptop's `levain cockpit pair`; Phill 2026-11-08, row 460); a caller that passes none gets it for
+# the cockpit device alone
 COCKPIT_DEVICE = "cockpit"
 _COCKPIT_SPEC_KEYS = _SPEC_KEYS | {"launches"}
 class CoordRefused(Exception):

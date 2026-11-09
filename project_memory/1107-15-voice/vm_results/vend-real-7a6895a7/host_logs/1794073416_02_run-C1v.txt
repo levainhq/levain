@@ -1,9 +1,0 @@
-$ /usr/bin/ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR -o PreferredAuthentications=password,keyboard-interactive -o PubkeyAuthentication=no -o ConnectTimeout=15 admin@192.168.64.42 sudo -n /usr/local/bin/python3.13 -I /tmp/fire/g_vm.py run --label C1v --mode real --slot 8 --timeout 420 --settle 90 --brief-file /tmp/fire/claude_brief.txt --model haiku --tunnel-bytes 100000000 --actions 60 --production-blob
-rc=0
-label C1v start 2026-11-07 17:43:12
-=== C1v mode=real plant=False secret=False 17:43:12
-start phase ended after 22s; planted=no
--- C1v.final.json {"poll": 0, "stop_file": false}
-
-slots busy=0 after 0s settle (a HELD END keeps the slot leased and retries about every 31 s)
-session s-790460ccaf5567aa

@@ -571,3 +571,98 @@ def test_fr3_a_session_cut_by_the_tail_window_names_its_reason(tmp_path):
         assert H._session_total_and_reason(fd, "S") == (None, "unmatched")
     finally:
         os.close(fd)
+
+
+def _boundary_log(tmp_path, shift=0):
+    """A log whose 1 MiB tail starts exactly on the first byte of the session's open record (shift=0), or `shift`
+    bytes into it."""
+    head = b"older junk\n"
+    body = _rec("A", 4242).encode()
+    pad_rec = {"event": "refused", "session": "other", "detail": ""}
+    room = H._PASSTHROUGH_TAIL_BYTES - len(body) - len((json.dumps(pad_rec) + "\n").encode())
+    pad_rec["detail"] = "x" * room
+    log = tmp_path / "front.log"
+    log.write_bytes(head + body + (json.dumps(pad_rec) + "\n").encode() + b"y" * shift)
+    return log, len(head)
+
+
+def test_a_complete_first_record_at_an_exact_tail_boundary_is_kept(tmp_path):
+    log, head = _boundary_log(tmp_path)
+    assert log.stat().st_size - H._PASSTHROUGH_TAIL_BYTES == head
+    assert H.read_session_total(log, "A") == 4242
+    assert H.read_passthrough_total(log) == 4242
+
+
+def test_a_partial_first_fragment_is_still_dropped(tmp_path):
+    log, _head = _boundary_log(tmp_path, shift=1)
+    assert H.read_session_total(log, "A") is None
+
+
+def test_a_partial_first_fragment_is_dropped_with_the_exact_reason(tmp_path):
+    log, _head = _boundary_log(tmp_path, shift=1)
+    fd = os.open(log, os.O_RDONLY)
+    try:
+        assert H._session_total_and_reason(fd, "A") == (None, "tail-window")
+    finally:
+        os.close(fd)
+
+
+_FIRST = b'{"event":"tunnel","passthrough_total":999}'
+
+
+def _windowed(tmp_path, prefix, first=_FIRST):
+    """A file whose last _PASSTHROUGH_TAIL_BYTES bytes are `first` + newline + non-JSON padding, after `prefix`."""
+    n = H._PASSTHROUGH_TAIL_BYTES - len(first) - 1
+    p = tmp_path / "w.log"
+    p.write_bytes(prefix + first + b"\n" + b"z" * n)
+    assert p.stat().st_size - len(prefix) == H._PASSTHROUGH_TAIL_BYTES
+    return p
+
+
+def _lines(path):
+    fd = os.open(path, os.O_RDONLY)
+    try:
+        off = max(0, os.fstat(fd).st_size - H._PASSTHROUGH_TAIL_BYTES)
+        return H._tail_lines(fd, off)
+    finally:
+        os.close(fd)
+
+
+def test_tail_lines_keeps_line_one_after_a_newline(tmp_path):
+    assert _lines(_windowed(tmp_path, b"junk\n"))[0] == _FIRST
+
+
+def test_tail_lines_drops_line_one_after_a_non_newline(tmp_path):
+    lines = _lines(_windowed(tmp_path, b"junk"))
+    assert _FIRST not in lines
+    assert lines[0].startswith(b"z")
+
+
+def test_a_json_fragment_with_a_wrong_total_is_dropped(tmp_path):
+    p = _windowed(tmp_path, b"x")
+    assert H.read_passthrough_total(p) is None
+    assert H.read_passthrough_total(_windowed(tmp_path, b"x\n")) == 999
+
+
+def test_tail_lines_offset_zero_keeps_line_one(tmp_path):
+    p = _windowed(tmp_path, b"")
+    assert _lines(p)[0] == _FIRST
+    assert H.read_passthrough_total(p) == 999
+
+
+def test_tail_lines_offset_one(tmp_path):
+    assert _lines(_windowed(tmp_path, b"\n"))[0] == _FIRST
+    assert _FIRST not in _lines(_windowed(tmp_path, b"x"))
+
+
+def test_session_total_is_stable_on_a_reused_fd(tmp_path):
+    p = tmp_path / "front.log"
+    p.write_text(_rec("S", 7))
+    fd = os.open(p, os.O_RDONLY)
+    try:
+        first = H._session_total_and_reason(fd, "S")
+        second = H._session_total_and_reason(fd, "S")
+    finally:
+        os.close(fd)
+    assert first == (7, "ok")
+    assert second == first

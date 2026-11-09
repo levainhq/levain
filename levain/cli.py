@@ -4498,7 +4498,7 @@ def _sign_refusals() -> tuple[type[BaseException], ...]:
 def _cmd_cockpit_pair(args: argparse.Namespace) -> int:
     """``levain cockpit pair [--revoke-all]`` (PAIR RP-7, RP-8, RS-5): straight to the journal, as the box's own
     user (its file permissions are the authority), minted by ``box``."""
-    from levain.cockpit.firejournal import CockpitDB, PairingError
+    from levain.cockpit.firejournal import BOX_MINTER, CockpitDB, PairingError
 
     modes = [name for name, on in (("--short", args.short), ("--list", args.list_devices),
                                    ("--revoke", args.revoke is not None), ("--revoke-all", args.revoke_all)) if on]
@@ -4520,11 +4520,11 @@ def _cmd_cockpit_pair(args: argparse.Namespace) -> int:
                                  + (f"revoked {d['revoked_at']}" if d["revoked_at"] else "live")))
             return 0
         if args.revoke is not None:
-            gone = db.revoke_devices(args.revoke, by="box", now=now)
+            gone = db.revoke_devices(args.revoke, by=BOX_MINTER, now=now)
             print(f"revoked {len(gone)} paired device(s)" + (": " + ", ".join(gone) if gone else ""))
             return 0
         if args.revoke_all:
-            gone = db.revoke_devices(None, by="box", now=now)
+            gone = db.revoke_devices(None, by=BOX_MINTER, now=now)
             print(f"revoked {len(gone)} paired device(s)" + (": " + ", ".join(gone) if gone else ""))
             return 0
         if not args.print_link and not sys.stdout.isatty():
@@ -4540,9 +4540,9 @@ def _cmd_cockpit_pair(args: argparse.Namespace) -> int:
                 print(f"pair: {refused}", file=sys.stderr)
                 return 1
         if args.short:
-            code = db.mint_short_offer(label=args.label, minted_by="box", now=now)
+            code = db.mint_short_offer(label=args.label, minted_by=BOX_MINTER, now=now)
         else:
-            code = db.mint_offer(label=args.label, minted_by="box", now=now)
+            code = db.mint_offer(label=args.label, minted_by=BOX_MINTER, now=now)
     except (PairingError, *_cockpit_refusals()) as exc:
         print(f"pair: {_term_safe(exc)}", file=sys.stderr)
         return 1

@@ -780,7 +780,7 @@ def _tomb_gate(store: Any, origin_key: str, effect_id: Any, episode_id: str) -> 
 # what a broker fire reads as in Recent edits: a past-tense phrase per verb, then the thing it touched, then where it came from
 _EDIT_PHRASES = {
     "spore_touch": "marked seen", "spore_descend": "resolved", "spore_surface_at": "rescheduled", "spore_update": "edited",
-    "spore_set_disposition": "moved", "spore_ascend": "promoted", "spore_seed": "added", "episode_tombstone": "deleted episode",
+    "list_intake": "added a line", "spore_set_disposition": "moved", "spore_ascend": "promoted", "spore_seed": "added", "episode_tombstone": "deleted episode",
     "operator_state": "set the state line", "section_edit": "edited", "config": "edited", "entity_name": "renamed the entity",
     "undo": "undid an edit", "pending_cancel": "cancelled a pending change", "token_rotate": "rotated the surface token"}
 
@@ -791,6 +791,8 @@ def _edit_target(resource_key: str) -> str:
         return f"item {ident}"
     if kind == "section" and ident:
         return f"the {ident} section"
+    if kind == "drop" and ident:
+        return "sent to the desk to sort"       # a sort's coordinator drop (coord_effects)
     if kind == "token":
         return ident          # a surface token: "rotated the surface token browser"
     if kind == "pend":
@@ -813,7 +815,10 @@ def _edit_origin(credential: Any) -> str:
 def plain_edit_title(verb: str, target: str, credential: Any) -> str:
     """A broker fire as a sentence a person reads: ``resolved item spore-017, from the browser``."""
     verb = verb if isinstance(verb, str) else ""     # a journal row's verb is a string; a malformed one must not take the panel down
-    said = " ".join(x for x in (_EDIT_PHRASES.get(verb) or verb.replace("_", " "), target) if x)
+    target = target if isinstance(target, str) else ""     # likewise for a malformed target
+    phrase = _EDIT_PHRASES.get(verb) or verb.replace("_", " ")
+    # a sort's drop reads as an aside to the line it was typed as: "added a line, sent to the desk to sort"
+    said = (f"{phrase}, {target}" if target.startswith("sent to ") else " ".join(x for x in (phrase, target) if x))
     return ", ".join(x for x in (said, _edit_origin(credential)) if x)
 
 

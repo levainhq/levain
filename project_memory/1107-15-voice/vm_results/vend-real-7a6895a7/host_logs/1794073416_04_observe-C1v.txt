@@ -1,3 +1,0 @@
-$ /usr/bin/ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR -o PreferredAuthentications=password,keyboard-interactive -o PubkeyAuthentication=no -o ConnectTimeout=15 admin@192.168.64.42 sudo -n /usr/local/bin/python3.13 -I /tmp/fire/g_vm.py observe --label C1v
-rc=0
-observe.json written; session s-790460ccaf5567aa | state ["{'state': 'RETAINED', 'tunnel_bytes': 708352}"] | tree_step entry/exc 1 0

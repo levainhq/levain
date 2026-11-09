@@ -415,3 +415,19 @@ def _no_real_process_table(monkeypatch):
     monkeypatch.setattr(ts, "_ps_rows", lambda: None)
     monkeypatch.setattr(ts, "_tty_atime", lambda tty: None)
     monkeypatch.setattr(ts, "_hid_idle_s", lambda: 0.0)       # a busy laptop: the agent view fallback never fires
+
+
+_INVARIANT_LIST = Path(__file__).resolve().parent / "ci" / "invariant_tests.txt"
+
+
+def invariant_node_ids():
+    """The whole-tree invariant tests, one `file::Class::function` per line (see the header of that file)."""
+    lines = _INVARIANT_LIST.read_text(encoding="utf-8").splitlines()
+    return {ln.strip() for ln in lines if ln.strip() and not ln.startswith("#")}
+
+
+def pytest_collection_modifyitems(config, items):
+    ids = invariant_node_ids()
+    for item in items:
+        if item.nodeid.split("[", 1)[0] in ids:
+            item.add_marker(pytest.mark.invariant)

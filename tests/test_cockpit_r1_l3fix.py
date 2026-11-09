@@ -10,7 +10,7 @@ from levain.cockpit.effects import DownstreamEffect
 from levain.writes import ActionVerb
 from tests._inbox_fake import FakeInbox
 from tests._chrome_flags import CHROME_SAFE_FLAGS
-from tests._shared_chrome import _session_chrome
+from tests._shared_chrome import _session_chrome, chrome_skip_reason
 from tests._page_drive_run import run as run_driver
 from tests.test_cockpit_k2a import _get, _install, _post, _serve
 from tests.test_cockpit_r1_write import INBOX_PANELS, _inbox_panel
@@ -75,6 +75,7 @@ from datetime import datetime, timezone
 import pytest
 
 CHROME = _session_chrome()   # chrome-headless-shell when installed (no keychain), else the CHROME env or the default Chrome
+needs_browser = pytest.mark.skipif(chrome_skip_reason() is not None, reason=chrome_skip_reason() or "")
 
 
 def _dump(url: str) -> str:
@@ -97,14 +98,14 @@ def _bare_install(tmp_path: Path, texts: list[str]):
     return SubstrateSource.local(root)
 
 
-@pytest.mark.skipif(not Path(CHROME).exists(), reason="Chrome is not installed")
+@needs_browser
 def test_the_default_cockpit_in_a_browser_offers_no_rename_and_no_text_edit_on_a_hidden_character_row(tmp_path: Path) -> None:
     src = _bare_install(tmp_path, ["plain seed", "zero​width seed"])
     with _serve(src, surface_tokens={"browser": "T"}, install_class="reported") as (url, _httpd):
         dom = _dump(f"{url}/?source=manifest#write_token=T")
     assert "plain seed" in dom and "&lt;U+200B&gt;" in dom, dom[:400]
     assert 'class="name-edit"' not in dom, "rename is not offered by the kernel"
-    assert 'placeholder="Add a note' in dom, "an empty Keep still has its capture box"
+    assert 'aria-label="add a line to the List"' in dom, "the List has its capture box (the Keep's note box retired with the Keep)"
     edits = re.findall(r'<button[^>]*data-verb="spore_update"[^>]*>edit</button>', dom)
     locked = [b for b in edits if "hidden characters" in b]
     assert len(edits) == 2 and len(locked) == 1 and "disabled" in locked[0], edits
@@ -124,7 +125,7 @@ def test_action_verb_fields_must_be_none_or_a_tuple_of_unique_non_empty_strings(
             ActionVerb(handler=h, fields=bad)
 
 
-@pytest.mark.skipif(not Path(CHROME).exists(), reason="Chrome is not installed")
+@needs_browser
 def test_the_default_page_draws_the_manifest_and_offers_a_downstream_send(tmp_path: Path) -> None:
     """The useManifest flip (HANDOFF OPEN #2): the default page is the manifest source, so an embedder's
     downstream send fires through /cockpit/verb and the broker. Before the flip `/` drew the legacy page,
@@ -140,6 +141,6 @@ def test_the_default_page_draws_the_manifest_and_offers_a_downstream_send(tmp_pa
                 install_class="reported") as (url, _httpd):
         default = _dump(f"{url}/#write_token=T")
         legacy = _dump(f"{url}/?source=substrate#write_token=T")
-    # the shell draws a card's count as its own chip beside the title (`<h2>Tray</h2><span class="ck-count">1`), not inside it
-    assert '<h2>Tray</h2><span class="ck-count">' in default and 'aria-label="message"' in default, default[:400]
-    assert '<h2>Tray</h2><span class="ck-count">' not in legacy and 'aria-label="message"' not in legacy
+    # the shell draws a card's count as its own chip beside the title (`<h2>List</h2><span class="ck-count">1`), not inside it
+    assert '<h2>List</h2><span class="ck-count">' in default and 'aria-label="message"' in default, default[:400]
+    assert '<h2>List</h2><span class="ck-count">' not in legacy and 'aria-label="message"' not in legacy

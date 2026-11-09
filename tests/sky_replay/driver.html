@@ -33,15 +33,21 @@
   setTimeout(function () {
     late.forEach(function (e, i) { setTimeout(function () { feed.push(e); sky.update({ events: feed.slice(), legend: R.legend }); if (i === 0) out.pendingAfterFirst = S.pending; }, i * 150); });
   }, 300);
-  setTimeout(function () {
-    out.framesAfterArrivals = S.frames; out.pendingAtRest = S.pending;
+  // No fixed settle time: a loaded runner stretches the meteors' flight. Wait until every arrival has been fed and
+  // nothing is pending (state, not the wall clock), then require the frame counter to stand still. The deadline
+  // is only a backstop so a loop that never rests still reports (and fails) instead of hanging.
+  var DEADLINE = performance.now() + 25000;
+  (function settle() {
+    var arrived = feed.length - base.length === late.length;
+    if (!(arrived && S.pending === 0) && performance.now() < DEADLINE) return setTimeout(settle, 100);
+    out.framesAfterArrivals = S.frames; out.pendingAtRest = S.pending; out.arrived = arrived;
     out.restFramesAdvance = null;
     var f = S.frames;
     setTimeout(function () {
       out.restFramesAdvance = S.frames - f;
-      out.pass = out.framesAfterArrivals > 0 && out.pendingAtRest === 0 && out.restFramesAdvance === 0;
+      out.pass = arrived && out.framesAfterArrivals > 0 && out.pendingAtRest === 0 && out.restFramesAdvance === 0;
       document.getElementById('result').textContent = 'RESULT ' + JSON.stringify(out);
     }, 1500);
-  }, 2500);
+  })();
 })();
 </script>
