@@ -25,7 +25,7 @@ import os
 import re
 import stat
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence, Tuple
 
@@ -45,6 +45,8 @@ YES, NO = "yes", "no"
 TERMINAL, DESK, PHONE = "terminal", "desk", "phone"
 CHANNELS = (TERMINAL, DESK, PHONE)
 _SIG_MAX = 16 * 1024
+LEASE_DAYS = 30            # a rule is a lease from the signed answer's own time, as a graduation policy is
+REMIND_DAYS = 3            # a renewal row is on the band from this many days before it lapses
 
 # The three kinds of approval the dialog saves as a rule. A bare tool name for Bash, a wildcard-only pattern and
 # anything with a line break or control character are not a shape the dialog writes.
@@ -211,18 +213,47 @@ def rules_of(path: Path) -> List[str]:
 EVIDENCE_KEYS = ("question_id", "channel", "signer_fp", "message", "sig", "answered_at")
 
 
+def _signed_at(ev: Mapping[str, Any]) -> datetime:
+    """The time the signed message names (``at``): inside the signed bytes, so it cannot be edited without breaking the
+    signature, and the lease runs from it."""
+    from levain.consent import terminal_sign as ts
+
+    raw = ev["message"].encode("utf-8")
+    return (ts.parse_desk_verified(raw) if ev["channel"] == DESK else ts.parse_verified(raw)).at
+
+
+def lease_end(ev: Mapping[str, Any]) -> Optional[datetime]:
+    """When the lease of the rule ``ev`` carries lapses, derived from the signed message; ``None`` when it cannot be."""
+    try:
+        return _signed_at(ev) + timedelta(days=LEASE_DAYS)
+    except Exception:  # noqa: BLE001
+        return None
+
+
 def append(path: Path, rule: str, session: str, evidence: Mapping[str, Any], now: Callable[[], str] = _now) -> bool:
     """Add ``rule`` with where it came from and the signed answer that carries it (``evidence``: the fields of
-    :data:`EVIDENCE_KEYS`). False when it is already there. Storing evidence is no proof of it: every launch verifies
+    :data:`EVIDENCE_KEYS`), recording the lease's end. A rule already there is renewed (its entry replaced, the lease
+    reset) when the new answer was signed later, else False. Storing evidence is no proof of it: every launch verifies
     it again (:func:`carried`)."""
+    from levain.cockpit.consent import utc_stamp
+
     if not shape_ok(rule):
         raise AllowRefused("not a dialog rule shape")
     if not isinstance(evidence, Mapping) or any(type(evidence.get(k)) is not str for k in EVIDENCE_KEYS):
         raise AllowRefused("a rule is stored with the signed answer that carries it")
+    end = lease_end(evidence)
+    if end is None:
+        raise AllowRefused("the signed answer's time cannot be read")
     doc = load(path)
-    if any(r["rule"] == rule for r in doc["rules"]):
-        return False
-    doc["rules"].append({"rule": rule, "session": session, "signed_at": now(), **{k: evidence[k] for k in EVIDENCE_KEYS}})
+    entry = {"rule": rule, "session": session, "signed_at": now(), "expires_at": utc_stamp(end),
+             **{k: evidence[k] for k in EVIDENCE_KEYS}}
+    old = [r for r in doc["rules"] if r["rule"] == rule]
+    if old:
+        prev = lease_end(old[0]) if isinstance(old[0].get("message"), str) and old[0].get("channel") in CHANNELS else None
+        if prev is not None and prev >= end:
+            return False
+        doc["rules"] = [r for r in doc["rules"] if r["rule"] != rule]
+    doc["rules"].append(entry)
     _save(path, doc)
     return True
 
@@ -264,7 +295,8 @@ def _no_live_check(public_key: str) -> Tuple[Optional[bool], str]:
 
 
 def verify_evidence(rule: str, ev: Mapping[str, Any], *, authority: Any, store_id: Optional[str],
-                    ctk: Optional[Callable[[str], Tuple[Optional[bool], str]]] = None) -> Optional[str]:
+                    ctk: Optional[Callable[[str], Tuple[Optional[bool], str]]] = None,
+                    now: Optional[datetime] = None, lease: bool = False) -> Optional[str]:
     """Why ``ev`` is not the operator's signature over a yes to exactly ``rule`` in this store, or ``None`` when it is.
     Both the question and the answer the signed message must name are rebuilt from ``rule`` (:func:`asked_text`,
     :func:`yes_text`), never read from the row; the key must be active in ``authority`` (a verified replay of the
@@ -272,7 +304,16 @@ def verify_evidence(rule: str, ev: Mapping[str, Any], *, authority: Any, store_i
     class covers signing for a phone countersign. Nothing here reads the question store: the signed bytes are the whole
     evidence. Never raises."""
     try:
-        return _verify_evidence(rule, ev, authority, store_id, ctk)
+        why = _verify_evidence(rule, ev, authority, store_id, ctk)
+        if why is None and lease:
+            from levain.cockpit.consent import utc_stamp
+
+            end = lease_end(ev)
+            if end is None or ev.get("expires_at") != utc_stamp(end):
+                return "its lease is not the one the signed answer names"
+            if (now or datetime.now(timezone.utc)) >= end:
+                return f"its {LEASE_DAYS}-day lease lapsed {utc_stamp(end)}: answer its renewal row on the band"
+        return why
     except Exception as exc:  # noqa: BLE001 - evidence that cannot be checked does not carry
         return f"its signature could not be checked ({type(exc).__name__})"
 
@@ -425,7 +466,8 @@ def rule_evidence(store: Any, question: Any, rule: str, judge: Judge) -> Tuple[O
     return (None, why) if why else (ev, "")
 
 
-def carried(path: Path, judge: Optional[Judge], store_id: Optional[str]) -> Tuple[List[str], List[Tuple[str, str]]]:
+def carried(path: Path, judge: Optional[Judge], store_id: Optional[str],
+            now: Optional[datetime] = None) -> Tuple[List[str], List[Tuple[str, str]]]:
     """``(rules, not_carried)`` from ``path``: a stored rule is carried only when its evidence verifies now, against the
     authority log as it stands (a swapped rule, an edited message, a revoked key and a rule with no evidence all fail).
     ``not_carried`` pairs each failing rule with why. A judge that cannot be had carries nothing."""
@@ -443,7 +485,7 @@ def carried(path: Path, judge: Optional[Judge], store_id: Optional[str]) -> Tupl
     ok: List[str] = []
     bad: List[Tuple[str, str]] = []
     for r in rules:
-        why = verify_evidence(r["rule"], r, authority=snapshot, store_id=store_id, ctk=_no_live_check)
+        why = verify_evidence(r["rule"], r, authority=snapshot, store_id=store_id, ctk=_no_live_check, now=now, lease=True)
         if why is None:
             ok.append(r["rule"])
         else:
@@ -471,7 +513,8 @@ def _save_pending(qdir: Path, rows: Mapping[str, Any]) -> None:
     _save(qdir / PENDING_NAME, {"format": PENDING_FORMAT, "rows": dict(rows)})
 
 
-def file_rows(qdir: Path, session: str, rules: Sequence[str], store: Any = None) -> List[str]:
+def file_rows(qdir: Path, session: str, rules: Sequence[str], store: Any = None,
+              lease: Optional[Mapping[str, str]] = None) -> List[str]:
     """One band row per rule (a yes and a no), listing the rule verbatim. A rule already on the band (open, or
     answered by a person) files nothing again. Returns the rules newly filed. Never writes the allow file."""
     from levain.consent.questions import ANSWER_CHANNELS, QuestionStore
@@ -482,18 +525,42 @@ def file_rows(qdir: Path, session: str, rules: Sequence[str], store: Any = None)
     for rule in rules:
         if not shape_ok(rule):
             continue
-        key = _key(rule)
+        ends = (lease or {}).get(rule)          # a renewal row is told apart by the lease it renews
+        key = _key(rule) if ends is None else _key(f"{rule}\x00renews {ends}")
         q, new = qs.file_once(
             agent=AGENT, key=key, cwd=str(qdir), held_by=ANSWER_CHANNELS, rec=NO,
             what=asked_text(rule),
             options=[(YES, yes_label(rule)), (NO, "No: keep asking")],
             blocks=(f"nothing: the slot already ran. Yes adds the rule to {FILE_NAME} (slot sessions only; never "
-                    f"your checkout or your own sessions); No asks again next run. Session {session}."))
+                    f"your checkout or your own sessions), for {LEASE_DAYS} days; No asks again next run. Session {session}."
+                    if ends is None else
+                    f"nothing changes today. The rule's {LEASE_DAYS}-day lease ends {ends}: yes renews it for another "
+                    f"{LEASE_DAYS} days from now; without it the rule lapses and slots ask again."))
         if new:
             pend[key] = {"rule": rule, "session": session, "question_id": q.id}
             filed.append(rule)
     if filed:
         _save_pending(qdir, pend)
+    return filed
+
+
+def remind(qdir: Path, allow_file: Path, store: Any = None, now: Optional[datetime] = None) -> List[str]:
+    """File ONE renewal row for each carried rule whose lease ends within :data:`REMIND_DAYS` (or has ended), keyed by
+    the rule and the lease it renews, so it is filed once per lease. The row is the rule's ordinary question, so its
+    signed yes is the renewal. Returns the rules filed."""
+    from levain.cockpit.consent import utc_stamp
+
+    doc = load(allow_file)
+    soon = (now or datetime.now(timezone.utc)) + timedelta(days=REMIND_DAYS)
+    due: Dict[str, str] = {}
+    for r in doc["rules"]:
+        end = lease_end(r) if isinstance(r.get("message"), str) and r.get("channel") in CHANNELS else None
+        if end is not None and end <= soon:
+            due[r["rule"]] = utc_stamp(end)
+    sessions = {r["rule"]: str(r.get("session", "?")) for r in doc["rules"]}
+    filed: List[str] = []
+    for rule, ends in due.items():
+        filed += file_rows(qdir, sessions[rule], [rule], store=store, lease={rule: ends})
     return filed
 
 
@@ -618,7 +685,11 @@ def run(args: Any, out: Any = None) -> int:
                 ok, bad = [], [(r["rule"], f"not checked ({type(e).__name__})") for r in doc["rules"]]
             why = dict(bad)
             for r in doc["rules"]:
-                where = f"session {r.get('session', '?')}, via {r.get('channel', '?')}, key {r.get('signer_fp', '?')}, signed {r.get('signed_at', '?')}"
+                end = lease_end(r) if isinstance(r.get("message"), str) and r.get("channel") in CHANNELS else None
+                left = "lease unknown" if end is None else (
+                    f"{(end - datetime.now(timezone.utc)).days} days left" if end > datetime.now(timezone.utc) else "lapsed")
+                where = (f"session {r.get('session', '?')}, via {r.get('channel', '?')}, key {r.get('signer_fp', '?')}, "
+                         f"signed {r.get('signed_at', '?')}, {left}")
                 if r["rule"] in why:
                     out.write(f"{r['rule']}\t(NOT CARRIED: {why[r['rule']]}; {where})\n")
                 else:
@@ -648,4 +719,4 @@ def run(args: Any, out: Any = None) -> int:
 
 __all__ = ["AGENT", "AllowRefused", "FILE_NAME", "FORMAT", "NO", "YES", "append", "apply_answered", "file_rows", "load",
            "merge_into_frozen", "parse_local_allow", "read_regular", "register", "revoke", "run", "rules_of", "shape_ok", "undo", "not_carried",
-           "Judge", "carried", "default_judge", "rule_evidence", "verify_evidence", "asked_text", "yes_text"]
+           "Judge", "carried", "lease_end", "remind", "default_judge", "rule_evidence", "verify_evidence", "asked_text", "yes_text"]
