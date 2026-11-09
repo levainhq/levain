@@ -92,4 +92,59 @@ def run(name: str, *, stdin: Optional[TextIO] = None, stdout: Optional[TextIO] =
     return 0
 
 
-__all__ = ["ADAPTER_MODULE", "REFUSED_EXIT", "refuse", "run"]
+CONFIG_PAYLOAD_MAX = 64 * 1024
+_FIELD_MAX = 300
+
+
+def _field(event: Any, key: str) -> str:
+    v = event.get(key) if isinstance(event, dict) else None
+    return v[:_FIELD_MAX].replace("\n", " ") if isinstance(v, str) else "?"
+
+
+def file_config_alarm(environ: Mapping[str, str], event: Any) -> Optional[str]:
+    """Record one ConfigChange alarm in the gate's own ledger (:func:`levain.consent.ledger.gate_row`, the record every
+    gated call leaves): a denied-by-gate row for the tool ``ConfigChange:<source>`` whose input (kept as a digest, as every
+    ledger row's is) is the event's ``source`` and ``file_path``, in the consent directory ``environ`` names. Returns the row id; None on any failure, and never
+    raises."""
+    try:
+        from levain.consent.adapters.claude_code import AGENT
+        from levain.consent.ledger import gate_row
+        from levain.consent.queue import queue_dir_for
+
+        session = event.get("session_id") if isinstance(event, dict) else None
+        cwd = event.get("cwd") if isinstance(event, dict) else None
+        return gate_row(AGENT, queue_dir_for(environ), event if isinstance(event, dict) else {},
+                 session if isinstance(session, str) and session else "config-change",
+                 "ConfigChange:" + _field(event, "source")[:40], {"source": _field(event, "source"), "file_path": _field(event, "file_path")},
+                 cwd if isinstance(cwd, str) and cwd else "/", refused="config-change")
+    except BaseException:  # noqa: BLE001 - the alarm is a record; the block does not depend on it
+        return None
+
+
+def config_guard(name: str, *, stdin: Optional[TextIO] = None, stderr: Optional[TextIO] = None,
+                 environ: Optional[Mapping[str, str]] = None,
+                 record: Optional[Callable[[Mapping[str, str], Any], None]] = None) -> int:
+    """The ``ConfigChange`` hook: every settings change in a running slot session is BLOCKED (exit
+    :data:`REFUSED_EXIT`, which stops the change from taking effect) and one alarm line goes to stderr and to the gate
+    ledger. A frozen session reads no settings file live, so a change is either a mistake or a tamper; the payload
+    is never trusted (it may be empty, not JSON, or not an object), and nothing it holds can make this return 0."""
+    import json
+
+    err: Any = None
+    try:
+        err = stderr if stderr is not None else sys.stderr
+        raw = (stdin if stdin is not None else sys.stdin).read(CONFIG_PAYLOAD_MAX)
+        try:
+            event = json.loads(raw)
+        except ValueError:
+            event = None
+        err.write("levain hook %s: blocked a settings change (source=%s file_path=%s)\n"
+                  % (name, _field(event, "source"), _field(event, "file_path")))
+        err.flush()
+        (record or file_config_alarm)(os.environ if environ is None else environ, event)
+    except BaseException:  # noqa: BLE001 - whatever failed, the change stays blocked
+        pass
+    return REFUSED_EXIT
+
+
+__all__ = ["ADAPTER_MODULE", "REFUSED_EXIT", "config_guard", "file_config_alarm", "refuse", "run"]

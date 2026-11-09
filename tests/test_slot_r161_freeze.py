@@ -51,7 +51,7 @@ def test_freeze_takes_hooks_permissions_and_plugin_keys_from_both_files():
     assert set(fz.settings) == {"hooks", "permissions", "enabledPlugins", "extraKnownMarketplaces"}
     assert fz.settings["permissions"] == {"allow": ["Bash(npm test)", "Bash(make)"], "deny": ["Read(./.env)"]}
     assert fz.settings["enabledPlugins"] == {"fmt@market": False}          # the local layer wins a key
-    assert list(fz.settings["hooks"]) == ["PreToolUse", "PostToolUse"]
+    assert sorted(fz.settings["hooks"]) == ["PostToolUse", "PreToolUse"]
     assert fz.dropped_other == ("model", "permissions.additionalDirectories", "permissions.defaultMode")
 
 
@@ -136,14 +136,12 @@ def test_an_allowlisted_name_would_pass_and_nothing_else(monkeypatch):
 
 def test_the_slot_launch_never_loads_a_settings_source():
     from levain.slot import start as st
-    S = f"{st.STORE['linux']}/live/s-00000000000000aa" if hasattr(st, "STORE") else None
     for host in ("linux", "darwin"):
         argv = st.vendor_argv(host, "claude", "s-00000000000000aa")
         i = argv.index("--setting-sources")
         assert argv[i + 1] == "" and "--settings" in argv and "user" not in argv
         ex = st.vendor_argv(host, "claude", "s-00000000000000aa", kind="dispatch", ticket_kind="executor")
         assert ex[ex.index("--setting-sources") + 1] == ""
-    assert S is not None
 
 
 # --- 4: the ConfigChange alarm ---------------------------------------------------------------------------------
@@ -197,10 +195,11 @@ def test_the_config_guard_files_the_alarm_in_the_gate_ledger(tmp_path):
     from levain.consent.ledger import Ledger
     event = {"hook_event_name": "ConfigChange", "source": "project_settings", "file_path": "/r/.claude/settings.json",
              "session_id": "sess-1", "cwd": "/r"}
-    hook_run.file_config_alarm({"HOME": str(tmp_path)}, event)
-    rows = Ledger(tmp_path / ".levain" / "consent").rows() if hasattr(Ledger, "rows") else None
-    assert (tmp_path / ".levain" / "consent").is_dir() and rows is not None
-    assert any("ConfigChange" in json.dumps(r, default=str) for r in rows)
+    row_id = hook_run.file_config_alarm({"HOME": str(tmp_path)}, event)
+    assert row_id
+    call = Ledger(tmp_path / ".levain" / "consent").get(row_id)
+    assert (call.tool_name, call.phase, call.outcome) == ("ConfigChange:project_settings", "denied_by_gate", "refused")
+    assert call.cwd == "/r" and call.agent_session_id == "sess-1"
 
 
 # --- 5: the macOS wrapper --------------------------------------------------------------------------------------

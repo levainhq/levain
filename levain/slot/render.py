@@ -35,6 +35,7 @@ import hashlib
 import json
 import os
 import re
+import shlex
 import unicodedata
 from dataclasses import dataclass, field
 from pathlib import PurePosixPath
@@ -51,9 +52,10 @@ from levain.slot import Refused
 from levain.slot.bwrap import LEVAIN_BWRAP
 from levain.slot.ids import SlotId, loopback_alias
 from levain.slot.layout import RUN, STORE
-from levain.slot.runtime_grammar import AUTHS, KINDS, RenderBlob, parse_stdin
+from levain.slot.runtime_grammar import (AUTHS, KINDS, REPO_FROZEN_KEYS, REPO_PERMISSION_LISTS, RenderBlob,
+                                         parse_stdin)
 from levain.slot.tickets import RENDERS_AS
-from levain.slot.wall import WallFacts, is_loader_env
+from levain.slot.wall import WallFacts
 
 VENDOR_PREFIX: Mapping[str, PurePosixPath] = {"darwin": PurePosixPath("/usr/local/lib/levain-vendor"),
                                               "linux": PurePosixPath("/usr/lib/levain-vendor")}   # §2.1
@@ -337,8 +339,11 @@ def check_facts(blob: RenderBlob, facts: RenderFacts) -> None:
     elif facts.var_folders:
         raise Refused("bad-config", "var_folders is macOS only")
     names = set(blob.hooks)
-    if set(facts.hook_templates) != names:
-        raise Refused("hook-template-missing", ",".join(sorted(names ^ set(facts.hook_templates))))
+    have = set(facts.hook_templates)
+    if facts.vendor == "claude":
+        have.discard(CONFIG_GUARD)          # the always-on ConfigChange alarm: optional here, supplied by production
+    if have != names:
+        raise Refused("hook-template-missing", ",".join(sorted(names ^ have)))
     for name, t in facts.hook_templates.items():
         if not _HOOK_NAME_RE.fullmatch(name) or not isinstance(t, HookTemplate) or type(t.body) is not bytes \
                 or not _HOOK_EVENT_RE.fullmatch(t.event) \
@@ -619,6 +624,124 @@ def env_text(env: Mapping[str, str]) -> bytes:
     return "".join(lines).encode("utf-8")
 
 
+# --- the repo's settings, frozen at render (row 161) ----------------------------------------------------------------
+
+#: The ONE list of env names a repo's settings ``env`` may set in a confined slot. Empty: every name a repo's
+#: ``env`` carries is dropped and reported by name. This is an allowlist by construction, not a denylist of the names
+#: known to be dangerous; a name joins it only by a reviewed edit here.
+REPO_ENV_ALLOW: frozenset = frozenset()
+
+#: The always-on ConfigChange alarm's hook name (``hook_templates`` makes its template; render wires it for a Claude
+#: session whose templates include it).
+CONFIG_GUARD = "levain_config"
+
+#: The names a macOS hook command takes from Claude Code's own environment, by fixed name and never by pattern: the
+#: queue cap (minted at exec and never rendered, so it cannot be a render-time value) and the three variables Claude
+#: Code sets for its hooks. Each is absent from the hook's environment when absent from Claude Code's.
+HOOK_INHERIT = ("LEVAIN_QUEUE_CAP", "CLAUDE_PROJECT_DIR", "CLAUDE_CODE_ENTRYPOINT", "CLAUDE_PID")
+
+
+@dataclass(frozen=True)
+class Frozen:
+    """What :func:`freeze_repo_settings` made: ``settings`` (the part that travels to the render helper), the env
+    names dropped (``dropped_env``, names only, sorted) and every other key not carried (``dropped_other``, dotted
+    names, sorted)."""
+
+    settings: Mapping[str, Any]
+    dropped_env: tuple
+    dropped_other: tuple
+
+
+def freeze_repo_settings(docs: Mapping[str, Any]) -> Frozen:
+    """The repo's committed settings layers (``docs``, as :func:`levain.slot.supervisor.repo_layer_docs` reads them:
+    ``.claude/settings.json`` then ``.claude/settings.local.json``, either optional) reduced to what the root-owned
+    layer carries: ``hooks`` (per event, the project file's groups then the local file's), the three ``permissions``
+    lists, and ``enabledPlugins`` / ``extraKnownMarketplaces`` (the local file wins a key). ``env`` goes through
+    :data:`REPO_ENV_ALLOW`. Any other key, and any other ``permissions`` key (``defaultMode``,
+    ``additionalDirectories``: in the flag layer they would take effect where in a project layer Claude Code ignores
+    them), is dropped and named. A value of the wrong shape is refused ``repo-settings-malformed``."""
+    hooks: dict = {}
+    perms: dict = {name: [] for name in REPO_PERMISSION_LISTS}
+    plug: dict = {k: {} for k in REPO_FROZEN_KEYS if k not in ("hooks", "permissions")}
+    env_kept: dict = {}
+    dropped_env: set = set()
+    dropped_other: set = set()
+
+    def bad(path: str, what: str) -> Refused:
+        return Refused("repo-settings-malformed", f"{path}: {what}")
+
+    for path in sorted(docs):
+        doc = docs[path]
+        if not isinstance(doc, Mapping):
+            raise bad(path, "not an object")
+        for key in sorted(doc):
+            v = doc[key]
+            if key == "hooks":
+                if not isinstance(v, Mapping):
+                    raise bad(path, "hooks")
+                for ev in sorted(v):
+                    groups = v[ev]
+                    if not isinstance(groups, list) or any(not isinstance(g, Mapping) for g in groups):
+                        raise bad(path, f"hooks.{ev}")
+                    hooks.setdefault(ev, []).extend(dict(g) for g in groups)
+            elif key == "permissions":
+                if not isinstance(v, Mapping):
+                    raise bad(path, "permissions")
+                for pk in sorted(v):
+                    if pk in perms:
+                        items = v[pk]
+                        if not isinstance(items, list) or any(type(i) is not str for i in items):
+                            raise bad(path, f"permissions.{pk}")
+                        perms[pk].extend(i for i in items if i not in perms[pk])
+                    else:
+                        dropped_other.add(f"permissions.{pk}")
+            elif key in plug:
+                if not isinstance(v, Mapping):
+                    raise bad(path, key)
+                plug[key].update(v)
+            elif key == "env":
+                if not isinstance(v, Mapping):
+                    raise bad(path, "env")
+                for name in sorted(v):
+                    if name in REPO_ENV_ALLOW:
+                        env_kept[name] = v[name]
+                    else:
+                        dropped_env.add(name)
+            else:
+                dropped_other.add(key)
+    out: dict = {}
+    if hooks:
+        out["hooks"] = hooks
+    kept_perms = {k: v for k, v in perms.items() if v}
+    if kept_perms:
+        out["permissions"] = kept_perms
+    out.update({k: v for k, v in plug.items() if v})
+    if env_kept:
+        out["env"] = env_kept
+    return Frozen(out, tuple(sorted(dropped_env)), tuple(sorted(dropped_other)))
+
+
+def _hook_env(blob: RenderBlob, facts: RenderFacts) -> dict:
+    envs = render_env(blob, facts)
+    return envs["child" if facts.slot.slot_class == "none" else "slot"]
+
+
+def hook_command(blob: RenderBlob, facts: RenderFacts, name: str) -> str:
+    """The command Claude Code runs for the root-owned hook ``name``. Linux: the script's absolute path. macOS: the
+    script under ``/usr/bin/env -i`` with every variable of the session's rendered env as a fixed ``NAME=value``
+    argument, plus the :data:`HOOK_INHERIT` names by fixed name, so the hook's interpreter (``/usr/bin/python3`` is
+    the xcode-select shim, which honours ``DEVELOPER_DIR``) starts from an environment Levain computed, not one
+    anything else in the session could add a name to."""
+    path = f"{facts.S}/root/hooks/{name}"
+    if facts.host != "darwin":
+        return path
+    parts = ["/usr/bin/env", "-i"]
+    parts += [shlex.quote(f"{k}={v}") for k, v in sorted(_hook_env(blob, facts).items())]
+    parts += ["${%s:+%s=\"$%s\"}" % (n, n, n) for n in HOOK_INHERIT]
+    parts.append(shlex.quote(path))
+    return " ".join(parts)
+
+
 # --- Claude Code flag layer + onboarding (§5.3) -------------------------------------------------------------
 
 def render_cc_settings(blob: RenderBlob, facts: RenderFacts) -> dict:
@@ -663,7 +786,7 @@ def render_cc_settings(blob: RenderBlob, facts: RenderFacts) -> dict:
             # (crash and timeout measured on PreToolUse, 1017-deadline/runs2 RUN C; can't-start, and a deny on
             # PermissionRequest, are Claude Code's documented behaviour, 2.1.295+, not measured here). A slot hook is a
             # gate, and a gate that opens when it breaks is not one.
-            handler: dict[str, Any] = {"type": "command", "command": f"{facts.S}/root/hooks/{name}",
+            handler: dict[str, Any] = {"type": "command", "command": hook_command(blob, facts, name),
                                        "onFailure": "block"}
             if t.timeout is not None:
                 handler["timeout"] = t.timeout
@@ -672,7 +795,33 @@ def render_cc_settings(blob: RenderBlob, facts: RenderFacts) -> dict:
                 entry["matcher"] = t.matcher
             events.setdefault(t.event, []).append(entry)
         out["hooks"] = events
+    t = facts.hook_templates.get(CONFIG_GUARD) if facts.vendor == "claude" else None
+    if t is not None:
+        # The alarm: every settings change in a running session is blocked and recorded (the watcher fires for the
+        # files `--setting-sources ""` leaves unread, too). Wired after the gate hooks, onFailure block like them.
+        handler = {"type": "command", "command": hook_command(blob, facts, CONFIG_GUARD), "onFailure": "block"}
+        if t.timeout is not None:
+            handler["timeout"] = t.timeout
+        out.setdefault("hooks", {}).setdefault(t.event, []).append({"hooks": [handler]})
+    if blob.repo_settings:
+        _merge_frozen(out, blob.repo_settings)
     return out
+
+
+def _merge_frozen(out: dict, repo: Mapping[str, Any]) -> None:
+    """Merge the frozen repo layer into ``out`` AFTER Levain's own entries, which are never displaced: a repo hook
+    group is appended to its event's list (a hook that denies beats one that allows, measured, so a repo entry on a
+    gate's own event cannot open it), a repo permission item is appended to Levain's list, and a plugin key is the
+    repo's unless Levain set one. Levain's scalar pins (``disableBypassPermissionsMode``, ``defaultMode``,
+    ``disableAllHooks``) are not in the frozen layer, so nothing here can reach them."""
+    for ev, groups in repo.get("hooks", {}).items():
+        out.setdefault("hooks", {}).setdefault(ev, []).extend(groups)
+    for k, items in repo.get("permissions", {}).items():
+        have = out["permissions"].setdefault(k, [])
+        have.extend(i for i in items if i not in have)
+    for k in ("enabledPlugins", "extraKnownMarketplaces"):
+        if k in repo:
+            out[k] = {**repo[k], **out.get(k, {})}
 
 
 #: identseed: the vendors whose gated sessions get the parked account block, and the only keys of it ever rendered (a
@@ -929,7 +1078,10 @@ def render(blob: RenderBlob, facts: RenderFacts) -> Rendered:
     if facts.kind in READSET_KINDS:
         # §2.1: root : root 0644 whatever the class, so the slot can read it and no slot group can change it.
         files.append(RenderedFile(READSET_ATTRIBUTES_PATH, READSET_ATTRIBUTES, 0, 0, 0o644))
-    for name in sorted(blob.hooks):
+    wired = set(blob.hooks)
+    if facts.vendor == "claude" and CONFIG_GUARD in facts.hook_templates:
+        wired.add(CONFIG_GUARD)
+    for name in sorted(wired):
         files.append(RenderedFile(f"root/hooks/{name}", facts.hook_templates[name].body, 0, rgid, xmode))
     # The onboarding pre-seed is the session vendor's only: a Codex session's CLAUDE_CONFIG_DIR stays empty, and a
     # Claude session's CODEX_HOME holds no config.toml (so §5.5 refuses any that appears there).
@@ -1030,11 +1182,11 @@ def repo_loosening_refusals(docs: Mapping[str, Any]) -> list[Refused]:
     layers the flag layer cannot pin; a ``sandbox.network`` or ``sandbox.filesystem`` that is not an object is
     ``repo-settings-malformed``),
     and a ``disableAllHooks`` that is anything but ``false`` (L2 M6; DECISION: a non-boolean is refused too, as
-    its meaning to CC is unmeasured), and an ``env`` naming the queue's vars, a :data:`PROXY_ENV` name, a dynamic-loader
-    name (``LD_*``, ``DYLD_*``), or a name ``levain.sandbox_keys.repo_env_rule`` refuses (PRE-L3 4-1; pf4r3: default
-    deny inside the vendor's namespace, provider prefixes and credential or endpoint suffixes outside it), and a
-    top-level key ``levain.sandbox_keys.repo_settings_rule`` refuses (a ``*Helper``, ``*AuthRefresh`` or
-    ``*CredentialExport``). A
+    its meaning to CC is unmeasured), and an ``env`` naming the queue's vars, a :data:`PROXY_ENV` name, or a name
+    ``levain.sandbox_keys.repo_env_rule`` refuses (PRE-L3 4-1; pf4r3: default deny inside the vendor's namespace,
+    provider prefixes and credential or endpoint suffixes outside it; every other ``env`` name is dropped by
+    :func:`freeze_repo_settings`, never rendered), and a top-level key ``levain.sandbox_keys.repo_settings_rule``
+    refuses (a ``*Helper``, ``*AuthRefresh`` or ``*CredentialExport``). A
     document that is not an object is refused ``repo-settings-malformed``.
     Hooks, permissions and every other key launch (plan §2c 3: the repo's settings are its own).
 
@@ -1065,16 +1217,13 @@ def repo_loosening_refusals(docs: Mapping[str, Any]) -> list[Refused]:
                 out.append(_refused("loosening", f"env.{name}", f"{path}: the queue's env is set by levain only"))
             for name in sorted(n for n in env if n in PROXY_ENV):
                 out.append(_refused("loosening", f"env.{name}", f"{path}: {name} is set by levain only"))
-            # A dynamic-loader name would load a repo library into the gate hook's interpreter (a cloned repo is an
-            # untrusted author); the wall also scrubs these at exec, so this is the visible half.
-            for name in sorted(n for n in env if is_loader_env(n)):
-                out.append(_refused("loosening", f"env.{name}", f"{path}: {name} steers the dynamic loader"))
             # PRE-L3 4-1: a key or bearer token Claude Code prefers to the stored login moves the bill of an unattended
             # run (or stops it at the "use this API key?" prompt), and an endpoint, provider switch, tenant or TLS
             # trust moves where its traffic goes and who pays; a vendor name off the allowlist is refused (pf4r3), the
-            # rule in the detail. The queue, proxy and loader names above keep their own refusal, once.
+            # rule in the detail. The queue and proxy names above keep their own refusal, once. (A dynamic-loader name
+            # needs no refusal of its own: freeze_repo_settings drops every other env name, so none is ever rendered.)
             for name in sorted((n for n in env if n not in PROXY_ENV and n not in (QUEUE_CAP_ENV, QUEUE_SOCKET_ENV)
-                                and not is_loader_env(n) and repo_env_rule(n)), key=str):
+                                and repo_env_rule(n)), key=str):
                 out.append(_refused("loosening", f"env.{name}",
                                     f"{path}: {name} is not a repo's to set ({repo_env_rule(name)})"))
         sb = doc.get("sandbox", {})
@@ -1227,7 +1376,7 @@ __all__ = [
     "front_limit_fields", "VENDOR_PREFIX", "READSET_ATTRIBUTES", "READSET_ATTRIBUTES_PATH", "READSET_KINDS", "READSET_TEMPLATE",
     "HookTemplate", "RenderFacts", "RenderedFile", "Rendered", "Contains", "DISCOVERY",
     "REPO_DISCOVERY", "wire_name", "gwport_for", "own_loopback", "check_facts", "render_env", "secret_env_names",
-    "is_print_executor", "TOKEN_ENV", "ABSENT_ENV", "PASSTHROUGH_ABSENT_ENV", "PASSTHROUGH_TICKET_KEYS", "check_env_absent", "PROXY_ENV", "CODEX_WEB_SEARCH", "CODEX_LAUNCH_ARGS", "egress_hosts",
+    "is_print_executor", "CONFIG_GUARD", "Frozen", "REPO_ENV_ALLOW", "freeze_repo_settings", "hook_command", "TOKEN_ENV", "ABSENT_ENV", "PASSTHROUGH_ABSENT_ENV", "PASSTHROUGH_TICKET_KEYS", "check_env_absent", "PROXY_ENV", "CODEX_WEB_SEARCH", "CODEX_LAUNCH_ARGS", "egress_hosts",
     "env_text", "render_cc_settings", "render_cc_onboarding", "codex_config", "codex_toml", "gitconfig_text",
     "assert_no_syscall", "check_driver_template", "profile_lines", "read_driver_template", "render_profile",
     "render_importer_profile", "render_verifier_profile",
