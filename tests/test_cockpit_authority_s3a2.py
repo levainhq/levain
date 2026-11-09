@@ -9,6 +9,7 @@ and ``levain.authority.append``.
 from __future__ import annotations
 
 import ast
+import functools
 import json
 import shutil
 import sqlite3
@@ -545,6 +546,30 @@ def test_the_anchor_is_read_before_the_snapshot_is_pinned(broker, keydir, monkey
 
 # --- structural fences ----------------------------------------------------------------------------
 
+_PARSED: dict[str, ast.AST] = {}
+
+
+def _parsed(source: str) -> ast.AST:
+    """``ast.parse`` of a source text, remembered by that text. The guards below only read a tree, never change one,
+    so every scan of the same text shares one parse; a planted copy's edited file has other text and parses afresh."""
+    if source not in _PARSED:
+        _PARSED[source] = ast.parse(source)
+    return _PARSED[source]
+
+
+def _by_tree(scan):
+    """Remember a scan of one parsed tree by the tree and its other arguments. A scan only reads the tree, and the
+    parse above hands the same tree to every scan of the same text, so a file that has not changed is not walked
+    again; a list result is handed out as a copy so no caller can change what is remembered."""
+    cached = functools.lru_cache(maxsize=None)(scan)
+
+    @functools.wraps(scan)
+    def run(*args):
+        result = cached(*args)
+        return list(result) if isinstance(result, list) else result
+    return run
+
+
 def _dotted(node: ast.AST) -> str | None:
     if isinstance(node, ast.Name):
         return node.id
@@ -591,9 +616,10 @@ def _module_aliases(tree: ast.AST, module: str) -> set[str]:
 def _uses(path: Path, names: tuple[str, ...], module: str = "levain.authority") -> list[tuple[str, str, int]]:
     """Calls in ``path`` of any of ``names`` from ``module``, as (name, enclosing function, line),
     through a from-import of the name or any alias of the module (:func:`_module_aliases`)."""
-    return _uses_in(ast.parse(path.read_text(encoding="utf-8")), names, module)
+    return _uses_in(_parsed(path.read_text(encoding="utf-8")), names, module)
 
 
+@_by_tree
 def _uses_in(tree: ast.AST, names: tuple[str, ...], module: str) -> list[tuple[str, str, int]]:
     modules = _module_aliases(tree, module)
     imported: dict[str, str] = {}
@@ -618,6 +644,7 @@ def _uses_in(tree: ast.AST, names: tuple[str, ...], module: str) -> list[tuple[s
     return found
 
 
+@_by_tree
 def _key_act_callers(tree: ast.AST) -> bool:
     """Whether ``tree`` reaches ``levain.cockpit.keys``' enroll, revoke or ledger_init: a from-import of
     any, or a call through any alias of the module."""
@@ -678,7 +705,7 @@ def test_the_replica_verify_is_only_the_append_transactions_check():
     """SNAPSHOT_BUILDERS' ``authority_replica._verify`` entry, held to its reason: ``_verify`` is called only from
     ``_txn``, after that function's ``BEGIN IMMEDIATE`` and before its ``COMMIT``, and ``append`` returns a ``Head``
     (``(seq, hash)``), so the snapshot it builds decides the write and reaches no reader."""
-    tree = ast.parse((LEVAIN / "agents" / "authority_replica.py").read_text(encoding="utf-8"))
+    tree = _parsed((LEVAIN / "agents" / "authority_replica.py").read_text(encoding="utf-8"))
     callers = [n for n in ast.walk(tree) if isinstance(n, ast.Call) and _dotted(n.func) == "self._verify"]
     txn = _function(tree, "_txn")
     assert len(callers) == 1 and _within(callers[0], txn)
@@ -709,7 +736,7 @@ def _check_the_coverage_replay(path: Path) -> None:
     ``sqlite3.connect`` is in ``_connect`` and opens a ``file:...?mode=ro`` URI with ``uri=True``; ``_replay``
     opens its connection through ``_connect`` and nothing else; every statement it executes itself is a literal
     in :data:`REPLAY_STATEMENTS`."""
-    tree = ast.parse(path.read_text(encoding="utf-8"))
+    tree = _parsed(path.read_text(encoding="utf-8"))
     connect_fn = _function(tree, "_connect")
     connects = [n for n in ast.walk(tree) if isinstance(n, ast.Call) and _dotted(n.func) == "sqlite3.connect"]
     assert connects and all(_within(c, connect_fn) for c in connects), "a sqlite3.connect outside _connect"
@@ -756,6 +783,7 @@ def test_the_coverage_replay_check_sees_a_planted_write_path(tmp_path, old, new,
         _check_the_coverage_replay(planted)
 
 
+@_by_tree
 def _key_setup_callers(tree: ast.AST) -> bool:
     """Whether ``tree`` reaches ``levain.chat_egress.key_setup``'s setup_key or revoke_key: a from-import of
     either, or a call through any alias of the module."""
@@ -983,18 +1011,18 @@ def _check_the_appenders(root: Path) -> None:
                                  ("voice/custody.py", "add_key", "append"),
                                  ("voice/custody.py", "add_key", "prepare")]
     for (rel, name), calls in PER_ACT_APPENDERS.items():
-        _check_per_act_append(_function(ast.parse((root / rel).read_text(encoding="utf-8")), name), calls)
-    _check_the_signing_module(ast.parse((root / "agents" / "signing.py").read_text(encoding="utf-8")))
+        _check_per_act_append(_function(_parsed((root / rel).read_text(encoding="utf-8")), name), calls)
+    _check_the_signing_module(_parsed((root / "agents" / "signing.py").read_text(encoding="utf-8")))
     for (rel, name), (param, acts) in HANDED_STEPS.items():
-        _check_handed_step(_function(ast.parse((root / rel).read_text(encoding="utf-8")), name), param, acts)
+        _check_handed_step(_function(_parsed((root / rel).read_text(encoding="utf-8")), name), param, acts)
     for (rel, name), param in HANDED_APPENDERS.items():
-        _check_handed_append(ast.parse((root / rel).read_text(encoding="utf-8")), name, param)
+        _check_handed_append(_parsed((root / rel).read_text(encoding="utf-8")), name, param)
     callers = [str(path.relative_to(root)) for path in sorted(root.rglob("*.py"))
-               if _key_act_callers(ast.parse(path.read_text(encoding="utf-8")))]
+               if _key_act_callers(_parsed(path.read_text(encoding="utf-8")))]
     assert callers == ["cli.py"]
     # the egress key acts are reached only from the CLI's commands, like the cockpit key acts
     setup_callers = [str(path.relative_to(root)) for path in sorted(root.rglob("*.py"))
-                     if _key_setup_callers(ast.parse(path.read_text(encoding="utf-8")))]
+                     if _key_setup_callers(_parsed(path.read_text(encoding="utf-8")))]
     assert setup_callers == ["cli.py"]
 
     holders = ("_journal", "CockpitDB")
@@ -1008,24 +1036,24 @@ def _check_the_appenders(root: Path) -> None:
         and any(isinstance(n, ast.Name) and n.id == "append_revoke"
                 or isinstance(n, ast.Attribute) and n.attr == "append_revoke"
                 or isinstance(n, ast.alias) and n.name == "append_revoke"
-                for n in ast.walk(ast.parse(p.read_text(encoding="utf-8")))))
+                for n in ast.walk(_parsed(p.read_text(encoding="utf-8")))))
     assert revoke_callers == ["consent/grant_phone.py"]
     # the journal is built inside append_revoke's body, and grants.py builds none at module level
-    grants = ast.parse((root / "consent" / "grants.py").read_text(encoding="utf-8"))
+    grants = _parsed((root / "consent" / "grants.py").read_text(encoding="utf-8"))
     fn = next(n for n in grants.body if isinstance(n, ast.FunctionDef) and n.name == "append_revoke")
     assert any(isinstance(n, ast.Call) and _dotted(n.func) == "_journal" for n in ast.walk(fn))
     module_level = [n for n in grants.body if not isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef))
                     and builds_journal(n)]
     assert module_level == []
     # key_setup builds its journal inside each act's body, and none at module level
-    setup = ast.parse((root / "chat_egress" / "key_setup.py").read_text(encoding="utf-8"))
+    setup = _parsed((root / "chat_egress" / "key_setup.py").read_text(encoding="utf-8"))
     for act in ("setup_key", "revoke_key"):
         fn = next(n for n in setup.body if isinstance(n, ast.FunctionDef) and n.name == act)
         assert any(isinstance(n, ast.Call) and _dotted(n.func) == "_journal" for n in ast.walk(fn)), act
     assert [n for n in setup.body if not isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef))
             and builds_journal(n)] == []
     # and the phone surface keeps no journal on itself between requests
-    phone = ast.parse((root / "consent" / "grant_phone.py").read_text(encoding="utf-8"))
+    phone = _parsed((root / "consent" / "grant_phone.py").read_text(encoding="utf-8"))
     kept = [n.lineno for n in ast.walk(phone) if isinstance(n, (ast.Assign, ast.AnnAssign, ast.AugAssign))
             and builds_journal(n.value if n.value is not None else n)
             and any(isinstance(t, ast.Attribute) for t in (n.targets if isinstance(n, ast.Assign) else [n.target]))]
