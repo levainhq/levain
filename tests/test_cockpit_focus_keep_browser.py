@@ -110,10 +110,11 @@ def test_an_idle_empty_focused_field_does_not_freeze_the_board(tmp_path: Path) -
     root, src, steps = _start(tmp_path, False, INPUT)
     # the counter is reset AFTER the focus step, so a redraw that landed before the focus cannot satisfy the wait
     steps += [{"eval": f"{INPUT}.focus(); window.__redraws = 0; JSON.stringify({{on: document.activeElement === {INPUT}}})"},
-              {"until": REDRAWN}, {"eval": "JSON.stringify({r: window.__redraws})"}]
+              {"until": REDRAWN}, {"eval": f"JSON.stringify({{r: window.__redraws, on: document.activeElement === {INPUT}}})"}]
     vals = _run_steps(tmp_path, root, src, steps)
     assert json.loads(vals[-3])["on"], vals[-3]
-    assert json.loads(vals[-1])["r"] > 0
+    got = json.loads(vals[-1])
+    assert got["r"] > 0 and got["on"], got      # the draw happened, and the keyboard is still in the box after it
 
 
 @needs_browser
@@ -213,12 +214,74 @@ def _selection_kept(tmp_path: Path, box: str, open_modal: bool) -> dict:
 
 
 @needs_browser
-def test_selection_mid_text_survives_a_board_redraw(tmp_path: Path) -> None:
+def test_a_text_field_keeps_focus_through_a_board_redraw_without_its_old_text(tmp_path: Path) -> None:
     got = _selection_kept(tmp_path, INPUT, open_modal=False)
-    assert got == {"rebuilt": True, "kept": True, "v": "hello world", "s": 3, "e": 7}, got
+    assert got == {"rebuilt": True, "kept": True, "v": "", "s": 0, "e": 0}   # the text is the draw's to keep or drop, never put back here, got
 
 
 @needs_browser
-def test_selection_mid_text_survives_a_modal_redraw(tmp_path: Path) -> None:
+def test_a_text_field_keeps_focus_through_a_modal_redraw_without_its_old_text(tmp_path: Path) -> None:
     got = _selection_kept(tmp_path, MODAL_INPUT, open_modal=True)
-    assert got == {"rebuilt": True, "kept": True, "v": "hello world", "s": 3, "e": 7}, got
+    assert got == {"rebuilt": True, "kept": True, "v": "", "s": 0, "e": 0}   # the text is the draw's to keep or drop, never put back here, got
+
+
+SAFE_REDRAW = "(() => { try { window.LevainDashboard.redraw(); return 'ok'; } catch (e) { return 'threw ' + e.message; } })()"
+
+
+def _redraw_with(tmp_path: Path, box: str, prepare: str) -> dict:
+    """A real field the redraw rebuilds, prepared on the live node; what the draw did and where the keyboard is after."""
+    root, src, steps = _start(tmp_path, False, box)
+    steps += [{"until": f"{box} && 1"},
+              {"eval": f"const f = {box}; f.focus(); {prepare} window.__old = f; 1"},
+              {"eval": f"const r = {SAFE_REDRAW}; JSON.stringify({{r, rebuilt: window.__old !== {box}, "
+                       f"on: document.activeElement === {box}, v: {box}.value}})"}]
+    return json.loads(_run_steps(tmp_path, root, src, steps, churn=False)[-1])
+
+
+@needs_browser
+def test_a_focused_field_whose_type_has_no_selection_survives_a_redraw(tmp_path: Path) -> None:
+    # selection reads on such a type can throw: the draw must not, and the keyboard comes back
+    got = _redraw_with(tmp_path, INPUT, "Object.defineProperty(f, 'selectionStart', {get() { throw new Error('no selection'); }});")
+    assert got == {"r": "ok", "rebuilt": True, "on": True, "v": ""}, got
+
+
+@needs_browser
+def test_a_field_whose_class_is_only_whitespace_survives_a_redraw(tmp_path: Path) -> None:
+    got = _redraw_with(tmp_path, INPUT, "f.className = '  ';")
+    assert got["r"] == "ok" and got["rebuilt"], got
+
+
+@needs_browser
+def test_a_redraw_never_puts_the_old_text_back(tmp_path: Path) -> None:
+    # the old field's text was sent or discarded by the write that caused the draw: the rebuilt twin stays empty, and focused
+    got = _redraw_with(tmp_path, INPUT, "f.value = 'sent text';")   # set without an input event: the kept draft stays empty
+    assert got == {"r": "ok", "rebuilt": True, "on": True, "v": ""}, got
+
+
+@needs_browser
+def test_a_stream_repaint_of_a_panel_body_keeps_the_focused_field(tmp_path: Path) -> None:
+    # a typed panel's body is repainted in place by a refetch: a field in it, focused, is rebuilt by that repaint and takes the keyboard back
+    from levain.cockpit.providers import build_default_cockpit
+    from tests.test_cockpit_expand_keep import NARROW, _install_long, _things
+    from tests.test_cockpit_scroll_keep_page import _Served
+
+    _root, src = _install_long(tmp_path)
+    ck = build_default_cockpit(src)
+    ck.register(_things({"first": 0.0}, ["alpha", "beta"]))
+    panel = "document.querySelector('[data-ck-panel=things]')"
+    body = f"{panel}.querySelector('.row').parentElement"
+    # the body's repaint (replaceChildren) rebuilds the field in the same stroke, as a drawn form does
+    arm = (f"(() => {{ const b = {body}; const make = () => {{ const i = document.createElement('input'); i.id = 'mb'; i.type = 'text'; b.appendChild(i); return i; }};"
+           " const orig = b.replaceChildren.bind(b); b.replaceChildren = (...a) => { orig(...a); make(); };"
+           " const f = make(); f.focus(); window.__old = f; return 1; })()")
+    with _Served(src, cockpit=ck, surface_tokens={"browser": "T"}, install_class="reported") as url:
+        out = _drive(tmp_path, f"{url}/", [
+            NARROW,
+            {"until": f"{panel} && {panel}.querySelector('.row') && 1"},
+            {"eval": arm},
+            {"eval": "window.LevainCockpitView.refetchPanel('things')"},
+            {"eval": "JSON.stringify({rebuilt: window.__old !== document.getElementById('mb'), on: document.activeElement === document.getElementById('mb')})"},
+        ])
+    v = out["values"]
+    assert v[2] == "applied", v
+    assert json.loads(v[3]) == {"rebuilt": True, "on": True}, v

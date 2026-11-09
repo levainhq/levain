@@ -9369,14 +9369,19 @@
   const isTextField = (a) => !!a && a.tagName && (a.tagName === "TEXTAREA" ||
     (a.tagName === "INPUT" && !/^(button|submit|reset|checkbox|radio|file|image|range|color)$/i.test(a.type || "")));
   const cssq = (s) => (window.CSS && CSS.escape ? CSS.escape(s) : String(s).replace(/[^\w-]/g, "\\$&"));
+  let fieldWarned = false;
+  const fieldWarn = (e) => { if (!fieldWarned) { fieldWarned = true; try { console.warn("focus keep skipped:", e); } catch (x) { /* no console */ } } };
+  // a type with no selection (email, number, date...) throws on the read and on the write: neither may break a draw
+  const selOf = (a) => { try { return [a.selectionStart, a.selectionEnd]; } catch (e) { return [null, null]; } };
   function captureField() {
-    const a = document.activeElement;
-    if (!isTextField(a) || !a.closest) return null;
-    const region = a.closest(FOCUS_REBUILT);
-    if (!region || !region.id) return null;
-    let sel = "";
-    if (a.id) sel = "#" + cssq(a.id);
-    else {
+    try {
+      const a = document.activeElement;
+      if (!isTextField(a) || !a.closest) return null;
+      const region = a.closest(FOCUS_REBUILT);
+      if (!region || !region.id) return null;
+      const [ss, se] = selOf(a);
+      const base = { nth: 0, region: region.id, ss, se, st: a.scrollTop, el: a };
+      if (a.id) return Object.assign(base, { sel: "#" + cssq(a.id) });
       const path = [];
       for (let n = a.parentElement; n && n !== region; n = n.parentElement) {
         for (const k of FIELD_KEYS) {
@@ -9384,24 +9389,24 @@
           if (v !== null && v !== undefined && v !== "") { path.unshift("[" + k + "=\"" + String(v).replace(/["\\]/g, "\\$&") + "\"]"); break; }
         }
       }
-      const cls = (a.className && typeof a.className === "string" ? a.className.trim().split(/\s+/) : []).map((c) => "." + cssq(c)).join("");
+      const cls = (a.className && typeof a.className === "string" ? a.className.split(/\s+/).filter(Boolean) : []).map((c) => "." + cssq(c)).join("");
       const tail = a.tagName.toLowerCase() + cls;
       const scope = "#" + cssq(region.id) + (path.length ? " " + path.join(" ") : "");
       const same = Array.from(region.querySelectorAll(path.length ? path.join(" ") + " " + tail : tail));
-      sel = scope + " " + tail;
-      return { sel, nth: same.indexOf(a), region: region.id, value: a.value, ss: a.selectionStart, se: a.selectionEnd, st: a.scrollTop, el: a };
-    }
-    return { sel, nth: 0, region: region.id, value: a.value, ss: a.selectionStart, se: a.selectionEnd, st: a.scrollTop, el: a };
+      return Object.assign(base, { sel: scope + " " + tail, nth: same.indexOf(a) });
+    } catch (e) { fieldWarn(e); return null; }
   }
+  // Focus, selection and scroll only: the value is never put back (a write that cleared the field must stay cleared).
   function restoreField(f) {
-    if (!f || document.activeElement === f.el && f.el.isConnected) return;
-    let t = null;
-    try { const all = document.querySelectorAll(f.sel); t = all[Math.max(0, f.nth)] || (f.nth < 0 ? all[0] : null) || null; } catch (e) { t = null; }
-    if (!t || !isTextField(t)) return;
-    if (t.value === "" && f.value) t.value = f.value;
-    t.focus({ preventScroll: true });
-    try { if (f.ss !== null && f.ss !== undefined) t.setSelectionRange(f.ss, f.se); } catch (e) { /* a type with no selection */ }
-    if (f.st) t.scrollTop = f.st;
+    try {
+      if (!f || document.activeElement === f.el && f.el.isConnected) return;
+      let t = null;
+      try { const all = document.querySelectorAll(f.sel); t = all[Math.max(0, f.nth)] || (f.nth < 0 ? all[0] : null) || null; } catch (e) { t = null; }
+      if (!t || !isTextField(t)) return;
+      t.focus({ preventScroll: true });
+      try { if (f.ss !== null && f.ss !== undefined) t.setSelectionRange(f.ss, f.se); } catch (e) { /* a type with no selection */ }
+      if (f.st) t.scrollTop = f.st;
+    } catch (e) { fieldWarn(e); }
   }
   function renderKeepingPlace(view, opts) {
     const y = window.scrollY || 0;
@@ -10589,5 +10594,5 @@ for (const type of ["touchstart", "wheel", "pointerdown", "click", "keydown"]) d
   window.LevainAgentPage = { open: openAgentPage };
   window.LevainNeeds = { items: (lines) => needsWaiting(needsItems(lines)), name: needsName, summary: needsSummary, go: needsGo, history: openDecisionsHistory };
   window.LevainLoops = { find: loopFind, go: loopGo, why: () => loopWhy };
-  window.LevainDashboard = { render: renderKeepingPlace, redraw: ckRedraw, openCustom, composeDrop, adoptPanel, captureKept, settleKept, buildKept: () => buildKept, renderPanel: renderPanelSafe, measureClauses, measureOverflow, hasUnsavedEdit, editHoldsRefresh, dropBoxText, setDropBoxText, dropBoxIsOff, jobsActive: () => _activeJobs.size > 0, fitLineTile, lineTileCount: () => lineFits.size, noteBodyCount: () => noteBodies.size };
+  window.LevainDashboard = { render: renderKeepingPlace, redraw: ckRedraw, openCustom, composeDrop, adoptPanel, captureField, restoreField, captureKept, settleKept, buildKept: () => buildKept, renderPanel: renderPanelSafe, measureClauses, measureOverflow, hasUnsavedEdit, editHoldsRefresh, dropBoxText, setDropBoxText, dropBoxIsOff, jobsActive: () => _activeJobs.size > 0, fitLineTile, lineTileCount: () => lineFits.size, noteBodyCount: () => noteBodies.size };
 })();

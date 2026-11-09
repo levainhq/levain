@@ -1907,7 +1907,8 @@
       for (const k of s.carry.open) kept.open.add(k);
       for (const [k, v] of s.carry.scroll) if (!kept.scroll.has(k)) kept.scroll.set(k, v);
     }
-    paint(s);
+    const field = core && core.captureField ? core.captureField() : null;   // a focused field in a repainted body keeps its place, as in a board draw
+    try { paint(s); } finally { if (core && core.restoreField) core.restoreField(field); }
     if (s.body.querySelector && s.body.querySelector(".row")) s.carry = null;
     if (core && core.settleKept) core.settleKept(host, kept);
     else if (core && core.measureClauses) core.measureClauses(host);   // a core without the keeper still re-measures its rows
