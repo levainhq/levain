@@ -3444,7 +3444,7 @@ def run_band_snooze(args: argparse.Namespace) -> int:
         store = QuestionStore(args.queue_dir)
         qid = question_of_band_number(store, args.number)
         install = getattr(args, "path", None)         # the install whose spore store the guard reads (default: this directory)
-        spores = Path(install).expanduser() / ".levain" / "memory.spores.json" if install is not None else None
+        spores = Path(install).expanduser() / ".levain" / "memory.spores.json" if install else None
         got = store.snooze(qid, until=args.until, channel="cli", via="cli", note=getattr(args, "note", None),
                            spores_json=spores)
     except Exception as exc:

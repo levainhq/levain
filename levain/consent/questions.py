@@ -889,7 +889,8 @@ class QuestionStore:
                         break
                 if sid:
                     raise ConsentError(f"question #{q.n} is the ring of {sid}, an open agenda: snoozing the row would leave "
-                                       f"the agenda stamped; snooze {sid} itself (spore_surface_at) so one date moves")
+                                       f"the agenda stamped; snooze the agenda {sid} itself (its snooze moves the date and "
+                                       "ends this ring)")
             now = _now_utc(self._clock)
             today = local_today(now)
             if until is None:

@@ -79,6 +79,7 @@ import re
 import threading
 import uuid
 import warnings
+from collections.abc import Mapping
 from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -1796,7 +1797,7 @@ def _refuse_if_ringing(scope: WriteScope, store: Any, spore_id: str) -> None:
     except Exception:  # noqa: BLE001
         return
     stamp = spore.get("germinated")
-    if not isinstance(stamp, dict) or not stamp.get("ref"):
+    if not isinstance(stamp, Mapping) or not stamp.get("ref"):
         return
     qs = scope.questions
     if qs is None:
@@ -1808,7 +1809,8 @@ def _refuse_if_ringing(scope: WriteScope, store: Any, spore_id: str) -> None:
     ref = ringing_ref(spore, open_question_ids(qs) if qs is not None else frozenset())
     if ref:
         raise EditError("rings_in_band", 409,
-                        f"{spore_id} rings in the band as {ref}: use its snooze / edit / done / clear there, not a spore verb")
+                        f"{spore_id} rings in the band as {ref}: use the band row's edit / done / clear there; to defer it, "
+                        "snooze the agenda itself (its snooze moves the date and ends the ring)")
 
 
 def _apply_spore_verb(

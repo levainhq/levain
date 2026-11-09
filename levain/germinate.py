@@ -205,7 +205,7 @@ def _germinate(spores_json: Path, qdir: Path, install: Path, agent: str, today: 
     from anneal_memory.spores import SporeError, spore_version
 
     from levain.consent import band
-    from levain.consent.questions import ANSWER_CHANNELS, DB_NAME, QuestionStore
+    from levain.consent.questions import ANSWER_CHANNELS, DB_NAME, QuestionStore, later_date
     from levain.coordinator.store import CoordStore
     from levain.spores import answered_descend_kind, guarded_spore_store, ringing_ref
 
@@ -221,7 +221,10 @@ def _germinate(spores_json: Path, qdir: Path, install: Path, agent: str, today: 
     due = [s for s in open_items if is_due(s, today, now) and (not timed_only or is_timed(s.get("next")))]
     # a dry run on a machine with no band yet must not create one
     questions = None if dry_run and not (qdir / DB_NAME).exists() else QuestionStore(qdir)
-    open_ids = {q.id for q in questions.open_questions()} if questions is not None else set()
+    open_qs = questions.open_questions() if questions is not None else []
+    open_ids = {q.id for q in open_qs}
+    # a row the operator deferred is open but not due: a due agenda never adopts it (the band's own due predicate)
+    adoptable = {q.id for q in open_qs if later_date(q, today.isoformat()) is None}
 
     def _stamp_ref(s: dict[str, Any]) -> str:
         st = s.get("germinated")
@@ -282,7 +285,7 @@ def _germinate(spores_json: Path, qdir: Path, install: Path, agent: str, today: 
             target, repo = _target_of(item)
             nxt = _day(item.get("next"))
             title = _title(item, sid)
-            adopted = _adopt(item, open_ids)
+            adopted = _adopt(item, adoptable)
             filed = pinged = False
             ping_failed = ""
             drop_target = target == TARGET_DESK or target.startswith(TARGET_BOARD + ":")
