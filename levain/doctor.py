@@ -2627,8 +2627,9 @@ def _check_queue_answers(*, host: str | None = None, store: Path | None = None, 
     target_modes = (0o2750, 0o750) if host == "darwin" else (0o2750,)
     isdir = st_mod.S_ISDIR(st.st_mode)
     if isdir and st.st_uid == me and st.st_gid == gid and mode in target_modes:
+        acl = "the repair clears them with chmod -N" if host == "darwin" else "the repair does not remove them"
         return [CheckResult(name, True, "only you can write the queue's answers; the queue broker reads them (ACLs "
-                            "on the directory were not read; the repair clears them with chmod -N)")]
+                            f"on the directory were not read; {acl})")]
     if isdir and st.st_uid == me and legacy is not None and st.st_gid == legacy and mode == 0o2770:
         return [CheckResult(name, True, f"{path} is in the old shape (group levain-queue, 2770): it works, but dispatch "
                             "can still create files in the queue's answers directory (an answer is only ever trusted "
