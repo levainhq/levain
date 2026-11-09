@@ -244,7 +244,7 @@ def test_pins_regardless_of_input():
         assert s["hooks"] == {"PreToolUse": [{"matcher": "Bash", "hooks": [
             {"type": "command", "command": rd.hook_command(blob, facts, "levain_gate"), "onFailure": "block"}]}]}
         cmd = s["hooks"]["PreToolUse"][0]["hooks"][0]["command"]
-        assert (cmd == f"{L}/root/hooks/levain_gate") if host == "linux" else cmd.startswith("/usr/bin/env -i ")
+        assert cmd.startswith("/usr/bin/env -i ") and cmd.endswith(f"{L}/root/hooks/levain_gate")
         r = rd.render(blob, facts)
         hook = r.file("root/hooks/levain_gate")
         assert (hook.data, hook.uid, hook.gid, hook.mode) == (tmpl["levain_gate"].body, 0, 3990, 0o750)
