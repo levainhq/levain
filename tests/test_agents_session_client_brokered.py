@@ -4,7 +4,8 @@ The client is the REAL :class:`levain.agents.session_client.DispatchSessionLaunc
 store's auth reader; the servers are the REAL pair of run servers (one holder registry, one index, one replica) over
 socketpairs, each connect counted. Held here: an api_key occurrence reaches the brokered server and mints with the
 link's share, a subscription one reaches the passthrough server; USAGE and END follow the auth the store recorded, also
-from a client built afresh; nothing is ever tried on the other socket; a brokered launch with no brokered server refuses
+from a client built afresh; nothing but the END of a brokered session whose socket is gone is tried on the other
+socket; a brokered launch with no brokered server refuses
 by name with nothing minted."""
 from __future__ import annotations
 
@@ -273,3 +274,45 @@ def test_a_refusal_before_spawn_is_a_retakable_tombstone_and_never_overwrites_a_
     pair.br._refuse_unspawned(launch, L.LauncherRefused("no-free-slot", reason_class="transient"))
     assert pair.index.get(KEY_B)["state"] == "started"      # a live holder's key is never recorded refused
     child.abort()
+
+
+# --- r1 B: END of a brokered session falls back to run.sock when the brokered server is gone; USAGE and LAUNCH never --
+
+def test_end_of_a_brokered_session_reaches_run_sock_after_the_brokered_server_is_gone(lrig, pair):
+    from levain.agents import session_launcher as SL
+    from levain.slot.services import dispatch_run as DR
+    from tests.test_agents_session_launcher import FakeSources
+    oid = _occurrence(lrig, billing="api_key", micros=1_000_000)
+    first, _w = client_of(lrig, pair)
+    launch, _figure = api_launch(lrig, oid, KEY_B)
+    record(lrig, oid, KEY_B)
+    first.spawn(launch).release()
+    # the opt-out and a restart: the brokered server is gone, a fresh passthrough server (its own registry) over the
+    # same index and runtime is all that answers
+    restarted = DR.RunServer(SL.RealLauncher(pair.control, pair.runtime, FakeSources(), pair.index),
+                             verify=lambda *a: None, pool_free=lambda: True, peer_ok=lambda s: True, holder_idle_s=20)
+    wire = Wire(restarted, None)
+    rebuilt = C.DispatchSessionLauncher(wire.connector("passthrough", pair), lambda occ: None, None, None, None,
+                                        wire.connector("brokered", pair), C.session_auth_of(lrig.store))
+    ended = rebuilt.end_session(KEY_B, 10)
+    assert ended.terminated is True, ended
+    assert wire.opens == {"passthrough": 1, "brokered": 0}
+    assert pair.index.get(KEY_B)["state"] == "ended"
+    assert len(pair.runtime.ended) == 1                      # the slot's session was ended (the slot is released)
+
+
+def test_usage_of_a_brokered_session_never_falls_back_to_run_sock(lrig, pair):
+    oid = _occurrence(lrig, billing="api_key", micros=1_000_000)
+    record(lrig, oid, KEY_B)
+    client, wire = client_of(lrig, pair, brokered_up=False)
+    got = client.usage(KEY_B)
+    assert got.usd_micros is None and got.source == "session:dispatch-unreachable"
+    assert wire.opens == {"passthrough": 0, "brokered": 0}
+
+
+def test_a_brokered_launch_never_falls_back_to_run_sock(lrig, pair):
+    oid = _occurrence(lrig, billing="api_key", micros=1_000_000)
+    client, wire = client_of(lrig, pair, brokered_up=False)
+    with pytest.raises(L.LauncherRefused):
+        client.spawn(api_launch(lrig, oid, KEY_B)[0])
+    assert wire.opens == {"passthrough": 0, "brokered": 0}

@@ -1354,7 +1354,7 @@ def build_server(host: str, store: Path, control_sock: Path, operator_uid: int, 
     :class:`HolderRegistry` (a key is one session whichever socket launched it, so SYNC and END reach it from either). Both
     servers come from the one ``RunServer(`` call below with ``replica=replica`` (the claims=None ruling's pin). The
     client's ``build_launcher`` sends an ``api_key`` occurrence to the brokered socket and a subscription one to
-    ``run.sock``; nothing falls back from one to the other. Never mutate a shared launcher's ``auth`` per request: concurrent launches and later
+    ``run.sock``; only an END of a brokered session whose socket is gone is sent to ``run.sock``. Never mutate a shared launcher's ``auth`` per request: concurrent launches and later
     USAGE reads would race on it.
 
     The production wiring: the real ports behind :class:`RealLauncher`, and the authority REPLICA at

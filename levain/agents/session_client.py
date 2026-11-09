@@ -889,6 +889,11 @@ def unix_connector(path: Path | str, *, timeout: float = _CONNECT_S) -> Callable
     return connect
 
 
+def _open(connect: Callable[..., socket.socket], within: float) -> socket.socket:
+    """``connect()``, its connect capped at ``within`` seconds when the connector takes a cap."""
+    return connect(max(0.001, within)) if getattr(connect, "accepts_within", False) else connect()
+
+
 def _head_of(ans: dict) -> tuple[int, str]:
     h = _exact(ans["head"], ("seq", "hash"), "head")
     return _int(h["seq"], "head.seq"), _str(h["hash"], "head.hash", max_len=128)
@@ -1127,7 +1132,8 @@ class DispatchSessionLauncher:
     def _connector_for_session(self, session_key: str) -> Callable[..., socket.socket]:
         """The connector of the socket a recorded session was launched through: the auth the store recorded for the
         key; a session the store records no auth for is passthrough's (as the server reads an index record with no
-        auth). One socket is chosen and never a second tried. With no ``auth_of`` this client serves passthrough alone."""
+        auth). USAGE tries this one socket only; :meth:`end_session` alone may then try ``run.sock`` for a brokered
+        session whose socket is gone. With no ``auth_of`` this client serves passthrough alone."""
         if self._auth_of is None:
             return self._connect
         return self._connector(self._auth_of(session_key) or "passthrough")
@@ -1165,7 +1171,15 @@ class DispatchSessionLauncher:
             # it, and no answer margin extends it (the server is asked for a little less than is left)
             end = time.monotonic() + deadline
             connect = self._connector_for_session(session_key)
-            sock = connect(max(0.001, deadline)) if getattr(connect, "accepts_within", False) else connect()
+            try:
+                sock = _open(connect, deadline)
+            except (FileNotFoundError, ConnectionRefusedError):
+                if self._connect_brokered is None or connect is not self._connect_brokered:
+                    raise
+                # END only (L3 w3client r1, codex HIGH 2): the brokered server is gone (turned off, or its service
+                # down) and the session it launched must still be ended. The passthrough server shares its session
+                # index, so it can END the key; USAGE and LAUNCH never take this way.
+                sock = _open(self._connect, end - time.monotonic())
             conn = _Conn(sock)
             try:
                 left = end - time.monotonic()
