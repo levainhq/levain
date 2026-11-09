@@ -2119,8 +2119,9 @@ def hook_templates_for(seams: "Seams", blob: RenderBlob) -> Dict[str, RD.HookTem
     if have is None:
         from levain.slot.hook_templates import hook_templates
         have = hook_templates(seams.host)
-    # the ConfigChange alarm is wired for every Claude session, named by the blob or not
-    return {k: v for k, v in have.items() if k in blob.hooks or (k == RD.CONFIG_GUARD and blob.vendor == "claude")}
+    # the ConfigChange alarm and the repo hook filter go to every Claude session, named by the blob or not
+    return {k: v for k, v in have.items()
+            if k in blob.hooks or (k in (RD.CONFIG_GUARD, RD.REPO_FILTER) and blob.vendor == "claude")}
 
 
 def identity_gated(a: R.Alloc) -> bool:
