@@ -331,3 +331,22 @@ def test_an_api_key_reservation_is_never_launched_with_the_passthrough_auth_on_a
     assert S.launch_refusal(ROLE, SUBRES, Both(), EXP, usd_micros=0, auth="brokered") \
         == "ticket-auth-not-the-links-billing"
     assert S.launch_refusal(ROLE, API, Both(), None, usd_micros=100_000, auth="brokered") is None
+
+
+# --- r1 G: only a missing or refusing brokered socket reads as the brokered server absent ------------------------------
+
+@pytest.mark.parametrize("err,name", [(FileNotFoundError(2, "gone"), "brokered-server-absent"),
+                                      (ConnectionRefusedError(61, "refused"), "brokered-server-absent"),
+                                      (PermissionError(13, "denied"), "dispatch-unreachable"),
+                                      (TimeoutError("slow"), "dispatch-unreachable")])
+def test_a_brokered_connect_error_is_absent_only_when_the_socket_is_missing_or_refusing(lrig, pair, err, name):
+    oid = _occurrence(lrig, billing="api_key", micros=1_000_000)
+    client, wire = client_of(lrig, pair)
+
+    def connect(within=None):
+        raise err
+    client._connect_brokered = connect
+    with pytest.raises(L.LauncherRefused) as e:
+        client.spawn(api_launch(lrig, oid, KEY_B)[0])
+    assert (e.value.name, e.value.reason_class, e.value.nothing_sent) == (name, "transient", True)
+    assert wire.opens["passthrough"] == 0

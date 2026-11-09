@@ -1079,7 +1079,8 @@ class DispatchSessionLauncher:
         except BrokeredServerAbsent:
             raise
         except OSError as exc:
-            if launch.auth == "brokered":
+            # absent only when nothing listens there; any other connect fault reads as passthrough's does
+            if launch.auth == "brokered" and isinstance(exc, (FileNotFoundError, ConnectionRefusedError)):
                 raise BrokeredServerAbsent(
                     "brokered-server-absent", "no brokered run server answers: it is turned off (L/policy/dispatch_auth "
                     "holds 'passthrough') or its service is down", reason_class="transient") from None
