@@ -1,3 +1,6 @@
+# Hash-pinned test tools for the Python 3.9 job. uv.lock is Python >=3.12 and cannot serve 3.9, so this file is
+# compiled separately. Regenerate with:
+#   printf 'pytest\npytest-xdist\nh11>=0.16.0\n' | uv pip compile - --python-version 3.9 --generate-hashes --no-header --no-annotate -o requirements-ci-py39.txt
 exceptiongroup==1.3.1 \
     --hash=sha256:8b412432c6055b0b7d14c310000ae93352ed6754f70fa8f7c34141f91c4e3219 \
     --hash=sha256:a7a39a3bd276781e98394987d3a5701d0c4edffb633bb7a5144577f82c773598

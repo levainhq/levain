@@ -2,8 +2,8 @@ name: dep-drift
 
 # Would the suite still pass if uv.lock were regenerated tonight? The committed lock is what every test run installs
 # (scripts/ci_install_locked.sh); this workflow re-resolves in the runner without committing anything, runs the suite on
-# that, and on red files ONE issue naming every package whose version changed against the committed lock. The same
-# logic runs on a laptop: scripts/dep_drift.py prints a last line `DEP_DRIFT {json}`.
+# that, and on red keeps ONE open `dep-drift` issue: a comment per red night naming every package whose version
+# changed against the committed lock, closed by the first green night. The same logic runs on a laptop: scripts/dep_drift.py prints a last line `DEP_DRIFT {json}`.
 
 on:
   schedule:
@@ -21,6 +21,7 @@ concurrency:
 jobs:
   drift:
     name: drift (Python 3.12, upgraded lock)
+    if: github.repository == 'levainhq/levain'
     # Pinned because ubuntu-latest moved to ubuntu-26.04, whose sudo/bash/python differ; revisit when the tests are made to pass on it.
     runs-on: ubuntu-24.04
     timeout-minutes: 60
@@ -39,7 +40,9 @@ jobs:
         run: sudo /usr/bin/python3 -m pip install --break-system-packages "$(python tests/ci/root_closure.py h11-spec)"
 
       - name: Install uv
-        run: python -m pip install --upgrade pip uv==0.13.5
+        # The pins here are the ones scripts/ci_install_locked.sh installs into the drift venv; this step only puts
+        # uv on PATH for the re-resolve.
+        run: python -m pip install pip==26.3 uv==0.13.5
 
       - name: Upgrade the lock in a scratch copy, install it, run the suite
         id: drift
@@ -50,28 +53,47 @@ jobs:
         env:
           LEVAIN_TEST_WAIT_SCALE: "2"
 
-      - name: File or update the day's issue when it went red
-        if: steps.drift.outputs.code != '0'
+      - name: File, update or close the one dep-drift issue
         env:
           GH_TOKEN: ${{ github.token }}
+          DRIFT_CODE: ${{ steps.drift.outputs.code }}
         run: |
           set -euo pipefail
           day="$(date -u +%F)"
-          title="dependency drift red ${day}"
+          title="dependency drift red"
+          run_url="${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
+          gh label create dep-drift --color B60205 --description "dependency drift went red" 2>/dev/null || true
+          existing="$(gh issue list --state open --label dep-drift --json number --jq '.[0].number // empty')"
+          if [ "$DRIFT_CODE" = "0" ]; then
+            if [ -n "$existing" ]; then
+              gh issue close "$existing" --comment "Green on ${day}: the suite passes on a freshly re-resolved lock. ${run_url}"
+            fi
+            exit 0
+          fi
           line="$(grep '^DEP_DRIFT ' "$RUNNER_TEMP/drift.log" | tail -1 || true)"
           {
-            echo "The nightly dep-drift run went red: the suite does not pass on a freshly re-resolved lock."
+            echo "Red on ${day}: the suite does not pass on a freshly re-resolved lock."
             echo
-            echo "Run: ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
+            echo "Run: ${run_url}"
             echo
             echo "Result line: \`${line:-none (the script died before printing one)}\`"
             echo
-            echo "Packages whose version changed against the committed uv.lock (old -> new):"
-            echo
             if [ -n "$line" ]; then
-              printf '%s' "${line#DEP_DRIFT }" | python -c 'import json,sys; d=json.load(sys.stdin); print("\n".join("- "+c for c in d["changed"]) or "- none changed (the failure is not a version drift)")'
+              printf '%s' "${line#DEP_DRIFT }" | python -c '
+          import json, sys
+          d = json.load(sys.stdin)
+          if d["changed"]:
+              print("Packages whose version changed against the committed uv.lock (old -> new):\n")
+              print("\n".join("- " + c for c in d["changed"]))
+          else:
+              print("red with no version change: likely flaky test, not drift")
+          failed = d.get("failed_tests") or []
+          if failed:
+              print("\nFailing tests:\n")
+              print("\n".join("- " + t for t in failed))
+          '
             else
-              echo "- unknown"
+              echo "Packages whose version changed: unknown."
             fi
             echo
             echo "Log tail:"
@@ -79,12 +101,10 @@ jobs:
             tail -n 60 "$RUNNER_TEMP/drift.log"
             echo '```'
           } > "$RUNNER_TEMP/body.md"
-          gh label create drift --color B60205 --description "dependency drift went red" 2>/dev/null || true
-          existing="$(gh issue list --state open --label drift --search "\"${title}\" in:title" --json number --jq '.[0].number // empty')"
           if [ -n "$existing" ]; then
-            gh issue edit "$existing" --body-file "$RUNNER_TEMP/body.md"
+            gh issue comment "$existing" --body-file "$RUNNER_TEMP/body.md"
           else
-            gh issue create --title "$title" --label drift --body-file "$RUNNER_TEMP/body.md"
+            gh issue create --title "$title" --label dep-drift --body-file "$RUNNER_TEMP/body.md"
           fi
 
       - name: Fail the run when the drift was red
