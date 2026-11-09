@@ -1,0 +1,10 @@
+{
+  "_note": "Every body here was recorded by pointing a client's base URL at a local 127.0.0.1 listener that answered 400; no real API was contacted. Prose is replaced by \"x\" in the Claude Code and Codex bodies (every key kept); the SDK bodies are verbatim. Dates are the capture day.",
+  "claude_code_messages_main.json": {"client": "Claude Code", "version": "2.1.321", "captured": "2026-11-09", "how": "ANTHROPIC_BASE_URL at the listener, `claude -p`, one turn"},
+  "claude_code_messages_full_tools.json": {"client": "Claude Code", "version": "2.1.321", "captured": "2026-11-09", "how": "ANTHROPIC_BASE_URL at the listener, `claude -p`, the request that carried the full tool list"},
+  "codex_responses_exec.json": {"client": "Codex CLI", "version": "0.162.1", "captured": "2026-11-09", "how": "a model_providers entry whose base_url is the listener, `codex exec`, default tools (web_search on)"},
+  "codex_responses_exec_nosearch.json": {"client": "Codex CLI", "version": "0.162.1", "captured": "2026-11-09", "how": "the same, with web_search disabled"},
+  "openai_sdk_chat_stream_tools.json": {"client": "openai Python SDK (the SDK's own wire shape, not an agent client)", "version": "3.48.0", "captured": "2026-11-09", "how": "pip --target into a scratch directory, `chat.completions.create` with a function tool and stream on, base_url the listener; the SDK added no field beyond those passed"},
+  "openai_sdk_chat_openrouter_path.json": {"client": "openai Python SDK (the SDK's own wire shape, not an agent client)", "version": "3.48.0", "captured": "2026-11-09", "how": "base_url `<listener>/api/v1` (an OpenRouter-style path), OpenRouter's HTTP-Referer and X-Title as default headers (headers are not in the body), `provider` through extra_body"},
+  "openai_sdk_responses_stream_tools.json": {"client": "openai Python SDK (the SDK's own wire shape, not an agent client)", "version": "3.48.0", "captured": "2026-11-09", "how": "`responses.create` with a function tool and stream on, base_url the listener"}
+}
