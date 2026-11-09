@@ -7,6 +7,7 @@ push child a recorder."""
 from __future__ import annotations
 
 import re
+import json
 import sqlite3
 from pathlib import Path
 
@@ -192,6 +193,24 @@ def test_the_verifier_rejects_a_bad_signature_and_accepts_the_genuine_one(monkey
     v = verdict(qs[1])
     assert (v.state, v.reason) == ("failed", "the card is for another answer")
     assert sig_bytes and record                                                  # the stranger's artifacts existed
+
+
+def test_countersign_evidence_is_the_card_and_its_signature_only_once_countersigned(monkeypatch, store, env, keydir,
+                                                                                    signq, pushes):
+    qs = seen(store, env, 1)
+    remote_line(monkeypatch, store, env, keydir, "1a", signq)
+    [path] = cards(signq)
+    rid = path.stem
+    pk = _Passkey()
+    enrolled = lambda: {pk.key.fingerprint: pk.key}  # noqa: E731
+    got = lambda: ac.countersign_evidence(store, qs[0].id, sign_queue=signq, keys=enrolled)  # noqa: E731
+    assert got() is None                                    # a card nobody signed is no evidence
+    sign_card(signq, pk, rid)
+    message, signature, fp = got()
+    assert message == json.loads(path.read_text())["message"] and fp == pk.key.fingerprint and signature.startswith("-----BEGIN SSH")
+    assert ac.countersign_evidence(store, qs[0].id, sign_queue=None, keys=enrolled) is None
+    path.write_text(path.read_text().replace("fixed 30 s", "fail loud"))
+    assert got() is None                                    # an edited card is not the one filed
 
 
 # --- 4. the local answer path is unchanged ----------------------------------------------------------------------

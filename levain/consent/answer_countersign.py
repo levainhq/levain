@@ -26,7 +26,7 @@ from urllib.parse import urlsplit
 
 from levain.contracts.namespaces import ANSWER_COUNTERSIGN_NAMESPACE as NS, LEVAIN_SIGN_REQUESTS
 
-__all__ = ["CARD_TITLE", "CARD_TTL_S", "CardResult", "SignQueue", "Verdict", "build_card", "file_card", "nonce_of",
+__all__ = ["CARD_TITLE", "CARD_TTL_S", "CardResult", "SignQueue", "Verdict", "build_card", "countersign_evidence", "file_card", "nonce_of",
            "resolve_sign_queue", "sign_queue_dir", "sign_queue_hint", "verdict", "badge_words"]
 
 CARD_TTL_S = 24 * 3600
@@ -362,6 +362,30 @@ def _verdict(store: Any, question_id: str, sign_queue: Path | str | None, keys: 
     except Exception:  # noqa: BLE001 - a record without a readable time is not evidence
         return Verdict("failed", "the signing time cannot be read")
     return Verdict("countersigned", "", record["signed_at"])
+
+
+def countersign_evidence(store: Any, question_id: str, *, sign_queue: Path | str | None,
+                         keys: Any = None, now: datetime | None = None) -> tuple[str, str, str] | None:
+    """``(message, signature, signer_fp)`` of the card the phone countersigned for ``question_id``, or ``None``:
+    only when :func:`verdict` reads it as countersigned now. The bytes are what a later reader re-verifies by itself
+    (the card's message, its signature and the passkey's fingerprint); nothing here says they still hold then."""
+    if sign_queue is None or verdict(store, question_id, sign_queue=sign_queue, keys=keys, now=now).state != "countersigned":
+        return None
+    try:
+        with store._peek() as conn:
+            row = conn.execute("SELECT request_id FROM answer_countersign WHERE question_id = ?", (question_id,)).fetchone()
+        if row is None:
+            return None
+        from levain.consent.sign import read_request, sign_dir
+
+        request = read_request(Path(sign_queue), row[0])
+        d = sign_dir(Path(sign_queue))
+        record = json.loads((d / f"{row[0]}.signed.json").read_text(encoding="utf-8"))
+        signature = (d / f"{row[0]}.sig").read_text(encoding="ascii")
+        fp = record.get("signer_fp") if isinstance(record, dict) else None
+    except Exception:  # noqa: BLE001 - evidence that cannot be read is no evidence
+        return None
+    return (request.message, signature, fp) if isinstance(fp, str) else None
 
 
 def _store_id(store: Any) -> str | None:

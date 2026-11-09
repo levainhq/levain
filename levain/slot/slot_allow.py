@@ -8,8 +8,11 @@ rule forward without ever widening what the operator's own sessions do:
   writes and names the rest as dropped;
 * :func:`read_regular` is the bounded read of a file a slot wrote (no symlink, a regular file, size-capped);
 * :func:`file_rows` puts each kept rule on the band, one row per rule with a yes and a no;
-* :func:`apply_answered` appends a rule to ``slot-allow.json`` only for a row a person answered ``yes``;
-* :func:`merge_into_frozen` adds the file's rules to a slot's frozen ``permissions.allow`` and nothing else.
+* :func:`apply_answered` appends a rule to ``slot-allow.json`` only for a row whose ``yes`` carries the operator's own
+  signature over exactly this rule's question and answer (:func:`rule_evidence`), and stores that signature with it;
+* :func:`carried` re-verifies every stored rule's evidence against the authority log at each launch, so the file alone
+  (an operator-uid file any session of his could write) carries nothing;
+* :func:`merge_into_frozen` adds the verified rules to a slot's frozen ``permissions.allow`` and nothing else.
 
 ``slot-allow.json`` lives beside the question store in the operator's consent directory. Nothing here writes to the
 operator's checkout, and the file is read by slot launches only.
@@ -21,6 +24,7 @@ import json
 import os
 import re
 import stat
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence, Tuple
@@ -38,12 +42,29 @@ FILE_CAP = 1024 * 1024
 RULE_MAX = 300
 RULES_PER_SESSION_MAX = 50
 YES, NO = "yes", "no"
+TERMINAL, DESK, PHONE = "terminal", "desk", "phone"
+CHANNELS = (TERMINAL, DESK, PHONE)
+_SIG_MAX = 16 * 1024
 
 # The three kinds of approval the dialog saves as a rule. A bare tool name for Bash, a wildcard-only pattern and
 # anything with a line break or control character are not a shape the dialog writes.
 _BASH = re.compile(r"Bash\((?P<body>[^()\x00-\x1f\x7f]{1,%d})\)" % (RULE_MAX - 6))
 _WEBFETCH = re.compile(r"WebFetch\(domain:[A-Za-z0-9][A-Za-z0-9.-]{0,252}\)")
 _WILD_ONLY = re.compile(r"[\s*:]*")
+
+
+def asked_text(rule: str) -> str:
+    """The question the band shows for ``rule``: what a signature over its row must name."""
+    return f"A slot session asked to always allow: {rule}"
+
+
+def yes_label(rule: str) -> str:
+    return f"Yes: allow {rule} in every future slot session"
+
+
+def yes_text(rule: str) -> str:
+    """The answer a signature over a yes to ``rule`` names: option (a), as the signed message writes it."""
+    return f"(a) {yes_label(rule)}"
 
 
 class AllowRefused(ValueError):
@@ -187,14 +208,21 @@ def rules_of(path: Path) -> List[str]:
     return [r["rule"] for r in load(path)["rules"]]
 
 
-def append(path: Path, rule: str, session: str, now: Callable[[], str] = _now) -> bool:
-    """Add ``rule`` with where it came from. False when it is already there."""
+EVIDENCE_KEYS = ("question_id", "channel", "signer_fp", "message", "sig", "answered_at")
+
+
+def append(path: Path, rule: str, session: str, evidence: Mapping[str, Any], now: Callable[[], str] = _now) -> bool:
+    """Add ``rule`` with where it came from and the signed answer that carries it (``evidence``: the fields of
+    :data:`EVIDENCE_KEYS`). False when it is already there. Storing evidence is no proof of it: every launch verifies
+    it again (:func:`carried`)."""
     if not shape_ok(rule):
         raise AllowRefused("not a dialog rule shape")
+    if not isinstance(evidence, Mapping) or any(type(evidence.get(k)) is not str for k in EVIDENCE_KEYS):
+        raise AllowRefused("a rule is stored with the signed answer that carries it")
     doc = load(path)
     if any(r["rule"] == rule for r in doc["rules"]):
         return False
-    doc["rules"].append({"rule": rule, "session": session, "signed_at": now()})
+    doc["rules"].append({"rule": rule, "session": session, "signed_at": now(), **{k: evidence[k] for k in EVIDENCE_KEYS}})
     _save(path, doc)
     return True
 
@@ -225,6 +253,202 @@ def undo(path: Path, rule: str) -> str:
         doc["rules"].append(back)
     _save(path, doc)
     return f"restored {rule!r}"
+
+
+# --- the signed yes -----------------------------------------------------------------------------------------------
+
+def _no_live_check(public_key: str) -> Tuple[Optional[bool], str]:
+    """A re-read of stored evidence asks the authority log who the key is, not the Secure Enclave: that check is made
+    once, when the answer is applied."""
+    return None, "not re-checked on a re-read"
+
+
+def verify_evidence(rule: str, ev: Mapping[str, Any], *, authority: Any, store_id: Optional[str],
+                    ctk: Optional[Callable[[str], Tuple[Optional[bool], str]]] = None) -> Optional[str]:
+    """Why ``ev`` is not the operator's signature over a yes to exactly ``rule`` in this store, or ``None`` when it is.
+    Both the question and the answer the signed message must name are rebuilt from ``rule`` (:func:`asked_text`,
+    :func:`yes_text`), never read from the row; the key must be active in ``authority`` (a verified replay of the
+    authority log) and of the class the channel needs: a laptop-presence key for a terminal or desk answer, a key whose
+    class covers signing for a phone countersign. Nothing here reads the question store: the signed bytes are the whole
+    evidence. Never raises."""
+    try:
+        return _verify_evidence(rule, ev, authority, store_id, ctk)
+    except Exception as exc:  # noqa: BLE001 - evidence that cannot be checked does not carry
+        return f"its signature could not be checked ({type(exc).__name__})"
+
+
+def _verify_evidence(rule: str, ev: Any, authority: Any, store_id: Optional[str],
+                     ctk: Optional[Callable[[str], Tuple[Optional[bool], str]]]) -> Optional[str]:
+    from levain.authority import LAPTOP, VerifierUnavailable, custody_mismatch
+    from levain.authority_sig import _signers_line, verify_link_sig
+    from levain.consent import terminal_sign as ts
+    from levain.consent.queue import class_covers
+    from levain.contracts.namespaces import ANSWER_COUNTERSIGN_NAMESPACE
+    from levain.coordinator.review import SIGN_TIER
+
+    if not shape_ok(rule):
+        return "not a dialog rule shape"
+    if not isinstance(ev, Mapping) or any(type(ev.get(k)) is not str for k in EVIDENCE_KEYS):
+        return "no signed answer is stored with it"
+    channel, message, sig, fp, qid = ev["channel"], ev["message"], ev["sig"], ev["signer_fp"], ev["question_id"]
+    if channel not in CHANNELS or len(sig) > _SIG_MAX or len(message) > ts.MAX_BYTES:
+        return "the stored signed answer is not in a form this reads"
+    if store_id is None:
+        return "this store's id cannot be read"
+    raw = message.encode("utf-8")
+    try:
+        if channel == DESK:
+            parsed: Any = ts.parse_desk_verified(raw)
+            namespace, countersign_ok = ts.DESK_NAMESPACE, parsed.countersign_of is None
+        else:
+            parsed = ts.parse_verified(raw)
+            if channel == TERMINAL:
+                namespace, countersign_ok = ts.NAMESPACE, parsed.countersign_of is None
+            else:
+                namespace, countersign_ok = ANSWER_COUNTERSIGN_NAMESPACE, parsed.countersign_of == ev["answered_at"]
+    except ts.MessageError:
+        return "the stored message is not a signed answer"
+    if not countersign_ok:
+        return f"the stored message is not a {channel} answer"
+    if parsed.store != f"levain-questions:{store_id}" or parsed.install != store_id:
+        return "it was signed for another store"
+    entries = [e for e in parsed.entries if e.item == qid]
+    if len(entries) != 1:
+        return "the signed answer names no such question, or names it twice"
+    e = entries[0]
+    if e.asked != asked_text(rule) or e.text is not None or e.answer != yes_text(rule):
+        return "the signature is over another question or another answer than a yes to this rule"
+    key = authority.key(fp) if hasattr(authority, "key") else None
+    if key is None or not key.active:
+        return "the signing key is not an active key in the authority log"
+    if channel == PHONE:
+        if not class_covers(key.key_class, SIGN_TIER):
+            return f"key class {key.key_class} cannot countersign here"
+    else:
+        if key.key_class != LAPTOP:
+            return f"key class {key.key_class} cannot sign a slot rule: it needs {LAPTOP}"
+        problem = custody_mismatch(key.public_key, key.custody)
+        if problem is not None:
+            return problem
+    try:
+        if channel == PHONE:
+            good = verify_link_sig(raw, sig, public_key=key.public_key, fingerprint=key.fingerprint,
+                                   namespace=namespace)
+            got_fp = key.fingerprint if good else None
+            problem = None if good else "the signature does not verify"
+        else:
+            principal = "authority-signer"
+            res = ts.verify(raw, sig, _signers_line(principal, namespace, key.public_key), principal,
+                            ctk=ctk, namespace=namespace)
+            got_fp, problem = (res.fingerprint, None) if res.ok else (None, res.problem or "the signature does not verify")
+    except (VerifierUnavailable, ts.KeyError_) as exc:
+        return f"the signature could not be verified ({exc})"
+    if problem is not None:
+        return problem
+    if got_fp != key.fingerprint or key.fingerprint != fp:
+        return "it is signed by another key than the one it names"
+    return None
+
+
+@dataclass(frozen=True)
+class Judge:
+    """What a yes is judged by: ``authority`` (a call returning a verified replay of the authority log), the signing
+    queue a phone countersign card lives in, and the live Secure Enclave check (``None`` = the real one)."""
+    authority: Callable[[], Any]
+    sign_queue: Optional[Path] = None
+    ctk: Optional[Callable[[str], Tuple[Optional[bool], str]]] = None
+
+
+def default_authority(qdir: Path) -> Any:
+    """The cockpit's authority log, replayed (the cockpit the consent hooks in ``qdir`` name). Raises when none is
+    named or the log does not replay."""
+    from levain.authority import anchor_path
+    from levain.consent.queue import authority_source
+    from levain.consent.sign import sign_root
+
+    root = sign_root(Path(qdir))
+    return authority_source(root / "cockpit.db", anchor=anchor_path(root))()
+
+
+def default_judge(qdir: Path) -> Judge:
+    from levain.consent.answer_countersign import sign_queue_dir
+
+    return Judge(authority=lambda: default_authority(qdir), sign_queue=sign_queue_dir(os.environ))
+
+
+def store_id_of(store: Any) -> Optional[str]:
+    """The question store's id (what a signed answer names as its store), ``None`` when it cannot be read."""
+    from levain.band_view import _store_id_of
+
+    return _store_id_of(store)
+
+
+def rule_evidence(store: Any, question: Any, rule: str, judge: Judge) -> Tuple[Optional[Dict[str, str]], str]:
+    """``(evidence, "")`` when the answer to ``question`` is the operator's signed yes to exactly ``rule``, else
+    ``(None, why)``. Direct: the band answer's own signature (a terminal or a desk click), fresh against the recorded
+    answer time and verified live. Remote: the phone's countersign of the answer (``answer_countersign``), which must
+    read as countersigned. The same check runs again at every launch (:func:`verify_evidence`)."""
+    from levain.band_view import answer_sign_of
+    from levain.cockpit.consent import parse_stamp
+    from levain.consent import answer_countersign as ac
+    from levain.consent import terminal_sign as ts
+
+    a = question.answer
+    if a is None or a.kind != "option" or a.value != YES:
+        return None, "not a yes"
+    sign = answer_sign_of(store, question.id)
+    ev: Dict[str, str]
+    if sign and sign.get("sign_state") == "signed" and sign.get("message") and sign.get("sig") and sign.get("signer_fp"):
+        message = sign["message"]
+        channel = DESK if message.startswith(ts.DESK_FORMAT + "\n") else TERMINAL
+        ev = {"question_id": question.id, "channel": channel, "signer_fp": sign["signer_fp"], "message": message,
+              "sig": sign["sig"], "answered_at": a.answered_at}
+        try:
+            parsed = (ts.parse_desk_verified if channel == DESK else ts.parse_verified)(message.encode("utf-8"))
+            if not ts.fresh(parsed, parse_stamp(a.answered_at)):       # fresh reads only the signed time
+                return None, "the signature is not fresh against the answer"
+        except Exception as exc:  # noqa: BLE001
+            return None, f"the signed answer cannot be read ({type(exc).__name__})"
+    elif sign and sign.get("sign_state") == "unsigned" and sign.get("sign_reason") == "remote":
+        got = ac.countersign_evidence(store, question.id, sign_queue=judge.sign_queue)
+        if got is None:
+            return None, "answered at a remote terminal and not countersigned on your phone"
+        ev = {"question_id": question.id, "channel": PHONE, "signer_fp": got[2], "message": got[0], "sig": got[1],
+              "answered_at": a.answered_at}
+    else:
+        return None, "answered unsigned"
+    try:
+        snapshot = judge.authority()
+    except Exception as exc:  # noqa: BLE001
+        return None, f"the authority log cannot be read ({type(exc).__name__})"
+    why = verify_evidence(rule, ev, authority=snapshot, store_id=store_id_of(store), ctk=judge.ctk)
+    return (None, why) if why else (ev, "")
+
+
+def carried(path: Path, judge: Optional[Judge], store_id: Optional[str]) -> Tuple[List[str], List[Tuple[str, str]]]:
+    """``(rules, not_carried)`` from ``path``: a stored rule is carried only when its evidence verifies now, against the
+    authority log as it stands (a swapped rule, an edited message, a revoked key and a rule with no evidence all fail).
+    ``not_carried`` pairs each failing rule with why. A judge that cannot be had carries nothing."""
+    doc = load(path)
+    rules = doc["rules"]
+    if not rules:
+        return [], []
+    try:
+        snapshot = judge.authority() if judge is not None else None
+    except Exception as exc:  # noqa: BLE001
+        why = f"the authority log cannot be read ({type(exc).__name__})"
+        return [], [(r["rule"], why) for r in rules]
+    if snapshot is None:
+        return [], [(r["rule"], "no authority to check its signature against") for r in rules]
+    ok: List[str] = []
+    bad: List[Tuple[str, str]] = []
+    for r in rules:
+        why = verify_evidence(r["rule"], r, authority=snapshot, store_id=store_id, ctk=_no_live_check)
+        if why is None:
+            ok.append(r["rule"])
+        else:
+            bad.append((r["rule"], why))
+    return ok, bad
 
 
 # --- the band rows ------------------------------------------------------------------------------------------------
@@ -261,12 +485,12 @@ def file_rows(qdir: Path, session: str, rules: Sequence[str], store: Any = None)
         key = _key(rule)
         q, new = qs.file_once(
             agent=AGENT, key=key, cwd=str(qdir), held_by=ANSWER_CHANNELS, rec=NO,
-            what=f"A slot session asked to always allow: {rule}",
-            options=[(YES, f"Yes: allow {rule} in every future slot session"), (NO, "No: keep asking")],
+            what=asked_text(rule),
+            options=[(YES, yes_label(rule)), (NO, "No: keep asking")],
             blocks=(f"nothing: the slot already ran. Yes adds the rule to {FILE_NAME} (slot sessions only; never "
                     f"your checkout or your own sessions); No asks again next run. Session {session}."))
         if new:
-            pend[key] = {"rule": rule, "session": session}
+            pend[key] = {"rule": rule, "session": session, "question_id": q.id}
             filed.append(rule)
     if filed:
         _save_pending(qdir, pend)
@@ -274,46 +498,71 @@ def file_rows(qdir: Path, session: str, rules: Sequence[str], store: Any = None)
 
 
 def _answered(qdir: Path, pend: Mapping[str, Any], store: Any) -> Dict[str, Any]:
+    """The question each pending key's row became, once it has an answer."""
     from levain.consent.questions import QuestionStore
 
     qs = store or QuestionStore(qdir)
     by_key = {q.agent_session_id: q for q in qs.recent(500) if q.agent_session_id.startswith(KEY_PREFIX)}
-    return {key: by_key[key].answer for key in pend if key in by_key}
+    return {key: by_key[key] for key in pend if key in by_key and by_key[key].answer is not None}
 
 
-def apply_answered(qdir: Path, allow_file: Path, store: Any = None, now: Callable[[], str] = _now) -> List[str]:
-    """Carry every rule whose row a person answered ``yes`` AND signed into ``allow_file``; a ``no`` drops the pending
-    note. A rule widens what a slot may do, so it is authority: a yes whose ``signed`` is not True stays pending and
-    writes nothing (``unsigned_yes`` names it). A row not yet answered is left. Returns the rules added."""
+def _judged(qdir: Path, pend: Mapping[str, Any], store: Any, judge: Optional[Judge]):
+    """``(key, rule, question, evidence, why)`` for each pending row a person answered ``yes``: the evidence when the
+    yes is their signed one for exactly this rule, else why not."""
+    from levain.consent.questions import ANSWER_CHANNELS, QuestionStore
+
+    qs = store or QuestionStore(qdir)
+    for key, q in sorted(_answered(qdir, pend, qs).items()):
+        a = q.answer
+        if a.channel not in ANSWER_CHANNELS or a.kind != "option" or a.value != YES:
+            continue
+        rule = pend[key]["rule"]
+        if pend[key].get("question_id") not in (None, q.id):
+            yield key, rule, q, None, "the answered row is not the one filed for this rule"
+        elif judge is None:
+            yield key, rule, q, None, "no authority named to check its signature against"
+        else:
+            ev, why = rule_evidence(qs, q, rule, judge)
+            yield key, rule, q, ev, why
+
+
+def apply_answered(qdir: Path, allow_file: Path, store: Any = None, now: Callable[[], str] = _now,
+                   judge: Optional[Judge] = None) -> List[str]:
+    """Carry every rule whose row a person answered ``yes`` AND signed into ``allow_file``, with the signed answer
+    stored beside it; a ``no`` drops the pending note. A rule widens what a slot may do, so it is authority: a yes
+    that is not the operator's signed yes to exactly that rule (:func:`rule_evidence`) stays pending and writes
+    nothing (:func:`not_carried` names why). A row not yet answered is left. Returns the rules added."""
     from levain.consent.questions import ANSWER_CHANNELS
 
     pend = _pending(qdir)
     if not pend:
         return []
-    answers = _answered(qdir, pend, store)
+    qs = store
+    if qs is None:
+        from levain.consent.questions import QuestionStore
+        qs = QuestionStore(qdir)
     added: List[str] = []
-    for key in sorted(pend):
-        a = answers.get(key)
-        if a is None or a.channel not in ANSWER_CHANNELS:
+    judged = {key: (rule, q, ev) for key, rule, q, ev, _why in _judged(qdir, pend, qs, judge)}
+    for key, q in sorted(_answered(qdir, pend, qs).items()):
+        a = q.answer
+        if a.channel not in ANSWER_CHANNELS:
             continue
         if a.kind == "option" and a.value == YES:
-            if a.signed is not True:
+            rule, _q, ev = judged[key]
+            if ev is None:
                 continue
-            if append(allow_file, pend[key]["rule"], str(pend[key].get("session", "?")), now):
-                added.append(pend[key]["rule"])
+            if append(allow_file, rule, str(pend[key].get("session", "?")), ev, now):
+                added.append(rule)
         del pend[key]
     _save_pending(qdir, pend)
     return added
 
 
-def unsigned_yes(qdir: Path, store: Any = None) -> List[str]:
-    """The rules a person answered ``yes`` that are not carried because the answer is not signed."""
-    from levain.consent.questions import ANSWER_CHANNELS
-
+def not_carried(qdir: Path, store: Any = None, judge: Optional[Judge] = None) -> List[Tuple[str, str]]:
+    """The rules a person answered ``yes`` that are not carried (yet), each with why: unsigned, signed over other
+    words, a key no longer active, a remote answer nobody countersigned."""
     pend = _pending(qdir)
-    return [pend[k]["rule"] for k, a in sorted(_answered(qdir, pend, store).items())
-            if a is not None and a.channel in ANSWER_CHANNELS and a.kind == "option" and a.value == YES
-            and a.signed is not True]
+    return [(rule, why) for _k, rule, _q, ev, why in _judged(qdir, pend, store, judge) if ev is None]
 
 
 # --- the launch ---------------------------------------------------------------------------------------------------
@@ -360,14 +609,26 @@ def run(args: Any, out: Any = None) -> int:
         verb = args.slot_allow_verb
         if verb == "list":
             doc = load(path)
-            for r in doc["rules"]:
-                out.write(f"{r['rule']}\t(session {r.get('session', '?')}, signed {r.get('signed_at', '?')})\n")
+            judge = default_judge(qdir)
             try:
-                waiting = unsigned_yes(qdir)
+                from levain.consent.questions import QuestionStore
+
+                ok, bad = carried(path, judge, store_id_of(QuestionStore(qdir)))
+            except Exception as e:   # noqa: BLE001 - the listing does not depend on the authority log
+                ok, bad = [], [(r["rule"], f"not checked ({type(e).__name__})") for r in doc["rules"]]
+            why = dict(bad)
+            for r in doc["rules"]:
+                where = f"session {r.get('session', '?')}, via {r.get('channel', '?')}, key {r.get('signer_fp', '?')}, signed {r.get('signed_at', '?')}"
+                if r["rule"] in why:
+                    out.write(f"{r['rule']}\t(NOT CARRIED: {why[r['rule']]}; {where})\n")
+                else:
+                    out.write(f"{r['rule']}\t({where})\n")
+            try:
+                waiting = not_carried(qdir, judge=judge)
             except Exception:   # noqa: BLE001 - the listing of carried rules does not depend on the band
                 waiting = []
-            for rule in waiting:
-                out.write(f"{rule}\t(answered unsigned: sign it to carry it)\n")
+            for rule, reason in waiting:
+                out.write(f"{rule}\t(answered yes, not carried: {reason})\n")
             if not doc["rules"] and not waiting:
                 out.write("no slot allow rules\n")
             return 0
@@ -386,4 +647,5 @@ def run(args: Any, out: Any = None) -> int:
 
 
 __all__ = ["AGENT", "AllowRefused", "FILE_NAME", "FORMAT", "NO", "YES", "append", "apply_answered", "file_rows", "load",
-           "merge_into_frozen", "parse_local_allow", "read_regular", "register", "revoke", "run", "rules_of", "shape_ok", "undo", "unsigned_yes"]
+           "merge_into_frozen", "parse_local_allow", "read_regular", "register", "revoke", "run", "rules_of", "shape_ok", "undo", "not_carried",
+           "Judge", "carried", "default_judge", "rule_evidence", "verify_evidence", "asked_text", "yes_text"]
