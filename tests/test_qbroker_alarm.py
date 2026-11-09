@@ -121,13 +121,23 @@ def test_every_slots_budget_fits_the_log_at_the_largest_record():
     assert MAX_SLOTS * per_slot <= ALARM_LOG_MAX - biggest
 
 
-def test_bad_cap_frames_never_spend_the_real_alarms_tokens(L, broker, caplog):
+def test_bad_cap_frames_never_spend_the_real_alarms_tokens(L, resolver, clock, caplog):
     caplog.set_level(logging.WARNING, logger="levain.qbroker")
+    b = make_broker(L, resolver, clock, monotonic=lambda: 1000.0)
+    assert alarm(b, reason="first")["ok"] is True                 # the slot's real cap has resolved once
     for i in range(50):
-        assert alarm(broker, cap=f"bad-{i}")["refused"] == "cap-unknown"
-    assert alarm(broker)["ok"] is True
-    assert len(records(L)) == 1
+        assert alarm(b, cap=f"bad-{i}")["refused"] in ("cap-unknown", "rate-limited")
+    assert alarm(b, reason="second")["ok"] is True
+    assert len(records(L)) == 2
     assert sum("could not be resolved" in r.getMessage() for r in caplog.records) == 1
+
+
+def test_a_flood_of_distinct_bad_caps_is_bounded_by_the_slots_bucket_at_control(L, resolver, clock):
+    b = make_broker(L, resolver, clock, monotonic=lambda: 1000.0)
+    got = [alarm(b, cap=f"bad-{i}") for i in range(50)]
+    assert len(resolver.calls) <= qbroker.ALARM_BURST
+    assert {g["refused"] for g in got[qbroker.ALARM_BURST:]} == {"rate-limited"}
+    assert records(L) == []
 
 
 def test_a_repeated_alarm_spends_no_token(L, resolver, clock):
