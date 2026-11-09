@@ -1746,13 +1746,16 @@ class Supervisor:
             kept, dropped = slot_allow.parse_local_allow(raw)
             qdir = Path(self.s.allow_dir)                                                  # type: ignore[arg-type]
             judge = self.s.allow_judge or slot_allow.default_judge(qdir)
-            new = slot_allow.offer(qdir, path, session, kept, judge)
+            refused: list = []
+            new = slot_allow.offer(qdir, path, session, kept, judge, refused=refused)
         except slot_allow.AllowRefused as e:
             self.say(f"slot allow rules not read from session {session} ({e})")
             return
         except Exception as e:   # noqa: BLE001
             self.say(f"slot allow rules not filed ({type(e).__name__})")
             return
+        for rule, why in refused:
+            self.say(f"slot allow rule answered yes, not carried: {rule} ({why})")
         if new:
             self.say(f"{len(new)} rule(s) the session asked to always allow are on your band (yes or no each); "
                      "nothing changes until you answer")

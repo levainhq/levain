@@ -813,7 +813,6 @@ def test_an_unsigned_yes_drops_its_pending_record_and_a_later_save_files_a_new_r
     _save(rig, qdir, "WebSearch", "S1")
     (q,) = _rows(rig, "WebSearch")
     rig.yes(q, signed=False)
-    assert _save(rig, qdir, "WebSearch", "S2") == []                     # a yes waiting for its launch is not re-asked
     refused = []
     assert SA.apply_answered(qdir, allow, store=rig.qs, judge=rig.judge, refused=refused) == []
     assert refused == [("WebSearch", "answered unsigned")]
@@ -930,3 +929,139 @@ def test_a_pending_file_of_the_keyed_format_holds_nothing_back(rig, qdir):
         "slot-allow:0": {"rule": "WebSearch", "session": "S0", "question_id": "q-gone"}}}))
     assert SA.apply_answered(qdir, qdir / SA.FILE_NAME, store=rig.qs, judge=rig.judge) == []
     assert _save(rig, qdir, "WebSearch", "S1") == ["WebSearch"]
+
+
+# --- the offer lifecycle: one consumer, consume then file ----------------------------------------------------------
+
+def _every_row(rig, rule):
+    return [q for q in rig.qs.recent(1000) if q.what == SA.asked_text(rule)]
+
+
+def test_a_no_to_a_renewal_row_is_seen_even_when_a_slot_saves_the_rule_before_the_next_apply(rig, qdir):
+    rule = "Bash(npm test *)"
+    allow = qdir / SA.FILE_NAME
+    _at_day(rig, 31)                                   # signed and applied on its day; its lease has since lapsed
+    rig.yes(rig.file(rule)[SA.asked_text(rule)])
+    then = SA.Judge(authority=rig.judge.authority, ctk=rig.judge.ctk, clock=rig.qs._clock)
+    assert SA.apply_answered(qdir, allow, store=rig.qs, judge=then) == [rule]
+    _at_day(rig, 0)
+    assert SA.remind(qdir, allow, store=rig.qs, judge=rig.judge) == [rule]
+    (q,) = _rows(rig, rule)
+    assert "No ends the rule" in q.blocks
+    rig.qs.answer(q.id, option="no", channel="cli")
+    _save(rig, qdir, rule, "S2")                       # a slot END that saved the rule, before any launch applied the no
+    SA.apply_answered(qdir, allow, store=rig.qs, judge=rig.judge)
+    assert SA.rules_of(allow) == []                    # the no ended the rule
+    (gone,) = SA.load(allow)["revoked"]
+    assert gone["rule"] == rule and gone["reason"] == SA.DECLINED
+    renewals = [r for r in _every_row(rig, rule) if "No ends the rule" in r.blocks]
+    assert [r.id for r in renewals] == [q.id]          # one renewal row ever: the answered one was never replaced
+    (fresh,) = _rows(rig, rule)                        # the END that saved it asks as any rule is first asked
+    assert "No asks again" in fresh.blocks
+
+
+class _Crash(Exception):
+    pass
+
+
+def _crash_after_filing(rig, monkeypatch):
+    """The next row filed reaches the question store, then the process dies before anything else is written."""
+    hit = []
+    for name in ("file", "file_once"):
+        real = getattr(rig.qs, name)
+
+        def crashing(*a, _real=real, **kw):
+            got = _real(*a, **kw)
+            if not hit:
+                hit.append(True)
+                raise _Crash()
+            return got
+        monkeypatch.setattr(rig.qs, name, crashing)
+
+
+def test_a_crash_between_filing_a_row_and_recording_it_never_files_a_second_row(rig, qdir, monkeypatch):
+    allow = qdir / SA.FILE_NAME
+    with monkeypatch.context() as m:
+        _crash_after_filing(rig, m)
+        with pytest.raises(_Crash):
+            _save(rig, qdir, "WebSearch", "S1")
+    (orphan,) = _rows(rig, "WebSearch")
+    _save(rig, qdir, "WebSearch", "S2")
+    _save(rig, qdir, "WebSearch", "S3")
+    assert [r.id for r in _rows(rig, "WebSearch")] == [orphan.id]       # the row filed before the crash is the one
+    assert len(_every_row(rig, "WebSearch")) == 1
+    rig.yes(orphan)
+    assert SA.apply_answered(qdir, allow, store=rig.qs, judge=rig.judge) == ["WebSearch"]
+
+
+def test_a_row_answered_before_its_crashed_filing_was_recorded_is_adopted_and_applied(rig, qdir, monkeypatch):
+    allow = qdir / SA.FILE_NAME
+    with monkeypatch.context() as m:
+        _crash_after_filing(rig, m)
+        with pytest.raises(_Crash):
+            _save(rig, qdir, "WebSearch", "S1")
+    (orphan,) = _rows(rig, "WebSearch")
+    rig.yes(orphan)                                    # he answers the row the crash left unrecorded
+    _launch(rig, qdir)                                 # apply, then the launch's filing step finds the row by its key
+    settings, _said = _launch(rig, qdir)
+    assert settings["permissions"]["allow"] == ["WebSearch"]
+    assert len(_every_row(rig, "WebSearch")) == 1
+
+
+def test_a_refused_renewal_yes_is_not_re_asked_by_the_same_launch(rig, qdir):
+    rule = "Bash(npm test *)"
+    _at_day(rig, 28)
+    allow = _carried_one(rig, qdir, rule)
+    _at_day(rig, 0)
+    _launch(rig, qdir)                                 # the renewal row
+    (q,) = _rows(rig, rule)
+    rig.yes(q, signed=False)
+    _settings, said = _launch(rig, qdir)
+    assert any(f"answered yes, not carried: {rule}" in m and "the next time a slot saves it" in m for m in said)
+    assert _rows(rig, rule) == []                      # the launch's reminder files no fresh row
+    _launch(rig, qdir)
+    assert _rows(rig, rule) == []                      # nor does the next one
+    assert SA.rules_of(allow) == [rule]                # the rule stays stored to its lease end
+    lapsed = datetime.now(timezone.utc) + timedelta(days=3)
+    assert SA.offer(qdir, allow, "S9", [rule], rig.judge, store=rig.qs, now=lapsed) == [rule]   # a slot saving it asks again
+    assert len(_rows(rig, rule)) == 1
+
+
+def test_undo_from_the_verb_with_no_authority_log_raises_nothing_and_re_offers(rig, qdir, capsys, monkeypatch):
+    allow = _carried_one(rig, qdir, "WebSearch")
+    SA.revoke(allow, "WebSearch", confirm=True)
+    monkeypatch.delenv("LEVAIN_SIGN_QUEUE_DIR", raising=False)
+    judge = SA.default_judge(qdir)                     # building the judge reads no authority log
+    with pytest.raises(Exception):
+        judge.authority()                              # there is none to read here
+    assert SA.run(SimpleNamespace(queue_dir=qdir, slot_allow_verb="undo", rule="WebSearch")) == 0
+    assert "re-offered on the band" in capsys.readouterr().out
+    assert len(_rows(rig, "WebSearch")) == 1
+
+
+def test_a_slot_end_applies_an_answered_row_before_it_files(rig, qdir):
+    _save(rig, qdir, "WebSearch", "S1")
+    (q,) = _rows(rig, "WebSearch")
+    rig.yes(q, signed=False)
+    refused = []
+    assert SA.offer(qdir, qdir / SA.FILE_NAME, "S2", ["WebSearch"], rig.judge, store=rig.qs, refused=refused) == ["WebSearch"]
+    assert refused == [("WebSearch", "answered unsigned")]                # applied, refused, then asked again
+    (row,) = _rows(rig, "WebSearch")
+    assert row.id != q.id
+    assert SA.not_carried(qdir, store=rig.qs, judge=rig.judge) == []
+
+
+def test_a_slot_end_says_a_yes_its_apply_refused(rig, qdir):
+    _save(rig, qdir, "WebSearch", "S1")
+    (q,) = _rows(rig, "WebSearch")
+    rig.yes(q, signed=False)
+    seams = sup.Seams(host="linux", helper=("x",), client_factory=lambda p: None, control_socket=Path("/x"),
+                      store=Path("/x"), base_map=Path("/x"), allow_dir=qdir, allow_judge=rig.judge,
+                      retained_allow=lambda session: local("WebSearch"))
+    said = []
+    s = sup.Supervisor.__new__(sup.Supervisor)
+    s.s, s.say = seams, said.append
+    s._file_allow_rows("S2")
+    assert any("answered yes, not carried: WebSearch (answered unsigned)" in m for m in said)
+    assert any("on your band" in m for m in said)
+    assert len(_rows(rig, "WebSearch")) == 1
