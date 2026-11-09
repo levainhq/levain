@@ -22,6 +22,11 @@
     return "as of read: " + by + " · " + (j.iso || "no time") + " · " + move + " · " + (j.why || "no reason given");
   }
 
+  // The one rule for a card the desk alone owes (the host's section desk, not carried over to him): not his, so not drawn and not
+  // counted. The same rule as levain.band_view.desk_owed, which the app badge and the compact board counts apply.
+  function isDeskOwed(k) { return !!k && k.section === "desk" && !k.carried; }
+  function visibleCards(cards) { return (cards || []).filter(function (k) { return !isDeskOwed(k); }); }
+
   function boardModel(body) {
     var cols = {};
     (body.columns || []).forEach(function (c) { cols[c.category] = c; });
@@ -37,9 +42,8 @@
         var c = cols[name] || { cards: [] };
         return {
           category: name,
-          // a band row the desk alone owes (section desk, not carried over to him) is not his: left out as the Needs strip leaves
-          // it out (dashboard_core needsItems) and the app badge does (webpush/needs.py). Both read the host's own two fields
-          cards: (c.cards || []).filter(function (k) { return !(k.band === true && k.section === "desk" && !k.carried); }).map(function (k) {
+          // a card the desk alone owes is left out (isDeskOwed), as the Needs strip leaves it out and the app badge does
+          cards: visibleCards(c.cards).map(function (k) {
             return {
               id: String(k.id), title: k.title == null ? "" : String(k.title), repo: k.repo || "",
               tier: k.tier || "", held: k.held_reason || "", number: k.number == null ? null : k.number,
@@ -229,6 +233,6 @@
     host.appendChild(wrap);
   }
 
-  var api = { boardModel: boardModel, filterModel: filterModel, countLabel: countLabel, journalLine: journalLine, renderBoard: renderBoard, renderGrouped: renderGrouped, dropWords: dropWords };
+  var api = { isDeskOwed: isDeskOwed, visibleCards: visibleCards, boardModel: boardModel, filterModel: filterModel, countLabel: countLabel, journalLine: journalLine, renderBoard: renderBoard, renderGrouped: renderGrouped, dropWords: dropWords };
   root.LevainBoardView = api;
 })(typeof window !== "undefined" ? window : this);
