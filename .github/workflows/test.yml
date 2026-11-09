@@ -6,12 +6,12 @@ name: test
 # The `test` job runs the suite in shards (tests/ci/shard.py computes the partition); the workflow stays
 # named `test` because the release gate reads a completed success of that workflow on the exact sha.
 
-# land/** is the land waiter's candidate ref: the push whose verdict decides a landing. seat/** stays until a real
-# landing has gone through land/**; then a seat's own push stops running the suite and workflow_dispatch asks for a run.
+# land/** is the land waiter's candidate ref: the push whose verdict decides a landing. A seat's own push no longer runs
+# the suite: workflow_dispatch on the seat's branch asks for a run, and that run uses one Python (3.12).
 # The schedule is the nightly rerun of main HEAD, the same-sha check that replaces the duplicate run a main push was.
 on:
   push:
-    branches: [main, "seat/**", "land/**"]
+    branches: [main, "land/**"]
     tags: ["v*"]
   pull_request:
     branches: [main]
@@ -29,7 +29,7 @@ concurrency:
   # cancels the superseded run of the same ref. A scheduled run is grouped like a dispatch: a main push must not cancel
   # the nightly (a cancelled nightly is a missing flake check), nor the nightly a main push.
   # A push to main is grouped by its sha and never cancels: each main sha's run is a verdict the release gate may read,
-  # so a newer main push must not cancel it. land/** and seat/** pushes and PRs keep cancelling the superseded run of the ref.
+  # so a newer main push must not cancel it. land/** pushes and PRs keep cancelling the superseded run of the ref.
   group: ${{ github.workflow }}-${{ github.ref }}-${{ (github.event_name == 'workflow_dispatch' || github.event_name == 'schedule') && github.run_id || (github.event_name == 'push' && github.ref == 'refs/heads/main') && github.sha || 'ci' }}
   cancel-in-progress: ${{ !(github.event_name == 'push' && github.ref == 'refs/heads/main') }}
 
@@ -112,7 +112,7 @@ jobs:
     name: pytest (Python ${{ matrix.python-version }}, shard ${{ matrix.shard }})
     needs: gate
     # The gate exists only on a main push, so on every other run it is skipped and these jobs run; without always() the
-    # implicit success() sees the skipped gate and skips this matrix (a seat/** or land/** run once went green without
+    # implicit success() sees the skipped gate and skips this matrix (a land/** run once went green without
     # the unit suite). A failed, errored or cancelled gate runs the shards too (fail closed); only a gate that
     # succeeded and said skip skips them. The shard list is static (below), so no planning job sits in front of them.
     if: ${{ always() && !cancelled() && !(needs.gate.result == 'success' && needs.gate.outputs.skip == 'true') }}
@@ -124,9 +124,9 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        # main, land/** and every other event run both Pythons. A seat/** push, or a workflow_dispatch on a seat/** branch,
-        # runs 3.12 only: the landing candidate on land/** still runs the full set.
-        python-version: ${{ fromJSON(startsWith(github.ref, 'refs/heads/seat/') && '["3.12"]' || '["3.12", "3.13"]') }}
+        # main, land/** and every other event run both Pythons. A workflow_dispatch on any other ref (a seat branch) runs
+        # 3.12 only: the landing candidate on land/** and main still run the full set.
+        python-version: ${{ fromJSON(github.event_name == 'workflow_dispatch' && github.ref != 'refs/heads/main' && !startsWith(github.ref, 'refs/heads/land/') && '["3.12"]' || '["3.12", "3.13"]') }}
         # The static shard list: keep equal to TEST_SHARDS (the `plan` job fails when it is not). Re-cut both together.
         shard: [0, 1, 2, 3, 4, 5]  # static shard list
     steps:
@@ -312,8 +312,8 @@ jobs:
     # One job ran every file in series and was within a few minutes of its 40 minute limit (35m42s on 10-29, then
     # over it once the sign-attempt tests joined), so the files are dealt round-robin into three shards: each
     # shard keeps the same rules (selection by file, nothing collected fails, any skip fails).
-    # Python 3.13 on main, land/** and every event but a seat/** push or a dispatch on a seat/** branch; those run 3.12 only.
-    name: cockpit browser tests (Python ${{ startsWith(github.ref, 'refs/heads/seat/') && '3.12' || '3.13' }}, shard ${{ matrix.shard }})
+    # Python 3.13 everywhere but a workflow_dispatch on a ref that is neither main nor land/**; that runs 3.12 only.
+    name: cockpit browser tests (Python ${{ github.event_name == 'workflow_dispatch' && github.ref != 'refs/heads/main' && !startsWith(github.ref, 'refs/heads/land/') && '3.12' || '3.13' }}, shard ${{ matrix.shard }})
     needs: gate
     # The gate exists only on a main push, so on every other run it is skipped and these jobs run; a failed, errored or
     # cancelled gate runs them too (fail closed: any doubt is a test). Only a gate that succeeded and said skip skips them.
@@ -331,7 +331,7 @@ jobs:
       - name: Set up Python
         uses: actions/setup-python@v6
         with:
-          python-version: ${{ startsWith(github.ref, 'refs/heads/seat/') && '3.12' || '3.13' }}
+          python-version: ${{ github.event_name == 'workflow_dispatch' && github.ref != 'refs/heads/main' && !startsWith(github.ref, 'refs/heads/land/') && '3.12' || '3.13' }}
           cache: pip
           cache-dependency-path: pyproject.toml
 
