@@ -129,13 +129,17 @@ def _probe(directory: Path, handle: tuple[str, Any] | None) -> tuple[bool, bool,
     """What a store directory holds, read without making or migrating anything: None when no coordinator was ever in
     it (a store a drop made is not one), else ``(holds the handle, the handle is its standing lease, a coordinator is
     live there)``. Live means a live lease, or a coordinator launch pending or active. A store in an older format
-    cannot be read: its live is None (unknown), never False."""
+    cannot be read: its live is None (unknown), never False; a store whose coordinator tables predate this format is
+    present the same way (never dropped as empty)."""
     from levain.coordinator import lease
     from levain.coordinator.store import StoreAbsent
 
     store = EnvelopeStore(directory)
-    if not store.holds_coordinator():
+    holds = store.holds_coordinator()
+    if holds is False:
         return None
+    if holds is None:                   # the tables that would say predate this format: present, live unknown
+        return False, False, None
     try:
         conn = store.open_readonly()
     except StoreAbsent:
@@ -177,23 +181,21 @@ def _coordinator_dir(args: argparse.Namespace) -> Path:
                 raise CoordError(f"{handle[0]} {handle[1]} is in both {consent} and {board}; name its store with "
                                  "--queue-dir")
             holding = standing
-        if len(holding) == 1:
+        if holding:                     # one: two were narrowed to the standing one or refused above
             return holding[0]
-        if holding:
-            raise CoordError(f"{handle[0]} {handle[1]} is in both {consent} and {board}; name its store with "
-                             "--queue-dir")
     present = [d for d, p in found.items() if p is not None]
     if not present:
         return board if args.coord_cmd == "take" else consent
     if len(present) == 2:
         unknown = [d for d in present if found[d][2] is None]
-        present = [d for d in present if found[d][2]]
-        if len(present) != 1:
-            why = "a coordinator is live in both" if present else (
-                "it is unknown whether one is live in " + " or ".join(str(d) for d in unknown)
-                + " (an older format a writer has not brought current)" if unknown else "none is live")
+        live = [d for d in present if found[d][2]]
+        if unknown or len(live) != 1:
+            why = ("it is unknown whether one is live in " + " or ".join(str(d) for d in unknown)
+                   + " (an older format a writer has not brought current)" if unknown
+                   else "a coordinator is live in both" if live else "none is live")
             raise CoordError(f"a coordinator store is in both {consent} and {board}, and {why}: name the one you "
                              "mean with --queue-dir")
+        present = live
     return present[0]
 
 

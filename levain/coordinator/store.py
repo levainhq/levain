@@ -735,7 +735,7 @@ class CoordStore:
             raise
         return conn
 
-    def _read_existing(self, sql_for) -> bool:
+    def _read_existing(self, sql_for) -> bool | None:
         """The read-only look behind :meth:`coordinator_present` and :meth:`holds_coordinator`: False for no directory
         or no file, else ``sql_for(names)`` run on a ``query_only`` connection (names: the tables in the file). The
         directory rule is read with ``lstat``; one that breaks it raises, as every opener's does."""
@@ -758,7 +758,7 @@ class CoordStore:
             raise
         try:
             conn.execute("PRAGMA query_only = ON")
-            return bool(sql_for(conn, _names(conn)))
+            return sql_for(conn, _names(conn))
         finally:
             conn.close()
 
@@ -769,17 +769,23 @@ class CoordStore:
         drop, not that a coordinator was ever in it (:meth:`holds_coordinator`)."""
         return self._read_existing(lambda conn, names: "threads" in names)
 
-    def holds_coordinator(self) -> bool:
+    def holds_coordinator(self) -> bool | None:
         """Whether a coordinator was ever in this store, read as :meth:`coordinator_present` reads: a lease event, a
-        coordinator setting, or a coordinator launch recorded. A store a drop made holds none of them. A file whose
-        format predates these tables holds none that can be read, so False."""
-        def held(conn: sqlite3.Connection, names: set[str]) -> bool:
-            if "lease_events" in names and conn.execute("SELECT 1 FROM lease_events LIMIT 1").fetchone():
+        coordinator setting, or a coordinator launch recorded. True when one is recorded; False when the tables that
+        would hold one exist and hold none (a store a drop made); None when it cannot be told, because a table (or
+        the launches ``role`` column) predates this format. An unknown store is never read as an empty one."""
+        def held(conn: sqlite3.Connection, names: set[str]) -> bool | None:
+            unknown = False
+            for table in ("lease_events", "coord_settings"):
+                if table not in names:
+                    unknown = True
+                elif conn.execute(f"SELECT 1 FROM {table} LIMIT 1").fetchone():
+                    return True
+            if "launches" not in names or "role" not in {r[1] for r in conn.execute("PRAGMA table_info(launches)")}:
+                unknown = True
+            elif conn.execute("SELECT 1 FROM launches WHERE role = 'coordinator' LIMIT 1").fetchone() is not None:
                 return True
-            if "coord_settings" in names and conn.execute("SELECT 1 FROM coord_settings LIMIT 1").fetchone():
-                return True
-            return "launches" in names and conn.execute(
-                "SELECT 1 FROM launches WHERE role = 'coordinator' LIMIT 1").fetchone() is not None
+            return None if unknown else False
         return self._read_existing(held)
 
     def _schema_current(self, conn: sqlite3.Connection, *, base: bool = False) -> bool:

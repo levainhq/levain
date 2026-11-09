@@ -127,16 +127,17 @@ def test_a_hint_names_the_store_a_bare_command_would_miss(homes, capsys):
 def test_a_store_a_drop_made_holds_no_coordinator(homes, capsys):
     """A phone or cockpit drop makes the consent store's tables. With the board's coordinator released, that store does
     not make the bare verbs ambiguous: they still reach the board's."""
+    from levain.coordinator.envelopes import EnvelopeStore
     from levain.coordinator.store import CoordStore
     consent, board = homes
     token = _json(capsys, "take")["token"]
     _json(capsys, "release", "--token", str(token), "--by", "coordinator")
-    CoordStore(consent).accept_drop("from the couch", surface="phone")
-    assert CoordStore(consent).coordinator_present() and not CoordStore(consent).holds_coordinator()
+    EnvelopeStore(consent).accept_drop("from the couch", surface="phone")
+    assert CoordStore(consent).coordinator_present() and CoordStore(consent).holds_coordinator() is False
     assert _json(capsys, "agent", "none")["agent"] == "none"
     assert _json(capsys, "status")["setting"]["agent"] == "none"
     assert _json(capsys, "status", "--queue-dir", str(board))["setting"]["agent"] == "none"
-    assert not CoordStore(consent).holds_coordinator()
+    assert CoordStore(consent).holds_coordinator() is False
 
 
 def test_a_stale_token_in_both_stores_is_refused_by_name(homes, capsys):
@@ -166,3 +167,47 @@ def test_the_refusal_says_unknown_for_a_store_that_cannot_be_read(homes, capsys,
     monkeypatch.setattr(store_mod.CoordStore, "open_readonly", unreadable)
     code, out, err = _run(capsys, "status")
     assert code == 1 and "unknown whether one is live in " + str(consent) in err
+
+
+def _older_store(directory, *, launches_without_role=False):
+    """A real older-format store file: it has `threads` (so a coordinator store is there) and none of the lease tables
+    (or, for the launches case, a launches table that predates the role column)."""
+    import sqlite3
+    directory.mkdir(parents=True, exist_ok=True, mode=0o700)
+    directory.chmod(0o700)
+    conn = sqlite3.connect(directory / "dispatch.db")
+    conn.execute("CREATE TABLE threads (thread_id TEXT PRIMARY KEY)")
+    if launches_without_role:
+        conn.execute("CREATE TABLE lease_events (gseq INTEGER)")
+        conn.execute("CREATE TABLE coord_settings (gseq INTEGER)")
+        conn.execute("CREATE TABLE launches (launch_id TEXT)")
+    conn.commit()
+    conn.close()
+
+
+@pytest.mark.parametrize("no_role", [False, True])
+def test_an_older_format_store_is_unknown_never_empty(homes, no_role):
+    from levain.coordinator.store import CoordStore
+    consent, board = homes
+    _older_store(consent, launches_without_role=no_role)
+    assert CoordStore(consent).coordinator_present()
+    assert CoordStore(consent).holds_coordinator() is None
+
+
+@pytest.mark.parametrize("no_role", [False, True])
+def test_an_older_format_store_beside_a_live_one_refuses(homes, capsys, no_role):
+    consent, board = homes
+    _older_store(consent, launches_without_role=no_role)
+    _json(capsys, "take", "--queue-dir", str(board))                 # the board's coordinator is live
+    code, out, err = _run(capsys, "status")
+    assert code == 1 and out == ""
+    assert "unknown whether one is live in " + str(consent) in err
+
+
+def test_an_older_format_store_alone_is_still_the_store(homes, capsys):
+    consent, board = homes
+    _older_store(consent)
+    from levain.coordinator import cli
+    import argparse
+    got = cli._coordinator_dir(argparse.Namespace(coord_cmd="status", token=None))
+    assert got == consent
