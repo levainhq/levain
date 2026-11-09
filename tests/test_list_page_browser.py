@@ -651,3 +651,57 @@ def test_lpr3_the_cards_one_control_is_drawn_once_and_not_redrawn_by_its_own_lay
         ])
     got = json.loads(out["values"][-1])
     assert got == {"same": True, "n": 0, "count": 1}, got
+
+
+# --- row 141 again: the bar is solid in BOTH themes, at the scroll where text sits behind it, and nothing of a row shows above it ---
+
+_BAR_LAYERS = """(() => {
+  const mb = document.querySelector('#levain-modal .modal-body');
+  const bar = mb.querySelector('.ep-search'); const r = bar.getBoundingClientRect(); const mr = mb.getBoundingClientRect();
+  const alphaOf = (c) => { const m = /(?:\\/\\s*|rgba\\([^,)]*,[^,)]*,[^,)]*,\\s*)([0-9.]+%?)/.exec(c);
+    return m ? (m[1].endsWith('%') ? parseFloat(m[1]) / 100 : parseFloat(m[1])) : 1; };
+  const cs = getComputedStyle(bar);
+  // what is on top at points across the bar's height and in the strip between the modal body's top edge and the bar
+  const owned = [];
+  for (const y of [r.top + 2, r.top + r.height / 2, r.bottom - 2]) for (const x of [r.left + 6, r.left + r.width / 2, r.right - 6]) {
+    const e = document.elementFromPoint(x, y); owned.push(!!e && bar.contains(e) || e === bar); }
+  const above = mr.top < r.top - 0.5 ? document.elementFromPoint(r.left + r.width / 2, mr.top + (r.top - mr.top) / 2) : null;
+  return JSON.stringify({bg: cs.backgroundColor, alpha: alphaOf(cs.backgroundColor), theme: document.documentElement.dataset.theme,
+    owned, aboveRow: !!(above && above.closest('.row')), gap: r.top - mr.top, hair: cs.borderBottomWidth + ' ' + cs.borderBottomStyle,
+    scrolled: mb.scrollTop, probe: 'bar'});
+})()"""
+
+
+@needs_browser
+def test_listpanel_141_again_the_sticky_bar_is_opaque_and_ruled_in_both_themes_scrolled_at_390(tmp_path: Path) -> None:
+    root, src, _ids = _install(tmp_path)
+    _seed_more(root)
+    _seed_phone(root)
+    shots = Path(os.environ.get("LEVAIN_LIST_SHOTS") or tmp_path)
+    shots.mkdir(parents=True, exist_ok=True)
+    steps: list[dict[str, Any]] = [
+        {"emulate": {"w": 390, "h": 844, "dpr": 2, "mobile": True}},
+        *_reload(),
+        {"until": f"{TRAY} && {TRAY}.querySelectorAll('.sp-results .row[data-surface=band]').length > 1 && 1"},
+        {"eval": f"{TRAY}.querySelector('.pexpand').click(); 1"},
+        {"until": "document.querySelector('#levain-modal .modal-body .sp-results .row') && 1"},
+        {"eval": "new Promise(r => setTimeout(() => r(1), 900))"},
+    ]
+    for theme in ("light", "dark"):
+        steps += [
+            {"eval": f"document.documentElement.dataset.theme = '{theme}'; 1"},
+            {"eval": "(() => { const mb = document.querySelector('#levain-modal .modal-body'); mb.scrollTop = 0; mb.scrollTop = 260; return 1; })()"},
+            {"eval": "new Promise(r => setTimeout(() => r(1), 300))"},
+            {"eval": _BAR_LAYERS},
+            {"shot": str(shots / f"{theme}.png")},
+        ]
+    with _serve(src, write_token=TOKEN, surface_tokens={"browser": TOKEN}, install_class="reported") as (url, _httpd):
+        out = _drive(tmp_path, f"{url}/", steps)
+    probes = [json.loads(x) for x in out["values"] if isinstance(x, str) and '"probe"' in x]
+    assert [p["theme"] for p in probes] == ["light", "dark"], probes
+    for p in probes:
+        assert p["scrolled"] > 0, p
+        assert p["alpha"] == 1, p                                      # opaque, not a tint a row shows through
+        assert all(p["owned"]), p                                      # at every point across the bar the bar is what is on top
+        assert p["aboveRow"] is False and p["gap"] <= 0.5, p           # no row text in a strip above it
+        assert p["hair"].startswith("1px") and "solid" in p["hair"], p # and a hairline under it
