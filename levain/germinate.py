@@ -15,9 +15,12 @@ is due from that minute; an agenda with no ``next`` is never due) it does, in or
    the spore as it is now), or, with no coordinator store that can take a drop (``coordinator_present``), the band
    filing with the reason in ``blocks``. ``desk`` files the spore's words verbatim and uncut (a spore too long for a
    drop is an error for that spore, never a truncation);
-5. stamp ``germinated={on, target, ref}`` and then compost the spore, each as a compare-and-set against the spore as
-   it was read (its version and ``agenda`` disposition), so a spore edited while this ran is left open, reported under
-   ``skipped``, and filed again from its new words on the next run.
+5. stamp ``germinated={on, target, ref}`` as a compare-and-set against the spore as it was read (its version and ``agenda``
+   disposition), so a spore edited while this ran is left open, reported under ``skipped``, and filed again from its new
+   words on the next run. An agenda that filed or adopted a QUESTION (``adopted``, ``band``, ``nudge``, ``band-fallback``)
+   is then LEFT OPEN: its stamp names the row, the row rings in the band, and the operator's controls on that intention
+   move the spore and the row together. An agenda that handed a coordinator drop (``board``, ``desk``) is composted, as
+   before, with a second compare-and-set.
 
 One bad spore never stops the others: its error is recorded under ``errors`` and the run goes on; the CLI prints every
 outcome that did complete and exits non-zero when any spore errored. A missing ``.levain/memory.spores.json`` is
@@ -27,9 +30,11 @@ not), so two overlapping runs (cron plus a hand run, the 06:10 run plus a minute
 The dedupe key is the spore's immutable ``origin_key``, never its id: the question store is per USER while ``spore-NNN``
 ids are per INSTALL, so an id key would let install B's due ``spore-004`` adopt install A's held row and compost with no
 row of its own. Filing is idempotent (``file_once`` / the outbox id), so a crash between any two steps re-runs into the
-same one row; a spore stamped but not yet composted is finished on the next run.
+same one row; a drop spore stamped but not yet composted is finished on the next run (a stamp naming a question is the
+live intention and is never finished).
 
-Known edges (closed under the reachability line, TS-2 L3): ``board:<repo>`` does not carry the repo into the drop: a
+Known edges (closed under the reachability line, TS-2 L3): an open stamped agenda is invisible to the due test (it carries a
+stamp) and to the finish loop (its stamp names a question), so it stays until an operator act resolves it. ``board:<repo>`` does not carry the repo into the drop: a
 drop's ``Source`` takes only an absolute repo path, a ``refs/heads/`` ref and a full commit id, none of which a repo
 NAME determines, and the words stay his verbatim; the repo is recorded in the spore's ``germinated`` stamp (target)
 only. A drop has no field for the spore's ``created`` or ``next`` either (``sent_at`` is the sender's clock stamp, not an
@@ -123,6 +128,12 @@ def is_due(item: dict[str, Any], today: date, now: datetime | None = None) -> bo
     return nxt is not None and nxt <= today
 
 
+def _rings(stamp: Any) -> bool:
+    """True for a stamp that names a QUESTION (a band row): that intention stays live. A coordinator drop's id starts ``dr-``."""
+    ref = stamp.get("ref") if isinstance(stamp, dict) else None
+    return isinstance(ref, str) and bool(ref) and not ref.startswith("dr-")
+
+
 def _target_of(item: dict[str, Any]) -> tuple[str, str | None]:
     """``(target, repo)``: ``band`` (default and the fallback for an unknown value), ``nudge``, ``desk``,
     ``board:<repo>``. The keyword is matched without regard to case; the repo keeps its own."""
@@ -214,7 +225,7 @@ def _germinate(spores_json: Path, qdir: Path, install: Path, agent: str, today: 
     else:
         open_items = store.list_open(today=today)
     due = [s for s in open_items if is_due(s, today, now) and (not timed_only or is_timed(s.get("next")))]
-    finish = [s for s in open_items if _is_agenda(s) and s.get("germinated")]
+    finish = [s for s in open_items if _is_agenda(s) and s.get("germinated") and not _rings(s.get("germinated"))]
     # a dry run on a machine with no band yet must not create one
     questions = None if dry_run and not (qdir / DB_NAME).exists() else QuestionStore(qdir)
     open_ids = {q.id for q in questions.open_questions()} if questions is not None else set()
@@ -308,8 +319,9 @@ def _germinate(spores_json: Path, qdir: Path, install: Path, agent: str, today: 
                     updated = store.update(sid, germinated={**stamp_for, "target": target, "ref": ref},
                                            expect_disposition="agenda", expected_version=spore_version(item),
                                            today=today)
-                    store.descend(sid, kind="composted", expect_disposition="agenda",
-                                  expected_version=spore_version(updated), today=today)
+                    if via not in ("adopted", "band", "nudge", "band-fallback"):
+                        store.descend(sid, kind="composted", expect_disposition="agenda",
+                                      expected_version=spore_version(updated), today=today)
                     done = True
                 except SporeError as exc:
                     if "changed since read" not in str(exc) and "disposition changed" not in str(exc):
@@ -352,7 +364,8 @@ def run_germinate(args: argparse.Namespace, out: Any = None) -> int:
         return rc
     verb = "would germinate" if args.dry_run else "germinated"
     for o in res["due"]:
-        print(f"{verb} {o['spore_id']} ({o['target']}) via {o['via']}" + (f" -> {o['ref']}" if o["ref"] else ""), file=out)
+        live = " (stamped, live)" if o["done"] and o["via"] in ("adopted", "band", "nudge", "band-fallback") else ""
+        print(f"{verb} {o['spore_id']} ({o['target']}) via {o['via']}" + (f" -> {o['ref']}" if o["ref"] else "") + live, file=out)
     for o in res["finish"]:
         print(f"{'would finish' if args.dry_run else 'finished'} {o['spore_id']} (stamped, now composted)", file=out)
     for s in res["skipped"]:
