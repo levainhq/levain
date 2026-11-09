@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import json
 import os
+import threading
 import time
 from collections.abc import Mapping
 from typing import Any, Callable, Optional
@@ -96,8 +97,7 @@ FINAL_WAIT_S = 6.0
 _POLL_S = 0.2
 
 
-class _Torn(Exception):
-    """The sink ends in a line not yet whole (an append in flight): read again."""
+_DONE, _RETRY, _BAD = "done", "retry", "bad"
 
 
 def _no_constant(name: str) -> None:
@@ -108,78 +108,102 @@ def _micros(v: object) -> Optional[int]:
     return v if type(v) is int and 0 <= v <= _INT_MAX else None
 
 
-def _read_sink(path: object, run_id: str, *, torn_is_final: bool = True) -> Optional[int]:
-    """One whole read of the sink. The sum, None when the proof fails, or raises :class:`_Torn` when
-    ``torn_is_final`` is False and the tail is not a whole line."""
-    total, matched, triples, finals = 0, 0, [], []
-    try:
-        fd = os.open(os.fspath(path), os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC)
-    except OSError:
-        return None
-    try:
-        with os.fdopen(fd, "rb") as fh:
-            fd = -1
-            while True:
-                raw = fh.readline(_LINE_MAX + 1)
-                if not raw:
-                    break
-                if len(raw) > _LINE_MAX:
-                    return None
-                if not raw.endswith(b"\n"):
-                    if torn_is_final:
-                        return None            # a torn tail (an append in flight, or a crash): never a row
-                    raise _Torn()
-                try:
-                    row = json.loads(raw.decode("utf-8"), parse_constant=_no_constant)
-                except (ValueError, RecursionError):
-                    return None
-                # every decision here keys on `format`, never on a key's presence: a run-final row's `quarantined`
-                # is a COUNT, a `/3` row's `quarantined` is the quarantine marker
-                fmt = row.get("format") if isinstance(row, dict) else None
-                if fmt == _FINAL_FORMAT:
-                    if row.get("run_id") == run_id:
-                        finals.append(row)
-                    continue
-                if fmt != _LINEAGE_FORMAT:
-                    return None
-                if "quarantined" in row:
-                    continue                   # a quarantine row names no run: the final's own count attributes it
-                if row.get("run_id") != run_id:
-                    continue
-                settled, hold, cost = row.get("settled"), _micros(row.get("hold_microdollars")), row.get("cost_microdollars")
-                if hold is None or (cost is not None and _micros(cost) is None):
-                    return None
-                if settled == "yes":
-                    figure = hold if cost is None else cost
-                elif settled == "uncertain":
-                    figure = hold if cost is None else max(hold, cost)
-                elif settled == "no":
-                    figure = 0
-                else:
-                    return None
-                src = row.get("source")
-                if not isinstance(src, dict) or set(src) != {"ledger", "epoch", "ref"}:
-                    return None
-                triples.append(src)
-                total += figure
-                matched += 1
-    except OSError:
-        return None
-    finally:
-        if fd != -1:
-            os.close(fd)
-    if len(finals) != 1:
-        return None
-    fin = finals[0]
-    n, q, digest = fin.get("rows"), fin.get("quarantined"), fin.get("triples_digest")
-    if type(n) is not int or type(q) is not int or q != 0 or n != matched or type(digest) is not str:
-        return None
-    try:
-        if triples_digest(triples) != digest:
-            return None
-    except (KeyError, TypeError, IndexError):
-        return None
-    return total if total <= _INT_MAX else None
+class _SinkRead:
+    """An incremental read of the sink for one run. :meth:`step` reads from where the last step stopped and answers
+    one of three things: ``(_DONE, total)`` (the proof is whole and holds), ``(_RETRY, None)`` (not yet: no final so
+    far, a tail not yet a whole line, or the sink not yet there) or ``(_BAD, None)`` (a proof that cannot become good by
+    waiting: a malformed line, an unknown format, a figure that is no count, a final that disagrees with the rows,
+    a second final, a quarantine count, a sink that cannot be opened for any reason but absence). A torn tail with
+    ``torn_is_final`` is bad: the one-shot reader never waits."""
+
+    def __init__(self, path: object, run_id: str, *, torn_is_final: bool) -> None:
+        self._path, self._run, self._torn_final = path, run_id, torn_is_final
+        self._offset, self._total, self._matched = 0, 0, 0
+        self._triples: list = []
+        self._finals: list = []
+
+    def step(self) -> "tuple[str, Optional[int]]":
+        try:
+            fd = os.open(os.fspath(self._path), os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC)
+        except FileNotFoundError:
+            return (_BAD, None) if self._torn_final else (_RETRY, None)
+        except OSError:
+            return _BAD, None
+        try:
+            fh = os.fdopen(fd, "rb")
+        except BaseException:
+            os.close(fd)                       # fdopen took no ownership: this close is the only one
+            raise
+        try:
+            with fh:                           # from here fh owns the descriptor: nothing closes it a second time
+                if os.fstat(fh.fileno()).st_size < self._offset:
+                    return _BAD, None          # a sink that shrank is no append-only record
+                fh.seek(self._offset)
+                while True:
+                    raw = fh.readline(_LINE_MAX + 1)
+                    if not raw:
+                        break
+                    if len(raw) > _LINE_MAX:
+                        return _BAD, None
+                    if not raw.endswith(b"\n"):
+                        return (_BAD, None) if self._torn_final else (_RETRY, None)
+                    self._offset += len(raw)
+                    if not self._take(raw):
+                        return _BAD, None
+        except OSError:
+            return _BAD, None
+        return self._verdict()
+
+    def _take(self, raw: bytes) -> bool:
+        try:
+            row = json.loads(raw.decode("utf-8"), parse_constant=_no_constant)
+        except (ValueError, RecursionError):
+            return False
+        # every decision here keys on `format`, never on a key's presence: a run-final row's `quarantined`
+        # is a COUNT, a `/3` row's `quarantined` is the quarantine marker
+        fmt = row.get("format") if isinstance(row, dict) else None
+        if fmt == _FINAL_FORMAT:
+            if row.get("run_id") == self._run:
+                self._finals.append(row)
+            return len(self._finals) <= 1      # a second final is no proof, whatever follows
+        if fmt != _LINEAGE_FORMAT:
+            return False
+        if "quarantined" in row:
+            return True                        # a quarantine row names no run: the final's own count attributes it
+        if row.get("run_id") != self._run:
+            return True
+        settled, hold, cost = row.get("settled"), _micros(row.get("hold_microdollars")), row.get("cost_microdollars")
+        if hold is None or (cost is not None and _micros(cost) is None):
+            return False
+        if settled == "yes":
+            figure = hold if cost is None else cost
+        elif settled == "uncertain":
+            figure = hold if cost is None else max(hold, cost)
+        elif settled == "no":
+            figure = 0
+        else:
+            return False
+        src = row.get("source")
+        if not isinstance(src, dict) or set(src) != {"ledger", "epoch", "ref"}:
+            return False
+        self._triples.append(src)
+        self._total += figure
+        self._matched += 1
+        return True
+
+    def _verdict(self) -> "tuple[str, Optional[int]]":
+        if not self._finals:
+            return _BAD if self._torn_final else _RETRY, None
+        fin = self._finals[0]
+        n, q, digest = fin.get("rows"), fin.get("quarantined"), fin.get("triples_digest")
+        if type(n) is not int or type(q) is not int or q != 0 or n != self._matched or type(digest) is not str:
+            return _BAD, None
+        try:
+            if triples_digest(self._triples) != digest:
+                return _BAD, None
+        except (KeyError, TypeError, IndexError):
+            return _BAD, None
+        return (_DONE, self._total) if self._total <= _INT_MAX else (_BAD, None)
 
 
 def lineage_spend(path: object, run_id: str) -> Optional[int]:
@@ -202,7 +226,17 @@ def lineage_spend(path: object, run_id: str) -> Optional[int]:
     hold and no row) gets no final and settles at its reservation: the safe direction."""
     if type(run_id) is not str or not run_id or not isinstance(path, (str, os.PathLike)):
         return None
-    return _read_sink(path, run_id)
+    try:
+        status, got = _SinkRead(path, run_id, torn_is_final=True).step()
+    except Exception:  # noqa: BLE001 - an unreadable proof is no proof
+        return None
+    return got if status == _DONE else None
+
+
+#: [judged] at most this many USAGE reads wait at once; any further read is one look and no wait, so a burst of drops
+#: cannot hold every non-holder connection slot for the whole wait and leave END none (the run server's connection cap
+#: leaves sixteen beyond its holder cap)
+MAX_WAITERS = 8
 
 
 def lineage_spend_reader(path: object, *, wait_s: float = FINAL_WAIT_S, poll_s: float = _POLL_S,
@@ -210,22 +244,28 @@ def lineage_spend_reader(path: object, *, wait_s: float = FINAL_WAIT_S, poll_s: 
                          sleep: Callable[[float], Any] = time.sleep) -> Callable[[str], Optional[int]]:
     """:func:`lineage_spend` bound to the sink at ``path``: the ``spend`` a brokered ``RealLauncher`` is built with.
     The settle reads once, so the read WAITS for the run final, up to ``wait_s`` (:data:`FINAL_WAIT_S`), polling every
-    ``poll_s``: a torn tail means read again, and at the deadline the answer is None. A reader that raises is None."""
+    ``poll_s``, but only while the proof can still arrive: no final yet, a torn tail or an absent sink read again (from
+    the offset the last poll reached), and a proof that is bad (see :class:`_SinkRead`) answers None at once. At the
+    deadline the answer is None. A reader that raises is None. At most :data:`MAX_WAITERS` reads wait together."""
+    waiters = threading.BoundedSemaphore(MAX_WAITERS)
+
     def read(run_id: str) -> Optional[int]:
         if type(run_id) is not str or not run_id or not isinstance(path, (str, os.PathLike)):
             return None
-        deadline = clock() + max(0.0, float(wait_s))
+        waits = waiters.acquire(blocking=False)
         try:
+            src = _SinkRead(path, run_id, torn_is_final=False)
+            deadline = clock() + (max(0.0, float(wait_s)) if waits else 0.0)
             while True:
-                try:
-                    got = _read_sink(path, run_id, torn_is_final=False)
-                except _Torn:
-                    got = None
-                if got is not None:
+                status, got = src.step()
+                if status == _DONE:
                     return got
-                if clock() >= deadline:
+                if status == _BAD or clock() >= deadline:
                     return None
                 sleep(poll_s)
         except Exception:  # noqa: BLE001 - an unreadable proof is no proof
             return None
+        finally:
+            if waits:
+                waiters.release()
     return read
