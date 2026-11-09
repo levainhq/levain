@@ -380,10 +380,10 @@ class PendingActionStore:
             try:
                 self._write_raw(records)   # commit the removal (atomic tmp+replace)
             except OSError as e:
-                # the write failed BEFORE os.replace → the file is unchanged → the record SURVIVES and
-                # is retriable. Fail-soft to "not claimed" (None) rather than propagate a misleading
-                # resolve_error: the caller sees unknown_pending; the pending stays open (L3 complement
-                # LOW-2). Never returns a claimed record we couldn't durably remove (no double-fire).
+                # a failed temp flush leaves the file unchanged (the record survives); a failed directory flush
+                # raises after the rename (the record is gone, not durably). Either way fail-soft to "not
+                # claimed" (None) rather than propagate a misleading resolve_error: the caller sees
+                # unknown_pending and the action is never fired from here (no double-fire; at worst dropped).
                 _log.error("pending store: claim write FAILED for %r (%s): %s — NOT claimed (record survives)",
                            pending_id, type(e).__name__, e)
                 return None

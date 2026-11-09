@@ -362,6 +362,7 @@ def _journal_fullfsync_raising(monkeypatch, code: int) -> list:
 
     plain: list = []
     monkeypatch.setattr(J.fcntl, "F_FULLFSYNC", 51, raising=False)
+    assert J.fcntl.F_FULLFSYNC == 51        # pinned here, so the fcntl branch runs on a platform without it too
 
     def fake_fcntl(fd, op, *a):
         raise OSError(code, os.strerror(code))
@@ -382,10 +383,42 @@ def test_durable_fsync_propagates_eio_and_does_not_fall_back(monkeypatch):
     assert plain == []
 
 
-def test_durable_fsync_falls_back_when_the_filesystem_has_no_fullfsync(monkeypatch):
+@pytest.mark.parametrize("name", ["ENOTSUP", "EOPNOTSUPP", "EINVAL", "ENOTTY", "ENOSYS", "ENODEV"])
+def test_durable_fsync_falls_back_when_the_filesystem_has_no_fullfsync(monkeypatch, name):
     import errno
     from levain.autonomic import journal as J
 
-    plain = _journal_fullfsync_raising(monkeypatch, errno.ENOTSUP)
+    plain = _journal_fullfsync_raising(monkeypatch, getattr(errno, name))
     J.durable_fsync(7)
     assert plain == [7]
+
+
+def test_durable_replace_removes_the_temp_when_the_file_fsync_fails(tmp_path, monkeypatch):
+    from levain.autonomic import journal as J
+
+    target = tmp_path / "f.json"
+    target.write_text("old")
+    monkeypatch.setattr(J, "durable_fsync", lambda fd: (_ for _ in ()).throw(OSError(5, "EIO")))
+    with pytest.raises(OSError):
+        J.durable_replace(target, "new")
+    assert target.read_text() == "old"
+    assert sorted(p.name for p in tmp_path.iterdir()) == ["f.json"]
+
+
+def test_durable_replace_directory_fsync_failure_raises_after_the_rename_applied(tmp_path, monkeypatch):
+    from levain.autonomic import journal as J
+
+    target = tmp_path / "f.json"
+    target.write_text("old")
+    calls = []
+
+    def sync(fd):
+        calls.append(fd)
+        if len(calls) == 2:                  # the directory's flush, after the rename
+            raise OSError(5, "EIO")
+
+    monkeypatch.setattr(J, "durable_fsync", sync)
+    with pytest.raises(OSError):
+        J.durable_replace(target, "new")
+    assert target.read_text() == "new"       # applied, not durable
+    assert sorted(p.name for p in tmp_path.iterdir()) == ["f.json"]
