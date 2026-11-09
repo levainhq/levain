@@ -284,6 +284,7 @@
    "emphasis": "none",
    "facets": {
     "age_days": 0,
+    "band_age": "0m",
     "band_number": null,
     "list_pointer": "answer it in Decisions (levain band)",
     "source": "levain · claude_code",
