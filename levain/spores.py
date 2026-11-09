@@ -335,6 +335,33 @@ def check_steering(disposition: Any, target: Any, attention: Any) -> str | None:
     return None
 
 
+def ringing_ref(spore: Mapping[str, Any]) -> str | None:
+    """The band row an OPEN agenda rings in: the ``ref`` of its ``germinated`` stamp, or None. Read from the stored record
+    (never a facet), so it holds whatever the List could or could not read."""
+    stamp = spore.get("germinated")
+    ref = stamp.get("ref") if isinstance(stamp, Mapping) else None
+    if (spore.get("disposition") == "agenda" and spore.get("status", "open") == "open"
+            and isinstance(ref, str) and ref):
+        return ref
+    return None
+
+
+def spore_ringing_question(spores_json: Any, ref: Any) -> str | None:
+    """The id of the open agenda whose stamp names the band row ``ref``, or None (no store, no such stamp, an unreadable store:
+    a guard that cannot read says nothing, it never blocks an unrelated act)."""
+    from pathlib import Path
+
+    try:
+        if not Path(spores_json).is_file():
+            return None
+        for item in list_open_readonly(spores_json):
+            if ringing_ref(item) == ref:
+                return str(item.get("id"))
+    except Exception:  # noqa: BLE001 - see the docstring
+        return None
+    return None
+
+
 def list_open_readonly(path: Any, *, today: Any = None) -> list[dict[str, Any]]:
     """anneal's ``list_open`` WITHOUT its write: ``list_open`` backfills a missing ``origin_key`` and saves the store
     (and takes a ``.lock`` file), which a diagnostic or a dry run must never do. This reads the document, ranks it

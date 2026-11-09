@@ -331,6 +331,17 @@ def _spore_id(target: dict[str, Any]) -> str:
     return row_id[len("spore:"):]
 
 
+def _ringing_ref(scope: "WriteScope", sid: str) -> str | None:
+    """The band row an open agenda rings in, read from the STORED spore (a spore the store cannot read says nothing: the
+    write's own CAS then refuses what is wrong)."""
+    from levain.spores import guarded_spore_store, ringing_ref
+
+    try:
+        return ringing_ref(guarded_spore_store(scope.anneal.spores_json).get(sid) or {})
+    except Exception:  # noqa: BLE001
+        return None
+
+
 def _spore_fire(kind: str) -> Callable[..., dict[str, Any]]:
     def fire(scope: "WriteScope", params: dict[str, Any], target: dict[str, Any], confirm: bool) -> dict[str, Any]:
         # The CAS keys come from the row as read from the source, never from the client (§4.4:
@@ -338,7 +349,12 @@ def _spore_fire(kind: str) -> Callable[..., dict[str, Any]]:
         # recomputes inside its write transaction, so the row the tier was computed on is the row
         # the write lands on (a write between read_one and here is refused 409).
         row = target["row"]
-        req = {"kind": kind, **params, "spore_id": _spore_id(target),
+        sid = _spore_id(target)
+        ringing = _ringing_ref(scope, sid)
+        if ringing:
+            raise EditError("rings_in_band", 409,
+                            f"{sid} rings in the band as {ringing}: use its snooze / edit / done / clear there, not a spore verb")
+        req = {"kind": kind, **params, "spore_id": sid,
                "expect_disposition": _facet(row, "disposition")}
         if confirm:
             req["confirm"] = True
