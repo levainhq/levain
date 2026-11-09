@@ -21,7 +21,7 @@ LAYOUT = """(() => { const q = (s) => document.querySelector(s);
   const strip = q('#ck-phonetabs'); const cs = getComputedStyle(strip);
   return JSON.stringify({ display: cs.display, position: cs.position, tabs: [...strip.querySelectorAll('button')].map(b => b.dataset.phoneJump),
     tabH: Math.min(...[...strip.querySelectorAll('button')].map(b => Math.round(b.getBoundingClientRect().height))),
-    stripFits: strip.scrollWidth <= strip.clientWidth, stripTop: top(strip), band: top(q('#ck-band')), needs: top(q('#ck-needs')), drop: top(q('#ck-drop')), sky: top(q('#ck-skycard')), scrollW: document.documentElement.scrollWidth,
+    tabsWhole: [...strip.querySelectorAll('button')].every(b => b.scrollWidth <= b.clientWidth), stripTop: top(strip), band: top(q('#ck-band')), needs: top(q('#ck-needs')), drop: top(q('#ck-drop')), sky: top(q('#ck-skycard')), scrollW: document.documentElement.scrollWidth,
     vw: document.documentElement.clientWidth, heroDisplay: getComputedStyle(q('#ck-hero')).display, heroBox: heroBox(q('#ck-hero')) }); })()"""
 
 
@@ -48,7 +48,7 @@ def test_a_phone_gets_the_strip_the_needs_first_and_a_jump_to_each_page_view(tmp
     layout, jumps = values[0], {v["which"]: v for v in values[1:]}
     assert layout["display"] == "flex" and layout["position"] == "sticky" and layout["tabs"] == TABS
     assert layout["tabH"] >= 40, layout   # a thumb's height
-    assert layout["stripFits"], layout    # all five tabs show at 390, none cut at the edge
+    assert layout["tabsWhole"], layout    # every tab shows its whole label at 390 (the strip scrolls for the rest)
     assert layout["scrollW"] <= layout["vw"], layout   # no sideways scroll
     # the hero's two children join the deck's column without the hero's own box: it carries none for the flatten to lose
     assert layout["heroDisplay"] == "contents" and layout["heroBox"] == "0px 0px 0px 0px 0px 0px 0px 0px rgba(0, 0, 0, 0) none", layout

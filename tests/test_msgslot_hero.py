@@ -13,7 +13,7 @@ import pytest
 
 from tests.test_cockpit_consent_rows import OPEN_DECISIONS
 from tests.test_cockpit_k2a import TOKEN as K2A_TOKEN, _install, _serve
-from tests.test_cockpit_narrow_layout_rig import (NEEDS, PHONE_TOUCH, SETTLE, TOK, FullRig, _drive, drive_touch, needs_browser,
+from tests.test_cockpit_narrow_layout_rig import (NEEDS, PHONE_TOUCH, SETTLE, TOK, FullRig, _drive, drive_touch, drop_tap, needs_browser,
                                                   needs_ssh)
 
 VIEWS = {"390": list(PHONE_TOUCH), "1280": [{"emulate": {"w": 1280, "h": 900, "dpr": 1}}]}
@@ -161,7 +161,7 @@ def test_add_an_envelope_opens_the_drop_sheet_with_the_typed_words(tmp_path: Pat
     with rig.serving():
         out = _drive(tmp_path, f"{rig.origin}/#write_token={TOK}",
                      [{"emulate": {"w": 1280, "h": 900, "dpr": 1}}, {"until": NEEDS, "ms": 30000}, {"until": READY, "ms": 30000},
-                      _type("with an envelope\nsecond line"), {"eval": "document.querySelector('#ck-drop [data-coord-drop=envelope]').click(); 1"},
+                      _type("with an envelope\nsecond line"), drop_tap("envelope"),
                       {"until": f"{inner} === 'with an envelope\\nsecond line'", "ms": 30000},
                       {"eval": f"JSON.stringify({{t: 'sheet', src: ({frame} || {{}}).src, words: {inner}, stored: sessionStorage.getItem('levain-drop-prefill')}})"},
                       _shot(tmp_path, "1280_sheet")])
@@ -368,7 +368,7 @@ def test_a_signed_drop_from_the_sheet_shows_in_the_hero_at_once_not_after_the_re
     frame = "document.querySelector('#levain-sign-sheet-frame, iframe[title=\"desk drop\"]')"
     click_in = f"(() => {{ const f = {frame}; const d = f && f.contentDocument; const b = d && d.getElementById('drop-send'); if (!b || b.disabled) return 0; d.getElementById('drop-words').value = 'from the sheet'; b.click(); return 1; }})()"
     steps = [{"emulate": {"w": 1280, "h": 900, "dpr": 1}}, {"until": NEEDS, "ms": 30000}, {"until": READY, "ms": 30000},
-             {"eval": "document.querySelector('#ck-drop [data-coord-drop=envelope]').click(); 1"}, {"until": click_in, "ms": 30000}, {"posts": 1, "ms": 15000},
+             drop_tap("envelope"), {"until": click_in, "ms": 30000}, {"posts": 1, "ms": 15000},
              {"until": "document.querySelectorAll('#ck-drop .drop-recent-row').length === 1 && /from the sheet/.test(document.querySelector('#ck-drop .drop-recent-row').textContent)", "ms": 15000}]
     with rig.serving():
         out = _drive(tmp_path, f"{rig.origin}/#write_token={TOK}", steps)

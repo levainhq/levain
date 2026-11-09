@@ -422,7 +422,8 @@
     var Speech = opts.speech === undefined ? (root.SpeechRecognition || root.webkitSpeechRecognition) : opts.speech;
     // Dictation is on-device or absent: a browser whose recognizer cannot be told to stay local (it would send the audio to
     // the browser vendor's cloud) gets no control, and the keyboard's own dictation key fills the draft box instead.
-    if (Speech && !(Speech.prototype && "processLocally" in Speech.prototype)) Speech = null;
+    // the test is mic.js's one function (the card boxes use it too); without mic.js on the page there is no dictation control
+    if (Speech) Speech = root.LevainMic && typeof root.LevainMic.localSpeech === "function" ? root.LevainMic.localSpeech(Speech) : null;
     var store = opts.storage === undefined ? (function () { try { return root.sessionStorage; } catch (e) { return null; } })() : opts.storage;
     var stopped = false, timer = 0, gen = 0, last = "", thread = null, current = null, ui = { open: {} }, drafts = {};
     var wrap = el(doc, "div", "rv"), top = el(doc, "div", "rv-top"), stage = el(doc, "div", "rv-stage"), body = el(doc, "div", "rv-body"), dock = el(doc, "div", "rv-dock"),

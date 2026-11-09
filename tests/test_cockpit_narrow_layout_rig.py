@@ -23,6 +23,15 @@ from tests.test_cockpit_sign_card import TOK, needs_ssh
 
 NEEDS = "document.querySelector('#ck-needs:not([hidden]) .needs-row')"
 SETTLE = {"eval": "new Promise(r => setTimeout(r, 1200)).then(() => 1)"}
+
+
+def drop_tap(which: str) -> dict:
+    """Click the cockpit drop card's `which` button (envelope, send) once it is enabled, so a click is never silently lost.
+    Why (11-09): bundle5 land #7's CI shot showed the typed words still in the box and no sheet open after a bare .click()
+    that had answered 1; a click on a disabled button does nothing, and the failure surfaced one step later as a frame that
+    never opened. If the button never enables, this step is now the one that times out."""
+    return {"until": f"(() => {{ const b = document.querySelector('#ck-drop [data-coord-drop={which}]'); if (!b || b.disabled) return null; "
+                     f"b.click(); return 1; }})()", "ms": 30000}
 PHONE = {"emulate": {"w": 390, "h": 844, "dpr": 2, "mobile": True}}
 DESKTOP = {"emulate": {"w": 1440, "h": 900, "dpr": 1}}
 

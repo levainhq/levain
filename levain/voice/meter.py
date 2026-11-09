@@ -485,6 +485,35 @@ class Meter:
             failed = type(exc).__name__
         raise MeterError(f"the voice ledger could not be read: {failed}")
 
+    def snapshot_if_present(self) -> tuple[Spend, dict[str, dict[str, tuple[int, int]]]]:
+        """The totals AND the per-provider rows from ONE clock read and ONE statement, so the two always agree: the totals
+        are the sum of the rows. Read-only, creates nothing (a missing ledger is zero and ``{}``); a symlink, a path that cannot be
+        resolved or opened, or a file that is not a ledger is a :class:`MeterError`."""
+        now = self._clock()
+        m0, m1, d0, d1 = self._periods(now)
+        if os.path.islink(self.path):
+            raise MeterError(f"voice ledger {self.path} is a symlink")
+        if not self.path.exists():
+            return Spend(0, 0, m0, d0, self.prices.as_of), {}
+        try:
+            uri = self.path.resolve().as_uri() + "?mode=ro"
+            with closing(sqlite3.connect(uri, uri=True, timeout=_BUSY_WAIT_S, isolation_level=None)) as conn:
+                row = conn.execute("SELECT value FROM meta WHERE key = 'format'").fetchone()
+                _need_format(row[0] if row is not None else None)
+                rows = conn.execute(
+                    "SELECT provider, COUNT(*), COALESCE(SUM(cost_micros), 0), "
+                    "COALESCE(SUM(CASE WHEN at >= ? AND at < ? THEN 1 ELSE 0 END), 0), "
+                    "COALESCE(SUM(CASE WHEN at >= ? AND at < ? THEN cost_micros ELSE 0 END), 0) "
+                    f"FROM calls WHERE {_COUNTED} AND at >= ? AND at < ? GROUP BY provider",
+                    (d0, d1, d0, d1, m0, m1)).fetchall()
+            by = {r[0]: {"month": (r[1], r[2]), "day": (r[3], r[4])} for r in rows}
+            month = sum(v["month"][1] for v in by.values())
+            day = sum(v["day"][1] for v in by.values())
+            return Spend(month, day, m0, d0, self.prices.as_of), by
+        except (sqlite3.Error, OSError) as exc:        # an unresolvable or unopenable path reads like an unreadable ledger
+            failed = type(exc).__name__
+        raise MeterError(f"the voice ledger could not be read: {failed}")
+
     def ledger(self, limit: int | None = None) -> list[LedgerRow]:
         """Rows newest first, for checking the estimate against a provider's dashboard."""
         sql = "SELECT id, at, provider, use, model, units, cost_micros, status FROM calls ORDER BY id DESC"

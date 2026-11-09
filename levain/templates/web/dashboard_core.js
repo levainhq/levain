@@ -444,10 +444,37 @@
     const place = body.scrollTop;
     try { return foldRowsAt(body, panel); } finally { if (body.scrollTop !== place) body.scrollTop = place; }
   }
+  // The List card's one control: what the card folds, then what it leaves to the focus view ("26 more · desk owes 5 · later 3 ·
+  // 18 held", only the non-zero parts), and it opens the focus view.
+  function listApart(panel) {
+    try {
+      const a = JSON.parse(panel.dataset.listApart || "null");
+      return a && (a.desk > 0 || a.later > 0 || a.held > 0) ? a : null;
+    } catch (e) { return null; }
+  }
+  function listMore(panel, hidden, a) {
+    const parts = [];
+    if (hidden > 0) parts.push(hidden + " more");
+    if (a.desk > 0) parts.push("desk owes " + a.desk);
+    if (a.later > 0) parts.push("later " + a.later);
+    if (a.held > 0) parts.push(a.held + " held");
+    const more = el("button", "more-foot", parts.join(" · "));
+    more.type = "button";
+    more.dataset.listMore = "1";
+    more.setAttribute("aria-label", parts.join(", ") + ": open the full list");
+    more.addEventListener("click", () => {
+      const x = panel.querySelector(".pexpand");
+      if (x) x.click();
+      modalReturnFocus = more;      // closing the focus view lands back on the control he pressed (its successor is found by closeModal)
+    });
+    panel.appendChild(more);
+    return hidden > 0;
+  }
   function foldRowsAt(body, panel) {
     for (const n of body.querySelectorAll("[data-folded]")) { n.style.display = ""; delete n.dataset.folded; }
     const old = panel.querySelector(":scope > .more-foot:not([data-readall])"); if (old) old.remove();   // the "Read all" foot is memFoot's: removing it here made memFoot re-add it, a childList change that re-ran this, without end
-    if (!(body.scrollHeight > body.clientHeight + 1)) return false;
+    const apartNow = listApart(panel);
+    if (!(body.scrollHeight > body.clientHeight + 1)) return apartNow ? listMore(panel, 0, apartNow) : false;
     const top = body.getBoundingClientRect().top;
     const heldLine = body.querySelector(":scope > .held-line, .held-line");
     const limit = body.clientHeight - 34 - (heldLine ? heldLine.offsetHeight : 0);   // room kept for the link and the held-back line
@@ -481,11 +508,12 @@
         if (nextRow < 0 || (nextHead >= 0 && i + 1 + nextHead < nextRow)) { list[i].style.display = "none"; list[i].dataset.folded = "1"; }
       }
     }
-    if (!hidden) return false;
+    if (!hidden) return apartNow ? listMore(panel, 0, apartNow) : false;
     // a list that has more rows than it first draws ends in its own "show all N" link; once the card folds, two links to the same rest would
     // disagree on the count, so the card keeps one: the foot, saying how many the focus view holds
     const xm = body.querySelector(".xmore"), total = xm ? parseInt((/\d+/.exec(xm.textContent) || [])[0], 10) : NaN;
     if (xm) { xm.style.display = "none"; xm.dataset.folded = "1"; }
+    if (apartNow) return listMore(panel, hidden, apartNow);
     const more = el("button", "more-foot", Number.isFinite(total) && total > hidden ? "Read all " + total : hidden + " more");
     more.type = "button";
     more.setAttribute("aria-label", (Number.isFinite(total) && total > hidden ? "Read all " + total + " rows" : hidden + " more rows") + ": open the full list");
@@ -1575,7 +1603,7 @@
       case "graph": return renderGraph(entry, view);
       case "crystals": return renderCrystals(entry, view);
       case "spores": return renderSpores(entry, view);
-      case "tray": return renderTray(entry, view);
+      case "tray": return renderTray(entry, view, opts);
       case "episodes": return renderEpisodes(entry, view, opts);
       case "wraps": return renderWraps(entry, view);
       case "section": return renderSection(entry, (view.sections || [])[entry.ref]);
@@ -2062,6 +2090,19 @@
     // the spore id is the common reference handle (how flow tracks + you name it,
     // e.g. "compost spore-049") — show it leading so the row is addressable; the TUI
     // shows the same id trailing (tui.render_panel_lines).
+    // A List row's pill names THAT ROW'S OWN origin: its repo, or the lowercase "<origin>:" its text leads with ("desk: ...",
+    // "levain: ..."). Never the store the row sits in (the pointer already says that) and never a repo its words merely mention;
+    // a row with no origin wears no pill. It leads the meta line, inline, so it wraps with the rest of it.
+    let originDrawn = false;
+    if (s.surface) {
+      const lead = /^([a-z][a-z0-9_-]{1,23}):\s/.exec(String(s.text || ""));
+      // the lead word is an origin only when it is a repo this page already knows (the sky's registry) or "desk" / "flow":
+      // "note: call Alice" and "re: invoice" lead with a word, not an origin
+      const leadOrigin = lead ? knownOrigin(lead[1]) : "";
+      const origin = (typeof s.repo === "string" && s.repo) || (!foreign && typeof s.domain === "string" && s.domain) || leadOrigin;
+      originDrawn = !!origin;
+      if (origin) { const pill = el("span", "k7-repo", String(origin)); pill.dataset.repoFacet = String(origin); pill.dataset.originPill = "1"; host.appendChild(pill); }
+    }
     if (s.id && !foreign) { host.appendChild(el("span", "sid", s.id)); row.dataset.spore = String(s.id); }   // the Work lens finds a loop's row by this
     // Tray badges the disposition (a legacy note badges "note"); Open Loops the tier (a parked loop badges "parked").
     let badge;
@@ -2077,12 +2118,15 @@
     if (foreign) {
       // read-only by construction: band rows point at the Decisions panel, board rows at the agents' queue; no verbs below
       if (s.support && !s.text_locked) host.appendChild(el("span", "muted list-support", s.support));
+      if (s.later_words && s.group === "later") host.appendChild(tagEl("muted", "back " + s.later_words));   // a carried desk row is due now (needs you), never "back Mon"
+      // a desk row the desk has carried past its day is listed under Needs you, tagged as flow's footer tags it
+      if (s.band_section === "desk" && s.carried) host.appendChild(tagEl("muted list-desk-owed", "desk-owed"));
       if (s.list_pointer) host.appendChild(tagEl("muted list-pointer", s.list_pointer));
       if (s.surface === "board") {
-        if (s.repo) host.appendChild(tagEl("muted", s.repo));
         if (s.board_tier) host.appendChild(tagEl("muted", s.board_tier));
       }
-      if (Number.isInteger(s.age_days) && s.age_days >= 0) host.appendChild(el("span", "muted", s.age_days + " d"));
+      if (s.band_age) host.appendChild(el("span", "muted", s.band_age));       // the footer's clock and form, never whole days from the add
+      else if (s.surface !== "band" && Number.isInteger(s.age_days) && s.age_days >= 0) host.appendChild(el("span", "muted", s.age_days + " d"));
       return row;
     }
     if (s.surface && !s.held) {
@@ -2123,7 +2167,7 @@
     // Build's Open loops draw "open N d" and the repo chip under the title (cockpit.css hides both elsewhere)
     // the integer the kernel sends (the spore's own created date), never the badge words parsed back
     if (Number.isInteger(s.age_days) && s.age_days >= 0) host.appendChild(el("span", "k7-opend", "open " + s.age_days + " d"));
-    if (s.domain) { const rc = el("span", "k7-repo", String(s.domain)); rc.dataset.repoFacet = String(s.domain); host.appendChild(rc); }
+    if (s.domain && !originDrawn) { const rc = el("span", "k7-repo", String(s.domain)); rc.dataset.repoFacet = String(s.domain); host.appendChild(rc); }
     if (verbs && s.id) appendRowVerbs(row, buildSporeVerbs(s, panelKind), panelKind === "tray" ? ["Resolve", "Snooze"] : null, panelKind === "tray" ? 2 : 0);
     return row;
   }
@@ -2141,7 +2185,7 @@
     const bar = el("div", "ep-search");
     const input = el("input", "ep-search-input");
     input.type = "search";
-    input.placeholder = "filter " + noun + " by text or spore-id…";
+    narrowPlaceholder(input, "filter " + noun + " by text or spore-id…", "filter by text or id…");
     input.setAttribute("aria-label", "filter " + kind + " by text or spore id");
     const status = el("span", "ep-search-status", "");
     bar.append(input, status);
@@ -2178,7 +2222,16 @@
   // The three spore projections share one renderer — same read/verb contract, different
   // source list + badge axis + empty copy. All three read their fault from the single
   // `open_spores` error key (the dashboard does ONE spore read that fills all three).
-  function renderSporeProjection(entry, view, list, emptyMsg, badgeField) {
+  // a group heading in a list is a heading to a screen reader too (VoiceOver rotor), the look is the same
+  function headingEl(text) {
+    const h = el("div", "grp-head", text);
+    h.setAttribute("role", "heading");
+    h.setAttribute("aria-level", "3");
+    return h;
+  }
+  // the heading the kernel gives the List's desk group; a carried desk row's second listing wears it when no desk row sent it
+  const DESK_OWES_TITLE = "Desk owes (the desk is on these; nothing for you)";
+  function renderSporeProjection(entry, view, list, emptyMsg, badgeField, ropts) {
     const p = panel(entry);
     // Both projections (Open Loops / Tray) come from ONE dashboard spore read,
     // whose fault is recorded under the single "open_spores" key — so every projection
@@ -2196,26 +2249,59 @@
     const heldLine = held.length && view.tray_held_line && typeof view.tray_held_line === "object" ? view.tray_held_line : null;
     // the List: rows that carry a `surface` get the surface filter (the kernel names the stores; the page only filters by them)
     const isList = entry.kind === "tray" && view.tray_is_list === true;   // the panel offers list_intake: a marker, never the rows' contents
-    // held rows count when they are shown: a surface only held rows carry still gets its chip and stays selectable
-    const listAll = () => (list || []).concat(heldLine && trayHeldShown ? held : []);
-    const listNow = () => (isList && listAll().some((s) => s.surface === listSurface) ? listSurface : "");
-    const inSurface = (s) => !listNow() || s.surface === listNow();
+    // The List's card holds what is due for the operator and what else fits; everything else it holds (the desk's rows, the rows
+    // that come back on a later day, the rows held until their date) is listed in the focus view, under its own heading, and the
+    // card names them in ONE control that opens it. So the card draws neither a held row nor a held toggle.
+    const inCard = isList && !(ropts && ropts.modal);
+    const apart = (s) => s.group === "desk" || s.group === "later";
+    const cardHides = (s) => inCard && apart(s);
+    // read live: the plain Tray's toggle flips trayHeldShown and redraws without rebuilding this closure
+    const heldShownNow = () => (isList ? !inCard : trayHeldShown);
+    // what the card leaves to the focus view, counted as flow's footer counts it: DESK OWES is every desk row, a carried one too
+    // (it is also listed under Needs you); LATER the rows that come back on a later day
+    const apartCount = { desk: (list || []).filter((s) => s.band_section === "desk").length,
+                         later: (list || []).filter((s) => s.group === "later").length, held: heldLine ? heldLine.count : 0 };
+    const cardHasApart = inCard && (apartCount.desk > 0 || apartCount.later > 0 || apartCount.held > 0);
+    // ONE rule for "all", in the card and the focus view: the rows in this view's own list (the card's without the desk's and the
+    // later ones it names in its control, the focus view's with them). Held rows are never in it, nor in a surface chip: they have
+    // their own "held" chip. So the header, the "all" chip and the control's numbers follow from each other.
+    const listAll = () => (list || []).filter((s) => !cardHides(s));
+    const withCarriedDesk = (rows) => {
+      const copies = rows.filter((s) => s.group === "band" && s.band_section === "desk" && s.carried)
+        .map((s) => Object.assign({}, s, { group: "desk", group_title: DESK_OWES_TITLE }));
+      if (!copies.length) return rows;
+      const at = rows.findIndex((s) => s.group !== "band");     // Desk owes follows Needs you, ahead of the rows already in it
+      return at < 0 ? rows.concat(copies) : rows.slice(0, at).concat(copies, rows.slice(at));
+    };
+    const heldChosen = () => isList && !inCard && listSurface === "held" && !!heldLine;   // the card names its held rows in its control, never draws them
+    const listNow = () => (heldChosen() ? "held" : isList && listAll().some((s) => s.surface === listSurface) ? listSurface : "");
+    const inSurface = (s) => !listNow() || listNow() === "held" || s.surface === listNow();
+    if (isList && !inCard) p.dataset.listTotal = String(listAll().length);   // the focus view's header counts what its "all" chip counts
+    let chipRow = null;     // the chips' row, drawn by controls(); the panel's own element is empty once the focus view moves its body
     const opts = views.length || heldLine || isList ? {
-      empty: emptyMsg,
-      extra: () => (heldLine && trayHeldShown ? held.filter(inSurface) : []),
-      unlisted: () => (heldLine && !trayHeldShown ? held.filter(inSurface) : []),
+      // a card whose due rows are all done still holds the desk's, the later and the held ones: it says nothing is due, not that it is empty
+      empty: cardHasApart ? "Nothing due for you." : emptyMsg,
+      extra: () => (isList ? (heldChosen() ? held : []) : heldLine && heldShownNow() ? held.filter(inSurface) : []),
+      // the card's search also reads what the card leaves to the focus view, so a match there is told, never "no items match"
+      unlisted: () => (inCard ? (list || []).filter(cardHides).concat(heldLine ? held : []).filter(inSurface)
+                              : (heldLine && !isList && !heldShownNow() ? held.filter(inSurface) : isList && heldLine && !heldChosen() ? held.filter(inSurface) : [])),
       hintShow: (note, n) => {
-        note.appendChild(document.createTextNode(" — " + n + (n === 1 ? " held row matches — " : " held rows match — ")));
+        note.appendChild(document.createTextNode(inCard ? " — " + n + (n === 1 ? " row matches in the full list — " : " rows match in the full list — ")
+                                                        : " — " + n + (n === 1 ? " held row matches — " : " held rows match — ")));
         const go = el("button", "held-toggle");
         go.type = "button";
         go.dataset.heldShowMatches = "1";
-        go.textContent = "show";
-        go.addEventListener("click", () => { const t = p.querySelector("[data-held-toggle]"); if (t) t.click(); });
+        go.textContent = inCard ? "open it" : "show";
+        go.addEventListener("click", () => {
+          if (inCard) { const m = p.querySelector("[data-list-more]"); if (m) m.click(); return; }
+          if (isList) { const c = chipRow && chipRow.querySelector('[data-surface="held"]'); if (c) c.click(); return; }
+          const t = p.querySelector("[data-held-toggle]"); if (t) t.click();
+        });
         note.appendChild(go);
       },
       controls: (bar, redraw) => {
-        if (isList) bar.after(buildSurfaceChips(listAll(), listNow, (v) => { listSurface = v; redraw(); }));
-        if (heldLine) {
+        if (isList) bar.after(chipRow = buildSurfaceChips(listAll(), listNow, (v) => { listSurface = v; redraw(); }, heldLine && !inCard ? heldLine.count : 0));
+        if (heldLine && !isList) {
           const line = el("div", "ext-note held-line");
           // the earliest surface date among the held rows: "1 held back until Dec 3"
           const nexts = held.map((h) => String(h.next || "")).filter((d) => /^\d{4}-\d{2}-\d{2}/.test(d)).sort();
@@ -2250,8 +2336,11 @@
         bar.appendChild(sel);
       },
       pick: (rows) => {
-        const all = listNow() ? rows.filter((s) => s.surface === listNow()) : rows;
+        const base = (listNow() === "held" ? [] : listNow() ? rows.filter((s) => s.surface === listNow() && inSurfaceChip(s)) : rows).filter((s) => !cardHides(s));
         const ids = views.length && viewOf() ? view.tray_view_rows[viewOf()] : null;
+        // the focus view draws a carried desk row under Needs you AND under Desk owes, as flow's footer prints it, so the control's
+        // "desk owes N" is the number of rows a person can see under that heading (a chosen view is ungrouped: no copy there)
+        const all = isList && !inCard && !Array.isArray(ids) && !listNow() ? withCarriedDesk(base) : base;
         if (!Array.isArray(ids)) return all;
         const byId = new Map(all.map((s) => [s.id, Object.assign({}, s, { age_shown: true })]));
         // a row the view did not name still shows, after the named ones
@@ -2260,19 +2349,23 @@
           .concat(all.filter((s) => !named.has(s.id)).map((s) => byId.get(s.id)));
       },
     } : undefined;
+    if (inCard) {
+      // what the card leaves to the focus view, for its one control (foldRowsAt words it)
+      p.dataset.listApart = JSON.stringify(apartCount);
+    }
     mountSporeFilter(p, list || [], "items", entry.kind, (rows, results) => {
       let lastGroup = null;
       let heldHead = false;
       let box = results;
       for (const s of rows) {
-        if (s.held && !heldHead) { heldHead = true; box = results; results.appendChild(el("div", "grp-head", "Held until their surface date")); }
+        if (s.held && !heldHead) { heldHead = true; box = results; results.appendChild(headingEl("Held until their surface date")); }
         // a manifest source brings the kernel's own bands (Today / Overdue / Also pending), in its order;
         // a chosen view is ungrouped
         const g = s.group || null;
         if (s.group_title && g !== lastGroup && !viewOf() && !s.held) {
           // each band is a column of its own where the page is wide (Morning's Tray: Overdue | Today); `display: contents` elsewhere
           box = entry.kind === "tray" ? results.appendChild(el("div", "grp-col")) : results;
-          box.appendChild(el("div", "grp-head", s.group_title));
+          box.appendChild(headingEl(s.group_title));
         }
         lastGroup = g;
         box.appendChild(sporeRow(s, verbs, badgeField, entry.kind));
@@ -2340,9 +2433,9 @@
     else p.insertBefore(box, p.firstChild);
   }
 
-  function renderTray(entry, view) {
+  function renderTray(entry, view, opts) {
     const p = renderSporeProjection(entry, view, view.tray,
-      "Nothing yet. Drop a line in the box above and " + (view.entity_name || "the assistant") + " sorts it.", "disposition");
+      "Nothing yet. Drop a line in the box above and " + (view.entity_name || "the assistant") + " sorts it.", "disposition", opts);
     // The intake box is the primary capture affordance (the List's one line) — mounted under the title when
     // writable. A read-only port (mesh) shows the List but offers no box (NO-THEATER). A panel that sends no `surface` on its
     // rows is the old Tray and keeps its dump box.
@@ -2356,12 +2449,19 @@
   // The List's surface filter: one chip per store that has a row now, with its count, plus All. A display choice only
   // (`listSurface`); the rows and their order are the kernel's.
   const SURFACE_WORDS = { band: "band", board: "board", spore: "spores", talk: "talk", drop: "drops" };
-  function buildSurfaceChips(list, current, choose) {
+  // ONE rule for which rows a surface chip stands for: the chip's count and the rows the focus view draws under it both use it, so
+  // a number on a chip is the number of rows its tap shows. The band's chip excludes the desk's rows and the later ones.
+  function inSurfaceChip(s) {
+    return !!(s && s.surface) && !(s.surface === "band" && (s.group === "desk" || s.group === "later"));
+  }
+  function buildSurfaceChips(list, current, choose, heldCount) {
     const row = el("div", "list-surfaces");
     row.setAttribute("role", "group");
     row.setAttribute("aria-label", "filter the List by where a row comes from");
     const counts = new Map();
-    for (const s of list) if (s && s.surface) counts.set(s.surface, (counts.get(s.surface) || 0) + 1);
+    // the band chip counts the rows due for the operator, as the panel's header does: the desk's rows and the later ones sit
+    // under their own headings, outside it
+    for (const s of list) if (inSurfaceChip(s)) counts.set(s.surface, (counts.get(s.surface) || 0) + 1);
     const chips = [];
     const mk = (value, label) => {
       const c = el("button", "rc-chip list-surface-chip", label);
@@ -2374,6 +2474,7 @@
     const sync = (now) => { for (const c of chips) c.setAttribute("aria-pressed", c.dataset.surface === now ? "true" : "false"); };
     mk("", "all " + list.length);
     for (const k of Object.keys(SURFACE_WORDS)) if (counts.has(k)) mk(k, SURFACE_WORDS[k] + " " + counts.get(k));
+    if (heldCount > 0) mk("held", "held " + heldCount);     // its own chip: held rows are never folded into "all" or a surface's number
     sync(current());
     return row;
   }
@@ -2389,6 +2490,37 @@
       n.textContent = r ? r.text : "";
     }
   }
+  // A placeholder that must fit its box: the full words on a wide screen, a shorter line on a phone (re-chosen when the width crosses).
+  // ONE media listener for every such input, registered once: an input opts in by data-ph-wide / data-ph-narrow, and the
+  // listener sets every opted-in input still in the document (a rebuilt List leaves its old inputs out of it).
+  let phListening = false;
+  let phMq = null;   // held at module scope so the browser cannot collect the list and stop delivering "change"
+  function phNarrow() { try { return typeof window.matchMedia === "function" && window.matchMedia("(max-width: 720px)").matches; } catch (e) { return false; } }
+  function setPlaceholders() {
+    const narrow = phNarrow();
+    for (const i of document.querySelectorAll("[data-ph-wide]")) i.placeholder = narrow ? i.getAttribute("data-ph-narrow") : i.getAttribute("data-ph-wide");
+  }
+  function narrowPlaceholder(input, wide, narrow) {
+    input.setAttribute("data-ph-wide", wide);
+    input.setAttribute("data-ph-narrow", narrow);
+    input.placeholder = phNarrow() ? narrow : wide;
+    if (!phListening && typeof window.matchMedia === "function") {
+      try {
+        phMq = window.matchMedia("(max-width: 720px)");
+        if (phMq && typeof phMq.addEventListener === "function") { phMq.addEventListener("change", setPlaceholders); phListening = true; }   // only once it is registered
+      } catch (e) { /* the placeholder keeps its first choice; a later call may try again */ }
+    }
+  }
+  // an origin a List row's lead word may name: a repo the sky's registry knows, or "desk" / "flow".
+  // Returns the canonical name (the registry's own spelling), or "" when the word is no origin.
+  function knownOrigin(word) {
+    const w = String(word).toLowerCase();
+    if (w === "desk" || w === "flow") return w;
+    const sky = window.LevainSky;
+    const names = sky && typeof sky.repos === "function" ? sky.repos() : [];
+    const hit = names.find((n) => String(n).toLowerCase() === w);
+    return hit === undefined ? "" : String(hit);
+  }
   function buildListIntake() {
     const box = el("div", "tray-dump list-intake");
     const row = el("div", "list-intake-row");
@@ -2397,7 +2529,7 @@
     noContactFill(input);
     input.setAttribute("enterkeyhint", "send");      // overrides the helper's default: this box sends on Enter
     input.setAttribute("aria-label", "add a line to the List");
-    input.placeholder = "@mon 9am call X  ·  ? talk about Y  ·  or a plain line";
+    narrowPlaceholder(input, "@mon 9am call X  ·  ? talk about Y  ·  or a plain line", "@mon 9am call · ? talk Y");
     input.value = intakeKept.draft;
     input.maxLength = 500;
     const go = el("button", "tray-dump-btn list-intake-btn", "add");
@@ -4700,7 +4832,13 @@
   // the options, the words box and the send button go to the card's own bottom row, so cards in a row end their actions together.
   // `receipt` (a settled Needs-you card): the question is decided, so only the title, the answer line and what it blocked are
   // drawn; the options, the recommendation and every control are not built at all.
+  // the mics a slot's last draw made (board row 140) end with it: a redraw never leaves a capture running into a box that left
+  function offSlotMics(slot) {
+    if (Array.isArray(slot.__mics)) for (const m of slot.__mics) m.off();
+    slot.__mics = [];
+  }
   function drawQuestionBody(q, slot, b, card, receipt) {
+    offSlotMics(slot);
     const sv = (x) => (typeof x === "string" ? x : "");
     const open = q.state === "open";
     const cli = "levain question show " + q.n;   // the options are listed there; answer with: levain question answer N --option KEY
@@ -4763,6 +4901,7 @@
       // answered by a signature (DESIGN_SIGN D5): the sign request's own options are the buttons, and no unsigned answer is
       // drawn beside them (an unsigned tap on a row its caller asked to be signed is refused there, never his word)
       const facet = signFacet(q.sign, head, blocksOf(b));
+      slot.__mics = facet.__mics;
       slot.replaceChildren(...parts);
       if (card) { const bottom = el("div", "needs-actions needs-qa needs-sign"); bottom.appendChild(facet); card.appendChild(bottom); }
       else slot.appendChild(facet);
@@ -4777,14 +4916,17 @@
     const wrap = el("div", "verb-actions question-answer");
     const controls = [];
     const msg = el("span", "edit-msg", "");
+    // a mic's own buttons are locked by its lock(): a live capture's Stop stays enabled
+    const lockAll = (on) => { for (const c of controls) c.disabled = on; if (wmic) wmic.lock(on); };
     const send = async (params) => {
-      for (const c of controls) c.disabled = true;
+      if (wmic) wmic.stop();     // an answer under a live mic ends the mic first
+      lockAll(true);
       let res;
       try { res = await answerQuestion(q.id, params); } catch (e) { res = { ok: false, message: "the answer could not be sent" }; }
       if (res && res.ok) { words.value = ""; return; }   // the board re-reads and redraws this row as answered
       const kept = res && res.error === "stale" && words.value.trim() !== "";
       if (kept) { questionDrafts.set(q.id, words.value); words.value = ""; }
-      for (const c of controls) c.disabled = false;
+      lockAll(false);
       msg.textContent = ((res && (res.message || res.error)) || "failed") +
         (kept ? " (your words are kept: they come back here while the question is still open)" : "");
       if (kept) document.dispatchEvent(new CustomEvent("levain:editor-closed"));   // the re-read the refusal owes may land now
@@ -4807,16 +4949,24 @@
     if (questionDrafts.has(q.id)) { words.value = questionDrafts.get(q.id); questionDrafts.delete(q.id); }
     const sendWords = el("button", "undo-btn question-send", "send words");
     sendWords.type = "button";
-    sendWords.addEventListener("click", () => { if (words.value.trim()) send({ text: words.value }); });
+    // the streaming Mic and on-device Dictate on the reply box (board row 140), drawn only where the server and browser offer them;
+    // send words waits for the mic to end, so a partial is never sent
+    const wmic = window.LevainMic && typeof window.LevainMic.attach === "function" ? window.LevainMic.attach(words, { cls: "undo-btn", note: (t) => { msg.textContent = t; } }) : null;
+    sendWords.addEventListener("click", () => {
+      if (wmic && wmic.busy()) { msg.textContent = "Stop the mic first: your words are sent as they stand when it has ended."; return; }
+      if (words.value.trim()) send({ text: words.value });
+    });
     controls.push(words, sendWords);
+    slot.__mics = wmic ? [wmic] : [];
+    const micBtns = wmic ? wmic.buttons : [];
     if (card) {
       const bottom = el("div", "needs-actions needs-qa");
-      bottom.append(wrap, words, sendWords, msg);
+      bottom.append(wrap, words, ...micBtns, sendWords, msg);
       slot.replaceChildren(...parts);
       card.appendChild(bottom);
       return;
     }
-    parts.push(wrap, words, sendWords, msg);
+    parts.push(wrap, words, ...micBtns, sendWords, msg);
     slot.replaceChildren(...parts);
   }
   // iOS keyboards take a free-text box for a contact field when the card around it reads like mail (Phill 11-07, an
@@ -5080,6 +5230,7 @@
     return got;
   }
   function drawNoteBody(n, slot, b) {
+    offSlotMics(slot);        // a redraw ends the write-in mics of the sign facet it replaces
     const sv = (x) => (typeof x === "string" ? x : "");
     if (b.error) { slot.replaceChildren(el("div", "consent-note ext-meta", b.error)); return; }
     const parts = [el("div", "note-what", sv(b.what))];
@@ -5105,7 +5256,7 @@
       parts.push(bar);
     }
     // a note its caller filed a sign request for (DESIGN_SIGN D5) carries that request's ceremony under its words
-    if (!d && n.state === "open" && n.sign) parts.push(signFacet(n.sign));
+    if (!d && n.state === "open" && n.sign) { const facet = signFacet(n.sign); slot.__mics = facet.__mics; parts.push(facet); }
     slot.replaceChildren(...parts);
   }
   function noteRow(o) {
@@ -5256,6 +5407,8 @@
   // card's, and one drawn afresh after its request left the listing): each is told every answer and drops itself once its
   // facet is off the page, so a facet drawn later never takes the ask away from one still shown
   const signPending = new Map();
+  const signDecidedSha = new Map();   // request id -> the sha256 of the version the sheet signed ("" when the sheet did not say)
+  const signDecided = new Map();      // request id -> the note text of a request the sign sheet signed: every card of it, drawn now or later, is dead
   const signSettledIds = new Set();   // request ids whose signNotes entry is a settled outcome (signed or refused), shown even once the request is gone
   function signSettledSaid(st) {
     if (st.state === "signed") {
@@ -5376,6 +5529,16 @@
       .then((a) => (a.ok && a.body && typeof a.body.state === "string" ? a.body : { state: "", why: signWhy(a) }));
   }
   const signNewAttempt = () => signB64u(crypto.getRandomValues(new Uint8Array(18)));
+  // a decided request stays decided only while the listing names it at the version the sheet signed: one the listing no longer
+  // has is dropped, and one it lists at another sha256 is a new version of the request, shown live
+  function signDecidedPrune(requests) {
+    for (const id of [...signDecided.keys()]) {
+      const r = requests.find((x) => x && x.id === id);
+      const sha = signDecidedSha.get(id) || "";
+      if (!r) { signDecided.delete(id); signDecidedSha.delete(id); continue; }
+      if (sha && r.sha256 !== sha) { signDecided.delete(id); signDecidedSha.delete(id); signSettledIds.delete(id); signNotes.delete(id); }
+    }
+  }
   // the listing: {requests, signers, origin, note} or {error}. One read serves every card drawn within a second or two;
   // `fresh` reads again (after a ceremony, and before a compose)
   function signListing(fresh) {
@@ -5390,7 +5553,10 @@
                              () => ({ error: "the sign requests could not be read" }));
     }, () => ({ error: "the sign requests could not be read (network)" }));
     signListed = { at: Date.now(), got: got };
-    got.then((b) => { if (b.error && signListed && signListed.got === got) signListed = null; });
+    got.then((b) => {
+      if (b.error && signListed && signListed.got === got) signListed = null;
+      if (!b.error) signDecidedPrune(b.requests);
+    });
     return got;
   }
   // ONE request by its id, whatever the listing's cap: {request, signers, origin, note}, {request: null} when it is not
@@ -5583,6 +5749,7 @@
   // `head`: the focus view's question lines a needs-phill card replaces (signCardOf), else none
   function signFacet(id, head, full) {
     const wrap = el("div", "sign-facet");
+    wrap.__mics = [];       // the write-in's mic, ended with the card by its slot's next draw
     wrap.dataset.signRequest = id;
     const note = el("div", "sign-note ext-meta", "reading the sign request…");
     wrap.appendChild(note);
@@ -5625,7 +5792,7 @@
         // answered here: its signed line stays until the row itself leaves; else it was answered, denied or expired elsewhere
         return show(kept && (kept[1] === "ok" || signSettledIds.has(id)) ? kept[0] : "this sign request is no longer open; the card updates on the next read", kept && kept[1]);
       }
-      if (kept && kept[2] !== (r.sha256 || "")) signNotes.delete(id);
+      if (kept && kept[2] !== (r.sha256 || "") && !signDecided.has(id)) signNotes.delete(id);
       if (r.refused) return show("not signable: " + r.refused, "bad");
       // the focus view's needs-phill card (card_format.js, the sheet's rule and builders): drawn in place of the question's
       // title, blocks and REC lines (`head`), the signed text whole one tap away above the buttons, Detail after them
@@ -5651,7 +5818,7 @@
       const acts = el("div", "sign-actions");
       const buttons = [];
       let sheetBtn = null;    // "open the sheet": locked with the card's own controls, whether or not a key may sign
-      const lock = (on) => { for (const b of buttons) b.disabled = on || !signers.length; if (sheetBtn) sheetBtn.disabled = on; };
+      const lock = (on) => { for (const b of buttons) b.disabled = on || !signers.length; if (sheetBtn) sheetBtn.disabled = on; for (const m of wrap.__mics) m.lock(on || !signers.length); };
       let freeze = null;      // the write-in's frozen state while its ceremony runs (set below when it offers one)
       // the frozen card's view of its unsettled answer (signPending): "signed" says so and the board reads again;
       // "refused" gives the card back; anything else keeps it frozen until the next board read asks again (signRecheck)
@@ -5669,6 +5836,7 @@
         if (ask !== false) signAskPending(id);
       };
       const settleShow = (st) => {
+        if (signDecided.has(id)) return;     // the sheet signed it: no later word about an older attempt gives the card back
         if (st.state === "signed") {
           signWriteIns.delete(id);
           say("signed" + (typeof st.choice === "string" && st.choice ? " (" + st.choice + ")" : "")
@@ -5690,6 +5858,9 @@
       };
       const run = (choice, words) => {
         if (signBusy) return say(SIGN_BUSY, "bad");   // the lease holds a second tap, never a button drawn disabled
+        // a ceremony under a live mic ends the mic first, at once (off): a Dictate tail must not land in the write-in after the tap,
+        // so the box shown stays the words a ceremony signs; an idle mic keeps its control for a retry
+        for (const m of wrap.__mics) if (m.busy()) m.off();
         signBusy++;
         lock(true);
         if (!signInFlight.has(id)) signInFlight.set(id, new Set());
@@ -5765,12 +5936,16 @@
         box.addEventListener("input", () => signWriteIns.set(id, { sha256: r.sha256 || "", words: box.value }));
         const b = el("button", "undo-btn question-option sign-option", "(" + String(wi.key) + ") sign my words");
         b.type = "button";
+        // the streaming Mic and on-device Dictate on the write-in (board row 140); a tap that signs the words waits for the mic to end
+        const wmic = window.LevainMic && typeof window.LevainMic.attach === "function" ? window.LevainMic.attach(box, { cls: "undo-btn", note: (t) => say(t) }) : null;
+        if (wmic) wrap.__mics.push(wmic);
         // the words being signed are frozen from the tap until the ceremony ends; only a definite "nothing was signed"
         // unfreezes them, so a retry is a new tap over the same words
         freeze = { release: () => { box.readOnly = box.disabled = false; } };
         if (signInFlight.has(id)) box.readOnly = box.disabled = true;
         b.addEventListener("click", () => {
           if (signBusy) return say(SIGN_BUSY, "bad");
+          if (wmic && wmic.busy()) return say("Stop the mic first: your words are signed as they stand when it has ended.", "bad");
           const w = box.value.trim();
           if (!w) return say("type your answer first", "bad");
           box.value = w;
@@ -5779,7 +5954,7 @@
           run(String(wi.key), w);
         });
         buttons.push(b);
-        acts.append(box, b);
+        acts.append(box, ...(wmic ? wmic.buttons : []), b);
       }
       lock(false);
       sheetBtn = signSheetButton(r, say);
@@ -5799,6 +5974,7 @@
         for (const x of acts.querySelectorAll("input")) x.readOnly = x.disabled = true;
         settleHere();
       }
+      if (signDecided.has(id)) signCardDead(wrap, signDecided.get(id));     // decided before this card's controls existed
       if (options.length) {
         const lines = el("div", "sign-lines ext-meta", "an option signs the request's message with its line appended:");
         for (const o of options) lines.appendChild(el("div", "sign-line", String(o.line)));
@@ -5822,6 +5998,9 @@
   const SIGN_RELOAD_MS = 1500;
   const SIGN_RELOAD_LATE_MS = 8000;     // a second read after a close forced past a sheet that never answered
   let signSheetInerted = [];      // what openSignSheet made inert (and closeSignSheet gives back): never what was already
+  let signSheetOpen = null;       // {kind, id}: what the open sheet was opened for, given by the caller that opened it; only a plain sign sheet's "signed" message decides a card, and only for its own id
+  const SIGN_SIGNED_GRACE_MS = 30000;   // a plain sign sheet closed this recently may still have its "signed" message arrive
+  let signSheetRecent = [];       // {id, win, until}: the plain sign sheets closed within that grace, with the window each one's frame had
   let signSheetLease = false;     // the sheet holds a `signBusy` count
   let signSheetAsk = null;        // the pending close request's timer
   let signSheetWatch = null;      // the MutationObserver that makes a node added to the body while open inert
@@ -5837,17 +6016,18 @@
   // `version`: the listing's sha256 the card showed (the sheet draws a pick only on it); `choice`: an option to preselect
   function openSignSheet(id, version, choice) {
     if (typeof id !== "string" || !/^[A-Za-z0-9_-]{8,64}$/.test(id)) return null;
-    return openSheet("/sign/" + encodeURIComponent(id), version, choice, "sign request");
+    return openSheet("/sign/" + encodeURIComponent(id), version, choice, "sign request", undefined, { kind: "sign", id: id });
   }
   // OS-2: the same sheet over a consent request (/sign/consent/<id>), answered or ruled there with a passkey
   function openConsentSheet(id, version, choice) {
     if (typeof id !== "string" || !/^[A-Za-z0-9._:-]{1,160}$/.test(id)) return null;
-    return openSheet("/sign/consent/" + encodeURIComponent(id), version, choice, "consent request");
+    return openSheet("/sign/consent/" + encodeURIComponent(id), version, choice, "consent request", undefined, { kind: "consent", id: id });
   }
   // `heading`: the modal's title when it should not be `what` (which names the frame for assistive tech)
-  function openSheet(path, version, choice, what, heading) {
+  function openSheet(path, version, choice, what, heading, ident) {
     closeSignSheet();
     if (signBusy) return null;
+    signSheetOpen = ident && typeof ident.kind === "string" ? { kind: ident.kind, id: String(ident.id) } : null;
     signBusy++;
     signSheetLease = true;
     try {
@@ -5919,6 +6099,12 @@
     clearTimeout(signSheetAsk);
     signSheetAsk = null;
     const veil = document.getElementById(SIGN_SHEET_ID);
+    const closing = document.getElementById(SIGN_SHEET_ID + "-frame");
+    const now = Date.now();
+    signSheetRecent = signSheetRecent.filter((e) => e.until > now);
+    if (signSheetOpen && signSheetOpen.kind === "sign" && closing && closing.contentWindow) {
+      signSheetRecent.push({ id: signSheetOpen.id, win: closing.contentWindow, until: now + SIGN_SIGNED_GRACE_MS });
+    }
     if (signSheetWatch) { signSheetWatch.disconnect(); signSheetWatch = null; }
     for (const n of signSheetInerted) n.inert = false;
     signSheetInerted = [];
@@ -5927,6 +6113,7 @@
     if (veil) veil.remove();
     if (!document.getElementById("levain-modal")) document.body.classList.remove("modal-open");
     if (signSheetLease) { signSheetLease = false; signBusy--; }
+    signSheetOpen = null;
   }
   // one pending board read; `latch`: a second read follows, for a sheet closed while its signature may have been landing
   function signBoardTick() {
@@ -5942,14 +6129,54 @@
     clearTimeout(signBoardTimer);
     signBoardTimer = setTimeout(signBoardTick, SIGN_RELOAD_MS);
   }
+  // A card of a signed request: its note says what was signed and every control on it is dead, whatever draws it
+  function signCardDead(wrap, text) {
+    const note = wrap.querySelector(".sign-note");
+    if (note) { note.textContent = text; note.className = "sign-note ext-meta sign-ok"; }
+    for (const c of wrap.querySelectorAll("button, input, textarea, select, [contenteditable]")) {
+      c.disabled = true;
+      if ("readOnly" in c) c.readOnly = true;
+      if (c.isContentEditable) c.setAttribute("contenteditable", "false");
+    }
+  }
+  // The sheet signed request `id`: the card behind it is decided now, not at the next redraw (the strip keeps a card whose item
+  // did not change, so the board read alone never reaches it). The decision is kept by id, so a card whose controls are built
+  // after this message (a facet still reading, a redraw on the cached listing) comes out decided too.
+  // the server's option key grammar (a sign request's option keys are [a-z0-9]{1,8}) plus the key a write-in signs under, "*"
+  const SIGN_CHOICE_RE = /^(?:[a-z0-9]{1,8}|\*)$/;
+  function signSheetSigned(id, choice, sha) {
+    if (typeof id !== "string" || !/^[A-Za-z0-9_-]{8,64}$/.test(id)) return;
+    const text = "signed" + (typeof choice === "string" && SIGN_CHOICE_RE.test(choice) ? " (" + choice + ")" : "");
+    signDecidedSha.set(id, typeof sha === "string" && /^[0-9a-f]{16,64}$/.test(sha) ? sha : "");
+    signNotes.set(id, [text, "ok", ""]);
+    signSettledIds.add(id);
+    signDecided.set(id, text);
+    signPending.delete(id);
+    signWriteIns.delete(id);
+    signListed = null;
+    for (const wrap of document.querySelectorAll(".sign-facet[data-sign-request]")) {
+      if (wrap.dataset.signRequest === id) signCardDead(wrap, text);
+    }
+  }
   window.addEventListener("message", (ev) => {
+    if (ev.origin !== window.location.origin) return;
     const frame = document.getElementById(SIGN_SHEET_ID + "-frame");
-    if (!frame || ev.source !== frame.contentWindow || ev.origin !== window.location.origin) return;
     const what = ev.data && typeof ev.data === "object" ? ev.data.levainSheet : null;
+    if (!frame || ev.source !== frame.contentWindow) {
+      // a plain sign sheet closed a moment ago, its signature landing after the close: taken only from that sheet's own frame
+      // window (a frame already gone sends nothing that can be told from any other; the board read settles that card)
+      if (what === "signed" && ev.source) {
+        const now = Date.now();
+        const late = signSheetRecent.find((e) => e.win === ev.source && e.until > now && e.id === ev.data.id);
+        if (late) { signSheetSigned(late.id, ev.data.choice, ev.data.sha256); rereadBoard(); }
+      }
+      return;
+    }
     if (what === "ack") { clearTimeout(signSheetAsk); signSheetAsk = null; }
     else if (what === "close") { closeSignSheet(); dispatchStale(); }
     else if (what === "signed" || what === "reload") {
       // the sheet's line stays on it until it is closed; the board under it reads again, and the dispatch jobs with it
+      if (what === "signed" && signSheetOpen && signSheetOpen.kind === "sign" && ev.data.id === signSheetOpen.id) signSheetSigned(ev.data.id, ev.data.choice, ev.data.sha256);
       dispatchStale();
       rereadBoard();
       // the server accepted the drop the sheet filed: the box lets go of the words only if it holds exactly those words
@@ -6226,6 +6453,13 @@
     const bk = (it) => { const b = cardBandNum(it.q.n); return Number(b === undefined ? it.q.n : b); };
     return out.sort((a, b) => (a.later < b.later ? -1 : a.later > b.later ? 1 : bk(a) - bk(b)));
   }
+  // the headline is cut on a word boundary (never mid-token); the page's 2-line clamp does the rest
+  function needsLaterCut(t) {
+    t = String(t);
+    if (t.length <= 160) return t;
+    const c = t.slice(0, 160), i = c.lastIndexOf(" ");
+    return (i > 0 ? c.slice(0, i) : c).replace(/[\s,;:]+$/, "") + "\u2026";   // the last space anywhere before the limit; a headline with none keeps its one token to the limit
+  }
   function needsLaterLine(it) {
     const row = el("div", "needs-later-line band-later");
     row.dataset.needsLater = String(it.q.n);
@@ -6236,11 +6470,11 @@
     tag.hidden = bn === undefined;
     const words = el("span", "ext-meta needs-later-text", it.q.laterWords || it.q.later);
     const title = el("span", "ext-meta needs-later-title", "");
-    row.append(el("span", "ext-meta needs-later-mark", "LATER"), tag, words, title);
+    row.append(tag, words, title);        // no per-row LATER word: the section's one header says it (a narrow screen wrapped it "LAT / ER")
     questionBody(it.q, row).then((b) => {
       if (!b || b.error) return;
       const first = needsFirstSentence(b.what);
-      if (first) title.textContent = " \u00b7 " + (first.replace(/^\s*DESK OWES:\s*/i, "") || first).slice(0, 80);
+      if (first) title.textContent = needsLaterCut(first.replace(/^\s*DESK OWES:\s*/i, "") || first);
     });
     return row;
   }
@@ -6830,7 +7064,14 @@
       sec.append(toggle, body);
       return sec;
     };
-    const laterSection = (rows) => { const sec = el("div", "needs-later"); for (const it of rows) sec.appendChild(needsLaterLine(it)); return sec; };
+    const laterSection = (rows) => {
+      const sec = el("div", "needs-later");
+      const hd = el("div", "needs-later-head");       // one header like Just answered's: the label and the count, then the rows
+      hd.append(el("span", "needs-sec-label", "Later"), el("span", "needs-answered-n", String(rows.length)));
+      sec.appendChild(hd);
+      for (const it of rows) sec.appendChild(needsLaterLine(it));
+      return sec;
+    };
     // each tab draws its own LATER lines: a "you" row never sits in the Desk owes tab, nor a desk one in Needs you
     const laterShown = prefs.tab === "desk" ? laterDesk : laterYou;
     if (!items.length && !desk.length && !laterYou.length && !laterDesk.length) {
@@ -7519,7 +7760,9 @@
   function grantFill(slot) {
     const n = ++grantFillSeq;
     Promise.all([grantFetch(), grantSignList()]).then(([b, signList]) => {
-      if (!b || n !== grantFillSeq) return;
+      if (n !== grantFillSeq) return;
+      slot.dataset.filled = "1";     // the grants' read has answered, with grants or without: the phone jump may fall back to the envelopes
+      if (!b) return;
       // sort is stable: the server's order holds among grants with and among grants without a refused call
       const rows = b.grants.slice().sort((x, y) => (grantRefused(y) ? 1 : 0) - (grantRefused(x) ? 1 : 0));
       const note = typeof b.note === "string" ? b.note : "";
@@ -7538,7 +7781,205 @@
       slot.replaceChildren(head, ...said, ...(note ? [el("div", "consent-note ext-meta", note)] : []),
                            ...(why ? [el("div", "consent-note ext-meta grant-why", why)] : []),
                            ...rows.map((g) => grantCard(g, inert, signList)));
-    }).catch(() => {});
+    }).catch(() => { if (n === grantFillSeq) slot.dataset.filled = "1"; });
+  }
+  // Board row 153: the envelopes beside the grants, each live one ended with a passkey, the grant revoke's own ceremony
+  // (levain.coordinator.envelope_revoke.EnvelopeRevoke). /cockpit/envelope/list.json lists the envelopes and the passkeys
+  // that may revoke (a 404 is a cockpit with no signing: no card), then /cockpit/envelope/<id>/revoke-challenge ->
+  // navigator.credentials.get -> /revoke. The server builds and holds the message; the page recomputes the challenge from
+  // the text it is sent, so what the prompt signs is the text shown. Without a usable passkey the button copies the
+  // terminal line, as the grant card's does.
+  const ENVELOPE_LIST = "/cockpit/envelope/list.json";
+  let envelopeSaid = "";       // what the last revoke said, kept across the slot's redraw
+  function envelopeFetch() {
+    const headers = signHeaders(false);
+    if (!headers["X-Levain-Write-Token"]) return Promise.resolve(null);
+    return fetchBounded(ENVELOPE_LIST, { cache: "no-store", headers: headers },
+      (res) => (res.ok ? res.json().then((b) => (b && Array.isArray(b.envelopes) ? b : null), () => null) : null),
+      () => null);
+  }
+  // the bytes a passkey signs for `line` in the envelope-revoke namespace, as levain.consent.passkey.challenge builds them
+  function envelopeChallenge(line) {
+    const enc = (t) => new TextEncoder().encode(t);
+    const str = (b) => { const n = b.length, out = new Uint8Array(4 + n); out.set([n >>> 24 & 255, n >>> 16 & 255, n >>> 8 & 255, n & 255]); out.set(b, 4); return out; };
+    return crypto.subtle.digest("SHA-512", enc(line)).then((h) => {
+      const parts = [enc("SSHSIG"), str(enc("levain-envelope-revoke")), str(new Uint8Array(0)), str(enc("sha512")), str(new Uint8Array(h))];
+      const out = new Uint8Array(parts.reduce((n, p) => n + p.length, 0));
+      parts.reduce((at, p) => { out.set(p, at); return at + p.length; }, 0);
+      return out;
+    });
+  }
+  // "ends in 3 h 20 min", in the words a person says it
+  // (rounded up: "ended" only once the expiry has passed)
+  function envelopeWhen(iso) {
+    const t = Date.parse(iso);
+    if (!Number.isFinite(t)) return "";
+    const ms = t - Date.now();
+    if (ms <= 0) return "ended";
+    if (ms < 60000) return "ends in <1 min";
+    const mins = Math.ceil(ms / 60000);
+    if (mins < 60) return "ends in " + mins + " min";
+    if (mins < 48 * 60) return "ends in " + Math.floor(mins / 60) + " h" + (mins % 60 ? " " + (mins % 60) + " min" : "");
+    return "ends in " + Math.round(mins / 1440) + " days";
+  }
+  const ENVELOPE_ID = /^ev-[0-9a-f]{32}$/;
+  // the states a revoke is offered for (an ended envelope is counted, not drawn)
+  const ENVELOPE_REVOCABLE = ["live", "live-unknown", "unreadable"];
+  // the WHOLE signed text, field by field: a line with a
+  // field more, a field less or a field changed, another envelope's id, or another namespace is never put to the passkey
+  const ENVELOPE_LINE = /^levain-envelope-revoke\/1\nstore: [0-9a-f]{32}\nenvelope: (ev-[0-9a-f]{32})\nat: [0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}\.[0-9]{6}Z\nnonce: [0-9a-f]{32}\n$/;
+  function envelopeLineOk(body, id) {
+    if (!body || typeof body.line !== "string" || body.namespace !== "levain-envelope-revoke") return false;
+    const m = ENVELOPE_LINE.exec(body.line);
+    return !!m && m[1] === id;
+  }
+  function envelopeCard(e, listing) {
+    const sv = (x) => (typeof x === "string" ? x : "");
+    const row = el("div", "row consent-row envelope-row");
+    row.setAttribute("data-envelope", sv(e.id));
+    const head = el("div", "consent-head");
+    head.appendChild(el("b", "consent-tool", sv(e.label) || sv(e.scope) || "envelope"));
+    head.appendChild(el("span", "ext-meta", envelopeWhen(sv(e.expires))));
+    row.appendChild(head);
+    const facts = el("div", "consent-facts");
+    if (sv(e.label) && sv(e.scope)) facts.appendChild(el("span", "ext-meta", sv(e.scope)));
+    const ends = Date.parse(sv(e.expires));
+    if (Number.isFinite(ends)) {
+      const when = el("span", "ext-meta", new Date(ends).toLocaleString([], { weekday: "short", hour: "numeric", minute: "2-digit" }));
+      when.title = sv(e.expires);
+      facts.appendChild(when);
+    }
+    // a narrowing written for one bound thread only is said, never read as the whole envelope ending
+    const tn = Number(e.threads), en = Number(e.ended_threads);
+    if (en > 0) facts.appendChild(el("span", "ext-meta envelope-threads", "ended for " + en + " of " + (tn || en) + " thread" + ((tn || en) === 1 ? "" : "s")));
+    facts.appendChild(el("span", "ext-meta", sv(e.id).slice(0, 11)));
+    // a row the server could not read in full is still a row, said plainly, and its revoke stays
+    if (e.state === "live-unknown") facts.appendChild(el("span", "ext-meta envelope-unknown", "an earlier stop it carries cannot be read; treat it as live"));
+    if (e.state === "unreadable") facts.appendChild(el("span", "ext-meta envelope-unknown", sv(e.note) || "this envelope cannot be read in full"));
+    row.appendChild(facts);
+    if (!ENVELOPE_ID.test(sv(e.id))) return row;          // no id a revoke can name: nothing to offer
+    const signers = Array.isArray(listing.signers) ? listing.signers : [];
+    const line = el("div", "consent-cmd envelope-sign");
+    const btn = el("button", "undo-btn envelope-revoke", "Revoke");
+    btn.type = "button";
+    if (signers.length && !signElsewhere(listing)) {
+      btn.title = "revoke with your passkey";
+      const note = el("span", "sign-note ext-meta");
+      const say = (text, kind) => { note.textContent = text; note.className = "sign-note ext-meta" + (kind ? " sign-" + kind : ""); };
+      btn.addEventListener("click", () => envelopeRevoke(e, signers, listing, btn, line, say));
+      line.append(btn, note);
+    } else {
+      const cmd = "levain envelope kill " + sv(e.id);
+      const code = el("code", "consent-code", cmd);
+      btn.dataset.label = btn.textContent;
+      btn.title = "copy the revoke command; run it in a terminal. This page signs nothing here";
+      btn.addEventListener("click", () => copyText(cmd, code, btn));
+      line.append(btn, code);
+    }
+    row.appendChild(line);
+    return row;
+  }
+  function envelopeRevoke(e, signers, listing, btn, host, say) {
+    if (signBusy) { say(SIGN_BUSY.replace("signed", "revoked"), "bad"); return; }
+    signBusy++;
+    btn.disabled = true;
+    const base = "/cockpit/envelope/" + encodeURIComponent(e.id) + "/";
+    const slot = host.closest(".envelope-slot");
+    let sent = false, revoked = false;
+    signWho({ signers: signers, origin: listing.origin, credentials: listing.credentials }, host, say).then((who) => {
+      if (!who) { say("nothing was revoked"); return; }
+      say("asking for the revoke to sign…");
+      return signCall(base + "revoke-challenge", { signer_fp: who.fp, instance: e.instance }).then((c) => {
+        if (!c.ok) { say("not revoked: " + signWhy(c), "bad"); return; }
+        // the server builds the message itself; one that is not exactly a revoke of this envelope is not put to the passkey
+        if (!envelopeLineOk(c.body, e.id) || typeof c.body.challenge !== "string") {
+          say("not revoked: the text the server sent is not a revoke of this envelope, so nothing was signed", "bad");
+          return;
+        }
+        return envelopeChallenge(c.body.line).then((want) => {
+          if (signB64u(want) !== c.body.challenge) {
+            say("not revoked: the challenge the server sent is not over the text it shows, so nothing was signed", "bad");
+            return;
+          }
+          // the exact text the passkey signs, on the screen before the prompt opens
+          const row = host.closest(".envelope-row");
+          const old = row && row.querySelector(".envelope-line");
+          if (old) old.remove();
+          const shown = el("pre", "envelope-line", c.body.line);
+          host.parentNode.insertBefore(shown, host);
+          shown.scrollIntoView({ block: "nearest" });
+          say("confirm with your passkey to end this envelope: it signs the text above…");
+          const pk = { challenge: want, rpId: c.body.rp_id, userVerification: "required", timeout: 60000 };
+          return signAsk(pk, c.body.rp_id, who.fp, who.rawId).then((cred) => {
+            if (!cred || !cred.response) { say("not revoked: the passkey gave nothing to send; nothing was revoked", "bad"); return; }
+            say("verifying the signature…");
+            sent = true;
+            return signCall(base + "revoke", {
+              authenticator_data: signB64u(cred.response.authenticatorData), client_data_json: signB64u(cred.response.clientDataJSON),
+              signature: signB64u(cred.response.signature) }).then((r) => {
+              const refused = !r.ok && r.status >= 400 && r.status < 500 && r.body && typeof r.body.error === "string";
+              if (!r.ok && !refused) {
+                envelopeSaid = "result unknown for " + e.id + " (" + signWhy(r) + "): the envelopes were read again to show whether it is still live";
+                say(envelopeSaid, "bad");
+                return;
+              }
+              if (!r.ok) { envelopeSaid = "not revoked " + e.id + ": " + signWhy(r); say(envelopeSaid, "bad"); return; }
+              signKeep(c.body.rp_id, who.fp, cred);
+              revoked = true;
+              envelopeSaid = "Revoked " + e.id.slice(0, 11) + ". Work it authorised stops at its next step.";
+              say(envelopeSaid, "ok");
+            });
+          }, (err) => say(signDeclined(err, "nothing was revoked"), "bad"));
+        });
+      });
+    }).catch((err) => {
+      const name = (err && err.name) || "error";
+      if (sent) envelopeSaid = "result unknown for " + e.id + " (the page failed: " + name + "): the envelopes were read again to show where it stands";
+      say(sent ? envelopeSaid : "the page failed (" + name + "); nothing was revoked", "bad");
+    }).finally(() => {
+      signBusy--;
+      btn.disabled = false;
+      if (!sent && !revoked) return;
+      setTimeout(() => {
+        const live = slot && slot.isConnected ? slot : document.querySelector(".envelope-slot");
+        if (live) envelopeFill(live);
+      }, 1500);
+    });
+  }
+  function envelopeSlot() {
+    const slot = el("div", "envelope-slot");
+    envelopeFill(slot);
+    return slot;
+  }
+  let envelopeFillSeq = 0;     // the newest fill wins
+  // what the last revoke said, taken once: whichever fill draws next shows it and clears it, so it is never repeated stale
+  function envelopeSaidOnce() {
+    const said = envelopeSaid ? [el("div", "consent-note ext-meta envelope-said", envelopeSaid)] : [];
+    envelopeSaid = "";
+    return said;
+  }
+  // Every fill that answers draws the heading and marks the slot filled (the phone jump waits on it): a failed read (no
+  // token, no route, a fault) says so under the heading, never leaves the slot blank.
+  function envelopeFill(slot) {
+    const n = ++envelopeFillSeq;
+    const unavailable = () => {
+      if (n !== envelopeFillSeq) return;
+      slot.replaceChildren(el("div", "ext-grouphead", "Envelopes"), ...envelopeSaidOnce(),
+        el("div", "consent-note ext-meta envelope-unavailable", "The envelopes cannot be read here now"));
+      slot.dataset.filled = "1";
+    };
+    envelopeFetch().then((b) => {
+      if (n !== envelopeFillSeq) return;
+      if (!b) { unavailable(); return; }
+      const open = b.envelopes.filter((e) => e && ENVELOPE_REVOCABLE.includes(e.state));
+      const ended = b.envelopes.length - open.length;
+      const said = envelopeSaidOnce();
+      const why = typeof b.note === "string" && b.note ? [el("div", "consent-note ext-meta envelope-why", b.note)] : [];
+      slot.replaceChildren(el("div", "ext-grouphead", "Envelopes"), ...said, ...why,
+        ...(open.length ? open.map((e) => envelopeCard(e, b)) : [el("div", "consent-note ext-meta envelope-empty", "No live envelopes")]),
+        ...(ended ? [el("div", "consent-note ext-meta", ended + " ended")] : []));
+      slot.dataset.filled = "1";
+    }).catch(unavailable);
   }
   // OS-2, the dispatch family: the live dispatch jobs as cards, each act (Sign, Cancel, Authorise) a button that opens the sign
   // sheet at /sign/dispatch/<job> with that act picked. /cockpit/dispatch.json lists them as the sheet's rows (one object per
@@ -7563,7 +8004,7 @@
   // OS-2: the sheet over a dispatch job (/sign/dispatch/<job>), signed, cancelled or authorised there with a passkey
   function openDispatchSheet(id, version, choice) {
     if (typeof id !== "string" || !/^dj-[0-9a-f]{32}$/.test(id)) return null;
-    return openSheet("/sign/dispatch/" + encodeURIComponent(id), version, choice, "dispatch job");
+    return openSheet("/sign/dispatch/" + encodeURIComponent(id), version, choice, "dispatch job", undefined, { kind: "dispatch", id: id });
   }
   // OS-2: the sheet over a coordinator drop (/sign/drop): words, and optionally an envelope the passkey signs there
   function openDropSheet(words) {
@@ -7571,7 +8012,7 @@
     // the sheet reads them once and removes them
     // (set after openSheet, which closes any sheet first and so clears the key; the frame loads later than this returns;
     // closeSignSheet and an edit of the box clear it again, so a sheet that never reads it leaves nothing behind)
-    const got = openSheet("/sign/drop", "", "", "desk drop", "Add an envelope");
+    const got = openSheet("/sign/drop", "", "", "desk drop", "Add an envelope", { kind: "drop", id: "" });
     if (got && typeof words === "string" && words) { try { window.sessionStorage.setItem(DROP_PREFILL_KEY, words); } catch (e) { /* the sheet opens empty */ } }
     return got;
   }
@@ -8236,7 +8677,7 @@
   // the Decisions history's standing-rule slots (and the dispatch jobs), drawn together wherever the proposals are
   function standingSlots() {
     const f = document.createDocumentFragment();
-    f.append(proposalSlot(), grantSlot(), dispatchSlot());   // the drop is its own card under the Needs-you row (renderDropHero), not a slot here
+    f.append(proposalSlot(), grantSlot(), envelopeSlot(), dispatchSlot());   // the drop is its own card under the Needs-you row (renderDropHero), not a slot here
     return f;
   }
 
@@ -8566,7 +9007,10 @@
     if (p.dataset.editable === "1" && p._levainEdit) {
       host.appendChild(buildEditRow(host, p._levainEdit.entry, p._levainEdit.doc));
     }
-    return { host, zone: p.dataset.zone || "", title: entry.title || "", editClass: entry.edit_class || "" };
+    // the List's focus view counts its header as its "all" chip does (the card's count is the kernel's, without the desk's and later rows)
+    const total = p.dataset.listTotal;
+    const title = total ? String(entry.title || "").replace(/ \(\d+\)$/, " (" + total + ")") : entry.title || "";
+    return { host, zone: p.dataset.zone || "", title, editClass: entry.edit_class || "" };
   }
 
   function customModalContent(c) {
@@ -8739,6 +9183,10 @@
         return n.dataset.node === rf.dataset.node && !!t && t.dataset.task === wasTask;
       }) || null;
     }
+    // the List card's control is rebuilt by every fold: its successor is the card's control now
+    if (rf && !document.body.contains(rf) && rf.dataset && rf.dataset.listMore) {
+      rf = document.querySelector('[data-ck-panel="tray"] [data-list-more]') || document.querySelector('[data-ck-panel="tray"] .pexpand');
+    }
     // restore focus to the ⤢ trigger if it's still in the DOM (an intervening board
     // re-render may have replaced it — then focus simply falls to <body>, acceptable).
     // a Needs-you row replaced by a redraw is found again by its item id
@@ -8910,8 +9358,15 @@
   // `slot`: where the tab's section sits once it is drawn; `filled`: the same node once its read has filled it (the grants heading
   // exists only with a grant under it)
   function phoneJumpFind(which, overlay) {
-    const head = Array.from(overlay.querySelectorAll(".ext-grouphead")).find((h) => /standing grants/i.test(h.textContent)) || null;
-    return { slot: head, filled: head };
+    const heads = Array.from(overlay.querySelectorAll(".ext-grouphead"));
+    const grants = heads.find((h) => /standing grants/i.test(h.textContent)) || null;
+    if (grants) return { slot: grants, filled: grants };
+    // no grant under a heading: once BOTH reads have answered (each slot says so), the envelopes' heading is where the tab
+    // lands; before that a grants heading may still be drawn above it
+    const gs = overlay.querySelector(".grant-slot"), es = overlay.querySelector(".envelope-slot");
+    const env = gs && gs.dataset.filled && es && es.dataset.filled
+      ? heads.find((h) => /^envelopes$/i.test(h.textContent.trim())) || null : null;
+    return { slot: env, filled: env };
   }
   const phoneJumpDrawn = (n) => !!n && n.getClientRects().length > 0;
   // The filled node is scrolled to again until the view stops growing above it (steady looks at the same height), so a row that
@@ -8973,6 +9428,28 @@
     const b = ev.target && ev.target.closest ? ev.target.closest("[data-phone-jump]") : null;
     if (b) phoneJump(b.dataset.phoneJump, b);
   });
+  // The jump strip hides its scrollbar, so a tab past either edge gets a cue: the edge it continues past fades (classes the CSS masks on).
+  (function () {
+    const strip = document.getElementById("ck-phonetabs");
+    if (!strip) return;
+    const cue = () => {
+      strip.classList.toggle("ck-more-right", strip.scrollLeft + strip.clientWidth < strip.scrollWidth - 1);
+      strip.classList.toggle("ck-more-left", strip.scrollLeft > 1);
+    };
+    strip.addEventListener("scroll", cue, { passive: true });
+    window.addEventListener("resize", cue);
+    window.addEventListener("load", cue);
+    if (typeof MutationObserver === "function") new MutationObserver(cue).observe(strip, { childList: true, subtree: true, characterData: true });
+    // Labels can widen with no watched event (a late webfont swap, a text-size change, a container resize that is not a window resize).
+    // Toggling the mask classes changes neither the strip's box nor a button's, so the observer cannot loop on its own cue.
+    if (document.fonts && document.fonts.ready) document.fonts.ready.then(cue);
+    if (typeof ResizeObserver === "function") {
+      const ro = new ResizeObserver(cue);
+      ro.observe(strip);
+      strip.querySelectorAll("button").forEach((b) => ro.observe(b));   // the strip's own box is fixed; a widening label moves its buttons
+    }
+    cue();
+  })();
   // Any trusted reader input ends a pending automatic jump (a late Decisions read must never replace the view the reader chose): a touch, a
 // wheel, a press or click anywhere (a panel's expand, a nav link, Notifications) or a key. Script-made events (isTrusted false) do not.
 for (const type of ["touchstart", "wheel", "pointerdown", "click", "keydown"]) document.addEventListener(type, (ev) => { if (ev.isTrusted) phoneJumpRun++; }, { passive: true, capture: true });

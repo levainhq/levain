@@ -288,9 +288,9 @@ def push_request(queue_dir: Path, rid: str) -> str | None:
             return "the cockpit has published no origin to link the request to"
         if not webpush.live(Path(queue_dir)):
             return "no phone is subscribed to the signing queue"
-        if not sender.spawn(Path(queue_dir), kind="question", ref=rid, title=REQUEST_TITLE,
-                            body="A dispatch configuration change waits for your approval.",
-                            url=deep_link(origin, rid)):
+        if not sender.spawn_sign_request(
+                Path(queue_dir), rid, title=REQUEST_TITLE,
+                body="A dispatch configuration change waits for your approval.", url=deep_link(origin, rid)):
             return "the push could not be started"
         return None
     except Exception as exc:  # noqa: BLE001 - a push is a convenience; the request stands

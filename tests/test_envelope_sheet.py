@@ -13,7 +13,7 @@ from pathlib import Path
 
 import levain
 import pytest
-from tests.test_cockpit_narrow_layout_rig import NEEDS, PHONE_TOUCH, TOK, FullRig, drive_touch, needs_browser, needs_ssh
+from tests.test_cockpit_narrow_layout_rig import NEEDS, PHONE_TOUCH, TOK, FullRig, drive_touch, drop_tap, needs_browser, needs_ssh
 from tests.test_msgslot_hero import READY, _tagged, _type
 
 WEB = Path(levain.__file__).parent / "templates" / "web"
@@ -181,7 +181,7 @@ def _open_from_cockpit(view: str, init: str = INIT, wait: bool = True) -> list:
     pre = [emu] if emu else list(PHONE_TOUCH)
     return pre + [{"init": init}, {"until": NEEDS, "ms": 30000}, {"until": READY, "ms": 30000},
                   _type("tidy the changelog"),
-                  {"eval": "document.querySelector('#ck-drop [data-coord-drop=envelope]').click(); 1"},
+                  drop_tap("envelope"),
                   {"until": _in(FD, "return !!d.getElementById('drop-review') && /ev-test/.test(d.getElementById('drop-review').textContent);") if wait
                    else _in(FD, "return !!d.getElementById('drop-review') && " + REVIEWS + ".length >= 1;"), "ms": 30000}]
 

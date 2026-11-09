@@ -1397,6 +1397,18 @@
     vcBusy = false;
     if (final) vcDone = true;
   }
+  // After the first read the spend would freeze at that moment, so a focus or a return to the tab reads voice.json again and
+  // repaints from the answer. A failed or odd answer leaves what is on screen as it was.
+  let vcAgain = false;
+  async function voiceReread() {
+    if (!vcDone || !vcState || vcAgain || document.hidden) return;
+    vcAgain = true;
+    try {
+      const res = await api("GET", "/cockpit/voice.json", undefined, READ_TIMEOUT_MS);
+      if (res && res.status === 200 && res.data && Array.isArray(res.data.providers)) { vcState = res.data; paintVoice(); }
+    } catch (_) { /* keep the last good read */ }
+    vcAgain = false;
+  }
   function vcRow(label, control, help) {
     const r = el("div", "dev-row vc-row");
     const lab = el("label", "vc-lab", label);
@@ -1500,10 +1512,52 @@
     // keys and the estimated spend: read only
     const keys = vcState.providers.map((p) => p.name + ": " + (p.key === "set" ? "key set" : "no key")).join(" · ");
     vcBody.appendChild(el("p", "dev-note vc-keys", "Keys: " + keys + ". Revoke a key beside its grant."));
-    const caps = vcState.caps, n = (v) => (v === null || v === undefined ? "?" : v);
-    if (caps && caps.spent_month_est !== null && caps.spent_month_est !== undefined) {
-      vcBody.appendChild(el("p", "dev-note vc-caps", "Estimated spend: $" + n(caps.spent_day_est) + " today of a $" + n(caps.day_usd) +
-        " cap, $" + caps.spent_month_est + " this month of $" + n(caps.month_usd) + ". An estimate; the provider's bill is the truth."));
+    const caps = vcState.caps, has = (v) => v !== null && v !== undefined;
+    if (caps && has(caps.spent_month_est) && has(caps.spent_day_est) && has(caps.day_usd) && has(caps.month_usd)) {
+      vcBody.appendChild(el("p", "dev-note vc-caps", "Estimated spend: $" + caps.spent_day_est + " today of a $" + caps.day_usd +
+        " cap, $" + caps.spent_month_est + " this month of $" + caps.month_usd + ". An estimate; the provider's bill is the truth."));
+    } else if (caps && has(caps.day_usd) && has(caps.month_usd)) {
+      // the ledger cannot be read: the caps are still true, the spent figures are left out (the one note below says why)
+      vcBody.appendChild(el("p", "dev-note vc-caps", "Spend caps: $" + caps.day_usd + " a day, $" + caps.month_usd + " a month."));
+    }
+    // Dictation and per-provider spend: read only, all from voice.json (the server names the dictation provider; this page never picks one).
+    const cap1 = (s) => s.charAt(0).toUpperCase() + s.slice(1), dict = vcState.mic_in;
+    if (dict) {
+      const why = { turned_off: "off (turned off on the server)", no_stt_key: "off (no speech-to-text key)",
+                    no_stream_key: "off (no key that can stream)", unreadable: "unknown (the key log could not be read)" };
+      const words = dict.on ? cap1(dict.provider || "") + (dict.model ? " (" + dict.model + ")" : "") : (why[dict.reason] || "off");
+      const dr = el("div", "dev-row vc-row vc-dictation");
+      dr.appendChild(el("span", "vc-lab", "Dictation"));
+      dr.appendChild(el("span", "vc-dict-val", words));
+      vcBody.appendChild(dr);
+    }
+    const calls = (c) => c + (c === 1 ? " call" : " calls");
+    const spendWords = (sp) => "$" + sp.day_est_usd + " today (" + calls(sp.day_calls) + ") · $" + sp.month_est_usd + " this month (" + calls(sp.month_calls) + ")";
+    for (const p of vcState.providers) {
+      if (p.key !== "set" && !p.spend) continue;         // a row for every provider that holds a key or has counted spend
+      const r = el("div", "dev-row vc-row vc-spend"); r.dataset.provider = p.name;
+      r.appendChild(el("span", "vc-lab", cap1(p.name)));
+      let words = p.spend ? spendWords(p.spend) : "—";
+      if (p.key !== "set" && p.spend && (!vcState.authority || vcState.authority === "ok")) words += " · no key now";
+      r.appendChild(el("span", "vc-spend-val", words));
+      if (p.console_url) {
+        const a = el("a", "vc-console", "Reload credit"); a.href = p.console_url; a.target = "_blank"; a.rel = "noopener noreferrer";
+        r.appendChild(a);
+      }
+      vcBody.appendChild(r);
+    }
+    // spend that counts toward the caps but belongs to a provider this page has no row for: one row, so the rows add up to the caps line
+    if (vcState.spend_other) {
+      const r = el("div", "dev-row vc-row vc-spend vc-spend-other");
+      r.appendChild(el("span", "vc-lab", "Other providers (not shown above)"));
+      r.appendChild(el("span", "vc-spend-val", spendWords(vcState.spend_other)));
+      vcBody.appendChild(r);
+    }
+    if (vcState.meter === "unreadable") {
+      vcBody.appendChild(el("p", "dev-note vc-spend-gone", "Spend unavailable: the ledger can't be read."));
+    }
+    if (vcState.providers.some((p) => (p.key === "set" || p.spend) && p.console_url)) {
+      vcBody.appendChild(el("p", "dev-note vc-balance", "Balance is not shown here: check it in the provider's console (the link beside each provider)."));
     }
     // Keyboard users keep their place. On a touch screen a focus() on the rebuilt <select> re-opens its picker (iOS Safari), so
     // choosing a value looked like the list reloading and staying open until he tapped away: no refocus where the pointer is coarse.
@@ -1531,8 +1585,8 @@
     readPresence();
     // The cockpit stores its token a moment after load when the link carried one; look again, then keep a slow pulse.
     setTimeout(() => { refresh(); readPresence(); voiceProbe(); }, 2500);
-    window.addEventListener("focus", voiceProbe);
-    document.addEventListener("visibilitychange", () => { if (!document.hidden) voiceProbe(); });
+    window.addEventListener("focus", () => { voiceProbe(); voiceReread(); });
+    document.addEventListener("visibilitychange", () => { if (!document.hidden) { voiceProbe(); voiceReread(); } });
     // The Follow line is the server's one derivation, re-read while the page is visible so a second cockpit (a phone's) never
     // keeps a state the laptop's already left: on a short pulse, when the tab comes back, and when the window gains focus.
     const reread = () => { if (!document.hidden && !prGone && !prBusy) readPresence(); };
