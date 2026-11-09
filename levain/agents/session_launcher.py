@@ -672,12 +672,16 @@ class RealLauncher:
         return {"workspace": {"head": ws.head, "manifest_digest": ws.manifest_digest,
                               "withhold_digest": withhold_digest(ws.withhold)}}
 
-    def refuse_key(self, key: str, reason: str, *, occurrence_id: str | None = None) -> None:
-        """Record a refusal made BEFORE this launcher was asked to spawn (the run server's workspace check) as the
+    def refuse_key(self, key: str, reason: str, *, occurrence_id: str | None = None,
+                   reason_class: str | None = None) -> None:
+        """Record a refusal made BEFORE this launcher was asked to spawn (the run server's LAUNCH checks) as the
         zero-usage ``refused`` tombstone every refusal before allocation leaves, so the fire's later usage read settles
         at nothing instead of at the caps. Only where the key holds no record: another spawn's record is left as it is.
-        Never raises."""
-        extra = {} if occurrence_id is None else {"occurrence_id": occurrence_id}
+        A ``transient`` one for an occurrence is retakable by a later spawn of the same key for that occurrence, as a
+        transient mint refusal is. Never raises."""
+        extra: dict[str, Any] = {} if occurrence_id is None else {"occurrence_id": occurrence_id}
+        if reason_class is not None:
+            extra["reason_class"] = reason_class
         self._tombstone(key, "refused", reason, new=True, **extra)
 
     @staticmethod

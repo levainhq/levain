@@ -683,10 +683,16 @@ class RunServer:
             try:
                 claims = self._claims(req, bar=True)
                 launch, proof = C.launch_from_wire({k: v for k, v in req.items() if k not in ("ledger_head", "bar")})
-                grant = self._verify(proof, launch.exposure, claims)
-                launch = self._priced(launch, grant)
-                launch = self._workspace_of(launch, owner, proof, grant)
-                self._pool()
+                try:
+                    grant = self._verify(proof, launch.exposure, claims)
+                    launch = self._priced(launch, grant)
+                    launch = self._workspace_of(launch, owner, proof, grant)
+                    self._pool()
+                except WS.WorkspaceRefused:
+                    raise               # the workspace judgment records its own refusals (``_workspace_of``)
+                except LauncherRefused as exc:
+                    self._refuse_unspawned(launch, exc)
+                    raise
                 holder = self._spawn(launch, proof, claims)
             finally:
                 # every LAUNCH ends this connection's upload BEFORE its answer is sent: a held-for-spawn upload was
@@ -981,6 +987,19 @@ class RunServer:
         if not free:
             raise LauncherRefused("no-free-slot", _NO_FREE_SLOT_DETAIL, reason_class="transient")
 
+    def _refuse_unspawned(self, launch: Any, exc: LauncherRefused) -> None:
+        """A LAUNCH refused before the launcher was asked to spawn started nothing: record its key as the zero-usage
+        ``refused`` tombstone (:meth:`RealLauncher.refuse_key`), so the fire's usage read settles at nothing instead
+        of at the caps (L3 w3client r1, codex HIGH 1). Not for a key a live holder holds (its spawn writes the record),
+        and only where the key holds no record. A transient refusal stays retakable by the same occurrence."""
+        refuse = getattr(self.launcher, "refuse_key", None)
+        if refuse is None:
+            return
+        with self._mu:
+            if launch.session_key in self._live:
+                return
+        refuse(launch.session_key, exc.name, occurrence_id=launch.occurrence_id, reason_class=exc.reason_class)
+
     # -- holders -----------------------------------------------------------------------------------------------------
 
     def _spawn(self, launch: Any, proof: C.LinkProof, claims: Optional[FrameClaims] = None) -> _Holder:
@@ -988,14 +1007,20 @@ class RunServer:
         ``_live`` BEFORE the blocking spawn, in the same critical section that reads ``_closing``, so a shutdown's
         snapshot holds every spawn that can still produce a session; refused transient while the server is stopping."""
         key = launch.session_key
+        unspawned: Optional[LauncherRefused] = None
         with self._mu:
-            if self._closing:
-                raise LauncherRefused("server-stopping", "the run server is stopping", reason_class="transient")
             if key in self._live:       # the registry's: a key held on the sibling socket is held here too
+                # never recorded as refused: the record is the holder's spawn's to write
                 raise LauncherRefused("session-key-already-used", "this server already holds a session under this key")
-            if not self._holder_slots.acquire(blocking=False):
-                raise LauncherRefused("no-holder-capacity", "every holder slot is taken", reason_class="transient")
-            holder = self._live[key] = _Holder(key, proof, launch.exposure, claims, owner=self)
+            if self._closing:
+                unspawned = LauncherRefused("server-stopping", "the run server is stopping", reason_class="transient")
+            elif not self._holder_slots.acquire(blocking=False):
+                unspawned = LauncherRefused("no-holder-capacity", "every holder slot is taken", reason_class="transient")
+            else:
+                holder = self._live[key] = _Holder(key, proof, launch.exposure, claims, owner=self)
+        if unspawned is not None:
+            self._refuse_unspawned(launch, unspawned)       # outside ``mu``: it writes the index
+            raise unspawned
         try:
             child = self.launcher.spawn(launch)
         except BaseException:

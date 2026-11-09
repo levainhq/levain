@@ -217,3 +217,59 @@ def test_the_brokered_socket_name_is_one_constant_the_server_imports():
     from levain.slot.services import dispatch_run as DR
     assert DR.BROKERED_SOCKET_NAME is C.BROKERED_SOCKET_NAME
     assert C.default_brokered_socket() == C.default_run_socket().parent / C.BROKERED_SOCKET_NAME
+
+
+# --- r1 A: a definitive refusal before any process starts settles the reservation at zero --------------------------------
+
+@pytest.mark.parametrize("billing", ["api_key", "subscription"])
+def test_a_launch_the_server_refuses_for_no_free_slot_settles_at_zero(lrig, pair, billing):
+    oid = (_occurrence(lrig, billing="api_key", micros=1_000_000) if billing == "api_key"
+           else _occurrence(lrig, billing="subscription", exposure=EXP))
+    pair.br._pool_free = pair.pt._pool_free = lambda: False
+    client, _wire = client_of(lrig, pair)
+    kw = {"micros": 1_000_000} if billing == "api_key" else {"exposure": EXP}
+    _sup, report = _run(lrig, oid, client, **kw)
+    assert report.outcome == "session_spawn_failed" and report.code == 1
+    res = _reservation(lrig, oid)
+    zero = (None, None, None, 0) if billing == "api_key" else (0, 0, 0, 0)     # an api_key run carries no action caps
+    assert res[:2] == ("settled", "actual") and res[2:] == zero, res
+    assert [op for op, _f in pair.control.calls if op == "RUN-TICKET-MINT"] == []
+
+
+@pytest.mark.parametrize("fault", ["feed", "wire", "connect"])
+def test_a_local_failure_before_launch_is_marked_nothing_sent(lrig, pair, fault):
+    import socket
+    oid = _occurrence(lrig, billing="api_key", micros=1_000_000)
+    client, _wire = client_of(lrig, pair)
+    if fault == "feed":
+        class Unreadable:
+            def read(self, occ):
+                raise C.ProofUnavailable("the authority log does not read", standing=False)
+        client._feed = Unreadable()
+    elif fault == "wire":
+        def closed(within=None):
+            a, b = socket.socketpair()
+            b.close()
+            return a
+        client._connect_brokered = closed
+    else:
+        def refused(within=None):
+            raise PermissionError(13, "denied")
+        client._connect_brokered = refused
+    with pytest.raises(L.LauncherRefused) as e:
+        client.spawn(api_launch(lrig, oid, KEY_B)[0])
+    assert e.value.nothing_sent is True
+
+
+def test_a_refusal_before_spawn_is_a_retakable_tombstone_and_never_overwrites_a_live_holders_key(lrig, pair):
+    oid = _occurrence(lrig, billing="api_key", micros=1_000_000)
+    launch, _figure = api_launch(lrig, oid, KEY_B)
+    pair.br._refuse_unspawned(launch, L.LauncherRefused("no-free-slot", reason_class="transient"))
+    rec = pair.index.get(KEY_B)
+    assert (rec["state"], rec["reason_class"], rec["occurrence_id"]) == ("refused", "transient", oid)
+    client, _wire = client_of(lrig, pair)
+    child = client.spawn(launch)                    # the same key, the same occurrence: the tombstone is retaken
+    assert pair.index.get(KEY_B)["state"] == "started"
+    pair.br._refuse_unspawned(launch, L.LauncherRefused("no-free-slot", reason_class="transient"))
+    assert pair.index.get(KEY_B)["state"] == "started"      # a live holder's key is never recorded refused
+    child.abort()

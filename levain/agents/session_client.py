@@ -86,7 +86,7 @@ __all__ = ["PROTOCOL", "RUN_FRAME_MAX", "LAUNCHER_NAME", "WAIT_SLICE_S", "WireEr
            "launch_to_wire", "launch_from_wire", "usage_to_wire", "usage_from_wire", "link_proof",
            "WS_CHUNK_BYTES", "WS_PARTS", "WsBegin", "ws_begin_to_wire", "ws_begin_from_wire", "ws_chunk_frames",
            "ws_chunk_from_wire",
-           "WorkspaceNotSent", "BrokeredServerAbsent", "BROKERED_SOCKET_NAME", "default_run_socket", "default_brokered_socket",
+           "WorkspaceNotSent", "LaunchNotSent", "BrokeredServerAbsent", "BROKERED_SOCKET_NAME", "default_run_socket", "default_brokered_socket",
            "session_auth_of", "unix_connector", "DispatchSessionLauncher", "build_launcher",
            "AuthorityFeed"]
 
@@ -830,6 +830,15 @@ class WorkspaceNotSent(LauncherRefused):
     nothing_sent = True
 
 
+class LaunchNotSent(LauncherRefused):
+    """A launch refused on the operator uid before its LAUNCH frame was sent (no proof, a frame too big, no socket, a
+    SYNC that was refused or lost its wire): nothing reached the server that can start a process, so
+    :func:`levain.agents.session.run_session` settles the run at zero (``nothing_sent``). A refusal the SERVER answers
+    to LAUNCH is not this: the server records its own refusals before a spawn as zero-usage, and its usage answer is
+    what settles them."""
+    nothing_sent = True
+
+
 def default_run_socket() -> Path:
     """[judged by this slice, S10b confirms] where the run server listens: ``dispatch/run.sock`` under the host's run
     directory (:data:`levain.slot.layout.RUN`). S10b owns the path; a launcher built with another ``connect`` ignores it."""
@@ -1043,14 +1052,14 @@ class DispatchSessionLauncher:
         try:
             proof = self._proof_of(launch.occurrence_id)
         except ProofUnavailable as exc:
-            raise LauncherRefused("link-proof-unavailable", str(exc),
-                                  reason_class="standing" if exc.standing else "transient") from None
+            raise LaunchNotSent("link-proof-unavailable", str(exc),
+                                reason_class="standing" if exc.standing else "transient") from None
         if launch.workspace is not None:     # the signed role rides only a launch that stages a workspace
             try:
                 proof = dataclasses.replace(proof, signed=self._signed(launch))
             except ProofUnavailable as exc:
-                raise LauncherRefused("link-proof-unavailable", str(exc),
-                                      reason_class="standing" if exc.standing else "transient") from None
+                raise LaunchNotSent("link-proof-unavailable", str(exc),
+                                    reason_class="standing" if exc.standing else "transient") from None
         body = launch_to_wire(launch, proof)
         try:
             # worst-case claims (the largest seq and hash the wire admits), so a body that passes here cannot overflow
@@ -1059,7 +1068,7 @@ class DispatchSessionLauncher:
                       "bar": {"open": False, "closed_revoke_seq": _INT_MAX}} if self._feed is not None else {})
             encode_run_frame({**body, **extra, "p": PROTOCOL, "op": "LAUNCH", "id": 1})      # too big: refused before any connect
         except WireError as exc:
-            raise LauncherRefused("launch-frame-refused", str(exc)) from None
+            raise LaunchNotSent("launch-frame-refused", str(exc)) from None
         try:
             sock = self._connector(launch.auth)()
         except BrokeredServerAbsent:
@@ -1069,17 +1078,17 @@ class DispatchSessionLauncher:
                 raise BrokeredServerAbsent(
                     "brokered-server-absent", "no brokered run server answers: it is turned off (L/policy/dispatch_auth "
                     "holds 'passthrough') or its service is down", reason_class="transient") from None
-            raise LauncherRefused("dispatch-unreachable", f"{type(exc).__name__}", reason_class="transient") from None
+            raise LaunchNotSent("dispatch-unreachable", f"{type(exc).__name__}", reason_class="transient") from None
         conn = _Conn(sock)
         if self._feed is not None:
             try:
                 body = {**body, **self._claims(conn, launch.occurrence_id, bar=True)}
-            except LauncherRefused:
+            except LauncherRefused as exc:
                 conn.close()
-                raise
+                raise LaunchNotSent(exc.name, exc.detail, reason_class=exc.reason_class) from None
             except (_Down, WireError, KeyError) as exc:     # nothing was launched yet: a plain transient refusal
                 conn.close()
-                raise LauncherRefused("dispatch-unreachable", f"SYNC: {type(exc).__name__}", reason_class="transient") from None
+                raise LaunchNotSent("dispatch-unreachable", f"SYNC: {type(exc).__name__}", reason_class="transient") from None
         if launch.workspace is not None:
             try:
                 self.stage_workspace(conn, launch, upload)  # before LAUNCH, on this connection; raises or has staged
