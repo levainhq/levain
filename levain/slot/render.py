@@ -624,11 +624,6 @@ def env_text(env: Mapping[str, str]) -> bytes:
 
 # --- the repo's settings, frozen at render (row 161) ----------------------------------------------------------------
 
-#: The ONE list of env names a repo's settings ``env`` may set in a confined slot. Empty: every name a repo's
-#: ``env`` carries is dropped and reported by name. This is an allowlist by construction, not a denylist of the names
-#: known to be dangerous; a name joins it only by a reviewed edit here.
-REPO_ENV_ALLOW: frozenset = frozenset()
-
 #: The always-on ConfigChange alarm's hook name (``hook_templates`` makes its template; render wires it for a Claude
 #: session whose templates include it).
 CONFIG_GUARD = "levain_config"
@@ -646,7 +641,7 @@ REPO_FILTER_MARGIN = 30
 
 #: The names a macOS hook command takes from Claude Code's own environment, by fixed name and never by pattern: the
 #: queue cap (minted at exec and never rendered, so it cannot be a render-time value) and the three variables Claude
-#: Code sets for its hooks. Each is absent from the hook's environment when absent from Claude Code's.
+#: Code sets for its hooks. Each is absent from the hook's environment when absent or empty in Claude Code's.
 HOOK_INHERIT = ("LEVAIN_QUEUE_CAP", "CLAUDE_PROJECT_DIR", "CLAUDE_CODE_ENTRYPOINT", "CLAUDE_PID")
 
 
@@ -664,7 +659,9 @@ class Frozen:
 def _filtered_groups(ev: str, groups: list, dropped: set) -> list:
     """A gate event's repo groups reduced to what :func:`levain.slot.hook_run.repo_filter` can run: handlers of
     ``type`` ``command`` with a non-empty string ``command``. Every other handler is dropped and named
-    ``hooks.<event>:<type>``; a group left with none is dropped whole."""
+    ``hooks.<event>:<type>``, and an ``async`` one is dropped and named ``hooks.<event>:async`` (Claude Code documents
+    that it does not wait on one, so it could never deny; through the filter it would block every call); a group left
+    with none is dropped whole."""
     out = []
     for g in groups:
         handlers = g.get("hooks")
@@ -672,7 +669,9 @@ def _filtered_groups(ev: str, groups: list, dropped: set) -> list:
             raise Refused("repo-settings-malformed", f"hooks.{ev}: a group's hooks is not a list")
         keep = []
         for h in handlers:
-            if isinstance(h, Mapping) and h.get("type") == "command" and isinstance(h.get("command"), str) \
+            if isinstance(h, Mapping) and h.get("async") is True:
+                dropped.add(f"hooks.{ev}:async")
+            elif isinstance(h, Mapping) and h.get("type") == "command" and isinstance(h.get("command"), str) \
                     and h["command"]:
                 keep.append(dict(h))
             else:
@@ -687,14 +686,14 @@ def freeze_repo_settings(docs: Mapping[str, Any]) -> Frozen:
     """The repo's settings layers (``docs``: ``.claude/settings.json`` then ``.claude/settings.local.json``, either
     optional, as the supervisor reads them) reduced to what the root-owned layer carries: ``hooks`` (per event, the
     project file's groups then the local file's; on a gate event only what :func:`_filtered_groups` keeps, since render
-    wires those through the filter) and the three ``permissions`` lists. ``env`` goes through :data:`REPO_ENV_ALLOW`.
+    wires those through the filter) and the three ``permissions`` lists. Every ``env`` name is dropped and named
+    (``dropped_env``): no repo env reaches a confined slot.
     Any other key (the plugin keys ``enabledPlugins`` / ``extraKnownMarketplaces`` among them: a plugin brings hooks,
     MCP servers and agents from a source the freeze cannot pin) and any other ``permissions`` key (``defaultMode``,
     ``additionalDirectories``: in the flag layer they would take effect where in a project layer Claude Code ignores
     them) is dropped and named. A value of the wrong shape is refused ``repo-settings-malformed``."""
     hooks: dict = {}
     perms: dict = {name: [] for name in REPO_PERMISSION_LISTS}
-    env_kept: dict = {}
     dropped_env: set = set()
     dropped_other: set = set()
 
@@ -733,11 +732,7 @@ def freeze_repo_settings(docs: Mapping[str, Any]) -> Frozen:
             elif key == "env":
                 if not isinstance(v, Mapping):
                     raise bad(path, "env")
-                for name in sorted(v):
-                    if name in REPO_ENV_ALLOW:
-                        env_kept[name] = v[name]
-                    else:
-                        dropped_env.add(name)
+                dropped_env.update(v)
             else:
                 dropped_other.add(key)
     out: dict = {}
@@ -746,8 +741,6 @@ def freeze_repo_settings(docs: Mapping[str, Any]) -> Frozen:
     kept_perms = {k: v for k, v in perms.items() if v}
     if kept_perms:
         out["permissions"] = kept_perms
-    if env_kept:
-        out["env"] = env_kept
     return Frozen(out, tuple(sorted(dropped_env)), tuple(sorted(dropped_other)))
 
 
@@ -848,15 +841,20 @@ def _repo_timeout(h: Mapping[str, Any]) -> int:
 def _filtered(blob: RenderBlob, facts: RenderFacts, ev: str, group: Mapping[str, Any]) -> dict | None:
     """One repo group on a gate event as Claude Code gets it: each ``command`` handler replaced by the filter's
     command (:data:`REPO_FILTER`) with the event, the repo command's bounded timeout and the repo command itself as
-    arguments, and no other key of the handler; the group's string ``matcher`` kept. None when nothing is left."""
+    arguments, and of the handler's other keys only a string ``if`` (the condition it runs under); the group's string
+    ``matcher`` kept. None when nothing is left."""
     handlers = []
+    filter_cmd = hook_command(blob, facts, REPO_FILTER)
     for h in group.get("hooks") or ():
         if not (isinstance(h, Mapping) and h.get("type") == "command" and isinstance(h.get("command"), str)
                 and h["command"]):
             continue
         t = _repo_timeout(h)
-        handlers.append({"type": "command", "onFailure": "block", "timeout": t + REPO_FILTER_MARGIN,
-                         "command": f"{hook_command(blob, facts, REPO_FILTER)} {ev} {t} {shlex.quote(h['command'])}"})
+        handler = {"type": "command", "onFailure": "block", "timeout": t + REPO_FILTER_MARGIN,
+                   "command": f"{filter_cmd} {ev} {t} {shlex.quote(h['command'])}"}
+        if isinstance(h.get("if"), str):
+            handler["if"] = h["if"]
+        handlers.append(handler)
     if not handlers:
         return None
     entry: dict[str, Any] = {"hooks": handlers}
@@ -1411,7 +1409,7 @@ __all__ = [
     "front_limit_fields", "VENDOR_PREFIX", "READSET_ATTRIBUTES", "READSET_ATTRIBUTES_PATH", "READSET_KINDS", "READSET_TEMPLATE",
     "HookTemplate", "RenderFacts", "RenderedFile", "Rendered", "Contains", "DISCOVERY",
     "REPO_DISCOVERY", "wire_name", "gwport_for", "own_loopback", "check_facts", "render_env", "secret_env_names",
-    "is_print_executor", "CONFIG_GUARD", "Frozen", "REPO_ENV_ALLOW", "REPO_FILTER", "REPO_FILTER_MARGIN",
+    "is_print_executor", "CONFIG_GUARD", "Frozen", "REPO_FILTER", "REPO_FILTER_MARGIN",
     "REPO_HOOK_TIMEOUT_DEFAULT", "REPO_HOOK_TIMEOUT_MAX", "freeze_repo_settings", "hook_command", "TOKEN_ENV", "ABSENT_ENV", "PASSTHROUGH_ABSENT_ENV", "PASSTHROUGH_TICKET_KEYS", "check_env_absent", "PROXY_ENV", "CODEX_WEB_SEARCH", "CODEX_LAUNCH_ARGS", "egress_hosts",
     "env_text", "render_cc_settings", "render_cc_onboarding", "codex_config", "codex_toml", "gitconfig_text",
     "assert_no_syscall", "check_driver_template", "profile_lines", "read_driver_template", "render_profile",

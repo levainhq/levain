@@ -120,7 +120,8 @@ def test_a_repo_hook_on_a_gate_event_reaches_claude_code_only_through_the_filter
     original. On the gate's events the only command Claude Code is given for a repo hook is Levain's root-owned filter,
     which runs the repo command and passes on nothing but a deny; the repo's own command is only its argument."""
     same = {".claude/settings.json": {"hooks": {event: [
-        {"hooks": [{"type": "command", "command": "planted-allow --rewrite", "timeout": 7, "async": True}]}]}}}
+        {"hooks": [{"type": "command", "command": "planted-allow --rewrite", "timeout": 7,
+                    "statusMessage": "x"}]}]}}}
     for host in ("linux", "darwin"):
         blob, facts, _ = frozen_blob(host, same)
         groups = rd.render_cc_settings(blob, facts)["hooks"][event]
@@ -134,6 +135,21 @@ def test_a_repo_hook_on_a_gate_event_reaches_claude_code_only_through_the_filter
         assert h["timeout"] > 7                                              # the filter outlives the repo command
         r = rd.render(blob, facts)
         assert r.file("root/hooks/levain_repo_filter").data == FILTER["levain_repo_filter"].body
+
+
+def test_an_async_handler_on_a_gate_event_is_dropped_and_its_if_condition_is_carried():
+    """r161f2 (K3): an ``async`` handler cannot block in Claude Code, so it is dropped on a gate event rather than run
+    as a blocking one; a handler's ``if`` condition stays on the filter's handler, so it runs when it ran before."""
+    doc = {"hooks": {"PreToolUse": [{"matcher": "Bash", "hooks": [
+        {"type": "command", "command": "only-on-commit", "if": "Bash(git commit*)"},
+        {"type": "command", "command": "bg-logger", "async": True},
+        {"type": "command", "command": "odd-if", "if": 7}]}]}}
+    blob, facts, fz = frozen_blob("linux", {".claude/settings.json": doc})
+    assert "hooks.PreToolUse:async" in fz.dropped_other
+    wired = {h["command"].rsplit(" ", 1)[-1]: h for g in rd.render_cc_settings(blob, facts)["hooks"]["PreToolUse"]
+             for h in g["hooks"] if "levain_repo_filter" in h["command"]}
+    assert set(wired) == {"only-on-commit", "odd-if"}
+    assert wired["only-on-commit"]["if"] == "Bash(git commit*)" and "if" not in wired["odd-if"]
 
 
 def test_without_the_filter_template_a_repo_hook_on_a_gate_event_is_not_carried():
@@ -181,18 +197,14 @@ def test_the_supervisors_blob_carries_the_frozen_layer():
 
 # --- 2: the env allowlist, default empty -------------------------------------------------------------------------
 
-def test_the_repo_env_allowlist_is_empty_and_every_dropped_key_is_named():
-    assert rd.REPO_ENV_ALLOW == frozenset()
+def test_every_repo_env_name_is_dropped_and_named():
+    """r161f2 (K6/G2): no repo env name is carried, so the freeze, the grammar and the merge agree: the grammar
+    refuses an ``env`` key and the freeze never makes one."""
+    assert not hasattr(rd, "REPO_ENV_ALLOW")
     fz = rd.freeze_repo_settings(DOCS)
     assert fz.dropped_env == ("BAR", "FOO", "LD_PRELOAD", "NODE_OPTIONS")      # names, never values
     assert "env" not in fz.settings
     assert "/x.so" not in repr(fz)
-
-
-def test_an_allowlisted_name_would_pass_and_nothing_else(monkeypatch):
-    monkeypatch.setattr(rd, "REPO_ENV_ALLOW", frozenset({"FOO"}))
-    fz = rd.freeze_repo_settings(DOCS)
-    assert fz.settings["env"] == {"FOO": "1"} and "FOO" not in fz.dropped_env and "BAR" in fz.dropped_env
 
 
 # --- 3: never read live ----------------------------------------------------------------------------------------
@@ -358,14 +370,102 @@ def test_an_exit_2_passes_with_its_stderr(tmp_path):
 
 
 @pytest.mark.parametrize("script", [
-    "cat >/dev/null\necho '" + json.dumps({"decision": "block"}) + "'\nexit 1\n",     # Claude Code reads no JSON then
     "cat >/dev/null\necho 'not json at all'\n",
     "cat >/dev/null\necho '[1, 2]'\n",
-    "cat >/dev/null\nexit 3\n",
-    "cat >/dev/null\nyes deny | head -c 3000000\n",
+    "cat >/dev/null\nprintf '%s' '{\"continue\": \"false\"}'\n",
 ])
-def test_other_outcomes_are_no_decision(tmp_path, script):
+def test_an_answer_that_is_not_a_decision_is_no_decision(tmp_path, script):
     assert run_filter(tmp_path, "PreToolUse", script) == (0, "", "")
+
+
+def failed(err: str) -> bool:
+    return err.startswith(hook_run.REPO_FAILED) and err.endswith("\n") and err.count("\n") == 1
+
+
+@pytest.mark.parametrize("script,what", [
+    ("cat >/dev/null\necho '" + json.dumps({"decision": "block"}) + "'\nexit 1\n", "exit 1"),
+    ("cat >/dev/null\nexit 3\n", "exit 3"),
+    ("cat >/dev/null\nkill -9 $$\n", "signal 9"),
+    ("cat >/dev/null\nyes deny | head -c 3000000\n", "output"),
+])
+def test_a_repo_hook_that_fails_denies(tmp_path, script, what):
+    """r161f2 (C2): a repo hook that fails is a deny with the fixed reason, never no decision."""
+    code, out, err = run_filter(tmp_path, "PreToolUse", script)
+    assert (code, out) == (hook_run.REFUSED_EXIT, "") and failed(err) and what in err
+
+
+def test_a_repo_command_that_cannot_start_denies(tmp_path):
+    err = io.StringIO()
+    code = hook_run.repo_filter("levain_repo_filter", ["PreToolUse", "5", str(tmp_path / "no-such-hook")],
+                                stdin=io.BytesIO(b"{}"), stdout=io.StringIO(), stderr=err)
+    assert code == hook_run.REFUSED_EXIT and failed(err.getvalue())
+
+
+def test_a_payload_past_the_bound_denies():
+    err = io.StringIO()
+    code = hook_run.repo_filter("levain_repo_filter", ["PreToolUse", "5", "true"],
+                                stdin=io.BytesIO(b"x" * (hook_run.REPO_PAYLOAD_MAX + 1)), stdout=io.StringIO(),
+                                stderr=err)
+    assert code == hook_run.REFUSED_EXIT and failed(err.getvalue())
+
+
+def test_a_filter_that_breaks_denies(tmp_path, monkeypatch):
+    import subprocess as sp
+
+    def boom(*a, **k):
+        raise RuntimeError("broken")
+    monkeypatch.setattr(sp, "Popen", boom)
+    code, _out, err = run_filter(tmp_path, "PreToolUse", "exit 0\n")
+    assert code == hook_run.REFUSED_EXIT and failed(err)
+
+
+@pytest.mark.parametrize("obj,why", [({"continue": False, "stopReason": "policy denied"}, "policy denied"),
+                                     ({"continue": False}, None)])
+def test_a_hard_stop_is_a_deny(tmp_path, obj, why):
+    """r161f2 (C3): exit 0 with ``continue: false`` is Claude Code's hard stop; the filter passes it as a deny."""
+    code, out, err = run_filter(tmp_path, "PreToolUse", emit(obj))
+    assert (code, out) == (hook_run.REFUSED_EXIT, "") and err == (why or hook_run.REPO_DENY_DEFAULT) + "\n"
+
+
+def test_a_background_child_of_the_repo_command_is_killed(tmp_path):
+    """r161f2 (C4): the repo command's process group is killed when it answers, not only at its timeout."""
+    import time
+    marker = tmp_path / "bg"
+    code = run_filter(tmp_path, "PreToolUse",
+                      f"cat >/dev/null\n(/bin/sleep 2; touch {shlex.quote(str(marker))}) >/dev/null 2>&1 &\nexit 0\n")
+    assert code == (0, "", "")
+    time.sleep(3)
+    assert not marker.exists()
+
+
+def test_the_repo_commands_output_is_bounded_while_it_runs(tmp_path):
+    """r161f2 (K1): output past the bound stops the command (a deny); it never lands whole anywhere."""
+    import time
+    marker = tmp_path / "done"
+    t0 = time.monotonic()
+    code, _out, err = run_filter(tmp_path, "PreToolUse",
+                                 f"cat >/dev/null\nhead -c 50000000 /dev/zero\ntouch {shlex.quote(str(marker))}\n")
+    assert code == hook_run.REFUSED_EXIT and failed(err) and "output" in err
+    assert time.monotonic() - t0 < 5 and not marker.exists()
+
+
+@pytest.mark.parametrize("sig", ["SIGTERM", "SIGHUP", "SIGINT"])
+def test_a_filter_that_is_stopped_kills_the_repo_command_and_denies(tmp_path, sig):
+    """r161f2 (K2): Claude Code stopping the filter takes the repo command's group with it."""
+    import signal
+    import time
+    marker = tmp_path / "late"
+    root = os.path.dirname(os.path.dirname(os.path.abspath(hook_run.__file__)))
+    code = ("import io,sys; sys.path.insert(0, %r); from levain.slot import hook_run as H; "
+            "sys.exit(H.repo_filter('f', ['PreToolUse', '30', sys.argv[1]], stdin=io.BytesIO(b'{}')))" % root)
+    p = subprocess.Popen([sys.executable, "-c", code, f"/bin/sleep 2; touch {shlex.quote(str(marker))}"],
+                         stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    time.sleep(1)
+    p.send_signal(getattr(signal, sig))
+    _o, e = p.communicate(timeout=10)
+    assert p.returncode == hook_run.REFUSED_EXIT and failed(e.decode())
+    time.sleep(2.5)
+    assert not marker.exists()
 
 
 def test_the_repo_command_gets_the_payload_and_runs_through_a_shell(tmp_path):
@@ -375,17 +475,19 @@ def test_the_repo_command_gets_the_payload_and_runs_through_a_shell(tmp_path):
     assert seen.read_bytes() == payload
 
 
-def test_a_repo_command_past_its_timeout_is_killed_and_is_no_decision(tmp_path):
+def test_a_repo_command_past_its_timeout_is_killed_and_denies(tmp_path):
     import time
     marker = tmp_path / "late"
     t0 = time.monotonic()
-    code = run_filter(tmp_path, "PreToolUse", f"cat >/dev/null\n/bin/sleep 20\ntouch {shlex.quote(str(marker))}\n",
-                      timeout=1)
-    assert code == (0, "", "") and time.monotonic() - t0 < 10 and not marker.exists()
+    code, out, err = run_filter(tmp_path, "PreToolUse",
+                                f"cat >/dev/null\n/bin/sleep 20\ntouch {shlex.quote(str(marker))}\n", timeout=1)
+    assert (code, out) == (hook_run.REFUSED_EXIT, "") and failed(err) and "timeout" in err
+    assert time.monotonic() - t0 < 10 and not marker.exists()
 
 
 @pytest.mark.parametrize("argv", [[], ["PreToolUse", "5"], ["PostToolUse", "5", "x"], ["PreToolUse", "x", "c"],
-                                  ["PreToolUse", "0", "c"], ["PreToolUse", "5", ""], ["PreToolUse", "5", "c", "d"]])
+                                  ["PreToolUse", "0", "c"], ["PreToolUse", "5", ""], ["PreToolUse", "5", "c", "d"],
+                                  ["PreToolUse", "\u00b2", "c"]])
 def test_a_filter_call_render_never_makes_is_refused(argv):
     err = io.StringIO()
     code = hook_run.repo_filter("levain_repo_filter", argv, stdin=io.BytesIO(b"{}"), stdout=io.StringIO(),
@@ -415,6 +517,11 @@ def test_the_filter_template_runs_repo_filter_with_its_arguments(tmp_path):
 
 
 # --- 6: what the freeze makes redundant ----------------------------------------------------------------------
+
+def test_the_alarm_line_carries_no_control_character():
+    """r161f2 (G5): a payload field cannot move the terminal's cursor in the alarm line."""
+    assert hook_run._field({"file_path": "a\rb\nc\x1b[2Kd"}, "file_path") == "a b c [2Kd"
+
 
 def test_no_rendered_env_names_a_dynamic_loader_variable():
     from tests.test_slot_s2b_render import every_variant
