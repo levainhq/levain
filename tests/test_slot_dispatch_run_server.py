@@ -234,8 +234,10 @@ def test_end_is_async_and_idempotent_two_ends_one_teardown(rig, tmp_path):
     oid, key = _session_row(rig)
     env.launcher.spawn(S.SessionLaunch(oid, key, "claude", "sonnet", "b", "passthrough", EXP))
     client = env.client()
-    first = client.end_session(key, 0.05)
-    second = client.end_session(key, 0.05)
+    # the server answers a little before the client's own deadline; the deadline must leave that margin real time
+    # to cross a loaded box, or the client times out first and reports the wire as down, not the END as in progress
+    first = client.end_session(key, 2.0)
+    second = client.end_session(key, 2.0)
     assert first.terminated is False and "in progress" in first.detail and second.terminated is False
     runtime.gate.set()
     third = client.end_session(key, 5)
