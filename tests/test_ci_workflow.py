@@ -314,7 +314,7 @@ def test_a_seat_push_triggers_no_suite_and_land_and_main_do():
     assert WF[True]["push"]["branches"] == ["main", "land/**"]
     assert "workflow_dispatch" in WF[True]
     x = yaml.safe_load((Path(__file__).resolve().parent.parent / ".github" / "workflows" / "contracts-xcheck.yml").read_text())
-    assert x[True]["push"]["branches"] == ["main"]
+    assert x[True]["push"]["branches"] == ["main", "land/**"]  # a landing is cross-checked before main
     assert "workflow_dispatch" in x[True]
 
 
