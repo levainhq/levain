@@ -18,10 +18,11 @@ bash scripts/install_hooks.sh
 ## Running the tests
 
 CI is the recipe: [`.github/workflows/test.yml`](.github/workflows/test.yml) installs with the line below and runs `pytest`
-(in shards; the workflow splits the suite).
+(in shards; the workflow splits the suite). The script installs from the committed `uv.lock`, hash-checked, then levain
+itself editable; it needs `python` with `pip`, and installs `uv` and `pip` at pinned versions first.
 
 ```
-pip install -e ".[dev,openhands]" hatchling
+scripts/ci_install_locked.sh dev openhands
 ```
 
 Some tests need something your machine may not have and skip themselves where it is absent: macOS's `sandbox-exec`, a
