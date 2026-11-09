@@ -8,11 +8,12 @@ rule forward without ever widening what the operator's own sessions do:
   writes and names the rest as dropped;
 * :func:`read_regular` is the bounded read of a file a slot wrote (no symlink, a regular file, size-capped);
 * :func:`file_rows` puts each kept rule on the band, one row per rule with a yes and a no, and keeps ONE pending
-  record per rule (the row's question id): a rule whose row is open (or answered yes, not yet applied) files nothing;
-  any other rule gets a fresh row, so "No: keep asking" and a refused yes are asked again at the next save;
-* :func:`apply_answered` walks the pending records once, each from one read of its question by id, and appends a rule
-  to ``slot-allow.json`` only for a row whose ``yes`` carries the operator's own signature over exactly this rule's
-  question and answer (:func:`rule_evidence`), storing that signature with it; anything else drops the record;
+  record per rule (the row's question id): a rule with a record files nothing, whatever its row's answer;
+* :func:`apply_answered` is the one consumer of those records, run first by every entry point: it walks them once,
+  each from one read of its question by id, and appends a rule to ``slot-allow.json`` only for a row whose ``yes``
+  carries the operator's own signature over exactly this rule's question and answer (:func:`rule_evidence`), storing
+  that signature with it; any other answer drops the record, so "No: keep asking" and a refused yes are asked again
+  at the next save;
 * :func:`carried` re-verifies every stored rule's evidence against the authority log at each launch, so the file alone
   (an operator-uid file any session of his could write) carries nothing;
 * :func:`merge_into_frozen` adds the verified rules to a slot's frozen ``permissions.allow`` and nothing else.
@@ -399,18 +400,20 @@ def _decline(path: Path, rule: str, now: Callable[[], str]) -> bool:
 
 def undo(path: Path, rule: str, store: Any = None, judge: Optional[Judge] = None) -> str:
     """Undo a revoke of ``rule``. When :func:`carried` carries the rule now (a later signed yes, verified against the
-    authority log), only the revoke record is cleared. Otherwise a fresh row for it goes on the band (never the one
-    answered before), whatever entry for it the file holds: the rule carries again only on a new signed yes to that
-    row, as every slot rule does. Restores nothing itself."""
+    authority log), only the revoke record is cleared. Otherwise, after answered rows are applied
+    (:func:`apply_answered`), a row for it goes on the band unless one is still open (never the one answered before),
+    whatever entry for it the file holds: the rule carries again only on a new signed yes to that row, as every slot
+    rule does. Restores nothing itself."""
     from levain.consent.questions import QuestionStore
 
     qdir = path.parent
     qs = store if store is not None else QuestionStore(qdir)
     with _locked(qdir):
+        if not [r for r in load(path)["revoked"] if r["rule"] == rule]:
+            raise AllowRefused(f"{rule!r} has no revoke to undo")
+        apply_answered(qdir, path, store=qs, judge=judge)
         doc = load(path)
         hit = [r for r in doc["revoked"] if r["rule"] == rule]
-        if not hit:
-            raise AllowRefused(f"{rule!r} has no revoke to undo")
         now_carried = rule in carried(path, judge, store_id_of(qs))[0]
         if not now_carried:
             file_rows(qdir, str(hit[-1].get("session", "?")), [rule], store=qs,
@@ -643,10 +646,16 @@ def carried(path: Path, judge: Optional[Judge], store_id: Optional[str],
 
 # --- the band rows ------------------------------------------------------------------------------------------------
 #
-# One pending record per rule: {rule, session, question_id, key}. A record is resolved by reading its question by id,
-# never by a window of recent questions, and the question must still be the one filed for the rule (its key and its
-# words). Each row is filed under a key no other row has, so nothing answered before can hold a new one back: whether a
-# rule is asked again is decided here, by whether its one pending record is still open, never by the band's keys.
+# One pending record per rule: {rule, session, question_id, key, renew?, why?}. Its lifecycle has ONE consumer:
+# :func:`apply_answered` is the only step that deletes or replaces a record, and every entry point (a slot END's offer,
+# a launch's apply and reminder, undo) runs it before anything files, under the one lock. The filer only asks whether a
+# record exists: it never judges an answer, so no answer can be lost to a reader that is not its consumer.
+#
+# A record is resolved by reading its question by id, never by a window of recent questions, and the question must
+# still be the one filed for the rule (its key and its words). Each row is filed under a key no other row has. Filing
+# writes the record first (key set, question id null), then the row, then the question id: a crash between them leaves
+# a record whose row the next filing step finds by its key and adopts (:func:`_file_row`), or files when it never
+# landed.
 
 def _key(rule: str) -> str:
     return f"{KEY_PREFIX}{hashlib.sha256(rule.encode()).hexdigest()[:16]}:{os.urandom(8).hex()}"
@@ -666,7 +675,9 @@ def _pending_doc(qdir: Path) -> Dict[str, Any]:
         raise AllowRefused(f"{PENDING_NAME}: malformed")
     for rule, rec in rows.items():
         if (not shape_ok(rule) or not isinstance(rec, dict) or rec.get("rule") != rule
-                or any(type(rec.get(k)) is not str for k in ("session", "question_id", "key"))
+                or any(type(rec.get(k)) is not str for k in ("session", "key"))
+                or not (rec.get("question_id") is None or type(rec.get("question_id")) is str)
+                or not (rec.get("why") is None or type(rec.get("why")) is str)
                 or type(rec.get("renew", False)) is not bool):
             raise AllowRefused(f"{PENDING_NAME}: malformed")
     for rule, why in refused.items():
@@ -693,58 +704,68 @@ def _question_of(qs: Any, rec: Mapping[str, Any]) -> Any:
     return q
 
 
-def _waiting(q: Any) -> bool:
-    """Whether ``q`` still waits on something: open on the band, or answered yes and not yet applied."""
-    a = q.answer
-    return a is None or (a.kind == "option" and a.value == YES)
+def _row_text(rule: str, session: str, said: Optional[str], ends: bool) -> Tuple[List[Tuple[str, str]], str]:
+    """The options and words of ``rule``'s row: rebuilt from its record, so a row whose filing was cut short is filed
+    again as it would have been."""
+    no_does = ("No ends the rule: slots stop carrying it until one saves it again" if ends else
+               "No asks again the next time a slot saves it")
+    if said is None:
+        blocks = (f"nothing: the slot already ran. Yes adds the rule to {FILE_NAME} (slot sessions only; never "
+                  f"your checkout or your own sessions), for {LEASE_DAYS} days; {no_does}. Session {session}.")
+    else:
+        blocks = (f"nothing changes today. {said}. Yes carries it in slot sessions (never your checkout "
+                  f"or your own sessions) for {LEASE_DAYS} days from now; {no_does}.")
+    return [(YES, yes_label(rule)), (NO, "No: stop carrying it" if ends else "No: keep asking")], blocks
 
 
-_WHY_FIRST = "first"
+def _file_row(qs: Any, qdir: Path, rec: Mapping[str, Any]) -> Tuple[Any, bool]:
+    """``rec``'s row, filed under its key unless the store already holds a row under that key, open or answered by a
+    person (then that row is adopted): ``(question, filed)``."""
+    from levain.consent.questions import ANSWER_CHANNELS
+
+    options, blocks = _row_text(rec["rule"], rec["session"], rec.get("why"), rec.get("renew") is True)
+    return qs.file_once(agent=AGENT, key=rec["key"], what=asked_text(rec["rule"]), options=options, rec=NO,
+                        blocks=blocks, cwd=str(qdir), held_by=ANSWER_CHANNELS)
 
 
 def file_rows(qdir: Path, session: str, rules: Sequence[str], store: Any = None,
               why: Optional[Mapping[str, str]] = None, renew: Sequence[str] = ()) -> List[str]:
-    """One band row per rule (a yes and a no), listing the rule verbatim, unless the rule's pending record still
-    waits (its row is open, or answered yes and not applied yet). Otherwise (no record, or its row was answered no,
-    or its yes was refused at apply and the record dropped) a FRESH row is filed and replaces the record. ``why``
-    (rule -> words) says on the row why it is asked again (a lapsed lease, an answer that no longer carries, an undone
-    revoke); a rule without one is asked for the first time. A rule in ``renew`` is one the store holds: a no to its
-    row ends it (:func:`apply_answered`), and its No option says so. Returns the rules newly filed. Never writes the
-    allow file."""
+    """One band row per rule (a yes and a no), listing the rule verbatim, for each rule with NO pending record: a rule
+    that has one files nothing, whatever its row's answer (only :func:`apply_answered` resolves or drops a record, so
+    the entry points run it first). ``why`` (rule -> words) says on the row why it is asked again (a lapsed lease, an
+    answer that no longer carries, an undone revoke); a rule without one is asked for the first time. A rule in
+    ``renew`` is one the store holds: a no to its row ends it (:func:`apply_answered`), and its No option says so.
+    First, any record whose filing was cut short gets its row (:func:`_file_row`). Returns the rules newly filed.
+    Never writes the allow file."""
     from levain.consent.questions import QuestionStore
 
     qs = store or QuestionStore(qdir)
     filed: List[str] = []
     with _locked(qdir):
         doc = _pending_doc(qdir)
+        for rule, rec in sorted(doc["rows"].items()):
+            if rec.get("question_id") is None:
+                q, new = _file_row(qs, qdir, rec)
+                rec["question_id"] = q.id
+                _save_pending(qdir, doc)
+                if new and rule in rules:
+                    filed.append(rule)
         for rule in rules:
-            if not shape_ok(rule) or rule in filed:
-                continue
-            rec = doc["rows"].get(rule)
-            q = _question_of(qs, rec) if rec is not None else None
-            if q is not None and _waiting(q):
+            if not shape_ok(rule) or rule in filed or rule in doc["rows"]:
                 continue
             said = (why or {}).get(rule)
-            ends = rule in renew
-            no_does = ("No ends the rule: slots stop carrying it until one saves it again" if ends else
-                       "No asks again the next time a slot saves it")
-            if said is None:
-                blocks = (f"nothing: the slot already ran. Yes adds the rule to {FILE_NAME} (slot sessions only; never "
-                          f"your checkout or your own sessions), for {LEASE_DAYS} days; {no_does}. Session {session}.")
-            else:
-                blocks = (f"nothing changes today. {said[:200]}. Yes carries it in slot sessions (never your checkout "
-                          f"or your own sessions) for {LEASE_DAYS} days from now; {no_does}.")
-            key = _key(rule)
-            q = qs.file(agent=AGENT, agent_session_id=key, cwd=str(qdir), rec=NO, what=asked_text(rule),
-                        options=[(YES, yes_label(rule)), (NO, "No: stop carrying it" if ends else "No: keep asking")],
-                        blocks=blocks)
-            doc["rows"][rule] = {"rule": rule, "session": session, "question_id": q.id, "key": key}
-            if ends:
-                doc["rows"][rule]["renew"] = True
+            rec = {"rule": rule, "session": session, "question_id": None, "key": _key(rule)}
+            if rule in renew:
+                rec["renew"] = True
+            if said is not None:
+                rec["why"] = said[:200]
+            doc["rows"][rule] = rec
             doc["refused"].pop(rule, None)
-            filed.append(rule)
-        if filed:
+            _save_pending(qdir, doc)                   # the intent is on disk before the row exists
+            q, _new = _file_row(qs, qdir, rec)
+            rec["question_id"] = q.id
             _save_pending(qdir, doc)
+            filed.append(rule)
     return filed
 
 
@@ -794,54 +815,68 @@ def _bad_why(why: str) -> str:
 
 
 def offer(qdir: Path, allow_file: Path, session: str, rules: Sequence[str], judge: Optional[Judge],
-          store: Any = None, now: Optional[datetime] = None) -> List[str]:
-    """At a slot's END: put each rule its dialog saved on the band unless the store carries it now (:func:`file_rows`
-    files a row only when the rule has none waiting). A stored rule whose verified lease ran out is asked as a renewal;
-    one whose signed answer no longer carries it (a re-enrolled or revoked key, an edited entry) says why. With nothing
-    to judge by (:func:`_standing` is ``None``) a stored rule files nothing. Returns the rules newly filed."""
+          store: Any = None, now: Optional[datetime] = None,
+          refused: Optional[List[Tuple[str, str]]] = None) -> List[str]:
+    """At a slot's END: first every answered row is applied (:func:`apply_answered`), then each rule the dialog saved
+    goes on the band unless the store carries it now (:func:`file_rows` files a row only for a rule with no pending
+    record). A stored rule whose verified lease ran out is asked as a renewal; one whose signed answer no longer
+    carries it (a re-enrolled or revoked key, an edited entry) says why. With nothing to judge by (:func:`_standing`
+    is ``None``) a stored rule files nothing. A yes the apply refuses is appended to ``refused`` when given. Returns
+    the rules newly filed."""
     from levain.consent.questions import QuestionStore
 
     qs = store or QuestionStore(qdir)
-    doc = load(allow_file)
-    stored = {r["rule"] for r in doc["rules"]}
-    standing = _standing(doc, judge, store_id_of(qs), now) or {}
-    why: Dict[str, str] = {}
-    todo: List[str] = []
-    for rule in rules:
-        st = standing.get(rule)
-        if rule not in stored:
-            todo.append(rule)
-        elif st is None or st.kind == "carried":
-            continue
-        else:
-            why[rule] = _renew_why(st.end) if st.kind == "lapsed" else _bad_why(st.why)
-            todo.append(rule)
-    return file_rows(qdir, session, todo, store=qs, why=why, renew=[r for r in todo if r in stored])
+    with _locked(qdir):
+        apply_answered(qdir, allow_file, store=qs, judge=judge, refused=refused)
+        doc = load(allow_file)
+        stored = {r["rule"] for r in doc["rules"]}
+        standing = _standing(doc, judge, store_id_of(qs), now) or {}
+        why: Dict[str, str] = {}
+        todo: List[str] = []
+        for rule in rules:
+            st = standing.get(rule)
+            if rule not in stored:
+                todo.append(rule)
+            elif st is None or st.kind == "carried":
+                continue
+            else:
+                why[rule] = _renew_why(st.end) if st.kind == "lapsed" else _bad_why(st.why)
+                todo.append(rule)
+        return file_rows(qdir, session, todo, store=qs, why=why, renew=[r for r in todo if r in stored])
 
 
 def remind(qdir: Path, allow_file: Path, store: Any = None, now: Optional[datetime] = None,
            judge: Optional[Judge] = None) -> List[str]:
-    """Run at each slot launch: a renewal row for each stored rule whose VERIFIED lease ends within
+    """Run at each slot launch, after its apply: a renewal row for each stored rule whose VERIFIED lease ends within
     :data:`REMIND_DAYS` (or has ended), and a row for each stored rule whose signed answer does not verify (its stored
-    lease is not trusted, so it never silences this). A row is filed only when the rule has none waiting
-    (:func:`file_rows`); its signed yes renews the rule. With nothing to judge by (no judge, an unreadable authority
-    log) it files nothing. Returns the rules filed."""
+    lease is not trusted, so it never silences this). Answered rows are applied first (:func:`apply_answered`); a row
+    is filed only when the rule has no pending record (:func:`file_rows`); its signed yes renews the rule. A rule whose
+    yes was refused is not asked here: it is asked again when a slot END saves it (:func:`offer`). With nothing to
+    judge by (no judge, an unreadable authority log) it files no new row. Returns the rules filed."""
     from levain.consent.questions import QuestionStore
 
     qs = store or QuestionStore(qdir)
-    doc = load(allow_file)
-    standing = _standing(doc, judge, store_id_of(qs), now)
-    if not standing:
-        return []
-    soon = (now or _clock(judge)) + timedelta(days=REMIND_DAYS)
-    sessions = {r["rule"]: str(r.get("session", "?")) for r in doc["rules"]}
-    filed: List[str] = []
-    for rule, st in standing.items():
-        if st.kind == "bad":
-            filed += file_rows(qdir, sessions[rule], [rule], store=qs, why={rule: _bad_why(st.why)}, renew=[rule])
-        elif st.end_at is not None and st.end_at <= soon:
-            filed += file_rows(qdir, sessions[rule], [rule], store=qs, why={rule: _renew_why(st.end)}, renew=[rule])
-    return filed
+    with _locked(qdir):
+        apply_answered(qdir, allow_file, store=qs, judge=judge)
+        doc = load(allow_file)
+        standing = _standing(doc, judge, store_id_of(qs), now) or {}
+        refused = _pending_doc(qdir)["refused"]
+        soon = (now or _clock(judge)) + timedelta(days=REMIND_DAYS)
+        sessions = {r["rule"]: str(r.get("session", "?")) for r in doc["rules"]}
+        why: Dict[str, str] = {}
+        for rule, st in standing.items():
+            if rule in refused:
+                continue
+            if st.kind == "bad":
+                why[rule] = _bad_why(st.why)
+            elif st.end_at is not None and st.end_at <= soon:
+                why[rule] = _renew_why(st.end)
+        filed: List[str] = []
+        for rule in why:
+            filed += file_rows(qdir, sessions[rule], [rule], store=qs, why={rule: why[rule]}, renew=[rule])
+        if not why:
+            file_rows(qdir, "?", [], store=qs)     # a row whose filing was cut short is still filed
+        return filed
 
 
 def _resolve(qs: Any, rec: Mapping[str, Any], judge: Optional[Judge]) -> Tuple[str, Optional[Dict[str, str]], str]:
@@ -851,6 +886,8 @@ def _resolve(qs: Any, rec: Mapping[str, Any], judge: Optional[Judge]) -> Tuple[s
     or is not this rule's)."""
     from levain.consent.questions import ANSWER_CHANNELS
 
+    if rec.get("question_id") is None:
+        return "open", None, ""                # its filing was cut short: the filer finishes it, nothing to read yet
     q = _question_of(qs, rec)
     if q is None:
         return "drop", None, "its row is gone"
@@ -871,12 +908,14 @@ def _resolve(qs: Any, rec: Mapping[str, Any], judge: Optional[Judge]) -> Tuple[s
 
 def apply_answered(qdir: Path, allow_file: Path, store: Any = None, now: Callable[[], str] = _now,
                    judge: Optional[Judge] = None, refused: Optional[List[Tuple[str, str]]] = None) -> List[str]:
-    """Walk the pending records ONCE, each resolved from one read of its question (:func:`_resolve`): the operator's
-    signed yes to exactly the rule (:func:`rule_evidence`) carries it into ``allow_file`` with that answer stored
-    beside it; a record still open is left; anything else (a no, an unsigned or otherwise refused yes, a row that is
-    gone) drops the record, so the next time a slot saves the rule it is asked again. A no to a row filed for a stored
-    rule (``renew``) also ends that rule (:func:`_decline`). A refused yes is noted (with why)
-    for ``list`` until that new row is filed, and appended to ``refused`` when given. A rule already stored is replaced
+    """The ONE consumer of the pending records: the only step that deletes or replaces one. Walks them once, each
+    resolved from one read of its question (:func:`_resolve`): the operator's signed yes to exactly the rule
+    (:func:`rule_evidence`) carries it into ``allow_file`` with that answer stored beside it; a record still open (or
+    still being filed) is left; anything else (a no, an unsigned or otherwise refused yes, a row that is gone) drops
+    the record, so the next time a slot saves the rule it is asked again. A no to a row filed for a stored rule
+    (``renew``) also ends that rule (:func:`_decline`). A refused yes is kept as refused (with why) until a slot END
+    files the rule's next row: ``list`` names it and :func:`remind` does not re-ask it. It is appended to ``refused``
+    when given. A rule already stored is replaced
     unless its old entry still verifies with a lease at least as long (:func:`append`). Returns the rules added."""
     from levain.consent.questions import QuestionStore
 
