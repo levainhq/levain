@@ -4,11 +4,13 @@ scratch project plants a SessionStart hook that touches a marker, ``claude -p`` 
 the hook must fire) and once WITH ``--setting-sources ""`` (the hook must not), each with a fake key, its own scratch HOME
 and config dir (never the operator's), and its own local listener as the API address.
 
-The evidence is positive, never an absence. A run that opens a connection to its listener has got past hook loading and
-reached its first API call. The control validates that order on this binary: its marker must already exist when its
-connection arrives. Only then does the empty-list run's connection without a marker read ``held``. A rejected flag, a
-crash, a run that never reaches its API, or a timeout is ``inconclusive``; the empty-list marker appearing at any moment
-is ``leaked``. Each run is killed as a whole process group."""
+The evidence is positive, never an absence. The listener never answers; it reads each connection's request line. A
+connection alone proves nothing: the client sends a preflight before it runs any hook. The anchor is the first model
+request, a ``POST`` to ``/v1/messages``, which the client sends only after its SessionStart hooks. The control validates
+that order on this binary: its marker must already exist when its model request arrives. Only then does the empty-list
+run's model request without a marker read ``held``. A rejected flag, a crash, a run that never sends its model request,
+or a timeout is ``inconclusive``; the empty-list marker appearing at any moment is ``leaked``. Each run is killed as a
+whole process group."""
 from __future__ import annotations
 
 import json
@@ -28,6 +30,19 @@ from levain.host_guard import SEAT_SOURCE_ARGS
 __all__ = ["ProbeResult", "run_probe"]
 
 _STDERR_CAP = 300
+_LINE_CAP = 4096
+_MODEL_PATH = "/v1/messages"
+
+
+def _is_model_request(head: bytes) -> bool:
+    """True when ``head`` holds a complete request line that POSTs to the model endpoint (any query string)."""
+    end = head.find(b"\r\n")
+    if end < 0:
+        return False
+    parts = head[:end].decode("latin-1").split(" ")
+    if len(parts) != 3 or parts[0] != "POST":
+        return False
+    return parts[1].split("?", 1)[0] == _MODEL_PATH
 
 
 @dataclass(frozen=True)
@@ -52,6 +67,8 @@ class _Run:
         self.listener = socket.create_server(("127.0.0.1", 0))
         self.listener.setblocking(False)
         self.conns: list[socket.socket] = []
+        self.heads: list[bytes] = []
+        self.sent_model_request = False
         self.err_path = root / f"{name}.stderr"
         port = self.listener.getsockname()[1]
         env = {"PATH": os.environ.get("PATH", ""), "HOME": str(home), "CLAUDE_CONFIG_DIR": str(home / "cfg"),
@@ -66,13 +83,30 @@ class _Run:
             self.listener.close()
             raise
 
-    def reached_api(self) -> bool:
-        try:
-            conn, _addr = self.listener.accept()
-        except (BlockingIOError, InterruptedError):
-            return bool(self.conns)
-        self.conns.append(conn)
-        return True
+    def reached_model(self) -> bool:
+        """Accept new connections, read what each has sent so far, and report whether any of them carries the model
+        request. Never answers, so the client cannot reuse a connection for a second request."""
+        if self.sent_model_request:
+            return True
+        while True:
+            try:
+                conn, _addr = self.listener.accept()
+            except (BlockingIOError, InterruptedError):
+                break
+            conn.setblocking(False)
+            self.conns.append(conn)
+            self.heads.append(b"")
+        for i, conn in enumerate(self.conns):
+            if len(self.heads[i]) >= _LINE_CAP:
+                continue
+            try:
+                data = conn.recv(_LINE_CAP - len(self.heads[i]))
+            except OSError:
+                continue
+            self.heads[i] += data
+            if _is_model_request(self.heads[i]):
+                self.sent_model_request = True
+        return self.sent_model_request
 
     def exited(self) -> int | None:
         return self.proc.poll()
@@ -105,8 +139,8 @@ class _Run:
 
 
 def run_probe(binary: str, *, timeout: float = 20.0) -> ProbeResult:
-    """``held``: the control fired its hook before reaching its API, and the empty-list run reached its API with no
-    hook. ``leaked``: the empty-list run's hook fired, at any moment. ``inconclusive``: anything else, including a
+    """``held``: the control fired its hook before sending its model request, and the empty-list run sent its model
+    request with no hook. ``leaked``: the empty-list run's hook fired, at any moment. ``inconclusive``: anything else, including a
     rejected flag, a crash, an early control exit and the overall ``timeout``."""
     root: Path | None = None
     runs: list[_Run] = []
@@ -121,36 +155,36 @@ def run_probe(binary: str, *, timeout: float = 20.0) -> ProbeResult:
         while True:
             if empty.marker.exists():
                 return ProbeResult("leaked", '--setting-sources "" still loaded the project settings (its hook fired)')
-            if not ctl_ok and ctl.reached_api():
+            if not ctl_ok and ctl.reached_model():
                 if not ctl.marker.exists():
-                    return ProbeResult("inconclusive", "the control reached its API before its project hook fired, so "
-                                       "the order this probe relies on does not hold on this version")
+                    return ProbeResult("inconclusive", "the control sent its model request before its project hook "
+                                       "fired, so the order this probe relies on does not hold on this version")
                 ctl_ok = True
             if not ctl_ok and ctl.exited() is not None:
                 return ProbeResult("inconclusive", f"the control run {ctl.why_exited()}"[:400])
-            if empty.reached_api():
+            if empty.reached_model():
                 if ctl_ok:
                     empty.stop()
                     if empty.marker.exists():
                         return ProbeResult("leaked", '--setting-sources "" still loaded the project settings (its hook '
                                            "fired)")
-                    return ProbeResult("held", f"the control fired its project hook before its API call in "
-                                       f"{time.monotonic() - t0:.1f}s; the empty-list run reached its API call with "
-                                       "no hook")
+                    return ProbeResult("held", f"the control fired its project hook before its POST {_MODEL_PATH}; "
+                                       f"the empty-list run sent its POST {_MODEL_PATH} with no hook, in "
+                                       f"{time.monotonic() - t0:.1f}s")
             elif empty.exited() is not None:
                 empty.stop()
                 if empty.marker.exists():
                     return ProbeResult("leaked", '--setting-sources "" still loaded the project settings (its hook '
                                        "fired)")
                 return ProbeResult("inconclusive", (f'the --setting-sources "" run {empty.why_exited()} before its '
-                                                    "API call")[:400])
+                                                    "model request")[:400])
             if time.monotonic() - t0 > timeout:
                 empty.stop()
                 if empty.marker.exists():
                     return ProbeResult("leaked", '--setting-sources "" still loaded the project settings (its hook '
                                        "fired)")
-                which = "the empty-list run never reached its API call" if ctl_ok else \
-                    "the control run never fired its project hook and reached its API call"
+                which = "the empty-list run never sent its model request" if ctl_ok else \
+                    "the control run never fired its project hook and sent its model request"
                 return ProbeResult("inconclusive", f"{which} within {timeout:.0f}s, so the probe proves nothing")
             time.sleep(0.05)
     except OSError as exc:

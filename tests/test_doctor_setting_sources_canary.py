@@ -28,13 +28,29 @@ _FAKE = textwrap.dedent('''\
         cmd = json.load(open(".claude/settings.json"))["hooks"]["SessionStart"][0]["hooks"][0]["command"]
         subprocess.run(cmd, shell=True)
 
-    def api():
+    held_open = []
+
+    def send(line):
         u = urlsplit(os.environ.get("ANTHROPIC_BASE_URL", ""))
         try:
             s = socket.create_connection((u.hostname, u.port), timeout=2)
-            s.sendall(b"POST /v1/messages HTTP/1.1\\r\\n\\r\\n")
+            s.sendall(line + b"\\r\\nHost: x\\r\\n\\r\\n")
+            held_open.append(s)
         except OSError:
             pass
+
+    def api():
+        send(b"POST /v1/messages?beta=true HTTP/1.1")
+
+    # the real binary's measured order: a HEAD preflight before any hook, the model request after the hooks
+    parse_fails = (role, mode) in (("empty", "reject"), ("ctl", "ctl_exit"))
+    if not parse_fails:
+        send(b"HEAD /api/hello HTTP/1.1")
+        time.sleep(0.2)
+    if mode == "preflight_only":
+        if role == "ctl":
+            hook()
+        time.sleep(60)
 
     if role == "ctl":
         if mode in ("leak_only", "hang_empty_and_ctl"):
@@ -141,6 +157,16 @@ def test_a_control_that_reaches_its_api_before_its_hook_is_inconclusive(tmp_path
     assert r.verdict == "inconclusive", r
 
 
+def test_a_preflight_alone_is_not_the_api_call_so_it_is_inconclusive_never_held(tmp_path):
+    r, _ = _run(tmp_path, "preflight_only", timeout=2.0)
+    assert r.verdict == "inconclusive", r
+
+
+def test_held_names_the_model_request_as_its_evidence(tmp_path):
+    r, _ = _run(tmp_path, "held")
+    assert r.verdict == "held" and "/v1/messages" in r.detail, r
+
+
 def test_each_run_gets_its_own_home(tmp_path):
     r, _ = _run(tmp_path, "held")
     side = tmp_path / "side"
@@ -225,4 +251,12 @@ def test_doctor_bounds_the_probe_by_passing_a_timeout(monkeypatch):
         return ssc.ProbeResult("held", "x")
     monkeypatch.setattr(ssc, "run_probe", fake_probe)
     doctor._check_setting_sources(claude_bin="/x/claude", version="9.9.9")
-    assert 0 < seen["timeout"] <= 30, seen
+    assert 0 < seen["timeout"] <= 10, seen
+
+
+def test_only_a_complete_post_to_the_model_endpoint_is_the_anchor():
+    yes = [b"POST /v1/messages HTTP/1.1\r\n", b"POST /v1/messages?beta=true HTTP/1.1\r\nHost: x\r\n"]
+    no = [b"HEAD /api/hello HTTP/1.1\r\n", b"POST /v1/messages?beta=true HTTP/1.1", b"GET /v1/messages HTTP/1.1\r\n",
+          b"POST /v1/messages/count_tokens HTTP/1.1\r\n", b"", b"\x16\x03\x01garbage\r\n"]
+    assert all(ssc._is_model_request(h) for h in yes)
+    assert not any(ssc._is_model_request(h) for h in no)

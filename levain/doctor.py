@@ -5301,7 +5301,7 @@ def _check_seat_profile(*, claude_bin: str | None = None, python: str | None = N
             shutil.rmtree(base, ignore_errors=True)
 
 
-_SETTING_SOURCES_PROBE_TIMEOUT = 20.0  # the whole probe's bound inside a doctor run
+_SETTING_SOURCES_PROBE_TIMEOUT = 10.0  # the whole probe's bound inside a doctor run, beside the version read's own
 
 
 def _check_setting_sources(*, claude_bin: str | None = None, version: str | None = ...,
