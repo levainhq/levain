@@ -66,7 +66,7 @@ from typing import Any
 from levain.cockpit.consent import utc_stamp
 from levain.consent.record import ExternalGateRequest, redact_display, tool_input_digest
 from levain.qbroker import wire
-from levain.qbroker.broker import RUN_CALLS_KIND, RUN_DEADLINE_KIND
+from levain.qbroker.broker import ALARM_REASON_MAX, RUN_CALLS_KIND, RUN_DEADLINE_KIND
 
 __all__ = ["BROKER_ACCOUNT", "CAP_ENV", "FAST_POLLS", "GATE_BACKOFF", "GATE_TOOL_USE_ID_MAX", "GO",
            "IO_TIMEOUT", "PENDING_REFUSALS", "REQUEST_RETRY", "SLOW_POLL", "SOCKET_ENV",
@@ -243,6 +243,14 @@ class BrokerClient:
         if keys == {"decision"} and got["decision"] in DECISIONS:
             return got["decision"]
         raise BrokerError("malformed", "ANSWER? answered neither a decision nor pending")
+
+    def alarm(self, kind: str, reason: str, *, timeout: float | None = None) -> None:
+        """``ALARM {kind, reason}`` (row 166, :mod:`levain.qbroker.broker`): one operator-side record of what the slot
+        hook saw. ``reason`` is cut to the broker's bound. Only a bare ack returns; a refusal, or an answer carrying
+        anything, raises :class:`BrokerError`. An ALARM grants nothing, so the caller acts the same either way."""
+        got = self.call("ALARM", timeout=timeout, kind=kind, reason=reason[:ALARM_REASON_MAX])
+        if set(got) != {"id", "ok"}:
+            raise BrokerError("malformed", "ALARM answered more than an ack")
 
     def gate(self, *, agent: str, tool_name: str, tool_input: Any, tool_use_id: str | None,
              timeout: float | None = None) -> tuple[str, str | None]:

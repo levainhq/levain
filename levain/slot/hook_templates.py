@@ -32,7 +32,8 @@ ENTRIES = {"levain_config": "config_guard", REPO_FILTER: "repo_filter"}
 #: holds ``DEFAULT_GATE_HOLD`` (300 s) after a bounded broker GATE, so it always answers inside this. render wires every
 #: slot hook with ``"onFailure": "block"``, so the timeout firing (a hang, not a hold) blocks the call, never lets it run.
 HOOK_TIMEOUT = 870
-#: the ConfigChange alarm answers at once (it reads one payload and writes one line)
+#: the ConfigChange alarm answers at once (it reads one payload, writes one line and sends the broker one ALARM, whose
+#: wait is bounded well inside this)
 CONFIG_TIMEOUT = 30
 
 
