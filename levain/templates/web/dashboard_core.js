@@ -2325,7 +2325,11 @@
         if (isList) {
           // every number reads rowsFor, with the chip's own value in place of the one chosen
           let timeRow = null;
+          // the shared choices the card last drew from: closing a view that left them unchanged redraws nothing
+          const listChoice = () => listSurface + "\u0000" + listTime + "\u0000" + trayView;
+          let drawnChoice = null;
           const build = () => {
+            if (inCard) drawnChoice = listChoice();
             const was = document.activeElement;
             const at = was && was.dataset && ((chipRow && was.closest(".list-surfaces") === chipRow) || (timeRow && was.closest(".list-times") === timeRow))
               ? (was.dataset.surface !== undefined ? ["surface", was.dataset.surface] : was.dataset.time !== undefined ? ["time", was.dataset.time] : null) : null;
@@ -2349,7 +2353,7 @@
           };
           const chooseSurface = (v) => { listSurface = v; build(); redraw(); };
           rebuildChips = build;
-          if (inCard) listCardRedraw = () => { if (document.body.contains(p)) { build(); redraw(); } };
+          if (inCard) listCardRedraw = () => { if (document.body.contains(p) && listChoice() !== drawnChoice) { build(); redraw(); } };
           build();
         }
         if (!views.length) return;
@@ -9174,13 +9178,14 @@
     pruneModalKinds();
     document.body.classList.remove("modal-open");
     unlockNeedsScroll();
-    if (listCardRedraw) listCardRedraw();
     modalKey = null;
     modalCustom = null;
     modalGlance = false;
     modalPending = null;
     modalAwaiting = false;
     modalGen++;
+    // after the view's own state is reset, so a card that fails to draw never leaves the modal half-closed
+    if (listCardRedraw) { try { listCardRedraw(); } catch (e) { console.error(e); } }
     let rf = modalReturnFocus;
     modalReturnFocus = null;
     // a re-render of the widgets replaces the tile that opened the view: its successor is found by the panel id
