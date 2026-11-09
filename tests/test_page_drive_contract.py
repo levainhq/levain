@@ -152,9 +152,10 @@ def test_an_eval_that_navigates_passes_and_any_other_eval_error_still_fails(tmp_
 
 @needs_browser
 def test_act_until_does_not_run_its_action_again_once_the_condition_came_true_between_polls(tmp_path: Path) -> None:
-    # the first run makes the condition true 150 ms later; the retry tick (every 200) must see that before it acts again
-    do = "window.__n = (window.__n || 0) + 1; if (window.__n === 1) setTimeout(() => { window.__ok = 1; }, 150); 1"
-    r = _drive(tmp_path, [{"do": do, "until": "window.__ok", "ms": 10000, "every": 200}, {"eval": "new Promise(r => setTimeout(() => r(window.__n), 600))"}])
+    # the first run makes the condition true 20 ms later; the retry tick (every 700) must see that before it acts again. The gap is wide on
+    # purpose: a page timer on a loaded box can fire late, and a tick that beats it is a loaded timer, not an action run twice
+    do = "window.__n = (window.__n || 0) + 1; if (window.__n === 1) setTimeout(() => { window.__ok = 1; }, 20); 1"
+    r = _drive(tmp_path, [{"do": do, "until": "window.__ok", "ms": 10000, "every": 700}, {"eval": "new Promise(r => setTimeout(() => r(window.__n), 1400))"}])
     assert r.returncode == 0, r.stderr
     assert json.loads(r.stdout)["values"][-1] == 1, r.stdout
 
