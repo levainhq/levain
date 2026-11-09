@@ -40,6 +40,19 @@ lines (its header is never rewritten), so a `/2` build refuses that file `ledger
   line's are its own. `unacked()` lists them in ref order; `ack()` writes one `lineage-acked` line and moves its refs out
   of the outbox only in its future's done-callback, after the flush.
 
+The run-final record (W3-3b): a brokered run is complete in the sink only when keys says so. `run_final(run_id)` writes
+one `run-final {seq, epoch, run_id, meta, at}` line per run, `meta["lineage"]` being the `levain-dispatch-run-final/1`
+payload `{format, run_id, rows, quarantined, triples_digest, at}`; it rides the outbox like any other payload, its triple
+being `(ledger_id, epoch, own seq)`. `rows` is how many distinct payload triples carry the run's `run_id` (the final's
+own excluded), `quarantined` how many of those CONTROL's ack quarantined, and `triples_digest` the digest of their sorted
+triples (:func:`triples_digest`: the one definition a reader recomputes). The ledger writes it only when the run is
+READY (:meth:`Ledger.run_ready`): no hold of scope `("run", run_id)` short of RESOLVED (STRANDED included) and no triple
+of the run in the outbox, durable or queued, so every row of the run has a durable ack first. From the moment the line is
+queued the run is FENCED: `admit` on that run's scope and `refused` for that run raise :class:`RunFinalized`, so no row
+of the run can be built after its count. That the run's sessions are gone and its refusal windows flushed is keys' to
+decide before it calls `run_final`; the ledger holds only what it can see. A second `run-final` line for one run is
+`ledger-corrupt:final-dup` at replay.
+
 Runs on the root interpreter (3.9): no `match`, no 3.10+ API. Standard library imports only (a tripwire holds it).
 """
 from __future__ import annotations
@@ -50,6 +63,7 @@ import enum
 import errno
 import fcntl
 import functools
+import hashlib
 import inspect
 import json
 import logging
@@ -64,6 +78,12 @@ from typing import Any, Callable, Dict, List, NamedTuple, Optional, Tuple
 
 FORMAT = "levain-reservation-ledger/3"
 FORMAT_VERSION = 3
+#: the run-final payload's format (the sink's record, CONTROL's check), and the grammar of the run id it names
+RUN_FINAL_FORMAT = "levain-dispatch-run-final/1"
+_RUN_ID_RE = re.compile(r"r-[0-9a-f]{16}")
+_SECOND_RE = re.compile(r"[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z")
+_DIGEST_RE = re.compile(r"sha256:[0-9a-f]{64}")
+_FINAL_KEYS = frozenset({"format", "run_id", "rows", "quarantined", "triples_digest", "at"})
 #: the header formats this build reads (a `/2` file is read as it stands)
 READ_FORMATS = frozenset({"levain-reservation-ledger/2", FORMAT})
 META_MAX = 4096                  # bytes of a meta object's canonical encoding
@@ -100,6 +120,7 @@ _KEYS = {
     "uncertain": (frozenset({"kind", "seq", "ref", "reason", "meta", "at"}),),
     "refused": (frozenset({"kind", "seq", "epoch", "session", "run_id", "route", "reason", "count", "meta", "at"}),),
     "lineage-acked": (frozenset({"kind", "seq", "refs", "at"}), frozenset({"kind", "seq", "refs", "quarantined", "at"})),
+    "run-final": (frozenset({"kind", "seq", "epoch", "run_id", "meta", "at"}),),
 }
 _RESOLUTIONS = ("released", "settled", "uncertain")
 
@@ -126,6 +147,15 @@ class LedgerUnavailable(Exception):
     def __init__(self, detail: str = "") -> None:
         super().__init__("keys-unavailable" + (": " + detail if detail else ""))
         self.detail = detail
+
+
+class RunFinalized(LedgerUnavailable):
+    """A run's count is already written (or queued): nothing more of that run is built. It is a `LedgerUnavailable`,
+    so a caller that answers the one as `keys-unavailable` answers this one the same way."""
+
+    def __init__(self, run_id: str) -> None:
+        super().__init__("run-finalized")
+        self.run_id = run_id
 
 
 class LedgerMisuse(Exception):
@@ -274,6 +304,47 @@ def _triple_ok(t: Any) -> bool:
 
 def _triple_obj(t: "Ref") -> dict:
     return {"ledger": t[0], "epoch": t[1], "ref": t[2]}
+
+
+def triples_digest(triples: Any) -> str:
+    """The digest a run-final record carries over its rows' source triples: `sha256:` and the hex SHA-256 of the
+    compact JSON array of `[ledger, epoch, ref]` arrays, sorted by (ledger, epoch, ref). Each triple is a tuple or a
+    list; a row's `source` object `{ledger, epoch, ref}` is read as the same triple. One definition, for the writer
+    here and for a reader that recomputes it from the sink."""
+    items = sorted((t["ledger"], t["epoch"], t["ref"]) if type(t) is dict else (t[0], t[1], t[2]) for t in triples)
+    raw = json.dumps([list(t) for t in items], separators=(",", ":"), ensure_ascii=True)
+    return "sha256:" + hashlib.sha256(raw.encode("ascii")).hexdigest()
+
+
+def _final_ok(o: dict) -> bool:
+    """A `run-final` line's own checks: a strict run id, and a payload of exactly the record's keys that names the
+    same run."""
+    if type(o["run_id"]) is not str or not _RUN_ID_RE.fullmatch(o["run_id"]):
+        return False
+    p = o["meta"].get("lineage")
+    if type(p) is not dict or frozenset(p) != _FINAL_KEYS or frozenset(o["meta"]) != frozenset({"lineage"}):
+        return False
+    return (p["format"] == RUN_FINAL_FORMAT and p["run_id"] == o["run_id"]
+            and _is_int(p["rows"]) and p["rows"] >= 0 and _is_int(p["quarantined"]) and 0 <= p["quarantined"] <= p["rows"]
+            and type(p["triples_digest"]) is str and bool(_DIGEST_RE.fullmatch(p["triples_digest"]))
+            and type(p["at"]) is str and bool(_SECOND_RE.fullmatch(p["at"])))
+
+
+def _base_run(meta: dict) -> Optional[str]:
+    """The run a `reserved` line's `lineage_base` names, if any."""
+    b = meta.get("lineage_base")
+    rid = b.get("run_id") if type(b) is dict else None
+    return rid if type(rid) is str else None
+
+
+def _payload_run(meta: dict) -> Optional[str]:
+    """The run a payload line belongs to (its `run_id`), or None for a line with no payload, one with no run, or the
+    run-final record itself (the count of a run is not a row of it)."""
+    p = meta.get("lineage")
+    if type(p) is not dict or p.get("format") == RUN_FINAL_FORMAT:
+        return None
+    rid = p.get("run_id")
+    return rid if type(rid) is str else None
 
 
 def _scope_ok(scope: Any) -> bool:
@@ -477,6 +548,8 @@ def _type_ok(kind: str, o: dict) -> bool:
                     return False
     if "meta" in o and not (_meta_ok(o["meta"]) and _lineage_ok(o["meta"])):
         return False
+    if kind == "run-final":
+        return _final_ok(o)
     return True
 
 
@@ -500,11 +573,16 @@ class _Replay:
         self.known: set = set()                       # every triple a payload line named
         self.outbox: Dict[Ref, dict] = {}             # payload lines with no ack yet
         self.quarantined: Dict[Ref, str] = {}
+        self.run_triples: Dict[str, set] = {}         # run_id -> every triple whose payload carries it
+        self.finals: Dict[str, int] = {}              # run_id -> its run-final line's seq
 
     def payload(self, triple: "Ref", meta: dict) -> None:
         if "lineage" in meta:
             self.known.add(triple)
             self.outbox[triple] = meta["lineage"]
+            rid = _payload_run(meta)
+            if rid is not None:
+                self.run_triples.setdefault(rid, set()).add(triple)
 
     def line(self, n: int, raw: bytes) -> None:
         p = self.path
@@ -545,6 +623,13 @@ class _Replay:
                 raise _corrupt("epoch", n, p)
             if o["count"] < 1:
                 raise _corrupt("amount", n, p)
+            self.payload((self.ledger_id, o["epoch"], seq), o["meta"])
+        elif kind == "run-final":
+            if o["epoch"] != self.epoch:
+                raise _corrupt("epoch", n, p)
+            if o["run_id"] in self.finals:
+                raise _corrupt("final-dup", n, p)
+            self.finals[o["run_id"]] = seq
             self.payload((self.ledger_id, o["epoch"], seq), o["meta"])
         elif kind == "lineage-acked":
             refs = [_triple_key(t) for t in o["refs"]]
@@ -654,6 +739,8 @@ class Ledger:
         self._outbox: Dict[Ref, dict] = {}                          # durable payload lines with no durable ack
         self._ack_pending: set = set()                              # triples in an ack line not yet durable
         self._quarantined: Dict[Ref, str] = {}
+        self._run_triples: Dict[str, set] = {}                      # run_id -> every durable payload triple it carries
+        self._finals: Dict[str, int] = {}                           # run_id -> its run-final line's seq (from queueing)
         #: called on the loop as `on_outbox(triple, payload)` when a payload line becomes durable (3c-6c's sender)
         self.on_outbox: Optional[Callable[[Ref, dict], None]] = None
         self._inflight_since = 0.0
@@ -785,6 +872,7 @@ class Ledger:
             raise _io_error("flush-opened", e, path)
         led = cls(path, fd, rp.ledger_id, epoch, seq + 1, rp.acc)
         led._known, led._outbox, led._quarantined = rp.known, rp.outbox, rp.quarantined
+        led._run_triples, led._finals = rp.run_triples, rp.finals
         return led
 
     @staticmethod
@@ -943,6 +1031,7 @@ class Ledger:
             raise LedgerMisuse("a malformed price_ref")
         if not _meta_ok(meta) or not _lineage_ok(meta):
             raise LedgerMisuse("a malformed meta")
+        self._fence(scope[1] if scope[0] == "run" and len(scope) == 2 else None, _base_run(meta))
         if not callable(bound) or inspect.iscoroutinefunction(bound) or asyncio.iscoroutinefunction(bound):
             raise LedgerMisuse("bound must be a plain function")
         try:
@@ -1090,6 +1179,9 @@ class Ledger:
     def _outbox_add(self, triple: Ref, payload: dict) -> None:
         self._known.add(triple)
         self._outbox[triple] = payload
+        rid = _payload_run({"lineage": payload})
+        if rid is not None:
+            self._run_triples.setdefault(rid, set()).add(triple)
         fn = self.on_outbox
         if fn is not None:
             try:
@@ -1276,6 +1368,7 @@ class Ledger:
             raise LedgerMisuse("a malformed count")
         if not _meta_ok(meta) or "lineage_base" in meta or not _lineage_ok(meta):
             raise LedgerMisuse("a malformed meta")
+        self._fence(run_id, _payload_run(meta))
         meta_c = json.loads(json.dumps(meta))
         loop = self._loop
         assert loop is not None
@@ -1288,6 +1381,67 @@ class Ledger:
         outbox = (triple, meta_c["lineage"]) if "lineage" in meta_c else None
         self._submit(seq, data, None, "refused", fut=fut, outbox=outbox)
         return triple, fut
+
+    def _fence(self, *run_ids: Optional[str]) -> None:
+        """Raises :class:`RunFinalized` for a run whose count is queued or written, whichever of the given ids names it."""
+        for rid in run_ids:
+            if rid is not None and rid in self._finals:
+                raise RunFinalized(rid)
+
+    # -- the run's count -------------------------------------------------------------------------------------------
+
+    def run_finalized(self, run_id: str) -> bool:
+        """True once the run's `run-final` line is queued (the fence is up) or was found at replay."""
+        self._check_read()
+        return run_id in self._finals
+
+    def run_ready(self, run_id: str) -> bool:
+        """True when no hold of scope `("run", run_id)` is short of RESOLVED (a STRANDED one counts as outstanding) and
+        no payload triple of the run is still in the outbox, durable or queued: every row of the run then has its ack
+        durable. It says nothing of the run's sessions or refusal windows, which only keys knows."""
+        self._check_read()
+        if type(run_id) is not str or not _RUN_ID_RE.fullmatch(run_id):
+            raise LedgerMisuse("a malformed run_id")
+        acc = self._acc.get(("run", run_id))
+        if acc is not None and acc[_OUT] > 0:
+            return False
+        for t in self._run_triples.get(run_id, ()):
+            if t in self._outbox:
+                return False
+        for _t, payload in self._pending_outbox.values():
+            if _payload_run({"lineage": payload}) == run_id:
+                return False
+        return True
+
+    def run_final(self, run_id: str) -> "asyncio.Future":
+        """Queues the run's one `run-final` line and returns a future that resolves when it is durable (or fails
+        `LedgerUnavailable`). Raises `LedgerMisuse` unless the run is ready and not already finalized, and
+        `LedgerUnavailable` while the ledger is unhealthy or closing. The fence is up from this call on."""
+        self._check_loop()
+        if type(run_id) is not str or not _RUN_ID_RE.fullmatch(run_id):
+            raise LedgerMisuse("a malformed run_id")
+        if not self._healthy or self._closing:
+            raise LedgerUnavailable("the ledger is %s" % ("closing" if self._healthy else "unhealthy"))
+        if run_id in self._finals:
+            raise LedgerMisuse("the run is already finalized")
+        if not self.run_ready(run_id):
+            raise LedgerMisuse("the run is not ready")
+        triples = self._run_triples.get(run_id, set())
+        loop = self._loop
+        assert loop is not None
+        seq = self._take_seq()
+        at = _now()
+        payload = {"format": RUN_FINAL_FORMAT, "run_id": run_id, "rows": len(triples),
+                   "quarantined": sum(1 for t in triples if t in self._quarantined),
+                   "triples_digest": triples_digest(triples), "at": _second(at)}
+        meta = {"lineage": payload}
+        data = _encode({"kind": "run-final", "seq": seq, "epoch": self.epoch, "run_id": run_id, "meta": meta,
+                        "at": at})
+        fut = loop.create_future()
+        fut.add_done_callback(_retrieve)
+        self._finals[run_id] = seq
+        self._submit(seq, data, None, "run-final", fut=fut, outbox=((self.ledger_id, self.epoch, seq), payload))
+        return fut
 
     def unacked(self) -> List[Tuple[Ref, dict]]:
         """Every durable payload line with no durable ack, in ref order: `[(triple, payload)]`. A triple whose ack

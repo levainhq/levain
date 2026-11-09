@@ -548,3 +548,252 @@ def test_an_ack_line_lost_before_its_flush_replays_unacked(py, mode):
         _close(led)
     finally:
         shutil.rmtree(d, ignore_errors=True)
+
+
+# ---- the run-final record (W3-3b): a run's count, written only when every row of it is acked -------------------------
+
+RID = BASE["run_id"]
+RID2 = "r-fedcba9876543210"
+
+
+def _run_hold(led, rid=RID, amount=AMOUNT):
+    return Owner(led, amount=amount, cap=10 * AMOUNT, scope=("run", rid), meta={"lineage_base": dict(BASE, run_id=rid)})
+
+
+async def _resolved_row(led, rid=RID, quarantined=False):
+    """One sent, settled, durable ticketed hold of the run; returns its triple."""
+    o = await _run_hold(led, rid).start()
+    await o.hold.durable()
+    o.hold.send_gate()
+    o.hold.mark_sent()
+    o.hold.settle(1, {"lineage": dict(BASE, run_id=rid, settled="yes")})
+    await until(lambda: o.hold.state is L.RESOLVED)
+    await o.finish()
+    return o.hold.ref
+
+
+def _finals(path):
+    return [o for o in file_lines(path) if o["kind"] == "run-final"]
+
+
+def test_a_final_is_written_only_after_every_triple_is_durably_acked(tmp_path):
+    path = ledger_path(tmp_path)
+
+    async def go():
+        led = L.Ledger.open(path)
+        led.attach(asyncio.get_running_loop())
+        a = await _resolved_row(led)
+        b = await _resolved_row(led)
+        other = await _resolved_row(led, RID2)                      # another run's row never counts here
+        assert not led.run_ready(RID)                               # both rows are durable and unacked
+        with pytest.raises(L.LedgerMisuse):
+            led.run_final(RID)
+        assert _finals(path) == []
+        await led.ack([a])
+        assert not led.run_ready(RID)                               # one still unacked
+        await led.ack([b], {b: "tokens_in"})
+        assert led.run_ready(RID)
+        await led.run_final(RID)
+        (fin,) = _finals(path)
+        assert fin["run_id"] == RID and fin["epoch"] == led.epoch
+        pay = fin["meta"]["lineage"]
+        assert pay == {"format": L.RUN_FINAL_FORMAT, "run_id": RID, "rows": 2, "quarantined": 1,
+                       "triples_digest": L.triples_digest([a, b]), "at": fin["at"][:19] + "Z"}
+        assert L.triples_digest([a, b]) != L.triples_digest([a, other])
+        # the final rides the outbox as its own triple; it is no row of its run
+        assert [(r, p.get("format")) for r, p in led.unacked() if p.get("format")] == [
+            ((led.ledger_id, led.epoch, fin["seq"]), L.RUN_FINAL_FORMAT)]
+        await led.aclose(5)
+
+    asyncio.run(go())
+    led = L.Ledger.open(path)                                       # replay finds the same count and the same fence
+    assert led.run_finalized(RID) and not led.run_finalized(RID2)
+    assert [p.get("format") for _r, p in led.unacked()].count(L.RUN_FINAL_FORMAT) == 1      # the final is an unacked payload
+    _close(led)
+
+
+def test_a_final_waits_for_an_open_hold_and_counts_a_refused_row(tmp_path):
+    path = ledger_path(tmp_path)
+
+    async def go():
+        led = L.Ledger.open(path)
+        led.attach(asyncio.get_running_loop())
+        done = await _resolved_row(led)
+        o = await _run_hold(led).start()
+        await o.hold.durable()
+        o.hold.send_gate()
+        o.hold.mark_sent()                                          # SENT: outstanding, no row yet
+        await led.ack([done])
+        assert not led.run_ready(RID)
+        with pytest.raises(L.LedgerMisuse):
+            led.run_final(RID)
+        o.hold.settle(1, {"lineage": dict(BASE, settled="yes")})
+        await until(lambda: o.hold.state is L.RESOLVED)
+        await o.finish()
+        assert not led.run_ready(RID)                               # its row is durable, not acked
+        t, fut = led.refused("s1", "r-a", "budget-exhausted", 2, {"lineage": dict(BASE, refused="budget-exhausted")},
+                             run_id=RID)
+        assert not led.run_ready(RID)                               # queued, not durable
+        await fut
+        await led.ack([o.hold.ref, t])
+        assert led.run_ready(RID)
+        await led.run_final(RID)
+        await led.aclose(5)
+
+    asyncio.run(go())
+    assert _finals(path)[0]["meta"]["lineage"]["rows"] == 3
+
+
+def test_the_fence_refuses_any_row_of_a_finalized_run(tmp_path):
+    path = ledger_path(tmp_path)
+
+    async def go():
+        led = L.Ledger.open(path)
+        led.attach(asyncio.get_running_loop())
+        a = await _resolved_row(led)
+        await led.ack([a])
+        fut = led.run_final(RID)                                    # queued, not yet durable: the fence is already up
+        o = await _run_hold(led).start()
+        assert isinstance(o.error, L.RunFinalized) and isinstance(o.error, L.LedgerUnavailable)
+        assert o.error.detail == "run-finalized" and o.hold is None
+        with pytest.raises(L.RunFinalized):
+            led.refused("s1", "r-a", "budget-exhausted", 1, {"lineage": dict(BASE, refused="x")}, run_id=RID)
+        with pytest.raises(L.RunFinalized):                         # the payload names the run though the argument does not
+            led.refused("s1", "r-a", "budget-exhausted", 1, {"lineage": dict(BASE, refused="x")})
+        await fut
+        assert [o["kind"] for o in file_lines(path)].count("refused") == 0
+        # another run, and a refusal naming no run, are untouched
+        o2 = await _run_hold(led, RID2).start()
+        assert o2.error is None
+        await o2.finish()
+        t, f2 = led.refused("s1", "r-a", "budget-exhausted", 1, {}, run_id=None)
+        await f2
+        await led.aclose(5)
+
+    asyncio.run(go())
+
+
+def test_a_reused_run_id_refuses_live_and_after_a_restart(tmp_path):
+    path = ledger_path(tmp_path)
+
+    async def go():
+        led = L.Ledger.open(path)
+        led.attach(asyncio.get_running_loop())
+        a = await _resolved_row(led)
+        await led.ack([a])
+        await led.run_final(RID)
+        with pytest.raises(L.LedgerMisuse):
+            led.run_final(RID)
+        await led.aclose(5)
+
+    asyncio.run(go())
+    assert len(_finals(path)) == 1
+
+    async def again():
+        led = L.Ledger.open(path)
+        led.attach(asyncio.get_running_loop())
+        assert led.run_finalized(RID)
+        with pytest.raises(L.LedgerMisuse):
+            led.run_final(RID)
+        o = await _run_hold(led).start()
+        assert isinstance(o.error, L.RunFinalized)
+        await led.aclose(5)
+
+    asyncio.run(again())
+    assert len(_finals(path)) == 1
+
+
+def test_a_run_replayed_after_a_restart_finalizes_with_the_same_count(tmp_path):
+    path = ledger_path(tmp_path)
+
+    async def first():
+        led = L.Ledger.open(path)
+        led.attach(asyncio.get_running_loop())
+        a = await _resolved_row(led)
+        b = await _resolved_row(led)
+        await led.ack([a, b])
+        await led.aclose(5)
+        return a, b
+
+    a, b = asyncio.run(first())
+
+    async def second():
+        led = L.Ledger.open(path)
+        led.attach(asyncio.get_running_loop())
+        assert not led.run_finalized(RID) and led.run_ready(RID)
+        await led.run_final(RID)
+        await led.aclose(5)
+
+    asyncio.run(second())
+    pay = _finals(path)[0]["meta"]["lineage"]
+    assert (pay["rows"], pay["quarantined"], pay["triples_digest"]) == (2, 0, L.triples_digest([a, b]))
+
+
+def test_a_restart_booked_row_is_a_row_of_its_run(tmp_path):
+    """A hold open at a crash is booked `uncertain {restart}` with its payload at the next open: that row is the run's
+    too, and the run is ready only after its ack."""
+    path = ledger_path(tmp_path)
+
+    async def first():
+        led = L.Ledger.open(path)
+        led.attach(asyncio.get_running_loop())
+        o = await _run_hold(led).start()
+        await o.hold.durable()
+        o.hold.send_gate()
+        o.hold.mark_sent()
+        return led, o
+
+    loop = asyncio.new_event_loop()
+    led, o = loop.run_until_complete(first())
+    held = o.hold.ref
+    os.close(led._fd)                                               # a kill: nothing more is written, the lock goes
+    led._fd = -1
+    loop.close()
+
+    async def second():
+        led2 = L.Ledger.open(path)
+        led2.attach(asyncio.get_running_loop())
+        assert led2.run_ready(RID) is False                         # its restart row is unacked
+        await led2.ack([held])
+        assert led2.run_ready(RID)
+        await led2.run_final(RID)
+        await led2.aclose(5)
+
+    asyncio.run(second())
+    pay = _finals(path)[0]["meta"]["lineage"]
+    assert (pay["rows"], pay["triples_digest"]) == (1, L.triples_digest([held]))
+
+
+def test_a_second_final_line_for_one_run_is_corrupt(tmp_path):
+    path = ledger_path(tmp_path)
+    p1 = {"format": L.RUN_FINAL_FORMAT, "run_id": RID, "rows": 0, "quarantined": 0,
+          "triples_digest": L.triples_digest([]), "at": "2026-11-09T01:02:03Z"}
+
+    def fin(seq):
+        return line("run-final", seq, epoch=E1, run_id=RID, meta={"lineage": p1})
+
+    write_file(path, header(), opened(1), fin(2))
+    led = L.Ledger.open(path)
+    assert led.run_finalized(RID)
+    _close(led)
+    write_file(path, header(), opened(1), fin(2), fin(3))
+    assert _refusal(path).name == "ledger-corrupt:final-dup:4"
+
+
+@pytest.mark.parametrize("bad", [
+    {"run_id": "r-1"},                                              # not the run id grammar
+    {"meta": {"lineage": {"format": "levain-dispatch-run-final/2"}}},
+    {"meta": {}},
+    {"meta": {"lineage": {"extra": 1}}},
+])
+def test_a_malformed_final_line_is_corrupt(tmp_path, bad):
+    path = ledger_path(tmp_path)
+    p1 = {"format": L.RUN_FINAL_FORMAT, "run_id": RID, "rows": 0, "quarantined": 0,
+          "triples_digest": L.triples_digest([]), "at": "2026-11-09T01:02:03Z"}
+    fields = {"epoch": E1, "run_id": RID, "meta": {"lineage": p1}}
+    if "meta" in bad and "lineage" in bad["meta"]:
+        fields["meta"] = {"lineage": dict(p1, **bad["meta"]["lineage"])}
+    else:
+        fields.update(bad)
+    write_file(path, header(), opened(1), line("run-final", 2, **fields))
+    assert _refusal(path).name == "ledger-corrupt:type:3"
