@@ -350,3 +350,81 @@ def test_a_brokered_connect_error_is_absent_only_when_the_socket_is_missing_or_r
         client.spawn(api_launch(lrig, oid, KEY_B)[0])
     assert (e.value.name, e.value.reason_class, e.value.nothing_sent) == (name, "transient", True)
     assert wire.opens["passthrough"] == 0
+
+
+# --- r2 A1: a refusal the server makes from the frame's claims, before any spawn, settles at zero too ---------------------
+
+def _forge_claims(client, forge):
+    """The client's claims as it read them, with ``forge`` laid over them (what a client behind or on another chain sends)."""
+    real = client._claims
+
+    def claims(conn, occ, *, bar):
+        got = real(conn, occ, bar=bar)
+        return {**got, **forge(got)}
+    client._claims = claims
+
+
+@pytest.mark.parametrize("billing", ["api_key", "subscription"])
+@pytest.mark.parametrize("forge,name", [
+    (lambda got: {"ledger_head": {"seq": got["ledger_head"]["seq"], "hash": "f" * 64}}, "ledger-fork"),
+    (lambda got: {"bar": {"open": False, "closed_revoke_seq": got["ledger_head"]["seq"] + 1}}, "bar-invalid"),
+    (lambda got: {"bar": {"open": "no", "closed_revoke_seq": 0}}, "bad-request"),
+], ids=["ledger-fork", "bar-invalid", "claims-off-the-wire"])
+def test_a_launch_the_server_refuses_on_its_frame_claims_settles_at_zero(lrig, pair, billing, forge, name):
+    oid = (_occurrence(lrig, billing="api_key", micros=1_000_000) if billing == "api_key"
+           else _occurrence(lrig, billing="subscription", exposure=EXP))
+    client, _wire = client_of(lrig, pair)
+    _forge_claims(client, forge)
+    kw = {"micros": 1_000_000} if billing == "api_key" else {"exposure": EXP}
+    _sup, report = _run(lrig, oid, client, **kw)
+    assert report.outcome == "session_spawn_failed" and report.code == 1
+    res = _reservation(lrig, oid)
+    zero = (None, None, None, 0) if billing == "api_key" else (0, 0, 0, 0)
+    assert res[:2] == ("settled", "actual") and res[2:] == zero, res
+    with lrig.store.read() as c:
+        key = c.execute("SELECT session_key FROM agent_occurrences WHERE occurrence_id = ?", (oid,)).fetchone()[0]
+    rec = pair.index.get(key)
+    assert rec is not None and (rec["state"], rec["reason"], rec["occurrence_id"]) == ("refused", name, oid), rec
+    assert [op for op, _f in pair.control.calls if op == "RUN-TICKET-MINT"] == []
+
+
+# --- r2 G1: the run.sock fallback of END never runs on a deadline the brokered connect already spent ---------------------
+
+def test_end_whose_brokered_connect_spent_the_deadline_does_not_try_run_sock(lrig, pair, monkeypatch):
+    clock = [1000.0]
+    monkeypatch.setattr(C.time, "monotonic", lambda: clock[0])
+    wire = Wire(pair.pt, None)
+    tried = []
+
+    def gone(within=None):
+        clock[0] += 5.0                                  # the brokered connect took the whole deadline, then failed
+        raise FileNotFoundError(2, "no such socket")
+    gone.accepts_within = True
+
+    def passthrough(within=None):
+        tried.append(within)
+        return pair.conn(pair.pt)
+    passthrough.accepts_within = True
+    client = C.DispatchSessionLauncher(passthrough, lambda occ: None, None, None, None, gone, lambda key: "brokered")
+    got = client.end_session(KEY_B, 5)
+    assert got.terminated is False and "TimeoutError" in got.detail, got     # what a capped connect's timeout reads
+    assert tried == []                                   # nothing was connected on a spent deadline
+
+
+def test_end_falls_back_to_run_sock_with_only_what_the_deadline_has_left(lrig, pair, monkeypatch):
+    clock = [1000.0]
+    monkeypatch.setattr(C.time, "monotonic", lambda: clock[0])
+    tried = []
+
+    def gone(within=None):
+        clock[0] += 3.0
+        raise FileNotFoundError(2, "no such socket")
+    gone.accepts_within = True
+
+    def passthrough(within=None):
+        tried.append(within)
+        raise ConnectionRefusedError(61, "refused")
+    passthrough.accepts_within = True
+    client = C.DispatchSessionLauncher(passthrough, lambda occ: None, None, None, None, gone, lambda key: "brokered")
+    got = client.end_session(KEY_B, 5)
+    assert got.terminated is False and tried == [pytest.approx(2.0)], (got, tried)

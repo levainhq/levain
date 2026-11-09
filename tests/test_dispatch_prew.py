@@ -976,6 +976,19 @@ def test_serve_retries_a_recoverable_accept_error(err):
     assert lst.accepts == 2                     # it accepted again after the error, and left only on the stop
 
 
+def test_serve_logs_the_first_retried_accept_error_and_every_nth_after(monkeypatch, capsys):
+    # r2 L1 (complement): a persistent EMFILE kept the socket accepting nothing and said nothing
+    import threading
+    monkeypatch.setattr(DR, "_ACCEPT_BACKOFF_S", 0.0)
+    monkeypatch.setattr(DR, "_ACCEPT_LOG_EVERY", 3, raising=False)
+    stop = threading.Event()
+    lst = _ScriptedListener([OSError(errno.EMFILE, "too many")] * 5, stop)
+    DR.serve(object(), lst, stop)
+    lines = [ln for ln in capsys.readouterr().err.splitlines() if "accept" in ln]
+    assert lst.accepts == 6 and len(lines) == 2, lines      # the first retry and the Nth after it, nothing between
+    assert "EMFILE" in lines[0] or "too many" in lines[0]
+
+
 def test_serve_sets_the_shared_stop_on_an_unrecoverable_accept_error():
     import threading
     stop = threading.Event()

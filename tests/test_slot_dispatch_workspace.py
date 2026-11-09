@@ -13,8 +13,9 @@ the zero-usage ``refused`` tombstone: a tampered bundle (in transit; a damaged p
 header; a changed object count), an over-cap bundle and an overrunning chunk, a symlink at ``repo.bundle``, a manifest
 that does not match the bundle (another snapshot's, not canonical, not what WSBEGIN declared), a head or withhold the
 member does not share with the manifest, a snapshot whose ``.claude/settings.json`` loosens the sandbox, one carrying
-``.mcp.json``, an upload with no member. A member with no upload on its connection is refused and writes NO tombstone
-(the key may be another connection's in-flight upload), nor does a transient host failure (L3 w1srv r1).
+``.mcp.json``, an upload with no member. A member with no upload on its connection, and a transient host failure, are
+refused with a TRANSIENT tombstone only (the key may be another connection's in-flight upload, or launchable once the
+host recovers: the same occurrence retakes it), so the refused fire still settles at zero (L3 w1srv r1, w3client r2 A2).
 
 The L3 r1 fix round (two real connections where a race needs two): one upload per connection, replaced on re-begin and
 dropped by every LAUNCH outcome, so a transient refusal is retryable on the same connection; a foreign LAUNCH neither
@@ -193,6 +194,12 @@ class World:
         rec = self.env.launcher.index.get(key)
         if not tombstone:
             assert rec is None, rec
+            return
+        if tombstone == "transient":
+            # a refusal that is not this connection's to make standing: the zero-usage tombstone, retakable by the same
+            # occurrence (L3 w3client r2 A2, deepseek)
+            assert (rec["state"], rec["reason_class"], rec["occurrence_id"]) == ("refused", "transient", self.oid), rec
+            assert self.env.launcher.usage(key).actions == 0
             return
         assert rec is not None and rec["state"] == "refused" and rec["reason"] == REFUSED
         assert self.env.launcher.usage(key).actions == 0      # a refusal before the mint spends nothing
@@ -580,7 +587,7 @@ def test_a_member_with_no_upload_and_an_upload_with_no_member_are_each_refused(w
     with pytest.raises(L.LauncherRefused) as exc:
         w.launch(sock, key, parts.workspace())
     assert cause(exc.value) == "no-upload"
-    w.assert_nothing_staged(key, tombstone=False)       # no upload here: the key may be another connection's
+    w.assert_nothing_staged(key, tombstone="transient")  # no upload here: never standing, the key may be another's
     key2 = w.key()
     sock, _ = w.upload(key2, parts)
     with pytest.raises(L.LauncherRefused) as exc:
@@ -596,7 +603,8 @@ def test_an_upload_begun_on_another_connection_is_not_this_launchs(w, tmp_path):
     with pytest.raises(L.LauncherRefused) as exc:
         w.launch(w.env.connect(), key, parts.workspace())
     assert cause(exc.value) == "no-upload" and key in w.uploads._ups      # A's upload is not B's to take, nor to drop
-    assert w.env.launcher.index.get(key) is None                          # nor to poison (gemini HIGH 1, codex MED 2)
+    rec = w.env.launcher.index.get(key)                                   # nor to poison (gemini HIGH 1, codex MED 2):
+    assert (rec["state"], rec["reason_class"]) == ("refused", "transient")  # B's zero-usage record, which A's spawn retakes
     child = w.launch(holder, key, parts.workspace())                       # A's own LAUNCH still stages
     assert child.session == "sess-1" and w.staged.read_bytes() == parts.bundle
     assert w.env.launcher.index.get(key)["state"] == "started"
@@ -626,7 +634,9 @@ def test_a_transient_refusal_leaves_no_upload_and_the_same_connection_retries(w,
     # the message states what the gate counts (spares beyond the operator's and other dispatches'), not "one marked + one spare"
     assert "spare slot" in _NO_FREE_SLOT_DETAIL and "kept for the operator" in _NO_FREE_SLOT_DETAIL and "other dispatches" in _NO_FREE_SLOT_DETAIL
     assert "marked slot plus" not in _NO_FREE_SLOT_DETAIL and not any(c.isdigit() for c in _NO_FREE_SLOT_DETAIL)
-    assert w.uploads._ups == {} and w.env.launcher.index.get(key) is None   # nothing pinned, nothing tombstoned
+    assert w.uploads._ups == {}                                           # nothing pinned
+    rec = w.env.launcher.index.get(key)                                   # the zero-usage record, retakable (r2 L2)
+    assert (rec["state"], rec["reason_class"], rec["occurrence_id"]) == ("refused", "transient", w.oid), rec
     w.env.pool = True
     assert w.send(sock, "WSBEGIN", **C.ws_begin_to_wire(key, parts.manifest_bytes, parts.bundle))["ok"]
     assert all(a["ok"] for a in w.chunks(sock, key, parts))
@@ -641,7 +651,9 @@ def test_a_launch_of_another_key_ends_this_connections_upload(w, tmp_path):
     sock, _ = w.upload(k1, parts)
     ans = w.raw_launch(sock, k2, None)                                     # bytes for k1, a launch of k2 with none
     assert ans["refused"] == REFUSED and ans["detail"].startswith("upload-without-workspace")
-    assert w.uploads._ups == {} and w.env.launcher.index.get(k2) is None and w.env.launcher.index.get(k1) is None
+    assert w.uploads._ups == {} and w.env.launcher.index.get(k1) is None  # the upload's key is not the launch's
+    rec = w.env.launcher.index.get(k2)                                    # the launch's: zero-usage, retakable (r2 A2)
+    assert (rec["state"], rec["reason_class"]) == ("refused", "transient"), rec
     sock2, _ = w.upload(k1, parts)
     ans = w.raw_launch(sock2, k3, parts.workspace())                       # bytes for k1, a launch of k3 naming one
     assert ans["refused"] == REFUSED and ans["detail"].startswith("no-upload") and w.uploads._ups == {}
@@ -681,7 +693,7 @@ def test_a_full_scratch_is_transient_and_the_key_stays_launchable(w, tmp_path, m
         w.launch(sock, key, parts.workspace())
     assert (exc.value.name, exc.value.reason_class) == (REFUSED, "transient")
     assert exc.value.detail.startswith("scratch-unavailable")
-    w.assert_nothing_staged(key, tombstone=False)
+    w.assert_nothing_staged(key, tombstone="transient")
     monkeypatch.undo()
     sock, _ = w.upload(key, parts)                                         # the host recovered: the SAME key launches
     assert w.launch(sock, key, parts.workspace()).session == "sess-1" and w.staged.read_bytes() == parts.bundle
@@ -696,7 +708,7 @@ def test_an_unsafe_scratch_parent_is_transient_not_a_tombstone(w, tmp_path):
     with pytest.raises(L.LauncherRefused) as exc:
         w.launch(sock, key, parts.workspace())
     assert exc.value.reason_class == "transient" and exc.value.detail.startswith("readset-workdir")
-    w.assert_nothing_staged(key, tombstone=False)
+    w.assert_nothing_staged(key, tombstone="transient")
     os.chmod(scratch, 0o700)
     sock, _ = w.upload(key, parts)
     assert w.launch(sock, key, parts.workspace()).session == "sess-1"

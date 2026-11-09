@@ -13,8 +13,8 @@ uid's client (:mod:`levain.agents.session_client`, wire ``levain-run/1``) on a u
   (bounded, in order, base64) of the canonical snapshot manifest and the git bundle. After the authority check and
   before the pool check or any mint, the LAUNCH verifies the upload (hash identity: the server re-derives the commit and
   the object count from the manifest, ingests the bundle in a scratch clone, binds the repo-layer loosening check) and
-  refuses ``session_refused:workspace`` on any mismatch, with nothing staged (and a zero-usage ``refused`` record only
-  for a standing refusal of this connection's own upload for the key); the slot runtime later writes the verified bytes
+  refuses ``session_refused:workspace`` on any mismatch, with nothing staged and a zero-usage ``refused`` record (standing
+  for a standing refusal of this connection's own upload for the key, transient for any other); the slot runtime later writes the verified bytes
   to ``staging/repo.bundle``. One upload per connection (a WSBEGIN replaces the earlier one); the LAUNCH, whatever its
   outcome, and the connection ending drop whatever the stager did not take.
 * **RELEASE re-runs** :func:`verify_point_of_use` with the LAUNCH's proof and exposure: a link that expired, was revoked
@@ -682,17 +682,28 @@ class RunServer:
             if mine is not None:
                 raise C.WireError("one launch per connection")
             try:
-                claims = self._claims(req, bar=True)
+                # the launch first (it reads neither claim), so every refusal after it names the key it refuses
                 launch, proof = C.launch_from_wire({k: v for k, v in req.items() if k not in ("ledger_head", "bar")})
                 try:
+                    claims = self._claims(req, bar=True)
                     grant = self._verify(proof, launch.exposure, claims)
                     launch = self._priced(launch, grant)
                     launch = self._workspace_of(launch, owner, proof, grant)
                     self._pool()
-                except WS.WorkspaceRefused:
-                    raise               # the workspace judgment records its own refusals (``_workspace_of``)
+                except WS.WorkspaceRefused as exc:
+                    # standing only for a refusal of this connection's own upload (``exc.tombstone``); any other is
+                    # recorded transient, so the same occurrence retakes the key (L3 w3client r2 A2, deepseek)
+                    self._refuse_unspawned(launch, exc, reason_class=None if exc.tombstone else "transient")
+                    raise
                 except LauncherRefused as exc:
                     self._refuse_unspawned(launch, exc)
+                    raise
+                except C.WireError as exc:      # the frame's claims off the wire: answered ``bad-request`` below
+                    self._refuse_unspawned(launch, LauncherRefused("bad-request", str(exc)))
+                    raise
+                except Exception as exc:  # noqa: BLE001 - answered ``internal-error``: nothing was spawned either
+                    self._refuse_unspawned(launch, LauncherRefused("internal-error", type(exc).__name__,
+                                                                   reason_class="transient"))
                     raise
                 holder = self._spawn(launch, proof, claims)
             finally:
@@ -797,11 +808,12 @@ class RunServer:
     def _workspace_of(self, launch: Any, owner: Optional[WS.UploadOwner], proof: Any = None, grant: Any = None) -> Any:
         """The LAUNCH's workspace judgment, after the authority check and before the pool check or any mint: the launch
         itself when it names none and no upload exists; the launch with its member's ``manifest_digest`` filled by the
-        server's own derivation when the upload verifies; else ``session_refused:workspace``. Only a standing refusal of
-        the upload THIS connection holds for the key (``exc.tombstone``) is recorded as the zero-usage ``refused``
-        tombstone (:meth:`RealLauncher.refuse_key`), so the fire's usage read settles at nothing; a refusal for no
-        upload here, a foreign one, or a transient host failure writes nothing, as a pool refusal writes nothing, so
-        it never poisons another connection's upload or a retry (L3 w1srv r1, gemini HIGH 1, codex MED 2 and 4)."""
+        server's own derivation when the upload verifies; else ``session_refused:workspace``. The LAUNCH records every
+        such refusal as the zero-usage ``refused`` tombstone, so the fire's usage read settles at nothing. Only a
+        standing refusal of the upload THIS connection holds for the key (``exc.tombstone``) is recorded standing; a
+        refusal for no upload here, a foreign one, or a transient host failure is recorded transient, which the same
+        occurrence's retry retakes, so it never poisons another connection's upload or a retry (L3 w1srv r1, gemini
+        HIGH 1, codex MED 2 and 4; L3 w3client r2 A2, deepseek)."""
         try:
             if self._uploads is None:
                 if launch.workspace is None:
@@ -811,9 +823,6 @@ class RunServer:
                                       launch.workspace, signed_withhold=lambda: self._signed_withhold(proof, grant))
         except WS.WorkspaceRefused as exc:
             _log.warning("workspace refused for %s: %s", launch.session_key, exc.cause)
-            refuse = getattr(self.launcher, "refuse_key", None)
-            if exc.tombstone and refuse is not None:
-                refuse(launch.session_key, WS.WORKSPACE_REFUSAL, occurrence_id=launch.occurrence_id)
             raise
         return launch if ws is None else dataclasses.replace(launch, workspace=ws)
 
@@ -988,18 +997,21 @@ class RunServer:
         if not free:
             raise LauncherRefused("no-free-slot", _NO_FREE_SLOT_DETAIL, reason_class="transient")
 
-    def _refuse_unspawned(self, launch: Any, exc: LauncherRefused) -> None:
+    def _refuse_unspawned(self, launch: Any, exc: LauncherRefused, *, reason_class: Optional[str] = None) -> None:
         """A LAUNCH refused before the launcher was asked to spawn started nothing: record its key as the zero-usage
         ``refused`` tombstone (:meth:`RealLauncher.refuse_key`), so the fire's usage read settles at nothing instead
         of at the caps (L3 w3client r1, codex HIGH 1). Not for a key a live holder holds (its spawn writes the record),
-        and only where the key holds no record. A transient refusal stays retakable by the same occurrence."""
+        and only where the key holds no record. A transient refusal stays retakable by the same occurrence;
+        ``reason_class`` records the refusal under another class than its own (a workspace refusal that is not this
+        connection's to make standing)."""
         refuse = getattr(self.launcher, "refuse_key", None)
         if refuse is None:
             return
         with self._mu:
             if launch.session_key in self._live:
                 return
-        refuse(launch.session_key, exc.name, occurrence_id=launch.occurrence_id, reason_class=exc.reason_class)
+        refuse(launch.session_key, exc.name, occurrence_id=launch.occurrence_id,
+               reason_class=reason_class or exc.reason_class)
 
     # -- holders -----------------------------------------------------------------------------------------------------
 
@@ -1209,6 +1221,8 @@ class RunServer:
 #: loop waits this long and accepts again
 _ACCEPT_RETRY = frozenset({errno.EMFILE, errno.ENFILE, errno.ECONNABORTED, errno.EINTR, errno.ENOBUFS, errno.ENOMEM})
 _ACCEPT_BACKOFF_S = 0.1
+#: a run of retried accept errors logs its first and then every this many (L3 w3client r2 L1, complement)
+_ACCEPT_LOG_EVERY = 100
 
 
 def serve(server: RunServer, listener: socket.socket, stop: threading.Event) -> None:
@@ -1216,6 +1230,7 @@ def serve(server: RunServer, listener: socket.socket, stop: threading.Event) -> 
     listeners) exits and the service manager starts it again, never one socket dead beside a live one (L3 w3client
     r1, codex MED 3)."""
     listener.settimeout(0.5)
+    retried = 0                         # retried accept errors since the last accept that returned a connection
     while not stop.is_set():
         try:
             conn, _ = listener.accept()
@@ -1223,12 +1238,17 @@ def serve(server: RunServer, listener: socket.socket, stop: threading.Event) -> 
             continue
         except OSError as exc:
             if exc.errno in _ACCEPT_RETRY:
+                retried += 1
+                if retried % _ACCEPT_LOG_EVERY == 1 or _ACCEPT_LOG_EVERY == 1:
+                    print(f"levain dispatch-run: accept failed ({type(exc).__name__}: {exc}); retrying "
+                          f"(retry {retried} of this run)", file=sys.stderr, flush=True)
                 stop.wait(_ACCEPT_BACKOFF_S)
                 continue
             print(f"levain dispatch-run: accept failed ({type(exc).__name__}: {exc}); stopping for a restart",
                   file=sys.stderr, flush=True)
             stop.set()
             return
+        retried = 0
         threading.Thread(target=server.handle, args=(conn,), daemon=True).start()
 
 

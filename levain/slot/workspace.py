@@ -93,8 +93,10 @@ class WorkspaceRefused(LauncherRefused):
     full disk, the scratch directory, git that could not run).
 
     ``tombstone`` is set by :meth:`WorkspaceUploads.verify` only for a STANDING refusal of an upload the LAUNCH's own
-    connection holds for the LAUNCH's own key: only then is the key this connection's to spend (L3 w1srv r1, gemini
-    HIGH 1 / codex MED 2: a foreign connection's LAUNCH must not poison another's in-flight upload)."""
+    connection holds for the LAUNCH's own key: only then is the key this connection's to spend, and the run server
+    records the refusal standing (L3 w1srv r1, gemini HIGH 1 / codex MED 2: a foreign connection's LAUNCH must not
+    poison another's in-flight upload). Every other workspace refusal it records transient, which the same occurrence
+    retakes, so the refused fire still settles at zero (L3 w3client r2 A2)."""
 
     def __init__(self, cause: str, detail: str = "", *, reason_class: str = "standing") -> None:
         self.cause = cause
@@ -103,7 +105,7 @@ class WorkspaceRefused(LauncherRefused):
 
 
 #: Read-set refusals that name the HOST, not the bytes (git could not run or passed its timeout, the scratch parent or
-#: workdir, the copy's deadline): transient, so no tombstone (L3 w1srv r1, codex MED 4 / deepseek MED 2).
+#: workdir, the copy's deadline): transient, so never a standing tombstone (L3 w1srv r1, codex MED 4 / deepseek MED 2).
 #: ``readset-git-failed`` stays standing: a clone that fails on a damaged pack and one that fails on a full disk are
 #: the same answer from git (known edge).
 _TRANSIENT_READSET = frozenset({"readset-git-unavailable", "readset-workdir", "readset-handoff-raced"})
