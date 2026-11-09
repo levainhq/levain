@@ -213,6 +213,13 @@ def test_the_first_block_in_body_order_is_named_across_positions(body, name):
     assert _check(AM, body, dispatch=True) == name
 
 
+def test_two_known_costs_from_the_unscoped_scan_are_named_in_body_order():
+    """L3 r2 codex: the unscoped type scan read siblings last-first, so the later of two known costs was named."""
+    body = {"max_tokens": 10, "system": [{"type": "document", "source": {"type": "text", "data": "x"}}],
+            "messages": [{"role": "user", "content": [{"type": "container_upload", "file_id": "f"}]}]}
+    assert _check(AM, body, dispatch=True) == "body-unbounded:document"
+
+
 def test_an_unjudged_block_in_an_earlier_position_does_not_hide_a_later_known_cost():
     body = {"max_tokens": 10, "system": [{"type": "bad_sys"}],
             "messages": [{"role": "user", "content": [{"type": "advisor_tool_result", "tool_use_id": "a"}]}]}

@@ -401,9 +401,9 @@ class Codec:
                 t = v.get("type")
                 if isinstance(t, str):
                     out.append(t)
-                stack.extend(v.values())
+                stack.extend(reversed(list(v.values())))   # pushed reversed, so the body is read in the order it was sent
             elif isinstance(v, list):
-                stack.extend(v)
+                stack.extend(reversed(v))
         return out
 
     # -- the ceiling ---------------------------------------------------------------------------------------------
@@ -1212,8 +1212,9 @@ class OpenAIResponses(_OpenAI):
         return super()._block_type(b, p)
 
     def _block_fault(self, t: str, b: Mapping[str, Any]) -> Optional[str]:
-        """A tool search is admitted only when it says it ran on the client; a server run (or one that does not say) is a
-        provider-side tool run, and its output is that run's history."""
+        """A tool search CALL is admitted only when it says it ran on the client (a server run, or one that does not say, is
+        a provider-side tool run). Its OUTPUT is refused when it names a server run; an output that names no run is
+        admitted (design A4), because what it carries is its tools[], each judged by the tool allowlist and counted."""
         if t == "tool_search_call" and b.get("execution") != "client":
             return "unbounded"
         if t == "tool_search_output" and "execution" in b and b.get("execution") != "client":
