@@ -477,7 +477,7 @@
     var FACE_WORDS = { dictate: "Dictate", "dictate-stop": "Stop dictating", mic: "Mic", "mic-stop": "Stop mic" };
     function face(b, kind, title) {
       if (root.LevainVoiceIcons) { root.LevainVoiceIcons.set(b, kind, null, title); return; }
-      b.textContent = FACE_WORDS[kind]; b.setAttribute("aria-label", FACE_WORDS[kind]); b.setAttribute("title", title || FACE_WORDS[kind]);
+      b.textContent = FACE_WORDS[kind]; b.classList.add("voice-words"); b.setAttribute("aria-label", FACE_WORDS[kind]); b.setAttribute("title", title || FACE_WORDS[kind]);
     }
     var micB = null, rec = null;
     if (Speech) {

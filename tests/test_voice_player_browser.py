@@ -171,7 +171,7 @@ def test_autoplay_waits_for_the_setting_the_mount_the_page_and_a_tap(tmp_path, m
         {"eval": "(() => { Object.defineProperty(document, 'hidden', {configurable: true, get: () => true}); const r = LevainVoice.replyFinished({thread: 't1', gseq: 8, text: 'e'}); Object.defineProperty(document, 'hidden', {configurable: true, get: () => false}); return r; })()"},  # 8 hidden
         {"eval": "LevainVoice.replyFinished({thread: 't1', gseq: 9, text: 'nine'})"},                                       # 9 tap (locked)
         {"eval": "JSON.stringify([window.__spoken, %s.length])" % SPEAK_CALLS},                                          # 10 nothing read yet
-        {"eval": "(() => { const w = LevainVoice.button({thread: 't1', gseq: 9, text: 'nine'}); return w.querySelector('button').getAttribute('aria-label'); })()"},  # 11
+        {"eval": "(() => { const w = LevainVoice.button({thread: 't1', gseq: 9, text: 'nine'}); const b = w.querySelector('button'); return JSON.stringify([b.getAttribute('aria-label'), b.getAttribute('title'), b.getAttribute('data-voice-icon'), b.querySelectorAll('svg[data-voice-shape=play]').length, b.textContent, b.getAttribute('aria-pressed')]); })()"},  # 11
         {"eval": "(async () => { LevainVoice.unlock(); await new Promise((r) => setTimeout(r, 100)); return LevainVoice.isUnlocked(); })()"},  # 12
         {"eval": "LevainVoice.replyFinished({thread: 't1', gseq: 10, text: 'ten'})"},                                    # 13 play
         {"eval": "JSON.stringify(window.__spoken)"},                                                                     # 14
@@ -179,7 +179,7 @@ def test_autoplay_waits_for_the_setting_the_mount_the_page_and_a_tap(tmp_path, m
     ], _fixture())
     assert v[3] == "off" and v[5] == "backlog" and v[6] == "backlog" and v[7] == "seen" and v[8] == "hidden" and v[9] == "tap", v[3:10]
     assert json.loads(v[10]) == [[], 0], v[10]
-    assert v[11] == "Tap to hear", v[11]
+    assert json.loads(v[11]) == ["Tap to hear", "Tap to hear", "play", 1, "", None], v[11]    # the tap state: the play icon, named, no words
     assert v[12] is True and v[13] == "play", v[12:14]
     assert json.loads(v[14]) == ["ten"], v[14]
     assert json.loads(v[15]) == [], v[15]

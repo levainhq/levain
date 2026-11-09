@@ -397,7 +397,7 @@
   function face(b, state, tapWords) {
     const words = state === "stop" ? WORDS.stop : (state === "tap" ? (tapWords || WORDS.tap) : WORDS.play);
     if (window.LevainVoiceIcons) { window.LevainVoiceIcons.set(b, state === "stop" ? "stop" : "play", words); return; }
-    b.textContent = words; b.setAttribute("aria-label", words); b.setAttribute("title", words);
+    b.textContent = words; b.classList.add("voice-words"); b.setAttribute("aria-label", words); b.setAttribute("title", words);
   }
 
   // The per-reply control: one icon button, Play / Stop / Tap to hear, and a line for a fixed sentence about that reply.
@@ -413,7 +413,6 @@
     const paint = () => {
       const mine = playing && key(playing) === k;
       face(b, mine ? "stop" : (tapNeeded.has(k) ? "tap" : "play"));
-      b.setAttribute("aria-pressed", mine ? "true" : "false");
       const m = messages.get(k) || "";
       note.textContent = m; note.hidden = !m;
     };

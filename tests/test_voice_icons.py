@@ -26,7 +26,8 @@ from tests.test_voice_room_hook import A, SETTINGS, _room, _run, _set, _to_room
 AUDIT = """(() => {
   const all = [...document.querySelectorAll('%s')];
   return JSON.stringify(all.filter((b) => !b.hidden).map((b) => ({
-    cls: b.className, label: b.getAttribute('aria-label'), title: b.getAttribute('title'), svg: b.querySelectorAll('svg').length,
+    cls: b.className, label: b.getAttribute('aria-label'), title: b.getAttribute('title'), svg: b.querySelectorAll('svg').length, pressed: b.getAttribute('aria-pressed'),
+    shape: (b.querySelector('svg') || document.body).getAttribute('data-voice-shape'),
     words: b.textContent.trim() })));
 })()"""
 SELECTOR = ".card-mic, .voice-btn, .rv-mic"
@@ -107,6 +108,9 @@ def test_a_card_reply_boxs_voice_controls_are_icons_on_one_row_with_send(tmp_pat
     assert {"Play", "Dictate", "Mic"} <= names, audit
     for b in audit:
         assert b["svg"] == 1 and b["words"] == "" and b["label"] and b["title"], b      # an icon, named, no words
+        assert b["pressed"] is None, b                       # the name swaps with the state, so no pressed state beside it
+    shapes = {b["label"]: b["shape"] for b in audit}
+    assert shapes["Dictate"] == "microphone" and shapes["Mic"] == "waveform" and shapes["Play"] == "play", shapes
     row = json.loads(out["values"][-1])
     assert len(row["mics"]) == 2, row
     for m in row["mics"]:                                    # one row with the send button: same band, mic left of send
@@ -131,25 +135,28 @@ def test_the_rooms_voice_controls_are_icons_and_stay_in_the_composer(tmp_path, q
     audit = json.loads(v[-2])
     assert {"Play", "Dictate", "Mic"} <= {b["label"] for b in audit}, audit
     for b in audit:
-        assert b["svg"] == 1 and b["words"] == "" and b["label"] and b["title"], b
+        assert b["svg"] == 1 and b["words"] == "" and b["label"] and b["title"] and b["pressed"] is None, b
+    assert {b["label"]: b["shape"] for b in audit}["Dictate"] == "microphone", audit
     assert json.loads(v[-1]) == [True, True], v[-1]
 
 
 @needs_browser
 def test_a_state_change_swaps_the_icon_and_the_accessible_name_not_words(tmp_path, qdir) -> None:
-    """Red with: a toggle in mic.js or room_view.js writing textContent again (words come back, the label goes stale)."""
+    """Red with: a toggle in mic.js or room_view.js writing textContent again (words come back, the label goes stale), or the
+    `aria-pressed` line back in voice_icons.js set() (the swapped name is announced twice), or the `announce` call out of set()
+    (the polite status node says nothing on start or stop)."""
     v = _run(tmp_path, qdir, [
         _phone(430), _set(_room("t1", *A)), _to_room(),
         {"until": "document.querySelector('.rv-mic-stream') && !document.querySelector('.rv-mic-stream').hidden", "ms": 20000},
         {"eval": "const b = document.querySelector('.rv-mic-stream'); b.click(); 1"},
         {"until": "document.querySelector('.rv-mic-stream').getAttribute('aria-label') === 'Stop mic'", "ms": 20000},
-        {"eval": "(() => { const b = document.querySelector('.rv-mic-stream'); return JSON.stringify([b.getAttribute('aria-label'), b.getAttribute('aria-pressed'), b.getAttribute('data-voice-icon'), b.textContent, b.querySelectorAll('svg').length]); })()"},
+        {"eval": "(() => { const b = document.querySelector('.rv-mic-stream'); return JSON.stringify([b.getAttribute('aria-label'), b.getAttribute('aria-pressed'), b.getAttribute('data-voice-icon'), b.textContent, b.querySelectorAll('svg').length, (document.getElementById('levain-voice-status') || {textContent: null}).textContent]); })()"},
         {"eval": "document.querySelector('.rv-mic-stream').click(); 1"},
         {"until": "document.querySelector('.rv-mic-stream').getAttribute('aria-label') === 'Mic'", "ms": 20000},
-        {"eval": "(() => { const b = document.querySelector('.rv-mic-stream'); return JSON.stringify([b.getAttribute('aria-label'), b.getAttribute('aria-pressed'), b.getAttribute('data-voice-icon'), b.textContent, b.querySelectorAll('svg').length]); })()"},
+        {"eval": "(() => { const b = document.querySelector('.rv-mic-stream'); return JSON.stringify([b.getAttribute('aria-label'), b.getAttribute('aria-pressed'), b.getAttribute('data-voice-icon'), b.textContent, b.querySelectorAll('svg').length, (document.getElementById('levain-voice-status') || {textContent: null}).textContent]); })()"},
     ], init_extra=_fake())
-    assert json.loads(v[-4]) == ["Stop mic", "true", "mic-stop", "", 1], v[-4]
-    assert json.loads(v[-1]) == ["Mic", "false", "mic", "", 1], v[-1]
+    assert json.loads(v[-4]) == ["Stop mic", None, "mic-stop", "", 1, "Mic on"], v[-4]
+    assert json.loads(v[-1]) == ["Mic", None, "mic", "", 1, "Stopped"], v[-1]
 
 
 SIGN_ROW = """(() => {
@@ -183,3 +190,62 @@ def test_a_signed_cards_write_in_row_spans_the_card_and_sign_and_sheet_share_the
     assert abs(words["t"] - sheet["t"]) <= 2 and words["r"] <= sheet["l"], row         # sign my words | open the sheet, one row
     assert words["t"] >= box["b"] - 1, row                                             # under the box row, not beside it
     assert row["sw"] <= row["vw"], row
+
+
+@needs_browser
+def test_every_kind_announces_its_state_in_one_polite_status_node_and_the_first_draw_is_silent(tmp_path, qdir) -> None:
+    """Red with: the `if (before && before !== kind) announce(...)` line of voice_icons.js removed (no node), or its `before`
+    test dropped (a first draw says "Stopped" out of nowhere), or a second node made per call (two ids)."""
+    v = _run(tmp_path, qdir, [
+        _phone(430), _set(_room("t1", *A)), _to_room(),
+        {"until": "window.LevainVoiceIcons && 1"},
+        {"eval": "(() => { window.__b = document.createElement('button'); document.body.appendChild(window.__b); const V = window.LevainVoiceIcons;"
+                 " const say = () => { const n = document.getElementById('levain-voice-status'); return n ? n.textContent : null; };"
+                 " const out = [];"
+                 " V.set(window.__b, 'dictate'); out.push(say());"                      # first draw: nothing said
+                 " V.set(window.__b, 'dictate-stop'); out.push(say());"
+                 " V.set(window.__b, 'dictate'); out.push(say());"
+                 " V.set(window.__b, 'mic'); V.set(window.__b, 'mic-stop'); out.push(say());"
+                 " V.set(window.__b, 'mic'); out.push(say());"
+                 " V.set(window.__b, 'play'); V.set(window.__b, 'stop'); out.push(say());"
+                 " V.set(window.__b, 'stop'); out.push(say());"                         # a redraw in the same state: unchanged
+                 " V.set(window.__b, 'play'); out.push(say());"
+                 " const n = document.querySelectorAll('#levain-voice-status');"
+                 " out.push([n.length, n[0].getAttribute('role'), n[0].getAttribute('aria-live')]);"
+                 " return JSON.stringify(out); })()"},
+    ], init_extra=_fake())
+    got = json.loads(v[-1])
+    assert got[:8] == [None, "Dictating", "Stopped", "Mic on", "Stopped", "Playing", "Playing", "Stopped"], got
+    assert got[8] == [1, "status", "polite"], got
+
+
+@needs_browser
+@pytest.mark.parametrize("width", WIDTHS)
+def test_without_the_icon_module_the_voice_words_are_named_and_sit_in_a_padded_pill(tmp_path, monkeypatch, width) -> None:
+    """The fallback with /voice_icons.js answering 404. Red with: the `voice-words` class dropped from the fallback `face()` in
+    mic.js (the words land in a padding:0 pill and touch its edges), or the `.voice-words` padding rule in dashboard.css removed."""
+    from levain import web_server
+    monkeypatch.delitem(web_server._ASSETS, "/voice_icons.js")
+    _card(tmp_path, monkeypatch, False)
+    _root, src, _ids = _install(tmp_path)
+    mic = "document.querySelector('#levain-modal .card-mic-stream')"
+    pad = ("JSON.stringify([...document.querySelectorAll('#levain-modal .card-mic, #levain-modal .voice-btn')].filter((b) => !b.hidden)"
+           ".map((b) => { const c = getComputedStyle(b); return [b.className, c.paddingLeft, c.paddingRight, b.getBoundingClientRect().height]; }))")
+    with _serve(src, surface_tokens={"browser": "T"}, install_class="reported") as (url, _h):
+        out = _drive(tmp_path, f"{url}/#write_token=T", [
+            _phone(width), {"init": _fake()},
+            {"until": "[...document.querySelectorAll('#ck-needs .needs-question')].length === 1", "ms": 30000},
+            {"eval": "[...document.querySelectorAll('#ck-needs .needs-question')][0].click(); 1"},
+            {"until": f"{mic} && !{mic}.hidden && document.querySelector('#levain-modal .voice-btn') && 1", "ms": 30000},
+            {"eval": "String(window.LevainVoiceIcons)"},
+            {"eval": AUDIT % "#levain-modal .card-mic, #levain-modal .voice-btn"},
+            {"eval": pad},
+        ])
+    assert out["values"][-3] == "undefined", out["values"][-3]          # the module really was absent
+    audit = json.loads(out["values"][-2])
+    assert {"Play", "Dictate", "Mic"} <= {b["label"] for b in audit}, audit
+    for b in audit:
+        assert b["label"] and b["words"] and b["svg"] == 0, b           # named, and the words are the button
+    for cls, left, right, height in json.loads(out["values"][-1]):
+        assert left != "0px" and right != "0px", (cls, left, right)     # the words do not touch the pill's edges
+        assert height <= 60, (cls, height)                              # a single line, not a wrapped tall pill

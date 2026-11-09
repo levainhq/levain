@@ -2953,7 +2953,7 @@ body.ke[data-mode="build"] .th-zone .zone-head { display: flex; }   /* titled li
 .rv .rv-mic, .rv .rv-rotate, .rv .rv-card button { min-height: var(--hit-min, 44px); padding: var(--sp-2) var(--sp-5); border-radius: var(--r-pill); cursor: pointer; font: var(--fw-semibold) var(--fs-meta)/1 var(--sans); background: none; color: var(--text); border: 1px solid var(--hair-2); }
 .rv .rv-mic { align-self: flex-end; border-color: transparent; color: var(--label); display: inline-flex; align-items: center; justify-content: center; flex: none; min-width: var(--hit-min, 44px); padding: 0; }
 .rv .rv-mic[hidden] { display: none; }
-.rv .rv-mic[aria-pressed="true"] { color: var(--accent); }
+.rv .rv-mic[data-voice-icon$="stop"] { color: var(--accent); }
 .rv .rv-rotate { min-width: var(--hit-min, 44px); margin-left: auto; }
 .rv button:disabled { opacity: .45; cursor: not-allowed; }
 .rv button:focus-visible { outline: 2px solid var(--accent-line); outline-offset: 2px; }
@@ -3685,7 +3685,9 @@ a.nc-pick.is-rec:hover { border-color: var(--text); }
 .voice-btn[hidden], .card-mic[hidden] { display: none; }
 .undo-btn.card-mic::before { content: none; }
 .voice-icon { flex: none; display: block; }
-.voice-btn[aria-pressed="true"], .card-mic[aria-pressed="true"] { color: var(--accent); border-color: var(--accent-line); }
+.voice-btn:is([data-voice-icon="stop"], [data-voice-icon$="-stop"]), .card-mic:is([data-voice-icon="stop"], [data-voice-icon$="-stop"]) { color: var(--accent); border-color: var(--accent-line); }
+/* no icon module: the words are the button, in a pill that fits them */
+.voice-btn.voice-words, body button.card-mic.card-mic.voice-words, .rv .rv-mic.voice-words { padding: 0 var(--sp-4); white-space: nowrap; }
 .card-voice-large .voice-btn { min-width: 64px; min-height: 64px; }
 .card-voice-large .voice-icon { width: 30px; height: 30px; }
 .voice-row { display: flex; flex-wrap: nowrap; align-items: center; justify-content: flex-end; gap: var(--sp-3); min-width: 0; }

@@ -347,7 +347,7 @@
   var FACE_WORDS = { dictate: "Dictate", "dictate-stop": "Stop dictating", mic: "Mic", "mic-stop": "Stop mic" };
   function face(b, kind) {
     if (window.LevainVoiceIcons) { window.LevainVoiceIcons.set(b, kind); return; }
-    b.textContent = FACE_WORDS[kind]; b.setAttribute("aria-label", FACE_WORDS[kind]); b.setAttribute("title", FACE_WORDS[kind]);
+    b.textContent = FACE_WORDS[kind]; b.classList.add("voice-words"); b.setAttribute("aria-label", FACE_WORDS[kind]); b.setAttribute("title", FACE_WORDS[kind]);
   }
 
   var insts = [];                            // every attach() still in use: a capture started in one box ends the others'
