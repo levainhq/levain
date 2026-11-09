@@ -122,3 +122,47 @@ def test_a_hint_names_the_store_a_bare_command_would_miss(homes, capsys):
     assert code == 1 and f"levain coord status --queue-dir {consent} says why" in err
     code, out, err = _run(capsys, "import-status", str(board / "absent.md"), "--token", str(token + 1))
     assert code == 1 and f"levain coord status --queue-dir {board} shows the live one" in err
+
+
+def test_a_store_a_drop_made_holds_no_coordinator(homes, capsys):
+    """A phone or cockpit drop makes the consent store's tables. With the board's coordinator released, that store does
+    not make the bare verbs ambiguous: they still reach the board's."""
+    from levain.coordinator.store import CoordStore
+    consent, board = homes
+    token = _json(capsys, "take")["token"]
+    _json(capsys, "release", "--token", str(token), "--by", "coordinator")
+    CoordStore(consent).accept_drop("from the couch", surface="phone")
+    assert CoordStore(consent).coordinator_present() and not CoordStore(consent).holds_coordinator()
+    assert _json(capsys, "agent", "none")["agent"] == "none"
+    assert _json(capsys, "status")["setting"]["agent"] == "none"
+    assert _json(capsys, "status", "--queue-dir", str(board))["setting"]["agent"] == "none"
+    assert not CoordStore(consent).holds_coordinator()
+
+
+def test_a_stale_token_in_both_stores_is_refused_by_name(homes, capsys):
+    """A token both stores hold that neither current lease uses is the "in both" refusal, never a fall-through to
+    whichever store is live."""
+    consent, board = homes
+    for qdir in (consent, board):
+        first = _json(capsys, "take", "--queue-dir", str(qdir))["token"]
+        _json(capsys, "release", "--token", str(first), "--by", "coordinator")
+        _json(capsys, "take", "--queue-dir", str(qdir))
+    code, out, err = _run(capsys, "beat", "--token", str(first))
+    assert code == 1 and f"token {first} is in both {consent} and {board}" in err
+
+
+def test_the_refusal_says_unknown_for_a_store_that_cannot_be_read(homes, capsys, monkeypatch):
+    """An older-format store's liveness is not guessed: the refusal says it is unknown."""
+    consent, board = homes
+    _json(capsys, "agent", "none")
+    _json(capsys, "agent", "none", "--queue-dir", str(board))
+    from levain.coordinator import store as store_mod
+    real = store_mod.CoordStore.open_readonly
+
+    def unreadable(self, *a, **k):
+        if self.directory == consent:
+            raise store_mod.StoreAbsent("older format")
+        return real(self, *a, **k)
+    monkeypatch.setattr(store_mod.CoordStore, "open_readonly", unreadable)
+    code, out, err = _run(capsys, "status")
+    assert code == 1 and "unknown whether one is live in " + str(consent) in err

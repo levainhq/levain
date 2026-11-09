@@ -735,11 +735,10 @@ class CoordStore:
             raise
         return conn
 
-    def coordinator_present(self) -> bool:
-        """Whether a coordinator store is here, read without making or migrating anything: the directory rule read
-        with ``lstat``, the file opened ``mode=ro`` and ``query_only``, True when it holds the coordinator's
-        ``threads`` table (an older format still counts: a writer brings it current). False for no directory, no file,
-        or a dispatch-only file; a directory that breaks the rule raises, as every opener's does."""
+    def _read_existing(self, sql_for) -> bool:
+        """The read-only look behind :meth:`coordinator_present` and :meth:`holds_coordinator`: False for no directory
+        or no file, else ``sql_for(names)`` run on a ``query_only`` connection (names: the tables in the file). The
+        directory rule is read with ``lstat``; one that breaks it raises, as every opener's does."""
         try:
             self._check_directory_readonly()
         except StoreAbsent:
@@ -759,9 +758,29 @@ class CoordStore:
             raise
         try:
             conn.execute("PRAGMA query_only = ON")
-            return "threads" in _names(conn)
+            return bool(sql_for(conn, _names(conn)))
         finally:
             conn.close()
+
+    def coordinator_present(self) -> bool:
+        """Whether a coordinator store is here, read without making or migrating anything: True when the file holds
+        the coordinator's ``threads`` table (an older format still counts: a writer brings it current). False for no
+        directory, no file, or a dispatch-only file. A drop makes that table too, so this says a store can take a
+        drop, not that a coordinator was ever in it (:meth:`holds_coordinator`)."""
+        return self._read_existing(lambda conn, names: "threads" in names)
+
+    def holds_coordinator(self) -> bool:
+        """Whether a coordinator was ever in this store, read as :meth:`coordinator_present` reads: a lease event, a
+        coordinator setting, or a coordinator launch recorded. A store a drop made holds none of them. A file whose
+        format predates these tables holds none that can be read, so False."""
+        def held(conn: sqlite3.Connection, names: set[str]) -> bool:
+            if "lease_events" in names and conn.execute("SELECT 1 FROM lease_events LIMIT 1").fetchone():
+                return True
+            if "coord_settings" in names and conn.execute("SELECT 1 FROM coord_settings LIMIT 1").fetchone():
+                return True
+            return "launches" in names and conn.execute(
+                "SELECT 1 FROM launches WHERE role = 'coordinator' LIMIT 1").fetchone() is not None
+        return self._read_existing(held)
 
     def _schema_current(self, conn: sqlite3.Connection, *, base: bool = False) -> bool:
         """``base`` (every display's gate, and a non-creating write's): the lifecycle tables are ADDITIVE, so a store

@@ -125,20 +125,21 @@ def _handle(args: argparse.Namespace) -> tuple[str, Any] | None:
     return None
 
 
-def _probe(directory: Path, handle: tuple[str, Any] | None) -> tuple[bool, bool, bool] | None:
-    """What a store directory holds, read without making or migrating anything: None when no coordinator store is
-    there, else ``(holds the handle, the handle is its standing lease, a coordinator is live there)``. Live means a
-    live lease, or a coordinator launch pending or active. A store in an older format is present, with nothing read."""
+def _probe(directory: Path, handle: tuple[str, Any] | None) -> tuple[bool, bool, bool | None] | None:
+    """What a store directory holds, read without making or migrating anything: None when no coordinator was ever in
+    it (a store a drop made is not one), else ``(holds the handle, the handle is its standing lease, a coordinator is
+    live there)``. Live means a live lease, or a coordinator launch pending or active. A store in an older format
+    cannot be read: its live is None (unknown), never False."""
     from levain.coordinator import lease
     from levain.coordinator.store import StoreAbsent
 
     store = EnvelopeStore(directory)
-    if not store.coordinator_present():
+    if not store.holds_coordinator():
         return None
     try:
         conn = store.open_readonly()
     except StoreAbsent:
-        return False, False, False
+        return False, False, None
     try:
         now = store._stamp()
         held = lease.lease(conn, now)
@@ -171,7 +172,11 @@ def _coordinator_dir(args: argparse.Namespace) -> Path:
     if handle is not None:
         holding = [d for d, p in found.items() if p is not None and p[0]]
         if len(holding) == 2:
-            holding = [d for d in holding if found[d][1]]
+            standing = [d for d in holding if found[d][1]]
+            if len(standing) != 1:
+                raise CoordError(f"{handle[0]} {handle[1]} is in both {consent} and {board}; name its store with "
+                                 "--queue-dir")
+            holding = standing
         if len(holding) == 1:
             return holding[0]
         if holding:
@@ -181,10 +186,13 @@ def _coordinator_dir(args: argparse.Namespace) -> Path:
     if not present:
         return board if args.coord_cmd == "take" else consent
     if len(present) == 2:
+        unknown = [d for d in present if found[d][2] is None]
         present = [d for d in present if found[d][2]]
         if len(present) != 1:
-            raise CoordError(f"a coordinator store is in both {consent} and {board}, and "
-                             f"{'a coordinator is live in both' if present else 'none is live'}: name the one you "
+            why = "a coordinator is live in both" if present else (
+                "it is unknown whether one is live in " + " or ".join(str(d) for d in unknown)
+                + " (an older format a writer has not brought current)" if unknown else "none is live")
+            raise CoordError(f"a coordinator store is in both {consent} and {board}, and {why}: name the one you "
                              "mean with --queue-dir")
     return present[0]
 
