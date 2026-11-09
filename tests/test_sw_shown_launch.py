@@ -185,7 +185,7 @@ def test_the_legacy_singleton_key_is_swept_by_the_worker_and_by_the_page() -> No
 
 @functools.lru_cache(maxsize=1)
 def _resume_once() -> dict:
-    return _open_rig("resume")                  # ~15 s (the 1.5 s retry of each case runs inside it): once for the four tests
+    return _open_rig("resume")                  # the slow rig (each case's retry runs inside it): once for the four tests
 
 
 def _resume() -> dict:
