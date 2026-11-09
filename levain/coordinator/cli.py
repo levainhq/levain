@@ -1857,15 +1857,15 @@ def _coord_apply_reports(args: argparse.Namespace, out: Any, store: EnvelopeStor
     pass, and a store that is the live consent store, is one line on stderr and the exit is 2."""
     from levain.coordinator import work_attach
 
+    if work_attach.is_live_consent(Path(store.directory)):
+        print(f"levain coord apply-reports: not applied, {store.directory} is the live consent store and never a "
+              "board", file=sys.stderr)
+        return 2
     held = None if _no_store(store) else store.coord_lease()
     if held is None or not held.live or held.token != args.token:
         print("levain coord apply-reports: the coordinator lease is not held by this token (levain coord status "
               "shows the live one); nothing was applied", file=sys.stderr)
         return 1
-    if work_attach.is_live_consent(Path(store.directory)):
-        print(f"levain coord apply-reports: not applied, {store.directory} is the live consent store and never a "
-              "board", file=sys.stderr)
-        return 2
     try:
         lines = work_attach.coordinator_apply(store, args.token)
     except Exception as exc:    # noqa: BLE001 - every fault of the pass is one line, never a traceback

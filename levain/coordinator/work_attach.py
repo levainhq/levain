@@ -29,7 +29,7 @@ holds, never on the worker name a report carries:
   attach holds its item: a later report naming that worker from another session, or that session under another name,
   is refused ``worker-mismatch``. Its later events keep the kind its attach was recorded with (else ``kind-mismatch``),
   and it never names the kind ``launch``. The session is real when its observed interval (``sessions_seen``, written
-  by every service pass, and every coordinator pass with a report waiting, whose listing it could read, from its
+  by every service pass and every coordinator pass on a board with a queue file, whose listing it could read, from its
   first sighting to its last, this pass's listing (:func:`live_session_ids`) counting as a sighting now) reaches the report's ``at``: its last sighting within :data:`GRACE_PASSES` pass
   intervals after it, its first no more than :data:`DEFER_DEADLINE` later: a seat whose last act is ``landed`` or ``ended`` and which then exits is still judged on what
   was true when it spoke. An unreadable listing defers such a report, and one deferred past :data:`DEFER_DEADLINE`
@@ -55,6 +55,8 @@ Known edges (ruled, one line each):
   itself with :func:`coordinator_apply` (``levain coord apply-reports --token N``, and at the end of ``coord
   import-status``), as the coordinator, facts only, through the same judging. A holder that runs neither leaves the
   reports waiting for its lease to end.
+* The coordinator's own sightings are only as frequent as its passes (``apply-reports``, ``import-status``); the
+  watch service records them continuously.
 * A stale lease of someone other than the service is left for its holder or a coordinator to lapse: the service's pass
   is skipped until then.
 """
@@ -791,8 +793,9 @@ def coordinator_apply(store: CoordStore, token: Any, *, sessions: Any = None,
     """The coordinator's own pass over the board's queue (row 162): while a coordinator holds the board lease the
     service's pass is skipped (:func:`watch_apply`), so the holder applies the queued reports itself, as the
     ``coordinator`` with its own live ``token``, through :func:`apply_reports`: the same judging, the same facts only,
-    the same refusals with a record. The lease is neither taken nor released here. Returns ``[]`` when no report is
-    queued, else one line. Raises :class:`CoordError` when ``token`` is not the live lease; a directory that is the
+    the same refusals with a record. The lease is neither taken nor released here. Every pass on a board with a queue
+    file records the sessions its listing shows (``sessions_seen``), a report queued or not. Returns ``[]`` when no
+    report is queued, else one line. Raises :class:`CoordError` when ``token`` is not the live lease; a directory that is the
     live consent store is never a board (one line, nothing applied)."""
     directory = Path(store.directory)
     if is_live_consent(directory):
@@ -803,10 +806,17 @@ def coordinator_apply(store: CoordStore, token: Any, *, sessions: Any = None,
     held = store.coord_lease() if (directory / "dispatch.db").exists() else None
     if held is None or not held.live or held.token != token:
         raise CoordError("the coordinator lease is not held by this token; no report was applied")
-    if not reports_path(directory).exists() or not _unresolved(directory):
+    if not reports_path(directory).exists():      # no queue file: nothing to judge, and none is made here
         return []
     live = (sessions or live_session_ids)(store)
-    return [_applied_line(apply_reports(store, token, live_sessions=live, every=every))]
+    if _unresolved(directory):
+        return [_applied_line(apply_reports(store, token, live_sessions=live, every=every))]
+    # nothing queued: the pass still records what its listing shows, so a seat that lands and exits before the next
+    # pass is judged on this sighting (row 162 L3 r2)
+    if live is not None:
+        with store._write("coordinator", token, create=False) as (conn, now):
+            _record_seen(conn, now, live)
+    return []
 
 
 # ------------------------------------------------------------------------------------------------ a report's outcome

@@ -262,3 +262,43 @@ def test_import_status_json_always_carries_the_reports_key(board, coord, tmp_pat
     status.write_text("# head\n\n## LANE MENU\n\n1. **First item** (tier: sonnet) DONE: it works.\n")
     code = main(["coord", "import-status", str(status), "--token", str(token), "--queue-dir", str(board), "--json"])
     assert code == 0 and json.loads(capsys.readouterr().out)["reports"] == []
+
+
+# ------------------------------------------------------------------------------------------------ row 162 L3 r2
+def test_a_holder_pass_with_an_empty_queue_records_its_sightings(board, coord):
+    """A holder pass with nothing queued still records the seat it sees live, so a seat that lands and exits before
+    the next pass is judged on that sighting (L3 r2 complement 1)."""
+    import time
+
+    store, token, _ = coord
+    every = 0.05
+
+    def apply(live):
+        return work_attach.coordinator_apply(CoordStore(board), token, sessions=live, every=every)
+
+    _seat(board, "r-att")
+    apply(_live("sess-a"))                                 # the attach applied, the seat seen live
+    time.sleep(0.3)                                        # well past the grace of two passes
+    spoke = datetime.now(timezone.utc).isoformat()
+    assert apply(_live("sess-a")) == []                    # the queue is empty; the seat is still live
+    _seat(board, "r-land", event="landed", sha="e" * 40, branch="seat/a", at=spoke)
+    apply(_none_live)                                      # the seat has exited
+    assert _rows(board, "SELECT report_id, by FROM worker_attach ORDER BY gseq") == [
+        ("r-att", "coordinator"), ("r-land", "coordinator")]
+    assert _rows(board, "SELECT count(*) FROM report_refusals") == [(0,)]
+
+
+def test_a_holder_pass_with_no_queue_file_creates_none(board, coord):
+    store, token, _ = coord
+    assert work_attach.coordinator_apply(CoordStore(board), token, sessions=_live("sess-a")) == []
+    assert not work_attach.reports_path(board).exists()
+
+
+def test_the_verb_names_the_live_consent_store_without_a_lease_there(tmp_path, monkeypatch, capsys):
+    """The consent-store check comes before the lease check (L3 r2 codex LOW)."""
+    monkeypatch.setenv("LEVAIN_HOME", str(tmp_path / "home"))
+    consent = work_attach.live_consent_dir()
+    consent.mkdir(parents=True, mode=0o700)
+    CoordStore(consent).coord_take()
+    code = main(["coord", "apply-reports", "--token", "999999", "--queue-dir", str(consent)])
+    assert code == 2 and "live consent store" in capsys.readouterr().err
