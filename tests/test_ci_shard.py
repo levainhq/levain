@@ -296,3 +296,13 @@ def test_the_weights_command_end_to_end_and_its_refusals(tmp_path):
 def test_the_weights_command_rejects_a_bad_invocation():
     assert _run("weights", "--nodes").returncode == 2
     assert _run("weights", "--bogus", "x").returncode == 2
+
+
+def test_the_committed_weights_deal_their_own_files_evenly():
+    """The shard job that runs longest sets the run's wall time, so the committed weights must not leave one shard
+    far above the mean: the plan over the weights file's own files stays within 10% of the mean load."""
+    files, _ = shard.load_weights()
+    assert files, "no measured files in tests/ci/shard_weights.json"
+    shards, loads = shard.partition(list(files), 6, lambda f: shard.weight(f, shard.ROOT, (files, 1.0)))
+    shard.check(shards, list(files))
+    assert max(loads) <= 1.10 * (sum(loads) / len(loads)), [round(x) for x in loads]
