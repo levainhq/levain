@@ -6,7 +6,8 @@ name: contracts-xcheck
 
 on:
   push:
-    branches: [main]
+    # land/**: a landing's sha is cross-checked before it reaches main, not only on main's follow run.
+    branches: [main, "land/**"]
     tags: ["v*"]
   pull_request:
     branches: [main]
