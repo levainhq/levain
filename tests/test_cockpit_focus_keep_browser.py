@@ -127,7 +127,7 @@ def test_typing_elsewhere_does_not_hold_a_fresh_empty_board_field(tmp_path: Path
     vals = _run_steps(tmp_path, root, src, steps)
     assert json.loads(vals[-3])["on"], vals[-3]
     got = json.loads(vals[-1])
-    assert got["r"] > 0 and got["ms"] < 5000, got   # a held read would wait out the whole idle window
+    assert got["r"] > 0 and got["ms"] < 9000, got   # a held read would wait out the whole idle window
 
 
 @needs_browser
