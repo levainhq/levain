@@ -995,13 +995,10 @@ def test_a_reconcile_drop_and_an_attachment_eof_each_finalize():
 
     async def fn(ctl, k, led, spy):
         # the reconcile's drop of a session's digest is `_drop_locked` on that session
-        k._run_join("s1", rid)
-        k._run_join("s2", rid)
+        # (one session per run: a second session naming it is refused, see the one-session test)
+        assert k._run_join("s1", rid)
         async with k.state_lock:
             k._drop_locked("s1")
-        assert k._run_sessions == {rid: {"s2"}} and not led.run_finalized(rid)    # one session left: still live
-        async with k.state_lock:
-            k._drop_locked("s2")
         await until(lambda: led.run_finalized(rid), 10, "the reconcile drop finalized the run")
         # an attachment EOF: CONTROL revokes every session on it, so keys finalizes every run it still holds
         k._run_join("s3", rid2)
@@ -1035,9 +1032,226 @@ def test_a_restart_sweep_finalizes_a_run_the_durable_lines_name(tmp_path):
         assert led.open_runs() == [rid] and not led.run_finalized(rid)
         await k.start([])                                        # no sockets: the sweep alone
         done = led.run_finalized(rid)
+        await until(lambda: not k._finalizing, 10, "the count is durable")   # the run leaves once its line is
         status = k.lineage_status()
         await led.aclose(5)
         return done, status
 
     done, status = asyncio.run(second())
     assert done and status["finalizing"] == 0
+
+
+# ---- review round 1 (runfinal r1, lane K) --------------------------------------------------------------------------
+
+def test_an_ack_made_durable_after_the_attachment_dropped_still_finalizes_the_run(monkeypatch):
+    # codex HIGH 1: the run's last row is acked by CONTROL, keys' `lineage-acked` line waits at a closed flush gate,
+    # the attachment drops (the sender awaiting `ack()` is cancelled), the line becomes durable with no attachment,
+    # and a new attachment opens on an empty outbox. The run's count must still be written.
+    from tests.ledger_support import FlushCtl
+    fc = FlushCtl()
+    monkeypatch.setattr(L, "_flush", fc)
+    rid = RUN["run_id"]
+
+    async def prefill(led):
+        a = _hold_of(led, 100)
+        await _settle(a)
+        await a.finish()
+        await until(lambda: led.outbox_size == 1, 10, "the row is durable")
+        fc.gate.clear()                                          # the next flush (keys' ack line) waits at the gate
+
+    async def fn(ctl, k, led, spy):
+        await until(lambda: fc.entered.is_set() and led._ack_pending, 20, "the ack line waits at the gate")
+        orig, reopen = k._attach_open, asyncio.Event()
+
+        async def held_open():
+            await reopen.wait()
+            return await orig()
+
+        k._attach_open = held_open
+        k._run_join("s1", rid)
+        async with k.state_lock:
+            k._drop_locked("s1")                                 # the run is closed; its row is not acked yet
+        assert k._finalizing == {rid}
+        k._attach_close(k.attached)
+        await until(lambda: k.attached is None, 10, "the attachment dropped")
+        fc.gate.set()                                            # the ack line becomes durable with no attachment
+        await until(lambda: not led._ack_pending, 10, "the ack line was answered")
+        reopen.set()
+        await until(lambda: k.attached is not None, 20, "a new attachment")
+        await until(lambda: len(_finals(ctl.rows())) == 1, 10, "the final reached the sink")
+        return ctl.rows(), k.lineage_status()
+
+    rows, status = delivery(fn, prefill=prefill)
+    final = _finals(rows)[0]
+    assert (final["rows"], final["quarantined"], final["run_id"]) == (1, 0, rid)
+    assert status["finalizing"] == 0
+
+
+RID2 = "r-fedcba9876543210"
+
+
+def test_a_run_final_waits_for_room_at_the_outbox_bound(tmp_path):
+    # codex HIGH 2: a run's count is a payload like any row, so it is queued only below `lineage_outbox_max`; a ready
+    # run at a full outbox stays closed and is asked for again when an ack frees room
+    path = str(tmp_path / "ledger.jsonl")
+
+    async def go():
+        led = keys_ledger(path)
+        k = K.Keys(ledger=led)
+        k._in_loop()
+        k.lineage_outbox_max = 2
+        triples = await fill(led, [good_row(), good_row()])     # another run's rows: the outbox is at its bound
+        k._run_join("s9", RID2)
+        k._run_leave("s9")                                       # a run that made no call, closed: ready, no room
+        await asyncio.sleep(0.2)
+        held = (led.run_finalized(RID2), led.outbox_committed, set(k._finalizing))
+        await led.ack(triples[:1])                               # room: the ack's own listener asks again
+        await until(lambda: RID2 not in k._finalizing, 10, "the final was written")
+        after = (led.run_finalized(RID2), led.outbox_committed)
+        await led.aclose(5)
+        return held, after
+
+    held, after = asyncio.run(go())
+    assert held == (False, 2, {RID2})
+    assert after == (True, 2)
+
+
+def test_a_hold_that_resolves_with_no_row_finalizes_its_closed_run(tmp_path):
+    # complement LOW 4: the hold-resolution path is a trigger too, so a closed run whose last hold resolves with no
+    # outbox row (no ack ever follows) is counted without waiting for an unrelated ack
+    path = str(tmp_path / "ledger.jsonl")
+    rid = RUN["run_id"]
+
+    async def go():
+        from tests.ledger_support import Owner
+        led = keys_ledger(path)
+        k = K.Keys(ledger=led)
+        k._in_loop()
+        k._run_join("s1", rid)
+        o = Owner(led, amount=100, cap=RUN["reserved_microdollars"], scope=("run", rid), meta={})
+        await o.start()
+        await o.hold.durable()
+        o.hold.send_gate()
+        o.hold.mark_sent()
+        k._run_leave("s1")
+        await asyncio.sleep(0.2)
+        waiting = (led.run_finalized(rid), set(k._finalizing))
+        o.hold.settle(100, {})
+        await o.finish()
+        await until(lambda: led.run_finalized(rid) and rid not in k._finalizing, 10, "the run was counted")
+        await led.aclose(5)
+        return waiting
+
+    waiting = asyncio.run(go())
+    assert waiting == (False, {rid})
+    finals = [o for o in file_lines(path) if o["kind"] == "run-final"]
+    assert len(finals) == 1 and finals[0]["meta"]["lineage"]["rows"] == 0
+
+
+def test_a_run_final_that_fails_to_write_keeps_the_run_and_the_next_start_counts_it(tmp_path, monkeypatch):
+    # complement LOW 3 / deepseek MED / gemini HIGH: a count lost to a write failure is never treated as written.
+    # The fence comes down, keys keeps the run, and the restart sweep (a run with rows and no durable count) counts it.
+    import errno as _errno
+    path = str(tmp_path / "ledger.jsonl")
+    rid = RUN["run_id"]
+    real = L._write_all
+
+    def full_for_finals(fd, data):
+        if b'"kind":"run-final"' in data:
+            raise OSError(_errno.ENOSPC, "no space")
+        return real(fd, data)
+
+    async def first():
+        led = keys_ledger(path)
+        k = K.Keys(ledger=led)
+        k._in_loop()
+        k._run_join("s1", rid)
+        a = _hold_of(led, 100)
+        await _settle(a)
+        await a.finish()
+        await until(lambda: led.outbox_size == 1, 10, "the row is durable")
+        k._run_leave("s1")
+        assert k._finalizing == {rid}                            # not ready: the row is not acked
+        monkeypatch.setattr(L, "_write_all", full_for_finals)
+        await led.ack([t for t, _ in led.unacked()])             # the ack's listener asks for the count; it fails
+        await until(lambda: not led.healthy and not k._final_pending, 10, "the final's line failed")
+        state = (led.run_finalized(rid), set(k._finalizing))
+        k._try_finalize()                                        # a later trigger: the ledger takes nothing now
+        state2 = set(k._finalizing)
+        await led.aclose(5)
+        return state, state2
+
+    state, state2 = asyncio.run(first())
+    assert state == (False, {rid}) and state2 == {rid}
+    monkeypatch.setattr(L, "_write_all", real)
+    assert [o for o in file_lines(path) if o["kind"] == "run-final"] == []
+
+    async def second():
+        led = keys_ledger(path)
+        k = K.Keys(ledger=led)
+        k._in_loop()
+        assert led.open_runs() == [rid]
+        await k.start([])
+        await until(lambda: rid not in k._finalizing, 10, "the sweep counted the run")
+        await led.aclose(5)
+
+    asyncio.run(second())
+    finals = [o for o in file_lines(path) if o["kind"] == "run-final"]
+    assert len(finals) == 1 and finals[0]["meta"]["lineage"]["rows"] == 1
+
+
+def test_one_session_per_run_a_second_session_or_a_closed_run_is_refused(monkeypatch):
+    # complement MED 2: keys holds one session per run. A second session naming a run, or a session naming a run
+    # already closed, is refused at the resolve (nothing cached, a FAILURE noted), never let spend around its
+    # run's count.
+    rid = RUN["run_id"]
+
+    async def go(d):
+        async with KeysWorld(d, monkeypatch) as w:
+            k = w.k
+            answers = {"claims": dict(TICKETED)}
+
+            async def resolve(digest):
+                return ("answer", {"session": "s1", "claims": answers["claims"]})
+
+            k._token_resolve = resolve
+
+            async def ask():
+                conn = K.Conn(None, w.reg, "pending")
+                conn.admin_epoch = k.admin_epoch
+                return await k._token_state(conn, TOKEN)
+
+            k._run_join("s0", rid)
+            second = await ask()
+            second_cached = dict(k.cache)
+            failure = k.lineage_failure
+            k._run_leave("s0")
+            closed = await ask()
+            answers["claims"] = dict(TICKETED, run=dict(RUN, run_id=RID2))
+            fresh = await ask()
+            return second, second_cached, failure, closed, fresh, dict(k._run_sessions), len(k.cache)
+
+    second, second_cached, failure, closed, fresh, sessions, cached = run_go(go)
+    assert second == {"refused": "keys-unavailable"} and second_cached == {}
+    assert "second session" in failure
+    assert closed == {"refused": "keys-unavailable"}
+    assert "answer" in fresh and sessions == {RID2: {"s1"}} and cached == 1
+
+
+def test_a_refusal_window_with_no_run_never_breaks_a_runs_close(tmp_path):
+    # deepseek LOW: `_run_closed` and `_refused_close` tolerate a window whose run is None
+    path = str(tmp_path / "ledger.jsonl")
+
+    async def go():
+        led = keys_ledger(path)
+        k = K.Keys(ledger=led)
+        k._in_loop()
+        k._refusals[("s1", "keys-unavailable")] = [0.0, 1, None, None]
+        k._run_join("s2", RID2)
+        k._run_leave("s2")
+        k.flush_refusals()
+        out = (dict(k._refusals), led.run_finalized(RID2))
+        await led.aclose(5)
+        return out
+
+    assert asyncio.run(go()) == ({}, True)

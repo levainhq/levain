@@ -296,6 +296,9 @@ LINEAGE_ENVELOPE_BYTES = 48 * 1024
 REFUSED_ROW_S = 60.0
 #: DECISION: the wait before an envelope CONTROL refused, or did not answer, is sent again (the attach backoff's cap)
 LINEAGE_RETRY_S = 5.0
+#: DECISION: the triggers a closed run's count may fail on with an error the ledger did not name before keys stops
+#: asking for it (noted); a run with rows comes back at the next start's sweep
+FINALIZE_TRIES = 3
 
 
 def _stamp(t: float) -> str:
@@ -1130,8 +1133,13 @@ class Keys:
         self._run_sessions: Dict[str, Set[str]] = {}
         self._session_runs: Dict[str, Set[str]] = {}
         self._finalizing: Set[str] = set()
+        #: the closed runs whose run-final line is queued and not yet answered (they stay in `_finalizing` until it is
+        #: durable), and the count of unnamed errors each run's count has hit (`FINALIZE_TRIES`)
+        self._final_pending: Set[str] = set()
+        self._finalize_errors: Dict[str, int] = {}
         if ledger is not None:
             ledger.on_outbox = self._lineage_due
+            ledger.on_runs = self._try_finalize
         #: the dispatch route maps (S1 3c-4): keys' own head and every generation it verified; `main()` loads them
         #: before anything is served. None (no lib root): no dispatch map, every dispatch route refused.
         self.routes = routes if routes is not None else (
@@ -1748,11 +1756,15 @@ class Keys:
         if led is None or wake is None:
             return
         led.on_outbox = self._lineage_due
+        led.on_runs = self._try_finalize
         try:
             while self.attached is att and not att.ended:
                 wake.clear()      # before the read: a line made durable after it sets the wake again
                 got = lineage_envelope(led.unacked())
                 if got is None:
+                    # an empty outbox may be the drain a closed run waited for (its last ack counted while no sender
+                    # was there to see it): ask for the counts before sleeping
+                    self._try_finalize()
                     await wake.wait()
                     continue
                 sent, env = got
@@ -1782,7 +1794,7 @@ class Keys:
                                                                                            type(e).__name__))
                     await asyncio.sleep(self.lineage_retry_s)
                     continue
-                self._try_finalize()   # a run whose last row just got its durable ack may be complete now
+                # a run whose last row just got its durable ack was already asked for: the ledger's `on_runs`
                 if quarantined:
                     self._lineage_trouble("CONTROL quarantined %d record(s) (%s)" % (
                         len(quarantined), ",".join(sorted(set(quarantined.values())))))
@@ -1811,17 +1823,39 @@ class Keys:
 
     # -- the run's count (W3-3b: the completeness proof a brokered run settles on) --
 
-    def _run_join(self, session: str, run_id: str) -> None:
+    def _run_join(self, session: str, run_id: str) -> bool:
         """A token of `session` resolved to `run_id` (under state_lock, on the loop): the run has a live session, and
-        the ledger is told it is a run keys knows (the record a run with no hold and no row is finalized on)."""
+        the ledger is told it is a run keys knows (the record a run with no hold and no row is finalized on).
+
+        keys holds ONE session per run: a second session naming a run, or a session naming a run keys already closed
+        (its count asked for or written), is a fault upstream, not a use. Either is refused here (False: the caller refuses the token `keys-unavailable` and
+        caches nothing) and noted as a FAILURE: a run whose count could be written while one of its sessions still
+        spends is never let in. The same session naming its run again (a re-registration's resolve) is a join."""
+        live = self._run_sessions.get(run_id)
+        if live is not None and session not in live:
+            why = "a second session named a run (%s; %s holds it)" % (run_id, ",".join(sorted(live)))
+        elif live is None and (run_id in self._finalizing or self._run_counted(run_id)):
+            why = "a session named a closed run (%s)" % run_id
+        else:
+            why = None
+        if why is not None:
+            self._lineage_trouble("%s: its token is refused" % why)
+            return False
         self._run_sessions.setdefault(run_id, set()).add(session)
         self._session_runs.setdefault(session, set()).add(run_id)
-        self._finalizing.discard(run_id)
         if self.ledger is not None:
             try:
                 self.ledger.note_run(run_id)
             except Exception as e:
                 _note(logging.WARNING, "levain gw-keys: a run was not noted to the ledger (%s)", type(e).__name__)
+        return True
+
+    def _run_counted(self, run_id: str) -> bool:
+        """The ledger holds the run's count (queued or written); False when there is no ledger or it cannot say."""
+        try:
+            return self.ledger is not None and self.ledger.run_finalized(run_id)
+        except Exception:
+            return False
 
     def _run_leave(self, session: str) -> None:
         """`session` is dropped (DROP-SESSION, registered or not, or the reconcile's drop): every run left with no
@@ -1845,15 +1879,20 @@ class Keys:
     def _run_closed(self, run_id: str) -> None:
         """A run's last session is gone: its open refusal windows are flushed now (their rows are the run's, and the
         count must come after them), then it waits in `_finalizing` for the ledger to find it ready."""
-        for key in [k for k, w in self._refusals.items() if w[2]["run_id"] == run_id]:
+        for key in [k for k, w in self._refusals.items() if type(w[2]) is dict and w[2].get("run_id") == run_id]:
             self._refused_close(key)
         self._finalizing.add(run_id)
         self._try_finalize()
 
     def _try_finalize(self) -> None:
-        """Asks the ledger for the run-final line of every closed run it finds ready (on the loop). The line enters the
-        outbox and rides the existing sender. A run that is not ready waits for the next trigger (an ack, a drop, the
-        start); one with a live session again, already counted, or unknown to the ledger leaves the set."""
+        """Asks the ledger for the run-final line of every closed run it finds ready (on the loop; the ledger's
+        `on_runs` calls it too, after an ack is counted or a hold resolves, whoever was waiting for either). The line
+        enters the outbox and rides the existing sender; the run leaves `_finalizing` only when that line is durable
+        (`_final_answered`). A ready run waits while the outbox is at `lineage_outbox_max` (its line is a payload like
+        any other; the next ack frees room and calls back here), and a run that is not ready waits for the next
+        trigger. A run already counted, or unknown to the ledger, leaves the set. A `LedgerUnavailable` keeps every
+        run (the ledger writes nothing now: the next start's sweep finds a run with rows); any other error keeps the
+        run for the next trigger, `FINALIZE_TRIES` times, then lets it go, noted."""
         led = self.ledger
         if led is None or self.closing:
             return
@@ -1861,17 +1900,35 @@ class Keys:
             if run_id in self._run_sessions:
                 self._finalizing.discard(run_id)
                 continue
+            if run_id in self._final_pending:
+                continue
             try:
                 if led.run_finalized(run_id) or not led.run_known(run_id):
                     self._finalizing.discard(run_id)
-                elif led.run_ready(run_id):
-                    led.run_final(run_id)
-                    self._finalizing.discard(run_id)
+                    self._finalize_errors.pop(run_id, None)
+                elif led.run_ready(run_id) and led.outbox_committed < self.lineage_outbox_max:
+                    fut = led.run_final(run_id)
+                    self._final_pending.add(run_id)
+                    fut.add_done_callback(functools.partial(self._final_answered, run_id))
             except ledger.LedgerUnavailable:
-                return   # the ledger writes nothing now: the run settles at its reservation, and stays counted
+                return
             except Exception as e:
-                self._finalizing.discard(run_id)
-                _note(logging.WARNING, "levain gw-keys: a run-final was not written (%s)", type(e).__name__)
+                n = self._finalize_errors[run_id] = self._finalize_errors.get(run_id, 0) + 1
+                if n >= FINALIZE_TRIES:
+                    self._finalizing.discard(run_id)
+                    del self._finalize_errors[run_id]
+                _note(logging.WARNING, "levain gw-keys: a run-final was not written (%s)%s", type(e).__name__,
+                      "; given up" if n >= FINALIZE_TRIES else "; kept for the next trigger")
+
+    def _final_answered(self, run_id: str, fut: "asyncio.Future") -> None:
+        """A queued run-final line's answer: durable, the run is done; failed (the ledger faulted or closed first, and
+        took its fence down), the run stays in `_finalizing` for the next start's sweep."""
+        self._final_pending.discard(run_id)
+        if not fut.cancelled() and fut.exception() is None:
+            self._finalizing.discard(run_id)
+            self._finalize_errors.pop(run_id, None)
+        else:
+            _note(logging.WARNING, "levain gw-keys: a run-final line did not become durable; the run is kept")
 
     def _note_refusal(self, session: str, run: Optional[dict], name: str) -> None:
         """One refusal of a TICKETED `Q` made before any hold (so no hold row records it): counted in its (session,
@@ -1897,6 +1954,10 @@ class Keys:
         if timer is not None:
             timer.cancel()
         session, name = key
+        if type(run) is not dict:
+            # `_note_refusal` opens no window without a run; a window that has none anyway has no row to write
+            _note(logging.WARNING, "levain gw-keys: a refusal window with no run was closed; %d %s lost", count, name)
+            return
         row = refused_row(run, reason=name, count=count, at=_stamp(first), ended_at=_stamp(time.time()))
         led = self.ledger
         if led is None:
@@ -3322,10 +3383,12 @@ class Keys:
                     return None
                 if digest in self.dropped:
                     return {"refused": "token-revoked"}
+                claims = res[1].get("claims")
+                run = claims.get("run") if type(claims) is dict else None
+                run_id = run.get("run_id") if type(run) is dict else None
+                if type(run_id) is str and not self._run_join(res[1]["session"], run_id):
+                    return {"refused": "keys-unavailable"}   # the run's one session is another, or it is closed
                 self.cache[digest] = res[1]
-                run = res[1]["claims"].get("run")
-                if run is not None:
-                    self._run_join(res[1]["session"], run["run_id"])
             return {"answer": res[1]}
         if not front_binding(hit, reg):
             return {"refused": "front-mismatch"}
